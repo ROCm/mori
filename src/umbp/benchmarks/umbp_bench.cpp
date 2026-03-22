@@ -502,10 +502,10 @@ static int RunLatencyBench() {
     std::string session = MakeSessionId();
 
     printf("\n================================================================\n");
-    printf(" LATENCY Benchmark — backend=%s  (single-thread QD=1)\n", backend);
+    printf(" WRITE LATENCY — backend=%s  (single-thread QD=1)\n", backend);
     printf("================================================================\n");
-    printf("  %8s  %7s  %5s  %10s  %10s  %10s  %10s\n",
-           "ValSize", "Op", "Count", "Avg(us)", "P50(us)", "P99(us)", "Max(us)");
+    printf("  %8s  %5s  %10s  %10s  %10s  %10s\n",
+           "ValSize", "Count", "Avg(us)", "P50(us)", "P99(us)", "Max(us)");
 
     for (const auto& spec : kLatencySpecs) {
         size_t vsize = spec.size;
@@ -523,46 +523,59 @@ static int RunLatencyBench() {
         for (size_t j = 0; j < vsize; ++j)
             data[j] = static_cast<char>((j + 1) & 0xFF);
 
+        std::vector<double> samples;
+        samples.reserve(count);
+        for (int i = 0; i < count; ++i) {
+            std::string key = prefix + std::to_string(i);
+            double t0 = NowSec();
+            ssd->Write(key, data.data(), vsize);
+            double t1 = NowSec();
+            samples.push_back((t1 - t0) * 1e6);
+        }
+        ssd->Flush();
+
+        auto st = ComputeStats(samples);
+        printf("  %8s  %5d  %10.1f  %10.1f  %10.1f  %10.1f\n",
+               sz_label, count, st.avg_us, st.p50_us, st.p99_us, st.max_us);
+    }
+
+    printf("\n================================================================\n");
+    printf(" READ LATENCY — backend=%s  (single-thread QD=1, O_DIRECT)\n", backend);
+    printf("================================================================\n");
+    printf("  %8s  %5s  %10s  %10s  %10s  %10s\n",
+           "ValSize", "Count", "Avg(us)", "P50(us)", "P99(us)", "Max(us)");
+
+    ssd->SetColdRead(true);
+    for (const auto& spec : kLatencySpecs) {
+        size_t vsize = spec.size;
+        int count = spec.count;
+
+        char sz_label[16];
+        if (vsize >= 1024 * 1024)
+            snprintf(sz_label, sizeof(sz_label), "%zuMB", vsize / (1024 * 1024));
+        else
+            snprintf(sz_label, sizeof(sz_label), "%zuKB", vsize / 1024);
+
+        std::string prefix = "lat_" + session + "_" + std::to_string(vsize) + "_";
+
         std::vector<char> read_buf(vsize, 0);
         uintptr_t dst = reinterpret_cast<uintptr_t>(read_buf.data());
 
-        // --- Write latency ---
-        {
-            std::vector<double> samples;
-            samples.reserve(count);
-            for (int i = 0; i < count; ++i) {
-                std::string key = prefix + std::to_string(i);
-                double t0 = NowSec();
-                ssd->Write(key, data.data(), vsize);
-                double t1 = NowSec();
-                samples.push_back((t1 - t0) * 1e6);
-            }
-            auto st = ComputeStats(samples);
-            printf("  %8s  %7s  %5d  %10.1f  %10.1f  %10.1f  %10.1f\n",
-                   sz_label, "Write", count, st.avg_us, st.p50_us, st.p99_us, st.max_us);
+        std::vector<double> samples;
+        samples.reserve(count);
+        for (int i = 0; i < count; ++i) {
+            std::string key = prefix + std::to_string(i);
+            double t0 = NowSec();
+            ssd->ReadIntoPtr(key, dst, vsize);
+            double t1 = NowSec();
+            samples.push_back((t1 - t0) * 1e6);
         }
 
-        ssd->Flush();
-
-        // --- Cold read latency (O_DIRECT / bypass cache) ---
-        {
-            ssd->SetColdRead(true);
-            std::vector<double> samples;
-            samples.reserve(count);
-            for (int i = 0; i < count; ++i) {
-                std::string key = prefix + std::to_string(i);
-                double t0 = NowSec();
-                ssd->ReadIntoPtr(key, dst, vsize);
-                double t1 = NowSec();
-                samples.push_back((t1 - t0) * 1e6);
-            }
-            ssd->SetColdRead(false);
-            auto st = ComputeStats(samples);
-            printf("  %8s  %7s  %5d  %10.1f  %10.1f  %10.1f  %10.1f\n",
-                   sz_label, "ColdRd", count, st.avg_us, st.p50_us, st.p99_us, st.max_us);
-        }
-
+        auto st = ComputeStats(samples);
+        printf("  %8s  %5d  %10.1f  %10.1f  %10.1f  %10.1f\n",
+               sz_label, count, st.avg_us, st.p50_us, st.p99_us, st.max_us);
     }
+    ssd->SetColdRead(false);
 
     printf("================================================================\n");
     fflush(stdout);
