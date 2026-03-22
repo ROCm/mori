@@ -506,8 +506,10 @@ static int RunLatencyBench() {
     const char* backend = cfg.ssd_backend.c_str();
     std::string session = MakeSessionId();
 
+    ssd->SetColdRead(true);
+
     printf("\n================================================================\n");
-    printf(" WRITE LATENCY — backend=%s  (single-thread QD=1)\n", backend);
+    printf(" WRITE LATENCY — backend=%s  (single-thread QD=1, O_DIRECT)\n", backend);
     printf("================================================================\n");
     printf("  %8s  %5s  %10s  %10s  %10s  %10s\n",
            "ValSize", "Count", "Avg(us)", "P50(us)", "P99(us)", "Max(us)");
@@ -550,7 +552,6 @@ static int RunLatencyBench() {
     printf("  %8s  %5s  %10s  %10s  %10s  %10s\n",
            "ValSize", "Count", "Avg(us)", "P50(us)", "P99(us)", "Max(us)");
 
-    ssd->SetColdRead(true);
     for (const auto& spec : kLatencySpecs) {
         size_t vsize = spec.size;
         int count = spec.count;
