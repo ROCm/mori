@@ -33,6 +33,7 @@
 #include <thread>
 #include <vector>
 
+#include "umbp/common/config.h"
 #include "umbp/common/types.h"
 #include "umbp/distributed/routing/route_put_strategy.h"
 
@@ -47,13 +48,6 @@ struct RouteGetResult {
   std::string peer_address;
   std::vector<uint8_t> engine_desc_bytes;
   std::vector<uint8_t> dram_memory_desc_bytes;
-};
-
-struct MasterClientConfig {
-  std::string master_address;
-  std::string node_id;
-  std::string node_address;
-  bool auto_heartbeat = true;
 };
 
 class MasterClient {

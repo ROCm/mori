@@ -28,6 +28,8 @@
 
 #include "storage_io_driver_impl.h"
 
+namespace mori::umbp {
+
 namespace {
 
 IoStatus ErrnoIoStatus(const std::string& message) {
@@ -77,3 +79,5 @@ class PosixStorageIoDriver final : public StorageIoDriver {
 std::unique_ptr<StorageIoDriver> CreatePosixStorageIoDriver() {
   return std::make_unique<PosixStorageIoDriver>();
 }
+
+}  // namespace mori::umbp

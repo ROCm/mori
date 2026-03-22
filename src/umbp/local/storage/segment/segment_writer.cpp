@@ -21,7 +21,7 @@
 // SOFTWARE.
 #include "umbp/local/storage/segment/segment_writer.h"
 
-namespace segment {
+namespace mori::umbp::segment {
 
 bool Writer::Prepare(const std::string& key, const void* data, size_t size, Meta* segment_meta,
                      Index& index, PreparedRecord* out) const {
@@ -71,4 +71,4 @@ IoStatus Writer::WriteRecords(int fd, const std::vector<PreparedRecord>& records
   return IoStatus::Ok();
 }
 
-}  // namespace segment
+}  // namespace mori::umbp::segment

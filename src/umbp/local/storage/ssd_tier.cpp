@@ -34,6 +34,8 @@
 
 namespace fs = std::filesystem;
 
+namespace mori::umbp {
+
 SSDTier::SSDTier(const std::string& dir, size_t capacity, const UMBPConfig& config,
                  SSDAccessMode access_mode)
     : TierBackend(StorageTier::LOCAL_SSD),
@@ -487,3 +489,5 @@ std::vector<std::string> SSDTier::GetLRUCandidates(size_t max_candidates) const 
   std::lock_guard<std::mutex> lock(mu_);
   return index_.GetLRUCandidates(max_candidates);
 }
+
+}  // namespace mori::umbp

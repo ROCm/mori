@@ -34,6 +34,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "umbp/common/config.h"
 #include "umbp/common/types.h"
 
 namespace mori::umbp {
@@ -52,12 +53,6 @@ struct ClientIOInfo {
   std::string peer_address;
   std::vector<uint8_t> engine_desc_bytes;
   std::vector<uint8_t> dram_memory_desc_bytes;
-};
-
-struct ClientRegistryConfig {
-  std::chrono::seconds heartbeat_ttl{10};
-  std::chrono::seconds reaper_interval{5};
-  uint32_t max_missed_heartbeats = 3;
 };
 
 class ClientRegistry {

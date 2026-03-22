@@ -29,6 +29,7 @@
 namespace py = pybind11;
 
 namespace mori {
+using namespace umbp;
 void RegisterMoriUmbp(py::module_& m) {
   py::enum_<UMBPRole>(m, "UMBPRole")
       .value("Standalone", UMBPRole::Standalone)

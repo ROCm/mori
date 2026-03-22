@@ -33,37 +33,12 @@
 #include <vector>
 
 #include "mori/io/engine.hpp"
+#include "umbp/common/config.h"
 #include "umbp/common/types.h"
 #include "umbp/distributed/master/master_client.h"
 #include "umbp/distributed/peer/peer_service.h"
 
 namespace mori::umbp {
-
-struct ExportableDram {
-  void* buffer = nullptr;
-  size_t size = 0;
-};
-
-struct ExportableSsd {
-  std::string dir;
-  size_t capacity = 0;
-};
-
-struct PoolClientConfig {
-  MasterClientConfig master_config;
-
-  std::string io_engine_host;
-  uint16_t io_engine_port = 0;
-
-  size_t staging_buffer_size = 64ULL * 1024 * 1024;
-
-  std::vector<ExportableDram> dram_buffers;
-  std::vector<ExportableSsd> ssd_stores;
-
-  std::map<TierType, TierCapacity> tier_capacities;
-
-  uint16_t peer_service_port = 0;
-};
 
 class PoolClient {
  public:
