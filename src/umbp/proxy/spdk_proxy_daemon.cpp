@@ -346,28 +346,52 @@ static void ProcessBatchRequest(SpdkSsdTier& tier,
 
     if (type == RequestType::BATCH_WRITE) {
         std::vector<std::string> keys(count);
-        std::vector<const void*> cptrs(count);
         std::vector<size_t> sizes(count);
         std::vector<size_t> shm_offsets(count);
         for (uint32_t i = 0; i < count; ++i) {
             auto& e = desc->entries[i];
             keys[i] = std::string(e.key, e.key_len);
-            cptrs[i] = data_base + e.data_offset;
             sizes[i] = e.data_size;
             shm_offsets[i] = e.data_offset;
         }
 
+        // Determine data source: ring buffer (client wrote there) or data_region.
+        auto* hdr = shm.Header();
+        uint64_t ring_write_base = desc->ring_data_base;
+        char* src_base = nullptr;
+        bool use_ring_write = false;
+
+        if (ring_write_base != 0) {
+            auto* ctrl = GetCacheRingControl(shm.Base(), hdr);
+            if (ctrl) {
+                char* ring_data = GetCacheRingData(shm.Base(), hdr);
+                uint64_t cap = ctrl->capacity;
+                src_base = ring_data + static_cast<size_t>(ring_write_base % cap);
+                use_ring_write = true;
+            }
+        }
+        if (!src_base) src_base = data_base;
+
+        std::vector<const void*> cptrs(count);
+        for (uint32_t i = 0; i < count; ++i)
+            cptrs[i] = src_base + desc->entries[i].data_offset;
+
         if (write_back && wb_out) {
-            // Write-Back fast path: ShmCache + results + stage data to heap.
-            // The caller pushes the staged task to a background flush queue,
-            // then immediately releases the rank (batch_inflight=false).
-            // NVMe persistence runs asynchronously; Flush() drains the queue.
             uint64_t total = desc->total_data_size;
             while (desc->bytes_ready.load(std::memory_order_acquire) < total)
                 ;
-            for (uint32_t i = 0; i < count; ++i) {
-                WriteShmCache(shm, keys[i], cptrs[i], sizes[i]);
-                desc->entries[i].result = 1;
+
+            if (use_ring_write) {
+                for (uint32_t i = 0; i < count; ++i) {
+                    UpdateRingCacheIndex(shm, keys[i],
+                        ring_write_base + desc->entries[i].data_offset, sizes[i]);
+                    desc->entries[i].result = 1;
+                }
+            } else {
+                for (uint32_t i = 0; i < count; ++i) {
+                    WriteShmCache(shm, keys[i], cptrs[i], sizes[i]);
+                    desc->entries[i].result = 1;
+                }
             }
 
             wb_out->keys = std::move(keys);
@@ -382,20 +406,33 @@ static void ProcessBatchRequest(SpdkSsdTier& tier,
                 wb_out->ptrs[i] = wb_out->staged_bufs[i].data();
             }
         } else {
-            // Write-Through: NVMe write + parallel ShmCache population
-            std::thread shm_cache_thread([&shm, &keys, &cptrs, &sizes, count, desc]() {
-                uint64_t total = desc->total_data_size;
-                while (desc->bytes_ready.load(std::memory_order_acquire) < total)
-                    ;
-                for (uint32_t i = 0; i < count; ++i)
-                    WriteShmCache(shm, keys[i], cptrs[i], sizes[i]);
-            });
+            // Write-Through: NVMe write, then update cache index.
+            // When data is in ring, shm_cache_thread is unnecessary — just
+            // update the index after NVMe write completes.
+            std::thread shm_cache_thread;
+            if (!use_ring_write) {
+                shm_cache_thread = std::thread([&shm, &keys, &cptrs, &sizes, count, desc]() {
+                    uint64_t total = desc->total_data_size;
+                    while (desc->bytes_ready.load(std::memory_order_acquire) < total)
+                        ;
+                    for (uint32_t i = 0; i < count; ++i)
+                        WriteShmCache(shm, keys[i], cptrs[i], sizes[i]);
+                });
+            }
 
             auto results = tier.BatchWriteStreaming(
                 keys, cptrs, sizes, &desc->bytes_ready, shm_offsets,
                 dma_bufs, dma_count);
 
-            shm_cache_thread.join();
+            if (shm_cache_thread.joinable())
+                shm_cache_thread.join();
+
+            if (use_ring_write) {
+                for (uint32_t i = 0; i < count; ++i)
+                    if (results[i])
+                        UpdateRingCacheIndex(shm, keys[i],
+                            ring_write_base + desc->entries[i].data_offset, sizes[i]);
+            }
 
             int write_ok = 0;
             for (uint32_t i = 0; i < count; ++i) {
@@ -779,7 +816,7 @@ int main(int argc, char** argv) {
     std::string nvme_pci = getenv_str("UMBP_SPDK_NVME_PCI", "");
     std::string nvme_ctrl = getenv_str("UMBP_SPDK_NVME_CTRL", "NVMe0");
     std::string bdev_name = getenv_str("UMBP_SPDK_BDEV", "");
-    std::string reactor_mask = getenv_str("UMBP_SPDK_REACTOR_MASK", "0x3");
+    std::string reactor_mask = getenv_str("UMBP_SPDK_REACTOR_MASK", "0xF");
     int mem_mb = getenv_int("UMBP_SPDK_MEM_MB", 4096);
     int io_workers = getenv_int("UMBP_SPDK_IO_WORKERS", 4);
     size_t ssd_cap = getenv_size("UMBP_SSD_CAPACITY", 0);

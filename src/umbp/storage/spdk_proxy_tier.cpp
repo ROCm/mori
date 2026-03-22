@@ -369,6 +369,23 @@ std::vector<bool> SpdkProxyTier::SubmitBatch(
             data_cursor += aligned;
         }
 
+        // For BATCH_WRITE: try to allocate ring space before submitting
+        // the slot so that daemon sees ring_data_base on first access.
+        char* write_target = data_base;
+        if (type == RequestType::BATCH_WRITE) {
+            auto* wr_hdr = shm_.Header();
+            auto* wr_ctrl = GetCacheRingControl(shm_.Base(), wr_hdr);
+            if (wr_ctrl) {
+                uint64_t rbase = AllocRingContiguous(wr_ctrl, total_data);
+                if (rbase != UINT64_MAX) {
+                    char* ring_data = GetCacheRingData(shm_.Base(), wr_hdr);
+                    uint64_t cap = wr_ctrl->capacity;
+                    write_target = ring_data + static_cast<size_t>(rbase % cap);
+                    desc->ring_data_base = rbase;
+                }
+            }
+        }
+
         // Submit ring slot
         auto* ch = shm_.Channel(rank_id_);
         uint32_t h = ch->head.load(std::memory_order_relaxed);
@@ -397,14 +414,12 @@ std::vector<bool> SpdkProxyTier::SubmitBatch(
         ch->head.store((h + 1) % kRingSize, std::memory_order_release);
 
         if (type == RequestType::BATCH_WRITE) {
-            // STREAMING WRITE: copy data in 2MB chunks, update bytes_ready
-            // so daemon can start NVMe writes before the full item is copied.
             constexpr size_t kCopyChunk = 2ULL * 1024 * 1024;
             for (int i = 0; i < sub_count; ++i) {
                 int gi = base + i;
                 if (!data_ptrs.empty() && data_ptrs[gi] != nullptr) {
                     const char* src = static_cast<const char*>(data_ptrs[gi]);
-                    char* dst = data_base + desc->entries[i].data_offset;
+                    char* dst = write_target + desc->entries[i].data_offset;
                     size_t item_sz = sizes[gi];
                     size_t copied = 0;
                     while (copied < item_sz) {
