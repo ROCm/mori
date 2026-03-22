@@ -26,6 +26,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <stdexcept>
@@ -101,24 +102,44 @@ bool SSDTier::Write(const std::string& key, const void* data, size_t size) {
     return false;
   }
 
-  // Atomic write: write to .tmp then rename, so followers never see partial files
   std::string path = KeyToPath(key);
   std::string tmp_path = path + ".tmp";
-  int fd = open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  int oflags = O_WRONLY | O_CREAT | O_TRUNC;
+#ifdef __linux__
+  if (direct_io_) oflags |= O_DIRECT;
+#endif
+  int fd = open(tmp_path.c_str(), oflags, 0644);
   if (fd < 0) return false;
 
-  size_t written = 0;
-  while (written < size) {
-    ssize_t n = ::write(fd, static_cast<const char*>(data) + written, size - written);
-    if (n < 0) {
-      close(fd);
-      std::remove(tmp_path.c_str());
-      return false;
+  static constexpr size_t kAlign = 4096;
+  bool ok = true;
+  if (direct_io_) {
+    size_t aligned_sz = (size + kAlign - 1) & ~(kAlign - 1);
+    void* abuf = nullptr;
+    if (posix_memalign(&abuf, kAlign, aligned_sz) != 0) { close(fd); std::remove(tmp_path.c_str()); return false; }
+    std::memcpy(abuf, data, size);
+    if (aligned_sz > size) std::memset(static_cast<char*>(abuf) + size, 0, aligned_sz - size);
+    size_t written = 0;
+    while (written < aligned_sz) {
+      ssize_t n = ::write(fd, static_cast<char*>(abuf) + written, aligned_sz - written);
+      if (n < 0) { ok = false; break; }
+      written += n;
     }
-    written += n;
+    free(abuf);
+    if (ok) {
+      // Truncate to actual size (O_DIRECT wrote rounded-up bytes)
+      if (ftruncate(fd, static_cast<off_t>(size)) < 0) ok = false;
+    }
+  } else {
+    size_t written = 0;
+    while (written < size) {
+      ssize_t n = ::write(fd, static_cast<const char*>(data) + written, size - written);
+      if (n < 0) { ok = false; break; }
+      written += n;
+    }
   }
-  // Flush data to disk before rename so followers see complete content
-  // once the file appears under its final name.
+
+  if (!ok) { close(fd); std::remove(tmp_path.c_str()); return false; }
   fsync(fd);
   close(fd);
 
@@ -141,18 +162,41 @@ bool SSDTier::Write(const std::string& key, const void* data, size_t size) {
   return true;
 }
 
+// O_DIRECT helper: read entire file using aligned bounce buffer.
+static bool PreadDirect(int fd, char* dst, size_t size) {
+  static constexpr size_t kAlign = 4096;
+  size_t aligned_sz = (size + kAlign - 1) & ~(kAlign - 1);
+  void* buf = nullptr;
+  if (posix_memalign(&buf, kAlign, aligned_sz) != 0) return false;
+
+  size_t total = 0;
+  while (total < aligned_sz) {
+    size_t chunk = std::min(aligned_sz - total, static_cast<size_t>(128ULL * 1024 * 1024));
+    size_t chunk_aligned = (chunk + kAlign - 1) & ~(kAlign - 1);
+    ssize_t n = pread(fd, static_cast<char*>(buf) + total, chunk_aligned,
+                      static_cast<off_t>(total));
+    if (n <= 0) { free(buf); return false; }
+    total += static_cast<size_t>(n);
+  }
+  std::memcpy(dst, buf, size);
+  free(buf);
+  return true;
+}
+
 bool SSDTier::ReadIntoPtr(const std::string& key, uintptr_t dst_ptr, size_t size) {
   std::lock_guard<std::mutex> lock(mu_);
+  int oflags = O_RDONLY;
+#ifdef __linux__
+  if (direct_io_) oflags |= O_DIRECT;
+#endif
 
   auto it = keys_.find(key);
   if (it != keys_.end()) {
-    // Fast path: key tracked locally
     if (size != it->second) return false;
 
     std::string path = KeyToPath(key);
-    int fd = open(path.c_str(), O_RDONLY);
+    int fd = open(path.c_str(), oflags);
     if (fd < 0) {
-      // File disappeared; drop local tracking to avoid permanent false positives.
       used_ = SaturatingSub(used_, it->second);
       keys_.erase(it);
       auto lru_it = lru_map_.find(key);
@@ -163,24 +207,31 @@ bool SSDTier::ReadIntoPtr(const std::string& key, uintptr_t dst_ptr, size_t size
       return false;
     }
 
-    size_t total_read = 0;
-    while (total_read < size) {
-      ssize_t n =
-          pread(fd, reinterpret_cast<char*>(dst_ptr) + total_read, size - total_read, total_read);
-      if (n <= 0) {
-        close(fd);
-        used_ = SaturatingSub(used_, it->second);
-        keys_.erase(key);
-        auto lru_it = lru_map_.find(key);
-        if (lru_it != lru_map_.end()) {
-          lru_list_.erase(lru_it->second);
-          lru_map_.erase(lru_it);
-        }
-        return false;
+    bool ok;
+    if (direct_io_) {
+      ok = PreadDirect(fd, reinterpret_cast<char*>(dst_ptr), size);
+    } else {
+      ok = true;
+      size_t total_read = 0;
+      while (total_read < size) {
+        ssize_t n = pread(fd, reinterpret_cast<char*>(dst_ptr) + total_read,
+                          size - total_read, total_read);
+        if (n <= 0) { ok = false; break; }
+        total_read += n;
       }
-      total_read += n;
     }
     close(fd);
+
+    if (!ok) {
+      used_ = SaturatingSub(used_, it->second);
+      keys_.erase(key);
+      auto lru_it = lru_map_.find(key);
+      if (lru_it != lru_map_.end()) {
+        lru_list_.erase(lru_it->second);
+        lru_map_.erase(lru_it);
+      }
+      return false;
+    }
 
     TouchLRU(key);
     return true;
@@ -190,7 +241,7 @@ bool SSDTier::ReadIntoPtr(const std::string& key, uintptr_t dst_ptr, size_t size
   if (!IsReadOnlyShared()) return false;
 
   std::string path = KeyToPath(key);
-  int fd = open(path.c_str(), O_RDONLY);
+  int fd = open(path.c_str(), oflags);
   if (fd < 0) return false;
 
   struct stat st;
@@ -199,20 +250,22 @@ bool SSDTier::ReadIntoPtr(const std::string& key, uintptr_t dst_ptr, size_t size
     return false;
   }
 
-  size_t total_read = 0;
-  while (total_read < size) {
-    ssize_t n =
-        pread(fd, reinterpret_cast<char*>(dst_ptr) + total_read, size - total_read, total_read);
-    if (n <= 0) {
-      close(fd);
-      return false;
+  bool ok;
+  if (direct_io_) {
+    ok = PreadDirect(fd, reinterpret_cast<char*>(dst_ptr), size);
+  } else {
+    ok = true;
+    size_t total_read = 0;
+    while (total_read < size) {
+      ssize_t n = pread(fd, reinterpret_cast<char*>(dst_ptr) + total_read,
+                        size - total_read, total_read);
+      if (n <= 0) { ok = false; break; }
+      total_read += n;
     }
-    total_read += n;
   }
   close(fd);
+  if (!ok) return false;
 
-  // Register in local map for future fast-path lookups.
-  // Do not increment used_ — disk space is owned by leader.
   keys_[key] = size;
   TouchLRU(key);
   return true;
@@ -220,14 +273,16 @@ bool SSDTier::ReadIntoPtr(const std::string& key, uintptr_t dst_ptr, size_t size
 
 std::vector<char> SSDTier::Read(const std::string& key) {
   std::lock_guard<std::mutex> lock(mu_);
+  int oflags = O_RDONLY;
+#ifdef __linux__
+  if (direct_io_) oflags |= O_DIRECT;
+#endif
 
   auto it = keys_.find(key);
   if (it != keys_.end()) {
-    // Fast path: known key
     std::string path = KeyToPath(key);
-    int fd = open(path.c_str(), O_RDONLY);
+    int fd = open(path.c_str(), oflags);
     if (fd < 0) {
-      // File disappeared; drop local tracking to avoid permanent false positives.
       used_ = SaturatingSub(used_, it->second);
       keys_.erase(it);
       auto lru_it = lru_map_.find(key);
@@ -240,23 +295,30 @@ std::vector<char> SSDTier::Read(const std::string& key) {
 
     size_t file_size = it->second;
     std::vector<char> buf(file_size);
-    size_t total_read = 0;
-    while (total_read < file_size) {
-      ssize_t n = ::read(fd, buf.data() + total_read, file_size - total_read);
-      if (n <= 0) {
-        close(fd);
-        used_ = SaturatingSub(used_, it->second);
-        keys_.erase(key);
-        auto lru_it = lru_map_.find(key);
-        if (lru_it != lru_map_.end()) {
-          lru_list_.erase(lru_it->second);
-          lru_map_.erase(lru_it);
-        }
-        return {};
+    bool ok;
+    if (direct_io_) {
+      ok = PreadDirect(fd, buf.data(), file_size);
+    } else {
+      ok = true;
+      size_t total_read = 0;
+      while (total_read < file_size) {
+        ssize_t n = ::read(fd, buf.data() + total_read, file_size - total_read);
+        if (n <= 0) { ok = false; break; }
+        total_read += n;
       }
-      total_read += n;
     }
     close(fd);
+
+    if (!ok) {
+      used_ = SaturatingSub(used_, it->second);
+      keys_.erase(key);
+      auto lru_it = lru_map_.find(key);
+      if (lru_it != lru_map_.end()) {
+        lru_list_.erase(lru_it->second);
+        lru_map_.erase(lru_it);
+      }
+      return {};
+    }
 
     TouchLRU(key);
     return buf;
@@ -266,7 +328,7 @@ std::vector<char> SSDTier::Read(const std::string& key) {
   if (!IsReadOnlyShared()) return {};
 
   std::string path = KeyToPath(key);
-  int fd = open(path.c_str(), O_RDONLY);
+  int fd = open(path.c_str(), oflags);
   if (fd < 0) return {};
 
   struct stat st;
@@ -277,16 +339,20 @@ std::vector<char> SSDTier::Read(const std::string& key) {
 
   size_t file_size = static_cast<size_t>(st.st_size);
   std::vector<char> buf(file_size);
-  size_t total_read = 0;
-  while (total_read < file_size) {
-    ssize_t n = ::read(fd, buf.data() + total_read, file_size - total_read);
-    if (n <= 0) {
-      close(fd);
-      return {};
+  bool ok;
+  if (direct_io_) {
+    ok = PreadDirect(fd, buf.data(), file_size);
+  } else {
+    ok = true;
+    size_t total_read = 0;
+    while (total_read < file_size) {
+      ssize_t n = ::read(fd, buf.data() + total_read, file_size - total_read);
+      if (n <= 0) { ok = false; break; }
+      total_read += n;
     }
-    total_read += n;
   }
   close(fd);
+  if (!ok) return {};
 
   keys_[key] = file_size;
   TouchLRU(key);

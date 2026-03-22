@@ -60,6 +60,7 @@ class SSDTier : public TierBackend {
   std::vector<char> Read(const std::string& key) override;
   std::string GetLRUKey() const override;
   std::vector<std::string> GetLRUCandidates(size_t max_candidates) const override;
+  void SetColdRead(bool enable) override { direct_io_ = enable; }
 
  private:
   std::string dir_;
@@ -75,4 +76,5 @@ class SSDTier : public TierBackend {
   bool FileExistsOnDisk(const std::string& key) const;
   void TouchLRU(const std::string& key);
   void EvictLRU();
+  bool direct_io_ = false;  // SetColdRead(true): O_DIRECT bypass page cache
 };

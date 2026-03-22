@@ -93,6 +93,10 @@ class TierBackend {
   // SpdkProxyTier overrides this to drain pending write-back NVMe flushes.
   virtual bool Flush() { return true; }
 
+  // Toggle cold-read mode: bypass all caches, read directly from storage.
+  // SSDTier: O_DIRECT; SpdkProxyTier: skip ring buffer cache.
+  virtual void SetColdRead(bool /*enable*/) {}
+
   // Which StorageTier does this backend represent?
   StorageTier tier_id() const { return tier_id_; }
 

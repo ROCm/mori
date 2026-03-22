@@ -116,18 +116,12 @@ SpdkProxyTier::SpdkProxyTier(const UMBPConfig& config)
 
     connected_ = true;
 
-    // Cold-read mode: skip ring cache lookup, every read hits NVMe.
-    const char* cold_env = std::getenv("UMBP_SPDK_COLD_READ");
-    cold_read_ = (cold_env && std::string(cold_env) == "1");
-
     UMBP_LOG_INFO("SpdkProxyTier: connected rank=%u shm='%s' "
-                  "bdev_size=%zuMB block_size=%u data_region=%zuMB "
-                  "cold_read=%s",
+                  "bdev_size=%zuMB block_size=%u data_region=%zuMB",
                   rank_id_, shm_name.c_str(),
                   static_cast<size_t>(hdr->bdev_size / (1024 * 1024)),
                   hdr->block_size,
-                  static_cast<size_t>(hdr->data_region_per_rank / (1024 * 1024)),
-                  cold_read_ ? "ON" : "OFF");
+                  static_cast<size_t>(hdr->data_region_per_rank / (1024 * 1024)));
 }
 
 SpdkProxyTier::~SpdkProxyTier() {

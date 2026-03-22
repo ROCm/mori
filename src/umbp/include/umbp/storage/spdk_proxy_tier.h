@@ -47,6 +47,7 @@ class SpdkProxyTier : public TierBackend {
     std::vector<std::string> GetLRUCandidates(size_t max_candidates) const override;
 
     bool Flush() override;
+    void SetColdRead(bool enable) override { cold_read_ = enable; }
 
     static bool WaitForProxy(const std::string& shm_name, int timeout_ms);
 
@@ -73,7 +74,7 @@ class SpdkProxyTier : public TierBackend {
     bool TryShmCacheReadOne(const std::string& key, uintptr_t dst, size_t size) const;
 
     bool connected_ = false;
-    bool cold_read_ = false;    // UMBP_SPDK_COLD_READ=1: skip ring cache, always read from NVMe
+    bool cold_read_ = false;    // SetColdRead(true): skip ring cache, always read from NVMe
     uint32_t rank_id_ = 0;
     mutable umbp::proxy::ProxyShmRegion shm_;
     mutable std::mutex submit_mu_;

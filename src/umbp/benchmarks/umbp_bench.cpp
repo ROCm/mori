@@ -158,6 +158,8 @@ static BenchResult RunBatch(UMBPClient& client, int rank_id,
     int best_read_ok = 0;
     int corrupt = 0;
     for (int iter = 0; iter < iterations; ++iter) {
+        ssd->SetColdRead(iter == 0);
+
         for (auto& b : read_bufs) std::memset(b.data(), 0, b.size());
 
         double t0 = NowSec();
@@ -195,6 +197,7 @@ static BenchResult RunBatch(UMBPClient& client, int rank_id,
             }
         }
     }
+    ssd->SetColdRead(false);
 
     return {value_size, count, best_write, first_read, cache_read,
             best_read_ok, corrupt, cold_t0, cold_t1, cache_last_t0, cache_last_t1};
@@ -262,19 +265,7 @@ static BenchResult RunBatchPhased(UMBPClient& client, int rank_id,
             fprintf(stderr, "  [Leader] WARNING: wrote %d/%d read-keys for %zuKB\n",
                     write_ok, count, value_size / 1024);
 
-        // Ensure all write-back NVMe flushes are complete before the barrier
-        // so that Follower reads can find every key in entries_.
         client.Flush();
-
-        // Drop OS page cache if UMBP_DROP_CACHES=1 so that the first
-        // read iteration measures true cold-read from disk (POSIX only).
-        static bool drop_caches = (std::getenv("UMBP_DROP_CACHES") &&
-                                   std::string(std::getenv("UMBP_DROP_CACHES")) == "1");
-        if (drop_caches) {
-            sync();
-            FILE* dc = fopen("/proc/sys/vm/drop_caches", "w");
-            if (dc) { fprintf(dc, "3\n"); fclose(dc); }
-        }
 
         coord->write_gen.store(size_idx + 1, std::memory_order_release);
     }
@@ -294,13 +285,15 @@ static BenchResult RunBatchPhased(UMBPClient& client, int rank_id,
     for (int i = 0; i < count; ++i)
         dst_ptrs[i] = reinterpret_cast<uintptr_t>(read_bufs[i].data());
 
-    double first_read = 0;   // iteration 0: cold read (real business scenario)
+    double first_read = 0;   // iteration 0: cold read (O_DIRECT / bypass cache)
     double cache_read = 0;   // last cache iteration (steady-state)
     double cold_t0 = 0, cold_t1 = 0;
     double cache_last_t0 = 0, cache_last_t1 = 0;
     int best_read_ok = 0;
     int corrupt = 0;
     for (int iter = 0; iter < iterations; ++iter) {
+        ssd->SetColdRead(iter == 0);
+
         if (iter > 0) {
             coord->iter_barrier.fetch_add(1, std::memory_order_acq_rel);
             int sync = (size_idx * (iterations - 1) + iter) * coord->num_ranks;
@@ -345,6 +338,8 @@ static BenchResult RunBatchPhased(UMBPClient& client, int rank_id,
         }
     }
 
+    ssd->SetColdRead(false);
+
     // === BARRIER: all ranks done reading this size ===
     coord->reads_complete.fetch_add(1, std::memory_order_acq_rel);
     int target = (size_idx + 1) * coord->num_ranks;
@@ -368,7 +363,7 @@ static void PrintResults(int rank_id, int num_ranks, const char* role_str,
            rank_id, num_ranks, role_str, backend);
     printf("========================================================\n");
     printf("  %8s  %6s  %10s  %10s  %12s\n",
-           "ValSize", "Count", "Write MB/s", "Read MB/s", "CacheRd MB/s");
+           "ValSize", "Count", "Write MB/s", "ColdRd MB/s", "HotRd MB/s");
 
     for (const auto& r : results) {
         char sz_label[16];
@@ -422,7 +417,7 @@ static int RunBenchmarkProcess(int rank_id, int num_ranks, int pipe_fd,
                            (role == UMBPRole::SharedSSDLeader) ? "Leader" : "Follower";
     const char* backend = cfg.ssd_backend.c_str();
 
-    const int iterations = 3;
+    const int iterations = 2;  // 0=cold (O_DIRECT/bypass cache), 1=hot
 
     std::vector<BenchResult> results;
 
@@ -574,7 +569,7 @@ int main(int argc, char** argv) {
         printf("========================================================\n");
     }
     printf("  %8s  %10s  %10s  %12s\n",
-           "ValSize", "Write MB/s", "Read MB/s", "CacheRd MB/s");
+           "ValSize", "Write MB/s", "ColdRd MB/s", "HotRd MB/s");
     for (size_t s = 0; s < num_specs; ++s) {
         double sum_w = 0;
         double min_cold_t0 = 1e18, max_cold_t1 = 0;
