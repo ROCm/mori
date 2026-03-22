@@ -245,14 +245,31 @@ ResultCode SpdkProxyTier::SubmitAndWait(
     auto& slot = ch->slots[h % kRingSize];
 
     void* data_region = shm_.DataRegion(rank_id_);
+    uint64_t ring_base_for_slot = 0;
+
     if (write_data && write_size > 0) {
-        size_t max_size = shm_.Header()->data_region_per_rank;
-        if (write_size > max_size) {
-            UMBP_LOG_ERROR("SpdkProxyTier: data too large %zu > %zu",
-                           write_size, max_size);
-            return ResultCode::ERROR;
+        // Try ring buffer for single-op WRITE.
+        auto* wr_hdr = shm_.Header();
+        auto* wr_ctrl = GetCacheRingControl(shm_.Base(), wr_hdr);
+        if (wr_ctrl && type == RequestType::WRITE) {
+            uint64_t rbase = AllocRingContiguous(wr_ctrl, write_size);
+            if (rbase != UINT64_MAX) {
+                char* ring_data = GetCacheRingData(shm_.Base(), wr_hdr);
+                uint64_t cap = wr_ctrl->capacity;
+                std::memcpy(ring_data + static_cast<size_t>(rbase % cap),
+                            write_data, write_size);
+                ring_base_for_slot = rbase;
+            }
         }
-        std::memcpy(data_region, write_data, write_size);
+        if (ring_base_for_slot == 0) {
+            size_t max_size = shm_.Header()->data_region_per_rank;
+            if (write_size > max_size) {
+                UMBP_LOG_ERROR("SpdkProxyTier: data too large %zu > %zu",
+                               write_size, max_size);
+                return ResultCode::ERROR;
+            }
+            std::memcpy(data_region, write_data, write_size);
+        }
     }
 
     slot.type = static_cast<uint32_t>(type);
@@ -264,6 +281,7 @@ ResultCode SpdkProxyTier::SubmitAndWait(
     slot.data_size = write_size;
     slot.batch_count = 0;
     slot.flags = 0;
+    slot.ring_data_base = ring_base_for_slot;
 
     slot.state.store(static_cast<uint32_t>(SlotState::PENDING),
                      std::memory_order_release);
@@ -289,7 +307,22 @@ ResultCode SpdkProxyTier::SubmitAndWait(
 
     if (read_buf && slot.result_size > 0 && rc == ResultCode::OK) {
         size_t copy_sz = std::min(static_cast<size_t>(slot.result_size), read_buf_size);
-        std::memcpy(read_buf, data_region, copy_sz);
+        // Read from ring if daemon placed data there, else from data_region.
+        if (slot.ring_data_base != 0) {
+            auto* rd_hdr = shm_.Header();
+            auto* rd_ctrl = GetCacheRingControl(shm_.Base(), rd_hdr);
+            if (rd_ctrl) {
+                const char* ring_data = GetCacheRingData(shm_.Base(), rd_hdr);
+                uint64_t cap = rd_ctrl->capacity;
+                std::memcpy(read_buf,
+                            ring_data + static_cast<size_t>(slot.ring_data_base % cap),
+                            copy_sz);
+            } else {
+                std::memcpy(read_buf, data_region, copy_sz);
+            }
+        } else {
+            std::memcpy(read_buf, data_region, copy_sz);
+        }
     }
 
     slot.state.store(static_cast<uint32_t>(SlotState::EMPTY),

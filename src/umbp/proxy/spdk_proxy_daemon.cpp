@@ -244,30 +244,65 @@ static void ProcessSingleRequest(SpdkSsdTier& tier,
     std::string key(slot.key, slot.key_len);
     auto type = static_cast<RequestType>(slot.type);
 
+    // Resolve data pointer: ring buffer (if client placed data there) or data_region.
+    auto* ring_hdr = shm.Header();
+    auto* ring_ctrl = GetCacheRingControl(shm.Base(), ring_hdr);
+    char* ring_data_ptr = ring_ctrl ? GetCacheRingData(shm.Base(), ring_hdr) : nullptr;
+    uint64_t ring_cap = ring_ctrl ? ring_ctrl->capacity : 0;
+
     switch (type) {
         case RequestType::WRITE: {
-            if (slot.data_size > region_size) {
+            if (slot.data_size > region_size && slot.ring_data_base == 0) {
                 slot.result = static_cast<int32_t>(ResultCode::ERROR);
                 break;
             }
-            bool ok = tier.Write(key, data_region, slot.data_size);
+            const void* src = data_region;
+            if (slot.ring_data_base != 0 && ring_data_ptr) {
+                src = ring_data_ptr + static_cast<size_t>(slot.ring_data_base % ring_cap);
+            }
+            bool ok = tier.Write(key, src, slot.data_size);
             slot.result = ok ? static_cast<int32_t>(ResultCode::OK)
                              : static_cast<int32_t>(ResultCode::NO_SPACE);
-            if (ok)
-                WriteShmCache(shm, key, data_region, slot.data_size);
+            if (ok) {
+                if (slot.ring_data_base != 0 && ring_data_ptr)
+                    UpdateRingCacheIndex(shm, key, slot.ring_data_base, slot.data_size);
+                else
+                    WriteShmCache(shm, key, src, slot.data_size);
+            }
             break;
         }
         case RequestType::READ: {
             size_t max_read = std::min(static_cast<size_t>(slot.data_size),
                                        region_size);
             if (max_read == 0) max_read = region_size;
-            auto dst = reinterpret_cast<uintptr_t>(data_region);
+
+            // Try reading directly into ring buffer for cache + client read.
+            bool use_ring_read = false;
+            uint64_t read_ring_base = 0;
+            uintptr_t dst;
+            if (ring_ctrl) {
+                read_ring_base = AllocRingContiguous(ring_ctrl, max_read);
+                if (read_ring_base != UINT64_MAX) {
+                    dst = reinterpret_cast<uintptr_t>(
+                        ring_data_ptr + static_cast<size_t>(read_ring_base % ring_cap));
+                    use_ring_read = true;
+                }
+            }
+            if (!use_ring_read)
+                dst = reinterpret_cast<uintptr_t>(data_region);
+
             bool ok = tier.ReadIntoPtr(key, dst, max_read);
             slot.result = ok ? static_cast<int32_t>(ResultCode::OK)
                              : static_cast<int32_t>(ResultCode::NOT_FOUND);
             if (ok) {
                 slot.result_size = max_read;
-                WriteShmCache(shm, key, data_region, max_read);
+                if (use_ring_read) {
+                    slot.ring_data_base = read_ring_base;
+                    UpdateRingCacheIndex(shm, key, read_ring_base, max_read);
+                } else {
+                    slot.ring_data_base = 0;
+                    WriteShmCache(shm, key, reinterpret_cast<void*>(dst), max_read);
+                }
             }
             break;
         }

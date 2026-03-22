@@ -114,6 +114,11 @@ struct alignas(64) RingSlot {
     uint32_t flags;                 // reserved
     uint32_t batch_count;           // for BATCH_WRITE/READ: number of entries
 
+    // Ring buffer data offset — shared by request (WRITE) and response (READ).
+    // Non-zero: bulk data lives in ring buffer at this absolute offset.
+    // Zero (default): bulk data lives in the rank's data_region.
+    uint64_t ring_data_base;
+
     // Response fields (written by proxy, read by rank)
     int32_t result;                 // ResultCode
     uint64_t result_size;           // for READ: actual bytes written to data region
