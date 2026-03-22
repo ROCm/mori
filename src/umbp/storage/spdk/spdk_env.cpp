@@ -360,10 +360,11 @@ int SpdkEnv::Init(const SpdkEnvConfig &config) {
             }
 
             if (use_raid) {
-                // UMBP_SPDK_RAID_STRIP_KB: strip size in KB (default 2048 = 2MB).
-                // Larger strips reduce sub-I/O count for large sequential workloads.
+                // UMBP_SPDK_RAID_STRIP_KB: strip size in KB (default 128).
+                // 128KB balances per-disk parallelism (both disks active per I/O)
+                // with manageable sub-I/O count (16 per 2MB DMA chunk).
                 const char* strip_env = std::getenv("UMBP_SPDK_RAID_STRIP_KB");
-                int strip_kb = strip_env ? std::atoi(strip_env) : 2048;
+                int strip_kb = strip_env ? std::atoi(strip_env) : 128;
                 if (strip_kb < 4) strip_kb = 4;
 
                 fprintf(f,
