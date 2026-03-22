@@ -23,6 +23,9 @@
 
 #include <stdexcept>
 
+#include "mori/utils/mori_log.hpp"
+#include "umbp/distributed/pool_client.h"
+
 namespace mori::umbp {
 
 UMBPConfig UMBPClient::NormalizeConfig(const UMBPConfig& config) {
@@ -40,9 +43,41 @@ UMBPConfig UMBPClient::NormalizeConfig(const UMBPConfig& config) {
 UMBPClient::UMBPClient(const UMBPConfig& config)
     : config_(NormalizeConfig(config)), role_(config_.ResolveRole()), storage_(config_, &index_) {
   copy_pipeline_ = std::make_unique<CopyPipeline>(storage_, config_.copy_pipeline, role_);
+
+  // Phase 1: connect to Master and start heartbeat. No delegation, no DRAM/SSD
+  // export, no changes to Put/Get/Remove yet.
+  if (config_.distributed.has_value()) {
+    const auto& dist = config_.distributed.value();
+
+    PoolClientConfig pc_config;
+    pc_config.master_config.master_address = dist.master_address;
+    pc_config.master_config.node_id = dist.node_id;
+    pc_config.master_config.node_address = dist.node_address;
+    pc_config.master_config.auto_heartbeat = dist.auto_heartbeat;
+    pc_config.io_engine_host = dist.io_engine_host;
+    pc_config.io_engine_port = dist.io_engine_port;
+    pc_config.staging_buffer_size = dist.staging_buffer_size;
+    pc_config.peer_service_port = dist.peer_service_port;
+    // dram_buffers, ssd_stores, and tier_capacities are left empty for Phase 1.
+    // Phase 2 will export DramTier buffer and SSD stores to PoolClient.
+
+    pool_client_ = std::make_unique<PoolClient>(std::move(pc_config));
+    if (!pool_client_->Init()) {
+      MORI_ERROR(mori::modules::UMBP,
+                 "PoolClient init failed for node '{}', falling back to local mode", dist.node_id);
+      pool_client_.reset();
+    }
+  }
 }
 
-UMBPClient::~UMBPClient() = default;
+UMBPClient::~UMBPClient() {
+  // Shut down PoolClient before storage_/index_ are destroyed, since later
+  // phases will give PoolClient pointers into those members.
+  if (pool_client_) {
+    pool_client_->Shutdown();
+    pool_client_.reset();
+  }
+}
 
 bool UMBPClient::Put(const std::string& key, const void* data, size_t size) {
   if (role_ == UMBPRole::SharedSSDFollower) return false;
@@ -277,5 +312,7 @@ void UMBPClient::Clear() {
 mori::umbp::LocalBlockIndex& UMBPClient::Index() { return index_; }
 
 LocalStorageManager& UMBPClient::Storage() { return storage_; }
+
+bool UMBPClient::IsDistributed() const { return pool_client_ != nullptr; }
 
 }  // namespace mori::umbp

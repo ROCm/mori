@@ -183,9 +183,15 @@ if(NOT EXISTS "${_PROTOBUF_COMPAT_DIR}/google")
 endif()
 target_include_directories(umbp_common BEFORE PUBLIC "${_PROTOBUF_COMPAT_DIR}")
 
-target_link_libraries(umbp_common PUBLIC mori_logging mori_io)
+target_link_libraries(umbp_common PUBLIC mori_logging mori_io ${_PROTOBUF_LIBS}
+                                         ${_GRPCPP_LIB})
 
 target_compile_features(umbp_common PUBLIC cxx_std_17)
+
+# Link umbp_core → umbp_common so that UMBPClient can construct PoolClient when
+# distributed mode is enabled. The distributed code is linked but not activated
+# unless UMBPConfig::distributed is set at runtime.
+target_link_libraries(umbp_core PUBLIC umbp_common)
 
 # ---------- Master executable -------------------------------------------------
 

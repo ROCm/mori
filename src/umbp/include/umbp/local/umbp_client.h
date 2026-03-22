@@ -34,6 +34,8 @@
 
 namespace mori::umbp {
 
+class PoolClient;  // forward declaration — full include in .cpp only
+
 class UMBPClient {
  public:
   explicit UMBPClient(const UMBPConfig& config = UMBPConfig{});
@@ -70,6 +72,9 @@ class UMBPClient {
   mori::umbp::LocalBlockIndex& Index();
   LocalStorageManager& Storage();
 
+  // Returns true when distributed mode is active (PoolClient connected to Master).
+  bool IsDistributed() const;
+
  private:
   static UMBPConfig NormalizeConfig(const UMBPConfig& config);
 
@@ -78,6 +83,7 @@ class UMBPClient {
   mori::umbp::LocalBlockIndex index_;
   LocalStorageManager storage_;
   std::unique_ptr<CopyPipeline> copy_pipeline_;
+  std::unique_ptr<PoolClient> pool_client_;  // non-null iff distributed mode
 };
 
 }  // namespace mori::umbp

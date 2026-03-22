@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -94,6 +95,25 @@ struct UMBPCopyPipelineConfig {
   size_t batch_max_ops = 128;
 };
 
+// User-facing distributed configuration. Set UMBPConfig::distributed to enable
+// distributed mode. Internally translated to PoolClientConfig by UMBPClient.
+struct UMBPDistributedConfig {
+  std::string master_address;  // e.g. "master-host:50051"
+  std::string node_id;         // unique node identifier
+  std::string node_address;    // this node's reachable address for peers
+
+  bool auto_heartbeat = true;  // start heartbeat thread on Init
+
+  std::string io_engine_host;   // RDMA engine hostname
+  uint16_t io_engine_port = 0;  // RDMA engine port (0 = no RDMA)
+
+  size_t staging_buffer_size = 64ULL * 1024 * 1024;  // 64 MB
+
+  uint16_t peer_service_port = 0;  // gRPC peer service port
+
+  bool cache_remote_fetches = true;  // cache remotely-fetched blocks locally
+};
+
 struct UMBPConfig {
   UMBPDramConfig dram;
   UMBPSsdConfig ssd;
@@ -107,6 +127,11 @@ struct UMBPConfig {
   // New code should set `role` instead.
   bool follower_mode = false;
   bool force_ssd_copy_on_write = false;
+
+  // Optional distributed mode. When set, UMBPClient creates an internal
+  // PoolClient that connects to the Master and sends periodic heartbeats.
+  // nullopt (default) = local-only mode with no network dependencies.
+  std::optional<UMBPDistributedConfig> distributed;
 
   UMBPRole ResolveRole() const {
     if (role != UMBPRole::Standalone) {
@@ -147,6 +172,21 @@ struct UMBPConfig {
     if (copy_pipeline.batch_max_ops == 0) {
       if (error_message) *error_message = "copy_pipeline.batch_max_ops must be > 0";
       return false;
+    }
+    if (distributed.has_value()) {
+      const auto& d = distributed.value();
+      if (d.master_address.empty()) {
+        if (error_message) *error_message = "distributed.master_address must not be empty";
+        return false;
+      }
+      if (d.node_id.empty()) {
+        if (error_message) *error_message = "distributed.node_id must not be empty";
+        return false;
+      }
+      if (d.node_address.empty()) {
+        if (error_message) *error_message = "distributed.node_address must not be empty";
+        return false;
+      }
     }
     return true;
   }
