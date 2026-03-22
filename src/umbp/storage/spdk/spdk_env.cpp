@@ -10,6 +10,8 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
+#include <sstream>
+#include <vector>
 
 extern "C" {
 #include "spdk/bdev.h"
@@ -287,9 +289,25 @@ int SpdkEnv::Init(const SpdkEnvConfig &config) {
     }
 
     config_ = config;
-    if (config_.bdev_name.empty() && !config_.nvme_pci_addr.empty()) {
-        config_.bdev_name = config_.nvme_ctrl_name + "n1";
+
+    // Parse comma-separated PCI addresses for multi-disk support.
+    std::vector<std::string> pci_addrs;
+    if (!config_.nvme_pci_addr.empty()) {
+        std::istringstream ss(config_.nvme_pci_addr);
+        std::string addr;
+        while (std::getline(ss, addr, ',')) {
+            if (!addr.empty()) pci_addrs.push_back(addr);
+        }
     }
+
+    bool use_raid = pci_addrs.size() > 1;
+    if (config_.bdev_name.empty()) {
+        if (use_raid)
+            config_.bdev_name = "Raid0";
+        else if (!pci_addrs.empty())
+            config_.bdev_name = config_.nvme_ctrl_name + "n1";
+    }
+
     init_complete_ = false;
     init_result_ = -1;
 
@@ -317,30 +335,57 @@ int SpdkEnv::Init(const SpdkEnvConfig &config) {
                 config_.malloc_block_size);
             fclose(f);
         }
-    } else if (!config_.nvme_pci_addr.empty()) {
+    } else if (!pci_addrs.empty()) {
         json_path = "/tmp/umbp_spdk_nvme_bdev.json";
         FILE *f = fopen(json_path.c_str(), "w");
         if (f) {
-            fprintf(f,
-                "{\n"
-                "  \"subsystems\": [{\n"
-                "    \"subsystem\": \"bdev\",\n"
-                "    \"config\": [{\n"
-                "      \"method\": \"bdev_nvme_attach_controller\",\n"
-                "      \"params\": {\n"
-                "        \"name\": \"%s\",\n"
-                "        \"trtype\": \"PCIe\",\n"
-                "        \"traddr\": \"%s\"\n"
-                "      }\n"
-                "    }]\n"
-                "  }]\n"
-                "}\n",
-                config_.nvme_ctrl_name.c_str(),
-                config_.nvme_pci_addr.c_str());
+            fprintf(f, "{\n  \"subsystems\": [{\n    \"subsystem\": \"bdev\",\n    \"config\": [\n");
+
+            // Attach each NVMe controller.
+            for (size_t i = 0; i < pci_addrs.size(); ++i) {
+                std::string ctrl = "NVMe" + std::to_string(i);
+                fprintf(f,
+                    "      {\n"
+                    "        \"method\": \"bdev_nvme_attach_controller\",\n"
+                    "        \"params\": {\n"
+                    "          \"name\": \"%s\",\n"
+                    "          \"trtype\": \"PCIe\",\n"
+                    "          \"traddr\": \"%s\"\n"
+                    "        }\n"
+                    "      }",
+                    ctrl.c_str(), pci_addrs[i].c_str());
+                fprintf(f, ",\n");
+                UMBP_LOG_INFO("SpdkEnv: NVMe bdev JSON — ctrl=%s traddr=%s",
+                              ctrl.c_str(), pci_addrs[i].c_str());
+            }
+
+            if (use_raid) {
+                // Create RAID0 bdev on top of all NVMe base bdevs.
+                fprintf(f,
+                    "      {\n"
+                    "        \"method\": \"bdev_raid_create\",\n"
+                    "        \"params\": {\n"
+                    "          \"name\": \"Raid0\",\n"
+                    "          \"strip_size_kb\": 64,\n"
+                    "          \"raid_level\": \"raid0\",\n"
+                    "          \"base_bdevs\": [");
+                for (size_t i = 0; i < pci_addrs.size(); ++i) {
+                    if (i > 0) fprintf(f, ", ");
+                    fprintf(f, "\"NVMe%zun1\"", i);
+                }
+                fprintf(f, "]\n"
+                    "        }\n"
+                    "      }\n");
+                UMBP_LOG_INFO("SpdkEnv: RAID0 bdev — %zu disks, strip_size=64KB",
+                              pci_addrs.size());
+            } else {
+                // Remove trailing comma for single-disk case: rewind past ",\n"
+                fseek(f, -2, SEEK_CUR);
+                fprintf(f, "\n");
+            }
+
+            fprintf(f, "    ]\n  }]\n}\n");
             fclose(f);
-            UMBP_LOG_INFO("SpdkEnv: NVMe bdev JSON — ctrl=%s traddr=%s",
-                          config_.nvme_ctrl_name.c_str(),
-                          config_.nvme_pci_addr.c_str());
         }
     }
 
