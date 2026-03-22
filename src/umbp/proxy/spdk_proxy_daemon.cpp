@@ -858,8 +858,6 @@ int main(int argc, char** argv) {
 
     std::string shm_name = getenv_str("UMBP_SPDK_PROXY_SHM", kDefaultShmName);
     int max_ranks = getenv_int("UMBP_SPDK_PROXY_MAX_RANKS", 8);
-    size_t data_per_rank_mb = getenv_size("UMBP_SPDK_PROXY_DATA_MB", 2048);
-    size_t data_per_rank = data_per_rank_mb * 1024 * 1024;
     bool write_back = getenv_int("UMBP_SPDK_PROXY_WRITE_BACK", 0) != 0;
     bool ring_read = getenv_int("UMBP_SPDK_RING_READ", 1) != 0;
 
@@ -872,11 +870,34 @@ int main(int argc, char** argv) {
     g_shm_name = shm_name;
     std::atexit(atexit_cleanup);
 
-    size_t shm_cache_mb = getenv_size("UMBP_SPDK_PROXY_CACHE_MB", 8192);
+    // Ring buffer size: UMBP_SPDK_RING_MB (preferred) or UMBP_SPDK_PROXY_CACHE_MB (compat)
+    static constexpr size_t kMinRingMb = 1024;
+    size_t ring_mb = 0;
+    const char* ring_env = std::getenv("UMBP_SPDK_RING_MB");
+    const char* cache_env = std::getenv("UMBP_SPDK_PROXY_CACHE_MB");
+    if (ring_env)
+        ring_mb = static_cast<size_t>(std::stoull(ring_env));
+    else if (cache_env)
+        ring_mb = static_cast<size_t>(std::stoull(cache_env));
+    else
+        ring_mb = 8192;
+
+    if (ring_mb < kMinRingMb) {
+        fprintf(stderr,
+                "spdk_proxy: UMBP_SPDK_RING_MB=%zu is below minimum %zu. "
+                "Ring buffer is required for data transport. "
+                "Set UMBP_SPDK_RING_MB >= %zu.\n",
+                ring_mb, kMinRingMb, kMinRingMb);
+        return 1;
+    }
+
+    // With ring always available, data_region only needs to hold metadata.
+    size_t data_per_rank_mb = getenv_size("UMBP_SPDK_PROXY_DATA_MB", 32);
+    size_t data_per_rank = data_per_rank_mb * 1024 * 1024;
 
     ProxyShmRegion shm;
     int rc = shm.Create(shm_name, max_ranks, data_per_rank, /*try_hugepage=*/true,
-                        shm_cache_mb);
+                        ring_mb);
     if (rc != 0) {
         fprintf(stderr, "spdk_proxy: failed to create SHM '%s' rc=%d\n",
                 shm_name.c_str(), rc);
@@ -931,11 +952,12 @@ int main(int argc, char** argv) {
     auto* rank_dma = new RankDmaPool[max_ranks];
     AllocRankDmaPools(rank_dma, max_ranks);
 
-    UMBP_LOG_INFO("spdk_proxy: READY — capacity=%zuMB, ring_cache=%zuMB (index=%u slots), "
-                  "write_back=%s, ring_read=%s",
+    UMBP_LOG_INFO("spdk_proxy: READY — capacity=%zuMB, ring=%zuMB (index=%u slots), "
+                  "data_region=%zuMB/rank, write_back=%s, ring_read=%s",
                   total / (1024 * 1024),
-                  shm_cache_mb,
+                  ring_mb,
                   hdr->cache_index_slots,
+                  data_per_rank_mb,
                   write_back ? "ON" : "OFF",
                   ring_read ? "ON" : "OFF");
     fflush(stdout);

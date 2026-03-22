@@ -93,6 +93,7 @@ class SpdkProxyTier : public TierBackend {
     size_t heap_cache_max_bytes_ = 0;
 
     bool connected_ = false;
+    bool cold_read_ = false;    // UMBP_SPDK_COLD_READ=1: skip ring cache, always read from NVMe
     uint32_t rank_id_ = 0;
     mutable umbp::proxy::ProxyShmRegion shm_;
     mutable std::mutex submit_mu_;
