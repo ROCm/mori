@@ -13,7 +13,7 @@ MORI_BRANCH="${1:-main}"
 # ===========================================================================
 
 run_bench_hicache() {
-    local MODE="${1:-dp_ep}"
+    local MODE="${1:-tp}"
     local SERVER_LOG="server_hicache_$(date +%Y%m%d_%H%M%S).log"
     local SERVER_PORT=30000
     local BENCH_DIR="/apps/ditian12/sglang/benchmark/gsm8k"
