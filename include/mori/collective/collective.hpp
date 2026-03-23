@@ -20,21 +20,13 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-// Pybind module entry point.
-// Bindings are split into separate compilation units for faster parallel builds
-// and to decouple torch dependencies:
-//   pybind_ops.cpp   - Ops bindings (torch-free, uses raw pointers + DLPack)
-//   pybind_shmem.cpp - Shmem bindings
-//   pybind_io.cpp    - IO bindings
+#pragma once
 
-#include "src/pybind/mori.hpp"
-
-PYBIND11_MODULE(libmori_pybinds, m) {
-  mori::RegisterMoriOps(m);
-  mori::RegisterMoriShmem(m);
-  mori::RegisterMoriIo(m);
-  mori::RegisterMoriCcl(m);
-#ifdef MORI_BUILD_UMBP
-  mori::RegisterMoriUmbp(m);
-#endif
-}
+#include "mori/collective/all2all/sdma_all2all.hpp"
+#include "mori/collective/all2all/oneshot_all2all_sdma_class.hpp"
+#include "mori/collective/all2all/oneshot_all2all_sdma_async_kernel.hpp"
+#include "mori/collective/allgather/sdma_allgather.hpp"
+#include "mori/collective/allgather/oneshot_allgather_sdma_class.hpp"
+#include "mori/collective/allgather/oneshot_sdma_async_kernel.hpp"
+#include "mori/collective/allreduce/sdma_allreduce.hpp"
+#include "mori/collective/allreduce/twoshot_allreduce_sdma_class.hpp"

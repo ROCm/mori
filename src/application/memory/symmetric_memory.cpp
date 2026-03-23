@@ -21,6 +21,7 @@
 // SOFTWARE.
 #include "mori/application/memory/symmetric_memory.hpp"
 
+#include <cstdlib>
 #include <fcntl.h>
 
 #include <cerrno>
@@ -74,8 +75,12 @@ void SymmMemManager::HostFree(void* localPtr) {
 
 SymmMemObjPtr SymmMemManager::Malloc(size_t size) {
   void* ptr = nullptr;
-  // HIP_RUNTIME_CHECK(hipExtMallocWithFlags(&ptr, size, hipDeviceMallocUncached));
-  HIP_RUNTIME_CHECK(hipMalloc(&ptr, size));
+  const bool enableSdma = (std::getenv("MORI_ENABLE_SDMA") != nullptr);
+  if (enableSdma) {
+    HIP_RUNTIME_CHECK(hipExtMallocWithFlags(&ptr, size, hipDeviceMallocUncached));
+  } else {
+    HIP_RUNTIME_CHECK(hipMalloc(&ptr, size));
+  }
   HIP_RUNTIME_CHECK(hipMemset(ptr, 0, size));
   return RegisterSymmMemObj(ptr, size);
 }

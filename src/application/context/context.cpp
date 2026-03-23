@@ -22,7 +22,7 @@
 #include "mori/application/context/context.hpp"
 
 #include <arpa/inet.h>
-#include <hip/hip_runtime_api.h>
+#include <hip/hip_runtime.h>
 #include <ifaddrs.h>
 #include <netdb.h>
 #include <string.h>
@@ -33,10 +33,9 @@
 #include <string>
 #include <vector>
 
-#include "mori/application/transport/sdma/anvil.hpp"
 #include "mori/application/utils/check.hpp"
-#include "mori/utils/env_utils.hpp"
 #include "mori/utils/mori_log.hpp"
+#include "mori/application/transport/sdma/anvil.hpp"
 
 namespace mori {
 namespace application {
@@ -83,16 +82,6 @@ std::string GetLocalIP() {
 
 std::string Context::HostName() const { return hostnames[LocalRank()]; }
 
-bool Context::CanUseP2P(int destRank) const {
-  if (destRank == LocalRank()) {
-    return false;  // Cannot use P2P with self
-  }
-  // Check if on the same node by comparing hostnames
-  // Note: IsP2PDisabled only affects transport type selection (peerPtrs),
-  // but we still maintain P2P data path in p2pPeerPtrs
-  return HostName() == hostnames[destRank];
-}
-
 void Context::CollectHostNames() {
   char hostname[HOST_NAME_MAX];
   gethostname(hostname, HOST_NAME_MAX);
@@ -120,9 +109,15 @@ void Context::CollectHostNames() {
   }
 }
 
-bool IsP2PDisabled() { return env::IsEnvVarEnabled("MORI_DISABLE_P2P"); }
+bool IsP2PDisabled() {
+  const char* varName = "MORI_DISABLE_P2P";
+  return getenv(varName) != nullptr;
+}
 
-bool IsSDMAEnabled() { return env::IsEnvVarEnabled("MORI_ENABLE_SDMA"); }
+bool IsSDMAEnabled() {
+  const char* varName = "MORI_ENABLE_SDMA";
+  return getenv(varName) != nullptr;
+}
 
 void Context::InitializePossibleTransports() {
   // Find my rank in node
@@ -137,20 +132,20 @@ void Context::InitializePossibleTransports() {
   ActiveDevicePortList activeDevicePortList = GetActiveDevicePortList(devices);
 
   if (rankInNode == 0) {
-    std::string rdma_devices;
+    std::cout << "rank " << LocalRank() << " RDMA devices: ";
     if (activeDevicePortList.empty()) {
-      rdma_devices = "None";
+      std::cout << "None" << std::endl;
     } else {
       for (size_t i = 0; i < activeDevicePortList.size(); ++i) {
-        if (i > 0) rdma_devices += ", ";
-        rdma_devices += activeDevicePortList[i].first->Name();
+        if (i > 0) std::cout << ", ";
+        std::cout << activeDevicePortList[i].first->Name();
       }
+      std::cout << std::endl;
     }
-    MORI_APP_INFO("rank {} RDMA devices: {}", LocalRank(), rdma_devices);
   }
 
   // Match gpu and nic
-  bool disableTopo = env::IsEnvVarEnabled("MORI_DISABLE_TOPO");
+  const char* disableTopo = std::getenv("MORI_DISABLE_TOPO");
   int portId = -1;
   int devicePortId = -1;
   RdmaDevice* device = nullptr;
@@ -168,8 +163,7 @@ void Context::InitializePossibleTransports() {
     HIP_RUNTIME_CHECK(hipGetDevice(&deviceId));
     topo.reset(new TopoSystem());
     std::string nicName = topo->MatchGpuAndNic(deviceId);
-    MORI_APP_TRACE("rank {} rankInNode {} matched nic {} for gpu {}", LocalRank(), rankInNode,
-                   nicName, deviceId);
+
     for (int i = 0; i < activeDevicePortList.size(); i++) {
       auto& dp = activeDevicePortList[i];
       if (dp.first->Name() != nicName) continue;
@@ -182,10 +176,11 @@ void Context::InitializePossibleTransports() {
   }
 
   if (device == nullptr) {
-    MORI_APP_INFO("rank {} rankInNode {} select no device", LocalRank(), rankInNode);
+    std::cout << "rank " << LocalRank() << " rankInNode " << rankInNode << " select no device"
+              << std::endl;
   } else {
-    MORI_APP_INFO("rank {} rankInNode {} select device [{}] {}", LocalRank(), rankInNode,
-                  devicePortId, device->Name());
+    std::cout << "rank " << LocalRank() << " rankInNode " << rankInNode << " select device "
+              << "[" << devicePortId << "] " << device->Name() << std::endl;
   }
 
   int numQpPerPe = 4;
@@ -196,10 +191,7 @@ void Context::InitializePossibleTransports() {
   this->numQpPerPe = numQpPerPe;
   // Initialize transport
   int peerRankInNode = -1;
-  if (!IsP2PDisabled() && IsSDMAEnabled()) anvil::anvil.init();
-
-  int sdmaNumChannels = anvil::GetSdmaNumChannels();
-  MORI_APP_INFO("SDMA num channels per GPU pair: {}", sdmaNumChannels);
+  if(!IsP2PDisabled() && IsSDMAEnabled()) anvil::anvil.init();
 
   for (int i = 0; i < WorldSize(); i++) {
     // Check P2P availability
@@ -212,17 +204,17 @@ void Context::InitializePossibleTransports() {
         bool canAccessPeer = true;
 
         if ((i == LocalRank()) || canAccessPeer) {
-          if (IsSDMAEnabled()) {
-            if (i != LocalRank()) {
+          if(IsSDMAEnabled()){
+            if(i != LocalRank()){
               transportTypes.push_back(TransportType::SDMA);
-              anvil::EnablePeerAccess(LocalRank() % 8, i % 8);
+	            anvil::EnablePeerAccess(LocalRank()%8, i%8);
               // Better performance if allocating all 8 queues
-              anvil::anvil.connect(LocalRank() % 8, i % 8, sdmaNumChannels);
-            } else {
+              anvil::anvil.connect(LocalRank()%8, i%8, 8);
+            }else{
               transportTypes.push_back(TransportType::SDMA);
-              anvil::anvil.connect(LocalRank() % 8, i % 8, sdmaNumChannels);
+              anvil::anvil.connect(LocalRank()%8, i%8, 8);
             }
-          } else {
+          }else{
             transportTypes.push_back(TransportType::P2P);
           }
           for (int qp = 0; qp < numQpPerPe; qp++) {
@@ -251,8 +243,11 @@ void Context::InitializePossibleTransports() {
       config.gidIdx = std::atoi(envGidIdx);
     }
     config.maxMsgsNum = 4096;
-    uint32_t vid = rdmaDeviceContext->GetRdmaDevice()->GetDeviceAttr()->orig_attr.vendor_id;
-    config.maxCqeNum = (vid == static_cast<uint32_t>(RdmaDeviceVendorId::Broadcom)) ? 1 : 4096;
+#ifdef ENABLE_BNXT
+    config.maxCqeNum = 1;
+#else
+    config.maxCqeNum = 4096;
+#endif
     config.alignment = 4096;
     config.onGpu = true;
     for (int qp = 0; qp < numQpPerPe; qp++) {

@@ -272,6 +272,19 @@ int ShmemBufferDeregister(void* ptr, size_t size) {
   return 0;
 }
 
+application::SymmMemObjPtr ShmemSymmetricRegister(void* ptr, size_t size) {
+  ShmemStates* states = ShmemStatesSingleton::GetInstance();
+  states->CheckStatusValid();
+  return states->memoryStates->symmMemMgr->RegisterSymmMemObj(ptr, size);
+}
+
+int ShmemSymmetricDeregister(void* ptr, size_t size) {
+  ShmemStates* states = ShmemStatesSingleton::GetInstance();
+  states->CheckStatusValid();
+  states->memoryStates->symmMemMgr->DeregisterSymmMemObj(ptr);
+  return 0;
+}
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                    P2P Pointer Conversion                                     */
 /* ---------------------------------------------------------------------------------------------- */

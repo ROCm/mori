@@ -20,21 +20,18 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-// Pybind module entry point.
-// Bindings are split into separate compilation units for faster parallel builds
-// and to decouple torch dependencies:
-//   pybind_ops.cpp   - Ops bindings (torch-free, uses raw pointers + DLPack)
-//   pybind_shmem.cpp - Shmem bindings
-//   pybind_io.cpp    - IO bindings
+#pragma once
+namespace mori {
+namespace collective {
 
-#include "src/pybind/mori.hpp"
+// Complete inline definition of ShmemDeleter in header
+struct ShmemDeleter {
+    void operator()(void* ptr) const {
+        if (ptr) {
+            shmem::ShmemFree(ptr);
+        }
+    }
+};
 
-PYBIND11_MODULE(libmori_pybinds, m) {
-  mori::RegisterMoriOps(m);
-  mori::RegisterMoriShmem(m);
-  mori::RegisterMoriIo(m);
-  mori::RegisterMoriCcl(m);
-#ifdef MORI_BUILD_UMBP
-  mori::RegisterMoriUmbp(m);
-#endif
+}
 }
