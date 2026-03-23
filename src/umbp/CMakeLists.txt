@@ -159,50 +159,73 @@ if(Protobuf_FOUND)
 endif()
 
 if(HAVE_GRPC)
-  message(STATUS "[UMBP] gRPC + Protobuf found — distributed control plane ENABLED")
+  find_library(_PROTOBUF_LIB NAMES protobuf libprotobuf QUIET)
+  if(NOT _PROTOBUF_LIB)
+    message(WARNING "[UMBP] libprotobuf not found — disabling distributed control plane.")
+    set(HAVE_GRPC FALSE)
+  endif()
+endif()
 
-  find_library(_PROTOBUF_LIB NAMES protobuf libprotobuf REQUIRED)
+if(HAVE_GRPC)
   get_filename_component(_PROTOBUF_LIB_DIR "${_PROTOBUF_LIB}" DIRECTORY)
   get_filename_component(_PROTOBUF_PREFIX "${_PROTOBUF_LIB_DIR}" DIRECTORY)
   find_path(_PROTOBUF_INCLUDE_DIR google/protobuf/message.h
-            HINTS "${_PROTOBUF_PREFIX}/include" REQUIRED)
+            HINTS "${_PROTOBUF_PREFIX}/include" QUIET)
+  if(NOT _PROTOBUF_INCLUDE_DIR)
+    message(WARNING "[UMBP] protobuf headers not found — disabling distributed control plane.")
+    set(HAVE_GRPC FALSE)
+  endif()
+endif()
+
+if(HAVE_GRPC)
   set(_PROTOBUF_LIBS "${_PROTOBUF_LIB}")
-  message(STATUS "UMBP protobuf lib: ${_PROTOBUF_LIBS}")
-  message(STATUS "UMBP protobuf include: ${_PROTOBUF_INCLUDE_DIR}")
 
   set(_PROTOBUF_PROTOC "${Protobuf_PROTOC_EXECUTABLE}")
   if(NOT _PROTOBUF_PROTOC)
     set(_PROTOBUF_PROTOC "${PROTOBUF_PROTOC_EXECUTABLE}")
   endif()
   if(NOT _PROTOBUF_PROTOC)
-    find_program(_PROTOBUF_PROTOC protoc HINTS "${_PROTOBUF_PREFIX}/bin" REQUIRED)
+    find_program(_PROTOBUF_PROTOC protoc HINTS "${_PROTOBUF_PREFIX}/bin" QUIET)
   endif()
-  message(STATUS "UMBP protoc: ${_PROTOBUF_PROTOC}")
+  if(NOT _PROTOBUF_PROTOC)
+    message(WARNING "[UMBP] protoc not found — disabling distributed control plane.")
+    set(HAVE_GRPC FALSE)
+  endif()
+endif()
 
+if(HAVE_GRPC)
   if(TARGET gRPC::grpc_cpp_plugin)
     set(_GRPC_CPP_PLUGIN $<TARGET_FILE:gRPC::grpc_cpp_plugin>)
   elseif(TARGET grpc_cpp_plugin)
     set(_GRPC_CPP_PLUGIN $<TARGET_FILE:grpc_cpp_plugin>)
   else()
-    find_program(_GRPC_CPP_PLUGIN grpc_cpp_plugin REQUIRED)
-  endif()
-
-  if(DEFINED Protobuf_VERSION)
-    execute_process(
-      COMMAND ${_PROTOBUF_PROTOC} --version
-      OUTPUT_VARIABLE _PROTOC_VERSION_OUTPUT
-      OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
-    string(REGEX MATCH "[0-9]+\\.[0-9]+" _PROTOC_MM "${_PROTOC_VERSION_OUTPUT}")
-    string(REGEX MATCH "^[0-9]+\\.[0-9]+" _PROTOBUF_MM "${Protobuf_VERSION}")
-    if(_PROTOC_MM
-       AND _PROTOBUF_MM
-       AND NOT _PROTOC_MM STREQUAL _PROTOBUF_MM)
-      message(
-        FATAL_ERROR
-          "protoc (${_PROTOC_VERSION_OUTPUT}) and libprotobuf (${Protobuf_VERSION}) mismatch."
-      )
+    find_program(_GRPC_CPP_PLUGIN grpc_cpp_plugin QUIET)
+    if(NOT _GRPC_CPP_PLUGIN)
+      message(WARNING "[UMBP] grpc_cpp_plugin not found — disabling distributed control plane.")
+      set(HAVE_GRPC FALSE)
     endif()
   endif()
+endif()
+
+if(HAVE_GRPC AND DEFINED Protobuf_VERSION)
+  execute_process(
+    COMMAND ${_PROTOBUF_PROTOC} --version
+    OUTPUT_VARIABLE _PROTOC_VERSION_OUTPUT
+    OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+  string(REGEX MATCH "[0-9]+\\.[0-9]+" _PROTOC_MM "${_PROTOC_VERSION_OUTPUT}")
+  string(REGEX MATCH "^[0-9]+\\.[0-9]+" _PROTOBUF_MM "${Protobuf_VERSION}")
+  if(_PROTOC_MM
+     AND _PROTOBUF_MM
+     AND NOT _PROTOC_MM STREQUAL _PROTOBUF_MM)
+    message(WARNING "[UMBP] protoc (${_PROTOC_VERSION_OUTPUT}) and libprotobuf (${Protobuf_VERSION}) mismatch — disabling distributed control plane.")
+    set(HAVE_GRPC FALSE)
+  endif()
+endif()
+
+if(HAVE_GRPC)
+  message(STATUS "[UMBP] gRPC + Protobuf found — distributed control plane ENABLED")
+  message(STATUS "UMBP protobuf lib: ${_PROTOBUF_LIBS}")
+  message(STATUS "UMBP protoc: ${_PROTOBUF_PROTOC}")
 
   # ---------- Proto compilation -----------------------------------------------
 
