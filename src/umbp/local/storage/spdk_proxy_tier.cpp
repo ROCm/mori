@@ -455,6 +455,8 @@ std::vector<bool> SpdkProxyTier::SubmitBatch(
                 desc->items_ready.store(static_cast<uint32_t>(i + 1),
                                         std::memory_order_release);
             }
+            desc->bytes_ready.store(desc->total_data_size,
+                                    std::memory_order_release);
 
             // Wait for proxy to finish
             int spin = 0;
@@ -697,9 +699,7 @@ bool SpdkProxyTier::WriteBatch(
     const std::vector<std::string>& keys,
     const std::vector<const void*>& data_ptrs,
     const std::vector<size_t>& sizes) {
-    UMBP_LOG_WARN("SpdkProxyTier::WriteBatch enter keys=%zu", keys.size());
     auto results = BatchWrite(keys, data_ptrs, sizes);
-    UMBP_LOG_WARN("SpdkProxyTier::WriteBatch done, results=%zu", results.size());
     for (bool ok : results) {
         if (!ok) return false;
     }
