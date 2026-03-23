@@ -811,6 +811,7 @@ bool LocalStorageManager::CopyToSSDBatch(const std::vector<std::string>& keys) {
   std::vector<size_t> batch_sizes;
   std::vector<std::string> fallback_keys;
 
+  UMBP_LOG_WARN("CopyToSSDBatch: enter keys=%zu", keys.size());
   for (const auto& key : keys) {
     if (ssd->Exists(key)) continue;
     size_t sz = 0;
@@ -820,12 +821,18 @@ bool LocalStorageManager::CopyToSSDBatch(const std::vector<std::string>& keys) {
     batch_ptrs.push_back(ptr);
     batch_sizes.push_back(sz);
   }
+  UMBP_LOG_WARN("CopyToSSDBatch: exists-loop done, batch_keys=%zu", batch_keys.size());
 
   if (batch_keys.empty()) return true;
 
   // Try batch write if SSDTier is available.
   if (ssd->Capabilities().batch_write && batch_keys.size() > 1) {
-    if (ssd->WriteBatch(batch_keys, batch_ptrs, batch_sizes)) return true;
+    UMBP_LOG_WARN("CopyToSSDBatch: calling WriteBatch(%zu keys)", batch_keys.size());
+    if (ssd->WriteBatch(batch_keys, batch_ptrs, batch_sizes)) {
+      UMBP_LOG_WARN("CopyToSSDBatch: WriteBatch OK");
+      return true;
+    }
+    UMBP_LOG_WARN("CopyToSSDBatch: WriteBatch FAILED, falling through");
     // Batch failed (likely capacity) — fall through to per-key CopyToSSD.
   }
 
