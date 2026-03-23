@@ -1,0 +1,281 @@
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+#include <getopt.h>
+#include <hip/hip_runtime.h>
+#include <mpi.h>
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <iomanip>
+#include <iostream>
+#include <memory>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#include "mori/collective/intra_node/executor.hpp"
+
+namespace {
+inline void hipCheck(hipError_t err, const char* expr, const char* file, int line) {
+  if (err != hipSuccess) {
+    std::ostringstream oss;
+    oss << "HIP error: " << hipGetErrorString(err) << " (" << static_cast<int>(err) << ") at "
+        << file << ":" << line << " in " << expr;
+    throw std::runtime_error(oss.str());
+  }
+}
+}  // namespace
+
+#define HIP_CHECK(expr) hipCheck((expr), #expr, __FILE__, __LINE__)
+
+// Default arguments
+struct Args {
+  size_t min_bytes = 1024;            // 1KB
+  size_t max_bytes = (128ull << 20);  // 128MB
+  size_t step_factor = 2;
+  int warmup_iters = 5;
+  int iters = 20;
+  bool check = false;
+};
+
+void parseArgs(int argc, char** argv, Args& args) {
+  int opt;
+  while ((opt = getopt(argc, argv, "b:e:f:w:n:c")) != -1) {
+    switch (opt) {
+      case 'b': {
+        std::string s(optarg);
+        size_t multiplier = 1;
+        if (s.back() == 'G')
+          multiplier = 1 << 30;
+        else if (s.back() == 'M')
+          multiplier = 1 << 20;
+        else if (s.back() == 'K')
+          multiplier = 1 << 10;
+        if (multiplier > 1) s.pop_back();
+        args.min_bytes = std::stoull(s) * multiplier;
+        break;
+      }
+      case 'e': {
+        std::string s(optarg);
+        size_t multiplier = 1;
+        if (s.back() == 'G')
+          multiplier = 1 << 30;
+        else if (s.back() == 'M')
+          multiplier = 1 << 20;
+        else if (s.back() == 'K')
+          multiplier = 1 << 10;
+        if (multiplier > 1) s.pop_back();
+        args.max_bytes = std::stoull(s) * multiplier;
+        break;
+      }
+      case 'f':
+        args.step_factor = std::stoull(optarg);
+        if (args.step_factor < 2) args.step_factor = 2;  // prevent infinite loops
+        break;
+      case 'w':
+        args.warmup_iters = std::stoi(optarg);
+        break;
+      case 'n':
+        args.iters = std::stoi(optarg);
+        break;
+      case 'c':
+        args.check = true;
+        break;
+      default:
+        break;
+    }
+  }
+}
+
+std::string formatBytes(size_t bytes) {
+  char buf[64];
+  if (bytes < 1024)
+    snprintf(buf, sizeof(buf), "%4zu  B", bytes);
+  else if (bytes < 1024 * 1024)
+    snprintf(buf, sizeof(buf), "%4.0f KB", bytes / 1024.0);
+  else if (bytes < 1024 * 1024 * 1024)
+    snprintf(buf, sizeof(buf), "%4.0f MB", bytes / (1024.0 * 1024.0));
+  else
+    snprintf(buf, sizeof(buf), "%4.2f GB", bytes / (1024.0 * 1024.0 * 1024.0));
+  return std::string(buf);
+}
+
+// Estimate the per-rank "bus traffic factor" based on the intra-node kernel selection logic.
+//
+// In `CommKernelEntity::dispatchAllReduce()` there are two main paths:
+// - 1-stage: directly reads full input from all GPUs once, so remote traffic per rank ~=
+// bytes*(N-1)
+// - 2-stage: reduce-scatter + allgather, so remote traffic per rank ~= bytes*2*(N-1)/N
+//
+inline double estimateBusFactor(size_t bytes, int num_ranks) {
+  if (num_ranks == 2) return 1.0;
+  const bool call_1stage =
+      (num_ranks <= 4 && bytes < 160 * 1024) || (num_ranks <= 8 && bytes < 80 * 1024);
+  if (call_1stage) return static_cast<double>(num_ranks - 1);
+  return 2.0 * static_cast<double>(num_ranks - 1) / static_cast<double>(num_ranks);
+}
+
+int main(int argc, char** argv) {
+  MPI_Init(&argc, &argv);
+
+  int rank, num_ranks;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &num_ranks);
+
+  Args args;
+  parseArgs(argc, argv, args);
+
+  if (rank == 0) {
+    std::cout << "# Mori Intra-Node AllReduce Benchmark" << std::endl;
+    std::cout << "# Dist: " << num_ranks << " ranks" << std::endl;
+    std::cout << std::endl;
+    std::cout << std::setw(15) << "size" << std::setw(15) << "count" << std::setw(10) << "type"
+              << std::setw(10) << "redop" << std::setw(15) << "time(us)" << std::setw(15)
+              << "algbw(GB/s)" << std::setw(15) << "busbw(GB/s)" << std::endl;
+  }
+
+  int device_count = 0;
+  HIP_CHECK(hipGetDeviceCount(&device_count));
+  if (device_count <= 0) {
+    if (rank == 0) std::cerr << "No HIP devices found." << std::endl;
+    MPI_Abort(MPI_COMM_WORLD, 1);
+  }
+  int device_id = rank % device_count;
+  HIP_CHECK(hipSetDevice(device_id));
+  if (rank == 0 && num_ranks > device_count) {
+    std::cerr << "Warning: num_ranks (" << num_ranks << ") > device_count (" << device_count
+              << "); using device_id = rank % device_count." << std::endl;
+  }
+
+  using T = float;
+  size_t executor_max_size = std::max((size_t)8 * 1024 * 1024, args.max_bytes);
+
+  std::unique_ptr<mori::collective::AllReduceExecutor<T>> executor;
+  try {
+    executor = std::make_unique<mori::collective::IntraNodeAllReduceExecutor<T>>(
+        num_ranks, rank, MPI_COMM_WORLD, executor_max_size);
+  } catch (const std::exception& e) {
+    if (rank == 0) std::cerr << "Failed to initialize executor: " << e.what() << std::endl;
+    MPI_Abort(MPI_COMM_WORLD, 1);
+  }
+
+  hipStream_t stream;
+  HIP_CHECK(hipStreamCreate(&stream));
+
+  // Use out-of-place buffers so repeated Execute() calls don't accumulate values in-place.
+  T* d_in = nullptr;
+  T* d_out = nullptr;
+  HIP_CHECK(hipMalloc(&d_in, args.max_bytes));
+  HIP_CHECK(hipMalloc(&d_out, args.max_bytes));
+
+  std::vector<T> h_input;
+  std::vector<T> h_output;
+
+  if (args.check) {
+    h_input.resize(args.max_bytes / sizeof(T));
+    h_output.resize(args.max_bytes / sizeof(T));
+  }
+
+  MPI_Barrier(MPI_COMM_WORLD);
+
+  for (size_t bytes = args.min_bytes; bytes <= args.max_bytes; bytes *= args.step_factor) {
+    size_t count = bytes / sizeof(T);
+    if (count == 0) continue;
+
+    if (args.check) {
+      for (size_t i = 0; i < count; ++i) h_input[i] = 1.0f;
+      HIP_CHECK(hipMemcpy(d_in, h_input.data(), count * sizeof(T), hipMemcpyHostToDevice));
+    } else {
+      // Still initialize input to avoid reading uninitialized device memory.
+      HIP_CHECK(hipMemsetAsync(d_in, 0, bytes, stream));
+      HIP_CHECK(hipStreamSynchronize(stream));
+    }
+
+    // Warmup
+    for (int i = 0; i < args.warmup_iters; ++i) {
+      int rc = executor->Execute(d_in, d_out, count, stream);
+      if (rc != 0) {
+        std::cerr << "Rank " << rank << " Execute() failed during warmup, rc=" << rc << std::endl;
+        MPI_Abort(MPI_COMM_WORLD, 1);
+      }
+    }
+    HIP_CHECK(hipStreamSynchronize(stream));
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    // Measure
+    auto start = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < args.iters; ++i) {
+      int rc = executor->Execute(d_in, d_out, count, stream);
+      if (rc != 0) {
+        std::cerr << "Rank " << rank << " Execute() failed during measure, rc=" << rc << std::endl;
+        MPI_Abort(MPI_COMM_WORLD, 1);
+      }
+    }
+    HIP_CHECK(hipStreamSynchronize(stream));
+    auto end = std::chrono::high_resolution_clock::now();
+
+    if (args.check) {
+      HIP_CHECK(hipMemcpy(h_output.data(), d_out, count * sizeof(T), hipMemcpyDeviceToHost));
+      bool correct = true;
+      for (size_t i = 0; i < count; ++i) {
+        if (std::abs(h_output[i] - (float)num_ranks) > 1e-5) {
+          correct = false;
+          break;
+        }
+      }
+      int ok = correct ? 1 : 0;
+      int all_ok = 0;
+      MPI_Allreduce(&ok, &all_ok, 1, MPI_INT, MPI_LAND, MPI_COMM_WORLD);
+      if (!all_ok) {
+        std::cerr << "Rank " << rank << " Verification FAILED at size " << formatBytes(bytes)
+                  << std::endl;
+      }
+    }
+
+    // Report worst-rank time (more representative than rank-0 only).
+    double elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+    double avg_time_us_local = elapsed_us / args.iters;
+    double avg_time_us = 0.0;
+    MPI_Reduce(&avg_time_us_local, &avg_time_us, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+
+    if (rank == 0) {
+      double alg_bw = (double)bytes / (avg_time_us * 1e-6) / 1e9;  // GB/s
+      double bus_bw = alg_bw * estimateBusFactor(bytes, num_ranks);
+
+      std::cout << std::setw(15) << formatBytes(bytes) << std::setw(15) << count << std::setw(10)
+                << "float" << std::setw(10) << "sum" << std::setw(15) << std::fixed
+                << std::setprecision(2) << avg_time_us << std::setw(15) << std::fixed
+                << std::setprecision(2) << alg_bw << std::setw(15) << std::fixed
+                << std::setprecision(2) << bus_bw << std::endl;
+    }
+  }
+
+  HIP_CHECK(hipFree(d_in));
+  HIP_CHECK(hipFree(d_out));
+  HIP_CHECK(hipStreamDestroy(stream));
+
+  MPI_Finalize();
+  return 0;
+}
