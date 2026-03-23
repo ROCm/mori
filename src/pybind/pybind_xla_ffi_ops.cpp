@@ -378,7 +378,10 @@ void RegisterXLAFFIOps(py::module_& m) {
   m.def("preload_kernels", []() {
     mori::moe::KernelRegistry::Instance().AutoLoad();
   });
-//   m.def("get_cur_rank_num_token", &EpDispatchCombineHandle::GetCurRankNumToken);
+  m.def("clear_ep_handle_cache", []() {
+    std::lock_guard<std::mutex> lock(g_handle_cache_mu);
+    g_handle_cache.clear();
+  });
 }
 
 }  // namespace mori
