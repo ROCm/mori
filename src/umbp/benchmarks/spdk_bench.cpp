@@ -30,8 +30,8 @@
 #include "umbp/common/config.h"
 #include "umbp/common/log.h"
 #include "umbp/spdk/spdk_env.h"
-#include "umbp/storage/spdk_ssd_tier.h"
-#include "umbp/storage/ssd_tier.h"
+#include "umbp/local/storage/spdk_ssd_tier.h"
+#include "umbp/local/storage/ssd_tier.h"
 
 using Clock = std::chrono::high_resolution_clock;
 
@@ -390,7 +390,7 @@ int main(int argc, char** argv) {
         tier_cfg.spdk_nvme_pci_addr = ecfg.nvme_pci_addr;
         tier_cfg.spdk_nvme_ctrl_name = ecfg.nvme_ctrl_name;
         tier_cfg.spdk_io_workers = bench.threads;
-        tier_cfg.ssd_capacity_bytes = env.GetBdevSize();
+        tier_cfg.ssd.capacity_bytes = env.GetBdevSize();
 
         SpdkSsdTier tier(tier_cfg);
         if (!tier.IsValid()) {

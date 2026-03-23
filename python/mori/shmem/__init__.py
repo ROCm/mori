@@ -20,9 +20,23 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 from .api import *
-from .tensor_utils import (
-    MoriShmemBuffer,
-    mori_shmem_create_tensor,
-    symm_mori_shmem_tensor,
-    mori_shmem_create_tensor_list_intra_node,
-)
+
+_LAZY_ATTRS = {
+    "MoriShmemBuffer": "tensor_utils",
+    "mori_shmem_create_tensor": "tensor_utils",
+    "symm_mori_shmem_tensor": "tensor_utils",
+    "mori_shmem_create_tensor_list_intra_node": "tensor_utils",
+}
+
+
+def __getattr__(name: str):
+    if name in _LAZY_ATTRS:
+        import importlib
+
+        mod = importlib.import_module(f".{_LAZY_ATTRS[name]}", __name__)
+        return getattr(mod, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return list(globals().keys()) + sorted(_LAZY_ATTRS)

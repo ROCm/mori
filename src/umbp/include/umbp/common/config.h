@@ -34,25 +34,66 @@ enum class UMBPRole : int {
 
 static constexpr uint32_t kAutoRankId = UINT32_MAX;
 
-struct UMBPConfig {
-  // DRAM
-  size_t dram_capacity_bytes = 4ULL * 1024 * 1024 * 1024;  // 4 GB
-  bool use_shared_memory = false;                          // shm_open vs MAP_ANONYMOUS
-  std::string shm_name = "/umbp_dram";                     // only used when use_shared_memory=true
+enum class UMBPSsdLayoutMode : int {
+  SegmentedLog = 1,
+};
 
-  // SSD
-  bool ssd_enabled = true;
-  std::string ssd_storage_dir = "/tmp/umbp_ssd";
-  size_t ssd_capacity_bytes = 32ULL * 1024 * 1024 * 1024;
+enum class UMBPIoBackend : int {
+  PThread = 0,
+  IoUring = 1,
+};
 
-  // Policy: "lru" (default) or "prefix_aware_lru"
-  std::string eviction_policy = "lru";
-  // Number of LRU-tail candidates inspected when eviction_policy == "prefix_aware_lru".
-  // Must be >= 1; values of 0 are treated as 1.
-  size_t eviction_candidate_window = 16;
+enum class UMBPDurabilityMode : int {
+  Strict = 0,
+  Relaxed = 1,
+};
+
+struct UMBPDramConfig {
+  size_t capacity_bytes = 4ULL * 1024 * 1024 * 1024;
+  bool use_shared_memory = false;
+  std::string shm_name = "/umbp_dram";
+  double high_watermark = 0.9;
+  double low_watermark = 0.7;
+};
+
+struct UMBPIoConfig {
+  UMBPIoBackend backend = UMBPIoBackend::IoUring;
+  size_t queue_depth = 4096;
+};
+
+struct UMBPDurabilityConfig {
+  UMBPDurabilityMode mode = UMBPDurabilityMode::Strict;
+  bool enable_background_gc = true;
+};
+
+struct UMBPSsdConfig {
+  bool enabled = true;
+  std::string storage_dir = "/tmp/umbp_ssd";
+  size_t capacity_bytes = 32ULL * 1024 * 1024 * 1024;
+  UMBPSsdLayoutMode layout_mode = UMBPSsdLayoutMode::SegmentedLog;
+  size_t segment_size_bytes = 256ULL * 1024 * 1024;
+  UMBPIoConfig io;
+  UMBPDurabilityConfig durability;
+};
+
+struct UMBPEvictionConfig {
+  std::string policy = "lru";
+  size_t candidate_window = 16;
   bool auto_promote_on_read = true;
-  double dram_high_watermark = 0.9;
-  double dram_low_watermark = 0.7;
+};
+
+struct UMBPCopyPipelineConfig {
+  bool async_enabled = true;
+  size_t queue_depth = 4096;
+  size_t worker_threads = 2;
+  size_t batch_max_ops = 128;
+};
+
+struct UMBPConfig {
+  UMBPDramConfig dram;
+  UMBPSsdConfig ssd;
+  UMBPEvictionConfig eviction;
+  UMBPCopyPipelineConfig copy_pipeline;
 
   // SPDK SSD tier configuration (only used when ssd_backend == "spdk")
   std::string ssd_backend = "posix";       // "posix" or "spdk"
@@ -92,6 +133,36 @@ struct UMBPConfig {
     return UMBPRole::Standalone;
   }
 
+  bool Validate(std::string* error_message = nullptr) const {
+    if (dram.capacity_bytes == 0) {
+      if (error_message) *error_message = "dram.capacity_bytes must be > 0";
+      return false;
+    }
+    if (ssd.enabled) {
+      if (ssd.capacity_bytes == 0) {
+        if (error_message) *error_message = "ssd.capacity_bytes must be > 0";
+        return false;
+      }
+      if (ssd.segment_size_bytes == 0) {
+        if (error_message) *error_message = "ssd.segment_size_bytes must be > 0";
+        return false;
+      }
+    }
+    if (copy_pipeline.queue_depth == 0) {
+      if (error_message) *error_message = "copy_pipeline.queue_depth must be > 0";
+      return false;
+    }
+    if (copy_pipeline.worker_threads == 0) {
+      if (error_message) *error_message = "copy_pipeline.worker_threads must be > 0";
+      return false;
+    }
+    if (copy_pipeline.batch_max_ops == 0) {
+      if (error_message) *error_message = "copy_pipeline.batch_max_ops must be > 0";
+      return false;
+    }
+    return true;
+  }
+
   static UMBPConfig FromEnvironment() {
     UMBPConfig cfg;
     auto getenv_str = [](const char* name, const std::string& def) -> std::string {
@@ -111,17 +182,15 @@ struct UMBPConfig {
       return v ? std::atof(v) : def;
     };
 
-    cfg.dram_capacity_bytes = getenv_size("UMBP_DRAM_CAPACITY", cfg.dram_capacity_bytes);
-    cfg.ssd_enabled = getenv_int("UMBP_SSD_ENABLED", cfg.ssd_enabled ? 1 : 0) != 0;
-    cfg.ssd_storage_dir = getenv_str("UMBP_SSD_DIR", cfg.ssd_storage_dir);
-    cfg.ssd_capacity_bytes = getenv_size("UMBP_SSD_CAPACITY", cfg.ssd_capacity_bytes);
-    cfg.eviction_policy = getenv_str("UMBP_EVICTION_POLICY", cfg.eviction_policy);
-    cfg.dram_high_watermark = getenv_double("UMBP_DRAM_HIGH_WM", cfg.dram_high_watermark);
-    cfg.dram_low_watermark = getenv_double("UMBP_DRAM_LOW_WM", cfg.dram_low_watermark);
+    cfg.dram.capacity_bytes = getenv_size("UMBP_DRAM_CAPACITY", cfg.dram.capacity_bytes);
+    cfg.ssd.enabled = getenv_int("UMBP_SSD_ENABLED", cfg.ssd.enabled ? 1 : 0) != 0;
+    cfg.ssd.storage_dir = getenv_str("UMBP_SSD_DIR", cfg.ssd.storage_dir);
+    cfg.ssd.capacity_bytes = getenv_size("UMBP_SSD_CAPACITY", cfg.ssd.capacity_bytes);
+    cfg.eviction.policy = getenv_str("UMBP_EVICTION_POLICY", cfg.eviction.policy);
+    cfg.dram.high_watermark = getenv_double("UMBP_DRAM_HIGH_WM", cfg.dram.high_watermark);
+    cfg.dram.low_watermark = getenv_double("UMBP_DRAM_LOW_WM", cfg.dram.low_watermark);
 
     cfg.ssd_backend = getenv_str("UMBP_SSD_BACKEND", cfg.ssd_backend);
-    // Auto-detect: if UMBP_SPDK_NVME_PCI is set but UMBP_SSD_BACKEND is not,
-    // default to "spdk" so users don't have to specify both.
     if (cfg.ssd_backend == "posix" && !std::getenv("UMBP_SSD_BACKEND") &&
         std::getenv("UMBP_SPDK_NVME_PCI")) {
       cfg.ssd_backend = "spdk";
@@ -142,7 +211,6 @@ struct UMBPConfig {
     cfg.spdk_proxy_bin = getenv_str("UMBP_SPDK_PROXY_BIN", cfg.spdk_proxy_bin);
     cfg.spdk_proxy_startup_timeout_ms = getenv_int("UMBP_SPDK_PROXY_TIMEOUT_MS", cfg.spdk_proxy_startup_timeout_ms);
 
-    // --- Role auto-deduction ---
     std::string role_str = getenv_str("UMBP_ROLE", "");
     if (role_str == "leader") cfg.role = UMBPRole::SharedSSDLeader;
     else if (role_str == "follower") cfg.role = UMBPRole::SharedSSDFollower;

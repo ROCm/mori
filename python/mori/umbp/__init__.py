@@ -20,6 +20,30 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 """UMBP (Unified Memory/Bandwidth Pool) Python bindings via mori."""
-from mori.cpp import UMBPClient, UMBPConfig, UMBPRole
+from mori.cpp import (
+    UMBPClient,
+    UMBPConfig,
+    UMBPCopyPipelineConfig,
+    UMBPDramConfig,
+    UMBPDurabilityMode,
+    UMBPIoBackend,
+    UMBPIoConfig,
+    UMBPRole,
+    UMBPSsdConfig,
+    UMBPEvictionConfig,
+    UMBPDurabilityConfig,
+)
 
-__all__ = ["UMBPClient", "UMBPConfig", "UMBPRole"]
+__all__ = [
+    "UMBPClient",
+    "UMBPConfig",
+    "UMBPCopyPipelineConfig",
+    "UMBPDramConfig",
+    "UMBPDurabilityConfig",
+    "UMBPDurabilityMode",
+    "UMBPIoBackend",
+    "UMBPIoConfig",
+    "UMBPRole",
+    "UMBPSsdConfig",
+    "UMBPEvictionConfig",
+]

@@ -23,6 +23,7 @@ option(USE_ROCM "Whether to use rocm" ON)
 option(USE_BNXT "Whether to use BNXT NIC" OFF)
 option(USE_IONIC "Whether to use IONIC" OFF)
 option(BUILD_EXAMPLES "Whether to build examples" ON)
+option(WITH_MPI "Enable MPI support (required for mpi_bootstrap and C++ examples)" ${BUILD_EXAMPLES})
 option(BUILD_APPLICATION "Whether to build application library" ON)
 option(BUILD_SHMEM "Whether to build shmem library" ON)
 option(BUILD_OPS "Whether to build mori operation kernels" ON)
@@ -142,182 +143,26 @@ if(USE_IONIC)
 endif()
 message(STATUS "Host NIC: USE_BNXT=${USE_BNXT}, USE_IONIC=${USE_IONIC}")
 
-# ---------------------------------------------------------------------------
-# Device NIC: detect exactly one provider for IBGDA dispatch in device code.
-# Same logic as Python JIT detect_nic_type(): env > sysfs > lspci > host libs.
-# Sets MORI_DEVICE_NIC_DEFINE to the compile definition for device targets.
-# ---------------------------------------------------------------------------
-function(detect_device_nic out_var)
-  # 1. Env override
-  if(DEFINED ENV{MORI_DEVICE_NIC})
-    string(TOLOWER "$ENV{MORI_DEVICE_NIC}" _nic)
-    message(
-      STATUS "Device NIC: override from MORI_DEVICE_NIC=$ENV{MORI_DEVICE_NIC}")
-    set(${out_var}
-        "${_nic}"
-        PARENT_SCOPE)
-    return()
-  endif()
-
-  # 1. /sys/class/infiniband/ — pick NIC with most devices + verify library
-  file(GLOB _ib_devices "/sys/class/infiniband/*")
-  set(_bnxt 0)
-  set(_ionic 0)
-  set(_mlx5 0)
-  foreach(_dev ${_ib_devices})
-    get_filename_component(_name ${_dev} NAME)
-    if(_name MATCHES "^bnxt_re")
-      math(EXPR _bnxt "${_bnxt} + 1")
-    elseif(_name MATCHES "^ionic")
-      math(EXPR _ionic "${_ionic} + 1")
-    elseif(_name MATCHES "^mlx5")
-      math(EXPR _mlx5 "${_mlx5} + 1")
-    else()
-      execute_process(
-        COMMAND readlink -f "${_dev}/device/driver"
-        OUTPUT_VARIABLE _drv
-        OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET
-        RESULT_VARIABLE _rc)
-      if(_rc EQUAL 0)
-        get_filename_component(_drv_name "${_drv}" NAME)
-        if(_drv_name MATCHES "^bnxt")
-          math(EXPR _bnxt "${_bnxt} + 1")
-        elseif(_drv_name MATCHES "^ionic")
-          math(EXPR _ionic "${_ionic} + 1")
-        elseif(_drv_name MATCHES "^mlx5")
-          math(EXPR _mlx5 "${_mlx5} + 1")
-        endif()
-      endif()
-    endif()
-  endforeach()
-
-  # Pick the NIC with the most devices, verify library exists. Tie-break: mlx5 >
-  # bnxt > ionic (mlx5 inserted first = stable sort priority). Use ":" separator
-  # since ";" is CMake's list delimiter.
-  set(_sysfs_candidates "")
-  if(_mlx5 GREATER 0)
-    list(APPEND _sysfs_candidates "${_mlx5}:mlx5")
-  endif()
-  if(_bnxt GREATER 0)
-    list(APPEND _sysfs_candidates "${_bnxt}:bnxt")
-  endif()
-  if(_ionic GREATER 0)
-    list(APPEND _sysfs_candidates "${_ionic}:ionic")
-  endif()
-  if(_sysfs_candidates)
-    list(
-      SORT _sysfs_candidates
-      COMPARE NATURAL
-      ORDER DESCENDING)
-    message(
-      STATUS
-        "Device NIC: sysfs counts (mlx5=${_mlx5}, bnxt=${_bnxt}, ionic=${_ionic})"
-    )
-    foreach(_entry ${_sysfs_candidates})
-      string(REGEX REPLACE "^[0-9]+:" "" _nic "${_entry}")
-      if((_nic STREQUAL "bnxt"
-          AND BNXT_RE_LIB
-          AND _bnxt_headers_found)
-         OR (_nic STREQUAL "ionic" AND IONIC_LIB)
-         OR (_nic STREQUAL "mlx5" AND MLX5_LIB))
-        message(
-          STATUS "Device NIC: selected '${_nic}' (most devices with library)")
-        set(${out_var}
-            "${_nic}"
-            PARENT_SCOPE)
-        return()
-      else()
-        message(
-          STATUS "Device NIC: skipping '${_nic}' (missing library or headers)")
-      endif()
-    endforeach()
-  endif()
-
-  # 1. lspci PCI vendor ID — pick vendor with most devices + verify library
-  execute_process(
-    COMMAND lspci -nn -d ::0200
-    OUTPUT_VARIABLE _lspci
-    ERROR_QUIET
-    RESULT_VARIABLE _rc)
-  if(_rc EQUAL 0 AND _lspci)
-    string(REGEX MATCHALL "14e4" _b "${_lspci}")
-    string(REGEX MATCHALL "1dd8" _i "${_lspci}")
-    string(REGEX MATCHALL "15b3" _m "${_lspci}")
-    list(LENGTH _b _bp)
-    list(LENGTH _i _ip)
-    list(LENGTH _m _mp)
-
-    set(_lspci_candidates "")
-    if(_mp GREATER 0)
-      list(APPEND _lspci_candidates "${_mp}:mlx5")
-    endif()
-    if(_bp GREATER 0)
-      list(APPEND _lspci_candidates "${_bp}:bnxt")
-    endif()
-    if(_ip GREATER 0)
-      list(APPEND _lspci_candidates "${_ip}:ionic")
-    endif()
-    if(_lspci_candidates)
-      list(
-        SORT _lspci_candidates
-        COMPARE NATURAL
-        ORDER DESCENDING)
-      message(
-        STATUS
-          "Device NIC: lspci counts (mlx5=${_mp}, bnxt=${_bp}, ionic=${_ip})")
-      foreach(_entry ${_lspci_candidates})
-        string(REGEX REPLACE "^[0-9]+:" "" _nic "${_entry}")
-        if((_nic STREQUAL "bnxt"
-            AND BNXT_RE_LIB
-            AND _bnxt_headers_found)
-           OR (_nic STREQUAL "ionic" AND IONIC_LIB)
-           OR (_nic STREQUAL "mlx5" AND MLX5_LIB))
-          message(STATUS "Device NIC: selected '${_nic}' (lspci + library)")
-          set(${out_var}
-              "${_nic}"
-              PARENT_SCOPE)
-          return()
-        else()
-          message(
-            STATUS "Device NIC: skipping '${_nic}' (missing library or headers)"
-          )
-        endif()
-      endforeach()
-    endif()
-  endif()
-
-  # 1. Fallback: first available library (mlx5 preferred)
-  if(MLX5_LIB)
-    set(_nic "mlx5")
-  elseif(BNXT_RE_LIB AND _bnxt_headers_found)
-    set(_nic "bnxt")
-  elseif(IONIC_LIB)
-    set(_nic "ionic")
+if(DEFINED ENV{MORI_WITH_MPI})
+  string(TOUPPER "$ENV{MORI_WITH_MPI}" _env_with_mpi)
+  if(_env_with_mpi STREQUAL "ON")
+    message(STATUS "MPI: enabled via MORI_WITH_MPI env")
+    set(WITH_MPI ON CACHE BOOL "Enable MPI support" FORCE)
   else()
-    set(_nic "mlx5")
+    message(STATUS "MPI: disabled via MORI_WITH_MPI env")
+    set(WITH_MPI OFF CACHE BOOL "Enable MPI support" FORCE)
   endif()
-  message(STATUS "Device NIC: fallback to '${_nic}' (library detection)")
-  set(${out_var}
-      "${_nic}"
-      PARENT_SCOPE)
-endfunction()
-
-detect_device_nic(_detected_device_nic)
-if(_detected_device_nic STREQUAL "bnxt")
-  set(MORI_DEVICE_NIC_DEFINE
-      "MORI_DEVICE_NIC_BNXT"
-      CACHE STRING "Device NIC provider" FORCE)
-elseif(_detected_device_nic STREQUAL "ionic")
-  set(MORI_DEVICE_NIC_DEFINE
-      "MORI_DEVICE_NIC_IONIC"
-      CACHE STRING "Device NIC provider" FORCE)
-else()
-  set(MORI_DEVICE_NIC_DEFINE
-      ""
-      CACHE STRING "Device NIC provider" FORCE)
 endif()
-message(
-  STATUS "Device NIC: ${_detected_device_nic} (${MORI_DEVICE_NIC_DEFINE})")
+
+# ---------------------------------------------------------------------------
+# Device NIC + GPU arch detection (reuse the shared module in cmake/)
+# ---------------------------------------------------------------------------
+include(${CMAKE_SOURCE_DIR}/cmake/MoriDetectDevice.cmake)
+mori_detect_device_config()
+# Bridge: if user didn't set GPU_TARGETS explicitly, use the detected arch
+if(NOT DEFINED GPU_TARGETS AND MORI_GPU_ARCH)
+  set(GPU_TARGETS "${MORI_GPU_ARCH}" CACHE STRING "GPU architectures" FORCE)
+endif()
 
 message(STATUS "ENABLE_PROFILER = ${ENABLE_PROFILER}")
 if(ENABLE_PROFILER)
@@ -464,14 +309,47 @@ if(BUILD_IO)
   add_subdirectory(src/io)
 endif()
 
-if(BUILD_UMBP)
-  add_subdirectory(src/umbp)
-endif()
-
 if(BUILD_PYBINDS)
   add_subdirectory(src/pybind)
 endif()
 
+if(BUILD_UMBP)
+  add_subdirectory(src/umbp)
+endif()
+
 if(BUILD_TESTS)
+  enable_testing()
   add_subdirectory(tests/cpp)
 endif()
+
+# ---------------------------------------------------------------------------
+# Install rules
+# ---------------------------------------------------------------------------
+# Shared libraries
+if(BUILD_APPLICATION)
+  install(TARGETS mori_application LIBRARY DESTINATION lib)
+endif()
+if(BUILD_SHMEM)
+  install(TARGETS mori_shmem LIBRARY DESTINATION lib)
+endif()
+if(BUILD_OPS)
+  install(TARGETS mori_ops LIBRARY DESTINATION lib)
+endif()
+if(BUILD_IO)
+  install(TARGETS mori_io LIBRARY DESTINATION lib)
+endif()
+
+# Public headers
+install(DIRECTORY include/mori DESTINATION include)
+
+# CMake package config (enables find_package(mori) for external C++ users)
+install(FILES
+  cmake/mori-config.cmake
+  cmake/MoriDetectDevice.cmake
+  DESTINATION lib/cmake/mori)
+
+# Logging (spdlog is statically linked, but install the shared lib if built)
+if(TARGET spdlog)
+  install(TARGETS spdlog ARCHIVE DESTINATION lib)
+endif()
+

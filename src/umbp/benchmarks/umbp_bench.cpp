@@ -31,7 +31,7 @@
 #include <unistd.h>
 #endif
 
-#include "umbp/umbp_client.h"
+#include "umbp/local/umbp_client.h"
 
 static double NowSec() {
     auto tp = std::chrono::steady_clock::now();
@@ -407,7 +407,7 @@ static std::vector<BenchResult> ReadResultsFromPipe(int fd) {
 static int RunBenchmarkProcess(int rank_id, int num_ranks, int pipe_fd,
                                void* coord_ptr) {
     auto cfg = UMBPConfig::FromEnvironment();
-    cfg.dram_capacity_bytes = 64ULL * 1024 * 1024;
+    cfg.dram.capacity_bytes = 64ULL * 1024 * 1024;
 
     UMBPClient client(cfg);
 
@@ -494,7 +494,7 @@ static LatencyStats ComputeStats(std::vector<double>& samples_us) {
 
 static int RunLatencyBench() {
     auto cfg = UMBPConfig::FromEnvironment();
-    cfg.dram_capacity_bytes = 64ULL * 1024 * 1024;
+    cfg.dram.capacity_bytes = 64ULL * 1024 * 1024;
     UMBPClient client(cfg);
 
     auto* ssd = client.Storage().GetTier(StorageTier::LOCAL_SSD);

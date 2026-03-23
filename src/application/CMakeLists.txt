@@ -1,4 +1,12 @@
-find_package(MPI REQUIRED)
+if(WITH_MPI)
+  find_package(MPI)
+  if(NOT MPI_FOUND)
+    message(FATAL_ERROR
+      "MPI not found, but WITH_MPI=ON (enabled because BUILD_EXAMPLES=ON).\n"
+      "Please install MPI (e.g. 'apt install libopenmpi-dev') or disable examples with "
+      "'-DBUILD_EXAMPLES=OFF' / 'BUILD_EXAMPLES=OFF pip install .'")
+  endif()
+endif()
 find_package(hsa-runtime64 REQUIRED)
 find_package(hsakmt REQUIRED)
 #find_library(IONIC_LIBRARY 
@@ -30,9 +38,12 @@ if(BUILD_TORCH_BOOTSTRAP)
 endif()
 
 set(MORI_APP_SOURCES
-  bootstrap/mpi_bootstrap.cpp
   bootstrap/socket_bootstrap.cpp
   bootstrap/local_bootstrap.cpp)
+
+if(WITH_MPI)
+  list(PREPEND MORI_APP_SOURCES bootstrap/mpi_bootstrap.cpp)
+endif()
 
 if(BUILD_TORCH_BOOTSTRAP)
   list(APPEND MORI_APP_SOURCES bootstrap/torch_bootstrap.cpp)
@@ -66,7 +77,6 @@ find_library(HSA_RUNTIME_LIB hsa-runtime64 HINTS /opt/rocm/lib REQUIRED)
 target_link_libraries(
   mori_application
   PUBLIC
-  MPI::MPI_CXX
   ibverbs
   hip::host
   mlx5
@@ -75,6 +85,11 @@ target_link_libraries(
   mori_logging
   ${HSA_RUNTIME_LIB}
   hsakmt::hsakmt)
+
+if(WITH_MPI)
+  target_compile_definitions(mori_application PUBLIC MORI_WITH_MPI)
+  target_link_libraries(mori_application PUBLIC MPI::MPI_CXX)
+endif()
 #  ${IONIC_LIBRARY})
 
 if(USE_BNXT)

@@ -22,7 +22,6 @@
 #pragma once
 
 #include <assert.h>
-#include <mpi.h>
 
 #include <type_traits>
 
@@ -410,6 +409,56 @@ inline __device__ void ShmemAtomicSizeNonFetchWarpKernel<application::TransportT
     const void* dest, void* val, size_t bytes, core::atomicType amoType, int pe, int qpId) {
   ShmemAtomicSizeNonFetchWarpKernel<application::TransportType::P2P>(dest, val, bytes, amoType, pe,
                                                                      qpId);
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                                    GetMemNbi (SymmMemObjPtr)                                   */
+/* ---------------------------------------------------------------------------------------------- */
+// TODO: implement SDMA-specific GET, delegating to P2P for now
+template <>
+inline __device__ void ShmemGetMemNbiThreadKernel<application::TransportType::SDMA>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe, int qpId) {
+  ShmemGetMemNbiThreadKernel<application::TransportType::P2P>(dest, destOffset, source,
+                                                               sourceOffset, bytes, pe, qpId);
+}
+
+template <>
+inline __device__ void ShmemGetMemNbiWarpKernel<application::TransportType::SDMA>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe, int qpId) {
+  ShmemGetMemNbiWarpKernel<application::TransportType::P2P>(dest, destOffset, source, sourceOffset,
+                                                             bytes, pe, qpId);
+}
+
+template <>
+inline __device__ void ShmemGetMemNbiBlockKernel<application::TransportType::SDMA>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe, int qpId) {
+  ShmemGetMemNbiBlockKernel<application::TransportType::P2P>(dest, destOffset, source,
+                                                              sourceOffset, bytes, pe, qpId);
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                               GetMemNbi (Pure Address-Based)                                   */
+/* ---------------------------------------------------------------------------------------------- */
+// TODO: implement SDMA-specific GET, delegating to P2P for now
+template <>
+inline __device__ void ShmemGetMemNbiThreadKernel<application::TransportType::SDMA>(
+    void* dest, const void* source, size_t bytes, int pe, int qpId) {
+  ShmemGetMemNbiThreadKernel<application::TransportType::P2P>(dest, source, bytes, pe, qpId);
+}
+
+template <>
+inline __device__ void ShmemGetMemNbiWarpKernel<application::TransportType::SDMA>(
+    void* dest, const void* source, size_t bytes, int pe, int qpId) {
+  ShmemGetMemNbiWarpKernel<application::TransportType::P2P>(dest, source, bytes, pe, qpId);
+}
+
+template <>
+inline __device__ void ShmemGetMemNbiBlockKernel<application::TransportType::SDMA>(
+    void* dest, const void* source, size_t bytes, int pe, int qpId) {
+  ShmemGetMemNbiBlockKernel<application::TransportType::P2P>(dest, source, bytes, pe, qpId);
 }
 
 /* ---------------------------------------------------------------------------------------------- */

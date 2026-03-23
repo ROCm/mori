@@ -32,7 +32,9 @@ from setuptools.command.build_ext import build_ext
 
 _supported_arch_list = ["gfx942", "gfx950"]
 
-_REQUIRED_SYSTEM_DEPS = [
+_REQUIRED_SYSTEM_DEPS: list = []
+
+_MPI_SYSTEM_DEPS = [
     (
         "mpicc",
         ("libopenmpi-dev", "openmpi-devel"),
@@ -113,6 +115,51 @@ def _check_system_deps() -> None:
         f"Missing system packages: {', '.join(pkg_names)}. "
         "See messages above for install instructions."
     )
+
+
+def _invalidate_cmake_cache_if_changed(cmake_cache: "Path", cmake_args: list) -> None:
+    """Clear CMake cache if any -DKEY=VALUE arg differs from the cached value."""
+    if not cmake_cache.is_file():
+        return
+
+    # Parse -DKEY=VALUE args (normalize booleans to uppercase)
+    _BOOL_MAP = {"1": "ON", "TRUE": "ON", "YES": "ON", "0": "OFF", "FALSE": "OFF", "NO": "OFF"}
+
+    def _normalize(v: str) -> str:
+        return _BOOL_MAP.get(v.upper(), v)
+
+    new_opts: dict[str, str] = {}
+    for arg in cmake_args:
+        if arg.startswith("-D") and "=" in arg:
+            key, val = arg[2:].split("=", 1)
+            new_opts[key] = _normalize(val)
+
+    # Parse CMakeCache.txt: lines like KEY:TYPE=VALUE
+    cached_opts: dict[str, str] = {}
+    for line in cmake_cache.read_text().splitlines():
+        line = line.strip()
+        if line.startswith("#") or line.startswith("//") or "=" not in line:
+            continue
+        key_type, val = line.split("=", 1)
+        key = key_type.split(":")[0]
+        cached_opts[key] = _normalize(val)
+
+    changed = [
+        k for k, v in new_opts.items()
+        if k in cached_opts and cached_opts[k] != v
+    ]
+
+    # Also check stale CMAKE_MAKE_PROGRAM path
+    make_prog = cached_opts.get("CMAKE_MAKE_PROGRAM", "")
+    if make_prog and not os.path.isfile(make_prog):
+        changed.append("CMAKE_MAKE_PROGRAM (no longer exists)")
+
+    if changed:
+        print(f"[mori] CMake options changed ({', '.join(changed)}), clearing cache.")
+        cmake_cache.unlink()
+        cmake_files = cmake_cache.parent / "CMakeFiles"
+        if cmake_files.is_dir():
+            shutil.rmtree(cmake_files)
 
 
 def _detect_local_gpu_arch() -> str | None:
@@ -247,6 +294,12 @@ class CMakeBuild(build_ext):
             raise RuntimeError(
                 "CMake is required. Install via: pip install cmake  OR  sudo apt-get install cmake"
             ) from exn
+        mpi_enabled = (
+            os.environ.get("BUILD_EXAMPLES", "OFF").upper() == "ON"
+            or os.environ.get("MORI_WITH_MPI", "OFF").upper() == "ON"
+        )
+        if mpi_enabled:
+            _REQUIRED_SYSTEM_DEPS.extend(_MPI_SYSTEM_DEPS)
         _check_system_deps()
         for ext in self.extensions:
             self.build_extension(ext)
@@ -262,21 +315,6 @@ class CMakeBuild(build_ext):
         build_dir.mkdir(parents=True, exist_ok=True)
 
         cmake_cache = build_dir / "CMakeCache.txt"
-        if cmake_cache.is_file():
-            cache_text = cmake_cache.read_text()
-            for line in cache_text.splitlines():
-                if "CMAKE_MAKE_PROGRAM" in line and "=" in line:
-                    cached_path = line.split("=", 1)[1]
-                    if cached_path and not os.path.isfile(cached_path):
-                        print(
-                            f"[mori] Stale CMake cache: {cached_path} no longer exists. "
-                            "Re-running CMake configure (compiled objects preserved)."
-                        )
-                        cmake_cache.unlink()
-                        cmake_files = build_dir / "CMakeFiles"
-                        if cmake_files.is_dir():
-                            shutil.rmtree(cmake_files)
-                    break
 
         build_type = os.environ.get("CMAKE_BUILD_TYPE", "Release")
         unroll_value = os.environ.get("WARP_ACCUM_UNROLL", "1")
@@ -290,6 +328,10 @@ class CMakeBuild(build_ext):
         build_examples = os.environ.get("BUILD_EXAMPLES", "OFF")
         build_tests = os.environ.get("BUILD_TESTS", "OFF")
         build_umbp = os.environ.get("BUILD_UMBP", "OFF")
+        with_mpi = "ON" if (
+            build_examples.upper() == "ON"
+            or os.environ.get("MORI_WITH_MPI", "OFF").upper() == "ON"
+        ) else "OFF"
 
         cmake_args = [
             "cmake",
@@ -304,6 +346,7 @@ class CMakeBuild(build_ext):
             f"-DBUILD_EXAMPLES={build_examples}",
             f"-DBUILD_TESTS={build_tests}",
             f"-DBUILD_UMBP={build_umbp}",
+            f"-DWITH_MPI={with_mpi}",
             "-DBUILD_TORCH_BOOTSTRAP=OFF",
             "-B",
             str(build_dir),
@@ -319,6 +362,7 @@ class CMakeBuild(build_ext):
             cmake_args.append("-DCMAKE_C_COMPILER_LAUNCHER=ccache")
             cmake_args.append("-DCMAKE_CXX_COMPILER_LAUNCHER=ccache")
 
+        _invalidate_cmake_cache_if_changed(cmake_cache, cmake_args)
         subprocess.check_call(cmake_args)
         subprocess.check_call(
             ["cmake", "--build", ".", "-j", f"{os.cpu_count()}"], cwd=str(build_dir)

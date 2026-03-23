@@ -46,7 +46,7 @@
 #include "umbp/proxy/spdk_proxy_protocol.h"
 #include "umbp/proxy/spdk_proxy_shm.h"
 #include "umbp/spdk/spdk_env.h"
-#include "umbp/storage/spdk_ssd_tier.h"
+#include "umbp/local/storage/spdk_ssd_tier.h"
 
 #ifdef __linux__
 #include <sys/prctl.h>
@@ -920,8 +920,8 @@ int main(int argc, char** argv) {
     cfg.spdk_nvme_pci_addr = nvme_pci;
     cfg.spdk_nvme_ctrl_name = nvme_ctrl;
     cfg.spdk_io_workers = io_workers;
-    if (ssd_cap > 0) cfg.ssd_capacity_bytes = ssd_cap;
-    else cfg.ssd_capacity_bytes = static_cast<size_t>(-1);
+    if (ssd_cap > 0) cfg.ssd.capacity_bytes = ssd_cap;
+    else cfg.ssd.capacity_bytes = static_cast<size_t>(-1);
 
     SpdkSsdTier tier(cfg);
     if (!tier.IsValid()) {
