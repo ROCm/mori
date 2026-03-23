@@ -309,5 +309,7 @@ if(HAVE_GRPC)
                                                  ${_GRPCPP_LIB})
 
 else()
-  message(STATUS "[UMBP] gRPC/Protobuf not found — distributed control plane DISABLED (local-only build)")
+  message(WARNING "[UMBP] gRPC/Protobuf not found — distributed control plane DISABLED.\n"
+    "  Targets umbp_master/umbp_client/umbp_pool_client will NOT be available.\n"
+    "  Install gRPC + Protobuf to enable. Local SPDK/POSIX targets are unaffected.")
 endif()
