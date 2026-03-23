@@ -315,6 +315,14 @@ int LocalStorageManager::SpawnProxyDaemon() {
   }
 
   if (pid == 0) {
+    if (UmbpLogLevel() >= 1) {
+      int devnull = open("/dev/null", O_WRONLY);
+      if (devnull >= 0) {
+        dup2(devnull, STDOUT_FILENO);
+        dup2(devnull, STDERR_FILENO);
+        close(devnull);
+      }
+    }
     std::string spawner_pid_str = std::to_string(getppid());
     execlp(bin.c_str(), "spdk_proxy",
            "--spawner-pid", spawner_pid_str.c_str(),
