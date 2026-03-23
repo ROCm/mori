@@ -123,8 +123,8 @@ endfunction()
 function(_mori_detect_device_nic out_var)
   # Find NIC libraries (needed for validation)
   find_library(_mori_bnxt_re_lib NAMES bnxt_re)
-  find_library(_mori_ionic_lib NAMES ionic HINTS /lib/x86_64-linux-gnu)
-  find_library(_mori_mlx5_lib NAMES mlx5)
+  find_library(_mori_ionic_lib NAMES ionic HINTS /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu)
+  find_library(_mori_mlx5_lib NAMES mlx5 HINTS /usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu)
 
   find_path(_mori_bnxt_dv_hdr NAMES infiniband/bnxt_re_dv.h
     HINTS /usr/include /usr/local/include)

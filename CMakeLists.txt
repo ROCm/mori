@@ -45,8 +45,8 @@ find_library(BNXT_RE_LIB NAMES bnxt_re)
 find_library(
   IONIC_LIB
   NAMES ionic
-  HINTS /lib/x86_64-linux-gnu)
-find_library(MLX5_LIB NAMES mlx5)
+  HINTS /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu)
+find_library(MLX5_LIB NAMES mlx5 HINTS /usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu)
 
 find_path(
   BNXT_RE_DV_INCLUDE
