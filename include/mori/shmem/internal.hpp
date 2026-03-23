@@ -127,7 +127,7 @@ struct GpuStates {
 };
 
 // Changed from __constant__ to __device__ to allow hipMemcpyToSymbol updates (like rocshmem)
-extern __device__ __attribute__((visibility("default"))) GpuStates globalGpuStates;
+extern __device__ __attribute__((visibility("hidden"))) GpuStates globalGpuStates;
 
 static __device__ GpuStates* GetGlobalGpuStatesPtr() { return &globalGpuStates; }
 

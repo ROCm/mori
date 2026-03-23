@@ -19,19 +19,14 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+
 #pragma once
 
-#include <pybind11/pybind11.h>
-
-namespace mori {
-void RegisterMoriOps(pybind11::module_& m);
-void RegisterMoriShmem(pybind11::module_& m);
-void RegisterMoriIo(pybind11::module_& m);
-void RegisterMoriCcl(pybind11::module_& m);
-#ifdef BUILD_XLA_FFI_OPS
-void RegisterXLAFFIOps(pybind11::module_& m);
-#endif
-#ifdef MORI_BUILD_UMBP
-void RegisterMoriUmbp(pybind11::module_& m);
-#endif
-}  // namespace mori
+#include "mori/collective/all2all/sdma_all2all.hpp"
+#include "mori/collective/all2all/oneshot_all2all_sdma_class.hpp"
+#include "mori/collective/all2all/oneshot_all2all_sdma_async_kernel.hpp"
+#include "mori/collective/allgather/sdma_allgather.hpp"
+#include "mori/collective/allgather/oneshot_allgather_sdma_class.hpp"
+#include "mori/collective/allgather/oneshot_sdma_async_kernel.hpp"
+#include "mori/collective/allreduce/sdma_allreduce.hpp"
+#include "mori/collective/allreduce/twoshot_allreduce_sdma_class.hpp"

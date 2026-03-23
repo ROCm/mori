@@ -19,19 +19,19 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#pragma once
+#include "mori/collective/core/topology_detector.hpp"
 
-#include <pybind11/pybind11.h>
+#include <mpi.h>
+
+#include <cassert>
+
+#include "mori/collective/all2all/sdma_all2all.hpp"
+#include "mori/collective/allgather/sdma_allgather.hpp"
 
 namespace mori {
-void RegisterMoriOps(pybind11::module_& m);
-void RegisterMoriShmem(pybind11::module_& m);
-void RegisterMoriIo(pybind11::module_& m);
-void RegisterMoriCcl(pybind11::module_& m);
-#ifdef BUILD_XLA_FFI_OPS
-void RegisterXLAFFIOps(pybind11::module_& m);
-#endif
-#ifdef MORI_BUILD_UMBP
-void RegisterMoriUmbp(pybind11::module_& m);
-#endif
+namespace collective {
+
+
+
+}  // namespace collective
 }  // namespace mori

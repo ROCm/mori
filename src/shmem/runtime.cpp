@@ -26,6 +26,7 @@
 // and GpuStates management (shared with init.cpp).
 
 #include <cassert>
+#include <vector>
 
 #include "hip/hip_runtime_api.h"
 #include "mori/shmem/internal.hpp"
@@ -46,13 +47,13 @@ static hipFunction_t s_barrierFunc = nullptr;
 GpuStates s_hostGpuStatesCopy{};
 
 using GpuStatesAddrProvider = void* (*)();
-static GpuStatesAddrProvider s_gpuStatesAddrProvider = nullptr;
+static std::vector<GpuStatesAddrProvider> s_gpuStatesAddrProviders;
 
 using BarrierLauncher = void (*)(hipStream_t);
 static BarrierLauncher s_staticBarrierLauncher = nullptr;
 
 void RegisterGpuStatesAddrProvider(GpuStatesAddrProvider provider) {
-  s_gpuStatesAddrProvider = provider;
+  s_gpuStatesAddrProviders.push_back(provider);
 }
 
 void RegisterBarrierLauncher(BarrierLauncher launcher) { s_staticBarrierLauncher = launcher; }
@@ -92,8 +93,8 @@ void CopyGpuStatesToDevice(const GpuStates* gpuStates) {
         hipMemcpy(s_deviceGpuStatesAddr, gpuStates, sizeof(GpuStates), hipMemcpyHostToDevice));
   }
 
-  if (s_gpuStatesAddrProvider != nullptr) {
-    void* staticAddr = s_gpuStatesAddrProvider();
+  for (auto& provider : s_gpuStatesAddrProviders) {
+    void* staticAddr = provider();
     if (staticAddr != nullptr) {
       MORI_SHMEM_TRACE("Copying GpuStates to static globalGpuStates ({:p})", staticAddr);
       HIP_RUNTIME_CHECK(hipMemcpy(staticAddr, gpuStates, sizeof(GpuStates), hipMemcpyHostToDevice));
@@ -112,6 +113,7 @@ void FinalizeRuntime() {
     s_barrierFunc = nullptr;
   }
   s_hostGpuStatesCopy = {};
+  s_gpuStatesAddrProviders.clear();
 }
 
 /* ---------------------------------------------------------------------------------------------- */
