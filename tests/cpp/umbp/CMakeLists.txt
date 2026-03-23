@@ -7,4 +7,6 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(googletest)
 
 add_subdirectory(local)
-add_subdirectory(pool)
+if(TARGET umbp_common)
+  add_subdirectory(pool)
+endif()
