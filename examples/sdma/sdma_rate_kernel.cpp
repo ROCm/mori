@@ -5,7 +5,6 @@
  *
  * @note: This code is adapted/modified from the implementation by Sidler, David
  */
-
 #include "sdma_rate_kernel.h"
 
 __global__ void packet_rate_kernel(void* srcBuf, void* dstBuf, size_t copy_size, size_t numCopyCommands,
@@ -15,7 +14,7 @@ __global__ void packet_rate_kernel(void* srcBuf, void* dstBuf, size_t copy_size,
 {
    uint64_t base = 0;
    uint64_t pendingWptr = 0;
-
+   uint64_t slot_offset = 0;
    const int warpId = threadIdx.x / warpSize;
    const int laneId = threadIdx.x % warpSize;
    const int nWarps = blockDim.x / warpSize;
@@ -41,8 +40,7 @@ __global__ void packet_rate_kernel(void* srcBuf, void* dstBuf, size_t copy_size,
    {
       if (laneId == 0)
       {
-         uint64_t offset = 0;
-         base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_COPY_LINEAR), offset);
+         base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_COPY_LINEAR), slot_offset);
          pendingWptr = base;
          if (c == 0)
          {
@@ -51,7 +49,7 @@ __global__ void packet_rate_kernel(void* srcBuf, void* dstBuf, size_t copy_size,
 
          auto packet = anvil::CreateCopyPacket(srcPtr, dstPtr, copy_size);
 
-         handle.template placePacket<SDMA_PKT_COPY_LINEAR>(packet, pendingWptr, offset);
+         handle.template placePacket<SDMA_PKT_COPY_LINEAR>(packet, pendingWptr, slot_offset);
          srcPtr += copy_size;
          dstPtr += copy_size;
       }
@@ -59,12 +57,11 @@ __global__ void packet_rate_kernel(void* srcBuf, void* dstBuf, size_t copy_size,
 
    if (laneId == 0)
    {
-      uint64_t offset = 0;
-      base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_ATOMIC), offset);
+      base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_ATOMIC), slot_offset);
 
       pendingWptr = base;
       auto packet = anvil::CreateAtomicIncPacket(signal);
-      handle.template placePacket<SDMA_PKT_ATOMIC>(packet, pendingWptr, offset);
+      handle.template placePacket<SDMA_PKT_ATOMIC>(packet, pendingWptr, slot_offset);
    }
 
    if (laneId == 0)
