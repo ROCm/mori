@@ -682,6 +682,39 @@ bool SpdkProxyTier::TryShmCacheReadOne(const std::string& key,
 }
 
 // ---------------------------------------------------------------------------
+// Capabilities — advertise batch support so CopyToSSDBatch uses WriteBatch.
+// ---------------------------------------------------------------------------
+TierCapabilities SpdkProxyTier::Capabilities() const {
+    return {/*.zero_copy_read=*/false,
+            /*.batch_write=*/true,
+            /*.batch_read=*/true};
+}
+
+// ---------------------------------------------------------------------------
+// WriteBatch (bool) — called by CopyToSSDBatch; delegates to BatchWrite.
+// ---------------------------------------------------------------------------
+bool SpdkProxyTier::WriteBatch(
+    const std::vector<std::string>& keys,
+    const std::vector<const void*>& data_ptrs,
+    const std::vector<size_t>& sizes) {
+    auto results = BatchWrite(keys, data_ptrs, sizes);
+    for (bool ok : results) {
+        if (!ok) return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// ReadBatchIntoPtr (vector<bool>) — called by CopyToSSDBatch read path.
+// ---------------------------------------------------------------------------
+std::vector<bool> SpdkProxyTier::ReadBatchIntoPtr(
+    const std::vector<std::string>& keys,
+    const std::vector<uintptr_t>& dst_ptrs,
+    const std::vector<size_t>& sizes) {
+    return BatchReadIntoPtr(keys, dst_ptrs, sizes);
+}
+
+// ---------------------------------------------------------------------------
 // BatchWrite — write-through to daemon via ring buffer.
 // ---------------------------------------------------------------------------
 std::vector<bool> SpdkProxyTier::BatchWrite(
