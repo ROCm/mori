@@ -92,6 +92,18 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("worker_threads", &UMBPCopyPipelineConfig::worker_threads)
       .def_readwrite("batch_max_ops", &UMBPCopyPipelineConfig::batch_max_ops);
 
+  py::class_<UMBPDistributedConfig>(m, "UMBPDistributedConfig")
+      .def(py::init<>())
+      .def_readwrite("master_address", &UMBPDistributedConfig::master_address)
+      .def_readwrite("node_id", &UMBPDistributedConfig::node_id)
+      .def_readwrite("node_address", &UMBPDistributedConfig::node_address)
+      .def_readwrite("auto_heartbeat", &UMBPDistributedConfig::auto_heartbeat)
+      .def_readwrite("io_engine_host", &UMBPDistributedConfig::io_engine_host)
+      .def_readwrite("io_engine_port", &UMBPDistributedConfig::io_engine_port)
+      .def_readwrite("staging_buffer_size", &UMBPDistributedConfig::staging_buffer_size)
+      .def_readwrite("peer_service_port", &UMBPDistributedConfig::peer_service_port)
+      .def_readwrite("cache_remote_fetches", &UMBPDistributedConfig::cache_remote_fetches);
+
   py::class_<UMBPConfig>(m, "UMBPConfig")
       .def(py::init<>())
       .def_readwrite("dram", &UMBPConfig::dram)
@@ -100,7 +112,8 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("copy_pipeline", &UMBPConfig::copy_pipeline)
       .def_readwrite("role", &UMBPConfig::role)
       .def_readwrite("follower_mode", &UMBPConfig::follower_mode)
-      .def_readwrite("force_ssd_copy_on_write", &UMBPConfig::force_ssd_copy_on_write);
+      .def_readwrite("force_ssd_copy_on_write", &UMBPConfig::force_ssd_copy_on_write)
+      .def_readwrite("distributed", &UMBPConfig::distributed);
 
   py::class_<UMBPClient>(m, "UMBPClient")
       .def(py::init<const UMBPConfig&>(), py::arg("config") = UMBPConfig{})

@@ -112,18 +112,24 @@ Caller → UMBPClient::GetIntoPtr(key, dst, size)
   │
   ├─ [Local mode] return false  ← miss is final
   │
-  └─ [Distributed mode] pool_client_->FetchRemote(key, dst, size)
+  └─ [Distributed mode] pool_client_->GetRemote(key, dst, size)
       ├─ master_client_->RouteGet(key) → {node_B, "0:1024", DRAM, peer_addr}
       ├─ GetOrConnectPeer(node_B) → RDMA connection
       └─ RemoteDramRead(peer, buf=0, dst, size, offset=1024)
           └─ io_engine_->Read(staging, 0, remote_mem, 1024, size)
       │
       └─ Cache locally (if distributed.cache_remote_fetches):
-          ├─ storage_.WriteFromPtr(key, dst, size)
-          ├─ index_.Insert(key, {CPU_DRAM, 0, size})
+          ├─ storage_.WriteFromPtr(key, dst, size)     ← UMBPClient calls directly
+          ├─ index_.Insert(key, {CPU_DRAM, 0, size})   ← UMBPClient calls directly
           └─ pool_client_->RegisterWithMaster(key, size, "0:<Y>", DRAM)
              → block is now cached locally AND registered with Master
 ```
+
+**Phase 3 (DRAM-only):** `FetchRemote` only supports RDMA reads from remote DRAM.
+If the remote block is on SSD, the fetch fails and returns false.
+
+**Phase 6 (SSD support):** `FetchRemote` for SSD-resident remote blocks goes through
+PeerService gRPC staging (see Phase 6 data flow diagram).
 
 ### 3.4 Remove
 
@@ -140,6 +146,7 @@ Caller → UMBPClient::Remove(key)
 
 ### 3.5 Eviction / Demotion (DRAM → SSD tier change)
 
+**Phase 3 (DRAM-only):**
 ```
 LocalStorageManager::DemoteLRUForSpace(dram_tier)
   │
@@ -147,8 +154,17 @@ LocalStorageManager::DemoteLRUForSpace(dram_tier)
   ├─ MoveKey(victim_key, dram → ssd)
   └─ on_tier_change_(victim_key, CPU_DRAM, LOCAL_SSD)
        └─ [Distributed only] UMBPClient callback:
+          └─ pool_client_->UnregisterFromMaster(key)
+             → block is no longer remotely accessible (SSD not served yet)
+```
+
+**Phase 6 (SSD support):**
+```
+  └─ on_tier_change_(victim_key, CPU_DRAM, LOCAL_SSD)
+       └─ [Distributed only] UMBPClient callback:
           └─ pool_client_->UpdateMasterRegistration(key, new_location_id, SSD)
-             └─ Unregister old DRAM location, Register new SSD location
+             → Unregister old DRAM location, Register new SSD location
+             → block remains remotely accessible via PeerService staging
 ```
 
 **Local mode:** `on_tier_change_` callback is not set, so no Master update occurs.
@@ -170,22 +186,44 @@ LocalStorageManager::DemoteLRUForSpace(dram_tier)
 itself as a node, and sends periodic heartbeats. All Put/Get/Remove behavior is
 unchanged (local-only). The Master can see the node is alive.
 
-### Phase 2: PoolClient Refactor + DramTier Accessors
+### Phase 2: PoolClient Refactor + DramTier Accessors (DRAM-only)
 
 | File | Change |
 |------|--------|
 | `include/umbp/local/storage/dram_tier.h` | Add `void* GetBasePtr() const` (returns `base_ptr_`) and `std::optional<size_t> GetSlotOffset(const std::string& key) const` (looks up `slots_[key].offset` under lock, returns nullopt if key not found). |
 | `local/storage/dram_tier.cpp` | Implement `GetSlotOffset()`. |
-| `include/umbp/distributed/pool_client.h` | Add delegation pointers to `PoolClientConfig`: `local_storage`, `local_index`, `dram_base_ptr`, `dram_capacity`, `ssd_dir`, `ssd_capacity`. Add new methods: `RegisterWithMaster(key, size, location_id, tier)`, `FetchRemote(key, dst, size)`, `UnregisterFromMaster(key)`. |
-| `distributed/pool_client.cpp` | Implement new methods. In `Init()`, when `dram_base_ptr` is set, register it as the RDMA-exportable buffer instead of iterating `dram_buffers`. When `local_storage` delegate is set, redirect `PutLocalDram/GetLocalDram/PutLocalSsd/GetLocalSsd` to delegate (for remote-originated writes routed to this node). |
+| `include/umbp/distributed/pool_client.h` | No delegation pointers, no new config fields. Add new methods: `RegisterWithMaster(key, size, location_id, tier)`, `GetRemote(key, dst, size)`, `PutRemote(key, src, size)`, `UnregisterFromMaster(key)`. Keep `PutLocalDram/GetLocalDram/PutLocalSsd/GetLocalSsd` as-is — they are bypassed by the new methods but retained for existing tests. |
+| `distributed/pool_client.cpp` | Implement new methods. DRAM buffer registration uses the existing `RegisterMemory(ptr, size)` method — UMBPClient calls it in Phase 3 with `DramTier::GetBasePtr()`. No delegation redirects — PoolClient only handles Master registration and RDMA. |
 
-### Phase 3: Wire UMBPClient → PoolClient
+**Design principle:** No delegation functions. UMBPClient owns both `storage_` and
+`pool_client_` and orchestrates all flows top-down. PoolClient never touches local
+storage directly — it only handles cluster interactions (Master gRPC + RDMA).
+
+**New methods are the remote-only subsets of the current `Put`/`Get`:**
+
+| Current method | New method | What it extracts |
+|----------------|------------|------------------|
+| `Put` (lines 294–377) | `RegisterWithMaster` | The `master_client_->Register()` call at the end (line 364). UMBPClient already wrote locally; this just makes the block discoverable. |
+| `Put` (lines 294–377) | `PutRemote` | The remote DRAM branch (lines 344–350): `RoutePut` → `GetOrConnectPeer` → `RemoteDramWrite`. Only the `!is_local && DRAM` case. |
+| `Get` (lines 379–422) | `GetRemote` | The remote DRAM branch (lines 406–411): `RouteGet` → `GetOrConnectPeer` → `RemoteDramRead`. Only the `!is_local && DRAM` case. |
+| `Put`/`Get` | (removed) | Local DRAM/SSD branches → handled by UMBPClient via `storage_` directly. |
+| `Put`/`Get` | (Phase 6) | Remote SSD branches (`RemoteSsdWrite`/`RemoteSsdRead`) → deferred. |
+
+**DRAM-only scope:** `GetRemote` and `PutRemote` only support RDMA reads/writes
+to remote DRAM. If the target block is on a remote node's SSD, the operation fails.
+SSD support is deferred to Phase 6.
+
+### Phase 3: Wire UMBPClient → PoolClient (DRAM-only)
 
 | File | Change |
 |------|--------|
-| `local/umbp_client.cpp` | Extend constructor to set delegation pointers (`local_storage`, `local_index`), export DramTier buffer for RDMA (`dram_base_ptr`, `dram_capacity`), export SSD config (`ssd_dir`, `ssd_capacity`), and populate `tier_capacities`. Install `on_tier_change_` callback that unregisters old location and registers new location on tier change. Modify `Put`, `PutFromPtr`, `BatchPutFromPtr`, `BatchPutFromPtrWithDepth`: after local write, if `pool_client_` is non-null, get slot offset from DramTier and call `RegisterWithMaster`. Modify `GetIntoPtr`, `BatchGetIntoPtr`: on local miss, if `pool_client_` is non-null, call `FetchRemote`; on success, optionally cache locally and register with Master. Modify `Remove`: if `pool_client_` is non-null, call `UnregisterFromMaster`. `Clear`: let Master reap stale entries via heartbeat timeout. |
+| `local/umbp_client.cpp` | Extend constructor to export DramTier buffer for RDMA via `pool_client_->RegisterMemory(dram_tier.GetBasePtr(), dram_capacity)`. No new config fields needed, no delegation pointers, no SSD export. Install `on_tier_change_` callback: on DRAM→SSD demotion, **unregister** the block from Master (block is no longer remotely accessible until Phase 6 adds SSD serving). On full eviction, also unregister. Modify `Put`, `PutFromPtr`, `BatchPutFromPtr`, `BatchPutFromPtrWithDepth`: after local write, if `pool_client_` is non-null, get slot offset from DramTier and call `RegisterWithMaster` (DRAM tier only). Modify `GetIntoPtr`, `BatchGetIntoPtr`: on local miss, if `pool_client_` is non-null, call `GetRemote` (DRAM-only RDMA); on success, optionally cache locally and register with Master. Modify `Remove`: if `pool_client_` is non-null, call `UnregisterFromMaster`. `Clear`: let Master reap stale entries via heartbeat timeout. |
 | `include/umbp/local/storage/local_storage_manager.h` | Add `TierChangeCallback` typedef and `SetOnTierChange()` method. |
 | `local/storage/local_storage_manager.cpp` | Call `on_tier_change_` in `MoveKey()` and `Evict()` after successful tier change. |
+
+**DRAM-only implication:** Only blocks in DRAM are visible to the cluster. When a block
+is demoted to SSD, it becomes "local-only" again until Phase 6. This is acceptable
+because hot blocks stay in DRAM, and nodes primarily read recent data from peers.
 
 ### Phase 4: Build System + Python Bindings
 
@@ -199,6 +237,41 @@ unchanged (local-only). The Master can see the node is alive.
 | File | Change |
 |------|--------|
 | `sglang/.../umbp_store.py` | Read distributed config from `extra_config`. When `distributed_enabled` is set, construct `UMBPDistributedConfig`, populate fields from extra config, and assign to `cfg.distributed`. No other changes to `UMBPStore` — Put/Get/Remove are transparently enhanced by `pool_client_` inside `UMBPClient`. |
+
+### Phase 6: Remote SSD Support
+
+| File | Change |
+|------|--------|
+| `include/umbp/local/umbp_client.h` | Add `bool ReadForRemotePeer(const std::string& key, void* dst, size_t size)` — public method for PeerService to request data that may reside on SSD. UMBPClient reads from `storage_` (which handles DRAM/SSD transparently), stages into `dst`, and returns success. This keeps UMBPClient as the **sole entry point** to local storage. |
+| `local/umbp_client.cpp` | Implement `ReadForRemotePeer`: read from `storage_.ReadIntoPtr()`. If the block is on SSD, this triggers SSD I/O transparently. No index mutation, no Master registration — this is a read-only serving path. |
+| `include/umbp/distributed/pool_client.h` | Add `SetRemoteReadCallback(std::function<bool(key, dst, size)>)` to `PoolClient`. PeerService uses this callback when a remote node requests a block that is on SSD (not directly RDMA-readable). |
+| `distributed/pool_client.cpp` | Wire PeerService to use the callback for SSD-resident block requests. When a remote `RouteGet` returns a SSD location on this node, PeerService calls the callback to stage data into RDMA-exportable memory, then completes the RDMA transfer. |
+| `distributed/peer_service.cpp` | On incoming remote read for a SSD-resident block: call `remote_read_callback_(key, staging_buf, size)` instead of directly accessing SSD. Stage the result into RDMA buffer and complete the transfer. |
+| `local/umbp_client.cpp` | In constructor (distributed mode): call `pool_client_->SetRemoteReadCallback(...)` with a lambda that calls `this->ReadForRemotePeer(...)`. Update `on_tier_change_` callback: on DRAM→SSD demotion, **re-register** with Master at new SSD location (instead of unregistering). Block remains remotely accessible via PeerService staging. |
+
+**Design principle:** PeerService never touches `LocalStorageManager` or `SsdTier`
+directly. Instead it calls back through UMBPClient via a `std::function` callback.
+This ensures:
+- **Single entry point:** All local storage access flows through UMBPClient
+- **Thread safety:** UMBPClient controls locking order — no risk of PeerService
+  acquiring locks in wrong order
+- **No circular header dependency:** PeerService holds a `std::function`, not a
+  `UMBPClient*`
+
+**Data flow for remote SSD read:**
+```
+Remote Node B                          This Node A (block on SSD)
+    │                                       │
+    ├─ RouteGet(key) → Master ──────────► {node_A, ssd_location}
+    │                                       │
+    ├─ gRPC to PeerService(node_A) ────►  PeerService receives request
+    │                                       ├─ remote_read_callback_(key, staging, size)
+    │                                       │   └─ UMBPClient::ReadForRemotePeer()
+    │                                       │       └─ storage_.ReadIntoPtr() (SSD I/O)
+    │                                       ├─ Data now in staging buffer (RDMA-registered)
+    │                                       └─ RDMA write staging → Node B
+    ◄──────────────────────────────────── Data arrives at Node B
+```
 
 ---
 
@@ -238,20 +311,34 @@ is needed later.
 
 ## 6. Thread Safety
 
+### Phase 3 (DRAM-only, no delegation)
+
 | Interaction | Direction | Safety |
 |-------------|-----------|--------|
 | `UMBPClient` → `PoolClient::RegisterWithMaster` | After local write | Sequential in Put path; PoolClient has its own `cache_mutex_` |
-| `UMBPClient` → `PoolClient::FetchRemote` | On local miss in Get | Sequential in Get path; RDMA and staging have own mutexes |
+| `UMBPClient` → `PoolClient::GetRemote` | On local miss in Get | Sequential in Get path; RDMA and staging have own mutexes |
 | `LocalStorageManager` → `on_tier_change_` callback | During eviction | Callback must NOT call back into `LocalStorageManager` (deadlock risk) |
-| `PoolClient` → `config_.local_storage` (delegation) | For remote-originated local writes | `LocalStorageManager` tier backends have their own locks |
 
-**No circular lock dependency**: UMBPClient → PoolClient → Master (gRPC, network).
-PoolClient → LocalStorageManager → TierBackend. These are one-directional.
+**No delegation = no reverse calls.** Lock order is strictly one-directional:
+UMBPClient → PoolClient → Master (gRPC, network). PoolClient never calls back
+into UMBPClient or LocalStorageManager.
 
 The `on_tier_change_` callback fires inside `LocalStorageManager::MoveKey()` which
 may hold tier locks. The callback must only call `PoolClient` methods (which go to
 gRPC/network, no local locks). This is safe as long as the callback does NOT call
 `storage_.Write/Read/Evict`.
+
+### Phase 6 (SSD support adds one reverse path)
+
+| Interaction | Direction | Safety |
+|-------------|-----------|--------|
+| `PeerService` → `remote_read_callback_` → `UMBPClient::ReadForRemotePeer` | Remote read request | PeerService holds no UMBPClient locks; `ReadForRemotePeer` acquires `storage_` locks independently |
+
+**New reverse path:** PeerService → UMBPClient → `storage_`. This is safe because:
+- PeerService uses a `std::function` callback, not a direct `UMBPClient*` (no header dependency)
+- PeerService holds no locks from UMBPClient or LocalStorageManager when calling the callback
+- `ReadForRemotePeer` is read-only — it does not mutate `index_` or call `PoolClient`
+- Lock order: PeerService (gRPC thread) → UMBPClient::ReadForRemotePeer → storage_ tier locks. No overlap with the forward path (UMBPClient → PoolClient → PeerService)
 
 ---
 
@@ -266,17 +353,26 @@ gRPC/network, no local locks). This is safe as long as the callback does NOT cal
 | `test_dram_get_base_ptr` | `DramTier::GetBasePtr()` returns non-null after construction |
 | `test_dram_get_slot_offset` | Write key, verify offset returned. Evict, verify nullopt. |
 | `test_pool_client_register` | `RegisterWithMaster` → Master sees the block |
-| `test_pool_client_fetch_remote` | `FetchRemote` retrieves data from remote node |
+| `test_pool_client_get_remote` | `GetRemote` retrieves data from remote node's DRAM via RDMA |
+| `test_pool_client_put_remote` | `PutRemote` writes data to remote node's DRAM via RDMA |
 | `test_pool_client_unregister` | `UnregisterFromMaster` → Master no longer has the block |
 
-### Integration Tests
+### Integration Tests (Phase 3, DRAM-only)
 
 | Test | Description |
 |------|-------------|
 | `test_two_node_put_get` | Node A puts, Node B gets via RDMA. Verify data integrity. |
 | `test_remote_cache_local` | After remote fetch, verify `Exists()` returns true on fetcher. |
 | `test_remove_propagation` | Put on A, Remove on A. Get from B fails. |
-| `test_eviction_tier_update` | Fill DRAM past watermark. Verify Master registration updates. |
+| `test_eviction_unregisters` | Fill DRAM past watermark. Verify demoted block is **unregistered** from Master. Remote Get fails. |
+
+### Integration Tests (Phase 6, SSD support)
+
+| Test | Description |
+|------|-------------|
+| `test_remote_ssd_read` | Node A puts, block demoted to SSD. Node B gets via PeerService staging. Verify data integrity. |
+| `test_eviction_tier_update` | Fill DRAM past watermark. Verify Master registration **updates** to SSD location (not unregistered). Remote Get succeeds via PeerService. |
+| `test_peer_service_callback` | Verify PeerService calls `ReadForRemotePeer` (not SsdTier directly) for SSD-resident blocks. |
 
 ### E2E Test
 
@@ -300,20 +396,34 @@ Phase 1  ───────────────────────�
 
 Phase 2  ──────────────────────────────────────────────────  PR #2
   ├─ dram_tier.h/cpp: GetBasePtr(), GetSlotOffset()
-  ├─ pool_client.h/cpp: delegation pointers, new methods
+  ├─ pool_client.h/cpp: no delegates, DRAM-only methods
+  │   ├─ RegisterWithMaster, GetRemote, PutRemote, UnregisterFromMaster
+  │   └─ Keep PutLocalDram/GetLocalDram/PutLocalSsd/GetLocalSsd (existing tests)
   ├─ pool_client_main.cpp: adapt for new config shape
   └─ Existing distributed tests pass
 
 Phase 3  ──────────────────────────────────────────────────  PR #3
-  ├─ umbp_client.cpp: wire DRAM/SSD export, delegation, tier_capacities
+  ├─ umbp_client.cpp: call RegisterMemory(GetBasePtr(), capacity) (no SSD export)
   ├─ umbp_client.cpp: wire Put/Get/Remove with runtime pool_client_ checks
+  ├─ on_tier_change_: DRAM→SSD = unregister from Master (DRAM-only)
   ├─ local_storage_manager.h/cpp: on_tier_change_ callback
-  └─ New distributed unit + integration tests
+  └─ New distributed unit + integration tests (DRAM-only)
 
 Phase 4  ──────────────────────────────────────────────────  PR #4
   ├─ pybind_umbp.cpp: bind UMBPDistributedConfig
   ├─ umbp_store.py: read distributed config from extra_config
   └─ E2E test with SGLang
+
+Phase 5  ──────────────────────────────────────────────────  PR #5
+  └─ (Python consumer adaptation, same as before)
+
+Phase 6  ──────────────────────────────────────────────────  PR #6
+  ├─ umbp_client.h/cpp: ReadForRemotePeer() method
+  ├─ pool_client.h/cpp: SetRemoteReadCallback(), wire PeerService
+  ├─ peer_service.cpp: use callback for SSD-resident block requests
+  ├─ umbp_client.cpp: update on_tier_change_ to re-register SSD location
+  │   (instead of unregistering — block stays remotely accessible)
+  └─ Tests: remote SSD read, tier demotion with continued remote access
 ```
 
 ---
@@ -328,10 +438,10 @@ Phase 4  ───────────────────────�
    key. For batch misses, launching parallel RDMA reads would improve throughput. This can be
    a follow-up optimization.
 
-3. **Eviction vs. Master registration**: When a block is fully evicted (removed from both DRAM
-   and SSD), should we unregister from Master? Yes — otherwise remote nodes will try to read
-   stale data. The `on_tier_change_` callback with `new_tier = EVICTED` (or a separate
-   `on_evict_` callback) handles this.
+3. **Eviction vs. Master registration**: Resolved by phased approach. Phase 3 (DRAM-only):
+   any demotion out of DRAM unregisters from Master. Phase 6 (SSD support): DRAM→SSD
+   re-registers at SSD location; full eviction (removed from both tiers) unregisters.
+   The `on_tier_change_` callback handles both cases.
 
 4. **`Clear()` behavior**: Should `Clear()` unregister all blocks from Master? For bulk reset
    this could be expensive. Alternative: let the Master reap stale entries via heartbeat
