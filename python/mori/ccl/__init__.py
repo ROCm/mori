@@ -19,8 +19,9 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-from . import cpp
-from . import ops
-from . import shmem
-from . import io
-from . import ccl
+
+from .collective import All2allSdma
+from .collective import AllgatherSdma
+from .collective import AllreduceSdma
+
+__all__ = ['All2allSdma', 'AllgatherSdma', 'AllreduceSdma']
