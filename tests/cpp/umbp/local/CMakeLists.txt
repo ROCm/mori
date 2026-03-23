@@ -31,3 +31,8 @@ add_test(NAME test_ssd_tier COMMAND test_ssd_tier)
 # Benchmark (manual run only, not registered as a test)
 add_executable(bench_umbp bench_umbp.cpp)
 target_link_libraries(bench_umbp PRIVATE umbp_core)
+
+if(UNIX)
+  add_executable(bench_umbp_spdk bench_umbp_spdk.cpp)
+  target_link_libraries(bench_umbp_spdk PRIVATE umbp_core)
+endif()
