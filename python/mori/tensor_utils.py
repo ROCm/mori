@@ -192,6 +192,14 @@ def _init_dtype_info():
         )
     if hasattr(torch, "float8_e4m3fn"):
         _DTYPE_INFO[torch.float8_e4m3fn] = ("<u1", 1, torch.float8_e4m3fn, kDLUInt, 8)
+    if hasattr(torch, "float8_e8m0fnu"):
+        _DTYPE_INFO[torch.float8_e8m0fnu] = (
+            "<u1",
+            1,
+            torch.float8_e8m0fnu,
+            kDLUInt,
+            8,
+        )
     if hasattr(torch, "float4_e2m1fn_x2"):
         _DTYPE_INFO[torch.float4_e2m1fn_x2] = (
             "<u1",
