@@ -2250,6 +2250,58 @@ static void BenchStorageIoDriver(const BenchConfig& cfg,
                  WallSeconds(run_start, run_end), results);
   }
 
+  // --- ReadBatch ---
+  {
+    ScopedFd batch_fd = OpenBenchFile(tmp.path + "/read_batch.bin");
+    for (size_t i = 0; i < values.size(); ++i) {
+      EnsureIoOk(
+          driver->WriteAt(batch_fd.fd, values[i].data(), values[i].size(), i * cfg.value_size),
+          "prefill ReadBatch");
+    }
+    EnsureIoOk(driver->Sync(batch_fd.fd), "sync ReadBatch");
+
+    size_t total_batches = (values.size() + cfg.batch_size - 1) / cfg.batch_size;
+    std::vector<std::vector<char>> read_buffers(values.size(), std::vector<char>(cfg.value_size));
+    std::vector<std::vector<IoReadOp>> read_batches;
+    read_batches.reserve(total_batches);
+    for (size_t i = 0; i < values.size(); i += cfg.batch_size) {
+      size_t end = std::min(i + cfg.batch_size, values.size());
+      std::vector<IoReadOp> ops;
+      ops.reserve(end - i);
+      for (size_t j = i; j < end; ++j) {
+        ops.push_back(
+            {batch_fd.fd, read_buffers[j].data(), read_buffers[j].size(), j * cfg.value_size});
+      }
+      read_batches.push_back(std::move(ops));
+    }
+
+    bench::ResultTally tally;
+    tally.ReserveLatencySamples(values.size() * cfg.measure_iters);
+
+    for (size_t w = 0; w < cfg.warmup_iters; ++w) {
+      for (const auto& ops : read_batches) {
+        EnsureIoOk(driver->ReadBatch(ops), "warmup ReadBatch");
+      }
+    }
+
+    auto run_start = Clock::now();
+    for (size_t m = 0; m < cfg.measure_iters; ++m) {
+      for (const auto& ops : read_batches) {
+        auto t0 = Clock::now();
+        EnsureIoOk(driver->ReadBatch(ops), "ReadBatch");
+        auto t1 = Clock::now();
+        tally.AddSample(ops.size(), ops.size(), ops.size() * cfg.value_size,
+                        ops.size() * cfg.value_size,
+                        std::chrono::duration<double, std::micro>(t1 - t0).count());
+      }
+    }
+    auto run_end = Clock::now();
+
+    RecordResult("Driver ReadBatch",
+                 JoinVariant({backend_variant, "bs=" + std::to_string(cfg.batch_size)}), tally,
+                 WallSeconds(run_start, run_end), results);
+  }
+
   // --- Sync ---
   {
     ScopedFd sync_fd = OpenBenchFile(tmp.path + "/sync.bin");
