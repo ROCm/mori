@@ -91,6 +91,28 @@ class TierBackend {
   // Default delegates to GetLRUKey(); override in tiers with LRU tracking.
   virtual std::vector<std::string> GetLRUCandidates(size_t max_candidates) const;
 
+  // Batch write: write multiple keys in one call.
+  // Default loops over Write(). Override for deep-queue NVMe pipeline.
+  virtual std::vector<bool> BatchWrite(
+      const std::vector<std::string>& keys,
+      const std::vector<const void*>& data_ptrs,
+      const std::vector<size_t>& sizes);
+
+  // Batch read into user pointers. Default loops over ReadIntoPtr().
+  virtual std::vector<bool> BatchReadIntoPtr(
+      const std::vector<std::string>& keys,
+      const std::vector<uintptr_t>& dst_ptrs,
+      const std::vector<size_t>& sizes);
+
+  // Ensure all prior writes are durable and visible to readers.
+  // Default is a no-op (write-through tiers are always consistent).
+  // SpdkProxyTier overrides this to drain pending write-back NVMe flushes.
+  virtual bool Flush() { return true; }
+
+  // Toggle cold-read mode: bypass all caches, read directly from storage.
+  // SSDTier: O_DIRECT; SpdkProxyTier: skip ring buffer cache.
+  virtual void SetColdRead(bool /*enable*/) {}
+
   // Which StorageTier does this backend represent?
   StorageTier tier_id() const { return tier_id_; }
 

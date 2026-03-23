@@ -31,3 +31,17 @@ add_test(NAME test_ssd_tier COMMAND test_ssd_tier)
 # Benchmark (manual run only, not registered as a test)
 add_executable(bench_umbp bench_umbp.cpp)
 target_link_libraries(bench_umbp PRIVATE umbp_core)
+
+if(UNIX)
+  add_executable(bench_umbp_spdk bench_umbp_spdk.cpp)
+  target_link_libraries(bench_umbp_spdk PRIVATE umbp_core)
+
+  if(TARGET spdk_proxy)
+    add_dependencies(bench_umbp_spdk spdk_proxy)
+    add_custom_command(TARGET bench_umbp_spdk POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E create_symlink
+              $<TARGET_FILE:spdk_proxy>
+              $<TARGET_FILE_DIR:bench_umbp_spdk>/spdk_proxy
+      COMMENT "Symlink spdk_proxy next to bench_umbp_spdk")
+  endif()
+endif()

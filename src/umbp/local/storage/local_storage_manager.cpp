@@ -22,10 +22,25 @@
 #include "umbp/local/storage/local_storage_manager.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstring>
 #include <stdexcept>
+#include <thread>
 
+#include "umbp/common/log.h"
 #include "umbp/local/storage/dram_tier.h"
 #include "umbp/local/storage/ssd_tier.h"
+#ifdef USE_SPDK
+#include "umbp/local/storage/spdk_ssd_tier.h"
+#endif
+#ifdef __linux__
+#include "umbp/local/storage/spdk_proxy_tier.h"
+#include "umbp/proxy/spdk_proxy_shm.h"
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 // ---------------------------------------------------------------------------
 // ExtractBaseHash
@@ -203,6 +218,126 @@ bool LocalStorageManager::WriteFromPtrWithDepth(const std::string& key, uintptr_
   return ok;
 }
 
+// ---------------------------------------------------------------------------
+// Destructor — graceful proxy shutdown if we spawned it
+// ---------------------------------------------------------------------------
+LocalStorageManager::~LocalStorageManager() {
+#ifdef __linux__
+  tiers_.clear();
+
+  if (proxy_child_pid_ > 0) {
+    umbp::proxy::ProxyShmRegion shm;
+    if (shm.Attach(proxy_shm_name_) == 0) {
+      shm.Header()->shutdown_requested.store(1, std::memory_order_release);
+    }
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    bool exited = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+      int status = 0;
+      pid_t r = waitpid(proxy_child_pid_, &status, WNOHANG);
+      if (r == proxy_child_pid_ || r == -1) {
+        exited = true;
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    if (!exited) {
+      UMBP_LOG_WARN("LSM: proxy pid=%d did not exit in time, sending SIGKILL",
+                     proxy_child_pid_);
+      kill(proxy_child_pid_, SIGKILL);
+      waitpid(proxy_child_pid_, nullptr, 0);
+    }
+    proxy_child_pid_ = -1;
+
+    umbp::proxy::ProxyShmRegion::CleanupStale(proxy_shm_name_);
+  }
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Auto-fork proxy daemon (Linux only)
+// ---------------------------------------------------------------------------
+#ifdef __linux__
+static std::string FindProxyBinary(const std::string& explicit_path) {
+  if (!explicit_path.empty()) {
+    if (access(explicit_path.c_str(), X_OK) == 0) return explicit_path;
+    UMBP_LOG_WARN("LSM: UMBP_SPDK_PROXY_BIN='%s' not executable",
+                   explicit_path.c_str());
+  }
+
+  char exe_buf[4096];
+  ssize_t len = readlink("/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
+  if (len > 0) {
+    exe_buf[len] = '\0';
+    std::string dir(exe_buf);
+    size_t slash = dir.rfind('/');
+    if (slash != std::string::npos) {
+      dir.resize(slash + 1);
+      std::string candidate = dir + "spdk_proxy";
+      if (access(candidate.c_str(), X_OK) == 0) return candidate;
+    }
+  }
+
+  return "spdk_proxy";
+}
+
+int LocalStorageManager::SpawnProxyDaemon() {
+  int probe = umbp::proxy::ProxyShmRegion::ProbeExisting(proxy_shm_name_);
+  if (probe == 1 || probe == -1) {
+    UMBP_LOG_INFO("LSM: killing existing proxy on SHM '%s'", proxy_shm_name_.c_str());
+    umbp::proxy::ProxyShmRegion tmp;
+    if (tmp.Attach(proxy_shm_name_) == 0) {
+      auto* hdr = tmp.Header();
+      uint32_t old_pid = hdr->proxy_pid.load(std::memory_order_relaxed);
+      if (old_pid > 0) {
+        hdr->shutdown_requested.store(1, std::memory_order_release);
+        kill(static_cast<pid_t>(old_pid), SIGTERM);
+        for (int i = 0; i < 50 && kill(static_cast<pid_t>(old_pid), 0) == 0; ++i)
+          usleep(100000);
+        if (kill(static_cast<pid_t>(old_pid), 0) == 0) {
+          UMBP_LOG_WARN("LSM: old proxy pid=%u did not exit, sending SIGKILL", old_pid);
+          kill(static_cast<pid_t>(old_pid), SIGKILL);
+        }
+      }
+    }
+  }
+
+  umbp::proxy::ProxyShmRegion::CleanupStale(proxy_shm_name_);
+
+  std::string bin = FindProxyBinary(config_.spdk_proxy_bin);
+
+  pid_t pid = fork();
+  if (pid < 0) {
+    UMBP_LOG_ERROR("LSM: fork() failed: %s", strerror(errno));
+    return -1;
+  }
+
+  if (pid == 0) {
+    if (UmbpLogLevel() >= 1) {
+      int devnull = open("/dev/null", O_WRONLY);
+      if (devnull >= 0) {
+        dup2(devnull, STDOUT_FILENO);
+        dup2(devnull, STDERR_FILENO);
+        close(devnull);
+      }
+    }
+    std::string spawner_pid_str = std::to_string(getppid());
+    execlp(bin.c_str(), "spdk_proxy",
+           "--spawner-pid", spawner_pid_str.c_str(),
+           static_cast<char*>(nullptr));
+    fprintf(stderr, "[UMBP ERROR] execlp('%s') failed: %s\n",
+            bin.c_str(), strerror(errno));
+    _exit(127);
+  }
+
+  proxy_child_pid_ = pid;
+  UMBP_LOG_INFO("LSM: spawned spdk_proxy daemon pid=%d", pid);
+  return 0;
+}
+#endif
+
 LocalStorageManager::LocalStorageManager(const UMBPConfig& config,
                                          mori::umbp::LocalBlockIndex* index)
     : config_(config), role_(config.ResolveRole()), index_(index) {
@@ -218,13 +353,72 @@ LocalStorageManager::LocalStorageManager(const UMBPConfig& config,
 
   // SSD tier is optional (slower)
   if (config_.ssd.enabled) {
-    SSDAccessMode segmented_access_mode = SSDAccessMode::ReadWrite;
-    if (role_ == UMBPRole::SharedSSDFollower) {
-      segmented_access_mode = SSDAccessMode::ReadOnlyShared;
+    std::unique_ptr<TierBackend> ssd_backend;
+    bool use_proxy = false;
+
+    if (config_.ssd_backend == "spdk") {
+      if (role_ == UMBPRole::Standalone) {
+#ifdef USE_SPDK
+        auto spdk_tier = std::make_unique<SpdkSsdTier>(config_);
+        if (spdk_tier->IsValid()) {
+          ssd_backend = std::move(spdk_tier);
+        } else {
+          fprintf(stderr, "[UMBP WARN] SpdkSsdTier init failed, falling back to POSIX SSD\n");
+        }
+#else
+        fprintf(stderr,
+                "[UMBP WARN] UMBP_SSD_BACKEND=spdk requested, but this build was compiled "
+                "without SPDK support. Falling back to POSIX SSD.\n");
+#endif
+      } else {
+        use_proxy = true;
+      }
+    } else if (config_.ssd_backend == "spdk_proxy") {
+      use_proxy = true;
     }
-    tiers_.push_back({StorageTier::LOCAL_SSD,
-                      std::make_unique<SSDTier>(config_.ssd.storage_dir, config_.ssd.capacity_bytes,
-                                                config_, segmented_access_mode)});
+
+#ifdef __linux__
+    if (use_proxy && !ssd_backend) {
+      proxy_shm_name_ = config_.spdk_proxy_shm_name;
+      if (proxy_shm_name_.empty())
+        proxy_shm_name_ = umbp::proxy::kDefaultShmName;
+
+      bool should_spawn = (role_ == UMBPRole::SharedSSDLeader);
+      if (!should_spawn && config_.ssd_backend == "spdk_proxy" &&
+          role_ == UMBPRole::Standalone) {
+        int probe = umbp::proxy::ProxyShmRegion::ProbeExisting(proxy_shm_name_);
+        if (probe == 0) should_spawn = true;
+      }
+
+      if (should_spawn) {
+        SpawnProxyDaemon();
+      }
+
+      bool proxy_ready = SpdkProxyTier::WaitForProxy(
+          proxy_shm_name_, config_.spdk_proxy_startup_timeout_ms);
+
+      if (proxy_ready) {
+        auto proxy_tier = std::make_unique<SpdkProxyTier>(config_);
+        if (proxy_tier->IsValid()) {
+          ssd_backend = std::move(proxy_tier);
+        }
+      }
+
+      if (!ssd_backend) {
+        fprintf(stderr,
+                "[UMBP WARN] SPDK proxy connect failed. Falling back to POSIX SSD.\n");
+      }
+    }
+#endif
+    if (!ssd_backend) {
+      SSDAccessMode segmented_access_mode = SSDAccessMode::ReadWrite;
+      if (role_ == UMBPRole::SharedSSDFollower) {
+        segmented_access_mode = SSDAccessMode::ReadOnlyShared;
+      }
+      ssd_backend = std::make_unique<SSDTier>(config_.ssd.storage_dir, config_.ssd.capacity_bytes,
+                                              config_, segmented_access_mode);
+    }
+    tiers_.push_back({StorageTier::LOCAL_SSD, std::move(ssd_backend)});
   }
 }
 
@@ -715,4 +909,42 @@ void LocalStorageManager::Clear() {
   std::unique_lock<std::shared_mutex> lock(depth_mu_);
   depth_map_.clear();
   group_map_.clear();
+}
+
+bool LocalStorageManager::Flush() {
+  bool ok = true;
+  for (auto& entry : tiers_) {
+    if (!entry.backend->Flush()) ok = false;
+  }
+  return ok;
+}
+
+std::vector<bool> LocalStorageManager::BatchWrite(
+    const std::vector<std::string>& keys,
+    const std::vector<const void*>& data_ptrs,
+    const std::vector<size_t>& sizes,
+    StorageTier tier) {
+  TierBackend* target = GetTier(tier);
+  if (!target) return std::vector<bool>(keys.size(), false);
+
+  auto results = target->BatchWrite(keys, data_ptrs, sizes);
+
+  // Fallback: retry failed items one-by-one with eviction support
+  for (size_t i = 0; i < results.size(); ++i) {
+    if (!results[i]) {
+      results[i] = Write(keys[i], data_ptrs[i], sizes[i], tier);
+    }
+  }
+  return results;
+}
+
+std::vector<bool> LocalStorageManager::BatchReadIntoPtr(
+    const std::vector<std::string>& keys,
+    const std::vector<uintptr_t>& dst_ptrs,
+    const std::vector<size_t>& sizes) {
+  std::vector<bool> results(keys.size(), false);
+  for (size_t i = 0; i < keys.size(); ++i) {
+    results[i] = ReadIntoPtr(keys[i], dst_ptrs[i], sizes[i]);
+  }
+  return results;
 }

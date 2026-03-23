@@ -37,6 +37,7 @@ class LocalStorageManager {
   // index may be nullptr if index updates are not needed (testing).
   explicit LocalStorageManager(const UMBPConfig& config,
                                mori::umbp::LocalBlockIndex* index = nullptr);
+  ~LocalStorageManager();
 
   // Write to the specified tier.
   // When writing to DRAM and space is insufficient, automatically demotes
@@ -62,6 +63,18 @@ class LocalStorageManager {
   bool CopyToSSD(const std::string& key);                     // Non-destructive DRAM→SSD copy
   bool CopyToSSDBatch(const std::vector<std::string>& keys);  // Batched DRAM→SSD copy
   void Clear();
+
+  // Flush all tiers — ensures pending write-back data is durable.
+  bool Flush();
+
+  // Batch operations — delegates to tier backend's batch methods.
+  std::vector<bool> BatchWrite(const std::vector<std::string>& keys,
+                               const std::vector<const void*>& data_ptrs,
+                               const std::vector<size_t>& sizes,
+                               StorageTier tier = StorageTier::CPU_DRAM);
+  std::vector<bool> BatchReadIntoPtr(const std::vector<std::string>& keys,
+                                     const std::vector<uintptr_t>& dst_ptrs,
+                                     const std::vector<size_t>& sizes);
 
   // Access tiers generically
   TierBackend* GetTier(StorageTier tier);
@@ -127,4 +140,10 @@ class LocalStorageManager {
   void UpsertIndexTier(const std::string& key, StorageTier tier, size_t size_hint);
 
   void MaybeAutoPromote(const std::string& key);
+
+#ifdef __linux__
+  int proxy_child_pid_ = -1;
+  std::string proxy_shm_name_;
+  int SpawnProxyDaemon();
+#endif
 };
