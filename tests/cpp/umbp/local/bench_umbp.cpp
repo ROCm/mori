@@ -30,7 +30,7 @@
 //     --num-keys N                     Keys per scenario
 //     --value-size N                   Value size in bytes
 //     --batch-size N                   Batch size
-//     --iters N                        Measurement iterations
+//     --iters N                        Measurement iterations (default: 10)
 //     --filter SUBSTRING               Run only matching scenarios
 //     --dir PATH                       Temp directory path
 //     -h, --help                       Help
@@ -66,6 +66,7 @@
 #include "umbp/local/storage/dram_tier.h"
 #include "umbp/local/storage/io/storage_io_driver.h"
 #include "umbp/local/storage/local_storage_manager.h"
+#include "umbp/local/storage/segment/segment_format.h"
 #include "umbp/local/storage/ssd_tier.h"
 #include "umbp/local/umbp_client.h"
 
@@ -74,7 +75,7 @@ namespace fs = std::filesystem;
 // ---------------------------------------------------------------------------
 // Clock alias
 // ---------------------------------------------------------------------------
-using Clock = std::chrono::high_resolution_clock;
+using Clock = std::chrono::steady_clock;
 
 // ---------------------------------------------------------------------------
 // BenchConfig
@@ -84,7 +85,7 @@ struct BenchConfig {
   size_t value_size = 4096;
   size_t batch_size = 64;
   size_t warmup_iters = 1;
-  size_t measure_iters = 3;
+  size_t measure_iters = 10;
 
   size_t dram_capacity = 64ULL * 1024 * 1024;
   size_t ssd_capacity = 256ULL * 1024 * 1024;
@@ -97,6 +98,7 @@ struct BenchConfig {
 
   std::string base_dir = "/tmp/umbp_bench";
   std::string filter;
+  bool list_scenarios = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -183,6 +185,161 @@ static std::string ToLower(std::string value) {
   return value;
 }
 
+namespace mori::umbp::bench {
+
+inline std::string ToLowerCopy(std::string value) {
+  std::transform(value.begin(), value.end(), value.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return value;
+}
+
+inline bool FilterMatches(const std::string& filter, const std::string& scenario_name) {
+  if (filter.empty()) return true;
+  return ToLowerCopy(scenario_name).find(ToLowerCopy(filter)) != std::string::npos;
+}
+
+inline size_t CountTrue(const std::vector<bool>& values) {
+  return static_cast<size_t>(std::count(values.begin(), values.end(), true));
+}
+
+inline size_t CountSuccessfulPages(const std::vector<bool>& key_results, size_t keys_per_page) {
+  if (keys_per_page == 0) return 0;
+  size_t ok_pages = 0;
+  for (size_t i = 0; i < key_results.size(); i += keys_per_page) {
+    bool page_ok = true;
+    for (size_t j = 0; j < keys_per_page && i + j < key_results.size(); ++j) {
+      page_ok = page_ok && key_results[i + j];
+    }
+    if (page_ok) ++ok_pages;
+  }
+  return ok_pages;
+}
+
+inline double ThroughputOpsPerSec(size_t successful_ops, double elapsed_sec) {
+  return elapsed_sec > 0.0 ? static_cast<double>(successful_ops) / elapsed_sec : 0.0;
+}
+
+inline double ThroughputMbPerSec(size_t successful_bytes, double elapsed_sec) {
+  return elapsed_sec > 0.0 ? static_cast<double>(successful_bytes) / (1024.0 * 1024.0) / elapsed_sec
+                           : 0.0;
+}
+
+struct ResultTally {
+  size_t requested_ops = 0;
+  size_t successful_ops = 0;
+  size_t requested_bytes = 0;
+  size_t successful_bytes = 0;
+  std::vector<double> latencies_us;
+
+  void ReserveLatencySamples(size_t n) { latencies_us.reserve(n); }
+
+  size_t failed_ops() const {
+    return (requested_ops >= successful_ops) ? (requested_ops - successful_ops) : 0;
+  }
+
+  size_t sample_count() const { return latencies_us.size(); }
+
+  void AddSample(size_t requested, size_t succeeded, size_t req_bytes, size_t ok_bytes,
+                 double total_us) {
+    requested_ops += requested;
+    successful_ops += succeeded;
+    requested_bytes += req_bytes;
+    successful_bytes += ok_bytes;
+    if (requested == 0) return;
+    latencies_us.push_back(total_us);
+  }
+
+  void AddCall(size_t requested, size_t succeeded, size_t req_bytes, size_t ok_bytes,
+               double total_us) {
+    requested_ops += requested;
+    successful_ops += succeeded;
+    requested_bytes += req_bytes;
+    successful_bytes += ok_bytes;
+    latencies_us.push_back(total_us);
+  }
+
+  void AddOp(bool ok, size_t bytes, double total_us) {
+    AddSample(1, ok ? 1 : 0, bytes, ok ? bytes : 0, total_us);
+  }
+
+  void Merge(const ResultTally& other) {
+    requested_ops += other.requested_ops;
+    successful_ops += other.successful_ops;
+    requested_bytes += other.requested_bytes;
+    successful_bytes += other.successful_bytes;
+    latencies_us.insert(latencies_us.end(), other.latencies_us.begin(), other.latencies_us.end());
+  }
+};
+
+enum class BatchWriteMode {
+  Fused,
+  Fallback,
+};
+
+inline size_t EstimateRecordBytes(size_t key_size, size_t value_size, size_t record_header_size) {
+  return record_header_size + key_size + value_size;
+}
+
+inline size_t EstimateBatchRecordBytes(size_t keys_in_batch, size_t key_size, size_t value_size,
+                                       size_t record_header_size) {
+  return keys_in_batch * EstimateRecordBytes(key_size, value_size, record_header_size);
+}
+
+inline BatchWriteMode ClassifyBatchWriteMode(size_t keys_in_batch, size_t key_size,
+                                             size_t value_size, size_t segment_size,
+                                             size_t record_header_size) {
+  return EstimateBatchRecordBytes(keys_in_batch, key_size, value_size, record_header_size) <=
+                 segment_size
+             ? BatchWriteMode::Fused
+             : BatchWriteMode::Fallback;
+}
+
+struct WorkloadSummary {
+  size_t num_keys = 0;
+  size_t value_size = 0;
+  size_t batch_size = 0;
+  size_t dram_capacity = 0;
+  size_t ssd_capacity = 0;
+  size_t segment_size = 0;
+  size_t key_size_hint = 0;
+  size_t record_header_size = 0;
+};
+
+struct ConfigWarning {
+  std::string message;
+};
+
+inline std::vector<ConfigWarning> CollectConfigWarnings(const WorkloadSummary& summary) {
+  std::vector<ConfigWarning> warnings;
+  if (summary.value_size > summary.dram_capacity) {
+    warnings.push_back(
+        {"value_size exceeds DRAM capacity; DRAM-resident and cold CopyToSSD scenarios will "
+         "partially fail or be skipped."});
+  }
+  if (summary.value_size > summary.ssd_capacity) {
+    warnings.push_back(
+        {"value_size exceeds SSD capacity; single-value SSD writes cannot succeed."});
+  }
+  if (summary.num_keys * summary.value_size > summary.ssd_capacity) {
+    warnings.push_back(
+        {"working set exceeds SSD capacity; warm-cache SSD read scenarios will report mixed "
+         "residency rather than full-hit throughput."});
+  }
+  if (summary.batch_size > 0 &&
+      ClassifyBatchWriteMode(summary.batch_size, summary.key_size_hint, summary.value_size,
+                             summary.segment_size,
+                             summary.record_header_size) == BatchWriteMode::Fallback) {
+    warnings.push_back(
+        {"batch payload exceeds segment_size; WriteBatch-style scenarios will "
+         "exercise fallback/per-key behavior instead of fused writes."});
+  }
+  return warnings;
+}
+
+}  // namespace mori::umbp::bench
+
+namespace bench = mori::umbp::bench;
+
 struct IoBackendSpec {
   UMBPIoBackend backend;
   const char* cli_name;
@@ -236,8 +393,9 @@ static bool ParseDurabilityMode(const std::string& text, UMBPDurabilityMode& mod
 }
 
 static std::string BackendVariantLabel(UMBPIoBackend backend, size_t queue_depth) {
-  return std::string(GetIoBackendSpec(backend).display_name) +
-         "(qd=" + std::to_string(queue_depth) + ")";
+  const auto& spec = GetIoBackendSpec(backend);
+  if (backend != UMBPIoBackend::IoUring) return "backend=" + std::string(spec.display_name);
+  return "backend=" + std::string(spec.display_name) + "/qd=" + std::to_string(queue_depth);
 }
 
 static UMBPConfig MakeBaseSsdConfig(const BenchConfig& cfg) {
@@ -333,11 +491,26 @@ static void EnsureIoOk(const IoStatus& status, const std::string& context) {
 // ---------------------------------------------------------------------------
 // BenchResult
 // ---------------------------------------------------------------------------
+struct DisplayTag {
+  std::string key;
+  std::string value;
+};
+
+struct BenchDisplay {
+  std::string benchmark;
+  std::string workload;
+  std::vector<DisplayTag> scenario_tags;
+  std::string latency_scope;
+};
+
 struct BenchResult {
-  std::string name;
-  std::string variant;
-  size_t ops = 0;
-  size_t bytes = 0;
+  BenchDisplay display;
+  size_t requested_ops = 0;
+  size_t successful_ops = 0;
+  size_t failed_ops = 0;
+  size_t requested_bytes = 0;
+  size_t successful_bytes = 0;
+  size_t sample_count = 0;
   double elapsed_sec = 0.0;
 
   double lat_min_us = 0.0;
@@ -348,12 +521,316 @@ struct BenchResult {
   double lat_max_us = 0.0;
 
   double throughput_ops_sec() const {
-    return elapsed_sec > 0.0 ? static_cast<double>(ops) / elapsed_sec : 0.0;
+    return bench::ThroughputOpsPerSec(successful_ops, elapsed_sec);
   }
   double throughput_mb_sec() const {
-    return elapsed_sec > 0.0 ? static_cast<double>(bytes) / (1024.0 * 1024.0) / elapsed_sec : 0.0;
+    return bench::ThroughputMbPerSec(successful_bytes, elapsed_sec);
   }
 };
+
+static DisplayTag Tag(std::string key, std::string value) {
+  return DisplayTag{std::move(key), std::move(value)};
+}
+
+static int DisplayTagOrder(const std::string& key) {
+  static const std::vector<std::string> order = {
+      "backend", "qd",       "durability", "path",  "source", "phase", "resident",
+      "dram",    "ssd_seed", "dram_seed",  "batch", "bs",     "op",    "threads",
+      "copy",    "fds",      "hit",        "dedup", "bytes",
+  };
+  for (size_t i = 0; i < order.size(); ++i) {
+    if (order[i] == key) return static_cast<int>(i);
+  }
+  return static_cast<int>(order.size());
+}
+
+static BenchDisplay MakeDisplay(std::string benchmark, std::string workload = {},
+                                std::initializer_list<DisplayTag> scenario_tags = {},
+                                std::string latency_scope = {}) {
+  BenchDisplay display;
+  display.benchmark = std::move(benchmark);
+  display.workload = std::move(workload);
+  display.scenario_tags.assign(scenario_tags.begin(), scenario_tags.end());
+  std::sort(display.scenario_tags.begin(), display.scenario_tags.end(),
+            [](const DisplayTag& lhs, const DisplayTag& rhs) {
+              int lhs_order = DisplayTagOrder(lhs.key);
+              int rhs_order = DisplayTagOrder(rhs.key);
+              if (lhs_order != rhs_order) return lhs_order < rhs_order;
+              return lhs.key < rhs.key;
+            });
+  display.latency_scope = std::move(latency_scope);
+  return display;
+}
+
+static bool ContainsTagKey(const std::vector<DisplayTag>& tags, const std::string& key) {
+  return std::any_of(tags.begin(), tags.end(),
+                     [&](const DisplayTag& tag) { return tag.key == key; });
+}
+
+static BenchDisplay ParseLegacyDisplay(const std::string& benchmark, const std::string& variant) {
+  std::vector<std::string> parts;
+  std::stringstream ss(variant);
+  std::string part;
+  while (std::getline(ss, part, '/')) {
+    if (!part.empty()) parts.push_back(part);
+  }
+
+  std::string workload;
+  size_t i = 0;
+  if (parts.size() >= 3 && (parts[0] == "MLA" || parts[0] == "MHA") &&
+      parts[1].find("pg") != std::string::npos && parts[2].find("KB") != std::string::npos) {
+    workload = parts[0] + "/" + parts[1] + "/" + parts[2];
+    i = 3;
+  }
+
+  std::vector<DisplayTag> tags;
+  std::string explicit_latency_scope;
+  for (; i < parts.size(); ++i) {
+    const std::string& token = parts[i];
+    size_t eq = token.find('=');
+    if (eq == std::string::npos) continue;
+
+    std::string key = token.substr(0, eq);
+    std::string value = token.substr(eq + 1);
+    if ((key == "resident" || key == "dram_seed" || key == "ssd_seed") && i + 1 < parts.size() &&
+        parts[i + 1].find('=') == std::string::npos) {
+      value += "/" + parts[++i];
+    }
+
+    if (key == "timing") {
+      explicit_latency_scope = value;
+      continue;
+    }
+    tags.push_back(Tag(key, value));
+  }
+
+  if (explicit_latency_scope.empty()) {
+    if (benchmark.find("ExistsScan") != std::string::npos ||
+        benchmark.find("PrefetchCycle") != std::string::npos) {
+      explicit_latency_scope = "per-cycle";
+    } else if (benchmark.rfind("E2E ", 0) == 0 && benchmark.find("Leader") == std::string::npos) {
+      explicit_latency_scope = "per-batch";
+    } else if (ContainsTagKey(tags, "batch") || ContainsTagKey(tags, "bs") ||
+               ContainsTagKey(tags, "fds")) {
+      explicit_latency_scope = "per-batch";
+    } else {
+      explicit_latency_scope = "per-op";
+    }
+  }
+
+  BenchDisplay display;
+  display.benchmark = benchmark;
+  display.workload = workload;
+  display.scenario_tags = std::move(tags);
+  std::sort(display.scenario_tags.begin(), display.scenario_tags.end(),
+            [](const DisplayTag& lhs, const DisplayTag& rhs) {
+              int lhs_order = DisplayTagOrder(lhs.key);
+              int rhs_order = DisplayTagOrder(rhs.key);
+              if (lhs_order != rhs_order) return lhs_order < rhs_order;
+              return lhs.key < rhs.key;
+            });
+  display.latency_scope = explicit_latency_scope;
+  return display;
+}
+
+static std::string FormatScenario(const BenchDisplay& display) {
+  if (display.scenario_tags.empty()) return "-";
+
+  auto residency_tier_label = [&]() -> std::string {
+    if (display.benchmark.rfind("DRAM ", 0) == 0) return "DRAM";
+    if (display.benchmark.rfind("SSD ", 0) == 0) return "SSD";
+    if (display.benchmark.rfind("IO Backend Read", 0) == 0) return "SSD";
+    return "storage";
+  };
+
+  auto format_tag_key = [](const std::string& key) {
+    if (key == "qd") return std::string("queue depth");
+    if (key == "source") return std::string("read source");
+    if (key == "dram") return std::string("DRAM fit");
+    if (key == "ssd_seed") return std::string("SSD preloaded");
+    if (key == "dram_seed") return std::string("DRAM preloaded");
+    if (key == "batch") return std::string("batch mode");
+    if (key == "bs") return std::string("batch size");
+    if (key == "op") return std::string("operation");
+    if (key == "copy") return std::string("copy mode");
+    if (key == "fds") return std::string("files synced");
+    if (key == "hit") return std::string("existing pages");
+    if (key == "dedup") return std::string("reused pages");
+    if (key == "bytes") return std::string("throughput");
+    if (key == "resident") return std::string("residency");
+    return key;
+  };
+
+  auto format_tag_value = [&](const std::string& key, const std::string& value) {
+    if (key == "path") {
+      if (value == "ssd-miss") return std::string("needs SSD copy");
+      if (value == "ssd-hit") return std::string("already on SSD");
+    }
+    if (key == "resident") {
+      if (value == "all") return "all data on " + residency_tier_label();
+      return value + " on " + residency_tier_label();
+    }
+    if (key == "batch") {
+      if (value == "fused") return std::string("fused write");
+      if (value == "fallback") return std::string("per-key fallback");
+    }
+    if (key == "op") {
+      if (value == "single") return std::string("single call");
+      if (value == "batch") return std::string("batch call");
+    }
+    if (key == "copy") {
+      if (value == "sync") return std::string("sync");
+      if (value == "async") return std::string("async");
+    }
+    if (key == "source" && value == "ssd-only") return std::string("SSD only");
+    if (key == "phase") {
+      if (value == "fits-in-dram") return std::string("fits in DRAM");
+      if (value == "spills-to-ssd") return std::string("spills to SSD");
+      if (value == "read-after-spill") return std::string("read after spill");
+      if (value == "pressure") return std::string("under pressure");
+    }
+    if (key == "hit" || key == "dedup" || key == "dram") {
+      return value;
+    }
+    if (key == "bytes" && value == "physical") return std::string("physical writes only");
+    return value;
+  };
+
+  std::ostringstream oss;
+  for (size_t i = 0; i < display.scenario_tags.size(); ++i) {
+    if (i > 0) oss << ", ";
+    oss << format_tag_key(display.scenario_tags[i].key) << "="
+        << format_tag_value(display.scenario_tags[i].key, display.scenario_tags[i].value);
+  }
+  return oss.str();
+}
+
+static std::string FormatScopeLabel(const std::string& scope) {
+  if (scope == "per-op") return "single call";
+  if (scope == "per-batch") return "batch call";
+  if (scope == "per-cycle") return "full cycle";
+  if (scope == "end-to-end") return "full request";
+  return scope;
+}
+
+static std::vector<std::string> WrapCell(std::string text, size_t width) {
+  if (width == 0) return {text};
+  if (text.empty()) return {"-"};
+
+  std::vector<std::string> lines;
+  while (text.size() > width) {
+    size_t split = text.rfind(' ', width);
+    if (split == std::string::npos || split == 0) {
+      split = text.rfind(',', width);
+      if (split != std::string::npos && split + 1 < text.size()) ++split;
+    }
+    if (split == std::string::npos || split == 0) split = width;
+
+    lines.push_back(text.substr(0, split));
+    text.erase(0, split);
+    while (!text.empty() && text.front() == ' ') text.erase(text.begin());
+  }
+  if (!text.empty()) lines.push_back(text);
+  if (lines.empty()) lines.push_back("-");
+  return lines;
+}
+
+enum class OutputTableKind {
+  Detail,
+  Summary,
+};
+
+constexpr int kBenchmarkColWidth = 30;
+constexpr int kWorkloadColWidth = 20;
+constexpr int kScenarioColWidth = 58;
+constexpr int kScopeColWidth = 12;
+
+static void PrintSectionTitle(const std::string& section) {
+  std::cout << "\n=== " << section << " ===" << std::endl;
+}
+
+static void PrintTableDivider() {
+  constexpr size_t kDividerWidth = kBenchmarkColWidth + kWorkloadColWidth + kScenarioColWidth +
+                                   kScopeColWidth + 8 * 4 + 10 + 9 * 6 + 12 + 18;
+  std::printf("%s\n", std::string(kDividerWidth, '-').c_str());
+}
+
+static void PrintTableHeader(OutputTableKind kind) {
+  if (kind == OutputTableKind::Detail) {
+    std::printf("%-*s %-*s %-*s %-*s %8s %8s %8s %8s %10s %9s %9s %9s %9s %9s %9s %12s\n",
+                kBenchmarkColWidth, "Benchmark", kWorkloadColWidth, "Workload", kScenarioColWidth,
+                "Scenario", kScopeColWidth, "Scope", "req", "ok", "fail", "samples", "MB/s",
+                "min(us)", "avg(us)", "p50(us)", "p95(us)", "p99(us)", "max(us)", "ops/s");
+  } else {
+    std::printf("%-*s %-*s %-*s %-*s %8s %8s %12s %10s\n", kBenchmarkColWidth, "Benchmark",
+                kWorkloadColWidth, "Workload", kScenarioColWidth, "Scenario", kScopeColWidth,
+                "Scope", "ok", "fail", "ops/s", "MB/s");
+  }
+  PrintTableDivider();
+}
+
+static void PrintSectionHeader(const std::string& section) {
+  PrintSectionTitle(section);
+  PrintTableHeader(OutputTableKind::Detail);
+}
+
+static void PrintDetailResult(const BenchResult& r) {
+  auto benchmark_lines = WrapCell(r.display.benchmark, kBenchmarkColWidth);
+  auto workload_lines =
+      WrapCell(r.display.workload.empty() ? "-" : r.display.workload, kWorkloadColWidth);
+  auto scenario_lines = WrapCell(FormatScenario(r.display), kScenarioColWidth);
+  auto scope_lines =
+      WrapCell(r.display.latency_scope.empty() ? "-" : FormatScopeLabel(r.display.latency_scope),
+               kScopeColWidth);
+  size_t line_count = std::max(std::max(benchmark_lines.size(), workload_lines.size()),
+                               std::max(scenario_lines.size(), scope_lines.size()));
+
+  for (size_t i = 0; i < line_count; ++i) {
+    const char* benchmark = (i < benchmark_lines.size()) ? benchmark_lines[i].c_str() : "";
+    const char* workload = (i < workload_lines.size()) ? workload_lines[i].c_str() : "";
+    const char* scenario = (i < scenario_lines.size()) ? scenario_lines[i].c_str() : "";
+    const char* scope = (i < scope_lines.size()) ? scope_lines[i].c_str() : "";
+    if (i == 0) {
+      std::printf(
+          "%-*s %-*s %-*s %-*s %8zu %8zu %8zu %8zu %10.1f %9.1f %9.1f %9.1f %9.1f %9.1f %9.1f "
+          "%12.0f\n",
+          kBenchmarkColWidth, benchmark, kWorkloadColWidth, workload, kScenarioColWidth, scenario,
+          kScopeColWidth, scope, r.requested_ops, r.successful_ops, r.failed_ops, r.sample_count,
+          r.throughput_mb_sec(), r.lat_min_us, r.lat_avg_us, r.lat_p50_us, r.lat_p95_us,
+          r.lat_p99_us, r.lat_max_us, r.throughput_ops_sec());
+    } else {
+      std::printf("%-*s %-*s %-*s %-*s\n", kBenchmarkColWidth, benchmark, kWorkloadColWidth,
+                  workload, kScenarioColWidth, scenario, kScopeColWidth, scope);
+    }
+  }
+}
+
+static void PrintSummaryResult(const BenchResult& r) {
+  auto benchmark_lines = WrapCell(r.display.benchmark, kBenchmarkColWidth);
+  auto workload_lines =
+      WrapCell(r.display.workload.empty() ? "-" : r.display.workload, kWorkloadColWidth);
+  auto scenario_lines = WrapCell(FormatScenario(r.display), kScenarioColWidth);
+  auto scope_lines =
+      WrapCell(r.display.latency_scope.empty() ? "-" : FormatScopeLabel(r.display.latency_scope),
+               kScopeColWidth);
+  size_t line_count = std::max(std::max(benchmark_lines.size(), workload_lines.size()),
+                               std::max(scenario_lines.size(), scope_lines.size()));
+
+  for (size_t i = 0; i < line_count; ++i) {
+    const char* benchmark = (i < benchmark_lines.size()) ? benchmark_lines[i].c_str() : "";
+    const char* workload = (i < workload_lines.size()) ? workload_lines[i].c_str() : "";
+    const char* scenario = (i < scenario_lines.size()) ? scenario_lines[i].c_str() : "";
+    const char* scope = (i < scope_lines.size()) ? scope_lines[i].c_str() : "";
+    if (i == 0) {
+      std::printf("%-*s %-*s %-*s %-*s %8zu %8zu %12.0f %10.1f\n", kBenchmarkColWidth, benchmark,
+                  kWorkloadColWidth, workload, kScenarioColWidth, scenario, kScopeColWidth, scope,
+                  r.successful_ops, r.failed_ops, r.throughput_ops_sec(), r.throughput_mb_sec());
+    } else {
+      std::printf("%-*s %-*s %-*s %-*s\n", kBenchmarkColWidth, benchmark, kWorkloadColWidth,
+                  workload, kScenarioColWidth, scenario, kScopeColWidth, scope);
+    }
+  }
+}
 
 // ---------------------------------------------------------------------------
 // ScopedTempDir — RAII directory cleanup
@@ -541,6 +1018,16 @@ static std::vector<int> GenerateDepths(const E2EConfig& e2e, size_t start_page, 
 // ---------------------------------------------------------------------------
 // Latency statistics
 // ---------------------------------------------------------------------------
+static double PercentileValue(const std::vector<double>& latencies, double pct) {
+  if (latencies.empty()) return 0.0;
+  if (latencies.size() == 1) return latencies.front();
+  double index = pct * static_cast<double>(latencies.size() - 1);
+  size_t lo = static_cast<size_t>(index);
+  size_t hi = std::min(lo + 1, latencies.size() - 1);
+  double frac = index - static_cast<double>(lo);
+  return latencies[lo] + (latencies[hi] - latencies[lo]) * frac;
+}
+
 static void ComputeLatencyStats(std::vector<double>& latencies, BenchResult& result) {
   if (latencies.empty()) return;
   std::sort(latencies.begin(), latencies.end());
@@ -549,54 +1036,94 @@ static void ComputeLatencyStats(std::vector<double>& latencies, BenchResult& res
   result.lat_max_us = latencies.back();
   result.lat_avg_us =
       std::accumulate(latencies.begin(), latencies.end(), 0.0) / static_cast<double>(n);
-  result.lat_p50_us = latencies[n * 50 / 100];
-  result.lat_p95_us = latencies[n * 95 / 100];
-  result.lat_p99_us = latencies[std::min(n * 99 / 100, n - 1)];
+  result.lat_p50_us = PercentileValue(latencies, 0.50);
+  result.lat_p95_us = PercentileValue(latencies, 0.95);
+  result.lat_p99_us = PercentileValue(latencies, 0.99);
 }
 
 // ---------------------------------------------------------------------------
 // Result formatting
 // ---------------------------------------------------------------------------
-static void PrintHeader(const std::string& section) {
-  std::cout << "\n=== " << section << " ===" << std::endl;
-  std::printf("%-36s %-20s %8s %10s %9s %9s %9s %9s %9s %9s %12s\n", "Benchmark", "Variant", "Ops",
-              "MB/s", "min(us)", "avg(us)", "p50(us)", "p95(us)", "p99(us)", "max(us)", "ops/s");
-  std::printf("%s\n", std::string(36 + 20 + 8 + 10 + 9 * 6 + 12 + 10, '-').c_str());
+static double WallSeconds(const Clock::time_point& start, const Clock::time_point& end) {
+  return std::chrono::duration<double>(end - start).count();
 }
 
-static void PrintResult(const BenchResult& r) {
-  std::printf("%-36s %-20s %8zu %10.1f %9.1f %9.1f %9.1f %9.1f %9.1f %9.1f %12.0f\n",
-              r.name.c_str(), r.variant.c_str(), r.ops, r.throughput_mb_sec(), r.lat_min_us,
-              r.lat_avg_us, r.lat_p50_us, r.lat_p95_us, r.lat_p99_us, r.lat_max_us,
-              r.throughput_ops_sec());
-}
-
-// Elapsed time from latency vector (sum of per-call microseconds → seconds).
-static double LatencyElapsed(const std::vector<double>& latencies) {
-  return std::accumulate(latencies.begin(), latencies.end(), 0.0) / 1e6;
-}
+static void PrintHeader(const std::string& section) { PrintSectionHeader(section); }
 
 // Record a benchmark result: compute stats, print, and append to results vector.
-static void RecordResult(const std::string& name, const std::string& variant, size_t ops,
-                         size_t bytes, double elapsed_sec, std::vector<double>& latencies,
+static void RecordResult(BenchDisplay display, const bench::ResultTally& tally, double elapsed_sec,
+                         std::vector<BenchResult>& results);
+static void RecordResult(BenchDisplay display, size_t requested_ops, size_t requested_bytes,
+                         double elapsed_sec, std::vector<double>& latencies,
+                         std::vector<BenchResult>& results);
+
+static void RecordResult(const std::string& name, const std::string& variant,
+                         const bench::ResultTally& tally, double elapsed_sec,
+                         std::vector<BenchResult>& results) {
+  RecordResult(ParseLegacyDisplay(name, variant), tally, elapsed_sec, results);
+}
+
+static void RecordResult(BenchDisplay display, const bench::ResultTally& tally, double elapsed_sec,
                          std::vector<BenchResult>& results) {
   BenchResult r;
-  r.name = name;
-  r.variant = variant;
-  r.ops = ops;
-  r.bytes = bytes;
+  r.display = std::move(display);
+  r.requested_ops = tally.requested_ops;
+  r.successful_ops = tally.successful_ops;
+  r.failed_ops = tally.failed_ops();
+  r.requested_bytes = tally.requested_bytes;
+  r.successful_bytes = tally.successful_bytes;
+  r.sample_count = tally.sample_count();
   r.elapsed_sec = elapsed_sec;
+  auto latencies = tally.latencies_us;
   ComputeLatencyStats(latencies, r);
-  PrintResult(r);
+  PrintDetailResult(r);
   results.push_back(r);
+}
+
+static void RecordResult(const std::string& name, const std::string& variant, size_t requested_ops,
+                         size_t requested_bytes, double elapsed_sec, std::vector<double>& latencies,
+                         std::vector<BenchResult>& results) {
+  RecordResult(ParseLegacyDisplay(name, variant), requested_ops, requested_bytes, elapsed_sec,
+               latencies, results);
+}
+
+static void RecordResult(BenchDisplay display, size_t requested_ops, size_t requested_bytes,
+                         double elapsed_sec, std::vector<double>& latencies,
+                         std::vector<BenchResult>& results) {
+  bench::ResultTally tally;
+  tally.requested_ops = requested_ops;
+  tally.successful_ops = requested_ops;
+  tally.requested_bytes = requested_bytes;
+  tally.successful_bytes = requested_bytes;
+  tally.latencies_us = latencies;
+  RecordResult(std::move(display), tally, elapsed_sec, results);
 }
 
 // ---------------------------------------------------------------------------
 // Scenario filter check
 // ---------------------------------------------------------------------------
 static bool ShouldRun(const BenchConfig& cfg, const std::string& name) {
-  if (cfg.filter.empty()) return true;
-  return name.find(cfg.filter) != std::string::npos;
+  return bench::FilterMatches(cfg.filter, name);
+}
+
+static const std::vector<std::string>& ScenarioFilters() {
+  static const std::vector<std::string> filters = {
+      "DRAM",      "SSD Tier",   "Batch",  "CopyToSSD", "IO Backend", "Durability",
+      "StorageIo", "Concurrent", "Leader", "Capacity",  "E2E",
+  };
+  return filters;
+}
+
+static void PrintScenarioList() {
+  std::printf("Available scenario filters:\n");
+  for (const auto& name : ScenarioFilters()) {
+    std::printf("  %s\n", name.c_str());
+  }
+}
+
+static void PrintSkipMessage(const std::string& section, const std::string& reason) {
+  std::cout << "\n=== " << section << " ===" << std::endl;
+  std::printf("[skipped] %s\n", reason.c_str());
 }
 
 // ---------------------------------------------------------------------------
@@ -663,6 +1190,85 @@ static std::vector<std::vector<std::string>> BuildKeyBatches(
   return descs;
 }
 
+static size_t CountExistingKeys(const TierBackend* tier, const std::vector<std::string>& keys) {
+  size_t existing = 0;
+  for (const auto& key : keys) {
+    if (tier->Exists(key)) ++existing;
+  }
+  return existing;
+}
+
+static std::string ResidentValue(size_t resident_keys, size_t total_keys) {
+  if (resident_keys >= total_keys) return "all";
+  std::ostringstream oss;
+  oss << resident_keys << "/" << total_keys;
+  return oss.str();
+}
+
+static std::string ResidencyVariantPrefix(size_t resident_keys, size_t total_keys) {
+  return "resident=" + ResidentValue(resident_keys, total_keys);
+}
+
+static std::string JoinVariant(std::initializer_list<std::string> parts) {
+  std::ostringstream oss;
+  bool first = true;
+  for (const auto& value : parts) {
+    if (value.empty()) continue;
+    if (!first) oss << "/";
+    oss << value;
+    first = false;
+  }
+  return oss.str();
+}
+
+static bool BatchFitsSegment(const WriteBatchDesc& desc, size_t segment_size) {
+  size_t total_bytes = 0;
+  for (size_t i = 0; i < desc.keys.size(); ++i) {
+    total_bytes += sizeof(segment::RecordHeader) + desc.keys[i].size() + desc.sizes[i];
+  }
+  return total_bytes <= segment_size;
+}
+
+static std::string BatchModeValue(const std::vector<WriteBatchDesc>& descs, size_t segment_size) {
+  for (const auto& desc : descs) {
+    if (!BatchFitsSegment(desc, segment_size)) return "fallback";
+  }
+  return "fused";
+}
+
+static std::string BatchModeLabel(const std::vector<WriteBatchDesc>& descs, size_t segment_size) {
+  return "batch=" + BatchModeValue(descs, segment_size);
+}
+
+static std::string BatchSizeValue(size_t batch_size) { return std::to_string(batch_size); }
+
+static std::string BackendDisplayValue(UMBPIoBackend backend) {
+  return GetIoBackendSpec(backend).display_name;
+}
+
+static std::string E2EWorkloadLabel(const E2EConfig& e2e) {
+  std::string mode = (e2e.mode == E2EModelMode::MLA) ? "MLA" : "MHA";
+  return mode + "/" + std::to_string(e2e.batch_pages) + "pg/" +
+         std::to_string(e2e.ValueSizePerKey() / 1024) + "KB";
+}
+
+static void PrintConfigWarnings(const BenchConfig& cfg) {
+  bench::WorkloadSummary summary;
+  summary.num_keys = cfg.num_keys;
+  summary.value_size = cfg.value_size;
+  summary.batch_size = cfg.batch_size;
+  summary.dram_capacity = cfg.dram_capacity;
+  summary.ssd_capacity = cfg.ssd_capacity;
+  summary.segment_size = cfg.segment_size;
+  summary.key_size_hint = MakeKey(0).size();
+  summary.record_header_size = sizeof(segment::RecordHeader);
+
+  auto warnings = bench::CollectConfigWarnings(summary);
+  for (const auto& warning : warnings) {
+    std::printf("  warning      = %s\n", warning.message.c_str());
+  }
+}
+
 // ---------------------------------------------------------------------------
 // A. DRAM Tier Benchmarks
 // ---------------------------------------------------------------------------
@@ -670,15 +1276,23 @@ static void BenchDRAMTier(const BenchConfig& cfg, const std::vector<std::string>
                           const std::vector<std::vector<char>>& values,
                           std::vector<BenchResult>& results) {
   if (!ShouldRun(cfg, "DRAM")) return;
+  if (cfg.value_size > cfg.dram_capacity) {
+    PrintSkipMessage("DRAM Tier",
+                     "value_size exceeds dram_capacity; a single payload cannot fit in DRAM.");
+    return;
+  }
 
   PrintHeader("DRAM Tier");
 
   DRAMTier tier(cfg.dram_capacity);
 
   // Pre-fill for read benchmarks
+  size_t resident_keys = 0;
   for (size_t i = 0; i < keys.size(); ++i) {
-    tier.Write(keys[i], values[i].data(), values[i].size());
+    if (tier.Write(keys[i], values[i].data(), values[i].size())) ++resident_keys;
   }
+  std::string read_variant =
+      JoinVariant({ResidencyVariantPrefix(resident_keys, keys.size()), "op=single"});
 
   // 1. DRAM Write
   {
@@ -693,30 +1307,32 @@ static void BenchDRAMTier(const BenchConfig& cfg, const std::vector<std::string>
     }
     tier.Clear();
 
-    std::vector<double> latencies;
-    latencies.reserve(keys.size() * cfg.measure_iters);
+    bench::ResultTally tally;
+    tally.ReserveLatencySamples(keys.size() * cfg.measure_iters);
 
+    auto run_start = Clock::now();
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
       tier.Clear();
       for (size_t i = 0; i < keys.size(); ++i) {
         auto t0 = Clock::now();
-        tier.Write(keys[i], values[i].data(), values[i].size());
+        bool ok = tier.Write(keys[i], values[i].data(), values[i].size());
         auto t1 = Clock::now();
         double us = std::chrono::duration<double, std::micro>(t1 - t0).count();
-        latencies.push_back(us);
+        tally.AddOp(ok, cfg.value_size, us);
       }
     }
+    auto run_end = Clock::now();
 
-    RecordResult("DRAM Write", "single-key", keys.size() * cfg.measure_iters,
-                 keys.size() * cfg.measure_iters * cfg.value_size, LatencyElapsed(latencies),
-                 latencies, results);
+    RecordResult("DRAM Write", "op=single", tally, WallSeconds(run_start, run_end), results);
   }
 
   // Re-fill for reads
   tier.Clear();
+  resident_keys = 0;
   for (size_t i = 0; i < keys.size(); ++i) {
-    tier.Write(keys[i], values[i].data(), values[i].size());
+    if (tier.Write(keys[i], values[i].data(), values[i].size())) ++resident_keys;
   }
+  read_variant = JoinVariant({ResidencyVariantPrefix(resident_keys, keys.size()), "op=single"});
 
   // 2. DRAM Read (ReadIntoPtr)
   {
@@ -729,21 +1345,21 @@ static void BenchDRAMTier(const BenchConfig& cfg, const std::vector<std::string>
       }
     }
 
-    std::vector<double> latencies;
-    latencies.reserve(keys.size() * cfg.measure_iters);
+    bench::ResultTally tally;
+    tally.ReserveLatencySamples(keys.size() * cfg.measure_iters);
 
+    auto run_start = Clock::now();
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
       for (size_t i = 0; i < keys.size(); ++i) {
         auto t0 = Clock::now();
-        tier.ReadIntoPtr(keys[i], reinterpret_cast<uintptr_t>(buf.data()), buf.size());
+        bool ok = tier.ReadIntoPtr(keys[i], reinterpret_cast<uintptr_t>(buf.data()), buf.size());
         auto t1 = Clock::now();
-        latencies.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+        tally.AddOp(ok, cfg.value_size, std::chrono::duration<double, std::micro>(t1 - t0).count());
       }
     }
+    auto run_end = Clock::now();
 
-    RecordResult("DRAM Read", "single-key", keys.size() * cfg.measure_iters,
-                 keys.size() * cfg.measure_iters * cfg.value_size, LatencyElapsed(latencies),
-                 latencies, results);
+    RecordResult("DRAM Read", read_variant, tally, WallSeconds(run_start, run_end), results);
   }
 
   // 3. DRAM ReadPtr (zero-copy)
@@ -756,22 +1372,24 @@ static void BenchDRAMTier(const BenchConfig& cfg, const std::vector<std::string>
       }
     }
 
-    std::vector<double> latencies;
-    latencies.reserve(keys.size() * cfg.measure_iters);
+    bench::ResultTally tally;
+    tally.ReserveLatencySamples(keys.size() * cfg.measure_iters);
 
+    auto run_start = Clock::now();
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
       for (size_t i = 0; i < keys.size(); ++i) {
         size_t sz = 0;
         auto t0 = Clock::now();
-        tier.ReadPtr(keys[i], &sz);
+        const void* ptr = tier.ReadPtr(keys[i], &sz);
         auto t1 = Clock::now();
-        latencies.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+        tally.AddOp(ptr != nullptr && sz == cfg.value_size, cfg.value_size,
+                    std::chrono::duration<double, std::micro>(t1 - t0).count());
       }
     }
+    auto run_end = Clock::now();
 
-    RecordResult("DRAM ReadPtr (zero-copy)", "single-key", keys.size() * cfg.measure_iters,
-                 keys.size() * cfg.measure_iters * cfg.value_size, LatencyElapsed(latencies),
-                 latencies, results);
+    RecordResult("DRAM ReadPtr (zero-copy)", read_variant, tally, WallSeconds(run_start, run_end),
+                 results);
   }
 }
 
@@ -782,6 +1400,11 @@ static void BenchSSDTier(const BenchConfig& cfg, const std::vector<std::string>&
                          const std::vector<std::vector<char>>& values,
                          std::vector<BenchResult>& results) {
   if (!ShouldRun(cfg, "SSD Tier")) return;
+  if (cfg.value_size > cfg.ssd_capacity) {
+    PrintSkipMessage("SSD Tier",
+                     "value_size exceeds ssd_capacity; a single payload cannot fit in SSD.");
+    return;
+  }
 
   PrintHeader("SSD Tier");
 
@@ -801,22 +1424,59 @@ static void BenchSSDTier(const BenchConfig& cfg, const std::vector<std::string>&
     }
     tier.Clear();
 
-    std::vector<double> latencies;
-    latencies.reserve(keys.size() * cfg.measure_iters);
+    bench::ResultTally tally;
+    tally.ReserveLatencySamples(keys.size() * cfg.measure_iters);
 
+    auto run_start = Clock::now();
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
       tier.Clear();
       for (size_t i = 0; i < keys.size(); ++i) {
         auto t0 = Clock::now();
-        tier.Write(keys[i], values[i].data(), values[i].size());
+        bool ok = tier.Write(keys[i], values[i].data(), values[i].size());
         auto t1 = Clock::now();
-        latencies.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+        tally.AddOp(ok, cfg.value_size, std::chrono::duration<double, std::micro>(t1 - t0).count());
       }
     }
+    auto run_end = Clock::now();
 
-    RecordResult("SSD Tier Write", "single-key", keys.size() * cfg.measure_iters,
-                 keys.size() * cfg.measure_iters * cfg.value_size, LatencyElapsed(latencies),
-                 latencies, results);
+    RecordResult("SSD Tier Write", "op=single", tally, WallSeconds(run_start, run_end), results);
+  }
+
+  // WriteBatch
+  {
+    ScopedTempDir tmp(cfg.base_dir + "/ssd_tier_write_batch");
+    SSDTier tier(tmp.path, cfg.ssd_capacity, ucfg);
+
+    auto wdescs = BuildWriteBatches(keys, values, cfg.batch_size);
+    std::string batch_variant = JoinVariant(
+        {BatchModeLabel(wdescs, cfg.segment_size), "bs=" + std::to_string(cfg.batch_size)});
+
+    for (size_t w = 0; w < cfg.warmup_iters; ++w) {
+      tier.Clear();
+      for (const auto& d : wdescs) tier.WriteBatch(d.keys, d.data_ptrs, d.sizes);
+    }
+    tier.Clear();
+
+    bench::ResultTally tally;
+    tally.ReserveLatencySamples(keys.size() * cfg.measure_iters);
+
+    auto run_start = Clock::now();
+    for (size_t m = 0; m < cfg.measure_iters; ++m) {
+      tier.Clear();
+      for (const auto& d : wdescs) {
+        auto t0 = Clock::now();
+        bool ok = tier.WriteBatch(d.keys, d.data_ptrs, d.sizes);
+        auto t1 = Clock::now();
+        size_t wrote = ok ? d.keys.size() : 0;
+        tally.AddSample(d.keys.size(), wrote, d.keys.size() * cfg.value_size,
+                        wrote * cfg.value_size,
+                        std::chrono::duration<double, std::micro>(t1 - t0).count());
+      }
+    }
+    auto run_end = Clock::now();
+
+    RecordResult("SSD Tier WriteBatch", batch_variant, tally, WallSeconds(run_start, run_end),
+                 results);
   }
 
   // Read
@@ -825,9 +1485,12 @@ static void BenchSSDTier(const BenchConfig& cfg, const std::vector<std::string>&
     SSDTier tier(tmp.path, cfg.ssd_capacity, ucfg);
 
     // Pre-fill
+    size_t resident_keys = 0;
     for (size_t i = 0; i < keys.size(); ++i) {
-      tier.Write(keys[i], values[i].data(), values[i].size());
+      if (tier.Write(keys[i], values[i].data(), values[i].size())) ++resident_keys;
     }
+    std::string read_variant =
+        JoinVariant({ResidencyVariantPrefix(resident_keys, keys.size()), "op=single"});
 
     std::vector<char> buf(cfg.value_size);
 
@@ -838,21 +1501,21 @@ static void BenchSSDTier(const BenchConfig& cfg, const std::vector<std::string>&
       }
     }
 
-    std::vector<double> latencies;
-    latencies.reserve(keys.size() * cfg.measure_iters);
+    bench::ResultTally tally;
+    tally.ReserveLatencySamples(keys.size() * cfg.measure_iters);
 
+    auto run_start = Clock::now();
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
       for (size_t i = 0; i < keys.size(); ++i) {
         auto t0 = Clock::now();
-        tier.ReadIntoPtr(keys[i], reinterpret_cast<uintptr_t>(buf.data()), buf.size());
+        bool ok = tier.ReadIntoPtr(keys[i], reinterpret_cast<uintptr_t>(buf.data()), buf.size());
         auto t1 = Clock::now();
-        latencies.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+        tally.AddOp(ok, cfg.value_size, std::chrono::duration<double, std::micro>(t1 - t0).count());
       }
     }
+    auto run_end = Clock::now();
 
-    RecordResult("SSD Tier Read", "single-key", keys.size() * cfg.measure_iters,
-                 keys.size() * cfg.measure_iters * cfg.value_size, LatencyElapsed(latencies),
-                 latencies, results);
+    RecordResult("SSD Tier Read", read_variant, tally, WallSeconds(run_start, run_end), results);
   }
 
   // ReadBatch
@@ -861,9 +1524,12 @@ static void BenchSSDTier(const BenchConfig& cfg, const std::vector<std::string>&
     SSDTier tier(tmp.path, cfg.ssd_capacity, ucfg);
 
     // Pre-fill
+    size_t resident_keys = 0;
     for (size_t i = 0; i < keys.size(); ++i) {
-      tier.Write(keys[i], values[i].data(), values[i].size());
+      if (tier.Write(keys[i], values[i].data(), values[i].size())) ++resident_keys;
     }
+    std::string read_variant = JoinVariant({ResidencyVariantPrefix(resident_keys, keys.size()),
+                                            "bs=" + std::to_string(cfg.batch_size)});
 
     // Prepare per-key read buffers and pre-build batch descriptors.
     std::vector<std::vector<char>> bufs(keys.size(), std::vector<char>(cfg.value_size));
@@ -878,21 +1544,24 @@ static void BenchSSDTier(const BenchConfig& cfg, const std::vector<std::string>&
       for (const auto& d : rdescs) tier.ReadBatchIntoPtr(d.keys, d.dst_ptrs, d.sizes);
     }
 
-    std::vector<double> latencies;
-    latencies.reserve(rdescs.size() * cfg.measure_iters);
+    bench::ResultTally tally;
+    tally.ReserveLatencySamples(keys.size() * cfg.measure_iters);
 
+    auto run_start = Clock::now();
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
       for (const auto& d : rdescs) {
         auto t0 = Clock::now();
-        tier.ReadBatchIntoPtr(d.keys, d.dst_ptrs, d.sizes);
+        auto batch_results = tier.ReadBatchIntoPtr(d.keys, d.dst_ptrs, d.sizes);
         auto t1 = Clock::now();
-        latencies.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+        size_t ok = bench::CountTrue(batch_results);
+        tally.AddSample(d.keys.size(), ok, d.keys.size() * cfg.value_size, ok * cfg.value_size,
+                        std::chrono::duration<double, std::micro>(t1 - t0).count());
       }
     }
+    auto run_end = Clock::now();
 
-    RecordResult("SSD Tier ReadBatch", "bs=" + std::to_string(cfg.batch_size),
-                 keys.size() * cfg.measure_iters, keys.size() * cfg.measure_iters * cfg.value_size,
-                 LatencyElapsed(latencies), latencies, results);
+    RecordResult("SSD Tier ReadBatch", read_variant, tally, WallSeconds(run_start, run_end),
+                 results);
   }
 }
 
@@ -903,6 +1572,11 @@ static void BenchBatchWrite(const BenchConfig& cfg, const std::vector<std::strin
                             const std::vector<std::vector<char>>& values,
                             std::vector<BenchResult>& results) {
   if (!ShouldRun(cfg, "Batch")) return;
+  if (cfg.value_size > cfg.ssd_capacity) {
+    PrintSkipMessage("Batch vs Single Write",
+                     "value_size exceeds ssd_capacity; SSD write comparisons cannot succeed.");
+    return;
+  }
 
   PrintHeader("Batch vs Single Write");
 
@@ -922,22 +1596,22 @@ static void BenchBatchWrite(const BenchConfig& cfg, const std::vector<std::strin
     }
     tier.Clear();
 
-    std::vector<double> latencies;
-    latencies.reserve(keys.size() * cfg.measure_iters);
+    bench::ResultTally tally;
+    tally.ReserveLatencySamples(keys.size() * cfg.measure_iters);
 
+    auto run_start = Clock::now();
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
       tier.Clear();
       for (size_t i = 0; i < keys.size(); ++i) {
         auto t0 = Clock::now();
-        tier.Write(keys[i], values[i].data(), values[i].size());
+        bool ok = tier.Write(keys[i], values[i].data(), values[i].size());
         auto t1 = Clock::now();
-        latencies.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+        tally.AddOp(ok, cfg.value_size, std::chrono::duration<double, std::micro>(t1 - t0).count());
       }
     }
+    auto run_end = Clock::now();
 
-    RecordResult("SSD Write", "sequential", keys.size() * cfg.measure_iters,
-                 keys.size() * cfg.measure_iters * cfg.value_size, LatencyElapsed(latencies),
-                 latencies, results);
+    RecordResult("SSD Write Compare", "op=single", tally, WallSeconds(run_start, run_end), results);
   }
 
   // WriteBatch
@@ -946,6 +1620,8 @@ static void BenchBatchWrite(const BenchConfig& cfg, const std::vector<std::strin
     SSDTier tier(tmp.path, cfg.ssd_capacity, ucfg);
 
     auto wdescs = BuildWriteBatches(keys, values, cfg.batch_size);
+    std::string batch_variant = JoinVariant({"op=batch", BatchModeLabel(wdescs, cfg.segment_size),
+                                             "bs=" + std::to_string(cfg.batch_size)});
 
     for (size_t w = 0; w < cfg.warmup_iters; ++w) {
       tier.Clear();
@@ -953,22 +1629,26 @@ static void BenchBatchWrite(const BenchConfig& cfg, const std::vector<std::strin
     }
     tier.Clear();
 
-    std::vector<double> latencies;
-    latencies.reserve(wdescs.size() * cfg.measure_iters);
+    bench::ResultTally tally;
+    tally.ReserveLatencySamples(keys.size() * cfg.measure_iters);
 
+    auto run_start = Clock::now();
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
       tier.Clear();
       for (const auto& d : wdescs) {
         auto t0 = Clock::now();
-        tier.WriteBatch(d.keys, d.data_ptrs, d.sizes);
+        bool ok = tier.WriteBatch(d.keys, d.data_ptrs, d.sizes);
         auto t1 = Clock::now();
-        latencies.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+        size_t wrote = ok ? d.keys.size() : 0;
+        tally.AddSample(d.keys.size(), wrote, d.keys.size() * cfg.value_size,
+                        wrote * cfg.value_size,
+                        std::chrono::duration<double, std::micro>(t1 - t0).count());
       }
     }
+    auto run_end = Clock::now();
 
-    RecordResult("SSD Write", "WriteBatch(bs=" + std::to_string(cfg.batch_size) + ")",
-                 keys.size() * cfg.measure_iters, keys.size() * cfg.measure_iters * cfg.value_size,
-                 LatencyElapsed(latencies), latencies, results);
+    RecordResult("SSD Write Compare", batch_variant, tally, WallSeconds(run_start, run_end),
+                 results);
   }
 }
 
@@ -979,6 +1659,11 @@ static void BenchBatchRead(const BenchConfig& cfg, const std::vector<std::string
                            const std::vector<std::vector<char>>& values,
                            std::vector<BenchResult>& results) {
   if (!ShouldRun(cfg, "Batch")) return;
+  if (cfg.value_size > cfg.ssd_capacity) {
+    PrintSkipMessage("Batch vs Single Read",
+                     "value_size exceeds ssd_capacity; SSD read comparisons cannot succeed.");
+    return;
+  }
 
   PrintHeader("Batch vs Single Read");
 
@@ -989,9 +1674,12 @@ static void BenchBatchRead(const BenchConfig& cfg, const std::vector<std::string
     ScopedTempDir tmp(cfg.base_dir + "/batch_read_seq");
     SSDTier tier(tmp.path, cfg.ssd_capacity, ucfg);
 
+    size_t resident_keys = 0;
     for (size_t i = 0; i < keys.size(); ++i) {
-      tier.Write(keys[i], values[i].data(), values[i].size());
+      if (tier.Write(keys[i], values[i].data(), values[i].size())) ++resident_keys;
     }
+    std::string seq_variant =
+        JoinVariant({ResidencyVariantPrefix(resident_keys, keys.size()), "op=single"});
 
     std::vector<char> buf(cfg.value_size);
 
@@ -1002,21 +1690,21 @@ static void BenchBatchRead(const BenchConfig& cfg, const std::vector<std::string
       }
     }
 
-    std::vector<double> latencies;
-    latencies.reserve(keys.size() * cfg.measure_iters);
+    bench::ResultTally tally;
+    tally.ReserveLatencySamples(keys.size() * cfg.measure_iters);
 
+    auto run_start = Clock::now();
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
       for (size_t i = 0; i < keys.size(); ++i) {
         auto t0 = Clock::now();
-        tier.ReadIntoPtr(keys[i], reinterpret_cast<uintptr_t>(buf.data()), buf.size());
+        bool ok = tier.ReadIntoPtr(keys[i], reinterpret_cast<uintptr_t>(buf.data()), buf.size());
         auto t1 = Clock::now();
-        latencies.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+        tally.AddOp(ok, cfg.value_size, std::chrono::duration<double, std::micro>(t1 - t0).count());
       }
     }
+    auto run_end = Clock::now();
 
-    RecordResult("SSD Read", "sequential", keys.size() * cfg.measure_iters,
-                 keys.size() * cfg.measure_iters * cfg.value_size, LatencyElapsed(latencies),
-                 latencies, results);
+    RecordResult("SSD Read Compare", seq_variant, tally, WallSeconds(run_start, run_end), results);
   }
 
   // ReadBatchIntoPtr
@@ -1024,8 +1712,9 @@ static void BenchBatchRead(const BenchConfig& cfg, const std::vector<std::string
     ScopedTempDir tmp(cfg.base_dir + "/batch_read_batch");
     SSDTier tier(tmp.path, cfg.ssd_capacity, ucfg);
 
+    size_t resident_keys = 0;
     for (size_t i = 0; i < keys.size(); ++i) {
-      tier.Write(keys[i], values[i].data(), values[i].size());
+      if (tier.Write(keys[i], values[i].data(), values[i].size())) ++resident_keys;
     }
 
     std::vector<std::vector<char>> bufs(keys.size(), std::vector<char>(cfg.value_size));
@@ -1035,26 +1724,31 @@ static void BenchBatchRead(const BenchConfig& cfg, const std::vector<std::string
       ptrs[i] = reinterpret_cast<uintptr_t>(bufs[i].data());
     }
     auto rdescs = BuildReadBatches(keys, ptrs, sizes, cfg.batch_size);
+    std::string batch_variant = JoinVariant({ResidencyVariantPrefix(resident_keys, keys.size()),
+                                             "op=batch", "bs=" + std::to_string(cfg.batch_size)});
 
     for (size_t w = 0; w < cfg.warmup_iters; ++w) {
       for (const auto& d : rdescs) tier.ReadBatchIntoPtr(d.keys, d.dst_ptrs, d.sizes);
     }
 
-    std::vector<double> latencies;
-    latencies.reserve(rdescs.size() * cfg.measure_iters);
+    bench::ResultTally tally;
+    tally.ReserveLatencySamples(keys.size() * cfg.measure_iters);
 
+    auto run_start = Clock::now();
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
       for (const auto& d : rdescs) {
         auto t0 = Clock::now();
-        tier.ReadBatchIntoPtr(d.keys, d.dst_ptrs, d.sizes);
+        auto batch_results = tier.ReadBatchIntoPtr(d.keys, d.dst_ptrs, d.sizes);
         auto t1 = Clock::now();
-        latencies.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+        size_t ok = bench::CountTrue(batch_results);
+        tally.AddSample(d.keys.size(), ok, d.keys.size() * cfg.value_size, ok * cfg.value_size,
+                        std::chrono::duration<double, std::micro>(t1 - t0).count());
       }
     }
+    auto run_end = Clock::now();
 
-    RecordResult("SSD Read", "ReadBatch(bs=" + std::to_string(cfg.batch_size) + ")",
-                 keys.size() * cfg.measure_iters, keys.size() * cfg.measure_iters * cfg.value_size,
-                 LatencyElapsed(latencies), latencies, results);
+    RecordResult("SSD Read Compare", batch_variant, tally, WallSeconds(run_start, run_end),
+                 results);
   }
 }
 
@@ -1066,81 +1760,185 @@ static void BenchCopyToSSD(const BenchConfig& cfg, const std::vector<std::string
                            std::vector<BenchResult>& results) {
   if (!ShouldRun(cfg, "CopyToSSD")) return;
 
-  PrintHeader("CopyToSSD vs CopyToSSDBatch");
+  PrintHeader("CopyToSSD Paths");
 
-  // Single CopyToSSD
+  auto seed_dram = [&](LocalStorageManager& mgr) {
+    size_t ready = 0;
+    for (size_t i = 0; i < keys.size(); ++i) {
+      if (mgr.Write(keys[i], values[i].data(), values[i].size(), StorageTier::CPU_DRAM)) ++ready;
+    }
+    return ready;
+  };
+
+  auto seed_ssd = [&](TierBackend* ssd) {
+    size_t ready = 0;
+    for (size_t i = 0; i < keys.size(); ++i) {
+      if (ssd->Write(keys[i], values[i].data(), values[i].size())) ++ready;
+    }
+    return ready;
+  };
+
+  auto hot_variant = [&](size_t seeded, const std::string& suffix) {
+    std::ostringstream oss;
+    oss << "path=ssd-hit/ssd_seed=" << seeded << "/" << keys.size() << "/" << suffix;
+    return oss.str();
+  };
+
+  auto cold_variant = [&](size_t seeded, const std::string& suffix) {
+    std::ostringstream oss;
+    oss << "path=ssd-miss/dram_seed=" << seeded << "/" << keys.size() << "/" << suffix;
+    return oss.str();
+  };
+
+  // Single CopyToSSD, cold path.
   {
-    ScopedTempDir tmp(cfg.base_dir + "/copy_single");
-
+    ScopedTempDir tmp(cfg.base_dir + "/copy_single_cold");
     UMBPConfig ucfg = MakeStandaloneClientConfig(cfg, tmp.path + "/ssd", cfg.dram_capacity);
-
     fs::create_directories(ucfg.ssd.storage_dir);
     LocalStorageManager mgr(ucfg);
+    TierBackend* ssd = mgr.GetTier(StorageTier::LOCAL_SSD);
+    size_t dram_ready = seed_dram(mgr);
 
-    // Pre-fill DRAM
-    for (size_t i = 0; i < keys.size(); ++i) {
-      mgr.Write(keys[i], values[i].data(), values[i].size(), StorageTier::CPU_DRAM);
-    }
-
-    // Warmup
     for (size_t w = 0; w < cfg.warmup_iters; ++w) {
       for (size_t i = 0; i < keys.size(); ++i) {
         mgr.CopyToSSD(keys[i]);
+        if (ssd->Exists(keys[i])) ssd->Evict(keys[i]);
       }
     }
 
-    std::vector<double> latencies;
-    latencies.reserve(keys.size() * cfg.measure_iters);
-
+    bench::ResultTally tally;
+    tally.ReserveLatencySamples(keys.size() * cfg.measure_iters);
+    auto run_start = Clock::now();
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
       for (size_t i = 0; i < keys.size(); ++i) {
         auto t0 = Clock::now();
-        mgr.CopyToSSD(keys[i]);
+        bool ok = mgr.CopyToSSD(keys[i]);
         auto t1 = Clock::now();
-        latencies.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+        bool copied = ok && ssd->Exists(keys[i]);
+        tally.AddOp(copied, cfg.value_size,
+                    std::chrono::duration<double, std::micro>(t1 - t0).count());
+        if (copied) ssd->Evict(keys[i]);
+      }
+    }
+    auto run_end = Clock::now();
+
+    RecordResult("CopyToSSD", cold_variant(dram_ready, "op=single"), tally,
+                 WallSeconds(run_start, run_end), results);
+  }
+
+  // Single CopyToSSD, already-present fast path.
+  {
+    ScopedTempDir tmp(cfg.base_dir + "/copy_single_hot");
+    UMBPConfig ucfg = MakeStandaloneClientConfig(cfg, tmp.path + "/ssd", cfg.dram_capacity);
+    fs::create_directories(ucfg.ssd.storage_dir);
+    LocalStorageManager mgr(ucfg);
+    TierBackend* ssd = mgr.GetTier(StorageTier::LOCAL_SSD);
+    size_t ssd_ready = seed_ssd(ssd);
+
+    for (size_t w = 0; w < cfg.warmup_iters; ++w) {
+      for (size_t i = 0; i < keys.size(); ++i) {
+        mgr.CopyToSSD(keys[i]);
       }
     }
 
-    RecordResult("CopyToSSD", "single-key", keys.size() * cfg.measure_iters,
-                 keys.size() * cfg.measure_iters * cfg.value_size, LatencyElapsed(latencies),
-                 latencies, results);
+    bench::ResultTally tally;
+    tally.ReserveLatencySamples(keys.size() * cfg.measure_iters);
+    auto run_start = Clock::now();
+    for (size_t m = 0; m < cfg.measure_iters; ++m) {
+      for (size_t i = 0; i < keys.size(); ++i) {
+        auto t0 = Clock::now();
+        bool ok = mgr.CopyToSSD(keys[i]);
+        auto t1 = Clock::now();
+        tally.AddOp(ok && ssd->Exists(keys[i]), cfg.value_size,
+                    std::chrono::duration<double, std::micro>(t1 - t0).count());
+      }
+    }
+    auto run_end = Clock::now();
+
+    RecordResult("CopyToSSD", hot_variant(ssd_ready, "op=single"), tally,
+                 WallSeconds(run_start, run_end), results);
   }
 
-  // Batch CopyToSSDBatch
+  auto kdescs = BuildKeyBatches(keys, cfg.batch_size);
+  auto wdescs = BuildWriteBatches(keys, values, cfg.batch_size);
+  std::string batch_mode = BatchModeLabel(wdescs, cfg.segment_size);
+
+  // Batch CopyToSSDBatch, cold path.
   {
-    ScopedTempDir tmp(cfg.base_dir + "/copy_batch");
-
+    ScopedTempDir tmp(cfg.base_dir + "/copy_batch_cold");
     UMBPConfig ucfg = MakeStandaloneClientConfig(cfg, tmp.path + "/ssd", cfg.dram_capacity);
-
     fs::create_directories(ucfg.ssd.storage_dir);
     LocalStorageManager mgr(ucfg);
-
-    // Pre-fill DRAM
-    for (size_t i = 0; i < keys.size(); ++i) {
-      mgr.Write(keys[i], values[i].data(), values[i].size(), StorageTier::CPU_DRAM);
-    }
-
-    auto kdescs = BuildKeyBatches(keys, cfg.batch_size);
+    TierBackend* ssd = mgr.GetTier(StorageTier::LOCAL_SSD);
+    size_t dram_ready = seed_dram(mgr);
 
     for (size_t w = 0; w < cfg.warmup_iters; ++w) {
-      for (const auto& batch : kdescs) mgr.CopyToSSDBatch(batch);
+      for (const auto& batch : kdescs) {
+        mgr.CopyToSSDBatch(batch);
+        for (const auto& key : batch) {
+          if (ssd->Exists(key)) ssd->Evict(key);
+        }
+      }
     }
 
-    std::vector<double> latencies;
-    latencies.reserve(kdescs.size() * cfg.measure_iters);
-
+    bench::ResultTally tally;
+    tally.ReserveLatencySamples(keys.size() * cfg.measure_iters);
+    double measured_sec = 0.0;
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
       for (const auto& batch : kdescs) {
         auto t0 = Clock::now();
         mgr.CopyToSSDBatch(batch);
         auto t1 = Clock::now();
-        latencies.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+        measured_sec += WallSeconds(t0, t1);
+        tally.AddSample(batch.size(), batch.size(), batch.size() * cfg.value_size,
+                        batch.size() * cfg.value_size,
+                        std::chrono::duration<double, std::micro>(t1 - t0).count());
+        // Reset SSD state for next iteration (untimed).
+        for (const auto& key : batch) {
+          if (ssd->Exists(key)) ssd->Evict(key);
+        }
       }
     }
 
-    RecordResult("CopyToSSD", "batch(bs=" + std::to_string(cfg.batch_size) + ")",
-                 keys.size() * cfg.measure_iters, keys.size() * cfg.measure_iters * cfg.value_size,
-                 LatencyElapsed(latencies), latencies, results);
+    RecordResult(
+        "CopyToSSD",
+        cold_variant(dram_ready, JoinVariant({batch_mode, "bs=" + std::to_string(cfg.batch_size)})),
+        tally, measured_sec, results);
+  }
+
+  // Batch CopyToSSDBatch, already-present fast path.
+  {
+    ScopedTempDir tmp(cfg.base_dir + "/copy_batch_hot");
+    UMBPConfig ucfg = MakeStandaloneClientConfig(cfg, tmp.path + "/ssd", cfg.dram_capacity);
+    fs::create_directories(ucfg.ssd.storage_dir);
+    LocalStorageManager mgr(ucfg);
+    TierBackend* ssd = mgr.GetTier(StorageTier::LOCAL_SSD);
+    size_t ssd_ready = seed_ssd(ssd);
+
+    for (size_t w = 0; w < cfg.warmup_iters; ++w) {
+      for (const auto& batch : kdescs) mgr.CopyToSSDBatch(batch);
+    }
+
+    bench::ResultTally tally;
+    tally.ReserveLatencySamples(keys.size() * cfg.measure_iters);
+    auto run_start = Clock::now();
+    for (size_t m = 0; m < cfg.measure_iters; ++m) {
+      for (const auto& batch : kdescs) {
+        auto t0 = Clock::now();
+        mgr.CopyToSSDBatch(batch);
+        auto t1 = Clock::now();
+        // All keys pre-seeded on SSD; no need for CountExistingKeys here.
+        tally.AddSample(batch.size(), batch.size(), batch.size() * cfg.value_size,
+                        batch.size() * cfg.value_size,
+                        std::chrono::duration<double, std::micro>(t1 - t0).count());
+      }
+    }
+    auto run_end = Clock::now();
+
+    RecordResult(
+        "CopyToSSD",
+        hot_variant(ssd_ready, JoinVariant({batch_mode, "bs=" + std::to_string(cfg.batch_size)})),
+        tally, WallSeconds(run_start, run_end), results);
   }
 }
 
@@ -1151,6 +1949,11 @@ static void BenchIOBackend(const BenchConfig& cfg, const std::vector<std::string
                            const std::vector<std::vector<char>>& values,
                            std::vector<BenchResult>& results) {
   if (!ShouldRun(cfg, "IO Backend")) return;
+  if (cfg.value_size > cfg.ssd_capacity) {
+    PrintSkipMessage("IO Backend Sweep",
+                     "value_size exceeds ssd_capacity; backend SSD comparisons cannot succeed.");
+    return;
+  }
 
   PrintHeader("IO Backend Sweep");
 
@@ -1180,22 +1983,23 @@ static void BenchIOBackend(const BenchConfig& cfg, const std::vector<std::string
       }
       tier->Clear();
 
-      std::vector<double> latencies;
-      latencies.reserve(keys.size() * cfg.measure_iters);
+      bench::ResultTally tally;
+      tally.ReserveLatencySamples(keys.size() * cfg.measure_iters);
 
+      auto run_start = Clock::now();
       for (size_t m = 0; m < cfg.measure_iters; ++m) {
         tier->Clear();
         for (size_t i = 0; i < keys.size(); ++i) {
           auto t0 = Clock::now();
-          tier->Write(keys[i], values[i].data(), values[i].size());
+          bool ok = tier->Write(keys[i], values[i].data(), values[i].size());
           auto t1 = Clock::now();
-          latencies.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+          tally.AddOp(ok, cfg.value_size,
+                      std::chrono::duration<double, std::micro>(t1 - t0).count());
         }
       }
+      auto run_end = Clock::now();
 
-      RecordResult("IO Backend Write", variant, keys.size() * cfg.measure_iters,
-                   keys.size() * cfg.measure_iters * cfg.value_size, LatencyElapsed(latencies),
-                   latencies, results);
+      RecordResult("IO Backend Write", variant, tally, WallSeconds(run_start, run_end), results);
     }
 
     // Read
@@ -1210,9 +2014,12 @@ static void BenchIOBackend(const BenchConfig& cfg, const std::vector<std::string
       }
 
       // Pre-fill
+      size_t resident_keys = 0;
       for (size_t i = 0; i < keys.size(); ++i) {
-        tier->Write(keys[i], values[i].data(), values[i].size());
+        if (tier->Write(keys[i], values[i].data(), values[i].size())) ++resident_keys;
       }
+      std::string read_variant =
+          JoinVariant({variant, ResidencyVariantPrefix(resident_keys, keys.size())});
 
       std::vector<char> buf(cfg.value_size);
 
@@ -1223,21 +2030,23 @@ static void BenchIOBackend(const BenchConfig& cfg, const std::vector<std::string
         }
       }
 
-      std::vector<double> latencies;
-      latencies.reserve(keys.size() * cfg.measure_iters);
+      bench::ResultTally tally;
+      tally.ReserveLatencySamples(keys.size() * cfg.measure_iters);
 
+      auto run_start = Clock::now();
       for (size_t m = 0; m < cfg.measure_iters; ++m) {
         for (size_t i = 0; i < keys.size(); ++i) {
           auto t0 = Clock::now();
-          tier->ReadIntoPtr(keys[i], reinterpret_cast<uintptr_t>(buf.data()), buf.size());
+          bool ok = tier->ReadIntoPtr(keys[i], reinterpret_cast<uintptr_t>(buf.data()), buf.size());
           auto t1 = Clock::now();
-          latencies.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+          tally.AddOp(ok, cfg.value_size,
+                      std::chrono::duration<double, std::micro>(t1 - t0).count());
         }
       }
+      auto run_end = Clock::now();
 
-      RecordResult("IO Backend Read", variant, keys.size() * cfg.measure_iters,
-                   keys.size() * cfg.measure_iters * cfg.value_size, LatencyElapsed(latencies),
-                   latencies, results);
+      RecordResult("IO Backend Read", read_variant, tally, WallSeconds(run_start, run_end),
+                   results);
     }
   };
 
@@ -1253,6 +2062,12 @@ static void BenchDurability(const BenchConfig& cfg, const std::vector<std::strin
                             const std::vector<std::vector<char>>& values,
                             std::vector<BenchResult>& results) {
   if (!ShouldRun(cfg, "Durability")) return;
+  if (cfg.value_size > cfg.ssd_capacity) {
+    PrintSkipMessage(
+        "Durability (Strict vs Relaxed)",
+        "value_size exceeds ssd_capacity; durability write comparisons cannot succeed.");
+    return;
+  }
 
   PrintHeader("Durability (Strict vs Relaxed)");
 
@@ -1271,26 +2086,27 @@ static void BenchDurability(const BenchConfig& cfg, const std::vector<std::strin
     }
     tier.Clear();
 
-    std::vector<double> latencies;
-    latencies.reserve(keys.size() * cfg.measure_iters);
+    bench::ResultTally tally;
+    tally.ReserveLatencySamples(keys.size() * cfg.measure_iters);
 
+    auto run_start = Clock::now();
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
       tier.Clear();
       for (size_t i = 0; i < keys.size(); ++i) {
         auto t0 = Clock::now();
-        tier.Write(keys[i], values[i].data(), values[i].size());
+        bool ok = tier.Write(keys[i], values[i].data(), values[i].size());
         auto t1 = Clock::now();
-        latencies.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+        tally.AddOp(ok, cfg.value_size, std::chrono::duration<double, std::micro>(t1 - t0).count());
       }
     }
+    auto run_end = Clock::now();
 
-    RecordResult("SSD Write Durability", label, keys.size() * cfg.measure_iters,
-                 keys.size() * cfg.measure_iters * cfg.value_size, LatencyElapsed(latencies),
-                 latencies, results);
+    RecordResult("SSD Write Durability", "durability=" + label, tally,
+                 WallSeconds(run_start, run_end), results);
   };
 
-  run_mode(UMBPDurabilityMode::Strict, "Strict");
-  run_mode(UMBPDurabilityMode::Relaxed, "Relaxed");
+  run_mode(UMBPDurabilityMode::Strict, "strict");
+  run_mode(UMBPDurabilityMode::Relaxed, "relaxed");
 }
 
 // ---------------------------------------------------------------------------
@@ -1343,6 +2159,7 @@ static void BenchStorageIoDriver(const BenchConfig& cfg,
       }
     }
 
+    auto run_start = Clock::now();
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
       for (size_t i = 0; i < values.size(); ++i) {
         auto t0 = Clock::now();
@@ -1353,10 +2170,11 @@ static void BenchStorageIoDriver(const BenchConfig& cfg,
         latencies.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
       }
     }
+    auto run_end = Clock::now();
 
     RecordResult("Driver WriteAt", backend_variant, values.size() * cfg.measure_iters,
-                 values.size() * cfg.measure_iters * cfg.value_size, LatencyElapsed(latencies),
-                 latencies, results);
+                 values.size() * cfg.measure_iters * cfg.value_size,
+                 WallSeconds(run_start, run_end), latencies, results);
   }
 
   // --- ReadAt ---
@@ -1373,6 +2191,7 @@ static void BenchStorageIoDriver(const BenchConfig& cfg,
       }
     }
 
+    auto run_start = Clock::now();
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
       for (size_t i = 0; i < values.size(); ++i) {
         auto t0 = Clock::now();
@@ -1381,10 +2200,11 @@ static void BenchStorageIoDriver(const BenchConfig& cfg,
         latencies.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
       }
     }
+    auto run_end = Clock::now();
 
     RecordResult("Driver ReadAt", backend_variant, values.size() * cfg.measure_iters,
-                 values.size() * cfg.measure_iters * cfg.value_size, LatencyElapsed(latencies),
-                 latencies, results);
+                 values.size() * cfg.measure_iters * cfg.value_size,
+                 WallSeconds(run_start, run_end), latencies, results);
   }
 
   // --- WriteBatch ---
@@ -1403,8 +2223,8 @@ static void BenchStorageIoDriver(const BenchConfig& cfg,
       write_batches.push_back(std::move(ops));
     }
 
-    std::vector<double> latencies;
-    latencies.reserve(total_batches * cfg.measure_iters);
+    bench::ResultTally tally;
+    tally.ReserveLatencySamples(values.size() * cfg.measure_iters);
 
     for (size_t w = 0; w < cfg.warmup_iters; ++w) {
       for (const auto& ops : write_batches) {
@@ -1412,19 +2232,22 @@ static void BenchStorageIoDriver(const BenchConfig& cfg,
       }
     }
 
+    auto run_start = Clock::now();
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
       for (const auto& ops : write_batches) {
         auto t0 = Clock::now();
         EnsureIoOk(driver->WriteBatch(ops), "WriteBatch");
         auto t1 = Clock::now();
-        latencies.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+        tally.AddSample(ops.size(), ops.size(), ops.size() * cfg.value_size,
+                        ops.size() * cfg.value_size,
+                        std::chrono::duration<double, std::micro>(t1 - t0).count());
       }
     }
+    auto run_end = Clock::now();
 
-    RecordResult("Driver WriteBatch", backend_variant + "/bs=" + std::to_string(cfg.batch_size),
-                 values.size() * cfg.measure_iters,
-                 values.size() * cfg.measure_iters * cfg.value_size, LatencyElapsed(latencies),
-                 latencies, results);
+    RecordResult("Driver WriteBatch",
+                 JoinVariant({backend_variant, "bs=" + std::to_string(cfg.batch_size)}), tally,
+                 WallSeconds(run_start, run_end), results);
   }
 
   // --- Sync ---
@@ -1441,6 +2264,7 @@ static void BenchStorageIoDriver(const BenchConfig& cfg,
       }
     }
 
+    auto run_start = Clock::now();
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
       for (size_t i = 0; i < values.size(); ++i) {
         EnsureIoOk(driver->WriteAt(sync_fd.fd, values[i].data(), values[i].size(), 0),
@@ -1451,9 +2275,10 @@ static void BenchStorageIoDriver(const BenchConfig& cfg,
         latencies.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
       }
     }
+    auto run_end = Clock::now();
 
     RecordResult("Driver Sync", backend_variant, values.size() * cfg.measure_iters, 0,
-                 LatencyElapsed(latencies), latencies, results);
+                 WallSeconds(run_start, run_end), latencies, results);
   }
 
   // --- SyncMany ---
@@ -1466,8 +2291,8 @@ static void BenchStorageIoDriver(const BenchConfig& cfg,
     }
 
     size_t total_groups = (values.size() + sync_group_size - 1) / sync_group_size;
-    std::vector<double> latencies;
-    latencies.reserve(total_groups * cfg.measure_iters);
+    bench::ResultTally tally;
+    tally.ReserveLatencySamples(values.size() * cfg.measure_iters);
 
     auto write_group = [&](size_t start_idx) {
       size_t count = std::min(sync_group_size, values.size() - start_idx);
@@ -1489,6 +2314,7 @@ static void BenchStorageIoDriver(const BenchConfig& cfg,
       }
     }
 
+    auto run_start = Clock::now();
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
       for (size_t start = 0; start < values.size(); start += sync_group_size) {
         size_t count = write_group(start);
@@ -1498,13 +2324,15 @@ static void BenchStorageIoDriver(const BenchConfig& cfg,
         auto t0 = Clock::now();
         EnsureIoOk(driver->SyncMany(fds), "SyncMany");
         auto t1 = Clock::now();
-        latencies.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+        tally.AddSample(count, count, 0, 0,
+                        std::chrono::duration<double, std::micro>(t1 - t0).count());
       }
     }
+    auto run_end = Clock::now();
 
-    RecordResult("Driver SyncMany", backend_variant + "/fds=" + std::to_string(sync_group_size),
-                 values.size() * cfg.measure_iters, 0, LatencyElapsed(latencies), latencies,
-                 results);
+    RecordResult("Driver SyncMany",
+                 JoinVariant({backend_variant, "fds=" + std::to_string(sync_group_size)}), tally,
+                 WallSeconds(run_start, run_end), results);
   }
 }
 
@@ -1529,7 +2357,7 @@ static void BenchConcurrent(const BenchConfig& cfg, const std::vector<std::strin
     size_t keys_per_thread = keys.size() / static_cast<size_t>(nthreads);
     if (keys_per_thread == 0) continue;
 
-    std::string variant = std::to_string(nthreads) + " threads";
+    std::string variant = "threads=" + std::to_string(nthreads);
 
     // --- Put ---
     {
@@ -1542,13 +2370,15 @@ static void BenchConcurrent(const BenchConfig& cfg, const std::vector<std::strin
       }
       client.Clear();
 
-      std::vector<std::vector<double>> thread_latencies(nthreads);
+      std::vector<bench::ResultTally> thread_tallies(nthreads);
       for (int t = 0; t < nthreads; ++t) {
-        thread_latencies[t].reserve(keys_per_thread * cfg.measure_iters);
+        thread_tallies[t].ReserveLatencySamples(keys_per_thread * cfg.measure_iters);
       }
+      double elapsed_sec = 0.0;
 
       for (size_t m = 0; m < cfg.measure_iters; ++m) {
         client.Clear();
+        auto iter_start = Clock::now();
         std::vector<std::thread> threads;
         for (int t = 0; t < nthreads; ++t) {
           threads.emplace_back([&, t]() {
@@ -1556,27 +2386,21 @@ static void BenchConcurrent(const BenchConfig& cfg, const std::vector<std::strin
             size_t end = start + keys_per_thread;
             for (size_t i = start; i < end; ++i) {
               auto t0 = Clock::now();
-              client.Put(keys[i], values[i].data(), values[i].size());
+              bool ok = client.Put(keys[i], values[i].data(), values[i].size());
               auto t1 = Clock::now();
-              thread_latencies[t].push_back(
-                  std::chrono::duration<double, std::micro>(t1 - t0).count());
+              thread_tallies[t].AddOp(ok, cfg.value_size,
+                                      std::chrono::duration<double, std::micro>(t1 - t0).count());
             }
           });
         }
         for (auto& th : threads) th.join();
+        elapsed_sec += WallSeconds(iter_start, Clock::now());
       }
 
-      // Merge latencies
-      std::vector<double> all_lat;
-      for (auto& tl : thread_latencies) {
-        all_lat.insert(all_lat.end(), tl.begin(), tl.end());
-      }
+      bench::ResultTally tally;
+      for (const auto& thread_tally : thread_tallies) tally.Merge(thread_tally);
 
-      RecordResult(
-          "Concurrent Put", variant,
-          keys_per_thread * static_cast<size_t>(nthreads) * cfg.measure_iters,
-          keys_per_thread * static_cast<size_t>(nthreads) * cfg.measure_iters * cfg.value_size,
-          LatencyElapsed(all_lat), all_lat, results);
+      RecordResult("Concurrent Put", variant, tally, elapsed_sec, results);
     }
 
     // --- Get ---
@@ -1595,12 +2419,14 @@ static void BenchConcurrent(const BenchConfig& cfg, const std::vector<std::strin
         }
       }
 
-      std::vector<std::vector<double>> thread_latencies(nthreads);
+      std::vector<bench::ResultTally> thread_tallies(nthreads);
       for (int t = 0; t < nthreads; ++t) {
-        thread_latencies[t].reserve(keys_per_thread * cfg.measure_iters);
+        thread_tallies[t].ReserveLatencySamples(keys_per_thread * cfg.measure_iters);
       }
+      double elapsed_sec = 0.0;
 
       for (size_t m = 0; m < cfg.measure_iters; ++m) {
+        auto iter_start = Clock::now();
         std::vector<std::thread> threads;
         for (int t = 0; t < nthreads; ++t) {
           threads.emplace_back([&, t]() {
@@ -1609,26 +2435,22 @@ static void BenchConcurrent(const BenchConfig& cfg, const std::vector<std::strin
             size_t end = start + keys_per_thread;
             for (size_t i = start; i < end; ++i) {
               auto t0 = Clock::now();
-              client.GetIntoPtr(keys[i], reinterpret_cast<uintptr_t>(buf.data()), buf.size());
+              bool ok =
+                  client.GetIntoPtr(keys[i], reinterpret_cast<uintptr_t>(buf.data()), buf.size());
               auto t1 = Clock::now();
-              thread_latencies[t].push_back(
-                  std::chrono::duration<double, std::micro>(t1 - t0).count());
+              thread_tallies[t].AddOp(ok, cfg.value_size,
+                                      std::chrono::duration<double, std::micro>(t1 - t0).count());
             }
           });
         }
         for (auto& th : threads) th.join();
+        elapsed_sec += WallSeconds(iter_start, Clock::now());
       }
 
-      std::vector<double> all_lat;
-      for (auto& tl : thread_latencies) {
-        all_lat.insert(all_lat.end(), tl.begin(), tl.end());
-      }
+      bench::ResultTally tally;
+      for (const auto& thread_tally : thread_tallies) tally.Merge(thread_tally);
 
-      RecordResult(
-          "Concurrent Get", variant,
-          keys_per_thread * static_cast<size_t>(nthreads) * cfg.measure_iters,
-          keys_per_thread * static_cast<size_t>(nthreads) * cfg.measure_iters * cfg.value_size,
-          LatencyElapsed(all_lat), all_lat, results);
+      RecordResult("Concurrent Get", variant, tally, elapsed_sec, results);
     }
   }
 }
@@ -1658,27 +2480,31 @@ static void BenchLeaderMode(const BenchConfig& cfg, const std::vector<std::strin
       }
     }
 
-    std::vector<double> latencies;
-    latencies.reserve(keys.size() * cfg.measure_iters);
+    bench::ResultTally tally;
+    tally.ReserveLatencySamples(keys.size() * cfg.measure_iters);
+    double elapsed_sec = 0.0;
 
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
-      UMBPClient client(ucfg);
-      for (size_t i = 0; i < keys.size(); ++i) {
-        auto t0 = Clock::now();
-        client.Put(keys[i], values[i].data(), values[i].size());
-        auto t1 = Clock::now();
-        latencies.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+      auto iter_start = Clock::now();
+      {
+        UMBPClient client(ucfg);
+        for (size_t i = 0; i < keys.size(); ++i) {
+          auto t0 = Clock::now();
+          bool ok = client.Put(keys[i], values[i].data(), values[i].size());
+          auto t1 = Clock::now();
+          tally.AddOp(ok, cfg.value_size,
+                      std::chrono::duration<double, std::micro>(t1 - t0).count());
+        }
       }
-      // Destructor waits for async drain
+      elapsed_sec += WallSeconds(iter_start, Clock::now());
     }
 
-    RecordResult("Leader Put", label, keys.size() * cfg.measure_iters,
-                 keys.size() * cfg.measure_iters * cfg.value_size, LatencyElapsed(latencies),
-                 latencies, results);
+    RecordResult("Leader Put", JoinVariant({label, "timing=end-to-end"}), tally, elapsed_sec,
+                 results);
   };
 
-  run_mode(false, "sync copy");
-  run_mode(true, "async copy");
+  run_mode(false, "copy=sync");
+  run_mode(true, "copy=async");
 }
 
 // ---------------------------------------------------------------------------
@@ -1715,22 +2541,23 @@ static void BenchCapacityPressure(const BenchConfig& cfg, const std::vector<std:
     }
     client.Clear();
 
-    std::vector<double> latencies;
-    latencies.reserve(half * cfg.measure_iters);
+    bench::ResultTally tally;
+    tally.ReserveLatencySamples(half * cfg.measure_iters);
+    double elapsed_sec = 0.0;
 
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
       client.Clear();
+      auto iter_start = Clock::now();
       for (size_t i = 0; i < half; ++i) {
         auto t0 = Clock::now();
-        client.Put(keys[i], values[i].data(), values[i].size());
+        bool ok = client.Put(keys[i], values[i].data(), values[i].size());
         auto t1 = Clock::now();
-        latencies.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+        tally.AddOp(ok, cfg.value_size, std::chrono::duration<double, std::micro>(t1 - t0).count());
       }
+      elapsed_sec += WallSeconds(iter_start, Clock::now());
     }
 
-    RecordResult("Capacity Put", "no pressure", half * cfg.measure_iters,
-                 half * cfg.measure_iters * cfg.value_size, LatencyElapsed(latencies), latencies,
-                 results);
+    RecordResult("Capacity Put", "phase=fits-in-dram/dram=50%", tally, elapsed_sec, results);
   }
 
   // Under pressure: write all keys, second half triggers eviction
@@ -1746,8 +2573,9 @@ static void BenchCapacityPressure(const BenchConfig& cfg, const std::vector<std:
     }
     client.Clear();
 
-    std::vector<double> latencies;
-    latencies.reserve(half * cfg.measure_iters);
+    bench::ResultTally tally;
+    tally.ReserveLatencySamples(half * cfg.measure_iters);
+    double elapsed_sec = 0.0;
 
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
       client.Clear();
@@ -1756,17 +2584,17 @@ static void BenchCapacityPressure(const BenchConfig& cfg, const std::vector<std:
         client.Put(keys[i], values[i].data(), values[i].size());
       }
       // Write second half — triggers eviction + demotion
+      auto iter_start = Clock::now();
       for (size_t i = half; i < keys.size(); ++i) {
         auto t0 = Clock::now();
-        client.Put(keys[i], values[i].data(), values[i].size());
+        bool ok = client.Put(keys[i], values[i].data(), values[i].size());
         auto t1 = Clock::now();
-        latencies.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+        tally.AddOp(ok, cfg.value_size, std::chrono::duration<double, std::micro>(t1 - t0).count());
       }
+      elapsed_sec += WallSeconds(iter_start, Clock::now());
     }
 
-    RecordResult("Capacity Put", "under pressure", (keys.size() - half) * cfg.measure_iters,
-                 (keys.size() - half) * cfg.measure_iters * cfg.value_size,
-                 LatencyElapsed(latencies), latencies, results);
+    RecordResult("Capacity Put", "phase=spills-to-ssd/dram=50%", tally, elapsed_sec, results);
   }
 }
 
@@ -1783,7 +2611,7 @@ static void BenchE2E(const BenchConfig& cfg, const E2EConfig& e2e,
   std::string variant_label = mode_str + "/" + std::to_string(e2e.batch_pages) + "pg/" +
                               std::to_string(value_size / 1024) + "KB";
 
-  PrintHeader("E2E UMBPClient (" + variant_label + ")");
+  PrintSectionTitle("E2E UMBPClient (" + variant_label + ")");
   std::printf("  mode          = %s\n", mode_str.c_str());
   std::printf("  num_layers    = %zu\n", e2e.num_layers);
   if (e2e.mode == E2EModelMode::MLA) {
@@ -1819,17 +2647,24 @@ static void BenchE2E(const BenchConfig& cfg, const E2EConfig& e2e,
 
   size_t batches_per_iter = (e2e.num_pages + e2e.batch_pages - 1) / e2e.batch_pages;
 
-  // Auto-scale iters to ensure enough latency samples for reliable percentiles.
-  // Target: >=100 batch samples for p95, >=1000 for p99.
+  // Auto-scale iters to keep percentile rows reasonably stable.
+  // Batch-style rows target >=100 batch samples; whole-cycle rows need a higher floor
+  // because p99 from only ~100 calls is still noisy.
   // User --iters is treated as a minimum; we scale up if batches_per_iter is small.
-  constexpr size_t kMinSamplesForP95 = 100;
+  constexpr size_t kMinBatchSamples = 100;
+  constexpr size_t kMinWholeCycleSamples = 200;
   size_t e2e_iters = cfg.measure_iters;
-  if (batches_per_iter > 0 && batches_per_iter * e2e_iters < kMinSamplesForP95) {
-    e2e_iters = (kMinSamplesForP95 + batches_per_iter - 1) / batches_per_iter;
+  if (batches_per_iter > 0 && batches_per_iter * e2e_iters < kMinBatchSamples) {
+    e2e_iters = (kMinBatchSamples + batches_per_iter - 1) / batches_per_iter;
   }
   size_t total_samples = batches_per_iter * e2e_iters;
+  size_t e2e_call_iters = std::max(e2e_iters, kMinWholeCycleSamples);
   std::printf("  e2e_iters     = %zu (auto-scaled from %zu; %zu batches/iter, %zu total samples)\n",
               e2e_iters, cfg.measure_iters, batches_per_iter, total_samples);
+  if (e2e_call_iters != e2e_iters) {
+    std::printf("  e2e_call_iters= %zu (whole-cycle latency rows)\n", e2e_call_iters);
+  }
+  PrintTableHeader(OutputTableKind::Detail);
 
   // Helper: fill all pages into a client (untimed).
   auto FillAll = [&](UMBPClient& client) {
@@ -1844,8 +2679,8 @@ static void BenchE2E(const BenchConfig& cfg, const E2EConfig& e2e,
     }
   };
 
-  // Helper: fill pages [0, num_pages) via BatchPut, collecting per-batch latencies.
-  auto FillAllTimed = [&](UMBPClient& client, size_t num_pages, std::vector<double>& latencies) {
+  // Helper: fill pages [0, num_pages) via BatchPut, collecting per-page metrics.
+  auto FillAllTimed = [&](UMBPClient& client, size_t num_pages, bench::ResultTally& tally) {
     for (size_t b = 0; b < num_pages; b += e2e.batch_pages) {
       size_t count = std::min(e2e.batch_pages, num_pages - b);
       auto keys = keygen.KeysForPages(b, count);
@@ -1854,9 +2689,37 @@ static void BenchE2E(const BenchConfig& cfg, const E2EConfig& e2e,
       host_buf.GetBatchMeta(b, count, ptrs, sizes);
       auto depths = GenerateDepths(e2e, b, count);
       auto t0 = Clock::now();
-      client.BatchPutFromPtrWithDepth(keys, ptrs, sizes, depths);
+      auto batch_results = client.BatchPutFromPtrWithDepth(keys, ptrs, sizes, depths);
       auto t1 = Clock::now();
-      latencies.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+      size_t ok_pages = bench::CountSuccessfulPages(batch_results, keys_per_page);
+      tally.AddSample(count, ok_pages, count * keys_per_page * value_size,
+                      ok_pages * keys_per_page * value_size,
+                      std::chrono::duration<double, std::micro>(t1 - t0).count());
+    }
+  };
+
+  auto FillAllTimedDedup = [&](UMBPClient& client, size_t num_pages, size_t prefill_pages,
+                               bench::ResultTally& tally) {
+    for (size_t b = 0; b < num_pages; b += e2e.batch_pages) {
+      size_t count = std::min(e2e.batch_pages, num_pages - b);
+      auto keys = keygen.KeysForPages(b, count);
+      std::vector<uintptr_t> ptrs;
+      std::vector<size_t> sizes;
+      host_buf.GetBatchMeta(b, count, ptrs, sizes);
+      auto depths = GenerateDepths(e2e, b, count);
+      auto t0 = Clock::now();
+      auto batch_results = client.BatchPutFromPtrWithDepth(keys, ptrs, sizes, depths);
+      auto t1 = Clock::now();
+
+      size_t ok_pages = bench::CountSuccessfulPages(batch_results, keys_per_page);
+      size_t dedup_pages = 0;
+      if (b < prefill_pages) {
+        dedup_pages = std::min(count, prefill_pages - b);
+      }
+      size_t physical_write_pages = (ok_pages > dedup_pages) ? (ok_pages - dedup_pages) : 0;
+      tally.AddSample(count, ok_pages, count * keys_per_page * value_size,
+                      physical_write_pages * keys_per_page * value_size,
+                      std::chrono::duration<double, std::micro>(t1 - t0).count());
     }
   };
 
@@ -1865,16 +2728,19 @@ static void BenchE2E(const BenchConfig& cfg, const E2EConfig& e2e,
   std::vector<uintptr_t> read_ptrs;
   std::vector<size_t> read_sizes;
 
-  auto ReadAllTimed = [&](UMBPClient& client, size_t num_pages, std::vector<double>& latencies) {
+  auto ReadAllTimed = [&](UMBPClient& client, size_t num_pages, bench::ResultTally& tally) {
     for (size_t b = 0; b < num_pages; b += e2e.batch_pages) {
       size_t count = std::min(e2e.batch_pages, num_pages - b);
       auto keys = keygen.KeysForPages(b, count);
       E2EHostBuffer::MakeReadMeta(count, keys_per_page, value_size, read_buf, read_ptrs,
                                   read_sizes);
       auto t0 = Clock::now();
-      client.BatchGetIntoPtr(keys, read_ptrs, read_sizes);
+      auto batch_results = client.BatchGetIntoPtr(keys, read_ptrs, read_sizes);
       auto t1 = Clock::now();
-      latencies.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+      size_t ok_pages = bench::CountSuccessfulPages(batch_results, keys_per_page);
+      tally.AddSample(count, ok_pages, count * keys_per_page * value_size,
+                      ok_pages * keys_per_page * value_size,
+                      std::chrono::duration<double, std::micro>(t1 - t0).count());
     }
   };
 
@@ -1888,8 +2754,6 @@ static void BenchE2E(const BenchConfig& cfg, const E2EConfig& e2e,
       client.BatchGetIntoPtr(keys, read_ptrs, read_sizes);
     }
   };
-
-  // LatencyElapsed() is now a file-scope helper (above RecordResult).
 
   // ---------------------------------------------------------------
   // (a) E2E BatchSet — fresh writes via BatchPutFromPtrWithDepth
@@ -1906,16 +2770,16 @@ static void BenchE2E(const BenchConfig& cfg, const E2EConfig& e2e,
     }
     client.Clear();
 
-    std::vector<double> latencies;
-    latencies.reserve(batches_per_iter * e2e_iters);
+    bench::ResultTally tally;
+    tally.ReserveLatencySamples(e2e.num_pages * e2e_iters);
 
+    auto run_start = Clock::now();
     for (size_t m = 0; m < e2e_iters; ++m) {
       client.Clear();
-      FillAllTimed(client, e2e.num_pages, latencies);
+      FillAllTimed(client, e2e.num_pages, tally);
     }
-    RecordResult("E2E BatchSet", variant_label, e2e.num_pages * e2e_iters,
-                 e2e.num_pages * e2e_iters * keys_per_page * value_size, LatencyElapsed(latencies),
-                 latencies, results);
+    auto run_end = Clock::now();
+    RecordResult("E2E BatchSet", variant_label, tally, WallSeconds(run_start, run_end), results);
   }
 
   // ---------------------------------------------------------------
@@ -1929,16 +2793,16 @@ static void BenchE2E(const BenchConfig& cfg, const E2EConfig& e2e,
 
     for (size_t w = 0; w < cfg.warmup_iters; ++w) ReadAll(client, e2e.num_pages);
 
-    std::vector<double> latencies;
-    latencies.reserve(batches_per_iter * e2e_iters);
-    for (size_t m = 0; m < e2e_iters; ++m) ReadAllTimed(client, e2e.num_pages, latencies);
-    RecordResult("E2E BatchGet", variant_label, e2e.num_pages * e2e_iters,
-                 e2e.num_pages * e2e_iters * keys_per_page * value_size, LatencyElapsed(latencies),
-                 latencies, results);
+    bench::ResultTally tally;
+    tally.ReserveLatencySamples(e2e.num_pages * e2e_iters);
+    auto run_start = Clock::now();
+    for (size_t m = 0; m < e2e_iters; ++m) ReadAllTimed(client, e2e.num_pages, tally);
+    auto run_end = Clock::now();
+    RecordResult("E2E BatchGet", variant_label, tally, WallSeconds(run_start, run_end), results);
   }
 
   // ---------------------------------------------------------------
-  // (c) E2E BatchExists — BatchExistsConsecutive with partial fill
+  // (c) E2E ExistsScan — BatchExistsConsecutive with partial fill
   // ---------------------------------------------------------------
   {
     ScopedTempDir tmp(cfg.base_dir + "/e2e_exists");
@@ -1965,18 +2829,22 @@ static void BenchE2E(const BenchConfig& cfg, const E2EConfig& e2e,
       client.BatchExistsConsecutive(all_keys);
     }
 
-    std::vector<double> latencies;
-    latencies.reserve(e2e_iters);
+    bench::ResultTally tally;
+    tally.ReserveLatencySamples(e2e_call_iters);
+    size_t hit_pct = (e2e.num_pages == 0) ? 0 : ((fill_pages * 100) / e2e.num_pages);
 
-    for (size_t m = 0; m < e2e_iters; ++m) {
+    auto run_start = Clock::now();
+    for (size_t m = 0; m < e2e_call_iters; ++m) {
       auto t0 = Clock::now();
-      size_t hit = client.BatchExistsConsecutive(all_keys);
+      client.BatchExistsConsecutive(all_keys);
       auto t1 = Clock::now();
-      latencies.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
-      (void)hit;
+      tally.AddCall(/*requested=*/1, /*succeeded=*/1, /*req_bytes=*/0, /*ok_bytes=*/0,
+                    std::chrono::duration<double, std::micro>(t1 - t0).count());
     }
-    RecordResult("E2E BatchExists", variant_label, e2e.num_pages * e2e_iters, 0,
-                 LatencyElapsed(latencies), latencies, results);
+    auto run_end = Clock::now();
+    RecordResult("E2E ExistsScan",
+                 JoinVariant({variant_label, "hit=" + std::to_string(hit_pct) + "%"}), tally,
+                 WallSeconds(run_start, run_end), results);
   }
 
   // ---------------------------------------------------------------
@@ -2015,21 +2883,26 @@ static void BenchE2E(const BenchConfig& cfg, const E2EConfig& e2e,
       }
     }
 
-    std::vector<double> latencies;
-    latencies.reserve(batches_per_iter * e2e_iters);
+    bench::ResultTally tally;
+    tally.ReserveLatencySamples(e2e.num_pages * e2e_iters);
 
     UMBPClient client(ucfg);
+    auto run_start = Clock::now();
     for (size_t m = 0; m < e2e_iters; ++m) {
       SeedPrefix(client);
-      FillAllTimed(client, e2e.num_pages, latencies);
+      FillAllTimedDedup(client, e2e.num_pages, prefill_pages, tally);
     }
-    RecordResult("E2E Dedup", std::to_string(static_cast<int>(e2e.dedup_ratio * 100)) + "% dedup",
-                 e2e.num_pages * e2e_iters, e2e.num_pages * e2e_iters * keys_per_page * value_size,
-                 LatencyElapsed(latencies), latencies, results);
+    auto run_end = Clock::now();
+    RecordResult(
+        "E2E Dedup",
+        JoinVariant({variant_label,
+                     "dedup=" + std::to_string(static_cast<int>(e2e.dedup_ratio * 100)) + "%",
+                     "bytes=physical"}),
+        tally, WallSeconds(run_start, run_end), results);
   }
 
   // ---------------------------------------------------------------
-  // (e) E2E Prefetch — exists → get pipeline (sglang prefetch flow)
+  // (e) E2E PrefetchCycle — exists → get pipeline (sglang prefetch flow)
   // ---------------------------------------------------------------
   {
     ScopedTempDir tmp(cfg.base_dir + "/e2e_prefetch");
@@ -2044,10 +2917,11 @@ static void BenchE2E(const BenchConfig& cfg, const E2EConfig& e2e,
       ReadAll(client, e2e.num_pages);
     }
 
-    std::vector<double> latencies;
-    latencies.reserve(e2e_iters);
+    bench::ResultTally tally;
+    tally.ReserveLatencySamples(e2e_call_iters);
 
-    for (size_t m = 0; m < e2e_iters; ++m) {
+    auto run_start = Clock::now();
+    for (size_t m = 0; m < e2e_call_iters; ++m) {
       auto t0 = Clock::now();
 
       // Step 1: exists check (determines how many pages to fetch).
@@ -2066,11 +2940,14 @@ static void BenchE2E(const BenchConfig& cfg, const E2EConfig& e2e,
       }
 
       auto t1 = Clock::now();
-      latencies.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+      tally.AddCall(/*requested=*/1, /*succeeded=*/1,
+                    /*req_bytes=*/e2e.num_pages * keys_per_page * value_size,
+                    /*ok_bytes=*/hit_pages * keys_per_page * value_size,
+                    std::chrono::duration<double, std::micro>(t1 - t0).count());
     }
-    RecordResult("E2E Prefetch", variant_label, e2e.num_pages * e2e_iters,
-                 e2e.num_pages * e2e_iters * keys_per_page * value_size, LatencyElapsed(latencies),
-                 latencies, results);
+    auto run_end = Clock::now();
+    RecordResult("E2E PrefetchCycle", variant_label, tally, WallSeconds(run_start, run_end),
+                 results);
   }
 
   // ---------------------------------------------------------------
@@ -2099,16 +2976,18 @@ static void BenchE2E(const BenchConfig& cfg, const E2EConfig& e2e,
       }
       client.Clear();
 
-      std::vector<double> latencies;
-      latencies.reserve(batches_per_iter * e2e_iters);
+      bench::ResultTally tally;
+      tally.ReserveLatencySamples(e2e.num_pages * e2e_iters);
 
+      auto run_start = Clock::now();
       for (size_t m = 0; m < e2e_iters; ++m) {
         client.Clear();
-        FillAllTimed(client, e2e.num_pages, latencies);
+        FillAllTimed(client, e2e.num_pages, tally);
       }
-      RecordResult("E2E Capacity Set", "DRAM 50%", e2e.num_pages * e2e_iters,
-                   e2e.num_pages * e2e_iters * keys_per_page * value_size,
-                   LatencyElapsed(latencies), latencies, results);
+      auto run_end = Clock::now();
+      RecordResult("E2E Capacity Put",
+                   JoinVariant({variant_label, "phase=spills-to-ssd", "dram=50%"}), tally,
+                   WallSeconds(run_start, run_end), results);
     }
 
     // --- Read-back (early pages evicted to SSD) ---
@@ -2118,13 +2997,15 @@ static void BenchE2E(const BenchConfig& cfg, const E2EConfig& e2e,
 
       for (size_t w = 0; w < cfg.warmup_iters; ++w) ReadAll(client, e2e.num_pages);
 
-      std::vector<double> latencies;
-      latencies.reserve(batches_per_iter * e2e_iters);
+      bench::ResultTally tally;
+      tally.ReserveLatencySamples(e2e.num_pages * e2e_iters);
 
-      for (size_t m = 0; m < e2e_iters; ++m) ReadAllTimed(client, e2e.num_pages, latencies);
-      RecordResult("E2E Capacity Get", "DRAM+SSD mixed", e2e.num_pages * e2e_iters,
-                   e2e.num_pages * e2e_iters * keys_per_page * value_size,
-                   LatencyElapsed(latencies), latencies, results);
+      auto run_start = Clock::now();
+      for (size_t m = 0; m < e2e_iters; ++m) ReadAllTimed(client, e2e.num_pages, tally);
+      auto run_end = Clock::now();
+      RecordResult("E2E Capacity Get",
+                   JoinVariant({variant_label, "phase=read-after-spill", "dram=50%"}), tally,
+                   WallSeconds(run_start, run_end), results);
     }
   }
 
@@ -2149,20 +3030,29 @@ static void BenchE2E(const BenchConfig& cfg, const E2EConfig& e2e,
         FillAll(client);
       }
 
-      std::vector<double> latencies;
-      latencies.reserve(batches_per_iter * e2e_iters);
+      bench::ResultTally tally;
+      tally.ReserveLatencySamples(e2e.num_pages * e2e_iters);
 
+      auto run_start = Clock::now();
       for (size_t m = 0; m < e2e_iters; ++m) {
-        UMBPClient client(ucfg);  // fresh client per iter (destructor drains async)
-        FillAllTimed(client, e2e.num_pages, latencies);
+        bench::ResultTally iter_tally;
+        auto iter_start = Clock::now();
+        {
+          UMBPClient client(ucfg);  // fresh client per iter (destructor drains async)
+          FillAllTimed(client, e2e.num_pages, iter_tally);
+        }
+        auto iter_end = Clock::now();
+        tally.AddSample(iter_tally.requested_ops, iter_tally.successful_ops,
+                        iter_tally.requested_bytes, iter_tally.successful_bytes,
+                        std::chrono::duration<double, std::micro>(iter_end - iter_start).count());
       }
-      RecordResult("E2E Leader Set", label, e2e.num_pages * e2e_iters,
-                   e2e.num_pages * e2e_iters * keys_per_page * value_size,
-                   LatencyElapsed(latencies), latencies, results);
+      auto run_end = Clock::now();
+      RecordResult("E2E Leader Set", JoinVariant({variant_label, label, "timing=end-to-end"}),
+                   tally, WallSeconds(run_start, run_end), results);
     };
 
-    run_leader(false, "sync copy");
-    run_leader(true, "async copy");
+    run_leader(false, "copy=sync");
+    run_leader(true, "copy=async");
   }
 
   // ---------------------------------------------------------------
@@ -2193,12 +3083,13 @@ static void BenchE2E(const BenchConfig& cfg, const E2EConfig& e2e,
 
     for (size_t w = 0; w < cfg.warmup_iters; ++w) ReadAll(follower, e2e.num_pages);
 
-    std::vector<double> latencies;
-    latencies.reserve(batches_per_iter * e2e_iters);
-    for (size_t m = 0; m < e2e_iters; ++m) ReadAllTimed(follower, e2e.num_pages, latencies);
-    RecordResult("E2E Follower Get", "SSD read", e2e.num_pages * e2e_iters,
-                 e2e.num_pages * e2e_iters * keys_per_page * value_size, LatencyElapsed(latencies),
-                 latencies, results);
+    bench::ResultTally tally;
+    tally.ReserveLatencySamples(e2e.num_pages * e2e_iters);
+    auto run_start = Clock::now();
+    for (size_t m = 0; m < e2e_iters; ++m) ReadAllTimed(follower, e2e.num_pages, tally);
+    auto run_end = Clock::now();
+    RecordResult("E2E Follower Get", JoinVariant({variant_label, "source=ssd-only"}), tally,
+                 WallSeconds(run_start, run_end), results);
   }
 }
 
@@ -2254,11 +3145,12 @@ static void PrintUsage(const char* argv0) {
       "\n"
       "General:\n"
       "  --profile <small|medium|large>   Preset config (default: medium)\n"
+      "  --list-scenarios                 Print available scenario filters and exit\n"
       "  --num-keys N                     Keys per scenario\n"
       "  --value-size N                   Value size in bytes\n"
       "  --batch-size N                   Batch size\n"
       "  --warmup-iters N                 Warmup iterations\n"
-      "  --iters N                        Measurement iterations\n"
+      "  --iters N                        Measurement iterations (default: 10)\n"
       "  --filter SUBSTRING               Run only matching scenarios\n"
       "  --dir PATH                       Temp directory path\n"
       "  -h, --help                       Help\n"
@@ -2346,6 +3238,8 @@ static ParsedArgs ParseArgs(int argc, char* argv[]) {
     if (arg == "-h" || arg == "--help") {
       PrintUsage(argv[0]);
       std::exit(0);
+    } else if (arg == "--list-scenarios") {
+      cfg.list_scenarios = true;
     } else if (arg == "--profile" && i + 1 < argc) {
       profile = argv[++i];
     } else if (arg == "--num-keys" && i + 1 < argc) {
@@ -2542,6 +3436,10 @@ static ParsedArgs ParseArgs(int argc, char* argv[]) {
 // ---------------------------------------------------------------------------
 int main(int argc, char* argv[]) {
   auto [cfg, e2e] = ParseArgs(argc, argv);
+  if (cfg.list_scenarios) {
+    PrintScenarioList();
+    return 0;
+  }
 
   std::printf("UMBP Benchmark\n");
   std::printf("  num_keys     = %zu\n", cfg.num_keys);
@@ -2559,6 +3457,7 @@ int main(int argc, char* argv[]) {
   if (!cfg.filter.empty()) {
     std::printf("  filter       = %s\n", cfg.filter.c_str());
   }
+  PrintConfigWarnings(cfg);
   std::printf("  threads      =");
   for (int t : cfg.thread_counts) std::printf(" %d", t);
   std::printf("\n");
@@ -2585,13 +3484,20 @@ int main(int argc, char* argv[]) {
   BenchCapacityPressure(cfg, keys, values, results);
   BenchE2E(cfg, e2e, results);
 
+  if (results.empty()) {
+    if (!cfg.filter.empty()) {
+      std::fprintf(stderr,
+                   "Warning: filter '%s' matched no benchmark scenarios. Use --list-scenarios.\n",
+                   cfg.filter.c_str());
+    }
+    return 1;
+  }
+
   // Summary
   std::printf("\n=== Summary ===\n");
-  std::printf("%-36s %-20s %12s %10s\n", "Benchmark", "Variant", "ops/s", "MB/s");
-  std::printf("%s\n", std::string(36 + 20 + 12 + 10 + 3, '-').c_str());
+  PrintTableHeader(OutputTableKind::Summary);
   for (const auto& r : results) {
-    std::printf("%-36s %-20s %12.0f %10.1f\n", r.name.c_str(), r.variant.c_str(),
-                r.throughput_ops_sec(), r.throughput_mb_sec());
+    PrintSummaryResult(r);
   }
 
   std::printf("\nDone. %zu benchmarks completed.\n", results.size());
