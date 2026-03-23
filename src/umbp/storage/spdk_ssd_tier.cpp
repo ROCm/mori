@@ -2,6 +2,11 @@
 // MIT License
 //
 // SpdkSsdTier: deep-queue NVMe pipeline via SPDK.
+//
+// Metadata management follows mooncake-store's OffsetAllocatorStorageBackend:
+//   - Sharded map with shared_mutex for concurrent reads
+//   - RefCounted allocation handles for safe concurrent access
+//   - Auto LRU eviction on allocation failure
 
 #include "umbp/storage/spdk_ssd_tier.h"
 
@@ -55,14 +60,14 @@ SpdkSsdTier::SpdkSsdTier(const UMBPConfig& config)
 
     num_io_workers_ = std::max(1, config.spdk_io_workers);
 
-    // Pre-allocate DMA ring buffers (2MB each, kMaxQueueDepth slots)
     size_t ring_buf_size = 2ULL * 1024 * 1024;
     AllocDmaRing(ring_buf_size);
 
     initialized_ = true;
-    UMBP_LOG_INFO("SpdkSsdTier: ready — capacity=%zuMB block_size=%u dma_ring=%d×%zuKB io_workers=%d",
+    UMBP_LOG_INFO("SpdkSsdTier: ready — capacity=%zuMB block_size=%u dma_ring=%d×%zuKB io_workers=%d shards=%zu",
                   capacity_ / (1024 * 1024), block_size_,
-                  dma_ring_count_, dma_ring_buf_size_ / 1024, num_io_workers_);
+                  dma_ring_count_, dma_ring_buf_size_ / 1024, num_io_workers_,
+                  kNumShards);
 }
 
 SpdkSsdTier::~SpdkSsdTier() {
@@ -77,21 +82,13 @@ void SpdkSsdTier::AllocDmaRing(size_t buf_size) {
     dma_ring_buf_size_ = buf_size;
     dma_ring_count_ = kMaxQueueDepth * std::max(1, num_io_workers_);
     dma_ring_ = new void*[dma_ring_count_];
-
-    int got = env.DmaPoolAllocBatch(dma_ring_, dma_ring_buf_size_,
-                                     dma_ring_count_);
-    if (got < dma_ring_count_) {
-        UMBP_LOG_WARN("SpdkSsdTier: DMA ring partial %d/%d", got, dma_ring_count_);
-        for (int i = got; i < dma_ring_count_; ++i)
-            dma_ring_[i] = nullptr;
-        dma_ring_count_ = got;
-    }
+    env.DmaPoolAllocBatch(dma_ring_, dma_ring_buf_size_, dma_ring_count_);
 }
 
 void SpdkSsdTier::FreeDmaRing() {
     if (!dma_ring_) return;
     auto& env = umbp::SpdkEnv::Instance();
-    if (env.IsInitialized() && dma_ring_count_ > 0) {
+    if (env.IsInitialized()) {
         env.DmaPoolFreeBatch(dma_ring_, dma_ring_buf_size_, dma_ring_count_);
     }
     delete[] dma_ring_;
@@ -100,7 +97,7 @@ void SpdkSsdTier::FreeDmaRing() {
 }
 
 // ---------------------------------------------------------------------------
-// Single-key Write — wrapper around BatchWrite for simplicity.
+// Single-key wrappers
 // ---------------------------------------------------------------------------
 bool SpdkSsdTier::Write(const std::string& key, const void* data, size_t size) {
     std::vector<std::string> keys = {key};
@@ -110,9 +107,6 @@ bool SpdkSsdTier::Write(const std::string& key, const void* data, size_t size) {
     return !results.empty() && results[0];
 }
 
-// ---------------------------------------------------------------------------
-// Single-key Read — wrapper around BatchReadIntoPtr.
-// ---------------------------------------------------------------------------
 bool SpdkSsdTier::ReadIntoPtr(const std::string& key, uintptr_t dst_ptr,
                                size_t size) {
     std::vector<std::string> keys = {key};
@@ -123,19 +117,22 @@ bool SpdkSsdTier::ReadIntoPtr(const std::string& key, uintptr_t dst_ptr,
 }
 
 // ---------------------------------------------------------------------------
-// Exists / Evict / Capacity / Clear
+// Exists / Evict / Capacity / Clear / LRU — sharded
 // ---------------------------------------------------------------------------
 bool SpdkSsdTier::Exists(const std::string& key) const {
-    std::lock_guard<std::mutex> lk(mu_);
-    return entries_.count(key) > 0;
+    auto& shard = shards_[ShardForKey(key)];
+    std::shared_lock<std::shared_mutex> slk(shard.mutex);
+    return shard.map.count(key) > 0;
 }
 
 bool SpdkSsdTier::Evict(const std::string& key) {
-    std::lock_guard<std::mutex> lk(mu_);
-    auto it = entries_.find(key);
-    if (it == entries_.end()) return false;
+    std::lock_guard<std::mutex> lru_lk(lru_mu_);
+    auto& shard = shards_[ShardForKey(key)];
+    std::unique_lock<std::shared_mutex> slk(shard.mutex);
+    auto it = shard.map.find(key);
+    if (it == shard.map.end()) return false;
     lru_list_.erase(it->second.lru_pos);
-    entries_.erase(it);
+    shard.map.erase(it);
     return true;
 }
 
@@ -146,19 +143,22 @@ std::pair<size_t, size_t> SpdkSsdTier::Capacity() const {
 }
 
 void SpdkSsdTier::Clear() {
-    std::lock_guard<std::mutex> lk(mu_);
-    entries_.clear();
+    std::lock_guard<std::mutex> lru_lk(lru_mu_);
+    for (size_t s = 0; s < kNumShards; ++s) {
+        std::unique_lock<std::shared_mutex> slk(shards_[s].mutex);
+        shards_[s].map.clear();
+    }
     lru_list_.clear();
 }
 
 std::string SpdkSsdTier::GetLRUKey() const {
-    std::lock_guard<std::mutex> lk(mu_);
+    std::lock_guard<std::mutex> lk(lru_mu_);
     if (lru_list_.empty()) return "";
     return lru_list_.back();
 }
 
 std::vector<std::string> SpdkSsdTier::GetLRUCandidates(size_t max_candidates) const {
-    std::lock_guard<std::mutex> lk(mu_);
+    std::lock_guard<std::mutex> lk(lru_mu_);
     std::vector<std::string> result;
     if (max_candidates == 0) max_candidates = 1;
     result.reserve(std::min(max_candidates, lru_list_.size()));
@@ -170,11 +170,212 @@ std::vector<std::string> SpdkSsdTier::GetLRUCandidates(size_t max_candidates) co
 }
 
 // ===========================================================================
+// LRU eviction — evicts entries until `needed` bytes are freed.
+// Lock ordering: lru_mu_ → shard.mutex (consistent with all other methods).
+// Returns actual bytes freed (may be 0 if LRU is empty).
+// ===========================================================================
+size_t SpdkSsdTier::EvictLRU(size_t needed) {
+    size_t freed = 0;
+    int evicted = 0;
+    while (freed < needed) {
+        std::lock_guard<std::mutex> lru_lk(lru_mu_);
+        if (lru_list_.empty()) break;
+
+        std::string key = lru_list_.back();
+        auto& shard = shards_[ShardForKey(key)];
+        std::unique_lock<std::shared_mutex> slk(shard.mutex);
+        auto it = shard.map.find(key);
+        if (it != shard.map.end()) {
+            size_t entry_size = AlignUp(it->second.data_size);
+            bool immediate = (it->second.allocation.use_count() == 1);
+            freed += entry_size;
+            shard.map.erase(it);
+            if (!immediate) {
+                UMBP_LOG_WARN("EvictLRU: key '%s' (%zuKB) has in-flight readers, "
+                              "space reclaim deferred",
+                              key.c_str(), entry_size / 1024);
+            }
+        }
+        lru_list_.pop_back();
+        ++evicted;
+    }
+    if (evicted > 0) {
+        UMBP_LOG_INFO("EvictLRU: evicted %d entries, freed %zuMB (requested %zuMB)",
+                      evicted, freed / (1024 * 1024), needed / (1024 * 1024));
+    }
+    return freed;
+}
+
+// ===========================================================================
+// PrepareWriteAlloc — common Phase 1 for all BatchWrite* variants.
+//
+// 1) Checks existing keys (shard shared lock + LRU update)
+// 2) Batch allocates space for new keys
+// 3) On allocation failure, evicts LRU entries and retries
+// ===========================================================================
+std::vector<SpdkSsdTier::PendingWrite> SpdkSsdTier::PrepareWriteAlloc(
+    const std::vector<std::string>& keys,
+    const std::vector<size_t>& sizes,
+    std::vector<bool>& results) {
+    const int count = static_cast<int>(keys.size());
+    std::vector<PendingWrite> pending;
+    pending.reserve(count);
+
+    std::vector<size_t> alloc_sizes;
+    std::vector<int> new_indices;
+    alloc_sizes.reserve(count);
+    new_indices.reserve(count);
+
+    {
+        std::lock_guard<std::mutex> lru_lk(lru_mu_);
+        for (int i = 0; i < count; ++i) {
+            if (sizes[i] == 0) {
+                results[i] = false;
+                continue;
+            }
+            auto& shard = shards_[ShardForKey(keys[i])];
+            std::unique_lock<std::shared_mutex> slk(shard.mutex);
+            auto eit = shard.map.find(keys[i]);
+            if (eit != shard.map.end()) {
+                results[i] = true;
+                lru_list_.splice(lru_list_.begin(), lru_list_, eit->second.lru_pos);
+                continue;
+            }
+            new_indices.push_back(i);
+            alloc_sizes.push_back(AlignUp(sizes[i]));
+        }
+    }
+
+    if (alloc_sizes.empty()) return pending;
+
+    // Allocate with auto-eviction retry
+    size_t success_count = 0;
+    constexpr int kMaxEvictRetries = 3;
+
+    for (int retry = 0; retry <= kMaxEvictRetries; ++retry) {
+        std::vector<size_t> remaining(
+            alloc_sizes.begin() + static_cast<ptrdiff_t>(success_count),
+            alloc_sizes.end());
+
+        auto handles = allocator_->batch_allocate(remaining);
+
+        for (size_t j = 0; j < handles.size(); ++j) {
+            if (!handles[j].has_value()) break;
+            PendingWrite pw;
+            pw.idx = new_indices[success_count + j];
+            pw.aligned_size = alloc_sizes[success_count + j];
+            pw.allocation = std::make_shared<RefCountedAllocationHandle>(
+                std::move(handles[j].value()));
+            pending.push_back(std::move(pw));
+        }
+
+        success_count = pending.size();
+        if (success_count >= new_indices.size()) break;
+
+        size_t needed = 0;
+        for (size_t k = success_count; k < alloc_sizes.size(); ++k)
+            needed += alloc_sizes[k];
+
+        size_t freed = EvictLRU(needed);
+        if (freed == 0) break;
+    }
+
+    if (success_count < new_indices.size()) {
+        size_t failed = new_indices.size() - success_count;
+        auto metrics = allocator_->get_metrics();
+        UMBP_LOG_WARN("PrepareWriteAlloc: %zu/%zu keys failed to allocate "
+                      "(free=%zuMB, largest_free=%zuMB)",
+                      failed, new_indices.size(),
+                      metrics.total_free_space_ / (1024 * 1024),
+                      metrics.largest_free_region_ / (1024 * 1024));
+        for (size_t k = success_count; k < new_indices.size(); ++k)
+            results[new_indices[k]] = false;
+    }
+
+    return pending;
+}
+
+// ===========================================================================
+// CommitWriteEntries — common Phase 3 for all BatchWrite* variants.
+//
+// Inserts successfully-written entries into sharded map + LRU.
+// ===========================================================================
+void SpdkSsdTier::CommitWriteEntries(
+    const std::vector<std::string>& keys,
+    const std::vector<size_t>& sizes,
+    std::vector<PendingWrite>& pending,
+    const std::vector<bool>& item_ok,
+    std::vector<bool>& results) {
+    const int pending_count = static_cast<int>(pending.size());
+
+    std::lock_guard<std::mutex> lru_lk(lru_mu_);
+    for (int j = 0; j < pending_count; ++j) {
+        if (!item_ok[static_cast<size_t>(j)]) continue;
+        int idx = pending[j].idx;
+
+        auto& shard = shards_[ShardForKey(keys[idx])];
+        std::unique_lock<std::shared_mutex> slk(shard.mutex);
+
+        Entry entry;
+        entry.allocation = std::move(pending[j].allocation);
+        entry.data_size = sizes[idx];
+
+        auto [it, inserted] = shard.map.try_emplace(
+            keys[idx], std::move(entry));
+        if (inserted) {
+            lru_list_.push_front(keys[idx]);
+            it->second.lru_pos = lru_list_.begin();
+        } else {
+            it->second.allocation = std::move(entry.allocation);
+            it->second.data_size = entry.data_size;
+            lru_list_.splice(lru_list_.begin(), lru_list_, it->second.lru_pos);
+        }
+        results[idx] = true;
+    }
+}
+
+// ===========================================================================
+// PrepareReadLookup — common Phase 1 for all BatchRead* variants.
+//
+// Looks up entries, copies AllocationPtr (keeps NVMe extent alive during DMA),
+// and updates LRU.
+// ===========================================================================
+std::vector<SpdkSsdTier::ReadInfo> SpdkSsdTier::PrepareReadLookup(
+    const std::vector<std::string>& keys,
+    const std::vector<size_t>& sizes,
+    std::vector<bool>& results) {
+    const int count = static_cast<int>(keys.size());
+    std::vector<ReadInfo> items;
+    items.reserve(count);
+
+    std::lock_guard<std::mutex> lru_lk(lru_mu_);
+    for (int i = 0; i < count; ++i) {
+        auto& shard = shards_[ShardForKey(keys[i])];
+        std::shared_lock<std::shared_mutex> slk(shard.mutex);
+        auto it = shard.map.find(keys[i]);
+        if (it == shard.map.end()) continue;
+
+        lru_list_.splice(lru_list_.begin(), lru_list_, it->second.lru_pos);
+
+        size_t rd = std::min(sizes[i], it->second.data_size);
+        ReadInfo ri;
+        ri.idx = i;
+        ri.offset = it->second.allocation->handle.address();
+        ri.aligned_size = AlignUp(rd);
+        ri.data_size = rd;
+        ri.guard = it->second.allocation;
+        items.push_back(std::move(ri));
+    }
+
+    return items;
+}
+
+// ===========================================================================
 // BatchWrite — deep-queue NVMe write pipeline
 //
-// Phase 1 (lock):   check existing keys, batch_allocate space
-// Phase 2 (unlock): memcpy + submit + drain pipeline on calling thread
-// Phase 3 (lock):   update entries_ + LRU
+// Phase 1: PrepareWriteAlloc (check existing, allocate with auto-eviction)
+// Phase 2: memcpy + submit + drain pipeline on calling thread
+// Phase 3: CommitWriteEntries (update sharded map + LRU)
 // ===========================================================================
 std::vector<bool> SpdkSsdTier::BatchWrite(
     const std::vector<std::string>& keys,
@@ -186,60 +387,10 @@ std::vector<bool> SpdkSsdTier::BatchWrite(
 
     auto& env = umbp::SpdkEnv::Instance();
 
-    // --- Phase 1: Allocate space (lock held) ---
-    struct PendingItem {
-        int idx;                 // index into input arrays
-        size_t aligned_size;
-        umbp::offset_allocator::OffsetAllocationHandle handle;
-    };
-    std::vector<PendingItem> pending;
-    pending.reserve(count);
-
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-
-        std::vector<size_t> alloc_sizes;
-        std::vector<int> new_indices;
-        alloc_sizes.reserve(count);
-        new_indices.reserve(count);
-
-        for (int i = 0; i < count; ++i) {
-            auto eit = entries_.find(keys[i]);
-            if (eit != entries_.end()) {
-                results[i] = true;
-                lru_list_.splice(lru_list_.begin(),
-                                 lru_list_, eit->second.lru_pos);
-                continue;
-            }
-            size_t aligned = AlignUp(sizes[i]);
-            new_indices.push_back(i);
-            alloc_sizes.push_back(aligned);
-        }
-
-        if (!alloc_sizes.empty()) {
-            auto handles = allocator_->batch_allocate(alloc_sizes);
-            for (size_t j = 0; j < handles.size(); ++j) {
-                if (handles[j].has_value()) {
-                    PendingItem item;
-                    item.idx = new_indices[j];
-                    item.aligned_size = alloc_sizes[j];
-                    item.handle = std::move(handles[j].value());
-                    pending.push_back(std::move(item));
-                } else {
-                    for (size_t k = j; k < new_indices.size(); ++k)
-                        results[new_indices[k]] = false;
-                    break;
-                }
-            }
-        }
-    }
-    // mu_ released
-
+    auto pending = PrepareWriteAlloc(keys, sizes, results);
     if (pending.empty()) return results;
 
     // --- Phase 2: Chunked deep-queue I/O pipeline (no lock) ---
-    // Split large values into DMA-ring-sized chunks so we always use the
-    // pre-allocated ring and never need large contiguous DMA allocations.
     const int pending_count = static_cast<int>(pending.size());
     const size_t chunk_sz = dma_ring_buf_size_;
 
@@ -257,7 +408,7 @@ std::vector<bool> SpdkSsdTier::BatchWrite(
         size_t rem_aligned = p.aligned_size;
         size_t rem_data = sizes[p.idx];
         size_t src_off = 0;
-        uint64_t dev_off = p.handle.address();
+        uint64_t dev_off = p.allocation->handle.address();
         while (rem_aligned > 0) {
             size_t ca = std::min(rem_aligned, chunk_sz);
             size_t cd = std::min(rem_data, ca);
@@ -359,47 +510,17 @@ std::vector<bool> SpdkSsdTier::BatchWrite(
         }
     }
 
-    // --- Phase 3: Update metadata (lock held) ---
-    // All chunks of an item must succeed for it to be valid.
+    // --- Phase 3: Update metadata ---
     std::vector<bool> item_ok(pending_count, true);
     for (int j = 0; j < chunk_count; ++j)
         if (!chunk_ok[j]) item_ok[chunks[j].item_idx] = false;
 
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        for (int j = 0; j < pending_count; ++j) {
-            int idx = pending[j].idx;
-            if (item_ok[j]) {
-                Entry entry;
-                entry.handle = std::move(pending[j].handle);
-                entry.data_size = sizes[idx];
-
-                auto [it, inserted] = entries_.try_emplace(
-                    keys[idx], std::move(entry));
-                if (inserted) {
-                    lru_list_.push_front(keys[idx]);
-                    it->second.lru_pos = lru_list_.begin();
-                } else {
-                    it->second.handle = std::move(entry.handle);
-                    it->second.data_size = entry.data_size;
-                    lru_list_.splice(lru_list_.begin(),
-                                     lru_list_, it->second.lru_pos);
-                }
-                results[idx] = true;
-            }
-        }
-    }
-
+    CommitWriteEntries(keys, sizes, pending, item_ok, results);
     return results;
 }
 
 // ===========================================================================
 // BatchWriteStreaming — byte-level streaming write from shared memory.
-//
-// Same allocation + metadata logic as BatchWrite.
-// In Phase 2 the pipeline waits for *bytes_ready >= absolute_chunk_end
-// before memcpy-ing each DMA chunk, allowing the NVMe write pipeline to
-// overlap with the client's memcpy into SHM.
 // ===========================================================================
 std::vector<bool> SpdkSsdTier::BatchWriteStreaming(
     const std::vector<std::string>& keys,
@@ -414,54 +535,7 @@ std::vector<bool> SpdkSsdTier::BatchWriteStreaming(
 
     auto& env = umbp::SpdkEnv::Instance();
 
-    // --- Phase 1: Allocate space (lock held) ---
-    struct PendingItem {
-        int idx;
-        size_t aligned_size;
-        umbp::offset_allocator::OffsetAllocationHandle handle;
-    };
-    std::vector<PendingItem> pending;
-    pending.reserve(count);
-
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-
-        std::vector<size_t> alloc_sizes;
-        std::vector<int> new_indices;
-        alloc_sizes.reserve(count);
-        new_indices.reserve(count);
-
-        for (int i = 0; i < count; ++i) {
-            auto eit = entries_.find(keys[i]);
-            if (eit != entries_.end()) {
-                results[i] = true;
-                lru_list_.splice(lru_list_.begin(),
-                                 lru_list_, eit->second.lru_pos);
-                continue;
-            }
-            size_t aligned = AlignUp(sizes[i]);
-            new_indices.push_back(i);
-            alloc_sizes.push_back(aligned);
-        }
-
-        if (!alloc_sizes.empty()) {
-            auto handles = allocator_->batch_allocate(alloc_sizes);
-            for (size_t j = 0; j < handles.size(); ++j) {
-                if (handles[j].has_value()) {
-                    PendingItem item;
-                    item.idx = new_indices[j];
-                    item.aligned_size = alloc_sizes[j];
-                    item.handle = std::move(handles[j].value());
-                    pending.push_back(std::move(item));
-                } else {
-                    for (size_t k = j; k < new_indices.size(); ++k)
-                        results[new_indices[k]] = false;
-                    break;
-                }
-            }
-        }
-    }
-
+    auto pending = PrepareWriteAlloc(keys, sizes, results);
     if (pending.empty()) return results;
 
     // --- Phase 2: Chunked pipeline with bytes_ready gating ---
@@ -482,7 +556,7 @@ std::vector<bool> SpdkSsdTier::BatchWriteStreaming(
         size_t rem_aligned = p.aligned_size;
         size_t rem_data = sizes[p.idx];
         size_t src_off = 0;
-        uint64_t dev_off = p.handle.address();
+        uint64_t dev_off = p.allocation->handle.address();
         while (rem_aligned > 0) {
             size_t ca = std::min(rem_aligned, chunk_sz);
             size_t cd = std::min(rem_data, ca);
@@ -498,7 +572,6 @@ std::vector<bool> SpdkSsdTier::BatchWriteStreaming(
     auto chunk_ok = std::make_unique<uint8_t[]>(chunk_count);
     std::memset(chunk_ok.get(), 0, chunk_count);
 
-    // Select DMA buffers: external (per-rank, no lock) or internal ring (global lock)
     std::unique_lock<std::mutex> dma_lk;
     void** bufs;
     int total_bufs;
@@ -604,44 +677,17 @@ std::vector<bool> SpdkSsdTier::BatchWriteStreaming(
 
     if (dma_lk.owns_lock()) dma_lk.unlock();
 
-    // --- Phase 3: Update metadata (lock held) ---
+    // --- Phase 3: Update metadata ---
     std::vector<bool> item_ok(pending_count, true);
     for (int j = 0; j < chunk_count; ++j)
         if (!chunk_ok[j]) item_ok[chunks[j].item_idx] = false;
 
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        for (int j = 0; j < pending_count; ++j) {
-            int idx = pending[j].idx;
-            if (item_ok[j]) {
-                Entry entry;
-                entry.handle = std::move(pending[j].handle);
-                entry.data_size = sizes[idx];
-
-                auto [it, inserted] = entries_.try_emplace(
-                    keys[idx], std::move(entry));
-                if (inserted) {
-                    lru_list_.push_front(keys[idx]);
-                    it->second.lru_pos = lru_list_.begin();
-                } else {
-                    it->second.handle = std::move(entry.handle);
-                    it->second.data_size = entry.data_size;
-                    lru_list_.splice(lru_list_.begin(),
-                                     lru_list_, it->second.lru_pos);
-                }
-                results[idx] = true;
-            }
-        }
-    }
-
+    CommitWriteEntries(keys, sizes, pending, item_ok, results);
     return results;
 }
 
 // ===========================================================================
 // BatchReadIntoPtr — deep-queue NVMe read pipeline
-//
-// Phase 1 (lock):   look up entries, collect offsets and sizes
-// Phase 2 (unlock): submit reads + drain + memcpy DMA→user (pipelined)
 // ===========================================================================
 std::vector<bool> SpdkSsdTier::BatchReadIntoPtr(
     const std::vector<std::string>& keys,
@@ -653,36 +699,7 @@ std::vector<bool> SpdkSsdTier::BatchReadIntoPtr(
 
     auto& env = umbp::SpdkEnv::Instance();
 
-    // --- Phase 1: Look up entries (lock held) ---
-    struct ReadItem {
-        int idx;
-        uint64_t offset;
-        size_t aligned_size;
-        size_t data_size;
-    };
-    std::vector<ReadItem> items;
-    items.reserve(count);
-
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        for (int i = 0; i < count; ++i) {
-            auto it = entries_.find(keys[i]);
-            if (it == entries_.end()) continue;
-
-            lru_list_.splice(lru_list_.begin(),
-                             lru_list_, it->second.lru_pos);
-
-            size_t read_size = std::min(sizes[i], it->second.data_size);
-            ReadItem ri;
-            ri.idx = i;
-            ri.offset = it->second.handle.address();
-            ri.aligned_size = AlignUp(read_size);
-            ri.data_size = read_size;
-            items.push_back(ri);
-        }
-    }
-    // mu_ released
-
+    auto items = PrepareReadLookup(keys, sizes, results);
     if (items.empty()) return results;
 
     // --- Phase 2: Chunked deep-queue I/O pipeline (no lock) ---
@@ -817,11 +834,6 @@ std::vector<bool> SpdkSsdTier::BatchReadIntoPtr(
 
 // ===========================================================================
 // BatchReadIntoPtrStreaming — DMA-ring read with per-item progress signaling
-//
-// Same I/O path as BatchReadIntoPtr (NVMe → DMA ring → memcpy to dst),
-// but uses a single-worker pipeline so items complete in order and
-// *items_done is incremented as soon as each item's data is fully in dst.
-// QD=128 still saturates NVMe read bandwidth.
 // ===========================================================================
 std::vector<bool> SpdkSsdTier::BatchReadIntoPtrStreaming(
     const std::vector<std::string>& keys,
@@ -837,19 +849,7 @@ std::vector<bool> SpdkSsdTier::BatchReadIntoPtrStreaming(
 
     auto& env = umbp::SpdkEnv::Instance();
 
-    struct ReadItem { int idx; uint64_t offset; size_t aligned_size; size_t data_size; };
-    std::vector<ReadItem> items;
-    items.reserve(count);
-
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        for (int i = 0; i < count; ++i) {
-            auto it = entries_.find(keys[i]);
-            if (it == entries_.end()) continue;
-            size_t rd = std::min(sizes[i], it->second.data_size);
-            items.push_back({i, it->second.handle.address(), AlignUp(rd), rd});
-        }
-    }
+    auto items = PrepareReadLookup(keys, sizes, results);
 
     if (items.empty()) {
         if (items_done) items_done->store(count, std::memory_order_release);
@@ -881,7 +881,6 @@ std::vector<bool> SpdkSsdTier::BatchReadIntoPtrStreaming(
     auto chunk_ok = std::make_unique<uint8_t[]>(chunk_count);
     std::memset(chunk_ok.get(), 0, chunk_count);
 
-    // Select DMA buffers: external (per-rank, no lock) or internal ring (global lock)
     std::unique_lock<std::mutex> dma_lk;
     void** bufs;
     int total_bufs;
@@ -967,10 +966,6 @@ std::vector<bool> SpdkSsdTier::BatchReadIntoPtrStreaming(
 
 // ===========================================================================
 // BatchWriteDmaDirect — zero-copy write pipeline
-//
-// Same as BatchWrite, but dma_ptrs are already DMA-registered + 4KB-aligned.
-// Skips the DMA ring and memcpy — SPDK DMAs directly from the caller's buffers.
-// The caller must ensure AlignUp(size) bytes of writable space per pointer.
 // ===========================================================================
 std::vector<bool> SpdkSsdTier::BatchWriteDmaDirect(
     const std::vector<std::string>& keys,
@@ -982,56 +977,12 @@ std::vector<bool> SpdkSsdTier::BatchWriteDmaDirect(
 
     auto& env = umbp::SpdkEnv::Instance();
 
-    // --- Phase 1: Allocate space (lock held) — identical to BatchWrite ---
-    struct PendingItem {
-        int idx;
-        size_t aligned_size;
-        umbp::offset_allocator::OffsetAllocationHandle handle;
-    };
-    std::vector<PendingItem> pending;
-    pending.reserve(count);
-
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        std::vector<size_t> alloc_sizes;
-        std::vector<int> new_indices;
-        alloc_sizes.reserve(count);
-        new_indices.reserve(count);
-
-        for (int i = 0; i < count; ++i) {
-            auto eit = entries_.find(keys[i]);
-            if (eit != entries_.end()) {
-                results[i] = true;
-                lru_list_.splice(lru_list_.begin(), lru_list_, eit->second.lru_pos);
-                continue;
-            }
-            new_indices.push_back(i);
-            alloc_sizes.push_back(AlignUp(sizes[i]));
-        }
-
-        if (!alloc_sizes.empty()) {
-            auto handles = allocator_->batch_allocate(alloc_sizes);
-            for (size_t j = 0; j < handles.size(); ++j) {
-                if (handles[j].has_value()) {
-                    PendingItem item;
-                    item.idx = new_indices[j];
-                    item.aligned_size = alloc_sizes[j];
-                    item.handle = std::move(handles[j].value());
-                    pending.push_back(std::move(item));
-                } else {
-                    for (size_t k = j; k < new_indices.size(); ++k)
-                        results[new_indices[k]] = false;
-                    break;
-                }
-            }
-        }
-    }
-
+    auto pending = PrepareWriteAlloc(keys, sizes, results);
     if (pending.empty()) return results;
 
-    // --- Phase 2: Zero-copy I/O pipeline (no DMA ring, no memcpy) ---
+    // --- Phase 2: Zero-copy I/O pipeline ---
+    const int pending_count = static_cast<int>(pending.size());
 
-    // Zero-pad tail of each key's data to aligned size
     for (auto& p : pending) {
         int idx = p.idx;
         if (p.aligned_size > sizes[idx]) {
@@ -1040,7 +991,6 @@ std::vector<bool> SpdkSsdTier::BatchWriteDmaDirect(
         }
     }
 
-    // Build chunk list (for large values that exceed the max single-I/O size)
     const size_t chunk_sz = dma_ring_buf_size_ > 0 ? dma_ring_buf_size_
                                                      : 2ULL * 1024 * 1024;
     struct DmaChunk {
@@ -1050,14 +1000,14 @@ std::vector<bool> SpdkSsdTier::BatchWriteDmaDirect(
         size_t nbytes;
     };
     std::vector<DmaChunk> chunks;
-    chunks.reserve(static_cast<int>(pending.size()));
+    chunks.reserve(pending_count);
 
-    for (int i = 0; i < static_cast<int>(pending.size()); ++i) {
+    for (int i = 0; i < pending_count; ++i) {
         auto& p = pending[i];
         char* base = static_cast<char*>(dma_ptrs[p.idx]);
         size_t rem = p.aligned_size;
         size_t off = 0;
-        uint64_t dev_off = p.handle.address();
+        uint64_t dev_off = p.allocation->handle.address();
         while (rem > 0) {
             size_t cs = std::min(rem, chunk_sz);
             chunks.push_back({i, base + off, dev_off, cs});
@@ -1071,7 +1021,6 @@ std::vector<bool> SpdkSsdTier::BatchWriteDmaDirect(
     auto chunk_ok = std::make_unique<uint8_t[]>(chunk_count);
     std::memset(chunk_ok.get(), 0, chunk_count);
 
-    // Submit pipeline — no DMA ring lock needed, each chunk has its own unique buffer
     {
         constexpr int kMinChunksPerWorker = 16;
         int num_workers = std::clamp(chunk_count / kMinChunksPerWorker,
@@ -1090,7 +1039,7 @@ std::vector<bool> SpdkSsdTier::BatchWriteDmaDirect(
                     auto& c = chunks[head];
                     auto& req = lreqs[slot];
                     req.op = umbp::SpdkIoRequest::WRITE;
-                    req.buf = c.buf;  // ZERO COPY — direct DMA pointer
+                    req.buf = c.buf;
                     req.offset = c.offset;
                     req.nbytes = c.nbytes;
                     req.src_data = nullptr;
@@ -1137,44 +1086,17 @@ std::vector<bool> SpdkSsdTier::BatchWriteDmaDirect(
         }
     }
 
-    // --- Phase 3: Update metadata (identical to BatchWrite) ---
-    const int pending_count = static_cast<int>(pending.size());
+    // --- Phase 3: Update metadata ---
     std::vector<bool> item_ok(pending_count, true);
     for (int j = 0; j < chunk_count; ++j)
         if (!chunk_ok[j]) item_ok[chunks[j].item_idx] = false;
 
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        for (int j = 0; j < pending_count; ++j) {
-            int idx = pending[j].idx;
-            if (item_ok[j]) {
-                Entry entry;
-                entry.handle = std::move(pending[j].handle);
-                entry.data_size = sizes[idx];
-                auto [it, inserted] = entries_.try_emplace(
-                    keys[idx], std::move(entry));
-                if (inserted) {
-                    lru_list_.push_front(keys[idx]);
-                    it->second.lru_pos = lru_list_.begin();
-                } else {
-                    it->second.handle = std::move(entry.handle);
-                    it->second.data_size = entry.data_size;
-                    lru_list_.splice(lru_list_.begin(),
-                                     lru_list_, it->second.lru_pos);
-                }
-                results[idx] = true;
-            }
-        }
-    }
-
+    CommitWriteEntries(keys, sizes, pending, item_ok, results);
     return results;
 }
 
 // ===========================================================================
 // BatchReadDmaDirect — zero-copy read pipeline
-//
-// Same as BatchReadIntoPtr, but dma_ptrs are DMA-registered + 4KB-aligned.
-// SPDK reads directly into the caller's buffers — no DMA ring, no memcpy.
 // ===========================================================================
 std::vector<bool> SpdkSsdTier::BatchReadDmaDirect(
     const std::vector<std::string>& keys,
@@ -1186,34 +1108,7 @@ std::vector<bool> SpdkSsdTier::BatchReadDmaDirect(
 
     auto& env = umbp::SpdkEnv::Instance();
 
-    // --- Phase 1: Look up entries (lock held) ---
-    struct ReadItem {
-        int idx;
-        uint64_t offset;
-        size_t aligned_size;
-        size_t data_size;
-    };
-    std::vector<ReadItem> items;
-    items.reserve(count);
-
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        for (int i = 0; i < count; ++i) {
-            auto it = entries_.find(keys[i]);
-            if (it == entries_.end()) continue;
-
-            lru_list_.splice(lru_list_.begin(), lru_list_, it->second.lru_pos);
-
-            size_t read_size = std::min(sizes[i], it->second.data_size);
-            ReadItem ri;
-            ri.idx = i;
-            ri.offset = it->second.handle.address();
-            ri.aligned_size = AlignUp(read_size);
-            ri.data_size = read_size;
-            items.push_back(ri);
-        }
-    }
-
+    auto items = PrepareReadLookup(keys, sizes, results);
     if (items.empty()) return results;
 
     // --- Phase 2: Zero-copy read pipeline ---
@@ -1223,9 +1118,9 @@ std::vector<bool> SpdkSsdTier::BatchReadDmaDirect(
 
     struct DmaReadChunk {
         int item_idx;
-        void* buf;          // DMA-capable destination
-        uint64_t offset;    // device offset
-        size_t nbytes;      // aligned read size
+        void* buf;
+        uint64_t offset;
+        size_t nbytes;
     };
     std::vector<DmaReadChunk> chunks;
     chunks.reserve(item_count);
@@ -1267,7 +1162,7 @@ std::vector<bool> SpdkSsdTier::BatchReadDmaDirect(
                     auto& c = chunks[head];
                     auto& req = lreqs[slot];
                     req.op = umbp::SpdkIoRequest::READ;
-                    req.buf = c.buf;  // ZERO COPY — DMA directly into caller's buffer
+                    req.buf = c.buf;
                     req.offset = c.offset;
                     req.nbytes = c.nbytes;
                     req.src_data = nullptr;
@@ -1286,7 +1181,6 @@ std::vector<bool> SpdkSsdTier::BatchReadDmaDirect(
                 }
                 if (bc > 0) env.SubmitIoBatchAsync(lbatch.get(), bc);
 
-                // Drain: no memcpy needed, data is already in place
                 while (tail < head) {
                     int slot = (tail - c_begin) % local_qd;
                     if (!lreqs[slot].completed.load(std::memory_order_acquire))
@@ -1327,10 +1221,6 @@ std::vector<bool> SpdkSsdTier::BatchReadDmaDirect(
 
 // ===========================================================================
 // BatchWriteDmaStreaming — zero-copy + pipelined memcpy
-//
-// Phase 2 polls *items_ready before processing each key. The client copies
-// data to SHM concurrently and increments items_ready per key, so NVMe DMA
-// and client memcpy overlap like Standalone's deep-queue pipeline.
 // ===========================================================================
 std::vector<bool> SpdkSsdTier::BatchWriteDmaStreaming(
     const std::vector<std::string>& keys,
@@ -1343,64 +1233,22 @@ std::vector<bool> SpdkSsdTier::BatchWriteDmaStreaming(
 
     auto& env = umbp::SpdkEnv::Instance();
 
-    struct PendingItem {
-        int idx;
-        size_t aligned_size;
-        umbp::offset_allocator::OffsetAllocationHandle handle;
-    };
-    std::vector<PendingItem> pending;
-    pending.reserve(count);
-
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        std::vector<size_t> alloc_sizes;
-        std::vector<int> new_indices;
-        alloc_sizes.reserve(count);
-        new_indices.reserve(count);
-
-        for (int i = 0; i < count; ++i) {
-            auto eit = entries_.find(keys[i]);
-            if (eit != entries_.end()) {
-                results[i] = true;
-                lru_list_.splice(lru_list_.begin(), lru_list_, eit->second.lru_pos);
-                continue;
-            }
-            new_indices.push_back(i);
-            alloc_sizes.push_back(AlignUp(sizes[i]));
-        }
-
-        if (!alloc_sizes.empty()) {
-            auto handles = allocator_->batch_allocate(alloc_sizes);
-            for (size_t j = 0; j < handles.size(); ++j) {
-                if (handles[j].has_value()) {
-                    PendingItem item;
-                    item.idx = new_indices[j];
-                    item.aligned_size = alloc_sizes[j];
-                    item.handle = std::move(handles[j].value());
-                    pending.push_back(std::move(item));
-                } else {
-                    for (size_t k = j; k < new_indices.size(); ++k)
-                        results[new_indices[k]] = false;
-                    break;
-                }
-            }
-        }
-    }
-
+    auto pending = PrepareWriteAlloc(keys, sizes, results);
     if (pending.empty()) return results;
 
+    const int pending_count = static_cast<int>(pending.size());
     const size_t chunk_sz = dma_ring_buf_size_ > 0 ? dma_ring_buf_size_
                                                      : 2ULL * 1024 * 1024;
     struct DmaChunk { int item_idx; void* buf; uint64_t offset; size_t nbytes; };
     std::vector<DmaChunk> chunks;
-    chunks.reserve(static_cast<int>(pending.size()));
+    chunks.reserve(pending_count);
 
-    for (int i = 0; i < static_cast<int>(pending.size()); ++i) {
+    for (int i = 0; i < pending_count; ++i) {
         auto& p = pending[i];
         char* base = static_cast<char*>(dma_ptrs[p.idx]);
         size_t rem = p.aligned_size;
         size_t off = 0;
-        uint64_t dev_off = p.handle.address();
+        uint64_t dev_off = p.allocation->handle.address();
         while (rem > 0) {
             size_t cs = std::min(rem, chunk_sz);
             chunks.push_back({i, base + off, dev_off, cs});
@@ -1431,7 +1279,6 @@ std::vector<bool> SpdkSsdTier::BatchWriteDmaStreaming(
                     int key_idx = pending[c.item_idx].idx;
 
                     if (c.item_idx != last_ready_item) {
-                        // Wait until client has finished copying this key
                         while (items_ready->load(std::memory_order_acquire) <=
                                static_cast<uint32_t>(key_idx)) {
                             CPU_PAUSE();
@@ -1492,43 +1339,17 @@ std::vector<bool> SpdkSsdTier::BatchWriteDmaStreaming(
         }
     }
 
-    const int pending_count = static_cast<int>(pending.size());
+    // --- Phase 3: Update metadata ---
     std::vector<bool> item_ok(pending_count, true);
     for (int j = 0; j < chunk_count; ++j)
         if (!chunk_ok[j]) item_ok[chunks[j].item_idx] = false;
 
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        for (int j = 0; j < pending_count; ++j) {
-            int idx = pending[j].idx;
-            if (item_ok[j]) {
-                Entry entry;
-                entry.handle = std::move(pending[j].handle);
-                entry.data_size = sizes[idx];
-                auto [it, inserted] = entries_.try_emplace(
-                    keys[idx], std::move(entry));
-                if (inserted) {
-                    lru_list_.push_front(keys[idx]);
-                    it->second.lru_pos = lru_list_.begin();
-                } else {
-                    it->second.handle = std::move(entry.handle);
-                    it->second.data_size = entry.data_size;
-                    lru_list_.splice(lru_list_.begin(),
-                                     lru_list_, it->second.lru_pos);
-                }
-                results[idx] = true;
-            }
-        }
-    }
+    CommitWriteEntries(keys, sizes, pending, item_ok, results);
     return results;
 }
 
 // ===========================================================================
 // BatchReadDmaStreaming — zero-copy + streaming completion notification
-//
-// Proxy increments *items_done per key so the client can copy SHM→user
-// while later NVMe reads are still in flight. Single-worker for in-order
-// items_done signaling; QD=128 still saturates NVMe read bandwidth.
 // ===========================================================================
 std::vector<bool> SpdkSsdTier::BatchReadDmaStreaming(
     const std::vector<std::string>& keys,
@@ -1541,21 +1362,7 @@ std::vector<bool> SpdkSsdTier::BatchReadDmaStreaming(
 
     auto& env = umbp::SpdkEnv::Instance();
 
-    struct ReadItem { int idx; uint64_t offset; size_t aligned_size; size_t data_size; };
-    std::vector<ReadItem> items;
-    items.reserve(count);
-
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        for (int i = 0; i < count; ++i) {
-            auto it = entries_.find(keys[i]);
-            if (it == entries_.end()) continue;
-            lru_list_.splice(lru_list_.begin(), lru_list_, it->second.lru_pos);
-            size_t rd = std::min(sizes[i], it->second.data_size);
-            items.push_back({i, it->second.handle.address(), AlignUp(rd), rd});
-        }
-    }
-
+    auto items = PrepareReadLookup(keys, sizes, results);
     if (items.empty()) return results;
 
     const int item_count = static_cast<int>(items.size());

@@ -2,13 +2,20 @@
 // MIT License
 //
 // SpdkSsdTier: SPDK-based SSD tier with deep-queue NVMe pipeline.
+//
+// Metadata management follows mooncake-store's OffsetAllocatorStorageBackend:
+//   - Sharded map (kNumShards) with std::shared_mutex for concurrent reads
+//   - RefCounted allocation handles (AllocationPtr) for safe concurrent access
+//   - Auto LRU eviction on allocation failure
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <list>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -43,10 +50,6 @@ class SpdkSsdTier : public TierBackend {
         const std::vector<size_t>& sizes) override;
 
     // DMA-ring write with byte-level streaming from shared memory.
-    // Identical to BatchWrite except that before memcpy-ing each DMA chunk,
-    // the pipeline waits for *bytes_ready >= item_shm_offset[i] + chunk_end.
-    // item_shm_offsets[i] is the absolute byte offset of item i's data within
-    // the SHM data area (caller computes from BatchEntry::data_offset).
     std::vector<bool> BatchWriteStreaming(
         const std::vector<std::string>& keys,
         const std::vector<const void*>& data_ptrs,
@@ -55,14 +58,7 @@ class SpdkSsdTier : public TierBackend {
         const std::vector<size_t>& item_shm_offsets,
         void** ext_dma_bufs = nullptr, int ext_dma_count = 0);
 
-    // DMA-ring read with streaming progress at two granularities:
-    //   *items_done  — incremented after each item's data is fully in dst.
-    //   *bytes_done  — updated after each 2MB DMA chunk is memcpy'd to dst,
-    //                  using absolute SHM offsets so the caller can overlap
-    //                  downstream copies at sub-item granularity.
-    // item_shm_offsets[i] is the byte offset of item i's data in the SHM
-    // data area (from BatchEntry::data_offset).  May be nullptr to disable
-    // byte-level signaling.
+    // DMA-ring read with streaming progress at two granularities.
     std::vector<bool> BatchReadIntoPtrStreaming(
         const std::vector<std::string>& keys,
         const std::vector<uintptr_t>& dst_ptrs,
@@ -74,7 +70,6 @@ class SpdkSsdTier : public TierBackend {
 
     // Zero-copy DMA variants: data_ptrs must be DMA-registered, 4KB-aligned,
     // with AlignUp(size) bytes of writable space per key.
-    // Skips the DMA ring + memcpy entirely — SPDK DMAs directly from/to the buffers.
     std::vector<bool> BatchWriteDmaDirect(
         const std::vector<std::string>& keys,
         const std::vector<void*>& dma_ptrs,
@@ -85,9 +80,7 @@ class SpdkSsdTier : public TierBackend {
         const std::vector<uintptr_t>& dma_ptrs,
         const std::vector<size_t>& sizes);
 
-    // Streaming zero-copy: client memcpy and proxy NVMe DMA run in parallel.
-    // Write: proxy polls items_ready (client increments per key) before submitting.
-    // Read:  proxy increments items_done per key so client can copy in parallel.
+    // Streaming zero-copy variants.
     std::vector<bool> BatchWriteDmaStreaming(
         const std::vector<std::string>& keys,
         const std::vector<void*>& dma_ptrs,
@@ -104,8 +97,22 @@ class SpdkSsdTier : public TierBackend {
     std::vector<std::string> GetLRUCandidates(size_t max_candidates) const override;
 
    private:
-    struct Entry {
+    // -- RefCounted allocation handle (mooncake-store pattern) ---------------
+    struct RefCountedAllocationHandle {
         umbp::offset_allocator::OffsetAllocationHandle handle;
+        explicit RefCountedAllocationHandle(
+            umbp::offset_allocator::OffsetAllocationHandle&& h)
+            : handle(std::move(h)) {}
+        RefCountedAllocationHandle(const RefCountedAllocationHandle&) = delete;
+        RefCountedAllocationHandle& operator=(const RefCountedAllocationHandle&) = delete;
+        RefCountedAllocationHandle(RefCountedAllocationHandle&&) = default;
+        RefCountedAllocationHandle& operator=(RefCountedAllocationHandle&&) = default;
+    };
+    using AllocationPtr = std::shared_ptr<RefCountedAllocationHandle>;
+
+    // -- Entry stored per key ------------------------------------------------
+    struct Entry {
+        AllocationPtr allocation;
         size_t data_size = 0;
         std::list<std::string>::iterator lru_pos;
 
@@ -116,6 +123,19 @@ class SpdkSsdTier : public TierBackend {
         Entry& operator=(const Entry&) = delete;
     };
 
+    // -- Sharded metadata (mooncake-store pattern) ---------------------------
+    static constexpr size_t kNumShards = 64;
+    static_assert((kNumShards & (kNumShards - 1)) == 0,
+                  "kNumShards must be a power of 2");
+    struct MetadataShard {
+        mutable std::shared_mutex mutex;
+        std::unordered_map<std::string, Entry> map;
+    };
+
+    size_t ShardForKey(const std::string& key) const {
+        return std::hash<std::string>{}(key) & (kNumShards - 1);
+    }
+
     size_t AlignUp(size_t size) const {
         return (size + block_size_ - 1) & ~(static_cast<size_t>(block_size_) - 1);
     }
@@ -123,19 +143,55 @@ class SpdkSsdTier : public TierBackend {
     void AllocDmaRing(size_t buf_size);
     void FreeDmaRing();
 
+    // -- Write helpers (common Phase 1 / Phase 3 for all BatchWrite*) --------
+    struct PendingWrite {
+        int idx;
+        size_t aligned_size;
+        AllocationPtr allocation;
+    };
+
+    std::vector<PendingWrite> PrepareWriteAlloc(
+        const std::vector<std::string>& keys,
+        const std::vector<size_t>& sizes,
+        std::vector<bool>& results);
+
+    void CommitWriteEntries(
+        const std::vector<std::string>& keys,
+        const std::vector<size_t>& sizes,
+        std::vector<PendingWrite>& pending,
+        const std::vector<bool>& item_ok,
+        std::vector<bool>& results);
+
+    // -- Read helper (common Phase 1 for all BatchRead*) ---------------------
+    struct ReadInfo {
+        int idx;
+        uint64_t offset;
+        size_t aligned_size;
+        size_t data_size;
+        AllocationPtr guard;
+    };
+
+    std::vector<ReadInfo> PrepareReadLookup(
+        const std::vector<std::string>& keys,
+        const std::vector<size_t>& sizes,
+        std::vector<bool>& results);
+
+    // -- LRU eviction --------------------------------------------------------
+    size_t EvictLRU(size_t needed);
+
+    // -- Member data ---------------------------------------------------------
     bool initialized_ = false;
     std::shared_ptr<umbp::offset_allocator::OffsetAllocator> allocator_;
     uint32_t block_size_ = 4096;
     size_t capacity_ = 0;
 
-    mutable std::mutex mu_;
-    std::unordered_map<std::string, Entry> entries_;
+    std::array<MetadataShard, kNumShards> shards_;
+    mutable std::mutex lru_mu_;
     std::list<std::string> lru_list_;
 
     static constexpr int kMaxQueueDepth = 128;
     int num_io_workers_ = 1;
 
-    // Pre-allocated DMA ring buffers to avoid per-batch pool alloc overhead
     std::mutex dma_ring_mu_;
     void** dma_ring_ = nullptr;
     size_t dma_ring_buf_size_ = 0;
