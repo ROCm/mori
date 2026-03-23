@@ -37,7 +37,6 @@
 #include "umbp/local/umbp_client.h"
 
 using Clock = std::chrono::high_resolution_clock;
-using TierBackend = mori::umbp::TierBackend;
 
 // ---------------------------------------------------------------------------
 // BenchConfig
