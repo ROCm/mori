@@ -320,13 +320,7 @@ if(HAVE_GRPC)
            ${UMBP_PROTO_GEN_DIR}
            ${_PROTOBUF_INCLUDE_DIR})
 
-  set(_PROTOBUF_COMPAT_DIR "${CMAKE_CURRENT_BINARY_DIR}/protobuf_compat")
-  if(NOT EXISTS "${_PROTOBUF_COMPAT_DIR}/google")
-    file(MAKE_DIRECTORY "${_PROTOBUF_COMPAT_DIR}")
-    file(CREATE_LINK "/usr/include/google" "${_PROTOBUF_COMPAT_DIR}/google"
-         SYMBOLIC)
-  endif()
-  target_include_directories(umbp_common BEFORE PUBLIC "${_PROTOBUF_COMPAT_DIR}")
+  target_include_directories(umbp_common BEFORE PUBLIC "${_PROTOBUF_INCLUDE_DIR}")
 
   target_link_libraries(umbp_common PUBLIC mori_logging mori_io)
 
