@@ -207,18 +207,46 @@ if(HAVE_GRPC)
   endif()
 endif()
 
-if(HAVE_GRPC AND DEFINED Protobuf_VERSION)
+if(HAVE_GRPC)
+  # Verify protoc / libprotobuf header compatibility by reading the version
+  # macro directly from the header (independent of cmake's Protobuf_VERSION).
   execute_process(
     COMMAND ${_PROTOBUF_PROTOC} --version
     OUTPUT_VARIABLE _PROTOC_VERSION_OUTPUT
-    OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
-  string(REGEX MATCH "[0-9]+\\.[0-9]+" _PROTOC_MM "${_PROTOC_VERSION_OUTPUT}")
-  string(REGEX MATCH "^[0-9]+\\.[0-9]+" _PROTOBUF_MM "${Protobuf_VERSION}")
-  if(_PROTOC_MM
-     AND _PROTOBUF_MM
-     AND NOT _PROTOC_MM STREQUAL _PROTOBUF_MM)
-    message(WARNING "[UMBP] protoc (${_PROTOC_VERSION_OUTPUT}) and libprotobuf (${Protobuf_VERSION}) mismatch — disabling distributed control plane.")
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+    RESULT_VARIABLE _PROTOC_RC)
+  if(NOT _PROTOC_RC EQUAL 0)
+    message(WARNING "[UMBP] protoc failed to run — disabling distributed control plane.")
     set(HAVE_GRPC FALSE)
+  else()
+    string(REGEX MATCH "[0-9]+\\.[0-9]+" _PROTOC_MM "${_PROTOC_VERSION_OUTPUT}")
+    # Read GOOGLE_PROTOBUF_VERSION from the actual header file
+    set(_PROTOBUF_MM "")
+    if(EXISTS "${_PROTOBUF_INCLUDE_DIR}/google/protobuf/stubs/common.h")
+      file(STRINGS "${_PROTOBUF_INCLUDE_DIR}/google/protobuf/stubs/common.h"
+           _PB_VER_LINE REGEX "^#define GOOGLE_PROTOBUF_VERSION [0-9]+")
+      if(_PB_VER_LINE)
+        string(REGEX MATCH "[0-9]+" _PB_VER_NUM "${_PB_VER_LINE}")
+        math(EXPR _PB_MAJOR "${_PB_VER_NUM} / 1000000")
+        math(EXPR _PB_MINOR "(${_PB_VER_NUM} / 1000) % 1000")
+        set(_PROTOBUF_MM "${_PB_MAJOR}.${_PB_MINOR}")
+      endif()
+    endif()
+    if(NOT _PROTOBUF_MM)
+      # Fallback to cmake-provided version
+      if(DEFINED Protobuf_VERSION)
+        string(REGEX MATCH "^[0-9]+\\.[0-9]+" _PROTOBUF_MM "${Protobuf_VERSION}")
+      endif()
+    endif()
+    message(STATUS "[UMBP] protoc version: ${_PROTOC_VERSION_OUTPUT} (${_PROTOC_MM}), libprotobuf headers: ${_PROTOBUF_MM}")
+    if(_PROTOC_MM AND _PROTOBUF_MM AND NOT _PROTOC_MM STREQUAL _PROTOBUF_MM)
+      message(WARNING "[UMBP] protoc ${_PROTOC_MM} vs libprotobuf ${_PROTOBUF_MM} mismatch — disabling distributed control plane.")
+      set(HAVE_GRPC FALSE)
+    elseif(NOT _PROTOBUF_MM)
+      message(WARNING "[UMBP] cannot determine libprotobuf header version — disabling distributed control plane.")
+      set(HAVE_GRPC FALSE)
+    endif()
   endif()
 endif()
 
