@@ -30,6 +30,7 @@ option(BUILD_APPLICATION "Whether to build application library" ON)
 option(BUILD_SHMEM "Whether to build shmem library" ON)
 option(BUILD_OPS "Whether to build mori operation kernels" ON)
 option(BUILD_IO "Whether to build mori io library" ON)
+option(BUILD_COLLECTIVE "Whether to build mori collective library" ON)
 option(BUILD_PYBINDS "Whether to build mori python bindings" ON)
 option(BUILD_UMBP "Whether to build UMBP (Unified Memory/Bandwidth Pool)" OFF)
 option(BUILD_TESTS "Whether to build mori CPP tests" ON)
@@ -319,6 +320,10 @@ endif()
 
 if(BUILD_IO)
   add_subdirectory(src/io)
+endif()
+
+if(BUILD_COLLECTIVE)
+  add_subdirectory(src/collective)
 endif()
 
 if(BUILD_PYBINDS)

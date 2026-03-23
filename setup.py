@@ -123,14 +123,7 @@ def _invalidate_cmake_cache_if_changed(cmake_cache: "Path", cmake_args: list) ->
         return
 
     # Parse -DKEY=VALUE args (normalize booleans to uppercase)
-    _BOOL_MAP = {
-        "1": "ON",
-        "TRUE": "ON",
-        "YES": "ON",
-        "0": "OFF",
-        "FALSE": "OFF",
-        "NO": "OFF",
-    }
+    _BOOL_MAP = {"1": "ON", "TRUE": "ON", "YES": "ON", "0": "OFF", "FALSE": "OFF", "NO": "OFF"}
 
     def _normalize(v: str) -> str:
         return _BOOL_MAP.get(v.upper(), v)
@@ -152,7 +145,8 @@ def _invalidate_cmake_cache_if_changed(cmake_cache: "Path", cmake_args: list) ->
         cached_opts[key] = _normalize(val)
 
     changed = [
-        k for k, v in new_opts.items() if k in cached_opts and cached_opts[k] != v
+        k for k, v in new_opts.items()
+        if k in cached_opts and cached_opts[k] != v
     ]
 
     # Also check stale CMAKE_MAKE_PROGRAM path
@@ -334,14 +328,10 @@ class CMakeBuild(build_ext):
         build_examples = os.environ.get("BUILD_EXAMPLES", "OFF")
         build_tests = os.environ.get("BUILD_TESTS", "OFF")
         build_umbp = os.environ.get("BUILD_UMBP", "OFF")
-        with_mpi = (
-            "ON"
-            if (
-                build_examples.upper() == "ON"
-                or os.environ.get("MORI_WITH_MPI", "OFF").upper() == "ON"
-            )
-            else "OFF"
-        )
+        with_mpi = "ON" if (
+            build_examples.upper() == "ON"
+            or os.environ.get("MORI_WITH_MPI", "OFF").upper() == "ON"
+        ) else "OFF"
 
         cmake_args = [
             "cmake",
@@ -399,19 +389,16 @@ class CMakeBuild(build_ext):
                 build_dir / "src/io/libmori_io.so",
                 root_dir / "python/mori/libmori_io.so",
             ),
+            (
+                build_dir / "src/collective/libmori_collective.so",
+                root_dir / "python/mori/libmori_collective.so",
+            ),
         ]
         for src_path, dst_path in files_to_copy:
             shutil.copyfile(src_path, dst_path)
 
         # UMBP bindings are compiled into libmori_pybinds.so when BUILD_UMBP=ON
         # (no separate .so to copy)
-        spdk_proxy_src = build_dir / "src/umbp/spdk_proxy"
-        spdk_proxy_dst = root_dir / "python/mori/spdk_proxy"
-        if spdk_proxy_src.exists():
-            shutil.copyfile(spdk_proxy_src, spdk_proxy_dst)
-            os.chmod(spdk_proxy_dst, 0o755)
-        elif spdk_proxy_dst.exists():
-            spdk_proxy_dst.unlink()
 
         _copy_jit_sources(root_dir)
 
@@ -487,7 +474,7 @@ setup(
             "libmori_ops.so",
             "libmori_io.so",
             "libmori_application.so",
-            "spdk_proxy",
+            "libmori_collective.so",
             "_jit_sources/include/**/*.hpp",
             "_jit_sources/include/**/*.h",
             "_jit_sources/src/**/*.hip",

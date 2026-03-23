@@ -22,46 +22,50 @@
 #pragma once
 
 #include "mori/shmem/shmem_api.hpp"
+
+#if defined(__HIPCC__) || defined(__CUDACC__)
 #include "mori/shmem/shmem_device_api.hpp"
 #include "mori/shmem/shmem_device_kernels.hpp"
 #include "mori/shmem/shmem_ibgda_kernels.hpp"
 #include "mori/shmem/shmem_p2p_kernels.hpp"
 #include "mori/shmem/shmem_sdma_kernels.hpp"
+#endif
 
-// When compiled with hipcc (C++ users with device code), automatically define
-// globalGpuStates and register the barrier kernel so that ShmemInit and
-// ShmemBarrierOnStream work without any manual setup.
-// The weak attribute ensures only one copy survives linking when multiple TUs
-// include this header.
-#if defined(__HIPCC__) && !defined(MORI_SHMEM_NO_STATIC_INIT)
+// When compiled with hipcc (C++ users with device code), define a weak
+// globalGpuStates symbol per TU. This keeps non-RDC HIP builds linkable.
+#if defined(__HIPCC__) || defined(__HIP__) || defined(__CUDACC__)
 namespace mori {
 namespace shmem {
 
-__device__ __attribute__((visibility("default"), weak)) GpuStates globalGpuStates;
+__device__ __attribute__((visibility("hidden"), weak)) GpuStates globalGpuStates;
 
 namespace _static_init {
 
+__attribute__((visibility("hidden"), weak)) void* _getGpuStatesAddr() {
+  void* addr = nullptr;
+  (void)hipGetSymbolAddress(&addr, HIP_SYMBOL(mori::shmem::globalGpuStates));
+  return addr;
+}
+
+struct _GpuStatesRegistrar {
+  _GpuStatesRegistrar() { RegisterGpuStatesAddrProvider(_getGpuStatesAddr); }
+};
+__attribute__((visibility("hidden"), weak)) _GpuStatesRegistrar _s_gpuStatesRegistrar;
+
+#if !defined(MORI_SHMEM_NO_STATIC_INIT)
 __global__ void _barrier_kernel() { ShmemBarrierAllBlock(); }
 
 __attribute__((weak)) void _barrierLauncher(hipStream_t stream) {
   _barrier_kernel<<<1, 1, 0, stream>>>();
 }
 
-__attribute__((weak)) void* _getGpuStatesAddr() {
-  void* addr = nullptr;
-  (void)hipGetSymbolAddress(&addr, HIP_SYMBOL(mori::shmem::globalGpuStates));
-  return addr;
-}
-
-struct _Registrar {
-  _Registrar() {
-    RegisterGpuStatesAddrProvider(_getGpuStatesAddr);
-    RegisterBarrierLauncher(_barrierLauncher);
-  }
+struct _BarrierRegistrar {
+  _BarrierRegistrar() { RegisterBarrierLauncher(_barrierLauncher); }
 };
-__attribute__((weak)) _Registrar _s_registrar;
+__attribute__((weak)) _BarrierRegistrar _s_barrierRegistrar;
+#endif  // !MORI_SHMEM_NO_STATIC_INIT
 
 }  // namespace _static_init
 }  // namespace shmem
 }  // namespace mori
-#endif  // __HIPCC__ && !MORI_SHMEM_NO_STATIC_INIT
+#endif  // __HIPCC__ || __HIP__ || __CUDACC__
