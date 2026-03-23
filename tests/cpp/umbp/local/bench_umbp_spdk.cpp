@@ -7,17 +7,11 @@
 // Scenarios that are POSIX-specific (IO Backend, Durability, StorageIoDriver)
 // are skipped; all remaining scenarios use the SPDK proxy path.
 //
-// Requires: UMBP_SPDK_NVME_PCI environment variable set.
+// The proxy daemon is spawned once at startup (via an anchor UMBPClient) and
+// reused across tier-level, batch, concurrent benchmarks.  Only scenarios that
+// need a different DRAM capacity or copy-pipeline config create fresh clients.
 //
-// Usage:
-//   UMBP_SPDK_NVME_PCI=0000:88:00.0 ./bench_umbp_spdk [OPTIONS]
-//     --profile <small|medium|large>   Preset config (default: medium)
-//     --num-keys N                     Keys per scenario
-//     --value-size N                   Value size in bytes
-//     --batch-size N                   Batch size
-//     --iters N                        Measurement iterations
-//     --filter SUBSTRING               Run only matching scenarios
-//     -h, --help                       Help
+// Requires: UMBP_SPDK_NVME_PCI environment variable set.
 
 #include <algorithm>
 #include <chrono>
@@ -25,7 +19,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <mutex>
+#include <memory>
 #include <numeric>
 #include <random>
 #include <string>
@@ -43,6 +37,7 @@
 #include "umbp/local/umbp_client.h"
 
 using Clock = std::chrono::high_resolution_clock;
+using TierBackend = mori::umbp::TierBackend;
 
 // ---------------------------------------------------------------------------
 // BenchConfig
@@ -381,38 +376,32 @@ static UMBPConfig MakeSpdkFollowerConfig() {
 }
 
 // ---------------------------------------------------------------------------
-// A. SPDK Tier Benchmarks (Write / Read / ReadBatch)
+// A. SPDK Tier Benchmarks — uses shared SSD tier from anchor client
 // ---------------------------------------------------------------------------
 static void BenchSpdkTier(const BenchConfig& cfg,
                           const std::vector<std::string>& keys,
                           const std::vector<std::vector<char>>& values,
-                          std::vector<BenchResult>& results) {
+                          std::vector<BenchResult>& results,
+                          TierBackend& ssd) {
   if (!ShouldRun(cfg, "SPDK Tier")) return;
   PrintHeader("SPDK Tier");
-
-  UMBPClient client(MakeSpdkLeaderConfig(cfg));
-  auto* ssd = client.Storage().GetTier(StorageTier::LOCAL_SSD);
-  if (!ssd) {
-    std::printf("[SKIP] SPDK SSD tier not available\n");
-    return;
-  }
 
   // Write
   {
     for (size_t w = 0; w < cfg.warmup_iters; ++w) {
-      ssd->Clear();
+      ssd.Clear();
       for (size_t i = 0; i < keys.size(); ++i)
-        ssd->Write(keys[i], values[i].data(), values[i].size());
+        ssd.Write(keys[i], values[i].data(), values[i].size());
     }
-    ssd->Clear();
+    ssd.Clear();
 
     std::vector<double> lat;
     lat.reserve(keys.size() * cfg.measure_iters);
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
-      ssd->Clear();
+      ssd.Clear();
       for (size_t i = 0; i < keys.size(); ++i) {
         auto t0 = Clock::now();
-        ssd->Write(keys[i], values[i].data(), values[i].size());
+        ssd.Write(keys[i], values[i].data(), values[i].size());
         auto t1 = Clock::now();
         lat.push_back(
             std::chrono::duration<double, std::micro>(t1 - t0).count());
@@ -426,23 +415,23 @@ static void BenchSpdkTier(const BenchConfig& cfg,
 
   // Read
   {
-    ssd->Clear();
+    ssd.Clear();
     for (size_t i = 0; i < keys.size(); ++i)
-      ssd->Write(keys[i], values[i].data(), values[i].size());
+      ssd.Write(keys[i], values[i].data(), values[i].size());
 
     std::vector<char> buf(cfg.value_size);
     for (size_t w = 0; w < cfg.warmup_iters; ++w)
       for (size_t i = 0; i < keys.size(); ++i)
-        ssd->ReadIntoPtr(keys[i], reinterpret_cast<uintptr_t>(buf.data()),
-                         buf.size());
+        ssd.ReadIntoPtr(keys[i], reinterpret_cast<uintptr_t>(buf.data()),
+                        buf.size());
 
     std::vector<double> lat;
     lat.reserve(keys.size() * cfg.measure_iters);
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
       for (size_t i = 0; i < keys.size(); ++i) {
         auto t0 = Clock::now();
-        ssd->ReadIntoPtr(keys[i], reinterpret_cast<uintptr_t>(buf.data()),
-                         buf.size());
+        ssd.ReadIntoPtr(keys[i], reinterpret_cast<uintptr_t>(buf.data()),
+                        buf.size());
         auto t1 = Clock::now();
         lat.push_back(
             std::chrono::duration<double, std::micro>(t1 - t0).count());
@@ -456,9 +445,9 @@ static void BenchSpdkTier(const BenchConfig& cfg,
 
   // ReadBatch
   {
-    ssd->Clear();
+    ssd.Clear();
     for (size_t i = 0; i < keys.size(); ++i)
-      ssd->Write(keys[i], values[i].data(), values[i].size());
+      ssd.Write(keys[i], values[i].data(), values[i].size());
 
     std::vector<std::vector<char>> bufs(keys.size(),
                                         std::vector<char>(cfg.value_size));
@@ -470,14 +459,14 @@ static void BenchSpdkTier(const BenchConfig& cfg,
 
     for (size_t w = 0; w < cfg.warmup_iters; ++w)
       for (const auto& d : rdescs)
-        ssd->ReadBatchIntoPtr(d.keys, d.dst_ptrs, d.sizes);
+        ssd.ReadBatchIntoPtr(d.keys, d.dst_ptrs, d.sizes);
 
     std::vector<double> lat;
     lat.reserve(rdescs.size() * cfg.measure_iters);
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
       for (const auto& d : rdescs) {
         auto t0 = Clock::now();
-        ssd->ReadBatchIntoPtr(d.keys, d.dst_ptrs, d.sizes);
+        ssd.ReadBatchIntoPtr(d.keys, d.dst_ptrs, d.sizes);
         auto t1 = Clock::now();
         lat.push_back(
             std::chrono::duration<double, std::micro>(t1 - t0).count());
@@ -492,38 +481,32 @@ static void BenchSpdkTier(const BenchConfig& cfg,
 }
 
 // ---------------------------------------------------------------------------
-// B. Batch vs Single Write
+// B. Batch vs Single Write — uses shared SSD tier
 // ---------------------------------------------------------------------------
 static void BenchSpdkBatchWrite(const BenchConfig& cfg,
                                 const std::vector<std::string>& keys,
                                 const std::vector<std::vector<char>>& values,
-                                std::vector<BenchResult>& results) {
+                                std::vector<BenchResult>& results,
+                                TierBackend& ssd) {
   if (!ShouldRun(cfg, "Batch")) return;
   PrintHeader("SPDK Batch vs Single Write");
-
-  UMBPClient client(MakeSpdkLeaderConfig(cfg));
-  auto* ssd = client.Storage().GetTier(StorageTier::LOCAL_SSD);
-  if (!ssd) {
-    std::printf("[SKIP] SPDK SSD tier not available\n");
-    return;
-  }
 
   // Sequential
   {
     for (size_t w = 0; w < cfg.warmup_iters; ++w) {
-      ssd->Clear();
+      ssd.Clear();
       for (size_t i = 0; i < keys.size(); ++i)
-        ssd->Write(keys[i], values[i].data(), values[i].size());
+        ssd.Write(keys[i], values[i].data(), values[i].size());
     }
-    ssd->Clear();
+    ssd.Clear();
 
     std::vector<double> lat;
     lat.reserve(keys.size() * cfg.measure_iters);
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
-      ssd->Clear();
+      ssd.Clear();
       for (size_t i = 0; i < keys.size(); ++i) {
         auto t0 = Clock::now();
-        ssd->Write(keys[i], values[i].data(), values[i].size());
+        ssd.Write(keys[i], values[i].data(), values[i].size());
         auto t1 = Clock::now();
         lat.push_back(
             std::chrono::duration<double, std::micro>(t1 - t0).count());
@@ -538,19 +521,19 @@ static void BenchSpdkBatchWrite(const BenchConfig& cfg,
   {
     auto wdescs = BuildWriteBatches(keys, values, cfg.batch_size);
     for (size_t w = 0; w < cfg.warmup_iters; ++w) {
-      ssd->Clear();
+      ssd.Clear();
       for (const auto& d : wdescs)
-        ssd->BatchWrite(d.keys, d.data_ptrs, d.sizes);
+        ssd.BatchWrite(d.keys, d.data_ptrs, d.sizes);
     }
-    ssd->Clear();
+    ssd.Clear();
 
     std::vector<double> lat;
     lat.reserve(wdescs.size() * cfg.measure_iters);
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
-      ssd->Clear();
+      ssd.Clear();
       for (const auto& d : wdescs) {
         auto t0 = Clock::now();
-        ssd->BatchWrite(d.keys, d.data_ptrs, d.sizes);
+        ssd.BatchWrite(d.keys, d.data_ptrs, d.sizes);
         auto t1 = Clock::now();
         lat.push_back(
             std::chrono::duration<double, std::micro>(t1 - t0).count());
@@ -565,41 +548,35 @@ static void BenchSpdkBatchWrite(const BenchConfig& cfg,
 }
 
 // ---------------------------------------------------------------------------
-// C. Batch vs Single Read
+// C. Batch vs Single Read — uses shared SSD tier
 // ---------------------------------------------------------------------------
 static void BenchSpdkBatchRead(const BenchConfig& cfg,
                                const std::vector<std::string>& keys,
                                const std::vector<std::vector<char>>& values,
-                               std::vector<BenchResult>& results) {
+                               std::vector<BenchResult>& results,
+                               TierBackend& ssd) {
   if (!ShouldRun(cfg, "Batch")) return;
   PrintHeader("SPDK Batch vs Single Read");
 
-  UMBPClient client(MakeSpdkLeaderConfig(cfg));
-  auto* ssd = client.Storage().GetTier(StorageTier::LOCAL_SSD);
-  if (!ssd) {
-    std::printf("[SKIP] SPDK SSD tier not available\n");
-    return;
-  }
-
-  ssd->Clear();
+  ssd.Clear();
   for (size_t i = 0; i < keys.size(); ++i)
-    ssd->Write(keys[i], values[i].data(), values[i].size());
+    ssd.Write(keys[i], values[i].data(), values[i].size());
 
   // Sequential
   {
     std::vector<char> buf(cfg.value_size);
     for (size_t w = 0; w < cfg.warmup_iters; ++w)
       for (size_t i = 0; i < keys.size(); ++i)
-        ssd->ReadIntoPtr(keys[i], reinterpret_cast<uintptr_t>(buf.data()),
-                         buf.size());
+        ssd.ReadIntoPtr(keys[i], reinterpret_cast<uintptr_t>(buf.data()),
+                        buf.size());
 
     std::vector<double> lat;
     lat.reserve(keys.size() * cfg.measure_iters);
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
       for (size_t i = 0; i < keys.size(); ++i) {
         auto t0 = Clock::now();
-        ssd->ReadIntoPtr(keys[i], reinterpret_cast<uintptr_t>(buf.data()),
-                         buf.size());
+        ssd.ReadIntoPtr(keys[i], reinterpret_cast<uintptr_t>(buf.data()),
+                        buf.size());
         auto t1 = Clock::now();
         lat.push_back(
             std::chrono::duration<double, std::micro>(t1 - t0).count());
@@ -622,14 +599,14 @@ static void BenchSpdkBatchRead(const BenchConfig& cfg,
 
     for (size_t w = 0; w < cfg.warmup_iters; ++w)
       for (const auto& d : rdescs)
-        ssd->ReadBatchIntoPtr(d.keys, d.dst_ptrs, d.sizes);
+        ssd.ReadBatchIntoPtr(d.keys, d.dst_ptrs, d.sizes);
 
     std::vector<double> lat;
     lat.reserve(rdescs.size() * cfg.measure_iters);
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
       for (const auto& d : rdescs) {
         auto t0 = Clock::now();
-        ssd->ReadBatchIntoPtr(d.keys, d.dst_ptrs, d.sizes);
+        ssd.ReadBatchIntoPtr(d.keys, d.dst_ptrs, d.sizes);
         auto t1 = Clock::now();
         lat.push_back(
             std::chrono::duration<double, std::micro>(t1 - t0).count());
@@ -644,17 +621,15 @@ static void BenchSpdkBatchRead(const BenchConfig& cfg,
 }
 
 // ---------------------------------------------------------------------------
-// D. CopyToSSD (DRAM → SPDK NVMe)
+// D. CopyToSSD — uses anchor's storage manager
 // ---------------------------------------------------------------------------
 static void BenchSpdkCopyToSSD(const BenchConfig& cfg,
                                 const std::vector<std::string>& keys,
                                 const std::vector<std::vector<char>>& values,
-                                std::vector<BenchResult>& results) {
+                                std::vector<BenchResult>& results,
+                                LocalStorageManager& mgr) {
   if (!ShouldRun(cfg, "CopyToSSD")) return;
   PrintHeader("SPDK CopyToSSD vs CopyToSSDBatch");
-
-  auto ucfg = MakeSpdkLeaderConfig(cfg);
-  LocalStorageManager mgr(ucfg);
 
   for (size_t i = 0; i < keys.size(); ++i)
     mgr.Write(keys[i], values[i].data(), values[i].size(),
@@ -708,19 +683,17 @@ static void BenchSpdkCopyToSSD(const BenchConfig& cfg,
 }
 
 // ---------------------------------------------------------------------------
-// E. Concurrent Scaling (UMBPClient Put + Get via SPDK proxy)
+// E. Concurrent Scaling — uses anchor client (single proxy, all thread counts)
 // ---------------------------------------------------------------------------
 static void BenchSpdkConcurrent(const BenchConfig& cfg,
                                 const std::vector<std::string>& keys,
                                 const std::vector<std::vector<char>>& values,
-                                std::vector<BenchResult>& results) {
+                                std::vector<BenchResult>& results,
+                                UMBPClient& client) {
   if (!ShouldRun(cfg, "Concurrent")) return;
   PrintHeader("SPDK Concurrent Scaling");
 
   for (int nthreads : cfg.thread_counts) {
-    auto ucfg = MakeSpdkLeaderConfig(cfg);
-    UMBPClient client(ucfg);
-
     size_t kpt = keys.size() / static_cast<size_t>(nthreads);
     if (kpt == 0) continue;
     std::string variant = std::to_string(nthreads) + " threads";
@@ -803,7 +776,7 @@ static void BenchSpdkConcurrent(const BenchConfig& cfg,
 }
 
 // ---------------------------------------------------------------------------
-// F. Leader Mode (sync vs async copy via SPDK)
+// F. Leader Mode — one client per mode, Clear() between iterations
 // ---------------------------------------------------------------------------
 static void BenchSpdkLeaderMode(const BenchConfig& cfg,
                                 const std::vector<std::string>& keys,
@@ -815,9 +788,10 @@ static void BenchSpdkLeaderMode(const BenchConfig& cfg,
   auto run_mode = [&](bool async_copy, const std::string& label) {
     auto ucfg = MakeSpdkLeaderConfig(cfg);
     ucfg.copy_pipeline.async_enabled = async_copy;
+    UMBPClient client(ucfg);
 
     for (size_t w = 0; w < cfg.warmup_iters; ++w) {
-      UMBPClient client(ucfg);
+      client.Clear();
       for (size_t i = 0; i < keys.size(); ++i)
         client.Put(keys[i], values[i].data(), values[i].size());
     }
@@ -825,7 +799,7 @@ static void BenchSpdkLeaderMode(const BenchConfig& cfg,
     std::vector<double> lat;
     lat.reserve(keys.size() * cfg.measure_iters);
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
-      UMBPClient client(ucfg);
+      client.Clear();
       for (size_t i = 0; i < keys.size(); ++i) {
         auto t0 = Clock::now();
         client.Put(keys[i], values[i].data(), values[i].size());
@@ -844,7 +818,7 @@ static void BenchSpdkLeaderMode(const BenchConfig& cfg,
 }
 
 // ---------------------------------------------------------------------------
-// G. Capacity Pressure (DRAM eviction → SPDK NVMe)
+// G. Capacity Pressure — one client shared across both sub-tests
 // ---------------------------------------------------------------------------
 static void
 BenchSpdkCapacityPressure(const BenchConfig& cfg,
@@ -860,10 +834,10 @@ BenchSpdkCapacityPressure(const BenchConfig& cfg,
 
   auto ucfg = MakeSpdkLeaderConfig(cfg);
   ucfg.dram.capacity_bytes = pressure_dram;
+  UMBPClient client(ucfg);
 
   // No pressure
   {
-    UMBPClient client(ucfg);
     for (size_t w = 0; w < cfg.warmup_iters; ++w) {
       client.Clear();
       for (size_t i = 0; i < half; ++i)
@@ -891,7 +865,6 @@ BenchSpdkCapacityPressure(const BenchConfig& cfg,
 
   // Under pressure
   {
-    UMBPClient client(ucfg);
     for (size_t w = 0; w < cfg.warmup_iters; ++w) {
       client.Clear();
       for (size_t i = 0; i < keys.size(); ++i)
@@ -921,7 +894,7 @@ BenchSpdkCapacityPressure(const BenchConfig& cfg,
 }
 
 // ---------------------------------------------------------------------------
-// H. E2E UMBPClient (sglang connector) via SPDK
+// H. E2E UMBPClient — minimized proxy restarts
 // ---------------------------------------------------------------------------
 static void BenchSpdkE2E(const BenchConfig& cfg, const E2EConfig& e2e,
                          std::vector<BenchResult>& results) {
@@ -1006,7 +979,7 @@ static void BenchSpdkE2E(const BenchConfig& cfg, const E2EConfig& e2e,
     return ucfg;
   };
 
-  // (a) BatchSet — DRAM only (measures UMBPClient overhead, same as POSIX)
+  // (a) BatchSet — DRAM only
   {
     UMBPClient client(MakeDramOnly());
     for (size_t w = 0; w < cfg.warmup_iters; ++w) {
@@ -1038,14 +1011,14 @@ static void BenchSpdkE2E(const BenchConfig& cfg, const E2EConfig& e2e,
                  LatencyElapsed(lat), lat, results);
   }
 
-  // (c) Capacity pressure — DRAM 50%, eviction to SPDK NVMe
+  // (c) Capacity pressure — one client for both set and get
   {
     auto ucfg = MakeSpdkLeaderConfig(cfg);
     ucfg.dram.capacity_bytes = total_data / 2;
+    UMBPClient client(ucfg);
 
     // Write under pressure
     {
-      UMBPClient client(ucfg);
       for (size_t w = 0; w < cfg.warmup_iters; ++w) {
         client.Clear();
         FillAll(client);
@@ -1063,9 +1036,9 @@ static void BenchSpdkE2E(const BenchConfig& cfg, const E2EConfig& e2e,
                    LatencyElapsed(lat), lat, results);
     }
 
-    // Read back (DRAM+NVMe mixed)
+    // Read back (reuse same client — data already evicted to NVMe)
     {
-      UMBPClient client(ucfg);
+      client.Clear();
       FillAll(client);
       std::vector<double> lat;
       lat.reserve(batches_per_iter * e2e_iters);
@@ -1078,21 +1051,22 @@ static void BenchSpdkE2E(const BenchConfig& cfg, const E2EConfig& e2e,
     }
   }
 
-  // (d) Leader — sync vs async copy to SPDK NVMe
+  // (d) Leader — one client per mode, Clear() between iterations
   {
     auto run_leader = [&](bool async_copy, const std::string& label) {
       auto ucfg = MakeSpdkLeaderConfig(cfg);
       ucfg.dram.capacity_bytes = total_data * 2;
       ucfg.copy_pipeline.async_enabled = async_copy;
+      UMBPClient client(ucfg);
 
       for (size_t w = 0; w < cfg.warmup_iters; ++w) {
-        UMBPClient client(ucfg);
+        client.Clear();
         FillAll(client);
       }
       std::vector<double> lat;
       lat.reserve(batches_per_iter * e2e_iters);
       for (size_t m = 0; m < e2e_iters; ++m) {
-        UMBPClient client(ucfg);
+        client.Clear();
         FillAllTimed(client, e2e.num_pages, lat);
       }
       RecordResult("E2E SPDK Leader Set", label, e2e.num_pages * e2e_iters,
@@ -1103,7 +1077,7 @@ static void BenchSpdkE2E(const BenchConfig& cfg, const E2EConfig& e2e,
     run_leader(true, "async copy");
   }
 
-  // (e) Follower — pure NVMe read via SharedSSDFollower
+  // (e) Follower — pure NVMe read
   {
     auto leader_cfg = MakeSpdkLeaderConfig(cfg);
     leader_cfg.dram.capacity_bytes = total_data * 2;
@@ -1264,11 +1238,25 @@ int main(int argc, char* argv[]) {
 
   std::vector<BenchResult> results;
 
-  BenchSpdkTier(cfg, keys, values, results);
-  BenchSpdkBatchWrite(cfg, keys, values, results);
-  BenchSpdkBatchRead(cfg, keys, values, results);
-  BenchSpdkCopyToSSD(cfg, keys, values, results);
-  BenchSpdkConcurrent(cfg, keys, values, results);
+  // Phase 1: anchor client keeps proxy alive for tier/batch/concurrent tests
+  {
+    std::printf("\nSpawning SPDK proxy (single init for tier/batch/concurrent)...\n");
+    auto anchor_cfg = MakeSpdkLeaderConfig(cfg);
+    UMBPClient anchor(anchor_cfg);
+    auto* ssd = anchor.Storage().GetTier(StorageTier::LOCAL_SSD);
+    if (!ssd) {
+      std::fprintf(stderr, "ERROR: SPDK SSD tier not available\n");
+      return 1;
+    }
+
+    BenchSpdkTier(cfg, keys, values, results, *ssd);
+    BenchSpdkBatchWrite(cfg, keys, values, results, *ssd);
+    BenchSpdkBatchRead(cfg, keys, values, results, *ssd);
+    BenchSpdkCopyToSSD(cfg, keys, values, results, anchor.Storage());
+    BenchSpdkConcurrent(cfg, keys, values, results, anchor);
+  }
+
+  // Phase 2: scenarios needing own client configs (proxy restarts here)
   BenchSpdkLeaderMode(cfg, keys, values, results);
   BenchSpdkCapacityPressure(cfg, keys, values, results);
   BenchSpdkE2E(cfg, e2e, results);
