@@ -60,7 +60,7 @@ struct BenchResult {
 using BenchFn = std::function<bool(uint32_t* in, uint32_t* out, int elems, hipStream_t s)>;
 
 static BenchResult runBench(const char* label, BenchFn fn,
-                            uint32_t* inBuf, uint32_t* outBuf,
+                            uint32_t* inBuf, void* verifyBuf,
                             const std::vector<uint32_t>& hostData,
                             int elemsPerPe, size_t bytesPerPe, int npes, int myPe,
                             hipStream_t stream, int warmup, int iterations,
@@ -74,16 +74,16 @@ static BenchResult runBench(const char* label, BenchFn fn,
     res.avgMs = res.algoBw = res.busBw = 0.0;
 
     CHECK_HIP(hipMemcpy(inBuf, hostData.data(), bytesPerPe, hipMemcpyHostToDevice));
-    CHECK_HIP(hipMemset(outBuf, 0, bytesPerPe));
     CHECK_HIP(hipDeviceSynchronize());
     MPI_Barrier(MPI_COMM_WORLD);
 
+    uint32_t* outBuf = reinterpret_cast<uint32_t*>(verifyBuf);
     bool ok = fn(inBuf, outBuf, elemsPerPe, stream);
     CHECK_HIP(hipStreamSynchronize(stream));
 
     if (ok) {
         std::vector<uint32_t> result(elemsPerPe);
-        CHECK_HIP(hipMemcpy(result.data(), outBuf, bytesPerPe, hipMemcpyDeviceToHost));
+        CHECK_HIP(hipMemcpy(result.data(), verifyBuf, bytesPerPe, hipMemcpyDeviceToHost));
         ok = verifyResult(result.data(), elemsPerPe, computeExpected(npes), myPe);
     }
 
@@ -161,20 +161,12 @@ void testPipelinedAllreduce() {
         uint32_t fillValue = static_cast<uint32_t>((myPe + 1) * 1000);
 
         uint32_t* inBuf = nullptr;
-        uint32_t* outBuf = nullptr;
         CHECK_HIP(hipMalloc(&inBuf, bytesPerPe));
-        CHECK_HIP(hipMalloc(&outBuf, bytesPerPe));
         std::vector<uint32_t> hostData(elemsPerPe, fillValue);
 
+        // copy_output_to_user=false: 从 transit buffer 直接验证，避免 L2 coherence 问题
         auto ar = std::make_unique<AllreduceSdma<uint32_t>>(
-            myPe, npes, bytesPerPe, totalBytes);
-
-        // 清零 transit buffer 避免首次使用时 L2 缓存残留导致 reduce 结果错误
-        void* transitBuf = ar->getOutputTransitBuffer();
-        if (transitBuf) {
-            CHECK_HIP(hipMemset(transitBuf, 0, ar->getOutputTransitBufferSize()));
-            CHECK_HIP(hipDeviceSynchronize());
-        }
+            myPe, npes, bytesPerPe, totalBytes, false);
 
         if (myPe == 0) {
             printf("\n--- 数据大小: %zu MB/PE ---\n", dataMB);
@@ -191,7 +183,7 @@ void testPipelinedAllreduce() {
                 [&](uint32_t* in, uint32_t* out, int n, hipStream_t s) {
                     return (*ar)(in, out, n, s);
                 },
-                inBuf, outBuf, hostData, elemsPerPe, bytesPerPe, npes, myPe,
+                inBuf, ar->getOutputTransitBuffer(), hostData, elemsPerPe, bytesPerPe, npes, myPe,
                 stream, warmup, iterations, 0, -1);
             if (myPe == 0 && res.passed) {
                 printf("%-42s %10.3f %12.2f %12.2f %8s\n",
@@ -204,7 +196,7 @@ void testPipelinedAllreduce() {
         for (size_t chunkKB : chunkSizesKB) {
             size_t chunkBytes = chunkKB * 1024;
             size_t chunkElems = chunkBytes / sizeof(uint32_t);
-            if (chunkBytes > bytesPerPe) continue;  // chunk 不能大于数据
+            if (chunkBytes > bytesPerPe) continue;
 
             char label[64];
             snprintf(label, sizeof(label), "Pipeline SDMA chunk=%zuKB", chunkKB);
@@ -212,7 +204,7 @@ void testPipelinedAllreduce() {
                 [&](uint32_t* in, uint32_t* out, int n, hipStream_t s) {
                     return ar->pipelined(in, out, n, chunkElems, 0, s);
                 },
-                inBuf, outBuf, hostData, elemsPerPe, bytesPerPe, npes, myPe,
+                inBuf, ar->getOutputTransitBuffer(), hostData, elemsPerPe, bytesPerPe, npes, myPe,
                 stream, warmup, iterations, chunkBytes, 0);
             if (myPe == 0 && res.passed) {
                 printf("%-42s %10.3f %12.2f %12.2f %8s\n",
@@ -233,7 +225,7 @@ void testPipelinedAllreduce() {
                 [&](uint32_t* in, uint32_t* out, int n, hipStream_t s) {
                     return ar->pipelined(in, out, n, chunkElems, 1, s);
                 },
-                inBuf, outBuf, hostData, elemsPerPe, bytesPerPe, npes, myPe,
+                inBuf, ar->getOutputTransitBuffer(), hostData, elemsPerPe, bytesPerPe, npes, myPe,
                 stream, warmup, iterations, chunkBytes, 1);
             if (myPe == 0 && res.passed) {
                 printf("%-42s %10.3f %12.2f %12.2f %8s\n",
@@ -243,7 +235,6 @@ void testPipelinedAllreduce() {
         }
 
         ar.reset();
-        CHECK_HIP(hipFree(outBuf));
         CHECK_HIP(hipFree(inBuf));
     }
 
