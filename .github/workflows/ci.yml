@@ -29,6 +29,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Build and install mori
+        run: pip install .
+
+      - name: Build and install mori (with examples)
         run: BUILD_EXAMPLES=ON pip install .
 
       - name: Verify installation
