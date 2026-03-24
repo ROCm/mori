@@ -45,7 +45,7 @@ jobs:
           echo "matrix=$(grep -v '//' /tmp/matrix.json | tr -d '\n')" >> $GITHUB_OUTPUT
 
   build:
-    name: mori build (${{ matrix.runner }} / ${{ matrix.platform }})
+    name: mori build (platform:${{ matrix.platform }})
     needs: setup
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -103,7 +103,7 @@ jobs:
              bash -c 'cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install .'"
 
   intranode-test:
-    name: mori intranode test (${{ matrix.runner }} / ${{ matrix.platform }})
+    name: mori intranode test (platform:${{ matrix.platform }})
     needs: [setup, build]
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -146,44 +146,33 @@ jobs:
           timeout 60 pytest tests/python/io/ -v
 
       - name: MORI-IR
+        env:
+          HOME: /tmp
         run: |
           cd $GITHUB_WORKSPACE
-          timeout 60 torchrun --nproc_per_node=2 \
-            examples/shmem/ir/test_triton_shmem.py
-          timeout 60 torchrun --nproc_per_node=8 \
-            examples/shmem/ir/test_triton_allreduce.py
+          timeout 60 torchrun --nproc_per_node=2 examples/shmem/ir/test_triton_shmem.py
+          timeout 60 torchrun --nproc_per_node=8 examples/shmem/ir/test_triton_allreduce.py
+          MORI_DISABLE_P2P=ON timeout 60 torchrun --nproc_per_node=8 examples/shmem/ir/test_triton_allreduce.py
 
       - name: MORI-CPP shmem (P2P)
         run: |
           cd $GITHUB_WORKSPACE
-          timeout 60 mpirun --allow-run-as-root -np 2 \
-            ./build/examples/concurrent_put_thread
-          timeout 60 mpirun --allow-run-as-root -np 2 \
-            ./build/examples/concurrent_get_thread
-          # timeout 60 mpirun --allow-run-as-root -np 2 \
-          #   ./build/examples/concurrent_put_imm_thread
-          timeout 60 mpirun --allow-run-as-root -np 2 \
-            ./build/examples/concurrent_put_signal_thread
-          timeout 60 mpirun --allow-run-as-root -np 2 \
-            ./build/examples/atomic_nonfetch_thread
-          timeout 60 mpirun --allow-run-as-root -np 2 \
-            ./build/examples/atomic_fetch_thread
+          timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_put_thread
+          timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_get_thread
+          # timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_put_imm_thread
+          timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_put_signal_thread
+          timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/atomic_nonfetch_thread
+          timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/atomic_fetch_thread
 
       - name: MORI-CPP shmem (IBGDA)
         run: |
           cd $GITHUB_WORKSPACE
-          MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 \
-            ./build/examples/concurrent_put_thread
-          MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 \
-            ./build/examples/concurrent_get_thread
-          # MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 \
-          #   ./build/examples/concurrent_put_imm_thread
-          MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 \
-            ./build/examples/concurrent_put_signal_thread
-          MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 \
-            ./build/examples/atomic_nonfetch_thread
-          MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 \
-            ./build/examples/atomic_fetch_thread
+          MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_put_thread
+          MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_get_thread
+          # MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_put_imm_thread
+          MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_put_signal_thread
+          MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/atomic_nonfetch_thread
+          MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/atomic_fetch_thread
 
       - name: MORI-CCL/shmem
         run: |
@@ -191,7 +180,7 @@ jobs:
           timeout 600 pytest tests/python/shmem/test_api.py -v
 
   internode-test:
-    name: mori internode test (${{ matrix.runner }} / ${{ matrix.platform }})
+    name: mori internode test (platform:${{ matrix.platform }})
     needs: [setup, build, intranode-test]
     if: needs.build.result == 'success'
     runs-on: ${{ matrix.runner }}
@@ -235,33 +224,37 @@ jobs:
           ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} \
             "docker exec $CONTAINER pip install prettytable"
 
-      - name: MORI-EP inter bench
+      - name: MORI-EP internode normal kernel bench
         run: |
-          NODE2_CMD="docker exec -e GLOO_SOCKET_IFNAME=${{ matrix.node2_ifname }} -e MORI_SOCKET_IFNAME=${{ matrix.node2_ifname }} $CONTAINER bash -c 'cd $GITHUB_WORKSPACE && timeout 120 torchrun --nnodes=2 --node_rank=1 --nproc_per_node=1 --master_addr=${{ matrix.node1_host }} --master_port=1234 examples/ops/dispatch_combine/test_dispatch_combine_internode.py --cmd bench --kernel-type v1 --num-qp 2 --max-tokens 4096'"
-          ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} "$NODE2_CMD" &
-          docker exec \
-            -e GLOO_SOCKET_IFNAME=${{ matrix.node1_ifname }} \
-            -e MORI_SOCKET_IFNAME=${{ matrix.node1_ifname }} \
-            $CONTAINER \
-            bash -c "cd $GITHUB_WORKSPACE && \
-              timeout 120 torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
-                --master_addr=${{ matrix.node1_host }} --master_port=1234 \
-                examples/ops/dispatch_combine/test_dispatch_combine_internode.py \
-                --cmd bench --kernel-type v1 --num-qp 2 --max-tokens 4096"
+          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
+          for KERNEL in v1 v1_ll; do
+            for TOKENS in 64 128 1024 4096; do
+              echo "=== bench kernel=$KERNEL max-tokens=$TOKENS ==="
+              NODE2_CMD="docker exec $CONTAINER bash $SCRIPT --rank 1 --master-addr ${{ matrix.node1_host }} --ifname ${{ matrix.node2_ifname }} --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS"
+              ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} "$NODE2_CMD" &
+              docker exec $CONTAINER bash $SCRIPT \
+                --rank 0 --master-addr ${{ matrix.node1_host }} \
+                --ifname ${{ matrix.node1_ifname }} \
+                --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS
+              wait
+            done
+          done
 
-      - name: MORI-EP inter stress
+      - name: MORI-EP internode normal kernel stress
         run: |
-          NODE2_CMD="docker exec -e GLOO_SOCKET_IFNAME=${{ matrix.node2_ifname }} -e MORI_SOCKET_IFNAME=${{ matrix.node2_ifname }} $CONTAINER bash -c 'cd $GITHUB_WORKSPACE && timeout 120 torchrun --nnodes=2 --node_rank=1 --nproc_per_node=1 --master_addr=${{ matrix.node1_host }} --master_port=1234 examples/ops/dispatch_combine/test_dispatch_combine_internode.py --cmd stress --kernel-type v1 --num-qp 2 --max-tokens 128'"
-          ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} "$NODE2_CMD" &
-          docker exec \
-            -e GLOO_SOCKET_IFNAME=${{ matrix.node1_ifname }} \
-            -e MORI_SOCKET_IFNAME=${{ matrix.node1_ifname }} \
-            $CONTAINER \
-            bash -c "cd $GITHUB_WORKSPACE && \
-              timeout 120 torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
-                --master_addr=${{ matrix.node1_host }} --master_port=1234 \
-                examples/ops/dispatch_combine/test_dispatch_combine_internode.py \
-                --cmd stress --kernel-type v1 --num-qp 2 --max-tokens 128"
+          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
+          for KERNEL in v1 v1_ll; do
+            for TOKENS in 64 128 1024 4096; do
+              echo "=== stress kernel=$KERNEL max-tokens=$TOKENS ==="
+              NODE2_CMD="docker exec $CONTAINER bash $SCRIPT --rank 1 --master-addr ${{ matrix.node1_host }} --ifname ${{ matrix.node2_ifname }} --cmd stress --kernel-type $KERNEL --max-tokens $TOKENS"
+              ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} "$NODE2_CMD" &
+              docker exec $CONTAINER bash $SCRIPT \
+                --rank 0 --master-addr ${{ matrix.node1_host }} \
+                --ifname ${{ matrix.node1_ifname }} \
+                --cmd stress --kernel-type $KERNEL --max-tokens $TOKENS
+              wait
+            done
+          done
 
       - name: Cleanup node1 container
         if: always()
