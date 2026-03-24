@@ -91,15 +91,9 @@ __global__ void PipelinedAllReduceSdmaKernel(
         s_scatter_base = core::AtomicLoadRelaxed(
             dstMemObj->signalPtrs + static_cast<size_t>(i) * numQ + 0);
         if (blockIdx.x == 0) {
-          if constexpr (SCATTER_MODE == 0) {
-            // SDMA pipeline: AG signals live on the reduce buffer
-            s_ag_base = core::AtomicLoadRelaxed(
-                inputSymmObj->signalPtrs + static_cast<size_t>(i) * numQ + 1);
-          } else {
-            // P2P: AG signals live on the output transit buffer
-            s_ag_base = core::AtomicLoadRelaxed(
-                dstMemObj->signalPtrs + static_cast<size_t>(i) * numQ + 1);
-          }
+          // AG signals always on dstMemObj (pre-registered, reliable SDMA infra)
+          s_ag_base = core::AtomicLoadRelaxed(
+              dstMemObj->signalPtrs + static_cast<size_t>(i) * numQ + 1);
         }
         break;
       }
@@ -247,9 +241,10 @@ __global__ void PipelinedAllReduceSdmaKernel(
                   + static_cast<size_t>(myPe) * totalShardBytes + cOff;
               uint8_t* dst = reinterpret_cast<uint8_t*>(inputSymmObj->peerPtrs[destPe])
                   + static_cast<size_t>(myPe) * totalShardBytes + cOff;
+              // Use dstMemObj's SDMA queues & signals (pre-registered, reliable)
               anvil::SdmaQueueDeviceHandle** dh =
-                  inputSymmObj->deviceHandles_d + destPe * numQ;
-              HSAuint64* rSig = inputSymmObj->peerSignalPtrs[destPe]
+                  dstMemObj->deviceHandles_d + destPe * numQ;
+              HSAuint64* rSig = dstMemObj->peerSignalPtrs[destPe]
                   + static_cast<size_t>(myPe) * numQ;
               core::SdmaPutThread(src, dst, actualBytes, dh, rSig, numQ, 1);
             }
@@ -257,14 +252,14 @@ __global__ void PipelinedAllReduceSdmaKernel(
         }
       }
 
-      // Final AG wait — signals on the reduce buffer
+      // Final AG wait — signals on dstMemObj (pre-registered)
       {
         const int thr = static_cast<int>(threadIdx.x);
         if (thr < npes - 1) {
           const int sender = thr < myPe ? thr : thr + 1;
           const uint64_t expected =
               agBase + static_cast<uint64_t>(numChunks);
-          HSAuint64* sig = inputSymmObj->signalPtrs
+          HSAuint64* sig = dstMemObj->signalPtrs
               + static_cast<size_t>(sender) * numQ + 1;
           int spin = 0;
           while (core::AtomicLoadRelaxed(sig) < expected) {
