@@ -245,6 +245,25 @@ jobs:
             done
           done
 
+      - name: MORI-EP internode async kernel test
+        run: |
+          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
+          for TOKENS in 64 128 1024 4096; do
+            echo "=== async_ll test max-tokens=$TOKENS ==="
+            NODE2_CMD="docker exec -e MORI_RDMA_SL=3 -e MORI_RDMA_TC=96 -e MORI_SHMEM_MODE=ISOLATION -e SGLANG_USE_AITER=1 -e GPU_PER_NODE=8 $CONTAINER bash $SCRIPT --rank 1 --master-addr ${{ matrix.node1_host }} --ifname ${{ matrix.node2_ifname }} --cmd test --kernel-type async_ll --quant-type none --dtype bf16 --max-tokens $TOKENS"
+            ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} "$NODE2_CMD" &
+            docker exec \
+              -e MORI_RDMA_SL=3 -e MORI_RDMA_TC=96 \
+              -e MORI_SHMEM_MODE=ISOLATION \
+              -e SGLANG_USE_AITER=1 -e GPU_PER_NODE=8 \
+              $CONTAINER bash $SCRIPT \
+              --rank 0 --master-addr ${{ matrix.node1_host }} \
+              --ifname ${{ matrix.node1_ifname }} \
+              --cmd test --kernel-type async_ll \
+              --quant-type none --dtype bf16 --max-tokens $TOKENS
+            wait
+          done
+
       - name: Cleanup node1 container
         if: always()
         run: docker rm -f $CONTAINER || true
