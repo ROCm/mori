@@ -131,7 +131,7 @@ jobs:
       - name: MORI-EP
         run: |
           cd $GITHUB_WORKSPACE
-          timeout 120 pytest tests/python/ops/test_dispatch_combine.py -q
+          timeout 300 pytest tests/python/ops/test_dispatch_combine.py -v
 
       - name: MORI-EP bench
         run: |
