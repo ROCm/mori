@@ -73,11 +73,24 @@ static BenchResult runBench(const char* label, BenchFn fn,
     res.passed = false;
     res.avgMs = res.algoBw = res.busBw = 0.0;
 
+    uint32_t* outBuf = reinterpret_cast<uint32_t*>(verifyBuf);
+
+    // Warmup: 第一次调用可能因 L2 缓存残留导致 transit buffer 数据不正确
+    // 多次执行让 SDMA 写入的数据填充 L2 缓存
+    for (int w = 0; w < 3; w++) {
+        CHECK_HIP(hipMemcpy(inBuf, hostData.data(), bytesPerPe, hipMemcpyHostToDevice));
+        CHECK_HIP(hipDeviceSynchronize());
+        MPI_Barrier(MPI_COMM_WORLD);
+        fn(inBuf, outBuf, elemsPerPe, stream);
+        CHECK_HIP(hipStreamSynchronize(stream));
+        MPI_Barrier(MPI_COMM_WORLD);
+    }
+
+    // 验证
     CHECK_HIP(hipMemcpy(inBuf, hostData.data(), bytesPerPe, hipMemcpyHostToDevice));
     CHECK_HIP(hipDeviceSynchronize());
     MPI_Barrier(MPI_COMM_WORLD);
 
-    uint32_t* outBuf = reinterpret_cast<uint32_t*>(verifyBuf);
     bool ok = fn(inBuf, outBuf, elemsPerPe, stream);
     CHECK_HIP(hipStreamSynchronize(stream));
 
