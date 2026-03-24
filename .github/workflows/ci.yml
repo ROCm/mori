@@ -69,7 +69,9 @@ jobs:
           python -c "import mori; print('OK')"
       - name: Copy source to node2
         run: |
-          scp -P ${{ matrix.node2_port }} -r $GITHUB_WORKSPACE root@${{ matrix.node2_host }}:$GITHUB_WORKSPACE
+          ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} "mkdir -p $GITHUB_WORKSPACE"
+          rsync -az --exclude='.git' -e "ssh -p ${{ matrix.node2_port }}" \
+            $GITHUB_WORKSPACE/ root@${{ matrix.node2_host }}:$GITHUB_WORKSPACE/
       - name: Start container on node2
         run: |
           ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} "
