@@ -51,8 +51,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
-    outputs:
-      node2_workspace: ${{ steps.export-workspace.outputs.node2_workspace }}
     container:
       image: rocm/pytorch-private:mori_rocm7.2_ubuntu22.04_py3.10_pytorch_bnxt_ionic
       credentials:
@@ -61,52 +59,16 @@ jobs:
       options: >-
         --device=/dev/kfd --device=/dev/dri --device=/dev/infiniband
         --group-add video --ipc=host --privileged
-        -v /root/.ssh:/root/.ssh
     timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build and install mori (node1)
+      - name: Build and install mori
         run: BUILD_EXAMPLES=ON pip install .
 
-      - name: Verify installation (node1)
+      - name: Verify installation
         run: python -c "import mori; print('OK')"
-
-      - name: Copy source to node2
-        run: |
-          ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} \
-            "mkdir -p $GITHUB_WORKSPACE"
-          rsync -az --exclude='.git' \
-            -e "ssh -p ${{ matrix.node2_port }}" \
-            $GITHUB_WORKSPACE/ \
-            root@${{ matrix.node2_host }}:$GITHUB_WORKSPACE/
-
-      - name: Start container on node2
-        run: |
-          ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} "
-            echo '${{ secrets.DOCKER_PASSWORD }}' \
-              | docker login -u '${{ secrets.DOCKER_USERNAME }}' --password-stdin
-            docker rm -f mori_ci_${{ github.run_id }} 2>/dev/null || true
-            docker run -d \
-              --name mori_ci_${{ github.run_id }} \
-              --network=host \
-              --device=/dev/kfd --device=/dev/dri --device=/dev/infiniband \
-              --group-add video --ipc=host --privileged \
-              -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
-              rocm/pytorch-private:mori_rocm7.2_ubuntu22.04_py3.10_pytorch_bnxt_ionic \
-              sleep infinity
-          "
-
-      - name: Build and install mori (node2)
-        run: |
-          ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} \
-            "docker exec mori_ci_${{ github.run_id }} \
-             bash -c 'cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install .'"
-
-      - name: Export node2 workspace path
-        id: export-workspace
-        run: echo "node2_workspace=$GITHUB_WORKSPACE" >> $GITHUB_OUTPUT
 
   intranode-test:
     name: mori intranode test (platform:${{ matrix.platform }})
@@ -189,9 +151,6 @@ jobs:
     name: mori internode test (platform:${{ matrix.platform }})
     needs: [setup, build, intranode-test]
     if: needs.build.result == 'success'
-    # needs.build.outputs.node2_workspace is the GITHUB_WORKSPACE path inside
-    # the build job's container: context (e.g. /__w/mori/mori), which is also
-    # the path used when mounting into the node2 docker container.
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -221,28 +180,48 @@ jobs:
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
             $IMAGE sleep infinity
 
+      - name: Start container on node2
+        run: |
+          ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} "
+            echo '${{ secrets.DOCKER_PASSWORD }}' \
+              | docker login -u '${{ secrets.DOCKER_USERNAME }}' --password-stdin
+            docker rm -f $CONTAINER 2>/dev/null || true
+            mkdir -p $GITHUB_WORKSPACE
+            docker run -d \
+              --name $CONTAINER \
+              --network=host \
+              --device=/dev/kfd --device=/dev/dri --device=/dev/infiniband \
+              --group-add video --ipc=host --privileged \
+              -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
+              $IMAGE sleep infinity
+          "
+
+      - name: Sync source to node2
+        run: |
+          rsync -az --exclude='.git' \
+            -e "ssh -p ${{ matrix.node2_port }}" \
+            $GITHUB_WORKSPACE/ \
+            root@${{ matrix.node2_host }}:$GITHUB_WORKSPACE/
+
       - name: Install mori and deps (node1)
         run: |
           docker exec $CONTAINER \
-            bash -c "cd $GITHUB_WORKSPACE && \
-              BUILD_EXAMPLES=ON pip install . && \
-              pip install prettytable"
+            bash -c "cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install . && pip install prettytable"
 
-      - name: Install deps (node2)
+      - name: Install mori and deps (node2)
         run: |
           ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} \
-            "docker exec $CONTAINER pip install prettytable"
+            "docker exec $CONTAINER bash -c 'cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install . && pip install prettytable'"
 
       - name: MORI-EP internode normal kernel bench
         run: |
-          NODE1_SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
-          NODE2_SCRIPT="${{ needs.build.outputs.node2_workspace }}/tools/run_internode_test.sh"
+          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
           for KERNEL in v1 v1_ll; do
             for TOKENS in 64 128 1024 4096; do
               echo "=== bench kernel=$KERNEL max-tokens=$TOKENS ==="
-              NODE2_CMD="docker exec $CONTAINER bash $NODE2_SCRIPT --rank 1 --master-addr ${{ matrix.node1_host }} --ifname ${{ matrix.node2_ifname }} --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS"
+              NODE2_CMD="docker exec $CONTAINER bash $SCRIPT --rank 1 --master-addr ${{ matrix.node1_host }} --ifname ${{ matrix.node2_ifname }} --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS"
               ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} "$NODE2_CMD" &
-              docker exec $CONTAINER bash $NODE1_SCRIPT \
+              docker exec $CONTAINER bash $SCRIPT \
                 --rank 0 --master-addr ${{ matrix.node1_host }} \
                 --ifname ${{ matrix.node1_ifname }} \
                 --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS
@@ -252,14 +231,13 @@ jobs:
 
       - name: MORI-EP internode normal kernel stress
         run: |
-          NODE1_SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
-          NODE2_SCRIPT="${{ needs.build.outputs.node2_workspace }}/tools/run_internode_test.sh"
+          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
           for KERNEL in v1 v1_ll; do
             for TOKENS in 64 128 1024 4096; do
               echo "=== stress kernel=$KERNEL max-tokens=$TOKENS ==="
-              NODE2_CMD="docker exec $CONTAINER bash $NODE2_SCRIPT --rank 1 --master-addr ${{ matrix.node1_host }} --ifname ${{ matrix.node2_ifname }} --cmd stress --kernel-type $KERNEL --max-tokens $TOKENS"
+              NODE2_CMD="docker exec $CONTAINER bash $SCRIPT --rank 1 --master-addr ${{ matrix.node1_host }} --ifname ${{ matrix.node2_ifname }} --cmd stress --kernel-type $KERNEL --max-tokens $TOKENS"
               ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} "$NODE2_CMD" &
-              docker exec $CONTAINER bash $NODE1_SCRIPT \
+              docker exec $CONTAINER bash $SCRIPT \
                 --rank 0 --master-addr ${{ matrix.node1_host }} \
                 --ifname ${{ matrix.node1_ifname }} \
                 --cmd stress --kernel-type $KERNEL --max-tokens $TOKENS
