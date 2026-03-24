@@ -60,7 +60,7 @@ jobs:
       - name: Install mori
         run: |
           cd $GITHUB_WORKSPACE
-          BUILD_EXAMPLES=ON pip install .
+          BUILD_EXAMPLES=ON pip install . && pip install prettytable
 
       - name: MORI-EP
         run: |
