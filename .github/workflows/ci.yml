@@ -1,4 +1,4 @@
-name: mori
+name: MoRI CI test
 on:
   push:
     branches: [main]
@@ -51,6 +51,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+    outputs:
+      node2_workspace: ${{ steps.export-workspace.outputs.node2_workspace }}
     container:
       image: rocm/pytorch-private:mori_rocm7.2_ubuntu22.04_py3.10_pytorch_bnxt_ionic
       credentials:
@@ -101,6 +103,10 @@ jobs:
           ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} \
             "docker exec mori_ci_${{ github.run_id }} \
              bash -c 'cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install .'"
+
+      - name: Export node2 workspace path
+        id: export-workspace
+        run: echo "node2_workspace=$GITHUB_WORKSPACE" >> $GITHUB_OUTPUT
 
   intranode-test:
     name: mori intranode test (platform:${{ matrix.platform }})
@@ -183,6 +189,9 @@ jobs:
     name: mori internode test (platform:${{ matrix.platform }})
     needs: [setup, build, intranode-test]
     if: needs.build.result == 'success'
+    # needs.build.outputs.node2_workspace is the GITHUB_WORKSPACE path inside
+    # the build job's container: context (e.g. /__w/mori/mori), which is also
+    # the path used when mounting into the node2 docker container.
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -226,13 +235,14 @@ jobs:
 
       - name: MORI-EP internode normal kernel bench
         run: |
-          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
+          NODE1_SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
+          NODE2_SCRIPT="${{ needs.build.outputs.node2_workspace }}/tools/run_internode_test.sh"
           for KERNEL in v1 v1_ll; do
             for TOKENS in 64 128 1024 4096; do
               echo "=== bench kernel=$KERNEL max-tokens=$TOKENS ==="
-              NODE2_CMD="docker exec $CONTAINER bash $SCRIPT --rank 1 --master-addr ${{ matrix.node1_host }} --ifname ${{ matrix.node2_ifname }} --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS"
+              NODE2_CMD="docker exec $CONTAINER bash $NODE2_SCRIPT --rank 1 --master-addr ${{ matrix.node1_host }} --ifname ${{ matrix.node2_ifname }} --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS"
               ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} "$NODE2_CMD" &
-              docker exec $CONTAINER bash $SCRIPT \
+              docker exec $CONTAINER bash $NODE1_SCRIPT \
                 --rank 0 --master-addr ${{ matrix.node1_host }} \
                 --ifname ${{ matrix.node1_ifname }} \
                 --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS
@@ -242,13 +252,14 @@ jobs:
 
       - name: MORI-EP internode normal kernel stress
         run: |
-          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
+          NODE1_SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
+          NODE2_SCRIPT="${{ needs.build.outputs.node2_workspace }}/tools/run_internode_test.sh"
           for KERNEL in v1 v1_ll; do
             for TOKENS in 64 128 1024 4096; do
               echo "=== stress kernel=$KERNEL max-tokens=$TOKENS ==="
-              NODE2_CMD="docker exec $CONTAINER bash $SCRIPT --rank 1 --master-addr ${{ matrix.node1_host }} --ifname ${{ matrix.node2_ifname }} --cmd stress --kernel-type $KERNEL --max-tokens $TOKENS"
+              NODE2_CMD="docker exec $CONTAINER bash $NODE2_SCRIPT --rank 1 --master-addr ${{ matrix.node1_host }} --ifname ${{ matrix.node2_ifname }} --cmd stress --kernel-type $KERNEL --max-tokens $TOKENS"
               ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} "$NODE2_CMD" &
-              docker exec $CONTAINER bash $SCRIPT \
+              docker exec $CONTAINER bash $NODE1_SCRIPT \
                 --rank 0 --master-addr ${{ matrix.node1_host }} \
                 --ifname ${{ matrix.node1_ifname }} \
                 --cmd stress --kernel-type $KERNEL --max-tokens $TOKENS
