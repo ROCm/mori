@@ -311,7 +311,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             if (scatter_mode == 1) {
                 chunk_elems = total_count;
             } else {
-                chunk_elems = total_count / 8;
+                chunk_elems = total_count / 4;
             }
             if (chunk_elems < min_chunk)
                 chunk_elems = min_chunk;
@@ -329,6 +329,16 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             }
             copy_input_to_transit(input, total_count, stream);
             inputSymmObj = input_transit_buffer_obj_;
+        }
+
+        // SCATTER_MODE=0 uses double-buffer: 2x transit size
+        if (scatter_mode == 0) {
+            size_t required = 2 * total_count * dtype_size_;
+            if (!ensure_buffer_size(output_transit_buffer_, output_transit_buffer_ptr_,
+                                    output_transit_buffer_size_, output_transit_buffer_obj_,
+                                    required, "output transit buffer")) {
+                return false;
+            }
         }
 
         if (scatter_mode == 1) {
@@ -349,7 +359,25 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         }
 
         if (copy_output_to_user_) {
-            copy_output_to_user(output, total_count, stream);
+            if (scatter_mode == 0) {
+                size_t reduce_offset = total_count * dtype_size_;
+                hipError_t cpErr = stream
+                    ? hipMemcpyAsync(output,
+                          static_cast<char*>(output_transit_buffer_) + reduce_offset,
+                          total_count * dtype_size_,
+                          hipMemcpyDeviceToDevice, stream)
+                    : hipMemcpy(output,
+                          static_cast<char*>(output_transit_buffer_) + reduce_offset,
+                          total_count * dtype_size_,
+                          hipMemcpyDeviceToDevice);
+                if (cpErr != hipSuccess) {
+                    fprintf(stderr, "PE %d: copy from reduce region failed: %s\n",
+                            myPe_, hipGetErrorString(cpErr));
+                    return false;
+                }
+            } else {
+                copy_output_to_user(output, total_count, stream);
+            }
         }
     } catch (const std::exception& e) {
         fprintf(stderr, "PE %d: PipelinedAllReduce failed: %s\n", myPe_, e.what());
