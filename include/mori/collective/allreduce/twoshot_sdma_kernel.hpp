@@ -40,11 +40,12 @@ struct alignas(128) RSBarrierSignal {
   alignas(128) uint32_t flag[kRSMaxBlocks];
 };
 
-// Lightweight barrier for SdmaReduceScatterKernel.
+// Lightweight barrier for SdmaReduceScatterKernel / PipelinedAllReduceSdmaKernel.
 // Block 0 does the SDMA scatter + wait, then device-scope broadcasts to
 // all other blocks.  Device-side generation counter → graph-safe.
 struct alignas(128) CrossPeBarrier {
-  alignas(128) uint32_t flag;
+  uint32_t flag;
+  uint32_t ag_sync;   // monotonic counter for all-blocks → block-0 gather barrier
 };
 
 inline int getDeviceMaxBlocks() {

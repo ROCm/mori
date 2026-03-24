@@ -298,9 +298,18 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         if (blocks < 1) blocks = 1;
 
         if (chunk_elems == 0) {
-            chunk_elems = total_count / 16;
-            if (chunk_elems < static_cast<size_t>(pack_size * npes_))
-                chunk_elems = pack_size * npes_;
+            size_t min_chunk = std::max<size_t>(
+                static_cast<size_t>(pack_size) * npes_,
+                (512ULL * 1024 / dtype_size_) * npes_);
+            if (scatter_mode == 1) {
+                // P2P: 1 chunk optimal (bidirectional xGMI, no scatter overhead)
+                chunk_elems = total_count;
+            } else {
+                // SDMA: 2 chunks — minimal overhead while overlapping scatter DMA
+                chunk_elems = total_count / 2;
+            }
+            if (chunk_elems < min_chunk)
+                chunk_elems = min_chunk;
         }
         size_t align = static_cast<size_t>(pack_size * npes_);
         chunk_elems = ((chunk_elems + align - 1) / align) * align;
