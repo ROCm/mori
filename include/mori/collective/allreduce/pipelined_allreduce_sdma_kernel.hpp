@@ -68,14 +68,13 @@ __global__ void PipelinedAllReduceSdmaKernel(
   const uint32_t numQ = dstMemObj->sdmaNumQueue;
   const int compBlocks = static_cast<int>(gridDim.x) - 1;
 
-  // ---- Signal baselines (block 0 reads, compute blocks read their own) ----
+  // ---- Signal baselines ----
   __shared__ uint64_t s_scatter_base;
   __shared__ uint64_t s_ag_base;
   __shared__ uint64_t s_rd_base;
-  __shared__ uint32_t s_bd_base;  // block_done baseline for multi-invocation
+  __shared__ uint32_t s_bd_base;
 
   if (threadIdx.x == 0) {
-    s_scatter_base = 0;
     s_ag_base = 0;
     s_rd_base = 0;
     if (blockIdx.x == 0 && compBlocks > 0) {
@@ -87,23 +86,23 @@ __global__ void PipelinedAllReduceSdmaKernel(
     } else {
       s_bd_base = 0;
     }
-  }
-  __syncthreads();
-
-  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    // ALL blocks read scatter base (compute blocks need it for scatter polling).
+    // Block 0 additionally reads ag_base and rd_base.
     for (int i = 0; i < npes; ++i) {
       if (i != myPe) {
         s_scatter_base = core::AtomicLoadRelaxed(
             dstMemObj->signalPtrs + static_cast<size_t>(i) * numQ + 0);
-        s_ag_base = core::AtomicLoadRelaxed(
-            dstMemObj->signalPtrs + static_cast<size_t>(i) * numQ + 1);
-        s_rd_base = core::AtomicLoadRelaxed(
-            dstMemObj->signalPtrs + static_cast<size_t>(i) * numQ + 2);
+        if (blockIdx.x == 0) {
+          s_ag_base = core::AtomicLoadRelaxed(
+              dstMemObj->signalPtrs + static_cast<size_t>(i) * numQ + 1);
+          s_rd_base = core::AtomicLoadRelaxed(
+              dstMemObj->signalPtrs + static_cast<size_t>(i) * numQ + 2);
+        }
         break;
       }
     }
   }
-  if (blockIdx.x == 0) __syncthreads();
+  __syncthreads();
 
   const uint64_t scatterBase = s_scatter_base;
   const uint64_t agBase = s_ag_base;
