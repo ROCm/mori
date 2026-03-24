@@ -145,7 +145,7 @@ void testPipelinedAllreduce() {
     int npes = ShmemNPes();
 
     // 测试数据大小：4MB, 16MB, 32MB, 64MB, 128MB, 256MB (per PE)
-    std::vector<size_t> dataSizesMB = {32};
+    std::vector<size_t> dataSizesMB = {32, 64, 128, 256};
 
     // 测试 chunk 大小：128KB, 512KB, 1MB, 2MB, 4MB, 8MB
     std::vector<size_t> chunkSizesKB = {128, 512, 1024, 2048, 4096, 8192};
@@ -209,21 +209,7 @@ void testPipelinedAllreduce() {
             std::vector<uint32_t> result(elemsPerPe);
             CHECK_HIP(hipMemcpy(result.data(), transitBuf, bytesPerPe, hipMemcpyDeviceToHost));
 
-            if (myPe == 0) {
-                printf("  DEBUG PE 0: first 16 values from transit buffer:\n  ");
-                for (int d = 0; d < 16; d++) printf("%u ", result[d]);
-                printf("\n  expected: %u\n", computeExpected(npes));
-                // Also check input
-                std::vector<uint32_t> inCheck(16);
-                CHECK_HIP(hipMemcpy(inCheck.data(), inBuf, 16 * sizeof(uint32_t), hipMemcpyDeviceToHost));
-                printf("  DEBUG PE 0: first 16 input values: ");
-                for (int d = 0; d < 16; d++) printf("%u ", inCheck[d]);
-                printf("\n");
-            }
-
             bool ok = verifyResult(result.data(), elemsPerPe, computeExpected(npes), myPe);
-            printf("PE %d: verify %s (first val=%u, expected=%u)\n",
-                   myPe, ok ? "PASS" : "FAIL", result[0], computeExpected(npes));
 
             int lok = ok ? 1 : 0, gok = 0;
             MPI_Allreduce(&lok, &gok, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
@@ -269,9 +255,6 @@ void testPipelinedAllreduce() {
             CHECK_HIP(hipFree(outBuf));
         }
 
-        // TODO: Pipeline 测试暂时禁用，先确认串行模式正确性
-        // 确认后取消注释以下代码块
-#if 0
         // 2) Pipeline SDMA scatter 模式，遍历不同 chunk 大小
         for (size_t chunkKB : chunkSizesKB) {
             size_t chunkBytes = chunkKB * 1024;
@@ -313,7 +296,6 @@ void testPipelinedAllreduce() {
             }
             allResults.push_back(res);
         }
-#endif
 
         ar.reset();
         CHECK_HIP(hipFree(inBuf));
