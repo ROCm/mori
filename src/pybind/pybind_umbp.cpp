@@ -93,13 +93,18 @@ void RegisterMoriUmbp(py::module_& m) {
 
   py::class_<UMBPConfig>(m, "UMBPConfig")
       .def(py::init<>())
+      .def_static("from_environment", &UMBPConfig::FromEnvironment)
       .def_readwrite("dram", &UMBPConfig::dram)
       .def_readwrite("ssd", &UMBPConfig::ssd)
       .def_readwrite("eviction", &UMBPConfig::eviction)
       .def_readwrite("copy_pipeline", &UMBPConfig::copy_pipeline)
       .def_readwrite("role", &UMBPConfig::role)
       .def_readwrite("follower_mode", &UMBPConfig::follower_mode)
-      .def_readwrite("force_ssd_copy_on_write", &UMBPConfig::force_ssd_copy_on_write);
+      .def_readwrite("force_ssd_copy_on_write", &UMBPConfig::force_ssd_copy_on_write)
+      .def_readwrite("ssd_backend", &UMBPConfig::ssd_backend)
+      .def_readwrite("spdk_nvme_pci_addr", &UMBPConfig::spdk_nvme_pci_addr)
+      .def_readwrite("spdk_proxy_shm_name", &UMBPConfig::spdk_proxy_shm_name)
+      .def_readwrite("spdk_proxy_startup_timeout_ms", &UMBPConfig::spdk_proxy_startup_timeout_ms);
 
   py::class_<UMBPClient>(m, "UMBPClient")
       .def(py::init<const UMBPConfig&>(), py::arg("config") = UMBPConfig{})

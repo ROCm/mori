@@ -32,16 +32,14 @@ add_test(NAME test_ssd_tier COMMAND test_ssd_tier)
 add_executable(bench_umbp bench_umbp.cpp)
 target_link_libraries(bench_umbp PRIVATE umbp_core)
 
-if(UNIX)
-  add_executable(bench_umbp_spdk bench_umbp_spdk.cpp)
-  target_link_libraries(bench_umbp_spdk PRIVATE umbp_core)
-
-  if(TARGET spdk_proxy)
-    add_dependencies(bench_umbp_spdk spdk_proxy)
-    add_custom_command(TARGET bench_umbp_spdk POST_BUILD
-      COMMAND ${CMAKE_COMMAND} -E create_symlink
-              $<TARGET_FILE:spdk_proxy>
-              $<TARGET_FILE_DIR:bench_umbp_spdk>/spdk_proxy
-      COMMENT "Symlink spdk_proxy next to bench_umbp_spdk")
-  endif()
+# When spdk_proxy is available, symlink it next to bench_umbp so that
+# LocalStorageManager::SpawnProxyDaemon() can find the binary.
+if(TARGET spdk_proxy)
+  add_dependencies(bench_umbp spdk_proxy)
+  add_custom_command(
+    TARGET bench_umbp
+    POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E create_symlink $<TARGET_FILE:spdk_proxy>
+            $<TARGET_FILE_DIR:bench_umbp>/spdk_proxy
+    COMMENT "Symlink spdk_proxy next to bench_umbp")
 endif()

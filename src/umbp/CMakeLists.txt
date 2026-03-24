@@ -1,19 +1,26 @@
 # ---------------------------------------------------------------------------
-# SPDK auto-detection: try pkg-config, enable if found.
-# Set SPDK_PKG_CONFIG_PATH to override search path for non-standard installs.
-# Set USE_SPDK=OFF to force-disable even if SPDK is installed.
+# SPDK auto-detection: try pkg-config, enable if found. Search order: 1.
+# SPDK_PKG_CONFIG_PATH (user override) 2. System pkg-config paths (e.g.
+# /usr/local/lib/pkgconfig) 3. 3rdparty/spdk/build/lib/pkgconfig (local
+# submodule build) Set USE_SPDK=OFF to force-disable even if SPDK is installed.
 # ---------------------------------------------------------------------------
-set(SPDK_PKG_CONFIG_PATH "" CACHE STRING "Custom pkg-config path for SPDK")
+set(SPDK_PKG_CONFIG_PATH
+    ""
+    CACHE STRING "Custom pkg-config path for SPDK")
 option(USE_SPDK "Enable SPDK support (auto-detected by default)" ON)
 
 set(HAVE_SPDK FALSE)
 if(USE_SPDK)
   find_package(PkgConfig QUIET)
   if(PkgConfig_FOUND)
+    # Save and restore PKG_CONFIG_PATH so we don't leak changes.
+    set(_spdk_orig_pc_path "$ENV{PKG_CONFIG_PATH}")
+
     if(SPDK_PKG_CONFIG_PATH)
-      set(ENV{PKG_CONFIG_PATH} "${SPDK_PKG_CONFIG_PATH}:$ENV{PKG_CONFIG_PATH}")
+      set(ENV{PKG_CONFIG_PATH} "${SPDK_PKG_CONFIG_PATH}:${_spdk_orig_pc_path}")
     endif()
 
+    # Try 1: system / user-specified pkg-config paths
     execute_process(
       COMMAND pkg-config --cflags spdk_event spdk_event_bdev spdk_env_dpdk
       OUTPUT_VARIABLE SPDK_CFLAGS
@@ -21,7 +28,8 @@ if(USE_SPDK)
       RESULT_VARIABLE SPDK_CFLAGS_RC
       ERROR_QUIET)
     execute_process(
-      COMMAND pkg-config --libs --static spdk_event spdk_event_bdev spdk_env_dpdk
+      COMMAND pkg-config --libs --static spdk_event spdk_event_bdev
+              spdk_env_dpdk
       OUTPUT_VARIABLE SPDK_LDFLAGS
       OUTPUT_STRIP_TRAILING_WHITESPACE
       RESULT_VARIABLE SPDK_LDFLAGS_RC
@@ -30,6 +38,35 @@ if(USE_SPDK)
     if(SPDK_CFLAGS_RC EQUAL 0 AND SPDK_LDFLAGS_RC EQUAL 0)
       set(HAVE_SPDK TRUE)
     endif()
+
+    # Try 2: fallback to 3rdparty/spdk local build (from tools/setup_spdk.sh)
+    if(NOT HAVE_SPDK)
+      set(_spdk_3rdparty_pc
+          "${CMAKE_CURRENT_SOURCE_DIR}/../../3rdparty/spdk/build/lib/pkgconfig")
+      get_filename_component(_spdk_3rdparty_pc "${_spdk_3rdparty_pc}" ABSOLUTE)
+      if(EXISTS "${_spdk_3rdparty_pc}/spdk_event.pc")
+        set(ENV{PKG_CONFIG_PATH} "${_spdk_3rdparty_pc}:${_spdk_orig_pc_path}")
+        execute_process(
+          COMMAND pkg-config --cflags spdk_event spdk_event_bdev spdk_env_dpdk
+          OUTPUT_VARIABLE SPDK_CFLAGS
+          OUTPUT_STRIP_TRAILING_WHITESPACE
+          RESULT_VARIABLE SPDK_CFLAGS_RC
+          ERROR_QUIET)
+        execute_process(
+          COMMAND pkg-config --libs --static spdk_event spdk_event_bdev
+                  spdk_env_dpdk
+          OUTPUT_VARIABLE SPDK_LDFLAGS
+          OUTPUT_STRIP_TRAILING_WHITESPACE
+          RESULT_VARIABLE SPDK_LDFLAGS_RC
+          ERROR_QUIET)
+        if(SPDK_CFLAGS_RC EQUAL 0 AND SPDK_LDFLAGS_RC EQUAL 0)
+          set(HAVE_SPDK TRUE)
+          message(STATUS "[UMBP] SPDK found via 3rdparty/spdk local build")
+        endif()
+      endif()
+    endif()
+
+    set(ENV{PKG_CONFIG_PATH} "${_spdk_orig_pc_path}")
   endif()
 
   if(HAVE_SPDK)
@@ -37,39 +74,39 @@ if(USE_SPDK)
     message(STATUS "[UMBP] SPDK CFLAGS: ${SPDK_CFLAGS}")
     message(STATUS "[UMBP] SPDK LDFLAGS: ${SPDK_LDFLAGS}")
   else()
-    message(STATUS "[UMBP] SPDK not found via pkg-config — SPDK support DISABLED (POSIX only)")
+    message(STATUS "[UMBP] SPDK not found — SPDK support DISABLED (POSIX only)")
+    message(
+      STATUS "[UMBP]   To enable: run tools/setup_spdk.sh, then reconfigure.")
   endif()
 endif()
 
 # Core static library
 set(UMBP_CORE_SRCS
-  local/block_index/local_block_index.cpp
-  local/storage/io/storage_io_driver.cpp
-  local/storage/io/posix_storage_io_driver.cpp
-  local/storage/io/io_uring_storage_io_driver.cpp
-  local/storage/copy_pipeline.cpp
-  local/storage/segment/segment_format.cpp
-  local/storage/segment/segment_index.cpp
-  local/storage/segment/segment_scanner.cpp
-  local/storage/segment/segment_writer.cpp
-  local/storage/tier_backend.cpp
-  local/storage/dram_tier.cpp
-  local/storage/ssd_tier.cpp
-  local/storage/local_storage_manager.cpp
-  local/umbp_client.cpp
-  allocator/offset_allocator.cpp)
+    local/block_index/local_block_index.cpp
+    local/storage/io/storage_io_driver.cpp
+    local/storage/io/posix_storage_io_driver.cpp
+    local/storage/io/io_uring_storage_io_driver.cpp
+    local/storage/copy_pipeline.cpp
+    local/storage/segment/segment_format.cpp
+    local/storage/segment/segment_index.cpp
+    local/storage/segment/segment_scanner.cpp
+    local/storage/segment/segment_writer.cpp
+    local/storage/tier_backend.cpp
+    local/storage/dram_tier.cpp
+    local/storage/ssd_tier.cpp
+    local/storage/local_storage_manager.cpp
+    local/umbp_client.cpp
+    allocator/offset_allocator.cpp)
 
 # SPDK Proxy client (shared memory IPC, no SPDK dependency — Linux only)
 if(UNIX)
-  list(APPEND UMBP_CORE_SRCS
-    proxy/spdk_proxy_shm.cpp
-    local/storage/spdk_proxy_tier.cpp)
+  list(APPEND UMBP_CORE_SRCS proxy/spdk_proxy_shm.cpp
+       local/storage/spdk_proxy_tier.cpp)
 endif()
 
 if(HAVE_SPDK)
-  list(APPEND UMBP_CORE_SRCS
-    local/storage/spdk/spdk_env.cpp
-    local/storage/spdk_ssd_tier.cpp)
+  list(APPEND UMBP_CORE_SRCS local/storage/spdk/spdk_env.cpp
+       local/storage/spdk_ssd_tier.cpp)
 endif()
 
 add_library(umbp_core STATIC ${UMBP_CORE_SRCS})
@@ -85,15 +122,33 @@ if(HAVE_SPDK)
   target_compile_options(umbp_core PUBLIC ${SPDK_CFLAGS_LIST})
 
   separate_arguments(SPDK_LDFLAGS_LIST UNIX_COMMAND "${SPDK_LDFLAGS}")
-  target_link_libraries(umbp_core PUBLIC
-    -Wl,--whole-archive ${SPDK_LDFLAGS_LIST} -Wl,--no-whole-archive
-    -lisal -lisal_crypto -lssl -lcrypto -lfuse3 -lnuma -ldl -lrt -luuid -lm -laio -lpthread -lelf)
+  target_link_libraries(
+    umbp_core
+    PUBLIC -Wl,--whole-archive
+           ${SPDK_LDFLAGS_LIST}
+           -Wl,--no-whole-archive
+           -lisal
+           -lisal_crypto
+           -lssl
+           -lcrypto
+           -lfuse3
+           -lnuma
+           -ldl
+           -lrt
+           -luuid
+           -lm
+           -laio
+           -lpthread
+           -lelf)
 
   # SPDK test executables
-  add_executable(test_spdk_env ${CMAKE_SOURCE_DIR}/tests/cpp/umbp/local/test_spdk_env.cpp)
+  add_executable(test_spdk_env
+                 ${CMAKE_SOURCE_DIR}/tests/cpp/umbp/local/test_spdk_env.cpp)
   target_link_libraries(test_spdk_env PRIVATE umbp_core)
 
-  add_executable(test_spdk_ssd_tier ${CMAKE_SOURCE_DIR}/tests/cpp/umbp/local/test_spdk_ssd_tier.cpp)
+  add_executable(
+    test_spdk_ssd_tier
+    ${CMAKE_SOURCE_DIR}/tests/cpp/umbp/local/test_spdk_ssd_tier.cpp)
   target_link_libraries(test_spdk_ssd_tier PRIVATE umbp_core)
 
   # SPDK benchmark
@@ -115,7 +170,8 @@ if(UNIX)
   target_link_libraries(umbp_bench PRIVATE umbp_core)
 
   # E2E integration test (one command, all backends)
-  add_executable(test_umbp_e2e ${CMAKE_SOURCE_DIR}/tests/cpp/umbp/local/test_umbp_e2e.cpp)
+  add_executable(test_umbp_e2e
+                 ${CMAKE_SOURCE_DIR}/tests/cpp/umbp/local/test_umbp_e2e.cpp)
   target_link_libraries(test_umbp_e2e PRIVATE umbp_core)
 endif()
 
@@ -145,7 +201,10 @@ if(Protobuf_FOUND)
     find_library(GRPC_LIBRARY NAMES grpc QUIET)
     find_library(GPR_LIBRARY NAMES gpr QUIET)
 
-    if(GRPC_INCLUDE_DIR AND GRPCPP_LIBRARY AND GRPC_LIBRARY AND GPR_LIBRARY)
+    if(GRPC_INCLUDE_DIR
+       AND GRPCPP_LIBRARY
+       AND GRPC_LIBRARY
+       AND GPR_LIBRARY)
       add_library(gRPC::grpc++ UNKNOWN IMPORTED)
       set_target_properties(
         gRPC::grpc++
@@ -161,7 +220,9 @@ endif()
 if(HAVE_GRPC)
   find_library(_PROTOBUF_LIB NAMES protobuf libprotobuf QUIET)
   if(NOT _PROTOBUF_LIB)
-    message(WARNING "[UMBP] libprotobuf not found — disabling distributed control plane.")
+    message(
+      WARNING
+        "[UMBP] libprotobuf not found — disabling distributed control plane.")
     set(HAVE_GRPC FALSE)
   endif()
 endif()
@@ -172,7 +233,10 @@ if(HAVE_GRPC)
   find_path(_PROTOBUF_INCLUDE_DIR google/protobuf/message.h
             HINTS "${_PROTOBUF_PREFIX}/include" QUIET)
   if(NOT _PROTOBUF_INCLUDE_DIR)
-    message(WARNING "[UMBP] protobuf headers not found — disabling distributed control plane.")
+    message(
+      WARNING
+        "[UMBP] protobuf headers not found — disabling distributed control plane."
+    )
     set(HAVE_GRPC FALSE)
   endif()
 endif()
@@ -188,7 +252,8 @@ if(HAVE_GRPC)
     find_program(_PROTOBUF_PROTOC protoc HINTS "${_PROTOBUF_PREFIX}/bin" QUIET)
   endif()
   if(NOT _PROTOBUF_PROTOC)
-    message(WARNING "[UMBP] protoc not found — disabling distributed control plane.")
+    message(
+      WARNING "[UMBP] protoc not found — disabling distributed control plane.")
     set(HAVE_GRPC FALSE)
   endif()
 endif()
@@ -201,7 +266,10 @@ if(HAVE_GRPC)
   else()
     find_program(_GRPC_CPP_PLUGIN grpc_cpp_plugin QUIET)
     if(NOT _GRPC_CPP_PLUGIN)
-      message(WARNING "[UMBP] grpc_cpp_plugin not found — disabling distributed control plane.")
+      message(
+        WARNING
+          "[UMBP] grpc_cpp_plugin not found — disabling distributed control plane."
+      )
       set(HAVE_GRPC FALSE)
     endif()
   endif()
@@ -213,11 +281,12 @@ if(HAVE_GRPC)
   execute_process(
     COMMAND ${_PROTOBUF_PROTOC} --version
     OUTPUT_VARIABLE _PROTOC_VERSION_OUTPUT
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET
+    OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET
     RESULT_VARIABLE _PROTOC_RC)
   if(NOT _PROTOC_RC EQUAL 0)
-    message(WARNING "[UMBP] protoc failed to run — disabling distributed control plane.")
+    message(
+      WARNING
+        "[UMBP] protoc failed to run — disabling distributed control plane.")
     set(HAVE_GRPC FALSE)
   else()
     string(REGEX MATCH "[0-9]+\\.[0-9]+" _PROTOC_MM "${_PROTOC_VERSION_OUTPUT}")
@@ -236,22 +305,35 @@ if(HAVE_GRPC)
     if(NOT _PROTOBUF_MM)
       # Fallback to cmake-provided version
       if(DEFINED Protobuf_VERSION)
-        string(REGEX MATCH "^[0-9]+\\.[0-9]+" _PROTOBUF_MM "${Protobuf_VERSION}")
+        string(REGEX MATCH "^[0-9]+\\.[0-9]+" _PROTOBUF_MM
+                     "${Protobuf_VERSION}")
       endif()
     endif()
-    message(STATUS "[UMBP] protoc version: ${_PROTOC_VERSION_OUTPUT} (${_PROTOC_MM}), libprotobuf headers: ${_PROTOBUF_MM}")
-    if(_PROTOC_MM AND _PROTOBUF_MM AND NOT _PROTOC_MM STREQUAL _PROTOBUF_MM)
-      message(WARNING "[UMBP] protoc ${_PROTOC_MM} vs libprotobuf ${_PROTOBUF_MM} mismatch — disabling distributed control plane.")
+    message(
+      STATUS
+        "[UMBP] protoc version: ${_PROTOC_VERSION_OUTPUT} (${_PROTOC_MM}), libprotobuf headers: ${_PROTOBUF_MM}"
+    )
+    if(_PROTOC_MM
+       AND _PROTOBUF_MM
+       AND NOT _PROTOC_MM STREQUAL _PROTOBUF_MM)
+      message(
+        WARNING
+          "[UMBP] protoc ${_PROTOC_MM} vs libprotobuf ${_PROTOBUF_MM} mismatch — disabling distributed control plane."
+      )
       set(HAVE_GRPC FALSE)
     elseif(NOT _PROTOBUF_MM)
-      message(WARNING "[UMBP] cannot determine libprotobuf header version — disabling distributed control plane.")
+      message(
+        WARNING
+          "[UMBP] cannot determine libprotobuf header version — disabling distributed control plane."
+      )
       set(HAVE_GRPC FALSE)
     endif()
   endif()
 endif()
 
 if(HAVE_GRPC)
-  message(STATUS "[UMBP] gRPC + Protobuf found — distributed control plane ENABLED")
+  message(
+    STATUS "[UMBP] gRPC + Protobuf found — distributed control plane ENABLED")
   message(STATUS "UMBP protobuf lib: ${_PROTOBUF_LIBS}")
   message(STATUS "UMBP protoc: ${_PROTOBUF_PROTOC}")
 
@@ -285,8 +367,8 @@ if(HAVE_GRPC)
     VERBATIM)
 
   add_custom_command(
-    OUTPUT ${UMBP_PEER_PROTO_SRCS} ${UMBP_PEER_PROTO_HDRS} ${UMBP_PEER_GRPC_SRCS}
-           ${UMBP_PEER_GRPC_HDRS}
+    OUTPUT ${UMBP_PEER_PROTO_SRCS} ${UMBP_PEER_PROTO_HDRS}
+           ${UMBP_PEER_GRPC_SRCS} ${UMBP_PEER_GRPC_HDRS}
     COMMAND
       ${_PROTOBUF_PROTOC} --proto_path=${UMBP_PROTO_DIR}
       --cpp_out=${UMBP_PROTO_GEN_DIR} --grpc_out=${UMBP_PROTO_GEN_DIR}
@@ -315,12 +397,11 @@ if(HAVE_GRPC)
     distributed/pool_client.cpp)
 
   target_include_directories(
-    umbp_common
-    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
-           ${UMBP_PROTO_GEN_DIR}
-           ${_PROTOBUF_INCLUDE_DIR})
+    umbp_common PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+                       ${UMBP_PROTO_GEN_DIR} ${_PROTOBUF_INCLUDE_DIR})
 
-  target_include_directories(umbp_common BEFORE PUBLIC "${_PROTOBUF_INCLUDE_DIR}")
+  target_include_directories(umbp_common BEFORE
+                             PUBLIC "${_PROTOBUF_INCLUDE_DIR}")
 
   target_link_libraries(umbp_common PUBLIC mori_logging mori_io)
 
@@ -354,7 +435,10 @@ if(HAVE_GRPC)
                                                  ${_GRPCPP_LIB})
 
 else()
-  message(WARNING "[UMBP] gRPC/Protobuf not found — distributed control plane DISABLED.\n"
-    "  Targets umbp_master/umbp_client/umbp_pool_client will NOT be available.\n"
-    "  Install gRPC + Protobuf to enable. Local SPDK/POSIX targets are unaffected.")
+  message(
+    WARNING
+      "[UMBP] gRPC/Protobuf not found — distributed control plane DISABLED.\n"
+      "  Targets umbp_master/umbp_client/umbp_pool_client will NOT be available.\n"
+      "  Install gRPC + Protobuf to enable. Local SPDK/POSIX targets are unaffected."
+  )
 endif()
