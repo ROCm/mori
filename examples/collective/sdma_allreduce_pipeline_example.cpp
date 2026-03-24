@@ -208,6 +208,19 @@ void testPipelinedAllreduce() {
             void* transitBuf = ar->getOutputTransitBuffer();
             std::vector<uint32_t> result(elemsPerPe);
             CHECK_HIP(hipMemcpy(result.data(), transitBuf, bytesPerPe, hipMemcpyDeviceToHost));
+
+            if (myPe == 0) {
+                printf("  DEBUG PE 0: first 16 values from transit buffer:\n  ");
+                for (int d = 0; d < 16; d++) printf("%u ", result[d]);
+                printf("\n  expected: %u\n", computeExpected(npes));
+                // Also check input
+                std::vector<uint32_t> inCheck(16);
+                CHECK_HIP(hipMemcpy(inCheck.data(), inBuf, 16 * sizeof(uint32_t), hipMemcpyDeviceToHost));
+                printf("  DEBUG PE 0: first 16 input values: ");
+                for (int d = 0; d < 16; d++) printf("%u ", inCheck[d]);
+                printf("\n");
+            }
+
             bool ok = verifyResult(result.data(), elemsPerPe, computeExpected(npes), myPe);
 
             int lok = ok ? 1 : 0, gok = 0;
