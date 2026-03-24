@@ -21,6 +21,7 @@
 // SOFTWARE.
 #include "src/io/xgmi/backend_impl.hpp"
 
+#include <errno.h>
 #include <limits.h>
 #include <unistd.h>
 
@@ -43,8 +44,20 @@ int getScatterGatherKernelThreshold() {
   static const int threshold = []() {
     const char* env = std::getenv("MORI_IO_XGMI_SCATTER_GATHER_THRESHOLD");
     if (env != nullptr && env[0] != '\0') {
-      int val = std::atoi(env);
-      if (val >= 0) return val;
+      errno = 0;
+      char* end = nullptr;
+      long val = std::strtol(env, &end, 10);
+      if (errno == 0 && end != env && *end == '\0' && val >= 0 && val <= INT_MAX) {
+        MORI_IO_WARN(
+            "XGMI: Experimental scatter/gather batch-copy optimization enabled via "
+            "MORI_IO_XGMI_SCATTER_GATHER_THRESHOLD={}.",
+            val);
+        return static_cast<int>(val);
+      }
+      MORI_IO_WARN(
+          "XGMI: Ignoring invalid MORI_IO_XGMI_SCATTER_GATHER_THRESHOLD='{}'. "
+          "Scatter/gather remains disabled.",
+          env);
     }
     return INT_MAX;
   }();
@@ -288,9 +301,9 @@ void XgmiBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
 
       err = hipGetLastError();
       if (err != hipSuccess) {
-        status->Update(StatusCode::ERR_GPU_OP,
-                       std::string("XGMI: scatter/gather kernel launch failed: ") +
-                           hipGetErrorString(err));
+        status->Update(
+            StatusCode::ERR_GPU_OP,
+            std::string("XGMI: scatter/gather kernel launch failed: ") + hipGetErrorString(err));
         (void)hipFree(dMeta);
         eventPool->PutEvent(event, kernelDevice);
         return;
@@ -312,15 +325,13 @@ void XgmiBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
           status->SetCode(StatusCode::SUCCESS);
         } else {
           status->Update(StatusCode::ERR_GPU_OP,
-                         std::string("XGMI: hipEventSynchronize failed: ") +
-                             hipGetErrorString(e));
+                         std::string("XGMI: hipEventSynchronize failed: ") + hipGetErrorString(e));
         }
         (void)hipFree(dMeta);
         pool->PutEvent(event, kernelDevice);
       });
-      MORI_IO_TRACE(
-          "XGMI: Batch transfer via scatter/gather kernel, id={}, segments={}, isRead={}", id,
-          numSegs, isRead);
+      MORI_IO_TRACE("XGMI: Batch transfer via scatter/gather kernel, id={}, segments={}, isRead={}",
+                    id, numSegs, isRead);
       return;
     }
   }
@@ -643,9 +654,9 @@ XgmiBackendSession* XgmiBackend::GetOrCreateSessionCached(const MemoryDesc& loca
                  remoteDevice);
   }
 
-  auto sess = std::make_unique<XgmiBackendSession>(config, localAddr, remoteAddr, localDevice,
-                                                   remoteDevice, ipcSession, streamPool.get(),
-                                                   eventPool.get());
+  auto sess =
+      std::make_unique<XgmiBackendSession>(config, localAddr, remoteAddr, localDevice, remoteDevice,
+                                           ipcSession, streamPool.get(), eventPool.get());
 
   XgmiBackendSession* rawPtr = sess.get();
   sessionCache[key] = std::move(sess);
