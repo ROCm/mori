@@ -33,23 +33,21 @@
 
 #include "src/io/xgmi/scatter_gather_kernel.hpp"
 
-#define HIP_CHECK(cmd)                                                         \
-  do {                                                                         \
-    hipError_t err = (cmd);                                                    \
-    if (err != hipSuccess) {                                                   \
-      fprintf(stderr, "HIP error at %s:%d: %s\n", __FILE__, __LINE__,         \
-              hipGetErrorString(err));                                          \
-      assert(false);                                                           \
-    }                                                                          \
+#define HIP_CHECK(cmd)                                                                         \
+  do {                                                                                         \
+    hipError_t err = (cmd);                                                                    \
+    if (err != hipSuccess) {                                                                   \
+      fprintf(stderr, "HIP error at %s:%d: %s\n", __FILE__, __LINE__, hipGetErrorString(err)); \
+      assert(false);                                                                           \
+    }                                                                                          \
   } while (0)
 
 // --------------------------------------------------------------------------
 // Naive baseline: one hipMemcpyAsync per segment
 // --------------------------------------------------------------------------
-static void NaiveBatchCopy(char* dst, const char* src,
-                           const std::vector<size_t>& srcOffsets,
-                           const std::vector<size_t>& dstOffsets,
-                           const std::vector<size_t>& sizes, hipStream_t stream) {
+static void NaiveBatchCopy(char* dst, const char* src, const std::vector<size_t>& srcOffsets,
+                           const std::vector<size_t>& dstOffsets, const std::vector<size_t>& sizes,
+                           hipStream_t stream) {
   for (size_t i = 0; i < sizes.size(); ++i) {
     HIP_CHECK(hipMemcpyAsync(dst + dstOffsets[i], src + srcOffsets[i], sizes[i],
                              hipMemcpyDeviceToDevice, stream));
@@ -59,10 +57,8 @@ static void NaiveBatchCopy(char* dst, const char* src,
 // --------------------------------------------------------------------------
 // Optimized: single scatter/gather kernel launch
 // --------------------------------------------------------------------------
-static void KernelBatchCopy(char* dst, const char* src,
-                            const std::vector<size_t>& srcOffsets,
-                            const std::vector<size_t>& dstOffsets,
-                            const std::vector<size_t>& sizes,
+static void KernelBatchCopy(char* dst, const char* src, const std::vector<size_t>& srcOffsets,
+                            const std::vector<size_t>& dstOffsets, const std::vector<size_t>& sizes,
                             size_t* dMeta, hipStream_t stream) {
   int n = static_cast<int>(sizes.size());
   size_t metaBytes = n * sizeof(size_t);
@@ -72,8 +68,7 @@ static void KernelBatchCopy(char* dst, const char* src,
   std::copy(dstOffsets.begin(), dstOffsets.end(), hostMeta.begin() + n);
   std::copy(sizes.begin(), sizes.end(), hostMeta.begin() + n * 2);
 
-  HIP_CHECK(hipMemcpyAsync(dMeta, hostMeta.data(), metaBytes * 3,
-                           hipMemcpyHostToDevice, stream));
+  HIP_CHECK(hipMemcpyAsync(dMeta, hostMeta.data(), metaBytes * 3, hipMemcpyHostToDevice, stream));
 
   size_t* dSrcOff = dMeta;
   size_t* dDstOff = dMeta + n;
@@ -81,8 +76,8 @@ static void KernelBatchCopy(char* dst, const char* src,
 
   int threads = 256;
   int blocks = std::min(n, 1024);
-  mori::io::scatterGatherCopyKernel<<<blocks, threads, 0, stream>>>(
-      src, dst, dSrcOff, dDstOff, dSizes, n);
+  mori::io::scatterGatherCopyKernel<<<blocks, threads, 0, stream>>>(src, dst, dSrcOff, dDstOff,
+                                                                    dSizes, n);
   HIP_CHECK(hipGetLastError());
 }
 
@@ -134,16 +129,14 @@ static void TestCorrectness() {
     for (size_t j = 0; j < segSize; j++) {
       size_t off = dstOff[i] + j;
       if (naiveRes[off] != kernelRes[off]) {
-        fprintf(stderr, "FAIL: mismatch at seg %d byte %zu (naive=%d kernel=%d)\n",
-                i, j, (int)(unsigned char)naiveRes[off],
-                (int)(unsigned char)kernelRes[off]);
+        fprintf(stderr, "FAIL: mismatch at seg %d byte %zu (naive=%d kernel=%d)\n", i, j,
+                (int)(unsigned char)naiveRes[off], (int)(unsigned char)kernelRes[off]);
         assert(false);
       }
     }
   }
 
-  printf("  PASSED: %d discrete segments of %zu bytes verified\n",
-         numSegments, segSize);
+  printf("  PASSED: %d discrete segments of %zu bytes verified\n", numSegments, segSize);
 
   HIP_CHECK(hipFree(srcGpu));
   HIP_CHECK(hipFree(dstNaive));
@@ -209,10 +202,8 @@ static void TestCorrectnessUnaligned() {
     for (size_t j = 0; j < sizes[i]; j++) {
       size_t off = dstOff[i] + j;
       if (naiveRes[off] != kernelRes[off]) {
-        fprintf(stderr,
-                "FAIL: unaligned mismatch at seg %d byte %zu (naive=%d kernel=%d)\n",
-                i, j, (int)(unsigned char)naiveRes[off],
-                (int)(unsigned char)kernelRes[off]);
+        fprintf(stderr, "FAIL: unaligned mismatch at seg %d byte %zu (naive=%d kernel=%d)\n", i, j,
+                (int)(unsigned char)naiveRes[off], (int)(unsigned char)kernelRes[off]);
         assert(false);
       }
     }
@@ -232,10 +223,10 @@ static void TestCorrectnessUnaligned() {
 // --------------------------------------------------------------------------
 static void TestPerformance() {
   printf("\n=== TestPerformance (discrete buffer batch copy) ===\n");
-  printf("%-30s %12s %12s %10s %6s\n", "TestCase", "Naive(us)", "Kernel(us)",
-         "Speedup", "Result");
-  printf("----------------------------------------------------------------------"
-         "------\n");
+  printf("%-30s %12s %12s %10s %6s\n", "TestCase", "Naive(us)", "Kernel(us)", "Speedup", "Result");
+  printf(
+      "----------------------------------------------------------------------"
+      "------\n");
 
   struct TestCase {
     int numSegments;
@@ -244,14 +235,10 @@ static void TestPerformance() {
   };
 
   std::vector<TestCase> cases = {
-      {32, 4096, "32 segs x 4KB"},
-      {64, 4096, "64 segs x 4KB"},
-      {128, 4096, "128 segs x 4KB"},
-      {256, 4096, "256 segs x 4KB"},
-      {512, 2048, "512 segs x 2KB"},
-      {1024, 1024, "1024 segs x 1KB"},
-      {128, 16384, "128 segs x 16KB"},
-      {64, 65536, "64 segs x 64KB"},
+      {32, 4096, "32 segs x 4KB"},     {64, 4096, "64 segs x 4KB"},
+      {128, 4096, "128 segs x 4KB"},   {256, 4096, "256 segs x 4KB"},
+      {512, 2048, "512 segs x 2KB"},   {1024, 1024, "1024 segs x 1KB"},
+      {128, 16384, "128 segs x 16KB"}, {64, 65536, "64 segs x 64KB"},
   };
 
   bool allPassed = true;
@@ -293,8 +280,7 @@ static void TestPerformance() {
       HIP_CHECK(hipStreamSynchronize(stream));
     }
     auto t1 = std::chrono::high_resolution_clock::now();
-    double naiveUs =
-        std::chrono::duration<double, std::micro>(t1 - t0).count() / iterations;
+    double naiveUs = std::chrono::duration<double, std::micro>(t1 - t0).count() / iterations;
 
     // Warmup kernel
     for (int w = 0; w < warmup; w++) {
@@ -309,15 +295,14 @@ static void TestPerformance() {
       HIP_CHECK(hipStreamSynchronize(stream));
     }
     auto t3 = std::chrono::high_resolution_clock::now();
-    double kernelUs =
-        std::chrono::duration<double, std::micro>(t3 - t2).count() / iterations;
+    double kernelUs = std::chrono::duration<double, std::micro>(t3 - t2).count() / iterations;
 
     double speedup = naiveUs / kernelUs;
     bool passed = speedup > 1.0;
     if (!passed) allPassed = false;
 
-    printf("%-30s %12.2f %12.2f %9.2fx %6s\n", tc.desc, naiveUs, kernelUs,
-           speedup, passed ? "PASS" : "FAIL");
+    printf("%-30s %12.2f %12.2f %9.2fx %6s\n", tc.desc, naiveUs, kernelUs, speedup,
+           passed ? "PASS" : "FAIL");
 
     HIP_CHECK(hipFree(srcGpu));
     HIP_CHECK(hipFree(dstGpu));
@@ -325,13 +310,15 @@ static void TestPerformance() {
     HIP_CHECK(hipStreamDestroy(stream));
   }
 
-  printf("----------------------------------------------------------------------"
-         "------\n");
+  printf(
+      "----------------------------------------------------------------------"
+      "------\n");
   if (allPassed) {
     printf("All performance tests PASSED: kernel is faster for discrete buffers\n");
   } else {
-    printf("WARNING: some tests show kernel not faster - may be expected for "
-           "few/large segments\n");
+    printf(
+        "WARNING: some tests show kernel not faster - may be expected for "
+        "few/large segments\n");
   }
 }
 
@@ -420,12 +407,12 @@ static void TestSortMerge() {
     }
   }
 
-  printf("  %d input segments, unsorted merge → %d, sorted merge → %d\n",
-         numSegments, unsortedMerged, sortedMerged);
+  printf("  %d input segments, unsorted merge → %d, sorted merge → %d\n", numSegments,
+         unsortedMerged, sortedMerged);
   assert(sortedMerged <= unsortedMerged);
   assert(sortedMerged == 1);
-  printf("  PASSED: sorting reduces %d segments to %d (optimal: 1)\n",
-         unsortedMerged, sortedMerged);
+  printf("  PASSED: sorting reduces %d segments to %d (optimal: 1)\n", unsortedMerged,
+         sortedMerged);
 }
 
 int main() {

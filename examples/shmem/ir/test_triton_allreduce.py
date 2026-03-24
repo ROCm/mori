@@ -1,4 +1,25 @@
 #!/usr/bin/env python3
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+#
+# MIT License
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 """
 Intra-node allreduce (bf16 sum) using Triton + mori.ir.triton.
 
@@ -12,7 +33,6 @@ Usage:
 
 import os
 import sys
-import time
 
 import torch
 import torch.distributed as dist
@@ -79,8 +99,12 @@ def allreduce_put_signal_kernel(
     recv_ptr,
     output_ptr,
     signal_ptr,
-    mype: int, npes: int, N: int,
-    CHUNK_SIZE: tl.constexpr, MAX_PES: tl.constexpr, CHUNKS_PER_PE: tl.constexpr,
+    mype: int,
+    npes: int,
+    N: int,
+    CHUNK_SIZE: tl.constexpr,
+    MAX_PES: tl.constexpr,
+    CHUNKS_PER_PE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     bid = tl.program_id(0)
@@ -96,10 +120,11 @@ def allreduce_put_signal_kernel(
             for off in range(0, CHUNK_SIZE, BLOCK_SIZE):
                 o = chunk_offset + off + tl.arange(0, BLOCK_SIZE)
                 m = o < N
-                tl.store(recv_ptr + mype * N + o,
-                         tl.load(input_ptr + o, mask=m), mask=m)
+                tl.store(
+                    recv_ptr + mype * N + o, tl.load(input_ptr + o, mask=m), mask=m
+                )
             sig_addr = signal_ptr + mype
-            tl.atomic_add(sig_addr, 1, sem='release')
+            tl.atomic_add(sig_addr, 1, sem="release")
         else:
             mori_shmem_device.putmem_nbi_signal_block(
                 recv_ptr + mype * N + chunk_offset,
@@ -117,7 +142,8 @@ def allreduce_put_signal_kernel(
     for i in tl.static_range(MAX_PES):
         if i < npes:
             mori_shmem_device.uint64_wait_until_equals(
-                signal_ptr + i, tl.cast(CHUNKS_PER_PE, tl.uint64))
+                signal_ptr + i, tl.cast(CHUNKS_PER_PE, tl.uint64)
+            )
 
     # Phase 3: multi-block accumulate
     total_blocks = MAX_PES * CHUNKS_PER_PE
@@ -127,7 +153,9 @@ def allreduce_put_signal_kernel(
         acc = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
         for pe in tl.static_range(MAX_PES):
             if pe < npes:
-                acc += tl.load(recv_ptr + pe * N + offs, mask=mask, other=0.0).to(tl.float32)
+                acc += tl.load(recv_ptr + pe * N + offs, mask=mask, other=0.0).to(
+                    tl.float32
+                )
         tl.store(output_ptr + offs, acc.to(tl.bfloat16), mask=mask)
 
 
@@ -142,6 +170,7 @@ def setup_distributed():
     world_group = dist.group.WORLD
     torch._C._distributed_c10d._register_process_group("default", world_group)
     import mori.shmem as ms
+
     ms.shmem_torch_process_group_init("default")
     mype, npes = ms.shmem_mype(), ms.shmem_npes()
     print(f"[PE {mype}/{npes}] initialized")
@@ -150,6 +179,7 @@ def setup_distributed():
 
 def cleanup():
     import mori.shmem as ms
+
     ms.shmem_finalize()
     if dist.is_initialized():
         dist.destroy_process_group()
@@ -199,7 +229,14 @@ def test_allreduce(mype, npes, extern_libs):
     local_cpu = local_data.cpu()
     all_data_cpu = [torch.empty_like(local_cpu) for _ in range(npes)]
     dist.all_gather(all_data_cpu, local_cpu)
-    expected = torch.stack(all_data_cpu).to(torch.float32).sum(dim=0).to(torch.bfloat16).view(-1).cuda()
+    expected = (
+        torch.stack(all_data_cpu)
+        .to(torch.float32)
+        .sum(dim=0)
+        .to(torch.bfloat16)
+        .view(-1)
+        .cuda()
+    )
 
     ms.shmem_barrier_all()
 
@@ -207,24 +244,32 @@ def test_allreduce(mype, npes, extern_libs):
     print(f"[PE {mype}] --- Kernel A: device-side shmem_ptr_p2p ---")
     grid_a = (triton.cdiv(N, 1024),)
     allreduce_p2p_kernel[grid_a](
-        symm_buf, result_a, npes, N, MAX_PES=MAX_PES,
-        extern_libs=extern_libs)
+        symm_buf, result_a, npes, N, MAX_PES=MAX_PES, extern_libs=extern_libs
+    )
     torch.cuda.synchronize()
 
     best_a = allreduce_p2p_kernel.best_config
     grid_a = (triton.cdiv(N, best_a.kwargs["BLOCK_SIZE"]),)
     allreduce_p2p_kernel[grid_a](
-        symm_buf, result_a, npes, N, MAX_PES=MAX_PES,
-        extern_libs=extern_libs)
+        symm_buf, result_a, npes, N, MAX_PES=MAX_PES, extern_libs=extern_libs
+    )
     torch.cuda.synchronize()
 
     err_a = (result_a.float() - expected.float()).abs().max().item()
     print(f"[PE {mype}] A max_err={err_a:.6f}")
-    torch.testing.assert_close(result_a.view(M, K), expected.view(M, K), atol=1e-1, rtol=1e-1)
-    print(f"[PE {mype}] A PASS (BLOCK_SIZE={best_a.kwargs['BLOCK_SIZE']}, warps={best_a.num_warps})")
+    torch.testing.assert_close(
+        result_a.view(M, K), expected.view(M, K), atol=1e-1, rtol=1e-1
+    )
+    print(
+        f"[PE {mype}] A PASS (BLOCK_SIZE={best_a.kwargs['BLOCK_SIZE']}, warps={best_a.num_warps})"
+    )
 
-    us_a = bench("A", lambda: allreduce_p2p_kernel[grid_a](
-        symm_buf, result_a, npes, N, MAX_PES=MAX_PES, extern_libs=extern_libs))
+    us_a = bench(
+        "A",
+        lambda: allreduce_p2p_kernel[grid_a](
+            symm_buf, result_a, npes, N, MAX_PES=MAX_PES, extern_libs=extern_libs
+        ),
+    )
     bw_a = N * 2 * npes / (us_a * 1e-6) / 1e9
     print(f"[PE {mype}] A: {us_a:.1f} us, {bw_a:.1f} GB/s")
 
@@ -239,7 +284,9 @@ def test_allreduce(mype, npes, extern_libs):
     CPP = 1 if is_rdma else 8
     NW = 16
     transport_name = "RDMA/IBGDA" if is_rdma else "P2P"
-    print(f"\n[PE {mype}] --- Kernel B: put+signal ({transport_name}, chunks_per_pe={CPP}) ---")
+    print(
+        f"\n[PE {mype}] --- Kernel B: put+signal ({transport_name}, chunks_per_pe={CPP}) ---"
+    )
     ms.shmem_barrier_all()
 
     recv_b = mori_shmem_create_tensor((npes * N,), torch.bfloat16)
@@ -250,34 +297,58 @@ def test_allreduce(mype, npes, extern_libs):
     CHUNK_SZ = triton.cdiv(CHUNK_SZ, BS) * BS
     TOTAL_BLOCKS = MAX_PES * CPP
 
-    recv_b.zero_(); signal_b.zero_()
-    torch.cuda.synchronize(); ms.shmem_barrier_all()
+    recv_b.zero_()
+    signal_b.zero_()
+    torch.cuda.synchronize()
+    ms.shmem_barrier_all()
 
     allreduce_put_signal_kernel[(TOTAL_BLOCKS,)](
-        symm_buf, recv_b, output_b, signal_b,
-        mype, npes, N,
-        CHUNK_SIZE=CHUNK_SZ, MAX_PES=MAX_PES,
-        CHUNKS_PER_PE=CPP, BLOCK_SIZE=BS,
-        extern_libs=extern_libs, num_warps=NW)
+        symm_buf,
+        recv_b,
+        output_b,
+        signal_b,
+        mype,
+        npes,
+        N,
+        CHUNK_SIZE=CHUNK_SZ,
+        MAX_PES=MAX_PES,
+        CHUNKS_PER_PE=CPP,
+        BLOCK_SIZE=BS,
+        extern_libs=extern_libs,
+        num_warps=NW,
+    )
     torch.cuda.synchronize()
 
     err_b = (output_b.float() - expected.float()).abs().max().item()
     print(f"[PE {mype}] B max_err={err_b:.6f} (grid={TOTAL_BLOCKS}, {transport_name})")
-    torch.testing.assert_close(output_b.view(M, K), expected.view(M, K), atol=1e-1, rtol=1e-1)
+    torch.testing.assert_close(
+        output_b.view(M, K), expected.view(M, K), atol=1e-1, rtol=1e-1
+    )
     print(f"[PE {mype}] B PASS")
 
     ms.shmem_barrier_all()
-    signal_b.zero_(); torch.cuda.synchronize(); ms.shmem_barrier_all()
+    signal_b.zero_()
+    torch.cuda.synchronize()
+    ms.shmem_barrier_all()
 
     s_b = torch.cuda.Event(enable_timing=True)
     e_b = torch.cuda.Event(enable_timing=True)
     s_b.record()
     allreduce_put_signal_kernel[(TOTAL_BLOCKS,)](
-        symm_buf, recv_b, output_b, signal_b,
-        mype, npes, N,
-        CHUNK_SIZE=CHUNK_SZ, MAX_PES=MAX_PES,
-        CHUNKS_PER_PE=CPP, BLOCK_SIZE=BS,
-        extern_libs=extern_libs, num_warps=NW)
+        symm_buf,
+        recv_b,
+        output_b,
+        signal_b,
+        mype,
+        npes,
+        N,
+        CHUNK_SIZE=CHUNK_SZ,
+        MAX_PES=MAX_PES,
+        CHUNKS_PER_PE=CPP,
+        BLOCK_SIZE=BS,
+        extern_libs=extern_libs,
+        num_warps=NW,
+    )
     e_b.record()
     torch.cuda.synchronize()
     us_b = s_b.elapsed_time(e_b) * 1000
@@ -302,10 +373,11 @@ def main():
         if mype == 0:
             print(f"\n{'=' * 60}")
             print(f"  All allreduce tests PASSED on {npes} PEs")
-            print(f"  (Triton + mori shmem device API)")
+            print("  (Triton + mori shmem device API)")
             print(f"{'=' * 60}")
     except Exception:
         import traceback
+
         traceback.print_exc()
         sys.exit(1)
     finally:

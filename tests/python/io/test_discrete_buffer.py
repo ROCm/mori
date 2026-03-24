@@ -38,6 +38,9 @@ import os
 import pytest
 import time
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from tests.python.utils import TorchDistContext, get_free_port
 from mori.io import (
     IOEngineConfig,
     BackendType,
@@ -60,6 +63,7 @@ DST_GPU = 1
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture(scope="module")
 def xgmi_engine():
     set_log_level("info")
@@ -73,7 +77,9 @@ def xgmi_engine():
 def _alloc_pair(engine, src_gpu, dst_gpu, num_elements):
     """Allocate a src tensor filled with random data and a zeroed dst tensor."""
     src = torch.randint(
-        1, 256, (num_elements,),
+        1,
+        256,
+        (num_elements,),
         dtype=torch.uint8,
         device=torch.device("cuda", src_gpu),
     )
@@ -90,6 +96,7 @@ def _alloc_pair(engine, src_gpu, dst_gpu, num_elements):
 # ---------------------------------------------------------------------------
 # Correctness tests
 # ---------------------------------------------------------------------------
+
 
 def test_discrete_batch_write_strided(xgmi_engine):
     """batch_write with strided (non-contiguous) offsets across GPUs."""
@@ -112,9 +119,9 @@ def test_discrete_batch_write_strided(xgmi_engine):
     src_cpu, dst_cpu = src.cpu(), dst.cpu()
     for i in range(num_segments):
         off = offsets[i]
-        assert torch.equal(src_cpu[off : off + seg_size], dst_cpu[off : off + seg_size]), (
-            f"mismatch at segment {i}"
-        )
+        assert torch.equal(
+            src_cpu[off : off + seg_size], dst_cpu[off : off + seg_size]
+        ), f"mismatch at segment {i}"
 
 
 def test_discrete_batch_read_strided(xgmi_engine):
@@ -152,6 +159,7 @@ def test_discrete_batch_shuffled_offsets(xgmi_engine):
 
     indices = list(range(num_segments))
     import random
+
     random.seed(42)
     random.shuffle(indices)
 
@@ -164,9 +172,9 @@ def test_discrete_batch_shuffled_offsets(xgmi_engine):
     status.Wait()
     assert status.Succeeded()
 
-    assert torch.equal(src.cpu(), dst.cpu()), (
-        "Shuffled-offset batch_write should produce identical result to full copy"
-    )
+    assert torch.equal(
+        src.cpu(), dst.cpu()
+    ), "Shuffled-offset batch_write should produce identical result to full copy"
 
 
 def test_discrete_batch_varying_sizes(xgmi_engine):
@@ -284,7 +292,8 @@ def _run_batch_perf(xgmi_engine, op):
 
 
 @pytest.mark.skipif(
-    not os.environ.get("MORI_RUN_PERF_TESTS"), reason="set MORI_RUN_PERF_TESTS=1 to run benchmarks"
+    not os.environ.get("MORI_RUN_PERF_TESTS"),
+    reason="set MORI_RUN_PERF_TESTS=1 to run benchmarks",
 )
 def test_discrete_batch_write_performance(xgmi_engine):
     """Benchmark batch_write across GPUs with various discrete segment patterns."""
@@ -292,7 +301,8 @@ def test_discrete_batch_write_performance(xgmi_engine):
 
 
 @pytest.mark.skipif(
-    not os.environ.get("MORI_RUN_PERF_TESTS"), reason="set MORI_RUN_PERF_TESTS=1 to run benchmarks"
+    not os.environ.get("MORI_RUN_PERF_TESTS"),
+    reason="set MORI_RUN_PERF_TESTS=1 to run benchmarks",
 )
 def test_discrete_batch_read_performance(xgmi_engine):
     """Benchmark batch_read across GPUs with various discrete segment patterns."""
@@ -304,10 +314,6 @@ def test_discrete_batch_read_performance(xgmi_engine):
 # Follows the same pattern as benchmark.py xgmi_multiprocess and
 # TorchDistProcessManager in tests/python/utils.py.
 # ---------------------------------------------------------------------------
-
-import torch.distributed as dist
-import torch.multiprocessing as mp
-from tests.python.utils import TorchDistContext, get_free_port
 
 
 def _send_bytes(data: bytes, dst: int):
@@ -370,7 +376,10 @@ def _mp_discrete_worker(rank, world_size, master_port, result_queue):
             total = num_segments * stride + seg_size
 
             tensor = torch.randint(
-                1, 256, (total,), dtype=torch.uint8,
+                1,
+                256,
+                (total,),
+                dtype=torch.uint8,
                 device=torch.device("cuda", gpu_id),
             )
             mem = engine.register_torch_tensor(tensor)
@@ -401,7 +410,8 @@ def _mp_discrete_worker(rank, world_size, master_port, result_queue):
             if rank == 0:
                 # batch_read: read back from GPU 1 -> GPU 0
                 read_tensor = torch.zeros(
-                    total, dtype=torch.uint8,
+                    total,
+                    dtype=torch.uint8,
                     device=torch.device("cuda", gpu_id),
                 )
                 read_mem = engine.register_torch_tensor(read_tensor)
@@ -425,6 +435,7 @@ def _mp_discrete_worker(rank, world_size, master_port, result_queue):
 
     except Exception as e:
         import traceback
+
         result_queue.put(("FAIL", f"{e}\n{traceback.format_exc()}"))
 
 
@@ -441,7 +452,9 @@ def test_discrete_batch_multiprocess():
 
     processes = []
     for rank in range(2):
-        p = ctx.Process(target=_mp_discrete_worker, args=(rank, 2, master_port, result_queue))
+        p = ctx.Process(
+            target=_mp_discrete_worker, args=(rank, 2, master_port, result_queue)
+        )
         p.start()
         processes.append(p)
 
@@ -450,7 +463,9 @@ def test_discrete_batch_multiprocess():
         if p.is_alive():
             p.terminate()
             p.join()
-            pytest.fail(f"Multi-process test timed out: worker {p.pid} did not finish within 120s")
+            pytest.fail(
+                f"Multi-process test timed out: worker {p.pid} did not finish within 120s"
+            )
         assert p.exitcode == 0, f"Worker process {p.pid} exited with code {p.exitcode}"
 
     world_size = 2
@@ -518,9 +533,7 @@ def _mp_perf_worker(rank, world_size, master_port, result_queue):
             perf_lines = []
 
             for op in ("batch_write", "batch_read"):
-                perf_lines.append(
-                    f"\n  GPU 0 -> GPU 1 multi-process {op} benchmark"
-                )
+                perf_lines.append(f"\n  GPU 0 -> GPU 1 multi-process {op} benchmark")
                 perf_lines.append("  %-25s %12s" % ("TestCase", f"{op}(us)"))
                 perf_lines.append("  " + "-" * 40)
 
@@ -529,7 +542,10 @@ def _mp_perf_worker(rank, world_size, master_port, result_queue):
                     total = num_segments * stride + seg_size
 
                     tensor = torch.randint(
-                        1, 256, (total,), dtype=torch.uint8,
+                        1,
+                        256,
+                        (total,),
+                        dtype=torch.uint8,
                         device=torch.device("cuda", gpu_id),
                     )
                     mem = engine.register_torch_tensor(tensor)
@@ -579,11 +595,13 @@ def _mp_perf_worker(rank, world_size, master_port, result_queue):
 
     except Exception as e:
         import traceback
+
         result_queue.put(("FAIL", f"{e}\n{traceback.format_exc()}"))
 
 
 @pytest.mark.skipif(
-    not os.environ.get("MORI_RUN_PERF_TESTS"), reason="set MORI_RUN_PERF_TESTS=1 to run benchmarks"
+    not os.environ.get("MORI_RUN_PERF_TESTS"),
+    reason="set MORI_RUN_PERF_TESTS=1 to run benchmarks",
 )
 def test_discrete_batch_multiprocess_performance():
     """Multi-process XGMI performance benchmark for discrete buffer
@@ -597,7 +615,9 @@ def test_discrete_batch_multiprocess_performance():
 
     processes = []
     for rank in range(2):
-        p = ctx.Process(target=_mp_perf_worker, args=(rank, 2, master_port, result_queue))
+        p = ctx.Process(
+            target=_mp_perf_worker, args=(rank, 2, master_port, result_queue)
+        )
         p.start()
         processes.append(p)
 
@@ -606,7 +626,9 @@ def test_discrete_batch_multiprocess_performance():
         if p.is_alive():
             p.terminate()
             p.join()
-            pytest.fail(f"Multi-process perf test timed out: worker {p.pid} did not finish within 300s")
+            pytest.fail(
+                f"Multi-process perf test timed out: worker {p.pid} did not finish within 300s"
+            )
         assert p.exitcode == 0, f"Worker process {p.pid} exited with code {p.exitcode}"
 
     world_size = 2

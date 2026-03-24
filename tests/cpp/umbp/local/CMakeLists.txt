@@ -38,9 +38,10 @@ if(UNIX)
 
   if(TARGET spdk_proxy)
     add_dependencies(bench_umbp_spdk spdk_proxy)
-    add_custom_command(TARGET bench_umbp_spdk POST_BUILD
-      COMMAND ${CMAKE_COMMAND} -E create_symlink
-              $<TARGET_FILE:spdk_proxy>
+    add_custom_command(
+      TARGET bench_umbp_spdk
+      POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E create_symlink $<TARGET_FILE:spdk_proxy>
               $<TARGET_FILE_DIR:bench_umbp_spdk>/spdk_proxy
       COMMENT "Symlink spdk_proxy next to bench_umbp_spdk")
   endif()

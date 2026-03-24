@@ -2,6 +2,27 @@
 #
 # MIT License
 #
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+#
+# MIT License
+#
 # This file is adapted from:
 #   https://github.com/deepseek-ai/DeepEP/blob/main/tests/test_low_latency.py
 #   https://github.com/deepseek-ai/DeepEP/blob/main/tests/utils.py
@@ -22,17 +43,19 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+import json
 import os
 import sys
+import tempfile
 import numpy as np
 import random
 import torch
 import torch.distributed as dist
 from functools import partial
+from pathlib import Path
 from typing import Optional, Union
 
 import mori
-from tests.python.ops.test_dispatch_combine import EpDispatchCombineTestCase
 
 
 def init_dist(local_rank: int, num_local_ranks: int):
@@ -120,6 +143,7 @@ def bench(fn, num_warmups: int = 50, num_tests: int = 50, post_fn=None):
     )[1:]
     return np.average(times), np.min(times), np.max(times)
 
+
 class empty_suppress:
 
     def __enter__(self):
@@ -127,6 +151,7 @@ class empty_suppress:
 
     def __exit__(self, *_):
         pass
+
 
 class suppress_stdout_stderr:
 
@@ -373,7 +398,7 @@ def test_main(
         # multiple node does not support zero_copy
         if multi_node and zero_copy:
             continue
-        hash_value, num_times = 0, 0
+        hash_value = 0
         if fused_moe_adaption:
             (
                 packed_recv_x,
@@ -481,13 +506,15 @@ def test_main(
         if zero_copy:
             combine_input = op.get_registered_combine_input_buffer(config.data_type)
             combine_input[:, :].copy_(simulated_gemm_x)
-        out = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
+        _ = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
         combined_x, _ = op.combine(
             simulated_gemm_x,
             None,
             topk_idx,
             block_num=combine_block_num,
-            warp_per_block=4 if zero_copy and not multi_node else combine_warp_per_block,
+            warp_per_block=(
+                4 if zero_copy and not multi_node else combine_warp_per_block
+            ),
             use_external_inp_buf=not zero_copy,
         )
         torch.cuda.synchronize()
@@ -526,7 +553,9 @@ def test_main(
             None,
             topk_idx,
             block_num=combine_block_num,
-            warp_per_block=4 if zero_copy and not multi_node else combine_warp_per_block,
+            warp_per_block=(
+                4 if zero_copy and not multi_node else combine_warp_per_block
+            ),
             use_external_inp_buf=not zero_copy,
         )
 
@@ -572,8 +601,11 @@ def test_main(
             barrier_comm_profiling=True,
             suppress_kineto_output=True,
         )
-        print(f'[rank {rank}] EpDispatchCopyToStaging avg_t={dispatch_copy_t * 1e6:.2f} us | '
-                  f'EpCombineAll avg_t={combine_all_t * 1e6:.2f} us', flush=True)
+        print(
+            f"[rank {rank}] EpDispatchCopyToStaging avg_t={dispatch_copy_t * 1e6:.2f} us | "
+            f"EpCombineAll avg_t={combine_all_t * 1e6:.2f} us",
+            flush=True,
+        )
         dispatch_t += dispatch_copy_t
         combine_t += combine_all_t
         print(
@@ -588,9 +620,7 @@ def test_main(
                 zero_copy=True,
                 use_fp8=bench_use_fp8,
             ),
-            kernel_names=(
-                ("EpDispatchIntraNodeKernel", "EpCombineIntraNodeKernel")
-            ),
+            kernel_names=(("EpDispatchIntraNodeKernel", "EpCombineIntraNodeKernel")),
             barrier_comm_profiling=True,
             suppress_kineto_output=True,
         )

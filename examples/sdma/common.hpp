@@ -1,8 +1,29 @@
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 /**
  * @acknowledgements:
  * - Original implementation by: Sidler, David
  * - Source: https://github.com/AARInternal/shader_sdma
- * 
+ *
  * @note: This code is adapted/modified from the implementation by Sidler, David
  */
 
@@ -21,26 +42,28 @@ constexpr int WARP_SIZE = 64;
 
 // stdout header fields
 constexpr std::array<std::string_view, 13> headerFields = {
-    "Src",   // Src GPU
-    "#Dest", // N destinations
+    "Src",    // Src GPU
+    "#Dest",  // N destinations
     "Grid",
     "Block",
-    "CopySize",         // Size of each individual SDMA packet
-    "#Copies",          // Number of packets used for the transfer
-    "Time [us]",        // GPU-side measured transfer time (avg)
-    "Time (std)",       // Std deviation of device-side latency
-    "Bandwidth [GB/s]", // Average Device bandwidth for the transfer
-    "Time [us] (host)", // Host-side timing (avg)
-    "Time (std)",       // Std deviation of host-side latency
-    "Bandwidth [GB/s]", // Average Host bandwidth for the transfer
+    "CopySize",          // Size of each individual SDMA packet
+    "#Copies",           // Number of packets used for the transfer
+    "Time [us]",         // GPU-side measured transfer time (avg)
+    "Time (std)",        // Std deviation of device-side latency
+    "Bandwidth [GB/s]",  // Average Device bandwidth for the transfer
+    "Time [us] (host)",  // Host-side timing (avg)
+    "Time (std)",        // Std deviation of host-side latency
+    "Bandwidth [GB/s]",  // Average Host bandwidth for the transfer
     "#Wrong",
 };
 
 void printHeader(std::ostream& out, const std::array<std::string_view, 13>& headers);
 
-void printRowOfResults(std::ostream& out, int srcGpuId, size_t num_dsts, int numBlocks, int numThreadsPerBlock,
-                       size_t totalTransferSize, size_t copySize, size_t numCopies, double deviceLatency,
-                       double deviceLatencyStd, double deviceBandwidth, double hostLatency, double hostLatencyStd,
+void printRowOfResults(std::ostream& out, int srcGpuId, size_t num_dsts, int numBlocks,
+                       int numThreadsPerBlock, size_t totalTransferSize, size_t copySize,
+                       size_t numCopies, double deviceLatency, double deviceLatencyStd,
+                       double deviceBandwidth, double hostLatency, double hostLatencyStd,
                        double hostBandwidth, std::optional<size_t> numErrors);
 
-size_t verifyData(const std::vector<uint32_t>& hostSrcBuffer, void** dstBufs, size_t num_dsts, size_t transferSize);
+size_t verifyData(const std::vector<uint32_t>& hostSrcBuffer, void** dstBufs, size_t num_dsts,
+                  size_t transferSize);

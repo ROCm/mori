@@ -1,3 +1,24 @@
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 /**
  * @acknowledgements:
  * - Original implementation by: Sidler, David
@@ -114,7 +135,8 @@ struct SdmaQueueDeviceHandle {
     return (uptoIndex - cachedHwReadIndex) < queue_size_in_bytes;
   }
 
-  __device__ __forceinline__ uint64_t ReserveQueueSpace(const size_t size_in_bytes, uint64_t& offset) {
+  __device__ __forceinline__ uint64_t ReserveQueueSpace(const size_t size_in_bytes,
+                                                        uint64_t& offset) {
     const uint64_t queue_size_in_bytes = SDMA_QUEUE_SIZE;
 
     uint64_t cur_index;
@@ -131,8 +153,9 @@ struct SdmaQueueDeviceHandle {
       uint64_t new_index = cur_index + size_in_bytes + offset;
 
       if (CanWriteUpto(new_index)) {
-        if (__hip_atomic_compare_exchange_strong(cachedWptr, &cur_index, new_index, __ATOMIC_RELAXED,
-                                                 __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT)) {
+        if (__hip_atomic_compare_exchange_strong(cachedWptr, &cur_index, new_index,
+                                                 __ATOMIC_RELAXED, __ATOMIC_RELAXED,
+                                                 __HIP_MEMORY_SCOPE_AGENT)) {
           break;
         }
       }
@@ -147,7 +170,8 @@ struct SdmaQueueDeviceHandle {
   }
 
   template <typename PacketType>
-  __device__ __forceinline__ void placePacket(PacketType& packet, uint64_t& pendingWptr, uint64_t offset) {
+  __device__ __forceinline__ void placePacket(PacketType& packet, uint64_t& pendingWptr,
+                                              uint64_t offset) {
     // Ensure that one warp can write the whole packet
     static_assert(sizeof(PacketType) / sizeof(uint32_t) <= 64);
 
@@ -158,7 +182,8 @@ struct SdmaQueueDeviceHandle {
     uint64_t base_index_in_dwords = WrapIntoRing(pendingWptr) / sizeof(uint32_t);
 
     for (int i = 0; i < numOffsetDwords; i++) {
-      __hip_atomic_store(queueBuf + base_index_in_dwords + i, 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      __hip_atomic_store(queueBuf + base_index_in_dwords + i, 0, __ATOMIC_RELAXED,
+                         __HIP_MEMORY_SCOPE_AGENT);
     }
     pendingWptr += offset;
     base_index_in_dwords = WrapIntoRing(pendingWptr) / sizeof(uint32_t);
@@ -236,8 +261,7 @@ struct SdmaQueueDeviceHandle {
   uint64_t cachedHwReadIndex;
 };
 
-struct SdmaQueueSingleProducerDeviceHandle : SdmaQueueDeviceHandle {
-};
+struct SdmaQueueSingleProducerDeviceHandle : SdmaQueueDeviceHandle {};
 
 static_assert(sizeof(SdmaQueueSingleProducerDeviceHandle) == sizeof(SdmaQueueDeviceHandle));
 
@@ -265,7 +289,8 @@ __device__ __forceinline__ void signal(SdmaQueueDeviceHandle& handle, void* sign
 __device__ __forceinline__ void putWithSignal(SdmaQueueDeviceHandle& handle, void* dst, void* src,
                                               size_t size, void* signal) {
   uint64_t offset = 0;
-  auto base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_COPY_LINEAR) + sizeof(SDMA_PKT_ATOMIC), offset);
+  auto base =
+      handle.ReserveQueueSpace(sizeof(SDMA_PKT_COPY_LINEAR) + sizeof(SDMA_PKT_ATOMIC), offset);
   auto copy_packet = CreateCopyPacket(src, dst, size);
   auto signal_packet = CreateAtomicIncPacket(reinterpret_cast<HSAuint64*>(signal));
   uint64_t pendingWptr = base;

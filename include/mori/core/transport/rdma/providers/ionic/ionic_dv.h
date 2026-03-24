@@ -1,3 +1,24 @@
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 /* SPDX-License-Identifier: GPL-2.0 OR Linux-OpenIB */
 /*
  * Copyright (c) 2023 Advanced Micro Devices, Inc.  All rights reserved.
@@ -6,8 +27,8 @@
 #ifndef IONIC_DV_H
 #define IONIC_DV_H
 
-#include <stdbool.h>
 #include <infiniband/verbs.h>
+#include <stdbool.h>
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -16,101 +37,100 @@ struct ibv_cq;
 struct ibv_qp;
 
 /** IONIC_PD_TAG - tag used for parent domain resource allocation. */
-#define IONIC_PD_TAG		((uint64_t)RDMA_DRIVER_IONIC << 32)
-#define IONIC_PD_TAG_CQ		(IONIC_PD_TAG | 1)
-#define IONIC_PD_TAG_SQ		(IONIC_PD_TAG | 2)
-#define IONIC_PD_TAG_RQ		(IONIC_PD_TAG | 3)
-#define IONIC_PD_TAG_RCQ	(IONIC_PD_TAG | 4)
+#define IONIC_PD_TAG ((uint64_t)RDMA_DRIVER_IONIC << 32)
+#define IONIC_PD_TAG_CQ (IONIC_PD_TAG | 1)
+#define IONIC_PD_TAG_SQ (IONIC_PD_TAG | 2)
+#define IONIC_PD_TAG_RQ (IONIC_PD_TAG | 3)
+#define IONIC_PD_TAG_RCQ (IONIC_PD_TAG | 4)
 
 /* deprecated */
-#define IONIC_SQ_SIG_ALL	1
+#define IONIC_SQ_SIG_ALL 1
 /* deprecated */
-#define IONIC_SQ_SIG_HACK_HIGH	2
+#define IONIC_SQ_SIG_HACK_HIGH 2
 
 /** IONIC_UDMA_MASK_LOW - flag represents the udma0 pipeline in the udma mask. */
-#define IONIC_UDMA_MASK_LOW	1
+#define IONIC_UDMA_MASK_LOW 1
 /** IONIC_UDMA_MASK_HIGH - flag represents the udma1 pipeline in the udma mask. */
-#define IONIC_UDMA_MASK_HIGH	2
+#define IONIC_UDMA_MASK_HIGH 2
 
 #define IONIC_DV_PUEC_NPORTS_MAX 8
 
 /** struct ionic_dv_ctx - Context information for gpu-initiated rdma. */
 struct ionic_dv_ctx {
-	void			*db_page;
-	uint64_t		*db_ptr;
-	uint8_t			sq_qtype;
-	uint8_t			rq_qtype;
-	uint8_t			cq_qtype;
+  void* db_page;
+  uint64_t* db_ptr;
+  uint8_t sq_qtype;
+  uint8_t rq_qtype;
+  uint8_t cq_qtype;
 };
 
 /** struct ionic_dv_ctx - Queue information for gpu-initiated rdma. */
 struct ionic_dv_queue {
-	void			*ptr;
-	size_t			size;
-	uint64_t		db_val;
-	uint16_t		mask;
-	uint8_t			depth_log2;
-	uint8_t			stride_log2;
+  void* ptr;
+  size_t size;
+  uint64_t db_val;
+  uint16_t mask;
+  uint8_t depth_log2;
+  uint8_t stride_log2;
 };
 
 /** struct ionic_dv_ctx - CQ information for gpu-initiated rdma. */
 struct ionic_dv_cq {
-	struct ionic_dv_queue	q;
+  struct ionic_dv_queue q;
 };
 
 /** struct ionic_dv_ctx - QP information for gpu-initiated rdma. */
 struct ionic_dv_qp {
-	struct ionic_dv_queue	rq;
-	struct ionic_dv_queue	sq;
+  struct ionic_dv_queue rq;
+  struct ionic_dv_queue sq;
 };
 
 /** struct ionic_puec_route - Info needed to setup a PUEC plane route. */
 struct ionic_dv_puec_route {
-        union ibv_gid	dgid;
-        union ibv_gid	sgid;
-        uint32_t	flow_label;
-        uint8_t		hop_limit;
-        uint8_t		traffic_class;
-	uint8_t		sl;
-	uint8_t		rsvd[5];
-	uint32_t	flags;
+  union ibv_gid dgid;
+  union ibv_gid sgid;
+  uint32_t flow_label;
+  uint8_t hop_limit;
+  uint8_t traffic_class;
+  uint8_t sl;
+  uint8_t rsvd[5];
+  uint32_t flags;
 };
 
 /**
  * ionic_dv_is_ionic_ctx - Test if context belongs to ionic provider.
  */
-bool ionic_dv_is_ionic_ctx(struct ibv_context *ibctx);
+bool ionic_dv_is_ionic_ctx(struct ibv_context* ibctx);
 
 /**
  * ionic_dv_is_ionic_pd - Test if pd belongs to ionic provider.
  */
-bool ionic_dv_is_ionic_pd(struct ibv_pd *ibpd);
+bool ionic_dv_is_ionic_pd(struct ibv_pd* ibpd);
 
 /**
  * ionic_dv_is_ionic_cq - Test if cq belongs to ionic provider.
  */
-bool ionic_dv_is_ionic_cq(struct ibv_cq *ibcq);
+bool ionic_dv_is_ionic_cq(struct ibv_cq* ibcq);
 
 /**
  * ionic_dv_is_ionic_qp - Test if qp belongs to ionic provider.
  */
-bool ionic_dv_is_ionic_qp(struct ibv_qp *ibqp);
-
+bool ionic_dv_is_ionic_qp(struct ibv_qp* ibqp);
 
 /**
  * ionic_dv_ctx_get_udma_count - Get number of udma pipelines.
  */
-uint8_t ionic_dv_ctx_get_udma_count(struct ibv_context *ibctx);
+uint8_t ionic_dv_ctx_get_udma_count(struct ibv_context* ibctx);
 
 /**
  * ionic_dv_ctx_get_udma_mask - Get mask of udma pipeline ids.
  */
-uint8_t ionic_dv_ctx_get_udma_mask(struct ibv_context *ibctx);
+uint8_t ionic_dv_ctx_get_udma_mask(struct ibv_context* ibctx);
 
 /**
  * ionic_dv_pd_get_udma_mask - Get mask of udma pipeline ids of pd or parent domain.
  */
-uint8_t ionic_dv_pd_get_udma_mask(struct ibv_pd *ibpd);
+uint8_t ionic_dv_pd_get_udma_mask(struct ibv_pd* ibpd);
 
 /**
  * ionic_dv_pd_set_udma_mask - Restrict pipeline ids of pd or parent domain.
@@ -126,18 +146,17 @@ uint8_t ionic_dv_pd_get_udma_mask(struct ibv_pd *ibpd);
  * each queue.  Changing the udma mask of the pd has no effect on previously created
  * queues.
  */
-int ionic_dv_pd_set_udma_mask(struct ibv_pd *ibpd, uint8_t udma_mask);
+int ionic_dv_pd_set_udma_mask(struct ibv_pd* ibpd, uint8_t udma_mask);
 
 /**
  * ionic_dv_cq_get_udma_mask - Get mask of udma pipeline ids of completion queueue.
  */
-uint8_t ionic_dv_cq_get_udma_mask(struct ibv_cq *ibcq);
+uint8_t ionic_dv_cq_get_udma_mask(struct ibv_cq* ibcq);
 
 /**
  * ionic_dv_qp_get_udma_idx - Get udma pipeline id of queueue pair.
  */
-uint8_t ionic_dv_qp_get_udma_idx(struct ibv_qp *ibqp);
-
+uint8_t ionic_dv_qp_get_udma_idx(struct ibv_qp* ibqp);
 
 /**
  * ionic_dv_pd_set_sqcmb - Specify send queue preference for controller memory bar.
@@ -149,15 +168,14 @@ uint8_t ionic_dv_qp_get_udma_idx(struct ibv_qp *ibqp);
  * @expdb - Allow the use of express doorbell optimizations.
  * @require - Require preferences to be met, no fallback.
  */
-int ionic_dv_pd_set_sqcmb(struct ibv_pd *ibpd, bool enable, bool expdb, bool require);
+int ionic_dv_pd_set_sqcmb(struct ibv_pd* ibpd, bool enable, bool expdb, bool require);
 
 /**
  * ionic_dv_pd_set_rqcmb - Specify receive queue preference for controller memory bar.
  *
  * See ionic_dv_pd_set_sqcmb().
  */
-int ionic_dv_pd_set_rqcmb(struct ibv_pd *ibpd, bool enable, bool expdb, bool require);
-
+int ionic_dv_pd_set_rqcmb(struct ibv_pd* ibpd, bool enable, bool expdb, bool require);
 
 /**
  * ionic_dv_qp_set_gda - Enable or disable GPU-Direct Async (GDA) mode.
@@ -176,7 +194,7 @@ int ionic_dv_pd_set_rqcmb(struct ibv_pd *ibpd, bool enable, bool expdb, bool req
  * @enable_send - Enable GDA mode for the send queue.
  * @enable_recv - Enable GDA mode for the recv queue.
  */
-int ionic_dv_qp_set_gda(struct ibv_qp *ibqp, bool enable_send, bool enable_recv);
+int ionic_dv_qp_set_gda(struct ibv_qp* ibqp, bool enable_send, bool enable_recv);
 
 /**
  * ionic_dv_qp_get_send_dbell_data - Get send queue doorbell data.
@@ -198,7 +216,7 @@ int ionic_dv_qp_set_gda(struct ibv_qp *ibqp, bool enable_send, bool enable_recv)
  * @ibqp - Get send doorbell data for this queue pair.
  * @dbdata - Output parameter for doorbell data.
  */
-int ionic_dv_qp_get_send_dbell_data(struct ibv_qp *ibqp, uint64_t *dbdata);
+int ionic_dv_qp_get_send_dbell_data(struct ibv_qp* ibqp, uint64_t* dbdata);
 
 /**
  * ionic_dv_qp_get_recv_dbell_data - Get recv queue doorbell data.
@@ -221,29 +239,28 @@ int ionic_dv_qp_get_send_dbell_data(struct ibv_qp *ibqp, uint64_t *dbdata);
  * @ibqp - Get recv doorbell data for this queue pair.
  * @dbdata - Output parameter for doorbell data.
  */
-int ionic_dv_qp_get_recv_dbell_data(struct ibv_qp *ibqp, uint64_t *dbdata);
-
+int ionic_dv_qp_get_recv_dbell_data(struct ibv_qp* ibqp, uint64_t* dbdata);
 
 /**
  * ionic_dv_get_ctx - Extract context information for gpu-initiated rdma.
  */
-int ionic_dv_get_ctx(struct ionic_dv_ctx *dvctx, struct ibv_context *ibctx);
+int ionic_dv_get_ctx(struct ionic_dv_ctx* dvctx, struct ibv_context* ibctx);
 
 /**
  * ionic_dv_get_cq - Extract cq information for gpu-initiated rdma.
  */
-int ionic_dv_get_cq(struct ionic_dv_cq *dvcq, struct ibv_cq *ibcq, uint8_t udma_idx);
+int ionic_dv_get_cq(struct ionic_dv_cq* dvcq, struct ibv_cq* ibcq, uint8_t udma_idx);
 
 /**
  * ionic_dv_get_qp - Extract qp information for gpu-initiated rdma.
  */
-int ionic_dv_get_qp(struct ionic_dv_qp *dvqp, struct ibv_qp *ibqp);
+int ionic_dv_get_qp(struct ionic_dv_qp* dvqp, struct ibv_qp* ibqp);
 
 /**
  * ionic_dv_qp_set_puec_plane_route - set route info for a PUEC plane.
  */
-int ionic_dv_qp_set_puec_plane_route(struct ibv_qp *ibqp, uint8_t plane_idx,
-				     struct ionic_dv_puec_route *ipr);
+int ionic_dv_qp_set_puec_plane_route(struct ibv_qp* ibqp, uint8_t plane_idx,
+                                     struct ionic_dv_puec_route* ipr);
 #ifdef __cplusplus
 }
 #endif

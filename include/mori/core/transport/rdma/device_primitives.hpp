@@ -205,14 +205,16 @@ inline __device__ int PollCq(void* cqAddr, uint32_t cqeNum, uint32_t* consIdx,
                              uint32_t* wqeCounter);
 
 template <ProviderType PrvdType>
-inline __device__ int PollCq(WorkQueueHandle& wqHandle, CompletionQueueHandle& cqHandle, 
-		             void* cqAddr, uint32_t cqeNum, uint32_t* consIdx, uint16_t* wqeCounter);
-  
+inline __device__ int PollCq(WorkQueueHandle& wqHandle, CompletionQueueHandle& cqHandle,
+                             void* cqAddr, uint32_t cqeNum, uint32_t* consIdx,
+                             uint16_t* wqeCounter);
+
 template <ProviderType PrvdType>
 inline __device__ void UpdateCqDbrRecord(CompletionQueueHandle& cq, uint32_t consIdx);
 
 template <ProviderType PrvdType>
-inline __device__ int PollCqAndUpdateDbr(CompletionQueueHandle& cq, uint32_t* consIdx, uint32_t* lockVar);
+inline __device__ int PollCqAndUpdateDbr(CompletionQueueHandle& cq, uint32_t* consIdx,
+                                         uint32_t* lockVar);
 
 }  // namespace core
 }  // namespace mori

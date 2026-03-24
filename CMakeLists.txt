@@ -23,7 +23,9 @@ option(USE_ROCM "Whether to use rocm" ON)
 option(USE_BNXT "Whether to use BNXT NIC" OFF)
 option(USE_IONIC "Whether to use IONIC" OFF)
 option(BUILD_EXAMPLES "Whether to build examples" ON)
-option(WITH_MPI "Enable MPI support (required for mpi_bootstrap and C++ examples)" ${BUILD_EXAMPLES})
+option(WITH_MPI
+       "Enable MPI support (required for mpi_bootstrap and C++ examples)"
+       ${BUILD_EXAMPLES})
 option(BUILD_APPLICATION "Whether to build application library" ON)
 option(BUILD_SHMEM "Whether to build shmem library" ON)
 option(BUILD_OPS "Whether to build mori operation kernels" ON)
@@ -46,7 +48,10 @@ find_library(
   IONIC_LIB
   NAMES ionic
   HINTS /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu)
-find_library(MLX5_LIB NAMES mlx5 HINTS /usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu)
+find_library(
+  MLX5_LIB
+  NAMES mlx5
+  HINTS /usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu)
 
 find_path(
   BNXT_RE_DV_INCLUDE
@@ -147,10 +152,14 @@ if(DEFINED ENV{MORI_WITH_MPI})
   string(TOUPPER "$ENV{MORI_WITH_MPI}" _env_with_mpi)
   if(_env_with_mpi STREQUAL "ON")
     message(STATUS "MPI: enabled via MORI_WITH_MPI env")
-    set(WITH_MPI ON CACHE BOOL "Enable MPI support" FORCE)
+    set(WITH_MPI
+        ON
+        CACHE BOOL "Enable MPI support" FORCE)
   else()
     message(STATUS "MPI: disabled via MORI_WITH_MPI env")
-    set(WITH_MPI OFF CACHE BOOL "Enable MPI support" FORCE)
+    set(WITH_MPI
+        OFF
+        CACHE BOOL "Enable MPI support" FORCE)
   endif()
 endif()
 
@@ -161,7 +170,9 @@ include(${CMAKE_SOURCE_DIR}/cmake/MoriDetectDevice.cmake)
 mori_detect_device_config()
 # Bridge: if user didn't set GPU_TARGETS explicitly, use the detected arch
 if(NOT DEFINED GPU_TARGETS AND MORI_GPU_ARCH)
-  set(GPU_TARGETS "${MORI_GPU_ARCH}" CACHE STRING "GPU architectures" FORCE)
+  set(GPU_TARGETS
+      "${MORI_GPU_ARCH}"
+      CACHE STRING "GPU architectures" FORCE)
 endif()
 
 message(STATUS "ENABLE_PROFILER = ${ENABLE_PROFILER}")
@@ -343,13 +354,10 @@ endif()
 install(DIRECTORY include/mori DESTINATION include)
 
 # CMake package config (enables find_package(mori) for external C++ users)
-install(FILES
-  cmake/mori-config.cmake
-  cmake/MoriDetectDevice.cmake
-  DESTINATION lib/cmake/mori)
+install(FILES cmake/mori-config.cmake cmake/MoriDetectDevice.cmake
+        DESTINATION lib/cmake/mori)
 
 # Logging (spdlog is statically linked, but install the shared lib if built)
 if(TARGET spdlog)
   install(TARGETS spdlog ARCHIVE DESTINATION lib)
 endif()
-
