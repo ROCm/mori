@@ -319,16 +319,18 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         size_t align = static_cast<size_t>(pack_size * npes_);
         chunk_elems = ((chunk_elems + align - 1) / align) * align;
 
-        application::SymmMemObjPtr inputSymmObj = {};
-        if (scatter_mode == 1) {
-            size_t required_input_size = total_count * dtype_size_;
+        // Both modes use input_transit_buffer_ (SDMA: reduce output, P2P: input copy)
+        {
+            size_t required = total_count * dtype_size_;
             if (!ensure_buffer_size(input_transit_buffer_, input_transit_buffer_ptr_,
                                     input_transit_buffer_size_, input_transit_buffer_obj_,
-                                    required_input_size, "input transit buffer")) {
+                                    required, "input transit buffer")) {
                 return false;
             }
+        }
+        application::SymmMemObjPtr inputSymmObj = input_transit_buffer_obj_;
+        if (scatter_mode == 1) {
             copy_input_to_transit(input, total_count, stream);
-            inputSymmObj = input_transit_buffer_obj_;
         }
 
         if (scatter_mode == 1) {
@@ -338,7 +340,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         } else {
             PipelinedAllReduceSdmaKernel<T, 0><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input, output_transit_buffer_obj_, flagsObj_,
-                barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems);
+                barrierPtr_, inputSymmObj, total_count, chunk_elems);
         }
 
         hipError_t err = hipGetLastError();
@@ -349,7 +351,22 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         }
 
         if (copy_output_to_user_) {
-            copy_output_to_user(output, total_count, stream);
+            if (scatter_mode == 0) {
+                hipError_t cpErr = stream
+                    ? hipMemcpyAsync(output, input_transit_buffer_,
+                          total_count * dtype_size_,
+                          hipMemcpyDeviceToDevice, stream)
+                    : hipMemcpy(output, input_transit_buffer_,
+                          total_count * dtype_size_,
+                          hipMemcpyDeviceToDevice);
+                if (cpErr != hipSuccess) {
+                    fprintf(stderr, "PE %d: copy from reduce buffer failed: %s\n",
+                            myPe_, hipGetErrorString(cpErr));
+                    return false;
+                }
+            } else {
+                copy_output_to_user(output, total_count, stream);
+            }
         }
     } catch (const std::exception& e) {
         fprintf(stderr, "PE %d: PipelinedAllReduce failed: %s\n", myPe_, e.what());
