@@ -23,7 +23,7 @@ jobs:
               {
                 "runner": "label-1",
                 "platform": "MI325X+Thor2",
-                "node1_host": "10.32.80.214",
+                "node1_host": "10.36.40.214",
                 "node2_host": "tus1-p8-g27",
                 "node2_port": 22,
                 "node1_ifname": "eno1",
@@ -226,13 +226,13 @@ jobs:
             "docker exec mori_ci_${{ github.run_id }} \
              env GLOO_SOCKET_IFNAME=${{ matrix.node2_ifname }} \
                  MORI_SOCKET_IFNAME=${{ matrix.node2_ifname }} \
-             torchrun --nnodes=2 --node_rank=1 --nproc_per_node=1 \
+             timeout 120 torchrun --nnodes=2 --node_rank=1 --nproc_per_node=1 \
                --master_addr=${{ matrix.node1_host }} --master_port=1234 \
                $GITHUB_WORKSPACE/examples/ops/dispatch_combine/test_dispatch_combine_internode.py \
                --cmd bench --kernel-type v1 --num-qp 2 --max-tokens 4096" &
           GLOO_SOCKET_IFNAME=${{ matrix.node1_ifname }} \
           MORI_SOCKET_IFNAME=${{ matrix.node1_ifname }} \
-          torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
+          timeout 120 torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
             --master_addr="${{ matrix.node1_host }}" --master_port=1234 \
             examples/ops/dispatch_combine/test_dispatch_combine_internode.py \
             --cmd bench --kernel-type v1 --num-qp 2 --max-tokens 4096
@@ -244,13 +244,13 @@ jobs:
             "docker exec mori_ci_${{ github.run_id }} \
              env GLOO_SOCKET_IFNAME=${{ matrix.node2_ifname }} \
                  MORI_SOCKET_IFNAME=${{ matrix.node2_ifname }} \
-             torchrun --nnodes=2 --node_rank=1 --nproc_per_node=1 \
+             timeout 120 torchrun --nnodes=2 --node_rank=1 --nproc_per_node=1 \
                --master_addr=${{ matrix.node1_host }} --master_port=1234 \
                $GITHUB_WORKSPACE/examples/ops/dispatch_combine/test_dispatch_combine_internode.py \
                --cmd stress --kernel-type v1 --num-qp 2 --max-tokens 128" &
           GLOO_SOCKET_IFNAME=${{ matrix.node1_ifname }} \
           MORI_SOCKET_IFNAME=${{ matrix.node1_ifname }} \
-          torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
+          timeout 120 torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
             --master_addr="${{ matrix.node1_host }}" --master_port=1234 \
             examples/ops/dispatch_combine/test_dispatch_combine_internode.py \
             --cmd stress --kernel-type v1 --num-qp 2 --max-tokens 128
