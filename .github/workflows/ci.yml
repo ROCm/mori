@@ -22,7 +22,8 @@ jobs:
             "include": [
               {
                 "runner": "label-1",
-                "node1_host": "tus1-p8-g25",
+                "platform": "MI325X+Thor2",
+                "node1_host": "10.32.80.214",
                 "node2_host": "tus1-p8-g27",
                 "node2_port": 22,
                 "node1_ifname": "eno1",
@@ -31,6 +32,7 @@ jobs:
               // add more runners here:
               // {
               //   "runner": "label-2",
+              //   "platform": "...",
               //   "node1_host": "...",
               //   "node2_host": "...",
               //   "node2_port": 22,
@@ -43,7 +45,7 @@ jobs:
           echo "matrix=$(grep -v '//' /tmp/matrix.json | tr -d '\n')" >> $GITHUB_OUTPUT
 
   build:
-    name: mori build (${{ matrix.runner }})
+    name: mori build (${{ matrix.runner }} / ${{ matrix.platform }})
     needs: setup
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -99,7 +101,7 @@ jobs:
              bash -c 'cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install .'"
 
   intranode-test:
-    name: mori intranode test (${{ matrix.runner }})
+    name: mori intranode test (${{ matrix.runner }} / ${{ matrix.platform }})
     needs: [setup, build]
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -139,7 +141,7 @@ jobs:
       - name: MORI-IO
         run: |
           cd $GITHUB_WORKSPACE
-          timeout 60 pytest tests/python/io/
+          timeout 60 pytest tests/python/io/ -v
 
       - name: MORI-IR
         run: |
@@ -187,7 +189,7 @@ jobs:
           timeout 600 pytest tests/python/shmem/test_api.py -v
 
   internode-test:
-    name: mori internode test (${{ matrix.runner }})
+    name: mori internode test (${{ matrix.runner }} / ${{ matrix.platform }})
     needs: [setup, build, intranode-test]
     if: needs.build.result == 'success'
     runs-on: ${{ matrix.runner }}
