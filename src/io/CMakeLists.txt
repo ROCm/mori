@@ -20,8 +20,7 @@ target_link_libraries(mori_io mori_application ibverbs mlx5 hip::host hip::devic
                       mori_logging)
 target_compile_definitions(mori_io PUBLIC MSGPACK_NO_BOOST)
 if(DEFINED GPU_TARGETS)
-  set_source_files_properties(xgmi/backend_impl.cpp
-    PROPERTIES COMPILE_FLAGS "--offload-arch=${GPU_TARGETS}")
+  set_target_properties(mori_io PROPERTIES HIP_ARCHITECTURES "${GPU_TARGETS}")
 endif()
 set_target_properties(
   mori_io

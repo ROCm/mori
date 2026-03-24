@@ -34,6 +34,7 @@ Tests cover:
   2. Performance: batch_write latency benchmark across segment counts and sizes
 """
 
+import os
 import pytest
 import time
 import torch
@@ -282,11 +283,17 @@ def _run_batch_perf(xgmi_engine, op):
         xgmi_engine.deregister_memory(dst_mem)
 
 
+@pytest.mark.skipif(
+    not os.environ.get("MORI_RUN_PERF_TESTS"), reason="set MORI_RUN_PERF_TESTS=1 to run benchmarks"
+)
 def test_discrete_batch_write_performance(xgmi_engine):
     """Benchmark batch_write across GPUs with various discrete segment patterns."""
     _run_batch_perf(xgmi_engine, "batch_write")
 
 
+@pytest.mark.skipif(
+    not os.environ.get("MORI_RUN_PERF_TESTS"), reason="set MORI_RUN_PERF_TESTS=1 to run benchmarks"
+)
 def test_discrete_batch_read_performance(xgmi_engine):
     """Benchmark batch_read across GPUs with various discrete segment patterns."""
     _run_batch_perf(xgmi_engine, "batch_read")
@@ -298,7 +305,6 @@ def test_discrete_batch_read_performance(xgmi_engine):
 # TorchDistProcessManager in tests/python/utils.py.
 # ---------------------------------------------------------------------------
 
-import os
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from tests.python.utils import TorchDistContext, get_free_port
@@ -441,15 +447,19 @@ def test_discrete_batch_multiprocess():
 
     for p in processes:
         p.join(timeout=120)
+        if p.is_alive():
+            p.terminate()
+            p.join()
+            pytest.fail(f"Multi-process test timed out: worker {p.pid} did not finish within 120s")
+        assert p.exitcode == 0, f"Worker process {p.pid} exited with code {p.exitcode}"
 
+    world_size = 2
     results = []
-    while not result_queue.empty():
-        results.append(result_queue.get_nowait())
+    for _ in range(world_size):
+        results.append(result_queue.get(timeout=10))
 
     for status, msg in results:
         assert status == "PASS", f"Multi-process test failed: {msg}"
-
-    assert len(results) == 2, f"Expected 2 results, got {len(results)}"
 
 
 # ---------------------------------------------------------------------------
@@ -572,6 +582,9 @@ def _mp_perf_worker(rank, world_size, master_port, result_queue):
         result_queue.put(("FAIL", f"{e}\n{traceback.format_exc()}"))
 
 
+@pytest.mark.skipif(
+    not os.environ.get("MORI_RUN_PERF_TESTS"), reason="set MORI_RUN_PERF_TESTS=1 to run benchmarks"
+)
 def test_discrete_batch_multiprocess_performance():
     """Multi-process XGMI performance benchmark for discrete buffer
     batch_write and batch_read."""
@@ -590,14 +603,18 @@ def test_discrete_batch_multiprocess_performance():
 
     for p in processes:
         p.join(timeout=300)
+        if p.is_alive():
+            p.terminate()
+            p.join()
+            pytest.fail(f"Multi-process perf test timed out: worker {p.pid} did not finish within 300s")
+        assert p.exitcode == 0, f"Worker process {p.pid} exited with code {p.exitcode}"
 
+    world_size = 2
     results = []
-    while not result_queue.empty():
-        results.append(result_queue.get_nowait())
+    for _ in range(world_size):
+        results.append(result_queue.get(timeout=10))
 
     for status, msg in results:
         assert status == "PASS", f"Multi-process perf test failed: {msg}"
         if msg:
             print(msg)
-
-    assert len(results) == 2, f"Expected 2 results, got {len(results)}"

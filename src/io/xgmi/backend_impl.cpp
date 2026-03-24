@@ -327,6 +327,7 @@ void XgmiBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
 
   // Fallback: individual hipMemcpy per merged segment — always uses dstDevice
   // because hipMemcpyPeerAsync handles cross-device routing internally.
+  int eventDevice = kernelDevice;
   if (kernelOnLocal) {
     (void)hipSetDevice(dstDevice);
     hipStream_t memcpyStream = streamPool->GetNextStream(dstDevice);
@@ -335,6 +336,10 @@ void XgmiBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
       eventPool->PutEvent(event, kernelDevice);
       stream = memcpyStream;
       event = memcpyEvent;
+      eventDevice = dstDevice;
+    } else {
+      // Cannot obtain dstDevice resources; stay on kernelDevice.
+      (void)hipSetDevice(kernelDevice);
     }
   }
 
@@ -352,7 +357,7 @@ void XgmiBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
     if (err != hipSuccess) {
       status->Update(StatusCode::ERR_GPU_OP,
                      std::string("XGMI: memcpy failed: ") + hipGetErrorString(err));
-      eventPool->PutEvent(event, dstDevice);
+      eventPool->PutEvent(event, eventDevice);
       return;
     }
   }
@@ -361,12 +366,12 @@ void XgmiBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
   if (err != hipSuccess) {
     status->Update(StatusCode::ERR_GPU_OP,
                    std::string("XGMI: hipEventRecord failed: ") + hipGetErrorString(err));
-    eventPool->PutEvent(event, dstDevice);
+    eventPool->PutEvent(event, eventDevice);
     return;
   }
 
   status->SetCode(StatusCode::IN_PROGRESS);
-  status->SetWaitCallback([status, event, dstDevice, pool = eventPool]() {
+  status->SetWaitCallback([status, event, eventDevice, pool = eventPool]() {
     hipError_t e = hipEventSynchronize(event);
     if (e == hipSuccess) {
       status->SetCode(StatusCode::SUCCESS);
@@ -374,7 +379,7 @@ void XgmiBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
       status->Update(StatusCode::ERR_GPU_OP,
                      std::string("XGMI: hipEventSynchronize failed: ") + hipGetErrorString(e));
     }
-    pool->PutEvent(event, dstDevice);
+    pool->PutEvent(event, eventDevice);
   });
   MORI_IO_TRACE("XGMI: Batch transfer via hipMemcpy, id={}, segments={}, isRead={}", id,
                 segments.size(), isRead);
