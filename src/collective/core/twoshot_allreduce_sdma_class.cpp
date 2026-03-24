@@ -301,10 +301,12 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             size_t min_chunk = std::max<size_t>(
                 static_cast<size_t>(pack_size) * npes_,
                 (512ULL * 1024 / dtype_size_) * npes_);
-            // 1 chunk is optimal for both modes:
-            //   SDMA: cross-PE barrier overhead (~5µs/chunk) dominates savings
-            //   P2P:  bidirectional xGMI, no scatter overhead
-            chunk_elems = total_count;
+            if (scatter_mode == 1) {
+                chunk_elems = total_count;
+            } else {
+                // SDMA: 4 chunks for scatter/reduce/AG pipeline overlap
+                chunk_elems = total_count / 4;
+            }
             if (chunk_elems < min_chunk)
                 chunk_elems = min_chunk;
         }

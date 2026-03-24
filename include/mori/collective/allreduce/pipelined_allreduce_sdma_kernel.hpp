@@ -1,17 +1,16 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
 // MIT License (see twoshot_sdma_kernel.hpp for full text)
 //
-// Pipelined AllReduce SDMA kernel.
+// Pipelined AllReduce kernel.
 //
-// SCATTER_MODE=0: SDMA scatter → reduce → cross-PE barrier → CU AllGather
-//   The fused reduce+CU-AG has a cross-PE HBM race: PE X's CU AG write to
-//   PE Y's HBM can arrive before PE Y reads the scatter data at the same
-//   address (xGMI bypasses L2; L2 cold-miss reads from HBM which may
-//   already be overwritten). Fix: split reduce / CU-AG with a lightweight
-//   cross-PE barrier on signal-slot qId=2.
+// SCATTER_MODE=0: 3-stage SDMA pipeline
+//   scatter(c) | reduce(c-1) | SDMA_AG(c-2)
+//   All data movement via SDMA (scatter + allgather); CU only does reduce.
+//   SDMA AG runs on a separate engine, overlapping with scatter + reduce.
+//   No cross-PE HBM race (SDMA reads local HBM, writes remote HBM).
 //
 // SCATTER_MODE=1: P2P read (inputSymmObj) + CU AG write (dstMemObj)
-//   Input and output are separate buffers → no cross-PE race → fused.
+//   Input/output are separate buffers → no cross-PE race → fused.
 //
 #pragma once
 
@@ -57,6 +56,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
   const int numChunks =
       static_cast<int>((packedPerRank + packedChunkPerRank - 1) / packedChunkPerRank);
   const size_t chunkBytes = chunkPerRank * bytesPerElement;
+  const size_t totalShardBytes = elementCountPerRank * bytesPerElement;
 
   const size_t tid =
       static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + threadIdx.x;
@@ -66,26 +66,19 @@ __global__ void PipelinedAllReduceSdmaKernel(
   P* __restrict__ buf = reinterpret_cast<P*>(dstMemObj->localPtr);
   const uint32_t numQ = dstMemObj->sdmaNumQueue;
 
-  // ---- Shared state ----
   __shared__ uint32_t s_gen;
   __shared__ uint64_t s_scatter_base;
   __shared__ uint64_t s_ag_base;
-  __shared__ uint64_t s_rd_base;  // reduce-done baseline (qId=2)
   __shared__ uint32_t s_gather_count;
 
   if (threadIdx.x == 0) {
     s_gen = barrier->flag;
     s_scatter_base = 0;
     s_ag_base = 0;
-    s_rd_base = 0;
     s_gather_count = 0;
   }
   __syncthreads();
 
-  // Read actual signal baselines from the first non-self peer.
-  // barrier->flag diverges from scatter signals when broadcastBarrier is
-  // called more than once per scatter (e.g. 2× per chunk with cross-PE
-  // barrier), so we must read the real signal values here.
   if (blockIdx.x == 0 && threadIdx.x == 0) {
     for (int i = 0; i < npes; ++i) {
       if (i != myPe) {
@@ -93,8 +86,6 @@ __global__ void PipelinedAllReduceSdmaKernel(
             dstMemObj->signalPtrs + static_cast<size_t>(i) * numQ + 0);
         s_ag_base = core::AtomicLoadRelaxed(
             dstMemObj->signalPtrs + static_cast<size_t>(i) * numQ + 1);
-        s_rd_base = core::AtomicLoadRelaxed(
-            dstMemObj->signalPtrs + static_cast<size_t>(i) * numQ + 2);
         break;
       }
     }
@@ -103,10 +94,9 @@ __global__ void PipelinedAllReduceSdmaKernel(
 
   const uint64_t scatterBase = s_scatter_base;
   const uint64_t agBase = s_ag_base;
-  const uint64_t rdBase = s_rd_base;
 
   // =========================================================================
-  // Intra-PE barriers (block 0 ↔ all blocks)
+  // Intra-PE barriers
   // =========================================================================
   auto broadcastBarrier = [&]() {
     if (blockIdx.x == 0) {
@@ -146,7 +136,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
   };
 
   // =========================================================================
-  // Reduce only — reads scatter data from buf, writes to local myDst.
+  // Reduce — reads scatter data from buf, writes result to local myDst.
   // =========================================================================
   auto reduceOnly = [&](int chunkIdx) {
     const size_t off = static_cast<size_t>(chunkIdx) * packedChunkPerRank;
@@ -172,29 +162,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
   };
 
   // =========================================================================
-  // CU AllGather only — reads local reduce result, writes to remote peers.
-  // =========================================================================
-  auto cuAgOnly = [&](int chunkIdx) {
-    const size_t off = static_cast<size_t>(chunkIdx) * packedChunkPerRank;
-    size_t cnt = packedChunkPerRank;
-    if (off + cnt > packedPerRank) cnt = packedPerRank - off;
-
-    const P* __restrict__ myResult =
-        buf + static_cast<size_t>(myPe) * packedPerRank + off;
-
-    for (size_t k = tid; k < cnt; k += stride) {
-      P val = myResult[k];
-      for (int pe = 0; pe < npes; ++pe) {
-        if (pe == myPe) continue;
-        reinterpret_cast<P*>(dstMemObj->peerPtrs[pe])
-            [static_cast<size_t>(myPe) * packedPerRank + off + k] = val;
-      }
-    }
-  };
-
-  // =========================================================================
   // Fused P2P read-reduce + CU AllGather (SCATTER_MODE=1 only)
-  // Input/output are separate symmetric buffers → no cross-PE race.
   // =========================================================================
   auto p2pReduceAndCuAg = [&](int chunkIdx) {
     const size_t off = static_cast<size_t>(chunkIdx) * packedChunkPerRank;
@@ -225,64 +193,8 @@ __global__ void PipelinedAllReduceSdmaKernel(
   };
 
   // =========================================================================
-  // Cross-PE signaling helpers
+  // Final AG wait — block 0 waits for cumulative SDMA AG signals.
   // =========================================================================
-
-  // Signal all remote PEs that our reduce is done (qId=2, system-scope).
-  // RELEASE ordering ensures prior stores (reduce result in L2/HBM) are
-  // visible before the signal becomes visible at the remote PE.
-  auto signalReduceDone = [&]() {
-    if (blockIdx.x == 0) {
-      const int pe = static_cast<int>(threadIdx.x);
-      if (pe < npes && pe != myPe) {
-        HSAuint64* sig = dstMemObj->peerSignalPtrs[pe]
-            + static_cast<size_t>(myPe) * numQ + 2;
-        __hip_atomic_fetch_add(sig, 1ULL,
-                               __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
-      }
-    }
-  };
-
-  // Block 0 waits until all remote PEs have finished their reduce for the
-  // current chunk.  After this returns, it is safe for any PE to issue
-  // CU AG writes that touch remote PEs' transit buffers.
-  auto waitReduceDone = [&](int chunkOrdinal) {
-    if (blockIdx.x != 0) return;
-    const int thr = static_cast<int>(threadIdx.x);
-    if (thr < npes - 1) {
-      const int sender = thr < myPe ? thr : thr + 1;
-      const uint64_t expected =
-          rdBase + static_cast<uint64_t>(chunkOrdinal);
-      HSAuint64* sig = dstMemObj->signalPtrs
-          + static_cast<size_t>(sender) * numQ + 2;
-      int spin = 0;
-      while (core::AtomicLoadRelaxed(sig) < expected) {
-        if (++spin > 100000000) {
-          printf("PE %d: reduce-done timeout chunk=%d peer=%d exp=%llu act=%llu\n",
-                 myPe, chunkOrdinal - 1, sender,
-                 (unsigned long long)expected,
-                 (unsigned long long)core::AtomicLoadRelaxed(sig));
-          break;
-        }
-      }
-    }
-    __syncthreads();
-  };
-
-  // Signal all remote PEs that our AG write for one chunk is done (qId=1).
-  auto signalAg = [&]() {
-    if (blockIdx.x == 0) {
-      const int pe = static_cast<int>(threadIdx.x);
-      if (pe < npes && pe != myPe) {
-        HSAuint64* sig = dstMemObj->peerSignalPtrs[pe]
-            + static_cast<size_t>(myPe) * numQ + 1;
-        __hip_atomic_fetch_add(sig, 1ULL,
-                               __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
-      }
-    }
-  };
-
-  // Block 0 waits for cumulative AG signals from all peers (all chunks).
   auto finalAgWait = [&]() {
     if (blockIdx.x != 0) return;
     const int thr = static_cast<int>(threadIdx.x);
@@ -307,28 +219,23 @@ __global__ void PipelinedAllReduceSdmaKernel(
   };
 
   // =========================================================================
-  // Main pipeline — SCATTER_MODE = 0 (SDMA scatter + CU AllGather)
+  // Main pipeline — SCATTER_MODE = 0
   // =========================================================================
   //
-  // Per-chunk timeline:
+  // 3-stage pipeline:  scatter(c) | reduce(c-1) | SDMA_AG(c-2)
   //
-  //   Block 0: scatter submit(c) | scatter wait(c-1)   [parallel wavefronts]
-  //   __syncthreads
-  //   broadcastBarrier            → all blocks know scatter(c-1) data ready
-  //   reduceOnly(c-1)            → all blocks read scatter data, write local
-  //   __threadfence_system        → flush local reduce result to HBM
-  //   gatherBarrier               → all local blocks done with reduce
-  //   signalReduceDone            → block 0 tells remote PEs "reduce done"
-  //   waitReduceDone              → block 0 waits for all remote PEs
-  //   broadcastBarrier            → all blocks know it's safe to CU AG
-  //   cuAgOnly(c-1)              → all blocks write to remote peers via xGMI
-  //   __threadfence               → drain xGMI stores
-  //   gatherBarrier               → all local blocks done with CU AG
-  //   signalAg                    → block 0 tells remote PEs "AG done"
+  //   c=0: scatter(0)
+  //   c=1: scatter(1)+wait(0)                     → reduce(0) + wbl2
+  //   c=2: AG(0) + scatter(2)+wait(1)             → reduce(1) + wbl2
+  //   ...
+  //   c=N: AG(N-2) + wait(N-1)                    → reduce(N-1) + wbl2
+  //   drain: AG(N-1)
+  //   finalAgWait
+  //
+  // SDMA AG runs on a separate SDMA engine (qId=1), overlapping with
+  // scatter (qId=0) and CU reduce.  ~5× faster than CU xGMI stores.
   //
   if constexpr (SCATTER_MODE == 0) {
-
-    int rdChunkOrd = 0;
 
     for (int c = 0; c <= numChunks; c++) {
 
@@ -336,11 +243,31 @@ __global__ void PipelinedAllReduceSdmaKernel(
       if (blockIdx.x == 0) {
         const int thr = static_cast<int>(threadIdx.x);
 
-        // Warp 0: SDMA scatter submit for chunk c
+        // SDMA AG submit for chunk c-2 (reduce completed 1 iteration ago)
+        if (c >= 2 && thr < npes && thr != myPe) {
+          const int agChunk = c - 2;
+          const int destPe = thr;
+          const size_t cOff = static_cast<size_t>(agChunk) * chunkBytes;
+          size_t actualBytes = chunkBytes;
+          if (cOff + actualBytes > totalShardBytes)
+            actualBytes = totalShardBytes - cOff;
+          if (actualBytes > 0) {
+            uint8_t* src = reinterpret_cast<uint8_t*>(dstMemObj->localPtr)
+                + static_cast<size_t>(myPe) * totalShardBytes + cOff;
+            uint8_t* dst = reinterpret_cast<uint8_t*>(dstMemObj->peerPtrs[destPe])
+                + static_cast<size_t>(myPe) * totalShardBytes + cOff;
+            anvil::SdmaQueueDeviceHandle** dh =
+                dstMemObj->deviceHandles_d + destPe * numQ;
+            HSAuint64* rSig = dstMemObj->peerSignalPtrs[destPe]
+                + static_cast<size_t>(myPe) * numQ;
+            core::SdmaPutThread(src, dst, actualBytes, dh, rSig, numQ, 1);
+          }
+        }
+
+        // SDMA scatter submit for chunk c
         if (c < numChunks && thr < npes && thr != myPe) {
           const int destPe = thr;
           const size_t cOff = static_cast<size_t>(c) * chunkBytes;
-          const size_t totalShardBytes = elementCountPerRank * bytesPerElement;
           size_t actualBytes = chunkBytes;
           if (cOff + actualBytes > totalShardBytes)
             actualBytes = totalShardBytes - cOff;
@@ -357,7 +284,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
           }
         }
 
-        // Warp 1: parallel scatter wait for chunk c-1
+        // Parallel scatter wait for chunk c-1
         if (c >= 1 && thr >= 64 && thr < 64 + npes - 1) {
           const int idx = thr - 64;
           const int sender = idx < myPe ? idx : idx + 1;
@@ -382,24 +309,42 @@ __global__ void PipelinedAllReduceSdmaKernel(
 
       // ---- Compute phase (all blocks, for chunk c-1) ----
       if (c >= 1) {
-        // Phase 1: Reduce — all PEs read scatter data, write local result.
         broadcastBarrier();
         reduceOnly(c - 1);
+#if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
+        __syncthreads();
+        if (threadIdx.x == 0) {
+          asm volatile("buffer_wbl2" ::: "memory");
+        }
+        __syncthreads();
+#else
         __threadfence_system();
+#endif
         gatherBarrier();
+      }
+    }
 
-        // Cross-PE barrier: all PEs must finish reduce before any PE
-        // starts CU AG (which writes to remote PEs' transit buffers).
-        rdChunkOrd++;
-        signalReduceDone();
-        waitReduceDone(rdChunkOrd);
-
-        // Phase 2: CU AllGather — safe now that all PEs finished reduce.
-        broadcastBarrier();
-        cuAgOnly(c - 1);
-        __threadfence();
-        gatherBarrier();
-        signalAg();
+    // Drain: submit AG for the last chunk
+    if (blockIdx.x == 0) {
+      const int thr = static_cast<int>(threadIdx.x);
+      if (thr < npes && thr != myPe) {
+        const int agChunk = numChunks - 1;
+        const int destPe = thr;
+        const size_t cOff = static_cast<size_t>(agChunk) * chunkBytes;
+        size_t actualBytes = chunkBytes;
+        if (cOff + actualBytes > totalShardBytes)
+          actualBytes = totalShardBytes - cOff;
+        if (actualBytes > 0) {
+          uint8_t* src = reinterpret_cast<uint8_t*>(dstMemObj->localPtr)
+              + static_cast<size_t>(myPe) * totalShardBytes + cOff;
+          uint8_t* dst = reinterpret_cast<uint8_t*>(dstMemObj->peerPtrs[destPe])
+              + static_cast<size_t>(myPe) * totalShardBytes + cOff;
+          anvil::SdmaQueueDeviceHandle** dh =
+              dstMemObj->deviceHandles_d + destPe * numQ;
+          HSAuint64* rSig = dstMemObj->peerSignalPtrs[destPe]
+              + static_cast<size_t>(myPe) * numQ;
+          core::SdmaPutThread(src, dst, actualBytes, dh, rSig, numQ, 1);
+        }
       }
     }
 
@@ -409,20 +354,24 @@ __global__ void PipelinedAllReduceSdmaKernel(
     // =========================================================================
     // Main pipeline — SCATTER_MODE = 1 (P2P read + CU AllGather)
     // =========================================================================
-    // Input/output are separate symmetric buffers → fused reduce+AG is safe.
-
     for (int c = 0; c < numChunks; c++) {
       p2pReduceAndCuAg(c);
       __threadfence_system();
       gatherBarrier();
-      signalAg();
+      if (blockIdx.x == 0) {
+        const int pe = static_cast<int>(threadIdx.x);
+        if (pe < npes && pe != myPe) {
+          HSAuint64* sig = dstMemObj->peerSignalPtrs[pe]
+              + static_cast<size_t>(myPe) * numQ + 1;
+          __hip_atomic_fetch_add(sig, 1ULL,
+                                 __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+        }
+      }
     }
 
     finalAgWait();
   }
 
-  // Flush local reduce results from L2 → HBM for subsequent host/DMA reads.
-  // CU AG stores bypass L2 (fine-grained xGMI) — only local writes need flush.
 #if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
   __syncthreads();
   if (threadIdx.x == 0) {
