@@ -75,16 +75,22 @@ __global__ void PipelinedAllReduceSdmaKernel(
 
   if (threadIdx.x == 0) {
     s_gen = barrier->flag;
-    s_scatter_base = static_cast<uint64_t>(barrier->flag);
+    s_scatter_base = 0;
     s_ag_base = 0;
     s_rd_base = 0;
     s_gather_count = 0;
   }
   __syncthreads();
 
+  // Read actual signal baselines from the first non-self peer.
+  // barrier->flag diverges from scatter signals when broadcastBarrier is
+  // called more than once per scatter (e.g. 2× per chunk with cross-PE
+  // barrier), so we must read the real signal values here.
   if (blockIdx.x == 0 && threadIdx.x == 0) {
     for (int i = 0; i < npes; ++i) {
       if (i != myPe) {
+        s_scatter_base = core::AtomicLoadRelaxed(
+            dstMemObj->signalPtrs + static_cast<size_t>(i) * numQ + 0);
         s_ag_base = core::AtomicLoadRelaxed(
             dstMemObj->signalPtrs + static_cast<size_t>(i) * numQ + 1);
         s_rd_base = core::AtomicLoadRelaxed(
