@@ -16,6 +16,9 @@ jobs:
       credentials:
         username: ${{ secrets.DOCKER_USERNAME }}
         password: ${{ secrets.DOCKER_PASSWORD }}
+      options: >-
+        --device=/dev/kfd --device=/dev/dri --device=/dev/infiniband
+        --group-add video --ipc=host --privileged
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -38,6 +41,9 @@ jobs:
       credentials:
         username: ${{ secrets.DOCKER_USERNAME }}
         password: ${{ secrets.DOCKER_PASSWORD }}
+      options: >-
+        --device=/dev/kfd --device=/dev/dri --device=/dev/infiniband
+        --group-add video --ipc=host --privileged
     timeout-minutes: 30
     env:
       PYTHONPATH: ${{ github.workspace }}:$PYTHONPATH
