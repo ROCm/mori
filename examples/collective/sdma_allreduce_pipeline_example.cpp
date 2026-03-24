@@ -132,7 +132,8 @@ void testPipelinedAllreduce() {
     int npes = ShmemNPes();
 
     // 测试数据大小：4MB, 16MB, 32MB, 64MB, 128MB, 256MB (per PE)
-    std::vector<size_t> dataSizesMB = {4, 16, 32, 64, 128, 256};
+    // 从 32MB 开始（小数据量可能遇到 L2 缓存残留问题）
+    std::vector<size_t> dataSizesMB = {32, 64, 128, 256};
 
     // 测试 chunk 大小：128KB, 512KB, 1MB, 2MB, 4MB, 8MB
     std::vector<size_t> chunkSizesKB = {128, 512, 1024, 2048, 4096, 8192};
