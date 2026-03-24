@@ -112,13 +112,13 @@ jobs:
           timeout 600 pytest tests/python/shmem/test_api.py -v
 
       - name: MORI-EP async kernel bench (intranode)
-        if: false
+        if: true
         run: |
           cd $GITHUB_WORKSPACE
           PORT=12390
-          for TOKENS in 64 128 1024 4096; do
+          for TOKENS in 64 128; do
             echo "=== async_ll bench max-tokens=$TOKENS port=$PORT ==="
-            MORI_ENABLE_SDMA=1 MORI_SHMEM_MODE=ISOLATION GPU_PER_NODE=8 \
+            MORI_ENABLE_SDMA=1 GPU_PER_NODE=8 \
             timeout 120 torchrun \
               --nnodes=1 --node_rank=0 --nproc_per_node=1 \
               --master_addr=127.0.0.1 --master_port=$PORT \
