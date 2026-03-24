@@ -57,6 +57,7 @@ jobs:
         username: ${{ secrets.DOCKER_USERNAME }}
         password: ${{ secrets.DOCKER_PASSWORD }}
       options: >-
+        --network=host
         --device=/dev/kfd --device=/dev/dri --device=/dev/infiniband
         --group-add video --ipc=host --privileged
         -v /root/.ssh:/root/.ssh
@@ -88,6 +89,7 @@ jobs:
             docker rm -f mori_ci_${{ github.run_id }} 2>/dev/null || true
             docker run -d \
               --name mori_ci_${{ github.run_id }} \
+              --network=host \
               --device=/dev/kfd --device=/dev/dri --device=/dev/infiniband \
               --group-add video --ipc=host --privileged \
               -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
@@ -114,6 +116,7 @@ jobs:
         username: ${{ secrets.DOCKER_USERNAME }}
         password: ${{ secrets.DOCKER_PASSWORD }}
       options: >-
+        --network=host
         --device=/dev/kfd --device=/dev/dri --device=/dev/infiniband
         --group-add video --ipc=host --privileged
         -v /root/.ssh:/root/.ssh
@@ -203,6 +206,7 @@ jobs:
         username: ${{ secrets.DOCKER_USERNAME }}
         password: ${{ secrets.DOCKER_PASSWORD }}
       options: >-
+        --network=host
         --device=/dev/kfd --device=/dev/dri --device=/dev/infiniband
         --group-add video --ipc=host --privileged
         -v /root/.ssh:/root/.ssh
