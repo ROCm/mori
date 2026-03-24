@@ -58,6 +58,29 @@ class PoolClient {
   bool Get(const std::string& key, void* dst, size_t size, bool zero_copy = true);
   bool Remove(const std::string& key);
 
+  // Phase 2: DRAM-only methods for UMBPClient integration.
+  // UMBPClient handles local storage directly and calls these for cluster
+  // interactions only. PoolClient never touches local storage.
+
+  // Register an already-written local block with the Master so remote nodes
+  // can discover it. UMBPClient provides the location_id (e.g. "0:<offset>").
+  bool RegisterWithMaster(const std::string& key, size_t size, const std::string& location_id,
+                          TierType tier);
+
+  // Check whether a block exists on any remote node (RouteGet without RDMA).
+  bool ExistsRemote(const std::string& key);
+
+  // Fetch a block from a remote node's DRAM via RDMA (RouteGet → RDMA read).
+  // DRAM-only: returns false if the remote block is on SSD.
+  bool GetRemote(const std::string& key, void* dst, size_t size);
+
+  // Write a block to a remote node's DRAM via RDMA (RoutePut → RDMA write).
+  // DRAM-only: returns false if the target tier is SSD.
+  bool PutRemote(const std::string& key, const void* src, size_t size);
+
+  // Unregister a block from the Master (block no longer remotely accessible).
+  bool UnregisterFromMaster(const std::string& key);
+
   MasterClient& Master();
   bool IsInitialized() const;
 

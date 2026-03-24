@@ -23,11 +23,11 @@
 
 #include <fcntl.h>
 #include <grpcpp/grpcpp.h>
-#include <spdlog/spdlog.h>
 #include <unistd.h>
 
 #include <cstring>
 
+#include "mori/utils/mori_log.hpp"
 #include "umbp_peer.grpc.pb.h"
 
 namespace mori::umbp {
@@ -61,8 +61,8 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
 
     uint32_t idx = request->store_index();
     if (idx >= ssd_stores_.size()) {
-      spdlog::error("[PeerService] CommitSsdWrite: store_index {} out of range (have {})", idx,
-                    ssd_stores_.size());
+      MORI_UMBP_ERROR("[PeerService] CommitSsdWrite: store_index {} out of range (have {})", idx,
+                      ssd_stores_.size());
       response->set_success(false);
       return grpc::Status::OK;
     }
@@ -74,7 +74,7 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
     }
 
     if (request->staging_offset() + request->size() > ssd_staging_size_ / 2) {
-      spdlog::error("[PeerService] CommitSsdWrite: staging_offset + size exceeds write region");
+      MORI_UMBP_ERROR("[PeerService] CommitSsdWrite: staging_offset + size exceeds write region");
       response->set_success(false);
       return grpc::Status::OK;
     }
@@ -102,8 +102,8 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
     response->set_success(true);
     response->set_ssd_location_id(request->key() + ".bin");
 
-    spdlog::info("[PeerService] CommitSsdWrite: key={}, size={}, store={}, file={}", request->key(),
-                 request->size(), idx, filename);
+    MORI_UMBP_INFO("[PeerService] CommitSsdWrite: key={}, size={}, store={}, file={}",
+                   request->key(), request->size(), idx, filename);
     return grpc::Status::OK;
   }
 
@@ -116,8 +116,8 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
     const uint64_t read_offset = ssd_staging_size_ / 2;
 
     if (request->size() > ssd_staging_size_ / 2) {
-      spdlog::error("[PeerService] PrepareSsdRead: size {} exceeds read region {}", request->size(),
-                    ssd_staging_size_ / 2);
+      MORI_UMBP_ERROR("[PeerService] PrepareSsdRead: size {} exceeds read region {}",
+                      request->size(), ssd_staging_size_ / 2);
       response->set_success(false);
       return grpc::Status::OK;
     }
@@ -139,8 +139,8 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
             if (bytes_read >= 0 && static_cast<size_t>(bytes_read) == request->size()) {
               response->set_success(true);
               response->set_staging_offset(read_offset);
-              spdlog::info("[PeerService] PrepareSsdRead: key={}, store={}, file={}, size={}",
-                           request->key(), idx, file_part, request->size());
+              MORI_UMBP_INFO("[PeerService] PrepareSsdRead: key={}, store={}, file={}, size={}",
+                             request->key(), idx, file_part, request->size());
               return grpc::Status::OK;
             }
           }
@@ -162,8 +162,8 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
       if (bytes_read >= 0 && static_cast<size_t>(bytes_read) == request->size()) {
         response->set_success(true);
         response->set_staging_offset(read_offset);
-        spdlog::info("[PeerService] PrepareSsdRead: key={}, ssd_location={}, size={}, dir={}",
-                     request->key(), loc_id, request->size(), s.dir);
+        MORI_UMBP_INFO("[PeerService] PrepareSsdRead: key={}, ssd_location={}, size={}, dir={}",
+                       request->key(), loc_id, request->size(), s.dir);
         return grpc::Status::OK;
       }
     }
@@ -209,17 +209,17 @@ bool PeerServiceServer::Start(uint16_t port) {
   server_ = builder.BuildAndStart();
 
   if (!server_) {
-    spdlog::error("[PeerService] Failed to start on {} (port may be in use)", address);
+    MORI_UMBP_ERROR("[PeerService] Failed to start on {} (port may be in use)", address);
     return false;
   }
-  spdlog::info("[PeerService] Listening on {}", address);
+  MORI_UMBP_INFO("[PeerService] Listening on {}", address);
   return true;
 }
 
 void PeerServiceServer::Stop() {
   if (server_) {
     const auto deadline = std::chrono::system_clock::now() + std::chrono::seconds(3);
-    spdlog::info("[PeerService] Shutting down");
+    MORI_UMBP_INFO("[PeerService] Shutting down");
     server_->Shutdown(deadline);
     server_.reset();
   }

@@ -19,13 +19,12 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#include <spdlog/spdlog.h>
-
 #include <csignal>
 #include <cstring>
 #include <filesystem>
 #include <thread>
 
+#include "mori/utils/mori_log.hpp"
 #include "umbp/distributed/pool_client.h"
 
 static volatile std::sig_atomic_t g_running = 1;
@@ -85,8 +84,6 @@ static void PrintUsage(const char* prog) {
 }
 
 int main(int argc, char** argv) {
-  spdlog::set_level(spdlog::level::info);
-
   if (argc < 4) {
     PrintUsage(argv[0]);
     return 1;
@@ -126,7 +123,7 @@ int main(int argc, char** argv) {
     } else if (arg == "--tier" && i + 1 < argc) {
       tier_filter = argv[++i];
     } else {
-      spdlog::error("Unknown option: {}", arg);
+      MORI_UMBP_ERROR("Unknown option: {}", arg);
       PrintUsage(argv[0]);
       return 1;
     }
@@ -210,7 +207,7 @@ int main(int argc, char** argv) {
   mori::umbp::PoolClient client(std::move(config));
 
   if (!client.Init()) {
-    spdlog::error("[Demo] Init failed");
+    MORI_UMBP_ERROR("[Demo] Init failed");
     return 1;
   }
 
@@ -224,9 +221,9 @@ int main(int argc, char** argv) {
       tier_info += "SSD=" + std::to_string(num_ssd) + "dirs ";
     }
   }
-  spdlog::info("[Demo] '{}' running as {} | {} | io={}:{} peer_port={}", node_id,
-               is_provider ? "PROVIDER" : "CONSUMER", tier_info,
-               io_host.empty() ? "(none)" : io_host, io_port, peer_port);
+  MORI_UMBP_INFO("[Demo] '{}' running as {} | {} | io={}:{} peer_port={}", node_id,
+                 is_provider ? "PROVIDER" : "CONSUMER", tier_info,
+                 io_host.empty() ? "(none)" : io_host, io_port, peer_port);
 
   // Register a data buffer for zero-copy RDMA
   constexpr size_t kDataBufSize = 4096;
@@ -235,12 +232,12 @@ int main(int argc, char** argv) {
   if (io_port > 0) {
     zero_copy_enabled = client.RegisterMemory(data_buffer.get(), kDataBufSize);
     if (zero_copy_enabled) {
-      spdlog::info("[Demo] Zero-copy buffer registered ({} bytes)", kDataBufSize);
+      MORI_UMBP_INFO("[Demo] Zero-copy buffer registered ({} bytes)", kDataBufSize);
     }
   }
 
   if (!is_provider) {
-    spdlog::info("[Demo] Consumer mode: waiting 3s for providers to register...");
+    MORI_UMBP_INFO("[Demo] Consumer mode: waiting 3s for providers to register...");
     if (!SleepInterruptible(std::chrono::seconds(3))) {
       client.Shutdown();
       return 0;
@@ -259,13 +256,13 @@ int main(int argc, char** argv) {
     std::memcpy(data_buffer.get(), data.data(), data.size());
     bool put_ok = client.Put(key, data_buffer.get(), data.size(), zero_copy_enabled);
     if (!put_ok) {
-      spdlog::warn("[Demo] #{} Put({}) FAILED", iteration, key);
+      MORI_UMBP_WARN("[Demo] #{} Put({}) FAILED", iteration, key);
       ++fail;
       if (!SleepInterruptible(std::chrono::seconds(3))) break;
       continue;
     }
-    spdlog::info("[Demo] #{} Put({}, {} bytes) OK (zero_copy={})", iteration, key, data.size(),
-                 zero_copy_enabled);
+    MORI_UMBP_INFO("[Demo] #{} Put({}, {} bytes) OK (zero_copy={})", iteration, key, data.size(),
+                   zero_copy_enabled);
 
     if (!SleepInterruptible(std::chrono::seconds(1))) break;
 
@@ -273,7 +270,7 @@ int main(int argc, char** argv) {
     std::memset(data_buffer.get(), 0, data.size());
     bool get_ok = client.Get(key, data_buffer.get(), data.size(), zero_copy_enabled);
     if (!get_ok) {
-      spdlog::warn("[Demo] #{} Get({}) FAILED", iteration, key);
+      MORI_UMBP_WARN("[Demo] #{} Get({}) FAILED", iteration, key);
       ++fail;
       if (!SleepInterruptible(std::chrono::seconds(3))) break;
       continue;
@@ -281,20 +278,20 @@ int main(int argc, char** argv) {
 
     std::string got(data_buffer.get(), data_buffer.get() + data.size());
     if (got == data) {
-      spdlog::info("[Demo] #{} Get({}) OK - data verified (zero_copy={})", iteration, key,
-                   zero_copy_enabled);
+      MORI_UMBP_INFO("[Demo] #{} Get({}) OK - data verified (zero_copy={})", iteration, key,
+                     zero_copy_enabled);
       ++pass;
     } else {
-      spdlog::error("[Demo] #{} Get({}) DATA MISMATCH: expected='{}' got='{}'", iteration, key,
-                    data, got);
+      MORI_UMBP_ERROR("[Demo] #{} Get({}) DATA MISMATCH: expected='{}' got='{}'", iteration, key,
+                      data, got);
       ++fail;
     }
 
     // Remove
     if (client.Remove(key)) {
-      spdlog::info("[Demo] #{} Remove({}) OK", iteration, key);
+      MORI_UMBP_INFO("[Demo] #{} Remove({}) OK", iteration, key);
     } else {
-      spdlog::warn("[Demo] #{} Remove({}) FAILED", iteration, key);
+      MORI_UMBP_WARN("[Demo] #{} Remove({}) FAILED", iteration, key);
     }
 
     if (!SleepInterruptible(std::chrono::seconds(3))) break;
@@ -304,6 +301,7 @@ int main(int argc, char** argv) {
     client.DeregisterMemory(data_buffer.get());
   }
   client.Shutdown();
-  spdlog::info("[Demo] Finished. {} passed, {} failed out of {} iterations", pass, fail, iteration);
+  MORI_UMBP_INFO("[Demo] Finished. {} passed, {} failed out of {} iterations", pass, fail,
+                 iteration);
   return 0;
 }

@@ -78,6 +78,9 @@ class UMBPClient {
  private:
   static UMBPConfig NormalizeConfig(const UMBPConfig& config);
 
+  // Phase 3: register a locally-written DRAM block with Master for remote discovery.
+  void MaybeRegisterWithMaster(const std::string& key, size_t size);
+
   UMBPConfig config_;
   UMBPRole role_;
   mori::umbp::LocalBlockIndex index_;

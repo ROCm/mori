@@ -277,4 +277,11 @@ std::string DRAMTier::GetLRUKey() const {
   return lru_list_.back();
 }
 
+std::optional<size_t> DRAMTier::GetSlotOffset(const std::string& key) const {
+  std::lock_guard<std::mutex> lock(mu_);
+  auto it = slots_.find(key);
+  if (it == slots_.end()) return std::nullopt;
+  return it->second.offset;
+}
+
 }  // namespace mori::umbp

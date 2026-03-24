@@ -21,10 +21,9 @@
 // SOFTWARE.
 #include "umbp/distributed/master/client_registry.h"
 
-#include <spdlog/spdlog.h>
-
 #include <algorithm>
 
+#include "mori/utils/mori_log.hpp"
 #include "umbp/distributed/master/global_block_index.h"
 
 namespace mori::umbp {
@@ -57,13 +56,13 @@ bool ClientRegistry::RegisterClient(
                             (it->second.status == ClientStatus::EXPIRED);
 
     if (it->second.status == ClientStatus::ALIVE && !is_expired) {
-      spdlog::warn("[Registry] Rejecting re-registration for alive node: {}", node_id);
+      MORI_UMBP_WARN("[Registry] Rejecting re-registration for alive node: {}", node_id);
       return false;
     }
 
     it->second.status = ClientStatus::EXPIRED;
     client_keys_.erase(node_id);
-    spdlog::info("[Registry] Re-registering expired node: {}", node_id);
+    MORI_UMBP_INFO("[Registry] Re-registering expired node: {}", node_id);
   }
 
   ClientRecord record;
@@ -118,13 +117,13 @@ bool ClientRegistry::RegisterClient(
   clients_[node_id] = std::move(record);
   client_keys_[node_id];
 
-  spdlog::info("[Registry] Registered node: {} at {} (dram_buffers={}, ssd_stores={})", node_id,
-               node_address,
-               dram_buffer_sizes.empty() ? (tier_capacities.count(TierType::DRAM) ? 1u : 0u)
-                                         : static_cast<unsigned>(dram_buffer_sizes.size()),
-               static_cast<unsigned>(ssd_store_capacities.empty()
-                                         ? (tier_capacities.count(TierType::SSD) ? 1u : 0u)
-                                         : ssd_store_capacities.size()));
+  MORI_UMBP_INFO("[Registry] Registered node: {} at {} (dram_buffers={}, ssd_stores={})", node_id,
+                 node_address,
+                 dram_buffer_sizes.empty() ? (tier_capacities.count(TierType::DRAM) ? 1u : 0u)
+                                           : static_cast<unsigned>(dram_buffer_sizes.size()),
+                 static_cast<unsigned>(ssd_store_capacities.empty()
+                                           ? (tier_capacities.count(TierType::SSD) ? 1u : 0u)
+                                           : ssd_store_capacities.size()));
   return true;
 }
 
@@ -155,7 +154,7 @@ size_t ClientRegistry::UnregisterClient(const std::string& node_id) {
     }
   }
 
-  spdlog::info("[Registry] Unregistered node: {} (keys_removed={})", node_id, keys_removed);
+  MORI_UMBP_INFO("[Registry] Unregistered node: {} (keys_removed={})", node_id, keys_removed);
   return keys_removed;
 }
 
@@ -165,7 +164,7 @@ ClientStatus ClientRegistry::Heartbeat(const std::string& node_id,
   std::unique_lock lock(mutex_);
   auto it = clients_.find(node_id);
   if (it == clients_.end()) {
-    spdlog::warn("[Registry] Heartbeat from unknown node: {}", node_id);
+    MORI_UMBP_WARN("[Registry] Heartbeat from unknown node: {}", node_id);
     return ClientStatus::UNKNOWN;
   }
 
@@ -345,8 +344,8 @@ std::optional<ClientIOInfo> ClientRegistry::GetClientIOInfo(const std::string& n
 void ClientRegistry::StartReaper() {
   reaper_running_ = true;
   reaper_thread_ = std::thread(&ClientRegistry::ReaperLoop, this);
-  spdlog::info("[Reaper] Started (interval={}s, expiry={}s)", config_.reaper_interval.count(),
-               ExpiryDuration().count());
+  MORI_UMBP_INFO("[Reaper] Started (interval={}s, expiry={}s)", config_.reaper_interval.count(),
+                 ExpiryDuration().count());
 }
 
 void ClientRegistry::StopReaper() {
@@ -356,7 +355,7 @@ void ClientRegistry::StopReaper() {
     if (reaper_thread_.joinable()) {
       reaper_thread_.join();
     }
-    spdlog::info("[Reaper] Stopped");
+    MORI_UMBP_INFO("[Reaper] Stopped");
   }
 }
 
@@ -386,7 +385,7 @@ void ClientRegistry::ReapExpiredClients() {
     while (it != clients_.end()) {
       if (now - it->second.last_heartbeat > expiry) {
         const std::string dead_id = it->first;
-        spdlog::warn("[Reaper] Reaping expired client: {}", dead_id);
+        MORI_UMBP_WARN("[Reaper] Reaping expired client: {}", dead_id);
 
         std::vector<std::string> keys_to_cleanup;
         auto keys_it = client_keys_.find(dead_id);

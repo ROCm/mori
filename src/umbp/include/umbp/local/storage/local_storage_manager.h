@@ -21,7 +21,9 @@
 // SOFTWARE.
 #pragma once
 
+#include <functional>
 #include <memory>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
@@ -36,6 +38,12 @@ namespace mori::umbp {
 
 class LocalStorageManager {
  public:
+  // Callback fired after a key changes tier or is fully evicted.
+  // to_tier == std::nullopt means the key was evicted (no destination tier).
+  // WARNING: Must NOT call back into LocalStorageManager (deadlock risk).
+  using TierChangeCallback = std::function<void(const std::string& key, StorageTier from_tier,
+                                                std::optional<StorageTier> to_tier)>;
+
   // index may be nullptr if index updates are not needed (testing).
   explicit LocalStorageManager(const UMBPConfig& config,
                                mori::umbp::LocalBlockIndex* index = nullptr);
@@ -65,6 +73,10 @@ class LocalStorageManager {
   bool CopyToSSDBatch(const std::vector<std::string>& keys);  // Batched DRAM→SSD copy
   void Clear();
 
+  // Install a callback invoked after MoveKey() or Evict() completes.
+  // Must be called before any concurrent Put/Get/Evict (typically in constructor).
+  void SetOnTierChange(TierChangeCallback cb);
+
   // Access tiers generically
   TierBackend* GetTier(StorageTier tier);
   const TierBackend* GetTier(StorageTier tier) const;
@@ -79,6 +91,7 @@ class LocalStorageManager {
   UMBPConfig config_;
   UMBPRole role_;
   mori::umbp::LocalBlockIndex* index_;  // non-owning, may be nullptr
+  TierChangeCallback on_tier_change_;   // set once before concurrent access
 
   // Ordered fastest-to-slowest: [{CPU_DRAM, dram}, {LOCAL_SSD, ssd}, ...]
   struct TierEntry {

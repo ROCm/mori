@@ -272,14 +272,20 @@ TierBackend* LocalStorageManager::NextFasterTier(StorageTier current) {
   return nullptr;
 }
 
+void LocalStorageManager::SetOnTierChange(TierChangeCallback cb) {
+  on_tier_change_ = std::move(cb);
+}
+
 bool LocalStorageManager::MoveKey(const std::string& key, TierBackend* from, TierBackend* to) {
   // Fast path for DRAM->slower movement to avoid an intermediate vector copy.
   if (from->Capabilities().zero_copy_read) {
     size_t sz = 0;
     const void* ptr = from->ReadPtr(key, &sz);
     if (ptr && sz > 0 && to->Write(key, ptr, sz)) {
+      StorageTier from_id = from->tier_id();
       from->Evict(key);
       UpsertIndexTier(key, to->tier_id(), sz);
+      if (on_tier_change_) on_tier_change_(key, from_id, to->tier_id());
       return true;
     }
   }
@@ -287,8 +293,10 @@ bool LocalStorageManager::MoveKey(const std::string& key, TierBackend* from, Tie
   auto data = from->Read(key);
   if (data.empty()) return false;
   if (!to->Write(key, data.data(), data.size())) return false;
+  StorageTier from_id = from->tier_id();
   from->Evict(key);
   UpsertIndexTier(key, to->tier_id(), data.size());
+  if (on_tier_change_) on_tier_change_(key, from_id, to->tier_id());
   return true;
 }
 
@@ -338,6 +346,7 @@ bool LocalStorageManager::Write(const std::string& key, const void* data, size_t
         bool only_on_target = !faster_than_target || !faster_than_target->Exists(k);
         target->Evict(k);
         if (only_on_target) {
+          if (on_tier_change_) on_tier_change_(k, target->tier_id(), std::nullopt);
           if (index_) index_->Remove(k);
           RemoveDepthAndGroup(k);
         }
@@ -486,7 +495,10 @@ bool LocalStorageManager::Evict(const std::string& key) {
     return false;
   }
   bool ok = tier->Evict(key);
-  if (ok && index_) index_->Remove(key);
+  if (ok) {
+    if (on_tier_change_) on_tier_change_(key, tier->tier_id(), std::nullopt);
+    if (index_) index_->Remove(key);
+  }
   RemoveDepthAndGroup(key);
   return ok;
 }

@@ -22,10 +22,10 @@
 #include "umbp/distributed/master/master_client.h"
 
 #include <grpcpp/grpcpp.h>
-#include <spdlog/spdlog.h>
 
 #include <system_error>
 
+#include "mori/utils/mori_log.hpp"
 #include "umbp.grpc.pb.h"
 
 namespace mori::umbp {
@@ -47,7 +47,7 @@ MasterClient::MasterClient(const MasterClientConfig& config)
       stub_(nullptr, [](void* p) { delete static_cast<::umbp::UMBPMaster::Stub*>(p); }) {
   channel_ = grpc::CreateChannel(config.master_address, grpc::InsecureChannelCredentials());
   stub_.reset(::umbp::UMBPMaster::NewStub(channel_).release());
-  spdlog::info("[Client] Created, master={}", config.master_address);
+  MORI_UMBP_INFO("[Client] Created, master={}", config.master_address);
 }
 
 MasterClient::~MasterClient() {
@@ -102,7 +102,7 @@ grpc::Status MasterClient::RegisterSelf(
   auto status = GetStub(stub_.get())->RegisterClient(&ctx, req, &resp);
 
   if (!status.ok()) {
-    spdlog::error("[Client] RegisterClient failed: {}", status.error_message());
+    MORI_UMBP_ERROR("[Client] RegisterClient failed: {}", status.error_message());
     return status;
   }
 
@@ -114,8 +114,8 @@ grpc::Status MasterClient::RegisterSelf(
     current_capacities_ = tier_capacities;
   }
 
-  spdlog::info("[Client] Registered with master (heartbeat_interval={}ms, dram_buffers={})",
-               heartbeat_interval_ms_, dram_memory_desc_bytes_list.size());
+  MORI_UMBP_INFO("[Client] Registered with master (heartbeat_interval={}ms, dram_buffers={})",
+                 heartbeat_interval_ms_, dram_memory_desc_bytes_list.size());
 
   if (config_.auto_heartbeat) {
     StartHeartbeat();
@@ -139,9 +139,9 @@ grpc::Status MasterClient::UnregisterSelf() {
   auto status = GetStub(stub_.get())->UnregisterClient(&ctx, req, &resp);
 
   if (status.ok()) {
-    spdlog::info("[Client] Unregistered from master (keys_removed={})", resp.keys_removed());
+    MORI_UMBP_INFO("[Client] Unregistered from master (keys_removed={})", resp.keys_removed());
   } else {
-    spdlog::error("[Client] UnregisterClient failed: {}", status.error_message());
+    MORI_UMBP_ERROR("[Client] UnregisterClient failed: {}", status.error_message());
   }
   registered_ = false;
   return status;
@@ -171,11 +171,12 @@ grpc::Status MasterClient::Register(const std::string& key, const Location& loca
   grpc::ClientContext ctx;
   auto status = GetStub(stub_.get())->Register(&ctx, req, &resp);
   if (!status.ok()) {
-    spdlog::error("[Client] Register(key={}) failed: {}", key, status.error_message());
+    MORI_UMBP_ERROR("[Client] Register(key={}) failed: {}", key, status.error_message());
     return status;
   }
 
-  spdlog::info("[Client] Registered key='{}' location='{}'", key, normalized_location.location_id);
+  MORI_UMBP_INFO("[Client] Registered key='{}' location='{}'", key,
+                 normalized_location.location_id);
   return grpc::Status::OK;
 }
 
@@ -208,7 +209,7 @@ grpc::Status MasterClient::Unregister(const std::string& key, const Location& lo
   grpc::ClientContext ctx;
   auto status = GetStub(stub_.get())->Unregister(&ctx, req, &resp);
   if (!status.ok()) {
-    spdlog::error("[Client] Unregister(key={}) failed: {}", key, status.error_message());
+    MORI_UMBP_ERROR("[Client] Unregister(key={}) failed: {}", key, status.error_message());
     return status;
   }
 
@@ -216,8 +217,8 @@ grpc::Status MasterClient::Unregister(const std::string& key, const Location& lo
     *removed = resp.removed();
   }
 
-  spdlog::info("[Client] Unregistered key='{}' location='{}' (removed={})", key,
-               normalized_location.location_id, resp.removed());
+  MORI_UMBP_INFO("[Client] Unregistered key='{}' location='{}' (removed={})", key,
+                 normalized_location.location_id, resp.removed());
   return grpc::Status::OK;
 }
 
@@ -241,7 +242,7 @@ grpc::Status MasterClient::RouteGet(const std::string& key,
   auto status = GetStub(stub_.get())->RouteGet(&ctx, req, &resp);
 
   if (!status.ok()) {
-    spdlog::error("[Client] RouteGet(key={}) failed: {}", key, status.error_message());
+    MORI_UMBP_ERROR("[Client] RouteGet(key={}) failed: {}", key, status.error_message());
     return status;
   }
 
@@ -259,7 +260,7 @@ grpc::Status MasterClient::RouteGet(const std::string& key,
     *out_result = result;
   }
 
-  spdlog::info("[Client] RouteGet key='{}': found={}", key, resp.found());
+  MORI_UMBP_INFO("[Client] RouteGet key='{}': found={}", key, resp.found());
   return grpc::Status::OK;
 }
 
@@ -284,7 +285,7 @@ grpc::Status MasterClient::RoutePut(const std::string& key, uint64_t block_size,
   auto status = GetStub(stub_.get())->RoutePut(&ctx, req, &resp);
 
   if (!status.ok()) {
-    spdlog::error("[Client] RoutePut(key={}) failed: {}", key, status.error_message());
+    MORI_UMBP_ERROR("[Client] RoutePut(key={}) failed: {}", key, status.error_message());
     return status;
   }
 
@@ -303,13 +304,13 @@ grpc::Status MasterClient::RoutePut(const std::string& key, uint64_t block_size,
     *out_result = result;
   }
 
-  spdlog::info("[Client] RoutePut key='{}': found={}", key, resp.found());
+  MORI_UMBP_INFO("[Client] RoutePut key='{}': found={}", key, resp.found());
   return grpc::Status::OK;
 }
 
 void MasterClient::StartHeartbeat() {
   if (!registered_) {
-    spdlog::warn("[Client] StartHeartbeat ignored: not registered");
+    MORI_UMBP_WARN("[Client] StartHeartbeat ignored: not registered");
     return;
   }
 
@@ -322,11 +323,11 @@ void MasterClient::StartHeartbeat() {
     heartbeat_thread_ = std::thread(&MasterClient::HeartbeatLoop, this);
   } catch (const std::system_error& e) {
     heartbeat_running_ = false;
-    spdlog::error("[Client] Failed to start heartbeat thread: {}", e.what());
+    MORI_UMBP_ERROR("[Client] Failed to start heartbeat thread: {}", e.what());
     return;
   }
 
-  spdlog::info("[Client] Heartbeat thread started (interval={}ms)", heartbeat_interval_ms_);
+  MORI_UMBP_INFO("[Client] Heartbeat thread started (interval={}ms)", heartbeat_interval_ms_);
 }
 
 void MasterClient::StopHeartbeat() {
@@ -339,7 +340,7 @@ void MasterClient::StopHeartbeat() {
   if (heartbeat_thread_.joinable()) {
     heartbeat_thread_.join();
   }
-  spdlog::info("[Client] Heartbeat thread stopped");
+  MORI_UMBP_INFO("[Client] Heartbeat thread stopped");
 }
 
 void MasterClient::HeartbeatLoop() {
@@ -366,23 +367,23 @@ void MasterClient::HeartbeatLoop() {
       }
     }
 
-    spdlog::info("[Client] Heartbeat sending: node_id={}, tiers={}", config_.node_id,
-                 req.tier_capacities_size());
+    MORI_UMBP_INFO("[Client] Heartbeat sending: node_id={}, tiers={}", config_.node_id,
+                   req.tier_capacities_size());
 
     ::umbp::HeartbeatResponse resp;
     grpc::ClientContext ctx;
     auto status = GetStub(stub_.get())->Heartbeat(&ctx, req, &resp);
 
     if (!status.ok()) {
-      spdlog::warn("[Client] Heartbeat failed: node_id={}, error={}", config_.node_id,
-                   status.error_message());
+      MORI_UMBP_WARN("[Client] Heartbeat failed: node_id={}, error={}", config_.node_id,
+                     status.error_message());
     } else {
       auto server_status = static_cast<ClientStatus>(resp.status());
-      spdlog::info("[Client] Heartbeat ack: node_id={}, status={}", config_.node_id,
-                   ClientStatusName(server_status));
+      MORI_UMBP_INFO("[Client] Heartbeat ack: node_id={}, status={}", config_.node_id,
+                     ClientStatusName(server_status));
 
       if (resp.status() == ::umbp::CLIENT_STATUS_UNKNOWN) {
-        spdlog::warn(
+        MORI_UMBP_WARN(
             "[Client] Master does not recognize us; "
             "re-registration needed");
       }
