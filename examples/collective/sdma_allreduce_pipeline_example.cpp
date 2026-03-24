@@ -101,7 +101,7 @@ static BenchResult runBench(const char* label, BenchFn fn,
     }
 
     int lok = ok ? 1 : 0, gok = 0;
-    MPI_Allreduce(&lok, &gok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+    MPI_Allreduce(&lok, &gok, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
     if (gok != npes) {
         if (myPe == 0) printf("  %-40s VERIFY FAILED\n", label);
         return res;
@@ -226,7 +226,7 @@ void testPipelinedAllreduce() {
                    myPe, ok ? "PASS" : "FAIL", result[0], computeExpected(npes));
 
             int lok = ok ? 1 : 0, gok = 0;
-            MPI_Allreduce(&lok, &gok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+            MPI_Allreduce(&lok, &gok, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
 
             BenchResult res;
             res.label = "串行 operator()";
