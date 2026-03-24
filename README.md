@@ -16,7 +16,7 @@
 
 To help developers get started quickly, MORI also includes a suite of optimized libraries—**MORI-EP** (MoE dispatch & combine kernels), **MORI-IO** (p2p communication for KVCache transfer), and **MORI-CCL** (collective communication)—that deliver out-of-the-box performance, with support for AMD `Pensando DSC`, Broadcom `Thor2`, and NVIDIA Mellanox `ConnectX-7` NICs.
 
-Feature summary:
+## Features summary
 - Applications
     - MORI-EP: intra and inter-node dispatch/combine kernels with SOTA performance.
     - MORI-IO: point-to-point communication library with ultra-low overhead
@@ -24,19 +24,26 @@ Feature summary:
 - Framework
     - High-performance building blocks for IBGDA / P2P and more​
     - Modular & composable components for developing communication applications, such as transport management, topology detection and etc.
-    - Shmem-style APIs
-    - C++ level APIs
-    - Python level APIs
+    - Open-Shmem-style APIs
+    - C++ and Python level APIs
+
+## Documentation
+
+| **Topic** | **Description** | **Guide** |
+|---|---|---|
+| MORI-EP | Dispatch/combine API, kernel types, configuration, usage examples | [EP Guide](docs/MORI-EP-GUIDE.md) |
+| MORI-SHMEM | Symmetric memory APIs, initialization, memory management | [Shmem Guide](docs/MORI-SHMEM-GUIDE.md) |
+| MORI-IR | Device bitcode integration for Triton and other GPU kernel frameworks | [IR Guide](docs/MORI-IR-GUIDE.md) |
+| MORI-IO | P2P communication concepts, engine/backend/session design | [IO Guide](docs/MORI-IO-GUIDE.md) |
+| MORI-VIZ | Warp-level kernel profiler with Perfetto integration | [Profiler](docs/PROFILER.md) |
 
 ## Benchmarks
 
 ### MORI-EP
 
-Benchmark result on DeepSeek V3 model configurations:
+Benchmark on DeepSeek V3 model configurations:
 
-**Bandwidth Performance**
-
-4096 tokens per batch, 7168 hidden, top-8 experts, FP8 dispatching and BF16 combining
+**Bandwidth** (4096 tokens, 7168 hidden, top-8 experts, FP8 dispatch + BF16 combine)
 
 <table>
   <tr>
@@ -75,9 +82,7 @@ Benchmark result on DeepSeek V3 model configurations:
   </tr>
 </table>
 
-**Latency Performance**
-
-128 tokens per batch, 7168 hidden, top-8 experts, FP8 dispatching and BF16 combining
+**Latency** (128 tokens, 7168 hidden, top-8 experts, FP8 dispatch + BF16 combine)
 
 <table>
   <tr>
@@ -120,14 +125,9 @@ Benchmark result on DeepSeek V3 model configurations:
 
 ### MORI-IO
 
-**NOTE**: This is the preview version of MORI-IO Benchmark performance, we will soon merge MORI-IO into main branch
+**NOTE:** This is the preview version of MORI-IO benchmark performance.
 
-Benchmark result on the following configurations:
-- Operation: GPU direct RDMA READ
-- Mode: pairwise
-- Number of consecutive Transfer: 128
-- Number of GPUs: 1
-- Hardware: MI300X + Thor2
+GPU Direct RDMA READ, pairwise, 128 consecutive transfers, 1 GPU, MI300X + Thor2:
 
 ```
 +--------------------------------------------------------------------------------------------------------+
@@ -156,8 +156,6 @@ Benchmark result on the following configurations:
 +-------------+-----------+----------------+---------------+---------------+--------------+--------------+
 ```
 
-- Session is a specific technique used in MORI-IO to reduce overhead
-
 ## Hardware Support Matrix
 
 **GPU**
@@ -185,44 +183,88 @@ Benchmark result on the following configurations:
 
 ### Prerequisites
 
-- pytorch:rocm >= 6.4.0
-- Linux packages: see packages in dockerfile
+- ROCm >= 6.4 (hipcc needed at runtime for JIT kernel compilation, not at install time)
+- System packages: `libpci-dev` (see [Dockerfile.dev](docker/Dockerfile.dev))
+- Optional: `libopenmpi-dev`, `openmpi-bin` — only needed when building C++ examples (`BUILD_EXAMPLES=ON`) or enabling MPI bootstrap (`MORI_WITH_MPI=ON`)
 
 Or build docker image with:
-```
+```bash
 cd mori && docker build -t rocm/mori:dev -f docker/Dockerfile.dev .
 ```
 
-### Install with Python
-```
+**IBGDA NIC support** (optional, for GPU-direct RDMA — auto-detected, no manual configuration needed):
+
+| NIC | User library | Headers |
+|-----|-------------|---------|
+| AMD Pollara (AINIC) | `libionic.so` | — |
+| Mellanox ConnectX | `libmlx5.so` (typically pre-installed) | — |
+| Broadcom Thor2 | `libbnxt_re.so` | `bnxt_re_dv.h`, `bnxt_re_hsi.h` |
+
+> **Note**: IBGDA requires vendor-specific DV (Direct Verbs) libraries. Mellanox `libmlx5` is
+> typically pre-installed with the kernel OFED stack. For Thor2 and Pollara, install the
+> corresponding userspace library and headers from your NIC vendor.
+
+### Install
+
+```bash
 # NOTE: for venv build, add --no-build-isolation at the end
-cd mori && pip install -r requirements-build.txt && git submodule update --init --recursive && pip3 install .
+cd mori && pip install .
 ```
 
-### Test dispatch / combine
+That's it. No hipcc needed at install time — host code compiles with a standard
+C++ compiler. GPU kernels are JIT-compiled on first use and cached to
+`~/.mori/jit/`. If a GPU is detected during install, kernel precompilation
+starts automatically in the background.
+
+To manually precompile all kernels (e.g. in a Docker image build):
+```bash
+MORI_PRECOMPILE=1 python -c "import mori"
 ```
+
+### Verify installation
+
+```bash
+python -c "import mori; print('OK')"
+```
+
+## Testing
+
+### Test MORI-EP (dispatch / combine)
+
+```bash
 cd /path/to/mori
 export PYTHONPATH=/path/to/mori:$PYTHONPATH
 
-# Test correctness
-pytest tests/python/ops/
+# Test correctness (8 GPUs)
+pytest tests/python/ops/test_dispatch_combine.py -q
 
 # Benchmark performance
-python3 tests/python/ops/bench_dispatch_combine.py
+python tests/python/ops/bench_dispatch_combine.py
 ```
 
 ### Test MORI-IO
-```
+
+```bash
 cd /path/to/mori
 export PYTHONPATH=/path/to/mori:$PYTHONPATH
 
-# Test correctness
+# Correctness tests
 pytest tests/python/io/
 
-# Benchmark performance
-# Run the following command on two nodes
+# Benchmark performance (two nodes)
 export GLOO_SOCKET_IFNAME=ens14np0
-torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 --master_addr="10.194.129.65" --master_port=1234 tests/python/io/benchmark.py --host="10.194.129.65" --enable-batch-transfer --enable-sess --buffer-size 32768 --transfer-batch-size 128
+torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 --master_addr="10.194.129.65" --master_port=1234 \
+  tests/python/io/benchmark.py --host="10.194.129.65" --enable-batch-transfer --enable-sess --buffer-size 32768 --transfer-batch-size 128
+```
+
+### Test MORI-IR (Triton + shmem integration, [guide](python/mori/ir/README.md))
+
+```bash
+# Basic shmem put (2 GPUs)
+torchrun --nproc_per_node=2 examples/shmem/ir/test_triton_shmem.py
+
+# Allreduce (8 GPUs)
+torchrun --nproc_per_node=8 examples/shmem/ir/test_triton_allreduce.py
 ```
 
 ## Contribution Guide
@@ -234,7 +276,6 @@ Welcome to MORI! We appreciate your interest in contributing. Whether you're fix
 MORI uses pre-commit hooks to maintain code quality. After cloning the repository:
 
 ```bash
-# Install and setup pre-commit
 pip install pre-commit
 cd /path/to/mori
 pre-commit install

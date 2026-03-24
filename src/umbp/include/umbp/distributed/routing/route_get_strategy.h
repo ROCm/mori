@@ -19,10 +19,33 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#include "src/pybind/mori.hpp"
+#pragma once
 
-PYBIND11_MODULE(libmori_pybinds, m) {
-  mori::RegisterMoriOps(m);
-  mori::RegisterMoriShmem(m);
-  mori::RegisterMoriIo(m);
-}
+#include <string>
+#include <vector>
+
+#include "umbp/common/types.h"
+
+namespace mori::umbp {
+
+/// Abstract interface for RouteGet replica selection.
+/// Implement this to plug in a custom read-path routing strategy.
+class RouteGetStrategy {
+ public:
+  virtual ~RouteGetStrategy() = default;
+
+  /// Select one replica from the given non-empty locations list.
+  /// @param locations  All known replicas for the requested key (non-empty).
+  /// @param node_id    The requesting client's node_id (for locality-aware strategies).
+  /// @return           The chosen Location to read from.
+  virtual Location Select(const std::vector<Location>& locations, const std::string& node_id) = 0;
+};
+
+/// Default strategy: uniform random selection among replicas.
+/// Uses thread_local RNG — no contention under concurrent calls.
+class RandomRouteGetStrategy : public RouteGetStrategy {
+ public:
+  Location Select(const std::vector<Location>& locations, const std::string& node_id) override;
+};
+
+}  // namespace mori::umbp

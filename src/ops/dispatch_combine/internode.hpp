@@ -47,7 +47,7 @@ __device__ void SyncIfDebugEnabled(const char* msg) {
 /*                                    EpDispatchInterNodeKernel                                   */
 /* ---------------------------------------------------------------------------------------------- */
 template <typename T>
-__global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
+__device__ void EpDispatchInterNodeKernel_body(EpDispatchCombineArgs<T> args) {
   const EpDispatchCombineConfig& config = args.config;
 
   int thdId = threadIdx.x;
@@ -363,11 +363,16 @@ inline __device__ void CrossDeviceBarrierInterNodeKernel(EpDispatchCombineArgs<T
   }
   __syncthreads();
 }
+template <typename T>
+__global__ void EpDispatchInterNodeKernel(EpDispatchCombineArgs<T> args) {
+  EpDispatchInterNodeKernel_body<T>(args);
+}
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                    EpCombineInterNodeKernel                                    */
 /* ---------------------------------------------------------------------------------------------- */
 template <typename T>
-__global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
+__device__ void EpCombineInterNodeKernel_body(EpDispatchCombineArgs<T> args) {
   const EpDispatchCombineConfig& config = args.config;
   int thdId = threadIdx.x;
   int thdNum = blockDim.x;
@@ -568,6 +573,11 @@ __global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
     __hip_atomic_fetch_add(args.crossDeviceBarrierFlag, 1, __ATOMIC_RELEASE,
                            __HIP_MEMORY_SCOPE_SYSTEM);
   }
+}
+
+template <typename T>
+__global__ void EpCombineInterNodeKernel(EpDispatchCombineArgs<T> args) {
+  EpCombineInterNodeKernel_body<T>(args);
 }
 
 }  // namespace moe

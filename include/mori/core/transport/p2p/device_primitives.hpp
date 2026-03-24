@@ -92,6 +92,7 @@ struct VecTypeAdaptor<float, 4> {
   using dataType = float4;
 };
 
+#ifdef MORI_HAS_OCP_FP
 template <>
 struct VecTypeAdaptor<mori_fp4_e2m1, 2> {
   using dataType = mori_fp4x2_e2m1;
@@ -101,6 +102,7 @@ template <>
 struct VecTypeAdaptor<mori_fp4_e2m1, 4> {
   using dataType = mori_fp4x4_e2m1;
 };
+#endif  // MORI_HAS_OCP_FP
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                           Load/Store                                           */
@@ -858,8 +860,9 @@ __forceinline__ __device__ void WarpCastBf16ToCombineInternalFp8(
   // Note: when T != hip_bfloat16, this function is a no-op.
   // Callers should guard with if constexpr or ensure T is hip_bfloat16.
 #else
-  static_assert(!sizeof(T*), "WarpCastBf16ToCombineInternalFp8 requires FP8 type support "
-                              "(MORI_FP8_TYPE_OCP_ENABLED or MORI_FP8_TYPE_FNUZ_ENABLED)");
+  static_assert(!sizeof(T*),
+                "WarpCastBf16ToCombineInternalFp8 requires FP8 type support "
+                "(MORI_FP8_TYPE_OCP_ENABLED or MORI_FP8_TYPE_FNUZ_ENABLED)");
 #endif
 }
 
@@ -1092,8 +1095,9 @@ __forceinline__ __device__ void WarpAccumCombineInternalFp8ToBf16(
   // Note: when T != hip_bfloat16, this function is a no-op.
   // Callers should guard with if constexpr or ensure T is hip_bfloat16.
 #else
-  static_assert(!sizeof(T*), "WarpAccumCombineInternalFp8ToBf16 requires FP8 type support "
-                              "(MORI_FP8_TYPE_OCP_ENABLED or MORI_FP8_TYPE_FNUZ_ENABLED)");
+  static_assert(!sizeof(T*),
+                "WarpAccumCombineInternalFp8ToBf16 requires FP8 type support "
+                "(MORI_FP8_TYPE_OCP_ENABLED or MORI_FP8_TYPE_FNUZ_ENABLED)");
 #endif
 }
 

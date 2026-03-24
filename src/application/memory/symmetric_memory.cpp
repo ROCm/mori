@@ -28,7 +28,7 @@
 #include <map>
 #include <vector>
 
-#include "hip/hip_runtime.h"
+#include "hip/hip_runtime_api.h"
 #include "mori/application/bootstrap/local_bootstrap.hpp"
 #include "mori/application/transport/rdma/rdma.hpp"
 #include "mori/application/transport/sdma/anvil.hpp"
@@ -103,6 +103,7 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
   SymmMemObj* cpuMemObj = new SymmMemObj();
   cpuMemObj->localPtr = localPtr;
   cpuMemObj->size = size;
+  cpuMemObj->sdmaNumQueue = anvil::GetSdmaNumChannels();
 
   // Exchange pointers (RDMA virtual addresses)
   cpuMemObj->peerPtrs = static_cast<uintptr_t*>(calloc(worldSize, sizeof(uintptr_t)));
@@ -116,13 +117,13 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
   //   - [different-node peers]: 0
   cpuMemObj->p2pPeerPtrs = static_cast<uintptr_t*>(calloc(worldSize, sizeof(uintptr_t)));
   cpuMemObj->p2pPeerPtrs[rank] = reinterpret_cast<uintptr_t>(localPtr);  // Set self pointer
-  
+
   hipIpcMemHandle_t handle;
   HIP_RUNTIME_CHECK(hipIpcGetMemHandle(&handle, localPtr));
   cpuMemObj->ipcMemHandles =
       static_cast<hipIpcMemHandle_t*>(calloc(worldSize, sizeof(hipIpcMemHandle_t)));
   bootNet.Allgather(&handle, cpuMemObj->ipcMemHandles, sizeof(hipIpcMemHandle_t));
-  
+
   // Open IPC handles for all same-node peers to establish P2P data path
   // This happens regardless of transport type selection
   for (int i = 0; i < worldSize; i++) {
@@ -132,7 +133,7 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
                                           cpuMemObj->ipcMemHandles[i],
                                           hipIpcMemLazyEnablePeerAccess));
   }
-  
+
   // Update peerPtrs based on transport type:
   // - For RDMA transport: keep remote VA (already allgathered) in peerPtrs
   // - For P2P/SDMA transport: use P2P pointer from hipIpcOpenMemHandle
@@ -181,25 +182,55 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
   if (dstDeviceIds.size() != 0) {
     int srcDeviceId = rank % 8;
     int numOfQueuesPerDevice = gpuMemObj->sdmaNumQueue;  // all sdma queues are inited
-    HIP_RUNTIME_CHECK(hipMalloc(
-        &gpuMemObj->deviceHandles_d,
-        dstDeviceIds.size() * numOfQueuesPerDevice * sizeof(anvil::SdmaQueueDeviceHandle*)));
+    // Allocate based on worldSize (not dstDeviceIds.size()) because indexing uses pe * numQ
+    // where pe ranges 0..worldSize-1. Using dstDeviceIds.size() causes buffer overflow.
+    size_t numDevices = static_cast<size_t>(worldSize);
+    HIP_RUNTIME_CHECK(
+        hipMalloc(&gpuMemObj->deviceHandles_d,
+                  numDevices * numOfQueuesPerDevice * sizeof(anvil::SdmaQueueDeviceHandle*)));
+    HIP_RUNTIME_CHECK(
+        hipMemset(gpuMemObj->deviceHandles_d, 0,
+                  numDevices * numOfQueuesPerDevice * sizeof(anvil::SdmaQueueDeviceHandle*)));
 
     for (auto& dstDeviceId : dstDeviceIds) {
       for (size_t q = 0; q < numOfQueuesPerDevice; q++) {
-        gpuMemObj->deviceHandles_d[dstDeviceId * numOfQueuesPerDevice + q] =
-            anvil::anvil.getSdmaQueue(srcDeviceId, dstDeviceId, q)->deviceHandle();
+        auto* anvilHandle = anvil::anvil.getSdmaQueue(srcDeviceId, dstDeviceId, q)->deviceHandle();
+        HIP_RUNTIME_CHECK(
+            hipMemcpy(&gpuMemObj->deviceHandles_d[dstDeviceId * numOfQueuesPerDevice + q],
+                      &anvilHandle, sizeof(anvilHandle), hipMemcpyHostToDevice));
       }
     }
 
-    HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->signalPtrs,
-                                sizeof(HSAuint64) * dstDeviceIds.size() * numOfQueuesPerDevice));
-    HIP_RUNTIME_CHECK(hipMemset(gpuMemObj->signalPtrs, 0,
-                                sizeof(HSAuint64) * dstDeviceIds.size() * numOfQueuesPerDevice));
-    HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->expectSignalsPtr,
-                                sizeof(HSAuint64) * dstDeviceIds.size() * numOfQueuesPerDevice));
-    HIP_RUNTIME_CHECK(hipMemset(gpuMemObj->expectSignalsPtr, 0,
-                                sizeof(HSAuint64) * dstDeviceIds.size() * numOfQueuesPerDevice));
+    size_t signalArraySize = sizeof(HSAuint64) * numDevices * numOfQueuesPerDevice;
+    HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->signalPtrs, signalArraySize));
+    HIP_RUNTIME_CHECK(hipMemset(gpuMemObj->signalPtrs, 0, signalArraySize));
+    HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->expectSignalsPtr, signalArraySize));
+    HIP_RUNTIME_CHECK(hipMemset(gpuMemObj->expectSignalsPtr, 0, signalArraySize));
+
+    // Exchange signal memory via IPC so each PE can write to remote PE's signalPtrs
+    hipIpcMemHandle_t signalHandle;
+    HIP_RUNTIME_CHECK(hipIpcGetMemHandle(&signalHandle, gpuMemObj->signalPtrs));
+
+    auto* signalHandles =
+        static_cast<hipIpcMemHandle_t*>(calloc(worldSize, sizeof(hipIpcMemHandle_t)));
+    bootNet.Allgather(&signalHandle, signalHandles, sizeof(hipIpcMemHandle_t));
+
+    auto* peerSignalPtrsHost = static_cast<HSAuint64**>(calloc(worldSize, sizeof(HSAuint64*)));
+    peerSignalPtrsHost[rank] = gpuMemObj->signalPtrs;
+    for (int i = 0; i < worldSize; i++) {
+      if (context.GetTransportType(i) != TransportType::SDMA) continue;
+      if (i == rank) continue;
+      void* mappedPtr = nullptr;
+      HIP_RUNTIME_CHECK(
+          hipIpcOpenMemHandle(&mappedPtr, signalHandles[i], hipIpcMemLazyEnablePeerAccess));
+      peerSignalPtrsHost[i] = reinterpret_cast<HSAuint64*>(mappedPtr);
+    }
+
+    HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->peerSignalPtrs, sizeof(HSAuint64*) * worldSize));
+    HIP_RUNTIME_CHECK(hipMemcpy(gpuMemObj->peerSignalPtrs, peerSignalPtrsHost,
+                                sizeof(HSAuint64*) * worldSize, hipMemcpyHostToDevice));
+    free(signalHandles);
+    free(peerSignalPtrsHost);
   }
   SymmMemObjPtr result{cpuMemObj, gpuMemObj};
   if (!heap_begin) {
@@ -217,7 +248,7 @@ void SymmMemManager::DeregisterSymmMemObj(void* localPtr) {
   if (rdmaDeviceContext) rdmaDeviceContext->DeregisterRdmaMemoryRegion(localPtr);
 
   SymmMemObjPtr memObjPtr = memObjPool.at(localPtr);
-  
+
   // Close IPC handles for peers that had P2P connection
   int rank = bootNet.GetLocalRank();
   int worldSize = bootNet.GetWorldSize();
@@ -234,7 +265,7 @@ void SymmMemManager::DeregisterSymmMemObj(void* localPtr) {
       }
     }
   }
-  
+
   free(memObjPtr.cpu->peerPtrs);
   free(memObjPtr.cpu->p2pPeerPtrs);
   free(memObjPtr.cpu->peerRkeys);
@@ -312,6 +343,7 @@ SymmMemObjPtr SymmMemManager::RegisterStaticHeapSubRegion(void* localPtr, size_t
       gpuMemObj->deviceHandles_d = heapObj->gpu->deviceHandles_d;
       gpuMemObj->signalPtrs = heapObj->gpu->signalPtrs;
       gpuMemObj->expectSignalsPtr = heapObj->gpu->expectSignalsPtr;
+      gpuMemObj->peerSignalPtrs = heapObj->gpu->peerSignalPtrs;
     }
   }
 
@@ -405,8 +437,7 @@ size_t SymmMemManager::DetermineVMMChunkSize(size_t userChunkSize, HeapType heap
   allocProp.type =
       (heapType == HeapType::Normal) ? hipMemAllocationTypePinned : hipMemAllocationTypeUncached;
 #elif HIP_VERSION == 70051831
-  if (heapType == HeapType::Uncached &&
-      strcmp(HIP_VERSION_GITHASH, "7c9236b16") != 0) {
+  if (heapType == HeapType::Uncached && strcmp(HIP_VERSION_GITHASH, "7c9236b16") != 0) {
     allocProp.type = static_cast<hipMemAllocationType>(0x40000000);  // hipMemAllocationTypeUncached
   } else {
     allocProp.type = hipMemAllocationTypePinned;
@@ -536,11 +567,12 @@ SymmMemObjPtr SymmMemManager::CreateVMMHeapObject(size_t virtualSize, int worldS
   SymmMemObj* cpuHeapObj = new SymmMemObj();
   cpuHeapObj->localPtr = vmmVirtualBasePtr;
   cpuHeapObj->size = virtualSize;
+  cpuHeapObj->sdmaNumQueue = anvil::GetSdmaNumChannels();
 
   // Exchange virtual base pointers among all PEs
   cpuHeapObj->peerPtrs = static_cast<uintptr_t*>(calloc(worldSize, sizeof(uintptr_t)));
   bootNet.Allgather(&vmmVirtualBasePtr, cpuHeapObj->peerPtrs, sizeof(uintptr_t));
-  
+
   // Setup P2P peer pointers (vmmPeerBasePtrs) and update peerPtrs for non-RDMA transports
   cpuHeapObj->p2pPeerPtrs = static_cast<uintptr_t*>(calloc(worldSize, sizeof(uintptr_t)));
   for (int pe = 0; pe < worldSize; ++pe) {
@@ -891,8 +923,7 @@ hipMemAllocationProp SymmMemManager::ConfigureAllocationProp(HeapType heapType, 
   allocProp.type =
       (heapType == HeapType::Normal) ? hipMemAllocationTypePinned : hipMemAllocationTypeUncached;
 #elif HIP_VERSION == 70051831
-  if (heapType == HeapType::Uncached &&
-      strcmp(HIP_VERSION_GITHASH, "7c9236b16") != 0) {
+  if (heapType == HeapType::Uncached && strcmp(HIP_VERSION_GITHASH, "7c9236b16") != 0) {
     allocProp.type = static_cast<hipMemAllocationType>(0x40000000);
   } else {
     allocProp.type = hipMemAllocationTypePinned;
@@ -1580,6 +1611,7 @@ SymmMemObjPtr SymmMemManager::VMMRegisterSymmMemObj(void* localPtr, size_t size,
   SymmMemObj* cpuMemObj = new SymmMemObj();
   cpuMemObj->localPtr = localPtr;
   cpuMemObj->size = size;
+  cpuMemObj->sdmaNumQueue = anvil::GetSdmaNumChannels();
 
   // Calculate peer pointers based on VMM per-PE virtual address spaces
   cpuMemObj->peerPtrs = static_cast<uintptr_t*>(calloc(worldSize, sizeof(uintptr_t)));

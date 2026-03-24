@@ -44,7 +44,7 @@ struct ExecutorReq {
   const application::RdmaMemoryRegion& remote;
   const SizeVec& remoteOffsets;
   const SizeVec& sizes;
-  CqCallbackMeta* callbackMeta;
+  std::shared_ptr<CqCallbackMeta> callbackMeta;
   TransferUniqueId id;
   int postBatchSize;
   bool isRead;

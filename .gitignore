@@ -9,6 +9,9 @@ lib*
 *.pyc
 .pytest_cache
 __pycache__
+python/mori/_version.py
+python/mori/_jit_sources/
+python/mori/*.so
 
 .vscode
 *.log

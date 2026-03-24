@@ -293,7 +293,7 @@ class EpDispatchCombineTestCase:
         return rank_counts, rank_counts_remote_recv, rank_counts_remote_send
 
     def run_dispatch(self, op, token, weights, scales, indices):
-        if op.config.kernel_type is mori.ops.EpDispatchCombineKernelType.AsyncLL:
+        if op.config.kernel_type in (mori.ops.EpDispatchCombineKernelType.AsyncLL,):
             ret = op.dispatch_send(token, weights, scales, indices)
             op.dispatch_recv()
         else:
@@ -301,7 +301,7 @@ class EpDispatchCombineTestCase:
         return ret
 
     def run_combine(self, op, token, weights, indices):
-        if op.config.kernel_type is mori.ops.EpDispatchCombineKernelType.AsyncLL:
+        if op.config.kernel_type in (mori.ops.EpDispatchCombineKernelType.AsyncLL,):
             ret = op.combine_send(token, weights, indices)
             op.combine_recv()
         else:
@@ -379,7 +379,7 @@ class EpDispatchCombineTestCase:
             print(f"Node {self.rank // self.gpu_per_node} Dispatch Pass")
 
         # NOTE: weight combine not implemented yet
-        if op.config.kernel_type is mori.ops.EpDispatchCombineKernelType.AsyncLL:
+        if op.config.kernel_type in (mori.ops.EpDispatchCombineKernelType.AsyncLL,):
             dispatch_weights = None
         combine_output, combine_output_weight = self.run_combine(
             op, dispatch_output, dispatch_weights, all_rank_indices[self.rank]
@@ -405,9 +405,12 @@ class EpDispatchCombineTestCase:
             if final_unique_pes == 0:
                 continue
 
-            got, expected = combine_output[i], (
-                all_rank_input[self.rank][i].to(torch.float32) * final_unique_pes
-            ).to(self.config.data_type)
+            got, expected = (
+                combine_output[i],
+                (all_rank_input[self.rank][i].to(torch.float32) * final_unique_pes).to(
+                    self.config.data_type
+                ),
+            )
 
             atol, rtol = 1e-2, 1e-2
             if getattr(self.config, "quant_type", "none") == "fp8_direct_cast":
@@ -608,10 +611,10 @@ class EpDispatchCombineTestCase:
         )
 
         if hasattr(mori.cpp, "get_debug_time_buf"):
-            my_times = mori.cpp.get_debug_time_buf(op._handle)
+            my_times = op.get_debug_time_buf()
             my_times.zero_()
             if hasattr(mori.cpp, "get_debug_time_offset"):
-                my_offsets = mori.cpp.get_debug_time_offset(op._handle)
+                my_offsets = op.get_debug_time_offset()
                 my_offsets.zero_()
 
         torch.cuda.synchronize()

@@ -30,6 +30,7 @@
 #include <numeric>
 #include <sstream>
 
+#include "mori/io/env.hpp"
 #include "mori/io/logging.hpp"
 #include "src/io/xgmi/scatter_gather_kernel.hpp"
 
@@ -375,9 +376,8 @@ bool XgmiBackendSession::Alive() const { return true; }
 XgmiBackend::XgmiBackend(EngineKey k, const IOEngineConfig& engConfig,
                          const XgmiBackendConfig& beConfig)
     : myEngKey(k), config(beConfig) {
-  const char* nodeIdEnv = std::getenv("MORI_IO_NODE_ID");
-  if (nodeIdEnv != nullptr && nodeIdEnv[0] != '\0') {
-    myNodeId = std::string(nodeIdEnv);
+  if (auto nodeId = mori::env::GetString("MORI_IO_NODE_ID"); nodeId.has_value()) {
+    myNodeId = *nodeId;
   }
   char hostname[HOST_NAME_MAX];
   gethostname(hostname, HOST_NAME_MAX);

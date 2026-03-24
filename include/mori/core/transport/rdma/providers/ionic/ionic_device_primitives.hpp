@@ -143,11 +143,12 @@ inline __device__ uint64_t PostRecv<ProviderType::PSD>(WorkQueueHandle& wq, uint
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        Read / Write APIs                                       */
 /* ---------------------------------------------------------------------------------------------- */
-// TODO: convert raddr/rkey laddr/lkey to big endien in advance to save cycles
-inline __device__ uint64_t IonicPostReadWrite(WorkQueueHandle& wq, uint32_t curPostIdx,
-                                              bool cqeSignal, uint32_t qpn, uintptr_t laddr,
-                                              uint64_t lkey, uintptr_t raddr, uint64_t rkey,
-                                              size_t bytes, bool isRead) {
+template <bool IsRead>
+inline __device__ uint64_t IonicPostReadWriteImpl(WorkQueueHandle& wq, uint32_t curPostIdx,
+                                                   bool cqeSignal, uint32_t qpn, uintptr_t laddr,
+                                                   uint64_t lkey, uintptr_t raddr, uint64_t rkey,
+                                                   size_t bytes) {
+  constexpr uint8_t opcode = IsRead ? IONIC_V2_OP_RDMA_READ : IONIC_V2_OP_RDMA_WRITE;
   void* queueBuffAddr = wq.sqAddr;
   uint32_t wqeNum = wq.sqWqeNum;
   int32_t size = (int32_t)bytes;
@@ -156,8 +157,6 @@ inline __device__ uint64_t IonicPostReadWrite(WorkQueueHandle& wq, uint32_t curP
   struct ionic_v1_wqe* wqe = reinterpret_cast<ionic_v1_wqe*>(wqeAddr);
   uint16_t wqe_flags = 0;
 
-  // MORI_PRINTF("IonicPostReadWrite, wqe:%p, curPostIdx:%d, wqeIdx:%d\n", wqe, curPostIdx, wqeIdx);
-  // to do: need to clear memory
   if ((wqeNum & curPostIdx) == 0) {
     wqe_flags |= HTOBE16(IONIC_V1_FLAG_COLOR);
   }
@@ -167,7 +166,7 @@ inline __device__ uint64_t IonicPostReadWrite(WorkQueueHandle& wq, uint32_t curP
   }
 
   wqe->base.wqe_idx = curPostIdx;
-  wqe->base.op = isRead ? IONIC_V2_OP_RDMA_READ : IONIC_V2_OP_RDMA_WRITE;
+  wqe->base.op = opcode;
   wqe->base.num_sge_key = size ? 1 : 0;
   wqe->base.imm_data_key = HTOBE32(0);
 
@@ -182,61 +181,41 @@ inline __device__ uint64_t IonicPostReadWrite(WorkQueueHandle& wq, uint32_t curP
 
   __hip_atomic_store(&wqe->base.flags, wqe_flags, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
 
-#if 0
-  MORI_PRINTF("dump wqe at addr:%p\n", wqeAddr);
-  for (int i = 0; i < 64; i++) {
-    MORI_PRINTF("%02x", (unsigned char)wqeAddr[i]);
-    if ((i+1)%4 == 0)
-      MORI_PRINTF("\n");
-  }
-#endif
-#if 0
-  MORI_PRINTF("Write, block:%u, warp:%u, lane:%u, wqe:%p, raddr:%p, rkey:%lu, len:%u, curPostIdx:%u, wqeIdx:%u, doorbell:0x%x\n",
-         blockIdx.x, threadIdx.x/warpSize, __lane_id(),
-	 wqe, raddr, rkey, size, curPostIdx, curPostIdx, ((curPostIdx + 1) & (wqeNum - 1)));
-#endif
-  //__threadfence_system();
-  // asm volatile("" ::: "memory");
-  // return doorbell value
   return wq.sq_dbval | ((curPostIdx + 1) & (wqeNum - 1));
 }
 
 template <>
-inline __device__ uint64_t PostWrite<ProviderType::PSD>(WorkQueueHandle& wq, uint32_t curPostIdx,
-                                                        uint32_t curMsntblSlotIdx,
-                                                        uint32_t curPsnIdx, bool cqeSignal,
-                                                        uint32_t qpn, uintptr_t laddr,
-                                                        uint64_t lkey, uintptr_t raddr,
-                                                        uint64_t rkey, size_t bytes) {
-  return IonicPostReadWrite(wq, curPostIdx, cqeSignal, qpn, laddr, lkey, raddr, rkey, bytes, false);
+inline __device__ uint64_t PostReadWrite<ProviderType::PSD, false>(
+    WorkQueueHandle& wq, uint32_t curPostIdx, uint32_t curMsntblSlotIdx, uint32_t curPsnIdx,
+    bool cqeSignal, uint32_t qpn, uintptr_t laddr, uint64_t lkey, uintptr_t raddr, uint64_t rkey,
+    size_t bytes) {
+  return IonicPostReadWriteImpl<false>(wq, curPostIdx, cqeSignal, qpn, laddr, lkey, raddr, rkey,
+                                       bytes);
 }
 
 template <>
-inline __device__ uint64_t PostRead<ProviderType::PSD>(WorkQueueHandle& wq, uint32_t curPostIdx,
-                                                       uint32_t curMsntblSlotIdx,
-                                                       uint32_t curPsnIdx, bool cqeSignal,
-                                                       uint32_t qpn, uintptr_t laddr, uint64_t lkey,
-                                                       uintptr_t raddr, uint64_t rkey,
-                                                       size_t bytes) {
-  return IonicPostReadWrite(wq, curPostIdx, cqeSignal, qpn, laddr, lkey, raddr, rkey, bytes, true);
+inline __device__ uint64_t PostReadWrite<ProviderType::PSD, true>(
+    WorkQueueHandle& wq, uint32_t curPostIdx, uint32_t curMsntblSlotIdx, uint32_t curPsnIdx,
+    bool cqeSignal, uint32_t qpn, uintptr_t laddr, uint64_t lkey, uintptr_t raddr, uint64_t rkey,
+    size_t bytes) {
+  return IonicPostReadWriteImpl<true>(wq, curPostIdx, cqeSignal, qpn, laddr, lkey, raddr, rkey,
+                                      bytes);
 }
 
 template <>
-inline __device__ uint64_t PostWrite<ProviderType::PSD>(WorkQueueHandle& wq, uint32_t qpn,
-                                                        uintptr_t laddr, uint64_t lkey,
-                                                        uintptr_t raddr, uint64_t rkey,
-                                                        size_t bytes) {
+inline __device__ uint64_t PostReadWrite<ProviderType::PSD, false>(
+    WorkQueueHandle& wq, uint32_t qpn, uintptr_t laddr, uint64_t lkey, uintptr_t raddr,
+    uint64_t rkey, size_t bytes) {
   uint32_t curPostIdx = atomicAdd(&wq.postIdx, 1);
-  return IonicPostReadWrite(wq, curPostIdx, true, qpn, laddr, lkey, raddr, rkey, bytes, false);
+  return IonicPostReadWriteImpl<false>(wq, curPostIdx, true, qpn, laddr, lkey, raddr, rkey, bytes);
 }
 
 template <>
-inline __device__ uint64_t PostRead<ProviderType::PSD>(WorkQueueHandle& wq, uint32_t qpn,
-                                                       uintptr_t laddr, uint64_t lkey,
-                                                       uintptr_t raddr, uint64_t rkey,
-                                                       size_t bytes) {
+inline __device__ uint64_t PostReadWrite<ProviderType::PSD, true>(
+    WorkQueueHandle& wq, uint32_t qpn, uintptr_t laddr, uint64_t lkey, uintptr_t raddr,
+    uint64_t rkey, size_t bytes) {
   uint32_t curPostIdx = atomicAdd(&wq.postIdx, 1);
-  return IonicPostReadWrite(wq, curPostIdx, true, qpn, laddr, lkey, raddr, rkey, bytes, true);
+  return IonicPostReadWriteImpl<true>(wq, curPostIdx, true, qpn, laddr, lkey, raddr, rkey, bytes);
 }
 
 /* ---------------------------------------------------------------------------------------------- */

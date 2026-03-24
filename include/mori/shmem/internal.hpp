@@ -28,6 +28,7 @@
 
 #include "mori/application/application.hpp"
 #include "mori/application/bootstrap/bootstrap.hpp"
+#include "mori/hip_compat.hpp"
 
 namespace mori {
 namespace shmem {
@@ -39,8 +40,8 @@ enum class ShmemMode {
   VMHeap       // TODO: implement virtual memory heap
 };
 
-constexpr size_t DEFAULT_STATIC_SYMMETRIC_HEAP_SIZE = 2ULL * 1024 * 1024 * 1024;  // 2GB default
-constexpr size_t DEFAULT_VMM_SYMMETRIC_HEAP_SIZE = 8ULL * 1024 * 1024 * 1024;     // 8GB default
+constexpr size_t DEFAULT_STATIC_SYMMETRIC_HEAP_SIZE = 4ULL * 1024 * 1024 * 1024;  // 4GB default
+constexpr size_t DEFAULT_VMM_SYMMETRIC_HEAP_SIZE = 16ULL * 1024 * 1024 * 1024;    // 16GB default
 constexpr size_t DEFAULT_VMM_MIN_CHUNK_SIZE = 64ULL * 1024 * 1024;                // 64MB default
 
 struct BootStates {
@@ -122,7 +123,7 @@ struct GpuStates {
   uintptr_t heapBaseAddr{0};                  // Base address of symmetric heap
   uintptr_t heapEndAddr{0};                   // End address of symmetric heap (base + size)
   application::SymmMemObj* heapObj{nullptr};  // Pointer to the heap's SymmMemObj on device
-  uint64_t* internalSyncPtr{nullptr};  // Pointer to the internal synchronization object
+  uint64_t* internalSyncPtr{nullptr};         // Pointer to the internal synchronization object
 };
 
 // Changed from __constant__ to __device__ to allow hipMemcpyToSymbol updates (like rocshmem)
@@ -141,6 +142,11 @@ struct RemoteAddrInfo {
   __device__ RemoteAddrInfo() : raddr(0), rkey(0), valid(false) {}
   __device__ RemoteAddrInfo(uintptr_t r, uintptr_t k) : raddr(r), rkey(k), valid(true) {}
 };
+
+// Internal functions shared between init.cpp and runtime.cpp
+void CopyGpuStatesToDevice(const GpuStates* gpuStates);
+void FinalizeRuntime();
+extern GpuStates s_hostGpuStatesCopy;
 
 class ShmemStatesSingleton {
  public:

@@ -28,11 +28,11 @@
 #include "mori/core/transport/rdma/providers/bnxt/bnxt_defs.hpp"
 #include "mori/core/transport/rdma/providers/utils.h"
 #include "mori/core/utils.hpp"
-#ifdef ENABLE_BNXT
+#if defined(ENABLE_BNXT) || defined(MORI_DEVICE_NIC_BNXT)
 extern "C" {
 #include <infiniband/bnxt_re_dv.h>
 #include <infiniband/bnxt_re_hsi.h>
-}  // ENABLE_BNXT
+}
 #else
 extern "C" {
 #include "mori/core/transport/rdma/providers/bnxt/bnxt_re_dv.h"
@@ -261,15 +261,14 @@ inline __device__ uint64_t PostRecv<ProviderType::BNXT>(WorkQueueHandle& wq, uin
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        Read / Write APIs                                       */
 /* ---------------------------------------------------------------------------------------------- */
-// TODO: convert raddr/rkey laddr/lkey to big endien in advance to save cycles
-inline __device__ uint64_t BnxtPostReadWrite(WorkQueueHandle& wq, uint32_t curPostIdx,
-                                             uint32_t curMsntblSlotIdx, uint32_t curPsnIdx,
-                                             bool cqeSignal, uint32_t qpn, uintptr_t laddr,
-                                             uint64_t lkey, uintptr_t raddr, uint64_t rkey,
-                                             size_t bytes, bool isRead) {
-  uint32_t opcode = isRead ? BNXT_RE_WR_OPCD_RDMA_READ : BNXT_RE_WR_OPCD_RDMA_WRITE;
+template <bool IsRead>
+inline __device__ uint64_t BnxtPostReadWriteImpl(WorkQueueHandle& wq, uint32_t curPostIdx,
+                                                  uint32_t curMsntblSlotIdx, uint32_t curPsnIdx,
+                                                  bool cqeSignal, uint32_t qpn, uintptr_t laddr,
+                                                  uint64_t lkey, uintptr_t raddr, uint64_t rkey,
+                                                  size_t bytes) {
+  constexpr uint32_t opcode = IsRead ? BNXT_RE_WR_OPCD_RDMA_READ : BNXT_RE_WR_OPCD_RDMA_WRITE;
   uint8_t signalFlag = cqeSignal ? BNXT_RE_WR_FLAGS_SIGNALED : 0x00;
-  // In bnxt, wqeNum mean total sq slot num
   void* queueBuffAddr = wq.sqAddr;
   void* msntblAddr = wq.msntblAddr;
   uint32_t wqeNum = wq.sqWqeNum;
@@ -279,12 +278,7 @@ inline __device__ uint64_t BnxtPostReadWrite(WorkQueueHandle& wq, uint32_t curPo
   struct bnxt_re_rdma rdma;
   struct bnxt_re_sge sge;
 
-  // constexpr int sendWqeSize =
-  //     sizeof(struct bnxt_re_bsqe) + sizeof(struct bnxt_re_rdma) + sizeof(struct bnxt_re_sge);
-  // constexpr int slotsNum = CeilDiv(sendWqeSize, BNXT_RE_SLOT_SIZE);
-
   int psnCnt = (bytes == 0) ? 1 : (bytes + mtuSize - 1) / mtuSize;
-  // psn index needs to be strictly ordered
 
   uint32_t wqeIdx = curPostIdx & (wqeNum - 1);
   uint32_t slotIdx = wqeIdx * BNXT_RE_NUM_SLOT_PER_WQE;
@@ -309,13 +303,9 @@ inline __device__ uint64_t BnxtPostReadWrite(WorkQueueHandle& wq, uint32_t curPo
   ThreadCopy<char>(base + 1 * BNXT_RE_SLOT_SIZE, reinterpret_cast<char*>(&rdma), sizeof(rdma));
   ThreadCopy<char>(base + 2 * BNXT_RE_SLOT_SIZE, reinterpret_cast<char*>(&sge), sizeof(sge));
 
-  // fill psns in msn Table for retransmissions
   uint32_t msntblIdx = curMsntblSlotIdx % wq.msntblNum;
   bnxt_re_fill_psns_for_msntbl(msntblAddr, slotIdx, curPsnIdx, psnCnt, msntblIdx);
 
-  // get doorbell header
-  // struct bnxt_re_db_hdr hdr;
-  // uint8_t flags = ((curPostIdx + 1) / wqeNum) & 0x1;
   uint8_t flags = ((curPostIdx + 1) >> (__ffs(wqeNum) - 1)) & 0x1;
   uint32_t epoch = (flags & BNXT_RE_FLAG_EPOCH_TAIL_MASK) << BNXT_RE_DB_EPOCH_TAIL_SHIFT;
 
@@ -324,59 +314,48 @@ inline __device__ uint64_t BnxtPostReadWrite(WorkQueueHandle& wq, uint32_t curPo
 }
 
 template <>
-inline __device__ uint64_t PostWrite<ProviderType::BNXT>(WorkQueueHandle& wq, uint32_t curPostIdx,
-                                                         uint32_t curMsntblSlotIdx,
-                                                         uint32_t curPsnIdx, bool cqeSignal,
-                                                         uint32_t qpn, uintptr_t laddr,
-                                                         uint64_t lkey, uintptr_t raddr,
-                                                         uint64_t rkey, size_t bytes) {
-  return BnxtPostReadWrite(wq, curPostIdx, curMsntblSlotIdx, curPsnIdx, cqeSignal, qpn, laddr, lkey,
-                           raddr, rkey, bytes, false);
+inline __device__ uint64_t PostReadWrite<ProviderType::BNXT, false>(
+    WorkQueueHandle& wq, uint32_t curPostIdx, uint32_t curMsntblSlotIdx, uint32_t curPsnIdx,
+    bool cqeSignal, uint32_t qpn, uintptr_t laddr, uint64_t lkey, uintptr_t raddr, uint64_t rkey,
+    size_t bytes) {
+  return BnxtPostReadWriteImpl<false>(wq, curPostIdx, curMsntblSlotIdx, curPsnIdx, cqeSignal, qpn,
+                                      laddr, lkey, raddr, rkey, bytes);
 }
 
 template <>
-inline __device__ uint64_t PostRead<ProviderType::BNXT>(WorkQueueHandle& wq, uint32_t curPostIdx,
-                                                        uint32_t curMsntblSlotIdx,
-                                                        uint32_t curPsnIdx, bool cqeSignal,
-                                                        uint32_t qpn, uintptr_t laddr,
-                                                        uint64_t lkey, uintptr_t raddr,
-                                                        uint64_t rkey, size_t bytes) {
-  return BnxtPostReadWrite(wq, curPostIdx, curMsntblSlotIdx, curPsnIdx, cqeSignal, qpn, laddr, lkey,
-                           raddr, rkey, bytes, true);
+inline __device__ uint64_t PostReadWrite<ProviderType::BNXT, true>(
+    WorkQueueHandle& wq, uint32_t curPostIdx, uint32_t curMsntblSlotIdx, uint32_t curPsnIdx,
+    bool cqeSignal, uint32_t qpn, uintptr_t laddr, uint64_t lkey, uintptr_t raddr, uint64_t rkey,
+    size_t bytes) {
+  return BnxtPostReadWriteImpl<true>(wq, curPostIdx, curMsntblSlotIdx, curPsnIdx, cqeSignal, qpn,
+                                     laddr, lkey, raddr, rkey, bytes);
 }
 
-template <>
-inline __device__ uint64_t PostWrite<ProviderType::BNXT>(WorkQueueHandle& wq, uint32_t qpn,
-                                                         uintptr_t laddr, uint64_t lkey,
-                                                         uintptr_t raddr, uint64_t rkey,
-                                                         size_t bytes) {
+template <bool IsRead>
+inline __device__ uint64_t BnxtPostReadWriteSimple(WorkQueueHandle& wq, uint32_t qpn,
+                                                    uintptr_t laddr, uint64_t lkey, uintptr_t raddr,
+                                                    uint64_t rkey, size_t bytes) {
   uint32_t mtuSize = wq.mtuSize;
-
   int psnCnt = (bytes == 0) ? 1 : (bytes + mtuSize - 1) / mtuSize;
-  // psn index needs to be strictly ordered
-  uint32_t curMsntblSlotIdx, curPsnIdx, curPostIdx;
-  // psn index needs to be strictly ordered
+  uint32_t curMsntblSlotIdx, curPsnIdx;
   atomic_add_packed_msn_and_psn(&wq.msnPack, 1, psnCnt, &curMsntblSlotIdx, &curPsnIdx);
-  curPostIdx = curMsntblSlotIdx;
-  return BnxtPostReadWrite(wq, curPostIdx, curMsntblSlotIdx, curPsnIdx, true, qpn, laddr, lkey,
-                           raddr, rkey, bytes, false);
+  uint32_t curPostIdx = curMsntblSlotIdx;
+  return BnxtPostReadWriteImpl<IsRead>(wq, curPostIdx, curMsntblSlotIdx, curPsnIdx, true, qpn,
+                                        laddr, lkey, raddr, rkey, bytes);
 }
 
 template <>
-inline __device__ uint64_t PostRead<ProviderType::BNXT>(WorkQueueHandle& wq, uint32_t qpn,
-                                                        uintptr_t laddr, uint64_t lkey,
-                                                        uintptr_t raddr, uint64_t rkey,
-                                                        size_t bytes) {
-  uint32_t mtuSize = wq.mtuSize;
+inline __device__ uint64_t PostReadWrite<ProviderType::BNXT, false>(
+    WorkQueueHandle& wq, uint32_t qpn, uintptr_t laddr, uint64_t lkey, uintptr_t raddr,
+    uint64_t rkey, size_t bytes) {
+  return BnxtPostReadWriteSimple<false>(wq, qpn, laddr, lkey, raddr, rkey, bytes);
+}
 
-  int psnCnt = (bytes == 0) ? 1 : (bytes + mtuSize - 1) / mtuSize;
-  // psn index needs to be strictly ordered
-  uint32_t curMsntblSlotIdx, curPsnIdx, curPostIdx;
-  // psn index needs to be strictly ordered
-  atomic_add_packed_msn_and_psn(&wq.msnPack, 1, psnCnt, &curMsntblSlotIdx, &curPsnIdx);
-  curPostIdx = curMsntblSlotIdx;
-  return BnxtPostReadWrite(wq, curPostIdx, curMsntblSlotIdx, curPsnIdx, true, qpn, laddr, lkey,
-                           raddr, rkey, bytes, true);
+template <>
+inline __device__ uint64_t PostReadWrite<ProviderType::BNXT, true>(
+    WorkQueueHandle& wq, uint32_t qpn, uintptr_t laddr, uint64_t lkey, uintptr_t raddr,
+    uint64_t rkey, size_t bytes) {
+  return BnxtPostReadWriteSimple<true>(wq, qpn, laddr, lkey, raddr, rkey, bytes);
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -726,8 +705,8 @@ inline __device__ int PollCq<ProviderType::BNXT>(void* cqAddr, uint32_t cqeNum, 
   // Handle error cases
   if (opcode != BNXT_RE_REQ_ST_OK) {
     auto error = BnxtHandleErrorCqe(opcode);
-    MORI_PRINTF("[BNXT PollCq] CQE error: %s (opcode: %d) at %s:%d\n", IbvWcStatusString(error), opcode,
-           __FILE__, __LINE__);
+    MORI_PRINTF("[BNXT PollCq] CQE error: %s (opcode: %d) at %s:%d\n", IbvWcStatusString(error),
+                opcode, __FILE__, __LINE__);
     return opcode;
   }
 
@@ -749,7 +728,7 @@ inline __device__ int PollCq<ProviderType::BNXT>(void* cqAddr, uint32_t cqeNum, 
   if (opcode != BNXT_RE_REQ_ST_OK) {
     auto error = BnxtHandleErrorCqe(opcode);
     MORI_PRINTF("[BNXT PollCq] CQE error: %s (opcode: %d), wqeCounter: %u at %s:%d\n",
-           IbvWcStatusString(error), opcode, *wqeCounter, __FILE__, __LINE__);
+                IbvWcStatusString(error), opcode, *wqeCounter, __FILE__, __LINE__);
     return opcode;
   }
 
@@ -757,14 +736,16 @@ inline __device__ int PollCq<ProviderType::BNXT>(void* cqAddr, uint32_t cqeNum, 
 }
 
 template <>
-inline __device__ int PollCq<ProviderType::BNXT>(WorkQueueHandle& wqHandle, CompletionQueueHandle& cqHandle,
-                                                 void* cqAddr, uint32_t cqeNum, uint32_t* consIdx, uint16_t* wqeCounter)
-{
+inline __device__ int PollCq<ProviderType::BNXT>(WorkQueueHandle& wqHandle,
+                                                 CompletionQueueHandle& cqHandle, void* cqAddr,
+                                                 uint32_t cqeNum, uint32_t* consIdx,
+                                                 uint16_t* wqeCounter) {
   return 0;
 }
 
 template <>
-inline __device__ void UpdateCqDbrRecord<ProviderType::BNXT>(CompletionQueueHandle& cq, uint32_t consIdx) {
+inline __device__ void UpdateCqDbrRecord<ProviderType::BNXT>(CompletionQueueHandle& cq,
+                                                             uint32_t consIdx) {
   uint8_t flags = ((consIdx + 1) / cq.cqeNum) & (1UL << BNXT_RE_FLAG_EPOCH_HEAD_SHIFT);
   uint32_t epoch = (flags & BNXT_RE_FLAG_EPOCH_TAIL_MASK) << BNXT_RE_DB_EPOCH_TAIL_SHIFT;
   // uint64_t dbrVal = bnxt_re_init_db_hdr(((consIdx + 1) | epoch), 0, flags, BNXT_RE_QUE_TYPE_CQ);
@@ -774,8 +755,8 @@ inline __device__ void UpdateCqDbrRecord<ProviderType::BNXT>(CompletionQueueHand
 }
 
 template <>
-inline __device__ int PollCqAndUpdateDbr<ProviderType::BNXT>(CompletionQueueHandle& cq, uint32_t* consIdx,
-                                                             uint32_t* lockVar) {
+inline __device__ int PollCqAndUpdateDbr<ProviderType::BNXT>(CompletionQueueHandle& cq,
+                                                             uint32_t* consIdx, uint32_t* lockVar) {
   AcquireLock(lockVar);
 
   int opcode = PollCq<ProviderType::BNXT>(cq.cqAddr, cq.cqeNum, consIdx);

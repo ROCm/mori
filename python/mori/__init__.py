@@ -19,9 +19,30 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-from . import cpp
-from . import ops
-from . import shmem
-from . import io
-from . import ir
-from . import kernel_profiler
+import importlib
+import os
+
+_LAZY_SUBMODULES = {
+    "cpp",
+    "ops",
+    "shmem",
+    "io",
+    "ir",
+    "kernel_profiler",
+}
+
+
+def __getattr__(name: str):
+    if name in _LAZY_SUBMODULES:
+        return importlib.import_module(f".{name}", __name__)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return list(globals().keys()) + sorted(_LAZY_SUBMODULES)
+
+
+if os.environ.get("MORI_PRECOMPILE", "").lower() in ("1", "true", "on"):
+    from .jit import precompile
+
+    precompile()

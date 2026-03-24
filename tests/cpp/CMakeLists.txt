@@ -35,3 +35,7 @@ if(DEFINED GPU_TARGETS)
   set_target_properties(test_discrete_buffer PROPERTIES HIP_ARCHITECTURES
                                                         "${GPU_TARGETS}")
 endif()
+
+if(BUILD_UMBP)
+  add_subdirectory(umbp)
+endif()

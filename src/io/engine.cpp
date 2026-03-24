@@ -21,10 +21,11 @@
 // SOFTWARE.
 #include "mori/io/engine.hpp"
 
-#include <hip/hip_runtime.h>
+#include <hip/hip_runtime_api.h>
 
 #include <cstdlib>
 
+#include "mori/io/env.hpp"
 #include "mori/io/logging.hpp"
 #include "src/io/rdma/backend_impl.hpp"
 #include "src/io/xgmi/backend_impl.hpp"
@@ -320,9 +321,8 @@ std::optional<BackendType> IOEngine::QueryRouteCache(const RouteCacheKey& key) c
 }
 
 std::string IOEngine::ResolveNodeId(const std::string& hostname) const {
-  const char* nodeIdEnv = std::getenv("MORI_IO_NODE_ID");
-  if (nodeIdEnv != nullptr && nodeIdEnv[0] != '\0') {
-    return std::string(nodeIdEnv);
+  if (auto nodeId = mori::env::GetString("MORI_IO_NODE_ID"); nodeId.has_value()) {
+    return *nodeId;
   }
   return hostname;
 }

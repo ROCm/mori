@@ -21,13 +21,15 @@
 // SOFTWARE.
 #pragma once
 
+#ifdef MORI_WITH_MPI
 #include <mpi.h>
+#endif
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
 
-#include "hip/hip_runtime.h"
+#include "hip/hip_runtime_api.h"
 #include "mori/application/application.hpp"
 
 namespace mori {
@@ -52,8 +54,10 @@ constexpr unsigned int MORI_SHMEM_INIT_WITH_UNIQUEID = 1;
 
 // TODO: provide unified initialize / finalize APIs
 int ShmemInit(application::BootstrapNetwork* bootNet);
+#ifdef MORI_WITH_MPI
 int ShmemInit();  // Default initialization using MPI_COMM_WORLD
 int ShmemMpiInit(MPI_Comm);
+#endif
 int ShmemTorchProcessGroupInit(const std::string& groupName);
 
 // UniqueId-based initialization APIs (nvshmem/rocshmem compatible)
@@ -65,6 +69,14 @@ int ShmemInitAttr(unsigned int flags, mori_shmem_init_attr_t* attr);
 int ShmemFinalize();
 
 int ShmemModuleInit(void* hipModule);
+int LoadShmemModule(const char* hsaco_path);
+int CopyGpuStatesToSymbol(void* deviceSymbolAddr);
+
+using GpuStatesAddrProvider = void* (*)();
+void RegisterGpuStatesAddrProvider(GpuStatesAddrProvider provider);
+
+using BarrierLauncher = void (*)(hipStream_t);
+void RegisterBarrierLauncher(BarrierLauncher launcher);
 
 int ShmemMyPe();
 int ShmemNPes();

@@ -28,6 +28,7 @@
 #include <limits>
 #include <shared_mutex>
 
+#include "mori/io/env.hpp"
 #include "mori/io/logging.hpp"
 #include "src/io/rdma/protocol.hpp"
 namespace mori {
@@ -70,13 +71,16 @@ std::vector<std::pair<int, int>> RdmaManager::Search(TopoKey key) {
         return {{i, 1}};
       }
     }
+    MORI_IO_WARN("No matching NIC found for GPU {}, nicName: {}", key.deviceId, nicName);
   } else if (key.loc == MemoryLocationType::CPU) {
     if (availDevices.empty()) return {};
     int idx = (roundRobinCounter.fetch_add(1, std::memory_order_relaxed) % availDevices.size());
     return {{idx, 1}};
   }
-  assert(false && "topo searching for device other than CPU/GPU is not implemented yet");
-  return {};
+  MORI_IO_ERROR(
+      "topo searching for device other than CPU/GPU is not implemented yet, returning default "
+      "device 0");
+  return {{0, 1}};
 }
 
 /* ----------------------------------- Local Memory Management ---------------------------------- */
@@ -166,18 +170,6 @@ application::RdmaEndpointConfig RdmaManager::GetRdmaEndpointConfig(int devId) {
   uint32_t maxCqe = static_cast<uint32_t>(deviceAttr->orig_attr.max_cqe);
   uint32_t maxSge = static_cast<uint32_t>(deviceAttr->orig_attr.max_sge);
 
-  auto getEnvPositiveU32 = [](const char* name) -> std::optional<uint32_t> {
-    const char* v = std::getenv(name);
-    if (v == nullptr || v[0] == '\0') return std::nullopt;
-    char* end = nullptr;
-    unsigned long parsed = std::strtoul(v, &end, 10);
-    if (end == v || *end != '\0' || parsed == 0 || parsed > std::numeric_limits<uint32_t>::max()) {
-      MORI_IO_WARN("Ignore invalid env {}={}", name, v);
-      return std::nullopt;
-    }
-    return static_cast<uint32_t>(parsed);
-  };
-
   uint32_t desiredSendWr = config.maxSendWr > 0 ? static_cast<uint32_t>(config.maxSendWr) : 8192u;
   uint32_t desiredRecvWr = config.enableNotification ? 1024u : 0u;
   uint32_t desiredCqe = config.maxCqeNum > 0 ? static_cast<uint32_t>(config.maxCqeNum) : 16384u;
@@ -185,12 +177,12 @@ application::RdmaEndpointConfig RdmaManager::GetRdmaEndpointConfig(int devId) {
       config.maxMsgSge > 0 ? std::optional<uint32_t>(static_cast<uint32_t>(config.maxMsgSge))
                            : std::nullopt;
 
-  if (auto v = getEnvPositiveU32("MORI_IO_QP_MAX_SEND_WR"); v.has_value()) desiredSendWr = *v;
-  if (auto v = getEnvPositiveU32("MORI_IO_QP_MAX_RECV_WR"); v.has_value()) desiredRecvWr = *v;
-  if (auto v = getEnvPositiveU32("MORI_IO_QP_MAX_CQE"); v.has_value()) desiredCqe = *v;
-  if (auto v = getEnvPositiveU32("MORI_IO_QP_MAX_MSG_SGE"); v.has_value()) desiredMsgSge = *v;
+  env::Override("MORI_IO_QP_MAX_SEND_WR", desiredSendWr, mori::env::detail::ParsePositiveU32);
+  env::Override("MORI_IO_QP_MAX_RECV_WR", desiredRecvWr, mori::env::detail::ParsePositiveU32);
+  env::Override("MORI_IO_QP_MAX_CQE", desiredCqe, mori::env::detail::ParsePositiveU32);
+  env::Override("MORI_IO_QP_MAX_MSG_SGE", desiredMsgSge, mori::env::detail::ParsePositiveU32);
   // Alias for convenience: keep both MORI_IO_QP_MAX_MSG_SGE and MORI_IO_QP_MAX_SGE.
-  if (auto v = getEnvPositiveU32("MORI_IO_QP_MAX_SGE"); v.has_value()) desiredMsgSge = *v;
+  env::Override("MORI_IO_QP_MAX_SGE", desiredMsgSge, mori::env::detail::ParsePositiveU32);
 
   epConfig.maxMsgsNum = std::min(desiredSendWr, maxQpWr);
   // RQ must fit NotifManager's pre-posted recv WQEs (notifPerQp=1024) when notification is
@@ -234,7 +226,17 @@ void RdmaManager::ConnectEndpoint(EngineKey remoteKey, int devId, application::R
   std::unique_lock<std::shared_mutex> lock(mu);
   deviceCtxs[devId]->ConnectEndpoint(local.handle, remote);
   RemoteEngineMeta& meta = remotes[remoteKey];
-  EpPair ep{weight, devId, rdevId, remoteKey, local, remote};
+  auto epConfig = GetRdmaEndpointConfig(devId);
+  EpPair ep{weight,
+            devId,
+            rdevId,
+            remoteKey,
+            local,
+            remote,
+            std::make_shared<std::atomic<int>>(0),
+            static_cast<int>(epConfig.maxMsgsNum),
+            std::make_shared<std::atomic<bool>>(false),
+            std::make_shared<SubmissionLedger>()};
   meta.rTable[topoKey].push_back(ep);
   epsMap.insert({ep.local.handle.qpn, ep});
 }
@@ -374,41 +376,56 @@ void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
         struct ibv_recv_wr* bad = nullptr;
         SYSCALL_RETURN_ZERO(ibv_post_recv(ep.local.ibvHandle.qp, &wr, &bad));
       } else if (wc[i].opcode == IBV_WC_SEND) {
+        // Notify path: one signaled SEND completion releases one SQ reservation.
+        if (ep.sqDepth) ep.sqDepth->fetch_sub(1, std::memory_order_relaxed);
         uint64_t id = wc[i].wr_id;
         if (wc[i].status != IBV_WC_SUCCESS) {
           MORI_IO_ERROR("NotifManager receive send cqe failed for wr_id {} status {}: {}", id,
                         wc[i].status, ibv_wc_status_str(wc[i].status));
         }
       } else {
-        CqCallbackMessage* msg = reinterpret_cast<CqCallbackMessage*>(wc[i].wr_id);
-        uint32_t lastBatchSize = msg->meta->finishedBatchSize.fetch_add(msg->batchSize);
-        TransferStatus* statusPtr = msg->meta->status;
-        if (statusPtr != nullptr) {
-          if (wc[i].status == IBV_WC_SUCCESS) {
-            if ((lastBatchSize + msg->batchSize) == msg->meta->totalBatchSize) {
-              statusPtr->Update(StatusCode::SUCCESS, ibv_wc_status_str(wc[i].status));
+        // Batch path: wr_id carries a recordId from the SubmissionLedger.
+        uint64_t recordId = wc[i].wr_id;
+        int mergedBatchSize = 0;
+        auto meta = ep.ledger
+                        ? ep.ledger->ReleaseByCqe(recordId, ep.sqDepth.get(), &mergedBatchSize)
+                        : nullptr;
+        if (meta) {
+          uint32_t lastBatchSize = meta->finishedBatchSize.fetch_add(mergedBatchSize);
+          TransferStatus* statusPtr = meta->status;
+          if (statusPtr != nullptr) {
+            if (wc[i].status == IBV_WC_SUCCESS) {
+              if ((lastBatchSize + mergedBatchSize) == meta->totalBatchSize) {
+                statusPtr->Update(StatusCode::SUCCESS, ibv_wc_status_str(wc[i].status));
+              }
+            } else {
+              statusPtr->Update(StatusCode::ERR_RDMA_OP, ibv_wc_status_str(wc[i].status));
+              MORI_IO_ERROR("NotifManager receive cqe failed for task {} code {} status {}",
+                            meta->id, static_cast<uint32_t>(wc[i].status),
+                            ibv_wc_status_str(wc[i].status));
+              meta->status = nullptr;
+              if (ep.degraded && ep.degraded->load(std::memory_order_relaxed) && ep.ledger) {
+                const int orphanedReleased = ep.ledger->ReleaseOrphanedByRecovery(ep.sqDepth.get());
+                ep.degraded->store(false, std::memory_order_relaxed);
+                MORI_IO_WARN(
+                    "NotifManager recovered degraded EP qpn {} by releasing {} orphaned WRs", qpn,
+                    orphanedReleased);
+              }
             }
-          } else {
-            statusPtr->Update(StatusCode::ERR_RDMA_OP, ibv_wc_status_str(wc[i].status));
-            MORI_IO_ERROR("NotifManager receive cqe failed for task {} code {} status {}",
-                          msg->meta->id, static_cast<uint32_t>(wc[i].status),
-                          ibv_wc_status_str(wc[i].status));
-            // set status to nullptr indicate that transfer failed
-            msg->meta->status = nullptr;
           }
+          MORI_IO_TRACE(
+              "NotifManager receive cqe for task {} code {} total batch size {} last batch size {} "
+              "cur batch size {}",
+              meta->id,
+              statusPtr != nullptr ? statusPtr->CodeUint32()
+                                   : static_cast<uint32_t>(StatusCode::ERR_RDMA_OP),
+              meta->totalBatchSize, lastBatchSize, mergedBatchSize);
+        } else {
+          MORI_IO_WARN(
+              "NotifManager: no ledger record for wr_id {} (recordId {}); "
+              "sqDepth may be stale",
+              wc[i].wr_id, recordId);
         }
-        MORI_IO_TRACE(
-            "NotifManager receive cqe for task {} code {} total batch size {} last batch size {} "
-            "cur "
-            "batch size {}",
-            msg->meta->id,
-            statusPtr != nullptr ? statusPtr->CodeUint32()
-                                 : static_cast<uint32_t>(StatusCode::ERR_RDMA_OP),
-            msg->meta->totalBatchSize, lastBatchSize, msg->batchSize);
-        if ((lastBatchSize + msg->batchSize) == msg->meta->totalBatchSize) {
-          delete msg->meta;
-        }
-        delete msg;
       }
     }
   }
@@ -675,7 +692,7 @@ void RdmaBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size
                                    TransferStatus* status, TransferUniqueId id, bool isRead) {
   MORI_IO_FUNCTION_TIMER;
   status->SetCode(StatusCode::IN_PROGRESS);
-  CqCallbackMeta* callbackMeta = new CqCallbackMeta(status, id, 1);
+  auto callbackMeta = std::make_shared<CqCallbackMeta>(status, id, 1);
 
   RdmaOpRet ret =
       RdmaReadWrite(eps, local, localOffset, remote, remoteOffset, size, callbackMeta, id, isRead);
@@ -697,7 +714,7 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
                                         TransferUniqueId id, bool isRead) {
   MORI_IO_FUNCTION_TIMER;
   status->SetCode(StatusCode::IN_PROGRESS);
-  CqCallbackMeta* callbackMeta = new CqCallbackMeta(status, id, sizes.size());
+  auto callbackMeta = std::make_shared<CqCallbackMeta>(status, id, sizes.size());
   RdmaOpRet ret;
   if (executor) {
     ExecutorReq req{eps,          local, localOffsets,         remote, remoteOffsets, sizes,
@@ -730,11 +747,14 @@ bool RdmaBackendSession::Alive() const { return true; }
 RdmaBackend::RdmaBackend(EngineKey k, const IOEngineConfig& engConfig,
                          const RdmaBackendConfig& beConfig)
     : myEngKey(k), config(beConfig) {
+  env::Override("MORI_IO_ENABLE_NOTIFICATION", config.enableNotification,
+                mori::env::detail::ParseBool);
+
   application::RdmaContext* ctx =
       new application::RdmaContext(application::RdmaBackendType::IBVerbs);
-  rdma.reset(new mori::io::RdmaManager(beConfig, ctx));
+  rdma.reset(new mori::io::RdmaManager(config, ctx));
 
-  notif.reset(new NotifManager(rdma.get(), beConfig));
+  notif.reset(new NotifManager(rdma.get(), config));
   notif->Start();
 
   server.reset(
