@@ -23,6 +23,7 @@
 #include "mori/collective/allreduce/twoshot_allreduce_sdma_class.hpp"
 #include "mori/collective/allreduce/twoshot_sdma_kernel.hpp"
 #include "mori/collective/allreduce/twoshot_sdma_async_kernel.hpp"
+#include "mori/collective/allreduce/pipelined_allreduce_sdma_kernel.hpp"
 #include "mori/shmem/shmem.hpp"
 #include <hip/hip_fp16.h>
 #include <hip/hip_bfloat16.h>
@@ -276,6 +277,84 @@ bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
 
     } catch (const std::exception& e) {
         fprintf(stderr, "PE %d: AllReduce failed: %s\n", myPe_, e.what());
+        return false;
+    }
+    return true;
+}
+
+// ================ Pipelined AllReduce ================
+
+template <typename T>
+bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
+                                 size_t chunk_elems, int scatter_mode,
+                                 hipStream_t stream) {
+    try {
+        constexpr int pack_size = packed_t<T>::P::size;
+        int threads = 512;
+        int packedPerRank = static_cast<int>(
+            ((total_count / npes_ + pack_size - 1) / pack_size));
+        int blocks = std::min(max_blocks_,
+                              (packedPerRank + threads - 1) / threads);
+        if (blocks < 1) blocks = 1;
+
+        // Auto chunk size: ~totalCount/16, aligned to pack_size * npes
+        if (chunk_elems == 0) {
+            chunk_elems = total_count / 16;
+            if (chunk_elems < static_cast<size_t>(pack_size * npes_))
+                chunk_elems = pack_size * npes_;
+        }
+        // Align chunk_elems to pack_size * npes
+        size_t align = static_cast<size_t>(pack_size * npes_);
+        chunk_elems = ((chunk_elems + align - 1) / align) * align;
+
+        // For P2P read mode, need input in symmetric memory
+        application::SymmMemObjPtr inputSymmObj = {};
+        if (scatter_mode == 1) {
+            size_t required_input_size = total_count * dtype_size_;
+            if (!ensure_buffer_size(input_transit_buffer_, input_transit_buffer_ptr_,
+                                    input_transit_buffer_size_, input_transit_buffer_obj_,
+                                    required_input_size, "input transit buffer")) {
+                return false;
+            }
+            copy_input_to_transit(input, total_count, stream);
+            inputSymmObj = input_transit_buffer_obj_;
+        }
+
+        if (scatter_mode == 1) {
+            PipelinedAllReduceSdmaKernel<T, 1><<<blocks, threads, 0, stream>>>(
+                myPe_, npes_,
+                input,
+                output_transit_buffer_obj_,
+                flagsObj_,
+                barrierPtr_,
+                inputSymmObj,
+                total_count,
+                chunk_elems);
+        } else {
+            PipelinedAllReduceSdmaKernel<T, 0><<<blocks, threads, 0, stream>>>(
+                myPe_, npes_,
+                input,
+                output_transit_buffer_obj_,
+                flagsObj_,
+                barrierPtr_,
+                application::SymmMemObjPtr{},  // not used in SDMA mode
+                total_count,
+                chunk_elems);
+        }
+
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess) {
+            fprintf(stderr, "PE %d: PipelinedAllReduce launch failed: %s\n",
+                    myPe_, hipGetErrorString(err));
+            return false;
+        }
+
+        if (copy_output_to_user_) {
+            copy_output_to_user(output, total_count, stream);
+        }
+
+    } catch (const std::exception& e) {
+        fprintf(stderr, "PE %d: PipelinedAllReduce failed: %s\n", myPe_, e.what());
         return false;
     }
     return true;

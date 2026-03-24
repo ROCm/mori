@@ -154,6 +154,20 @@ public:
      */
     bool allreduce_inplace(T* data, size_t total_count, hipStream_t stream = nullptr);
 
+    /**
+     * @brief Pipelined AllReduce: overlaps SDMA scatter/AG with CU reduce
+     * @param input Input data pointer
+     * @param output Output data pointer
+     * @param total_count Number of data elements per PE
+     * @param chunk_elems Elements per chunk (0 = auto, ~totalCount/16)
+     * @param scatter_mode 0 = SDMA scatter, 1 = P2P read
+     * @param stream HIP stream
+     * @return true if successful
+     */
+    bool pipelined(T* input, T* output, size_t total_count,
+                   size_t chunk_elems = 0, int scatter_mode = 0,
+                   hipStream_t stream = nullptr);
+
     application::SymmMemObjPtr getFlagsObj() const { return flagsObj_; }
     void* getOutputTransitBuffer() const { return output_transit_buffer_; }
     size_t getOutputTransitBufferSize() const { return output_transit_buffer_size_; }
