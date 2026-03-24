@@ -223,14 +223,15 @@ jobs:
         run: |
           cd $GITHUB_WORKSPACE
           ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} \
-            "docker exec mori_ci_${{ github.run_id }} bash -c '
-              GLOO_SOCKET_IFNAME=${{ matrix.node2_ifname }}
-              MORI_SOCKET_IFNAME=${{ matrix.node2_ifname }}
-              torchrun --nnodes=2 --node_rank=1 --nproc_per_node=1 \
-                --master_addr=${{ matrix.node1_host }} --master_port=1234 \
-                $GITHUB_WORKSPACE/examples/ops/dispatch_combine/test_dispatch_combine_internode.py \
-                --cmd bench --kernel-type v1 --num-qp 2 --max-tokens 4096
-            '" &
+            "docker exec mori_ci_${{ github.run_id }} \
+             env GLOO_SOCKET_IFNAME=${{ matrix.node2_ifname }} \
+                 MORI_SOCKET_IFNAME=${{ matrix.node2_ifname }} \
+             torchrun --nnodes=2 --node_rank=1 --nproc_per_node=1 \
+               --master_addr=${{ matrix.node1_host }} --master_port=1234 \
+               $GITHUB_WORKSPACE/examples/ops/dispatch_combine/test_dispatch_combine_internode.py \
+               --cmd bench --kernel-type v1 --num-qp 2 --max-tokens 4096" &
+          GLOO_SOCKET_IFNAME=${{ matrix.node1_ifname }} \
+          MORI_SOCKET_IFNAME=${{ matrix.node1_ifname }} \
           torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
             --master_addr="${{ matrix.node1_host }}" --master_port=1234 \
             examples/ops/dispatch_combine/test_dispatch_combine_internode.py \
@@ -240,14 +241,15 @@ jobs:
         run: |
           cd $GITHUB_WORKSPACE
           ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} \
-            "docker exec mori_ci_${{ github.run_id }} bash -c '
-              GLOO_SOCKET_IFNAME=${{ matrix.node2_ifname }}
-              MORI_SOCKET_IFNAME=${{ matrix.node2_ifname }}
-              torchrun --nnodes=2 --node_rank=1 --nproc_per_node=1 \
-                --master_addr=${{ matrix.node1_host }} --master_port=1234 \
-                $GITHUB_WORKSPACE/examples/ops/dispatch_combine/test_dispatch_combine_internode.py \
-                --cmd stress --kernel-type v1 --num-qp 2 --max-tokens 128
-            '" &
+            "docker exec mori_ci_${{ github.run_id }} \
+             env GLOO_SOCKET_IFNAME=${{ matrix.node2_ifname }} \
+                 MORI_SOCKET_IFNAME=${{ matrix.node2_ifname }} \
+             torchrun --nnodes=2 --node_rank=1 --nproc_per_node=1 \
+               --master_addr=${{ matrix.node1_host }} --master_port=1234 \
+               $GITHUB_WORKSPACE/examples/ops/dispatch_combine/test_dispatch_combine_internode.py \
+               --cmd stress --kernel-type v1 --num-qp 2 --max-tokens 128" &
+          GLOO_SOCKET_IFNAME=${{ matrix.node1_ifname }} \
+          MORI_SOCKET_IFNAME=${{ matrix.node1_ifname }} \
           torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
             --master_addr="${{ matrix.node1_host }}" --master_port=1234 \
             examples/ops/dispatch_combine/test_dispatch_combine_internode.py \
