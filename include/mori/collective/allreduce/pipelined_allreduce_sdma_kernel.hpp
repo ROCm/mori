@@ -1,17 +1,15 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
 // MIT License (see twoshot_sdma_kernel.hpp for full text)
 //
-// Pipelined AllReduce — dual-buffer, barrier-free architecture.
+// Pipelined AllReduce — single-buffer, barrier-free SDMA pipeline.
 //
-// SCATTER_MODE=0: 2-stage SDMA pipeline with dual symmetric buffers
+// SCATTER_MODE=0: 2-stage SDMA pipeline
 //   scatter(c) | reduce(c-1) + AG(c-1)
 //
-//   Two independent symmetric buffers:
-//     dstMemObj      = scatter region (incoming data from peers)
-//     inputSymmObj   = reduce-output region (AG source & destination)
-//   Separate buffers eliminate cross-PE data hazard — AG writes to the
-//   reduce buffer while scatter reads from the scatter buffer.
-//   No signal_rd / wait_rd needed.
+//   Single buffer (dstMemObj) for scatter, reduce output, and AG.
+//   No cross-PE barrier required: scatter signal sync guarantees all PEs
+//   start reduce nearly simultaneously; SDMA AG latency (>>10µs) ensures
+//   AG data arrives long after the peer finishes reading the same chunk.
 //
 //   Block 0 = management (scatter / wbl2 / AG).
 //   Blocks 1..N = compute (parallel scatter-poll -> reduce -> flag-write).
@@ -70,7 +68,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
   const uint32_t numQ = dstMemObj->sdmaNumQueue;
   const int compBlocks = static_cast<int>(gridDim.x) - 1;
 
-  // ---- Signal baselines ----
+  // ---- Signal baselines (all from dstMemObj — pre-registered, reliable) ----
   __shared__ uint64_t s_scatter_base;
   __shared__ uint64_t s_ag_base;
   __shared__ uint32_t s_bd_base;
@@ -91,7 +89,6 @@ __global__ void PipelinedAllReduceSdmaKernel(
         s_scatter_base = core::AtomicLoadRelaxed(
             dstMemObj->signalPtrs + static_cast<size_t>(i) * numQ + 0);
         if (blockIdx.x == 0) {
-          // AG signals always on dstMemObj (pre-registered, reliable SDMA infra)
           s_ag_base = core::AtomicLoadRelaxed(
               dstMemObj->signalPtrs + static_cast<size_t>(i) * numQ + 1);
         }
@@ -106,11 +103,9 @@ __global__ void PipelinedAllReduceSdmaKernel(
   const uint32_t bdBase = s_bd_base;
 
   // =========================================================================
-  // SCATTER_MODE = 0 — Dual-buffer SDMA pipeline
+  // SCATTER_MODE = 0 — Single-buffer SDMA pipeline, no cross-PE barrier
   // =========================================================================
   if constexpr (SCATTER_MODE == 0) {
-
-    P* __restrict__ reduceBuf = reinterpret_cast<P*>(inputSymmObj->localPtr);
 
     if (blockIdx.x != 0) {
       // =================================================================
@@ -123,7 +118,6 @@ __global__ void PipelinedAllReduceSdmaKernel(
           static_cast<size_t>(compBlocks) * static_cast<size_t>(blockDim.x);
 
       for (int c = 0; c < numChunks; c++) {
-        // 7 threads poll scatter signals in parallel (one per peer)
         if (threadIdx.x < static_cast<unsigned>(npes - 1)) {
           const int idx = static_cast<int>(threadIdx.x);
           const int sender = idx < myPe ? idx : idx + 1;
@@ -136,7 +130,6 @@ __global__ void PipelinedAllReduceSdmaKernel(
         }
         __syncthreads();
 
-        // block_done for previous chunk (sync above confirms reduce(c-1) done)
         if (c > 0 && threadIdx.x == 0) {
           __scoped_atomic_store_n(
               &barrier->block_done[blockIdx.x],
@@ -144,14 +137,13 @@ __global__ void PipelinedAllReduceSdmaKernel(
               __ATOMIC_RELEASE, __MEMORY_SCOPE_DEVICE);
         }
 
-        // Reduce: read scatter buf (dstMemObj) + input, write reduce buf
         {
           const size_t off = static_cast<size_t>(c) * packedChunkPerRank;
           size_t cnt = packedChunkPerRank;
           if (off + cnt > packedPerRank) cnt = packedPerRank - off;
 
           P* __restrict__ myDst =
-              reduceBuf + static_cast<size_t>(myPe) * packedPerRank + off;
+              buf + static_cast<size_t>(myPe) * packedPerRank + off;
           const P* __restrict__ myInput =
               reinterpret_cast<const P*>(input)
               + static_cast<size_t>(myPe) * packedPerRank + off;
@@ -170,7 +162,6 @@ __global__ void PipelinedAllReduceSdmaKernel(
         }
       }
 
-      // Final block_done
       __syncthreads();
       if (threadIdx.x == 0) {
         __scoped_atomic_store_n(
@@ -182,8 +173,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
     } else {
       // =================================================================
       // BLOCK 0: management — scatter / bd_poll / wbl2 / AG
-      //   1 __syncthreads per iteration.
-      //   Pipeline: scatter(i) || bd_poll(i-1)  ->  wbl2 + AG(i-1)
+      //   Pipeline depth 1: scatter(i) || bd_poll(i-1) -> wbl2 + AG(i-1)
       // =================================================================
       for (int i = 0; i <= numChunks; i++) {
         const int thr = static_cast<int>(threadIdx.x);
@@ -219,16 +209,14 @@ __global__ void PipelinedAllReduceSdmaKernel(
 
         __syncthreads();
 
-        // Phase 2+3: wbl2 + AG(i-1)
-        // wbl2 on thread 0; AG on threads 0-6.
-        // Same wavefront => lockstep guarantees wbl2 completes before AG.
+        // Phase 2: wbl2 + AG(i-1)
+        // Same wavefront => lockstep guarantees wbl2 before AG submit.
         if (i >= 1) {
           if (thr == 0) {
 #if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
             asm volatile("buffer_wbl2" ::: "memory");
 #endif
           }
-          // AG via the reduce buffer (inputSymmObj)
           if (thr < npes && thr != myPe) {
             const int destPe = thr;
             const int agChunk = i - 1;
@@ -237,11 +225,10 @@ __global__ void PipelinedAllReduceSdmaKernel(
             if (cOff + actualBytes > totalShardBytes)
               actualBytes = totalShardBytes - cOff;
             if (actualBytes > 0) {
-              uint8_t* src = reinterpret_cast<uint8_t*>(inputSymmObj->localPtr)
+              uint8_t* src = reinterpret_cast<uint8_t*>(dstMemObj->localPtr)
                   + static_cast<size_t>(myPe) * totalShardBytes + cOff;
-              uint8_t* dst = reinterpret_cast<uint8_t*>(inputSymmObj->peerPtrs[destPe])
+              uint8_t* dst = reinterpret_cast<uint8_t*>(dstMemObj->peerPtrs[destPe])
                   + static_cast<size_t>(myPe) * totalShardBytes + cOff;
-              // Use dstMemObj's SDMA queues & signals (pre-registered, reliable)
               anvil::SdmaQueueDeviceHandle** dh =
                   dstMemObj->deviceHandles_d + destPe * numQ;
               HSAuint64* rSig = dstMemObj->peerSignalPtrs[destPe]
@@ -252,7 +239,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
         }
       }
 
-      // Final AG wait — signals on dstMemObj (pre-registered)
+      // Final AG wait
       {
         const int thr = static_cast<int>(threadIdx.x);
         if (thr < npes - 1) {
