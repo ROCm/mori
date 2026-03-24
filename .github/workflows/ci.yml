@@ -9,48 +9,12 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  setup:
-    name: setup matrix
-    runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.set-matrix.outputs.matrix }}
-    steps:
-      - id: set-matrix
-        run: |
-          cat << 'EOF' > /tmp/matrix.json
-          {
-            "include": [
-              {
-                "runner": "label-1",
-                "platform": "MI325X+Thor2",
-                "node1_host": "10.36.40.214",
-                "node2_host": "tus1-p8-g27",
-                "node2_port": 22,
-                "node1_ifname": "eno1",
-                "node2_ifname": "eno1"
-              }
-              // add more runners here:
-              // {
-              //   "runner": "label-2",
-              //   "platform": "...",
-              //   "node1_host": "...",
-              //   "node2_host": "...",
-              //   "node2_port": 22,
-              //   "node1_ifname": "...",
-              //   "node2_ifname": "..."
-              // }
-            ]
-          }
-          EOF
-          echo "matrix=$(grep -v '//' /tmp/matrix.json | tr -d '\n')" >> $GITHUB_OUTPUT
-
   build:
     name: mori build (platform:${{ matrix.platform }})
-    needs: setup
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
-      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+      matrix: ${{ fromJson(vars.CI_MATRIX) }}
     container:
       image: rocm/pytorch-private:mori_rocm7.2_ubuntu22.04_py3.10_pytorch_bnxt_ionic
       credentials:
@@ -72,11 +36,11 @@ jobs:
 
   intranode-test:
     name: mori intranode test (platform:${{ matrix.platform }})
-    needs: [setup, build]
+    needs: build
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
-      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+      matrix: ${{ fromJson(vars.CI_MATRIX) }}
     container:
       image: rocm/pytorch-private:mori_rocm7.2_ubuntu22.04_py3.10_pytorch_bnxt_ionic
       credentials:
@@ -166,12 +130,12 @@ jobs:
 
   internode-test:
     name: mori internode test (platform:${{ matrix.platform }})
-    needs: [setup, build, intranode-test]
+    needs: [build, intranode-test]
     if: needs.build.result == 'success'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
-      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+      matrix: ${{ fromJson(vars.CI_MATRIX) }}
     timeout-minutes: 30
     env:
       IMAGE: rocm/pytorch-private:mori_rocm7.2_ubuntu22.04_py3.10_pytorch_bnxt_ionic
