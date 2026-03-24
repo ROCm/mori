@@ -296,6 +296,11 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         int blocks = std::min(max_blocks_,
                               (packedPerRank + threads - 1) / threads);
         if (blocks < 1) blocks = 1;
+        if (scatter_mode == 0) {
+            // gatherBarrier cost ∝ (blocks-1) × ~50ns atomic.
+            // 32 blocks × 512 threads = 16K threads already saturates HBM BW.
+            blocks = std::min(blocks, 32);
+        }
 
         if (chunk_elems == 0) {
             size_t min_chunk = std::max<size_t>(
@@ -304,7 +309,6 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             if (scatter_mode == 1) {
                 chunk_elems = total_count;
             } else {
-                // SDMA: 4 chunks for scatter/reduce/AG pipeline overlap
                 chunk_elems = total_count / 4;
             }
             if (chunk_elems < min_chunk)
