@@ -286,9 +286,27 @@ __global__ void PipelinedAllReduceSdmaKernel(
   // Main pipeline loop
   // ========================================================================
 
-  // Signal generation counters: scatter uses odd generations, AG uses even
-  uint64_t scatterGen = static_cast<uint64_t>(s_gen) + 1;
-  uint64_t agGen = scatterGen + numChunks;  // AG signals start after all scatter signals
+  // SDMA signal accounting: scatter and AG share the same signal slot (qId=0)
+  // per (sender→receiver) pair.  Each SdmaPutThread atomically increments the
+  // signal by 1.  The submission order from any PE X targeting PE Y is:
+  //
+  //   scatter(0), scatter(1), AG(0), scatter(2), AG(1), ... scatter(N-1), AG(N-2), AG(N-1)
+  //
+  // So the signal value after each operation (relative to signalBase) is:
+  //   scatter(c): max(1, 2c)        — positions 1, 2, 4, 6, 8, ...
+  //   AG(k):      min(2k+3, 2N)     — positions 3, 5, 7, ..., 2N
+  //
+  const uint64_t signalBase = static_cast<uint64_t>(s_gen);
+
+  auto scatterFlagVal = [&](int c) -> uint64_t {
+      int pos = (2 * c > 1) ? 2 * c : 1;
+      return signalBase + static_cast<uint64_t>(pos);
+  };
+  auto agFlagVal = [&](int k) -> uint64_t {
+      int pos = 2 * k + 3;
+      int cap = 2 * numChunks;
+      return signalBase + static_cast<uint64_t>(pos < cap ? pos : cap);
+  };
 
   if constexpr (SCATTER_MODE == 0) {
     // === SDMA Scatter mode ===
@@ -297,7 +315,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
     for (int c = 0; c < numChunks + 2; c++) {
       // Step 1: AG-wait for chunk c-2
       if (c >= 2 && c - 2 < numChunks) {
-        agWaitChunk(c - 2, agGen + (c - 2));
+        agWaitChunk(c - 2, agFlagVal(c - 2));
       }
 
       // Step 2: Scatter chunk c (block 0 only, non-blocking SDMA submit)
@@ -307,7 +325,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
 
       // Step 3: Wait for scatter of chunk c-1
       if (c >= 1 && c - 1 < numChunks) {
-        waitScatterChunk(c - 1, scatterGen + (c - 1));
+        waitScatterChunk(c - 1, scatterFlagVal(c - 1));
       }
 
       // Step 4: Broadcast barrier + L2 fix + Reduce chunk c-1 (all blocks)
@@ -326,18 +344,29 @@ __global__ void PipelinedAllReduceSdmaKernel(
       if (blockIdx.x == 0) __syncthreads();
     }
 
-    // Final AG-wait for last two chunks
-    if (numChunks >= 1) agWaitChunk(numChunks - 1, agGen + (numChunks - 1));
+    // Final AG-wait for last chunk
+    if (numChunks >= 1) agWaitChunk(numChunks - 1, agFlagVal(numChunks - 1));
+
+    // broadcastBarrier() incremented barrier->flag by numChunks, but SDMA
+    // signals incremented by 2*numChunks.  Correct barrier->flag so the next
+    // kernel invocation computes the right signalBase.
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+      __scoped_atomic_store_n(&barrier->flag,
+          static_cast<uint32_t>(signalBase + 2 * numChunks),
+          __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
+    }
 
   } else {
     // === P2P Read mode ===
     // No SDMA scatter needed; all blocks read remotely and reduce directly.
     // Pipeline: overlap P2P-read-reduce(i) with AG-put(i-1)
 
+    // P2P mode: only AG puts use SDMA (no scatter).  Each AG(k) is the
+    // (k+1)-th SDMA op per peer, so expected signal = signalBase + k + 1.
     for (int c = 0; c < numChunks + 1; c++) {
       // Step 1: AG-wait for chunk c-2
       if (c >= 2 && c - 2 < numChunks) {
-        agWaitChunk(c - 2, agGen + (c - 2));
+        agWaitChunk(c - 2, signalBase + static_cast<uint64_t>(c - 2) + 1);
       }
 
       // Step 2: P2P read + reduce chunk c (all blocks)
@@ -355,7 +384,15 @@ __global__ void PipelinedAllReduceSdmaKernel(
 
     // Final AG-waits
     for (int c = numChunks >= 2 ? numChunks - 2 : 0; c < numChunks; c++) {
-      agWaitChunk(c, agGen + c);
+      agWaitChunk(c, signalBase + static_cast<uint64_t>(c) + 1);
+    }
+
+    // No broadcastBarrier in P2P mode, so barrier->flag is still signalBase.
+    // SDMA signals advanced by numChunks (one AG per chunk).  Correct it.
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+      __scoped_atomic_store_n(&barrier->flag,
+          static_cast<uint32_t>(signalBase + numChunks),
+          __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
     }
   }
 }
