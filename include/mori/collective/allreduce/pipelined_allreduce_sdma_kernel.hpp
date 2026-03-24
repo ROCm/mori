@@ -131,7 +131,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
                    myPe, chunkIdx, sender,
                    (unsigned long long)flagVal,
                    (unsigned long long)core::AtomicLoadRelaxed(mySignal),
-                   (unsigned long long)signalBase);
+                   (unsigned long long)s_gen);
             break;
           }
         }
@@ -257,7 +257,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
                    myPe, chunkIdx, sender,
                    (unsigned long long)flagVal,
                    (unsigned long long)core::AtomicLoadRelaxed(mySignal),
-                   (unsigned long long)signalBase,
+                   (unsigned long long)s_gen,
                    numChunks);
             break;
           }
