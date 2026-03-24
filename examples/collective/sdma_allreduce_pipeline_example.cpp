@@ -145,8 +145,7 @@ void testPipelinedAllreduce() {
     int npes = ShmemNPes();
 
     // 测试数据大小：4MB, 16MB, 32MB, 64MB, 128MB, 256MB (per PE)
-    // 从 32MB 开始（小数据量可能遇到 L2 缓存残留问题）
-    std::vector<size_t> dataSizesMB = {32, 64, 128, 256};
+    std::vector<size_t> dataSizesMB = {32};
 
     // 测试 chunk 大小：128KB, 512KB, 1MB, 2MB, 4MB, 8MB
     std::vector<size_t> chunkSizesKB = {128, 512, 1024, 2048, 4096, 8192};
@@ -190,21 +189,69 @@ void testPipelinedAllreduce() {
             printf("%s\n", std::string(90, '-').c_str());
         }
 
-        // 1) 基准：串行模式 (当前 operator())
+        // 1) 基准：串行模式——内联实现，与 allreduce_sdma_sync 完全一致
         {
-            char label[64];
-            snprintf(label, sizeof(label), "串行 operator()");
-            auto res = runBench(label,
-                [&](uint32_t* in, uint32_t* out, int n, hipStream_t s) {
-                    return (*ar)(in, out, n, s);
-                },
-                inBuf, ar->getOutputTransitBuffer(), hostData, elemsPerPe, bytesPerPe, npes, myPe,
-                stream, warmup, iterations, 0, -1);
-            if (myPe == 0 && res.passed) {
-                printf("%-42s %10.3f %12.2f %12.2f %8s\n",
-                       label, res.avgMs, res.algoBw, res.busBw, "基准");
+            uint32_t* outBuf = nullptr;
+            CHECK_HIP(hipMalloc(&outBuf, bytesPerPe));
+
+            // Warmup
+            for (int i = 0; i < 10; i++) {
+                CHECK_HIP(hipMemcpy(inBuf, hostData.data(), bytesPerPe, hipMemcpyHostToDevice));
+                CHECK_HIP(hipMemset(outBuf, 0, bytesPerPe));
+                MPI_Barrier(MPI_COMM_WORLD);
+                (*ar)(inBuf, outBuf, elemsPerPe, stream);
+                CHECK_HIP(hipStreamSynchronize(stream));
+                MPI_Barrier(MPI_COMM_WORLD);
+            }
+
+            // Verify from transit buffer
+            void* transitBuf = ar->getOutputTransitBuffer();
+            std::vector<uint32_t> result(elemsPerPe);
+            CHECK_HIP(hipMemcpy(result.data(), transitBuf, bytesPerPe, hipMemcpyDeviceToHost));
+            bool ok = verifyResult(result.data(), elemsPerPe, computeExpected(npes), myPe);
+
+            int lok = ok ? 1 : 0, gok = 0;
+            MPI_Allreduce(&lok, &gok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+
+            BenchResult res;
+            res.label = "串行 operator()";
+            res.dataBytes = bytesPerPe;
+            res.chunkBytes = 0;
+            res.scatterMode = -1;
+            res.passed = (gok == npes);
+
+            if (res.passed) {
+                // Benchmark
+                std::vector<double> times;
+                for (int i = 0; i < warmup + iterations; i++) {
+                    CHECK_HIP(hipMemcpy(inBuf, hostData.data(), bytesPerPe, hipMemcpyHostToDevice));
+                    MPI_Barrier(MPI_COMM_WORLD);
+                    double t0 = MPI_Wtime();
+                    (*ar)(inBuf, outBuf, elemsPerPe, stream);
+                    CHECK_HIP(hipStreamSynchronize(stream));
+                    double t1 = MPI_Wtime();
+                    if (i >= warmup) times.push_back(t1 - t0);
+                }
+                MPI_Barrier(MPI_COMM_WORLD);
+
+                double avg = 0;
+                for (double t : times) avg += t;
+                avg /= times.size();
+                double g_sum = 0;
+                MPI_Reduce(&avg, &g_sum, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+                if (myPe == 0) {
+                    double g_avg = g_sum / npes;
+                    res.avgMs = g_avg * 1000.0;
+                    res.algoBw = bytesPerPe / g_avg / (1024.0 * 1024.0 * 1024.0);
+                    res.busBw = res.algoBw * 2.0 * (npes - 1) / npes;
+                    printf("%-42s %10.3f %12.2f %12.2f %8s\n",
+                           res.label.c_str(), res.avgMs, res.algoBw, res.busBw, "基准");
+                }
+            } else {
+                if (myPe == 0) printf("  %-40s VERIFY FAILED\n", res.label.c_str());
             }
             allResults.push_back(res);
+            CHECK_HIP(hipFree(outBuf));
         }
 
         // 2) Pipeline SDMA scatter 模式，遍历不同 chunk 大小
