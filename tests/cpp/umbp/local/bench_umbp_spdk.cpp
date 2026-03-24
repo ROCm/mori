@@ -14,6 +14,7 @@
 // Requires: UMBP_SPDK_NVME_PCI environment variable set.
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -36,7 +37,7 @@
 #include "umbp/local/storage/tier_backend.h"
 #include "umbp/local/umbp_client.h"
 
-using Clock = std::chrono::high_resolution_clock;
+using Clock = std::chrono::steady_clock;
 
 // ---------------------------------------------------------------------------
 // BenchConfig
@@ -46,7 +47,7 @@ struct BenchConfig {
   size_t value_size = 4096;
   size_t batch_size = 64;
   size_t warmup_iters = 1;
-  size_t measure_iters = 3;
+  size_t measure_iters = 10;
   size_t dram_capacity = 64ULL * 1024 * 1024;
   std::vector<int> thread_counts = {1, 2, 4, 8};
   std::string filter;
@@ -303,6 +304,16 @@ static std::vector<int> GenerateDepths(const E2EConfig& e2e, size_t start,
 // ---------------------------------------------------------------------------
 // Latency / result helpers
 // ---------------------------------------------------------------------------
+static double PercentileValue(const std::vector<double>& latencies, double pct) {
+  if (latencies.empty()) return 0.0;
+  if (latencies.size() == 1) return latencies.front();
+  double index = pct * static_cast<double>(latencies.size() - 1);
+  size_t lo = static_cast<size_t>(index);
+  size_t hi = std::min(lo + 1, latencies.size() - 1);
+  double frac = index - static_cast<double>(lo);
+  return latencies[lo] + (latencies[hi] - latencies[lo]) * frac;
+}
+
 static void ComputeLatencyStats(std::vector<double>& lat, BenchResult& r) {
   if (lat.empty()) return;
   std::sort(lat.begin(), lat.end());
@@ -311,13 +322,14 @@ static void ComputeLatencyStats(std::vector<double>& lat, BenchResult& r) {
   r.lat_max_us = lat.back();
   r.lat_avg_us =
       std::accumulate(lat.begin(), lat.end(), 0.0) / static_cast<double>(n);
-  r.lat_p50_us = lat[n * 50 / 100];
-  r.lat_p95_us = lat[n * 95 / 100];
-  r.lat_p99_us = lat[std::min(n * 99 / 100, n - 1)];
+  r.lat_p50_us = PercentileValue(lat, 0.50);
+  r.lat_p95_us = PercentileValue(lat, 0.95);
+  r.lat_p99_us = PercentileValue(lat, 0.99);
 }
 
-static double LatencyElapsed(const std::vector<double>& lat) {
-  return std::accumulate(lat.begin(), lat.end(), 0.0) / 1e6;
+static double WallSeconds(const Clock::time_point& start,
+                          const Clock::time_point& end) {
+  return std::chrono::duration<double>(end - start).count();
 }
 
 static void PrintHeader(const std::string& section) {
@@ -351,9 +363,15 @@ static void RecordResult(const std::string& name, const std::string& variant,
   results.push_back(r);
 }
 
+static std::string ToLower(std::string s) {
+  std::transform(s.begin(), s.end(), s.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return s;
+}
+
 static bool ShouldRun(const BenchConfig& cfg, const std::string& name) {
   if (cfg.filter.empty()) return true;
-  return name.find(cfg.filter) != std::string::npos;
+  return ToLower(name).find(ToLower(cfg.filter)) != std::string::npos;
 }
 
 // ---------------------------------------------------------------------------
@@ -396,6 +414,7 @@ static void BenchSpdkTier(const BenchConfig& cfg,
 
     std::vector<double> lat;
     lat.reserve(keys.size() * cfg.measure_iters);
+    auto wall_start = Clock::now();
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
       ssd.Clear();
       for (size_t i = 0; i < keys.size(); ++i) {
@@ -406,10 +425,11 @@ static void BenchSpdkTier(const BenchConfig& cfg,
             std::chrono::duration<double, std::micro>(t1 - t0).count());
       }
     }
+    auto wall_end = Clock::now();
     RecordResult("SPDK Tier Write", "single-key",
                  keys.size() * cfg.measure_iters,
                  keys.size() * cfg.measure_iters * cfg.value_size,
-                 LatencyElapsed(lat), lat, results);
+                 WallSeconds(wall_start, wall_end), lat, results);
   }
 
   // Read
@@ -426,6 +446,7 @@ static void BenchSpdkTier(const BenchConfig& cfg,
 
     std::vector<double> lat;
     lat.reserve(keys.size() * cfg.measure_iters);
+    auto wall_start = Clock::now();
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
       for (size_t i = 0; i < keys.size(); ++i) {
         auto t0 = Clock::now();
@@ -436,10 +457,11 @@ static void BenchSpdkTier(const BenchConfig& cfg,
             std::chrono::duration<double, std::micro>(t1 - t0).count());
       }
     }
+    auto wall_end = Clock::now();
     RecordResult("SPDK Tier Read", "single-key",
                  keys.size() * cfg.measure_iters,
                  keys.size() * cfg.measure_iters * cfg.value_size,
-                 LatencyElapsed(lat), lat, results);
+                 WallSeconds(wall_start, wall_end), lat, results);
   }
 
   // ReadBatch
@@ -462,6 +484,7 @@ static void BenchSpdkTier(const BenchConfig& cfg,
 
     std::vector<double> lat;
     lat.reserve(rdescs.size() * cfg.measure_iters);
+    auto wall_start = Clock::now();
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
       for (const auto& d : rdescs) {
         auto t0 = Clock::now();
@@ -471,11 +494,12 @@ static void BenchSpdkTier(const BenchConfig& cfg,
             std::chrono::duration<double, std::micro>(t1 - t0).count());
       }
     }
+    auto wall_end = Clock::now();
     RecordResult("SPDK Tier ReadBatch",
                  "bs=" + std::to_string(cfg.batch_size),
                  keys.size() * cfg.measure_iters,
                  keys.size() * cfg.measure_iters * cfg.value_size,
-                 LatencyElapsed(lat), lat, results);
+                 WallSeconds(wall_start, wall_end), lat, results);
   }
 }
 
@@ -501,6 +525,7 @@ static void BenchSpdkBatchWrite(const BenchConfig& cfg,
 
     std::vector<double> lat;
     lat.reserve(keys.size() * cfg.measure_iters);
+    auto wall_start = Clock::now();
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
       ssd.Clear();
       for (size_t i = 0; i < keys.size(); ++i) {
@@ -511,9 +536,10 @@ static void BenchSpdkBatchWrite(const BenchConfig& cfg,
             std::chrono::duration<double, std::micro>(t1 - t0).count());
       }
     }
+    auto wall_end = Clock::now();
     RecordResult("SPDK Write", "sequential", keys.size() * cfg.measure_iters,
                  keys.size() * cfg.measure_iters * cfg.value_size,
-                 LatencyElapsed(lat), lat, results);
+                 WallSeconds(wall_start, wall_end), lat, results);
   }
 
   // BatchWrite
@@ -528,6 +554,7 @@ static void BenchSpdkBatchWrite(const BenchConfig& cfg,
 
     std::vector<double> lat;
     lat.reserve(wdescs.size() * cfg.measure_iters);
+    auto wall_start = Clock::now();
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
       ssd.Clear();
       for (const auto& d : wdescs) {
@@ -538,11 +565,12 @@ static void BenchSpdkBatchWrite(const BenchConfig& cfg,
             std::chrono::duration<double, std::micro>(t1 - t0).count());
       }
     }
+    auto wall_end = Clock::now();
     RecordResult("SPDK Write",
                  "BatchWrite(bs=" + std::to_string(cfg.batch_size) + ")",
                  keys.size() * cfg.measure_iters,
                  keys.size() * cfg.measure_iters * cfg.value_size,
-                 LatencyElapsed(lat), lat, results);
+                 WallSeconds(wall_start, wall_end), lat, results);
   }
 }
 
@@ -571,6 +599,7 @@ static void BenchSpdkBatchRead(const BenchConfig& cfg,
 
     std::vector<double> lat;
     lat.reserve(keys.size() * cfg.measure_iters);
+    auto wall_start = Clock::now();
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
       for (size_t i = 0; i < keys.size(); ++i) {
         auto t0 = Clock::now();
@@ -581,9 +610,10 @@ static void BenchSpdkBatchRead(const BenchConfig& cfg,
             std::chrono::duration<double, std::micro>(t1 - t0).count());
       }
     }
+    auto wall_end = Clock::now();
     RecordResult("SPDK Read", "sequential", keys.size() * cfg.measure_iters,
                  keys.size() * cfg.measure_iters * cfg.value_size,
-                 LatencyElapsed(lat), lat, results);
+                 WallSeconds(wall_start, wall_end), lat, results);
   }
 
   // ReadBatch
@@ -602,6 +632,7 @@ static void BenchSpdkBatchRead(const BenchConfig& cfg,
 
     std::vector<double> lat;
     lat.reserve(rdescs.size() * cfg.measure_iters);
+    auto wall_start = Clock::now();
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
       for (const auto& d : rdescs) {
         auto t0 = Clock::now();
@@ -611,11 +642,12 @@ static void BenchSpdkBatchRead(const BenchConfig& cfg,
             std::chrono::duration<double, std::micro>(t1 - t0).count());
       }
     }
+    auto wall_end = Clock::now();
     RecordResult("SPDK Read",
                  "ReadBatch(bs=" + std::to_string(cfg.batch_size) + ")",
                  keys.size() * cfg.measure_iters,
                  keys.size() * cfg.measure_iters * cfg.value_size,
-                 LatencyElapsed(lat), lat, results);
+                 WallSeconds(wall_start, wall_end), lat, results);
   }
 }
 
@@ -641,6 +673,7 @@ static void BenchSpdkCopyToSSD(const BenchConfig& cfg,
 
     std::vector<double> lat;
     lat.reserve(keys.size() * cfg.measure_iters);
+    auto wall_start = Clock::now();
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
       for (size_t i = 0; i < keys.size(); ++i) {
         auto t0 = Clock::now();
@@ -650,10 +683,11 @@ static void BenchSpdkCopyToSSD(const BenchConfig& cfg,
             std::chrono::duration<double, std::micro>(t1 - t0).count());
       }
     }
+    auto wall_end = Clock::now();
     RecordResult("SPDK CopyToSSD", "single-key",
                  keys.size() * cfg.measure_iters,
                  keys.size() * cfg.measure_iters * cfg.value_size,
-                 LatencyElapsed(lat), lat, results);
+                 WallSeconds(wall_start, wall_end), lat, results);
   }
 
   // Batch
@@ -664,6 +698,7 @@ static void BenchSpdkCopyToSSD(const BenchConfig& cfg,
 
     std::vector<double> lat;
     lat.reserve(kdescs.size() * cfg.measure_iters);
+    auto wall_start = Clock::now();
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
       for (const auto& batch : kdescs) {
         auto t0 = Clock::now();
@@ -673,11 +708,12 @@ static void BenchSpdkCopyToSSD(const BenchConfig& cfg,
             std::chrono::duration<double, std::micro>(t1 - t0).count());
       }
     }
+    auto wall_end = Clock::now();
     RecordResult("SPDK CopyToSSD",
                  "batch(bs=" + std::to_string(cfg.batch_size) + ")",
                  keys.size() * cfg.measure_iters,
                  keys.size() * cfg.measure_iters * cfg.value_size,
-                 LatencyElapsed(lat), lat, results);
+                 WallSeconds(wall_start, wall_end), lat, results);
   }
 }
 
@@ -710,6 +746,7 @@ static void BenchSpdkConcurrent(const BenchConfig& cfg,
       for (int t = 0; t < nthreads; ++t)
         tl[t].reserve(kpt * cfg.measure_iters);
 
+      auto wall_start = Clock::now();
       for (size_t m = 0; m < cfg.measure_iters; ++m) {
         client.Clear();
         std::vector<std::thread> threads;
@@ -727,12 +764,13 @@ static void BenchSpdkConcurrent(const BenchConfig& cfg,
         }
         for (auto& th : threads) th.join();
       }
+      auto wall_end = Clock::now();
       std::vector<double> all;
       for (auto& v : tl) all.insert(all.end(), v.begin(), v.end());
       RecordResult("SPDK Concurrent Put", variant,
                    kpt * nthreads * cfg.measure_iters,
                    kpt * nthreads * cfg.measure_iters * cfg.value_size,
-                   LatencyElapsed(all), all, results);
+                   WallSeconds(wall_start, wall_end), all, results);
     }
 
     // Get
@@ -745,6 +783,7 @@ static void BenchSpdkConcurrent(const BenchConfig& cfg,
       for (int t = 0; t < nthreads; ++t)
         tl[t].reserve(kpt * cfg.measure_iters);
 
+      auto wall_start = Clock::now();
       for (size_t m = 0; m < cfg.measure_iters; ++m) {
         std::vector<std::thread> threads;
         for (int t = 0; t < nthreads; ++t) {
@@ -764,12 +803,13 @@ static void BenchSpdkConcurrent(const BenchConfig& cfg,
         }
         for (auto& th : threads) th.join();
       }
+      auto wall_end = Clock::now();
       std::vector<double> all;
       for (auto& v : tl) all.insert(all.end(), v.begin(), v.end());
       RecordResult("SPDK Concurrent Get", variant,
                    kpt * nthreads * cfg.measure_iters,
                    kpt * nthreads * cfg.measure_iters * cfg.value_size,
-                   LatencyElapsed(all), all, results);
+                   WallSeconds(wall_start, wall_end), all, results);
     }
   }
 }
@@ -797,6 +837,7 @@ static void BenchSpdkLeaderMode(const BenchConfig& cfg,
 
     std::vector<double> lat;
     lat.reserve(keys.size() * cfg.measure_iters);
+    auto wall_start = Clock::now();
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
       client.Clear();
       for (size_t i = 0; i < keys.size(); ++i) {
@@ -807,9 +848,10 @@ static void BenchSpdkLeaderMode(const BenchConfig& cfg,
             std::chrono::duration<double, std::micro>(t1 - t0).count());
       }
     }
+    auto wall_end = Clock::now();
     RecordResult("SPDK Leader Put", label, keys.size() * cfg.measure_iters,
                  keys.size() * cfg.measure_iters * cfg.value_size,
-                 LatencyElapsed(lat), lat, results);
+                 WallSeconds(wall_start, wall_end), lat, results);
   };
 
   run_mode(false, "sync copy");
@@ -846,6 +888,7 @@ BenchSpdkCapacityPressure(const BenchConfig& cfg,
 
     std::vector<double> lat;
     lat.reserve(half * cfg.measure_iters);
+    auto wall_start = Clock::now();
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
       client.Clear();
       for (size_t i = 0; i < half; ++i) {
@@ -856,10 +899,11 @@ BenchSpdkCapacityPressure(const BenchConfig& cfg,
             std::chrono::duration<double, std::micro>(t1 - t0).count());
       }
     }
+    auto wall_end = Clock::now();
     RecordResult("SPDK Capacity Put", "no pressure",
                  half * cfg.measure_iters,
                  half * cfg.measure_iters * cfg.value_size,
-                 LatencyElapsed(lat), lat, results);
+                 WallSeconds(wall_start, wall_end), lat, results);
   }
 
   // Under pressure
@@ -873,6 +917,7 @@ BenchSpdkCapacityPressure(const BenchConfig& cfg,
 
     std::vector<double> lat;
     lat.reserve(half * cfg.measure_iters);
+    auto wall_start = Clock::now();
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
       client.Clear();
       for (size_t i = 0; i < half; ++i)
@@ -885,10 +930,11 @@ BenchSpdkCapacityPressure(const BenchConfig& cfg,
             std::chrono::duration<double, std::micro>(t1 - t0).count());
       }
     }
+    auto wall_end = Clock::now();
     RecordResult("SPDK Capacity Put", "under pressure",
                  (keys.size() - half) * cfg.measure_iters,
                  (keys.size() - half) * cfg.measure_iters * cfg.value_size,
-                 LatencyElapsed(lat), lat, results);
+                 WallSeconds(wall_start, wall_end), lat, results);
   }
 }
 
@@ -988,13 +1034,15 @@ static void BenchSpdkE2E(const BenchConfig& cfg, const E2EConfig& e2e,
     client.Clear();
     std::vector<double> lat;
     lat.reserve(batches_per_iter * e2e_iters);
+    auto wall_start = Clock::now();
     for (size_t m = 0; m < e2e_iters; ++m) {
       client.Clear();
       FillAllTimed(client, e2e.num_pages, lat);
     }
+    auto wall_end = Clock::now();
     RecordResult("E2E BatchSet", vlabel, e2e.num_pages * e2e_iters,
                  e2e.num_pages * e2e_iters * keys_per_page * value_size,
-                 LatencyElapsed(lat), lat, results);
+                 WallSeconds(wall_start, wall_end), lat, results);
   }
 
   // (b) BatchGet — DRAM only
@@ -1003,11 +1051,13 @@ static void BenchSpdkE2E(const BenchConfig& cfg, const E2EConfig& e2e,
     FillAll(client);
     std::vector<double> lat;
     lat.reserve(batches_per_iter * e2e_iters);
+    auto wall_start = Clock::now();
     for (size_t m = 0; m < e2e_iters; ++m)
       ReadAllTimed(client, e2e.num_pages, lat);
+    auto wall_end = Clock::now();
     RecordResult("E2E BatchGet", vlabel, e2e.num_pages * e2e_iters,
                  e2e.num_pages * e2e_iters * keys_per_page * value_size,
-                 LatencyElapsed(lat), lat, results);
+                 WallSeconds(wall_start, wall_end), lat, results);
   }
 
   // (c) Capacity pressure — one client for both set and get
@@ -1025,14 +1075,16 @@ static void BenchSpdkE2E(const BenchConfig& cfg, const E2EConfig& e2e,
       client.Clear();
       std::vector<double> lat;
       lat.reserve(batches_per_iter * e2e_iters);
+      auto wall_start = Clock::now();
       for (size_t m = 0; m < e2e_iters; ++m) {
         client.Clear();
         FillAllTimed(client, e2e.num_pages, lat);
       }
+      auto wall_end = Clock::now();
       RecordResult("E2E SPDK Capacity Set", "DRAM 50%",
                    e2e.num_pages * e2e_iters,
                    e2e.num_pages * e2e_iters * keys_per_page * value_size,
-                   LatencyElapsed(lat), lat, results);
+                   WallSeconds(wall_start, wall_end), lat, results);
     }
 
     // Read back (reuse same client — data already evicted to NVMe)
@@ -1041,12 +1093,14 @@ static void BenchSpdkE2E(const BenchConfig& cfg, const E2EConfig& e2e,
       FillAll(client);
       std::vector<double> lat;
       lat.reserve(batches_per_iter * e2e_iters);
+      auto wall_start = Clock::now();
       for (size_t m = 0; m < e2e_iters; ++m)
         ReadAllTimed(client, e2e.num_pages, lat);
+      auto wall_end = Clock::now();
       RecordResult("E2E SPDK Capacity Get", "DRAM+NVMe mixed",
                    e2e.num_pages * e2e_iters,
                    e2e.num_pages * e2e_iters * keys_per_page * value_size,
-                   LatencyElapsed(lat), lat, results);
+                   WallSeconds(wall_start, wall_end), lat, results);
     }
   }
 
@@ -1064,13 +1118,15 @@ static void BenchSpdkE2E(const BenchConfig& cfg, const E2EConfig& e2e,
       }
       std::vector<double> lat;
       lat.reserve(batches_per_iter * e2e_iters);
+      auto wall_start = Clock::now();
       for (size_t m = 0; m < e2e_iters; ++m) {
         client.Clear();
         FillAllTimed(client, e2e.num_pages, lat);
       }
+      auto wall_end = Clock::now();
       RecordResult("E2E SPDK Leader Set", label, e2e.num_pages * e2e_iters,
                    e2e.num_pages * e2e_iters * keys_per_page * value_size,
-                   LatencyElapsed(lat), lat, results);
+                   WallSeconds(wall_start, wall_end), lat, results);
     };
     run_leader(false, "sync copy");
     run_leader(true, "async copy");
@@ -1089,12 +1145,14 @@ static void BenchSpdkE2E(const BenchConfig& cfg, const E2EConfig& e2e,
 
     std::vector<double> lat;
     lat.reserve(batches_per_iter * e2e_iters);
+    auto wall_start = Clock::now();
     for (size_t m = 0; m < e2e_iters; ++m)
       ReadAllTimed(follower, e2e.num_pages, lat);
+    auto wall_end = Clock::now();
     RecordResult("E2E SPDK Follower Get", "NVMe read",
                  e2e.num_pages * e2e_iters,
                  e2e.num_pages * e2e_iters * keys_per_page * value_size,
-                 LatencyElapsed(lat), lat, results);
+                 WallSeconds(wall_start, wall_end), lat, results);
   }
 }
 
