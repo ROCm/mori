@@ -9,6 +9,11 @@ jobs:
   build:
     name: mori build
     runs-on: label-1
+    container:
+      image: rocm/pytorch-private:mori_rocm7.2_ubuntu22.04_py3.10_pytorch_bnxt_ionic
+      credentials:
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
     timeout-minutes: 10
     steps:
       - name: clone source code
@@ -43,6 +48,11 @@ jobs:
     name: mori test
     needs: build
     runs-on: label-1
+    container:
+      image: rocm/pytorch-private:mori_rocm7.2_ubuntu22.04_py3.10_pytorch_bnxt_ionic
+      credentials:
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
     timeout-minutes: 10
     steps:
         #- uses: actions/checkout@v4
