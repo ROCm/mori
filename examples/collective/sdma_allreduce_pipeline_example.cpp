@@ -169,6 +169,13 @@ void testPipelinedAllreduce() {
         auto ar = std::make_unique<AllreduceSdma<uint32_t>>(
             myPe, npes, bytesPerPe, totalBytes);
 
+        // 清零 transit buffer 避免首次使用时 L2 缓存残留导致 reduce 结果错误
+        void* transitBuf = ar->getOutputTransitBuffer();
+        if (transitBuf) {
+            CHECK_HIP(hipMemset(transitBuf, 0, ar->getOutputTransitBufferSize()));
+            CHECK_HIP(hipDeviceSynchronize());
+        }
+
         if (myPe == 0) {
             printf("\n--- 数据大小: %zu MB/PE ---\n", dataMB);
             printf("%-42s %10s %12s %12s %8s\n",
