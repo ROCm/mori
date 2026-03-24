@@ -117,8 +117,6 @@ jobs:
     timeout-minutes: 30
     env:
       PYTHONPATH: ${{ github.workspace }}:$PYTHONPATH
-      GLOO_SOCKET_IFNAME: ${{ matrix.node1_ifname }}
-      MORI_SOCKET_IFNAME: ${{ matrix.node1_ifname }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
