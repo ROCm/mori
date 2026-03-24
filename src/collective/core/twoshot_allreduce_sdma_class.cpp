@@ -331,16 +331,6 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             inputSymmObj = input_transit_buffer_obj_;
         }
 
-        // SCATTER_MODE=0 uses double-buffer: 2x transit size
-        if (scatter_mode == 0) {
-            size_t required = 2 * total_count * dtype_size_;
-            if (!ensure_buffer_size(output_transit_buffer_, output_transit_buffer_ptr_,
-                                    output_transit_buffer_size_, output_transit_buffer_obj_,
-                                    required, "output transit buffer")) {
-                return false;
-            }
-        }
-
         if (scatter_mode == 1) {
             PipelinedAllReduceSdmaKernel<T, 1><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input, output_transit_buffer_obj_, flagsObj_,
@@ -359,25 +349,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         }
 
         if (copy_output_to_user_) {
-            if (scatter_mode == 0) {
-                size_t reduce_offset = total_count * dtype_size_;
-                hipError_t cpErr = stream
-                    ? hipMemcpyAsync(output,
-                          static_cast<char*>(output_transit_buffer_) + reduce_offset,
-                          total_count * dtype_size_,
-                          hipMemcpyDeviceToDevice, stream)
-                    : hipMemcpy(output,
-                          static_cast<char*>(output_transit_buffer_) + reduce_offset,
-                          total_count * dtype_size_,
-                          hipMemcpyDeviceToDevice);
-                if (cpErr != hipSuccess) {
-                    fprintf(stderr, "PE %d: copy from reduce region failed: %s\n",
-                            myPe_, hipGetErrorString(cpErr));
-                    return false;
-                }
-            } else {
-                copy_output_to_user(output, total_count, stream);
-            }
+            copy_output_to_user(output, total_count, stream);
         }
     } catch (const std::exception& e) {
         fprintf(stderr, "PE %d: PipelinedAllReduce failed: %s\n", myPe_, e.what());
