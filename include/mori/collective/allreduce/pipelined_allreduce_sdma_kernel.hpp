@@ -127,7 +127,11 @@ __global__ void PipelinedAllReduceSdmaKernel(
         int spin = 0;
         while (core::AtomicLoadRelaxed(mySignal) < flagVal) {
           if (++spin > 100000000) {
-            printf("PE %d: Pipeline scatter timeout chunk %d peer %d\n", myPe, chunkIdx, sender);
+            printf("PE %d: scatter timeout chunk %d peer %d (expect %llu actual %llu base %llu)\n",
+                   myPe, chunkIdx, sender,
+                   (unsigned long long)flagVal,
+                   (unsigned long long)core::AtomicLoadRelaxed(mySignal),
+                   (unsigned long long)signalBase);
             break;
           }
         }
@@ -249,7 +253,12 @@ __global__ void PipelinedAllReduceSdmaKernel(
         int spin = 0;
         while (core::AtomicLoadRelaxed(mySignal) < flagVal) {
           if (++spin > 100000000) {
-            printf("PE %d: Pipeline AG timeout chunk %d peer %d\n", myPe, chunkIdx, sender);
+            printf("PE %d: AG timeout chunk %d peer %d (expect %llu actual %llu base %llu nChunks %d)\n",
+                   myPe, chunkIdx, sender,
+                   (unsigned long long)flagVal,
+                   (unsigned long long)core::AtomicLoadRelaxed(mySignal),
+                   (unsigned long long)signalBase,
+                   numChunks);
             break;
           }
         }
@@ -307,6 +316,19 @@ __global__ void PipelinedAllReduceSdmaKernel(
       int cap = 2 * numChunks;
       return signalBase + static_cast<uint64_t>(pos < cap ? pos : cap);
   };
+
+  // One-time diagnostic: verify signalBase matches actual SDMA signal values
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    printf("PE %d: pipeline start signalBase=%llu barrier=%u numChunks=%d\n",
+           myPe, (unsigned long long)signalBase, barrier->flag, numChunks);
+    for (int i = 0; i < npes; ++i) {
+      if (i == myPe) continue;
+      HSAuint64* sig = dstMemObj->signalPtrs
+                       + static_cast<size_t>(i) * dstMemObj->sdmaNumQueue;
+      printf("  signal[peer %d] = %llu\n", i, (unsigned long long)core::AtomicLoadRelaxed(sig));
+    }
+  }
+  __syncthreads();
 
   if constexpr (SCATTER_MODE == 0) {
     // === SDMA Scatter mode ===
