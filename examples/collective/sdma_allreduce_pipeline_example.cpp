@@ -222,6 +222,8 @@ void testPipelinedAllreduce() {
             }
 
             bool ok = verifyResult(result.data(), elemsPerPe, computeExpected(npes), myPe);
+            printf("PE %d: verify %s (first val=%u, expected=%u)\n",
+                   myPe, ok ? "PASS" : "FAIL", result[0], computeExpected(npes));
 
             int lok = ok ? 1 : 0, gok = 0;
             MPI_Allreduce(&lok, &gok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
