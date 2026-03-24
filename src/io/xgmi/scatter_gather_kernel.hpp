@@ -67,7 +67,5 @@ __global__ void scatterGatherCopyKernel(const char* __restrict__ srcBase,
   }
 }
 
-constexpr int kScatterGatherKernelThreshold = 4;
-
 }  // namespace io
 }  // namespace mori

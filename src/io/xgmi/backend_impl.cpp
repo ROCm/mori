@@ -25,6 +25,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <climits>
 #include <cstdlib>
 #include <cstring>
 #include <numeric>
@@ -37,6 +38,18 @@
 namespace mori {
 namespace io {
 namespace {
+
+int getScatterGatherKernelThreshold() {
+  static const int threshold = []() {
+    const char* env = std::getenv("MORI_IO_XGMI_SCATTER_GATHER_THRESHOLD");
+    if (env != nullptr && env[0] != '\0') {
+      int val = std::atoi(env);
+      if (val >= 0) return val;
+    }
+    return INT_MAX;
+  }();
+  return threshold;
+}
 
 // Keep caller-visible HIP current device unchanged across MORI internals.
 class ScopedHipDeviceGuard {
@@ -230,7 +243,7 @@ void XgmiBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
   void* srcBase = isRead ? remoteAddr : localAddr;
   void* dstBase = isRead ? localAddr : remoteAddr;
 
-  bool useKernel = static_cast<int>(segments.size()) > kScatterGatherKernelThreshold;
+  bool useKernel = static_cast<int>(segments.size()) > getScatterGatherKernelThreshold();
 
   if (useKernel) {
     size_t numSegs = segments.size();
