@@ -74,6 +74,7 @@ static BenchResult runBench(const char* label, BenchFn fn,
     res.avgMs = res.algoBw = res.busBw = 0.0;
 
     CHECK_HIP(hipMemcpy(inBuf, hostData.data(), bytesPerPe, hipMemcpyHostToDevice));
+    CHECK_HIP(hipMemset(outBuf, 0, bytesPerPe));
     CHECK_HIP(hipDeviceSynchronize());
     MPI_Barrier(MPI_COMM_WORLD);
 
