@@ -178,9 +178,10 @@ void testPipelinedAllreduce() {
         CHECK_HIP(hipMalloc(&inBuf, bytesPerPe));
         std::vector<uint32_t> hostData(elemsPerPe, fillValue);
 
-        // copy_output_to_user=false: 从 transit buffer 直接验证，避免 L2 coherence 问题
+        // copy_output_to_user=false，与 allreduce_sdma_sync 一致
+        size_t outputBufSize = static_cast<size_t>(npes) * (elemsPerPe / npes + 64) * sizeof(uint32_t);
         auto ar = std::make_unique<AllreduceSdma<uint32_t>>(
-            myPe, npes, bytesPerPe, totalBytes, false);
+            myPe, npes, bytesPerPe, outputBufSize, false);
 
         if (myPe == 0) {
             printf("\n--- 数据大小: %zu MB/PE ---\n", dataMB);
