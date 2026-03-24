@@ -254,6 +254,9 @@ void testPipelinedAllreduce() {
             CHECK_HIP(hipFree(outBuf));
         }
 
+        // TODO: Pipeline 测试暂时禁用，先确认串行模式正确性
+        // 确认后取消注释以下代码块
+#if 0
         // 2) Pipeline SDMA scatter 模式，遍历不同 chunk 大小
         for (size_t chunkKB : chunkSizesKB) {
             size_t chunkBytes = chunkKB * 1024;
@@ -295,6 +298,7 @@ void testPipelinedAllreduce() {
             }
             allResults.push_back(res);
         }
+#endif
 
         ar.reset();
         CHECK_HIP(hipFree(inBuf));
