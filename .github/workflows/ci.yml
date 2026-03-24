@@ -7,6 +7,7 @@ on:
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
+
 jobs:
   setup:
     name: setup matrix
@@ -39,7 +40,7 @@ jobs:
             ]
           }
           EOF
-          echo "matrix=$(cat /tmp/matrix.json | grep -v '//' | tr -d '\n')" >> $GITHUB_OUTPUT
+          echo "matrix=$(grep -v '//' /tmp/matrix.json | tr -d '\n')" >> $GITHUB_OUTPUT
 
   build:
     name: mori build (${{ matrix.runner }})
@@ -61,32 +62,42 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
       - name: Build and install mori (node1)
-        run: |
-          BUILD_EXAMPLES=ON pip install .
+        run: BUILD_EXAMPLES=ON pip install .
+
       - name: Verify installation (node1)
-        run: |
-          python -c "import mori; print('OK')"
+        run: python -c "import mori; print('OK')"
+
       - name: Copy source to node2
         run: |
-          ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} "mkdir -p $GITHUB_WORKSPACE"
-          rsync -az --exclude='.git' -e "ssh -p ${{ matrix.node2_port }}" \
-            $GITHUB_WORKSPACE/ root@${{ matrix.node2_host }}:$GITHUB_WORKSPACE/
+          ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} \
+            "mkdir -p $GITHUB_WORKSPACE"
+          rsync -az --exclude='.git' \
+            -e "ssh -p ${{ matrix.node2_port }}" \
+            $GITHUB_WORKSPACE/ \
+            root@${{ matrix.node2_host }}:$GITHUB_WORKSPACE/
+
       - name: Start container on node2
         run: |
           ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} "
-            echo '${{ secrets.DOCKER_PASSWORD }}' | docker login -u '${{ secrets.DOCKER_USERNAME }}' --password-stdin
-            docker run -d --name mori_ci_${{ github.run_id }} \
+            echo '${{ secrets.DOCKER_PASSWORD }}' \
+              | docker login -u '${{ secrets.DOCKER_USERNAME }}' --password-stdin
+            docker run -d \
+              --name mori_ci_${{ github.run_id }} \
               --device=/dev/kfd --device=/dev/dri --device=/dev/infiniband \
               --group-add video --ipc=host --privileged \
               -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
               rocm/pytorch-private:mori_rocm7.2_ubuntu22.04_py3.10_pytorch_bnxt_ionic \
               sleep infinity
           "
+
       - name: Build and install mori (node2)
         run: |
           ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} \
-            "docker exec mori_ci_${{ github.run_id }} bash -c 'cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install .'"
+            "docker exec mori_ci_${{ github.run_id }} \
+             bash -c 'cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install .'"
+
   intranode-test:
     name: mori intranode test (${{ matrix.runner }})
     needs: [setup, build]
@@ -111,45 +122,67 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
       - name: Install mori
         run: |
           cd $GITHUB_WORKSPACE
           BUILD_EXAMPLES=ON pip install .
+
       - name: MORI-EP
         run: |
           cd $GITHUB_WORKSPACE
           timeout 120 pytest tests/python/ops/test_dispatch_combine.py -q
+
       - name: MORI-EP bench
         run: |
           cd $GITHUB_WORKSPACE
           timeout 120 python3 tests/python/ops/bench_dispatch_combine.py
+
       - name: MORI-IO
         run: |
           cd $GITHUB_WORKSPACE
           timeout 60 pytest tests/python/io/
+
       - name: MORI-IR
         run: |
           cd $GITHUB_WORKSPACE
-          timeout 60 torchrun --nproc_per_node=2 examples/shmem/ir/test_triton_shmem.py
-          timeout 60 torchrun --nproc_per_node=8 examples/shmem/ir/test_triton_allreduce.py
+          timeout 60 torchrun --nproc_per_node=2 \
+            examples/shmem/ir/test_triton_shmem.py
+          timeout 60 torchrun --nproc_per_node=8 \
+            examples/shmem/ir/test_triton_allreduce.py
+
       - name: MORI-CPP shmem (P2P)
         run: |
           cd $GITHUB_WORKSPACE
-          timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_put_thread
-          timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_get_thread
-          # timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_put_imm_thread
-          timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_put_signal_thread
-          timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/atomic_nonfetch_thread
-          timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/atomic_fetch_thread
+          timeout 60 mpirun --allow-run-as-root -np 2 \
+            ./build/examples/concurrent_put_thread
+          timeout 60 mpirun --allow-run-as-root -np 2 \
+            ./build/examples/concurrent_get_thread
+          # timeout 60 mpirun --allow-run-as-root -np 2 \
+          #   ./build/examples/concurrent_put_imm_thread
+          timeout 60 mpirun --allow-run-as-root -np 2 \
+            ./build/examples/concurrent_put_signal_thread
+          timeout 60 mpirun --allow-run-as-root -np 2 \
+            ./build/examples/atomic_nonfetch_thread
+          timeout 60 mpirun --allow-run-as-root -np 2 \
+            ./build/examples/atomic_fetch_thread
+
       - name: MORI-CPP shmem (IBGDA)
         run: |
           cd $GITHUB_WORKSPACE
-          MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_put_thread
-          MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_get_thread
-          # MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_put_imm_thread
-          MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_put_signal_thread
-          MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/atomic_nonfetch_thread
-          MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/atomic_fetch_thread
+          MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 \
+            ./build/examples/concurrent_put_thread
+          MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 \
+            ./build/examples/concurrent_get_thread
+          # MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 \
+          #   ./build/examples/concurrent_put_imm_thread
+          MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 \
+            ./build/examples/concurrent_put_signal_thread
+          MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 \
+            ./build/examples/atomic_nonfetch_thread
+          MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 \
+            ./build/examples/atomic_fetch_thread
+
       - name: MORI-CCL/shmem
         run: |
           cd $GITHUB_WORKSPACE
@@ -158,7 +191,7 @@ jobs:
   internode-test:
     name: mori internode test (${{ matrix.runner }})
     needs: [setup, build, intranode-test]
-    if: always()
+    if: needs.build.result == 'success'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -180,20 +213,46 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
       - name: Install mori
         run: |
           cd $GITHUB_WORKSPACE
           BUILD_EXAMPLES=ON pip install .
+
       - name: MORI-EP inter bench
         run: |
           cd $GITHUB_WORKSPACE
-          ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} "docker exec mori_ci_${{ github.run_id }} bash -c 'GLOO_SOCKET_IFNAME=${{ matrix.node2_ifname }} MORI_SOCKET_IFNAME=${{ matrix.node2_ifname }} torchrun --nnodes=2 --node_rank=1 --nproc_per_node=1 --master_addr=${{ matrix.node1_host }} --master_port=1234 $GITHUB_WORKSPACE/examples/ops/dispatch_combine/test_dispatch_combine_internode.py --cmd bench --kernel-type v1 --num-qp 2 --max-tokens 4096'" &
-          torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 --master_addr="${{ matrix.node1_host }}" --master_port=1234 examples/ops/dispatch_combine/test_dispatch_combine_internode.py --cmd bench --kernel-type v1 --num-qp 2 --max-tokens 4096
+          ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} \
+            "docker exec mori_ci_${{ github.run_id }} bash -c '
+              GLOO_SOCKET_IFNAME=${{ matrix.node2_ifname }}
+              MORI_SOCKET_IFNAME=${{ matrix.node2_ifname }}
+              torchrun --nnodes=2 --node_rank=1 --nproc_per_node=1 \
+                --master_addr=${{ matrix.node1_host }} --master_port=1234 \
+                $GITHUB_WORKSPACE/examples/ops/dispatch_combine/test_dispatch_combine_internode.py \
+                --cmd bench --kernel-type v1 --num-qp 2 --max-tokens 4096
+            '" &
+          torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
+            --master_addr="${{ matrix.node1_host }}" --master_port=1234 \
+            examples/ops/dispatch_combine/test_dispatch_combine_internode.py \
+            --cmd bench --kernel-type v1 --num-qp 2 --max-tokens 4096
+
       - name: MORI-EP inter stress
         run: |
           cd $GITHUB_WORKSPACE
-          ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} "docker exec mori_ci_${{ github.run_id }} bash -c 'GLOO_SOCKET_IFNAME=${{ matrix.node2_ifname }} MORI_SOCKET_IFNAME=${{ matrix.node2_ifname }} torchrun --nnodes=2 --node_rank=1 --nproc_per_node=1 --master_addr=${{ matrix.node1_host }} --master_port=1234 $GITHUB_WORKSPACE/examples/ops/dispatch_combine/test_dispatch_combine_internode.py --cmd stress --kernel-type v1 --num-qp 2 --max-tokens 128'" &
-          torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 --master_addr="${{ matrix.node1_host }}" --master_port=1234 examples/ops/dispatch_combine/test_dispatch_combine_internode.py --cmd stress --kernel-type v1 --num-qp 2 --max-tokens 128
+          ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} \
+            "docker exec mori_ci_${{ github.run_id }} bash -c '
+              GLOO_SOCKET_IFNAME=${{ matrix.node2_ifname }}
+              MORI_SOCKET_IFNAME=${{ matrix.node2_ifname }}
+              torchrun --nnodes=2 --node_rank=1 --nproc_per_node=1 \
+                --master_addr=${{ matrix.node1_host }} --master_port=1234 \
+                $GITHUB_WORKSPACE/examples/ops/dispatch_combine/test_dispatch_combine_internode.py \
+                --cmd stress --kernel-type v1 --num-qp 2 --max-tokens 128
+            '" &
+          torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
+            --master_addr="${{ matrix.node1_host }}" --master_port=1234 \
+            examples/ops/dispatch_combine/test_dispatch_combine_internode.py \
+            --cmd stress --kernel-type v1 --num-qp 2 --max-tokens 128
+
       - name: Cleanup node2 container
         if: always()
         run: |
