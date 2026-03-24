@@ -4,7 +4,9 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 jobs:
   build:
     name: mori build
@@ -37,9 +39,15 @@ jobs:
         username: ${{ secrets.DOCKER_USERNAME }}
         password: ${{ secrets.DOCKER_PASSWORD }}
     timeout-minutes: 30
+    env:
+      PYTHONPATH: ${{ github.workspace }}:$PYTHONPATH
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Install mori
+        run: |
+          cd $GITHUB_WORKSPACE
+          BUILD_EXAMPLES=ON pip install .
       - name: MORI-EP
         run: |
           cd $GITHUB_WORKSPACE
