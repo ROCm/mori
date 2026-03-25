@@ -57,6 +57,7 @@ __global__ void ReduceScatterSdmaPutKernel(int myPe, int npes,
   if (threadLinearId < npes * dstMemObj->sdmaNumQueue) {
     int qId = threadLinearId % dstMemObj->sdmaNumQueue;
     int remotePe = threadLinearId / dstMemObj->sdmaNumQueue;
+    if (remotePe == myPe) return;
 
     const size_t sendBytesBase = bytesPerPeer / 8;
     size_t sendBytes = (qId == 7) ? (bytesPerPeer - 7 * sendBytesBase) : sendBytesBase;
@@ -120,18 +121,20 @@ __global__ void AllGatherAsyncPutKernel(int myPe, int npes,
 
   if (warpId < npes && laneId == 0) {
     int remotePe = warpId;
-    application::SymmMemObjPtr dest = dstMemObj;
+    if (remotePe != myPe) {
+      application::SymmMemObjPtr dest = dstMemObj;
 
-    uint8_t* agDstPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe])
-                        + static_cast<size_t>(myPe) * elementCountPerRank * bytesPerElement;
+      uint8_t* agDstPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe])
+                          + static_cast<size_t>(myPe) * elementCountPerRank * bytesPerElement;
 
-    anvil::SdmaQueueDeviceHandle** dh =
-        dest->deviceHandles_d + remotePe * dest->sdmaNumQueue;
-    HSAuint64* remoteSignal = dest->peerSignalPtrs[remotePe]
-                              + static_cast<size_t>(myPe) * dest->sdmaNumQueue;
+      anvil::SdmaQueueDeviceHandle** dh =
+          dest->deviceHandles_d + remotePe * dest->sdmaNumQueue;
+      HSAuint64* remoteSignal = dest->peerSignalPtrs[remotePe]
+                                + static_cast<size_t>(myPe) * dest->sdmaNumQueue;
 
-    core::SdmaPutThread(agSrcPtr, agDstPtr, agSendBytes,
-                        dh, remoteSignal, dest->sdmaNumQueue, 0);
+      core::SdmaPutThread(agSrcPtr, agDstPtr, agSendBytes,
+                          dh, remoteSignal, dest->sdmaNumQueue, 0);
+    }
   }
   // No ShmemQuietThread + AMO notify needed — remote signal written by SDMA ATOMIC
 }
@@ -303,6 +306,7 @@ __global__ void AllGatherReducedSdmaPutKernel(int myPe, int npes,
   if (threadLinearId < npes * dstMemObj->sdmaNumQueue) {
     int qId = threadLinearId % dstMemObj->sdmaNumQueue;
     int remotePe = threadLinearId / dstMemObj->sdmaNumQueue;
+    if (remotePe == myPe) return;
 
     const size_t sendBytesBase = bytesPerPeer / 8;
     size_t sendBytes = (qId == 7) ? (bytesPerPeer - 7 * sendBytesBase) : sendBytesBase;
@@ -374,22 +378,23 @@ __global__ void ReduceScatterAllGatherFusedKernel(
     const int warpId = static_cast<int>(threadIdx.x) / warpSize;
     const int laneId = static_cast<int>(threadIdx.x) % warpSize;
 
-    // Phase 1: SDMA scatter — each warp handles one destination PE
+    // Phase 1: SDMA scatter — each warp handles one destination PE (skip self; see twoshot_sdma_kernel)
     if (warpId < npes && laneId == 0) {
       int destPe = warpId;
+      if (destPe != myPe) {
+        uint8_t* srcPtr = reinterpret_cast<uint8_t*>(const_cast<T*>(input))
+                          + static_cast<size_t>(destPe) * chunkBytes;
+        uint8_t* remoteDst = reinterpret_cast<uint8_t*>(dstMemObj->peerPtrs[destPe])
+                             + static_cast<size_t>(myPe) * chunkBytes;
 
-      uint8_t* srcPtr = reinterpret_cast<uint8_t*>(const_cast<T*>(input))
-                        + static_cast<size_t>(destPe) * chunkBytes;
-      uint8_t* remoteDst = reinterpret_cast<uint8_t*>(dstMemObj->peerPtrs[destPe])
-                           + static_cast<size_t>(myPe) * chunkBytes;
+        anvil::SdmaQueueDeviceHandle** dh =
+            dstMemObj->deviceHandles_d + destPe * dstMemObj->sdmaNumQueue;
+        HSAuint64* remoteSignal = dstMemObj->peerSignalPtrs[destPe]
+                                  + static_cast<size_t>(myPe) * dstMemObj->sdmaNumQueue;
 
-      anvil::SdmaQueueDeviceHandle** dh =
-          dstMemObj->deviceHandles_d + destPe * dstMemObj->sdmaNumQueue;
-      HSAuint64* remoteSignal = dstMemObj->peerSignalPtrs[destPe]
-                                + static_cast<size_t>(myPe) * dstMemObj->sdmaNumQueue;
-
-      core::SdmaPutThread(srcPtr, remoteDst, chunkBytes,
-                          dh, remoteSignal, dstMemObj->sdmaNumQueue, 0);
+        core::SdmaPutThread(srcPtr, remoteDst, chunkBytes,
+                            dh, remoteSignal, dstMemObj->sdmaNumQueue, 0);
+      }
     }
     __syncthreads();
 

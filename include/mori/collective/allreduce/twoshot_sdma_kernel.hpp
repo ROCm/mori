@@ -198,24 +198,25 @@ __global__ void SdmaReduceScatterKernel(
 
     if (warpId < npes && laneId == 0) {
       int destPe = warpId;
+      // No SDMA self-scatter: Phase 2 never waits for sender==myPe, so a self-put
+      // can race Phase 2.5 CU stores into slot[myPe] (bad sums at shard starts).
+      if (destPe != myPe) {
+        uint8_t* srcPtr = reinterpret_cast<uint8_t*>(
+                               const_cast<T*>(input))
+                           + static_cast<size_t>(destPe) * chunkBytes;
 
-      uint8_t* srcPtr = reinterpret_cast<uint8_t*>(
-                             const_cast<T*>(input))
-                         + static_cast<size_t>(destPe) * chunkBytes;
+        uint8_t* remoteDst = reinterpret_cast<uint8_t*>(
+                                 dstMemObj->peerPtrs[destPe])
+                             + static_cast<size_t>(myPe) * chunkBytes;
 
-      uint8_t* remoteDst = reinterpret_cast<uint8_t*>(
-                               dstMemObj->peerPtrs[destPe])
-                           + static_cast<size_t>(myPe) * chunkBytes;
+        anvil::SdmaQueueDeviceHandle** dh =
+            dstMemObj->deviceHandles_d + destPe * dstMemObj->sdmaNumQueue;
+        HSAuint64* remoteSignal = dstMemObj->peerSignalPtrs[destPe]
+                                  + static_cast<size_t>(myPe) * dstMemObj->sdmaNumQueue;
 
-      anvil::SdmaQueueDeviceHandle** dh =
-          dstMemObj->deviceHandles_d + destPe * dstMemObj->sdmaNumQueue;
-      // Remote signal: ATOMIC writes directly to destPe's signal memory
-      // at slot [myPe * numQueues + qId], so destPe can detect completion locally
-      HSAuint64* remoteSignal = dstMemObj->peerSignalPtrs[destPe]
-                                + static_cast<size_t>(myPe) * dstMemObj->sdmaNumQueue;
-
-      core::SdmaPutThread(srcPtr, remoteDst, chunkBytes,
-                          dh, remoteSignal, dstMemObj->sdmaNumQueue, 0);
+        core::SdmaPutThread(srcPtr, remoteDst, chunkBytes,
+                            dh, remoteSignal, dstMemObj->sdmaNumQueue, 0);
+      }
     }
     __syncthreads();
 
@@ -363,19 +364,22 @@ __global__ void AllGatherSdmaKernel(int myPe, int npes,
 
   if (warpId < npes && laneId == 0) {
     int remotePe = warpId;
-    application::SymmMemObjPtr dest = dstMemObj;
+    // Skip self: reduced shard for partition myPe already lives at the AG dst offset.
+    if (remotePe != myPe) {
+      application::SymmMemObjPtr dest = dstMemObj;
 
-    uint8_t* agDstPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe])
-                        + static_cast<size_t>(myPe) * elementCountPerRank * bytesPerElement;
+      uint8_t* agDstPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe])
+                          + static_cast<size_t>(myPe) * elementCountPerRank * bytesPerElement;
 
-    anvil::SdmaQueueDeviceHandle** devicehandles =
-        dest->deviceHandles_d + remotePe * dest->sdmaNumQueue;
-    HSAuint64* remoteSignal = dest->peerSignalPtrs[remotePe]
-                              + static_cast<size_t>(myPe) * dest->sdmaNumQueue;
+      anvil::SdmaQueueDeviceHandle** devicehandles =
+          dest->deviceHandles_d + remotePe * dest->sdmaNumQueue;
+      HSAuint64* remoteSignal = dest->peerSignalPtrs[remotePe]
+                                + static_cast<size_t>(myPe) * dest->sdmaNumQueue;
 
-    core::SdmaPutThread(agSrcPtr, agDstPtr, agSendBytes,
-                        devicehandles, remoteSignal,
-                        dest->sdmaNumQueue, 0);
+      core::SdmaPutThread(agSrcPtr, agDstPtr, agSendBytes,
+                          devicehandles, remoteSignal,
+                          dest->sdmaNumQueue, 0);
+    }
   }
   __syncthreads();
 
