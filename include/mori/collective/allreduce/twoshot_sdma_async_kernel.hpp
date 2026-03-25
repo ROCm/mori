@@ -464,13 +464,14 @@ __global__ void ReduceScatterAllGatherFusedKernel(
     myDst[k] = downcast_v<typename P::type, pack_size>(acc);
   }
 
-  // Flush dirty L2 lines to HBM so SDMA-based AllGather reads fresh data.
-#if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
+  // Same visibility contract as SdmaReduceScatterKernel (twoshot_sdma_kernel.hpp).
   __syncthreads();
   if (threadIdx.x == 0) {
+#if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
     asm volatile("buffer_wbl2" ::: "memory");
-  }
 #endif
+    __threadfence_system();
+  }
 }
 
 }  // namespace collective

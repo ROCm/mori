@@ -298,15 +298,17 @@ __global__ void SdmaReduceScatterKernel(
     myDst[k] = downcast_v<typename P::type, pack_size>(acc);
   }
 
-  // Flush dirty L2 lines to HBM so the SDMA-based AllGather reads fresh data.
-  // CU stores land in L2 (write-back); SDMA reads bypass L2 and hit HBM.
-  // buffer_wbl2 (CDNA3 / MI300, gfx94x) writes back ALL dirty L2 lines.
-#if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
+  // Flush dirty L2 / make CU reduce visible before SDMA AllGather reads HBM.
+  // gfx94x: buffer_wbl2 writebacks L2. Always: __threadfence_system so builds
+  // without gfx94 macros or other ASICs still see correct data (matches
+  // PipelinedAllReduceSdmaKernel after reduce chunks).
   __syncthreads();
   if (threadIdx.x == 0) {
+#if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
     asm volatile("buffer_wbl2" ::: "memory");
-  }
 #endif
+    __threadfence_system();
+  }
 }
 
 // ============================================================================
