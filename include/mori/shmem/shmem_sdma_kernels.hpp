@@ -420,7 +420,7 @@ inline __device__ void ShmemGetMemNbiThreadKernel<application::TransportType::SD
     const application::SymmMemObjPtr dest, size_t destOffset,
     const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe, int qpId) {
   ShmemGetMemNbiThreadKernel<application::TransportType::P2P>(dest, destOffset, source,
-                                                               sourceOffset, bytes, pe, qpId);
+                                                              sourceOffset, bytes, pe, qpId);
 }
 
 template <>
@@ -428,15 +428,15 @@ inline __device__ void ShmemGetMemNbiWarpKernel<application::TransportType::SDMA
     const application::SymmMemObjPtr dest, size_t destOffset,
     const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe, int qpId) {
   ShmemGetMemNbiWarpKernel<application::TransportType::P2P>(dest, destOffset, source, sourceOffset,
-                                                             bytes, pe, qpId);
+                                                            bytes, pe, qpId);
 }
 
 template <>
 inline __device__ void ShmemGetMemNbiBlockKernel<application::TransportType::SDMA>(
     const application::SymmMemObjPtr dest, size_t destOffset,
     const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe, int qpId) {
-  ShmemGetMemNbiBlockKernel<application::TransportType::P2P>(dest, destOffset, source,
-                                                              sourceOffset, bytes, pe, qpId);
+  ShmemGetMemNbiBlockKernel<application::TransportType::P2P>(dest, destOffset, source, sourceOffset,
+                                                             bytes, pe, qpId);
 }
 
 /* ---------------------------------------------------------------------------------------------- */

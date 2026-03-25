@@ -30,9 +30,9 @@ def cast(input: torch.Tensor, output: torch.Tensor):
     from mori.ops.cast_jit import cast_float_to_fp4
 
     assert input.is_cuda and output.is_cuda, "Both tensors must be on GPU"
-    assert input.is_contiguous() and output.is_contiguous(), (
-        "Tensors must be contiguous"
-    )
+    assert (
+        input.is_contiguous() and output.is_contiguous()
+    ), "Tensors must be contiguous"
 
     stream = torch.cuda.current_stream().cuda_stream
     cast_float_to_fp4(

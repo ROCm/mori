@@ -1,4 +1,25 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
 // MIT License
 //
 // UMBP SPDK Benchmark Tool
@@ -73,15 +94,13 @@ struct E2EConfig {
   int prefix_depth_base = 10;
 
   size_t DtypeSize() const {
-    if (kv_cache_dtype == "fp8_e4m3" || kv_cache_dtype == "fp8_e5m2" ||
-        kv_cache_dtype == "fp8")
+    if (kv_cache_dtype == "fp8_e4m3" || kv_cache_dtype == "fp8_e5m2" || kv_cache_dtype == "fp8")
       return 1;
     return 2;
   }
   size_t KvCacheDim() const { return kv_lora_rank + qk_rope_head_dim; }
   size_t ValueSizePerKey() const {
-    if (mode == E2EModelMode::MLA)
-      return num_layers * page_size * KvCacheDim() * DtypeSize();
+    if (mode == E2EModelMode::MLA) return num_layers * page_size * KvCacheDim() * DtypeSize();
     return num_layers * page_size * num_kv_heads * head_dim * DtypeSize();
   }
   size_t KeysPerPage() const { return (mode == E2EModelMode::MLA) ? 1 : 2; }
@@ -106,9 +125,7 @@ struct BenchResult {
     return elapsed_sec > 0.0 ? static_cast<double>(ops) / elapsed_sec : 0.0;
   }
   double throughput_mb_sec() const {
-    return elapsed_sec > 0.0
-               ? static_cast<double>(bytes) / (1024.0 * 1024.0) / elapsed_sec
-               : 0.0;
+    return elapsed_sec > 0.0 ? static_cast<double>(bytes) / (1024.0 * 1024.0) / elapsed_sec : 0.0;
   }
 };
 
@@ -131,8 +148,7 @@ static std::vector<std::vector<char>> GenerateValues(size_t n, size_t sz) {
   std::vector<std::vector<char>> values(n);
   for (size_t i = 0; i < n; ++i) {
     values[i].resize(sz);
-    for (size_t j = 0; j < sz; ++j)
-      values[i][j] = static_cast<char>(dist(rng));
+    for (size_t j = 0; j < sz; ++j) values[i][j] = static_cast<char>(dist(rng));
   }
   return values;
 }
@@ -152,10 +168,9 @@ struct ReadBatchDesc {
   std::vector<size_t> sizes;
 };
 
-static std::vector<WriteBatchDesc>
-BuildWriteBatches(const std::vector<std::string>& all_keys,
-                  const std::vector<std::vector<char>>& values,
-                  size_t batch_size) {
+static std::vector<WriteBatchDesc> BuildWriteBatches(const std::vector<std::string>& all_keys,
+                                                     const std::vector<std::vector<char>>& values,
+                                                     size_t batch_size) {
   std::vector<WriteBatchDesc> descs;
   for (size_t i = 0; i < all_keys.size(); i += batch_size) {
     size_t end = std::min(i + batch_size, all_keys.size());
@@ -170,10 +185,10 @@ BuildWriteBatches(const std::vector<std::string>& all_keys,
   return descs;
 }
 
-static std::vector<ReadBatchDesc>
-BuildReadBatches(const std::vector<std::string>& all_keys,
-                 const std::vector<uintptr_t>& all_ptrs,
-                 const std::vector<size_t>& all_sizes, size_t batch_size) {
+static std::vector<ReadBatchDesc> BuildReadBatches(const std::vector<std::string>& all_keys,
+                                                   const std::vector<uintptr_t>& all_ptrs,
+                                                   const std::vector<size_t>& all_sizes,
+                                                   size_t batch_size) {
   std::vector<ReadBatchDesc> descs;
   for (size_t i = 0; i < all_keys.size(); i += batch_size) {
     size_t end = std::min(i + batch_size, all_keys.size());
@@ -186,8 +201,8 @@ BuildReadBatches(const std::vector<std::string>& all_keys,
   return descs;
 }
 
-static std::vector<std::vector<std::string>>
-BuildKeyBatches(const std::vector<std::string>& all_keys, size_t batch_size) {
+static std::vector<std::vector<std::string>> BuildKeyBatches(
+    const std::vector<std::string>& all_keys, size_t batch_size) {
   std::vector<std::vector<std::string>> descs;
   for (size_t i = 0; i < all_keys.size(); i += batch_size) {
     size_t end = std::min(i + batch_size, all_keys.size());
@@ -205,12 +220,9 @@ struct E2EKeyGenerator {
   size_t pp_rank = 0;
   size_t pp_size = 1;
 
-  std::string MlaSuffix() const {
-    return (pp_size > 1) ? std::to_string(pp_rank) : "";
-  }
+  std::string MlaSuffix() const { return (pp_size > 1) ? std::to_string(pp_rank) : ""; }
   std::string MhaSuffix() const {
-    if (pp_size > 1)
-      return std::to_string(tp_rank) + "_" + std::to_string(pp_rank);
+    if (pp_size > 1) return std::to_string(tp_rank) + "_" + std::to_string(pp_rank);
     return std::to_string(tp_rank);
   }
 
@@ -268,10 +280,8 @@ struct E2EHostBuffer {
     }
   }
 
-  static void MakeReadMeta(size_t count, size_t kpp, size_t vs,
-                           std::vector<char>& buf,
-                           std::vector<uintptr_t>& ptrs,
-                           std::vector<size_t>& sizes) {
+  static void MakeReadMeta(size_t count, size_t kpp, size_t vs, std::vector<char>& buf,
+                           std::vector<uintptr_t>& ptrs, std::vector<size_t>& sizes) {
     buf.assign(count * kpp * vs, 0);
     ptrs.clear();
     sizes.clear();
@@ -289,8 +299,7 @@ struct E2EHostBuffer {
   }
 };
 
-static std::vector<int> GenerateDepths(const E2EConfig& e2e, size_t start,
-                                       size_t count) {
+static std::vector<int> GenerateDepths(const E2EConfig& e2e, size_t start, size_t count) {
   std::vector<int> depths;
   depths.reserve(count * e2e.KeysPerPage());
   for (size_t i = 0; i < count; ++i) {
@@ -320,37 +329,33 @@ static void ComputeLatencyStats(std::vector<double>& lat, BenchResult& r) {
   size_t n = lat.size();
   r.lat_min_us = lat.front();
   r.lat_max_us = lat.back();
-  r.lat_avg_us =
-      std::accumulate(lat.begin(), lat.end(), 0.0) / static_cast<double>(n);
+  r.lat_avg_us = std::accumulate(lat.begin(), lat.end(), 0.0) / static_cast<double>(n);
   r.lat_p50_us = PercentileValue(lat, 0.50);
   r.lat_p95_us = PercentileValue(lat, 0.95);
   r.lat_p99_us = PercentileValue(lat, 0.99);
 }
 
-static double WallSeconds(const Clock::time_point& start,
-                          const Clock::time_point& end) {
+static double WallSeconds(const Clock::time_point& start, const Clock::time_point& end) {
   return std::chrono::duration<double>(end - start).count();
 }
 
 static void PrintHeader(const std::string& section) {
   std::printf("\n=== %s ===\n", section.c_str());
-  std::printf("%-36s %-20s %8s %10s %9s %9s %9s %9s %9s %9s %12s\n",
-              "Benchmark", "Variant", "Ops", "MB/s", "min(us)", "avg(us)",
-              "p50(us)", "p95(us)", "p99(us)", "max(us)", "ops/s");
+  std::printf("%-36s %-20s %8s %10s %9s %9s %9s %9s %9s %9s %12s\n", "Benchmark", "Variant", "Ops",
+              "MB/s", "min(us)", "avg(us)", "p50(us)", "p95(us)", "p99(us)", "max(us)", "ops/s");
   std::printf("%s\n", std::string(140, '-').c_str());
 }
 
 static void PrintResult(const BenchResult& r) {
-  std::printf("%-36s %-20s %8zu %10.1f %9.1f %9.1f %9.1f %9.1f %9.1f %9.1f "
-              "%12.0f\n",
-              r.name.c_str(), r.variant.c_str(), r.ops, r.throughput_mb_sec(),
-              r.lat_min_us, r.lat_avg_us, r.lat_p50_us, r.lat_p95_us,
-              r.lat_p99_us, r.lat_max_us, r.throughput_ops_sec());
+  std::printf(
+      "%-36s %-20s %8zu %10.1f %9.1f %9.1f %9.1f %9.1f %9.1f %9.1f "
+      "%12.0f\n",
+      r.name.c_str(), r.variant.c_str(), r.ops, r.throughput_mb_sec(), r.lat_min_us, r.lat_avg_us,
+      r.lat_p50_us, r.lat_p95_us, r.lat_p99_us, r.lat_max_us, r.throughput_ops_sec());
 }
 
-static void RecordResult(const std::string& name, const std::string& variant,
-                         size_t ops, size_t bytes, double elapsed_sec,
-                         std::vector<double>& lat,
+static void RecordResult(const std::string& name, const std::string& variant, size_t ops,
+                         size_t bytes, double elapsed_sec, std::vector<double>& lat,
                          std::vector<BenchResult>& results) {
   BenchResult r;
   r.name = name;
@@ -395,11 +400,9 @@ static UMBPConfig MakeSpdkFollowerConfig() {
 // ---------------------------------------------------------------------------
 // A. SPDK Tier Benchmarks — uses shared SSD tier from anchor client
 // ---------------------------------------------------------------------------
-static void BenchSpdkTier(const BenchConfig& cfg,
-                          const std::vector<std::string>& keys,
+static void BenchSpdkTier(const BenchConfig& cfg, const std::vector<std::string>& keys,
                           const std::vector<std::vector<char>>& values,
-                          std::vector<BenchResult>& results,
-                          TierBackend& ssd) {
+                          std::vector<BenchResult>& results, TierBackend& ssd) {
   if (!ShouldRun(cfg, "SPDK Tier")) return;
   PrintHeader("SPDK Tier");
 
@@ -421,13 +424,11 @@ static void BenchSpdkTier(const BenchConfig& cfg,
         auto t0 = Clock::now();
         ssd.Write(keys[i], values[i].data(), values[i].size());
         auto t1 = Clock::now();
-        lat.push_back(
-            std::chrono::duration<double, std::micro>(t1 - t0).count());
+        lat.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
       }
     }
     auto wall_end = Clock::now();
-    RecordResult("SPDK Tier Write", "single-key",
-                 keys.size() * cfg.measure_iters,
+    RecordResult("SPDK Tier Write", "single-key", keys.size() * cfg.measure_iters,
                  keys.size() * cfg.measure_iters * cfg.value_size,
                  WallSeconds(wall_start, wall_end), lat, results);
   }
@@ -435,14 +436,12 @@ static void BenchSpdkTier(const BenchConfig& cfg,
   // Read
   {
     ssd.Clear();
-    for (size_t i = 0; i < keys.size(); ++i)
-      ssd.Write(keys[i], values[i].data(), values[i].size());
+    for (size_t i = 0; i < keys.size(); ++i) ssd.Write(keys[i], values[i].data(), values[i].size());
 
     std::vector<char> buf(cfg.value_size);
     for (size_t w = 0; w < cfg.warmup_iters; ++w)
       for (size_t i = 0; i < keys.size(); ++i)
-        ssd.ReadIntoPtr(keys[i], reinterpret_cast<uintptr_t>(buf.data()),
-                        buf.size());
+        ssd.ReadIntoPtr(keys[i], reinterpret_cast<uintptr_t>(buf.data()), buf.size());
 
     std::vector<double> lat;
     lat.reserve(keys.size() * cfg.measure_iters);
@@ -450,16 +449,13 @@ static void BenchSpdkTier(const BenchConfig& cfg,
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
       for (size_t i = 0; i < keys.size(); ++i) {
         auto t0 = Clock::now();
-        ssd.ReadIntoPtr(keys[i], reinterpret_cast<uintptr_t>(buf.data()),
-                        buf.size());
+        ssd.ReadIntoPtr(keys[i], reinterpret_cast<uintptr_t>(buf.data()), buf.size());
         auto t1 = Clock::now();
-        lat.push_back(
-            std::chrono::duration<double, std::micro>(t1 - t0).count());
+        lat.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
       }
     }
     auto wall_end = Clock::now();
-    RecordResult("SPDK Tier Read", "single-key",
-                 keys.size() * cfg.measure_iters,
+    RecordResult("SPDK Tier Read", "single-key", keys.size() * cfg.measure_iters,
                  keys.size() * cfg.measure_iters * cfg.value_size,
                  WallSeconds(wall_start, wall_end), lat, results);
   }
@@ -467,20 +463,16 @@ static void BenchSpdkTier(const BenchConfig& cfg,
   // ReadBatch
   {
     ssd.Clear();
-    for (size_t i = 0; i < keys.size(); ++i)
-      ssd.Write(keys[i], values[i].data(), values[i].size());
+    for (size_t i = 0; i < keys.size(); ++i) ssd.Write(keys[i], values[i].data(), values[i].size());
 
-    std::vector<std::vector<char>> bufs(keys.size(),
-                                        std::vector<char>(cfg.value_size));
+    std::vector<std::vector<char>> bufs(keys.size(), std::vector<char>(cfg.value_size));
     std::vector<uintptr_t> ptrs(keys.size());
     std::vector<size_t> sizes(keys.size(), cfg.value_size);
-    for (size_t i = 0; i < keys.size(); ++i)
-      ptrs[i] = reinterpret_cast<uintptr_t>(bufs[i].data());
+    for (size_t i = 0; i < keys.size(); ++i) ptrs[i] = reinterpret_cast<uintptr_t>(bufs[i].data());
     auto rdescs = BuildReadBatches(keys, ptrs, sizes, cfg.batch_size);
 
     for (size_t w = 0; w < cfg.warmup_iters; ++w)
-      for (const auto& d : rdescs)
-        ssd.ReadBatchIntoPtr(d.keys, d.dst_ptrs, d.sizes);
+      for (const auto& d : rdescs) ssd.ReadBatchIntoPtr(d.keys, d.dst_ptrs, d.sizes);
 
     std::vector<double> lat;
     lat.reserve(rdescs.size() * cfg.measure_iters);
@@ -490,15 +482,12 @@ static void BenchSpdkTier(const BenchConfig& cfg,
         auto t0 = Clock::now();
         ssd.ReadBatchIntoPtr(d.keys, d.dst_ptrs, d.sizes);
         auto t1 = Clock::now();
-        lat.push_back(
-            std::chrono::duration<double, std::micro>(t1 - t0).count());
+        lat.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
       }
     }
     auto wall_end = Clock::now();
-    RecordResult("SPDK Tier ReadBatch",
-                 "bs=" + std::to_string(cfg.batch_size),
-                 keys.size() * cfg.measure_iters,
-                 keys.size() * cfg.measure_iters * cfg.value_size,
+    RecordResult("SPDK Tier ReadBatch", "bs=" + std::to_string(cfg.batch_size),
+                 keys.size() * cfg.measure_iters, keys.size() * cfg.measure_iters * cfg.value_size,
                  WallSeconds(wall_start, wall_end), lat, results);
   }
 }
@@ -506,11 +495,9 @@ static void BenchSpdkTier(const BenchConfig& cfg,
 // ---------------------------------------------------------------------------
 // B. Batch vs Single Write — uses shared SSD tier
 // ---------------------------------------------------------------------------
-static void BenchSpdkBatchWrite(const BenchConfig& cfg,
-                                const std::vector<std::string>& keys,
+static void BenchSpdkBatchWrite(const BenchConfig& cfg, const std::vector<std::string>& keys,
                                 const std::vector<std::vector<char>>& values,
-                                std::vector<BenchResult>& results,
-                                TierBackend& ssd) {
+                                std::vector<BenchResult>& results, TierBackend& ssd) {
   if (!ShouldRun(cfg, "Batch")) return;
   PrintHeader("SPDK Batch vs Single Write");
 
@@ -532,8 +519,7 @@ static void BenchSpdkBatchWrite(const BenchConfig& cfg,
         auto t0 = Clock::now();
         ssd.Write(keys[i], values[i].data(), values[i].size());
         auto t1 = Clock::now();
-        lat.push_back(
-            std::chrono::duration<double, std::micro>(t1 - t0).count());
+        lat.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
       }
     }
     auto wall_end = Clock::now();
@@ -547,8 +533,7 @@ static void BenchSpdkBatchWrite(const BenchConfig& cfg,
     auto wdescs = BuildWriteBatches(keys, values, cfg.batch_size);
     for (size_t w = 0; w < cfg.warmup_iters; ++w) {
       ssd.Clear();
-      for (const auto& d : wdescs)
-        ssd.BatchWrite(d.keys, d.data_ptrs, d.sizes);
+      for (const auto& d : wdescs) ssd.BatchWrite(d.keys, d.data_ptrs, d.sizes);
     }
     ssd.Clear();
 
@@ -561,15 +546,12 @@ static void BenchSpdkBatchWrite(const BenchConfig& cfg,
         auto t0 = Clock::now();
         ssd.BatchWrite(d.keys, d.data_ptrs, d.sizes);
         auto t1 = Clock::now();
-        lat.push_back(
-            std::chrono::duration<double, std::micro>(t1 - t0).count());
+        lat.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
       }
     }
     auto wall_end = Clock::now();
-    RecordResult("SPDK Write",
-                 "BatchWrite(bs=" + std::to_string(cfg.batch_size) + ")",
-                 keys.size() * cfg.measure_iters,
-                 keys.size() * cfg.measure_iters * cfg.value_size,
+    RecordResult("SPDK Write", "BatchWrite(bs=" + std::to_string(cfg.batch_size) + ")",
+                 keys.size() * cfg.measure_iters, keys.size() * cfg.measure_iters * cfg.value_size,
                  WallSeconds(wall_start, wall_end), lat, results);
   }
 }
@@ -577,25 +559,21 @@ static void BenchSpdkBatchWrite(const BenchConfig& cfg,
 // ---------------------------------------------------------------------------
 // C. Batch vs Single Read — uses shared SSD tier
 // ---------------------------------------------------------------------------
-static void BenchSpdkBatchRead(const BenchConfig& cfg,
-                               const std::vector<std::string>& keys,
+static void BenchSpdkBatchRead(const BenchConfig& cfg, const std::vector<std::string>& keys,
                                const std::vector<std::vector<char>>& values,
-                               std::vector<BenchResult>& results,
-                               TierBackend& ssd) {
+                               std::vector<BenchResult>& results, TierBackend& ssd) {
   if (!ShouldRun(cfg, "Batch")) return;
   PrintHeader("SPDK Batch vs Single Read");
 
   ssd.Clear();
-  for (size_t i = 0; i < keys.size(); ++i)
-    ssd.Write(keys[i], values[i].data(), values[i].size());
+  for (size_t i = 0; i < keys.size(); ++i) ssd.Write(keys[i], values[i].data(), values[i].size());
 
   // Sequential
   {
     std::vector<char> buf(cfg.value_size);
     for (size_t w = 0; w < cfg.warmup_iters; ++w)
       for (size_t i = 0; i < keys.size(); ++i)
-        ssd.ReadIntoPtr(keys[i], reinterpret_cast<uintptr_t>(buf.data()),
-                        buf.size());
+        ssd.ReadIntoPtr(keys[i], reinterpret_cast<uintptr_t>(buf.data()), buf.size());
 
     std::vector<double> lat;
     lat.reserve(keys.size() * cfg.measure_iters);
@@ -603,11 +581,9 @@ static void BenchSpdkBatchRead(const BenchConfig& cfg,
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
       for (size_t i = 0; i < keys.size(); ++i) {
         auto t0 = Clock::now();
-        ssd.ReadIntoPtr(keys[i], reinterpret_cast<uintptr_t>(buf.data()),
-                        buf.size());
+        ssd.ReadIntoPtr(keys[i], reinterpret_cast<uintptr_t>(buf.data()), buf.size());
         auto t1 = Clock::now();
-        lat.push_back(
-            std::chrono::duration<double, std::micro>(t1 - t0).count());
+        lat.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
       }
     }
     auto wall_end = Clock::now();
@@ -618,17 +594,14 @@ static void BenchSpdkBatchRead(const BenchConfig& cfg,
 
   // ReadBatch
   {
-    std::vector<std::vector<char>> bufs(keys.size(),
-                                        std::vector<char>(cfg.value_size));
+    std::vector<std::vector<char>> bufs(keys.size(), std::vector<char>(cfg.value_size));
     std::vector<uintptr_t> ptrs(keys.size());
     std::vector<size_t> sizes(keys.size(), cfg.value_size);
-    for (size_t i = 0; i < keys.size(); ++i)
-      ptrs[i] = reinterpret_cast<uintptr_t>(bufs[i].data());
+    for (size_t i = 0; i < keys.size(); ++i) ptrs[i] = reinterpret_cast<uintptr_t>(bufs[i].data());
     auto rdescs = BuildReadBatches(keys, ptrs, sizes, cfg.batch_size);
 
     for (size_t w = 0; w < cfg.warmup_iters; ++w)
-      for (const auto& d : rdescs)
-        ssd.ReadBatchIntoPtr(d.keys, d.dst_ptrs, d.sizes);
+      for (const auto& d : rdescs) ssd.ReadBatchIntoPtr(d.keys, d.dst_ptrs, d.sizes);
 
     std::vector<double> lat;
     lat.reserve(rdescs.size() * cfg.measure_iters);
@@ -638,15 +611,12 @@ static void BenchSpdkBatchRead(const BenchConfig& cfg,
         auto t0 = Clock::now();
         ssd.ReadBatchIntoPtr(d.keys, d.dst_ptrs, d.sizes);
         auto t1 = Clock::now();
-        lat.push_back(
-            std::chrono::duration<double, std::micro>(t1 - t0).count());
+        lat.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
       }
     }
     auto wall_end = Clock::now();
-    RecordResult("SPDK Read",
-                 "ReadBatch(bs=" + std::to_string(cfg.batch_size) + ")",
-                 keys.size() * cfg.measure_iters,
-                 keys.size() * cfg.measure_iters * cfg.value_size,
+    RecordResult("SPDK Read", "ReadBatch(bs=" + std::to_string(cfg.batch_size) + ")",
+                 keys.size() * cfg.measure_iters, keys.size() * cfg.measure_iters * cfg.value_size,
                  WallSeconds(wall_start, wall_end), lat, results);
   }
 }
@@ -654,17 +624,14 @@ static void BenchSpdkBatchRead(const BenchConfig& cfg,
 // ---------------------------------------------------------------------------
 // D. CopyToSSD — uses anchor's storage manager
 // ---------------------------------------------------------------------------
-static void BenchSpdkCopyToSSD(const BenchConfig& cfg,
-                                const std::vector<std::string>& keys,
-                                const std::vector<std::vector<char>>& values,
-                                std::vector<BenchResult>& results,
-                                LocalStorageManager& mgr) {
+static void BenchSpdkCopyToSSD(const BenchConfig& cfg, const std::vector<std::string>& keys,
+                               const std::vector<std::vector<char>>& values,
+                               std::vector<BenchResult>& results, LocalStorageManager& mgr) {
   if (!ShouldRun(cfg, "CopyToSSD")) return;
   PrintHeader("SPDK CopyToSSD vs CopyToSSDBatch");
 
   for (size_t i = 0; i < keys.size(); ++i)
-    mgr.Write(keys[i], values[i].data(), values[i].size(),
-              StorageTier::CPU_DRAM);
+    mgr.Write(keys[i], values[i].data(), values[i].size(), StorageTier::CPU_DRAM);
 
   // Single
   {
@@ -679,13 +646,11 @@ static void BenchSpdkCopyToSSD(const BenchConfig& cfg,
         auto t0 = Clock::now();
         mgr.CopyToSSD(keys[i]);
         auto t1 = Clock::now();
-        lat.push_back(
-            std::chrono::duration<double, std::micro>(t1 - t0).count());
+        lat.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
       }
     }
     auto wall_end = Clock::now();
-    RecordResult("SPDK CopyToSSD", "single-key",
-                 keys.size() * cfg.measure_iters,
+    RecordResult("SPDK CopyToSSD", "single-key", keys.size() * cfg.measure_iters,
                  keys.size() * cfg.measure_iters * cfg.value_size,
                  WallSeconds(wall_start, wall_end), lat, results);
   }
@@ -704,15 +669,12 @@ static void BenchSpdkCopyToSSD(const BenchConfig& cfg,
         auto t0 = Clock::now();
         mgr.CopyToSSDBatch(batch);
         auto t1 = Clock::now();
-        lat.push_back(
-            std::chrono::duration<double, std::micro>(t1 - t0).count());
+        lat.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
       }
     }
     auto wall_end = Clock::now();
-    RecordResult("SPDK CopyToSSD",
-                 "batch(bs=" + std::to_string(cfg.batch_size) + ")",
-                 keys.size() * cfg.measure_iters,
-                 keys.size() * cfg.measure_iters * cfg.value_size,
+    RecordResult("SPDK CopyToSSD", "batch(bs=" + std::to_string(cfg.batch_size) + ")",
+                 keys.size() * cfg.measure_iters, keys.size() * cfg.measure_iters * cfg.value_size,
                  WallSeconds(wall_start, wall_end), lat, results);
   }
 }
@@ -720,11 +682,9 @@ static void BenchSpdkCopyToSSD(const BenchConfig& cfg,
 // ---------------------------------------------------------------------------
 // E. Concurrent Scaling — uses anchor client (single proxy, all thread counts)
 // ---------------------------------------------------------------------------
-static void BenchSpdkConcurrent(const BenchConfig& cfg,
-                                const std::vector<std::string>& keys,
+static void BenchSpdkConcurrent(const BenchConfig& cfg, const std::vector<std::string>& keys,
                                 const std::vector<std::vector<char>>& values,
-                                std::vector<BenchResult>& results,
-                                UMBPClient& client) {
+                                std::vector<BenchResult>& results, UMBPClient& client) {
   if (!ShouldRun(cfg, "Concurrent")) return;
   PrintHeader("SPDK Concurrent Scaling");
 
@@ -743,8 +703,7 @@ static void BenchSpdkConcurrent(const BenchConfig& cfg,
       client.Clear();
 
       std::vector<std::vector<double>> tl(nthreads);
-      for (int t = 0; t < nthreads; ++t)
-        tl[t].reserve(kpt * cfg.measure_iters);
+      for (int t = 0; t < nthreads; ++t) tl[t].reserve(kpt * cfg.measure_iters);
 
       auto wall_start = Clock::now();
       for (size_t m = 0; m < cfg.measure_iters; ++m) {
@@ -757,8 +716,7 @@ static void BenchSpdkConcurrent(const BenchConfig& cfg,
               auto t0 = Clock::now();
               client.Put(keys[i], values[i].data(), values[i].size());
               auto t1 = Clock::now();
-              tl[t].push_back(
-                  std::chrono::duration<double, std::micro>(t1 - t0).count());
+              tl[t].push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
             }
           });
         }
@@ -767,8 +725,7 @@ static void BenchSpdkConcurrent(const BenchConfig& cfg,
       auto wall_end = Clock::now();
       std::vector<double> all;
       for (auto& v : tl) all.insert(all.end(), v.begin(), v.end());
-      RecordResult("SPDK Concurrent Put", variant,
-                   kpt * nthreads * cfg.measure_iters,
+      RecordResult("SPDK Concurrent Put", variant, kpt * nthreads * cfg.measure_iters,
                    kpt * nthreads * cfg.measure_iters * cfg.value_size,
                    WallSeconds(wall_start, wall_end), all, results);
     }
@@ -780,8 +737,7 @@ static void BenchSpdkConcurrent(const BenchConfig& cfg,
         client.Put(keys[i], values[i].data(), values[i].size());
 
       std::vector<std::vector<double>> tl(nthreads);
-      for (int t = 0; t < nthreads; ++t)
-        tl[t].reserve(kpt * cfg.measure_iters);
+      for (int t = 0; t < nthreads; ++t) tl[t].reserve(kpt * cfg.measure_iters);
 
       auto wall_start = Clock::now();
       for (size_t m = 0; m < cfg.measure_iters; ++m) {
@@ -792,12 +748,9 @@ static void BenchSpdkConcurrent(const BenchConfig& cfg,
             size_t s = t * kpt, e = s + kpt;
             for (size_t i = s; i < e; ++i) {
               auto t0 = Clock::now();
-              client.GetIntoPtr(keys[i],
-                                reinterpret_cast<uintptr_t>(buf.data()),
-                                buf.size());
+              client.GetIntoPtr(keys[i], reinterpret_cast<uintptr_t>(buf.data()), buf.size());
               auto t1 = Clock::now();
-              tl[t].push_back(
-                  std::chrono::duration<double, std::micro>(t1 - t0).count());
+              tl[t].push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
             }
           });
         }
@@ -806,8 +759,7 @@ static void BenchSpdkConcurrent(const BenchConfig& cfg,
       auto wall_end = Clock::now();
       std::vector<double> all;
       for (auto& v : tl) all.insert(all.end(), v.begin(), v.end());
-      RecordResult("SPDK Concurrent Get", variant,
-                   kpt * nthreads * cfg.measure_iters,
+      RecordResult("SPDK Concurrent Get", variant, kpt * nthreads * cfg.measure_iters,
                    kpt * nthreads * cfg.measure_iters * cfg.value_size,
                    WallSeconds(wall_start, wall_end), all, results);
     }
@@ -817,8 +769,7 @@ static void BenchSpdkConcurrent(const BenchConfig& cfg,
 // ---------------------------------------------------------------------------
 // F. Leader Mode — one client per mode, Clear() between iterations
 // ---------------------------------------------------------------------------
-static void BenchSpdkLeaderMode(const BenchConfig& cfg,
-                                const std::vector<std::string>& keys,
+static void BenchSpdkLeaderMode(const BenchConfig& cfg, const std::vector<std::string>& keys,
                                 const std::vector<std::vector<char>>& values,
                                 std::vector<BenchResult>& results) {
   if (!ShouldRun(cfg, "Leader")) return;
@@ -844,8 +795,7 @@ static void BenchSpdkLeaderMode(const BenchConfig& cfg,
         auto t0 = Clock::now();
         client.Put(keys[i], values[i].data(), values[i].size());
         auto t1 = Clock::now();
-        lat.push_back(
-            std::chrono::duration<double, std::micro>(t1 - t0).count());
+        lat.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
       }
     }
     auto wall_end = Clock::now();
@@ -861,11 +811,9 @@ static void BenchSpdkLeaderMode(const BenchConfig& cfg,
 // ---------------------------------------------------------------------------
 // G. Capacity Pressure — one client shared across both sub-tests
 // ---------------------------------------------------------------------------
-static void
-BenchSpdkCapacityPressure(const BenchConfig& cfg,
-                          const std::vector<std::string>& keys,
-                          const std::vector<std::vector<char>>& values,
-                          std::vector<BenchResult>& results) {
+static void BenchSpdkCapacityPressure(const BenchConfig& cfg, const std::vector<std::string>& keys,
+                                      const std::vector<std::vector<char>>& values,
+                                      std::vector<BenchResult>& results) {
   if (!ShouldRun(cfg, "Capacity")) return;
   PrintHeader("SPDK Capacity Pressure");
 
@@ -881,8 +829,7 @@ BenchSpdkCapacityPressure(const BenchConfig& cfg,
   {
     for (size_t w = 0; w < cfg.warmup_iters; ++w) {
       client.Clear();
-      for (size_t i = 0; i < half; ++i)
-        client.Put(keys[i], values[i].data(), values[i].size());
+      for (size_t i = 0; i < half; ++i) client.Put(keys[i], values[i].data(), values[i].size());
     }
     client.Clear();
 
@@ -895,15 +842,13 @@ BenchSpdkCapacityPressure(const BenchConfig& cfg,
         auto t0 = Clock::now();
         client.Put(keys[i], values[i].data(), values[i].size());
         auto t1 = Clock::now();
-        lat.push_back(
-            std::chrono::duration<double, std::micro>(t1 - t0).count());
+        lat.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
       }
     }
     auto wall_end = Clock::now();
-    RecordResult("SPDK Capacity Put", "no pressure",
-                 half * cfg.measure_iters,
-                 half * cfg.measure_iters * cfg.value_size,
-                 WallSeconds(wall_start, wall_end), lat, results);
+    RecordResult("SPDK Capacity Put", "no pressure", half * cfg.measure_iters,
+                 half * cfg.measure_iters * cfg.value_size, WallSeconds(wall_start, wall_end), lat,
+                 results);
   }
 
   // Under pressure
@@ -920,19 +865,16 @@ BenchSpdkCapacityPressure(const BenchConfig& cfg,
     auto wall_start = Clock::now();
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
       client.Clear();
-      for (size_t i = 0; i < half; ++i)
-        client.Put(keys[i], values[i].data(), values[i].size());
+      for (size_t i = 0; i < half; ++i) client.Put(keys[i], values[i].data(), values[i].size());
       for (size_t i = half; i < keys.size(); ++i) {
         auto t0 = Clock::now();
         client.Put(keys[i], values[i].data(), values[i].size());
         auto t1 = Clock::now();
-        lat.push_back(
-            std::chrono::duration<double, std::micro>(t1 - t0).count());
+        lat.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
       }
     }
     auto wall_end = Clock::now();
-    RecordResult("SPDK Capacity Put", "under pressure",
-                 (keys.size() - half) * cfg.measure_iters,
+    RecordResult("SPDK Capacity Put", "under pressure", (keys.size() - half) * cfg.measure_iters,
                  (keys.size() - half) * cfg.measure_iters * cfg.value_size,
                  WallSeconds(wall_start, wall_end), lat, results);
   }
@@ -948,26 +890,25 @@ static void BenchSpdkE2E(const BenchConfig& cfg, const E2EConfig& e2e,
   size_t value_size = e2e.ValueSizePerKey();
   size_t keys_per_page = e2e.KeysPerPage();
   std::string mode_str = (e2e.mode == E2EModelMode::MLA) ? "MLA" : "MHA";
-  std::string vlabel = mode_str + "/" + std::to_string(e2e.batch_pages) +
-                        "pg/" + std::to_string(value_size / 1024) + "KB";
+  std::string vlabel = mode_str + "/" + std::to_string(e2e.batch_pages) + "pg/" +
+                       std::to_string(value_size / 1024) + "KB";
 
   PrintHeader("SPDK E2E UMBPClient (" + vlabel + ")");
-  std::printf("  mode=%s  layers=%zu  value_size=%zuB  pages=%zu  "
-              "batch=%zu  dedup=%.0f%%\n",
-              mode_str.c_str(), e2e.num_layers, value_size, e2e.num_pages,
-              e2e.batch_pages, e2e.dedup_ratio * 100);
+  std::printf(
+      "  mode=%s  layers=%zu  value_size=%zuB  pages=%zu  "
+      "batch=%zu  dedup=%.0f%%\n",
+      mode_str.c_str(), e2e.num_layers, value_size, e2e.num_pages, e2e.batch_pages,
+      e2e.dedup_ratio * 100);
 
   E2EKeyGenerator keygen{e2e.mode, 0, 0};
   E2EHostBuffer host_buf(e2e.num_pages, value_size, keys_per_page);
   size_t total_data = e2e.num_pages * keys_per_page * value_size;
 
-  size_t batches_per_iter =
-      (e2e.num_pages + e2e.batch_pages - 1) / e2e.batch_pages;
+  size_t batches_per_iter = (e2e.num_pages + e2e.batch_pages - 1) / e2e.batch_pages;
   size_t e2e_iters = cfg.measure_iters;
   if (batches_per_iter > 0 && batches_per_iter * e2e_iters < 100)
     e2e_iters = (100 + batches_per_iter - 1) / batches_per_iter;
-  std::printf("  e2e_iters=%zu (%zu batches/iter)\n", e2e_iters,
-              batches_per_iter);
+  std::printf("  e2e_iters=%zu (%zu batches/iter)\n", e2e_iters, batches_per_iter);
 
   auto FillAll = [&](UMBPClient& c) {
     for (size_t b = 0; b < e2e.num_pages; b += e2e.batch_pages) {
@@ -981,8 +922,7 @@ static void BenchSpdkE2E(const BenchConfig& cfg, const E2EConfig& e2e,
     }
   };
 
-  auto FillAllTimed = [&](UMBPClient& c, size_t np,
-                          std::vector<double>& lat) {
+  auto FillAllTimed = [&](UMBPClient& c, size_t np, std::vector<double>& lat) {
     for (size_t b = 0; b < np; b += e2e.batch_pages) {
       size_t cnt = std::min(e2e.batch_pages, np - b);
       auto keys = keygen.KeysForPages(b, cnt);
@@ -993,8 +933,7 @@ static void BenchSpdkE2E(const BenchConfig& cfg, const E2EConfig& e2e,
       auto t0 = Clock::now();
       c.BatchPutFromPtrWithDepth(keys, ptrs, sizes, depths);
       auto t1 = Clock::now();
-      lat.push_back(
-          std::chrono::duration<double, std::micro>(t1 - t0).count());
+      lat.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
     }
   };
 
@@ -1002,18 +941,15 @@ static void BenchSpdkE2E(const BenchConfig& cfg, const E2EConfig& e2e,
   std::vector<uintptr_t> read_ptrs;
   std::vector<size_t> read_sizes;
 
-  auto ReadAllTimed = [&](UMBPClient& c, size_t np,
-                          std::vector<double>& lat) {
+  auto ReadAllTimed = [&](UMBPClient& c, size_t np, std::vector<double>& lat) {
     for (size_t b = 0; b < np; b += e2e.batch_pages) {
       size_t cnt = std::min(e2e.batch_pages, np - b);
       auto keys = keygen.KeysForPages(b, cnt);
-      E2EHostBuffer::MakeReadMeta(cnt, keys_per_page, value_size, read_buf,
-                                  read_ptrs, read_sizes);
+      E2EHostBuffer::MakeReadMeta(cnt, keys_per_page, value_size, read_buf, read_ptrs, read_sizes);
       auto t0 = Clock::now();
       c.BatchGetIntoPtr(keys, read_ptrs, read_sizes);
       auto t1 = Clock::now();
-      lat.push_back(
-          std::chrono::duration<double, std::micro>(t1 - t0).count());
+      lat.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
     }
   };
 
@@ -1052,8 +988,7 @@ static void BenchSpdkE2E(const BenchConfig& cfg, const E2EConfig& e2e,
     std::vector<double> lat;
     lat.reserve(batches_per_iter * e2e_iters);
     auto wall_start = Clock::now();
-    for (size_t m = 0; m < e2e_iters; ++m)
-      ReadAllTimed(client, e2e.num_pages, lat);
+    for (size_t m = 0; m < e2e_iters; ++m) ReadAllTimed(client, e2e.num_pages, lat);
     auto wall_end = Clock::now();
     RecordResult("E2E BatchGet", vlabel, e2e.num_pages * e2e_iters,
                  e2e.num_pages * e2e_iters * keys_per_page * value_size,
@@ -1081,8 +1016,7 @@ static void BenchSpdkE2E(const BenchConfig& cfg, const E2EConfig& e2e,
         FillAllTimed(client, e2e.num_pages, lat);
       }
       auto wall_end = Clock::now();
-      RecordResult("E2E SPDK Capacity Set", "DRAM 50%",
-                   e2e.num_pages * e2e_iters,
+      RecordResult("E2E SPDK Capacity Set", "DRAM 50%", e2e.num_pages * e2e_iters,
                    e2e.num_pages * e2e_iters * keys_per_page * value_size,
                    WallSeconds(wall_start, wall_end), lat, results);
     }
@@ -1094,11 +1028,9 @@ static void BenchSpdkE2E(const BenchConfig& cfg, const E2EConfig& e2e,
       std::vector<double> lat;
       lat.reserve(batches_per_iter * e2e_iters);
       auto wall_start = Clock::now();
-      for (size_t m = 0; m < e2e_iters; ++m)
-        ReadAllTimed(client, e2e.num_pages, lat);
+      for (size_t m = 0; m < e2e_iters; ++m) ReadAllTimed(client, e2e.num_pages, lat);
       auto wall_end = Clock::now();
-      RecordResult("E2E SPDK Capacity Get", "DRAM+NVMe mixed",
-                   e2e.num_pages * e2e_iters,
+      RecordResult("E2E SPDK Capacity Get", "DRAM+NVMe mixed", e2e.num_pages * e2e_iters,
                    e2e.num_pages * e2e_iters * keys_per_page * value_size,
                    WallSeconds(wall_start, wall_end), lat, results);
     }
@@ -1146,11 +1078,9 @@ static void BenchSpdkE2E(const BenchConfig& cfg, const E2EConfig& e2e,
     std::vector<double> lat;
     lat.reserve(batches_per_iter * e2e_iters);
     auto wall_start = Clock::now();
-    for (size_t m = 0; m < e2e_iters; ++m)
-      ReadAllTimed(follower, e2e.num_pages, lat);
+    for (size_t m = 0; m < e2e_iters; ++m) ReadAllTimed(follower, e2e.num_pages, lat);
     auto wall_end = Clock::now();
-    RecordResult("E2E SPDK Follower Get", "NVMe read",
-                 e2e.num_pages * e2e_iters,
+    RecordResult("E2E SPDK Follower Get", "NVMe read", e2e.num_pages * e2e_iters,
                  e2e.num_pages * e2e_iters * keys_per_page * value_size,
                  WallSeconds(wall_start, wall_end), lat, results);
   }
@@ -1159,8 +1089,7 @@ static void BenchSpdkE2E(const BenchConfig& cfg, const E2EConfig& e2e,
 // ---------------------------------------------------------------------------
 // CLI / profiles
 // ---------------------------------------------------------------------------
-static void ApplyProfile(BenchConfig& cfg, E2EConfig& e2e,
-                         const std::string& profile) {
+static void ApplyProfile(BenchConfig& cfg, E2EConfig& e2e, const std::string& profile) {
   if (profile == "small") {
     cfg.num_keys = 200;
     cfg.value_size = 1024;
@@ -1270,8 +1199,7 @@ int main(int argc, char* argv[]) {
   ApplyProfile(cfg, e2e, profile);
 
   std::printf("UMBP SPDK Benchmark\n");
-  std::printf("  backend      = SPDK (NVMe: %s)\n",
-              std::getenv("UMBP_SPDK_NVME_PCI"));
+  std::printf("  backend      = SPDK (NVMe: %s)\n", std::getenv("UMBP_SPDK_NVME_PCI"));
   std::printf("  num_keys     = %zu\n", cfg.num_keys);
   std::printf("  value_size   = %zu bytes\n", cfg.value_size);
   std::printf("  batch_size   = %zu\n", cfg.batch_size);
@@ -1287,8 +1215,7 @@ int main(int argc, char* argv[]) {
   std::printf("[SKIP] Durability      — Strict/Relaxed is POSIX fsync semantics\n");
   std::printf("[SKIP] StorageIoDriver — raw POSIX file I/O, not used by SPDK\n");
 
-  std::printf("\nGenerating %zu keys x %zu bytes...\n", cfg.num_keys,
-              cfg.value_size);
+  std::printf("\nGenerating %zu keys x %zu bytes...\n", cfg.num_keys, cfg.value_size);
   auto keys = GenerateKeys(cfg.num_keys);
   auto values = GenerateValues(cfg.num_keys, cfg.value_size);
   std::printf("Data generation complete.\n");
@@ -1319,13 +1246,11 @@ int main(int argc, char* argv[]) {
   BenchSpdkE2E(cfg, e2e, results);
 
   std::printf("\n=== Summary ===\n");
-  std::printf("%-36s %-20s %12s %10s\n", "Benchmark", "Variant", "ops/s",
-              "MB/s");
+  std::printf("%-36s %-20s %12s %10s\n", "Benchmark", "Variant", "ops/s", "MB/s");
   std::printf("%s\n", std::string(80, '-').c_str());
   for (const auto& r : results)
-    std::printf("%-36s %-20s %12.0f %10.1f\n", r.name.c_str(),
-                r.variant.c_str(), r.throughput_ops_sec(),
-                r.throughput_mb_sec());
+    std::printf("%-36s %-20s %12.0f %10.1f\n", r.name.c_str(), r.variant.c_str(),
+                r.throughput_ops_sec(), r.throughput_mb_sec());
 
   std::printf("\nDone. %zu benchmarks completed.\n", results.size());
   return 0;

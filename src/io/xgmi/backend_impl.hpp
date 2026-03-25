@@ -43,8 +43,8 @@ class XgmiBackendSession : public BackendSession {
  public:
   XgmiBackendSession() = default;
   XgmiBackendSession(const XgmiBackendConfig& config, void* localAddr, void* remoteAddr,
-                     int localDevice, int remoteDevice, bool isIpcSession,
-                     StreamPool* streamPool, EventPool* eventPool);
+                     int localDevice, int remoteDevice, bool isIpcSession, StreamPool* streamPool,
+                     EventPool* eventPool);
   ~XgmiBackendSession() = default;
 
   void ReadWrite(size_t localOffset, size_t remoteOffset, size_t size, TransferStatus* status,

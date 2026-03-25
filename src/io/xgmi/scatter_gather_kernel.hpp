@@ -36,8 +36,7 @@ __global__ void scatterGatherCopyKernel(const char* __restrict__ srcBase,
                                         char* __restrict__ dstBase,
                                         const size_t* __restrict__ srcOffsets,
                                         const size_t* __restrict__ dstOffsets,
-                                        const size_t* __restrict__ entrySizes,
-                                        int numEntries) {
+                                        const size_t* __restrict__ entrySizes, int numEntries) {
   for (int e = blockIdx.x; e < numEntries; e += gridDim.x) {
     const char* src = srcBase + srcOffsets[e];
     char* dst = dstBase + dstOffsets[e];

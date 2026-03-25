@@ -2,10 +2,10 @@
  * @acknowledgements:
  * - Original implementation by: Sidler, David
  * - Source: https://github.com/AARInternal/shader_sdma
- * 
+ *
  * @note: This code is adapted/modified from the implementation by Sidler, David
  */
- 
+
 #!/bin/bash
 
 # Ranging copy size from 1KB (2^10) to 1GB (2^30)
@@ -23,13 +23,13 @@ echo "==== Running shader_latency from $MIN_COPY_SIZE to $MAX_COPY_SIZE ===="
 rm -rf log.txt
 for (( NUM_COPY_CMDS=0; NUM_COPY_CMDS<=1; NUM_COPY_CMDS++ ))
 do
-    echo "==== num copy cmds:$NUM_COPY_CMDS ===="	
+    echo "==== num copy cmds:$NUM_COPY_CMDS ===="
     RESULT_CSV="p2p_xgmi_latency_${NUM_COPY_CMDS}copies.csv"
     #./build/bench/sdma_latency --minCopySize $MIN_COPY_SIZE --maxCopySize $MAX_COPY_SIZE --numCopyCommands $NUM_COPY_CMDS --fineGrainedLatency -o $OUTPUT_DIR/$RESULT_CSV  >> log.txt
     ./build/examples/sdma_latency --minCopySize $MIN_COPY_SIZE --maxCopySize $MAX_COPY_SIZE --numCopyCommands $NUM_COPY_CMDS --fineGrainedLatency
     #if [ $NUM_COPY_CMDS -eq 0 ]; then
-    #    cat $OUTPUT_DIR/$RESULT_CSV >> $SUMMARY_FILE 
+    #    cat $OUTPUT_DIR/$RESULT_CSV >> $SUMMARY_FILE
     #else
-    #    tail -n +2 $OUTPUT_DIR/$RESULT_CSV >> $SUMMARY_FILE 
+    #    tail -n +2 $OUTPUT_DIR/$RESULT_CSV >> $SUMMARY_FILE
     #fi
 done

@@ -1,3 +1,24 @@
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 // SDMA PUT test suite for sdma-batch branch.
 // Tests peerSignalPtrs (remote signal) and zero-size PUT guard.
 //
@@ -9,6 +30,7 @@
 //   5. Multiple sizes (4KB, 1MB, 32MB)
 
 #include <mpi.h>
+
 #include <cassert>
 #include <cstdio>
 #include <cstring>
@@ -21,23 +43,20 @@ using namespace mori::core;
 using namespace mori::application;
 using namespace mori::shmem;
 
-#define CHECK_HIP(call) \
-    do { \
-        hipError_t err = (call); \
-        if (err != hipSuccess) { \
-            fprintf(stderr, "HIP Error at %s:%d: %s\n", __FILE__, __LINE__, hipGetErrorString(err)); \
-            throw std::runtime_error("HIP call failed"); \
-        } \
-    } while(0)
+#define CHECK_HIP(call)                                                                        \
+  do {                                                                                         \
+    hipError_t err = (call);                                                                   \
+    if (err != hipSuccess) {                                                                   \
+      fprintf(stderr, "HIP Error at %s:%d: %s\n", __FILE__, __LINE__, hipGetErrorString(err)); \
+      throw std::runtime_error("HIP call failed");                                             \
+    }                                                                                          \
+  } while (0)
 
 // Test 1 & 2 & 5: SDMA PUT + Quiet (local signal), supports zero-size
 // Uses separate src (source data) and dst (destination on remote PE) buffers
 // to avoid L2 cache pollution on the receive side.
-__global__ void ShmemPutQuietKernel(
-    const SymmMemObjPtr srcObj,
-    const SymmMemObjPtr dstObj,
-    int myPe, int destPe,
-    size_t bytes) {
+__global__ void ShmemPutQuietKernel(const SymmMemObjPtr srcObj, const SymmMemObjPtr dstObj,
+                                    int myPe, int destPe, size_t bytes) {
   if (threadIdx.x != 0 || blockIdx.x != 0) return;
 
   // PUT: read from srcObj (local), write to dstObj (remote via peerPtrs)
@@ -46,11 +65,8 @@ __global__ void ShmemPutQuietKernel(
 }
 
 // Test 3: Remote signal PUT (bypass ShmemQuiet, write directly to remote signal)
-__global__ void RemoteSignalPutKernel(
-    const SymmMemObjPtr srcObj,
-    const SymmMemObjPtr dstObj,
-    int myPe, int destPe,
-    size_t bytes) {
+__global__ void RemoteSignalPutKernel(const SymmMemObjPtr srcObj, const SymmMemObjPtr dstObj,
+                                      int myPe, int destPe, size_t bytes) {
   if (threadIdx.x != 0 || blockIdx.x != 0) return;
 
   uint8_t* srcPtr = reinterpret_cast<uint8_t*>(srcObj->localPtr);
@@ -58,8 +74,8 @@ __global__ void RemoteSignalPutKernel(
 
   anvil::SdmaQueueDeviceHandle** dh = dstObj->deviceHandles_d + destPe * dstObj->sdmaNumQueue;
 
-  HSAuint64* remoteSignal = dstObj->peerSignalPtrs[destPe]
-                            + static_cast<size_t>(myPe) * dstObj->sdmaNumQueue;
+  HSAuint64* remoteSignal =
+      dstObj->peerSignalPtrs[destPe] + static_cast<size_t>(myPe) * dstObj->sdmaNumQueue;
 
   // Manual SDMA PUT with remote signal
   if (bytes > 0) {
@@ -85,18 +101,16 @@ __global__ void RemoteSignalPutKernel(
 }
 
 // Wait on local signal for remote signal test
-__global__ void WaitRemoteSignalKernel(
-    const SymmMemObjPtr memObj,
-    int senderPe,
-    HSAuint64 expectedVal) {
+__global__ void WaitRemoteSignalKernel(const SymmMemObjPtr memObj, int senderPe,
+                                       HSAuint64 expectedVal) {
   if (threadIdx.x != 0 || blockIdx.x != 0) return;
 
-  HSAuint64* mySignal = memObj->signalPtrs
-                        + static_cast<size_t>(senderPe) * memObj->sdmaNumQueue;
+  HSAuint64* mySignal = memObj->signalPtrs + static_cast<size_t>(senderPe) * memObj->sdmaNumQueue;
   int spin = 0;
   while (__hip_atomic_load(mySignal, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) < expectedVal) {
     if (++spin > 100000000) {
-      printf("Timeout waiting for remote signal from PE %d (expected %lu)\n", senderPe, expectedVal);
+      printf("Timeout waiting for remote signal from PE %d (expected %lu)\n", senderPe,
+             expectedVal);
       return;
     }
   }
@@ -146,8 +160,7 @@ void runTests() {
   if (myPe == 0) {
     printf("\n=== SDMA PUT Test Suite (sdma-batch) ===\n");
     printf("  PEs: %d, Testing PE %d -> PE %d\n", npes, myPe, remotePe);
-    printf("  peerSignalPtrs: %s\n\n",
-           dstMemObj->peerSignalPtrs ? "allocated" : "NULL");
+    printf("  peerSignalPtrs: %s\n\n", dstMemObj->peerSignalPtrs ? "allocated" : "NULL");
   }
   MPI_Barrier(MPI_COMM_WORLD);
 
@@ -214,7 +227,10 @@ void runTests() {
     CHECK_HIP(hipMemcpy(hostBuf.data(), dstBuf, 4096, hipMemcpyDeviceToHost));
     uint8_t expected = static_cast<uint8_t>(senderPe + 1);
     for (size_t i = 0; i < 4096; i++) {
-      if (hostBuf[i] != expected) { ok = false; break; }
+      if (hostBuf[i] != expected) {
+        ok = false;
+        break;
+      }
     }
 
     int lok = ok ? 1 : 0, gok = 0;
@@ -245,7 +261,10 @@ void runTests() {
     CHECK_HIP(hipMemcpy(hostBuf.data(), dstBuf, 4096, hipMemcpyDeviceToHost));
     uint8_t expected = static_cast<uint8_t>(senderPe + 1);
     for (size_t i = 0; i < 4096; i++) {
-      if (hostBuf[i] != expected) { ok = false; break; }
+      if (hostBuf[i] != expected) {
+        ok = false;
+        break;
+      }
     }
 
     int lok = ok ? 1 : 0, gok = 0;
@@ -275,7 +294,8 @@ void runTests() {
   // --- Summary ---
   if (myPe == 0) {
     int passed = 0;
-    for (auto& r : results) if (r.passed) passed++;
+    for (auto& r : results)
+      if (r.passed) passed++;
     printf("\n=== Summary: %d/%zu tests passed ===\n\n", passed, results.size());
   }
 

@@ -68,8 +68,10 @@ __device__ __attribute__((visibility("default"))) int mori_shmem_put_double_nbi_
 // ============================================================================
 // PutNbi APIs - Warp Scope (Address-based only)
 // ============================================================================
-__device__ __attribute__((visibility("default"))) int mori_shmem_putmem_nbi_warp(
-    void* dest, const void* source, size_t bytes, int pe, int qpId);
+__device__ __attribute__((visibility("default"))) int mori_shmem_putmem_nbi_warp(void* dest,
+                                                                                 const void* source,
+                                                                                 size_t bytes,
+                                                                                 int pe, int qpId);
 
 __device__ __attribute__((visibility("default"))) int mori_shmem_put_uint32_nbi_warp(
     uint32_t* dest, const uint32_t* source, size_t nelems, int pe, int qpId);
@@ -101,7 +103,6 @@ __device__ __attribute__((visibility("default"))) int mori_shmem_put_float_nbi_b
 __device__ __attribute__((visibility("default"))) int mori_shmem_put_double_nbi_block(
     double* dest, const double* source, size_t nelems, int pe, int qpId);
 
-
 // ============================================================================
 // GetNbi APIs - Thread Scope (Address-based only)
 // ============================================================================
@@ -123,8 +124,10 @@ __device__ __attribute__((visibility("default"))) int mori_shmem_get_double_nbi_
 // ============================================================================
 // GetNbi APIs - Warp Scope (Address-based only)
 // ============================================================================
-__device__ __attribute__((visibility("default"))) int mori_shmem_getmem_nbi_warp(
-    void* dest, const void* source, size_t bytes, int pe, int qpId);
+__device__ __attribute__((visibility("default"))) int mori_shmem_getmem_nbi_warp(void* dest,
+                                                                                 const void* source,
+                                                                                 size_t bytes,
+                                                                                 int pe, int qpId);
 
 __device__ __attribute__((visibility("default"))) int mori_shmem_get_uint32_nbi_warp(
     uint32_t* dest, const uint32_t* source, size_t nelems, int pe, int qpId);
@@ -159,8 +162,10 @@ __device__ __attribute__((visibility("default"))) int mori_shmem_get_double_nbi_
 // ============================================================================
 // Blocking GET APIs - Thread Scope (Address-based only)
 // ============================================================================
-__device__ __attribute__((visibility("default"))) int mori_shmem_getmem_thread(
-    void* dest, const void* source, size_t bytes, int pe, int qpId);
+__device__ __attribute__((visibility("default"))) int mori_shmem_getmem_thread(void* dest,
+                                                                               const void* source,
+                                                                               size_t bytes, int pe,
+                                                                               int qpId);
 
 __device__ __attribute__((visibility("default"))) int mori_shmem_get_uint32_thread(
     uint32_t* dest, const uint32_t* source, size_t nelems, int pe, int qpId);
@@ -177,8 +182,10 @@ __device__ __attribute__((visibility("default"))) int mori_shmem_get_double_thre
 // ============================================================================
 // Blocking GET APIs - Warp Scope (Address-based only)
 // ============================================================================
-__device__ __attribute__((visibility("default"))) int mori_shmem_getmem_warp(
-    void* dest, const void* source, size_t bytes, int pe, int qpId);
+__device__ __attribute__((visibility("default"))) int mori_shmem_getmem_warp(void* dest,
+                                                                             const void* source,
+                                                                             size_t bytes, int pe,
+                                                                             int qpId);
 
 __device__ __attribute__((visibility("default"))) int mori_shmem_get_uint32_warp(
     uint32_t* dest, const uint32_t* source, size_t nelems, int pe, int qpId);
@@ -186,8 +193,10 @@ __device__ __attribute__((visibility("default"))) int mori_shmem_get_uint32_warp
 __device__ __attribute__((visibility("default"))) int mori_shmem_get_uint64_warp(
     uint64_t* dest, const uint64_t* source, size_t nelems, int pe, int qpId);
 
-__device__ __attribute__((visibility("default"))) int mori_shmem_get_float_warp(
-    float* dest, const float* source, size_t nelems, int pe, int qpId);
+__device__ __attribute__((visibility("default"))) int mori_shmem_get_float_warp(float* dest,
+                                                                                const float* source,
+                                                                                size_t nelems,
+                                                                                int pe, int qpId);
 
 __device__ __attribute__((visibility("default"))) int mori_shmem_get_double_warp(
     double* dest, const double* source, size_t nelems, int pe, int qpId);
@@ -195,8 +204,10 @@ __device__ __attribute__((visibility("default"))) int mori_shmem_get_double_warp
 // ============================================================================
 // Blocking GET APIs - Block Scope (Address-based only)
 // ============================================================================
-__device__ __attribute__((visibility("default"))) int mori_shmem_getmem_block(
-    void* dest, const void* source, size_t bytes, int pe, int qpId);
+__device__ __attribute__((visibility("default"))) int mori_shmem_getmem_block(void* dest,
+                                                                              const void* source,
+                                                                              size_t bytes, int pe,
+                                                                              int qpId);
 
 __device__ __attribute__((visibility("default"))) int mori_shmem_get_uint32_block(
     uint32_t* dest, const uint32_t* source, size_t nelems, int pe, int qpId);
@@ -224,7 +235,6 @@ __device__ __attribute__((visibility("default"))) int mori_shmem_putmem_nbi_sign
 __device__ __attribute__((visibility("default"))) int mori_shmem_putmem_nbi_signal_block(
     void* dest, const void* source, size_t bytes, void* signalDest, uint64_t signalValue,
     atomicType signalOp, int pe, int qpId);
-
 
 // ============================================================================
 // PutNbi Immediate APIs - Thread Scope
@@ -263,12 +273,10 @@ __device__ __attribute__((visibility("default"))) int mori_shmem_ushort_p(unsign
                                                                           unsigned short val,
                                                                           int pe, int qpId);
 
-__device__ __attribute__((visibility("default"))) int mori_shmem_int32_p(int32_t* dest,
-                                                                         int32_t val, int pe,
-                                                                         int qpId);
-__device__ __attribute__((visibility("default"))) int mori_shmem_int64_p(int64_t* dest,
-                                                                         int64_t val, int pe,
-                                                                         int qpId);
+__device__ __attribute__((visibility("default"))) int mori_shmem_int32_p(int32_t* dest, int32_t val,
+                                                                         int pe, int qpId);
+__device__ __attribute__((visibility("default"))) int mori_shmem_int64_p(int64_t* dest, int64_t val,
+                                                                         int pe, int qpId);
 __device__ __attribute__((visibility("default"))) int mori_shmem_uint32_p(uint32_t* dest,
                                                                           uint32_t val, int pe,
                                                                           int qpId);
@@ -359,7 +367,7 @@ __device__ __attribute__((visibility("default"))) int mori_shmem_n_pes();
 __device__ __attribute__((visibility("default"))) uint64_t
 mori_shmem_ptr_p2p(const uint64_t destPtr, const int myPe, int destPe);
 
-__device__ __attribute__((visibility("default"))) uint64_t
-mori_shmem_ptr(uint64_t dest, int destPe);
+__device__ __attribute__((visibility("default"))) uint64_t mori_shmem_ptr(uint64_t dest,
+                                                                          int destPe);
 
 }  // extern "C"

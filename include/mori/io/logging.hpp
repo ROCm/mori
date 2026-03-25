@@ -35,9 +35,9 @@ inline void SetLogLevel(const std::string& strLevel) {
     InitializeLoggingFromEnv();
   } catch (...) {
   }
-  
+
   ForceSetModuleLogLevel(modules::IO, strLevel);
-  
+
   auto logger = mori::ModuleLogger::GetInstance().GetLogger(modules::IO);
   if (logger) {
     logger->info("Set MORI-IO log level to {}", strLevel);

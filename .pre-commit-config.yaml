@@ -46,11 +46,6 @@ repos:
           - "//"
           - --use-current-year
           - --no-extra-eol
-  - repo: https://github.com/PFCCLab/typos-pre-commit-mirror.git
-    rev: v1.35.1
-    hooks:
-      - id: typos
-        args: [--force-exclude]
   # For Python files
   - repo: https://github.com/psf/black-pre-commit-mirror
     rev: 25.1.0

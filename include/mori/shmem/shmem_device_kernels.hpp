@@ -174,7 +174,7 @@ inline __device__ T ShmemAtomicTypeFetchWarpKernel(const application::SymmMemObj
                                                    int qpId = 0);
 
 /* ---------------------------------------------------------------------------------------------- */
-/*                         Pure Address-Based GetNbi (New API)                                     */
+/*                         Pure Address-Based GetNbi (New API) */
 /* ---------------------------------------------------------------------------------------------- */
 
 template <application::TransportType TsptType>
@@ -190,7 +190,7 @@ inline __device__ void ShmemGetMemNbiBlockKernel(void* dest, const void* source,
                                                  int pe, int qpId = 0);
 
 /* ---------------------------------------------------------------------------------------------- */
-/*                         SymmMemObjPtr-Based GetNbi                                              */
+/*                         SymmMemObjPtr-Based GetNbi */
 /* ---------------------------------------------------------------------------------------------- */
 
 template <application::TransportType TsptType>

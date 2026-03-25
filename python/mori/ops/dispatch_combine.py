@@ -519,9 +519,7 @@ class EpDispatchCombineOp:
         hidden_dim = input.size(1)
         # Legacy pybind LaunchCombine: weights ptr iff optional && size(0) != 0
         weight_ptr = (
-            weights.data_ptr()
-            if weights is not None and weights.size(0) != 0
-            else 0
+            weights.data_ptr() if weights is not None and weights.size(0) != 0 else 0
         )
         actual_bn, actual_rbn, actual_wpb = self._resolve_launch_params(
             block_num, rdma_block_num, warp_per_block

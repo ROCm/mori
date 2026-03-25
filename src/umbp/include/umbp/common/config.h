@@ -96,21 +96,21 @@ struct UMBPConfig {
   UMBPCopyPipelineConfig copy_pipeline;
 
   // SPDK SSD tier configuration (only used when ssd_backend == "spdk")
-  std::string ssd_backend = "posix";       // "posix" or "spdk"
-  std::string spdk_bdev_name;              // e.g. "Malloc0" or "NVMe0n1"
-  std::string spdk_reactor_mask = "0x1";   // CPU core mask for SPDK reactors
-  int spdk_mem_size_mb = 256;              // DPDK hugepage limit (MB)
-  std::string spdk_nvme_pci_addr;          // PCI BDF, e.g. "0000:47:00.0"
+  std::string ssd_backend = "posix";      // "posix" or "spdk"
+  std::string spdk_bdev_name;             // e.g. "Malloc0" or "NVMe0n1"
+  std::string spdk_reactor_mask = "0x1";  // CPU core mask for SPDK reactors
+  int spdk_mem_size_mb = 256;             // DPDK hugepage limit (MB)
+  std::string spdk_nvme_pci_addr;         // PCI BDF, e.g. "0000:47:00.0"
   std::string spdk_nvme_ctrl_name = "NVMe0";
-  int spdk_io_workers = 4;                     // Internal I/O worker threads for SpdkSsdTier batch ops
+  int spdk_io_workers = 4;  // Internal I/O worker threads for SpdkSsdTier batch ops
 
   // SPDK Proxy configuration
   std::string spdk_proxy_shm_name = "/umbp_spdk_proxy";
-  uint32_t spdk_proxy_rank_id = kAutoRankId;   // kAutoRankId = CAS auto-allocate (default)
+  uint32_t spdk_proxy_rank_id = kAutoRankId;  // kAutoRankId = CAS auto-allocate (default)
   uint32_t spdk_proxy_max_ranks = 8;
-  size_t spdk_proxy_data_per_rank_mb = 512;    // MB of SHM data region per rank
-  std::string spdk_proxy_bin;                  // Path to spdk_proxy binary (empty = search PATH)
-  int spdk_proxy_startup_timeout_ms = 30000;   // Max ms to wait for proxy READY
+  size_t spdk_proxy_data_per_rank_mb = 512;   // MB of SHM data region per rank
+  std::string spdk_proxy_bin;                 // Path to spdk_proxy binary (empty = search PATH)
+  int spdk_proxy_startup_timeout_ms = 30000;  // Max ms to wait for proxy READY
 
   // Role is the source of truth for runtime behavior.
   UMBPRole role = UMBPRole::Standalone;
@@ -207,24 +207,29 @@ struct UMBPConfig {
     cfg.spdk_proxy_rank_id = rank_env ? static_cast<uint32_t>(std::atoi(rank_env)) : kAutoRankId;
     cfg.spdk_proxy_max_ranks = static_cast<uint32_t>(
         getenv_int("UMBP_SPDK_PROXY_MAX_RANKS", static_cast<int>(cfg.spdk_proxy_max_ranks)));
-    cfg.spdk_proxy_data_per_rank_mb = getenv_size("UMBP_SPDK_PROXY_DATA_MB", cfg.spdk_proxy_data_per_rank_mb);
+    cfg.spdk_proxy_data_per_rank_mb =
+        getenv_size("UMBP_SPDK_PROXY_DATA_MB", cfg.spdk_proxy_data_per_rank_mb);
     cfg.spdk_proxy_bin = getenv_str("UMBP_SPDK_PROXY_BIN", cfg.spdk_proxy_bin);
-    cfg.spdk_proxy_startup_timeout_ms = getenv_int("UMBP_SPDK_PROXY_TIMEOUT_MS", cfg.spdk_proxy_startup_timeout_ms);
+    cfg.spdk_proxy_startup_timeout_ms =
+        getenv_int("UMBP_SPDK_PROXY_TIMEOUT_MS", cfg.spdk_proxy_startup_timeout_ms);
 
     std::string role_str = getenv_str("UMBP_ROLE", "");
-    if (role_str == "leader") cfg.role = UMBPRole::SharedSSDLeader;
-    else if (role_str == "follower") cfg.role = UMBPRole::SharedSSDFollower;
-    else if (role_str == "standalone") cfg.role = UMBPRole::Standalone;
+    if (role_str == "leader")
+      cfg.role = UMBPRole::SharedSSDLeader;
+    else if (role_str == "follower")
+      cfg.role = UMBPRole::SharedSSDFollower;
+    else if (role_str == "standalone")
+      cfg.role = UMBPRole::Standalone;
     else if (role_str.empty() && cfg.role == UMBPRole::Standalone) {
       const char* local_rank = nullptr;
-      for (const char* name : {"LOCAL_RANK", "OMPI_COMM_WORLD_LOCAL_RANK",
-                                "SLURM_LOCALID", "MPI_LOCALRANKID"}) {
+      for (const char* name :
+           {"LOCAL_RANK", "OMPI_COMM_WORLD_LOCAL_RANK", "SLURM_LOCALID", "MPI_LOCALRANKID"}) {
         local_rank = std::getenv(name);
         if (local_rank) break;
       }
       if (local_rank) {
-        cfg.role = (std::atoi(local_rank) == 0)
-            ? UMBPRole::SharedSSDLeader : UMBPRole::SharedSSDFollower;
+        cfg.role =
+            (std::atoi(local_rank) == 0) ? UMBPRole::SharedSSDLeader : UMBPRole::SharedSSDFollower;
       }
     }
 
