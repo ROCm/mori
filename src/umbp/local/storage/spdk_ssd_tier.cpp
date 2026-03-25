@@ -19,8 +19,6 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-// Copyright © Advanced Micro Devices, Inc. All rights reserved.
-// MIT License
 //
 // SpdkSsdTier: deep-queue NVMe pipeline via SPDK.
 //
@@ -48,7 +46,55 @@
 // ---------------------------------------------------------------------------
 // Construction / destruction
 // ---------------------------------------------------------------------------
-SpdkSsdTier::SpdkSsdTier(const UMBPConfig& config) : TierBackend(StorageTier::LOCAL_SSD) {
+SpdkSsdTier::DmaPool::~DmaPool() {
+  if (!bufs || count <= 0) return;
+  auto& env = umbp::SpdkEnv::Instance();
+  if (env.IsInitialized()) {
+    env.DmaPoolFreeBatch(bufs, buf_size, count);
+  }
+  delete[] bufs;
+  bufs = nullptr;
+  count = 0;
+}
+
+SpdkSsdTier::SharedDmaPool SpdkSsdTier::CreateSharedDmaPool(size_t buf_size, int count) {
+  if (count <= 0 || buf_size == 0) return nullptr;
+
+  auto& env = umbp::SpdkEnv::Instance();
+  if (!env.IsInitialized()) return nullptr;
+
+  auto pool = std::make_shared<DmaPool>();
+  pool->buf_size = buf_size;
+  pool->count = count;
+  pool->bufs = new void*[count];
+  int got = env.DmaPoolAllocBatch(pool->bufs, buf_size, count);
+  if (got < count) {
+    for (int i = got; i < count; ++i) pool->bufs[i] = nullptr;
+    pool->count = got;
+  }
+  if (pool->count <= 0) {
+    delete[] pool->bufs;
+    pool->bufs = nullptr;
+    return nullptr;
+  }
+  return pool;
+}
+
+SpdkSsdTier::SharedDmaPool SpdkSsdTier::EnsureDmaPool() {
+  if (dma_pool_) return dma_pool_;
+
+  size_t ring_buf_size = 2ULL * 1024 * 1024;
+  int ring_count = kMaxQueueDepth * std::max(1, num_io_workers_);
+  dma_pool_ = CreateSharedDmaPool(ring_buf_size, ring_count);
+  return dma_pool_;
+}
+
+SpdkSsdTier::SpdkSsdTier(const UMBPConfig& config)
+    : SpdkSsdTier(config, 0, config.ssd.capacity_bytes, nullptr) {}
+
+SpdkSsdTier::SpdkSsdTier(const UMBPConfig& config, uint64_t base_offset, size_t capacity_bytes,
+                         SharedDmaPool shared_dma_pool)
+    : TierBackend(StorageTier::LOCAL_SSD) {
   auto& env = umbp::SpdkEnv::Instance();
   if (!env.IsInitialized()) {
     umbp::SpdkEnvConfig ecfg;
@@ -69,51 +115,57 @@ SpdkSsdTier::SpdkSsdTier(const UMBPConfig& config) : TierBackend(StorageTier::LO
   if (block_size_ == 0) block_size_ = 4096;
 
   uint64_t device_size = env.GetBdevSize();
-  capacity_ = std::min(config.ssd.capacity_bytes, static_cast<size_t>(device_size));
+  if (base_offset >= device_size) {
+    UMBP_LOG_ERROR("SpdkSsdTier: base offset %lu beyond device size %lu",
+                   static_cast<unsigned long>(base_offset),
+                   static_cast<unsigned long>(device_size));
+    return;
+  }
 
-  allocator_ = umbp::offset_allocator::OffsetAllocator::createAligned(0, capacity_, block_size_);
+  base_offset_ = base_offset;
+  size_t max_capacity = static_cast<size_t>(device_size - base_offset_);
+  capacity_ = std::min(capacity_bytes, max_capacity);
+  if (capacity_ == 0) {
+    UMBP_LOG_ERROR("SpdkSsdTier: capacity is zero after range clamp");
+    return;
+  }
+
+  allocator_ =
+      umbp::offset_allocator::OffsetAllocator::createAligned(base_offset_, capacity_, block_size_);
   if (!allocator_) {
     UMBP_LOG_ERROR("SpdkSsdTier: OffsetAllocator creation failed");
     return;
   }
 
   num_io_workers_ = std::max(1, config.spdk_io_workers);
-
-  size_t ring_buf_size = 2ULL * 1024 * 1024;
-  AllocDmaRing(ring_buf_size);
+  dma_pool_ = std::move(shared_dma_pool);
+  EnsureDmaPool();
 
   initialized_ = true;
   UMBP_LOG_INFO(
-      "SpdkSsdTier: ready — capacity=%zuMB block_size=%u dma_ring=%d×%zuKB io_workers=%d "
-      "shards=%zu",
-      capacity_ / (1024 * 1024), block_size_, dma_ring_count_, dma_ring_buf_size_ / 1024,
-      num_io_workers_, kNumShards);
+      "SpdkSsdTier: ready — base=%zuMB capacity=%zuMB block_size=%u "
+      "dma_pool=%d×%zuKB io_workers=%d shards=%zu",
+      static_cast<size_t>(base_offset_ / (1024 * 1024)), capacity_ / (1024 * 1024), block_size_,
+      dma_pool_ ? dma_pool_->count : 0, dma_pool_ ? dma_pool_->buf_size / 1024 : 0, num_io_workers_,
+      kNumShards);
 }
 
-SpdkSsdTier::~SpdkSsdTier() {
-  Clear();
-  FreeDmaRing();
+SpdkSsdTier::~SpdkSsdTier() { Clear(); }
+
+SpdkSsdTier::Stats SpdkSsdTier::GetStats() const {
+  Stats stats;
+  stats.hit_count = hit_count_.load(std::memory_order_relaxed);
+  stats.miss_count = miss_count_.load(std::memory_order_relaxed);
+  stats.evicted_bytes = evicted_bytes_.load(std::memory_order_relaxed);
+  return stats;
 }
 
-void SpdkSsdTier::AllocDmaRing(size_t buf_size) {
-  auto& env = umbp::SpdkEnv::Instance();
-  if (!env.IsInitialized()) return;
-
-  dma_ring_buf_size_ = buf_size;
-  dma_ring_count_ = kMaxQueueDepth * std::max(1, num_io_workers_);
-  dma_ring_ = new void*[dma_ring_count_];
-  env.DmaPoolAllocBatch(dma_ring_, dma_ring_buf_size_, dma_ring_count_);
+void SpdkSsdTier::RecordHit(uint64_t count) {
+  hit_count_.fetch_add(count, std::memory_order_relaxed);
 }
 
-void SpdkSsdTier::FreeDmaRing() {
-  if (!dma_ring_) return;
-  auto& env = umbp::SpdkEnv::Instance();
-  if (env.IsInitialized()) {
-    env.DmaPoolFreeBatch(dma_ring_, dma_ring_buf_size_, dma_ring_count_);
-  }
-  delete[] dma_ring_;
-  dma_ring_ = nullptr;
-  dma_ring_count_ = 0;
+void SpdkSsdTier::RecordMiss(uint64_t count) {
+  miss_count_.fetch_add(count, std::memory_order_relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -150,6 +202,7 @@ bool SpdkSsdTier::Evict(const std::string& key) {
   std::unique_lock<std::shared_mutex> slk(shard.mutex);
   auto it = shard.map.find(key);
   if (it == shard.map.end()) return false;
+  evicted_bytes_.fetch_add(AlignUp(it->second.data_size), std::memory_order_relaxed);
   lru_list_.erase(it->second.lru_pos);
   shard.map.erase(it);
   return true;
@@ -208,6 +261,7 @@ size_t SpdkSsdTier::EvictLRU(size_t needed) {
       size_t entry_size = AlignUp(it->second.data_size);
       bool immediate = (it->second.allocation.use_count() == 1);
       freed += entry_size;
+      evicted_bytes_.fetch_add(entry_size, std::memory_order_relaxed);
       shard.map.erase(it);
       if (!immediate) {
         UMBP_LOG_WARN(
@@ -254,10 +308,10 @@ std::vector<SpdkSsdTier::PendingWrite> SpdkSsdTier::PrepareWriteAlloc(
       }
       auto& shard = shards_[ShardForKey(keys[i])];
       std::unique_lock<std::shared_mutex> slk(shard.mutex);
-      auto eit = shard.map.find(keys[i]);
-      if (eit != shard.map.end()) {
+      auto it = shard.map.find(keys[i]);
+      if (it != shard.map.end()) {
         results[i] = true;
-        lru_list_.splice(lru_list_.begin(), lru_list_, eit->second.lru_pos);
+        lru_list_.splice(lru_list_.begin(), lru_list_, it->second.lru_pos);
         continue;
       }
       new_indices.push_back(i);
@@ -396,13 +450,15 @@ std::vector<bool> SpdkSsdTier::BatchWrite(const std::vector<std::string>& keys,
   if (!initialized_ || count == 0) return results;
 
   auto& env = umbp::SpdkEnv::Instance();
+  auto pool = EnsureDmaPool();
+  if (!pool || pool->count <= 0) return results;
 
   auto pending = PrepareWriteAlloc(keys, sizes, results);
   if (pending.empty()) return results;
 
   // --- Phase 2: Chunked deep-queue I/O pipeline (no lock) ---
   const int pending_count = static_cast<int>(pending.size());
-  const size_t chunk_sz = dma_ring_buf_size_;
+  const size_t chunk_sz = pool->buf_size;
 
   struct WriteChunk {
     int item_idx;
@@ -435,12 +491,12 @@ std::vector<bool> SpdkSsdTier::BatchWrite(const std::vector<std::string>& keys,
   std::memset(chunk_ok.get(), 0, chunk_count);
 
   {
-    std::lock_guard<std::mutex> dma_lk(dma_ring_mu_);
+    std::lock_guard<std::mutex> dma_lk(pool->mutex);
 
     constexpr int kMinChunksPerWorker = 16;
-    int max_w = std::min(num_io_workers_, dma_ring_count_ / 2);
+    int max_w = std::min(num_io_workers_, pool->count / 2);
     int num_workers = std::clamp(chunk_count / kMinChunksPerWorker, 1, max_w);
-    int bufs_per = dma_ring_count_ / num_workers;
+    int bufs_per = pool->count / num_workers;
 
     auto run_pipeline = [&](int c_begin, int c_end, void** bufs, int local_qd) {
       auto lreqs = std::make_unique<umbp::SpdkIoRequest[]>(local_qd);
@@ -492,16 +548,16 @@ std::vector<bool> SpdkSsdTier::BatchWrite(const std::vector<std::string>& keys,
     };
 
     if (num_workers <= 1) {
-      int qd = std::min({chunk_count, kMaxQueueDepth, dma_ring_count_});
-      run_pipeline(0, chunk_count, dma_ring_, qd);
+      int qd = std::min({chunk_count, kMaxQueueDepth, pool->count});
+      run_pipeline(0, chunk_count, pool->bufs, qd);
     } else {
       std::vector<std::thread> workers;
       workers.reserve(num_workers - 1);
       for (int w = 0; w < num_workers; ++w) {
         int cb = chunk_count * w / num_workers;
         int ce = chunk_count * (w + 1) / num_workers;
-        void** wb = dma_ring_ + w * bufs_per;
-        int wq = (w == num_workers - 1) ? (dma_ring_count_ - w * bufs_per) : bufs_per;
+        void** wb = pool->bufs + w * bufs_per;
+        int wq = (w == num_workers - 1) ? (pool->count - w * bufs_per) : bufs_per;
         if (w < num_workers - 1) {
           workers.emplace_back([&, cb, ce, wb, wq]() { run_pipeline(cb, ce, wb, wq); });
         } else {
@@ -535,13 +591,14 @@ std::vector<bool> SpdkSsdTier::BatchWriteStreaming(const std::vector<std::string
   if (!initialized_ || count == 0) return results;
 
   auto& env = umbp::SpdkEnv::Instance();
+  auto pool = EnsureDmaPool();
 
   auto pending = PrepareWriteAlloc(keys, sizes, results);
   if (pending.empty()) return results;
 
   // --- Phase 2: Chunked pipeline with bytes_ready gating ---
   const int pending_count = static_cast<int>(pending.size());
-  const size_t chunk_sz = dma_ring_buf_size_;
+  const size_t chunk_sz = pool ? pool->buf_size : (2ULL * 1024 * 1024);
 
   struct WriteChunk {
     int item_idx;
@@ -580,9 +637,10 @@ std::vector<bool> SpdkSsdTier::BatchWriteStreaming(const std::vector<std::string
     bufs = ext_dma_bufs;
     total_bufs = ext_dma_count;
   } else {
-    dma_lk = std::unique_lock<std::mutex>(dma_ring_mu_);
-    bufs = dma_ring_;
-    total_bufs = dma_ring_count_;
+    if (!pool || pool->count <= 0) return results;
+    dma_lk = std::unique_lock<std::mutex>(pool->mutex);
+    bufs = pool->bufs;
+    total_bufs = pool->count;
   }
 
   {
@@ -688,13 +746,15 @@ std::vector<bool> SpdkSsdTier::BatchReadIntoPtr(const std::vector<std::string>& 
   if (!initialized_ || count == 0) return results;
 
   auto& env = umbp::SpdkEnv::Instance();
+  auto pool = EnsureDmaPool();
+  if (!pool || pool->count <= 0) return results;
 
   auto items = PrepareReadLookup(keys, sizes, results);
   if (items.empty()) return results;
 
   // --- Phase 2: Chunked deep-queue I/O pipeline (no lock) ---
   const int item_count = static_cast<int>(items.size());
-  const size_t chunk_sz = dma_ring_buf_size_;
+  const size_t chunk_sz = pool->buf_size;
 
   struct ReadChunk {
     int item_idx;
@@ -727,12 +787,12 @@ std::vector<bool> SpdkSsdTier::BatchReadIntoPtr(const std::vector<std::string>& 
   std::memset(chunk_ok.get(), 0, chunk_count);
 
   {
-    std::lock_guard<std::mutex> dma_lk(dma_ring_mu_);
+    std::lock_guard<std::mutex> dma_lk(pool->mutex);
 
     constexpr int kMinChunksPerWorker = 16;
-    int max_w = std::min(num_io_workers_, dma_ring_count_ / 2);
+    int max_w = std::min(num_io_workers_, pool->count / 2);
     int num_workers = std::clamp(chunk_count / kMinChunksPerWorker, 1, max_w);
-    int bufs_per = dma_ring_count_ / num_workers;
+    int bufs_per = pool->count / num_workers;
 
     auto run_pipeline = [&](int c_begin, int c_end, void** bufs, int local_qd) {
       auto lreqs = std::make_unique<umbp::SpdkIoRequest[]>(local_qd);
@@ -785,16 +845,16 @@ std::vector<bool> SpdkSsdTier::BatchReadIntoPtr(const std::vector<std::string>& 
     };
 
     if (num_workers <= 1) {
-      int qd = std::min({chunk_count, kMaxQueueDepth, dma_ring_count_});
-      run_pipeline(0, chunk_count, dma_ring_, qd);
+      int qd = std::min({chunk_count, kMaxQueueDepth, pool->count});
+      run_pipeline(0, chunk_count, pool->bufs, qd);
     } else {
       std::vector<std::thread> workers;
       workers.reserve(num_workers - 1);
       for (int w = 0; w < num_workers; ++w) {
         int cb = chunk_count * w / num_workers;
         int ce = chunk_count * (w + 1) / num_workers;
-        void** wb = dma_ring_ + w * bufs_per;
-        int wq = (w == num_workers - 1) ? (dma_ring_count_ - w * bufs_per) : bufs_per;
+        void** wb = pool->bufs + w * bufs_per;
+        int wq = (w == num_workers - 1) ? (pool->count - w * bufs_per) : bufs_per;
         if (w < num_workers - 1) {
           workers.emplace_back([&, cb, ce, wb, wq]() { run_pipeline(cb, ce, wb, wq); });
         } else {
@@ -828,6 +888,7 @@ std::vector<bool> SpdkSsdTier::BatchReadIntoPtrStreaming(
   if (!initialized_ || count == 0) return results;
 
   auto& env = umbp::SpdkEnv::Instance();
+  auto pool = EnsureDmaPool();
 
   auto items = PrepareReadLookup(keys, sizes, results);
 
@@ -837,7 +898,7 @@ std::vector<bool> SpdkSsdTier::BatchReadIntoPtrStreaming(
   }
 
   const int item_count = static_cast<int>(items.size());
-  const size_t chunk_sz = dma_ring_buf_size_;
+  const size_t chunk_sz = pool ? pool->buf_size : (2ULL * 1024 * 1024);
 
   struct ReadChunk {
     int item_idx;
@@ -874,9 +935,10 @@ std::vector<bool> SpdkSsdTier::BatchReadIntoPtrStreaming(
     bufs = ext_dma_bufs;
     total_bufs = ext_dma_count;
   } else {
-    dma_lk = std::unique_lock<std::mutex>(dma_ring_mu_);
-    bufs = dma_ring_;
-    total_bufs = dma_ring_count_;
+    if (!pool || pool->count <= 0) return results;
+    dma_lk = std::unique_lock<std::mutex>(pool->mutex);
+    bufs = pool->bufs;
+    total_bufs = pool->count;
   }
 
   {
@@ -977,7 +1039,8 @@ std::vector<bool> SpdkSsdTier::BatchWriteDmaDirect(const std::vector<std::string
     }
   }
 
-  const size_t chunk_sz = dma_ring_buf_size_ > 0 ? dma_ring_buf_size_ : 2ULL * 1024 * 1024;
+  auto pool = EnsureDmaPool();
+  const size_t chunk_sz = pool ? pool->buf_size : (2ULL * 1024 * 1024);
   struct DmaChunk {
     int item_idx;
     void* buf;
@@ -1096,7 +1159,8 @@ std::vector<bool> SpdkSsdTier::BatchReadDmaDirect(const std::vector<std::string>
 
   // --- Phase 2: Zero-copy read pipeline ---
   const int item_count = static_cast<int>(items.size());
-  const size_t chunk_sz = dma_ring_buf_size_ > 0 ? dma_ring_buf_size_ : 2ULL * 1024 * 1024;
+  auto pool = EnsureDmaPool();
+  const size_t chunk_sz = pool ? pool->buf_size : (2ULL * 1024 * 1024);
 
   struct DmaReadChunk {
     int item_idx;
@@ -1217,7 +1281,8 @@ std::vector<bool> SpdkSsdTier::BatchWriteDmaStreaming(const std::vector<std::str
   if (pending.empty()) return results;
 
   const int pending_count = static_cast<int>(pending.size());
-  const size_t chunk_sz = dma_ring_buf_size_ > 0 ? dma_ring_buf_size_ : 2ULL * 1024 * 1024;
+  auto pool = EnsureDmaPool();
+  const size_t chunk_sz = pool ? pool->buf_size : (2ULL * 1024 * 1024);
   struct DmaChunk {
     int item_idx;
     void* buf;
@@ -1350,7 +1415,8 @@ std::vector<bool> SpdkSsdTier::BatchReadDmaStreaming(const std::vector<std::stri
   if (items.empty()) return results;
 
   const int item_count = static_cast<int>(items.size());
-  const size_t chunk_sz = dma_ring_buf_size_ > 0 ? dma_ring_buf_size_ : 2ULL * 1024 * 1024;
+  auto pool = EnsureDmaPool();
+  const size_t chunk_sz = pool ? pool->buf_size : (2ULL * 1024 * 1024);
   struct DmaRC {
     int item_idx;
     void* buf;

@@ -19,8 +19,6 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-// Copyright © Advanced Micro Devices, Inc. All rights reserved.
-// MIT License
 //
 // proxy_bench: Benchmark for SpdkProxyTier (shared memory IPC to spdk_proxy).
 // Measures batch write/read throughput at various value sizes.
@@ -58,13 +56,13 @@ static void RunBatch(SpdkProxyTier& tier, uint32_t rank_id, const std::string& s
   std::string prefix =
       "r" + std::to_string(rank_id) + "_" + session + "_" + std::to_string(value_size) + "_";
 
-  std::vector<std::vector<char>> datas(count);
+  std::vector<std::vector<char>> bufs(count);
   std::vector<const void*> ptrs(count);
   std::vector<size_t> sizes(count, value_size);
 
   for (int i = 0; i < count; ++i) {
-    datas[i].resize(value_size, static_cast<char>((i + 1) & 0xFF));
-    ptrs[i] = datas[i].data();
+    bufs[i].resize(value_size, static_cast<char>((i + 1) & 0xFF));
+    ptrs[i] = bufs[i].data();
   }
 
   double total_bytes = static_cast<double>(value_size) * count;

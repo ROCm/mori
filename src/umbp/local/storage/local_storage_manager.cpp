@@ -22,6 +22,7 @@
 #include "umbp/local/storage/local_storage_manager.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <stdexcept>
@@ -36,7 +37,7 @@
 #ifdef __linux__
 #include <fcntl.h>
 #include <signal.h>
-#include <sys/wait.h>
+#include <sys/file.h>
 #include <unistd.h>
 
 #include "umbp/local/storage/spdk_proxy_tier.h"
@@ -219,50 +220,19 @@ bool LocalStorageManager::WriteFromPtrWithDepth(const std::string& key, uintptr_
   return ok;
 }
 
-// ---------------------------------------------------------------------------
-// Destructor — graceful proxy shutdown if we spawned it
-// ---------------------------------------------------------------------------
-LocalStorageManager::~LocalStorageManager() {
-#ifdef __linux__
-  tiers_.clear();
-
-  if (proxy_child_pid_ > 0) {
-    umbp::proxy::ProxyShmRegion shm;
-    if (shm.Attach(proxy_shm_name_) == 0) {
-      shm.Header()->shutdown_requested.store(1, std::memory_order_release);
-    }
-
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    bool exited = false;
-    while (std::chrono::steady_clock::now() < deadline) {
-      int status = 0;
-      pid_t r = waitpid(proxy_child_pid_, &status, WNOHANG);
-      if (r == proxy_child_pid_ || r == -1) {
-        exited = true;
-        break;
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
-
-    if (!exited) {
-      UMBP_LOG_WARN("LSM: proxy pid=%d did not exit in time, sending SIGKILL", proxy_child_pid_);
-      kill(proxy_child_pid_, SIGKILL);
-      waitpid(proxy_child_pid_, nullptr, 0);
-    }
-    proxy_child_pid_ = -1;
-
-    umbp::proxy::ProxyShmRegion::CleanupStale(proxy_shm_name_);
-  }
-#endif
-}
+LocalStorageManager::~LocalStorageManager() = default;
 
 // ---------------------------------------------------------------------------
 // Auto-fork proxy daemon (Linux only)
 // ---------------------------------------------------------------------------
 #ifdef __linux__
 static std::string FindProxyBinary(const std::string& explicit_path) {
+  auto try_candidate = [](const std::string& candidate) -> std::string {
+    return (access(candidate.c_str(), X_OK) == 0) ? candidate : "";
+  };
+
   if (!explicit_path.empty()) {
-    if (access(explicit_path.c_str(), X_OK) == 0) return explicit_path;
+    if (auto hit = try_candidate(explicit_path); !hit.empty()) return hit;
     UMBP_LOG_WARN("LSM: UMBP_SPDK_PROXY_BIN='%s' not executable", explicit_path.c_str());
   }
 
@@ -274,38 +244,79 @@ static std::string FindProxyBinary(const std::string& explicit_path) {
     size_t slash = dir.rfind('/');
     if (slash != std::string::npos) {
       dir.resize(slash + 1);
-      std::string candidate = dir + "spdk_proxy";
-      if (access(candidate.c_str(), X_OK) == 0) return candidate;
+      if (auto hit = try_candidate(dir + "spdk_proxy"); !hit.empty()) return hit;
+
+      // CMake build tree layout: test binaries live under
+      // build_umbp/tests/... while spdk_proxy lives under build_umbp/src/umbp.
+      std::string parent = dir;
+      for (int depth = 0; depth < 8; ++depth) {
+        if (auto hit = try_candidate(parent + "src/umbp/spdk_proxy"); !hit.empty()) {
+          return hit;
+        }
+        if (parent.empty() || parent == "/") break;
+        size_t end = parent.size();
+        while (end > 0 && parent[end - 1] == '/') --end;
+        if (end == 0) break;
+        size_t prev = parent.rfind('/', end - 1);
+        if (prev == std::string::npos) break;
+        parent.resize(prev + 1);
+      }
     }
   }
 
   return "spdk_proxy";
 }
 
-int LocalStorageManager::SpawnProxyDaemon() {
-  int probe = umbp::proxy::ProxyShmRegion::ProbeExisting(proxy_shm_name_);
-  if (probe == 1 || probe == -1) {
-    UMBP_LOG_INFO("LSM: killing existing proxy on SHM '%s'", proxy_shm_name_.c_str());
-    umbp::proxy::ProxyShmRegion tmp;
-    if (tmp.Attach(proxy_shm_name_) == 0) {
-      auto* hdr = tmp.Header();
-      uint32_t old_pid = hdr->proxy_pid.load(std::memory_order_relaxed);
-      if (old_pid > 0) {
-        hdr->shutdown_requested.store(1, std::memory_order_release);
-        kill(static_cast<pid_t>(old_pid), SIGTERM);
-        for (int i = 0; i < 50 && kill(static_cast<pid_t>(old_pid), 0) == 0; ++i) usleep(100000);
-        if (kill(static_cast<pid_t>(old_pid), 0) == 0) {
-          UMBP_LOG_WARN("LSM: old proxy pid=%u did not exit, sending SIGKILL", old_pid);
-          kill(static_cast<pid_t>(old_pid), SIGKILL);
-        }
-      }
+class ScopedBootstrapLock {
+ public:
+  explicit ScopedBootstrapLock(const std::string& shm_name) {
+    path_ = umbp::proxy::ProxyShmRegion::BootstrapLockPath(shm_name);
+    fd_ = open(path_.c_str(), O_CREAT | O_RDWR, 0666);
+    if (fd_ < 0) {
+      UMBP_LOG_ERROR("LSM: open bootstrap lock '%s' failed: %s", path_.c_str(), strerror(errno));
+      return;
+    }
+    if (flock(fd_, LOCK_EX) != 0) {
+      UMBP_LOG_ERROR("LSM: flock bootstrap lock '%s' failed: %s", path_.c_str(), strerror(errno));
+      close(fd_);
+      fd_ = -1;
     }
   }
 
-  umbp::proxy::ProxyShmRegion::CleanupStale(proxy_shm_name_);
+  ~ScopedBootstrapLock() {
+    if (fd_ >= 0) {
+      flock(fd_, LOCK_UN);
+      close(fd_);
+    }
+  }
 
+  bool IsValid() const { return fd_ >= 0; }
+
+ private:
+  std::string path_;
+  int fd_ = -1;
+};
+
+static void SetEnvVarFromConfig(const char* name, const std::string& value) {
+  if (!value.empty()) setenv(name, value.c_str(), 1);
+}
+
+static void SetEnvVarFromConfig(const char* name, size_t value) {
+  setenv(name, std::to_string(value).c_str(), 1);
+}
+
+static void SetEnvVarFromConfig(const char* name, int value) {
+  setenv(name, std::to_string(value).c_str(), 1);
+}
+
+static void SetEnvVarFromConfig(const char* name, bool value) {
+  setenv(name, value ? "1" : "0", 1);
+}
+
+int LocalStorageManager::SpawnProxyDaemon(const std::string& shm_name) {
   std::string bin = FindProxyBinary(config_.spdk_proxy_bin);
-
+  UMBP_LOG_INFO("LSM: launching spdk_proxy binary '%s' for shm '%s'", bin.c_str(),
+                shm_name.c_str());
   pid_t pid = fork();
   if (pid < 0) {
     UMBP_LOG_ERROR("LSM: fork() failed: %s", strerror(errno));
@@ -313,6 +324,26 @@ int LocalStorageManager::SpawnProxyDaemon() {
   }
 
   if (pid == 0) {
+    setsid();
+
+    SetEnvVarFromConfig("UMBP_SPDK_PROXY_SHM", shm_name);
+    SetEnvVarFromConfig("UMBP_SPDK_PROXY_MAX_CHANNELS",
+                        static_cast<int>(config_.spdk_proxy_max_channels));
+    SetEnvVarFromConfig("UMBP_SPDK_PROXY_DATA_PER_CHANNEL_MB",
+                        config_.spdk_proxy_data_per_channel_mb);
+    SetEnvVarFromConfig("UMBP_SPDK_PROXY_IDLE_EXIT_TIMEOUT_MS",
+                        config_.spdk_proxy_idle_exit_timeout_ms);
+    SetEnvVarFromConfig("UMBP_SPDK_PROXY_ALLOW_BORROW", config_.spdk_proxy_allow_borrow);
+    SetEnvVarFromConfig("UMBP_SPDK_PROXY_RESERVED_SHARED_BYTES",
+                        config_.spdk_proxy_reserved_shared_bytes);
+    SetEnvVarFromConfig("UMBP_SSD_CAPACITY", config_.ssd.capacity_bytes);
+    SetEnvVarFromConfig("UMBP_SPDK_NVME_PCI", config_.spdk_nvme_pci_addr);
+    SetEnvVarFromConfig("UMBP_SPDK_NVME_CTRL", config_.spdk_nvme_ctrl_name);
+    SetEnvVarFromConfig("UMBP_SPDK_BDEV", config_.spdk_bdev_name);
+    SetEnvVarFromConfig("UMBP_SPDK_REACTOR_MASK", config_.spdk_reactor_mask);
+    SetEnvVarFromConfig("UMBP_SPDK_MEM_MB", config_.spdk_mem_size_mb);
+    SetEnvVarFromConfig("UMBP_SPDK_IO_WORKERS", config_.spdk_io_workers);
+
     if (UmbpLogLevel() >= 1) {
       int devnull = open("/dev/null", O_WRONLY);
       if (devnull >= 0) {
@@ -321,16 +352,69 @@ int LocalStorageManager::SpawnProxyDaemon() {
         close(devnull);
       }
     }
-    std::string spawner_pid_str = std::to_string(getppid());
-    execlp(bin.c_str(), "spdk_proxy", "--spawner-pid", spawner_pid_str.c_str(),
-           static_cast<char*>(nullptr));
+    execlp(bin.c_str(), "spdk_proxy", static_cast<char*>(nullptr));
     fprintf(stderr, "[UMBP ERROR] execlp('%s') failed: %s\n", bin.c_str(), strerror(errno));
     _exit(127);
   }
 
-  proxy_child_pid_ = pid;
-  UMBP_LOG_INFO("LSM: spawned spdk_proxy daemon pid=%d", pid);
+  UMBP_LOG_INFO("LSM: spawned spdk_proxy service pid=%d shm='%s'", pid, shm_name.c_str());
   return 0;
+}
+
+int LocalStorageManager::EnsureProxyDaemon(const std::string& shm_name) {
+  int probe = umbp::proxy::ProxyShmRegion::ProbeExisting(shm_name);
+  if (probe == 1) return 0;
+  if (probe == -2) {
+    UMBP_LOG_ERROR("LSM: proxy protocol version mismatch on SHM '%s'", shm_name.c_str());
+    return -1;
+  }
+  if (!config_.spdk_proxy_auto_start) {
+    if (probe == -1) {
+      return SpdkProxyTier::WaitForProxy(shm_name, config_.spdk_proxy_startup_timeout_ms) ? 0 : -1;
+    }
+    UMBP_LOG_ERROR("LSM: SPDK proxy absent on SHM '%s' and auto-start disabled", shm_name.c_str());
+    return -1;
+  }
+
+  ScopedBootstrapLock lock(shm_name);
+  if (!lock.IsValid()) return -1;
+
+  probe = umbp::proxy::ProxyShmRegion::ProbeExisting(shm_name);
+  if (probe == 1) return 0;
+  if (probe == -2) {
+    UMBP_LOG_ERROR("LSM: proxy protocol version mismatch on SHM '%s'", shm_name.c_str());
+    return -1;
+  }
+  if (probe == -1) {
+    if (SpdkProxyTier::WaitForProxy(shm_name, config_.spdk_proxy_startup_timeout_ms)) {
+      return 0;
+    }
+
+    umbp::proxy::ProxyShmRegion existing;
+    if (existing.Attach(shm_name) == 0) {
+      auto* hdr = existing.Header();
+      uint32_t st = hdr->state.load(std::memory_order_acquire);
+      uint32_t pid = hdr->proxy_pid.load(std::memory_order_acquire);
+      bool alive = false;
+#ifdef __linux__
+      alive = (pid > 0 && kill(static_cast<pid_t>(pid), 0) == 0);
+#endif
+      if (alive && st == static_cast<uint32_t>(umbp::proxy::ProxyState::ERROR)) {
+        UMBP_LOG_ERROR("LSM: proxy on SHM '%s' is alive but in ERROR state", shm_name.c_str());
+        return -1;
+      }
+      if (alive && st != static_cast<uint32_t>(umbp::proxy::ProxyState::SHUTDOWN)) {
+        UMBP_LOG_ERROR("LSM: proxy on SHM '%s' did not become READY in time (state=%u)",
+                       shm_name.c_str(), st);
+        return -1;
+      }
+    }
+  }
+
+  umbp::proxy::ProxyShmRegion::CleanupStale(shm_name);
+  if (SpawnProxyDaemon(shm_name) != 0) return -1;
+
+  return SpdkProxyTier::WaitForProxy(shm_name, config_.spdk_proxy_startup_timeout_ms) ? 0 : -1;
 }
 #endif
 
@@ -353,52 +437,60 @@ LocalStorageManager::LocalStorageManager(const UMBPConfig& config,
     bool use_proxy = false;
 
     if (config_.ssd_backend == "spdk") {
-      if (role_ == UMBPRole::Standalone) {
 #ifdef USE_SPDK
+      if (role_ == UMBPRole::Standalone) {
+        // Standalone with USE_SPDK compiled: try direct SPDK access first
+        // (best perf, single process, no proxy overhead).
         auto spdk_tier = std::make_unique<SpdkSsdTier>(config_);
         if (spdk_tier->IsValid()) {
-          ssd_backend = std::move(spdk_tier);
+          ssd_backend = std::unique_ptr<TierBackend>(spdk_tier.release());
         } else {
-          fprintf(stderr, "[UMBP WARN] SpdkSsdTier init failed, falling back to POSIX SSD\n");
+          throw std::runtime_error(
+              "UMBP_SSD_BACKEND=spdk: SpdkSsdTier init failed. "
+              "Run 'tools/umbp_spdk_preflight.sh --pci <addr>' to diagnose.");
         }
-#else
-        fprintf(stderr,
-                "[UMBP WARN] UMBP_SSD_BACKEND=spdk requested, but this build was compiled "
-                "without SPDK support. Falling back to POSIX SSD.\n");
-#endif
       } else {
+        // Non-Standalone (Leader/Follower): always use proxy for
+        // multi-process coordination.
         use_proxy = true;
       }
+#else
+      // USE_SPDK not set — SpdkSsdTier (direct) is unavailable.
+      // Fall back to proxy mode: SpdkProxyTier has zero SPDK dependency
+      // (pure POSIX SHM), and the separate spdk_proxy daemon handles NVMe.
+      use_proxy = true;
+#endif
     } else if (config_.ssd_backend == "spdk_proxy") {
       use_proxy = true;
     }
 
 #ifdef __linux__
     if (use_proxy && !ssd_backend) {
-      proxy_shm_name_ = config_.spdk_proxy_shm_name;
-      if (proxy_shm_name_.empty()) proxy_shm_name_ = umbp::proxy::kDefaultShmName;
+      std::string proxy_shm_name = config_.spdk_proxy_shm_name;
+      if (proxy_shm_name.empty()) proxy_shm_name = umbp::proxy::kDefaultShmName;
 
-      bool should_spawn = (role_ == UMBPRole::SharedSSDLeader);
-      if (!should_spawn && config_.ssd_backend == "spdk_proxy" && role_ == UMBPRole::Standalone) {
-        int probe = umbp::proxy::ProxyShmRegion::ProbeExisting(proxy_shm_name_);
-        if (probe == 0) should_spawn = true;
+      bool proxy_ready = false;
+      if (config_.spdk_proxy_auto_start) {
+        proxy_ready = (EnsureProxyDaemon(proxy_shm_name) == 0);
+      } else {
+        proxy_ready =
+            SpdkProxyTier::WaitForProxy(proxy_shm_name, config_.spdk_proxy_startup_timeout_ms);
       }
-
-      if (should_spawn) {
-        SpawnProxyDaemon();
-      }
-
-      bool proxy_ready =
-          SpdkProxyTier::WaitForProxy(proxy_shm_name_, config_.spdk_proxy_startup_timeout_ms);
 
       if (proxy_ready) {
         auto proxy_tier = std::make_unique<SpdkProxyTier>(config_);
         if (proxy_tier->IsValid()) {
-          ssd_backend = std::move(proxy_tier);
+          ssd_backend = std::unique_ptr<TierBackend>(proxy_tier.release());
         }
       }
 
       if (!ssd_backend) {
+        bool explicit_spdk = (config_.ssd_backend == "spdk" || config_.ssd_backend == "spdk_proxy");
+        if (explicit_spdk) {
+          throw std::runtime_error(
+              "UMBP_SSD_BACKEND=" + config_.ssd_backend + ": SPDK proxy connect failed (shm=" +
+              proxy_shm_name + "). Run 'tools/umbp_spdk_preflight.sh --pci <addr>' to diagnose.");
+        }
         fprintf(stderr, "[UMBP WARN] SPDK proxy connect failed. Falling back to POSIX SSD.\n");
       }
     }

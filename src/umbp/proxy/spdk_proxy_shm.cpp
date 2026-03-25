@@ -19,12 +19,11 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-// Copyright © Advanced Micro Devices, Inc. All rights reserved.
-// MIT License
 
 #include "umbp/proxy/spdk_proxy_shm.h"
 
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 
 #ifdef __linux__
@@ -45,16 +44,88 @@ static std::string HugepagePath(const std::string& name) {
   return "/dev/hugepages/" + name;
 }
 
+static uint64_t Fnv1a64(const std::string& value) {
+  uint64_t h = 14695981039346656037ULL;
+  for (unsigned char c : value) {
+    h ^= static_cast<uint64_t>(c);
+    h *= 1099511628211ULL;
+  }
+  return h;
+}
+
 static size_t AlignToHugepage(size_t size) {
   return (size + kHugepageSize - 1) & ~(kHugepageSize - 1);
 }
 
-int ProxyShmRegion::Create(const std::string& name, uint32_t max_ranks, size_t data_per_rank,
-                           bool try_hugepage, size_t cache_budget_mb) {
+static bool ValidateHeaderLayoutImpl(const ProxyShmHeader* hdr, size_t mapped_size,
+                                     std::string* error_message) {
+  auto fail = [&](const char* message) {
+    if (error_message) *error_message = message;
+    return false;
+  };
+
+  if (!hdr) return fail("null header");
+  if (hdr->magic != kProxyShmMagic) return fail("bad magic");
+  if (hdr->version != kProxyVersion) return fail("protocol version mismatch");
+  if (hdr->max_channels == 0 || hdr->max_channels > kMaxChannels) {
+    return fail("invalid max_channels");
+  }
+  if (hdr->max_tenants == 0 || hdr->max_tenants > kMaxTenants) {
+    return fail("invalid max_tenants");
+  }
+  if (hdr->data_region_per_channel == 0) return fail("invalid data_region_per_channel");
+  if (hdr->total_shm_size == 0 || hdr->total_shm_size > mapped_size) {
+    return fail("invalid total_shm_size");
+  }
+
+  size_t min_size =
+      ComputeShmSize(hdr->max_channels, hdr->max_tenants, hdr->data_region_per_channel, 0);
+  if (hdr->total_shm_size < min_size) return fail("shared memory too small");
+
+  size_t header_size = sizeof(ProxyShmHeader);
+  if (hdr->tenant_table_offset < header_size || hdr->tenant_table_offset >= hdr->total_shm_size) {
+    return fail("invalid tenant_table_offset");
+  }
+  if (hdr->channels_offset < hdr->tenant_table_offset + sizeof(TenantInfo) * hdr->max_tenants ||
+      hdr->channels_offset >= hdr->total_shm_size) {
+    return fail("invalid channels_offset");
+  }
+  if (hdr->data_region_offset < hdr->channels_offset + sizeof(ClientChannel) * hdr->max_channels ||
+      hdr->data_region_offset >= hdr->total_shm_size) {
+    return fail("invalid data_region_offset");
+  }
+  size_t data_region_end =
+      hdr->data_region_offset + hdr->data_region_per_channel * hdr->max_channels;
+  if (data_region_end > hdr->total_shm_size) return fail("data region exceeds shm");
+
+  if (hdr->cache_region_offset != 0) {
+    if (hdr->cache_region_offset < data_region_end ||
+        hdr->cache_region_offset >= hdr->total_shm_size) {
+      return fail("invalid cache_region_offset");
+    }
+    if (hdr->cache_index_slots == 0 || hdr->cache_ring_capacity == 0) {
+      return fail("cache region missing index/ring");
+    }
+    size_t cache_data_offset = CacheRingDataOffset(hdr);
+    if (cache_data_offset < hdr->cache_region_offset || cache_data_offset > hdr->total_shm_size) {
+      return fail("invalid cache data offset");
+    }
+    size_t cache_end = cache_data_offset + hdr->cache_ring_capacity;
+    if (cache_end > hdr->total_shm_size) return fail("cache region exceeds shm");
+  }
+
+  return true;
+}
+
+int ProxyShmRegion::Create(const std::string& name, uint32_t max_channels, uint32_t max_tenants,
+                           size_t data_per_channel, bool try_hugepage, size_t cache_budget_mb) {
 #ifndef __linux__
   return -ENOTSUP;
 #else
-  if (max_ranks > kMaxRanks) return -EINVAL;
+  if (max_channels == 0 || max_tenants == 0 || max_channels > kMaxChannels ||
+      max_tenants > kMaxTenants) {
+    return -EINVAL;
+  }
 
   uint32_t cache_index_slots = 0;
   size_t cache_ring_cap = 0;
@@ -69,7 +140,7 @@ int ProxyShmRegion::Create(const std::string& name, uint32_t max_ranks, size_t d
     cache_ring_cap = (budget > ctrl_and_idx_aligned) ? budget - ctrl_and_idx_aligned : 0;
     cache_total = ctrl_and_idx_aligned + cache_ring_cap;
   }
-  size_ = ComputeShmSize(max_ranks, data_per_rank, cache_total);
+  size_ = ComputeShmSize(max_channels, max_tenants, data_per_channel, cache_total);
   name_ = name;
   is_server_ = true;
   is_hugepage_ = false;
@@ -129,34 +200,55 @@ int ProxyShmRegion::Create(const std::string& name, uint32_t max_ranks, size_t d
   std::memset(base_, 0, size_);
 
   size_t header_sz = sizeof(ProxyShmHeader);
-  size_t channels_offset = (header_sz + 4095) & ~4095ULL;
-  size_t channels_size = sizeof(RankChannel) * max_ranks;
+  size_t tenants_offset = (header_sz + 4095) & ~4095ULL;
+  size_t tenants_size = sizeof(TenantInfo) * max_tenants;
+  size_t channels_offset = (tenants_offset + tenants_size + 4095) & ~4095ULL;
+  size_t channels_size = sizeof(ClientChannel) * max_channels;
   size_t data_offset = (channels_offset + channels_size + 4095) & ~4095ULL;
 
   auto* hdr = Header();
   hdr->magic = kProxyShmMagic;
   hdr->version = kProxyVersion;
   hdr->state.store(static_cast<uint32_t>(ProxyState::UNINIT), std::memory_order_relaxed);
-  hdr->max_ranks = max_ranks;
+  hdr->service_epoch = NowEpochMs();
+  hdr->max_channels = max_channels;
+  hdr->max_tenants = max_tenants;
   hdr->block_size = 0;
   hdr->hugepage = is_hugepage_ ? 1 : 0;
   hdr->bdev_size = 0;
+  hdr->tenant_table_offset = tenants_offset;
   hdr->channels_offset = channels_offset;
   hdr->data_region_offset = data_offset;
-  hdr->data_region_per_rank = data_per_rank;
+  hdr->data_region_per_channel = data_per_channel;
   hdr->total_shm_size = size_;
+  hdr->next_session_id.store(1, std::memory_order_relaxed);
+  hdr->next_cache_epoch.store(1, std::memory_order_relaxed);
   hdr->capacity_used.store(0, std::memory_order_relaxed);
   hdr->capacity_total.store(0, std::memory_order_relaxed);
 
   hdr->proxy_pid.store(0, std::memory_order_relaxed);
-  hdr->spawner_pid.store(0, std::memory_order_relaxed);
-  hdr->active_ranks.store(0, std::memory_order_relaxed);
-  hdr->shutdown_requested.store(0, std::memory_order_relaxed);
+  hdr->active_sessions.store(0, std::memory_order_relaxed);
   hdr->proxy_heartbeat_ms.store(0, std::memory_order_relaxed);
-  for (uint32_t r = 0; r < kMaxRanks; ++r) hdr->rank_pids[r].store(0, std::memory_order_relaxed);
+  hdr->last_activity_ms.store(hdr->service_epoch, std::memory_order_relaxed);
+
+  for (uint32_t t = 0; t < max_tenants; ++t) {
+    auto* tenant = Tenant(t);
+    tenant->tenant_id = 0;
+    tenant->tenant_slot = t;
+    tenant->active_sessions.store(0, std::memory_order_relaxed);
+    tenant->flags.store(0, std::memory_order_relaxed);
+    tenant->used_bytes.store(0, std::memory_order_relaxed);
+    tenant->quota_bytes.store(0, std::memory_order_relaxed);
+    tenant->reserved_bytes.store(0, std::memory_order_relaxed);
+    tenant->evicted_bytes.store(0, std::memory_order_relaxed);
+    tenant->hit_count.store(0, std::memory_order_relaxed);
+    tenant->miss_count.store(0, std::memory_order_relaxed);
+    tenant->last_activity_ms.store(0, std::memory_order_relaxed);
+    tenant->cache_epoch.store(0, std::memory_order_relaxed);
+  }
 
   if (cache_index_slots > 0 && cache_ring_cap > 0) {
-    size_t base_before_cache = ComputeShmSize(max_ranks, data_per_rank, 0);
+    size_t base_before_cache = ComputeShmSize(max_channels, max_tenants, data_per_channel, 0);
     hdr->cache_region_offset = (base_before_cache + 4095) & ~4095ULL;
     hdr->cache_ring_capacity = cache_ring_cap;
     hdr->cache_index_slots = cache_index_slots;
@@ -171,13 +263,19 @@ int ProxyShmRegion::Create(const std::string& name, uint32_t max_ranks, size_t d
     hdr->cache_index_slots = 0;
   }
 
-  for (uint32_t r = 0; r < max_ranks; ++r) {
-    auto* ch = Channel(r);
+  for (uint32_t c = 0; c < max_channels; ++c) {
+    auto* ch = Channel(c);
     ch->head.store(0, std::memory_order_relaxed);
     ch->tail.store(0, std::memory_order_relaxed);
-    ch->rank_id = r;
-    ch->is_leader = 0;
-    ch->connected = 0;
+    ch->owner_pid.store(0, std::memory_order_relaxed);
+    ch->connected.store(0, std::memory_order_relaxed);
+    ch->channel_id = c;
+    ch->client_pid = 0;
+    ch->tenant_id = 0;
+    ch->tenant_slot = 0;
+    ch->session_id.store(0, std::memory_order_relaxed);
+    ch->last_activity_ms.store(0, std::memory_order_relaxed);
+    ch->requested_quota_bytes = 0;
     for (uint32_t s = 0; s < kRingSize; ++s) {
       ch->slots[s].state.store(static_cast<uint32_t>(SlotState::EMPTY), std::memory_order_relaxed);
     }
@@ -237,6 +335,11 @@ int ProxyShmRegion::Attach(const std::string& name) {
 #endif
 }
 
+bool ProxyShmRegion::ValidateHeaderLayout(const ProxyShmHeader* hdr, size_t mapped_size,
+                                          std::string* error_message) {
+  return ValidateHeaderLayoutImpl(hdr, mapped_size, error_message);
+}
+
 void ProxyShmRegion::Detach() {
 #ifdef __linux__
   if (base_ && size_ > 0) {
@@ -275,6 +378,12 @@ int ProxyShmRegion::ProbeExisting(const std::string& name) {
 
   if (kill(static_cast<pid_t>(pid), 0) != 0) return 0;
 
+  std::string error_message;
+  if (!ValidateHeaderLayout(hdr, probe.Size(), &error_message)) return -2;
+
+  uint64_t hb = hdr->proxy_heartbeat_ms.load(std::memory_order_acquire);
+  if (hb != 0 && (NowEpochMs() - hb) >= kHeartbeatStaleMs) return -1;
+
   uint32_t st = hdr->state.load(std::memory_order_acquire);
   if (st == static_cast<uint32_t>(ProxyState::READY)) return 1;
 
@@ -291,6 +400,13 @@ void ProxyShmRegion::CleanupStale(const std::string& name) {
   unlink(hp.c_str());
   shm_unlink(name.c_str());
 #endif
+}
+
+std::string ProxyShmRegion::BootstrapLockPath(const std::string& name) {
+  char buf[64];
+  std::snprintf(buf, sizeof(buf), "/tmp/umbp_proxy_%016llx.lock",
+                static_cast<unsigned long long>(Fnv1a64(name)));
+  return std::string(buf);
 }
 
 }  // namespace proxy

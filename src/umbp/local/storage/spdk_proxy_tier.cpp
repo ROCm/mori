@@ -22,13 +22,8 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
 // MIT License
 //
-// SpdkProxyTier: TierBackend that communicates with spdk_proxy daemon via
-// POSIX shared memory. Zero SPDK dependency on the client side.
-//
-// Lifecycle:
-//   - On construction: attaches SHM, registers rank (active_ranks++, rank_pids).
-//   - On destruction: deregisters rank (rank_pids=0, active_ranks--).
-//   - All busy-poll loops check proxy heartbeat to avoid hanging on dead proxy.
+// SpdkProxyTier: TierBackend that communicates with a multitenant spdk_proxy
+// daemon via POSIX shared memory.
 
 #include "umbp/local/storage/spdk_proxy_tier.h"
 
@@ -61,7 +56,7 @@ using namespace umbp::proxy;
 SpdkProxyTier::SpdkProxyTier(const UMBPConfig& config) : TierBackend(StorageTier::LOCAL_SSD) {
   std::string shm_name = config.spdk_proxy_shm_name;
   if (shm_name.empty()) shm_name = kDefaultShmName;
-  rank_id_ = config.spdk_proxy_rank_id;
+  tenant_id_ = config.spdk_proxy_tenant_id;
 
   int rc = shm_.Attach(shm_name);
   if (rc != 0) {
@@ -70,9 +65,23 @@ SpdkProxyTier::SpdkProxyTier(const UMBPConfig& config) : TierBackend(StorageTier
   }
 
   auto* hdr = shm_.Header();
-  if (hdr->state.load(std::memory_order_acquire) != static_cast<uint32_t>(ProxyState::READY)) {
-    UMBP_LOG_ERROR("SpdkProxyTier: proxy not READY (state=%u)",
-                   hdr->state.load(std::memory_order_relaxed));
+  if (hdr->version != kProxyVersion) {
+    UMBP_LOG_ERROR("SpdkProxyTier: protocol mismatch on SHM '%s' (have=%u want=%u)",
+                   shm_name.c_str(), hdr->version, kProxyVersion);
+    shm_.Detach();
+    return;
+  }
+  std::string layout_error;
+  if (!ProxyShmRegion::ValidateHeaderLayout(hdr, shm_.Size(), &layout_error)) {
+    UMBP_LOG_ERROR("SpdkProxyTier: invalid proxy SHM layout on '%s': %s", shm_name.c_str(),
+                   layout_error.c_str());
+    shm_.Detach();
+    return;
+  }
+
+  uint32_t state = hdr->state.load(std::memory_order_acquire);
+  if (state != static_cast<uint32_t>(ProxyState::READY)) {
+    UMBP_LOG_ERROR("SpdkProxyTier: proxy not READY (state=%u)", state);
     shm_.Detach();
     return;
   }
@@ -82,74 +91,79 @@ SpdkProxyTier::SpdkProxyTier(const UMBPConfig& config) : TierBackend(StorageTier
   my_pid = static_cast<uint32_t>(getpid());
 #endif
 
-  // CAS rank slot allocation when rank_id is not explicitly set
-  if (rank_id_ == kAutoRankId) {
-    for (uint32_t r = 0; r < hdr->max_ranks; ++r) {
-      auto* ch = shm_.Channel(r);
-      uint32_t expected = 0;
+  channel_id_ = hdr->max_channels;
+  for (uint32_t c = 0; c < hdr->max_channels; ++c) {
+    auto* ch = shm_.Channel(c);
+    uint32_t expected = 0;
+    if (ch->owner_pid.compare_exchange_strong(expected, my_pid, std::memory_order_acq_rel)) {
+      channel_id_ = c;
+      break;
+    }
+#ifdef __linux__
+    if (expected > 0 && kill(static_cast<pid_t>(expected), 0) != 0) {
       if (ch->owner_pid.compare_exchange_strong(expected, my_pid, std::memory_order_acq_rel)) {
-        rank_id_ = r;
+        ch->connected.store(0, std::memory_order_relaxed);
+        ch->head.store(0, std::memory_order_relaxed);
+        ch->tail.store(0, std::memory_order_relaxed);
+        ch->session_id.store(0, std::memory_order_relaxed);
+        channel_id_ = c;
+        UMBP_LOG_WARN("SpdkProxyTier: reclaimed dead channel %u (pid %u)", c, expected);
         break;
       }
-#ifdef __linux__
-      // Slot occupied — reclaim if the owning process is dead
-      if (expected > 0 && kill(static_cast<pid_t>(expected), 0) != 0) {
-        if (ch->owner_pid.compare_exchange_strong(expected, my_pid, std::memory_order_acq_rel)) {
-          ch->connected = 0;
-          ch->head.store(0, std::memory_order_relaxed);
-          ch->tail.store(0, std::memory_order_relaxed);
-          rank_id_ = r;
-          UMBP_LOG_WARN("SpdkProxyTier: reclaimed dead slot %u (pid %u)", r, expected);
-          break;
-        }
-      }
+    }
 #endif
-    }
-    if (rank_id_ == kAutoRankId) {
-      UMBP_LOG_ERROR("SpdkProxyTier: all %u rank slots occupied", hdr->max_ranks);
-      shm_.Detach();
-      return;
-    }
   }
 
-  if (rank_id_ >= hdr->max_ranks) {
-    UMBP_LOG_ERROR("SpdkProxyTier: rank_id %u >= max_ranks %u", rank_id_, hdr->max_ranks);
+  if (channel_id_ >= hdr->max_channels) {
+    UMBP_LOG_ERROR("SpdkProxyTier: all %u proxy channels are occupied", hdr->max_channels);
     shm_.Detach();
     return;
   }
 
-  auto* ch = shm_.Channel(rank_id_);
-  ch->rank_id = rank_id_;
-  ch->connected = 1;
-  ch->owner_pid.store(my_pid, std::memory_order_release);
-
-#ifdef __linux__
-  hdr->rank_pids[rank_id_].store(my_pid, std::memory_order_relaxed);
-#endif
-  hdr->active_ranks.fetch_add(1, std::memory_order_release);
+  auto* ch = shm_.Channel(channel_id_);
+  ch->head.store(0, std::memory_order_relaxed);
+  ch->tail.store(0, std::memory_order_relaxed);
+  ch->connected.store(1, std::memory_order_release);
+  ch->channel_id = channel_id_;
+  ch->client_pid = my_pid;
+  ch->tenant_id = tenant_id_;
+  ch->tenant_slot = 0;
+  ch->requested_quota_bytes = config.spdk_proxy_tenant_quota_bytes;
+  ch->last_activity_ms.store(NowEpochMs(), std::memory_order_relaxed);
+  ch->session_id.store(0, std::memory_order_relaxed);
+  for (uint32_t s = 0; s < kRingSize; ++s) {
+    ch->slots[s].state.store(static_cast<uint32_t>(SlotState::EMPTY), std::memory_order_relaxed);
+  }
 
   connected_ = true;
+  uint64_t attach_session_id = 0;
+  auto attach_rc = SubmitAndWait(RequestType::ATTACH_SESSION, "", nullptr, 0, nullptr, 0,
+                                 config.spdk_proxy_tenant_quota_bytes, nullptr, &attach_session_id);
+  if (attach_rc != ResultCode::OK) {
+    UMBP_LOG_ERROR("SpdkProxyTier: ATTACH_SESSION failed tenant=%u rc=%d", tenant_id_,
+                   static_cast<int>(attach_rc));
+    connected_ = false;
+    ReleaseChannel();
+    shm_.Detach();
+    return;
+  }
 
-  UMBP_LOG_INFO(
-      "SpdkProxyTier: connected rank=%u shm='%s' "
-      "bdev_size=%zuMB block_size=%u data_region=%zuMB",
-      rank_id_, shm_name.c_str(), static_cast<size_t>(hdr->bdev_size / (1024 * 1024)),
-      hdr->block_size, static_cast<size_t>(hdr->data_region_per_rank / (1024 * 1024)));
+  session_id_ = attach_session_id;
+  tenant_slot_ = ch->tenant_slot;
+  if (session_id_ == 0) session_id_ = ch->session_id.load(std::memory_order_acquire);
+
+  UMBP_LOG_INFO("SpdkProxyTier: attached channel=%u tenant=%u session=%lu shm='%s'", channel_id_,
+                tenant_id_, static_cast<unsigned long>(session_id_), shm_name.c_str());
 }
 
 SpdkProxyTier::~SpdkProxyTier() {
   if (connected_ && shm_.IsValid()) {
-    auto* hdr = shm_.Header();
-    auto* ch = shm_.Channel(rank_id_);
-    if (ch) {
-      ch->connected = 0;
-      ch->owner_pid.store(0, std::memory_order_release);
+    if (session_id_ != 0 && IsProxyAlive()) {
+      (void)SubmitAndWait(RequestType::DETACH_SESSION, "", nullptr, 0, nullptr, 0);
     }
-
-    hdr->rank_pids[rank_id_].store(0, std::memory_order_relaxed);
-    hdr->active_ranks.fetch_sub(1, std::memory_order_release);
-
-    UMBP_LOG_INFO("SpdkProxyTier: disconnected rank=%u", rank_id_);
+    ReleaseChannel();
+    connected_ = false;
+    session_id_ = 0;
   }
   shm_.Detach();
 }
@@ -165,25 +179,33 @@ bool SpdkProxyTier::WaitForProxy(const std::string& shm_name, int timeout_ms) {
     int rc = probe.Attach(shm_name);
     if (rc == 0) {
       auto* hdr = probe.Header();
+      if (hdr->version != kProxyVersion) {
+        UMBP_LOG_ERROR("SpdkProxyTier: protocol mismatch on SHM '%s' (have=%u want=%u)",
+                       shm_name.c_str(), hdr->version, kProxyVersion);
+        return false;
+      }
+      std::string layout_error;
+      if (!ProxyShmRegion::ValidateHeaderLayout(hdr, probe.Size(), &layout_error)) {
+        UMBP_LOG_ERROR("SpdkProxyTier: invalid proxy SHM layout on '%s': %s", shm_name.c_str(),
+                       layout_error.c_str());
+        return false;
+      }
+
       uint32_t st = hdr->state.load(std::memory_order_acquire);
       if (st == static_cast<uint32_t>(ProxyState::READY)) {
 #ifdef __linux__
-        uint32_t ppid = hdr->proxy_pid.load(std::memory_order_relaxed);
-        if (ppid > 0 && kill(static_cast<pid_t>(ppid), 0) != 0) {
+        uint32_t pid = hdr->proxy_pid.load(std::memory_order_relaxed);
+        if (pid > 0 && kill(static_cast<pid_t>(pid), 0) != 0) {
           probe.Detach();
-          std::this_thread::sleep_for(std::chrono::milliseconds(100));
-          auto elapsed = std::chrono::steady_clock::now() - start;
-          if (std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count() >=
-              timeout_ms) {
-            UMBP_LOG_ERROR("SpdkProxyTier: timed out — proxy pid %u is dead (stale SHM)", ppid);
-            return false;
-          }
-          continue;
-        }
+        } else
 #endif
-        return true;
-      }
-      if (st == static_cast<uint32_t>(ProxyState::ERROR)) {
+        {
+          uint64_t hb = hdr->proxy_heartbeat_ms.load(std::memory_order_acquire);
+          if (hb == 0 || (NowEpochMs() - hb) < kHeartbeatStaleMs) {
+            return true;
+          }
+        }
+      } else if (st == static_cast<uint32_t>(ProxyState::ERROR)) {
         UMBP_LOG_ERROR("SpdkProxyTier: proxy reported ERROR state");
         return false;
       }
@@ -206,7 +228,7 @@ bool SpdkProxyTier::IsProxyAlive() const {
   if (!shm_.IsValid()) return false;
   auto* hdr = shm_.Header();
   uint64_t hb = hdr->proxy_heartbeat_ms.load(std::memory_order_relaxed);
-  if (hb == 0) return true;  // Proxy hasn't started heartbeat yet
+  if (hb == 0) return true;
   uint64_t now = NowEpochMs();
   return (now - hb) < kHeartbeatStaleMs;
 }
@@ -216,18 +238,41 @@ bool SpdkProxyTier::IsProxyAlive() const {
 // ---------------------------------------------------------------------------
 uint32_t SpdkProxyTier::NextSeqId() const { return static_cast<uint32_t>(++seq_counter_); }
 
+void SpdkProxyTier::ReleaseChannel() const {
+  if (!shm_.IsValid()) return;
+  auto* ch = shm_.Channel(channel_id_);
+  if (!ch) return;
+
+  ch->connected.store(0, std::memory_order_release);
+  ch->client_pid = 0;
+  ch->tenant_id = 0;
+  ch->tenant_slot = 0;
+  ch->requested_quota_bytes = 0;
+  ch->session_id.store(0, std::memory_order_release);
+  ch->last_activity_ms.store(0, std::memory_order_release);
+  ch->head.store(0, std::memory_order_relaxed);
+  ch->tail.store(0, std::memory_order_relaxed);
+  for (uint32_t s = 0; s < kRingSize; ++s) {
+    ch->slots[s].state.store(static_cast<uint32_t>(SlotState::EMPTY), std::memory_order_relaxed);
+  }
+  ch->owner_pid.store(0, std::memory_order_release);
+}
+
 // ---------------------------------------------------------------------------
 // Single-op submit/wait (with heartbeat timeout)
 // ---------------------------------------------------------------------------
 ResultCode SpdkProxyTier::SubmitAndWait(RequestType type, const std::string& key,
                                         const void* write_data, size_t write_size, void* read_buf,
-                                        size_t read_buf_size, uint64_t* out_result_size,
-                                        uint64_t* out_result_aux) const {
+                                        size_t read_buf_size, uint64_t request_aux,
+                                        uint64_t* out_result_size, uint64_t* out_result_aux) const {
   if (!connected_) return ResultCode::ERROR;
+  if (type != RequestType::ATTACH_SESSION && session_id_ == 0) {
+    return ResultCode::PERMISSION_DENIED;
+  }
 
   std::lock_guard<std::mutex> lk(submit_mu_);
 
-  auto* ch = shm_.Channel(rank_id_);
+  auto* ch = shm_.Channel(channel_id_);
   uint32_t h = ch->head.load(std::memory_order_relaxed);
   uint32_t t = ch->tail.load(std::memory_order_acquire);
 
@@ -237,25 +282,23 @@ ResultCode SpdkProxyTier::SubmitAndWait(RequestType type, const std::string& key
   }
 
   auto& slot = ch->slots[h % kRingSize];
-
-  void* data_region = shm_.DataRegion(rank_id_);
+  void* data_region = shm_.DataRegion(channel_id_);
   uint64_t ring_base_for_slot = 0;
 
   if (write_data && write_size > 0) {
-    // Try ring buffer for single-op WRITE.
-    auto* wr_hdr = shm_.Header();
-    auto* wr_ctrl = GetCacheRingControl(shm_.Base(), wr_hdr);
-    if (wr_ctrl && type == RequestType::WRITE) {
-      uint64_t rbase = AllocRingContiguous(wr_ctrl, write_size);
+    auto* hdr = shm_.Header();
+    auto* ctrl = GetCacheRingControl(shm_.Base(), hdr);
+    if (ctrl && type == RequestType::PUT) {
+      uint64_t rbase = AllocRingContiguous(ctrl, write_size);
       if (rbase != UINT64_MAX) {
-        char* ring_data = GetCacheRingData(shm_.Base(), wr_hdr);
-        uint64_t cap = wr_ctrl->capacity;
+        char* ring_data = GetCacheRingData(shm_.Base(), hdr);
+        uint64_t cap = ctrl->capacity;
         std::memcpy(ring_data + static_cast<size_t>(rbase % cap), write_data, write_size);
         ring_base_for_slot = rbase;
       }
     }
     if (ring_base_for_slot == 0) {
-      size_t max_size = shm_.Header()->data_region_per_rank;
+      size_t max_size = shm_.Header()->data_region_per_channel;
       if (write_size > max_size) {
         UMBP_LOG_ERROR("SpdkProxyTier: data too large %zu > %zu", write_size, max_size);
         return ResultCode::ERROR;
@@ -267,18 +310,24 @@ ResultCode SpdkProxyTier::SubmitAndWait(RequestType type, const std::string& key
   slot.type = static_cast<uint32_t>(type);
   slot.seq_id = NextSeqId();
   slot.key_len = std::min(static_cast<uint32_t>(key.size()), kMaxKeyLen - 1);
-  std::memcpy(slot.key, key.data(), slot.key_len);
+  if (slot.key_len > 0) {
+    std::memcpy(slot.key, key.data(), slot.key_len);
+  }
   slot.key[slot.key_len] = '\0';
   slot.data_offset = 0;
   slot.data_size = write_size;
+  slot.request_aux = request_aux;
   slot.batch_count = 0;
   slot.flags = 0;
   slot.ring_data_base = ring_base_for_slot;
+  slot.result = static_cast<int32_t>(ResultCode::ERROR);
+  slot.result_size = 0;
+  slot.result_aux = 0;
 
+  ch->last_activity_ms.store(NowEpochMs(), std::memory_order_relaxed);
   slot.state.store(static_cast<uint32_t>(SlotState::PENDING), std::memory_order_release);
   ch->head.store((h + 1) % kRingSize, std::memory_order_release);
 
-  // Poll for completion with heartbeat safety
   int spin = 0;
   while (true) {
     uint32_t st = slot.state.load(std::memory_order_acquire);
@@ -297,13 +346,12 @@ ResultCode SpdkProxyTier::SubmitAndWait(RequestType type, const std::string& key
 
   if (read_buf && slot.result_size > 0 && rc == ResultCode::OK) {
     size_t copy_sz = std::min(static_cast<size_t>(slot.result_size), read_buf_size);
-    // Read from ring if daemon placed data there, else from data_region.
     if (slot.ring_data_base != 0) {
-      auto* rd_hdr = shm_.Header();
-      auto* rd_ctrl = GetCacheRingControl(shm_.Base(), rd_hdr);
-      if (rd_ctrl) {
-        const char* ring_data = GetCacheRingData(shm_.Base(), rd_hdr);
-        uint64_t cap = rd_ctrl->capacity;
+      auto* hdr = shm_.Header();
+      auto* ctrl = GetCacheRingControl(shm_.Base(), hdr);
+      if (ctrl) {
+        const char* ring_data = GetCacheRingData(shm_.Base(), hdr);
+        uint64_t cap = ctrl->capacity;
         std::memcpy(read_buf, ring_data + static_cast<size_t>(slot.ring_data_base % cap), copy_sz);
       } else {
         std::memcpy(read_buf, data_region, copy_sz);
@@ -326,13 +374,13 @@ std::vector<bool> SpdkProxyTier::SubmitBatch(RequestType type, const std::vector
                                              const std::vector<size_t>& sizes) const {
   const int count = static_cast<int>(keys.size());
   std::vector<bool> results(count, false);
-  if (!connected_ || count == 0) return results;
+  if (!connected_ || session_id_ == 0 || count == 0) return results;
 
   std::lock_guard<std::mutex> lk(submit_mu_);
 
   auto* hdr = shm_.Header();
-  void* data_region = shm_.DataRegion(rank_id_);
-  const size_t region_size = hdr->data_region_per_rank;
+  void* data_region = shm_.DataRegion(channel_id_);
+  const size_t region_size = hdr->data_region_per_channel;
 
   int base = 0;
   while (base < count) {
@@ -359,7 +407,6 @@ std::vector<bool> SpdkProxyTier::SubmitBatch(RequestType type, const std::vector
       continue;
     }
 
-    // Build BatchDescriptor metadata
     auto* desc = static_cast<BatchDescriptor*>(data_region);
     desc->count = sub_count;
     desc->total_data_size = total_data;
@@ -386,25 +433,21 @@ std::vector<bool> SpdkProxyTier::SubmitBatch(RequestType type, const std::vector
       data_cursor += aligned;
     }
 
-    // For BATCH_WRITE: try to allocate ring space before submitting
-    // the slot so that daemon sees ring_data_base on first access.
     char* write_target = data_base;
-    if (type == RequestType::BATCH_WRITE) {
-      auto* wr_hdr = shm_.Header();
-      auto* wr_ctrl = GetCacheRingControl(shm_.Base(), wr_hdr);
-      if (wr_ctrl) {
-        uint64_t rbase = AllocRingContiguous(wr_ctrl, total_data);
+    if (type == RequestType::BATCH_PUT) {
+      auto* ctrl = GetCacheRingControl(shm_.Base(), hdr);
+      if (ctrl) {
+        uint64_t rbase = AllocRingContiguous(ctrl, total_data);
         if (rbase != UINT64_MAX) {
-          char* ring_data = GetCacheRingData(shm_.Base(), wr_hdr);
-          uint64_t cap = wr_ctrl->capacity;
+          char* ring_data = GetCacheRingData(shm_.Base(), hdr);
+          uint64_t cap = ctrl->capacity;
           write_target = ring_data + static_cast<size_t>(rbase % cap);
           desc->ring_data_base = rbase;
         }
       }
     }
 
-    // Submit ring slot
-    auto* ch = shm_.Channel(rank_id_);
+    auto* ch = shm_.Channel(channel_id_);
     uint32_t h = ch->head.load(std::memory_order_relaxed);
 
     int ring_spin = 0;
@@ -422,13 +465,19 @@ std::vector<bool> SpdkProxyTier::SubmitBatch(RequestType type, const std::vector
     slot.key_len = 0;
     slot.data_offset = 0;
     slot.data_size = data_start + data_cursor;
+    slot.request_aux = 0;
     slot.batch_count = sub_count;
     slot.flags = 0;
+    slot.ring_data_base = 0;
+    slot.result = static_cast<int32_t>(ResultCode::ERROR);
+    slot.result_size = 0;
+    slot.result_aux = 0;
 
+    ch->last_activity_ms.store(NowEpochMs(), std::memory_order_relaxed);
     slot.state.store(static_cast<uint32_t>(SlotState::PENDING), std::memory_order_release);
     ch->head.store((h + 1) % kRingSize, std::memory_order_release);
 
-    if (type == RequestType::BATCH_WRITE) {
+    if (type == RequestType::BATCH_PUT) {
       constexpr size_t kCopyChunk = 2ULL * 1024 * 1024;
       for (int i = 0; i < sub_count; ++i) {
         int gi = base + i;
@@ -449,7 +498,6 @@ std::vector<bool> SpdkProxyTier::SubmitBatch(RequestType type, const std::vector
       }
       desc->bytes_ready.store(desc->total_data_size, std::memory_order_release);
 
-      // Wait for proxy to finish
       int spin = 0;
       while (true) {
         uint32_t st = slot.state.load(std::memory_order_acquire);
@@ -465,12 +513,8 @@ std::vector<bool> SpdkProxyTier::SubmitBatch(RequestType type, const std::vector
       for (int i = 0; i < sub_count; ++i) results[base + i] = (desc->entries[i].result != 0);
 
     } else {
-      // STREAMING READ: copy data in 2MB chunks using bytes_done.
-      // read_base is resolved lazily after the first bytes_done
-      // acquire to avoid racing with daemon's ring_data_base write.
       constexpr size_t kReadChunk = 2ULL * 1024 * 1024;
       char* read_base = nullptr;
-
       int current_item = 0;
       size_t item_copied = 0;
       int spin = 0;
@@ -491,7 +535,6 @@ std::vector<bool> SpdkProxyTier::SubmitBatch(RequestType type, const std::vector
             if (bd >= need) {
               if (!read_base) {
                 if (desc->ring_data_base != 0) {
-                  auto* hdr = shm_.Header();
                   auto* ctrl = GetCacheRingControl(shm_.Base(), hdr);
                   if (ctrl) {
                     char* rd = GetCacheRingData(shm_.Base(), hdr);
@@ -524,7 +567,6 @@ std::vector<bool> SpdkProxyTier::SubmitBatch(RequestType type, const std::vector
         item_copied = 0;
       }
 
-      // Wait for overall slot completion
       spin = 0;
       while (true) {
         uint32_t st = slot.state.load(std::memory_order_acquire);
@@ -537,7 +579,6 @@ std::vector<bool> SpdkProxyTier::SubmitBatch(RequestType type, const std::vector
         }
       }
 
-      // Authoritative results from proxy
       for (int i = 0; i < sub_count; ++i) {
         int gi = base + i;
         results[gi] = (desc->entries[i].result != 0);
@@ -555,7 +596,7 @@ std::vector<bool> SpdkProxyTier::SubmitBatch(RequestType type, const std::vector
 // TierBackend interface
 // ---------------------------------------------------------------------------
 bool SpdkProxyTier::Write(const std::string& key, const void* data, size_t size) {
-  auto rc = SubmitAndWait(RequestType::WRITE, key, data, size, nullptr, 0);
+  auto rc = SubmitAndWait(RequestType::PUT, key, data, size, nullptr, 0);
   return rc == ResultCode::OK;
 }
 
@@ -563,8 +604,8 @@ bool SpdkProxyTier::ReadIntoPtr(const std::string& key, uintptr_t dst_ptr, size_
   if (TryShmCacheReadOne(key, dst_ptr, size)) return true;
 
   uint64_t actual_size = 0;
-  auto rc = SubmitAndWait(RequestType::READ, key, nullptr, 0, reinterpret_cast<void*>(dst_ptr),
-                          size, &actual_size);
+  auto rc = SubmitAndWait(RequestType::GET, key, nullptr, 0, reinterpret_cast<void*>(dst_ptr), size,
+                          0, &actual_size);
   return rc == ResultCode::OK;
 }
 
@@ -574,59 +615,61 @@ bool SpdkProxyTier::Exists(const std::string& key) const {
 }
 
 bool SpdkProxyTier::Evict(const std::string& key) {
-  auto rc = SubmitAndWait(RequestType::EVICT, key, nullptr, 0, nullptr, 0);
+  auto rc = SubmitAndWait(RequestType::REMOVE, key, nullptr, 0, nullptr, 0);
   return rc == ResultCode::OK;
 }
 
 std::pair<size_t, size_t> SpdkProxyTier::Capacity() const {
   uint64_t result_size = 0, result_aux = 0;
-  auto rc =
-      SubmitAndWait(RequestType::CAPACITY, "", nullptr, 0, nullptr, 0, &result_size, &result_aux);
+  auto rc = SubmitAndWait(RequestType::CAPACITY_TENANT, "", nullptr, 0, nullptr, 0, 0, &result_size,
+                          &result_aux);
   if (rc != ResultCode::OK) return {0, 0};
   return {static_cast<size_t>(result_size), static_cast<size_t>(result_aux)};
 }
 
-void SpdkProxyTier::Clear() { SubmitAndWait(RequestType::CLEAR, "", nullptr, 0, nullptr, 0); }
+void SpdkProxyTier::Clear() {
+  (void)SubmitAndWait(RequestType::CLEAR_TENANT, "", nullptr, 0, nullptr, 0);
+}
 
 bool SpdkProxyTier::Flush() {
-  auto rc = SubmitAndWait(RequestType::FLUSH, "", nullptr, 0, nullptr, 0);
+  auto rc = SubmitAndWait(RequestType::FLUSH_TENANT, "", nullptr, 0, nullptr, 0);
   return rc == ResultCode::OK;
 }
 
 // ---------------------------------------------------------------------------
-// Per-item ring cache read — ring buffer with seqlock + liveness validation.
-//
-// Protocol:
-//   1. Read index entry gen (must be even & non-zero).
-//   2. Match key and size.
-//   3. Validate ring_offset hasn't been overwritten (write_pos - offset <= cap).
-//   4. memcpy from ring (handle wrap-around).
-//   5. Re-check gen and write_pos for consistency.
+// Per-item ring cache read — validate tenant, key, and tenant cache epoch.
 // ---------------------------------------------------------------------------
 bool SpdkProxyTier::TryShmCacheReadOne(const std::string& key, uintptr_t dst, size_t size) const {
-  using namespace umbp::proxy;
   if (!connected_ || cold_read_) return false;
 
   auto* hdr = shm_.Header();
-  if (hdr->cache_index_slots == 0) return false;
+  if (hdr->cache_index_slots == 0 || tenant_slot_ >= hdr->max_tenants) return false;
 
   auto* ctrl = GetCacheRingControl(shm_.Base(), hdr);
   if (!ctrl) return false;
 
+  const auto* tenant = shm_.Tenant(tenant_slot_);
+  if (!tenant) return false;
+  if ((tenant->flags.load(std::memory_order_acquire) & kTenantFlagActive) == 0) return false;
+  if (tenant->tenant_id != tenant_id_) return false;
+  uint64_t cache_epoch = tenant->cache_epoch.load(std::memory_order_acquire);
+  if (cache_epoch == 0) return false;
+
   auto* index = GetCacheIndex(shm_.Base(), hdr);
-  uint32_t idx =
-      CacheIndexHash(key.data(), static_cast<uint32_t>(key.size()), hdr->cache_index_slots);
+  uint32_t idx = CacheIndexHash(key.data(), static_cast<uint32_t>(key.size()), tenant_id_,
+                                hdr->cache_index_slots);
   auto& entry = index[idx];
 
   uint64_t g1 = entry.gen.load(std::memory_order_acquire);
   if (g1 == 0 || (g1 & 1)) return false;
 
-  if (entry.key_len != key.size() || std::memcmp(entry.key, key.data(), key.size()) != 0 ||
-      entry.data_size != size)
+  if (entry.tenant_id != tenant_id_ || entry.key_len != key.size() ||
+      entry.tenant_cache_epoch != cache_epoch ||
+      std::memcmp(entry.key, key.data(), key.size()) != 0 || entry.data_size != size) {
     return false;
+  }
 
   uint64_t ring_off = entry.ring_offset;
-
   uint64_t wp = ctrl->write_pos.load(std::memory_order_acquire);
   if (wp - ring_off > ctrl->capacity) return false;
 
@@ -661,9 +704,6 @@ TierCapabilities SpdkProxyTier::Capabilities() const {
           /*.batch_read=*/true};
 }
 
-// ---------------------------------------------------------------------------
-// WriteBatch (bool) — called by CopyToSSDBatch; delegates to BatchWrite.
-// ---------------------------------------------------------------------------
 bool SpdkProxyTier::WriteBatch(const std::vector<std::string>& keys,
                                const std::vector<const void*>& data_ptrs,
                                const std::vector<size_t>& sizes) {
@@ -674,45 +714,35 @@ bool SpdkProxyTier::WriteBatch(const std::vector<std::string>& keys,
   return true;
 }
 
-// ---------------------------------------------------------------------------
-// ReadBatchIntoPtr (vector<bool>) — called by CopyToSSDBatch read path.
-// ---------------------------------------------------------------------------
 std::vector<bool> SpdkProxyTier::ReadBatchIntoPtr(const std::vector<std::string>& keys,
                                                   const std::vector<uintptr_t>& dst_ptrs,
                                                   const std::vector<size_t>& sizes) {
   return BatchReadIntoPtr(keys, dst_ptrs, sizes);
 }
 
-// ---------------------------------------------------------------------------
-// BatchWrite — write-through to daemon via ring buffer.
-// ---------------------------------------------------------------------------
 std::vector<bool> SpdkProxyTier::BatchWrite(const std::vector<std::string>& keys,
                                             const std::vector<const void*>& data_ptrs,
                                             const std::vector<size_t>& sizes) {
-  return SubmitBatch(RequestType::BATCH_WRITE, keys, data_ptrs, {}, sizes);
+  return SubmitBatch(RequestType::BATCH_PUT, keys, data_ptrs, {}, sizes);
 }
 
-// ---------------------------------------------------------------------------
-// BatchReadIntoPtr — per-item: ring cache → daemon (NVMe).
-// ---------------------------------------------------------------------------
 std::vector<bool> SpdkProxyTier::BatchReadIntoPtr(const std::vector<std::string>& keys,
                                                   const std::vector<uintptr_t>& dst_ptrs,
                                                   const std::vector<size_t>& sizes) {
   const int count = static_cast<int>(keys.size());
   std::vector<bool> results(count, false);
 
-  // Phase 1: ring cache (TryShmCacheReadOne returns false in cold-read mode)
   std::vector<int> misses;
   misses.reserve(count);
   for (int i = 0; i < count; ++i) {
-    if (TryShmCacheReadOne(keys[i], dst_ptrs[i], sizes[i]))
+    if (TryShmCacheReadOne(keys[i], dst_ptrs[i], sizes[i])) {
       results[i] = true;
-    else
+    } else {
       misses.push_back(i);
+    }
   }
   if (misses.empty()) return results;
 
-  // Phase 2: daemon (NVMe)
   std::vector<std::string> m_keys(misses.size());
   std::vector<uintptr_t> m_dst(misses.size());
   std::vector<size_t> m_sizes(misses.size());
@@ -722,7 +752,7 @@ std::vector<bool> SpdkProxyTier::BatchReadIntoPtr(const std::vector<std::string>
     m_dst[j] = dst_ptrs[i];
     m_sizes[j] = sizes[i];
   }
-  auto m_results = SubmitBatch(RequestType::BATCH_READ, m_keys, {}, m_dst, m_sizes);
+  auto m_results = SubmitBatch(RequestType::BATCH_GET, m_keys, {}, m_dst, m_sizes);
   for (size_t j = 0; j < misses.size(); ++j) {
     int i = misses[j];
     results[i] = m_results[j];
@@ -734,7 +764,8 @@ std::string SpdkProxyTier::GetLRUKey() const {
   if (!connected_) return "";
   uint64_t result_size = 0;
   char buf[kMaxKeyLen] = {};
-  auto rc = SubmitAndWait(RequestType::GET_LRU_KEY, "", nullptr, 0, buf, sizeof(buf), &result_size);
+  auto rc =
+      SubmitAndWait(RequestType::GET_LRU_KEY, "", nullptr, 0, buf, sizeof(buf), 0, &result_size);
   if (rc != ResultCode::OK || result_size == 0) return "";
   return std::string(buf, std::min(static_cast<size_t>(result_size), sizeof(buf) - 1));
 }

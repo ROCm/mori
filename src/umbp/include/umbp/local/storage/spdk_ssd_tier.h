@@ -19,8 +19,6 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-// Copyright © Advanced Micro Devices, Inc. All rights reserved.
-// MIT License
 //
 // SpdkSsdTier: SPDK-based SSD tier with deep-queue NVMe pipeline.
 //
@@ -31,6 +29,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <list>
@@ -48,10 +47,34 @@
 
 class SpdkSsdTier : public TierBackend {
  public:
+  struct Stats {
+    uint64_t hit_count = 0;
+    uint64_t miss_count = 0;
+    uint64_t evicted_bytes = 0;
+  };
+
+  struct DmaPool {
+    ~DmaPool();
+
+    std::mutex mutex;
+    void** bufs = nullptr;
+    size_t buf_size = 0;
+    int count = 0;
+  };
+  using SharedDmaPool = std::shared_ptr<DmaPool>;
+
   explicit SpdkSsdTier(const UMBPConfig& config);
+  SpdkSsdTier(const UMBPConfig& config, uint64_t base_offset, size_t capacity_bytes,
+              SharedDmaPool shared_dma_pool = nullptr);
   ~SpdkSsdTier() override;
 
   bool IsValid() const { return initialized_; }
+  uint64_t base_offset() const { return base_offset_; }
+
+  static SharedDmaPool CreateSharedDmaPool(size_t buf_size, int count);
+  Stats GetStats() const;
+  void RecordHit(uint64_t count = 1);
+  void RecordMiss(uint64_t count = 1);
 
   bool Write(const std::string& key, const void* data, size_t size) override;
   bool ReadIntoPtr(const std::string& key, uintptr_t dst_ptr, size_t size) override;
@@ -151,8 +174,7 @@ class SpdkSsdTier : public TierBackend {
     return (size + block_size_ - 1) & ~(static_cast<size_t>(block_size_) - 1);
   }
 
-  void AllocDmaRing(size_t buf_size);
-  void FreeDmaRing();
+  SharedDmaPool EnsureDmaPool();
 
   // -- Write helpers (common Phase 1 / Phase 3 for all BatchWrite*) --------
   struct PendingWrite {
@@ -189,6 +211,7 @@ class SpdkSsdTier : public TierBackend {
   bool initialized_ = false;
   std::shared_ptr<umbp::offset_allocator::OffsetAllocator> allocator_;
   uint32_t block_size_ = 4096;
+  uint64_t base_offset_ = 0;
   size_t capacity_ = 0;
 
   std::array<MetadataShard, kNumShards> shards_;
@@ -198,8 +221,8 @@ class SpdkSsdTier : public TierBackend {
   static constexpr int kMaxQueueDepth = 128;
   int num_io_workers_ = 1;
 
-  std::mutex dma_ring_mu_;
-  void** dma_ring_ = nullptr;
-  size_t dma_ring_buf_size_ = 0;
-  int dma_ring_count_ = 0;
+  SharedDmaPool dma_pool_;
+  std::atomic<uint64_t> hit_count_{0};
+  std::atomic<uint64_t> miss_count_{0};
+  std::atomic<uint64_t> evicted_bytes_{0};
 };

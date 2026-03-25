@@ -19,8 +19,6 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-// Copyright © Advanced Micro Devices, Inc. All rights reserved.
-// MIT License
 //
 // test_umbp_e2e: End-to-end integration tests for UMBP.
 // Runs POSIX tests always. SPDK tests run only if UMBP_SPDK_NVME_PCI is set.
@@ -99,6 +97,7 @@ static UMBPConfig MakePosixConfig(size_t dram_mb = 64, size_t ssd_mb = 256) {
   UMBPConfig cfg;
   cfg.dram.capacity_bytes = dram_mb * 1024 * 1024;
   cfg.ssd.capacity_bytes = ssd_mb * 1024 * 1024;
+  cfg.ssd.io.backend = UMBPIoBackend::PThread;
   cfg.ssd_backend = "posix";
   cfg.ssd.storage_dir = "/tmp/umbp_e2e_test_" + std::to_string(getpid());
   cfg.role = UMBPRole::Standalone;
@@ -216,14 +215,14 @@ static bool test_posix_batch_write_read() {
   const int N = 100;
   const size_t sz = 8192;
   std::vector<std::string> keys(N);
-  std::vector<std::vector<char>> datas(N);
+  std::vector<std::vector<char>> bufs(N);
   std::vector<uintptr_t> ptrs(N);
   std::vector<size_t> sizes(N, sz);
 
   for (int i = 0; i < N; ++i) {
     keys[i] = "posix_batch_" + std::to_string(i);
-    datas[i].resize(sz, static_cast<char>(i & 0xFF));
-    ptrs[i] = reinterpret_cast<uintptr_t>(datas[i].data());
+    bufs[i].resize(sz, static_cast<char>(i & 0xFF));
+    ptrs[i] = reinterpret_cast<uintptr_t>(bufs[i].data());
   }
 
   auto wr = client.BatchPutFromPtr(keys, ptrs, sizes);
@@ -240,7 +239,7 @@ static bool test_posix_batch_write_read() {
   for (auto b : rr) read_ok += b;
   CHECK(read_ok == N);
 
-  for (int i = 0; i < N; ++i) CHECK(read_bufs[i] == datas[i]);
+  for (int i = 0; i < N; ++i) CHECK(read_bufs[i] == bufs[i]);
 
   client.Clear();
   return true;
@@ -566,8 +565,10 @@ static bool test_proxy_auto_fork_leader_follower() {
 }
 
 static bool test_proxy_daemon_cleanup_after_leader_exit() {
-  // Fork a leader that creates proxy, then exits immediately.
-  // Daemon should self-terminate (orphan timeout or spawner-death signal).
+  // Service-mode proxy should survive the first client exiting, remain
+  // usable by a later client, then idle-exit after the last client leaves.
+  setenv("UMBP_SPDK_PROXY_IDLE_EXIT_TIMEOUT_MS", "2000", 1);
+
   pid_t leader = fork();
   if (leader == 0) {
     unsetenv("UMBP_ROLE");
@@ -579,7 +580,10 @@ static bool test_proxy_daemon_cleanup_after_leader_exit() {
       auto cfg = UMBPConfig::FromEnvironment();
       cfg.dram.capacity_bytes = 64ULL * 1024 * 1024;
       UMBPClient client(cfg);
-      // client destructor will trigger proxy shutdown
+      auto* ssd = client.Storage().GetTier(StorageTier::LOCAL_SSD);
+      if (!ssd) _exit(1);
+      std::vector<char> data(4096, 'Q');
+      if (!ssd->Write("proxy_survive_key", data.data(), data.size())) _exit(2);
     }
     _exit(0);
   }
@@ -588,14 +592,38 @@ static bool test_proxy_daemon_cleanup_after_leader_exit() {
   waitpid(leader, &status, 0);
   CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 
-  // Wait a bit and verify proxy SHM is gone or daemon exited
-  std::this_thread::sleep_for(std::chrono::seconds(3));
+  pid_t follower = fork();
+  if (follower == 0) {
+    unsetenv("UMBP_ROLE");
+    unsetenv("UMBP_SPDK_PROXY_RANK");
+    setenv("LOCAL_RANK", "1", 1);
+    setenv("UMBP_SSD_BACKEND", "spdk", 1);
+
+    auto cfg = UMBPConfig::FromEnvironment();
+    cfg.dram.capacity_bytes = 64ULL * 1024 * 1024;
+    UMBPClient client(cfg);
+    auto* ssd = client.Storage().GetTier(StorageTier::LOCAL_SSD);
+    if (!ssd) _exit(3);
+
+    std::vector<char> buf(4096, 0);
+    if (!ssd->ReadIntoPtr("proxy_survive_key", reinterpret_cast<uintptr_t>(buf.data()),
+                          buf.size())) {
+      _exit(4);
+    }
+    std::vector<char> expected(4096, 'Q');
+    if (buf != expected) _exit(5);
+    _exit(0);
+  }
+
+  waitpid(follower, &status, 0);
+  CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+  // Wait for idle-exit after the last client disconnects.
+  std::this_thread::sleep_for(std::chrono::seconds(4));
   int probe = umbp::proxy::ProxyShmRegion::ProbeExisting(umbp::proxy::kDefaultShmName);
-  // Either SHM is gone (probe==0) or daemon is shutting down
-  // We don't require immediate cleanup, just that it doesn't hang forever
   CHECK(probe <= 0);
 
-  // Clean up any residual SHM
+  unsetenv("UMBP_SPDK_PROXY_IDLE_EXIT_TIMEOUT_MS");
   umbp::proxy::ProxyShmRegion::CleanupStale(umbp::proxy::kDefaultShmName);
   return true;
 }
@@ -699,11 +727,11 @@ static bool test_proxy_batch_write_read() {
     std::vector<std::string> keys(N);
     std::vector<const void*> cptrs(N);
     std::vector<size_t> sizes(N, sz);
-    std::vector<std::vector<char>> datas(N);
+    std::vector<std::vector<char>> bufs(N);
     for (int i = 0; i < N; ++i) {
       keys[i] = "proxy_batch_" + std::to_string(i);
-      datas[i].resize(sz, static_cast<char>(i & 0xFF));
-      cptrs[i] = datas[i].data();
+      bufs[i].resize(sz, static_cast<char>(i & 0xFF));
+      cptrs[i] = bufs[i].data();
     }
 
     auto wr = ssd->BatchWrite(keys, cptrs, sizes);
@@ -721,7 +749,7 @@ static bool test_proxy_batch_write_read() {
     if (rok != N) _exit(3);
 
     for (int i = 0; i < N; ++i) {
-      if (rbufs[i] != datas[i]) _exit(4);
+      if (rbufs[i] != bufs[i]) _exit(4);
     }
     _exit(0);
   }

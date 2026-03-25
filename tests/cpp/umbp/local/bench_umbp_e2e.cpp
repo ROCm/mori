@@ -19,8 +19,6 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-// Copyright © Advanced Micro Devices, Inc. All rights reserved.
-// MIT License
 //
 // umbp_bench: End-to-end benchmark using UMBPClient (full stack).
 //
@@ -112,10 +110,10 @@ static BenchResult RunBatch(UMBPClient& client, int rank_id, const std::string& 
   uint32_t seed = 0;
   for (char c : session) seed = seed * 31 + static_cast<uint8_t>(c);
 
-  std::vector<std::vector<char>> datas(count);
+  std::vector<std::vector<char>> bufs(count);
   std::vector<size_t> sizes(count, value_size);
   for (int i = 0; i < count; ++i)
-    datas[i].resize(value_size, static_cast<char>((seed + i + 1) & 0xFF));
+    bufs[i].resize(value_size, static_cast<char>((seed + i + 1) & 0xFF));
 
   double total_bytes = static_cast<double>(value_size) * count;
 
@@ -123,7 +121,7 @@ static BenchResult RunBatch(UMBPClient& client, int rank_id, const std::string& 
   if (!ssd) return {value_size, count, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 
   std::vector<const void*> cptrs(count);
-  for (int i = 0; i < count; ++i) cptrs[i] = datas[i].data();
+  for (int i = 0; i < count; ++i) cptrs[i] = bufs[i].data();
 
   double best_write = 0;
   for (int iter = 0; iter < iterations; ++iter) {
@@ -238,13 +236,13 @@ static BenchResult RunBatchPhased(UMBPClient& client, int rank_id, size_t value_
 
   // === WRITE PHASE (Leader only, others wait) ===
   if (rank_id == 0) {
-    std::vector<std::vector<char>> datas(count);
+    std::vector<std::vector<char>> bufs(count);
     std::vector<size_t> sizes(count, value_size);
     for (int i = 0; i < count; ++i)
-      datas[i].resize(value_size, static_cast<char>((seed + i + 1) & 0xFF));
+      bufs[i].resize(value_size, static_cast<char>((seed + i + 1) & 0xFF));
 
     std::vector<const void*> cptrs(count);
-    for (int i = 0; i < count; ++i) cptrs[i] = datas[i].data();
+    for (int i = 0; i < count; ++i) cptrs[i] = bufs[i].data();
 
     for (int iter = 0; iter < iterations; ++iter) {
       std::vector<std::string> wkeys(count);

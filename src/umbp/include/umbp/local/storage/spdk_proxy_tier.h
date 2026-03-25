@@ -19,8 +19,6 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-// Copyright © Advanced Micro Devices, Inc. All rights reserved.
-// MIT License
 //
 // SpdkProxyTier: TierBackend that communicates with an external spdk_proxy
 // daemon via POSIX shared memory. Does NOT depend on SPDK headers/libraries.
@@ -45,7 +43,9 @@ class SpdkProxyTier : public TierBackend {
   ~SpdkProxyTier() override;
 
   bool IsValid() const { return connected_; }
-  uint32_t rank_id() const { return rank_id_; }
+  uint32_t channel_id() const { return channel_id_; }
+  uint32_t rank_id() const { return channel_id_; }  // legacy alias
+  uint32_t tenant_id() const { return tenant_id_; }
 
   bool Write(const std::string& key, const void* data, size_t size) override;
   bool ReadIntoPtr(const std::string& key, uintptr_t dst_ptr, size_t size) override;
@@ -81,7 +81,8 @@ class SpdkProxyTier : public TierBackend {
  private:
   umbp::proxy::ResultCode SubmitAndWait(umbp::proxy::RequestType type, const std::string& key,
                                         const void* write_data, size_t write_size, void* read_buf,
-                                        size_t read_buf_size, uint64_t* out_result_size = nullptr,
+                                        size_t read_buf_size, uint64_t request_aux = 0,
+                                        uint64_t* out_result_size = nullptr,
                                         uint64_t* out_result_aux = nullptr) const;
 
   std::vector<bool> SubmitBatch(umbp::proxy::RequestType type, const std::vector<std::string>& keys,
@@ -91,13 +92,17 @@ class SpdkProxyTier : public TierBackend {
 
   uint32_t NextSeqId() const;
   bool IsProxyAlive() const;
+  void ReleaseChannel() const;
 
   // Per-item ring cache read — seqlock, returns true on hit.
   bool TryShmCacheReadOne(const std::string& key, uintptr_t dst, size_t size) const;
 
   bool connected_ = false;
   bool cold_read_ = false;  // SetColdRead(true): skip ring cache, always read from NVMe
-  uint32_t rank_id_ = 0;
+  uint32_t channel_id_ = 0;
+  uint32_t tenant_id_ = 0;
+  uint32_t tenant_slot_ = 0;
+  uint64_t session_id_ = 0;
   mutable umbp::proxy::ProxyShmRegion shm_;
   mutable std::mutex submit_mu_;
   mutable uint64_t seq_counter_ = 0;

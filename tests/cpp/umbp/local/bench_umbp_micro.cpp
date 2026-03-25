@@ -31,6 +31,7 @@
 //     --value-size N                   Value size in bytes
 //     --batch-size N                   Batch size
 //     --iters N                        Measurement iterations (default: 10)
+//     --ssd-backend <posix|spdk>       SSD backend (default: posix)
 //     --filter SUBSTRING               Run only matching scenarios
 //     --dir PATH                       Temp directory path
 //     -h, --help                       Help
@@ -67,6 +68,7 @@
 #include "umbp/local/storage/io/storage_io_driver.h"
 #include "umbp/local/storage/local_storage_manager.h"
 #include "umbp/local/storage/segment/segment_format.h"
+#include "umbp/local/storage/spdk_proxy_tier.h"
 #include "umbp/local/storage/ssd_tier.h"
 #include "umbp/local/umbp_client.h"
 
@@ -95,6 +97,8 @@ struct BenchConfig {
   UMBPDurabilityMode ssd_durability_mode = UMBPDurabilityMode::Relaxed;
 
   std::vector<int> thread_counts = {1, 2, 4, 8};
+
+  std::string ssd_backend = "posix";  // "posix" or "spdk"
 
   std::string base_dir = "/tmp/umbp_bench";
   std::string filter;
@@ -398,9 +402,12 @@ static std::string BackendVariantLabel(UMBPIoBackend backend, size_t queue_depth
   return "backend=" + std::string(spec.display_name) + "/qd=" + std::to_string(queue_depth);
 }
 
+static bool IsSpdk(const BenchConfig& cfg) { return cfg.ssd_backend == "spdk"; }
+
 static UMBPConfig MakeBaseSsdConfig(const BenchConfig& cfg) {
-  UMBPConfig ucfg;
+  UMBPConfig ucfg = IsSpdk(cfg) ? UMBPConfig::FromEnvironment() : UMBPConfig();
   ucfg.ssd.enabled = true;
+  ucfg.ssd_backend = cfg.ssd_backend;
   ucfg.ssd.capacity_bytes = cfg.ssd_capacity;
   ucfg.ssd.io.backend = cfg.ssd_io_backend;
   ucfg.ssd.io.queue_depth = cfg.ssd_io_queue_depth;
@@ -415,6 +422,7 @@ static UMBPConfig MakeBaseSsdConfig(const BenchConfig& cfg, UMBPIoBackend backen
   ucfg.ssd.io.backend = backend;
   ucfg.ssd.io.queue_depth = queue_depth;
   ucfg.ssd.durability.mode = durability;
+  ucfg.ssd_backend = cfg.ssd_backend;
   return ucfg;
 }
 
@@ -426,7 +434,7 @@ static UMBPConfig MakeStandaloneClientConfig(const BenchConfig& cfg, const std::
   ucfg.ssd.enabled = true;
   ucfg.ssd.storage_dir = storage_dir;
   if (ssd_capacity_override > 0) ucfg.ssd.capacity_bytes = ssd_capacity_override;
-  ucfg.role = UMBPRole::Standalone;
+  ucfg.role = IsSpdk(cfg) ? UMBPRole::SharedSSDLeader : UMBPRole::Standalone;
   ucfg.copy_pipeline.async_enabled = false;
   ucfg.eviction.auto_promote_on_read = false;
   return ucfg;
@@ -847,6 +855,27 @@ struct ScopedTempDir {
   }
   ScopedTempDir(const ScopedTempDir&) = delete;
   ScopedTempDir& operator=(const ScopedTempDir&) = delete;
+};
+
+// ---------------------------------------------------------------------------
+// TierScope — RAII for SSDTier (POSIX) or external TierBackend* (SPDK)
+// ---------------------------------------------------------------------------
+struct TierScope {
+  std::unique_ptr<ScopedTempDir> tmp;
+  std::unique_ptr<SSDTier> local_tier;
+  TierBackend* tier;
+
+  // POSIX: create local SSDTier
+  TierScope(const std::string& dir, size_t capacity, const UMBPConfig& ucfg)
+      : tmp(std::make_unique<ScopedTempDir>(dir)),
+        local_tier(std::make_unique<SSDTier>(tmp->path, capacity, ucfg)),
+        tier(local_tier.get()) {}
+
+  // SPDK: borrow external tier
+  explicit TierScope(TierBackend* ext) : tier(ext) {}
+
+  TierScope(const TierScope&) = delete;
+  TierScope& operator=(const TierScope&) = delete;
 };
 
 // ---------------------------------------------------------------------------
@@ -1398,9 +1427,9 @@ static void BenchDRAMTier(const BenchConfig& cfg, const std::vector<std::string>
 // ---------------------------------------------------------------------------
 static void BenchSSDTier(const BenchConfig& cfg, const std::vector<std::string>& keys,
                          const std::vector<std::vector<char>>& values,
-                         std::vector<BenchResult>& results) {
+                         std::vector<BenchResult>& results, TierBackend* ext_tier = nullptr) {
   if (!ShouldRun(cfg, "SSD Tier")) return;
-  if (cfg.value_size > cfg.ssd_capacity) {
+  if (!ext_tier && cfg.value_size > cfg.ssd_capacity) {
     PrintSkipMessage("SSD Tier",
                      "value_size exceeds ssd_capacity; a single payload cannot fit in SSD.");
     return;
@@ -1412,8 +1441,9 @@ static void BenchSSDTier(const BenchConfig& cfg, const std::vector<std::string>&
 
   // Write
   {
-    ScopedTempDir tmp(cfg.base_dir + "/ssd_tier_write");
-    SSDTier tier(tmp.path, cfg.ssd_capacity, ucfg);
+    auto ts = ext_tier ? TierScope(ext_tier)
+                       : TierScope(cfg.base_dir + "/ssd_tier_write", cfg.ssd_capacity, ucfg);
+    TierBackend& tier = *ts.tier;
 
     // Warmup
     for (size_t w = 0; w < cfg.warmup_iters; ++w) {
@@ -1442,10 +1472,11 @@ static void BenchSSDTier(const BenchConfig& cfg, const std::vector<std::string>&
     RecordResult("SSD Tier Write", "op=single", tally, WallSeconds(run_start, run_end), results);
   }
 
-  // WriteBatch
+  // BatchWrite
   {
-    ScopedTempDir tmp(cfg.base_dir + "/ssd_tier_write_batch");
-    SSDTier tier(tmp.path, cfg.ssd_capacity, ucfg);
+    auto ts = ext_tier ? TierScope(ext_tier)
+                       : TierScope(cfg.base_dir + "/ssd_tier_write_batch", cfg.ssd_capacity, ucfg);
+    TierBackend& tier = *ts.tier;
 
     auto wdescs = BuildWriteBatches(keys, values, cfg.batch_size);
     std::string batch_variant = JoinVariant(
@@ -1453,7 +1484,7 @@ static void BenchSSDTier(const BenchConfig& cfg, const std::vector<std::string>&
 
     for (size_t w = 0; w < cfg.warmup_iters; ++w) {
       tier.Clear();
-      for (const auto& d : wdescs) tier.WriteBatch(d.keys, d.data_ptrs, d.sizes);
+      for (const auto& d : wdescs) tier.BatchWrite(d.keys, d.data_ptrs, d.sizes);
     }
     tier.Clear();
 
@@ -1465,9 +1496,9 @@ static void BenchSSDTier(const BenchConfig& cfg, const std::vector<std::string>&
       tier.Clear();
       for (const auto& d : wdescs) {
         auto t0 = Clock::now();
-        bool ok = tier.WriteBatch(d.keys, d.data_ptrs, d.sizes);
+        auto write_results = tier.BatchWrite(d.keys, d.data_ptrs, d.sizes);
         auto t1 = Clock::now();
-        size_t wrote = ok ? d.keys.size() : 0;
+        size_t wrote = bench::CountTrue(write_results);
         tally.AddSample(d.keys.size(), wrote, d.keys.size() * cfg.value_size,
                         wrote * cfg.value_size,
                         std::chrono::duration<double, std::micro>(t1 - t0).count());
@@ -1481,8 +1512,9 @@ static void BenchSSDTier(const BenchConfig& cfg, const std::vector<std::string>&
 
   // Read
   {
-    ScopedTempDir tmp(cfg.base_dir + "/ssd_tier_read");
-    SSDTier tier(tmp.path, cfg.ssd_capacity, ucfg);
+    auto ts = ext_tier ? TierScope(ext_tier)
+                       : TierScope(cfg.base_dir + "/ssd_tier_read", cfg.ssd_capacity, ucfg);
+    TierBackend& tier = *ts.tier;
 
     // Pre-fill
     size_t resident_keys = 0;
@@ -1518,10 +1550,11 @@ static void BenchSSDTier(const BenchConfig& cfg, const std::vector<std::string>&
     RecordResult("SSD Tier Read", read_variant, tally, WallSeconds(run_start, run_end), results);
   }
 
-  // ReadBatch
+  // BatchReadIntoPtr
   {
-    ScopedTempDir tmp(cfg.base_dir + "/ssd_tier_read_batch");
-    SSDTier tier(tmp.path, cfg.ssd_capacity, ucfg);
+    auto ts = ext_tier ? TierScope(ext_tier)
+                       : TierScope(cfg.base_dir + "/ssd_tier_read_batch", cfg.ssd_capacity, ucfg);
+    TierBackend& tier = *ts.tier;
 
     // Pre-fill
     size_t resident_keys = 0;
@@ -1541,7 +1574,7 @@ static void BenchSSDTier(const BenchConfig& cfg, const std::vector<std::string>&
     auto rdescs = BuildReadBatches(keys, ptrs, sizes, cfg.batch_size);
 
     for (size_t w = 0; w < cfg.warmup_iters; ++w) {
-      for (const auto& d : rdescs) tier.ReadBatchIntoPtr(d.keys, d.dst_ptrs, d.sizes);
+      for (const auto& d : rdescs) tier.BatchReadIntoPtr(d.keys, d.dst_ptrs, d.sizes);
     }
 
     bench::ResultTally tally;
@@ -1551,7 +1584,7 @@ static void BenchSSDTier(const BenchConfig& cfg, const std::vector<std::string>&
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
       for (const auto& d : rdescs) {
         auto t0 = Clock::now();
-        auto batch_results = tier.ReadBatchIntoPtr(d.keys, d.dst_ptrs, d.sizes);
+        auto batch_results = tier.BatchReadIntoPtr(d.keys, d.dst_ptrs, d.sizes);
         auto t1 = Clock::now();
         size_t ok = bench::CountTrue(batch_results);
         tally.AddSample(d.keys.size(), ok, d.keys.size() * cfg.value_size, ok * cfg.value_size,
@@ -1570,9 +1603,9 @@ static void BenchSSDTier(const BenchConfig& cfg, const std::vector<std::string>&
 // ---------------------------------------------------------------------------
 static void BenchBatchWrite(const BenchConfig& cfg, const std::vector<std::string>& keys,
                             const std::vector<std::vector<char>>& values,
-                            std::vector<BenchResult>& results) {
+                            std::vector<BenchResult>& results, TierBackend* ext_tier = nullptr) {
   if (!ShouldRun(cfg, "Batch")) return;
-  if (cfg.value_size > cfg.ssd_capacity) {
+  if (!ext_tier && cfg.value_size > cfg.ssd_capacity) {
     PrintSkipMessage("Batch vs Single Write",
                      "value_size exceeds ssd_capacity; SSD write comparisons cannot succeed.");
     return;
@@ -1584,8 +1617,9 @@ static void BenchBatchWrite(const BenchConfig& cfg, const std::vector<std::strin
 
   // Sequential single-key write
   {
-    ScopedTempDir tmp(cfg.base_dir + "/batch_seq");
-    SSDTier tier(tmp.path, cfg.ssd_capacity, ucfg);
+    auto ts = ext_tier ? TierScope(ext_tier)
+                       : TierScope(cfg.base_dir + "/batch_seq", cfg.ssd_capacity, ucfg);
+    TierBackend& tier = *ts.tier;
 
     // Warmup
     for (size_t w = 0; w < cfg.warmup_iters; ++w) {
@@ -1614,10 +1648,11 @@ static void BenchBatchWrite(const BenchConfig& cfg, const std::vector<std::strin
     RecordResult("SSD Write Compare", "op=single", tally, WallSeconds(run_start, run_end), results);
   }
 
-  // WriteBatch
+  // BatchWrite
   {
-    ScopedTempDir tmp(cfg.base_dir + "/batch_batch");
-    SSDTier tier(tmp.path, cfg.ssd_capacity, ucfg);
+    auto ts = ext_tier ? TierScope(ext_tier)
+                       : TierScope(cfg.base_dir + "/batch_batch", cfg.ssd_capacity, ucfg);
+    TierBackend& tier = *ts.tier;
 
     auto wdescs = BuildWriteBatches(keys, values, cfg.batch_size);
     std::string batch_variant = JoinVariant({"op=batch", BatchModeLabel(wdescs, cfg.segment_size),
@@ -1625,7 +1660,7 @@ static void BenchBatchWrite(const BenchConfig& cfg, const std::vector<std::strin
 
     for (size_t w = 0; w < cfg.warmup_iters; ++w) {
       tier.Clear();
-      for (const auto& d : wdescs) tier.WriteBatch(d.keys, d.data_ptrs, d.sizes);
+      for (const auto& d : wdescs) tier.BatchWrite(d.keys, d.data_ptrs, d.sizes);
     }
     tier.Clear();
 
@@ -1637,9 +1672,9 @@ static void BenchBatchWrite(const BenchConfig& cfg, const std::vector<std::strin
       tier.Clear();
       for (const auto& d : wdescs) {
         auto t0 = Clock::now();
-        bool ok = tier.WriteBatch(d.keys, d.data_ptrs, d.sizes);
+        auto write_results = tier.BatchWrite(d.keys, d.data_ptrs, d.sizes);
         auto t1 = Clock::now();
-        size_t wrote = ok ? d.keys.size() : 0;
+        size_t wrote = bench::CountTrue(write_results);
         tally.AddSample(d.keys.size(), wrote, d.keys.size() * cfg.value_size,
                         wrote * cfg.value_size,
                         std::chrono::duration<double, std::micro>(t1 - t0).count());
@@ -1657,9 +1692,9 @@ static void BenchBatchWrite(const BenchConfig& cfg, const std::vector<std::strin
 // ---------------------------------------------------------------------------
 static void BenchBatchRead(const BenchConfig& cfg, const std::vector<std::string>& keys,
                            const std::vector<std::vector<char>>& values,
-                           std::vector<BenchResult>& results) {
+                           std::vector<BenchResult>& results, TierBackend* ext_tier = nullptr) {
   if (!ShouldRun(cfg, "Batch")) return;
-  if (cfg.value_size > cfg.ssd_capacity) {
+  if (!ext_tier && cfg.value_size > cfg.ssd_capacity) {
     PrintSkipMessage("Batch vs Single Read",
                      "value_size exceeds ssd_capacity; SSD read comparisons cannot succeed.");
     return;
@@ -1671,8 +1706,9 @@ static void BenchBatchRead(const BenchConfig& cfg, const std::vector<std::string
 
   // Sequential single-key read
   {
-    ScopedTempDir tmp(cfg.base_dir + "/batch_read_seq");
-    SSDTier tier(tmp.path, cfg.ssd_capacity, ucfg);
+    auto ts = ext_tier ? TierScope(ext_tier)
+                       : TierScope(cfg.base_dir + "/batch_read_seq", cfg.ssd_capacity, ucfg);
+    TierBackend& tier = *ts.tier;
 
     size_t resident_keys = 0;
     for (size_t i = 0; i < keys.size(); ++i) {
@@ -1707,10 +1743,11 @@ static void BenchBatchRead(const BenchConfig& cfg, const std::vector<std::string
     RecordResult("SSD Read Compare", seq_variant, tally, WallSeconds(run_start, run_end), results);
   }
 
-  // ReadBatchIntoPtr
+  // BatchReadIntoPtr
   {
-    ScopedTempDir tmp(cfg.base_dir + "/batch_read_batch");
-    SSDTier tier(tmp.path, cfg.ssd_capacity, ucfg);
+    auto ts = ext_tier ? TierScope(ext_tier)
+                       : TierScope(cfg.base_dir + "/batch_read_batch", cfg.ssd_capacity, ucfg);
+    TierBackend& tier = *ts.tier;
 
     size_t resident_keys = 0;
     for (size_t i = 0; i < keys.size(); ++i) {
@@ -1728,7 +1765,7 @@ static void BenchBatchRead(const BenchConfig& cfg, const std::vector<std::string
                                              "op=batch", "bs=" + std::to_string(cfg.batch_size)});
 
     for (size_t w = 0; w < cfg.warmup_iters; ++w) {
-      for (const auto& d : rdescs) tier.ReadBatchIntoPtr(d.keys, d.dst_ptrs, d.sizes);
+      for (const auto& d : rdescs) tier.BatchReadIntoPtr(d.keys, d.dst_ptrs, d.sizes);
     }
 
     bench::ResultTally tally;
@@ -1738,7 +1775,7 @@ static void BenchBatchRead(const BenchConfig& cfg, const std::vector<std::string
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
       for (const auto& d : rdescs) {
         auto t0 = Clock::now();
-        auto batch_results = tier.ReadBatchIntoPtr(d.keys, d.dst_ptrs, d.sizes);
+        auto batch_results = tier.BatchReadIntoPtr(d.keys, d.dst_ptrs, d.sizes);
         auto t1 = Clock::now();
         size_t ok = bench::CountTrue(batch_results);
         tally.AddSample(d.keys.size(), ok, d.keys.size() * cfg.value_size, ok * cfg.value_size,
@@ -1949,6 +1986,10 @@ static void BenchIOBackend(const BenchConfig& cfg, const std::vector<std::string
                            const std::vector<std::vector<char>>& values,
                            std::vector<BenchResult>& results) {
   if (!ShouldRun(cfg, "IO Backend")) return;
+  if (IsSpdk(cfg)) {
+    PrintSkipMessage("IO Backend Sweep", "not applicable for SPDK backend");
+    return;
+  }
   if (cfg.value_size > cfg.ssd_capacity) {
     PrintSkipMessage("IO Backend Sweep",
                      "value_size exceeds ssd_capacity; backend SSD comparisons cannot succeed.");
@@ -2062,6 +2103,10 @@ static void BenchDurability(const BenchConfig& cfg, const std::vector<std::strin
                             const std::vector<std::vector<char>>& values,
                             std::vector<BenchResult>& results) {
   if (!ShouldRun(cfg, "Durability")) return;
+  if (IsSpdk(cfg)) {
+    PrintSkipMessage("Durability (Strict vs Relaxed)", "not applicable for SPDK backend");
+    return;
+  }
   if (cfg.value_size > cfg.ssd_capacity) {
     PrintSkipMessage(
         "Durability (Strict vs Relaxed)",
@@ -2116,6 +2161,10 @@ static void BenchStorageIoDriver(const BenchConfig& cfg,
                                  const std::vector<std::vector<char>>& values,
                                  std::vector<BenchResult>& results) {
   if (!ShouldRun(cfg, "StorageIoDriver")) return;
+  if (IsSpdk(cfg)) {
+    PrintSkipMessage("StorageIoDriver", "not applicable for SPDK backend");
+    return;
+  }
 
   PrintHeader("StorageIoDriver");
   std::string backend_variant = BackendVariantLabel(cfg.ssd_io_backend, cfg.ssd_io_queue_depth);
@@ -3214,6 +3263,8 @@ static void PrintUsage(const char* argv0) {
       "  --ssd-io-backend <pthread|posix|io_uring>\n"
       "  --ssd-queue-depth N              Storage I/O queue depth\n"
       "  --ssd-durability <strict|relaxed>\n"
+      "  --ssd-backend <posix|spdk>       SSD backend (default: posix)\n"
+      "                                   spdk requires UMBP_SPDK_NVME_PCI env var\n"
       "\n"
       "E2E (sglang connector simulation):\n"
       "  --model <deepseek-v3|deepseek-v2|llama-70b|llama-8b>\n"
@@ -3340,6 +3391,14 @@ static ParsedArgs ParseArgs(int argc, char* argv[]) {
         std::exit(1);
       }
       override_ssd_durability = true;
+    } else if (arg == "--ssd-backend" && i + 1 < argc) {
+      std::string val = argv[++i];
+      std::string lower = ToLower(val);
+      if (lower != "posix" && lower != "spdk") {
+        std::cerr << "Error: --ssd-backend must be 'posix' or 'spdk'\n";
+        std::exit(1);
+      }
+      cfg.ssd_backend = lower;
       // E2E flags
     } else if (arg == "--model" && i + 1 < argc) {
       model_preset = argv[++i];
@@ -3502,7 +3561,8 @@ int main(int argc, char* argv[]) {
   std::printf("  dram_capacity= %zu bytes\n", cfg.dram_capacity);
   std::printf("  ssd_capacity = %zu bytes\n", cfg.ssd_capacity);
   std::printf("  segment_size = %zu bytes\n", cfg.segment_size);
-  std::printf("  ssd_backend  = %s\n", GetIoBackendSpec(cfg.ssd_io_backend).display_name);
+  std::printf("  ssd_io_back  = %s\n", GetIoBackendSpec(cfg.ssd_io_backend).display_name);
+  std::printf("  ssd_backend  = %s\n", cfg.ssd_backend.c_str());
   std::printf("  ssd_queue_d  = %zu\n", cfg.ssd_io_queue_depth);
   std::printf("  ssd_durability = %s\n", DurabilityLabel(cfg.ssd_durability_mode));
   std::printf("  base_dir     = %s\n", cfg.base_dir.c_str());
@@ -3522,19 +3582,57 @@ int main(int argc, char* argv[]) {
 
   std::vector<BenchResult> results;
 
-  // Run all scenarios
+  // SPDK anchor — keeps the proxy daemon alive for the entire benchmark run.
+  // All subsequent UMBPClient instances probe the existing proxy and reuse it
+  // instead of spawning new ones (see LocalStorageManager proxy probe logic).
+  std::unique_ptr<UMBPClient> spdk_anchor;
+  TierBackend* ext_ssd = nullptr;
+  if (IsSpdk(cfg)) {
+    const char* pci = std::getenv("UMBP_SPDK_NVME_PCI");
+    if (!pci || !pci[0]) {
+      std::fprintf(stderr,
+                   "ERROR: --ssd-backend spdk requires UMBP_SPDK_NVME_PCI env var.\n"
+                   "  Example: UMBP_SPDK_NVME_PCI=0000:c1:00.0 ./bench_umbp --ssd-backend spdk\n"
+                   "  Find NVMe PCI addresses with: lspci | grep -i nvme\n");
+      return 1;
+    }
+    std::printf("\nInitializing SPDK backend (PCI: %s)...\n", pci);
+    UMBPConfig acfg = MakeBaseSsdConfig(cfg);
+    acfg.dram.capacity_bytes = cfg.dram_capacity;
+    acfg.role = UMBPRole::SharedSSDLeader;
+    acfg.copy_pipeline.async_enabled = false;
+    acfg.eviction.auto_promote_on_read = false;
+    spdk_anchor = std::make_unique<UMBPClient>(acfg);
+    ext_ssd = spdk_anchor->Storage().GetTier(StorageTier::LOCAL_SSD);
+    if (!ext_ssd || !dynamic_cast<SpdkProxyTier*>(ext_ssd)) {
+      std::fprintf(stderr,
+                   "ERROR: SPDK SSD tier not available. "
+                   "Check UMBP_SPDK_NVME_PCI env var.\n");
+      return 1;
+    }
+    std::printf("SPDK backend initialized.\n");
+  }
+
+  // Phase 1: tier-level benchmarks
   BenchDRAMTier(cfg, keys, values, results);
-  BenchSSDTier(cfg, keys, values, results);
-  BenchBatchWrite(cfg, keys, values, results);
-  BenchBatchRead(cfg, keys, values, results);
-  BenchCopyToSSD(cfg, keys, values, results);
+  BenchSSDTier(cfg, keys, values, results, ext_ssd);
+  BenchBatchWrite(cfg, keys, values, results, ext_ssd);
+  BenchBatchRead(cfg, keys, values, results, ext_ssd);
+
+  // Phase 2: POSIX-specific (auto-skipped for SPDK inside each function)
   BenchIOBackend(cfg, keys, values, results);
   BenchDurability(cfg, keys, values, results);
   BenchStorageIoDriver(cfg, values, results);
+
+  // Phase 3: client-level — each creates own UMBPClient that reuses the
+  // anchor's proxy (probed as alive, no respawn needed).
+  BenchCopyToSSD(cfg, keys, values, results);
   BenchConcurrent(cfg, keys, values, results);
   BenchLeaderMode(cfg, keys, values, results);
   BenchCapacityPressure(cfg, keys, values, results);
   BenchE2E(cfg, e2e, results);
+
+  // Anchor destroyed here (after all benchmarks) — proxy shuts down.
 
   if (results.empty()) {
     if (!cfg.filter.empty()) {

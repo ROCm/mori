@@ -1,7 +1,8 @@
 # ---------------------------------------------------------------------------
-# SPDK auto-detection: try pkg-config, enable if found. Set SPDK_PKG_CONFIG_PATH
-# to override search path for non-standard installs. Set USE_SPDK=OFF to
-# force-disable even if SPDK is installed.
+# SPDK auto-detection: try pkg-config, enable if found. Search order: 1.
+# SPDK_PKG_CONFIG_PATH (user override) 2. System pkg-config paths (e.g.
+# /usr/local/lib/pkgconfig) 3. 3rdparty/spdk/build/lib/pkgconfig (local
+# submodule build) Set USE_SPDK=OFF to force-disable even if SPDK is installed.
 # ---------------------------------------------------------------------------
 set(SPDK_PKG_CONFIG_PATH
     ""
@@ -12,10 +13,14 @@ set(HAVE_SPDK FALSE)
 if(USE_SPDK)
   find_package(PkgConfig QUIET)
   if(PkgConfig_FOUND)
+    # Save and restore PKG_CONFIG_PATH so we don't leak changes.
+    set(_spdk_orig_pc_path "$ENV{PKG_CONFIG_PATH}")
+
     if(SPDK_PKG_CONFIG_PATH)
-      set(ENV{PKG_CONFIG_PATH} "${SPDK_PKG_CONFIG_PATH}:$ENV{PKG_CONFIG_PATH}")
+      set(ENV{PKG_CONFIG_PATH} "${SPDK_PKG_CONFIG_PATH}:${_spdk_orig_pc_path}")
     endif()
 
+    # Try 1: system / user-specified pkg-config paths
     execute_process(
       COMMAND pkg-config --cflags spdk_event spdk_event_bdev spdk_env_dpdk
       OUTPUT_VARIABLE SPDK_CFLAGS
@@ -33,6 +38,35 @@ if(USE_SPDK)
     if(SPDK_CFLAGS_RC EQUAL 0 AND SPDK_LDFLAGS_RC EQUAL 0)
       set(HAVE_SPDK TRUE)
     endif()
+
+    # Try 2: fallback to 3rdparty/spdk local build (from tools/setup_spdk.sh)
+    if(NOT HAVE_SPDK)
+      set(_spdk_3rdparty_pc
+          "${CMAKE_CURRENT_SOURCE_DIR}/../../3rdparty/spdk/build/lib/pkgconfig")
+      get_filename_component(_spdk_3rdparty_pc "${_spdk_3rdparty_pc}" ABSOLUTE)
+      if(EXISTS "${_spdk_3rdparty_pc}/spdk_event.pc")
+        set(ENV{PKG_CONFIG_PATH} "${_spdk_3rdparty_pc}:${_spdk_orig_pc_path}")
+        execute_process(
+          COMMAND pkg-config --cflags spdk_event spdk_event_bdev spdk_env_dpdk
+          OUTPUT_VARIABLE SPDK_CFLAGS
+          OUTPUT_STRIP_TRAILING_WHITESPACE
+          RESULT_VARIABLE SPDK_CFLAGS_RC
+          ERROR_QUIET)
+        execute_process(
+          COMMAND pkg-config --libs --static spdk_event spdk_event_bdev
+                  spdk_env_dpdk
+          OUTPUT_VARIABLE SPDK_LDFLAGS
+          OUTPUT_STRIP_TRAILING_WHITESPACE
+          RESULT_VARIABLE SPDK_LDFLAGS_RC
+          ERROR_QUIET)
+        if(SPDK_CFLAGS_RC EQUAL 0 AND SPDK_LDFLAGS_RC EQUAL 0)
+          set(HAVE_SPDK TRUE)
+          message(STATUS "[UMBP] SPDK found via 3rdparty/spdk local build")
+        endif()
+      endif()
+    endif()
+
+    set(ENV{PKG_CONFIG_PATH} "${_spdk_orig_pc_path}")
   endif()
 
   if(HAVE_SPDK)
@@ -40,10 +74,9 @@ if(USE_SPDK)
     message(STATUS "[UMBP] SPDK CFLAGS: ${SPDK_CFLAGS}")
     message(STATUS "[UMBP] SPDK LDFLAGS: ${SPDK_LDFLAGS}")
   else()
+    message(STATUS "[UMBP] SPDK not found — SPDK support DISABLED (POSIX only)")
     message(
-      STATUS
-        "[UMBP] SPDK not found via pkg-config — SPDK support DISABLED (POSIX only)"
-    )
+      STATUS "[UMBP]   To enable: run tools/setup_spdk.sh, then reconfigure.")
   endif()
 endif()
 
@@ -108,38 +141,9 @@ if(HAVE_SPDK)
            -lpthread
            -lelf)
 
-  # SPDK test executables
-  add_executable(test_spdk_env
-                 ${CMAKE_SOURCE_DIR}/tests/cpp/umbp/local/test_spdk_env.cpp)
-  target_link_libraries(test_spdk_env PRIVATE umbp_core)
-
-  add_executable(
-    test_spdk_ssd_tier
-    ${CMAKE_SOURCE_DIR}/tests/cpp/umbp/local/test_spdk_ssd_tier.cpp)
-  target_link_libraries(test_spdk_ssd_tier PRIVATE umbp_core)
-
-  # SPDK benchmark
-  add_executable(spdk_bench benchmarks/spdk_bench.cpp)
-  target_link_libraries(spdk_bench PRIVATE umbp_core)
-
   # SPDK Proxy daemon (owns SPDK, serves ranks via SHM IPC)
   add_executable(spdk_proxy proxy/spdk_proxy_daemon.cpp)
   target_link_libraries(spdk_proxy PRIVATE umbp_core)
-endif()
-
-# SPDK Proxy benchmark (no SPDK dependency, only SHM — Linux only)
-if(UNIX)
-  add_executable(proxy_bench benchmarks/proxy_bench.cpp)
-  target_link_libraries(proxy_bench PRIVATE umbp_core)
-
-  # E2E benchmark using UMBPClient (auto Leader/Follower fork)
-  add_executable(umbp_bench benchmarks/umbp_bench.cpp)
-  target_link_libraries(umbp_bench PRIVATE umbp_core)
-
-  # E2E integration test (one command, all backends)
-  add_executable(test_umbp_e2e
-                 ${CMAKE_SOURCE_DIR}/tests/cpp/umbp/local/test_umbp_e2e.cpp)
-  target_link_libraries(test_umbp_e2e PRIVATE umbp_core)
 endif()
 
 # Python bindings are registered in src/pybind/pybind_umbp.cpp (compiled into

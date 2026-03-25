@@ -106,11 +106,16 @@ struct UMBPConfig {
 
   // SPDK Proxy configuration
   std::string spdk_proxy_shm_name = "/umbp_spdk_proxy";
-  uint32_t spdk_proxy_rank_id = kAutoRankId;  // kAutoRankId = CAS auto-allocate (default)
-  uint32_t spdk_proxy_max_ranks = 8;
-  size_t spdk_proxy_data_per_rank_mb = 512;   // MB of SHM data region per rank
-  std::string spdk_proxy_bin;                 // Path to spdk_proxy binary (empty = search PATH)
-  int spdk_proxy_startup_timeout_ms = 30000;  // Max ms to wait for proxy READY
+  uint32_t spdk_proxy_tenant_id = 0;
+  size_t spdk_proxy_tenant_quota_bytes = 0;
+  uint32_t spdk_proxy_max_channels = 8;
+  size_t spdk_proxy_data_per_channel_mb = 32;  // MB of SHM data region per channel
+  std::string spdk_proxy_bin;                  // Path to spdk_proxy binary (empty = search PATH)
+  int spdk_proxy_startup_timeout_ms = 30000;   // Max ms to wait for proxy READY
+  bool spdk_proxy_auto_start = true;
+  int spdk_proxy_idle_exit_timeout_ms = 30000;
+  bool spdk_proxy_allow_borrow = false;
+  size_t spdk_proxy_reserved_shared_bytes = 0;
 
   // Role is the source of truth for runtime behavior.
   UMBPRole role = UMBPRole::Standalone;
@@ -160,6 +165,10 @@ struct UMBPConfig {
       if (error_message) *error_message = "copy_pipeline.batch_max_ops must be > 0";
       return false;
     }
+    if (spdk_proxy_max_channels == 0) {
+      if (error_message) *error_message = "spdk_proxy_max_channels must be > 0";
+      return false;
+    }
     return true;
   }
 
@@ -203,15 +212,34 @@ struct UMBPConfig {
     cfg.spdk_io_workers = getenv_int("UMBP_SPDK_IO_WORKERS", cfg.spdk_io_workers);
 
     cfg.spdk_proxy_shm_name = getenv_str("UMBP_SPDK_PROXY_SHM", cfg.spdk_proxy_shm_name);
-    const char* rank_env = std::getenv("UMBP_SPDK_PROXY_RANK");
-    cfg.spdk_proxy_rank_id = rank_env ? static_cast<uint32_t>(std::atoi(rank_env)) : kAutoRankId;
-    cfg.spdk_proxy_max_ranks = static_cast<uint32_t>(
-        getenv_int("UMBP_SPDK_PROXY_MAX_RANKS", static_cast<int>(cfg.spdk_proxy_max_ranks)));
-    cfg.spdk_proxy_data_per_rank_mb =
-        getenv_size("UMBP_SPDK_PROXY_DATA_MB", cfg.spdk_proxy_data_per_rank_mb);
+    cfg.spdk_proxy_tenant_id = static_cast<uint32_t>(
+        getenv_int("UMBP_SPDK_PROXY_TENANT_ID", static_cast<int>(cfg.spdk_proxy_tenant_id)));
+    cfg.spdk_proxy_tenant_quota_bytes =
+        getenv_size("UMBP_SPDK_PROXY_TENANT_QUOTA_BYTES", cfg.spdk_proxy_tenant_quota_bytes);
+
+    const char* max_channels_env = std::getenv("UMBP_SPDK_PROXY_MAX_CHANNELS");
+    if (!max_channels_env) max_channels_env = std::getenv("UMBP_SPDK_PROXY_MAX_RANKS");
+    if (max_channels_env) {
+      cfg.spdk_proxy_max_channels = static_cast<uint32_t>(std::atoi(max_channels_env));
+    }
+
+    const char* data_mb_env = std::getenv("UMBP_SPDK_PROXY_DATA_PER_CHANNEL_MB");
+    if (!data_mb_env) data_mb_env = std::getenv("UMBP_SPDK_PROXY_DATA_MB");
+    if (data_mb_env) {
+      cfg.spdk_proxy_data_per_channel_mb = static_cast<size_t>(std::stoull(data_mb_env));
+    }
+
     cfg.spdk_proxy_bin = getenv_str("UMBP_SPDK_PROXY_BIN", cfg.spdk_proxy_bin);
     cfg.spdk_proxy_startup_timeout_ms =
         getenv_int("UMBP_SPDK_PROXY_TIMEOUT_MS", cfg.spdk_proxy_startup_timeout_ms);
+    cfg.spdk_proxy_auto_start =
+        getenv_int("UMBP_SPDK_PROXY_AUTO_START", cfg.spdk_proxy_auto_start ? 1 : 0) != 0;
+    cfg.spdk_proxy_idle_exit_timeout_ms =
+        getenv_int("UMBP_SPDK_PROXY_IDLE_EXIT_TIMEOUT_MS", cfg.spdk_proxy_idle_exit_timeout_ms);
+    cfg.spdk_proxy_allow_borrow =
+        getenv_int("UMBP_SPDK_PROXY_ALLOW_BORROW", cfg.spdk_proxy_allow_borrow ? 1 : 0) != 0;
+    cfg.spdk_proxy_reserved_shared_bytes =
+        getenv_size("UMBP_SPDK_PROXY_RESERVED_SHARED_BYTES", cfg.spdk_proxy_reserved_shared_bytes);
 
     std::string role_str = getenv_str("UMBP_ROLE", "");
     if (role_str == "leader")
