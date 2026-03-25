@@ -67,13 +67,15 @@ __global__ void PipelinedAllReduceSdmaKernel(
   const int compBlocks = static_cast<int>(gridDim.x) - 1;
 
   // ---- Signal baselines (dstMemObj; requires sdmaNumQueue >= 3 for qId=2) ----
-  __shared__ uint64_t s_scatter_base;
+  // Per-sender baselines are required: queue counters for different peers are
+  // independent; using only the first peer's scatter/rd baseline makes waits
+  // too strict for lagging peers → reduce runs before that peer's scatter lands.
+  __shared__ uint64_t s_scatter_by_sender[64];
   __shared__ uint64_t s_ag_by_sender[64];
-  __shared__ uint64_t s_rd_base;
+  __shared__ uint64_t s_rd_by_sender[64];
   __shared__ uint32_t s_bd_base;
 
   if (threadIdx.x == 0) {
-    s_rd_base = 0;
     if (blockIdx.x == 0 && compBlocks > 0) {
       s_bd_base = __scoped_atomic_load_n(
           &barrier->block_done[1], __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
@@ -85,30 +87,19 @@ __global__ void PipelinedAllReduceSdmaKernel(
     }
     for (int s = 0; s < npes && s < 64; ++s) {
       if (s == myPe) continue;
-      s_ag_by_sender[s] = core::AtomicLoadRelaxed(
-          dstMemObj->signalPtrs + static_cast<size_t>(s) * numQ + 1);
-    }
-    for (int i = 0; i < npes; ++i) {
-      if (i != myPe) {
-        s_scatter_base = core::AtomicLoadRelaxed(
-            dstMemObj->signalPtrs + static_cast<size_t>(i) * numQ + 0);
-        break;
-      }
-    }
-    if (blockIdx.x == 0) {
-      for (int i = 0; i < npes; ++i) {
-        if (i != myPe) {
-          s_rd_base = core::AtomicLoadRelaxed(
-              dstMemObj->signalPtrs + static_cast<size_t>(i) * numQ + 2);
-          break;
-        }
+      const size_t row = static_cast<size_t>(s) * numQ;
+      s_scatter_by_sender[s] =
+          core::AtomicLoadRelaxed(dstMemObj->signalPtrs + row + 0);
+      if (blockIdx.x == 0) {
+        s_ag_by_sender[s] =
+            core::AtomicLoadRelaxed(dstMemObj->signalPtrs + row + 1);
+        s_rd_by_sender[s] =
+            core::AtomicLoadRelaxed(dstMemObj->signalPtrs + row + 2);
       }
     }
   }
   __syncthreads();
 
-  const uint64_t scatterBase = s_scatter_base;
-  const uint64_t rdBase = s_rd_base;
   const uint32_t bdBase = s_bd_base;
 
   // =========================================================================
@@ -139,7 +130,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
           const int idx = static_cast<int>(threadIdx.x);
           const int sender = idx < myPe ? idx : idx + 1;
           const uint64_t expected =
-              scatterBase + static_cast<uint64_t>(c + 1);
+              s_scatter_by_sender[sender] + static_cast<uint64_t>(c + 1);
           HSAuint64* sig = dstMemObj->signalPtrs
               + static_cast<size_t>(sender) * numQ;
           while (core::AtomicLoadRelaxed(sig) < expected)
@@ -197,7 +188,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
       // BLOCK 0: i = 0..numChunks+1
       //   Ph1: scatter(i) | wait_rd(i) | bd_poll(i)  [parallel]
       //   Ph2: wbl2 + signal q=2 for reduce(i-1) | AG(i-2)
-      //   wait_rd: need rdBase + (i-1) from each peer before AG(i-2) (i>=2)
+      //   wait_rd: per-sender rd baseline + (i-1) before AG(i-2) (i>=2)
       //   bd_poll: i in [1,numChunks] target bdBase + i
       // =================================================================
       for (int i = 0; i <= numChunks + 1; i++) {
@@ -226,7 +217,8 @@ __global__ void PipelinedAllReduceSdmaKernel(
             thr < 64 + npes - 1) {
           const int idx = thr - 64;
           const int sender = idx < myPe ? idx : idx + 1;
-          const uint64_t need = rdBase + static_cast<uint64_t>(i - 1);
+          const uint64_t need =
+              s_rd_by_sender[sender] + static_cast<uint64_t>(i - 1);
           HSAuint64* sig = dstMemObj->signalPtrs
               + static_cast<size_t>(sender) * numQ + 2;
           while (core::AtomicLoadRelaxed(sig) < need)
