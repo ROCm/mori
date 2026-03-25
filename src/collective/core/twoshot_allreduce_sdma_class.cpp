@@ -297,10 +297,9 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                               (packedPerRank + threads - 1) / threads);
         if (blocks < 1) blocks = 1;
         if (scatter_mode == 0) {
-            // Barrier-free pipeline: block 0 = management, rest = compute.
-            // Cap compute blocks, then add 1 for management block 0.
-            int comp = std::min(blocks, 32);
-            comp = std::min(comp, kMaxPipelineBlocks - 1);
+            // Block 0 = management; remaining blocks = compute (reduce).
+            // Use up to kMaxPipelineBlocks-1 for large tensors (was capped at 32).
+            int comp = std::min(blocks, kMaxPipelineBlocks - 1);
             blocks = comp + 1;
         }
 

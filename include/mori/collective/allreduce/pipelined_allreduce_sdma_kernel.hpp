@@ -239,6 +239,8 @@ __global__ void PipelinedAllReduceSdmaKernel(
         }
         __syncthreads();
 
+        // signal(q=2) then AG: same threads 0..npes-1, program order; one fewer
+        // __syncthreads than splitting signal / AG.
         if (i >= 1 && i <= numChunks) {
           if (thr < npes && thr != myPe) {
             HSAuint64* rs = dstMemObj->peerSignalPtrs[thr]
@@ -247,8 +249,6 @@ __global__ void PipelinedAllReduceSdmaKernel(
                 __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
           }
         }
-        __syncthreads();
-
         if (i >= 2 && i <= numChunks + 1 && thr < npes && thr != myPe) {
           const int destPe = thr;
           const int agChunk = i - 2;
@@ -268,6 +268,8 @@ __global__ void PipelinedAllReduceSdmaKernel(
             core::SdmaPutThread(src, dst, actualBytes, dh, rSig, numQ, 1);
           }
         }
+
+        __syncthreads();
       }
 
       // Final AG wait
