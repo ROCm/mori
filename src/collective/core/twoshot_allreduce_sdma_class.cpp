@@ -410,7 +410,16 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             size_t min_chunk = std::max<size_t>(
                 static_cast<size_t>(pack_size) * npes_,
                 (512ULL * 1024 / dtype_size_) * npes_);
-            chunk_elems_arg = total_count;
+            if (scatter_mode == 0) {
+                // Enable real overlap in SDMA pipeline by default.
+                // Approximate 8 MiB per-rank chunks unless tensor is smaller.
+                const size_t target_per_rank_bytes = 8ULL * 1024 * 1024;
+                size_t target = (target_per_rank_bytes / dtype_size_) *
+                                static_cast<size_t>(npes_);
+                chunk_elems_arg = std::min(total_count, target);
+            } else {
+                chunk_elems_arg = total_count;
+            }
             if (chunk_elems_arg < min_chunk)
                 chunk_elems_arg = min_chunk;
         }
