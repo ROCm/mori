@@ -142,8 +142,7 @@ class LocalStorageManager {
   void MaybeAutoPromote(const std::string& key);
 
 #ifdef __linux__
-  int proxy_child_pid_ = -1;
-  std::string proxy_shm_name_;
-  int SpawnProxyDaemon();
+  int EnsureProxyDaemon(const std::string& shm_name);
+  int SpawnProxyDaemon(const std::string& shm_name);
 #endif
 };

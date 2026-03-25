@@ -20,6 +20,35 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 """UMBP (Unified Memory/Bandwidth Pool) Python bindings via mori."""
+import os
+import stat
+from pathlib import Path
+
+
+def _configure_packaged_spdk_proxy() -> None:
+    if os.environ.get("UMBP_SPDK_PROXY_BIN"):
+        return
+
+    proxy_path = Path(__file__).resolve().parents[1] / "spdk_proxy"
+    if not proxy_path.is_file():
+        return
+
+    try:
+        mode = proxy_path.stat().st_mode
+        exec_bits = stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+        if (mode & exec_bits) != exec_bits:
+            proxy_path.chmod(mode | exec_bits)
+    except OSError:
+        # Best effort only; if chmod fails we fall back to the existing
+        # discovery logic in LocalStorageManager.
+        pass
+
+    if os.access(proxy_path, os.X_OK):
+        os.environ["UMBP_SPDK_PROXY_BIN"] = str(proxy_path)
+
+
+_configure_packaged_spdk_proxy()
+
 from mori.cpp import (
     UMBPClient,
     UMBPConfig,

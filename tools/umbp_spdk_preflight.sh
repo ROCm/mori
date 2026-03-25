@@ -277,7 +277,7 @@ else
             break
         fi
     done
-    # Check next to bench_umbp
+    # Check next to bench_umbp_micro
     for f in $(find ./build_umbp -name spdk_proxy -type f 2>/dev/null | head -1); do
         found="$f"
     done
@@ -342,7 +342,7 @@ echo "=========================================="
 if [[ $FAIL -eq 0 ]]; then
     echo " SPDK backend is ready."
     if [[ -n "$TARGET_PCI" ]]; then
-        echo " Run: UMBP_SPDK_NVME_PCI=${TARGET_PCI} ./bench_umbp --ssd-backend spdk"
+        echo " Run: UMBP_SPDK_NVME_PCI=${TARGET_PCI} ./bench_umbp_micro --ssd-backend spdk"
     fi
     exit 0
 else

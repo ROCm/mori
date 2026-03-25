@@ -141,38 +141,9 @@ if(HAVE_SPDK)
            -lpthread
            -lelf)
 
-  # SPDK test executables
-  add_executable(test_spdk_env
-                 ${CMAKE_SOURCE_DIR}/tests/cpp/umbp/local/test_spdk_env.cpp)
-  target_link_libraries(test_spdk_env PRIVATE umbp_core)
-
-  add_executable(
-    test_spdk_ssd_tier
-    ${CMAKE_SOURCE_DIR}/tests/cpp/umbp/local/test_spdk_ssd_tier.cpp)
-  target_link_libraries(test_spdk_ssd_tier PRIVATE umbp_core)
-
-  # SPDK benchmark
-  add_executable(spdk_bench benchmarks/spdk_bench.cpp)
-  target_link_libraries(spdk_bench PRIVATE umbp_core)
-
   # SPDK Proxy daemon (owns SPDK, serves ranks via SHM IPC)
   add_executable(spdk_proxy proxy/spdk_proxy_daemon.cpp)
   target_link_libraries(spdk_proxy PRIVATE umbp_core)
-endif()
-
-# SPDK Proxy benchmark (no SPDK dependency, only SHM — Linux only)
-if(UNIX)
-  add_executable(proxy_bench benchmarks/proxy_bench.cpp)
-  target_link_libraries(proxy_bench PRIVATE umbp_core)
-
-  # E2E benchmark using UMBPClient (auto Leader/Follower fork)
-  add_executable(umbp_bench benchmarks/umbp_bench.cpp)
-  target_link_libraries(umbp_bench PRIVATE umbp_core)
-
-  # E2E integration test (one command, all backends)
-  add_executable(test_umbp_e2e
-                 ${CMAKE_SOURCE_DIR}/tests/cpp/umbp/local/test_umbp_e2e.cpp)
-  target_link_libraries(test_umbp_e2e PRIVATE umbp_core)
 endif()
 
 # Python bindings are registered in src/pybind/pybind_umbp.cpp (compiled into
