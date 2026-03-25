@@ -487,6 +487,15 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                 return false;
             }
         }
+        // Ensure signal/barrier clears are visible before the kernel issues SDMA.
+        if (stream != nullptr) {
+            hipError_t sy = hipStreamSynchronize(stream);
+            if (sy != hipSuccess) {
+                fprintf(stderr, "PE %d: pipelined pre-launch stream sync failed: %s\n",
+                        myPe_, hipGetErrorString(sy));
+                return false;
+            }
+        }
 
         if (scatter_mode == 1) {
             PipelinedAllReduceSdmaKernel<T, 1><<<blocks, threads, 0, stream>>>(

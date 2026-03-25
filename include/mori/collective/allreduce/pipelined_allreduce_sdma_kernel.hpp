@@ -67,10 +67,9 @@ __global__ void PipelinedAllReduceSdmaKernel(
   const int compBlocks = static_cast<int>(gridDim.x) - 1;
 
   // ---- Signal baselines (dstMemObj; requires sdmaNumQueue >= 3 for qId=2) ----
-  // Per-sender baselines are required: queue counters for different peers are
-  // independent; using only the first peer's scatter/rd baseline makes waits
-  // too strict for lagging peers → reduce runs before that peer's scatter lands.
-  __shared__ uint64_t s_scatter_by_sender[64];
+  // Scatter completion: block 0 waits q0 then publishes barrier->flag (like
+  // SdmaReduceScatterKernel). Compute blocks must NOT spin on q0 themselves —
+  // they can otherwise pass before this device's scatter data is visible.
   __shared__ uint64_t s_ag_by_sender[64];
   __shared__ uint64_t s_rd_by_sender[64];
   __shared__ uint32_t s_bd_base;
@@ -85,12 +84,10 @@ __global__ void PipelinedAllReduceSdmaKernel(
     } else {
       s_bd_base = 0;
     }
-    for (int s = 0; s < npes && s < 64; ++s) {
-      if (s == myPe) continue;
-      const size_t row = static_cast<size_t>(s) * numQ;
-      s_scatter_by_sender[s] =
-          core::AtomicLoadRelaxed(dstMemObj->signalPtrs + row + 0);
-      if (blockIdx.x == 0) {
+    if (blockIdx.x == 0) {
+      for (int s = 0; s < npes && s < 64; ++s) {
+        if (s == myPe) continue;
+        const size_t row = static_cast<size_t>(s) * numQ;
         s_ag_by_sender[s] =
             core::AtomicLoadRelaxed(dstMemObj->signalPtrs + row + 1);
         s_rd_by_sender[s] =
@@ -126,14 +123,11 @@ __global__ void PipelinedAllReduceSdmaKernel(
           static_cast<size_t>(compBlocks) * static_cast<size_t>(blockDim.x);
 
       for (int c = 0; c < numChunks; c++) {
-        if (threadIdx.x < static_cast<unsigned>(npes - 1)) {
-          const int idx = static_cast<int>(threadIdx.x);
-          const int sender = idx < myPe ? idx : idx + 1;
-          const uint64_t expected =
-              s_scatter_by_sender[sender] + static_cast<uint64_t>(c + 1);
-          HSAuint64* sig = dstMemObj->signalPtrs
-              + static_cast<size_t>(sender) * numQ;
-          while (core::AtomicLoadRelaxed(sig) < expected)
+        if (threadIdx.x == 0) {
+          while (__scoped_atomic_load_n(
+                     &barrier->flag,
+                     __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) <
+                 static_cast<uint32_t>(c + 1))
             ;
         }
         __syncthreads();
@@ -211,6 +205,39 @@ __global__ void PipelinedAllReduceSdmaKernel(
                 + static_cast<size_t>(myPe) * numQ;
             core::SdmaPutThread(src, dst, actualBytes, dh, rSig, numQ, 0);
           }
+        }
+
+        __syncthreads();
+        // After posting scatter(i), block 0 waits all incoming q0 (host zeros
+        // signals at launch → expect i+1). Then release compute via flag.
+        if (i < numChunks) {
+          if (threadIdx.x == 0) {
+            for (int sender = 0; sender < npes; ++sender) {
+              if (sender == myPe) continue;
+              HSAuint64* sig = dstMemObj->signalPtrs
+                  + static_cast<size_t>(sender) * numQ;
+              int spin = 0;
+              bool warned = false;
+              while (core::AtomicLoadRelaxed(sig) <
+                     static_cast<uint64_t>(i + 1)) {
+                if (++spin > 100000000 && !warned) {
+                  printf(
+                      "PE %d: pipeline scatter-wait timeout sender=%d "
+                      "need=%d\n",
+                      myPe, sender, i + 1);
+                  warned = true;
+                }
+              }
+            }
+#if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
+            asm volatile("buffer_wbl2" ::: "memory");
+#endif
+            __threadfence_system();
+            __scoped_atomic_store_n(
+                &barrier->flag, static_cast<uint32_t>(i + 1),
+                __ATOMIC_RELEASE, __MEMORY_SCOPE_DEVICE);
+          }
+          __syncthreads();
         }
 
         if (i >= 2 && i <= numChunks + 1 && thr >= 64 &&
