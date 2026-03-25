@@ -568,8 +568,8 @@ static ShmemMode ConfigureShmemMode() {
   const char* modeEnv = std::getenv("MORI_SHMEM_MODE");
 
   if (!modeEnv) {
-    MORI_SHMEM_INFO("MORI_SHMEM_MODE not set, defaulting to static heap mode");
-    return ShmemMode::StaticHeap;
+    MORI_SHMEM_INFO("MORI_SHMEM_MODE not set, defaulting to isolation mode");
+    return ShmemMode::Isolation;
   }
 
   std::string modeStr(modeEnv);
@@ -584,8 +584,8 @@ static ShmemMode ConfigureShmemMode() {
     MORI_SHMEM_INFO("Shmem mode: VMM Heap");
     return ShmemMode::VMHeap;
   } else {
-    MORI_SHMEM_WARN("Unknown MORI_SHMEM_MODE '{}', defaulting to static heap", modeStr);
-    return ShmemMode::StaticHeap;
+    MORI_SHMEM_WARN("Unknown MORI_SHMEM_MODE '{}', defaulting to isolation mode", modeStr);
+    return ShmemMode::Isolation;
   }
 }
 
