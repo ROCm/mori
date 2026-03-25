@@ -51,7 +51,7 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t transit_buffer_size,
 // ---------------------------------------------------------------------------
 template <typename T>
 AllreduceSdma<T>::AllreduceSdma(int myPe, int npes,
-                                size_t /*input_buffer_size*/,
+                                size_t input_buffer_size,
                                 size_t output_buffer_size,
                                 bool copy_output_to_user,
                                 bool /*use_graph_mode*/)
@@ -63,7 +63,7 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes,
       barrierPtr_(nullptr),
       barrierMem_(nullptr, ShmemDeleter()),
       input_transit_buffer_(nullptr),
-      input_transit_buffer_size_(0),
+      input_transit_buffer_size_(input_buffer_size),
       input_transit_buffer_ptr_(nullptr, ShmemDeleter()),
       output_transit_buffer_(nullptr),
       output_transit_buffer_size_(output_buffer_size),
@@ -108,6 +108,18 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes,
     if (!output_transit_buffer_obj_.IsValid())
         throw std::runtime_error("Failed to register output transit buffer");
 
+    if (input_transit_buffer_size_ > 0) {
+        input_transit_buffer_ = shmem::ShmemMalloc(input_transit_buffer_size_);
+        if (!input_transit_buffer_)
+            throw std::runtime_error("Failed to allocate input transit buffer");
+        input_transit_buffer_ptr_.reset(input_transit_buffer_);
+        input_transit_buffer_obj_ =
+            shmem::ShmemSymmetricRegister(input_transit_buffer_,
+                                          input_transit_buffer_size_);
+        if (!input_transit_buffer_obj_.IsValid())
+            throw std::runtime_error("Failed to register input transit buffer");
+    }
+
     printf("AllreduceSdma(SDMA) initialized: PE %d of %d, max_blocks=%d\n",
            myPe_, npes_, max_blocks_);
     printf("  Flags: %zu bytes at %p\n", flagsSize, flags_.get());
@@ -115,6 +127,11 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes,
     printf("  Output transit buffer: %.2f MB at %p\n",
            output_transit_buffer_size_ / (1024.0 * 1024.0),
            output_transit_buffer_);
+    if (input_transit_buffer_size_ > 0) {
+        printf("  Input transit buffer: %.2f MB at %p\n",
+               input_transit_buffer_size_ / (1024.0 * 1024.0),
+               input_transit_buffer_);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -323,6 +340,16 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
 
         application::SymmMemObjPtr inputSymmObj = {};
         if (scatter_mode == 1) {
+            // gatherBarrier uses barrier->ag_sync cumulatively within one kernel.
+            // Must be zero before each P2P launch (Async on stream can reorder vs kernel).
+            constexpr size_t kAgSyncOff = offsetof(CrossPeBarrier, ag_sync);
+            hipError_t mz = hipMemset(reinterpret_cast<char*>(barrierPtr_) + kAgSyncOff, 0,
+                                      sizeof(uint32_t));
+            if (mz != hipSuccess) {
+                fprintf(stderr, "PE %d: hipMemset(ag_sync) failed: %s\n",
+                        myPe_, hipGetErrorString(mz));
+                return false;
+            }
             size_t required_input_size = total_count * dtype_size_;
             if (!ensure_buffer_size(input_transit_buffer_, input_transit_buffer_ptr_,
                                     input_transit_buffer_size_, input_transit_buffer_obj_,
@@ -331,16 +358,16 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             }
             copy_input_to_transit(input, total_count, stream);
             inputSymmObj = input_transit_buffer_obj_;
-            // gatherBarrier uses barrier->ag_sync cumulatively; reset each launch
-            // or the first barrier sees a stale total and block 0 races past compute.
-            constexpr size_t kAgSyncOff = offsetof(CrossPeBarrier, ag_sync);
-            hipError_t mz = hipMemsetAsync(
-                reinterpret_cast<char*>(barrierPtr_) + kAgSyncOff, 0,
-                sizeof(uint32_t), stream);
-            if (mz != hipSuccess) {
-                fprintf(stderr, "PE %d: hipMemsetAsync(ag_sync) failed: %s\n",
-                        myPe_, hipGetErrorString(mz));
-                return false;
+            {
+                hipError_t se = (stream != nullptr)
+                    ? hipStreamSynchronize(stream)
+                    : hipDeviceSynchronize();
+                if (se != hipSuccess) {
+                    fprintf(stderr,
+                            "PE %d: sync before P2P kernel failed: %s\n",
+                            myPe_, hipGetErrorString(se));
+                    return false;
+                }
             }
         }
 

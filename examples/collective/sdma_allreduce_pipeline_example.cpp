@@ -147,8 +147,10 @@ void testPipelinedAllreduce() {
     // 测试数据大小：4MB, 16MB, 32MB, 64MB, 128MB, 256MB (per PE)
     std::vector<size_t> dataSizesMB = {32, 64, 128, 256};
 
-    // 测试 chunk 大小：128KB, 512KB, 1MB, 2MB, 4MB, 8MB
-    std::vector<size_t> chunkSizesKB = {128, 512, 1024, 2048, 4096, 8192};
+    // 测试 chunk 大小（总元素粒度；不超过每 PE 数据量会自动跳过）
+    // 含 16/32/64MB chunk；更大 chunk 通常更接近串行大块、Pipeline 开销更低
+    std::vector<size_t> chunkSizesKB = {
+        128, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536};
 
     const int warmup = 3;
     const int iterations = 5;
@@ -255,6 +257,22 @@ void testPipelinedAllreduce() {
             CHECK_HIP(hipFree(outBuf));
         }
 
+        // 2a) Pipeline SDMA：库默认 chunk（chunk_elems=0 → 整块，通常最快）
+        {
+            char label[] = "Pipeline SDMA chunk=default(0)";
+            auto res = runBench(label,
+                [&](uint32_t* in, uint32_t* out, int n, hipStream_t s) {
+                    return ar->pipelined(in, out, n, 0, 0, s);
+                },
+                inBuf, ar->getOutputTransitBuffer(), hostData, elemsPerPe, bytesPerPe, npes, myPe,
+                stream, warmup, iterations, 0, 0);
+            if (myPe == 0 && res.passed) {
+                printf("%-42s %10.3f %12.2f %12.2f %8s\n",
+                       label, res.avgMs, res.algoBw, res.busBw, "SDMA");
+            }
+            allResults.push_back(res);
+        }
+
         // 2) Pipeline SDMA scatter 模式，遍历不同 chunk 大小
         for (size_t chunkKB : chunkSizesKB) {
             size_t chunkBytes = chunkKB * 1024;
@@ -272,6 +290,22 @@ void testPipelinedAllreduce() {
             if (myPe == 0 && res.passed) {
                 printf("%-42s %10.3f %12.2f %12.2f %8s\n",
                        label, res.avgMs, res.algoBw, res.busBw, "SDMA");
+            }
+            allResults.push_back(res);
+        }
+
+        // 3a) Pipeline P2P：库默认 chunk
+        {
+            char label[] = "Pipeline P2P  chunk=default(0)";
+            auto res = runBench(label,
+                [&](uint32_t* in, uint32_t* out, int n, hipStream_t s) {
+                    return ar->pipelined(in, out, n, 0, 1, s);
+                },
+                inBuf, ar->getOutputTransitBuffer(), hostData, elemsPerPe, bytesPerPe, npes, myPe,
+                stream, warmup, iterations, 0, 1);
+            if (myPe == 0 && res.passed) {
+                printf("%-42s %10.3f %12.2f %12.2f %8s\n",
+                       label, res.avgMs, res.algoBw, res.busBw, "P2P");
             }
             allResults.push_back(res);
         }
