@@ -1,0 +1,48 @@
+# C++ unit tests
+add_executable(test_umbp_local_block_index test_local_block_index.cpp)
+target_link_libraries(test_umbp_local_block_index PRIVATE umbp_core)
+add_test(NAME umbp_local_block_index COMMAND test_umbp_local_block_index)
+
+add_executable(test_umbp_local_storage_manager test_local_storage_manager.cpp)
+target_link_libraries(test_umbp_local_storage_manager PRIVATE umbp_core)
+add_test(NAME umbp_local_storage_manager
+         COMMAND test_umbp_local_storage_manager)
+
+add_executable(test_umbp_local_client test_umbp_client.cpp)
+target_link_libraries(test_umbp_local_client PRIVATE umbp_core)
+add_test(NAME umbp_local_client COMMAND test_umbp_local_client)
+
+add_executable(test_umbp_local_follower_mode test_follower_mode.cpp)
+target_link_libraries(test_umbp_local_follower_mode PRIVATE umbp_core)
+add_test(NAME umbp_local_follower_mode COMMAND test_umbp_local_follower_mode)
+
+add_executable(test_umbp_local_eviction test_prefix_aware_eviction.cpp)
+target_link_libraries(test_umbp_local_eviction PRIVATE umbp_core)
+add_test(NAME umbp_local_eviction COMMAND test_umbp_local_eviction)
+
+add_executable(test_prefix_aware_eviction test_prefix_aware_eviction.cpp)
+target_link_libraries(test_prefix_aware_eviction PRIVATE umbp_core)
+add_test(NAME test_prefix_aware_eviction COMMAND test_prefix_aware_eviction)
+
+add_executable(test_ssd_tier test_ssd_tier.cpp)
+target_link_libraries(test_ssd_tier PRIVATE umbp_core)
+add_test(NAME test_ssd_tier COMMAND test_ssd_tier)
+
+# Benchmark (manual run only, not registered as a test)
+add_executable(bench_umbp bench_umbp.cpp)
+target_link_libraries(bench_umbp PRIVATE umbp_core)
+
+if(UNIX)
+  add_executable(bench_umbp_spdk bench_umbp_spdk.cpp)
+  target_link_libraries(bench_umbp_spdk PRIVATE umbp_core)
+
+  if(TARGET spdk_proxy)
+    add_dependencies(bench_umbp_spdk spdk_proxy)
+    add_custom_command(
+      TARGET bench_umbp_spdk
+      POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E create_symlink $<TARGET_FILE:spdk_proxy>
+              $<TARGET_FILE_DIR:bench_umbp_spdk>/spdk_proxy
+      COMMENT "Symlink spdk_proxy next to bench_umbp_spdk")
+  endif()
+endif()

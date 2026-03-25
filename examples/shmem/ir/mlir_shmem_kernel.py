@@ -1,4 +1,25 @@
 #!/usr/bin/env python3
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+#
+# MIT License
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 """
 MLIR-based mori shmem kernel — no Triton dependency.
 
@@ -34,7 +55,7 @@ from mlir.ir import (
     TypeAttr,
     UnitAttr,
 )
-from mlir.dialects import llvm, rocdl
+from mlir.dialects import llvm
 
 ROCM_PATH = os.environ.get("ROCM_PATH", "/opt/rocm")
 LLVM_LINK = os.path.join(ROCM_PATH, "lib/llvm/bin/llvm-link")
@@ -70,8 +91,13 @@ def call(result_type, callee: str, operands=None):
     """Call an extern function that returns a value."""
     if operands is None:
         operands = []
-    op = llvm.CallOp(result_type, operands, [], _get_no_bundle(),
-                     callee=FlatSymbolRefAttr.get(callee))
+    op = llvm.CallOp(
+        result_type,
+        operands,
+        [],
+        _get_no_bundle(),
+        callee=FlatSymbolRefAttr.get(callee),
+    )
     return op.result
 
 
@@ -107,14 +133,16 @@ def _find_mori_shmem_bc() -> str:
     if os.environ.get("MORI_SHMEM_BC"):
         candidates.append(os.environ["MORI_SHMEM_BC"])
     if os.environ.get("MORI_HOME"):
-        candidates.append(os.path.join(os.environ["MORI_HOME"], "lib",
-                                       "libmori_shmem_device.bc"))
+        candidates.append(
+            os.path.join(os.environ["MORI_HOME"], "lib", "libmori_shmem_device.bc")
+        )
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     mori_root = os.path.abspath(os.path.join(script_dir, "../../.."))
     candidates.append(os.path.join(mori_root, "lib", "libmori_shmem_device.bc"))
-    candidates.append(os.path.join(mori_root, "build", "lib",
-                                   "libmori_shmem_device.bc"))
+    candidates.append(
+        os.path.join(mori_root, "build", "lib", "libmori_shmem_device.bc")
+    )
 
     for p in candidates:
         if os.path.isfile(p):
@@ -122,7 +150,8 @@ def _find_mori_shmem_bc() -> str:
     raise FileNotFoundError(
         "libmori_shmem_device.bc not found.\n"
         "Run: bash tools/build_shmem_bitcode.sh\n"
-        f"Searched: {candidates}")
+        f"Searched: {candidates}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -148,8 +177,8 @@ def build_shmem_basic_kernel() -> Module:
             declare("mori_shmem_n_pes", "!llvm.func<i32 ()>")
 
             fn = llvm.LLVMFuncOp(
-                "shmem_basic_kernel",
-                TypeAttr.get(Type.parse("!llvm.func<void (ptr)>")))
+                "shmem_basic_kernel", TypeAttr.get(Type.parse("!llvm.func<void (ptr)>"))
+            )
             fn.operation.attributes["rocdl.kernel"] = UnitAttr.get()
 
             entry = fn.body.blocks.append(ptr)
@@ -193,13 +222,13 @@ def build_shmem_put_kernel() -> Module:
         with InsertionPoint(module.body):
             declare("mori_shmem_my_pe", "!llvm.func<i32 ()>")
             declare("mori_shmem_n_pes", "!llvm.func<i32 ()>")
-            declare("mori_shmem_int32_p",
-                    "!llvm.func<void (ptr, i32, i32, i32)>")
+            declare("mori_shmem_int32_p", "!llvm.func<void (ptr, i32, i32, i32)>")
             declare("mori_shmem_quiet_thread", "!llvm.func<void ()>")
 
             fn = llvm.LLVMFuncOp(
                 "shmem_put_kernel",
-                TypeAttr.get(Type.parse("!llvm.func<void (ptr, i32)>")))
+                TypeAttr.get(Type.parse("!llvm.func<void (ptr, i32)>")),
+            )
             fn.operation.attributes["rocdl.kernel"] = UnitAttr.get()
 
             entry = fn.body.blocks.append(ptr, i32)
@@ -216,8 +245,7 @@ def build_shmem_put_kernel() -> Module:
 
                 zero = llvm.ConstantOp(i32, IntegerAttr.get(i32, 0)).result
 
-                call_void("mori_shmem_int32_p",
-                          [symm_buf, value, dest_pe, zero])
+                call_void("mori_shmem_int32_p", [symm_buf, value, dest_pe, zero])
                 call_void("mori_shmem_quiet_thread")
 
                 llvm.ReturnOp()
@@ -229,8 +257,7 @@ def build_shmem_put_kernel() -> Module:
 # ---------------------------------------------------------------------------
 # 2. Compile:  MLIR module → LLVM IR → link bitcode → .hsaco
 # ---------------------------------------------------------------------------
-def compile_to_hsaco(module: Module, chip: str, out_path: str,
-                     mori_bc: str) -> str:
+def compile_to_hsaco(module: Module, chip: str, out_path: str, mori_bc: str) -> str:
     """Compile MLIR module to .hsaco, linking with mori shmem bitcode."""
     mlir_text = str(module)
     tmpdir = tempfile.mkdtemp(prefix="mori_mlir_")
@@ -238,7 +265,10 @@ def compile_to_hsaco(module: Module, chip: str, out_path: str,
         # MLIR → LLVM IR
         r = subprocess.run(
             [MLIR_TRANSLATE, "--mlir-to-llvmir"],
-            input=mlir_text, capture_output=True, text=True)
+            input=mlir_text,
+            capture_output=True,
+            text=True,
+        )
         if r.returncode != 0:
             raise RuntimeError(f"mlir-translate failed:\n{r.stderr}")
 
@@ -250,19 +280,29 @@ def compile_to_hsaco(module: Module, chip: str, out_path: str,
         linked_bc = os.path.join(tmpdir, "linked.bc")
         r = subprocess.run(
             [LLVM_LINK, kernel_ll, mori_bc, "-o", linked_bc],
-            capture_output=True, text=True)
+            capture_output=True,
+            text=True,
+        )
         if r.returncode != 0:
             raise RuntimeError(f"llvm-link failed:\n{r.stderr}")
 
         # Compile to .hsaco
         r = subprocess.run(
-            [ROCM_CLANG,
-             "-x", "ir", linked_bc,
-             "-target", "amdgcn-amd-amdhsa",
-             f"-mcpu={chip}",
-             "-O3",
-             "-o", out_path],
-            capture_output=True, text=True)
+            [
+                ROCM_CLANG,
+                "-x",
+                "ir",
+                linked_bc,
+                "-target",
+                "amdgcn-amd-amdhsa",
+                f"-mcpu={chip}",
+                "-O3",
+                "-o",
+                out_path,
+            ],
+            capture_output=True,
+            text=True,
+        )
         if r.returncode != 0:
             raise RuntimeError(f"clang failed:\n{r.stderr}")
     finally:
@@ -311,8 +351,7 @@ attributes #0 = { "amdgpu-flat-work-group-size"="1,1" }
 """
 
 
-def compile_ir_to_hsaco(llvm_ir: str, chip: str, out_path: str,
-                        mori_bc: str) -> str:
+def compile_ir_to_hsaco(llvm_ir: str, chip: str, out_path: str, mori_bc: str) -> str:
     """Compile raw LLVM IR text to .hsaco (no MLIR needed)."""
     tmpdir = tempfile.mkdtemp(prefix="mori_llvmir_")
     try:
@@ -323,18 +362,28 @@ def compile_ir_to_hsaco(llvm_ir: str, chip: str, out_path: str,
         linked_bc = os.path.join(tmpdir, "linked.bc")
         r = subprocess.run(
             [LLVM_LINK, kernel_ll, mori_bc, "-o", linked_bc],
-            capture_output=True, text=True)
+            capture_output=True,
+            text=True,
+        )
         if r.returncode != 0:
             raise RuntimeError(f"llvm-link failed:\n{r.stderr}")
 
         r = subprocess.run(
-            [ROCM_CLANG,
-             "-x", "ir", linked_bc,
-             "-target", "amdgcn-amd-amdhsa",
-             f"-mcpu={chip}",
-             "-O3",
-             "-o", out_path],
-            capture_output=True, text=True)
+            [
+                ROCM_CLANG,
+                "-x",
+                "ir",
+                linked_bc,
+                "-target",
+                "amdgcn-amd-amdhsa",
+                f"-mcpu={chip}",
+                "-O3",
+                "-o",
+                out_path,
+            ],
+            capture_output=True,
+            text=True,
+        )
         if r.returncode != 0:
             raise RuntimeError(f"clang failed:\n{r.stderr}")
     finally:
@@ -356,15 +405,17 @@ def main():
     print("\n[1/2] Building shmem_basic_kernel (MLIR path) ...")
     m1 = build_shmem_basic_kernel()
     print(m1)
-    h1 = compile_to_hsaco(m1, chip, os.path.join(tmpdir,
-                          "shmem_basic_kernel.hsaco"), mori_bc)
+    h1 = compile_to_hsaco(
+        m1, chip, os.path.join(tmpdir, "shmem_basic_kernel.hsaco"), mori_bc
+    )
     print(f"[OK] {h1} ({os.path.getsize(h1)} bytes)")
 
     print("\n[2/2] Building shmem_put_kernel (MLIR path) ...")
     m2 = build_shmem_put_kernel()
     print(m2)
-    h2 = compile_to_hsaco(m2, chip, os.path.join(tmpdir,
-                          "shmem_put_kernel.hsaco"), mori_bc)
+    h2 = compile_to_hsaco(
+        m2, chip, os.path.join(tmpdir, "shmem_put_kernel.hsaco"), mori_bc
+    )
     print(f"[OK] {h2} ({os.path.getsize(h2)} bytes)")
 
     print("\n[*] All kernels compiled successfully!")

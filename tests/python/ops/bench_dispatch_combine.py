@@ -412,7 +412,7 @@ def _bench_dispatch_combine(
         if max_num_inp_token_per_rank > 1024:
             dispatch_block_num = 80
             dispatch_warp_per_block = 16
-            if config.use_external_inp_buf == False:  # zero-copy
+            if not config.use_external_inp_buf:  # zero-copy
                 combine_block_num = 80
                 combine_warp_per_block = 4
             else:
@@ -421,7 +421,7 @@ def _bench_dispatch_combine(
         else:  # Low latency configuration
             dispatch_block_num = 64
             dispatch_warp_per_block = 16
-            if config.use_external_inp_buf == False:  # zero-copy
+            if not config.use_external_inp_buf:  # zero-copy
                 combine_block_num = 64
                 combine_warp_per_block = 4
             else:
@@ -433,7 +433,7 @@ def _bench_dispatch_combine(
             if max_num_inp_token_per_rank > 1024:
                 dispatch_block_num = 768
                 dispatch_warp_per_block = 8
-                if config.use_external_inp_buf == False:
+                if not config.use_external_inp_buf:
                     combine_block_num = 72
                     combine_warp_per_block = 4
                 else:
@@ -442,7 +442,7 @@ def _bench_dispatch_combine(
             elif max_num_inp_token_per_rank > 128:
                 dispatch_block_num = 768
                 dispatch_warp_per_block = 8
-                if config.use_external_inp_buf == False:
+                if not config.use_external_inp_buf:
                     combine_block_num = 72
                     combine_warp_per_block = 4
                 else:
@@ -451,7 +451,7 @@ def _bench_dispatch_combine(
             elif max_num_inp_token_per_rank > 64:
                 dispatch_block_num = 216
                 dispatch_warp_per_block = 6
-                if config.use_external_inp_buf == False:
+                if not config.use_external_inp_buf:
                     combine_block_num = 72
                     combine_warp_per_block = 4
                 else:
@@ -460,7 +460,7 @@ def _bench_dispatch_combine(
             else:
                 dispatch_block_num = 223
                 dispatch_warp_per_block = 6
-                if config.use_external_inp_buf == False:
+                if not config.use_external_inp_buf:
                     combine_block_num = 72
                     combine_warp_per_block = 4
                 else:

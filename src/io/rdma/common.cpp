@@ -22,35 +22,18 @@
 #include "src/io/rdma/common.hpp"
 
 #include <cassert>
-#include <cerrno>
 #include <chrono>
 #include <cstdlib>
 #include <limits>
 #include <numeric>
 #include <thread>
 
+#include "mori/io/env.hpp"
 #include "mori/io/logging.hpp"
 
 namespace mori {
 namespace io {
 
-static int GetSqBackoffTimeoutUs() {
-  static const int value = []() {
-    const char* env = std::getenv("MORI_IO_SQ_BACKOFF_TIMEOUT_US");
-    if (env && env[0] != '\0') {
-      errno = 0;
-      char* end = nullptr;
-      long v = std::strtol(env, &end, 10);
-      if (end != env && *end == '\0' && errno == 0 && v > 0 &&
-          v <= std::numeric_limits<int>::max()) {
-        return static_cast<int>(v);
-      }
-      MORI_IO_WARN("Invalid MORI_IO_SQ_BACKOFF_TIMEOUT_US='{}', using default 10000", env);
-    }
-    return 10000;
-  }();
-  return value;
-}
 // SQ depth is an admission counter only. It does not publish data dependencies
 // across threads, so relaxed atomics are sufficient for correctness.
 static bool TryReserveSqDepth(const EpPair& ep, int wrCount, int epId, const char* opTag,
@@ -70,7 +53,11 @@ static bool TryReserveSqDepth(const EpPair& ep, int wrCount, int epId, const cha
     }
     return false;
   }
-  const int kBackoffTimeoutUs = GetSqBackoffTimeoutUs();
+  static const int kBackoffTimeoutUs = []() {
+    int v = 10000;
+    env::Override("MORI_IO_SQ_BACKOFF_TIMEOUT_US", v, mori::env::detail::ParsePositiveInt);
+    return v;
+  }();
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::microseconds(kBackoffTimeoutUs);
   int backoff = 0;

@@ -75,8 +75,12 @@ struct SymmMemObj {
   // For Sdma
   anvil::SdmaQueueDeviceHandle** deviceHandles_d = nullptr;  // should only placed on GPU
   HSAuint64* signalPtrs = nullptr;                           // should only placed on GPU
-  uint32_t sdmaNumQueue = 8;                                 // number of sdma queue
+  uint32_t sdmaNumQueue = 2;                                 // number of sdma queue
   HSAuint64* expectSignalsPtr = nullptr;                     // should only placed on GPU
+  // Remote signal: peerSignalPtrs[pe] points to PE pe's signalPtrs mapped into local address space.
+  // SdmaPutThread writes ATOMIC to peerSignalPtrs[remotePe] + myPe*sdmaNumQueue + qId,
+  // so the remote PE can directly read its own signalPtrs to detect completion.
+  HSAuint64** peerSignalPtrs = nullptr;  // should only placed on GPU
 
   __device__ __host__ RdmaMemoryRegion GetRdmaMemoryRegion(int pe) const {
     RdmaMemoryRegion mr;

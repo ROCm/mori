@@ -1,3 +1,24 @@
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+#
+# MIT License
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 # Copyright (c) Advanced Micro Devices, Inc. All rights reserved.
 # MIT License
 """
@@ -30,7 +51,6 @@ MORI_DEVICE_FUNCTIONS = {
         "ret": "int32",
         "pure": True,
     },
-
     # ==== Point-to-Point ====
     "ptr_p2p": {
         "symbol": "mori_shmem_ptr_p2p",
@@ -42,7 +62,6 @@ MORI_DEVICE_FUNCTIONS = {
         "args": ["uint64", "int32"],
         "ret": "uint64",
     },
-
     # ==== Synchronization ====
     "quiet_thread": {
         "symbol": "mori_shmem_quiet_thread",
@@ -84,7 +103,6 @@ MORI_DEVICE_FUNCTIONS = {
         "args": [],
         "ret": "int32",
     },
-
     # ==== PutNbi – Thread ====
     "putmem_nbi_thread": {
         "symbol": "mori_shmem_putmem_nbi_thread",
@@ -111,7 +129,6 @@ MORI_DEVICE_FUNCTIONS = {
         "args": ["uint64", "uint64", "uint64", "int32", "int32"],
         "ret": "int32",
     },
-
     # ==== PutNbi – Warp ====
     "putmem_nbi_warp": {
         "symbol": "mori_shmem_putmem_nbi_warp",
@@ -138,7 +155,6 @@ MORI_DEVICE_FUNCTIONS = {
         "args": ["uint64", "uint64", "uint64", "int32", "int32"],
         "ret": "int32",
     },
-
     # ==== PutNbi – Block ====
     "putmem_nbi_block": {
         "symbol": "mori_shmem_putmem_nbi_block",
@@ -165,24 +181,205 @@ MORI_DEVICE_FUNCTIONS = {
         "args": ["uint64", "uint64", "uint64", "int32", "int32"],
         "ret": "int32",
     },
-
+    # ==== GetNbi – Thread ====
+    "getmem_nbi_thread": {
+        "symbol": "mori_shmem_getmem_nbi_thread",
+        "args": ["uint64", "uint64", "uint64", "int32", "int32"],
+        "ret": "int32",
+    },
+    "get_uint32_nbi_thread": {
+        "symbol": "mori_shmem_get_uint32_nbi_thread",
+        "args": ["uint64", "uint64", "uint64", "int32", "int32"],
+        "ret": "int32",
+    },
+    "get_uint64_nbi_thread": {
+        "symbol": "mori_shmem_get_uint64_nbi_thread",
+        "args": ["uint64", "uint64", "uint64", "int32", "int32"],
+        "ret": "int32",
+    },
+    "get_float_nbi_thread": {
+        "symbol": "mori_shmem_get_float_nbi_thread",
+        "args": ["uint64", "uint64", "uint64", "int32", "int32"],
+        "ret": "int32",
+    },
+    "get_double_nbi_thread": {
+        "symbol": "mori_shmem_get_double_nbi_thread",
+        "args": ["uint64", "uint64", "uint64", "int32", "int32"],
+        "ret": "int32",
+    },
+    # ==== GetNbi – Warp ====
+    "getmem_nbi_warp": {
+        "symbol": "mori_shmem_getmem_nbi_warp",
+        "args": ["uint64", "uint64", "uint64", "int32", "int32"],
+        "ret": "int32",
+    },
+    "get_uint32_nbi_warp": {
+        "symbol": "mori_shmem_get_uint32_nbi_warp",
+        "args": ["uint64", "uint64", "uint64", "int32", "int32"],
+        "ret": "int32",
+    },
+    "get_uint64_nbi_warp": {
+        "symbol": "mori_shmem_get_uint64_nbi_warp",
+        "args": ["uint64", "uint64", "uint64", "int32", "int32"],
+        "ret": "int32",
+    },
+    "get_float_nbi_warp": {
+        "symbol": "mori_shmem_get_float_nbi_warp",
+        "args": ["uint64", "uint64", "uint64", "int32", "int32"],
+        "ret": "int32",
+    },
+    "get_double_nbi_warp": {
+        "symbol": "mori_shmem_get_double_nbi_warp",
+        "args": ["uint64", "uint64", "uint64", "int32", "int32"],
+        "ret": "int32",
+    },
+    # ==== GetNbi – Block ====
+    "getmem_nbi_block": {
+        "symbol": "mori_shmem_getmem_nbi_block",
+        "args": ["uint64", "uint64", "uint64", "int32", "int32"],
+        "ret": "int32",
+    },
+    "get_uint32_nbi_block": {
+        "symbol": "mori_shmem_get_uint32_nbi_block",
+        "args": ["uint64", "uint64", "uint64", "int32", "int32"],
+        "ret": "int32",
+    },
+    "get_uint64_nbi_block": {
+        "symbol": "mori_shmem_get_uint64_nbi_block",
+        "args": ["uint64", "uint64", "uint64", "int32", "int32"],
+        "ret": "int32",
+    },
+    "get_float_nbi_block": {
+        "symbol": "mori_shmem_get_float_nbi_block",
+        "args": ["uint64", "uint64", "uint64", "int32", "int32"],
+        "ret": "int32",
+    },
+    "get_double_nbi_block": {
+        "symbol": "mori_shmem_get_double_nbi_block",
+        "args": ["uint64", "uint64", "uint64", "int32", "int32"],
+        "ret": "int32",
+    },
+    # ==== Blocking GET – Thread ====
+    "getmem_thread": {
+        "symbol": "mori_shmem_getmem_thread",
+        "args": ["uint64", "uint64", "uint64", "int32", "int32"],
+        "ret": "int32",
+    },
+    "get_uint32_thread": {
+        "symbol": "mori_shmem_get_uint32_thread",
+        "args": ["uint64", "uint64", "uint64", "int32", "int32"],
+        "ret": "int32",
+    },
+    "get_uint64_thread": {
+        "symbol": "mori_shmem_get_uint64_thread",
+        "args": ["uint64", "uint64", "uint64", "int32", "int32"],
+        "ret": "int32",
+    },
+    "get_float_thread": {
+        "symbol": "mori_shmem_get_float_thread",
+        "args": ["uint64", "uint64", "uint64", "int32", "int32"],
+        "ret": "int32",
+    },
+    "get_double_thread": {
+        "symbol": "mori_shmem_get_double_thread",
+        "args": ["uint64", "uint64", "uint64", "int32", "int32"],
+        "ret": "int32",
+    },
+    # ==== Blocking GET – Warp ====
+    "getmem_warp": {
+        "symbol": "mori_shmem_getmem_warp",
+        "args": ["uint64", "uint64", "uint64", "int32", "int32"],
+        "ret": "int32",
+    },
+    "get_uint32_warp": {
+        "symbol": "mori_shmem_get_uint32_warp",
+        "args": ["uint64", "uint64", "uint64", "int32", "int32"],
+        "ret": "int32",
+    },
+    "get_uint64_warp": {
+        "symbol": "mori_shmem_get_uint64_warp",
+        "args": ["uint64", "uint64", "uint64", "int32", "int32"],
+        "ret": "int32",
+    },
+    "get_float_warp": {
+        "symbol": "mori_shmem_get_float_warp",
+        "args": ["uint64", "uint64", "uint64", "int32", "int32"],
+        "ret": "int32",
+    },
+    "get_double_warp": {
+        "symbol": "mori_shmem_get_double_warp",
+        "args": ["uint64", "uint64", "uint64", "int32", "int32"],
+        "ret": "int32",
+    },
+    # ==== Blocking GET – Block ====
+    "getmem_block": {
+        "symbol": "mori_shmem_getmem_block",
+        "args": ["uint64", "uint64", "uint64", "int32", "int32"],
+        "ret": "int32",
+    },
+    "get_uint32_block": {
+        "symbol": "mori_shmem_get_uint32_block",
+        "args": ["uint64", "uint64", "uint64", "int32", "int32"],
+        "ret": "int32",
+    },
+    "get_uint64_block": {
+        "symbol": "mori_shmem_get_uint64_block",
+        "args": ["uint64", "uint64", "uint64", "int32", "int32"],
+        "ret": "int32",
+    },
+    "get_float_block": {
+        "symbol": "mori_shmem_get_float_block",
+        "args": ["uint64", "uint64", "uint64", "int32", "int32"],
+        "ret": "int32",
+    },
+    "get_double_block": {
+        "symbol": "mori_shmem_get_double_block",
+        "args": ["uint64", "uint64", "uint64", "int32", "int32"],
+        "ret": "int32",
+    },
     # ==== PutNbi with Signal ====
     "putmem_nbi_signal_thread": {
         "symbol": "mori_shmem_putmem_nbi_signal_thread",
-        "args": ["uint64", "uint64", "uint64", "uint64", "uint64", "int32", "int32", "int32"],
+        "args": [
+            "uint64",
+            "uint64",
+            "uint64",
+            "uint64",
+            "uint64",
+            "int32",
+            "int32",
+            "int32",
+        ],
         "ret": "int32",
     },
     "putmem_nbi_signal_warp": {
         "symbol": "mori_shmem_putmem_nbi_signal_warp",
-        "args": ["uint64", "uint64", "uint64", "uint64", "uint64", "int32", "int32", "int32"],
+        "args": [
+            "uint64",
+            "uint64",
+            "uint64",
+            "uint64",
+            "uint64",
+            "int32",
+            "int32",
+            "int32",
+        ],
         "ret": "int32",
     },
     "putmem_nbi_signal_block": {
         "symbol": "mori_shmem_putmem_nbi_signal_block",
-        "args": ["uint64", "uint64", "uint64", "uint64", "uint64", "int32", "int32", "int32"],
+        "args": [
+            "uint64",
+            "uint64",
+            "uint64",
+            "uint64",
+            "uint64",
+            "int32",
+            "int32",
+            "int32",
+        ],
         "ret": "int32",
     },
-
     # ==== Immediate Put ====
     "put_size_imm_nbi_thread": {
         "symbol": "mori_shmem_put_size_imm_nbi_thread",
@@ -224,7 +421,6 @@ MORI_DEVICE_FUNCTIONS = {
         "args": ["uint64", "float64", "int32", "int32"],
         "ret": "int32",
     },
-
     # ==== Atomic NonFetch – Thread ====
     "atomic_size_nonfetch_thread": {
         "symbol": "mori_shmem_atomic_size_nonfetch_thread",
@@ -246,7 +442,6 @@ MORI_DEVICE_FUNCTIONS = {
         "args": ["uint64", "int64", "int32", "int32", "int32"],
         "ret": "int32",
     },
-
     # ==== Atomic Fetch – Thread ====
     "atomic_uint32_fetch_thread": {
         "symbol": "mori_shmem_atomic_uint32_fetch_thread",
@@ -263,7 +458,6 @@ MORI_DEVICE_FUNCTIONS = {
         "args": ["uint64", "int64", "int64", "int32", "int32", "int32"],
         "ret": "int64",
     },
-
     # ==== Atomic Add Convenience – Thread ====
     "uint32_atomic_add_thread": {
         "symbol": "mori_shmem_uint32_atomic_add_thread",
@@ -295,7 +489,6 @@ MORI_DEVICE_FUNCTIONS = {
         "args": ["uint64", "int64", "int32", "int32"],
         "ret": "int64",
     },
-
     # ==== Wait ====
     "uint32_wait_until_greater_than": {
         "symbol": "mori_shmem_uint32_wait_until_greater_than",

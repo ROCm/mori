@@ -20,7 +20,9 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 #include <arpa/inet.h>
+#ifdef MORI_WITH_MPI
 #include <mpi.h>
+#endif
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -590,6 +592,17 @@ static void InitializeBootStates(ShmemStates* states, application::BootstrapNetw
 int ShmemInit(application::BootstrapNetwork* bootNet) {
   ShmemStates* states = ShmemStatesSingleton::GetInstance();
 
+  if (states->status == ShmemStatesStatus::Initialized) {
+    MORI_SHMEM_INFO("Shmem already initialized, skipping");
+    delete bootNet;
+    return 0;
+  }
+  if (states->status == ShmemStatesStatus::Finalized) {
+    MORI_SHMEM_ERROR("Shmem has been finalized, cannot re-initialize");
+    delete bootNet;
+    return -1;
+  }
+
   // Configure shmem mode
   states->mode = ConfigureShmemMode();
 
@@ -709,11 +722,13 @@ int ShmemFinalize() {
 /*                                      Other Initialization APIs                                */
 /* ---------------------------------------------------------------------------------------------- */
 
+#ifdef MORI_WITH_MPI
 int ShmemMpiInit(MPI_Comm mpiComm) {
   return ShmemInit(new application::MpiBootstrapNetwork(mpiComm));
 }
 
 int ShmemInit() { return ShmemMpiInit(MPI_COMM_WORLD); }
+#endif
 
 int ShmemTorchProcessGroupInit(const std::string& groupName) {
 #ifdef MORI_HAS_TORCH
@@ -847,6 +862,7 @@ int ShmemInitAttr(unsigned int flags, mori_shmem_init_attr_t* attr) {
     return -1;
   }
 
+#ifdef MORI_WITH_MPI
   // MPI-based initialization
   if (flags == MORI_SHMEM_INIT_WITH_MPI_COMM) {
     if (attr->mpi_comm == nullptr) {
@@ -856,6 +872,12 @@ int ShmemInitAttr(unsigned int flags, mori_shmem_init_attr_t* attr) {
     int result = ShmemMpiInit(*reinterpret_cast<MPI_Comm*>(attr->mpi_comm));
     return (result == 0) ? 0 : -1;
   }
+#else
+  if (flags == MORI_SHMEM_INIT_WITH_MPI_COMM) {
+    MORI_SHMEM_ERROR("MPI support is not enabled. Rebuild with -DWITH_MPI=ON.");
+    return -1;
+  }
+#endif
 
   // UniqueId-based initialization
   if (flags == MORI_SHMEM_INIT_WITH_UNIQUEID) {

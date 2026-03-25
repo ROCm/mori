@@ -287,19 +287,18 @@ class EpDispatchCombineTestCase:
         else:
             combine_input = dispatch_output
 
-        combine_buf = op.get_registered_combine_input_buffer(
-            combine_input.dtype, hidden_dim=combine_input.size(1)
-        )
-        combine_buf[:total_recv_num_token, :].copy_(
-            combine_input[:total_recv_num_token, :]
-        )
-
-        combine_input_weight = dispatch_weights
+        if not self.config.use_external_inp_buf:
+            combine_buf = op.get_registered_combine_input_buffer(
+                combine_input.dtype, hidden_dim=combine_input.size(1)
+            )
+            combine_buf[:total_recv_num_token, :].copy_(
+                combine_input[:total_recv_num_token, :]
+            )
 
         combine_output, combine_output_weight = op.combine(
             combine_input.to(torch.bfloat16),
-            combine_input_weight,
-            indices,
+            dispatch_weights,
+            dispatch_indices,
             block_num=80,
             warp_per_block=8,
         )
@@ -310,6 +309,7 @@ class EpDispatchCombineTestCase:
                 print(
                     "Combine Pass (fp4: dispatch verified, combine ran for state reset)"
                 )
+            op.reset()
             return
 
         for i in range(num_tokens):
@@ -319,37 +319,56 @@ class EpDispatchCombineTestCase:
             ]
             unique_pes = len(set(pes))
 
-            got, expected = combine_output[i], input[i].to(torch.bfloat16) * unique_pes
+            got = combine_output[i]
+            expected = (input[i].to(torch.float32) * unique_pes).to(
+                self.config.data_type
+            )
 
             atol, rtol = 1e-2, 1e-2
             if self.config.quant_type == "fp8_direct_cast":
                 atol, rtol = 1e-1, 1e-1
-            assert torch.allclose(got.float(), expected.float(), atol=atol, rtol=rtol)
-
-            got_weight, expected_weight = (
-                combine_output_weight[i],
-                weights[i] * unique_pes,
+            result_match = torch.allclose(
+                got.float(), expected.float(), atol=atol, rtol=rtol
             )
-            weight_match = torch.allclose(
-                got_weight, expected_weight, atol=1e-5, rtol=1e-5
-            )
-            if not weight_match and self.config.rank == 0:
-                print(f"Weight mismatch for token {i}:")
+            if not result_match and self.config.rank == 0:
+                print(f"Result mismatch for token {i}:")
                 print(f"  indices[{i}]: {indices[i].cpu().tolist()}")
                 print(f"  pes: {pes}")
                 print(f"  unique_pes: {unique_pes}")
-                print(f"  got_weight: {got_weight}")
-                print(
-                    f"  expected_weight (weights[{i}] * {unique_pes}): {expected_weight}"
-                )
-                print(f"  original weights[{i}]: {weights[i]}")
-                print(f"  diff: {torch.abs(got_weight - expected_weight)}")
-                print(f"  max_diff: {torch.abs(got_weight - expected_weight).max()}")
+                print(f"  got: {got}")
+                print(f"  expected: {expected}")
+                print(f"  input: {input[i].to(torch.float32)}")
+                print(f"  max_diff: {torch.abs(got.float() - expected.float()).max()}")
+            assert result_match, f"Result assertion failed for token {i}"
 
-            assert weight_match, f"Weight assertion failed for token {i}"
+            if combine_output_weight is not None:
+                got_weight, expected_weight = (
+                    combine_output_weight[i],
+                    weights[i] * unique_pes,
+                )
+                weight_match = torch.allclose(
+                    got_weight, expected_weight, atol=1e-5, rtol=1e-5
+                )
+                if not weight_match and self.config.rank == 0:
+                    print(f"Weight mismatch for token {i}:")
+                    print(f"  indices[{i}]: {indices[i].cpu().tolist()}")
+                    print(f"  pes: {pes}")
+                    print(f"  unique_pes: {unique_pes}")
+                    print(f"  got_weight: {got_weight}")
+                    print(
+                        f"  expected_weight (weights[{i}] * {unique_pes}): {expected_weight}"
+                    )
+                    print(f"  original weights[{i}]: {weights[i]}")
+                    print(f"  diff: {torch.abs(got_weight - expected_weight)}")
+                    print(
+                        f"  max_diff: {torch.abs(got_weight - expected_weight).max()}"
+                    )
+                assert weight_match, f"Weight assertion failed for token {i}"
 
         if self.config.rank == 0:
             print("Combine Pass")
+
+        op.reset()
 
     def test_dispatch_combine(self):
         op = mori.ops.EpDispatchCombineOp(self.config)

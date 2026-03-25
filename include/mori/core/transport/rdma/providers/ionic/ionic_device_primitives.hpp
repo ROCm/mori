@@ -143,11 +143,12 @@ inline __device__ uint64_t PostRecv<ProviderType::PSD>(WorkQueueHandle& wq, uint
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        Read / Write APIs                                       */
 /* ---------------------------------------------------------------------------------------------- */
-// TODO: convert raddr/rkey laddr/lkey to big endien in advance to save cycles
-inline __device__ uint64_t IonicPostReadWrite(WorkQueueHandle& wq, uint32_t curPostIdx,
-                                              bool cqeSignal, uint32_t qpn, uintptr_t laddr,
-                                              uint64_t lkey, uintptr_t raddr, uint64_t rkey,
-                                              size_t bytes, bool isRead) {
+template <bool IsRead>
+inline __device__ uint64_t IonicPostReadWriteImpl(WorkQueueHandle& wq, uint32_t curPostIdx,
+                                                  bool cqeSignal, uint32_t qpn, uintptr_t laddr,
+                                                  uint64_t lkey, uintptr_t raddr, uint64_t rkey,
+                                                  size_t bytes) {
+  constexpr uint8_t opcode = IsRead ? IONIC_V2_OP_RDMA_READ : IONIC_V2_OP_RDMA_WRITE;
   void* queueBuffAddr = wq.sqAddr;
   uint32_t wqeNum = wq.sqWqeNum;
   int32_t size = (int32_t)bytes;
@@ -156,8 +157,6 @@ inline __device__ uint64_t IonicPostReadWrite(WorkQueueHandle& wq, uint32_t curP
   struct ionic_v1_wqe* wqe = reinterpret_cast<ionic_v1_wqe*>(wqeAddr);
   uint16_t wqe_flags = 0;
 
-  // MORI_PRINTF("IonicPostReadWrite, wqe:%p, curPostIdx:%d, wqeIdx:%d\n", wqe, curPostIdx, wqeIdx);
-  // to do: need to clear memory
   if ((wqeNum & curPostIdx) == 0) {
     wqe_flags |= HTOBE16(IONIC_V1_FLAG_COLOR);
   }
@@ -167,7 +166,7 @@ inline __device__ uint64_t IonicPostReadWrite(WorkQueueHandle& wq, uint32_t curP
   }
 
   wqe->base.wqe_idx = curPostIdx;
-  wqe->base.op = isRead ? IONIC_V2_OP_RDMA_READ : IONIC_V2_OP_RDMA_WRITE;
+  wqe->base.op = opcode;
   wqe->base.num_sge_key = size ? 1 : 0;
   wqe->base.imm_data_key = HTOBE32(0);
 
@@ -182,61 +181,43 @@ inline __device__ uint64_t IonicPostReadWrite(WorkQueueHandle& wq, uint32_t curP
 
   __hip_atomic_store(&wqe->base.flags, wqe_flags, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
 
-#if 0
-  MORI_PRINTF("dump wqe at addr:%p\n", wqeAddr);
-  for (int i = 0; i < 64; i++) {
-    MORI_PRINTF("%02x", (unsigned char)wqeAddr[i]);
-    if ((i+1)%4 == 0)
-      MORI_PRINTF("\n");
-  }
-#endif
-#if 0
-  MORI_PRINTF("Write, block:%u, warp:%u, lane:%u, wqe:%p, raddr:%p, rkey:%lu, len:%u, curPostIdx:%u, wqeIdx:%u, doorbell:0x%x\n",
-         blockIdx.x, threadIdx.x/warpSize, __lane_id(),
-	 wqe, raddr, rkey, size, curPostIdx, curPostIdx, ((curPostIdx + 1) & (wqeNum - 1)));
-#endif
-  //__threadfence_system();
-  // asm volatile("" ::: "memory");
-  // return doorbell value
   return wq.sq_dbval | ((curPostIdx + 1) & (wqeNum - 1));
 }
 
 template <>
-inline __device__ uint64_t PostWrite<ProviderType::PSD>(WorkQueueHandle& wq, uint32_t curPostIdx,
-                                                        uint32_t curMsntblSlotIdx,
-                                                        uint32_t curPsnIdx, bool cqeSignal,
-                                                        uint32_t qpn, uintptr_t laddr,
-                                                        uint64_t lkey, uintptr_t raddr,
-                                                        uint64_t rkey, size_t bytes) {
-  return IonicPostReadWrite(wq, curPostIdx, cqeSignal, qpn, laddr, lkey, raddr, rkey, bytes, false);
+inline __device__ uint64_t PostReadWrite<ProviderType::PSD, false>(
+    WorkQueueHandle& wq, uint32_t curPostIdx, uint32_t curMsntblSlotIdx, uint32_t curPsnIdx,
+    bool cqeSignal, uint32_t qpn, uintptr_t laddr, uint64_t lkey, uintptr_t raddr, uint64_t rkey,
+    size_t bytes) {
+  return IonicPostReadWriteImpl<false>(wq, curPostIdx, cqeSignal, qpn, laddr, lkey, raddr, rkey,
+                                       bytes);
 }
 
 template <>
-inline __device__ uint64_t PostRead<ProviderType::PSD>(WorkQueueHandle& wq, uint32_t curPostIdx,
-                                                       uint32_t curMsntblSlotIdx,
-                                                       uint32_t curPsnIdx, bool cqeSignal,
-                                                       uint32_t qpn, uintptr_t laddr, uint64_t lkey,
-                                                       uintptr_t raddr, uint64_t rkey,
-                                                       size_t bytes) {
-  return IonicPostReadWrite(wq, curPostIdx, cqeSignal, qpn, laddr, lkey, raddr, rkey, bytes, true);
+inline __device__ uint64_t PostReadWrite<ProviderType::PSD, true>(
+    WorkQueueHandle& wq, uint32_t curPostIdx, uint32_t curMsntblSlotIdx, uint32_t curPsnIdx,
+    bool cqeSignal, uint32_t qpn, uintptr_t laddr, uint64_t lkey, uintptr_t raddr, uint64_t rkey,
+    size_t bytes) {
+  return IonicPostReadWriteImpl<true>(wq, curPostIdx, cqeSignal, qpn, laddr, lkey, raddr, rkey,
+                                      bytes);
 }
 
 template <>
-inline __device__ uint64_t PostWrite<ProviderType::PSD>(WorkQueueHandle& wq, uint32_t qpn,
-                                                        uintptr_t laddr, uint64_t lkey,
-                                                        uintptr_t raddr, uint64_t rkey,
-                                                        size_t bytes) {
+inline __device__ uint64_t PostReadWrite<ProviderType::PSD, false>(WorkQueueHandle& wq,
+                                                                   uint32_t qpn, uintptr_t laddr,
+                                                                   uint64_t lkey, uintptr_t raddr,
+                                                                   uint64_t rkey, size_t bytes) {
   uint32_t curPostIdx = atomicAdd(&wq.postIdx, 1);
-  return IonicPostReadWrite(wq, curPostIdx, true, qpn, laddr, lkey, raddr, rkey, bytes, false);
+  return IonicPostReadWriteImpl<false>(wq, curPostIdx, true, qpn, laddr, lkey, raddr, rkey, bytes);
 }
 
 template <>
-inline __device__ uint64_t PostRead<ProviderType::PSD>(WorkQueueHandle& wq, uint32_t qpn,
-                                                       uintptr_t laddr, uint64_t lkey,
-                                                       uintptr_t raddr, uint64_t rkey,
-                                                       size_t bytes) {
+inline __device__ uint64_t PostReadWrite<ProviderType::PSD, true>(WorkQueueHandle& wq, uint32_t qpn,
+                                                                  uintptr_t laddr, uint64_t lkey,
+                                                                  uintptr_t raddr, uint64_t rkey,
+                                                                  size_t bytes) {
   uint32_t curPostIdx = atomicAdd(&wq.postIdx, 1);
-  return IonicPostReadWrite(wq, curPostIdx, true, qpn, laddr, lkey, raddr, rkey, bytes, true);
+  return IonicPostReadWriteImpl<true>(wq, curPostIdx, true, qpn, laddr, lkey, raddr, rkey, bytes);
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -279,7 +260,7 @@ inline __device__ uint64_t IonicPostWriteInline(WorkQueueHandle& wq, uint32_t cu
   __hip_atomic_store(&wqe->base.flags, wqe_flags, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
 #if 0
   MORI_PRINTF("write inline, block:%u, warp:%u, lane:%u, wqe:%p, raddr:%p, rkey:%lu, size:%u, curPostIdx:%u, wqeIdx:%u, doorbell:0x%x\n",
-	 blockIdx.x, threadIdx.x/warpSize, __lane_id(),
+   blockIdx.x, threadIdx.x/warpSize, __lane_id(),
          wqe, raddr, rkey, size, curPostIdx, curPostIdx, ((curPostIdx + 1) & (wqeNum - 1)));
 #endif
   // asm volatile("" ::: "memory");
@@ -379,7 +360,7 @@ inline __device__ uint64_t IonicPrepareAtomicWqe(WorkQueueHandle& wq, uint32_t c
 
 #if 0
   MORI_PRINTF("atomic,block:%u, warp:%u, lane:%u, wqe:%p, curPostIdx:%u, wqeIdx:%u, doorbell:0x%x\n",
-	 blockIdx.x, threadIdx.x/warpSize, __lane_id(),
+   blockIdx.x, threadIdx.x/warpSize, __lane_id(),
          wqe, curPostIdx, wqeIdx, ((curPostIdx + 1) & (wqeNum - 1)));
 #endif
   // asm volatile("" ::: "memory");
@@ -513,8 +494,8 @@ inline __device__ int PollCqOnce<ProviderType::PSD>(void* cqeAddr, uint32_t cqeN
   struct ionic_v1_cqe* cqe = reinterpret_cast<ionic_v1_cqe*>(Addr);
 
   MORI_PRINTF("ABH %s:%d consIdx:%u, cqeIdx:%u, cqeAddr:%p, qtf_be:0x%08x, cqe->status_length:%d\n",
-         __func__, __LINE__, consIdx, cqeIdx, Addr, *(volatile uint32_t*)(&cqe->qid_type_flags),
-         HTOBE32(cqe->status_length));
+              __func__, __LINE__, consIdx, cqeIdx, Addr,
+              *(volatile uint32_t*)(&cqe->qid_type_flags), HTOBE32(cqe->status_length));
 #if 1
   MORI_PRINTF("dump cqe at addr:%p\n", Addr);
   for (int i = 0; i < 32; i++) {
@@ -548,7 +529,7 @@ inline __device__ int PollCqOnce<ProviderType::PSD>(void* cqeAddr, uint32_t cqeN
     uint32_t status = cqe->status_length;
     uint64_t npg = cqe->send.npg_wqe_idx_timestamp & IONIC_V1_CQE_WQE_IDX_MASK;
     MORI_PRINTF("QUIET ERROR: qid %u type %u flag %#x status %u msn %u npg %lu\n", qid, type, flag,
-           status, msn, npg);
+                status, msn, npg);
     return HTOBE32(cqe->status_length);
   }
 
@@ -573,8 +554,8 @@ inline __device__ int PollCq<ProviderType::PSD>(void* cqAddr, uint32_t cqeNum, u
   // Handle error cases
   if (err) {
     auto error = IonicHandleErrorCqe(err);
-    MORI_PRINTF("[IONIC PollCq] CQE error: %s (opcode: %d) at %s:%d\n", IbvWcStatusString(error), err,
-           __FILE__, __LINE__);
+    MORI_PRINTF("[IONIC PollCq] CQE error: %s (opcode: %d) at %s:%d\n", IbvWcStatusString(error),
+                err, __FILE__, __LINE__);
     return err;
   }
 
@@ -613,8 +594,8 @@ inline __device__ int PollCq<ProviderType::PSD>(void* cqAddr, uint32_t cqeNum, u
     // MORI_PRINTF(
     //     "PollCqOnce2, QUIET ERROR: block:%u, warp:%u, lane:%u, cqeAddr:%p, error:%u "
     //     "qid %u type %u flag %#x status 0x%08x msn %u npg %lu\n",
-    //     blockIdx.x, threadIdx.x / warpSize, __lane_id(), cqeAddr, error, qid, type, flags, status,
-    //     msn, npg);
+    //     blockIdx.x, threadIdx.x / warpSize, __lane_id(), cqeAddr, error, qid, type, flags,
+    //     status, msn, npg);
 
 #if 0
     // Debug: dump raw CQE contents
@@ -633,7 +614,6 @@ inline __device__ int PollCq<ProviderType::PSD>(void* cqAddr, uint32_t cqeNum, u
   *wqeCounter = BE32TOH(cqe->send.msg_msn);
   return 0;
 }
-
 
 #ifdef IONIC_CCQE
 inline __device__ int PollCqOnce2(WorkQueueHandle& wqHandle, CompletionQueueHandle& cqHandle,
@@ -669,8 +649,8 @@ inline __device__ int PollCqOnce2(WorkQueueHandle& wqHandle, CompletionQueueHand
   struct ionic_v1_cqe* cqe = reinterpret_cast<ionic_v1_cqe*>(Addr);
 #if 0
   MORI_PRINTF("PollCqOnce2, block:%u, warp:%u, lane:%u, consIdx:%u, cqeIdx:%u, cqeAddr:%p, qtf_be:0x%08x, cqe->status_length:%d, msn:%u\n",
-	 blockIdx.x, threadIdx.x/warpSize, __lane_id(), my_cq_pos, cqeIdx, Addr,
-	 *(volatile uint32_t *)(&cqe->qid_type_flags), BE32TOH(cqe->status_length), BE32TOH(cqe->send.msg_msn));
+   blockIdx.x, threadIdx.x/warpSize, __lane_id(), my_cq_pos, cqeIdx, Addr,
+   *(volatile uint32_t *)(&cqe->qid_type_flags), BE32TOH(cqe->status_length), BE32TOH(cqe->send.msg_msn));
 #endif
 #if 0
   MORI_PRINTF("dump cqe at addr:%p\n", Addr);
@@ -730,7 +710,7 @@ inline __device__ int PollCqOnce2(WorkQueueHandle& wqHandle, CompletionQueueHand
 #if 0
   MORI_PRINTF("PollCqOnce2, success, block:%u, warp:%u, lane:%u, qp:%u, cqeAddr:%p, my_cq_pos:%u, cqeNum:%u, msn:%u\n",
           blockIdx.x, threadIdx.x/warpSize, __lane_id(),
-	  qtf_be >> IONIC_V1_CQE_QID_SHIFT, Addr, my_cq_pos, cqHandle.cqeNum, msn);
+    qtf_be >> IONIC_V1_CQE_QID_SHIFT, Addr, my_cq_pos, cqHandle.cqeNum, msn);
 #endif
   /* Only proceed with the furthest ahead cqe to update the sq state */
   uint64_t my_lane_mask = 1ull << __lane_id();
@@ -827,8 +807,7 @@ inline __device__ void UpdateCqDbrRecord<ProviderType::PSD>(CompletionQueueHandl
                                                             uint32_t consIdx) {
 #if 1
   uint64_t dbrVal = cq.cq_dbval | ((cq.cqeNum - 1) & consIdx);  // don't add 1 to consIdx
-  __atomic_store_n(reinterpret_cast<uint64_t*>(cq.dbrRecAddr), dbrVal,
-                     __ATOMIC_SEQ_CST); 
+  __atomic_store_n(reinterpret_cast<uint64_t*>(cq.dbrRecAddr), dbrVal, __ATOMIC_SEQ_CST);
   // MORI_PRINTF("UpdateCqDbrRecord, dbrRecAddr:%p, dbrVal:%#lx\n",
   // reinterpret_cast<uint64_t*>(cq.dbrRecAddr), dbrVal);
   return;

@@ -95,25 +95,47 @@ template <ProviderType PrvdType>
 inline __device__ uint64_t PostRecv(WorkQueueHandle& wq, uint32_t qpn, uintptr_t laddr,
                                     uint64_t lkey, size_t bytes);
 
+template <ProviderType PrvdType, bool IsRead>
+inline __device__ uint64_t PostReadWrite(WorkQueueHandle& wq, uint32_t curPostIdx,
+                                         uint32_t curMsntblSlotIdx, uint32_t curPsnIdx,
+                                         bool cqeSignal, uint32_t qpn, uintptr_t laddr,
+                                         uint64_t lkey, uintptr_t raddr, uint64_t rkey,
+                                         size_t bytes);
+
+template <ProviderType PrvdType, bool IsRead>
+inline __device__ uint64_t PostReadWrite(WorkQueueHandle& wq, uint32_t qpn, uintptr_t laddr,
+                                         uint64_t lkey, uintptr_t raddr, uint64_t rkey,
+                                         size_t bytes);
+
 template <ProviderType PrvdType>
 inline __device__ uint64_t PostWrite(WorkQueueHandle& wq, uint32_t curPostIdx,
                                      uint32_t curMsntblSlotIdx, uint32_t curPsnIdx, bool cqeSignal,
                                      uint32_t qpn, uintptr_t laddr, uint64_t lkey, uintptr_t raddr,
-                                     uint64_t rkey, size_t bytes);
+                                     uint64_t rkey, size_t bytes) {
+  return PostReadWrite<PrvdType, false>(wq, curPostIdx, curMsntblSlotIdx, curPsnIdx, cqeSignal, qpn,
+                                        laddr, lkey, raddr, rkey, bytes);
+}
 
 template <ProviderType PrvdType>
 inline __device__ uint64_t PostRead(WorkQueueHandle& wq, uint32_t curPostIdx,
                                     uint32_t curMsntblSlotIdx, uint32_t curPsnIdx, bool cqeSignal,
                                     uint32_t qpn, uintptr_t laddr, uint64_t lkey, uintptr_t raddr,
-                                    uint64_t rkey, size_t bytes);
+                                    uint64_t rkey, size_t bytes) {
+  return PostReadWrite<PrvdType, true>(wq, curPostIdx, curMsntblSlotIdx, curPsnIdx, cqeSignal, qpn,
+                                       laddr, lkey, raddr, rkey, bytes);
+}
 
 template <ProviderType PrvdType>
 inline __device__ uint64_t PostWrite(WorkQueueHandle& wq, uint32_t qpn, uintptr_t laddr,
-                                     uint64_t lkey, uintptr_t raddr, uint64_t rkey, size_t bytes);
+                                     uint64_t lkey, uintptr_t raddr, uint64_t rkey, size_t bytes) {
+  return PostReadWrite<PrvdType, false>(wq, qpn, laddr, lkey, raddr, rkey, bytes);
+}
 
 template <ProviderType PrvdType>
 inline __device__ uint64_t PostRead(WorkQueueHandle& wq, uint32_t qpn, uintptr_t laddr,
-                                    uint64_t lkey, uintptr_t raddr, uint64_t rkey, size_t bytes);
+                                    uint64_t lkey, uintptr_t raddr, uint64_t rkey, size_t bytes) {
+  return PostReadWrite<PrvdType, true>(wq, qpn, laddr, lkey, raddr, rkey, bytes);
+}
 
 template <ProviderType PrvdType>
 inline __device__ uint64_t PostWriteInline(WorkQueueHandle& wq, uint32_t curPostIdx,
@@ -183,14 +205,16 @@ inline __device__ int PollCq(void* cqAddr, uint32_t cqeNum, uint32_t* consIdx,
                              uint32_t* wqeCounter);
 
 template <ProviderType PrvdType>
-inline __device__ int PollCq(WorkQueueHandle& wqHandle, CompletionQueueHandle& cqHandle, 
-		             void* cqAddr, uint32_t cqeNum, uint32_t* consIdx, uint16_t* wqeCounter);
-  
+inline __device__ int PollCq(WorkQueueHandle& wqHandle, CompletionQueueHandle& cqHandle,
+                             void* cqAddr, uint32_t cqeNum, uint32_t* consIdx,
+                             uint16_t* wqeCounter);
+
 template <ProviderType PrvdType>
 inline __device__ void UpdateCqDbrRecord(CompletionQueueHandle& cq, uint32_t consIdx);
 
 template <ProviderType PrvdType>
-inline __device__ int PollCqAndUpdateDbr(CompletionQueueHandle& cq, uint32_t* consIdx, uint32_t* lockVar);
+inline __device__ int PollCqAndUpdateDbr(CompletionQueueHandle& cq, uint32_t* consIdx,
+                                         uint32_t* lockVar);
 
 }  // namespace core
 }  // namespace mori

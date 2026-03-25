@@ -71,7 +71,6 @@ def shmem_torch_process_group_init(group_name: str):
     rank = dist.get_rank(group)
     world_size = dist.get_world_size(group)
 
-    store_key = f"mori_shmem_uid_{group_name}"
     if rank == 0:
         uid = shmem_get_unique_id()
         dist.broadcast_object_list([uid], src=0, group=group)

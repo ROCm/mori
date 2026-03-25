@@ -1,4 +1,25 @@
 #!/usr/bin/env python3
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+#
+# MIT License
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 """
 End-to-end test: two paths, both no Triton.
 
@@ -43,8 +64,10 @@ def hip_launch(func, args):
     ptrs = (ctypes.c_void_p * len(args))()
     for i, a in enumerate(args):
         ptrs[i] = ctypes.cast(ctypes.pointer(a), ctypes.c_void_p)
-    _check(_hip.hipModuleLaunchKernel(
-        func, 1, 1, 1, 1, 1, 1, 0, None, ptrs, None), "launch")
+    _check(
+        _hip.hipModuleLaunchKernel(func, 1, 1, 1, 1, 1, 1, 0, None, ptrs, None),
+        "launch",
+    )
 
 
 def hip_sync():
@@ -60,6 +83,7 @@ def setup_distributed():
     assert world_group is not None
     torch._C._distributed_c10d._register_process_group("default", world_group)
     import mori.shmem as ms
+
     ms.shmem_torch_process_group_init("default")
     mype, npes = ms.shmem_mype(), ms.shmem_npes()
     print(f"[PE {mype}/{npes}] initialized")
@@ -68,6 +92,7 @@ def setup_distributed():
 
 def cleanup():
     import mori.shmem as ms
+
     ms.shmem_finalize()
     if dist.is_initialized():
         dist.destroy_process_group()
@@ -78,6 +103,7 @@ def cleanup():
 # ---------------------------------------------------------------------------
 def run_basic_test(tag, hsaco_path, mype, npes):
     import mori.shmem as ms
+
     hip_mod = hip_module_load(hsaco_path)
     ms.shmem_module_init(hip_mod.value)
     func = hip_get_function(hip_mod, "shmem_basic_kernel")
@@ -92,6 +118,7 @@ def run_basic_test(tag, hsaco_path, mype, npes):
 def run_put_test(tag, hsaco_path, mype, npes):
     import mori.shmem as ms
     from mori.shmem import mori_shmem_create_tensor
+
     hip_mod = hip_module_load(hsaco_path)
     ms.shmem_module_init(hip_mod.value)
     func = hip_get_function(hip_mod, "shmem_put_kernel")
@@ -123,10 +150,15 @@ def main():
     tmp = tempfile.gettempdir()
 
     from mlir_shmem_kernel import (
-        build_shmem_basic_kernel, build_shmem_put_kernel,
-        compile_to_hsaco, _find_mori_shmem_bc,
-        compile_ir_to_hsaco, SHMEM_BASIC_KERNEL_IR, SHMEM_PUT_KERNEL_IR,
+        build_shmem_basic_kernel,
+        build_shmem_put_kernel,
+        compile_to_hsaco,
+        _find_mori_shmem_bc,
+        compile_ir_to_hsaco,
+        SHMEM_BASIC_KERNEL_IR,
+        SHMEM_PUT_KERNEL_IR,
     )
+
     mori_bc = _find_mori_shmem_bc()
 
     try:
@@ -136,11 +168,15 @@ def main():
         print(f"\n[PE {mype}] ===== Path A: MLIR =====")
 
         m1 = build_shmem_basic_kernel()
-        h1 = compile_to_hsaco(m1, chip, os.path.join(tmp, f"mlir_basic_pe{mype}.hsaco"), mori_bc)
+        h1 = compile_to_hsaco(
+            m1, chip, os.path.join(tmp, f"mlir_basic_pe{mype}.hsaco"), mori_bc
+        )
         run_basic_test("[MLIR]", h1, mype, npes)
 
         m2 = build_shmem_put_kernel()
-        h2 = compile_to_hsaco(m2, chip, os.path.join(tmp, f"mlir_put_pe{mype}.hsaco"), mori_bc)
+        h2 = compile_to_hsaco(
+            m2, chip, os.path.join(tmp, f"mlir_put_pe{mype}.hsaco"), mori_bc
+        )
         run_put_test("[MLIR]", h2, mype, npes)
 
         # ============================================================
@@ -148,24 +184,33 @@ def main():
         # ============================================================
         print(f"\n[PE {mype}] ===== Path B: LLVM IR =====")
 
-        h3 = compile_ir_to_hsaco(SHMEM_BASIC_KERNEL_IR, chip,
-                                 os.path.join(tmp, f"llvmir_basic_pe{mype}.hsaco"), mori_bc)
+        h3 = compile_ir_to_hsaco(
+            SHMEM_BASIC_KERNEL_IR,
+            chip,
+            os.path.join(tmp, f"llvmir_basic_pe{mype}.hsaco"),
+            mori_bc,
+        )
         run_basic_test("[LLVM IR]", h3, mype, npes)
 
-        h4 = compile_ir_to_hsaco(SHMEM_PUT_KERNEL_IR, chip,
-                                 os.path.join(tmp, f"llvmir_put_pe{mype}.hsaco"), mori_bc)
+        h4 = compile_ir_to_hsaco(
+            SHMEM_PUT_KERNEL_IR,
+            chip,
+            os.path.join(tmp, f"llvmir_put_pe{mype}.hsaco"),
+            mori_bc,
+        )
         run_put_test("[LLVM IR]", h4, mype, npes)
 
         # ============================================================
         if mype == 0:
             print(f"\n{'=' * 60}")
             print(f"  All 4 tests PASSED on {npes} PEs")
-            print(f"    Path A (MLIR):     basic + put  PASS")
-            print(f"    Path B (LLVM IR):  basic + put  PASS")
+            print("    Path A (MLIR):     basic + put  PASS")
+            print("    Path B (LLVM IR):  basic + put  PASS")
             print(f"{'=' * 60}")
 
     except Exception:
         import traceback
+
         traceback.print_exc()
         sys.exit(1)
     finally:

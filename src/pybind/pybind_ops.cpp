@@ -19,10 +19,11 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#include <cassert>
 #include <hip/hip_runtime_api.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+
+#include <cassert>
 
 #include "mori/ops/ops.hpp"
 #include "mori/pybind/profiler_registry.hpp"
@@ -56,8 +57,9 @@ hipDataType IntToHipDataType(int dtype) {
 }
 
 // Merged prepare + build in one call.
-// When input_ptr == 0 (recv-only calls like dispatch_recv / combine_recv),
-// skip PrepareInference to preserve handle state from the prior send call.
+// For recv-only calls (input_ptr == 0), keep the token-count state needed by
+// AsyncLL recv kernels, but clear external input/weight/index pointers so we do
+// not carry stale user tensor addresses across requests.
 int64_t PrepareAndBuildArgs(mori::moe::EpDispatchCombineHandle& handle, int64_t input_ptr,
                             int input_dtype, int64_t num_tokens, int64_t weight_ptr,
                             int64_t scale_ptr, int64_t indices_ptr, int rdmaBlockNum, int hiddenDim,
@@ -67,6 +69,11 @@ int64_t PrepareAndBuildArgs(mori::moe::EpDispatchCombineHandle& handle, int64_t 
                             nullptr, weight_ptr ? reinterpret_cast<float*>(weight_ptr) : nullptr,
                             scale_ptr ? reinterpret_cast<uint8_t*>(scale_ptr) : nullptr,
                             reinterpret_cast<mori::moe::index_t*>(indices_ptr), num_tokens);
+  } else {
+    const auto recv_num_tokens =
+        static_cast<mori::moe::index_t>((num_tokens > 0) ? num_tokens : handle.curRankNumToken);
+    handle.PrepareInference(HIP_R_32F, nullptr, nullptr, nullptr, nullptr, nullptr,
+                            recv_num_tokens);
   }
 
   thread_local mori::moe::EpDispatchCombineArgsRaw args;

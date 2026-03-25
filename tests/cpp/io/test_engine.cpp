@@ -283,6 +283,61 @@ void CaseRdmaNotificationDisabledBehavior() {
   Require(!popped, "inbound notification should be unavailable when notification is disabled");
 }
 
+void CaseRdmaNotificationEnvOverrideDisables() {
+  if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
+
+  ScopedEnvVar disableAutoXgmi("MORI_DISABLE_AUTO_XGMI", "1");
+  ScopedEnvVar forceDisableNotif("MORI_IO_ENABLE_NOTIFICATION", "0");
+  ConnectedEnginePair pair = CreateConnectedRdmaPair("rdma_env_no_notif", true);
+  auto src = RegisterGpuMemory(pair.initiator.get(), 64 * 1024, 0);
+  auto dst = RegisterGpuMemory(pair.target.get(), 64 * 1024, 0);
+
+  TransferStatus initStatus;
+  TransferUniqueId uid = pair.initiator->AllocateTransferUniqueId();
+  pair.initiator->Write(src.desc, 0, dst.desc, 0, 64 * 1024, &initStatus, uid);
+
+  std::string err;
+  Require(WaitTransferDone(&initStatus, 3000, &err),
+          "rdma(env_no_notif) initiator status timeout: " + err);
+  Require(initStatus.Succeeded(), "rdma(env_no_notif) initiator status failed: code=" +
+                                      std::to_string(initStatus.CodeUint32()) + ", msg='" +
+                                      initStatus.Message() + "'");
+
+  TransferStatus inbound;
+  bool popped = WaitInboundStatusWithTimeout(pair.target.get(), pair.initiator->GetEngineDesc().key,
+                                             uid, 200, &inbound, nullptr);
+  Require(!popped, "inbound notification should be disabled by MORI_IO_ENABLE_NOTIFICATION=0");
+}
+
+void CaseRdmaNotificationInvalidEnvKeepsConfig() {
+  if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
+
+  ScopedEnvVar disableAutoXgmi("MORI_DISABLE_AUTO_XGMI", "1");
+  ScopedEnvVar invalidNotif("MORI_IO_ENABLE_NOTIFICATION", "invalid");
+  ConnectedEnginePair pair = CreateConnectedRdmaPair("rdma_invalid_env_notif", true);
+  auto src = RegisterGpuMemory(pair.initiator.get(), 64 * 1024, 0);
+  auto dst = RegisterGpuMemory(pair.target.get(), 64 * 1024, 0);
+
+  TransferStatus initStatus;
+  TransferUniqueId uid = pair.initiator->AllocateTransferUniqueId();
+  pair.initiator->Write(src.desc, 0, dst.desc, 0, 64 * 1024, &initStatus, uid);
+
+  std::string err;
+  Require(WaitTransferDone(&initStatus, 3000, &err),
+          "rdma(invalid_env_notif) initiator status timeout: " + err);
+  Require(initStatus.Succeeded(), "rdma(invalid_env_notif) initiator status failed: code=" +
+                                      std::to_string(initStatus.CodeUint32()) + ", msg='" +
+                                      initStatus.Message() + "'");
+
+  TransferStatus inbound;
+  Require(WaitInboundStatusWithTimeout(pair.target.get(), pair.initiator->GetEngineDesc().key, uid,
+                                       3000, &inbound, &err),
+          "rdma(invalid_env_notif) inbound status timeout: " + err);
+  Require(inbound.Succeeded(),
+          "invalid MORI_IO_ENABLE_NOTIFICATION should keep config(true), inbound code=" +
+              std::to_string(inbound.CodeUint32()) + ", msg='" + inbound.Message() + "'");
+}
+
 void CaseXgmiInboundNotificationIsUnsupported() {
   if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
 
@@ -322,6 +377,8 @@ int main() {
       {"submission_ledger_basic", CaseSubmissionLedgerBasic},
       {"rdma_transfer_basic", CaseRdmaTransferBasic},
       {"rdma_notification_disabled_behavior", CaseRdmaNotificationDisabledBehavior},
+      {"rdma_notification_env_override_disables", CaseRdmaNotificationEnvOverrideDisables},
+      {"rdma_notification_invalid_env_keeps_config", CaseRdmaNotificationInvalidEnvKeepsConfig},
       {"xgmi_inbound_notification_is_unsupported", CaseXgmiInboundNotificationIsUnsupported},
   };
 

@@ -1,3 +1,24 @@
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+#
+# MIT License
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 # Copyright (c) Advanced Micro Devices, Inc. All rights reserved.
 # MIT License
 """Minimal ctypes wrapper around HIP driver API for loading and launching JIT-compiled kernels."""
@@ -6,7 +27,7 @@ from __future__ import annotations
 
 import ctypes
 import os
-from ctypes import c_char_p, c_int, c_size_t, c_uint, c_void_p, POINTER, byref
+from ctypes import c_char_p, c_uint, c_void_p, POINTER, byref
 
 _hip: ctypes.CDLL | None = None
 
@@ -191,9 +212,19 @@ def launch_multi(
 
     for i in range(len(funcs)):
         err = launch(
-            funcs[i], c_uint(grids[i]), c_one, c_one,
-            c_uint(blocks[i]), c_one, c_one,
-            c_uint(shared_mems[i]), c_stream, c_params, c_null,
+            funcs[i],
+            c_uint(grids[i]),
+            c_one,
+            c_one,
+            c_uint(blocks[i]),
+            c_one,
+            c_one,
+            c_uint(shared_mems[i]),
+            c_stream,
+            c_params,
+            c_null,
         )
         if err != 0:
-            raise RuntimeError(f"HIP error {err}: hipModuleLaunchKernel (batch index {i})")
+            raise RuntimeError(
+                f"HIP error {err}: hipModuleLaunchKernel (batch index {i})"
+            )
