@@ -46,7 +46,12 @@ struct alignas(128) RSBarrierSignal {
 //
 // block_done[]: per-block reduce-completion flags for barrier-free pipeline.
 // Each compute block writes its slot after reduce; block 0 polls all slots.
-static constexpr int kMaxPipelineBlocks = 64;
+// Must be large enough that pipelined reduce uses as many CTAs as
+// SdmaReduceScatterKernel (comp = min(blocks, kMaxPipelineBlocks-1)); 64
+// capped MI250-class parallelism vs ~80+ SM GPUs. Block 0 uses threads
+// [128, 128+compBlocks) for block_done polls — keep 128+(kMaxPipelineBlocks-1)
+// <= typical launch blockDim.x (512).
+static constexpr int kMaxPipelineBlocks = 384;
 struct alignas(128) CrossPeBarrier {
   uint32_t flag;
   uint32_t ag_sync;

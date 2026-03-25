@@ -30,6 +30,10 @@
 namespace mori {
 namespace collective {
 
+// Block 0: threads [128, 128 + compBlocks) poll block_done; launch uses 512 threads.
+static_assert(kMaxPipelineBlocks <= 385,
+              "pipelined block 0 thread layout needs 128 + compBlocks <= blockDim.x");
+
 template <typename T, int SCATTER_MODE = 0>
 __global__ void PipelinedAllReduceSdmaKernel(
     int myPe, int npes,

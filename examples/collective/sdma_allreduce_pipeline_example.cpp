@@ -193,6 +193,7 @@ void testPipelinedAllreduce() {
             CHECK_HIP(hipMemcpyAsync(inBuf, hostData.data(), bytesPerPe, hipMemcpyHostToDevice,
                                      stream));
             CHECK_HIP(hipStreamSynchronize(stream));
+            MPI_Barrier(MPI_COMM_WORLD);
             (*ar)(inBuf, devOut, elemsPerPe, stream);
             CHECK_HIP(hipStreamSynchronize(stream));
             CHECK_HIP(hipMemcpy(result.data(), devOut, bytesPerPe, hipMemcpyDeviceToHost));
@@ -326,22 +327,21 @@ void testPipelinedAllreduce() {
             bool od = (i < okSdma.size()) && okSdma[i];
             bool op = (i < okP2p.size()) && okP2p[i];
 
-            if (!os) {
-                printf("%-7zu %8s %8s %8s %7s %7s %5s %5s\n",
-                       dataSizesMB[i], "FAIL", "-", "-", "-", "-", "-", "-");
-                continue;
-            }
-            printf("%-7zu %8.3f ", dataSizesMB[i], s);
+            printf("%-7zu ", dataSizesMB[i]);
+            if (os && s > 0)
+                printf("%8.3f ", s);
+            else
+                printf("%8s ", os ? "-" : "FAIL");
             if (od && d > 0)
                 printf("%8.3f ", d);
             else
-                printf("%8s ", "-");
+                printf("%8s ", od ? "-" : "FAIL");
             if (op && p > 0)
                 printf("%8.3f ", p);
             else
-                printf("%8s ", "-");
+                printf("%8s ", op ? "-" : "FAIL");
 
-            if (od && d > 0) {
+            if (os && od && s > 0 && d > 0) {
                 double r = s / d;
                 printf("%7.2f ", r);
                 ncmp++;
@@ -350,17 +350,17 @@ void testPipelinedAllreduce() {
                 printf("%7s ", "-");
             }
 
-            if (op && p > 0)
+            if (os && op && s > 0 && p > 0)
                 printf("%7.2f ", s / p);
             else
                 printf("%7s ", "-");
 
-            if (i < serialGb.size())
+            if (os && i < serialGb.size())
                 printf("%5.0f ", serialGb[i]);
             else
                 printf("%5s ", "-");
 
-            if (od && d > 0)
+            if (os && od && s > 0 && d > 0)
                 printf("%5s\n", (d < s) ? "是" : "否");
             else
                 printf("%5s\n", "-");

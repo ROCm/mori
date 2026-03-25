@@ -56,11 +56,15 @@ size_t SdmaTransitUsedBytes(size_t total_count, int npes, size_t dtype_size) {
     return element_count_per_rank * static_cast<size_t>(npes) * dtype_size;
 }
 
-// Set MORI_SDMA_ZERO_TRANSIT=0 to skip (saves bandwidth; unsafe if SDMA drops puts).
+// Transit zeroing is off by default: every slot is overwritten (SDMA scatter +
+// Phase 2.5 CU copy) before the reduce reads it, so zeroing is redundant.
+// Zeroing also races with remote PEs' SDMA scatter when callers don't place a
+// cross-PE barrier before each AllReduce call.
+// Set MORI_SDMA_ZERO_TRANSIT=1 to re-enable (useful for debugging dropped puts).
 inline bool SdmaShouldZeroTransit() {
     const char* e = std::getenv("MORI_SDMA_ZERO_TRANSIT");
-    if (e && e[0] == '0' && e[1] == '\0') return false;
-    return true;
+    if (e && e[0] == '1' && e[1] == '\0') return true;
+    return false;
 }
 
 }  // namespace
@@ -115,7 +119,7 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes,
     if (!flagsObj_.IsValid())
         throw std::runtime_error("Failed to get valid flags memory object");
 
-    // 2. Allocate CrossPeBarrier (device-scope broadcast flag, ~128 bytes)
+    // 2. Allocate CrossPeBarrier (flag + ag_sync + block_done[] for pipeline)
     size_t barrierSize = sizeof(CrossPeBarrier);
     void* bMem = shmem::ShmemMalloc(barrierSize);
     if (!bMem) throw std::runtime_error("Failed to allocate barrier memory");
