@@ -17,9 +17,9 @@
 // SCATTER_MODE=1: P2P read + CU AG (legacy path).
 //
 // userOut: optional device pointer to the caller's output tensor. When non-null,
-// each chunk is copied from the transit shard (this PE's partition) into userOut
-// inside the same kernel as AG completes — no hipMemcpyAsync and no single
-// end-of-launch full-buffer copy.
+// each chunk copies every rank's shard slice from local transit (same layout as
+// post-AG twoshot) into userOut — each PE must hold the full reduced vector, not
+// only its own partition.
 //
 #pragma once
 
@@ -313,8 +313,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
         __syncthreads();
 
         // Pipeline chunk into user output: wait this chunk's AG (q=1) then copy
-        // this PE's shard slice — same kernel, no hipMemcpyAsync / no full-tensor
-        // copy at launch return.
+        // all peers' shard slices for this chunk (same layout as copy_output_to_user).
         if (userOut != nullptr && i >= 2 && i <= numChunks + 1) {
           const int agChunk = i - 2;
           const size_t cOff = static_cast<size_t>(agChunk) * chunkBytes;
@@ -332,13 +331,19 @@ __global__ void PipelinedAllReduceSdmaKernel(
                 ;
             }
             __syncthreads();
-            uint8_t* dst = reinterpret_cast<uint8_t*>(userOut)
-                + static_cast<size_t>(myPe) * totalShardBytes + cOff;
-            uint8_t* src = reinterpret_cast<uint8_t*>(dstMemObj->localPtr)
-                + static_cast<size_t>(myPe) * totalShardBytes + cOff;
-            for (size_t j = static_cast<size_t>(thr);
-                 j < actualBytes; j += static_cast<size_t>(blockDim.x)) {
-              dst[j] = src[j];
+            const size_t outBytes = elementCount * bytesPerElement;
+            const size_t span = static_cast<size_t>(npes) * actualBytes;
+            uint8_t* __restrict__ uob = reinterpret_cast<uint8_t*>(userOut);
+            uint8_t* __restrict__ lcl =
+                reinterpret_cast<uint8_t*>(dstMemObj->localPtr);
+            for (size_t linear = static_cast<size_t>(thr); linear < span;
+                 linear += static_cast<size_t>(blockDim.x)) {
+              const size_t pe = linear / actualBytes;
+              const size_t j = linear % actualBytes;
+              const size_t hist = pe * totalShardBytes + cOff + j;
+              if (hist < outBytes) {
+                uob[hist] = lcl[hist];
+              }
             }
             __syncthreads();
           }
@@ -437,12 +442,18 @@ __global__ void PipelinedAllReduceSdmaKernel(
         if (cOffBytes + actualBytes > totalShardBytes)
           actualBytes = totalShardBytes - cOffBytes;
         if (actualBytes > 0) {
-          uint8_t* dst = reinterpret_cast<uint8_t*>(userOut)
-              + static_cast<size_t>(myPe) * totalShardBytes + cOffBytes;
-          uint8_t* src = reinterpret_cast<uint8_t*>(dstMemObj->localPtr)
-              + static_cast<size_t>(myPe) * totalShardBytes + cOffBytes;
-          for (size_t j = tid; j < actualBytes; j += stride) {
-            dst[j] = src[j];
+          const size_t outBytes = elementCount * bytesPerElement;
+          const size_t span = static_cast<size_t>(npes) * actualBytes;
+          uint8_t* __restrict__ uob = reinterpret_cast<uint8_t*>(userOut);
+          uint8_t* __restrict__ lcl =
+              reinterpret_cast<uint8_t*>(dstMemObj->localPtr);
+          for (size_t linear = tid; linear < span; linear += stride) {
+            const size_t pe = linear / actualBytes;
+            const size_t j = linear % actualBytes;
+            const size_t hist = pe * totalShardBytes + cOffBytes + j;
+            if (hist < outBytes) {
+              uob[hist] = lcl[hist];
+            }
           }
         }
       }
