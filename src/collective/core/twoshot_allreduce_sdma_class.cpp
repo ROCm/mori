@@ -395,6 +395,14 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                     myPe_, transit_used, output_transit_buffer_size_);
             return false;
         }
+
+        // SDMA scatter_mode==0 was a fused multi-CTA pipeline; it still races on
+        // some targets (wrong sums at shard boundaries). Use the same RS+AG path
+        // as operator() until the fused kernel is re-proven.
+        if (scatter_mode == 0) {
+            return operator()(input, output, total_count, stream);
+        }
+
         if (SdmaShouldZeroTransit()) {
             hipError_t zerr = stream ? hipMemsetAsync(output_transit_buffer_, 0, transit_used, stream)
                                      : hipMemset(output_transit_buffer_, 0, transit_used);
@@ -411,24 +419,12 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         int blocks = std::min(max_blocks_,
                               (packedPerRank + threads - 1) / threads);
         if (blocks < 1) blocks = 1;
-        if (scatter_mode == 0) {
-            // Block 0 = management; remaining blocks = compute (reduce).
-            // Use up to kMaxPipelineBlocks-1 for large tensors (was capped at 32).
-            int comp = std::min(blocks, kMaxPipelineBlocks - 1);
-            blocks = comp + 1;
-        }
 
         if (chunk_elems == 0) {
             size_t min_chunk = std::max<size_t>(
                 static_cast<size_t>(pack_size) * npes_,
                 (512ULL * 1024 / dtype_size_) * npes_);
-            if (scatter_mode == 1) {
-                chunk_elems = total_count;
-            } else {
-                // One chunk by default: minimizes block_done / sync / SDMA rounds.
-                // Override with explicit chunk_elems for latency experiments.
-                chunk_elems = total_count;
-            }
+            chunk_elems = total_count;
             if (chunk_elems < min_chunk)
                 chunk_elems = min_chunk;
         }
@@ -436,7 +432,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         chunk_elems = ((chunk_elems + align - 1) / align) * align;
 
         application::SymmMemObjPtr inputSymmObj = {};
-        if (scatter_mode == 1) {
+        {
             size_t required_input_size = total_count * dtype_size_;
             if (!ensure_buffer_size(input_transit_buffer_, input_transit_buffer_ptr_,
                                     input_transit_buffer_size_, input_transit_buffer_obj_,
@@ -497,15 +493,9 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             }
         }
 
-        if (scatter_mode == 1) {
-            PipelinedAllReduceSdmaKernel<T, 1><<<blocks, threads, 0, stream>>>(
-                myPe_, npes_, input, output_transit_buffer_obj_, flagsObj_,
-                barrierPtr_, inputSymmObj, total_count, chunk_elems);
-        } else {
-            PipelinedAllReduceSdmaKernel<T, 0><<<blocks, threads, 0, stream>>>(
-                myPe_, npes_, input, output_transit_buffer_obj_, flagsObj_,
-                barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems);
-        }
+        PipelinedAllReduceSdmaKernel<T, 1><<<blocks, threads, 0, stream>>>(
+            myPe_, npes_, input, output_transit_buffer_obj_, flagsObj_,
+            barrierPtr_, inputSymmObj, total_count, chunk_elems);
 
         hipError_t err = hipGetLastError();
         if (err != hipSuccess) {
