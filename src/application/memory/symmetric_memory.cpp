@@ -27,6 +27,8 @@
 #include "mori/core/core.hpp"
 #include "mori/application/transport/sdma/anvil.hpp"
 
+#include <vector>
+
 namespace mori {
 namespace application {
 
@@ -124,28 +126,47 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size) {
   HIP_RUNTIME_CHECK(hipMemcpy(gpuMemObj->peerRkeys, cpuMemObj->peerRkeys,
                               sizeof(uint32_t) * worldSize, hipMemcpyHostToDevice));
 
-  std::vector<int> dstDeviceIds;
+  bool anySdma = false;
   for (int i = 0; i < worldSize; i++) {
-    if (context.GetTransportType(i) != TransportType::SDMA) continue;
-    //if (i == rank) continue;
-    dstDeviceIds.push_back(i%8); // should be intra devices count
+    if (context.GetTransportType(i) == TransportType::SDMA) {
+      anySdma = true;
+      break;
+    }
   }
-  if(dstDeviceIds.size() != 0) {
-    int srcDeviceId = rank%8;
-    int numOfQueuesPerDevice = gpuMemObj->sdmaNumQueue;  // all sdma queues are inited
-    HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->deviceHandles_d, dstDeviceIds.size()* numOfQueuesPerDevice* sizeof(anvil::SdmaQueueDeviceHandle*)));
+  if (anySdma) {
+    int myHipDevice = 0;
+    HIP_RUNTIME_CHECK(hipGetDevice(&myHipDevice));
 
-    for (auto& dstDeviceId : dstDeviceIds)
-    { 
-      for (size_t q = 0; q <numOfQueuesPerDevice; q++)
-        {
-          gpuMemObj->deviceHandles_d[dstDeviceId*numOfQueuesPerDevice + q] = anvil::anvil.getSdmaQueue(srcDeviceId, dstDeviceId, q)->deviceHandle();
-        }
+    std::vector<int> hipDevicePerRank(static_cast<size_t>(worldSize), -1);
+    bootNet.Allgather(&myHipDevice, hipDevicePerRank.data(), sizeof(int));
+
+    int numOfQueuesPerDevice = gpuMemObj->sdmaNumQueue;
+    const size_t dhRowBytes =
+        static_cast<size_t>(numOfQueuesPerDevice) *
+        sizeof(anvil::SdmaQueueDeviceHandle*);
+    const size_t dhBytes = static_cast<size_t>(worldSize) * dhRowBytes;
+    HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->deviceHandles_d, dhBytes));
+    HIP_RUNTIME_CHECK(hipMemset(gpuMemObj->deviceHandles_d, 0, dhBytes));
+
+    // Rows indexed by MPI rank (destPe in kernels), not by i%8.
+    for (int dstRank = 0; dstRank < worldSize; ++dstRank) {
+      if (context.GetTransportType(dstRank) != TransportType::SDMA) continue;
+      if (dstRank == rank) continue;
+      const int dstGpu = hipDevicePerRank[static_cast<size_t>(dstRank)];
+      if (dstGpu < 0) continue;
+      for (int q = 0; q < numOfQueuesPerDevice; ++q) {
+        gpuMemObj->deviceHandles_d[static_cast<size_t>(dstRank) *
+                                       static_cast<size_t>(numOfQueuesPerDevice) +
+                                   static_cast<size_t>(q)] =
+            anvil::anvil.getSdmaQueue(myHipDevice, dstGpu, q)->deviceHandle();
+      }
     }
 
-    // Allocate local signal memory: npes * numQueues slots
+    // Allocate local signal memory: worldSize * numQueues slots
     // Indexed as [sourcePe * numQueues + qId] — each source PE writes to its own slots
-    size_t signalArraySize = sizeof(HSAuint64) * dstDeviceIds.size() * numOfQueuesPerDevice;
+    size_t signalArraySize =
+        sizeof(HSAuint64) * static_cast<size_t>(worldSize) *
+        static_cast<size_t>(numOfQueuesPerDevice);
     HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->signalPtrs, signalArraySize));
     HIP_RUNTIME_CHECK(hipMemset(gpuMemObj->signalPtrs, 0, signalArraySize));
     HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->expectSignalsPtr, signalArraySize));

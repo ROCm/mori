@@ -140,6 +140,13 @@ void testPipelinedAllreduce() {
     int status = ShmemMpiInit(MPI_COMM_WORLD);
     assert(!status);
 
+    int nGpu = 0;
+    CHECK_HIP(hipGetDeviceCount(&nGpu));
+    if (nGpu > 0) {
+        int myPeBind = ShmemMyPe();
+        CHECK_HIP(hipSetDevice(myPeBind % nGpu));
+    }
+
     int myPe = ShmemMyPe();
     int npes = ShmemNPes();
 
