@@ -1,6 +1,10 @@
 // Pipeline AllReduce — 对比串行 vs Pipeline（整块默认 chunk）。
 // 少打印：默认只输出 PE0 一张汇总表。详细库日志: MORI_SDMA_VERBOSE=1
 // chunk 扫描: MORI_PIPELINE_CHUNK_SWEEP=1（表后附加简短行）
+//
+// 校验与 sdma_allreduce_sync 一致：copy_output_to_user=true，从 hipMalloc 的 devOut
+// D2H；避免从对称 transit 直接 D2H 在多卡/部分驱动路径上的异常。collective 前
+// 输入用 hipMemcpyAsync(..., stream)+sync，与 kernel 同流有序。
 
 #include <hip/hip_runtime.h>
 #include <mpi.h>
@@ -47,51 +51,54 @@ static bool verifyResult(const uint32_t* data, size_t elems, uint32_t expected, 
     return true;
 }
 
-using BenchFn = std::function<bool(uint32_t* in, uint32_t* out, int elems, hipStream_t s)>;
+using BenchFn = std::function<bool(uint32_t* in, uint32_t* out, size_t elems, hipStream_t s)>;
 
 // PE0: sets *outMs / *outGb; others: unchanged. Returns global pass.
-static bool runBenchMs(BenchFn fn, uint32_t* inBuf, void* verifyBuf,
+static bool runBenchMs(BenchFn fn, uint32_t* inBuf, uint32_t* devOut,
                        const std::vector<uint32_t>& hostData,
-                       int elemsPerPe, size_t bytesPerPe, int npes, int myPe,
+                       size_t elemsPerPe, size_t bytesPerPe, int npes, int myPe,
                        hipStream_t stream, int warmup, int iterations,
                        double* outMs, double* outAlgoGb) {
-    uint32_t* outBuf = reinterpret_cast<uint32_t*>(verifyBuf);
-
     for (int w = 0; w < 3; w++) {
-        CHECK_HIP(hipMemcpy(inBuf, hostData.data(), bytesPerPe, hipMemcpyHostToDevice));
-        CHECK_HIP(hipDeviceSynchronize());
+        CHECK_HIP(hipMemcpyAsync(inBuf, hostData.data(), bytesPerPe, hipMemcpyHostToDevice,
+                                 stream));
+        CHECK_HIP(hipStreamSynchronize(stream));
         MPI_Barrier(MPI_COMM_WORLD);
-        fn(inBuf, outBuf, elemsPerPe, stream);
+        fn(inBuf, devOut, elemsPerPe, stream);
         CHECK_HIP(hipStreamSynchronize(stream));
         MPI_Barrier(MPI_COMM_WORLD);
     }
 
-    CHECK_HIP(hipMemcpy(inBuf, hostData.data(), bytesPerPe, hipMemcpyHostToDevice));
-    CHECK_HIP(hipDeviceSynchronize());
+    CHECK_HIP(hipMemcpyAsync(inBuf, hostData.data(), bytesPerPe, hipMemcpyHostToDevice, stream));
+    CHECK_HIP(hipStreamSynchronize(stream));
     MPI_Barrier(MPI_COMM_WORLD);
 
-    bool ok = fn(inBuf, outBuf, elemsPerPe, stream);
+    bool ok = fn(inBuf, devOut, elemsPerPe, stream);
     CHECK_HIP(hipStreamSynchronize(stream));
 
     if (ok) {
         std::vector<uint32_t> result(elemsPerPe);
-        CHECK_HIP(hipMemcpy(result.data(), verifyBuf, bytesPerPe, hipMemcpyDeviceToHost));
+        CHECK_HIP(hipMemcpy(result.data(), devOut, bytesPerPe, hipMemcpyDeviceToHost));
         ok = verifyResult(result.data(), elemsPerPe, computeExpected(npes), myPe);
     }
 
     int lok = ok ? 1 : 0, gok = 0;
     MPI_Allreduce(&lok, &gok, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
     if (gok != npes) {
-        if (myPe == 0) fprintf(stderr, "VERIFY FAILED\n");
+        if (myPe == 0) {
+            fprintf(stderr, "VERIFY FAILED（若日志中有 RDMA/SDMA device None，需正确设备与 rank-GPU 绑定）\n");
+        }
         return false;
     }
 
     std::vector<double> times;
     for (int i = 0; i < warmup + iterations; i++) {
-        CHECK_HIP(hipMemcpy(inBuf, hostData.data(), bytesPerPe, hipMemcpyHostToDevice));
+        CHECK_HIP(hipMemcpyAsync(inBuf, hostData.data(), bytesPerPe, hipMemcpyHostToDevice,
+                                 stream));
+        CHECK_HIP(hipStreamSynchronize(stream));
         MPI_Barrier(MPI_COMM_WORLD);
         double t0 = MPI_Wtime();
-        fn(inBuf, outBuf, elemsPerPe, stream);
+        fn(inBuf, devOut, elemsPerPe, stream);
         CHECK_HIP(hipStreamSynchronize(stream));
         double t1 = MPI_Wtime();
         if (i >= warmup) times.push_back(t1 - t0);
@@ -154,38 +161,41 @@ void testPipelinedAllreduce() {
 
     for (size_t dataMB : dataSizesMB) {
         size_t bytesPerPe = dataMB * 1024 * 1024;
-        int elemsPerPe = bytesPerPe / sizeof(uint32_t);
+        size_t elemsPerPe = bytesPerPe / sizeof(uint32_t);
         uint32_t fillValue = static_cast<uint32_t>((myPe + 1) * 1000);
 
         uint32_t* inBuf = nullptr;
+        uint32_t* devOut = nullptr;
         CHECK_HIP(hipMalloc(&inBuf, bytesPerPe));
+        CHECK_HIP(hipMalloc(&devOut, bytesPerPe));
         std::vector<uint32_t> hostData(elemsPerPe, fillValue);
 
         size_t outputBufSize = static_cast<size_t>(npes) * (elemsPerPe / npes + 64) * sizeof(uint32_t);
         auto ar = std::make_unique<AllreduceSdma<uint32_t>>(
-            myPe, npes, bytesPerPe, outputBufSize, false);
+            myPe, npes, bytesPerPe, outputBufSize, true);
 
         double ms = 0, gb = 0;
         bool ok = false;
 
-        // 串行
+        // 串行（结果 D2D 到 devOut，与 sync example out-of-place 一致）
         {
-            uint32_t* outBuf = nullptr;
-            CHECK_HIP(hipMalloc(&outBuf, bytesPerPe));
             for (int i = 0; i < 10; i++) {
-                CHECK_HIP(hipMemcpy(inBuf, hostData.data(), bytesPerPe, hipMemcpyHostToDevice));
-                CHECK_HIP(hipMemset(outBuf, 0, bytesPerPe));
+                CHECK_HIP(hipMemcpyAsync(inBuf, hostData.data(), bytesPerPe, hipMemcpyHostToDevice,
+                                         stream));
+                CHECK_HIP(hipMemsetAsync(devOut, 0, bytesPerPe, stream));
+                CHECK_HIP(hipStreamSynchronize(stream));
                 MPI_Barrier(MPI_COMM_WORLD);
-                (*ar)(inBuf, outBuf, elemsPerPe, stream);
+                (*ar)(inBuf, devOut, elemsPerPe, stream);
                 CHECK_HIP(hipStreamSynchronize(stream));
                 MPI_Barrier(MPI_COMM_WORLD);
             }
             std::vector<uint32_t> result(elemsPerPe);
-            CHECK_HIP(hipMemcpy(inBuf, hostData.data(), bytesPerPe, hipMemcpyHostToDevice));
-            (*ar)(inBuf, outBuf, elemsPerPe, stream);
+            CHECK_HIP(hipMemcpyAsync(inBuf, hostData.data(), bytesPerPe, hipMemcpyHostToDevice,
+                                     stream));
             CHECK_HIP(hipStreamSynchronize(stream));
-            CHECK_HIP(hipMemcpy(result.data(), ar->getOutputTransitBuffer(), bytesPerPe,
-                                hipMemcpyDeviceToHost));
+            (*ar)(inBuf, devOut, elemsPerPe, stream);
+            CHECK_HIP(hipStreamSynchronize(stream));
+            CHECK_HIP(hipMemcpy(result.data(), devOut, bytesPerPe, hipMemcpyDeviceToHost));
             int v = verifyResult(result.data(), elemsPerPe, computeExpected(npes), myPe) ? 1 : 0;
             int gv = 0;
             MPI_Allreduce(&v, &gv, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
@@ -193,10 +203,12 @@ void testPipelinedAllreduce() {
             if (ok) {
                 std::vector<double> times;
                 for (int i = 0; i < warmup + iterations; i++) {
-                    CHECK_HIP(hipMemcpy(inBuf, hostData.data(), bytesPerPe, hipMemcpyHostToDevice));
+                    CHECK_HIP(hipMemcpyAsync(inBuf, hostData.data(), bytesPerPe,
+                                             hipMemcpyHostToDevice, stream));
+                    CHECK_HIP(hipStreamSynchronize(stream));
                     MPI_Barrier(MPI_COMM_WORLD);
                     double t0 = MPI_Wtime();
-                    (*ar)(inBuf, outBuf, elemsPerPe, stream);
+                    (*ar)(inBuf, devOut, elemsPerPe, stream);
                     CHECK_HIP(hipStreamSynchronize(stream));
                     double t1 = MPI_Wtime();
                     if (i >= warmup) times.push_back(t1 - t0);
@@ -213,7 +225,6 @@ void testPipelinedAllreduce() {
                     gb = bytesPerPe / g_avg / (1024.0 * 1024.0 * 1024.0);
                 }
             }
-            CHECK_HIP(hipFree(outBuf));
         }
         if (myPe == 0) {
             serialMs.push_back(ms);
@@ -225,11 +236,11 @@ void testPipelinedAllreduce() {
         ms = 0;
         gb = 0;
         ok = runBenchMs(
-            [&](uint32_t* in, uint32_t* out, int n, hipStream_t s) {
+            [&](uint32_t* in, uint32_t* out, size_t n, hipStream_t s) {
                 return ar->pipelined(in, out, n, 0, 0, s);
             },
-            inBuf, ar->getOutputTransitBuffer(), hostData, elemsPerPe, bytesPerPe, npes, myPe,
-            stream, warmup, iterations, &ms, &gb);
+            inBuf, devOut, hostData, elemsPerPe, bytesPerPe, npes, myPe, stream, warmup,
+            iterations, &ms, &gb);
         if (myPe == 0) {
             sdmaMs.push_back(ok ? ms : -1.0);
             sdmaGb.push_back(ok ? gb : 0.0);
@@ -246,11 +257,11 @@ void testPipelinedAllreduce() {
                 if (chunkBytes > bytesPerPe) continue;
                 double sm = 0, sg = 0;
                 bool sk = runBenchMs(
-                    [&](uint32_t* in, uint32_t* out, int n, hipStream_t s) {
+                    [&](uint32_t* in, uint32_t* out, size_t n, hipStream_t s) {
                         return ar->pipelined(in, out, n, chunkElems, 0, s);
                     },
-                    inBuf, ar->getOutputTransitBuffer(), hostData, elemsPerPe, bytesPerPe, npes,
-                    myPe, stream, warmup, iterations, &sm, &sg);
+                    inBuf, devOut, hostData, elemsPerPe, bytesPerPe, npes, myPe, stream, warmup,
+                    iterations, &sm, &sg);
                 if (myPe == 0 && sk) {
                     sweepPrintf(&sweep_lines, "    SDMA %5zuKB  %7.3f ms  %6.1f GB/s",
                                 chunkKB, sm, sg);
@@ -262,11 +273,11 @@ void testPipelinedAllreduce() {
         ms = 0;
         gb = 0;
         ok = runBenchMs(
-            [&](uint32_t* in, uint32_t* out, int n, hipStream_t s) {
+            [&](uint32_t* in, uint32_t* out, size_t n, hipStream_t s) {
                 return ar->pipelined(in, out, n, 0, 1, s);
             },
-            inBuf, ar->getOutputTransitBuffer(), hostData, elemsPerPe, bytesPerPe, npes, myPe,
-            stream, warmup, iterations, &ms, &gb);
+            inBuf, devOut, hostData, elemsPerPe, bytesPerPe, npes, myPe, stream, warmup,
+            iterations, &ms, &gb);
         if (myPe == 0) {
             p2pMs.push_back(ok ? ms : -1.0);
             p2pGb.push_back(ok ? gb : 0.0);
@@ -283,11 +294,11 @@ void testPipelinedAllreduce() {
                 if (chunkBytes > bytesPerPe) continue;
                 double sm = 0, sg = 0;
                 bool sk = runBenchMs(
-                    [&](uint32_t* in, uint32_t* out, int n, hipStream_t s) {
+                    [&](uint32_t* in, uint32_t* out, size_t n, hipStream_t s) {
                         return ar->pipelined(in, out, n, chunkElems, 1, s);
                     },
-                    inBuf, ar->getOutputTransitBuffer(), hostData, elemsPerPe, bytesPerPe, npes,
-                    myPe, stream, warmup, iterations, &sm, &sg);
+                    inBuf, devOut, hostData, elemsPerPe, bytesPerPe, npes, myPe, stream, warmup,
+                    iterations, &sm, &sg);
                 if (myPe == 0 && sk) {
                     sweepPrintf(&sweep_lines, "    P2P  %5zuKB  %7.3f ms  %6.1f GB/s",
                                 chunkKB, sm, sg);
@@ -296,6 +307,7 @@ void testPipelinedAllreduce() {
         }
 
         ar.reset();
+        CHECK_HIP(hipFree(devOut));
         CHECK_HIP(hipFree(inBuf));
     }
 
