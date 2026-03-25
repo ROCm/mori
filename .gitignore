@@ -11,3 +11,6 @@ lib*
 __pycache__
 
 .vscode
+
+# Local reference only (not vendored into mori)
+nccl/
