@@ -20,10 +20,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-import numpy as np
 import torch
 from mori import cpp as mori_cpp
-from mori import shmem as mori_shme
 from typing import Optional
 
 
@@ -79,21 +77,31 @@ def _cpp_all2all_factory(entity_name: str):
 class All2allSdma:
     """Python wrapper for All2allSdma C++ class"""
 
-    def __init__(self, my_pe: int, npes: int,
-                 input_buffer_size: Optional[int] = None,
-                 output_buffer_size: Optional[int] = None,
-                 transit_buffer_size: Optional[int] = None,
-                 copy_output_to_user: bool = True):
+    def __init__(
+        self,
+        my_pe: int,
+        npes: int,
+        input_buffer_size: Optional[int] = None,
+        output_buffer_size: Optional[int] = None,
+        transit_buffer_size: Optional[int] = None,
+        copy_output_to_user: bool = True,
+    ):
         self.my_pe = my_pe
         self.npes = npes
         handle_class = _cpp_all2all_factory("All2allSdmaHandle")
 
         if input_buffer_size is not None and output_buffer_size is not None:
-            self._handle = handle_class(my_pe, npes, input_buffer_size, output_buffer_size, copy_output_to_user)
+            self._handle = handle_class(
+                my_pe, npes, input_buffer_size, output_buffer_size, copy_output_to_user
+            )
         elif transit_buffer_size is not None:
-            self._handle = handle_class(my_pe, npes, transit_buffer_size, copy_output_to_user)
+            self._handle = handle_class(
+                my_pe, npes, transit_buffer_size, copy_output_to_user
+            )
         else:
-            self._handle = handle_class(my_pe, npes, 512 * 1024 * 1024, copy_output_to_user)
+            self._handle = handle_class(
+                my_pe, npes, 512 * 1024 * 1024, copy_output_to_user
+            )
 
     def __call__(self, input_data, output_data, count: int, stream=None) -> float:
         """Execute All2All SDMA operation.
@@ -108,13 +116,13 @@ class All2allSdma:
             Execution time in seconds
         """
         return self._handle(
-            input_data.data_ptr(), output_data.data_ptr(),
-            count, _stream_to_int(stream))
+            input_data.data_ptr(), output_data.data_ptr(), count, _stream_to_int(stream)
+        )
 
     def start_async(self, input_data, output_data, count: int, stream=None) -> bool:
         return self._handle.start_async(
-            input_data.data_ptr(), output_data.data_ptr(),
-            count, _stream_to_int(stream))
+            input_data.data_ptr(), output_data.data_ptr(), count, _stream_to_int(stream)
+        )
 
     def wait_async(self, stream=None) -> float:
         return self._handle.wait_async(_stream_to_int(stream))
@@ -145,21 +153,31 @@ def _cpp_allgather_factory(entity_name: str):
 class AllgatherSdma:
     """Python wrapper for AllgatherSdma C++ class"""
 
-    def __init__(self, my_pe: int, npes: int,
-                 input_buffer_size: Optional[int] = None,
-                 output_buffer_size: Optional[int] = None,
-                 transit_buffer_size: Optional[int] = None,
-                 copy_output_to_user: bool = True):
+    def __init__(
+        self,
+        my_pe: int,
+        npes: int,
+        input_buffer_size: Optional[int] = None,
+        output_buffer_size: Optional[int] = None,
+        transit_buffer_size: Optional[int] = None,
+        copy_output_to_user: bool = True,
+    ):
         self.my_pe = my_pe
         self.npes = npes
         handle_class = _cpp_allgather_factory("AllgatherSdmaHandle")
 
         if input_buffer_size is not None and output_buffer_size is not None:
-            self._handle = handle_class(my_pe, npes, input_buffer_size, output_buffer_size, copy_output_to_user)
+            self._handle = handle_class(
+                my_pe, npes, input_buffer_size, output_buffer_size, copy_output_to_user
+            )
         elif transit_buffer_size is not None:
-            self._handle = handle_class(my_pe, npes, transit_buffer_size, copy_output_to_user)
+            self._handle = handle_class(
+                my_pe, npes, transit_buffer_size, copy_output_to_user
+            )
         else:
-            self._handle = handle_class(my_pe, npes, 512 * 1024 * 1024, copy_output_to_user)
+            self._handle = handle_class(
+                my_pe, npes, 512 * 1024 * 1024, copy_output_to_user
+            )
 
     def __call__(self, input_data, output_data, count: int, stream=None) -> bool:
         """Execute Allgather SDMA operation.
@@ -171,15 +189,21 @@ class AllgatherSdma:
         byte_count = count * input_data.element_size()
         u32_count = (byte_count + 3) // 4
         return self._handle(
-            input_data.data_ptr(), output_data.data_ptr(),
-            u32_count, _stream_to_int(stream))
+            input_data.data_ptr(),
+            output_data.data_ptr(),
+            u32_count,
+            _stream_to_int(stream),
+        )
 
     def start_async(self, input_data, output_data, count: int, stream=None) -> bool:
         byte_count = count * input_data.element_size()
         u32_count = (byte_count + 3) // 4
         return self._handle.start_async(
-            input_data.data_ptr(), output_data.data_ptr(),
-            u32_count, _stream_to_int(stream))
+            input_data.data_ptr(),
+            output_data.data_ptr(),
+            u32_count,
+            _stream_to_int(stream),
+        )
 
     def wait_async(self, stream=None) -> float:
         return self._handle.wait_async(_stream_to_int(stream))
@@ -233,13 +257,17 @@ class AllreduceSdma:
         torch.bfloat16: "AllreduceSdmaHandleBf16",
     }
 
-    def __init__(self, my_pe: int, npes: int,
-                 input_buffer_size: Optional[int] = None,
-                 output_buffer_size: Optional[int] = None,
-                 transit_buffer_size: Optional[int] = None,
-                 copy_output_to_user: bool = True,
-                 dtype: torch.dtype = torch.uint32,
-                 mode: str = "eager"):
+    def __init__(
+        self,
+        my_pe: int,
+        npes: int,
+        input_buffer_size: Optional[int] = None,
+        output_buffer_size: Optional[int] = None,
+        transit_buffer_size: Optional[int] = None,
+        copy_output_to_user: bool = True,
+        dtype: torch.dtype = torch.uint32,
+        mode: str = "eager",
+    ):
         self.my_pe = my_pe
         self.npes = npes
         self.dtype = dtype
@@ -253,30 +281,34 @@ class AllreduceSdma:
         handle_class = _cpp_allreduce_factory(handle_name)
 
         if input_buffer_size is not None and output_buffer_size is not None:
-            self._handle = handle_class(my_pe, npes, input_buffer_size, output_buffer_size,
-                                        copy_output_to_user)
+            self._handle = handle_class(
+                my_pe, npes, input_buffer_size, output_buffer_size, copy_output_to_user
+            )
         elif transit_buffer_size is not None:
-            self._handle = handle_class(my_pe, npes, transit_buffer_size,
-                                        copy_output_to_user)
+            self._handle = handle_class(
+                my_pe, npes, transit_buffer_size, copy_output_to_user
+            )
         else:
-            self._handle = handle_class(my_pe, npes, 512 * 1024 * 1024,
-                                        copy_output_to_user)
+            self._handle = handle_class(
+                my_pe, npes, 512 * 1024 * 1024, copy_output_to_user
+            )
 
     def __call__(self, input_data, output_data, count: int, stream=None) -> bool:
         """Execute out-of-place AllReduce SDMA operation."""
         return self._handle(
-            input_data.data_ptr(), output_data.data_ptr(),
-            count, _stream_to_int(stream))
+            input_data.data_ptr(), output_data.data_ptr(), count, _stream_to_int(stream)
+        )
 
     def allreduce_inplace(self, data, count: int, stream=None) -> bool:
         """Execute in-place AllReduce SDMA operation (result overwrites input)."""
         return self._handle.allreduce_inplace(
-            data.data_ptr(), count, _stream_to_int(stream))
+            data.data_ptr(), count, _stream_to_int(stream)
+        )
 
     def start_async(self, input_data, output_data, count: int, stream=None) -> bool:
         return self._handle.start_async(
-            input_data.data_ptr(), output_data.data_ptr(),
-            count, _stream_to_int(stream))
+            input_data.data_ptr(), output_data.data_ptr(), count, _stream_to_int(stream)
+        )
 
     def wait_async(self, stream=None) -> float:
         return self._handle.wait_async(_stream_to_int(stream))

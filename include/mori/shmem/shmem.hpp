@@ -31,17 +31,40 @@
 #include "mori/shmem/shmem_sdma_kernels.hpp"
 #endif
 
-// When compiled with hipcc (C++ users with device code), define a weak
-// globalGpuStates symbol per TU. This keeps non-RDC HIP builds linkable.
+// -----------------------------------------------------------------------------
+// Policy: EP vs SDMA CCL vs JIT shmem_kernels (minimize shmem surface area)
+// -----------------------------------------------------------------------------
+// SDMA CCL "business" changes stay in shmem_api / memory.cpp (symmetric register)
+// and shmem_sdma_kernels.hpp (SDMA put + expectedSignals). This header only gates
+// the weak __device__ globalGpuStates + RegisterGpuStatesAddrProvider block.
+//
+// EP JIT (ep_common.hip -> ep_*.hip): set MORI_SHMEM_NO_STATIC_INIT only. Do NOT
+// set MORI_SHMEM_ENABLE_WEAK_GLOBAL_GPU_STATES. shmem.hpp then does not emit a
+// second globalGpuStates; each .hsaco defines it via MORI_DEFINE_GPU_STATES
+// (default visibility; must match internal.hpp). Host uses ShmemModuleInit.
+//
+// mori_collective (static HIP in libmori_collective): same NO_STATIC_INIT, plus
+// MORI_SHMEM_ENABLE_WEAK_GLOBAL_GPU_STATES from CMake so weak globalGpuStates
+// (default visibility; matches internal.hpp / EP) and the addr provider emit here.
+//
+// shmem_kernels.hip (JIT): NO_STATIC_INIT + MORI_SHMEM_ENABLE_WEAK_GLOBAL_GPU_STATES
+// before including shmem.hpp — same weak path as collective, no MORI_DEFINE_GPU_STATES.
+//
+// RegisterGpuStatesAddrProvider callbacks are stored in a std::vector in runtime.cpp
+// so CopyGpuStatesToDevice can update every registered static symbol (multiple HIP
+// TUs and/or future modules). Do not revert to a single provider without a new design.
+// -----------------------------------------------------------------------------
+
 #if defined(__HIPCC__) || defined(__HIP__) || defined(__CUDACC__)
 namespace mori {
 namespace shmem {
 
-__device__ __attribute__((visibility("hidden"), weak)) GpuStates globalGpuStates;
+#if !defined(MORI_SHMEM_NO_STATIC_INIT) || defined(MORI_SHMEM_ENABLE_WEAK_GLOBAL_GPU_STATES)
+__device__ __attribute__((visibility("default"), weak)) GpuStates globalGpuStates;
 
 namespace _static_init {
 
-__attribute__((visibility("hidden"), weak)) void* _getGpuStatesAddr() {
+__attribute__((visibility("default"), weak)) void* _getGpuStatesAddr() {
   void* addr = nullptr;
   (void)hipGetSymbolAddress(&addr, HIP_SYMBOL(mori::shmem::globalGpuStates));
   return addr;
@@ -50,7 +73,7 @@ __attribute__((visibility("hidden"), weak)) void* _getGpuStatesAddr() {
 struct _GpuStatesRegistrar {
   _GpuStatesRegistrar() { RegisterGpuStatesAddrProvider(_getGpuStatesAddr); }
 };
-__attribute__((visibility("hidden"), weak)) _GpuStatesRegistrar _s_gpuStatesRegistrar;
+__attribute__((visibility("default"), weak)) _GpuStatesRegistrar _s_gpuStatesRegistrar;
 
 #if !defined(MORI_SHMEM_NO_STATIC_INIT)
 __global__ void _barrier_kernel() { ShmemBarrierAllBlock(); }
@@ -66,6 +89,8 @@ __attribute__((weak)) _BarrierRegistrar _s_barrierRegistrar;
 #endif  // !MORI_SHMEM_NO_STATIC_INIT
 
 }  // namespace _static_init
+#endif  // !MORI_SHMEM_NO_STATIC_INIT || MORI_SHMEM_ENABLE_WEAK_GLOBAL_GPU_STATES
+
 }  // namespace shmem
 }  // namespace mori
 #endif  // __HIPCC__ || __HIP__ || __CUDACC__

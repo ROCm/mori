@@ -27,10 +27,10 @@
 #include <cstring>
 
 #include "mori/application/utils/check.hpp"
-#include "mori/collective/core/allreduce_config.hpp"
-#include "mori/collective/core/allreduce_executor.hpp"
 #include "mori/collective/core/all2all_config.hpp"
 #include "mori/collective/core/all2all_executor.hpp"
+#include "mori/collective/core/allreduce_config.hpp"
+#include "mori/collective/core/allreduce_executor.hpp"
 #include "mori/collective/inter_node/kernels/one_shot_kernel.hpp"
 #include "mori/shmem/shmem.hpp"
 
@@ -115,8 +115,8 @@ int OneShotAllReduceExecutor<T>::Execute(T* input, T* output, size_t count, hipS
     blocks = config.maxBlocks;
   }
 
-  OneShotAllReduceKernel<T><<<blocks, 512, 0, stream>>>(
-      rank, numRanks, srcMemObj, dstMemObj, scratchMemObj, flagsMemObj, count);
+  OneShotAllReduceKernel<T><<<blocks, 512, 0, stream>>>(rank, numRanks, srcMemObj, dstMemObj,
+                                                        scratchMemObj, flagsMemObj, count);
   hipError_t kernelStatus = hipGetLastError();
   shmem::ShmemFree(scratchBuffer);
   shmem::ShmemFree(flagsBuffer);
@@ -128,8 +128,7 @@ int OneShotAllReduceExecutor<T>::Execute(T* input, T* output, size_t count, hipS
 template <typename T>
 class OneShotAll2allExecutor : public All2allExecutor<T> {
  public:
-  OneShotAll2allExecutor(int num_ranks, int rank,
-                           const All2allConfig& config = All2allConfig());
+  OneShotAll2allExecutor(int num_ranks, int rank, const All2allConfig& config = All2allConfig());
   ~OneShotAll2allExecutor() override = default;
 
   int Execute(T* input, T* output, size_t count, hipStream_t stream) override;
@@ -142,7 +141,7 @@ class OneShotAll2allExecutor : public All2allExecutor<T> {
 
 template <typename T>
 OneShotAll2allExecutor<T>::OneShotAll2allExecutor(int num_ranks, int rank,
-                                                      const All2allConfig& config)
+                                                  const All2allConfig& config)
     : numRanks(num_ranks), rank(rank), config(config) {}
 
 template <typename T>
@@ -203,8 +202,8 @@ int OneShotAll2allExecutor<T>::Execute(T* input, T* output, size_t count, hipStr
     blocks = config.maxBlocks;
   }
 
-  OneShotAll2allKernel<T><<<blocks, 512, 0, stream>>>(
-      rank, numRanks, srcMemObj, dstMemObj, scratchMemObj, flagsMemObj, count);
+  OneShotAll2allKernel<T><<<blocks, 512, 0, stream>>>(rank, numRanks, srcMemObj, dstMemObj,
+                                                      scratchMemObj, flagsMemObj, count);
   hipError_t kernelStatus = hipGetLastError();
   shmem::ShmemFree(scratchBuffer);
   shmem::ShmemFree(flagsBuffer);
@@ -214,4 +213,4 @@ int OneShotAll2allExecutor<T>::Execute(T* input, T* output, size_t count, hipStr
 }
 
 }  // namespace collective
-}  // naespace mori
+}  // namespace mori

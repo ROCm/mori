@@ -19,19 +19,14 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#include "mori/collective/core/topology_detector.hpp"
-
 #include <mpi.h>
 
 #include <cassert>
 
 #include "mori/collective/all2all/sdma_all2all.hpp"
 #include "mori/collective/allgather/sdma_allgather.hpp"
+#include "mori/collective/core/topology_detector.hpp"
 
 namespace mori {
-namespace collective {
-
-
-
-}  // namespace collective
+namespace collective {}  // namespace collective
 }  // namespace mori

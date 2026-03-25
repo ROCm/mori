@@ -22,17 +22,17 @@
 #pragma once
 
 #include <hip/hip_runtime.h>
-#include "oneshot_sdma_kernel.hpp"
 #include <mpi.h>
+
+#include "oneshot_sdma_kernel.hpp"
 
 namespace mori {
 namespace collective {
 
 template <typename T>
-double Allgather_sdma(T* input, T* output, size_t total_count,
-                                          hipStream_t stream) {
-  int myPe =  shmem::ShmemMyPe();
-  int npes =  shmem::ShmemNPes();
+double Allgather_sdma(T* input, T* output, size_t total_count, hipStream_t stream) {
+  int myPe = shmem::ShmemMyPe();
+  int npes = shmem::ShmemNPes();
   size_t dtype_size = sizeof(T);
 
   application::SymmMemObjPtr inPutBuffObj =
@@ -54,8 +54,9 @@ double Allgather_sdma(T* input, T* output, size_t total_count,
   assert(flagsObj.IsValid());
 
   double start = MPI_Wtime();
-  OneShotAllGatherSdmaKernel<T><<<1, 512>>>(myPe, npes, input, inPutBuffObj, outPutBuffObj, flagsObj, total_count);
-  
+  OneShotAllGatherSdmaKernel<T>
+      <<<1, 512>>>(myPe, npes, input, inPutBuffObj, outPutBuffObj, flagsObj, total_count);
+
   // Synchronize GPU to ensure kernel completion
   hipError_t sync_err;
   if (stream != nullptr) {
@@ -63,17 +64,16 @@ double Allgather_sdma(T* input, T* output, size_t total_count,
   } else {
     sync_err = hipDeviceSynchronize();
   }
-  
+
   if (sync_err != hipSuccess) {
     fprintf(stderr, "PE %d: Failed to synchronize: %s\n", myPe, hipGetErrorString(sync_err));
     return -1.0;
   }
-  
+
   double end = MPI_Wtime();
 
-   
-  //shmem::ShmemFree(flags);
-  return end-start;
+  // shmem::ShmemFree(flags);
+  return end - start;
 }
-}
-}
+}  // namespace collective
+}  // namespace mori

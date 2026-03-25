@@ -22,35 +22,34 @@
 #pragma once
 
 #include <hip/hip_runtime.h>
+
 #include <cstddef>
 
-#include "mori/shmem/shmem.hpp"
 #include "mori/core/transport/rdma/device_primitives.hpp"
+#include "mori/shmem/shmem.hpp"
 
 namespace mori {
 namespace collective {
 template <typename T>
-__global__ void OneShotAllGatherSdmaKernel(int myPe, int npes,
-		                               T* input,
-                                       const application::SymmMemObjPtr srcMemObj,
-                                       const application::SymmMemObjPtr dstMemObj,
-                                       const application::SymmMemObjPtr flagsMemObj,
-                                       size_t elementCount,
-                                       size_t dstBaseOffset = 0,
-                                       uint64_t flagVal = 1) {
+__global__ void OneShotAllGatherSdmaKernel(int myPe, int npes, T* input,
+                                           const application::SymmMemObjPtr srcMemObj,
+                                           const application::SymmMemObjPtr dstMemObj,
+                                           const application::SymmMemObjPtr flagsMemObj,
+                                           size_t elementCount, size_t dstBaseOffset = 0,
+                                           uint64_t flagVal = 1) {
   if (elementCount == 0 || npes <= 0) {
     return;
   }
 
   T* __restrict__ inputData = input;
-//  T* __restrict__ src = reinterpret_cast<T*>(srcMemObj->localPtr);
-//  T* __restrict__ dst = reinterpret_cast<T*>(dstMemObj->localPtr);
+  //  T* __restrict__ src = reinterpret_cast<T*>(srcMemObj->localPtr);
+  //  T* __restrict__ dst = reinterpret_cast<T*>(dstMemObj->localPtr);
   uint64_t* __restrict__ flags = reinterpret_cast<uint64_t*>(flagsMemObj->localPtr);
 
   const size_t threadLinearId =
       static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + threadIdx.x;
-//  const size_t threadsPerGrid = static_cast<size_t>(blockDim.x) * static_cast<size_t>(gridDim.x);
-//  const size_t stride = threadsPerGrid > 0 ? threadsPerGrid : 1;
+  //  const size_t threadsPerGrid = static_cast<size_t>(blockDim.x) *
+  //  static_cast<size_t>(gridDim.x); const size_t stride = threadsPerGrid > 0 ? threadsPerGrid : 1;
 
   const size_t bytesPerElement = sizeof(T);
   const size_t bytesPerPeer = elementCount * bytesPerElement;
@@ -59,26 +58,31 @@ __global__ void OneShotAllGatherSdmaKernel(int myPe, int npes,
   int warpId = threadLinearId / warpSize;
   const int laneId = threadIdx.x % warpSize;
 
-  if(warpId < npes && laneId == 0){
+  if (warpId < npes && laneId == 0) {
     int remotePe = warpId;
-    size_t destByteOffset = myPe*bytesPerPeer;
+    size_t destByteOffset = myPe * bytesPerPeer;
     size_t srcByteOffset = 0;
     size_t sendBytes = bytesPerPeer;
-    #if 1
+#if 1
     application::SymmMemObjPtr dest = dstMemObj;
-    uint8_t* srcPtr = reinterpret_cast<uint8_t *>(inputData) + srcByteOffset;
-    uint8_t* dstPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe]) + dstBaseOffset + destByteOffset;
-    anvil::SdmaQueueDeviceHandle** devicehandles = dest->deviceHandles_d + remotePe*dest->sdmaNumQueue;
-    HSAuint64* signals = dest->signalPtrs + remotePe*dest->sdmaNumQueue;
-    HSAuint64* expectedSignals = dest->expectSignalsPtr + remotePe*dest->sdmaNumQueue;
-    core::SdmaPutThread(srcPtr, dstPtr, sendBytes, devicehandles, signals, expectedSignals, dest->sdmaNumQueue, 0);
-    #endif
+    uint8_t* srcPtr = reinterpret_cast<uint8_t*>(inputData) + srcByteOffset;
+    uint8_t* dstPtr =
+        reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe]) + dstBaseOffset + destByteOffset;
+    anvil::SdmaQueueDeviceHandle** devicehandles =
+        dest->deviceHandles_d + remotePe * dest->sdmaNumQueue;
+    HSAuint64* signals = dest->signalPtrs + remotePe * dest->sdmaNumQueue;
+    HSAuint64* expectedSignals = dest->expectSignalsPtr + remotePe * dest->sdmaNumQueue;
+    core::SdmaPutThread(srcPtr, dstPtr, sendBytes, devicehandles, signals, expectedSignals,
+                        dest->sdmaNumQueue, 0);
+#endif
   }
 
-  if(warpId < npes && laneId == 0){
-    int remotePe =warpId;
+  if (warpId < npes && laneId == 0) {
+    int remotePe = warpId;
     shmem::ShmemQuietThread(remotePe, dstMemObj);
-    shmem::ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::SDMA>(flagsMemObj, static_cast<size_t>(myPe) * sizeof(uint64_t), &flagVal, 8, core::atomicType::AMO_SET, remotePe, 0);
+    shmem::ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::SDMA>(
+        flagsMemObj, static_cast<size_t>(myPe) * sizeof(uint64_t), &flagVal, 8,
+        core::atomicType::AMO_SET, remotePe, 0);
   }
   __syncthreads();
 

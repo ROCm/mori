@@ -131,7 +131,14 @@ def _invalidate_cmake_cache_if_changed(cmake_cache: "Path", cmake_args: list) ->
         return
 
     # Parse -DKEY=VALUE args (normalize booleans to uppercase)
-    _BOOL_MAP = {"1": "ON", "TRUE": "ON", "YES": "ON", "0": "OFF", "FALSE": "OFF", "NO": "OFF"}
+    _BOOL_MAP = {
+        "1": "ON",
+        "TRUE": "ON",
+        "YES": "ON",
+        "0": "OFF",
+        "FALSE": "OFF",
+        "NO": "OFF",
+    }
 
     def _normalize(v: str) -> str:
         return _BOOL_MAP.get(v.upper(), v)
@@ -153,8 +160,7 @@ def _invalidate_cmake_cache_if_changed(cmake_cache: "Path", cmake_args: list) ->
         cached_opts[key] = _normalize(val)
 
     changed = [
-        k for k, v in new_opts.items()
-        if k in cached_opts and cached_opts[k] != v
+        k for k, v in new_opts.items() if k in cached_opts and cached_opts[k] != v
     ]
 
     # Also check stale CMAKE_MAKE_PROGRAM path

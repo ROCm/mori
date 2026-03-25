@@ -36,7 +36,8 @@ if(NOT _pybind11_result EQUAL 0)
 endif()
 message(STATUS "pybind11 include dir: ${PYBIND11_INCLUDE_DIR}")
 
-set(MORI_PYBIND_SOURCES mori.cpp pybind_ops.cpp pybind_shmem.cpp pybind_io.cpp pybind_ccl.cpp)
+set(MORI_PYBIND_SOURCES mori.cpp pybind_ops.cpp pybind_shmem.cpp pybind_io.cpp
+                        pybind_ccl.cpp)
 if(BUILD_UMBP)
   list(APPEND MORI_PYBIND_SOURCES pybind_umbp.cpp)
 endif()
@@ -51,7 +52,8 @@ target_include_directories(
   mori_pybinds PUBLIC ${PYTHON_INCLUDE_DIRS} ${PYBIND11_INCLUDE_DIR}
                       ${CMAKE_BINARY_DIR}/generated/include)
 target_link_directories(mori_pybinds PRIVATE /opt/rocm/lib)
-target_link_libraries(mori_pybinds mori_ops mori_shmem mori_io mori_collective hip::host)
+target_link_libraries(mori_pybinds mori_ops mori_shmem mori_io mori_collective
+                      hip::host)
 
 if(BUILD_UMBP)
   target_link_libraries(mori_pybinds umbp_core)

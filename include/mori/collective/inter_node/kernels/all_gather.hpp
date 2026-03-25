@@ -59,29 +59,32 @@ __global__ void AllGatherRingKernel(int myPe, int npes, const application::SymmM
       shmem::ShmemPutMemNbiThread(memObj, sourceOffset, memObj, sourceOffset, sendBytes, nextPeer);
     }
 #endif
-    if(warpId == 0){
-      if(sendDataRank != npes-1){
-        shmem::ShmemPutMemNbiWarp(memObj,  chunkBaseOffset, memObj,  chunkBaseOffset, peChunkSize, nextPeer);
-      }
-      else{
-        size_t sendBytes = memObj->size - peChunkSize*(npes-1);
-        shmem::ShmemPutMemNbiWarp(memObj,  chunkBaseOffset, memObj,  chunkBaseOffset, sendBytes, nextPeer);
+    if (warpId == 0) {
+      if (sendDataRank != npes - 1) {
+        shmem::ShmemPutMemNbiWarp(memObj, chunkBaseOffset, memObj, chunkBaseOffset, peChunkSize,
+                                  nextPeer);
+      } else {
+        size_t sendBytes = memObj->size - peChunkSize * (npes - 1);
+        shmem::ShmemPutMemNbiWarp(memObj, chunkBaseOffset, memObj, chunkBaseOffset, sendBytes,
+                                  nextPeer);
       }
     }
 
-//    __threadfence_system();
-    if(threadLinearId == 0){
-      shmem::ShmemQuietThread(nextPeer,memObj);
-      shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(flagsObj, sendDataRank * sizeof(uint64_t), 1, core::atomicType::AMO_ADD, nextPeer);
+    //    __threadfence_system();
+    if (threadLinearId == 0) {
+      shmem::ShmemQuietThread(nextPeer, memObj);
+      shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(flagsObj, sendDataRank * sizeof(uint64_t), 1,
+                                                     core::atomicType::AMO_ADD, nextPeer);
     }
     __syncthreads();
 
-//    if (threadLinearId == 0) {
-//      __threadfence_system();
-//      shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(flagsObj, sendDataRank * sizeof(uint64_t), 1,
-//                                                     core::atomicType::AMO_ADD, nextPeer);
-//    }
-//    __syncthreads();
+    //    if (threadLinearId == 0) {
+    //      __threadfence_system();
+    //      shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(flagsObj, sendDataRank *
+    //      sizeof(uint64_t), 1,
+    //                                                     core::atomicType::AMO_ADD, nextPeer);
+    //    }
+    //    __syncthreads();
 
     if (threadLinearId == 0) {
       int spinCount = 0;
