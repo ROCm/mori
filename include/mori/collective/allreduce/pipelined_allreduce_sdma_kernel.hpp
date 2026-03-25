@@ -1,15 +1,17 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
 // MIT License (see twoshot_sdma_kernel.hpp for full text)
 //
-// Pipelined AllReduce — single-buffer, barrier-free SDMA pipeline.
+// Pipelined AllReduce — single-buffer SDMA pipeline.
 //
 // SCATTER_MODE=0: 2-stage SDMA pipeline
 //   scatter(c) | reduce(c-1) + AG(c-1)
 //
 //   Single buffer (dstMemObj) for scatter, reduce output, and AG.
-//   No cross-PE barrier required: scatter signal sync guarantees all PEs
-//   start reduce nearly simultaneously; SDMA AG latency (>>10µs) ensures
-//   AG data arrives long after the peer finishes reading the same chunk.
+//   block_done[blk] = bdBase + (c+1) after compute finishes reduce(chunk c)
+//   so block 0 can wait bdBase + i before AG(i-1) (fixes numChunks==1 deadlock
+//   where the old "write only when c>0 before reduce" never released i=1).
+//
+//   Scatter qId=0 / AG qId=1; final wait on signalPtrs[sender*numQ+1].
 //
 //   Block 0 = management (scatter / wbl2 / AG).
 //   Blocks 1..N = compute (parallel scatter-poll -> reduce -> flag-write).
@@ -130,13 +132,6 @@ __global__ void PipelinedAllReduceSdmaKernel(
         }
         __syncthreads();
 
-        if (c > 0 && threadIdx.x == 0) {
-          __scoped_atomic_store_n(
-              &barrier->block_done[blockIdx.x],
-              bdBase + static_cast<uint32_t>(c),
-              __ATOMIC_RELEASE, __MEMORY_SCOPE_DEVICE);
-        }
-
         {
           const size_t off = static_cast<size_t>(c) * packedChunkPerRank;
           size_t cnt = packedChunkPerRank;
@@ -160,14 +155,16 @@ __global__ void PipelinedAllReduceSdmaKernel(
             myDst[k] = downcast_v<typename P::type, pack_size>(acc);
           }
         }
-      }
 
-      __syncthreads();
-      if (threadIdx.x == 0) {
-        __scoped_atomic_store_n(
-            &barrier->block_done[blockIdx.x],
-            bdBase + static_cast<uint32_t>(numChunks),
-            __ATOMIC_RELEASE, __MEMORY_SCOPE_DEVICE);
+        // After reduce(chunk c): release block 0 for AG(c). Required for
+        // numChunks==1 (otherwise bdBase+1 is never written inside the loop).
+        __syncthreads();
+        if (threadIdx.x == 0) {
+          __scoped_atomic_store_n(
+              &barrier->block_done[blockIdx.x],
+              bdBase + static_cast<uint32_t>(c + 1),
+              __ATOMIC_RELEASE, __MEMORY_SCOPE_DEVICE);
+        }
       }
 
     } else {

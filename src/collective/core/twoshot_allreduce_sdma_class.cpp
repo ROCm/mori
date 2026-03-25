@@ -311,7 +311,9 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             if (scatter_mode == 1) {
                 chunk_elems = total_count;
             } else {
-                chunk_elems = total_count / 4;
+                // One chunk by default: minimizes block_done / sync / SDMA rounds.
+                // Override with explicit chunk_elems for latency experiments.
+                chunk_elems = total_count;
             }
             if (chunk_elems < min_chunk)
                 chunk_elems = min_chunk;
