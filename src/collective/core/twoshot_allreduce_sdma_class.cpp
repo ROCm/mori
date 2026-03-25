@@ -31,10 +31,18 @@
 #include <stdexcept>
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
 #include <algorithm>
 
 namespace mori {
 namespace collective {
+
+namespace {
+inline bool MoriSdmaVerbose() {
+    const char* e = std::getenv("MORI_SDMA_VERBOSE");
+    return e && e[0] == '1' && e[1] == '\0';
+}
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // Delegating constructor
@@ -120,17 +128,29 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes,
             throw std::runtime_error("Failed to register input transit buffer");
     }
 
-    printf("AllreduceSdma(SDMA) initialized: PE %d of %d, max_blocks=%d\n",
-           myPe_, npes_, max_blocks_);
-    printf("  Flags: %zu bytes at %p\n", flagsSize, flags_.get());
-    printf("  Barrier: %zu bytes at %p\n", barrierSize, bMem);
-    printf("  Output transit buffer: %.2f MB at %p\n",
-           output_transit_buffer_size_ / (1024.0 * 1024.0),
-           output_transit_buffer_);
-    if (input_transit_buffer_size_ > 0) {
-        printf("  Input transit buffer: %.2f MB at %p\n",
-               input_transit_buffer_size_ / (1024.0 * 1024.0),
-               input_transit_buffer_);
+    if (myPe_ == 0) {
+        if (MoriSdmaVerbose()) {
+            printf("AllreduceSdma initialized: PE %d/%d max_blocks=%d\n",
+                   myPe_, npes_, max_blocks_);
+            printf("  flags %zu B @%p  barrier %zu B @%p\n",
+                   flagsSize, flags_.get(), barrierSize, bMem);
+            printf("  output %.2f MB @%p\n",
+                   output_transit_buffer_size_ / (1024.0 * 1024.0),
+                   output_transit_buffer_);
+            if (input_transit_buffer_size_ > 0) {
+                printf("  input  %.2f MB @%p\n",
+                       input_transit_buffer_size_ / (1024.0 * 1024.0),
+                       input_transit_buffer_);
+            }
+        } else {
+            printf("AllreduceSdma: %d PEs  out %.0f MiB", npes_,
+                   output_transit_buffer_size_ / (1024.0 * 1024.0));
+            if (input_transit_buffer_size_ > 0) {
+                printf("  in %.0f MiB",
+                       input_transit_buffer_size_ / (1024.0 * 1024.0));
+            }
+            printf("\n");
+        }
     }
 }
 
@@ -140,9 +160,7 @@ AllreduceSdma<T>::~AllreduceSdma() {
     if (async_in_progress_) {
         cancel_async();
     }
-    if (flags_) {
-        printf("AllreduceSdma destroyed: PE %d\n", myPe_);
-    }
+    (void)flags_;
 }
 
 // ---------------------------------------------------------------------------
@@ -157,11 +175,12 @@ bool AllreduceSdma<T>::ensure_buffer_size(void*& buffer,
         return true;
     }
 
-    // If buffer is not large enough, reallocate
-    printf("PE %d: %s too small: required %.2f MB, current %.2f MB\n",
-           myPe_, buffer_name,
-           required_size / (1024.0 * 1024.0),
-           current_size / (1024.0 * 1024.0));
+    if (MoriSdmaVerbose()) {
+        printf("PE %d: %s too small: need %.2f MB, have %.2f MB\n",
+               myPe_, buffer_name,
+               required_size / (1024.0 * 1024.0),
+               current_size / (1024.0 * 1024.0));
+    }
 
     // First release the old one
     buffer_ptr.reset();
@@ -183,8 +202,10 @@ bool AllreduceSdma<T>::ensure_buffer_size(void*& buffer,
         return false;
     }
 
-    printf("PE %d: %s reallocated to %.2f MB\n",
-           myPe_, buffer_name, current_size / (1024.0 * 1024.0));
+    if (MoriSdmaVerbose()) {
+        printf("PE %d: %s -> %.2f MB\n",
+               myPe_, buffer_name, current_size / (1024.0 * 1024.0));
+    }
     return true;
 }
 
