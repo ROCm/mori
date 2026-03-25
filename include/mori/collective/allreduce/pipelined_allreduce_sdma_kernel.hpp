@@ -171,9 +171,19 @@ __global__ void PipelinedAllReduceSdmaKernel(
           }
         }
 
+        // Flush CU stores before block 0 SDMA AllGather reads this chunk from HBM
+        // (same as SdmaReduceScatterKernel after Phase 3).
+        __syncthreads();
+        if (threadIdx.x == 0) {
+#if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
+          asm volatile("buffer_wbl2" ::: "memory");
+#endif
+          __threadfence_system();
+        }
+        __syncthreads();
+
         // After reduce(chunk c): release block 0 for AG(c). Required for
         // numChunks==1 (otherwise bdBase+1 is never written inside the loop).
-        __syncthreads();
         if (threadIdx.x == 0) {
           __scoped_atomic_store_n(
               &barrier->block_done[blockIdx.x],
