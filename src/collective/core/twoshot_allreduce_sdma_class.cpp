@@ -294,6 +294,15 @@ bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
             return false;
         }
 
+        // Retire ReduceScatter (CU reduce + fence) before AllGather SDMA reads transit.
+        err = stream ? hipStreamSynchronize(stream) : hipDeviceSynchronize();
+        if (err != hipSuccess) {
+            fprintf(stderr,
+                    "PE %d: sync after ReduceScatter failed: %s\n",
+                    myPe_, hipGetErrorString(err));
+            return false;
+        }
+
         // Step 2: AllGather via SDMA
         AllGatherSdmaKernel<T><<<1, 512, 0, stream>>>(
             myPe_, npes_,
@@ -461,6 +470,21 @@ bool AllreduceSdma<T>::start_async(T* input, T* output, size_t total_count, hipS
             flagsObj_,
             barrierPtr_,
             total_count);
+
+        hipError_t rs_err = hipGetLastError();
+        if (rs_err != hipSuccess) {
+            fprintf(stderr, "PE %d: Async ReduceScatter launch failed: %s\n",
+                    myPe_, hipGetErrorString(rs_err));
+            async_in_progress_ = false;
+            return false;
+        }
+        rs_err = stream ? hipStreamSynchronize(stream) : hipDeviceSynchronize();
+        if (rs_err != hipSuccess) {
+            fprintf(stderr, "PE %d: sync after Async ReduceScatter failed: %s\n",
+                    myPe_, hipGetErrorString(rs_err));
+            async_in_progress_ = false;
+            return false;
+        }
 
         // Step 2: AllGather PUT only — sends data, returns immediately
         // The wait is deferred to wait_async so the user can run GEMM on CU

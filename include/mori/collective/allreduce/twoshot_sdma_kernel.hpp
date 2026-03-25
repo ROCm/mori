@@ -246,6 +246,7 @@ __global__ void SdmaReduceScatterKernel(
           &barrier->flag, s_next,
           __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
     }
+    __syncthreads();  // block 0: all warps see flag store before Phase 2.5
   } else {
     // Non-zero blocks: wait for block 0's broadcast (device-scope, L2 only)
     if (threadIdx.x == 0) {
@@ -285,6 +286,9 @@ __global__ void SdmaReduceScatterKernel(
       myDst[k] = inputSlot[k];
     }
   }
+
+  __syncthreads();  // all blocks: every thread finishes slot[myPe] CU copy
+                    // before Phase 3 reads peer columns in this CTA.
 
   // === Phase 3: Local reduce (all blocks) ==================================
   for (size_t k = tid; k < packedPerRank; k += stride) {

@@ -418,6 +418,7 @@ __global__ void ReduceScatterAllGatherFusedKernel(
           &barrier->flag, s_next,
           __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
     }
+    __syncthreads();
   } else {
     // Non-zero blocks: wait for block 0's broadcast (device-scope, L2 only)
     if (threadIdx.x == 0) {
@@ -451,6 +452,8 @@ __global__ void ReduceScatterAllGatherFusedKernel(
       myDst[k] = inputSlot[k];
     }
   }
+
+  __syncthreads();
 
   // Local reduce
   for (size_t k = tid; k < packedPerRank; k += stride) {
