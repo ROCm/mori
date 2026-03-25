@@ -22,15 +22,15 @@
 #pragma once
 
 #include <hip/hip_runtime.h>
-#include "twoshot_sdma_kernel.hpp"
 #include <mpi.h>
+
+#include "twoshot_sdma_kernel.hpp"
 
 namespace mori {
 namespace collective {
 
 template <typename T>
-double Allreduce_sdma(T* input, T* output, size_t total_count,
-                      hipStream_t stream) {
+double Allreduce_sdma(T* input, T* output, size_t total_count, hipStream_t stream) {
   int myPe = shmem::ShmemMyPe();
   int npes = shmem::ShmemNPes();
   size_t dtype_size = sizeof(T);
@@ -51,8 +51,7 @@ double Allreduce_sdma(T* input, T* output, size_t total_count,
   if (transit == nullptr) {
     return -1;
   }
-  application::SymmMemObjPtr transitObj =
-      shmem::ShmemSymmetricRegister(transit, transit_size);
+  application::SymmMemObjPtr transitObj = shmem::ShmemSymmetricRegister(transit, transit_size);
 
   // Allocate flags
   int flagsSize = npes * sizeof(uint64_t);
@@ -69,8 +68,7 @@ double Allreduce_sdma(T* input, T* output, size_t total_count,
   if (barrierMem == nullptr) {
     return -1;
   }
-  application::SymmMemObjPtr barrierObj =
-      shmem::ShmemSymmetricRegister(barrierMem, barrierSize);
+  application::SymmMemObjPtr barrierObj = shmem::ShmemSymmetricRegister(barrierMem, barrierSize);
   hipMemset(barrierMem, 0, barrierSize);
 
   // Local barrier token for AllGather generation signaling.
@@ -96,10 +94,10 @@ double Allreduce_sdma(T* input, T* output, size_t total_count,
   if (blocks < 1) blocks = 1;
 
   double start = MPI_Wtime();
-  ReduceScatterKernel<T><<<blocks, threads, 0, stream>>>(
-      myPe, npes, inPutBuffObj, transitObj, barrierObj, total_count);
-  AllGatherSdmaKernel<T><<<1, 512, 0, stream>>>(
-      myPe, npes, transitObj, flagsObj, agBarrier, total_count);
+  ReduceScatterKernel<T><<<blocks, threads, 0, stream>>>(myPe, npes, inPutBuffObj, transitObj,
+                                                         barrierObj, total_count);
+  AllGatherSdmaKernel<T>
+      <<<1, 512, 0, stream>>>(myPe, npes, transitObj, flagsObj, agBarrier, total_count);
 
   // Synchronize GPU to ensure kernel completion
   hipError_t sync_err;
@@ -117,8 +115,8 @@ double Allreduce_sdma(T* input, T* output, size_t total_count,
   double end = MPI_Wtime();
 
   // Copy result from transit buffer to user output (first total_count elements)
-  hipError_t copy_err = hipMemcpy(output, transit, total_count * dtype_size,
-                                  hipMemcpyDeviceToDevice);
+  hipError_t copy_err =
+      hipMemcpy(output, transit, total_count * dtype_size, hipMemcpyDeviceToDevice);
   if (copy_err != hipSuccess) {
     fprintf(stderr, "PE %d: Failed to copy result: %s\n", myPe, hipGetErrorString(copy_err));
     return -1.0;

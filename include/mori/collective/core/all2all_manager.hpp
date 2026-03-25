@@ -102,10 +102,10 @@ int All2allManager<T>::Initialize(const All2allConfig& config) {
   currentAlgorithm = algorithm;
   if (currentAlgorithm == All2allAlgorithm::INTER_ONE_SHOT) {
     executor = std::make_unique<OneShotAll2allExecutor<T>>(TopologyDetector::GetNPes(),
-                                                             TopologyDetector::GetMyPe(), config);
+                                                           TopologyDetector::GetMyPe(), config);
   } else if (currentAlgorithm == All2allAlgorithm::INTER_RING_1D) {
-    //executor = std::make_unique<Ring1DAll2allExecutor<T>>(TopologyDetector::GetNPes(),
-    //                                                        TopologyDetector::GetMyPe(), config);
+    // executor = std::make_unique<Ring1DAll2allExecutor<T>>(TopologyDetector::GetNPes(),
+    //                                                         TopologyDetector::GetMyPe(), config);
   } else {
     return -1;
   }
@@ -153,4 +153,4 @@ int All2allManager<T>::All2all(T* input, T* output, size_t count, hipStream_t st
 }
 
 }  // namespace collective
-}  // namespace mor
+}  // namespace mori

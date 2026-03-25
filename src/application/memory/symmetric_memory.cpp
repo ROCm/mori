@@ -21,10 +21,10 @@
 // SOFTWARE.
 #include "mori/application/memory/symmetric_memory.hpp"
 
-#include <cstdlib>
 #include <fcntl.h>
 
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <vector>

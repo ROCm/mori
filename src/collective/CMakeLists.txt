@@ -4,7 +4,7 @@ find_package(MPI REQUIRED)
 set(COLLECTIVE_SOURCES
     core/topology_detector.cpp
     core/allreduce_manager.cpp
-	core/oneshot_all2all_sdma_class.cpp
+    core/oneshot_all2all_sdma_class.cpp
     core/oneshot_allgather_sdma_class.cpp
     core/twoshot_allreduce_sdma_class.cpp
     inter_node/executors/ring_1d_executor.cpp
@@ -18,8 +18,7 @@ add_library(mori_collective SHARED ${COLLECTIVE_SOURCES})
 if(USE_ROCM)
   target_compile_definitions(
     mori_collective PRIVATE __HIP_PLATFORM_AMD__=1 USE_ROCM=1 HIPBLAS_V2
-                            __HIP_PLATFORM_HCC__=1
-                            MORI_SHMEM_NO_STATIC_INIT)
+                            __HIP_PLATFORM_HCC__=1 MORI_SHMEM_NO_STATIC_INIT)
 
   # HIP-specific compile options
   target_compile_options(
