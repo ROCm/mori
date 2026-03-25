@@ -67,9 +67,9 @@ __global__ void PipelinedAllReduceSdmaKernel(
   const int compBlocks = static_cast<int>(gridDim.x) - 1;
 
   // ---- Signal baselines (dstMemObj; requires sdmaNumQueue >= 3 for qId=2) ----
-  // Scatter completion: block 0 waits q0 then publishes barrier->flag (like
-  // SdmaReduceScatterKernel). Compute blocks must NOT spin on q0 themselves —
-  // they can otherwise pass before this device's scatter data is visible.
+  // Scatter completion: block 0 waits q0 then publishes block_done[0].
+  // Do not use barrier->flag — that is the RS/AllGather generation counter.
+  // Compute blocks wait on block_done[0], not q0.
   __shared__ uint64_t s_ag_by_sender[64];
   __shared__ uint64_t s_rd_by_sender[64];
   __shared__ uint32_t s_bd_base;
@@ -125,7 +125,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
       for (int c = 0; c < numChunks; c++) {
         if (threadIdx.x == 0) {
           while (__scoped_atomic_load_n(
-                     &barrier->flag,
+                     &barrier->block_done[0],
                      __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) <
                  static_cast<uint32_t>(c + 1))
             ;
@@ -209,7 +209,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
 
         __syncthreads();
         // After posting scatter(i), block 0 waits all incoming q0 (host zeros
-        // signals at launch → expect i+1). Then release compute via flag.
+        // signals at launch → expect i+1). Then release compute via block_done[0].
         if (i < numChunks) {
           if (threadIdx.x == 0) {
             for (int sender = 0; sender < npes; ++sender) {
@@ -234,7 +234,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
 #endif
             __threadfence_system();
             __scoped_atomic_store_n(
-                &barrier->flag, static_cast<uint32_t>(i + 1),
+                &barrier->block_done[0], static_cast<uint32_t>(i + 1),
                 __ATOMIC_RELEASE, __MEMORY_SCOPE_DEVICE);
           }
           __syncthreads();

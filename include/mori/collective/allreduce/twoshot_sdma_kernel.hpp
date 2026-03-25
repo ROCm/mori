@@ -45,7 +45,8 @@ struct alignas(128) RSBarrierSignal {
 // all other blocks.  Device-side generation counter → graph-safe.
 //
 // block_done[]: per-block reduce-completion flags for barrier-free pipeline.
-// Each compute block writes its slot after reduce; block 0 polls all slots.
+// block_done[0]: SCATTER_MODE=0 pipeline scatter generation (not used by bd_poll).
+// block_done[1..]: compute block k writes slot k after reduce; block 0 polls.
 static constexpr int kMaxPipelineBlocks = 64;
 struct alignas(128) CrossPeBarrier {
   uint32_t flag;
