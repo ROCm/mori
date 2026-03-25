@@ -4,11 +4,12 @@ set -e
 # Inner script that runs inside the docker container.
 # Called by test_umbp_integration.sh — not meant to be run directly on the host.
 #
-# Usage: test_umbp_inner.sh [branch] [storage_mode] [sglang_branch]
+# Usage: test_umbp_inner.sh [branch] [storage_mode] [sglang_branch] [parallelism_mode]
 
 MORI_BRANCH="${1:-main}"
 STORAGE_MODE="${2:-local}"
 SGLANG_BRANCH="${3:-main}"
+PARALLELISM_MODE="${4:-dp_ep}"
 
 # ===========================================================================
 # Distributed UMBP settings
@@ -219,6 +220,6 @@ MASTER_PID=""
 start_umbp_master
 
 echo "=== Step 4/4: Running hicache benchmark ==="
-run_bench_hicache tp "$STORAGE_MODE"
+run_bench_hicache "$PARALLELISM_MODE" "$STORAGE_MODE"
 
 echo "=== UMBP integration test complete ==="

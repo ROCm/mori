@@ -3,22 +3,24 @@
 ## Usage
 
 ```bash
-bash src/umbp/scripts/test_umbp_integration.sh [branch] [storage_mode] [sglang_branch]
+bash src/umbp/scripts/test_umbp_integration.sh [branch] [storage_mode] [sglang_branch] [parallelism_mode]
 ```
 
 - `branch` — mori git branch to build (default: `main`)
 - `storage_mode` — `local` (default) or `distributed`
 - `sglang_branch` — sglang git branch to use (default: `main`)
+- `parallelism_mode` — `dp_ep` (default) or `tp`
 
 Examples:
 
 ```bash
-# Local mode (default)
-bash src/umbp/scripts/test_umbp_integration.sh                    # main, local, sglang main
-bash src/umbp/scripts/test_umbp_integration.sh feat_umbp_pool     # feat_umbp_pool, local, sglang main
+# Local mode, dp_ep (default)
+bash src/umbp/scripts/test_umbp_integration.sh                    # main, local, sglang main, dp_ep
+bash src/umbp/scripts/test_umbp_integration.sh main local main tp # main, local, sglang main, tp
 
 # Distributed mode — requires mori branch feat_umbp_pool and sglang branch feat/umbp-monitoring-dist
 bash src/umbp/scripts/test_umbp_integration.sh feat_umbp_pool distributed feat/umbp-monitoring-dist
+bash src/umbp/scripts/test_umbp_integration.sh feat_umbp_pool distributed feat/umbp-monitoring-dist tp
 ```
 
 Single command, non-interactive, no manual steps needed.
