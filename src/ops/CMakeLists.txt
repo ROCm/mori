@@ -1,6 +1,5 @@
-set(MORI_OPS_SOURCES
-  dispatch_combine/dispatch_combine.cpp
-  dispatch_combine/launch.cpp)
+set(MORI_OPS_SOURCES dispatch_combine/dispatch_combine.cpp
+                     dispatch_combine/launch.cpp)
 
 add_library(mori_ops SHARED ${MORI_OPS_SOURCES})
 
@@ -20,15 +19,17 @@ if(ENABLE_PROFILER)
 endif()
 
 # ---------------------------------------------------------------------------
-# BUILD_OPS_DEVICE: AOT compile EP kernels to .hsaco
-# launch.cpp is always compiled (host-only, pure CXX).
-# This option only controls whether .hsaco device modules are built.
-# GPU_TARGETS and MORI_DEVICE_NIC_DEFINE are set by the top-level CMakeLists.
+# BUILD_OPS_DEVICE: AOT compile EP kernels to .hsaco launch.cpp is always
+# compiled (host-only, pure CXX). This option only controls whether .hsaco
+# device modules are built. GPU_TARGETS and MORI_DEVICE_NIC_DEFINE are set by
+# the top-level CMakeLists.
 # ---------------------------------------------------------------------------
 if(BUILD_OPS_DEVICE)
   find_program(HIPCC_EXECUTABLE hipcc PATHS /opt/rocm/bin ENV ROCM_PATH)
   if(NOT HIPCC_EXECUTABLE)
-    message(FATAL_ERROR "BUILD_OPS_DEVICE=ON requires hipcc. Set ROCM_PATH or install ROCm.")
+    message(
+      FATAL_ERROR
+        "BUILD_OPS_DEVICE=ON requires hipcc. Set ROCM_PATH or install ROCm.")
   endif()
 
   # NIC and feature defines (from top-level CMake)
@@ -55,13 +56,8 @@ if(BUILD_OPS_DEVICE)
   endif()
 
   # Kernel sources
-  set(_kernel_sources
-    ep_intranode.hip
-    ep_internode.hip
-    ep_internode_v1.hip
-    ep_internode_v1ll.hip
-    ep_async_ll.hip
-  )
+  set(_kernel_sources ep_intranode.hip ep_internode.hip ep_internode_v1.hip
+                      ep_internode_v1ll.hip ep_async_ll.hip)
 
   # Output to build/lib/<arch>_<nic>/ (matches JIT cache layout)
   set(_arch_nic "${GPU_TARGETS}_${MORI_DEVICE_NIC}")
@@ -76,23 +72,14 @@ if(BUILD_OPS_DEVICE)
 
     add_custom_command(
       OUTPUT ${_hsaco_output}
-      COMMAND ${HIPCC_EXECUTABLE}
-        --genco
-        "--offload-arch=${GPU_TARGETS}"
-        -std=c++17 -O2
-        -D__HIP_PLATFORM_AMD__
-        -DHIP_ENABLE_WARP_SYNC_BUILTINS
-        ${_nic_defs}
-        ${_extra_defs}
-        -I${CMAKE_SOURCE_DIR}/include
-        -I${CMAKE_SOURCE_DIR}
-        ${_mpi_includes}
-        ${_ksrc_path}
-        -o ${_hsaco_output}
+      COMMAND
+        ${HIPCC_EXECUTABLE} --genco "--offload-arch=${GPU_TARGETS}" -std=c++17
+        -O2 -D__HIP_PLATFORM_AMD__ -DHIP_ENABLE_WARP_SYNC_BUILTINS ${_nic_defs}
+        ${_extra_defs} -I${CMAKE_SOURCE_DIR}/include -I${CMAKE_SOURCE_DIR}
+        ${_mpi_includes} ${_ksrc_path} -o ${_hsaco_output}
       DEPENDS ${_ksrc_path}
       COMMENT "AOT compiling ${_ksrc} -> ${_arch_nic}/${_kname}.hsaco"
-      VERBATIM
-    )
+      VERBATIM)
     list(APPEND _all_hsaco_outputs ${_hsaco_output})
   endforeach()
 
@@ -101,5 +88,6 @@ if(BUILD_OPS_DEVICE)
 
   install(FILES ${_all_hsaco_outputs} DESTINATION "lib/${_arch_nic}")
 
-  message(STATUS "BUILD_OPS_DEVICE: will AOT compile kernels -> lib/${_arch_nic}/")
+  message(
+    STATUS "BUILD_OPS_DEVICE: will AOT compile kernels -> lib/${_arch_nic}/")
 endif()

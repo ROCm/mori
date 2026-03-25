@@ -50,7 +50,7 @@ namespace mori {
 namespace shmem {
 int64_t ShmemModuleInit(void* hip_module);
 }
-}
+}  // namespace mori
 
 namespace mori {
 namespace moe {
@@ -86,8 +86,8 @@ void KernelRegistry::LoadModule(const std::string& hsaco_path) {
   hipModule_t mod;
   hipError_t err = hipModuleLoad(&mod, hsaco_path.c_str());
   if (err != hipSuccess) {
-    throw std::runtime_error("Failed to load hsaco: " + hsaco_path + " (" +
-                             hipGetErrorString(err) + ")");
+    throw std::runtime_error("Failed to load hsaco: " + hsaco_path + " (" + hipGetErrorString(err) +
+                             ")");
   }
   impl.modules.push_back(mod);
 
@@ -123,7 +123,8 @@ static std::string classify_ib_device(const std::string& dev_path) {
     if (driver == "bnxt_re" || driver == "bnxt_en") return "bnxt";
     if (driver == "mlx5_core" || driver == "mlx5_ib") return "mlx5";
     if (driver == "ionic_rdma" || driver == "ionic") return "ionic";
-  } catch (...) {}
+  } catch (...) {
+  }
   return "";
 }
 
@@ -136,8 +137,7 @@ static bool has_nic_lib(const std::string& nic) {
   auto it = lib_names.find(nic);
   if (it == lib_names.end()) return false;
   for (const auto& dir : search_paths) {
-    if (std::filesystem::exists(std::filesystem::path(dir) / it->second))
-      return true;
+    if (std::filesystem::exists(std::filesystem::path(dir) / it->second)) return true;
   }
   return false;
 }
@@ -190,7 +190,8 @@ static void detect_hardware() {
     std::sort(sorted_nics.begin(), sorted_nics.end(), [](const auto& a, const auto& b) {
       if (a.second != b.second) return a.second > b.second;
       // Tie-break order
-      static const std::unordered_map<std::string, int> prio = {{"mlx5", 0}, {"bnxt", 1}, {"ionic", 2}};
+      static const std::unordered_map<std::string, int> prio = {
+          {"mlx5", 0}, {"bnxt", 1}, {"ionic", 2}};
       return prio.at(a.first) < prio.at(b.first);
     });
     for (const auto& [nic, cnt] : sorted_nics) {
@@ -237,8 +238,7 @@ void KernelRegistry::AutoLoad(const std::string& base_dir) {
       if (entry.is_directory()) {
         std::string name = entry.path().filename().string();
         if (name.find(arch + "_") == 0) {
-          MORI_OPS_INFO("AutoLoad: arch match {} (wanted {})", name,
-                        arch_nic);
+          MORI_OPS_INFO("AutoLoad: arch match {} (wanted {})", name, arch_nic);
           LoadFromDirectory(entry.path().string());
           return;
         }
@@ -330,23 +330,21 @@ hipFunction_t KernelRegistry::GetFunction(const std::string& func_name) {
     }
   }
 
-  throw std::runtime_error(
-      "Kernel function not found in any loaded module: " + func_name +
-      ". Ensure BUILD_OPS_DEVICE=ON and .hsaco files are installed.");
+  throw std::runtime_error("Kernel function not found in any loaded module: " + func_name +
+                           ". Ensure BUILD_OPS_DEVICE=ON and .hsaco files are installed.");
 }
 
-void KernelRegistry::Launch(const std::string& func_name, unsigned int grid_x,
-                            unsigned int block_x, unsigned int shared_mem,
-                            hipStream_t stream, void* args, size_t args_size) {
+void KernelRegistry::Launch(const std::string& func_name, unsigned int grid_x, unsigned int block_x,
+                            unsigned int shared_mem, hipStream_t stream, void* args,
+                            size_t args_size) {
   hipFunction_t func = GetFunction(func_name);
-  void* config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, args,
-                    HIP_LAUNCH_PARAM_BUFFER_SIZE, &args_size,
+  void* config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, args, HIP_LAUNCH_PARAM_BUFFER_SIZE, &args_size,
                     HIP_LAUNCH_PARAM_END};
-  hipError_t err = hipModuleLaunchKernel(func, grid_x, 1, 1, block_x, 1, 1,
-                                         shared_mem, stream, nullptr, config);
+  hipError_t err =
+      hipModuleLaunchKernel(func, grid_x, 1, 1, block_x, 1, 1, shared_mem, stream, nullptr, config);
   if (err != hipSuccess) {
-    throw std::runtime_error("hipModuleLaunchKernel failed for " + func_name +
-                             ": " + hipGetErrorString(err));
+    throw std::runtime_error("hipModuleLaunchKernel failed for " + func_name + ": " +
+                             hipGetErrorString(err));
   }
 }
 
@@ -356,14 +354,19 @@ void KernelRegistry::Launch(const std::string& func_name, unsigned int grid_x,
 
 static const char* dtype_suffix(hipDataType dtype) {
   switch (dtype) {
-    case HIP_R_32F: return "f32";
-    case HIP_R_16BF: return "bf16";
+    case HIP_R_32F:
+      return "f32";
+    case HIP_R_16BF:
+      return "bf16";
 #if HIP_VERSION >= 60000000
-    case HIP_R_8F_E4M3_FNUZ: return "fp8_fnuz";
-    case HIP_R_8F_E4M3: return "fp8_ocp";
+    case HIP_R_8F_E4M3_FNUZ:
+      return "fp8_fnuz";
+    case HIP_R_8F_E4M3:
+      return "fp8_ocp";
 #endif
 #if __has_include(<hip/hip_ext_ocp.h>)
-    case HIP_R_4F_E2M1: return "fp4";
+    case HIP_R_4F_E2M1:
+      return "fp4";
 #endif
     default:
       throw std::runtime_error("Unsupported dtype for kernel launch");
@@ -371,8 +374,7 @@ static const char* dtype_suffix(hipDataType dtype) {
 }
 
 static int dispatch_shared_mem(const EpDispatchCombineConfig& cfg, int wpb) {
-  return (cfg.worldSize * wpb + cfg.numExpertPerRank * wpb +
-          cfg.numExpertPerRank) *
+  return (cfg.worldSize * wpb + cfg.numExpertPerRank * wpb + cfg.numExpertPerRank) *
          static_cast<int>(sizeof(index_t));
 }
 
@@ -398,16 +400,14 @@ static void ensure_loaded() {
 // -----------------------------------------------------------------------
 // LaunchDispatch
 // -----------------------------------------------------------------------
-void LaunchDispatch(EpDispatchCombineHandle& handle, void* input, void* weights,
-                    void* scales, void* indices, int64_t num_tokens,
-                    hipDataType dtype, int block_num, int rdma_block_num,
-                    int warp_per_block, hipStream_t stream, int hidden_dim) {
+void LaunchDispatch(EpDispatchCombineHandle& handle, void* input, void* weights, void* scales,
+                    void* indices, int64_t num_tokens, hipDataType dtype, int block_num,
+                    int rdma_block_num, int warp_per_block, hipStream_t stream, int hidden_dim) {
   ensure_loaded();
 
-  handle.PrepareInference(dtype, input, nullptr,
-                          reinterpret_cast<float*>(weights),
-                          reinterpret_cast<uint8_t*>(scales),
-                          reinterpret_cast<index_t*>(indices), num_tokens);
+  handle.PrepareInference(dtype, input, nullptr, reinterpret_cast<float*>(weights),
+                          reinterpret_cast<uint8_t*>(scales), reinterpret_cast<index_t*>(indices),
+                          num_tokens);
 
   int wpb = (warp_per_block <= 0) ? handle.config.warpNumPerBlock : warp_per_block;
   int bn = (block_num <= 0) ? handle.config.blockNum : block_num;
@@ -427,28 +427,28 @@ void LaunchDispatch(EpDispatchCombineHandle& handle, void* input, void* weights,
 
   switch (handle.config.kernelType) {
     case KernelType::IntraNode:
-      reg.Launch(std::string("EpDispatchIntraNodeKernel_") + sfx,
-                 bn, block_x, smem, stream, &args, args_size);
+      reg.Launch(std::string("EpDispatchIntraNodeKernel_") + sfx, bn, block_x, smem, stream, &args,
+                 args_size);
       break;
     case KernelType::InterNode:
-      reg.Launch(std::string("EpDispatchInterNodeKernel_") + sfx,
-                 bn, block_x, smem, stream, &args, args_size);
+      reg.Launch(std::string("EpDispatchInterNodeKernel_") + sfx, bn, block_x, smem, stream, &args,
+                 args_size);
       break;
     case KernelType::InterNodeV1:
-      reg.Launch(std::string("EpDispatchCopyToStaging_") + sfx,
-                 handle.multiProcessorCount, block_x, 0, stream, &args, args_size);
-      reg.Launch(std::string("EpDispatchInterNodeV1Kernel_") + sfx,
-                 bn, block_x, smem, stream, &args, args_size);
+      reg.Launch(std::string("EpDispatchCopyToStaging_") + sfx, handle.multiProcessorCount, block_x,
+                 0, stream, &args, args_size);
+      reg.Launch(std::string("EpDispatchInterNodeV1Kernel_") + sfx, bn, block_x, smem, stream,
+                 &args, args_size);
       break;
     case KernelType::InterNodeV1LL:
-      reg.Launch(std::string("EpDispatchCopyToStaging_") + sfx,
-                 handle.multiProcessorCount, block_x, 0, stream, &args, args_size);
-      reg.Launch(std::string("EpDispatchInterNodeV1KernelLowLatency_") + sfx,
-                 bn, block_x, smem, stream, &args, args_size);
+      reg.Launch(std::string("EpDispatchCopyToStaging_") + sfx, handle.multiProcessorCount, block_x,
+                 0, stream, &args, args_size);
+      reg.Launch(std::string("EpDispatchInterNodeV1KernelLowLatency_") + sfx, bn, block_x, smem,
+                 stream, &args, args_size);
       break;
     case KernelType::AsyncLL:
-      reg.Launch(std::string("EpDispatchLowLatencyAsyncSend_") + sfx,
-                 bn, block_x, smem, stream, &args, args_size);
+      reg.Launch(std::string("EpDispatchLowLatencyAsyncSend_") + sfx, bn, block_x, smem, stream,
+                 &args, args_size);
       break;
     default:
       throw std::runtime_error("Unsupported dispatch kernel_type");
@@ -458,15 +458,13 @@ void LaunchDispatch(EpDispatchCombineHandle& handle, void* input, void* weights,
 // -----------------------------------------------------------------------
 // LaunchCombine
 // -----------------------------------------------------------------------
-void LaunchCombine(EpDispatchCombineHandle& handle, void* input, void* weights,
-                   void* indices, int64_t num_tokens, hipDataType dtype,
-                   int block_num, int rdma_block_num, int warp_per_block,
-                   int use_external_inp_buf, hipStream_t stream,
+void LaunchCombine(EpDispatchCombineHandle& handle, void* input, void* weights, void* indices,
+                   int64_t num_tokens, hipDataType dtype, int block_num, int rdma_block_num,
+                   int warp_per_block, int use_external_inp_buf, hipStream_t stream,
                    int hidden_dim) {
   ensure_loaded();
 
-  handle.PrepareInference(dtype, input, nullptr,
-                          reinterpret_cast<float*>(weights),
+  handle.PrepareInference(dtype, input, nullptr, reinterpret_cast<float*>(weights),
                           reinterpret_cast<index_t*>(indices), num_tokens);
 
   int wpb = (warp_per_block <= 0) ? handle.config.warpNumPerBlock : warp_per_block;
@@ -492,40 +490,36 @@ void LaunchCombine(EpDispatchCombineHandle& handle, void* input, void* weights,
   switch (handle.config.kernelType) {
     case KernelType::IntraNode:
       if (args.config.useExternalInpBuffer) {
-        reg.Launch(std::string("EpCombineIntraNodeKernel_") + sfx + "_nop2p",
-                   bn, block_x, smem, stream, &args, args_size);
+        reg.Launch(std::string("EpCombineIntraNodeKernel_") + sfx + "_nop2p", bn, block_x, smem,
+                   stream, &args, args_size);
       } else {
-        reg.Launch(std::string("EpCombineIntraNodeKernel_") + sfx + "_p2p",
-                   bn, block_x, smem, stream, &args, args_size);
+        reg.Launch(std::string("EpCombineIntraNodeKernel_") + sfx + "_p2p", bn, block_x, smem,
+                   stream, &args, args_size);
       }
       break;
     case KernelType::InterNode:
-      reg.Launch(std::string("EpCombineInterNodeKernel_") + sfx,
-                 bn, block_x, smem, stream, &args, args_size);
+      reg.Launch(std::string("EpCombineInterNodeKernel_") + sfx, bn, block_x, smem, stream, &args,
+                 args_size);
       break;
     case KernelType::InterNodeV1:
-      reg.Launch(std::string("EpCombineSync_") + sfx,
-                 mp, block_x, 0, stream, &args, args_size);
-      reg.Launch(std::string("EpCombineSyncBarrier_") + sfx,
-                 1, WARP_SIZE, 0, stream, &args, args_size);
-      reg.Launch(std::string("EpCombineInterNodeV1Kernel_") + sfx,
-                 bn, block_x, smem, stream, &args, args_size);
-      reg.Launch(std::string("EpCombineAll_") + sfx,
-                 mp, block_x, smem, stream, &args, args_size);
+      reg.Launch(std::string("EpCombineSync_") + sfx, mp, block_x, 0, stream, &args, args_size);
+      reg.Launch(std::string("EpCombineSyncBarrier_") + sfx, 1, WARP_SIZE, 0, stream, &args,
+                 args_size);
+      reg.Launch(std::string("EpCombineInterNodeV1Kernel_") + sfx, bn, block_x, smem, stream, &args,
+                 args_size);
+      reg.Launch(std::string("EpCombineAll_") + sfx, mp, block_x, smem, stream, &args, args_size);
       break;
     case KernelType::InterNodeV1LL:
-      reg.Launch(std::string("EpCombineSync_") + sfx,
-                 mp, block_x, 0, stream, &args, args_size);
-      reg.Launch(std::string("EpCombineSyncBarrier_") + sfx,
-                 1, WARP_SIZE, 0, stream, &args, args_size);
-      reg.Launch(std::string("EpCombineInterNodeV1KernelLowLatency_") + sfx,
-                 bn, block_x, smem, stream, &args, args_size);
-      reg.Launch(std::string("EpCombineAll_") + sfx,
-                 mp, block_x, smem, stream, &args, args_size);
+      reg.Launch(std::string("EpCombineSync_") + sfx, mp, block_x, 0, stream, &args, args_size);
+      reg.Launch(std::string("EpCombineSyncBarrier_") + sfx, 1, WARP_SIZE, 0, stream, &args,
+                 args_size);
+      reg.Launch(std::string("EpCombineInterNodeV1KernelLowLatency_") + sfx, bn, block_x, smem,
+                 stream, &args, args_size);
+      reg.Launch(std::string("EpCombineAll_") + sfx, mp, block_x, smem, stream, &args, args_size);
       break;
     case KernelType::AsyncLL:
-      reg.Launch(std::string("EpCombineLowLatencyAsyncSend_") + sfx,
-                 bn, block_x, smem, stream, &args, args_size);
+      reg.Launch(std::string("EpCombineLowLatencyAsyncSend_") + sfx, bn, block_x, smem, stream,
+                 &args, args_size);
       break;
     default:
       throw std::runtime_error("Unsupported combine kernel_type");
@@ -535,8 +529,8 @@ void LaunchCombine(EpDispatchCombineHandle& handle, void* input, void* weights,
 // -----------------------------------------------------------------------
 // LaunchDispatchRecv
 // -----------------------------------------------------------------------
-void LaunchDispatchRecv(EpDispatchCombineHandle& handle, int block_num,
-                        int warp_per_block, hipStream_t stream) {
+void LaunchDispatchRecv(EpDispatchCombineHandle& handle, int block_num, int warp_per_block,
+                        hipStream_t stream) {
   ensure_loaded();
 
   int wpb = (warp_per_block <= 0) ? handle.config.warpNumPerBlock : warp_per_block;
@@ -551,9 +545,8 @@ void LaunchDispatchRecv(EpDispatchCombineHandle& handle, int block_num,
   const char* sfx = dtype_suffix(handle.inputType);
 
   if (handle.config.kernelType == KernelType::AsyncLL) {
-    KernelRegistry::Instance().Launch(
-        std::string("EpDispatchLowLatencyAsyncRecv_") + sfx,
-        bn, block_x, smem, stream, &args, args_size);
+    KernelRegistry::Instance().Launch(std::string("EpDispatchLowLatencyAsyncRecv_") + sfx, bn,
+                                      block_x, smem, stream, &args, args_size);
   } else {
     throw std::runtime_error("LaunchDispatchRecv only supported for AsyncLL");
   }
@@ -562,8 +555,8 @@ void LaunchDispatchRecv(EpDispatchCombineHandle& handle, int block_num,
 // -----------------------------------------------------------------------
 // LaunchCombineRecv
 // -----------------------------------------------------------------------
-void LaunchCombineRecv(EpDispatchCombineHandle& handle, int block_num,
-                       int warp_per_block, hipStream_t stream) {
+void LaunchCombineRecv(EpDispatchCombineHandle& handle, int block_num, int warp_per_block,
+                       hipStream_t stream) {
   ensure_loaded();
 
   int wpb = (warp_per_block <= 0) ? handle.config.warpNumPerBlock : warp_per_block;
@@ -578,9 +571,8 @@ void LaunchCombineRecv(EpDispatchCombineHandle& handle, int block_num,
   const char* sfx = dtype_suffix(handle.inputType);
 
   if (handle.config.kernelType == KernelType::AsyncLL) {
-    KernelRegistry::Instance().Launch(
-        std::string("EpCombineLowLatencyAsyncRecv_") + sfx,
-        bn, block_x, smem, stream, &args, args_size);
+    KernelRegistry::Instance().Launch(std::string("EpCombineLowLatencyAsyncRecv_") + sfx, bn,
+                                      block_x, smem, stream, &args, args_size);
   } else {
     throw std::runtime_error("LaunchCombineRecv only supported for AsyncLL");
   }

@@ -86,77 +86,76 @@ int main(int argc, char** argv) {
   config.numQpPerPe = 1;
 
   {  // Scope handle so it destructs before ShmemFinalize
-  EpDispatchCombineHandle handle(config);
+    EpDispatchCombineHandle handle(config);
 
-  // Allocate test data
-  size_t inp_size = num_tokens * hidden_dim * sizeof(hip_bfloat16);
-  size_t w_size = num_tokens * num_experts_per_token * sizeof(float);
-  size_t idx_size = num_tokens * num_experts_per_token * sizeof(index_t);
+    // Allocate test data
+    size_t inp_size = num_tokens * hidden_dim * sizeof(hip_bfloat16);
+    size_t w_size = num_tokens * num_experts_per_token * sizeof(float);
+    size_t idx_size = num_tokens * num_experts_per_token * sizeof(index_t);
 
-  void *input, *weights_buf, *indices_buf;
-  hipMalloc(&input, inp_size);
-  hipMalloc(&weights_buf, w_size);
-  hipMalloc(&indices_buf, idx_size);
+    void *input, *weights_buf, *indices_buf;
+    hipMalloc(&input, inp_size);
+    hipMalloc(&weights_buf, w_size);
+    hipMalloc(&indices_buf, idx_size);
 
-  // Generate valid test data on host then copy to device
-  {
-    std::vector<float> h_weights(num_tokens * num_experts_per_token, 1.0f);
-    hipMemcpy(weights_buf, h_weights.data(), w_size, hipMemcpyHostToDevice);
+    // Generate valid test data on host then copy to device
+    {
+      std::vector<float> h_weights(num_tokens * num_experts_per_token, 1.0f);
+      hipMemcpy(weights_buf, h_weights.data(), w_size, hipMemcpyHostToDevice);
 
-    // Random top-K expert indices (each token picks K unique experts)
-    int total_experts = num_experts_per_rank * world_size;
-    std::vector<index_t> h_indices(num_tokens * num_experts_per_token);
-    srand(42 + rank);
-    for (int t = 0; t < num_tokens; t++) {
-      for (int k = 0; k < num_experts_per_token; k++) {
-        h_indices[t * num_experts_per_token + k] = rand() % total_experts;
+      // Random top-K expert indices (each token picks K unique experts)
+      int total_experts = num_experts_per_rank * world_size;
+      std::vector<index_t> h_indices(num_tokens * num_experts_per_token);
+      srand(42 + rank);
+      for (int t = 0; t < num_tokens; t++) {
+        for (int k = 0; k < num_experts_per_token; k++) {
+          h_indices[t * num_experts_per_token + k] = rand() % total_experts;
+        }
       }
+      hipMemcpy(indices_buf, h_indices.data(), idx_size, hipMemcpyHostToDevice);
+      hipMemset(input, 0, inp_size);
     }
-    hipMemcpy(indices_buf, h_indices.data(), idx_size, hipMemcpyHostToDevice);
-    hipMemset(input, 0, inp_size);
-  }
 
-  hipStream_t stream;
-  hipStreamCreate(&stream);
+    hipStream_t stream;
+    hipStreamCreate(&stream);
 
-  // Launch dispatch via AOT C++ API
-  printf("[Rank %d] Launching dispatch...\n", rank);
-  LaunchDispatch(handle, input, weights_buf, nullptr, indices_buf,
-                 num_tokens, HIP_R_16BF, /*block_num=*/80,
-                 /*rdma_block_num=*/0, /*warp_per_block=*/16,
-                 stream, hidden_dim);
-  hipStreamSynchronize(stream);
+    // Launch dispatch via AOT C++ API
+    printf("[Rank %d] Launching dispatch...\n", rank);
+    LaunchDispatch(handle, input, weights_buf, nullptr, indices_buf, num_tokens, HIP_R_16BF,
+                   /*block_num=*/80,
+                   /*rdma_block_num=*/0, /*warp_per_block=*/16, stream, hidden_dim);
+    hipStreamSynchronize(stream);
 
-  // After dispatch, get the actual received token count
-  index_t recv_count = handle.GetCurRankNumToken();
-  printf("[Rank %d] Dispatch completed, received %d tokens\n", rank, recv_count);
+    // After dispatch, get the actual received token count
+    index_t recv_count = handle.GetCurRankNumToken();
+    printf("[Rank %d] Dispatch completed, received %d tokens\n", rank, recv_count);
 
-  // Get dispatch output buffer (shmem buffer where received tokens landed)
-  void* dispatch_out = handle.shmemDispatchOutTokMemObj->Get();
-  void* dispatch_out_weights = handle.shmemDispatchOutWeightsMemObj->Get();
+    // Get dispatch output buffer (shmem buffer where received tokens landed)
+    void* dispatch_out = handle.shmemDispatchOutTokMemObj->Get();
+    void* dispatch_out_weights = handle.shmemDispatchOutWeightsMemObj->Get();
 
-  // Simulate expert computation (identity: just use dispatch output as-is)
-  // In real usage, expert MLP would produce new output here.
+    // Simulate expert computation (identity: just use dispatch output as-is)
+    // In real usage, expert MLP would produce new output here.
 
-  // Launch combine via AOT C++ API
-  // Key: use recv_count (not num_tokens) and dispatch output buffers
-  printf("[Rank %d] Launching combine...\n", rank);
-  LaunchCombine(handle, dispatch_out, dispatch_out_weights, indices_buf,
-                recv_count, HIP_R_16BF, /*block_num=*/80,
-                /*rdma_block_num=*/0, /*warp_per_block=*/8,
-                /*use_external_inp_buf=*/-1, stream, hidden_dim);
-  hipStreamSynchronize(stream);
-  printf("[Rank %d] Combine completed\n", rank);
+    // Launch combine via AOT C++ API
+    // Key: use recv_count (not num_tokens) and dispatch output buffers
+    printf("[Rank %d] Launching combine...\n", rank);
+    LaunchCombine(handle, dispatch_out, dispatch_out_weights, indices_buf, recv_count, HIP_R_16BF,
+                  /*block_num=*/80,
+                  /*rdma_block_num=*/0, /*warp_per_block=*/8,
+                  /*use_external_inp_buf=*/-1, stream, hidden_dim);
+    hipStreamSynchronize(stream);
+    printf("[Rank %d] Combine completed\n", rank);
 
-  // Reset
-  LaunchReset(handle, stream);
-  hipStreamSynchronize(stream);
+    // Reset
+    LaunchReset(handle, stream);
+    hipStreamSynchronize(stream);
 
-  // Cleanup: destroy handle BEFORE ShmemFinalize (handle frees shmem buffers)
-  hipStreamDestroy(stream);
-  hipFree(input);
-  hipFree(weights_buf);
-  hipFree(indices_buf);
+    // Cleanup: destroy handle BEFORE ShmemFinalize (handle frees shmem buffers)
+    hipStreamDestroy(stream);
+    hipFree(input);
+    hipFree(weights_buf);
+    hipFree(indices_buf);
   }  // handle goes out of scope here, freeing shmem buffers
 
   ShmemFinalize();

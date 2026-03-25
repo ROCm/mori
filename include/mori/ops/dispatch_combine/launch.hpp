@@ -54,9 +54,8 @@ class KernelRegistry {
   hipFunction_t GetFunction(const std::string& func_name);
 
   // Launch a kernel by name.
-  void Launch(const std::string& func_name, unsigned int grid_x,
-              unsigned int block_x, unsigned int shared_mem,
-              hipStream_t stream, void* args, size_t args_size);
+  void Launch(const std::string& func_name, unsigned int grid_x, unsigned int block_x,
+              unsigned int shared_mem, hipStream_t stream, void* args, size_t args_size);
 
   bool IsLoaded() const;
 
@@ -74,17 +73,15 @@ class KernelRegistry {
 // -----------------------------------------------------------------------
 
 // Full dispatch: prepare input + launch kernel
-void LaunchDispatch(EpDispatchCombineHandle& handle, void* input, void* weights,
-                    void* scales, void* indices, int64_t num_tokens,
-                    hipDataType dtype, int block_num = -1,
-                    int rdma_block_num = -1, int warp_per_block = -1,
-                    hipStream_t stream = 0, int hidden_dim = -1);
+void LaunchDispatch(EpDispatchCombineHandle& handle, void* input, void* weights, void* scales,
+                    void* indices, int64_t num_tokens, hipDataType dtype, int block_num = -1,
+                    int rdma_block_num = -1, int warp_per_block = -1, hipStream_t stream = 0,
+                    int hidden_dim = -1);
 
 // Full combine: prepare input + launch kernel
-void LaunchCombine(EpDispatchCombineHandle& handle, void* input, void* weights,
-                   void* indices, int64_t num_tokens, hipDataType dtype,
-                   int block_num = -1, int rdma_block_num = -1,
-                   int warp_per_block = -1, int use_external_inp_buf = -1,
+void LaunchCombine(EpDispatchCombineHandle& handle, void* input, void* weights, void* indices,
+                   int64_t num_tokens, hipDataType dtype, int block_num = -1,
+                   int rdma_block_num = -1, int warp_per_block = -1, int use_external_inp_buf = -1,
                    hipStream_t stream = 0, int hidden_dim = -1);
 
 // Async split: dispatch recv phase
@@ -92,8 +89,8 @@ void LaunchDispatchRecv(EpDispatchCombineHandle& handle, int block_num = -1,
                         int warp_per_block = -1, hipStream_t stream = 0);
 
 // Async split: combine recv phase
-void LaunchCombineRecv(EpDispatchCombineHandle& handle, int block_num = -1,
-                       int warp_per_block = -1, hipStream_t stream = 0);
+void LaunchCombineRecv(EpDispatchCombineHandle& handle, int block_num = -1, int warp_per_block = -1,
+                       hipStream_t stream = 0);
 
 // Reset internal state between iterations
 void LaunchReset(EpDispatchCombineHandle& handle, hipStream_t stream = 0);

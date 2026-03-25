@@ -26,7 +26,8 @@ if(BUILD_IO)
   target_link_libraries(test_topology mori_application mori_io)
 
   add_executable(test_discrete_buffer io/test_discrete_buffer.cpp)
-  set_source_files_properties(io/test_discrete_buffer.cpp PROPERTIES LANGUAGE HIP)
+  set_source_files_properties(io/test_discrete_buffer.cpp PROPERTIES LANGUAGE
+                                                                     HIP)
 
   target_include_directories(test_discrete_buffer
                              PUBLIC ${CMAKE_SOURCE_DIR}/include)
@@ -44,7 +45,8 @@ if(BUILD_OPS_DEVICE)
   target_include_directories(test_aot_launch PUBLIC ${CMAKE_SOURCE_DIR}/include)
   target_include_directories(test_aot_launch PUBLIC ${CMAKE_SOURCE_DIR})
   target_include_directories(test_aot_launch PUBLIC ${MPI_CXX_INCLUDE_DIRS})
-  target_link_libraries(test_aot_launch mori_ops mori_shmem mori_application hip::host ${MPI_CXX_LIBRARIES})
+  target_link_libraries(test_aot_launch mori_ops mori_shmem mori_application
+                        hip::host ${MPI_CXX_LIBRARIES})
 endif()
 
 if(BUILD_UMBP)
