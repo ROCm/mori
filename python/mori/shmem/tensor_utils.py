@@ -68,6 +68,12 @@ def symm_mori_shmem_tensor(tensor: torch.Tensor, peer: int) -> torch.Tensor:
     return torch.as_tensor(buffer, device="cuda").view(tensor.dtype).view(tensor.shape)
 
 
+def mori_shmem_free_tensor(tensor: torch.Tensor):
+    assert getattr(tensor, "__symm_tensor__", False), "tensor is not a symm_tensor"
+    torch.cuda.synchronize()
+    mori_shmem.shmem_free(tensor.data_ptr())
+    torch.cuda.synchronize()
+
 def mori_shmem_create_tensor_list_intra_node(shape, dtype, num_ranks):
     tensor = mori_shmem_create_tensor(shape, dtype)
     return [symm_mori_shmem_tensor(tensor, i) for i in range(num_ranks)]
