@@ -1,22 +1,18 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
 // MIT License (see twoshot_sdma_kernel.hpp for full text)
 //
-// Pipelined AllReduce — single-buffer SDMA pipeline.
+// Pipelined AllReduce — single-buffer SDMA pipeline with cross-PE barrier.
 //
-// SCATTER_MODE=0: 2-stage SDMA pipeline
-//   scatter(c) | reduce(c-1) + AG(c-1)
+// SCATTER_MODE=0: 3-stage pipeline (loop i = 0 .. numChunks+1)
+//   scatter(i) | reduce(i-1) local | AG(i-2)
 //
-//   Single buffer (dstMemObj) for scatter, reduce output, and AG.
-//   block_done[blk] = bdBase + (c+1) after compute finishes reduce(chunk c)
-//   so block 0 can wait bdBase + i before AG(i-1) (fixes numChunks==1 deadlock
-//   where the old "write only when c>0 before reduce" never released i=1).
+//   qId=0 scatter, qId=1 AG, qId=2 reduce-done (CU atomic on peerSignalPtrs).
+//   Before AG(k), all PEs must finish reduce(k); wait on signalPtrs[*][2].
 //
-//   Scatter qId=0 / AG qId=1; final wait on signalPtrs[sender*numQ+1].
+//   block_done[blk] = bdBase + (c+1) after reduce(chunk c) (numChunks==1 safe).
 //
-//   Block 0 = management (scatter / wbl2 / AG).
-//   Blocks 1..N = compute (parallel scatter-poll -> reduce -> flag-write).
-//   Single __syncthreads per iteration in block 0; wbl2->AG ordering
-//   guaranteed by wavefront lockstep (threads 0-6 in same wave).
+//   Block 0: parallel wavefronts — scatter / wait_rd(q=2) / block_done poll;
+//   then wbl2 + signal q=2 + AG (wavefront lockstep for ordering).
 //
 // SCATTER_MODE=1: P2P read + CU AG (legacy path).
 //
@@ -70,13 +66,15 @@ __global__ void PipelinedAllReduceSdmaKernel(
   const uint32_t numQ = dstMemObj->sdmaNumQueue;
   const int compBlocks = static_cast<int>(gridDim.x) - 1;
 
-  // ---- Signal baselines (all from dstMemObj — pre-registered, reliable) ----
+  // ---- Signal baselines (dstMemObj; requires sdmaNumQueue >= 3 for qId=2) ----
   __shared__ uint64_t s_scatter_base;
   __shared__ uint64_t s_ag_base;
+  __shared__ uint64_t s_rd_base;
   __shared__ uint32_t s_bd_base;
 
   if (threadIdx.x == 0) {
     s_ag_base = 0;
+    s_rd_base = 0;
     if (blockIdx.x == 0 && compBlocks > 0) {
       s_bd_base = __scoped_atomic_load_n(
           &barrier->block_done[1], __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
@@ -93,6 +91,8 @@ __global__ void PipelinedAllReduceSdmaKernel(
         if (blockIdx.x == 0) {
           s_ag_base = core::AtomicLoadRelaxed(
               dstMemObj->signalPtrs + static_cast<size_t>(i) * numQ + 1);
+          s_rd_base = core::AtomicLoadRelaxed(
+              dstMemObj->signalPtrs + static_cast<size_t>(i) * numQ + 2);
         }
         break;
       }
@@ -102,12 +102,21 @@ __global__ void PipelinedAllReduceSdmaKernel(
 
   const uint64_t scatterBase = s_scatter_base;
   const uint64_t agBase = s_ag_base;
+  const uint64_t rdBase = s_rd_base;
   const uint32_t bdBase = s_bd_base;
 
   // =========================================================================
-  // SCATTER_MODE = 0 — Single-buffer SDMA pipeline, no cross-PE barrier
+  // SCATTER_MODE = 0 — Single-buffer SDMA + qId=2 cross-PE reduce barrier
   // =========================================================================
   if constexpr (SCATTER_MODE == 0) {
+
+    if (numQ < 3) {
+      if (threadIdx.x == 0 && blockIdx.x == 0) {
+        printf("PE %d: pipelined SDMA needs sdmaNumQueue>=3 (got %u)\n",
+               myPe, numQ);
+      }
+      return;
+    }
 
     if (blockIdx.x != 0) {
       // =================================================================
@@ -169,13 +178,15 @@ __global__ void PipelinedAllReduceSdmaKernel(
 
     } else {
       // =================================================================
-      // BLOCK 0: management — scatter / bd_poll / wbl2 / AG
-      //   Pipeline depth 1: scatter(i) || bd_poll(i-1) -> wbl2 + AG(i-1)
+      // BLOCK 0: i = 0..numChunks+1
+      //   Ph1: scatter(i) | wait_rd(i) | bd_poll(i)  [parallel]
+      //   Ph2: wbl2 + signal q=2 for reduce(i-1) | AG(i-2)
+      //   wait_rd: need rdBase + (i-1) from each peer before AG(i-2) (i>=2)
+      //   bd_poll: i in [1,numChunks] target bdBase + i
       // =================================================================
-      for (int i = 0; i <= numChunks; i++) {
+      for (int i = 0; i <= numChunks + 1; i++) {
         const int thr = static_cast<int>(threadIdx.x);
 
-        // Phase 1 (parallel): scatter(i) + block_done_poll(i-1)
         if (i < numChunks && thr < npes && thr != myPe) {
           const int destPe = thr;
           const size_t cOff = static_cast<size_t>(i) * chunkBytes;
@@ -195,7 +206,19 @@ __global__ void PipelinedAllReduceSdmaKernel(
           }
         }
 
-        if (i >= 1 && thr >= 128 && thr < 128 + compBlocks) {
+        if (i >= 2 && i <= numChunks + 1 && thr >= 64 &&
+            thr < 64 + npes - 1) {
+          const int idx = thr - 64;
+          const int sender = idx < myPe ? idx : idx + 1;
+          const uint64_t need = rdBase + static_cast<uint64_t>(i - 1);
+          HSAuint64* sig = dstMemObj->signalPtrs
+              + static_cast<size_t>(sender) * numQ + 2;
+          while (core::AtomicLoadRelaxed(sig) < need)
+            ;
+        }
+
+        if (i >= 1 && i <= numChunks && thr >= 128 &&
+            thr < 128 + compBlocks) {
           const int blk = thr - 128 + 1;
           const uint32_t target = bdBase + static_cast<uint32_t>(i);
           while (__scoped_atomic_load_n(
@@ -206,32 +229,43 @@ __global__ void PipelinedAllReduceSdmaKernel(
 
         __syncthreads();
 
-        // Phase 2: wbl2 + AG(i-1)
-        // Same wavefront => lockstep guarantees wbl2 before AG submit.
-        if (i >= 1) {
+        if (i >= 1 && i <= numChunks) {
           if (thr == 0) {
 #if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
             asm volatile("buffer_wbl2" ::: "memory");
 #endif
+            __threadfence_system();
           }
+        }
+        __syncthreads();
+
+        if (i >= 1 && i <= numChunks) {
           if (thr < npes && thr != myPe) {
-            const int destPe = thr;
-            const int agChunk = i - 1;
-            const size_t cOff = static_cast<size_t>(agChunk) * chunkBytes;
-            size_t actualBytes = chunkBytes;
-            if (cOff + actualBytes > totalShardBytes)
-              actualBytes = totalShardBytes - cOff;
-            if (actualBytes > 0) {
-              uint8_t* src = reinterpret_cast<uint8_t*>(dstMemObj->localPtr)
-                  + static_cast<size_t>(myPe) * totalShardBytes + cOff;
-              uint8_t* dst = reinterpret_cast<uint8_t*>(dstMemObj->peerPtrs[destPe])
-                  + static_cast<size_t>(myPe) * totalShardBytes + cOff;
-              anvil::SdmaQueueDeviceHandle** dh =
-                  dstMemObj->deviceHandles_d + destPe * numQ;
-              HSAuint64* rSig = dstMemObj->peerSignalPtrs[destPe]
-                  + static_cast<size_t>(myPe) * numQ;
-              core::SdmaPutThread(src, dst, actualBytes, dh, rSig, numQ, 1);
-            }
+            HSAuint64* rs = dstMemObj->peerSignalPtrs[thr]
+                + static_cast<size_t>(myPe) * numQ + 2;
+            __hip_atomic_fetch_add(rs, 1ULL,
+                __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+          }
+        }
+        __syncthreads();
+
+        if (i >= 2 && i <= numChunks + 1 && thr < npes && thr != myPe) {
+          const int destPe = thr;
+          const int agChunk = i - 2;
+          const size_t cOff = static_cast<size_t>(agChunk) * chunkBytes;
+          size_t actualBytes = chunkBytes;
+          if (cOff + actualBytes > totalShardBytes)
+            actualBytes = totalShardBytes - cOff;
+          if (actualBytes > 0) {
+            uint8_t* src = reinterpret_cast<uint8_t*>(dstMemObj->localPtr)
+                + static_cast<size_t>(myPe) * totalShardBytes + cOff;
+            uint8_t* dst = reinterpret_cast<uint8_t*>(dstMemObj->peerPtrs[destPe])
+                + static_cast<size_t>(myPe) * totalShardBytes + cOff;
+            anvil::SdmaQueueDeviceHandle** dh =
+                dstMemObj->deviceHandles_d + destPe * numQ;
+            HSAuint64* rSig = dstMemObj->peerSignalPtrs[destPe]
+                + static_cast<size_t>(myPe) * numQ;
+            core::SdmaPutThread(src, dst, actualBytes, dh, rSig, numQ, 1);
           }
         }
       }
