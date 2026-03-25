@@ -144,7 +144,9 @@ class CMakeBuild(build_ext):
         if build_shmem_device_wrapper.upper() == "ON":
             bc_script = root_dir / "tools" / "build_shmem_bitcode.sh"
             if bc_script.exists():
-                subprocess.check_call(["bash", str(bc_script)], cwd=str(root_dir))
+                bc_env = os.environ.copy()
+                bc_env["MORI_GPU_ARCHS"] = gpu_archs
+                subprocess.check_call(["bash", str(bc_script)], cwd=str(root_dir), env=bc_env)
             bc_path = root_dir / "lib" / "libmori_shmem_device.bc"
             if bc_path.exists():
                 ir_dir = root_dir / "python" / "mori" / "ir"

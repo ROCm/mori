@@ -27,14 +27,22 @@ OUTPUT_DIR=${1:-${MORI_DIR}/lib}
 # ---------------------------------------------------------------------------
 detect_gpu_arch() {
     local arch=""
-    if [ -x "${ROCM_PATH}/bin/rocm_agent_enumerator" ]; then
+    # Check env vars first (same priority as setup.py)
+    if [ -n "$MORI_GPU_ARCHS" ]; then
+        arch=$(echo "$MORI_GPU_ARCHS" | tr ';,' '\n' | grep "gfx" | head -1)
+    elif [ -n "$GPU_ARCHS" ]; then
+        arch=$(echo "$GPU_ARCHS" | tr ';,' '\n' | grep "gfx" | head -1)
+    elif [ -n "$PYTORCH_ROCM_ARCH" ]; then
+        arch=$(echo "$PYTORCH_ROCM_ARCH" | tr ';,' '\n' | grep "gfx" | head -1)
+    elif [ -n "$AMDGPU_TARGETS" ]; then
+        arch=$(echo "$AMDGPU_TARGETS" | tr ',' '\n' | grep "gfx" | head -1)
+    fi
+    # Fall back to hardware detection
+    if [ -z "$arch" ] && [ -x "${ROCM_PATH}/bin/rocm_agent_enumerator" ]; then
         arch=$(${ROCM_PATH}/bin/rocm_agent_enumerator | grep -v "gfx000" | grep "gfx" | head -1)
     fi
     if [ -z "$arch" ] && command -v rocminfo &> /dev/null; then
         arch=$(rocminfo | grep -oP 'gfx\w+' | head -1)
-    fi
-    if [ -z "$arch" ] && [ -n "$AMDGPU_TARGETS" ]; then
-        arch=$(echo "$AMDGPU_TARGETS" | tr ',' '\n' | grep "gfx" | head -1)
     fi
     if [ -z "$arch" ]; then
         echo "Warning: Could not detect GPU architecture, defaulting to gfx942" >&2
