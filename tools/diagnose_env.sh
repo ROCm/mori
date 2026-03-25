@@ -51,4 +51,3 @@ echo ""
 echo "10. ROCm Driver Version:"
 cat /sys/module/amdgpu/version 2>/dev/null || echo "Cannot read amdgpu version"
 echo ""
-

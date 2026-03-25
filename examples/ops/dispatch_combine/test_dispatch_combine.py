@@ -320,9 +320,9 @@ class EpDispatchCombineTestCase:
             unique_pes = len(set(pes))
 
             got = combine_output[i]
-            expected = (
-                input[i].to(torch.float32) * unique_pes
-            ).to(self.config.data_type)
+            expected = (input[i].to(torch.float32) * unique_pes).to(
+                self.config.data_type
+            )
 
             atol, rtol = 1e-2, 1e-2
             if self.config.quant_type == "fp8_direct_cast":

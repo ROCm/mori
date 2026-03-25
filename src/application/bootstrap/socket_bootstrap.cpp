@@ -67,13 +67,11 @@ void SocketBootstrapNetwork::Initialize() {
   // Setup communication infrastructure
   if (!SetupCommunicationRing()) {
     const char* ifname = std::getenv("MORI_SOCKET_IFNAME");
-    std::string hint = ifname
-        ? std::string("Using interface from MORI_SOCKET_IFNAME=") + ifname +
-          ". Verify this interface has connectivity to all peers."
-        : "Try setting MORI_SOCKET_IFNAME=<interface> (e.g. eth0, eno1) "
-          "to specify the network interface for bootstrap communication.";
-    throw std::runtime_error(
-        "Failed to setup communication ring. " + hint);
+    std::string hint = ifname ? std::string("Using interface from MORI_SOCKET_IFNAME=") + ifname +
+                                    ". Verify this interface has connectivity to all peers."
+                              : "Try setting MORI_SOCKET_IFNAME=<interface> (e.g. eth0, eno1) "
+                                "to specify the network interface for bootstrap communication.";
+    throw std::runtime_error("Failed to setup communication ring. " + hint);
   }
 
   initialized_ = true;

@@ -47,10 +47,9 @@ std::vector<bool> TierBackend::ReadBatchIntoPtr(const std::vector<std::string>& 
   return results;
 }
 
-std::vector<bool> TierBackend::BatchWrite(
-    const std::vector<std::string>& keys,
-    const std::vector<const void*>& data_ptrs,
-    const std::vector<size_t>& sizes) {
+std::vector<bool> TierBackend::BatchWrite(const std::vector<std::string>& keys,
+                                          const std::vector<const void*>& data_ptrs,
+                                          const std::vector<size_t>& sizes) {
   std::vector<bool> results(keys.size());
   for (size_t i = 0; i < keys.size(); ++i) {
     results[i] = Write(keys[i], data_ptrs[i], sizes[i]);
@@ -58,10 +57,9 @@ std::vector<bool> TierBackend::BatchWrite(
   return results;
 }
 
-std::vector<bool> TierBackend::BatchReadIntoPtr(
-    const std::vector<std::string>& keys,
-    const std::vector<uintptr_t>& dst_ptrs,
-    const std::vector<size_t>& sizes) {
+std::vector<bool> TierBackend::BatchReadIntoPtr(const std::vector<std::string>& keys,
+                                                const std::vector<uintptr_t>& dst_ptrs,
+                                                const std::vector<size_t>& sizes) {
   std::vector<bool> results(keys.size());
   for (size_t i = 0; i < keys.size(); ++i) {
     results[i] = ReadIntoPtr(keys[i], dst_ptrs[i], sizes[i]);

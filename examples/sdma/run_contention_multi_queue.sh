@@ -2,7 +2,7 @@
  * @acknowledgements:
  * - Original implementation by: Sidler, David
  * - Source: https://github.com/AARInternal/shader_sdma
- * 
+ *
  * @note: This code is adapted/modified from the implementation by Sidler, David
  */
 #!/bin/bash
@@ -38,14 +38,14 @@ do
     #do
         for (( NUM_WAVES=1; NUM_WAVES<=1; NUM_WAVES*=2 ))
         do
-	    echo "==== queues per dst:$QUEUES_PER_DST blocks per queue:$WGS_PER_QUEUE warps:$NUM_WAVES ===="	
+	    echo "==== queues per dst:$QUEUES_PER_DST blocks per queue:$WGS_PER_QUEUE warps:$NUM_WAVES ===="
             RESULT_CSV="p2p_xgmi_banwdith_${NUM_DST}dst_${QUEUES_PER_DST}queuesPerDst_${WGS_PER_QUEUE}wgsPerQ_${NUM_WAVES}waves_${NUM_COPY_COMMMANDS}copies.csv"
             #./build/bench/sdma_bw --minCopySize $MIN_COPY_SIZE --maxCopySize $MAX_COPY_SIZE --numCopyCommands $NUM_COPY_COMMMANDS --numOfQueuesPerDestination $QUEUES_PER_DST --numDestinations $NUM_DST --wgsPerQueue $WGS_PER_QUEUE --warpsPerWG $NUM_WAVES -o $OUTPUT_DIR/$RESULT_CSV  >> log.txt
             ./build/examples/sdma_bw --minCopySize $MIN_COPY_SIZE --maxCopySize $MAX_COPY_SIZE --numCopyCommands $NUM_COPY_COMMMANDS --numOfQueuesPerDestination $QUEUES_PER_DST --numDestinations $NUM_DST --wgsPerQueue $WGS_PER_QUEUE --warpsPerWG $NUM_WAVES
 	    #if [ $QUEUES_PER_DST -eq $MIN_QUEUES_PER_DST ] && [ $NUM_WAVES -eq 1 ]; then
-            #    cat $OUTPUT_DIR/$RESULT_CSV >> $SUMMARY_FILE 
+            #    cat $OUTPUT_DIR/$RESULT_CSV >> $SUMMARY_FILE
             #else
-            #    tail -n +2 $OUTPUT_DIR/$RESULT_CSV >> $SUMMARY_FILE 
+            #    tail -n +2 $OUTPUT_DIR/$RESULT_CSV >> $SUMMARY_FILE
             #fi
         done
     #done

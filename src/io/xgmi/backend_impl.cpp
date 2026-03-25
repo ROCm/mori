@@ -21,19 +21,48 @@
 // SOFTWARE.
 #include "src/io/xgmi/backend_impl.hpp"
 
+#include <errno.h>
 #include <limits.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <climits>
 #include <cstdlib>
 #include <cstring>
+#include <numeric>
 #include <sstream>
 
 #include "mori/io/env.hpp"
 #include "mori/io/logging.hpp"
+#include "src/io/xgmi/scatter_gather_kernel.hpp"
 
 namespace mori {
 namespace io {
 namespace {
+
+int getScatterGatherKernelThreshold() {
+  static const int threshold = []() {
+    const char* env = std::getenv("MORI_IO_XGMI_SCATTER_GATHER_THRESHOLD");
+    if (env != nullptr && env[0] != '\0') {
+      errno = 0;
+      char* end = nullptr;
+      long val = std::strtol(env, &end, 10);
+      if (errno == 0 && end != env && *end == '\0' && val >= 0 && val <= INT_MAX) {
+        MORI_IO_WARN(
+            "XGMI: Experimental scatter/gather batch-copy optimization enabled via "
+            "MORI_IO_XGMI_SCATTER_GATHER_THRESHOLD={}.",
+            val);
+        return static_cast<int>(val);
+      }
+      MORI_IO_WARN(
+          "XGMI: Ignoring invalid MORI_IO_XGMI_SCATTER_GATHER_THRESHOLD='{}'. "
+          "Scatter/gather remains disabled.",
+          env);
+    }
+    return INT_MAX;
+  }();
+  return threshold;
+}
 
 // Keep caller-visible HIP current device unchanged across MORI internals.
 class ScopedHipDeviceGuard {
@@ -68,12 +97,14 @@ class ScopedHipDeviceGuard {
 
 XgmiBackendSession::XgmiBackendSession(const XgmiBackendConfig& config, void* localAddr,
                                        void* remoteAddr, int localDevice, int remoteDevice,
-                                       StreamPool* streamPool, EventPool* eventPool)
+                                       bool isIpcSession, StreamPool* streamPool,
+                                       EventPool* eventPool)
     : config(config),
       localAddr(localAddr),
       remoteAddr(remoteAddr),
       localDevice(localDevice),
       remoteDevice(remoteDevice),
+      isIpcSession(isIpcSession),
       streamPool(streamPool),
       eventPool(eventPool) {}
 
@@ -161,116 +192,208 @@ void XgmiBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
   const int srcDevice = isRead ? remoteDevice : localDevice;
   const int dstDevice = isRead ? localDevice : remoteDevice;
 
-  hipError_t err = hipSetDevice(dstDevice);
+  // For IPC writes the scatter/gather kernel must run on localDevice because
+  // remoteAddr was IPC-opened in localDevice's context.  The hipMemcpyPeerAsync
+  // fallback handles cross-device routing internally so it stays on dstDevice.
+  const bool kernelOnLocal = isIpcSession && !isRead;
+  const int kernelDevice = kernelOnLocal ? localDevice : dstDevice;
+
+  hipError_t err = hipSetDevice(kernelDevice);
   if (err != hipSuccess) {
     status->Update(StatusCode::ERR_GPU_OP,
                    std::string("XGMI: Failed to set device: ") + hipGetErrorString(err));
     return;
   }
 
-  hipStream_t stream = streamPool->GetNextStream(dstDevice);
-  hipEvent_t event = eventPool->GetEvent(dstDevice);
+  hipStream_t stream = streamPool->GetNextStream(kernelDevice);
+  hipEvent_t event = eventPool->GetEvent(kernelDevice);
   if (stream == nullptr || event == nullptr) {
     status->Update(StatusCode::ERR_BAD_STATE, "XGMI: Failed to get stream or event from pool");
     if (event != nullptr) {
-      eventPool->PutEvent(event, dstDevice);
+      eventPool->PutEvent(event, kernelDevice);
     }
     return;
   }
 
-  size_t runStartIdx = 0;
-  size_t runLocalOff = 0;
-  size_t runRemoteOff = 0;
-  size_t runSize = 0;
-  bool hasRun = false;
+  // Sort indices by remote offset to maximize contiguous-run merging
+  std::vector<size_t> indices(batchSize);
+  std::iota(indices.begin(), indices.end(), 0);
+  if (!std::is_sorted(remoteOffsets.begin(), remoteOffsets.end())) {
+    std::sort(indices.begin(), indices.end(),
+              [&](size_t a, size_t b) { return remoteOffsets[a] < remoteOffsets[b]; });
+  }
 
-  auto flush_run = [&](size_t failedAtIdx) -> bool {
-    if (!hasRun) return true;
-
-    void* src = isRead ? static_cast<char*>(remoteAddr) + runRemoteOff
-                       : static_cast<char*>(localAddr) + runLocalOff;
-    void* dst = isRead ? static_cast<char*>(localAddr) + runLocalOff
-                       : static_cast<char*>(remoteAddr) + runRemoteOff;
-
-    if (srcDevice == dstDevice) {
-      err = hipMemcpyAsync(dst, src, runSize, hipMemcpyDeviceToDevice, stream);
-      if (err != hipSuccess) {
-        status->Update(StatusCode::ERR_GPU_OP,
-                       std::string("XGMI: hipMemcpyAsync failed at batch ") +
-                           std::to_string(failedAtIdx) + ": " + hipGetErrorString(err));
-        return false;
-      }
-    } else {
-      err = hipMemcpyPeerAsync(dst, dstDevice, src, srcDevice, runSize, stream);
-      if (err != hipSuccess) {
-        status->Update(StatusCode::ERR_GPU_OP,
-                       std::string("XGMI: hipMemcpyPeerAsync failed at batch ") +
-                           std::to_string(failedAtIdx) + ": " + hipGetErrorString(err));
-        return false;
-      }
-    }
-    return true;
+  struct MergedSeg {
+    size_t localOff;
+    size_t remoteOff;
+    size_t sz;
   };
+  std::vector<MergedSeg> segments;
+  segments.reserve(batchSize);
 
   for (size_t i = 0; i < batchSize; ++i) {
-    const size_t sz = sizes[i];
-    if (sz == 0) continue;
+    size_t idx = indices[i];
+    if (sizes[idx] == 0) continue;
 
-    if (!hasRun) {
-      runStartIdx = i;
-      runLocalOff = localOffsets[i];
-      runRemoteOff = remoteOffsets[i];
-      runSize = sz;
-      hasRun = true;
-      continue;
+    if (!segments.empty()) {
+      MergedSeg& last = segments.back();
+      bool localContig = (last.localOff + last.sz) == localOffsets[idx];
+      bool remoteContig = (last.remoteOff + last.sz) == remoteOffsets[idx];
+      if (localContig && remoteContig) {
+        last.sz += sizes[idx];
+        continue;
+      }
     }
-
-    const bool remoteContiguous = (runRemoteOff + runSize) == remoteOffsets[i];
-    const bool localContiguous = (runLocalOff + runSize) == localOffsets[i];
-
-    if (remoteContiguous && localContiguous) {
-      runSize += sz;
-      continue;
-    }
-
-    if (!flush_run(runStartIdx)) {
-      eventPool->PutEvent(event, dstDevice);
-      return;
-    }
-
-    runStartIdx = i;
-    runLocalOff = localOffsets[i];
-    runRemoteOff = remoteOffsets[i];
-    runSize = sz;
-    hasRun = true;
+    segments.push_back({localOffsets[idx], remoteOffsets[idx], sizes[idx]});
   }
 
-  if (!flush_run(runStartIdx)) {
-    eventPool->PutEvent(event, dstDevice);
+  if (segments.empty()) {
+    status->SetCode(StatusCode::SUCCESS);
+    eventPool->PutEvent(event, kernelDevice);
     return;
+  }
+
+  void* srcBase = isRead ? remoteAddr : localAddr;
+  void* dstBase = isRead ? localAddr : remoteAddr;
+
+  bool useKernel = static_cast<int>(segments.size()) > getScatterGatherKernelThreshold();
+
+  if (useKernel) {
+    size_t numSegs = segments.size();
+    size_t metaBytes = numSegs * sizeof(size_t) * 3;
+
+    std::vector<size_t> hostMeta(numSegs * 3);
+    size_t* hSrcOff = hostMeta.data();
+    size_t* hDstOff = hostMeta.data() + numSegs;
+    size_t* hSizes = hostMeta.data() + numSegs * 2;
+    for (size_t i = 0; i < numSegs; ++i) {
+      hSrcOff[i] = isRead ? segments[i].remoteOff : segments[i].localOff;
+      hDstOff[i] = isRead ? segments[i].localOff : segments[i].remoteOff;
+      hSizes[i] = segments[i].sz;
+    }
+
+    size_t* dMeta = nullptr;
+    err = hipMalloc(&dMeta, metaBytes);
+    if (err != hipSuccess) {
+      MORI_IO_WARN("XGMI: scatter/gather metadata alloc failed, falling back to hipMemcpy");
+      useKernel = false;
+    }
+
+    if (useKernel) {
+      err = hipMemcpyAsync(dMeta, hostMeta.data(), metaBytes, hipMemcpyHostToDevice, stream);
+      if (err != hipSuccess) {
+        (void)hipFree(dMeta);
+        MORI_IO_WARN("XGMI: scatter/gather metadata upload failed, falling back to hipMemcpy");
+        useKernel = false;
+      }
+    }
+
+    if (useKernel) {
+      size_t* dSrcOff = dMeta;
+      size_t* dDstOff = dMeta + numSegs;
+      size_t* dSizes = dMeta + numSegs * 2;
+
+      int threadsPerBlock = 256;
+      int numBlocks = std::min(static_cast<int>(numSegs), 1024);
+      scatterGatherCopyKernel<<<numBlocks, threadsPerBlock, 0, stream>>>(
+          reinterpret_cast<const char*>(srcBase), reinterpret_cast<char*>(dstBase), dSrcOff,
+          dDstOff, dSizes, static_cast<int>(numSegs));
+
+      err = hipGetLastError();
+      if (err != hipSuccess) {
+        status->Update(
+            StatusCode::ERR_GPU_OP,
+            std::string("XGMI: scatter/gather kernel launch failed: ") + hipGetErrorString(err));
+        (void)hipFree(dMeta);
+        eventPool->PutEvent(event, kernelDevice);
+        return;
+      }
+
+      err = hipEventRecord(event, stream);
+      if (err != hipSuccess) {
+        status->Update(StatusCode::ERR_GPU_OP,
+                       std::string("XGMI: hipEventRecord failed: ") + hipGetErrorString(err));
+        (void)hipFree(dMeta);
+        eventPool->PutEvent(event, kernelDevice);
+        return;
+      }
+
+      status->SetCode(StatusCode::IN_PROGRESS);
+      status->SetWaitCallback([status, event, kernelDevice, pool = eventPool, dMeta]() {
+        hipError_t e = hipEventSynchronize(event);
+        if (e == hipSuccess) {
+          status->SetCode(StatusCode::SUCCESS);
+        } else {
+          status->Update(StatusCode::ERR_GPU_OP,
+                         std::string("XGMI: hipEventSynchronize failed: ") + hipGetErrorString(e));
+        }
+        (void)hipFree(dMeta);
+        pool->PutEvent(event, kernelDevice);
+      });
+      MORI_IO_TRACE("XGMI: Batch transfer via scatter/gather kernel, id={}, segments={}, isRead={}",
+                    id, numSegs, isRead);
+      return;
+    }
+  }
+
+  // Fallback: individual hipMemcpy per merged segment — always uses dstDevice
+  // because hipMemcpyPeerAsync handles cross-device routing internally.
+  int eventDevice = kernelDevice;
+  if (kernelOnLocal) {
+    (void)hipSetDevice(dstDevice);
+    hipStream_t memcpyStream = streamPool->GetNextStream(dstDevice);
+    hipEvent_t memcpyEvent = eventPool->GetEvent(dstDevice);
+    if (memcpyStream != nullptr && memcpyEvent != nullptr) {
+      eventPool->PutEvent(event, kernelDevice);
+      stream = memcpyStream;
+      event = memcpyEvent;
+      eventDevice = dstDevice;
+    } else {
+      // Cannot obtain dstDevice resources; stay on kernelDevice.
+      (void)hipSetDevice(kernelDevice);
+    }
+  }
+
+  for (auto& seg : segments) {
+    void* src = isRead ? static_cast<char*>(remoteAddr) + seg.remoteOff
+                       : static_cast<char*>(localAddr) + seg.localOff;
+    void* dst = isRead ? static_cast<char*>(localAddr) + seg.localOff
+                       : static_cast<char*>(remoteAddr) + seg.remoteOff;
+
+    if (srcDevice == dstDevice) {
+      err = hipMemcpyAsync(dst, src, seg.sz, hipMemcpyDeviceToDevice, stream);
+    } else {
+      err = hipMemcpyPeerAsync(dst, dstDevice, src, srcDevice, seg.sz, stream);
+    }
+    if (err != hipSuccess) {
+      status->Update(StatusCode::ERR_GPU_OP,
+                     std::string("XGMI: memcpy failed: ") + hipGetErrorString(err));
+      eventPool->PutEvent(event, eventDevice);
+      return;
+    }
   }
 
   err = hipEventRecord(event, stream);
   if (err != hipSuccess) {
     status->Update(StatusCode::ERR_GPU_OP,
                    std::string("XGMI: hipEventRecord failed: ") + hipGetErrorString(err));
-    eventPool->PutEvent(event, dstDevice);
+    eventPool->PutEvent(event, eventDevice);
     return;
   }
 
   status->SetCode(StatusCode::IN_PROGRESS);
-  status->SetWaitCallback([status, event, dstDevice, pool = eventPool]() {
-    hipError_t err = hipEventSynchronize(event);
-    if (err == hipSuccess) {
+  status->SetWaitCallback([status, event, eventDevice, pool = eventPool]() {
+    hipError_t e = hipEventSynchronize(event);
+    if (e == hipSuccess) {
       status->SetCode(StatusCode::SUCCESS);
     } else {
       status->Update(StatusCode::ERR_GPU_OP,
-                     std::string("XGMI: hipEventSynchronize failed: ") + hipGetErrorString(err));
+                     std::string("XGMI: hipEventSynchronize failed: ") + hipGetErrorString(e));
     }
-    pool->PutEvent(event, dstDevice);
+    pool->PutEvent(event, eventDevice);
   });
-  MORI_IO_TRACE("XGMI: Batch transfer issued, id={}, batchSize={}, isRead={}", id, batchSize,
-                isRead);
+  MORI_IO_TRACE("XGMI: Batch transfer via hipMemcpy, id={}, segments={}, isRead={}", id,
+                segments.size(), isRead);
 }
 
 bool XgmiBackendSession::Alive() const { return true; }
@@ -425,9 +548,10 @@ void* XgmiBackend::GetRemappedAddress(const MemoryDesc& desc, int localDeviceId)
     return reinterpret_cast<void*>(desc.data);
   }
 
+  IpcCacheKey cacheKey{desc.id, localDeviceId};
   {
     std::shared_lock<std::shared_mutex> rlock(ipcMutex);
-    auto it = remoteIpcHandles.find(desc.id);
+    auto it = remoteIpcHandles.find(cacheKey);
     if (it != remoteIpcHandles.end() && it->second.remappedAddr != nullptr) {
       return it->second.remappedAddr;
     }
@@ -456,14 +580,15 @@ void* XgmiBackend::GetRemappedAddress(const MemoryDesc& desc, int localDeviceId)
       MORI_IO_TRACE("XGMI: IPC failed, using direct P2P pointer for id={}", desc.id);
       return reinterpret_cast<void*>(desc.data);
     }
-    MORI_IO_WARN("XGMI: Failed to open IPC handle for id={}: {}", desc.id, hipGetErrorString(err));
+    MORI_IO_WARN("XGMI: Failed to open IPC handle for id={} on device {}: {}", desc.id,
+                 localDeviceId, hipGetErrorString(err));
     return nullptr;
   }
 
   std::unique_lock<std::shared_mutex> wlock(ipcMutex);
-  remoteIpcHandles[desc.id] = {handle, remappedAddr, desc.size};
-  MORI_IO_TRACE("XGMI: Opened IPC handle for id={}, remapped={}", desc.id,
-                reinterpret_cast<uintptr_t>(remappedAddr));
+  remoteIpcHandles[cacheKey] = {handle, remappedAddr, desc.size};
+  MORI_IO_TRACE("XGMI: Opened IPC handle for id={} on device {}, remapped={}", desc.id,
+                localDeviceId, reinterpret_cast<uintptr_t>(remappedAddr));
   return remappedAddr;
 }
 
@@ -494,9 +619,10 @@ void XgmiBackend::BatchReadWrite(const MemoryDesc& localDest, const SizeVec& loc
 
 BackendSession* XgmiBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remote) {
   int localDevice = local.deviceId;
+  int remoteDevice = remote.deviceId;
   void* localAddr = GetRemappedAddress(local, localDevice);
   void* remoteAddr = GetRemappedAddress(remote, localDevice);
-  int remoteDevice = remote.deviceId;
+  bool ipcSession = (remote.engineKey != myEngKey);
 
   if (!IsP2PAccessible(localDevice, remoteDevice)) {
     MORI_IO_WARN("XGMI: P2P access not available between devices {} and {}", localDevice,
@@ -504,7 +630,7 @@ BackendSession* XgmiBackend::CreateSession(const MemoryDesc& local, const Memory
   }
 
   return new XgmiBackendSession(config, localAddr, remoteAddr, localDevice, remoteDevice,
-                                streamPool.get(), eventPool.get());
+                                ipcSession, streamPool.get(), eventPool.get());
 }
 
 XgmiBackendSession* XgmiBackend::GetOrCreateSessionCached(const MemoryDesc& local,
@@ -518,17 +644,19 @@ XgmiBackendSession* XgmiBackend::GetOrCreateSessionCached(const MemoryDesc& loca
   }
 
   void* localAddr = reinterpret_cast<void*>(local.data);
-  void* remoteAddr = GetRemappedAddress(remote, local.deviceId);
   int localDevice = local.deviceId;
   int remoteDevice = remote.deviceId;
+  void* remoteAddr = GetRemappedAddress(remote, localDevice);
+  bool ipcSession = (remote.engineKey != myEngKey);
 
   if (!IsP2PAccessible(localDevice, remoteDevice)) {
     MORI_IO_WARN("XGMI: P2P access not available between devices {} and {}", localDevice,
                  remoteDevice);
   }
 
-  auto sess = std::make_unique<XgmiBackendSession>(config, localAddr, remoteAddr, localDevice,
-                                                   remoteDevice, streamPool.get(), eventPool.get());
+  auto sess =
+      std::make_unique<XgmiBackendSession>(config, localAddr, remoteAddr, localDevice, remoteDevice,
+                                           ipcSession, streamPool.get(), eventPool.get());
 
   XgmiBackendSession* rawPtr = sess.get();
   sessionCache[key] = std::move(sess);

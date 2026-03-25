@@ -5,9 +5,8 @@ add_library(mori_shmem SHARED ${MORI_SHMEM_SOURCES})
 
 target_include_directories(mori_shmem PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_include_directories(mori_shmem PUBLIC ${CMAKE_SOURCE_DIR})
-target_link_libraries(
-  mori_shmem
-  PUBLIC mori_application mori_logging ibverbs hip::host mlx5)
+target_link_libraries(mori_shmem PUBLIC mori_application mori_logging ibverbs
+                                        hip::host mlx5)
 
 set_target_properties(
   mori_shmem

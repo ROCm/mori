@@ -34,9 +34,7 @@ static int AlignUp(int n, int alignment) { return ((n + alignment - 1) / alignme
 
 static int AlignUpTo256(int n) { return AlignUp(n, 256); }
 
-static int RoundUpPowOfTwoAlignUpTo256(int n) {
-  return RoundUpPowOfTwo((n + 255) & ~255);
-}
+static int RoundUpPowOfTwoAlignUpTo256(int n) { return RoundUpPowOfTwo((n + 255) & ~255); }
 
 static int LogCeil2(int val) { return ceil(log2(float(val))); }
 

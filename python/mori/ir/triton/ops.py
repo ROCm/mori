@@ -1,3 +1,24 @@
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+#
+# MIT License
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 # Copyright (c) Advanced Micro Devices, Inc. All rights reserved.
 # MIT License
 """
@@ -52,15 +73,17 @@ def _make_extern(name: str, meta: dict):
     is_pure = meta.get("pure", False)
 
     @core.extern
-    def _fn(*args, _semantic=None, _sym=symbol, _at=arg_types, _rt=ret_type,
-            _pure=is_pure):
-        cast_args = [
-            tl.cast(a, t, _semantic=_semantic) for a, t in zip(args, _at)
-        ]
+    def _fn(
+        *args, _semantic=None, _sym=symbol, _at=arg_types, _rt=ret_type, _pure=is_pure
+    ):
+        cast_args = [tl.cast(a, t, _semantic=_semantic) for a, t in zip(args, _at)]
         return core.extern_elementwise(
-            _LIB_NAME, "", cast_args,
+            _LIB_NAME,
+            "",
+            cast_args,
             {_at: (_sym, _rt)},
-            is_pure=_pure, _semantic=_semantic,
+            is_pure=_pure,
+            _semantic=_semantic,
         )
 
     _set_name(_fn, name)
@@ -76,9 +99,12 @@ def _make_extern_noargs(name: str, meta: dict):
     @core.extern
     def _fn(_semantic=None, _sym=symbol, _rt=ret_type, _pure=is_pure):
         return core.extern_elementwise(
-            _LIB_NAME, "", [],
+            _LIB_NAME,
+            "",
+            [],
             {(): (_sym, _rt)},
-            is_pure=_pure, _semantic=_semantic,
+            is_pure=_pure,
+            _semantic=_semantic,
         )
 
     _set_name(_fn, name)

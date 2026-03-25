@@ -93,16 +93,14 @@ class TierBackend {
 
   // Batch write: write multiple keys in one call.
   // Default loops over Write(). Override for deep-queue NVMe pipeline.
-  virtual std::vector<bool> BatchWrite(
-      const std::vector<std::string>& keys,
-      const std::vector<const void*>& data_ptrs,
-      const std::vector<size_t>& sizes);
+  virtual std::vector<bool> BatchWrite(const std::vector<std::string>& keys,
+                                       const std::vector<const void*>& data_ptrs,
+                                       const std::vector<size_t>& sizes);
 
   // Batch read into user pointers. Default loops over ReadIntoPtr().
-  virtual std::vector<bool> BatchReadIntoPtr(
-      const std::vector<std::string>& keys,
-      const std::vector<uintptr_t>& dst_ptrs,
-      const std::vector<size_t>& sizes);
+  virtual std::vector<bool> BatchReadIntoPtr(const std::vector<std::string>& keys,
+                                             const std::vector<uintptr_t>& dst_ptrs,
+                                             const std::vector<size_t>& sizes);
 
   // Ensure all prior writes are durable and visible to readers.
   // Default is a no-op (write-through tiers are always consistent).

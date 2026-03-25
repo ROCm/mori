@@ -143,8 +143,8 @@ __global__ void BlockingGetThreadKernel(int myPe, const SymmMemObjPtr srcMemObj,
   int threadOffset = globalTid * sizeof(uint32_t);
 
   if (myPe == getPe) {
-    ShmemGetMemThread(dstMemObj, threadOffset, srcMemObj, threadOffset, sizeof(uint32_t),
-                      remotePe, 1);
+    ShmemGetMemThread(dstMemObj, threadOffset, srcMemObj, threadOffset, sizeof(uint32_t), remotePe,
+                      1);
   }
 }
 
@@ -469,8 +469,8 @@ void Test3_LargeMultiChunk(int myPe) {
 
   if (myPe == 0) {
     std::vector<uint32_t> hostBuff(testElements);
-    HIP_RUNTIME_CHECK(
-        hipMemcpy(hostBuff.data(), localBuff, testElements * sizeof(uint32_t), hipMemcpyDeviceToHost));
+    HIP_RUNTIME_CHECK(hipMemcpy(hostBuff.data(), localBuff, testElements * sizeof(uint32_t),
+                                hipMemcpyDeviceToHost));
 
     bool success = true;
     for (size_t i = 0; i < testElements; i++) {
