@@ -16,6 +16,11 @@
 //
 // SCATTER_MODE=1: P2P read + CU AG (legacy path).
 //
+// userOut: optional device pointer to the caller's output tensor. When non-null,
+// each chunk is copied from the transit shard (this PE's partition) into userOut
+// inside the same kernel as AG completes — no hipMemcpyAsync and no single
+// end-of-launch full-buffer copy.
+//
 #pragma once
 
 #include <hip/hip_runtime.h>
@@ -34,6 +39,7 @@ template <typename T, int SCATTER_MODE = 0>
 __global__ void PipelinedAllReduceSdmaKernel(
     int myPe, int npes,
     const T* __restrict__ input,
+    T* __restrict__ userOut,
     const application::SymmMemObjPtr dstMemObj,
     const application::SymmMemObjPtr flagsMemObj,
     CrossPeBarrier* __restrict__ barrier,
@@ -305,6 +311,38 @@ __global__ void PipelinedAllReduceSdmaKernel(
         }
 
         __syncthreads();
+
+        // Pipeline chunk into user output: wait this chunk's AG (q=1) then copy
+        // this PE's shard slice — same kernel, no hipMemcpyAsync / no full-tensor
+        // copy at launch return.
+        if (userOut != nullptr && i >= 2 && i <= numChunks + 1) {
+          const int agChunk = i - 2;
+          const size_t cOff = static_cast<size_t>(agChunk) * chunkBytes;
+          size_t actualBytes = chunkBytes;
+          if (cOff + actualBytes > totalShardBytes)
+            actualBytes = totalShardBytes - cOff;
+          if (actualBytes > 0) {
+            if (thr < npes - 1) {
+              const int sender = thr < myPe ? thr : thr + 1;
+              const uint64_t need =
+                  s_ag_by_sender[sender] + static_cast<uint64_t>(agChunk + 1);
+              HSAuint64* sig = dstMemObj->signalPtrs
+                  + static_cast<size_t>(sender) * numQ + 1;
+              while (core::AtomicLoadRelaxed(sig) < need)
+                ;
+            }
+            __syncthreads();
+            uint8_t* dst = reinterpret_cast<uint8_t*>(userOut)
+                + static_cast<size_t>(myPe) * totalShardBytes + cOff;
+            uint8_t* src = reinterpret_cast<uint8_t*>(dstMemObj->localPtr)
+                + static_cast<size_t>(myPe) * totalShardBytes + cOff;
+            for (size_t j = static_cast<size_t>(thr);
+                 j < actualBytes; j += static_cast<size_t>(blockDim.x)) {
+              dst[j] = src[j];
+            }
+            __syncthreads();
+          }
+        }
       }
 
       // Final AG wait (per-sender baseline — slots need not match across senders)
@@ -392,6 +430,23 @@ __global__ void PipelinedAllReduceSdmaKernel(
       }
       __threadfence_system();
       gatherBarrier();
+
+      if (userOut != nullptr) {
+        const size_t cOffBytes = static_cast<size_t>(c) * chunkBytes;
+        size_t actualBytes = chunkBytes;
+        if (cOffBytes + actualBytes > totalShardBytes)
+          actualBytes = totalShardBytes - cOffBytes;
+        if (actualBytes > 0) {
+          uint8_t* dst = reinterpret_cast<uint8_t*>(userOut)
+              + static_cast<size_t>(myPe) * totalShardBytes + cOffBytes;
+          uint8_t* src = reinterpret_cast<uint8_t*>(dstMemObj->localPtr)
+              + static_cast<size_t>(myPe) * totalShardBytes + cOffBytes;
+          for (size_t j = tid; j < actualBytes; j += stride) {
+            dst[j] = src[j];
+          }
+        }
+      }
+
       if (blockIdx.x == 0) {
         const int pe = static_cast<int>(threadIdx.x);
         if (pe < npes && pe != myPe) {

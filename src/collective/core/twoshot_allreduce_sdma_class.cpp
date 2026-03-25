@@ -362,6 +362,15 @@ bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
             return false;
         }
 
+        // Retire AllGather (SDMA puts + device waits) before reading transit for D2D.
+        err = stream ? hipStreamSynchronize(stream) : hipDeviceSynchronize();
+        if (err != hipSuccess) {
+            fprintf(stderr,
+                    "PE %d: sync after AllGather failed: %s\n",
+                    myPe_, hipGetErrorString(err));
+            return false;
+        }
+
         // Step 3: Copy result to user buffer
         if (copy_output_to_user_) {
             copy_output_to_user(output, total_count, stream);
@@ -396,11 +405,88 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             return false;
         }
 
-        // SDMA scatter_mode==0 was a fused multi-CTA pipeline; it still races on
-        // some targets (wrong sums at shard boundaries). Use the same RS+AG path
-        // as operator() until the fused kernel is re-proven.
+        size_t chunk_elems_arg = chunk_elems;
+        if (chunk_elems_arg == 0) {
+            size_t min_chunk = std::max<size_t>(
+                static_cast<size_t>(pack_size) * npes_,
+                (512ULL * 1024 / dtype_size_) * npes_);
+            chunk_elems_arg = total_count;
+            if (chunk_elems_arg < min_chunk)
+                chunk_elems_arg = min_chunk;
+        }
+        size_t align = static_cast<size_t>(pack_size * npes_);
+        chunk_elems_arg = ((chunk_elems_arg + align - 1) / align) * align;
+
+        int threads = 512;
+        int packedPerRank = static_cast<int>(
+            ((total_count / npes_ + pack_size - 1) / pack_size));
+        int blocks = std::min(max_blocks_,
+                              (packedPerRank + threads - 1) / threads);
+        if (blocks < 1) blocks = 1;
+
+        T* userOut = copy_output_to_user_ ? output : nullptr;
+
+        auto zero_sdma_signals_and_barrier = [&]() -> bool {
+            application::SymmMemObj* cpuMo = output_transit_buffer_obj_.cpu;
+            if (cpuMo && cpuMo->signalPtrs) {
+                const uint32_t nq = cpuMo->sdmaNumQueue ? cpuMo->sdmaNumQueue : 8u;
+                const size_t sig_bytes =
+                    static_cast<size_t>(npes_) * static_cast<size_t>(nq) * sizeof(uint64_t);
+                hipError_t sg =
+                    stream ? hipMemsetAsync(cpuMo->signalPtrs, 0, sig_bytes, stream)
+                           : hipMemset(cpuMo->signalPtrs, 0, sig_bytes);
+                if (sg != hipSuccess) {
+                    fprintf(stderr, "PE %d: pipelined hipMemset(SDMA signals) failed: %s\n",
+                            myPe_, hipGetErrorString(sg));
+                    return false;
+                }
+            }
+            hipError_t br =
+                stream ? hipMemsetAsync(barrierPtr_, 0, sizeof(CrossPeBarrier), stream)
+                       : hipMemset(barrierPtr_, 0, sizeof(CrossPeBarrier));
+            if (br != hipSuccess) {
+                fprintf(stderr, "PE %d: pipelined hipMemset(barrier) failed: %s\n",
+                        myPe_, hipGetErrorString(br));
+                return false;
+            }
+            if (stream != nullptr) {
+                hipError_t sy = hipStreamSynchronize(stream);
+                if (sy != hipSuccess) {
+                    fprintf(stderr, "PE %d: pipelined pre-launch stream sync failed: %s\n",
+                            myPe_, hipGetErrorString(sy));
+                    return false;
+                }
+            }
+            return true;
+        };
+
         if (scatter_mode == 0) {
-            return operator()(input, output, total_count, stream);
+            if (SdmaShouldZeroTransit()) {
+                hipError_t zerr =
+                    stream ? hipMemsetAsync(output_transit_buffer_, 0, transit_used, stream)
+                           : hipMemset(output_transit_buffer_, 0, transit_used);
+                if (zerr != hipSuccess) {
+                    fprintf(stderr, "PE %d: pipelined hipMemset(output transit) failed: %s\n",
+                            myPe_, hipGetErrorString(zerr));
+                    return false;
+                }
+            }
+            if (!zero_sdma_signals_and_barrier())
+                return false;
+
+            application::SymmMemObjPtr unusedInputSymm{};
+            PipelinedAllReduceSdmaKernel<T, 0><<<blocks, threads, 0, stream>>>(
+                myPe_, npes_, input, userOut,
+                output_transit_buffer_obj_, flagsObj_, barrierPtr_,
+                unusedInputSymm, total_count, chunk_elems_arg);
+
+            hipError_t err = hipGetLastError();
+            if (err != hipSuccess) {
+                fprintf(stderr, "PE %d: PipelinedAllReduce (SDMA) launch failed: %s\n",
+                        myPe_, hipGetErrorString(err));
+                return false;
+            }
+            return true;
         }
 
         if (SdmaShouldZeroTransit()) {
@@ -412,24 +498,6 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                 return false;
             }
         }
-
-        int threads = 512;
-        int packedPerRank = static_cast<int>(
-            ((total_count / npes_ + pack_size - 1) / pack_size));
-        int blocks = std::min(max_blocks_,
-                              (packedPerRank + threads - 1) / threads);
-        if (blocks < 1) blocks = 1;
-
-        if (chunk_elems == 0) {
-            size_t min_chunk = std::max<size_t>(
-                static_cast<size_t>(pack_size) * npes_,
-                (512ULL * 1024 / dtype_size_) * npes_);
-            chunk_elems = total_count;
-            if (chunk_elems < min_chunk)
-                chunk_elems = min_chunk;
-        }
-        size_t align = static_cast<size_t>(pack_size * npes_);
-        chunk_elems = ((chunk_elems + align - 1) / align) * align;
 
         application::SymmMemObjPtr inputSymmObj = {};
         {
@@ -454,58 +522,19 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             }
         }
 
-        // SDMA queue completion counters live on the symmetric object (not shmem flags).
-        // Zero them every launch so compute CTAs' baseline reads cannot race block 0's
-        // first scatter or inherit mismatched totals from a prior collective.
-        {
-            application::SymmMemObj* cpuMo = output_transit_buffer_obj_.cpu;
-            if (cpuMo && cpuMo->signalPtrs) {
-                const uint32_t nq = cpuMo->sdmaNumQueue ? cpuMo->sdmaNumQueue : 8u;
-                const size_t sig_bytes =
-                    static_cast<size_t>(npes_) * static_cast<size_t>(nq) * sizeof(uint64_t);
-                hipError_t sg =
-                    stream ? hipMemsetAsync(cpuMo->signalPtrs, 0, sig_bytes, stream)
-                           : hipMemset(cpuMo->signalPtrs, 0, sig_bytes);
-                if (sg != hipSuccess) {
-                    fprintf(stderr, "PE %d: pipelined hipMemset(SDMA signals) failed: %s\n",
-                            myPe_, hipGetErrorString(sg));
-                    return false;
-                }
-            }
-        }
-        {
-            hipError_t br =
-                stream ? hipMemsetAsync(barrierPtr_, 0, sizeof(CrossPeBarrier), stream)
-                       : hipMemset(barrierPtr_, 0, sizeof(CrossPeBarrier));
-            if (br != hipSuccess) {
-                fprintf(stderr, "PE %d: pipelined hipMemset(barrier) failed: %s\n",
-                        myPe_, hipGetErrorString(br));
-                return false;
-            }
-        }
-        // Ensure signal/barrier clears are visible before the kernel issues SDMA.
-        if (stream != nullptr) {
-            hipError_t sy = hipStreamSynchronize(stream);
-            if (sy != hipSuccess) {
-                fprintf(stderr, "PE %d: pipelined pre-launch stream sync failed: %s\n",
-                        myPe_, hipGetErrorString(sy));
-                return false;
-            }
-        }
+        if (!zero_sdma_signals_and_barrier())
+            return false;
 
         PipelinedAllReduceSdmaKernel<T, 1><<<blocks, threads, 0, stream>>>(
-            myPe_, npes_, input, output_transit_buffer_obj_, flagsObj_,
-            barrierPtr_, inputSymmObj, total_count, chunk_elems);
+            myPe_, npes_, input, userOut,
+            output_transit_buffer_obj_, flagsObj_, barrierPtr_,
+            inputSymmObj, total_count, chunk_elems_arg);
 
         hipError_t err = hipGetLastError();
         if (err != hipSuccess) {
             fprintf(stderr, "PE %d: PipelinedAllReduce launch failed: %s\n",
                     myPe_, hipGetErrorString(err));
             return false;
-        }
-
-        if (copy_output_to_user_) {
-            copy_output_to_user(output, total_count, stream);
         }
     } catch (const std::exception& e) {
         fprintf(stderr, "PE %d: PipelinedAllReduce failed: %s\n", myPe_, e.what());
