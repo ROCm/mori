@@ -22,22 +22,21 @@
 #pragma once
 
 #include <hip/hip_runtime.h>
+
 #include <cstddef>
 
-#include "mori/shmem/shmem.hpp"
 #include "mori/core/transport/rdma/device_primitives.hpp"
+#include "mori/shmem/shmem.hpp"
 
 namespace mori {
 namespace collective {
 
 template <typename T>
-__global__ void OneShotAllGatherSdmaAsyncPutKernel(int myPe, int npes,
-		                               T* input,
-                                       const application::SymmMemObjPtr srcMemObj,
-                                       const application::SymmMemObjPtr dstMemObj,
-                                       const application::SymmMemObjPtr flagsMemObj,
-                                       size_t elementCount,
-                                       size_t dstBaseOffset = 0) {
+__global__ void OneShotAllGatherSdmaAsyncPutKernel(int myPe, int npes, T* input,
+                                                   const application::SymmMemObjPtr srcMemObj,
+                                                   const application::SymmMemObjPtr dstMemObj,
+                                                   const application::SymmMemObjPtr flagsMemObj,
+                                                   size_t elementCount, size_t dstBaseOffset = 0) {
   if (elementCount == 0 || npes <= 0) {
     return;
   }
@@ -58,39 +57,47 @@ __global__ void OneShotAllGatherSdmaAsyncPutKernel(int myPe, int npes,
   int warpId = threadLinearId / warpSize;
   const int laneId = threadIdx.x % warpSize;
 
-  if(threadLinearId < npes * dstMemObj->sdmaNumQueue){
+  if (threadLinearId < npes * dstMemObj->sdmaNumQueue) {
     int qId = threadLinearId % dstMemObj->sdmaNumQueue;
     int remotePe = threadLinearId / dstMemObj->sdmaNumQueue;
-    const size_t sendBytes_rand = bytesPerPeer/8;
-    size_t destByteOffset = myPe*bytesPerPeer + qId*sendBytes_rand;
-    size_t srcByteOffset = qId*sendBytes_rand;
+    const size_t sendBytes_rand = bytesPerPeer / 8;
+    size_t destByteOffset = myPe * bytesPerPeer + qId * sendBytes_rand;
+    size_t srcByteOffset = qId * sendBytes_rand;
     size_t sendBytes = 0;
 
-    if( qId == 7) sendBytes = bytesPerPeer - 7*sendBytes_rand;
-    else sendBytes = sendBytes_rand;
+    if (qId == 7)
+      sendBytes = bytesPerPeer - 7 * sendBytes_rand;
+    else
+      sendBytes = sendBytes_rand;
 
     application::SymmMemObjPtr dest = dstMemObj;
-    uint8_t* srcPtr = reinterpret_cast<uint8_t *>(inputData) + srcByteOffset;
-    uint8_t* dstPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe]) + dstBaseOffset + destByteOffset;
-    anvil::SdmaQueueDeviceHandle** devicehandles = dest->deviceHandles_d + remotePe*dest->sdmaNumQueue;
-    HSAuint64* signals = dest->signalPtrs + remotePe*dest->sdmaNumQueue;
-    HSAuint64* expectedSignals = dest->expectSignalsPtr + remotePe*dest->sdmaNumQueue;
-    core::SdmaPutThread(srcPtr, dstPtr, sendBytes, devicehandles, signals, expectedSignals, dest->sdmaNumQueue, qId);
+    uint8_t* srcPtr = reinterpret_cast<uint8_t*>(inputData) + srcByteOffset;
+    uint8_t* dstPtr =
+        reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe]) + dstBaseOffset + destByteOffset;
+    anvil::SdmaQueueDeviceHandle** devicehandles =
+        dest->deviceHandles_d + remotePe * dest->sdmaNumQueue;
+    HSAuint64* signals = dest->signalPtrs + remotePe * dest->sdmaNumQueue;
+    HSAuint64* expectedSignals = dest->expectSignalsPtr + remotePe * dest->sdmaNumQueue;
+    core::SdmaPutThread(srcPtr, dstPtr, sendBytes, devicehandles, signals, expectedSignals,
+                        dest->sdmaNumQueue, qId);
   }
 }
 
 __global__ void OneShotAllGatherSdmaAsyncWaitKernel(int myPe, int npes,
-                                        const application::SymmMemObjPtr dstMemObj,
-                                        const application::SymmMemObjPtr flagsMemObj,
-                                        uint64_t flagVal = 1) {
+                                                    const application::SymmMemObjPtr dstMemObj,
+                                                    const application::SymmMemObjPtr flagsMemObj,
+                                                    uint64_t flagVal = 1) {
   uint64_t* __restrict__ flags = reinterpret_cast<uint64_t*>(flagsMemObj->localPtr);
 
-  const size_t threadLinearId = static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + threadIdx.x;
+  const size_t threadLinearId =
+      static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + threadIdx.x;
 
-  if(threadLinearId < npes){
+  if (threadLinearId < npes) {
     int remotePe = threadLinearId;
-    shmem::ShmemQuietThread(remotePe,dstMemObj);
-    shmem::ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::SDMA>(flagsMemObj, static_cast<size_t>(myPe) * sizeof(uint64_t), &flagVal, 8, core::atomicType::AMO_SET, remotePe, 0);
+    shmem::ShmemQuietThread(remotePe, dstMemObj);
+    shmem::ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::SDMA>(
+        flagsMemObj, static_cast<size_t>(myPe) * sizeof(uint64_t), &flagVal, 8,
+        core::atomicType::AMO_SET, remotePe, 0);
   }
   __syncthreads();
 

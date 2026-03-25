@@ -260,9 +260,8 @@ __device__ void EpDispatchLowLatencyAsyncRecvTransfer_body(EpDispatchCombineArgs
   uint64_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<uint64_t*>();
   for (int destPe = blockId; destPe < npes; destPe += blockNum) {
     if (laneId < config.numQpPerPe) {
-      shmem::ShmemUint64WaitUntilGreaterThan(recvTokenNums + destPe * config.numQpPerPe + laneId,
-                                             0) -
-          1;
+      (void)shmem::ShmemUint64WaitUntilGreaterThan(
+          recvTokenNums + destPe * config.numQpPerPe + laneId, 0);
     }
   }
 }

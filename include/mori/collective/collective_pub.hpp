@@ -21,17 +21,20 @@
 // SOFTWARE.
 
 #pragma once
+
+#include "mori/shmem/shmem_api.hpp"
+
 namespace mori {
 namespace collective {
 
 // Complete inline definition of ShmemDeleter in header
 struct ShmemDeleter {
-    void operator()(void* ptr) const {
-        if (ptr) {
-            shmem::ShmemFree(ptr);
-        }
+  void operator()(void* ptr) const {
+    if (ptr) {
+      mori::shmem::ShmemFree(ptr);
     }
+  }
 };
 
-}
-}
+}  // namespace collective
+}  // namespace mori

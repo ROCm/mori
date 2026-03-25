@@ -47,6 +47,8 @@ static hipFunction_t s_barrierFunc = nullptr;
 GpuStates s_hostGpuStatesCopy{};
 
 using GpuStatesAddrProvider = void* (*)();
+// One entry per RegisterGpuStatesAddrProvider (e.g. multiple HIP TUs + modules).
+// Single-pointer storage would drop earlier registrations. See shmem.hpp policy.
 static std::vector<GpuStatesAddrProvider> s_gpuStatesAddrProviders;
 
 using BarrierLauncher = void (*)(hipStream_t);
