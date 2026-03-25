@@ -64,7 +64,9 @@ def _current_stream():
 
 @dataclass
 class EpDispatchCombineConfig:
-    data_type: torch.dtype  # Deprecated for kernel launch (runtime dtype inferred from input tensor); retained for test/example compatibility
+    data_type: (
+        torch.dtype
+    )  # Deprecated for kernel launch (runtime dtype inferred from input tensor); retained for test/example compatibility
     rank: int
     world_size: int
     hidden_dim: int
