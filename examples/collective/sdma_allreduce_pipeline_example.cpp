@@ -1,11 +1,12 @@
-// Pipeline AllReduce SDMA 基准测试
-// 遍历不同数据大小、不同 chunk 大小、SDMA/P2P 两种模式
-// 输出对比表格，并根据结果判断最优配置
+// Pipeline AllReduce — 示例只做一件事：对照串行 operator，看 Pipeline 能否更快。
+// 只跑库默认整块 chunk（chunk_elems=0），不扫小 chunk（小 chunk 必然拖慢，与「赢串行」无关）。
+// 扩展扫 chunk：设置环境变量 MORI_PIPELINE_CHUNK_SWEEP=1
 
 #include <hip/hip_runtime.h>
 #include <mpi.h>
 #include <cassert>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <vector>
 #include <algorithm>
@@ -75,8 +76,6 @@ static BenchResult runBench(const char* label, BenchFn fn,
 
     uint32_t* outBuf = reinterpret_cast<uint32_t*>(verifyBuf);
 
-    // Warmup: 第一次调用可能因 L2 缓存残留导致 transit buffer 数据不正确
-    // 多次执行让 SDMA 写入的数据填充 L2 缓存
     for (int w = 0; w < 3; w++) {
         CHECK_HIP(hipMemcpy(inBuf, hostData.data(), bytesPerPe, hipMemcpyHostToDevice));
         CHECK_HIP(hipDeviceSynchronize());
@@ -86,7 +85,6 @@ static BenchResult runBench(const char* label, BenchFn fn,
         MPI_Barrier(MPI_COMM_WORLD);
     }
 
-    // 验证
     CHECK_HIP(hipMemcpy(inBuf, hostData.data(), bytesPerPe, hipMemcpyHostToDevice));
     CHECK_HIP(hipDeviceSynchronize());
     MPI_Barrier(MPI_COMM_WORLD);
@@ -136,6 +134,11 @@ static BenchResult runBench(const char* label, BenchFn fn,
     return res;
 }
 
+static bool wantChunkSweep() {
+    const char* e = std::getenv("MORI_PIPELINE_CHUNK_SWEEP");
+    return e && e[0] == '1' && e[1] == '\0';
+}
+
 void testPipelinedAllreduce() {
     MPI_Init(NULL, NULL);
     int status = ShmemMpiInit(MPI_COMM_WORLD);
@@ -144,45 +147,43 @@ void testPipelinedAllreduce() {
     int myPe = ShmemMyPe();
     int npes = ShmemNPes();
 
-    // 测试数据大小：4MB, 16MB, 32MB, 64MB, 128MB, 256MB (per PE)
     std::vector<size_t> dataSizesMB = {32, 64, 128, 256};
-
-    // 测试 chunk 大小（总元素粒度；不超过每 PE 数据量会自动跳过）
-    // 含 16/32/64MB chunk；更大 chunk 通常更接近串行大块、Pipeline 开销更低
-    std::vector<size_t> chunkSizesKB = {
+    const std::vector<size_t> chunkSizesKB = {
         128, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536};
 
     const int warmup = 3;
     const int iterations = 5;
+    const bool chunkSweep = wantChunkSweep();
 
     hipStream_t stream;
     CHECK_HIP(hipStreamCreate(&stream));
 
     if (myPe == 0) {
         printf("\n======================================================================\n");
-        printf("Pipeline AllReduce SDMA 综合基准测试\n");
-        printf("  节点数: %d GPU\n", npes);
-        printf("  预热次数: %d, 测量次数: %d\n", warmup, iterations);
+        printf("Pipeline AllReduce — 目标: Pipeline SDMA(整块) 快于 串行 operator()\n");
+        printf("  PE=%d  仅默认 chunk；小 chunk 扫描: %s\n", npes,
+               chunkSweep ? "开启(MORI_PIPELINE_CHUNK_SWEEP=1)" : "关闭");
         printf("======================================================================\n");
     }
 
-    // 存储所有结果用于最终汇总
     std::vector<BenchResult> allResults;
+    std::vector<double> serialMsBySize;
+    std::vector<double> sdmaDefaultMsBySize;
 
     for (size_t dataMB : dataSizesMB) {
         size_t bytesPerPe = dataMB * 1024 * 1024;
         int elemsPerPe = bytesPerPe / sizeof(uint32_t);
-        size_t totalBytes = bytesPerPe * npes;
         uint32_t fillValue = static_cast<uint32_t>((myPe + 1) * 1000);
 
         uint32_t* inBuf = nullptr;
         CHECK_HIP(hipMalloc(&inBuf, bytesPerPe));
         std::vector<uint32_t> hostData(elemsPerPe, fillValue);
 
-        // copy_output_to_user=false，与 allreduce_sdma_sync 一致
         size_t outputBufSize = static_cast<size_t>(npes) * (elemsPerPe / npes + 64) * sizeof(uint32_t);
         auto ar = std::make_unique<AllreduceSdma<uint32_t>>(
             myPe, npes, bytesPerPe, outputBufSize, false);
+
+        double serialMs = -1.0;
 
         if (myPe == 0) {
             printf("\n--- 数据大小: %zu MB/PE ---\n", dataMB);
@@ -191,12 +192,11 @@ void testPipelinedAllreduce() {
             printf("%s\n", std::string(90, '-').c_str());
         }
 
-        // 1) 基准：串行模式——内联实现，与 allreduce_sdma_sync 完全一致
+        // 1) 串行基准
         {
             uint32_t* outBuf = nullptr;
             CHECK_HIP(hipMalloc(&outBuf, bytesPerPe));
 
-            // Warmup
             for (int i = 0; i < 10; i++) {
                 CHECK_HIP(hipMemcpy(inBuf, hostData.data(), bytesPerPe, hipMemcpyHostToDevice));
                 CHECK_HIP(hipMemset(outBuf, 0, bytesPerPe));
@@ -206,13 +206,11 @@ void testPipelinedAllreduce() {
                 MPI_Barrier(MPI_COMM_WORLD);
             }
 
-            // Verify from transit buffer
             void* transitBuf = ar->getOutputTransitBuffer();
             std::vector<uint32_t> result(elemsPerPe);
             CHECK_HIP(hipMemcpy(result.data(), transitBuf, bytesPerPe, hipMemcpyDeviceToHost));
 
             bool ok = verifyResult(result.data(), elemsPerPe, computeExpected(npes), myPe);
-
             int lok = ok ? 1 : 0, gok = 0;
             MPI_Allreduce(&lok, &gok, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
 
@@ -224,7 +222,6 @@ void testPipelinedAllreduce() {
             res.passed = (gok == npes);
 
             if (res.passed) {
-                // Benchmark
                 std::vector<double> times;
                 for (int i = 0; i < warmup + iterations; i++) {
                     CHECK_HIP(hipMemcpy(inBuf, hostData.data(), bytesPerPe, hipMemcpyHostToDevice));
@@ -236,7 +233,6 @@ void testPipelinedAllreduce() {
                     if (i >= warmup) times.push_back(t1 - t0);
                 }
                 MPI_Barrier(MPI_COMM_WORLD);
-
                 double avg = 0;
                 for (double t : times) avg += t;
                 avg /= times.size();
@@ -247,6 +243,7 @@ void testPipelinedAllreduce() {
                     res.avgMs = g_avg * 1000.0;
                     res.algoBw = bytesPerPe / g_avg / (1024.0 * 1024.0 * 1024.0);
                     res.busBw = res.algoBw * 2.0 * (npes - 1) / npes;
+                    serialMs = res.avgMs;
                     printf("%-42s %10.3f %12.2f %12.2f %8s\n",
                            res.label.c_str(), res.avgMs, res.algoBw, res.busBw, "基准");
                 }
@@ -257,9 +254,13 @@ void testPipelinedAllreduce() {
             CHECK_HIP(hipFree(outBuf));
         }
 
-        // 2a) Pipeline SDMA：库默认 chunk（chunk_elems=0 → 整块，通常最快）
+        if (myPe == 0) {
+            serialMsBySize.push_back(serialMs);
+        }
+
+        // 2) Pipeline SDMA 整块 — 主赛道
         {
-            char label[] = "Pipeline SDMA chunk=default(0)";
+            const char* label = "Pipeline SDMA chunk=default(0)";
             auto res = runBench(label,
                 [&](uint32_t* in, uint32_t* out, int n, hipStream_t s) {
                     return ar->pipelined(in, out, n, 0, 0, s);
@@ -269,34 +270,47 @@ void testPipelinedAllreduce() {
             if (myPe == 0 && res.passed) {
                 printf("%-42s %10.3f %12.2f %12.2f %8s\n",
                        label, res.avgMs, res.algoBw, res.busBw, "SDMA");
+                sdmaDefaultMsBySize.push_back(res.avgMs);
+
+                if (serialMs > 0.0) {
+                    double fasterPct = (serialMs - res.avgMs) / serialMs * 100.0;
+                    printf("\n  >>> 对决: 串行 %.3f ms  vs  Pipeline SDMA %.3f ms", serialMs, res.avgMs);
+                    if (fasterPct > 0.0)
+                        printf("  |  Pipeline 快 %.1f%%  [%s]\n", fasterPct, "达成目标");
+                    else
+                        printf("  |  Pipeline 慢 %.1f%%  [%s]\n", -fasterPct, "未达成，继续优化 kernel");
+                }
+            } else {
+                if (myPe == 0) sdmaDefaultMsBySize.push_back(-1.0);
             }
             allResults.push_back(res);
         }
 
-        // 2) Pipeline SDMA scatter 模式，遍历不同 chunk 大小
-        for (size_t chunkKB : chunkSizesKB) {
-            size_t chunkBytes = chunkKB * 1024;
-            size_t chunkElems = chunkBytes / sizeof(uint32_t);
-            if (chunkBytes > bytesPerPe) continue;
+        if (chunkSweep) {
+            for (size_t chunkKB : chunkSizesKB) {
+                size_t chunkBytes = chunkKB * 1024;
+                size_t chunkElems = chunkBytes / sizeof(uint32_t);
+                if (chunkBytes > bytesPerPe) continue;
 
-            char label[64];
-            snprintf(label, sizeof(label), "Pipeline SDMA chunk=%zuKB", chunkKB);
-            auto res = runBench(label,
-                [&](uint32_t* in, uint32_t* out, int n, hipStream_t s) {
-                    return ar->pipelined(in, out, n, chunkElems, 0, s);
-                },
-                inBuf, ar->getOutputTransitBuffer(), hostData, elemsPerPe, bytesPerPe, npes, myPe,
-                stream, warmup, iterations, chunkBytes, 0);
-            if (myPe == 0 && res.passed) {
-                printf("%-42s %10.3f %12.2f %12.2f %8s\n",
-                       label, res.avgMs, res.algoBw, res.busBw, "SDMA");
+                char label[64];
+                snprintf(label, sizeof(label), "Pipeline SDMA chunk=%zuKB", chunkKB);
+                auto res = runBench(label,
+                    [&](uint32_t* in, uint32_t* out, int n, hipStream_t s) {
+                        return ar->pipelined(in, out, n, chunkElems, 0, s);
+                    },
+                    inBuf, ar->getOutputTransitBuffer(), hostData, elemsPerPe, bytesPerPe, npes, myPe,
+                    stream, warmup, iterations, chunkBytes, 0);
+                if (myPe == 0 && res.passed) {
+                    printf("%-42s %10.3f %12.2f %12.2f %8s\n",
+                           label, res.avgMs, res.algoBw, res.busBw, "SDMA");
+                }
+                allResults.push_back(res);
             }
-            allResults.push_back(res);
         }
 
-        // 3a) Pipeline P2P：库默认 chunk
+        // 3) Pipeline P2P 整块（参考，主目标仍是 SDMA）
         {
-            char label[] = "Pipeline P2P  chunk=default(0)";
+            const char* label = "Pipeline P2P  chunk=default(0)";
             auto res = runBench(label,
                 [&](uint32_t* in, uint32_t* out, int n, hipStream_t s) {
                     return ar->pipelined(in, out, n, 0, 1, s);
@@ -310,75 +324,62 @@ void testPipelinedAllreduce() {
             allResults.push_back(res);
         }
 
-        // 3) Pipeline P2P read 模式，遍历不同 chunk 大小
-        for (size_t chunkKB : chunkSizesKB) {
-            size_t chunkBytes = chunkKB * 1024;
-            size_t chunkElems = chunkBytes / sizeof(uint32_t);
-            if (chunkBytes > bytesPerPe) continue;
+        if (chunkSweep) {
+            for (size_t chunkKB : chunkSizesKB) {
+                size_t chunkBytes = chunkKB * 1024;
+                size_t chunkElems = chunkBytes / sizeof(uint32_t);
+                if (chunkBytes > bytesPerPe) continue;
 
-            char label[64];
-            snprintf(label, sizeof(label), "Pipeline P2P  chunk=%zuKB", chunkKB);
-            auto res = runBench(label,
-                [&](uint32_t* in, uint32_t* out, int n, hipStream_t s) {
-                    return ar->pipelined(in, out, n, chunkElems, 1, s);
-                },
-                inBuf, ar->getOutputTransitBuffer(), hostData, elemsPerPe, bytesPerPe, npes, myPe,
-                stream, warmup, iterations, chunkBytes, 1);
-            if (myPe == 0 && res.passed) {
-                printf("%-42s %10.3f %12.2f %12.2f %8s\n",
-                       label, res.avgMs, res.algoBw, res.busBw, "P2P");
+                char label[64];
+                snprintf(label, sizeof(label), "Pipeline P2P  chunk=%zuKB", chunkKB);
+                auto res = runBench(label,
+                    [&](uint32_t* in, uint32_t* out, int n, hipStream_t s) {
+                        return ar->pipelined(in, out, n, chunkElems, 1, s);
+                    },
+                    inBuf, ar->getOutputTransitBuffer(), hostData, elemsPerPe, bytesPerPe, npes, myPe,
+                    stream, warmup, iterations, chunkBytes, 1);
+                if (myPe == 0 && res.passed) {
+                    printf("%-42s %10.3f %12.2f %12.2f %8s\n",
+                           label, res.avgMs, res.algoBw, res.busBw, "P2P");
+                }
+                allResults.push_back(res);
             }
-            allResults.push_back(res);
         }
 
         ar.reset();
         CHECK_HIP(hipFree(inBuf));
     }
 
-    // ================================================================
-    // 汇总：每种数据大小下的最优配置
-    // ================================================================
     if (myPe == 0) {
         printf("\n======================================================================\n");
-        printf("最优配置汇总\n");
+        printf("汇总: 串行 vs Pipeline SDMA(整块) — 加速比 (>1 为更快)\n");
         printf("======================================================================\n");
-        printf("%-12s %-42s %10s %12s %12s\n",
-               "数据大小", "最优配置", "时间(ms)", "算法BW", "总线BW");
-        printf("%s\n", std::string(90, '-').c_str());
+        printf("%-10s %12s %18s %12s\n", "MB/PE", "串行(ms)", "Pipeline默认(ms)", "加速比");
+        printf("%s\n", std::string(56, '-').c_str());
 
-        for (size_t dataMB : dataSizesMB) {
-            size_t targetBytes = dataMB * 1024 * 1024;
-            double bestBw = 0;
-            const BenchResult* bestRes = nullptr;
-
-            for (const auto& r : allResults) {
-                if (r.dataBytes == targetBytes && r.passed && r.algoBw > bestBw) {
-                    bestBw = r.algoBw;
-                    bestRes = &r;
-                }
-            }
-
-            if (bestRes) {
-                printf("%-12s %-42s %10.3f %12.2f %12.2f\n",
-                       (std::to_string(dataMB) + " MB").c_str(),
-                       bestRes->label.c_str(),
-                       bestRes->avgMs, bestRes->algoBw, bestRes->busBw);
+        for (size_t i = 0; i < dataSizesMB.size(); i++) {
+            double s = (i < serialMsBySize.size()) ? serialMsBySize[i] : -1.0;
+            double p = (i < sdmaDefaultMsBySize.size()) ? sdmaDefaultMsBySize[i] : -1.0;
+            if (s > 0 && p > 0) {
+                double speedup = s / p;
+                printf("%-10zu %12.3f %18.3f %12.2fx\n",
+                       dataSizesMB[i], s, p, speedup);
+            } else {
+                printf("%-10zu %12s %18s %12s\n",
+                       dataSizesMB[i], "—", "—", "—");
             }
         }
 
-        // 模式对比总结
-        printf("\n--- 模式对比（所有数据大小平均） ---\n");
-        double serialAvg = 0, sdmaAvg = 0, p2pAvg = 0;
-        int serialCnt = 0, sdmaCnt = 0, p2pCnt = 0;
-        for (const auto& r : allResults) {
-            if (!r.passed) continue;
-            if (r.scatterMode == -1) { serialAvg += r.algoBw; serialCnt++; }
-            else if (r.scatterMode == 0) { sdmaAvg += r.algoBw; sdmaCnt++; }
-            else if (r.scatterMode == 1) { p2pAvg += r.algoBw; p2pCnt++; }
+        int wins = 0, total = 0;
+        for (size_t i = 0; i < dataSizesMB.size(); i++) {
+            double s = (i < serialMsBySize.size()) ? serialMsBySize[i] : -1.0;
+            double p = (i < sdmaDefaultMsBySize.size()) ? sdmaDefaultMsBySize[i] : -1.0;
+            if (s > 0 && p > 0) {
+                total++;
+                if (p < s) wins++;
+            }
         }
-        if (serialCnt > 0) printf("  串行模式平均算法BW:     %.2f GB/s (%d 个测试)\n", serialAvg / serialCnt, serialCnt);
-        if (sdmaCnt > 0)   printf("  Pipeline SDMA 平均算法BW: %.2f GB/s (%d 个测试)\n", sdmaAvg / sdmaCnt, sdmaCnt);
-        if (p2pCnt > 0)    printf("  Pipeline P2P  平均算法BW: %.2f GB/s (%d 个测试)\n", p2pAvg / p2pCnt, p2pCnt);
+        printf("\n  Pipeline SDMA(整块) 在 %d / %d 个数据量上快于串行\n", wins, total);
 
         printf("\n======================================================================\n");
     }
@@ -389,6 +390,8 @@ void testPipelinedAllreduce() {
 }
 
 int main(int argc, char* argv[]) {
+    (void)argc;
+    (void)argv;
     testPipelinedAllreduce();
     return 0;
 }
