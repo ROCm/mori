@@ -437,16 +437,6 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
 
         application::SymmMemObjPtr inputSymmObj = {};
         if (scatter_mode == 1) {
-            // gatherBarrier uses barrier->ag_sync cumulatively within one kernel.
-            // Must be zero before each P2P launch (Async on stream can reorder vs kernel).
-            constexpr size_t kAgSyncOff = offsetof(CrossPeBarrier, ag_sync);
-            hipError_t mz = hipMemset(reinterpret_cast<char*>(barrierPtr_) + kAgSyncOff, 0,
-                                      sizeof(uint32_t));
-            if (mz != hipSuccess) {
-                fprintf(stderr, "PE %d: hipMemset(ag_sync) failed: %s\n",
-                        myPe_, hipGetErrorString(mz));
-                return false;
-            }
             size_t required_input_size = total_count * dtype_size_;
             if (!ensure_buffer_size(input_transit_buffer_, input_transit_buffer_ptr_,
                                     input_transit_buffer_size_, input_transit_buffer_obj_,
@@ -465,6 +455,36 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                             myPe_, hipGetErrorString(se));
                     return false;
                 }
+            }
+        }
+
+        // SDMA queue completion counters live on the symmetric object (not shmem flags).
+        // Zero them every launch so compute CTAs' baseline reads cannot race block 0's
+        // first scatter or inherit mismatched totals from a prior collective.
+        {
+            application::SymmMemObj* cpuMo = output_transit_buffer_obj_.cpu;
+            if (cpuMo && cpuMo->signalPtrs) {
+                const uint32_t nq = cpuMo->sdmaNumQueue ? cpuMo->sdmaNumQueue : 8u;
+                const size_t sig_bytes =
+                    static_cast<size_t>(npes_) * static_cast<size_t>(nq) * sizeof(uint64_t);
+                hipError_t sg =
+                    stream ? hipMemsetAsync(cpuMo->signalPtrs, 0, sig_bytes, stream)
+                           : hipMemset(cpuMo->signalPtrs, 0, sig_bytes);
+                if (sg != hipSuccess) {
+                    fprintf(stderr, "PE %d: pipelined hipMemset(SDMA signals) failed: %s\n",
+                            myPe_, hipGetErrorString(sg));
+                    return false;
+                }
+            }
+        }
+        {
+            hipError_t br =
+                stream ? hipMemsetAsync(barrierPtr_, 0, sizeof(CrossPeBarrier), stream)
+                       : hipMemset(barrierPtr_, 0, sizeof(CrossPeBarrier));
+            if (br != hipSuccess) {
+                fprintf(stderr, "PE %d: pipelined hipMemset(barrier) failed: %s\n",
+                        myPe_, hipGetErrorString(br));
+                return false;
             }
         }
 
