@@ -20,26 +20,27 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 #pragma once
- 
+
 #include <hip/hip_runtime.h>
-#include "oneshot_all2all_sdma_kernel.hpp"
 #include <mpi.h>
- 
+
+#include "oneshot_all2all_sdma_kernel.hpp"
+
 namespace mori {
 namespace collective {
- 
+
 template <typename T>
 double All2all_sdma(T* input, T* output, size_t total_count, hipStream_t stream) {
-  int myPe =  shmem::ShmemMyPe();
-  int npes =  shmem::ShmemNPes();
+  int myPe = shmem::ShmemMyPe();
+  int npes = shmem::ShmemNPes();
   size_t dtype_size = sizeof(T);
- 
+
   application::SymmMemObjPtr inPutBuffObj =
       shmem::ShmemSymmetricRegister(static_cast<void*>(input), total_count * dtype_size);
- 
+
   application::SymmMemObjPtr outPutBuffObj =
       shmem::ShmemSymmetricRegister(static_cast<void*>(output), total_count * dtype_size * npes);
- 
+
   int flagsSize = npes * sizeof(uint64_t);
   void* flags = shmem::ShmemMalloc(flagsSize);
   if (flags == nullptr) {
@@ -47,14 +48,15 @@ double All2all_sdma(T* input, T* output, size_t total_count, hipStream_t stream)
   }
   memset(flags, 0, flagsSize);
   application::SymmMemObjPtr flagsObj = shmem::ShmemQueryMemObjPtr(flags);
- 
+
   assert(inPutBuffObj.IsValid());
   assert(outPutBuffObj.IsValid());
   assert(flagsObj.IsValid());
- 
+
   double start = MPI_Wtime();
-  //OneShotAll2allSdmaKernel<T><<<1, 512>>>(myPe, npes, input, inPutBuffObj, outPutBuffObj, flagsObj, total_count);
-  
+  // OneShotAll2allSdmaKernel<T><<<1, 512>>>(myPe, npes, input, inPutBuffObj, outPutBuffObj,
+  // flagsObj, total_count);
+
   // Synchronize GPU to ensure kernel completion
   hipError_t sync_err;
   if (stream != nullptr) {
@@ -62,17 +64,17 @@ double All2all_sdma(T* input, T* output, size_t total_count, hipStream_t stream)
   } else {
     sync_err = hipDeviceSynchronize();
   }
-  
+
   if (sync_err != hipSuccess) {
     fprintf(stderr, "PE %d: Failed to synchronize: %s\n", myPe, hipGetErrorString(sync_err));
     return -1.0;
   }
-  
+
   double end = MPI_Wtime();
-  printf("========local consume time:%.9f======== \n", end-start);
- 
-  //shmem::ShmemFree(flags);
-  return end-start;
+  printf("========local consume time:%.9f======== \n", end - start);
+
+  // shmem::ShmemFree(flags);
+  return end - start;
 }
-}
-}
+}  // namespace collective
+}  // namespace mori

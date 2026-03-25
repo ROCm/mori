@@ -25,210 +25,215 @@
 
 #include <hip/hip_runtime.h>
 #include <mpi.h>
-#include <memory>
-#include <cstdint>
+
 #include <atomic>
+#include <cstdint>
 #include <map>
+#include <memory>
 
 // Include necessary headers
 #include "mori/application/application.hpp"
-#include "mori/shmem/shmem.hpp"
 #include "mori/collective/collective_pub.hpp"
+#include "mori/shmem/shmem.hpp"
 
 namespace mori {
 namespace collective {
 template <typename T>
 class AllgatherSdma {
-private:
-    int myPe_;
-    int npes_;
-    size_t dtype_size_;
+ private:
+  int myPe_;
+  int npes_;
+  size_t dtype_size_;
 
-    // Flag memory
-    application::SymmMemObjPtr flagsObj_;
-    std::unique_ptr<uint64_t[], ShmemDeleter> flags_;
+  // Flag memory
+  application::SymmMemObjPtr flagsObj_;
+  std::unique_ptr<uint64_t[], ShmemDeleter> flags_;
 
-    // Input transit buffer
-    void* input_transit_buffer_;
-    size_t input_transit_buffer_size_;
-    application::SymmMemObjPtr input_transit_buffer_obj_;
-    std::unique_ptr<void, ShmemDeleter> input_transit_buffer_ptr_;
+  // Input transit buffer
+  void* input_transit_buffer_;
+  size_t input_transit_buffer_size_;
+  application::SymmMemObjPtr input_transit_buffer_obj_;
+  std::unique_ptr<void, ShmemDeleter> input_transit_buffer_ptr_;
 
-    // Output transit buffer
-    void* output_transit_buffer_;
-    size_t output_transit_buffer_size_;
-    application::SymmMemObjPtr output_transit_buffer_obj_;
-    std::unique_ptr<void, ShmemDeleter> output_transit_buffer_ptr_;
+  // Output transit buffer
+  void* output_transit_buffer_;
+  size_t output_transit_buffer_size_;
+  application::SymmMemObjPtr output_transit_buffer_obj_;
+  std::unique_ptr<void, ShmemDeleter> output_transit_buffer_ptr_;
 
-    // ================ NEW: Async state variables ================
-    std::atomic<bool> async_in_progress_;      // Flag indicating async operation is active
-    std::atomic<uint64_t> call_seq_;           // Monotonic generation token for flag synchronization
-    T* async_input_;                           // Saved input pointer for async operation
-    T* async_output_;                          // Saved output pointer for async operation
-    size_t async_total_count_;                 // Saved element count for async operation
-    hipStream_t async_stream_;                 // Saved stream for async operation
-    application::SymmMemObjPtr async_dst_obj_; // Destination symm object used by async PUT
-    double async_start_time_;                  // Start time for async operation
-    uint64_t async_flag_token_;                // Generation token for current async op
-    // ============================================================
-    
-    // Copy mode flag: if true, copy output_transit_buffer to user output buffer
-    // if false, user should directly use output_transit_buffer
-    bool copy_output_to_user_;
+  // ================ NEW: Async state variables ================
+  std::atomic<bool> async_in_progress_;       // Flag indicating async operation is active
+  std::atomic<uint64_t> call_seq_;            // Monotonic generation token for flag synchronization
+  T* async_input_;                            // Saved input pointer for async operation
+  T* async_output_;                           // Saved output pointer for async operation
+  size_t async_total_count_;                  // Saved element count for async operation
+  hipStream_t async_stream_;                  // Saved stream for async operation
+  application::SymmMemObjPtr async_dst_obj_;  // Destination symm object used by async PUT
+  double async_start_time_;                   // Start time for async operation
+  uint64_t async_flag_token_;                 // Generation token for current async op
+  // ============================================================
 
-    // Registered output buffer pool regions.
-    // Key = base address.  Sorted map enables range lookup: given an
-    // arbitrary pointer, find the region that contains it in O(log N).
-    struct RegisteredBuf {
-        application::SymmMemObjPtr obj;  // full IPC-mapped symm object
-        size_t size;                     // registration size in bytes
-    };
-    std::map<uintptr_t, RegisteredBuf> registered_output_buffers_;
+  // Copy mode flag: if true, copy output_transit_buffer to user output buffer
+  // if false, user should directly use output_transit_buffer
+  bool copy_output_to_user_;
 
-    // Range lookup helper: returns {SymmMemObjPtr, offset_from_base} or {invalid, 0}.
-    std::pair<application::SymmMemObjPtr, size_t> find_registered(void* ptr) const;
+  // Registered output buffer pool regions.
+  // Key = base address.  Sorted map enables range lookup: given an
+  // arbitrary pointer, find the region that contains it in O(log N).
+  struct RegisteredBuf {
+    application::SymmMemObjPtr obj;  // full IPC-mapped symm object
+    size_t size;                     // registration size in bytes
+  };
+  std::map<uintptr_t, RegisteredBuf> registered_output_buffers_;
 
-    // Disable copy constructor and assignment operator
-    AllgatherSdma(const AllgatherSdma&) = delete;
-    AllgatherSdma& operator=(const AllgatherSdma&) = delete;
+  // Range lookup helper: returns {SymmMemObjPtr, offset_from_base} or {invalid, 0}.
+  std::pair<application::SymmMemObjPtr, size_t> find_registered(void* ptr) const;
 
-    // Internal methods
-    bool ensure_buffer_size(void*& buffer,
-                           std::unique_ptr<void, ShmemDeleter>& buffer_ptr,
-                           size_t& current_size,
-                           application::SymmMemObjPtr& buffer_obj,
-                           size_t required_size,
-                           const char* buffer_name);
+  // Disable copy constructor and assignment operator
+  AllgatherSdma(const AllgatherSdma&) = delete;
+  AllgatherSdma& operator=(const AllgatherSdma&) = delete;
 
-    void copy_input_to_transit(T* input, size_t total_count, hipStream_t stream);
-    void copy_output_to_user(T* output, size_t total_count, hipStream_t stream);
+  // Internal methods
+  bool ensure_buffer_size(void*& buffer, std::unique_ptr<void, ShmemDeleter>& buffer_ptr,
+                          size_t& current_size, application::SymmMemObjPtr& buffer_obj,
+                          size_t required_size, const char* buffer_name);
 
-public:
-    /**
-     * @brief Constructor, initializes AllgatherSdma class
-     * @param myPe Current PE ID
-     * @param npes Total number of PEs
-     * @param transit_buffer_size Transit buffer size in bytes (default 512MB), half for input and half for output
-     * @param copy_output_to_user If true, copy output_transit_buffer to user output buffer (default true)
-     */
-    AllgatherSdma(int myPe, int npes, size_t transit_buffer_size = 512 * 1024 * 1024, bool copy_output_to_user = true);
+  void copy_input_to_transit(T* input, size_t total_count, hipStream_t stream);
+  void copy_output_to_user(T* output, size_t total_count, hipStream_t stream);
 
-    /**
-     * @brief Constructor, specifying input and output transit buffer sizes separately
-     * @param myPe Current PE ID
-     * @param npes Total number of PEs
-     * @param input_buffer_size Input transit buffer size in bytes
-     * @param output_buffer_size Output transit buffer size in bytes
-     * @param copy_output_to_user If true, copy output_transit_buffer to user output buffer (default true)
-     */
-    AllgatherSdma(int myPe, int npes, size_t input_buffer_size, size_t output_buffer_size, bool copy_output_to_user = true);
+ public:
+  /**
+   * @brief Constructor, initializes AllgatherSdma class
+   * @param myPe Current PE ID
+   * @param npes Total number of PEs
+   * @param transit_buffer_size Transit buffer size in bytes (default 512MB), half for input and
+   * half for output
+   * @param copy_output_to_user If true, copy output_transit_buffer to user output buffer (default
+   * true)
+   */
+  AllgatherSdma(int myPe, int npes, size_t transit_buffer_size = 512 * 1024 * 1024,
+                bool copy_output_to_user = true);
 
-    /**
-     * @brief Destructor, cleans up resources
-     */
-    ~AllgatherSdma();
+  /**
+   * @brief Constructor, specifying input and output transit buffer sizes separately
+   * @param myPe Current PE ID
+   * @param npes Total number of PEs
+   * @param input_buffer_size Input transit buffer size in bytes
+   * @param output_buffer_size Output transit buffer size in bytes
+   * @param copy_output_to_user If true, copy output_transit_buffer to user output buffer (default
+   * true)
+   */
+  AllgatherSdma(int myPe, int npes, size_t input_buffer_size, size_t output_buffer_size,
+                bool copy_output_to_user = true);
 
-    // ================ NEW: Async API Methods ================
+  /**
+   * @brief Destructor, cleans up resources
+   */
+  ~AllgatherSdma();
 
-    /**
-     * @brief Start asynchronous AllGATHER operation (PUT phase only)
-     * @param input Input data pointer
-     * @param output Output data pointer
-     * @param total_count Number of data elements per PE
-     * @param stream HIP stream
-     * @return true if successful, false otherwise
-     */
-    bool start_async(T* input, T* output, size_t total_count, hipStream_t stream = nullptr);
+  // ================ NEW: Async API Methods ================
 
-    /**
-     * @brief Wait for asynchronous AllGATHER operation to complete (WAIT phase)
-     * @param stream HIP stream (optional, can be different from start_async stream)
-     * @return Execution time in seconds, -1.0 if failed
-     */
-    double wait_async(hipStream_t stream = nullptr);
+  /**
+   * @brief Start asynchronous AllGATHER operation (PUT phase only)
+   * @param input Input data pointer
+   * @param output Output data pointer
+   * @param total_count Number of data elements per PE
+   * @param stream HIP stream
+   * @return true if successful, false otherwise
+   */
+  bool start_async(T* input, T* output, size_t total_count, hipStream_t stream = nullptr);
 
-    /**
-     * @brief Check if async operation is in progress
-     * @return true if async operation is active
-     */
-    bool is_async_in_progress() const { return async_in_progress_; }
+  /**
+   * @brief Wait for asynchronous AllGATHER operation to complete (WAIT phase)
+   * @param stream HIP stream (optional, can be different from start_async stream)
+   * @return Execution time in seconds, -1.0 if failed
+   */
+  double wait_async(hipStream_t stream = nullptr);
 
-    /**
-     * @brief Cancel ongoing async operation
-     */
-    void cancel_async();
-    // =======================================================
+  /**
+   * @brief Check if async operation is in progress
+   * @return true if async operation is active
+   */
+  bool is_async_in_progress() const { return async_in_progress_; }
 
-    /**
-     * @brief Register an external VRAM buffer for direct SDMA writes.
-     *        Collective — all ranks must call simultaneously with matching size.
-     */
-    void register_output_buffer(void* ptr, size_t size);
+  /**
+   * @brief Cancel ongoing async operation
+   */
+  void cancel_async();
+  // =======================================================
 
-    /**
-     * @brief Deregister a previously registered output buffer.
-     *        Collective — all ranks must call simultaneously.
-     */
-    void deregister_output_buffer(void* ptr);
+  /**
+   * @brief Register an external VRAM buffer for direct SDMA writes.
+   *        Collective — all ranks must call simultaneously with matching size.
+   */
+  void register_output_buffer(void* ptr, size_t size);
 
-    /**
-     * @brief Check whether an output pointer is registered.
-     */
-    bool is_output_registered(void* ptr) const;
+  /**
+   * @brief Deregister a previously registered output buffer.
+   *        Collective — all ranks must call simultaneously.
+   */
+  void deregister_output_buffer(void* ptr);
 
-    /**
-     * @brief Executes synchronous AllGATHER SDMA operation
-     * @param input Input data pointer
-     * @param output Output data pointer
-     * @param total_count Number of data elements per PE
-     * @param stream HIP stream
-     * @return true if successful, false if failed
-     * @note Synchronization must be handled by the caller
-     */
-    bool operator()(T* input, T* output, size_t total_count, hipStream_t stream = nullptr);
+  /**
+   * @brief Check whether an output pointer is registered.
+   */
+  bool is_output_registered(void* ptr) const;
 
-    /**
-     * @brief Gets flag symmetric memory object
-     */
-    application::SymmMemObjPtr getFlagsObj() const { return flagsObj_; }
+  /**
+   * @brief Executes synchronous AllGATHER SDMA operation
+   * @param input Input data pointer
+   * @param output Output data pointer
+   * @param total_count Number of data elements per PE
+   * @param stream HIP stream
+   * @return true if successful, false if failed
+   * @note Synchronization must be handled by the caller
+   */
+  bool operator()(T* input, T* output, size_t total_count, hipStream_t stream = nullptr);
 
-    /**
-     * @brief Gets input transit buffer pointer
-     */
-    void* getInputTransitBuffer() const { return input_transit_buffer_; }
+  /**
+   * @brief Gets flag symmetric memory object
+   */
+  application::SymmMemObjPtr getFlagsObj() const { return flagsObj_; }
 
-    /**
-     * @brief Gets input transit buffer size in bytes
-     */
-    size_t getInputTransitBufferSize() const { return input_transit_buffer_size_; }
+  /**
+   * @brief Gets input transit buffer pointer
+   */
+  void* getInputTransitBuffer() const { return input_transit_buffer_; }
 
-    /**
-     * @brief Gets input transit buffer symmetric memory object
-     */
-    application::SymmMemObjPtr getInputTransitBufferObj() const { return input_transit_buffer_obj_; }
+  /**
+   * @brief Gets input transit buffer size in bytes
+   */
+  size_t getInputTransitBufferSize() const { return input_transit_buffer_size_; }
 
-    /**
-     * @brief Gets output transit buffer pointer
-     */
-    void* getOutputTransitBuffer() const { return output_transit_buffer_; }
+  /**
+   * @brief Gets input transit buffer symmetric memory object
+   */
+  application::SymmMemObjPtr getInputTransitBufferObj() const { return input_transit_buffer_obj_; }
 
-    /**
-     * @brief Gets output transit buffer size in bytes
-     */
-    size_t getOutputTransitBufferSize() const { return output_transit_buffer_size_; }
+  /**
+   * @brief Gets output transit buffer pointer
+   */
+  void* getOutputTransitBuffer() const { return output_transit_buffer_; }
 
-    /**
-     * @brief Gets output transit buffer symmetric memory object
-     */
-    application::SymmMemObjPtr getOutputTransitBufferObj() const { return output_transit_buffer_obj_; }
+  /**
+   * @brief Gets output transit buffer size in bytes
+   */
+  size_t getOutputTransitBufferSize() const { return output_transit_buffer_size_; }
 
-    /**
-     * @brief Resets flags (sets to 0)
-     */
-    void resetFlags();
+  /**
+   * @brief Gets output transit buffer symmetric memory object
+   */
+  application::SymmMemObjPtr getOutputTransitBufferObj() const {
+    return output_transit_buffer_obj_;
+  }
+
+  /**
+   * @brief Resets flags (sets to 0)
+   */
+  void resetFlags();
 };
 
-} // namespace collective
-} // namespace mori
+}  // namespace collective
+}  // namespace mori
 
-#endif // ONESHOT_ALLGATHER_SDMA_CLASS_HPP
+#endif  // ONESHOT_ALLGATHER_SDMA_CLASS_HPP

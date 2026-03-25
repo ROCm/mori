@@ -94,14 +94,15 @@ __global__ void OneShotAllReduceKernel(int myPe, int npes,
   }
 #endif
 
-  if(warpId < npes && warpId != myPe){
+  if (warpId < npes && warpId != myPe) {
     shmem::ShmemPutMemNbiWarp(scratchMemObj, 0, srcMemObj, 0, bytesPerPeer, warpId);
-    //shmem::ShmemQuietWarp(warpId,scratchMemObj);
-    if(laneId == 0){
-      shmem::ShmemQuietThread(warpId,scratchMemObj);
-      shmem::ShmemAtomicSizeNonFetchThread(flagsMemObj, static_cast<size_t>(myPe) * sizeof(uint64_t), &flag_val, 8, core::atomicType::AMO_ADD, warpId);
+    // shmem::ShmemQuietWarp(warpId,scratchMemObj);
+    if (laneId == 0) {
+      shmem::ShmemQuietThread(warpId, scratchMemObj);
+      shmem::ShmemAtomicSizeNonFetchThread(flagsMemObj,
+                                           static_cast<size_t>(myPe) * sizeof(uint64_t), &flag_val,
+                                           8, core::atomicType::AMO_ADD, warpId);
     }
-      
   }
   __syncthreads();
 
@@ -138,12 +139,11 @@ __global__ void OneShotAllReduceKernel(int myPe, int npes,
 // One-shot all2all: single phase.
 // Every GPU reads the full buffer from all peers, accumulates locally, and writes the result.
 template <typename T>
-__global__ void OneShotAll2allKernel(int myPe, int npes,
-                                       const application::SymmMemObjPtr srcMemObj,
-                                       const application::SymmMemObjPtr dstMemObj,
-                                       const application::SymmMemObjPtr scratchMemObj,
-                                       const application::SymmMemObjPtr flagsMemObj,
-                                       size_t elementCount) {
+__global__ void OneShotAll2allKernel(int myPe, int npes, const application::SymmMemObjPtr srcMemObj,
+                                     const application::SymmMemObjPtr dstMemObj,
+                                     const application::SymmMemObjPtr scratchMemObj,
+                                     const application::SymmMemObjPtr flagsMemObj,
+                                     size_t elementCount) {
   if (elementCount == 0 || npes <= 0) {
     return;
   }
@@ -199,14 +199,15 @@ __global__ void OneShotAll2allKernel(int myPe, int npes,
   }
 #endif
 
-  if(warpId < npes && warpId != myPe){
+  if (warpId < npes && warpId != myPe) {
     shmem::ShmemPutMemNbiWarp(scratchMemObj, 0, srcMemObj, 0, bytesPerPeer, warpId);
-    //shmem::ShmemQuietWarp(warpId,scratchMemObj);
-    if(laneId == 0){
-      shmem::ShmemQuietThread(warpId,scratchMemObj);
-      shmem::ShmemAtomicSizeNonFetchThread(flagsMemObj, static_cast<size_t>(myPe) * sizeof(uint64_t), &flag_val, 8, core::atomicType::AMO_ADD, warpId);
+    // shmem::ShmemQuietWarp(warpId,scratchMemObj);
+    if (laneId == 0) {
+      shmem::ShmemQuietThread(warpId, scratchMemObj);
+      shmem::ShmemAtomicSizeNonFetchThread(flagsMemObj,
+                                           static_cast<size_t>(myPe) * sizeof(uint64_t), &flag_val,
+                                           8, core::atomicType::AMO_ADD, warpId);
     }
-      
   }
   __syncthreads();
 

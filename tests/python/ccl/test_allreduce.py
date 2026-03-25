@@ -1,4 +1,25 @@
 #!/usr/bin/env python3
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+#
+# MIT License
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 """
 AllReduce SDMA Test using torch.distributed and multiprocessing.
 
@@ -28,7 +49,9 @@ def _to_numpy(tensor):
     return tensor.numpy()
 
 
-def _verify_allreduce_result(data_cpu, elems, my_pe, npes, label="", dtype=torch.uint32):
+def _verify_allreduce_result(
+    data_cpu, elems, my_pe, npes, label="", dtype=torch.uint32
+):
     """Verify allreduce result: each element should equal sum of (pe+1)*1000 across all PEs."""
     expected_value = sum((pe + 1) * 1000 for pe in range(npes))
     first_n = min(elems, len(data_cpu))
@@ -40,19 +63,25 @@ def _verify_allreduce_result(data_cpu, elems, my_pe, npes, label="", dtype=torch
         if np.allclose(chunk_f, expected_arr, rtol=1e-2, atol=1.0):
             return True
         else:
-            mismatches = np.where(~np.isclose(chunk_f, expected_arr, rtol=1e-2, atol=1.0))[0]
-            print(f"  PE {my_pe} [{label}]: FAILED! Expected ~{expected_value}, "
-                  f"got {len(mismatches)} mismatches in first {first_n} elements. "
-                  f"First mismatch at idx {mismatches[0]}: {chunk[mismatches[0]]}")
+            mismatches = np.where(
+                ~np.isclose(chunk_f, expected_arr, rtol=1e-2, atol=1.0)
+            )[0]
+            print(
+                f"  PE {my_pe} [{label}]: FAILED! Expected ~{expected_value}, "
+                f"got {len(mismatches)} mismatches in first {first_n} elements. "
+                f"First mismatch at idx {mismatches[0]}: {chunk[mismatches[0]]}"
+            )
             return False
     else:
         if np.all(chunk == expected_value):
             return True
         else:
             mismatches = np.where(chunk != expected_value)[0]
-            print(f"  PE {my_pe} [{label}]: FAILED! Expected {expected_value}, "
-                  f"got {len(mismatches)} mismatches in first {first_n} elements. "
-                  f"First mismatch at idx {mismatches[0]}: {chunk[mismatches[0]]}")
+            print(
+                f"  PE {my_pe} [{label}]: FAILED! Expected {expected_value}, "
+                f"got {len(mismatches)} mismatches in first {first_n} elements. "
+                f"First mismatch at idx {mismatches[0]}: {chunk[mismatches[0]]}"
+            )
             return False
 
 
@@ -104,7 +133,7 @@ def _print_stats(exec_times, data_bytes, npes, rank, label):
         g_min = min_t.item()
         g_max = max_t.item()
         g_avg = avg_t.item() / npes
-        algo_bw = data_bytes / g_avg / (1024.0 ** 3) if g_avg > 0 else 0
+        algo_bw = data_bytes / g_avg / (1024.0**3) if g_avg > 0 else 0
         bus_bw = algo_bw * 2 * (npes - 1) / npes if npes > 1 else algo_bw
 
         print(f"\n--- {label} Performance ---")
@@ -132,15 +161,29 @@ _RCCL_DTYPE_MAP = {
 #  Individual test helpers
 # ---------------------------------------------------------------------------
 
-def _test_outplace(rank, my_pe, npes, elems, data_bytes, output_buf_size,
-                   fill_value, dtype, dtype_name, device, stream,
-                   iterations, warmup):
+
+def _test_outplace(
+    rank,
+    my_pe,
+    npes,
+    elems,
+    data_bytes,
+    output_buf_size,
+    fill_value,
+    dtype,
+    dtype_name,
+    device,
+    stream,
+    iterations,
+    warmup,
+):
     """Test 1: out-of-place (copy_output_to_user=False)."""
     if rank == 0:
         print(f"\n>>> Test 1: Out-of-place (copy_output_to_user=False, {dtype_name})")
 
     ar = AllreduceSdma(
-        my_pe, npes,
+        my_pe,
+        npes,
         input_buffer_size=data_bytes,
         output_buffer_size=output_buf_size,
         copy_output_to_user=False,
@@ -160,18 +203,24 @@ def _test_outplace(rank, my_pe, npes, elems, data_bytes, output_buf_size,
 
     times = _run_benchmark(
         _bench_outplace,
-        iterations, warmup, stream, rank,
+        iterations,
+        warmup,
+        stream,
+        rank,
     )
 
     transit_buf = ar.get_output_transit_buffer(dtype=input_tensor.dtype)
     transit_cpu = _to_numpy(transit_buf.cpu())
-    ok = _verify_allreduce_result(transit_cpu, elems, my_pe, npes,
-                                  f"outplace/{dtype_name}", dtype=dtype)
+    ok = _verify_allreduce_result(
+        transit_cpu, elems, my_pe, npes, f"outplace/{dtype_name}", dtype=dtype
+    )
 
     out_cpu = _to_numpy(output_tensor.cpu())
-    zero_check = (np.allclose(out_cpu, 0)
-                  if dtype not in (torch.uint32, torch.int32)
-                  else np.all(out_cpu == 0))
+    zero_check = (
+        np.allclose(out_cpu, 0)
+        if dtype not in (torch.uint32, torch.int32)
+        else np.all(out_cpu == 0)
+    )
     if zero_check and rank == 0:
         print(f"  PE {rank}: output_tensor correctly untouched (all zeros)")
 
@@ -182,15 +231,28 @@ def _test_outplace(rank, my_pe, npes, elems, data_bytes, output_buf_size,
     return ok
 
 
-def _test_inplace(rank, my_pe, npes, elems, data_bytes, output_buf_size,
-                  fill_value, dtype, dtype_name, device, stream,
-                  iterations, warmup):
+def _test_inplace(
+    rank,
+    my_pe,
+    npes,
+    elems,
+    data_bytes,
+    output_buf_size,
+    fill_value,
+    dtype,
+    dtype_name,
+    device,
+    stream,
+    iterations,
+    warmup,
+):
     """Test 2: in-place."""
     if rank == 0:
         print(f"\n>>> Test 2: In-place (allreduce_inplace, {dtype_name})")
 
     ar = AllreduceSdma(
-        my_pe, npes,
+        my_pe,
+        npes,
         input_buffer_size=data_bytes,
         output_buffer_size=output_buf_size,
         copy_output_to_user=False,
@@ -209,8 +271,9 @@ def _test_inplace(rank, my_pe, npes, elems, data_bytes, output_buf_size,
     stream.synchronize()
 
     inp_cpu = _to_numpy(inplace_tensor.cpu())
-    ok = _verify_allreduce_result(inp_cpu, elems, my_pe, npes,
-                                  f"inplace/{dtype_name}", dtype=dtype)
+    ok = _verify_allreduce_result(
+        inp_cpu, elems, my_pe, npes, f"inplace/{dtype_name}", dtype=dtype
+    )
     if rank == 0 and ok:
         expected = sum((pe + 1) * 1000 for pe in range(npes))
         print(f"  PE {rank}: inplace result verified (all values ~ {expected})")
@@ -237,8 +300,9 @@ def _rccl_verify(cpu_data, elems, npes, rccl_dtype, rank, label):
     expected_value = sum((pe + 1) * 1000 for pe in range(npes))
     first_n = min(elems, len(cpu_data))
     if rccl_dtype in (torch.float16, torch.bfloat16):
-        ok = np.allclose(cpu_data[:first_n].astype(np.float32),
-                         expected_value, rtol=1e-2, atol=1.0)
+        ok = np.allclose(
+            cpu_data[:first_n].astype(np.float32), expected_value, rtol=1e-2, atol=1.0
+        )
     else:
         ok = np.all(cpu_data[:first_n] == expected_value)
     if rank == 0:
@@ -246,17 +310,34 @@ def _rccl_verify(cpu_data, elems, npes, rccl_dtype, rank, label):
     return ok
 
 
-def _test_rccl_outplace(rank, my_pe, npes, elems, data_bytes,
-                        fill_value, dtype, dtype_name, device, stream,
-                        iterations, warmup):
+def _test_rccl_outplace(
+    rank,
+    my_pe,
+    npes,
+    elems,
+    data_bytes,
+    fill_value,
+    dtype,
+    dtype_name,
+    device,
+    stream,
+    iterations,
+    warmup,
+):
     """Test 3: RCCL out-of-place — allreduce into a separate output tensor."""
     rccl_dtype = _RCCL_DTYPE_MAP.get(dtype, torch.float32)
-    rccl_dtype_name = str(rccl_dtype).split('.')[-1]
+    rccl_dtype_name = str(rccl_dtype).split(".")[-1]
     if rank == 0:
-        print(f"\n>>> Test 3: RCCL out-of-place (torch.distributed, "
-              f"{dtype_name}→{rccl_dtype_name})")
+        print(
+            f"\n>>> Test 3: RCCL out-of-place (torch.distributed, "
+            f"{dtype_name}→{rccl_dtype_name})"
+        )
 
-    rccl_fill = float(fill_value) if rccl_dtype in (torch.float16, torch.bfloat16) else fill_value
+    rccl_fill = (
+        float(fill_value)
+        if rccl_dtype in (torch.float16, torch.bfloat16)
+        else fill_value
+    )
 
     input_tensor = torch.full((elems,), rccl_fill, dtype=rccl_dtype, device=device)
     output_tensor = torch.zeros(elems, dtype=rccl_dtype, device=device)
@@ -268,8 +349,9 @@ def _test_rccl_outplace(rank, my_pe, npes, elems, data_bytes,
     output_tensor.copy_(input_tensor)
     dist.all_reduce(output_tensor, op=dist.ReduceOp.SUM)
     torch.cuda.synchronize()
-    ok = _rccl_verify(_to_numpy(output_tensor.cpu()), elems, npes,
-                      rccl_dtype, rank, "outplace")
+    ok = _rccl_verify(
+        _to_numpy(output_tensor.cpu()), elems, npes, rccl_dtype, rank, "outplace"
+    )
 
     dist.barrier()
 
@@ -290,22 +372,40 @@ def _test_rccl_outplace(rank, my_pe, npes, elems, data_bytes,
             print(f"  Warmup {i + 1}/{warmup}: {elapsed * 1000:.3f} ms")
 
     dist.barrier()
-    _print_stats(exec_times, data_bytes, npes, rank,
-                 f"RCCL out-of-place ({rccl_dtype_name})")
+    _print_stats(
+        exec_times, data_bytes, npes, rank, f"RCCL out-of-place ({rccl_dtype_name})"
+    )
     return ok
 
 
-def _test_rccl_inplace(rank, my_pe, npes, elems, data_bytes,
-                       fill_value, dtype, dtype_name, device, stream,
-                       iterations, warmup):
+def _test_rccl_inplace(
+    rank,
+    my_pe,
+    npes,
+    elems,
+    data_bytes,
+    fill_value,
+    dtype,
+    dtype_name,
+    device,
+    stream,
+    iterations,
+    warmup,
+):
     """Test 4: RCCL in-place — allreduce directly on the tensor."""
     rccl_dtype = _RCCL_DTYPE_MAP.get(dtype, torch.float32)
-    rccl_dtype_name = str(rccl_dtype).split('.')[-1]
+    rccl_dtype_name = str(rccl_dtype).split(".")[-1]
     if rank == 0:
-        print(f"\n>>> Test 4: RCCL in-place (torch.distributed, "
-              f"{dtype_name}→{rccl_dtype_name})")
+        print(
+            f"\n>>> Test 4: RCCL in-place (torch.distributed, "
+            f"{dtype_name}→{rccl_dtype_name})"
+        )
 
-    rccl_fill = float(fill_value) if rccl_dtype in (torch.float16, torch.bfloat16) else fill_value
+    rccl_fill = (
+        float(fill_value)
+        if rccl_dtype in (torch.float16, torch.bfloat16)
+        else fill_value
+    )
 
     inplace_tensor = torch.full((elems,), rccl_fill, dtype=rccl_dtype, device=device)
 
@@ -316,8 +416,9 @@ def _test_rccl_inplace(rank, my_pe, npes, elems, data_bytes,
     inplace_tensor.fill_(rccl_fill)
     dist.all_reduce(inplace_tensor, op=dist.ReduceOp.SUM)
     torch.cuda.synchronize()
-    ok = _rccl_verify(_to_numpy(inplace_tensor.cpu()), elems, npes,
-                      rccl_dtype, rank, "inplace")
+    ok = _rccl_verify(
+        _to_numpy(inplace_tensor.cpu()), elems, npes, rccl_dtype, rank, "inplace"
+    )
 
     dist.barrier()
 
@@ -337,8 +438,9 @@ def _test_rccl_inplace(rank, my_pe, npes, elems, data_bytes,
             print(f"  Warmup {i + 1}/{warmup}: {elapsed * 1000:.3f} ms")
 
     dist.barrier()
-    _print_stats(exec_times, data_bytes, npes, rank,
-                 f"RCCL in-place ({rccl_dtype_name})")
+    _print_stats(
+        exec_times, data_bytes, npes, rank, f"RCCL in-place ({rccl_dtype_name})"
+    )
     return ok
 
 
@@ -346,8 +448,10 @@ def _test_rccl_inplace(rank, my_pe, npes, elems, data_bytes,
 #  Main worker
 # ---------------------------------------------------------------------------
 
-def _test_allreduce(rank, world_size, port, elems, iterations, warmup,
-                    dtype=torch.uint32):
+
+def _test_allreduce(
+    rank, world_size, port, elems, iterations, warmup, dtype=torch.uint32
+):
     """Worker function for each process."""
 
     with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
@@ -361,7 +465,7 @@ def _test_allreduce(rank, world_size, port, elems, iterations, warmup,
         elem_size = torch.tensor([], dtype=dtype).element_size()
         data_bytes = elems * elem_size
         output_buf_size = npes * (elems // npes + 64) * elem_size
-        dtype_name = str(dtype).split('.')[-1]
+        dtype_name = str(dtype).split(".")[-1]
 
         if rank == 0:
             print(f"\n{'=' * 70}")
@@ -376,20 +480,64 @@ def _test_allreduce(rank, world_size, port, elems, iterations, warmup,
         stream = torch.cuda.Stream(device=device)
         fill_value = (my_pe + 1) * 1000
 
-        ok1 = _test_outplace(rank, my_pe, npes, elems, data_bytes,
-                             output_buf_size, fill_value, dtype,
-                             dtype_name, device, stream,
-                             iterations, warmup)
-        ok2 = _test_inplace(rank, my_pe, npes, elems, data_bytes,
-                            output_buf_size, fill_value, dtype,
-                            dtype_name, device, stream,
-                            iterations, warmup)
-        ok3 = _test_rccl_outplace(rank, my_pe, npes, elems, data_bytes,
-                                  fill_value, dtype, dtype_name, device,
-                                  stream, iterations, warmup)
-        ok4 = _test_rccl_inplace(rank, my_pe, npes, elems, data_bytes,
-                                 fill_value, dtype, dtype_name, device,
-                                 stream, iterations, warmup)
+        ok1 = _test_outplace(
+            rank,
+            my_pe,
+            npes,
+            elems,
+            data_bytes,
+            output_buf_size,
+            fill_value,
+            dtype,
+            dtype_name,
+            device,
+            stream,
+            iterations,
+            warmup,
+        )
+        ok2 = _test_inplace(
+            rank,
+            my_pe,
+            npes,
+            elems,
+            data_bytes,
+            output_buf_size,
+            fill_value,
+            dtype,
+            dtype_name,
+            device,
+            stream,
+            iterations,
+            warmup,
+        )
+        ok3 = _test_rccl_outplace(
+            rank,
+            my_pe,
+            npes,
+            elems,
+            data_bytes,
+            fill_value,
+            dtype,
+            dtype_name,
+            device,
+            stream,
+            iterations,
+            warmup,
+        )
+        ok4 = _test_rccl_inplace(
+            rank,
+            my_pe,
+            npes,
+            elems,
+            data_bytes,
+            fill_value,
+            dtype,
+            dtype_name,
+            device,
+            stream,
+            iterations,
+            warmup,
+        )
 
         all_ok = ok1 and ok2 and ok3 and ok4
 
@@ -412,7 +560,9 @@ def _test_allreduce(rank, world_size, port, elems, iterations, warmup,
         shmem.shmem_finalize()
 
         if not all_ok:
-            raise AssertionError(f"PE {rank}: AllReduce verification failed ({dtype_name})")
+            raise AssertionError(
+                f"PE {rank}: AllReduce verification failed ({dtype_name})"
+            )
 
 
 _DTYPE_MAP = {
@@ -425,10 +575,11 @@ _DTYPE_MAP = {
 }
 
 
-def test_allreduce(elems=67108864, world_size=8, iterations=10, warmup=10,
-                   dtype=torch.uint32):
+def test_allreduce(
+    elems=67108864, world_size=8, iterations=10, warmup=10, dtype=torch.uint32
+):
     """Run AllReduce SDMA test."""
-    os.environ.setdefault('MORI_ENABLE_SDMA', '1')
+    os.environ.setdefault("MORI_ENABLE_SDMA", "1")
     port = get_free_port()
     torch.multiprocessing.spawn(
         _test_allreduce,
@@ -447,19 +598,27 @@ if __name__ == "__main__":
     )
     parser.add_argument("--elems", type=int, default=67108864, help="Elements per PE")
     parser.add_argument("--world-size", type=int, default=8, help="Number of processes")
-    parser.add_argument("--iterations", type=int, default=10, help="Measurement iterations")
+    parser.add_argument(
+        "--iterations", type=int, default=10, help="Measurement iterations"
+    )
     parser.add_argument("--warmup", type=int, default=10, help="Warmup iterations")
-    parser.add_argument("--enable-sdma", type=int, default=1, choices=[0, 1], help="Enable SDMA")
-    parser.add_argument("--dtype", type=str, default="uint32",
-                        choices=list(_DTYPE_MAP.keys()),
-                        help="Data type (uint32, fp16, bf16)")
+    parser.add_argument(
+        "--enable-sdma", type=int, default=1, choices=[0, 1], help="Enable SDMA"
+    )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="uint32",
+        choices=list(_DTYPE_MAP.keys()),
+        help="Data type (uint32, fp16, bf16)",
+    )
     args = parser.parse_args()
-    os.environ['MORI_ENABLE_SDMA'] = str(args.enable_sdma)
+    os.environ["MORI_ENABLE_SDMA"] = str(args.enable_sdma)
 
     dtype = _DTYPE_MAP[args.dtype]
-    dtype_name = str(dtype).split('.')[-1]
+    dtype_name = str(dtype).split(".")[-1]
 
-    print(f"AllReduce SDMA Test")
+    print("AllReduce SDMA Test")
     print(f"  Elements per PE : {args.elems:,}")
     print(f"  World size      : {args.world_size}")
     print(f"  Iterations      : {args.iterations}")
