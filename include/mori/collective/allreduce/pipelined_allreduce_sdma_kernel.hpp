@@ -68,12 +68,11 @@ __global__ void PipelinedAllReduceSdmaKernel(
 
   // ---- Signal baselines (dstMemObj; requires sdmaNumQueue >= 3 for qId=2) ----
   __shared__ uint64_t s_scatter_base;
-  __shared__ uint64_t s_ag_base;
+  __shared__ uint64_t s_ag_by_sender[64];
   __shared__ uint64_t s_rd_base;
   __shared__ uint32_t s_bd_base;
 
   if (threadIdx.x == 0) {
-    s_ag_base = 0;
     s_rd_base = 0;
     if (blockIdx.x == 0 && compBlocks > 0) {
       s_bd_base = __scoped_atomic_load_n(
@@ -84,24 +83,31 @@ __global__ void PipelinedAllReduceSdmaKernel(
     } else {
       s_bd_base = 0;
     }
+    for (int s = 0; s < npes && s < 64; ++s) {
+      if (s == myPe) continue;
+      s_ag_by_sender[s] = core::AtomicLoadRelaxed(
+          dstMemObj->signalPtrs + static_cast<size_t>(s) * numQ + 1);
+    }
     for (int i = 0; i < npes; ++i) {
       if (i != myPe) {
         s_scatter_base = core::AtomicLoadRelaxed(
             dstMemObj->signalPtrs + static_cast<size_t>(i) * numQ + 0);
-        if (blockIdx.x == 0) {
-          s_ag_base = core::AtomicLoadRelaxed(
-              dstMemObj->signalPtrs + static_cast<size_t>(i) * numQ + 1);
+        break;
+      }
+    }
+    if (blockIdx.x == 0) {
+      for (int i = 0; i < npes; ++i) {
+        if (i != myPe) {
           s_rd_base = core::AtomicLoadRelaxed(
               dstMemObj->signalPtrs + static_cast<size_t>(i) * numQ + 2);
+          break;
         }
-        break;
       }
     }
   }
   __syncthreads();
 
   const uint64_t scatterBase = s_scatter_base;
-  const uint64_t agBase = s_ag_base;
   const uint64_t rdBase = s_rd_base;
   const uint32_t bdBase = s_bd_base;
 
@@ -272,13 +278,13 @@ __global__ void PipelinedAllReduceSdmaKernel(
         __syncthreads();
       }
 
-      // Final AG wait
+      // Final AG wait (per-sender baseline — slots need not match across senders)
       {
         const int thr = static_cast<int>(threadIdx.x);
         if (thr < npes - 1) {
           const int sender = thr < myPe ? thr : thr + 1;
           const uint64_t expected =
-              agBase + static_cast<uint64_t>(numChunks);
+              s_ag_by_sender[sender] + static_cast<uint64_t>(numChunks);
           HSAuint64* sig = dstMemObj->signalPtrs
               + static_cast<size_t>(sender) * numQ + 1;
           int spin = 0;
@@ -373,7 +379,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
       if (thr < npes - 1) {
         const int sender = thr < myPe ? thr : thr + 1;
         const uint64_t expected =
-            agBase + static_cast<uint64_t>(numChunks);
+            s_ag_by_sender[sender] + static_cast<uint64_t>(numChunks);
         HSAuint64* sig = dstMemObj->signalPtrs
             + static_cast<size_t>(sender) * numQ + 1;
         int spin = 0;

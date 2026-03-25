@@ -27,6 +27,7 @@
 #include "mori/shmem/shmem.hpp"
 #include <hip/hip_fp16.h>
 #include <hip/hip_bfloat16.h>
+#include <cstddef>
 #include <stdexcept>
 #include <cstring>
 #include <cstdio>
@@ -330,6 +331,17 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             }
             copy_input_to_transit(input, total_count, stream);
             inputSymmObj = input_transit_buffer_obj_;
+            // gatherBarrier uses barrier->ag_sync cumulatively; reset each launch
+            // or the first barrier sees a stale total and block 0 races past compute.
+            constexpr size_t kAgSyncOff = offsetof(CrossPeBarrier, ag_sync);
+            hipError_t mz = hipMemsetAsync(
+                reinterpret_cast<char*>(barrierPtr_) + kAgSyncOff, 0,
+                sizeof(uint32_t), stream);
+            if (mz != hipSuccess) {
+                fprintf(stderr, "PE %d: hipMemsetAsync(ag_sync) failed: %s\n",
+                        myPe_, hipGetErrorString(mz));
+                return false;
+            }
         }
 
         if (scatter_mode == 1) {
