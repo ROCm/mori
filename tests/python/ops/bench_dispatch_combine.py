@@ -26,7 +26,7 @@ import torch
 import torch.distributed as dist
 import os
 
-os.environ["MORI_SHMEM_HEAP_SIZE"] = "6G"
+os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "6G")
 
 
 class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
