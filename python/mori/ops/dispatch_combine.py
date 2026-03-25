@@ -64,7 +64,7 @@ def _current_stream():
 
 @dataclass
 class EpDispatchCombineConfig:
-    data_type: torch.dtype
+    data_type: torch.dtype  # Deprecated for kernel launch (runtime dtype inferred from input tensor); retained for test/example compatibility
     rank: int
     world_size: int
     hidden_dim: int
@@ -345,6 +345,7 @@ class EpDispatchCombineOp:
             block_num, rdma_block_num, warp_per_block
         )
         stream = _current_stream()
+        self._dispatch_dtype = input.dtype
         sfx = _DTYPE_SUFFIX[input.dtype]
 
         args_ptr = mori_cpp.prepare_and_build_args(
@@ -472,7 +473,10 @@ class EpDispatchCombineOp:
     ):
         _, _, actual_wpb = self._resolve_launch_params(block_num, 0, warp_per_block)
         stream = _current_stream()
-        sfx = _DTYPE_SUFFIX[self.config.data_type]
+        assert hasattr(
+            self, "_dispatch_dtype"
+        ), "dispatch_recv requires a prior dispatch/dispatch_send call"
+        sfx = _DTYPE_SUFFIX[self._dispatch_dtype]
         kt = self.config.kernel_type.value
 
         args_ptr = mori_cpp.prepare_and_build_args(
@@ -525,6 +529,7 @@ class EpDispatchCombineOp:
             block_num, rdma_block_num, warp_per_block
         )
         stream = _current_stream()
+        self._combine_dtype = input.dtype
         sfx = _DTYPE_SUFFIX[input.dtype]
 
         args_ptr = mori_cpp.prepare_and_build_args(
@@ -701,7 +706,10 @@ class EpDispatchCombineOp:
     ):
         _, _, actual_wpb = self._resolve_launch_params(block_num, 0, warp_per_block)
         stream = _current_stream()
-        sfx = _DTYPE_SUFFIX[self.config.data_type]
+        assert hasattr(
+            self, "_combine_dtype"
+        ), "combine_recv requires a prior combine/combine_send call"
+        sfx = _DTYPE_SUFFIX[self._combine_dtype]
         kt = self.config.kernel_type.value
 
         args_ptr = mori_cpp.prepare_and_build_args(
