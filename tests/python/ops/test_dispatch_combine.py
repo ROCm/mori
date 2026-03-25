@@ -26,7 +26,7 @@ from tests.python.utils import TorchDistProcessManager, data_type_supported
 import torch
 import torch.distributed as dist
 
-os.environ["MORI_SHMEM_HEAP_SIZE"] = "4G"
+os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "4G")
 
 TORCH_FLOAT4_E2M1FN_X2 = getattr(torch, "float4_e2m1fn_x2", None)
 
