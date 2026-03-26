@@ -34,7 +34,8 @@ namespace collective {
 static_assert(kMaxPipelineBlocks <= 385,
               "compute block count must fit in grid launch");
 
-template <typename T, int SCATTER_MODE = 0, bool MULTI_CHUNK = false>
+template <typename T, int SCATTER_MODE = 0, bool MULTI_CHUNK = false,
+          bool COPY_OUTPUT = false>
 __global__ void PipelinedAllReduceSdmaKernel(
     int myPe, int npes,
     const T* __restrict__ input,
@@ -83,8 +84,10 @@ __global__ void PipelinedAllReduceSdmaKernel(
         ? __scoped_atomic_load_n(
               &barrier->chunks_complete, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE)
         : 0u;
-    s_ag_base = __scoped_atomic_load_n(
-        &barrier->ag_gate, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
+    if constexpr (COPY_OUTPUT || MULTI_CHUNK) {
+      s_ag_base = __scoped_atomic_load_n(
+          &barrier->ag_gate, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
+    }
     for (int s = 0; s < npes && s < 64; ++s) {
       if (s == myPe) continue;
       const size_t row = static_cast<size_t>(s) * numQ;
@@ -211,24 +214,23 @@ __global__ void PipelinedAllReduceSdmaKernel(
       // Compute blocks wait for Block 0's ag_gate signal (AG done), then
       // bulk-copy the completed result using all threads in parallel.
       // 1-chunk only — MULTI_CHUNK uses ag_gate for per-chunk AG gating.
-      if constexpr (!MULTI_CHUNK) {
-        if (output != nullptr) {
-          if (threadIdx.x == 0) {
-            while (__scoped_atomic_load_n(
-                       &barrier->ag_gate, __ATOMIC_ACQUIRE,
-                       __MEMORY_SCOPE_DEVICE) < s_ag_base + 1u)
-              ;
-          }
-          __syncthreads();
-          const size_t copyU4 =
-              (elementCount * bytesPerElement) / sizeof(uint4);
-          const uint4* __restrict__ copySrc =
-              reinterpret_cast<const uint4*>(dstMemObj->localPtr);
-          uint4* __restrict__ copyDst =
-              reinterpret_cast<uint4*>(output);
-          for (size_t i = compTid; i < copyU4; i += compStride) {
-            copyDst[i] = copySrc[i];
-          }
+      // if constexpr keeps VGPR budget identical to the no-copy variant.
+      if constexpr (COPY_OUTPUT && !MULTI_CHUNK) {
+        if (threadIdx.x == 0) {
+          while (__scoped_atomic_load_n(
+                     &barrier->ag_gate, __ATOMIC_ACQUIRE,
+                     __MEMORY_SCOPE_DEVICE) < s_ag_base + 1u)
+            ;
+        }
+        __syncthreads();
+        const size_t copyU4 =
+            (elementCount * bytesPerElement) / sizeof(uint4);
+        const uint4* __restrict__ copySrc =
+            reinterpret_cast<const uint4*>(dstMemObj->localPtr);
+        uint4* __restrict__ copyDst =
+            reinterpret_cast<uint4*>(output);
+        for (size_t i = compTid; i < copyU4; i += compStride) {
+          copyDst[i] = copySrc[i];
         }
       }
 
@@ -340,7 +342,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
         }
 
         // Signal compute blocks: AG complete, CU copy is safe.
-        if (output != nullptr) {
+        if constexpr (COPY_OUTPUT) {
           __syncthreads();
           if (thr == 0) {
             __hip_atomic_fetch_add(&barrier->ag_gate, 1u,

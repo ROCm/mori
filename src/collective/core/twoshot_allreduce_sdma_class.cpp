@@ -511,12 +511,18 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                 output_transit_buffer_obj_, flagsObj_,
                 barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems,
                 static_cast<T*>(nullptr));
-        } else {
-            PipelinedAllReduceSdmaKernel<T, 0, false><<<blocks, threads, 0, stream>>>(
+        } else if (kernel_copies) {
+            PipelinedAllReduceSdmaKernel<T, 0, false, true><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
                 barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems,
-                kernel_copies ? output : static_cast<T*>(nullptr));
+                output);
+        } else {
+            PipelinedAllReduceSdmaKernel<T, 0, false, false><<<blocks, threads, 0, stream>>>(
+                myPe_, npes_, input,
+                output_transit_buffer_obj_, flagsObj_,
+                barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems,
+                static_cast<T*>(nullptr));
         }
 
         hipError_t err = hipGetLastError();
