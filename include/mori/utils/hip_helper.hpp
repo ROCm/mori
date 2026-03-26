@@ -22,6 +22,8 @@
 #pragma once
 
 #include <hip/hip_runtime_api.h>
+#include "mori/application/utils/check.hpp"
+#include "mori/utils/mori_log.hpp"
 
 namespace mori {
 inline int GetMultiProcessorCount(int device) {
@@ -58,6 +60,41 @@ inline int GetCurDeviceWallClockFreqMhz() {
   int device = 0;
   HIP_RUNTIME_CHECK(hipGetDevice(&device));
   return GetDeviceWallClockFreqMhz(device);
+}
+
+inline bool MoriEnablePeerAccess(int devId, int peerDevId) {
+
+  int curId = -1;
+  HIP_RUNTIME_CHECK(hipGetDevice(&curId));
+  if (curId != devId) {
+    MORI_CORE_ERROR("Provided device ID {} != current device ID {}", devId, curId);
+    return false;
+  }
+
+  int canAccess = 0;
+  if (hipDeviceCanAccessPeer(&canAccess, devId, peerDevId) != hipSuccess) {
+    MORI_CORE_WARN("Failed to query P2P access from device {} to {}", devId, peerDevId);
+    return false;
+  }
+
+  if (!canAccess) {
+    MORI_CORE_TRACE("P2P access not available from device {} to {}", devId, peerDevId);
+    return false;
+  }
+
+  auto enableErr = hipDeviceEnablePeerAccess(peerDevId, 0);
+  if (enableErr == hipErrorPeerAccessAlreadyEnabled) {
+    auto clearErr = hipGetLastError();
+    (void)clearErr; // Clear sticky error bit
+    MORI_CORE_TRACE("P2P access already enabled from device {} to {}", devId, peerDevId);
+    return true;
+  } else if (enableErr != hipSuccess) {
+    MORI_CORE_WARN("Failed to enable P2P access from device {} to {}: {}", devId, peerDevId,
+                 hipGetErrorString(enableErr));
+    return false;
+  }
+  MORI_CORE_TRACE("Enabled P2P access from device {} to {}", devId, peerDevId);
+  return true;
 }
 
 }  // namespace mori

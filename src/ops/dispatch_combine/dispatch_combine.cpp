@@ -31,8 +31,9 @@
 #include "mori/utils/env_utils.hpp"
 #include "mori/utils/hip_helper.hpp"
 #include "mori/utils/mori_log.hpp"
+#include "mori/application/application.hpp"
 
-namespace mori {
+namespace mori {  
 namespace moe {
 
 using namespace mori::application;
