@@ -429,9 +429,22 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             if (scatter_mode == 1) {
                 chunk_elems = total_count;
             } else {
-                // One chunk by default: minimizes block_done / sync / SDMA rounds.
-                // Override with explicit chunk_elems for latency experiments.
-                chunk_elems = total_count;
+                // Auto-select chunk count for the 3-stage pipeline
+                // scatter(i) | reduce(i-1) | AG(i-2).
+                // Target 4 chunks: fills the 3-deep pipeline + 1 steady-state step.
+                // Guard: each per-PE shard must be >= 512 KB to amortise
+                // per-chunk SDMA packet / signal / syncthreads overhead.
+                constexpr size_t kMinShardBytes = 512ULL * 1024;
+                constexpr int    kTargetChunks  = 4;
+                const size_t shard_bytes =
+                    (total_count / npes_) * dtype_size_;
+                const size_t chunk_shard_bytes =
+                    shard_bytes / kTargetChunks;
+                if (chunk_shard_bytes >= kMinShardBytes) {
+                    chunk_elems = total_count / kTargetChunks;
+                } else {
+                    chunk_elems = total_count;
+                }
             }
             if (chunk_elems < min_chunk)
                 chunk_elems = min_chunk;

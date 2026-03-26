@@ -166,20 +166,16 @@ __global__ void PipelinedAllReduceSdmaKernel(
           }
         }
 
-        // Flush CU stores before block 0 SDMA AllGather reads this chunk from HBM
-        // (same as SdmaReduceScatterKernel after Phase 3).
         __syncthreads();
+
+        // wbl2 + system fence + block_done: thread 0 only.
+        // No trailing __syncthreads needed — next iteration's scatter-poll
+        // syncthreads reconverges all threads before the next reduce.
         if (threadIdx.x == 0) {
 #if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
           asm volatile("buffer_wbl2" ::: "memory");
 #endif
           __threadfence_system();
-        }
-        __syncthreads();
-
-        // After reduce(chunk c): release block 0 for AG(c). Required for
-        // numChunks==1 (otherwise bdBase+1 is never written inside the loop).
-        if (threadIdx.x == 0) {
           __scoped_atomic_store_n(
               &barrier->block_done[blockIdx.x],
               bdBase + static_cast<uint32_t>(c + 1),
@@ -189,15 +185,15 @@ __global__ void PipelinedAllReduceSdmaKernel(
 
     } else {
       // =================================================================
-      // BLOCK 0: i = 0..numChunks+1
-      //   Ph1: scatter(i) | wait_rd(i) | bd_poll(i)  [parallel]
-      //   Ph2: wbl2 + signal q=2 for reduce(i-1) | AG(i-2)
-      //   wait_rd: per-sender rd baseline + (i-1) before AG(i-2) (i>=2)
-      //   bd_poll: i in [1,numChunks] target bdBase + i
+      // BLOCK 0: i = 0..numChunks+1  (2 syncthreads per iteration)
+      //   Phase A: scatter(i) || rd_wait(i-1) || bd_poll(i)  [parallel]
+      //   Phase B: signal_q2(i-1) + AG(i-2)
+      //   No wbl2/threadfence — compute blocks fence before block_done.
       // =================================================================
       for (int i = 0; i <= numChunks + 1; i++) {
         const int thr = static_cast<int>(threadIdx.x);
 
+        // --- Phase A: three parallel wavefronts -------------------------
         if (i < numChunks && thr < npes && thr != myPe) {
           const int destPe = thr;
           const size_t cOff = static_cast<size_t>(i) * chunkBytes;
@@ -239,20 +235,9 @@ __global__ void PipelinedAllReduceSdmaKernel(
             ;
         }
 
-        __syncthreads();
+        __syncthreads();  // Phase A complete
 
-        if (i >= 1 && i <= numChunks) {
-          if (thr == 0) {
-#if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
-            asm volatile("buffer_wbl2" ::: "memory");
-#endif
-            __threadfence_system();
-          }
-        }
-        __syncthreads();
-
-        // signal(q=2) then AG: same threads 0..npes-1, program order; one fewer
-        // __syncthreads than splitting signal / AG.
+        // --- Phase B: signal reduce-done + submit AllGather -------------
         if (i >= 1 && i <= numChunks) {
           if (thr < npes && thr != myPe) {
             HSAuint64* rs = dstMemObj->peerSignalPtrs[thr]
@@ -281,7 +266,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
           }
         }
 
-        __syncthreads();
+        __syncthreads();  // Phase B complete
       }
 
       // Final AG wait (per-sender baseline — slots need not match across senders)
