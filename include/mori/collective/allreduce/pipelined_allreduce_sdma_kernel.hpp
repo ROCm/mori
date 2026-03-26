@@ -3,18 +3,20 @@
 //
 // Pipelined AllReduce — burst-submit SDMA pipeline with cross-PE barrier.
 //
-// SCATTER_MODE=0: Burst-Submit Pipeline
+// SCATTER_MODE=0: Burst-Submit Pipeline with Remote-Read AllGather
 //   Block 0 (threads 0..npes-1, one per peer):
 //     Phase 1: burst-submit ALL scatter packets (all chunks) to SDMA queues.
-//              Eliminates idle gaps between per-chunk submissions.
+//              Scatter uses SDMA write → remote (outbound XGMI).
 //     Phase 2: per-thread AG loop (zero __syncthreads in hot path):
 //              poll chunks_complete → signal_q2 → rd_wait → AG submit.
+//              AG uses SDMA read ← remote (inbound XGMI), enabling true
+//              bidirectional pipeline overlap with scatter.
 //     Phase 3: final AG wait.
 //
 //   Compute blocks (1..N):
 //     scatter-poll → reduce → wbl2+fence → atomic_add(chunks_complete).
 //
-//   qId=0 scatter, qId=1 AG, qId=2 reduce-done (CU atomic on peerSignalPtrs).
+//   qId=0 scatter (outbound), qId=1 AG (inbound), qId=2 reduce-done.
 //
 // SCATTER_MODE=1: P2P read + CU AG (legacy path).
 //
@@ -209,15 +211,12 @@ __global__ void PipelinedAllReduceSdmaKernel(
       }
 
       // ---- Phase 2: per-thread AG loop (no __syncthreads) ----
-      // Within a wavefront, all active threads poll the same chunks_complete
-      // counter and diverge only on per-peer rd_wait.  Program order within
-      // each thread guarantees: chunks_complete → signal_q2 → rd_wait → AG.
+      // Remote-read AG: pull each peer's reduced shard to local buffer.
+      // Scatter → outbound XGMI, AG ← inbound XGMI: no bandwidth contention.
       if (thr < npes && thr != myPe) {
-        const int destPe = thr;
+        const int peer = thr;
         anvil::SdmaQueueDeviceHandle** dh =
-            dstMemObj->deviceHandles_d + destPe * numQ;
-        HSAuint64* rSig = dstMemObj->peerSignalPtrs[destPe]
-            + static_cast<size_t>(myPe) * numQ;
+            dstMemObj->deviceHandles_d + peer * numQ;
 
         for (int c = 0; c < numChunks; c++) {
           // Wait for ALL compute blocks to finish reduce(c)
@@ -228,31 +227,35 @@ __global__ void PipelinedAllReduceSdmaKernel(
                      __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) < ccTarget)
             ;
 
-          // Signal remote PE: our reduce(c) is done
-          HSAuint64* rs = dstMemObj->peerSignalPtrs[destPe]
+          // Signal remote PE: our reduce(c) is done (they can pull our data)
+          HSAuint64* rs = dstMemObj->peerSignalPtrs[peer]
               + static_cast<size_t>(myPe) * numQ + 2;
           __hip_atomic_fetch_add(rs, 1ULL,
               __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
 
-          // Wait for remote PE's reduce(c) done before reading their data
+          // Wait for remote PE's reduce(c) done before pulling their data
           const uint64_t rdNeed =
-              s_rd_by_sender[destPe] + static_cast<uint64_t>(c + 1);
+              s_rd_by_sender[peer] + static_cast<uint64_t>(c + 1);
           HSAuint64* rdSig = dstMemObj->signalPtrs
-              + static_cast<size_t>(destPe) * numQ + 2;
+              + static_cast<size_t>(peer) * numQ + 2;
           while (core::AtomicLoadRelaxed(rdSig) < rdNeed)
             ;
 
-          // Submit AG(c) for this peer
+          // Pull AG(c): SDMA read from remote peer's reduced shard to local.
+          // src = peer's transit buffer (peer's shard), dst = our local buffer.
+          // Signal goes to OUR signalPtrs (local atomic, faster detection).
           const size_t cOff = static_cast<size_t>(c) * chunkBytes;
           size_t actualBytes = chunkBytes;
           if (cOff + actualBytes > totalShardBytes)
             actualBytes = totalShardBytes - cOff;
           if (actualBytes > 0) {
-            uint8_t* src = reinterpret_cast<uint8_t*>(dstMemObj->localPtr)
-                + static_cast<size_t>(myPe) * totalShardBytes + cOff;
-            uint8_t* dst = reinterpret_cast<uint8_t*>(dstMemObj->peerPtrs[destPe])
-                + static_cast<size_t>(myPe) * totalShardBytes + cOff;
-            core::SdmaPutThread(src, dst, actualBytes, dh, rSig, numQ, 1);
+            uint8_t* src = reinterpret_cast<uint8_t*>(dstMemObj->peerPtrs[peer])
+                + static_cast<size_t>(peer) * totalShardBytes + cOff;
+            uint8_t* dst = reinterpret_cast<uint8_t*>(dstMemObj->localPtr)
+                + static_cast<size_t>(peer) * totalShardBytes + cOff;
+            HSAuint64* localSig = dstMemObj->signalPtrs
+                + static_cast<size_t>(peer) * numQ;
+            core::SdmaPutThread(src, dst, actualBytes, dh, localSig, numQ, 1);
           }
         }
       }
