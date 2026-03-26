@@ -496,33 +496,21 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
 
         const bool multi_chunk = (chunk_elems < total_count);
 
-        const bool kernel_copies =
-            (scatter_mode == 0 && !multi_chunk && copy_output_to_user_);
-
         if (scatter_mode == 1) {
             PipelinedAllReduceSdmaKernel<T, 1><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
-                barrierPtr_, inputSymmObj, total_count, chunk_elems,
-                static_cast<T*>(nullptr));
+                barrierPtr_, inputSymmObj, total_count, chunk_elems);
         } else if (multi_chunk) {
             PipelinedAllReduceSdmaKernel<T, 0, true><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
-                barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems,
-                static_cast<T*>(nullptr));
-        } else if (kernel_copies) {
-            PipelinedAllReduceSdmaKernel<T, 0, false, true><<<blocks, threads, 0, stream>>>(
-                myPe_, npes_, input,
-                output_transit_buffer_obj_, flagsObj_,
-                barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems,
-                output);
+                barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems);
         } else {
-            PipelinedAllReduceSdmaKernel<T, 0, false, false><<<blocks, threads, 0, stream>>>(
+            PipelinedAllReduceSdmaKernel<T, 0, false><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
-                barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems,
-                static_cast<T*>(nullptr));
+                barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems);
         }
 
         hipError_t err = hipGetLastError();
@@ -532,7 +520,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             return false;
         }
 
-        if (copy_output_to_user_ && !kernel_copies) {
+        if (copy_output_to_user_) {
             copy_output_to_user(output, total_count, stream);
         }
     } catch (const std::exception& e) {
