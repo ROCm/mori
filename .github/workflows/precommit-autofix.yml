@@ -1,8 +1,8 @@
 name: pre-commit autofix
 
 on:
-  issue_comment:
-    types: [created]
+  pull_request:
+    types: [labeled]
 
 permissions:
   contents: write
@@ -10,63 +10,25 @@ permissions:
 
 jobs:
   autofix:
-    # Only run on PR comments that contain the trigger command
-    if: >
-      github.event.issue.pull_request != null &&
-      contains(github.event.comment.body, '/fix-precommit')
+    if: github.event.label.name == 'fix-precommit'
     runs-on: ubuntu-latest
 
     steps:
-      - name: React with 👀 to acknowledge
+      - name: Remove trigger label (so it can be re-applied next time)
         uses: actions/github-script@v7
         with:
           script: |
-            await github.rest.reactions.createForIssueComment({
+            await github.rest.issues.removeLabel({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              comment_id: context.payload.comment.id,
-              content: 'eyes'
-            });
-
-      - name: Get PR metadata
-        id: pr
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const { data: pr } = await github.rest.pulls.get({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: context.issue.number,
-            });
-            core.setOutput('head_ref',  pr.head.ref);
-            core.setOutput('base_sha',  pr.base.sha);
-            core.setOutput('is_fork',   String(pr.head.repo.full_name !== context.repo.full_name));
-
-      - name: Abort on fork PRs (cannot push)
-        if: steps.pr.outputs.is_fork == 'true'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: [
-                '### ⚠️ `/fix-precommit` — fork PR detected',
-                '',
-                'Cannot auto-push to a forked repository. Please run pre-commit locally:',
-                '```bash',
-                'pip install pre-commit',
-                'pre-commit run --from-ref origin/main --to-ref HEAD',
-                '```',
-              ].join('\n'),
-            });
-            core.setFailed('Fork PR — skipping autofix');
+              issue_number: context.payload.pull_request.number,
+              name: 'fix-precommit',
+            }).catch(() => {});
 
       - name: Checkout PR branch
         uses: actions/checkout@v4
         with:
-          ref: ${{ steps.pr.outputs.head_ref }}
+          ref: ${{ github.event.pull_request.head.ref }}
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
 
@@ -82,7 +44,7 @@ jobs:
       - name: Run pre-commit (auto-fix pass)
         id: fix
         run: |
-          BASE_SHA="${{ steps.pr.outputs.base_sha }}"
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
 
           set +e
           pre-commit run --from-ref "$BASE_SHA" --to-ref HEAD 2>&1
@@ -111,7 +73,7 @@ jobs:
       - name: Run pre-commit (check pass)
         id: check
         run: |
-          BASE_SHA="${{ steps.pr.outputs.base_sha }}"
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
 
           set +e
           OUTPUT=$(pre-commit run --from-ref "$BASE_SHA" --to-ref HEAD 2>&1)
@@ -120,7 +82,6 @@ jobs:
 
           echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
 
-          # Truncate if very long
           TRUNCATED=$(echo "$OUTPUT" | head -200)
           echo "output<<EOF" >> "$GITHUB_OUTPUT"
           echo "$TRUNCATED" >> "$GITHUB_OUTPUT"
@@ -148,15 +109,11 @@ jobs:
             }
 
             if (exitCode === 0) {
-              if (filesChanged) {
-                lines.push('🎉 All issues were resolved automatically — no manual action needed.');
-              } else {
-                lines.push('### ✅ Already clean — no pre-commit issues found.');
-              }
+              lines.push(filesChanged
+                ? '🎉 All issues resolved automatically — no manual action needed.'
+                : '### ✅ Already clean — no pre-commit issues found.');
             } else {
               lines.push('### ❌ Remaining issues require manual fix');
-              lines.push('');
-              lines.push('The following hooks could not be auto-fixed:');
               lines.push('');
               lines.push('<details><summary>pre-commit output</summary>');
               lines.push('');
@@ -169,14 +126,6 @@ jobs:
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: context.issue.number,
+              issue_number: context.payload.pull_request.number,
               body: lines.join('\n'),
-            });
-
-            // Update reaction on the trigger comment: 👍 clean, 👎 needs manual fix
-            await github.rest.reactions.createForIssueComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              comment_id: context.payload.comment.id,
-              content: exitCode === 0 ? '+1' : '-1',
             });
