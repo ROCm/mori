@@ -157,4 +157,10 @@ class SymmMemManager {
 };
 
 }  // namespace application
+
+namespace shmem {
+// Note: temporary API for testing
+application::SymmMemObjPtr ShmemQueryMemObjPtr(void*);
+}
+
 }  // namespace mori

@@ -29,6 +29,7 @@
 #include <hip/hip_runtime_api.h>
 
 #include <algorithm>
+#include <deque>
 #include <cassert>
 #include <cctype>
 #include <filesystem>
@@ -68,8 +69,20 @@ struct KernelRegistry::Impl {
 };
 
 KernelRegistry::Impl& KernelRegistry::GetImpl() {
+#ifdef MORI_MULTITHREAD_SUPPORT 
+  static std::mutex mutex_;
+  static std::deque<KernelRegistry::Impl> impls_(8); // 8 GPUs per node
+  int id = -1;
+  HIP_RUNTIME_CHECK(hipGetDevice(&id));
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (impls_.size() <= static_cast<size_t>(id)) {
+    impls_.resize(id + 1);
+  }
+  return impls_[id];
+#else
   static Impl impl;
   return impl;
+#endif // MORI_MULTITHREAD_SUPPORT
 }
 
 KernelRegistry& KernelRegistry::Instance() {
@@ -90,7 +103,6 @@ void KernelRegistry::LoadModule(const std::string& hsaco_path) {
                              ")");
   }
   impl.modules.push_back(mod);
-
   // Initialize shmem globalGpuStates in this module
   mori::shmem::ShmemModuleInit(reinterpret_cast<void*>(mod));
 }

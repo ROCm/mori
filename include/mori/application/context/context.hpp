@@ -39,10 +39,10 @@ class Context {
   int LocalRank() const { return bootNet.GetLocalRank(); }
   int WorldSize() const { return bootNet.GetWorldSize(); }
   int LocalRankInNode() const { return rankInNode; }
-  std::string HostName() const;
+  const std::string& HostName() const { return myHostname; }
 
   TransportType GetTransportType(int destRank) const { return transportTypes[destRank]; }
-  std::vector<TransportType> GetTransportTypes() const { return transportTypes; }
+  const std::vector<TransportType>& GetTransportTypes() const { return transportTypes; }
   int GetNumQpPerPe() const { return numQpPerPe; }
 
   RdmaContext* GetRdmaContext() const { return rdmaContext.get(); }
@@ -51,6 +51,8 @@ class Context {
 
   // Check if P2P connection is possible with a peer (same node)
   bool CanUseP2P(int destRank) const;
+  // Check if P2P connection is possible with a peer (same process)
+  bool SameProcessP2P(int destRank) const;
 
   // Cached env-var snapshot taken at construction time. All later code MUST
   // consult these (not getenv) so that env-var changes after Context init
@@ -68,13 +70,19 @@ class Context {
   void InitializePossibleTransports();
 
  private:
+  struct PeerInfo {
+    bool sameHost{false};    // true if LocalRank and destRank are on the same node
+    bool sameProcess{false}; // true if LocalRank and destRank are in the same process
+  };
+
   BootstrapNetwork& bootNet;
   int rankInNode{-1};
   int numQpPerPe{4};
+  std::string myHostname;
   // Snapshotted at construction; see IsSdmaEnabled() / IsP2PDisabled() above.
   bool sdmaEnabled{false};
   bool p2pDisabled{false};
-  std::vector<std::string> hostnames;
+  std::vector<PeerInfo> peerInfos;
   std::vector<TransportType> transportTypes;
 
   std::unique_ptr<RdmaContext> rdmaContext{nullptr};

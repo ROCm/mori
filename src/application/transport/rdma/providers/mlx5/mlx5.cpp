@@ -23,7 +23,7 @@
 
 #include <hip/hip_runtime_api.h>
 #include <infiniband/verbs.h>
-
+#include <cstring>
 #include <iostream>
 
 #include "mori/application/transport/rdma/providers/mlx5/mlx5_ifc.hpp"

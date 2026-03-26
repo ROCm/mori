@@ -23,6 +23,8 @@
 
 #include "mori/application/utils/check.hpp"
 #include "mori/utils/mori_log.hpp"
+#include <cstring>
+
 namespace mori {
 namespace application {
 
