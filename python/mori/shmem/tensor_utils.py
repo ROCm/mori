@@ -74,6 +74,7 @@ def mori_shmem_free_tensor(tensor: torch.Tensor):
     mori_shmem.shmem_free(tensor.data_ptr())
     torch.cuda.synchronize()
 
+
 def mori_shmem_create_tensor_list_intra_node(shape, dtype, num_ranks):
     tensor = mori_shmem_create_tensor(shape, dtype)
     return [symm_mori_shmem_tensor(tensor, i) for i in range(num_ranks)]
