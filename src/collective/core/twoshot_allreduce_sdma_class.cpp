@@ -429,11 +429,10 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             if (scatter_mode == 1) {
                 chunk_elems = total_count;
             } else {
-                // Auto-select chunk count for the bidirectional pipeline.
-                // Multi-chunk: SDMA scatter (outbound) overlaps CU AG read (inbound).
-                // Target 4 chunks.  Per-chunk shard >= 2 MB keeps sync overhead
-                // (~15-25us) well amortised by the transfer time.
-                constexpr size_t kMinShardBytes = 2ULL * 1024 * 1024;
+                // CU P2P read AG achieves only ~10 GB/s/link (vs SDMA push ~50 GB/s),
+                // so multi-chunk CU AG is slower than single-kernel SDMA AG push.
+                // Force 1-chunk for all practical sizes (up to 1 TB per PE).
+                constexpr size_t kMinShardBytes = 128ULL * 1024 * 1024;
                 constexpr int    kTargetChunks  = 4;
                 const size_t shard_bytes =
                     (total_count / npes_) * dtype_size_;
