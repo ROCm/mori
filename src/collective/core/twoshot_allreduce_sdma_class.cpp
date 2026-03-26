@@ -432,6 +432,11 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         int blocks = std::min(max_blocks_,
                               (packedPerRank + threads - 1) / threads);
         if (blocks < 1) blocks = 1;
+        if (scatter_mode == 0) {
+            // block_done[] has fixed capacity in CrossPeBarrier.
+            int compBlocks = std::min(blocks, kMaxPipelineBlocks - 1);
+            blocks = compBlocks + 1;  // +1 manager block
+        }
 
         T* userOut = copy_output_to_user_ ? output : nullptr;
 
