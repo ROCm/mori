@@ -35,6 +35,20 @@ namespace collective {
 static_assert(kMaxPipelineBlocks <= 385,
               "compute block count must fit in grid launch");
 
+// Non-inlined D2D copy helper — keeps SdmaPutThread's VGPR cost out of the
+// main kernel's register budget, preventing occupancy-induced deadlocks.
+__attribute__((noinline)) __device__
+void PipelinedD2DCopy(
+    void* src, void* dst, size_t bytes,
+    anvil::SdmaQueueDeviceHandle** selfDh,
+    HSAuint64* copySigBase,
+    uint32_t numQ,
+    uint64_t sigBaseline) {
+  core::SdmaPutThread(src, dst, bytes, selfDh, copySigBase, numQ, 2);
+  while (core::AtomicLoadRelaxed(copySigBase + 2) < sigBaseline + 1ULL)
+    ;
+}
+
 template <typename T, int SCATTER_MODE = 0, bool MULTI_CHUNK = false,
           bool COPY_OUTPUT = false>
 __global__ void __launch_bounds__(512, 2)
@@ -100,7 +114,12 @@ PipelinedAllReduceSdmaKernel(
         }
       }
     }
-    // s_copy_sig_base read removed for DIAG — empty COPY_OUTPUT test
+    if constexpr (COPY_OUTPUT) {
+      if (blockIdx.x == 0) {
+        s_copy_sig_base = core::AtomicLoadRelaxed(
+            dstMemObj->signalPtrs + static_cast<size_t>(myPe) * numQ + 2);
+      }
+    }
   }
   __syncthreads();
 
@@ -317,9 +336,19 @@ PipelinedAllReduceSdmaKernel(
         }
 
         if constexpr (COPY_OUTPUT) {
-          // DIAG: empty COPY_OUTPUT to test if extra VGPR pressure alone
-          // causes the hang.  No D2D copy, no printf.
           __syncthreads();
+          if (threadIdx.x == 0) {
+            const size_t copyBytes = elementCount * bytesPerElement;
+            anvil::SdmaQueueDeviceHandle** selfDh =
+                dstMemObj->deviceHandles_d + static_cast<size_t>(myPe) * numQ;
+            HSAuint64* copySigBase = dstMemObj->signalPtrs
+                + static_cast<size_t>(myPe) * numQ;
+            PipelinedD2DCopy(
+                dstMemObj->localPtr,
+                reinterpret_cast<void*>(output),
+                copyBytes, selfDh, copySigBase, numQ,
+                s_copy_sig_base);
+          }
         }
       }
 

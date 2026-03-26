@@ -524,8 +524,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             return false;
         }
 
-        // DIAG: always copy — COPY_OUTPUT block is empty for this test
-        if (copy_output_to_user_) {
+        if (copy_output_to_user_ && !kernel_copies) {
             copy_output_to_user(output, total_count, stream);
         }
     } catch (const std::exception& e) {
