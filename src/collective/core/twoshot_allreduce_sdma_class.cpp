@@ -473,26 +473,14 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             }
         }
 
-        // SDMA queue completion counters live on the symmetric object (not shmem flags).
-        // Zero them every launch so compute CTAs' baseline reads cannot race block 0's
-        // first scatter or inherit mismatched totals from a prior collective.
-        {
-            application::SymmMemObj* cpuMo = output_transit_buffer_obj_.cpu;
-            if (cpuMo && cpuMo->signalPtrs) {
-                const uint32_t nq = cpuMo->sdmaNumQueue ? cpuMo->sdmaNumQueue : 8u;
-                const size_t sig_bytes =
-                    static_cast<size_t>(npes_) * static_cast<size_t>(nq) * sizeof(uint64_t);
-                hipError_t sg =
-                    stream ? hipMemsetAsync(cpuMo->signalPtrs, 0, sig_bytes, stream)
-                           : hipMemset(cpuMo->signalPtrs, 0, sig_bytes);
-                if (sg != hipSuccess) {
-                    fprintf(stderr, "PE %d: pipelined hipMemset(SDMA signals) failed: %s\n",
-                            myPe_, hipGetErrorString(sg));
-                    return false;
-                }
-            }
-        }
-        {
+        // Signal and barrier zeroing is unnecessary for SCATTER_MODE 0.
+        // SdmaPutThread uses ATOMIC_INC (monotonically increasing signals), and
+        // the kernel reads baselines at launch to compute expected values.  The
+        // protocol is self-consistent across calls without resetting.
+        //
+        // SCATTER_MODE 1 (P2P) uses barrier->ag_sync with absolute counts in its
+        // gatherBarrier, so the full barrier must be zeroed for that path.
+        if (scatter_mode == 1) {
             hipError_t br =
                 stream ? hipMemsetAsync(barrierPtr_, 0, sizeof(CrossPeBarrier), stream)
                        : hipMemset(barrierPtr_, 0, sizeof(CrossPeBarrier));
