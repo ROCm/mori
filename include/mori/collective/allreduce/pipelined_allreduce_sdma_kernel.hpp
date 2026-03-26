@@ -5,7 +5,8 @@
 //
 // SCATTER_MODE=0: Single-kernel AllReduce (SDMA scatter + reduce + SDMA AG)
 //   1-chunk mode (all practical sizes up to ~1 TB/PE):
-//     Block 0: burst scatter → cc wait → SDMA AG push → AG wait.
+//     Block 0: burst scatter → cc wait → SDMA AG push → AG wait
+//              → [COPY_OUTPUT] SDMA D2D copy transit→output → signal wait.
 //     Compute blocks: scatter-poll → reduce → wbl2+fence → chunks_complete.
 //     No q2/rd handshake: AG SDMA transfer time ≫ remote reduce time.
 //     No signal/barrier zeroing: monotonic ATOMIC_INC + baseline protocol.
@@ -34,10 +35,13 @@ namespace collective {
 static_assert(kMaxPipelineBlocks <= 385,
               "compute block count must fit in grid launch");
 
-template <typename T, int SCATTER_MODE = 0, bool MULTI_CHUNK = false>
-__global__ void PipelinedAllReduceSdmaKernel(
+template <typename T, int SCATTER_MODE = 0, bool MULTI_CHUNK = false,
+          bool COPY_OUTPUT = false>
+__global__ void __launch_bounds__(512, 2)
+PipelinedAllReduceSdmaKernel(
     int myPe, int npes,
     const T* __restrict__ input,
+    T* __restrict__ output,
     const application::SymmMemObjPtr dstMemObj,
     const application::SymmMemObjPtr flagsMemObj,
     CrossPeBarrier* __restrict__ barrier,
@@ -75,6 +79,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
   __shared__ uint64_t s_ag_by_sender[64];
   __shared__ uint64_t s_rd_by_sender[64];
   __shared__ uint32_t s_cc_base;
+  __shared__ uint64_t s_copy_sig_base;
 
   if (threadIdx.x == 0) {
     s_cc_base = (blockIdx.x == 0)
@@ -93,6 +98,12 @@ __global__ void PipelinedAllReduceSdmaKernel(
           s_rd_by_sender[s] =
               core::AtomicLoadRelaxed(dstMemObj->signalPtrs + row + 2);
         }
+      }
+    }
+    if constexpr (COPY_OUTPUT) {
+      if (blockIdx.x == 0) {
+        s_copy_sig_base = core::AtomicLoadRelaxed(
+            dstMemObj->signalPtrs + static_cast<size_t>(myPe) * numQ + 2);
       }
     }
   }
@@ -308,6 +319,28 @@ __global__ void PipelinedAllReduceSdmaKernel(
               + static_cast<size_t>(sender) * numQ + 1;
           while (core::AtomicLoadRelaxed(sig) < expected)
             ;
+        }
+
+        if constexpr (COPY_OUTPUT) {
+          // SDMA D2D copy: transit → user output (self-PE queue 2).
+          // __launch_bounds__(512,2) guarantees enough occupancy for all
+          // 385 blocks even with the extra VGPR from this code path.
+          __syncthreads();
+          if (threadIdx.x == 0) {
+            const size_t copyBytes = elementCount * bytesPerElement;
+            anvil::SdmaQueueDeviceHandle** selfDh =
+                dstMemObj->deviceHandles_d + static_cast<size_t>(myPe) * numQ;
+            HSAuint64* copySigBase = dstMemObj->signalPtrs
+                + static_cast<size_t>(myPe) * numQ;
+            core::SdmaPutThread(
+                dstMemObj->localPtr,
+                reinterpret_cast<void*>(output),
+                copyBytes,
+                selfDh, copySigBase, numQ, 2);
+            while (core::AtomicLoadRelaxed(copySigBase + 2)
+                   < s_copy_sig_base + 1ULL)
+              ;
+          }
         }
       }
 
