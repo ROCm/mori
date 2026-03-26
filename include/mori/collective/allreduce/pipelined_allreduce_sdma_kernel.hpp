@@ -75,6 +75,22 @@ __global__ void PipelinedAllReduceSdmaKernel(
   __shared__ uint64_t s_ag_by_sender[64];
   __shared__ uint64_t s_rd_by_sender[64];
   __shared__ uint32_t s_cc_base;
+  __shared__ uint32_t s_bd_base[kMaxPipelineBlocks];
+  __shared__ uint32_t s_my_bd_base;
+
+  if constexpr (SCATTER_MODE == 0 && !MULTI_CHUNK) {
+    if (blockIdx.x == 0) {
+      if (static_cast<int>(threadIdx.x) < compBlocks) {
+        s_bd_base[threadIdx.x] = __scoped_atomic_load_n(
+            &barrier->block_done[threadIdx.x],
+            __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
+      }
+    } else if (threadIdx.x == 0) {
+      s_my_bd_base = __scoped_atomic_load_n(
+          &barrier->block_done[blockIdx.x - 1],
+          __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
+    }
+  }
 
   if (threadIdx.x == 0) {
     s_cc_base = (blockIdx.x == 0)
@@ -164,9 +180,17 @@ __global__ void PipelinedAllReduceSdmaKernel(
 #if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
           asm volatile("buffer_wbl2" ::: "memory");
 #endif
-          __threadfence_system();
-          __hip_atomic_fetch_add(&barrier->chunks_complete, 1u,
-                                 __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+          if constexpr (!MULTI_CHUNK) {
+            __threadfence();
+            __scoped_atomic_store_n(
+                &barrier->block_done[blockIdx.x - 1],
+                s_my_bd_base + static_cast<uint32_t>(c + 1),
+                __ATOMIC_RELEASE, __MEMORY_SCOPE_DEVICE);
+          } else {
+            __threadfence_system();
+            __hip_atomic_fetch_add(&barrier->chunks_complete, 1u,
+                                   __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+          }
         }
 
         // CU P2P Read AG — multi-chunk pipeline only.
@@ -273,26 +297,29 @@ __global__ void PipelinedAllReduceSdmaKernel(
           }
         }
       } else {
-        // Single-chunk: SDMA AG push (outbound) — single-kernel advantage.
-        //
-        // q2/rd handshake is omitted: the AG SDMA transfer time (shard /
-        // link_bw ≈ 40-1280 µs) always exceeds the remote PE's reduce
-        // duration (8·shard / HBM_bw ≈ 5-150 µs) by ~8×, so the AG data
-        // cannot arrive before the remote reduce finishes reading the
-        // scatter slot we are about to overwrite.
+        // Single-chunk: per-block-done poll → SDMA AG push (outbound).
+        // Uses parallel per-block flags instead of a single atomic counter
+        // to eliminate O(compBlocks) serialization on chunks_complete.
+        // Block-0 threads 0..compBlocks-1 each poll one compute block's
+        // block_done flag — no contention, ~30ns vs ~3.5µs.
+        {
+          const int t = static_cast<int>(threadIdx.x);
+          if (t < compBlocks) {
+            const uint32_t expected = s_bd_base[t] + 1u;
+            while (__scoped_atomic_load_n(
+                       &barrier->block_done[t],
+                       __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) < expected)
+              ;
+          }
+        }
+        __syncthreads();
+
         if (thr < npes && thr != myPe) {
           const int destPe = thr;
           anvil::SdmaQueueDeviceHandle** dh =
               dstMemObj->deviceHandles_d + destPe * numQ;
           HSAuint64* rSig = dstMemObj->peerSignalPtrs[destPe]
               + static_cast<size_t>(myPe) * numQ;
-
-          const uint32_t ccTarget =
-              ccBase + static_cast<uint32_t>(compBlocks);
-          while (__scoped_atomic_load_n(
-                     &barrier->chunks_complete,
-                     __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) < ccTarget)
-            ;
 
           uint8_t* src = reinterpret_cast<uint8_t*>(dstMemObj->localPtr)
               + static_cast<size_t>(myPe) * totalShardBytes;
@@ -409,9 +436,11 @@ __global__ void PipelinedAllReduceSdmaKernel(
   }
 
 #if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    asm volatile("buffer_wbl2" ::: "memory");
+  if constexpr (SCATTER_MODE != 0 || MULTI_CHUNK) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      asm volatile("buffer_wbl2" ::: "memory");
+    }
   }
 #endif
 }
