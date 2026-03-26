@@ -315,6 +315,17 @@ bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
             }
         }
 
+        const T* rs_input = input;
+        {
+            size_t required_input_size = total_count * dtype_size_;
+            if (ensure_buffer_size(input_transit_buffer_, input_transit_buffer_ptr_,
+                                   input_transit_buffer_size_, input_transit_buffer_obj_,
+                                   required_input_size, "input transit buffer")) {
+                copy_input_to_transit(input, total_count, stream);
+                rs_input = reinterpret_cast<const T*>(input_transit_buffer_);
+            }
+        }
+
         // Step 1: SdmaReduceScatter — SDMA scatter + local reduce
         int threads = 512;
         int packedPerRank = static_cast<int>(
@@ -325,7 +336,7 @@ bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
 
         SdmaReduceScatterKernel<T><<<blocks, threads, 0, stream>>>(
             myPe_, npes_,
-            input,
+            rs_input,
             output_transit_buffer_obj_,
             flagsObj_,
             barrierPtr_,
@@ -499,11 +510,32 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             if (!global_launch_barrier())
                 return false;
 
-            application::SymmMemObjPtr unusedInputSymm{};
+            application::SymmMemObjPtr inputSymmObj = {};
+            {
+                size_t required_input_size = total_count * dtype_size_;
+                if (!ensure_buffer_size(input_transit_buffer_, input_transit_buffer_ptr_,
+                                        input_transit_buffer_size_, input_transit_buffer_obj_,
+                                        required_input_size, "input transit buffer")) {
+                    return false;
+                }
+                copy_input_to_transit(input, total_count, stream);
+                inputSymmObj = input_transit_buffer_obj_;
+                {
+                    hipError_t se = (stream != nullptr)
+                        ? hipStreamSynchronize(stream)
+                        : hipDeviceSynchronize();
+                    if (se != hipSuccess) {
+                        fprintf(stderr,
+                                "PE %d: sync before SDMA mode0 kernel failed: %s\n",
+                                myPe_, hipGetErrorString(se));
+                        return false;
+                    }
+                }
+            }
             PipelinedAllReduceSdmaKernel<T, 0><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input, userOut,
                 output_transit_buffer_obj_, flagsObj_, barrierPtr_,
-                unusedInputSymm, total_count, chunk_elems_arg);
+                inputSymmObj, total_count, chunk_elems_arg);
 
             hipError_t err = hipGetLastError();
             if (err != hipSuccess) {

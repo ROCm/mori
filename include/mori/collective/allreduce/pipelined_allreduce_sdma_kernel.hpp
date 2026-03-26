@@ -212,7 +212,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
           if (cOff + actualBytes > totalShardBytes)
             actualBytes = totalShardBytes - cOff;
           if (actualBytes > 0) {
-            uint8_t* src = reinterpret_cast<uint8_t*>(const_cast<T*>(input))
+            uint8_t* src = reinterpret_cast<uint8_t*>(inputSymmObj->localPtr)
                 + static_cast<size_t>(destPe) * totalShardBytes + cOff;
             uint8_t* dst = reinterpret_cast<uint8_t*>(dstMemObj->peerPtrs[destPe])
                 + static_cast<size_t>(myPe) * totalShardBytes + cOff;
