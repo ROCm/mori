@@ -417,11 +417,6 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         if (blocks < 1) blocks = 1;
         if (scatter_mode == 0) {
             int comp = std::min(blocks, kMaxPipelineBlocks - 1);
-            // Scale down for small data: fewer blocks = less scatter-poll
-            // L2 contention + cheaper wbl2/threadfence + faster CC wait.
-            const int idealComp = std::max(16,
-                packedPerRank / (threads * 4));
-            comp = std::min(comp, idealComp);
             blocks = comp + 1;
         }
 
