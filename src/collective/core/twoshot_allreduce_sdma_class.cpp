@@ -438,7 +438,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                 // share XGMI link bandwidth, so the only overlap gain is CU
                 // reduce vs SDMA transfer (~8% of total); too many small chunks
                 // erase that gain.
-                constexpr size_t kMinShardBytes = 4ULL * 1024 * 1024;
+                constexpr size_t kMinShardBytes = 5ULL * 1024 * 1024;
                 constexpr int    kTargetChunks  = 4;
                 const size_t shard_bytes =
                     (total_count / npes_) * dtype_size_;
