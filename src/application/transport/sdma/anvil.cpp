@@ -54,39 +54,6 @@ auto checkHsaError = [](hsa_status_t s, const char* msg, const char* file, int l
     }                                                                                          \
   } while (0)
 
-#if 0
-inline void checkHipError(hipError_t err, const char* msg, const char* file, int line)
-{
-   if (err != hipSuccess)
-   {
-      std::cerr << "HIP error at " << file << ":" << line << " — " << msg << "\n"
-                << "  Code: " << err << " (" << hipGetErrorString(err) << ")" << std::endl;
-      std::exit(EXIT_FAILURE);
-   }
-}
-
-#define CHECK_HIP_ERROR(cmd) checkHipError((cmd), #cmd, __FILE__, __LINE__)
-
-// Allow access to peerDeviceId from deviceId
-inline void EnablePeerAccess(int const deviceId, int const peerDeviceId)
-{
-   int canAccess;
-   CHECK_HIP_ERROR(hipDeviceCanAccessPeer(&canAccess, deviceId, peerDeviceId));
-   if (!canAccess)
-   {
-      std::cerr << "Unable to enable peer access from GPU devices " << deviceId << " to " << peerDeviceId << "\n";
-   }
-
-   CHECK_HIP_ERROR(hipSetDevice(deviceId));
-   hipError_t error = hipDeviceEnablePeerAccess(peerDeviceId, 0);
-   if (error != hipSuccess && error != hipErrorPeerAccessAlreadyEnabled)
-   {
-      std::cerr << "Unable to enable peer to peer access from " << deviceId << "  to " << peerDeviceId << " ("
-                << hipGetErrorString(error) << ")\n";
-   }
-}
-#endif
-
 // HSA agents
 std::vector<hsa_agent_t> cpuAgents_;
 std::vector<hsa_agent_t> gpuAgents_;
@@ -234,6 +201,7 @@ SdmaQueue::~SdmaQueue() {
 SdmaQueueDeviceHandle* SdmaQueue::deviceHandle() const { return deviceHandle_; }
 
 AnvilLib::~AnvilLib() {
+  std::lock_guard<std::mutex> lock(mutex_);
   for (auto& p : sdma_channels_) {
     p.second.clear();
   }
@@ -267,34 +235,36 @@ void AnvilLib::init() {
 }
 
 bool AnvilLib::connect(int srcDeviceId, int dstDeviceId, int numChannels) {
+  std::lock_guard<std::mutex> lock(mutex_);
   uint32_t engineId = getSdmaEngineId(srcDeviceId, dstDeviceId);  // + 1) * 2;
-  MORI_APP_INFO("Connect from {} to {} with {} channels using engine {}", srcDeviceId, dstDeviceId,
-                numChannels, engineId);
   for (int c = 0; c < numChannels; ++c) {
-    sdma_channels_[dstDeviceId].emplace_back(
+    sdma_channels_[getKey(srcDeviceId, dstDeviceId)].emplace_back(
         std::make_unique<SdmaQueue>(srcDeviceId, dstDeviceId, gpuAgents_[srcDeviceId], engineId));
   }
+  MORI_APP_INFO("Connect from {} to {} with {} channels using engine {} num channels {}", srcDeviceId, dstDeviceId,
+    numChannels, engineId, sdma_channels_.size());
+
   return true;
 }
 
 SdmaQueue* AnvilLib::getSdmaQueue(int srcDeviceId, int dstDeviceId, int channel_idx) {
-  if (sdma_channels_.find(dstDeviceId) == sdma_channels_.end()) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto key = getKey(srcDeviceId, dstDeviceId);
+  if (sdma_channels_.find(key) == sdma_channels_.end()) {
     return nullptr;
   }
 
-  if (!(channel_idx < sdma_channels_[dstDeviceId].size())) {
+  if (!(channel_idx < sdma_channels_[key].size())) {
     return nullptr;
   }
 
-  return sdma_channels_[dstDeviceId][channel_idx].get();  // TODO
+  return sdma_channels_[key][channel_idx].get();  // TODO
 }
 
 AnvilLib& AnvilLib::getInstance() {
-  static AnvilLib* instance;
-  if (instance == nullptr) {
-    instance = new AnvilLib();
-  }
-  return *instance;
+
+  static AnvilLib instance;
+  return instance;
 }
 
 int AnvilLib::getOamId(int deviceId) {
@@ -319,7 +289,5 @@ int AnvilLib::getSdmaEngineId(int srcDeviceId, int dstDeviceId) {
   // Use even engines only
   return mi300xOamMap[srcOamId][dstOamId] * 2;
 }
-
-AnvilLib& anvil = anvil.getInstance();
 
 }  // namespace anvil

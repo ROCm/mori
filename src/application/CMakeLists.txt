@@ -10,9 +10,7 @@ if(WITH_MPI)
 endif()
 find_package(hsa-runtime64 REQUIRED)
 find_package(hsakmt REQUIRED)
-# find_library(IONIC_LIBRARY NAMES ionic HINTS /lib/x86_64-linux-gnu REQUIRED )
-option(BUILD_TORCH_BOOTSTRAP
-       "Build Torch process group bootstrap (requires PyTorch)" ON)
+
 
 if(BUILD_TORCH_BOOTSTRAP)
   execute_process(

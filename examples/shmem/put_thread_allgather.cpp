@@ -35,6 +35,21 @@ constexpr ProviderType PrvdType = ProviderType::MLX5;
 __global__ void RingAllGatherWithPutMemAPIKernel(int myPe, int npes, const SymmMemObjPtr memObj) {
   int nextPeer = (myPe + 1) % npes;
   int peChunkSize = memObj->size / npes;
+  auto localPtr = reinterpret_cast<uint32_t*>(memObj->localPtr);
+
+  GpuStates* s = GetGlobalGpuStatesPtr();
+  uintptr_t localAddrInt = reinterpret_cast<uintptr_t>(localPtr);
+
+  printf("localAddrInt: %lx in [%lx, %lx]\n", localAddrInt, s->heapBaseAddr, s->heapEndAddr);
+  auto peerPtr = ShmemPtrP2p(reinterpret_cast<uint64_t>(localPtr), myPe, nextPeer);
+
+  printf("myPe: %d, npes: %d, peChunkSize: %d heapObj: %p\n", s->rank, s->worldSize, peChunkSize, s->heapObj);
+  printf("localPtr: %p peerPtr %p\n", localPtr, reinterpret_cast<uint64_t*>(peerPtr));
+
+  if (peerPtr == 0) {
+    printf("XXX rank %d, peerPtr is 0\n", myPe);
+    return;
+  }
 
   for (int i = 0; i < npes - 1; i++) {
     int sendDataRank = ((myPe - i) + npes) % npes;
@@ -76,20 +91,32 @@ inline void EnablePeerAccess(int const deviceId, int const peerDeviceId) {
     std::cerr << "Unable to enable peer to peer access from " << deviceId << "  to " << peerDeviceId
               << " (" << hipGetErrorString(error) << ")\n";
   }
+  std::cerr << "Enabled peer access from " << deviceId << " to " << peerDeviceId << "\n";
 }
 
 void RingAllGatherWithPutMemAPI() {
-  int status;
+
   MPI_Init(NULL, NULL);
 
-  status = ShmemMpiInit(MPI_COMM_WORLD);
+  MPI_Comm localComm;
+  MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &localComm);
+
+  int localRank;
+  MPI_Comm_rank(localComm, &localRank);
+
+  int deviceCount;
+  HIP_RUNTIME_CHECK(hipGetDeviceCount(&deviceCount));
+  int deviceId = localRank % deviceCount;
+  HIP_RUNTIME_CHECK(hipSetDevice(deviceId));
+
+  int status = ShmemMpiInit(MPI_COMM_WORLD);
   assert(!status);
 
-  // Assume in same node
   int myPe = ShmemMyPe();
   int npes = ShmemNPes();
 
-  HIP_RUNTIME_CHECK(hipSetDevice(myPe % 8));
+  EnablePeerAccess(deviceId, (deviceId + 1) % npes);
+
   // Allocate buffer
   int buffSize = npes * 1024 * sizeof(uint32_t);
   int peChunkSize = buffSize / npes / sizeof(uint32_t);

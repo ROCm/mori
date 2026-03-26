@@ -25,6 +25,7 @@
 #include <memory>
 #include <mutex>
 #include <vector>
+#include <deque>
 
 #include "mori/application/application.hpp"
 #include "mori/application/bootstrap/bootstrap.hpp"
@@ -87,13 +88,22 @@ enum ShmemStatesStatus {
   Finalized = 2,
 };
 
+struct GpuStates;
+struct ModuleStates {
+  hipModule_t module{nullptr};
+  GpuStates* gpuStatesPtr{nullptr};
+  hipFunction_t barrierFunc{nullptr};
+};
+
 struct ShmemStates {
   ShmemStatesStatus status{ShmemStatesStatus::New};
   ShmemMode mode{ShmemMode::StaticHeap};  // Default to static heap mode
   BootStates* bootStates{nullptr};
   RdmaStates* rdmaStates{nullptr};
   MemoryStates* memoryStates{nullptr};
-
+  ModuleStates moduleStates; // module states shall be available for all threads
+  GpuStates *gpuStates{nullptr};
+  
   // This is a temporary API for debugging only
   void CheckStatusValid() {
     if (status == ShmemStatesStatus::New) {
@@ -144,18 +154,22 @@ struct RemoteAddrInfo {
 };
 
 // Internal functions shared between init.cpp and runtime.cpp
-void CopyGpuStatesToDevice(const GpuStates* gpuStates);
-void FinalizeRuntime();
-extern GpuStates s_hostGpuStatesCopy;
+void CopyGpuStatesToDevice(ShmemStates* states);
+void FinalizeRuntime(ShmemStates* states);
 
 class ShmemStatesSingleton {
  public:
   ShmemStatesSingleton(const ShmemStatesSingleton& obj) = delete;
 
-  static ShmemStates* GetInstance() {
-    static ShmemStates states;
-    return &states;
+  static ShmemStates* GetInstance();
+private:
+#ifdef MORI_MULTITHREAD_SUPPORT 
+  ShmemStatesSingleton() {
+    states_.resize(8); // 8 GPUs per node
   }
+  std::mutex mutex_;
+  std::deque<ShmemStates> states_;
+#endif
 };
 
 }  // namespace shmem
