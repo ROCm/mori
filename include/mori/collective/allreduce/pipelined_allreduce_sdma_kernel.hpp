@@ -43,7 +43,8 @@ __global__ void PipelinedAllReduceSdmaKernel(
     CrossPeBarrier* __restrict__ barrier,
     const application::SymmMemObjPtr inputSymmObj,
     size_t elementCount,
-    size_t chunkElementCount) {
+    size_t chunkElementCount,
+    T* __restrict__ output) {
 
   if (elementCount == 0 || npes <= 0) return;
 
@@ -75,12 +76,15 @@ __global__ void PipelinedAllReduceSdmaKernel(
   __shared__ uint64_t s_ag_by_sender[64];
   __shared__ uint64_t s_rd_by_sender[64];
   __shared__ uint32_t s_cc_base;
+  __shared__ uint32_t s_ag_base;
 
   if (threadIdx.x == 0) {
     s_cc_base = (blockIdx.x == 0)
         ? __scoped_atomic_load_n(
               &barrier->chunks_complete, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE)
         : 0u;
+    s_ag_base = __scoped_atomic_load_n(
+        &barrier->ag_gate, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
     for (int s = 0; s < npes && s < 64; ++s) {
       if (s == myPe) continue;
       const size_t row = static_cast<size_t>(s) * numQ;
@@ -203,6 +207,31 @@ __global__ void PipelinedAllReduceSdmaKernel(
         }
       }
 
+      // In-kernel CU copy: transit → user output (eliminates hipMemcpyAsync).
+      // Compute blocks wait for Block 0's ag_gate signal (AG done), then
+      // bulk-copy the completed result using all threads in parallel.
+      // 1-chunk only — MULTI_CHUNK uses ag_gate for per-chunk AG gating.
+      if constexpr (!MULTI_CHUNK) {
+        if (output != nullptr) {
+          if (threadIdx.x == 0) {
+            while (__scoped_atomic_load_n(
+                       &barrier->ag_gate, __ATOMIC_ACQUIRE,
+                       __MEMORY_SCOPE_DEVICE) < s_ag_base + 1u)
+              ;
+          }
+          __syncthreads();
+          const size_t copyU4 =
+              (elementCount * bytesPerElement) / sizeof(uint4);
+          const uint4* __restrict__ copySrc =
+              reinterpret_cast<const uint4*>(dstMemObj->localPtr);
+          uint4* __restrict__ copyDst =
+              reinterpret_cast<uint4*>(output);
+          for (size_t i = compTid; i < copyU4; i += compStride) {
+            copyDst[i] = copySrc[i];
+          }
+        }
+      }
+
     } else {
       // =================================================================
       // BLOCK 0 — Burst-Submit Scatter + AG
@@ -308,6 +337,15 @@ __global__ void PipelinedAllReduceSdmaKernel(
               + static_cast<size_t>(sender) * numQ + 1;
           while (core::AtomicLoadRelaxed(sig) < expected)
             ;
+        }
+
+        // Signal compute blocks: AG complete, CU copy is safe.
+        if (output != nullptr) {
+          __syncthreads();
+          if (thr == 0) {
+            __hip_atomic_fetch_add(&barrier->ag_gate, 1u,
+                                   __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+          }
         }
 
       }

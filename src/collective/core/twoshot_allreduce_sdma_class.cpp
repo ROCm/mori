@@ -416,9 +416,12 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                               (packedPerRank + threads - 1) / threads);
         if (blocks < 1) blocks = 1;
         if (scatter_mode == 0) {
-            // Block 0 = management; remaining blocks = compute (reduce).
-            // Use up to kMaxPipelineBlocks-1 for large tensors (was capped at 32).
             int comp = std::min(blocks, kMaxPipelineBlocks - 1);
+            // Scale down for small data: fewer blocks = less scatter-poll
+            // L2 contention + cheaper wbl2/threadfence + faster CC wait.
+            const int idealComp = std::max(16,
+                packedPerRank / (threads * 4));
+            comp = std::min(comp, idealComp);
             blocks = comp + 1;
         }
 
@@ -493,21 +496,27 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
 
         const bool multi_chunk = (chunk_elems < total_count);
 
+        const bool kernel_copies =
+            (scatter_mode == 0 && !multi_chunk && copy_output_to_user_);
+
         if (scatter_mode == 1) {
             PipelinedAllReduceSdmaKernel<T, 1><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
-                barrierPtr_, inputSymmObj, total_count, chunk_elems);
+                barrierPtr_, inputSymmObj, total_count, chunk_elems,
+                static_cast<T*>(nullptr));
         } else if (multi_chunk) {
             PipelinedAllReduceSdmaKernel<T, 0, true><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
-                barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems);
+                barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems,
+                static_cast<T*>(nullptr));
         } else {
             PipelinedAllReduceSdmaKernel<T, 0, false><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
-                barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems);
+                barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems,
+                kernel_copies ? output : static_cast<T*>(nullptr));
         }
 
         hipError_t err = hipGetLastError();
@@ -517,7 +526,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             return false;
         }
 
-        if (copy_output_to_user_) {
+        if (copy_output_to_user_ && !kernel_copies) {
             copy_output_to_user(output, total_count, stream);
         }
     } catch (const std::exception& e) {
