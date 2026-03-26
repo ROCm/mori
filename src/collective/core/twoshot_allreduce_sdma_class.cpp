@@ -323,15 +323,13 @@ bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
         }
 
         const T* rs_input = input;
-        application::SymmMemObjPtr rs_transit_obj = output_transit_buffer_obj_;
         {
-            // Prefer a dedicated RS transit buffer to decouple RS destination
-            // from AG destination and avoid cross-iteration aliasing.
+            size_t required_input_size = total_count * dtype_size_;
             if (ensure_buffer_size(input_transit_buffer_, input_transit_buffer_ptr_,
                                    input_transit_buffer_size_, input_transit_buffer_obj_,
-                                   transit_used, "input transit buffer")) {
-                rs_transit_obj = input_transit_buffer_obj_;
-                rs_input = input;
+                                   required_input_size, "input transit buffer")) {
+                copy_input_to_transit(input, total_count, stream);
+                rs_input = reinterpret_cast<const T*>(input_transit_buffer_);
             }
         }
 
@@ -346,7 +344,7 @@ bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
         SdmaReduceScatterKernel<T><<<blocks, threads, 0, stream>>>(
             myPe_, npes_,
             rs_input,
-            rs_transit_obj,
+            output_transit_buffer_obj_,
             flagsObj_,
             barrierPtr_,
             total_count);
@@ -370,7 +368,6 @@ bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
         // Step 2: AllGather via SDMA
         AllGatherSdmaKernel<T><<<1, 512, 0, stream>>>(
             myPe_, npes_,
-            rs_transit_obj,
             output_transit_buffer_obj_,
             flagsObj_,
             barrierPtr_,

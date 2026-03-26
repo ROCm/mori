@@ -337,7 +337,6 @@ __global__ void SdmaReduceScatterKernel(
 // ============================================================================
 template <typename T>
 __global__ void AllGatherSdmaKernel(int myPe, int npes,
-                                    const application::SymmMemObjPtr srcMemObj,
                                     const application::SymmMemObjPtr dstMemObj,
                                     const application::SymmMemObjPtr flagsMemObj,
                                     CrossPeBarrier* __restrict__ barrier,
@@ -377,25 +376,8 @@ __global__ void AllGatherSdmaKernel(int myPe, int npes,
   int warpId = threadLinearId / warpSize;
   const int laneId = threadIdx.x % warpSize;
 
-  // Copy my shard from RS source buffer to AG destination buffer for self rank.
-  // When src/dst buffers are split, self-put is skipped and this local copy is
-  // required to populate row myPe in the output transit.
-  {
-    const P* __restrict__ srcRow =
-        reinterpret_cast<const P*>(srcMemObj->localPtr)
-        + static_cast<size_t>(myPe) * elementCountPerRank;
-    P* __restrict__ dstRow =
-        reinterpret_cast<P*>(dstMemObj->localPtr)
-        + static_cast<size_t>(myPe) * elementCountPerRank;
-    for (size_t k = threadLinearId; k < elementCountPerRank; k +=
-         static_cast<size_t>(blockDim.x) * static_cast<size_t>(gridDim.x)) {
-      dstRow[k] = srcRow[k];
-    }
-  }
-  __syncthreads();
-
   // --- SDMA put: send my reduced shard to every rank -------------------------
-  uint8_t* agSrcPtr = reinterpret_cast<uint8_t*>(srcMemObj->localPtr)
+  uint8_t* agSrcPtr = reinterpret_cast<uint8_t*>(dstMemObj->localPtr)
                       + static_cast<size_t>(myPe) * elementCountPerRank * bytesPerElement;
   size_t agSendBytes = elementCountPerRank * bytesPerElement;
 
