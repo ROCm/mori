@@ -44,9 +44,8 @@ void PipelinedD2DCopy(
     HSAuint64* copySigBase,
     uint32_t numQ,
     uint64_t sigBaseline) {
-  core::SdmaPutThread(src, dst, bytes, selfDh, copySigBase, numQ, 2);
-  while (core::AtomicLoadRelaxed(copySigBase + 2) < sigBaseline + 1ULL)
-    ;
+  // DIAG: no-op body — test if noinline call overhead causes hang
+  asm volatile("" ::: "memory");
 }
 
 template <typename T, int SCATTER_MODE = 0, bool MULTI_CHUNK = false,
