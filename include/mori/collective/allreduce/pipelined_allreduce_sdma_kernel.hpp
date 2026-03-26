@@ -5,10 +5,13 @@
 //
 // SCATTER_MODE=0: Single-kernel AllReduce (SDMA scatter + reduce + SDMA AG)
 //   1-chunk mode (all practical sizes up to ~1 TB/PE):
-//     Block 0: burst scatter → cc wait → SDMA AG push → AG wait.
-//     Compute blocks: scatter-poll → reduce → wbl2+fence → chunks_complete.
+//     Block 0: burst scatter → cc wait → SDMA AG push → AG wait → ag_gate.
+//     Compute blocks: scatter-poll → reduce → wbl2+fence → chunks_complete
+//       → copy myPe shard to output (overlaps AG wait) → wait ag_gate
+//       → copy remaining shards to output.
 //     No q2/rd handshake: AG SDMA transfer time ≫ remote reduce time.
 //     No signal/barrier zeroing: monotonic ATOMIC_INC + baseline protocol.
+//     In-kernel output copy eliminates post-kernel hipMemcpyAsync.
 //   Multi-chunk mode (disabled by kMinShardBytes=128MB):
 //     Block 0: burst scatter → q2/rd handshake → ag_gate per chunk.
 //     Compute blocks: scatter-poll → reduce → wait ag_gate → CU P2P AG.
@@ -38,6 +41,7 @@ template <typename T, int SCATTER_MODE = 0, bool MULTI_CHUNK = false>
 __global__ void PipelinedAllReduceSdmaKernel(
     int myPe, int npes,
     const T* __restrict__ input,
+    T* __restrict__ output,
     const application::SymmMemObjPtr dstMemObj,
     const application::SymmMemObjPtr flagsMemObj,
     CrossPeBarrier* __restrict__ barrier,
@@ -75,12 +79,15 @@ __global__ void PipelinedAllReduceSdmaKernel(
   __shared__ uint64_t s_ag_by_sender[64];
   __shared__ uint64_t s_rd_by_sender[64];
   __shared__ uint32_t s_cc_base;
+  __shared__ uint32_t s_ag_gate_base;
 
   if (threadIdx.x == 0) {
     s_cc_base = (blockIdx.x == 0)
         ? __scoped_atomic_load_n(
               &barrier->chunks_complete, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE)
         : 0u;
+    s_ag_gate_base = __scoped_atomic_load_n(
+        &barrier->ag_gate, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
     for (int s = 0; s < npes && s < 64; ++s) {
       if (s == myPe) continue;
       const size_t row = static_cast<size_t>(s) * numQ;
@@ -203,6 +210,44 @@ __global__ void PipelinedAllReduceSdmaKernel(
         }
       }
 
+      // ---- In-kernel copy: transit → user output (1-chunk path) ----
+      // Eliminates post-kernel hipMemcpyAsync by using idle compute blocks.
+      if constexpr (!MULTI_CHUNK) {
+        if (output) {
+          // Phase 1: copy myPe's reduced shard (overlaps with AG wait)
+          {
+            const size_t myOff = static_cast<size_t>(myPe) * packedPerRank;
+            const P* __restrict__ src = buf + myOff;
+            P* __restrict__ dst = reinterpret_cast<P*>(output) + myOff;
+            for (size_t k = compTid; k < packedPerRank; k += compStride) {
+              dst[k] = src[k];
+            }
+          }
+
+          // Phase 2: wait for Block 0 to signal all AG complete (ag_gate)
+          if (threadIdx.x == 0) {
+            while (__scoped_atomic_load_n(
+                       &barrier->ag_gate,
+                       __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE)
+                   < s_ag_gate_base + 1u)
+              ;
+          }
+          __syncthreads();
+
+          // Phase 3: copy remaining (npes-1) shards from transit to output
+          {
+            P* __restrict__ dst = reinterpret_cast<P*>(output);
+            for (int pe = 0; pe < npes; ++pe) {
+              if (pe == myPe) continue;
+              const size_t off = static_cast<size_t>(pe) * packedPerRank;
+              for (size_t k = compTid; k < packedPerRank; k += compStride) {
+                dst[off + k] = buf[off + k];
+              }
+            }
+          }
+        }
+      }
+
     } else {
       // =================================================================
       // BLOCK 0 — Burst-Submit Scatter + AG
@@ -308,6 +353,12 @@ __global__ void PipelinedAllReduceSdmaKernel(
               + static_cast<size_t>(sender) * numQ + 1;
           while (core::AtomicLoadRelaxed(sig) < expected)
             ;
+        }
+
+        __syncthreads();
+        if (threadIdx.x == 0) {
+          __hip_atomic_fetch_add(&barrier->ag_gate, 1u,
+                                 __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
         }
       }
 
