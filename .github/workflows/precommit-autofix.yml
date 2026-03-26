@@ -1,8 +1,13 @@
 name: pre-commit autofix
 
+# Supports two triggers:
+#   1. PR label "fix-precommit"  — works from any branch (before merge)
+#   2. PR comment "/fix-precommit" — works after this workflow is on main
 on:
   pull_request:
     types: [labeled]
+  issue_comment:
+    types: [created]
 
 permissions:
   contents: write
@@ -10,25 +15,72 @@ permissions:
 
 jobs:
   autofix:
-    if: github.event.label.name == 'fix-precommit'
+    if: |
+      (github.event_name == 'pull_request' && github.event.label.name == 'fix-precommit') ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request != null && contains(github.event.comment.body, '/fix-precommit'))
     runs-on: ubuntu-latest
 
     steps:
-      - name: Remove trigger label (so it can be re-applied next time)
+      - name: Get PR metadata and acknowledge
+        id: pr
         uses: actions/github-script@v7
         with:
           script: |
-            await github.rest.issues.removeLabel({
+            let pr;
+            if (context.eventName === 'issue_comment') {
+              const { data } = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.issue.number,
+              });
+              pr = data;
+              // React with 👀 to acknowledge the comment
+              await github.rest.reactions.createForIssueComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: context.payload.comment.id,
+                content: 'eyes',
+              }).catch(() => {});
+            } else {
+              pr = context.payload.pull_request;
+              // Remove label so it can be re-applied to trigger again
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                name: 'fix-precommit',
+              }).catch(() => {});
+            }
+            core.setOutput('pr_number', String(pr.number));
+            core.setOutput('head_ref',  pr.head.ref);
+            core.setOutput('base_sha',  pr.base.sha);
+            core.setOutput('is_fork',   String(pr.head.repo.full_name !== context.repo.full_name));
+
+      - name: Abort on fork PRs (cannot push)
+        if: steps.pr.outputs.is_fork == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: context.payload.pull_request.number,
-              name: 'fix-precommit',
-            }).catch(() => {});
+              issue_number: parseInt('${{ steps.pr.outputs.pr_number }}'),
+              body: [
+                '### ⚠️ `/fix-precommit` — fork PR detected',
+                '',
+                'Cannot auto-push to a forked repository. Please run pre-commit locally:',
+                '```bash',
+                'pip install pre-commit',
+                'pre-commit run --from-ref origin/main --to-ref HEAD',
+                '```',
+              ].join('\n'),
+            });
+            core.setFailed('Fork PR — skipping autofix');
 
       - name: Checkout PR branch
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.ref }}
+          ref: ${{ steps.pr.outputs.head_ref }}
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
 
@@ -44,7 +96,7 @@ jobs:
       - name: Run pre-commit (auto-fix pass)
         id: fix
         run: |
-          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          BASE_SHA="${{ steps.pr.outputs.base_sha }}"
 
           set +e
           pre-commit run --from-ref "$BASE_SHA" --to-ref HEAD 2>&1
@@ -73,7 +125,7 @@ jobs:
       - name: Run pre-commit (check pass)
         id: check
         run: |
-          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          BASE_SHA="${{ steps.pr.outputs.base_sha }}"
 
           set +e
           OUTPUT=$(pre-commit run --from-ref "$BASE_SHA" --to-ref HEAD 2>&1)
@@ -95,6 +147,7 @@ jobs:
             const changedFiles  = `${{ steps.fix.outputs.changed_files }}`;
             const exitCode      = parseInt('${{ steps.check.outputs.exit_code }}');
             const precommitOut  = `${{ steps.check.outputs.output }}`;
+            const prNumber      = parseInt('${{ steps.pr.outputs.pr_number }}');
 
             const lines = [];
 
@@ -126,6 +179,6 @@ jobs:
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: context.payload.pull_request.number,
+              issue_number: prNumber,
               body: lines.join('\n'),
             });
