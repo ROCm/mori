@@ -408,6 +408,19 @@ std::vector<bool> SSDTier::ReadBatchIntoPtr(const std::vector<std::string>& keys
   return results;
 }
 
+std::vector<bool> SSDTier::BatchWrite(const std::vector<std::string>& keys,
+                                      const std::vector<const void*>& data_ptrs,
+                                      const std::vector<size_t>& sizes) {
+  bool ok = WriteBatch(keys, data_ptrs, sizes);
+  return std::vector<bool>(keys.size(), ok);
+}
+
+std::vector<bool> SSDTier::BatchReadIntoPtr(const std::vector<std::string>& keys,
+                                            const std::vector<uintptr_t>& dst_ptrs,
+                                            const std::vector<size_t>& sizes) {
+  return ReadBatchIntoPtr(keys, dst_ptrs, sizes);
+}
+
 bool SSDTier::Exists(const std::string& key) const {
   std::lock_guard<std::mutex> lock(mu_);
   if (index_.HasKey(key)) return true;

@@ -1119,8 +1119,10 @@ inline __device__ void ShmemGetMemNbiThreadKernel<application::TransportType::P2
 }
 
 template <>
-inline __device__ void ShmemGetMemNbiWarpKernel<application::TransportType::P2P>(
-    void* dest, const void* source, size_t bytes, int pe, int qpId) {
+inline __device__ void ShmemGetMemNbiWarpKernel<application::TransportType::P2P>(void* dest,
+                                                                                 const void* source,
+                                                                                 size_t bytes,
+                                                                                 int pe, int qpId) {
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
 
   uintptr_t srcAddr = reinterpret_cast<uintptr_t>(source);

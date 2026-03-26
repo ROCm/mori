@@ -1,20 +1,18 @@
 if(WITH_MPI)
   find_package(MPI)
   if(NOT MPI_FOUND)
-    message(FATAL_ERROR
-      "MPI not found, but WITH_MPI=ON (enabled because BUILD_EXAMPLES=ON).\n"
-      "Please install MPI (e.g. 'apt install libopenmpi-dev') or disable examples with "
-      "'-DBUILD_EXAMPLES=OFF' / 'BUILD_EXAMPLES=OFF pip install .'")
+    message(
+      FATAL_ERROR
+        "MPI not found, but WITH_MPI=ON (enabled because BUILD_EXAMPLES=ON).\n"
+        "Please install MPI (e.g. 'apt install libopenmpi-dev') or disable examples with "
+        "'-DBUILD_EXAMPLES=OFF' / 'BUILD_EXAMPLES=OFF pip install .'")
   endif()
 endif()
 find_package(hsa-runtime64 REQUIRED)
 find_package(hsakmt REQUIRED)
-#find_library(IONIC_LIBRARY 
-#  NAMES ionic 
-#  HINTS /lib/x86_64-linux-gnu
-#  REQUIRED
-#)
-option(BUILD_TORCH_BOOTSTRAP "Build Torch process group bootstrap (requires PyTorch)" ON)
+# find_library(IONIC_LIBRARY NAMES ionic HINTS /lib/x86_64-linux-gnu REQUIRED )
+option(BUILD_TORCH_BOOTSTRAP
+       "Build Torch process group bootstrap (requires PyTorch)" ON)
 
 if(BUILD_TORCH_BOOTSTRAP)
   execute_process(
@@ -37,9 +35,8 @@ if(BUILD_TORCH_BOOTSTRAP)
   endif()
 endif()
 
-set(MORI_APP_SOURCES
-  bootstrap/socket_bootstrap.cpp
-  bootstrap/local_bootstrap.cpp)
+set(MORI_APP_SOURCES bootstrap/socket_bootstrap.cpp
+                     bootstrap/local_bootstrap.cpp)
 
 if(WITH_MPI)
   list(PREPEND MORI_APP_SOURCES bootstrap/mpi_bootstrap.cpp)
@@ -49,7 +46,9 @@ if(BUILD_TORCH_BOOTSTRAP)
   list(APPEND MORI_APP_SOURCES bootstrap/torch_bootstrap.cpp)
 endif()
 
-list(APPEND MORI_APP_SOURCES
+list(
+  APPEND
+  MORI_APP_SOURCES
   transport/rdma/rdma.cpp
   transport/rdma/providers/mlx5/mlx5.cpp
   transport/rdma/providers/bnxt/bnxt.cpp
@@ -76,34 +75,34 @@ find_library(ROCM_SMI_LIB rocm_smi64 HINTS /opt/rocm/lib REQUIRED)
 find_library(HSA_RUNTIME_LIB hsa-runtime64 HINTS /opt/rocm/lib REQUIRED)
 target_link_libraries(
   mori_application
-  PUBLIC
-  ibverbs
-  hip::host
-  mlx5
-  ${ROCM_SMI_LIB}
-  pci
-  mori_logging
-  ${HSA_RUNTIME_LIB}
-  hsakmt::hsakmt)
+  PUBLIC ibverbs
+         hip::host
+         mlx5
+         ${ROCM_SMI_LIB}
+         pci
+         mori_logging
+         ${HSA_RUNTIME_LIB}
+         hsakmt::hsakmt)
 
 if(WITH_MPI)
   target_compile_definitions(mori_application PUBLIC MORI_WITH_MPI)
   target_link_libraries(mori_application PUBLIC MPI::MPI_CXX)
 endif()
-#  ${IONIC_LIBRARY})
+# ${IONIC_LIBRARY})
 
 if(USE_BNXT)
   target_link_libraries(mori_application PUBLIC ${BNXT_RE_LIB})
 endif()
 
 if(USE_IONIC)
-	target_link_libraries(mori_application PUBLIC ${IONIC_LIB})
+  target_link_libraries(mori_application PUBLIC ${IONIC_LIB})
 endif()
 
 if(BUILD_TORCH_BOOTSTRAP)
   target_compile_definitions(mori_application PUBLIC MORI_HAS_TORCH)
   target_include_directories(mori_application PRIVATE ${TORCH_INCLUDE_DIRS})
-  target_link_libraries(mori_application PRIVATE c10 torch torch_cpu c10_hip torch_hip)
+  target_link_libraries(mori_application PRIVATE c10 torch torch_cpu c10_hip
+                                                 torch_hip)
   set_target_properties(
     mori_application
     PROPERTIES BUILD_RPATH "$ORIGIN;$ORIGIN/../torch/lib"

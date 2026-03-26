@@ -60,6 +60,12 @@ class SSDTier : public TierBackend {
   std::vector<bool> ReadBatchIntoPtr(const std::vector<std::string>& keys,
                                      const std::vector<uintptr_t>& dst_ptrs,
                                      const std::vector<size_t>& sizes) override;
+  std::vector<bool> BatchWrite(const std::vector<std::string>& keys,
+                               const std::vector<const void*>& data_ptrs,
+                               const std::vector<size_t>& sizes) override;
+  std::vector<bool> BatchReadIntoPtr(const std::vector<std::string>& keys,
+                                     const std::vector<uintptr_t>& dst_ptrs,
+                                     const std::vector<size_t>& sizes) override;
   bool Exists(const std::string& key) const override;
   bool Evict(const std::string& key) override;
   std::pair<size_t, size_t> Capacity() const override;

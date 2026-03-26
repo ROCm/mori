@@ -28,6 +28,52 @@ add_executable(test_ssd_tier test_ssd_tier.cpp)
 target_link_libraries(test_ssd_tier PRIVATE umbp_core)
 add_test(NAME test_ssd_tier COMMAND test_ssd_tier)
 
-# Benchmark (manual run only, not registered as a test)
-add_executable(bench_umbp bench_umbp.cpp)
-target_link_libraries(bench_umbp PRIVATE umbp_core)
+# Micro-benchmark (manual run only, not registered as a test)
+add_executable(bench_umbp_micro bench_umbp_micro.cpp)
+target_link_libraries(bench_umbp_micro PRIVATE umbp_core)
+
+# ---------------------------------------------------------------------------
+# Helper: symlink spdk_proxy next to a target so SpawnProxyDaemon() finds it
+# ---------------------------------------------------------------------------
+function(umbp_symlink_spdk_proxy target)
+  add_dependencies(${target} spdk_proxy)
+  add_custom_command(
+    TARGET ${target}
+    POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E create_symlink $<TARGET_FILE:spdk_proxy>
+            $<TARGET_FILE_DIR:${target}>/spdk_proxy
+    COMMENT "Symlink spdk_proxy next to ${target}")
+endfunction()
+
+# When spdk_proxy is available, symlink it next to targets that need it
+if(TARGET spdk_proxy)
+  umbp_symlink_spdk_proxy(bench_umbp_micro)
+
+  # SPDK test/benchmark targets (require SPDK libraries at link time)
+  add_executable(test_spdk_env test_spdk_env.cpp)
+  target_link_libraries(test_spdk_env PRIVATE umbp_core)
+
+  add_executable(test_spdk_ssd_tier test_spdk_ssd_tier.cpp)
+  target_link_libraries(test_spdk_ssd_tier PRIVATE umbp_core)
+
+  add_executable(bench_spdk_raw bench_spdk_raw.cpp)
+  target_link_libraries(bench_spdk_raw PRIVATE umbp_core)
+endif()
+
+# Unix-only targets (SHM IPC / fork-based, no SPDK dependency)
+if(UNIX)
+  add_executable(bench_proxy_ipc bench_proxy_ipc.cpp)
+  target_link_libraries(bench_proxy_ipc PRIVATE umbp_core)
+
+  add_executable(bench_umbp_e2e bench_umbp_e2e.cpp)
+  target_link_libraries(bench_umbp_e2e PRIVATE umbp_core)
+
+  add_executable(test_umbp_e2e test_umbp_e2e.cpp)
+  target_link_libraries(test_umbp_e2e PRIVATE umbp_core)
+
+  if(TARGET spdk_proxy)
+    umbp_symlink_spdk_proxy(bench_proxy_ipc)
+    umbp_symlink_spdk_proxy(bench_umbp_e2e)
+    umbp_symlink_spdk_proxy(test_umbp_e2e)
+  endif()
+endif()

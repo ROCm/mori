@@ -2738,18 +2738,18 @@ inline __device__ void ShmemGetMemNbiThreadKernelImpl(const application::SymmMem
     if constexpr (PrvdType == core::ProviderType::MLX5) {
       wq->outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter;
       dbr_val =
-          core::PostRead<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, is_leader,
-                                   qpn, destAddr, lkey, raddr, rkey, transfer_size);
+          core::PostRead<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, is_leader, qpn,
+                                   destAddr, lkey, raddr, rkey, transfer_size);
     } else if constexpr (PrvdType == core::ProviderType::BNXT) {
       wq->outstandingWqe[my_sq_counter % wq->sqWqeNum] = my_sq_counter;
       dbr_val =
-          core::PostRead<PrvdType>(*wq, my_sq_counter, my_msntbl_counter, my_psn_counter,
-                                   is_leader, qpn, destAddr, lkey, raddr, rkey, transfer_size);
+          core::PostRead<PrvdType>(*wq, my_sq_counter, my_msntbl_counter, my_psn_counter, is_leader,
+                                   qpn, destAddr, lkey, raddr, rkey, transfer_size);
     } else if constexpr (PrvdType == core::ProviderType::PSD) {
       wq->outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter;
       dbr_val =
-          core::PostRead<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, is_leader,
-                                   qpn, destAddr, lkey, raddr, rkey, transfer_size);
+          core::PostRead<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, is_leader, qpn,
+                                   destAddr, lkey, raddr, rkey, transfer_size);
     } else {
       static_assert(false);
     }
@@ -2953,18 +2953,18 @@ inline __device__ void ShmemGetMemNbiThreadKernelAddrImpl(void* dest, const void
     if constexpr (PrvdType == core::ProviderType::MLX5) {
       wq->outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter;
       dbr_val =
-          core::PostRead<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, is_leader,
-                                   qpn, destAddr, lkey, raddr, rkey, transfer_size);
+          core::PostRead<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, is_leader, qpn,
+                                   destAddr, lkey, raddr, rkey, transfer_size);
     } else if constexpr (PrvdType == core::ProviderType::BNXT) {
       wq->outstandingWqe[my_sq_counter % wq->sqWqeNum] = my_sq_counter;
       dbr_val =
-          core::PostRead<PrvdType>(*wq, my_sq_counter, my_msntbl_counter, my_psn_counter,
-                                   is_leader, qpn, destAddr, lkey, raddr, rkey, transfer_size);
+          core::PostRead<PrvdType>(*wq, my_sq_counter, my_msntbl_counter, my_psn_counter, is_leader,
+                                   qpn, destAddr, lkey, raddr, rkey, transfer_size);
     } else if constexpr (PrvdType == core::ProviderType::PSD) {
       wq->outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter;
       dbr_val =
-          core::PostRead<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, is_leader,
-                                   qpn, destAddr, lkey, raddr, rkey, transfer_size);
+          core::PostRead<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, is_leader, qpn,
+                                   destAddr, lkey, raddr, rkey, transfer_size);
     } else {
       static_assert(false);
     }

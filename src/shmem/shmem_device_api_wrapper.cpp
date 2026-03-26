@@ -42,7 +42,7 @@ __device__ __attribute__((visibility("default"))) int mori_shmem_quiet_thread_pe
 }
 
 __device__ __attribute__((visibility("default"))) int mori_shmem_quiet_thread_pe_qp(int pe,
-                                                                                     int qpId) {
+                                                                                    int qpId) {
   mori::shmem::ShmemQuietThread(pe, qpId);
   return 0;
 }
@@ -58,7 +58,7 @@ __device__ __attribute__((visibility("default"))) int mori_shmem_fence_thread_pe
 }
 
 __device__ __attribute__((visibility("default"))) int mori_shmem_fence_thread_pe_qp(int pe,
-                                                                                     int qpId) {
+                                                                                    int qpId) {
   mori::shmem::ShmemFenceThread(pe, qpId);
   return 0;
 }
@@ -109,8 +109,10 @@ __device__ __attribute__((visibility("default"))) int mori_shmem_put_double_nbi_
 // ============================================================================
 // PutNbi APIs - Warp Scope (Address-based only)
 // ============================================================================
-__device__ __attribute__((visibility("default"))) int mori_shmem_putmem_nbi_warp(
-    void* dest, const void* source, size_t bytes, int pe, int qpId) {
+__device__ __attribute__((visibility("default"))) int mori_shmem_putmem_nbi_warp(void* dest,
+                                                                                 const void* source,
+                                                                                 size_t bytes,
+                                                                                 int pe, int qpId) {
   mori::shmem::ShmemPutMemNbiWarp(dest, source, bytes, pe, qpId);
   return 0;
 }
@@ -208,8 +210,10 @@ __device__ __attribute__((visibility("default"))) int mori_shmem_get_double_nbi_
 // ============================================================================
 // GetNbi APIs - Warp Scope (Address-based only)
 // ============================================================================
-__device__ __attribute__((visibility("default"))) int mori_shmem_getmem_nbi_warp(
-    void* dest, const void* source, size_t bytes, int pe, int qpId) {
+__device__ __attribute__((visibility("default"))) int mori_shmem_getmem_nbi_warp(void* dest,
+                                                                                 const void* source,
+                                                                                 size_t bytes,
+                                                                                 int pe, int qpId) {
   mori::shmem::ShmemGetMemNbiWarp(dest, source, bytes, pe, qpId);
   return 0;
 }
@@ -274,8 +278,10 @@ __device__ __attribute__((visibility("default"))) int mori_shmem_get_double_nbi_
 // ============================================================================
 // Blocking GET APIs - Address-based only
 // ============================================================================
-__device__ __attribute__((visibility("default"))) int mori_shmem_getmem_thread(
-    void* dest, const void* source, size_t bytes, int pe, int qpId) {
+__device__ __attribute__((visibility("default"))) int mori_shmem_getmem_thread(void* dest,
+                                                                               const void* source,
+                                                                               size_t bytes, int pe,
+                                                                               int qpId) {
   mori::shmem::ShmemGetMemThread(dest, source, bytes, pe, qpId);
   return 0;
 }
@@ -304,8 +310,10 @@ __device__ __attribute__((visibility("default"))) int mori_shmem_get_double_thre
   return 0;
 }
 
-__device__ __attribute__((visibility("default"))) int mori_shmem_getmem_warp(
-    void* dest, const void* source, size_t bytes, int pe, int qpId) {
+__device__ __attribute__((visibility("default"))) int mori_shmem_getmem_warp(void* dest,
+                                                                             const void* source,
+                                                                             size_t bytes, int pe,
+                                                                             int qpId) {
   mori::shmem::ShmemGetMemWarp(dest, source, bytes, pe, qpId);
   return 0;
 }
@@ -322,8 +330,10 @@ __device__ __attribute__((visibility("default"))) int mori_shmem_get_uint64_warp
   return 0;
 }
 
-__device__ __attribute__((visibility("default"))) int mori_shmem_get_float_warp(
-    float* dest, const float* source, size_t nelems, int pe, int qpId) {
+__device__ __attribute__((visibility("default"))) int mori_shmem_get_float_warp(float* dest,
+                                                                                const float* source,
+                                                                                size_t nelems,
+                                                                                int pe, int qpId) {
   mori::shmem::ShmemGetFloatWarp(dest, source, nelems, pe, qpId);
   return 0;
 }
@@ -334,8 +344,10 @@ __device__ __attribute__((visibility("default"))) int mori_shmem_get_double_warp
   return 0;
 }
 
-__device__ __attribute__((visibility("default"))) int mori_shmem_getmem_block(
-    void* dest, const void* source, size_t bytes, int pe, int qpId) {
+__device__ __attribute__((visibility("default"))) int mori_shmem_getmem_block(void* dest,
+                                                                              const void* source,
+                                                                              size_t bytes, int pe,
+                                                                              int qpId) {
   mori::shmem::ShmemGetMemBlock(dest, source, bytes, pe, qpId);
   return 0;
 }
@@ -401,58 +413,58 @@ __device__ __attribute__((visibility("default"))) int mori_shmem_put_size_imm_nb
 }
 
 __device__ __attribute__((visibility("default"))) int mori_shmem_int_p(int* dest, int val, int pe,
-                                                                        int qpId) {
+                                                                       int qpId) {
   mori::shmem::ShmemPutTypeImmNbiThread<int>(dest, val, pe, qpId);
   return 0;
 }
 
 __device__ __attribute__((visibility("default"))) int mori_shmem_long_p(long* dest, long val,
-                                                                         int pe, int qpId) {
+                                                                        int pe, int qpId) {
   mori::shmem::ShmemPutTypeImmNbiThread<long>(dest, val, pe, qpId);
   return 0;
 }
 
 __device__ __attribute__((visibility("default"))) int mori_shmem_longlong_p(long long* dest,
-                                                                             long long val, int pe,
-                                                                             int qpId) {
+                                                                            long long val, int pe,
+                                                                            int qpId) {
   mori::shmem::ShmemPutTypeImmNbiThread<long long>(dest, val, pe, qpId);
   return 0;
 }
 
 __device__ __attribute__((visibility("default"))) int mori_shmem_float_p(float* dest, float val,
-                                                                          int pe, int qpId) {
+                                                                         int pe, int qpId) {
   mori::shmem::ShmemPutTypeImmNbiThread<float>(dest, val, pe, qpId);
   return 0;
 }
 
 __device__ __attribute__((visibility("default"))) int mori_shmem_double_p(double* dest, double val,
-                                                                           int pe, int qpId) {
+                                                                          int pe, int qpId) {
   mori::shmem::ShmemPutTypeImmNbiThread<double>(dest, val, pe, qpId);
   return 0;
 }
 
 __device__ __attribute__((visibility("default"))) int mori_shmem_char_p(char* dest, char val,
-                                                                         int pe, int qpId) {
+                                                                        int pe, int qpId) {
   mori::shmem::ShmemPutTypeImmNbiThread<char>(dest, val, pe, qpId);
   return 0;
 }
 
 __device__ __attribute__((visibility("default"))) int mori_shmem_short_p(short* dest, short val,
-                                                                          int pe, int qpId) {
+                                                                         int pe, int qpId) {
   mori::shmem::ShmemPutTypeImmNbiThread<short>(dest, val, pe, qpId);
   return 0;
 }
 
 __device__ __attribute__((visibility("default"))) int mori_shmem_uint_p(unsigned int* dest,
-                                                                         unsigned int val, int pe,
-                                                                         int qpId) {
+                                                                        unsigned int val, int pe,
+                                                                        int qpId) {
   mori::shmem::ShmemPutTypeImmNbiThread<unsigned int>(dest, val, pe, qpId);
   return 0;
 }
 
 __device__ __attribute__((visibility("default"))) int mori_shmem_ulong_p(unsigned long* dest,
-                                                                          unsigned long val, int pe,
-                                                                          int qpId) {
+                                                                         unsigned long val, int pe,
+                                                                         int qpId) {
   mori::shmem::ShmemPutTypeImmNbiThread<unsigned long>(dest, val, pe, qpId);
   return 0;
 }
@@ -464,43 +476,41 @@ __device__ __attribute__((visibility("default"))) int mori_shmem_ulonglong_p(
 }
 
 __device__ __attribute__((visibility("default"))) int mori_shmem_uchar_p(unsigned char* dest,
-                                                                          unsigned char val, int pe,
-                                                                          int qpId) {
+                                                                         unsigned char val, int pe,
+                                                                         int qpId) {
   mori::shmem::ShmemPutTypeImmNbiThread<unsigned char>(dest, val, pe, qpId);
   return 0;
 }
 
 __device__ __attribute__((visibility("default"))) int mori_shmem_ushort_p(unsigned short* dest,
-                                                                           unsigned short val,
-                                                                           int pe, int qpId) {
+                                                                          unsigned short val,
+                                                                          int pe, int qpId) {
   mori::shmem::ShmemPutTypeImmNbiThread<unsigned short>(dest, val, pe, qpId);
   return 0;
 }
 
-__device__ __attribute__((visibility("default"))) int mori_shmem_int32_p(int32_t* dest,
-                                                                          int32_t val, int pe,
-                                                                          int qpId) {
+__device__ __attribute__((visibility("default"))) int mori_shmem_int32_p(int32_t* dest, int32_t val,
+                                                                         int pe, int qpId) {
   mori::shmem::ShmemPutTypeImmNbiThread<int32_t>(dest, val, pe, qpId);
   return 0;
 }
 
-__device__ __attribute__((visibility("default"))) int mori_shmem_int64_p(int64_t* dest,
-                                                                          int64_t val, int pe,
-                                                                          int qpId) {
+__device__ __attribute__((visibility("default"))) int mori_shmem_int64_p(int64_t* dest, int64_t val,
+                                                                         int pe, int qpId) {
   mori::shmem::ShmemPutTypeImmNbiThread<int64_t>(dest, val, pe, qpId);
   return 0;
 }
 
 __device__ __attribute__((visibility("default"))) int mori_shmem_uint32_p(uint32_t* dest,
-                                                                           uint32_t val, int pe,
-                                                                           int qpId) {
+                                                                          uint32_t val, int pe,
+                                                                          int qpId) {
   mori::shmem::ShmemPutTypeImmNbiThread<uint32_t>(dest, val, pe, qpId);
   return 0;
 }
 
 __device__ __attribute__((visibility("default"))) int mori_shmem_uint64_p(uint64_t* dest,
-                                                                           uint64_t val, int pe,
-                                                                           int qpId) {
+                                                                          uint64_t val, int pe,
+                                                                          int qpId) {
   mori::shmem::ShmemPutTypeImmNbiThread<uint64_t>(dest, val, pe, qpId);
   return 0;
 }
@@ -643,8 +653,8 @@ mori_shmem_ptr_p2p(const uint64_t destPtr, const int myPe, int destPe) {
   return mori::shmem::ShmemPtrP2p(destPtr, myPe, destPe);
 }
 
-__device__ __attribute__((visibility("default"))) uint64_t
-mori_shmem_ptr(uint64_t dest, int destPe) {
+__device__ __attribute__((visibility("default"))) uint64_t mori_shmem_ptr(uint64_t dest,
+                                                                          int destPe) {
   int myPe = mori::shmem::ShmemMyPe();
   return mori::shmem::ShmemPtrP2p(dest, myPe, destPe);
 }

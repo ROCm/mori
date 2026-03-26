@@ -334,9 +334,8 @@ application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionDmabuf(
                                                                                 int dmabuf_fd,
                                                                                 int accessFlag) {
   int effectiveAccessFlag = MaybeAddRelaxedOrderingFlag(accessFlag);
-  ibv_mr* mr =
-      ibv_reg_dmabuf_mr(pd, 0, size, reinterpret_cast<uint64_t>(ptr), dmabuf_fd,
-                        effectiveAccessFlag);
+  ibv_mr* mr = ibv_reg_dmabuf_mr(pd, 0, size, reinterpret_cast<uint64_t>(ptr), dmabuf_fd,
+                                 effectiveAccessFlag);
   if (!mr) {
     MORI_APP_ERROR(
         "RegisterRdmaMemoryRegionDmabuf failed! addr:{}, size:{}, dmabuf_fd:{}, accessFlag:{}, "

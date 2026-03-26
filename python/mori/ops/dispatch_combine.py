@@ -62,18 +62,11 @@ def _current_stream():
     return torch.cuda.current_stream().cuda_stream
 
 
-def _opt_ptr(t):
-    """Extract data_ptr from an optional tensor, returning 0 for None/empty."""
-    if t is None:
-        return 0
-    if isinstance(t, torch.Tensor) and t.numel() == 0:
-        return 0
-    return t.data_ptr()
-
-
 @dataclass
 class EpDispatchCombineConfig:
-    data_type: torch.dtype
+    data_type: (
+        torch.dtype
+    )  # Deprecated for kernel launch (runtime dtype inferred from input tensor); retained for test/example compatibility
     rank: int
     world_size: int
     hidden_dim: int
@@ -345,12 +338,16 @@ class EpDispatchCombineOp:
         warp_per_block: int = -1,
     ):
         hidden_dim = input.size(1)
-        scale_ptr = _opt_ptr(scales)
-        has_scales = scale_ptr != 0 and self.config.scale_dim > 0
+        # Legacy pybind LaunchDispatch: weights optional -> ptr if tensor provided
+        # (including 0 rows); scales ptr and output iff has_value && scaleDim > 0.
+        weight_ptr = weights.data_ptr() if weights is not None else 0
+        has_scales = scales is not None and self.config.scale_dim > 0
+        scale_ptr = scales.data_ptr() if has_scales else 0
         actual_bn, actual_rbn, actual_wpb = self._resolve_launch_params(
             block_num, rdma_block_num, warp_per_block
         )
         stream = _current_stream()
+        self._dispatch_dtype = input.dtype
         sfx = _DTYPE_SUFFIX[input.dtype]
 
         args_ptr = mori_cpp.prepare_and_build_args(
@@ -358,7 +355,7 @@ class EpDispatchCombineOp:
             inp_ptr=input.data_ptr(),
             dtype=dtype_to_int(input.dtype),
             num_tokens=input.size(0),
-            weight_ptr=_opt_ptr(weights),
+            weight_ptr=weight_ptr,
             scale_ptr=scale_ptr,
             indices_ptr=indices.data_ptr(),
             rdma_block_num=actual_rbn,
@@ -478,7 +475,10 @@ class EpDispatchCombineOp:
     ):
         _, _, actual_wpb = self._resolve_launch_params(block_num, 0, warp_per_block)
         stream = _current_stream()
-        sfx = _DTYPE_SUFFIX[self.config.data_type]
+        assert hasattr(
+            self, "_dispatch_dtype"
+        ), "dispatch_recv requires a prior dispatch/dispatch_send call"
+        sfx = _DTYPE_SUFFIX[self._dispatch_dtype]
         kt = self.config.kernel_type.value
 
         args_ptr = mori_cpp.prepare_and_build_args(
@@ -523,11 +523,15 @@ class EpDispatchCombineOp:
         call_reset: bool = False,
     ):
         hidden_dim = input.size(1)
-        weight_ptr = _opt_ptr(weights)
+        # Legacy pybind LaunchCombine: weights ptr iff optional && size(0) != 0
+        weight_ptr = (
+            weights.data_ptr() if weights is not None and weights.size(0) != 0 else 0
+        )
         actual_bn, actual_rbn, actual_wpb = self._resolve_launch_params(
             block_num, rdma_block_num, warp_per_block
         )
         stream = _current_stream()
+        self._combine_dtype = input.dtype
         sfx = _DTYPE_SUFFIX[input.dtype]
 
         args_ptr = mori_cpp.prepare_and_build_args(
@@ -704,7 +708,10 @@ class EpDispatchCombineOp:
     ):
         _, _, actual_wpb = self._resolve_launch_params(block_num, 0, warp_per_block)
         stream = _current_stream()
-        sfx = _DTYPE_SUFFIX[self.config.data_type]
+        assert hasattr(
+            self, "_combine_dtype"
+        ), "combine_recv requires a prior combine/combine_send call"
+        sfx = _DTYPE_SUFFIX[self._combine_dtype]
         kt = self.config.kernel_type.value
 
         args_ptr = mori_cpp.prepare_and_build_args(
@@ -808,8 +815,12 @@ class EpDispatchCombineOp:
             inp_ptr=input.data_ptr(),
             dtype=dtype_to_int(input.dtype),
             num_tokens=input.size(0),
-            weight_ptr=_opt_ptr(weights),
-            scale_ptr=_opt_ptr(scales),
+            weight_ptr=(weights.data_ptr() if weights is not None else 0),
+            scale_ptr=(
+                scales.data_ptr()
+                if scales is not None and self.config.scale_dim > 0
+                else 0
+            ),
             indices_ptr=indices.data_ptr(),
             rdma_block_num=actual_rbn,
             hidden_dim=hidden_dim,
@@ -900,7 +911,11 @@ class EpDispatchCombineOp:
             inp_ptr=input.data_ptr(),
             dtype=dtype_to_int(input.dtype),
             num_tokens=self._get_cur_rank_num_token(self._handle),
-            weight_ptr=_opt_ptr(weights),
+            weight_ptr=(
+                weights.data_ptr()
+                if weights is not None and weights.size(0) != 0
+                else 0
+            ),
             scale_ptr=0,
             indices_ptr=indices.data_ptr(),
             rdma_block_num=actual_rbn,

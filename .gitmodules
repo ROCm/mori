@@ -5,3 +5,7 @@
 [submodule "3rdparty/spdlog"]
 	path = 3rdparty/spdlog
 	url = https://github.com/gabime/spdlog.git
+[submodule "3rdparty/spdk"]
+	path = 3rdparty/spdk
+	url = https://github.com/spdk/spdk.git
+	shallow = true

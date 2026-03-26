@@ -43,7 +43,7 @@ class XgmiBackendSession : public BackendSession {
  public:
   XgmiBackendSession() = default;
   XgmiBackendSession(const XgmiBackendConfig& config, void* localAddr, void* remoteAddr,
-                     int localDevice, int remoteDevice, StreamPool* streamPool,
+                     int localDevice, int remoteDevice, bool isIpcSession, StreamPool* streamPool,
                      EventPool* eventPool);
   ~XgmiBackendSession() = default;
 
@@ -62,6 +62,7 @@ class XgmiBackendSession : public BackendSession {
   void* remoteAddr{nullptr};
   int localDevice{-1};
   int remoteDevice{-1};
+  bool isIpcSession{false};
   StreamPool* streamPool{nullptr};
   EventPool* eventPool{nullptr};
 };
@@ -138,9 +139,21 @@ class XgmiBackend : public Backend {
     void* remappedAddr{nullptr};
     size_t size{0};
   };
+  struct IpcCacheKey {
+    MemoryUniqueId memId;
+    int deviceId;
+    bool operator==(const IpcCacheKey& o) const {
+      return memId == o.memId && deviceId == o.deviceId;
+    }
+  };
+  struct IpcCacheKeyHash {
+    std::size_t operator()(const IpcCacheKey& k) const noexcept {
+      return std::hash<uint64_t>()(k.memId) ^ (std::hash<int>()(k.deviceId) << 32);
+    }
+  };
   mutable std::shared_mutex ipcMutex;
   std::unordered_map<MemoryUniqueId, hipIpcMemHandle_t> localIpcHandles;
-  std::unordered_map<MemoryUniqueId, IpcHandleEntry> remoteIpcHandles;
+  std::unordered_map<IpcCacheKey, IpcHandleEntry, IpcCacheKeyHash> remoteIpcHandles;
 
   std::unordered_map<SessionCacheKey, std::unique_ptr<XgmiBackendSession>, SessionCacheKeyHash>
       sessionCache;

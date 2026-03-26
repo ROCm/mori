@@ -51,22 +51,28 @@ def mori_shmem_create_tensor(shape, dtype) -> torch.Tensor:
     torch.cuda.synchronize()
     buffer = MoriShmemBuffer(ptr, nbytes, dtype)
     # First create as uint8 tensor (byte array), then view as target dtype
-    tensor = torch.as_tensor(buffer, device='cuda').view(dtype).view(*shape)
+    tensor = torch.as_tensor(buffer, device="cuda").view(dtype).view(*shape)
     setattr(tensor, "__symm_tensor__", True)
     return tensor
 
+
 def symm_mori_shmem_tensor(tensor: torch.Tensor, peer: int) -> torch.Tensor:
 
-    assert getattr(tensor, "__symm_tensor__",
-                   False), "tensor is not a symm_tensor"
+    assert getattr(tensor, "__symm_tensor__", False), "tensor is not a symm_tensor"
 
     if peer == mori_shmem.shmem_mype():
         return tensor
 
     ptr = mori_shmem.shmem_ptr_p2p(tensor.data_ptr(), mori_shmem.shmem_mype(), peer)
     buffer = MoriShmemBuffer(ptr, tensor.nbytes, tensor.dtype)
-    return torch.as_tensor(buffer,
-                           device="cuda").view(tensor.dtype).view(tensor.shape)
+    return torch.as_tensor(buffer, device="cuda").view(tensor.dtype).view(tensor.shape)
+
+
+def mori_shmem_free_tensor(tensor: torch.Tensor):
+    assert getattr(tensor, "__symm_tensor__", False), "tensor is not a symm_tensor"
+    torch.cuda.synchronize()
+    mori_shmem.shmem_free(tensor.data_ptr())
+    torch.cuda.synchronize()
 
 
 def mori_shmem_create_tensor_list_intra_node(shape, dtype, num_ranks):

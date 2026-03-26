@@ -24,6 +24,7 @@ from .api import *
 _LAZY_ATTRS = {
     "MoriShmemBuffer": "tensor_utils",
     "mori_shmem_create_tensor": "tensor_utils",
+    "mori_shmem_free_tensor": "tensor_utils",
     "symm_mori_shmem_tensor": "tensor_utils",
     "mori_shmem_create_tensor_list_intra_node": "tensor_utils",
 }
