@@ -337,6 +337,7 @@ __global__ void SdmaReduceScatterKernel(
 // ============================================================================
 template <typename T>
 __global__ void AllGatherSdmaKernel(int myPe, int npes,
+                                    const application::SymmMemObjPtr srcMemObj,
                                     const application::SymmMemObjPtr dstMemObj,
                                     const application::SymmMemObjPtr flagsMemObj,
                                     CrossPeBarrier* __restrict__ barrier,
@@ -377,7 +378,7 @@ __global__ void AllGatherSdmaKernel(int myPe, int npes,
   const int laneId = threadIdx.x % warpSize;
 
   // --- SDMA put: send my reduced shard to every rank -------------------------
-  uint8_t* agSrcPtr = reinterpret_cast<uint8_t*>(dstMemObj->localPtr)
+  uint8_t* agSrcPtr = reinterpret_cast<uint8_t*>(srcMemObj->localPtr)
                       + static_cast<size_t>(myPe) * elementCountPerRank * bytesPerElement;
   size_t agSendBytes = elementCountPerRank * bytesPerElement;
 
