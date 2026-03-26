@@ -87,6 +87,7 @@ inline void EnablePeerAccess(int const deviceId, int const peerDeviceId)
 }
 #endif
 
+
 // HSA agents
 std::vector<hsa_agent_t> cpuAgents_;
 std::vector<hsa_agent_t> gpuAgents_;
@@ -232,6 +233,7 @@ SdmaQueue::~SdmaQueue() {
 SdmaQueueDeviceHandle* SdmaQueue::deviceHandle() const { return deviceHandle_; }
 
 AnvilLib::~AnvilLib() {
+  std::lock_guard<std::mutex> lock(mutex_);
   for (auto& p : sdma_channels_) {
     p.second.clear();
   }
@@ -265,36 +267,38 @@ void AnvilLib::init() {
 }
 
 bool AnvilLib::connect(int srcDeviceId, int dstDeviceId, int numChannels) {
+  std::lock_guard<std::mutex> lock(mutex_);
   uint32_t engineId = getSdmaEngineId(srcDeviceId, dstDeviceId);  // + 1) * 2;
-  // std::cout << "Connect from " << srcDeviceId << " to " << dstDeviceId << " with " << numChannels
-  //           << " channels using engine " << engineId << std::endl;
   for (int c = 0; c < numChannels; ++c) {
-    sdma_channels_[dstDeviceId].emplace_back(
+    sdma_channels_[getKey(srcDeviceId, dstDeviceId)].emplace_back(
         std::make_unique<SdmaQueue>(srcDeviceId, dstDeviceId, gpuAgents_[srcDeviceId], engineId));
   }
+  MORI_APP_INFO("Connect from {} to {} with {} channels using engine {} num channels {}", srcDeviceId, dstDeviceId,
+    numChannels, engineId, sdma_channels_.size());
+
   return true;
 }
 
 SdmaQueue* AnvilLib::getSdmaQueue(int srcDeviceId, int dstDeviceId, int channel_idx) {
-  if (sdma_channels_.find(dstDeviceId) == sdma_channels_.end()) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto key = getKey(srcDeviceId, dstDeviceId);
+  if (sdma_channels_.find(key) == sdma_channels_.end()) {
     return nullptr;
   }
 
-  if (!(channel_idx < sdma_channels_[dstDeviceId].size())) {
+  if (!(channel_idx < sdma_channels_[key].size())) {
     return nullptr;
   }
 
-  return sdma_channels_[dstDeviceId][channel_idx].get();  // TODO
+  return sdma_channels_[key][channel_idx].get();  // TODO
 }
 
 AnvilLib& AnvilLib::getInstance() {
+
   // Keep pre-SDMA-collective behavior: do not run ~AnvilLib during process teardown.
   // Worker exits can otherwise stall in ROCm/HSA shutdown ordering.
-  static AnvilLib* instance;
-  if (instance == nullptr) {
-    instance = new AnvilLib();
-  }
-  return *instance;
+  static AnvilLib instance;
+  return instance;
 }
 
 int AnvilLib::getOamId(int deviceId) {

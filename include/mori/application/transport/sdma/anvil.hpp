@@ -103,7 +103,11 @@ class AnvilLib {
   int getSdmaEngineId(int srcDeviceId, int dstDeviceId);
 
   std::once_flag init_flag;
-  std::unordered_map<int, std::vector<std::unique_ptr<SdmaQueue>>> sdma_channels_;
+  std::mutex mutex_;
+  uint64_t getKey(int A, int B) {
+    return static_cast<uint64_t>(A) << 32 | static_cast<uint64_t>(B);
+  }
+  std::unordered_map<uint64_t, std::vector<std::unique_ptr<SdmaQueue>>> sdma_channels_;
 };
 
 extern AnvilLib& anvil;
@@ -117,22 +121,7 @@ inline void checkHipError(hipError_t err, const char* msg, const char* file, int
 }
 
 #define CHECK_HIP_ERROR(cmd) anvil::checkHipError((cmd), #cmd, __FILE__, __LINE__)
-// Allow access to peerDeviceId from deviceId
-inline void EnablePeerAccess(int const deviceId, int const peerDeviceId) {
-  int canAccess;
-  CHECK_HIP_ERROR(hipDeviceCanAccessPeer(&canAccess, deviceId, peerDeviceId));
-  if (!canAccess) {
-    std::cerr << "Unable to enable peer access from GPU devices " << deviceId << " to "
-              << peerDeviceId << "\n";
-  }
 
-  CHECK_HIP_ERROR(hipSetDevice(deviceId));
-  hipError_t error = hipDeviceEnablePeerAccess(peerDeviceId, 0);
-  if (error != hipSuccess && error != hipErrorPeerAccessAlreadyEnabled) {
-    std::cerr << "Unable to enable peer to peer access from " << deviceId << "  to " << peerDeviceId
-              << " (" << hipGetErrorString(error) << ")\n";
-  }
-}
 inline int GetSdmaNumChannels(int defaultVal = 2) {
   const char* env = std::getenv("MORI_SDMA_NUM_CHANNELS");
   if (env != nullptr) {

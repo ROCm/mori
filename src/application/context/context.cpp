@@ -35,6 +35,7 @@
 
 #include "mori/application/transport/sdma/anvil.hpp"
 #include "mori/application/utils/check.hpp"
+#include "mori/utils/hip_helper.hpp"
 #include "mori/utils/env_utils.hpp"
 #include "mori/utils/mori_log.hpp"
 
@@ -81,8 +82,6 @@ std::string GetLocalIP() {
   return localIP;
 }
 
-std::string Context::HostName() const { return hostnames[LocalRank()]; }
-
 bool Context::CanUseP2P(int destRank) const {
   if (destRank == LocalRank()) {
     return false;  // Cannot use P2P with self
@@ -90,33 +89,54 @@ bool Context::CanUseP2P(int destRank) const {
   // Check if on the same node by comparing hostnames
   // Note: IsP2PDisabled only affects transport type selection (peerPtrs),
   // but we still maintain P2P data path in p2pPeerPtrs
-  return HostName() == hostnames[destRank];
+  return peerInfos[destRank].sameHost;
+}
+
+bool Context::SameProcessP2P(int destRank) const {
+  if (destRank == LocalRank()) {
+    return false;  // Cannot use P2P with self
+  }
+  // Check if on the same process by comparing pids, 
+  // if not on the same node, return false
+  return peerInfos[destRank].sameProcess;
 }
 
 void Context::CollectHostNames() {
   char hostname[HOST_NAME_MAX];
   gethostname(hostname, HOST_NAME_MAX);
+  std::string localIP = GetLocalIP();
 
-  // Keep node identity stable across ranks on the same machine.
-  // Using hostname+IP can split local ranks when different NICs are selected.
-  std::string hostIdentifier = std::string(hostname);
+  constexpr int PID_MAX = sizeof(pid_t);
+  constexpr int STRING_MAX = HOST_NAME_MAX + INET_ADDRSTRLEN;
+  constexpr int IDENTIFIER_MAX = PID_MAX + STRING_MAX;
 
-  constexpr int IDENTIFIER_MAX = HOST_NAME_MAX + INET_ADDRSTRLEN;
   std::vector<char> globalIdentifiers(IDENTIFIER_MAX * WorldSize());
   // Create a non-const buffer for Allgather
+  pid_t pid = getpid();
   char localBuffer[IDENTIFIER_MAX];
-  strncpy(localBuffer, hostIdentifier.c_str(), IDENTIFIER_MAX - 1);
-  localBuffer[IDENTIFIER_MAX - 1] = '\0';
+  memcpy(localBuffer, &pid, PID_MAX);
+  // Keep node identity stable across ranks on the same machine.
+  // Using hostname+IP can split local ranks when different NICs are selected.
+  //snprintf(localBuffer + PID_MAX, STRING_MAX, "%s:%s", hostname, localIP.c_str());
+  snprintf(localBuffer + PID_MAX, STRING_MAX, "%s", hostname);
   bootNet.Allgather(localBuffer, globalIdentifiers.data(), IDENTIFIER_MAX);
 
-  for (int i = 0; i < WorldSize(); i++) {
-    hostnames.push_back(&globalIdentifiers.data()[i * IDENTIFIER_MAX]);
+  auto pstr = globalIdentifiers.data();
+  std::vector< std::tuple<std::string, pid_t> > hostInfo(WorldSize());
+  for (auto& hostInfo : hostInfo) {
+    hostInfo = std::make_tuple(std::string(pstr + PID_MAX), 
+                               *reinterpret_cast<pid_t*>(pstr));
+    pstr += IDENTIFIER_MAX;
   }
-
-  if (LocalRank() == 0) {
-    MORI_APP_TRACE("Collected hostnames:");
-    for (int i = 0; i < hostnames.size(); i++) {
-      MORI_APP_TRACE("  rank {}: {}", i, hostnames[i]);
+  myHostname = std::get<0>(hostInfo[LocalRank()]);
+  peerInfos.resize(hostInfo.size());
+  for (int i = 0; i < hostInfo.size(); i++) {
+    const auto& [peerHost, peerPid] = hostInfo[i];
+    peerInfos[i].sameHost = peerHost == myHostname;
+    peerInfos[i].sameProcess = peerInfos[i].sameHost && (peerPid == pid);
+    if (LocalRank() == 0) {
+      MORI_APP_TRACE("Rank {} hostname={} pid={} sameHost={} sameProcess={}", 
+       i, peerHost, peerPid, peerInfos[i].sameHost, peerInfos[i].sameProcess);
     }
   }
 }
@@ -128,7 +148,7 @@ bool IsSDMAEnabled() { return env::IsEnvVarEnabled("MORI_ENABLE_SDMA"); }
 void Context::InitializePossibleTransports() {
   // Find my rank in node
   for (int i = 0; i <= LocalRank(); i++) {
-    if (HostName() == hostnames[i]) rankInNode++;
+    if (peerInfos[i].sameHost) rankInNode++;
   }
   assert(rankInNode < 8);
 
@@ -205,7 +225,7 @@ void Context::InitializePossibleTransports() {
   for (int i = 0; i < WorldSize(); i++) {
     // Check P2P availability
     if (!IsP2PDisabled()) {
-      if (HostName() == hostnames[i]) {
+      if (peerInfos[i].sameHost) {
         peerRankInNode++;
 
         // TODO: should use TopoSystemGpu to determine if peer access is enabled, but that requires
@@ -215,14 +235,14 @@ void Context::InitializePossibleTransports() {
         if ((i == LocalRank()) || canAccessPeer) {
           if (IsSDMAEnabled()) {
             if (i != LocalRank()) {
-              transportTypes.push_back(TransportType::SDMA);
-              anvil::EnablePeerAccess(LocalRank() % 8, i % 8);
-              // Better performance if allocating all 8 queues
-              anvil::anvil.connect(LocalRank() % 8, i % 8, sdmaNumChannels);
-            } else {
-              transportTypes.push_back(TransportType::SDMA);
-              anvil::anvil.connect(LocalRank() % 8, i % 8, sdmaNumChannels);
+              int localDeviceId = LocalRank() % 8;
+              if (!mori::MoriEnablePeerAccess(localDeviceId, i % 8)) {
+                MORI_APP_ERROR("Failed to enable peer access from device {} to {}", localDeviceId, i % 8);
+              }
             }
+            transportTypes.push_back(TransportType::SDMA);
+            // Better performance if allocating all 8 queues
+            anvil::anvil.connect(LocalRank() % 8, i % 8, sdmaNumChannels);
           } else {
             transportTypes.push_back(TransportType::P2P);
           }

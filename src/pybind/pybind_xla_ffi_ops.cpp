@@ -33,6 +33,8 @@
 #include "mori/ops/dispatch_combine/launch.hpp"
 #include "mori/ops/ops.hpp"
 #include "mori/shmem/internal.hpp"
+#include "mori/shmem/shmem_api.hpp"
+#include "mori/application/bootstrap/socket_bootstrap.hpp"
 #include "mori/utils/hip_helper.hpp"
 #include "src/pybind/mori.hpp"
 #include "xla/ffi/api/c_api.h"
@@ -66,17 +68,15 @@ struct VecI32Hash {
   }
 };
 
+using HandlesVec = std::vector<std::unique_ptr<EpDispatchCombineHandle>>;
+
 static std::mutex g_handle_cache_mu;
-static std::unordered_map<std::vector<int32_t>, std::unique_ptr<EpDispatchCombineHandle>,
-                          VecI32Hash>
+static std::unordered_map<std::vector<int32_t>, HandlesVec, VecI32Hash>
     g_handle_cache;
 
 struct EpDispatchCombineState {
   static TypeId id;
-
-  explicit EpDispatchCombineState(EpDispatchCombineHandle* h) : handle(h) {}
-
-  EpDispatchCombineHandle* handle = nullptr;
+  HandlesVec *handles = nullptr;
 };
 
 TypeId EpDispatchCombineState::id = {};
@@ -172,8 +172,9 @@ Error MoriDispatchImpl(hipStream_t stream, EpDispatchCombineHandle* h, Dictionar
            ByteWidth(scales.element_type()) == h->config.scaleTypeSize);
     scalesPtr = static_cast<uint8_t*>(scales.untyped_data());
   }
-  // XPUT("MoriDispatch h: %p, input=%d hiddenDim=%d weights=%p scales=%p",
-  //   h, (int)input.size_bytes(), hiddenDim, weightsPtr, scalesPtr);
+
+  // XPUT("MoriDispatch h: %p, input=%d topk_ids=%d hiddenDim: %d weights=%p scales=%p stream=%p",
+  //   h, (int)input.size_bytes(), (int)topk_ids.size_bytes(), hiddenDim, weightsPtr, scalesPtr, stream);
 
   mori::moe::LaunchDispatch(*h, input.untyped_data(), weightsPtr, scalesPtr, topk_ids.typed_data(),
                             input.dimensions()[0], FFIType2HipType(input.element_type()), block_num,
@@ -279,20 +280,32 @@ ErrorOr<std::unique_ptr<EpDispatchCombineState>> EpDispatchCombineInstantiate(
   // Use the packed config as cache key so all call sites with the same
   // ep_config share a single EpDispatchCombineHandle.
   std::vector<int32_t> key(ep_config->begin(), ep_config->end());
-
   std::lock_guard<std::mutex> lock(g_handle_cache_mu);
   auto& entry = g_handle_cache[key];
-  if (!entry) {
+#ifdef MORI_MULTITHREAD_SUPPORT
+  if (entry.empty()) {
+    auto cfg = EpDispatchCombineConfig::FromPackedI32Array(key.data(), key.size());
+    entry.resize(cfg.worldSize);
+  }
+  auto state = std::make_unique<EpDispatchCombineState>();
+  state->handles = &entry;
+  return state;
+#else
+  if (entry.empty()) {
     auto* states = mori::shmem::ShmemStatesSingleton::GetInstance();
     states->CheckStatusValid();
     states->bootStates->bootNet->Barrier();
 
     auto cfg = EpDispatchCombineConfig::FromPackedI32Array(key.data(), key.size());
-    // XPUT("EpDispatchCombineInstantiate: creating new handle for rank %d "
-    //      "(#attrs: %zu)", cfg.rank, attrs.size());
-    entry = std::make_unique<EpDispatchCombineHandle>(cfg);
+    XPUT("EpDispatchCombineInstantiate: creating new handle for rank %d "
+         "(#attrs: %zu)", cfg.rank, attrs.size());
+    entry.resize(1);
+    entry[0] = std::make_unique<EpDispatchCombineHandle>(cfg);
   }
-  return std::make_unique<EpDispatchCombineState>(entry.get());
+  auto state = std::make_unique<EpDispatchCombineState>(1);
+  state->handles = &entry;
+  return state;
+#endif // MORI_MULTITHREAD_SUPPORT
 } catch (const std::exception& e) {
   return ErrorOr<std::unique_ptr<EpDispatchCombineState>>(Error::Internal(e.what()));
 }
@@ -300,22 +313,59 @@ ErrorOr<std::unique_ptr<EpDispatchCombineState>> EpDispatchCombineInstantiate(
 XLA_FFI_DEFINE_HANDLER(EpDispatchCombineInstHandler, EpDispatchCombineInstantiate,
                        Ffi::BindInstantiate().Attrs());
 
+mori::application::UniqueId g_unique_id;
+std::atomic<int> g_unique_id_count = 0;
+
 Error EpDispatchCombineImpl(hipStream_t stream, EpDispatchCombineState* state, Dictionary attrs,
                             RemainingArgs args, RemainingRets rets) try {
-  auto& h = *state->handle;
+  int dev_id = 0;
+  if (XLA_FFI_PREDICT_FALSE(state->handles == nullptr)) {
+    return Error::Internal("handles is nullptr");
+  }
+  auto& handles = *state->handles;
+
+#ifdef MORI_MULTITHREAD_SUPPORT
+  HIP_RUNTIME_CHECK(hipGetDevice(&dev_id));
+  if (XLA_FFI_PREDICT_FALSE(handles[dev_id] == nullptr)) {
+    if (dev_id == 0) {
+      mori::shmem::mori_shmem_uniqueid_t uid;
+      mori::shmem::ShmemGetUniqueId(&uid);
+      std::memcpy(&g_unique_id, uid.data(), sizeof(g_unique_id));
+    }
+    auto ep_config = attrs.get<Span<const int32_t>>("ep_config");
+    auto cfg = EpDispatchCombineConfig::FromPackedI32Array(ep_config->begin(), 
+                                                           ep_config->size());
+    
+    g_unique_id_count++;
+    while (g_unique_id_count != cfg.worldSize) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    auto* bootstrap = new mori::application::SocketBootstrapNetwork(g_unique_id, dev_id, cfg.worldSize);
+    auto init_status = mori::shmem::ShmemInit(bootstrap);
+    if (init_status != 0) {
+      return Error::Internal("ShmemInit failed");
+    }
+    // NOTE: in multi-thread mode, the rank is the thread id
+    cfg.rank = dev_id;
+    handles[dev_id] = std::make_unique<EpDispatchCombineHandle>(cfg);
+    XPUT("EpDispatchCombineImpl: dev_id=%d state=%p handles=%p", dev_id, state, handles[dev_id].get());
+    //return Error::Success();
+  }
+#endif // MORI_MULTITHREAD_SUPPORT
+  auto h = handles[dev_id].get();
   // XPUT("EpDispatchCombineImpl stream=%p rank=%d  attrs: %zu",
   //     stream, h.config.rank, attrs.size());
   if (attrs.contains("dispatch_op")) {
-    return MoriDispatchImpl(stream, &h, attrs, args, rets);
+    return MoriDispatchImpl(stream, h, attrs, args, rets);
   }
   if (attrs.contains("combine_op")) {
-    return MoriCombineImpl(stream, &h, attrs, args, rets);
+    return MoriCombineImpl(stream, h, attrs, args, rets);
   }
   if (attrs.contains("reset_op")) {
-    return MoriResetImpl(stream, &h);
+    return MoriResetImpl(stream, h);
   }
   if (attrs.contains("get_src_token_id")) {
-    return GetDispatchSrcTokenId(stream, &h, rets);
+    return GetDispatchSrcTokenId(stream, h, rets);
   }
   return Error::Internal("Invalid operation type");
 } catch (const std::exception& e) {
