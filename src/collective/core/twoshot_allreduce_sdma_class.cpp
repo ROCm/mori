@@ -504,12 +504,17 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             }
         }
 
+        const bool multi_chunk = (chunk_elems < total_count);
         if (scatter_mode == 1) {
             PipelinedAllReduceSdmaKernel<T, 1><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input, output_transit_buffer_obj_, flagsObj_,
                 barrierPtr_, inputSymmObj, total_count, chunk_elems);
+        } else if (multi_chunk) {
+            PipelinedAllReduceSdmaKernel<T, 0, true><<<blocks, threads, 0, stream>>>(
+                myPe_, npes_, input, output_transit_buffer_obj_, flagsObj_,
+                barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems);
         } else {
-            PipelinedAllReduceSdmaKernel<T, 0><<<blocks, threads, 0, stream>>>(
+            PipelinedAllReduceSdmaKernel<T, 0, false><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input, output_transit_buffer_obj_, flagsObj_,
                 barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems);
         }

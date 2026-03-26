@@ -39,7 +39,7 @@ namespace collective {
 static_assert(kMaxPipelineBlocks <= 385,
               "compute block count must fit in grid launch");
 
-template <typename T, int SCATTER_MODE = 0>
+template <typename T, int SCATTER_MODE = 0, bool MULTI_CHUNK = false>
 __global__ void PipelinedAllReduceSdmaKernel(
     int myPe, int npes,
     const T* __restrict__ input,
@@ -176,7 +176,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
         // Each compute block reads a strided portion of every remote PE's
         // reduced shard via inbound XGMI, while SDMA scatter continues on
         // outbound XGMI (true bidirectional overlap with scatter(c+1)).
-        if (numChunks > 1) {
+        if constexpr (MULTI_CHUNK) {
           if (threadIdx.x == 0) {
             const uint32_t agTarget = static_cast<uint32_t>(c + 1);
             while (__scoped_atomic_load_n(
@@ -241,7 +241,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
       }
 
       // ---- Phase 2+3: dual-mode AG ----
-      if (numChunks > 1) {
+      if constexpr (MULTI_CHUNK) {
         // Multi-chunk: q2/rd handshake per chunk, then signal ag_gate so
         // compute blocks can start CU P2P Read AG (inbound XGMI).
         const bool active = (thr < npes && thr != myPe);
