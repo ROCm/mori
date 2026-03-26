@@ -492,8 +492,6 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         }
 
         const bool multi_chunk = (chunk_elems < total_count);
-        const bool sdma_d2d =
-            (scatter_mode == 0 && !multi_chunk && copy_output_to_user_);
 
         if (scatter_mode == 1) {
             PipelinedAllReduceSdmaKernel<T, 1><<<blocks, threads, 0, stream>>>(
@@ -519,19 +517,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             return false;
         }
 
-        if (sdma_d2d) {
-            size_t copyBytes = total_count * dtype_size_;
-            SdmaD2DCopyKernel<<<1, 1, 0, stream>>>(
-                output_transit_buffer_obj_,
-                reinterpret_cast<void*>(output),
-                copyBytes, myPe_);
-            err = hipGetLastError();
-            if (err != hipSuccess) {
-                fprintf(stderr, "PE %d: SdmaD2DCopyKernel launch failed: %s\n",
-                        myPe_, hipGetErrorString(err));
-                return false;
-            }
-        } else if (copy_output_to_user_) {
+        if (copy_output_to_user_) {
             copy_output_to_user(output, total_count, stream);
         }
     } catch (const std::exception& e) {

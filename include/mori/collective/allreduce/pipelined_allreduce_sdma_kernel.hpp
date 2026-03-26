@@ -5,8 +5,7 @@
 //
 // SCATTER_MODE=0: Single-kernel AllReduce (SDMA scatter + reduce + SDMA AG)
 //   1-chunk mode (all practical sizes up to ~1 TB/PE):
-//     Block 0: burst scatter → cc wait → SDMA AG push → AG wait
-//              → [COPY_OUTPUT] SDMA D2D copy transit→output → signal wait.
+//     Block 0: burst scatter → cc wait → SDMA AG push → AG wait.
 //     Compute blocks: scatter-poll → reduce → wbl2+fence → chunks_complete.
 //     No q2/rd handshake: AG SDMA transfer time ≫ remote reduce time.
 //     No signal/barrier zeroing: monotonic ATOMIC_INC + baseline protocol.
@@ -35,27 +34,8 @@ namespace collective {
 static_assert(kMaxPipelineBlocks <= 385,
               "compute block count must fit in grid launch");
 
-// Separate kernel for SDMA D2D copy (transit → user output).
-// Launched after the main AllReduce kernel in the same stream.
-__global__ void SdmaD2DCopyKernel(
-    const application::SymmMemObjPtr memObj,
-    void* dst, size_t bytes, int myPe) {
-  if (threadIdx.x != 0) return;
-  const uint32_t numQ = memObj->sdmaNumQueue;
-  anvil::SdmaQueueDeviceHandle** selfDh =
-      memObj->deviceHandles_d + static_cast<size_t>(myPe) * numQ;
-  HSAuint64* sigBase = memObj->signalPtrs
-      + static_cast<size_t>(myPe) * numQ;
-  uint64_t baseline = core::AtomicLoadRelaxed(sigBase + 2);
-  core::SdmaPutThread(memObj->localPtr, dst, bytes,
-                       selfDh, sigBase, numQ, 2);
-  while (core::AtomicLoadRelaxed(sigBase + 2) < baseline + 1ULL)
-    ;
-}
-
 template <typename T, int SCATTER_MODE = 0, bool MULTI_CHUNK = false>
-__global__ void __launch_bounds__(512, 2)
-PipelinedAllReduceSdmaKernel(
+__global__ void PipelinedAllReduceSdmaKernel(
     int myPe, int npes,
     const T* __restrict__ input,
     const application::SymmMemObjPtr dstMemObj,
