@@ -560,8 +560,26 @@ bool SocketBootstrapNetwork::ConnectSocket(Socket& sock, const SocketAddress& ad
   return true;
 }
 
-bool SocketBootstrapNetwork::AcceptSocket(Socket& listen_sock, Socket& client_sock) {
+bool SocketBootstrapNetwork::AcceptSocket(Socket& listen_sock, Socket& client_sock,
+                                          int timeout_ms) {
   if (listen_sock.state != SocketStateListening) return false;
+
+  // Use poll() to enforce a timeout so callers never block indefinitely.
+  // A timeout_ms <= 0 means wait forever (original behaviour), but all
+  // internal callers should pass a positive value.
+  if (timeout_ms > 0) {
+    struct pollfd pfd;
+    pfd.fd = listen_sock.fd;
+    pfd.events = POLLIN;
+    int ret = poll(&pfd, 1, timeout_ms);
+    if (ret <= 0) {
+      // timeout (0) or error (-1)
+      if (ret == 0) {
+        MORI_APP_ERROR("AcceptSocket timed out after {} ms", timeout_ms);
+      }
+      return false;
+    }
+  }
 
   socklen_t addr_len;
   while (true) {
@@ -644,12 +662,19 @@ bool SocketBootstrapNetwork::SetupCommunicationRing() {
   // Setup ring connections
   int next_rank = (localRank + 1) % worldSize;
 
-  constexpr int kRingMaxRetries = 10;
-  constexpr int kRingRetryDelayMs = 100;
+  // Allow up to 30 s total for the ring connect (50 retries × 200 ms back-off
+  // after the first immediate attempt).
+  constexpr int kRingMaxRetries = 50;
+  constexpr int kRingRetryDelayMs = 200;
 
   // Connect to next rank in ring (with retries)
   bool ring_connected = false;
   for (int retry = 0; retry < kRingMaxRetries; retry++) {
+    // Try immediately on the first attempt; sleep only after a failure.
+    if (retry > 0) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(kRingRetryDelayMs));
+    }
+
     if (!InitializeSocket(ring_send_socket_)) {
       return false;
     }
@@ -660,7 +685,8 @@ bool SocketBootstrapNetwork::SetupCommunicationRing() {
     }
 
     CloseSocket(ring_send_socket_);
-    std::this_thread::sleep_for(std::chrono::milliseconds(kRingRetryDelayMs));
+    MORI_APP_TRACE("Rank {} retrying ring connect to rank {} ({}/{})", localRank, next_rank,
+                   retry + 1, kRingMaxRetries);
   }
 
   if (!ring_connected) {
@@ -669,8 +695,10 @@ bool SocketBootstrapNetwork::SetupCommunicationRing() {
     return false;
   }
 
-  // Accept connection from previous rank
-  if (!AcceptSocket(listen_socket_, ring_recv_socket_)) {
+  // Accept connection from previous rank. Use a 30 s timeout so that if the
+  // previous rank's connect loop exhausts its retries we don't hang forever.
+  constexpr int kRingAcceptTimeoutMs = 30000;
+  if (!AcceptSocket(listen_socket_, ring_recv_socket_, kRingAcceptTimeoutMs)) {
     int prev_rank = (localRank - 1 + worldSize) % worldSize;
     MORI_APP_ERROR("Rank {}: failed to accept ring connection from rank {} (errno={})", localRank,
                    prev_rank, errno);
@@ -713,10 +741,15 @@ bool SocketBootstrapNetwork::PhoneHomeProtocol() {
     // Keep client sockets open to avoid race condition
     std::vector<Socket> client_sockets(worldSize);
 
+    // 30 s per-rank accept timeout: non-root ranks may start connecting after
+    // up to kConnectMaxRetries × kConnectRetryDelayMs = ~10 s, so 30 s gives
+    // plenty of headroom while still preventing an infinite hang.
+    constexpr int kPhoneHomeAcceptTimeoutMs = 30000;
+
     // Collect from other ranks - keep sockets open
     for (int i = 1; i < worldSize; i++) {
       Socket client_sock;
-      if (!AcceptSocket(root_listen_socket, client_sock)) {
+      if (!AcceptSocket(root_listen_socket, client_sock, kPhoneHomeAcceptTimeoutMs)) {
         CloseSocket(root_listen_socket);
         // Close any previously accepted sockets
         for (int j = 1; j < i; j++) {
@@ -783,13 +816,19 @@ bool SocketBootstrapNetwork::PhoneHomeProtocol() {
     SocketAddress root_addr;
     ExtractAddressFromUniqueId(unique_id_, root_addr);
 
-    constexpr int kConnectMaxRetries = 10;
-    constexpr int kConnectRetryDelayMs = 100;
+    // Allow up to 30 s total: 50 retries × 200 ms back-off after the first
+    // immediate attempt.  The very first attempt is made without any sleep so
+    // that a fast-starting root is reached immediately.
+    constexpr int kConnectMaxRetries = 50;
+    constexpr int kConnectRetryDelayMs = 200;
 
     Socket sock;
     bool connected = false;
     for (int retry = 0; retry < kConnectMaxRetries; retry++) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(kConnectRetryDelayMs));
+      // Sleep only after a failed attempt, not before the first try.
+      if (retry > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(kConnectRetryDelayMs));
+      }
 
       if (!InitializeSocket(sock)) {
         return false;
