@@ -322,9 +322,6 @@ PipelinedAllReduceSdmaKernel(
         }
 
         if constexpr (COPY_OUTPUT) {
-          // SDMA D2D copy: transit → user output (self-PE queue 2).
-          // __launch_bounds__(512,2) guarantees enough occupancy for all
-          // 385 blocks even with the extra VGPR from this code path.
           __syncthreads();
           if (threadIdx.x == 0) {
             const size_t copyBytes = elementCount * bytesPerElement;
@@ -332,14 +329,28 @@ PipelinedAllReduceSdmaKernel(
                 dstMemObj->deviceHandles_d + static_cast<size_t>(myPe) * numQ;
             HSAuint64* copySigBase = dstMemObj->signalPtrs
                 + static_cast<size_t>(myPe) * numQ;
+            printf("PE%d: D2D copy start  bytes=%zu numQ=%u sig_base=%llu handle=%p\n",
+                   myPe, copyBytes, numQ, (unsigned long long)s_copy_sig_base,
+                   (void*)*(selfDh + 2));
             core::SdmaPutThread(
                 dstMemObj->localPtr,
                 reinterpret_cast<void*>(output),
                 copyBytes,
                 selfDh, copySigBase, numQ, 2);
+            printf("PE%d: D2D submitted, polling sig[%zu] cur=%llu want=%llu\n",
+                   myPe,
+                   static_cast<size_t>(myPe) * numQ + 2,
+                   (unsigned long long)core::AtomicLoadRelaxed(copySigBase + 2),
+                   (unsigned long long)(s_copy_sig_base + 1ULL));
+            int polls = 0;
             while (core::AtomicLoadRelaxed(copySigBase + 2)
-                   < s_copy_sig_base + 1ULL)
-              ;
+                   < s_copy_sig_base + 1ULL) {
+              if (++polls % 100000000 == 0)
+                printf("PE%d: D2D still waiting  polls=%d sig=%llu\n",
+                       myPe, polls,
+                       (unsigned long long)core::AtomicLoadRelaxed(copySigBase + 2));
+            }
+            printf("PE%d: D2D copy done\n", myPe);
           }
         }
       }

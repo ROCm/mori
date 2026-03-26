@@ -492,9 +492,8 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         }
 
         const bool multi_chunk = (chunk_elems < total_count);
-        // DISABLED: isolate whether __launch_bounds__ alone causes hang
-        const bool kernel_copies = false;
-        (void)(copy_output_to_user_);
+        const bool kernel_copies =
+            (scatter_mode == 0 && !multi_chunk && copy_output_to_user_);
 
         if (scatter_mode == 1) {
             PipelinedAllReduceSdmaKernel<T, 1><<<blocks, threads, 0, stream>>>(
