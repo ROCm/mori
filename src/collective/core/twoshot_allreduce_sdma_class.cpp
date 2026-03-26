@@ -492,27 +492,22 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         }
 
         const bool multi_chunk = (chunk_elems < total_count);
-        const bool kernel_copies =
+        const bool sdma_d2d =
             (scatter_mode == 0 && !multi_chunk && copy_output_to_user_);
 
         if (scatter_mode == 1) {
             PipelinedAllReduceSdmaKernel<T, 1><<<blocks, threads, 0, stream>>>(
-                myPe_, npes_, input, static_cast<T*>(nullptr),
+                myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
                 barrierPtr_, inputSymmObj, total_count, chunk_elems);
         } else if (multi_chunk) {
             PipelinedAllReduceSdmaKernel<T, 0, true><<<blocks, threads, 0, stream>>>(
-                myPe_, npes_, input, static_cast<T*>(nullptr),
-                output_transit_buffer_obj_, flagsObj_,
-                barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems);
-        } else if (kernel_copies) {
-            PipelinedAllReduceSdmaKernel<T, 0, false, true><<<blocks, threads, 0, stream>>>(
-                myPe_, npes_, input, output,
+                myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
                 barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems);
         } else {
-            PipelinedAllReduceSdmaKernel<T, 0, false, false><<<blocks, threads, 0, stream>>>(
-                myPe_, npes_, input, static_cast<T*>(nullptr),
+            PipelinedAllReduceSdmaKernel<T, 0, false><<<blocks, threads, 0, stream>>>(
+                myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
                 barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems);
         }
@@ -524,8 +519,19 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             return false;
         }
 
-        // DIAG: always copy — noinline D2D is no-op for this test
-        if (copy_output_to_user_) {
+        if (sdma_d2d) {
+            size_t copyBytes = total_count * dtype_size_;
+            SdmaD2DCopyKernel<<<1, 1, 0, stream>>>(
+                output_transit_buffer_obj_,
+                reinterpret_cast<void*>(output),
+                copyBytes, myPe_);
+            err = hipGetLastError();
+            if (err != hipSuccess) {
+                fprintf(stderr, "PE %d: SdmaD2DCopyKernel launch failed: %s\n",
+                        myPe_, hipGetErrorString(err));
+                return false;
+            }
+        } else if (copy_output_to_user_) {
             copy_output_to_user(output, total_count, stream);
         }
     } catch (const std::exception& e) {

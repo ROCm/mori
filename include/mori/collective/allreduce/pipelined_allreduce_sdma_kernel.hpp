@@ -35,26 +35,29 @@ namespace collective {
 static_assert(kMaxPipelineBlocks <= 385,
               "compute block count must fit in grid launch");
 
-// Non-inlined D2D copy helper — keeps SdmaPutThread's VGPR cost out of the
-// main kernel's register budget, preventing occupancy-induced deadlocks.
-__attribute__((noinline)) __device__
-void PipelinedD2DCopy(
-    void* src, void* dst, size_t bytes,
-    anvil::SdmaQueueDeviceHandle** selfDh,
-    HSAuint64* copySigBase,
-    uint32_t numQ,
-    uint64_t sigBaseline) {
-  // DIAG: submit only, no signal wait — test if SdmaPutThread itself hangs
-  core::SdmaPutThread(src, dst, bytes, selfDh, copySigBase, numQ, 2);
+// Separate kernel for SDMA D2D copy (transit → user output).
+// Launched after the main AllReduce kernel in the same stream.
+__global__ void SdmaD2DCopyKernel(
+    const application::SymmMemObjPtr memObj,
+    void* dst, size_t bytes, int myPe) {
+  if (threadIdx.x != 0) return;
+  const uint32_t numQ = memObj->sdmaNumQueue;
+  anvil::SdmaQueueDeviceHandle** selfDh =
+      memObj->deviceHandles_d + static_cast<size_t>(myPe) * numQ;
+  HSAuint64* sigBase = memObj->signalPtrs
+      + static_cast<size_t>(myPe) * numQ;
+  uint64_t baseline = core::AtomicLoadRelaxed(sigBase + 2);
+  core::SdmaPutThread(memObj->localPtr, dst, bytes,
+                       selfDh, sigBase, numQ, 2);
+  while (core::AtomicLoadRelaxed(sigBase + 2) < baseline + 1ULL)
+    ;
 }
 
-template <typename T, int SCATTER_MODE = 0, bool MULTI_CHUNK = false,
-          bool COPY_OUTPUT = false>
+template <typename T, int SCATTER_MODE = 0, bool MULTI_CHUNK = false>
 __global__ void __launch_bounds__(512, 2)
 PipelinedAllReduceSdmaKernel(
     int myPe, int npes,
     const T* __restrict__ input,
-    T* __restrict__ output,
     const application::SymmMemObjPtr dstMemObj,
     const application::SymmMemObjPtr flagsMemObj,
     CrossPeBarrier* __restrict__ barrier,
@@ -92,7 +95,6 @@ PipelinedAllReduceSdmaKernel(
   __shared__ uint64_t s_ag_by_sender[64];
   __shared__ uint64_t s_rd_by_sender[64];
   __shared__ uint32_t s_cc_base;
-  __shared__ uint64_t s_copy_sig_base;
 
   if (threadIdx.x == 0) {
     s_cc_base = (blockIdx.x == 0)
@@ -111,12 +113,6 @@ PipelinedAllReduceSdmaKernel(
           s_rd_by_sender[s] =
               core::AtomicLoadRelaxed(dstMemObj->signalPtrs + row + 2);
         }
-      }
-    }
-    if constexpr (COPY_OUTPUT) {
-      if (blockIdx.x == 0) {
-        s_copy_sig_base = core::AtomicLoadRelaxed(
-            dstMemObj->signalPtrs + static_cast<size_t>(myPe) * numQ + 2);
       }
     }
   }
@@ -334,21 +330,6 @@ PipelinedAllReduceSdmaKernel(
             ;
         }
 
-        if constexpr (COPY_OUTPUT) {
-          __syncthreads();
-          if (threadIdx.x == 0) {
-            const size_t copyBytes = elementCount * bytesPerElement;
-            anvil::SdmaQueueDeviceHandle** selfDh =
-                dstMemObj->deviceHandles_d + static_cast<size_t>(myPe) * numQ;
-            HSAuint64* copySigBase = dstMemObj->signalPtrs
-                + static_cast<size_t>(myPe) * numQ;
-            PipelinedD2DCopy(
-                dstMemObj->localPtr,
-                reinterpret_cast<void*>(output),
-                copyBytes, selfDh, copySigBase, numQ,
-                s_copy_sig_base);
-          }
-        }
       }
 
     }  // end block 0 vs compute
