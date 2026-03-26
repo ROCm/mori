@@ -86,7 +86,7 @@ class CMakeBuild(build_ext):
         build_type = os.environ.get("CMAKE_BUILD_TYPE", "Release")
         unroll_value = os.environ.get("WARP_ACCUM_UNROLL", "1")
         use_bnxt = os.environ.get("USE_BNXT", "OFF")
-        build_shmem_device_wrapper = os.environ.get("BUILD_SHMEM_DEVICE_WRAPPER", "ON")
+        build_shmem_device_wrapper = os.environ.get("BUILD_SHMEM_DEVICE_WRAPPER", "OFF")
         use_ionic = os.environ.get("USE_IONIC", "OFF")
         enable_profiler = os.environ.get("ENABLE_PROFILER", "OFF")
         enable_debug_printf = os.environ.get("ENABLE_DEBUG_PRINTF", "OFF")
