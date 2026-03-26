@@ -356,11 +356,17 @@ __global__ void AllGatherSdmaKernel(int myPe, int npes,
   }
 
   const size_t bytesPerElement = sizeof(T);
-  uint64_t* __restrict__ flags = reinterpret_cast<uint64_t*>(flagsMemObj->localPtr);
+  (void)flagsMemObj;
+
+  // IMPORTANT: RS scatter waits on q0. AG must use a different queue-id and
+  // its own generation counter; otherwise AG completion may satisfy RS waits
+  // and cause stale-shard over-counts.
+  constexpr uint32_t kAgQid = 1;
   __shared__ uint64_t ag_token;
   if (threadIdx.x == 0) {
-    ag_token = static_cast<uint64_t>(barrier->flag) + 1ULL;
-    barrier->flag = static_cast<uint32_t>(ag_token);
+    uint32_t g = __scoped_atomic_fetch_add(&barrier->ag_sync, 1u,
+                                           __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE) + 1u;
+    ag_token = static_cast<uint64_t>(g);
   }
   __syncthreads();
   uint64_t flag_val = ag_token;
@@ -391,18 +397,18 @@ __global__ void AllGatherSdmaKernel(int myPe, int npes,
 
       core::SdmaPutThread(agSrcPtr, agDstPtr, agSendBytes,
                           devicehandles, remoteSignal,
-                          dest->sdmaNumQueue, 0);
+                          dest->sdmaNumQueue, kAgQid);
     }
   }
   __syncthreads();
 
   // --- Wait for all peers to finish AllGather --------------------------------
-  // Remote PEs wrote to our local signalPtrs[sender * numQueues + 0]
+  // Remote PEs wrote to our local signalPtrs[sender * numQueues + kAgQid]
   for (int sender = 0; sender < npes; ++sender) {
     if (sender == myPe) continue;
     if (threadLinearId == 0) {
       HSAuint64* mySignal = dstMemObj->signalPtrs
-                            + static_cast<size_t>(sender) * dstMemObj->sdmaNumQueue;
+                            + static_cast<size_t>(sender) * dstMemObj->sdmaNumQueue + kAgQid;
       int spinCount = 0;
       bool warned = false;
       while (core::AtomicLoadRelaxed(mySignal) < flag_val) {
