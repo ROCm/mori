@@ -432,9 +432,13 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                 // Auto-select chunk count for the 3-stage pipeline
                 // scatter(i) | reduce(i-1) | AG(i-2).
                 // Target 4 chunks: fills the 3-deep pipeline + 1 steady-state step.
-                // Guard: each per-PE shard must be >= 512 KB to amortise
-                // per-chunk SDMA packet / signal / syncthreads overhead.
-                constexpr size_t kMinShardBytes = 512ULL * 1024;
+                // Guard: each chunk's per-PE shard must be >= 4 MB so that the
+                // per-chunk sync overhead (~15-25us × extra iterations) is
+                // amortised by the SDMA transfer time.  SDMA scatter and AG
+                // share XGMI link bandwidth, so the only overlap gain is CU
+                // reduce vs SDMA transfer (~8% of total); too many small chunks
+                // erase that gain.
+                constexpr size_t kMinShardBytes = 4ULL * 1024 * 1024;
                 constexpr int    kTargetChunks  = 4;
                 const size_t shard_bytes =
                     (total_count / npes_) * dtype_size_;
