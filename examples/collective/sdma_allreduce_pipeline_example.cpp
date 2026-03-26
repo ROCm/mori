@@ -137,15 +137,20 @@ static void sweepPrintf(std::vector<std::string>* lines, const char* fmt, ...) {
 
 void testPipelinedAllreduce() {
     MPI_Init(NULL, NULL);
-    int status = ShmemMpiInit(MPI_COMM_WORLD);
-    assert(!status);
 
     int nGpu = 0;
     CHECK_HIP(hipGetDeviceCount(&nGpu));
     if (nGpu > 0) {
-        int myPeBind = ShmemMyPe();
-        CHECK_HIP(hipSetDevice(myPeBind % nGpu));
+        MPI_Comm localComm;
+        int localRank = 0;
+        MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &localComm);
+        MPI_Comm_rank(localComm, &localRank);
+        CHECK_HIP(hipSetDevice(localRank % nGpu));
+        MPI_Comm_free(&localComm);
     }
+
+    int status = ShmemMpiInit(MPI_COMM_WORLD);
+    assert(!status);
 
     int myPe = ShmemMyPe();
     int npes = ShmemNPes();

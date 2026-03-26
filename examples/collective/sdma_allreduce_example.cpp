@@ -143,6 +143,18 @@ void testAllreduceSdma() {
     int status;
 
     MPI_Init(NULL, NULL);
+
+    int nGpu = 0;
+    CHECK_HIP(hipGetDeviceCount(&nGpu));
+    if (nGpu > 0) {
+        MPI_Comm localComm;
+        int localRank = 0;
+        MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &localComm);
+        MPI_Comm_rank(localComm, &localRank);
+        CHECK_HIP(hipSetDevice(localRank % nGpu));
+        MPI_Comm_free(&localComm);
+    }
+
     status = ShmemMpiInit(MPI_COMM_WORLD);
     assert(!status);
 
