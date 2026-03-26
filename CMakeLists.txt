@@ -18,11 +18,13 @@ endif()
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-
+option(MORI_MULTITHREAD_SUPPORT "Whether to support multithread" OFF)
 option(USE_ROCM "Whether to use rocm" ON)
 option(USE_BNXT "Whether to use BNXT NIC" OFF)
 option(USE_IONIC "Whether to use IONIC" OFF)
 option(BUILD_EXAMPLES "Whether to build examples" ON)
+option(BUILD_TORCH_BOOTSTRAP
+       "Build Torch process group bootstrap (requires PyTorch)" ON)
 option(WITH_MPI
        "Enable MPI support (required for mpi_bootstrap and C++ examples)"
        ${BUILD_EXAMPLES})
@@ -65,8 +67,13 @@ if(BUILD_XLA_FFI_OPS)
     message(FATAL_ERROR "BUILD_XLA_FFI_OPS=ON requires BUILD_OPS_DEVICE=ON")
   endif()
   add_compile_definitions(BUILD_XLA_FFI_OPS)
-  add_compile_options(-Wno-deprecated-literal-operator)
 endif()
+
+if (MORI_MULTITHREAD_SUPPORT)
+  add_compile_definitions(MORI_MULTITHREAD_SUPPORT)
+endif()
+
+add_compile_options(-Wno-deprecated-literal-operator)
 
 # ---------------------------------------------------------------------------
 # Device NIC + GPU arch detection (reuse the shared module in cmake/)

@@ -36,6 +36,7 @@
 #include "mori/core/core.hpp"
 #include "mori/shmem/internal.hpp"
 #include "mori/utils/hip_compat.hpp"
+#include "mori/utils/hip_helper.hpp"
 #include "mori/utils/mori_log.hpp"
 
 namespace mori {
@@ -100,6 +101,13 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
   int worldSize = bootNet.GetWorldSize();
   int rank = bootNet.GetLocalRank();
 
+  int device = -1;
+  HIP_RUNTIME_CHECK(hipGetDevice(&device));
+
+  MORI_SHMEM_DEBUG("RegisterSymmMemObj: localPtr={:p} size={} heap_begin={} device={}", localPtr, size, heap_begin, device);
+  MORI_SHMEM_DEBUG("RegisterSymmMemObj: worldSize={} rank={} context={:p}", worldSize, rank, 
+          reinterpret_cast<void*>(&context));
+
   SymmMemObj* cpuMemObj = new SymmMemObj();
   cpuMemObj->localPtr = localPtr;
   cpuMemObj->size = size;
@@ -117,23 +125,28 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
   //   - [different-node peers]: 0
   cpuMemObj->p2pPeerPtrs = static_cast<uintptr_t*>(calloc(worldSize, sizeof(uintptr_t)));
   cpuMemObj->p2pPeerPtrs[rank] = reinterpret_cast<uintptr_t>(localPtr);  // Set self pointer
-
-  hipIpcMemHandle_t handle;
-  HIP_RUNTIME_CHECK(hipIpcGetMemHandle(&handle, localPtr));
+    
   cpuMemObj->ipcMemHandles =
       static_cast<hipIpcMemHandle_t*>(calloc(worldSize, sizeof(hipIpcMemHandle_t)));
+  hipIpcMemHandle_t handle;
+  HIP_RUNTIME_CHECK(hipIpcGetMemHandle(&handle, localPtr));
   bootNet.Allgather(&handle, cpuMemObj->ipcMemHandles, sizeof(hipIpcMemHandle_t));
-
   // Open IPC handles for all same-node peers to establish P2P data path
   // This happens regardless of transport type selection
   for (int i = 0; i < worldSize; i++) {
+
     if (!context.CanUseP2P(i)) continue;
-
-    HIP_RUNTIME_CHECK(hipIpcOpenMemHandle(reinterpret_cast<void**>(&cpuMemObj->p2pPeerPtrs[i]),
-                                          cpuMemObj->ipcMemHandles[i],
-                                          hipIpcMemLazyEnablePeerAccess));
+    if (context.SameProcessP2P(i)) {
+      cpuMemObj->p2pPeerPtrs[i] = cpuMemObj->peerPtrs[i];
+      if (!mori::MoriEnablePeerAccess(rank, i)) {
+        MORI_APP_ERROR("Failed to enable peer access from device {} to {}", rank, i);
+      }
+    } else {
+      HIP_RUNTIME_CHECK(hipIpcOpenMemHandle(reinterpret_cast<void**>(&cpuMemObj->p2pPeerPtrs[i]),
+                                            cpuMemObj->ipcMemHandles[i],
+                                            hipIpcMemLazyEnablePeerAccess));
+    }
   }
-
   // Update peerPtrs based on transport type:
   // - For RDMA transport: keep remote VA (already allgathered) in peerPtrs
   // - For P2P/SDMA transport: use P2P pointer from hipIpcOpenMemHandle
@@ -194,7 +207,7 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
 
     for (auto& dstDeviceId : dstDeviceIds) {
       for (size_t q = 0; q < numOfQueuesPerDevice; q++) {
-        auto* anvilHandle = anvil::anvil.getSdmaQueue(srcDeviceId, dstDeviceId, q)->deviceHandle();
+        auto* anvilHandle = anvil::AnvilLib::getInstance().getSdmaQueue(srcDeviceId, dstDeviceId, q)->deviceHandle();
         HIP_RUNTIME_CHECK(
             hipMemcpy(&gpuMemObj->deviceHandles_d[dstDeviceId * numOfQueuesPerDevice + q],
                       &anvilHandle, sizeof(anvilHandle), hipMemcpyHostToDevice));
@@ -211,9 +224,14 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
     hipIpcMemHandle_t signalHandle;
     HIP_RUNTIME_CHECK(hipIpcGetMemHandle(&signalHandle, gpuMemObj->signalPtrs));
 
-    auto* signalHandles =
-        static_cast<hipIpcMemHandle_t*>(calloc(worldSize, sizeof(hipIpcMemHandle_t)));
-    bootNet.Allgather(&signalHandle, signalHandles, sizeof(hipIpcMemHandle_t));
+    struct SignalInfo {
+      hipIpcMemHandle_t handle;
+      HSAuint64* signalPtrs;
+    };
+    auto* signalInfos =
+        static_cast<SignalInfo*>(calloc(worldSize, sizeof(SignalInfo)));
+    signalInfos[rank] = {signalHandle, gpuMemObj->signalPtrs};
+    bootNet.Allgather(signalInfos + rank, signalInfos, sizeof(SignalInfo));
 
     auto* peerSignalPtrsHost = static_cast<HSAuint64**>(calloc(worldSize, sizeof(HSAuint64*)));
     peerSignalPtrsHost[rank] = gpuMemObj->signalPtrs;
@@ -221,15 +239,20 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
       if (context.GetTransportType(i) != TransportType::SDMA) continue;
       if (i == rank) continue;
       void* mappedPtr = nullptr;
-      HIP_RUNTIME_CHECK(
-          hipIpcOpenMemHandle(&mappedPtr, signalHandles[i], hipIpcMemLazyEnablePeerAccess));
-      peerSignalPtrsHost[i] = reinterpret_cast<HSAuint64*>(mappedPtr);
+      if (context.SameProcessP2P(i)) {
+        peerSignalPtrsHost[i] = signalInfos[i].signalPtrs;
+        mori::MoriEnablePeerAccess(rank, i);
+      } else {
+        HIP_RUNTIME_CHECK(
+          hipIpcOpenMemHandle(&mappedPtr, signalInfos[i].handle, hipIpcMemLazyEnablePeerAccess));
+        peerSignalPtrsHost[i] = reinterpret_cast<HSAuint64*>(mappedPtr);
+      }
     }
 
     HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->peerSignalPtrs, sizeof(HSAuint64*) * worldSize));
     HIP_RUNTIME_CHECK(hipMemcpy(gpuMemObj->peerSignalPtrs, peerSignalPtrsHost,
                                 sizeof(HSAuint64*) * worldSize, hipMemcpyHostToDevice));
-    free(signalHandles);
+    free(signalInfos);
     free(peerSignalPtrsHost);
   }
   SymmMemObjPtr result{cpuMemObj, gpuMemObj};
@@ -253,7 +276,7 @@ void SymmMemManager::DeregisterSymmMemObj(void* localPtr) {
   int rank = bootNet.GetLocalRank();
   int worldSize = bootNet.GetWorldSize();
   for (int i = 0; i < worldSize; i++) {
-    if (!context.CanUseP2P(i)) continue;
+    if (!context.CanUseP2P(i) || context.SameProcessP2P(i)) continue;
     if (memObjPtr.cpu->p2pPeerPtrs && memObjPtr.cpu->p2pPeerPtrs[i] != 0) {
       void* peerPtr = reinterpret_cast<void*>(memObjPtr.cpu->p2pPeerPtrs[i]);
       hipError_t closeErr = hipIpcCloseMemHandle(peerPtr);
@@ -305,6 +328,7 @@ SymmMemObjPtr SymmMemManager::RegisterStaticHeapSubRegion(void* localPtr, size_t
 
   cpuMemObj->ipcMemHandles =
       static_cast<hipIpcMemHandle_t*>(calloc(worldSize, sizeof(hipIpcMemHandle_t)));
+
   memcpy(cpuMemObj->ipcMemHandles, heapObj->cpu->ipcMemHandles,
          sizeof(hipIpcMemHandle_t) * worldSize);
 

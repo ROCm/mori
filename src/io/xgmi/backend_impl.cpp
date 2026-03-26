@@ -35,6 +35,7 @@
 
 #include "mori/io/env.hpp"
 #include "mori/io/logging.hpp"
+#include "mori/utils/hip_helper.hpp"
 
 namespace mori {
 namespace io {
@@ -560,32 +561,8 @@ void XgmiBackend::InitializeP2PAccess() {
         continue;
       }
 
-      int canAccess = 0;
-      err = hipDeviceCanAccessPeer(&canAccess, i, j);
-      if (err != hipSuccess) {
-        MORI_IO_WARN("XGMI: Failed to query P2P access from device {} to {}", i, j);
-        continue;
-      }
-
-      if (canAccess) {
-        hipError_t enableErr = hipDeviceEnablePeerAccess(j, 0);
-        if (enableErr == hipErrorPeerAccessAlreadyEnabled) {
-          hipError_t clearErr = hipGetLastError();
-          if (clearErr != hipSuccess) {
-            MORI_IO_WARN("XGMI: Failed to clear peer access error: {}",
-                         hipGetErrorString(clearErr));
-          }
-          p2pMatrix[i][j] = true;
-          MORI_IO_TRACE("XGMI: P2P access already enabled from device {} to {}", i, j);
-        } else if (enableErr != hipSuccess) {
-          MORI_IO_WARN("XGMI: Failed to enable P2P access from device {} to {}: {}", i, j,
-                       hipGetErrorString(enableErr));
-        } else {
-          p2pMatrix[i][j] = true;
-          MORI_IO_TRACE("XGMI: Enabled P2P access from device {} to {}", i, j);
-        }
-      } else {
-        MORI_IO_TRACE("XGMI: P2P access not available from device {} to {}", i, j);
+      if (mori::MoriEnablePeerAccess(i, j)) {
+        p2pMatrix[i][j] = true;
       }
     }
   }

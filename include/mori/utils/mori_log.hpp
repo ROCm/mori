@@ -99,6 +99,7 @@ class ModuleLogger {
 
   // Get logger for a specific module
   std::shared_ptr<spdlog::logger> GetLogger(const std::string& moduleName) {
+    std::lock_guard<std::mutex> lock(mutex_);
     auto it = loggers_.find(moduleName);
     if (it != loggers_.end()) {
       return it->second;
@@ -127,6 +128,7 @@ class ModuleLogger {
 
   // Set log level for all modules (global control)
   void SetGlobalLevel(Level level) {
+    std::lock_guard<std::mutex> lock(mutex_);
     globalLevel_ = level;
     globalLevelSet_ = true;
 
@@ -144,6 +146,7 @@ class ModuleLogger {
     auto logger = GetLogger(moduleName);
     logger->set_level(ConvertLevel(level));
     if (fromEnv) {
+      std::lock_guard<std::mutex> lock(mutex_);
       envOverrides_[moduleName] = level;
     }
   }
@@ -195,6 +198,7 @@ class ModuleLogger {
   std::unordered_map<std::string, Level> envOverrides_;  // Track env variable overrides
   Level globalLevel_ = Level::ERROR;
   bool globalLevelSet_ = false;
+  std::mutex mutex_;
 
   spdlog::level::level_enum ConvertLevel(Level level) {
     switch (level) {
@@ -310,15 +314,17 @@ class ScopedTimer {
 
 // Initialization helper functions
 inline void InitializeLogging() {
-  auto& logger = ModuleLogger::GetInstance();
-
-  // Initialize all modules with default ERROR level
-  logger.InitModule(modules::APPLICATION);
-  logger.InitModule(modules::IO);
-  logger.InitModule(modules::SHMEM);
-  logger.InitModule(modules::CORE);
-  logger.InitModule(modules::OPS);
-  logger.InitModule(modules::UMBP);
+  static std::once_flag once_flag;
+  std::call_once(once_flag, []{ 
+    auto& logger = ModuleLogger::GetInstance();
+    // Initialize all modules with default ERROR level
+    logger.InitModule(modules::APPLICATION);
+    logger.InitModule(modules::IO);
+    logger.InitModule(modules::SHMEM);
+    logger.InitModule(modules::CORE);
+    logger.InitModule(modules::OPS);
+    logger.InitModule(modules::UMBP);
+  });
 }
 
 inline void InitializeLogging(const std::string& globalLevel) {
