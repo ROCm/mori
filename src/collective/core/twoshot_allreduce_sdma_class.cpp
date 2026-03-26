@@ -56,11 +56,11 @@ size_t SdmaTransitUsedBytes(size_t total_count, int npes, size_t dtype_size) {
     return element_count_per_rank * static_cast<size_t>(npes) * dtype_size;
 }
 
-// Set MORI_SDMA_ZERO_TRANSIT=0 to skip (saves bandwidth; unsafe if SDMA drops puts).
+// Transit pre-zero can poison cache visibility for SDMA-written data on some stacks.
+// Default is OFF for SDMA allreduce; set MORI_SDMA_ZERO_TRANSIT=1 to force zeroing.
 inline bool SdmaShouldZeroTransit() {
     const char* e = std::getenv("MORI_SDMA_ZERO_TRANSIT");
-    if (e && e[0] == '0' && e[1] == '\0') return false;
-    return true;
+    return (e && e[0] == '1' && e[1] == '\0');
 }
 
 }  // namespace

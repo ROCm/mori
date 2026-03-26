@@ -324,62 +324,76 @@ void testPipelinedAllreduce() {
     }
 
     if (myPe == 0) {
-        printf("pipeline_bench  npes=%d  sweep=%s\n\n", npes, chunkSweep ? "on" : "off");
-        printf("%-7s %8s %8s %8s %7s %7s %5s %5s\n",
-               "MB/PE", "串行ms", "SDMAms", "P2Pms", "SDMA×", "P2P×", "S算法", "SDMA胜");
-        printf("%s\n", std::string(65, '-').c_str());
+        printf("-------------------------------------------------------------------------------------\n");
+        printf("  AllReduce Pipeline Benchmark\n");
+        printf("  npes=%d    dtype=uint32  warmup=%d  iters=%d  chunk_sweep=%s\n",
+               npes, warmup, iterations, chunkSweep ? "on" : "off");
+        printf("  Serial = ReduceScatter + AllGather  (single-shot, no pipeline)\n");
+        printf("  SDMA   = Pipeline SDMA scatter/reduce/AG  (auto default chunk, 3-stage)\n");
+        printf("  P2P    = Pipeline with P2P scatter mode\n");
+        printf("-------------------------------------------------------------------------------------\n");
+        printf("MB/PE   | --- Latency (ms) --- | --- Bandwidth (GB/s) --- | -- Speedup -- | Winner\n");
+        printf("        |  Serial    SDMA     P2P |   Serial     SDMA      P2P |  SDMA    P2P |\n");
+        printf("-------------------------------------------------------------------------------------\n");
 
-        int wins = 0, ncmp = 0;
+        int sdmaWins = 0, sdmaCmp = 0;
         for (size_t i = 0; i < dataSizesMB.size(); i++) {
             double s = (i < serialMs.size()) ? serialMs[i] : -1.0;
             double d = (i < sdmaMs.size()) ? sdmaMs[i] : -1.0;
             double p = (i < p2pMs.size()) ? p2pMs[i] : -1.0;
+            double sbw = (i < serialGb.size()) ? serialGb[i] : -1.0;
+            double dbw = (i < sdmaGb.size()) ? sdmaGb[i] : -1.0;
+            double pbw = (i < p2pGb.size()) ? p2pGb[i] : -1.0;
             bool os = (i < okSerial.size()) && okSerial[i];
             bool od = (i < okSdma.size()) && okSdma[i];
             bool op = (i < okP2p.size()) && okP2p[i];
 
-            if (!os) {
-                printf("%-7zu %8s %8s %8s %7s %7s %5s %5s\n",
-                       dataSizesMB[i], "FAIL", "-", "-", "-", "-", "-", "-");
-                continue;
-            }
-            printf("%-7zu %8.3f ", dataSizesMB[i], s);
-            if (od && d > 0)
-                printf("%8.3f ", d);
-            else
-                printf("%8s ", "-");
-            if (op && p > 0)
-                printf("%8.3f ", p);
-            else
-                printf("%8s ", "-");
+            char latS[16], latD[16], latP[16];
+            char bwS[16], bwD[16], bwP[16];
+            char spD[16], spP[16];
+            const char* winner = "-";
 
-            if (od && d > 0) {
-                double r = s / d;
-                printf("%7.2f ", r);
-                ncmp++;
-                if (d < s) wins++;
+            if (os && s > 0) snprintf(latS, sizeof(latS), "%.3f", s);
+            else snprintf(latS, sizeof(latS), "FAIL");
+            if (od && d > 0) snprintf(latD, sizeof(latD), "%.3f", d);
+            else snprintf(latD, sizeof(latD), "-");
+            if (op && p > 0) snprintf(latP, sizeof(latP), "%.3f", p);
+            else snprintf(latP, sizeof(latP), "-");
+
+            if (os && sbw > 0) snprintf(bwS, sizeof(bwS), "%.1f", sbw);
+            else snprintf(bwS, sizeof(bwS), "-");
+            if (od && dbw > 0) snprintf(bwD, sizeof(bwD), "%.1f", dbw);
+            else snprintf(bwD, sizeof(bwD), "-");
+            if (op && pbw > 0) snprintf(bwP, sizeof(bwP), "%.1f", pbw);
+            else snprintf(bwP, sizeof(bwP), "-");
+
+            if (os && od && s > 0 && d > 0) {
+                snprintf(spD, sizeof(spD), "%.2fx", s / d);
+                sdmaCmp++;
+                if (d < s) sdmaWins++;
             } else {
-                printf("%7s ", "-");
+                snprintf(spD, sizeof(spD), "-");
+            }
+            if (os && op && s > 0 && p > 0) snprintf(spP, sizeof(spP), "%.2fx", s / p);
+            else snprintf(spP, sizeof(spP), "-");
+
+            if (os && s > 0) {
+                double best = s;
+                winner = "Serial";
+                if (od && d > 0 && d < best) {
+                    best = d;
+                    winner = "SDMA";
+                }
+                if (op && p > 0 && p < best) {
+                    winner = "P2P";
+                }
             }
 
-            if (op && p > 0)
-                printf("%7.2f ", s / p);
-            else
-                printf("%7s ", "-");
-
-            if (i < serialGb.size())
-                printf("%5.0f ", serialGb[i]);
-            else
-                printf("%5s ", "-");
-
-            if (od && d > 0)
-                printf("%5s\n", (d < s) ? "是" : "否");
-            else
-                printf("%5s\n", "-");
+            printf("%-7zu | %8s %8s %8s | %8s %8s %8s | %6s %6s | %s\n",
+                   dataSizesMB[i], latS, latD, latP, bwS, bwD, bwP, spD, spP, winner);
         }
-        printf("%s\n", std::string(65, '-').c_str());
-        if (ncmp > 0)
-            printf("SDMA整块 vs 串行: %d/%d 更快\n", wins, ncmp);
+        printf("-------------------------------------------------------------------------------------\n");
+        if (sdmaCmp > 0) printf("SDMA default-chunk vs Serial: %d/%d faster\n", sdmaWins, sdmaCmp);
 
         if (chunkSweep && !sweep_lines.empty()) {
             printf("\n--- chunk sweep (MORI_PIPELINE_CHUNK_SWEEP=1) ---\n");
