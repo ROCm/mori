@@ -138,6 +138,17 @@ __global__ void PipelinedAllReduceSdmaKernel(
         }
         __syncthreads();
 
+        // Scatter for this chunk arrives via SDMA (HBM path). Invalidate stale
+        // cache lines before reading peer slots for local reduce.
+        if (threadIdx.x == 0) {
+#if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
+          asm volatile("buffer_wbl2" ::: "memory");
+          asm volatile("buffer_inv" ::: "memory");
+#endif
+          __threadfence_system();
+        }
+        __syncthreads();
+
         {
           const size_t off = static_cast<size_t>(c) * packedChunkPerRank;
           size_t cnt = packedChunkPerRank;

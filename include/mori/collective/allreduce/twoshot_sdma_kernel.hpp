@@ -292,6 +292,18 @@ __global__ void SdmaReduceScatterKernel(
   __syncthreads();  // all blocks: every thread finishes slot[myPe] CU copy
                     // before Phase 3 reads peer columns in this CTA.
 
+  // SDMA updates peer slots in HBM and may not invalidate resident cache lines.
+  // Before reducing across all peer slots, force writeback+invalidate so loads
+  // observe current scatter data instead of stale prior-iteration lines.
+  if (threadIdx.x == 0) {
+#if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
+    asm volatile("buffer_wbl2" ::: "memory");
+    asm volatile("buffer_inv" ::: "memory");
+#endif
+    __threadfence_system();
+  }
+  __syncthreads();
+
   // === Phase 3: Local reduce (all blocks) ==================================
   for (size_t k = tid; k < packedPerRank; k += stride) {
     A acc = upcast_v<typename P::type, pack_size>(buf[k]);
