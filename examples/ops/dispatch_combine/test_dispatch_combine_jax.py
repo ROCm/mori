@@ -28,15 +28,19 @@ try:
 except ImportError:
     from jax.experimental.shard_map import shard_map
 import numpy as np
-
 import random
+from functools import partial
 
-# os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "6G")
 import mori
 import argparse
 
+NUM_PEERS=4
+RUN_MULTITHREADED=True
 
 def init_distributed():
+    if RUN_MULTITHREADED:
+        return (0, NUM_PEERS)
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--world_size", type=int, default=1)
     parser.add_argument("--rank", type=int, default=0)
@@ -74,107 +78,72 @@ class EpDispatchCombineTestCase:
             block_num=80,
             use_external_inp_buf=True,
             kernel_type=mori.cpp.EpDispatchCombineKernelType.IntraNode,
-            gpu_per_node=8,
+            gpu_per_node=NUM_PEERS,
             rdma_block_num=16,
             num_qp_per_pe=1,
             quant_type=mori.cpp.EpDispatchCombineQuantType.None_,
         )
 
     def setup(self):
-        mori.jax.shmem_init_attr(self.rank, self.world_size)
+        # for JAX multi-threaded mode, SHMEM is initialized in the thread
+        if not RUN_MULTITHREADED:
+            mori.jax.shmem_init_attr(self.rank, self.world_size)
+        def set_seed():
+          return jax.random.PRNGKey(777 + self.rank)
+        self.rng = jax.jit(set_seed)()
 
     def cleanup(self):
         mori.jax.shmem_finalize()
-
-    def gen_local_data(self, num_tokens):
-        """Generate random test data using NumPy (avoids JAX/ROCm PRNG bugs)."""
-        total_experts = self.config.num_experts_per_rank * self.config.world_size
-        rng = np.random.RandomState(777 + self.rank)
-
-        indices_np = np.zeros(
-            (num_tokens, self.config.num_experts_per_token), dtype=np.int32
-        )
-        for t in range(num_tokens):
-            indices_np[t] = rng.choice(
-                total_experts, self.config.num_experts_per_token, replace=False
-            )
-        indices = jnp.array(indices_np)
-
-        weights = jnp.array(
-            rng.uniform(size=(num_tokens, self.config.num_experts_per_token)).astype(
-                np.float32
-            )
-        )
-
-        if self.config.scale_dim != 0:
-            scales_fp32 = jnp.array(
-                rng.uniform(size=(num_tokens, self.config.scale_dim)).astype(np.float32)
-            )
-        else:
-            scales_fp32 = jnp.zeros((1, 1), dtype=jnp.float32)
-
-        input_fp32 = jnp.array(
-            rng.standard_normal((num_tokens, self.config.hidden_dim)).astype(np.float32)
-        )
-        return indices, weights, scales_fp32, input_fp32
-
-    def all_gather_data(self, indices, weights, scales_fp32, input_fp32):
-        """Gather local data from all ranks using shard_map."""
+    
+    def gen_test_data(self, num_tokens):
         max_tokens = self.config.max_num_inp_token_per_rank
 
-        def do_gather(indices, weights, scales_fp32, input_fp32):
-            def _gather(x):
-                padded = jnp.pad(
-                    x, [(0, max_tokens - x.shape[0])] + [(0, 0)] * (x.ndim - 1)
-                )
-                gathered = jax.lax.all_gather(padded, axis_name="i")
-                return gathered.reshape(-1, *gathered.shape[2:])
-
-            return (
-                _gather(indices),
-                _gather(weights),
-                _gather(scales_fp32),
-                _gather(input_fp32),
+        def all_gather(inp):
+            padded = jnp.pad(inp,
+                [(0, max_tokens - inp.shape[0])] + [(0, 0)] * (inp.ndim - 1),
             )
+            gathered = jax.lax.all_gather(padded, axis_name="i")
+            gathered = gathered.reshape(-1, *gathered.shape[2:])
+            return gathered
+        
+        # indices: shape [num_tokens, num_experts_per_token]
+        total_experts = self.config.num_experts_per_rank * self.config.world_size
+        # print(f"----- rank {self.rank} #tokens {num_tokens} #experts {total_experts}")
+       
+        keys = jax.random.split(self.rng, num_tokens)
+        perms = jax.vmap(
+            lambda k: jax.random.permutation(k, total_experts)
+        )(keys)
+        indices = perms[:,:self.config.num_experts_per_token]
+        indices_list = all_gather(indices)
+                
+        weights = jax.random.uniform(self.rng, (num_tokens, self.config.num_experts_per_token), dtype=jnp.float32)
+        weights_list = all_gather(weights)
 
-        return do_gather(indices, weights, scales_fp32, input_fp32)
+        if self.config.scale_dim != 0:
+            scales_fp32 = jax.random.uniform(self.rng, (num_tokens, self.config.scale_dim), dtype=jnp.float32)
+        else:
+            scales_fp32 = jnp.zeros((1, 1), dtype=jnp.float32)
+        # cast to target type after gather
+        scales_list = all_gather(scales_fp32).astype(self.jax_scale_dtype)
 
-    def gen_test_data(self, num_tokens, mesh):
-        """Generate local data, then all_gather across ranks."""
-        indices, weights, scales_fp32, input_fp32 = self.gen_local_data(num_tokens)
+        # input: [num_tokens, hidden_dim] - this 
+        input_fp32 = jax.random.normal(self.rng, (num_tokens, self.config.hidden_dim), dtype=jnp.float32)
+        input_list = all_gather(input_fp32).astype(self.dtype)
+        
+        print(f"num_tokens {num_tokens}  hidden: {self.config.hidden_dim} indices: {indices.shape}/{indices.dtype}")
+        print(f"weights: {weights.shape}/{weights.dtype}")
+        print(f"scales_fp32: {scales_fp32.shape}/{scales_fp32.dtype}", flush=True)
 
-        gather_fn = shard_map(
-            self.all_gather_data,
-            mesh=mesh,
-            in_specs=(P(), P(), P(), P()),
-            out_specs=(P(), P(), P(), P()),
-            check_rep=False,
-        )
-        jitted_gather = jax.jit(gather_fn)
-        indices_list, weights_list, scales_list_fp32, input_list = jitted_gather(
-            indices, weights, scales_fp32, input_fp32
-        )
-        scales_list = scales_list_fp32.astype(self.jax_scale_dtype)
-        input_list = input_list.astype(self.dtype)
-
-        print(
-            f"num_tokens {num_tokens}  hidden: {self.config.hidden_dim} "
-            f"indices: {indices.shape}/{indices.dtype}",
-            flush=True,
-        )
-
-        return (
-            indices,
-            weights,
+        return (indices, weights,
             scales_fp32.astype(self.jax_scale_dtype),
             input_fp32.astype(self.dtype),
             indices_list,
             weights_list,
             scales_list,
-            input_list,
-        )
+            input_list)
 
-    def run_test_once(self, op, num_tokens, test_data):
+    def run_test_once(self, op, num_tokens, test_data, mesh):
         (
             indices,
             weights,
@@ -186,7 +155,6 @@ class EpDispatchCombineTestCase:
             input_list,
         ) = test_data
 
-        @jax.jit
         def ffi_calls(inputs, weights, scales, indices):
             (
                 dispatch_output,
@@ -198,7 +166,7 @@ class EpDispatchCombineTestCase:
             src_token_pos = op.get_dispatch_src_token_pos(num)
 
             (combine_output, combine_weights) = op.combine(
-                dispatch_output.astype(self.dtype), dispatch_weights, indices
+                dispatch_output.astype(self.dtype), dispatch_weights, dispatch_indices
             )
 
             return (
@@ -214,6 +182,19 @@ class EpDispatchCombineTestCase:
                 combine_weights,
             )
 
+        jitted_ffi_calls = jax.jit(shard_map(
+            ffi_calls,
+            mesh=mesh,
+            in_specs=(P(), P(), P(), P()),
+            out_specs=(
+                (P(), P(), P(), P(), P()),
+                P(),
+                P(),
+                P(),
+            ),
+            check_rep=False,
+        ))
+
         (
             (
                 dispatch_output,
@@ -225,11 +206,9 @@ class EpDispatchCombineTestCase:
             src_token_pos,
             combine_output,
             combine_weights,
-        ) = ffi_calls(inputs, weights, scales, indices)
+        ) = jitted_ffi_calls(inputs, weights, scales, indices)
 
-        print(f"src_token_pos: {src_token_pos} {src_token_pos.shape}")
-        print(f"dispatch_recv_num_token: {dispatch_recv_num_token}")
-
+        print(f"src_token_pos: {src_token_pos} {src_token_pos.shape}", flush=True)
         # num_tokens = [1..max_num_inp_tokens_per_rank]
         # indices [num_tokes x num_experts_per_token]
         # this basically maps each local token to some set of experts
@@ -243,7 +222,6 @@ class EpDispatchCombineTestCase:
         # combine_weights: [max_num_inp_tokens_per_rank, num_experts_per_token]
 
         num_recv = dispatch_recv_num_token
-        print(f"dispatch_output: {dispatch_output.shape}")
         print(
             f"rank {self.rank} got {num_tokens} / received {num_recv} tokens",
             flush=True,
@@ -371,14 +349,26 @@ class EpDispatchCombineTestCase:
         random.seed(333 + self.rank)
         max_tokens = self.config.max_num_inp_token_per_rank
         num_tokens = int(random.randint(1, max_tokens + 1))
-
+        
         devices = np.array(jax.devices())
         mesh = jax.sharding.Mesh(devices, axis_names=("i",))
-
+        
+        #@jax.jit
+        #@partial(shard_map, mesh=mesh, in_specs=P(), out_specs=P(), check_rep=False)
+        jitted_gen = jax.jit(shard_map(partial(self.gen_test_data, num_tokens),
+                    mesh=mesh, in_specs=(), out_specs=(P(), # indices
+                                                       P(), # weights
+                                                       P(), # scales
+                                                       P(), # input
+                                                       P(), # indices_list
+                                                       P(), # weights_list
+                                                       P(), # scales_list
+                                                       P(),), # input_list
+                    check_rep=False), static_argnums=())
         for _ in range(1):
-            test_data = self.gen_test_data(num_tokens, mesh)
-            print(f"{self.rank} gen_test_data OK", flush=True)
-            self.run_test_once(op, num_tokens, test_data)
+            test_data = jitted_gen() 
+            print(f"{self.rank} en_test_data OK")
+            self.run_test_once(op, num_tokens, test_data, mesh)
         del op
 
 

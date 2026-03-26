@@ -39,11 +39,6 @@ namespace shmem {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                  JIT Module & GpuStates Management                            */
 /* ---------------------------------------------------------------------------------------------- */
-static hipModule_t s_shmemModule = nullptr;
-static GpuStates* s_deviceGpuStatesAddr = nullptr;
-static hipFunction_t s_barrierFunc = nullptr;
-
-GpuStates s_hostGpuStatesCopy{};
 
 using GpuStatesAddrProvider = void* (*)();
 static GpuStatesAddrProvider s_gpuStatesAddrProvider = nullptr;
@@ -58,38 +53,44 @@ void RegisterGpuStatesAddrProvider(GpuStatesAddrProvider provider) {
 void RegisterBarrierLauncher(BarrierLauncher launcher) { s_staticBarrierLauncher = launcher; }
 
 int LoadShmemModule(const char* hsaco_path) {
-  if (s_shmemModule != nullptr) return 0;
-  hipError_t err = hipModuleLoad(&s_shmemModule, hsaco_path);
+
+  ShmemStates* states = ShmemStatesSingleton::GetInstance();
+  auto &moduleStates = states->moduleStates;
+
+  if (moduleStates.module != nullptr) return 0;
+  hipError_t err = hipModuleLoad(&moduleStates.module, hsaco_path);
   if (err != hipSuccess) {
     MORI_SHMEM_ERROR("Failed to load shmem module from {}: {}", hsaco_path, hipGetErrorString(err));
     return -1;
   }
-  err = hipModuleGetGlobal(reinterpret_cast<hipDeviceptr_t*>(&s_deviceGpuStatesAddr), nullptr,
-                           s_shmemModule, "_ZN4mori5shmem15globalGpuStatesE");
+  err = hipModuleGetGlobal(reinterpret_cast<hipDeviceptr_t*>(&moduleStates.gpuStatesPtr), nullptr,
+                           moduleStates.module, "_ZN4mori5shmem15globalGpuStatesE");
   if (err != hipSuccess) {
     MORI_SHMEM_ERROR("globalGpuStates symbol not found in shmem module: {}",
                      hipGetErrorString(err));
     return -1;
   }
-  err = hipModuleGetFunction(&s_barrierFunc, s_shmemModule, "mori_shmem_barrier_all_block");
+  err = hipModuleGetFunction(&moduleStates.barrierFunc, moduleStates.module, "mori_shmem_barrier_all_block");
   if (err != hipSuccess) {
     MORI_SHMEM_ERROR("mori_shmem_barrier_all_block not found in shmem module: {}",
                      hipGetErrorString(err));
     return -1;
   }
   MORI_SHMEM_TRACE("Loaded shmem JIT module: globalGpuStates={:p}, barrier={:p}",
-                   (void*)s_deviceGpuStatesAddr, (void*)s_barrierFunc);
+                   (void*)moduleStates.gpuStatesPtr, (void*)moduleStates.barrierFunc);
   return 0;
 }
 
 void CopyGpuStatesToDevice(const GpuStates* gpuStates) {
-  s_hostGpuStatesCopy = *gpuStates;
+ 
+  ShmemStates* states = ShmemStatesSingleton::GetInstance();
+  auto &moduleStates = states->moduleStates;
 
-  if (s_deviceGpuStatesAddr != nullptr) {
+  if (moduleStates.gpuStatesPtr != nullptr) {
     MORI_SHMEM_TRACE("Copying GpuStates to JIT module globalGpuStates ({:p})",
-                     (void*)s_deviceGpuStatesAddr);
+                     (void*)moduleStates.gpuStatesPtr);
     HIP_RUNTIME_CHECK(
-        hipMemcpy(s_deviceGpuStatesAddr, gpuStates, sizeof(GpuStates), hipMemcpyHostToDevice));
+        hipMemcpy(moduleStates.gpuStatesPtr, gpuStates, sizeof(GpuStates), hipMemcpyHostToDevice));
   }
 
   if (s_gpuStatesAddrProvider != nullptr) {
@@ -105,13 +106,16 @@ void CopyGpuStatesToDevice(const GpuStates* gpuStates) {
 }
 
 void FinalizeRuntime() {
-  if (s_shmemModule) {
-    hipModuleUnload(s_shmemModule);
-    s_shmemModule = nullptr;
-    s_deviceGpuStatesAddr = nullptr;
-    s_barrierFunc = nullptr;
+  ShmemStates* states = ShmemStatesSingleton::GetInstance();
+  states->CheckStatusValid();
+  auto &moduleStates = states->moduleStates;
+
+  if (moduleStates.module != nullptr) {
+    hipModuleUnload(moduleStates.module);
+    moduleStates.module = nullptr;
+    moduleStates.gpuStatesPtr = nullptr;
+    moduleStates.barrierFunc = nullptr;
   }
-  s_hostGpuStatesCopy = {};
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -121,7 +125,7 @@ void FinalizeRuntime() {
 int ShmemModuleInit(void* hipModule) {
   ShmemStates* states = ShmemStatesSingleton::GetInstance();
   states->CheckStatusValid();
-
+  auto &moduleStates = states->moduleStates;
   hipModule_t module = static_cast<hipModule_t>(hipModule);
   GpuStates* moduleGlobalGpuStatesAddr = nullptr;
 
@@ -136,21 +140,22 @@ int ShmemModuleInit(void* hipModule) {
   }
 
   MORI_SHMEM_TRACE("Module globalGpuStates address: {:p} (shmem module address: {:p})",
-                   (void*)moduleGlobalGpuStatesAddr, (void*)s_deviceGpuStatesAddr);
+                   (void*)moduleGlobalGpuStatesAddr, (void*)moduleStates.gpuStatesPtr);
 
-  HIP_RUNTIME_CHECK(hipMemcpy(moduleGlobalGpuStatesAddr, &s_hostGpuStatesCopy, sizeof(GpuStates),
+  HIP_RUNTIME_CHECK(hipMemcpy(moduleGlobalGpuStatesAddr, states->gpuStates, sizeof(GpuStates),
                               hipMemcpyHostToDevice));
 
   MORI_SHMEM_TRACE("Successfully initialized globalGpuStates in module (rank={}, worldSize={})",
-                   s_hostGpuStatesCopy.rank, s_hostGpuStatesCopy.worldSize);
+                   states->gpuStates->rank, states->gpuStates->worldSize);
 
   return 0;
 }
 
 int CopyGpuStatesToSymbol(void* deviceSymbolAddr) {
   if (deviceSymbolAddr == nullptr) return -1;
+  ShmemStates* states = ShmemStatesSingleton::GetInstance();
   HIP_RUNTIME_CHECK(
-      hipMemcpy(deviceSymbolAddr, &s_hostGpuStatesCopy, sizeof(GpuStates), hipMemcpyHostToDevice));
+      hipMemcpy(deviceSymbolAddr, states->gpuStates, sizeof(GpuStates), hipMemcpyHostToDevice));
   return 0;
 }
 
@@ -189,12 +194,13 @@ void ShmemBarrierAll() {
 void ShmemBarrierOnStream(hipStream_t stream) {
   ShmemStates* states = ShmemStatesSingleton::GetInstance();
   states->CheckStatusValid();
+  auto &moduleStates = states->moduleStates;
 
   MORI_SHMEM_TRACE("PE {} launching device barrier on stream", states->bootStates->rank);
 
-  if (s_barrierFunc != nullptr) {
+  if (moduleStates.barrierFunc != nullptr) {
     hipError_t err =
-        hipModuleLaunchKernel(s_barrierFunc, 1, 1, 1, 1, 1, 1, 0, stream, nullptr, nullptr);
+        hipModuleLaunchKernel(moduleStates.barrierFunc, 1, 1, 1, 1, 1, 1, 0, stream, nullptr, nullptr);
     assert(err == hipSuccess && "ShmemBarrierOnStream launch failed");
   } else if (s_staticBarrierLauncher != nullptr) {
     s_staticBarrierLauncher(stream);

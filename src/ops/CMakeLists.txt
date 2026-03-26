@@ -70,11 +70,15 @@ if(BUILD_OPS_DEVICE)
     set(_hsaco_output "${_hsaco_dir}/${_kname}.hsaco")
     set(_ksrc_path "${CMAKE_SOURCE_DIR}/src/ops/kernels/${_ksrc}")
 
+    set(FLAGS "-g" "-O0")
+    if(CMAKE_BUILD_TYPE STREQUAL "Release")
+      set(FLAGS "-O2")
+    endif()
     add_custom_command(
       OUTPUT ${_hsaco_output}
       COMMAND
         ${HIPCC_EXECUTABLE} --genco "--offload-arch=${GPU_TARGETS}" -std=c++17
-        -O2 -D__HIP_PLATFORM_AMD__ -DHIP_ENABLE_WARP_SYNC_BUILTINS ${_nic_defs}
+        ${FLAGS} -D__HIP_PLATFORM_AMD__ -DHIP_ENABLE_WARP_SYNC_BUILTINS ${_nic_defs}
         ${_extra_defs} -I${CMAKE_SOURCE_DIR}/include -I${CMAKE_SOURCE_DIR}
         ${_mpi_includes} ${_ksrc_path} -o ${_hsaco_output}
       DEPENDS ${_ksrc_path}

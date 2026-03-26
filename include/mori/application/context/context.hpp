@@ -39,7 +39,7 @@ class Context {
   int LocalRank() const { return bootNet.GetLocalRank(); }
   int WorldSize() const { return bootNet.GetWorldSize(); }
   int LocalRankInNode() const { return rankInNode; }
-  std::string HostName() const;
+  const std::string& HostName() const { return peerInfos[LocalRank()].hostname; }
 
   TransportType GetTransportType(int destRank) const { return transportTypes[destRank]; }
   std::vector<TransportType> GetTransportTypes() const { return transportTypes; }
@@ -51,6 +51,8 @@ class Context {
 
   // Check if P2P connection is possible with a peer (same node)
   bool CanUseP2P(int destRank) const;
+  // Check if P2P connection is possible with a peer (same process)
+  bool SameProcessP2P(int destRank) const;
 
   const std::vector<RdmaEndpoint>& GetRdmaEndpoints() const { return rdmaEps; }
 
@@ -59,10 +61,15 @@ class Context {
   void InitializePossibleTransports();
 
  private:
+  struct PeerInfo {
+    std::string hostname; // hostname to identify same node P2P
+    pid_t pid{};          // process id to identify same process P2P
+  };
+
   BootstrapNetwork& bootNet;
   int rankInNode{-1};
   int numQpPerPe{4};
-  std::vector<std::string> hostnames;
+  std::vector<PeerInfo> peerInfos;
   std::vector<TransportType> transportTypes;
 
   std::unique_ptr<RdmaContext> rdmaContext{nullptr};
