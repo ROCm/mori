@@ -469,6 +469,15 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             return true;
         };
 
+        auto global_launch_barrier = [&]() -> bool {
+            int rc = MPI_Barrier(MPI_COMM_WORLD);
+            if (rc != MPI_SUCCESS) {
+                fprintf(stderr, "PE %d: MPI_Barrier before pipelined launch failed\n", myPe_);
+                return false;
+            }
+            return true;
+        };
+
         if (scatter_mode == 0) {
             if (SdmaShouldZeroTransit()) {
                 hipError_t zerr =
@@ -481,6 +490,8 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                 }
             }
             if (!zero_sdma_signals_and_barrier())
+                return false;
+            if (!global_launch_barrier())
                 return false;
 
             application::SymmMemObjPtr unusedInputSymm{};
@@ -532,6 +543,8 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         }
 
         if (!zero_sdma_signals_and_barrier())
+            return false;
+        if (!global_launch_barrier())
             return false;
 
         PipelinedAllReduceSdmaKernel<T, 1><<<blocks, threads, 0, stream>>>(
