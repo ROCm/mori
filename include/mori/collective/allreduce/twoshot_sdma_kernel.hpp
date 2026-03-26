@@ -356,21 +356,14 @@ __global__ void AllGatherSdmaKernel(int myPe, int npes,
   }
 
   const size_t bytesPerElement = sizeof(T);
-  (void)flagsMemObj;
-  (void)barrier;
-
-  // Use dedicated AG queue-id and per-sender baselines so AG completion
-  // doesn't alias with RS scatter counters across iterations.
-  constexpr uint32_t kAgQid = 1;
-  __shared__ uint64_t s_ag_base[64];
+  uint64_t* __restrict__ flags = reinterpret_cast<uint64_t*>(flagsMemObj->localPtr);
+  __shared__ uint64_t ag_token;
   if (threadIdx.x == 0) {
-    for (int s = 0; s < npes && s < 64; ++s) {
-      if (s == myPe) continue;
-      s_ag_base[s] = core::AtomicLoadRelaxed(
-          dstMemObj->signalPtrs + static_cast<size_t>(s) * dstMemObj->sdmaNumQueue + kAgQid);
-    }
+    ag_token = static_cast<uint64_t>(barrier->flag) + 1ULL;
+    barrier->flag = static_cast<uint32_t>(ag_token);
   }
   __syncthreads();
+  uint64_t flag_val = ag_token;
 
   const size_t threadLinearId =
       static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + threadIdx.x;
@@ -398,22 +391,21 @@ __global__ void AllGatherSdmaKernel(int myPe, int npes,
 
       core::SdmaPutThread(agSrcPtr, agDstPtr, agSendBytes,
                           devicehandles, remoteSignal,
-                          dest->sdmaNumQueue, kAgQid);
+                          dest->sdmaNumQueue, 0);
     }
   }
   __syncthreads();
 
   // --- Wait for all peers to finish AllGather --------------------------------
-  // Remote PEs wrote to our local signalPtrs[sender * numQueues + kAgQid]
+  // Remote PEs wrote to our local signalPtrs[sender * numQueues + 0]
   for (int sender = 0; sender < npes; ++sender) {
     if (sender == myPe) continue;
     if (threadLinearId == 0) {
       HSAuint64* mySignal = dstMemObj->signalPtrs
-                            + static_cast<size_t>(sender) * dstMemObj->sdmaNumQueue + kAgQid;
-      const uint64_t expected = s_ag_base[sender] + 1ULL;
+                            + static_cast<size_t>(sender) * dstMemObj->sdmaNumQueue;
       int spinCount = 0;
       bool warned = false;
-      while (core::AtomicLoadRelaxed(mySignal) < expected) {
+      while (core::AtomicLoadRelaxed(mySignal) < flag_val) {
         ++spinCount;
         if (spinCount > 10000000 && !warned) {
           printf("PE %d: AllGather timeout waiting for peer %d\n", myPe, sender);
