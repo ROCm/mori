@@ -63,6 +63,13 @@ inline bool SdmaShouldZeroTransit() {
     return (e && e[0] == '1' && e[1] == '\0');
 }
 
+// Enable fused mode0 kernel only when explicitly requested.
+// Default keeps sdma pipeline mode0 on stable RS+AG path.
+inline bool SdmaEnableMode0FusedKernel() {
+    const char* e = std::getenv("MORI_SDMA_MODE0_FUSED");
+    return e && e[0] == '1' && e[1] == '\0';
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -495,6 +502,10 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         };
 
         if (scatter_mode == 0) {
+            if (!SdmaEnableMode0FusedKernel()) {
+                // Keep default mode0 behavior on the stable two-shot path.
+                return operator()(input, output, total_count, stream);
+            }
             if (SdmaShouldZeroTransit()) {
                 hipError_t zerr =
                     stream ? hipMemsetAsync(output_transit_buffer_, 0, transit_used, stream)
