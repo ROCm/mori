@@ -42,6 +42,22 @@
 namespace mori {
 namespace shmem {
 
+ShmemStates* ShmemStatesSingleton::GetInstance() {
+#ifdef MORI_MULTITHREAD_SUPPORT 
+  static ShmemStatesSingleton s_inst;
+  int id = -1;
+  HIP_RUNTIME_CHECK(hipGetDevice(&id));
+  std::lock_guard<std::mutex> lock(s_inst.mutex_);
+  if (s_inst.states_.size() <= static_cast<size_t>(id)) {
+    s_inst.states_.resize(id + 1);
+  }
+  return &s_inst.states_[id];
+#else
+  static ShmemStates states;
+  return &states;
+#endif
+}
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                          Helper Functions                                     */
 /* ---------------------------------------------------------------------------------------------- */
@@ -492,11 +508,11 @@ static void AllocateInternalSync(GpuStates* gpuStates, const ShmemStates* states
 }
 
 static void FinalizeInternalSync(const ShmemStates* states) {
-  if (s_hostGpuStatesCopy.internalSyncPtr == nullptr) {
+  if (states->gpuStates->internalSyncPtr == nullptr) {
     return;
   }
 
-  void* syncPtr = reinterpret_cast<void*>(s_hostGpuStatesCopy.internalSyncPtr);
+  void* syncPtr = reinterpret_cast<void*>(states->gpuStates->internalSyncPtr);
   switch (states->mode) {
     case ShmemMode::StaticHeap: {
       states->memoryStates->symmMemMgr->DeregisterStaticHeapSubRegion(syncPtr);
@@ -522,25 +538,24 @@ static void FinalizeInternalSync(const ShmemStates* states) {
 
 void GpuStateInit() {
   ShmemStates* states = ShmemStatesSingleton::GetInstance();
-
+  states->gpuStates = new GpuStates();
   // Initialize basic GPU states
-  GpuStates gpuStates;
-  gpuStates.rank = states->bootStates->rank;
-  gpuStates.worldSize = states->bootStates->worldSize;
-  gpuStates.numQpPerPe = states->rdmaStates->commContext->GetNumQpPerPe();
+  states->gpuStates->rank = states->bootStates->rank;
+  states->gpuStates->worldSize = states->bootStates->worldSize;
+  states->gpuStates->numQpPerPe = states->rdmaStates->commContext->GetNumQpPerPe();
 
   // Copy communication metadata to GPU
-  CopyTransportTypesToGpu(&gpuStates, states);
-  CopyRdmaEndpointsToGpu(&gpuStates, states);
+  CopyTransportTypesToGpu(states->gpuStates, states);
+  CopyRdmaEndpointsToGpu(states->gpuStates, states);
 
   // Configure heap information for GPU access
-  ConfigureHeapInfoForGpu(&gpuStates, states);
+  ConfigureHeapInfoForGpu(states->gpuStates, states);
 
   // Allocate internal synchronization memory for device barriers
-  AllocateInternalSync(&gpuStates, states);
+  AllocateInternalSync(states->gpuStates, states);
 
   // Copy complete state to device
-  CopyGpuStatesToDevice(&gpuStates);
+  CopyGpuStatesToDevice(states->gpuStates);
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -622,8 +637,9 @@ int ShmemInit(application::BootstrapNetwork* bootNet) {
 /* ---------------------------------------------------------------------------------------------- */
 
 static void FinalizeGpuStates() {
-  HIP_RUNTIME_CHECK(hipFree(s_hostGpuStatesCopy.transportTypes));
-  HIP_RUNTIME_CHECK(hipFree(s_hostGpuStatesCopy.rdmaEndpoints));
+  ShmemStates* states = ShmemStatesSingleton::GetInstance();
+  HIP_RUNTIME_CHECK(hipFree(states->gpuStates->transportTypes));
+  HIP_RUNTIME_CHECK(hipFree(states->gpuStates->rdmaEndpoints));
   FinalizeRuntime();
   MORI_SHMEM_TRACE("GPU states finalized");
 }
@@ -690,6 +706,7 @@ static void FinalizeAllStates(ShmemStates* states) {
   states->bootStates->bootNet->Finalize();
   delete states->bootStates->bootNet;
   delete states->bootStates;
+  delete states->gpuStates;
 
   MORI_SHMEM_TRACE("All states finalized");
 }

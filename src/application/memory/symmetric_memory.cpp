@@ -100,6 +100,13 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
   int worldSize = bootNet.GetWorldSize();
   int rank = bootNet.GetLocalRank();
 
+  int device = -1;
+  HIP_RUNTIME_CHECK(hipGetDevice(&device));
+
+  MORI_SHMEM_DEBUG("RegisterSymmMemObj: localPtr={:p} size={} heap_begin={} device={}", localPtr, size, heap_begin, device);
+  MORI_SHMEM_DEBUG("RegisterSymmMemObj: worldSize={} rank={} context={:p}", worldSize, rank, 
+          reinterpret_cast<void*>(&context));
+
   SymmMemObj* cpuMemObj = new SymmMemObj();
   cpuMemObj->localPtr = localPtr;
   cpuMemObj->size = size;
@@ -117,23 +124,28 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
   //   - [different-node peers]: 0
   cpuMemObj->p2pPeerPtrs = static_cast<uintptr_t*>(calloc(worldSize, sizeof(uintptr_t)));
   cpuMemObj->p2pPeerPtrs[rank] = reinterpret_cast<uintptr_t>(localPtr);  // Set self pointer
-
-  hipIpcMemHandle_t handle;
-  HIP_RUNTIME_CHECK(hipIpcGetMemHandle(&handle, localPtr));
+    
   cpuMemObj->ipcMemHandles =
       static_cast<hipIpcMemHandle_t*>(calloc(worldSize, sizeof(hipIpcMemHandle_t)));
+  hipIpcMemHandle_t handle;
+  HIP_RUNTIME_CHECK(hipIpcGetMemHandle(&handle, localPtr));
   bootNet.Allgather(&handle, cpuMemObj->ipcMemHandles, sizeof(hipIpcMemHandle_t));
-
   // Open IPC handles for all same-node peers to establish P2P data path
   // This happens regardless of transport type selection
   for (int i = 0; i < worldSize; i++) {
     if (!context.CanUseP2P(i)) continue;
-
-    HIP_RUNTIME_CHECK(hipIpcOpenMemHandle(reinterpret_cast<void**>(&cpuMemObj->p2pPeerPtrs[i]),
-                                          cpuMemObj->ipcMemHandles[i],
-                                          hipIpcMemLazyEnablePeerAccess));
+    if (context.SameProcessP2P(i)) {
+      cpuMemObj->p2pPeerPtrs[i] = cpuMemObj->peerPtrs[i];
+      auto res = hipDeviceEnablePeerAccess(i, 0 /* = flags */);
+      if (res != hipSuccess && res != hipErrorPeerAccessAlreadyEnabled) {
+        HIP_RUNTIME_CHECK(res);
+      }
+    } else {
+      HIP_RUNTIME_CHECK(hipIpcOpenMemHandle(reinterpret_cast<void**>(&cpuMemObj->p2pPeerPtrs[i]),
+                                            cpuMemObj->ipcMemHandles[i],
+                                            hipIpcMemLazyEnablePeerAccess));
+    }
   }
-
   // Update peerPtrs based on transport type:
   // - For RDMA transport: keep remote VA (already allgathered) in peerPtrs
   // - For P2P/SDMA transport: use P2P pointer from hipIpcOpenMemHandle
@@ -253,7 +265,7 @@ void SymmMemManager::DeregisterSymmMemObj(void* localPtr) {
   int rank = bootNet.GetLocalRank();
   int worldSize = bootNet.GetWorldSize();
   for (int i = 0; i < worldSize; i++) {
-    if (!context.CanUseP2P(i)) continue;
+    if (!context.CanUseP2P(i) || context.SameProcessP2P(i)) continue;
     if (memObjPtr.cpu->p2pPeerPtrs && memObjPtr.cpu->p2pPeerPtrs[i] != 0) {
       void* peerPtr = reinterpret_cast<void*>(memObjPtr.cpu->p2pPeerPtrs[i]);
       hipError_t closeErr = hipIpcCloseMemHandle(peerPtr);
@@ -305,6 +317,7 @@ SymmMemObjPtr SymmMemManager::RegisterStaticHeapSubRegion(void* localPtr, size_t
 
   cpuMemObj->ipcMemHandles =
       static_cast<hipIpcMemHandle_t*>(calloc(worldSize, sizeof(hipIpcMemHandle_t)));
+
   memcpy(cpuMemObj->ipcMemHandles, heapObj->cpu->ipcMemHandles,
          sizeof(hipIpcMemHandle_t) * worldSize);
 
