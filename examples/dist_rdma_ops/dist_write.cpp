@@ -498,17 +498,9 @@ void distRdmaOps(int argc, char* argv[]) {
   // 2 Create an endpoint
   RdmaEndpointConfig config;
   config.portId = activeDevicePortList[local_rank % activeDevicePortList.size()].second;
-#ifdef ENABLE_IONIC
-  config.gidIdx = 1;
-#else
-  config.gidIdx = 3;
-#endif
+  config.gidIdx = IonicDvApi::Available() ? 1 : 3;
   config.maxMsgsNum = 8092;
-#ifdef ENABLE_BNXT
-  config.maxCqeNum = 1;
-#else
-  config.maxCqeNum = 4096;
-#endif
+  config.maxCqeNum = BnxtDvApi::Available() ? 1 : 4096;
   config.alignment = 4096;
   config.onGpu = on_gpu;
   std::vector<RdmaEndpoint> endpoints;
@@ -655,18 +647,14 @@ void distRdmaOps(int argc, char* argv[]) {
           MultiQpWrite<ProviderType::MLX5><<<blocks, threads>>>(
               devEndpoints, global_mr_handles[0], global_mr_handles[1], size, 1, blockSync, num_qp);
           break;
-#ifdef ENABLE_BNXT
         case ProviderType::BNXT:
           MultiQpWrite<ProviderType::BNXT><<<blocks, threads>>>(
               devEndpoints, global_mr_handles[0], global_mr_handles[1], size, 1, blockSync, num_qp);
           break;
-#endif
-#ifdef ENABLE_IONIC
         case ProviderType::PSD:
           MultiQpWrite<ProviderType::PSD><<<blocks, threads>>>(
               devEndpoints, global_mr_handles[0], global_mr_handles[1], size, 1, blockSync, num_qp);
           break;
-#endif
         default:
           break;
       }
@@ -690,20 +678,16 @@ void distRdmaOps(int argc, char* argv[]) {
                                                                 global_mr_handles[1], size,
                                                                 warmupIters, blockSync + 1, num_qp);
           break;
-#ifdef ENABLE_BNXT
         case ProviderType::BNXT:
           MultiQpWrite<ProviderType::BNXT><<<blocks, threads>>>(devEndpoints, global_mr_handles[0],
                                                                 global_mr_handles[1], size,
                                                                 warmupIters, blockSync + 1, num_qp);
           break;
-#endif
-#ifdef ENABLE_IONIC
         case ProviderType::PSD:
           MultiQpWrite<ProviderType::PSD><<<blocks, threads>>>(devEndpoints, global_mr_handles[0],
                                                                global_mr_handles[1], size,
                                                                warmupIters, blockSync + 1, num_qp);
           break;
-#endif
         default:
           break;
       }
@@ -717,20 +701,16 @@ void distRdmaOps(int argc, char* argv[]) {
               <<<blocks, threads>>>(devEndpoints, global_mr_handles[0], global_mr_handles[1], size,
                                     iters, blockSync + 1 + warmupIters, num_qp);
           break;
-#ifdef ENABLE_BNXT
         case ProviderType::BNXT:
           MultiQpWrite<ProviderType::BNXT>
               <<<blocks, threads>>>(devEndpoints, global_mr_handles[0], global_mr_handles[1], size,
                                     iters, blockSync + 1 + warmupIters, num_qp);
           break;
-#endif
-#ifdef ENABLE_IONIC
         case ProviderType::PSD:
           MultiQpWrite<ProviderType::PSD><<<blocks, threads>>>(devEndpoints, global_mr_handles[0],
                                                                global_mr_handles[1], size, iters,
                                                                blockSync + 1 + warmupIters, num_qp);
           break;
-#endif
         default:
           break;
       }

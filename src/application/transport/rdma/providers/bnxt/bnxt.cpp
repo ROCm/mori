@@ -39,7 +39,6 @@
 
 #define USE_BNXT_DEFAULT_DBR
 
-#ifdef ENABLE_BNXT
 namespace std {
 static std::ostream& operator<<(std::ostream& s, const bnxt_re_dv_qp_mem_info& m) {
   std::stringstream ss;
@@ -68,11 +67,9 @@ struct fmt::formatter<bnxt_re_dv_qp_mem_info> {
                           m.sq_npsn, m.rq_va, m.rq_len, m.rq_slots, m.rq_wqe_sz, m.comp_mask);
   }
 };
-#endif  // ENABLE_BNXT
 
 namespace mori {
 namespace application {
-#ifdef ENABLE_BNXT
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                          BnxtCqContainer */
@@ -100,14 +97,14 @@ BnxtCqContainer::BnxtCqContainer(ibv_context* context, const RdmaEndpointConfig&
   umem_attr.size = cqSize;
   umem_attr.access_flags = IBV_ACCESS_LOCAL_WRITE;
 
-  cqUmem = bnxt_re_dv_umem_reg(context, &umem_attr);
+  cqUmem = BnxtDvApi::Instance().umem_reg(context, &umem_attr);
   assert(cqUmem);
 
   memset(&cq_attr, 0, sizeof(struct bnxt_re_dv_cq_init_attr));
   cq_attr.umem_handle = cqUmem;
   cq_attr.ncqe = cqeNum;
 
-  cq = bnxt_re_dv_create_cq(context, &cq_attr);
+  cq = BnxtDvApi::Instance().create_cq(context, &cq_attr);
   assert(cq);
 
   struct bnxt_re_dv_obj dv_obj{};
@@ -115,7 +112,7 @@ BnxtCqContainer::BnxtCqContainer(ibv_context* context, const RdmaEndpointConfig&
   memset(&dv_obj, 0, sizeof(struct bnxt_re_dv_obj));
   dv_obj.cq.in = cq;
   dv_obj.cq.out = &dvcq;
-  int status = bnxt_re_dv_init_obj(&dv_obj, BNXT_RE_DV_OBJ_CQ);
+  int status = BnxtDvApi::Instance().init_obj(&dv_obj, BNXT_RE_DV_OBJ_CQ);
   assert(!status);
   cqn = dvcq.cqn;
 
@@ -126,7 +123,7 @@ BnxtCqContainer::BnxtCqContainer(ibv_context* context, const RdmaEndpointConfig&
 BnxtCqContainer::~BnxtCqContainer() {
   if (cqUmemAddr) HIP_RUNTIME_CHECK(hipFree(cqUmemAddr));
   if (cqDbrUmemAddr) HIP_RUNTIME_CHECK(hipFree(cqDbrUmemAddr));
-  if (cqUmem) bnxt_re_dv_umem_dereg(cqUmem);
+  if (cqUmem) BnxtDvApi::Instance().umem_dereg(cqUmem);
   // Note: cqUar is shared with qpUar. Since CQ is destroyed after QP,
   // this is the correct place to unregister the shared UAR.
   // Use TryUnregisterUar to avoid double-unregister when multiple endpoints share the same UAR
@@ -135,7 +132,7 @@ BnxtCqContainer::~BnxtCqContainer() {
       HIP_RUNTIME_CHECK(hipHostUnregister(cqUar));
     }
   }
-  if (cq) bnxt_re_dv_destroy_cq(cq);
+  if (cq) BnxtDvApi::Instance().destroy_cq(cq);
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -238,7 +235,7 @@ BnxtQpContainer::BnxtQpContainer(ibv_context* context, const RdmaEndpointConfig&
 
 #ifndef USE_BNXT_DEFAULT_DBR
   // Allocate dedicated db region for this QP
-  dbrAttr = bnxt_re_dv_alloc_db_region(context);
+  dbrAttr = BnxtDvApi::Instance().alloc_db_region(context);
   assert(dbrAttr != nullptr);
 #endif
 
@@ -270,17 +267,17 @@ BnxtQpContainer::BnxtQpContainer(ibv_context* context, const RdmaEndpointConfig&
   umem_attr.addr = sqUmemAddr;
   umem_attr.size = qpMemInfo.sq_len;
   umem_attr.access_flags = IBV_ACCESS_LOCAL_WRITE;
-  sqUmem = dv_qp_attr.sq_umem_handle = bnxt_re_dv_umem_reg(context, &umem_attr);
+  sqUmem = dv_qp_attr.sq_umem_handle = BnxtDvApi::Instance().umem_reg(context, &umem_attr);
   assert(sqUmem);
 
   memset(&umem_attr, 0, sizeof(struct bnxt_re_dv_umem_reg_attr));
   umem_attr.addr = rqUmemAddr;
   umem_attr.size = qpMemInfo.rq_len;
   umem_attr.access_flags = IBV_ACCESS_LOCAL_WRITE;
-  rqUmem = dv_qp_attr.rq_umem_handle = bnxt_re_dv_umem_reg(context, &umem_attr);
+  rqUmem = dv_qp_attr.rq_umem_handle = BnxtDvApi::Instance().umem_reg(context, &umem_attr);
   assert(rqUmem);
 
-  qp = bnxt_re_dv_create_qp(pd, &dv_qp_attr);
+  qp = BnxtDvApi::Instance().create_qp(pd, &dv_qp_attr);
   assert(qp);
   qpn = qp->qp_num;
 
@@ -326,8 +323,8 @@ void BnxtQpContainer::DestroyQueuePair() {
     atomicIbufAddr = nullptr;
   }
 
-  if (sqUmem) bnxt_re_dv_umem_dereg(sqUmem);
-  if (rqUmem) bnxt_re_dv_umem_dereg(rqUmem);
+  if (sqUmem) BnxtDvApi::Instance().umem_dereg(sqUmem);
+  if (rqUmem) BnxtDvApi::Instance().umem_dereg(rqUmem);
   if (sqUmemAddr) {
     if (config.onGpu) {
       HIP_RUNTIME_CHECK(hipFree(sqUmemAddr));
@@ -353,12 +350,12 @@ void BnxtQpContainer::DestroyQueuePair() {
   // Do not call hipHostUnregister here to avoid double unregister
 #ifndef USE_BNXT_DEFAULT_DBR
   if (dbrAttr) {
-    int ret = bnxt_re_dv_free_db_region(context, dbrAttr);
+    int ret = BnxtDvApi::Instance().free_db_region(context, dbrAttr);
     assert(!ret);
     dbrAttr = nullptr;
   }
 #endif
-  if (qp) bnxt_re_dv_destroy_qp(qp);
+  if (qp) BnxtDvApi::Instance().destroy_qp(qp);
 }
 
 void* BnxtQpContainer::GetSqAddress() { return static_cast<char*>(sqUmemAddr); }
@@ -379,7 +376,7 @@ void BnxtQpContainer::ModifyRst2Init() {
 
   attr_mask = IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS;
 
-  int status = bnxt_re_dv_modify_qp(qp, &attr, attr_mask, 0, 0);
+  int status = BnxtDvApi::Instance().modify_qp(qp, &attr, attr_mask, 0, 0);
   assert(!status);
 }
 
@@ -416,7 +413,7 @@ void BnxtQpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& local_handle,
   attr_mask = IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_RQ_PSN | IBV_QP_DEST_QPN | IBV_QP_AV |
               IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
 
-  int status = bnxt_re_dv_modify_qp(qp, &attr, attr_mask, 0, 0);
+  int status = BnxtDvApi::Instance().modify_qp(qp, &attr, attr_mask, 0, 0);
   assert(!status);
 }
 
@@ -436,7 +433,7 @@ void BnxtQpContainer::ModifyRtr2Rts(const RdmaEndpointHandle& local_handle,
   attr_mask = IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC | IBV_QP_TIMEOUT |
               IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY;
 
-  int status = bnxt_re_dv_modify_qp(qp, &attr, attr_mask, 0, 0);
+  int status = BnxtDvApi::Instance().modify_qp(qp, &attr, attr_mask, 0, 0);
   assert(!status);
 
   // Check environment variable to decide whether to set UDP sport
@@ -454,7 +451,7 @@ void BnxtQpContainer::ModifyRtr2Rts(const RdmaEndpointHandle& local_handle,
     uint16_t selected_udp_sport = GetDeviceContext()->GetUdpSport(qpId);
     MORI_APP_TRACE("QP {} using UDP sport {} (qpId={}, index={})", qpn, selected_udp_sport, qpId,
                    qpId % RDMA_UDP_SPORT_ARRAY_SIZE);
-    status = bnxt_re_dv_modify_qp_udp_sport(qp, selected_udp_sport);
+    status = BnxtDvApi::Instance().modify_qp_udp_sport(qp, selected_udp_sport);
     if (status) {
       MORI_APP_WARN("Failed to set UDP sport {} for QP {}: error code {}", selected_udp_sport, qpn,
                     status);
@@ -476,7 +473,7 @@ BnxtDeviceContext::BnxtDeviceContext(RdmaDevice* rdma_device, ibv_pd* in_pd)
 
   dv_obj.pd.in = in_pd;
   dv_obj.pd.out = &dvpd;
-  int status = bnxt_re_dv_init_obj(&dv_obj, BNXT_RE_DV_OBJ_PD);
+  int status = BnxtDvApi::Instance().init_obj(&dv_obj, BNXT_RE_DV_OBJ_PD);
   assert(!status);
   pdn = dvpd.pdn;
 }
@@ -541,7 +538,7 @@ RdmaEndpoint BnxtDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& con
 #ifdef USE_BNXT_DEFAULT_DBR
   // Get default shared db region
   struct bnxt_re_dv_db_region_attr dbrAttr{};
-  ret = bnxt_re_dv_get_default_db_region(context, &dbrAttr);
+  ret = BnxtDvApi::Instance().get_default_db_region(context, &dbrAttr);
   assert(!ret);
   void* uar_host = (void*)dbrAttr.dbr;
 #else
@@ -624,7 +621,5 @@ RdmaDeviceContext* BnxtDevice::CreateRdmaDeviceContext() {
   ibv_pd* pd = ibv_alloc_pd(defaultContext);
   return new BnxtDeviceContext(this, pd);
 }
-#endif
-
 }  // namespace application
 }  // namespace mori
