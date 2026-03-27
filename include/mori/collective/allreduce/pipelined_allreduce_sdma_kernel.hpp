@@ -74,7 +74,6 @@ __global__ void PipelinedAllReduceSdmaKernel(
   // ---- Signal baselines (per-sender, requires sdmaNumQueue >= 3) ----
   __shared__ uint64_t s_scatter_by_sender[64];
   __shared__ uint64_t s_ag_by_sender[64];
-  __shared__ uint64_t s_rd_by_sender[64];
   __shared__ uint32_t s_cc_base;
 
   if (threadIdx.x == 0) {
@@ -82,15 +81,16 @@ __global__ void PipelinedAllReduceSdmaKernel(
         ? __scoped_atomic_load_n(
               &barrier->chunks_complete, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE)
         : 0u;
-    for (int s = 0; s < npes && s < 64; ++s) {
-      if (s == myPe) continue;
+  }
+  {
+    const int s = static_cast<int>(threadIdx.x);
+    if (s < npes && s != myPe) {
       const size_t row = static_cast<size_t>(s) * numQ;
       s_scatter_by_sender[s] =
           core::AtomicLoadRelaxed(dstMemObj->signalPtrs + row + 0);
       if (blockIdx.x == 0) {
         s_ag_by_sender[s] =
             core::AtomicLoadRelaxed(dstMemObj->signalPtrs + row + 1);
-        // q2/rd handshake removed: SDMA AG push replaces CU P2P AG.
       }
     }
   }
