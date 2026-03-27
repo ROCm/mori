@@ -50,8 +50,8 @@ HcaCapability QueryHcaCap(ibv_context* context) {
   DEVX_SET(query_hca_cap_in, cmd_cap_in, opcode, MLX5_CMD_OP_QUERY_HCA_CAP);
   DEVX_SET(query_hca_cap_in, cmd_cap_in, op_mod, HCA_CAP_OPMOD_GET_CUR);
 
-  status = Mlx5DvApi::Instance().devx_general_cmd(context, cmd_cap_in, sizeof(cmd_cap_in), cmd_cap_out,
-                                   sizeof(cmd_cap_out));
+  status = Mlx5DvApi::Instance().devx_general_cmd(context, cmd_cap_in, sizeof(cmd_cap_in),
+                                                  cmd_cap_out, sizeof(cmd_cap_out));
   assert(!status);
 
   HcaCapability hca_cap;
@@ -110,7 +110,8 @@ Mlx5CqContainer::Mlx5CqContainer(ibv_context* context, const RdmaEndpointConfig&
     assert(!status);
   }
 
-  cqDbrUmem = Mlx5DvApi::Instance().devx_umem_reg(context, cqDbrUmemAddr, 8, IBV_ACCESS_LOCAL_WRITE);
+  cqDbrUmem =
+      Mlx5DvApi::Instance().devx_umem_reg(context, cqDbrUmemAddr, 8, IBV_ACCESS_LOCAL_WRITE);
   assert(cqDbrUmem);
 
   // Allocate user access region
@@ -133,7 +134,8 @@ Mlx5CqContainer::Mlx5CqContainer(ibv_context* context, const RdmaEndpointConfig&
   assert(!status);
   DEVX_SET(cqc, cq_context, c_eqn, eqn);
 
-  cq = Mlx5DvApi::Instance().devx_obj_create(context, cmd_in, sizeof(cmd_in), cmd_out, sizeof(cmd_out));
+  cq = Mlx5DvApi::Instance().devx_obj_create(context, cmd_in, sizeof(cmd_in), cmd_out,
+                                             sizeof(cmd_out));
   assert(cq);
 
   cqn = DEVX_GET(create_cq_out, cmd_out, cqn);
@@ -210,7 +212,8 @@ void Mlx5QpContainer::CreateQueuePair(uint32_t cqn, uint32_t pdn) {
     assert(!status);
   }
 
-  qpUmem = Mlx5DvApi::Instance().devx_umem_reg(context, qpUmemAddr, qpTotalSize, IBV_ACCESS_LOCAL_WRITE);
+  qpUmem =
+      Mlx5DvApi::Instance().devx_umem_reg(context, qpUmemAddr, qpTotalSize, IBV_ACCESS_LOCAL_WRITE);
   assert(qpUmem);
 
   // Allocate user memory for DBR (doorbell?)
@@ -223,7 +226,8 @@ void Mlx5QpContainer::CreateQueuePair(uint32_t cqn, uint32_t pdn) {
     assert(!status);
   }
 
-  qpDbrUmem = Mlx5DvApi::Instance().devx_umem_reg(context, qpDbrUmemAddr, 8, IBV_ACCESS_LOCAL_WRITE);
+  qpDbrUmem =
+      Mlx5DvApi::Instance().devx_umem_reg(context, qpDbrUmemAddr, 8, IBV_ACCESS_LOCAL_WRITE);
   assert(qpDbrUmem);
 
   // Allocate and register atomic internal buffer (ibuf)
@@ -293,7 +297,8 @@ void Mlx5QpContainer::CreateQueuePair(uint32_t cqn, uint32_t pdn) {
   DEVX_SET(qpc, qp_context, dbr_umem_id, qpDbrUmem->umem_id);  // DBR buffer
   DEVX_SET(qpc, qp_context, page_offset, 0);
 
-  qp = Mlx5DvApi::Instance().devx_obj_create(context, cmd_in, sizeof(cmd_in), cmd_out, sizeof(cmd_out));
+  qp = Mlx5DvApi::Instance().devx_obj_create(context, cmd_in, sizeof(cmd_in), cmd_out,
+                                             sizeof(cmd_out));
   assert(qp);
 
   qpn = DEVX_GET(create_qp_out, cmd_out, qpn);
@@ -375,7 +380,7 @@ void Mlx5QpContainer::ModifyRst2Init() {
   DEVX_SET(qpc, qpc, counter_set_id, 0x0);
 
   int status = Mlx5DvApi::Instance().devx_obj_modify(qp, rst2init_cmd_in, sizeof(rst2init_cmd_in),
-                                      rst2init_cmd_out, sizeof(rst2init_cmd_out));
+                                                     rst2init_cmd_out, sizeof(rst2init_cmd_out));
   assert(!status);
 }
 
@@ -424,7 +429,7 @@ void Mlx5QpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& local_handle,
   }
 
   int status = Mlx5DvApi::Instance().devx_obj_modify(qp, init2rtr_cmd_in, sizeof(init2rtr_cmd_in),
-                                      init2rtr_cmd_out, sizeof(init2rtr_cmd_out));
+                                                     init2rtr_cmd_out, sizeof(init2rtr_cmd_out));
   assert(!status);
 }
 
@@ -447,8 +452,8 @@ void Mlx5QpContainer::ModifyRtr2Rts(const RdmaEndpointHandle& local_handle) {
   DEVX_SET(qpc, qpc, primary_address_path.ack_timeout, 20);
   DEVX_SET(qpc, qpc, primary_address_path.vhca_port_num, config.portId);
 
-  int status = Mlx5DvApi::Instance().devx_obj_modify(qp, rtr2rts_cmd_in, sizeof(rtr2rts_cmd_in), rtr2rts_cmd_out,
-                                      sizeof(rtr2rts_cmd_out));
+  int status = Mlx5DvApi::Instance().devx_obj_modify(qp, rtr2rts_cmd_in, sizeof(rtr2rts_cmd_in),
+                                                     rtr2rts_cmd_out, sizeof(rtr2rts_cmd_out));
   assert(!status);
 }
 

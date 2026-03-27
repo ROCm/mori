@@ -56,7 +56,8 @@ inline void* DvLoadSymbol(void* handle, const char* symbol_name) {
 // ============================================================================
 struct Mlx5DvApi {
   using devx_general_cmd_t = int (*)(struct ibv_context*, const void*, size_t, void*, size_t);
-  using devx_umem_reg_t = struct mlx5dv_devx_umem* (*)(struct ibv_context*, void*, size_t, uint32_t);
+  using devx_umem_reg_t = struct mlx5dv_devx_umem* (*)(struct ibv_context*, void*, size_t,
+                                                       uint32_t);
   using devx_umem_dereg_t = int (*)(struct mlx5dv_devx_umem*);
   using devx_alloc_uar_t = struct mlx5dv_devx_uar* (*)(struct ibv_context*, uint32_t);
   using devx_free_uar_t = void (*)(struct mlx5dv_devx_uar*);
@@ -84,29 +85,20 @@ struct Mlx5DvApi {
     handle = DvLoadLibrary("libmlx5.so");
     if (!handle) return false;
 
-    devx_general_cmd =
-        (devx_general_cmd_t)DvLoadSymbol(handle, "mlx5dv_devx_general_cmd");
-    devx_umem_reg =
-        (devx_umem_reg_t)DvLoadSymbol(handle, "mlx5dv_devx_umem_reg");
-    devx_umem_dereg =
-        (devx_umem_dereg_t)DvLoadSymbol(handle, "mlx5dv_devx_umem_dereg");
-    devx_alloc_uar =
-        (devx_alloc_uar_t)DvLoadSymbol(handle, "mlx5dv_devx_alloc_uar");
-    devx_free_uar =
-        (devx_free_uar_t)DvLoadSymbol(handle, "mlx5dv_devx_free_uar");
-    devx_query_eqn =
-        (devx_query_eqn_t)DvLoadSymbol(handle, "mlx5dv_devx_query_eqn");
-    devx_obj_create =
-        (devx_obj_create_t)DvLoadSymbol(handle, "mlx5dv_devx_obj_create");
-    devx_obj_modify =
-        (devx_obj_modify_t)DvLoadSymbol(handle, "mlx5dv_devx_obj_modify");
-    devx_obj_destroy =
-        (devx_obj_destroy_t)DvLoadSymbol(handle, "mlx5dv_devx_obj_destroy");
+    devx_general_cmd = (devx_general_cmd_t)DvLoadSymbol(handle, "mlx5dv_devx_general_cmd");
+    devx_umem_reg = (devx_umem_reg_t)DvLoadSymbol(handle, "mlx5dv_devx_umem_reg");
+    devx_umem_dereg = (devx_umem_dereg_t)DvLoadSymbol(handle, "mlx5dv_devx_umem_dereg");
+    devx_alloc_uar = (devx_alloc_uar_t)DvLoadSymbol(handle, "mlx5dv_devx_alloc_uar");
+    devx_free_uar = (devx_free_uar_t)DvLoadSymbol(handle, "mlx5dv_devx_free_uar");
+    devx_query_eqn = (devx_query_eqn_t)DvLoadSymbol(handle, "mlx5dv_devx_query_eqn");
+    devx_obj_create = (devx_obj_create_t)DvLoadSymbol(handle, "mlx5dv_devx_obj_create");
+    devx_obj_modify = (devx_obj_modify_t)DvLoadSymbol(handle, "mlx5dv_devx_obj_modify");
+    devx_obj_destroy = (devx_obj_destroy_t)DvLoadSymbol(handle, "mlx5dv_devx_obj_destroy");
     init_obj = (init_obj_t)DvLoadSymbol(handle, "mlx5dv_init_obj");
 
-    return devx_general_cmd && devx_umem_reg && devx_umem_dereg &&
-           devx_alloc_uar && devx_free_uar && devx_query_eqn &&
-           devx_obj_create && devx_obj_modify && devx_obj_destroy && init_obj;
+    return devx_general_cmd && devx_umem_reg && devx_umem_dereg && devx_alloc_uar &&
+           devx_free_uar && devx_query_eqn && devx_obj_create && devx_obj_modify &&
+           devx_obj_destroy && init_obj;
   }
 
   static Mlx5DvApi& Instance() {
@@ -167,18 +159,16 @@ struct BnxtDvApi {
     create_qp = (create_qp_t)DvLoadSymbol(handle, "bnxt_re_dv_create_qp");
     destroy_qp = (destroy_qp_t)DvLoadSymbol(handle, "bnxt_re_dv_destroy_qp");
     modify_qp = (modify_qp_t)DvLoadSymbol(handle, "bnxt_re_dv_modify_qp");
-    alloc_db_region =
-        (alloc_db_region_t)DvLoadSymbol(handle, "bnxt_re_dv_alloc_db_region");
-    free_db_region =
-        (free_db_region_t)DvLoadSymbol(handle, "bnxt_re_dv_free_db_region");
+    alloc_db_region = (alloc_db_region_t)DvLoadSymbol(handle, "bnxt_re_dv_alloc_db_region");
+    free_db_region = (free_db_region_t)DvLoadSymbol(handle, "bnxt_re_dv_free_db_region");
     modify_qp_udp_sport =
         (modify_qp_udp_sport_t)DvLoadSymbol(handle, "bnxt_re_dv_modify_qp_udp_sport");
     get_default_db_region =
         (get_default_db_region_t)DvLoadSymbol(handle, "bnxt_re_dv_get_default_db_region");
 
     // Required symbols for basic operation
-    return umem_reg && umem_dereg && create_cq && destroy_cq && init_obj &&
-           create_qp && destroy_qp && modify_qp;
+    return umem_reg && umem_dereg && create_cq && destroy_cq && init_obj && create_qp &&
+           destroy_qp && modify_qp;
   }
 
   static BnxtDvApi& Instance() {
@@ -219,17 +209,15 @@ struct IonicDvApi {
     if (!handle) return false;
 
     get_ctx = (get_ctx_t)DvLoadSymbol(handle, "ionic_dv_get_ctx");
-    qp_get_udma_idx =
-        (qp_get_udma_idx_t)DvLoadSymbol(handle, "ionic_dv_qp_get_udma_idx");
+    qp_get_udma_idx = (qp_get_udma_idx_t)DvLoadSymbol(handle, "ionic_dv_qp_get_udma_idx");
     get_cq = (get_cq_t)DvLoadSymbol(handle, "ionic_dv_get_cq");
     get_qp = (get_qp_t)DvLoadSymbol(handle, "ionic_dv_get_qp");
     pd_set_sqcmb = (pd_set_sqcmb_t)DvLoadSymbol(handle, "ionic_dv_pd_set_sqcmb");
     pd_set_rqcmb = (pd_set_rqcmb_t)DvLoadSymbol(handle, "ionic_dv_pd_set_rqcmb");
-    pd_set_udma_mask =
-        (pd_set_udma_mask_t)DvLoadSymbol(handle, "ionic_dv_pd_set_udma_mask");
+    pd_set_udma_mask = (pd_set_udma_mask_t)DvLoadSymbol(handle, "ionic_dv_pd_set_udma_mask");
 
-    return get_ctx && qp_get_udma_idx && get_cq && get_qp && pd_set_sqcmb &&
-           pd_set_rqcmb && pd_set_udma_mask;
+    return get_ctx && qp_get_udma_idx && get_cq && get_qp && pd_set_sqcmb && pd_set_rqcmb &&
+           pd_set_udma_mask;
   }
 
   static IonicDvApi& Instance() {
@@ -245,8 +233,8 @@ struct IonicDvApi {
 
 namespace mori {
 namespace application {
-using ::Mlx5DvApi;
 using ::BnxtDvApi;
 using ::IonicDvApi;
+using ::Mlx5DvApi;
 }  // namespace application
 }  // namespace mori

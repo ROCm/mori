@@ -49,32 +49,32 @@ struct mlx5dv_pd {
 
 struct mlx5dv_obj {
   struct {
-    struct ibv_qp *in;
-    void *out;
+    struct ibv_qp* in;
+    void* out;
   } qp;
   struct {
-    struct ibv_cq *in;
-    void *out;
+    struct ibv_cq* in;
+    void* out;
   } cq;
   struct {
-    struct ibv_srq *in;
-    void *out;
+    struct ibv_srq* in;
+    void* out;
   } srq;
   struct {
-    struct ibv_wq *in;
-    void *out;
+    struct ibv_wq* in;
+    void* out;
   } rwq;
   struct {
-    struct ibv_dm *in;
-    void *out;
+    struct ibv_dm* in;
+    void* out;
   } dm;
   struct {
-    struct ibv_ah *in;
-    void *out;
+    struct ibv_ah* in;
+    void* out;
   } ah;
   struct {
-    struct ibv_pd *in;
-    struct mlx5dv_pd *out;
+    struct ibv_pd* in;
+    struct mlx5dv_pd* out;
   } pd;
 };
 
@@ -86,8 +86,8 @@ struct mlx5dv_devx_umem {
 };
 
 struct mlx5dv_devx_uar {
-  void *reg_addr;
-  void *base_addr;
+  void* reg_addr;
+  void* base_addr;
   uint32_t page_id;
   off_t mmap_off;
   uint64_t comp_mask;
