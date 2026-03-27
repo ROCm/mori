@@ -76,15 +76,6 @@ __global__ void PipelinedAllReduceSdmaKernel(
   __shared__ uint64_t s_ag_by_sender[64];
   __shared__ uint64_t s_rd_by_sender[64];
   __shared__ uint32_t s_cc_base;
-  __shared__ uint32_t s_my_bd_base;
-
-  if constexpr (SCATTER_MODE == 0 && !MULTI_CHUNK) {
-    if (blockIdx.x != 0 && threadIdx.x == 0) {
-      s_my_bd_base = __scoped_atomic_load_n(
-          &barrier->block_done[blockIdx.x - 1],
-          __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
-    }
-  }
 
   if (threadIdx.x == 0) {
     s_cc_base = (blockIdx.x == 0)
@@ -171,17 +162,9 @@ __global__ void PipelinedAllReduceSdmaKernel(
 #if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
           asm volatile("buffer_wbl2" ::: "memory");
 #endif
-          if constexpr (!MULTI_CHUNK) {
-            __threadfence();
-            __scoped_atomic_store_n(
-                &barrier->block_done[blockIdx.x - 1],
-                s_my_bd_base + static_cast<uint32_t>(c + 1),
-                __ATOMIC_RELEASE, __MEMORY_SCOPE_DEVICE);
-          } else {
-            __threadfence_system();
-            __hip_atomic_fetch_add(&barrier->chunks_complete, 1u,
-                                   __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
-          }
+          __threadfence_system();
+          __hip_atomic_fetch_add(&barrier->chunks_complete, 1u,
+                                 __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
         }
 
         // Multi-chunk: AG is handled by Block 0 via SDMA (not CU P2P).
@@ -267,32 +250,20 @@ __global__ void PipelinedAllReduceSdmaKernel(
             ;
         }
       } else {
-        // Single-chunk: per-block-done poll → SDMA AG push (outbound).
-        // Uses parallel per-block flags instead of a single atomic counter
-        // to eliminate O(compBlocks) serialization on chunks_complete.
-        // Each thread reads its own baseline on-the-fly (in registers, no
-        // shared memory array) then polls until the flag advances.
-        {
-          const int t = static_cast<int>(threadIdx.x);
-          if (t < compBlocks) {
-            const uint32_t base = __scoped_atomic_load_n(
-                &barrier->block_done[t],
-                __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
-            const uint32_t expected = base + 1u;
-            while (__scoped_atomic_load_n(
-                       &barrier->block_done[t],
-                       __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) < expected)
-              ;
-          }
-        }
-        __syncthreads();
-
+        // Single-chunk: cc wait → SDMA AG push (outbound).
         if (thr < npes && thr != myPe) {
           const int destPe = thr;
           anvil::SdmaQueueDeviceHandle** dh =
               dstMemObj->deviceHandles_d + destPe * numQ;
           HSAuint64* rSig = dstMemObj->peerSignalPtrs[destPe]
               + static_cast<size_t>(myPe) * numQ;
+
+          const uint32_t ccTarget =
+              ccBase + static_cast<uint32_t>(compBlocks);
+          while (__scoped_atomic_load_n(
+                     &barrier->chunks_complete,
+                     __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) < ccTarget)
+            ;
 
           uint8_t* src = reinterpret_cast<uint8_t*>(dstMemObj->localPtr)
               + static_cast<size_t>(myPe) * totalShardBytes;
@@ -409,11 +380,9 @@ __global__ void PipelinedAllReduceSdmaKernel(
   }
 
 #if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
-  if constexpr (SCATTER_MODE != 0 || MULTI_CHUNK) {
-    __syncthreads();
-    if (threadIdx.x == 0) {
-      asm volatile("buffer_wbl2" ::: "memory");
-    }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    asm volatile("buffer_wbl2" ::: "memory");
   }
 #endif
 }
