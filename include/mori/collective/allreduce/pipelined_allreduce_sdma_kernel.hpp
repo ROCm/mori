@@ -75,17 +75,12 @@ __global__ void PipelinedAllReduceSdmaKernel(
   __shared__ uint64_t s_scatter_by_sender[64];
   __shared__ uint64_t s_ag_by_sender[64];
   __shared__ uint32_t s_cc_base;
-  __shared__ uint32_t s_rh_base;
 
   if (threadIdx.x == 0) {
     s_cc_base = (blockIdx.x == 0)
         ? __scoped_atomic_load_n(
               &barrier->chunks_complete, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE)
         : 0u;
-    if (blockIdx.x == 0) {
-      s_rh_base = __scoped_atomic_load_n(
-          &barrier->reduce_half, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
-    }
   }
   {
     const int s = static_cast<int>(threadIdx.x);
@@ -148,56 +143,16 @@ __global__ void PipelinedAllReduceSdmaKernel(
               reinterpret_cast<const P*>(input)
               + static_cast<size_t>(myPe) * packedPerRank + off;
 
-          if constexpr (!MULTI_CHUNK) {
-            const size_t half_cnt = cnt / 2;
-
-            size_t k = compTid;
-            for (; k < half_cnt; k += compStride) {
-              A acc = upcast_v<typename P::type, pack_size>(myInput[k]);
-              for (int pe = 0; pe < npes; ++pe) {
-                if (pe == myPe) continue;
-                packed_assign_add(
-                    acc,
-                    upcast_v<typename P::type, pack_size>(
-                        buf[static_cast<size_t>(pe) * packedPerRank + off + k]));
-              }
-              myDst[k] = downcast_v<typename P::type, pack_size>(acc);
+          for (size_t k = compTid; k < cnt; k += compStride) {
+            A acc = upcast_v<typename P::type, pack_size>(myInput[k]);
+            for (int pe = 0; pe < npes; ++pe) {
+              if (pe == myPe) continue;
+              packed_assign_add(
+                  acc,
+                  upcast_v<typename P::type, pack_size>(
+                      buf[static_cast<size_t>(pe) * packedPerRank + off + k]));
             }
-
-            __syncthreads();
-            if (threadIdx.x == 0) {
-#if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
-              asm volatile("buffer_wbl2" ::: "memory");
-#endif
-              __threadfence();
-              __hip_atomic_fetch_add(&barrier->reduce_half, 1u,
-                                     __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
-            }
-            __syncthreads();
-
-            for (; k < cnt; k += compStride) {
-              A acc = upcast_v<typename P::type, pack_size>(myInput[k]);
-              for (int pe = 0; pe < npes; ++pe) {
-                if (pe == myPe) continue;
-                packed_assign_add(
-                    acc,
-                    upcast_v<typename P::type, pack_size>(
-                        buf[static_cast<size_t>(pe) * packedPerRank + off + k]));
-              }
-              myDst[k] = downcast_v<typename P::type, pack_size>(acc);
-            }
-          } else {
-            for (size_t k = compTid; k < cnt; k += compStride) {
-              A acc = upcast_v<typename P::type, pack_size>(myInput[k]);
-              for (int pe = 0; pe < npes; ++pe) {
-                if (pe == myPe) continue;
-                packed_assign_add(
-                    acc,
-                    upcast_v<typename P::type, pack_size>(
-                        buf[static_cast<size_t>(pe) * packedPerRank + off + k]));
-              }
-              myDst[k] = downcast_v<typename P::type, pack_size>(acc);
-            }
+            myDst[k] = downcast_v<typename P::type, pack_size>(acc);
           }
         }
 
@@ -292,9 +247,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
             ;
         }
       } else {
-        // Single-chunk: poll reduce_half → early SDMA AG push (outbound).
-        // reduce_half fires after first half of reduce iterations + wbl2,
-        // allowing AG to overlap with the second half of reduce.
+        // Single-chunk: cc wait → SDMA AG push (outbound).
         if (thr < npes && thr != myPe) {
           const int destPe = thr;
           anvil::SdmaQueueDeviceHandle** dh =
@@ -302,11 +255,11 @@ __global__ void PipelinedAllReduceSdmaKernel(
           HSAuint64* rSig = dstMemObj->peerSignalPtrs[destPe]
               + static_cast<size_t>(myPe) * numQ;
 
-          const uint32_t rhTarget =
-              s_rh_base + static_cast<uint32_t>(compBlocks);
+          const uint32_t ccTarget =
+              ccBase + static_cast<uint32_t>(compBlocks);
           while (__scoped_atomic_load_n(
-                     &barrier->reduce_half,
-                     __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) < rhTarget)
+                     &barrier->chunks_complete,
+                     __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) < ccTarget)
             ;
 
           uint8_t* src = reinterpret_cast<uint8_t*>(dstMemObj->localPtr)
