@@ -54,7 +54,7 @@ jobs:
             core.setOutput('pr_number', String(pr.number));
             core.setOutput('head_ref',  pr.head.ref);
             core.setOutput('base_sha',  pr.base.sha);
-            core.setOutput('is_fork',   String(pr.head.repo.full_name !== context.repo.full_name));
+            core.setOutput('is_fork',   String(pr.head.repo.full_name !== `${context.repo.owner}/${context.repo.repo}`));
 
       - name: Abort on fork PRs (cannot push)
         if: steps.pr.outputs.is_fork == 'true'
