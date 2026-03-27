@@ -432,7 +432,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                 // 2 chunks is near-optimal: each AG transfer (~shard/2/link_bw)
                 // fully overlaps with the next chunk's scatter+reduce+fence.
                 constexpr int    kTargetChunks      = 2;
-                constexpr size_t kMinChunkShardBytes = 4ULL * 1024 * 1024;
+                constexpr size_t kMinChunkShardBytes = 8ULL * 1024 * 1024;
                 const size_t shard_bytes =
                     (total_count / npes_) * dtype_size_;
                 const size_t chunk_shard_bytes =
