@@ -39,12 +39,14 @@ namespace io {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        XgmiBackendSession                                      */
 /* ---------------------------------------------------------------------------------------------- */
+class XgmiBackend;
+
 class XgmiBackendSession : public BackendSession {
  public:
   XgmiBackendSession() = default;
   XgmiBackendSession(const XgmiBackendConfig& config, void* localAddr, void* remoteAddr,
-                     int localDevice, int remoteDevice, bool isIpcSession, StreamPool* streamPool,
-                     EventPool* eventPool);
+                     int localDevice, int remoteDevice, bool isIpcSession, XgmiBackend* backend,
+                     StreamPool* streamPool, EventPool* eventPool);
   ~XgmiBackendSession() = default;
 
   void ReadWrite(size_t localOffset, size_t remoteOffset, size_t size, TransferStatus* status,
@@ -63,6 +65,7 @@ class XgmiBackendSession : public BackendSession {
   int localDevice{-1};
   int remoteDevice{-1};
   bool isIpcSession{false};
+  XgmiBackend* backend{nullptr};
   StreamPool* streamPool{nullptr};
   EventPool* eventPool{nullptr};
 };
@@ -93,6 +96,8 @@ class XgmiBackend : public Backend {
   bool CanHandle(const MemoryDesc& local, const MemoryDesc& remote) const override;
 
   bool IsP2PAccessible(int srcDevice, int dstDevice) const;
+  void LoadScatterGatherModule(const std::string& hsacoPath);
+  hipFunction_t GetScatterGatherFunc(int deviceId);
 
  private:
   void InitializeP2PAccess();
@@ -161,6 +166,10 @@ class XgmiBackend : public Backend {
 
   std::unordered_map<EngineKey, EngineDesc> remoteEngines;
   mutable std::mutex remoteEnginesMu;
+
+  std::string scatterGatherHsacoPath_;
+  std::vector<hipModule_t> scatterGatherModules_;
+  std::vector<hipFunction_t> scatterGatherFuncs_;
 };
 
 }  // namespace io

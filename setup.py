@@ -241,6 +241,10 @@ def _copy_jit_sources(root_dir: Path) -> None:
         jit_dir / "src" / "ops" / "dispatch_combine",
     )
 
+    io_kernels_src = root_dir / "src" / "io" / "kernels"
+    if io_kernels_src.is_dir():
+        _copytree(io_kernels_src, jit_dir / "src" / "io" / "kernels")
+
     shmem_dst = jit_dir / "src" / "shmem"
     shmem_dst.mkdir(parents=True, exist_ok=True)
     for name in ["shmem_device_api_wrapper.cpp"]:
