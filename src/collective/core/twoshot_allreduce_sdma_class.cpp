@@ -416,7 +416,10 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                               (packedPerRank + threads - 1) / threads);
         if (blocks < 1) blocks = 1;
         if (scatter_mode == 0) {
-            int comp = std::min(blocks, kMaxPipelineBlocks - 1);
+            // Cap compute blocks: reduce is HBM-BW-limited (~80 CUs saturate
+            // 5.3 TB/s), extra blocks only add chunks_complete atomic contention.
+            constexpr int kPipelineCompCap = 72;
+            int comp = std::min(blocks, kPipelineCompCap);
             blocks = comp + 1;
         }
 
@@ -427,19 +430,18 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             if (scatter_mode == 1) {
                 chunk_elems = total_count;
             } else {
-                // Multi-chunk SDMA AG: overlap AG(c) with reduce(c+1)
-                // on independent HW.  Try 4 chunks first (best overlap for
-                // large sizes), fall back to 2, then 1.
-                constexpr int    kMaxChunks          = 4;
+                // Multi-chunk SDMA AG: overlap AG(c) transfer with
+                // scatter(c+1)+reduce(c+1) on independent HW engines.
+                // 2 chunks is near-optimal: each AG transfer (~shard/2/link_bw)
+                // fully overlaps with the next chunk's scatter+reduce+fence.
+                constexpr int    kTargetChunks      = 2;
                 constexpr size_t kMinChunkShardBytes = 8ULL * 1024 * 1024;
                 const size_t shard_bytes =
                     (total_count / npes_) * dtype_size_;
-                int nc = kMaxChunks;
-                while (nc > 1 &&
-                       shard_bytes / static_cast<size_t>(nc) < kMinChunkShardBytes)
-                    nc /= 2;
-                if (nc > 1) {
-                    chunk_elems = total_count / static_cast<size_t>(nc);
+                const size_t chunk_shard_bytes =
+                    shard_bytes / kTargetChunks;
+                if (chunk_shard_bytes >= kMinChunkShardBytes) {
+                    chunk_elems = total_count / kTargetChunks;
                 } else {
                     chunk_elems = total_count;
                 }
