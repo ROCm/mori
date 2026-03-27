@@ -162,7 +162,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
 #if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
           asm volatile("buffer_wbl2" ::: "memory");
 #endif
-          __threadfence_system();
+          __threadfence();
           __hip_atomic_fetch_add(&barrier->chunks_complete, 1u,
                                  __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
         }
@@ -379,12 +379,6 @@ __global__ void PipelinedAllReduceSdmaKernel(
     }
   }
 
-#if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    asm volatile("buffer_wbl2" ::: "memory");
-  }
-#endif
 }
 
 }  // namespace collective
