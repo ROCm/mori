@@ -129,7 +129,7 @@ setup(
         "build_ext": CMakeBuild,
         "build": CustomBuild,
     },
-    setup_requires=["setuptools_scm"],
+    setup_requires=["setuptools_scm==9.2.2"],
     python_requires=">=3.10",
     ext_modules=extensions,
     include_package_data=True,
