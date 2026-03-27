@@ -416,10 +416,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                               (packedPerRank + threads - 1) / threads);
         if (blocks < 1) blocks = 1;
         if (scatter_mode == 0) {
-            // Cap compute blocks: reduce is HBM-BW-limited (~80 CUs saturate
-            // 5.3 TB/s), extra blocks only add chunks_complete atomic contention.
-            constexpr int kPipelineCompCap = 72;
-            int comp = std::min(blocks, kPipelineCompCap);
+            int comp = std::min(blocks, kMaxPipelineBlocks - 1);
             blocks = comp + 1;
         }
 
