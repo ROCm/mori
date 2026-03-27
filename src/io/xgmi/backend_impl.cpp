@@ -303,8 +303,8 @@ void XgmiBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
       char* dstPtr = reinterpret_cast<char*>(dstBase);
       int numSegsInt = static_cast<int>(numSegs);
       void* kernelArgs[] = {&srcPtr, &dstPtr, &dSrcOff, &dDstOff, &dSizes, &numSegsInt};
-      err = hipModuleLaunchKernel(sgFunc, numBlocks, 1, 1, threadsPerBlock, 1, 1, 0,
-                                  stream, kernelArgs, nullptr);
+      err = hipModuleLaunchKernel(sgFunc, numBlocks, 1, 1, threadsPerBlock, 1, 1, 0, stream,
+                                  kernelArgs, nullptr);
       if (err != hipSuccess) {
         status->Update(
             StatusCode::ERR_GPU_OP,
@@ -705,9 +705,9 @@ XgmiBackendSession* XgmiBackend::GetOrCreateSessionCached(const MemoryDesc& loca
                  remoteDevice);
   }
 
-  auto sess = std::make_unique<XgmiBackendSession>(
-      config, localAddr, remoteAddr, localDevice, remoteDevice, ipcSession, this, streamPool.get(),
-      eventPool.get());
+  auto sess =
+      std::make_unique<XgmiBackendSession>(config, localAddr, remoteAddr, localDevice, remoteDevice,
+                                           ipcSession, this, streamPool.get(), eventPool.get());
 
   XgmiBackendSession* rawPtr = sess.get();
   sessionCache[key] = std::move(sess);
