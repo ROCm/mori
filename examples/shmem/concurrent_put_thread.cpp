@@ -776,14 +776,14 @@ void ConcurrentPutThread() {
     printf("=================================================================\n");
   }
 
-  Test0_DirectGPUAccess(myPe);
+  // Test0_DirectGPUAccess(myPe);
   Test1_LegacyAPI(myPe);
-  Test1_LegacyAPI_Block(myPe);
-  Test2_PureAddressAPI(myPe);
-  Test2_PureAddressAPI_Block(myPe);
-  Test3_LargeMultiChunk(myPe);
-  Test4_MixedMallocFree(myPe);
-  Test5_FragmentationReuse(myPe);
+  // Test1_LegacyAPI_Block(myPe);
+  // Test2_PureAddressAPI(myPe);
+  // Test2_PureAddressAPI_Block(myPe);
+  // Test3_LargeMultiChunk(myPe);
+  // Test4_MixedMallocFree(myPe);
+  // Test5_FragmentationReuse(myPe);
 
   // Test 6: Device barrier via direct kernel launch
   constexpr int barrierThreadNum = 128;

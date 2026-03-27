@@ -175,6 +175,7 @@ inline __device__ void ShmemQuietThreadKernelSerialImpl(int pe, int qpId) {
   if (core::GetActiveLaneNum() != 0) return;
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
+  // printf("quiet qpId %d\n", qpId);
   int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
   core::WorkQueueHandle& wq = ep[epIndex].wqHandle;
   core::CompletionQueueHandle& cq = ep[epIndex].cqHandle;
@@ -199,8 +200,18 @@ inline __device__ void ShmemQuietThreadKernelSerialImpl(int pe, int qpId) {
       MORI_PRINTF("rank %d dest pe %d consIdx %d opcode %d\n", rank, pe, my_cq_index, opcode);
       assert(false);
     }
+
+    uint32_t wqe_id_cqe = wqe_counter;
+    // printf("BNXT CQE POLL tid wqe_counter %d\n", wqe_counter);
     wqe_counter = (wqe_counter + wq.sqWqeNum - 1) % wq.sqWqeNum;
     uint64_t wqe_id = wq.outstandingWqe[wqe_counter] + 1;
+    // //wqe_counter是由CQE带上来的wqe_id，为啥还要 206这个查表操作?
+    int tid = core::FlatThreadId();
+    printf("tid %d bid %d wqe_id_cqe %d quried wqeId %d\n", tid, blockIdx.x, wqe_id_cqe, wqe_id);
+    if (wqe_id_cqe != wqe_id) {
+      printf("assert wqe_id_cqe %d quried wqeId %d\n", wqe_id_cqe, wqe_id);
+      // assert(0);
+    }
 
     __atomic_signal_fence(__ATOMIC_SEQ_CST);
     __hip_atomic_fetch_max(&wq.doneIdx, wqe_id, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
@@ -439,12 +450,19 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
   size_t currentOffset = 0;
   size_t remaining = bytes;
 
+  int thread_id = core::FlatThreadId();
+
+  if (thread_id == 0) {
+  }
+  // printf("PE %d qpn %d needChunk %d\n", pe, qpn, needsChunking);
+
   while (true) {
     // Check if current thread still has data to transfer
     bool has_remaining = (remaining > 0);
 
     // Synchronize within warp: get mask of threads that still have work
     uint64_t activemask = __ballot(has_remaining);
+    // printf("threadId %d activemask %u\n", thread_id, activemask);
     if (activemask == 0) {
       break;  // All threads in warp are done
     }
@@ -473,6 +491,7 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
       raddr = dest->peerPtrs[pe] + destOffset + currentOffset;
       rkey = dest->peerRkeys[pe];
       transfer_size = remaining;
+
     } else {
       // Slow path: VMM Heap - query keys for current chunk
       srcAddr = reinterpret_cast<uintptr_t>(source->localPtr) + sourceOffset + currentOffset;
@@ -484,7 +503,7 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
       VmmQueryRemoteAddr(dstAddr, pe, remaining, raddr, rkey, dst_chunk_size);
 
       transfer_size = src_chunk_size < dst_chunk_size ? src_chunk_size : dst_chunk_size;
-      // MORI_PRINTF("blockId %d, threadId %d VMM Heap: single transfer,srcAddr: %p, dstAddr: %p,
+      // printf("blockId %d, threadId %d VMM Heap: single transfer,srcAddr: %p, dstAddr: %p,
       // lkey: %x, raddr: %lx, rkey: %x, transfer_size: %zu\n", blockIdx.x, threadIdx.x, srcAddr,
       // dstAddr, lkey, raddr, rkey, transfer_size);
     }
@@ -497,19 +516,24 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
     uint32_t psnCnt = 0;
 
     if constexpr (PrvdType == core::ProviderType::BNXT) {
-      psnCnt = (transfer_size + wq->mtuSize - 1) / wq->mtuSize;
+      psnCnt = (transfer_size + wq->mtuSize - 1) /
+               wq->mtuSize;  // calculate how many rdma packets on the wire
     }
     if (is_leader) {
       if constexpr (PrvdType == core::ProviderType::MLX5) {
         warp_sq_counter = __hip_atomic_fetch_add(&wq->postIdx, num_active_lanes, __ATOMIC_RELAXED,
                                                  __HIP_MEMORY_SCOPE_AGENT);
-      } else if constexpr (PrvdType == core::ProviderType::BNXT) {
+
+      } else if constexpr (PrvdType == core::ProviderType::BNXT) {  // 每个lane发一个WQE
         core::atomic_add_packed_msn_and_psn(&wq->msnPack, num_active_lanes,
                                             psnCnt * num_active_lanes, &warp_msntbl_counter,
                                             &warp_psn_counter);
         warp_sq_counter = warp_msntbl_counter;
         __hip_atomic_fetch_max(&wq->postIdx, warp_sq_counter + num_active_lanes, __ATOMIC_RELAXED,
                                __HIP_MEMORY_SCOPE_AGENT);
+        // printf("tid %d psnCnt %u num_active_lanes %u warp_msntbl_counter %u\n", thread_id,
+        // psnCnt,
+        //        num_active_lanes, warp_msntbl_counter);
       } else if constexpr (PrvdType == core::ProviderType::PSD) {
         warp_sq_counter = __hip_atomic_fetch_add(&wq->postIdx, num_active_lanes, __ATOMIC_RELAXED,
                                                  __HIP_MEMORY_SCOPE_AGENT);
@@ -521,8 +545,8 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
     if constexpr (PrvdType == core::ProviderType::MLX5) {
       my_sq_counter = warp_sq_counter + my_logical_lane_id;
     } else if constexpr (PrvdType == core::ProviderType::BNXT) {
-      warp_msntbl_counter = __shfl(warp_msntbl_counter, leader_phys_lane_id);
-      warp_psn_counter = __shfl(warp_psn_counter, leader_phys_lane_id);
+      warp_msntbl_counter = __shfl(warp_msntbl_counter, leader_phys_lane_id);  // broadcast
+      warp_psn_counter = __shfl(warp_psn_counter, leader_phys_lane_id);        // broadcast
       my_sq_counter = warp_sq_counter + my_logical_lane_id;
       my_msntbl_counter = warp_msntbl_counter + my_logical_lane_id;
       my_psn_counter = warp_psn_counter + psnCnt * my_logical_lane_id;
@@ -533,6 +557,8 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
     }
 
     while (true) {
+      // doneIdx poll cq更新
+      // db_touch: ring doorbell的位置
       uint64_t db_touched =
           __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
       uint64_t db_done =
@@ -541,6 +567,9 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
       uint64_t num_free_entries = wq->sqWqeNum - num_active_sq_entries;
       uint64_t num_entries_until_warp_last_entry = warp_sq_counter + num_active_lanes - db_touched;
       if (num_free_entries > num_entries_until_warp_last_entry) {
+        // printf("tid %d db_touched %u db_done %u num_active_sq_entries %u\n", thread_id,
+        // db_touched,
+        //        db_done, num_active_sq_entries);
         break;
       }
       ShmemQuietThreadKernelImpl<PrvdType>(pe, qpId);
@@ -561,21 +590,25 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
       wq->outstandingWqe[my_sq_counter % OUTSTANDING_TABLE_SIZE] = my_sq_counter;
       dbr_val =
           core::PostWrite<PrvdType>(*wq, my_sq_counter, my_sq_counter, my_sq_counter, is_leader,
+
                                     qpn, srcAddr, lkey, raddr, rkey, transfer_size);
     } else {
       static_assert(false);
     }
-    __threadfence_system();
+    __threadfence_system();  // 保证所有对GPU内容的写入对其他设备可见
     if (is_leader) {
       uint64_t db_touched{0};
       do {
         db_touched = __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
       } while (db_touched != warp_sq_counter);
 
-      core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, warp_sq_counter + num_active_lanes);
+      core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr,
+                                          warp_sq_counter + num_active_lanes);  // 没用啊
       __threadfence_system();
       core::RingDoorbell<PrvdType>(wq->dbrAddr, dbr_val);
       __threadfence_system();
+
+      // printf("tid %d warp_sq_counter %d dbr_value %d\n", thread_id, warp_sq_counter, dbr_val);
 
       __hip_atomic_fetch_add(&cq->needConsIdx, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
       __hip_atomic_store(&wq->dbTouchIdx, warp_sq_counter + num_active_lanes, __ATOMIC_RELAXED,

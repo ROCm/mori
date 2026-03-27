@@ -69,6 +69,7 @@ add_shmem_example(atomic_fetch_thread SOURCES shmem/atomic_fetch_thread.cpp)
 add_shmem_example(test_p2p_direct_access SOURCES
                   shmem/test_p2p_direct_access.cpp)
 add_shmem_example(sdma_put_test SOURCES shmem/sdma_put_test.cpp)
+add_shmem_example(shm_put_rdma_test SOURCES shmem/shm_put_rdma_test.cpp)
 
 # --- Application examples ---
 add_executable(context application/context.cpp)

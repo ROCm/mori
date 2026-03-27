@@ -75,12 +75,12 @@ class BnxtCqContainer {
 
  public:
   uint32_t cqn{0};
-  void* cqUmemAddr{nullptr};
+  void* cqUmemAddr{nullptr};  // GPU写入CQE的显存地址
   void* cqDbrUmemAddr{nullptr};
   void* cqUmem{nullptr};
   void* cqDbrUmem{nullptr};
-  void* cqUar{nullptr};
-  void* cqUarPtr{nullptr};
+  void* cqUar{nullptr};     // CPU视角下的 CQ db指针
+  void* cqUarPtr{nullptr};  // GPU视角下的指针
   ibv_cq* cq{nullptr};
 };
 
@@ -120,9 +120,9 @@ class BnxtQpContainer {
   void* rqUmemAddr{nullptr};
   void* msntblUmemAddr{nullptr};
   void* qpDbrUmemAddr{nullptr};
-  void* sqUmem{nullptr};
-  void* rqUmem{nullptr};
-  void* qpDbrUmem{nullptr};
+  void* sqUmem{nullptr};     // used when destroy
+  void* rqUmem{nullptr};     //  used when destroy
+  void* qpDbrUmem{nullptr};  // not used
   void* qpUar{nullptr};
   void* qpUarPtr{nullptr};
   ibv_qp* qp{nullptr};
