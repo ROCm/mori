@@ -38,7 +38,5 @@ def ensure_scatter_gather_kernel() -> str:
     if _hsaco_path is None:
         from mori.jit.core import compile_genco
 
-        _hsaco_path = compile_genco(
-            "scatter_gather", source_dir="src/io/kernels"
-        )
+        _hsaco_path = compile_genco("scatter_gather", source_dir="src/io/kernels")
     return _hsaco_path

@@ -256,8 +256,7 @@ void XgmiBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
   void* srcBase = isRead ? remoteAddr : localAddr;
   void* dstBase = isRead ? localAddr : remoteAddr;
 
-  hipFunction_t sgFunc =
-      backend != nullptr ? backend->GetScatterGatherFunc(kernelDevice) : nullptr;
+  hipFunction_t sgFunc = backend != nullptr ? backend->GetScatterGatherFunc(kernelDevice) : nullptr;
   bool useKernel =
       sgFunc != nullptr && static_cast<int>(segments.size()) > getScatterGatherKernelThreshold();
 
