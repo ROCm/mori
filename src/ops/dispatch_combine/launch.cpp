@@ -91,6 +91,16 @@ void KernelRegistry::LoadModule(const std::string& hsaco_path) {
   }
   impl.modules.push_back(mod);
 
+  int dev_id = 0;
+#ifdef MORI_MULTITHREAD_SUPPORT
+  HIP_RUNTIME_CHECK(hipGetDevice(&dev_id));
+  // TODO we need to keep kernel registry per device
+  // Possibly just put kernel registry to shmem states
+  fprintf(stderr, "LoadModule: dev_id=%d total modules=%zu hsaco_path=%s\n", dev_id, impl.modules.size(), hsaco_path.c_str());
+  // NOTE NOTE: we need to 
+
+#endif // MORI_MULTITHREAD_SUPPORT
+
   // Initialize shmem globalGpuStates in this module
   mori::shmem::ShmemModuleInit(reinterpret_cast<void*>(mod));
 }
