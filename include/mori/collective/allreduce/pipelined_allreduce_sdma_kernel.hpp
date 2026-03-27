@@ -1,17 +1,18 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
 // MIT License (see twoshot_sdma_kernel.hpp for full text)
 //
-// Pipelined AllReduce — SDMA scatter + CU P2P-read AllGather.
+// Pipelined AllReduce — SDMA scatter + reduce + SDMA AllGather.
 //
 // SCATTER_MODE=0: Single-kernel AllReduce (SDMA scatter + reduce + SDMA AG)
-//   1-chunk mode (all practical sizes up to ~1 TB/PE):
+//   1-chunk mode (shard < 2×kMinChunkShardBytes):
 //     Block 0: burst scatter → cc wait → SDMA AG push → AG wait.
 //     Compute blocks: scatter-poll → reduce → wbl2+fence → chunks_complete.
-//     No q2/rd handshake: AG SDMA transfer time ≫ remote reduce time.
 //     No signal/barrier zeroing: monotonic ATOMIC_INC + baseline protocol.
-//   Multi-chunk mode (disabled by kMinShardBytes=128MB):
-//     Block 0: burst scatter → q2/rd handshake → ag_gate per chunk.
-//     Compute blocks: scatter-poll → reduce → wait ag_gate → CU P2P AG.
+//   Multi-chunk mode (shard ≥ 2×kMinChunkShardBytes, default 2 chunks):
+//     Block 0: burst scatter → per-chunk (cc wait → SDMA AG push) → AG wait.
+//     Compute blocks: scatter-poll → reduce → wbl2+fence → chunks_complete.
+//     Overlaps AG(c) SDMA transfer with scatter(c+1)+reduce(c+1) on CU,
+//     recovering ~50% of the AG latency.
 //
 // SCATTER_MODE=1: P2P read + CU AG (legacy path).
 //
@@ -98,10 +99,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
       if (blockIdx.x == 0) {
         s_ag_by_sender[s] =
             core::AtomicLoadRelaxed(dstMemObj->signalPtrs + row + 1);
-        if constexpr (MULTI_CHUNK) {
-          s_rd_by_sender[s] =
-              core::AtomicLoadRelaxed(dstMemObj->signalPtrs + row + 2);
-        }
+        // q2/rd handshake removed: SDMA AG push replaces CU P2P AG.
       }
     }
   }
@@ -186,38 +184,8 @@ __global__ void PipelinedAllReduceSdmaKernel(
           }
         }
 
-        // CU P2P Read AG — multi-chunk pipeline only.
-        // Each compute block reads a strided portion of every remote PE's
-        // reduced shard via inbound XGMI, while SDMA scatter continues on
-        // outbound XGMI (true bidirectional overlap with scatter(c+1)).
-        if constexpr (MULTI_CHUNK) {
-          if (threadIdx.x == 0) {
-            const uint32_t agTarget = static_cast<uint32_t>(c + 1);
-            while (__scoped_atomic_load_n(
-                       &barrier->ag_gate,
-                       __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) < agTarget)
-              ;
-          }
-          __syncthreads();
-
-          {
-            const size_t off = static_cast<size_t>(c) * packedChunkPerRank;
-            size_t cnt = packedChunkPerRank;
-            if (off + cnt > packedPerRank) cnt = packedPerRank - off;
-
-            for (int pe = 0; pe < npes; ++pe) {
-              if (pe == myPe) continue;
-              const P* __restrict__ remoteSrc =
-                  reinterpret_cast<const P*>(dstMemObj->peerPtrs[pe])
-                  + static_cast<size_t>(pe) * packedPerRank + off;
-              P* __restrict__ localDst =
-                  buf + static_cast<size_t>(pe) * packedPerRank + off;
-              for (size_t k = compTid; k < cnt; k += compStride) {
-                localDst[k] = remoteSrc[k];
-              }
-            }
-          }
-        }
+        // Multi-chunk: AG is handled by Block 0 via SDMA (not CU P2P).
+        // Compute blocks only do scatter-poll + reduce + CC signal.
       }
 
     } else {
@@ -225,7 +193,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
       // BLOCK 0 — Burst-Submit Scatter + AG
       //
       // Phase 1: burst-submit ALL scatter packets to SDMA queues.
-      // Phase 2 (multi-chunk): q2/rd handshake → ag_gate per chunk.
+      // Phase 2 (multi-chunk): per-chunk cc wait → SDMA AG push.
       // Phase 2 (1-chunk): cc wait → SDMA AG push → final AG wait.
       // =================================================================
       const int thr = static_cast<int>(threadIdx.x);
@@ -255,14 +223,20 @@ __global__ void PipelinedAllReduceSdmaKernel(
 
       // ---- Phase 2+3: dual-mode AG ----
       if constexpr (MULTI_CHUNK) {
-        // Multi-chunk: q2/rd handshake per chunk, then signal ag_gate so
-        // compute blocks can start CU P2P Read AG (inbound XGMI).
-        const bool active = (thr < npes && thr != myPe);
+        // Multi-chunk SDMA AG: overlap AG(c) with scatter(c+1)+reduce(c+1).
+        // Each active thread handles one remote PE.  Per chunk: wait for
+        // all compute blocks to finish reduce, then submit SDMA AG push.
+        // AG overwrite of scatter data is safe: AG arrives at remote PE
+        // long after that PE's reduce finished reading the scatter slot
+        // (fence + CC + AG_transfer ≫ remote reduce time).
+        if (thr < npes && thr != myPe) {
+          const int destPe = thr;
+          anvil::SdmaQueueDeviceHandle** dh =
+              dstMemObj->deviceHandles_d + destPe * numQ;
+          HSAuint64* rSig = dstMemObj->peerSignalPtrs[destPe]
+              + static_cast<size_t>(myPe) * numQ;
 
-        for (int c = 0; c < numChunks; c++) {
-          if (active) {
-            const int destPe = thr;
-
+          for (int c = 0; c < numChunks; c++) {
             const uint32_t ccTarget =
                 ccBase + static_cast<uint32_t>((c + 1) * compBlocks);
             while (__scoped_atomic_load_n(
@@ -270,24 +244,27 @@ __global__ void PipelinedAllReduceSdmaKernel(
                        __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) < ccTarget)
               ;
 
-            HSAuint64* rs = dstMemObj->peerSignalPtrs[destPe]
-                + static_cast<size_t>(myPe) * numQ + 2;
-            __hip_atomic_fetch_add(rs, 1ULL,
-                __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+            const size_t cOff = static_cast<size_t>(c) * chunkBytes;
+            size_t agBytes = chunkBytes;
+            if (cOff + agBytes > totalShardBytes)
+              agBytes = totalShardBytes - cOff;
 
-            const uint64_t rdNeed =
-                s_rd_by_sender[destPe] + static_cast<uint64_t>(c + 1);
-            HSAuint64* rdSig = dstMemObj->signalPtrs
-                + static_cast<size_t>(destPe) * numQ + 2;
-            while (core::AtomicLoadRelaxed(rdSig) < rdNeed)
-              ;
+            uint8_t* src = reinterpret_cast<uint8_t*>(dstMemObj->localPtr)
+                + static_cast<size_t>(myPe) * totalShardBytes + cOff;
+            uint8_t* dst = reinterpret_cast<uint8_t*>(dstMemObj->peerPtrs[destPe])
+                + static_cast<size_t>(myPe) * totalShardBytes + cOff;
+            core::SdmaPutThread(src, dst, agBytes, dh, rSig, numQ, 1);
           }
-          __syncthreads();
+        }
 
-          if (thr == 0) {
-            __hip_atomic_fetch_add(&barrier->ag_gate, 1u,
-                                   __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
-          }
+        if (thr < npes && thr != myPe) {
+          const int sender = thr;
+          const uint64_t expected =
+              s_ag_by_sender[sender] + static_cast<uint64_t>(numChunks);
+          HSAuint64* sig = dstMemObj->signalPtrs
+              + static_cast<size_t>(sender) * numQ + 1;
+          while (core::AtomicLoadRelaxed(sig) < expected)
+            ;
         }
       } else {
         // Single-chunk: per-block-done poll → SDMA AG push (outbound).
