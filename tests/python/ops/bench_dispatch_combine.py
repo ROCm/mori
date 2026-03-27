@@ -36,11 +36,116 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
     def gen_test_data(self):
         return super().gen_test_data(use_max_token_num=True)
 
-    def run_once(
+    def _get_combine_input(self, op, dispatch_output):
+        if self.config.use_external_inp_buf:
+            return dispatch_output
+        return op.get_registered_combine_input_buffer(
+            self.config.data_type, hidden_dim=dispatch_output.size(1)
+        )
+
+    def _capture_split_graphs(
         self,
         op,
         test_data,
-        check_result,
+        dispatch_block_num,
+        dispatch_warp_per_block,
+        combine_block_num,
+        combine_warp_per_block,
+    ):
+        (
+            _,
+            all_rank_indices,
+            all_rank_input,
+            all_rank_weights,
+            all_rank_scales,
+        ) = test_data
+
+        dispatch_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(dispatch_graph):
+            (
+                dispatch_output,
+                _,
+                _,
+                dispatch_indices,
+                dispatch_recv_num_token,
+            ) = op.dispatch(
+                all_rank_input[self.config.rank],
+                all_rank_weights[self.config.rank],
+                # None,
+                all_rank_scales[self.config.rank],
+                all_rank_indices[self.config.rank],
+                block_num=dispatch_block_num,
+                warp_per_block=dispatch_warp_per_block,
+            )
+
+        combine_input = self._get_combine_input(op, dispatch_output)
+
+        combine_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(combine_graph):
+            combine_output, _ = op.combine(
+                combine_input,
+                # dispatch_weights,
+                None,
+                dispatch_indices,
+                block_num=combine_block_num,
+                warp_per_block=combine_warp_per_block,
+            )
+        self.sync()
+
+        return dispatch_graph, combine_graph
+
+    def _capture_e2e_graph(
+        self,
+        op,
+        test_data,
+        dispatch_block_num,
+        dispatch_warp_per_block,
+        combine_block_num,
+        combine_warp_per_block,
+        total_recv_num_token,
+    ):
+        (
+            _,
+            all_rank_indices,
+            all_rank_input,
+            all_rank_weights,
+            all_rank_scales,
+        ) = test_data
+
+        e2e_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(e2e_graph):
+            (
+                e2e_dispatch_output,
+                _,
+                _,
+                e2e_dispatch_indices,
+                e2e_dispatch_recv_num_token,
+            ) = op.dispatch(
+                all_rank_input[self.config.rank],
+                all_rank_weights[self.config.rank],
+                # None,
+                all_rank_scales[self.config.rank],
+                all_rank_indices[self.config.rank],
+                block_num=dispatch_block_num,
+                warp_per_block=dispatch_warp_per_block,
+            )
+            e2e_combine_arg = self._get_combine_input(op, e2e_dispatch_output)
+            e2e_combine_output, _ = op.combine(
+                e2e_combine_arg,
+                # dispatch_weights,
+                None,
+                e2e_dispatch_indices,
+                block_num=combine_block_num,
+                warp_per_block=combine_warp_per_block,
+            )
+        self.sync()
+
+        return e2e_graph
+
+    def run_once_test(
+        self,
+        op,
+        test_data,
         dispatch_block_num,
         dispatch_warp_per_block,
         combine_block_num,
@@ -54,11 +159,6 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             all_rank_scales,
         ) = test_data
 
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-
-        self.sync()
-        start_event.record()
         (
             dispatch_output,
             dispatch_weights,
@@ -74,48 +174,142 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             block_num=dispatch_block_num,
             warp_per_block=dispatch_warp_per_block,
         )
-        end_event.record()
-        self.sync()
-        disp_duration = start_event.elapsed_time(end_event)
-
-        if check_result:
-            self.check_dispatch_result(
-                op,
-                test_data,
-                dispatch_output,
-                dispatch_weights,
-                dispatch_scales,
-                dispatch_indices,
-                dispatch_recv_num_token,
-            )
+        self.check_dispatch_result(
+            op,
+            test_data,
+            dispatch_output,
+            dispatch_weights,
+            dispatch_scales,
+            dispatch_indices,
+            dispatch_recv_num_token,
+        )
 
         total_recv_num_token = dispatch_recv_num_token[0].item()
 
+        combine_input = self._get_combine_input(op, dispatch_output)
         if not self.config.use_external_inp_buf:
-            combine_input = op.get_registered_combine_input_buffer(
-                self.config.data_type, hidden_dim=dispatch_output.size(1)
-            )
             combine_input[:total_recv_num_token, :].copy_(
                 dispatch_output[:total_recv_num_token, :]
             )
 
-        self.sync()
-        start_event.record()
         combine_output, _ = op.combine(
-            dispatch_output if self.config.use_external_inp_buf else combine_input,
+            combine_input,
             # dispatch_weights,
             None,
             dispatch_indices,
             block_num=combine_block_num,
             warp_per_block=combine_warp_per_block,
         )
-        end_event.record()
+        self.check_combine_result(op, test_data, combine_output)
         self.sync()
-        comb_duration = start_event.elapsed_time(end_event)
+        return total_recv_num_token
 
-        if check_result:
-            self.check_combine_result(op, test_data, combine_output)
-        op.reset()
+    def run_once_bench(
+        self,
+        op,
+        test_data,
+        dispatch_block_num,
+        dispatch_warp_per_block,
+        combine_block_num,
+        combine_warp_per_block,
+        graph_replay_iters=10,
+    ):
+        (
+            _,
+            all_rank_indices,
+            all_rank_input,
+            all_rank_weights,
+            all_rank_scales,
+        ) = test_data
+
+        if graph_replay_iters <= 0:
+            raise ValueError("graph_replay_iters must be greater than 0")
+
+        # Run one real pair first so the dynamic recv-token count is available
+        # before we build the benchmark graphs.
+        total_recv_num_token = self.run_once_test(
+            op,
+            test_data,
+            dispatch_block_num,
+            dispatch_warp_per_block,
+            combine_block_num,
+            combine_warp_per_block,
+        )
+
+        # Split dispatch/combine into two graphs so we can time each replay
+        # separately with host-side events.
+        dispatch_graph, combine_graph = self._capture_split_graphs(
+            op,
+            test_data,
+            dispatch_block_num,
+            dispatch_warp_per_block,
+            combine_block_num,
+            combine_warp_per_block,
+        )
+
+        # Capture the full end-to-end path to compare single-graph replay
+        # against the split-graph timings above.
+        e2e_graph = self._capture_e2e_graph(
+            op,
+            test_data,
+            dispatch_block_num,
+            dispatch_warp_per_block,
+            combine_block_num,
+            combine_warp_per_block,
+            total_recv_num_token,
+        )
+
+        round_start_events = [
+            torch.cuda.Event(enable_timing=True) for _ in range(graph_replay_iters)
+        ]
+        mid_events = [
+            torch.cuda.Event(enable_timing=True) for _ in range(graph_replay_iters)
+        ]
+        round_end_events = [
+            torch.cuda.Event(enable_timing=True) for _ in range(graph_replay_iters)
+        ]
+        e2e_start_events = [
+            torch.cuda.Event(enable_timing=True) for _ in range(graph_replay_iters)
+        ]
+        e2e_end_events = [
+            torch.cuda.Event(enable_timing=True) for _ in range(graph_replay_iters)
+        ]
+
+        for i in range(graph_replay_iters):
+            # Split-graph replay path.
+            round_start_events[i].record()
+            dispatch_graph.replay()
+            mid_events[i].record()
+            combine_graph.replay()
+            round_end_events[i].record()
+
+            # Single-graph end-to-end replay path.
+            e2e_start_events[i].record()
+            e2e_graph.replay()
+            e2e_end_events[i].record()
+
+        torch.cuda.synchronize()
+        disp_duration = (
+            sum(
+                start_event.elapsed_time(end_event)
+                for start_event, end_event in zip(round_start_events, mid_events)
+            )
+            / graph_replay_iters
+        )
+        comb_duration = (
+            sum(
+                start_event.elapsed_time(end_event)
+                for start_event, end_event in zip(mid_events, round_end_events)
+            )
+            / graph_replay_iters
+        )
+        e2e_duration = (
+            sum(
+                start_event.elapsed_time(end_event)
+                for start_event, end_event in zip(e2e_start_events, e2e_end_events)
+            )
+            / graph_replay_iters
+        )
         self.sync()
 
         element_size = all_rank_input[self.config.rank].element_size()
@@ -131,6 +325,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         return (
             disp_duration,
             comb_duration,
+            e2e_duration,
             disp_bandwidth,
             comb_bandwidth,
             total_bytes,
@@ -146,13 +341,13 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         combine_warp_per_block,
         warmup=1,
         iters=10,
+        graph_replay_iters=10,
     ):
         test_data = self.gen_test_data()
         for _ in range(warmup):
-            self.run_once(
+            self.run_once_test(
                 op,
                 test_data,
-                True,
                 dispatch_block_num,
                 dispatch_warp_per_block,
                 combine_block_num,
@@ -163,40 +358,50 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         disp_bandwidth_GB_list = []
         comb_duration_us_list = []
         comb_bandwidth_GB_list = []
+        e2e_duration_us_list = []
         avg_total_bytes_MB_list = []
 
         test_data_list = [self.gen_test_data() for i in range(iters)]
 
         for i in range(iters):
             self.sync()
-            disp_dur, comb_dur, disp_bw, comb_bw, total_bytes, ll_mode_scale = (
-                self.run_once(
-                    op,
-                    test_data_list[i],
-                    False,
-                    dispatch_block_num,
-                    dispatch_warp_per_block,
-                    combine_block_num,
-                    combine_warp_per_block,
-                )
+            (
+                disp_dur,
+                comb_dur,
+                e2e_dur,
+                disp_bw,
+                comb_bw,
+                total_bytes,
+                ll_mode_scale,
+            ) = self.run_once_bench(
+                op,
+                test_data_list[i],
+                dispatch_block_num,
+                dispatch_warp_per_block,
+                combine_block_num,
+                combine_warp_per_block,
+                graph_replay_iters=graph_replay_iters,
             )
 
             disp_dur_list = [torch.zeros(1) for _ in range(self.config.world_size)]
             disp_bw_list = [torch.zeros(1) for _ in range(self.config.world_size)]
             comb_dur_list = [torch.zeros(1) for _ in range(self.config.world_size)]
             comb_bw_list = [torch.zeros(1) for _ in range(self.config.world_size)]
+            e2e_dur_list = [torch.zeros(1) for _ in range(self.config.world_size)]
             total_bytes_list = [torch.zeros(1) for _ in range(self.config.world_size)]
 
             dist.all_gather(disp_dur_list, torch.tensor([disp_dur * 1000]))
             dist.all_gather(disp_bw_list, torch.tensor([disp_bw]))
             dist.all_gather(comb_dur_list, torch.tensor([comb_dur * 1000]))
             dist.all_gather(comb_bw_list, torch.tensor([comb_bw]))
+            dist.all_gather(e2e_dur_list, torch.tensor([e2e_dur * 1000]))
             dist.all_gather(total_bytes_list, torch.tensor([total_bytes / (1024**2)]))
 
             disp_duration_us_list.append([int(t.item()) for t in disp_dur_list])
             disp_bandwidth_GB_list.append([int(t.item()) for t in disp_bw_list])
             comb_duration_us_list.append([int(t.item()) for t in comb_dur_list])
             comb_bandwidth_GB_list.append([int(t.item()) for t in comb_bw_list])
+            e2e_duration_us_list.append([int(t.item()) for t in e2e_dur_list])
             avg_total_bytes_MB_list.append(
                 int(torch.tensor(total_bytes_list).mean().item())
             )
@@ -207,6 +412,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         max_comb_algo_bw = 0
         min_disp_latency_us = float("inf")
         min_comb_latency_us = float("inf")
+        min_e2e_latency_us = float("inf")
         for i in range(iters):
             disp_algo_bw = sum(disp_bandwidth_GB_list[i]) / self.config.world_size
             comb_algo_bw = sum(comb_bandwidth_GB_list[i]) / self.config.world_size
@@ -214,8 +420,10 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             max_comb_algo_bw = max(max_comb_algo_bw, comb_algo_bw)
             disp_max_lat = max(disp_duration_us_list[i])
             comb_max_lat = max(comb_duration_us_list[i])
+            e2e_max_lat = max(e2e_duration_us_list[i])
             min_disp_latency_us = min(min_disp_latency_us, disp_max_lat)
             min_comb_latency_us = min(min_comb_latency_us, comb_max_lat)
+            min_e2e_latency_us = min(min_e2e_latency_us, e2e_max_lat)
 
         if self.config.rank == 0:
             print("Dispatch result:")
@@ -223,7 +431,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
                 algo_bw = sum(disp_bandwidth_GB_list[i]) / self.config.world_size
                 print(
                     f"Round {i} duration(us) {duration_us} "
-                    f"bandwidth(GB/s) {disp_bandwidth_GB_list[i]}"
+                    f"bandwidth(GB/s) {disp_bandwidth_GB_list[i]} "
                     f"avg bytes(MB) {avg_total_bytes_MB_list[i]} bw {algo_bw} / {algo_bw * ll_mode_scale:.2f}"
                 )
 
@@ -233,9 +441,17 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
                 algo_bw = sum(comb_bandwidth_GB_list[i]) / self.config.world_size
                 print(
                     f"Round {i} duration(us) {duration_us} "
-                    f"bandwidth(GB/s) {comb_bandwidth_GB_list[i]}"
+                    f"bandwidth(GB/s) {comb_bandwidth_GB_list[i]} "
                     f"avg bytes(MB) {avg_total_bytes_MB_list[i]} bw {algo_bw} / {algo_bw * ll_mode_scale:.2f}"
                 )
+
+            print()
+            print("End-to-end result:")
+            print(
+                "Note: e2e is one full-graph replay; separate results use two graph replays, so sep total is usually higher."
+            )
+            for i, duration_us in enumerate(e2e_duration_us_list):
+                print(f"Round {i} e2e(us) {duration_us} ")
 
         return (
             max_disp_algo_bw,
@@ -243,48 +459,6 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             min_disp_latency_us,
             min_comb_latency_us,
         )
-
-    def stress_once(
-        self,
-        op,
-        test_data,
-        dispatch_block_num,
-        dispatch_warp_per_block,
-        combine_block_num,
-        combine_warp_per_block,
-    ):
-        (
-            all_rank_num_token,
-            all_rank_indices,
-            all_rank_input,
-            all_rank_weights,
-            all_rank_scales,
-        ) = test_data
-
-        (
-            dispatch_output,
-            dispatch_weights,
-            dispatch_scales,
-            dispatch_indices,
-            dispatch_recv_num_token,
-        ) = op.dispatch(
-            all_rank_input[self.config.rank],
-            all_rank_weights[self.config.rank],
-            # None,
-            all_rank_scales[self.config.rank],
-            all_rank_indices[self.config.rank],
-            block_num=dispatch_block_num,
-            warp_per_block=dispatch_warp_per_block,
-        )
-
-        combine_output, _ = op.combine(
-            dispatch_output,
-            None,
-            dispatch_indices,
-            block_num=combine_block_num,
-            warp_per_block=combine_warp_per_block,
-        )
-        torch.cuda.synchronize()
 
     def stress(
         self,
@@ -294,67 +468,47 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         combine_block_num,
         combine_warp_per_block,
     ):
-        test_data_list = [self.gen_test_data() for i in range(5)]
-        for i in range(100):
-            if self.config.rank == 0:
-                print(f"Round {i} begin")
-            self.stress_once(
-                op,
-                test_data_list[i % 5],
-                dispatch_block_num,
-                dispatch_warp_per_block,
-                combine_block_num,
-                combine_warp_per_block,
-            )
-
-    def stress_graph(
-        self,
-        op,
-        dispatch_block_num,
-        dispatch_warp_per_block,
-        combine_block_num,
-        combine_warp_per_block,
-    ):
         test_data = self.gen_test_data()
-        g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
-            (
-                all_rank_num_token,
-                all_rank_indices,
-                all_rank_input,
-                all_rank_weights,
-                all_rank_scales,
-            ) = test_data
-
-            (
-                dispatch_output,
-                dispatch_weights,
-                dispatch_scales,
-                dispatch_indices,
-                dispatch_recv_num_token,
-            ) = op.dispatch(
-                all_rank_input[self.config.rank],
-                all_rank_weights[self.config.rank],
-                # None,
-                all_rank_scales[self.config.rank],
-                all_rank_indices[self.config.rank],
-                block_num=dispatch_block_num,
-                warp_per_block=dispatch_warp_per_block,
-            )
-
-            combine_output, _ = op.combine(
-                dispatch_output,
-                None,
-                dispatch_indices,
-                block_num=combine_block_num,
-                warp_per_block=combine_warp_per_block,
-            )
+        total_recv_num_token = self.run_once_test(
+            op,
+            test_data,
+            dispatch_block_num,
+            dispatch_warp_per_block,
+            combine_block_num,
+            combine_warp_per_block,
+        )
+        g = self._capture_e2e_graph(
+            op,
+            test_data,
+            dispatch_block_num,
+            dispatch_warp_per_block,
+            combine_block_num,
+            combine_warp_per_block,
+            total_recv_num_token,
+        )
         torch.cuda.synchronize()
         for i in range(135):
             if self.config.rank == 0:
                 print(f"Round {i} begin")
             g.replay()
             torch.cuda.synchronize()
+
+
+def _get_default_launch_config(
+    world_size,
+    max_num_inp_token_per_rank,
+    use_external_inp_buf,
+):
+    if world_size <= 4:
+        if max_num_inp_token_per_rank > 128:
+            return (768, 8, 72, 4) if not use_external_inp_buf else (768, 8, 256, 14)
+        if max_num_inp_token_per_rank > 64:
+            return (216, 6, 72, 4) if not use_external_inp_buf else (216, 6, 224, 8)
+        return (223, 6, 72, 4) if not use_external_inp_buf else (223, 6, 224, 4)
+
+    if max_num_inp_token_per_rank > 1024:
+        return (80, 16, 80, 4) if not use_external_inp_buf else (80, 16, 80, 16)
+    return (64, 16, 64, 4) if not use_external_inp_buf else (64, 16, 64, 16)
 
 
 def _bench_dispatch_combine(
@@ -408,64 +562,16 @@ def _bench_dispatch_combine(
         op = mori.ops.EpDispatchCombineOp(config)
         benchmark = EpDispatchCombineBenchmark(config)
 
-        # Default launch configuration (EP8)
-        if max_num_inp_token_per_rank > 1024:
-            dispatch_block_num = 80
-            dispatch_warp_per_block = 16
-            if not config.use_external_inp_buf:  # zero-copy
-                combine_block_num = 80
-                combine_warp_per_block = 4
-            else:
-                combine_block_num = 80
-                combine_warp_per_block = 16
-        else:  # Low latency configuration
-            dispatch_block_num = 64
-            dispatch_warp_per_block = 16
-            if not config.use_external_inp_buf:  # zero-copy
-                combine_block_num = 64
-                combine_warp_per_block = 4
-            else:
-                combine_block_num = 64
-                combine_warp_per_block = 16
-
-        # EP4 override: tuned optimal configs for FP4 dispatch + BF16/FP8 combine.
-        if world_size <= 4:
-            if max_num_inp_token_per_rank > 1024:
-                dispatch_block_num = 768
-                dispatch_warp_per_block = 8
-                if not config.use_external_inp_buf:
-                    combine_block_num = 72
-                    combine_warp_per_block = 4
-                else:
-                    combine_block_num = 256
-                    combine_warp_per_block = 14
-            elif max_num_inp_token_per_rank > 128:
-                dispatch_block_num = 768
-                dispatch_warp_per_block = 8
-                if not config.use_external_inp_buf:
-                    combine_block_num = 72
-                    combine_warp_per_block = 4
-                else:
-                    combine_block_num = 256
-                    combine_warp_per_block = 14
-            elif max_num_inp_token_per_rank > 64:
-                dispatch_block_num = 216
-                dispatch_warp_per_block = 6
-                if not config.use_external_inp_buf:
-                    combine_block_num = 72
-                    combine_warp_per_block = 4
-                else:
-                    combine_block_num = 224
-                    combine_warp_per_block = 8
-            else:
-                dispatch_block_num = 223
-                dispatch_warp_per_block = 6
-                if not config.use_external_inp_buf:
-                    combine_block_num = 72
-                    combine_warp_per_block = 4
-                else:
-                    combine_block_num = 224
-                    combine_warp_per_block = 4
+        (
+            dispatch_block_num,
+            dispatch_warp_per_block,
+            combine_block_num,
+            combine_warp_per_block,
+        ) = _get_default_launch_config(
+            world_size=world_size,
+            max_num_inp_token_per_rank=max_num_inp_token_per_rank,
+            use_external_inp_buf=config.use_external_inp_buf,
+        )
 
         if cmd != "tuning":
             if dispatch_block_num_arg is not None:
@@ -507,13 +613,6 @@ def _bench_dispatch_combine(
                 combine_block_num=combine_block_num,
                 combine_warp_per_block=combine_warp_per_block,
             )
-            # benchmark.stress_graph(
-            #     op,
-            #     dispatch_block_num=dispatch_block_num,
-            #     dispatch_warp_per_block=dispatch_warp_per_block,
-            #     combine_block_num=combine_block_num,
-            #     combine_warp_per_block=combine_warp_per_block,
-            # )
 
         elif cmd == "tuning":
             if rank == 0 and any(
