@@ -23,6 +23,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -112,6 +113,10 @@ class TierBackend {
   // Toggle cold-read mode: bypass all caches, read directly from storage.
   // SSDTier: O_DIRECT; SpdkProxyTier: skip ring buffer cache.
   virtual void SetColdRead(bool /*enable*/) {}
+
+  // Return an opaque location identifier for a previously written key.
+  // Callers prepend the store index before publishing to the Master.
+  virtual std::optional<std::string> GetLocationId(const std::string& key) const;
 
   // Which StorageTier does this backend represent?
   StorageTier tier_id() const { return tier_id_; }

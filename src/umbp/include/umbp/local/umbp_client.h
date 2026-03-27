@@ -35,6 +35,7 @@
 namespace mori::umbp {
 
 class PoolClient;  // forward declaration — full include in .cpp only
+class PeerServiceServer;
 
 class UMBPClient {
  public:
@@ -82,8 +83,8 @@ class UMBPClient {
  private:
   static UMBPConfig NormalizeConfig(const UMBPConfig& config);
 
-  // Phase 3: register a locally-written DRAM block with Master for remote discovery.
-  void MaybeRegisterWithMaster(const std::string& key, size_t size);
+  // Publish a locally-written block to the Master for remote discovery.
+  void MaybePublishLocal(const std::string& key, size_t size);
 
   UMBPConfig config_;
   UMBPRole role_;
@@ -91,6 +92,7 @@ class UMBPClient {
   LocalStorageManager storage_;
   std::unique_ptr<CopyPipeline> copy_pipeline_;
   std::unique_ptr<PoolClient> pool_client_;  // non-null iff distributed mode
+  std::unique_ptr<PeerServiceServer> peer_service_;
 };
 
 }  // namespace mori::umbp

@@ -75,6 +75,11 @@ class MasterClient {
   // If removed is non-null, returns 1 when removed, otherwise 0.
   grpc::Status Unregister(const std::string& key, const Location& location,
                           uint32_t* removed = nullptr);
+  grpc::Status FinalizeAllocation(const std::string& key, const Location& location,
+                                  const std::string& allocation_id);
+  grpc::Status PublishLocalBlock(const std::string& key, const Location& location);
+  grpc::Status AbortAllocation(const std::string& node_id, const std::string& allocation_id,
+                               uint64_t size);
 
   // --- Router ---
   /// Pick an existing replica to read from.
@@ -82,7 +87,8 @@ class MasterClient {
   grpc::Status RouteGet(const std::string& key, std::optional<RouteGetResult>* out_result);
 
   /// Pick a target node to write to.
-  /// After receiving the result, write via MORI-IO, then call Register().
+  /// After receiving the result, write via MORI-IO, then call FinalizeAllocation()
+  /// or AbortAllocation().
   grpc::Status RoutePut(const std::string& key, uint64_t block_size,
                         std::optional<RoutePutResult>* out_result);
 

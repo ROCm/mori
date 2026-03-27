@@ -36,7 +36,6 @@
 #include "umbp/common/config.h"
 #include "umbp/common/types.h"
 #include "umbp/distributed/master/master_client.h"
-#include "umbp/distributed/peer/peer_service.h"
 
 namespace mori::umbp {
 
@@ -50,6 +49,8 @@ class PoolClient {
 
   bool Init();
   void Shutdown();
+
+  const std::string& NodeId() const { return config_.master_config.node_id; }
 
   bool RegisterMemory(void* ptr, size_t size);
   void DeregisterMemory(void* ptr);
@@ -66,9 +67,17 @@ class PoolClient {
   // can discover it. UMBPClient provides the location_id (e.g. "0:<offset>").
   bool RegisterWithMaster(const std::string& key, size_t size, const std::string& location_id,
                           TierType tier);
+  bool FinalizeAllocation(const std::string& key, size_t size, const std::string& location_id,
+                          TierType tier, const std::string& allocation_id);
+  bool PublishLocalBlock(const std::string& key, size_t size, const std::string& location_id,
+                         TierType tier);
+  bool AbortAllocation(const std::string& node_id, TierType tier,
+                       const std::string& allocation_id, uint64_t size);
 
   // Check whether a block exists on any remote node (RouteGet without RDMA).
   bool ExistsRemote(const std::string& key);
+
+  bool IsRegistered(const std::string& key) const;
 
   // Fetch a block from a remote node's DRAM via RDMA (RouteGet → RDMA read).
   // DRAM-only: returns false if the remote block is on SSD.
@@ -81,6 +90,10 @@ class PoolClient {
   // Unregister a block from the Master (block no longer remotely accessible).
   bool UnregisterFromMaster(const std::string& key);
 
+  void* SsdStagingPtr() const { return ssd_staging_buffer_.get(); }
+  size_t SsdStagingSize() const { return config_.staging_buffer_size; }
+  const std::vector<uint8_t>& SsdStagingMemDescBytes() const { return ssd_staging_mem_desc_bytes_; }
+
   MasterClient& Master();
   bool IsInitialized() const;
 
@@ -89,8 +102,6 @@ class PoolClient {
   std::atomic<bool> initialized_{false};
 
   std::unique_ptr<MasterClient> master_client_;
-
-  std::unique_ptr<PeerServiceServer> peer_service_;
 
   // IO Engine (data plane)
   std::unique_ptr<mori::io::IOEngine> io_engine_;
@@ -134,7 +145,8 @@ class PoolClient {
                       uint64_t offset, bool zero_copy);
   bool EnsurePeerServiceConnection(PeerConnection& peer);
   bool RemoteSsdWrite(PeerConnection& peer, const std::string& key, const void* src, size_t size,
-                      bool zero_copy, uint32_t store_index = 0);
+                      bool zero_copy, uint32_t store_index = 0,
+                      const std::string& allocation_id = "");
   bool RemoteSsdRead(PeerConnection& peer, const std::string& key, const std::string& location_id,
                      void* dst, size_t size, bool zero_copy);
 
@@ -150,8 +162,8 @@ class PoolClient {
   std::optional<std::pair<mori::io::MemoryDesc, size_t>> FindRegisteredMemory(const void* ptr,
                                                                               size_t size);
 
-  std::mutex cache_mutex_;
-  std::unordered_map<std::string, Location> location_cache_;
+  mutable std::mutex cache_mutex_;
+  std::unordered_map<std::string, Location> cluster_locations_;
 
   bool PutLocalDram(uint32_t buffer_index, const void* src, size_t size, uint64_t offset);
   bool GetLocalDram(uint32_t buffer_index, void* dst, size_t size, uint64_t offset);

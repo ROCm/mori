@@ -47,7 +47,28 @@ def _configure_packaged_spdk_proxy() -> None:
         os.environ["UMBP_SPDK_PROXY_BIN"] = str(proxy_path)
 
 
+def _configure_packaged_umbp_master() -> None:
+    if os.environ.get("UMBP_MASTER_BIN"):
+        return
+
+    master_path = Path(__file__).resolve().parents[1] / "umbp_master"
+    if not master_path.is_file():
+        return
+
+    try:
+        mode = master_path.stat().st_mode
+        exec_bits = stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+        if (mode & exec_bits) != exec_bits:
+            master_path.chmod(mode | exec_bits)
+    except OSError:
+        pass
+
+    if os.access(master_path, os.X_OK):
+        os.environ["UMBP_MASTER_BIN"] = str(master_path)
+
+
 _configure_packaged_spdk_proxy()
+_configure_packaged_umbp_master()
 
 from mori.cpp import (
     UMBPClient,

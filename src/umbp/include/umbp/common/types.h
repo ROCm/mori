@@ -83,6 +83,16 @@ struct ClientRecord {
   std::vector<PoolAllocator> ssd_allocators;
 };
 
+struct PendingAllocation {
+  std::string allocation_id;
+  std::string node_id;
+  TierType tier = TierType::UNKNOWN;
+  uint32_t buffer_index = 0;
+  uint64_t offset = 0;
+  uint64_t size = 0;
+  std::chrono::steady_clock::time_point allocated_at;
+};
+
 // Helpers for logging
 inline const char* TierTypeName(TierType t) {
   switch (t) {

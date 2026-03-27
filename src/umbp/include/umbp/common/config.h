@@ -322,6 +322,7 @@ class RoutePutStrategy;
 struct ClientRegistryConfig {
   std::chrono::seconds heartbeat_ttl{10};
   std::chrono::seconds reaper_interval{5};
+  std::chrono::seconds allocation_ttl{30};
   uint32_t max_missed_heartbeats = 3;
 };
 

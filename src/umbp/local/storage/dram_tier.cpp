@@ -284,4 +284,12 @@ std::optional<size_t> DRAMTier::GetSlotOffset(const std::string& key) const {
   return it->second.offset;
 }
 
+std::optional<std::string> DRAMTier::GetLocationId(const std::string& key) const {
+  auto offset = GetSlotOffset(key);
+  if (!offset.has_value()) {
+    return std::nullopt;
+  }
+  return std::to_string(*offset);
+}
+
 }  // namespace mori::umbp

@@ -555,6 +555,23 @@ void LocalStorageManager::SetOnTierChange(TierChangeCallback cb) {
   on_tier_change_ = std::move(cb);
 }
 
+std::optional<LocalStorageManager::TierLocationInfo> LocalStorageManager::BuildTierLocationInfo(
+    TierBackend* tier, const std::string& key, size_t size) {
+  if (!tier) {
+    return std::nullopt;
+  }
+
+  auto raw_id = tier->GetLocationId(key);
+  if (!raw_id.has_value()) {
+    return std::nullopt;
+  }
+
+  TierLocationInfo info;
+  info.location_id = "0:" + *raw_id;
+  info.size = size;
+  return info;
+}
+
 bool LocalStorageManager::MoveKey(const std::string& key, TierBackend* from, TierBackend* to) {
   // Fast path for DRAM->slower movement to avoid an intermediate vector copy.
   if (from->Capabilities().zero_copy_read) {
@@ -562,9 +579,10 @@ bool LocalStorageManager::MoveKey(const std::string& key, TierBackend* from, Tie
     const void* ptr = from->ReadPtr(key, &sz);
     if (ptr && sz > 0 && to->Write(key, ptr, sz)) {
       StorageTier from_id = from->tier_id();
+      auto new_location = BuildTierLocationInfo(to, key, sz);
       from->Evict(key);
       UpsertIndexTier(key, to->tier_id(), sz);
-      if (on_tier_change_) on_tier_change_(key, from_id, to->tier_id());
+      if (on_tier_change_) on_tier_change_(key, from_id, to->tier_id(), new_location);
       return true;
     }
   }
@@ -573,9 +591,10 @@ bool LocalStorageManager::MoveKey(const std::string& key, TierBackend* from, Tie
   if (data.empty()) return false;
   if (!to->Write(key, data.data(), data.size())) return false;
   StorageTier from_id = from->tier_id();
+  auto new_location = BuildTierLocationInfo(to, key, data.size());
   from->Evict(key);
   UpsertIndexTier(key, to->tier_id(), data.size());
-  if (on_tier_change_) on_tier_change_(key, from_id, to->tier_id());
+  if (on_tier_change_) on_tier_change_(key, from_id, to->tier_id(), new_location);
   return true;
 }
 
@@ -625,7 +644,7 @@ bool LocalStorageManager::Write(const std::string& key, const void* data, size_t
         bool only_on_target = !faster_than_target || !faster_than_target->Exists(k);
         target->Evict(k);
         if (only_on_target) {
-          if (on_tier_change_) on_tier_change_(k, target->tier_id(), std::nullopt);
+          if (on_tier_change_) on_tier_change_(k, target->tier_id(), std::nullopt, std::nullopt);
           if (index_) index_->Remove(k);
           RemoveDepthAndGroup(k);
         }
@@ -641,16 +660,21 @@ bool LocalStorageManager::WriteFromPtr(const std::string& key, uintptr_t src, si
 }
 
 bool LocalStorageManager::ReadIntoPtr(const std::string& key, uintptr_t dst, size_t size) {
+  bool ok = ReadIntoPtrNoPromote(key, dst, size);
+  if (ok && config_.eviction.auto_promote_on_read) {
+    MaybeAutoPromote(key);
+  }
+  return ok;
+}
+
+bool LocalStorageManager::ReadIntoPtrNoPromote(const std::string& key, uintptr_t dst,
+                                               size_t size) {
   if (index_) {
     auto loc = index_->Lookup(key);
     if (loc) {
       TierBackend* hinted = GetTier(loc->tier);
       if (hinted && hinted->Exists(key)) {
         bool ok = hinted->ReadIntoPtr(key, dst, size);
-        if (ok && hinted->tier_id() != StorageTier::CPU_DRAM &&
-            config_.eviction.auto_promote_on_read) {
-          MaybeAutoPromote(key);
-        }
         if (ok) return true;
       }
     }
@@ -659,10 +683,6 @@ bool LocalStorageManager::ReadIntoPtr(const std::string& key, uintptr_t dst, siz
   for (size_t i = 0; i < tiers_.size(); ++i) {
     if (tiers_[i].backend->Exists(key)) {
       bool ok = tiers_[i].backend->ReadIntoPtr(key, dst, size);
-      // Auto-promote if read from a slower tier
-      if (ok && i > 0 && config_.eviction.auto_promote_on_read) {
-        MaybeAutoPromote(key);
-      }
       return ok;
     }
   }
@@ -775,7 +795,7 @@ bool LocalStorageManager::Evict(const std::string& key) {
   }
   bool ok = tier->Evict(key);
   if (ok) {
-    if (on_tier_change_) on_tier_change_(key, tier->tier_id(), std::nullopt);
+    if (on_tier_change_) on_tier_change_(key, tier->tier_id(), std::nullopt, std::nullopt);
     if (index_) index_->Remove(key);
   }
   RemoveDepthAndGroup(key);
@@ -832,8 +852,11 @@ bool LocalStorageManager::Promote(const std::string& key) {
       }
     }
     // Drop read-tracking metadata in source tier while preserving shared file.
+    auto new_location = BuildTierLocationInfo(to, key, data.size());
+    StorageTier from_id = from->tier_id();
     from->Evict(key);
     UpsertIndexTier(key, to->tier_id(), data.size());
+    if (on_tier_change_) on_tier_change_(key, from_id, to->tier_id(), new_location);
     return true;
   }
 
@@ -841,16 +864,22 @@ bool LocalStorageManager::Promote(const std::string& key) {
     // Target full — demote LRU keys from target to make room
     while (DemoteLRUForSpace(to)) {
       if (to->Write(key, data.data(), data.size())) {
+        auto new_location = BuildTierLocationInfo(to, key, data.size());
+        StorageTier from_id = from->tier_id();
         from->Evict(key);
         UpsertIndexTier(key, to->tier_id(), data.size());
+        if (on_tier_change_) on_tier_change_(key, from_id, to->tier_id(), new_location);
         return true;
       }
     }
     return false;  // Cannot promote
   }
 
+  auto new_location = BuildTierLocationInfo(to, key, data.size());
+  StorageTier from_id = from->tier_id();
   from->Evict(key);
   UpsertIndexTier(key, to->tier_id(), data.size());
+  if (on_tier_change_) on_tier_change_(key, from_id, to->tier_id(), new_location);
   return true;
 }
 

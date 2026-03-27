@@ -144,7 +144,9 @@ void RegisterMoriUmbp(py::module_& m) {
            py::arg("sizes"))
       .def("batch_exists", &UMBPClient::BatchExists, py::arg("keys"))
       .def("batch_exists_consecutive", &UMBPClient::BatchExistsConsecutive, py::arg("keys"))
-      .def("clear", &UMBPClient::Clear);
+      .def("clear", &UMBPClient::Clear)
+      .def("flush", &UMBPClient::Flush)
+      .def("is_distributed", &UMBPClient::IsDistributed);
 }
 
 }  // namespace mori

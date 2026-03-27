@@ -27,6 +27,7 @@
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/types.h"
 #include "umbp/distributed/pool_client.h"
+#include "umbp/distributed/peer/peer_service.h"
 #include "umbp/local/storage/dram_tier.h"
 
 namespace mori::umbp {
@@ -47,8 +48,6 @@ UMBPClient::UMBPClient(const UMBPConfig& config)
     : config_(NormalizeConfig(config)), role_(config_.ResolveRole()), storage_(config_, &index_) {
   copy_pipeline_ = std::make_unique<CopyPipeline>(storage_, config_.copy_pipeline, role_);
 
-  // Phase 1: connect to Master and start heartbeat. No delegation, no DRAM/SSD
-  // export, no changes to Put/Get/Remove yet.
   MORI_UMBP_INFO("[UMBPClient] ctor: distributed.has_value()={}", config_.distributed.has_value());
   if (config_.distributed.has_value()) {
     const auto& dist = config_.distributed.value();
@@ -69,9 +68,16 @@ UMBPClient::UMBPClient(const UMBPConfig& config)
     if (dram) {
       auto [used, total] = storage_.Capacity(StorageTier::CPU_DRAM);
       pc_config.dram_buffers.push_back({dram->GetBasePtr(), total});
-      pc_config.tier_capacities[TierType::DRAM] = {total, total};
+      pc_config.tier_capacities[TierType::DRAM] = {total, 0};
       MORI_UMBP_INFO("[UMBPClient] ctor: exporting DRAM buffer ptr={}, size={}", dram->GetBasePtr(),
                      total);
+    }
+
+    if (config_.ssd.enabled) {
+      pc_config.ssd_stores.push_back({config_.ssd.storage_dir, config_.ssd.capacity_bytes});
+      const uint64_t ssd_available =
+          (role_ == UMBPRole::SharedSSDFollower) ? 0 : config_.ssd.capacity_bytes;
+      pc_config.tier_capacities[TierType::SSD] = {config_.ssd.capacity_bytes, ssd_available};
     }
 
     MORI_UMBP_INFO("[UMBPClient] ctor: creating PoolClient for node '{}', master='{}'",
@@ -92,18 +98,46 @@ UMBPClient::UMBPClient(const UMBPConfig& config)
       pool_client_->RegisterMemory(dram->GetBasePtr(), total);
     }
 
-    // On DRAM→SSD demotion or full eviction from DRAM, unregister the block
-    // from Master so remote nodes stop attempting RDMA reads to a stale offset.
+    if (config_.distributed->peer_service_port > 0 && config_.ssd.enabled &&
+        pool_client_->SsdStagingPtr() != nullptr) {
+      peer_service_ = std::make_unique<PeerServiceServer>(
+          pool_client_->SsdStagingPtr(), pool_client_->SsdStagingSize(),
+          pool_client_->SsdStagingMemDescBytes(), storage_, index_, *pool_client_);
+      if (!peer_service_->Start(config_.distributed->peer_service_port)) {
+        MORI_UMBP_ERROR("PeerService init failed on port {}",
+                        config_.distributed->peer_service_port);
+        peer_service_.reset();
+      }
+    }
+
     storage_.SetOnTierChange(
-        [this](const std::string& key, StorageTier from, std::optional<StorageTier> /*to*/) {
-          if (from == StorageTier::CPU_DRAM && pool_client_) {
+        [this](const std::string& key, StorageTier from, std::optional<StorageTier> to,
+               std::optional<LocalStorageManager::TierLocationInfo> new_location) {
+          if (pool_client_) {
             pool_client_->UnregisterFromMaster(key);
+          }
+
+          if (!pool_client_ || !to.has_value() || !new_location.has_value()) {
+            return;
+          }
+
+          if (*to == StorageTier::LOCAL_SSD) {
+            pool_client_->PublishLocalBlock(key, new_location->size, new_location->location_id,
+                                            TierType::SSD);
+          } else if (*to == StorageTier::CPU_DRAM) {
+            pool_client_->PublishLocalBlock(key, new_location->size, new_location->location_id,
+                                            TierType::DRAM);
           }
         });
   }
 }
 
 UMBPClient::~UMBPClient() {
+  if (peer_service_) {
+    peer_service_->Stop();
+    peer_service_.reset();
+  }
+
   // Shut down PoolClient before storage_/index_ are destroyed, since later
   // phases will give PoolClient pointers into those members.
   if (pool_client_) {
@@ -112,14 +146,14 @@ UMBPClient::~UMBPClient() {
   }
 }
 
-void UMBPClient::MaybeRegisterWithMaster(const std::string& key, size_t size) {
+void UMBPClient::MaybePublishLocal(const std::string& key, size_t size) {
   if (!pool_client_) return;
   auto* dram = storage_.GetTierAs<DRAMTier>(StorageTier::CPU_DRAM);
   if (!dram) return;
   auto offset = dram->GetSlotOffset(key);
   if (!offset) return;
   std::string location_id = "0:" + std::to_string(*offset);
-  pool_client_->RegisterWithMaster(key, size, location_id, TierType::DRAM);
+  pool_client_->PublishLocalBlock(key, size, location_id, TierType::DRAM);
 }
 
 bool UMBPClient::Put(const std::string& key, const void* data, size_t size) {
@@ -133,7 +167,7 @@ bool UMBPClient::Put(const std::string& key, const void* data, size_t size) {
   if (!storage_.Write(key, data, size)) return false;
 
   index_.Insert(key, {StorageTier::CPU_DRAM, 0, size});
-  MaybeRegisterWithMaster(key, size);
+  MaybePublishLocal(key, size);
   copy_pipeline_->MaybeCopyToSharedSSD(key);
   return true;
 }
@@ -145,7 +179,7 @@ bool UMBPClient::PutFromPtr(const std::string& key, uintptr_t src, size_t size) 
   if (!storage_.WriteFromPtr(key, src, size)) return false;
 
   index_.Insert(key, {StorageTier::CPU_DRAM, 0, size});
-  MaybeRegisterWithMaster(key, size);
+  MaybePublishLocal(key, size);
   copy_pipeline_->MaybeCopyToSharedSSD(key);
   return true;
 }
@@ -229,11 +263,7 @@ bool UMBPClient::Remove(const std::string& key) {
   if (!loc) return false;
 
   storage_.Evict(key);
-  // Note: the on_tier_change_ callback inside Evict() already calls
-  // UnregisterFromMaster for DRAM-resident blocks. Call explicitly here
-  // to cover cases where the block may have already left DRAM (e.g. on SSD)
-  // but is still registered with Master (Phase 6 scenario).
-  if (pool_client_) {
+  if (pool_client_ && pool_client_->IsRegistered(key)) {
     pool_client_->UnregisterFromMaster(key);
   }
   return true;
@@ -253,7 +283,7 @@ std::vector<bool> UMBPClient::BatchPutFromPtr(const std::vector<std::string>& ke
     }
     if (!storage_.WriteFromPtr(keys[i], ptrs[i], sizes[i])) continue;
     index_.Insert(keys[i], {StorageTier::CPU_DRAM, 0, sizes[i]});
-    MaybeRegisterWithMaster(keys[i], sizes[i]);
+    MaybePublishLocal(keys[i], sizes[i]);
     results[i] = true;
   }
 
@@ -284,7 +314,7 @@ std::vector<bool> UMBPClient::BatchPutFromPtrWithDepth(const std::vector<std::st
     int depth = (i < depths.size()) ? depths[i] : -1;
     if (!storage_.WriteFromPtrWithDepth(keys[i], ptrs[i], sizes[i], depth)) continue;
     index_.Insert(keys[i], {StorageTier::CPU_DRAM, 0, sizes[i]});
-    MaybeRegisterWithMaster(keys[i], sizes[i]);
+    MaybePublishLocal(keys[i], sizes[i]);
     results[i] = true;
   }
 

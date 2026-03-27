@@ -222,6 +222,94 @@ grpc::Status MasterClient::Unregister(const std::string& key, const Location& lo
   return grpc::Status::OK;
 }
 
+grpc::Status MasterClient::FinalizeAllocation(const std::string& key, const Location& location,
+                                              const std::string& allocation_id) {
+  if (!registered_) {
+    return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
+                        "node must be registered before finalization");
+  }
+
+  Location normalized_location = location;
+  if (normalized_location.node_id.empty()) {
+    normalized_location.node_id = config_.node_id;
+  }
+
+  ::umbp::FinalizeRequest req;
+  req.set_node_id(config_.node_id);
+  req.set_key(key);
+  req.set_allocation_id(allocation_id);
+  FillProtoLocation(normalized_location, req.mutable_location());
+
+  ::umbp::FinalizeResponse resp;
+  grpc::ClientContext ctx;
+  auto status = GetStub(stub_.get())->FinalizeAllocation(&ctx, req, &resp);
+  if (!status.ok()) {
+    MORI_UMBP_ERROR("[Client] FinalizeAllocation(key={}) failed: {}", key,
+                    status.error_message());
+    return status;
+  }
+  if (!resp.finalized()) {
+    return grpc::Status(grpc::StatusCode::UNKNOWN, "FinalizeAllocation rejected by master");
+  }
+  return grpc::Status::OK;
+}
+
+grpc::Status MasterClient::PublishLocalBlock(const std::string& key, const Location& location) {
+  if (!registered_) {
+    return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
+                        "node must be registered before publishing");
+  }
+
+  Location normalized_location = location;
+  if (normalized_location.node_id.empty()) {
+    normalized_location.node_id = config_.node_id;
+  }
+
+  ::umbp::PublishRequest req;
+  req.set_node_id(config_.node_id);
+  req.set_key(key);
+  FillProtoLocation(normalized_location, req.mutable_location());
+
+  ::umbp::PublishResponse resp;
+  grpc::ClientContext ctx;
+  auto status = GetStub(stub_.get())->PublishLocalBlock(&ctx, req, &resp);
+  if (!status.ok()) {
+    MORI_UMBP_ERROR("[Client] PublishLocalBlock(key={}) failed: {}", key,
+                    status.error_message());
+    return status;
+  }
+  if (!resp.published()) {
+    return grpc::Status(grpc::StatusCode::UNKNOWN, "PublishLocalBlock rejected by master");
+  }
+  return grpc::Status::OK;
+}
+
+grpc::Status MasterClient::AbortAllocation(const std::string& node_id,
+                                           const std::string& allocation_id, uint64_t size) {
+  if (!registered_) {
+    return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
+                        "node must be registered before aborting allocation");
+  }
+
+  ::umbp::AbortAllocationRequest req;
+  req.set_node_id(node_id);
+  req.set_allocation_id(allocation_id);
+  req.set_size(size);
+
+  ::umbp::AbortAllocationResponse resp;
+  grpc::ClientContext ctx;
+  auto status = GetStub(stub_.get())->AbortAllocation(&ctx, req, &resp);
+  if (!status.ok()) {
+    MORI_UMBP_ERROR("[Client] AbortAllocation(node={}, id={}) failed: {}", node_id, allocation_id,
+                    status.error_message());
+    return status;
+  }
+  if (!resp.aborted()) {
+    return grpc::Status(grpc::StatusCode::UNKNOWN, "AbortAllocation rejected by master");
+  }
+  return grpc::Status::OK;
+}
+
 grpc::Status MasterClient::RouteGet(const std::string& key,
                                     std::optional<RouteGetResult>* out_result) {
   if (out_result != nullptr) {
@@ -301,6 +389,7 @@ grpc::Status MasterClient::RoutePut(const std::string& key, uint64_t block_size,
     result.dram_memory_desc_bytes.assign(md.begin(), md.end());
     result.allocated_offset = resp.allocated_offset();
     result.buffer_index = resp.buffer_index();
+    result.allocation_id = resp.allocation_id();
     *out_result = result;
   }
 

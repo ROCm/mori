@@ -21,13 +21,15 @@
 // SOFTWARE.
 #include "umbp/distributed/peer/peer_service.h"
 
-#include <fcntl.h>
 #include <grpcpp/grpcpp.h>
-#include <unistd.h>
 
 #include <cstring>
 
 #include "mori/utils/mori_log.hpp"
+#include "umbp/common/types.h"
+#include "umbp/distributed/pool_client.h"
+#include "umbp/local/block_index/local_block_index.h"
+#include "umbp/local/storage/local_storage_manager.h"
 #include "umbp_peer.grpc.pb.h"
 
 namespace mori::umbp {
@@ -36,11 +38,14 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
  public:
   UMBPPeerServiceImpl(void* ssd_staging_base, size_t ssd_staging_size,
                       const std::vector<uint8_t>& ssd_staging_mem_desc_bytes,
-                      std::vector<SsdStore>& ssd_stores, std::mutex& ssd_mutex)
+                      LocalStorageManager& storage, LocalBlockIndex& index,
+                      PoolClient& coordinator, std::mutex& ssd_mutex)
       : ssd_staging_base_(ssd_staging_base),
         ssd_staging_size_(ssd_staging_size),
         ssd_staging_mem_desc_bytes_(ssd_staging_mem_desc_bytes),
-        ssd_stores_(ssd_stores),
+        storage_(storage),
+        index_(index),
+        coordinator_(coordinator),
         ssd_mutex_(ssd_mutex) {}
 
   grpc::Status GetPeerInfo(grpc::ServerContext* /*context*/,
@@ -59,16 +64,9 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
                               ::umbp::CommitSsdWriteResponse* response) override {
     std::lock_guard<std::mutex> lock(ssd_mutex_);
 
-    uint32_t idx = request->store_index();
-    if (idx >= ssd_stores_.size()) {
-      MORI_UMBP_ERROR("[PeerService] CommitSsdWrite: store_index {} out of range (have {})", idx,
-                      ssd_stores_.size());
-      response->set_success(false);
-      return grpc::Status::OK;
-    }
-    auto& target = ssd_stores_[idx];
-
-    if (target.used + request->size() > target.capacity) {
+    if (request->store_index() != 0) {
+      MORI_UMBP_ERROR("[PeerService] CommitSsdWrite: store_index {} != 0, rejected",
+                      request->store_index());
       response->set_success(false);
       return grpc::Status::OK;
     }
@@ -79,31 +77,50 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
       return grpc::Status::OK;
     }
 
+    const std::string& key = request->key();
+    const size_t size = request->size();
+    auto existing = index_.Lookup(key);
+    if (existing.has_value() && coordinator_.IsRegistered(key)) {
+      response->set_success(true);
+      return grpc::Status::OK;
+    }
+
     const void* src = static_cast<const uint8_t*>(ssd_staging_base_) + request->staging_offset();
-    std::string filename = target.dir + "/" + request->key() + ".bin";
+    if (!existing.has_value()) {
+      bool ok = storage_.Write(key, src, size, StorageTier::LOCAL_SSD);
+      if (!ok) {
+        MORI_UMBP_ERROR("[PeerService] CommitSsdWrite: local SSD write failed for '{}'", key);
+        response->set_success(false);
+        return grpc::Status::OK;
+      }
+      index_.Insert(key, {StorageTier::LOCAL_SSD, 0, size});
+    }
 
-    int fd = ::open(filename.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) {
+    auto* ssd = storage_.GetTier(StorageTier::LOCAL_SSD);
+    auto loc_id = ssd ? ssd->GetLocationId(key) : std::nullopt;
+    if (!loc_id.has_value()) {
+      storage_.Evict(key);
+      index_.Remove(key);
+      MORI_UMBP_ERROR("[PeerService] CommitSsdWrite: GetLocationId failed for '{}'", key);
+      response->set_success(false);
+      return grpc::Status::OK;
+    }
+    std::string location_id = "0:" + *loc_id;
+
+    bool finalized =
+        coordinator_.FinalizeAllocation(key, size, location_id, TierType::SSD, request->allocation_id());
+    if (!finalized) {
+      storage_.Evict(key);
+      index_.Remove(key);
+      MORI_UMBP_ERROR("[PeerService] CommitSsdWrite: FinalizeAllocation failed for '{}'", key);
       response->set_success(false);
       return grpc::Status::OK;
     }
 
-    ssize_t written = ::write(fd, src, request->size());
-    if (written < 0 || static_cast<size_t>(written) != request->size()) {
-      ::close(fd);
-      response->set_success(false);
-      return grpc::Status::OK;
-    }
-
-    ::fsync(fd);
-    ::close(fd);
-
-    target.used += request->size();
     response->set_success(true);
-    response->set_ssd_location_id(request->key() + ".bin");
-
-    MORI_UMBP_INFO("[PeerService] CommitSsdWrite: key={}, size={}, store={}, file={}",
-                   request->key(), request->size(), idx, filename);
+    response->set_ssd_location_id(location_id);
+    MORI_UMBP_INFO("[PeerService] CommitSsdWrite: key={}, size={}, location={}", key, size,
+                   location_id);
     return grpc::Status::OK;
   }
 
@@ -122,50 +139,15 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
       return grpc::Status::OK;
     }
 
-    // Parse store_index from ssd_location_id (format: "store_index:filename" or just "filename")
-    const auto& loc_id = request->ssd_location_id();
-    auto colon = loc_id.find(':');
-    if (colon != std::string::npos) {
-      try {
-        uint32_t idx = static_cast<uint32_t>(std::stoul(loc_id.substr(0, colon)));
-        std::string file_part = loc_id.substr(colon + 1);
-        if (idx < ssd_stores_.size()) {
-          std::string filepath = ssd_stores_[idx].dir + "/" + file_part;
-          int fd = ::open(filepath.c_str(), O_RDONLY);
-          if (fd >= 0) {
-            void* dst = static_cast<uint8_t*>(ssd_staging_base_) + read_offset;
-            ssize_t bytes_read = ::pread(fd, dst, request->size(), 0);
-            ::close(fd);
-            if (bytes_read >= 0 && static_cast<size_t>(bytes_read) == request->size()) {
-              response->set_success(true);
-              response->set_staging_offset(read_offset);
-              MORI_UMBP_INFO("[PeerService] PrepareSsdRead: key={}, store={}, file={}, size={}",
-                             request->key(), idx, file_part, request->size());
-              return grpc::Status::OK;
-            }
-          }
-        }
-      } catch (...) {
-      }
-    }
-
-    // Fallback: search all stores (backward compat for plain "filename" format)
-    for (const auto& s : ssd_stores_) {
-      std::string filename = s.dir + "/" + loc_id;
-      int fd = ::open(filename.c_str(), O_RDONLY);
-      if (fd < 0) continue;
-
-      void* dst = static_cast<uint8_t*>(ssd_staging_base_) + read_offset;
-      ssize_t bytes_read = ::pread(fd, dst, request->size(), 0);
-      ::close(fd);
-
-      if (bytes_read >= 0 && static_cast<size_t>(bytes_read) == request->size()) {
-        response->set_success(true);
-        response->set_staging_offset(read_offset);
-        MORI_UMBP_INFO("[PeerService] PrepareSsdRead: key={}, ssd_location={}, size={}, dir={}",
-                       request->key(), loc_id, request->size(), s.dir);
-        return grpc::Status::OK;
-      }
+    void* dst = static_cast<uint8_t*>(ssd_staging_base_) + read_offset;
+    bool ok = storage_.ReadIntoPtrNoPromote(request->key(), reinterpret_cast<uintptr_t>(dst),
+                                            request->size());
+    if (ok) {
+      response->set_success(true);
+      response->set_staging_offset(read_offset);
+      MORI_UMBP_INFO("[PeerService] PrepareSsdRead: key={}, location={}, size={}", request->key(),
+                     request->ssd_location_id(), request->size());
+      return grpc::Status::OK;
     }
 
     response->set_success(false);
@@ -176,26 +158,25 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
   void* ssd_staging_base_;
   size_t ssd_staging_size_;
   const std::vector<uint8_t>& ssd_staging_mem_desc_bytes_;
-  std::vector<SsdStore>& ssd_stores_;
+  LocalStorageManager& storage_;
+  LocalBlockIndex& index_;
+  PoolClient& coordinator_;
   std::mutex& ssd_mutex_;
 };
 
 PeerServiceServer::PeerServiceServer(void* ssd_staging_base, size_t ssd_staging_size,
                                      const std::vector<uint8_t>& ssd_staging_mem_desc_bytes,
-                                     const std::vector<std::string>& ssd_dirs,
-                                     const std::vector<size_t>& ssd_capacities)
+                                     LocalStorageManager& storage, LocalBlockIndex& index,
+                                     PoolClient& coordinator)
     : ssd_staging_base_(ssd_staging_base),
       ssd_staging_size_(ssd_staging_size),
+      storage_(storage),
+      index_(index),
+      coordinator_(coordinator),
       ssd_staging_mem_desc_bytes_(ssd_staging_mem_desc_bytes) {
-  for (size_t i = 0; i < ssd_dirs.size(); ++i) {
-    SsdStore store;
-    store.dir = ssd_dirs[i];
-    store.capacity = (i < ssd_capacities.size()) ? ssd_capacities[i] : 0;
-    store.used = 0;
-    ssd_stores_.push_back(std::move(store));
-  }
   service_ = std::make_unique<UMBPPeerServiceImpl>(
-      ssd_staging_base_, ssd_staging_size_, ssd_staging_mem_desc_bytes_, ssd_stores_, ssd_mutex_);
+      ssd_staging_base_, ssd_staging_size_, ssd_staging_mem_desc_bytes_, storage_, index_,
+      coordinator_, ssd_mutex_);
 }
 
 PeerServiceServer::~PeerServiceServer() { Stop(); }

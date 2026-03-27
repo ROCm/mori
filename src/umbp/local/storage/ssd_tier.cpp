@@ -503,4 +503,17 @@ std::vector<std::string> SSDTier::GetLRUCandidates(size_t max_candidates) const 
   return index_.GetLRUCandidates(max_candidates);
 }
 
+std::optional<std::string> SSDTier::GetLocationId(const std::string& key) const {
+  std::lock_guard<std::mutex> lock(mu_);
+  auto* meta = index_.FindKey(key);
+  if (!meta && IsReadOnlyShared()) {
+    const_cast<SSDTier*>(this)->RefreshFromDiskLocked(false);
+    meta = index_.FindKey(key);
+  }
+  if (!meta) {
+    return std::nullopt;
+  }
+  return "seg" + std::to_string(meta->segment_id) + ":" + std::to_string(meta->value_offset);
+}
+
 }  // namespace mori::umbp

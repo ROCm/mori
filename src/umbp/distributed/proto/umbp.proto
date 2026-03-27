@@ -117,6 +117,35 @@ message RoutePutResponse {
   bytes    dram_memory_desc = 7;   // target node's packed MemoryDesc (selected buffer)
   uint64   allocated_offset = 8;   // Master-allocated offset (DRAM tier only)
   uint32   buffer_index     = 9;   // Index of the selected DRAM buffer
+  string   allocation_id    = 10;  // Unique lease id for Finalize/AbortAllocation
+}
+
+message FinalizeRequest {
+  string   node_id       = 1;
+  string   key           = 2;
+  Location location      = 3;
+  string   allocation_id = 4;
+}
+message FinalizeResponse {
+  bool finalized = 1;
+}
+
+message PublishRequest {
+  string   node_id   = 1;
+  string   key       = 2;
+  Location location  = 3;
+}
+message PublishResponse {
+  bool published = 1;
+}
+
+message AbortAllocationRequest {
+  string node_id       = 1;  // target node whose lease should be rolled back
+  string allocation_id = 2;
+  uint64 size          = 3;
+}
+message AbortAllocationResponse {
+  bool aborted = 1;
 }
 
 // ============================================================
@@ -132,6 +161,9 @@ service UMBPMaster {
   // Block index
   rpc Register(RegisterRequest) returns (RegisterResponse);
   rpc Unregister(UnregisterRequest) returns (UnregisterResponse);
+  rpc FinalizeAllocation(FinalizeRequest) returns (FinalizeResponse);
+  rpc PublishLocalBlock(PublishRequest) returns (PublishResponse);
+  rpc AbortAllocation(AbortAllocationRequest) returns (AbortAllocationResponse);
 
   // Router
   rpc RouteGet(RouteGetRequest) returns (RouteGetResponse);

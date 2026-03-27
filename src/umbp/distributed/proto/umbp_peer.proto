@@ -28,6 +28,7 @@ message CommitSsdWriteRequest {
   uint64 staging_offset   = 2;  // offset within DRAM staging area
   uint64 size             = 3;
   uint32 store_index      = 4;  // Master-selected SSD store index
+  string allocation_id    = 5;  // echoed from RoutePut
 }
 message CommitSsdWriteResponse {
   bool   success          = 1;

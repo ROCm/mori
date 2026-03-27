@@ -78,4 +78,9 @@ std::vector<std::string> TierBackend::GetLRUCandidates(size_t max_candidates) co
   return {lru};
 }
 
+std::optional<std::string> TierBackend::GetLocationId(const std::string& key) const {
+  (void)key;
+  return std::nullopt;
+}
+
 }  // namespace mori::umbp

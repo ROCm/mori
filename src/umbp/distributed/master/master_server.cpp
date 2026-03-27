@@ -194,6 +194,57 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     return grpc::Status::OK;
   }
 
+  grpc::Status FinalizeAllocation(grpc::ServerContext* /*context*/,
+                                  const ::umbp::FinalizeRequest* request,
+                                  ::umbp::FinalizeResponse* response) override {
+    if (request->node_id().empty() || request->key().empty() || request->allocation_id().empty()) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                          "node_id/key/allocation_id cannot be empty");
+    }
+
+    Location location = ToLocation(request->location());
+    if (location.node_id.empty()) {
+      location.node_id = request->node_id();
+    }
+
+    const bool finalized = registry_.FinalizeAllocation(request->node_id(), request->key(),
+                                                        location, request->allocation_id());
+    response->set_finalized(finalized);
+    return grpc::Status::OK;
+  }
+
+  grpc::Status PublishLocalBlock(grpc::ServerContext* /*context*/,
+                                 const ::umbp::PublishRequest* request,
+                                 ::umbp::PublishResponse* response) override {
+    if (request->node_id().empty() || request->key().empty()) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "node_id/key cannot be empty");
+    }
+
+    Location location = ToLocation(request->location());
+    if (location.node_id.empty()) {
+      location.node_id = request->node_id();
+    }
+
+    const bool published = registry_.PublishLocalBlock(request->node_id(), request->key(),
+                                                       location);
+    response->set_published(published);
+    return grpc::Status::OK;
+  }
+
+  grpc::Status AbortAllocation(grpc::ServerContext* /*context*/,
+                               const ::umbp::AbortAllocationRequest* request,
+                               ::umbp::AbortAllocationResponse* response) override {
+    if (request->node_id().empty() || request->allocation_id().empty()) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                          "node_id/allocation_id cannot be empty");
+    }
+
+    const bool aborted = registry_.AbortAllocation(request->node_id(), request->allocation_id(),
+                                                   request->size());
+    response->set_aborted(aborted);
+    return grpc::Status::OK;
+  }
+
   grpc::Status RouteGet(grpc::ServerContext* /*context*/, const ::umbp::RouteGetRequest* request,
                         ::umbp::RouteGetResponse* response) override {
     if (request->key().empty()) {
@@ -259,6 +310,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
                                    result->dram_memory_desc_bytes.size());
     response->set_allocated_offset(result->allocated_offset);
     response->set_buffer_index(result->buffer_index);
+    response->set_allocation_id(result->allocation_id);
 
     MORI_UMBP_INFO("[Master] RoutePut key='{}': target_node={}, tier={}, buffer={}, offset={}",
                    request->key(), result->node_id, TierTypeName(result->tier),

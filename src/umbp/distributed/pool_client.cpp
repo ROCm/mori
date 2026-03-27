@@ -141,13 +141,6 @@ bool PoolClient::Init() {
   // Allocate a dedicated SSD staging buffer, independent of DRAM exportable
   // buffers, so that SSD staging RDMA traffic cannot conflict with
   // Master-managed DRAM tier offset allocations.
-  std::vector<std::string> ssd_dirs;
-  std::vector<size_t> ssd_capacities;
-  for (const auto& store : config_.ssd_stores) {
-    ssd_dirs.push_back(store.dir);
-    ssd_capacities.push_back(store.capacity);
-  }
-
   if (!config_.ssd_stores.empty()) {
     ssd_staging_buffer_ = std::make_unique<char[]>(config_.staging_buffer_size);
     std::memset(ssd_staging_buffer_.get(), 0, config_.staging_buffer_size);
@@ -161,23 +154,10 @@ bool PoolClient::Init() {
     }
   }
 
-  // Start PeerService (for remote SSD coordination)
-  if (config_.peer_service_port > 0 && !ssd_dirs.empty()) {
-    peer_service_ =
-        std::make_unique<PeerServiceServer>(ssd_staging_buffer_.get(), config_.staging_buffer_size,
-                                            ssd_staging_mem_desc_bytes_, ssd_dirs, ssd_capacities);
-    if (!peer_service_->Start(config_.peer_service_port)) {
-      MORI_UMBP_ERROR("[PoolClient] PeerService failed to start on port {}",
-                      config_.peer_service_port);
-      peer_service_.reset();
-    } else {
-      MORI_UMBP_INFO("[PoolClient] PeerService started on port {}", config_.peer_service_port);
-    }
-  }
-
-  // Only advertise peer_address if PeerService was actually started
+  // PeerService is started by UMBPClient after PoolClient init. Advertise the
+  // configured address here so the Master can route peer SSD traffic.
   std::string peer_address;
-  if (peer_service_) {
+  if (config_.peer_service_port > 0 && !config_.ssd_stores.empty()) {
     std::string host = config_.io_engine_host.empty() ? config_.master_config.node_address
                                                       : config_.io_engine_host;
     peer_address = host + ":" + std::to_string(config_.peer_service_port);
@@ -217,11 +197,6 @@ void PoolClient::Shutdown() {
     }
   }
 
-  if (peer_service_) {
-    peer_service_->Stop();
-    peer_service_.reset();
-  }
-
   {
     std::lock_guard<std::mutex> lock(peers_mutex_);
     peers_.clear();
@@ -253,7 +228,7 @@ void PoolClient::Shutdown() {
   master_client_.reset();
 
   std::lock_guard<std::mutex> lock(cache_mutex_);
-  location_cache_.clear();
+  cluster_locations_.clear();
 }
 
 bool PoolClient::RegisterMemory(void* ptr, size_t size) {
@@ -303,11 +278,11 @@ bool PoolClient::Put(const std::string& key, const void* src, size_t size, bool 
     bool has_old = false;
     {
       std::lock_guard<std::mutex> lock(cache_mutex_);
-      auto it = location_cache_.find(key);
-      if (it != location_cache_.end()) {
+      auto it = cluster_locations_.find(key);
+      if (it != cluster_locations_.end()) {
         old_loc = it->second;
         has_old = true;
-        location_cache_.erase(it);
+        cluster_locations_.erase(it);
       }
     }
     if (has_old) {
@@ -333,14 +308,20 @@ bool PoolClient::Put(const std::string& key, const void* src, size_t size, bool 
   location.node_id = result->node_id;
   location.size = size;
   location.tier = result->tier;
+  bool finalize_on_caller = false;
+  bool cache_location = false;
 
   if (is_local && result->tier == TierType::DRAM) {
     ok = PutLocalDram(result->buffer_index, src, size, result->allocated_offset);
     location.location_id =
         std::to_string(result->buffer_index) + ":" + std::to_string(result->allocated_offset);
+    finalize_on_caller = ok;
+    cache_location = ok;
   } else if (is_local && result->tier == TierType::SSD) {
     ok = PutLocalSsd(key, src, size, result->buffer_index);
     location.location_id = std::to_string(result->buffer_index) + ":" + key + ".bin";
+    finalize_on_caller = ok;
+    cache_location = ok;
   } else if (!is_local && result->tier == TierType::DRAM) {
     auto& peer = GetOrConnectPeer(result->node_id, result->peer_address, result->engine_desc_bytes,
                                   result->dram_memory_desc_bytes, result->buffer_index);
@@ -348,30 +329,40 @@ bool PoolClient::Put(const std::string& key, const void* src, size_t size, bool 
         RemoteDramWrite(peer, result->buffer_index, src, size, result->allocated_offset, zero_copy);
     location.location_id =
         std::to_string(result->buffer_index) + ":" + std::to_string(result->allocated_offset);
+    finalize_on_caller = ok;
+    cache_location = ok;
   } else if (!is_local && result->tier == TierType::SSD) {
     auto& peer = GetOrConnectPeer(result->node_id, result->peer_address, result->engine_desc_bytes,
                                   result->dram_memory_desc_bytes);
-    ok = RemoteSsdWrite(peer, key, src, size, zero_copy, result->buffer_index);
+    ok = RemoteSsdWrite(peer, key, src, size, zero_copy, result->buffer_index,
+                        result->allocation_id);
     location.location_id = std::to_string(result->buffer_index) + ":" + key + ".bin";
+    finalize_on_caller = false;
+    cache_location = false;
   } else {
     MORI_UMBP_ERROR("[PoolClient] Unsupported Put path: node={}, tier={}", result->node_id,
                     TierTypeName(result->tier));
     return false;
   }
 
-  if (!ok) return false;
-
-  status = master_client_->Register(key, location);
-  if (!status.ok()) {
-    MORI_UMBP_ERROR("[PoolClient] Register failed: {}, attempting rollback",
-                    status.error_message());
-    master_client_->Unregister(key, location);
+  if (!ok) {
+    master_client_->AbortAllocation(result->node_id, result->allocation_id, size);
     return false;
   }
 
-  {
+  if (finalize_on_caller) {
+    status = master_client_->FinalizeAllocation(key, location, result->allocation_id);
+    if (!status.ok()) {
+      MORI_UMBP_ERROR("[PoolClient] FinalizeAllocation failed: {}, attempting rollback",
+                      status.error_message());
+      master_client_->AbortAllocation(result->node_id, result->allocation_id, size);
+      return false;
+    }
+  }
+
+  if (cache_location) {
     std::lock_guard<std::mutex> lock(cache_mutex_);
-    location_cache_[key] = location;
+    cluster_locations_[key] = location;
   }
 
   return true;
@@ -431,8 +422,8 @@ bool PoolClient::Remove(const std::string& key) {
   Location location;
   {
     std::lock_guard<std::mutex> lock(cache_mutex_);
-    auto it = location_cache_.find(key);
-    if (it == location_cache_.end()) {
+    auto it = cluster_locations_.find(key);
+    if (it == cluster_locations_.end()) {
       MORI_UMBP_WARN("[PoolClient] Remove: key '{}' not in local cache", key);
       return false;
     }
@@ -448,7 +439,7 @@ bool PoolClient::Remove(const std::string& key) {
 
   {
     std::lock_guard<std::mutex> lock(cache_mutex_);
-    location_cache_.erase(key);
+    cluster_locations_.erase(key);
   }
 
   return removed > 0;
@@ -460,6 +451,12 @@ bool PoolClient::Remove(const std::string& key) {
 
 bool PoolClient::RegisterWithMaster(const std::string& key, size_t size,
                                     const std::string& location_id, TierType tier) {
+  return PublishLocalBlock(key, size, location_id, tier);
+}
+
+bool PoolClient::FinalizeAllocation(const std::string& key, size_t size,
+                                    const std::string& location_id, TierType tier,
+                                    const std::string& allocation_id) {
   if (!initialized_) {
     MORI_UMBP_ERROR("[PoolClient] Not initialized");
     return false;
@@ -471,18 +468,62 @@ bool PoolClient::RegisterWithMaster(const std::string& key, size_t size,
   location.size = size;
   location.tier = tier;
 
-  auto status = master_client_->Register(key, location);
+  auto status = master_client_->FinalizeAllocation(key, location, allocation_id);
   if (!status.ok()) {
-    MORI_UMBP_ERROR("[PoolClient] RegisterWithMaster failed for key '{}': {}", key,
+    MORI_UMBP_ERROR("[PoolClient] FinalizeAllocation failed for key '{}': {}", key,
                     status.error_message());
     return false;
   }
 
   {
     std::lock_guard<std::mutex> lock(cache_mutex_);
-    location_cache_[key] = location;
+    cluster_locations_[key] = location;
   }
 
+  return true;
+}
+
+bool PoolClient::PublishLocalBlock(const std::string& key, size_t size,
+                                   const std::string& location_id, TierType tier) {
+  if (!initialized_) {
+    MORI_UMBP_ERROR("[PoolClient] Not initialized");
+    return false;
+  }
+
+  Location location;
+  location.node_id = config_.master_config.node_id;
+  location.location_id = location_id;
+  location.size = size;
+  location.tier = tier;
+
+  auto status = master_client_->PublishLocalBlock(key, location);
+  if (!status.ok()) {
+    MORI_UMBP_ERROR("[PoolClient] PublishLocalBlock failed for key '{}': {}", key,
+                    status.error_message());
+    return false;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex_);
+    cluster_locations_[key] = location;
+  }
+
+  return true;
+}
+
+bool PoolClient::AbortAllocation(const std::string& node_id, TierType /*tier*/,
+                                 const std::string& allocation_id, uint64_t size) {
+  if (!initialized_) {
+    MORI_UMBP_ERROR("[PoolClient] Not initialized");
+    return false;
+  }
+
+  auto status = master_client_->AbortAllocation(node_id, allocation_id, size);
+  if (!status.ok()) {
+    MORI_UMBP_ERROR("[PoolClient] AbortAllocation failed for node '{}' allocation '{}': {}",
+                    node_id, allocation_id, status.error_message());
+    return false;
+  }
   return true;
 }
 
@@ -495,8 +536,8 @@ bool PoolClient::UnregisterFromMaster(const std::string& key) {
   Location location;
   {
     std::lock_guard<std::mutex> lock(cache_mutex_);
-    auto it = location_cache_.find(key);
-    if (it == location_cache_.end()) {
+    auto it = cluster_locations_.find(key);
+    if (it == cluster_locations_.end()) {
       MORI_UMBP_WARN("[PoolClient] UnregisterFromMaster: key '{}' not in local cache", key);
       return false;
     }
@@ -513,10 +554,15 @@ bool PoolClient::UnregisterFromMaster(const std::string& key) {
 
   {
     std::lock_guard<std::mutex> lock(cache_mutex_);
-    location_cache_.erase(key);
+    cluster_locations_.erase(key);
   }
 
   return removed > 0;
+}
+
+bool PoolClient::IsRegistered(const std::string& key) const {
+  std::lock_guard<std::mutex> lock(cache_mutex_);
+  return cluster_locations_.find(key) != cluster_locations_.end();
 }
 
 bool PoolClient::ExistsRemote(const std::string& key) {
@@ -600,7 +646,10 @@ bool PoolClient::PutRemote(const std::string& key, const void* src, size_t size)
   auto& peer = GetOrConnectPeer(result->node_id, result->peer_address, result->engine_desc_bytes,
                                 result->dram_memory_desc_bytes, result->buffer_index);
   bool ok = RemoteDramWrite(peer, result->buffer_index, src, size, result->allocated_offset, false);
-  if (!ok) return false;
+  if (!ok) {
+    master_client_->AbortAllocation(result->node_id, result->allocation_id, size);
+    return false;
+  }
 
   // Register with Master so the block is discoverable
   Location location;
@@ -610,15 +659,16 @@ bool PoolClient::PutRemote(const std::string& key, const void* src, size_t size)
   location.size = size;
   location.tier = result->tier;
 
-  status = master_client_->Register(key, location);
+  status = master_client_->FinalizeAllocation(key, location, result->allocation_id);
   if (!status.ok()) {
-    MORI_UMBP_ERROR("[PoolClient] PutRemote Register failed: {}", status.error_message());
+    MORI_UMBP_ERROR("[PoolClient] PutRemote FinalizeAllocation failed: {}", status.error_message());
+    master_client_->AbortAllocation(result->node_id, result->allocation_id, size);
     return false;
   }
 
   {
     std::lock_guard<std::mutex> lock(cache_mutex_);
-    location_cache_[key] = location;
+    cluster_locations_[key] = location;
   }
 
   return true;
@@ -930,7 +980,8 @@ bool PoolClient::EnsurePeerServiceConnection(PeerConnection& peer) {
 }
 
 bool PoolClient::RemoteSsdWrite(PeerConnection& peer, const std::string& key, const void* src,
-                                size_t size, bool zero_copy, uint32_t store_index) {
+                                size_t size, bool zero_copy, uint32_t store_index,
+                                const std::string& allocation_id) {
   if (!io_engine_) return false;
   if (!EnsurePeerServiceConnection(peer)) return false;
   // SSD staging is split in half: write region = [0, size/2)
@@ -1013,6 +1064,7 @@ bool PoolClient::RemoteSsdWrite(PeerConnection& peer, const std::string& key, co
   req.set_staging_offset(write_offset);
   req.set_size(size);
   req.set_store_index(store_index);
+  req.set_allocation_id(allocation_id);
 
   ::umbp::CommitSsdWriteResponse resp;
   grpc::ClientContext ctx;

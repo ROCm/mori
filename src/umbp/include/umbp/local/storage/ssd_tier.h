@@ -75,6 +75,7 @@ class SSDTier : public TierBackend {
   std::string GetLRUKey() const override;
   std::vector<std::string> GetLRUCandidates(size_t max_candidates) const override;
   const IoStatus& LastIoStatus() const { return last_io_status_; }
+  std::optional<std::string> GetLocationId(const std::string& key) const override;
 
  private:
   bool IsReadOnlyShared() const { return access_mode_ == SSDAccessMode::ReadOnlyShared; }

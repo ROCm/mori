@@ -38,11 +38,17 @@ namespace mori::umbp {
 
 class LocalStorageManager {
  public:
+  struct TierLocationInfo {
+    std::string location_id;
+    size_t size = 0;
+  };
+
   // Callback fired after a key changes tier or is fully evicted.
   // to_tier == std::nullopt means the key was evicted (no destination tier).
   // WARNING: Must NOT call back into LocalStorageManager (deadlock risk).
   using TierChangeCallback = std::function<void(const std::string& key, StorageTier from_tier,
-                                                std::optional<StorageTier> to_tier)>;
+                                                std::optional<StorageTier> to_tier,
+                                                std::optional<TierLocationInfo> new_location)>;
 
   // index may be nullptr if index updates are not needed (testing).
   explicit LocalStorageManager(const UMBPConfig& config,
@@ -61,6 +67,7 @@ class LocalStorageManager {
                              StorageTier tier = StorageTier::CPU_DRAM);
 
   bool ReadIntoPtr(const std::string& key, uintptr_t dst, size_t size);
+  bool ReadIntoPtrNoPromote(const std::string& key, uintptr_t dst, size_t size);
   std::vector<bool> ReadBatchIntoPtr(const std::vector<std::string>& keys,
                                      const std::vector<uintptr_t>& dst_ptrs,
                                      const std::vector<size_t>& sizes);
@@ -153,6 +160,9 @@ class LocalStorageManager {
   bool DemoteLRUForSpace(TierBackend* tier);
   bool InsertReadCacheNoWriteback(const std::string& key);
   void UpsertIndexTier(const std::string& key, StorageTier tier, size_t size_hint);
+  static std::optional<TierLocationInfo> BuildTierLocationInfo(TierBackend* tier,
+                                                               const std::string& key,
+                                                               size_t size);
 
   void MaybeAutoPromote(const std::string& key);
 
