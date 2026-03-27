@@ -156,8 +156,8 @@ endif()
 find_package(Protobuf QUIET)
 find_package(gRPC CONFIG QUIET)
 
-# This branch wires distributed PoolClient support directly into umbp_core,
-# so gRPC + Protobuf are a required build dependency here.
+# This branch wires distributed PoolClient support directly into umbp_core, so
+# gRPC + Protobuf are a required build dependency here.
 if(TARGET gRPC::grpc++)
   set(_GRPCPP_LIB gRPC::grpc++)
 elseif(TARGET grpc++)
@@ -241,7 +241,8 @@ elseif(NOT _PROTOBUF_MM)
   message(FATAL_ERROR "[UMBP] cannot determine libprotobuf header version.")
 endif()
 
-message(STATUS "[UMBP] gRPC + Protobuf found — distributed control plane ENABLED")
+message(
+  STATUS "[UMBP] gRPC + Protobuf found — distributed control plane ENABLED")
 
 # ---------- Proto compilation -------------------------------------------------
 
@@ -303,10 +304,8 @@ add_library(
   distributed/pool_client.cpp)
 
 target_include_directories(
-  umbp_common
-  PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
-         ${UMBP_PROTO_GEN_DIR}
-         ${_PROTOBUF_INCLUDE_DIR})
+  umbp_common PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${UMBP_PROTO_GEN_DIR}
+                     ${_PROTOBUF_INCLUDE_DIR})
 
 # mori_io pulls in Torch headers, which can shadow the protobuf headers used by
 # protoc. Expose only the resolved google/ subtree ahead of Torch's includes.
@@ -344,12 +343,3 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 target_link_libraries(umbp_client PRIVATE umbp_common ${_PROTOBUF_LIBS}
                                           ${_GRPCPP_LIB})
-
-# ---------- PoolClient demo executable ----------------------------------------
-
-add_executable(umbp_pool_client distributed/bin/pool_client_main.cpp)
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  target_link_options(umbp_pool_client PRIVATE -Wl,--no-as-needed)
-endif()
-target_link_libraries(umbp_pool_client PRIVATE umbp_common ${_PROTOBUF_LIBS}
-                                               ${_GRPCPP_LIB})

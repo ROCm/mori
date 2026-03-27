@@ -55,10 +55,6 @@ class PoolClient {
   bool RegisterMemory(void* ptr, size_t size);
   void DeregisterMemory(void* ptr);
 
-  bool Put(const std::string& key, const void* src, size_t size, bool zero_copy = true);
-  bool Get(const std::string& key, void* dst, size_t size, bool zero_copy = true);
-  bool Remove(const std::string& key);
-
   // Phase 2: DRAM-only methods for UMBPClient integration.
   // UMBPClient handles local storage directly and calls these for cluster
   // interactions only. PoolClient never touches local storage.
@@ -71,8 +67,8 @@ class PoolClient {
                           TierType tier, const std::string& allocation_id);
   bool PublishLocalBlock(const std::string& key, size_t size, const std::string& location_id,
                          TierType tier);
-  bool AbortAllocation(const std::string& node_id, TierType tier,
-                       const std::string& allocation_id, uint64_t size);
+  bool AbortAllocation(const std::string& node_id, TierType tier, const std::string& allocation_id,
+                       uint64_t size);
 
   // Check whether a block exists on any remote node (RouteGet without RDMA).
   bool ExistsRemote(const std::string& key);
@@ -164,12 +160,6 @@ class PoolClient {
 
   mutable std::mutex cache_mutex_;
   std::unordered_map<std::string, Location> cluster_locations_;
-
-  bool PutLocalDram(uint32_t buffer_index, const void* src, size_t size, uint64_t offset);
-  bool GetLocalDram(uint32_t buffer_index, void* dst, size_t size, uint64_t offset);
-
-  bool PutLocalSsd(const std::string& key, const void* src, size_t size, uint32_t store_index = 0);
-  bool GetLocalSsd(const std::string& filename, void* dst, size_t size, uint32_t store_index = 0);
 };
 
 }  // namespace mori::umbp
