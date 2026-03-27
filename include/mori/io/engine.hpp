@@ -106,6 +106,7 @@ class IOEngine {
   bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id, TransferStatus* status);
 
   std::optional<IOEngineSession> CreateSession(const MemoryDesc& local, const MemoryDesc& remote);
+  void LoadScatterGatherModule(const std::string& hsacoPath);
 
  private:
   struct RouteCacheKey {

@@ -37,6 +37,10 @@ ALL_KERNELS = [
     "cast_kernel",
 ]
 
+IO_KERNELS = [
+    ("scatter_gather", "src/io/kernels"),
+]
+
 
 def main():
     cfg = detect_build_config()
@@ -47,13 +51,16 @@ def main():
     def _bc():
         return "shmem bitcode", ensure_bitcode()
 
-    def _genco(name):
-        return name, compile_genco(name)
+    def _genco(name, source_dir="src/ops/kernels"):
+        return name, compile_genco(name, source_dir=source_dir)
 
-    with ThreadPoolExecutor(max_workers=len(ALL_KERNELS) + 1) as pool:
+    total = len(ALL_KERNELS) + len(IO_KERNELS) + 1
+    with ThreadPoolExecutor(max_workers=total) as pool:
         futures = [pool.submit(_bc)]
         for k in ALL_KERNELS:
             futures.append(pool.submit(_genco, k))
+        for name, src_dir in IO_KERNELS:
+            futures.append(pool.submit(_genco, name, src_dir))
 
         for f in as_completed(futures):
             try:

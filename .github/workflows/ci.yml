@@ -79,6 +79,8 @@ jobs:
         run: |
           cd $GITHUB_WORKSPACE
           timeout 60 pytest tests/python/io/ -v
+          MORI_IO_XGMI_SCATTER_GATHER_THRESHOLD=4 \
+            timeout 120 pytest tests/python/io/test_discrete_buffer.py -v -k 'not performance'
 
       - name: MORI-IR
         env:

@@ -171,7 +171,8 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def("Write", &mori::io ::IOEngine::Write)
       .def("BatchWrite", &mori::io ::IOEngine::BatchWrite)
       .def("CreateSession", &mori::io::IOEngine::CreateSession)
-      .def("PopInboundTransferStatus", &mori::io::IOEngine::PopInboundTransferStatus);
+      .def("PopInboundTransferStatus", &mori::io::IOEngine::PopInboundTransferStatus)
+      .def("LoadScatterGatherModule", &mori::io::IOEngine::LoadScatterGatherModule);
 }
 
 }  // namespace mori
