@@ -75,17 +75,10 @@ __global__ void PipelinedAllReduceSdmaKernel(
   __shared__ uint64_t s_ag_by_sender[64];
   __shared__ uint64_t s_rd_by_sender[64];
   __shared__ uint32_t s_cc_base;
-  __shared__ uint32_t s_bd_base[kMaxPipelineBlocks];
   __shared__ uint32_t s_my_bd_base;
 
   if constexpr (SCATTER_MODE == 0 && !MULTI_CHUNK) {
-    if (blockIdx.x == 0) {
-      if (static_cast<int>(threadIdx.x) < compBlocks) {
-        s_bd_base[threadIdx.x] = __scoped_atomic_load_n(
-            &barrier->block_done[threadIdx.x],
-            __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
-      }
-    } else if (threadIdx.x == 0) {
+    if (blockIdx.x != 0 && threadIdx.x == 0) {
       s_my_bd_base = __scoped_atomic_load_n(
           &barrier->block_done[blockIdx.x - 1],
           __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
@@ -300,12 +293,15 @@ __global__ void PipelinedAllReduceSdmaKernel(
         // Single-chunk: per-block-done poll → SDMA AG push (outbound).
         // Uses parallel per-block flags instead of a single atomic counter
         // to eliminate O(compBlocks) serialization on chunks_complete.
-        // Block-0 threads 0..compBlocks-1 each poll one compute block's
-        // block_done flag — no contention, ~30ns vs ~3.5µs.
+        // Each thread reads its own baseline on-the-fly (in registers, no
+        // shared memory array) then polls until the flag advances.
         {
           const int t = static_cast<int>(threadIdx.x);
           if (t < compBlocks) {
-            const uint32_t expected = s_bd_base[t] + 1u;
+            const uint32_t base = __scoped_atomic_load_n(
+                &barrier->block_done[t],
+                __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
+            const uint32_t expected = base + 1u;
             while (__scoped_atomic_load_n(
                        &barrier->block_done[t],
                        __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) < expected)
