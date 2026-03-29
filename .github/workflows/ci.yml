@@ -2,7 +2,7 @@ name: MoRI CI test
 on:
   push:
     branches: [main]
-  pull_request:
+  pull_request_target:
     branches: [main]
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -14,7 +14,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
-      matrix: ${{ fromJson(vars.CI_MATRIX) }}
+      matrix: ${{ fromJson(vars.CI_MATRIX || '{"include":[{"platform":"MI325X+Thor2"}]}') }}
     container:
       image: rocm/pytorch-private:mori_rocm7.2_ubuntu22.04_py3.10_pytorch_bnxt_ionic
       credentials:
@@ -27,6 +27,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Build and install mori
         run: pip install .
@@ -43,7 +45,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
-      matrix: ${{ fromJson(vars.CI_MATRIX) }}
+      matrix: ${{ fromJson(vars.CI_MATRIX || '{"include":[{"platform":"MI325X+Thor2"}]}') }}
     container:
       image: rocm/pytorch-private:mori_rocm7.2_ubuntu22.04_py3.10_pytorch_bnxt_ionic
       credentials:
@@ -59,6 +61,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Install mori
         run: |
@@ -140,7 +144,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
-      matrix: ${{ fromJson(vars.CI_MATRIX) }}
+      matrix: ${{ fromJson(vars.CI_MATRIX || '{"include":[{"platform":"MI325X+Thor2"}]}') }}
     timeout-minutes: 30
     env:
       IMAGE: rocm/pytorch-private:mori_rocm7.2_ubuntu22.04_py3.10_pytorch_bnxt_ionic
@@ -148,6 +152,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Docker login
         run: |
