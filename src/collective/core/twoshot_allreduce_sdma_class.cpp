@@ -113,6 +113,11 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t /*input_buffer_size*/
   printf("  Barrier: %zu bytes at %p\n", barrierSize, bMem);
   printf("  Output transit buffer: %.2f MB at %p\n",
          output_transit_buffer_size_ / (1024.0 * 1024.0), output_transit_buffer_);
+
+  // ShmemMalloc / ShmemQueryMemObjPtr may internally call HIP APIs that fail
+  // and leave a stale error.  Clear it so the first hipGetLastError() in
+  // operator() / pipelined() sees only real kernel-launch errors.
+  (void)hipGetLastError();
 }
 
 // ---------------------------------------------------------------------------
