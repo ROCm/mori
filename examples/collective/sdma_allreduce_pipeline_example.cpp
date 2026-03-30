@@ -155,9 +155,9 @@ void testPipelinedAllreduce() {
     hipStream_t stream;
     CHECK_HIP(hipStreamCreate(&stream));
 
-    std::vector<double> serialMs, sdmaMs, p2pMs;
-    std::vector<double> serialGb, sdmaGb, p2pGb;
-    std::vector<bool> okSerial, okSdma, okP2p;
+    std::vector<double> serialMs, sdmaMs;
+    std::vector<double> serialGb, sdmaGb;
+    std::vector<bool> okSerial, okSdma;
 
     for (size_t dataMB : dataSizesMB) {
         size_t bytesPerPe = dataMB * 1024 * 1024;
@@ -270,43 +270,6 @@ void testPipelinedAllreduce() {
             }
         }
 
-        // P2P default
-        ms = 0;
-        gb = 0;
-        ok = runBenchMs(
-            [&](uint32_t* in, uint32_t* out, size_t n, hipStream_t s) {
-                return ar->pipelined(in, out, n, 0, 1, s);
-            },
-            inBuf, devOut, hostData, elemsPerPe, bytesPerPe, npes, myPe, stream, warmup,
-            iterations, &ms, &gb);
-        if (myPe == 0) {
-            p2pMs.push_back(ok ? ms : -1.0);
-            p2pGb.push_back(ok ? gb : 0.0);
-            okP2p.push_back(ok);
-        }
-
-        if (chunkSweep && myPe == 0) {
-            sweepPrintf(&sweep_lines, "  [%zu MB/PE] P2P chunk sweep", dataMB);
-        }
-        if (chunkSweep) {
-            for (size_t chunkKB : chunkSizesKB) {
-                size_t chunkBytes = chunkKB * 1024;
-                size_t chunkElems = chunkBytes / sizeof(uint32_t);
-                if (chunkBytes > bytesPerPe) continue;
-                double sm = 0, sg = 0;
-                bool sk = runBenchMs(
-                    [&](uint32_t* in, uint32_t* out, size_t n, hipStream_t s) {
-                        return ar->pipelined(in, out, n, chunkElems, 1, s);
-                    },
-                    inBuf, devOut, hostData, elemsPerPe, bytesPerPe, npes, myPe, stream, warmup,
-                    iterations, &sm, &sg);
-                if (myPe == 0 && sk) {
-                    sweepPrintf(&sweep_lines, "    P2P  %5zuKB  %7.3f ms  %6.1f GB/s",
-                                chunkKB, sm, sg);
-                }
-            }
-        }
-
         ar.reset();
         CHECK_HIP(hipFree(devOut));
         CHECK_HIP(hipFree(inBuf));
@@ -320,29 +283,25 @@ void testPipelinedAllreduce() {
         printf("  npes=%-3d  dtype=uint32  warmup=%d  iters=%d  chunk_sweep=%s\n",
                npes, warmup, iterations, chunkSweep ? "on" : "off");
         printf("  Serial = ReduceScatter + AllGather  (single-shot, no pipeline)\n");
-        printf("  SDMA   = Pipeline SDMA scatter/reduce/AG  (auto %d-chunk, 3-stage)\n", 4);
-        printf("  P2P    = Pipeline with P2P scatter mode\n");
+        printf("  SDMA   = Pipeline SDMA scatter/reduce/AG  (auto 2-chunk, 3-stage)\n");
         printf("%s\n\n", sep);
 
-        printf("%-7s | --- Latency (ms) --- | --- Bandwidth (GB/s) --- | -- Speedup -- | Winner\n",
+        printf("%-7s | --- Latency (ms) --- | --- Bandwidth (GB/s) --- | Speedup | Winner\n",
                "MB/PE");
-        printf("%-7s | %7s %7s %7s | %8s %8s %8s | %6s %6s |\n",
-               "", "Serial", "SDMA", "P2P",
-               "Serial", "SDMA", "P2P",
-               "SDMA", "P2P");
+        printf("%-7s | %7s %7s | %8s %8s | %7s |\n",
+               "", "Serial", "SDMA",
+               "Serial", "SDMA",
+               "SDMA");
         printf("%s\n", sep);
 
         int wins = 0, ncmp = 0;
         for (size_t i = 0; i < dataSizesMB.size(); i++) {
             double s  = (i < serialMs.size()) ? serialMs[i] : -1.0;
             double d  = (i < sdmaMs.size())   ? sdmaMs[i]   : -1.0;
-            double p  = (i < p2pMs.size())    ? p2pMs[i]    : -1.0;
             double sg = (i < serialGb.size()) ? serialGb[i] : 0.0;
             double dg = (i < sdmaGb.size())   ? sdmaGb[i]   : 0.0;
-            double pg = (i < p2pGb.size())    ? p2pGb[i]    : 0.0;
             bool os = (i < okSerial.size()) && okSerial[i];
             bool od = (i < okSdma.size())   && okSdma[i];
-            bool op = (i < okP2p.size())    && okP2p[i];
 
             printf("%-7zu |", dataSizesMB[i]);
 
@@ -357,9 +316,9 @@ void testPipelinedAllreduce() {
                 return                printf(" %8.1f", v);
             };
 
-            fmtMs(os, s); fmtMs(od, d); fmtMs(op, p);
+            fmtMs(os, s); fmtMs(od, d);
             printf(" |");
-            fmtGb(os, sg); fmtGb(od, dg); fmtGb(op, pg);
+            fmtGb(os, sg); fmtGb(od, dg);
             printf(" |");
 
             if (os && od && s > 0 && d > 0) {
@@ -367,13 +326,8 @@ void testPipelinedAllreduce() {
                 ncmp++;
                 if (d < s) wins++;
             } else {
-                printf(" %6s", "-");
+                printf(" %7s", "-");
             }
-
-            if (os && op && s > 0 && p > 0)
-                printf(" %5.2fx", s / p);
-            else
-                printf(" %6s", "-");
 
             printf(" |");
 
