@@ -103,9 +103,17 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t /*input_buffer_size*/
   if (!output_transit_buffer_obj_.IsValid())
     throw std::runtime_error("Failed to query output transit buffer SymmMemObj");
 
-  // Signal baselines start at 0: ShmemMalloc creates a fresh SymmMemObj with
-  // zero-initialized signal arrays for each new allocation.
-  // operator()/pipelined() maintain the running totals from here.
+  // ShmemMalloc may reuse the same address across AllreduceSdma instances,
+  // so the SymmMemObj's signal arrays can retain accumulated values from a
+  // previous instance.  Reset them to 0 so signal_base_q0_/q1_ = 0 is valid.
+  {
+    const uint32_t numQ = output_transit_buffer_obj_->sdmaNumQueue;
+    size_t sigBytes = static_cast<size_t>(npes_) * numQ * sizeof(HSAuint64);
+    if (output_transit_buffer_obj_->signalPtrs)
+      hipMemset(output_transit_buffer_obj_->signalPtrs, 0, sigBytes);
+    if (output_transit_buffer_obj_->expectSignalsPtr)
+      hipMemset(output_transit_buffer_obj_->expectSignalsPtr, 0, sigBytes);
+  }
 
   printf("AllreduceSdma(SDMA) initialized: PE %d of %d, max_blocks=%d\n", myPe_, npes_,
          max_blocks_);
@@ -114,9 +122,7 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t /*input_buffer_size*/
   printf("  Output transit buffer: %.2f MB at %p\n",
          output_transit_buffer_size_ / (1024.0 * 1024.0), output_transit_buffer_);
 
-  // ShmemMalloc / ShmemQueryMemObjPtr may internally call HIP APIs that fail
-  // and leave a stale error.  Clear it so the first hipGetLastError() in
-  // operator() / pipelined() sees only real kernel-launch errors.
+  // Clear any stale HIP error from ShmemMalloc / ShmemQueryMemObjPtr / hipMemset.
   (void)hipGetLastError();
 }
 
