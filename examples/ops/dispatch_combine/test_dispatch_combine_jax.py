@@ -30,7 +30,10 @@ except ImportError:
 
 import numpy as np
 from functools import partial
-import mori, random, argparse
+import mori
+import random
+import argparse
+
 
 def init_distributed():
     parser = argparse.ArgumentParser()
@@ -78,8 +81,10 @@ class EpDispatchCombineTestCase:
 
     def setup(self):
         mori.jax.shmem_init_attr(self.rank, self.world_size)
+
         def set_seed():
             return jax.random.PRNGKey(777 + self.rank)
+
         self.rng = jax.jit(set_seed)()
 
     def cleanup(self):
@@ -89,50 +94,60 @@ class EpDispatchCombineTestCase:
         max_tokens = self.config.max_num_inp_token_per_rank
 
         def all_gather(inp):
-            padded = jnp.pad(inp,
+            padded = jnp.pad(
+                inp,
                 [(0, max_tokens - inp.shape[0])] + [(0, 0)] * (inp.ndim - 1),
             )
             gathered = jax.lax.all_gather(padded, axis_name="i")
             gathered = gathered.reshape(-1, *gathered.shape[2:])
             return gathered
-        
+
         # indices: shape [num_tokens, num_experts_per_token]
         total_experts = self.config.num_experts_per_rank * self.config.world_size
         # print(f"----- rank {self.rank} #tokens {num_tokens} #experts {total_experts}")
-       
+
         keys = jax.random.split(self.rng, num_tokens)
-        perms = jax.vmap(
-            lambda k: jax.random.permutation(k, total_experts)
-        )(keys)
-        indices = perms[:,:self.config.num_experts_per_token]
+        perms = jax.vmap(lambda k: jax.random.permutation(k, total_experts))(keys)
+        indices = perms[:, : self.config.num_experts_per_token]
         indices_list = all_gather(indices)
-                
-        weights = jax.random.uniform(self.rng, (num_tokens, self.config.num_experts_per_token), dtype=jnp.float32)
+
+        weights = jax.random.uniform(
+            self.rng, (num_tokens, self.config.num_experts_per_token), dtype=jnp.float32
+        )
         weights_list = all_gather(weights)
 
         if self.config.scale_dim != 0:
-            scales_fp32 = jax.random.uniform(self.rng, (num_tokens, self.config.scale_dim), dtype=jnp.float32)
+            scales_fp32 = jax.random.uniform(
+                self.rng, (num_tokens, self.config.scale_dim), dtype=jnp.float32
+            )
         else:
             scales_fp32 = jnp.zeros((1, 1), dtype=jnp.float32)
         # cast to target type after gather
         scales_list = all_gather(scales_fp32).astype(self.jax_scale_dtype)
 
-        # input: [num_tokens, hidden_dim] - this 
-        input_fp32 = jax.random.normal(self.rng, (num_tokens, self.config.hidden_dim), dtype=jnp.float32)
+        # input: [num_tokens, hidden_dim] - this
+        input_fp32 = jax.random.normal(
+            self.rng, (num_tokens, self.config.hidden_dim), dtype=jnp.float32
+        )
         input_list = all_gather(input_fp32).astype(self.dtype)
-        
-        print(f"num_tokens {num_tokens}  hidden: {self.config.hidden_dim} indices: {indices.shape}/{indices.dtype}")
+
+        print(
+            f"num_tokens {num_tokens}  hidden: {self.config.hidden_dim} indices: {indices.shape}/{indices.dtype}"
+        )
         print(f"weights: {weights.shape}/{weights.dtype}")
         print(f"scales_fp32: {scales_fp32.shape}/{scales_fp32.dtype}", flush=True)
 
-        return (indices, weights,
+        return (
+            indices,
+            weights,
             scales_fp32.astype(self.jax_scale_dtype),
             input_fp32.astype(self.dtype),
             indices_list,
             weights_list,
             scales_list,
-            input_list)
-        
+            input_list,
+        )
+
     def run_test_once(self, op, num_tokens, test_data):
         (
             indices,
@@ -144,19 +159,23 @@ class EpDispatchCombineTestCase:
             scales_list,
             input_list,
         ) = test_data
-        
+
         weights = None
+
         @jax.jit
         def ffi_calls(inputs, weights, scales, indices):
-            (dispatch_output, 
-             dispatch_indices, 
-             num, 
-             dispatch_weights, 
-             dispatch_scales) = op.dispatch(inputs, weights, scales, indices)
+            (
+                dispatch_output,
+                dispatch_indices,
+                num,
+                dispatch_weights,
+                dispatch_scales,
+            ) = op.dispatch(inputs, weights, scales, indices)
             src_token_pos = op.get_dispatch_src_token_pos(num)
 
             (combine_output, combine_weights) = op.combine(
-                dispatch_output.astype(self.dtype), dispatch_weights, dispatch_indices)
+                dispatch_output.astype(self.dtype), dispatch_weights, dispatch_indices
+            )
 
             return (
                 (
@@ -331,17 +350,26 @@ class EpDispatchCombineTestCase:
 
         devices = np.array(jax.devices())
         mesh = jax.sharding.Mesh(devices, axis_names=("i",))
-        
-        jitted_gen = jax.jit(shard_map(partial(self.gen_test_data, num_tokens),
-            mesh=mesh, in_specs=(), out_specs=(P(), # indices
-                                               P(), # weights
-                                               P(), # scales
-                                               P(), # input
-                                               P(), # indices_list
-                                               P(), # weights_list
-                                               P(), # scales_list
-                                               P(),), # input_list
-                    check_rep=False), static_argnums=())
+
+        jitted_gen = jax.jit(
+            shard_map(
+                partial(self.gen_test_data, num_tokens),
+                mesh=mesh,
+                in_specs=(),
+                out_specs=(
+                    P(),  # indices
+                    P(),  # weights
+                    P(),  # scales
+                    P(),  # input
+                    P(),  # indices_list
+                    P(),  # weights_list
+                    P(),  # scales_list
+                    P(),
+                ),  # input_list
+                check_rep=False,
+            ),
+            static_argnums=(),
+        )
 
         for _ in range(1):
             test_data = jitted_gen()

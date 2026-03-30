@@ -344,8 +344,10 @@ class CMakeBuild(build_ext):
             else "OFF"
         )
         build_ops_device = (
-            "ON" if build_xla_ffi_ops.upper() == "ON" 
-            else os.environ.get("BUILD_OPS_DEVICE", "OFF"))
+            "ON"
+            if build_xla_ffi_ops.upper() == "ON"
+            else os.environ.get("BUILD_OPS_DEVICE", "OFF")
+        )
 
         cmake_args = [
             "cmake",

@@ -268,7 +268,7 @@ Error GetDispatchSrcTokenId(hipStream_t stream, EpDispatchCombineHandle* h, Rema
 }
 
 ErrorOr<std::unique_ptr<EpDispatchCombineState>> EpDispatchCombineInstantiate(
-          Dictionary attrs) try {
+    Dictionary attrs) try {
   auto ep_config = attrs.get<Span<const int32_t>>("ep_config");
   using ErrOr = ErrorOr<std::unique_ptr<EpDispatchCombineState>>;
 
@@ -293,10 +293,8 @@ ErrorOr<std::unique_ptr<EpDispatchCombineState>> EpDispatchCombineInstantiate(
     entry = std::make_unique<EpDispatchCombineHandle>(cfg);
   }
   return std::make_unique<EpDispatchCombineState>(entry.get());
-}
-catch (const std::exception& e) {
-  return ErrorOr<std::unique_ptr<EpDispatchCombineState>>(
-                      Error::Internal(e.what()));
+} catch (const std::exception& e) {
+  return ErrorOr<std::unique_ptr<EpDispatchCombineState>>(Error::Internal(e.what()));
 }
 
 XLA_FFI_DEFINE_HANDLER(EpDispatchCombineInstHandler, EpDispatchCombineInstantiate,

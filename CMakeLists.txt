@@ -166,7 +166,7 @@ if(DEFINED ENV{MORI_WITH_MPI})
 endif()
 
 if(BUILD_XLA_FFI_OPS)
-  if (NOT BUILD_OPS_DEVICE)
+  if(NOT BUILD_OPS_DEVICE)
     message(FATAL_ERROR "BUILD_XLA_FFI_OPS=ON requires BUILD_OPS_DEVICE=ON")
   endif()
   add_compile_definitions(BUILD_XLA_FFI_OPS)
