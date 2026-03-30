@@ -72,28 +72,26 @@ __global__ void PipelinedAllReduceSdmaKernel(
   const uint32_t numQ = dstMemObj->sdmaNumQueue;
   const int compBlocks = static_cast<int>(gridDim.x) - 1;
 
-  // ---- Signal baselines (per-sender, requires sdmaNumQueue >= 3) ----
   __shared__ uint64_t s_scatter_by_sender[64];
   __shared__ uint64_t s_ag_by_sender[64];
   __shared__ uint32_t s_cc_base;
+  __shared__ uint32_t s_scatter_gen;
   __shared__ const P* s_pe_ptrs[8];
 
   if (threadIdx.x == 0) {
+    s_scatter_gen = __scoped_atomic_load_n(
+        &barrier->ag_sync, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
     s_cc_base = (blockIdx.x == 0)
         ? __scoped_atomic_load_n(
               &barrier->chunks_complete, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE)
         : 0u;
   }
-  {
+  if (blockIdx.x == 0) {
     const int s = static_cast<int>(threadIdx.x);
     if (s < npes && s != myPe) {
       const size_t row = static_cast<size_t>(s) * numQ;
-      s_scatter_by_sender[s] =
-          dstMemObj->expectSignalsPtr[row + 0];
-      if (blockIdx.x == 0) {
-        s_ag_by_sender[s] =
-            dstMemObj->expectSignalsPtr[row + 1];
-      }
+      s_scatter_by_sender[s] = dstMemObj->expectSignalsPtr[row + 0];
+      s_ag_by_sender[s]      = dstMemObj->expectSignalsPtr[row + 1];
     }
   }
   __syncthreads();
@@ -113,7 +111,12 @@ __global__ void PipelinedAllReduceSdmaKernel(
 
     if (blockIdx.x != 0) {
       // =================================================================
-      // COMPUTE BLOCKS (1..N): scatter-poll → reduce → chunks_complete
+      // COMPUTE BLOCKS (1..N): wait block-0 scatter-ready → reduce → cc
+      //
+      // Block 0 polls signalPtrs for scatter arrival and broadcasts via
+      // barrier->ag_sync.  This avoids the baseline race condition where
+      // compute blocks could read an inflated signalPtrs/expectSignalsPtr
+      // value due to early-arriving remote SDMA or block-0 SdmaPutThread.
       // =================================================================
       const size_t compTid =
           static_cast<size_t>(blockIdx.x - 1) * static_cast<size_t>(blockDim.x)
@@ -121,11 +124,11 @@ __global__ void PipelinedAllReduceSdmaKernel(
       const size_t compStride =
           static_cast<size_t>(compBlocks) * static_cast<size_t>(blockDim.x);
 
+      const uint32_t genBase = s_scatter_gen;
+
       for (int c = 0; c < numChunks; c++) {
         const size_t off = static_cast<size_t>(c) * packedChunkPerRank;
 
-        // Flush+signal previous chunk on wavefront 1 (thread 64)
-        // while scatter-poll runs on wavefront 0 (threads 0-6).
         if (c > 0 && threadIdx.x == 64) {
 #if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
           asm volatile("buffer_wbl2" ::: "memory");
@@ -134,16 +137,15 @@ __global__ void PipelinedAllReduceSdmaKernel(
           __hip_atomic_fetch_add(&barrier->chunks_complete, 1u,
                                  __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
         }
-        if (threadIdx.x < static_cast<unsigned>(npes - 1)) {
-          const int idx = static_cast<int>(threadIdx.x);
-          const int sender = idx < myPe ? idx : idx + 1;
-          const uint64_t expected =
-              s_scatter_by_sender[sender] + static_cast<uint64_t>(c + 1);
-          HSAuint64* sig = dstMemObj->signalPtrs
-              + static_cast<size_t>(sender) * numQ;
-          while (core::AtomicLoadRelaxed(sig) < expected)
+
+        if (threadIdx.x == 0) {
+          while (__scoped_atomic_load_n(
+                     &barrier->ag_sync,
+                     __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE)
+                 < genBase + static_cast<uint32_t>(c + 1))
             ;
         }
+
         if (threadIdx.x < static_cast<unsigned>(npes)) {
           const int pe = static_cast<int>(threadIdx.x);
           s_pe_ptrs[pe] = (pe == myPe)
@@ -203,14 +205,19 @@ __global__ void PipelinedAllReduceSdmaKernel(
 
     } else {
       // =================================================================
-      // BLOCK 0 — Burst-Submit Scatter + AG
+      // BLOCK 0 — Scatter + scatter-arrival poll + broadcast + AG
       //
       // Phase 1: burst-submit ALL scatter packets to SDMA queues.
-      // Phase 2 (multi-chunk): per-chunk cc wait → SDMA AG push.
-      // Phase 2 (1-chunk): cc wait → SDMA AG push → final AG wait.
+      // Phase 2: per-chunk: poll signalPtrs for scatter arrival from
+      //          all senders, then broadcast to compute blocks via
+      //          barrier->ag_sync.  This mirrors the serial kernel's
+      //          approach and eliminates the baseline race condition.
+      // Phase 3: per-chunk cc wait → SDMA AG push.
+      // Phase 4: final AG signal wait.
       // =================================================================
       const int thr = static_cast<int>(threadIdx.x);
       const uint32_t ccBase = s_cc_base;
+      const uint32_t genBase = s_scatter_gen;
 
       // ---- Phase 1: burst scatter (all chunks, all peers) ----
       if (thr < npes && thr != myPe) {
@@ -236,24 +243,38 @@ __global__ void PipelinedAllReduceSdmaKernel(
         }
       }
 
-      // ---- Phase 2+3: dual-mode AG ----
+      // ---- Phase 2+3+4: scatter-wait → broadcast → cc wait → AG ----
       if constexpr (MULTI_CHUNK) {
-        // Multi-chunk SDMA AG: overlap AG(c) with scatter(c+1)+reduce(c+1).
-        // Each active thread handles one remote PE.  Per chunk: wait for
-        // all compute blocks to finish reduce, then submit SDMA AG push.
-        // AG overwrite of scatter data is safe: AG arrives at remote PE
-        // long after that PE's reduce finished reading the scatter slot
-        // (fence + CC + AG_transfer ≫ remote reduce time).
-        if (thr < npes && thr != myPe) {
-          const int destPe = thr;
-          anvil::SdmaQueueDeviceHandle** dh =
-              dstMemObj->deviceHandles_d + destPe * numQ;
-          HSAuint64* rSigAG = dstMemObj->peerSignalPtrs[destPe]
-              + static_cast<size_t>(myPe) * numQ + 1;
-          HSAuint64* eSigAG = dstMemObj->expectSignalsPtr
-              + destPe * numQ + 1;
+        for (int c = 0; c < numChunks; c++) {
+          // Phase 2: wait for scatter chunk c from all senders
+          if (thr < npes && thr != myPe) {
+            const int sender = thr;
+            const uint64_t expected =
+                s_scatter_by_sender[sender] + static_cast<uint64_t>(c + 1);
+            HSAuint64* sig = dstMemObj->signalPtrs
+                + static_cast<size_t>(sender) * numQ;
+            while (core::AtomicLoadRelaxed(sig) < expected)
+              ;
+          }
+          __syncthreads();
 
-          for (int c = 0; c < numChunks; c++) {
+          if (thr == 0) {
+            __scoped_atomic_store_n(
+                &barrier->ag_sync,
+                genBase + static_cast<uint32_t>(c + 1),
+                __ATOMIC_RELEASE, __MEMORY_SCOPE_DEVICE);
+          }
+
+          // Phase 3: wait for compute blocks to finish reduce, submit AG
+          if (thr < npes && thr != myPe) {
+            const int destPe = thr;
+            anvil::SdmaQueueDeviceHandle** dh =
+                dstMemObj->deviceHandles_d + destPe * numQ;
+            HSAuint64* rSigAG = dstMemObj->peerSignalPtrs[destPe]
+                + static_cast<size_t>(myPe) * numQ + 1;
+            HSAuint64* eSigAG = dstMemObj->expectSignalsPtr
+                + destPe * numQ + 1;
+
             const uint32_t ccTarget =
                 ccBase + static_cast<uint32_t>((c + 1) * compBlocks);
             while (__scoped_atomic_load_n(
@@ -272,8 +293,10 @@ __global__ void PipelinedAllReduceSdmaKernel(
                 + static_cast<size_t>(myPe) * totalShardBytes + cOff;
             core::SdmaPutThread(src, dst, agBytes, dh, rSigAG, eSigAG, numQ, 0);
           }
+          __syncthreads();
         }
 
+        // Phase 4: wait for AG from all senders
         if (thr < npes && thr != myPe) {
           const int sender = thr;
           const uint64_t expected =
@@ -284,7 +307,26 @@ __global__ void PipelinedAllReduceSdmaKernel(
             ;
         }
       } else {
-        // Single-chunk: cc wait → SDMA AG push (outbound).
+        // Single-chunk path
+        // Phase 2: wait for scatter from all senders
+        if (thr < npes && thr != myPe) {
+          const int sender = thr;
+          const uint64_t expected = s_scatter_by_sender[sender] + 1ULL;
+          HSAuint64* sig = dstMemObj->signalPtrs
+              + static_cast<size_t>(sender) * numQ;
+          while (core::AtomicLoadRelaxed(sig) < expected)
+            ;
+        }
+        __syncthreads();
+
+        if (thr == 0) {
+          __scoped_atomic_store_n(
+              &barrier->ag_sync,
+              genBase + 1u,
+              __ATOMIC_RELEASE, __MEMORY_SCOPE_DEVICE);
+        }
+
+        // Phase 3: cc wait → SDMA AG push
         if (thr < npes && thr != myPe) {
           const int destPe = thr;
           anvil::SdmaQueueDeviceHandle** dh =
@@ -308,6 +350,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
           core::SdmaPutThread(src, dst, totalShardBytes, dh, rSigAG, eSigAG, numQ, 0);
         }
 
+        // Phase 4: wait for AG from all senders
         if (thr < npes && thr != myPe) {
           const int sender = thr;
           const uint64_t expected = s_ag_by_sender[sender] + 1ULL;
@@ -316,7 +359,6 @@ __global__ void PipelinedAllReduceSdmaKernel(
           while (core::AtomicLoadRelaxed(sig) < expected)
             ;
         }
-
       }
 
     }  // end block 0 vs compute
