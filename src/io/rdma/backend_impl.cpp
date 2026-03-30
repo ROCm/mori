@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <limits>
 #include <shared_mutex>
+#include <stdexcept>
 
 #include "mori/io/env.hpp"
 #include "mori/io/logging.hpp"
@@ -170,8 +171,16 @@ application::RdmaEndpointConfig RdmaManager::GetRdmaEndpointConfig(int devId) {
   uint32_t maxCqe = static_cast<uint32_t>(deviceAttr->orig_attr.max_cqe);
   uint32_t maxSge = static_cast<uint32_t>(deviceAttr->orig_attr.max_sge);
 
+  if (config.enableNotification && maxQpWr < config.notifPerQp) {
+    MORI_IO_ERROR(
+        "Device max_qp_wr={} is less than notifPerQp={}; notification requires at least "
+        "notifPerQp RQ slots. Either reduce notifPerQp or disable notification.",
+        maxQpWr, config.notifPerQp);
+    throw std::runtime_error("Device RQ capacity insufficient for configured notifPerQp");
+  }
+
   uint32_t desiredSendWr = config.maxSendWr > 0 ? static_cast<uint32_t>(config.maxSendWr) : 8192u;
-  uint32_t desiredRecvWr = config.enableNotification ? 1024u : 0u;
+  uint32_t desiredRecvWr = config.enableNotification ? config.notifPerQp : 0u;
   uint32_t desiredCqe = config.maxCqeNum > 0 ? static_cast<uint32_t>(config.maxCqeNum) : 16384u;
   std::optional<uint32_t> desiredMsgSge =
       config.maxMsgSge > 0 ? std::optional<uint32_t>(static_cast<uint32_t>(config.maxMsgSge))
@@ -184,9 +193,15 @@ application::RdmaEndpointConfig RdmaManager::GetRdmaEndpointConfig(int devId) {
   // Alias for convenience: keep both MORI_IO_QP_MAX_MSG_SGE and MORI_IO_QP_MAX_SGE.
   env::Override("MORI_IO_QP_MAX_SGE", desiredMsgSge, mori::env::detail::ParsePositiveU32);
 
+  if (config.enableNotification && desiredRecvWr < config.notifPerQp) {
+    MORI_IO_WARN("MORI_IO_QP_MAX_RECV_WR={} is less than notifPerQp={}; clamping to notifPerQp",
+                 desiredRecvWr, config.notifPerQp);
+    desiredRecvWr = config.notifPerQp;
+  }
+
   epConfig.maxMsgsNum = std::min(desiredSendWr, maxQpWr);
-  // RQ must fit NotifManager's pre-posted recv WQEs (notifPerQp=1024) when notification is
-  // enabled. MORI_IO_QP_MAX_RECV_WR can override this baseline when provided.
+  // RQ must fit NotifManager's pre-posted recv WQEs (config.notifPerQp) when notification is
+  // enabled. MORI_IO_QP_MAX_RECV_WR can raise this baseline, but not lower it.
   epConfig.maxRecvWr = desiredRecvWr > 0 ? std::min(desiredRecvWr, maxQpWr) : 0;
   epConfig.maxCqeNum = std::min(desiredCqe, maxCqe);
   uint32_t minRequiredCqe = epConfig.maxMsgsNum + epConfig.maxRecvWr;
@@ -234,7 +249,7 @@ void RdmaManager::ConnectEndpoint(EngineKey remoteKey, int devId, application::R
             std::make_shared<std::atomic<int>>(0),
             static_cast<int>(epConfig.maxMsgsNum),
             std::make_shared<std::atomic<bool>>(false),
-            std::make_shared<SubmissionLedger>()};
+            std::make_shared<SubmissionLedger>(config.notifPerQp)};
   meta.rTable[topoKey].push_back(ep);
   epsMap.insert({ep.local.handle.qpn, ep});
 }
@@ -301,16 +316,17 @@ void NotifManager::RegisterEndpointByQpn(uint32_t qpn) {
 
   void* buf;
   SYSCALL_RETURN_ZERO(
-      posix_memalign(reinterpret_cast<void**>(&buf), PAGESIZE, notifPerQp * sizeof(NotifMessage)));
+      posix_memalign(reinterpret_cast<void**>(&buf), PAGESIZE,
+                     static_cast<size_t>(config.notifPerQp) * sizeof(NotifMessage)));
   application::RdmaMemoryRegion mr =
-      devCtx->RegisterRdmaMemoryRegion(buf, notifPerQp * sizeof(NotifMessage));
+      devCtx->RegisterRdmaMemoryRegion(buf, config.notifPerQp * sizeof(NotifMessage));
 
   qpNotifCtx.insert({qpn, {mr, buf}});
 
   struct ibv_qp* qp = ep->local.ibvHandle.qp;
   assert(qp);
 
-  for (uint64_t i = 0; i < notifPerQp; i++) {
+  for (uint64_t i = 0; i < config.notifPerQp; i++) {
     struct ibv_sge sge{};
     sge.addr = mr.addr + i * sizeof(NotifMessage);
     sge.length = sizeof(NotifMessage);
@@ -335,6 +351,49 @@ void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
 
   while ((n = ibv_poll_cq(cq, batchSize, wc)) > 0) {
     for (int i = 0; i < n; ++i) {
+      if (wc[i].status != IBV_WC_SUCCESS) {
+        MORI_IO_ERROR("ProcessOneCqe: CQE error: wr_id={} status={}({}) qp_num={} vendor_err={}",
+                      wc[i].wr_id, static_cast<uint32_t>(wc[i].status),
+                      ibv_wc_status_str(wc[i].status), wc[i].qp_num, wc[i].vendor_err);
+
+        int mergedBatchSize = 0;
+        auto meta = ep.ledger
+                        ? ep.ledger->ReleaseByCqe(wc[i].wr_id, ep.sqDepth.get(), &mergedBatchSize)
+                        : nullptr;
+        if (meta) {
+          uint32_t finishedBefore = meta->finishedBatchSize.fetch_add(mergedBatchSize);
+          TransferStatus* statusPtr = meta->status;
+          if (statusPtr != nullptr) {
+            statusPtr->Update(StatusCode::ERR_RDMA_OP, ibv_wc_status_str(wc[i].status));
+            MORI_IO_ERROR("ProcessOneCqe: batch transfer {} failed, status={}({}), finished={}/{}",
+                          meta->id, static_cast<uint32_t>(wc[i].status),
+                          ibv_wc_status_str(wc[i].status), finishedBefore + mergedBatchSize,
+                          meta->totalBatchSize);
+            meta->status = nullptr;
+          }
+          if (ep.degraded && ep.degraded->load(std::memory_order_relaxed) && ep.ledger) {
+            const int orphanedReleased = ep.ledger->ReleaseOrphanedByRecovery(ep.sqDepth.get());
+            ep.degraded->store(false, std::memory_order_relaxed);
+            MORI_IO_WARN("ProcessOneCqe: recovered degraded EP qpn {} by releasing {} orphaned WRs",
+                         qpn, orphanedReleased);
+          }
+        } else if (IsNotifSendWrId(wc[i].wr_id)) {
+          if (ep.sqDepth) ep.sqDepth->fetch_sub(1, std::memory_order_relaxed);
+          MORI_IO_WARN(
+              "ProcessOneCqe: failed notification SEND CQE, transfer_id={}, released 1 sqDepth",
+              ExtractTransferIdFromWrId(wc[i].wr_id));
+        } else if (wc[i].wr_id < config.notifPerQp) {
+          MORI_IO_WARN("ProcessOneCqe: failed notification RECV CQE, wr_id={} (recv_idx)",
+                       wc[i].wr_id);
+        } else {
+          MORI_IO_WARN(
+              "ProcessOneCqe: failed CQE wr_id={} in ledger range but no record found, "
+              "sqDepth may be stale",
+              wc[i].wr_id);
+        }
+        continue;
+      }
+
       if (wc[i].opcode == IBV_WC_RECV) {
         // Skip RECV processing if notification is disabled
         if (!config.enableNotification) {
@@ -374,13 +433,7 @@ void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
         struct ibv_recv_wr* bad = nullptr;
         SYSCALL_RETURN_ZERO(ibv_post_recv(ep.local.ibvHandle.qp, &wr, &bad));
       } else if (wc[i].opcode == IBV_WC_SEND) {
-        // Notify path: one signaled SEND completion releases one SQ reservation.
         if (ep.sqDepth) ep.sqDepth->fetch_sub(1, std::memory_order_relaxed);
-        uint64_t id = wc[i].wr_id;
-        if (wc[i].status != IBV_WC_SUCCESS) {
-          MORI_IO_ERROR("NotifManager receive send cqe failed for wr_id {} status {}: {}", id,
-                        wc[i].status, ibv_wc_status_str(wc[i].status));
-        }
       } else {
         // Batch path: wr_id carries a recordId from the SubmissionLedger.
         uint64_t recordId = wc[i].wr_id;
@@ -389,39 +442,16 @@ void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
                         ? ep.ledger->ReleaseByCqe(recordId, ep.sqDepth.get(), &mergedBatchSize)
                         : nullptr;
         if (meta) {
-          uint32_t lastBatchSize = meta->finishedBatchSize.fetch_add(mergedBatchSize);
+          uint32_t finishedBefore = meta->finishedBatchSize.fetch_add(mergedBatchSize);
           TransferStatus* statusPtr = meta->status;
-          if (statusPtr != nullptr) {
-            if (wc[i].status == IBV_WC_SUCCESS) {
-              if ((lastBatchSize + mergedBatchSize) == meta->totalBatchSize) {
-                statusPtr->Update(StatusCode::SUCCESS, ibv_wc_status_str(wc[i].status));
-              }
-            } else {
-              statusPtr->Update(StatusCode::ERR_RDMA_OP, ibv_wc_status_str(wc[i].status));
-              MORI_IO_ERROR("NotifManager receive cqe failed for task {} code {} status {}",
-                            meta->id, static_cast<uint32_t>(wc[i].status),
-                            ibv_wc_status_str(wc[i].status));
-              meta->status = nullptr;
-              if (ep.degraded && ep.degraded->load(std::memory_order_relaxed) && ep.ledger) {
-                const int orphanedReleased = ep.ledger->ReleaseOrphanedByRecovery(ep.sqDepth.get());
-                ep.degraded->store(false, std::memory_order_relaxed);
-                MORI_IO_WARN(
-                    "NotifManager recovered degraded EP qpn {} by releasing {} orphaned WRs", qpn,
-                    orphanedReleased);
-              }
-            }
+          if (statusPtr != nullptr && (finishedBefore + mergedBatchSize) == meta->totalBatchSize) {
+            statusPtr->Update(StatusCode::SUCCESS, ibv_wc_status_str(wc[i].status));
           }
-          MORI_IO_TRACE(
-              "NotifManager receive cqe for task {} code {} total batch size {} last batch size {} "
-              "cur batch size {}",
-              meta->id,
-              statusPtr != nullptr ? statusPtr->CodeUint32()
-                                   : static_cast<uint32_t>(StatusCode::ERR_RDMA_OP),
-              meta->totalBatchSize, lastBatchSize, mergedBatchSize);
+          MORI_IO_TRACE("ProcessOneCqe: batch CQE for task {} total={} finished={} cur={}",
+                        meta->id, meta->totalBatchSize, finishedBefore, mergedBatchSize);
         } else {
           MORI_IO_WARN(
-              "NotifManager: no ledger record for wr_id {} (recordId {}); "
-              "sqDepth may be stale",
+              "ProcessOneCqe: no ledger record for wr_id {} (recordId {}); sqDepth may be stale",
               wc[i].wr_id, recordId);
         }
       }
