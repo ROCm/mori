@@ -75,6 +75,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
   __shared__ uint64_t s_scatter_by_sender[64];
   __shared__ uint64_t s_ag_by_sender[64];
   __shared__ uint32_t s_cc_base;
+  __shared__ const P* s_pe_ptrs[8];
 
   if (threadIdx.x == 0) {
     s_cc_base = (blockIdx.x == 0)
@@ -120,6 +121,8 @@ __global__ void PipelinedAllReduceSdmaKernel(
           static_cast<size_t>(compBlocks) * static_cast<size_t>(blockDim.x);
 
       for (int c = 0; c < numChunks; c++) {
+        const size_t off = static_cast<size_t>(c) * packedChunkPerRank;
+
         if (threadIdx.x < static_cast<unsigned>(npes - 1)) {
           const int idx = static_cast<int>(threadIdx.x);
           const int sender = idx < myPe ? idx : idx + 1;
@@ -130,27 +133,46 @@ __global__ void PipelinedAllReduceSdmaKernel(
           while (core::AtomicLoadRelaxed(sig) < expected)
             ;
         }
+        if (threadIdx.x < static_cast<unsigned>(npes)) {
+          const int pe = static_cast<int>(threadIdx.x);
+          s_pe_ptrs[pe] = (pe == myPe)
+              ? reinterpret_cast<const P*>(input)
+                  + static_cast<size_t>(myPe) * packedPerRank + off
+              : buf + static_cast<size_t>(pe) * packedPerRank + off;
+        }
         __syncthreads();
 
         {
-          const size_t off = static_cast<size_t>(c) * packedChunkPerRank;
           size_t cnt = packedChunkPerRank;
           if (off + cnt > packedPerRank) cnt = packedPerRank - off;
 
           P* __restrict__ myDst =
               buf + static_cast<size_t>(myPe) * packedPerRank + off;
-          const P* __restrict__ myInput =
-              reinterpret_cast<const P*>(input)
-              + static_cast<size_t>(myPe) * packedPerRank + off;
 
-          for (size_t k = compTid; k < cnt; k += compStride) {
-            A acc = upcast_v<typename P::type, pack_size>(myInput[k]);
-            for (int pe = 0; pe < npes; ++pe) {
-              if (pe == myPe) continue;
+          size_t k = compTid;
+          for (; k + compStride < cnt; k += compStride * 2) {
+            A acc0 = upcast_v<typename P::type, pack_size>(s_pe_ptrs[0][k]);
+            A acc1 = upcast_v<typename P::type, pack_size>(
+                s_pe_ptrs[0][k + compStride]);
+            for (int pe = 1; pe < npes; ++pe) {
+              packed_assign_add(
+                  acc0,
+                  upcast_v<typename P::type, pack_size>(s_pe_ptrs[pe][k]));
+              packed_assign_add(
+                  acc1,
+                  upcast_v<typename P::type, pack_size>(
+                      s_pe_ptrs[pe][k + compStride]));
+            }
+            myDst[k] = downcast_v<typename P::type, pack_size>(acc0);
+            myDst[k + compStride] =
+                downcast_v<typename P::type, pack_size>(acc1);
+          }
+          if (k < cnt) {
+            A acc = upcast_v<typename P::type, pack_size>(s_pe_ptrs[0][k]);
+            for (int pe = 1; pe < npes; ++pe) {
               packed_assign_add(
                   acc,
-                  upcast_v<typename P::type, pack_size>(
-                      buf[static_cast<size_t>(pe) * packedPerRank + off + k]));
+                  upcast_v<typename P::type, pack_size>(s_pe_ptrs[pe][k]));
             }
             myDst[k] = downcast_v<typename P::type, pack_size>(acc);
           }
