@@ -54,13 +54,13 @@ IonicCqContainer::IonicCqContainer(ibv_context* context, const RdmaEndpointConfi
   cqeNum = config.maxCqeNum;
 
   memset(&cq_attr, 0, sizeof(struct ibv_cq_init_attr_ex));
-#ifdef IONIC_CCQE
-  cq_attr.cqe = 0;
-  MORI_APP_TRACE("cqe mode: ccqe mode");
-#else
-  cq_attr.cqe = cqeNum * 2;  // from rocshmem, send&recv?
-  MORI_APP_TRACE("cqe mode: normal mode");
-#endif
+  // #ifdef IONIC_CCQE
+  //   cq_attr.cqe = 0;
+  //   MORI_APP_TRACE("cqe mode: ccqe mode");
+  // #else
+  //   cq_attr.cqe = cqeNum * 2;  // from rocshmem, send&recv?
+  //   MORI_APP_TRACE("cqe mode: normal mode");
+  // #endif
   cq_attr.cq_context = nullptr;
   cq_attr.channel = nullptr;
   cq_attr.comp_vector = 0;
@@ -68,7 +68,20 @@ IonicCqContainer::IonicCqContainer(ibv_context* context, const RdmaEndpointConfi
   cq_attr.comp_mask = IBV_CQ_INIT_ATTR_MASK_PD;
   cq_attr.parent_domain = pd;
 
+#ifdef IONIC_CCQE
+  MORI_APP_TRACE("cqe mode: ccqe mode");
+  struct ionic_cq_init_attr_ex ionic_cq_attr;
+  memset(&ionic_cq_attr, 0, sizeof(struct ionic_cq_init_attr_ex));
+  ionic_cq_attr.comp_mask = IONIC_CQ_INIT_ATTR_MASK_FLAGS;
+  ionic_cq_attr.flags = IONIC_CQ_INIT_ATTR_CCQE;
+  cq_attr.cqe = 1;
+  cq_ex = ionic_dv_create_cq_ex(context, &cq_attr, &ionic_cq_attr);
+#else
+  MORI_APP_TRACE("cqe mode: normal mode");
+  cq_attr.cqe = cqeNum * 2;  // from rocshmem, send&recv?
   cq_ex = ibv_create_cq_ex(context, &cq_attr);
+#endif
+
   assert(cq_ex);
   cq = ibv_cq_ex_to_cq(cq_ex);
   assert(cq);
