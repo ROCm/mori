@@ -498,9 +498,10 @@ void distRdmaOps(int argc, char* argv[]) {
   // 2 Create an endpoint
   RdmaEndpointConfig config;
   config.portId = activeDevicePortList[local_rank % activeDevicePortList.size()].second;
-  config.gidIdx = IonicDvApi::Available() ? 1 : 3;
+  uint32_t vendor_id = device->GetDeviceAttr()->orig_attr.vendor_id;
+  config.gidIdx = (vendor_id == static_cast<uint32_t>(RdmaDeviceVendorId::Pensando)) ? 1 : 3;
   config.maxMsgsNum = 8092;
-  config.maxCqeNum = BnxtDvApi::Available() ? 1 : 4096;
+  config.maxCqeNum = (vendor_id == static_cast<uint32_t>(RdmaDeviceVendorId::Broadcom)) ? 1 : 4096;
   config.alignment = 4096;
   config.onGpu = on_gpu;
   std::vector<RdmaEndpoint> endpoints;

@@ -28,7 +28,6 @@
 #include <limits>
 #include <shared_mutex>
 
-#include "mori/application/transport/rdma/providers/dv_loader.hpp"
 #include "mori/io/env.hpp"
 #include "mori/io/logging.hpp"
 #include "src/io/rdma/protocol.hpp"
@@ -201,7 +200,9 @@ application::RdmaEndpointConfig RdmaManager::GetRdmaEndpointConfig(int devId) {
   if (desiredMsgSge.has_value()) {
     epConfig.maxMsgSge = std::min(*desiredMsgSge, maxSge);
   } else {
-    epConfig.maxMsgSge = std::min(maxSge, IonicDvApi::Available() ? 2u : 4u);
+    bool is_ionic = (deviceAttr->orig_attr.vendor_id ==
+                     static_cast<uint32_t>(application::RdmaDeviceVendorId::Pensando));
+    epConfig.maxMsgSge = std::min(maxSge, is_ionic ? 2u : 4u);
   }
   return epConfig;
 }
