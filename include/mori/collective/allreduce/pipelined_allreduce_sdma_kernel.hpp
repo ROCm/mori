@@ -8,11 +8,11 @@
 //     Block 0: burst scatter → cc wait → SDMA AG push → AG wait.
 //     Compute blocks: scatter-poll → reduce → wbl2+fence → chunks_complete.
 //     No signal/barrier zeroing: monotonic ATOMIC_INC + baseline protocol.
-//   Multi-chunk mode (shard ≥ 2×kMinChunkShardBytes, default 2 chunks):
+//   Multi-chunk mode (shard ≥ 8 MB → 2 chunks, ≥ 16 MB → 4 chunks):
 //     Block 0: burst scatter → per-chunk (cc wait → SDMA AG push) → AG wait.
 //     Compute blocks: scatter-poll → reduce → wbl2+fence → chunks_complete.
-//     Overlaps AG(c) SDMA transfer with scatter(c+1)+reduce(c+1) on CU,
-//     recovering ~50% of the AG latency.
+//     Smaller chunks let reduce start after partial scatter; AG(c)
+//     overlaps with scatter(c+1)+reduce(c+1) on independent HW engines.
 //
 // SCATTER_MODE=1: P2P read + CU AG (legacy path).
 //
@@ -123,6 +123,16 @@ __global__ void PipelinedAllReduceSdmaKernel(
       for (int c = 0; c < numChunks; c++) {
         const size_t off = static_cast<size_t>(c) * packedChunkPerRank;
 
+        // Flush+signal previous chunk on wavefront 1 (thread 64)
+        // while scatter-poll runs on wavefront 0 (threads 0-6).
+        if (c > 0 && threadIdx.x == 64) {
+#if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
+          asm volatile("buffer_wbl2" ::: "memory");
+#endif
+          __threadfence();
+          __hip_atomic_fetch_add(&barrier->chunks_complete, 1u,
+                                 __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+        }
         if (threadIdx.x < static_cast<unsigned>(npes - 1)) {
           const int idx = static_cast<int>(threadIdx.x);
           const int sender = idx < myPe ? idx : idx + 1;
@@ -179,15 +189,15 @@ __global__ void PipelinedAllReduceSdmaKernel(
         }
 
         __syncthreads();
+      }
 
-        if (threadIdx.x == 0) {
+      if (threadIdx.x == 0) {
 #if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
-          asm volatile("buffer_wbl2" ::: "memory");
+        asm volatile("buffer_wbl2" ::: "memory");
 #endif
-          __threadfence();
-          __hip_atomic_fetch_add(&barrier->chunks_complete, 1u,
-                                 __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
-        }
+        __threadfence();
+        __hip_atomic_fetch_add(&barrier->chunks_complete, 1u,
+                               __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
       }
 
     } else {

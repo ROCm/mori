@@ -427,18 +427,25 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             if (scatter_mode == 1) {
                 chunk_elems = total_count;
             } else {
-                // Multi-chunk SDMA AG: overlap AG(c) transfer with
+                // Multi-chunk SDMA AG: smaller chunks let the reduce
+                // start after partial scatter, and AG(c) overlaps with
                 // scatter(c+1)+reduce(c+1) on independent HW engines.
-                // 2 chunks is near-optimal: each AG transfer (~shard/2/link_bw)
-                // fully overlaps with the next chunk's scatter+reduce+fence.
-                constexpr int    kTargetChunks      = 2;
-                constexpr size_t kMinChunkShardBytes = 8ULL * 1024 * 1024;
+                // Shard >= 16 MB → 4 chunks (~4 MB each): first reduce
+                // starts 4× sooner than single-chunk.
+                // Shard >= 8 MB  → 2 chunks.
+                constexpr size_t kMinChunkShardBytes = 4ULL * 1024 * 1024;
                 const size_t shard_bytes =
                     (total_count / npes_) * dtype_size_;
-                const size_t chunk_shard_bytes =
-                    shard_bytes / kTargetChunks;
-                if (chunk_shard_bytes >= kMinChunkShardBytes) {
-                    chunk_elems = total_count / kTargetChunks;
+                int target_chunks;
+                if (shard_bytes >= 16ULL * 1024 * 1024) {
+                    target_chunks = 4;
+                } else if (shard_bytes >= 2 * kMinChunkShardBytes) {
+                    target_chunks = 2;
+                } else {
+                    target_chunks = 1;
+                }
+                if (target_chunks > 1) {
+                    chunk_elems = total_count / target_chunks;
                 } else {
                     chunk_elems = total_count;
                 }
