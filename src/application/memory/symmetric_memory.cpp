@@ -24,6 +24,7 @@
 #include <fcntl.h>
 
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <vector>
@@ -74,8 +75,12 @@ void SymmMemManager::HostFree(void* localPtr) {
 
 SymmMemObjPtr SymmMemManager::Malloc(size_t size) {
   void* ptr = nullptr;
-  // HIP_RUNTIME_CHECK(hipExtMallocWithFlags(&ptr, size, hipDeviceMallocUncached));
-  HIP_RUNTIME_CHECK(hipMalloc(&ptr, size));
+  const bool enableSdma = (std::getenv("MORI_ENABLE_SDMA") != nullptr);
+  if (enableSdma) {
+    HIP_RUNTIME_CHECK(hipExtMallocWithFlags(&ptr, size, hipDeviceMallocUncached));
+  } else {
+    HIP_RUNTIME_CHECK(hipMalloc(&ptr, size));
+  }
   HIP_RUNTIME_CHECK(hipMemset(ptr, 0, size));
   return RegisterSymmMemObj(ptr, size);
 }
@@ -176,7 +181,6 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
   std::vector<int> dstDeviceIds;
   for (int i = 0; i < worldSize; i++) {
     if (context.GetTransportType(i) != TransportType::SDMA) continue;
-    if (i == rank) continue;
     dstDeviceIds.push_back(i % 8);  // should be intra devices count
   }
   if (dstDeviceIds.size() != 0) {
@@ -334,7 +338,6 @@ SymmMemObjPtr SymmMemManager::RegisterStaticHeapSubRegion(void* localPtr, size_t
     std::vector<int> dstDeviceIds;
     for (int i = 0; i < worldSize; i++) {
       if (context.GetTransportType(i) != TransportType::SDMA) continue;
-      if (i == rank) continue;
       dstDeviceIds.push_back(i % 8);  // should be intra devices count
     }
 

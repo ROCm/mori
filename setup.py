@@ -403,19 +403,16 @@ class CMakeBuild(build_ext):
                 build_dir / "src/io/libmori_io.so",
                 root_dir / "python/mori/libmori_io.so",
             ),
+            (
+                build_dir / "src/collective/libmori_collective.so",
+                root_dir / "python/mori/libmori_collective.so",
+            ),
         ]
         for src_path, dst_path in files_to_copy:
             shutil.copyfile(src_path, dst_path)
 
         # UMBP bindings are compiled into libmori_pybinds.so when BUILD_UMBP=ON
         # (no separate .so to copy)
-        spdk_proxy_src = build_dir / "src/umbp/spdk_proxy"
-        spdk_proxy_dst = root_dir / "python/mori/spdk_proxy"
-        if spdk_proxy_src.exists():
-            shutil.copyfile(spdk_proxy_src, spdk_proxy_dst)
-            os.chmod(spdk_proxy_dst, 0o755)
-        elif spdk_proxy_dst.exists():
-            spdk_proxy_dst.unlink()
 
         _copy_jit_sources(root_dir)
 
@@ -491,7 +488,7 @@ setup(
             "libmori_ops.so",
             "libmori_io.so",
             "libmori_application.so",
-            "spdk_proxy",
+            "libmori_collective.so",
             "_jit_sources/include/**/*.hpp",
             "_jit_sources/include/**/*.h",
             "_jit_sources/src/**/*.hip",

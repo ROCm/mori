@@ -26,7 +26,6 @@
  *
  * @note: This code is adapted/modified from the implementation by Sidler, David
  */
-
 #include "sdma_latency_kernel.h"
 
 // Each WG wants to access all destinations.
@@ -47,7 +46,7 @@ __global__ void multiQueueSDMATransfer(size_t iteration_id, void* srcBuf, void* 
                                        TimeStampBreakdown* timestamp_breakdown) {
   uint64_t base = 0;
   uint64_t pendingWptr = 0;
-
+  uint64_t slot_offset;
   const int warpId = threadIdx.x / warpSize;
   const int laneId = threadIdx.x % warpSize;
   const int nWarps = blockDim.x / warpSize;
@@ -81,8 +80,7 @@ __global__ void multiQueueSDMATransfer(size_t iteration_id, void* srcBuf, void* 
         timestamp_breakdown->reserveQueueSpace_st[packetGlobalIndex] = wall_clock64();
       }
 
-      uint64_t offset = 0;
-      base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_COPY_LINEAR), offset);
+      base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_COPY_LINEAR), slot_offset);
 
       if constexpr (TIMESTAMPING_EN) {
         timestamp_breakdown->reserveQueueSpace_e[packetGlobalIndex] = wall_clock64();
@@ -98,7 +96,7 @@ __global__ void multiQueueSDMATransfer(size_t iteration_id, void* srcBuf, void* 
         timestamp_breakdown->entailPacket_st[packetGlobalIndex] = wall_clock64();
       }
 
-      handle.template placePacket<SDMA_PKT_COPY_LINEAR>(packet, pendingWptr, offset);
+      handle.template placePacket<SDMA_PKT_COPY_LINEAR>(packet, pendingWptr, slot_offset);
 
       if constexpr (TIMESTAMPING_EN) {
         timestamp_breakdown->entailPacket_e[packetGlobalIndex] =
@@ -121,8 +119,7 @@ __global__ void multiQueueSDMATransfer(size_t iteration_id, void* srcBuf, void* 
           ->iterTimeStamps[warpGlobalIndex][PerIterationTimeStamps::RESERVE_SPACE_FENCE_START] =
           wall_clock64();
     }
-    uint64_t offset = 0;
-    base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_ATOMIC), offset);
+    base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_ATOMIC), slot_offset);
     if constexpr (TIMESTAMPING_EN) {
       timestamp_breakdown
           ->iterTimeStamps[warpGlobalIndex][PerIterationTimeStamps::RESERVE_SPACE_FENCE_END] =
@@ -138,7 +135,7 @@ __global__ void multiQueueSDMATransfer(size_t iteration_id, void* srcBuf, void* 
           ->iterTimeStamps[warpGlobalIndex][PerIterationTimeStamps::ENTAIL_FENCE_PACKET_START] =
           wall_clock64();
     }
-    handle.template placePacket<SDMA_PKT_ATOMIC>(packet, pendingWptr, offset);
+    handle.template placePacket<SDMA_PKT_ATOMIC>(packet, pendingWptr, slot_offset);
     if constexpr (TIMESTAMPING_EN) {
       long long int ts = wall_clock64();
       timestamp_breakdown

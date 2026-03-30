@@ -34,17 +34,10 @@ namespace core {
 /*                                           Post Tasks                                           */
 /* ---------------------------------------------------------------------------------------------- */
 
-// SdmaPutThread: COPY data + ATOMIC increment signal.
-// signalAddr is the remote PE's signal memory (mapped locally via IPC).
-// The remote PE reads its own signalPtrs to detect completion.
 inline __device__ void SdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_size,
                                      anvil::SdmaQueueDeviceHandle** deviceHandles,
-                                     HSAuint64* signalAddr, uint32_t queNum, uint32_t qId) {
-  if (copy_size == 0) {
-    __hip_atomic_fetch_add(signalAddr + qId, 1ULL, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-    return;
-  }
-
+                                     HSAuint64* signals, HSAuint64* expectedSignals,
+                                     uint32_t queNum, uint32_t qId) {
   uint64_t base = 0;
   uint64_t pendingWptr = 0;
   uint64_t startBase = 0;
@@ -52,9 +45,7 @@ inline __device__ void SdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_siz
   char* srcPtr = reinterpret_cast<char*>(srcBuf);
   char* dstPtr = reinterpret_cast<char*>(dstBuf);
 
-  anvil::SdmaQueueDeviceHandle* handlePtr = *(deviceHandles + qId);
-  anvil::SdmaQueueDeviceHandle handle = *handlePtr;
-
+  anvil::SdmaQueueDeviceHandle handle = **(deviceHandles + qId);
   base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_COPY_LINEAR), offset);
   pendingWptr = base;
   startBase = base;
@@ -63,33 +54,27 @@ inline __device__ void SdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_siz
   handle.template placePacket<SDMA_PKT_COPY_LINEAR>(packet_d, pendingWptr, offset);
 
   base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_ATOMIC), offset);
-
   pendingWptr = base;
-  auto packet_s = anvil::CreateAtomicIncPacket(signalAddr + qId);
+  HSAuint64* signal = signals + qId;
+  auto packet_s = anvil::CreateAtomicIncPacket(signal);
   handle.template placePacket<SDMA_PKT_ATOMIC>(packet_s, pendingWptr, offset);
 
   handle.submitPacket(startBase, pendingWptr);
+  expectedSignals[qId]++;
 }
 
 inline __device__ void SdmaPutWarp(void* srcBuf, void* dstBuf, size_t copy_size,
-                                   anvil::SdmaQueueDeviceHandle** deviceHandles,
-                                   HSAuint64* signalAddr, uint32_t queNum) {
+                                   anvil::SdmaQueueDeviceHandle** deviceHandles, HSAuint64* signals,
+                                   HSAuint64* expectedSignals, uint32_t queNum) {
+  uint64_t base = 0;
+  uint64_t pendingWptr = 0;
+  uint64_t startBase = 0;
+  size_t perq_send_size = 0;
+  uint64_t offset = 0;
   const int laneId = threadIdx.x % warpSize;
 
   if (laneId >= queNum) return;
   int queueId = laneId;
-
-  if (copy_size == 0) {
-    __hip_atomic_fetch_add(signalAddr + queueId, 1ULL, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-    return;
-  }
-
-  uint64_t base = 0;
-  uint64_t pendingWptr = 0;
-  uint64_t startBase = 0;
-  uint64_t offset = 0;
-  size_t perq_send_size = 0;
-
   const size_t rand_size = copy_size / queNum;  // per queue rand data
 
   char* srcPtr = reinterpret_cast<char*>(srcBuf);
@@ -112,10 +97,12 @@ inline __device__ void SdmaPutWarp(void* srcBuf, void* dstBuf, size_t copy_size,
 
   base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_ATOMIC), offset);
   pendingWptr = base;
-  auto packet_s = anvil::CreateAtomicIncPacket(signalAddr + queueId);
+  HSAuint64* signal = signals + queueId;
+  auto packet_s = anvil::CreateAtomicIncPacket(signal);
   handle.template placePacket<SDMA_PKT_ATOMIC>(packet_s, pendingWptr, offset);
 
   handle.submitPacket(startBase, pendingWptr);
+  expectedSignals[laneId]++;
 }
 
 /* ---------------------------------------------------------------------------------------------- */
