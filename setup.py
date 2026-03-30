@@ -334,6 +334,7 @@ class CMakeBuild(build_ext):
         build_examples = os.environ.get("BUILD_EXAMPLES", "OFF")
         build_tests = os.environ.get("BUILD_TESTS", "OFF")
         build_umbp = os.environ.get("BUILD_UMBP", "OFF")
+        build_xla_ffi_ops = os.environ.get("BUILD_XLA_FFI_OPS", "OFF")
         with_mpi = (
             "ON"
             if (
@@ -342,6 +343,9 @@ class CMakeBuild(build_ext):
             )
             else "OFF"
         )
+        build_ops_device = (
+            "ON" if build_xla_ffi_ops.upper() == "ON" 
+            else os.environ.get("BUILD_OPS_DEVICE", "OFF"))
 
         cmake_args = [
             "cmake",
@@ -358,6 +362,8 @@ class CMakeBuild(build_ext):
             f"-DBUILD_UMBP={build_umbp}",
             f"-DWITH_MPI={with_mpi}",
             "-DBUILD_TORCH_BOOTSTRAP=OFF",
+            f"-DBUILD_XLA_FFI_OPS={build_xla_ffi_ops}",
+            f"-DBUILD_OPS_DEVICE={build_ops_device}",
             "-B",
             str(build_dir),
             "-S",

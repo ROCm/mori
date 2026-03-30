@@ -26,7 +26,9 @@ import ctypes
 
 try:
     import torch  # noqa: F401
-except ImportError:
+except ModuleNotFoundError as e:
+    if getattr(e, "name", None) != "torch":
+        raise e
     pass
 
 cur_dir = os.path.dirname(os.path.abspath(__file__))

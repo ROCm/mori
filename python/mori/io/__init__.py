@@ -19,13 +19,7 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-
-try:
-    import torch  # noqa: F401
-    from .engine import *
-except ImportError:
-    pass
-
+from .engine import *
 from mori.cpp import (
     IOEngineConfig,
     StatusCode,

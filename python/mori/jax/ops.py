@@ -63,10 +63,8 @@ class EpDispatchCombineOp:
     def __init__(self, config: cpp.EpDispatchCombineConfig):
         self.config = config
 
-    # output order:
-    # out, out_indices,
-    # total_recv_token_num,
-    # out_weights (optional), out_scales (optional)
+    # output tuple (weights and scales could be None):
+    # (out, out_indices, total_recv_token_num, out_weights (optional), out_scales (optional))
     def dispatch(
         self,
         input,
@@ -120,13 +118,12 @@ class EpDispatchCombineOp:
         # [out, out_indices, total_recv_token_num, out_weights, out_scales]
         if has_weights:
             if not has_scales:
-                output.append(None)
-        else:
-            if has_scales:
-                out, out_indices, total, out_scales = output
-                return [out, out_indices, total, None, out_scales]
-            output.extend([None, None])
-        return output
+                return (*output, None)
+            return output
+        if has_scales:
+            out, out_indices, total, out_scales = output
+            return (out, out_indices, total, None, out_scales)
+        return (*output, None, None)
 
     # output order:
     # out, out_weights (optional)
@@ -169,9 +166,7 @@ class EpDispatchCombineOp:
                 ep_config=np.asarray(self.config.to_packed_array(), dtype=np.int32),
                 reset_op=True,
             )
-        if not has_weights:
-            output.append(None)
-        return output
+        return output if has_weights else (*output, None)
 
     def get_dispatch_src_token_pos(self, total_recv_token_num):
         if self.config.kernel_type.value in (

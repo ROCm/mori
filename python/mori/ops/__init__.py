@@ -20,15 +20,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-try:
-    import torch  # noqa: F401
-    from .dispatch_combine import (
-        EpDispatchCombineKernelType,
-        EpDispatchCombineConfig,
-        EpDispatchCombineOp,
-    )
-    from .ops import (
-        cast,
-    )
-except ImportError:
-    pass
+from .dispatch_combine import (
+    EpDispatchCombineKernelType,
+    EpDispatchCombineConfig,
+    EpDispatchCombineOp,
+)
+from .ops import (
+    cast,
+)
