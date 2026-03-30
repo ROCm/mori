@@ -389,26 +389,29 @@ bool PoolClient::GetRemote(const std::string& key, void* dst, size_t size) {
 
   const auto& loc = result->location;
 
-  // DRAM-only: reject SSD-resident remote blocks (Phase 6 will add SSD support)
-  if (loc.tier != TierType::DRAM) {
-    MORI_UMBP_WARN("[PoolClient] GetRemote: key '{}' is on {} (DRAM-only supported)", key,
-                   TierTypeName(loc.tier));
-    return false;
-  }
-
   bool is_local = (loc.node_id == config_.master_config.node_id);
   if (is_local) {
-    // UMBPClient should handle local reads via storage_ directly
     MORI_UMBP_WARN("[PoolClient] GetRemote: key '{}' is on local node", key);
     return false;
   }
 
-  auto parsed = ParseLocationId(loc.location_id);
-  if (!parsed) return false;
+  if (loc.tier == TierType::DRAM) {
+    auto parsed = ParseLocationId(loc.location_id);
+    if (!parsed) return false;
+    auto& peer = GetOrConnectPeer(loc.node_id, result->peer_address, result->engine_desc_bytes,
+                                  result->dram_memory_desc_bytes, parsed->buffer_index);
+    return RemoteDramRead(peer, parsed->buffer_index, dst, size, parsed->offset, false);
+  }
 
-  auto& peer = GetOrConnectPeer(loc.node_id, result->peer_address, result->engine_desc_bytes,
-                                result->dram_memory_desc_bytes, parsed->buffer_index);
-  return RemoteDramRead(peer, parsed->buffer_index, dst, size, parsed->offset, false);
+  if (loc.tier == TierType::SSD) {
+    auto& peer = GetOrConnectPeer(loc.node_id, result->peer_address, result->engine_desc_bytes,
+                                  result->dram_memory_desc_bytes);
+    return RemoteSsdRead(peer, key, loc.location_id, dst, size, false);
+  }
+
+  MORI_UMBP_WARN("[PoolClient] GetRemote: key '{}' is on unsupported tier {}", key,
+                 TierTypeName(loc.tier));
+  return false;
 }
 
 bool PoolClient::PutRemote(const std::string& key, const void* src, size_t size) {
@@ -690,15 +693,9 @@ bool PoolClient::RemoteSsdWrite(PeerConnection& peer, const std::string& key, co
                                 const std::string& allocation_id) {
   if (!io_engine_) return false;
   if (!EnsurePeerServiceConnection(peer)) return false;
-  // SSD staging is split in half: write region = [0, size/2)
-  // Use min of local and remote staging size for bounds check
-  size_t effective_staging = peer.ssd_staging_size > 0
-                                 ? std::min(config_.staging_buffer_size, peer.ssd_staging_size)
-                                 : config_.staging_buffer_size;
-  size_t max_ssd_staging = effective_staging / 2;
-  if (!zero_copy && size > max_ssd_staging) {
-    MORI_UMBP_ERROR("[PoolClient] RemoteSsdWrite: size {} exceeds SSD staging write region {}",
-                    size, max_ssd_staging);
+  if (!zero_copy && size > config_.staging_buffer_size) {
+    MORI_UMBP_ERROR("[PoolClient] RemoteSsdWrite: size {} exceeds local staging_buffer_size {}",
+                    size, config_.staging_buffer_size);
     return false;
   }
   if (!IsValidMemoryDesc(peer.ssd_staging_mem)) {
@@ -706,12 +703,31 @@ bool PoolClient::RemoteSsdWrite(PeerConnection& peer, const std::string& key, co
     return false;
   }
   auto& staging_remote_mem = peer.ssd_staging_mem;
-  // Write region: first half of the dedicated SSD staging buffer [0, size/2)
-  constexpr uint64_t write_offset = 0;
 
-  std::lock_guard<std::mutex> ssd_lock(peer.ssd_op_mutex);
+  {
+    std::lock_guard<std::mutex> lock(peer.ssd_op_mutex);
+    if (!peer.peer_stub) {
+      auto channel = grpc::CreateChannel(peer.peer_address, grpc::InsecureChannelCredentials());
+      auto s = ::umbp::UMBPPeer::NewStub(channel);
+      peer.peer_stub = std::unique_ptr<void, void (*)(void*)>(
+          s.release(), +[](void* p) { delete static_cast<::umbp::UMBPPeer::Stub*>(p); });
+    }
+  }
+  auto* stub = static_cast<::umbp::UMBPPeer::Stub*>(peer.peer_stub.get());
 
-  // Phase 1: RDMA write data into remote SSD staging write region
+  // Phase 0: Pre-allocate a write slot on the remote peer
+  ::umbp::AllocateWriteSlotRequest alloc_req;
+  alloc_req.set_size(size);
+  ::umbp::AllocateWriteSlotResponse alloc_resp;
+  grpc::ClientContext alloc_ctx;
+  auto alloc_status = stub->AllocateWriteSlot(&alloc_ctx, alloc_req, &alloc_resp);
+  if (!alloc_status.ok() || !alloc_resp.success()) {
+    MORI_UMBP_ERROR("[PoolClient] AllocateWriteSlot failed for key={}", key);
+    return false;
+  }
+  uint64_t write_offset = alloc_resp.staging_offset();
+
+  // Phase 1: RDMA write data into the allocated staging slot
   {
     bool used_zero_copy = false;
     if (zero_copy) {
@@ -725,16 +741,14 @@ bool PoolClient::RemoteSsdWrite(PeerConnection& peer, const std::string& key, co
                           uid);
         status.Wait();
         if (!status.Succeeded()) {
-          MORI_UMBP_ERROR("[PoolClient] RemoteSsdWrite RDMA phase (zero-copy) failed: uid={}, {}",
-                          uid, status.Message());
+          MORI_UMBP_ERROR("[PoolClient] RemoteSsdWrite RDMA (zero-copy) failed: uid={}, {}", uid,
+                          status.Message());
           return false;
         }
         MORI_UMBP_DEBUG("[PoolClient] RemoteSsdWrite RDMA (zero-copy) done: uid={}", uid);
         used_zero_copy = true;
       } else {
-        MORI_UMBP_WARN(
-            "[PoolClient] zero_copy=true but pointer not registered, "
-            "falling back to staging");
+        MORI_UMBP_WARN("[PoolClient] zero_copy=true but pointer not registered, falling back");
       }
     }
 
@@ -748,7 +762,7 @@ bool PoolClient::RemoteSsdWrite(PeerConnection& peer, const std::string& key, co
       io_engine_->Write(staging_mem_, 0, staging_remote_mem, write_offset, size, &status, uid);
       status.Wait();
       if (!status.Succeeded()) {
-        MORI_UMBP_ERROR("[PoolClient] RemoteSsdWrite RDMA phase failed: uid={}, {}", uid,
+        MORI_UMBP_ERROR("[PoolClient] RemoteSsdWrite RDMA failed: uid={}, {}", uid,
                         status.Message());
         return false;
       }
@@ -756,21 +770,14 @@ bool PoolClient::RemoteSsdWrite(PeerConnection& peer, const std::string& key, co
     }
   }
 
-  // Phase 2: Ask PeerService to persist staging data to SSD
-  if (!peer.peer_stub) {
-    auto channel = grpc::CreateChannel(peer.peer_address, grpc::InsecureChannelCredentials());
-    auto stub = ::umbp::UMBPPeer::NewStub(channel);
-    peer.peer_stub = std::unique_ptr<void, void (*)(void*)>(
-        stub.release(), +[](void* p) { delete static_cast<::umbp::UMBPPeer::Stub*>(p); });
-  }
-  auto* stub = static_cast<::umbp::UMBPPeer::Stub*>(peer.peer_stub.get());
-
+  // Phase 2: CommitSsdWrite with lease_id (slot is released by server on completion)
   ::umbp::CommitSsdWriteRequest req;
   req.set_key(key);
   req.set_staging_offset(write_offset);
   req.set_size(size);
   req.set_store_index(store_index);
   req.set_allocation_id(allocation_id);
+  req.set_lease_id(alloc_resp.lease_id());
 
   ::umbp::CommitSsdWriteResponse resp;
   grpc::ClientContext ctx;
@@ -792,34 +799,29 @@ bool PoolClient::RemoteSsdRead(PeerConnection& peer, const std::string& key,
                                bool zero_copy) {
   if (!io_engine_) return false;
   if (!EnsurePeerServiceConnection(peer)) return false;
-  // SSD staging is split in half: read region = [size/2, size)
-  size_t effective_staging = peer.ssd_staging_size > 0
-                                 ? std::min(config_.staging_buffer_size, peer.ssd_staging_size)
-                                 : config_.staging_buffer_size;
-  size_t max_ssd_staging = effective_staging / 2;
-  if (!zero_copy && size > max_ssd_staging) {
-    MORI_UMBP_ERROR("[PoolClient] RemoteSsdRead: size {} exceeds SSD staging read region {}", size,
-                    max_ssd_staging);
+  if (!zero_copy && size > config_.staging_buffer_size) {
+    MORI_UMBP_ERROR("[PoolClient] RemoteSsdRead: size {} exceeds local staging_buffer_size {}", size,
+                    config_.staging_buffer_size);
     return false;
   }
   if (!IsValidMemoryDesc(peer.ssd_staging_mem)) {
     MORI_UMBP_ERROR("[PoolClient] RemoteSsdRead: no SSD staging MemoryDesc");
     return false;
   }
-  // Read region: second half of the dedicated SSD staging buffer [size/2, size)
   auto& staging_remote_mem = peer.ssd_staging_mem;
 
-  std::lock_guard<std::mutex> ssd_lock(peer.ssd_op_mutex);
-
-  // Phase 1: Ask PeerService to load SSD data into staging (unaffected by zero_copy)
-  if (!peer.peer_stub) {
-    auto channel = grpc::CreateChannel(peer.peer_address, grpc::InsecureChannelCredentials());
-    auto s = ::umbp::UMBPPeer::NewStub(channel);
-    peer.peer_stub = std::unique_ptr<void, void (*)(void*)>(
-        s.release(), +[](void* p) { delete static_cast<::umbp::UMBPPeer::Stub*>(p); });
+  {
+    std::lock_guard<std::mutex> lock(peer.ssd_op_mutex);
+    if (!peer.peer_stub) {
+      auto channel = grpc::CreateChannel(peer.peer_address, grpc::InsecureChannelCredentials());
+      auto s = ::umbp::UMBPPeer::NewStub(channel);
+      peer.peer_stub = std::unique_ptr<void, void (*)(void*)>(
+          s.release(), +[](void* p) { delete static_cast<::umbp::UMBPPeer::Stub*>(p); });
+    }
   }
   auto* stub = static_cast<::umbp::UMBPPeer::Stub*>(peer.peer_stub.get());
 
+  // Phase 1: PrepareSsdRead — server allocates a slot and loads SSD data
   ::umbp::PrepareSsdReadRequest req;
   req.set_key(key);
   req.set_ssd_location_id(location_id);
@@ -837,7 +839,8 @@ bool PoolClient::RemoteSsdRead(PeerConnection& peer, const std::string& key,
     return false;
   }
 
-  // Phase 2: RDMA read from remote staging area
+  // Phase 2: RDMA read from the allocated staging slot
+  bool rdma_ok = false;
   if (zero_copy) {
     auto reg = FindRegisteredMemory(dst, size);
     if (reg) {
@@ -848,22 +851,20 @@ bool PoolClient::RemoteSsdRead(PeerConnection& peer, const std::string& key,
       io_engine_->Read(reg->first, reg->second, staging_remote_mem, resp.staging_offset(), size,
                        &status, uid);
       status.Wait();
-      if (!status.Succeeded()) {
-        MORI_UMBP_ERROR("[PoolClient] RemoteSsdRead RDMA phase (zero-copy) failed: uid={}, {}", uid,
+      rdma_ok = status.Succeeded();
+      if (!rdma_ok) {
+        MORI_UMBP_ERROR("[PoolClient] RemoteSsdRead RDMA (zero-copy) failed: uid={}, {}", uid,
                         status.Message());
-        return false;
+      } else {
+        MORI_UMBP_DEBUG("[PoolClient] RemoteSsdRead RDMA (zero-copy) done: uid={}", uid);
       }
-      MORI_UMBP_DEBUG("[PoolClient] RemoteSsdRead RDMA (zero-copy) done: uid={}", uid);
-      return true;
+    } else {
+      MORI_UMBP_WARN("[PoolClient] zero_copy=true but pointer not registered, falling back");
     }
-    MORI_UMBP_WARN(
-        "[PoolClient] zero_copy=true but pointer not registered, "
-        "falling back to staging");
   }
 
-  {
+  if (!rdma_ok) {
     std::lock_guard<std::mutex> lock(staging_mutex_);
-
     auto uid = io_engine_->AllocateTransferUniqueId();
     MORI_UMBP_DEBUG("[PoolClient] RemoteSsdRead RDMA start: uid={}, size={}", uid, size);
     mori::io::TransferStatus status;
@@ -871,16 +872,36 @@ bool PoolClient::RemoteSsdRead(PeerConnection& peer, const std::string& key,
                      uid);
     status.Wait();
     if (!status.Succeeded()) {
-      MORI_UMBP_ERROR("[PoolClient] RemoteSsdRead RDMA phase failed: uid={}, {}", uid,
-                      status.Message());
+      MORI_UMBP_ERROR("[PoolClient] RemoteSsdRead RDMA failed: uid={}, {}", uid, status.Message());
+      // Release slot even on failure
+      if (resp.lease_id() > 0) {
+        for (int attempt = 0; attempt < 2; ++attempt) {
+          ::umbp::ReleaseSsdLeaseRequest rel_req;
+          rel_req.set_lease_id(resp.lease_id());
+          ::umbp::ReleaseSsdLeaseResponse rel_resp;
+          grpc::ClientContext rel_ctx;
+          if (stub->ReleaseSsdLease(&rel_ctx, rel_req, &rel_resp).ok()) break;
+        }
+      }
       return false;
     }
     MORI_UMBP_DEBUG("[PoolClient] RemoteSsdRead RDMA done: uid={}", uid);
-
     std::memcpy(dst, staging_buffer_.get(), size);
+    rdma_ok = true;
   }
 
-  return true;
+  // Phase 3: Release staging slot (with lightweight retry)
+  if (resp.lease_id() > 0) {
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      ::umbp::ReleaseSsdLeaseRequest rel_req;
+      rel_req.set_lease_id(resp.lease_id());
+      ::umbp::ReleaseSsdLeaseResponse rel_resp;
+      grpc::ClientContext rel_ctx;
+      if (stub->ReleaseSsdLease(&rel_ctx, rel_req, &rel_resp).ok()) break;
+    }
+  }
+
+  return rdma_ok;
 }
 
 }  // namespace mori::umbp

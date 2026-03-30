@@ -22,30 +22,36 @@
 #include <grpcpp/grpcpp.h>
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
-#include <fstream>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "umbp/common/config.h"
 #include "umbp/distributed/peer/peer_service.h"
+#include "umbp/distributed/pool_client.h"
+#include "umbp/local/block_index/local_block_index.h"
+#include "umbp/local/storage/local_storage_manager.h"
 #include "umbp_peer.grpc.pb.h"
 
 namespace mori::umbp {
 namespace {
 
 constexpr size_t kStagingSize = 4096;
-constexpr size_t kSsdCapacity = 1 << 20;  // 1 MB
 constexpr uint16_t kBasePort = 50200;
+constexpr int kNumReadSlots = 4;
+constexpr int kNumWriteSlots = 4;
+constexpr int kLeaseTimeoutS = 2;
 
 static uint16_t AllocPort() {
   static std::atomic<uint16_t> next{kBasePort};
   return next.fetch_add(1);
 }
 
-class PeerServiceTest : public ::testing::Test {
+class PeerServiceSlotTest : public ::testing::Test {
  protected:
   void SetUp() override {
     staging_buffer_ = std::malloc(kStagingSize);
@@ -58,11 +64,23 @@ class PeerServiceTest : public ::testing::Test {
 
     ssd_staging_mem_desc_ = {0xD0, 0xE0, 0xF0};
 
+    UMBPConfig cfg;
+    cfg.dram.capacity_bytes = 1 << 20;
+    cfg.ssd.enabled = true;
+    cfg.ssd.storage_dir = ssd_dir_.string();
+    cfg.ssd.capacity_bytes = 1 << 20;
+    storage_ = std::make_unique<LocalStorageManager>(cfg, &index_);
+
+    PoolClientConfig pc_cfg;
+    pc_cfg.master_config.master_address = "localhost:9999";
+    pc_cfg.master_config.node_id = "test_node";
+    coordinator_ = std::make_unique<PoolClient>(std::move(pc_cfg));
+
     port_ = AllocPort();
 
     server_ = std::make_unique<PeerServiceServer>(
-        staging_buffer_, kStagingSize, ssd_staging_mem_desc_,
-        std::vector<std::string>{ssd_dir_.string()}, std::vector<size_t>{kSsdCapacity});
+        staging_buffer_, kStagingSize, ssd_staging_mem_desc_, *storage_, index_, *coordinator_,
+        kNumReadSlots, kNumWriteSlots, kLeaseTimeoutS);
     server_->Start(port_);
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
@@ -74,174 +92,419 @@ class PeerServiceTest : public ::testing::Test {
   void TearDown() override {
     server_->Stop();
     server_.reset();
+    coordinator_.reset();
+    storage_.reset();
     std::free(staging_buffer_);
     std::filesystem::remove_all(ssd_dir_);
+  }
+
+  void WriteTestDataToSsd(const std::string& key, const std::string& data) {
+    storage_->Write(key, data.data(), data.size(), StorageTier::LOCAL_SSD);
+    index_.Insert(key, {StorageTier::LOCAL_SSD, 0, data.size()});
   }
 
   void* staging_buffer_ = nullptr;
   std::filesystem::path ssd_dir_;
   std::vector<uint8_t> ssd_staging_mem_desc_;
   uint16_t port_ = 0;
+  LocalBlockIndex index_;
+  std::unique_ptr<LocalStorageManager> storage_;
+  std::unique_ptr<PoolClient> coordinator_;
   std::unique_ptr<PeerServiceServer> server_;
   std::unique_ptr<::umbp::UMBPPeer::Stub> stub_;
 };
 
-TEST_F(PeerServiceTest, GetPeerInfo) {
+// --- GetPeerInfo ---
+
+TEST_F(PeerServiceSlotTest, GetPeerInfoReturnsStagingInfo) {
   ::umbp::GetPeerInfoRequest request;
   ::umbp::GetPeerInfoResponse response;
   grpc::ClientContext context;
 
   auto status = stub_->GetPeerInfo(&context, request, &response);
   ASSERT_TRUE(status.ok()) << status.error_message();
-
-  // GetPeerInfo only returns SSD staging info (engine_desc and dram_memory_desc
-  // are provided by Master in RoutePut/RouteGet responses)
   EXPECT_EQ(response.ssd_staging_mem_desc(),
             std::string(ssd_staging_mem_desc_.begin(), ssd_staging_mem_desc_.end()));
   EXPECT_EQ(response.ssd_staging_size(), kStagingSize);
 }
 
-TEST_F(PeerServiceTest, CommitSsdWriteSuccess) {
-  const std::string test_data = "hello, ssd world!";
-  std::memcpy(staging_buffer_, test_data.data(), test_data.size());
+// --- AllocateWriteSlot ---
 
-  ::umbp::CommitSsdWriteRequest request;
-  request.set_key("block_1");
-  request.set_staging_offset(0);
-  request.set_size(test_data.size());
-  request.set_store_index(0);
+TEST_F(PeerServiceSlotTest, AllocateWriteSlotSuccess) {
+  ::umbp::AllocateWriteSlotRequest req;
+  req.set_size(64);
+  ::umbp::AllocateWriteSlotResponse resp;
+  grpc::ClientContext ctx;
 
-  ::umbp::CommitSsdWriteResponse response;
-  grpc::ClientContext context;
-
-  auto status = stub_->CommitSsdWrite(&context, request, &response);
-  ASSERT_TRUE(status.ok()) << status.error_message();
-  EXPECT_TRUE(response.success());
-  EXPECT_EQ(response.ssd_location_id(), "block_1.bin");
-}
-
-TEST_F(PeerServiceTest, CommitSsdWriteStoreIndexOutOfRange) {
-  const std::string test_data = "oob test";
-  std::memcpy(staging_buffer_, test_data.data(), test_data.size());
-
-  ::umbp::CommitSsdWriteRequest request;
-  request.set_key("block_oob");
-  request.set_staging_offset(0);
-  request.set_size(test_data.size());
-  request.set_store_index(99);
-
-  ::umbp::CommitSsdWriteResponse response;
-  grpc::ClientContext context;
-
-  auto status = stub_->CommitSsdWrite(&context, request, &response);
+  auto status = stub_->AllocateWriteSlot(&ctx, req, &resp);
   ASSERT_TRUE(status.ok());
-  EXPECT_FALSE(response.success());
+  ASSERT_TRUE(resp.success());
+  EXPECT_GT(resp.lease_id(), 0u);
+  EXPECT_GT(resp.lease_ttl_ms(), 0u);
+  EXPECT_LT(resp.staging_offset(), kStagingSize / 2);
 }
 
-TEST_F(PeerServiceTest, CommitSsdWriteFileContents) {
-  const std::string test_data = "verify file contents";
-  std::memcpy(staging_buffer_, test_data.data(), test_data.size());
+TEST_F(PeerServiceSlotTest, AllocateWriteSlotTooLarge) {
+  ::umbp::AllocateWriteSlotRequest req;
+  req.set_size(kStagingSize);  // exceeds slot size
+  ::umbp::AllocateWriteSlotResponse resp;
+  grpc::ClientContext ctx;
 
-  ::umbp::CommitSsdWriteRequest request;
-  request.set_key("block_verify");
-  request.set_staging_offset(0);
-  request.set_size(test_data.size());
-  request.set_store_index(0);
-
-  ::umbp::CommitSsdWriteResponse response;
-  grpc::ClientContext context;
-
-  auto status = stub_->CommitSsdWrite(&context, request, &response);
-  ASSERT_TRUE(status.ok()) << status.error_message();
-  ASSERT_TRUE(response.success());
-
-  std::ifstream file(ssd_dir_ / "block_verify.bin", std::ios::binary);
-  ASSERT_TRUE(file.is_open());
-  std::string file_contents((std::istreambuf_iterator<char>(file)),
-                            std::istreambuf_iterator<char>());
-  EXPECT_EQ(file_contents, test_data);
+  auto status = stub_->AllocateWriteSlot(&ctx, req, &resp);
+  ASSERT_TRUE(status.ok());
+  EXPECT_FALSE(resp.success());
 }
 
-TEST_F(PeerServiceTest, PrepareSsdReadSuccess) {
-  const std::string test_data = "read me from ssd";
-  std::memcpy(staging_buffer_, test_data.data(), test_data.size());
+TEST_F(PeerServiceSlotTest, AllocateWriteSlotZeroSize) {
+  ::umbp::AllocateWriteSlotRequest req;
+  req.set_size(0);
+  ::umbp::AllocateWriteSlotResponse resp;
+  grpc::ClientContext ctx;
 
-  {
-    ::umbp::CommitSsdWriteRequest req;
-    req.set_key("block_read");
-    req.set_staging_offset(0);
-    req.set_size(test_data.size());
-    req.set_store_index(0);
-    ::umbp::CommitSsdWriteResponse resp;
+  auto status = stub_->AllocateWriteSlot(&ctx, req, &resp);
+  ASSERT_TRUE(status.ok());
+  EXPECT_FALSE(resp.success());
+}
+
+TEST_F(PeerServiceSlotTest, AllocateWriteSlotExhaustAll) {
+  for (int i = 0; i < kNumWriteSlots; ++i) {
+    ::umbp::AllocateWriteSlotRequest req;
+    req.set_size(32);
+    ::umbp::AllocateWriteSlotResponse resp;
     grpc::ClientContext ctx;
-    auto s = stub_->CommitSsdWrite(&ctx, req, &resp);
-    ASSERT_TRUE(s.ok());
-    ASSERT_TRUE(resp.success());
+    auto status = stub_->AllocateWriteSlot(&ctx, req, &resp);
+    ASSERT_TRUE(status.ok());
+    ASSERT_TRUE(resp.success()) << "Slot " << i << " should succeed";
   }
 
-  std::memset(staging_buffer_, 0, kStagingSize);
+  ::umbp::AllocateWriteSlotRequest req;
+  req.set_size(32);
+  ::umbp::AllocateWriteSlotResponse resp;
+  grpc::ClientContext ctx;
+  auto status = stub_->AllocateWriteSlot(&ctx, req, &resp);
+  ASSERT_TRUE(status.ok());
+  EXPECT_FALSE(resp.success()) << "Should fail when all slots exhausted";
+}
 
-  {
+TEST_F(PeerServiceSlotTest, AllocateWriteSlotTtlReclaim) {
+  for (int i = 0; i < kNumWriteSlots; ++i) {
+    ::umbp::AllocateWriteSlotRequest req;
+    req.set_size(32);
+    ::umbp::AllocateWriteSlotResponse resp;
+    grpc::ClientContext ctx;
+    stub_->AllocateWriteSlot(&ctx, req, &resp);
+  }
+
+  std::this_thread::sleep_for(std::chrono::seconds(kLeaseTimeoutS + 1));
+
+  ::umbp::AllocateWriteSlotRequest req;
+  req.set_size(32);
+  ::umbp::AllocateWriteSlotResponse resp;
+  grpc::ClientContext ctx;
+  auto status = stub_->AllocateWriteSlot(&ctx, req, &resp);
+  ASSERT_TRUE(status.ok());
+  EXPECT_TRUE(resp.success()) << "Should succeed after TTL reclaim";
+  EXPECT_GT(server_->Metrics().expired_reclaims.load(), 0u);
+}
+
+// --- PrepareSsdRead ---
+
+TEST_F(PeerServiceSlotTest, PrepareSsdReadSuccess) {
+  const std::string data = "read me from ssd";
+  WriteTestDataToSsd("block_read", data);
+
+  ::umbp::PrepareSsdReadRequest req;
+  req.set_key("block_read");
+  req.set_ssd_location_id("0:block_read");
+  req.set_size(data.size());
+  ::umbp::PrepareSsdReadResponse resp;
+  grpc::ClientContext ctx;
+
+  auto status = stub_->PrepareSsdRead(&ctx, req, &resp);
+  ASSERT_TRUE(status.ok()) << status.error_message();
+  ASSERT_TRUE(resp.success());
+  EXPECT_GE(resp.staging_offset(), kStagingSize / 2);
+  EXPECT_GT(resp.lease_id(), 0u);
+  EXPECT_GT(resp.lease_ttl_ms(), 0u);
+
+  std::string loaded(static_cast<const char*>(staging_buffer_) + resp.staging_offset(), data.size());
+  EXPECT_EQ(loaded, data);
+}
+
+TEST_F(PeerServiceSlotTest, PrepareSsdReadNotFound) {
+  ::umbp::PrepareSsdReadRequest req;
+  req.set_key("nonexistent");
+  req.set_ssd_location_id("nonexistent");
+  req.set_size(64);
+  ::umbp::PrepareSsdReadResponse resp;
+  grpc::ClientContext ctx;
+
+  auto status = stub_->PrepareSsdRead(&ctx, req, &resp);
+  ASSERT_TRUE(status.ok());
+  EXPECT_FALSE(resp.success());
+}
+
+TEST_F(PeerServiceSlotTest, PrepareSsdReadTooLarge) {
+  ::umbp::PrepareSsdReadRequest req;
+  req.set_key("anything");
+  req.set_ssd_location_id("anything");
+  req.set_size(kStagingSize);
+  ::umbp::PrepareSsdReadResponse resp;
+  grpc::ClientContext ctx;
+
+  auto status = stub_->PrepareSsdRead(&ctx, req, &resp);
+  ASSERT_TRUE(status.ok());
+  EXPECT_FALSE(resp.success());
+}
+
+TEST_F(PeerServiceSlotTest, PrepareSsdReadExhaustSlots) {
+  for (int i = 0; i < kNumReadSlots; ++i) {
+    const std::string key = "block_" + std::to_string(i);
+    const std::string data = "data_" + std::to_string(i);
+    WriteTestDataToSsd(key, data);
+  }
+
+  for (int i = 0; i < kNumReadSlots; ++i) {
+    const std::string key = "block_" + std::to_string(i);
     ::umbp::PrepareSsdReadRequest req;
-    req.set_key("block_read");
-    req.set_ssd_location_id("0:block_read.bin");
-    req.set_size(test_data.size());
+    req.set_key(key);
+    req.set_ssd_location_id("0:" + key);
+    req.set_size(6);
     ::umbp::PrepareSsdReadResponse resp;
     grpc::ClientContext ctx;
-    auto s = stub_->PrepareSsdRead(&ctx, req, &resp);
-    ASSERT_TRUE(s.ok()) << s.error_message();
-    ASSERT_TRUE(resp.success());
-    EXPECT_EQ(resp.staging_offset(), kStagingSize / 2);
+    auto status = stub_->PrepareSsdRead(&ctx, req, &resp);
+    ASSERT_TRUE(status.ok());
+    ASSERT_TRUE(resp.success()) << "Slot " << i << " should succeed";
   }
 
-  std::string loaded(static_cast<const char*>(staging_buffer_) + kStagingSize / 2,
-                     test_data.size());
-  EXPECT_EQ(loaded, test_data);
+  WriteTestDataToSsd("block_extra", "extra");
+  ::umbp::PrepareSsdReadRequest req;
+  req.set_key("block_extra");
+  req.set_ssd_location_id("0:block_extra");
+  req.set_size(5);
+  ::umbp::PrepareSsdReadResponse resp;
+  grpc::ClientContext ctx;
+  auto status = stub_->PrepareSsdRead(&ctx, req, &resp);
+  ASSERT_TRUE(status.ok());
+  EXPECT_FALSE(resp.success()) << "Should fail when all read slots exhausted";
 }
 
-TEST_F(PeerServiceTest, PrepareSsdReadNotFound) {
-  ::umbp::PrepareSsdReadRequest request;
-  request.set_key("nonexistent");
-  request.set_ssd_location_id("nonexistent.bin");
-  request.set_size(64);
+// --- ReleaseSsdLease ---
 
-  ::umbp::PrepareSsdReadResponse response;
-  grpc::ClientContext context;
+TEST_F(PeerServiceSlotTest, ReleaseSsdLeaseSuccess) {
+  const std::string data = "release test";
+  WriteTestDataToSsd("block_rel", data);
 
-  auto status = stub_->PrepareSsdRead(&context, request, &response);
-  ASSERT_TRUE(status.ok());
-  EXPECT_FALSE(response.success());
+  uint64_t lease_id;
+  {
+    ::umbp::PrepareSsdReadRequest req;
+    req.set_key("block_rel");
+    req.set_ssd_location_id("0:block_rel");
+    req.set_size(data.size());
+    ::umbp::PrepareSsdReadResponse resp;
+    grpc::ClientContext ctx;
+    stub_->PrepareSsdRead(&ctx, req, &resp);
+    ASSERT_TRUE(resp.success());
+    lease_id = resp.lease_id();
+  }
+
+  {
+    ::umbp::ReleaseSsdLeaseRequest req;
+    req.set_lease_id(lease_id);
+    ::umbp::ReleaseSsdLeaseResponse resp;
+    grpc::ClientContext ctx;
+    auto status = stub_->ReleaseSsdLease(&ctx, req, &resp);
+    ASSERT_TRUE(status.ok());
+    EXPECT_TRUE(resp.success());
+  }
+
+  {
+    ::umbp::ReleaseSsdLeaseRequest req;
+    req.set_lease_id(lease_id);
+    ::umbp::ReleaseSsdLeaseResponse resp;
+    grpc::ClientContext ctx;
+    auto status = stub_->ReleaseSsdLease(&ctx, req, &resp);
+    ASSERT_TRUE(status.ok());
+    EXPECT_FALSE(resp.success()) << "Double release should fail";
+  }
 }
 
-TEST_F(PeerServiceTest, CommitSsdWriteOverCapacity) {
-  auto server_small = std::make_unique<PeerServiceServer>(
-      staging_buffer_, kStagingSize, ssd_staging_mem_desc_,
-      std::vector<std::string>{ssd_dir_.string()}, std::vector<size_t>{16});
-  uint16_t small_port = AllocPort();
-  server_small->Start(small_port);
-  std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
-  auto channel = grpc::CreateChannel("localhost:" + std::to_string(small_port),
-                                     grpc::InsecureChannelCredentials());
-  auto small_stub = ::umbp::UMBPPeer::NewStub(channel);
-
-  const std::string data(32, 'x');
-  std::memcpy(staging_buffer_, data.data(), data.size());
-
-  ::umbp::CommitSsdWriteRequest request;
-  request.set_key("too_big");
-  request.set_staging_offset(0);
-  request.set_size(data.size());
-  request.set_store_index(0);
-
-  ::umbp::CommitSsdWriteResponse response;
-  grpc::ClientContext context;
-
-  auto status = small_stub->CommitSsdWrite(&context, request, &response);
+TEST_F(PeerServiceSlotTest, ReleaseSsdLeaseInvalid) {
+  ::umbp::ReleaseSsdLeaseRequest req;
+  req.set_lease_id(9999);
+  ::umbp::ReleaseSsdLeaseResponse resp;
+  grpc::ClientContext ctx;
+  auto status = stub_->ReleaseSsdLease(&ctx, req, &resp);
   ASSERT_TRUE(status.ok());
-  EXPECT_FALSE(response.success());
+  EXPECT_FALSE(resp.success());
+}
 
-  server_small->Stop();
+// --- CommitSsdWrite with lease_id ---
+
+TEST_F(PeerServiceSlotTest, CommitSsdWriteInvalidLeaseId) {
+  ::umbp::CommitSsdWriteRequest req;
+  req.set_key("block_bad_lease");
+  req.set_staging_offset(0);
+  req.set_size(10);
+  req.set_store_index(0);
+  req.set_lease_id(9999);
+  ::umbp::CommitSsdWriteResponse resp;
+  grpc::ClientContext ctx;
+
+  auto status = stub_->CommitSsdWrite(&ctx, req, &resp);
+  ASSERT_TRUE(status.ok());
+  EXPECT_FALSE(resp.success());
+  EXPECT_GT(server_->Metrics().invalid_lease_rejects.load(), 0u);
+}
+
+TEST_F(PeerServiceSlotTest, CommitSsdWriteBadStoreIndex) {
+  ::umbp::AllocateWriteSlotRequest alloc_req;
+  alloc_req.set_size(32);
+  ::umbp::AllocateWriteSlotResponse alloc_resp;
+  grpc::ClientContext alloc_ctx;
+  stub_->AllocateWriteSlot(&alloc_ctx, alloc_req, &alloc_resp);
+  ASSERT_TRUE(alloc_resp.success());
+
+  ::umbp::CommitSsdWriteRequest req;
+  req.set_key("block_bad_store");
+  req.set_staging_offset(alloc_resp.staging_offset());
+  req.set_size(32);
+  req.set_store_index(99);
+  req.set_lease_id(alloc_resp.lease_id());
+  ::umbp::CommitSsdWriteResponse resp;
+  grpc::ClientContext ctx;
+
+  auto status = stub_->CommitSsdWrite(&ctx, req, &resp);
+  ASSERT_TRUE(status.ok());
+  EXPECT_FALSE(resp.success());
+}
+
+TEST_F(PeerServiceSlotTest, CommitSsdWriteSizeTooLarge) {
+  ::umbp::AllocateWriteSlotRequest alloc_req;
+  alloc_req.set_size(32);
+  ::umbp::AllocateWriteSlotResponse alloc_resp;
+  grpc::ClientContext alloc_ctx;
+  stub_->AllocateWriteSlot(&alloc_ctx, alloc_req, &alloc_resp);
+  ASSERT_TRUE(alloc_resp.success());
+
+  ::umbp::CommitSsdWriteRequest req;
+  req.set_key("block_size_check");
+  req.set_staging_offset(alloc_resp.staging_offset());
+  req.set_size(64);  // larger than allocated 32
+  req.set_store_index(0);
+  req.set_lease_id(alloc_resp.lease_id());
+  ::umbp::CommitSsdWriteResponse resp;
+  grpc::ClientContext ctx;
+
+  auto status = stub_->CommitSsdWrite(&ctx, req, &resp);
+  ASSERT_TRUE(status.ok());
+  EXPECT_FALSE(resp.success());
+}
+
+TEST_F(PeerServiceSlotTest, CommitSsdWriteOffsetMismatch) {
+  ::umbp::AllocateWriteSlotRequest alloc_req;
+  alloc_req.set_size(32);
+  ::umbp::AllocateWriteSlotResponse alloc_resp;
+  grpc::ClientContext alloc_ctx;
+  stub_->AllocateWriteSlot(&alloc_ctx, alloc_req, &alloc_resp);
+  ASSERT_TRUE(alloc_resp.success());
+
+  ::umbp::CommitSsdWriteRequest req;
+  req.set_key("block_offset_check");
+  req.set_staging_offset(alloc_resp.staging_offset() + 1);  // wrong offset
+  req.set_size(32);
+  req.set_store_index(0);
+  req.set_lease_id(alloc_resp.lease_id());
+  ::umbp::CommitSsdWriteResponse resp;
+  grpc::ClientContext ctx;
+
+  auto status = stub_->CommitSsdWrite(&ctx, req, &resp);
+  ASSERT_TRUE(status.ok());
+  EXPECT_FALSE(resp.success());
+}
+
+// --- Slot isolation: different slots get different offsets ---
+
+TEST_F(PeerServiceSlotTest, MultipleReadSlotsDifferentOffsets) {
+  for (int i = 0; i < kNumReadSlots; ++i) {
+    const std::string key = "iso_" + std::to_string(i);
+    const std::string data(16, 'a' + i);
+    WriteTestDataToSsd(key, data);
+  }
+
+  std::vector<uint64_t> offsets;
+  for (int i = 0; i < kNumReadSlots; ++i) {
+    const std::string key = "iso_" + std::to_string(i);
+    ::umbp::PrepareSsdReadRequest req;
+    req.set_key(key);
+    req.set_ssd_location_id("0:" + key);
+    req.set_size(16);
+    ::umbp::PrepareSsdReadResponse resp;
+    grpc::ClientContext ctx;
+    stub_->PrepareSsdRead(&ctx, req, &resp);
+    ASSERT_TRUE(resp.success());
+    offsets.push_back(resp.staging_offset());
+  }
+
+  for (size_t i = 0; i < offsets.size(); ++i) {
+    for (size_t j = i + 1; j < offsets.size(); ++j) {
+      EXPECT_NE(offsets[i], offsets[j]) << "Slots " << i << " and " << j << " overlap";
+    }
+  }
+}
+
+TEST_F(PeerServiceSlotTest, MultipleWriteSlotsDifferentOffsets) {
+  std::vector<uint64_t> offsets;
+  for (int i = 0; i < kNumWriteSlots; ++i) {
+    ::umbp::AllocateWriteSlotRequest req;
+    req.set_size(32);
+    ::umbp::AllocateWriteSlotResponse resp;
+    grpc::ClientContext ctx;
+    stub_->AllocateWriteSlot(&ctx, req, &resp);
+    ASSERT_TRUE(resp.success());
+    offsets.push_back(resp.staging_offset());
+  }
+
+  for (size_t i = 0; i < offsets.size(); ++i) {
+    for (size_t j = i + 1; j < offsets.size(); ++j) {
+      EXPECT_NE(offsets[i], offsets[j]) << "Write slots " << i << " and " << j << " overlap";
+    }
+  }
+}
+
+// --- TTL reclaim for read slots ---
+
+TEST_F(PeerServiceSlotTest, ReadSlotTtlReclaim) {
+  for (int i = 0; i < kNumReadSlots; ++i) {
+    const std::string key = "ttl_" + std::to_string(i);
+    const std::string data = "ttl_data_" + std::to_string(i);
+    WriteTestDataToSsd(key, data);
+  }
+
+  for (int i = 0; i < kNumReadSlots; ++i) {
+    const std::string key = "ttl_" + std::to_string(i);
+    ::umbp::PrepareSsdReadRequest req;
+    req.set_key(key);
+    req.set_ssd_location_id("0:" + key);
+    req.set_size(10);
+    ::umbp::PrepareSsdReadResponse resp;
+    grpc::ClientContext ctx;
+    stub_->PrepareSsdRead(&ctx, req, &resp);
+    ASSERT_TRUE(resp.success());
+  }
+
+  std::this_thread::sleep_for(std::chrono::seconds(kLeaseTimeoutS + 1));
+
+  const std::string key = "ttl_0";
+  ::umbp::PrepareSsdReadRequest req;
+  req.set_key(key);
+  req.set_ssd_location_id("0:" + key);
+  req.set_size(10);
+  ::umbp::PrepareSsdReadResponse resp;
+  grpc::ClientContext ctx;
+  auto status = stub_->PrepareSsdRead(&ctx, req, &resp);
+  ASSERT_TRUE(status.ok());
+  EXPECT_TRUE(resp.success()) << "Should succeed after TTL reclaim";
 }
 
 }  // namespace

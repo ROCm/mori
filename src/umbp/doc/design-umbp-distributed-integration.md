@@ -125,11 +125,14 @@ Caller → UMBPClient::GetIntoPtr(key, dst, size)
              → block is now cached locally AND registered with Master
 ```
 
-**Phase 3 (DRAM-only):** `FetchRemote` only supports RDMA reads from remote DRAM.
-If the remote block is on SSD, the fetch fails and returns false.
+**DRAM path:** `GetRemote` performs a direct RDMA read from the remote node's DRAM buffer.
 
-**Phase 6 (SSD support):** `FetchRemote` for SSD-resident remote blocks goes through
-PeerService gRPC staging (see Phase 6 data flow diagram).
+**SSD path (implemented):** `GetRemote` dispatches to `RemoteSsdRead`, which uses a
+slot-based staging mechanism: `PrepareSsdRead` allocates a dedicated staging slot on
+the remote node, reads SSD data into it (lock-free I/O), and returns the slot offset
+plus a `lease_id`. The caller RDMA-reads from that slot, then releases it via
+`ReleaseSsdLease`. Slots have a configurable TTL (default 10s) for crash recovery.
+See `design-local-distributed-unification.md` for the full slot architecture.
 
 ### 3.4 Remove
 
@@ -207,11 +210,11 @@ storage directly — it only handles cluster interactions (Master gRPC + RDMA).
 | `Put` (lines 294–377) | `PutRemote` | The remote DRAM branch (lines 344–350): `RoutePut` → `GetOrConnectPeer` → `RemoteDramWrite`. Only the `!is_local && DRAM` case. |
 | `Get` (lines 379–422) | `GetRemote` | The remote DRAM branch (lines 406–411): `RouteGet` → `GetOrConnectPeer` → `RemoteDramRead`. Only the `!is_local && DRAM` case. |
 | `Put`/`Get` | (removed) | Local DRAM/SSD branches → handled by UMBPClient via `storage_` directly. |
-| `Put`/`Get` | (Phase 6) | Remote SSD branches (`RemoteSsdWrite`/`RemoteSsdRead`) → deferred. |
+| `Put`/`Get` | (done) | Remote SSD: `GetRemote` dispatches to `RemoteSsdRead` (slot-based staging); `RemoteSsdWrite` uses `AllocateWriteSlot` + `CommitSsdWrite`. |
 
-**DRAM-only scope:** `GetRemote` and `PutRemote` only support RDMA reads/writes
-to remote DRAM. If the target block is on a remote node's SSD, the operation fails.
-SSD support is deferred to Phase 6.
+**DRAM + SSD:** `GetRemote` supports both tiers. DRAM path uses direct RDMA read.
+SSD path uses slot-based staging: `PrepareSsdRead` → RDMA read → `ReleaseSsdLease`.
+Write path: `AllocateWriteSlot` → RDMA write → `CommitSsdWrite` with lease_id.
 
 ### Phase 3: Wire UMBPClient → PoolClient (DRAM-only)
 

@@ -75,12 +75,14 @@ class PoolClient {
 
   bool IsRegistered(const std::string& key) const;
 
-  // Fetch a block from a remote node's DRAM via RDMA (RouteGet → RDMA read).
-  // DRAM-only: returns false if the remote block is on SSD.
+  // Fetch a block from a remote node via RDMA.
+  // DRAM: RouteGet -> direct RDMA read.
+  // SSD: RouteGet -> PeerService PrepareSsdRead (SSD->staging slot) -> RDMA read.
   bool GetRemote(const std::string& key, void* dst, size_t size);
 
-  // Write a block to a remote node's DRAM via RDMA (RoutePut → RDMA write).
-  // DRAM-only: returns false if the target tier is SSD.
+  // Write a block to a remote node via RDMA.
+  // DRAM: RoutePut -> direct RDMA write.
+  // SSD: RoutePut -> AllocateWriteSlot -> RDMA write -> CommitSsdWrite.
   bool PutRemote(const std::string& key, const void* src, size_t size);
 
   // Unregister a block from the Master (block no longer remotely accessible).

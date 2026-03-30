@@ -2,40 +2,55 @@ syntax = "proto3";
 package umbp;
 
 service UMBPPeer {
-  // IO Engine handshake (one-time per peer)
   rpc GetPeerInfo(GetPeerInfoRequest) returns (GetPeerInfoResponse);
 
-  // SSD coordination
+  // SSD write: pre-allocate staging slot, RDMA write, then commit to SSD
+  rpc AllocateWriteSlot(AllocateWriteSlotRequest) returns (AllocateWriteSlotResponse);
   rpc CommitSsdWrite(CommitSsdWriteRequest) returns (CommitSsdWriteResponse);
+
+  // SSD read: load SSD into staging slot, caller RDMA reads, then release
   rpc PrepareSsdRead(PrepareSsdReadRequest) returns (PrepareSsdReadResponse);
+  rpc ReleaseSsdLease(ReleaseSsdLeaseRequest) returns (ReleaseSsdLeaseResponse);
 }
 
 // --- Handshake ---
 message GetPeerInfoRequest {}
 message GetPeerInfoResponse {
-  bytes  engine_desc           = 1;  // packed EngineDesc
-  bytes  dram_memory_desc      = 2;  // packed MemoryDesc
+  bytes  engine_desc           = 1;
+  bytes  dram_memory_desc      = 2;
   uint64 ssd_capacity          = 3;
   uint64 ssd_available         = 4;
   uint64 staging_base_offset   = 5;  // deprecated: kept for wire compat
-  bytes  ssd_staging_mem_desc  = 6;  // packed MemoryDesc for the dedicated SSD staging buffer
-  uint64 ssd_staging_size      = 7;  // total staging buffer size (write=[0,size/2), read=[size/2,size))
+  bytes  ssd_staging_mem_desc  = 6;  // packed MemoryDesc for dedicated SSD staging buffer
+  uint64 ssd_staging_size      = 7;  // total staging buffer size
 }
 
-// --- SSD Write: RDMA into staging → persist to SSD ---
+// --- Write slot pre-allocation ---
+message AllocateWriteSlotRequest {
+  uint64 size = 1;
+}
+message AllocateWriteSlotResponse {
+  bool   success        = 1;
+  uint64 staging_offset = 2;
+  uint64 lease_id       = 3;
+  uint64 lease_ttl_ms   = 4;  // remaining lease milliseconds
+}
+
+// --- SSD Write: RDMA into allocated slot → persist to SSD ---
 message CommitSsdWriteRequest {
   string key              = 1;
-  uint64 staging_offset   = 2;  // offset within DRAM staging area
+  uint64 staging_offset   = 2;  // must match AllocateWriteSlot response
   uint64 size             = 3;
-  uint32 store_index      = 4;  // Master-selected SSD store index
+  uint32 store_index      = 4;
   string allocation_id    = 5;  // echoed from RoutePut
+  uint64 lease_id         = 6;  // from AllocateWriteSlot
 }
 message CommitSsdWriteResponse {
   bool   success          = 1;
-  string ssd_location_id  = 2;  // opaque SSD handle (e.g. file path)
+  string ssd_location_id  = 2;
 }
 
-// --- SSD Read: load SSD → staging → caller RDMA reads ---
+// --- SSD Read: load SSD → staging slot → caller RDMA reads ---
 message PrepareSsdReadRequest {
   string key              = 1;
   string ssd_location_id  = 2;
@@ -43,5 +58,15 @@ message PrepareSsdReadRequest {
 }
 message PrepareSsdReadResponse {
   bool   success          = 1;
-  uint64 staging_offset   = 2;  // data loaded at this DRAM staging offset
+  uint64 staging_offset   = 2;
+  uint64 lease_id         = 3;  // client must release after RDMA completes
+  uint64 lease_ttl_ms     = 4;  // remaining lease milliseconds
+}
+
+// --- Read slot release ---
+message ReleaseSsdLeaseRequest {
+  uint64 lease_id = 1;
+}
+message ReleaseSsdLeaseResponse {
+  bool success = 1;
 }

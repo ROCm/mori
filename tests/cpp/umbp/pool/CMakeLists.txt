@@ -43,6 +43,6 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   target_link_options(test_umbp_peer_service PRIVATE -Wl,--no-as-needed)
 endif()
 target_link_libraries(
-  test_umbp_peer_service PRIVATE umbp_common ${_TEST_PROTOBUF_LIB}
+  test_umbp_peer_service PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB}
                                  ${_TEST_GRPCPP_LIB} gtest_main)
 add_test(NAME umbp_peer_service COMMAND test_umbp_peer_service)
