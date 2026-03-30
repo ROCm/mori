@@ -73,7 +73,9 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t /*input_buffer_size*/
       async_total_count_(0),
       async_stream_(nullptr),
       async_start_time_(0.0),
-      copy_output_to_user_(copy_output_to_user) {
+      copy_output_to_user_(copy_output_to_user),
+      signal_base_q0_(0),
+      signal_base_q1_(0) {
   // 1. Allocate SDMA completion flags
   size_t flagsSize = npes_ * sizeof(uint64_t);
   void* flags = shmem::ShmemMalloc(flagsSize);
@@ -100,6 +102,23 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t /*input_buffer_size*/
   output_transit_buffer_obj_ = shmem::ShmemQueryMemObjPtr(output_transit_buffer_);
   if (!output_transit_buffer_obj_.IsValid())
     throw std::runtime_error("Failed to query output transit buffer SymmMemObj");
+
+  // Read current signal baselines from device (may be non-zero if SymmMemObj
+  // was used by a previous AllreduceSdma instance).
+  {
+    const uint32_t numQ = output_transit_buffer_obj_->sdmaNumQueue;
+    if (numQ >= 1 && npes_ >= 2) {
+      int refPe = (myPe_ == 0) ? 1 : 0;
+      size_t refOff = static_cast<size_t>(refPe) * numQ;
+      uint64_t init_vals[2] = {0, 0};
+      hipMemcpy(init_vals,
+                output_transit_buffer_obj_->expectSignalsPtr + refOff,
+                sizeof(uint64_t) * std::min(numQ, 2u),
+                hipMemcpyDeviceToHost);
+      signal_base_q0_ = init_vals[0];
+      signal_base_q1_ = (numQ >= 2) ? init_vals[1] : 0;
+    }
+  }
 
   printf("AllreduceSdma(SDMA) initialized: PE %d of %d, max_blocks=%d\n", myPe_, npes_,
          max_blocks_);
@@ -243,6 +262,9 @@ bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
       return false;
     }
 
+    // Serial RS + AG both use SdmaPutThread on qId=0 → two increments per peer.
+    signal_base_q0_ += 2;
+
     // Step 3: Copy result to user buffer
     if (copy_output_to_user_) {
       copy_output_to_user(output, total_count, stream);
@@ -303,6 +325,7 @@ bool AllreduceSdma<T>::start_async(T* input, T* output, size_t total_count, hipS
       throw std::runtime_error("Kernel launch failed");
     }
 
+    signal_base_q0_ += 2;
     return true;
 
   } catch (const std::exception& e) {
@@ -516,21 +539,35 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
 
         const bool multi_chunk = (chunk_elems < total_count);
 
+        // Compute numChunks on host to update signal baselines after launch.
+        int hostNumChunks = 1;
+        if (scatter_mode == 0) {
+            size_t epr = ((total_count / npes_ + pack_size - 1) / pack_size) * pack_size;
+            size_t cpr = ((chunk_elems / npes_ + pack_size - 1) / pack_size) * pack_size;
+            size_t ppR = epr / pack_size;
+            size_t pcR = cpr / pack_size;
+            if (pcR > 0)
+                hostNumChunks = static_cast<int>((ppR + pcR - 1) / pcR);
+        }
+
         if (scatter_mode == 1) {
             PipelinedAllReduceSdmaKernel<T, 1><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
-                barrierPtr_, inputSymmObj, total_count, chunk_elems);
+                barrierPtr_, inputSymmObj, total_count, chunk_elems,
+                signal_base_q0_, signal_base_q1_);
         } else if (multi_chunk) {
             PipelinedAllReduceSdmaKernel<T, 0, true><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
-                barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems);
+                barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems,
+                signal_base_q0_, signal_base_q1_);
         } else {
             PipelinedAllReduceSdmaKernel<T, 0, false><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
-                barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems);
+                barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems,
+                signal_base_q0_, signal_base_q1_);
         }
 
         hipError_t err = hipGetLastError();
@@ -539,6 +576,10 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                     myPe_, hipGetErrorString(err));
             return false;
         }
+
+        // Pipeline scatter on q0, AG on q1: each increments numChunks per peer.
+        signal_base_q0_ += static_cast<uint64_t>(hostNumChunks);
+        signal_base_q1_ += static_cast<uint64_t>(hostNumChunks);
 
         if (copy_output_to_user_) {
             copy_output_to_user(output, total_count, stream);

@@ -83,6 +83,11 @@ class AllreduceSdma {
   // if false, user should directly use output_transit_buffer
   bool copy_output_to_user_;
 
+  // Host-side signal baselines: track accumulated expectSignalsPtr[peer*numQ+q]
+  // to provide race-free baselines to the pipeline kernel.
+  uint64_t signal_base_q0_;
+  uint64_t signal_base_q1_;
+
   AllreduceSdma(const AllreduceSdma&) = delete;
   AllreduceSdma& operator=(const AllreduceSdma&) = delete;
 
