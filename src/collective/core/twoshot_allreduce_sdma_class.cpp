@@ -103,22 +103,9 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t /*input_buffer_size*/
   if (!output_transit_buffer_obj_.IsValid())
     throw std::runtime_error("Failed to query output transit buffer SymmMemObj");
 
-  // Read current signal baselines from device (may be non-zero if SymmMemObj
-  // was used by a previous AllreduceSdma instance).
-  {
-    const uint32_t numQ = output_transit_buffer_obj_->sdmaNumQueue;
-    if (numQ >= 1 && npes_ >= 2) {
-      int refPe = (myPe_ == 0) ? 1 : 0;
-      size_t refOff = static_cast<size_t>(refPe) * numQ;
-      uint64_t init_vals[2] = {0, 0};
-      hipMemcpy(init_vals,
-                output_transit_buffer_obj_->expectSignalsPtr + refOff,
-                sizeof(uint64_t) * std::min(numQ, 2u),
-                hipMemcpyDeviceToHost);
-      signal_base_q0_ = init_vals[0];
-      signal_base_q1_ = (numQ >= 2) ? init_vals[1] : 0;
-    }
-  }
+  // Signal baselines start at 0: ShmemMalloc creates a fresh SymmMemObj with
+  // zero-initialized signal arrays for each new allocation.
+  // operator()/pipelined() maintain the running totals from here.
 
   printf("AllreduceSdma(SDMA) initialized: PE %d of %d, max_blocks=%d\n", myPe_, npes_,
          max_blocks_);
