@@ -220,9 +220,12 @@ __global__ void SdmaReduceScatterKernel(
             dstMemObj->deviceHandles_d + destPe * dstMemObj->sdmaNumQueue;
         HSAuint64* remoteSignal = dstMemObj->peerSignalPtrs[destPe]
                                   + static_cast<size_t>(myPe) * dstMemObj->sdmaNumQueue;
+        HSAuint64* expectedSignal = dstMemObj->expectSignalsPtr
+                                  + destPe * dstMemObj->sdmaNumQueue;
 
         core::SdmaPutThread(srcPtr, remoteDst, chunkBytes,
-                            dh, remoteSignal, dstMemObj->sdmaNumQueue, 0);
+                            dh, remoteSignal, expectedSignal,
+                            dstMemObj->sdmaNumQueue, 0);
       }
     }
     __syncthreads();
@@ -382,9 +385,11 @@ __global__ void AllGatherSdmaKernel(int myPe, int npes,
           dest->deviceHandles_d + remotePe * dest->sdmaNumQueue;
       HSAuint64* remoteSignal = dest->peerSignalPtrs[remotePe]
                                 + static_cast<size_t>(myPe) * dest->sdmaNumQueue;
+      HSAuint64* expectedSignal = dest->expectSignalsPtr
+                                + remotePe * dest->sdmaNumQueue;
 
       core::SdmaPutThread(agSrcPtr, agDstPtr, agSendBytes,
-                          devicehandles, remoteSignal,
+                          devicehandles, remoteSignal, expectedSignal,
                           dest->sdmaNumQueue, 0);
     }
   }

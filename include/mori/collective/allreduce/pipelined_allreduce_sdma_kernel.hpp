@@ -219,6 +219,8 @@ __global__ void PipelinedAllReduceSdmaKernel(
             dstMemObj->deviceHandles_d + destPe * numQ;
         HSAuint64* rSig = dstMemObj->peerSignalPtrs[destPe]
             + static_cast<size_t>(myPe) * numQ;
+        HSAuint64* eSig = dstMemObj->expectSignalsPtr
+            + destPe * numQ;
         for (int c = 0; c < numChunks; c++) {
           const size_t cOff = static_cast<size_t>(c) * chunkBytes;
           size_t actualBytes = chunkBytes;
@@ -229,7 +231,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
                 + static_cast<size_t>(destPe) * totalShardBytes + cOff;
             uint8_t* dst = reinterpret_cast<uint8_t*>(dstMemObj->peerPtrs[destPe])
                 + static_cast<size_t>(myPe) * totalShardBytes + cOff;
-            core::SdmaPutThread(src, dst, actualBytes, dh, rSig, numQ, 0);
+            core::SdmaPutThread(src, dst, actualBytes, dh, rSig, eSig, numQ, 0);
           }
         }
       }
@@ -248,6 +250,8 @@ __global__ void PipelinedAllReduceSdmaKernel(
               dstMemObj->deviceHandles_d + destPe * numQ;
           HSAuint64* rSig = dstMemObj->peerSignalPtrs[destPe]
               + static_cast<size_t>(myPe) * numQ;
+          HSAuint64* eSig = dstMemObj->expectSignalsPtr
+              + destPe * numQ;
 
           for (int c = 0; c < numChunks; c++) {
             const uint32_t ccTarget =
@@ -266,7 +270,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
                 + static_cast<size_t>(myPe) * totalShardBytes + cOff;
             uint8_t* dst = reinterpret_cast<uint8_t*>(dstMemObj->peerPtrs[destPe])
                 + static_cast<size_t>(myPe) * totalShardBytes + cOff;
-            core::SdmaPutThread(src, dst, agBytes, dh, rSig, numQ, 1);
+            core::SdmaPutThread(src, dst, agBytes, dh, rSig, eSig, numQ, 1);
           }
         }
 
@@ -287,6 +291,8 @@ __global__ void PipelinedAllReduceSdmaKernel(
               dstMemObj->deviceHandles_d + destPe * numQ;
           HSAuint64* rSig = dstMemObj->peerSignalPtrs[destPe]
               + static_cast<size_t>(myPe) * numQ;
+          HSAuint64* eSig = dstMemObj->expectSignalsPtr
+              + destPe * numQ;
 
           const uint32_t ccTarget =
               ccBase + static_cast<uint32_t>(compBlocks);
@@ -299,7 +305,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
               + static_cast<size_t>(myPe) * totalShardBytes;
           uint8_t* dst = reinterpret_cast<uint8_t*>(dstMemObj->peerPtrs[destPe])
               + static_cast<size_t>(myPe) * totalShardBytes;
-          core::SdmaPutThread(src, dst, totalShardBytes, dh, rSig, numQ, 1);
+          core::SdmaPutThread(src, dst, totalShardBytes, dh, rSig, eSig, numQ, 1);
         }
 
         if (thr < npes && thr != myPe) {
