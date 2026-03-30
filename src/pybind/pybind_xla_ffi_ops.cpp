@@ -150,7 +150,9 @@ Error MoriDispatchImpl(hipStream_t stream, EpDispatchCombineHandle* h, Dictionar
   auto warp_per_block = GetAttr<int32_t>(attrs, "warp_per_block");
   auto has_scales = GetAttr<int32_t>(attrs, "has_scales");
 
-  assert(input.dimensions().size() == 2);
+  if (XLA_FFI_PREDICT_FALSE(input.dimensions().size() != 2)) {
+    return Error::InvalidArgument("input must be a 2D tensor");
+  }
   const int hiddenDim = static_cast<int>(input.dimensions()[1]);
   assert(hiddenDim > 0 && hiddenDim <= h->config.hiddenDim);
 
@@ -206,7 +208,9 @@ Error MoriCombineImpl(hipStream_t stream, EpDispatchCombineHandle* h, Dictionary
   auto block_num = GetAttr<int32_t>(attrs, "block_num");
   auto rdma_block_num = GetAttr<int32_t>(attrs, "rdma_block_num");
   auto warp_per_block = GetAttr<int32_t>(attrs, "warp_per_block");
-  assert(input.dimensions().size() == 2);
+  if (XLA_FFI_PREDICT_FALSE(input.dimensions().size() != 2)) {
+    return Error::InvalidArgument("input must be a 2D tensor");
+  }
   const int hiddenDim = static_cast<int>(input.dimensions()[1]);
   assert(hiddenDim > 0 && hiddenDim <= h->config.hiddenDim);
   assert(ByteWidth(topk_ids.element_type()) == sizeof(index_t));
@@ -225,6 +229,7 @@ Error MoriCombineImpl(hipStream_t stream, EpDispatchCombineHandle* h, Dictionary
   //   index_t total_recv_token_num = h->totalRecvTokenNum[0];
   //   // we need to copy data to shmemCombineInpTokMemObj directly
   if (!h->config.useExternalInpBuffer) {
+    return Error::Internal("useExternalInpBuffer=false is not supported");
     // GpuCopy(h->shmemCombineInpTokMemObj->Get(), input.untyped_data(),
     //     out_weights->size_bytes(), // should this be input.size_bytes()?
     //     stream);
