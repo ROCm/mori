@@ -133,8 +133,8 @@ SpdkSsdTier::SpdkSsdTier(const UMBPConfig& config, uint64_t base_offset, size_t 
     return;
   }
 
-  allocator_ =
-      ::umbp::offset_allocator::OffsetAllocator::createAligned(base_offset_, capacity_, block_size_);
+  allocator_ = ::umbp::offset_allocator::OffsetAllocator::createAligned(base_offset_, capacity_,
+                                                                        block_size_);
   if (!allocator_) {
     UMBP_LOG_ERROR("SpdkSsdTier: OffsetAllocator creation failed");
     return;

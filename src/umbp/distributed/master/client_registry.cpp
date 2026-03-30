@@ -331,9 +331,14 @@ std::optional<AllocateResult> ClientRegistry::AllocateForPut(const std::string& 
           result.dram_memory_desc_bytes = record.dram_memory_desc_bytes_list[i];
         result.allocated_offset = *offset;
         result.buffer_index = i;
-        pending_allocations_[result.allocation_id] = PendingAllocation{
-            result.allocation_id, record.node_id, tier, i, *offset, size,
-            std::chrono::steady_clock::now()};
+        pending_allocations_[result.allocation_id] =
+            PendingAllocation{result.allocation_id,
+                              record.node_id,
+                              tier,
+                              i,
+                              *offset,
+                              size,
+                              std::chrono::steady_clock::now()};
         return result;
       }
     }
@@ -356,7 +361,12 @@ std::optional<AllocateResult> ClientRegistry::AllocateForPut(const std::string& 
         result.allocated_offset = 0;
         result.buffer_index = i;
         pending_allocations_[result.allocation_id] =
-            PendingAllocation{result.allocation_id, record.node_id, tier, i, 0, size,
+            PendingAllocation{result.allocation_id,
+                              record.node_id,
+                              tier,
+                              i,
+                              0,
+                              size,
                               std::chrono::steady_clock::now()};
         return result;
       }
@@ -597,14 +607,14 @@ void ClientRegistry::ReapExpiredPendingAllocations() {
     if (client_it != clients_.end()) {
       if (it->second.tier == TierType::DRAM || it->second.tier == TierType::HBM) {
         if (it->second.buffer_index < client_it->second.dram_allocators.size()) {
-          client_it->second.dram_allocators[it->second.buffer_index].Deallocate(
-              it->second.offset, it->second.size);
+          client_it->second.dram_allocators[it->second.buffer_index].Deallocate(it->second.offset,
+                                                                                it->second.size);
           UpdateAvailableBytesLocked(client_it->second, it->second.tier);
         }
       } else if (it->second.tier == TierType::SSD) {
         if (it->second.buffer_index < client_it->second.ssd_allocators.size()) {
-          client_it->second.ssd_allocators[it->second.buffer_index].Deallocate(
-              it->second.offset, it->second.size);
+          client_it->second.ssd_allocators[it->second.buffer_index].Deallocate(it->second.offset,
+                                                                               it->second.size);
           UpdateAvailableBytesLocked(client_it->second, it->second.tier);
         }
       }

@@ -611,9 +611,8 @@ static bool test_proxy_daemon_cleanup_after_leader_exit() {
       if (!ssd) rc = 3;
 
       std::vector<char> buf(4096, 0);
-      if (rc == 0 &&
-          !ssd->ReadIntoPtr("proxy_survive_key", reinterpret_cast<uintptr_t>(buf.data()),
-                            buf.size())) {
+      if (rc == 0 && !ssd->ReadIntoPtr("proxy_survive_key", reinterpret_cast<uintptr_t>(buf.data()),
+                                       buf.size())) {
         rc = 4;
       }
       std::vector<char> expected(4096, 'Q');

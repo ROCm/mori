@@ -26,8 +26,8 @@
 
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/types.h"
-#include "umbp/distributed/pool_client.h"
 #include "umbp/distributed/peer/peer_service.h"
+#include "umbp/distributed/pool_client.h"
 #include "umbp/local/storage/dram_tier.h"
 
 namespace mori::umbp {

@@ -667,8 +667,7 @@ bool LocalStorageManager::ReadIntoPtr(const std::string& key, uintptr_t dst, siz
   return ok;
 }
 
-bool LocalStorageManager::ReadIntoPtrNoPromote(const std::string& key, uintptr_t dst,
-                                               size_t size) {
+bool LocalStorageManager::ReadIntoPtrNoPromote(const std::string& key, uintptr_t dst, size_t size) {
   if (index_) {
     auto loc = index_->Lookup(key);
     if (loc) {

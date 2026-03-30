@@ -161,8 +161,7 @@ class LocalStorageManager {
   bool InsertReadCacheNoWriteback(const std::string& key);
   void UpsertIndexTier(const std::string& key, StorageTier tier, size_t size_hint);
   static std::optional<TierLocationInfo> BuildTierLocationInfo(TierBackend* tier,
-                                                               const std::string& key,
-                                                               size_t size);
+                                                               const std::string& key, size_t size);
 
   void MaybeAutoPromote(const std::string& key);
 

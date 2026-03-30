@@ -800,8 +800,8 @@ bool PoolClient::RemoteSsdRead(PeerConnection& peer, const std::string& key,
   if (!io_engine_) return false;
   if (!EnsurePeerServiceConnection(peer)) return false;
   if (!zero_copy && size > config_.staging_buffer_size) {
-    MORI_UMBP_ERROR("[PoolClient] RemoteSsdRead: size {} exceeds local staging_buffer_size {}", size,
-                    config_.staging_buffer_size);
+    MORI_UMBP_ERROR("[PoolClient] RemoteSsdRead: size {} exceeds local staging_buffer_size {}",
+                    size, config_.staging_buffer_size);
     return false;
   }
   if (!IsValidMemoryDesc(peer.ssd_staging_mem)) {

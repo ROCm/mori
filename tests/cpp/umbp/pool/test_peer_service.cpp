@@ -227,7 +227,8 @@ TEST_F(PeerServiceSlotTest, PrepareSsdReadSuccess) {
   EXPECT_GT(resp.lease_id(), 0u);
   EXPECT_GT(resp.lease_ttl_ms(), 0u);
 
-  std::string loaded(static_cast<const char*>(staging_buffer_) + resp.staging_offset(), data.size());
+  std::string loaded(static_cast<const char*>(staging_buffer_) + resp.staging_offset(),
+                     data.size());
   EXPECT_EQ(loaded, data);
 }
 

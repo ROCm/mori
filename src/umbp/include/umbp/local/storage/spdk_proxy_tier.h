@@ -83,9 +83,8 @@ class SpdkProxyTier : public TierBackend {
 
  private:
   ::umbp::proxy::ResultCode SubmitAndWait(::umbp::proxy::RequestType type, const std::string& key,
-                                          const void* write_data, size_t write_size,
-                                          void* read_buf, size_t read_buf_size,
-                                          uint64_t request_aux = 0,
+                                          const void* write_data, size_t write_size, void* read_buf,
+                                          size_t read_buf_size, uint64_t request_aux = 0,
                                           uint64_t* out_result_size = nullptr,
                                           uint64_t* out_result_aux = nullptr) const;
 

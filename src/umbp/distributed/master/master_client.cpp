@@ -244,8 +244,7 @@ grpc::Status MasterClient::FinalizeAllocation(const std::string& key, const Loca
   grpc::ClientContext ctx;
   auto status = GetStub(stub_.get())->FinalizeAllocation(&ctx, req, &resp);
   if (!status.ok()) {
-    MORI_UMBP_ERROR("[Client] FinalizeAllocation(key={}) failed: {}", key,
-                    status.error_message());
+    MORI_UMBP_ERROR("[Client] FinalizeAllocation(key={}) failed: {}", key, status.error_message());
     return status;
   }
   if (!resp.finalized()) {
@@ -274,8 +273,7 @@ grpc::Status MasterClient::PublishLocalBlock(const std::string& key, const Locat
   grpc::ClientContext ctx;
   auto status = GetStub(stub_.get())->PublishLocalBlock(&ctx, req, &resp);
   if (!status.ok()) {
-    MORI_UMBP_ERROR("[Client] PublishLocalBlock(key={}) failed: {}", key,
-                    status.error_message());
+    MORI_UMBP_ERROR("[Client] PublishLocalBlock(key={}) failed: {}", key, status.error_message());
     return status;
   }
   if (!resp.published()) {

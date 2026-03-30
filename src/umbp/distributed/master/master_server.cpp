@@ -225,8 +225,8 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
       location.node_id = request->node_id();
     }
 
-    const bool published = registry_.PublishLocalBlock(request->node_id(), request->key(),
-                                                       location);
+    const bool published =
+        registry_.PublishLocalBlock(request->node_id(), request->key(), location);
     response->set_published(published);
     return grpc::Status::OK;
   }
@@ -239,8 +239,8 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
                           "node_id/allocation_id cannot be empty");
     }
 
-    const bool aborted = registry_.AbortAllocation(request->node_id(), request->allocation_id(),
-                                                   request->size());
+    const bool aborted =
+        registry_.AbortAllocation(request->node_id(), request->allocation_id(), request->size());
     response->set_aborted(aborted);
     return grpc::Status::OK;
   }

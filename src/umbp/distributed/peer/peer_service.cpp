@@ -44,10 +44,8 @@ struct StagingSlot {
   std::chrono::steady_clock::time_point allocated_at;
 };
 
-int AllocateSlot(std::vector<StagingSlot>& slots,
-                 std::atomic<uint64_t>& next_lease_id,
-                 std::chrono::seconds lease_timeout, size_t request_size,
-                 StagingMetrics& metrics) {
+int AllocateSlot(std::vector<StagingSlot>& slots, std::atomic<uint64_t>& next_lease_id,
+                 std::chrono::seconds lease_timeout, size_t request_size, StagingMetrics& metrics) {
   auto now = std::chrono::steady_clock::now();
   for (auto& slot : slots) {
     if (slot.in_use && now - slot.allocated_at > lease_timeout) {
@@ -100,9 +98,9 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
  public:
   UMBPPeerServiceImpl(void* ssd_staging_base, size_t ssd_staging_size,
                       const std::vector<uint8_t>& ssd_staging_mem_desc_bytes,
-                      LocalStorageManager& storage, LocalBlockIndex& index,
-                      PoolClient& coordinator, StagingMetrics& metrics, int num_read_slots,
-                      int num_write_slots, int lease_timeout_s)
+                      LocalStorageManager& storage, LocalBlockIndex& index, PoolClient& coordinator,
+                      StagingMetrics& metrics, int num_read_slots, int num_write_slots,
+                      int lease_timeout_s)
       : ssd_staging_base_(ssd_staging_base),
         ssd_staging_size_(ssd_staging_size),
         ssd_staging_mem_desc_bytes_(ssd_staging_mem_desc_bytes),
@@ -120,9 +118,8 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
         read_slots_(std::max(num_read_slots, 1)),
         write_slots_(std::max(num_write_slots, 1)) {
     if (num_read_slots <= 0 || num_write_slots <= 0) {
-      MORI_UMBP_ERROR(
-          "[PeerService] num_read_slots={} num_write_slots={} invalid, clamped to 1",
-          num_read_slots, num_write_slots);
+      MORI_UMBP_ERROR("[PeerService] num_read_slots={} num_write_slots={} invalid, clamped to 1",
+                      num_read_slots, num_write_slots);
     }
   }
 
@@ -150,8 +147,8 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
     std::chrono::steady_clock::time_point alloc_time;
     {
       std::lock_guard<std::mutex> lock(write_slots_mutex_);
-      slot_idx = AllocateSlot(write_slots_, next_lease_id_, lease_timeout_, request->size(),
-                              metrics_);
+      slot_idx =
+          AllocateSlot(write_slots_, next_lease_id_, lease_timeout_, request->size(), metrics_);
       if (slot_idx < 0) {
         metrics_.slot_full_rejects.fetch_add(1, std::memory_order_relaxed);
         response->set_success(false);

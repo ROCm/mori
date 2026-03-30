@@ -100,8 +100,7 @@ class ClientRegistry {
                           const Location& location, const std::string& allocation_id);
   bool PublishLocalBlock(const std::string& node_id, const std::string& key,
                          const Location& location);
-  bool AbortAllocation(const std::string& node_id, const std::string& allocation_id,
-                       uint64_t size);
+  bool AbortAllocation(const std::string& node_id, const std::string& allocation_id, uint64_t size);
   std::optional<ClientIOInfo> GetClientIOInfo(const std::string& node_id,
                                               uint32_t buffer_index = 0) const;
 

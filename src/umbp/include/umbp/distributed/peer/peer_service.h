@@ -46,9 +46,8 @@ class PeerServiceServer {
  public:
   PeerServiceServer(void* ssd_staging_base, size_t ssd_staging_size,
                     const std::vector<uint8_t>& ssd_staging_mem_desc_bytes,
-                    LocalStorageManager& storage, LocalBlockIndex& index,
-                    PoolClient& coordinator, int num_read_slots = 8,
-                    int num_write_slots = 8, int lease_timeout_s = 10);
+                    LocalStorageManager& storage, LocalBlockIndex& index, PoolClient& coordinator,
+                    int num_read_slots = 8, int num_write_slots = 8, int lease_timeout_s = 10);
   ~PeerServiceServer();
 
   bool Start(uint16_t port);
