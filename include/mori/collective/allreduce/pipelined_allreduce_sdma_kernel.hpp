@@ -89,10 +89,10 @@ __global__ void PipelinedAllReduceSdmaKernel(
     if (s < npes && s != myPe) {
       const size_t row = static_cast<size_t>(s) * numQ;
       s_scatter_by_sender[s] =
-          core::AtomicLoadRelaxed(dstMemObj->signalPtrs + row + 0);
+          dstMemObj->expectSignalsPtr[row + 0];
       if (blockIdx.x == 0) {
         s_ag_by_sender[s] =
-            core::AtomicLoadRelaxed(dstMemObj->signalPtrs + row + 1);
+            dstMemObj->expectSignalsPtr[row + 1];
       }
     }
   }
@@ -212,22 +212,6 @@ __global__ void PipelinedAllReduceSdmaKernel(
       const int thr = static_cast<int>(threadIdx.x);
       const uint32_t ccBase = s_cc_base;
 
-      // ---- DIAG: signal baselines ----
-      if (thr == 0) {
-        printf("PE%d PIPE-ENTER ccBase=%u numChunks=%d compBlocks=%d numQ=%u\n",
-               myPe, ccBase, numChunks, compBlocks, numQ);
-        for (int p = 0; p < npes; p++) {
-          if (p == myPe) continue;
-          uint64_t s0 = core::AtomicLoadRelaxed(dstMemObj->signalPtrs + static_cast<size_t>(p) * numQ);
-          uint64_t e0 = dstMemObj->expectSignalsPtr[static_cast<size_t>(p) * numQ];
-          uint64_t s1 = core::AtomicLoadRelaxed(dstMemObj->signalPtrs + static_cast<size_t>(p) * numQ + 1);
-          uint64_t e1 = dstMemObj->expectSignalsPtr[static_cast<size_t>(p) * numQ + 1];
-          if (s0 != e0 || s1 != e1)
-            printf("  PE%d sig[%d] q0: sig=%lu exp=%lu  q1: sig=%lu exp=%lu %s\n",
-                   myPe, p, s0, e0, s1, e1, (s0!=e0||s1!=e1) ? "MISMATCH!" : "");
-        }
-      }
-
       // ---- Phase 1: burst scatter (all chunks, all peers) ----
       if (thr < npes && thr != myPe) {
         const int destPe = thr;
@@ -251,8 +235,6 @@ __global__ void PipelinedAllReduceSdmaKernel(
           }
         }
       }
-
-      if (thr == 0) printf("PE%d SCATTER-DONE\n", myPe);
 
       // ---- Phase 2+3: dual-mode AG ----
       if constexpr (MULTI_CHUNK) {
@@ -292,17 +274,12 @@ __global__ void PipelinedAllReduceSdmaKernel(
           }
         }
 
-        if (thr == 0) printf("PE%d MC-AG-SENT\n", myPe);
-
         if (thr < npes && thr != myPe) {
           const int sender = thr;
           const uint64_t expected =
               s_ag_by_sender[sender] + static_cast<uint64_t>(numChunks);
           HSAuint64* sig = dstMemObj->signalPtrs
               + static_cast<size_t>(sender) * numQ + 1;
-          if (thr == 1 || (thr == 0 && myPe != 1))
-            printf("PE%d MC-AG-WAIT sender=%d exp=%lu cur=%lu\n",
-                   myPe, sender, expected, core::AtomicLoadRelaxed(sig));
           while (core::AtomicLoadRelaxed(sig) < expected)
             ;
         }
@@ -331,23 +308,17 @@ __global__ void PipelinedAllReduceSdmaKernel(
           core::SdmaPutThread(src, dst, totalShardBytes, dh, rSigAG, eSigAG, numQ, 0);
         }
 
-        if (thr == 0) printf("PE%d SC-AG-SENT\n", myPe);
-
         if (thr < npes && thr != myPe) {
           const int sender = thr;
           const uint64_t expected = s_ag_by_sender[sender] + 1ULL;
           HSAuint64* sig = dstMemObj->signalPtrs
               + static_cast<size_t>(sender) * numQ + 1;
-          if (thr == 1 || (thr == 0 && myPe != 1))
-            printf("PE%d SC-AG-WAIT sender=%d exp=%lu cur=%lu\n",
-                   myPe, sender, expected, core::AtomicLoadRelaxed(sig));
           while (core::AtomicLoadRelaxed(sig) < expected)
             ;
         }
 
       }
 
-      if (thr == 0) printf("PE%d PIPE-EXIT\n", myPe);
     }  // end block 0 vs compute
 
   } else {

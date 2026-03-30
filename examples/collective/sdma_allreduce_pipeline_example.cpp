@@ -60,7 +60,6 @@ static bool runBenchMs(BenchFn fn, uint32_t* inBuf, uint32_t* devOut,
                        hipStream_t stream, int warmup, int iterations,
                        double* outMs, double* outAlgoGb) {
     for (int w = 0; w < 3; w++) {
-        if (myPe == 0) fprintf(stderr, "[DIAG] bench warmup %d/%d  %.2f MB/PE\n", w, 3, bytesPerPe/(1024.0*1024.0));
         CHECK_HIP(hipMemcpyAsync(inBuf, hostData.data(), bytesPerPe, hipMemcpyHostToDevice,
                                  stream));
         CHECK_HIP(hipStreamSynchronize(stream));
@@ -70,7 +69,6 @@ static bool runBenchMs(BenchFn fn, uint32_t* inBuf, uint32_t* devOut,
         MPI_Barrier(MPI_COMM_WORLD);
     }
 
-    if (myPe == 0) fprintf(stderr, "[DIAG] bench verify  %.2f MB/PE\n", bytesPerPe/(1024.0*1024.0));
     CHECK_HIP(hipMemcpyAsync(inBuf, hostData.data(), bytesPerPe, hipMemcpyHostToDevice, stream));
     CHECK_HIP(hipStreamSynchronize(stream));
     MPI_Barrier(MPI_COMM_WORLD);
@@ -181,7 +179,6 @@ void testPipelinedAllreduce() {
 
         // 串行（结果 D2D 到 devOut，与 sync example out-of-place 一致）
         {
-            if (myPe == 0) fprintf(stderr, "[DIAG] serial begin %.2f MB/PE\n", bytesPerPe/(1024.0*1024.0));
             for (int i = 0; i < 10; i++) {
                 CHECK_HIP(hipMemcpyAsync(inBuf, hostData.data(), bytesPerPe, hipMemcpyHostToDevice,
                                          stream));
@@ -237,7 +234,6 @@ void testPipelinedAllreduce() {
         }
         MPI_Barrier(MPI_COMM_WORLD);
 
-        if (myPe == 0) fprintf(stderr, "[DIAG] serial done %.2f MB/PE, starting pipeline\n", bytesPerPe/(1024.0*1024.0));
 
         ms = 0;
         gb = 0;
