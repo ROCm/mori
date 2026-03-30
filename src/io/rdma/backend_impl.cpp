@@ -200,11 +200,9 @@ application::RdmaEndpointConfig RdmaManager::GetRdmaEndpointConfig(int devId) {
   if (desiredMsgSge.has_value()) {
     epConfig.maxMsgSge = std::min(*desiredMsgSge, maxSge);
   } else {
-#ifdef ENABLE_IONIC
-    epConfig.maxMsgSge = std::min(maxSge, 2u);
-#else
-    epConfig.maxMsgSge = std::min(maxSge, 4u);
-#endif
+    bool is_ionic = (deviceAttr->orig_attr.vendor_id ==
+                     static_cast<uint32_t>(application::RdmaDeviceVendorId::Pensando));
+    epConfig.maxMsgSge = std::min(maxSge, is_ionic ? 2u : 4u);
   }
   return epConfig;
 }

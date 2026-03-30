@@ -28,17 +28,10 @@
 #include "mori/core/transport/rdma/providers/bnxt/bnxt_defs.hpp"
 #include "mori/core/transport/rdma/providers/utils.h"
 #include "mori/core/utils.hpp"
-#if defined(ENABLE_BNXT) || defined(MORI_DEVICE_NIC_BNXT)
-extern "C" {
-#include <infiniband/bnxt_re_dv.h>
-#include <infiniband/bnxt_re_hsi.h>
-}
-#else
 extern "C" {
 #include "mori/core/transport/rdma/providers/bnxt/bnxt_re_dv.h"
 #include "mori/core/transport/rdma/providers/bnxt/bnxt_re_hsi.h"
 }
-#endif
 
 namespace mori {
 namespace core {
