@@ -30,6 +30,8 @@
 #include "umbp/local/storage/ssd_tier.h"
 #include "umbp/local/umbp_client.h"
 
+using namespace mori::umbp;
+
 namespace fs = std::filesystem;
 
 static const std::string SHARED_SSD_DIR = "/tmp/umbp_test_follower_ssd";

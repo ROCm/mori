@@ -23,6 +23,8 @@
 
 #include <algorithm>
 
+namespace mori::umbp {
+
 CopyPipeline::CopyPipeline(LocalStorageManager& storage, const UMBPCopyPipelineConfig& config,
                            UMBPRole role)
     : storage_(storage), config_(config), role_(role) {
@@ -119,3 +121,5 @@ void CopyPipeline::CopyWorkerLoop() {
     }
   }
 }
+
+}  // namespace mori::umbp

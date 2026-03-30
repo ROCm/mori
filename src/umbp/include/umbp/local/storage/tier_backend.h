@@ -23,11 +23,14 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "umbp/common/storage_tier.h"
+
+namespace mori::umbp {
 
 struct TierCapabilities {
   bool zero_copy_read = false;
@@ -111,6 +114,10 @@ class TierBackend {
   // SSDTier: O_DIRECT; SpdkProxyTier: skip ring buffer cache.
   virtual void SetColdRead(bool /*enable*/) {}
 
+  // Return an opaque location identifier for a previously written key.
+  // Callers prepend the store index before publishing to the Master.
+  virtual std::optional<std::string> GetLocationId(const std::string& key) const;
+
   // Which StorageTier does this backend represent?
   StorageTier tier_id() const { return tier_id_; }
 
@@ -120,3 +127,5 @@ class TierBackend {
  private:
   StorageTier tier_id_;
 };
+
+}  // namespace mori::umbp

@@ -45,6 +45,9 @@
 #include "umbp/common/config.h"
 #include "umbp/local/storage/tier_backend.h"
 
+namespace mori {
+namespace umbp {
+
 class SpdkSsdTier : public TierBackend {
  public:
   struct Stats {
@@ -135,8 +138,8 @@ class SpdkSsdTier : public TierBackend {
  private:
   // -- RefCounted allocation handle (mooncake-store pattern) ---------------
   struct RefCountedAllocationHandle {
-    umbp::offset_allocator::OffsetAllocationHandle handle;
-    explicit RefCountedAllocationHandle(umbp::offset_allocator::OffsetAllocationHandle&& h)
+    ::umbp::offset_allocator::OffsetAllocationHandle handle;
+    explicit RefCountedAllocationHandle(::umbp::offset_allocator::OffsetAllocationHandle&& h)
         : handle(std::move(h)) {}
     RefCountedAllocationHandle(const RefCountedAllocationHandle&) = delete;
     RefCountedAllocationHandle& operator=(const RefCountedAllocationHandle&) = delete;
@@ -209,7 +212,7 @@ class SpdkSsdTier : public TierBackend {
 
   // -- Member data ---------------------------------------------------------
   bool initialized_ = false;
-  std::shared_ptr<umbp::offset_allocator::OffsetAllocator> allocator_;
+  std::shared_ptr<::umbp::offset_allocator::OffsetAllocator> allocator_;
   uint32_t block_size_ = 4096;
   uint64_t base_offset_ = 0;
   size_t capacity_ = 0;
@@ -226,3 +229,6 @@ class SpdkSsdTier : public TierBackend {
   std::atomic<uint64_t> miss_count_{0};
   std::atomic<uint64_t> evicted_bytes_{0};
 };
+
+}  // namespace umbp
+}  // namespace mori

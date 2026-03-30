@@ -29,6 +29,8 @@
 #include "umbp/local/storage/local_storage_manager.h"
 #include "umbp/local/umbp_client.h"
 
+using namespace mori::umbp;
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------

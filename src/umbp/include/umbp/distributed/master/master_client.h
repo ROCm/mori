@@ -33,6 +33,7 @@
 #include <thread>
 #include <vector>
 
+#include "umbp/common/config.h"
 #include "umbp/common/types.h"
 #include "umbp/distributed/routing/route_put_strategy.h"
 
@@ -47,13 +48,6 @@ struct RouteGetResult {
   std::string peer_address;
   std::vector<uint8_t> engine_desc_bytes;
   std::vector<uint8_t> dram_memory_desc_bytes;
-};
-
-struct MasterClientConfig {
-  std::string master_address;
-  std::string node_id;
-  std::string node_address;
-  bool auto_heartbeat = true;
 };
 
 class MasterClient {
@@ -81,6 +75,11 @@ class MasterClient {
   // If removed is non-null, returns 1 when removed, otherwise 0.
   grpc::Status Unregister(const std::string& key, const Location& location,
                           uint32_t* removed = nullptr);
+  grpc::Status FinalizeAllocation(const std::string& key, const Location& location,
+                                  const std::string& allocation_id);
+  grpc::Status PublishLocalBlock(const std::string& key, const Location& location);
+  grpc::Status AbortAllocation(const std::string& node_id, const std::string& allocation_id,
+                               uint64_t size);
 
   // --- Router ---
   /// Pick an existing replica to read from.
@@ -88,7 +87,8 @@ class MasterClient {
   grpc::Status RouteGet(const std::string& key, std::optional<RouteGetResult>* out_result);
 
   /// Pick a target node to write to.
-  /// After receiving the result, write via MORI-IO, then call Register().
+  /// After receiving the result, write via MORI-IO, then call FinalizeAllocation()
+  /// or AbortAllocation().
   grpc::Status RoutePut(const std::string& key, uint64_t block_size,
                         std::optional<RoutePutResult>* out_result);
 

@@ -60,6 +60,7 @@
 #include <unistd.h>
 #endif
 
+using namespace mori::umbp;
 using namespace umbp::proxy;
 
 namespace {

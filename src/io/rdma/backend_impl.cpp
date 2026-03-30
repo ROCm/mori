@@ -74,6 +74,15 @@ std::vector<std::pair<int, int>> RdmaManager::Search(TopoKey key) {
     MORI_IO_WARN("No matching NIC found for GPU {}, nicName: {}", key.deviceId, nicName);
   } else if (key.loc == MemoryLocationType::CPU) {
     if (availDevices.empty()) return {};
+    const char* envNic = std::getenv("MORI_IO_RDMA_NIC_IDX");
+    if (envNic) {
+      int idx = std::atoi(envNic);
+      if (idx >= 0 && idx < static_cast<int>(availDevices.size())) {
+        return {{idx, 1}};
+      }
+      MORI_IO_WARN("MORI_IO_RDMA_NIC_IDX={} out of range [0, {}), falling back to round-robin", idx,
+                   availDevices.size());
+    }
     int idx = (roundRobinCounter.fetch_add(1, std::memory_order_relaxed) % availDevices.size());
     return {{idx, 1}};
   }

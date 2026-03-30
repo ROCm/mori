@@ -19,11 +19,10 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#include <spdlog/spdlog.h>
-
 #include <csignal>
 #include <thread>
 
+#include "mori/utils/mori_log.hpp"
 #include "umbp/distributed/master/master_client.h"
 
 static volatile std::sig_atomic_t g_running = 1;
@@ -45,8 +44,6 @@ static bool SleepInterruptible(std::chrono::seconds total) {
 }
 
 int main(int argc, char** argv) {
-  spdlog::set_level(spdlog::level::info);
-
   std::string master_addr = "localhost:50051";
   std::string node_id = "node-1";
   std::string node_addr = "localhost:8080";
@@ -73,17 +70,17 @@ int main(int argc, char** argv) {
 
   auto register_self_status = client.RegisterSelf(caps);
   if (!register_self_status.ok()) {
-    spdlog::error("[Client] RegisterSelf failed: code={}, message={}",
-                  static_cast<int>(register_self_status.error_code()),
-                  register_self_status.error_message());
+    MORI_UMBP_ERROR("[Client] RegisterSelf failed: code={}, message={}",
+                    static_cast<int>(register_self_status.error_code()),
+                    register_self_status.error_message());
     return 1;
   }
 
   constexpr auto kOperationInterval = std::chrono::seconds(3);
   uint64_t iteration = 0;
 
-  spdlog::info("[Client] Starting RoutePut -> Register -> RouteGet demo as '{}'. Ctrl+C to stop.",
-               node_id);
+  MORI_UMBP_INFO("[Client] Starting RoutePut -> Register -> RouteGet demo as '{}'. Ctrl+C to stop.",
+                 node_id);
 
   while (IsRunning()) {
     ++iteration;
@@ -93,27 +90,27 @@ int main(int argc, char** argv) {
     std::optional<mori::umbp::RoutePutResult> put_target;
     auto route_put_status = client.RoutePut(key, 4ULL * 1024 * 1024, &put_target);
     if (!route_put_status.ok()) {
-      spdlog::warn("[Client] Iteration {} RoutePut(key={}) RPC failed: {}", iteration, key,
-                   route_put_status.error_message());
+      MORI_UMBP_WARN("[Client] Iteration {} RoutePut(key={}) RPC failed: {}", iteration, key,
+                     route_put_status.error_message());
       if (!SleepInterruptible(kOperationInterval)) break;
       continue;
     }
 
     if (!put_target.has_value()) {
-      spdlog::warn("[Client] Iteration {} RoutePut(key={}): no suitable target node", iteration,
-                   key);
+      MORI_UMBP_WARN("[Client] Iteration {} RoutePut(key={}): no suitable target node", iteration,
+                     key);
       if (!SleepInterruptible(kOperationInterval)) break;
       continue;
     }
 
-    spdlog::info("[Client] Iteration {} RoutePut(key={}): target_node={}, addr={}, tier={}",
-                 iteration, key, put_target->node_id, put_target->node_address,
-                 mori::umbp::TierTypeName(put_target->tier));
+    MORI_UMBP_INFO("[Client] Iteration {} RoutePut(key={}): target_node={}, addr={}, tier={}",
+                   iteration, key, put_target->node_id, put_target->node_address,
+                   mori::umbp::TierTypeName(put_target->tier));
 
     // ---- Step 2: Simulate MORI-IO write (would be real RDMA in production) ----
     std::string simulated_location_id = "sim-loc-" + std::to_string(iteration);
-    spdlog::info("[Client] Iteration {} Simulating MORI-IO write to {} -> location_id='{}'",
-                 iteration, put_target->node_id, simulated_location_id);
+    MORI_UMBP_INFO("[Client] Iteration {} Simulating MORI-IO write to {} -> location_id='{}'",
+                   iteration, put_target->node_id, simulated_location_id);
 
     // ---- Step 3: Register — tell master where the block landed ----
     mori::umbp::Location location;
@@ -124,12 +121,12 @@ int main(int argc, char** argv) {
 
     auto register_status = client.Register(key, location);
     if (!register_status.ok()) {
-      spdlog::warn("[Client] Iteration {} Register(key={}) failed: {}", iteration, key,
-                   register_status.error_message());
+      MORI_UMBP_WARN("[Client] Iteration {} Register(key={}) failed: {}", iteration, key,
+                     register_status.error_message());
       if (!SleepInterruptible(kOperationInterval)) break;
       continue;
     }
-    spdlog::info("[Client] Iteration {} Register(key={}) succeeded", iteration, key);
+    MORI_UMBP_INFO("[Client] Iteration {} Register(key={}) succeeded", iteration, key);
 
     if (!SleepInterruptible(std::chrono::seconds(1))) break;
 
@@ -137,30 +134,31 @@ int main(int argc, char** argv) {
     std::optional<mori::umbp::RouteGetResult> get_result;
     auto route_get_status = client.RouteGet(key, &get_result);
     if (!route_get_status.ok()) {
-      spdlog::warn("[Client] Iteration {} RouteGet(key={}) RPC failed: {}", iteration, key,
-                   route_get_status.error_message());
+      MORI_UMBP_WARN("[Client] Iteration {} RouteGet(key={}) RPC failed: {}", iteration, key,
+                     route_get_status.error_message());
       if (!SleepInterruptible(kOperationInterval)) break;
       continue;
     }
 
     if (get_result.has_value()) {
-      spdlog::info(
+      MORI_UMBP_INFO(
           "[Client] Iteration {} RouteGet(key={}): read from node={}, location={}, tier={}",
           iteration, key, get_result->location.node_id, get_result->location.location_id,
           mori::umbp::TierTypeName(get_result->location.tier));
     } else {
-      spdlog::warn("[Client] Iteration {} RouteGet(key={}): not found (unexpected)", iteration,
-                   key);
+      MORI_UMBP_WARN("[Client] Iteration {} RouteGet(key={}): not found (unexpected)", iteration,
+                     key);
     }
 
     // ---- Step 5: Cleanup — unregister the block ----
     uint32_t removed = 0;
     auto unregister_status = client.Unregister(key, location, &removed);
     if (!unregister_status.ok()) {
-      spdlog::warn("[Client] Iteration {} Unregister(key={}) failed: {}", iteration, key,
-                   unregister_status.error_message());
+      MORI_UMBP_WARN("[Client] Iteration {} Unregister(key={}) failed: {}", iteration, key,
+                     unregister_status.error_message());
     } else {
-      spdlog::info("[Client] Iteration {} Unregister(key={}) removed={}", iteration, key, removed);
+      MORI_UMBP_INFO("[Client] Iteration {} Unregister(key={}) removed={}", iteration, key,
+                     removed);
     }
 
     if (!SleepInterruptible(kOperationInterval)) break;
@@ -169,13 +167,13 @@ int main(int argc, char** argv) {
   if (client.IsRegistered()) {
     auto unregister_status = client.UnregisterSelf();
     if (!unregister_status.ok()) {
-      spdlog::error("[Client] Final UnregisterSelf failed: code={}, message={}",
-                    static_cast<int>(unregister_status.error_code()),
-                    unregister_status.error_message());
+      MORI_UMBP_ERROR("[Client] Final UnregisterSelf failed: code={}, message={}",
+                      static_cast<int>(unregister_status.error_code()),
+                      unregister_status.error_message());
       return 1;
     }
   }
 
-  spdlog::info("[Client] Exited cleanly");
+  MORI_UMBP_INFO("[Client] Exited cleanly");
   return 0;
 }

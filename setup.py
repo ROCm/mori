@@ -417,6 +417,14 @@ class CMakeBuild(build_ext):
         elif spdk_proxy_dst.exists():
             spdk_proxy_dst.unlink()
 
+        umbp_master_src = build_dir / "src/umbp/umbp_master"
+        umbp_master_dst = root_dir / "python/mori/umbp_master"
+        if umbp_master_src.exists():
+            shutil.copyfile(umbp_master_src, umbp_master_dst)
+            os.chmod(umbp_master_dst, 0o755)
+        elif umbp_master_dst.exists():
+            umbp_master_dst.unlink()
+
         _copy_jit_sources(root_dir)
 
         if os.environ.get("MORI_SKIP_PRECOMPILE", "").lower() not in (
@@ -492,6 +500,7 @@ setup(
             "libmori_io.so",
             "libmori_application.so",
             "spdk_proxy",
+            "umbp_master",
             "_jit_sources/include/**/*.hpp",
             "_jit_sources/include/**/*.h",
             "_jit_sources/src/**/*.hip",

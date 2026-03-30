@@ -43,6 +43,7 @@ def _write_fake_mori_package(tmp_path: Path, proxy_mode: int) -> Path:
                 "class UMBPClient: pass",
                 "class UMBPConfig: pass",
                 "class UMBPCopyPipelineConfig: pass",
+                "class UMBPDistributedConfig: pass",
                 "class UMBPDramConfig: pass",
                 "class UMBPDurabilityMode: pass",
                 "class UMBPIoBackend: pass",
@@ -62,7 +63,10 @@ def _write_fake_mori_package(tmp_path: Path, proxy_mode: int) -> Path:
     proxy_path = pkg_root / "spdk_proxy"
     proxy_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     proxy_path.chmod(proxy_mode)
-    return proxy_path
+    master_path = pkg_root / "umbp_master"
+    master_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    master_path.chmod(proxy_mode)
+    return proxy_path, master_path
 
 
 def _import_umbp_in_subprocess(
@@ -95,7 +99,7 @@ print(json.dumps({
 
 
 def test_packaged_spdk_proxy_auto_configures_env(tmp_path: Path) -> None:
-    proxy_path = _write_fake_mori_package(tmp_path, 0o644)
+    proxy_path, master_path = _write_fake_mori_package(tmp_path, 0o644)
 
     result = _import_umbp_in_subprocess(tmp_path, {})
 
@@ -103,6 +107,8 @@ def test_packaged_spdk_proxy_auto_configures_env(tmp_path: Path) -> None:
     assert result["is_exec"] is True
     mode = proxy_path.stat().st_mode
     assert mode & stat.S_IXUSR
+    master_mode = master_path.stat().st_mode
+    assert master_mode & stat.S_IXUSR
 
 
 def test_packaged_spdk_proxy_does_not_override_explicit_env(tmp_path: Path) -> None:
@@ -116,4 +122,67 @@ def test_packaged_spdk_proxy_does_not_override_explicit_env(tmp_path: Path) -> N
     )
 
     assert result["proxy_bin"] == str(explicit_proxy)
+    assert result["is_exec"] is True
+
+
+def test_packaged_umbp_master_auto_configures_env(tmp_path: Path) -> None:
+    _, master_path = _write_fake_mori_package(tmp_path, 0o644)
+
+    env = os.environ.copy()
+    env.pop("UMBP_MASTER_BIN", None)
+    env["PYTHONPATH"] = str(tmp_path)
+    script = """
+import json
+import os
+import mori.umbp
+
+master_bin = os.getenv("UMBP_MASTER_BIN")
+print(json.dumps({
+    "master_bin": master_bin,
+    "is_exec": bool(master_bin and os.access(master_bin, os.X_OK)),
+}))
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    result = json.loads(proc.stdout)
+
+    assert result["master_bin"] == str(master_path)
+    assert result["is_exec"] is True
+
+
+def test_packaged_umbp_master_does_not_override_explicit_env(tmp_path: Path) -> None:
+    _write_fake_mori_package(tmp_path, 0o755)
+    explicit_master = tmp_path / "user_umbp_master"
+    explicit_master.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    explicit_master.chmod(0o755)
+
+    env = os.environ.copy()
+    env["UMBP_MASTER_BIN"] = str(explicit_master)
+    env["PYTHONPATH"] = str(tmp_path)
+    script = """
+import json
+import os
+import mori.umbp
+
+master_bin = os.getenv("UMBP_MASTER_BIN")
+print(json.dumps({
+    "master_bin": master_bin,
+    "is_exec": bool(master_bin and os.access(master_bin, os.X_OK)),
+}))
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    result = json.loads(proc.stdout)
+
+    assert result["master_bin"] == str(explicit_master)
     assert result["is_exec"] is True

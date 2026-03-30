@@ -23,7 +23,7 @@
 
 #include "umbp/local/storage/segment/segment_format.h"
 
-namespace segment {
+namespace mori::umbp::segment {
 
 void Index::TouchLRU(const std::string& key) {
   auto it = lru_map_.find(key);
@@ -158,4 +158,4 @@ void Index::ResetAll() {
   active_segment_id_ = 0;
 }
 
-}  // namespace segment
+}  // namespace mori::umbp::segment

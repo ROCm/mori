@@ -37,6 +37,9 @@
 #include "umbp/proxy/spdk_proxy_protocol.h"
 #include "umbp/proxy/spdk_proxy_shm.h"
 
+namespace mori {
+namespace umbp {
+
 class SpdkProxyTier : public TierBackend {
  public:
   explicit SpdkProxyTier(const UMBPConfig& config);
@@ -79,13 +82,14 @@ class SpdkProxyTier : public TierBackend {
   static bool WaitForProxy(const std::string& shm_name, int timeout_ms);
 
  private:
-  umbp::proxy::ResultCode SubmitAndWait(umbp::proxy::RequestType type, const std::string& key,
-                                        const void* write_data, size_t write_size, void* read_buf,
-                                        size_t read_buf_size, uint64_t request_aux = 0,
-                                        uint64_t* out_result_size = nullptr,
-                                        uint64_t* out_result_aux = nullptr) const;
+  ::umbp::proxy::ResultCode SubmitAndWait(::umbp::proxy::RequestType type, const std::string& key,
+                                          const void* write_data, size_t write_size, void* read_buf,
+                                          size_t read_buf_size, uint64_t request_aux = 0,
+                                          uint64_t* out_result_size = nullptr,
+                                          uint64_t* out_result_aux = nullptr) const;
 
-  std::vector<bool> SubmitBatch(umbp::proxy::RequestType type, const std::vector<std::string>& keys,
+  std::vector<bool> SubmitBatch(::umbp::proxy::RequestType type,
+                                const std::vector<std::string>& keys,
                                 const std::vector<const void*>& data_ptrs,
                                 const std::vector<uintptr_t>& dst_ptrs,
                                 const std::vector<size_t>& sizes) const;
@@ -103,7 +107,10 @@ class SpdkProxyTier : public TierBackend {
   uint32_t tenant_id_ = 0;
   uint32_t tenant_slot_ = 0;
   uint64_t session_id_ = 0;
-  mutable umbp::proxy::ProxyShmRegion shm_;
+  mutable ::umbp::proxy::ProxyShmRegion shm_;
   mutable std::mutex submit_mu_;
   mutable uint64_t seq_counter_ = 0;
 };
+
+}  // namespace umbp
+}  // namespace mori

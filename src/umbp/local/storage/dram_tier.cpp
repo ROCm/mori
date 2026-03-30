@@ -29,6 +29,8 @@
 #include <cstring>
 #include <stdexcept>
 
+namespace mori::umbp {
+
 DRAMTier::DRAMTier(size_t capacity, bool use_shm, const std::string& shm_name)
     : TierBackend(StorageTier::CPU_DRAM),
       base_ptr_(nullptr),
@@ -274,3 +276,20 @@ std::string DRAMTier::GetLRUKey() const {
   if (lru_list_.empty()) return "";
   return lru_list_.back();
 }
+
+std::optional<size_t> DRAMTier::GetSlotOffset(const std::string& key) const {
+  std::lock_guard<std::mutex> lock(mu_);
+  auto it = slots_.find(key);
+  if (it == slots_.end()) return std::nullopt;
+  return it->second.offset;
+}
+
+std::optional<std::string> DRAMTier::GetLocationId(const std::string& key) const {
+  auto offset = GetSlotOffset(key);
+  if (!offset.has_value()) {
+    return std::nullopt;
+  }
+  return std::to_string(*offset);
+}
+
+}  // namespace mori::umbp

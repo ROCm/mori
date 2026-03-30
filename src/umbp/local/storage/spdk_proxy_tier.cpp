@@ -41,7 +41,10 @@
 #include <csignal>
 #endif
 
-using namespace umbp::proxy;
+namespace mori {
+namespace umbp {
+
+using namespace ::umbp::proxy;
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
@@ -438,7 +441,11 @@ std::vector<bool> SpdkProxyTier::SubmitBatch(RequestType type, const std::vector
       auto* ctrl = GetCacheRingControl(shm_.Base(), hdr);
       if (ctrl) {
         uint64_t rbase = AllocRingContiguous(ctrl, total_data);
-        if (rbase != UINT64_MAX) {
+        // `ring_data_base == 0` is reserved as the protocol sentinel for
+        // "payload lives in the per-channel data region".  Avoid using the
+        // ring for that first allocation so client and proxy interpret the
+        // descriptor consistently.
+        if (rbase != UINT64_MAX && rbase != 0) {
           char* ring_data = GetCacheRingData(shm_.Base(), hdr);
           uint64_t cap = ctrl->capacity;
           write_target = ring_data + static_cast<size_t>(rbase % cap);
@@ -777,3 +784,6 @@ std::vector<std::string> SpdkProxyTier::GetLRUCandidates(size_t max_candidates) 
   if (!k.empty()) result.push_back(std::move(k));
   return result;
 }
+
+}  // namespace umbp
+}  // namespace mori

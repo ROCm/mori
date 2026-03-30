@@ -25,6 +25,8 @@
 #include <vector>
 
 #include "umbp/local/block_index/local_block_index.h"
+
+using namespace mori::umbp;
 using mori::umbp::LocalBlockIndex;
 
 void test_insert_lookup() {

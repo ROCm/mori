@@ -49,7 +49,10 @@ struct Location {
   uint64_t size = 0;
   TierType tier = TierType::UNKNOWN;
 
-  bool operator==(const Location& other) const;
+  bool operator==(const Location& other) const {
+    return node_id == other.node_id && location_id == other.location_id && size == other.size &&
+           tier == other.tier;
+  }
 };
 
 enum class ClientStatus : int {
@@ -80,8 +83,39 @@ struct ClientRecord {
   std::vector<PoolAllocator> ssd_allocators;
 };
 
+struct PendingAllocation {
+  std::string allocation_id;
+  std::string node_id;
+  TierType tier = TierType::UNKNOWN;
+  uint32_t buffer_index = 0;
+  uint64_t offset = 0;
+  uint64_t size = 0;
+  std::chrono::steady_clock::time_point allocated_at;
+};
+
 // Helpers for logging
-const char* TierTypeName(TierType t);
-const char* ClientStatusName(ClientStatus s);
+inline const char* TierTypeName(TierType t) {
+  switch (t) {
+    case TierType::HBM:
+      return "HBM";
+    case TierType::DRAM:
+      return "DRAM";
+    case TierType::SSD:
+      return "SSD";
+    default:
+      return "UNKNOWN";
+  }
+}
+
+inline const char* ClientStatusName(ClientStatus s) {
+  switch (s) {
+    case ClientStatus::ALIVE:
+      return "ALIVE";
+    case ClientStatus::EXPIRED:
+      return "EXPIRED";
+    default:
+      return "UNKNOWN";
+  }
+}
 
 }  // namespace mori::umbp
