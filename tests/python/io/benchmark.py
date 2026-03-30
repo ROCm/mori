@@ -132,7 +132,7 @@ def parse_args():
     parser.add_argument(
         "--batch-contiguous",
         action="store_true",
-        help="Use contiguous offsets so transfers may be merged. Default is non-contiguous (strided offsets, each transfer is a separate WR).",
+        help="Use contiguous offsets so transfers may be merged. Default is non-contiguous (strided offsets, each transfer is a separate WR). Don't enable this when stress SQ / reproduce ENOMEM on notify due to merged wr",
     )
     parser.add_argument(
         "--enable-sess",
