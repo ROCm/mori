@@ -249,9 +249,9 @@ __global__ void PipelinedAllReduceSdmaKernel(
           anvil::SdmaQueueDeviceHandle** dh =
               dstMemObj->deviceHandles_d + destPe * numQ;
           HSAuint64* rSigAG = dstMemObj->peerSignalPtrs[destPe]
-              + static_cast<size_t>(myPe) * numQ;
+              + static_cast<size_t>(myPe) * numQ + 1;
           HSAuint64* eSigAG = dstMemObj->expectSignalsPtr
-              + destPe * numQ;
+              + destPe * numQ + 1;
 
           for (int c = 0; c < numChunks; c++) {
             const uint32_t ccTarget =
@@ -270,7 +270,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
                 + static_cast<size_t>(myPe) * totalShardBytes + cOff;
             uint8_t* dst = reinterpret_cast<uint8_t*>(dstMemObj->peerPtrs[destPe])
                 + static_cast<size_t>(myPe) * totalShardBytes + cOff;
-            core::SdmaPutThread(src, dst, agBytes, dh, rSigAG, eSigAG, numQ, 1);
+            core::SdmaPutThread(src, dst, agBytes, dh, rSigAG, eSigAG, numQ, 0);
           }
         }
 
@@ -290,9 +290,9 @@ __global__ void PipelinedAllReduceSdmaKernel(
           anvil::SdmaQueueDeviceHandle** dh =
               dstMemObj->deviceHandles_d + destPe * numQ;
           HSAuint64* rSigAG = dstMemObj->peerSignalPtrs[destPe]
-              + static_cast<size_t>(myPe) * numQ;
+              + static_cast<size_t>(myPe) * numQ + 1;
           HSAuint64* eSigAG = dstMemObj->expectSignalsPtr
-              + destPe * numQ;
+              + destPe * numQ + 1;
 
           const uint32_t ccTarget =
               ccBase + static_cast<uint32_t>(compBlocks);
@@ -305,7 +305,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
               + static_cast<size_t>(myPe) * totalShardBytes;
           uint8_t* dst = reinterpret_cast<uint8_t*>(dstMemObj->peerPtrs[destPe])
               + static_cast<size_t>(myPe) * totalShardBytes;
-          core::SdmaPutThread(src, dst, totalShardBytes, dh, rSigAG, eSigAG, numQ, 1);
+          core::SdmaPutThread(src, dst, totalShardBytes, dh, rSigAG, eSigAG, numQ, 0);
         }
 
         if (thr < npes && thr != myPe) {
