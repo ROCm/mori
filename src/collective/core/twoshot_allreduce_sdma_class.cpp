@@ -97,10 +97,9 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t /*input_buffer_size*/
   if (!output_transit_buffer_) throw std::runtime_error("Failed to allocate output transit buffer");
   output_transit_buffer_ptr_.reset(output_transit_buffer_);
 
-  output_transit_buffer_obj_ =
-      shmem::ShmemSymmetricRegister(output_transit_buffer_, output_transit_buffer_size_);
+  output_transit_buffer_obj_ = shmem::ShmemQueryMemObjPtr(output_transit_buffer_);
   if (!output_transit_buffer_obj_.IsValid())
-    throw std::runtime_error("Failed to register output transit buffer");
+    throw std::runtime_error("Failed to query output transit buffer SymmMemObj");
 
   printf("AllreduceSdma(SDMA) initialized: PE %d of %d, max_blocks=%d\n", myPe_, npes_,
          max_blocks_);
@@ -149,10 +148,9 @@ bool AllreduceSdma<T>::ensure_buffer_size(void*& buffer,
   }
   buffer_ptr.reset(buffer);
 
-  // Re-register
-  buffer_obj = shmem::ShmemSymmetricRegister(buffer, current_size);
+  buffer_obj = shmem::ShmemQueryMemObjPtr(buffer);
   if (!buffer_obj.IsValid()) {
-    fprintf(stderr, "PE %d: Failed to re-register %s\n", myPe_, buffer_name);
+    fprintf(stderr, "PE %d: Failed to query re-allocated %s\n", myPe_, buffer_name);
     return false;
   }
 

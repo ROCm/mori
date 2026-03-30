@@ -232,8 +232,8 @@ void testPipelinedAllreduce() {
             serialGb.push_back(gb);
             okSerial.push_back(ok);
         }
+        MPI_Barrier(MPI_COMM_WORLD);
 
-        // Pipeline SDMA default
         ms = 0;
         gb = 0;
         ok = runBenchMs(
@@ -247,6 +247,7 @@ void testPipelinedAllreduce() {
             sdmaGb.push_back(ok ? gb : 0.0);
             okSdma.push_back(ok);
         }
+        MPI_Barrier(MPI_COMM_WORLD);
 
         if (chunkSweep && myPe == 0) {
             sweepPrintf(&sweep_lines, "  [%zu MB/PE] SDMA chunk sweep", dataMB);
