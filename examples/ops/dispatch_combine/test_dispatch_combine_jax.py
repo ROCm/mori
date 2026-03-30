@@ -160,8 +160,6 @@ class EpDispatchCombineTestCase:
             input_list,
         ) = test_data
 
-        weights = None
-
         @jax.jit
         def ffi_calls(inputs, weights, scales, indices):
             (
