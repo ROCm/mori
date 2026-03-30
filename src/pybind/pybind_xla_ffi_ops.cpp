@@ -150,6 +150,7 @@ Error MoriDispatchImpl(hipStream_t stream, EpDispatchCombineHandle* h, Dictionar
   auto warp_per_block = GetAttr<int32_t>(attrs, "warp_per_block");
   auto has_scales = GetAttr<int32_t>(attrs, "has_scales");
 
+  assert(input.dimensions().size() == 2);
   const int hiddenDim = static_cast<int>(input.dimensions()[1]);
   assert(hiddenDim > 0 && hiddenDim <= h->config.hiddenDim);
 
@@ -205,6 +206,7 @@ Error MoriCombineImpl(hipStream_t stream, EpDispatchCombineHandle* h, Dictionary
   auto block_num = GetAttr<int32_t>(attrs, "block_num");
   auto rdma_block_num = GetAttr<int32_t>(attrs, "rdma_block_num");
   auto warp_per_block = GetAttr<int32_t>(attrs, "warp_per_block");
+  assert(input.dimensions().size() == 2);
   const int hiddenDim = static_cast<int>(input.dimensions()[1]);
   assert(hiddenDim > 0 && hiddenDim <= h->config.hiddenDim);
   assert(ByteWidth(topk_ids.element_type()) == sizeof(index_t));
@@ -260,7 +262,8 @@ Error GetDispatchSrcTokenId(hipStream_t stream, EpDispatchCombineHandle* h, Rema
   return Error::Success();
 }
 
-ErrorOr<std::unique_ptr<EpDispatchCombineState>> EpDispatchCombineInstantiate(Dictionary attrs) {
+ErrorOr<std::unique_ptr<EpDispatchCombineState>> EpDispatchCombineInstantiate(
+          Dictionary attrs) try {
   auto ep_config = attrs.get<Span<const int32_t>>("ep_config");
   using ErrOr = ErrorOr<std::unique_ptr<EpDispatchCombineState>>;
 
@@ -285,6 +288,10 @@ ErrorOr<std::unique_ptr<EpDispatchCombineState>> EpDispatchCombineInstantiate(Di
     entry = std::make_unique<EpDispatchCombineHandle>(cfg);
   }
   return std::make_unique<EpDispatchCombineState>(entry.get());
+}
+catch (const std::exception& e) {
+  return ErrorOr<std::unique_ptr<EpDispatchCombineState>>(
+                      Error::Internal(e.what()));
 }
 
 XLA_FFI_DEFINE_HANDLER(EpDispatchCombineInstHandler, EpDispatchCombineInstantiate,
