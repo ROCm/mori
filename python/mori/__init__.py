@@ -25,6 +25,7 @@ import os
 _LAZY_SUBMODULES = {
     "cpp",
     "ops",
+    "jax",
     "shmem",
     "io",
     "ir",

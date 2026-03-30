@@ -39,7 +39,7 @@ if(BUILD_IO)
   endif()
 endif()
 
-if(BUILD_OPS_DEVICE)
+if(BUILD_OPS_DEVICE AND WITH_MPI)
   find_package(MPI REQUIRED)
   add_executable(test_aot_launch ops/test_aot_launch.cpp)
   target_include_directories(test_aot_launch PUBLIC ${CMAKE_SOURCE_DIR}/include)
