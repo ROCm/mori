@@ -20,7 +20,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 import mori
-from tests.python.ops.test_dispatch_combine import EpDispatchCombineTestCase
+from collections import namedtuple
+from tests.python.ops.test_dispatch_combine import (
+    EpDispatchCombineTestCase,
+    _is_fp4x2_dtype,
+    unpack_fp4x2,
+)
 from tests.python.utils import TorchDistContext, get_free_port
 import torch
 import torch.distributed as dist
@@ -30,17 +35,49 @@ os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "6G")
 
 
 class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
-    def __init__(self, config):
+    def __init__(
+        self,
+        config,
+        combine_data_type=None,
+        combine_hidden_dim=None,
+        dispatch_hidden_dim=None,
+    ):
         super().__init__(config)
+        self.combine_data_type = (
+            combine_data_type if combine_data_type is not None else config.data_type
+        )
+        self.combine_hidden_dim = (
+            combine_hidden_dim if combine_hidden_dim is not None else config.hidden_dim
+        )
+        self.dispatch_hidden_dim = (
+            dispatch_hidden_dim
+            if dispatch_hidden_dim is not None
+            else config.hidden_dim
+        )
 
     def gen_test_data(self):
-        return super().gen_test_data(use_max_token_num=True)
+        saved = self.config.hidden_dim
+        self.config.hidden_dim = self.dispatch_hidden_dim
+        result = super().gen_test_data(use_max_token_num=True)
+        self.config.hidden_dim = saved
+        return result
 
     def _get_combine_input(self, op, dispatch_output):
+        """Return the tensor to pass as combine input.
+
+        For external-input-buffer mode (non-zero-copy): returns the data tensor
+        directly (converted if cross-type).
+        For zero-copy mode: returns the registered shmem buffer; the caller
+        is responsible for copying converted data into it.
+        """
         if self.config.use_external_inp_buf:
+            if self.combine_data_type != self.config.data_type:
+                if _is_fp4x2_dtype(self.config.data_type):
+                    return unpack_fp4x2(dispatch_output, dtype=self.combine_data_type)
+                return dispatch_output.to(self.combine_data_type)
             return dispatch_output
         return op.get_registered_combine_input_buffer(
-            self.config.data_type, hidden_dim=dispatch_output.size(1)
+            self.combine_data_type, hidden_dim=self.combine_hidden_dim
         )
 
     def _capture_split_graphs(
@@ -188,19 +225,35 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
 
         combine_input = self._get_combine_input(op, dispatch_output)
         if not self.config.use_external_inp_buf:
-            combine_input[:total_recv_num_token, :].copy_(
-                dispatch_output[:total_recv_num_token, :]
-            )
+            if self.combine_data_type != self.config.data_type:
+                if _is_fp4x2_dtype(self.config.data_type):
+                    converted = unpack_fp4x2(
+                        dispatch_output[:total_recv_num_token],
+                        dtype=self.combine_data_type,
+                    )
+                else:
+                    converted = dispatch_output[:total_recv_num_token].to(
+                        self.combine_data_type
+                    )
+                combine_input[:total_recv_num_token, :].copy_(converted)
+            else:
+                combine_input[:total_recv_num_token, :].copy_(
+                    dispatch_output[:total_recv_num_token, :]
+                )
 
         combine_output, _ = op.combine(
             combine_input,
-            # dispatch_weights,
             None,
             dispatch_indices,
             block_num=combine_block_num,
             warp_per_block=combine_warp_per_block,
         )
-        self.check_combine_result(op, test_data, combine_output)
+        self.check_combine_result(
+            op,
+            test_data,
+            combine_output,
+            combine_data_type=self.combine_data_type,
+        )
         self.sync()
         return total_recv_num_token
 
@@ -247,17 +300,21 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             combine_warp_per_block,
         )
 
-        # Capture the full end-to-end path to compare single-graph replay
-        # against the split-graph timings above.
-        e2e_graph = self._capture_e2e_graph(
-            op,
-            test_data,
-            dispatch_block_num,
-            dispatch_warp_per_block,
-            combine_block_num,
-            combine_warp_per_block,
-            total_recv_num_token,
-        )
+        is_cross_type = self.combine_data_type != self.config.data_type
+
+        # e2e graph not supported for cross-type (graph capture cannot
+        # allocate memory for type conversion).
+        e2e_graph = None
+        if not is_cross_type:
+            e2e_graph = self._capture_e2e_graph(
+                op,
+                test_data,
+                dispatch_block_num,
+                dispatch_warp_per_block,
+                combine_block_num,
+                combine_warp_per_block,
+                total_recv_num_token,
+            )
 
         round_start_events = [
             torch.cuda.Event(enable_timing=True) for _ in range(graph_replay_iters)
@@ -276,17 +333,16 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         ]
 
         for i in range(graph_replay_iters):
-            # Split-graph replay path.
             round_start_events[i].record()
             dispatch_graph.replay()
             mid_events[i].record()
             combine_graph.replay()
             round_end_events[i].record()
 
-            # Single-graph end-to-end replay path.
-            e2e_start_events[i].record()
-            e2e_graph.replay()
-            e2e_end_events[i].record()
+            if e2e_graph is not None:
+                e2e_start_events[i].record()
+                e2e_graph.replay()
+                e2e_end_events[i].record()
 
         torch.cuda.synchronize()
         disp_duration = (
@@ -303,24 +359,35 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             )
             / graph_replay_iters
         )
-        e2e_duration = (
-            sum(
-                start_event.elapsed_time(end_event)
-                for start_event, end_event in zip(e2e_start_events, e2e_end_events)
+        if e2e_graph is not None:
+            e2e_duration = (
+                sum(
+                    start_event.elapsed_time(end_event)
+                    for start_event, end_event in zip(e2e_start_events, e2e_end_events)
+                )
+                / graph_replay_iters
             )
-            / graph_replay_iters
-        )
+        else:
+            e2e_duration = -1.0
         self.sync()
 
-        element_size = all_rank_input[self.config.rank].element_size()
-        total_bytes = total_recv_num_token * self.config.hidden_dim * element_size
+        disp_element_size = all_rank_input[self.config.rank].element_size()
+        disp_total_bytes = (
+            total_recv_num_token * self.dispatch_hidden_dim * disp_element_size
+        )
+        comb_element_size = torch.tensor(
+            [], dtype=self.combine_data_type
+        ).element_size()
+        comb_total_bytes = (
+            total_recv_num_token * self.combine_hidden_dim * comb_element_size
+        )
         ll_mode_scale = (
             self.config.max_num_inp_token_per_rank
             * self.config.num_experts_per_token
             / (total_recv_num_token + 0.01)
         )
-        disp_bandwidth = total_bytes / (1000**3) / (disp_duration / (10**3))
-        comb_bandwidth = total_bytes / (1000**3) / (comb_duration / (10**3))
+        disp_bandwidth = disp_total_bytes / (1000**3) / (disp_duration / (10**3))
+        comb_bandwidth = comb_total_bytes / (1000**3) / (comb_duration / (10**3))
 
         return (
             disp_duration,
@@ -328,7 +395,8 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             e2e_duration,
             disp_bandwidth,
             comb_bandwidth,
-            total_bytes,
+            disp_total_bytes,
+            comb_total_bytes,
             ll_mode_scale,
         )
 
@@ -359,7 +427,8 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         comb_duration_us_list = []
         comb_bandwidth_GB_list = []
         e2e_duration_us_list = []
-        avg_total_bytes_MB_list = []
+        disp_avg_bytes_MB_list = []
+        comb_avg_bytes_MB_list = []
 
         test_data_list = [self.gen_test_data() for i in range(iters)]
 
@@ -371,7 +440,8 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
                 e2e_dur,
                 disp_bw,
                 comb_bw,
-                total_bytes,
+                disp_total_bytes,
+                comb_total_bytes,
                 ll_mode_scale,
             ) = self.run_once_bench(
                 op,
@@ -388,31 +458,37 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             comb_dur_list = [torch.zeros(1) for _ in range(self.config.world_size)]
             comb_bw_list = [torch.zeros(1) for _ in range(self.config.world_size)]
             e2e_dur_list = [torch.zeros(1) for _ in range(self.config.world_size)]
-            total_bytes_list = [torch.zeros(1) for _ in range(self.config.world_size)]
+            disp_bytes_list = [torch.zeros(1) for _ in range(self.config.world_size)]
+            comb_bytes_list = [torch.zeros(1) for _ in range(self.config.world_size)]
 
             dist.all_gather(disp_dur_list, torch.tensor([disp_dur * 1000]))
             dist.all_gather(disp_bw_list, torch.tensor([disp_bw]))
             dist.all_gather(comb_dur_list, torch.tensor([comb_dur * 1000]))
             dist.all_gather(comb_bw_list, torch.tensor([comb_bw]))
             dist.all_gather(e2e_dur_list, torch.tensor([e2e_dur * 1000]))
-            dist.all_gather(total_bytes_list, torch.tensor([total_bytes / (1024**2)]))
+            dist.all_gather(
+                disp_bytes_list, torch.tensor([disp_total_bytes / (1024**2)])
+            )
+            dist.all_gather(
+                comb_bytes_list, torch.tensor([comb_total_bytes / (1024**2)])
+            )
 
             disp_duration_us_list.append([int(t.item()) for t in disp_dur_list])
             disp_bandwidth_GB_list.append([int(t.item()) for t in disp_bw_list])
             comb_duration_us_list.append([int(t.item()) for t in comb_dur_list])
             comb_bandwidth_GB_list.append([int(t.item()) for t in comb_bw_list])
             e2e_duration_us_list.append([int(t.item()) for t in e2e_dur_list])
-            avg_total_bytes_MB_list.append(
-                int(torch.tensor(total_bytes_list).mean().item())
+            disp_avg_bytes_MB_list.append(
+                int(torch.tensor(disp_bytes_list).mean().item())
+            )
+            comb_avg_bytes_MB_list.append(
+                int(torch.tensor(comb_bytes_list).mean().item())
             )
 
-        # Compute max algo_bw and min latency on ALL ranks
-        # (data is identical via all_gather)
         max_disp_algo_bw = 0
         max_comb_algo_bw = 0
         min_disp_latency_us = float("inf")
         min_comb_latency_us = float("inf")
-        min_e2e_latency_us = float("inf")
         for i in range(iters):
             disp_algo_bw = sum(disp_bandwidth_GB_list[i]) / self.config.world_size
             comb_algo_bw = sum(comb_bandwidth_GB_list[i]) / self.config.world_size
@@ -420,38 +496,41 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             max_comb_algo_bw = max(max_comb_algo_bw, comb_algo_bw)
             disp_max_lat = max(disp_duration_us_list[i])
             comb_max_lat = max(comb_duration_us_list[i])
-            e2e_max_lat = max(e2e_duration_us_list[i])
             min_disp_latency_us = min(min_disp_latency_us, disp_max_lat)
             min_comb_latency_us = min(min_comb_latency_us, comb_max_lat)
-            min_e2e_latency_us = min(min_e2e_latency_us, e2e_max_lat)
 
         if self.config.rank == 0:
             print("Dispatch result:")
             for i, duration_us in enumerate(disp_duration_us_list):
                 algo_bw = sum(disp_bandwidth_GB_list[i]) / self.config.world_size
+                lat = max(duration_us)
                 print(
                     f"Round {i} duration(us) {duration_us} "
                     f"bandwidth(GB/s) {disp_bandwidth_GB_list[i]} "
-                    f"avg bytes(MB) {avg_total_bytes_MB_list[i]} bw {algo_bw} / {algo_bw * ll_mode_scale:.2f}"
+                    f"avg bytes(MB) {disp_avg_bytes_MB_list[i]} lat {lat} bw {algo_bw} / {algo_bw * ll_mode_scale:.2f}"
                 )
 
             print()
             print("Combine result:")
             for i, duration_us in enumerate(comb_duration_us_list):
                 algo_bw = sum(comb_bandwidth_GB_list[i]) / self.config.world_size
+                lat = max(duration_us)
                 print(
                     f"Round {i} duration(us) {duration_us} "
                     f"bandwidth(GB/s) {comb_bandwidth_GB_list[i]} "
-                    f"avg bytes(MB) {avg_total_bytes_MB_list[i]} bw {algo_bw} / {algo_bw * ll_mode_scale:.2f}"
+                    f"avg bytes(MB) {comb_avg_bytes_MB_list[i]} lat {lat} bw {algo_bw} / {algo_bw * ll_mode_scale:.2f}"
                 )
 
             print()
-            print("End-to-end result:")
-            print(
-                "Note: e2e is one full-graph replay; separate results use two graph replays, so sep total is usually higher."
-            )
-            for i, duration_us in enumerate(e2e_duration_us_list):
-                print(f"Round {i} e2e(us) {duration_us} ")
+            if e2e_duration_us_list and e2e_duration_us_list[0][0] >= 0:
+                print("End-to-end result:")
+                print(
+                    "Note: e2e is one full-graph replay; separate results use two graph replays, so sep total is usually higher."
+                )
+                for i, duration_us in enumerate(e2e_duration_us_list):
+                    print(f"Round {i} e2e(us) {duration_us} ")
+            else:
+                print("End-to-end result: skipped (cross-type)")
 
         return (
             max_disp_algo_bw,
@@ -468,6 +547,11 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         combine_block_num,
         combine_warp_per_block,
     ):
+        if self.combine_data_type != self.config.data_type:
+            raise ValueError(
+                "Stress mode does not support cross-type dispatch/combine. "
+                "Use --cmd bench or --cmd tuning instead."
+            )
         test_data = self.gen_test_data()
         total_recv_num_token = self.run_once_test(
             op,
@@ -494,21 +578,45 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             torch.cuda.synchronize()
 
 
+LaunchConfig = namedtuple(
+    "LaunchConfig",
+    [
+        "dispatch_block_num",
+        "dispatch_warp_per_block",
+        "combine_block_num",
+        "combine_warp_per_block",
+    ],
+)
+
+
 def _get_default_launch_config(
     world_size,
     max_num_inp_token_per_rank,
     use_external_inp_buf,
 ):
+    zero_copy = not use_external_inp_buf
     if world_size <= 4:
         if max_num_inp_token_per_rank > 128:
-            return (768, 8, 72, 4) if not use_external_inp_buf else (768, 8, 256, 14)
+            return (
+                LaunchConfig(768, 8, 72, 4)
+                if zero_copy
+                else LaunchConfig(768, 8, 256, 14)
+            )
         if max_num_inp_token_per_rank > 64:
-            return (216, 6, 72, 4) if not use_external_inp_buf else (216, 6, 224, 8)
-        return (223, 6, 72, 4) if not use_external_inp_buf else (223, 6, 224, 4)
+            return (
+                LaunchConfig(216, 6, 72, 4)
+                if zero_copy
+                else LaunchConfig(216, 6, 224, 8)
+            )
+        return (
+            LaunchConfig(223, 6, 72, 4) if zero_copy else LaunchConfig(223, 6, 224, 4)
+        )
 
     if max_num_inp_token_per_rank > 1024:
-        return (80, 16, 80, 4) if not use_external_inp_buf else (80, 16, 80, 16)
-    return (64, 16, 64, 4) if not use_external_inp_buf else (64, 16, 64, 16)
+        return (
+            LaunchConfig(80, 16, 80, 4) if zero_copy else LaunchConfig(80, 16, 80, 16)
+        )
+    return LaunchConfig(64, 16, 64, 4) if zero_copy else LaunchConfig(64, 16, 64, 16)
 
 
 def _bench_dispatch_combine(
@@ -530,11 +638,15 @@ def _bench_dispatch_combine(
     combine_block_num_arg=None,
     combine_warp_per_block_arg=None,
     combine_data_type=None,
-    combine_hidden_dim=None,
 ):
     if combine_data_type is None:
         combine_data_type = data_type
-    if combine_hidden_dim is None:
+
+    if _is_fp4x2_dtype(data_type) and not _is_fp4x2_dtype(combine_data_type):
+        combine_hidden_dim = hidden_dim * 2
+    elif not _is_fp4x2_dtype(data_type) and _is_fp4x2_dtype(combine_data_type):
+        combine_hidden_dim = hidden_dim // 2
+    else:
         combine_hidden_dim = hidden_dim
 
     if quant_type == "fp8_direct_cast" and data_type is not torch.bfloat16:
@@ -544,7 +656,7 @@ def _bench_dispatch_combine(
         data_type=data_type,
         rank=rank,
         world_size=world_size,
-        hidden_dim=hidden_dim,
+        hidden_dim=max(hidden_dim, combine_hidden_dim),
         scale_dim=scale_dim,
         scale_type_size=scale_type_size,
         max_token_type_size=2,
@@ -560,7 +672,12 @@ def _bench_dispatch_combine(
     with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
         mori.shmem.shmem_torch_process_group_init("default")
         op = mori.ops.EpDispatchCombineOp(config)
-        benchmark = EpDispatchCombineBenchmark(config)
+        benchmark = EpDispatchCombineBenchmark(
+            config,
+            combine_data_type=combine_data_type,
+            combine_hidden_dim=combine_hidden_dim,
+            dispatch_hidden_dim=hidden_dim,
+        )
 
         (
             dispatch_block_num,
@@ -627,152 +744,103 @@ def _bench_dispatch_combine(
                 print(
                     "Warning: dispatch/combine block/warp arguments are ignored when --cmd tuning"
                 )
-            # Test different block_num and warp_per_block combinations
             sm_count = torch.cuda.get_device_properties(rank).multi_processor_count
 
-            # Dispatch and Combine must be tuned SEPARATELY:
-
-            # --- Dispatch candidates (can over-subscribe) ---
+            # Build full dispatch candidate set (includes over-subscribe)
             max_disp_block_num = max(sm_count * 4, 320)
-            disp_block_set = set()
-            disp_block_set.update(range(32, sm_count + 1, 8))
+            all_block_set = set()
+            all_block_set.update(range(32, sm_count + 1, 8))
             pow2 = 32
             while pow2 <= max_disp_block_num:
-                disp_block_set.add(pow2)
+                all_block_set.add(pow2)
                 pow2 <<= 1
             for anchor in [224, 256]:
                 for delta in [-32, -16, -8, -4, -1, 0, 1, 4, 8, 16, 32]:
                     v = anchor + delta
                     if 32 <= v <= max_disp_block_num:
-                        disp_block_set.add(v)
+                        all_block_set.add(v)
             for mult in [1, 2, 3, 4]:
-                disp_block_set.add(sm_count * mult)
-            disp_block_list = sorted(disp_block_set)
+                all_block_set.add(sm_count * mult)
 
-            # --- Combine candidates (must fit in SM count) ---
-            max_comb_block_num = sm_count
-            comb_block_set = set()
-            comb_block_set.update(range(32, max_comb_block_num + 1, 8))
-            pow2 = 32
-            while pow2 <= max_comb_block_num:
-                comb_block_set.add(pow2)
-                pow2 <<= 1
-            comb_block_list = sorted(comb_block_set)
+            common_block_list = sorted(v for v in all_block_set if v <= sm_count)
+            extra_disp_block_list = sorted(v for v in all_block_set if v > sm_count)
 
             warp_per_block_list = [4, 5, 6, 8, 10, 12, 14, 15, 16]
 
             if rank == 0:
                 print(
                     f"SM count={sm_count}\n"
-                    f"Dispatch block_num candidates ({len(disp_block_list)}): {disp_block_list}\n"
-                    f"Combine  block_num candidates ({len(comb_block_list)}): {comb_block_list}\n"
+                    f"Common block_num candidates ({len(common_block_list)}): {common_block_list}\n"
+                    f"Extra dispatch block_num candidates ({len(extra_disp_block_list)}): {extra_disp_block_list}\n"
                     f"warp_per_block candidates: {warp_per_block_list}"
                 )
 
-            # --- Phase 1: Tune Dispatch (fix combine at safe default) ---
             best_disp_bw = 0
-            best_disp_latency = float("inf")
+            best_comb_bw = 0
             best_disp_config = None
-            comb_safe_block = min(sm_count, 72)
-            comb_safe_wpb = 15
+            best_comb_config = None
 
+            # Common sweep uses the same block/warp for both dispatch and combine
+            # to keep the search space manageable. Asymmetric configs (different
+            # block/warp for dispatch vs combine) are not explored here; the extra
+            # dispatch sweep below covers over-subscribe block_num candidates.
             if rank == 0:
                 print(f"\n{'#' * 60}")
-                print(
-                    f"Phase 1: Tuning DISPATCH (combine fixed at block_num={comb_safe_block}, wpb={comb_safe_wpb})"
-                )
+                print("Common sweep (same block/warp for dispatch and combine)")
                 print(f"{'#' * 60}")
 
-            for block_num in disp_block_list:
+            for block_num in common_block_list:
                 for warp_per_block in warp_per_block_list:
                     if rank == 0:
                         print(f"\n{'=' * 60}")
-                        print(
-                            f"Dispatch: block_num={block_num}, warp_per_block={warp_per_block}"
-                        )
+                        print(f"block_num={block_num}, warp_per_block={warp_per_block}")
                         print(f"{'=' * 60}")
 
-                    disp_bw, _, disp_lat, _ = benchmark.run(
+                    disp_bw, comb_bw, _, _ = benchmark.run(
                         op,
                         dispatch_block_num=block_num,
                         dispatch_warp_per_block=warp_per_block,
-                        combine_block_num=comb_safe_block,
-                        combine_warp_per_block=comb_safe_wpb,
-                    )
-
-                    if disp_bw > best_disp_bw:
-                        best_disp_bw = disp_bw
-                        best_disp_latency = disp_lat
-                        best_disp_config = (block_num, warp_per_block)
-
-            # --- Phase 2: Tune Combine (fix dispatch at best found) ---
-            # NOTE: Dispatch and combine should share the same op instance in real usage.
-            # The op now accepts different runtime input dtype/hidden_dim between dispatch/combine,
-            # so actual usage can still use one op; separate combine op here is only for tuning.
-            use_separate_combine_op = (
-                combine_data_type != data_type or combine_hidden_dim != hidden_dim
-            )
-            if use_separate_combine_op:
-                comb_config = mori.ops.EpDispatchCombineConfig(
-                    data_type=combine_data_type,
-                    rank=rank,
-                    world_size=world_size,
-                    hidden_dim=combine_hidden_dim,
-                    scale_dim=scale_dim,
-                    scale_type_size=scale_type_size,
-                    max_token_type_size=2,
-                    max_num_inp_token_per_rank=max_num_inp_token_per_rank,
-                    num_experts_per_rank=num_experts_per_rank,
-                    num_experts_per_token=num_experts_per_token,
-                    warp_num_per_block=16,
-                    block_num=80,
-                    use_external_inp_buf=not zero_copy,
-                    gpu_per_node=world_size,
-                    quant_type=quant_type,
-                )
-                comb_op = mori.ops.EpDispatchCombineOp(comb_config)
-                comb_benchmark = EpDispatchCombineBenchmark(comb_config)
-            else:
-                comb_op = op
-                comb_benchmark = benchmark
-
-            best_comb_bw = 0
-            best_comb_latency = float("inf")
-            best_comb_config = None
-
-            if rank == 0:
-                print(f"\n{'#' * 60}")
-                dtype_info = ""
-                if use_separate_combine_op:
-                    dtype_info = f", combine_dtype={combine_data_type}"
-                print(
-                    f"Phase 2: Tuning COMBINE (dispatch fixed at "
-                    f"block_num={best_disp_config[0]}, wpb={best_disp_config[1]}"
-                    f"{dtype_info})"
-                )
-                print(f"{'#' * 60}")
-
-            for block_num in comb_block_list:
-                for warp_per_block in warp_per_block_list:
-                    if rank == 0:
-                        print(f"\n{'=' * 60}")
-                        print(
-                            f"Combine: block_num={block_num}, warp_per_block={warp_per_block}"
-                        )
-                        print(f"{'=' * 60}")
-
-                    _, comb_bw, _, comb_lat = comb_benchmark.run(
-                        comb_op,
-                        dispatch_block_num=best_disp_config[0],
-                        dispatch_warp_per_block=best_disp_config[1],
                         combine_block_num=block_num,
                         combine_warp_per_block=warp_per_block,
                     )
 
+                    if disp_bw > best_disp_bw:
+                        best_disp_bw = disp_bw
+                        best_disp_config = (block_num, warp_per_block)
                     if comb_bw > best_comb_bw:
                         best_comb_bw = comb_bw
-                        best_comb_latency = comb_lat
                         best_comb_config = (block_num, warp_per_block)
+
+            # --- Extra dispatch sweep: over-subscribe, fix combine at best ---
+            if extra_disp_block_list:
+                if rank == 0:
+                    print(f"\n{'#' * 60}")
+                    print(
+                        f"Extra dispatch sweep "
+                        f"(combine fixed at block_num={best_comb_config[0]}, wpb={best_comb_config[1]})"
+                    )
+                    print(f"{'#' * 60}")
+
+                for block_num in extra_disp_block_list:
+                    for warp_per_block in warp_per_block_list:
+                        if rank == 0:
+                            print(f"\n{'=' * 60}")
+                            print(
+                                f"Dispatch: block_num={block_num}, warp_per_block={warp_per_block}"
+                            )
+                            print(f"{'=' * 60}")
+
+                        disp_bw, _, _, _ = benchmark.run(
+                            op,
+                            dispatch_block_num=block_num,
+                            dispatch_warp_per_block=warp_per_block,
+                            combine_block_num=best_comb_config[0],
+                            combine_warp_per_block=best_comb_config[1],
+                        )
+
+                        if disp_bw > best_disp_bw:
+                            best_disp_bw = disp_bw
+                            best_disp_config = (block_num, warp_per_block)
 
             if rank == 0:
                 print(f"\n{'=' * 60}")
@@ -781,17 +849,13 @@ def _bench_dispatch_combine(
                 disp_dtype_str = str(data_type).split(".")[-1]
                 comb_dtype_str = str(combine_data_type).split(".")[-1]
                 print(
-                    f"Best Dispatch  ({disp_dtype_str}): {best_disp_bw:.2f} GB/s, "
-                    f"latency={best_disp_latency} us "
+                    f"Best Dispatch  ({disp_dtype_str}): {best_disp_bw:.2f} GB/s "
                     f"at block_num={best_disp_config[0]}, warp_per_block={best_disp_config[1]}"
                 )
                 print(
-                    f"Best Combine   ({comb_dtype_str}, quant={quant_type}): {best_comb_bw:.2f} GB/s, "
-                    f"latency={best_comb_latency} us "
+                    f"Best Combine   ({comb_dtype_str}): {best_comb_bw:.2f} GB/s "
                     f"at block_num={best_comb_config[0]}, warp_per_block={best_comb_config[1]}"
                 )
-                total_latency = best_disp_latency + best_comb_latency
-                print(f"Total Dispatch+Combine latency: {total_latency} us")
                 print(f"{'=' * 60}")
 
         else:
@@ -813,12 +877,9 @@ def bench_dispatch_combine(
     num_experts_per_rank=32,
     num_experts_per_token=8,
     combine_data_type=None,
-    combine_hidden_dim=None,
 ):
     if combine_data_type is None:
         combine_data_type = dtype
-    if combine_hidden_dim is None:
-        combine_hidden_dim = hidden_dim
     port = get_free_port()
     torch.multiprocessing.spawn(
         _bench_dispatch_combine,
@@ -840,7 +901,6 @@ def bench_dispatch_combine(
             combine_block_num,
             combine_warp_per_block,
             combine_data_type,
-            combine_hidden_dim,
         ),
         nprocs=world_size,
         join=True,
@@ -960,16 +1020,8 @@ if __name__ == "__main__":
     combine_dtype = _DATA_TYPE_MAP[combine_dtype_str]
 
     base_hidden_dim = 7168
-    _fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
     dispatch_hidden_dim = (
-        base_hidden_dim // 2
-        if _fp4_dtype is not None and dispatch_dtype is _fp4_dtype
-        else base_hidden_dim
-    )
-    combine_hidden_dim = (
-        base_hidden_dim // 2
-        if _fp4_dtype is not None and combine_dtype is _fp4_dtype
-        else base_hidden_dim
+        base_hidden_dim // 2 if _is_fp4x2_dtype(dispatch_dtype) else base_hidden_dim
     )
 
     print(
@@ -1001,5 +1053,4 @@ if __name__ == "__main__":
         num_experts_per_rank=args.num_experts_per_rank,
         num_experts_per_token=args.num_experts_per_token,
         combine_data_type=combine_dtype,
-        combine_hidden_dim=combine_hidden_dim,
     )
