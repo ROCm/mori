@@ -103,9 +103,9 @@ __global__ void PipelinedAllReduceSdmaKernel(
   // =========================================================================
   if constexpr (SCATTER_MODE == 0) {
 
-    if (numQ < 3) {
+    if (numQ < 2) {
       if (threadIdx.x == 0 && blockIdx.x == 0) {
-        printf("PE %d: pipelined SDMA needs sdmaNumQueue>=3 (got %u)\n",
+        printf("PE %d: pipelined SDMA needs sdmaNumQueue>=2 (got %u)\n",
                myPe, numQ);
       }
       return;
