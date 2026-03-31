@@ -711,7 +711,7 @@ __forceinline__ __device__ void CombineIntraNodeTyped(EpDispatchCombineArgs<T>& 
   float** srcWeightsPtr = reinterpret_cast<float**>(sharedMem) +
                           warpNum * config.numExpertPerToken + warpId * config.numExpertPerToken;
   uint8_t* stagingPtr = args.interNodeV1TokBufs.staging->template GetAs<uint8_t*>() +
-                        (nNodes + myNode) * config.MaxNumTokensToRecvPerRank() * tokCombXferBytes;
+                        SendBufSlotOffset(config, nNodes + myNode, 0) * tokCombXferBytes;
 
   int tokenPerBlock = (args.curRankNumToken + xgmiBlockNum - 1) / xgmiBlockNum;
   int startTokenIdx = (blockId - blockOffset) * tokenPerBlock;
@@ -758,7 +758,7 @@ __forceinline__ __device__ void CombineIntraNodeLLTyped(EpDispatchCombineArgs<T>
   float** srcWeightsPtr = reinterpret_cast<float**>(sharedMem) +
                           warpNum * config.numExpertPerToken + warpId * config.numExpertPerToken;
   uint8_t* stagingPtr = args.interNodeV1TokBufs.staging->template GetAs<uint8_t*>() +
-                        (nNodes + myNode) * config.MaxNumTokensToRecvPerRank() * tokCombXferBytes;
+                        SendBufSlotOffset(config, nNodes + myNode, 0) * tokCombXferBytes;
 
   index_t warpsPerToken = (xgmiWarpNum + args.curRankNumToken - 1) / args.curRankNumToken;
   index_t hiddenDimPerWarp = (config.hiddenDim + warpsPerToken - 1) / warpsPerToken;
@@ -913,10 +913,9 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs<T>& 
               int qpId = k % config.numQpPerPe;
               shmem::ShmemPutTypeNbiWarp<uint8_t>(
                   args.interNodeV1TokBufs.staging,
-                  ((myNode + nNodes) * config.MaxNumTokensToRecvPerRank() + startTokenIdx) *
-                      tokCombXferBytes,
+                  SendBufSlotOffset(config, myNode + nNodes, startTokenIdx) * tokCombXferBytes,
                   args.interNodeV1TokBufs.staging,
-                  (node * config.MaxNumTokensToRecvPerRank() + startTokenIdx) * tokCombXferBytes,
+                  SendBufSlotOffset(config, node, startTokenIdx) * tokCombXferBytes,
                   thisChunkTokenNum * tokCombXferBytes, proxyPe, qpId);
             }
           }
@@ -1056,10 +1055,9 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs<T>
         int qpId = k % config.numQpPerPe;
         shmem::ShmemPutTypeNbiWarp<uint8_t>(
             args.interNodeV1TokBufs.staging,
-            ((myNode + nNodes) * config.MaxNumTokensToRecvPerRank() + startTokenIdx) *
-                tokCombXferBytes,
+            SendBufSlotOffset(config, myNode + nNodes, startTokenIdx) * tokCombXferBytes,
             args.interNodeV1TokBufs.staging,
-            (node * config.MaxNumTokensToRecvPerRank() + startTokenIdx) * tokCombXferBytes,
+            SendBufSlotOffset(config, node, startTokenIdx) * tokCombXferBytes,
             thisChunkTokenNum * tokCombXferBytes, proxyPe, qpId);
       }
     }
@@ -1203,7 +1201,7 @@ __forceinline__ __device__ void EpCombineAllInternalFp8(EpDispatchCombineArgs<T>
   float** srcWeightsPtrs = reinterpret_cast<float**>(sharedMem) +
                            warpNum * config.numExpertPerToken + warpId * config.numExpertPerToken;
   uint8_t* stagingPtr = args.interNodeV1TokBufs.staging->template GetAs<uint8_t*>() +
-                        nNodes * config.MaxNumTokensToRecvPerRank() * fp8CombXferBytes;
+                        SendBufSlotOffset(config, nNodes, 0) * fp8CombXferBytes;
 
   index_t warpsPerToken = (globalWarpNum + args.curRankNumToken - 1) / args.curRankNumToken;
   index_t hiddenDimPerWarp = (config.hiddenDim + warpsPerToken - 1) / warpsPerToken;
@@ -1229,8 +1227,7 @@ __forceinline__ __device__ void EpCombineAllInternalFp8(EpDispatchCombineArgs<T>
     for (int n = 0; n < nNodes; n++) {
       if (__any(laneNode == n) && (laneId == 0)) {
         int mappedId = (n == myNode) ? tokenId : args.interNodeDispSendMap[nNodes * tokenId + n];
-        uint8_t* base =
-            stagingPtr + (n * config.MaxNumTokensToRecvPerRank() + mappedId) * fp8CombXferBytes;
+        uint8_t* base = stagingPtr + SendBufSlotOffset(config, n, mappedId) * fp8CombXferBytes;
         srcPtrs[n] = reinterpret_cast<Fp8T*>(base) + hiddenDimOffset;
         srcWeightsPtrs[n] = reinterpret_cast<float*>(base + fp8HiddenBytes);
       }
@@ -1258,7 +1255,7 @@ __forceinline__ __device__ void EpCombineAllGeneric(EpDispatchCombineArgs<T>& ar
   float** srcWeightsPtrs = reinterpret_cast<float**>(sharedMem) +
                            warpNum * config.numExpertPerToken + warpId * config.numExpertPerToken;
   uint8_t* stagingPtr = args.interNodeV1TokBufs.staging->template GetAs<uint8_t*>() +
-                        nNodes * config.MaxNumTokensToRecvPerRank() * combXferBytes;
+                        SendBufSlotOffset(config, nNodes, 0) * combXferBytes;
 
   index_t warpsPerToken = (globalWarpNum + args.curRankNumToken - 1) / args.curRankNumToken;
   index_t hiddenDimPerWarp = (config.hiddenDim + warpsPerToken - 1) / warpsPerToken;
@@ -1284,8 +1281,7 @@ __forceinline__ __device__ void EpCombineAllGeneric(EpDispatchCombineArgs<T>& ar
     for (int n = 0; n < nNodes; n++) {
       if (__any(laneNode == n) && (laneId == 0)) {
         int mappedId = (n == myNode) ? tokenId : args.interNodeDispSendMap[nNodes * tokenId + n];
-        uint8_t* base =
-            stagingPtr + (n * config.MaxNumTokensToRecvPerRank() + mappedId) * combXferBytes;
+        uint8_t* base = stagingPtr + SendBufSlotOffset(config, n, mappedId) * combXferBytes;
         srcPtrs[n] = reinterpret_cast<T*>(base) + hiddenDimOffset;
         srcWeightsPtrs[n] = reinterpret_cast<float*>(base + hiddenBytes);
       }
