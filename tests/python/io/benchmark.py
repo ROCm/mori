@@ -130,9 +130,9 @@ def parse_args():
         help="Whether to enable batch APIs, default: False",
     )
     parser.add_argument(
-        "--batch-non-contiguous",
+        "--batch-contiguous",
         action="store_true",
-        help="Use strided offsets so each transfer is a separate WR (no merging). Use with --max-send-wr to stress SQ / reproduce ENOMEM on notify.",
+        help="Use contiguous offsets so transfers may be merged. Default is non-contiguous (strided offsets, each transfer is a separate WR). Don't enable this when stress SQ / reproduce ENOMEM on notify due to merged wr",
     )
     parser.add_argument(
         "--enable-sess",
@@ -218,7 +218,7 @@ class MoriIoBenchmark:
         buffer_size: int,
         transfer_batch_size: int,
         enable_batch_transfer: bool = False,
-        batch_non_contiguous: bool = False,
+        batch_contiguous: bool = False,
         enable_sess: bool = False,
         iters: int = 128,
         sweep: bool = False,
@@ -248,7 +248,7 @@ class MoriIoBenchmark:
         self.buffer_size = buffer_size
         self.transfer_batch_size = transfer_batch_size
         self.enable_batch_transfer = enable_batch_transfer
-        self.batch_non_contiguous = batch_non_contiguous
+        self.batch_contiguous = batch_contiguous
         self.enable_sess = enable_sess
         self.iters = iters
         self.sweep = sweep
@@ -302,10 +302,10 @@ class MoriIoBenchmark:
             self.role = EngineRole.TARGET
 
         self.device = torch.device("cuda", self.role_rank)
-        # When batch_non_contiguous, use strided offsets so buffer must fit (buffer_size+1)*transfer_batch_size
+        # When not batch_contiguous, use strided offsets so buffer must fit (buffer_size+1)*transfer_batch_size
         total_elements = (
             (self.buffer_size + 1) * self.transfer_batch_size
-            if self.batch_non_contiguous
+            if not self.batch_contiguous
             else self.buffer_size * self.transfer_batch_size
         )
         self.tensor = torch.randn(total_elements).to(
@@ -369,7 +369,7 @@ class MoriIoBenchmark:
         print(f"  buffer_size: {self.buffer_size} B")
         print(f"  transfer_batch_size: {self.transfer_batch_size}")
         print(f"  enable_batch_transfer: {self.enable_batch_transfer}")
-        print(f"  batch_non_contiguous: {self.batch_non_contiguous}")
+        print(f"  batch_contiguous: {self.batch_contiguous}")
         print(f"  enable_sess: {self.enable_sess}")
         print(f"  iters: {self.iters}")
         print()
@@ -402,7 +402,7 @@ class MoriIoBenchmark:
                 dtype=torch.uint8,
             )
             dist.recv(recv_tensor, src=self.num_initiator_dev + self.role_rank)
-            if self.batch_non_contiguous:
+            if not self.batch_contiguous:
                 # Received data is packed (contiguous); compare to packed view of self.tensor
                 stride = self.buffer_size + 1
                 expected = torch.empty(
@@ -421,9 +421,9 @@ class MoriIoBenchmark:
                 expected = self.tensor.view(torch.uint8)
                 assert torch.equal(recv_tensor, expected)
         else:
-            # With batch_non_contiguous, tensor has (buffer_size+1)*transfer_batch_size
+            # Without batch_contiguous, tensor has (buffer_size+1)*transfer_batch_size
             # elements; Gloo send size must match initiator recv (buffer_size*transfer_batch_size).
-            if self.batch_non_contiguous:
+            if not self.batch_contiguous:
                 stride = self.buffer_size + 1
                 packed = torch.empty(
                     self.buffer_size * self.transfer_batch_size,
@@ -633,7 +633,7 @@ class MoriIoBenchmark:
             return 0
 
         # Strided offsets prevent merging: each transfer becomes a separate WR (to stress SQ / reproduce notify ENOMEM)
-        if self.batch_non_contiguous:
+        if not self.batch_contiguous:
             stride = buffer_size + 1  # 1-element gap so remote/local are not contiguous
             offsets = [i * stride for i in range(transfer_batch_size)]
         else:
@@ -907,7 +907,7 @@ def benchmark_engine(local_rank, node_rank, args):
         buffer_size=max_buffer_size,
         transfer_batch_size=max_transfer_batch_size,
         enable_batch_transfer=args.enable_batch_transfer,
-        batch_non_contiguous=args.batch_non_contiguous,
+        batch_contiguous=args.batch_contiguous,
         enable_sess=args.enable_sess,
         iters=args.iters,
         sweep=args.all,
