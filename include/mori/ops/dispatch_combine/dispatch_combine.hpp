@@ -130,6 +130,27 @@ struct EpDispatchCombineConfig {
 
   std::vector<int32_t> ToPackedI32Array() const;
   static EpDispatchCombineConfig FromPackedI32Array(const int32_t* packed, size_t size);
+  inline __host__ __device__ size_t HiddenBytes(size_t tokenTypeSize) const {
+    return tokenTypeSize * hiddenDim;
+  }
+  inline __host__ __device__ size_t MaxHiddenBytes() const { return HiddenBytes(maxTokenTypeSize); }
+
+  inline __host__ __device__ size_t IndexBytes() const {
+    return numExpertPerToken * sizeof(index_t);
+  }
+  inline __host__ __device__ size_t WeightBytes() const {
+    return numExpertPerToken * sizeof(float);
+  }
+  inline __host__ __device__ size_t SrcTokenIdBytes() const { return sizeof(index_t); }
+  inline __host__ __device__ size_t ScaleBytes() const { return scaleDim * scaleTypeSize; }
+
+  inline __host__ __device__ size_t XferBytesPerToken(size_t tokenTypeSize) const {
+    return HiddenBytes(tokenTypeSize) + IndexBytes() + WeightBytes() + SrcTokenIdBytes() +
+           ScaleBytes();
+  }
+  inline __host__ __device__ size_t MaxXferBytesPerToken() const {
+    return XferBytesPerToken(maxTokenTypeSize);
+  }
 };
 
 // Per-kernel-type token buffer groups.

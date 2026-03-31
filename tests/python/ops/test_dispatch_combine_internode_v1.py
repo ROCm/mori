@@ -32,8 +32,24 @@ from tests.python.ops.dispatch_combine_test_utils import (
 
 os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "6G")
 
+# Kernel-type string → (EpDispatchCombineKernelType, block_num, rdma_block_num, warp_num_per_block)
+_KERNEL_CONFIGS = {
+    "internode_v1": (
+        mori.ops.EpDispatchCombineKernelType.InterNodeV1,
+        96,  # block_num
+        64,  # rdma_block_num
+        8,  # warp_num_per_block
+    ),
+    "internode_v1_ll": (
+        mori.ops.EpDispatchCombineKernelType.InterNodeV1LL,
+        256,  # block_num
+        128,  # rdma_block_num
+        8,  # warp_num_per_block
+    ),
+}
 
-class InterNodeDispatchCombineTestCase(EpDispatchCombineTestCase):
+
+class InterNodeV1DispatchCombineTestCase(EpDispatchCombineTestCase):
     def run_test_once(self, op, test_data):
         (
             _,
@@ -45,7 +61,7 @@ class InterNodeDispatchCombineTestCase(EpDispatchCombineTestCase):
         (
             dispatch_output,
             dispatch_weights,
-            _,
+            dispatch_scales,
             dispatch_indices,
             dispatch_recv_num_token,
         ) = op.dispatch(
@@ -54,16 +70,22 @@ class InterNodeDispatchCombineTestCase(EpDispatchCombineTestCase):
             all_rank_scales[self.config.rank],
             all_rank_indices[self.config.rank],
         )
-
-        recv_num_token = dispatch_recv_num_token.item()
-        max_expert_idx = dispatch_indices[:recv_num_token].max().item()
-        num_experts = self.config.num_experts_per_rank * self.config.world_size
-        if max_expert_idx >= num_experts:
-            print(f"Invalid expert id: {max_expert_idx}")
-            assert False
-
-        op.combine(dispatch_output, dispatch_weights, dispatch_indices, call_reset=True)
         self.sync()
+        self.check_dispatch_result(
+            op,
+            test_data,
+            dispatch_output,
+            dispatch_weights,
+            dispatch_scales,
+            dispatch_indices,
+            dispatch_recv_num_token,
+        )
+
+        combine_output, combine_output_weight = op.combine(
+            dispatch_output, dispatch_weights, dispatch_indices, call_reset=False
+        )
+        self.sync()
+        self.check_combine_result(op, test_data, combine_output, combine_output_weight)
 
 
 @pytest.fixture(scope="session")
@@ -76,6 +98,7 @@ def torch_dist_process_manager():
 def _test_dispatch_combine(
     rank,
     world_size,
+    kernel_type_str,
     data_type,
     hidden_dim,
     scale_dim,
@@ -83,7 +106,11 @@ def _test_dispatch_combine(
     max_num_inp_token_per_rank,
     num_experts_per_rank,
     num_experts_per_token,
+    gpu_per_node,
 ):
+    kernel_type, block_num, rdma_block_num, warp_num_per_block = _KERNEL_CONFIGS[
+        kernel_type_str
+    ]
     config = mori.ops.EpDispatchCombineConfig(
         data_type=data_type,
         rank=rank,
@@ -95,32 +122,35 @@ def _test_dispatch_combine(
         num_experts_per_rank=num_experts_per_rank,
         num_experts_per_token=num_experts_per_token,
         max_token_type_size=2,
-        block_num=16,
-        warp_num_per_block=16,
-        kernel_type=mori.ops.EpDispatchCombineKernelType.InterNode,
+        block_num=block_num,
+        rdma_block_num=rdma_block_num,
+        warp_num_per_block=warp_num_per_block,
+        kernel_type=kernel_type,
+        gpu_per_node=gpu_per_node,
     )
     op = mori.ops.EpDispatchCombineOp(config)
-    test_case = InterNodeDispatchCombineTestCase(config)
+    test_case = InterNodeV1DispatchCombineTestCase(config)
     test_data = test_case.gen_test_data(use_max_token_num=True)
-    num_reps = 128
-    for idx in range(num_reps):
-        test_case.run_test_once(op, test_data)
-        if rank == 0:
-            print(f"Passed {idx}/{num_reps}")
+    test_case.run_test_once(op, test_data)
 
 
-# TODO: create a sub process group so that we can test worlds size < 8
+# TODO: create a sub process group so that we can test world size < 8
 @pytest.mark.parametrize("world_size", (8,))
+@pytest.mark.parametrize("kernel_type", ("internode_v1", "internode_v1_ll"))
 @pytest.mark.parametrize("data_type", _all_data_types())
-@pytest.mark.parametrize("hidden_dim", (7168,))
-@pytest.mark.parametrize("scale_dim", (56,))
-@pytest.mark.parametrize("scale_type_size", (4,))
-@pytest.mark.parametrize("max_num_inp_token_per_rank", (4096,))
+@pytest.mark.parametrize("hidden_dim", (7168, 4096))
+@pytest.mark.parametrize("scale_dim", (0, 56))
+@pytest.mark.parametrize("scale_type_size", (1, 4))
+@pytest.mark.parametrize("max_num_inp_token_per_rank", (32, 128))
 @pytest.mark.parametrize("num_experts_per_rank", (32,))
 @pytest.mark.parametrize("num_experts_per_token", (8,))
+# gpu_per_node=8: 1 node × 8 GPUs (exercises intranode paths within the kernels)
+# gpu_per_node=4: 2 nodes × 4 GPUs (exercises actual internode/RDMA paths)
+@pytest.mark.parametrize("gpu_per_node", (8,))
 def test_dispatch_combine(
     torch_dist_process_manager,
     world_size,
+    kernel_type,
     data_type,
     hidden_dim,
     scale_dim,
@@ -128,6 +158,7 @@ def test_dispatch_combine(
     max_num_inp_token_per_rank,
     num_experts_per_rank,
     num_experts_per_token,
+    gpu_per_node,
 ):
     for _ in range(world_size):
         torch_dist_process_manager.task_queue.put(
@@ -135,6 +166,7 @@ def test_dispatch_combine(
                 _test_dispatch_combine,
                 [
                     world_size,
+                    kernel_type,
                     data_type,
                     hidden_dim,
                     scale_dim,
@@ -142,6 +174,7 @@ def test_dispatch_combine(
                     max_num_inp_token_per_rank,
                     num_experts_per_rank,
                     num_experts_per_token,
+                    gpu_per_node,
                 ],
             )
         )

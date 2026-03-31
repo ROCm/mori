@@ -156,10 +156,8 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
                           config.hiddenDim * config.maxTokenTypeSize;
   size_t dispatchOutSize = static_cast<ssize_t>(config.MaxNumTokensToRecv()) * config.hiddenDim *
                            config.maxTokenTypeSize;
-  size_t maxStagingSize = static_cast<ssize_t>(config.MaxNumTokensToRecv()) *
-                          (config.hiddenDim * config.maxTokenTypeSize +
-                           (sizeof(float) + sizeof(index_t)) * config.numExpertPerToken +
-                           config.scaleDim * config.scaleTypeSize);
+  size_t maxStagingSize =
+      static_cast<ssize_t>(config.MaxNumTokensToRecv()) * config.MaxXferBytesPerToken();
 
   if (config.kernelType == KernelType::IntraNode) {
     auto& bufs = shmemTokBufs.emplace<ShmemBufsIntraNode>();
@@ -169,7 +167,9 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
   } else if (config.kernelType == KernelType::InterNodeV1 ||
              config.kernelType == KernelType::InterNodeV1LL) {
     auto& bufs = shmemTokBufs.emplace<ShmemBufsInterNodeV1>();
-    bufs.dispatchInp = ShmemMallocAndReturnMemObjPtr(maxStagingSize, hipDeviceMallocUncached);
+    size_t dispatchInpSize = static_cast<ssize_t>(config.worldSize / config.gpuPerNode) *
+                             config.MaxNumTokensToSendPerRank() * config.MaxXferBytesPerToken();
+    bufs.dispatchInp = ShmemMallocAndReturnMemObjPtr(dispatchInpSize, hipDeviceMallocUncached);
     bufs.combineInp = ShmemMallocAndReturnMemObjPtr(maxStagingSize, hipDeviceMallocUncached);
     bufs.staging = ShmemMallocAndReturnMemObjPtr(maxStagingSize, hipDeviceMallocUncached);
     bufs.dispatchOut = ShmemMallocAndReturnMemObjPtr(dispatchOutSize, hipDeviceMallocUncached);

@@ -188,7 +188,7 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
               }
             }
           }
-          size_t remoteIdx = (myNode * config.MaxNumTokensToRecvPerRank() + destTokId);
+          size_t remoteIdx = SendBufSlotOffset(config, myNode, destTokId);
           if (count > 0) {
             size_t stagingTokOffset = tokenId * xferBytes;
             int qpId = (tokenId / warpSize) % config.numQpPerPe;
@@ -223,7 +223,7 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
         index_t destTokIdOffset = flagSlotId * warpSize;
         index_t destTokId = destTokIdOffset + laneId;
 
-        size_t remoteIdx = (myNode * config.MaxNumTokensToRecvPerRank() + destTokId);
+        size_t remoteIdx = SendBufSlotOffset(config, myNode, destTokId);
         if (laneId == 0) {
           index_t tokenNum = std::min(tokenId + warpSize, endTokenIdx) - tokenId;
           size_t stagingTokOffset = tokenId * xferBytes;
@@ -292,7 +292,7 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs<T>& args) {
       index_t destTokIdOffset = flagSlotId * warpSize;
       index_t destTokId = destTokIdOffset + laneId;
 
-      size_t remoteIdx = (myNode * config.MaxNumTokensToRecvPerRank() + destTokId);
+      size_t remoteIdx = SendBufSlotOffset(config, myNode, destTokId);
       if (laneId == 0) {
         index_t tokenNum = std::min(tokenId + warpSize, chunkEndTokenIdx) - tokenId;
         size_t stagingTokOffset = tokenId * xferBytes;
@@ -369,7 +369,7 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
 
     for (int j = startTokenIdx + (blockId % numRecvBlock) * warpNum + warpId; j < endTokenIdx;
          j += numRecvBlock * warpNum) {
-      int tokIdx = node * config.MaxNumTokensToRecvPerRank() + j;
+      int tokIdx = SendBufSlotOffset(config, node, j);
       index_t* indices = reinterpret_cast<index_t*>(stagingPtr + tokIdx * xferBytes + hiddenBytes);
       int lanePe = -1;
       if (laneId < config.numExpertPerToken) {
@@ -470,7 +470,7 @@ inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs<T>& args) {
     int endTokenIdx = startTokenIdx + thisChunkTokenNum;
     if (tokenId >= endTokenIdx) continue;
 
-    int globalTokenId = node * config.MaxNumTokensToRecvPerRank() + tokenId;
+    int globalTokenId = SendBufSlotOffset(config, node, tokenId);
     index_t* indices =
         reinterpret_cast<index_t*>(stagingPtr + globalTokenId * xferBytes + hiddenBytes);
     int lanePe = -1;
@@ -863,7 +863,7 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs<T>& 
 
             for (int j = startTokenIdx + (bid % numRecvBlock) * warpNum + warpId; j < endTokenIdx;
                  j += numRecvBlock * warpNum) {
-              int tokIdx = node * config.MaxNumTokensToRecvPerRank() + j;
+              int tokIdx = SendBufSlotOffset(config, node, j);
 
               if (laneId < config.numExpertPerToken) {
                 srcPtrs[laneId] = nullptr;
@@ -1012,7 +1012,7 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs<T>
         int hiddenDimSize =
             std::max(0, std::min(config.hiddenDim - hiddenDimOffset, hiddenDimPerWarp));
 
-        int globalTokenId = node * config.MaxNumTokensToRecvPerRank() + tokenId;
+        int globalTokenId = SendBufSlotOffset(config, node, tokenId);
         if (laneId < config.numExpertPerToken) {
           srcPtrs[laneId] = nullptr;
           srcWeightsPtr[laneId] = nullptr;
