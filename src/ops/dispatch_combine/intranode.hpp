@@ -53,7 +53,7 @@ inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T
   if (globalThdId < args.config.worldSize) {
     // Set remote flag after all copies are done
     shmem::ShmemUint32WaitUntilEquals(args.combineGridBarrier, gridDim.x);
-    args.combineGridBarrier[0] = 0;
+    __hip_atomic_store(args.combineGridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 
     __threadfence_system();
     core::AtomicStoreRelaxedSystem(
@@ -165,7 +165,7 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
     for (int destPe = laneId; destPe < npes; destPe += warpSize) {
       // Wait until all tokens are sent
       shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, gridDim.x);
-      args.dispatchGridBarrier[0] = 0;
+      __hip_atomic_store(args.dispatchGridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 
       // Add 1 so that when token number == 0, receiver side still know the signal is sent
       index_t numTokenSignal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe) + 1;
