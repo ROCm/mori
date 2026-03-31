@@ -5,20 +5,21 @@
 //
 // SCATTER_MODE=0: Single-kernel AllReduce (SDMA scatter + reduce + SDMA AG)
 //   1-chunk mode (shard < 2×kMinChunkShardBytes):
-//     Block 0: burst scatter → cc wait → SDMA AG push → AG wait.
-//     Compute blocks: scatter-poll → reduce → wbl2+fence → chunks_complete.
-//     No signal/barrier zeroing: monotonic ATOMIC_INC + baseline protocol.
+//     Block 0: read baselines → broadcast → burst scatter → cc wait → AG → AG wait.
+//     Compute blocks: wait broadcast → scatter-poll → reduce → wbl2+fence → cc.
 //   Multi-chunk mode (shard ≥ 2×kMinChunkShardBytes, default 2 chunks):
-//     Block 0: burst scatter → per-chunk (cc wait → SDMA AG push) → AG wait.
-//     Compute blocks: scatter-poll → reduce → wbl2+fence → chunks_complete.
+//     Block 0: read baselines → broadcast → burst scatter → per-chunk (cc→AG) → AG wait.
+//     Compute blocks: wait broadcast → scatter-poll → reduce → wbl2+fence → cc.
 //     Overlaps AG(c) SDMA transfer with scatter(c+1)+reduce(c+1) on CU.
 //     wbl2+CC for intermediate chunks runs on wavefront 1 (thread 64),
 //     parallel with scatter-poll on wavefront 0.
 //
 // SCATTER_MODE=1: P2P read + CU AG (legacy path).
 //
-// scatterBase / agBase: host-provided baselines for signalPtrs polling,
-// eliminating the kernel-side race condition and broadcast overhead.
+// Baseline protocol: Block 0 reads expectSignalsPtr once (before SdmaPutThread
+// modifies it), stores to barrier->scatter_base/ag_base with device-scope
+// release, then compute blocks acquire-poll barrier->ag_sync.  One-time
+// broadcast at kernel start, ~100ns overhead.
 //
 #pragma once
 
@@ -48,9 +49,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
     CrossPeBarrier* __restrict__ barrier,
     const application::SymmMemObjPtr inputSymmObj,
     size_t elementCount,
-    size_t chunkElementCount,
-    uint64_t scatterBase,
-    uint64_t agBase) {
+    size_t chunkElementCount) {
 
   if (elementCount == 0 || npes <= 0) return;
 
@@ -87,7 +86,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
   __syncthreads();
 
   // =========================================================================
-  // SCATTER_MODE = 0 — Single-buffer SDMA + host-baseline direct polling
+  // SCATTER_MODE = 0 — Single-buffer SDMA + kernel-side baseline broadcast
   // =========================================================================
   if constexpr (SCATTER_MODE == 0) {
 
@@ -101,13 +100,19 @@ __global__ void PipelinedAllReduceSdmaKernel(
 
     if (blockIdx.x != 0) {
       // =================================================================
-      // COMPUTE BLOCKS (1..N): scatter-poll → reduce → cc
-      //
-      // Each compute block directly polls signalPtrs for scatter arrival
-      // using the host-provided scatterBase.  This avoids both the race
-      // condition (baselines are immutable kernel args) and the broadcast
-      // overhead (no block-0 mediation).
+      // COMPUTE BLOCKS (1..N): wait baseline → scatter-poll → reduce → cc
       // =================================================================
+      __shared__ uint64_t s_scatter_base;
+
+      if (threadIdx.x == 0) {
+        while (__scoped_atomic_load_n(
+                   &barrier->ag_sync, __ATOMIC_ACQUIRE,
+                   __MEMORY_SCOPE_DEVICE) == 0u)
+          ;
+        s_scatter_base = barrier->scatter_base;
+      }
+      __syncthreads();
+
       const size_t compTid =
           static_cast<size_t>(blockIdx.x - 1) * static_cast<size_t>(blockDim.x)
           + threadIdx.x;
@@ -132,7 +137,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
             HSAuint64* sig = dstMemObj->signalPtrs
                 + static_cast<size_t>(s) * numQ;
             const uint64_t expected =
-                scatterBase + static_cast<uint64_t>(c + 1);
+                s_scatter_base + static_cast<uint64_t>(c + 1);
             while (core::AtomicLoadRelaxed(sig) < expected)
               ;
           }
@@ -197,14 +202,29 @@ __global__ void PipelinedAllReduceSdmaKernel(
 
     } else {
       // =================================================================
-      // BLOCK 0 — Scatter burst + cc wait + AG + AG wait
-      //
-      // Phase 1: burst-submit ALL scatter packets to SDMA queues.
-      // Phase 2: per-chunk cc wait → SDMA AG push.
-      // Phase 3: final AG signal wait.
+      // BLOCK 0 — Read baselines → broadcast → scatter → cc wait → AG
       // =================================================================
       const int thr = static_cast<int>(threadIdx.x);
       const uint32_t ccBase = s_cc_base;
+
+      __shared__ uint64_t s_ag_base;
+
+      // ---- Read baselines and broadcast to compute blocks ----
+      if (thr == 0) {
+        const int refPe = (myPe == 0) ? 1 : 0;
+        const size_t refOff = static_cast<size_t>(refPe) * numQ;
+
+        uint64_t sb = dstMemObj->expectSignalsPtr[refOff + 0];
+        uint64_t ab = dstMemObj->expectSignalsPtr[refOff + 1];
+        s_ag_base = ab;
+
+        barrier->scatter_base = sb;
+        barrier->ag_base = ab;
+        __threadfence();
+        __scoped_atomic_store_n(&barrier->ag_sync, 1u,
+                                __ATOMIC_RELEASE, __MEMORY_SCOPE_DEVICE);
+      }
+      __syncthreads();
 
       // ---- Phase 1: burst scatter (all chunks, all peers) ----
       if (thr < npes && thr != myPe) {
@@ -292,7 +312,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
       if (thr < npes && thr != myPe) {
         const int sender = thr;
         const uint64_t expected =
-            agBase + static_cast<uint64_t>(numChunks);
+            s_ag_base + static_cast<uint64_t>(numChunks);
         HSAuint64* sig = dstMemObj->signalPtrs
             + static_cast<size_t>(sender) * numQ + 1;
         while (core::AtomicLoadRelaxed(sig) < expected)

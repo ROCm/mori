@@ -51,6 +51,8 @@ struct alignas(128) CrossPeBarrier {
   alignas(128) uint32_t flag;
   uint32_t ag_sync;
   uint32_t chunks_complete;
+  uint64_t scatter_base;
+  uint64_t ag_base;
 };
 
 inline int getDeviceMaxBlocks() {
