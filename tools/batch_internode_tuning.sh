@@ -192,6 +192,8 @@ build_torchrun_cmd() {
 COMBO_IDX=0
 FAILED=0
 
+HUNG_COMBOS=""
+
 for HIDDEN_DIM in "${HIDDEN_DIM_ARRAY[@]}"; do
     for TOKENS in "${TOKEN_ARRAY[@]}"; do
         COMBO_IDX=$((COMBO_IDX + 1))
@@ -207,37 +209,44 @@ for HIDDEN_DIM in "${HIDDEN_DIM_ARRAY[@]}"; do
         CMD_RANK0=$(build_torchrun_cmd 0 "$REPO_ROOT" "$PY_ARGS_RANK0")
         CMD_RANK1=$(build_torchrun_cmd 1 "$REMOTE_REPO_ROOT" "$PY_ARGS_RANK1")
 
+        REPRO_RANK0="HSA_NO_SCRATCH_RECLAIM=1 $CMD_RANK0"
+        REPRO_RANK1="HSA_NO_SCRATCH_RECLAIM=1 $CMD_RANK1"
+
         # Launch peer (rank 1) via SSH in background
         ssh "$PEER_HOST" "bash -lc '$CMD_RANK1'" &
         PEER_PID=$!
 
-        # Launch local (rank 0) in background
-        bash -c "$CMD_RANK0" &
-        LOCAL_PID=$!
+        # Launch local (rank 0) with timeout
+        timeout "$TIMEOUT_SEC" bash -c "$CMD_RANK0"
+        EXIT_CODE=$?
 
-        # Wait with timeout
-        WAIT_OK=true
-        if ! timeout "$TIMEOUT_SEC" bash -c "wait $LOCAL_PID" 2>/dev/null; then
-            echo "ERROR: rank 0 timed out or failed for tokens=$TOKENS, hidden_dim=$HIDDEN_DIM"
-            kill "$LOCAL_PID" 2>/dev/null || true
-            kill "$PEER_PID" 2>/dev/null || true
-            ssh "$PEER_HOST" "pkill -f 'torchrun.*test_dispatch_combine_internode'" 2>/dev/null || true
-            WAIT_OK=false
-        fi
-
-        # Also wait for peer to finish
-        wait "$PEER_PID" 2>/dev/null || true
-
-        if $WAIT_OK; then
-            echo "[$(date)] Completed [$COMBO_IDX/$TOTAL_COMBOS]"
-        else
+        if [[ $EXIT_CODE -eq 124 ]]; then
             FAILED=$((FAILED + 1))
-            echo "[$(date)] FAILED [$COMBO_IDX/$TOTAL_COMBOS]"
+            HUNG_COMBOS="${HUNG_COMBOS}\n  hidden_dim=$HIDDEN_DIM, max_tokens=$TOKENS"
+            echo ""
+            echo "!!! TIMEOUT (${TIMEOUT_SEC}s): hidden_dim=$HIDDEN_DIM, max_tokens=$TOKENS — possible kernel hang !!!"
+            echo "!!! Reproduce rank 0: $REPRO_RANK0 !!!"
+            echo "!!! Reproduce rank 1 (on $PEER_HOST): $REPRO_RANK1 !!!"
+            echo ""
+        elif [[ $EXIT_CODE -ne 0 ]]; then
+            FAILED=$((FAILED + 1))
+            echo ""
+            echo "!!! FAILED (exit $EXIT_CODE): hidden_dim=$HIDDEN_DIM, max_tokens=$TOKENS !!!"
+            echo "!!! Reproduce rank 0: $REPRO_RANK0 !!!"
+            echo "!!! Reproduce rank 1 (on $PEER_HOST): $REPRO_RANK1 !!!"
+            echo ""
+        else
+            echo "[$(date)] Completed [$COMBO_IDX/$TOTAL_COMBOS]"
         fi
 
-        # Brief pause between runs for cleanup
-        sleep 2
+        # Clean up peer: kill SSH process, then remote torchrun if still alive
+        kill "$PEER_PID" 2>/dev/null || true
+        wait "$PEER_PID" 2>/dev/null || true
+        if [[ $EXIT_CODE -ne 0 ]]; then
+            ssh "$PEER_HOST" "pkill -f 'torchrun.*test_dispatch_combine_internode'" 2>/dev/null || true
+        fi
 
+        sleep 2
     done
 done
 
@@ -246,6 +255,9 @@ echo "============================================================"
 echo "Batch internode tuning complete"
 echo "  Total:    $TOTAL_COMBOS"
 echo "  Failed:   $FAILED"
+if [[ -n "$HUNG_COMBOS" ]]; then
+    echo -e "  Hung:$HUNG_COMBOS"
+fi
 echo "  Config:   $CONFIG_OUTPUT"
 echo "  Log:      $LOG_FILE"
 echo "============================================================"

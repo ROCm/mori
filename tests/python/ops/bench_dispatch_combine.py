@@ -266,6 +266,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         combine_block_num,
         combine_warp_per_block,
         graph_replay_iters=10,
+        skip_e2e=False,
     ):
         (
             _,
@@ -302,10 +303,8 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
 
         is_cross_type = self.combine_data_type != self.config.data_type
 
-        # e2e graph not supported for cross-type (graph capture cannot
-        # allocate memory for type conversion).
         e2e_graph = None
-        if not is_cross_type:
+        if not skip_e2e and not is_cross_type:
             e2e_graph = self._capture_e2e_graph(
                 op,
                 test_data,
@@ -410,6 +409,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         warmup=1,
         iters=10,
         graph_replay_iters=10,
+        skip_e2e=False,
     ):
         test_data = self.gen_test_data()
         for _ in range(warmup):
@@ -451,6 +451,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
                 combine_block_num,
                 combine_warp_per_block,
                 graph_replay_iters=graph_replay_iters,
+                skip_e2e=skip_e2e,
             )
 
             disp_dur_list = [torch.zeros(1) for _ in range(self.config.world_size)]
@@ -897,6 +898,7 @@ def _bench_dispatch_combine(
                         dispatch_warp_per_block=warp_per_block,
                         combine_block_num=block_num,
                         combine_warp_per_block=warp_per_block,
+                        skip_e2e=True,
                     )
 
                     if disp_bw > best_disp_bw:
@@ -931,6 +933,7 @@ def _bench_dispatch_combine(
                             dispatch_warp_per_block=warp_per_block,
                             combine_block_num=best_comb_config[0],
                             combine_warp_per_block=best_comb_config[1],
+                            skip_e2e=True,
                         )
 
                         if disp_bw > best_disp_bw:

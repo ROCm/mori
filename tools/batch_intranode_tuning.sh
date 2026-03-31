@@ -38,18 +38,29 @@ QUANT_TYPE=fp8_direct_cast
 CONFIG_OUTPUT=auto
 GPUS=""
 SHMEM_MODE=""
+TIMEOUT=600
 
 # Typical tuning matrix (run each separately):
 #
-#   EP2/4/8, fp4 dispatch + bf16 combine + fp8 quant:
+#   EP2/4/8, fp4 dispatch + bf16 combine + fp8 quant, zero-copy (default):
 #     bash tools/batch_intranode_tuning.sh --world-size 2 --dtype fp4 --combine-dtype bf16 --quant-type fp8_direct_cast
 #     bash tools/batch_intranode_tuning.sh --world-size 4 --dtype fp4 --combine-dtype bf16 --quant-type fp8_direct_cast
 #     bash tools/batch_intranode_tuning.sh --world-size 8 --dtype fp4 --combine-dtype bf16 --quant-type fp8_direct_cast
 #
-#   EP2/4/8, fp8 dispatch + bf16 combine:
+#   EP2/4/8, fp4 dispatch + bf16 combine + fp8 quant, non-zero-copy (P2P write):
+#     bash tools/batch_intranode_tuning.sh --world-size 2 --dtype fp4 --combine-dtype bf16 --quant-type fp8_direct_cast --zero-copy 0
+#     bash tools/batch_intranode_tuning.sh --world-size 4 --dtype fp4 --combine-dtype bf16 --quant-type fp8_direct_cast --zero-copy 0
+#     bash tools/batch_intranode_tuning.sh --world-size 8 --dtype fp4 --combine-dtype bf16 --quant-type fp8_direct_cast --zero-copy 0
+#
+#   EP2/4/8, fp8 dispatch + bf16 combine, zero-copy:
 #     bash tools/batch_intranode_tuning.sh --world-size 2 --dtype fp8_e4m3_fnuz --combine-dtype bf16 --quant-type none
 #     bash tools/batch_intranode_tuning.sh --world-size 4 --dtype fp8_e4m3_fnuz --combine-dtype bf16 --quant-type none
 #     bash tools/batch_intranode_tuning.sh --world-size 8 --dtype fp8_e4m3_fnuz --combine-dtype bf16 --quant-type none
+#
+#   EP2/4/8, fp8 dispatch + bf16 combine, non-zero-copy (P2P write):
+#     bash tools/batch_intranode_tuning.sh --world-size 2 --dtype fp8_e4m3_fnuz --combine-dtype bf16 --quant-type none --zero-copy 0
+#     bash tools/batch_intranode_tuning.sh --world-size 4 --dtype fp8_e4m3_fnuz --combine-dtype bf16 --quant-type none --zero-copy 0
+#     bash tools/batch_intranode_tuning.sh --world-size 8 --dtype fp8_e4m3_fnuz --combine-dtype bf16 --quant-type none --zero-copy 0
 
 # ---- Parse args ----
 EXTRA_ARGS=()
@@ -65,6 +76,7 @@ while [[ $# -gt 0 ]]; do
         --config-output)    CONFIG_OUTPUT="$2";     shift 2 ;;
         --gpus)             GPUS="$2";              shift 2 ;;
         --shmem-mode)       SHMEM_MODE="$2";        shift 2 ;;
+        --timeout)          TIMEOUT="$2";           shift 2 ;;
         *)                  EXTRA_ARGS+=("$1");     shift ;;
     esac
 done
@@ -104,6 +116,7 @@ echo "  hidden_dims:         ${HIDDEN_DIM_ARRAY[*]}"
 echo "  dtype:               $DTYPE"
 echo "  combine_dtype:       ${COMBINE_DTYPE:-same as dtype}"
 echo "  zero_copy:           $ZERO_COPY"
+echo "  timeout:             ${TIMEOUT}s per combo"
 echo "  quant_type:          $QUANT_TYPE"
 echo "  config_output:       $CONFIG_OUTPUT"
 echo "  gpus:                ${GPUS:-all}"
@@ -129,6 +142,8 @@ fi
 PY_COMMON_ARGS+=("${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}")
 
 # ---- Run sweep ----
+FAILED=0
+HUNG_COMBOS=""
 for HIDDEN_DIM in "${HIDDEN_DIM_ARRAY[@]}"; do
     for TOKENS in "${TOKEN_ARRAY[@]}"; do
         COMBO_IDX=$((COMBO_IDX + 1))
@@ -138,20 +153,44 @@ for HIDDEN_DIM in "${HIDDEN_DIM_ARRAY[@]}"; do
         echo "############################################################"
         echo ""
 
-        python "$BENCH_SCRIPT" \
+        REPRO_CMD="HSA_NO_SCRATCH_RECLAIM=1 python $BENCH_SCRIPT --cmd tuning --world-size $WORLD_SIZE --max-tokens $TOKENS --hidden-dim $HIDDEN_DIM --dtype $DTYPE --zero-copy $ZERO_COPY --quant-type $QUANT_TYPE"
+        [[ -n "$COMBINE_DTYPE" ]] && REPRO_CMD="$REPRO_CMD --combine-dtype $COMBINE_DTYPE"
+
+        timeout "$TIMEOUT" python "$BENCH_SCRIPT" \
             "${PY_COMMON_ARGS[@]}" \
             --max-tokens "$TOKENS" \
             --hidden-dim "$HIDDEN_DIM" \
             2>&1 | tee -a "$LOG_FILE"
+        EXIT_CODE=${PIPESTATUS[0]}
 
-        echo ""
-        echo "[$(date)] Completed [$COMBO_IDX/$TOTAL_COMBOS]"
+        if [[ $EXIT_CODE -eq 124 ]]; then
+            FAILED=$((FAILED + 1))
+            HUNG_COMBOS="${HUNG_COMBOS}\n  hidden_dim=$HIDDEN_DIM, max_tokens=$TOKENS"
+            echo ""
+            echo "!!! TIMEOUT (${TIMEOUT}s): hidden_dim=$HIDDEN_DIM, max_tokens=$TOKENS — possible kernel hang !!!"
+            echo "!!! Reproduce: $REPRO_CMD !!!"
+            echo ""
+        elif [[ $EXIT_CODE -ne 0 ]]; then
+            FAILED=$((FAILED + 1))
+            echo ""
+            echo "!!! FAILED (exit $EXIT_CODE): hidden_dim=$HIDDEN_DIM, max_tokens=$TOKENS !!!"
+            echo "!!! Reproduce: $REPRO_CMD !!!"
+            echo ""
+        else
+            echo ""
+            echo "[$(date)] Completed [$COMBO_IDX/$TOTAL_COMBOS]"
+        fi
     done
 done
 
 echo ""
 echo "============================================================"
-echo "Batch tuning complete: $TOTAL_COMBOS combinations"
-echo "Config: $CONFIG_OUTPUT"
-echo "Log:    $LOG_FILE"
+echo "Batch tuning complete"
+echo "  Total:    $TOTAL_COMBOS"
+echo "  Failed:   $FAILED"
+if [[ -n "$HUNG_COMBOS" ]]; then
+    echo -e "  Hung:$HUNG_COMBOS"
+fi
+echo "  Config:   $CONFIG_OUTPUT"
+echo "  Log:      $LOG_FILE"
 echo "============================================================"

@@ -21,6 +21,7 @@
       "dtype": "bf16",
       "num_tokens": 128,
       "hidden_dim": 7168,
+      "zero_copy": true,
       "block_num": 64,
       "rdma_block_num": 0,
       "warp_per_block": 16,
