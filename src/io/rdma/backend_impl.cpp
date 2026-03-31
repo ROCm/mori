@@ -35,6 +35,17 @@
 namespace mori {
 namespace io {
 
+static void ValidateRdmaNotificationConfig(const RdmaBackendConfig& config) {
+  if (config.enableNotification && config.notifPerQp == 0) {
+    MORI_IO_ERROR(
+        "Invalid RDMA config: notifPerQp must be >= 1 when notification is enabled; got {}",
+        config.notifPerQp);
+    throw std::runtime_error(
+        "Invalid RDMA config: notifPerQp must be >= 1 when notification is "
+        "enabled");
+  }
+}
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                           RdmaManager                                          */
 /* ---------------------------------------------------------------------------------------------- */
@@ -433,6 +444,12 @@ void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
         struct ibv_recv_wr* bad = nullptr;
         SYSCALL_RETURN_ZERO(ibv_post_recv(ep.local.ibvHandle.qp, &wr, &bad));
       } else if (wc[i].opcode == IBV_WC_SEND) {
+        if (!IsNotifSendWrId(wc[i].wr_id)) {
+          MORI_IO_WARN(
+              "ProcessOneCqe: unexpected SEND completion with non-notification wr_id {}; "
+              "releasing 1 sqDepth under current SEND invariant",
+              wc[i].wr_id);
+        }
         if (ep.sqDepth) ep.sqDepth->fetch_sub(1, std::memory_order_relaxed);
       } else {
         // Batch path: wr_id carries a recordId from the SubmissionLedger.
@@ -777,6 +794,7 @@ RdmaBackend::RdmaBackend(EngineKey k, const IOEngineConfig& engConfig,
     : myEngKey(k), config(beConfig) {
   env::Override("MORI_IO_ENABLE_NOTIFICATION", config.enableNotification,
                 mori::env::detail::ParseBool);
+  ValidateRdmaNotificationConfig(config);
 
   application::RdmaContext* ctx =
       new application::RdmaContext(application::RdmaBackendType::IBVerbs);

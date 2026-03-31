@@ -255,6 +255,27 @@ void CaseWrIdNamespaceHelpers() {
   Require(!IsNotifSendWrId(4096), "ledger-range ids without bit 63 should not be SEND-tagged");
 }
 
+void CaseRdmaNotificationRejectsZeroNotifPerQp() {
+  IOEngineConfig cfg;
+  cfg.host = "127.0.0.1";
+  cfg.port = 0;
+  IOEngine engine("rdma_invalid_notif_per_qp", cfg);
+
+  RdmaBackendConfig rdmaCfg{};
+  rdmaCfg.enableNotification = true;
+  rdmaCfg.notifPerQp = 0;
+
+  bool threw = false;
+  try {
+    engine.CreateBackend(BackendType::RDMA, rdmaCfg);
+  } catch (const std::runtime_error& e) {
+    threw = true;
+    Require(std::string(e.what()).find("notifPerQp") != std::string::npos,
+            "zero notifPerQp failure should mention notifPerQp");
+  }
+  Require(threw, "notification-enabled RDMA backend should reject notifPerQp == 0");
+}
+
 void CaseRdmaTransferBasic() {
   if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
 
@@ -400,6 +421,7 @@ int main() {
   std::vector<TestCase> cases = {
       {"submission_ledger_basic", CaseSubmissionLedgerBasic},
       {"wr_id_namespace_helpers", CaseWrIdNamespaceHelpers},
+      {"rdma_notification_rejects_zero_notif_per_qp", CaseRdmaNotificationRejectsZeroNotifPerQp},
       {"rdma_transfer_basic", CaseRdmaTransferBasic},
       {"rdma_notification_disabled_behavior", CaseRdmaNotificationDisabledBehavior},
       {"rdma_notification_env_override_disables", CaseRdmaNotificationEnvOverrideDisables},
