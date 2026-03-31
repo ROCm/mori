@@ -40,11 +40,28 @@ for var in RANK MASTER_ADDR IFNAME; do
 done
 
 if [[ -z "$HOST" ]]; then
-  HOST="$(ip -o -4 addr show dev "$IFNAME" | awk '{print $4}' | cut -d/ -f1 | head -n1 || true)"
+  HOST="$(
+    python3 - "$IFNAME" <<'PY'
+import fcntl
+import socket
+import struct
+import sys
+
+ifname = sys.argv[1].encode("utf-8")
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+try:
+    packed = struct.pack("256s", ifname[:15])
+    addr = fcntl.ioctl(sock.fileno(), 0x8915, packed)[20:24]
+    print(socket.inet_ntoa(addr))
+except OSError:
+    pass
+PY
+  )"
 fi
 
 if [[ -z "$HOST" ]]; then
-  HOST="$MASTER_ADDR"
+  echo "Failed to determine local host address for interface '$IFNAME'; pass --host explicitly" >&2
+  exit 1
 fi
 
 export GLOO_SOCKET_IFNAME="$IFNAME"

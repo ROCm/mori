@@ -210,11 +210,12 @@ jobs:
             local BENCH_ARGS
             printf -v BENCH_ARGS '%q ' "$@"
             echo "=== MORI-IO internode benchmark: $NAME port=$PORT ==="
-            NODE2_CMD="docker exec $CONTAINER bash $SCRIPT --rank 1 --master-addr ${{ matrix.node1_host }} --master-port $PORT --ifname ${{ matrix.node2_ifname }} -- ${BENCH_ARGS}"
+            NODE2_CMD="docker exec $CONTAINER bash $SCRIPT --rank 1 --master-addr ${{ matrix.node1_host }} --master-port $PORT --ifname ${{ matrix.node2_ifname }} --host ${{ matrix.node2_host }} -- ${BENCH_ARGS}"
             ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} "$NODE2_CMD" &
             docker exec $CONTAINER bash $SCRIPT \
               --rank 0 --master-addr ${{ matrix.node1_host }} --master-port $PORT \
               --ifname ${{ matrix.node1_ifname }} \
+              --host ${{ matrix.node1_host }} \
               -- "$@"
             wait
             PORT=$((PORT + 1))
