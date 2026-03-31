@@ -53,7 +53,7 @@ jobs:
         --device=/dev/kfd --device=/dev/dri --device=/dev/infiniband
         --group-add video --ipc=host --privileged
         -v /root/.ssh:/root/.ssh
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
       PYTHONPATH: ${{ github.workspace }}:$PYTHONPATH
     steps:
@@ -141,7 +141,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(vars.CI_MATRIX) }}
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
       IMAGE: rocm/pytorch-private:mori_rocm7.2_ubuntu22.04_py3.10_pytorch_bnxt_ionic
       CONTAINER: mori_ci_${{ github.run_id }}
@@ -198,6 +198,55 @@ jobs:
         run: |
           ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} \
             "docker exec $CONTAINER bash -c 'cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install . && pip install prettytable'"
+
+      - name: MORI-IO internode benchmark
+        run: |
+          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_io_benchmark.sh"
+          PORT=12320
+
+          run_case() {
+            local NAME="$1"
+            shift
+            local BENCH_ARGS
+            printf -v BENCH_ARGS '%q ' "$@"
+            echo "=== MORI-IO internode benchmark: $NAME port=$PORT ==="
+            NODE2_CMD="docker exec $CONTAINER bash $SCRIPT --rank 1 --master-addr ${{ matrix.node1_host }} --master-port $PORT --ifname ${{ matrix.node2_ifname }} -- ${BENCH_ARGS}"
+            ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} "$NODE2_CMD" &
+            docker exec $CONTAINER bash $SCRIPT \
+              --rank 0 --master-addr ${{ matrix.node1_host }} --master-port $PORT \
+              --ifname ${{ matrix.node1_ifname }} \
+              -- "$@"
+            wait
+            PORT=$((PORT + 1))
+          }
+
+          run_case "wide-write-sweep" \
+            --op-type write \
+            --transfer-batch-size 128 \
+            --all \
+            --sweep-start-size 1024 \
+            --sweep-max-size 16777216 \
+            --iters 4 \
+            --enable-sess \
+            --enable-batch-transfer \
+            --num-qp-per-transfer 2 \
+            --num-worker-threads 2 \
+            --num-initiator-dev 8 \
+            --num-target-dev 8
+
+          run_case "batch-session-read-event-noncontig" \
+            --op-type read \
+            --buffer-size 4096 \
+            --transfer-batch-size 128 \
+            --iters 8 \
+            --enable-batch-transfer \
+            --enable-sess \
+            --batch-non-contiguous \
+            --poll_cq_mode event \
+            --num-qp-per-transfer 2 \
+            --num-worker-threads 2 \
+            --num-initiator-dev 8 \
+            --num-target-dev 8
 
       - name: MORI-EP internode normal kernel bench
         run: |
