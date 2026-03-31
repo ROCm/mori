@@ -3,16 +3,17 @@
 //
 // Pipelined AllReduce — SDMA scatter + reduce + SDMA AllGather.
 //
-// sdma-total signal architecture: SdmaPutThread (8 args) always increments
-// both the SDMA atomic target (signals[qId]) and local expectedSignals[qId].
-// The serial kernel uses q=0 for outgoing-completion tracking.  To avoid
-// corrupting the serial kernel's signal counters, the pipeline uses q=1
-// exclusively for both scatter and AG.  Because every PE sends the same
-// number of scatter+AG operations (symmetric), the incoming SDMA atomics
-// on q=1 always balance the outgoing kernel-store increments, keeping
-// SdmaQueitThread's exact-equality invariant satisfied.
+// Ported from sdma-figo.  Uses an inline 7-arg SdmaPut (identical to
+// sdma-figo's SdmaPutThread) that does NOT touch expectSignalsPtr.
+// sdma-total's serial kernel tracks outgoing completions via the 8-arg
+// SdmaPutThread + SdmaQueitThread exact-equality check on signalPtrs vs
+// expectSignalsPtr.  The pipeline's remote SDMA atomics increment
+// signalPtrs (incoming counters) without a matching expectSignalsPtr
+// bump, so block 0 runs a fixup after Phase 3 that snapshots
+// signalPtrs → expectSignalsPtr, re-aligning the two arrays before
+// the serial kernel ever sees them.
 //
-// SCATTER_MODE=0: scatter + AG both on queue 1 (queue 0 reserved for serial).
+// SCATTER_MODE=0: scatter on queue 0, AG on queue 1.
 // SCATTER_MODE=1: P2P read + CU AG (legacy).
 //
 #pragma once
@@ -28,6 +29,37 @@
 
 namespace mori {
 namespace collective {
+
+// Identical to sdma-figo's 7-arg SdmaPutThread.
+// SDMA copy + atomic INC on signalAddr; does NOT modify expectSignalsPtr.
+inline __device__ void PipelineSdmaPut(
+    void* srcBuf, void* dstBuf, size_t copy_size,
+    anvil::SdmaQueueDeviceHandle** deviceHandles,
+    HSAuint64* signalAddr, uint32_t queNum, uint32_t qId) {
+  if (copy_size == 0) {
+    __hip_atomic_fetch_add(signalAddr + qId, 1ULL,
+                           __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    return;
+  }
+  uint64_t base = 0, pendingWptr = 0, startBase = 0, offset = 0;
+  char* srcPtr = reinterpret_cast<char*>(srcBuf);
+  char* dstPtr = reinterpret_cast<char*>(dstBuf);
+
+  anvil::SdmaQueueDeviceHandle handle = **(deviceHandles + qId);
+  base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_COPY_LINEAR), offset);
+  pendingWptr = base;
+  startBase = base;
+
+  auto packet_d = anvil::CreateCopyPacket(srcPtr, dstPtr, copy_size);
+  handle.template placePacket<SDMA_PKT_COPY_LINEAR>(packet_d, pendingWptr, offset);
+
+  base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_ATOMIC), offset);
+  pendingWptr = base;
+  auto packet_s = anvil::CreateAtomicIncPacket(signalAddr + qId);
+  handle.template placePacket<SDMA_PKT_ATOMIC>(packet_s, pendingWptr, offset);
+
+  handle.submitPacket(startBase, pendingWptr);
+}
 
 static_assert(kMaxPipelineBlocks <= 385,
               "compute block count must fit in grid launch");
@@ -68,7 +100,6 @@ __global__ void PipelinedAllReduceSdmaKernel(
   const uint32_t numQ = dstMemObj->sdmaNumQueue;
   const int compBlocks = static_cast<int>(gridDim.x) - 1;
 
-  // ---- Per-sender signal baselines (all blocks snapshot signalPtrs) ----
   __shared__ uint64_t s_scatter_by_sender[64];
   __shared__ uint64_t s_ag_by_sender[64];
   __shared__ uint32_t s_cc_base;
@@ -84,18 +115,18 @@ __global__ void PipelinedAllReduceSdmaKernel(
     const int s = static_cast<int>(threadIdx.x);
     if (s < npes && s != myPe) {
       const size_t row = static_cast<size_t>(s) * numQ;
-      // Both scatter and AG use q=1; read the single shared baseline.
       s_scatter_by_sender[s] =
-          core::AtomicLoadRelaxed(dstMemObj->signalPtrs + row + 1);
+          core::AtomicLoadRelaxed(dstMemObj->signalPtrs + row + 0);
       if (blockIdx.x == 0) {
-        s_ag_by_sender[s] = s_scatter_by_sender[s];
+        s_ag_by_sender[s] =
+            core::AtomicLoadRelaxed(dstMemObj->signalPtrs + row + 1);
       }
     }
   }
   __syncthreads();
 
   // =========================================================================
-  // SCATTER_MODE = 0 — SDMA scatter(q1) + reduce + SDMA AG(q1)
+  // SCATTER_MODE = 0 — SDMA scatter(q0) + reduce + SDMA AG(q1)
   // =========================================================================
   if constexpr (SCATTER_MODE == 0) {
 
@@ -135,7 +166,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
           const uint64_t expected =
               s_scatter_by_sender[sender] + static_cast<uint64_t>(c + 1);
           HSAuint64* sig = dstMemObj->signalPtrs
-              + static_cast<size_t>(sender) * numQ + 1;
+              + static_cast<size_t>(sender) * numQ;
           while (core::AtomicLoadRelaxed(sig) < expected)
             ;
         }
@@ -199,20 +230,18 @@ __global__ void PipelinedAllReduceSdmaKernel(
 
     } else {
       // =================================================================
-      // BLOCK 0 — Scatter burst + cc wait + AG
+      // BLOCK 0 — Scatter burst + cc wait + AG + fixup
       // =================================================================
       const int thr = static_cast<int>(threadIdx.x);
       const uint32_t ccBase = s_cc_base;
 
-      // ---- Phase 1: burst scatter (all chunks, all peers) on queue 1 ----
+      // ---- Phase 1: burst scatter (all chunks, all peers) on queue 0 ----
       if (thr < npes && thr != myPe) {
         const int destPe = thr;
         anvil::SdmaQueueDeviceHandle** dh =
             dstMemObj->deviceHandles_d + destPe * numQ;
         HSAuint64* rSig = dstMemObj->peerSignalPtrs[destPe]
             + static_cast<size_t>(myPe) * numQ;
-        HSAuint64* eSig = dstMemObj->expectSignalsPtr
-            + static_cast<size_t>(destPe) * numQ;
         for (int c = 0; c < numChunks; c++) {
           const size_t cOff = static_cast<size_t>(c) * chunkBytes;
           size_t actualBytes = chunkBytes;
@@ -223,12 +252,12 @@ __global__ void PipelinedAllReduceSdmaKernel(
                 + static_cast<size_t>(destPe) * totalShardBytes + cOff;
             uint8_t* dst = reinterpret_cast<uint8_t*>(dstMemObj->peerPtrs[destPe])
                 + static_cast<size_t>(myPe) * totalShardBytes + cOff;
-            core::SdmaPutThread(src, dst, actualBytes, dh, rSig, eSig, numQ, 1);
+            PipelineSdmaPut(src, dst, actualBytes, dh, rSig, numQ, 0);
           }
         }
       }
 
-      // ---- Phase 2: per-chunk cc wait → AG on queue 1 ----
+      // ---- Phase 2+3: AG ----
       if constexpr (MULTI_CHUNK) {
         if (thr < npes && thr != myPe) {
           const int destPe = thr;
@@ -236,8 +265,6 @@ __global__ void PipelinedAllReduceSdmaKernel(
               dstMemObj->deviceHandles_d + destPe * numQ;
           HSAuint64* rSig = dstMemObj->peerSignalPtrs[destPe]
               + static_cast<size_t>(myPe) * numQ;
-          HSAuint64* eSig = dstMemObj->expectSignalsPtr
-              + static_cast<size_t>(destPe) * numQ;
 
           for (int c = 0; c < numChunks; c++) {
             const uint32_t ccTarget =
@@ -256,8 +283,18 @@ __global__ void PipelinedAllReduceSdmaKernel(
                 + static_cast<size_t>(myPe) * totalShardBytes + cOff;
             uint8_t* dst = reinterpret_cast<uint8_t*>(dstMemObj->peerPtrs[destPe])
                 + static_cast<size_t>(myPe) * totalShardBytes + cOff;
-            core::SdmaPutThread(src, dst, agBytes, dh, rSig, eSig, numQ, 1);
+            PipelineSdmaPut(src, dst, agBytes, dh, rSig, numQ, 1);
           }
+        }
+
+        if (thr < npes && thr != myPe) {
+          const int sender = thr;
+          const uint64_t expected =
+              s_ag_by_sender[sender] + static_cast<uint64_t>(numChunks);
+          HSAuint64* sig = dstMemObj->signalPtrs
+              + static_cast<size_t>(sender) * numQ + 1;
+          while (core::AtomicLoadRelaxed(sig) < expected)
+            ;
         }
       } else {
         if (thr < npes && thr != myPe) {
@@ -266,8 +303,6 @@ __global__ void PipelinedAllReduceSdmaKernel(
               dstMemObj->deviceHandles_d + destPe * numQ;
           HSAuint64* rSig = dstMemObj->peerSignalPtrs[destPe]
               + static_cast<size_t>(myPe) * numQ;
-          HSAuint64* eSig = dstMemObj->expectSignalsPtr
-              + static_cast<size_t>(destPe) * numQ;
 
           const uint32_t ccTarget =
               ccBase + static_cast<uint32_t>(compBlocks);
@@ -280,22 +315,33 @@ __global__ void PipelinedAllReduceSdmaKernel(
               + static_cast<size_t>(myPe) * totalShardBytes;
           uint8_t* dst = reinterpret_cast<uint8_t*>(dstMemObj->peerPtrs[destPe])
               + static_cast<size_t>(myPe) * totalShardBytes;
-          core::SdmaPutThread(src, dst, totalShardBytes, dh, rSig, eSig, numQ, 1);
+          PipelineSdmaPut(src, dst, totalShardBytes, dh, rSig, numQ, 1);
+        }
+
+        if (thr < npes && thr != myPe) {
+          const int sender = thr;
+          const uint64_t expected = s_ag_by_sender[sender] + 1ULL;
+          HSAuint64* sig = dstMemObj->signalPtrs
+              + static_cast<size_t>(sender) * numQ + 1;
+          while (core::AtomicLoadRelaxed(sig) < expected)
+            ;
         }
       }
 
-      // ---- Phase 3: wait for AG from all senders ----
-      // Scatter+AG share q=1: each pipeline call sends numChunks scatter +
-      // numChunks AG per peer, so total expected increments = 2*numChunks.
-      if (thr < npes && thr != myPe) {
-        const int sender = thr;
-        const uint64_t expected =
-            s_ag_by_sender[sender] + static_cast<uint64_t>(
-                MULTI_CHUNK ? 2 * numChunks : 2);
-        HSAuint64* sig = dstMemObj->signalPtrs
-            + static_cast<size_t>(sender) * numQ + 1;
-        while (core::AtomicLoadRelaxed(sig) < expected)
-          ;
+      // ---- Fixup: align expectSignalsPtr with signalPtrs ----
+      // PipelineSdmaPut does not touch expectSignalsPtr, but remote SDMA
+      // atomics did increment signalPtrs.  Snapshot the current signalPtrs
+      // into expectSignalsPtr so the serial kernel's SdmaQueitThread
+      // (exact-equality check) stays satisfied.
+      if (thr == 0) {
+        for (int pe = 0; pe < npes; pe++) {
+          const size_t row = static_cast<size_t>(pe) * numQ;
+          for (uint32_t q = 0; q < numQ; q++) {
+            core::AtomicStoreRelaxed(
+                dstMemObj->expectSignalsPtr + row + q,
+                core::AtomicLoadRelaxed(dstMemObj->signalPtrs + row + q));
+          }
+        }
       }
 
     }  // end block 0 vs compute
