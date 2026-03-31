@@ -3,10 +3,10 @@
 //
 // Pipelined AllReduce — SDMA scatter + reduce + SDMA AllGather.
 //
-// Faithfully ported from sdma-figo.  Only adaptation: sdma-total's 8-arg
-// SdmaPutThread gets a per-thread scratch pointer for expectedSignals so
-// the pipeline does NOT modify the real expectSignalsPtr (which is owned
-// by the serial kernel's SdmaQueitThread exact-equality protocol).
+// Faithfully ported from sdma-figo.  The pipeline's SdmaPutThread uses
+// the real expectSignalsPtr (not a scratch buffer) because remote SDMA
+// atomics increment signalPtrs on the receiver — expectSignalsPtr must
+// track those increments for SdmaQueitThread's exact-equality check.
 //
 // SCATTER_MODE=0: scatter on queue 0, AG on queue 1.
 // SCATTER_MODE=1: P2P read + CU AG (legacy).
@@ -200,10 +200,6 @@ __global__ void PipelinedAllReduceSdmaKernel(
       const int thr = static_cast<int>(threadIdx.x);
       const uint32_t ccBase = s_cc_base;
 
-      // Scratch expectedSignals: prevents SdmaPutThread from corrupting
-      // the real expectSignalsPtr that the serial kernel relies on.
-      __shared__ HSAuint64 scratch_esig[8 * 2];
-
       // ---- Phase 1: burst scatter (all chunks, all peers) on queue 0 ----
       if (thr < npes && thr != myPe) {
         const int destPe = thr;
@@ -211,7 +207,8 @@ __global__ void PipelinedAllReduceSdmaKernel(
             dstMemObj->deviceHandles_d + destPe * numQ;
         HSAuint64* rSig = dstMemObj->peerSignalPtrs[destPe]
             + static_cast<size_t>(myPe) * numQ;
-        HSAuint64* eScratch = scratch_esig + thr * numQ;
+        HSAuint64* eSig = dstMemObj->expectSignalsPtr
+            + static_cast<size_t>(destPe) * numQ;
         for (int c = 0; c < numChunks; c++) {
           const size_t cOff = static_cast<size_t>(c) * chunkBytes;
           size_t actualBytes = chunkBytes;
@@ -222,7 +219,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
                 + static_cast<size_t>(destPe) * totalShardBytes + cOff;
             uint8_t* dst = reinterpret_cast<uint8_t*>(dstMemObj->peerPtrs[destPe])
                 + static_cast<size_t>(myPe) * totalShardBytes + cOff;
-            core::SdmaPutThread(src, dst, actualBytes, dh, rSig, eScratch, numQ, 0);
+            core::SdmaPutThread(src, dst, actualBytes, dh, rSig, eSig, numQ, 0);
           }
         }
       }
@@ -235,7 +232,8 @@ __global__ void PipelinedAllReduceSdmaKernel(
               dstMemObj->deviceHandles_d + destPe * numQ;
           HSAuint64* rSig = dstMemObj->peerSignalPtrs[destPe]
               + static_cast<size_t>(myPe) * numQ;
-          HSAuint64* eScratch = scratch_esig + thr * numQ;
+          HSAuint64* eSig = dstMemObj->expectSignalsPtr
+              + static_cast<size_t>(destPe) * numQ;
 
           for (int c = 0; c < numChunks; c++) {
             const uint32_t ccTarget =
@@ -254,7 +252,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
                 + static_cast<size_t>(myPe) * totalShardBytes + cOff;
             uint8_t* dst = reinterpret_cast<uint8_t*>(dstMemObj->peerPtrs[destPe])
                 + static_cast<size_t>(myPe) * totalShardBytes + cOff;
-            core::SdmaPutThread(src, dst, agBytes, dh, rSig, eScratch, numQ, 1);
+            core::SdmaPutThread(src, dst, agBytes, dh, rSig, eSig, numQ, 1);
           }
         }
       } else {
@@ -264,7 +262,8 @@ __global__ void PipelinedAllReduceSdmaKernel(
               dstMemObj->deviceHandles_d + destPe * numQ;
           HSAuint64* rSig = dstMemObj->peerSignalPtrs[destPe]
               + static_cast<size_t>(myPe) * numQ;
-          HSAuint64* eScratch = scratch_esig + thr * numQ;
+          HSAuint64* eSig = dstMemObj->expectSignalsPtr
+              + static_cast<size_t>(destPe) * numQ;
 
           const uint32_t ccTarget =
               ccBase + static_cast<uint32_t>(compBlocks);
@@ -277,7 +276,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
               + static_cast<size_t>(myPe) * totalShardBytes;
           uint8_t* dst = reinterpret_cast<uint8_t*>(dstMemObj->peerPtrs[destPe])
               + static_cast<size_t>(myPe) * totalShardBytes;
-          core::SdmaPutThread(src, dst, totalShardBytes, dh, rSig, eScratch, numQ, 1);
+          core::SdmaPutThread(src, dst, totalShardBytes, dh, rSig, eSig, numQ, 1);
         }
       }
 
