@@ -523,6 +523,7 @@ mori_package_data = [
     "_jit_sources/src/**/*.h",
     "_jit_sources/3rdparty/**/*.h",
     "_jit_sources/3rdparty/**/*.hpp",
+    "ops/tuning_configs/*.json",
 ]
 if _env_flag("BUILD_UMBP", "OFF"):
     mori_package_data.append("spdk_proxy")

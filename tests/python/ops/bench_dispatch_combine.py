@@ -578,6 +578,78 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             torch.cuda.synchronize()
 
 
+def _save_intranode_tuning_result(
+    config_path,
+    world_size,
+    max_num_inp_token_per_rank,
+    dispatch_hidden_dim,
+    combine_hidden_dim,
+    data_type,
+    combine_data_type,
+    quant_type,
+    best_disp_config,
+    best_disp_bw,
+    best_comb_config,
+    best_comb_bw,
+):
+    from pathlib import Path
+    from mori.ops.tuning_config import (
+        TuningConfigManager,
+        dtype_to_config_str,
+        build_config_filename,
+        quant_type_to_config_str,
+    )
+    from mori.jit.config import detect_gpu_arch
+
+    gpu_arch = detect_gpu_arch()
+    disp_dtype_str = dtype_to_config_str(data_type)
+    comb_dtype_str = dtype_to_config_str(combine_data_type)
+    qt_str = quant_type_to_config_str(quant_type)
+
+    metadata = {
+        "gpu_arch": gpu_arch,
+        "kernel_type": "IntraNode",
+        "ep_size": world_size,
+        "quant_type": qt_str,
+    }
+
+    dispatch_entry = {
+        "dtype": disp_dtype_str,
+        "num_tokens": max_num_inp_token_per_rank,
+        "hidden_dim": dispatch_hidden_dim,
+        "block_num": best_disp_config[0],
+        "rdma_block_num": 0,
+        "warp_per_block": best_disp_config[1],
+        "bandwidth_gbps": round(best_disp_bw, 2),
+    }
+
+    combine_entry = {
+        "dtype": comb_dtype_str,
+        "num_tokens": max_num_inp_token_per_rank,
+        "hidden_dim": combine_hidden_dim,
+        "block_num": best_comb_config[0],
+        "rdma_block_num": 0,
+        "warp_per_block": best_comb_config[1],
+        "bandwidth_gbps": round(best_comb_bw, 2),
+    }
+
+    if config_path == "auto":
+        repo_tuning_dir = (
+            Path(__file__).resolve().parents[3]
+            / "python"
+            / "mori"
+            / "ops"
+            / "tuning_configs"
+        )
+        filename = build_config_filename(gpu_arch, "IntraNode", world_size, qt_str)
+        config_path = str(repo_tuning_dir / filename)
+
+    TuningConfigManager.save_tuning_result(
+        config_path, metadata, dispatch_entry, combine_entry
+    )
+    print(f"Tuning config saved to: {config_path}")
+
+
 LaunchConfig = namedtuple(
     "LaunchConfig",
     [
@@ -639,6 +711,7 @@ def _bench_dispatch_combine(
     combine_warp_per_block_arg=None,
     combine_data_type=None,
     max_total_recv_tokens=0,
+    save_tuning_config=None,
 ):
     if combine_data_type is None:
         combine_data_type = data_type
@@ -860,6 +933,22 @@ def _bench_dispatch_combine(
                 )
                 print(f"{'=' * 60}")
 
+                if save_tuning_config and best_disp_config and best_comb_config:
+                    _save_intranode_tuning_result(
+                        save_tuning_config,
+                        world_size=world_size,
+                        max_num_inp_token_per_rank=max_num_inp_token_per_rank,
+                        dispatch_hidden_dim=hidden_dim,
+                        combine_hidden_dim=combine_hidden_dim,
+                        data_type=data_type,
+                        combine_data_type=combine_data_type,
+                        quant_type=quant_type,
+                        best_disp_config=best_disp_config,
+                        best_disp_bw=best_disp_bw,
+                        best_comb_config=best_comb_config,
+                        best_comb_bw=best_comb_bw,
+                    )
+
         else:
             raise ValueError(f"Unknown command: {cmd}")
 
@@ -880,6 +969,7 @@ def bench_dispatch_combine(
     num_experts_per_token=8,
     combine_data_type=None,
     max_total_recv_tokens=0,
+    save_tuning_config=None,
 ):
     if combine_data_type is None:
         combine_data_type = dtype
@@ -905,6 +995,7 @@ def bench_dispatch_combine(
             combine_warp_per_block,
             combine_data_type,
             max_total_recv_tokens,
+            save_tuning_config,
         ),
         nprocs=world_size,
         join=True,
@@ -1018,6 +1109,21 @@ if __name__ == "__main__":
             "When set, Phase 2 creates a separate op with this dtype. "
         ),
     )
+    parser.add_argument(
+        "--hidden-dim",
+        type=int,
+        default=7168,
+        help="Base hidden dimension for the model (default: 7168)",
+    )
+    parser.add_argument(
+        "--save-tuning-config",
+        type=str,
+        default=None,
+        help=(
+            "Path to save tuning results as JSON config. "
+            "Use 'auto' to auto-generate filename based on GPU/dtype/EP."
+        ),
+    )
     args = parser.parse_args()
 
     if args.num_experts_per_rank is None:
@@ -1029,7 +1135,7 @@ if __name__ == "__main__":
     dispatch_dtype = _DATA_TYPE_MAP[args.dtype]
     combine_dtype = _DATA_TYPE_MAP[combine_dtype_str]
 
-    base_hidden_dim = 7168
+    base_hidden_dim = args.hidden_dim
     dispatch_hidden_dim = (
         base_hidden_dim // 2 if _is_fp4x2_dtype(dispatch_dtype) else base_hidden_dim
     )
@@ -1037,6 +1143,7 @@ if __name__ == "__main__":
     print(
         f"Running {args.cmd} with max_tokens_per_rank: {args.max_tokens}, "
         f"dispatch_dtype: {args.dtype}, combine_dtype: {combine_dtype_str}, "
+        f"hidden_dim: {base_hidden_dim}, "
         f"world_size(EP): {args.world_size}, "
         f"num_experts_per_rank: {args.num_experts_per_rank}, "
         f"num_experts_per_token: {args.num_experts_per_token}, "
@@ -1064,4 +1171,5 @@ if __name__ == "__main__":
         num_experts_per_token=args.num_experts_per_token,
         combine_data_type=combine_dtype,
         max_total_recv_tokens=args.max_recv_total_tokens,
+        save_tuning_config=args.save_tuning_config,
     )

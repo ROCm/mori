@@ -1,0 +1,29 @@
+{
+  "version": "1.0",
+  "gpu_arch": "gfx942",
+  "kernel_type": "IntraNode",
+  "ep_size": 4,
+  "quant_type": "none",
+  "dispatch_rules": [
+    {
+      "dtype": "bf16",
+      "num_tokens": 128,
+      "hidden_dim": 7168,
+      "block_num": 260,
+      "rdma_block_num": 0,
+      "warp_per_block": 15,
+      "bandwidth_gbps": 107.5
+    }
+  ],
+  "combine_rules": [
+    {
+      "dtype": "bf16",
+      "num_tokens": 128,
+      "hidden_dim": 7168,
+      "block_num": 64,
+      "rdma_block_num": 0,
+      "warp_per_block": 16,
+      "bandwidth_gbps": 97.75
+    }
+  ]
+}

@@ -265,8 +265,36 @@ class EpDispatchCombineOp:
 
         self.launch_config_mode = os.environ.get("MORI_EP_LAUNCH_CONFIG_MODE", "MANUAL")
         if self.launch_config_mode == "AUTO":
+            self._dispatch_rules = None
+            self._combine_rules = None
+            try:
+                from mori.ops.tuning_config import (
+                    TuningConfigManager,
+                    quant_type_to_config_str,
+                    kernel_type_to_config_str,
+                )
+                from mori.jit.config import detect_gpu_arch
+
+                gpu_arch = detect_gpu_arch()
+                kt_str = kernel_type_to_config_str(config.kernel_type)
+                qt_str = quant_type_to_config_str(config.quant_type)
+                mgr = TuningConfigManager.get_instance(
+                    gpu_arch,
+                    kt_str,
+                    config.world_size,
+                    qt_str,
+                )
+                self._dispatch_rules = mgr.dispatch_rules or None
+                self._combine_rules = mgr.combine_rules or None
+            except Exception as exc:
+                import logging
+
+                logging.getLogger(__name__).debug(
+                    "Failed to load tuning config: %s", exc
+                )
+
             if (
-                self.config.kernel_type.value
+                config.kernel_type.value
                 == EpDispatchCombineKernelType.InterNodeV1.value
             ):
                 (
@@ -275,7 +303,7 @@ class EpDispatchCombineOp:
                     self.auto_warp_per_block,
                 ) = (96, 64, 8)
             elif (
-                self.config.kernel_type.value
+                config.kernel_type.value
                 == EpDispatchCombineKernelType.InterNodeV1LL.value
             ):
                 (
@@ -290,6 +318,8 @@ class EpDispatchCombineOp:
                     self.auto_warp_per_block,
                 ) = (128, 0, 16)
         elif self.launch_config_mode == "MANUAL":
+            self._dispatch_rules = None
+            self._combine_rules = None
             self.auto_block_num, self.auto_rdma_block_num, self.auto_warp_per_block = (
                 None,
                 None,
@@ -303,7 +333,25 @@ class EpDispatchCombineOp:
     # ------------------------------------------------------------------
     # Kernel launch helpers
     # ------------------------------------------------------------------
-    def _resolve_launch_params(self, block_num, rdma_block_num, warp_per_block):
+    def _resolve_launch_params(
+        self,
+        block_num,
+        rdma_block_num,
+        warp_per_block,
+        *,
+        num_tokens=0,
+        hidden_dim=0,
+        dtype=None,
+        tuning_rules=None,
+    ):
+        if tuning_rules and dtype is not None:
+            from mori.ops.tuning_config import TuningConfigManager
+
+            params = TuningConfigManager.lookup(
+                tuning_rules, dtype, num_tokens, hidden_dim
+            )
+            if params is not None:
+                return params.block_num, params.rdma_block_num, params.warp_per_block
         bn = self.auto_block_num if self.auto_block_num else block_num
         rbn = self.auto_rdma_block_num if self.auto_rdma_block_num else rdma_block_num
         wpb = self.auto_warp_per_block if self.auto_warp_per_block else warp_per_block
@@ -345,6 +393,20 @@ class EpDispatchCombineOp:
     def get_launch_config(
         self, is_dispatch=True, block_num=-1, rdma_block_num=-1, warp_per_block=-1
     ):
+        rules = self._dispatch_rules if is_dispatch else self._combine_rules
+        if rules:
+            from mori.ops.tuning_config import TuningConfigManager
+
+            # Best-effort lookup using config values; actual dtype comes from
+            # input tensor in dispatch()/combine() which calls _resolve_launch_params directly.
+            params = TuningConfigManager.lookup(
+                rules,
+                self.config.data_type,
+                self.config.max_num_inp_token_per_rank,
+                self.config.hidden_dim,
+            )
+            if params is not None:
+                return params.block_num, params.rdma_block_num, params.warp_per_block
         return (
             self.auto_block_num if self.auto_block_num else block_num,
             self.auto_rdma_block_num if self.auto_rdma_block_num else rdma_block_num,
@@ -387,14 +449,19 @@ class EpDispatchCombineOp:
         warp_per_block: int = -1,
     ):
         hidden_dim = input.size(1)
-        # Legacy pybind LaunchDispatch: weights optional -> ptr if tensor provided
-        # (including 0 rows); scales ptr and output iff has_value && scaleDim > 0.
         weight_ptr = weights.data_ptr() if weights is not None else 0
         has_scales = scales is not None and self.config.scale_dim > 0
         scale_ptr = scales.data_ptr() if has_scales else 0
         actual_bn, actual_rbn, actual_wpb = self._resolve_launch_params(
-            block_num, rdma_block_num, warp_per_block
+            block_num,
+            rdma_block_num,
+            warp_per_block,
+            num_tokens=input.size(0),
+            hidden_dim=hidden_dim,
+            dtype=input.dtype,
+            tuning_rules=self._dispatch_rules,
         )
+        self._cached_dispatch_launch = (actual_bn, actual_rbn, actual_wpb)
         stream = _current_stream()
         self._dispatch_dtype = input.dtype
         sfx = _DTYPE_SUFFIX[input.dtype]
@@ -511,10 +578,8 @@ class EpDispatchCombineOp:
             weights,
             scales,
             indices,
-            block_num=self.auto_block_num if self.auto_block_num else block_num,
-            warp_per_block=(
-                self.auto_warp_per_block if self.auto_warp_per_block else warp_per_block
-            ),
+            block_num=block_num,
+            warp_per_block=warp_per_block,
         )
 
     def dispatch_recv(
@@ -522,7 +587,10 @@ class EpDispatchCombineOp:
         block_num: int = -1,
         warp_per_block: int = -1,
     ):
-        _, _, actual_wpb = self._resolve_launch_params(block_num, 0, warp_per_block)
+        if hasattr(self, "_cached_dispatch_launch"):
+            _, _, actual_wpb = self._cached_dispatch_launch
+        else:
+            _, _, actual_wpb = self._resolve_launch_params(block_num, 0, warp_per_block)
         stream = _current_stream()
         assert hasattr(
             self, "_dispatch_dtype"
@@ -572,13 +640,19 @@ class EpDispatchCombineOp:
         call_reset: bool = False,
     ):
         hidden_dim = input.size(1)
-        # Legacy pybind LaunchCombine: weights ptr iff optional && size(0) != 0
         weight_ptr = (
             weights.data_ptr() if weights is not None and weights.size(0) != 0 else 0
         )
         actual_bn, actual_rbn, actual_wpb = self._resolve_launch_params(
-            block_num, rdma_block_num, warp_per_block
+            block_num,
+            rdma_block_num,
+            warp_per_block,
+            num_tokens=self._get_cur_rank_num_token(self._handle),
+            hidden_dim=hidden_dim,
+            dtype=input.dtype,
+            tuning_rules=self._combine_rules,
         )
+        self._cached_combine_launch = (actual_bn, actual_rbn, actual_wpb)
         stream = _current_stream()
         self._combine_dtype = input.dtype
         sfx = _DTYPE_SUFFIX[input.dtype]
@@ -744,10 +818,8 @@ class EpDispatchCombineOp:
             input,
             weights,
             indices,
-            block_num=self.auto_block_num if self.auto_block_num else block_num,
-            warp_per_block=(
-                self.auto_warp_per_block if self.auto_warp_per_block else warp_per_block
-            ),
+            block_num=block_num,
+            warp_per_block=warp_per_block,
         )
 
     def combine_recv(
@@ -755,7 +827,10 @@ class EpDispatchCombineOp:
         block_num: int = -1,
         warp_per_block: int = -1,
     ):
-        _, _, actual_wpb = self._resolve_launch_params(block_num, 0, warp_per_block)
+        if hasattr(self, "_cached_combine_launch"):
+            _, _, actual_wpb = self._cached_combine_launch
+        else:
+            _, _, actual_wpb = self._resolve_launch_params(block_num, 0, warp_per_block)
         stream = _current_stream()
         assert hasattr(
             self, "_combine_dtype"
@@ -825,20 +900,19 @@ class EpDispatchCombineOp:
                 "dispatch_standard_moe is not available. "
                 "Rebuild with ENABLE_STANDARD_MOE_ADAPT=ON."
             )
-        block_num, rdma_block_num, warp_per_block = self.get_launch_config(
-            is_dispatch=True,
-            block_num=block_num,
-            rdma_block_num=rdma_block_num,
-            warp_per_block=warp_per_block,
-        )
-
         hidden_dim = input.size(1)
         num_local_experts = self.config.num_experts_per_rank
         max_tokens_per_expert = (
             self.config.world_size * self.config.max_num_inp_token_per_rank
         )
         actual_bn, actual_rbn, actual_wpb = self._resolve_launch_params(
-            block_num, rdma_block_num, warp_per_block
+            block_num,
+            rdma_block_num,
+            warp_per_block,
+            num_tokens=input.size(0),
+            hidden_dim=hidden_dim,
+            dtype=input.dtype,
+            tuning_rules=self._dispatch_rules,
         )
         stream = _current_stream()
         sfx = _DTYPE_SUFFIX[input.dtype]
@@ -939,16 +1013,15 @@ class EpDispatchCombineOp:
                 "combine_standard_moe is not available. "
                 "Rebuild with ENABLE_STANDARD_MOE_ADAPT=ON."
             )
-        block_num, rdma_block_num, warp_per_block = self.get_launch_config(
-            is_dispatch=False,
-            block_num=block_num,
-            rdma_block_num=rdma_block_num,
-            warp_per_block=warp_per_block,
-        )
-
         hidden_dim = input.size(2)
         actual_bn, actual_rbn, actual_wpb = self._resolve_launch_params(
-            block_num, rdma_block_num, warp_per_block
+            block_num,
+            rdma_block_num,
+            warp_per_block,
+            num_tokens=self._get_cur_rank_num_token(self._handle),
+            hidden_dim=hidden_dim,
+            dtype=input.dtype,
+            tuning_rules=self._combine_rules,
         )
         stream = _current_stream()
         sfx = _DTYPE_SUFFIX[input.dtype]
