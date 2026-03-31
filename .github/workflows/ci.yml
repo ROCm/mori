@@ -133,6 +133,40 @@ jobs:
             PORT=$((PORT + 1))
           done
 
+  jax-intranode-test:
+    name: mori JAX intranode test (platform:${{ matrix.platform }})
+    needs: build
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(vars.CI_MATRIX) }}
+    container:
+      image: rocm/pytorch-private:mori_jax091_rocm711
+      credentials:
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+      options: >-
+        --device=/dev/kfd --device=/dev/dri --device=/dev/infiniband
+        --group-add video --ipc=host --privileged
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install mori (XLA FFI)
+        run: |
+          cd $GITHUB_WORKSPACE
+          BUILD_XLA_FFI_OPS=ON \
+          pip install --break-system-packages -v .
+
+      - name: MORI-EP JAX test
+        run: |
+          cd $GITHUB_WORKSPACE
+          MORI_KERNEL_DIR=$(ls -d $GITHUB_WORKSPACE/build/lib/gfx* | head -1) \
+          timeout 300 pytest tests/python/ops/test_dispatch_combine_jax.py -s -v
+
   internode-test:
     name: mori internode test (platform:${{ matrix.platform }})
     needs: [build, intranode-test]

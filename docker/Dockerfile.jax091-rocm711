@@ -52,9 +52,9 @@ RUN python${PYTHON_VERSION} -m pip install --break-system-packages \
         /tmp/wheels/*.whl && \
     rm -rf /tmp/wheels
 
-# Common runtime dependencies
+# Common runtime and test dependencies
 RUN python${PYTHON_VERSION} -m pip install --break-system-packages \
-        numpy scipy cmake pybind11
+        numpy scipy cmake pybind11 pytest
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libibverbs-dev \
@@ -67,21 +67,3 @@ RUN python${PYTHON_VERSION} -c \
     || true
 
 WORKDIR /workspace
-
-ARG MORI_BRANCH=pemeliya/jax_integration_upstream
-
-RUN git clone --depth 1 --recurse-submodules --shallow-submodules \
-      --branch ${MORI_BRANCH} \
-        https://github.com/ROCm/mori.git /workspace/mori
-
-RUN cd /workspace/mori && \
-        PYTHONUNBUFFERED=1 \
-        BUILD_XLA_FFI_OPS=ON BUILD_EXAMPLES=OFF BUILD_TESTS=OFF \
-        BUILD_TORCH_BOOTSTRAP=OFF WITH_MPI=OFF \
-        pip install --break-system-packages -v .
-
-# Discover and export MORI_KERNEL_DIR pointing to the built gfx*_* kernel directory
-RUN KERNEL_DIR=$(ls -d /workspace/mori/build/lib/gfx* | head -1) && \
-    echo "MORI_KERNEL_DIR=${KERNEL_DIR}" >> /etc/environment && \
-    ln -sf "${KERNEL_DIR}" /workspace/mori/build/lib/kernels
-ENV MORI_KERNEL_DIR=/workspace/mori/build/lib/kernels
