@@ -41,16 +41,24 @@ struct alignas(128) RSBarrierSignal {
   alignas(128) uint32_t flag[kRSMaxBlocks];
 };
 
-// Max compute blocks for PipelinedAllReduceSdmaKernel (block 0 is control).
-static constexpr int kMaxPipelineBlocks = 384;
-
 // Lightweight barrier for SdmaReduceScatterKernel / PipelinedAllReduceSdmaKernel.
 // Block 0 does the SDMA scatter + wait, then device-scope broadcasts to
 // all other blocks.  Device-side generation counter → graph-safe.
+//
+// block_done[]: per-block reduce-completion flags for barrier-free pipeline.
+// Each compute block writes its slot after reduce; block 0 polls all slots.
+// Must be large enough that pipelined reduce uses as many CTAs as
+// SdmaReduceScatterKernel (comp = min(blocks, kMaxPipelineBlocks-1)); 64
+// capped MI250-class parallelism vs ~80+ SM GPUs. Block 0 uses threads
+// [128, 128+compBlocks) for block_done polls — keep 128+(kMaxPipelineBlocks-1)
+// <= typical launch blockDim.x (512).
+static constexpr int kMaxPipelineBlocks = 384;
 struct alignas(128) CrossPeBarrier {
-  alignas(128) uint32_t flag;
+  uint32_t flag;
   uint32_t ag_sync;
+  uint32_t block_done[kMaxPipelineBlocks];
   uint32_t chunks_complete;
+  uint32_t ag_gate;
 };
 
 inline int getDeviceMaxBlocks() {

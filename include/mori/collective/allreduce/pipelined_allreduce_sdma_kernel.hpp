@@ -3,13 +3,19 @@
 //
 // Pipelined AllReduce — SDMA scatter + reduce + SDMA AllGather.
 //
-// Uses remote signals (peerSignalPtrs): SDMA ATOMIC INC lands on the
-// remote PE's signalPtrs; the remote PE polls its own signalPtrs to
-// detect completion.  No local expectSignalsPtr tracking, no FLAG
-// notification, no fixup required.
+// SCATTER_MODE=0: Single-kernel AllReduce (SDMA scatter + reduce + SDMA AG)
+//   1-chunk mode (shard < 2×kMinChunkShardBytes):
+//     Block 0: burst scatter → cc wait → SDMA AG push → AG wait.
+//     Compute blocks: scatter-poll → reduce → wbl2+fence → chunks_complete.
+//     No signal/barrier zeroing: monotonic ATOMIC_INC + baseline protocol.
+//   Multi-chunk mode (shard ≥ 2×kMinChunkShardBytes, default 2 chunks):
+//     Block 0: burst scatter → per-chunk (cc wait → SDMA AG push) → AG wait.
+//     Compute blocks: scatter-poll → reduce → wbl2+fence → chunks_complete.
+//     Overlaps AG(c) SDMA transfer with scatter(c+1)+reduce(c+1) on CU.
+//     wbl2+CC for intermediate chunks runs on wavefront 1 (thread 64),
+//     parallel with scatter-poll on wavefront 0.
 //
-// SCATTER_MODE=0: scatter on queue 0, AG on queue 1.
-// SCATTER_MODE=1: P2P read + CU AG (legacy).
+// SCATTER_MODE=1: P2P read + CU AG (legacy path).
 //
 #pragma once
 
@@ -25,6 +31,8 @@
 namespace mori {
 namespace collective {
 
+// Burst-submit pipeline: Block 0 only uses threads 0..npes-1 (one per peer).
+// kMaxPipelineBlocks still caps compute blocks for register pressure.
 static_assert(kMaxPipelineBlocks <= 385,
               "compute block count must fit in grid launch");
 
@@ -64,6 +72,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
   const uint32_t numQ = dstMemObj->sdmaNumQueue;
   const int compBlocks = static_cast<int>(gridDim.x) - 1;
 
+  // ---- Signal baselines (per-sender, requires sdmaNumQueue >= 3) ----
   __shared__ uint64_t s_scatter_by_sender[64];
   __shared__ uint64_t s_ag_by_sender[64];
   __shared__ uint32_t s_cc_base;
@@ -90,13 +99,13 @@ __global__ void PipelinedAllReduceSdmaKernel(
   __syncthreads();
 
   // =========================================================================
-  // SCATTER_MODE = 0 — SDMA scatter(q0) + reduce + SDMA AG(q1)
+  // SCATTER_MODE = 0 — Single-buffer SDMA + qId=2 cross-PE reduce barrier
   // =========================================================================
   if constexpr (SCATTER_MODE == 0) {
 
-    if (numQ < 2) {
+    if (numQ < 3) {
       if (threadIdx.x == 0 && blockIdx.x == 0) {
-        printf("PE %d: pipelined SDMA needs sdmaNumQueue>=2 (got %u)\n",
+        printf("PE %d: pipelined SDMA needs sdmaNumQueue>=3 (got %u)\n",
                myPe, numQ);
       }
       return;
@@ -104,7 +113,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
 
     if (blockIdx.x != 0) {
       // =================================================================
-      // COMPUTE BLOCKS — scatter-poll → reduce → chunks_complete
+      // COMPUTE BLOCKS (1..N): scatter-poll → reduce → chunks_complete
       // =================================================================
       const size_t compTid =
           static_cast<size_t>(blockIdx.x - 1) * static_cast<size_t>(blockDim.x)
@@ -115,6 +124,8 @@ __global__ void PipelinedAllReduceSdmaKernel(
       for (int c = 0; c < numChunks; c++) {
         const size_t off = static_cast<size_t>(c) * packedChunkPerRank;
 
+        // Flush+signal previous chunk on wavefront 1 (thread 64)
+        // while scatter-poll runs on wavefront 0 (threads 0-6).
         if (c > 0 && threadIdx.x == 64) {
 #if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
           asm volatile("buffer_wbl2" ::: "memory");
@@ -194,7 +205,11 @@ __global__ void PipelinedAllReduceSdmaKernel(
 
     } else {
       // =================================================================
-      // BLOCK 0 — Scatter burst + cc wait + AG + fixup
+      // BLOCK 0 — Burst-Submit Scatter + AG
+      //
+      // Phase 1: burst-submit ALL scatter packets to SDMA queues.
+      // Phase 2 (multi-chunk): per-chunk cc wait → SDMA AG push.
+      // Phase 2 (1-chunk): cc wait → SDMA AG push → final AG wait.
       // =================================================================
       const int thr = static_cast<int>(threadIdx.x);
       const uint32_t ccBase = s_cc_base;
@@ -221,8 +236,14 @@ __global__ void PipelinedAllReduceSdmaKernel(
         }
       }
 
-      // ---- Phase 2+3: AG ----
+      // ---- Phase 2+3: dual-mode AG ----
       if constexpr (MULTI_CHUNK) {
+        // Multi-chunk SDMA AG: overlap AG(c) with scatter(c+1)+reduce(c+1).
+        // Each active thread handles one remote PE.  Per chunk: wait for
+        // all compute blocks to finish reduce, then submit SDMA AG push.
+        // AG overwrite of scatter data is safe: AG arrives at remote PE
+        // long after that PE's reduce finished reading the scatter slot
+        // (fence + CC + AG_transfer ≫ remote reduce time).
         if (thr < npes && thr != myPe) {
           const int destPe = thr;
           anvil::SdmaQueueDeviceHandle** dh =
@@ -261,6 +282,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
             ;
         }
       } else {
+        // Single-chunk: cc wait → SDMA AG push (outbound).
         if (thr < npes && thr != myPe) {
           const int destPe = thr;
           anvil::SdmaQueueDeviceHandle** dh =
