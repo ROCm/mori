@@ -76,8 +76,8 @@ if(BUILD_OPS_DEVICE)
         ${HIPCC_EXECUTABLE} --genco "--offload-arch=${GPU_TARGETS}" -std=c++17
         -O2 -D__HIP_PLATFORM_AMD__ -DHIP_ENABLE_WARP_SYNC_BUILTINS ${_nic_defs}
         ${_extra_defs} -I${CMAKE_SOURCE_DIR}/include -I${CMAKE_SOURCE_DIR}
-        -I${CMAKE_SOURCE_DIR}/3rdparty/spdlog/include
-        ${_mpi_includes} ${_ksrc_path} -o ${_hsaco_output}
+        -I${CMAKE_SOURCE_DIR}/3rdparty/spdlog/include ${_mpi_includes}
+        ${_ksrc_path} -o ${_hsaco_output}
       DEPENDS ${_ksrc_path}
       COMMENT "AOT compiling ${_ksrc} -> ${_arch_nic}/${_kname}.hsaco"
       VERBATIM)
