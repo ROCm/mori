@@ -40,9 +40,12 @@ import pytest
 os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "16G")
 os.environ.setdefault("NPROC", "8")
 os.environ.setdefault("PJRT_NPROC", "8")
-os.environ.setdefault("XLA_FLAGS", "--xla_gpu_autotune_level=0 \
+os.environ.setdefault(
+    "XLA_FLAGS",
+    "--xla_gpu_autotune_level=0 \
                                     --xla_gpu_enable_command_buffer= \
-                                    --xla_gpu_enable_triton_gemm=false")
+                                    --xla_gpu_enable_triton_gemm=false",
+)
 
 _NUM_PROCS = int(os.environ.get("MORI_NUM_PROCS", "8"))
 _TOTAL_GPUS = int(os.environ.get("MORI_TOTAL_GPUS", "8"))
@@ -59,8 +62,9 @@ def _get_free_port():
         return s.getsockname()[1]
 
 
-def _jax_worker(rank, world_size, coordinator_port, total_gpus,
-                task_queue, result_queue):
+def _jax_worker(
+    rank, world_size, coordinator_port, total_gpus, task_queue, result_queue
+):
     """Long-lived JAX worker: init distributed + mori, then serve tasks."""
     gpus_per_proc = total_gpus // world_size
     os.environ["HIP_VISIBLE_DEVICES"] = ",".join(
@@ -68,6 +72,7 @@ def _jax_worker(rank, world_size, coordinator_port, total_gpus,
     )
 
     import jax
+
     jax.distributed.initialize(
         coordinator_address=f"localhost:{coordinator_port}",
         num_processes=world_size,
@@ -75,6 +80,7 @@ def _jax_worker(rank, world_size, coordinator_port, total_gpus,
     )
 
     import mori
+
     mori.jax.shmem_init_attr(rank, world_size)
 
     while True:
@@ -104,8 +110,14 @@ class JaxDistProcessManager:
         self.processes = [
             self._ctx.Process(
                 target=_jax_worker,
-                args=(rank, world_size, port, total_gpus,
-                      self.task_queue, self.result_queue),
+                args=(
+                    rank,
+                    world_size,
+                    port,
+                    total_gpus,
+                    self.task_queue,
+                    self.result_queue,
+                ),
             )
             for rank in range(world_size)
         ]
@@ -154,12 +166,15 @@ def jax_dist_manager():
 # ---------------------------------------------------------------------------
 
 
-def _run_ep_dispatch_combine(rank, world_size,
-                             hidden_dim=7168,
-                             scale_dim=32,
-                             max_num_inp_token_per_rank=4096,
-                             num_experts_per_rank=32,
-                             num_experts_per_token=56):
+def _run_ep_dispatch_combine(
+    rank,
+    world_size,
+    hidden_dim=7168,
+    scale_dim=32,
+    max_num_inp_token_per_rank=4096,
+    num_experts_per_rank=32,
+    num_experts_per_token=56,
+):
     """Executed in every worker — creates an op, generates data, and
     validates dispatch + combine round-trip."""
     import random
@@ -168,6 +183,7 @@ def _run_ep_dispatch_combine(rank, world_size,
     import jax
     import jax.numpy as jnp
     from jax.sharding import PartitionSpec as P
+
     try:
         from jax.shard_map import shard_map
     except ImportError:
@@ -216,27 +232,31 @@ def _run_ep_dispatch_combine(rank, world_size,
         total_experts = config.num_experts_per_rank * config.world_size
 
         keys = jax.random.split(rng, num_tokens)
-        perms = jax.vmap(
-            lambda k: jax.random.permutation(k, total_experts)
-        )(keys)
-        indices = perms[:, :config.num_experts_per_token]
+        perms = jax.vmap(lambda k: jax.random.permutation(k, total_experts))(keys)
+        indices = perms[:, : config.num_experts_per_token]
         indices_list = all_gather(indices)
 
         weights = jax.random.uniform(
-            rng, (num_tokens, config.num_experts_per_token), dtype=jnp.float32,
+            rng,
+            (num_tokens, config.num_experts_per_token),
+            dtype=jnp.float32,
         )
         weights_list = all_gather(weights)
 
         if config.scale_dim != 0:
             scales_fp32 = jax.random.uniform(
-                rng, (num_tokens, config.scale_dim), dtype=jnp.float32,
+                rng,
+                (num_tokens, config.scale_dim),
+                dtype=jnp.float32,
             )
         else:
             scales_fp32 = jnp.zeros((1, 1), dtype=jnp.float32)
         scales_list = all_gather(scales_fp32).astype(jax_scale_dtype)
 
         input_fp32 = jax.random.normal(
-            rng, (num_tokens, config.hidden_dim), dtype=jnp.float32,
+            rng,
+            (num_tokens, config.hidden_dim),
+            dtype=jnp.float32,
         )
         input_list = all_gather(input_fp32).astype(dtype)
 
@@ -260,8 +280,14 @@ def _run_ep_dispatch_combine(rank, world_size,
 
     def run_test_once(op, num_tokens, test_data):
         (
-            indices, weights, scales, inputs,
-            indices_list, weights_list, scales_list, input_list,
+            indices,
+            weights,
+            scales,
+            inputs,
+            indices_list,
+            weights_list,
+            scales_list,
+            input_list,
         ) = test_data
 
         @jax.jit
@@ -276,21 +302,29 @@ def _run_ep_dispatch_combine(rank, world_size,
             src_token_pos = op.get_dispatch_src_token_pos(num)
 
             combine_output, combine_weights = op.combine(
-                dispatch_output.astype(dtype), 
-                dispatch_weights, 
-                dispatch_indices
+                dispatch_output.astype(dtype), dispatch_weights, dispatch_indices
             )
             return (
-                (dispatch_output, dispatch_indices, num,
-                 dispatch_weights, dispatch_scales),
+                (
+                    dispatch_output,
+                    dispatch_indices,
+                    num,
+                    dispatch_weights,
+                    dispatch_scales,
+                ),
                 src_token_pos,
                 combine_output,
                 combine_weights,
             )
 
         (
-            (dispatch_output, dispatch_indices, dispatch_recv_num_token,
-             dispatch_weights, dispatch_scales),
+            (
+                dispatch_output,
+                dispatch_indices,
+                dispatch_recv_num_token,
+                dispatch_weights,
+                dispatch_scales,
+            ),
             src_token_pos,
             combine_output,
             combine_weights,
@@ -343,12 +377,17 @@ def _run_ep_dispatch_combine(rank, world_size,
         )
         assert res, f"{rank} validate_dispatch failed!"
         print(f"{rank} dispatch tokens ok", flush=True)
-        
+
         # --- validate combine ---
         @jax.jit
         def validate_combine(
-            combine_output, combine_weights, inputs, weights,
-            indices, num_experts_per_rank, num_tokens,
+            combine_output,
+            combine_weights,
+            inputs,
+            weights,
+            indices,
+            num_experts_per_rank,
+            num_tokens,
         ):
             max_tokens = combine_output.shape[0]
             mask_1d = jnp.arange(max_tokens) < num_tokens
@@ -362,33 +401,45 @@ def _run_ep_dispatch_combine(rank, world_size,
             pes = indices // num_experts_per_rank
             pes_sorted = jnp.sort(pes, axis=-1)
             unique_pes = 1 + jnp.sum(
-                pes_sorted[:, 1:] != pes_sorted[:, :-1], axis=-1,
+                pes_sorted[:, 1:] != pes_sorted[:, :-1],
+                axis=-1,
             )
 
             Xinputs = inputs.astype(dtype) * unique_pes[:, None]
             inputs_buf = jnp.zeros(
-                (max_tokens, Xinputs.shape[1]), dtype=Xinputs.dtype,
+                (max_tokens, Xinputs.shape[1]),
+                dtype=Xinputs.dtype,
             )
             inputs_buf = jax.lax.dynamic_update_slice(inputs_buf, Xinputs, (0, 0))
             ok_output = masked_allclose(
                 combine_output.astype(jnp.float32),
                 inputs_buf.astype(jnp.float32),
-                mask_1d, atol=1e-2, rtol=1e-2,
+                mask_1d,
+                atol=1e-2,
+                rtol=1e-2,
             )
 
             ok_weight = True
             if weights is not None:
                 Xweights = weights * unique_pes[:, None]
                 weights_buf = jnp.zeros(
-                    (max_tokens, Xweights.shape[1]), dtype=Xweights.dtype,
+                    (max_tokens, Xweights.shape[1]),
+                    dtype=Xweights.dtype,
                 )
                 weights_buf = jax.lax.dynamic_update_slice(
-                    weights_buf, Xweights, (0, 0),
+                    weights_buf,
+                    Xweights,
+                    (0, 0),
                 )
                 ok_weight = masked_allclose(
-                    combine_weights, weights_buf, mask_1d, atol=1e-5, rtol=1e-5,
+                    combine_weights,
+                    weights_buf,
+                    mask_1d,
+                    atol=1e-5,
+                    rtol=1e-5,
                 )
             return ok_output & ok_weight
+
         print(f"{rank} running validate combine", flush=True)
 
         res = validate_combine(
@@ -444,6 +495,5 @@ def test_ep_dispatch_combine(jax_dist_manager):
         print(f"\n=== Rank {r} FAILED ===\n{tb}")
     if failures:
         pytest.fail(
-            f"{len(failures)} rank(s) failed: "
-            + ", ".join(str(r) for r, _ in failures)
+            f"{len(failures)} rank(s) failed: " + ", ".join(str(r) for r, _ in failures)
         )
