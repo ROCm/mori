@@ -38,7 +38,6 @@ import traceback
 import pytest
 
 os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "16G")
-os.environ.setdefault("MORI_KERNEL_DIR", "/tf/mori/build/lib/gfx942_mlx5")
 os.environ.setdefault("NPROC", "8")
 os.environ.setdefault("PJRT_NPROC", "8")
 os.environ.setdefault("XLA_FLAGS", "--xla_gpu_autotune_level=0 \
