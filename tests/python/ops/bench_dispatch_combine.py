@@ -591,6 +591,7 @@ def _save_intranode_tuning_result(
     best_disp_bw,
     best_comb_config,
     best_comb_bw,
+    zero_copy=True,
 ):
     from pathlib import Path
     from mori.ops.tuning_config import (
@@ -630,6 +631,7 @@ def _save_intranode_tuning_result(
         "dtype": comb_dtype_str,
         "num_tokens": max_num_inp_token_per_rank,
         "hidden_dim": combine_hidden_dim,
+        "zero_copy": zero_copy,
         "block_num": best_comb_config[0],
         "rdma_block_num": 0,
         "warp_per_block": best_comb_config[1],
@@ -732,8 +734,11 @@ def _bench_dispatch_combine(
     else:
         combine_hidden_dim = hidden_dim
 
-    if quant_type == "fp8_direct_cast" and data_type is not torch.bfloat16:
-        raise ValueError("fp8_direct_cast is only supported for bfloat16 data type")
+    if quant_type == "fp8_direct_cast" and combine_data_type is not torch.bfloat16:
+        raise ValueError(
+            "fp8_direct_cast quant requires combine dtype to be bfloat16, "
+            f"got {combine_data_type}"
+        )
 
     config = mori.ops.EpDispatchCombineConfig(
         data_type=data_type,
@@ -962,6 +967,7 @@ def _bench_dispatch_combine(
                         best_disp_bw=best_disp_bw,
                         best_comb_config=best_comb_config,
                         best_comb_bw=best_comb_bw,
+                        zero_copy=bool(zero_copy),
                     )
 
         else:

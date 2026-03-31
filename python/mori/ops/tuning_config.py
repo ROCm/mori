@@ -367,7 +367,14 @@ class TuningConfigManager:
                 )
                 continue
             valid.append(rule)
-        valid.sort(key=lambda r: (r["dtype"], r["hidden_dim"], r["num_tokens"]))
+        valid.sort(
+            key=lambda r: (
+                r["dtype"],
+                r["hidden_dim"],
+                r.get("zero_copy", False),
+                r["num_tokens"],
+            )
+        )
         logger.debug("Loaded %d %s rules from %s", len(valid), phase, path)
         return valid
 
@@ -381,11 +388,14 @@ class TuningConfigManager:
         dtype: torch.dtype,
         num_tokens: int,
         hidden_dim: int,
+        zero_copy: bool | None = None,
     ) -> LaunchParams | None:
         """Find the best matching launch params.
 
         Exact-matches dtype and hidden_dim, then picks the tightest
         (smallest) rule num_tokens >= actual num_tokens (ceiling match).
+        If zero_copy is provided, also matches the rule's ``zero_copy``
+        field (rules without the field are treated as matching any value).
         """
         dtype_str = DTYPE_TO_CONFIG_STR.get(dtype)
         if dtype_str is None:
@@ -395,6 +405,9 @@ class TuningConfigManager:
                 continue
             if rule["hidden_dim"] != hidden_dim:
                 continue
+            if zero_copy is not None and "zero_copy" in rule:
+                if rule["zero_copy"] != zero_copy:
+                    continue
             if num_tokens <= rule["num_tokens"]:
                 return LaunchParams(
                     block_num=rule["block_num"],
@@ -448,7 +461,12 @@ class TuningConfigManager:
             ("combine_rules", combine_entry),
         ]:
             rules: list[dict] = data.setdefault(section_key, [])
-            merge_key = (entry["dtype"], entry["num_tokens"], entry["hidden_dim"])
+            merge_key = (
+                entry["dtype"],
+                entry["num_tokens"],
+                entry["hidden_dim"],
+                entry.get("zero_copy"),
+            )
 
             matched_idx = None
             for i, rule in enumerate(rules):
@@ -456,6 +474,7 @@ class TuningConfigManager:
                     rule.get("dtype"),
                     rule.get("num_tokens"),
                     rule.get("hidden_dim"),
+                    rule.get("zero_copy"),
                 ) == merge_key:
                     matched_idx = i
                     break
@@ -485,7 +504,14 @@ class TuningConfigManager:
                 rules.append(entry)
                 logger.info("Added %s rule: %s", section_key, merge_key)
 
-            rules.sort(key=lambda r: (r["dtype"], r["hidden_dim"], r["num_tokens"]))
+            rules.sort(
+                key=lambda r: (
+                    r["dtype"],
+                    r["hidden_dim"],
+                    r.get("zero_copy", False),
+                    r["num_tokens"],
+                )
+            )
 
         path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp_path = tempfile.mkstemp(

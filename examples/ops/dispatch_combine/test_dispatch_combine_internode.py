@@ -133,6 +133,7 @@ def _save_internode_tuning_result(
         "dtype": comb_dtype_str,
         "num_tokens": max_num_token,
         "hidden_dim": combine_hidden_dim,
+        "zero_copy": False,
         "block_num": best_comb_config[0],
         "rdma_block_num": best_comb_config[2],
         "warp_per_block": best_comb_config[1],

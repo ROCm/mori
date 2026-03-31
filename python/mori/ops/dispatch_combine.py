@@ -346,12 +346,13 @@ class EpDispatchCombineOp:
         hidden_dim=0,
         dtype=None,
         tuning_rules=None,
+        zero_copy=None,
     ):
         if tuning_rules and dtype is not None:
             from mori.ops.tuning_config import TuningConfigManager
 
             params = TuningConfigManager.lookup(
-                tuning_rules, dtype, num_tokens, hidden_dim
+                tuning_rules, dtype, num_tokens, hidden_dim, zero_copy
             )
             if params is not None:
                 return params.block_num, params.rdma_block_num, params.warp_per_block
@@ -646,6 +647,12 @@ class EpDispatchCombineOp:
         weight_ptr = (
             weights.data_ptr() if weights is not None and weights.size(0) != 0 else 0
         )
+        actual_use_ext = (
+            use_external_inp_buf
+            if use_external_inp_buf >= 0
+            else int(self.config.use_external_inp_buf)
+        )
+        is_zero_copy = not actual_use_ext
         actual_bn, actual_rbn, actual_wpb = self._resolve_launch_params(
             block_num,
             rdma_block_num,
@@ -654,6 +661,7 @@ class EpDispatchCombineOp:
             hidden_dim=hidden_dim,
             dtype=input.dtype,
             tuning_rules=self._combine_rules,
+            zero_copy=is_zero_copy,
         )
         self._cached_combine_launch = (actual_bn, actual_rbn, actual_wpb)
         stream = _current_stream()
@@ -677,11 +685,6 @@ class EpDispatchCombineOp:
         block = (WARP_SIZE * actual_wpb,)
         shared_mem = self._combine_shared_mem(actual_wpb)
         kt = self.config.kernel_type.value
-        actual_use_ext = (
-            use_external_inp_buf
-            if use_external_inp_buf >= 0
-            else int(self.config.use_external_inp_buf)
-        )
 
         if kt == EpDispatchCombineKernelType.InterNode.value:
             self._launch(
