@@ -19,31 +19,12 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-import importlib
-import os
 
-_LAZY_SUBMODULES = {
-    "cpp",
-    "ops",
-    "jax",
-    "shmem",
-    "io",
-    "ir",
-    "kernel_profiler",
-}
+import jax  # noqa: F401
+from mori.cpp import mori_ep_handler, mori_ep_type_info, preload_kernels
+from .ops import *
 
-
-def __getattr__(name: str):
-    if name in _LAZY_SUBMODULES:
-        return importlib.import_module(f".{name}", __name__)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
-def __dir__():
-    return list(globals().keys()) + sorted(_LAZY_SUBMODULES)
-
-
-if os.environ.get("MORI_PRECOMPILE", "").lower() in ("1", "true", "on"):
-    from .jit import precompile
-
-    precompile()
+# note this used to work for jax-0.7.1
+# jax.ffi.register_ffi_type_id("mori_ep", mori_ep_type_id(), platform="ROCM")
+jax.ffi.register_ffi_type("mori_ep", mori_ep_type_info(), platform="ROCM")
+jax.ffi.register_ffi_target("mori_ep", mori_ep_handler(), platform="ROCM")
