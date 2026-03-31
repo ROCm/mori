@@ -101,6 +101,21 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t /*input_buffer_size*/
   if (!output_transit_buffer_obj_.IsValid())
     throw std::runtime_error("Failed to query output transit buffer SymmMemObj");
 
+  // ShmemMalloc reuses virtual addresses across instances.  If a previous
+  // process was killed (Ctrl+C) mid-pipeline, its remote SDMA atomics will
+  // have incremented signalPtrs without matching expectSignalsPtr bumps.
+  // Snapshot signalPtrs → expectSignalsPtr so SdmaQueitThread's exact-
+  // equality check passes on the very first serial call.
+  {
+    auto* obj = output_transit_buffer_obj_.cpu;
+    if (obj && obj->signalPtrs && obj->expectSignalsPtr) {
+      size_t sigBytes =
+          static_cast<size_t>(npes_) * obj->sdmaNumQueue * sizeof(HSAuint64);
+      hipMemcpy(obj->expectSignalsPtr, obj->signalPtrs, sigBytes,
+                hipMemcpyDeviceToDevice);
+    }
+  }
+
   printf("AllreduceSdma(SDMA) initialized: PE %d of %d, max_blocks=%d\n", myPe_, npes_,
          max_blocks_);
   printf("  Flags: %zu bytes at %p\n", flagsSize, flags_.get());
