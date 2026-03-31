@@ -83,6 +83,8 @@ class AllreduceSdma {
   // if false, user should directly use output_transit_buffer
   bool copy_output_to_user_;
 
+  uint32_t pipeline_gen_;
+
   AllreduceSdma(const AllreduceSdma&) = delete;
   AllreduceSdma& operator=(const AllreduceSdma&) = delete;
 

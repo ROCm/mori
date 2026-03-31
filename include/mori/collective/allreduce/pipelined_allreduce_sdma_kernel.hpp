@@ -49,7 +49,8 @@ __global__ void PipelinedAllReduceSdmaKernel(
     CrossPeBarrier* __restrict__ barrier,
     const application::SymmMemObjPtr inputSymmObj,
     size_t elementCount,
-    size_t chunkElementCount) {
+    size_t chunkElementCount,
+    uint32_t pipelineGen) {
 
   if (elementCount == 0 || npes <= 0) return;
 
@@ -106,8 +107,8 @@ __global__ void PipelinedAllReduceSdmaKernel(
 
       if (threadIdx.x == 0) {
         while (__scoped_atomic_load_n(
-                   &barrier->ag_sync, __ATOMIC_ACQUIRE,
-                   __MEMORY_SCOPE_DEVICE) == 0u)
+                   &barrier->pipeline_gen, __ATOMIC_ACQUIRE,
+                   __MEMORY_SCOPE_DEVICE) < pipelineGen)
           ;
         s_scatter_base = barrier->scatter_base;
       }
@@ -221,7 +222,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
         barrier->scatter_base = sb;
         barrier->ag_base = ab;
         __threadfence();
-        __scoped_atomic_store_n(&barrier->ag_sync, 1u,
+        __scoped_atomic_store_n(&barrier->pipeline_gen, pipelineGen,
                                 __ATOMIC_RELEASE, __MEMORY_SCOPE_DEVICE);
       }
       __syncthreads();

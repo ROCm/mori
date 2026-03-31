@@ -73,7 +73,8 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t /*input_buffer_size*/
       async_total_count_(0),
       async_stream_(nullptr),
       async_start_time_(0.0),
-      copy_output_to_user_(copy_output_to_user) {
+      copy_output_to_user_(copy_output_to_user),
+      pipeline_gen_(0) {
   // 1. Allocate SDMA completion flags
   size_t flagsSize = npes_ * sizeof(uint64_t);
   void* flags = shmem::ShmemMalloc(flagsSize);
@@ -515,30 +516,28 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                         myPe_, hipGetErrorString(br));
                 return false;
             }
-        } else {
-            // SCATTER_MODE=0: reset ag_sync so the kernel's one-time baseline
-            // broadcast protocol starts cleanly (block 0 sets ag_sync=1 after
-            // writing baselines; compute blocks poll for ag_sync!=0).
-            barrierPtr_->ag_sync = 0;
         }
 
         const bool multi_chunk = (chunk_elems < total_count);
+        const uint32_t gen = ++pipeline_gen_;
 
         if (scatter_mode == 1) {
             PipelinedAllReduceSdmaKernel<T, 1><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
-                barrierPtr_, inputSymmObj, total_count, chunk_elems);
+                barrierPtr_, inputSymmObj, total_count, chunk_elems, gen);
         } else if (multi_chunk) {
             PipelinedAllReduceSdmaKernel<T, 0, true><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
-                barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems);
+                barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems,
+                gen);
         } else {
             PipelinedAllReduceSdmaKernel<T, 0, false><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
-                barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems);
+                barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems,
+                gen);
         }
 
         hipError_t err = hipGetLastError();

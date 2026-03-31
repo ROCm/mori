@@ -51,6 +51,7 @@ struct alignas(128) CrossPeBarrier {
   alignas(128) uint32_t flag;
   uint32_t ag_sync;
   uint32_t chunks_complete;
+  uint32_t pipeline_gen;
   uint64_t scatter_base;
   uint64_t ag_base;
 };
