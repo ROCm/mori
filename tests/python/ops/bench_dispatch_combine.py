@@ -598,16 +598,19 @@ def _save_intranode_tuning_result(
         dtype_to_config_str,
         build_config_filename,
         quant_type_to_config_str,
+        detect_gpu_model,
     )
     from mori.jit.config import detect_gpu_arch
 
     gpu_arch = detect_gpu_arch()
+    gpu_model = detect_gpu_model()
     disp_dtype_str = dtype_to_config_str(data_type)
     comb_dtype_str = dtype_to_config_str(combine_data_type)
     qt_str = quant_type_to_config_str(quant_type)
 
     metadata = {
         "gpu_arch": gpu_arch,
+        "gpu_model": gpu_model,
         "kernel_type": "IntraNode",
         "ep_size": world_size,
         "quant_type": qt_str,
@@ -641,7 +644,13 @@ def _save_intranode_tuning_result(
             / "ops"
             / "tuning_configs"
         )
-        filename = build_config_filename(gpu_arch, "IntraNode", world_size, qt_str)
+        filename = build_config_filename(
+            gpu_arch,
+            "IntraNode",
+            world_size,
+            qt_str,
+            gpu_model,
+        )
         config_path = str(repo_tuning_dir / filename)
 
     TuningConfigManager.save_tuning_result(
@@ -838,7 +847,10 @@ def _bench_dispatch_combine(
                 all_block_set.add(sm_count * mult)
 
             common_block_list = sorted(v for v in all_block_set if v <= sm_count)
-            extra_disp_block_list = sorted(v for v in all_block_set if v > sm_count)
+            # Over-subscribe (block_num > SM count) is disabled by default due to
+            # hang risk with inter-block synchronization. Uncomment to enable:
+            # extra_disp_block_list = sorted(v for v in all_block_set if v > sm_count)
+            extra_disp_block_list = []
 
             warp_per_block_list = [4, 5, 6, 8, 10, 12, 14, 15, 16]
 
@@ -846,9 +858,12 @@ def _bench_dispatch_combine(
                 print(
                     f"SM count={sm_count}\n"
                     f"Common block_num candidates ({len(common_block_list)}): {common_block_list}\n"
-                    f"Extra dispatch block_num candidates ({len(extra_disp_block_list)}): {extra_disp_block_list}\n"
                     f"warp_per_block candidates: {warp_per_block_list}"
                 )
+                if extra_disp_block_list:
+                    print(
+                        f"Extra dispatch block_num candidates ({len(extra_disp_block_list)}): {extra_disp_block_list}"
+                    )
 
             best_disp_bw = 0
             best_comb_bw = 0

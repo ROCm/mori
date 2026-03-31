@@ -28,16 +28,28 @@ LOG_DIR="$REPO_ROOT/logs"
 mkdir -p "$LOG_DIR"
 
 # ---- Defaults ----
-WORLD_SIZE=4
+WORLD_SIZE=8
 TOKENS_LIST="64,128,256,512,1024,2048,4096"
-HIDDEN_DIMS="2048,4096,7168"
-DTYPE=bf16
-COMBINE_DTYPE=""
+HIDDEN_DIMS="7168"
+DTYPE=fp4
+COMBINE_DTYPE=bf16
 ZERO_COPY=1
-QUANT_TYPE=none
+QUANT_TYPE=fp8_direct_cast
 CONFIG_OUTPUT=auto
 GPUS=""
 SHMEM_MODE=""
+
+# Typical tuning matrix (run each separately):
+#
+#   EP2/4/8, fp4 dispatch + bf16 combine + fp8 quant:
+#     bash tools/batch_intranode_tuning.sh --world-size 2 --dtype fp4 --combine-dtype bf16 --quant-type fp8_direct_cast
+#     bash tools/batch_intranode_tuning.sh --world-size 4 --dtype fp4 --combine-dtype bf16 --quant-type fp8_direct_cast
+#     bash tools/batch_intranode_tuning.sh --world-size 8 --dtype fp4 --combine-dtype bf16 --quant-type fp8_direct_cast
+#
+#   EP2/4/8, fp8 dispatch + bf16 combine:
+#     bash tools/batch_intranode_tuning.sh --world-size 2 --dtype fp8_e4m3_fnuz --combine-dtype bf16 --quant-type none
+#     bash tools/batch_intranode_tuning.sh --world-size 4 --dtype fp8_e4m3_fnuz --combine-dtype bf16 --quant-type none
+#     bash tools/batch_intranode_tuning.sh --world-size 8 --dtype fp8_e4m3_fnuz --combine-dtype bf16 --quant-type none
 
 # ---- Parse args ----
 EXTRA_ARGS=()

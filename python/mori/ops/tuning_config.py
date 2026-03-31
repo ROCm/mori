@@ -120,6 +120,31 @@ _SUPPORTED_VERSION = "1.0"
 
 _TUNING_CONFIGS_DIR = Path(__file__).parent / "tuning_configs"
 
+_gpu_model_cache: str | None = None
+_gpu_model_detected: bool = False
+
+
+def detect_gpu_model() -> str | None:
+    """Detect GPU model from device name, e.g. 'mi300x', 'mi308x'.
+
+    Returns None if detection fails. Result is cached after first call.
+    """
+    global _gpu_model_cache, _gpu_model_detected
+    if _gpu_model_detected:
+        return _gpu_model_cache
+    _gpu_model_detected = True
+    try:
+        name = torch.cuda.get_device_properties(0).name.lower()
+    except Exception:
+        return None
+    import re
+
+    m = re.search(r"\bmi\d+\w*", name)
+    if m:
+        _gpu_model_cache = m.group(0)
+    return _gpu_model_cache
+
+
 _PHASE_RULE_REQUIRED = frozenset(
     {
         "dtype",
@@ -147,13 +172,44 @@ def build_config_filename(
     kernel_type: str,
     ep_size: int,
     quant_type: str,
+    gpu_model: str | None = None,
 ) -> str:
-    """Build the JSON config filename (no dtype — dtype lives inside rules)."""
-    name = f"{gpu_arch}_{kernel_type}_ep{ep_size}"
+    """Build the JSON config filename.
+
+    gpu_model is optional (e.g. 'mi300x'). When provided, the filename
+    includes it: ``gfx942_mi300x_IntraNode_ep8.json``.
+    """
+    parts = [gpu_arch]
+    if gpu_model:
+        parts.append(gpu_model)
+    parts.append(f"{kernel_type}_ep{ep_size}")
+    name = "_".join(parts)
     if quant_type != "none":
         quant_short = _QUANT_SHORT_NAME.get(quant_type, quant_type)
         name += f"_{quant_short}"
     return name + ".json"
+
+
+def _find_fallback_config(
+    gpu_arch: str,
+    kernel_type: str,
+    ep_size: int,
+    quant_type: str,
+) -> Path | None:
+    """Find any config file matching the same (arch, kernel, ep, quant) but
+    different gpu_model. Returns None if nothing found."""
+    suffix = f"_{kernel_type}_ep{ep_size}"
+    if quant_type != "none":
+        quant_short = _QUANT_SHORT_NAME.get(quant_type, quant_type)
+        suffix += f"_{quant_short}"
+    suffix += ".json"
+    prefix = f"{gpu_arch}_"
+    if not _TUNING_CONFIGS_DIR.is_dir():
+        return None
+    for f in sorted(_TUNING_CONFIGS_DIR.iterdir()):
+        if f.name.startswith(prefix) and f.name.endswith(suffix) and f.is_file():
+            return f
+    return None
 
 
 def config_path_for(
@@ -161,13 +217,36 @@ def config_path_for(
     kernel_type: str,
     ep_size: int,
     quant_type: str,
+    gpu_model: str | None = None,
 ) -> Path:
-    """Resolve the config file path, honoring MORI_EP_TUNING_CONFIG override."""
+    """Resolve the config file path.
+
+    Priority:
+    1. MORI_EP_TUNING_CONFIG env var (exact path override)
+    2. Exact match: ``{arch}_{model}_{kernel}_ep{n}[_{quant}].json``
+    3. Fallback: any file matching ``{arch}_*_{kernel}_ep{n}[_{quant}].json``
+    """
     env_override = os.environ.get("MORI_EP_TUNING_CONFIG")
     if env_override:
         return Path(env_override)
-    filename = build_config_filename(gpu_arch, kernel_type, ep_size, quant_type)
-    return _TUNING_CONFIGS_DIR / filename
+    exact = _TUNING_CONFIGS_DIR / build_config_filename(
+        gpu_arch,
+        kernel_type,
+        ep_size,
+        quant_type,
+        gpu_model,
+    )
+    if exact.is_file():
+        return exact
+    fallback = _find_fallback_config(gpu_arch, kernel_type, ep_size, quant_type)
+    if fallback is not None:
+        logger.info(
+            "No tuning config for gpu_model=%s, using fallback: %s",
+            gpu_model,
+            fallback.name,
+        )
+        return fallback
+    return exact
 
 
 # ---------------------------------------------------------------------------
@@ -208,12 +287,25 @@ class TuningConfigManager:
         kernel_type: str,
         ep_size: int,
         quant_type: str,
+        gpu_model: str | None = None,
     ) -> "TuningConfigManager":
-        cache_key = build_config_filename(gpu_arch, kernel_type, ep_size, quant_type)
+        cache_key = build_config_filename(
+            gpu_arch,
+            kernel_type,
+            ep_size,
+            quant_type,
+            gpu_model,
+        )
         if cache_key in cls._cache:
             return cls._cache[cache_key]
 
-        path = config_path_for(gpu_arch, kernel_type, ep_size, quant_type)
+        path = config_path_for(
+            gpu_arch,
+            kernel_type,
+            ep_size,
+            quant_type,
+            gpu_model,
+        )
         dispatch_rules, combine_rules = cls._load_rules(path, gpu_arch)
         instance = cls(dispatch_rules, combine_rules)
         cls._cache[cache_key] = instance

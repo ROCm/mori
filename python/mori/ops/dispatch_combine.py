@@ -272,10 +272,12 @@ class EpDispatchCombineOp:
                     TuningConfigManager,
                     quant_type_to_config_str,
                     kernel_type_to_config_str,
+                    detect_gpu_model,
                 )
                 from mori.jit.config import detect_gpu_arch
 
                 gpu_arch = detect_gpu_arch()
+                gpu_model = detect_gpu_model()
                 kt_str = kernel_type_to_config_str(config.kernel_type)
                 qt_str = quant_type_to_config_str(config.quant_type)
                 mgr = TuningConfigManager.get_instance(
@@ -283,6 +285,7 @@ class EpDispatchCombineOp:
                     kt_str,
                     config.world_size,
                     qt_str,
+                    gpu_model,
                 )
                 self._dispatch_rules = mgr.dispatch_rules or None
                 self._combine_rules = mgr.combine_rules or None

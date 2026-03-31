@@ -100,10 +100,12 @@ def _save_internode_tuning_result(
         build_config_filename,
         quant_type_to_config_str,
         kernel_type_to_config_str,
+        detect_gpu_model,
     )
     from mori.jit.config import detect_gpu_arch
 
     gpu_arch = detect_gpu_arch()
+    gpu_model = detect_gpu_model()
     kernel_type_name = kernel_type_to_config_str(config.kernel_type)
     disp_dtype_str = dtype_to_config_str(config.data_type)
     comb_dtype_str = dtype_to_config_str(combine_data_type)
@@ -111,6 +113,7 @@ def _save_internode_tuning_result(
 
     metadata = {
         "gpu_arch": gpu_arch,
+        "gpu_model": gpu_model,
         "kernel_type": kernel_type_name,
         "ep_size": config.world_size,
         "quant_type": qt_str,
@@ -149,6 +152,7 @@ def _save_internode_tuning_result(
             kernel_type_name,
             config.world_size,
             qt_str,
+            gpu_model,
         )
         config_path = str(repo_tuning_dir / filename)
 

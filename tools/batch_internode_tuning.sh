@@ -44,14 +44,24 @@ IFNAME=""
 REMOTE_REPO_ROOT=""
 KERNEL_TYPE="v1"
 NUM_QP=1
-TOKENS_LIST="128,512,1024,2048,4096"
+TOKENS_LIST="64,128,256,512,1024,2048,4096"
 HIDDEN_DIMS="7168"
-DTYPE="bf16"
-COMBINE_DTYPE=""
-QUANT_TYPE="none"
+DTYPE="fp4"
+COMBINE_DTYPE="bf16"
+QUANT_TYPE="fp8_direct_cast"
 CONFIG_OUTPUT="auto"
 GPU_PER_NODE=8
 TIMEOUT_SEC=600
+
+# Typical tuning matrix for EP16 (2 nodes x 8 GPUs, run each separately):
+#
+#   fp4 dispatch + bf16 combine + fp8 quant:
+#     bash tools/batch_internode_tuning.sh --master-addr <host0> --peer-host <host1> --ifname bond0 \
+#         --kernel-type v1 --dtype fp4 --combine-dtype bf16 --quant-type fp8_direct_cast
+#
+#   fp8 dispatch + bf16 combine:
+#     bash tools/batch_internode_tuning.sh --master-addr <host0> --peer-host <host1> --ifname bond0 \
+#         --kernel-type v1 --dtype fp8_e4m3_fnuz --combine-dtype bf16 --quant-type none
 
 # ---- Parse args ----
 while [[ $# -gt 0 ]]; do
