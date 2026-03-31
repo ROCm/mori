@@ -97,24 +97,10 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t /*input_buffer_size*/
   if (!output_transit_buffer_) throw std::runtime_error("Failed to allocate output transit buffer");
   output_transit_buffer_ptr_.reset(output_transit_buffer_);
 
-  output_transit_buffer_obj_ = shmem::ShmemQueryMemObjPtr(output_transit_buffer_);
+  output_transit_buffer_obj_ =
+      shmem::ShmemSymmetricRegister(output_transit_buffer_, output_transit_buffer_size_);
   if (!output_transit_buffer_obj_.IsValid())
-    throw std::runtime_error("Failed to query output transit buffer SymmMemObj");
-
-  // ShmemMalloc reuses virtual addresses across instances.  If a previous
-  // process was killed (Ctrl+C) mid-pipeline, its remote SDMA atomics will
-  // have incremented signalPtrs without matching expectSignalsPtr bumps.
-  // Snapshot signalPtrs → expectSignalsPtr so SdmaQueitThread's exact-
-  // equality check passes on the very first serial call.
-  {
-    auto* obj = output_transit_buffer_obj_.cpu;
-    if (obj && obj->signalPtrs && obj->expectSignalsPtr) {
-      size_t sigBytes =
-          static_cast<size_t>(npes_) * obj->sdmaNumQueue * sizeof(HSAuint64);
-      hipMemcpy(obj->expectSignalsPtr, obj->signalPtrs, sigBytes,
-                hipMemcpyDeviceToDevice);
-    }
-  }
+    throw std::runtime_error("Failed to register output transit buffer SymmMemObj");
 
   printf("AllreduceSdma(SDMA) initialized: PE %d of %d, max_blocks=%d\n", myPe_, npes_,
          max_blocks_);
@@ -166,9 +152,9 @@ bool AllreduceSdma<T>::ensure_buffer_size(void*& buffer,
   }
   buffer_ptr.reset(buffer);
 
-  buffer_obj = shmem::ShmemQueryMemObjPtr(buffer);
+  buffer_obj = shmem::ShmemSymmetricRegister(buffer, current_size);
   if (!buffer_obj.IsValid()) {
-    fprintf(stderr, "PE %d: Failed to query re-allocated %s\n", myPe_, buffer_name);
+    fprintf(stderr, "PE %d: Failed to register re-allocated %s\n", myPe_, buffer_name);
     return false;
   }
 
@@ -341,8 +327,8 @@ double AllreduceSdma<T>::wait_async(hipStream_t stream) {
     hipStream_t wait_stream = (stream != nullptr) ? stream : async_stream_;
 
     // Wait for AllGather SDMA transfers to complete + invalidate L2
-    AllGatherAsyncWaitKernel<<<1, 64, 0, wait_stream>>>(myPe_, npes_, flagsObj_, barrierPtr_,
-                                                        async_total_count_);
+    AllGatherAsyncWaitKernel<<<1, 64, 0, wait_stream>>>(myPe_, npes_, output_transit_buffer_obj_,
+                                                        barrierPtr_, async_total_count_);
 
     // Copy result to user buffer (if enabled)
     if (copy_output_to_user_) {

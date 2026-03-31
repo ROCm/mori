@@ -65,12 +65,17 @@ __global__ void ShmemAllReduceKernel(int myPe, int npes, const uint32_t* __restr
   const size_t bytesPerElement = sizeof(uint32_t);
   const size_t chunkBytes = elementCountPerRank * bytesPerElement;
 
-  uint64_t* __restrict__ flags = reinterpret_cast<uint64_t*>(flagsObj->localPtr);
-
   const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
   int warpId = static_cast<int>(threadIdx.x) / warpSize;
   int laneId = static_cast<int>(threadIdx.x) % warpSize;
+
+  __shared__ uint64_t s_base[8];
+  if (threadIdx.x < static_cast<unsigned>(npes) && static_cast<int>(threadIdx.x) != myPe) {
+    s_base[threadIdx.x] = mori::core::AtomicLoadRelaxed(
+        gatherObj->signalPtrs + static_cast<size_t>(threadIdx.x) * gatherObj->sdmaNumQueue);
+  }
+  __syncthreads();
 
   // =========================================================================
   // Phase 1: Scatter — block 0, each warp's lane 0 sends one shard
@@ -79,31 +84,21 @@ __global__ void ShmemAllReduceKernel(int myPe, int npes, const uint32_t* __restr
   // =========================================================================
   if (blockIdx.x == 0 && warpId < npes && laneId == 0) {
     int destPe = warpId;
-    size_t srcOffset = static_cast<size_t>(destPe) * chunkBytes;
-    size_t dstOffset = static_cast<size_t>(myPe) * chunkBytes;
+    if (destPe != myPe) {
+      size_t srcOffset = static_cast<size_t>(destPe) * chunkBytes;
+      size_t dstOffset = static_cast<size_t>(myPe) * chunkBytes;
 
-    uint8_t* srcPtr = reinterpret_cast<uint8_t*>(gatherObj->localPtr) + srcOffset;
-    uint8_t* dstPtr = reinterpret_cast<uint8_t*>(gatherObj->peerPtrs[destPe]) + dstOffset;
+      uint8_t* srcPtr = reinterpret_cast<uint8_t*>(gatherObj->localPtr) + srcOffset;
+      uint8_t* dstPtr = reinterpret_cast<uint8_t*>(gatherObj->peerPtrs[destPe]) + dstOffset;
 
-    anvil::SdmaQueueDeviceHandle** dh =
-        gatherObj->deviceHandles_d + destPe * gatherObj->sdmaNumQueue;
-    HSAuint64* remoteSignal =
-        gatherObj->peerSignalPtrs[destPe] + static_cast<size_t>(myPe) * gatherObj->sdmaNumQueue;
-    HSAuint64* localExpected =
-        gatherObj->expectSignalsPtr + static_cast<size_t>(destPe) * gatherObj->sdmaNumQueue;
+      anvil::SdmaQueueDeviceHandle** dh =
+          gatherObj->deviceHandles_d + destPe * gatherObj->sdmaNumQueue;
+      HSAuint64* remoteSignal =
+          gatherObj->peerSignalPtrs[destPe] + static_cast<size_t>(myPe) * gatherObj->sdmaNumQueue;
 
-    mori::core::SdmaPutThread(srcPtr, dstPtr, chunkBytes, dh, remoteSignal, localExpected,
-                              gatherObj->sdmaNumQueue, 0);
-  }
-
-  if (blockIdx.x == 0 && warpId < npes && laneId == 0) {
-    int destPe = warpId;
-    mori::shmem::ShmemQuietThread(destPe, gatherObj);
-
-    uint64_t flag_val = 1;
-    mori::shmem::ShmemAtomicSizeNonFetchThread(
-        flagsObj, static_cast<size_t>(myPe) * sizeof(uint64_t), &flag_val, 8,
-        mori::core::atomicType::AMO_ADD, destPe);
+      mori::core::SdmaPutThread(srcPtr, dstPtr, chunkBytes, dh, remoteSignal,
+                                gatherObj->sdmaNumQueue, 0);
+    }
   }
 
   if (blockIdx.x == 0) {
@@ -111,13 +106,13 @@ __global__ void ShmemAllReduceKernel(int myPe, int npes, const uint32_t* __restr
     for (int sender = 0; sender < npes; ++sender) {
       if (sender == myPe) continue;
       if (threadIdx.x == 0) {
-        while (mori::core::AtomicLoadRelaxed(flags + sender) == 0) {
+        uint64_t expected = s_base[sender] + 1ULL;
+        HSAuint64* mySignal = gatherObj->signalPtrs
+                              + static_cast<size_t>(sender) * gatherObj->sdmaNumQueue;
+        while (mori::core::AtomicLoadRelaxed(mySignal) < expected) {
         }
       }
       __syncthreads();
-    }
-    if (threadIdx.x < static_cast<unsigned>(npes)) {
-      flags[threadIdx.x] = 0;
     }
   }
   __syncthreads();
@@ -154,30 +149,20 @@ __global__ void ShmemAllReduceKernel(int myPe, int npes, const uint32_t* __restr
   // =========================================================================
   if (blockIdx.x == 0 && warpId < npes && laneId == 0) {
     int destPe = warpId;
-    size_t offset = static_cast<size_t>(myPe) * chunkBytes;
+    if (destPe != myPe) {
+      size_t offset = static_cast<size_t>(myPe) * chunkBytes;
 
-    uint8_t* srcPtr = reinterpret_cast<uint8_t*>(gatherObj->localPtr) + offset;
-    uint8_t* dstPtr = reinterpret_cast<uint8_t*>(gatherObj->peerPtrs[destPe]) + offset;
+      uint8_t* srcPtr = reinterpret_cast<uint8_t*>(gatherObj->localPtr) + offset;
+      uint8_t* dstPtr = reinterpret_cast<uint8_t*>(gatherObj->peerPtrs[destPe]) + offset;
 
-    anvil::SdmaQueueDeviceHandle** dh =
-        gatherObj->deviceHandles_d + destPe * gatherObj->sdmaNumQueue;
-    HSAuint64* remoteSignal =
-        gatherObj->peerSignalPtrs[destPe] + static_cast<size_t>(myPe) * gatherObj->sdmaNumQueue;
-    HSAuint64* localExpected =
-        gatherObj->expectSignalsPtr + static_cast<size_t>(destPe) * gatherObj->sdmaNumQueue;
+      anvil::SdmaQueueDeviceHandle** dh =
+          gatherObj->deviceHandles_d + destPe * gatherObj->sdmaNumQueue;
+      HSAuint64* remoteSignal =
+          gatherObj->peerSignalPtrs[destPe] + static_cast<size_t>(myPe) * gatherObj->sdmaNumQueue;
 
-    mori::core::SdmaPutThread(srcPtr, dstPtr, chunkBytes, dh, remoteSignal, localExpected,
-                              gatherObj->sdmaNumQueue, 0);
-  }
-
-  if (blockIdx.x == 0 && warpId < npes && laneId == 0) {
-    int destPe = warpId;
-    mori::shmem::ShmemQuietThread(destPe, gatherObj);
-
-    uint64_t flag_val = 1;
-    mori::shmem::ShmemAtomicSizeNonFetchThread(
-        flagsObj, static_cast<size_t>(myPe) * sizeof(uint64_t), &flag_val, 8,
-        mori::core::atomicType::AMO_ADD, destPe);
+      mori::core::SdmaPutThread(srcPtr, dstPtr, chunkBytes, dh, remoteSignal,
+                                gatherObj->sdmaNumQueue, 0);
+    }
   }
 
   // =========================================================================
@@ -188,13 +173,13 @@ __global__ void ShmemAllReduceKernel(int myPe, int npes, const uint32_t* __restr
     for (int sender = 0; sender < npes; ++sender) {
       if (sender == myPe) continue;
       if (threadIdx.x == 0) {
-        while (mori::core::AtomicLoadRelaxed(flags + sender) == 0) {
+        uint64_t expected = s_base[sender] + 2ULL;
+        HSAuint64* mySignal = gatherObj->signalPtrs
+                              + static_cast<size_t>(sender) * gatherObj->sdmaNumQueue;
+        while (mori::core::AtomicLoadRelaxed(mySignal) < expected) {
         }
       }
       __syncthreads();
-    }
-    if (threadIdx.x < static_cast<unsigned>(npes)) {
-      flags[threadIdx.x] = 0;
     }
   }
 }

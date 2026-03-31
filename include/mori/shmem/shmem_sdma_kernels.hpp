@@ -41,17 +41,17 @@ template <>
 inline __device__ void ShmemPutMemNbiThreadKernel<application::TransportType::SDMA>(
     const application::SymmMemObjPtr dest, size_t destOffset,
     const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe, int qpId) {
-  int intraNodePe = pe % 8;
   uint8_t* srcPtr =
       reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(source->localPtr) + sourceOffset);
   uint8_t* dstPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[pe] + destOffset);
 
   anvil::SdmaQueueDeviceHandle** devicehandles =
-      dest->deviceHandles_d + intraNodePe * dest->sdmaNumQueue;
-  HSAuint64* signalAddr = dest->signalPtrs + intraNodePe * dest->sdmaNumQueue;
-  HSAuint64* expectedSignals = dest->expectSignalsPtr + intraNodePe * dest->sdmaNumQueue;
+      dest->deviceHandles_d + pe * dest->sdmaNumQueue;
+  int myPe = GetGlobalGpuStatesPtr()->rank;
+  HSAuint64* remoteSignal = dest->peerSignalPtrs[pe]
+                            + static_cast<size_t>(myPe) * dest->sdmaNumQueue;
 
-  core::SdmaPutThread(srcPtr, dstPtr, bytes, devicehandles, signalAddr, expectedSignals,
+  core::SdmaPutThread(srcPtr, dstPtr, bytes, devicehandles, remoteSignal,
                       dest->sdmaNumQueue, qpId);
 }
 
@@ -59,17 +59,17 @@ template <>
 inline __device__ void ShmemPutMemNbiWarpKernel<application::TransportType::SDMA>(
     const application::SymmMemObjPtr dest, size_t destOffset,
     const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe, int qpId) {
-  int intraNodePe = pe % 8;
   uint8_t* srcPtr =
       reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(source->localPtr) + sourceOffset);
   uint8_t* dstPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[pe] + destOffset);
 
   anvil::SdmaQueueDeviceHandle** devicehandles =
-      dest->deviceHandles_d + intraNodePe * dest->sdmaNumQueue;
-  HSAuint64* signalAddr = dest->signalPtrs + intraNodePe * dest->sdmaNumQueue;
-  HSAuint64* expectedSignals = dest->expectSignalsPtr + intraNodePe * dest->sdmaNumQueue;
+      dest->deviceHandles_d + pe * dest->sdmaNumQueue;
+  int myPe = GetGlobalGpuStatesPtr()->rank;
+  HSAuint64* remoteSignal = dest->peerSignalPtrs[pe]
+                            + static_cast<size_t>(myPe) * dest->sdmaNumQueue;
 
-  core::SdmaPutWarp(srcPtr, dstPtr, bytes, devicehandles, signalAddr, expectedSignals,
+  core::SdmaPutWarp(srcPtr, dstPtr, bytes, devicehandles, remoteSignal,
                     dest->sdmaNumQueue);
 }
 
@@ -93,7 +93,6 @@ inline __device__ void ShmemPutMemNbiThreadKernel<application::TransportType::SD
     const void* dest, const void* source, size_t bytes, int pe, int qpId) {
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   application::SymmMemObj* heapObj = globalGpuStates->heapObj;
-  int intraNodePe = pe % 8;
 
   uintptr_t destAddr = reinterpret_cast<uintptr_t>(dest);
   size_t offset = destAddr - globalGpuStates->heapBaseAddr;
@@ -102,11 +101,12 @@ inline __device__ void ShmemPutMemNbiThreadKernel<application::TransportType::SD
   uint8_t* dstPtr = reinterpret_cast<uint8_t*>(heapObj->peerPtrs[pe] + offset);
 
   anvil::SdmaQueueDeviceHandle** devicehandles =
-      heapObj->deviceHandles_d + intraNodePe * heapObj->sdmaNumQueue;
-  HSAuint64* signalAddr = heapObj->signalPtrs + intraNodePe * heapObj->sdmaNumQueue;
-  HSAuint64* expectedSignals = heapObj->expectSignalsPtr + intraNodePe * heapObj->sdmaNumQueue;
+      heapObj->deviceHandles_d + pe * heapObj->sdmaNumQueue;
+  int myPe = globalGpuStates->rank;
+  HSAuint64* remoteSignal = heapObj->peerSignalPtrs[pe]
+                            + static_cast<size_t>(myPe) * heapObj->sdmaNumQueue;
 
-  core::SdmaPutThread(srcPtr, dstPtr, bytes, devicehandles, signalAddr, expectedSignals,
+  core::SdmaPutThread(srcPtr, dstPtr, bytes, devicehandles, remoteSignal,
                       heapObj->sdmaNumQueue, qpId);
 }
 
@@ -115,7 +115,6 @@ inline __device__ void ShmemPutMemNbiWarpKernel<application::TransportType::SDMA
     const void* dest, const void* source, size_t bytes, int pe, int qpId) {
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   application::SymmMemObj* heapObj = globalGpuStates->heapObj;
-  int intraNodePe = pe % 8;
 
   uintptr_t destAddr = reinterpret_cast<uintptr_t>(dest);
   size_t offset = destAddr - globalGpuStates->heapBaseAddr;
@@ -124,11 +123,12 @@ inline __device__ void ShmemPutMemNbiWarpKernel<application::TransportType::SDMA
   uint8_t* dstPtr = reinterpret_cast<uint8_t*>(heapObj->peerPtrs[pe] + offset);
 
   anvil::SdmaQueueDeviceHandle** devicehandles =
-      heapObj->deviceHandles_d + intraNodePe * heapObj->sdmaNumQueue;
-  HSAuint64* signalAddr = heapObj->signalPtrs + intraNodePe * heapObj->sdmaNumQueue;
-  HSAuint64* expectedSignals = heapObj->expectSignalsPtr + intraNodePe * heapObj->sdmaNumQueue;
+      heapObj->deviceHandles_d + pe * heapObj->sdmaNumQueue;
+  int myPe = globalGpuStates->rank;
+  HSAuint64* remoteSignal = heapObj->peerSignalPtrs[pe]
+                            + static_cast<size_t>(myPe) * heapObj->sdmaNumQueue;
 
-  core::SdmaPutWarp(srcPtr, dstPtr, bytes, devicehandles, signalAddr, expectedSignals,
+  core::SdmaPutWarp(srcPtr, dstPtr, bytes, devicehandles, remoteSignal,
                     heapObj->sdmaNumQueue);
 }
 

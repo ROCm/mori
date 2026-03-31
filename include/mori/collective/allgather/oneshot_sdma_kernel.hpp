@@ -60,44 +60,31 @@ __global__ void OneShotAllGatherSdmaKernel(int myPe, int npes, T* input,
 
   if (warpId < npes && laneId == 0) {
     int remotePe = warpId;
-    size_t destByteOffset = myPe * bytesPerPeer;
-    size_t srcByteOffset = 0;
-    size_t sendBytes = bytesPerPeer;
-#if 1
-    application::SymmMemObjPtr dest = dstMemObj;
-    uint8_t* srcPtr = reinterpret_cast<uint8_t*>(inputData) + srcByteOffset;
-    uint8_t* dstPtr =
-        reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe]) + dstBaseOffset + destByteOffset;
-    anvil::SdmaQueueDeviceHandle** devicehandles =
-        dest->deviceHandles_d + remotePe * dest->sdmaNumQueue;
-    HSAuint64* signals = dest->signalPtrs + remotePe * dest->sdmaNumQueue;
-    HSAuint64* expectedSignals = dest->expectSignalsPtr + remotePe * dest->sdmaNumQueue;
-    core::SdmaPutThread(srcPtr, dstPtr, sendBytes, devicehandles, signals, expectedSignals,
-                        dest->sdmaNumQueue, 0);
-#endif
-  }
-
-  if (warpId < npes && laneId == 0) {
-    int remotePe = warpId;
-    shmem::ShmemQuietThread(remotePe, dstMemObj);
-    shmem::ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::SDMA>(
-        flagsMemObj, static_cast<size_t>(myPe) * sizeof(uint64_t), &flagVal, 8,
-        core::atomicType::AMO_SET, remotePe, 0);
+    if (remotePe != myPe) {
+      size_t destByteOffset = myPe * bytesPerPeer;
+      size_t sendBytes = bytesPerPeer;
+      application::SymmMemObjPtr dest = dstMemObj;
+      uint8_t* srcPtr = reinterpret_cast<uint8_t*>(inputData);
+      uint8_t* dstPtr =
+          reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe]) + dstBaseOffset + destByteOffset;
+      anvil::SdmaQueueDeviceHandle** devicehandles =
+          dest->deviceHandles_d + remotePe * dest->sdmaNumQueue;
+      HSAuint64* remoteSignal = dest->peerSignalPtrs[remotePe]
+                                + static_cast<size_t>(myPe) * dest->sdmaNumQueue;
+      core::SdmaPutThread(srcPtr, dstPtr, sendBytes, devicehandles, remoteSignal,
+                          dest->sdmaNumQueue, 0);
+    }
   }
   __syncthreads();
 
   for (int sender = 0; sender < npes; ++sender) {
-    if (sender == myPe) {
-      continue;
-    }
-
+    if (sender == myPe) continue;
     if (threadLinearId == 0) {
-      // Keep waiting for the peer completion flag. A finite spin threshold can
-      // produce false timeouts under heavy traffic and cause incorrect forward
-      // progress (kernel continues before data is actually ready).
+      HSAuint64* mySignal = dstMemObj->signalPtrs
+                            + static_cast<size_t>(sender) * dstMemObj->sdmaNumQueue;
       int spinCount = 0;
       bool warned = false;
-      while (core::AtomicLoadRelaxed(flags + sender) < flagVal) {
+      while (core::AtomicLoadRelaxed(mySignal) < flagVal) {
         ++spinCount;
         if (!warned && spinCount > 10000000) {
           printf("PE %d: Slow wait for data from peer %d (still waiting)\n", myPe, sender);
@@ -107,8 +94,6 @@ __global__ void OneShotAllGatherSdmaKernel(int myPe, int npes, T* input,
     }
     __syncthreads();
   }
-
-  // Monotonic generation flags; no reset needed.
 }
 }  // namespace collective
 }  // namespace mori

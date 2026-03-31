@@ -55,6 +55,13 @@ __global__ void SdmaSelfCopyKernel(const SymmMemObjPtr srcObj, void* dst, size_t
 
   uint32_t numQueues = srcObj->sdmaNumQueue;
 
+  __shared__ HSAuint64 s_baseline[8];
+  if (threadLinearId < numQueues) {
+    s_baseline[threadLinearId] = mori::core::AtomicLoadRelaxed(
+        srcObj->signalPtrs + static_cast<size_t>(myPe) * numQueues + threadLinearId);
+  }
+  __syncthreads();
+
   // Phase 1: multi-queue SDMA copy (self-to-self)
   if (threadLinearId < numQueues) {
     int qId = threadLinearId;
@@ -64,22 +71,21 @@ __global__ void SdmaSelfCopyKernel(const SymmMemObjPtr srcObj, void* dst, size_t
         (qId == (int)(numQueues - 1)) ? (totalBytes - (numQueues - 1) * chunkBase) : chunkBase;
 
     anvil::SdmaQueueDeviceHandle** dh = srcObj->deviceHandles_d + myPe * numQueues;
-    HSAuint64* signal = srcObj->signalPtrs + static_cast<size_t>(myPe) * numQueues;
-    HSAuint64* expectedSignals = srcObj->expectSignalsPtr + static_cast<size_t>(myPe) * numQueues;
+    HSAuint64* remoteSignal = srcObj->peerSignalPtrs[myPe]
+                              + static_cast<size_t>(myPe) * numQueues;
 
     uint8_t* srcPtr = reinterpret_cast<uint8_t*>(srcObj->localPtr) + offset;
     uint8_t* dstPtr = reinterpret_cast<uint8_t*>(dst) + offset;
 
-    SdmaPutThread(srcPtr, dstPtr, copyBytes, dh, signal, expectedSignals, numQueues, qId);
+    SdmaPutThread(srcPtr, dstPtr, copyBytes, dh, remoteSignal, numQueues, qId);
   }
   __syncthreads();
 
-  // Phase 2: wait for all queues (expectedSignals[qId] was bumped in SdmaPutThread)
+  // Phase 2: wait for all queues
   if (threadLinearId < numQueues) {
     int qId = threadLinearId;
     HSAuint64* signal = srcObj->signalPtrs + static_cast<size_t>(myPe) * numQueues;
-    HSAuint64* expectedSignals = srcObj->expectSignalsPtr + static_cast<size_t>(myPe) * numQueues;
-    anvil::waitForSignal(signal + qId, expectedSignals[qId]);
+    anvil::waitForSignal(signal + qId, s_baseline[qId] + 1);
   }
   __syncthreads();
 }

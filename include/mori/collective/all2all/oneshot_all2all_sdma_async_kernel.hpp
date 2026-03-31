@@ -71,44 +71,34 @@ __global__ void OneShotAll2allSdmaAsyncPutKernel(int myPe, int npes, T* input,
     else
       sendBytes = sendBytes_rand;
 
+    if (targetPe == myPe) return;
+
     application::SymmMemObjPtr dest = dstMemObj;
     uint8_t* srcPtr = reinterpret_cast<uint8_t*>(inputData) + srcByteOffset;
     uint8_t* dstPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[targetPe] + destByteOffset);
     anvil::SdmaQueueDeviceHandle** devicehandles =
         dest->deviceHandles_d + targetPe * dest->sdmaNumQueue;
-    HSAuint64* signals = dest->signalPtrs + targetPe * dest->sdmaNumQueue;
-    HSAuint64* expectedSignals = dest->expectSignalsPtr + targetPe * dest->sdmaNumQueue;
-    core::SdmaPutThread(srcPtr, dstPtr, sendBytes, devicehandles, signals, expectedSignals,
+    HSAuint64* remoteSignal = dest->peerSignalPtrs[targetPe]
+                              + static_cast<size_t>(myPe) * dest->sdmaNumQueue;
+    core::SdmaPutThread(srcPtr, dstPtr, sendBytes, devicehandles, remoteSignal,
                         dest->sdmaNumQueue, qId);
   }
 }
 
 __global__ void OneShotAll2allSdmaAsyncWaitKernel(int myPe, int npes,
                                                   const application::SymmMemObjPtr dstMemObj,
-                                                  const application::SymmMemObjPtr flagsMemObj) {
-  int flag_val = 1;
-  uint64_t* __restrict__ flags = reinterpret_cast<uint64_t*>(flagsMemObj->localPtr);
-
+                                                  const application::SymmMemObjPtr flagsMemObj,
+                                                  uint64_t flag_val = 1) {
   const size_t threadLinearId =
       static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + threadIdx.x;
 
-  if (threadLinearId < npes) {
-    int targetPe = threadLinearId;
-    shmem::ShmemQuietThread(targetPe, dstMemObj);
-    shmem::ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::SDMA>(
-        flagsMemObj, static_cast<size_t>(myPe) * sizeof(uint64_t), &flag_val, 8,
-        core::atomicType::AMO_ADD, targetPe, 0);
-  }
-  __syncthreads();
-
   for (int sender = 0; sender < npes; ++sender) {
-    if (sender == myPe) {
-      continue;
-    }
-
+    if (sender == myPe) continue;
     if (threadLinearId == 0) {
+      HSAuint64* mySignal = dstMemObj->signalPtrs
+                            + static_cast<size_t>(sender) * dstMemObj->sdmaNumQueue;
       int spinCount = 0;
-      while (core::AtomicLoadRelaxed(flags + sender) == 0) {
+      while (core::AtomicLoadRelaxed(mySignal) < flag_val) {
         ++spinCount;
         if (spinCount > 10000000) {
           printf("PE %d: Timeout waiting for data from peer %d\n", myPe, sender);
@@ -117,10 +107,6 @@ __global__ void OneShotAll2allSdmaAsyncWaitKernel(int myPe, int npes,
       }
     }
     __syncthreads();
-  }
-
-  if (threadLinearId < npes) {
-    flags[threadLinearId] = 0;
   }
 }
 }  // namespace collective

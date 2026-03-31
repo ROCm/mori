@@ -58,13 +58,12 @@ __global__ void ReduceScatterSdmaPutKernel(int myPe, int npes, T* input,
   if (threadLinearId < npes * dstMemObj->sdmaNumQueue) {
     int qId = threadLinearId % dstMemObj->sdmaNumQueue;
     int remotePe = threadLinearId / dstMemObj->sdmaNumQueue;
+    if (remotePe == myPe) return;
 
     const size_t sendBytesBase = bytesPerPeer / 8;
     size_t sendBytes = (qId == 7) ? (bytesPerPeer - 7 * sendBytesBase) : sendBytesBase;
 
-    // Source: shard for remotePe in my input, split by queue
     size_t srcByteOffset = remotePe * bytesPerPeer + qId * sendBytesBase;
-    // Destination: remotePe's output buffer, slot myPe, split by queue
     size_t destByteOffset = myPe * bytesPerPeer + qId * sendBytesBase;
 
     application::SymmMemObjPtr dest = dstMemObj;
@@ -73,9 +72,10 @@ __global__ void ReduceScatterSdmaPutKernel(int myPe, int npes, T* input,
 
     anvil::SdmaQueueDeviceHandle** devicehandles =
         dest->deviceHandles_d + remotePe * dest->sdmaNumQueue;
-    HSAuint64* signals = dest->signalPtrs + remotePe * dest->sdmaNumQueue;
-    HSAuint64* expectedSignals = dest->expectSignalsPtr + remotePe * dest->sdmaNumQueue;
-    core::SdmaPutThread(srcPtr, dstPtr, sendBytes, devicehandles, signals, expectedSignals,
+    HSAuint64* remoteSignal = dest->peerSignalPtrs[remotePe]
+                              + static_cast<size_t>(myPe) * dest->sdmaNumQueue;
+
+    core::SdmaPutThread(srcPtr, dstPtr, sendBytes, devicehandles, remoteSignal,
                         dest->sdmaNumQueue, qId);
   }
 }
@@ -121,24 +121,19 @@ __global__ void AllGatherAsyncPutKernel(int myPe, int npes,
 
   if (warpId < npes && laneId == 0) {
     int remotePe = warpId;
-    application::SymmMemObjPtr dest = dstMemObj;
+    if (remotePe != myPe) {
+      application::SymmMemObjPtr dest = dstMemObj;
 
-    uint8_t* agDstPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe]) +
-                        static_cast<size_t>(myPe) * elementCountPerRank * bytesPerElement;
+      uint8_t* agDstPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe]) +
+                          static_cast<size_t>(myPe) * elementCountPerRank * bytesPerElement;
 
-    anvil::SdmaQueueDeviceHandle** dh = dest->deviceHandles_d + remotePe * dest->sdmaNumQueue;
-    HSAuint64* sig = dest->signalPtrs + remotePe * dest->sdmaNumQueue;
-    HSAuint64* esig = dest->expectSignalsPtr + remotePe * dest->sdmaNumQueue;
-    core::SdmaPutThread(agSrcPtr, agDstPtr, agSendBytes, dh, sig, esig, dest->sdmaNumQueue, 0);
-  }
+      anvil::SdmaQueueDeviceHandle** dh = dest->deviceHandles_d + remotePe * dest->sdmaNumQueue;
+      HSAuint64* remoteSignal = dest->peerSignalPtrs[remotePe]
+                                + static_cast<size_t>(myPe) * dest->sdmaNumQueue;
 
-  // Notify remote PEs
-  if (warpId < npes && laneId == 0) {
-    int remotePe = warpId;
-    shmem::ShmemQuietThread(remotePe, dstMemObj);
-    shmem::ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::SDMA>(
-        flagsMemObj, static_cast<size_t>(myPe) * sizeof(uint64_t), &flag_val, 8,
-        core::atomicType::AMO_SET, remotePe, 0);
+      core::SdmaPutThread(agSrcPtr, agDstPtr, agSendBytes,
+                          dh, remoteSignal, dest->sdmaNumQueue, 0);
+    }
   }
 }
 
@@ -150,20 +145,19 @@ __global__ void AllGatherAsyncPutKernel(int myPe, int npes,
 // Paired with AllGatherAsyncPutKernel above.
 // ============================================================
 __global__ void AllGatherAsyncWaitKernel(int myPe, int npes,
-                                         const application::SymmMemObjPtr flagsMemObj,
+                                         const application::SymmMemObjPtr dstMemObj,
                                          CrossPeBarrier* __restrict__ barrier,
                                          size_t elementCount) {
-  uint64_t* __restrict__ flags = reinterpret_cast<uint64_t*>(flagsMemObj->localPtr);
-
-  // Read the generation token set by AllGatherAsyncPutKernel
   uint64_t flag_val = static_cast<uint64_t>(barrier->flag);
 
   for (int sender = 0; sender < npes; ++sender) {
     if (sender == myPe) continue;
     if (threadIdx.x == 0) {
+      HSAuint64* mySignal = dstMemObj->signalPtrs
+                            + static_cast<size_t>(sender) * dstMemObj->sdmaNumQueue;
       int spin = 0;
       bool warned = false;
-      while (core::AtomicLoadRelaxed(flags + sender) < flag_val) {
+      while (core::AtomicLoadRelaxed(mySignal) < flag_val) {
         if (++spin > 100000000 && !warned) {
           printf("PE %d: AllGather wait timeout for peer %d\n", myPe, sender);
           warned = true;
@@ -172,14 +166,6 @@ __global__ void AllGatherAsyncWaitKernel(int myPe, int npes,
     }
     __syncthreads();
   }
-
-  // Ensure SDMA-written data is visible to subsequent CU reads.
-  // SDMA AllGather writes bypass L2/L1, so flush caches to force re-fetch.
-  __threadfence_system();
-  if (threadIdx.x == 0) {
-    // asm volatile("buffer_wbinvl1_vol" ::: "memory");
-  }
-  __syncthreads();
 }
 
 // ============================================================
@@ -317,11 +303,11 @@ __global__ void AllGatherReducedSdmaPutKernel(int myPe, int npes,
   if (threadLinearId < npes * dstMemObj->sdmaNumQueue) {
     int qId = threadLinearId % dstMemObj->sdmaNumQueue;
     int remotePe = threadLinearId / dstMemObj->sdmaNumQueue;
+    if (remotePe == myPe) return;
 
     const size_t sendBytesBase = bytesPerPeer / 8;
     size_t sendBytes = (qId == 7) ? (bytesPerPeer - 7 * sendBytesBase) : sendBytesBase;
 
-    // Both source and destination are at slot myPe, split by queue
     size_t byteOffset = myPe * bytesPerPeer + qId * sendBytesBase;
 
     application::SymmMemObjPtr dest = dstMemObj;
@@ -331,9 +317,10 @@ __global__ void AllGatherReducedSdmaPutKernel(int myPe, int npes,
 
     anvil::SdmaQueueDeviceHandle** devicehandles =
         dest->deviceHandles_d + remotePe * dest->sdmaNumQueue;
-    HSAuint64* signals = dest->signalPtrs + remotePe * dest->sdmaNumQueue;
-    HSAuint64* expectedSignals = dest->expectSignalsPtr + remotePe * dest->sdmaNumQueue;
-    core::SdmaPutThread(srcPtr, dstPtr, sendBytes, devicehandles, signals, expectedSignals,
+    HSAuint64* remoteSignal = dest->peerSignalPtrs[remotePe]
+                              + static_cast<size_t>(myPe) * dest->sdmaNumQueue;
+
+    core::SdmaPutThread(srcPtr, dstPtr, sendBytes, devicehandles, remoteSignal,
                         dest->sdmaNumQueue, qId);
   }
 }
@@ -380,45 +367,38 @@ __global__ void ReduceScatterAllGatherFusedKernel(int myPe, int npes, const T* _
   // with generation counter, device-scope broadcast to all blocks.
   // =========================================================================
   if (blockIdx.x == 0) {
-    uint64_t* __restrict__ flags = reinterpret_cast<uint64_t*>(flagsMemObj->localPtr);
     uint64_t flag_val = static_cast<uint64_t>(s_next);
 
     const int warpId = static_cast<int>(threadIdx.x) / warpSize;
     const int laneId = static_cast<int>(threadIdx.x) % warpSize;
 
-    // Phase 1: SDMA scatter — each warp handles one destination PE
     if (warpId < npes && laneId == 0) {
       int destPe = warpId;
+      if (destPe != myPe) {
+        uint8_t* srcPtr = reinterpret_cast<uint8_t*>(const_cast<T*>(input)) +
+                          static_cast<size_t>(destPe) * chunkBytes;
+        uint8_t* remoteDst = reinterpret_cast<uint8_t*>(dstMemObj->peerPtrs[destPe]) +
+                             static_cast<size_t>(myPe) * chunkBytes;
 
-      uint8_t* srcPtr = reinterpret_cast<uint8_t*>(const_cast<T*>(input)) +
-                        static_cast<size_t>(destPe) * chunkBytes;
-      uint8_t* remoteDst = reinterpret_cast<uint8_t*>(dstMemObj->peerPtrs[destPe]) +
-                           static_cast<size_t>(myPe) * chunkBytes;
+        anvil::SdmaQueueDeviceHandle** dh =
+            dstMemObj->deviceHandles_d + destPe * dstMemObj->sdmaNumQueue;
+        HSAuint64* remoteSignal = dstMemObj->peerSignalPtrs[destPe]
+                                  + static_cast<size_t>(myPe) * dstMemObj->sdmaNumQueue;
 
-      anvil::SdmaQueueDeviceHandle** dh =
-          dstMemObj->deviceHandles_d + destPe * dstMemObj->sdmaNumQueue;
-      HSAuint64* sig = dstMemObj->signalPtrs + destPe * dstMemObj->sdmaNumQueue;
-      HSAuint64* esig = dstMemObj->expectSignalsPtr + destPe * dstMemObj->sdmaNumQueue;
-      core::SdmaPutThread(srcPtr, remoteDst, chunkBytes, dh, sig, esig, dstMemObj->sdmaNumQueue, 0);
-    }
-
-    // Notify remote PEs that our data has landed
-    if (warpId < npes && laneId == 0) {
-      int destPe = warpId;
-      shmem::ShmemQuietThread(destPe, dstMemObj);
-      shmem::ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::SDMA>(
-          flagsMemObj, static_cast<size_t>(myPe) * sizeof(uint64_t), &flag_val, 8,
-          core::atomicType::AMO_SET, destPe, 0);
+        core::SdmaPutThread(srcPtr, remoteDst, chunkBytes,
+                            dh, remoteSignal, dstMemObj->sdmaNumQueue, 0);
+      }
     }
     __syncthreads();
 
-    // Phase 2: Wait for all peers' scatter
     for (int sender = 0; sender < npes; ++sender) {
       if (sender == myPe) continue;
       if (threadIdx.x == 0) {
+        HSAuint64* mySignal = dstMemObj->signalPtrs
+                              + static_cast<size_t>(sender) * dstMemObj->sdmaNumQueue;
         int spin = 0;
         bool warned = false;
-        while (core::AtomicLoadRelaxed(flags + sender) < flag_val) {
+        while (core::AtomicLoadRelaxed(mySignal) < flag_val) {
           if (++spin > 100000000 && !warned) {
             printf("PE %d: Fused scatter timeout waiting for peer %d\n", myPe, sender);
             warned = true;
@@ -428,10 +408,10 @@ __global__ void ReduceScatterAllGatherFusedKernel(int myPe, int npes, const T* _
       __syncthreads();
     }
 
-    // Broadcast to all local blocks: scatter done
     if (threadIdx.x == 0) {
       __scoped_atomic_store_n(&barrier->flag, s_next, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
     }
+    __syncthreads();
   } else {
     // Non-zero blocks: wait for block 0's broadcast (device-scope, L2 only)
     if (threadIdx.x == 0) {
@@ -471,13 +451,13 @@ __global__ void ReduceScatterAllGatherFusedKernel(int myPe, int npes, const T* _
     myDst[k] = downcast_v<typename P::type, pack_size>(acc);
   }
 
-  // Flush dirty L2 lines to HBM so SDMA-based AllGather reads fresh data.
-#if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
   __syncthreads();
   if (threadIdx.x == 0) {
+#if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
     asm volatile("buffer_wbl2" ::: "memory");
-  }
 #endif
+    __threadfence_system();
+  }
 }
 
 }  // namespace collective
