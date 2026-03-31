@@ -21,10 +21,10 @@
 # SOFTWARE.
 import mori
 from collections import namedtuple
-from tests.python.ops.test_dispatch_combine import (
-    EpDispatchCombineTestCase,
+from tests.python.ops.dispatch_combine_test_utils import (
     _is_fp4x2_dtype,
     unpack_fp4x2,
+    EpDispatchCombineTestCase,
 )
 from tests.python.utils import TorchDistContext, get_free_port
 import torch
@@ -663,7 +663,7 @@ def _bench_dispatch_combine(
         max_num_inp_token_per_rank=max_num_inp_token_per_rank,
         num_experts_per_rank=num_experts_per_rank,
         num_experts_per_token=num_experts_per_token,
-        num_worst_token=num_worst_token,
+        max_total_recv_tokens=0,
         warp_num_per_block=16,
         block_num=80,
         use_external_inp_buf=not zero_copy,  # zero-copy mode requires use_external_inp_buf=False

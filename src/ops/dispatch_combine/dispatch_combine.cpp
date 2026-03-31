@@ -112,6 +112,19 @@ EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config_
   config.enableSdma = env::IsEnvVarEnabled("MORI_ENABLE_SDMA");
   MORI_OPS_INFO("EpDispatchCombine SDMA {} (currently only effective for AsyncLL kernel type)",
                 config.enableSdma ? "enabled" : "disabled");
+  if (config.maxTotalRecvTokens > 0) {
+    int worstCase = config.worldSize * config.maxNumInpTokenPerRank;
+    if (config.maxTotalRecvTokens > worstCase) {
+      MORI_OPS_INFO("maxTotalRecvTokens={} exceeds worst case {}, clamping to worst case",
+                    config.maxTotalRecvTokens, worstCase);
+      config.maxTotalRecvTokens = worstCase;
+    }
+    MORI_OPS_INFO(
+        "maxTotalRecvTokens={}, effective MaxNumTokensToRecvPerRank={}, "
+        "buffer MaxNumTokensToRecv={} (original worst case={})",
+        config.maxTotalRecvTokens, config.MaxNumTokensToRecvPerRank(), config.MaxNumTokensToRecv(),
+        worstCase);
+  }
   InitializeShmemBuf();
   InitializeTokenNumSignalBuf();
   InitializeOrderMapBuf();
@@ -139,20 +152,36 @@ mori::application::SymmMemObjPtr ShmemMallocAndReturnMemObjPtr(size_t size, unsi
 }
 
 void EpDispatchCombineHandle::InitializeShmemBuf() {
-  size_t maxTokenSize = static_cast<ssize_t>(config.MaxNumTokensToRecv()) * config.hiddenDim *
-                        config.maxTokenTypeSize;
+  size_t combineOutSize = static_cast<ssize_t>(config.MaxNumTokensToSendPerRank()) *
+                          config.hiddenDim * config.maxTokenTypeSize;
+  size_t dispatchOutSize = static_cast<ssize_t>(config.MaxNumTokensToRecv()) * config.hiddenDim *
+                           config.maxTokenTypeSize;
+  size_t maxStagingSize = static_cast<ssize_t>(config.MaxNumTokensToRecv()) *
+                          (config.hiddenDim * config.maxTokenTypeSize +
+                           (sizeof(float) + sizeof(index_t)) * config.numExpertPerToken +
+                           config.scaleDim * config.scaleTypeSize);
 
-  size_t maxStagingTokSize = static_cast<ssize_t>(config.MaxNumTokensToRecv()) *
-                             (config.hiddenDim * config.maxTokenTypeSize +
-                              (sizeof(float) + sizeof(index_t)) * config.numExpertPerToken +
-                              config.scaleDim * config.scaleTypeSize);
-  shmemDispatchInpTokMemObj =
-      ShmemMallocAndReturnMemObjPtr(maxStagingTokSize, hipDeviceMallocUncached);
-  shmemCombineInpTokMemObj =
-      ShmemMallocAndReturnMemObjPtr(maxStagingTokSize, hipDeviceMallocUncached);
-  shmemDispatchOutTokMemObj = ShmemMallocAndReturnMemObjPtr(maxTokenSize, hipDeviceMallocUncached);
-  shmemCombineOutTokMemObj = ShmemMallocAndReturnMemObjPtr(maxTokenSize, hipDeviceMallocUncached);
-  shmemStagingTokMemObj = ShmemMallocAndReturnMemObjPtr(maxStagingTokSize, hipDeviceMallocUncached);
+  if (config.kernelType == KernelType::IntraNode) {
+    auto& bufs = shmemTokBufs.emplace<ShmemBufsIntraNode>();
+    bufs.combineInp = ShmemMallocAndReturnMemObjPtr(maxStagingSize, hipDeviceMallocUncached);
+    bufs.dispatchOut = ShmemMallocAndReturnMemObjPtr(dispatchOutSize, hipDeviceMallocUncached);
+    bufs.combineOut = ShmemMallocAndReturnMemObjPtr(combineOutSize, hipDeviceMallocUncached);
+  } else if (config.kernelType == KernelType::InterNodeV1 ||
+             config.kernelType == KernelType::InterNodeV1LL) {
+    auto& bufs = shmemTokBufs.emplace<ShmemBufsInterNodeV1>();
+    bufs.dispatchInp = ShmemMallocAndReturnMemObjPtr(maxStagingSize, hipDeviceMallocUncached);
+    bufs.combineInp = ShmemMallocAndReturnMemObjPtr(maxStagingSize, hipDeviceMallocUncached);
+    bufs.staging = ShmemMallocAndReturnMemObjPtr(maxStagingSize, hipDeviceMallocUncached);
+    bufs.dispatchOut = ShmemMallocAndReturnMemObjPtr(dispatchOutSize, hipDeviceMallocUncached);
+    bufs.combineOut = ShmemMallocAndReturnMemObjPtr(combineOutSize, hipDeviceMallocUncached);
+  } else {
+    auto& bufs = shmemTokBufs.emplace<ShmemBufsInterNode>();
+    bufs.dispatchInp = ShmemMallocAndReturnMemObjPtr(maxStagingSize, hipDeviceMallocUncached);
+    bufs.combineInp = ShmemMallocAndReturnMemObjPtr(maxStagingSize, hipDeviceMallocUncached);
+    bufs.staging = ShmemMallocAndReturnMemObjPtr(maxStagingSize, hipDeviceMallocUncached);
+    bufs.dispatchOut = ShmemMallocAndReturnMemObjPtr(dispatchOutSize, hipDeviceMallocUncached);
+    bufs.combineOut = ShmemMallocAndReturnMemObjPtr(combineOutSize, hipDeviceMallocUncached);
+  }
 
   size_t maxWeightSize = config.MaxNumTokensToRecv() * config.numExpertPerToken * sizeof(float);
   shmemInpWeightsMemObj = ShmemMallocAndReturnMemObjPtr(maxWeightSize, hipDeviceMallocUncached);
@@ -183,11 +212,27 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
 }
 
 void EpDispatchCombineHandle::FinalizeShmemBuf() {
-  ShmemFree(shmemDispatchInpTokMemObj->localPtr);
-  ShmemFree(shmemCombineInpTokMemObj->localPtr);
-  ShmemFree(shmemDispatchOutTokMemObj->localPtr);
-  ShmemFree(shmemCombineOutTokMemObj->localPtr);
-  ShmemFree(shmemStagingTokMemObj->localPtr);
+  if (config.kernelType == KernelType::IntraNode) {
+    auto& bufs = std::get<ShmemBufsIntraNode>(shmemTokBufs);
+    ShmemFree(bufs.dispatchOut->localPtr);
+    ShmemFree(bufs.combineInp->localPtr);
+    ShmemFree(bufs.combineOut->localPtr);
+  } else if (config.kernelType == KernelType::InterNodeV1 ||
+             config.kernelType == KernelType::InterNodeV1LL) {
+    auto& bufs = std::get<ShmemBufsInterNodeV1>(shmemTokBufs);
+    ShmemFree(bufs.dispatchInp->localPtr);
+    ShmemFree(bufs.combineInp->localPtr);
+    ShmemFree(bufs.dispatchOut->localPtr);
+    ShmemFree(bufs.combineOut->localPtr);
+    ShmemFree(bufs.staging->localPtr);
+  } else {
+    auto& bufs = std::get<ShmemBufsInterNode>(shmemTokBufs);
+    ShmemFree(bufs.dispatchInp->localPtr);
+    ShmemFree(bufs.combineInp->localPtr);
+    ShmemFree(bufs.dispatchOut->localPtr);
+    ShmemFree(bufs.combineOut->localPtr);
+    ShmemFree(bufs.staging->localPtr);
+  }
   ShmemFree(shmemInpWeightsMemObj->localPtr);
   ShmemFree(shmemDispatchOutWeightsMemObj->localPtr);
   ShmemFree(shmemCombineOutWeightsMemObj->localPtr);
@@ -225,7 +270,8 @@ void EpDispatchCombineHandle::FinalizeTokenNumSignalBuf() {
 }
 
 void EpDispatchCombineHandle::InitializeOrderMapBuf() {
-  size_t maxNumOutToken = config.worldSize * config.maxNumInpTokenPerRank * config.numExpertPerRank;
+  size_t maxNumOutToken =
+      config.worldSize * config.MaxNumTokensToRecvPerRank() * config.numExpertPerRank;
   HIP_RUNTIME_CHECK(hipMalloc(&dispReceiverIdxMap, maxNumOutToken * sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(dispReceiverIdxMap, 0, maxNumOutToken * sizeof(index_t)));
 
@@ -257,7 +303,7 @@ void EpDispatchCombineHandle::InitializeOrderMapBuf() {
   HIP_RUNTIME_CHECK(hipMemset(dispDestTokIdMap, 0, maxNumOutToken * sizeof(index_t)));
 
   size_t maxNumInterNodeToken = config.worldSize / config.gpuPerNode *
-                                config.maxNumInpTokenPerRank * config.numExpertPerToken;
+                                config.MaxNumTokensToRecvPerRank() * config.numExpertPerToken;
   HIP_RUNTIME_CHECK(hipMalloc(&interNodeDispDestTokIdMap, maxNumInterNodeToken * sizeof(index_t)));
   HIP_RUNTIME_CHECK(
       hipMemset(interNodeDispDestTokIdMap, 0, maxNumInterNodeToken * sizeof(index_t)));
@@ -268,7 +314,7 @@ void EpDispatchCombineHandle::InitializeOrderMapBuf() {
       hipMemset(blockFlagCounter, 0, config.worldSize / config.gpuPerNode * sizeof(index_t)));
 
   size_t interNodeDispSendMapSize =
-      config.worldSize / config.gpuPerNode * config.maxNumInpTokenPerRank * sizeof(index_t);
+      config.worldSize / config.gpuPerNode * config.MaxNumTokensToRecvPerRank() * sizeof(index_t);
   HIP_RUNTIME_CHECK(hipMalloc(&interNodeDispSendMap, interNodeDispSendMapSize));
   HIP_RUNTIME_CHECK(hipMemset(interNodeDispSendMap, 0, interNodeDispSendMapSize));
 
@@ -358,11 +404,14 @@ EpDispatchCombineArgsRaw GetEpDispatchCombineArgsRaw(const EpDispatchCombineHand
   args.scalesBuf = handle.scalesBuf;
   args.destPeTokenCounter = handle.destPeTokenCounter;
   args.localPeTokenCounter = handle.localPeTokenCounter;
-  args.shmemDispatchInpTokMemObj = handle.shmemDispatchInpTokMemObj;
-  args.shmemCombineInpTokMemObj = handle.shmemCombineInpTokMemObj;
-  args.shmemDispatchOutTokMemObj = handle.shmemDispatchOutTokMemObj;
-  args.shmemCombineOutTokMemObj = handle.shmemCombineOutTokMemObj;
-  args.shmemStagingTokMemObj = handle.shmemStagingTokMemObj;
+  if (handle.config.kernelType == KernelType::IntraNode) {
+    args.intraNodeTokBufs = std::get<ShmemBufsIntraNode>(handle.shmemTokBufs);
+  } else if (handle.config.kernelType == KernelType::InterNodeV1 ||
+             handle.config.kernelType == KernelType::InterNodeV1LL) {
+    args.interNodeV1TokBufs = std::get<ShmemBufsInterNodeV1>(handle.shmemTokBufs);
+  } else {
+    args.interNodeTokBufs = std::get<ShmemBufsInterNode>(handle.shmemTokBufs);
+  }
   args.shmemInpWeightsMemObj = handle.shmemInpWeightsMemObj;
   args.shmemDispatchOutWeightsMemObj = handle.shmemDispatchOutWeightsMemObj;
   args.shmemCombineOutWeightsMemObj = handle.shmemCombineOutWeightsMemObj;

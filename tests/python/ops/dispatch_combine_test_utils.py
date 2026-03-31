@@ -19,14 +19,10 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-import os
 import pytest
-import mori
 from tests.python.utils import TorchDistProcessManager, data_type_supported
 import torch
 import torch.distributed as dist
-
-os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "4G")
 
 TORCH_FLOAT4_E2M1FN_X2 = getattr(torch, "float4_e2m1fn_x2", None)
 
@@ -69,6 +65,67 @@ def unpack_fp4x2(fp4x2_tensor, dtype=torch.bfloat16):
     return result.reshape(*raw.shape[:-1], raw.shape[-1] * 2)
 
 
+def _all_data_types():
+    """Return parametrize list of all supported data types with skipif marks."""
+    types = [
+        torch.bfloat16,
+        pytest.param(
+            torch.float8_e4m3fnuz,
+            marks=pytest.mark.skipif(
+                not data_type_supported(torch.float8_e4m3fnuz),
+                reason="Skip float8_e4m3fnuz, it is not supported",
+            ),
+        ),
+        pytest.param(
+            torch.float8_e4m3fn,
+            marks=pytest.mark.skipif(
+                not data_type_supported(torch.float8_e4m3fn),
+                reason="Skip float8_e4m3fn, it is not supported",
+            ),
+        ),
+    ]
+    if TORCH_FLOAT4_E2M1FN_X2 is not None:
+        types.append(
+            pytest.param(
+                TORCH_FLOAT4_E2M1FN_X2,
+                marks=pytest.mark.skipif(
+                    not data_type_supported(TORCH_FLOAT4_E2M1FN_X2),
+                    reason="Skip float4_e2m1fn_x2, it is not supported",
+                ),
+            )
+        )
+    return types
+
+
+def start_torch_dist_process_manager(world_size=8, disable_p2p=False):
+    if disable_p2p:
+        torch.cuda.empty_cache()
+        import os
+
+        os.environ["MORI_DISABLE_P2P"] = "1"
+
+    try:
+        torch.multiprocessing.set_start_method("spawn", force=True)
+        print("Multiprocessing start method set to spawn")
+    except RuntimeError:
+        pass
+
+    manager = TorchDistProcessManager()
+    manager.start_workers(world_size=world_size)
+    return manager
+
+
+def assert_worker_results(manager, world_size):
+    results = []
+    for _ in range(world_size):
+        rank, result = manager.result_queue.get()
+        results.append((rank, result))
+
+    for _, result in sorted(results, key=lambda item: item[0]):
+        if result is not None:
+            pytest.assume(False, result)
+
+
 class EpDispatchCombineTestCase:
     def __init__(self, config):
         self.config = config
@@ -80,12 +137,13 @@ class EpDispatchCombineTestCase:
         torch.cuda.synchronize()
         dist.barrier()
 
-    def gen_test_data(self, use_max_token_num=False):
+    def gen_test_data(self, use_max_token_num=False, routing="random"):
+        """Generate test data."""
         if use_max_token_num:
             num_token = torch.tensor(
                 [
                     self.config.max_num_inp_token_per_rank
-                    for i in range(self.config.world_size)
+                    for _ in range(self.config.world_size)
                 ]
             ).to(self.device)
         else:
@@ -97,25 +155,38 @@ class EpDispatchCombineTestCase:
                 device=self.device,
             )
 
-        # gen indices
+        total_experts = self.config.num_experts_per_rank * self.config.world_size
+
         all_rank_indices = []
         for r in range(self.config.world_size):
-            indices = torch.empty(
-                num_token[r],
-                self.config.num_experts_per_token,
-                dtype=torch.int64,
-                # device=self.device,
-            )
-            for i in range(num_token[r]):
-                perm = torch.randperm(
-                    self.config.num_experts_per_rank * self.config.world_size,
-                    generator=self.rng,
-                    device=self.device,
+            n = int(num_token[r])
+            if routing == "round_robin":
+                indices = torch.empty(
+                    n, self.config.num_experts_per_token, dtype=torch.int64
                 )
-                indices[i] = perm[: self.config.num_experts_per_token]
+                for i in range(n):
+                    base = (
+                        r * self.config.max_num_inp_token_per_rank + i
+                    ) * self.config.num_experts_per_token
+                    for j in range(self.config.num_experts_per_token):
+                        indices[i, j] = (base + j) % total_experts
+            elif routing == "all_to_one":
+                indices = torch.zeros(
+                    n, self.config.num_experts_per_token, dtype=torch.int64
+                )
+            else:
+                indices = torch.empty(
+                    n, self.config.num_experts_per_token, dtype=torch.int64
+                )
+                for i in range(n):
+                    perm = torch.randperm(
+                        total_experts,
+                        generator=self.rng,
+                        device=self.device,
+                    )
+                    indices[i] = perm[: self.config.num_experts_per_token]
             all_rank_indices.append(indices.to(torch.int32).to(self.device))
 
-        # gen weights
         all_rank_weights = [
             torch.rand(
                 num_token[r],
@@ -127,7 +198,6 @@ class EpDispatchCombineTestCase:
             for r in range(self.config.world_size)
         ]
 
-        # gen scales
         all_rank_scales = [
             torch.rand(
                 num_token[r],
@@ -141,8 +211,6 @@ class EpDispatchCombineTestCase:
         if self.config.scale_type_size == 1:
             all_rank_scales = [t.to(torch.float8_e4m3fnuz) for t in all_rank_scales]
 
-        # gen input & output
-        # some functions such as randn and cat are not implemented for fp8
         all_rank_input = []
         for r in range(self.config.world_size):
             input_fp32 = torch.randn(
@@ -185,7 +253,7 @@ class EpDispatchCombineTestCase:
     ):
         self.sync()
         (
-            all_rank_num_token,
+            _,
             all_rank_indices,
             all_rank_input,
             all_rank_weights,
@@ -194,8 +262,8 @@ class EpDispatchCombineTestCase:
         src_token_pos = op.get_dispatch_src_token_pos()
 
         for i, pos in enumerate(src_token_pos):
-            src_rank = int(pos) // self.config.max_num_inp_token_per_rank
-            src_id = int(pos) % self.config.max_num_inp_token_per_rank
+            src_rank = int(pos) // self.config.max_num_tokens_to_recv
+            src_id = int(pos) % self.config.max_num_tokens_to_recv
             if _is_fp4x2_dtype(self.config.data_type):
                 assert torch.equal(
                     all_rank_input[src_rank][src_id].view(torch.uint8),
@@ -297,7 +365,7 @@ class EpDispatchCombineTestCase:
 
     def run_test_once(self, op, test_data):
         (
-            all_rank_num_token,
+            _,
             all_rank_indices,
             all_rank_input,
             all_rank_weights,
@@ -339,147 +407,3 @@ class EpDispatchCombineTestCase:
         )
         self.sync()
         self.check_combine_result(op, test_data, combine_output, combine_output_weight)
-
-
-@pytest.fixture(scope="session")
-def torch_dist_process_manager():
-    try:
-        torch.multiprocessing.set_start_method("spawn", force=True)
-        print("Multiprocessing start method set to spawn")
-    except RuntimeError:
-        pass
-    manager = TorchDistProcessManager()
-    manager.start_workers(world_size=8)
-    yield manager
-    manager.shutdown()
-
-
-def _test_dispatch_combine(
-    rank,
-    world_size,
-    data_type,
-    hidden_dim,
-    scale_dim,
-    scale_type_size,
-    max_num_inp_token_per_rank,
-    num_experts_per_rank,
-    num_experts_per_token,
-    use_external_inp_buf,
-    quant_type="none",
-):
-    config = mori.ops.EpDispatchCombineConfig(
-        data_type=data_type,
-        rank=rank,
-        world_size=world_size,
-        hidden_dim=hidden_dim // 2 if _is_fp4x2_dtype(data_type) else hidden_dim,
-        scale_dim=scale_dim,
-        scale_type_size=scale_type_size,
-        max_num_inp_token_per_rank=max_num_inp_token_per_rank,
-        num_experts_per_rank=num_experts_per_rank,
-        num_experts_per_token=num_experts_per_token,
-        max_token_type_size=4,
-        block_num=40,
-        warp_num_per_block=8,
-        use_external_inp_buf=use_external_inp_buf,
-        quant_type=quant_type,
-    )
-    op = mori.ops.EpDispatchCombineOp(config)
-    test_case = EpDispatchCombineTestCase(config)
-    test_data = test_case.gen_test_data()
-    test_case.run_test_once(op, test_data)
-
-
-# TODO: create a sub process group so that we can test worlds size < 8
-@pytest.mark.parametrize("world_size", (8,))
-@pytest.mark.parametrize(
-    "data_type",
-    (
-        [
-            torch.bfloat16,
-            pytest.param(
-                torch.float8_e4m3fnuz,
-                marks=pytest.mark.skipif(
-                    not data_type_supported(torch.float8_e4m3fnuz),
-                    reason="Skip float8_e4m3fnuz, it is not supported",
-                ),
-            ),
-            pytest.param(
-                torch.float8_e4m3fn,
-                marks=pytest.mark.skipif(
-                    not data_type_supported(torch.float8_e4m3fn),
-                    reason="Skip float8_e4m3fn, it is not supported",
-                ),
-            ),
-        ]
-        + (
-            [
-                pytest.param(
-                    TORCH_FLOAT4_E2M1FN_X2,
-                    marks=pytest.mark.skipif(
-                        not data_type_supported(TORCH_FLOAT4_E2M1FN_X2),
-                        reason="Skip float4_e2m1fn_x2, it is not supported",
-                    ),
-                )
-            ]
-            if TORCH_FLOAT4_E2M1FN_X2 is not None
-            else []
-        )
-    ),
-)
-@pytest.mark.parametrize("hidden_dim", (7168, 4096))
-@pytest.mark.parametrize("scale_dim", (0, 32))
-@pytest.mark.parametrize("scale_type_size", (1, 4))
-@pytest.mark.parametrize("max_num_inp_token_per_rank", (1, 128))
-@pytest.mark.parametrize("num_experts_per_rank", (32,))
-@pytest.mark.parametrize("num_experts_per_token", (8,))
-@pytest.mark.parametrize("use_external_inp_buf", (True, False))
-@pytest.mark.parametrize("quant_type", ("none", "fp8_direct_cast"))
-def test_dispatch_combine(
-    torch_dist_process_manager,
-    world_size,
-    data_type,
-    hidden_dim,
-    scale_dim,
-    scale_type_size,
-    max_num_inp_token_per_rank,
-    num_experts_per_rank,
-    num_experts_per_token,
-    use_external_inp_buf,
-    quant_type,
-):
-    # fp8_direct_cast is not supported in zero-copy mode (use_external_inp_buf=False)
-    if quant_type == "fp8_direct_cast" and not use_external_inp_buf:
-        pytest.skip("fp8_direct_cast is not supported in zero-copy mode")
-    if quant_type == "fp8_direct_cast" and data_type is not torch.bfloat16:
-        pytest.skip("fp8_direct_cast is only supported for bfloat16 data type")
-
-    for i in range(world_size):
-        torch_dist_process_manager.task_queue.put(
-            (
-                _test_dispatch_combine,
-                [
-                    world_size,
-                    data_type,
-                    hidden_dim,
-                    scale_dim,
-                    scale_type_size,
-                    max_num_inp_token_per_rank,
-                    num_experts_per_rank,
-                    num_experts_per_token,
-                    use_external_inp_buf,
-                    quant_type,
-                ],
-            )
-        )
-
-    results = []
-    for i in range(world_size):
-        (
-            rank,
-            result,
-        ) = torch_dist_process_manager.result_queue.get()
-        results.append(result)
-
-    for result in results:
-        if result is not None:
-            pytest.assume(False, result)

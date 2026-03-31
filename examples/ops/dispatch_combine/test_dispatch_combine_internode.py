@@ -417,7 +417,7 @@ class EpDispatchCombineTestCase:
         rank_counts, _, _ = self.count_token_num(all_rank_indices)
 
         src_token_pos = op.get_dispatch_src_token_pos().tolist()
-        max_num_token_to_send_per_rank = self.config.max_num_inp_token_per_rank
+        # max_num_token_to_send_per_rank = self.config.max_num_inp_token_per_rank
         recv_token_num = len(src_token_pos)
 
         # Check recv token num
@@ -431,9 +431,13 @@ class EpDispatchCombineTestCase:
 
         # Check token equality
         for i, src_token_id in enumerate(src_token_pos):
-            src_pe = src_token_id // max_num_token_to_send_per_rank
-            src_tok_id = src_token_id % max_num_token_to_send_per_rank
-            if _is_fp4x2_dtype(self.dispatch_data_type):
+            src_pe = (
+                src_token_id // self.config.max_num_tokens_to_recv
+            ) 
+            src_tok_id = (
+                src_token_id % self.config.max_num_tokens_to_recv
+            )
+            if _is_fp4x2_dtype(self.config.data_type):
                 is_pass = torch.equal(
                     dispatch_output[i].view(torch.uint8),
                     all_rank_input[src_pe][src_tok_id].view(torch.uint8),

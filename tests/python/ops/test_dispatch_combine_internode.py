@@ -19,113 +19,23 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+import os
 import pytest
 import mori
-import os
-from tests.python.utils import TorchDistProcessManager
 import torch
-import torch.distributed as dist
+from tests.python.ops.dispatch_combine_test_utils import (
+    EpDispatchCombineTestCase,
+    assert_worker_results,
+    start_torch_dist_process_manager,
+)
 
 os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "6G")
 
 
-class EpDispatchCombineTestCase:
-    def __init__(self, config):
-        self.config = config
-        self.device = torch.device("cuda", self.config.rank)
-        self.rng = torch.Generator(device=self.device)
-        self.rng.manual_seed(123)
-
-    def sync(self):
-        torch.cuda.synchronize()
-        dist.barrier()
-
-    def gen_test_data(self, use_max_token_num=False):
-        if use_max_token_num:
-            num_token = torch.tensor(
-                [
-                    self.config.max_num_inp_token_per_rank
-                    for i in range(self.config.world_size)
-                ]
-            ).to(self.device)
-        else:
-            num_token = torch.randint(
-                0,
-                self.config.max_num_inp_token_per_rank + 1,
-                [self.config.world_size],
-                generator=self.rng,
-                device=self.device,
-            )
-
-        # gen indices
-        all_rank_indices = []
-        for r in range(self.config.world_size):
-            indices = torch.empty(
-                num_token[r],
-                self.config.num_experts_per_token,
-                dtype=torch.int64,
-                # device=self.device,
-            )
-            for i in range(num_token[r]):
-                perm = torch.randperm(
-                    self.config.num_experts_per_rank * self.config.world_size,
-                    generator=self.rng,
-                    device=self.device,
-                )
-                indices[i] = perm[: self.config.num_experts_per_token]
-            all_rank_indices.append(indices.to(torch.int32).to(self.device))
-
-        # gen weights
-        all_rank_weights = [
-            torch.rand(
-                num_token[r],
-                self.config.num_experts_per_token,
-                dtype=torch.float32,
-                generator=self.rng,
-                device=self.device,
-            )
-            for r in range(self.config.world_size)
-        ]
-
-        # gen scales
-        all_rank_scales = [
-            torch.rand(
-                num_token[r],
-                self.config.scale_dim,
-                dtype=torch.float32,
-                generator=self.rng,
-                device=self.device,
-            )
-            for r in range(self.config.world_size)
-        ]
-        if self.config.scale_type_size == 1:
-            all_rank_scales = [t.to(torch.bfloat16) for t in all_rank_scales]
-
-        # gen input & output
-        # some functions such as randn and cat are not implemented for fp8
-        all_rank_input = []
-        for r in range(self.config.world_size):
-            all_rank_input.append(
-                torch.randn(
-                    num_token[r],
-                    self.config.hidden_dim,
-                    dtype=torch.float32,
-                    generator=self.rng,
-                    device=self.device,
-                ).to(self.config.data_type)
-            )
-
-        return (
-            num_token,
-            all_rank_indices,
-            all_rank_input,
-            all_rank_weights,
-            all_rank_scales,
-        )
-
+class InterNodeDispatchCombineTestCase(EpDispatchCombineTestCase):
     def run_test_once(self, op, test_data):
         (
-            all_rank_num_token,
+            _,
             all_rank_indices,
             all_rank_input,
             all_rank_weights,
@@ -134,7 +44,7 @@ class EpDispatchCombineTestCase:
         (
             dispatch_output,
             dispatch_weights,
-            dispatch_scales,
+            _,
             dispatch_indices,
             dispatch_recv_num_token,
         ) = op.dispatch(
@@ -151,22 +61,13 @@ class EpDispatchCombineTestCase:
             print(f"Invalid expert id: {max_expert_idx}")
             assert False
 
-        combine_output, combine_output_weight = op.combine(
-            dispatch_output, dispatch_weights, dispatch_indices, call_reset=True
-        )
+        op.combine(dispatch_output, dispatch_weights, dispatch_indices, call_reset=True)
         self.sync()
 
 
 @pytest.fixture(scope="session")
 def torch_dist_process_manager():
-    os.environ["MORI_DISABLE_P2P"] = "1"
-    try:
-        torch.multiprocessing.set_start_method("spawn", force=True)
-        print("Multiprocessing start method set to spawn")
-    except RuntimeError:
-        pass
-    manager = TorchDistProcessManager()
-    manager.start_workers(world_size=8)
+    manager = start_torch_dist_process_manager(world_size=8, disable_p2p=True)
     yield manager
     manager.shutdown()
 
@@ -198,8 +99,8 @@ def _test_dispatch_combine(
         kernel_type=mori.ops.EpDispatchCombineKernelType.InterNode,
     )
     op = mori.ops.EpDispatchCombineOp(config)
-    test_case = EpDispatchCombineTestCase(config)
-    test_data = test_case.gen_test_data(True)
+    test_case = InterNodeDispatchCombineTestCase(config)
+    test_data = test_case.gen_test_data(use_max_token_num=True)
     num_reps = 128
     for idx in range(num_reps):
         test_case.run_test_once(op, test_data)
@@ -227,7 +128,7 @@ def test_dispatch_combine(
     num_experts_per_rank,
     num_experts_per_token,
 ):
-    for i in range(world_size):
+    for _ in range(world_size):
         torch_dist_process_manager.task_queue.put(
             (
                 _test_dispatch_combine,
@@ -244,14 +145,4 @@ def test_dispatch_combine(
             )
         )
 
-    results = []
-    for i in range(world_size):
-        (
-            rank,
-            result,
-        ) = torch_dist_process_manager.result_queue.get()
-        results.append(result)
-
-    for result in results:
-        if result is not None:
-            pytest.assume(False, result)
+    assert_worker_results(torch_dist_process_manager, world_size)

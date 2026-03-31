@@ -184,7 +184,14 @@ template <typename T>
 __device__ inline void InvokeConvertDispatchOutput(const EpDispatchCombineArgs<T>& args, int myPe) {
   ConvertDispatchOutputArgs convArgs{};
   convArgs.config = args.config;
-  convArgs.dispatchOutX = args.shmemDispatchOutTokMemObj->template GetAs<T*>(myPe);
+  if (args.config.kernelType == KernelType::IntraNode) {
+    convArgs.dispatchOutX = args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(myPe);
+  } else if (args.config.kernelType == KernelType::InterNodeV1 ||
+             args.config.kernelType == KernelType::InterNodeV1LL) {
+    convArgs.dispatchOutX = args.interNodeV1TokBufs.dispatchOut->template GetAs<T*>(myPe);
+  } else {
+    convArgs.dispatchOutX = args.interNodeTokBufs.dispatchOut->template GetAs<T*>(myPe);
+  }
   convArgs.dispatchOutTopkIdx = args.shmemOutIndicesMemObj->template GetAs<index_t*>(myPe);
   convArgs.dispatchSrcTokenPos = args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(myPe);
   convArgs.totalRecvTokenNum = args.totalRecvTokenNum;
@@ -211,7 +218,14 @@ __device__ inline void InvokeConvertCombineInput(const EpDispatchCombineArgs<T>&
   convArgs.combineInput = nullptr;
   convArgs.dispTokToEpSlotMap = args.dispTokToEpSlotMap;
   convArgs.packedRecvCount = args.standardPackedRecvCount;
-  convArgs.shmemCombineInpTokMemObj = args.shmemCombineInpTokMemObj;
+  if (args.config.kernelType == KernelType::IntraNode) {
+    convArgs.shmemCombineInpTokMemObj = args.intraNodeTokBufs.combineInp;
+  } else if (args.config.kernelType == KernelType::InterNodeV1 ||
+             args.config.kernelType == KernelType::InterNodeV1LL) {
+    convArgs.shmemCombineInpTokMemObj = args.interNodeV1TokBufs.combineInp;
+  } else {
+    convArgs.shmemCombineInpTokMemObj = args.interNodeTokBufs.combineInp;
+  }
   convArgs.dispTokIdToSrcTokIdMemObj = args.dispTokIdToSrcTokIdMemObj;
   ConvertCombineInputDevice<T, UseP2PRead>(convArgs);
 }

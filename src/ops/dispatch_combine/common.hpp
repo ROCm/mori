@@ -26,6 +26,52 @@
 namespace mori {
 namespace moe {
 
+// Encode/decode a (pe, localTokId) pair into a flat global token index for bookkeeping.
+// Stride: MaxNumTokensToRecv(), which guarantees uniqueness across all PEs.
+inline __device__ int FlatTokenIndex(const EpDispatchCombineConfig& config, int pe,
+                                     int localTokId) {
+  return pe * config.MaxNumTokensToRecv() + localTokId;
+}
+inline __device__ int PeFromFlatTokenIndex(const EpDispatchCombineConfig& config, int flatIdx) {
+  return flatIdx / config.MaxNumTokensToRecv();
+}
+inline __device__ int LocalTokIdFromFlatTokenIndex(const EpDispatchCombineConfig& config,
+                                                   int flatIdx) {
+  return flatIdx % config.MaxNumTokensToRecv();
+}
+inline __device__ int NullFlatTokenIndex(const EpDispatchCombineConfig& config) {
+  return config.worldSize * config.MaxNumTokensToRecv();
+}
+
+// Encode/decode a flat offset into a per-PE staging buffer.
+// Stride: MaxNumTokensToRecvPerRank, which determines how much buffer space is allocated per PE.
+inline __device__ int BufSlotOffset(const EpDispatchCombineConfig& config, int pe, int slotId) {
+  return pe * config.MaxNumTokensToRecvPerRank() + slotId;
+}
+inline __device__ int PeFromBufSlotOffset(const EpDispatchCombineConfig& config, int flatIdx) {
+  return flatIdx / config.MaxNumTokensToRecvPerRank();
+}
+inline __device__ int SlotIdFromBufSlotOffset(const EpDispatchCombineConfig& config, int flatIdx) {
+  return flatIdx % config.MaxNumTokensToRecvPerRank();
+}
+
+// Encode/decode a flat offset into a per-PE send staging buffer.
+// Stride: MaxNumTokensToSendPerRank, which determines how much buffer space is allocated per PE.
+// NullSendBufSlotOffset() returns an out-of-range sentinel indicating "already sent".
+inline __device__ int SendBufSlotOffset(const EpDispatchCombineConfig& config, int pe, int slotId) {
+  return pe * config.MaxNumTokensToSendPerRank() + slotId;
+}
+inline __device__ int PeFromSendBufSlotOffset(const EpDispatchCombineConfig& config, int flatIdx) {
+  return flatIdx / config.MaxNumTokensToSendPerRank();
+}
+inline __device__ int SlotIdFromSendBufSlotOffset(const EpDispatchCombineConfig& config,
+                                                  int flatIdx) {
+  return flatIdx % config.MaxNumTokensToSendPerRank();
+}
+inline __device__ int NullSendBufSlotOffset(const EpDispatchCombineConfig& config) {
+  return config.worldSize * config.MaxNumTokensToSendPerRank();
+}
+
 #define DEF_COMMON_VARS                                                                         \
   const EpDispatchCombineConfig& config = args.config;                                          \
   int thdId = threadIdx.x;                                                                      \
@@ -39,7 +85,7 @@ namespace moe {
   int globalThdNum = gridDim.x * blockDim.x;                                                    \
   int globalWarpId = blockIdx.x * warpNum + warpId;                                             \
   int globalWarpNum = gridDim.x * warpNum;                                                      \
-  int nullTokenId = config.worldSize * config.MaxNumTokensToRecv();                             \
+  int nullTokenId = NullFlatTokenIndex(config);                                                 \
   int myPe = config.rank;                                                                       \
   int npes = config.worldSize;                                                                  \
   int myNode = myPe / config.gpuPerNode;                                                        \

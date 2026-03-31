@@ -64,6 +64,40 @@ def _current_stream():
 
 @dataclass
 class EpDispatchCombineConfig:
+    """Configuration for :class:`EpDispatchCombineOp`.
+
+    Args:
+        data_type: Deprecated. Tensor dtype kept only for backward
+            compatibility with tests and examples. Kernel launch dtype is
+            inferred from the runtime input tensor instead of this field.
+        rank: Rank of the current process in the expert-parallel group.
+        world_size: Total number of ranks participating in the dispatch/combine
+            operation.
+        hidden_dim: Hidden dimension of each token embedding.
+        scale_dim: Number of scale values stored per token for quantized paths.
+        scale_type_size: Size in bytes of each scale element.
+        max_token_type_size: Maximum size in bytes for the token element type.
+        max_num_inp_token_per_rank: Maximum number of input tokens each rank
+            can process.
+        num_experts_per_rank: Number of local experts hosted on each rank.
+        num_experts_per_token: Number of experts selected for each token.
+        warp_num_per_block: Number of warps per GPU block for the kernel launch.
+        block_num: Number of GPU blocks to launch for the main kernel.
+        max_total_recv_tokens: Optional cap used to derive the maximum number
+            of tokens a rank can receive, which also affects memory
+            consumption. A value of ``0`` disables the cap. If the actual
+            received token count exceeds the derived limit, the kernel
+            currently asserts.
+        use_external_inp_buf: Whether the operator expects the input buffer to
+            be managed externally.
+        kernel_type: Dispatch/combine kernel implementation to use.
+        gpu_per_node: Number of GPUs per node. This affects all kernel types.
+        rdma_block_num: Number of RDMA blocks for inter-node kernels.
+        num_qp_per_pe: Number of queue pairs per processing element.
+        quant_type: Quantization mode. Supported string values are ``"none"``
+            and ``"fp8_direct_cast"``.
+    """
+
     data_type: (
         torch.dtype
     )  # Deprecated for kernel launch (runtime dtype inferred from input tensor); retained for test/example compatibility
@@ -78,7 +112,7 @@ class EpDispatchCombineConfig:
     num_experts_per_token: int
     warp_num_per_block: int = 8
     block_num: int = 80
-    num_worst_token: int = 0
+    max_total_recv_tokens: int = 0
     use_external_inp_buf: bool = True
     kernel_type: EpDispatchCombineKernelType = EpDispatchCombineKernelType.IntraNode
     gpu_per_node: int = 8
@@ -87,8 +121,17 @@ class EpDispatchCombineConfig:
     quant_type: str = "none"
 
     @property
+    def max_num_tokens_to_recv_per_rank(self):
+        if self.max_total_recv_tokens > 0:
+            per_rank = (
+                self.max_total_recv_tokens + self.world_size - 1
+            ) // self.world_size
+            return min(per_rank, self.max_num_inp_token_per_rank)
+        return self.max_num_inp_token_per_rank
+
+    @property
     def max_num_tokens_to_recv(self):
-        return self.world_size * self.max_num_inp_token_per_rank
+        return self.world_size * self.max_num_tokens_to_recv_per_rank
 
 
 def _cpp_dispatch_combine_factory(entity_name, allow_missing=False):
@@ -206,7 +249,7 @@ class EpDispatchCombineOp:
             rdma_block_num=config.rdma_block_num,
             num_qp_per_pe=config.num_qp_per_pe,
             quant_type=_normalize_quant_type(config.quant_type),
-            num_worst_token=config.num_worst_token,
+            max_total_recv_tokens=config.max_total_recv_tokens,
         )
 
         self._handle = handle_class(cpp_config)

@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <sstream>
 #include <vector>
+#include <variant>
 
 #include "mori/application/application.hpp"
 #include "mori/core/profiler/constants.hpp"
@@ -37,8 +38,6 @@
 // the template args / variant that need them are also hipcc-only.
 #if defined(__HIPCC__) || defined(__CUDACC__)
 #include <hip/hip_fp8.h>
-
-#include <variant>
 
 #include "mori/utils/data_types.hpp"
 #endif
@@ -98,7 +97,7 @@ struct EpDispatchCombineConfig {
   int maxNumInpTokenPerRank{128};
   int numExpertPerRank{1};
   int numExpertPerToken{2};
-  int numWorstToken{0};
+  int maxTotalRecvTokens{0};
   int warpNumPerBlock{1};
   int blockNum{1};
   // If true, use external buffer which incurs extra copy overhead; otherwise, the kernel assumes
@@ -117,17 +116,49 @@ struct EpDispatchCombineConfig {
     return worldSize * MaxNumTokensToSendPerRank();
   }
 
-  inline __host__ __device__ int MaxNumTokensToRecvPerRank() const { return maxNumInpTokenPerRank; }
+  inline __host__ __device__ int MaxNumTokensToRecvPerRank() const {
+    if (maxTotalRecvTokens > 0) {
+      int perRank = (maxTotalRecvTokens + worldSize - 1) / worldSize;
+      return perRank < maxNumInpTokenPerRank ? perRank : maxNumInpTokenPerRank;
+    }
+    return maxNumInpTokenPerRank;
+  }
 
   inline __host__ __device__ int MaxNumTokensToRecv() const {
-    if (numWorstToken != 0) {
-      return numWorstToken;
-    }
     return worldSize * MaxNumTokensToRecvPerRank();
   }
 
   std::vector<int32_t> ToPackedI32Array() const;
   static EpDispatchCombineConfig FromPackedI32Array(const int32_t* packed, size_t size);
+};
+
+// Per-kernel-type token buffer groups.
+// Used both as host-side allocation holders (via variant in EpDispatchCombineHandle)
+// and embedded by value in EpDispatchCombineArgs / EpDispatchCombineArgsRaw for kernel launch.
+
+// IntraNode: no RDMA path, staging buffer not needed.
+struct ShmemBufsIntraNode {
+  mori::application::SymmMemObjPtr dispatchOut;
+  mori::application::SymmMemObjPtr combineInp;
+  mori::application::SymmMemObjPtr combineOut;
+};
+
+// InterNodeV1 / InterNodeV1LL: full 5-buffer set used by the V1 RDMA path.
+struct ShmemBufsInterNodeV1 {
+  mori::application::SymmMemObjPtr dispatchInp;
+  mori::application::SymmMemObjPtr combineInp;
+  mori::application::SymmMemObjPtr dispatchOut;
+  mori::application::SymmMemObjPtr combineOut;
+  mori::application::SymmMemObjPtr staging;
+};
+
+// InterNode / AsyncLL: full 5-buffer set used by the non-V1 RDMA paths.
+struct ShmemBufsInterNode {
+  mori::application::SymmMemObjPtr dispatchInp;
+  mori::application::SymmMemObjPtr combineInp;
+  mori::application::SymmMemObjPtr dispatchOut;
+  mori::application::SymmMemObjPtr combineOut;
+  mori::application::SymmMemObjPtr staging;
 };
 
 class EpDispatchCombineHandle {
@@ -143,7 +174,6 @@ class EpDispatchCombineHandle {
     this->weightsBuf = weights;
     this->tokenIndices = tokenIndices;
     this->curRankNumToken = numToken;
-    // printf("handle inputType %s\n", HipDataTypeToString(inputType));
   }
 
   void PrepareInference(hipDataType inputType, void* input, void* output, float* weights,
@@ -155,7 +185,6 @@ class EpDispatchCombineHandle {
     this->scalesBuf = scales;
     this->tokenIndices = tokenIndices;
     this->curRankNumToken = numToken;
-    // printf("handle inputType %s\n", HipDataTypeToString(inputType));
   }
 
 #ifdef ENABLE_STANDARD_MOE_ADAPT
@@ -180,6 +209,31 @@ class EpDispatchCombineHandle {
   void LaunchReset(hipStream_t = 0);
 
   index_t GetCurRankNumToken() const { return curRankNumToken; }
+
+  mori::application::SymmMemObjPtr GetShmemDispatchOutTokMemObj() const {
+    if (config.kernelType == KernelType::IntraNode)
+      return std::get<ShmemBufsIntraNode>(shmemTokBufs).dispatchOut;
+    if (config.kernelType == KernelType::InterNodeV1 ||
+        config.kernelType == KernelType::InterNodeV1LL)
+      return std::get<ShmemBufsInterNodeV1>(shmemTokBufs).dispatchOut;
+    return std::get<ShmemBufsInterNode>(shmemTokBufs).dispatchOut;
+  }
+  mori::application::SymmMemObjPtr GetShmemCombineOutTokMemObj() const {
+    if (config.kernelType == KernelType::IntraNode)
+      return std::get<ShmemBufsIntraNode>(shmemTokBufs).combineOut;
+    if (config.kernelType == KernelType::InterNodeV1 ||
+        config.kernelType == KernelType::InterNodeV1LL)
+      return std::get<ShmemBufsInterNodeV1>(shmemTokBufs).combineOut;
+    return std::get<ShmemBufsInterNode>(shmemTokBufs).combineOut;
+  }
+  mori::application::SymmMemObjPtr GetShmemCombineInpTokMemObj() const {
+    if (config.kernelType == KernelType::IntraNode)
+      return std::get<ShmemBufsIntraNode>(shmemTokBufs).combineInp;
+    if (config.kernelType == KernelType::InterNodeV1 ||
+        config.kernelType == KernelType::InterNodeV1LL)
+      return std::get<ShmemBufsInterNodeV1>(shmemTokBufs).combineInp;
+    return std::get<ShmemBufsInterNode>(shmemTokBufs).combineInp;
+  }
 
  private:
   void InitializeShmemBuf();
@@ -215,12 +269,8 @@ class EpDispatchCombineHandle {
   float* weightsBuf{nullptr};
   uint8_t* scalesBuf{nullptr};
 
-  // Registered buffers for tokens, shmemOutTokMemObj will be returned to user as output
-  mori::application::SymmMemObjPtr shmemDispatchInpTokMemObj;
-  mori::application::SymmMemObjPtr shmemCombineInpTokMemObj;
-  mori::application::SymmMemObjPtr shmemDispatchOutTokMemObj;
-  mori::application::SymmMemObjPtr shmemCombineOutTokMemObj;
-  mori::application::SymmMemObjPtr shmemStagingTokMemObj;
+  // Registered buffers for tokens — allocated according to kernelType.
+  std::variant<ShmemBufsIntraNode, ShmemBufsInterNodeV1, ShmemBufsInterNode> shmemTokBufs;
 
   // Registered buffer used for weights, indices and scales
   mori::application::SymmMemObjPtr shmemInpWeightsMemObj;
@@ -317,11 +367,9 @@ struct EpDispatchCombineArgs {
   T* outTokenBuf{nullptr};
   float* weightsBuf{nullptr};
   uint8_t* scalesBuf{nullptr};
-  mori::application::SymmMemObjPtr shmemDispatchInpTokMemObj;
-  mori::application::SymmMemObjPtr shmemCombineInpTokMemObj;
-  mori::application::SymmMemObjPtr shmemDispatchOutTokMemObj;
-  mori::application::SymmMemObjPtr shmemCombineOutTokMemObj;
-  mori::application::SymmMemObjPtr shmemStagingTokMemObj;
+  ShmemBufsIntraNode intraNodeTokBufs;
+  ShmemBufsInterNodeV1 interNodeV1TokBufs;
+  ShmemBufsInterNode interNodeTokBufs;
   mori::application::SymmMemObjPtr shmemInpWeightsMemObj;
   mori::application::SymmMemObjPtr shmemDispatchOutWeightsMemObj;
   mori::application::SymmMemObjPtr shmemCombineOutWeightsMemObj;
@@ -381,11 +429,9 @@ struct EpDispatchCombineArgsRaw {
   void* outTokenBuf{nullptr};
   float* weightsBuf{nullptr};
   uint8_t* scalesBuf{nullptr};
-  mori::application::SymmMemObjPtr shmemDispatchInpTokMemObj;
-  mori::application::SymmMemObjPtr shmemCombineInpTokMemObj;
-  mori::application::SymmMemObjPtr shmemDispatchOutTokMemObj;
-  mori::application::SymmMemObjPtr shmemCombineOutTokMemObj;
-  mori::application::SymmMemObjPtr shmemStagingTokMemObj;
+  ShmemBufsIntraNode intraNodeTokBufs;
+  ShmemBufsInterNodeV1 interNodeV1TokBufs;
+  ShmemBufsInterNode interNodeTokBufs;
   mori::application::SymmMemObjPtr shmemInpWeightsMemObj;
   mori::application::SymmMemObjPtr shmemDispatchOutWeightsMemObj;
   mori::application::SymmMemObjPtr shmemCombineOutWeightsMemObj;
