@@ -45,19 +45,21 @@ struct BackendConfig {
 struct RdmaBackendConfig : public BackendConfig {
   RdmaBackendConfig() : BackendConfig(BackendType::RDMA) {}
   RdmaBackendConfig(int qpPerTransfer_, int postBatchSize_, int numWorkerThreads_,
-                    PollCqMode pollCqMode_, bool enableNotification_)
+                    PollCqMode pollCqMode_, bool enableNotification_, uint32_t notifPerQp_ = 1024)
       : BackendConfig(BackendType::RDMA),
         qpPerTransfer(qpPerTransfer_),
         postBatchSize(postBatchSize_),
         numWorkerThreads(numWorkerThreads_),
         pollCqMode(pollCqMode_),
-        enableNotification(enableNotification_) {}
+        enableNotification(enableNotification_),
+        notifPerQp(notifPerQp_) {}
 
   int qpPerTransfer{1};
   int postBatchSize{-1};
   int numWorkerThreads{1};
   PollCqMode pollCqMode{PollCqMode::POLLING};
   bool enableNotification{true};  // Enable/disable notification mechanism for transfer completion
+  uint32_t notifPerQp{1024};      // Pre-posted RECV WRs per QP; defines the Zone A boundary
 
   int maxSendWr{0};
   int maxCqeNum{0};
@@ -67,8 +69,8 @@ struct RdmaBackendConfig : public BackendConfig {
 inline std::ostream& operator<<(std::ostream& os, const RdmaBackendConfig& c) {
   return os << "qpPerTransfer[" << c.qpPerTransfer << "] postBatchSize[" << c.postBatchSize
             << "] numWorkerThreads[" << c.numWorkerThreads << "] enableNotification["
-            << c.enableNotification << "] maxSendWr[" << c.maxSendWr << "] maxCqeNum["
-            << c.maxCqeNum << "] maxMsgSge[" << c.maxMsgSge << "]";
+            << c.enableNotification << "] notifPerQp[" << c.notifPerQp << "] maxSendWr["
+            << c.maxSendWr << "] maxCqeNum[" << c.maxCqeNum << "] maxMsgSge[" << c.maxMsgSge << "]";
 }
 
 struct XgmiBackendConfig : public BackendConfig {

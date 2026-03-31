@@ -44,6 +44,36 @@ def _is_fp4x2_dtype(dtype):
     return _FP4_DTYPE is not None and dtype is _FP4_DTYPE
 
 
+_FP4_E2M1_LUT = [
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    -0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
+]
+
+
+def unpack_fp4x2(fp4x2_tensor, dtype=torch.bfloat16):
+    """Unpack float4_e2m1fn_x2 tensor [*, H] to float [*, H*2]."""
+    raw = fp4x2_tensor.view(torch.uint8)
+    low = raw & 0x0F
+    high = (raw >> 4) & 0x0F
+    lut = torch.tensor(_FP4_E2M1_LUT, dtype=dtype, device=raw.device)
+    result = torch.stack([lut[low.long()], lut[high.long()]], dim=-1)
+    return result.reshape(*raw.shape[:-1], raw.shape[-1] * 2)
+
+
 class EpDispatchCombineTestCase:
     def __init__(
         self,
@@ -56,15 +86,29 @@ class EpDispatchCombineTestCase:
         quant_type="none",
         dtype=torch.bfloat16,
         hidden_dim=7168,
+        combine_dtype=None,
     ):
         self.rank = rank
         self.gpu_per_node = gpu_per_node
         self.world_size = world_size
+
+        self.dispatch_data_type = dtype
+        self.combine_data_type = combine_dtype if combine_dtype is not None else dtype
+        self.dispatch_hidden_dim = (
+            hidden_dim // 2 if _is_fp4x2_dtype(dtype) else hidden_dim
+        )
+        if _is_fp4x2_dtype(dtype) and not _is_fp4x2_dtype(self.combine_data_type):
+            self.combine_hidden_dim = self.dispatch_hidden_dim * 2
+        elif not _is_fp4x2_dtype(dtype) and _is_fp4x2_dtype(self.combine_data_type):
+            self.combine_hidden_dim = self.dispatch_hidden_dim // 2
+        else:
+            self.combine_hidden_dim = self.dispatch_hidden_dim
+
         self.config = mori.ops.EpDispatchCombineConfig(
             data_type=dtype,
             rank=self.rank,
             world_size=self.world_size,
-            hidden_dim=(hidden_dim // 2 if _is_fp4x2_dtype(dtype) else hidden_dim),
+            hidden_dim=max(self.dispatch_hidden_dim, self.combine_hidden_dim),
             scale_dim=32,
             scale_type_size=4,
             max_num_inp_token_per_rank=(max_tokens + 63) // 64 * 64,
@@ -140,6 +184,8 @@ class EpDispatchCombineTestCase:
         return output
 
     def gen_test_data(self, max_num_token, use_max_token_num=False):
+        hidden_dim = self.dispatch_hidden_dim
+
         # gen num_tokens
         if use_max_token_num:
             num_token = torch.tensor(
@@ -159,36 +205,16 @@ class EpDispatchCombineTestCase:
         all_rank_indices = []
         for r in range(self.world_size):
             num_tok = num_token[r].item()
-            # Generate random floats and use argsort to get permutations
-            # This is much faster than calling randperm in a loop
             random_vals = torch.rand(
                 num_tok,
                 num_total_experts,
                 generator=self.rng,
                 device=self.device,
             )
-            # argsort gives us a random permutation, take first K columns
             indices = torch.argsort(random_vals, dim=1)[
                 :, : self.config.num_experts_per_token
             ]
             all_rank_indices.append(indices.to(torch.int32))
-
-        # num_total_experts = self.config.num_experts_per_rank * self.config.world_size
-        # num_nodes = self.config.world_size // self.config.gpu_per_node
-
-        # even_indices = (
-        #     torch.arange(
-        #         max_num_token
-        #         * self.config.num_experts_per_token,
-        #         device="cuda",
-        #     ).view(
-        #         max_num_token,
-        #         self.config.num_experts_per_token,
-        #     )
-        #     % 256
-        # )
-        # even_indices = even_indices.to(torch.int32)
-        # all_rank_indices = [even_indices for _ in range(self.world_size)]
 
         # gen weights
         all_rank_weights = [
@@ -214,29 +240,27 @@ class EpDispatchCombineTestCase:
             for r in range(self.world_size)
         ]
 
-        # gen input & output
-        # some functions such as randn and cat are not implemented for fp8
         all_rank_input = []
         for r in range(self.world_size):
             data_fp32 = torch.randn(
                 num_token[r],
-                self.config.hidden_dim,
+                hidden_dim,
                 dtype=torch.float32,
                 generator=self.rng,
                 device=self.device,
             )
-            if _is_fp4x2_dtype(self.config.data_type):
+            if _is_fp4x2_dtype(self.dispatch_data_type):
                 data = torch.randint(
                     0,
                     256,
-                    (num_token[r], self.config.hidden_dim),
+                    (num_token[r], hidden_dim),
                     dtype=torch.uint8,
                     generator=self.rng,
                     device=self.device,
                 )
                 data = data.view(_FP4_DTYPE)
             else:
-                data = data_fp32.to(self.config.data_type)
+                data = data_fp32.to(self.dispatch_data_type)
             all_rank_input.append(data)
 
         return (
@@ -246,6 +270,14 @@ class EpDispatchCombineTestCase:
             all_rank_weights,
             all_rank_scales,
         )
+
+    def _convert_for_combine(self, dispatch_output):
+        """Convert dispatch output to combine dtype if cross-type."""
+        if self.combine_data_type == self.dispatch_data_type:
+            return dispatch_output
+        if _is_fp4x2_dtype(self.dispatch_data_type):
+            return unpack_fp4x2(dispatch_output, dtype=self.combine_data_type)
+        return dispatch_output.to(self.combine_data_type)
 
     def count_token_num(self, all_rank_indices):
         # Per-rank counts
@@ -291,25 +323,71 @@ class EpDispatchCombineTestCase:
 
         if self.config.rank == 0:
             print("Rank counts (deduplicated):", rank_counts)
-            # print("Rank counts local nodes:", rank_counts - rank_counts_remote_recv)
-            # print("Rank counts from other nodes:", rank_counts_remote_recv)
-            # print("Rank counts to other nodes:", rank_counts_remote_send)
         return rank_counts, rank_counts_remote_recv, rank_counts_remote_send
 
-    def run_dispatch(self, op, token, weights, scales, indices):
+    def run_dispatch(
+        self,
+        op,
+        token,
+        weights,
+        scales,
+        indices,
+        block_num=-1,
+        rdma_block_num=-1,
+        warp_per_block=-1,
+    ):
         if op.config.kernel_type in (mori.ops.EpDispatchCombineKernelType.AsyncLL,):
-            ret = op.dispatch_send(token, weights, scales, indices)
-            op.dispatch_recv()
+            ret = op.dispatch(
+                token,
+                weights,
+                scales,
+                indices,
+                block_num=block_num,
+                rdma_block_num=rdma_block_num,
+                warp_per_block=warp_per_block,
+            )
+            op.dispatch_recv(block_num=block_num, warp_per_block=warp_per_block)
         else:
-            ret = op.dispatch(token, weights, scales, indices)
+            ret = op.dispatch(
+                token,
+                weights,
+                scales,
+                indices,
+                block_num=block_num,
+                rdma_block_num=rdma_block_num,
+                warp_per_block=warp_per_block,
+            )
         return ret
 
-    def run_combine(self, op, token, weights, indices):
+    def run_combine(
+        self,
+        op,
+        token,
+        weights,
+        indices,
+        block_num=-1,
+        rdma_block_num=-1,
+        warp_per_block=-1,
+    ):
         if op.config.kernel_type in (mori.ops.EpDispatchCombineKernelType.AsyncLL,):
-            ret = op.combine_send(token, weights, indices)
-            op.combine_recv()
+            ret = op.combine(
+                token,
+                weights,
+                indices,
+                block_num=block_num,
+                rdma_block_num=rdma_block_num,
+                warp_per_block=warp_per_block,
+            )
+            op.combine_recv(block_num=block_num, warp_per_block=warp_per_block)
         else:
-            ret = op.combine(token, weights, indices)
+            ret = op.combine(
+                token,
+                weights,
+                indices,
+                block_num=block_num,
+                rdma_block_num=rdma_block_num,
+                warp_per_block=warp_per_block,
+            )
         return ret
 
     def run_test_once(self, op, test_data, error_round, round):
@@ -355,7 +433,7 @@ class EpDispatchCombineTestCase:
         for i, src_token_id in enumerate(src_token_pos):
             src_pe = src_token_id // max_num_token_to_send_per_rank
             src_tok_id = src_token_id % max_num_token_to_send_per_rank
-            if _is_fp4x2_dtype(self.config.data_type):
+            if _is_fp4x2_dtype(self.dispatch_data_type):
                 is_pass = torch.equal(
                     dispatch_output[i].view(torch.uint8),
                     all_rank_input[src_pe][src_tok_id].view(torch.uint8),
@@ -369,7 +447,6 @@ class EpDispatchCombineTestCase:
                     f"rank {self.rank} token {i} assert {is_pass} expected {all_rank_input[src_pe][src_tok_id].view(torch.uint8)} got {dispatch_output[i].view(torch.uint8)}"
                 )
                 assert False
-                # error_round.add(round)
             if dispatch_weights is not None:
                 assert torch.equal(
                     dispatch_weights[i], all_rank_weights[src_pe][src_tok_id]
@@ -385,13 +462,14 @@ class EpDispatchCombineTestCase:
         # NOTE: weight combine not implemented yet
         if op.config.kernel_type in (mori.ops.EpDispatchCombineKernelType.AsyncLL,):
             dispatch_weights = None
+        combine_input = self._convert_for_combine(dispatch_output)
         combine_output, combine_output_weight = self.run_combine(
-            op, dispatch_output, dispatch_weights, all_rank_indices[self.rank]
+            op, combine_input, dispatch_weights, all_rank_indices[self.rank]
         )
-
         torch.cuda.synchronize()
+        combine_data_type = self.combine_data_type
         for i in range(all_rank_num_token[self.rank]):
-            if _is_fp4x2_dtype(self.config.data_type):
+            if _is_fp4x2_dtype(combine_data_type):
                 continue
             pes = [
                 (idx // self.config.num_experts_per_rank)
@@ -409,10 +487,18 @@ class EpDispatchCombineTestCase:
             if final_unique_pes == 0:
                 continue
 
+            inp = all_rank_input[self.rank][i]
+            if _is_fp4x2_dtype(self.dispatch_data_type):
+                inp_converted = unpack_fp4x2(
+                    inp.unsqueeze(0), dtype=combine_data_type
+                ).squeeze(0)
+            else:
+                inp_converted = inp.to(combine_data_type)
+
             got, expected = (
                 combine_output[i],
-                (all_rank_input[self.rank][i].to(torch.float32) * final_unique_pes).to(
-                    self.config.data_type
+                (inp_converted.to(torch.float32) * final_unique_pes).to(
+                    combine_data_type
                 ),
             )
 
@@ -432,9 +518,6 @@ class EpDispatchCombineTestCase:
                     expected,
                     all_rank_input[self.rank][i],
                 )
-                # delta = got.float() - expected.float()
-                # print(self.rank, "delta:", delta)
-                # error_round.add(round)
                 assert False
                 # pass
 
@@ -494,6 +577,7 @@ class EpDispatchCombineTestCase:
         op = mori.ops.EpDispatchCombineOp(self.config)
         num_test_data = 128
         sync_interval = 128
+        is_cross_type = self.combine_data_type != self.dispatch_data_type
 
         if self.rank == 0:
             print("Stress Test")
@@ -525,55 +609,71 @@ class EpDispatchCombineTestCase:
                 all_rank_scales[self.rank],
                 all_rank_indices[self.rank],
             )
+            combine_input = self._convert_for_combine(dispatch_output)
             combine_output, combine_output_weight = self.run_combine(
-                op, dispatch_output, None, all_rank_indices[self.rank]
+                op, combine_input, None, all_rank_indices[self.rank]
             )
             if i % sync_interval == 0:
                 torch.cuda.synchronize()
         torch.cuda.synchronize()
 
-        if self.rank == 0:
-            print("Stress Test with CUDA Graph")
-        test_data = self.gen_test_data(
-            max_num_token=self.config.max_num_inp_token_per_rank,
-            use_max_token_num=False,
-        )
-        (
-            all_rank_num_token,
-            all_rank_indices,
-            all_rank_input,
-            all_rank_weights,
-            all_rank_scales,
-        ) = test_data
-        g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
+        if is_cross_type:
+            if self.rank == 0:
+                print(
+                    "Skipping CUDA Graph stress test (cross-type not supported in graph)"
+                )
+        else:
+            if self.rank == 0:
+                print("Stress Test with CUDA Graph")
+            test_data = self.gen_test_data(
+                max_num_token=self.config.max_num_inp_token_per_rank,
+                use_max_token_num=False,
+            )
             (
-                dispatch_output,
-                dispatch_weights,
-                dispatch_scales,
-                dispatch_indices,
-                dispatch_recv_num_token,
-            ) = self.run_dispatch(
-                op,
-                all_rank_input[self.rank],
-                all_rank_weights[self.rank],
-                all_rank_scales[self.rank],
-                all_rank_indices[self.rank],
-            )
-            combine_output, combine_output_weight = self.run_combine(
-                op, dispatch_output, None, all_rank_indices[self.rank]
-            )
-        torch.cuda.synchronize()
-
-        for i in tqdm(range(5000)):
-            g.replay()
+                all_rank_num_token,
+                all_rank_indices,
+                all_rank_input,
+                all_rank_weights,
+                all_rank_scales,
+            ) = test_data
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                (
+                    dispatch_output,
+                    dispatch_weights,
+                    dispatch_scales,
+                    dispatch_indices,
+                    dispatch_recv_num_token,
+                ) = self.run_dispatch(
+                    op,
+                    all_rank_input[self.rank],
+                    all_rank_weights[self.rank],
+                    all_rank_scales[self.rank],
+                    all_rank_indices[self.rank],
+                )
+                combine_output, combine_output_weight = self.run_combine(
+                    op, dispatch_output, None, all_rank_indices[self.rank]
+                )
             torch.cuda.synchronize()
-            time.sleep(0.0001)
+
+            for i in tqdm(range(5000)):
+                g.replay()
+                torch.cuda.synchronize()
+                time.sleep(0.0001)
 
         del op
 
-    def run_bench_once(self, max_num_token, op, test_data, repeat=10):
-        num_events = 2 * repeat + 1
+    def run_bench_once(
+        self,
+        max_num_token,
+        op,
+        test_data,
+        repeat=10,
+        block_num=-1,
+        rdma_block_num=-1,
+        warp_per_block=-1,
+    ):
+        num_events = 3 * repeat + 1
         events = [torch.cuda.Event(enable_timing=True) for i in range(num_events)]
 
         (
@@ -598,13 +698,22 @@ class EpDispatchCombineTestCase:
                 all_rank_weights[self.rank],
                 all_rank_scales[self.rank],
                 all_rank_indices[self.rank],
+                block_num=block_num,
+                rdma_block_num=rdma_block_num,
+                warp_per_block=warp_per_block,
             )
             if i == warmup_rounds - 1:
-                # Read totalRecvTokenNum after dispatch but before combine resets it
                 torch.cuda.synchronize()
                 total_recv_num_token = dispatch_recv_num_token[0].item()
+            combine_input = self._convert_for_combine(dispatch_output)
             combine_output, combine_output_weight = self.run_combine(
-                op, dispatch_output, None, all_rank_indices[self.rank]
+                op,
+                combine_input,
+                None,
+                all_rank_indices[self.rank],
+                block_num=block_num,
+                rdma_block_num=rdma_block_num,
+                warp_per_block=warp_per_block,
             )
             torch.cuda.synchronize()
         total_rdma_recv_num_token = (
@@ -637,43 +746,67 @@ class EpDispatchCombineTestCase:
                 all_rank_weights[self.rank],
                 all_rank_scales[self.rank],
                 all_rank_indices[self.rank],
+                block_num=block_num,
+                rdma_block_num=rdma_block_num,
+                warp_per_block=warp_per_block,
             )
-            events[2 * i + 1].record()
+            events[3 * i + 1].record()
+            combine_input = self._convert_for_combine(dispatch_output)
+            events[3 * i + 2].record()
             combine_output, combine_output_weight = self.run_combine(
-                op, dispatch_output, None, all_rank_indices[self.rank]
+                op,
+                combine_input,
+                None,
+                all_rank_indices[self.rank],
+                block_num=block_num,
+                rdma_block_num=rdma_block_num,
+                warp_per_block=warp_per_block,
             )
-            events[2 * i + 2].record()
+            events[3 * i + 3].record()
         torch.cuda.synchronize()
 
-        element_size = all_rank_input[self.rank].element_size()
-        total_bytes = total_recv_num_token * self.config.hidden_dim * element_size
+        disp_element_size = all_rank_input[self.rank].element_size()
+        disp_total_bytes = (
+            total_recv_num_token * self.dispatch_hidden_dim * disp_element_size
+        )
+        comb_element_size = torch.tensor(
+            [], dtype=self.combine_data_type
+        ).element_size()
+        comb_total_bytes = (
+            total_recv_num_token * self.combine_hidden_dim * comb_element_size
+        )
         ll_mode_scale = (
             max_num_token
             * self.config.num_experts_per_token
-            / (total_recv_num_token + 1)  # avoid division by zero
+            / (total_recv_num_token + 1)
         )
-        total_rdma_bytes = (
-            total_rdma_recv_num_token * self.config.hidden_dim * element_size
+        disp_total_rdma_bytes = (
+            total_rdma_recv_num_token * self.dispatch_hidden_dim * disp_element_size
+        )
+        comb_total_rdma_bytes = (
+            total_rdma_recv_num_token * self.combine_hidden_dim * comb_element_size
         )
 
         disp_duration_list = []
         comb_duration_list = []
-        for i in range(1, num_events, 2):
-            disp_duration_list.append(events[i - 1].elapsed_time(events[i]))
-            comb_duration_list.append(events[i].elapsed_time(events[i + 1]))
+        for i in range(repeat):
+            disp_duration_list.append(events[3 * i].elapsed_time(events[3 * i + 1]))
+            comb_duration_list.append(events[3 * i + 2].elapsed_time(events[3 * i + 3]))
 
         disp_rdma_bandwidth_list = [
-            total_rdma_bytes / (1000**3) / (t / (10**3)) for t in disp_duration_list
+            disp_total_rdma_bytes / (1000**3) / (t / (10**3))
+            for t in disp_duration_list
         ]
         disp_bandwidth_list = [
-            total_bytes / (1000**3) / (t / (10**3)) for t in disp_duration_list
+            disp_total_bytes / (1000**3) / (t / (10**3)) for t in disp_duration_list
         ]
 
         comb_rdma_bandwidth_list = [
-            total_rdma_bytes / (1000**3) / (t / (10**3)) for t in comb_duration_list
+            comb_total_rdma_bytes / (1000**3) / (t / (10**3))
+            for t in comb_duration_list
         ]
         comb_bandwidth_list = [
-            total_bytes / (1000**3) / (t / (10**3)) for t in comb_duration_list
+            comb_total_bytes / (1000**3) / (t / (10**3)) for t in comb_duration_list
         ]
 
         if hasattr(mori.cpp, "get_debug_time_buf"):
@@ -694,7 +827,9 @@ class EpDispatchCombineTestCase:
             ll_mode_scale,
         )
 
-    def bench_dispatch_combine(self, max_num_token):
+    def bench_dispatch_combine(
+        self, max_num_token, block_num=-1, rdma_block_num=-1, warp_per_block=-1
+    ):
         op = mori.ops.EpDispatchCombineOp(self.config)
         test_data = self.gen_test_data(
             max_num_token=max_num_token, use_max_token_num=True
@@ -725,7 +860,15 @@ class EpDispatchCombineTestCase:
             comb_rdma_bandwidth,
             comb_bandwidth,
             ll_mode_scale,
-        ) = self.run_bench_once(max_num_token, op, test_data, repeat)
+        ) = self.run_bench_once(
+            max_num_token,
+            op,
+            test_data,
+            repeat,
+            block_num=block_num,
+            rdma_block_num=rdma_block_num,
+            warp_per_block=warp_per_block,
+        )
 
         for i in range(repeat):
             disp_duration_output = [torch.zeros(1) for _ in range(self.world_size)]
@@ -825,7 +968,25 @@ class EpDispatchCombineTestCase:
             "LL Bandwidth (GB/s)",
             "Latency (us)",
         ]
-        disp_table.title = "Dispatch Performance"
+        disp_dtype_str = str(self.config.data_type).split(".")[-1]
+        comb_dtype_str = str(self.combine_data_type).split(".")[-1]
+        is_cross_type = self.combine_data_type != self.config.data_type
+
+        disp_title = f"Dispatch Performance ({disp_dtype_str})"
+        comb_title = f"Combine Performance ({comb_dtype_str})"
+        if is_cross_type:
+            disp_elem = torch.tensor([], dtype=self.config.data_type).element_size()
+            comb_elem = torch.tensor([], dtype=self.combine_data_type).element_size()
+            disp_data_mb = (
+                max_num_token * self.dispatch_hidden_dim * disp_elem / (1024**2)
+            )
+            comb_data_mb = (
+                max_num_token * self.combine_hidden_dim * comb_elem / (1024**2)
+            )
+            disp_title += f" ~{disp_data_mb:.1f} MB/rank"
+            comb_title += f" ~{comb_data_mb:.1f} MB/rank"
+
+        disp_table.title = disp_title
         disp_table.field_names = field_names
         disp_table.add_rows(
             [
@@ -853,7 +1014,7 @@ class EpDispatchCombineTestCase:
             ]
         )
         comb_table.field_names = field_names
-        comb_table.title = "Combine Performance"
+        comb_table.title = comb_title
         comb_table.add_rows(
             [
                 [
@@ -892,6 +1053,110 @@ class EpDispatchCombineTestCase:
             comb_lat,
         )
 
+    def tuning_dispatch_combine(self, max_num_token):
+        op = mori.ops.EpDispatchCombineOp(self.config)
+        sm_count = torch.cuda.get_device_properties(
+            self.rank % self.gpu_per_node
+        ).multi_processor_count
+
+        block_set = set()
+        pow2 = 32
+        while pow2 <= sm_count:
+            block_set.add(pow2)
+            pow2 <<= 1
+        block_set.add(sm_count)
+        block_list = sorted(block_set)
+
+        warp_list = [4, 6, 8, 12, 16]
+
+        def rdma_candidates_for(bn):
+            return sorted(
+                set(v for v in [bn // 4, bn // 2, bn * 2 // 3] if 1 <= v < bn)
+            )
+
+        total_configs = sum(
+            len(warp_list) * len(rdma_candidates_for(bn)) for bn in block_list
+        )
+        if self.rank == 0:
+            print(
+                f"SM count={sm_count}\n"
+                f"block_num candidates ({len(block_list)}): {block_list}\n"
+                f"warp_per_block candidates: {warp_list}\n"
+                f"Total configurations: {total_configs}"
+            )
+
+        best_disp_bw = 0
+        best_comb_bw = 0
+        best_disp_config = None
+        best_comb_config = None
+
+        error_round = set()
+        test_data = self.gen_test_data(
+            max_num_token=max_num_token, use_max_token_num=True
+        )
+        for wr_i in range(1):
+            self.run_test_once(op, test_data, error_round, wr_i)
+        assert len(error_round) == 0, f"Warmup failed: {error_round}"
+
+        config_idx = 0
+        for bn in block_list:
+            for warp in warp_list:
+                for rdma_bn in rdma_candidates_for(bn):
+                    config_idx += 1
+                    if self.rank == 0:
+                        print(
+                            f"\n{'=' * 60}\n"
+                            f"[{config_idx}/{total_configs}] "
+                            f"block_num={bn}, warp={warp}, rdma_block_num={rdma_bn}\n"
+                            f"{'=' * 60}"
+                        )
+                    (
+                        _,
+                        _,
+                        disp_bandwidth,
+                        _,
+                        _,
+                        comb_bandwidth,
+                        _,
+                    ) = self.run_bench_once(
+                        max_num_token,
+                        op,
+                        test_data,
+                        repeat=5,
+                        block_num=bn,
+                        rdma_block_num=rdma_bn,
+                        warp_per_block=warp,
+                    )
+                    disp_bw = sum(disp_bandwidth) / len(disp_bandwidth)
+                    comb_bw = sum(comb_bandwidth) / len(comb_bandwidth)
+
+                    if disp_bw > best_disp_bw:
+                        best_disp_bw = disp_bw
+                        best_disp_config = (bn, warp, rdma_bn)
+                    if comb_bw > best_comb_bw:
+                        best_comb_bw = comb_bw
+                        best_comb_config = (bn, warp, rdma_bn)
+
+        if self.rank == 0:
+            disp_dtype_str = str(self.config.data_type).split(".")[-1]
+            comb_dtype_str = str(self.combine_data_type).split(".")[-1]
+            print(f"\n{'=' * 60}")
+            print("Performance Summary:")
+            print(f"{'=' * 60}")
+            print(
+                f"Best Dispatch  ({disp_dtype_str}): {best_disp_bw:.2f} GB/s "
+                f"at block_num={best_disp_config[0]}, warp={best_disp_config[1]}, "
+                f"rdma={best_disp_config[2]}"
+            )
+            print(
+                f"Best Combine   ({comb_dtype_str}): {best_comb_bw:.2f} GB/s "
+                f"at block_num={best_comb_config[0]}, warp={best_comb_config[1]}, "
+                f"rdma={best_comb_config[2]}"
+            )
+            print(f"{'=' * 60}")
+
+        del op
+
     def profile_dispatch_combine(self, max_num_token):
         op = mori.ops.EpDispatchCombineOp(self.config)
         test_data = self.gen_test_data(
@@ -916,6 +1181,7 @@ def sweep_bench_dispatch_combine(
     kernel_type,
     num_qp,
     sweep_token_interval,
+    combine_dtype=None,
 ):
     world_size = num_node * gpu_per_node
     node_rank = int(os.environ["RANK"])
@@ -924,7 +1190,14 @@ def sweep_bench_dispatch_combine(
     if sweep_token_interval <= 0:
         raise ValueError(f"sweep_token_interval must >= 1, got {sweep_token_interval}")
     test_case = EpDispatchCombineTestCase(
-        global_rank, gpu_per_node, world_size, max_tokens, kernel_type, num_qp, dtype
+        global_rank,
+        gpu_per_node,
+        world_size,
+        max_tokens,
+        kernel_type,
+        num_qp,
+        dtype=dtype,
+        combine_dtype=combine_dtype,
     )
     test_case.setup()
 
@@ -984,12 +1257,16 @@ def test_dispatch_combine(
     quant_type="none",
     cmd="test",
     sweep_token_interval=64,
+    combine_dtype=None,
+    block_num=-1,
+    rdma_block_num=-1,
+    warp_per_block=-1,
 ):
     world_size = num_node * gpu_per_node
     node_rank = int(os.environ["RANK"])
     global_rank = node_rank * gpu_per_node + local_rank
 
-    if cmd in ("test", "bench", "stress", "profile"):
+    if cmd in ("test", "bench", "stress", "profile", "tuning"):
         test_case = EpDispatchCombineTestCase(
             global_rank,
             gpu_per_node,
@@ -999,26 +1276,36 @@ def test_dispatch_combine(
             num_qp,
             quant_type,
             dtype,
+            combine_dtype=combine_dtype,
         )
         test_case.setup()
         if cmd == "test":
             test_case.test_dispatch_combine()
         elif cmd == "bench":
-            test_case.bench_dispatch_combine(max_tokens)
+            test_case.bench_dispatch_combine(
+                max_tokens,
+                block_num=block_num,
+                rdma_block_num=rdma_block_num,
+                warp_per_block=warp_per_block,
+            )
         elif cmd == "stress":
             test_case.stress_dispatch_combine()
         elif cmd == "profile":
             test_case.profile_dispatch_combine(max_tokens)
+        elif cmd == "tuning":
+            test_case.tuning_dispatch_combine(max_tokens)
         test_case.cleanup()
     elif cmd == "sweep_bench":
         sweep_bench_dispatch_combine(
             local_rank,
             num_node,
             gpu_per_node,
+            dtype,
             max_tokens,
             kernel_type,
             num_qp,
             sweep_token_interval,
+            combine_dtype=combine_dtype,
         )
     else:
         raise ValueError(f"unsupported command: {cmd}")
@@ -1038,8 +1325,8 @@ parser.add_argument(
     "--cmd",
     type=str,
     default="test",
-    choices=["test", "bench", "stress", "sweep_bench", "profile"],
-    help="Available subcommands: test, bench, stress, sweep_bench",
+    choices=["test", "bench", "stress", "sweep_bench", "profile", "tuning"],
+    help="Available subcommands: test, bench, stress, sweep_bench, profile, tuning",
 )
 parser.add_argument(
     "--dtype",
@@ -1047,6 +1334,13 @@ parser.add_argument(
     default="bf16",
     choices=list(_DATA_TYPE_MAP.keys()),
     help="Data type of dispatch / combine",
+)
+parser.add_argument(
+    "--combine-dtype",
+    type=str,
+    default=None,
+    choices=["bf16", "fp8_e4m3_fnuz", "fp8_e4m3"],
+    help="Data type for combine phase. Defaults to same as --dtype.",
 )
 parser.add_argument(
     "--max-tokens",
@@ -1083,6 +1377,24 @@ parser.add_argument(
         "'fp8_direct_cast' is the current BF16<->FP8 direct cast path."
     ),
 )
+parser.add_argument(
+    "--block-num",
+    type=int,
+    default=None,
+    help="Override block_num for bench mode.",
+)
+parser.add_argument(
+    "--warp-per-block",
+    type=int,
+    default=None,
+    help="Override warp_per_block for bench mode.",
+)
+parser.add_argument(
+    "--rdma-block-num",
+    type=int,
+    default=None,
+    help="Override rdma_block_num for bench mode.",
+)
 args_cli = parser.parse_args()
 
 if __name__ == "__main__":
@@ -1090,19 +1402,29 @@ if __name__ == "__main__":
     gpu_per_node = int(gpu_per_node) if gpu_per_node is not None else 8
     num_node = int(os.environ["WORLD_SIZE"])
 
+    combine_dtype_str = (
+        args_cli.combine_dtype if args_cli.combine_dtype else args_cli.dtype
+    )
+    dispatch_dtype = _DATA_TYPE_MAP[args_cli.dtype]
+    combine_dtype = _DATA_TYPE_MAP[combine_dtype_str]
+
     world_size = num_node * gpu_per_node
     torch.multiprocessing.spawn(
         test_dispatch_combine,
         args=(
             num_node,
             gpu_per_node,
-            _DATA_TYPE_MAP[args_cli.dtype],
+            dispatch_dtype,
             args_cli.max_tokens,
             args_cli.kernel_type,
             args_cli.num_qp,
             args_cli.quant_type,
             args_cli.cmd,
             args_cli.sweep_token_interval,
+            combine_dtype,
+            args_cli.block_num if args_cli.block_num is not None else -1,
+            args_cli.rdma_block_num if args_cli.rdma_block_num is not None else -1,
+            args_cli.warp_per_block if args_cli.warp_per_block is not None else -1,
         ),
         nprocs=gpu_per_node,
         join=True,

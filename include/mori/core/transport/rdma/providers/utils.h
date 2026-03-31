@@ -32,15 +32,9 @@
 #include "mori/core/transport/rdma/device_primitives.hpp"
 #endif
 
-#if defined(ENABLE_BNXT) || defined(MORI_DEVICE_NIC_BNXT)
-extern "C" {
-#include <infiniband/bnxt_re_hsi.h>
-}
-#else
 extern "C" {
 #include "mori/core/transport/rdma/providers/bnxt/bnxt_re_hsi.h"
 }
-#endif
 #include "mori/core/transport/rdma/providers/ionic/ionic_dv.h"
 #include "mori/core/transport/rdma/providers/ionic/ionic_fw.h"
 

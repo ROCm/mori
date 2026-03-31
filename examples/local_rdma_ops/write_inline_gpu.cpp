@@ -89,16 +89,12 @@ __global__ void SendRecvOnGpu(RdmaEndpoint& epSend, RdmaEndpoint& epRecv, RdmaMe
       case ProviderType::MLX5:
         SendThreadKernel<ProviderType::MLX5>(epSend, mrRecv);
         break;
-#ifdef ENABLE_BNXT
       case ProviderType::BNXT:
         SendThreadKernel<ProviderType::BNXT>(epSend, mrRecv);
         break;
-#endif
-#ifdef ENABLE_IONIC
       case ProviderType::PSD:
         SendThreadKernel<ProviderType::PSD>(epSend, mrRecv);
         break;
-#endif
       default:
         // unsupported provider
         break;

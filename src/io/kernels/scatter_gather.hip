@@ -19,24 +19,23 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#pragma once
+
+// Batched scatter/gather memory copy kernel for XGMI discrete buffer transfers.
+// JIT-compiled via hipcc --genco at runtime; loaded as .hsaco module.
+//
+// Replaces N individual hipMemcpy calls with a single kernel launch when
+// transferring many small non-contiguous segments.
 
 #include <hip/hip_runtime.h>
 
-namespace mori {
-namespace io {
-
-// Batched scatter/gather memory copy kernel. Processes multiple discrete copy
-// operations in a single kernel launch, avoiding per-operation hipMemcpy
-// overhead that dominates when there are many small non-contiguous segments.
-//
 // Layout of metadata buffer: [srcOffsets... | dstOffsets... | sizes...]
 // Each array has numEntries elements of type size_t, packed contiguously.
-__global__ void scatterGatherCopyKernel(const char* __restrict__ srcBase,
-                                        char* __restrict__ dstBase,
-                                        const size_t* __restrict__ srcOffsets,
-                                        const size_t* __restrict__ dstOffsets,
-                                        const size_t* __restrict__ entrySizes, int numEntries) {
+extern "C" __global__ void scatterGatherCopyKernel(const char* __restrict__ srcBase,
+                                                   char* __restrict__ dstBase,
+                                                   const size_t* __restrict__ srcOffsets,
+                                                   const size_t* __restrict__ dstOffsets,
+                                                   const size_t* __restrict__ entrySizes,
+                                                   int numEntries) {
   for (int e = blockIdx.x; e < numEntries; e += gridDim.x) {
     const char* src = srcBase + srcOffsets[e];
     char* dst = dstBase + dstOffsets[e];
@@ -65,6 +64,3 @@ __global__ void scatterGatherCopyKernel(const char* __restrict__ srcBase,
     }
   }
 }
-
-}  // namespace io
-}  // namespace mori

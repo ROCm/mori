@@ -34,6 +34,7 @@
 
 #include "infiniband/verbs.h"
 #include "mori/application/transport/rdma/providers/bnxt/bnxt.hpp"
+#include "mori/application/transport/rdma/providers/dv_loader.hpp"
 #include "mori/application/transport/rdma/providers/ibverbs/ibverbs.hpp"
 #include "mori/application/transport/rdma/providers/ionic/ionic.hpp"
 #include "mori/application/transport/rdma/providers/mlx5/mlx5.hpp"
@@ -517,18 +518,26 @@ RdmaDevice* RdmaContext::RdmaDeviceFactory(ibv_device* inDevice) {
   } else if (backendType == RdmaBackendType::DirectVerbs) {
     switch (device_attr_ex.orig_attr.vendor_id) {
       case (static_cast<uint32_t>(RdmaDeviceVendorId::Mellanox)):
+        if (!Mlx5DvApi::Available()) {
+          MORI_APP_ERROR("MLX5 device detected but libmlx5.so not available at runtime");
+          return nullptr;
+        }
         return new Mlx5Device(inDevice);
         break;
-#ifdef ENABLE_BNXT
       case (static_cast<uint32_t>(RdmaDeviceVendorId::Broadcom)):
+        if (!BnxtDvApi::Available()) {
+          MORI_APP_ERROR("BNXT device detected but libbnxt_re.so not available at runtime");
+          return nullptr;
+        }
         return new BnxtDevice(inDevice);
         break;
-#endif
-#ifdef ENABLE_IONIC
       case (static_cast<uint32_t>(RdmaDeviceVendorId::Pensando)):
+        if (!IonicDvApi::Available()) {
+          MORI_APP_ERROR("IONIC device detected but libionic.so not available at runtime");
+          return nullptr;
+        }
         return new IonicDevice(inDevice);
         break;
-#endif
       default:
         return nullptr;
     }

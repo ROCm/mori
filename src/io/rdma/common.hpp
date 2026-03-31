@@ -22,6 +22,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -110,6 +111,20 @@ struct NotifMessage {
   int totalNum{-1};
 };
 
+// wr_id namespace:
+//   Zone A: notification RECV indices [0, notifPerQp)
+//   Zone B: ledger record IDs [notifPerQp, 2^63)
+//   Zone C: notification SEND IDs tagged with bit 63
+static constexpr uint64_t kNotifSendWrIdTag = uint64_t{1} << 63;
+
+inline bool IsNotifSendWrId(uint64_t wr_id) { return (wr_id & kNotifSendWrIdTag) != 0; }
+
+inline TransferUniqueId ExtractTransferIdFromWrId(uint64_t wr_id) {
+  return static_cast<TransferUniqueId>(wr_id & ~kNotifSendWrIdTag);
+}
+
+uint64_t MakeNotifSendWrId(TransferUniqueId id);
+
 struct CqCallbackMeta {
   CqCallbackMeta(TransferStatus* s, TransferUniqueId id_, int n)
       : status(s), id(id_), totalBatchSize(n) {}
@@ -137,6 +152,8 @@ struct SubmissionRecord {
 
 class SubmissionLedger {
  public:
+  explicit SubmissionLedger(uint32_t notifPerQp) : nextId_{notifPerQp} {}
+
   // Allocate recordId, insert Posted record, return recordId.
   uint64_t Insert(int postedWr, bool hasSignaledTail, std::shared_ptr<CqCallbackMeta> meta,
                   int batchSize);
@@ -156,7 +173,7 @@ class SubmissionLedger {
 
  private:
   mutable std::mutex mu_;
-  uint64_t nextId_{1};
+  uint64_t nextId_;
   std::unordered_map<uint64_t, SubmissionRecord> records_;
 };
 

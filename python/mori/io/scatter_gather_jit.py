@@ -19,25 +19,24 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-from .api import *
+# Copyright (c) Advanced Micro Devices, Inc. All rights reserved.
+# MIT License
+"""JIT compilation for the XGMI scatter/gather copy kernel.
 
-_LAZY_ATTRS = {
-    "MoriShmemBuffer": "tensor_utils",
-    "mori_shmem_create_tensor": "tensor_utils",
-    "mori_shmem_free_tensor": "tensor_utils",
-    "symm_mori_shmem_tensor": "tensor_utils",
-    "mori_shmem_create_tensor_list_intra_node": "tensor_utils",
-}
+Compiles src/io/kernels/scatter_gather.hip via hipcc --genco on first use.
+The resulting .hsaco is loaded by C++ XgmiBackend via hipModuleLoad.
+"""
 
+from __future__ import annotations
 
-def __getattr__(name: str):
-    if name in _LAZY_ATTRS:
-        import importlib
-
-        mod = importlib.import_module(f".{_LAZY_ATTRS[name]}", __name__)
-        return getattr(mod, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+_hsaco_path: str | None = None
 
 
-def __dir__():
-    return list(globals().keys()) + sorted(_LAZY_ATTRS)
+def ensure_scatter_gather_kernel() -> str:
+    """JIT compile the scatter/gather kernel and return the .hsaco path."""
+    global _hsaco_path
+    if _hsaco_path is None:
+        from mori.jit.core import compile_genco
+
+        _hsaco_path = compile_genco("scatter_gather", source_dir="src/io/kernels")
+    return _hsaco_path

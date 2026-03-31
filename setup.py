@@ -57,6 +57,15 @@ _REQUIRED_HEADERS = [
 ]
 
 
+def _env_flag(name: str, default: str = "OFF") -> bool:
+    return os.environ.get(name, default).strip().upper() in {
+        "1",
+        "ON",
+        "TRUE",
+        "YES",
+    }
+
+
 def _detect_pkg_manager() -> str:
     """Detect the system package manager."""
     if shutil.which("apt-get"):
@@ -241,6 +250,10 @@ def _copy_jit_sources(root_dir: Path) -> None:
         jit_dir / "src" / "ops" / "dispatch_combine",
     )
 
+    io_kernels_src = root_dir / "src" / "io" / "kernels"
+    if io_kernels_src.is_dir():
+        _copytree(io_kernels_src, jit_dir / "src" / "io" / "kernels")
+
     shmem_dst = jit_dir / "src" / "shmem"
     shmem_dst.mkdir(parents=True, exist_ok=True)
     for name in ["shmem_device_api_wrapper.cpp"]:
@@ -333,7 +346,8 @@ class CMakeBuild(build_ext):
         print(f"[mori] GPU architecture: {gpu_archs}")
         build_examples = os.environ.get("BUILD_EXAMPLES", "OFF")
         build_tests = os.environ.get("BUILD_TESTS", "OFF")
-        build_umbp = os.environ.get("BUILD_UMBP", "OFF")
+        build_umbp_enabled = _env_flag("BUILD_UMBP", "OFF")
+        build_umbp = "ON" if build_umbp_enabled else "OFF"
         build_xla_ffi_ops = os.environ.get("BUILD_XLA_FFI_OPS", "OFF")
         with_mpi = (
             "ON"
@@ -415,7 +429,7 @@ class CMakeBuild(build_ext):
         # (no separate .so to copy)
         spdk_proxy_src = build_dir / "src/umbp/spdk_proxy"
         spdk_proxy_dst = root_dir / "python/mori/spdk_proxy"
-        if spdk_proxy_src.exists():
+        if build_umbp_enabled and spdk_proxy_src.exists():
             shutil.copyfile(spdk_proxy_src, spdk_proxy_dst)
             os.chmod(spdk_proxy_dst, 0o755)
         elif spdk_proxy_dst.exists():
@@ -485,26 +499,29 @@ extensions = [
     ),
 ]
 
+mori_package_data = [
+    "libmori_pybinds.so",
+    "libmori_shmem.so",
+    "libmori_ops.so",
+    "libmori_io.so",
+    "libmori_application.so",
+    "_jit_sources/include/**/*.hpp",
+    "_jit_sources/include/**/*.h",
+    "_jit_sources/src/**/*.hip",
+    "_jit_sources/src/**/*.hpp",
+    "_jit_sources/src/**/*.cpp",
+    "_jit_sources/src/**/*.h",
+    "_jit_sources/3rdparty/**/*.h",
+    "_jit_sources/3rdparty/**/*.hpp",
+]
+if _env_flag("BUILD_UMBP", "OFF"):
+    mori_package_data.append("spdk_proxy")
+
 setup(
     packages=find_packages(where="python"),
     package_dir={"": "python"},
     package_data={
-        "mori": [
-            "libmori_pybinds.so",
-            "libmori_shmem.so",
-            "libmori_ops.so",
-            "libmori_io.so",
-            "libmori_application.so",
-            "spdk_proxy",
-            "_jit_sources/include/**/*.hpp",
-            "_jit_sources/include/**/*.h",
-            "_jit_sources/src/**/*.hip",
-            "_jit_sources/src/**/*.hpp",
-            "_jit_sources/src/**/*.cpp",
-            "_jit_sources/src/**/*.h",
-            "_jit_sources/3rdparty/**/*.h",
-            "_jit_sources/3rdparty/**/*.hpp",
-        ],
+        "mori": mori_package_data,
         "mori.ir": ["*.bc"],
     },
     exclude_package_data={

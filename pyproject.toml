@@ -15,8 +15,8 @@ write_to_template = "__version__ = '{version}'\n"
 fallback_version = "0.1.0"
 
 [project]
-name = "mori"
-dynamic = ["version"]
+name = "amd_mori"
+version = "1.0.0"
 description = "Modular RDMA Interface — GPU communication library for P2P, RDMA/IBGDA, and SDMA"
 readme = "README.md"
 license = "MIT"
