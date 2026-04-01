@@ -123,6 +123,7 @@ def test_engine_desc():
 
     desc = engine.get_engine_desc()
     assert desc.node_id != ""
+    assert desc.pid > 0
 
     packed_desc = desc.pack()
     unpacked_desc = EngineDesc.unpack(packed_desc)
@@ -140,6 +141,7 @@ def test_engine_desc_port_zero_auto_bind():
     desc = engine.get_engine_desc()
     assert desc.port > 0
     assert desc.node_id != ""
+    assert desc.pid > 0
 
     packed_desc = desc.pack()
     unpacked_desc = EngineDesc.unpack(packed_desc)
@@ -228,6 +230,7 @@ def test_mem_desc():
 
     assert mem_desc.engine_key == "engine"
     assert mem_desc.device_id == -1
+    assert mem_desc.device_bus_id == ""
     assert mem_desc.data == tensor.data_ptr()
     assert mem_desc.size == tensor.nelement() * tensor.element_size()
     assert mem_desc.loc == MemoryLocationType.CPU
@@ -239,6 +242,7 @@ def test_mem_desc():
 
     assert mem_desc.engine_key == "engine"
     assert mem_desc.device_id == 0
+    assert mem_desc.device_bus_id != ""
     assert mem_desc.data == tensor.data_ptr()
     assert mem_desc.size == tensor.nelement() * tensor.element_size()
     assert mem_desc.loc == MemoryLocationType.GPU
@@ -714,6 +718,23 @@ def test_xgmi_same_device(xgmi_engine):
     status = xgmi_engine.write(src_mem, 0, dst_mem, 0, 1024 * 4, transfer_uid)
     status.Wait()
     assert status.Succeeded()
+    assert torch.equal(src_tensor.cpu(), dst_tensor.cpu())
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
+def test_xgmi_status_completes_without_wait(xgmi_engine):
+    src_tensor, dst_tensor, src_mem, dst_mem = alloc_xgmi_mem(
+        xgmi_engine, src_gpu=0, dst_gpu=1, shape=(1024,)
+    )
+    transfer_uid = xgmi_engine.allocate_transfer_uid()
+    status = xgmi_engine.write(src_mem, 0, dst_mem, 0, 1024 * 4, transfer_uid)
+
+    deadline = time.time() + 5
+    while status.InProgress() and time.time() < deadline:
+        time.sleep(0.01)
+
+    assert not status.InProgress(), "XGMI status should progress without calling Wait()"
+    assert status.Succeeded(), status.Message()
     assert torch.equal(src_tensor.cpu(), dst_tensor.cpu())
 
 

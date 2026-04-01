@@ -25,6 +25,7 @@
 #include <functional>
 #include <msgpack.hpp>
 #include <mutex>
+#include <string>
 
 #include "mori/application/transport/p2p/p2p.hpp"
 #include "mori/application/transport/rdma/rdma.hpp"
@@ -75,13 +76,14 @@ struct EngineDesc {
   std::string hostname;
   std::string host;
   int port;
+  int pid{0};
 
   constexpr bool operator==(const EngineDesc& rhs) const noexcept {
     return (key == rhs.key) && (nodeId == rhs.nodeId) && (hostname == rhs.hostname) &&
-           (host == rhs.host) && (port == rhs.port);
+           (host == rhs.host) && (port == rhs.port) && (pid == rhs.pid);
   }
 
-  MSGPACK_DEFINE(key, nodeId, hostname, host, port);
+  MSGPACK_DEFINE(key, nodeId, hostname, host, port, pid);
 };
 
 using MemoryUniqueId = uint32_t;
@@ -92,6 +94,7 @@ struct MemoryDesc {
   EngineKey engineKey;
   MemoryUniqueId id{0};
   int deviceId{-1};
+  std::string deviceBusId;
   uintptr_t data{0};
   size_t size{0};
   MemoryLocationType loc;
@@ -99,10 +102,11 @@ struct MemoryDesc {
 
   constexpr bool operator==(const MemoryDesc& rhs) const noexcept {
     return (engineKey == rhs.engineKey) && (id == rhs.id) && (deviceId == rhs.deviceId) &&
-           (data == rhs.data) && (size == rhs.size) && (loc == rhs.loc);
+           (deviceBusId == rhs.deviceBusId) && (data == rhs.data) && (size == rhs.size) &&
+           (loc == rhs.loc);
   }
 
-  MSGPACK_DEFINE(engineKey, id, deviceId, data, size, loc, ipcHandle);
+  MSGPACK_DEFINE(engineKey, id, deviceId, deviceBusId, data, size, loc, ipcHandle);
 };
 
 using TransferUniqueId = uint64_t;
@@ -112,8 +116,8 @@ struct TransferStatus {
   TransferStatus() = default;
   ~TransferStatus() = default;
 
-  StatusCode Code() { return code.load(std::memory_order_acquire); }
-  uint32_t CodeUint32() { return static_cast<uint32_t>(code.load(std::memory_order_acquire)); }
+  StatusCode Code() { return CodeWithProgress(); }
+  uint32_t CodeUint32() { return static_cast<uint32_t>(Code()); }
 
   std::string Message() {
     std::lock_guard<std::mutex> lock(msgMu);
@@ -141,6 +145,7 @@ struct TransferStatus {
   }
 
   void Wait() {
+    PollProgress();
     if (waitCallback) {
       waitCallback();
       return;
@@ -150,12 +155,24 @@ struct TransferStatus {
   }
 
   void SetWaitCallback(std::function<void()> cb) { waitCallback = std::move(cb); }
+  void SetProgressCallback(std::function<void()> cb) { progressCallback = std::move(cb); }
 
  private:
+  StatusCode CodeWithProgress() {
+    PollProgress();
+    return code.load(std::memory_order_acquire);
+  }
+
+  void PollProgress() {
+    if (code.load(std::memory_order_acquire) != StatusCode::IN_PROGRESS) return;
+    if (progressCallback) progressCallback();
+  }
+
   std::atomic<StatusCode> code{StatusCode::INIT};
   mutable std::mutex msgMu;
   std::string msg;
   std::function<void()> waitCallback;
+  std::function<void()> progressCallback;
 };
 
 using SizeVec = std::vector<size_t>;
