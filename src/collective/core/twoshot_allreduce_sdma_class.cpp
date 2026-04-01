@@ -501,12 +501,19 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
 
         const bool multi_chunk = (chunk_elems < total_count);
 
-        if (myPe_ == 0) {
+        {
+            static int s_call = 0;
+            int call_id = s_call++;
+            uint32_t dbg_flag = 0, dbg_cc = 0;
+            hipMemcpy(&dbg_flag,
+                      reinterpret_cast<char*>(barrierPtr_) + offsetof(CrossPeBarrier, flag),
+                      sizeof(uint32_t), hipMemcpyDeviceToHost);
+            hipMemcpy(&dbg_cc,
+                      reinterpret_cast<char*>(barrierPtr_) + offsetof(CrossPeBarrier, chunks_complete),
+                      sizeof(uint32_t), hipMemcpyDeviceToHost);
             fprintf(stderr,
-                    "PE0: pipe sm=%d mc=%d blk=%d n=%zu chunk=%zu numQ=%u\n",
-                    scatter_mode, (int)multi_chunk,
-                    blocks, total_count, chunk_elems,
-                    output_transit_buffer_obj_->sdmaNumQueue);
+                    "PE %d: pipe#%d sm=%d blk=%d cc=%u flag=%u\n",
+                    myPe_, call_id, scatter_mode, blocks, dbg_cc, dbg_flag);
         }
 
         if (scatter_mode == 1) {

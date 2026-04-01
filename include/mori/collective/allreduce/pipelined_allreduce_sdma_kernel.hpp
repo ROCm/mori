@@ -144,7 +144,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
                      (unsigned long long)expected,
                      (unsigned long long)core::AtomicLoadRelaxed(sig),
                      (unsigned long long)s_scatter_by_sender[sender]);
-              break;
+              _sp = 0;
             }
           }
         }
@@ -253,7 +253,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
                        myPe, c, ccBase, ccTarget,
                        __scoped_atomic_load_n(&barrier->chunks_complete,
                                               __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE));
-                break;
+                _sp4 = 0;
               }
             }
 
@@ -283,7 +283,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
                      myPe, sender,
                      (unsigned long long)expected,
                      (unsigned long long)core::AtomicLoadRelaxed(sig));
-              break;
+              _sp5 = 0;
             }
           }
         }
@@ -307,7 +307,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
                      __scoped_atomic_load_n(&barrier->chunks_complete,
                                             __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE),
                      compBlocks);
-              break;
+              _sp2 = 0;
             }
           }
 
@@ -331,7 +331,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
                      (unsigned long long)expected,
                      (unsigned long long)core::AtomicLoadRelaxed(sig),
                      (unsigned long long)s_ag_by_sender[sender]);
-              break;
+              _sp3 = 0;
             }
           }
         }
@@ -422,12 +422,12 @@ __global__ void PipelinedAllReduceSdmaKernel(
             + static_cast<size_t>(sender) * numQ + 1;
         int spin = 0;
         while (core::AtomicLoadRelaxed(sig) < expected) {
-          if (++spin > 100000000) {
+          if (++spin > 200000000) {
             printf("PE %d: final AG timeout peer=%d exp=%llu act=%llu\n",
                    myPe, sender,
                    (unsigned long long)expected,
                    (unsigned long long)core::AtomicLoadRelaxed(sig));
-            break;
+            spin = 0;
           }
         }
       }
