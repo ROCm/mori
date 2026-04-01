@@ -267,7 +267,6 @@ def _copy_jit_sources(root_dir: Path) -> None:
             _copytree(src, jit_dir / "3rdparty" / subdir)
 
 
-
 class CMakeBuild(build_ext):
     def run(self) -> None:
         try:

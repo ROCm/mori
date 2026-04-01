@@ -255,4 +255,3 @@ install(DIRECTORY include/mori DESTINATION include)
 # CMake package config (enables find_package(mori) for external C++ users)
 install(FILES cmake/mori-config.cmake cmake/MoriDetectDevice.cmake
         DESTINATION lib/cmake/mori)
-
