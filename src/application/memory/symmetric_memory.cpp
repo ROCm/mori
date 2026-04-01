@@ -108,7 +108,7 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
   SymmMemObj* cpuMemObj = new SymmMemObj();
   cpuMemObj->localPtr = localPtr;
   cpuMemObj->size = size;
-  cpuMemObj->sdmaNumQueue = anvil::GetSdmaNumChannels();
+  cpuMemObj->sdmaNumQueue = 8;
 
   // Exchange pointers (RDMA virtual addresses)
   cpuMemObj->peerPtrs = static_cast<uintptr_t*>(calloc(worldSize, sizeof(uintptr_t)));
@@ -570,7 +570,7 @@ SymmMemObjPtr SymmMemManager::CreateVMMHeapObject(size_t virtualSize, int worldS
   SymmMemObj* cpuHeapObj = new SymmMemObj();
   cpuHeapObj->localPtr = vmmVirtualBasePtr;
   cpuHeapObj->size = virtualSize;
-  cpuHeapObj->sdmaNumQueue = anvil::GetSdmaNumChannels();
+  cpuHeapObj->sdmaNumQueue = 8;
 
   // Exchange virtual base pointers among all PEs
   cpuHeapObj->peerPtrs = static_cast<uintptr_t*>(calloc(worldSize, sizeof(uintptr_t)));
@@ -1614,7 +1614,7 @@ SymmMemObjPtr SymmMemManager::VMMRegisterSymmMemObj(void* localPtr, size_t size,
   SymmMemObj* cpuMemObj = new SymmMemObj();
   cpuMemObj->localPtr = localPtr;
   cpuMemObj->size = size;
-  cpuMemObj->sdmaNumQueue = anvil::GetSdmaNumChannels();
+  cpuMemObj->sdmaNumQueue = 8;
 
   // Calculate peer pointers based on VMM per-PE virtual address spaces
   cpuMemObj->peerPtrs = static_cast<uintptr_t*>(calloc(worldSize, sizeof(uintptr_t)));
