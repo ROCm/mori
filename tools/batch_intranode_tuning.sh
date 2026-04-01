@@ -38,7 +38,7 @@ QUANT_TYPE=fp8_direct_cast
 CONFIG_OUTPUT=auto
 GPUS=""
 SHMEM_MODE=""
-TIMEOUT=600
+TIMEOUT=3600
 
 # Typical tuning matrix (run each separately):
 #
@@ -156,12 +156,14 @@ for HIDDEN_DIM in "${HIDDEN_DIM_ARRAY[@]}"; do
         REPRO_CMD="HSA_NO_SCRATCH_RECLAIM=1 python $BENCH_SCRIPT --cmd tuning --world-size $WORLD_SIZE --max-tokens $TOKENS --hidden-dim $HIDDEN_DIM --dtype $DTYPE --zero-copy $ZERO_COPY --quant-type $QUANT_TYPE"
         [[ -n "$COMBINE_DTYPE" ]] && REPRO_CMD="$REPRO_CMD --combine-dtype $COMBINE_DTYPE"
 
+        set +e
         timeout "$TIMEOUT" python "$BENCH_SCRIPT" \
             "${PY_COMMON_ARGS[@]}" \
             --max-tokens "$TOKENS" \
             --hidden-dim "$HIDDEN_DIM" \
             2>&1 | tee -a "$LOG_FILE"
         EXIT_CODE=${PIPESTATUS[0]}
+        set -e
 
         if [[ $EXIT_CODE -eq 124 ]]; then
             FAILED=$((FAILED + 1))
