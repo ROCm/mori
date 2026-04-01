@@ -39,26 +39,6 @@
 namespace mori {
 namespace collective {
 
-namespace {
-
-template <typename T>
-size_t SdmaTransitUsedBytes(size_t total_count, int npes, size_t dtype_size) {
-    constexpr int pack_size = packed_t<T>::P::size;
-    const size_t element_count_per_rank =
-        ((total_count / static_cast<size_t>(npes) + static_cast<size_t>(pack_size) - 1U) /
-         static_cast<size_t>(pack_size)) *
-        static_cast<size_t>(pack_size);
-    return element_count_per_rank * static_cast<size_t>(npes) * dtype_size;
-}
-
-inline bool SdmaShouldZeroTransit() {
-    const char* e = std::getenv("MORI_SDMA_ZERO_TRANSIT");
-    if (e && e[0] == '1' && e[1] == '\0') return true;
-    return false;
-}
-
-}  // namespace
-
 // ---------------------------------------------------------------------------
 // Delegating constructor
 // ---------------------------------------------------------------------------
@@ -71,7 +51,7 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t transit_buffer_size,
 // Main constructor
 // ---------------------------------------------------------------------------
 template <typename T>
-AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t input_buffer_size,
+AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t /*input_buffer_size*/,
                                 size_t output_buffer_size, bool copy_output_to_user,
                                 bool /*use_graph_mode*/)
     : myPe_(myPe),
@@ -82,7 +62,7 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t input_buffer_size,
       barrierPtr_(nullptr),
       barrierMem_(nullptr, ShmemDeleter()),
       input_transit_buffer_(nullptr),
-      input_transit_buffer_size_(input_buffer_size),
+      input_transit_buffer_size_(0),
       input_transit_buffer_ptr_(nullptr, ShmemDeleter()),
       output_transit_buffer_(nullptr),
       output_transit_buffer_size_(output_buffer_size),
@@ -122,15 +102,22 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t input_buffer_size,
   if (!output_transit_buffer_obj_.IsValid())
     throw std::runtime_error("Failed to register output transit buffer");
 
-  if (input_transit_buffer_size_ > 0) {
-    input_transit_buffer_ = shmem::ShmemMalloc(input_transit_buffer_size_);
-    if (!input_transit_buffer_)
-      throw std::runtime_error("Failed to allocate input transit buffer");
-    input_transit_buffer_ptr_.reset(input_transit_buffer_);
-    input_transit_buffer_obj_ =
-        shmem::ShmemSymmetricRegister(input_transit_buffer_, input_transit_buffer_size_);
-    if (!input_transit_buffer_obj_.IsValid())
-      throw std::runtime_error("Failed to register input transit buffer");
+  // Zero SDMA completion signals so the generation counter (barrier->flag) stays in sync.
+  // Without this, reused SHMEM memory may carry stale signal values from a prior instance.
+  // NOTE: cpu-side SymmMemObj does NOT carry signalPtrs (it's null). Read the device
+  // pointer from the gpu-side struct via hipMemcpy.
+  {
+    uint32_t numQ = output_transit_buffer_obj_->sdmaNumQueue;
+    if (numQ > 0 && output_transit_buffer_obj_.gpu != nullptr) {
+      HSAuint64* devSigPtr = nullptr;
+      hipMemcpy(&devSigPtr,
+                reinterpret_cast<char*>(output_transit_buffer_obj_.gpu) +
+                    offsetof(application::SymmMemObj, signalPtrs),
+                sizeof(HSAuint64*), hipMemcpyDeviceToHost);
+      if (devSigPtr) {
+        hipMemset(devSigPtr, 0, static_cast<size_t>(npes_) * numQ * sizeof(HSAuint64));
+      }
+    }
   }
 
   printf("AllreduceSdma(SDMA) initialized: PE %d of %d, max_blocks=%d\n", myPe_, npes_,
@@ -139,10 +126,6 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t input_buffer_size,
   printf("  Barrier: %zu bytes at %p\n", barrierSize, bMem);
   printf("  Output transit buffer: %.2f MB at %p\n",
          output_transit_buffer_size_ / (1024.0 * 1024.0), output_transit_buffer_);
-  if (input_transit_buffer_size_ > 0) {
-    printf("  Input transit buffer: %.2f MB at %p\n",
-           input_transit_buffer_size_ / (1024.0 * 1024.0), input_transit_buffer_);
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -252,77 +235,44 @@ void AllreduceSdma<T>::copy_output_to_user(T* output, size_t total_count, hipStr
 // ---------------------------------------------------------------------------
 template <typename T>
 bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count, hipStream_t stream) {
-    try {
-        if (total_count == 0) return true;
-        if (!output_transit_buffer_) {
-            fprintf(stderr, "PE %d: operator(): output transit buffer is null\n", myPe_);
-            return false;
-        }
+  try {
+    // Step 1: SdmaReduceScatter — SDMA scatter + local reduce
+    constexpr int pack_size = packed_t<T>::P::size;
+    int threads = 512;
+    int packedPerRank = static_cast<int>(((total_count / npes_ + pack_size - 1) / pack_size));
+    int blocks = std::min(max_blocks_, (packedPerRank + threads - 1) / threads);
+    if (blocks < 1) blocks = 1;
 
-        constexpr int pack_size = packed_t<T>::P::size;
-        const size_t transit_used = SdmaTransitUsedBytes<T>(total_count, npes_, dtype_size_);
-        if (transit_used > output_transit_buffer_size_) {
-            fprintf(stderr,
-                    "PE %d: operator(): transit need %zu B > allocated %zu B\n",
-                    myPe_, transit_used, output_transit_buffer_size_);
-            return false;
-        }
-        if (SdmaShouldZeroTransit()) {
-            hipError_t zerr = stream ? hipMemsetAsync(output_transit_buffer_, 0, transit_used, stream)
-                                     : hipMemset(output_transit_buffer_, 0, transit_used);
-            if (zerr != hipSuccess) {
-                fprintf(stderr, "PE %d: hipMemset(output transit) failed: %s\n",
-                        myPe_, hipGetErrorString(zerr));
-                return false;
-            }
-        }
+    SdmaReduceScatterKernel<T><<<blocks, threads, 0, stream>>>(
+        myPe_, npes_, input, output_transit_buffer_obj_, flagsObj_, barrierPtr_, total_count);
 
-        int threads = 512;
-        int packedPerRank = static_cast<int>(
-            ((total_count / npes_ + pack_size - 1) / pack_size));
-        int blocks = std::min(max_blocks_,
-                              (packedPerRank + threads - 1) / threads);
-        if (blocks < 1) blocks = 1;
-
-        SdmaReduceScatterKernel<T><<<blocks, threads, 0, stream>>>(
-            myPe_, npes_, input,
-            output_transit_buffer_obj_, flagsObj_, barrierPtr_, total_count);
-
-        hipError_t err = hipGetLastError();
-        if (err != hipSuccess) {
-            fprintf(stderr, "PE %d: SdmaReduceScatter launch failed: %s\n",
-                    myPe_, hipGetErrorString(err));
-            return false;
-        }
-
-        err = stream ? hipStreamSynchronize(stream) : hipDeviceSynchronize();
-        if (err != hipSuccess) {
-            fprintf(stderr,
-                    "PE %d: sync after ReduceScatter failed: %s\n",
-                    myPe_, hipGetErrorString(err));
-            return false;
-        }
-
-        AllGatherSdmaKernel<T><<<1, 512, 0, stream>>>(
-            myPe_, npes_, output_transit_buffer_obj_,
-            flagsObj_, barrierPtr_, total_count);
-
-        err = hipGetLastError();
-        if (err != hipSuccess) {
-            fprintf(stderr, "PE %d: AllGather launch failed: %s\n",
-                    myPe_, hipGetErrorString(err));
-            return false;
-        }
-
-        if (copy_output_to_user_) {
-            copy_output_to_user(output, total_count, stream);
-        }
-
-    } catch (const std::exception& e) {
-        fprintf(stderr, "PE %d: AllReduce failed: %s\n", myPe_, e.what());
-        return false;
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+      fprintf(stderr, "PE %d: SdmaReduceScatter launch failed: %s\n", myPe_,
+              hipGetErrorString(err));
+      return false;
     }
-    return true;
+
+    // Step 2: AllGather via SDMA
+    AllGatherSdmaKernel<T><<<1, 512, 0, stream>>>(myPe_, npes_, output_transit_buffer_obj_,
+                                                  flagsObj_, barrierPtr_, total_count);
+
+    err = hipGetLastError();
+    if (err != hipSuccess) {
+      fprintf(stderr, "PE %d: AllGather launch failed: %s\n", myPe_, hipGetErrorString(err));
+      return false;
+    }
+
+    // Step 3: Copy result to user buffer
+    if (copy_output_to_user_) {
+      copy_output_to_user(output, total_count, stream);
+    }
+
+  } catch (const std::exception& e) {
+    fprintf(stderr, "PE %d: AllReduce failed: %s\n", myPe_, e.what());
+    return false;
+  }
+  return true;
 }
 
 // ================ Async API Implementations ================
@@ -342,25 +292,16 @@ bool AllreduceSdma<T>::start_async(T* input, T* output, size_t total_count, hipS
   async_start_time_ = MPI_Wtime();
 
   try {
-    const size_t transit_used = SdmaTransitUsedBytes<T>(total_count, npes_, dtype_size_);
+    size_t elementCountPerRank = total_count / npes_;
+    size_t required_output_size = elementCountPerRank * npes_ * dtype_size_;
     if (!ensure_buffer_size(output_transit_buffer_, output_transit_buffer_ptr_,
                             output_transit_buffer_size_, output_transit_buffer_obj_,
-                            transit_used, "output transit buffer")) {
+                            required_output_size, "output transit buffer")) {
       async_in_progress_ = false;
       return false;
     }
 
-    if (SdmaShouldZeroTransit()) {
-      hipError_t zerr = stream ? hipMemsetAsync(output_transit_buffer_, 0, transit_used, stream)
-                               : hipMemset(output_transit_buffer_, 0, transit_used);
-      if (zerr != hipSuccess) {
-        fprintf(stderr, "PE %d: start_async hipMemset(transit) failed: %s\n",
-                myPe_, hipGetErrorString(zerr));
-        async_in_progress_ = false;
-        return false;
-      }
-    }
-
+    // Step 1: SdmaReduceScatter — same as operator()
     constexpr int pack_size = packed_t<T>::P::size;
     int threads = 512;
     int packedPerRank = static_cast<int>(((total_count / npes_ + pack_size - 1) / pack_size));
@@ -370,21 +311,8 @@ bool AllreduceSdma<T>::start_async(T* input, T* output, size_t total_count, hipS
     SdmaReduceScatterKernel<T><<<blocks, threads, 0, stream>>>(
         myPe_, npes_, input, output_transit_buffer_obj_, flagsObj_, barrierPtr_, total_count);
 
-    hipError_t rs_err = hipGetLastError();
-    if (rs_err != hipSuccess) {
-      fprintf(stderr, "PE %d: Async ReduceScatter launch failed: %s\n",
-              myPe_, hipGetErrorString(rs_err));
-      async_in_progress_ = false;
-      return false;
-    }
-    rs_err = stream ? hipStreamSynchronize(stream) : hipDeviceSynchronize();
-    if (rs_err != hipSuccess) {
-      fprintf(stderr, "PE %d: sync after Async ReduceScatter failed: %s\n",
-              myPe_, hipGetErrorString(rs_err));
-      async_in_progress_ = false;
-      return false;
-    }
-
+    // Step 2: AllGather PUT only — sends data, returns immediately
+    // The wait is deferred to wait_async so the user can run GEMM on CU
     AllGatherAsyncPutKernel<T><<<1, 512, 0, stream>>>(myPe_, npes_, output_transit_buffer_obj_,
                                                       flagsObj_, barrierPtr_, total_count);
 
@@ -500,22 +428,6 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         }
 
         constexpr int pack_size = packed_t<T>::P::size;
-        const size_t transit_used = SdmaTransitUsedBytes<T>(total_count, npes_, dtype_size_);
-        if (transit_used > output_transit_buffer_size_) {
-            fprintf(stderr,
-                    "PE %d: pipelined: transit need %zu B > allocated %zu B\n",
-                    myPe_, transit_used, output_transit_buffer_size_);
-            return false;
-        }
-        if (SdmaShouldZeroTransit()) {
-            hipError_t zerr = stream ? hipMemsetAsync(output_transit_buffer_, 0, transit_used, stream)
-                                     : hipMemset(output_transit_buffer_, 0, transit_used);
-            if (zerr != hipSuccess) {
-                fprintf(stderr, "PE %d: pipelined hipMemset(output transit) failed: %s\n",
-                        myPe_, hipGetErrorString(zerr));
-                return false;
-            }
-        }
 
         int threads = 512;
         int packedPerRank = static_cast<int>(
@@ -589,6 +501,15 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
 
         const bool multi_chunk = (chunk_elems < total_count);
 
+        fprintf(stderr,
+                "PE %d: pipelined LAUNCH scatter_mode=%d multi_chunk=%d "
+                "blocks=%d threads=%d total_count=%zu chunk_elems=%zu "
+                "numQ=%u barrier=%p sizeof(barrier)=%zu\n",
+                myPe_, scatter_mode, (int)multi_chunk,
+                blocks, threads, total_count, chunk_elems,
+                output_transit_buffer_obj_->sdmaNumQueue,
+                (void*)barrierPtr_, sizeof(CrossPeBarrier));
+
         if (scatter_mode == 1) {
             PipelinedAllReduceSdmaKernel<T, 1><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
@@ -612,6 +533,8 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                     myPe_, hipGetErrorString(err));
             return false;
         }
+
+        fprintf(stderr, "PE %d: pipelined kernel launched OK, waiting...\n", myPe_);
 
         if (copy_output_to_user_) {
             copy_output_to_user(output, total_count, stream);
