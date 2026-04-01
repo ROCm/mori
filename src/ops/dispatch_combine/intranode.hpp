@@ -272,7 +272,7 @@ __device__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       index_t destPe = PeFromFlatTokenIndex(config, destTokId);
       index_t destLocalTokId = LocalTokIdFromFlatTokenIndex(config, destTokId);
       uint8_t* destStagingPtr = args.intraNodeTokBufs.combineInp->template GetAs<uint8_t*>(destPe) +
-                                BufSlotOffset(config, myPe, destLocalTokId) * combXferBytes;
+                                SendBufSlotOffset(config, myPe, destLocalTokId) * combXferBytes;
       if constexpr (!std::is_same_v<T, TokT> && std::is_same_v<TokT, core::CombineInternalFp8>) {
         core::WarpCastBf16ToCombineInternalFp8<T>(reinterpret_cast<TokT*>(destStagingPtr),
                                                   args.inpTokenBuf + tokenIdx * config.hiddenDim,
@@ -325,11 +325,11 @@ __device__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
         } else {
           srcPtrs[j] = reinterpret_cast<TokT*>(
                            args.intraNodeTokBufs.combineInp->template GetAs<uint8_t*>(myPe) +
-                           BufSlotOffset(config, destPe, tokenId) * combXferBytes) +
+                           SendBufSlotOffset(config, destPe, tokenId) * combXferBytes) +
                        hiddenDimOffset;
           srcWeightsPtr[j] = reinterpret_cast<float*>(
               args.intraNodeTokBufs.combineInp->template GetAs<uint8_t*>(myPe) +
-              BufSlotOffset(config, destPe, tokenId) * combXferBytes + hiddenBytes);
+              SendBufSlotOffset(config, destPe, tokenId) * combXferBytes + hiddenBytes);
         }
       } else {
         srcPtrs[j] = nullptr;

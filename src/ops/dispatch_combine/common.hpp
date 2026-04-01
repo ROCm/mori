@@ -27,12 +27,12 @@ namespace mori {
 namespace moe {
 
 // Encode/decode a (pe, localTokId) pair into a flat global token index for bookkeeping.
-// Stride: MaxNumTokensToRecv(), which guarantees uniqueness across all PEs.
+// Stride: MaxNumTokensToSend(), which guarantees uniqueness across all PEs.
 inline __device__ int FlatTokenIndex(const EpDispatchCombineConfig& config, int pe,
                                      int localTokId) {
   return pe * config.MaxNumTokensToSend() + localTokId;
 }
-inline __device__ int PeFromFlatTokenIndex(const EpDispatchCombineConfig& config, int flatIdx) {
+/ inline __device__ int PeFromFlatTokenIndex(const EpDispatchCombineConfig& config, int flatIdx) {
   return flatIdx / config.MaxNumTokensToSend();
 }
 inline __device__ int LocalTokIdFromFlatTokenIndex(const EpDispatchCombineConfig& config,
@@ -41,18 +41,6 @@ inline __device__ int LocalTokIdFromFlatTokenIndex(const EpDispatchCombineConfig
 }
 inline __device__ int NullFlatTokenIndex(const EpDispatchCombineConfig& config) {
   return config.worldSize * config.MaxNumTokensToSend();
-}
-
-// Encode/decode a flat offset into a per-PE staging buffer.
-// Stride: MaxNumTokensToRecvPerRank, which determines how much buffer space is allocated per PE.
-inline __device__ int BufSlotOffset(const EpDispatchCombineConfig& config, int pe, int slotId) {
-  return pe * config.MaxNumTokensToRecvPerRank() + slotId;
-}
-inline __device__ int PeFromBufSlotOffset(const EpDispatchCombineConfig& config, int flatIdx) {
-  return flatIdx / config.MaxNumTokensToRecvPerRank();
-}
-inline __device__ int SlotIdFromBufSlotOffset(const EpDispatchCombineConfig& config, int flatIdx) {
-  return flatIdx % config.MaxNumTokensToRecvPerRank();
 }
 
 // Encode/decode a flat offset into a per-PE send staging buffer.
