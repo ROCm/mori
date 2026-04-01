@@ -137,21 +137,15 @@ else()
   set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -expt-relaxed-constexpr")
 endif()
 
-set(SPDLOG_BUILD_EXAMPLE
-    OFF
-    CACHE BOOL "" FORCE)
-set(SPDLOG_BUILD_TESTS
-    OFF
-    CACHE BOOL "" FORCE)
-set(SPDLOG_BUILD_BENCH
-    OFF
-    CACHE BOOL "" FORCE)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-add_subdirectory(3rdparty/spdlog)
 
+# spdlog: header-only mode (vendored headers in 3rdparty/spdlog/include)
+find_package(Threads REQUIRED)
 add_library(mori_logging INTERFACE)
 target_include_directories(mori_logging INTERFACE include)
-target_link_libraries(mori_logging INTERFACE spdlog::spdlog)
+target_include_directories(mori_logging INTERFACE 3rdparty/spdlog/include)
+target_compile_definitions(mori_logging INTERFACE SPDLOG_HEADER_ONLY)
+target_link_libraries(mori_logging INTERFACE Threads::Threads)
 
 if(ENABLE_PROFILER)
   find_package(
@@ -262,7 +256,3 @@ install(DIRECTORY include/mori DESTINATION include)
 install(FILES cmake/mori-config.cmake cmake/MoriDetectDevice.cmake
         DESTINATION lib/cmake/mori)
 
-# Logging (spdlog is statically linked, but install the shared lib if built)
-if(TARGET spdlog)
-  install(TARGETS spdlog ARCHIVE DESTINATION lib)
-endif()
