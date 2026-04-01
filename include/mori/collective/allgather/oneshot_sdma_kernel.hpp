@@ -22,93 +22,67 @@
 #pragma once
 
 #include <hip/hip_runtime.h>
-
 #include <cstddef>
 
-#include "mori/core/transport/rdma/device_primitives.hpp"
 #include "mori/shmem/shmem.hpp"
+#include "mori/core/transport/rdma/device_primitives.hpp"
 
 namespace mori {
 namespace collective {
 template <typename T>
-__global__ void OneShotAllGatherSdmaKernel(int myPe, int npes, T* input,
-                                           const application::SymmMemObjPtr srcMemObj,
-                                           const application::SymmMemObjPtr dstMemObj,
-                                           const application::SymmMemObjPtr flagsMemObj,
-                                           size_t elementCount, size_t dstBaseOffset = 0,
-                                           uint64_t flagVal = 1) {
+__global__ void OneShotAllGatherSdmaKernel(int myPe, int npes,
+		                               T* input,
+                                       const application::SymmMemObjPtr srcMemObj,
+                                       const application::SymmMemObjPtr dstMemObj,
+                                       const application::SymmMemObjPtr flagsMemObj,
+                                       size_t elementCount) {
   if (elementCount == 0 || npes <= 0) {
     return;
   }
 
   T* __restrict__ inputData = input;
-  //  T* __restrict__ src = reinterpret_cast<T*>(srcMemObj->localPtr);
-  //  T* __restrict__ dst = reinterpret_cast<T*>(dstMemObj->localPtr);
-  uint64_t* __restrict__ flags = reinterpret_cast<uint64_t*>(flagsMemObj->localPtr);
-
   const size_t threadLinearId =
       static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + threadIdx.x;
-  //  const size_t threadsPerGrid = static_cast<size_t>(blockDim.x) *
-  //  static_cast<size_t>(gridDim.x); const size_t stride = threadsPerGrid > 0 ? threadsPerGrid : 1;
 
   const size_t bytesPerElement = sizeof(T);
   const size_t bytesPerPeer = elementCount * bytesPerElement;
-  const size_t elemsPerPeer = elementCount;
 
-  int warpId = threadLinearId / warpSize;
-  const int laneId = threadIdx.x % warpSize;
+  // Multi-queue: each thread handles one SDMA queue for one remote PE
+  if(threadLinearId < npes * dstMemObj->sdmaNumQueue){
+    int qId = threadLinearId % dstMemObj->sdmaNumQueue;
+    int remotePe = threadLinearId / dstMemObj->sdmaNumQueue;
+    const size_t sendBytesBase = bytesPerPeer / 8;
+    size_t destByteOffset = myPe * bytesPerPeer + qId * sendBytesBase;
+    size_t srcByteOffset = qId * sendBytesBase;
+    size_t sendBytes = (qId == 7) ? (bytesPerPeer - 7 * sendBytesBase) : sendBytesBase;
 
-  if (warpId < npes && laneId == 0) {
-    int remotePe = warpId;
-    size_t destByteOffset = myPe * bytesPerPeer;
-    size_t srcByteOffset = 0;
-    size_t sendBytes = bytesPerPeer;
-#if 1
     application::SymmMemObjPtr dest = dstMemObj;
-    uint8_t* srcPtr = reinterpret_cast<uint8_t*>(inputData) + srcByteOffset;
-    uint8_t* dstPtr =
-        reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe]) + dstBaseOffset + destByteOffset;
-    anvil::SdmaQueueDeviceHandle** devicehandles =
-        dest->deviceHandles_d + remotePe * dest->sdmaNumQueue;
-    HSAuint64* signals = dest->signalPtrs + remotePe * dest->sdmaNumQueue;
-    HSAuint64* expectedSignals = dest->expectSignalsPtr + remotePe * dest->sdmaNumQueue;
-    core::SdmaPutThread(srcPtr, dstPtr, sendBytes, devicehandles, signals, expectedSignals,
-                        dest->sdmaNumQueue, 0);
-#endif
-  }
-
-  if (warpId < npes && laneId == 0) {
-    int remotePe = warpId;
-    shmem::ShmemQuietThread(remotePe, dstMemObj);
-    shmem::ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::SDMA>(
-        flagsMemObj, static_cast<size_t>(myPe) * sizeof(uint64_t), &flagVal, 8,
-        core::atomicType::AMO_SET, remotePe, 0);
+    uint8_t* srcPtr = reinterpret_cast<uint8_t *>(inputData) + srcByteOffset;
+    uint8_t* dstPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe]) + destByteOffset;
+    anvil::SdmaQueueDeviceHandle** devicehandles = dest->deviceHandles_d + remotePe*dest->sdmaNumQueue;
+    HSAuint64* remoteSignal = dest->peerSignalPtrs[remotePe]
+                              + static_cast<size_t>(myPe) * dest->sdmaNumQueue;
+    core::SdmaPutThread(srcPtr, dstPtr, sendBytes, devicehandles, remoteSignal, dest->sdmaNumQueue, qId);
   }
   __syncthreads();
 
-  for (int sender = 0; sender < npes; ++sender) {
-    if (sender == myPe) {
-      continue;
-    }
-
-    if (threadLinearId == 0) {
-      // Keep waiting for the peer completion flag. A finite spin threshold can
-      // produce false timeouts under heavy traffic and cause incorrect forward
-      // progress (kernel continues before data is actually ready).
-      int spinCount = 0;
-      bool warned = false;
-      while (core::AtomicLoadRelaxed(flags + sender) < flagVal) {
-        ++spinCount;
-        if (!warned && spinCount > 10000000) {
-          printf("PE %d: Slow wait for data from peer %d (still waiting)\n", myPe, sender);
-          warned = true;
-        }
+  // Parallel wait: each thread handles one sender
+  if (threadLinearId < npes && threadLinearId != myPe) {
+    int sender = threadLinearId;
+    HSAuint64* mySignal = dstMemObj->signalPtrs
+                          + static_cast<size_t>(sender) * dstMemObj->sdmaNumQueue;
+    HSAuint64 expected = dstMemObj->expectSignalsPtr[sender * dstMemObj->sdmaNumQueue] + 1;
+    int spinCount = 0;
+    while (core::AtomicLoadRelaxed(mySignal) < expected) {
+      ++spinCount;
+      if (spinCount > 10000000) {
+        printf("PE %d: Timeout waiting for data from peer %d\n", myPe, sender);
+        break;
       }
     }
-    __syncthreads();
+    dstMemObj->expectSignalsPtr[sender * dstMemObj->sdmaNumQueue] = expected;
   }
-
-  // Monotonic generation flags; no reset needed.
+  __syncthreads();
 }
 }  // namespace collective
 }  // namespace mori
