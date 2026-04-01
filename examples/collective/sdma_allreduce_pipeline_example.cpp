@@ -176,8 +176,13 @@ void testPipelinedAllreduce() {
         double ms = 0, gb = 0;
         bool ok = false;
 
+        const bool skipSerial = [] {
+            const char* e = std::getenv("MORI_SKIP_SERIAL");
+            return e && e[0] == '1';
+        }();
+
         // Serial (D2D to devOut, same as sync example out-of-place)
-        {
+        if (!skipSerial) {
             for (int i = 0; i < 10; i++) {
                 CHECK_HIP(hipMemcpyAsync(inBuf, hostData.data(), bytesPerPe, hipMemcpyHostToDevice,
                                          stream));
@@ -227,9 +232,9 @@ void testPipelinedAllreduce() {
             }
         }
         if (myPe == 0) {
-            serialMs.push_back(ms);
-            serialGb.push_back(gb);
-            okSerial.push_back(ok);
+            serialMs.push_back(skipSerial ? 0.0 : ms);
+            serialGb.push_back(skipSerial ? 0.0 : gb);
+            okSerial.push_back(skipSerial ? true : ok);
         }
 
         if (myPe == 0) fprintf(stderr, "--- %zuMB SDMA pipe ---\n", dataMB);
