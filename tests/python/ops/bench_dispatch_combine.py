@@ -615,7 +615,6 @@ def _save_intranode_tuning_result(
         "gpu_model": gpu_model,
         "kernel_type": "IntraNode",
         "ep_size": world_size,
-        "quant_type": qt_str,
     }
 
     dispatch_entry = {
@@ -632,7 +631,8 @@ def _save_intranode_tuning_result(
         "dtype": comb_dtype_str,
         "num_tokens": max_num_inp_token_per_rank,
         "hidden_dim": combine_hidden_dim,
-        "zero_copy": zero_copy,
+        "zero_copy": bool(zero_copy),
+        "quant_type": qt_str,
         "block_num": best_comb_config[0],
         "rdma_block_num": 0,
         "warp_per_block": best_comb_config[1],
@@ -647,19 +647,47 @@ def _save_intranode_tuning_result(
             / "ops"
             / "tuning_configs"
         )
-        filename = build_config_filename(
-            gpu_arch,
-            "IntraNode",
-            world_size,
-            qt_str,
-            gpu_model,
+        dispatch_path = str(
+            repo_tuning_dir
+            / build_config_filename(
+                gpu_arch,
+                "IntraNode",
+                world_size,
+                gpu_model,
+                "dispatch",
+            )
         )
-        config_path = str(repo_tuning_dir / filename)
+        combine_path = str(
+            repo_tuning_dir
+            / build_config_filename(
+                gpu_arch,
+                "IntraNode",
+                world_size,
+                gpu_model,
+                "combine",
+            )
+        )
+    else:
+        base = config_path.rsplit(".", 1)[0] if "." in config_path else config_path
+        dispatch_path = f"{base}_dispatch.json"
+        combine_path = f"{base}_combine.json"
+
+    dispatch_metadata = {**metadata, "phase": "dispatch"}
+    combine_metadata = {**metadata, "phase": "combine"}
 
     TuningConfigManager.save_tuning_result(
-        config_path, metadata, dispatch_entry, combine_entry
+        dispatch_path,
+        dispatch_metadata,
+        dispatch_entry,
+        phase="dispatch",
     )
-    print(f"Tuning config saved to: {config_path}")
+    TuningConfigManager.save_tuning_result(
+        combine_path,
+        combine_metadata,
+        combine_entry,
+        phase="combine",
+    )
+    print(f"Tuning config saved to: {dispatch_path} + {combine_path}")
 
 
 LaunchConfig = namedtuple(

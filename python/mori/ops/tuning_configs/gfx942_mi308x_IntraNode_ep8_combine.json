@@ -1,0 +1,76 @@
+{
+  "version": "1.0",
+  "gpu_arch": "gfx942",
+  "gpu_model": "mi308x",
+  "kernel_type": "IntraNode",
+  "ep_size": 8,
+  "phase": "combine",
+  "rules": [
+    {
+      "dtype": "bf16",
+      "num_tokens": 64,
+      "hidden_dim": 7168,
+      "zero_copy": true,
+      "block_num": 64,
+      "rdma_block_num": 0,
+      "warp_per_block": 8,
+      "bandwidth_gbps": 120.62,
+      "quant_type": "fp8_direct_cast"
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 128,
+      "hidden_dim": 7168,
+      "zero_copy": true,
+      "block_num": 64,
+      "rdma_block_num": 0,
+      "warp_per_block": 8,
+      "bandwidth_gbps": 171.5,
+      "quant_type": "fp8_direct_cast"
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 256,
+      "hidden_dim": 7168,
+      "zero_copy": true,
+      "block_num": 64,
+      "rdma_block_num": 0,
+      "warp_per_block": 8,
+      "bandwidth_gbps": 217.38,
+      "quant_type": "fp8_direct_cast"
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 512,
+      "hidden_dim": 7168,
+      "zero_copy": true,
+      "block_num": 56,
+      "rdma_block_num": 0,
+      "warp_per_block": 10,
+      "bandwidth_gbps": 254.88,
+      "quant_type": "fp8_direct_cast"
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 1024,
+      "hidden_dim": 7168,
+      "zero_copy": true,
+      "block_num": 72,
+      "rdma_block_num": 0,
+      "warp_per_block": 5,
+      "bandwidth_gbps": 302.0,
+      "quant_type": "fp8_direct_cast"
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 2048,
+      "hidden_dim": 7168,
+      "zero_copy": true,
+      "block_num": 72,
+      "rdma_block_num": 0,
+      "warp_per_block": 5,
+      "bandwidth_gbps": 313.12,
+      "quant_type": "fp8_direct_cast"
+    }
+  ]
+}
