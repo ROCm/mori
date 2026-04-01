@@ -448,6 +448,13 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             return false;
         }
 
+        // Drain any in-flight SDMA work from previous operator()/pipeline calls
+        // so that SDMA queue read/write pointers and signal values are fully settled.
+        // Figo's operator() has hipStreamSynchronize between RS and AG which provides
+        // this implicitly; test's operator() omits it for performance, so we sync here.
+        if (stream) hipStreamSynchronize(stream);
+        else        hipDeviceSynchronize();
+
         constexpr int pack_size = packed_t<T>::P::size;
         const size_t transit_used = SdmaTransitUsedBytes<T>(total_count, npes_, dtype_size_);
         if (transit_used > output_transit_buffer_size_) {
