@@ -267,10 +267,12 @@ class EpDispatchCombineOp:
         if self.launch_config_mode == "AUTO":
             self._dispatch_rules = None
             self._combine_rules = None
+            self._qt_str = "none"
             try:
                 from mori.ops.tuning_config import (
                     TuningConfigManager,
                     kernel_type_to_config_str,
+                    quant_type_to_config_str,
                     detect_gpu_model,
                 )
                 from mori.jit.config import detect_gpu_arch
@@ -278,6 +280,7 @@ class EpDispatchCombineOp:
                 gpu_arch = detect_gpu_arch()
                 gpu_model = detect_gpu_model()
                 kt_str = kernel_type_to_config_str(config.kernel_type)
+                self._qt_str = quant_type_to_config_str(config.quant_type)
                 mgr = TuningConfigManager.get_instance(
                     gpu_arch,
                     kt_str,
@@ -320,6 +323,7 @@ class EpDispatchCombineOp:
         elif self.launch_config_mode == "MANUAL":
             self._dispatch_rules = None
             self._combine_rules = None
+            self._qt_str = "none"
             self.auto_block_num, self.auto_rdma_block_num, self.auto_warp_per_block = (
                 None,
                 None,
@@ -397,17 +401,10 @@ class EpDispatchCombineOp:
     ):
         rules = self._dispatch_rules if is_dispatch else self._combine_rules
         if rules:
-            from mori.ops.tuning_config import (
-                TuningConfigManager,
-                quant_type_to_config_str,
-            )
+            from mori.ops.tuning_config import TuningConfigManager
 
             zc = not self.config.use_external_inp_buf if not is_dispatch else None
-            qt = (
-                quant_type_to_config_str(self.config.quant_type)
-                if not is_dispatch
-                else None
-            )
+            qt = self._qt_str if not is_dispatch else None
             params = TuningConfigManager.lookup(
                 rules,
                 self.config.data_type,
@@ -660,9 +657,6 @@ class EpDispatchCombineOp:
             else int(self.config.use_external_inp_buf)
         )
         is_zero_copy = not actual_use_ext
-        from mori.ops.tuning_config import quant_type_to_config_str
-
-        qt_str = quant_type_to_config_str(self.config.quant_type)
         actual_bn, actual_rbn, actual_wpb = self._resolve_launch_params(
             block_num,
             rdma_block_num,
@@ -672,7 +666,7 @@ class EpDispatchCombineOp:
             dtype=input.dtype,
             tuning_rules=self._combine_rules,
             zero_copy=is_zero_copy,
-            quant_type=qt_str,
+            quant_type=self._qt_str,
         )
         self._cached_combine_launch = (actual_bn, actual_rbn, actual_wpb)
         stream = _current_stream()
@@ -1031,8 +1025,6 @@ class EpDispatchCombineOp:
                 "Rebuild with ENABLE_STANDARD_MOE_ADAPT=ON."
             )
         hidden_dim = input.size(2)
-        from mori.ops.tuning_config import quant_type_to_config_str as _qt2s
-
         actual_bn, actual_rbn, actual_wpb = self._resolve_launch_params(
             block_num,
             rdma_block_num,
@@ -1042,7 +1034,7 @@ class EpDispatchCombineOp:
             dtype=input.dtype,
             tuning_rules=self._combine_rules,
             zero_copy=False,
-            quant_type=_qt2s(self.config.quant_type),
+            quant_type=self._qt_str,
         )
         stream = _current_stream()
         sfx = _DTYPE_SUFFIX[input.dtype]
