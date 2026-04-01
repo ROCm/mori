@@ -37,6 +37,7 @@ namespace mori {
 namespace collective {
 
 struct CrossPeBarrier;
+struct PipelineBarrier;
 
 template <typename T>
 class AllreduceSdma {
@@ -152,6 +153,20 @@ class AllreduceSdma {
    */
   bool allreduce_inplace(T* data, size_t total_count, hipStream_t stream = nullptr);
 
+  /**
+   * @brief Pipelined AllReduce: overlapped SDMA scatter + reduce + SDMA AG.
+   * @param input   Input data pointer (total_count elements on each rank)
+   * @param output  Output data pointer (total_count elements, may alias input)
+   * @param total_count Number of data elements per PE
+   * @param chunk_elems Chunk size in elements (0 = auto)
+   * @param scatter_mode 0 = SDMA scatter, 1 = P2P scatter
+   * @param stream  HIP stream
+   * @return true if successful
+   */
+  bool pipelined(T* input, T* output, size_t total_count,
+                 size_t chunk_elems = 0, int scatter_mode = 0,
+                 hipStream_t stream = nullptr);
+
   application::SymmMemObjPtr getFlagsObj() const { return flagsObj_; }
   void* getOutputTransitBuffer() const { return output_transit_buffer_; }
   size_t getOutputTransitBufferSize() const { return output_transit_buffer_size_; }
@@ -160,6 +175,12 @@ class AllreduceSdma {
   }
 
   void resetFlags();
+
+private:
+  // Pipeline-specific barrier (lazily allocated on first pipelined() call)
+  void* pipelineBarrierPtr_ = nullptr;
+  std::unique_ptr<void, ShmemDeleter> pipelineBarrierStorage_;
+  application::SymmMemObjPtr pipelineBarrierObj_;
 };
 
 }  // namespace collective
