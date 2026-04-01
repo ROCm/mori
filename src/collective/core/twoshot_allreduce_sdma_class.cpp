@@ -524,24 +524,10 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             }
         }
 
-        // Lazily allocate pipeline barrier on first call
-        if (!pipelineBarrierPtr_) {
-            size_t pbSize = sizeof(PipelineBarrier);
-            void* pbMem = shmem::ShmemMalloc(pbSize);
-            if (!pbMem) throw std::runtime_error("Failed to allocate pipeline barrier");
-            pipelineBarrierStorage_.reset(pbMem);
-            pipelineBarrierPtr_ = pbMem;
-            hipMemset(pbMem, 0, pbSize);
-        }
-
-        auto* pipeBarrier = reinterpret_cast<PipelineBarrier*>(pipelineBarrierPtr_);
-
-        // SCATTER_MODE 1 (P2P) uses barrier->ag_sync with absolute counts,
-        // so the full barrier must be zeroed for that path.
         if (scatter_mode == 1) {
             hipError_t br =
-                stream ? hipMemsetAsync(pipeBarrier, 0, sizeof(PipelineBarrier), stream)
-                       : hipMemset(pipeBarrier, 0, sizeof(PipelineBarrier));
+                stream ? hipMemsetAsync(barrierPtr_, 0, sizeof(CrossPeBarrier), stream)
+                       : hipMemset(barrierPtr_, 0, sizeof(CrossPeBarrier));
             if (br != hipSuccess) {
                 fprintf(stderr, "PE %d: pipelined hipMemset(barrier) failed: %s\n",
                         myPe_, hipGetErrorString(br));
@@ -555,17 +541,17 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             PipelinedAllReduceSdmaKernel<T, 1><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
-                pipeBarrier, inputSymmObj, total_count, chunk_elems);
+                barrierPtr_, inputSymmObj, total_count, chunk_elems);
         } else if (multi_chunk) {
             PipelinedAllReduceSdmaKernel<T, 0, true><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
-                pipeBarrier, application::SymmMemObjPtr{}, total_count, chunk_elems);
+                barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems);
         } else {
             PipelinedAllReduceSdmaKernel<T, 0, false><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
-                pipeBarrier, application::SymmMemObjPtr{}, total_count, chunk_elems);
+                barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems);
         }
 
         hipError_t err = hipGetLastError();

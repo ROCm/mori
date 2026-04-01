@@ -37,7 +37,6 @@ namespace mori {
 namespace collective {
 
 struct CrossPeBarrier;
-struct PipelineBarrier;
 
 template <typename T>
 class AllreduceSdma {
@@ -175,12 +174,6 @@ class AllreduceSdma {
   }
 
   void resetFlags();
-
-private:
-  // Pipeline-specific barrier (lazily allocated on first pipelined() call)
-  void* pipelineBarrierPtr_ = nullptr;
-  std::unique_ptr<void, ShmemDeleter> pipelineBarrierStorage_;
-  application::SymmMemObjPtr pipelineBarrierObj_;
 };
 
 }  // namespace collective
