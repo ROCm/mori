@@ -324,7 +324,12 @@ void RegisterMoriOps(py::module_& m) {
       .def_readwrite("num_qp_per_pe", &mori::moe::EpDispatchCombineConfig::numQpPerPe)
       .def_readwrite("quant_type", &mori::moe::EpDispatchCombineConfig::quantType)
       .def("to_packed_array", &mori::moe::EpDispatchCombineConfig::ToPackedI32Array)
-      .def("max_num_tokens_to_recv", &mori::moe::EpDispatchCombineConfig::MaxNumTokensToRecv);
+      .def("max_num_tokens_to_recv", &mori::moe::EpDispatchCombineConfig::MaxNumTokensToRecv)
+      .def("max_num_tokens_to_recv_per_rank",
+           &mori::moe::EpDispatchCombineConfig::MaxNumTokensToRecvPerRank)
+      .def("max_num_tokens_to_send", &mori::moe::EpDispatchCombineConfig::MaxNumTokensToSend)
+      .def("max_num_tokens_to_send_per_rank",
+           &mori::moe::EpDispatchCombineConfig::MaxNumTokensToSendPerRank);
 
   DeclareEpDispatchCombineHandle(m);
 

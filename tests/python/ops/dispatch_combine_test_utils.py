@@ -277,8 +277,7 @@ class EpDispatchCombineTestCase:
         src_token_pos = op.get_dispatch_src_token_pos()
 
         for i, pos in enumerate(src_token_pos):
-            src_rank = int(pos) // self.config.max_num_tokens_to_recv
-            src_id = int(pos) % self.config.max_num_tokens_to_recv
+            src_rank, src_id = op.decode_send_flat_idx(pos)
             if _is_fp4x2_dtype(self.config.data_type):
                 assert torch.equal(
                     all_rank_input[src_rank][src_id].view(torch.uint8),

@@ -30,17 +30,17 @@ namespace moe {
 // Stride: MaxNumTokensToRecv(), which guarantees uniqueness across all PEs.
 inline __device__ int FlatTokenIndex(const EpDispatchCombineConfig& config, int pe,
                                      int localTokId) {
-  return pe * config.MaxNumTokensToRecv() + localTokId;
+  return pe * config.MaxNumTokensToSend() + localTokId;
 }
 inline __device__ int PeFromFlatTokenIndex(const EpDispatchCombineConfig& config, int flatIdx) {
-  return flatIdx / config.MaxNumTokensToRecv();
+  return flatIdx / config.MaxNumTokensToSend();
 }
 inline __device__ int LocalTokIdFromFlatTokenIndex(const EpDispatchCombineConfig& config,
                                                    int flatIdx) {
-  return flatIdx % config.MaxNumTokensToRecv();
+  return flatIdx % config.MaxNumTokensToSend();
 }
 inline __device__ int NullFlatTokenIndex(const EpDispatchCombineConfig& config) {
-  return config.worldSize * config.MaxNumTokensToRecv();
+  return config.worldSize * config.MaxNumTokensToSend();
 }
 
 // Encode/decode a flat offset into a per-PE staging buffer.

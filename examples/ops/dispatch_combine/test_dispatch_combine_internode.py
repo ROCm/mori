@@ -433,8 +433,7 @@ class EpDispatchCombineTestCase:
 
         # Check token equality
         for i, src_token_id in enumerate(src_token_pos):
-            src_pe = src_token_id // self.config.max_num_tokens_to_recv
-            src_tok_id = src_token_id % self.config.max_num_tokens_to_recv
+            src_pe, src_tok_id = op.decode_send_flat_idx(src_token_id)
             if _is_fp4x2_dtype(self.config.data_type):
                 is_pass = torch.equal(
                     dispatch_output[i].view(torch.uint8),
@@ -1199,7 +1198,6 @@ def sweep_bench_dispatch_combine(
         kernel_type,
         num_qp,
         dtype=dtype,
-        combine_dtype=combine_dtype,
         max_total_recv_tokens=max_total_recv_tokens,
     )
     test_case.setup()
@@ -1310,7 +1308,6 @@ def test_dispatch_combine(
             kernel_type,
             num_qp,
             sweep_token_interval,
-            combine_dtype=combine_dtype,
             max_total_recv_tokens=max_total_recv_tokens,
         )
     else:
