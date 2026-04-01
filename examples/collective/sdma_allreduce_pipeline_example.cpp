@@ -58,20 +58,29 @@ static bool runBenchMs(BenchFn fn, uint32_t* inBuf, uint32_t* devOut,
                        hipStream_t stream, int warmup, int iterations,
                        double* outMs, double* outAlgoGb) {
     for (int w = 0; w < 3; w++) {
+        fprintf(stderr, "PE %d: runBench warmup %d/%d: H2D...\n", myPe, w, 3);
         CHECK_HIP(hipMemcpyAsync(inBuf, hostData.data(), bytesPerPe, hipMemcpyHostToDevice,
                                  stream));
         CHECK_HIP(hipStreamSynchronize(stream));
+        fprintf(stderr, "PE %d: runBench warmup %d: pre-barrier\n", myPe, w);
         MPI_Barrier(MPI_COMM_WORLD);
+        fprintf(stderr, "PE %d: runBench warmup %d: calling fn...\n", myPe, w);
         fn(inBuf, devOut, elemsPerPe, stream);
+        fprintf(stderr, "PE %d: runBench warmup %d: fn returned, sync...\n", myPe, w);
         CHECK_HIP(hipStreamSynchronize(stream));
+        fprintf(stderr, "PE %d: runBench warmup %d: post-barrier\n", myPe, w);
         MPI_Barrier(MPI_COMM_WORLD);
+        fprintf(stderr, "PE %d: runBench warmup %d: done\n", myPe, w);
     }
 
+    fprintf(stderr, "PE %d: runBench verify: H2D...\n", myPe);
     CHECK_HIP(hipMemcpyAsync(inBuf, hostData.data(), bytesPerPe, hipMemcpyHostToDevice, stream));
     CHECK_HIP(hipStreamSynchronize(stream));
     MPI_Barrier(MPI_COMM_WORLD);
 
+    fprintf(stderr, "PE %d: runBench verify: calling fn...\n", myPe);
     bool ok = fn(inBuf, devOut, elemsPerPe, stream);
+    fprintf(stderr, "PE %d: runBench verify: fn returned ok=%d, sync...\n", myPe, (int)ok);
     CHECK_HIP(hipStreamSynchronize(stream));
 
     if (ok) {
@@ -81,10 +90,12 @@ static bool runBenchMs(BenchFn fn, uint32_t* inBuf, uint32_t* devOut,
     }
 
     int lok = ok ? 1 : 0, gok = 0;
+    fprintf(stderr, "PE %d: runBench verify: local=%d, allreduce...\n", myPe, lok);
     MPI_Allreduce(&lok, &gok, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+    fprintf(stderr, "PE %d: runBench verify: global=%d/%d\n", myPe, gok, npes);
     if (gok != npes) {
         if (myPe == 0) {
-            fprintf(stderr, "VERIFY FAILED\n");
+            fprintf(stderr, "VERIFY FAILED (%d/%d passed)\n", gok, npes);
         }
         return false;
     }
@@ -101,6 +112,7 @@ static bool runBenchMs(BenchFn fn, uint32_t* inBuf, uint32_t* devOut,
         double t1 = MPI_Wtime();
         if (i >= warmup) times.push_back(t1 - t0);
     }
+    fprintf(stderr, "PE %d: runBench timing done, final barrier\n", myPe);
     MPI_Barrier(MPI_COMM_WORLD);
 
     double avg = 0;
@@ -177,6 +189,7 @@ void testPipelinedAllreduce() {
 
         // Serial (D2D to devOut, same as sync example out-of-place)
         {
+            fprintf(stderr, "PE %d: === Serial warmup start for %zuMB ===\n", myPe, dataMB);
             for (int i = 0; i < 10; i++) {
                 CHECK_HIP(hipMemcpyAsync(inBuf, hostData.data(), bytesPerPe, hipMemcpyHostToDevice,
                                          stream));
@@ -231,6 +244,9 @@ void testPipelinedAllreduce() {
             okSerial.push_back(ok);
         }
 
+        fprintf(stderr, "PE %d: === Serial section done for %zuMB, starting SDMA pipeline ===\n",
+                myPe, dataMB);
+
         // Pipeline SDMA default
         ms = 0;
         gb = 0;
@@ -267,6 +283,9 @@ void testPipelinedAllreduce() {
                 }
             }
         }
+
+        fprintf(stderr, "PE %d: === SDMA pipeline done for %zuMB, starting P2P pipeline ===\n",
+                myPe, dataMB);
 
         // P2P default
         ms = 0;

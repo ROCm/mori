@@ -534,15 +534,18 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             return false;
         }
 
-        fprintf(stderr, "PE %d: pipelined kernel launched OK, waiting...\n", myPe_);
+        fprintf(stderr, "PE %d: pipelined kernel launched OK\n", myPe_);
 
         if (copy_output_to_user_) {
+            fprintf(stderr, "PE %d: pipelined copy_output_to_user start\n", myPe_);
             copy_output_to_user(output, total_count, stream);
+            fprintf(stderr, "PE %d: pipelined copy_output_to_user done\n", myPe_);
         }
     } catch (const std::exception& e) {
-        fprintf(stderr, "PE %d: PipelinedAllReduce failed: %s\n", myPe_, e.what());
+        fprintf(stderr, "PE %d: PipelinedAllReduce exception: %s\n", myPe_, e.what());
         return false;
     }
+    fprintf(stderr, "PE %d: pipelined returning true\n", myPe_);
     return true;
 }
 
