@@ -102,10 +102,10 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t /*input_buffer_size*/
 
   // Zero SDMA completion signals so the generation counter (barrier->flag) stays in sync.
   // Without this, reused SHMEM memory may carry stale signal values from a prior instance.
-  if (output_transit_buffer_obj_.signalPtrs && output_transit_buffer_obj_.sdmaNumQueue > 0) {
+  if (output_transit_buffer_obj_->signalPtrs && output_transit_buffer_obj_->sdmaNumQueue > 0) {
     size_t sigSize =
-        static_cast<size_t>(npes_) * output_transit_buffer_obj_.sdmaNumQueue * sizeof(HSAuint64);
-    hipMemset(output_transit_buffer_obj_.signalPtrs, 0, sigSize);
+        static_cast<size_t>(npes_) * output_transit_buffer_obj_->sdmaNumQueue * sizeof(HSAuint64);
+    hipMemset(output_transit_buffer_obj_->signalPtrs, 0, sigSize);
   }
 
   printf("AllreduceSdma(SDMA) initialized: PE %d of %d, max_blocks=%d\n", myPe_, npes_,
