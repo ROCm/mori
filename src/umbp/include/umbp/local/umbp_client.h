@@ -32,6 +32,11 @@
 #include "umbp/local/storage/copy_pipeline.h"
 #include "umbp/local/storage/local_storage_manager.h"
 
+namespace mori::umbp {
+
+class PoolClient;  // forward declaration — full include in .cpp only
+class PeerServiceServer;
+
 class UMBPClient {
  public:
   explicit UMBPClient(const UMBPConfig& config = UMBPConfig{});
@@ -72,12 +77,22 @@ class UMBPClient {
   mori::umbp::LocalBlockIndex& Index();
   LocalStorageManager& Storage();
 
+  // Returns true when distributed mode is active (PoolClient connected to Master).
+  bool IsDistributed() const;
+
  private:
   static UMBPConfig NormalizeConfig(const UMBPConfig& config);
+
+  // Publish a locally-written block to the Master for remote discovery.
+  void MaybePublishLocal(const std::string& key, size_t size);
 
   UMBPConfig config_;
   UMBPRole role_;
   mori::umbp::LocalBlockIndex index_;
   LocalStorageManager storage_;
   std::unique_ptr<CopyPipeline> copy_pipeline_;
+  std::unique_ptr<PoolClient> pool_client_;  // non-null iff distributed mode
+  std::unique_ptr<PeerServiceServer> peer_service_;
 };
+
+}  // namespace mori::umbp

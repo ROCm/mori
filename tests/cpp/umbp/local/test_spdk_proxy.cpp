@@ -40,6 +40,8 @@
 #include "umbp/common/config.h"
 #include "umbp/local/storage/spdk_proxy_tier.h"
 
+using namespace mori::umbp;
+
 static UMBPConfig MakeProxyConfig() {
   auto cfg = UMBPConfig::FromEnvironment();
   cfg.ssd_backend = "spdk_proxy";

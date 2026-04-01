@@ -23,6 +23,7 @@
 
 #include <grpcpp/grpcpp.h>
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -31,29 +32,37 @@
 
 namespace mori::umbp {
 
-struct SsdStore {
-  std::string dir;
-  size_t capacity = 0;
-  size_t used = 0;
+class LocalStorageManager;
+class LocalBlockIndex;
+class PoolClient;
+
+struct StagingMetrics {
+  std::atomic<uint64_t> expired_reclaims{0};
+  std::atomic<uint64_t> invalid_lease_rejects{0};
+  std::atomic<uint64_t> slot_full_rejects{0};
 };
 
 class PeerServiceServer {
  public:
   PeerServiceServer(void* ssd_staging_base, size_t ssd_staging_size,
                     const std::vector<uint8_t>& ssd_staging_mem_desc_bytes,
-                    const std::vector<std::string>& ssd_dirs,
-                    const std::vector<size_t>& ssd_capacities);
+                    LocalStorageManager& storage, LocalBlockIndex& index, PoolClient& coordinator,
+                    int num_read_slots = 8, int num_write_slots = 8, int lease_timeout_s = 10);
   ~PeerServiceServer();
 
   bool Start(uint16_t port);
   void Stop();
 
+  const StagingMetrics& Metrics() const { return metrics_; }
+
  private:
   void* ssd_staging_base_;
   size_t ssd_staging_size_;
+  LocalStorageManager& storage_;
+  LocalBlockIndex& index_;
+  PoolClient& coordinator_;
 
-  std::vector<SsdStore> ssd_stores_;
-  std::mutex ssd_mutex_;
+  StagingMetrics metrics_;
 
   std::vector<uint8_t> ssd_staging_mem_desc_bytes_;
 

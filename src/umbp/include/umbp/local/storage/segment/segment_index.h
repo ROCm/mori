@@ -32,7 +32,7 @@
 
 #include "umbp/local/storage/segment/segment_types.h"
 
-namespace segment {
+namespace mori::umbp::segment {
 
 class Index {
  public:
@@ -127,4 +127,4 @@ class Index {
   std::unordered_map<std::string, std::list<std::string>::iterator> lru_map_;
 };
 
-}  // namespace segment
+}  // namespace mori::umbp::segment

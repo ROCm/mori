@@ -25,12 +25,15 @@
 #include <cstdint>
 #include <list>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "umbp/local/storage/tier_backend.h"
+
+namespace mori::umbp {
 
 // DRAM Tier: mmap pre-allocated large memory block with offset allocator
 class DRAMTier : public TierBackend {
@@ -58,11 +61,18 @@ class DRAMTier : public TierBackend {
   std::vector<char> Read(const std::string& key) override;
   std::string GetLRUKey() const override;
   std::vector<std::string> GetLRUCandidates(size_t max_candidates) const override;
+  std::optional<std::string> GetLocationId(const std::string& key) const override;
 
   // DRAM-specific: zero-copy read returning internal pointer.
   // Only safe for in-process mmap'd memory. Caller must not hold
   // the returned pointer across Evict/Write calls.
   const void* ReadPtr(const std::string& key, size_t* out_size) override;
+
+  // Accessors for distributed integration (Phase 2).
+  // Returns the mmap'd base address for RDMA registration.
+  void* GetBasePtr() const { return base_ptr_; }
+  // Returns the byte offset of a key's slot, or nullopt if not found.
+  std::optional<size_t> GetSlotOffset(const std::string& key) const;
 
  private:
   void* base_ptr_;  // mmap base address
@@ -97,3 +107,5 @@ class DRAMTier : public TierBackend {
   void EvictLRU();                              // Evict least recently used
   void TouchLRU(const std::string& key);        // Update LRU position
 };
+
+}  // namespace mori::umbp

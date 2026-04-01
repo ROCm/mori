@@ -26,6 +26,8 @@
 
 #include "umbp/local/storage/local_storage_manager.h"
 
+using namespace mori::umbp;
+
 void test_segmented_recovery() {
   std::cout << "test_segmented_recovery... ";
   const std::string dir = "/tmp/umbp_test_segmented_recovery";

@@ -25,7 +25,7 @@
 #include <cstdint>
 #include <string>
 
-namespace segment {
+namespace mori::umbp::segment {
 
 constexpr uint32_t kRecordMagic = 0x554D4250;  // "UMBP"
 constexpr uint16_t kRecordVersion = 1;
@@ -47,4 +47,4 @@ uint32_t CrcUpdate(const void* data, size_t size, uint32_t crc = 0xFFFFFFFFu);
 uint32_t ComputeRecordCrc32(const std::string& key, const void* value, size_t value_size);
 std::string BuildFileName(uint64_t segment_id);
 
-}  // namespace segment
+}  // namespace mori::umbp::segment

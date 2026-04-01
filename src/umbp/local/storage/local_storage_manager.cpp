@@ -44,6 +44,8 @@
 #include "umbp/proxy/spdk_proxy_shm.h"
 #endif
 
+namespace mori::umbp {
+
 // ---------------------------------------------------------------------------
 // ExtractBaseHash
 //
@@ -270,7 +272,7 @@ static std::string FindProxyBinary(const std::string& explicit_path) {
 class ScopedBootstrapLock {
  public:
   explicit ScopedBootstrapLock(const std::string& shm_name) {
-    path_ = umbp::proxy::ProxyShmRegion::BootstrapLockPath(shm_name);
+    path_ = ::umbp::proxy::ProxyShmRegion::BootstrapLockPath(shm_name);
     fd_ = open(path_.c_str(), O_CREAT | O_RDWR, 0666);
     if (fd_ < 0) {
       UMBP_LOG_ERROR("LSM: open bootstrap lock '%s' failed: %s", path_.c_str(), strerror(errno));
@@ -362,7 +364,7 @@ int LocalStorageManager::SpawnProxyDaemon(const std::string& shm_name) {
 }
 
 int LocalStorageManager::EnsureProxyDaemon(const std::string& shm_name) {
-  int probe = umbp::proxy::ProxyShmRegion::ProbeExisting(shm_name);
+  int probe = ::umbp::proxy::ProxyShmRegion::ProbeExisting(shm_name);
   if (probe == 1) return 0;
   if (probe == -2) {
     UMBP_LOG_ERROR("LSM: proxy protocol version mismatch on SHM '%s'", shm_name.c_str());
@@ -379,7 +381,7 @@ int LocalStorageManager::EnsureProxyDaemon(const std::string& shm_name) {
   ScopedBootstrapLock lock(shm_name);
   if (!lock.IsValid()) return -1;
 
-  probe = umbp::proxy::ProxyShmRegion::ProbeExisting(shm_name);
+  probe = ::umbp::proxy::ProxyShmRegion::ProbeExisting(shm_name);
   if (probe == 1) return 0;
   if (probe == -2) {
     UMBP_LOG_ERROR("LSM: proxy protocol version mismatch on SHM '%s'", shm_name.c_str());
@@ -390,7 +392,7 @@ int LocalStorageManager::EnsureProxyDaemon(const std::string& shm_name) {
       return 0;
     }
 
-    umbp::proxy::ProxyShmRegion existing;
+    ::umbp::proxy::ProxyShmRegion existing;
     if (existing.Attach(shm_name) == 0) {
       auto* hdr = existing.Header();
       uint32_t st = hdr->state.load(std::memory_order_acquire);
@@ -399,11 +401,11 @@ int LocalStorageManager::EnsureProxyDaemon(const std::string& shm_name) {
 #ifdef __linux__
       alive = (pid > 0 && kill(static_cast<pid_t>(pid), 0) == 0);
 #endif
-      if (alive && st == static_cast<uint32_t>(umbp::proxy::ProxyState::ERROR)) {
+      if (alive && st == static_cast<uint32_t>(::umbp::proxy::ProxyState::ERROR)) {
         UMBP_LOG_ERROR("LSM: proxy on SHM '%s' is alive but in ERROR state", shm_name.c_str());
         return -1;
       }
-      if (alive && st != static_cast<uint32_t>(umbp::proxy::ProxyState::SHUTDOWN)) {
+      if (alive && st != static_cast<uint32_t>(::umbp::proxy::ProxyState::SHUTDOWN)) {
         UMBP_LOG_ERROR("LSM: proxy on SHM '%s' did not become READY in time (state=%u)",
                        shm_name.c_str(), st);
         return -1;
@@ -411,7 +413,7 @@ int LocalStorageManager::EnsureProxyDaemon(const std::string& shm_name) {
     }
   }
 
-  umbp::proxy::ProxyShmRegion::CleanupStale(shm_name);
+  ::umbp::proxy::ProxyShmRegion::CleanupStale(shm_name);
   if (SpawnProxyDaemon(shm_name) != 0) return -1;
 
   return SpdkProxyTier::WaitForProxy(shm_name, config_.spdk_proxy_startup_timeout_ms) ? 0 : -1;
@@ -467,7 +469,7 @@ LocalStorageManager::LocalStorageManager(const UMBPConfig& config,
 #ifdef __linux__
     if (use_proxy && !ssd_backend) {
       std::string proxy_shm_name = config_.spdk_proxy_shm_name;
-      if (proxy_shm_name.empty()) proxy_shm_name = umbp::proxy::kDefaultShmName;
+      if (proxy_shm_name.empty()) proxy_shm_name = ::umbp::proxy::kDefaultShmName;
 
       bool proxy_ready = false;
       if (config_.spdk_proxy_auto_start) {
@@ -549,14 +551,38 @@ TierBackend* LocalStorageManager::NextFasterTier(StorageTier current) {
   return nullptr;
 }
 
+void LocalStorageManager::SetOnTierChange(TierChangeCallback cb) {
+  on_tier_change_ = std::move(cb);
+}
+
+std::optional<LocalStorageManager::TierLocationInfo> LocalStorageManager::BuildTierLocationInfo(
+    TierBackend* tier, const std::string& key, size_t size) {
+  if (!tier) {
+    return std::nullopt;
+  }
+
+  auto raw_id = tier->GetLocationId(key);
+  if (!raw_id.has_value()) {
+    return std::nullopt;
+  }
+
+  TierLocationInfo info;
+  info.location_id = "0:" + *raw_id;
+  info.size = size;
+  return info;
+}
+
 bool LocalStorageManager::MoveKey(const std::string& key, TierBackend* from, TierBackend* to) {
   // Fast path for DRAM->slower movement to avoid an intermediate vector copy.
   if (from->Capabilities().zero_copy_read) {
     size_t sz = 0;
     const void* ptr = from->ReadPtr(key, &sz);
     if (ptr && sz > 0 && to->Write(key, ptr, sz)) {
+      StorageTier from_id = from->tier_id();
+      auto new_location = BuildTierLocationInfo(to, key, sz);
       from->Evict(key);
       UpsertIndexTier(key, to->tier_id(), sz);
+      if (on_tier_change_) on_tier_change_(key, from_id, to->tier_id(), new_location);
       return true;
     }
   }
@@ -564,8 +590,11 @@ bool LocalStorageManager::MoveKey(const std::string& key, TierBackend* from, Tie
   auto data = from->Read(key);
   if (data.empty()) return false;
   if (!to->Write(key, data.data(), data.size())) return false;
+  StorageTier from_id = from->tier_id();
+  auto new_location = BuildTierLocationInfo(to, key, data.size());
   from->Evict(key);
   UpsertIndexTier(key, to->tier_id(), data.size());
+  if (on_tier_change_) on_tier_change_(key, from_id, to->tier_id(), new_location);
   return true;
 }
 
@@ -615,6 +644,7 @@ bool LocalStorageManager::Write(const std::string& key, const void* data, size_t
         bool only_on_target = !faster_than_target || !faster_than_target->Exists(k);
         target->Evict(k);
         if (only_on_target) {
+          if (on_tier_change_) on_tier_change_(k, target->tier_id(), std::nullopt, std::nullopt);
           if (index_) index_->Remove(k);
           RemoveDepthAndGroup(k);
         }
@@ -630,16 +660,20 @@ bool LocalStorageManager::WriteFromPtr(const std::string& key, uintptr_t src, si
 }
 
 bool LocalStorageManager::ReadIntoPtr(const std::string& key, uintptr_t dst, size_t size) {
+  bool ok = ReadIntoPtrNoPromote(key, dst, size);
+  if (ok && config_.eviction.auto_promote_on_read) {
+    MaybeAutoPromote(key);
+  }
+  return ok;
+}
+
+bool LocalStorageManager::ReadIntoPtrNoPromote(const std::string& key, uintptr_t dst, size_t size) {
   if (index_) {
     auto loc = index_->Lookup(key);
     if (loc) {
       TierBackend* hinted = GetTier(loc->tier);
       if (hinted && hinted->Exists(key)) {
         bool ok = hinted->ReadIntoPtr(key, dst, size);
-        if (ok && hinted->tier_id() != StorageTier::CPU_DRAM &&
-            config_.eviction.auto_promote_on_read) {
-          MaybeAutoPromote(key);
-        }
         if (ok) return true;
       }
     }
@@ -648,10 +682,6 @@ bool LocalStorageManager::ReadIntoPtr(const std::string& key, uintptr_t dst, siz
   for (size_t i = 0; i < tiers_.size(); ++i) {
     if (tiers_[i].backend->Exists(key)) {
       bool ok = tiers_[i].backend->ReadIntoPtr(key, dst, size);
-      // Auto-promote if read from a slower tier
-      if (ok && i > 0 && config_.eviction.auto_promote_on_read) {
-        MaybeAutoPromote(key);
-      }
       return ok;
     }
   }
@@ -763,7 +793,10 @@ bool LocalStorageManager::Evict(const std::string& key) {
     return false;
   }
   bool ok = tier->Evict(key);
-  if (ok && index_) index_->Remove(key);
+  if (ok) {
+    if (on_tier_change_) on_tier_change_(key, tier->tier_id(), std::nullopt, std::nullopt);
+    if (index_) index_->Remove(key);
+  }
   RemoveDepthAndGroup(key);
   return ok;
 }
@@ -818,8 +851,11 @@ bool LocalStorageManager::Promote(const std::string& key) {
       }
     }
     // Drop read-tracking metadata in source tier while preserving shared file.
+    auto new_location = BuildTierLocationInfo(to, key, data.size());
+    StorageTier from_id = from->tier_id();
     from->Evict(key);
     UpsertIndexTier(key, to->tier_id(), data.size());
+    if (on_tier_change_) on_tier_change_(key, from_id, to->tier_id(), new_location);
     return true;
   }
 
@@ -827,16 +863,22 @@ bool LocalStorageManager::Promote(const std::string& key) {
     // Target full — demote LRU keys from target to make room
     while (DemoteLRUForSpace(to)) {
       if (to->Write(key, data.data(), data.size())) {
+        auto new_location = BuildTierLocationInfo(to, key, data.size());
+        StorageTier from_id = from->tier_id();
         from->Evict(key);
         UpsertIndexTier(key, to->tier_id(), data.size());
+        if (on_tier_change_) on_tier_change_(key, from_id, to->tier_id(), new_location);
         return true;
       }
     }
     return false;  // Cannot promote
   }
 
+  auto new_location = BuildTierLocationInfo(to, key, data.size());
+  StorageTier from_id = from->tier_id();
   from->Evict(key);
   UpsertIndexTier(key, to->tier_id(), data.size());
+  if (on_tier_change_) on_tier_change_(key, from_id, to->tier_id(), new_location);
   return true;
 }
 
@@ -1031,3 +1073,5 @@ std::vector<bool> LocalStorageManager::BatchReadIntoPtr(const std::vector<std::s
   }
   return results;
 }
+
+}  // namespace mori::umbp

@@ -35,7 +35,7 @@
 
 namespace fs = std::filesystem;
 
-namespace segment {
+namespace mori::umbp::segment {
 
 bool Scanner::RefreshFromDisk(const std::string& dir, StorageIoDriver& io_driver, Index& index,
                               bool read_only_shared, bool force_full_rescan,
@@ -127,4 +127,4 @@ bool Scanner::RefreshFromDisk(const std::string& dir, StorageIoDriver& io_driver
   return true;
 }
 
-}  // namespace segment
+}  // namespace mori::umbp::segment

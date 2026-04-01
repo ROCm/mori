@@ -24,6 +24,7 @@
 #include <memory>
 #include <string>
 
+#include "umbp/common/config.h"
 #include "umbp/distributed/master/client_registry.h"
 #include "umbp/distributed/master/global_block_index.h"
 #include "umbp/distributed/routing/route_get_strategy.h"
@@ -35,14 +36,6 @@ class Server;
 }
 
 namespace mori::umbp {
-
-struct MasterServerConfig {
-  std::string listen_address = "0.0.0.0:50051";
-  ClientRegistryConfig registry_config;
-
-  std::unique_ptr<RouteGetStrategy> get_strategy;
-  std::unique_ptr<RoutePutStrategy> put_strategy;
-};
 
 class MasterServer {
  public:

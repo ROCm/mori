@@ -25,6 +25,8 @@
 #include <string>
 #include <utility>
 
+namespace mori::umbp {
+
 enum class IoStatusCode : int {
   Ok = 0,
   InvalidArgument = 1,
@@ -84,3 +86,5 @@ class IoStatus {
   std::string message_;
   int os_errno_ = 0;
 };
+
+}  // namespace mori::umbp

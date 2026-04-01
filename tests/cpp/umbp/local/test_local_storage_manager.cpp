@@ -28,6 +28,8 @@
 
 #include "umbp/local/storage/local_storage_manager.h"
 
+using namespace mori::umbp;
+
 void test_dram_write_read() {
   std::cout << "test_dram_write_read... ";
 

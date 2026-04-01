@@ -3,14 +3,24 @@
 ## Usage
 
 ```bash
-bash src/umbp/scripts/test_umbp_integration.sh [branch]
+bash src/umbp/scripts/test_umbp_integration.sh [branch] [storage_mode] [sglang_branch] [parallelism_mode]
 ```
+
+- `branch` — mori git branch to build (default: `main`)
+- `storage_mode` — `local` (default) or `distributed`
+- `sglang_branch` — sglang git branch to use (default: `main`)
+- `parallelism_mode` — `dp_ep` (default) or `tp`
 
 Examples:
 
 ```bash
-bash src/umbp/scripts/test_umbp_integration.sh                  # uses main (default)
-bash src/umbp/scripts/test_umbp_integration.sh feat_ump_dist    # uses feat_ump_dist
+# Local mode, dp_ep (default)
+bash src/umbp/scripts/test_umbp_integration.sh                    # main, local, sglang main, dp_ep
+bash src/umbp/scripts/test_umbp_integration.sh main local main tp # main, local, sglang main, tp
+
+# Distributed mode — requires mori branch feat_umbp_pool and sglang branch feat/umbp-monitoring-dist
+bash src/umbp/scripts/test_umbp_integration.sh feat_umbp_pool distributed feat/umbp-monitoring-dist
+bash src/umbp/scripts/test_umbp_integration.sh feat_umbp_pool distributed feat/umbp-monitoring-dist tp
 ```
 
 Single command, non-interactive, no manual steps needed.
@@ -26,9 +36,31 @@ Steps executed inside the container:
 
 1. **Update sglang** -- pulls latest from `/sgl-workspace/sglang/`
 2. **Build mori** -- checks out the specified branch (default `main`), builds with `BUILD_UMBP=ON BUILD_TESTS=ON`
-3. **Run hicache benchmark** -- starts an SGLang server in `dp_ep` mode (DP=8, EP=8, TP=8) with UMBP-backed hierarchical cache, waits for health check, then runs 2 rounds of GSM8K benchmark (200 questions each)
+3. **Start UMBP Master** (distributed mode only) -- launches `umbp_master` process, verifies it is alive
+4. **Run hicache benchmark** -- starts an SGLang server with UMBP-backed hierarchical cache, waits for health check, then runs 2 rounds of GSM8K benchmark (200 questions each)
 
-The server is automatically shut down after benchmarks complete or on failure. Server logs are written to `server_hicache_<timestamp>.log`.
+The server (and UMBP master, if running) is automatically shut down after benchmarks complete or on failure. Server logs are written to `server_hicache_<timestamp>.log`; master logs to `umbp_master_<timestamp>.log`.
+
+## Distributed Mode
+
+Distributed mode requires specific branches:
+- **mori**: `feat_umbp_pool`
+- **sglang**: `feat/umbp-monitoring-dist`
+
+When `storage_mode` is set to `distributed`, the test:
+
+- Locates the `umbp_master` binary from the mori build directory
+- Starts the UMBP master process (listening on `UMBP_MASTER_LISTEN`, default `0.0.0.0:50051`)
+- Configures the SGLang storage backend with `master_address`, `node_address`, and `io_engine_port`
+
+The following environment variables can be used to override distributed defaults:
+
+| Variable | Default | Description |
+|---|---|---|
+| `UMBP_MASTER_LISTEN` | `0.0.0.0:50051` | Address the master binds to |
+| `UMBP_MASTER_ADDRESS` | `localhost:50051` | Address clients connect to |
+| `UMBP_NODE_ADDRESS` | `localhost` | This node's address for the cluster |
+| `UMBP_IO_ENGINE_PORTS` | `50100,50101,...,50107` | Comma-separated IO engine ports |
 
 ## Expected Output
 

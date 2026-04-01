@@ -26,6 +26,8 @@
 
 #include "umbp/local/umbp_client.h"
 
+using namespace mori::umbp;
+
 void test_put_get() {
   std::cout << "test_put_get... ";
 

@@ -23,7 +23,7 @@
 
 #include <string>
 
-namespace segment {
+namespace mori::umbp::segment {
 
 uint32_t CrcUpdate(const void* data, size_t size, uint32_t crc) {
   const uint8_t* p = static_cast<const uint8_t*>(data);
@@ -46,4 +46,4 @@ std::string BuildFileName(uint64_t segment_id) {
   return "segment_" + std::to_string(segment_id) + ".log";
 }
 
-}  // namespace segment
+}  // namespace mori::umbp::segment

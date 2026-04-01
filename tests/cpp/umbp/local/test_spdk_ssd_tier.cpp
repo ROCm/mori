@@ -34,6 +34,8 @@
 #include "umbp/common/config.h"
 #include "umbp/local/storage/spdk_ssd_tier.h"
 
+using namespace mori::umbp;
+
 static UMBPConfig MakeTestConfig() {
   UMBPConfig cfg;
   cfg.ssd_backend = "spdk";

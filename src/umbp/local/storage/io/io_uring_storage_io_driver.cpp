@@ -37,6 +37,8 @@
 
 #include "storage_io_driver_impl.h"
 
+namespace mori::umbp {
+
 namespace {
 
 class IoUringStorageIoDriver final : public StorageIoDriver {
@@ -508,3 +510,5 @@ class IoUringStorageIoDriver final : public StorageIoDriver {
 std::unique_ptr<StorageIoDriver> CreateIoUringStorageIoDriver(uint32_t queue_depth) {
   return std::make_unique<IoUringStorageIoDriver>(queue_depth);
 }
+
+}  // namespace mori::umbp
