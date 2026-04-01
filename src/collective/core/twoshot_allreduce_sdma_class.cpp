@@ -414,7 +414,9 @@ bool AllreduceSdma<T>::allreduce_inplace(T* data, size_t total_count, hipStream_
 }
 
 // ---------------------------------------------------------------------------
-// pipelined() — overlapped SDMA scatter + CU reduce + SDMA AllGather
+// pipelined() — V1: simple chunked allreduce using existing RS+AG kernels.
+// Splits total_count into chunks and calls RS+AG per chunk sequentially.
+// No inter-chunk overlap yet — that is the V2 optimization target.
 // ---------------------------------------------------------------------------
 template <typename T>
 bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
@@ -428,126 +430,35 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         }
 
         constexpr int pack_size = packed_t<T>::P::size;
-
-        int threads = 512;
-        int packedPerRank = static_cast<int>(
-            ((total_count / npes_ + pack_size - 1) / pack_size));
-        int blocks = std::min(max_blocks_,
-                              (packedPerRank + threads - 1) / threads);
-        if (blocks < 1) blocks = 1;
-        if (scatter_mode == 0) {
-            int comp = std::min(blocks, kMaxPipelineBlocks - 1);
-            blocks = comp + 1;
-        }
-
-        if (chunk_elems == 0) {
-            size_t min_chunk = std::max<size_t>(
-                static_cast<size_t>(pack_size) * npes_,
-                (512ULL * 1024 / dtype_size_) * npes_);
-            if (scatter_mode == 1) {
-                chunk_elems = total_count;
-            } else {
-                constexpr int    kTargetChunks      = 2;
-                constexpr size_t kMinChunkShardBytes = 8ULL * 1024 * 1024;
-                const size_t shard_bytes =
-                    (total_count / npes_) * dtype_size_;
-                const size_t chunk_shard_bytes =
-                    shard_bytes / kTargetChunks;
-                if (chunk_shard_bytes >= kMinChunkShardBytes) {
-                    chunk_elems = total_count / kTargetChunks;
-                } else {
-                    chunk_elems = total_count;
-                }
-            }
-            if (chunk_elems < min_chunk)
-                chunk_elems = min_chunk;
-        }
         size_t align = static_cast<size_t>(pack_size * npes_);
+
+        if (chunk_elems == 0 || chunk_elems >= total_count) {
+            return (*this)(input, output, total_count, stream);
+        }
+
         chunk_elems = ((chunk_elems + align - 1) / align) * align;
+        if (chunk_elems >= total_count) {
+            return (*this)(input, output, total_count, stream);
+        }
 
-        application::SymmMemObjPtr inputSymmObj = {};
-        if (scatter_mode == 1) {
-            size_t required_input_size = total_count * dtype_size_;
-            if (!ensure_buffer_size(input_transit_buffer_, input_transit_buffer_ptr_,
-                                    input_transit_buffer_size_, input_transit_buffer_obj_,
-                                    required_input_size, "input transit buffer")) {
+        size_t processed = 0;
+        while (processed < total_count) {
+            size_t remaining = total_count - processed;
+            size_t this_chunk = std::min(chunk_elems, remaining);
+            this_chunk = ((this_chunk + align - 1) / align) * align;
+            if (this_chunk > remaining) this_chunk = remaining;
+
+            if (!(*this)(input + processed, output + processed, this_chunk, stream)) {
                 return false;
             }
-            copy_input_to_transit(input, total_count, stream);
-            inputSymmObj = input_transit_buffer_obj_;
-            {
-                hipError_t se = (stream != nullptr)
-                    ? hipStreamSynchronize(stream)
-                    : hipDeviceSynchronize();
-                if (se != hipSuccess) {
-                    fprintf(stderr,
-                            "PE %d: sync before P2P kernel failed: %s\n",
-                            myPe_, hipGetErrorString(se));
-                    return false;
-                }
-            }
+            processed += this_chunk;
         }
 
-        if (scatter_mode == 1) {
-            hipError_t br =
-                stream ? hipMemsetAsync(barrierPtr_, 0, sizeof(CrossPeBarrier), stream)
-                       : hipMemset(barrierPtr_, 0, sizeof(CrossPeBarrier));
-            if (br != hipSuccess) {
-                fprintf(stderr, "PE %d: pipelined hipMemset(barrier) failed: %s\n",
-                        myPe_, hipGetErrorString(br));
-                return false;
-            }
-        }
-
-        const bool multi_chunk = (chunk_elems < total_count);
-
-        {
-            static int s_call = 0;
-            int call_id = s_call++;
-            uint32_t dbg_flag = 0, dbg_cc = 0;
-            hipMemcpy(&dbg_flag,
-                      reinterpret_cast<char*>(barrierPtr_) + offsetof(CrossPeBarrier, flag),
-                      sizeof(uint32_t), hipMemcpyDeviceToHost);
-            hipMemcpy(&dbg_cc,
-                      reinterpret_cast<char*>(barrierPtr_) + offsetof(CrossPeBarrier, chunks_complete),
-                      sizeof(uint32_t), hipMemcpyDeviceToHost);
-            fprintf(stderr,
-                    "PE %d: pipe#%d sm=%d blk=%d cc=%u flag=%u\n",
-                    myPe_, call_id, scatter_mode, blocks, dbg_cc, dbg_flag);
-        }
-
-        if (scatter_mode == 1) {
-            PipelinedAllReduceSdmaKernel<T, 1><<<blocks, threads, 0, stream>>>(
-                myPe_, npes_, input,
-                output_transit_buffer_obj_, flagsObj_,
-                barrierPtr_, inputSymmObj, total_count, chunk_elems);
-        } else if (multi_chunk) {
-            PipelinedAllReduceSdmaKernel<T, 0, true><<<blocks, threads, 0, stream>>>(
-                myPe_, npes_, input,
-                output_transit_buffer_obj_, flagsObj_,
-                barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems);
-        } else {
-            PipelinedAllReduceSdmaKernel<T, 0, false><<<blocks, threads, 0, stream>>>(
-                myPe_, npes_, input,
-                output_transit_buffer_obj_, flagsObj_,
-                barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems);
-        }
-
-        hipError_t err = hipGetLastError();
-        if (err != hipSuccess) {
-            fprintf(stderr, "PE %d: PipelinedAllReduce launch failed: %s\n",
-                    myPe_, hipGetErrorString(err));
-            return false;
-        }
-
-        if (copy_output_to_user_) {
-            copy_output_to_user(output, total_count, stream);
-        }
+        return true;
     } catch (const std::exception& e) {
-        fprintf(stderr, "PE %d: PipelinedAllReduce exception: %s\n", myPe_, e.what());
+        fprintf(stderr, "PE %d: pipelined exception: %s\n", myPe_, e.what());
         return false;
     }
-    return true;
 }
 
 // ---------------------------------------------------------------------------

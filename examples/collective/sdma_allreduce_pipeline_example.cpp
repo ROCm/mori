@@ -176,8 +176,56 @@ void testPipelinedAllreduce() {
         double ms = 0, gb = 0;
         bool ok = false;
 
-        // Serial skipped ? output zeros to avoid polluting pipeline signal space
-        ok = true;
+        // Serial (D2D to devOut, same as sync example out-of-place)
+        {
+            for (int i = 0; i < 10; i++) {
+                CHECK_HIP(hipMemcpyAsync(inBuf, hostData.data(), bytesPerPe, hipMemcpyHostToDevice,
+                                         stream));
+                CHECK_HIP(hipMemsetAsync(devOut, 0, bytesPerPe, stream));
+                CHECK_HIP(hipStreamSynchronize(stream));
+                MPI_Barrier(MPI_COMM_WORLD);
+                (*ar)(inBuf, devOut, elemsPerPe, stream);
+                CHECK_HIP(hipStreamSynchronize(stream));
+                MPI_Barrier(MPI_COMM_WORLD);
+            }
+            std::vector<uint32_t> result(elemsPerPe);
+            CHECK_HIP(hipMemcpyAsync(inBuf, hostData.data(), bytesPerPe, hipMemcpyHostToDevice,
+                                     stream));
+            CHECK_HIP(hipStreamSynchronize(stream));
+            MPI_Barrier(MPI_COMM_WORLD);
+            (*ar)(inBuf, devOut, elemsPerPe, stream);
+            CHECK_HIP(hipStreamSynchronize(stream));
+            CHECK_HIP(hipMemcpy(result.data(), devOut, bytesPerPe, hipMemcpyDeviceToHost));
+            int v = verifyResult(result.data(), elemsPerPe, computeExpected(npes), myPe) ? 1 : 0;
+            int gv = 0;
+            MPI_Allreduce(&v, &gv, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+            ok = (gv == npes);
+            if (ok) {
+                std::vector<double> times;
+                for (int i = 0; i < warmup + iterations; i++) {
+                    CHECK_HIP(hipMemcpyAsync(inBuf, hostData.data(), bytesPerPe,
+                                             hipMemcpyHostToDevice, stream));
+                    CHECK_HIP(hipStreamSynchronize(stream));
+                    MPI_Barrier(MPI_COMM_WORLD);
+                    double t0 = MPI_Wtime();
+                    (*ar)(inBuf, devOut, elemsPerPe, stream);
+                    CHECK_HIP(hipStreamSynchronize(stream));
+                    double t1 = MPI_Wtime();
+                    if (i >= warmup) times.push_back(t1 - t0);
+                }
+                MPI_Barrier(MPI_COMM_WORLD);
+                double avg = 0;
+                for (double t : times) avg += t;
+                avg /= times.size();
+                double g_sum = 0;
+                MPI_Reduce(&avg, &g_sum, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+                if (myPe == 0) {
+                    double g_avg = g_sum / npes;
+                    ms = g_avg * 1000.0;
+                    gb = bytesPerPe / g_avg / (1024.0 * 1024.0 * 1024.0);
+                }
+            }
+        }
         if (myPe == 0) {
             serialMs.push_back(ms);
             serialGb.push_back(gb);
@@ -275,7 +323,7 @@ void testPipelinedAllreduce() {
         printf("  npes=%-3d  dtype=uint32  warmup=%d  iters=%d  chunk_sweep=%s\n",
                npes, warmup, iterations, chunkSweep ? "on" : "off");
         printf("  Serial = ReduceScatter + AllGather  (single-shot, no pipeline)\n");
-        printf("  SDMA   = Pipeline SDMA scatter/reduce/AG  (auto 2-chunk, 3-stage)\n");
+        printf("  SDMA   = Pipeline (chunked RS+AG, V1 baseline)\n");
         printf("  P2P    = Pipeline with P2P scatter mode\n");
         printf("%s\n\n", sep);
 
