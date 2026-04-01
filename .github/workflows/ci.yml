@@ -68,7 +68,9 @@ jobs:
       - name: MORI-EP
         run: |
           cd $GITHUB_WORKSPACE
-          timeout 300 pytest tests/python/ops/test_dispatch_combine.py -v
+          timeout 300 pytest tests/python/ops/test_dispatch_combine_intranode.py -v
+          timeout 300 pytest tests/python/ops/test_dispatch_combine_internode_v1.py -v
+          timeout 300 pytest tests/python/ops/test_dispatch_combine_async_ll.py -v
 
       - name: MORI-EP bench
         run: |
