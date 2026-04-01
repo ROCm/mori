@@ -26,6 +26,7 @@
 #include <hip/hip_fp16.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
@@ -102,10 +103,20 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t /*input_buffer_size*/
 
   // Zero SDMA completion signals so the generation counter (barrier->flag) stays in sync.
   // Without this, reused SHMEM memory may carry stale signal values from a prior instance.
-  if (output_transit_buffer_obj_->signalPtrs && output_transit_buffer_obj_->sdmaNumQueue > 0) {
-    size_t sigSize =
-        static_cast<size_t>(npes_) * output_transit_buffer_obj_->sdmaNumQueue * sizeof(HSAuint64);
-    hipMemset(output_transit_buffer_obj_->signalPtrs, 0, sigSize);
+  // NOTE: cpu-side SymmMemObj does NOT carry signalPtrs (it's null). Read the device
+  // pointer from the gpu-side struct via hipMemcpy.
+  {
+    uint32_t numQ = output_transit_buffer_obj_->sdmaNumQueue;
+    if (numQ > 0 && output_transit_buffer_obj_.gpu != nullptr) {
+      HSAuint64* devSigPtr = nullptr;
+      hipMemcpy(&devSigPtr,
+                reinterpret_cast<char*>(output_transit_buffer_obj_.gpu) +
+                    offsetof(application::SymmMemObj, signalPtrs),
+                sizeof(HSAuint64*), hipMemcpyDeviceToHost);
+      if (devSigPtr) {
+        hipMemset(devSigPtr, 0, static_cast<size_t>(npes_) * numQ * sizeof(HSAuint64));
+      }
+    }
   }
 
   printf("AllreduceSdma(SDMA) initialized: PE %d of %d, max_blocks=%d\n", myPe_, npes_,
