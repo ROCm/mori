@@ -22,6 +22,15 @@
 #include "umbp/local/umbp_client.h"
 
 #include <stdexcept>
+#include <string>
+
+#include "mori/utils/mori_log.hpp"
+#include "umbp/common/types.h"
+#include "umbp/distributed/peer/peer_service.h"
+#include "umbp/distributed/pool_client.h"
+#include "umbp/local/storage/dram_tier.h"
+
+namespace mori::umbp {
 
 UMBPConfig UMBPClient::NormalizeConfig(const UMBPConfig& config) {
   UMBPConfig normalized = config;
@@ -38,9 +47,114 @@ UMBPConfig UMBPClient::NormalizeConfig(const UMBPConfig& config) {
 UMBPClient::UMBPClient(const UMBPConfig& config)
     : config_(NormalizeConfig(config)), role_(config_.ResolveRole()), storage_(config_, &index_) {
   copy_pipeline_ = std::make_unique<CopyPipeline>(storage_, config_.copy_pipeline, role_);
+
+  MORI_UMBP_INFO("[UMBPClient] ctor: distributed.has_value()={}", config_.distributed.has_value());
+  if (config_.distributed.has_value()) {
+    const auto& dist = config_.distributed.value();
+
+    PoolClientConfig pc_config;
+    pc_config.master_config.master_address = dist.master_address;
+    pc_config.master_config.node_id = dist.node_id;
+    pc_config.master_config.node_address = dist.node_address;
+    pc_config.master_config.auto_heartbeat = dist.auto_heartbeat;
+    pc_config.io_engine_host = dist.io_engine_host;
+    pc_config.io_engine_port = dist.io_engine_port;
+    pc_config.staging_buffer_size = dist.staging_buffer_size;
+    pc_config.peer_service_port = dist.peer_service_port;
+
+    // Export DramTier buffer so PoolClient registers it with the master at
+    // Init() time, enabling remote RDMA reads into this node's DRAM.
+    auto* dram = storage_.GetTierAs<DRAMTier>(StorageTier::CPU_DRAM);
+    if (dram) {
+      auto [used, total] = storage_.Capacity(StorageTier::CPU_DRAM);
+      pc_config.dram_buffers.push_back({dram->GetBasePtr(), total});
+      pc_config.tier_capacities[TierType::DRAM] = {total, 0};
+      MORI_UMBP_INFO("[UMBPClient] ctor: exporting DRAM buffer ptr={}, size={}", dram->GetBasePtr(),
+                     total);
+    }
+
+    if (config_.ssd.enabled) {
+      pc_config.ssd_stores.push_back({config_.ssd.storage_dir, config_.ssd.capacity_bytes});
+      const uint64_t ssd_available =
+          (role_ == UMBPRole::SharedSSDFollower) ? 0 : config_.ssd.capacity_bytes;
+      pc_config.tier_capacities[TierType::SSD] = {config_.ssd.capacity_bytes, ssd_available};
+    }
+
+    MORI_UMBP_INFO("[UMBPClient] ctor: creating PoolClient for node '{}', master='{}'",
+                   dist.node_id, dist.master_address);
+    pool_client_ = std::make_unique<PoolClient>(std::move(pc_config));
+    if (!pool_client_->Init()) {
+      MORI_UMBP_ERROR("PoolClient init failed for node '{}', falling back to local mode",
+                      dist.node_id);
+      pool_client_.reset();
+    }
+  }
+
+  // Register DRAM for local zero-copy RDMA and install tier-change callback.
+  if (pool_client_) {
+    auto* dram = storage_.GetTierAs<DRAMTier>(StorageTier::CPU_DRAM);
+    if (dram) {
+      auto [used, total] = storage_.Capacity(StorageTier::CPU_DRAM);
+      pool_client_->RegisterMemory(dram->GetBasePtr(), total);
+    }
+
+    if (config_.distributed->peer_service_port > 0 && config_.ssd.enabled &&
+        pool_client_->SsdStagingPtr() != nullptr) {
+      peer_service_ = std::make_unique<PeerServiceServer>(
+          pool_client_->SsdStagingPtr(), pool_client_->SsdStagingSize(),
+          pool_client_->SsdStagingMemDescBytes(), storage_, index_, *pool_client_);
+      if (!peer_service_->Start(config_.distributed->peer_service_port)) {
+        MORI_UMBP_ERROR("PeerService init failed on port {}",
+                        config_.distributed->peer_service_port);
+        peer_service_.reset();
+      }
+    }
+
+    storage_.SetOnTierChange(
+        [this](const std::string& key, StorageTier from, std::optional<StorageTier> to,
+               std::optional<LocalStorageManager::TierLocationInfo> new_location) {
+          if (pool_client_) {
+            pool_client_->UnregisterFromMaster(key);
+          }
+
+          if (!pool_client_ || !to.has_value() || !new_location.has_value()) {
+            return;
+          }
+
+          if (*to == StorageTier::LOCAL_SSD) {
+            pool_client_->PublishLocalBlock(key, new_location->size, new_location->location_id,
+                                            TierType::SSD);
+          } else if (*to == StorageTier::CPU_DRAM) {
+            pool_client_->PublishLocalBlock(key, new_location->size, new_location->location_id,
+                                            TierType::DRAM);
+          }
+        });
+  }
 }
 
-UMBPClient::~UMBPClient() = default;
+UMBPClient::~UMBPClient() {
+  if (peer_service_) {
+    peer_service_->Stop();
+    peer_service_.reset();
+  }
+
+  // Shut down PoolClient before storage_/index_ are destroyed, since later
+  // phases will give PoolClient pointers into those members.
+  if (pool_client_) {
+    pool_client_->Shutdown();
+    pool_client_.reset();
+  }
+}
+
+void UMBPClient::MaybePublishLocal(const std::string& key, size_t size) {
+  if (!pool_client_) return;
+  auto* dram = storage_.GetTierAs<DRAMTier>(StorageTier::CPU_DRAM);
+  if (!dram) return;
+  auto offset = dram->GetSlotOffset(key);
+  if (!offset) return;
+  std::string location_id = "0:" + std::to_string(*offset);
+  pool_client_->PublishLocalBlock(key, size, location_id, TierType::DRAM);
+}
 
 bool UMBPClient::Put(const std::string& key, const void* data, size_t size) {
   if (role_ == UMBPRole::SharedSSDFollower) return false;
@@ -53,6 +167,7 @@ bool UMBPClient::Put(const std::string& key, const void* data, size_t size) {
   if (!storage_.Write(key, data, size)) return false;
 
   index_.Insert(key, {StorageTier::CPU_DRAM, 0, size});
+  MaybePublishLocal(key, size);
   copy_pipeline_->MaybeCopyToSharedSSD(key);
   return true;
 }
@@ -64,6 +179,7 @@ bool UMBPClient::PutFromPtr(const std::string& key, uintptr_t src, size_t size) 
   if (!storage_.WriteFromPtr(key, src, size)) return false;
 
   index_.Insert(key, {StorageTier::CPU_DRAM, 0, size});
+  MaybePublishLocal(key, size);
   copy_pipeline_->MaybeCopyToSharedSSD(key);
   return true;
 }
@@ -71,9 +187,26 @@ bool UMBPClient::PutFromPtr(const std::string& key, uintptr_t src, size_t size) 
 bool UMBPClient::GetIntoPtr(const std::string& key, uintptr_t dst, size_t size) {
   bool in_index = index_.MayExist(key);
 
-  if (!in_index && role_ != UMBPRole::SharedSSDFollower) return false;
+  MORI_UMBP_DEBUG("[UMBPClient] GetIntoPtr: key='{}' in_index={} role={} pool_client_={}", key,
+                  in_index, static_cast<int>(role_), pool_client_ != nullptr);
+
+  if (!in_index && role_ != UMBPRole::SharedSSDFollower && !pool_client_) {
+    MORI_UMBP_DEBUG(
+        "[UMBPClient] GetIntoPtr: early return false — not in index, not follower, no pool_client");
+    return false;
+  }
 
   bool ok = storage_.ReadIntoPtr(key, dst, size);
+  MORI_UMBP_DEBUG("[UMBPClient] GetIntoPtr: local ReadIntoPtr for key '{}' returned {}", key, ok);
+
+  // Phase 3: on local miss, try fetching from a remote node's DRAM via RDMA.
+  if (!ok && pool_client_) {
+    MORI_UMBP_DEBUG(
+        "[UMBPClient] GetIntoPtr: local miss for key '{}', attempting GetRemote (size={})", key,
+        size);
+    ok = pool_client_->GetRemote(key, reinterpret_cast<void*>(dst), size);
+    MORI_UMBP_DEBUG("[UMBPClient] GetIntoPtr: GetRemote for key '{}' returned {}", key, ok);
+  }
 
   if (role_ == UMBPRole::SharedSSDFollower) {
     if (ok) {
@@ -114,7 +247,15 @@ bool UMBPClient::Exists(const std::string& key) const {
     // performance hint and may be stale across ranks.
     return storage_.Exists(key);
   }
-  return index_.MayExist(key);
+  if (index_.MayExist(key)) return true;
+
+  // Phase 3: key not in local index — check if any remote node holds it.
+  // SGLang calls Exists() before Get(), so without this remote check a
+  // cluster-wide key would appear missing and Get() would never be called.
+  if (pool_client_) {
+    return pool_client_->ExistsRemote(key);
+  }
+  return false;
 }
 
 bool UMBPClient::Remove(const std::string& key) {
@@ -122,6 +263,9 @@ bool UMBPClient::Remove(const std::string& key) {
   if (!loc) return false;
 
   storage_.Evict(key);
+  if (pool_client_ && pool_client_->IsRegistered(key)) {
+    pool_client_->UnregisterFromMaster(key);
+  }
   return true;
 }
 
@@ -139,6 +283,7 @@ std::vector<bool> UMBPClient::BatchPutFromPtr(const std::vector<std::string>& ke
     }
     if (!storage_.WriteFromPtr(keys[i], ptrs[i], sizes[i])) continue;
     index_.Insert(keys[i], {StorageTier::CPU_DRAM, 0, sizes[i]});
+    MaybePublishLocal(keys[i], sizes[i]);
     results[i] = true;
   }
 
@@ -169,6 +314,7 @@ std::vector<bool> UMBPClient::BatchPutFromPtrWithDepth(const std::vector<std::st
     int depth = (i < depths.size()) ? depths[i] : -1;
     if (!storage_.WriteFromPtrWithDepth(keys[i], ptrs[i], sizes[i], depth)) continue;
     index_.Insert(keys[i], {StorageTier::CPU_DRAM, 0, sizes[i]});
+    MaybePublishLocal(keys[i], sizes[i]);
     results[i] = true;
   }
 
@@ -194,10 +340,17 @@ std::vector<bool> UMBPClient::BatchGetIntoPtr(const std::vector<std::string>& ke
   std::vector<bool> was_in_index(keys.size(), false);
   read_indices.reserve(keys.size());
 
+  MORI_UMBP_DEBUG("[UMBPClient] BatchGetIntoPtr: {} keys, role={} pool_client_={}", keys.size(),
+                  static_cast<int>(role_), pool_client_ != nullptr);
+
   for (size_t i = 0; i < keys.size(); ++i) {
     was_in_index[i] = index_.MayExist(keys[i]);
-    if (!was_in_index[i] && role_ != UMBPRole::SharedSSDFollower) {
-      // Non-follower: key not in index → guaranteed miss.
+    if (!was_in_index[i] && role_ != UMBPRole::SharedSSDFollower && !pool_client_) {
+      // Non-follower, non-distributed: key not in index → guaranteed miss.
+      MORI_UMBP_DEBUG(
+          "[UMBPClient] BatchGetIntoPtr: skipping key '{}' — not in index, not follower, no "
+          "pool_client",
+          keys[i]);
       continue;
     }
     read_indices.push_back(i);
@@ -220,14 +373,13 @@ std::vector<bool> UMBPClient::BatchGetIntoPtr(const std::vector<std::string>& ke
 
   auto batch_results = storage_.ReadBatchIntoPtr(batch_keys, batch_ptrs, batch_sizes);
 
-  // Phase 3: Post-read index maintenance (mirrors GetIntoPtr per-key logic).
+  // Phase 3: Update local index based on local storage results only.
   for (size_t j = 0; j < read_indices.size(); ++j) {
     size_t i = read_indices[j];
-    bool ok = batch_results[j];
-    results[i] = ok;
+    bool local_hit = batch_results[j];
 
     if (role_ == UMBPRole::SharedSSDFollower) {
-      if (ok) {
+      if (local_hit) {
         StorageTier tier = StorageTier::LOCAL_SSD;
         auto* dram = storage_.GetTier(StorageTier::CPU_DRAM);
         if (dram && dram->Exists(keys[i])) {
@@ -236,17 +388,28 @@ std::vector<bool> UMBPClient::BatchGetIntoPtr(const std::vector<std::string>& ke
         if (!index_.UpdateTier(keys[i], tier)) {
           index_.Insert(keys[i], {tier, 0, sizes[i]});
         }
-      } else {
-        if (was_in_index[i] && !storage_.Exists(keys[i])) {
-          index_.Remove(keys[i]);
-        }
-        if (!was_in_index[i] && !storage_.Exists(keys[i])) {
-          index_.Remove(keys[i]);
-        }
+      } else if (!storage_.Exists(keys[i])) {
+        index_.Remove(keys[i]);
       }
-    } else if (!ok && was_in_index[i] && !storage_.Exists(keys[i])) {
+    } else if (!local_hit && was_in_index[i] && !storage_.Exists(keys[i])) {
       index_.Remove(keys[i]);
     }
+  }
+
+  // Phase 4: Try remote DRAM for local misses and set final results.
+  for (size_t j = 0; j < read_indices.size(); ++j) {
+    size_t i = read_indices[j];
+    bool ok = batch_results[j];
+
+    if (!ok && pool_client_) {
+      MORI_UMBP_DEBUG(
+          "[UMBPClient] BatchGetIntoPtr: local miss for key '{}', attempting GetRemote (size={})",
+          keys[i], sizes[i]);
+      ok = pool_client_->GetRemote(keys[i], reinterpret_cast<void*>(ptrs[i]), sizes[i]);
+      MORI_UMBP_DEBUG("[UMBPClient] BatchGetIntoPtr: GetRemote for key '{}' returned {}", keys[i],
+                      ok);
+    }
+    results[i] = ok;
   }
 
   return results;
@@ -277,3 +440,7 @@ bool UMBPClient::Flush() { return storage_.Flush(); }
 mori::umbp::LocalBlockIndex& UMBPClient::Index() { return index_; }
 
 LocalStorageManager& UMBPClient::Storage() { return storage_; }
+
+bool UMBPClient::IsDistributed() const { return pool_client_ != nullptr; }
+
+}  // namespace mori::umbp

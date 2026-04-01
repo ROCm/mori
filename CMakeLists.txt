@@ -31,6 +31,7 @@ option(BUILD_SHMEM "Whether to build shmem library" ON)
 option(BUILD_OPS "Whether to build mori operation kernels" ON)
 option(BUILD_IO "Whether to build mori io library" ON)
 option(BUILD_PYBINDS "Whether to build mori python bindings" ON)
+option(BUILD_XLA_FFI_OPS "Whether to build mori xla ffi python bindings" OFF)
 option(BUILD_UMBP "Whether to build UMBP (Unified Memory/Bandwidth Pool)" OFF)
 option(BUILD_TESTS "Whether to build mori CPP tests" ON)
 option(ENABLE_PROFILER "Enable kernel profiling" OFF)
@@ -39,115 +40,10 @@ option(ENABLE_STANDARD_MOE_ADAPT "Enable standard moe adapt" OFF)
 option(BUILD_OPS_DEVICE "AOT compile EP kernels to .hsaco(requires hipcc)" OFF)
 
 # ---------------------------------------------------------------------------
-# Host NIC: link all available NIC libraries (can be multiple). Only requires
-# the library to exist — no device needed (supports CI builds).
+# Host NIC: all vendor-specific dv libraries (mlx5, bnxt_re, ionic) are loaded
+# at runtime via dlopen. No compile-time library or header detection needed.
 # ---------------------------------------------------------------------------
-set(CMAKE_LIBRARY_PATH "/usr/local/lib;${CMAKE_LIBRARY_PATH}")
-
-find_library(BNXT_RE_LIB NAMES bnxt_re)
-find_library(
-  IONIC_LIB
-  NAMES ionic
-  HINTS /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu)
-find_library(
-  MLX5_LIB
-  NAMES mlx5
-  HINTS /usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu)
-
-find_path(
-  BNXT_RE_DV_INCLUDE
-  NAMES infiniband/bnxt_re_dv.h
-  HINTS /usr/include /usr/local/include)
-find_path(
-  BNXT_RE_HSI_INCLUDE
-  NAMES infiniband/bnxt_re_hsi.h
-  HINTS /usr/include /usr/local/include)
-if(BNXT_RE_DV_INCLUDE AND BNXT_RE_HSI_INCLUDE)
-  set(_bnxt_headers_found TRUE)
-else()
-  set(_bnxt_headers_found FALSE)
-endif()
-
-# USE_BNXT: env override > cmake -D > auto-detect from library + headers
-if(DEFINED ENV{USE_BNXT})
-  string(TOUPPER "$ENV{USE_BNXT}" _env_bnxt)
-  if(_env_bnxt STREQUAL "ON")
-    if(BNXT_RE_LIB AND _bnxt_headers_found)
-      message(
-        STATUS "Host NIC BNXT: enabled via USE_BNXT env (lib=${BNXT_RE_LIB})")
-      set(USE_BNXT
-          ON
-          CACHE BOOL "Enable BNXT host features" FORCE)
-    else()
-      message(
-        WARNING "USE_BNXT=ON but libbnxt_re or headers not found — disabling")
-      set(USE_BNXT
-          OFF
-          CACHE BOOL "Enable BNXT host features" FORCE)
-    endif()
-  else()
-    message(STATUS "Host NIC BNXT: explicitly disabled via USE_BNXT env")
-    set(USE_BNXT
-        OFF
-        CACHE BOOL "Enable BNXT host features" FORCE)
-  endif()
-elseif(BNXT_RE_LIB AND _bnxt_headers_found)
-  message(STATUS "Host NIC BNXT: auto-detected (lib=${BNXT_RE_LIB})")
-  set(USE_BNXT
-      ON
-      CACHE BOOL "Enable BNXT host features" FORCE)
-else()
-  if(BNXT_RE_LIB AND NOT _bnxt_headers_found)
-    message(
-      STATUS "Host NIC BNXT: library found but missing headers — disabled")
-  else()
-    message(STATUS "Host NIC BNXT: not found")
-  endif()
-  set(USE_BNXT
-      OFF
-      CACHE BOOL "Enable BNXT host features" FORCE)
-endif()
-if(USE_BNXT)
-  add_compile_definitions(ENABLE_BNXT)
-endif()
-
-# USE_IONIC: env override > cmake -D > auto-detect from library
-if(DEFINED ENV{USE_IONIC})
-  string(TOUPPER "$ENV{USE_IONIC}" _env_ionic)
-  if(_env_ionic STREQUAL "ON")
-    if(IONIC_LIB)
-      message(
-        STATUS "Host NIC IONIC: enabled via USE_IONIC env (lib=${IONIC_LIB})")
-      set(USE_IONIC
-          ON
-          CACHE BOOL "Enable IONIC host features" FORCE)
-    else()
-      message(WARNING "USE_IONIC=ON but libionic not found — disabling")
-      set(USE_IONIC
-          OFF
-          CACHE BOOL "Enable IONIC host features" FORCE)
-    endif()
-  else()
-    message(STATUS "Host NIC IONIC: explicitly disabled via USE_IONIC env")
-    set(USE_IONIC
-        OFF
-        CACHE BOOL "Enable IONIC host features" FORCE)
-  endif()
-elseif(IONIC_LIB)
-  message(STATUS "Host NIC IONIC: auto-detected (lib=${IONIC_LIB})")
-  set(USE_IONIC
-      ON
-      CACHE BOOL "Enable IONIC host features" FORCE)
-else()
-  message(STATUS "Host NIC IONIC: not found")
-  set(USE_IONIC
-      OFF
-      CACHE BOOL "Enable IONIC host features" FORCE)
-endif()
-if(USE_IONIC)
-  add_compile_definitions(ENABLE_IONIC)
-endif()
-message(STATUS "Host NIC: USE_BNXT=${USE_BNXT}, USE_IONIC=${USE_IONIC}")
+message(STATUS "Host NIC: all dv libraries loaded at runtime via dlopen")
 
 if(DEFINED ENV{MORI_WITH_MPI})
   string(TOUPPER "$ENV{MORI_WITH_MPI}" _env_with_mpi)
@@ -162,6 +58,14 @@ if(DEFINED ENV{MORI_WITH_MPI})
         OFF
         CACHE BOOL "Enable MPI support" FORCE)
   endif()
+endif()
+
+if(BUILD_XLA_FFI_OPS)
+  if(NOT BUILD_OPS_DEVICE)
+    message(FATAL_ERROR "BUILD_XLA_FFI_OPS=ON requires BUILD_OPS_DEVICE=ON")
+  endif()
+  add_compile_definitions(BUILD_XLA_FFI_OPS)
+  add_compile_options(-Wno-deprecated-literal-operator)
 endif()
 
 # ---------------------------------------------------------------------------

@@ -194,15 +194,15 @@ cd mori && docker build -t rocm/mori:dev -f docker/Dockerfile.dev .
 
 **IBGDA NIC support** (optional, for GPU-direct RDMA — auto-detected, no manual configuration needed):
 
-| NIC | User library | Headers |
-|-----|-------------|---------|
-| AMD Pollara (AINIC) | `libionic.so` | — |
-| Mellanox ConnectX | `libmlx5.so` (typically pre-installed) | — |
-| Broadcom Thor2 | `libbnxt_re.so` | `bnxt_re_dv.h`, `bnxt_re_hsi.h` |
+| NIC | User library |
+|-----|-------------|
+| AMD Pollara (AINIC) | `libionic.so` |
+| Mellanox ConnectX | `libmlx5.so` (typically pre-installed) |
+| Broadcom Thor2 | `libbnxt_re.so` |
 
 > **Note**: IBGDA requires vendor-specific DV (Direct Verbs) libraries. Mellanox `libmlx5` is
 > typically pre-installed with the kernel OFED stack. For Thor2 and Pollara, install the
-> corresponding userspace library and headers from your NIC vendor.
+> corresponding userspace library from your NIC vendor.
 
 ### Install
 

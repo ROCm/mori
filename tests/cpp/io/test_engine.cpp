@@ -200,11 +200,13 @@ RegisteredGpuMem RegisterGpuMemory(IOEngine* engine, size_t sizeBytes, int devic
 }
 
 void CaseSubmissionLedgerBasic() {
-  SubmissionLedger ledger;
+  constexpr uint32_t kNotifPerQp = 16;
+  SubmissionLedger ledger(kNotifPerQp);
   std::atomic<int> sqDepth{5};
   TransferStatus status;
   auto meta = std::make_shared<CqCallbackMeta>(&status, 101, 8);
   const uint64_t id = ledger.Insert(3, true, meta, 8);
+  Require(id == kNotifPerQp, "first ledger record id should start at notifPerQp boundary");
   int batchSize = 0;
   auto releasedMeta = ledger.ReleaseByCqe(id, &sqDepth, &batchSize);
   Require(releasedMeta != nullptr, "ledger release meta should not be null");
@@ -212,10 +214,11 @@ void CaseSubmissionLedgerBasic() {
   Require(batchSize == 8, "unexpected batch size from ledger release");
   Require(sqDepth.load(std::memory_order_relaxed) == 2, "unexpected sq depth after release");
 
-  SubmissionLedger ledger2;
+  SubmissionLedger ledger2(kNotifPerQp);
   std::atomic<int> sqDepth2{12};
   auto meta2 = std::make_shared<CqCallbackMeta>(&status, 202, 16);
   uint64_t postedId = ledger2.Insert(4, true, meta2, 10);
+  Require(postedId == kNotifPerQp, "posted record id should respect notifPerQp offset");
   ledger2.InsertOrphaned(3, meta2, 6);
   Require(ledger2.HasOrphaned(), "expected orphaned record in ledger");
   int recovered = ledger2.ReleaseOrphanedByRecovery(&sqDepth2);
@@ -229,6 +232,48 @@ void CaseSubmissionLedgerBasic() {
   Require(postedMeta != nullptr, "posted record should survive recovery");
   Require(postedBatch == 10, "posted record batch size mismatch");
   Require(sqDepth2.load(std::memory_order_relaxed) == 5, "sq depth after posted CQE release");
+}
+
+void CaseWrIdNamespaceHelpers() {
+  const uint64_t taggedZero = MakeNotifSendWrId(0);
+  Require(taggedZero == kNotifSendWrIdTag, "tagged zero should only set the reserved high bit");
+  Require(IsNotifSendWrId(taggedZero), "tagged zero should be recognized as notification SEND");
+  Require(ExtractTransferIdFromWrId(taggedZero) == 0,
+          "extracting transfer id from tagged zero should yield zero");
+
+  const TransferUniqueId plainId = 1023;
+  const uint64_t taggedPlain = MakeNotifSendWrId(plainId);
+  Require(IsNotifSendWrId(taggedPlain), "tagged plain id should be recognized");
+  Require(ExtractTransferIdFromWrId(taggedPlain) == plainId,
+          "extracting transfer id should preserve the original low bits");
+
+  const TransferUniqueId externalTaggedId = kNotifSendWrIdTag | TransferUniqueId{42};
+  const uint64_t taggedMasked = MakeNotifSendWrId(externalTaggedId);
+  Require(IsNotifSendWrId(taggedMasked), "masked tagged id should still carry the SEND tag");
+  Require(ExtractTransferIdFromWrId(taggedMasked) == 42,
+          "high-bit caller ids should be masked before tagging");
+  Require(!IsNotifSendWrId(4096), "ledger-range ids without bit 63 should not be SEND-tagged");
+}
+
+void CaseRdmaNotificationRejectsZeroNotifPerQp() {
+  IOEngineConfig cfg;
+  cfg.host = "127.0.0.1";
+  cfg.port = 0;
+  IOEngine engine("rdma_invalid_notif_per_qp", cfg);
+
+  RdmaBackendConfig rdmaCfg{};
+  rdmaCfg.enableNotification = true;
+  rdmaCfg.notifPerQp = 0;
+
+  bool threw = false;
+  try {
+    engine.CreateBackend(BackendType::RDMA, rdmaCfg);
+  } catch (const std::runtime_error& e) {
+    threw = true;
+    Require(std::string(e.what()).find("notifPerQp") != std::string::npos,
+            "zero notifPerQp failure should mention notifPerQp");
+  }
+  Require(threw, "notification-enabled RDMA backend should reject notifPerQp == 0");
 }
 
 void CaseRdmaTransferBasic() {
@@ -412,6 +457,8 @@ int main() {
   SetLogLevel("info");
   std::vector<TestCase> cases = {
       {"submission_ledger_basic", CaseSubmissionLedgerBasic},
+      {"wr_id_namespace_helpers", CaseWrIdNamespaceHelpers},
+      {"rdma_notification_rejects_zero_notif_per_qp", CaseRdmaNotificationRejectsZeroNotifPerQp},
       {"rdma_transfer_basic", CaseRdmaTransferBasic},
       {"rdma_notification_disabled_behavior", CaseRdmaNotificationDisabledBehavior},
       {"rdma_notification_env_override_disables", CaseRdmaNotificationEnvOverrideDisables},

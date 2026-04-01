@@ -26,6 +26,8 @@
 
 #include "storage_io_driver_impl.h"
 
+namespace mori::umbp {
+
 IoStatus StorageIoDriver::WriteBatch(const std::vector<IoWriteOp>& ops) {
   for (const auto& op : ops) {
     IoStatus status = WriteAt(op.fd, op.data, op.size, op.offset);
@@ -59,3 +61,5 @@ std::unique_ptr<StorageIoDriver> CreateStorageIoDriver(UMBPIoBackend backend,
   }
   return CreatePosixStorageIoDriver();
 }
+
+}  // namespace mori::umbp

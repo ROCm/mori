@@ -33,6 +33,8 @@
 #include "umbp/common/config.h"
 #include "umbp/local/storage/local_storage_manager.h"
 
+namespace mori::umbp {
+
 class CopyPipeline {
  public:
   CopyPipeline(LocalStorageManager& storage, const UMBPCopyPipelineConfig& config, UMBPRole role);
@@ -60,3 +62,5 @@ class CopyPipeline {
   std::condition_variable copy_cv_;
   std::deque<CopyTask> copy_queue_;
 };
+
+}  // namespace mori::umbp

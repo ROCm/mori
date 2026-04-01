@@ -31,7 +31,7 @@
 #include <random>
 #include <vector>
 
-#include "src/io/xgmi/scatter_gather_kernel.hpp"
+#include "src/io/kernels/scatter_gather.hip"
 
 #define HIP_CHECK(cmd)                                                                         \
   do {                                                                                         \
@@ -76,8 +76,7 @@ static void KernelBatchCopy(char* dst, const char* src, const std::vector<size_t
 
   int threads = 256;
   int blocks = std::min(n, 1024);
-  mori::io::scatterGatherCopyKernel<<<blocks, threads, 0, stream>>>(src, dst, dSrcOff, dDstOff,
-                                                                    dSizes, n);
+  scatterGatherCopyKernel<<<blocks, threads, 0, stream>>>(src, dst, dSrcOff, dDstOff, dSizes, n);
   HIP_CHECK(hipGetLastError());
 }
 

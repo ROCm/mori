@@ -35,7 +35,6 @@
 
 #include "mori/io/env.hpp"
 #include "mori/io/logging.hpp"
-#include "src/io/xgmi/scatter_gather_kernel.hpp"
 
 namespace mori {
 namespace io {
@@ -162,14 +161,15 @@ void ArmTransferCompletion(TransferStatus* status, hipEvent_t event, int eventDe
 
 XgmiBackendSession::XgmiBackendSession(const XgmiBackendConfig& config, void* localAddr,
                                        void* remoteAddr, int localDevice, int remoteDevice,
-                                       bool isIpcSession, StreamPool* streamPool,
-                                       EventPool* eventPool)
+                                       bool isIpcSession, XgmiBackend* backend,
+                                       StreamPool* streamPool, EventPool* eventPool)
     : config(config),
       localAddr(localAddr),
       remoteAddr(remoteAddr),
       localDevice(localDevice),
       remoteDevice(remoteDevice),
       isIpcSession(isIpcSession),
+      backend(backend),
       streamPool(streamPool),
       eventPool(eventPool) {}
 
@@ -312,7 +312,9 @@ void XgmiBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
   void* srcBase = isRead ? remoteAddr : localAddr;
   void* dstBase = isRead ? localAddr : remoteAddr;
 
-  bool useKernel = static_cast<int>(segments.size()) > getScatterGatherKernelThreshold();
+  hipFunction_t sgFunc = backend != nullptr ? backend->GetScatterGatherFunc(kernelDevice) : nullptr;
+  bool useKernel =
+      sgFunc != nullptr && static_cast<int>(segments.size()) > getScatterGatherKernelThreshold();
 
   if (useKernel) {
     size_t numSegs = segments.size();
@@ -351,11 +353,13 @@ void XgmiBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
 
       int threadsPerBlock = 256;
       int numBlocks = std::min(static_cast<int>(numSegs), 1024);
-      scatterGatherCopyKernel<<<numBlocks, threadsPerBlock, 0, stream>>>(
-          reinterpret_cast<const char*>(srcBase), reinterpret_cast<char*>(dstBase), dSrcOff,
-          dDstOff, dSizes, static_cast<int>(numSegs));
 
-      err = hipGetLastError();
+      const char* srcPtr = reinterpret_cast<const char*>(srcBase);
+      char* dstPtr = reinterpret_cast<char*>(dstBase);
+      int numSegsInt = static_cast<int>(numSegs);
+      void* kernelArgs[] = {&srcPtr, &dstPtr, &dSrcOff, &dDstOff, &dSizes, &numSegsInt};
+      err = hipModuleLaunchKernel(sgFunc, numBlocks, 1, 1, threadsPerBlock, 1, 1, 0, stream,
+                                  kernelArgs, nullptr);
       if (err != hipSuccess) {
         status->Update(
             StatusCode::ERR_GPU_OP,
@@ -476,6 +480,52 @@ XgmiBackend::~XgmiBackend() {
   }
   remoteIpcHandles.clear();
   localIpcHandles.clear();
+
+  for (auto& mod : scatterGatherModules_) {
+    if (mod != nullptr) {
+      hipModuleUnload(mod);
+    }
+  }
+  scatterGatherModules_.clear();
+  scatterGatherFuncs_.clear();
+}
+
+void XgmiBackend::LoadScatterGatherModule(const std::string& hsacoPath) {
+  scatterGatherHsacoPath_ = hsacoPath;
+  scatterGatherModules_.resize(numDevices, nullptr);
+  scatterGatherFuncs_.resize(numDevices, nullptr);
+  MORI_IO_INFO("XGMI: Scatter/gather kernel registered from {}", hsacoPath);
+}
+
+hipFunction_t XgmiBackend::GetScatterGatherFunc(int deviceId) {
+  if (scatterGatherHsacoPath_.empty() || deviceId < 0 || deviceId >= numDevices) {
+    return nullptr;
+  }
+  if (scatterGatherFuncs_[deviceId] != nullptr) {
+    return scatterGatherFuncs_[deviceId];
+  }
+  ScopedHipDeviceGuard deviceGuard;
+  hipError_t err = hipSetDevice(deviceId);
+  if (err != hipSuccess) {
+    return nullptr;
+  }
+  err = hipModuleLoad(&scatterGatherModules_[deviceId], scatterGatherHsacoPath_.c_str());
+  if (err != hipSuccess) {
+    MORI_IO_WARN("XGMI: Failed to load scatter/gather module on device {}: {}", deviceId,
+                 hipGetErrorString(err));
+    return nullptr;
+  }
+  err = hipModuleGetFunction(&scatterGatherFuncs_[deviceId], scatterGatherModules_[deviceId],
+                             "scatterGatherCopyKernel");
+  if (err != hipSuccess) {
+    MORI_IO_WARN("XGMI: Failed to get scatterGatherCopyKernel on device {}: {}", deviceId,
+                 hipGetErrorString(err));
+    hipModuleUnload(scatterGatherModules_[deviceId]);
+    scatterGatherModules_[deviceId] = nullptr;
+    return nullptr;
+  }
+  MORI_IO_INFO("XGMI: Loaded scatter/gather kernel on device {}", deviceId);
+  return scatterGatherFuncs_[deviceId];
 }
 
 void XgmiBackend::InitializeP2PAccess() {
@@ -723,6 +773,10 @@ BackendSession* XgmiBackend::CreateSession(const MemoryDesc& local, const Memory
   int remoteDevice = remoteDeviceOpt.value();
   void* localAddr = GetRemappedAddress(local, localDevice);
   void* remoteAddr = GetRemappedAddress(remote, localDevice);
+  if (localAddr == nullptr || remoteAddr == nullptr) {
+    MORI_IO_WARN("XGMI: Failed to remap memory (local id={}, remote id={})", local.id, remote.id);
+    return nullptr;
+  }
   bool ipcSession = (remote.engineKey != myEngKey);
 
   if (!IsP2PAccessible(localDevice, remoteDevice)) {
@@ -731,7 +785,7 @@ BackendSession* XgmiBackend::CreateSession(const MemoryDesc& local, const Memory
   }
 
   return new XgmiBackendSession(config, localAddr, remoteAddr, localDevice, remoteDevice,
-                                ipcSession, streamPool.get(), eventPool.get());
+                                ipcSession, this, streamPool.get(), eventPool.get());
 }
 
 XgmiBackendSession* XgmiBackend::GetOrCreateSessionCached(const MemoryDesc& local,
@@ -754,6 +808,13 @@ XgmiBackendSession* XgmiBackend::GetOrCreateSessionCached(const MemoryDesc& loca
   }
   int remoteDevice = remoteDeviceOpt.value();
   void* remoteAddr = GetRemappedAddress(remote, localDevice);
+  if (remoteAddr == nullptr) {
+    MORI_IO_WARN(
+        "XGMI: Failed to remap remote memory for session creation (local.id={}, remote.id={}, "
+        "localDevice={}, remoteDevice={})",
+        local.id, remote.id, localDevice, remoteDevice);
+    return nullptr;
+  }
   bool ipcSession = (remote.engineKey != myEngKey);
 
   if (!IsP2PAccessible(localDevice, remoteDevice)) {
@@ -763,7 +824,7 @@ XgmiBackendSession* XgmiBackend::GetOrCreateSessionCached(const MemoryDesc& loca
 
   auto sess =
       std::make_unique<XgmiBackendSession>(config, localAddr, remoteAddr, localDevice, remoteDevice,
-                                           ipcSession, streamPool.get(), eventPool.get());
+                                           ipcSession, this, streamPool.get(), eventPool.get());
 
   XgmiBackendSession* rawPtr = sess.get();
   sessionCache[key] = std::move(sess);

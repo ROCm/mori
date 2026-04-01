@@ -26,5 +26,9 @@
 
 #include "umbp/local/storage/io/storage_io_driver.h"
 
+namespace mori::umbp {
+
 std::unique_ptr<StorageIoDriver> CreatePosixStorageIoDriver();
 std::unique_ptr<StorageIoDriver> CreateIoUringStorageIoDriver(uint32_t queue_depth);
+
+}  // namespace mori::umbp

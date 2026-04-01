@@ -72,6 +72,8 @@
 #include "umbp/local/storage/ssd_tier.h"
 #include "umbp/local/umbp_client.h"
 
+using namespace mori::umbp;
+
 namespace fs = std::filesystem;
 
 // ---------------------------------------------------------------------------

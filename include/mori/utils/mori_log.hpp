@@ -222,6 +222,7 @@ constexpr const char* IO = "io";
 constexpr const char* SHMEM = "shmem";
 constexpr const char* CORE = "core";
 constexpr const char* OPS = "ops";
+constexpr const char* UMBP = "umbp";
 }  // namespace modules
 
 // Macro helpers
@@ -273,6 +274,13 @@ constexpr const char* OPS = "ops";
 #define MORI_OPS_ERROR(...) MORI_ERROR(mori::modules::OPS, __VA_ARGS__)
 #define MORI_OPS_CRITICAL(...) MORI_CRITICAL(mori::modules::OPS, __VA_ARGS__)
 
+#define MORI_UMBP_TRACE(...) MORI_TRACE(mori::modules::UMBP, __VA_ARGS__)
+#define MORI_UMBP_DEBUG(...) MORI_DEBUG(mori::modules::UMBP, __VA_ARGS__)
+#define MORI_UMBP_INFO(...) MORI_INFO(mori::modules::UMBP, __VA_ARGS__)
+#define MORI_UMBP_WARN(...) MORI_WARN(mori::modules::UMBP, __VA_ARGS__)
+#define MORI_UMBP_ERROR(...) MORI_ERROR(mori::modules::UMBP, __VA_ARGS__)
+#define MORI_UMBP_CRITICAL(...) MORI_CRITICAL(mori::modules::UMBP, __VA_ARGS__)
+
 // Scoped Timer class
 class ScopedTimer {
  public:
@@ -310,6 +318,7 @@ inline void InitializeLogging() {
   logger.InitModule(modules::SHMEM);
   logger.InitModule(modules::CORE);
   logger.InitModule(modules::OPS);
+  logger.InitModule(modules::UMBP);
 }
 
 inline void InitializeLogging(const std::string& globalLevel) {
@@ -366,6 +375,13 @@ inline void InitializeLoggingFromEnv() {
     auto level = logger.LevelFromString(opsLevel);
     logger.SetModuleLevelInternal(modules::OPS, level, true);
     MORI_OPS_INFO("Set OPS log level to {} from MORI_OPS_LOG_LEVEL", opsLevel);
+  }
+
+  const char* umbpLevel = std::getenv("MORI_UMBP_LOG_LEVEL");
+  if (umbpLevel) {
+    auto level = logger.LevelFromString(umbpLevel);
+    logger.SetModuleLevelInternal(modules::UMBP, level, true);
+    MORI_UMBP_INFO("Set UMBP log level to {} from MORI_UMBP_LOG_LEVEL", umbpLevel);
   }
 
   // Check for log pattern override

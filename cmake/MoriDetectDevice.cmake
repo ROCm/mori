@@ -135,7 +135,10 @@ endfunction()
 # ---------------------------------------------------------------------------
 function(_mori_detect_device_nic out_var)
   # Find NIC libraries (needed for validation)
-  find_library(_mori_bnxt_re_lib NAMES bnxt_re)
+  find_library(
+    _mori_bnxt_re_lib
+    NAMES bnxt_re bnxt_re-rdmav34
+    HINTS /usr/local/lib)
   find_library(
     _mori_ionic_lib
     NAMES ionic

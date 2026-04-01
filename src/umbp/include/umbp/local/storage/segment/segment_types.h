@@ -28,7 +28,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
-namespace segment {
+namespace mori::umbp::segment {
 
 struct KeyMeta {
   uint64_t segment_id = 0;
@@ -56,4 +56,4 @@ struct WriteReservation {
   uint64_t previous_write_offset = 0;
 };
 
-}  // namespace segment
+}  // namespace mori::umbp::segment

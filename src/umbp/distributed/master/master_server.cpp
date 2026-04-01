@@ -22,13 +22,13 @@
 #include "umbp/distributed/master/master_server.h"
 
 #include <grpcpp/grpcpp.h>
-#include <spdlog/spdlog.h>
 
 #include <chrono>
 #include <cstdint>
 #include <string>
 #include <vector>
 
+#include "mori/utils/mori_log.hpp"
 #include "umbp.grpc.pb.h"
 #include "umbp/distributed/routing/router.h"
 
@@ -120,8 +120,8 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     ClientStatus status = registry_.Heartbeat(request->node_id(), caps);
     response->set_status(static_cast<::umbp::ClientStatus>(status));
 
-    spdlog::info("[Master] Heartbeat received: node_id={}, tiers={}, status={}", request->node_id(),
-                 request->tier_capacities_size(), ClientStatusName(status));
+    MORI_UMBP_INFO("[Master] Heartbeat received: node_id={}, tiers={}, status={}",
+                   request->node_id(), request->tier_capacities_size(), ClientStatusName(status));
 
     return grpc::Status::OK;
   }
@@ -144,9 +144,9 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     }
 
     index_.Register(request->node_id(), request->key(), location);
-    spdlog::info("[Master] Register key: node_id={}, key={}, location_id={}, size={}, tier={}",
-                 request->node_id(), request->key(), location.location_id, location.size,
-                 TierTypeName(location.tier));
+    MORI_UMBP_INFO("[Master] Register key: node_id={}, key={}, location_id={}, size={}, tier={}",
+                   request->node_id(), request->key(), location.location_id, location.size,
+                   TierTypeName(location.tier));
     return grpc::Status::OK;
   }
 
@@ -189,8 +189,59 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
                                         location.size);
     }
 
-    spdlog::info("[Master] Unregister key: node_id={}, key={}, location_id={}, removed={}",
-                 request->node_id(), request->key(), location.location_id, response->removed());
+    MORI_UMBP_INFO("[Master] Unregister key: node_id={}, key={}, location_id={}, removed={}",
+                   request->node_id(), request->key(), location.location_id, response->removed());
+    return grpc::Status::OK;
+  }
+
+  grpc::Status FinalizeAllocation(grpc::ServerContext* /*context*/,
+                                  const ::umbp::FinalizeRequest* request,
+                                  ::umbp::FinalizeResponse* response) override {
+    if (request->node_id().empty() || request->key().empty() || request->allocation_id().empty()) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                          "node_id/key/allocation_id cannot be empty");
+    }
+
+    Location location = ToLocation(request->location());
+    if (location.node_id.empty()) {
+      location.node_id = request->node_id();
+    }
+
+    const bool finalized = registry_.FinalizeAllocation(request->node_id(), request->key(),
+                                                        location, request->allocation_id());
+    response->set_finalized(finalized);
+    return grpc::Status::OK;
+  }
+
+  grpc::Status PublishLocalBlock(grpc::ServerContext* /*context*/,
+                                 const ::umbp::PublishRequest* request,
+                                 ::umbp::PublishResponse* response) override {
+    if (request->node_id().empty() || request->key().empty()) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "node_id/key cannot be empty");
+    }
+
+    Location location = ToLocation(request->location());
+    if (location.node_id.empty()) {
+      location.node_id = request->node_id();
+    }
+
+    const bool published =
+        registry_.PublishLocalBlock(request->node_id(), request->key(), location);
+    response->set_published(published);
+    return grpc::Status::OK;
+  }
+
+  grpc::Status AbortAllocation(grpc::ServerContext* /*context*/,
+                               const ::umbp::AbortAllocationRequest* request,
+                               ::umbp::AbortAllocationResponse* response) override {
+    if (request->node_id().empty() || request->allocation_id().empty()) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                          "node_id/allocation_id cannot be empty");
+    }
+
+    const bool aborted =
+        registry_.AbortAllocation(request->node_id(), request->allocation_id(), request->size());
+    response->set_aborted(aborted);
     return grpc::Status::OK;
   }
 
@@ -232,8 +283,8 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
                                      io_info->dram_memory_desc_bytes.size());
     }
 
-    spdlog::info("[Master] RouteGet key='{}': node={}, location={}", request->key(),
-                 result->node_id, result->location_id);
+    MORI_UMBP_INFO("[Master] RouteGet key='{}': node={}, location={}", request->key(),
+                   result->node_id, result->location_id);
     return grpc::Status::OK;
   }
 
@@ -259,10 +310,11 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
                                    result->dram_memory_desc_bytes.size());
     response->set_allocated_offset(result->allocated_offset);
     response->set_buffer_index(result->buffer_index);
+    response->set_allocation_id(result->allocation_id);
 
-    spdlog::info("[Master] RoutePut key='{}': target_node={}, tier={}, buffer={}, offset={}",
-                 request->key(), result->node_id, TierTypeName(result->tier), result->buffer_index,
-                 result->allocated_offset);
+    MORI_UMBP_INFO("[Master] RoutePut key='{}': target_node={}, tier={}, buffer={}, offset={}",
+                   request->key(), result->node_id, TierTypeName(result->tier),
+                   result->buffer_index, result->allocated_offset);
     return grpc::Status::OK;
   }
 
@@ -296,7 +348,7 @@ void MasterServer::Run() {
   builder.RegisterService(service_.get());
   server_ = builder.BuildAndStart();
 
-  spdlog::info("[Master] Listening on {}", config_.listen_address);
+  MORI_UMBP_INFO("[Master] Listening on {}", config_.listen_address);
   server_->Wait();
 }
 
@@ -304,7 +356,7 @@ void MasterServer::Shutdown() {
   if (server_) {
     // Use a deadline so Wait() unblocks even if RPCs do not drain quickly.
     const auto deadline = std::chrono::system_clock::now() + std::chrono::seconds(3);
-    spdlog::info("[Master] Shutting down");
+    MORI_UMBP_INFO("[Master] Shutting down");
     server_->Shutdown(deadline);
     server_.reset();
   }

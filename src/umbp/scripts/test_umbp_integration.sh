@@ -5,15 +5,20 @@ set -e
 # Launches docker container, rebuilds mori with UMBP, and runs hicache benchmarks.
 #
 # Usage:
-#   bash test_umbp_integration.sh [branch]
-#   bash test_umbp_integration.sh feat_ump_dist
+#   bash test_umbp_integration.sh [branch] [storage_mode] [sglang_branch] [parallelism_mode] [home_dir]
+#   bash test_umbp_integration.sh feat_umbp_pool distributed feat/umbp-monitoring-dist dp_ep /home/ditian12
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MORI_BRANCH="${1:-main}"
+STORAGE_MODE="${2:-local}"
+SGLANG_BRANCH="${3:-main}"
+PARALLELISM_MODE="${4:-dp_ep}"
+HOST_HOME_DIR="${5:-/home/ditian12}"
 IMAGE_NAME=rocm/pytorch-private:sglang-0.5.9-rocm700-mi35x-20260316-hicache
 
 echo "=== UMBP Integration Test ==="
 echo "Image: ${IMAGE_NAME}"
+echo "Storage mode: ${STORAGE_MODE}"
 
 sudo docker run -i \
     --ulimit memlock=-1:-1 \
@@ -32,8 +37,8 @@ sudo docker run -i \
     -v /apps/data/models/:/models \
     -v /nfsdata/DeepSeek-R1:/nfsdata/DeepSeek-R1 \
     -v /apps:/apps \
-    -v /home/ditian12:/home/ditian12 \
+    -v "${HOST_HOME_DIR}:${HOST_HOME_DIR}" \
     -v /it-share:/it-share \
     -v /usr/sbin/nicctl:/usr/sbin/nicctl \
     --shm-size 32G \
-    ${IMAGE_NAME} /bin/bash "${SCRIPT_DIR}/test_umbp_inner.sh" "${MORI_BRANCH}"
+    ${IMAGE_NAME} /bin/bash "${SCRIPT_DIR}/test_umbp_inner.sh" "${MORI_BRANCH}" "${STORAGE_MODE}" "${SGLANG_BRANCH}" "${PARALLELISM_MODE}"

@@ -520,7 +520,7 @@ __device__ void EpCombineLowLatencyAsyncSendTransfer_body(EpDispatchCombineArgs<
     for (int qpId = warpId; qpId < config.numQpPerPe; qpId += warpNum) {
       int tokenNum = 0;
       if (laneId == 0) {
-        tokenNum = recvTokenNums[destPe * config.numQpPerPe + qpId];
+        tokenNum = recvTokenNums[destPe * config.numQpPerPe + qpId] - 1;
         core::AtomicStoreRelaxedSystem(&recvTokenNums[destPe * config.numQpPerPe + qpId],
                                        uint64_t{0});
       }

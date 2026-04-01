@@ -37,6 +37,8 @@
 #include "umbp/local/storage/segment/segment_writer.h"
 #include "umbp/local/storage/tier_backend.h"
 
+namespace mori::umbp {
+
 enum class SSDAccessMode : int {
   ReadWrite = 0,
   ReadOnlyShared = 1,
@@ -73,6 +75,7 @@ class SSDTier : public TierBackend {
   std::string GetLRUKey() const override;
   std::vector<std::string> GetLRUCandidates(size_t max_candidates) const override;
   const IoStatus& LastIoStatus() const { return last_io_status_; }
+  std::optional<std::string> GetLocationId(const std::string& key) const override;
 
  private:
   bool IsReadOnlyShared() const { return access_mode_ == SSDAccessMode::ReadOnlyShared; }
@@ -104,3 +107,5 @@ class SSDTier : public TierBackend {
   std::unique_ptr<segment::Writer> writer_;
   mutable IoStatus last_io_status_;
 };
+
+}  // namespace mori::umbp

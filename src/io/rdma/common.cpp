@@ -21,7 +21,6 @@
 // SOFTWARE.
 #include "src/io/rdma/common.hpp"
 
-#include <cassert>
 #include <chrono>
 #include <cstdlib>
 #include <limits>
@@ -33,6 +32,15 @@
 
 namespace mori {
 namespace io {
+
+uint64_t MakeNotifSendWrId(TransferUniqueId id) {
+  if ((id & kNotifSendWrIdTag) != 0) {
+    MORI_IO_ERROR("MakeNotifSendWrId: TransferUniqueId {} has bit 63 set; masking reserved tag",
+                  id);
+    id &= ~kNotifSendWrIdTag;
+  }
+  return kNotifSendWrIdTag | id;
+}
 
 // SQ depth is an admission counter only. It does not publish data dependencies
 // across threads, so relaxed atomics are sufficient for correctness.
@@ -136,7 +144,7 @@ RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* status, Trans
     sge.lkey = 0;
 
     struct ibv_send_wr wr{};
-    wr.wr_id = id;
+    wr.wr_id = MakeNotifSendWrId(id);
     wr.opcode = IBV_WR_SEND;
     wr.send_flags = IBV_SEND_INLINE | IBV_SEND_SIGNALED;
     wr.sg_list = &sge;

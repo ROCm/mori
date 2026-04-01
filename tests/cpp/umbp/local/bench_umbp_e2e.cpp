@@ -52,6 +52,8 @@
 
 #include "umbp/local/umbp_client.h"
 
+using namespace mori::umbp;
+
 static double NowSec() {
   auto tp = std::chrono::steady_clock::now();
   return std::chrono::duration<double>(tp.time_since_epoch()).count();

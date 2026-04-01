@@ -39,6 +39,8 @@
 #include "umbp/common/config.h"
 #include "umbp/local/storage/spdk_proxy_tier.h"
 
+using namespace mori::umbp;
+
 static double NowSec() {
   auto tp = std::chrono::steady_clock::now();
   return std::chrono::duration<double>(tp.time_since_epoch()).count();

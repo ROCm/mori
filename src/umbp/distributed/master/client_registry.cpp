@@ -21,10 +21,9 @@
 // SOFTWARE.
 #include "umbp/distributed/master/client_registry.h"
 
-#include <spdlog/spdlog.h>
-
 #include <algorithm>
 
+#include "mori/utils/mori_log.hpp"
 #include "umbp/distributed/master/global_block_index.h"
 
 namespace mori::umbp {
@@ -39,6 +38,61 @@ ClientRegistry::~ClientRegistry() { StopReaper(); }
 void ClientRegistry::SetBlockIndex(GlobalBlockIndex* index) {
   std::unique_lock lock(mutex_);
   index_ = index;
+}
+
+uint32_t ClientRegistry::ParseBufferIndex(const std::string& location_id) {
+  auto colon = location_id.find(':');
+  if (colon == std::string::npos) {
+    return 0;
+  }
+  try {
+    return static_cast<uint32_t>(std::stoul(location_id.substr(0, colon)));
+  } catch (...) {
+    return 0;
+  }
+}
+
+void ClientRegistry::UpdateAvailableBytesLocked(ClientRecord& record, TierType tier) {
+  uint64_t total_avail = 0;
+  if (tier == TierType::DRAM || tier == TierType::HBM) {
+    for (auto& alloc : record.dram_allocators) {
+      total_avail += alloc.AvailableBytes();
+    }
+  } else if (tier == TierType::SSD) {
+    for (auto& alloc : record.ssd_allocators) {
+      total_avail += alloc.AvailableBytes();
+    }
+  }
+  record.tier_capacities[tier].available_bytes = total_avail;
+}
+
+void ClientRegistry::ReleasePendingAllocationsForNodeLocked(const std::string& node_id) {
+  auto it = pending_allocations_.begin();
+  while (it != pending_allocations_.end()) {
+    if (it->second.node_id != node_id) {
+      ++it;
+      continue;
+    }
+
+    auto client_it = clients_.find(node_id);
+    if (client_it != clients_.end()) {
+      auto& record = client_it->second;
+      if (it->second.tier == TierType::DRAM || it->second.tier == TierType::HBM) {
+        if (it->second.buffer_index < record.dram_allocators.size()) {
+          record.dram_allocators[it->second.buffer_index].Deallocate(it->second.offset,
+                                                                     it->second.size);
+          UpdateAvailableBytesLocked(record, it->second.tier);
+        }
+      } else if (it->second.tier == TierType::SSD) {
+        if (it->second.buffer_index < record.ssd_allocators.size()) {
+          record.ssd_allocators[it->second.buffer_index].Deallocate(it->second.offset,
+                                                                    it->second.size);
+          UpdateAvailableBytesLocked(record, it->second.tier);
+        }
+      }
+    }
+    it = pending_allocations_.erase(it);
+  }
 }
 
 bool ClientRegistry::RegisterClient(
@@ -57,13 +111,14 @@ bool ClientRegistry::RegisterClient(
                             (it->second.status == ClientStatus::EXPIRED);
 
     if (it->second.status == ClientStatus::ALIVE && !is_expired) {
-      spdlog::warn("[Registry] Rejecting re-registration for alive node: {}", node_id);
+      MORI_UMBP_WARN("[Registry] Rejecting re-registration for alive node: {}", node_id);
       return false;
     }
 
+    ReleasePendingAllocationsForNodeLocked(node_id);
     it->second.status = ClientStatus::EXPIRED;
     client_keys_.erase(node_id);
-    spdlog::info("[Registry] Re-registering expired node: {}", node_id);
+    MORI_UMBP_INFO("[Registry] Re-registering expired node: {}", node_id);
   }
 
   ClientRecord record;
@@ -77,19 +132,28 @@ bool ClientRegistry::RegisterClient(
   record.engine_desc_bytes = engine_desc_bytes;
   record.dram_memory_desc_bytes_list = dram_memory_desc_bytes_list;
 
+  const bool enable_remote_dram =
+      std::any_of(tier_capacities.begin(), tier_capacities.end(), [](const auto& entry) {
+        const auto tier = entry.first;
+        const auto& cap = entry.second;
+        return (tier == TierType::HBM || tier == TierType::DRAM) && cap.total_bytes > 0 &&
+               cap.available_bytes > 0;
+      });
+
   // Per-buffer DRAM allocators
-  if (!dram_buffer_sizes.empty()) {
+  if (!dram_buffer_sizes.empty() && enable_remote_dram) {
     for (size_t i = 0; i < dram_buffer_sizes.size(); ++i) {
       PoolAllocator alloc;
       alloc.total_size = dram_buffer_sizes[i];
       alloc.offset_tracker = PoolAllocator::OffsetTracker{};
       record.dram_allocators.push_back(std::move(alloc));
     }
-  } else {
+  } else if (enable_remote_dram) {
     // Backward compat: single allocator from tier_capacities (DRAM or HBM)
     for (auto check_tier : {TierType::HBM, TierType::DRAM}) {
       auto cap_it = tier_capacities.find(check_tier);
-      if (cap_it != tier_capacities.end() && cap_it->second.total_bytes > 0) {
+      if (cap_it != tier_capacities.end() && cap_it->second.total_bytes > 0 &&
+          cap_it->second.available_bytes > 0) {
         PoolAllocator alloc;
         alloc.total_size = cap_it->second.total_bytes;
         alloc.offset_tracker = PoolAllocator::OffsetTracker{};
@@ -118,13 +182,13 @@ bool ClientRegistry::RegisterClient(
   clients_[node_id] = std::move(record);
   client_keys_[node_id];
 
-  spdlog::info("[Registry] Registered node: {} at {} (dram_buffers={}, ssd_stores={})", node_id,
-               node_address,
-               dram_buffer_sizes.empty() ? (tier_capacities.count(TierType::DRAM) ? 1u : 0u)
-                                         : static_cast<unsigned>(dram_buffer_sizes.size()),
-               static_cast<unsigned>(ssd_store_capacities.empty()
-                                         ? (tier_capacities.count(TierType::SSD) ? 1u : 0u)
-                                         : ssd_store_capacities.size()));
+  MORI_UMBP_INFO("[Registry] Registered node: {} at {} (dram_buffers={}, ssd_stores={})", node_id,
+                 node_address,
+                 dram_buffer_sizes.empty() ? (tier_capacities.count(TierType::DRAM) ? 1u : 0u)
+                                           : static_cast<unsigned>(dram_buffer_sizes.size()),
+                 static_cast<unsigned>(ssd_store_capacities.empty()
+                                           ? (tier_capacities.count(TierType::SSD) ? 1u : 0u)
+                                           : ssd_store_capacities.size()));
   return true;
 }
 
@@ -146,6 +210,8 @@ size_t ClientRegistry::UnregisterClient(const std::string& node_id) {
       client_keys_.erase(keys_it);
     }
 
+    ReleasePendingAllocationsForNodeLocked(node_id);
+
     clients_.erase(it);
   }
 
@@ -155,22 +221,22 @@ size_t ClientRegistry::UnregisterClient(const std::string& node_id) {
     }
   }
 
-  spdlog::info("[Registry] Unregistered node: {} (keys_removed={})", node_id, keys_removed);
+  MORI_UMBP_INFO("[Registry] Unregistered node: {} (keys_removed={})", node_id, keys_removed);
   return keys_removed;
 }
 
 // PA-3 fix: exclusive lock because we mutate last_heartbeat and tier_capacities
 ClientStatus ClientRegistry::Heartbeat(const std::string& node_id,
                                        const std::map<TierType, TierCapacity>& tier_capacities) {
+  (void)tier_capacities;
   std::unique_lock lock(mutex_);
   auto it = clients_.find(node_id);
   if (it == clients_.end()) {
-    spdlog::warn("[Registry] Heartbeat from unknown node: {}", node_id);
+    MORI_UMBP_WARN("[Registry] Heartbeat from unknown node: {}", node_id);
     return ClientStatus::UNKNOWN;
   }
 
   it->second.last_heartbeat = std::chrono::steady_clock::now();
-  it->second.tier_capacities = tier_capacities;
   it->second.status = ClientStatus::ALIVE;
 
   return ClientStatus::ALIVE;
@@ -254,17 +320,25 @@ std::optional<AllocateResult> ClientRegistry::AllocateForPut(const std::string& 
     for (uint32_t i = 0; i < record.dram_allocators.size(); ++i) {
       auto offset = record.dram_allocators[i].Allocate(size);
       if (offset) {
-        uint64_t total_avail = 0;
-        for (auto& a : record.dram_allocators) total_avail += a.AvailableBytes();
-        record.tier_capacities[tier].available_bytes = total_avail;
+        UpdateAvailableBytesLocked(record, tier);
 
         AllocateResult result;
+        result.allocation_id =
+            record.node_id + ":" + std::to_string(next_allocation_id_.fetch_add(1));
         result.peer_address = record.peer_address;
         result.engine_desc_bytes = record.engine_desc_bytes;
         if (i < record.dram_memory_desc_bytes_list.size())
           result.dram_memory_desc_bytes = record.dram_memory_desc_bytes_list[i];
         result.allocated_offset = *offset;
         result.buffer_index = i;
+        pending_allocations_[result.allocation_id] =
+            PendingAllocation{result.allocation_id,
+                              record.node_id,
+                              tier,
+                              i,
+                              *offset,
+                              size,
+                              std::chrono::steady_clock::now()};
         return result;
       }
     }
@@ -275,17 +349,25 @@ std::optional<AllocateResult> ClientRegistry::AllocateForPut(const std::string& 
     for (uint32_t i = 0; i < record.ssd_allocators.size(); ++i) {
       auto offset = record.ssd_allocators[i].Allocate(size);
       if (offset) {
-        uint64_t total_avail = 0;
-        for (auto& a : record.ssd_allocators) total_avail += a.AvailableBytes();
-        record.tier_capacities[tier].available_bytes = total_avail;
+        UpdateAvailableBytesLocked(record, tier);
 
         AllocateResult result;
+        result.allocation_id =
+            record.node_id + ":" + std::to_string(next_allocation_id_.fetch_add(1));
         result.peer_address = record.peer_address;
         result.engine_desc_bytes = record.engine_desc_bytes;
         if (!record.dram_memory_desc_bytes_list.empty())
           result.dram_memory_desc_bytes = record.dram_memory_desc_bytes_list[0];
         result.allocated_offset = 0;
         result.buffer_index = i;
+        pending_allocations_[result.allocation_id] =
+            PendingAllocation{result.allocation_id,
+                              record.node_id,
+                              tier,
+                              i,
+                              0,
+                              size,
+                              std::chrono::steady_clock::now()};
         return result;
       }
     }
@@ -309,18 +391,114 @@ void ClientRegistry::DeallocateForUnregister(const std::string& node_id, TierTyp
   if (tier == TierType::DRAM || tier == TierType::HBM) {
     if (buffer_index < record.dram_allocators.size()) {
       record.dram_allocators[buffer_index].Deallocate(offset, size);
-      uint64_t total_avail = 0;
-      for (auto& a : record.dram_allocators) total_avail += a.AvailableBytes();
-      record.tier_capacities[tier].available_bytes = total_avail;
+      UpdateAvailableBytesLocked(record, tier);
     }
   } else if (tier == TierType::SSD) {
     if (buffer_index < record.ssd_allocators.size()) {
       record.ssd_allocators[buffer_index].Deallocate(offset, size);
-      uint64_t total_avail = 0;
-      for (auto& a : record.ssd_allocators) total_avail += a.AvailableBytes();
-      record.tier_capacities[tier].available_bytes = total_avail;
+      UpdateAvailableBytesLocked(record, tier);
     }
   }
+}
+
+bool ClientRegistry::FinalizeAllocation(const std::string& node_id, const std::string& key,
+                                        const Location& location,
+                                        const std::string& allocation_id) {
+  if (key.empty() || allocation_id.empty()) {
+    return false;
+  }
+
+  {
+    std::unique_lock lock(mutex_);
+    auto client_it = clients_.find(node_id);
+    if (client_it == clients_.end() || client_it->second.status != ClientStatus::ALIVE) {
+      return false;
+    }
+
+    auto pending_it = pending_allocations_.find(allocation_id);
+    if (pending_it == pending_allocations_.end()) {
+      return false;
+    }
+    if (pending_it->second.node_id != node_id) {
+      return false;
+    }
+
+    pending_allocations_.erase(pending_it);
+  }
+
+  if (index_ != nullptr) {
+    index_->Register(node_id, key, location);
+  }
+  return true;
+}
+
+bool ClientRegistry::PublishLocalBlock(const std::string& node_id, const std::string& key,
+                                       const Location& location) {
+  if (key.empty()) {
+    return false;
+  }
+
+  {
+    std::unique_lock lock(mutex_);
+    auto client_it = clients_.find(node_id);
+    if (client_it == clients_.end() || client_it->second.status != ClientStatus::ALIVE) {
+      return false;
+    }
+
+    if (location.tier == TierType::SSD) {
+      uint32_t buffer_index = ParseBufferIndex(location.location_id);
+      if (buffer_index >= client_it->second.ssd_allocators.size()) {
+        return false;
+      }
+      auto reserved = client_it->second.ssd_allocators[buffer_index].Allocate(location.size);
+      if (!reserved.has_value()) {
+        return false;
+      }
+      UpdateAvailableBytesLocked(client_it->second, TierType::SSD);
+    }
+  }
+
+  if (index_ != nullptr) {
+    index_->Register(node_id, key, location);
+  }
+  return true;
+}
+
+bool ClientRegistry::AbortAllocation(const std::string& node_id, const std::string& allocation_id,
+                                     uint64_t size) {
+  (void)size;
+  std::unique_lock lock(mutex_);
+  auto pending_it = pending_allocations_.find(allocation_id);
+  if (pending_it == pending_allocations_.end()) {
+    return false;
+  }
+  if (pending_it->second.node_id != node_id) {
+    return false;
+  }
+
+  auto client_it = clients_.find(node_id);
+  if (client_it == clients_.end()) {
+    pending_allocations_.erase(pending_it);
+    return false;
+  }
+
+  auto pending = pending_it->second;
+  pending_allocations_.erase(pending_it);
+
+  if (pending.tier == TierType::DRAM || pending.tier == TierType::HBM) {
+    if (pending.buffer_index < client_it->second.dram_allocators.size()) {
+      client_it->second.dram_allocators[pending.buffer_index].Deallocate(pending.offset,
+                                                                         pending.size);
+      UpdateAvailableBytesLocked(client_it->second, pending.tier);
+    }
+  } else if (pending.tier == TierType::SSD) {
+    if (pending.buffer_index < client_it->second.ssd_allocators.size()) {
+      client_it->second.ssd_allocators[pending.buffer_index].Deallocate(pending.offset,
+                                                                        pending.size);
+      UpdateAvailableBytesLocked(client_it->second, pending.tier);
+    }
+  }
+  return true;
 }
 
 std::optional<ClientIOInfo> ClientRegistry::GetClientIOInfo(const std::string& node_id,
@@ -345,8 +523,8 @@ std::optional<ClientIOInfo> ClientRegistry::GetClientIOInfo(const std::string& n
 void ClientRegistry::StartReaper() {
   reaper_running_ = true;
   reaper_thread_ = std::thread(&ClientRegistry::ReaperLoop, this);
-  spdlog::info("[Reaper] Started (interval={}s, expiry={}s)", config_.reaper_interval.count(),
-               ExpiryDuration().count());
+  MORI_UMBP_INFO("[Reaper] Started (interval={}s, expiry={}s)", config_.reaper_interval.count(),
+                 ExpiryDuration().count());
 }
 
 void ClientRegistry::StopReaper() {
@@ -356,7 +534,7 @@ void ClientRegistry::StopReaper() {
     if (reaper_thread_.joinable()) {
       reaper_thread_.join();
     }
-    spdlog::info("[Reaper] Stopped");
+    MORI_UMBP_INFO("[Reaper] Stopped");
   }
 }
 
@@ -371,6 +549,7 @@ void ClientRegistry::ReaperLoop() {
       break;
     }
     ReapExpiredClients();
+    ReapExpiredPendingAllocations();
   }
 }
 
@@ -386,7 +565,7 @@ void ClientRegistry::ReapExpiredClients() {
     while (it != clients_.end()) {
       if (now - it->second.last_heartbeat > expiry) {
         const std::string dead_id = it->first;
-        spdlog::warn("[Reaper] Reaping expired client: {}", dead_id);
+        MORI_UMBP_WARN("[Reaper] Reaping expired client: {}", dead_id);
 
         std::vector<std::string> keys_to_cleanup;
         auto keys_it = client_keys_.find(dead_id);
@@ -394,6 +573,8 @@ void ClientRegistry::ReapExpiredClients() {
           keys_to_cleanup.assign(keys_it->second.begin(), keys_it->second.end());
           client_keys_.erase(keys_it);
         }
+
+        ReleasePendingAllocationsForNodeLocked(dead_id);
 
         reap_cleanup.emplace_back(dead_id, std::move(keys_to_cleanup));
         it = clients_.erase(it);  // returns next valid iterator
@@ -409,6 +590,38 @@ void ClientRegistry::ReapExpiredClients() {
         index_->UnregisterByNode(key, dead_id);
       }
     }
+  }
+}
+
+void ClientRegistry::ReapExpiredPendingAllocations() {
+  const auto now = std::chrono::steady_clock::now();
+  std::unique_lock lock(mutex_);
+  auto it = pending_allocations_.begin();
+  while (it != pending_allocations_.end()) {
+    if (now - it->second.allocated_at <= config_.allocation_ttl) {
+      ++it;
+      continue;
+    }
+
+    auto client_it = clients_.find(it->second.node_id);
+    if (client_it != clients_.end()) {
+      if (it->second.tier == TierType::DRAM || it->second.tier == TierType::HBM) {
+        if (it->second.buffer_index < client_it->second.dram_allocators.size()) {
+          client_it->second.dram_allocators[it->second.buffer_index].Deallocate(it->second.offset,
+                                                                                it->second.size);
+          UpdateAvailableBytesLocked(client_it->second, it->second.tier);
+        }
+      } else if (it->second.tier == TierType::SSD) {
+        if (it->second.buffer_index < client_it->second.ssd_allocators.size()) {
+          client_it->second.ssd_allocators[it->second.buffer_index].Deallocate(it->second.offset,
+                                                                               it->second.size);
+          UpdateAvailableBytesLocked(client_it->second, it->second.tier);
+        }
+      }
+    }
+
+    MORI_UMBP_WARN("[Reaper] Expired pending allocation: id={}", it->second.allocation_id);
+    it = pending_allocations_.erase(it);
   }
 }
 

@@ -20,7 +20,6 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 #include <pthread.h>
-#include <spdlog/spdlog.h>
 
 #include <atomic>
 #include <cerrno>
@@ -29,11 +28,10 @@
 #include <ctime>
 #include <thread>
 
+#include "mori/utils/mori_log.hpp"
 #include "umbp/distributed/master/master_server.h"
 
 int main(int argc, char** argv) {
-  spdlog::set_level(spdlog::level::info);
-
   std::string address = "0.0.0.0:50051";
   if (argc > 1) {
     address = argv[1];
@@ -54,7 +52,7 @@ int main(int argc, char** argv) {
   // receive them via sigtimedwait.
   const int block_rc = pthread_sigmask(SIG_BLOCK, &signal_set, nullptr);
   if (block_rc != 0) {
-    spdlog::error("[Master] Failed to block signals: {}", std::strerror(block_rc));
+    MORI_UMBP_ERROR("[Master] Failed to block signals: {}", std::strerror(block_rc));
     return 1;
   }
 
@@ -67,23 +65,23 @@ int main(int argc, char** argv) {
 
       const int signum = sigtimedwait(&signal_set, nullptr, &timeout);
       if (signum == SIGINT || signum == SIGTERM) {
-        spdlog::info("[Master] Caught signal {}, shutting down", signum);
+        MORI_UMBP_INFO("[Master] Caught signal {}, shutting down", signum);
         server.Shutdown();
         return;
       }
       if (signum == -1 && errno != EAGAIN && errno != EINTR) {
-        spdlog::error("[Master] sigtimedwait failed: {}", std::strerror(errno));
+        MORI_UMBP_ERROR("[Master] sigtimedwait failed: {}", std::strerror(errno));
         return;
       }
     }
   });
 
-  spdlog::info("[Master] Starting UMBP master on {}", address);
+  MORI_UMBP_INFO("[Master] Starting UMBP master on {}", address);
   server.Run();  // blocks until Shutdown
 
   stop_signal_waiter = true;
   signal_waiter.join();
 
-  spdlog::info("[Master] Exited cleanly");
+  MORI_UMBP_INFO("[Master] Exited cleanly");
   return 0;
 }

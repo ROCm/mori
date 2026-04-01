@@ -43,12 +43,15 @@
 #define CPU_PAUSE() ((void)0)
 #endif
 
+namespace mori {
+namespace umbp {
+
 // ---------------------------------------------------------------------------
 // Construction / destruction
 // ---------------------------------------------------------------------------
 SpdkSsdTier::DmaPool::~DmaPool() {
   if (!bufs || count <= 0) return;
-  auto& env = umbp::SpdkEnv::Instance();
+  auto& env = ::umbp::SpdkEnv::Instance();
   if (env.IsInitialized()) {
     env.DmaPoolFreeBatch(bufs, buf_size, count);
   }
@@ -60,7 +63,7 @@ SpdkSsdTier::DmaPool::~DmaPool() {
 SpdkSsdTier::SharedDmaPool SpdkSsdTier::CreateSharedDmaPool(size_t buf_size, int count) {
   if (count <= 0 || buf_size == 0) return nullptr;
 
-  auto& env = umbp::SpdkEnv::Instance();
+  auto& env = ::umbp::SpdkEnv::Instance();
   if (!env.IsInitialized()) return nullptr;
 
   auto pool = std::make_shared<DmaPool>();
@@ -95,9 +98,9 @@ SpdkSsdTier::SpdkSsdTier(const UMBPConfig& config)
 SpdkSsdTier::SpdkSsdTier(const UMBPConfig& config, uint64_t base_offset, size_t capacity_bytes,
                          SharedDmaPool shared_dma_pool)
     : TierBackend(StorageTier::LOCAL_SSD) {
-  auto& env = umbp::SpdkEnv::Instance();
+  auto& env = ::umbp::SpdkEnv::Instance();
   if (!env.IsInitialized()) {
-    umbp::SpdkEnvConfig ecfg;
+    ::umbp::SpdkEnvConfig ecfg;
     ecfg.bdev_name = config.spdk_bdev_name;
     ecfg.reactor_mask = config.spdk_reactor_mask;
     ecfg.mem_size_mb = config.spdk_mem_size_mb;
@@ -130,8 +133,8 @@ SpdkSsdTier::SpdkSsdTier(const UMBPConfig& config, uint64_t base_offset, size_t 
     return;
   }
 
-  allocator_ =
-      umbp::offset_allocator::OffsetAllocator::createAligned(base_offset_, capacity_, block_size_);
+  allocator_ = ::umbp::offset_allocator::OffsetAllocator::createAligned(base_offset_, capacity_,
+                                                                        block_size_);
   if (!allocator_) {
     UMBP_LOG_ERROR("SpdkSsdTier: OffsetAllocator creation failed");
     return;
@@ -449,7 +452,7 @@ std::vector<bool> SpdkSsdTier::BatchWrite(const std::vector<std::string>& keys,
   std::vector<bool> results(count, false);
   if (!initialized_ || count == 0) return results;
 
-  auto& env = umbp::SpdkEnv::Instance();
+  auto& env = ::umbp::SpdkEnv::Instance();
   auto pool = EnsureDmaPool();
   if (!pool || pool->count <= 0) return results;
 
@@ -499,8 +502,8 @@ std::vector<bool> SpdkSsdTier::BatchWrite(const std::vector<std::string>& keys,
     int bufs_per = pool->count / num_workers;
 
     auto run_pipeline = [&](int c_begin, int c_end, void** bufs, int local_qd) {
-      auto lreqs = std::make_unique<umbp::SpdkIoRequest[]>(local_qd);
-      auto lbatch = std::make_unique<umbp::SpdkIoRequest*[]>(local_qd);
+      auto lreqs = std::make_unique<::umbp::SpdkIoRequest[]>(local_qd);
+      auto lbatch = std::make_unique<::umbp::SpdkIoRequest*[]>(local_qd);
       int head = c_begin, tail = c_begin;
 
       while (tail < c_end) {
@@ -516,7 +519,7 @@ std::vector<bool> SpdkSsdTier::BatchWrite(const std::vector<std::string>& keys,
             std::memset(static_cast<char*>(bufs[slot]) + c.data_bytes, 0, c.nbytes - c.data_bytes);
 
           auto& req = lreqs[slot];
-          req.op = umbp::SpdkIoRequest::WRITE;
+          req.op = ::umbp::SpdkIoRequest::WRITE;
           req.buf = bufs[slot];
           req.offset = c.offset;
           req.nbytes = c.nbytes;
@@ -590,7 +593,7 @@ std::vector<bool> SpdkSsdTier::BatchWriteStreaming(const std::vector<std::string
   std::vector<bool> results(count, false);
   if (!initialized_ || count == 0) return results;
 
-  auto& env = umbp::SpdkEnv::Instance();
+  auto& env = ::umbp::SpdkEnv::Instance();
   auto pool = EnsureDmaPool();
 
   auto pending = PrepareWriteAlloc(keys, sizes, results);
@@ -650,8 +653,8 @@ std::vector<bool> SpdkSsdTier::BatchWriteStreaming(const std::vector<std::string
     int bufs_per = total_bufs / num_workers;
 
     auto run_pipeline = [&](int c_begin, int c_end, void** wbufs, int local_qd) {
-      auto lreqs = std::make_unique<umbp::SpdkIoRequest[]>(local_qd);
-      auto lbatch = std::make_unique<umbp::SpdkIoRequest*[]>(local_qd);
+      auto lreqs = std::make_unique<::umbp::SpdkIoRequest[]>(local_qd);
+      auto lbatch = std::make_unique<::umbp::SpdkIoRequest*[]>(local_qd);
       int head = c_begin, tail = c_begin;
 
       while (tail < c_end) {
@@ -672,7 +675,7 @@ std::vector<bool> SpdkSsdTier::BatchWriteStreaming(const std::vector<std::string
             std::memset(static_cast<char*>(wbufs[slot]) + c.data_bytes, 0, c.nbytes - c.data_bytes);
 
           auto& req = lreqs[slot];
-          req.op = umbp::SpdkIoRequest::WRITE;
+          req.op = ::umbp::SpdkIoRequest::WRITE;
           req.buf = wbufs[slot];
           req.offset = c.offset;
           req.nbytes = c.nbytes;
@@ -745,7 +748,7 @@ std::vector<bool> SpdkSsdTier::BatchReadIntoPtr(const std::vector<std::string>& 
   std::vector<bool> results(count, false);
   if (!initialized_ || count == 0) return results;
 
-  auto& env = umbp::SpdkEnv::Instance();
+  auto& env = ::umbp::SpdkEnv::Instance();
   auto pool = EnsureDmaPool();
   if (!pool || pool->count <= 0) return results;
 
@@ -795,8 +798,8 @@ std::vector<bool> SpdkSsdTier::BatchReadIntoPtr(const std::vector<std::string>& 
     int bufs_per = pool->count / num_workers;
 
     auto run_pipeline = [&](int c_begin, int c_end, void** bufs, int local_qd) {
-      auto lreqs = std::make_unique<umbp::SpdkIoRequest[]>(local_qd);
-      auto lbatch = std::make_unique<umbp::SpdkIoRequest*[]>(local_qd);
+      auto lreqs = std::make_unique<::umbp::SpdkIoRequest[]>(local_qd);
+      auto lbatch = std::make_unique<::umbp::SpdkIoRequest*[]>(local_qd);
       int head = c_begin, tail = c_begin;
 
       while (tail < c_end) {
@@ -806,7 +809,7 @@ std::vector<bool> SpdkSsdTier::BatchReadIntoPtr(const std::vector<std::string>& 
           auto& c = chunks[head];
 
           auto& req = lreqs[slot];
-          req.op = umbp::SpdkIoRequest::READ;
+          req.op = ::umbp::SpdkIoRequest::READ;
           req.buf = bufs[slot];
           req.offset = c.offset;
           req.nbytes = c.nbytes;
@@ -887,7 +890,7 @@ std::vector<bool> SpdkSsdTier::BatchReadIntoPtrStreaming(
   std::vector<bool> results(count, false);
   if (!initialized_ || count == 0) return results;
 
-  auto& env = umbp::SpdkEnv::Instance();
+  auto& env = ::umbp::SpdkEnv::Instance();
   auto pool = EnsureDmaPool();
 
   auto items = PrepareReadLookup(keys, sizes, results);
@@ -943,8 +946,8 @@ std::vector<bool> SpdkSsdTier::BatchReadIntoPtrStreaming(
 
   {
     int qd = std::min({chunk_count, kMaxQueueDepth, total_bufs});
-    auto lreqs = std::make_unique<umbp::SpdkIoRequest[]>(qd);
-    auto lbatch = std::make_unique<umbp::SpdkIoRequest*[]>(qd);
+    auto lreqs = std::make_unique<::umbp::SpdkIoRequest[]>(qd);
+    auto lbatch = std::make_unique<::umbp::SpdkIoRequest*[]>(qd);
     int head = 0, tail = 0;
     int items_signaled = 0;
 
@@ -954,7 +957,7 @@ std::vector<bool> SpdkSsdTier::BatchReadIntoPtrStreaming(
         int slot = head % qd;
         auto& c = chunks[head];
         auto& req = lreqs[slot];
-        req.op = umbp::SpdkIoRequest::READ;
+        req.op = ::umbp::SpdkIoRequest::READ;
         req.buf = bufs[slot];
         req.offset = c.offset;
         req.nbytes = c.nbytes;
@@ -1023,7 +1026,7 @@ std::vector<bool> SpdkSsdTier::BatchWriteDmaDirect(const std::vector<std::string
   std::vector<bool> results(count, false);
   if (!initialized_ || count == 0) return results;
 
-  auto& env = umbp::SpdkEnv::Instance();
+  auto& env = ::umbp::SpdkEnv::Instance();
 
   auto pending = PrepareWriteAlloc(keys, sizes, results);
   if (pending.empty()) return results;
@@ -1076,8 +1079,8 @@ std::vector<bool> SpdkSsdTier::BatchWriteDmaDirect(const std::vector<std::string
 
     auto run_pipeline = [&](int c_begin, int c_end) {
       int local_qd = std::min(kMaxQueueDepth, c_end - c_begin);
-      auto lreqs = std::make_unique<umbp::SpdkIoRequest[]>(local_qd);
-      auto lbatch = std::make_unique<umbp::SpdkIoRequest*[]>(local_qd);
+      auto lreqs = std::make_unique<::umbp::SpdkIoRequest[]>(local_qd);
+      auto lbatch = std::make_unique<::umbp::SpdkIoRequest*[]>(local_qd);
       int head = c_begin, tail = c_begin;
 
       while (tail < c_end) {
@@ -1086,7 +1089,7 @@ std::vector<bool> SpdkSsdTier::BatchWriteDmaDirect(const std::vector<std::string
           int slot = (head - c_begin) % local_qd;
           auto& c = chunks[head];
           auto& req = lreqs[slot];
-          req.op = umbp::SpdkIoRequest::WRITE;
+          req.op = ::umbp::SpdkIoRequest::WRITE;
           req.buf = c.buf;
           req.offset = c.offset;
           req.nbytes = c.nbytes;
@@ -1152,7 +1155,7 @@ std::vector<bool> SpdkSsdTier::BatchReadDmaDirect(const std::vector<std::string>
   std::vector<bool> results(count, false);
   if (!initialized_ || count == 0) return results;
 
-  auto& env = umbp::SpdkEnv::Instance();
+  auto& env = ::umbp::SpdkEnv::Instance();
 
   auto items = PrepareReadLookup(keys, sizes, results);
   if (items.empty()) return results;
@@ -1197,8 +1200,8 @@ std::vector<bool> SpdkSsdTier::BatchReadDmaDirect(const std::vector<std::string>
 
     auto run_pipeline = [&](int c_begin, int c_end) {
       int local_qd = std::min(kMaxQueueDepth, c_end - c_begin);
-      auto lreqs = std::make_unique<umbp::SpdkIoRequest[]>(local_qd);
-      auto lbatch = std::make_unique<umbp::SpdkIoRequest*[]>(local_qd);
+      auto lreqs = std::make_unique<::umbp::SpdkIoRequest[]>(local_qd);
+      auto lbatch = std::make_unique<::umbp::SpdkIoRequest*[]>(local_qd);
       int head = c_begin, tail = c_begin;
 
       while (tail < c_end) {
@@ -1207,7 +1210,7 @@ std::vector<bool> SpdkSsdTier::BatchReadDmaDirect(const std::vector<std::string>
           int slot = (head - c_begin) % local_qd;
           auto& c = chunks[head];
           auto& req = lreqs[slot];
-          req.op = umbp::SpdkIoRequest::READ;
+          req.op = ::umbp::SpdkIoRequest::READ;
           req.buf = c.buf;
           req.offset = c.offset;
           req.nbytes = c.nbytes;
@@ -1275,7 +1278,7 @@ std::vector<bool> SpdkSsdTier::BatchWriteDmaStreaming(const std::vector<std::str
   std::vector<bool> results(count, false);
   if (!initialized_ || count == 0) return results;
 
-  auto& env = umbp::SpdkEnv::Instance();
+  auto& env = ::umbp::SpdkEnv::Instance();
 
   auto pending = PrepareWriteAlloc(keys, sizes, results);
   if (pending.empty()) return results;
@@ -1318,8 +1321,8 @@ std::vector<bool> SpdkSsdTier::BatchWriteDmaStreaming(const std::vector<std::str
 
     auto run_streaming = [&](int c_begin, int c_end) {
       int local_qd = std::min(kMaxQueueDepth, c_end - c_begin);
-      auto lreqs = std::make_unique<umbp::SpdkIoRequest[]>(local_qd);
-      auto lbatch = std::make_unique<umbp::SpdkIoRequest*[]>(local_qd);
+      auto lreqs = std::make_unique<::umbp::SpdkIoRequest[]>(local_qd);
+      auto lbatch = std::make_unique<::umbp::SpdkIoRequest*[]>(local_qd);
       int head = c_begin, tail = c_begin;
       int last_ready_item = -1;
 
@@ -1343,7 +1346,7 @@ std::vector<bool> SpdkSsdTier::BatchWriteDmaStreaming(const std::vector<std::str
 
           int slot = (head - c_begin) % local_qd;
           auto& req = lreqs[slot];
-          req.op = umbp::SpdkIoRequest::WRITE;
+          req.op = ::umbp::SpdkIoRequest::WRITE;
           req.buf = c.buf;
           req.offset = c.offset;
           req.nbytes = c.nbytes;
@@ -1409,7 +1412,7 @@ std::vector<bool> SpdkSsdTier::BatchReadDmaStreaming(const std::vector<std::stri
   std::vector<bool> results(count, false);
   if (!initialized_ || count == 0) return results;
 
-  auto& env = umbp::SpdkEnv::Instance();
+  auto& env = ::umbp::SpdkEnv::Instance();
 
   auto items = PrepareReadLookup(keys, sizes, results);
   if (items.empty()) return results;
@@ -1447,8 +1450,8 @@ std::vector<bool> SpdkSsdTier::BatchReadDmaStreaming(const std::vector<std::stri
 
   {
     int local_qd = std::min(kMaxQueueDepth, chunk_count);
-    auto lreqs = std::make_unique<umbp::SpdkIoRequest[]>(local_qd);
-    auto lbatch = std::make_unique<umbp::SpdkIoRequest*[]>(local_qd);
+    auto lreqs = std::make_unique<::umbp::SpdkIoRequest[]>(local_qd);
+    auto lbatch = std::make_unique<::umbp::SpdkIoRequest*[]>(local_qd);
     int head = 0, tail = 0;
     int items_signaled = 0;
 
@@ -1458,7 +1461,7 @@ std::vector<bool> SpdkSsdTier::BatchReadDmaStreaming(const std::vector<std::stri
         int slot = head % local_qd;
         auto& c = chunks[head];
         auto& req = lreqs[slot];
-        req.op = umbp::SpdkIoRequest::READ;
+        req.op = ::umbp::SpdkIoRequest::READ;
         req.buf = c.buf;
         req.offset = c.offset;
         req.nbytes = c.nbytes;
@@ -1501,3 +1504,6 @@ std::vector<bool> SpdkSsdTier::BatchReadDmaStreaming(const std::vector<std::stri
     if (item_ok[j]) results[items[j].idx] = true;
   return results;
 }
+
+}  // namespace umbp
+}  // namespace mori

@@ -21,154 +21,311 @@
 // SOFTWARE.
 #include "umbp/distributed/peer/peer_service.h"
 
-#include <fcntl.h>
 #include <grpcpp/grpcpp.h>
-#include <spdlog/spdlog.h>
-#include <unistd.h>
 
+#include <algorithm>
+#include <chrono>
 #include <cstring>
 
+#include "mori/utils/mori_log.hpp"
+#include "umbp/common/types.h"
+#include "umbp/distributed/pool_client.h"
+#include "umbp/local/block_index/local_block_index.h"
+#include "umbp/local/storage/local_storage_manager.h"
 #include "umbp_peer.grpc.pb.h"
 
 namespace mori::umbp {
+
+namespace {
+struct StagingSlot {
+  bool in_use = false;
+  uint64_t lease_id = 0;
+  size_t allocated_size = 0;
+  std::chrono::steady_clock::time_point allocated_at;
+};
+
+int AllocateSlot(std::vector<StagingSlot>& slots, std::atomic<uint64_t>& next_lease_id,
+                 std::chrono::seconds lease_timeout, size_t request_size, StagingMetrics& metrics) {
+  auto now = std::chrono::steady_clock::now();
+  for (auto& slot : slots) {
+    if (slot.in_use && now - slot.allocated_at > lease_timeout) {
+      metrics.expired_reclaims.fetch_add(1, std::memory_order_relaxed);
+      MORI_UMBP_WARN("[PeerService] Reclaiming expired slot (lease_id={})", slot.lease_id);
+      slot.in_use = false;
+    }
+  }
+  for (auto& slot : slots) {
+    if (!slot.in_use) {
+      slot.in_use = true;
+      slot.lease_id = next_lease_id.fetch_add(1, std::memory_order_relaxed);
+      slot.allocated_size = request_size;
+      slot.allocated_at = now;
+      return static_cast<int>(&slot - &slots[0]);
+    }
+  }
+  return -1;
+}
+
+int FindSlotByLeaseId(const std::vector<StagingSlot>& slots, uint64_t lease_id) {
+  for (size_t i = 0; i < slots.size(); ++i) {
+    if (slots[i].in_use && slots[i].lease_id == lease_id) {
+      return static_cast<int>(i);
+    }
+  }
+  return -1;
+}
+
+bool ReleaseSlotByLeaseId(std::vector<StagingSlot>& slots, uint64_t lease_id) {
+  for (auto& slot : slots) {
+    if (slot.in_use && slot.lease_id == lease_id) {
+      slot.in_use = false;
+      return true;
+    }
+  }
+  return false;
+}
+
+uint64_t RemainingTtlMs(std::chrono::steady_clock::time_point alloc_time,
+                        std::chrono::seconds lease_timeout) {
+  auto elapsed = std::chrono::steady_clock::now() - alloc_time;
+  auto remaining_ms = std::max<int64_t>(
+      0, std::chrono::duration_cast<std::chrono::milliseconds>(lease_timeout - elapsed).count());
+  return static_cast<uint64_t>(remaining_ms);
+}
+}  // namespace
 
 class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Service {
  public:
   UMBPPeerServiceImpl(void* ssd_staging_base, size_t ssd_staging_size,
                       const std::vector<uint8_t>& ssd_staging_mem_desc_bytes,
-                      std::vector<SsdStore>& ssd_stores, std::mutex& ssd_mutex)
+                      LocalStorageManager& storage, LocalBlockIndex& index, PoolClient& coordinator,
+                      StagingMetrics& metrics, int num_read_slots, int num_write_slots,
+                      int lease_timeout_s)
       : ssd_staging_base_(ssd_staging_base),
         ssd_staging_size_(ssd_staging_size),
         ssd_staging_mem_desc_bytes_(ssd_staging_mem_desc_bytes),
-        ssd_stores_(ssd_stores),
-        ssd_mutex_(ssd_mutex) {}
+        storage_(storage),
+        index_(index),
+        coordinator_(coordinator),
+        metrics_(metrics),
+        lease_timeout_(std::max(lease_timeout_s, 1)),
+        num_read_slots_(std::max(num_read_slots, 1)),
+        num_write_slots_(std::max(num_write_slots, 1)),
+        read_region_base_(ssd_staging_size / 2),
+        read_slot_size_((ssd_staging_size / 2) / static_cast<size_t>(std::max(num_read_slots, 1))),
+        write_slot_size_((ssd_staging_size / 2) /
+                         static_cast<size_t>(std::max(num_write_slots, 1))),
+        read_slots_(std::max(num_read_slots, 1)),
+        write_slots_(std::max(num_write_slots, 1)) {
+    if (num_read_slots <= 0 || num_write_slots <= 0) {
+      MORI_UMBP_ERROR("[PeerService] num_read_slots={} num_write_slots={} invalid, clamped to 1",
+                      num_read_slots, num_write_slots);
+    }
+  }
 
   grpc::Status GetPeerInfo(grpc::ServerContext* /*context*/,
                            const ::umbp::GetPeerInfoRequest* /*request*/,
                            ::umbp::GetPeerInfoResponse* response) override {
-    // Only return SSD staging info — engine_desc and dram_memory_desc
-    // are already provided by Master in RoutePut/RouteGet responses.
     response->set_ssd_staging_mem_desc(
         std::string(ssd_staging_mem_desc_bytes_.begin(), ssd_staging_mem_desc_bytes_.end()));
     response->set_ssd_staging_size(ssd_staging_size_);
     return grpc::Status::OK;
   }
 
-  grpc::Status CommitSsdWrite(grpc::ServerContext* /*context*/,
-                              const ::umbp::CommitSsdWriteRequest* request,
-                              ::umbp::CommitSsdWriteResponse* response) override {
-    std::lock_guard<std::mutex> lock(ssd_mutex_);
+  // ---- Write path: AllocateWriteSlot + CommitSsdWrite ----
 
-    uint32_t idx = request->store_index();
-    if (idx >= ssd_stores_.size()) {
-      spdlog::error("[PeerService] CommitSsdWrite: store_index {} out of range (have {})", idx,
-                    ssd_stores_.size());
-      response->set_success(false);
-      return grpc::Status::OK;
-    }
-    auto& target = ssd_stores_[idx];
-
-    if (target.used + request->size() > target.capacity) {
+  grpc::Status AllocateWriteSlot(grpc::ServerContext* /*context*/,
+                                 const ::umbp::AllocateWriteSlotRequest* request,
+                                 ::umbp::AllocateWriteSlotResponse* response) override {
+    if (request->size() > write_slot_size_ || request->size() == 0) {
       response->set_success(false);
       return grpc::Status::OK;
     }
 
-    if (request->staging_offset() + request->size() > ssd_staging_size_ / 2) {
-      spdlog::error("[PeerService] CommitSsdWrite: staging_offset + size exceeds write region");
-      response->set_success(false);
-      return grpc::Status::OK;
+    int slot_idx;
+    uint64_t offset, lease_id;
+    std::chrono::steady_clock::time_point alloc_time;
+    {
+      std::lock_guard<std::mutex> lock(write_slots_mutex_);
+      slot_idx =
+          AllocateSlot(write_slots_, next_lease_id_, lease_timeout_, request->size(), metrics_);
+      if (slot_idx < 0) {
+        metrics_.slot_full_rejects.fetch_add(1, std::memory_order_relaxed);
+        response->set_success(false);
+        return grpc::Status::OK;
+      }
+      offset = static_cast<uint64_t>(slot_idx) * write_slot_size_;
+      lease_id = write_slots_[slot_idx].lease_id;
+      alloc_time = write_slots_[slot_idx].allocated_at;
     }
 
-    const void* src = static_cast<const uint8_t*>(ssd_staging_base_) + request->staging_offset();
-    std::string filename = target.dir + "/" + request->key() + ".bin";
-
-    int fd = ::open(filename.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) {
-      response->set_success(false);
-      return grpc::Status::OK;
-    }
-
-    ssize_t written = ::write(fd, src, request->size());
-    if (written < 0 || static_cast<size_t>(written) != request->size()) {
-      ::close(fd);
-      response->set_success(false);
-      return grpc::Status::OK;
-    }
-
-    ::fsync(fd);
-    ::close(fd);
-
-    target.used += request->size();
     response->set_success(true);
-    response->set_ssd_location_id(request->key() + ".bin");
-
-    spdlog::info("[PeerService] CommitSsdWrite: key={}, size={}, store={}, file={}", request->key(),
-                 request->size(), idx, filename);
+    response->set_staging_offset(offset);
+    response->set_lease_id(lease_id);
+    response->set_lease_ttl_ms(RemainingTtlMs(alloc_time, lease_timeout_));
     return grpc::Status::OK;
   }
 
-  grpc::Status PrepareSsdRead(grpc::ServerContext* /*context*/,
-                              const ::umbp::PrepareSsdReadRequest* request,
-                              ::umbp::PrepareSsdReadResponse* response) override {
-    std::lock_guard<std::mutex> lock(ssd_mutex_);
-
-    // Read region occupies the second half of the staging buffer
-    const uint64_t read_offset = ssd_staging_size_ / 2;
-
-    if (request->size() > ssd_staging_size_ / 2) {
-      spdlog::error("[PeerService] PrepareSsdRead: size {} exceeds read region {}", request->size(),
-                    ssd_staging_size_ / 2);
-      response->set_success(false);
-      return grpc::Status::OK;
-    }
-
-    // Parse store_index from ssd_location_id (format: "store_index:filename" or just "filename")
-    const auto& loc_id = request->ssd_location_id();
-    auto colon = loc_id.find(':');
-    if (colon != std::string::npos) {
-      try {
-        uint32_t idx = static_cast<uint32_t>(std::stoul(loc_id.substr(0, colon)));
-        std::string file_part = loc_id.substr(colon + 1);
-        if (idx < ssd_stores_.size()) {
-          std::string filepath = ssd_stores_[idx].dir + "/" + file_part;
-          int fd = ::open(filepath.c_str(), O_RDONLY);
-          if (fd >= 0) {
-            void* dst = static_cast<uint8_t*>(ssd_staging_base_) + read_offset;
-            ssize_t bytes_read = ::pread(fd, dst, request->size(), 0);
-            ::close(fd);
-            if (bytes_read >= 0 && static_cast<size_t>(bytes_read) == request->size()) {
-              response->set_success(true);
-              response->set_staging_offset(read_offset);
-              spdlog::info("[PeerService] PrepareSsdRead: key={}, store={}, file={}, size={}",
-                           request->key(), idx, file_part, request->size());
-              return grpc::Status::OK;
-            }
-          }
-        }
-      } catch (...) {
+  grpc::Status CommitSsdWrite(grpc::ServerContext* /*context*/,
+                              const ::umbp::CommitSsdWriteRequest* request,
+                              ::umbp::CommitSsdWriteResponse* response) override {
+    const uint64_t commit_lease_id = request->lease_id();
+    uint64_t offset;
+    {
+      std::lock_guard<std::mutex> lock(write_slots_mutex_);
+      int slot_idx = FindSlotByLeaseId(write_slots_, commit_lease_id);
+      if (slot_idx < 0) {
+        metrics_.invalid_lease_rejects.fetch_add(1, std::memory_order_relaxed);
+        MORI_UMBP_ERROR("[PeerService] CommitSsdWrite: invalid/expired lease_id={}",
+                        commit_lease_id);
+        response->set_success(false);
+        return grpc::Status::OK;
       }
-    }
+      offset = static_cast<uint64_t>(slot_idx) * write_slot_size_;
 
-    // Fallback: search all stores (backward compat for plain "filename" format)
-    for (const auto& s : ssd_stores_) {
-      std::string filename = s.dir + "/" + loc_id;
-      int fd = ::open(filename.c_str(), O_RDONLY);
-      if (fd < 0) continue;
-
-      void* dst = static_cast<uint8_t*>(ssd_staging_base_) + read_offset;
-      ssize_t bytes_read = ::pread(fd, dst, request->size(), 0);
-      ::close(fd);
-
-      if (bytes_read >= 0 && static_cast<size_t>(bytes_read) == request->size()) {
-        response->set_success(true);
-        response->set_staging_offset(read_offset);
-        spdlog::info("[PeerService] PrepareSsdRead: key={}, ssd_location={}, size={}, dir={}",
-                     request->key(), loc_id, request->size(), s.dir);
+      if (request->store_index() != 0) {
+        MORI_UMBP_ERROR("[PeerService] CommitSsdWrite: store_index {} != 0, rejected",
+                        request->store_index());
+        ReleaseSlotByLeaseId(write_slots_, commit_lease_id);
+        response->set_success(false);
+        return grpc::Status::OK;
+      }
+      if (request->size() > write_slots_[slot_idx].allocated_size) {
+        MORI_UMBP_ERROR("[PeerService] CommitSsdWrite: size {} > allocated {}", request->size(),
+                        write_slots_[slot_idx].allocated_size);
+        ReleaseSlotByLeaseId(write_slots_, commit_lease_id);
+        response->set_success(false);
+        return grpc::Status::OK;
+      }
+      if (request->staging_offset() != offset) {
+        MORI_UMBP_ERROR("[PeerService] CommitSsdWrite: staging_offset {} != slot offset {}",
+                        request->staging_offset(), offset);
+        ReleaseSlotByLeaseId(write_slots_, commit_lease_id);
+        response->set_success(false);
         return grpc::Status::OK;
       }
     }
 
-    response->set_success(false);
+    const std::string& key = request->key();
+    const size_t size = request->size();
+
+    auto existing = index_.Lookup(key);
+    if (existing.has_value() && coordinator_.IsRegistered(key)) {
+      std::lock_guard<std::mutex> lock(write_slots_mutex_);
+      ReleaseSlotByLeaseId(write_slots_, commit_lease_id);
+      response->set_success(true);
+      return grpc::Status::OK;
+    }
+
+    const void* src = static_cast<const uint8_t*>(ssd_staging_base_) + offset;
+    if (!existing.has_value()) {
+      bool ok = storage_.Write(key, src, size, StorageTier::LOCAL_SSD);
+      if (!ok) {
+        MORI_UMBP_ERROR("[PeerService] CommitSsdWrite: local SSD write failed for '{}'", key);
+        std::lock_guard<std::mutex> lock(write_slots_mutex_);
+        ReleaseSlotByLeaseId(write_slots_, commit_lease_id);
+        response->set_success(false);
+        return grpc::Status::OK;
+      }
+      index_.Insert(key, {StorageTier::LOCAL_SSD, 0, size});
+    }
+
+    auto* ssd = storage_.GetTier(StorageTier::LOCAL_SSD);
+    auto loc_id = ssd ? ssd->GetLocationId(key) : std::nullopt;
+    if (!loc_id.has_value()) {
+      storage_.Evict(key);
+      index_.Remove(key);
+      MORI_UMBP_ERROR("[PeerService] CommitSsdWrite: GetLocationId failed for '{}'", key);
+      std::lock_guard<std::mutex> lock(write_slots_mutex_);
+      ReleaseSlotByLeaseId(write_slots_, commit_lease_id);
+      response->set_success(false);
+      return grpc::Status::OK;
+    }
+    std::string location_id = "0:" + *loc_id;
+
+    bool finalized = coordinator_.FinalizeAllocation(key, size, location_id, TierType::SSD,
+                                                     request->allocation_id());
+    if (!finalized) {
+      storage_.Evict(key);
+      index_.Remove(key);
+      MORI_UMBP_ERROR("[PeerService] CommitSsdWrite: FinalizeAllocation failed for '{}'", key);
+      std::lock_guard<std::mutex> lock(write_slots_mutex_);
+      ReleaseSlotByLeaseId(write_slots_, commit_lease_id);
+      response->set_success(false);
+      return grpc::Status::OK;
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(write_slots_mutex_);
+      ReleaseSlotByLeaseId(write_slots_, commit_lease_id);
+    }
+    response->set_success(true);
+    response->set_ssd_location_id(location_id);
+    MORI_UMBP_INFO("[PeerService] CommitSsdWrite: key={}, size={}, location={}", key, size,
+                   location_id);
+    return grpc::Status::OK;
+  }
+
+  // ---- Read path: PrepareSsdRead + ReleaseSsdLease ----
+
+  grpc::Status PrepareSsdRead(grpc::ServerContext* /*context*/,
+                              const ::umbp::PrepareSsdReadRequest* request,
+                              ::umbp::PrepareSsdReadResponse* response) override {
+    if (request->size() > read_slot_size_ || request->size() == 0) {
+      MORI_UMBP_ERROR("[PeerService] PrepareSsdRead: size {} invalid (slot_size={})",
+                      request->size(), read_slot_size_);
+      response->set_success(false);
+      return grpc::Status::OK;
+    }
+
+    int slot_idx;
+    uint64_t offset, lease_id;
+    std::chrono::steady_clock::time_point alloc_time;
+    {
+      std::lock_guard<std::mutex> lock(read_slots_mutex_);
+      slot_idx =
+          AllocateSlot(read_slots_, next_lease_id_, lease_timeout_, request->size(), metrics_);
+      if (slot_idx < 0) {
+        metrics_.slot_full_rejects.fetch_add(1, std::memory_order_relaxed);
+        MORI_UMBP_WARN("[PeerService] PrepareSsdRead: no free staging slots");
+        response->set_success(false);
+        return grpc::Status::OK;
+      }
+      offset = read_region_base_ + static_cast<uint64_t>(slot_idx) * read_slot_size_;
+      lease_id = read_slots_[slot_idx].lease_id;
+      alloc_time = read_slots_[slot_idx].allocated_at;
+    }
+
+    void* dst = static_cast<uint8_t*>(ssd_staging_base_) + offset;
+    bool ok = storage_.ReadIntoPtrNoPromote(request->key(), reinterpret_cast<uintptr_t>(dst),
+                                            request->size());
+    if (!ok) {
+      std::lock_guard<std::mutex> lock(read_slots_mutex_);
+      ReleaseSlotByLeaseId(read_slots_, lease_id);
+      response->set_success(false);
+      return grpc::Status::OK;
+    }
+
+    response->set_success(true);
+    response->set_staging_offset(offset);
+    response->set_lease_id(lease_id);
+    response->set_lease_ttl_ms(RemainingTtlMs(alloc_time, lease_timeout_));
+    MORI_UMBP_INFO("[PeerService] PrepareSsdRead: key={}, slot={}, offset={}, lease_id={}",
+                   request->key(), slot_idx, offset, lease_id);
+    return grpc::Status::OK;
+  }
+
+  grpc::Status ReleaseSsdLease(grpc::ServerContext* /*context*/,
+                               const ::umbp::ReleaseSsdLeaseRequest* request,
+                               ::umbp::ReleaseSsdLeaseResponse* response) override {
+    std::lock_guard<std::mutex> lock(read_slots_mutex_);
+    int idx = FindSlotByLeaseId(read_slots_, request->lease_id());
+    if (idx >= 0) {
+      read_slots_[idx].in_use = false;
+      response->set_success(true);
+    } else {
+      response->set_success(false);
+    }
     return grpc::Status::OK;
   }
 
@@ -176,26 +333,39 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
   void* ssd_staging_base_;
   size_t ssd_staging_size_;
   const std::vector<uint8_t>& ssd_staging_mem_desc_bytes_;
-  std::vector<SsdStore>& ssd_stores_;
-  std::mutex& ssd_mutex_;
+  LocalStorageManager& storage_;
+  LocalBlockIndex& index_;
+  PoolClient& coordinator_;
+  StagingMetrics& metrics_;
+
+  const std::chrono::seconds lease_timeout_;
+  const int num_read_slots_;
+  const int num_write_slots_;
+  const uint64_t read_region_base_;
+  const size_t read_slot_size_;
+  const size_t write_slot_size_;
+
+  std::mutex read_slots_mutex_;
+  std::mutex write_slots_mutex_;
+  std::vector<StagingSlot> read_slots_;
+  std::vector<StagingSlot> write_slots_;
+  std::atomic<uint64_t> next_lease_id_{1};
 };
 
 PeerServiceServer::PeerServiceServer(void* ssd_staging_base, size_t ssd_staging_size,
                                      const std::vector<uint8_t>& ssd_staging_mem_desc_bytes,
-                                     const std::vector<std::string>& ssd_dirs,
-                                     const std::vector<size_t>& ssd_capacities)
+                                     LocalStorageManager& storage, LocalBlockIndex& index,
+                                     PoolClient& coordinator, int num_read_slots,
+                                     int num_write_slots, int lease_timeout_s)
     : ssd_staging_base_(ssd_staging_base),
       ssd_staging_size_(ssd_staging_size),
+      storage_(storage),
+      index_(index),
+      coordinator_(coordinator),
       ssd_staging_mem_desc_bytes_(ssd_staging_mem_desc_bytes) {
-  for (size_t i = 0; i < ssd_dirs.size(); ++i) {
-    SsdStore store;
-    store.dir = ssd_dirs[i];
-    store.capacity = (i < ssd_capacities.size()) ? ssd_capacities[i] : 0;
-    store.used = 0;
-    ssd_stores_.push_back(std::move(store));
-  }
   service_ = std::make_unique<UMBPPeerServiceImpl>(
-      ssd_staging_base_, ssd_staging_size_, ssd_staging_mem_desc_bytes_, ssd_stores_, ssd_mutex_);
+      ssd_staging_base_, ssd_staging_size_, ssd_staging_mem_desc_bytes_, storage_, index_,
+      coordinator_, metrics_, num_read_slots, num_write_slots, lease_timeout_s);
 }
 
 PeerServiceServer::~PeerServiceServer() { Stop(); }
@@ -209,17 +379,17 @@ bool PeerServiceServer::Start(uint16_t port) {
   server_ = builder.BuildAndStart();
 
   if (!server_) {
-    spdlog::error("[PeerService] Failed to start on {} (port may be in use)", address);
+    MORI_UMBP_ERROR("[PeerService] Failed to start on {} (port may be in use)", address);
     return false;
   }
-  spdlog::info("[PeerService] Listening on {}", address);
+  MORI_UMBP_INFO("[PeerService] Listening on {}", address);
   return true;
 }
 
 void PeerServiceServer::Stop() {
   if (server_) {
     const auto deadline = std::chrono::system_clock::now() + std::chrono::seconds(3);
-    spdlog::info("[PeerService] Shutting down");
+    MORI_UMBP_INFO("[PeerService] Shutting down");
     server_->Shutdown(deadline);
     server_.reset();
   }

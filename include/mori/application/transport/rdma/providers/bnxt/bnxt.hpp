@@ -21,28 +21,20 @@
 // SOFTWARE.
 #pragma once
 
-#ifdef ENABLE_BNXT
-#include <infiniband/bnxt_re_dv.h>
-extern "C" {
-#include <infiniband/bnxt_re_hsi.h>
-}
-#else
 #include "mori/core/transport/rdma/providers/bnxt/bnxt_re_dv.h"
 extern "C" {
 #include "mori/core/transport/rdma/providers/bnxt/bnxt_re_hsi.h"
 }
-#endif
 
 #include <mutex>
 #include <set>
 
+#include "mori/application/transport/rdma/providers/dv_loader.hpp"
 #include "mori/application/transport/rdma/rdma.hpp"
 #include "mori/core/transport/rdma/providers/bnxt/bnxt_defs.hpp"
 
 namespace mori {
 namespace application {
-
-#ifdef ENABLE_BNXT
 // BNXT UDP sport configuration constants
 static constexpr uint32_t BNXT_UDP_SPORT_ARRAY_SIZE = 4;
 
@@ -169,6 +161,5 @@ class BnxtDevice : public RdmaDevice {
 
   RdmaDeviceContext* CreateRdmaDeviceContext() override;
 };
-#endif  // ENABLE_BNXT
 }  // namespace application
 }  // namespace mori

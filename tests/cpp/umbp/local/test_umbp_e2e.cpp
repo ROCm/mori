@@ -56,6 +56,8 @@
 #include "umbp/proxy/spdk_proxy_shm.h"
 #endif
 
+using namespace mori::umbp;
+
 // ---------------------------------------------------------------------------
 // Test infrastructure
 // ---------------------------------------------------------------------------
@@ -576,16 +578,17 @@ static bool test_proxy_daemon_cleanup_after_leader_exit() {
     setenv("LOCAL_RANK", "0", 1);
     setenv("UMBP_SSD_BACKEND", "spdk", 1);
 
+    int rc = 0;
     {
       auto cfg = UMBPConfig::FromEnvironment();
       cfg.dram.capacity_bytes = 64ULL * 1024 * 1024;
       UMBPClient client(cfg);
       auto* ssd = client.Storage().GetTier(StorageTier::LOCAL_SSD);
-      if (!ssd) _exit(1);
+      if (!ssd) rc = 1;
       std::vector<char> data(4096, 'Q');
-      if (!ssd->Write("proxy_survive_key", data.data(), data.size())) _exit(2);
+      if (rc == 0 && !ssd->Write("proxy_survive_key", data.data(), data.size())) rc = 2;
     }
-    _exit(0);
+    _exit(rc);
   }
 
   int status;
@@ -599,20 +602,23 @@ static bool test_proxy_daemon_cleanup_after_leader_exit() {
     setenv("LOCAL_RANK", "1", 1);
     setenv("UMBP_SSD_BACKEND", "spdk", 1);
 
-    auto cfg = UMBPConfig::FromEnvironment();
-    cfg.dram.capacity_bytes = 64ULL * 1024 * 1024;
-    UMBPClient client(cfg);
-    auto* ssd = client.Storage().GetTier(StorageTier::LOCAL_SSD);
-    if (!ssd) _exit(3);
+    int rc = 0;
+    {
+      auto cfg = UMBPConfig::FromEnvironment();
+      cfg.dram.capacity_bytes = 64ULL * 1024 * 1024;
+      UMBPClient client(cfg);
+      auto* ssd = client.Storage().GetTier(StorageTier::LOCAL_SSD);
+      if (!ssd) rc = 3;
 
-    std::vector<char> buf(4096, 0);
-    if (!ssd->ReadIntoPtr("proxy_survive_key", reinterpret_cast<uintptr_t>(buf.data()),
-                          buf.size())) {
-      _exit(4);
+      std::vector<char> buf(4096, 0);
+      if (rc == 0 && !ssd->ReadIntoPtr("proxy_survive_key", reinterpret_cast<uintptr_t>(buf.data()),
+                                       buf.size())) {
+        rc = 4;
+      }
+      std::vector<char> expected(4096, 'Q');
+      if (rc == 0 && buf != expected) rc = 5;
     }
-    std::vector<char> expected(4096, 'Q');
-    if (buf != expected) _exit(5);
-    _exit(0);
+    _exit(rc);
   }
 
   waitpid(follower, &status, 0);
@@ -715,47 +721,68 @@ static bool test_proxy_batch_write_read() {
     setenv("LOCAL_RANK", "0", 1);
     setenv("UMBP_SSD_BACKEND", "spdk", 1);
 
-    auto cfg = UMBPConfig::FromEnvironment();
-    cfg.dram.capacity_bytes = 64ULL * 1024 * 1024;
-    UMBPClient client(cfg);
+    int rc = 0;
+    {
+      auto cfg = UMBPConfig::FromEnvironment();
+      cfg.dram.capacity_bytes = 64ULL * 1024 * 1024;
+      UMBPClient client(cfg);
 
-    auto* ssd = client.Storage().GetTier(StorageTier::LOCAL_SSD);
-    if (!ssd) _exit(1);
+      auto* ssd = client.Storage().GetTier(StorageTier::LOCAL_SSD);
+      if (!ssd) rc = 1;
 
-    const int N = 50;
-    const size_t sz = 32768;
-    std::vector<std::string> keys(N);
-    std::vector<const void*> cptrs(N);
-    std::vector<size_t> sizes(N, sz);
-    std::vector<std::vector<char>> bufs(N);
-    for (int i = 0; i < N; ++i) {
-      keys[i] = "proxy_batch_" + std::to_string(i);
-      bufs[i].resize(sz, static_cast<char>(i & 0xFF));
-      cptrs[i] = bufs[i].data();
+      const int N = 50;
+      const size_t sz = 32768;
+      std::vector<std::string> keys(N);
+      std::vector<const void*> cptrs(N);
+      std::vector<size_t> sizes(N, sz);
+      std::vector<std::vector<char>> bufs(N);
+      for (int i = 0; i < N; ++i) {
+        keys[i] = "proxy_batch_" + std::to_string(i);
+        bufs[i].resize(sz, static_cast<char>(i & 0xFF));
+        cptrs[i] = bufs[i].data();
+      }
+
+      if (rc == 0) {
+        auto wr = ssd->BatchWrite(keys, cptrs, sizes);
+        int wok = 0;
+        for (auto b : wr) wok += b;
+        if (wok != N) rc = 2;
+      }
+
+      std::vector<std::vector<char>> rbufs(N, std::vector<char>(sz, 0));
+      std::vector<uintptr_t> dptrs(N);
+      for (int i = 0; i < N; ++i) dptrs[i] = reinterpret_cast<uintptr_t>(rbufs[i].data());
+
+      if (rc == 0) {
+        auto rr = ssd->BatchReadIntoPtr(keys, dptrs, sizes);
+        int rok = 0;
+        for (auto b : rr) rok += b;
+        if (rok != N) rc = 3;
+      }
+
+      if (rc == 0) {
+        for (int i = 0; i < N; ++i) {
+          if (rbufs[i] != bufs[i]) {
+            fprintf(stderr,
+                    "    proxy batch mismatch idx=%d got0=%d exp0=%d got_last=%d exp_last=%d\n", i,
+                    static_cast<unsigned char>(rbufs[i][0]), static_cast<unsigned char>(bufs[i][0]),
+                    static_cast<unsigned char>(rbufs[i][sz - 1]),
+                    static_cast<unsigned char>(bufs[i][sz - 1]));
+            rc = 4;
+            break;
+          }
+        }
+      }
     }
-
-    auto wr = ssd->BatchWrite(keys, cptrs, sizes);
-    int wok = 0;
-    for (auto b : wr) wok += b;
-    if (wok != N) _exit(2);
-
-    std::vector<std::vector<char>> rbufs(N, std::vector<char>(sz, 0));
-    std::vector<uintptr_t> dptrs(N);
-    for (int i = 0; i < N; ++i) dptrs[i] = reinterpret_cast<uintptr_t>(rbufs[i].data());
-
-    auto rr = ssd->BatchReadIntoPtr(keys, dptrs, sizes);
-    int rok = 0;
-    for (auto b : rr) rok += b;
-    if (rok != N) _exit(3);
-
-    for (int i = 0; i < N; ++i) {
-      if (rbufs[i] != bufs[i]) _exit(4);
-    }
-    _exit(0);
+    _exit(rc);
   }
 
   int status;
   waitpid(leader, &status, 0);
+  if (!(WIFEXITED(status) && WEXITSTATUS(status) == 0)) {
+    fprintf(stderr, "    proxy batch leader exit=%d\n",
+            WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+  }
   CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
   return true;
 }

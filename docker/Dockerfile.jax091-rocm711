@@ -1,0 +1,69 @@
+############################################################
+# Stage 1: Build jaxlib + ROCm plugin wheels from source
+############################################################
+FROM ghcr.io/rocm/jax-base-ubu24.rocm711:latest AS builder
+
+ARG JAX_BRANCH=rocm-jaxlib-v0.9.1
+ARG BAZEL_VERSION=7.7.0
+ARG GPU_TARGET=gfx942
+ARG ROCM_VERSION=7
+
+# Install build tools
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        wget \
+        patchelf && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Install Bazel
+RUN wget -q -O /usr/local/bin/bazel \
+        "https://github.com/bazelbuild/bazel/releases/download/${BAZEL_VERSION}/bazel-${BAZEL_VERSION}-linux-x86_64" && \
+    chmod +x /usr/local/bin/bazel && \
+    bazel --version
+
+# Clone ROCm JAX repo
+RUN git clone --depth 1 --branch ${JAX_BRANCH} \
+        https://github.com/ROCmSoftwarePlatform/jax.git /jax
+
+WORKDIR /jax
+
+# Build jaxlib + jax-rocm-plugin + jax-rocm-pjrt wheels
+RUN ROCM_PATH=$(realpath /opt/rocm) && \
+    CLANG_PATH=$(realpath /opt/rocm/llvm/bin/clang) && \
+    python3 ./build/build.py build \
+        --wheels=jaxlib,jax-rocm-plugin,jax-rocm-pjrt \
+        --use_clang=true --clang_path=$CLANG_PATH \
+        --rocm_version=${ROCM_VERSION} --rocm_path=$ROCM_PATH \
+        --rocm_amdgpu_targets=${GPU_TARGET}
+
+RUN ls -lah /jax/dist/
+
+############################################################
+# Stage 2: Clean runtime image
+############################################################
+FROM ghcr.io/rocm/jax-base-ubu24.rocm711:latest
+
+ARG PYTHON_VERSION=3.12
+
+RUN python${PYTHON_VERSION} -m pip install "jax==0.9.1"
+
+# Install the wheels built in stage 1
+COPY --from=builder /jax/dist/*.whl /tmp/wheels/
+RUN python${PYTHON_VERSION} -m pip install --break-system-packages \
+        /tmp/wheels/*.whl && \
+    rm -rf /tmp/wheels
+
+# Common runtime and test dependencies
+RUN python${PYTHON_VERSION} -m pip install --break-system-packages \
+        numpy scipy cmake pybind11 pytest
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libibverbs-dev \
+        libpci-dev && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Sanity check (CPU-only at build time, GPU visible at runtime)
+RUN python${PYTHON_VERSION} -c \
+        "import jax; print('JAX', jax.__version__); print('Devices:', jax.devices())" \
+    || true
+
+WORKDIR /workspace

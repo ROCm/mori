@@ -21,7 +21,7 @@
 // SOFTWARE.
 #include "umbp/distributed/routing/router.h"
 
-#include <spdlog/spdlog.h>
+#include "mori/utils/mori_log.hpp"
 
 namespace mori::umbp {
 
@@ -39,15 +39,15 @@ std::optional<Location> Router::RouteGet(const std::string& key, const std::stri
   auto locations = index_.Lookup(key);
 
   if (locations.empty()) {
-    spdlog::debug("[Router] RouteGet key='{}': not found", key);
+    MORI_UMBP_DEBUG("[Router] RouteGet key='{}': not found", key);
     return std::nullopt;
   }
 
   Location selected = get_strategy_->Select(locations, node_id);
   index_.RecordAccess(key);
 
-  spdlog::debug("[Router] RouteGet key='{}': selected node={}, location={}", key, selected.node_id,
-                selected.location_id);
+  MORI_UMBP_DEBUG("[Router] RouteGet key='{}': selected node={}, location={}", key,
+                  selected.node_id, selected.location_id);
   return selected;
 }
 
@@ -56,15 +56,15 @@ std::optional<RoutePutResult> Router::RoutePut(const std::string& key, const std
   auto candidates = registry_.GetAliveClients();
 
   if (candidates.empty()) {
-    spdlog::debug("[Router] RoutePut key='{}' from={}: no alive clients", key, node_id);
+    MORI_UMBP_DEBUG("[Router] RoutePut key='{}' from={}: no alive clients", key, node_id);
     return std::nullopt;
   }
 
   for (;;) {
     auto result = put_strategy_->Select(candidates, block_size);
     if (!result) {
-      spdlog::debug("[Router] RoutePut key='{}' from={}: no node with sufficient capacity", key,
-                    node_id);
+      MORI_UMBP_DEBUG("[Router] RoutePut key='{}' from={}: no node with sufficient capacity", key,
+                      node_id);
       return std::nullopt;
     }
 
@@ -75,13 +75,15 @@ std::optional<RoutePutResult> Router::RoutePut(const std::string& key, const std
       result->dram_memory_desc_bytes = std::move(alloc->dram_memory_desc_bytes);
       result->allocated_offset = alloc->allocated_offset;
       result->buffer_index = alloc->buffer_index;
-      spdlog::debug("[Router] RoutePut key='{}' from={}: selected node={}, tier={}, offset={}", key,
-                    node_id, result->node_id, TierTypeName(result->tier), result->allocated_offset);
+      result->allocation_id = std::move(alloc->allocation_id);
+      MORI_UMBP_DEBUG("[Router] RoutePut key='{}' from={}: selected node={}, tier={}, offset={}",
+                      key, node_id, result->node_id, TierTypeName(result->tier),
+                      result->allocated_offset);
       return result;
     }
 
-    spdlog::debug("[Router] RoutePut key='{}': allocation failed on node={} tier={}, retrying", key,
-                  result->node_id, TierTypeName(result->tier));
+    MORI_UMBP_DEBUG("[Router] RoutePut key='{}': allocation failed on node={} tier={}, retrying",
+                    key, result->node_id, TierTypeName(result->tier));
     for (auto& c : candidates) {
       if (c.node_id == result->node_id) {
         c.tier_capacities.erase(result->tier);

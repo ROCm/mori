@@ -451,6 +451,13 @@ std::optional<IOEngineSession> IOEngine::CreateSession(const MemoryDesc& local,
   return sess;
 }
 
+void IOEngine::LoadScatterGatherModule(const std::string& hsacoPath) {
+  auto it = backends.find(BackendType::XGMI);
+  if (it != backends.end()) {
+    static_cast<XgmiBackend*>(it->second.get())->LoadScatterGatherModule(hsacoPath);
+  }
+}
+
 bool IOEngine::PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
                                         TransferStatus* status) {
   // status->SetCode(StatusCode::SUCCESS);
