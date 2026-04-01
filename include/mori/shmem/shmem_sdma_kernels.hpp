@@ -22,15 +22,13 @@
 #pragma once
 
 #include <assert.h>
-#include <mpi.h>
 
 #include <type_traits>
 
 #include "mori/application/application.hpp"
 #include "mori/core/core.hpp"
-#include "mori/shmem/shmem_api.hpp"
 #include "mori/shmem/internal.hpp"
-
+#include "mori/shmem/shmem_api.hpp"
 #include "mori/shmem/shmem_p2p_kernels.hpp"
 
 namespace mori {
@@ -42,63 +40,431 @@ namespace shmem {
 template <>
 inline __device__ void ShmemPutMemNbiThreadKernel<application::TransportType::SDMA>(
     const application::SymmMemObjPtr dest, size_t destOffset,
-    const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes, int pe,
-    int qpId) {
-    uint8_t* srcPtr = reinterpret_cast<uint8_t*>(source.addr + sourceOffset);
-    uint8_t* dstPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[pe] + destOffset);
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe, int qpId) {
+  uint8_t* srcPtr =
+      reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(source->localPtr) + sourceOffset);
+  uint8_t* dstPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[pe] + destOffset);
 
-    anvil::SdmaQueueDeviceHandle** devicehandles = dest->deviceHandles_d + pe*dest->sdmaNumQueue;
-    int myPe = GetGlobalGpuStatesPtr()->rank;
-    HSAuint64* remoteSignal = dest->peerSignalPtrs[pe]
-                              + static_cast<size_t>(myPe) * dest->sdmaNumQueue;
+  anvil::SdmaQueueDeviceHandle** devicehandles =
+      dest->deviceHandles_d + pe * dest->sdmaNumQueue;
+  int myPe = GetGlobalGpuStatesPtr()->rank;
+  HSAuint64* remoteSignal = dest->peerSignalPtrs[pe]
+                            + static_cast<size_t>(myPe) * dest->sdmaNumQueue;
 
-    core::SdmaPutThread(srcPtr, dstPtr, bytes, devicehandles, remoteSignal, dest->sdmaNumQueue, qpId);
+  core::SdmaPutThread(srcPtr, dstPtr, bytes, devicehandles, remoteSignal,
+                      dest->sdmaNumQueue, qpId);
 }
 
 template <>
 inline __device__ void ShmemPutMemNbiWarpKernel<application::TransportType::SDMA>(
     const application::SymmMemObjPtr dest, size_t destOffset,
-    const application::RdmaMemoryRegion& source, size_t sourceOffset, size_t bytes, int pe,
-    int qpId) {
-    uint8_t* srcPtr = reinterpret_cast<uint8_t*>(source.addr + sourceOffset);
-    uint8_t* dstPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[pe] + destOffset);
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe, int qpId) {
+  uint8_t* srcPtr =
+      reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(source->localPtr) + sourceOffset);
+  uint8_t* dstPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[pe] + destOffset);
 
-    anvil::SdmaQueueDeviceHandle** devicehandles = dest->deviceHandles_d + pe*dest->sdmaNumQueue;
-    int myPe = GetGlobalGpuStatesPtr()->rank;
-    HSAuint64* remoteSignal = dest->peerSignalPtrs[pe]
-                              + static_cast<size_t>(myPe) * dest->sdmaNumQueue;
+  anvil::SdmaQueueDeviceHandle** devicehandles =
+      dest->deviceHandles_d + pe * dest->sdmaNumQueue;
+  int myPe = GetGlobalGpuStatesPtr()->rank;
+  HSAuint64* remoteSignal = dest->peerSignalPtrs[pe]
+                            + static_cast<size_t>(myPe) * dest->sdmaNumQueue;
 
-    core::SdmaPutWarp(srcPtr, dstPtr, bytes, devicehandles, remoteSignal, dest->sdmaNumQueue);
+  core::SdmaPutWarp(srcPtr, dstPtr, bytes, devicehandles, remoteSignal,
+                    dest->sdmaNumQueue);
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiBlockKernel<application::TransportType::SDMA>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe, int qpId) {
+  // TODO: add SDMA block-level PutMemNbi
+  (void)dest;
+  (void)destOffset;
+  (void)source;
+  (void)sourceOffset;
+  (void)bytes;
+  (void)pe;
+  (void)qpId;
+}
+
+// Pure address-based PutMemNbi versions
+template <>
+inline __device__ void ShmemPutMemNbiThreadKernel<application::TransportType::SDMA>(
+    const void* dest, const void* source, size_t bytes, int pe, int qpId) {
+  GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+  application::SymmMemObj* heapObj = globalGpuStates->heapObj;
+  int myPe = globalGpuStates->rank;
+
+  uintptr_t destAddr = reinterpret_cast<uintptr_t>(dest);
+  size_t offset = destAddr - globalGpuStates->heapBaseAddr;
+
+  uint8_t* srcPtr = const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(source));
+  uint8_t* dstPtr = reinterpret_cast<uint8_t*>(heapObj->peerPtrs[pe] + offset);
+
+  anvil::SdmaQueueDeviceHandle** devicehandles =
+      heapObj->deviceHandles_d + pe * heapObj->sdmaNumQueue;
+  HSAuint64* remoteSignal = heapObj->peerSignalPtrs[pe]
+                            + static_cast<size_t>(myPe) * heapObj->sdmaNumQueue;
+
+  core::SdmaPutThread(srcPtr, dstPtr, bytes, devicehandles, remoteSignal,
+                      heapObj->sdmaNumQueue, qpId);
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiWarpKernel<application::TransportType::SDMA>(
+    const void* dest, const void* source, size_t bytes, int pe, int qpId) {
+  GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
+  application::SymmMemObj* heapObj = globalGpuStates->heapObj;
+  int myPe = globalGpuStates->rank;
+
+  uintptr_t destAddr = reinterpret_cast<uintptr_t>(dest);
+  size_t offset = destAddr - globalGpuStates->heapBaseAddr;
+
+  uint8_t* srcPtr = const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(source));
+  uint8_t* dstPtr = reinterpret_cast<uint8_t*>(heapObj->peerPtrs[pe] + offset);
+
+  anvil::SdmaQueueDeviceHandle** devicehandles =
+      heapObj->deviceHandles_d + pe * heapObj->sdmaNumQueue;
+  HSAuint64* remoteSignal = heapObj->peerSignalPtrs[pe]
+                            + static_cast<size_t>(myPe) * heapObj->sdmaNumQueue;
+
+  core::SdmaPutWarp(srcPtr, dstPtr, bytes, devicehandles, remoteSignal,
+                    heapObj->sdmaNumQueue);
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiBlockKernel<application::TransportType::SDMA>(
+    const void* dest, const void* source, size_t bytes, int pe, int qpId) {
+  // TODO: add SDMA block-level PutMemNbi
+  (void)dest;
+  (void)source;
+  (void)bytes;
+  (void)pe;
+  (void)qpId;
 }
 
 template <>
 inline __device__ void ShmemPutSizeImmNbiThreadKernel<application::TransportType::SDMA>(
     const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes, int pe,
     int qpId) {
+  ShmemPutSizeImmNbiThreadKernel<application::TransportType::P2P>(dest, destOffset, val, bytes, pe,
+                                                                  qpId);
 }
 template <>
 inline __device__ void ShmemPutSizeImmNbiWarpKernel<application::TransportType::SDMA>(
     const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes, int pe,
     int qpId) {
+  ShmemPutSizeImmNbiWarpKernel<application::TransportType::P2P>(dest, destOffset, val, bytes, pe,
+                                                                qpId);
 }
+
+// Pure address-based PutSizeImmNbi versions
+template <>
+inline __device__ void ShmemPutSizeImmNbiThreadKernel<application::TransportType::SDMA>(
+    const void* dest, void* val, size_t bytes, int pe, int qpId) {
+  ShmemPutSizeImmNbiThreadKernel<application::TransportType::P2P>(dest, val, bytes, pe, qpId);
+}
+
+template <>
+inline __device__ void ShmemPutSizeImmNbiWarpKernel<application::TransportType::SDMA>(
+    const void* dest, void* val, size_t bytes, int pe, int qpId) {
+  ShmemPutSizeImmNbiWarpKernel<application::TransportType::P2P>(dest, val, bytes, pe, qpId);
+}
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                    PutMemNbi with Signal                                       */
 /* ---------------------------------------------------------------------------------------------- */
 
 template <>
+inline __device__ void ShmemPutMemNbiSignalThreadKernel<application::TransportType::SDMA, true>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
+    core::atomicType signalOp, int pe, int qpId) {
+  // TODO: add SDMA PutMemNbiSignal
+  (void)dest;
+  (void)destOffset;
+  (void)source;
+  (void)sourceOffset;
+  (void)bytes;
+  (void)signalDest;
+  (void)signalDestOffset;
+  (void)signalValue;
+  (void)signalOp;
+  (void)pe;
+  (void)qpId;
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiSignalThreadKernel<application::TransportType::SDMA, false>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
+    core::atomicType signalOp, int pe, int qpId) {
+  // TODO: add SDMA PutMemNbiSignal
+  (void)dest;
+  (void)destOffset;
+  (void)source;
+  (void)sourceOffset;
+  (void)bytes;
+  (void)signalDest;
+  (void)signalDestOffset;
+  (void)signalValue;
+  (void)signalOp;
+  (void)pe;
+  (void)qpId;
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiSignalWarpKernel<application::TransportType::SDMA, true>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
+    core::atomicType signalOp, int pe, int qpId) {
+  // TODO: add SDMA PutMemNbiSignal
+  (void)dest;
+  (void)destOffset;
+  (void)source;
+  (void)sourceOffset;
+  (void)bytes;
+  (void)signalDest;
+  (void)signalDestOffset;
+  (void)signalValue;
+  (void)signalOp;
+  (void)pe;
+  (void)qpId;
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiSignalWarpKernel<application::TransportType::SDMA, false>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
+    core::atomicType signalOp, int pe, int qpId) {
+  // TODO: add SDMA PutMemNbiSignal
+  (void)dest;
+  (void)destOffset;
+  (void)source;
+  (void)sourceOffset;
+  (void)bytes;
+  (void)signalDest;
+  (void)signalDestOffset;
+  (void)signalValue;
+  (void)signalOp;
+  (void)pe;
+  (void)qpId;
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiSignalBlockKernel<application::TransportType::SDMA, true>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
+    core::atomicType signalOp, int pe, int qpId) {
+  // TODO: add SDMA PutMemNbiSignal
+  (void)dest;
+  (void)destOffset;
+  (void)source;
+  (void)sourceOffset;
+  (void)bytes;
+  (void)signalDest;
+  (void)signalDestOffset;
+  (void)signalValue;
+  (void)signalOp;
+  (void)pe;
+  (void)qpId;
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiSignalBlockKernel<application::TransportType::SDMA, false>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes,
+    const application::SymmMemObjPtr signalDest, size_t signalDestOffset, uint64_t signalValue,
+    core::atomicType signalOp, int pe, int qpId) {
+  // TODO: add SDMA PutMemNbiSignal
+  (void)dest;
+  (void)destOffset;
+  (void)source;
+  (void)sourceOffset;
+  (void)bytes;
+  (void)signalDest;
+  (void)signalDestOffset;
+  (void)signalValue;
+  (void)signalOp;
+  (void)pe;
+  (void)qpId;
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiSignalThreadKernel<application::TransportType::SDMA, true>(
+    const void* dest, const void* source, size_t bytes, const void* signalDest,
+    uint64_t signalValue, core::atomicType signalOp, int pe, int qpId) {
+  // TODO: add SDMA PutMemNbiSignal (address-based)
+  (void)dest;
+  (void)source;
+  (void)bytes;
+  (void)signalDest;
+  (void)signalValue;
+  (void)signalOp;
+  (void)pe;
+  (void)qpId;
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiSignalThreadKernel<application::TransportType::SDMA, false>(
+    const void* dest, const void* source, size_t bytes, const void* signalDest,
+    uint64_t signalValue, core::atomicType signalOp, int pe, int qpId) {
+  // TODO: add SDMA PutMemNbiSignal (address-based)
+  (void)dest;
+  (void)source;
+  (void)bytes;
+  (void)signalDest;
+  (void)signalValue;
+  (void)signalOp;
+  (void)pe;
+  (void)qpId;
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiSignalWarpKernel<application::TransportType::SDMA, true>(
+    const void* dest, const void* source, size_t bytes, const void* signalDest,
+    uint64_t signalValue, core::atomicType signalOp, int pe, int qpId) {
+  // TODO: add SDMA PutMemNbiSignal (address-based)
+  (void)dest;
+  (void)source;
+  (void)bytes;
+  (void)signalDest;
+  (void)signalValue;
+  (void)signalOp;
+  (void)pe;
+  (void)qpId;
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiSignalWarpKernel<application::TransportType::SDMA, false>(
+    const void* dest, const void* source, size_t bytes, const void* signalDest,
+    uint64_t signalValue, core::atomicType signalOp, int pe, int qpId) {
+  // TODO: add SDMA PutMemNbiSignal (address-based)
+  (void)dest;
+  (void)source;
+  (void)bytes;
+  (void)signalDest;
+  (void)signalValue;
+  (void)signalOp;
+  (void)pe;
+  (void)qpId;
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiSignalBlockKernel<application::TransportType::SDMA, true>(
+    const void* dest, const void* source, size_t bytes, const void* signalDest,
+    uint64_t signalValue, core::atomicType signalOp, int pe, int qpId) {
+  // TODO: add SDMA PutMemNbiSignal (address-based)
+  (void)dest;
+  (void)source;
+  (void)bytes;
+  (void)signalDest;
+  (void)signalValue;
+  (void)signalOp;
+  (void)pe;
+  (void)qpId;
+}
+
+template <>
+inline __device__ void ShmemPutMemNbiSignalBlockKernel<application::TransportType::SDMA, false>(
+    const void* dest, const void* source, size_t bytes, const void* signalDest,
+    uint64_t signalValue, core::atomicType signalOp, int pe, int qpId) {
+  // TODO: add SDMA PutMemNbiSignal (address-based)
+  (void)dest;
+  (void)source;
+  (void)bytes;
+  (void)signalDest;
+  (void)signalValue;
+  (void)signalOp;
+  (void)pe;
+  (void)qpId;
+}
+
+template <>
 inline __device__ void ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::SDMA>(
     const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes,
     core::atomicType amoType, int pe, int qpId) {
-        ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::P2P>(dest, destOffset, val, bytes, amoType, pe);
+  ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::P2P>(dest, destOffset, val, bytes,
+                                                                       amoType, pe);
 }
 
 template <>
 inline __device__ void ShmemAtomicSizeNonFetchWarpKernel<application::TransportType::SDMA>(
     const application::SymmMemObjPtr dest, size_t destOffset, void* val, size_t bytes,
     core::atomicType amoType, int pe, int qpId) {
-        ShmemAtomicSizeNonFetchWarpKernel<application::TransportType::P2P>(dest, destOffset, val, bytes, amoType, pe);
+  ShmemAtomicSizeNonFetchWarpKernel<application::TransportType::P2P>(dest, destOffset, val, bytes,
+                                                                     amoType, pe);
 }
 
+// Pure address-based Atomic versions
+template <>
+inline __device__ void ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::SDMA>(
+    const void* dest, void* val, size_t bytes, core::atomicType amoType, int pe, int qpId) {
+  ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::P2P>(dest, val, bytes, amoType,
+                                                                       pe, qpId);
+}
+
+template <>
+inline __device__ void ShmemAtomicSizeNonFetchWarpKernel<application::TransportType::SDMA>(
+    const void* dest, void* val, size_t bytes, core::atomicType amoType, int pe, int qpId) {
+  ShmemAtomicSizeNonFetchWarpKernel<application::TransportType::P2P>(dest, val, bytes, amoType, pe,
+                                                                     qpId);
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                                    GetMemNbi (SymmMemObjPtr)                                   */
+/* ---------------------------------------------------------------------------------------------- */
+// TODO: implement SDMA-specific GET, delegating to P2P for now
+template <>
+inline __device__ void ShmemGetMemNbiThreadKernel<application::TransportType::SDMA>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe, int qpId) {
+  ShmemGetMemNbiThreadKernel<application::TransportType::P2P>(dest, destOffset, source,
+                                                              sourceOffset, bytes, pe, qpId);
+}
+
+template <>
+inline __device__ void ShmemGetMemNbiWarpKernel<application::TransportType::SDMA>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe, int qpId) {
+  ShmemGetMemNbiWarpKernel<application::TransportType::P2P>(dest, destOffset, source, sourceOffset,
+                                                            bytes, pe, qpId);
+}
+
+template <>
+inline __device__ void ShmemGetMemNbiBlockKernel<application::TransportType::SDMA>(
+    const application::SymmMemObjPtr dest, size_t destOffset,
+    const application::SymmMemObjPtr source, size_t sourceOffset, size_t bytes, int pe, int qpId) {
+  ShmemGetMemNbiBlockKernel<application::TransportType::P2P>(dest, destOffset, source, sourceOffset,
+                                                             bytes, pe, qpId);
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                               GetMemNbi (Pure Address-Based)                                   */
+/* ---------------------------------------------------------------------------------------------- */
+// TODO: implement SDMA-specific GET, delegating to P2P for now
+template <>
+inline __device__ void ShmemGetMemNbiThreadKernel<application::TransportType::SDMA>(
+    void* dest, const void* source, size_t bytes, int pe, int qpId) {
+  ShmemGetMemNbiThreadKernel<application::TransportType::P2P>(dest, source, bytes, pe, qpId);
+}
+
+template <>
+inline __device__ void ShmemGetMemNbiWarpKernel<application::TransportType::SDMA>(
+    void* dest, const void* source, size_t bytes, int pe, int qpId) {
+  ShmemGetMemNbiWarpKernel<application::TransportType::P2P>(dest, source, bytes, pe, qpId);
+}
+
+template <>
+inline __device__ void ShmemGetMemNbiBlockKernel<application::TransportType::SDMA>(
+    void* dest, const void* source, size_t bytes, int pe, int qpId) {
+  ShmemGetMemNbiBlockKernel<application::TransportType::P2P>(dest, source, bytes, pe, qpId);
+}
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                         Synchronization                                        */
@@ -114,23 +480,28 @@ template <>
 inline __device__ void ShmemQuietThreadKernel<application::TransportType::SDMA>(int pe, int qpId) {}
 
 template <application::TransportType>
-inline __device__ void ShmemQuietThreadKernel(int pe, const application::SymmMemObjPtr dest){
-    anvil::SdmaQueueDeviceHandle** devicehandles = dest->deviceHandles_d + pe*dest->sdmaNumQueue;
-    HSAuint64* signals = dest->signalPtrs + pe*dest->sdmaNumQueue;
-    HSAuint64* expectedSignals = dest->expectSignalsPtr + pe*dest->sdmaNumQueue;
+inline __device__ void ShmemQuietThreadKernel(int pe, const application::SymmMemObjPtr dest) {
+  int intraNodePe = pe % 8;
 
-    core::SdmaQueitThread(signals, expectedSignals, dest->sdmaNumQueue);
+  anvil::SdmaQueueDeviceHandle** devicehandles =
+      dest->deviceHandles_d + intraNodePe * dest->sdmaNumQueue;
+  HSAuint64* signals = dest->signalPtrs + intraNodePe * dest->sdmaNumQueue;
+  HSAuint64* expectedSignals = dest->expectSignalsPtr + intraNodePe * dest->sdmaNumQueue;
+
+  core::SdmaQueitThread(signals, expectedSignals, dest->sdmaNumQueue);
 }
 
 template <application::TransportType>
-inline __device__ void ShmemQuietWarpKernel(int pe, const application::SymmMemObjPtr dest){
-    anvil::SdmaQueueDeviceHandle** devicehandles = dest->deviceHandles_d + pe*dest->sdmaNumQueue;
-    HSAuint64* signals = dest->signalPtrs + pe*dest->sdmaNumQueue;
-     HSAuint64* expectedSignals = dest->expectSignalsPtr + pe*dest->sdmaNumQueue;
+inline __device__ void ShmemQuietWarpKernel(int pe, const application::SymmMemObjPtr dest) {
+  int intraNodePe = pe % 8;
 
-    core::SdmaQueitWarp(signals, expectedSignals, dest->sdmaNumQueue);
+  anvil::SdmaQueueDeviceHandle** devicehandles =
+      dest->deviceHandles_d + intraNodePe * dest->sdmaNumQueue;
+  HSAuint64* signals = dest->signalPtrs + intraNodePe * dest->sdmaNumQueue;
+  HSAuint64* expectedSignals = dest->expectSignalsPtr + intraNodePe * dest->sdmaNumQueue;
+
+  core::SdmaQueitWarp(signals, expectedSignals, dest->sdmaNumQueue);
 }
-
 
 }  // namespace shmem
 }  // namespace mori
