@@ -47,13 +47,6 @@ __global__ void PipelinedAllReduceSdmaKernel(
 
   if (elementCount == 0 || npes <= 0) return;
 
-  if (threadIdx.x == 0) {
-#if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) || defined(__gfx950__)
-    asm volatile("buffer_inv" ::: "memory");
-#endif
-  }
-  __syncthreads();
-
   using P = typename packed_t<T>::P;
   using A = typename packed_t<T>::A;
   constexpr int pack_size = P::size;
@@ -129,7 +122,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
         const size_t off = static_cast<size_t>(c) * packedChunkPerRank;
 
         if (c > 0 && threadIdx.x == 64) {
-#if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) || defined(__gfx950__)
+#if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
           asm volatile("buffer_wbl2" ::: "memory");
 #endif
           __threadfence();
@@ -195,7 +188,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
       }
 
       if (threadIdx.x == 0) {
-#if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) || defined(__gfx950__)
+#if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
         asm volatile("buffer_wbl2" ::: "memory");
 #endif
         __threadfence();
