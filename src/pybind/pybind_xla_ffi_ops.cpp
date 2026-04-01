@@ -179,7 +179,7 @@ Error MoriDispatchImpl(hipStream_t stream, EpDispatchCombineHandle* h, Dictionar
                             input.dimensions()[0], FFIType2HipType(input.element_type()), block_num,
                             rdma_block_num, warp_per_block, stream, hiddenDim);
 
-  GpuCopy(out->untyped_data(), h->shmemDispatchOutTokMemObj->Get(), out->size_bytes(), stream);
+  GpuCopy(out->untyped_data(), h->GetShmemDispatchOutTokMemObj()->Get(), out->size_bytes(), stream);
 
   if (weightsPtr) {
     auto out_weights = GetRet<BufferR2<F32>>(rets, 3);
@@ -240,7 +240,7 @@ Error MoriCombineImpl(hipStream_t stream, EpDispatchCombineHandle* h, Dictionary
                            rdma_block_num, warp_per_block, h->config.useExternalInpBuffer ? 1 : 0,
                            stream, hiddenDim);
 
-  GpuCopy(out->untyped_data(), h->shmemCombineOutTokMemObj->Get(), out->size_bytes(), stream);
+  GpuCopy(out->untyped_data(), h->GetShmemCombineOutTokMemObj()->Get(), out->size_bytes(), stream);
   // {handle.config.maxNumInpTokenPerRank, handle.config.hiddenDim},
 
   if (weightsPtr) {
