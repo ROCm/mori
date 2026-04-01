@@ -118,6 +118,8 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       if (laneId == 0) {
         // decide token id in dest pe
         destTokId = atomicAdd(args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe), 1);
+        assert(destTokId <= config.MaxNumTokensToRecv() &&
+               "Total recv token overflow: increase maxTotalRecvTokens");
         atomicAdd(args.destPeTokenCounter + destPe, 1);
         // In dispDestTokIdMap, record the destination slot for this token-expert pair (flat index
         // into the dest PE's recv buffer) In dispTokIdToSrcTokIdMemObj on the dest PE, record which

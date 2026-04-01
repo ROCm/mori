@@ -21,6 +21,7 @@
 # SOFTWARE.
 import pytest
 from tests.python.utils import TorchDistProcessManager, data_type_supported
+import mori
 import torch
 import torch.distributed as dist
 
@@ -170,6 +171,20 @@ class EpDispatchCombineTestCase:
                     ) * self.config.num_experts_per_token
                     for j in range(self.config.num_experts_per_token):
                         indices[i, j] = (base + j) % total_experts
+            elif routing == "spread":
+                # Sends exactly one expert to every rank (requires num_experts_per_token ==
+                # world_size). After per-rank deduplication each rank receives every source
+                # token exactly once, so total recv = max_num_inp_token_per_rank * world_size
+                # (the true worst case).
+                assert (
+                    self.config.num_experts_per_token == self.config.world_size
+                ), "spread routing requires num_experts_per_token == world_size"
+                indices = torch.empty(
+                    n, self.config.num_experts_per_token, dtype=torch.int64
+                )
+                for i in range(n):
+                    for j in range(self.config.num_experts_per_token):
+                        indices[i, j] = j * self.config.num_experts_per_rank
             elif routing == "all_to_one":
                 indices = torch.zeros(
                     n, self.config.num_experts_per_token, dtype=torch.int64
@@ -407,3 +422,17 @@ class EpDispatchCombineTestCase:
         )
         self.sync()
         self.check_combine_result(op, test_data, combine_output, combine_output_weight)
+
+
+def run_ep_dispatch_combine_test(
+    config, test_case_cls, use_max_token_num=False, routing=None
+):
+    op = mori.ops.EpDispatchCombineOp(config)
+    test_case = test_case_cls(config)
+    gen_kwargs = {}
+    if use_max_token_num:
+        gen_kwargs["use_max_token_num"] = True
+    if routing is not None:
+        gen_kwargs["routing"] = routing
+    test_data = test_case.gen_test_data(**gen_kwargs)
+    test_case.run_test_once(op, test_data)

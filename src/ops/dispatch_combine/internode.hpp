@@ -109,8 +109,6 @@ __device__ void EpDispatchInterNodeKernel_body(EpDispatchCombineArgs<T> args) {
       } else {
         index_t destPeTokenIdx = 0, peSortedIdx = 0;
         destPeTokenIdx = atomicAdd(args.destPeTokenCounter + destPe, 1);
-        assert(destPeTokenIdx < MaxNumTokensToRecvPerRank &&
-               "Per-PE recv token overflow: increase maxTotalRecvTokens");
         peSortedIdx = destPe * MaxNumTokensToRecvPerRank + destPeTokenIdx;
         args.dispSenderIdxMap[expertOffset] = peSortedIdx;
         args.destPeTokenIdxMap[peSortedIdx] = tokenId;

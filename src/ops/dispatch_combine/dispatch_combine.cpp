@@ -179,6 +179,11 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
     bufs.combineOut = ShmemMallocAndReturnMemObjPtr(combineOutSize, hipDeviceMallocUncached);
   } else {
     auto& bufs = shmemTokBufs.emplace<ShmemBufsInterNode>();
+    // NOTE(ditian12): no overflow protection for dispatchInp/combinInp/staging in async kernel,
+    // hence have to allocate to max size we need to either implement compact layout or add
+    // pre-assertion to prevent silent memory access fault
+    size_t maxStagingSize =
+        static_cast<ssize_t>(config.MaxNumTokensToSend()) * config.MaxXferBytesPerToken();
     bufs.dispatchInp = ShmemMallocAndReturnMemObjPtr(maxStagingSize, hipDeviceMallocUncached);
     bufs.combineInp = ShmemMallocAndReturnMemObjPtr(maxStagingSize, hipDeviceMallocUncached);
     bufs.staging = ShmemMallocAndReturnMemObjPtr(maxStagingSize, hipDeviceMallocUncached);
@@ -273,8 +278,7 @@ void EpDispatchCombineHandle::FinalizeTokenNumSignalBuf() {
 }
 
 void EpDispatchCombineHandle::InitializeOrderMapBuf() {
-  size_t maxNumOutToken =
-      config.worldSize * config.MaxNumTokensToRecvPerRank() * config.numExpertPerRank;
+  size_t maxNumOutToken = config.MaxNumTokensToSend() * config.numExpertPerRank;
   HIP_RUNTIME_CHECK(hipMalloc(&dispReceiverIdxMap, maxNumOutToken * sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(dispReceiverIdxMap, 0, maxNumOutToken * sizeof(index_t)));
 
@@ -306,7 +310,7 @@ void EpDispatchCombineHandle::InitializeOrderMapBuf() {
   HIP_RUNTIME_CHECK(hipMemset(dispDestTokIdMap, 0, maxNumOutToken * sizeof(index_t)));
 
   size_t maxNumInterNodeToken = config.worldSize / config.gpuPerNode *
-                                config.MaxNumTokensToRecvPerRank() * config.numExpertPerToken;
+                                config.MaxNumTokensToSendPerRank() * config.numExpertPerToken;
   HIP_RUNTIME_CHECK(hipMalloc(&interNodeDispDestTokIdMap, maxNumInterNodeToken * sizeof(index_t)));
   HIP_RUNTIME_CHECK(
       hipMemset(interNodeDispDestTokIdMap, 0, maxNumInterNodeToken * sizeof(index_t)));
@@ -317,7 +321,7 @@ void EpDispatchCombineHandle::InitializeOrderMapBuf() {
       hipMemset(blockFlagCounter, 0, config.worldSize / config.gpuPerNode * sizeof(index_t)));
 
   size_t interNodeDispSendMapSize =
-      config.worldSize / config.gpuPerNode * config.MaxNumTokensToRecvPerRank() * sizeof(index_t);
+      config.worldSize / config.gpuPerNode * config.MaxNumTokensToSendPerRank() * sizeof(index_t);
   HIP_RUNTIME_CHECK(hipMalloc(&interNodeDispSendMap, interNodeDispSendMapSize));
   HIP_RUNTIME_CHECK(hipMemset(interNodeDispSendMap, 0, interNodeDispSendMapSize));
 
@@ -368,7 +372,7 @@ void EpDispatchCombineHandle::InitializeBarrier() {
       ShmemMallocAndReturnMemObjPtr(barrierSize * 2 * sizeof(uint64_t), hipDeviceMallocUncached);
 
   size_t interNodeChunkFlagSize =
-      config.worldSize / config.gpuPerNode * config.MaxNumTokensToRecvPerRank() * sizeof(uint64_t);
+      config.worldSize / config.gpuPerNode * config.MaxNumTokensToSendPerRank() * sizeof(uint64_t);
   interNodeChunkFlagMemObj =
       ShmemMallocAndReturnMemObjPtr(interNodeChunkFlagSize, hipDeviceMallocUncached);
 
