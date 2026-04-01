@@ -87,6 +87,7 @@ class EpDispatchCombineTestCase:
         dtype=torch.bfloat16,
         hidden_dim=7168,
         combine_dtype=None,
+        max_total_recv_tokens=0,
     ):
         self.rank = rank
         self.gpu_per_node = gpu_per_node
@@ -122,6 +123,7 @@ class EpDispatchCombineTestCase:
             rdma_block_num=64,
             num_qp_per_pe=num_qp,
             quant_type=quant_type,
+            max_total_recv_tokens=max_total_recv_tokens,
         )
 
     def setup(self):
@@ -417,7 +419,7 @@ class EpDispatchCombineTestCase:
         rank_counts, _, _ = self.count_token_num(all_rank_indices)
 
         src_token_pos = op.get_dispatch_src_token_pos().tolist()
-        max_num_token_to_send_per_rank = self.config.max_num_inp_token_per_rank
+        # max_num_token_to_send_per_rank = self.config.max_num_inp_token_per_rank
         recv_token_num = len(src_token_pos)
 
         # Check recv token num
@@ -431,9 +433,8 @@ class EpDispatchCombineTestCase:
 
         # Check token equality
         for i, src_token_id in enumerate(src_token_pos):
-            src_pe = src_token_id // max_num_token_to_send_per_rank
-            src_tok_id = src_token_id % max_num_token_to_send_per_rank
-            if _is_fp4x2_dtype(self.dispatch_data_type):
+            src_pe, src_tok_id = op.decode_send_flat_idx(src_token_id)
+            if _is_fp4x2_dtype(self.config.data_type):
                 is_pass = torch.equal(
                     dispatch_output[i].view(torch.uint8),
                     all_rank_input[src_pe][src_tok_id].view(torch.uint8),
@@ -1181,7 +1182,7 @@ def sweep_bench_dispatch_combine(
     kernel_type,
     num_qp,
     sweep_token_interval,
-    combine_dtype=None,
+    max_total_recv_tokens=0,
 ):
     world_size = num_node * gpu_per_node
     node_rank = int(os.environ["RANK"])
@@ -1197,7 +1198,7 @@ def sweep_bench_dispatch_combine(
         kernel_type,
         num_qp,
         dtype=dtype,
-        combine_dtype=combine_dtype,
+        max_total_recv_tokens=max_total_recv_tokens,
     )
     test_case.setup()
 
@@ -1261,6 +1262,7 @@ def test_dispatch_combine(
     block_num=-1,
     rdma_block_num=-1,
     warp_per_block=-1,
+    max_total_recv_tokens=0,
 ):
     world_size = num_node * gpu_per_node
     node_rank = int(os.environ["RANK"])
@@ -1277,6 +1279,7 @@ def test_dispatch_combine(
             quant_type,
             dtype,
             combine_dtype=combine_dtype,
+            max_total_recv_tokens=max_total_recv_tokens,
         )
         test_case.setup()
         if cmd == "test":
@@ -1305,7 +1308,7 @@ def test_dispatch_combine(
             kernel_type,
             num_qp,
             sweep_token_interval,
-            combine_dtype=combine_dtype,
+            max_total_recv_tokens=max_total_recv_tokens,
         )
     else:
         raise ValueError(f"unsupported command: {cmd}")
@@ -1395,6 +1398,12 @@ parser.add_argument(
     default=None,
     help="Override rdma_block_num for bench mode.",
 )
+parser.add_argument(
+    "--max-recv-total-tokens",
+    type=int,
+    default=0,
+    help="Maximum total number of received tokens across all ranks (default: 0, meaning no limit)",
+)
 args_cli = parser.parse_args()
 
 if __name__ == "__main__":
@@ -1425,6 +1434,7 @@ if __name__ == "__main__":
             args_cli.block_num if args_cli.block_num is not None else -1,
             args_cli.rdma_block_num if args_cli.rdma_block_num is not None else -1,
             args_cli.warp_per_block if args_cli.warp_per_block is not None else -1,
+            args_cli.max_recv_total_tokens,
         ),
         nprocs=gpu_per_node,
         join=True,

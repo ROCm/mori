@@ -108,6 +108,7 @@ def run_sweep(args):
         "kernel_type",
         "world_size",
         "max_tokens",
+        "max_total_recv_tokens",
         "hidden_dim",
         "topk",
         "dtype",
@@ -120,16 +121,17 @@ def run_sweep(args):
         len(args.kernel_type)
         * len(args.world_size)
         * len(args.max_tokens)
+        * len(args.max_total_recv_tokens)
         * len(args.hidden_dim)
         * len(args.num_experts_per_token)
         * len(args.dtype)
     )
     print(f"Sweeping {total_configs} configurations...\n")
     print(
-        f"{'kernel_type':<16} {'world_size':>10} {'max_tokens':>10} {'hidden_dim':>10} {'topk':>4} "
-        f"{'dtype':>16} {'gpu_per_node':>12} {'HBM(GB)':>10} {'error'}"
+        f"{'kernel_type':<16} {'world_size':>10} {'max_tokens':>10} {'max_recv':>10} "
+        f"{'hidden_dim':>10} {'topk':>4} {'dtype':>16} {'gpu_per_node':>12} {'HBM(GB)':>10} {'error'}"
     )
-    print("-" * 92)
+    print("-" * 104)
 
     idx = 0
     for kernel_type_str in args.kernel_type:
@@ -141,72 +143,75 @@ def run_sweep(args):
                 )
                 continue
             for max_tokens in args.max_tokens:
-                for hidden_dim in args.hidden_dim:
-                    for topk in args.num_experts_per_token:
-                        for dtype_str in args.dtype:
-                            idx += 1
-                            data_type = _DATA_TYPE_MAP[dtype_str]
+                for max_total_recv_tokens in args.max_total_recv_tokens:
+                    for hidden_dim in args.hidden_dim:
+                        for topk in args.num_experts_per_token:
+                            for dtype_str in args.dtype:
+                                idx += 1
+                                data_type = _DATA_TYPE_MAP[dtype_str]
 
-                            gpu_per_node = min(args.gpu_per_node, world_size)
+                                gpu_per_node = min(args.gpu_per_node, world_size)
 
-                            num_experts_per_rank = max(
-                                1, args.total_experts // world_size
-                            )
+                                num_experts_per_rank = max(
+                                    1, args.total_experts // world_size
+                                )
 
-                            # max_token_type_size: largest dtype we might dispatch
-                            max_token_type_size = 2  # bf16 = 2 bytes
-                            if data_type in (
-                                torch.float8_e4m3fnuz,
-                                torch.float8_e4m3fn,
-                            ):
-                                max_token_type_size = 2  # op still uses 2 for max
-                            if (
-                                hasattr(torch, "float4_e2m1fn_x2")
-                                and data_type is torch.float4_e2m1fn_x2
-                            ):
-                                max_token_type_size = 2
+                                # max_token_type_size: largest dtype we might dispatch
+                                max_token_type_size = 2  # bf16 = 2 bytes
+                                if data_type in (
+                                    torch.float8_e4m3fnuz,
+                                    torch.float8_e4m3fn,
+                                ):
+                                    max_token_type_size = 2  # op still uses 2 for max
+                                if (
+                                    hasattr(torch, "float4_e2m1fn_x2")
+                                    and data_type is torch.float4_e2m1fn_x2
+                                ):
+                                    max_token_type_size = 2
 
-                            config = mori.ops.EpDispatchCombineConfig(
-                                data_type=data_type,
-                                rank=0,
-                                world_size=world_size,
-                                hidden_dim=hidden_dim,
-                                scale_dim=0,
-                                scale_type_size=0,
-                                max_token_type_size=max_token_type_size,
-                                max_num_inp_token_per_rank=max_tokens,
-                                num_experts_per_rank=num_experts_per_rank,
-                                num_experts_per_token=topk,
-                                warp_num_per_block=16,
-                                block_num=80,
-                                use_external_inp_buf=True,
-                                kernel_type=kernel_type,
-                                gpu_per_node=gpu_per_node,
-                            )
+                                config = mori.ops.EpDispatchCombineConfig(
+                                    data_type=data_type,
+                                    rank=0,
+                                    world_size=world_size,
+                                    hidden_dim=hidden_dim,
+                                    scale_dim=0,
+                                    scale_type_size=0,
+                                    max_token_type_size=max_token_type_size,
+                                    max_num_inp_token_per_rank=max_tokens,
+                                    num_experts_per_rank=num_experts_per_rank,
+                                    num_experts_per_token=topk,
+                                    max_total_recv_tokens=max_total_recv_tokens,
+                                    warp_num_per_block=16,
+                                    block_num=80,
+                                    use_external_inp_buf=True,
+                                    kernel_type=kernel_type,
+                                    gpu_per_node=gpu_per_node,
+                                )
 
-                            hbm_bytes, err = measure_op_memory(config)
-                            hbm_gb = hbm_bytes / (1024**3)
+                                hbm_bytes, err = measure_op_memory(config)
+                                hbm_gb = hbm_bytes / (1024**3)
 
-                            err_str = err if err else ""
-                            print(
-                                f"{kernel_type_str:<16} {world_size:>10} {max_tokens:>10} "
-                                f"{hidden_dim:>10} {topk:>4} {dtype_str:>16} "
-                                f"{gpu_per_node:>12} {hbm_gb:>10.1f} {err_str}"
-                            )
+                                err_str = err if err else ""
+                                print(
+                                    f"{kernel_type_str:<16} {world_size:>10} {max_tokens:>10} "
+                                    f"{max_total_recv_tokens:>10} {hidden_dim:>10} {topk:>4} "
+                                    f"{dtype_str:>16} {gpu_per_node:>12} {hbm_gb:>10.1f} {err_str}"
+                                )
 
-                            results.append(
-                                {
-                                    "kernel_type": kernel_type_str,
-                                    "world_size": world_size,
-                                    "max_tokens": max_tokens,
-                                    "hidden_dim": hidden_dim,
-                                    "topk": topk,
-                                    "dtype": dtype_str,
-                                    "gpu_per_node": gpu_per_node,
-                                    "hbm_GB": round(hbm_gb, 2),
-                                    "error": err_str,
-                                }
-                            )
+                                results.append(
+                                    {
+                                        "kernel_type": kernel_type_str,
+                                        "world_size": world_size,
+                                        "max_tokens": max_tokens,
+                                        "max_total_recv_tokens": max_total_recv_tokens,
+                                        "hidden_dim": hidden_dim,
+                                        "topk": topk,
+                                        "dtype": dtype_str,
+                                        "gpu_per_node": gpu_per_node,
+                                        "hbm_GB": round(hbm_gb, 2),
+                                        "error": err_str,
+                                    }
+                                )
 
     mori.shmem.shmem_finalize()
 
@@ -241,6 +246,13 @@ def main():
         nargs="+",
         default=[4096, 8192, 16384],
         help="Max input tokens per rank to sweep (default: 4096 8192 16384)",
+    )
+    parser.add_argument(
+        "--max-total-recv-tokens",
+        type=int,
+        nargs="+",
+        default=[0],
+        help="Max total received tokens across ranks to sweep (default: 0)",
     )
     parser.add_argument(
         "--hidden-dim",
@@ -314,6 +326,7 @@ def main():
     print(f"  MORI_SHMEM_HEAP_SIZE = {os.environ.get('MORI_SHMEM_HEAP_SIZE', 'unset')}")
     print(f"  world_size:    {args.world_size}")
     print(f"  max_tokens:    {args.max_tokens}")
+    print(f"  max_recv:      {args.max_total_recv_tokens}")
     print(f"  hidden_dim:    {args.hidden_dim}")
     print(f"  topk:          {args.num_experts_per_token}")
     print(f"  total_experts: {args.total_experts}")

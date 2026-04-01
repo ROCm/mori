@@ -93,7 +93,7 @@ int64_t PrepareAndBuildArgs(mori::moe::EpDispatchCombineHandle& handle, int64_t 
 }
 
 py::tuple GetDispatchOutputPtrs(mori::moe::EpDispatchCombineHandle& handle, bool has_scales) {
-  int64_t out_ptr = reinterpret_cast<int64_t>(handle.shmemDispatchOutTokMemObj->Get());
+  int64_t out_ptr = reinterpret_cast<int64_t>(handle.GetShmemDispatchOutTokMemObj()->Get());
   int64_t outW_ptr = reinterpret_cast<int64_t>(handle.shmemDispatchOutWeightsMemObj->Get());
   int64_t outS_ptr = (has_scales && handle.config.scaleDim > 0)
                          ? reinterpret_cast<int64_t>(handle.shmemOutScalesMemObj->Get())
@@ -104,7 +104,7 @@ py::tuple GetDispatchOutputPtrs(mori::moe::EpDispatchCombineHandle& handle, bool
 }
 
 py::tuple GetCombineOutputPtrs(mori::moe::EpDispatchCombineHandle& handle, bool has_weights) {
-  int64_t out_ptr = reinterpret_cast<int64_t>(handle.shmemCombineOutTokMemObj->Get());
+  int64_t out_ptr = reinterpret_cast<int64_t>(handle.GetShmemCombineOutTokMemObj()->Get());
   int64_t outW_ptr =
       has_weights ? reinterpret_cast<int64_t>(handle.shmemCombineOutWeightsMemObj->Get()) : 0;
   return py::make_tuple(out_ptr, outW_ptr);
@@ -173,10 +173,10 @@ int64_t BuildConvertCombineInputArgs(mori::moe::EpDispatchCombineHandle& handle,
   args->packedRecvSrcInfo = reinterpret_cast<void*>(packedRecvSrcInfo_ptr);
   args->packedRecvLayoutRange = nullptr;
   args->totalRecvTokenNum = handle.totalRecvTokenNum;
-  args->combineInput = handle.shmemCombineInpTokMemObj->Get();
+  args->combineInput = handle.GetShmemCombineInpTokMemObj()->Get();
   args->dispTokToEpSlotMap = handle.dispTokToEpSlotMap;
   args->packedRecvCount = handle.standardPackedRecvCount;
-  args->shmemCombineInpTokMemObj = handle.shmemCombineInpTokMemObj;
+  args->shmemCombineInpTokMemObj = handle.GetShmemCombineInpTokMemObj();
   args->dispTokIdToSrcTokIdMemObj = handle.dispTokIdToSrcTokIdMemObj;
   return reinterpret_cast<int64_t>(args);
 }
@@ -188,7 +188,7 @@ int64_t GetStandardMoePackedRecvCountPtr(mori::moe::EpDispatchCombineHandle& han
 }
 
 int64_t GetCombineInputPtr(mori::moe::EpDispatchCombineHandle& handle) {
-  return reinterpret_cast<int64_t>(handle.shmemCombineInpTokMemObj->Get());
+  return reinterpret_cast<int64_t>(handle.GetShmemCombineInpTokMemObj()->Get());
 }
 #endif
 
@@ -217,7 +217,7 @@ py::tuple GetDispatchReceiverTokenIdxMap(mori::moe::EpDispatchCombineHandle& han
 py::tuple GetRegisteredCombineInputBuffer(mori::moe::EpDispatchCombineHandle& handle,
                                           int hidden_dim = -1) {
   const int actual = (hidden_dim > 0) ? hidden_dim : static_cast<int>(handle.config.hiddenDim);
-  return py::make_tuple(reinterpret_cast<int64_t>(handle.shmemCombineInpTokMemObj->Get()),
+  return py::make_tuple(reinterpret_cast<int64_t>(handle.GetShmemCombineInpTokMemObj()->Get()),
                         static_cast<int64_t>(handle.config.MaxNumTokensToRecv()),
                         static_cast<int64_t>(actual));
 }
@@ -292,14 +292,14 @@ void RegisterMoriOps(py::module_& m) {
   mori::pybind::RegisterAllProfilerSlots(m);
 
   pybind11::class_<mori::moe::EpDispatchCombineConfig>(m, "EpDispatchCombineConfig")
-      .def(pybind11::init<int, int, int, int, int, int, int, int, int, int, int, bool,
+      .def(pybind11::init<int, int, int, int, int, int, int, int, int, int, int, int, bool,
                           mori::moe::KernelType, int, int, int, mori::moe::QuantType>(),
            py::arg("rank") = 0, py::arg("world_size") = 0, py::arg("hidden_dim") = 0,
            py::arg("scale_dim") = 0, py::arg("scale_type_size") = 0,
            py::arg("max_token_type_size") = 0, py::arg("max_num_inp_token_per_rank") = 0,
            py::arg("num_experts_per_rank") = 0, py::arg("num_experts_per_token") = 0,
-           py::arg("warp_num_per_block") = 0, py::arg("block_num") = 0,
-           py::arg("use_external_inp_buf") = true,
+           py::arg("max_total_recv_tokens") = 0, py::arg("warp_num_per_block") = 0,
+           py::arg("block_num") = 0, py::arg("use_external_inp_buf") = true,
            py::arg("kernel_type") = mori::moe::KernelType::IntraNode, py::arg("gpu_per_node") = 8,
            py::arg("rdma_block_num") = 0, py::arg("num_qp_per_pe") = 1,
            py::arg("quant_type") = mori::moe::QuantType::None)
@@ -314,6 +314,8 @@ void RegisterMoriOps(py::module_& m) {
       .def_readwrite("num_experts_per_rank", &mori::moe::EpDispatchCombineConfig::numExpertPerRank)
       .def_readwrite("num_experts_per_token",
                      &mori::moe::EpDispatchCombineConfig::numExpertPerToken)
+      .def_readwrite("max_total_recv_tokens",
+                     &mori::moe::EpDispatchCombineConfig::maxTotalRecvTokens)
       .def_readwrite("warp_num_per_block", &mori::moe::EpDispatchCombineConfig::warpNumPerBlock)
       .def_readwrite("block_num", &mori::moe::EpDispatchCombineConfig::blockNum)
       .def_readwrite("kernel_type", &mori::moe::EpDispatchCombineConfig::kernelType)
@@ -322,7 +324,12 @@ void RegisterMoriOps(py::module_& m) {
       .def_readwrite("num_qp_per_pe", &mori::moe::EpDispatchCombineConfig::numQpPerPe)
       .def_readwrite("quant_type", &mori::moe::EpDispatchCombineConfig::quantType)
       .def("to_packed_array", &mori::moe::EpDispatchCombineConfig::ToPackedI32Array)
-      .def("max_num_tokens_to_recv", &mori::moe::EpDispatchCombineConfig::MaxNumTokensToRecv);
+      .def("max_num_tokens_to_recv", &mori::moe::EpDispatchCombineConfig::MaxNumTokensToRecv)
+      .def("max_num_tokens_to_recv_per_rank",
+           &mori::moe::EpDispatchCombineConfig::MaxNumTokensToRecvPerRank)
+      .def("max_num_tokens_to_send", &mori::moe::EpDispatchCombineConfig::MaxNumTokensToSend)
+      .def("max_num_tokens_to_send_per_rank",
+           &mori::moe::EpDispatchCombineConfig::MaxNumTokensToSendPerRank);
 
   DeclareEpDispatchCombineHandle(m);
 

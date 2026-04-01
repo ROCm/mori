@@ -21,10 +21,10 @@
 # SOFTWARE.
 import mori
 from collections import namedtuple
-from tests.python.ops.test_dispatch_combine import (
-    EpDispatchCombineTestCase,
+from tests.python.ops.dispatch_combine_test_utils import (
     _is_fp4x2_dtype,
     unpack_fp4x2,
+    EpDispatchCombineTestCase,
 )
 from tests.python.utils import TorchDistContext, get_free_port
 import torch
@@ -638,6 +638,7 @@ def _bench_dispatch_combine(
     combine_block_num_arg=None,
     combine_warp_per_block_arg=None,
     combine_data_type=None,
+    max_total_recv_tokens=0,
 ):
     if combine_data_type is None:
         combine_data_type = data_type
@@ -663,6 +664,7 @@ def _bench_dispatch_combine(
         max_num_inp_token_per_rank=max_num_inp_token_per_rank,
         num_experts_per_rank=num_experts_per_rank,
         num_experts_per_token=num_experts_per_token,
+        max_total_recv_tokens=max_total_recv_tokens,
         warp_num_per_block=16,
         block_num=80,
         use_external_inp_buf=not zero_copy,  # zero-copy mode requires use_external_inp_buf=False
@@ -877,6 +879,7 @@ def bench_dispatch_combine(
     num_experts_per_rank=32,
     num_experts_per_token=8,
     combine_data_type=None,
+    max_total_recv_tokens=0,
 ):
     if combine_data_type is None:
         combine_data_type = dtype
@@ -901,6 +904,7 @@ def bench_dispatch_combine(
             combine_block_num,
             combine_warp_per_block,
             combine_data_type,
+            max_total_recv_tokens,
         ),
         nprocs=world_size,
         join=True,
@@ -999,6 +1003,12 @@ if __name__ == "__main__":
         help="Number of experts per token (top-k, default: 8)",
     )
     parser.add_argument(
+        "--max-recv-total-tokens",
+        type=int,
+        default=0,
+        help="Maximum total number of received tokens across all ranks (default: 0, meaning no limit)",
+    )
+    parser.add_argument(
         "--combine-dtype",
         type=str,
         default=None,
@@ -1053,4 +1063,5 @@ if __name__ == "__main__":
         num_experts_per_rank=args.num_experts_per_rank,
         num_experts_per_token=args.num_experts_per_token,
         combine_data_type=combine_dtype,
+        max_total_recv_tokens=args.max_recv_total_tokens,
     )

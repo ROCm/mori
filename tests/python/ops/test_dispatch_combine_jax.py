@@ -348,16 +348,27 @@ def _run_ep_dispatch_combine(
         assert src_num_recv_token_pos.size == int(dispatch_recv_num_token)
 
         # --- validate dispatch ---
+        # src_pos = pe * MaxNumTokensToSend() + local_tok_id
+        # MaxNumTokensToSend() = world_size * max_num_inp_token_per_rank
+        # input_list is gathered with stride max_num_inp_token_per_rank, so decode first.
+        tok_stride = config.max_num_tokens_to_send()
+        inp_tok_per_rank = config.max_num_inp_token_per_rank
+
         @jax.jit
-        def validate_dispatch(num, src_pos, base_list, base_out, *args):
-            Y = base_list[src_pos]
+        def validate_dispatch(
+            num, src_pos, tok_stride, inp_tok_per_rank, base_list, base_out, *args
+        ):
+            pe = src_pos // tok_stride
+            local_tok_id = src_pos - pe * tok_stride
+            list_idx = pe * inp_tok_per_rank + local_tok_id
+            Y = base_list[list_idx]
             N = Y.shape[0]
             mask = jnp.arange(N) < num
             mask2D = mask[:, None]
             x = jnp.all((Y == base_out) | (~mask2D))
             for x_list, x_out in args:
                 if x_out is not None:
-                    x = x & jnp.all((x_list[src_pos] == x_out) | (~mask2D))
+                    x = x & jnp.all((x_list[list_idx] == x_out) | (~mask2D))
             maxv = jnp.iinfo(src_pos.dtype).max
             S_masked = jnp.where(mask, src_pos, maxv)
             S_sorted = jnp.sort(S_masked)
@@ -369,6 +380,8 @@ def _run_ep_dispatch_combine(
         res = validate_dispatch(
             dispatch_recv_num_token,
             src_token_pos,
+            tok_stride,
+            inp_tok_per_rank,
             input_list,
             dispatch_output,
             (weights_list, dispatch_weights),
