@@ -2,7 +2,7 @@
 build/
 build*/
 lib*
-!3rdparty/**/lib*
+!3rdparty/
 dist/*
 
 # Python
