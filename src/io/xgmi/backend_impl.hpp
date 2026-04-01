@@ -25,6 +25,7 @@
 
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <unordered_map>
 
@@ -96,6 +97,9 @@ class XgmiBackend : public Backend {
 
  private:
   void InitializeP2PAccess();
+  std::optional<int> ResolveVisibleDeviceId(const MemoryDesc& desc) const;
+  bool IsSameProcessEngine(const EngineKey& engineKey) const;
+  bool IsSameNodeEngine(const EngineKey& engineKey) const;
   void* GetRemappedAddress(const MemoryDesc& desc, int localDeviceId);
 
   struct SessionCacheKey {
@@ -133,6 +137,7 @@ class XgmiBackend : public Backend {
 
   int numDevices{0};
   std::vector<std::vector<bool>> p2pMatrix;
+  std::unordered_map<std::string, int> localDeviceByBusId;
 
   struct IpcHandleEntry {
     hipIpcMemHandle_t handle;
@@ -140,15 +145,23 @@ class XgmiBackend : public Backend {
     size_t size{0};
   };
   struct IpcCacheKey {
+    EngineKey engineKey;
     MemoryUniqueId memId;
     int deviceId;
     bool operator==(const IpcCacheKey& o) const {
-      return memId == o.memId && deviceId == o.deviceId;
+      return engineKey == o.engineKey && memId == o.memId && deviceId == o.deviceId;
     }
   };
   struct IpcCacheKeyHash {
     std::size_t operator()(const IpcCacheKey& k) const noexcept {
-      return std::hash<uint64_t>()(k.memId) ^ (std::hash<int>()(k.deviceId) << 32);
+      std::size_t seed = 0;
+      auto hash_combine = [](std::size_t& value, std::size_t next) {
+        value ^= next + 0x9e3779b97f4a7c15ULL + (value << 6) + (value >> 2);
+      };
+      hash_combine(seed, std::hash<std::string>()(k.engineKey));
+      hash_combine(seed, std::hash<uint64_t>()(k.memId));
+      hash_combine(seed, std::hash<int>()(k.deviceId));
+      return seed;
     }
   };
   mutable std::shared_mutex ipcMutex;
@@ -161,6 +174,7 @@ class XgmiBackend : public Backend {
 
   std::unordered_map<EngineKey, EngineDesc> remoteEngines;
   mutable std::mutex remoteEnginesMu;
+  int myPid{0};
 };
 
 }  // namespace io

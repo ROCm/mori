@@ -29,6 +29,7 @@
 #include <climits>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <numeric>
 #include <sstream>
 
@@ -88,6 +89,70 @@ class ScopedHipDeviceGuard {
   int originalDevice_{0};
   bool valid_{true};
 };
+
+struct TransferCompletion {
+  TransferStatus* status{nullptr};
+  hipEvent_t event{nullptr};
+  int eventDevice{-1};
+  EventPool* eventPool{nullptr};
+  std::function<void()> cleanup;
+  std::once_flag completionOnce;
+  std::atomic<bool> completed{false};
+  std::mutex eventMu;
+
+  void FinalizeBlocking() {
+    std::lock_guard<std::mutex> lock(eventMu);
+    std::call_once(completionOnce, [this]() {
+      hipError_t err = hipEventSynchronize(event);
+      if (err == hipSuccess) {
+        status->SetCode(StatusCode::SUCCESS);
+      } else {
+        status->Update(StatusCode::ERR_GPU_OP,
+                       std::string("XGMI: hipEventSynchronize failed: ") + hipGetErrorString(err));
+      }
+      if (cleanup) cleanup();
+      eventPool->PutEvent(event, eventDevice);
+      completed.store(true, std::memory_order_release);
+    });
+  }
+
+  void FinalizeNonBlocking() {
+    std::lock_guard<std::mutex> lock(eventMu);
+    if (completed.load(std::memory_order_acquire)) {
+      return;
+    }
+
+    hipError_t err = hipEventQuery(event);
+    if (err == hipErrorNotReady) {
+      (void)hipGetLastError();
+      return;
+    }
+
+    std::call_once(completionOnce, [this, err]() {
+      if (err == hipSuccess) {
+        status->SetCode(StatusCode::SUCCESS);
+      } else {
+        status->Update(StatusCode::ERR_GPU_OP,
+                       std::string("XGMI: hipEventQuery failed: ") + hipGetErrorString(err));
+      }
+      if (cleanup) cleanup();
+      eventPool->PutEvent(event, eventDevice);
+      completed.store(true, std::memory_order_release);
+    });
+  }
+};
+
+void ArmTransferCompletion(TransferStatus* status, hipEvent_t event, int eventDevice,
+                           EventPool* eventPool, std::function<void()> cleanup = {}) {
+  auto completion = std::make_shared<TransferCompletion>();
+  completion->status = status;
+  completion->event = event;
+  completion->eventDevice = eventDevice;
+  completion->eventPool = eventPool;
+  completion->cleanup = std::move(cleanup);
+  status->SetWaitCallback([completion]() { completion->FinalizeBlocking(); });
+  status->SetProgressCallback([completion]() { completion->FinalizeNonBlocking(); });
+}
 
 }  // namespace
 
@@ -163,16 +228,7 @@ void XgmiBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size
   }
 
   status->SetCode(StatusCode::IN_PROGRESS);
-  status->SetWaitCallback([status, event, dstDevice, pool = eventPool]() {
-    hipError_t err = hipEventSynchronize(event);
-    if (err == hipSuccess) {
-      status->SetCode(StatusCode::SUCCESS);
-    } else {
-      status->Update(StatusCode::ERR_GPU_OP,
-                     std::string("XGMI: hipEventSynchronize failed: ") + hipGetErrorString(err));
-    }
-    pool->PutEvent(event, dstDevice);
-  });
+  ArmTransferCompletion(status, event, dstDevice, eventPool);
   MORI_IO_TRACE("XGMI: Transfer issued, id={}, size={}, isRead={}", id, size, isRead);
 }
 
@@ -319,17 +375,8 @@ void XgmiBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
       }
 
       status->SetCode(StatusCode::IN_PROGRESS);
-      status->SetWaitCallback([status, event, kernelDevice, pool = eventPool, dMeta]() {
-        hipError_t e = hipEventSynchronize(event);
-        if (e == hipSuccess) {
-          status->SetCode(StatusCode::SUCCESS);
-        } else {
-          status->Update(StatusCode::ERR_GPU_OP,
-                         std::string("XGMI: hipEventSynchronize failed: ") + hipGetErrorString(e));
-        }
-        (void)hipFree(dMeta);
-        pool->PutEvent(event, kernelDevice);
-      });
+      ArmTransferCompletion(status, event, kernelDevice, eventPool,
+                            [dMeta]() { (void)hipFree(dMeta); });
       MORI_IO_TRACE("XGMI: Batch transfer via scatter/gather kernel, id={}, segments={}, isRead={}",
                     id, numSegs, isRead);
       return;
@@ -382,16 +429,7 @@ void XgmiBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
   }
 
   status->SetCode(StatusCode::IN_PROGRESS);
-  status->SetWaitCallback([status, event, eventDevice, pool = eventPool]() {
-    hipError_t e = hipEventSynchronize(event);
-    if (e == hipSuccess) {
-      status->SetCode(StatusCode::SUCCESS);
-    } else {
-      status->Update(StatusCode::ERR_GPU_OP,
-                     std::string("XGMI: hipEventSynchronize failed: ") + hipGetErrorString(e));
-    }
-    pool->PutEvent(event, eventDevice);
-  });
+  ArmTransferCompletion(status, event, eventDevice, eventPool);
   MORI_IO_TRACE("XGMI: Batch transfer via hipMemcpy, id={}, segments={}, isRead={}", id,
                 segments.size(), isRead);
 }
@@ -404,7 +442,7 @@ bool XgmiBackendSession::Alive() const { return true; }
 
 XgmiBackend::XgmiBackend(EngineKey k, const IOEngineConfig& engConfig,
                          const XgmiBackendConfig& beConfig)
-    : myEngKey(k), config(beConfig) {
+    : myEngKey(k), config(beConfig), myPid(static_cast<int>(getpid())) {
   if (auto nodeId = mori::env::GetString("MORI_IO_NODE_ID"); nodeId.has_value()) {
     myNodeId = *nodeId;
   }
@@ -458,6 +496,14 @@ void XgmiBackend::InitializeP2PAccess() {
       continue;
     }
 
+    char busId[32] = {0};
+    err = hipDeviceGetPCIBusId(busId, sizeof(busId), i);
+    if (err == hipSuccess) {
+      localDeviceByBusId[std::string(busId)] = i;
+    } else {
+      MORI_IO_WARN("XGMI: Failed to query PCI bus id for device {}: {}", i, hipGetErrorString(err));
+    }
+
     for (int j = 0; j < numDevices; ++j) {
       if (i == j) {
         p2pMatrix[i][j] = true;
@@ -500,6 +546,53 @@ bool XgmiBackend::IsP2PAccessible(int srcDevice, int dstDevice) const {
     return false;
   }
   return p2pMatrix[srcDevice][dstDevice];
+}
+
+std::optional<int> XgmiBackend::ResolveVisibleDeviceId(const MemoryDesc& desc) const {
+  if (desc.loc != MemoryLocationType::GPU) {
+    return std::nullopt;
+  }
+
+  if (desc.engineKey == myEngKey) {
+    return desc.deviceId;
+  }
+
+  if (desc.deviceBusId.empty()) {
+    return std::nullopt;
+  }
+
+  auto it = localDeviceByBusId.find(desc.deviceBusId);
+  if (it == localDeviceByBusId.end()) {
+    return std::nullopt;
+  }
+  return it->second;
+}
+
+bool XgmiBackend::IsSameProcessEngine(const EngineKey& engineKey) const {
+  if (engineKey == myEngKey) {
+    return true;
+  }
+
+  std::lock_guard<std::mutex> lock(remoteEnginesMu);
+  auto it = remoteEngines.find(engineKey);
+  return it != remoteEngines.end() && it->second.pid == myPid;
+}
+
+bool XgmiBackend::IsSameNodeEngine(const EngineKey& engineKey) const {
+  if (engineKey == myEngKey) {
+    return true;
+  }
+
+  std::lock_guard<std::mutex> lock(remoteEnginesMu);
+  auto it = remoteEngines.find(engineKey);
+  if (it == remoteEngines.end()) {
+    return false;
+  }
+  const EngineDesc& remoteEngine = it->second;
+  if (!myNodeId.empty() && !remoteEngine.nodeId.empty()) {
+    return remoteEngine.nodeId == myNodeId;
+  }
+  return remoteEngine.hostname == myHostname;
 }
 
 void XgmiBackend::RegisterRemoteEngine(const EngineDesc& desc) {
@@ -548,7 +641,7 @@ void* XgmiBackend::GetRemappedAddress(const MemoryDesc& desc, int localDeviceId)
     return reinterpret_cast<void*>(desc.data);
   }
 
-  IpcCacheKey cacheKey{desc.id, localDeviceId};
+  IpcCacheKey cacheKey{desc.engineKey, desc.id, localDeviceId};
   {
     std::shared_lock<std::shared_mutex> rlock(ipcMutex);
     auto it = remoteIpcHandles.find(cacheKey);
@@ -576,7 +669,9 @@ void* XgmiBackend::GetRemappedAddress(const MemoryDesc& desc, int localDeviceId)
     if (clearErr != hipSuccess) {
       MORI_IO_WARN("XGMI: Failed to clear IPC open error: {}", hipGetErrorString(clearErr));
     }
-    if (IsP2PAccessible(localDeviceId, desc.deviceId)) {
+    auto visibleRemoteDevice = ResolveVisibleDeviceId(desc);
+    if (visibleRemoteDevice.has_value() && IsSameProcessEngine(desc.engineKey) &&
+        IsP2PAccessible(localDeviceId, visibleRemoteDevice.value())) {
       MORI_IO_TRACE("XGMI: IPC failed, using direct P2P pointer for id={}", desc.id);
       return reinterpret_cast<void*>(desc.data);
     }
@@ -619,7 +714,13 @@ void XgmiBackend::BatchReadWrite(const MemoryDesc& localDest, const SizeVec& loc
 
 BackendSession* XgmiBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remote) {
   int localDevice = local.deviceId;
-  int remoteDevice = remote.deviceId;
+  auto remoteDeviceOpt = ResolveVisibleDeviceId(remote);
+  if (!remoteDeviceOpt.has_value()) {
+    MORI_IO_WARN("XGMI: Remote memory id={} bus_id={} is not visible in local process", remote.id,
+                 remote.deviceBusId);
+    return nullptr;
+  }
+  int remoteDevice = remoteDeviceOpt.value();
   void* localAddr = GetRemappedAddress(local, localDevice);
   void* remoteAddr = GetRemappedAddress(remote, localDevice);
   bool ipcSession = (remote.engineKey != myEngKey);
@@ -645,7 +746,13 @@ XgmiBackendSession* XgmiBackend::GetOrCreateSessionCached(const MemoryDesc& loca
 
   void* localAddr = reinterpret_cast<void*>(local.data);
   int localDevice = local.deviceId;
-  int remoteDevice = remote.deviceId;
+  auto remoteDeviceOpt = ResolveVisibleDeviceId(remote);
+  if (!remoteDeviceOpt.has_value()) {
+    MORI_IO_WARN("XGMI: Remote memory id={} bus_id={} is not visible in local process", remote.id,
+                 remote.deviceBusId);
+    return nullptr;
+  }
+  int remoteDevice = remoteDeviceOpt.value();
   void* remoteAddr = GetRemappedAddress(remote, localDevice);
   bool ipcSession = (remote.engineKey != myEngKey);
 
@@ -686,24 +793,16 @@ bool XgmiBackend::CanHandle(const MemoryDesc& local, const MemoryDesc& remote) c
     return false;
   }
 
-  if (!IsP2PAccessible(local.deviceId, remote.deviceId)) {
+  auto remoteDeviceOpt = ResolveVisibleDeviceId(remote);
+  if (!remoteDeviceOpt.has_value()) {
     return false;
   }
 
-  if (remote.engineKey == myEngKey) {
-    return true;
-  }
-
-  std::lock_guard<std::mutex> lock(remoteEnginesMu);
-  auto it = remoteEngines.find(remote.engineKey);
-  if (it == remoteEngines.end()) {
+  if (!IsP2PAccessible(local.deviceId, remoteDeviceOpt.value())) {
     return false;
   }
-  const EngineDesc& remoteEngine = it->second;
-  if (!myNodeId.empty() && !remoteEngine.nodeId.empty()) {
-    return remoteEngine.nodeId == myNodeId;
-  }
-  return remoteEngine.hostname == myHostname;
+
+  return IsSameNodeEngine(remote.engineKey);
 }
 
 }  // namespace io

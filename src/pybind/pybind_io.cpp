@@ -105,6 +105,7 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def_readonly("hostname", &mori::io::EngineDesc::hostname)
       .def_readonly("host", &mori::io::EngineDesc::host)
       .def_readonly("port", &mori::io::EngineDesc::port)
+      .def_readonly("pid", &mori::io::EngineDesc::pid)
       .def(pybind11::self == pybind11::self)
       .def("pack",
            [](const mori::io::EngineDesc& d) {
@@ -124,6 +125,7 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def_readonly("engine_key", &mori::io::MemoryDesc::engineKey)
       .def_readonly("id", &mori::io::MemoryDesc::id)
       .def_readonly("device_id", &mori::io::MemoryDesc::deviceId)
+      .def_readonly("device_bus_id", &mori::io::MemoryDesc::deviceBusId)
       .def_property_readonly("data",
                              [](const mori::io::MemoryDesc& desc) -> uintptr_t {
                                return reinterpret_cast<uintptr_t>(desc.data);

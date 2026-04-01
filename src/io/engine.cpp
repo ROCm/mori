@@ -22,6 +22,7 @@
 #include "mori/io/engine.hpp"
 
 #include <hip/hip_runtime_api.h>
+#include <unistd.h>
 
 #include <cstdlib>
 
@@ -32,6 +33,24 @@
 
 namespace mori {
 namespace io {
+
+namespace {
+
+std::string QueryDeviceBusId(int deviceId) {
+  if (deviceId < 0) {
+    return "";
+  }
+
+  char busId[32] = {0};
+  hipError_t err = hipDeviceGetPCIBusId(busId, sizeof(busId), deviceId);
+  if (err != hipSuccess) {
+    MORI_IO_WARN("Failed to query PCI bus id for device {}: {}", deviceId, hipGetErrorString(err));
+    return "";
+  }
+  return std::string(busId);
+}
+
+}  // namespace
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                         IOEngineSession                                        */
@@ -95,6 +114,7 @@ IOEngine::IOEngine(EngineKey key, IOEngineConfig config) : config(config) {
   desc.hostname = std::string(hostname);
   desc.host = config.host;
   desc.port = config.port;
+  desc.pid = static_cast<int>(getpid());
   MORI_IO_INFO("Create engine key {} node_id {} hostname {}", key, desc.nodeId, hostname);
 }
 
@@ -237,6 +257,9 @@ MemoryDesc IOEngine::RegisterMemory(void* data, size_t size, int device, MemoryL
   memDesc.engineKey = desc.key;
   memDesc.id = nextMemUid.fetch_add(1, std::memory_order_relaxed);
   memDesc.deviceId = device;
+  if (loc == MemoryLocationType::GPU) {
+    memDesc.deviceBusId = QueryDeviceBusId(device);
+  }
   memDesc.data = reinterpret_cast<uintptr_t>(data);
   memDesc.size = size;
   memDesc.loc = loc;
@@ -421,6 +444,9 @@ std::optional<IOEngineSession> IOEngine::CreateSession(const MemoryDesc& local,
     return std::nullopt;
   }
   sess.backendSess.reset(backend->CreateSession(local, remote));
+  if (sess.backendSess == nullptr) {
+    return std::nullopt;
+  }
 
   return sess;
 }

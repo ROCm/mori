@@ -364,6 +364,43 @@ void CaseXgmiInboundNotificationIsUnsupported() {
   Require(!popped, "xgmi pop inbound should return false");
 }
 
+void CaseXgmiConcurrentWaitAndPollIsSafe() {
+  if (GetGpuCount() < 2) throw TestSkip("requires at least 2 GPUs");
+
+  IOEngineConfig cfg;
+  cfg.host = "127.0.0.1";
+  cfg.port = 0;
+  IOEngine engine("xgmi_concurrent_wait_poll_engine", cfg);
+  XgmiBackendConfig xgmiCfg{};
+  engine.CreateBackend(BackendType::XGMI, xgmiCfg);
+
+  auto src = RegisterGpuMemory(&engine, 64 * 1024 * 1024, 0);
+  auto dst = RegisterGpuMemory(&engine, 64 * 1024 * 1024, 1);
+
+  TransferStatus status;
+  TransferUniqueId uid = engine.AllocateTransferUniqueId();
+  engine.Write(src.desc, 0, dst.desc, 0, 64 * 1024 * 1024, &status, uid);
+
+  std::atomic<bool> stopPolling{false};
+  std::thread poller([&]() {
+    while (!stopPolling.load(std::memory_order_acquire)) {
+      (void)status.Code();
+      if (!status.Init() && !status.InProgress()) {
+        break;
+      }
+      std::this_thread::yield();
+    }
+  });
+
+  status.Wait();
+  stopPolling.store(true, std::memory_order_release);
+  if (poller.joinable()) poller.join();
+
+  Require(status.Succeeded(),
+          "xgmi concurrent wait/poll transfer failed: code=" + std::to_string(status.CodeUint32()) +
+              ", msg='" + status.Message() + "'");
+}
+
 struct TestCase {
   const char* name;
   std::function<void()> run;
@@ -380,6 +417,7 @@ int main() {
       {"rdma_notification_env_override_disables", CaseRdmaNotificationEnvOverrideDisables},
       {"rdma_notification_invalid_env_keeps_config", CaseRdmaNotificationInvalidEnvKeepsConfig},
       {"xgmi_inbound_notification_is_unsupported", CaseXgmiInboundNotificationIsUnsupported},
+      {"xgmi_concurrent_wait_and_poll_is_safe", CaseXgmiConcurrentWaitAndPollIsSafe},
   };
 
   int passed = 0;
