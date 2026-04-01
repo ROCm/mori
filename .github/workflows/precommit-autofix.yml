@@ -1,0 +1,184 @@
+name: pre-commit autofix
+
+# Supports two triggers:
+#   1. PR label "fix-precommit"  — works from any branch (before merge)
+#   2. PR comment "/fix-precommit" — works after this workflow is on main
+on:
+  pull_request:
+    types: [labeled]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  autofix:
+    if: |
+      (github.event_name == 'pull_request' && github.event.label.name == 'fix-precommit') ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request != null && contains(github.event.comment.body, '/fix-precommit'))
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Get PR metadata and acknowledge
+        id: pr
+        uses: actions/github-script@v7
+        with:
+          script: |
+            let pr;
+            if (context.eventName === 'issue_comment') {
+              const { data } = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.issue.number,
+              });
+              pr = data;
+              // React with 👀 to acknowledge the comment
+              await github.rest.reactions.createForIssueComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: context.payload.comment.id,
+                content: 'eyes',
+              }).catch(() => {});
+            } else {
+              pr = context.payload.pull_request;
+              // Remove label so it can be re-applied to trigger again
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                name: 'fix-precommit',
+              }).catch(() => {});
+            }
+            core.setOutput('pr_number', String(pr.number));
+            core.setOutput('head_ref',  pr.head.ref);
+            core.setOutput('base_sha',  pr.base.sha);
+            core.setOutput('is_fork',   String(pr.head.repo.full_name !== `${context.repo.owner}/${context.repo.repo}`));
+
+      - name: Abort on fork PRs (cannot push)
+        if: steps.pr.outputs.is_fork == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: parseInt('${{ steps.pr.outputs.pr_number }}'),
+              body: [
+                '### ⚠️ `/fix-precommit` — fork PR detected',
+                '',
+                'Cannot auto-push to a forked repository. Please run pre-commit locally:',
+                '```bash',
+                'pip install pre-commit',
+                'pre-commit run --from-ref origin/main --to-ref HEAD',
+                '```',
+              ].join('\n'),
+            });
+            core.setFailed('Fork PR — skipping autofix');
+
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pr.outputs.head_ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install pre-commit
+        run: pip install pre-commit
+
+      # First pass: let pre-commit auto-fix what it can
+      - name: Run pre-commit (auto-fix pass)
+        id: fix
+        run: |
+          BASE_SHA="${{ steps.pr.outputs.base_sha }}"
+
+          set +e
+          pre-commit run --from-ref "$BASE_SHA" --to-ref HEAD 2>&1
+          set -e
+
+          if git diff --quiet; then
+            echo "files_changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "files_changed=true" >> "$GITHUB_OUTPUT"
+            git diff --name-only > /tmp/changed_files.txt
+            echo "changed_files<<EOF" >> "$GITHUB_OUTPUT"
+            cat /tmp/changed_files.txt >> "$GITHUB_OUTPUT"
+            echo "EOF" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit and push auto-fixes
+        if: steps.fix.outputs.files_changed == 'true'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "style: auto-fix pre-commit issues"
+          git push
+
+      # Second pass: check if anything still fails (needs manual fix)
+      - name: Run pre-commit (check pass)
+        id: check
+        run: |
+          BASE_SHA="${{ steps.pr.outputs.base_sha }}"
+
+          set +e
+          OUTPUT=$(pre-commit run --from-ref "$BASE_SHA" --to-ref HEAD 2>&1)
+          EXIT_CODE=$?
+          set -e
+
+          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+
+          TRUNCATED=$(echo "$OUTPUT" | head -200)
+          echo "output<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$TRUNCATED" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Post result comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const filesChanged = '${{ steps.fix.outputs.files_changed }}' === 'true';
+            const changedFiles  = `${{ steps.fix.outputs.changed_files }}`;
+            const exitCode      = parseInt('${{ steps.check.outputs.exit_code }}');
+            const precommitOut  = `${{ steps.check.outputs.output }}`;
+            const prNumber      = parseInt('${{ steps.pr.outputs.pr_number }}');
+
+            const lines = [];
+
+            if (filesChanged) {
+              lines.push('### ✅ Auto-fixed and committed');
+              lines.push('');
+              lines.push('The following files were modified:');
+              lines.push('```');
+              lines.push(changedFiles.trim());
+              lines.push('```');
+              lines.push('');
+            }
+
+            if (exitCode === 0) {
+              lines.push(filesChanged
+                ? '🎉 All issues resolved automatically — no manual action needed.'
+                : '### ✅ Already clean — no pre-commit issues found.');
+            } else {
+              lines.push('### ❌ Remaining issues require manual fix');
+              lines.push('');
+              lines.push('<details><summary>pre-commit output</summary>');
+              lines.push('');
+              lines.push('```');
+              lines.push(precommitOut.trim());
+              lines.push('```');
+              lines.push('</details>');
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body: lines.join('\n'),
+            });

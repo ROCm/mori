@@ -291,8 +291,15 @@ def _update_latest_symlink(hsaco_path: Path) -> None:
         pass
 
 
-def compile_genco(kernel_name: str) -> str | list[str]:
+def compile_genco(
+    kernel_name: str, source_dir: str = "src/ops/kernels"
+) -> str | list[str]:
     """JIT compile kernel .hip source(s) to .hsaco via --genco. Returns cached path(s).
+
+    Args:
+        kernel_name: Name of the kernel (without .hip extension).
+        source_dir: Directory relative to mori source root containing the .hip file.
+            Defaults to "src/ops/kernels" for ops kernels.
 
     If the kernel has parallel sub-groups (e.g. dispatch_combine_kernels splits
     into ep_dispatch_kernels + ep_combine_kernels), compiles them in parallel
@@ -355,7 +362,7 @@ def compile_genco(kernel_name: str) -> str | list[str]:
 
         return [str(p) for p in hsaco_paths]
 
-    source = mori_root / "src" / "ops" / "kernels" / f"{kernel_name}.hip"
+    source = mori_root / source_dir / f"{kernel_name}.hip"
     if not source.is_file():
         raise FileNotFoundError(f"Kernel source not found: {source}")
 

@@ -63,15 +63,17 @@ void RegisterMoriIo(pybind11::module_& m) {
   py::class_<mori::io::BackendConfig>(m, "BackendConfig");
 
   py::class_<mori::io::RdmaBackendConfig, mori::io::BackendConfig>(m, "RdmaBackendConfig")
-      .def(py::init<int, int, int, mori::io::PollCqMode, bool>(), py::arg("qp_per_transfer") = 1,
-           py::arg("post_batch_size") = -1, py::arg("num_worker_threads") = -1,
+      .def(py::init<int, int, int, mori::io::PollCqMode, bool, uint32_t>(),
+           py::arg("qp_per_transfer") = 1, py::arg("post_batch_size") = -1,
+           py::arg("num_worker_threads") = -1,
            py::arg("poll_cq_mode") = mori::io::PollCqMode::POLLING,
-           py::arg("enable_notification") = true)
+           py::arg("enable_notification") = true, py::arg("notif_per_qp") = 1024)
       .def_readwrite("qp_per_transfer", &mori::io::RdmaBackendConfig::qpPerTransfer)
       .def_readwrite("post_batch_size", &mori::io::RdmaBackendConfig::postBatchSize)
       .def_readwrite("num_worker_threads", &mori::io::RdmaBackendConfig::numWorkerThreads)
       .def_readwrite("poll_cq_mode", &mori::io::RdmaBackendConfig::pollCqMode)
       .def_readwrite("enable_notification", &mori::io::RdmaBackendConfig::enableNotification)
+      .def_readwrite("notif_per_qp", &mori::io::RdmaBackendConfig::notifPerQp)
       .def_readwrite("max_send_wr", &mori::io::RdmaBackendConfig::maxSendWr)
       .def_readwrite("max_cqe_num", &mori::io::RdmaBackendConfig::maxCqeNum)
       .def_readwrite("max_msg_sge", &mori::io::RdmaBackendConfig::maxMsgSge);
@@ -171,7 +173,8 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def("Write", &mori::io ::IOEngine::Write)
       .def("BatchWrite", &mori::io ::IOEngine::BatchWrite)
       .def("CreateSession", &mori::io::IOEngine::CreateSession)
-      .def("PopInboundTransferStatus", &mori::io::IOEngine::PopInboundTransferStatus);
+      .def("PopInboundTransferStatus", &mori::io::IOEngine::PopInboundTransferStatus)
+      .def("LoadScatterGatherModule", &mori::io::IOEngine::LoadScatterGatherModule);
 }
 
 }  // namespace mori

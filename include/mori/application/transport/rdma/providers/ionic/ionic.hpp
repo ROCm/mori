@@ -25,6 +25,7 @@
 #include <hsa/hsa.h>
 #include <hsa/hsa_ext_amd.h>
 
+#include "mori/application/transport/rdma/providers/dv_loader.hpp"
 #include "mori/application/transport/rdma/rdma.hpp"
 #include "mori/core/transport/rdma/providers/ionic/ionic_defs.hpp"
 #include "mori/core/transport/rdma/providers/ionic/ionic_dv.h"
@@ -32,7 +33,6 @@
 
 namespace mori {
 namespace application {
-#ifdef ENABLE_IONIC
 // BNXT UDP sport configuration constants
 static constexpr uint32_t IONIC_UDP_SPORT_ARRAY_SIZE = 4;
 
@@ -168,6 +168,5 @@ class IonicDevice : public RdmaDevice {
 
   RdmaDeviceContext* CreateRdmaDeviceContext() override;
 };
-#endif
 }  // namespace application
 }  // namespace mori

@@ -140,7 +140,7 @@ class SocketBootstrapNetwork : public BootstrapNetwork {
   bool InitializeSocket(Socket& sock, const SocketAddress* addr = nullptr);
   bool ListenSocket(Socket& sock);
   bool ConnectSocket(Socket& sock, const SocketAddress& addr);
-  bool AcceptSocket(Socket& listen_sock, Socket& client_sock);
+  bool AcceptSocket(Socket& listen_sock, Socket& client_sock, int timeout_ms = 0);
   void CloseSocket(Socket& sock);
 
   // Network discovery

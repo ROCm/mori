@@ -35,6 +35,40 @@ def _is_fp4x2_dtype(dtype):
     return TORCH_FLOAT4_E2M1FN_X2 is not None and dtype is TORCH_FLOAT4_E2M1FN_X2
 
 
+_FP4_E2M1_LUT = [
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    -0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
+]
+
+
+def unpack_fp4x2(fp4x2_tensor, dtype=torch.bfloat16):
+    """Unpack float4_e2m1fn_x2 tensor [*, H] to float [*, H*2].
+
+    Each fp4x2 element (1 byte) stores two FP4 E2M1 values:
+    low nibble = first value, high nibble = second value.
+    """
+    raw = fp4x2_tensor.view(torch.uint8)
+    low = raw & 0x0F
+    high = (raw >> 4) & 0x0F
+    lut = torch.tensor(_FP4_E2M1_LUT, dtype=dtype, device=raw.device)
+    result = torch.stack([lut[low.long()], lut[high.long()]], dim=-1)
+    return result.reshape(*raw.shape[:-1], raw.shape[-1] * 2)
+
+
 class EpDispatchCombineTestCase:
     def __init__(self, config):
         self.config = config
@@ -182,7 +216,12 @@ class EpDispatchCombineTestCase:
         assert len(src_token_pos) == dispatch_recv_num_token[0]
 
     def check_combine_result(
-        self, op, test_data, combine_output, combine_output_weight=None
+        self,
+        op,
+        test_data,
+        combine_output,
+        combine_output_weight=None,
+        combine_data_type=None,
     ):
         self.sync()
         all_rank_num_token = test_data[0]
@@ -190,7 +229,10 @@ class EpDispatchCombineTestCase:
         all_rank_input = test_data[2]
         all_rank_weights = test_data[3]
 
-        if _is_fp4x2_dtype(self.config.data_type):
+        if combine_data_type is None:
+            combine_data_type = self.config.data_type
+
+        if _is_fp4x2_dtype(combine_data_type):
             return
 
         for i in range(all_rank_num_token[self.config.rank]):
@@ -200,9 +242,17 @@ class EpDispatchCombineTestCase:
             ]
             unique_pes = len(set(pes))
 
+            inp = all_rank_input[self.config.rank][i]
+            if _is_fp4x2_dtype(self.config.data_type):
+                inp_converted = unpack_fp4x2(
+                    inp.unsqueeze(0), dtype=combine_data_type
+                ).squeeze(0)
+            else:
+                inp_converted = inp.to(combine_data_type)
+
             got, expected = combine_output[i], (
-                all_rank_input[self.config.rank][i].to(torch.float32) * unique_pes
-            ).to(self.config.data_type)
+                inp_converted.to(torch.float32) * unique_pes
+            ).to(combine_data_type)
 
             atol, rtol = 1e-2, 1e-2
             if getattr(self.config, "quant_type", "none") == "fp8_direct_cast":

@@ -97,7 +97,19 @@ class IOEngine:
                 config = mori_cpp.XgmiBackendConfig()
             else:
                 raise NotImplementedError("backend not implemented yet")
-        return self._engine.CreateBackend(type, config)
+        result = self._engine.CreateBackend(type, config)
+        if type is mori_cpp.BackendType.XGMI:
+            self._load_scatter_gather_kernel()
+        return result
+
+    def _load_scatter_gather_kernel(self):
+        try:
+            from mori.io.scatter_gather_jit import ensure_scatter_gather_kernel
+
+            hsaco_path = ensure_scatter_gather_kernel()
+            self._engine.LoadScatterGatherModule(hsaco_path)
+        except Exception:
+            pass
 
     def remove_backend(self, type: mori_cpp.BackendType):
         return self._engine.RemoveBackend(type)

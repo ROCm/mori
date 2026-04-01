@@ -2,6 +2,7 @@
 build/
 build*/
 lib*
+dist/*
 
 # Python
 *.egg-info

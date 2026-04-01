@@ -77,7 +77,7 @@ target_link_libraries(
   mori_application
   PUBLIC ibverbs
          hip::host
-         mlx5
+         dl
          ${ROCM_SMI_LIB}
          pci
          mori_logging
@@ -87,15 +87,6 @@ target_link_libraries(
 if(WITH_MPI)
   target_compile_definitions(mori_application PUBLIC MORI_WITH_MPI)
   target_link_libraries(mori_application PUBLIC MPI::MPI_CXX)
-endif()
-# ${IONIC_LIBRARY})
-
-if(USE_BNXT)
-  target_link_libraries(mori_application PUBLIC ${BNXT_RE_LIB})
-endif()
-
-if(USE_IONIC)
-  target_link_libraries(mori_application PUBLIC ${IONIC_LIB})
 endif()
 
 if(BUILD_TORCH_BOOTSTRAP)

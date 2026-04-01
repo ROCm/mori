@@ -36,7 +36,6 @@
 
 namespace mori {
 namespace application {
-#ifdef ENABLE_IONIC
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        Device Attributes                                       */
 /* ---------------------------------------------------------------------------------------------- */
@@ -193,7 +192,7 @@ IonicQpContainer::IonicQpContainer(ibv_context* context, const RdmaEndpointConfi
   assert(qp);
 
   HIP_RUNTIME_CHECK(hipGetDevice(&hip_dev_id));
-  ionic_dv_get_ctx(&dvctx, context);
+  IonicDvApi::Instance().get_ctx(&dvctx, context);
   rocm_init();
   rocm_memory_lock_to_fine_grain(dvctx.db_page, 0x1000, &gpu_db_page, hip_dev_id);
 
@@ -207,8 +206,8 @@ IonicQpContainer::IonicQpContainer(ibv_context* context, const RdmaEndpointConfi
   gpu_db_sq = &gpu_db_ptr[dvctx.sq_qtype];
   gpu_db_rq = &gpu_db_ptr[dvctx.rq_qtype];
 
-  uint8_t udma_idx = ionic_dv_qp_get_udma_idx(qp);
-  ionic_dv_get_cq(&dvcq, cq, udma_idx);
+  uint8_t udma_idx = IonicDvApi::Instance().qp_get_udma_idx(qp);
+  IonicDvApi::Instance().get_cq(&dvcq, cq, udma_idx);
 
   cq_dbreg = gpu_db_cq;
   cq_dbval = dvcq.q.db_val;
@@ -218,7 +217,7 @@ IonicQpContainer::IonicQpContainer(ibv_context* context, const RdmaEndpointConfi
                  reinterpret_cast<uintptr_t>(dvcq.q.ptr), dvcq.q.size, dvcq.q.mask);
 
   ionic_dv_qp dvqp;
-  ionic_dv_get_qp(&dvqp, qp);
+  IonicDvApi::Instance().get_qp(&dvqp, qp);
 
   sq_dbreg = gpu_db_sq;
   sq_dbval = dvqp.sq.db_val;
@@ -406,16 +405,16 @@ void IonicDeviceContext::create_parent_domain(ibv_context* context, struct ibv_p
   pd_parent = ibv_alloc_parent_domain(defaultContext, &pattr);
   assert(pd_parent);
 
-  ionic_dv_pd_set_sqcmb(pd_parent, false, false, false);
-  ionic_dv_pd_set_rqcmb(pd_parent, false, false, false);
+  IonicDvApi::Instance().pd_set_sqcmb(pd_parent, false, false, false);
+  IonicDvApi::Instance().pd_set_rqcmb(pd_parent, false, false, false);
 #endif
   for (int i = 0; i < 2; i++) {
     pd_uxdma[i] = ibv_alloc_parent_domain(context, &pattr);
     assert(pd_uxdma[i]);
     // printf("create_parent_domain, pd_uxdma:%p\n", pd_uxdma[i]);
-    ionic_dv_pd_set_sqcmb(pd_uxdma[i], false, false, false);
-    ionic_dv_pd_set_rqcmb(pd_uxdma[i], false, false, false);
-    ionic_dv_pd_set_udma_mask(pd_uxdma[i], 1u << i);
+    IonicDvApi::Instance().pd_set_sqcmb(pd_uxdma[i], false, false, false);
+    IonicDvApi::Instance().pd_set_rqcmb(pd_uxdma[i], false, false, false);
+    IonicDvApi::Instance().pd_set_udma_mask(pd_uxdma[i], 1u << i);
   }
 }
 
@@ -536,6 +535,5 @@ RdmaDeviceContext* IonicDevice::CreateRdmaDeviceContext() {
   // printf("IonicDevice::CreateRdmaDeviceContext, defaultContext:%p, pd:%p\n", defaultContext, pd);
   return new IonicDeviceContext(this, defaultContext, pd);
 }
-#endif
 }  // namespace application
 }  // namespace mori
