@@ -29,7 +29,7 @@
 #include "mori/application/application.hpp"
 #include "mori/core/core.hpp"
 #include "mori/shmem/shmem_api.hpp"
-#include "src/shmem/internal.hpp"
+#include "mori/shmem/internal.hpp"
 
 #include "mori/shmem/shmem_p2p_kernels.hpp"
 
