@@ -113,9 +113,9 @@ __global__ void PipelinedAllReduceSdmaKernel(
   // =========================================================================
   if constexpr (SCATTER_MODE == 0) {
 
-    if (numQ < 2) {
+    if (numQ < 1) {
       if (threadIdx.x == 0 && blockIdx.x == 0) {
-        printf("PE %d: pipelined SDMA needs sdmaNumQueue>=2 (got %u)\n",
+        printf("PE %d: pipelined SDMA needs sdmaNumQueue>=1 (got %u)\n",
                myPe, numQ);
       }
       return;
@@ -262,16 +262,16 @@ __global__ void PipelinedAllReduceSdmaKernel(
                 + static_cast<size_t>(myPe) * totalShardBytes + cOff;
             uint8_t* dst = reinterpret_cast<uint8_t*>(dstMemObj->peerPtrs[destPe])
                 + static_cast<size_t>(myPe) * totalShardBytes + cOff;
-            core::SdmaPutThread(src, dst, agBytes, dh, rSig, numQ, 1);
+            core::SdmaPutThread(src, dst, agBytes, dh, rSig, numQ, 0);
           }
         }
 
         if (thr < npes && thr != myPe) {
           const int sender = thr;
           const uint64_t expected =
-              s_ag_by_sender[sender] + static_cast<uint64_t>(numChunks);
+              s_scatter_by_sender[sender] + static_cast<uint64_t>(2 * numChunks);
           HSAuint64* sig = dstMemObj->signalPtrs
-              + static_cast<size_t>(sender) * numQ + 1;
+              + static_cast<size_t>(sender) * numQ;
           while (core::AtomicLoadRelaxed(sig) < expected)
             ;
         }
@@ -294,14 +294,14 @@ __global__ void PipelinedAllReduceSdmaKernel(
               + static_cast<size_t>(myPe) * totalShardBytes;
           uint8_t* dst = reinterpret_cast<uint8_t*>(dstMemObj->peerPtrs[destPe])
               + static_cast<size_t>(myPe) * totalShardBytes;
-          core::SdmaPutThread(src, dst, totalShardBytes, dh, rSig, numQ, 1);
+          core::SdmaPutThread(src, dst, totalShardBytes, dh, rSig, numQ, 0);
         }
 
         if (thr < npes && thr != myPe) {
           const int sender = thr;
-          const uint64_t expected = s_ag_by_sender[sender] + 1ULL;
+          const uint64_t expected = s_scatter_by_sender[sender] + 2ULL;
           HSAuint64* sig = dstMemObj->signalPtrs
-              + static_cast<size_t>(sender) * numQ + 1;
+              + static_cast<size_t>(sender) * numQ;
           while (core::AtomicLoadRelaxed(sig) < expected)
             ;
         }
