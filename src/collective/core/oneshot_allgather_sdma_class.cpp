@@ -214,7 +214,7 @@ bool AllgatherSdma<T>::start_async(T* input, T* output, size_t total_count, hipS
 
     OneShotAllGatherSdmaAsyncPutKernel<T>
         <<<1, 512, 0, stream>>>(myPe_, npes_, input, input_transit_buffer_obj_, dst_obj, flagsObj_,
-                                total_count, direct ? byteOffset : 0);
+                                total_count);
 
     hipError_t kernel_err = hipGetLastError();
     if (kernel_err != hipSuccess) {
@@ -245,8 +245,7 @@ double AllgatherSdma<T>::wait_async(hipStream_t stream) {
     hipStream_t wait_stream = (stream != nullptr) ? stream : async_stream_;
 
     OneShotAllGatherSdmaAsyncWaitKernel<<<1, 64, 0, wait_stream>>>(
-        myPe_, npes_, async_dst_obj_.IsValid() ? async_dst_obj_ : output_transit_buffer_obj_,
-        flagsObj_, async_flag_token_);
+        myPe_, npes_, async_dst_obj_.IsValid() ? async_dst_obj_ : output_transit_buffer_obj_);
 
     if (wait_stream != nullptr) {
       hipError_t err = hipStreamSynchronize(wait_stream);
@@ -452,7 +451,7 @@ bool AllgatherSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
 
     OneShotAllGatherSdmaKernel<T>
         <<<1, 512, 0, stream>>>(myPe_, npes_, input, input_transit_buffer_obj_, dst_obj, flagsObj_,
-                                total_count, direct ? byteOffset : 0, flag_token);
+                                total_count);
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess) {
