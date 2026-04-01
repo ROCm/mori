@@ -26,8 +26,8 @@
 
 #include <cstdint>
 #include <sstream>
-#include <vector>
 #include <variant>
+#include <vector>
 
 #include "mori/application/application.hpp"
 #include "mori/core/profiler/constants.hpp"
