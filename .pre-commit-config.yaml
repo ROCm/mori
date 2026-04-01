@@ -1,7 +1,8 @@
 # Exclude all 3rd-party libraries
 exclude: |
   (?x)^(
-    third_party/.+
+    third_party/.+|
+    3rdparty/.+
   )$
 repos:
   # Common hooks
