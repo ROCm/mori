@@ -52,7 +52,7 @@ inline __device__ void DispatchIntraNodeBlock(EpDispatchCombineArgs<T>& args, in
   if (laneId == 0) {
     // decide token id in dest pe
     destTokId = atomicAdd(args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe), 1);
-    assert(destTokId <= config.MaxNumTokensToRecv() &&
+    assert(destTokId < config.MaxNumTokensToRecv() &&
            "Total recv token overflow: increase maxTotalRecvTokens");
     args.dispDestTokIdMap[tokenExpertId] = FlatTokenIndex(config, destPe, destTokId);
 
@@ -395,7 +395,7 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
         int destTokId = 0;
         if (laneId == 0) {
           destTokId = atomicAdd(args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe), 1);
-          assert(destTokId <= config.MaxNumTokensToRecv() &&
+          assert(destTokId < config.MaxNumTokensToRecv() &&
                  "Total recv token overflow: increase maxTotalRecvTokens");
           args.interNodeDispDestTokIdMap[tokIdx * config.numExpertPerToken + e] =
               FlatTokenIndex(config, destPe, destTokId);
@@ -499,7 +499,7 @@ inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs<T>& args) {
     int destTokId = 0;
     if (laneId == 0) {
       destTokId = atomicAdd(args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe), 1);
-      assert(destTokId <= config.MaxNumTokensToRecv() &&
+      assert(destTokId < config.MaxNumTokensToRecv() &&
              "Total recv token overflow: increase maxTotalRecvTokens");
       args.interNodeDispDestTokIdMap[globalTokenId * config.numExpertPerToken + expertId] =
           FlatTokenIndex(config, destPe, destTokId);

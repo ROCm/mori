@@ -53,6 +53,7 @@ std::vector<int32_t> EpDispatchCombineConfig::ToPackedI32Array() const {
       maxNumInpTokenPerRank,
       numExpertPerRank,
       numExpertPerToken,
+      maxTotalRecvTokens,
       warpNumPerBlock,
       blockNum,
       static_cast<int32_t>(useExternalInpBuffer),
@@ -85,15 +86,16 @@ EpDispatchCombineConfig EpDispatchCombineConfig::FromPackedI32Array(const int32_
   cfg.maxNumInpTokenPerRank = packed[7];
   cfg.numExpertPerRank = packed[8];
   cfg.numExpertPerToken = packed[9];
-  cfg.warpNumPerBlock = packed[10];
-  cfg.blockNum = packed[11];
-  cfg.useExternalInpBuffer = (packed[12] != 0);
-  cfg.kernelType = static_cast<KernelType>(packed[13]);
-  cfg.gpuPerNode = packed[14];
-  cfg.rdmaBlockNum = packed[15];
-  cfg.numQpPerPe = packed[16];
-  cfg.quantType = static_cast<QuantType>(packed[17]);
-  cfg.enableSdma = (packed[18] != 0);
+  cfg.maxTotalRecvTokens = packed[10];
+  cfg.warpNumPerBlock = packed[11];
+  cfg.blockNum = packed[12];
+  cfg.useExternalInpBuffer = (packed[13] != 0);
+  cfg.kernelType = static_cast<KernelType>(packed[14]);
+  cfg.gpuPerNode = packed[15];
+  cfg.rdmaBlockNum = packed[16];
+  cfg.numQpPerPe = packed[17];
+  cfg.quantType = static_cast<QuantType>(packed[18]);
+  cfg.enableSdma = (packed[19] != 0);
   return cfg;
 }
 

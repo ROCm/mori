@@ -295,9 +295,11 @@ __device__ void EpDispatchLowLatencyAsyncRecvCopyMultiBlock_body(EpDispatchCombi
   uint64_t peOffset = __shfl(peExclusive, destPe);
   uint64_t recvTokenNum = __shfl(myPeTokens, destPe);
   uint64_t totalTokens = __shfl(inclusive, npes - 1);
-  if (laneId == 0)
+  if (laneId == 0) {
+    // NOTE: totalTokens is a count number here, so use <=
     assert(totalTokens <= config.MaxNumTokensToRecv() &&
            "Total recv token overflow: increase maxTotalRecvTokens");
+  }
 
   // Copy data — multiple warps cooperate per token
   uint8_t* stagingPtr = (destPe != myPe)

@@ -86,7 +86,7 @@ using index_t = int32_t;
 
 #define MAX_EXPERTS_PER_TOKEN (9)
 struct EpDispatchCombineConfig {
-  constexpr static size_t kPackedI32Len = 18;
+  constexpr static size_t kPackedI32Len = 19;
 
   int rank{0};
   int worldSize{0};
