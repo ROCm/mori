@@ -323,7 +323,7 @@ void testPipelinedAllreduce() {
         printf("  npes=%-3d  dtype=uint32  warmup=%d  iters=%d  chunk_sweep=%s\n",
                npes, warmup, iterations, chunkSweep ? "on" : "off");
         printf("  Serial = ReduceScatter + AllGather  (single-shot, no pipeline)\n");
-        printf("  SDMA   = Pipeline (chunked RS+AG, V1 baseline)\n");
+        printf("  SDMA   = Pipeline SDMA scatter/reduce/AG  (auto 2-chunk, 3-stage)\n");
         printf("  P2P    = Pipeline with P2P scatter mode\n");
         printf("%s\n\n", sep);
 
