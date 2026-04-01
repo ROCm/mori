@@ -25,95 +25,52 @@ from tests.python.utils import TorchDistContext, get_free_port
 import torch
 
 
-def _test_torch_init(rank, world_size, port):
-    """Test basic PyTorch-based initialization"""
+def _test_shmem_apis(rank, world_size, port):
+    """Test all shmem APIs under a single torch-based init/finalize cycle."""
     with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
         shmem.shmem_torch_process_group_init("default")
+
+        # -- init --
         assert rank == shmem.shmem_mype()
         assert world_size == shmem.shmem_npes()
-        shmem.shmem_finalize()
 
+        # -- barrier --
+        shmem.shmem_barrier_all()
 
-def _test_shmem_malloc(rank, world_size, port):
-    """Test symmetric memory allocation and deallocation"""
-    with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
-        shmem.shmem_torch_process_group_init("default")
-
-        # Test basic malloc
+        # -- malloc --
         size = 4096
         ptr = shmem.shmem_malloc(size)
         assert ptr != 0, "shmem_malloc returned NULL"
 
-        # Test aligned malloc
         aligned_ptr = shmem.shmem_malloc_align(256, size)
         assert aligned_ptr != 0, "shmem_malloc_align returned NULL"
         assert aligned_ptr % 256 == 0, f"Memory not aligned: 0x{aligned_ptr:x}"
 
-        # Barrier before freeing
         shmem.shmem_barrier_all()
 
-        # Free memory
         shmem.shmem_free(ptr)
         shmem.shmem_free(aligned_ptr)
 
-        shmem.shmem_finalize()
-
-
-def _test_shmem_barrier(rank, world_size, port):
-    """Test global barrier synchronization"""
-    with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
-        shmem.shmem_torch_process_group_init("default")
-
-        # All ranks should pass barrier
-        shmem.shmem_barrier_all()
-
-        # Allocate memory
-        ptr = shmem.shmem_malloc(1024)
-
-        # Another barrier
-        shmem.shmem_barrier_all()
-
-        shmem.shmem_free(ptr)
-        shmem.shmem_finalize()
-
-
-def _test_shmem_barrier_on_stream(rank, world_size, port):
-    """Test device barrier on a HIP stream"""
-    with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
-        shmem.shmem_torch_process_group_init("default")
-
-        # Test with a PyTorch stream
+        # -- barrier on stream --
         stream = torch.cuda.Stream()
         shmem.shmem_barrier_on_stream(stream)
         stream.synchronize()
 
-        # Test with default (null) stream
         shmem.shmem_barrier_on_stream()
         torch.cuda.synchronize()
 
-        # Host barrier to confirm all PEs completed
         shmem.shmem_barrier_all()
 
-        shmem.shmem_finalize()
-
-
-def _test_buffer_register(rank, world_size, port):
-    """Test buffer registration with PyTorch tensors"""
-    with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
-        shmem.shmem_torch_process_group_init("default")
-
-        # Create a GPU tensor
+        # -- buffer register --
         tensor = torch.ones(1024, device="cuda", dtype=torch.float32)
         tensor_ptr = tensor.data_ptr()
         tensor_size = tensor.element_size() * tensor.numel()
 
-        # Register the tensor buffer
         ret = shmem.shmem_buffer_register(tensor_ptr, tensor_size)
         assert ret == 0, f"shmem_buffer_register failed with code {ret}"
 
         shmem.shmem_barrier_all()
 
-        # Deregister the buffer
         ret = shmem.shmem_buffer_deregister(tensor_ptr, tensor_size)
         assert ret == 0, f"shmem_buffer_deregister failed with code {ret}"
 
@@ -234,54 +191,10 @@ def _test_uniqueid_init(rank, world_size, port):
 
 
 @pytest.mark.parametrize("world_size", (2, 4, 8))
-def test_torch_init(world_size):
-    """Test basic initialization"""
+def test_shmem_apis(world_size):
+    """Test shmem APIs (init, malloc, barrier, stream barrier, buffer register)"""
     torch.multiprocessing.spawn(
-        _test_torch_init,
-        args=(world_size, get_free_port()),
-        nprocs=world_size,
-        join=True,
-    )
-
-
-@pytest.mark.parametrize("world_size", (2, 4, 8))
-def test_shmem_malloc(world_size):
-    """Test symmetric memory allocation"""
-    torch.multiprocessing.spawn(
-        _test_shmem_malloc,
-        args=(world_size, get_free_port()),
-        nprocs=world_size,
-        join=True,
-    )
-
-
-@pytest.mark.parametrize("world_size", (2, 4, 8))
-def test_shmem_barrier(world_size):
-    """Test barrier synchronization"""
-    torch.multiprocessing.spawn(
-        _test_shmem_barrier,
-        args=(world_size, get_free_port()),
-        nprocs=world_size,
-        join=True,
-    )
-
-
-@pytest.mark.parametrize("world_size", (2, 4, 8))
-def test_shmem_barrier_on_stream(world_size):
-    """Test device barrier on stream"""
-    torch.multiprocessing.spawn(
-        _test_shmem_barrier_on_stream,
-        args=(world_size, get_free_port()),
-        nprocs=world_size,
-        join=True,
-    )
-
-
-@pytest.mark.parametrize("world_size", (2, 4, 8))
-def test_buffer_register(world_size):
-    """Test buffer registration with PyTorch tensors"""
-    torch.multiprocessing.spawn(
-        _test_buffer_register,
+        _test_shmem_apis,
         args=(world_size, get_free_port()),
         nprocs=world_size,
         join=True,
