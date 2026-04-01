@@ -252,14 +252,6 @@ bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
       return false;
     }
 
-    // Retire ReduceScatter (CU reduce + fence) before AllGather SDMA reads transit.
-    err = stream ? hipStreamSynchronize(stream) : hipDeviceSynchronize();
-    if (err != hipSuccess) {
-      fprintf(stderr, "PE %d: sync after ReduceScatter failed: %s\n", myPe_,
-              hipGetErrorString(err));
-      return false;
-    }
-
     // Step 2: AllGather via SDMA
     AllGatherSdmaKernel<T><<<1, 512, 0, stream>>>(myPe_, npes_, output_transit_buffer_obj_,
                                                   flagsObj_, barrierPtr_, total_count);
