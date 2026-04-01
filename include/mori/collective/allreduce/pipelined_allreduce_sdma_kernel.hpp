@@ -136,8 +136,17 @@ __global__ void PipelinedAllReduceSdmaKernel(
               s_scatter_by_sender[sender] + static_cast<uint64_t>(c + 1);
           HSAuint64* sig = dstMemObj->signalPtrs
               + static_cast<size_t>(sender) * numQ;
-          while (core::AtomicLoadRelaxed(sig) < expected)
-            ;
+          int _sp = 0;
+          while (core::AtomicLoadRelaxed(sig) < expected) {
+            if (++_sp > 200000000) {
+              printf("PE %d blk%d: SCATTER TIMEOUT sender=%d c=%d exp=%llu act=%llu base=%llu\n",
+                     myPe, (int)blockIdx.x, sender, c,
+                     (unsigned long long)expected,
+                     (unsigned long long)core::AtomicLoadRelaxed(sig),
+                     (unsigned long long)s_scatter_by_sender[sender]);
+              break;
+            }
+          }
         }
         if (threadIdx.x < static_cast<unsigned>(npes)) {
           const int pe = static_cast<int>(threadIdx.x);
@@ -235,10 +244,18 @@ __global__ void PipelinedAllReduceSdmaKernel(
           for (int c = 0; c < numChunks; c++) {
             const uint32_t ccTarget =
                 ccBase + static_cast<uint32_t>((c + 1) * compBlocks);
+            int _sp4 = 0;
             while (__scoped_atomic_load_n(
                        &barrier->chunks_complete,
-                       __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) < ccTarget)
-              ;
+                       __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) < ccTarget) {
+              if (++_sp4 > 200000000) {
+                printf("PE %d blk0: MC-CC TIMEOUT c=%d ccBase=%u target=%u act=%u\n",
+                       myPe, c, ccBase, ccTarget,
+                       __scoped_atomic_load_n(&barrier->chunks_complete,
+                                              __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE));
+                break;
+              }
+            }
 
             const size_t cOff = static_cast<size_t>(c) * chunkBytes;
             size_t agBytes = chunkBytes;
@@ -259,8 +276,16 @@ __global__ void PipelinedAllReduceSdmaKernel(
               s_ag_by_sender[sender] + static_cast<uint64_t>(numChunks);
           HSAuint64* sig = dstMemObj->signalPtrs
               + static_cast<size_t>(sender) * numQ + 1;
-          while (core::AtomicLoadRelaxed(sig) < expected)
-            ;
+          int _sp5 = 0;
+          while (core::AtomicLoadRelaxed(sig) < expected) {
+            if (++_sp5 > 200000000) {
+              printf("PE %d blk0: MC-AG TIMEOUT sender=%d exp=%llu act=%llu\n",
+                     myPe, sender,
+                     (unsigned long long)expected,
+                     (unsigned long long)core::AtomicLoadRelaxed(sig));
+              break;
+            }
+          }
         }
       } else {
         if (thr < npes && thr != myPe) {
@@ -272,10 +297,19 @@ __global__ void PipelinedAllReduceSdmaKernel(
 
           const uint32_t ccTarget =
               ccBase + static_cast<uint32_t>(compBlocks);
+          int _sp2 = 0;
           while (__scoped_atomic_load_n(
                      &barrier->chunks_complete,
-                     __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) < ccTarget)
-            ;
+                     __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) < ccTarget) {
+            if (++_sp2 > 200000000) {
+              printf("PE %d blk0 thr%d: CC TIMEOUT ccBase=%u target=%u act=%u compBlocks=%d\n",
+                     myPe, thr, ccBase, ccTarget,
+                     __scoped_atomic_load_n(&barrier->chunks_complete,
+                                            __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE),
+                     compBlocks);
+              break;
+            }
+          }
 
           uint8_t* src = reinterpret_cast<uint8_t*>(dstMemObj->localPtr)
               + static_cast<size_t>(myPe) * totalShardBytes;
@@ -289,8 +323,17 @@ __global__ void PipelinedAllReduceSdmaKernel(
           const uint64_t expected = s_ag_by_sender[sender] + 1ULL;
           HSAuint64* sig = dstMemObj->signalPtrs
               + static_cast<size_t>(sender) * numQ + 1;
-          while (core::AtomicLoadRelaxed(sig) < expected)
-            ;
+          int _sp3 = 0;
+          while (core::AtomicLoadRelaxed(sig) < expected) {
+            if (++_sp3 > 200000000) {
+              printf("PE %d blk0 thr%d: AG TIMEOUT sender=%d exp=%llu act=%llu base=%llu\n",
+                     myPe, thr, sender,
+                     (unsigned long long)expected,
+                     (unsigned long long)core::AtomicLoadRelaxed(sig),
+                     (unsigned long long)s_ag_by_sender[sender]);
+              break;
+            }
+          }
         }
 
       }
