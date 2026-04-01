@@ -501,14 +501,13 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
 
         const bool multi_chunk = (chunk_elems < total_count);
 
-        fprintf(stderr,
-                "PE %d: pipelined LAUNCH scatter_mode=%d multi_chunk=%d "
-                "blocks=%d threads=%d total_count=%zu chunk_elems=%zu "
-                "numQ=%u barrier=%p sizeof(barrier)=%zu\n",
-                myPe_, scatter_mode, (int)multi_chunk,
-                blocks, threads, total_count, chunk_elems,
-                output_transit_buffer_obj_->sdmaNumQueue,
-                (void*)barrierPtr_, sizeof(CrossPeBarrier));
+        if (myPe_ == 0) {
+            fprintf(stderr,
+                    "PE0: pipe sm=%d mc=%d blk=%d n=%zu chunk=%zu numQ=%u\n",
+                    scatter_mode, (int)multi_chunk,
+                    blocks, total_count, chunk_elems,
+                    output_transit_buffer_obj_->sdmaNumQueue);
+        }
 
         if (scatter_mode == 1) {
             PipelinedAllReduceSdmaKernel<T, 1><<<blocks, threads, 0, stream>>>(
@@ -534,18 +533,13 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             return false;
         }
 
-        fprintf(stderr, "PE %d: pipelined kernel launched OK\n", myPe_);
-
         if (copy_output_to_user_) {
-            fprintf(stderr, "PE %d: pipelined copy_output_to_user start\n", myPe_);
             copy_output_to_user(output, total_count, stream);
-            fprintf(stderr, "PE %d: pipelined copy_output_to_user done\n", myPe_);
         }
     } catch (const std::exception& e) {
         fprintf(stderr, "PE %d: PipelinedAllReduce exception: %s\n", myPe_, e.what());
         return false;
     }
-    fprintf(stderr, "PE %d: pipelined returning true\n", myPe_);
     return true;
 }
 
