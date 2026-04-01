@@ -18,3 +18,4 @@ python/mori/*.so
 *.core
 .claude/
 .codex/
+_*.tmp
