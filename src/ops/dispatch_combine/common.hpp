@@ -32,7 +32,7 @@ inline __device__ int FlatTokenIndex(const EpDispatchCombineConfig& config, int 
                                      int localTokId) {
   return pe * config.MaxNumTokensToSend() + localTokId;
 }
-/ inline __device__ int PeFromFlatTokenIndex(const EpDispatchCombineConfig& config, int flatIdx) {
+inline __device__ int PeFromFlatTokenIndex(const EpDispatchCombineConfig& config, int flatIdx) {
   return flatIdx / config.MaxNumTokensToSend();
 }
 inline __device__ int LocalTokIdFromFlatTokenIndex(const EpDispatchCombineConfig& config,
