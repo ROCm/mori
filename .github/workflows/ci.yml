@@ -241,7 +241,6 @@ jobs:
             --iters 8 \
             --enable-batch-transfer \
             --enable-sess \
-            --batch-non-contiguous \
             --poll_cq_mode event \
             --num-qp-per-transfer 2 \
             --num-worker-threads 2 \
