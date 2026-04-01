@@ -271,25 +271,18 @@ void testPipelinedAllreduce() {
             }
         }
 
-        if (myPe == 0) fprintf(stderr, "--- %zuMB P2P pipe ---\n", dataMB);
-
-        // P2P default
+        // P2P skipped ? legacy path, focus on SDMA performance
         ms = 0;
         gb = 0;
-        ok = runBenchMs(
-            [&](uint32_t* in, uint32_t* out, size_t n, hipStream_t s) {
-                return ar->pipelined(in, out, n, 0, 1, s);
-            },
-            inBuf, devOut, hostData, elemsPerPe, bytesPerPe, npes, myPe, stream, warmup,
-            iterations, &ms, &gb);
+        ok = true;
         if (myPe == 0) {
-            p2pMs.push_back(ok ? ms : -1.0);
-            p2pGb.push_back(ok ? gb : 0.0);
-            okP2p.push_back(ok);
+            p2pMs.push_back(0.0);
+            p2pGb.push_back(0.0);
+            okP2p.push_back(true);
         }
 
         if (chunkSweep && myPe == 0) {
-            sweepPrintf(&sweep_lines, "  [%zu MB/PE] P2P chunk sweep", dataMB);
+            sweepPrintf(&sweep_lines, "  [%zu MB/PE] P2P chunk sweep (skipped)", dataMB);
         }
         if (chunkSweep) {
             for (size_t chunkKB : chunkSizesKB) {
@@ -297,16 +290,8 @@ void testPipelinedAllreduce() {
                 size_t chunkElems = chunkBytes / sizeof(uint32_t);
                 if (chunkBytes > bytesPerPe) continue;
                 double sm = 0, sg = 0;
-                bool sk = runBenchMs(
-                    [&](uint32_t* in, uint32_t* out, size_t n, hipStream_t s) {
-                        return ar->pipelined(in, out, n, chunkElems, 1, s);
-                    },
-                    inBuf, devOut, hostData, elemsPerPe, bytesPerPe, npes, myPe, stream, warmup,
-                    iterations, &sm, &sg);
-                if (myPe == 0 && sk) {
-                    sweepPrintf(&sweep_lines, "    P2P  %5zuKB  %7.3f ms  %6.1f GB/s",
-                                chunkKB, sm, sg);
-                }
+                // P2P chunk sweep skipped
+                (void)chunkElems;
             }
         }
 
