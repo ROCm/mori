@@ -65,21 +65,21 @@ __global__ void SdmaSelfCopyKernel(const SymmMemObjPtr srcObj, void* dst, size_t
 
     anvil::SdmaQueueDeviceHandle** dh = srcObj->deviceHandles_d + myPe * numQueues;
     HSAuint64* signal = srcObj->signalPtrs + static_cast<size_t>(myPe) * numQueues;
-    HSAuint64* expectedSignals = srcObj->expectSignalsPtr + static_cast<size_t>(myPe) * numQueues;
 
     uint8_t* srcPtr = reinterpret_cast<uint8_t*>(srcObj->localPtr) + offset;
     uint8_t* dstPtr = reinterpret_cast<uint8_t*>(dst) + offset;
 
-    SdmaPutThread(srcPtr, dstPtr, copyBytes, dh, signal, expectedSignals, numQueues, qId);
+    SdmaPutThread(srcPtr, dstPtr, copyBytes, dh, signal, numQueues, qId);
+    srcObj->expectSignalsPtr[static_cast<size_t>(myPe) * numQueues + qId]++;
   }
   __syncthreads();
 
-  // Phase 2: wait for all queues (expectedSignals[qId] was bumped in SdmaPutThread)
+  // Phase 2: wait for SDMA completion
   if (threadLinearId < numQueues) {
     int qId = threadLinearId;
     HSAuint64* signal = srcObj->signalPtrs + static_cast<size_t>(myPe) * numQueues;
-    HSAuint64* expectedSignals = srcObj->expectSignalsPtr + static_cast<size_t>(myPe) * numQueues;
-    anvil::waitForSignal(signal + qId, expectedSignals[qId]);
+    HSAuint64 expected = srcObj->expectSignalsPtr[static_cast<size_t>(myPe) * numQueues + qId];
+    anvil::waitForSignal(signal + qId, expected);
   }
   __syncthreads();
 }

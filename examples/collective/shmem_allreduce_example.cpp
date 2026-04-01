@@ -89,10 +89,8 @@ __global__ void ShmemAllReduceKernel(int myPe, int npes, const uint32_t* __restr
         gatherObj->deviceHandles_d + destPe * gatherObj->sdmaNumQueue;
     HSAuint64* remoteSignal =
         gatherObj->peerSignalPtrs[destPe] + static_cast<size_t>(myPe) * gatherObj->sdmaNumQueue;
-    HSAuint64* localExpected =
-        gatherObj->expectSignalsPtr + static_cast<size_t>(destPe) * gatherObj->sdmaNumQueue;
 
-    mori::core::SdmaPutThread(srcPtr, dstPtr, chunkBytes, dh, remoteSignal, localExpected,
+    mori::core::SdmaPutThread(srcPtr, dstPtr, chunkBytes, dh, remoteSignal,
                               gatherObj->sdmaNumQueue, 0);
   }
 
@@ -163,10 +161,8 @@ __global__ void ShmemAllReduceKernel(int myPe, int npes, const uint32_t* __restr
         gatherObj->deviceHandles_d + destPe * gatherObj->sdmaNumQueue;
     HSAuint64* remoteSignal =
         gatherObj->peerSignalPtrs[destPe] + static_cast<size_t>(myPe) * gatherObj->sdmaNumQueue;
-    HSAuint64* localExpected =
-        gatherObj->expectSignalsPtr + static_cast<size_t>(destPe) * gatherObj->sdmaNumQueue;
 
-    mori::core::SdmaPutThread(srcPtr, dstPtr, chunkBytes, dh, remoteSignal, localExpected,
+    mori::core::SdmaPutThread(srcPtr, dstPtr, chunkBytes, dh, remoteSignal,
                               gatherObj->sdmaNumQueue, 0);
   }
 
