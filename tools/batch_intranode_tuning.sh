@@ -39,6 +39,7 @@ CONFIG_OUTPUT=auto
 GPUS=""
 SHMEM_MODE=""
 TIMEOUT=3600
+TUNING_SCOPE=full
 
 # Typical tuning matrix (run each separately):
 #
@@ -77,6 +78,7 @@ while [[ $# -gt 0 ]]; do
         --gpus)             GPUS="$2";              shift 2 ;;
         --shmem-mode)       SHMEM_MODE="$2";        shift 2 ;;
         --timeout)          TIMEOUT="$2";           shift 2 ;;
+        --tuning-scope)     TUNING_SCOPE="$2";      shift 2 ;;
         *)                  EXTRA_ARGS+=("$1");     shift ;;
     esac
 done
@@ -89,6 +91,8 @@ fi
 if [[ -n "$SHMEM_MODE" ]]; then
     export MORI_SHMEM_MODE="$SHMEM_MODE"
 fi
+
+export MORI_TUNING_SCOPE="$TUNING_SCOPE"
 
 # ---- Convert comma-separated lists to arrays ----
 IFS=',' read -ra TOKEN_ARRAY <<< "$TOKENS_LIST"
@@ -116,6 +120,7 @@ echo "  hidden_dims:         ${HIDDEN_DIM_ARRAY[*]}"
 echo "  dtype:               $DTYPE"
 echo "  combine_dtype:       ${COMBINE_DTYPE:-same as dtype}"
 echo "  zero_copy:           $ZERO_COPY"
+echo "  tuning_scope:        $TUNING_SCOPE"
 echo "  timeout:             ${TIMEOUT}s per combo"
 echo "  quant_type:          $QUANT_TYPE"
 echo "  config_output:       $CONFIG_OUTPUT"

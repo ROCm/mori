@@ -863,36 +863,45 @@ def _bench_dispatch_combine(
                     "Warning: dispatch/combine block/warp arguments are ignored when --cmd tuning"
                 )
             sm_count = torch.cuda.get_device_properties(rank).multi_processor_count
+            tuning_scope = os.environ.get("MORI_TUNING_SCOPE", "full")
 
-            # Build full dispatch candidate set (includes over-subscribe)
-            max_disp_block_num = max(sm_count * 4, 320)
-            all_block_set = set()
-            all_block_set.update(range(32, sm_count + 1, 8))
-            pow2 = 32
-            while pow2 <= max_disp_block_num:
-                all_block_set.add(pow2)
-                pow2 <<= 1
-            for anchor in [224, 256]:
-                for delta in [-32, -16, -8, -4, -1, 0, 1, 4, 8, 16, 32]:
-                    v = anchor + delta
-                    if 32 <= v <= max_disp_block_num:
-                        all_block_set.add(v)
-            for mult in [1, 2, 3, 4]:
-                all_block_set.add(sm_count * mult)
+            if tuning_scope == "quick":
+                block_set = set()
+                pow2 = 32
+                while pow2 <= sm_count:
+                    block_set.add(pow2)
+                    pow2 <<= 1
+                block_set.add(sm_count)
+                common_block_list = sorted(block_set)
+                warp_per_block_list = [4, 8, 16]
+            else:
+                max_disp_block_num = max(sm_count * 4, 320)
+                all_block_set = set()
+                all_block_set.update(range(32, sm_count + 1, 8))
+                pow2 = 32
+                while pow2 <= max_disp_block_num:
+                    all_block_set.add(pow2)
+                    pow2 <<= 1
+                for anchor in [224, 256]:
+                    for delta in [-32, -16, -8, -4, -1, 0, 1, 4, 8, 16, 32]:
+                        v = anchor + delta
+                        if 32 <= v <= max_disp_block_num:
+                            all_block_set.add(v)
+                for mult in [1, 2, 3, 4]:
+                    all_block_set.add(sm_count * mult)
+                common_block_list = sorted(v for v in all_block_set if v <= sm_count)
+                warp_per_block_list = [4, 5, 6, 8, 10, 12, 14, 15, 16]
 
-            common_block_list = sorted(v for v in all_block_set if v <= sm_count)
-            # Over-subscribe (block_num > SM count) is disabled by default due to
-            # hang risk with inter-block synchronization. Uncomment to enable:
-            # extra_disp_block_list = sorted(v for v in all_block_set if v > sm_count)
+            # Over-subscribe disabled by default (hang risk)
             extra_disp_block_list = []
 
-            warp_per_block_list = [4, 5, 6, 8, 10, 12, 14, 15, 16]
-
+            total_configs = len(common_block_list) * len(warp_per_block_list)
             if rank == 0:
                 print(
-                    f"SM count={sm_count}\n"
-                    f"Common block_num candidates ({len(common_block_list)}): {common_block_list}\n"
-                    f"warp_per_block candidates: {warp_per_block_list}"
+                    f"SM count={sm_count}, tuning_scope={tuning_scope}\n"
+                    f"block_num candidates ({len(common_block_list)}): {common_block_list}\n"
+                    f"warp_per_block candidates ({len(warp_per_block_list)}): {warp_per_block_list}\n"
+                    f"Total configurations: {total_configs}"
                 )
                 if extra_disp_block_list:
                     print(

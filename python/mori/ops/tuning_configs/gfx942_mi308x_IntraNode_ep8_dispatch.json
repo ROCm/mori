@@ -22,16 +22,16 @@
       "block_num": 64,
       "rdma_block_num": 0,
       "warp_per_block": 16,
-      "bandwidth_gbps": 60.12
+      "bandwidth_gbps": 61.12
     },
     {
       "dtype": "fp4",
       "num_tokens": 256,
       "hidden_dim": 3584,
-      "block_num": 72,
+      "block_num": 64,
       "rdma_block_num": 0,
-      "warp_per_block": 15,
-      "bandwidth_gbps": 82.62
+      "warp_per_block": 16,
+      "bandwidth_gbps": 85.12
     },
     {
       "dtype": "fp4",
@@ -40,7 +40,7 @@
       "block_num": 64,
       "rdma_block_num": 0,
       "warp_per_block": 16,
-      "bandwidth_gbps": 106.75
+      "bandwidth_gbps": 110.5
     },
     {
       "dtype": "fp4",
@@ -49,7 +49,7 @@
       "block_num": 80,
       "rdma_block_num": 0,
       "warp_per_block": 15,
-      "bandwidth_gbps": 134.38
+      "bandwidth_gbps": 140.12
     },
     {
       "dtype": "fp4",
@@ -58,7 +58,70 @@
       "block_num": 80,
       "rdma_block_num": 0,
       "warp_per_block": 16,
-      "bandwidth_gbps": 163.12
+      "bandwidth_gbps": 170.88
+    },
+    {
+      "dtype": "fp8_e4m3_fnuz",
+      "num_tokens": 64,
+      "hidden_dim": 7168,
+      "block_num": 64,
+      "rdma_block_num": 0,
+      "warp_per_block": 8,
+      "bandwidth_gbps": 72.0
+    },
+    {
+      "dtype": "fp8_e4m3_fnuz",
+      "num_tokens": 128,
+      "hidden_dim": 7168,
+      "block_num": 64,
+      "rdma_block_num": 0,
+      "warp_per_block": 16,
+      "bandwidth_gbps": 114.75
+    },
+    {
+      "dtype": "fp8_e4m3_fnuz",
+      "num_tokens": 256,
+      "hidden_dim": 7168,
+      "block_num": 64,
+      "rdma_block_num": 0,
+      "warp_per_block": 16,
+      "bandwidth_gbps": 158.62
+    },
+    {
+      "dtype": "fp8_e4m3_fnuz",
+      "num_tokens": 512,
+      "hidden_dim": 7168,
+      "block_num": 64,
+      "rdma_block_num": 0,
+      "warp_per_block": 16,
+      "bandwidth_gbps": 200.75
+    },
+    {
+      "dtype": "fp8_e4m3_fnuz",
+      "num_tokens": 1024,
+      "hidden_dim": 7168,
+      "block_num": 64,
+      "rdma_block_num": 0,
+      "warp_per_block": 16,
+      "bandwidth_gbps": 240.75
+    },
+    {
+      "dtype": "fp8_e4m3_fnuz",
+      "num_tokens": 2048,
+      "hidden_dim": 7168,
+      "block_num": 80,
+      "rdma_block_num": 0,
+      "warp_per_block": 16,
+      "bandwidth_gbps": 271.0
+    },
+    {
+      "dtype": "fp8_e4m3_fnuz",
+      "num_tokens": 4096,
+      "hidden_dim": 7168,
+      "block_num": 80,
+      "rdma_block_num": 0,
+      "warp_per_block": 16,
+      "bandwidth_gbps": 288.5
     }
   ]
 }
