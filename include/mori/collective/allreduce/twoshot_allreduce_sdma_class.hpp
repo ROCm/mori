@@ -83,6 +83,11 @@ class AllreduceSdma {
   // if false, user should directly use output_transit_buffer
   bool copy_output_to_user_;
 
+  // Host-side generation counters for pipeline signal expectations.
+  // Avoids reading signal memory at kernel start (inter-GPU race).
+  uint64_t pipeline_scatter_gen_ = 0;  // total SDMA ATOMIC_INC on qId=2 per (sender,dest)
+  uint64_t pipeline_ag_gen_ = 0;       // total SDMA ATOMIC_INC on qId=1 per (sender,dest)
+
   AllreduceSdma(const AllreduceSdma&) = delete;
   AllreduceSdma& operator=(const AllreduceSdma&) = delete;
 

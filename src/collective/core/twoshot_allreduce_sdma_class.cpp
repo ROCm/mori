@@ -520,37 +520,34 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
 
         const bool multi_chunk = (chunk_elems < total_count);
 
-        if (scatter_mode == 0) {
-            hipError_t br = stream
-                ? hipMemsetAsync(
-                      reinterpret_cast<char*>(barrierPtr_) + offsetof(CrossPeBarrier, baseline_done),
-                      0, sizeof(uint32_t), stream)
-                : hipMemset(
-                      reinterpret_cast<char*>(barrierPtr_) + offsetof(CrossPeBarrier, baseline_done),
-                      0, sizeof(uint32_t));
-            if (br != hipSuccess) {
-                fprintf(stderr, "PE %d: pipelined hipMemset(baseline_done) failed: %s\n",
-                        myPe_, hipGetErrorString(br));
-                return false;
-            }
-        }
+        const int numChunks_host = (chunk_elems >= total_count) ? 1
+            : static_cast<int>((total_count + chunk_elems - 1) / chunk_elems);
+
+        uint64_t scatter_base = pipeline_scatter_gen_;
+        uint64_t ag_base      = pipeline_ag_gen_;
 
         if (scatter_mode == 1) {
             PipelinedAllReduceSdmaKernel<T, 1><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
-                barrierPtr_, inputSymmObj, total_count, chunk_elems);
+                barrierPtr_, inputSymmObj, total_count, chunk_elems,
+                scatter_base, ag_base);
         } else if (multi_chunk) {
             PipelinedAllReduceSdmaKernel<T, 0, true><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
-                barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems);
+                barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems,
+                scatter_base, ag_base);
         } else {
             PipelinedAllReduceSdmaKernel<T, 0, false><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
-                barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems);
+                barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems,
+                scatter_base, ag_base);
         }
+
+        pipeline_scatter_gen_ += numChunks_host;
+        pipeline_ag_gen_      += numChunks_host;
 
         hipError_t err = hipGetLastError();
         if (err != hipSuccess) {

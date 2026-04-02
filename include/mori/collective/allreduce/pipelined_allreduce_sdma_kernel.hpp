@@ -43,7 +43,9 @@ __global__ void PipelinedAllReduceSdmaKernel(
     CrossPeBarrier* __restrict__ barrier,
     const application::SymmMemObjPtr inputSymmObj,
     size_t elementCount,
-    size_t chunkElementCount) {
+    size_t chunkElementCount,
+    uint64_t scatterBase,
+    uint64_t agBase) {
 
   if (elementCount == 0 || npes <= 0) return;
 
@@ -84,12 +86,9 @@ __global__ void PipelinedAllReduceSdmaKernel(
   {
     const int s = static_cast<int>(threadIdx.x);
     if (s < npes && s != myPe) {
-      const size_t row = static_cast<size_t>(s) * numQ;
-      s_scatter_by_sender[s] =
-          core::AtomicLoadRelaxed(dstMemObj->signalPtrs + row + 0);
+      s_scatter_by_sender[s] = scatterBase;
       if (blockIdx.x == 0) {
-        s_ag_by_sender[s] =
-            core::AtomicLoadRelaxed(dstMemObj->signalPtrs + row + 1);
+        s_ag_by_sender[s] = agBase;
       }
     }
   }
@@ -106,32 +105,6 @@ __global__ void PipelinedAllReduceSdmaKernel(
                myPe, numQ);
       }
       return;
-    }
-
-    // Cross-block sync: compute blocks signal baselines are read,
-    // block 0 waits before submitting scatter SDMA.
-    // Prevents race where SDMA scatter completes before a late compute
-    // block reads its baseline, causing it to see an inflated base value.
-    if (blockIdx.x != 0) {
-      if (threadIdx.x == 0) {
-        __scoped_atomic_fetch_add(&barrier->baseline_done, 1u,
-                                  __ATOMIC_RELEASE, __MEMORY_SCOPE_DEVICE);
-      }
-    } else {
-      if (threadIdx.x == 0) {
-        uint32_t target = static_cast<uint32_t>(gridDim.x - 1);
-        int bspin = 0;
-        while (__scoped_atomic_load_n(&barrier->baseline_done,
-                   __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) < target) {
-          if (++bspin > 100000000) {
-            printf("PE%d blk0: BASELINE WAIT %u/%u\n", myPe,
-                   __scoped_atomic_load_n(&barrier->baseline_done,
-                       __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE), target);
-            bspin = 0;
-          }
-        }
-      }
-      __syncthreads();
     }
 
     if (blockIdx.x != 0) {
@@ -161,17 +134,9 @@ __global__ void PipelinedAllReduceSdmaKernel(
           const uint64_t expected =
               s_scatter_by_sender[sender] + static_cast<uint64_t>(c + 1);
           HSAuint64* sig = dstMemObj->signalPtrs
-              + static_cast<size_t>(sender) * numQ;
-          int sSpin = 0;
-          while (core::AtomicLoadRelaxed(sig) < expected) {
-            if (++sSpin > 100000000 && blockIdx.x == 1 && idx == 0) {
-              printf("PE%d blk1: SCATTER WAIT s=%d exp=%llu act=%llu base=%llu\n",
-                     myPe, sender, (unsigned long long)expected,
-                     (unsigned long long)core::AtomicLoadRelaxed(sig),
-                     (unsigned long long)s_scatter_by_sender[sender]);
-              sSpin = 0;
-            }
-          }
+              + static_cast<size_t>(sender) * numQ + 2;
+          while (core::AtomicLoadRelaxed(sig) < expected)
+            ;
         }
         if (threadIdx.x < static_cast<unsigned>(npes)) {
           const int pe = static_cast<int>(threadIdx.x);
@@ -253,14 +218,9 @@ __global__ void PipelinedAllReduceSdmaKernel(
                 + static_cast<size_t>(destPe) * totalShardBytes + cOff;
             uint8_t* dst = reinterpret_cast<uint8_t*>(dstMemObj->peerPtrs[destPe])
                 + static_cast<size_t>(myPe) * totalShardBytes + cOff;
-            core::SdmaPutThread(src, dst, actualBytes, dh, rSig, numQ, 0);
+            core::SdmaPutThread(src, dst, actualBytes, dh, rSig, numQ, 2);
           }
         }
-      }
-
-      if (thr == 0) {
-        printf("PE%d blk0: SCATTER SUBMITTED chunks=%d bytes=%zu\n",
-               myPe, numChunks, totalShardBytes);
       }
 
       if constexpr (MULTI_CHUNK) {
