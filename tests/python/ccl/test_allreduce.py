@@ -85,7 +85,7 @@ def _verify_allreduce_result(
             return False
 
 
-def _run_benchmark(allreduce_fn, iterations, warmup, stream, rank):
+def _run_benchmark(allreduce_fn, iterations, warmup, stream, rank, setup_fn=None):
     """Run warmup + measurement iterations, return list of measured times."""
     exec_times = []
     total_iters = warmup + iterations
@@ -94,6 +94,10 @@ def _run_benchmark(allreduce_fn, iterations, warmup, stream, rank):
     ev_end = torch.cuda.Event(enable_timing=True)
 
     for i in range(total_iters):
+        if setup_fn:
+            setup_fn()
+        torch.cuda.synchronize()
+        dist.barrier()
         ev_start.record(stream)
         success = allreduce_fn()
         ev_end.record(stream)
@@ -282,11 +286,15 @@ def _test_inplace(
 
     allreduce = ar
 
-    def _inplace_with_refill():
+    def _inplace_setup():
         inplace_tensor.fill_(fill_value)
+
+    def _inplace_fn():
         return allreduce.allreduce_inplace(inplace_tensor, elems, stream)
 
-    times = _run_benchmark(_inplace_with_refill, iterations, warmup, stream, rank)
+    times = _run_benchmark(
+        _inplace_fn, iterations, warmup, stream, rank, setup_fn=_inplace_setup
+    )
 
     dist.barrier()
     _print_stats(times, data_bytes, npes, rank, f"In-place ({dtype_name})")
@@ -361,6 +369,7 @@ def _test_rccl_outplace(
     for i in range(warmup + iterations):
         output_tensor.copy_(input_tensor)
         torch.cuda.synchronize()
+        dist.barrier()
         t0 = time.perf_counter()
         dist.all_reduce(output_tensor, op=dist.ReduceOp.SUM)
         torch.cuda.synchronize()
@@ -427,6 +436,7 @@ def _test_rccl_inplace(
     for i in range(warmup + iterations):
         inplace_tensor.fill_(rccl_fill)
         torch.cuda.synchronize()
+        dist.barrier()
         t0 = time.perf_counter()
         dist.all_reduce(inplace_tensor, op=dist.ReduceOp.SUM)
         torch.cuda.synchronize()
