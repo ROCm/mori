@@ -171,7 +171,8 @@ class AllreduceSdma {
    */
   bool pipelined(T* input, T* output, size_t total_count,
                  size_t chunk_elems = 0, int scatter_mode = 0,
-                 hipStream_t stream = nullptr);
+                 hipStream_t stream = nullptr,
+                 bool external_scatter = false);
 
   application::SymmMemObjPtr getFlagsObj() const { return flagsObj_; }
   void* getOutputTransitBuffer() const { return output_transit_buffer_; }

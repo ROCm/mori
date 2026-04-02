@@ -266,7 +266,7 @@ void AllreduceSdma<T>::copy_output_to_user(T* output, size_t total_count, hipStr
 // ---------------------------------------------------------------------------
 template <typename T>
 bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count, hipStream_t stream) {
-  return pipelined(input, output, total_count, 0, 0, stream);
+  return pipelined(input, output, total_count, 0, 0, stream, /*external_scatter=*/true);
 }
 
 // ================ Async API Implementations ================
@@ -415,7 +415,7 @@ bool AllreduceSdma<T>::allreduce_inplace(T* data, size_t total_count, hipStream_
 template <typename T>
 bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                                  size_t chunk_elems, int scatter_mode,
-                                 hipStream_t stream) {
+                                 hipStream_t stream, bool external_scatter) {
     try {
         if (total_count == 0) return true;
         if (!output_transit_buffer_) {
@@ -525,6 +525,26 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                 output_transit_buffer_obj_, flagsObj_,
                 barrierPtr_, inputSymmObj, total_count, chunk_elems,
                 scatter_base, ag_base);
+        } else if (external_scatter) {
+            // 2-kernel: scatter in a 1-block kernel, then pipeline reduce+AG
+            ScatterSdmaOnlyKernel<T><<<1, 512, 0, stream>>>(
+                myPe_, npes_, input, output_transit_buffer_obj_,
+                total_count, chunk_elems, scatter_base);
+            if (multi_chunk) {
+                PipelinedAllReduceSdmaKernel<T, 0, true, true>
+                    <<<blocks, threads, 0, stream>>>(
+                    myPe_, npes_, input,
+                    output_transit_buffer_obj_, flagsObj_,
+                    barrierPtr_, application::SymmMemObjPtr{},
+                    total_count, chunk_elems, scatter_base, ag_base);
+            } else {
+                PipelinedAllReduceSdmaKernel<T, 0, false, true>
+                    <<<blocks, threads, 0, stream>>>(
+                    myPe_, npes_, input,
+                    output_transit_buffer_obj_, flagsObj_,
+                    barrierPtr_, application::SymmMemObjPtr{},
+                    total_count, chunk_elems, scatter_base, ag_base);
+            }
         } else if (multi_chunk) {
             PipelinedAllReduceSdmaKernel<T, 0, true><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
