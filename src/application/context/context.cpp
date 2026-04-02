@@ -199,8 +199,7 @@ void Context::InitializePossibleTransports() {
   int peerRankInNode = -1;
   if (!IsP2PDisabled() && IsSDMAEnabled()) anvil::anvil.init();
 
-  int sdmaNumChannels = anvil::GetSdmaNumChannels();
-  MORI_APP_INFO("SDMA num channels per GPU pair: {}", sdmaNumChannels);
+  MORI_APP_INFO("SDMA: allocating 8 queues per GPU pair");
 
   for (int i = 0; i < WorldSize(); i++) {
     // Check P2P availability
@@ -218,10 +217,10 @@ void Context::InitializePossibleTransports() {
               transportTypes.push_back(TransportType::SDMA);
               anvil::EnablePeerAccess(LocalRank() % 8, i % 8);
               // Better performance if allocating all 8 queues
-              anvil::anvil.connect(LocalRank() % 8, i % 8, sdmaNumChannels);
+              anvil::anvil.connect(LocalRank() % 8, i % 8, 8);
             } else {
               transportTypes.push_back(TransportType::SDMA);
-              anvil::anvil.connect(LocalRank() % 8, i % 8, sdmaNumChannels);
+              anvil::anvil.connect(LocalRank() % 8, i % 8, 8);
             }
           } else {
             transportTypes.push_back(TransportType::P2P);

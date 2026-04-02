@@ -45,7 +45,7 @@ static constexpr int kMaxPipelineBlocks = 384;
 // Cross-PE barrier shared by SdmaReduceScatterKernel (uses flag only)
 // and PipelinedAllReduceSdmaKernel (uses all fields).
 struct alignas(128) CrossPeBarrier {
-  alignas(128) uint32_t flag;
+  uint32_t flag;
   uint32_t ag_sync;
   uint32_t block_done[kMaxPipelineBlocks];
   uint32_t chunks_complete;

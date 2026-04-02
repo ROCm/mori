@@ -123,24 +123,6 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t /*input_buffer_size*/
   if (!output_transit_buffer_obj_.IsValid())
     throw std::runtime_error("Failed to register output transit buffer");
 
-  // Zero SDMA completion signals so the generation counter (barrier->flag) stays in sync.
-  // Without this, reused SHMEM memory may carry stale signal values from a prior instance.
-  // NOTE: cpu-side SymmMemObj does NOT carry signalPtrs (it's null). Read the device
-  // pointer from the gpu-side struct via hipMemcpy.
-  {
-    uint32_t numQ = output_transit_buffer_obj_->sdmaNumQueue;
-    if (numQ > 0 && output_transit_buffer_obj_.gpu != nullptr) {
-      HSAuint64* devSigPtr = nullptr;
-      hipMemcpy(&devSigPtr,
-                reinterpret_cast<char*>(output_transit_buffer_obj_.gpu) +
-                    offsetof(application::SymmMemObj, signalPtrs),
-                sizeof(HSAuint64*), hipMemcpyDeviceToHost);
-      if (devSigPtr) {
-        hipMemset(devSigPtr, 0, static_cast<size_t>(npes_) * numQ * sizeof(HSAuint64));
-      }
-    }
-  }
-
   printf("AllreduceSdma(SDMA) initialized: PE %d of %d, max_blocks=%d\n", myPe_, npes_,
          max_blocks_);
   printf("  Flags: %zu bytes at %p\n", flagsSize, flags_.get());
@@ -485,7 +467,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                 chunk_elems = total_count;
             } else {
                 constexpr int    kTargetChunks      = 2;
-                constexpr size_t kMinChunkShardBytes = 4ULL * 1024 * 1024;
+                constexpr size_t kMinChunkShardBytes = 8ULL * 1024 * 1024;
                 const size_t shard_bytes =
                     (total_count / npes_) * dtype_size_;
                 const size_t chunk_shard_bytes =
