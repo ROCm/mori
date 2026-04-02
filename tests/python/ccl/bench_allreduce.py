@@ -18,7 +18,6 @@ Usage:
   python tests/python/ccl/bench_allreduce.py --world-size 8 --warmup 5 --iterations 10
 """
 
-import gc
 import os
 import time
 import argparse
@@ -193,10 +192,8 @@ def _bench_worker(rank, world_size, port, warmup, iterations, dtype):
         if rank == 0:
             _print_table(rows, npes, elem_size, dtype)
 
-        gc.collect()
         torch.cuda.synchronize()
         dist.barrier()
-        shmem.shmem_finalize()
 
 
 def _bw(data_bytes, t):
