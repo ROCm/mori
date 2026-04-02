@@ -29,7 +29,7 @@ from mori.ccl import AllreduceSdma
 from tests.python.utils import TorchDistContext, get_free_port
 
 
-DATA_SIZES_MB = [1, 2, 4, 8, 16, 32, 64, 128, 256]
+DATA_SIZES_MB = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
 
 _RCCL_DTYPE_MAP = {
     torch.uint32: torch.int32,
