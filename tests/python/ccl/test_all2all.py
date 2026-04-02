@@ -229,7 +229,7 @@ def _test_all2all(rank, world_size, port, elems, iterations, warmup):
 
         # Get output transit buffer and verify
         # Pass the output_tensor to ensure the buffer is on the correct device
-        output_transit_buffer = all2all.get_output_transit_buffer(device=output_tensor)
+        output_transit_buffer = all2all.get_output_transit_buffer()
         output_transit_buffer_cpu = output_transit_buffer.cpu().numpy()
 
         if rank == 0:
