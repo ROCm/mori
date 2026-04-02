@@ -49,8 +49,7 @@ set(CMAKE_LIBRARY_PATH "/usr/local/lib;${CMAKE_LIBRARY_PATH}")
 
 if(MORI_MULTITHREAD_SUPPORT)
   add_compile_definitions(MORI_MULTITHREAD_SUPPORT)
-  # disable MPI and Torch bootstrap for multithread support
-  set(WITH_MPI OFF)
+  # disable Torch bootstrap for multithread support
   set(BUILD_TORCH_BOOTSTRAP OFF)
 endif()
 

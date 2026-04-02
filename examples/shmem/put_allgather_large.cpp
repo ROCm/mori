@@ -55,17 +55,21 @@ __global__ void RingAllGatherKernel(int myPe, int npes, const SymmMemObjPtr memO
                                     size_t peChunkBytes) {
   int nextPeer = (myPe + 1) % npes;
 
-  auto peerPtr = ShmemPtrP2p(reinterpret_cast<uint64_t>(memObj->localPtr), myPe, nextPeer);
-
-  printf("myPe: %d, npes: %d, peChunkSize: %d\n", myPe, npes, peChunkBytes);
-  printf("localPtr: %p peerPtr %p\n", memObj->localPtr, peerPtr);
+  // auto peerPtr = ShmemPtrP2p(reinterpret_cast<uint64_t>(memObj->localPtr), myPe, nextPeer);
+  // printf("myPe: %d, npes: %d, peChunkSize: %d\n", myPe, npes, peChunkBytes);
+  // printf("localPtr: %p peerPtr %p\n", memObj->localPtr, peerPtr);
+  if (threadIdx.x == 0) {
+    auto transportType = GetGlobalGpuStatesPtr()->transportTypes[nextPeer];
+    printf("myPe: %d, nextPeer: %d, transportType: %d\n", myPe, nextPeer, transportType);
+  }
 
   for (int i = 0; i < npes - 1; i++) {
     int sendDataRank = ((myPe - i) + npes) % npes;
     size_t sendOffset = sendDataRank * peChunkBytes;
-
-    ShmemPutMemNbiThread(memObj, sendOffset, memObj, sendOffset, peChunkBytes, nextPeer);
-    ShmemQuietThread(nextPeer, memObj);
+    
+    ShmemPutMemNbiWarp(memObj, sendOffset, memObj, sendOffset, peChunkBytes, nextPeer);
+    // NOTE using memobj forces SDMA transport
+    ShmemQuietThread(nextPeer); //, memObj);
 
     int recvDataRank = ((sendDataRank - 1) + npes) % npes;
     size_t recvOffset = recvDataRank * peChunkBytes;
@@ -150,7 +154,7 @@ int main(int argc, char* argv[]) {
   HIP_RUNTIME_CHECK(hipEventCreate(&stop));
   HIP_RUNTIME_CHECK(hipEventRecord(start));
 
-  RingAllGatherKernel<<<1, 1>>>(myPe, npes, buffObj, bytesPerPe);
+  RingAllGatherKernel<<<1, 64>>>(myPe, npes, buffObj, bytesPerPe);
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
 
   HIP_RUNTIME_CHECK(hipEventRecord(stop));

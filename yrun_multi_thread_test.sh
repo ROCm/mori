@@ -47,7 +47,7 @@ export MORI_SHMEM_MODE=STATIC_HEAP #ISOLATION #VMM_HEAP #  STATIC_HEAP
 export MORI_SHMEM_HEAP_SIZE=5G
 export MORI_KERNEL_DIR=/tf/mori/build/lib/gfx942_mlx5
 export MORI_APP_LOG_LEVEL=DEBUG
-export MORI_SHMEM_LOG_LEVEL=TRACE
+export MORI_SHMEM_LOG_LEVEL=DEBUG
 export MORI_CORE_LOG_LEVEL=DEBUG
 export MORI_OPS_LOG_LEVEL=DEBUG
 
@@ -61,7 +61,7 @@ TORCH_LIBS=/usr/local/lib/python3.12/dist-packages/torch/lib
 export LD_PRELOAD=/lib/x86_64-linux-gnu/libnuma.so.1 #:/lib/x86_64-linux-gnu/libibverbs.so.1
 # export LD_LIBRARY_PATH=$TORCH_LIBS:$LD_LIBRARY_PATH
 
-#mpirun --allow-run-as-root -np 2 ./build/examples/put_allgather_large 1024
-mpirun --allow-run-as-root -np 2 ./build/examples/put_thread_allgather 1024
+mpirun --allow-run-as-root -np 2 ./build/examples/put_allgather_large $@
+#mpirun --allow-run-as-root -np 2 ./build/examples/put_thread_allgather 1024
 # $GDB $ROCPROF ./build/examples/send_recv_gpu 2>&1 | tee zzzrun.log
 # $GDB $ROCPROF ./build/examples/multithread_multi_gpu 2>&1 | tee zzzrun.log
