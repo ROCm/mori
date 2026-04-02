@@ -158,7 +158,20 @@ void testPipelinedAllreduce() {
     std::vector<double> serialGb, sdmaGb, p2pGb;
     std::vector<bool> okSerial, okSdma, okP2p;
 
+    const size_t startMB = [] {
+        const char* e = std::getenv("MORI_START_MB");
+        return e ? static_cast<size_t>(std::atoi(e)) : 0;
+    }();
+
     for (size_t dataMB : dataSizesMB) {
+        if (startMB > 0 && dataMB < startMB) {
+            if (myPe == 0) {
+                serialMs.push_back(0); serialGb.push_back(0); okSerial.push_back(true);
+                sdmaMs.push_back(0); sdmaGb.push_back(0); okSdma.push_back(true);
+                p2pMs.push_back(0); p2pGb.push_back(0); okP2p.push_back(true);
+            }
+            continue;
+        }
         size_t bytesPerPe = dataMB * 1024 * 1024;
         size_t elemsPerPe = bytesPerPe / sizeof(uint32_t);
         uint32_t fillValue = static_cast<uint32_t>((myPe + 1) * 1000);
