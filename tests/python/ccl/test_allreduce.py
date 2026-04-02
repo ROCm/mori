@@ -31,7 +31,7 @@ Tests four modes (always):
 
 Optional (--test-gemm-overlap): overlap wall time vs torch.matmul GEMM on a second
 stream, comparing SDMA allreduce (copy_output_to_user True and False) vs RCCL.
-Verifies correctness and measures bandwidth for each.
+Correctness is not checked in this phase (Tests 1–4 already cover it); only timing.
 """
 
 import os
@@ -508,7 +508,10 @@ def _test_gemm_overlap_comparison(
     gemm_n=_GEMM_N_DEFAULT,
     gemm_k=_GEMM_K_DEFAULT,
 ):
-    """SDMA (copy True/False) vs RCCL allreduce overlapped with torch.matmul."""
+    """SDMA (copy True/False) vs RCCL allreduce overlapped with torch.matmul.
+
+    No payload correctness checks here (Tests 1–4); only launch success and timing.
+    """
     stream_ar = torch.cuda.Stream(device=device)
     stream_gemm = torch.cuda.Stream(device=device)
     rccl_dtype = _RCCL_DTYPE_MAP.get(dtype, torch.float32)
@@ -556,7 +559,7 @@ def _test_gemm_overlap_comparison(
         all_ok = all_ok and ok_c
         if not ok_c:
             if rank == 0:
-                print(f"  [{label}] correctness failed on some PE, skipping bench")
+                print(f"  [{label}] setup failed on some PE, skipping bench")
             dist.barrier()
             return
 
@@ -645,9 +648,6 @@ def _test_gemm_overlap_comparison(
         stream_ar.synchronize()
         ok = ar(inp, out, elems, stream_ar)
         stream_ar.synchronize()
-        ok = ok and _verify_allreduce_result(
-            _to_numpy(out.cpu()), elems, my_pe, npes, "gemm_ov/sdma_copyT", dtype=dtype
-        )
 
         def prep():
             inp.fill_(fill_value)
@@ -656,7 +656,7 @@ def _test_gemm_overlap_comparison(
             return ar(inp, out, elems, stream_ar)
 
         if not ok and rank == 0:
-            print("  SDMA copy=True pre-bench verification failed")
+            print("  SDMA copy=True setup ar() failed")
         return ok, launch, prep, False
 
     bench_one(
@@ -680,15 +680,6 @@ def _test_gemm_overlap_comparison(
         stream_ar.synchronize()
         ok = ar(inp, out, elems, stream_ar)
         stream_ar.synchronize()
-        transit = ar.get_output_transit_buffer(dtype=inp.dtype)
-        ok = ok and _verify_allreduce_result(
-            _to_numpy(transit.cpu()),
-            elems,
-            my_pe,
-            npes,
-            "gemm_ov/sdma_copyF",
-            dtype=dtype,
-        )
 
         def prep():
             inp.fill_(fill_value)
@@ -697,7 +688,7 @@ def _test_gemm_overlap_comparison(
             return ar(inp, out, elems, stream_ar)
 
         if not ok and rank == 0:
-            print("  SDMA copy=False pre-bench verification failed")
+            print("  SDMA copy=False setup ar() failed")
         return ok, launch, prep, False
 
     bench_one(
@@ -711,9 +702,6 @@ def _test_gemm_overlap_comparison(
 
         dist.all_reduce(buf, op=dist.ReduceOp.SUM)
         torch.cuda.synchronize()
-        ok = _rccl_verify(
-            _to_numpy(buf.cpu()), elems, npes, rccl_dtype, rank, "gemm_ov/rccl"
-        )
 
         def prep():
             buf.fill_(rccl_fill)
@@ -722,9 +710,7 @@ def _test_gemm_overlap_comparison(
             dist.all_reduce(buf, op=dist.ReduceOp.SUM)
             return True
 
-        if not ok and rank == 0:
-            print("  RCCL pre-bench verification failed")
-        return ok, launch, prep, True
+        return True, launch, prep, True
 
     rccl_name = str(rccl_dtype).split(".")[-1]
     bench_one(

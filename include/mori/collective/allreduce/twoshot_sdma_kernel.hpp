@@ -131,6 +131,141 @@ __global__ void ReduceScatterKernel(int myPe, int npes, const application::SymmM
 }
 
 // ============================================================================
+// SdmaGatherForReduceKernel — sync path phase 1: gather shards via SDMA only
+//
+// Equivalent to Phase 1+2 of SdmaReduceScatterKernel (block 0), launched as a
+// single 512-thread block so SDMA progress uses minimal CU occupancy.
+// After all peers' data is in dstMemObj, fence before returning so a separate
+// SdmaLocalReduceKernel sees SDMA lands at CU (see AllGatherAsyncWaitKernel).
+// ============================================================================
+template <typename T>
+__global__ void SdmaGatherForReduceKernel(
+    int myPe, int npes, const T* __restrict__ input, const application::SymmMemObjPtr dstMemObj,
+    const application::SymmMemObjPtr flagsMemObj, CrossPeBarrier* __restrict__ barrier,
+    size_t elementCount) {
+  if (elementCount == 0 || npes <= 0) return;
+
+  constexpr int pack_size = packed_t<T>::P::size;
+
+  const size_t elementCountPerRank =
+      ((elementCount / npes + pack_size - 1) / pack_size) * pack_size;
+  if (elementCountPerRank == 0) return;
+
+  const size_t chunkBytes = elementCountPerRank * sizeof(T);
+  uint64_t* __restrict__ flags = reinterpret_cast<uint64_t*>(flagsMemObj->localPtr);
+
+  __shared__ uint64_t token;
+  if (threadIdx.x == 0) {
+    token = static_cast<uint64_t>(barrier->flag) + 1ULL;
+  }
+  __syncthreads();
+  uint64_t flag_val = token;
+
+  const int warpId = static_cast<int>(threadIdx.x) / warpSize;
+  const int laneId = static_cast<int>(threadIdx.x) % warpSize;
+
+  if (warpId < npes && laneId == 0) {
+    int destPe = warpId;
+
+    uint8_t* srcPtr = reinterpret_cast<uint8_t*>(const_cast<T*>(input)) +
+                      static_cast<size_t>(destPe) * chunkBytes;
+    uint8_t* remoteDst = reinterpret_cast<uint8_t*>(dstMemObj->peerPtrs[destPe]) +
+                         static_cast<size_t>(myPe) * chunkBytes;
+
+    anvil::SdmaQueueDeviceHandle** dh =
+        dstMemObj->deviceHandles_d + destPe * dstMemObj->sdmaNumQueue;
+    HSAuint64* sig = dstMemObj->signalPtrs + destPe * dstMemObj->sdmaNumQueue;
+    HSAuint64* esig = dstMemObj->expectSignalsPtr + destPe * dstMemObj->sdmaNumQueue;
+    core::SdmaPutThread(srcPtr, remoteDst, chunkBytes, dh, sig, esig, dstMemObj->sdmaNumQueue, 0);
+  }
+
+  if (warpId < npes && laneId == 0) {
+    int destPe = warpId;
+    shmem::ShmemQuietThread(destPe, dstMemObj);
+    shmem::ShmemAtomicSizeNonFetchThreadKernel<application::TransportType::SDMA>(
+        flagsMemObj, static_cast<size_t>(myPe) * sizeof(uint64_t), &flag_val, 8,
+        core::atomicType::AMO_SET, destPe, 0);
+  }
+  __syncthreads();
+
+  for (int sender = 0; sender < npes; ++sender) {
+    if (sender == myPe) continue;
+    if (threadIdx.x == 0) {
+      int spin = 0;
+      bool warned = false;
+      while (core::AtomicLoadRelaxed(flags + sender) < flag_val) {
+        if (++spin > 100000000 && !warned) {
+          printf("PE %d: GatherForReduce timeout waiting for peer %d\n", myPe, sender);
+          warned = true;
+        }
+      }
+    }
+    __syncthreads();
+  }
+
+  __threadfence_system();
+  __syncthreads();
+
+  if (threadIdx.x == 0) {
+    __scoped_atomic_store_n(
+        &barrier->flag, static_cast<uint32_t>(token), __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
+  }
+}
+
+// ============================================================================
+// SdmaLocalReduceKernel — sync path phase 2: local reduce on gathered buffer
+//
+// Same as Phase 2.5 + Phase 3 (+ optional buffer_wbl2) of SdmaReduceScatterKernel,
+// without SDMA. Launched with many blocks for throughput.
+// ============================================================================
+template <typename T>
+__global__ void SdmaLocalReduceKernel(int myPe, int npes, const T* __restrict__ input,
+                                    const application::SymmMemObjPtr dstMemObj,
+                                    size_t elementCount) {
+  if (elementCount == 0 || npes <= 0) return;
+
+  using P = typename packed_t<T>::P;
+  using A = typename packed_t<T>::A;
+  constexpr int pack_size = P::size;
+
+  const size_t elementCountPerRank =
+      ((elementCount / npes + pack_size - 1) / pack_size) * pack_size;
+  const size_t packedPerRank = elementCountPerRank / pack_size;
+  if (elementCountPerRank == 0) return;
+
+  P* __restrict__ buf = reinterpret_cast<P*>(dstMemObj->localPtr);
+  P* __restrict__ myDst = buf + static_cast<size_t>(myPe) * packedPerRank;
+
+  const size_t tid =
+      static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + threadIdx.x;
+  const size_t stride = static_cast<size_t>(blockDim.x) * static_cast<size_t>(gridDim.x);
+
+  {
+    const P* __restrict__ inputSlot =
+        reinterpret_cast<const P*>(input) + static_cast<size_t>(myPe) * packedPerRank;
+    for (size_t k = tid; k < packedPerRank; k += stride) {
+      myDst[k] = inputSlot[k];
+    }
+  }
+
+  for (size_t k = tid; k < packedPerRank; k += stride) {
+    A acc = upcast_v<typename P::type, pack_size>(buf[k]);
+    for (int pe = 1; pe < npes; ++pe) {
+      packed_assign_add(acc, upcast_v<typename P::type, pack_size>(
+                                 buf[static_cast<size_t>(pe) * packedPerRank + k]));
+    }
+    myDst[k] = downcast_v<typename P::type, pack_size>(acc);
+  }
+
+#if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    asm volatile("buffer_wbl2" ::: "memory");
+  }
+#endif
+}
+
+// ============================================================================
 // SdmaReduceScatterKernel — SDMA scatter + local reduce in ONE kernel
 //
 // Replaces ReduceScatterKernel.  Eliminates IPC registration, D2D copy,
@@ -146,6 +281,9 @@ __global__ void ReduceScatterKernel(int myPe, int npes, const application::SymmM
 // Block-0-to-all broadcast uses a device-scope generation counter so the
 // kernel works under CUDA graph replay.
 // Requirement: gridDim.x <= multiProcessorCount (co-resident blocks).
+//
+// Sync AllreduceSdma::operator() uses SdmaGatherForReduceKernel + SdmaLocalReduceKernel
+// instead to keep SDMA on a 1-block launch; async still uses this fused kernel.
 // ============================================================================
 template <typename T>
 __global__ void SdmaReduceScatterKernel(int myPe, int npes, const T* __restrict__ input,

@@ -216,24 +216,43 @@ void AllreduceSdma<T>::copy_output_to_user(T* output, size_t total_count, hipStr
 template <typename T>
 bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count, hipStream_t stream) {
   try {
-    // Step 1: SdmaReduceScatter — SDMA scatter + local reduce
+    size_t required_output_size = (total_count / npes_) * npes_ * dtype_size_;
+    if (!ensure_buffer_size(output_transit_buffer_, output_transit_buffer_ptr_,
+                            output_transit_buffer_size_, output_transit_buffer_obj_,
+                            required_output_size, "output transit buffer")) {
+      return false;
+    }
+
+    // Reduce-scatter as: SDMA gather-for-reduce (1 block) + local reduce (many blocks).
+    // Final result spread by AllGather SDMA. Async API still uses fused SdmaReduceScatterKernel.
     constexpr int pack_size = packed_t<T>::P::size;
-    int threads = 512;
+    int threads = 1024;
     int packedPerRank = static_cast<int>(((total_count / npes_ + pack_size - 1) / pack_size));
     int blocks = std::min(max_blocks_, (packedPerRank + threads - 1) / threads);
     if (blocks < 1) blocks = 1;
 
-    SdmaReduceScatterKernel<T><<<blocks, threads, 0, stream>>>(
+    SdmaGatherForReduceKernel<T><<<1, 512, 0, stream>>>(
         myPe_, npes_, input, output_transit_buffer_obj_, flagsObj_, barrierPtr_, total_count);
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess) {
-      fprintf(stderr, "PE %d: SdmaReduceScatter launch failed: %s\n", myPe_,
+      fprintf(stderr, "PE %d: SdmaGatherForReduce launch failed: %s\n", myPe_,
               hipGetErrorString(err));
       return false;
     }
 
-    // Step 2: AllGather via SDMA
+    SdmaLocalReduceKernel<T><<<blocks, threads, 0, stream>>>(myPe_, npes_, input,
+                                                               output_transit_buffer_obj_,
+                                                               total_count);
+
+    err = hipGetLastError();
+    if (err != hipSuccess) {
+      fprintf(stderr, "PE %d: SdmaLocalReduce launch failed: %s\n", myPe_,
+              hipGetErrorString(err));
+      return false;
+    }
+
+    // AllGather via SDMA
     AllGatherSdmaKernel<T><<<1, 512, 0, stream>>>(myPe_, npes_, output_transit_buffer_obj_,
                                                   flagsObj_, barrierPtr_, total_count);
 
@@ -283,7 +302,7 @@ bool AllreduceSdma<T>::start_async(T* input, T* output, size_t total_count, hipS
 
     // Step 1: SdmaReduceScatter — same as operator()
     constexpr int pack_size = packed_t<T>::P::size;
-    int threads = 512;
+    int threads = 1024;
     int packedPerRank = static_cast<int>(((total_count / npes_ + pack_size - 1) / pack_size));
     int blocks = std::min(max_blocks_, (packedPerRank + threads - 1) / threads);
     if (blocks < 1) blocks = 1;
