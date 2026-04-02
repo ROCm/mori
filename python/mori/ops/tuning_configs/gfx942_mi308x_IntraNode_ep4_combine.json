@@ -1,7 +1,7 @@
 {
   "version": "1.0",
   "gpu_arch": "gfx942",
-  "gpu_model": "mi300x",
+  "gpu_model": "mi308x",
   "kernel_type": "IntraNode",
   "ep_size": 4,
   "phase": "combine",
