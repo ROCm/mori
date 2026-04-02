@@ -449,6 +449,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         if (blocks < 1) blocks = 1;
         if (scatter_mode == 0) {
             int comp = std::min(blocks, kMaxPipelineBlocks - 1);
+            comp = std::min(comp, max_blocks_ - 1);
             blocks = comp + 1;
         }
 
