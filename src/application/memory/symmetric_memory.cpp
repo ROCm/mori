@@ -133,6 +133,7 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
   // Open IPC handles for all same-node peers to establish P2P data path
   // This happens regardless of transport type selection
   for (int i = 0; i < worldSize; i++) {
+
     if (!context.CanUseP2P(i)) continue;
     if (context.SameProcessP2P(i)) {
       cpuMemObj->p2pPeerPtrs[i] = cpuMemObj->peerPtrs[i];
@@ -156,6 +157,14 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
       cpuMemObj->peerPtrs[i] = cpuMemObj->p2pPeerPtrs[i];
     }
   }
+
+  for (int i = 0; i < worldSize; i++) {
+    MORI_SHMEM_DEBUG("XXX rank={} i={} "
+      " peerPtrs[i]={:p} p2pPeerPtrs[i]={:p}", rank, i,
+            reinterpret_cast<void*>(cpuMemObj->peerPtrs[i]),
+            reinterpret_cast<void*>(cpuMemObj->p2pPeerPtrs[i]));
+  }
+
 
   // Rdma context: set lkey and exchange rkeys
   cpuMemObj->peerRkeys = static_cast<uint32_t*>(calloc(worldSize, sizeof(uint32_t)));
