@@ -150,12 +150,13 @@ __global__ void PipelinedAllReduceSdmaKernel(
               + static_cast<size_t>(sender) * numQ;
           int sSpin = 0;
           while (core::AtomicLoadRelaxed(sig) < expected) {
-            if (++sSpin > 200000000) {
+            if (++sSpin > 50000000) {
               if (blockIdx.x == 1) {
-                printf("PE%d blk1 t%d: SCATTER TIMEOUT sender=%d exp=%llu act=%llu\n",
+                printf("PE%d blk1 t%d: SCATTER WAIT sender=%d exp=%llu act=%llu sig@%p\n",
                        myPe, idx, sender,
                        (unsigned long long)expected,
-                       (unsigned long long)core::AtomicLoadRelaxed(sig));
+                       (unsigned long long)core::AtomicLoadRelaxed(sig),
+                       (void*)sig);
               }
               sSpin = 0;
             }
@@ -310,11 +311,20 @@ __global__ void PipelinedAllReduceSdmaKernel(
           while (__scoped_atomic_load_n(
                      &barrier->chunks_complete,
                      __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) < ccTarget) {
-            if (++ccSpin > 200000000 && thr == (myPe == 0 ? 1 : 0)) {
-              printf("PE%d: CC TIMEOUT target=%u act=%u\n", myPe, ccTarget,
-                     __scoped_atomic_load_n(&barrier->chunks_complete,
-                                            __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE));
-              break;
+            if (++ccSpin > 50000000 && thr == (myPe == 0 ? 1 : 0)) {
+              uint32_t ccAct = __scoped_atomic_load_n(&barrier->chunks_complete,
+                                            __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
+              printf("PE%d blk0: CC TIMEOUT cc=%u/%u scatter_sigs:",
+                     myPe, ccAct, ccTarget);
+              for (int p = 0; p < npes; p++) {
+                if (p == myPe) continue;
+                printf(" %d:%llu/%llu", p,
+                    (unsigned long long)core::AtomicLoadRelaxed(
+                        dstMemObj->signalPtrs + static_cast<size_t>(p) * numQ),
+                    (unsigned long long)(s_scatter_by_sender[p] + 1));
+              }
+              printf("\n");
+              ccSpin = 0;
             }
           }
 
@@ -336,12 +346,12 @@ __global__ void PipelinedAllReduceSdmaKernel(
               + static_cast<size_t>(sender) * numQ + 1;
           int agSpin = 0;
           while (core::AtomicLoadRelaxed(sig) < expected) {
-            if (++agSpin > 200000000 && thr == (myPe == 0 ? 1 : 0)) {
+            if (++agSpin > 50000000 && thr == (myPe == 0 ? 1 : 0)) {
               printf("PE%d: AG SIG TIMEOUT sender=%d exp=%llu act=%llu\n",
                      myPe, sender,
                      (unsigned long long)expected,
                      (unsigned long long)core::AtomicLoadRelaxed(sig));
-              break;
+              agSpin = 0;
             }
           }
         }
