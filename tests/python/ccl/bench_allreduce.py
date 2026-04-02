@@ -227,11 +227,11 @@ def _print_table(rows, npes, elem_size, dtype):
 
     hdr = (
         f"{'MB/PE':>6} | {'sync':>8} {'sync':>8} | {'async':>8} {'async':>8} | "
-        f"{'RCCL':>8} {'RCCL':>8} | {'best':>8}"
+        f"{'RCCL':>8} {'RCCL':>8} | {'best':>14}"
     )
     sub = (
         f"{'':>6} | {'no-copy':>8} {'copy':>8} | {'no-copy':>8} {'copy':>8} | "
-        f"{'outplace':>8} {'inplace':>8} | {'':>8}"
+        f"{'outplace':>8} {'inplace':>8} | {'':>14}"
     )
     print(hdr)
     print(sub)
@@ -248,15 +248,15 @@ def _print_table(rows, npes, elem_size, dtype):
         bw_rn = _bw(db, r["rccl_nocopy"])
         bw_rc = _bw(db, r["rccl_copy"])
 
-        all_bw = {"sync-nc": bw_sn, "sync-cp": bw_sc,
-                  "async-nc": bw_an, "async-cp": bw_ac,
-                  "rccl-op": bw_rn, "rccl-ip": bw_rc}
+        all_bw = {"sync-no-copy": bw_sn, "sync-copy": bw_sc,
+                  "async-no-copy": bw_an, "async-copy": bw_ac,
+                  "rccl-outplace": bw_rn, "rccl-inplace": bw_rc}
         best_name = max(all_bw, key=all_bw.get)
 
         print(
             f"{mb:>6} | {bw_sn:>8.1f} {bw_sc:>8.1f} | "
             f"{bw_an:>8.1f} {bw_ac:>8.1f} | "
-            f"{bw_rn:>8.1f} {bw_rc:>8.1f} | {best_name:>8}"
+            f"{bw_rn:>8.1f} {bw_rc:>8.1f} | {best_name:>14}"
         )
 
     print(sep)
