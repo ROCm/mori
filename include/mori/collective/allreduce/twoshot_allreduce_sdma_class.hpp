@@ -85,8 +85,9 @@ class AllreduceSdma {
 
   // Host-side generation counters for pipeline signal expectations.
   // Avoids reading signal memory at kernel start (inter-GPU race).
-  uint64_t pipeline_scatter_gen_ = 0;  // total SDMA ATOMIC_INC on qId=2 per (sender,dest)
-  uint64_t pipeline_ag_gen_ = 0;       // total SDMA ATOMIC_INC on qId=1 per (sender,dest)
+  // Signals are zeroed in constructor, so counters start at 0.
+  uint64_t pipeline_scatter_gen_ = 0;  // total SDMA ATOMIC_INC on qId=0 (scatter)
+  uint64_t pipeline_ag_gen_ = 0;       // total SDMA ATOMIC_INC on qId=1 (AG)
 
   AllreduceSdma(const AllreduceSdma&) = delete;
   AllreduceSdma& operator=(const AllreduceSdma&) = delete;

@@ -95,13 +95,13 @@ __global__ void PipelinedAllReduceSdmaKernel(
   __syncthreads();
 
   // =========================================================================
-  // SCATTER_MODE = 0 — Single-buffer SDMA + qId=2 cross-PE reduce barrier
+  // SCATTER_MODE = 0 — Single-buffer SDMA scatter(qId=0) + AG(qId=1)
   // =========================================================================
   if constexpr (SCATTER_MODE == 0) {
 
-    if (numQ < 3) {
+    if (numQ < 2) {
       if (threadIdx.x == 0 && blockIdx.x == 0) {
-        printf("PE %d: pipelined SDMA needs sdmaNumQueue>=3 (got %u)\n",
+        printf("PE %d: pipelined SDMA needs sdmaNumQueue>=2 (got %u)\n",
                myPe, numQ);
       }
       return;
@@ -134,7 +134,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
           const uint64_t expected =
               s_scatter_by_sender[sender] + static_cast<uint64_t>(c + 1);
           HSAuint64* sig = dstMemObj->signalPtrs
-              + static_cast<size_t>(sender) * numQ + 2;
+              + static_cast<size_t>(sender) * numQ;
           while (core::AtomicLoadRelaxed(sig) < expected)
             ;
         }
@@ -218,7 +218,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
                 + static_cast<size_t>(destPe) * totalShardBytes + cOff;
             uint8_t* dst = reinterpret_cast<uint8_t*>(dstMemObj->peerPtrs[destPe])
                 + static_cast<size_t>(myPe) * totalShardBytes + cOff;
-            core::SdmaPutThread(src, dst, actualBytes, dh, rSig, numQ, 2);
+            core::SdmaPutThread(src, dst, actualBytes, dh, rSig, numQ, 0);
           }
         }
       }

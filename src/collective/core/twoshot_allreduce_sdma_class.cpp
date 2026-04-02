@@ -123,12 +123,17 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t /*input_buffer_size*/
   if (!output_transit_buffer_obj_.IsValid())
     throw std::runtime_error("Failed to register output transit buffer");
 
-  if (output_transit_buffer_obj_.cpu->signalPtrs &&
-      output_transit_buffer_obj_.cpu->sdmaNumQueue > 0) {
-    size_t sigSize =
-        static_cast<size_t>(npes_) * output_transit_buffer_obj_.cpu->sdmaNumQueue *
-        sizeof(HSAuint64);
-    hipMemset(output_transit_buffer_obj_.cpu->signalPtrs, 0, sigSize);
+  {
+    HSAuint64* gpuSig = nullptr;
+    uint32_t   gpuNumQ = 0;
+    hipMemcpy(&gpuSig, &(output_transit_buffer_obj_.gpu->signalPtrs),
+              sizeof(HSAuint64*), hipMemcpyDeviceToHost);
+    hipMemcpy(&gpuNumQ, &(output_transit_buffer_obj_.gpu->sdmaNumQueue),
+              sizeof(uint32_t), hipMemcpyDeviceToHost);
+    if (gpuSig && gpuNumQ > 0) {
+      size_t sigSize = static_cast<size_t>(npes_) * gpuNumQ * sizeof(HSAuint64);
+      hipMemset(gpuSig, 0, sigSize);
+    }
   }
 
   printf("AllreduceSdma(SDMA) initialized: PE %d of %d, max_blocks=%d\n", myPe_, npes_,
@@ -185,12 +190,19 @@ bool AllreduceSdma<T>::ensure_buffer_size(void*& buffer,
     return false;
   }
 
-  if (buffer_obj.cpu->signalPtrs && buffer_obj.cpu->sdmaNumQueue > 0) {
-    size_t sigSize =
-        static_cast<size_t>(npes_) * buffer_obj.cpu->sdmaNumQueue * sizeof(HSAuint64);
-    hipMemset(buffer_obj.cpu->signalPtrs, 0, sigSize);
-    pipeline_scatter_gen_ = 0;
-    pipeline_ag_gen_ = 0;
+  {
+    HSAuint64* gpuSig = nullptr;
+    uint32_t   gpuNumQ = 0;
+    hipMemcpy(&gpuSig, &(buffer_obj.gpu->signalPtrs),
+              sizeof(HSAuint64*), hipMemcpyDeviceToHost);
+    hipMemcpy(&gpuNumQ, &(buffer_obj.gpu->sdmaNumQueue),
+              sizeof(uint32_t), hipMemcpyDeviceToHost);
+    if (gpuSig && gpuNumQ > 0) {
+      size_t sigSize = static_cast<size_t>(npes_) * gpuNumQ * sizeof(HSAuint64);
+      hipMemset(gpuSig, 0, sigSize);
+      pipeline_scatter_gen_ = 0;
+      pipeline_ag_gen_ = 0;
+    }
   }
 
   printf("PE %d: %s reallocated to %.2f MB\n", myPe_, buffer_name,
