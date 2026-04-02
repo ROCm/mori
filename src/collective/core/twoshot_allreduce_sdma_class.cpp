@@ -303,6 +303,7 @@ bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
     fprintf(stderr, "PE %d: AllReduce failed: %s\n", myPe_, e.what());
     return false;
   }
+  pipeline_scatter_gen_ += 2;  // RS + AG each do one ATOMIC_INC on qId=0
   return true;
 }
 
@@ -354,6 +355,7 @@ bool AllreduceSdma<T>::start_async(T* input, T* output, size_t total_count, hipS
       throw std::runtime_error("Kernel launch failed");
     }
 
+    pipeline_scatter_gen_ += 1;  // RS does one ATOMIC_INC on qId=0
     return true;
 
   } catch (const std::exception& e) {
@@ -402,6 +404,7 @@ double AllreduceSdma<T>::wait_async(hipStream_t stream) {
     double end_time = MPI_Wtime();
     double duration = end_time - async_start_time_;
 
+    pipeline_scatter_gen_ += 1;  // AG does one ATOMIC_INC on qId=0
     async_in_progress_ = false;
     async_input_ = nullptr;
     async_output_ = nullptr;
