@@ -114,8 +114,8 @@ __global__ void PipelinedAllReduceSdmaKernel(
     // block reads its baseline, causing it to see an inflated base value.
     if (blockIdx.x != 0) {
       if (threadIdx.x == 0) {
-        __hip_atomic_fetch_add(&barrier->baseline_done, 1u,
-                               __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_DEVICE);
+        __scoped_atomic_fetch_add(&barrier->baseline_done, 1u,
+                                  __ATOMIC_RELEASE, __MEMORY_SCOPE_DEVICE);
       }
     } else {
       if (threadIdx.x == 0) {
