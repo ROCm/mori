@@ -441,7 +441,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             }
         }
 
-        int threads = 1024;
+        int threads = 512;
         int packedPerRank = static_cast<int>(
             ((total_count / npes_ + pack_size - 1) / pack_size));
         int blocks = std::min(max_blocks_,
