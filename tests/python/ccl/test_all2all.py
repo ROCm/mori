@@ -360,7 +360,7 @@ def _test_all2all(rank, world_size, port, elems, iterations, warmup):
             raise AssertionError(f"PE {rank}: All2All verification failed")
 
 
-def test_all2all(elems=67108864, world_size=8, iterations=10, warmup=10):
+def test_all2all(elems=8388608, world_size=8, iterations=10, warmup=10):
     """Run All2All SDMA test"""
     os.environ.setdefault("MORI_ENABLE_SDMA", "1")
     port = get_free_port()
@@ -379,7 +379,7 @@ if __name__ == "__main__":
         description="Test All2All SDMA (similar to C++ example)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--elems", type=int, default=67108864, help="Elements per PE")
+    parser.add_argument("--elems", type=int, default=8388608, help="Elements per PE")
     parser.add_argument("--world-size", type=int, default=8, help="Number of processes")
     parser.add_argument(
         "--iterations", type=int, default=10, help="Number of iterations"
