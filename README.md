@@ -236,7 +236,9 @@ cd /path/to/mori
 export PYTHONPATH=/path/to/mori:$PYTHONPATH
 
 # Test correctness (8 GPUs)
-pytest tests/python/ops/test_dispatch_combine.py -q
+pytest tests/python/ops/test_dispatch_combine_intranode.py -q
+pytest tests/python/ops/test_dispatch_combine_async_ll.py -q
+pytest tests/python/ops/test_dispatch_combine_internode_v1.py -q
 
 # Benchmark performance
 python tests/python/ops/bench_dispatch_combine.py
