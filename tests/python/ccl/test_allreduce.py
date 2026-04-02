@@ -23,13 +23,15 @@
 """
 AllReduce SDMA Test using torch.distributed and multiprocessing.
 
-Tests four modes:
+Tests four modes (always):
   1. SDMA out-of-place (copy_output_to_user=False, read from transit buffer)
   2. SDMA in-place     (allreduce_inplace)
   3. RCCL out-of-place (torch.distributed.all_reduce, copy + reduce)
   4. RCCL in-place     (torch.distributed.all_reduce, refill + reduce)
 
-Verifies correctness and measures bandwidth for each.
+Optional (--test-gemm-overlap): overlap wall time vs torch.matmul GEMM on a second
+stream, comparing SDMA allreduce (copy_output_to_user True and False) vs RCCL.
+Correctness is not checked in this phase (Tests 1–4 already cover it); only timing.
 """
 
 import os
@@ -454,13 +456,300 @@ def _test_rccl_inplace(
     return ok
 
 
+# GEMM size for overlap benchmarks (torch.matmul only; no aiter).
+_GEMM_M_DEFAULT = 4096
+_GEMM_N_DEFAULT = 4096
+_GEMM_K_DEFAULT = 4096
+
+
+def _print_overlap_summary(
+    rank, npes, label, seq_ar, seq_gemm, overlap_times, data_bytes
+):
+    """Reduce timing lists across ranks; print on rank 0 (seconds)."""
+    if len(seq_ar) == 0 or len(seq_gemm) == 0 or len(overlap_times) == 0:
+        if rank == 0:
+            print(f"  [{label}] insufficient samples for summary")
+        return
+
+    def _reduce_scalars(vals):
+        t = torch.tensor(
+            [min(vals), max(vals), sum(vals) / len(vals)],
+            dtype=torch.float64,
+            device=torch.device("cuda", rank),
+        )
+        mn = t[0].clone()
+        mx = t[1].clone()
+        avg = t[2].clone()
+        dist.all_reduce(mn, op=dist.ReduceOp.MIN)
+        dist.all_reduce(mx, op=dist.ReduceOp.MAX)
+        dist.all_reduce(avg, op=dist.ReduceOp.SUM)
+        return mn.item(), mx.item(), avg.item() / npes
+
+    g_ar = _reduce_scalars(seq_ar)
+    g_gm = _reduce_scalars(seq_gemm)
+    g_ov = _reduce_scalars(overlap_times)
+
+    if rank == 0:
+        seq_sum = g_ar[2] + g_gm[2]
+        print(f"\n--- GEMM overlap: {label} ---")
+        print(f"  Data (allreduce): {data_bytes / (1024**2):.2f} MB per rank")
+        print(f"  Sequential allreduce avg : {g_ar[2] * 1000:.3f} ms (min {g_ar[0]*1000:.3f})")
+        print(f"  Sequential GEMM avg      : {g_gm[2] * 1000:.3f} ms (min {g_gm[0]*1000:.3f})")
+        print(f"  Sum (sequential bound)   : {seq_sum * 1000:.3f} ms")
+        print(f"  Overlap wall avg         : {g_ov[2] * 1000:.3f} ms (min {g_ov[0]*1000:.3f})")
+        if seq_sum > 0:
+            print(f"  Overlap vs sequential sum: {g_ov[2] / seq_sum:.3f}x")
+
+
+def _test_gemm_overlap_comparison(
+    rank,
+    my_pe,
+    npes,
+    elems,
+    data_bytes,
+    output_buf_size,
+    fill_value,
+    dtype,
+    dtype_name,
+    device,
+    iterations,
+    warmup,
+    gemm_m=_GEMM_M_DEFAULT,
+    gemm_n=_GEMM_N_DEFAULT,
+    gemm_k=_GEMM_K_DEFAULT,
+):
+    """SDMA (copy True/False) vs RCCL allreduce overlapped with torch.matmul.
+
+    No payload correctness checks here (Tests 1–4); only launch success and timing.
+    """
+    stream_ar = torch.cuda.Stream(device=device)
+    stream_gemm = torch.cuda.Stream(device=device)
+    rccl_dtype = _RCCL_DTYPE_MAP.get(dtype, torch.float32)
+    rccl_fill = (
+        float(fill_value)
+        if rccl_dtype in (torch.float16, torch.bfloat16)
+        else fill_value
+    )
+    total_iters = warmup + iterations
+
+    A = torch.randn(gemm_m, gemm_k, dtype=torch.float32, device=device)
+    B = torch.randn(gemm_k, gemm_n, dtype=torch.float32, device=device)
+
+    def _run_gemm():
+        return torch.matmul(A, B)
+
+    ev_ar_s = torch.cuda.Event(enable_timing=True)
+    ev_ar_e = torch.cuda.Event(enable_timing=True)
+    ev_g_s = torch.cuda.Event(enable_timing=True)
+    ev_g_e = torch.cuda.Event(enable_timing=True)
+    ov_s = torch.cuda.Event(enable_timing=True)
+    ov_e = torch.cuda.Event(enable_timing=True)
+
+    all_ok = True
+
+    def bench_one(label, setup_verify_and_launch_ar):
+        """setup returns (ok, launch, prep, time_ar_with_wall).
+
+        prep runs each iteration before the timed section (untimed), e.g.
+        inp/buffer fill_. launch is timed only: SDMA ar(...) or RCCL all_reduce.
+        time_ar_with_wall: True -> perf_counter around launch (RCCL); False ->
+        CUDA events on stream_ar (SDMA).
+        """
+        nonlocal all_ok
+        setup_ret = setup_verify_and_launch_ar()
+        if len(setup_ret) != 4:
+            raise TypeError(
+                f"{label}: setup must return (ok, launch, prep, time_ar_with_wall)"
+            )
+        ok_c, launch_ar, prep_ar, time_ar_with_wall = setup_ret
+
+        ok_pe = torch.tensor([1 if ok_c else 0], dtype=torch.int32, device=device)
+        dist.all_reduce(ok_pe, op=dist.ReduceOp.MIN)
+        ok_c = ok_pe.item() == 1
+        all_ok = all_ok and ok_c
+        if not ok_c:
+            if rank == 0:
+                print(f"  [{label}] setup failed on some PE, skipping bench")
+            dist.barrier()
+            return
+
+        seq_ar, seq_gemm, overlap_times = [], [], []
+
+        for i in range(total_iters):
+            torch.cuda.synchronize()
+            prep_ar()
+            torch.cuda.synchronize()
+            if time_ar_with_wall:
+                t0 = time.perf_counter()
+                launch_ar()
+                torch.cuda.synchronize()
+                t_ar = time.perf_counter() - t0
+            else:
+                ev_ar_s.record(stream_ar)
+                with torch.cuda.stream(stream_ar):
+                    launch_ar()
+                ev_ar_e.record(stream_ar)
+                stream_ar.synchronize()
+                t_ar = ev_ar_s.elapsed_time(ev_ar_e) / 1000.0
+            if i >= warmup:
+                seq_ar.append(t_ar)
+
+        for i in range(total_iters):
+            torch.cuda.synchronize()
+            ev_g_s.record(stream_gemm)
+            with torch.cuda.stream(stream_gemm):
+                C = _run_gemm()
+            ev_g_e.record(stream_gemm)
+            stream_gemm.synchronize()
+            t_g = ev_g_s.elapsed_time(ev_g_e) / 1000.0
+            if i >= warmup:
+                seq_gemm.append(t_g)
+            elif rank == 0:
+                _ = C.sum().item()
+
+        for i in range(total_iters):
+            torch.cuda.synchronize()
+            prep_ar()
+            torch.cuda.synchronize()
+            ov_s.record()
+            ev_ar_s.record(stream_ar)
+            with torch.cuda.stream(stream_ar):
+                launch_ar()
+            ev_ar_e.record(stream_ar)
+            ev_g_s.record(stream_gemm)
+            with torch.cuda.stream(stream_gemm):
+                C = _run_gemm()
+            ev_g_e.record(stream_gemm)
+            stream_ar.synchronize()
+            stream_gemm.synchronize()
+            ov_e.record()
+            torch.cuda.synchronize()
+            t_ov = ov_s.elapsed_time(ov_e) / 1000.0
+            if i >= warmup:
+                overlap_times.append(t_ov)
+            elif rank == 0:
+                _ = C.sum().item()
+
+        dist.barrier()
+        _print_overlap_summary(
+            rank, npes, label, seq_ar, seq_gemm, overlap_times, data_bytes
+        )
+
+    if rank == 0:
+        print(f"\n>>> Test 5: GEMM overlap (torch.matmul {gemm_m}x{gemm_k}x{gemm_n})")
+        print("    Compare SDMA allreduce vs RCCL with concurrent GEMM on another stream")
+
+    torch.cuda.synchronize()
+    dist.barrier()
+
+    # --- SDMA copy_output_to_user=True ---
+    def setup_sdma_copy_true():
+        ar = AllreduceSdma(
+            my_pe,
+            npes,
+            input_buffer_size=data_bytes,
+            output_buffer_size=output_buf_size,
+            copy_output_to_user=True,
+            dtype=dtype,
+        )
+        inp = torch.full((elems,), fill_value, dtype=dtype, device=device)
+        out = torch.zeros(elems, dtype=dtype, device=device)
+
+        stream_ar.synchronize()
+        ok = ar(inp, out, elems, stream_ar)
+        stream_ar.synchronize()
+
+        def prep():
+            inp.fill_(fill_value)
+
+        def launch():
+            return ar(inp, out, elems, stream_ar)
+
+        if not ok and rank == 0:
+            print("  SDMA copy=True setup ar() failed")
+        return ok, launch, prep, False
+
+    bench_one(
+        f"SDMA allreduce copy_output_to_user=True ({dtype_name}; prep fill_ untimed)",
+        setup_sdma_copy_true,
+    )
+
+    # --- SDMA copy_output_to_user=False ---
+    def setup_sdma_copy_false():
+        ar = AllreduceSdma(
+            my_pe,
+            npes,
+            input_buffer_size=data_bytes,
+            output_buffer_size=output_buf_size,
+            copy_output_to_user=False,
+            dtype=dtype,
+        )
+        inp = torch.full((elems,), fill_value, dtype=dtype, device=device)
+        out = torch.zeros(elems, dtype=dtype, device=device)
+
+        stream_ar.synchronize()
+        ok = ar(inp, out, elems, stream_ar)
+        stream_ar.synchronize()
+
+        def prep():
+            inp.fill_(fill_value)
+
+        def launch():
+            return ar(inp, out, elems, stream_ar)
+
+        if not ok and rank == 0:
+            print("  SDMA copy=False setup ar() failed")
+        return ok, launch, prep, False
+
+    bench_one(
+        f"SDMA allreduce copy_output_to_user=False ({dtype_name}; prep fill_ untimed)",
+        setup_sdma_copy_false,
+    )
+
+    # --- RCCL: timed section is only dist.all_reduce; fill_ runs before each iter (outside events / wall slice). ---
+    def setup_rccl():
+        buf = torch.full((elems,), rccl_fill, dtype=rccl_dtype, device=device)
+
+        dist.all_reduce(buf, op=dist.ReduceOp.SUM)
+        torch.cuda.synchronize()
+
+        def prep():
+            buf.fill_(rccl_fill)
+
+        def launch():
+            dist.all_reduce(buf, op=dist.ReduceOp.SUM)
+            return True
+
+        return True, launch, prep, True
+
+    rccl_name = str(rccl_dtype).split(".")[-1]
+    bench_one(
+        f"RCCL all_reduce only ({dtype_name}→{rccl_name}; prep fill_ untimed)",
+        setup_rccl,
+    )
+
+    torch.cuda.synchronize()
+    dist.barrier()
+    return all_ok
+
+
 # ---------------------------------------------------------------------------
 #  Main worker
 # ---------------------------------------------------------------------------
 
 
 def _test_allreduce(
-    rank, world_size, port, elems, iterations, warmup, dtype=torch.uint32
+    rank,
+    world_size,
+    port,
+    elems,
+    iterations,
+    warmup,
+    dtype=torch.uint32,
+    test_gemm_overlap=False,
+    gemm_m=_GEMM_M_DEFAULT,
+    gemm_n=_GEMM_N_DEFAULT,
+    gemm_k=_GEMM_K_DEFAULT,
 ):
     """Worker function for each process."""
 
@@ -551,6 +840,26 @@ def _test_allreduce(
 
         all_ok = ok1 and ok2 and ok3 and ok4
 
+        if test_gemm_overlap:
+            ok5 = _test_gemm_overlap_comparison(
+                rank,
+                my_pe,
+                npes,
+                elems,
+                data_bytes,
+                output_buf_size,
+                fill_value,
+                dtype,
+                dtype_name,
+                device,
+                iterations,
+                warmup,
+                gemm_m=gemm_m,
+                gemm_n=gemm_n,
+                gemm_k=gemm_k,
+            )
+            all_ok = all_ok and ok5
+
         # --- Final summary ---
         ok_tensor = torch.tensor([1 if all_ok else 0], dtype=torch.int32)
         dist.all_reduce(ok_tensor, op=dist.ReduceOp.SUM)
@@ -586,14 +895,33 @@ _DTYPE_MAP = {
 
 
 def test_allreduce(
-    elems=67108864, world_size=8, iterations=10, warmup=10, dtype=torch.uint32
+    elems=67108864,
+    world_size=8,
+    iterations=10,
+    warmup=10,
+    dtype=torch.uint32,
+    test_gemm_overlap=False,
+    gemm_m=_GEMM_M_DEFAULT,
+    gemm_n=_GEMM_N_DEFAULT,
+    gemm_k=_GEMM_K_DEFAULT,
 ):
     """Run AllReduce SDMA test."""
     os.environ.setdefault("MORI_ENABLE_SDMA", "1")
     port = get_free_port()
     torch.multiprocessing.spawn(
         _test_allreduce,
-        args=(world_size, port, elems, iterations, warmup, dtype),
+        args=(
+            world_size,
+            port,
+            elems,
+            iterations,
+            warmup,
+            dtype,
+            test_gemm_overlap,
+            gemm_m,
+            gemm_n,
+            gemm_k,
+        ),
         nprocs=world_size,
         join=True,
     )
@@ -622,6 +950,29 @@ if __name__ == "__main__":
         choices=list(_DTYPE_MAP.keys()),
         help="Data type (uint32, fp16, bf16)",
     )
+    parser.add_argument(
+        "--test-gemm-overlap",
+        action="store_true",
+        help="Run SDMA vs RCCL allreduce overlap vs torch.matmul (extra benchmark)",
+    )
+    parser.add_argument(
+        "--gemm-m",
+        type=int,
+        default=_GEMM_M_DEFAULT,
+        help="GEMM M dimension for overlap test",
+    )
+    parser.add_argument(
+        "--gemm-n",
+        type=int,
+        default=_GEMM_N_DEFAULT,
+        help="GEMM N dimension for overlap test",
+    )
+    parser.add_argument(
+        "--gemm-k",
+        type=int,
+        default=_GEMM_K_DEFAULT,
+        help="GEMM K dimension for overlap test",
+    )
     args = parser.parse_args()
     os.environ["MORI_ENABLE_SDMA"] = str(args.enable_sdma)
 
@@ -634,6 +985,21 @@ if __name__ == "__main__":
     print(f"  Iterations      : {args.iterations}")
     print(f"  Warmup          : {args.warmup}")
     print(f"  Dtype           : {dtype_name}")
+    print(f"  GEMM overlap    : {args.test_gemm_overlap}")
+    if args.test_gemm_overlap:
+        print(
+            f"  GEMM size       : {args.gemm_m}x{args.gemm_k}x{args.gemm_n} (torch.matmul)"
+        )
     print("-" * 60)
 
-    test_allreduce(args.elems, args.world_size, args.iterations, args.warmup, dtype)
+    test_allreduce(
+        args.elems,
+        args.world_size,
+        args.iterations,
+        args.warmup,
+        dtype,
+        test_gemm_overlap=args.test_gemm_overlap,
+        gemm_m=args.gemm_m,
+        gemm_n=args.gemm_n,
+        gemm_k=args.gemm_k,
+    )
