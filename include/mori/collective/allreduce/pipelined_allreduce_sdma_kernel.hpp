@@ -120,9 +120,16 @@ __global__ void PipelinedAllReduceSdmaKernel(
     } else {
       if (threadIdx.x == 0) {
         uint32_t target = static_cast<uint32_t>(gridDim.x - 1);
+        int bspin = 0;
         while (__scoped_atomic_load_n(&barrier->baseline_done,
-                   __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) < target)
-          ;
+                   __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) < target) {
+          if (++bspin > 100000000) {
+            printf("PE%d blk0: BASELINE WAIT %u/%u\n", myPe,
+                   __scoped_atomic_load_n(&barrier->baseline_done,
+                       __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE), target);
+            bspin = 0;
+          }
+        }
       }
       __syncthreads();
     }
@@ -155,8 +162,16 @@ __global__ void PipelinedAllReduceSdmaKernel(
               s_scatter_by_sender[sender] + static_cast<uint64_t>(c + 1);
           HSAuint64* sig = dstMemObj->signalPtrs
               + static_cast<size_t>(sender) * numQ;
-          while (core::AtomicLoadRelaxed(sig) < expected)
-            ;
+          int sSpin = 0;
+          while (core::AtomicLoadRelaxed(sig) < expected) {
+            if (++sSpin > 100000000 && blockIdx.x == 1 && idx == 0) {
+              printf("PE%d blk1: SCATTER WAIT s=%d exp=%llu act=%llu base=%llu\n",
+                     myPe, sender, (unsigned long long)expected,
+                     (unsigned long long)core::AtomicLoadRelaxed(sig),
+                     (unsigned long long)s_scatter_by_sender[sender]);
+              sSpin = 0;
+            }
+          }
         }
         if (threadIdx.x < static_cast<unsigned>(npes)) {
           const int pe = static_cast<int>(threadIdx.x);
@@ -241,6 +256,11 @@ __global__ void PipelinedAllReduceSdmaKernel(
             core::SdmaPutThread(src, dst, actualBytes, dh, rSig, numQ, 0);
           }
         }
+      }
+
+      if (thr == 0) {
+        printf("PE%d blk0: SCATTER SUBMITTED chunks=%d bytes=%zu\n",
+               myPe, numChunks, totalShardBytes);
       }
 
       if constexpr (MULTI_CHUNK) {
