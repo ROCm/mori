@@ -172,6 +172,17 @@ void RegisterMoriCcl(pybind11::module_& m) {
           },
           py::arg("input_ptr"), py::arg("output_ptr"), py::arg("count"), py::arg("stream") = 0)
       .def(
+          "pipelined",
+          [](mori::collective::AllreduceSdma<uint32_t>& self, uintptr_t input_ptr,
+             uintptr_t output_ptr, size_t count, int64_t stream) -> bool {
+            return self.pipelined(reinterpret_cast<uint32_t*>(input_ptr),
+                                  reinterpret_cast<uint32_t*>(output_ptr), count,
+                                  0, 0, reinterpret_cast<hipStream_t>(stream),
+                                  /*external_scatter=*/false);
+          },
+          py::arg("input_ptr"), py::arg("output_ptr"), py::arg("count"), py::arg("stream") = 0,
+          "Single-kernel pipeline AllReduce (peak bandwidth, no scatter separation)")
+      .def(
           "allreduce_inplace",
           [](mori::collective::AllreduceSdma<uint32_t>& self, uintptr_t data_ptr, size_t count,
              int64_t stream) -> bool {
