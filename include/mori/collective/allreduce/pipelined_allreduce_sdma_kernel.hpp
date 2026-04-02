@@ -108,6 +108,12 @@ __global__ void PipelinedAllReduceSdmaKernel(
       return;
     }
 
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+      printf("PE%d: ENTER numQ=%u compBlk=%d chunks=%d shardB=%zu ccBase=%u\n",
+             myPe, numQ, compBlocks, numChunks,
+             totalShardBytes, s_cc_base);
+    }
+
     if (blockIdx.x != 0) {
       // =================================================================
       // COMPUTE BLOCKS (1..N): scatter-poll → reduce → chunks_complete
@@ -136,8 +142,17 @@ __global__ void PipelinedAllReduceSdmaKernel(
               s_scatter_by_sender[sender] + static_cast<uint64_t>(c + 1);
           HSAuint64* sig = dstMemObj->signalPtrs
               + static_cast<size_t>(sender) * numQ;
-          while (core::AtomicLoadRelaxed(sig) < expected)
-            ;
+          int sSpin = 0;
+          while (core::AtomicLoadRelaxed(sig) < expected) {
+            if (++sSpin > 200000000 && blockIdx.x == 1 && threadIdx.x == 0) {
+              printf("PE%d blk%d: SCATTER SIG TIMEOUT sender=%d c=%d exp=%llu act=%llu base=%llu\n",
+                     myPe, (int)blockIdx.x, sender, c,
+                     (unsigned long long)expected,
+                     (unsigned long long)core::AtomicLoadRelaxed(sig),
+                     (unsigned long long)s_scatter_by_sender[sender]);
+              break;
+            }
+          }
         }
         if (threadIdx.x < static_cast<unsigned>(npes)) {
           const int pe = static_cast<int>(threadIdx.x);
@@ -209,6 +224,10 @@ __global__ void PipelinedAllReduceSdmaKernel(
             dstMemObj->deviceHandles_d + destPe * numQ;
         HSAuint64* rSig = dstMemObj->peerSignalPtrs[destPe]
             + static_cast<size_t>(myPe) * numQ;
+        if (thr == (myPe == 0 ? 1 : 0)) {
+          printf("PE%d: SCATTER dh=%p rSig=%p bytes=%zu\n",
+                 myPe, (void*)dh, (void*)rSig, totalShardBytes);
+        }
         for (int c = 0; c < numChunks; c++) {
           const size_t cOff = static_cast<size_t>(c) * chunkBytes;
           size_t actualBytes = chunkBytes;
@@ -222,6 +241,10 @@ __global__ void PipelinedAllReduceSdmaKernel(
             core::SdmaPutThread(src, dst, actualBytes, dh, rSig, numQ, 0);
           }
         }
+      }
+      __syncthreads();
+      if (thr == 0) {
+        printf("PE%d: SCATTER DONE\n", myPe);
       }
 
       if constexpr (MULTI_CHUNK) {
@@ -263,6 +286,10 @@ __global__ void PipelinedAllReduceSdmaKernel(
             ;
         }
       } else {
+        if (thr == 0) {
+          printf("PE%d: CC_WAIT target=%u\n", myPe,
+                 ccBase + static_cast<uint32_t>(compBlocks));
+        }
         if (thr < npes && thr != myPe) {
           const int destPe = thr;
           anvil::SdmaQueueDeviceHandle** dh =
@@ -272,10 +299,17 @@ __global__ void PipelinedAllReduceSdmaKernel(
 
           const uint32_t ccTarget =
               ccBase + static_cast<uint32_t>(compBlocks);
+          int ccSpin = 0;
           while (__scoped_atomic_load_n(
                      &barrier->chunks_complete,
-                     __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) < ccTarget)
-            ;
+                     __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) < ccTarget) {
+            if (++ccSpin > 200000000 && thr == (myPe == 0 ? 1 : 0)) {
+              printf("PE%d: CC TIMEOUT target=%u act=%u\n", myPe, ccTarget,
+                     __scoped_atomic_load_n(&barrier->chunks_complete,
+                                            __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE));
+              break;
+            }
+          }
 
           uint8_t* src = reinterpret_cast<uint8_t*>(dstMemObj->localPtr)
               + static_cast<size_t>(myPe) * totalShardBytes;
@@ -283,14 +317,26 @@ __global__ void PipelinedAllReduceSdmaKernel(
               + static_cast<size_t>(myPe) * totalShardBytes;
           core::SdmaPutThread(src, dst, totalShardBytes, dh, rSig, numQ, 1);
         }
+        __syncthreads();
+        if (thr == 0) {
+          printf("PE%d: AG DONE, waiting sigs\n", myPe);
+        }
 
         if (thr < npes && thr != myPe) {
           const int sender = thr;
           const uint64_t expected = s_ag_by_sender[sender] + 1ULL;
           HSAuint64* sig = dstMemObj->signalPtrs
               + static_cast<size_t>(sender) * numQ + 1;
-          while (core::AtomicLoadRelaxed(sig) < expected)
-            ;
+          int agSpin = 0;
+          while (core::AtomicLoadRelaxed(sig) < expected) {
+            if (++agSpin > 200000000 && thr == (myPe == 0 ? 1 : 0)) {
+              printf("PE%d: AG SIG TIMEOUT sender=%d exp=%llu act=%llu\n",
+                     myPe, sender,
+                     (unsigned long long)expected,
+                     (unsigned long long)core::AtomicLoadRelaxed(sig));
+              break;
+            }
+          }
         }
 
       }
