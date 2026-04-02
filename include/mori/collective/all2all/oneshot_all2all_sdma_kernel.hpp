@@ -55,23 +55,18 @@ __global__ void OneShotAll2allSdmaKernel(int myPe, int npes,
     const size_t bytesPerElement = sizeof(T);
     const size_t bytesPerPeer = elementCount * bytesPerElement;
 
-    // Key modification: each thread is responsible for sending its own data to other PEs
-    if (threadLinearId < npes * outputTransitMemObj->sdmaNumQueue) {
-        int qId = threadLinearId % outputTransitMemObj->sdmaNumQueue;
-        int targetPe = threadLinearId / outputTransitMemObj->sdmaNumQueue;
+    // Each thread sends one chunk (1 queue) of data to one target PE
+    const uint32_t numQ = outputTransitMemObj->sdmaNumQueue;
+    if (threadLinearId < npes * numQ) {
+        int qId = threadLinearId % numQ;
+        int targetPe = threadLinearId / numQ;
         
-        // Calculate bytes to send
-        const size_t sendBytes_rand = bytesPerPeer / 8;
-        size_t srcByteOffset = targetPe * bytesPerPeer + qId * sendBytes_rand;  // Read from input transit buffer
-        size_t destByteOffset = myPe * bytesPerPeer + qId * sendBytes_rand;  // Write to targetPe's position in output transit buffer
-        //printf("myPe:%u, threadLinearId:%u, srcByteOffset:0x%x, destByteOffset:0x%x\n", myPe, threadLinearId, srcByteOffset, destByteOffset);        
-        size_t sendBytes = 0;
-
-        if (qId == 7) {
-            sendBytes = bytesPerPeer - 7 * sendBytes_rand;
-        } else {
-            sendBytes = sendBytes_rand;
-        }
+        const size_t sendBytes_rand = bytesPerPeer / numQ;
+        size_t srcByteOffset = targetPe * bytesPerPeer + qId * sendBytes_rand;
+        size_t destByteOffset = myPe * bytesPerPeer + qId * sendBytes_rand;
+        size_t sendBytes = (qId == static_cast<int>(numQ) - 1)
+                               ? bytesPerPeer - (numQ - 1) * sendBytes_rand
+                               : sendBytes_rand;
 
         // Send my data to target PE
         application::SymmMemObjPtr dest = outputTransitMemObj;

@@ -58,18 +58,16 @@ __global__ void OneShotAll2allSdmaAsyncPutKernel(int myPe, int npes,
   int warpId = threadLinearId / warpSize;
   const int laneId = threadIdx.x % warpSize;
 
-  if (threadLinearId < npes * dstMemObj->sdmaNumQueue) {
-    int qId = threadLinearId % dstMemObj->sdmaNumQueue;
-    int targetPe = threadLinearId / dstMemObj->sdmaNumQueue;
-    const size_t sendBytes_rand = bytesPerPeer/8;
+  const uint32_t numQ = dstMemObj->sdmaNumQueue;
+  if (threadLinearId < npes * numQ) {
+    int qId = threadLinearId % numQ;
+    int targetPe = threadLinearId / numQ;
+    const size_t sendBytes_rand = bytesPerPeer / numQ;
     size_t destByteOffset = myPe * bytesPerPeer + qId * sendBytes_rand;
     size_t srcByteOffset = targetPe * bytesPerPeer + qId * sendBytes_rand;
-    size_t sendBytes = 0;
-
-    if (qId == 7)
-      sendBytes = bytesPerPeer - 7*sendBytes_rand;
-    else
-      sendBytes = sendBytes_rand;
+    size_t sendBytes = (qId == static_cast<int>(numQ) - 1)
+                           ? bytesPerPeer - (numQ - 1) * sendBytes_rand
+                           : sendBytes_rand;
 
     application::SymmMemObjPtr dest = dstMemObj;
     uint8_t* srcPtr = reinterpret_cast<uint8_t *>(inputData) + srcByteOffset;
