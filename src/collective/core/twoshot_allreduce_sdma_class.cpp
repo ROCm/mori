@@ -123,6 +123,14 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t /*input_buffer_size*/
   if (!output_transit_buffer_obj_.IsValid())
     throw std::runtime_error("Failed to register output transit buffer");
 
+  if (output_transit_buffer_obj_.cpu->signalPtrs &&
+      output_transit_buffer_obj_.cpu->sdmaNumQueue > 0) {
+    size_t sigSize =
+        static_cast<size_t>(npes_) * output_transit_buffer_obj_.cpu->sdmaNumQueue *
+        sizeof(HSAuint64);
+    hipMemset(output_transit_buffer_obj_.cpu->signalPtrs, 0, sigSize);
+  }
+
   printf("AllreduceSdma(SDMA) initialized: PE %d of %d, max_blocks=%d\n", myPe_, npes_,
          max_blocks_);
   printf("  Flags: %zu bytes at %p\n", flagsSize, flags_.get());
@@ -175,6 +183,14 @@ bool AllreduceSdma<T>::ensure_buffer_size(void*& buffer,
   if (!buffer_obj.IsValid()) {
     fprintf(stderr, "PE %d: Failed to re-register %s\n", myPe_, buffer_name);
     return false;
+  }
+
+  if (buffer_obj.cpu->signalPtrs && buffer_obj.cpu->sdmaNumQueue > 0) {
+    size_t sigSize =
+        static_cast<size_t>(npes_) * buffer_obj.cpu->sdmaNumQueue * sizeof(HSAuint64);
+    hipMemset(buffer_obj.cpu->signalPtrs, 0, sigSize);
+    pipeline_scatter_gen_ = 0;
+    pipeline_ag_gen_ = 0;
   }
 
   printf("PE %d: %s reallocated to %.2f MB\n", myPe_, buffer_name,
