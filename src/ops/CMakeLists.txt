@@ -70,9 +70,11 @@ if(BUILD_OPS_DEVICE)
     set(_hsaco_output "${_hsaco_dir}/${_kname}.hsaco")
     set(_ksrc_path "${CMAKE_SOURCE_DIR}/src/ops/kernels/${_ksrc}")
 
-    set(FLAGS "-g" "-O0")
     if(CMAKE_BUILD_TYPE STREQUAL "Release")
       set(FLAGS "-O2")
+    endif()
+    if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+      set(FLAGS "-g3" "-ggdb" "-O2")
     endif()
     add_custom_command(
       OUTPUT ${_hsaco_output}
