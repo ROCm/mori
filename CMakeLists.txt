@@ -177,8 +177,9 @@ endif()
 if(BUILD_XLA_FFI_OPS)
   add_compile_definitions(BUILD_XLA_FFI_OPS)
   set(BUILD_OPS_DEVICE ON)
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-deprecated-literal-operator")
 endif()
+
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-deprecated-literal-operator")
 
 # ---------------------------------------------------------------------------
 # Device NIC + GPU arch detection (reuse the shared module in cmake/)
