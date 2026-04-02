@@ -199,18 +199,6 @@ void RegisterMoriCcl(pybind11::module_& m) {
       .def("cancel_async", &mori::collective::AllreduceSdma<uint32_t>::cancel_async)
       .def("reset_flags", &mori::collective::AllreduceSdma<uint32_t>::resetFlags)
       .def(
-          "pipelined",
-          [](mori::collective::AllreduceSdma<uint32_t>& self, uintptr_t input_ptr,
-             uintptr_t output_ptr, size_t count, size_t chunk_elems, int scatter_mode,
-             int64_t stream) -> bool {
-            return self.pipelined(reinterpret_cast<uint32_t*>(input_ptr),
-                                  reinterpret_cast<uint32_t*>(output_ptr), count, chunk_elems,
-                                  scatter_mode, reinterpret_cast<hipStream_t>(stream));
-          },
-          py::arg("input_ptr"), py::arg("output_ptr"), py::arg("count"),
-          py::arg("chunk_elems") = 0, py::arg("scatter_mode") = 0, py::arg("stream") = 0,
-          "Pipelined AllReduce: overlapped SDMA scatter + reduce + AG")
-      .def(
           "get_output_transit_buffer",
           [](mori::collective::AllreduceSdma<uint32_t>& self) -> py::tuple {
             void* ptr = self.getOutputTransitBuffer();
@@ -249,18 +237,6 @@ void RegisterMoriCcl(pybind11::module_& m) {
           py::arg("data_ptr"), py::arg("count"), py::arg("stream") = 0,
           "Execute in-place AllReduce SDMA operation (fp16)")
       .def("reset_flags", &mori::collective::AllreduceSdma<half>::resetFlags)
-      .def(
-          "pipelined",
-          [](mori::collective::AllreduceSdma<half>& self, uintptr_t input_ptr,
-             uintptr_t output_ptr, size_t count, size_t chunk_elems, int scatter_mode,
-             int64_t stream) -> bool {
-            return self.pipelined(reinterpret_cast<half*>(input_ptr),
-                                  reinterpret_cast<half*>(output_ptr), count, chunk_elems,
-                                  scatter_mode, reinterpret_cast<hipStream_t>(stream));
-          },
-          py::arg("input_ptr"), py::arg("output_ptr"), py::arg("count"),
-          py::arg("chunk_elems") = 0, py::arg("scatter_mode") = 0, py::arg("stream") = 0,
-          "Pipelined AllReduce: overlapped SDMA scatter + reduce + AG (fp16)")
       .def(
           "get_output_transit_buffer",
           [](mori::collective::AllreduceSdma<half>& self) -> py::tuple {
@@ -301,18 +277,6 @@ void RegisterMoriCcl(pybind11::module_& m) {
           py::arg("data_ptr"), py::arg("count"), py::arg("stream") = 0,
           "Execute in-place AllReduce SDMA operation (bf16)")
       .def("reset_flags", &mori::collective::AllreduceSdma<hip_bfloat16>::resetFlags)
-      .def(
-          "pipelined",
-          [](mori::collective::AllreduceSdma<hip_bfloat16>& self, uintptr_t input_ptr,
-             uintptr_t output_ptr, size_t count, size_t chunk_elems, int scatter_mode,
-             int64_t stream) -> bool {
-            return self.pipelined(reinterpret_cast<hip_bfloat16*>(input_ptr),
-                                  reinterpret_cast<hip_bfloat16*>(output_ptr), count, chunk_elems,
-                                  scatter_mode, reinterpret_cast<hipStream_t>(stream));
-          },
-          py::arg("input_ptr"), py::arg("output_ptr"), py::arg("count"),
-          py::arg("chunk_elems") = 0, py::arg("scatter_mode") = 0, py::arg("stream") = 0,
-          "Pipelined AllReduce: overlapped SDMA scatter + reduce + AG (bf16)")
       .def(
           "get_output_transit_buffer",
           [](mori::collective::AllreduceSdma<hip_bfloat16>& self) -> py::tuple {
