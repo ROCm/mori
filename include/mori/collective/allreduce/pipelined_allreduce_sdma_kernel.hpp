@@ -95,13 +95,13 @@ __global__ void PipelinedAllReduceSdmaKernel(
   __syncthreads();
 
   // =========================================================================
-  // SCATTER_MODE = 0 — Single-buffer SDMA scatter(qId=0) + AG(qId=1)
+  // SCATTER_MODE = 0 — SDMA scatter(qId=2) + AG(qId=1), isolated from serial qId=0
   // =========================================================================
   if constexpr (SCATTER_MODE == 0) {
 
-    if (numQ < 2) {
+    if (numQ < 3) {
       if (threadIdx.x == 0 && blockIdx.x == 0) {
-        printf("PE %d: pipelined SDMA needs sdmaNumQueue>=2 (got %u)\n",
+        printf("PE %d: pipelined SDMA needs sdmaNumQueue>=3 (got %u)\n",
                myPe, numQ);
       }
       return;
@@ -134,7 +134,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
           const uint64_t expected =
               s_scatter_by_sender[sender] + static_cast<uint64_t>(c + 1);
           HSAuint64* sig = dstMemObj->signalPtrs
-              + static_cast<size_t>(sender) * numQ;
+              + static_cast<size_t>(sender) * numQ + 2;
           while (core::AtomicLoadRelaxed(sig) < expected)
             ;
         }
@@ -218,7 +218,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
                 + static_cast<size_t>(destPe) * totalShardBytes + cOff;
             uint8_t* dst = reinterpret_cast<uint8_t*>(dstMemObj->peerPtrs[destPe])
                 + static_cast<size_t>(myPe) * totalShardBytes + cOff;
-            core::SdmaPutThread(src, dst, actualBytes, dh, rSig, numQ, 0);
+            core::SdmaPutThread(src, dst, actualBytes, dh, rSig, numQ, 2);
           }
         }
       }
