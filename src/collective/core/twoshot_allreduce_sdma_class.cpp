@@ -442,6 +442,10 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         }
 
         int threads = 512;
+        if (const char* e = getenv("MORI_PIPELINE_THREADS")) {
+            int v = atoi(e);
+            if (v == 256 || v == 512 || v == 1024) threads = v;
+        }
         int packedPerRank = static_cast<int>(
             ((total_count / npes_ + pack_size - 1) / pack_size));
         int blocks = std::min(max_blocks_,
@@ -450,6 +454,10 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         if (scatter_mode == 0) {
             int comp = std::min(blocks, kMaxPipelineBlocks - 1);
             comp = std::min(comp, max_blocks_ - 1);
+            if (const char* e = getenv("MORI_PIPELINE_CU")) {
+                int v = atoi(e);
+                if (v > 0 && v < comp) comp = v;
+            }
             blocks = comp + 1;
         }
 
