@@ -108,16 +108,23 @@ __global__ void PipelinedAllReduceSdmaKernel(
       return;
     }
 
-    if (threadIdx.x == 0 && blockIdx.x == 0) {
-      printf("PE%d: ENTER numQ=%u compBlk=%d chunks=%d shardB=%zu ccBase=%u sigBase=%p\n",
-             myPe, numQ, compBlocks, numChunks,
-             totalShardBytes, s_cc_base, (void*)dstMemObj->signalPtrs);
-      for (int p = 0; p < npes; p++) {
-        if (p == myPe) continue;
-        auto** dh0 = dstMemObj->deviceHandles_d + p * numQ;
-        printf("PE%d: dest=%d dh[0]=%p peerSig=%p\n",
-               myPe, p, (void*)(dh0[0]), (void*)(dstMemObj->peerSignalPtrs[p]));
+    // Cross-block sync: compute blocks signal baselines are read,
+    // block 0 waits before submitting scatter SDMA.
+    // Prevents race where SDMA scatter completes before a late compute
+    // block reads its baseline, causing it to see an inflated base value.
+    if (blockIdx.x != 0) {
+      if (threadIdx.x == 0) {
+        __hip_atomic_fetch_add(&barrier->baseline_done, 1u,
+                               __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_DEVICE);
       }
+    } else {
+      if (threadIdx.x == 0) {
+        uint32_t target = static_cast<uint32_t>(gridDim.x - 1);
+        while (__scoped_atomic_load_n(&barrier->baseline_done,
+                   __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) < target)
+          ;
+      }
+      __syncthreads();
     }
 
     if (blockIdx.x != 0) {
@@ -148,19 +155,8 @@ __global__ void PipelinedAllReduceSdmaKernel(
               s_scatter_by_sender[sender] + static_cast<uint64_t>(c + 1);
           HSAuint64* sig = dstMemObj->signalPtrs
               + static_cast<size_t>(sender) * numQ;
-          int sSpin = 0;
-          while (core::AtomicLoadRelaxed(sig) < expected) {
-            if (++sSpin > 50000000) {
-              if (blockIdx.x == 1) {
-                printf("PE%d blk1 t%d: SCATTER WAIT sender=%d exp=%llu act=%llu sig@%p\n",
-                       myPe, idx, sender,
-                       (unsigned long long)expected,
-                       (unsigned long long)core::AtomicLoadRelaxed(sig),
-                       (void*)sig);
-              }
-              sSpin = 0;
-            }
-          }
+          while (core::AtomicLoadRelaxed(sig) < expected)
+            ;
         }
         if (threadIdx.x < static_cast<unsigned>(npes)) {
           const int pe = static_cast<int>(threadIdx.x);
@@ -232,10 +228,6 @@ __global__ void PipelinedAllReduceSdmaKernel(
             dstMemObj->deviceHandles_d + destPe * numQ;
         HSAuint64* rSig = dstMemObj->peerSignalPtrs[destPe]
             + static_cast<size_t>(myPe) * numQ;
-        if (thr == (myPe == 0 ? 1 : 0)) {
-          printf("PE%d: SCATTER dh=%p rSig=%p bytes=%zu\n",
-                 myPe, (void*)dh, (void*)rSig, totalShardBytes);
-        }
         for (int c = 0; c < numChunks; c++) {
           const size_t cOff = static_cast<size_t>(c) * chunkBytes;
           size_t actualBytes = chunkBytes;
@@ -249,10 +241,6 @@ __global__ void PipelinedAllReduceSdmaKernel(
             core::SdmaPutThread(src, dst, actualBytes, dh, rSig, numQ, 0);
           }
         }
-      }
-      __syncthreads();
-      if (thr == 0) {
-        printf("PE%d: SCATTER DONE\n", myPe);
       }
 
       if constexpr (MULTI_CHUNK) {
@@ -294,10 +282,6 @@ __global__ void PipelinedAllReduceSdmaKernel(
             ;
         }
       } else {
-        if (thr == 0) {
-          printf("PE%d: CC_WAIT target=%u\n", myPe,
-                 ccBase + static_cast<uint32_t>(compBlocks));
-        }
         if (thr < npes && thr != myPe) {
           const int destPe = thr;
           anvil::SdmaQueueDeviceHandle** dh =
@@ -307,26 +291,10 @@ __global__ void PipelinedAllReduceSdmaKernel(
 
           const uint32_t ccTarget =
               ccBase + static_cast<uint32_t>(compBlocks);
-          int ccSpin = 0;
           while (__scoped_atomic_load_n(
                      &barrier->chunks_complete,
-                     __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) < ccTarget) {
-            if (++ccSpin > 50000000 && thr == (myPe == 0 ? 1 : 0)) {
-              uint32_t ccAct = __scoped_atomic_load_n(&barrier->chunks_complete,
-                                            __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
-              printf("PE%d blk0: CC TIMEOUT cc=%u/%u scatter_sigs:",
-                     myPe, ccAct, ccTarget);
-              for (int p = 0; p < npes; p++) {
-                if (p == myPe) continue;
-                printf(" %d:%llu/%llu", p,
-                    (unsigned long long)core::AtomicLoadRelaxed(
-                        dstMemObj->signalPtrs + static_cast<size_t>(p) * numQ),
-                    (unsigned long long)(s_scatter_by_sender[p] + 1));
-              }
-              printf("\n");
-              ccSpin = 0;
-            }
-          }
+                     __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) < ccTarget)
+            ;
 
           uint8_t* src = reinterpret_cast<uint8_t*>(dstMemObj->localPtr)
               + static_cast<size_t>(myPe) * totalShardBytes;
@@ -334,26 +302,14 @@ __global__ void PipelinedAllReduceSdmaKernel(
               + static_cast<size_t>(myPe) * totalShardBytes;
           core::SdmaPutThread(src, dst, totalShardBytes, dh, rSig, numQ, 1);
         }
-        __syncthreads();
-        if (thr == 0) {
-          printf("PE%d: AG DONE, waiting sigs\n", myPe);
-        }
 
         if (thr < npes && thr != myPe) {
           const int sender = thr;
           const uint64_t expected = s_ag_by_sender[sender] + 1ULL;
           HSAuint64* sig = dstMemObj->signalPtrs
               + static_cast<size_t>(sender) * numQ + 1;
-          int agSpin = 0;
-          while (core::AtomicLoadRelaxed(sig) < expected) {
-            if (++agSpin > 50000000 && thr == (myPe == 0 ? 1 : 0)) {
-              printf("PE%d: AG SIG TIMEOUT sender=%d exp=%llu act=%llu\n",
-                     myPe, sender,
-                     (unsigned long long)expected,
-                     (unsigned long long)core::AtomicLoadRelaxed(sig));
-              agSpin = 0;
-            }
-          }
+          while (core::AtomicLoadRelaxed(sig) < expected)
+            ;
         }
 
       }

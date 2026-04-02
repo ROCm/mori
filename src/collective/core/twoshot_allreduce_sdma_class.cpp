@@ -520,6 +520,21 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
 
         const bool multi_chunk = (chunk_elems < total_count);
 
+        if (scatter_mode == 0) {
+            hipError_t br = stream
+                ? hipMemsetAsync(
+                      reinterpret_cast<char*>(barrierPtr_) + offsetof(CrossPeBarrier, baseline_done),
+                      0, sizeof(uint32_t), stream)
+                : hipMemset(
+                      reinterpret_cast<char*>(barrierPtr_) + offsetof(CrossPeBarrier, baseline_done),
+                      0, sizeof(uint32_t));
+            if (br != hipSuccess) {
+                fprintf(stderr, "PE %d: pipelined hipMemset(baseline_done) failed: %s\n",
+                        myPe_, hipGetErrorString(br));
+                return false;
+            }
+        }
+
         if (scatter_mode == 1) {
             PipelinedAllReduceSdmaKernel<T, 1><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
