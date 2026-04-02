@@ -109,9 +109,15 @@ __global__ void PipelinedAllReduceSdmaKernel(
     }
 
     if (threadIdx.x == 0 && blockIdx.x == 0) {
-      printf("PE%d: ENTER numQ=%u compBlk=%d chunks=%d shardB=%zu ccBase=%u\n",
+      printf("PE%d: ENTER numQ=%u compBlk=%d chunks=%d shardB=%zu ccBase=%u sigBase=%p\n",
              myPe, numQ, compBlocks, numChunks,
-             totalShardBytes, s_cc_base);
+             totalShardBytes, s_cc_base, (void*)dstMemObj->signalPtrs);
+      for (int p = 0; p < npes; p++) {
+        if (p == myPe) continue;
+        auto** dh0 = dstMemObj->deviceHandles_d + p * numQ;
+        printf("PE%d: dest=%d dh[0]=%p peerSig=%p\n",
+               myPe, p, (void*)(dh0[0]), (void*)(dstMemObj->peerSignalPtrs[p]));
+      }
     }
 
     if (blockIdx.x != 0) {
@@ -144,13 +150,14 @@ __global__ void PipelinedAllReduceSdmaKernel(
               + static_cast<size_t>(sender) * numQ;
           int sSpin = 0;
           while (core::AtomicLoadRelaxed(sig) < expected) {
-            if (++sSpin > 200000000 && blockIdx.x == 1 && threadIdx.x == 0) {
-              printf("PE%d blk%d: SCATTER SIG TIMEOUT sender=%d c=%d exp=%llu act=%llu base=%llu\n",
-                     myPe, (int)blockIdx.x, sender, c,
-                     (unsigned long long)expected,
-                     (unsigned long long)core::AtomicLoadRelaxed(sig),
-                     (unsigned long long)s_scatter_by_sender[sender]);
-              break;
+            if (++sSpin > 200000000) {
+              if (blockIdx.x == 1) {
+                printf("PE%d blk1 t%d: SCATTER TIMEOUT sender=%d exp=%llu act=%llu\n",
+                       myPe, idx, sender,
+                       (unsigned long long)expected,
+                       (unsigned long long)core::AtomicLoadRelaxed(sig));
+              }
+              sSpin = 0;
             }
           }
         }
