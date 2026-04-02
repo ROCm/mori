@@ -133,7 +133,7 @@ inline void EnablePeerAccess(int const deviceId, int const peerDeviceId) {
               << " (" << hipGetErrorString(error) << ")\n";
   }
 }
-inline int GetSdmaNumChannels(int defaultVal = 2) {
+inline int GetSdmaNumChannels(int defaultVal = 8) {
   const char* env = std::getenv("MORI_SDMA_NUM_CHANNELS");
   if (env != nullptr) {
     int val = std::atoi(env);

@@ -176,9 +176,9 @@ void runExperiment(int srcDeviceId, const ExperimentParams& params) {
 
   size_t totalNumQueues = params.numOfQueues * params.numDestinations;
 
+  const int sdmaNumQueues = anvil::GetSdmaNumChannels();
   for (auto& dstDeviceId : dstDeviceIds) {
-    // Better performance if allocating all 8 queues
-    anvil::anvil.connect(srcDeviceId, dstDeviceId, 8);  // params.numOfQueues);
+    anvil::anvil.connect(srcDeviceId, dstDeviceId, sdmaNumQueues);
   }
 
   anvil::SdmaQueueDeviceHandle** deviceHandles_d = nullptr;
