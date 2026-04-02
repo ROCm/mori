@@ -655,6 +655,8 @@ def _test_gemm_overlap_comparison(
         inp = torch.full((elems,), fill_value, dtype=dtype, device=device)
         out = torch.zeros(elems, dtype=dtype, device=device)
 
+        torch.cuda.synchronize()
+        dist.barrier()
         stream_ar.synchronize()
         ok = ar(inp, out, elems, stream_ar)
         stream_ar.synchronize()
@@ -687,6 +689,8 @@ def _test_gemm_overlap_comparison(
         inp = torch.full((elems,), fill_value, dtype=dtype, device=device)
         out = torch.zeros(elems, dtype=dtype, device=device)
 
+        torch.cuda.synchronize()
+        dist.barrier()
         stream_ar.synchronize()
         ok = ar(inp, out, elems, stream_ar)
         stream_ar.synchronize()
