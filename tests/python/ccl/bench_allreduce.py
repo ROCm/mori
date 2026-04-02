@@ -168,8 +168,20 @@ def _bench_worker(rank, world_size, port, warmup, iterations, dtype):
             row["async_copy"] = _avg_across_pes(ts, npes)
             del ar
 
-            # --- RCCL in-place ---
+            # --- RCCL out-of-place (copy input → output, then allreduce output) ---
             rccl_fill = float(fill_val) if rccl_dtype in (torch.float16, torch.bfloat16) else fill_val
+            rccl_in = torch.full((elems,), rccl_fill, dtype=rccl_dtype, device=device)
+            rccl_out = torch.zeros(elems, dtype=rccl_dtype, device=device)
+
+            def _rccl_op_fn(src=rccl_in, dst=rccl_out):
+                dst.copy_(src)
+                dist.all_reduce(dst, op=dist.ReduceOp.SUM)
+
+            ts = _measure_rccl(_rccl_op_fn, None, warmup, iterations)
+            row["rccl_nocopy"] = _avg_across_pes(ts, npes)
+            del rccl_in, rccl_out
+
+            # --- RCCL in-place ---
             rccl_buf = torch.full((elems,), rccl_fill, dtype=rccl_dtype, device=device)
 
             def _rccl_setup(buf=rccl_buf, v=rccl_fill):
@@ -178,7 +190,7 @@ def _bench_worker(rank, world_size, port, warmup, iterations, dtype):
             ts = _measure_rccl(
                 lambda: dist.all_reduce(rccl_buf, op=dist.ReduceOp.SUM),
                 _rccl_setup, warmup, iterations)
-            row["rccl"] = _avg_across_pes(ts, npes)
+            row["rccl_copy"] = _avg_across_pes(ts, npes)
             del rccl_buf
 
             rows.append(row)
@@ -204,7 +216,7 @@ def _bw(data_bytes, t):
 
 def _print_table(rows, npes, elem_size, dtype):
     dtype_name = str(dtype).split(".")[-1]
-    sep = "-" * 105
+    sep = "-" * 120
     print()
     print(sep)
     print(f"  AllReduce Benchmark  npes={npes}  dtype={dtype_name}")
@@ -215,11 +227,11 @@ def _print_table(rows, npes, elem_size, dtype):
 
     hdr = (
         f"{'MB/PE':>6} | {'sync':>8} {'sync':>8} | {'async':>8} {'async':>8} | "
-        f"{'RCCL':>8} | {'best':>8}"
+        f"{'RCCL':>8} {'RCCL':>8} | {'best':>8}"
     )
     sub = (
         f"{'':>6} | {'no-copy':>8} {'copy':>8} | {'no-copy':>8} {'copy':>8} | "
-        f"{'inplace':>8} | {'':>8}"
+        f"{'outplace':>8} {'inplace':>8} | {'':>8}"
     )
     print(hdr)
     print(sub)
@@ -233,17 +245,18 @@ def _print_table(rows, npes, elem_size, dtype):
         bw_sc = _bw(db, r["sync_copy"])
         bw_an = _bw(db, r["async_nocopy"])
         bw_ac = _bw(db, r["async_copy"])
-        bw_r = _bw(db, r["rccl"])
+        bw_rn = _bw(db, r["rccl_nocopy"])
+        bw_rc = _bw(db, r["rccl_copy"])
 
         all_bw = {"sync-nc": bw_sn, "sync-cp": bw_sc,
-                  "async-nc": bw_an, "async-cp": bw_ac, "rccl": bw_r}
+                  "async-nc": bw_an, "async-cp": bw_ac,
+                  "rccl-op": bw_rn, "rccl-ip": bw_rc}
         best_name = max(all_bw, key=all_bw.get)
-        best_val = all_bw[best_name]
 
         print(
             f"{mb:>6} | {bw_sn:>8.1f} {bw_sc:>8.1f} | "
             f"{bw_an:>8.1f} {bw_ac:>8.1f} | "
-            f"{bw_r:>8.1f} | {best_name:>8}"
+            f"{bw_rn:>8.1f} {bw_rc:>8.1f} | {best_name:>8}"
         )
 
     print(sep)
