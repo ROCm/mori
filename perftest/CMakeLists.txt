@@ -49,13 +49,7 @@ endfunction()
 # Registered perftest targets
 # ---------------------------------------------------------------------------
 
-add_mori_perftest_app(perftest SOURCES shmem/demo.cpp)
-
-# More examples:
-# add_mori_perftest_shmem(put_bw SOURCES device/put_bw.cpp)
-# add_mori_perftest_app(host_bw SOURCES host/bw.cpp
-#                       ${CMAKE_SOURCE_DIR}/examples/utils/args_parser.cpp)
-#
-# Pure C++ sources with __global__ kernels: use add_mori_perftest_shmem, or
-# add_mori_perftest_app then set_source_files_properties(... LANGUAGE HIP).
-# ---------------------------------------------------------------------------
+if(WITH_MPI)
+  # libmori_application uses std::filesystem; GNU libstdc++ needs explicit -lstdc++fs.
+  add_mori_perftest_shmem(p2p_put_bw SOURCES shmem/p2p_put_bw.cpp LIBS stdc++fs)
+endif()
