@@ -37,6 +37,13 @@ kernel_type_map = {
     "async_ll": mori.ops.EpDispatchCombineKernelType.AsyncLL,
 }
 
+_CLI_TO_KERNEL_TYPE_NAME = {
+    "v0": "InterNode",
+    "v1": "InterNodeV1",
+    "v1_ll": "InterNodeV1LL",
+    "async_ll": "AsyncLL",
+}
+
 _FP4_DTYPE = getattr(torch, "float4_e2m1fn_x2", None)
 
 
@@ -72,6 +79,116 @@ def unpack_fp4x2(fp4x2_tensor, dtype=torch.bfloat16):
     lut = torch.tensor(_FP4_E2M1_LUT, dtype=dtype, device=raw.device)
     result = torch.stack([lut[low.long()], lut[high.long()]], dim=-1)
     return result.reshape(*raw.shape[:-1], raw.shape[-1] * 2)
+
+
+def _save_internode_tuning_result(
+    config_path,
+    config,
+    max_num_token,
+    dispatch_hidden_dim,
+    combine_hidden_dim,
+    combine_data_type,
+    best_disp_config,
+    best_disp_bw,
+    best_comb_config,
+    best_comb_bw,
+):
+    from pathlib import Path
+    from mori.ops.tuning_config import (
+        TuningConfigManager,
+        dtype_to_config_str,
+        build_config_filename,
+        quant_type_to_config_str,
+        kernel_type_to_config_str,
+        detect_gpu_model,
+    )
+    from mori.jit.config import detect_gpu_arch
+
+    gpu_arch = detect_gpu_arch()
+    gpu_model = detect_gpu_model()
+    kernel_type_name = kernel_type_to_config_str(config.kernel_type)
+    disp_dtype_str = dtype_to_config_str(config.data_type)
+    comb_dtype_str = dtype_to_config_str(combine_data_type)
+    qt_str = quant_type_to_config_str(config.quant_type)
+
+    metadata = {
+        "gpu_arch": gpu_arch,
+        "gpu_model": gpu_model,
+        "kernel_type": kernel_type_name,
+        "ep_size": config.world_size,
+    }
+
+    dispatch_entry = {
+        "dtype": disp_dtype_str,
+        "num_tokens": max_num_token,
+        "hidden_dim": dispatch_hidden_dim,
+        "block_num": best_disp_config[0],
+        "rdma_block_num": best_disp_config[2],
+        "warp_per_block": best_disp_config[1],
+        "bandwidth_gbps": round(best_disp_bw, 2),
+    }
+
+    combine_entry = {
+        "dtype": comb_dtype_str,
+        "num_tokens": max_num_token,
+        "hidden_dim": combine_hidden_dim,
+        "zero_copy": False,
+        "quant_type": qt_str,
+        "block_num": best_comb_config[0],
+        "rdma_block_num": best_comb_config[2],
+        "warp_per_block": best_comb_config[1],
+        "bandwidth_gbps": round(best_comb_bw, 2),
+    }
+
+    if config_path == "auto":
+        repo_tuning_dir = (
+            Path(__file__).resolve().parents[3]
+            / "python"
+            / "mori"
+            / "ops"
+            / "tuning_configs"
+        )
+        dispatch_path = str(
+            repo_tuning_dir
+            / build_config_filename(
+                gpu_arch,
+                kernel_type_name,
+                config.world_size,
+                gpu_model,
+                "dispatch",
+            )
+        )
+        combine_path = str(
+            repo_tuning_dir
+            / build_config_filename(
+                gpu_arch,
+                kernel_type_name,
+                config.world_size,
+                gpu_model,
+                "combine",
+            )
+        )
+    else:
+        base = config_path.rsplit(".", 1)[0] if "." in config_path else config_path
+        dispatch_path = f"{base}_dispatch.json"
+        combine_path = f"{base}_combine.json"
+
+    dispatch_metadata = {**metadata, "phase": "dispatch"}
+    combine_metadata = {**metadata, "phase": "combine"}
+
+    TuningConfigManager.save_tuning_result(
+        dispatch_path,
+        dispatch_metadata,
+        dispatch_entry,
+        phase="dispatch",
+    )
+    TuningConfigManager.save_tuning_result(
+        combine_path,
+        combine_metadata,
+        combine_entry,
+        phase="combine",
+    )
+    print(f"Tuning config saved to: {dispatch_path} + {combine_path}")
 
 
 class EpDispatchCombineTestCase:
@@ -1054,7 +1171,7 @@ class EpDispatchCombineTestCase:
             comb_lat,
         )
 
-    def tuning_dispatch_combine(self, max_num_token):
+    def tuning_dispatch_combine(self, max_num_token, save_tuning_config=None):
         op = mori.ops.EpDispatchCombineOp(self.config)
         sm_count = torch.cuda.get_device_properties(
             self.rank % self.gpu_per_node
@@ -1155,6 +1272,20 @@ class EpDispatchCombineTestCase:
                 f"rdma={best_comb_config[2]}"
             )
             print(f"{'=' * 60}")
+
+            if save_tuning_config and best_disp_config and best_comb_config:
+                _save_internode_tuning_result(
+                    save_tuning_config,
+                    config=self.config,
+                    max_num_token=max_num_token,
+                    dispatch_hidden_dim=self.dispatch_hidden_dim,
+                    combine_hidden_dim=self.combine_hidden_dim,
+                    combine_data_type=self.combine_data_type,
+                    best_disp_config=best_disp_config,
+                    best_disp_bw=best_disp_bw,
+                    best_comb_config=best_comb_config,
+                    best_comb_bw=best_comb_bw,
+                )
 
         del op
 
@@ -1263,6 +1394,8 @@ def test_dispatch_combine(
     rdma_block_num=-1,
     warp_per_block=-1,
     max_total_recv_tokens=0,
+    hidden_dim=7168,
+    save_tuning_config=None,
 ):
     world_size = num_node * gpu_per_node
     node_rank = int(os.environ["RANK"])
@@ -1278,6 +1411,7 @@ def test_dispatch_combine(
             num_qp,
             quant_type,
             dtype,
+            hidden_dim=hidden_dim,
             combine_dtype=combine_dtype,
             max_total_recv_tokens=max_total_recv_tokens,
         )
@@ -1296,7 +1430,10 @@ def test_dispatch_combine(
         elif cmd == "profile":
             test_case.profile_dispatch_combine(max_tokens)
         elif cmd == "tuning":
-            test_case.tuning_dispatch_combine(max_tokens)
+            test_case.tuning_dispatch_combine(
+                max_tokens,
+                save_tuning_config=save_tuning_config,
+            )
         test_case.cleanup()
     elif cmd == "sweep_bench":
         sweep_bench_dispatch_combine(
@@ -1404,6 +1541,21 @@ parser.add_argument(
     default=0,
     help="Maximum total number of received tokens across all ranks (default: 0, meaning no limit)",
 )
+parser.add_argument(
+    "--hidden-dim",
+    type=int,
+    default=7168,
+    help="Base hidden dimension for the model (default: 7168)",
+)
+parser.add_argument(
+    "--save-tuning-config",
+    type=str,
+    default=None,
+    help=(
+        "Path to save tuning results as JSON config. "
+        "Use 'auto' to auto-generate filename based on GPU/dtype/EP."
+    ),
+)
 args_cli = parser.parse_args()
 
 if __name__ == "__main__":
@@ -1435,6 +1587,8 @@ if __name__ == "__main__":
             args_cli.rdma_block_num if args_cli.rdma_block_num is not None else -1,
             args_cli.warp_per_block if args_cli.warp_per_block is not None else -1,
             args_cli.max_recv_total_tokens,
+            args_cli.hidden_dim,
+            args_cli.save_tuning_config,
         ),
         nprocs=gpu_per_node,
         join=True,

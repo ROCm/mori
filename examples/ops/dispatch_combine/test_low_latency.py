@@ -458,8 +458,7 @@ def test_main(
 
             rank_token_counts = {}
             for i, pos in enumerate(src_token_pos[:num_total_valid_tokens]):
-                src_rank = int(pos) // config.max_num_inp_token_per_rank
-                src_id = int(pos) % config.max_num_inp_token_per_rank
+                src_rank, src_id = op.decode_send_flat_idx(int(pos))
                 recv_token = global_recv_x[i]
 
                 # Check that token values are consistent (amin == amax for first hidden-128 dims)

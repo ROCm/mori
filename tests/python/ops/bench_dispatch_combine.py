@@ -266,6 +266,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         combine_block_num,
         combine_warp_per_block,
         graph_replay_iters=10,
+        skip_e2e=False,
     ):
         (
             _,
@@ -302,10 +303,8 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
 
         is_cross_type = self.combine_data_type != self.config.data_type
 
-        # e2e graph not supported for cross-type (graph capture cannot
-        # allocate memory for type conversion).
         e2e_graph = None
-        if not is_cross_type:
+        if not skip_e2e and not is_cross_type:
             e2e_graph = self._capture_e2e_graph(
                 op,
                 test_data,
@@ -410,6 +409,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         warmup=1,
         iters=10,
         graph_replay_iters=10,
+        skip_e2e=False,
     ):
         test_data = self.gen_test_data()
         for _ in range(warmup):
@@ -451,6 +451,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
                 combine_block_num,
                 combine_warp_per_block,
                 graph_replay_iters=graph_replay_iters,
+                skip_e2e=skip_e2e,
             )
 
             disp_dur_list = [torch.zeros(1) for _ in range(self.config.world_size)]
@@ -578,6 +579,117 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             torch.cuda.synchronize()
 
 
+def _save_intranode_tuning_result(
+    config_path,
+    world_size,
+    max_num_inp_token_per_rank,
+    dispatch_hidden_dim,
+    combine_hidden_dim,
+    data_type,
+    combine_data_type,
+    quant_type,
+    best_disp_config,
+    best_disp_bw,
+    best_comb_config,
+    best_comb_bw,
+    zero_copy=True,
+):
+    from pathlib import Path
+    from mori.ops.tuning_config import (
+        TuningConfigManager,
+        dtype_to_config_str,
+        build_config_filename,
+        quant_type_to_config_str,
+        detect_gpu_model,
+    )
+    from mori.jit.config import detect_gpu_arch
+
+    gpu_arch = detect_gpu_arch()
+    gpu_model = detect_gpu_model()
+    disp_dtype_str = dtype_to_config_str(data_type)
+    comb_dtype_str = dtype_to_config_str(combine_data_type)
+    qt_str = quant_type_to_config_str(quant_type)
+
+    metadata = {
+        "gpu_arch": gpu_arch,
+        "gpu_model": gpu_model,
+        "kernel_type": "IntraNode",
+        "ep_size": world_size,
+    }
+
+    dispatch_entry = {
+        "dtype": disp_dtype_str,
+        "num_tokens": max_num_inp_token_per_rank,
+        "hidden_dim": dispatch_hidden_dim,
+        "block_num": best_disp_config[0],
+        "rdma_block_num": 0,
+        "warp_per_block": best_disp_config[1],
+        "bandwidth_gbps": round(best_disp_bw, 2),
+    }
+
+    combine_entry = {
+        "dtype": comb_dtype_str,
+        "num_tokens": max_num_inp_token_per_rank,
+        "hidden_dim": combine_hidden_dim,
+        "zero_copy": bool(zero_copy),
+        "quant_type": qt_str,
+        "block_num": best_comb_config[0],
+        "rdma_block_num": 0,
+        "warp_per_block": best_comb_config[1],
+        "bandwidth_gbps": round(best_comb_bw, 2),
+    }
+
+    if config_path == "auto":
+        repo_tuning_dir = (
+            Path(__file__).resolve().parents[3]
+            / "python"
+            / "mori"
+            / "ops"
+            / "tuning_configs"
+        )
+        dispatch_path = str(
+            repo_tuning_dir
+            / build_config_filename(
+                gpu_arch,
+                "IntraNode",
+                world_size,
+                gpu_model,
+                "dispatch",
+            )
+        )
+        combine_path = str(
+            repo_tuning_dir
+            / build_config_filename(
+                gpu_arch,
+                "IntraNode",
+                world_size,
+                gpu_model,
+                "combine",
+            )
+        )
+    else:
+        base = config_path.rsplit(".", 1)[0] if "." in config_path else config_path
+        dispatch_path = f"{base}_dispatch.json"
+        combine_path = f"{base}_combine.json"
+
+    dispatch_metadata = {**metadata, "phase": "dispatch"}
+    combine_metadata = {**metadata, "phase": "combine"}
+
+    TuningConfigManager.save_tuning_result(
+        dispatch_path,
+        dispatch_metadata,
+        dispatch_entry,
+        phase="dispatch",
+    )
+    TuningConfigManager.save_tuning_result(
+        combine_path,
+        combine_metadata,
+        combine_entry,
+        phase="combine",
+    )
+    print(f"Tuning config saved to: {dispatch_path} + {combine_path}")
+
+
 LaunchConfig = namedtuple(
     "LaunchConfig",
     [
@@ -639,6 +751,7 @@ def _bench_dispatch_combine(
     combine_warp_per_block_arg=None,
     combine_data_type=None,
     max_total_recv_tokens=0,
+    save_tuning_config=None,
 ):
     if combine_data_type is None:
         combine_data_type = data_type
@@ -650,8 +763,11 @@ def _bench_dispatch_combine(
     else:
         combine_hidden_dim = hidden_dim
 
-    if quant_type == "fp8_direct_cast" and data_type is not torch.bfloat16:
-        raise ValueError("fp8_direct_cast is only supported for bfloat16 data type")
+    if quant_type == "fp8_direct_cast" and combine_data_type is not torch.bfloat16:
+        raise ValueError(
+            "fp8_direct_cast quant requires combine dtype to be bfloat16, "
+            f"got {combine_data_type}"
+        )
 
     config = mori.ops.EpDispatchCombineConfig(
         data_type=data_type,
@@ -747,35 +863,50 @@ def _bench_dispatch_combine(
                     "Warning: dispatch/combine block/warp arguments are ignored when --cmd tuning"
                 )
             sm_count = torch.cuda.get_device_properties(rank).multi_processor_count
+            tuning_scope = os.environ.get("MORI_TUNING_SCOPE", "full")
 
-            # Build full dispatch candidate set (includes over-subscribe)
-            max_disp_block_num = max(sm_count * 4, 320)
-            all_block_set = set()
-            all_block_set.update(range(32, sm_count + 1, 8))
-            pow2 = 32
-            while pow2 <= max_disp_block_num:
-                all_block_set.add(pow2)
-                pow2 <<= 1
-            for anchor in [224, 256]:
-                for delta in [-32, -16, -8, -4, -1, 0, 1, 4, 8, 16, 32]:
-                    v = anchor + delta
-                    if 32 <= v <= max_disp_block_num:
-                        all_block_set.add(v)
-            for mult in [1, 2, 3, 4]:
-                all_block_set.add(sm_count * mult)
+            if tuning_scope == "quick":
+                block_set = set()
+                pow2 = 32
+                while pow2 <= sm_count:
+                    block_set.add(pow2)
+                    pow2 <<= 1
+                block_set.add(sm_count)
+                common_block_list = sorted(block_set)
+                warp_per_block_list = [4, 8, 16]
+            else:
+                max_disp_block_num = max(sm_count * 4, 320)
+                all_block_set = set()
+                all_block_set.update(range(32, sm_count + 1, 8))
+                pow2 = 32
+                while pow2 <= max_disp_block_num:
+                    all_block_set.add(pow2)
+                    pow2 <<= 1
+                for anchor in [224, 256]:
+                    for delta in [-32, -16, -8, -4, -1, 0, 1, 4, 8, 16, 32]:
+                        v = anchor + delta
+                        if 32 <= v <= max_disp_block_num:
+                            all_block_set.add(v)
+                for mult in [1, 2, 3, 4]:
+                    all_block_set.add(sm_count * mult)
+                common_block_list = sorted(v for v in all_block_set if v <= sm_count)
+                warp_per_block_list = [4, 5, 6, 8, 10, 12, 14, 15, 16]
 
-            common_block_list = sorted(v for v in all_block_set if v <= sm_count)
-            extra_disp_block_list = sorted(v for v in all_block_set if v > sm_count)
+            # Over-subscribe disabled by default (hang risk)
+            extra_disp_block_list = []
 
-            warp_per_block_list = [4, 5, 6, 8, 10, 12, 14, 15, 16]
-
+            total_configs = len(common_block_list) * len(warp_per_block_list)
             if rank == 0:
                 print(
-                    f"SM count={sm_count}\n"
-                    f"Common block_num candidates ({len(common_block_list)}): {common_block_list}\n"
-                    f"Extra dispatch block_num candidates ({len(extra_disp_block_list)}): {extra_disp_block_list}\n"
-                    f"warp_per_block candidates: {warp_per_block_list}"
+                    f"SM count={sm_count}, tuning_scope={tuning_scope}\n"
+                    f"block_num candidates ({len(common_block_list)}): {common_block_list}\n"
+                    f"warp_per_block candidates ({len(warp_per_block_list)}): {warp_per_block_list}\n"
+                    f"Total configurations: {total_configs}"
                 )
+                if extra_disp_block_list:
+                    print(
+                        f"Extra dispatch block_num candidates ({len(extra_disp_block_list)}): {extra_disp_block_list}"
+                    )
 
             best_disp_bw = 0
             best_comb_bw = 0
@@ -804,6 +935,7 @@ def _bench_dispatch_combine(
                         dispatch_warp_per_block=warp_per_block,
                         combine_block_num=block_num,
                         combine_warp_per_block=warp_per_block,
+                        skip_e2e=True,
                     )
 
                     if disp_bw > best_disp_bw:
@@ -838,6 +970,7 @@ def _bench_dispatch_combine(
                             dispatch_warp_per_block=warp_per_block,
                             combine_block_num=best_comb_config[0],
                             combine_warp_per_block=best_comb_config[1],
+                            skip_e2e=True,
                         )
 
                         if disp_bw > best_disp_bw:
@@ -860,6 +993,23 @@ def _bench_dispatch_combine(
                 )
                 print(f"{'=' * 60}")
 
+                if save_tuning_config and best_disp_config and best_comb_config:
+                    _save_intranode_tuning_result(
+                        save_tuning_config,
+                        world_size=world_size,
+                        max_num_inp_token_per_rank=max_num_inp_token_per_rank,
+                        dispatch_hidden_dim=hidden_dim,
+                        combine_hidden_dim=combine_hidden_dim,
+                        data_type=data_type,
+                        combine_data_type=combine_data_type,
+                        quant_type=quant_type,
+                        best_disp_config=best_disp_config,
+                        best_disp_bw=best_disp_bw,
+                        best_comb_config=best_comb_config,
+                        best_comb_bw=best_comb_bw,
+                        zero_copy=bool(zero_copy),
+                    )
+
         else:
             raise ValueError(f"Unknown command: {cmd}")
 
@@ -880,6 +1030,7 @@ def bench_dispatch_combine(
     num_experts_per_token=8,
     combine_data_type=None,
     max_total_recv_tokens=0,
+    save_tuning_config=None,
 ):
     if combine_data_type is None:
         combine_data_type = dtype
@@ -905,6 +1056,7 @@ def bench_dispatch_combine(
             combine_warp_per_block,
             combine_data_type,
             max_total_recv_tokens,
+            save_tuning_config,
         ),
         nprocs=world_size,
         join=True,
@@ -1018,6 +1170,21 @@ if __name__ == "__main__":
             "When set, Phase 2 creates a separate op with this dtype. "
         ),
     )
+    parser.add_argument(
+        "--hidden-dim",
+        type=int,
+        default=7168,
+        help="Base hidden dimension for the model (default: 7168)",
+    )
+    parser.add_argument(
+        "--save-tuning-config",
+        type=str,
+        default=None,
+        help=(
+            "Path to save tuning results as JSON config. "
+            "Use 'auto' to auto-generate filename based on GPU/dtype/EP."
+        ),
+    )
     args = parser.parse_args()
 
     if args.num_experts_per_rank is None:
@@ -1029,7 +1196,7 @@ if __name__ == "__main__":
     dispatch_dtype = _DATA_TYPE_MAP[args.dtype]
     combine_dtype = _DATA_TYPE_MAP[combine_dtype_str]
 
-    base_hidden_dim = 7168
+    base_hidden_dim = args.hidden_dim
     dispatch_hidden_dim = (
         base_hidden_dim // 2 if _is_fp4x2_dtype(dispatch_dtype) else base_hidden_dim
     )
@@ -1037,6 +1204,7 @@ if __name__ == "__main__":
     print(
         f"Running {args.cmd} with max_tokens_per_rank: {args.max_tokens}, "
         f"dispatch_dtype: {args.dtype}, combine_dtype: {combine_dtype_str}, "
+        f"hidden_dim: {base_hidden_dim}, "
         f"world_size(EP): {args.world_size}, "
         f"num_experts_per_rank: {args.num_experts_per_rank}, "
         f"num_experts_per_token: {args.num_experts_per_token}, "
@@ -1064,4 +1232,5 @@ if __name__ == "__main__":
         num_experts_per_token=args.num_experts_per_token,
         combine_data_type=combine_dtype,
         max_total_recv_tokens=args.max_recv_total_tokens,
+        save_tuning_config=args.save_tuning_config,
     )
