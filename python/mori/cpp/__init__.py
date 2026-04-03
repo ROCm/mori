@@ -46,3 +46,7 @@ sys.modules["libmori_pybinds"] = module
 spec.loader.exec_module(module)
 
 from libmori_pybinds import *
+
+# Override the raw C++ binding with the Python wrapper that JIT-compiles the
+# kernel on first use. Implementation lives in mori.ops.local_expert_count.
+from mori.ops.local_expert_count import launch_local_expert_count  # noqa: F811

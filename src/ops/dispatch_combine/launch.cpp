@@ -383,6 +383,15 @@ static int combine_shared_mem(int wpb, int num_experts_per_token) {
   return wpb * num_experts_per_token * (8 + 8);
 }
 
+struct LocalExpertCountLaunchParams {
+  const index_t* indices;
+  const index_t* total_recv_token_num;
+  int rank;
+  int num_expert_per_rank;
+  int num_expert_per_token;
+  int* local_expert_count;
+};
+
 static void ensure_loaded() {
   if (!KernelRegistry::Instance().IsLoaded()) {
     KernelRegistry::Instance().AutoLoad();
@@ -575,6 +584,87 @@ void LaunchCombineRecv(EpDispatchCombineHandle& handle, int block_num, int warp_
                                       block_x, smem, stream, &args, args_size);
   } else {
     throw std::runtime_error("LaunchCombineRecv only supported for AsyncLL");
+  }
+}
+
+// -----------------------------------------------------------------------
+// LaunchLocalExpertCount
+// -----------------------------------------------------------------------
+void LaunchLocalExpertCount(const EpDispatchCombineConfig& config, const index_t* indices,
+                            const index_t* total_recv_token_num, int* local_expert_count,
+                            int block_num, int warp_per_block, hipStream_t stream) {
+  ensure_loaded();
+
+  if (indices == nullptr || total_recv_token_num == nullptr || local_expert_count == nullptr) {
+    throw std::runtime_error(
+        "LaunchLocalExpertCount requires non-null indices, total_recv_token_num, and output");
+  }
+
+  const int wpb = (warp_per_block <= 0) ? config.warpNumPerBlock : warp_per_block;
+  const int bn = (block_num <= 0) ? config.blockNum : block_num;
+  if (wpb <= 0 || bn <= 0) {
+    throw std::runtime_error("LaunchLocalExpertCount requires positive block and warp settings");
+  }
+
+  const hipError_t memset_err = hipMemsetAsync(
+      local_expert_count, 0, static_cast<size_t>(config.numExpertPerRank) * sizeof(int), stream);
+  if (memset_err != hipSuccess) {
+    throw std::runtime_error("hipMemsetAsync failed for LaunchLocalExpertCount: " +
+                             std::string(hipGetErrorString(memset_err)));
+  }
+
+  LocalExpertCountLaunchParams args{indices,
+                                    total_recv_token_num,
+                                    config.rank,
+                                    config.numExpertPerRank,
+                                    config.numExpertPerToken,
+                                    local_expert_count};
+  KernelRegistry::Instance().Launch("LocalExpertCountKernel", static_cast<unsigned int>(bn),
+                                    WARP_SIZE * static_cast<unsigned int>(wpb), 0, stream, &args,
+                                    sizeof(args));
+}
+
+// -----------------------------------------------------------------------
+// LaunchLocalExpertCountDirect — accepts hipFunction_t from Python HipModule
+// -----------------------------------------------------------------------
+void LaunchLocalExpertCountDirect(const EpDispatchCombineConfig& config, const index_t* indices,
+                                  const index_t* total_recv_token_num, int* local_expert_count,
+                                  hipFunction_t func, int block_num, int warp_per_block,
+                                  hipStream_t stream) {
+  if (indices == nullptr || total_recv_token_num == nullptr || local_expert_count == nullptr) {
+    throw std::runtime_error(
+        "LaunchLocalExpertCountDirect requires non-null indices, total_recv_token_num, and output");
+  }
+
+  const int wpb = (warp_per_block <= 0) ? config.warpNumPerBlock : warp_per_block;
+  const int bn = (block_num <= 0) ? config.blockNum : block_num;
+  if (wpb <= 0 || bn <= 0) {
+    throw std::runtime_error(
+        "LaunchLocalExpertCountDirect requires positive block and warp settings");
+  }
+
+  const hipError_t memset_err = hipMemsetAsync(
+      local_expert_count, 0, static_cast<size_t>(config.numExpertPerRank) * sizeof(int), stream);
+  if (memset_err != hipSuccess) {
+    throw std::runtime_error("hipMemsetAsync failed for LaunchLocalExpertCountDirect: " +
+                             std::string(hipGetErrorString(memset_err)));
+  }
+
+  LocalExpertCountLaunchParams args{indices,
+                                    total_recv_token_num,
+                                    config.rank,
+                                    config.numExpertPerRank,
+                                    config.numExpertPerToken,
+                                    local_expert_count};
+  size_t args_size = sizeof(args);
+  void* extra[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &args, HIP_LAUNCH_PARAM_BUFFER_SIZE, &args_size,
+                   HIP_LAUNCH_PARAM_END};
+  const hipError_t err = hipModuleLaunchKernel(func, static_cast<unsigned int>(bn), 1, 1,
+                                               WARP_SIZE * static_cast<unsigned int>(wpb), 1, 1, 0,
+                                               stream, nullptr, extra);
+  if (err != hipSuccess) {
+    throw std::runtime_error("hipModuleLaunchKernel failed for LocalExpertCountKernel: " +
+                             std::string(hipGetErrorString(err)));
   }
 }
 

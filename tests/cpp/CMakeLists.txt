@@ -39,6 +39,14 @@ if(BUILD_IO)
   endif()
 endif()
 
+if(BUILD_OPS_DEVICE)
+  add_executable(test_local_expert_count test_local_expert_count.cpp)
+  target_include_directories(test_local_expert_count
+                             PUBLIC ${CMAKE_SOURCE_DIR}/include)
+  target_include_directories(test_local_expert_count PUBLIC ${CMAKE_SOURCE_DIR})
+  target_link_libraries(test_local_expert_count mori_ops hip::host)
+endif()
+
 if(BUILD_OPS_DEVICE AND WITH_MPI)
   find_package(MPI REQUIRED)
   add_executable(test_aot_launch ops/test_aot_launch.cpp)
