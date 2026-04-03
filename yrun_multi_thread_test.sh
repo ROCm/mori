@@ -64,7 +64,7 @@ TORCH_LIBS=/usr/local/lib/python3.12/dist-packages/torch/lib
 export LD_PRELOAD=/lib/x86_64-linux-gnu/libnuma.so.1 #:/lib/x86_64-linux-gnu/libibverbs.so.1
 # export LD_LIBRARY_PATH=$TORCH_LIBS:$LD_LIBRARY_PATH
 
-mpirun --allow-run-as-root -np 2 ./build/examples/put_allgather_large $@
+mpirun --allow-run-as-root -np 2 ./build/examples/allgather_test $@
 #mpirun --allow-run-as-root -np 2 ./build/examples/put_thread_allgather 1024
 # $GDB $ROCPROF ./build/examples/send_recv_gpu 2>&1 | tee zzzrun.log
 # $GDB $ROCPROF ./build/examples/multithread_multi_gpu 2>&1 | tee zzzrun.log
