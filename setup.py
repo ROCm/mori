@@ -344,6 +344,7 @@ class CMakeBuild(build_ext):
         gpu_archs = _get_gpu_archs()
         print(f"[mori] GPU architecture: {gpu_archs}")
         build_examples = os.environ.get("BUILD_EXAMPLES", "OFF")
+        build_perftest = "ON" if _env_flag("BUILD_PERFTEST", "OFF") else "OFF"
         build_tests = os.environ.get("BUILD_TESTS", "OFF")
         build_umbp_enabled = _env_flag("BUILD_UMBP", "OFF")
         build_umbp = "ON" if build_umbp_enabled else "OFF"
@@ -373,6 +374,7 @@ class CMakeBuild(build_ext):
             f"-DGPU_TARGETS={gpu_archs}",
             f"-DENABLE_PROFILER={enable_profiler}",
             f"-DBUILD_EXAMPLES={build_examples}",
+            f"-DBUILD_PERFTEST={build_perftest}",
             f"-DBUILD_TESTS={build_tests}",
             f"-DBUILD_UMBP={build_umbp}",
             f"-DWITH_MPI={with_mpi}",
