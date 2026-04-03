@@ -284,7 +284,7 @@ def _worker(rank, world_size, port, sizes_mb, iterations, warmup,
             print(f"\nResults saved to {json_path}")
 
             _save_csv(results, output_dir)
-            _generate_charts(results, output_dir, gemm_m, gemm_n, gemm_k)
+            _print_summary_tables(results, gemm_m, gemm_n, gemm_k)
 
         torch.cuda.synchronize()
         dist.barrier()
@@ -310,132 +310,86 @@ def _save_csv(results, output_dir):
     print(f"CSV saved to {csv_path}")
 
 
-def _generate_charts(results, output_dir, gemm_m, gemm_n, gemm_k):
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("matplotlib not available, skipping chart generation")
-        return
+def _print_summary_tables(results, gemm_m, gemm_n, gemm_k):
+    def _ms(r, key):
+        v = r.get(key)
+        return f"{v * 1000:8.3f}" if v is not None else "     N/A"
 
-    sizes = [r["size_mb"] for r in results]
+    def _ratio(r, ov_key, ar_key, gemm_key):
+        ov = r.get(ov_key)
+        ar = r.get(ar_key)
+        gm = r.get(gemm_key)
+        if ov is not None and ar is not None and gm is not None and (ar + gm) > 0:
+            return f"{ov / (ar + gm):8.3f}"
+        return "     N/A"
 
-    def _get(key):
-        return [r.get(key, float("nan")) * 1000 for r in results]
+    def _speedup(r, rccl_key, sdma_key):
+        rc = r.get(rccl_key)
+        sd = r.get(sdma_key)
+        if rc is not None and sd is not None and rc > 0:
+            return f"{(rc - sd) / rc * 100:+7.1f}%"
+        return "     N/A"
 
-    sdma_copy_ov = _get("sdma_copy_overlap_avg")
-    sdma_nocopy_ov = _get("sdma_nocopy_overlap_avg")
-    rccl_ov = _get("rccl_overlap_avg")
+    sep = "-" * 120
 
-    sdma_copy_ar = _get("sdma_copy_ar_avg")
-    sdma_nocopy_ar = _get("sdma_nocopy_ar_avg")
-    rccl_ar = _get("rccl_ar_avg")
+    # Table 1: Overlap Wall Time (ms)
+    print(f"\n{'=' * 120}")
+    print(f"  GEMM Overlap Summary — GEMM {gemm_m}x{gemm_k}x{gemm_n}")
+    print(f"{'=' * 120}")
+    print(f"\n  Table 1: Overlap Wall Time (ms, avg)")
+    print(f"  {sep}")
+    print(f"  {'Size':>8s} | {'SDMA copy':>10s} | {'SDMA no-copy':>12s} | {'RCCL':>10s} |"
+          f" {'copy vs RCCL':>12s} | {'no-copy vs RCCL':>15s}")
+    print(f"  {sep}")
+    for r in results:
+        sz = f"{r['size_mb']:>6d} MB"
+        c = _ms(r, "sdma_copy_overlap_avg")
+        nc = _ms(r, "sdma_nocopy_overlap_avg")
+        rc = _ms(r, "rccl_overlap_avg")
+        sp_c = _speedup(r, "rccl_overlap_avg", "sdma_copy_overlap_avg")
+        sp_nc = _speedup(r, "rccl_overlap_avg", "sdma_nocopy_overlap_avg")
+        print(f"  {sz:>8s} | {c:>10s} | {nc:>12s} | {rc:>10s} | {sp_c:>12s} | {sp_nc:>15s}")
+    print(f"  {sep}")
 
-    sdma_copy_gemm = _get("sdma_copy_gemm_avg")
-    sdma_nocopy_gemm = _get("sdma_nocopy_gemm_avg")
-    rccl_gemm = _get("rccl_gemm_avg")
+    # Table 2: Overlap Ratio (lower = better)
+    print(f"\n  Table 2: Overlap Ratio (overlap_wall / seq_sum, lower = better)")
+    print(f"  {sep}")
+    print(f"  {'Size':>8s} | {'SDMA copy':>10s} | {'SDMA no-copy':>12s} | {'RCCL':>10s}")
+    print(f"  {sep}")
+    for r in results:
+        sz = f"{r['size_mb']:>6d} MB"
+        c = _ratio(r, "sdma_copy_overlap_avg", "sdma_copy_ar_avg", "sdma_copy_gemm_avg")
+        nc = _ratio(r, "sdma_nocopy_overlap_avg", "sdma_nocopy_ar_avg", "sdma_nocopy_gemm_avg")
+        rc = _ratio(r, "rccl_overlap_avg", "rccl_ar_avg", "rccl_gemm_avg")
+        print(f"  {sz:>8s} | {c:>10s} | {nc:>12s} | {rc:>10s}")
+    print(f"  {sep}")
 
-    subtitle = f"GEMM {gemm_m}x{gemm_k}x{gemm_n}, 8×MI300X"
+    # Table 3: Sequential Allreduce Time (ms)
+    print(f"\n  Table 3: Sequential Allreduce Time (ms, avg)")
+    print(f"  {sep}")
+    print(f"  {'Size':>8s} | {'SDMA copy':>10s} | {'SDMA no-copy':>12s} | {'RCCL':>10s}")
+    print(f"  {sep}")
+    for r in results:
+        sz = f"{r['size_mb']:>6d} MB"
+        c = _ms(r, "sdma_copy_ar_avg")
+        nc = _ms(r, "sdma_nocopy_ar_avg")
+        rc = _ms(r, "rccl_ar_avg")
+        print(f"  {sz:>8s} | {c:>10s} | {nc:>12s} | {rc:>10s}")
+    print(f"  {sep}")
 
-    # --- Chart 1: Overlap wall time ---
-    fig, ax = plt.subplots(figsize=(12, 6))
-    ax.plot(sizes, sdma_copy_ov, "o-", label="SDMA copy", linewidth=2, markersize=6)
-    ax.plot(sizes, sdma_nocopy_ov, "s-", label="SDMA no-copy", linewidth=2, markersize=6)
-    ax.plot(sizes, rccl_ov, "^-", label="RCCL", linewidth=2, markersize=6)
-    ax.set_xscale("log", base=2)
-    ax.set_xlabel("Allreduce Data Size (MB per rank)")
-    ax.set_ylabel("Overlap Wall Time (ms)")
-    ax.set_title(f"GEMM Overlap Wall Time vs Data Size\n{subtitle}")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    ax.set_xticks(sizes)
-    ax.set_xticklabels([str(s) for s in sizes], rotation=45)
-    fig.tight_layout()
-    path1 = os.path.join(output_dir, "overlap_wall_time.png")
-    fig.savefig(path1, dpi=150)
-    plt.close(fig)
-    print(f"Chart saved: {path1}")
-
-    # --- Chart 2: Overlap ratio ---
-    def _ratio(ov_list, ar_list, gemm_list):
-        out = []
-        for o, a, g in zip(ov_list, ar_list, gemm_list):
-            s = a + g
-            out.append(o / s if s > 0 else float("nan"))
-        return out
-
-    sdma_copy_ratio = _ratio(sdma_copy_ov, sdma_copy_ar, sdma_copy_gemm)
-    sdma_nocopy_ratio = _ratio(sdma_nocopy_ov, sdma_nocopy_ar, sdma_nocopy_gemm)
-    rccl_ratio = _ratio(rccl_ov, rccl_ar, rccl_gemm)
-
-    fig, ax = plt.subplots(figsize=(12, 6))
-    ax.plot(sizes, sdma_copy_ratio, "o-", label="SDMA copy", linewidth=2, markersize=6)
-    ax.plot(sizes, sdma_nocopy_ratio, "s-", label="SDMA no-copy", linewidth=2, markersize=6)
-    ax.plot(sizes, rccl_ratio, "^-", label="RCCL", linewidth=2, markersize=6)
-    ax.axhline(y=0.5, color="gray", linestyle="--", alpha=0.5, label="Ideal (0.5x)")
-    ax.set_xscale("log", base=2)
-    ax.set_xlabel("Allreduce Data Size (MB per rank)")
-    ax.set_ylabel("Overlap Ratio (lower = better)")
-    ax.set_title(f"Overlap Ratio vs Data Size\n{subtitle}")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    ax.set_xticks(sizes)
-    ax.set_xticklabels([str(s) for s in sizes], rotation=45)
-    fig.tight_layout()
-    path2 = os.path.join(output_dir, "overlap_ratio.png")
-    fig.savefig(path2, dpi=150)
-    plt.close(fig)
-    print(f"Chart saved: {path2}")
-
-    # --- Chart 3: Speedup over RCCL ---
-    def _speedup(rccl_list, sdma_list):
-        return [
-            (r - s) / r * 100 if r > 0 else float("nan")
-            for r, s in zip(rccl_list, sdma_list)
-        ]
-
-    speedup_copy = _speedup(rccl_ov, sdma_copy_ov)
-    speedup_nocopy = _speedup(rccl_ov, sdma_nocopy_ov)
-
-    fig, ax = plt.subplots(figsize=(12, 6))
-    ax.bar([s - 0.15 * s for s in sizes], speedup_copy, width=[0.25 * s for s in sizes],
-           label="SDMA copy", alpha=0.8)
-    ax.bar([s + 0.15 * s for s in sizes], speedup_nocopy, width=[0.25 * s for s in sizes],
-           label="SDMA no-copy", alpha=0.8)
-    ax.axhline(y=0, color="black", linewidth=0.5)
-    ax.set_xscale("log", base=2)
-    ax.set_xlabel("Allreduce Data Size (MB per rank)")
-    ax.set_ylabel("Speedup over RCCL (%)")
-    ax.set_title(f"SDMA Overlap Speedup over RCCL\n{subtitle}")
-    ax.legend()
-    ax.grid(True, alpha=0.3, axis="y")
-    ax.set_xticks(sizes)
-    ax.set_xticklabels([str(s) for s in sizes], rotation=45)
-    fig.tight_layout()
-    path3 = os.path.join(output_dir, "speedup_vs_rccl.png")
-    fig.savefig(path3, dpi=150)
-    plt.close(fig)
-    print(f"Chart saved: {path3}")
-
-    # --- Chart 4: Sequential allreduce time ---
-    fig, ax = plt.subplots(figsize=(12, 6))
-    ax.plot(sizes, sdma_copy_ar, "o-", label="SDMA copy", linewidth=2, markersize=6)
-    ax.plot(sizes, sdma_nocopy_ar, "s-", label="SDMA no-copy", linewidth=2, markersize=6)
-    ax.plot(sizes, rccl_ar, "^-", label="RCCL", linewidth=2, markersize=6)
-    ax.set_xscale("log", base=2)
-    ax.set_xlabel("Allreduce Data Size (MB per rank)")
-    ax.set_ylabel("Sequential Allreduce Time (ms)")
-    ax.set_title(f"Sequential Allreduce Time vs Data Size\n{subtitle}")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    ax.set_xticks(sizes)
-    ax.set_xticklabels([str(s) for s in sizes], rotation=45)
-    fig.tight_layout()
-    path4 = os.path.join(output_dir, "seq_allreduce_time.png")
-    fig.savefig(path4, dpi=150)
-    plt.close(fig)
-    print(f"Chart saved: {path4}")
+    # Table 4: Sequential GEMM Time (ms)
+    print(f"\n  Table 4: Sequential GEMM Time (ms, avg)")
+    print(f"  {sep}")
+    print(f"  {'Size':>8s} | {'SDMA copy':>10s} | {'SDMA no-copy':>12s} | {'RCCL':>10s}")
+    print(f"  {sep}")
+    for r in results:
+        sz = f"{r['size_mb']:>6d} MB"
+        c = _ms(r, "sdma_copy_gemm_avg")
+        nc = _ms(r, "sdma_nocopy_gemm_avg")
+        rc = _ms(r, "rccl_gemm_avg")
+        print(f"  {sz:>8s} | {c:>10s} | {nc:>12s} | {rc:>10s}")
+    print(f"  {sep}")
+    print()
 
 
 def main():
