@@ -625,9 +625,6 @@ def _test_gemm_overlap_comparison(
                 with torch.cuda.stream(stream_gemm):
                     C = _run_gemm()
                 ev_g_e_list[s].record(stream_gemm)
-
-            # Enqueue all ars on stream_ar: each ar[s] waits for gemm[s]
-            for s in range(num_stages):
                 stream_ar.wait_event(ev_g_e_list[s])
                 ev_ar_s_list[s].record(stream_ar)
                 with torch.cuda.stream(stream_ar):
