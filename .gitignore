@@ -11,8 +11,10 @@ dist/*
 .pytest_cache
 __pycache__
 python/mori/_version.py
-python/mori/_jit_sources/
+python/mori/_jit-sources/
 python/mori/*.so
+python/mori/umbp_master
+python/mori/spdk_proxy
 
 .vscode
 *.log

@@ -29,7 +29,6 @@ from setuptools import Extension, find_packages, setup
 from setuptools.command.build import build as _build
 from setuptools.command.build_ext import build_ext
 
-
 _supported_arch_list = ["gfx942", "gfx950"]
 
 _REQUIRED_SYSTEM_DEPS: list = []
@@ -231,11 +230,11 @@ def _get_gpu_archs() -> str:
 def _copy_jit_sources(root_dir: Path) -> None:
     """Copy JIT-required source files into the package for wheel distribution.
 
-    This creates python/mori/_jit_sources/ with the same directory structure
+    This creates python/mori/_jit-sources/ with the same directory structure
     as the repo root, so that get_mori_source_root() can use it as a drop-in
     replacement when the original source tree is not available.
     """
-    jit_dir = root_dir / "python" / "mori" / "_jit_sources"
+    jit_dir = root_dir / "python" / "mori" / "_jit-sources"
     if jit_dir.exists():
         shutil.rmtree(jit_dir)
 
@@ -515,14 +514,14 @@ mori_package_data = [
     "libmori_application.so",
     "spdk_proxy",
     "umbp_master",
-    "_jit_sources/include/**/*.hpp",
-    "_jit_sources/include/**/*.h",
-    "_jit_sources/src/**/*.hip",
-    "_jit_sources/src/**/*.hpp",
-    "_jit_sources/src/**/*.cpp",
-    "_jit_sources/src/**/*.h",
-    "_jit_sources/3rdparty/**/*.h",
-    "_jit_sources/3rdparty/**/*.hpp",
+    "_jit-sources/include/**/*.hpp",
+    "_jit-sources/include/**/*.h",
+    "_jit-sources/src/**/*.hip",
+    "_jit-sources/src/**/*.hpp",
+    "_jit-sources/src/**/*.cpp",
+    "_jit-sources/src/**/*.h",
+    "_jit-sources/3rdparty/**/*.h",
+    "_jit-sources/3rdparty/**/*.hpp",
 ]
 if _env_flag("BUILD_UMBP", "OFF"):
     mori_package_data.append("spdk_proxy")

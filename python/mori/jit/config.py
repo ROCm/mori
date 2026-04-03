@@ -292,7 +292,7 @@ def get_mori_source_root() -> Path | None:
 
     Search order:
       1. Development / editable install: repo root (3 levels up from this file)
-      2. Wheel install: _jit_sources/ packaged inside the mori package
+      2. Wheel install: _jit-sources/ packaged inside the mori package
     """
     here = Path(__file__).resolve().parent  # python/mori/jit/
 
@@ -302,7 +302,7 @@ def get_mori_source_root() -> Path | None:
     ).is_dir():
         return candidate
 
-    packaged = here.parent / "_jit_sources"  # mori/_jit_sources/
+    packaged = here.parent / "_jit-sources"  # mori/_jit-sources/
     if (packaged / "include" / "mori").is_dir():
         return packaged
 
