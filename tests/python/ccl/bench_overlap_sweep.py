@@ -73,6 +73,7 @@ def _bench_overlap_one(launch_ar, prep_fn, run_gemm, stream_ar, stream_gemm,
         torch.cuda.synchronize()
         prep_fn()
         torch.cuda.synchronize()
+        dist.barrier()
         if time_ar_wall:
             t0 = time.perf_counter()
             launch_ar()
@@ -103,6 +104,7 @@ def _bench_overlap_one(launch_ar, prep_fn, run_gemm, stream_ar, stream_gemm,
         torch.cuda.synchronize()
         prep_fn()
         torch.cuda.synchronize()
+        dist.barrier()
         ov_s.record()
         with torch.cuda.stream(stream_ar):
             launch_ar()
