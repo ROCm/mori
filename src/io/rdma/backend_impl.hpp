@@ -76,6 +76,7 @@ class RdmaManager {
   std::optional<EpPair> GetEpPairByQpn(uint32_t qpn);
 
   application::RdmaDeviceContext* GetRdmaDeviceContext(int devId);
+  const application::ActiveDevicePortList& GetAvailDevices() const { return availDevices; }
 
   // Endpoint enumeration
   using EnumerateEpCallbackFunc = std::function<void(int qpn, const EpPair& ep)>;
@@ -251,6 +252,7 @@ class RdmaBackend : public Backend {
                       bool isRead);
   BackendSession* CreateSession(const MemoryDesc& local, const MemoryDesc& remote);
   bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id, TransferStatus* status);
+  size_t GetMaxMemoryRegionSize() const override;
 
  private:
   void CreateSession(const MemoryDesc& local, const MemoryDesc& remote, RdmaBackendSession& sess);

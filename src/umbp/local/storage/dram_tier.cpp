@@ -77,19 +77,66 @@ DRAMTier::~DRAMTier() {
   }
 }
 
+void DRAMTier::SetAlignmentBoundary(size_t boundary) {
+  std::lock_guard<std::mutex> lock(mu_);
+  alignment_boundary_ = boundary;
+}
+
 size_t DRAMTier::Allocate(size_t size) {
+  // Fast reject: a single block cannot exceed one chunk.
+  if (alignment_boundary_ > 0 && size > alignment_boundary_) {
+    return static_cast<size_t>(-1);
+  }
+
   // First-fit allocation
   for (auto it = free_list_.begin(); it != free_list_.end(); ++it) {
-    if (it->size >= size) {
-      size_t offset = it->offset;
-      if (it->size == size) {
-        free_list_.erase(it);
-      } else {
-        it->offset += size;
-        it->size -= size;
+    if (it->size < size) continue;
+
+    size_t offset = it->offset;
+
+    // Check whether this allocation would cross an alignment boundary.
+    if (alignment_boundary_ > 0) {
+      size_t chunk_end = ((offset / alignment_boundary_) + 1) * alignment_boundary_;
+      if (offset + size > chunk_end) {
+        // Would cross boundary — try allocating from the next boundary.
+        size_t aligned_start = chunk_end;
+        size_t block_end = it->offset + it->size;
+        if (aligned_start + size > block_end) {
+          continue;  // Not enough space after alignment in this free block.
+        }
+        // Split:
+        //   [it->offset, aligned_start)           → keep as free (front waste)
+        //   [aligned_start, aligned_start + size)  → allocate
+        //   [aligned_start + size, block_end)      → keep as free (tail)
+        size_t front_waste = aligned_start - it->offset;
+        size_t tail_size = block_end - (aligned_start + size);
+
+        if (front_waste > 0) {
+          it->size = front_waste;  // shrink current block to front waste
+          if (tail_size > 0) {
+            free_list_.insert(std::next(it), {aligned_start + size, tail_size});
+          }
+        } else {
+          // front_waste == 0: offset is exactly at a boundary
+          if (tail_size > 0) {
+            it->offset = aligned_start + size;
+            it->size = tail_size;
+          } else {
+            free_list_.erase(it);
+          }
+        }
+        return aligned_start;
       }
-      return offset;
     }
+
+    // Normal path: allocation does not cross a boundary (or no boundary set).
+    if (it->size == size) {
+      free_list_.erase(it);
+    } else {
+      it->offset += size;
+      it->size -= size;
+    }
+    return offset;
   }
   return static_cast<size_t>(-1);  // Allocation failed
 }

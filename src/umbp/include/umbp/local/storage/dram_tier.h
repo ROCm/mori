@@ -74,6 +74,11 @@ class DRAMTier : public TierBackend {
   // Returns the byte offset of a key's slot, or nullopt if not found.
   std::optional<size_t> GetSlotOffset(const std::string& key) const;
 
+  // Set an alignment boundary for the offset allocator.  When set,
+  // Allocate() guarantees no returned slot crosses a multiple of this
+  // boundary.  Must be called before any allocation.
+  void SetAlignmentBoundary(size_t boundary);
+
  private:
   void* base_ptr_;  // mmap base address
   size_t capacity_;
@@ -101,6 +106,7 @@ class DRAMTier : public TierBackend {
   std::list<FreeBlock> free_list_;
 
   mutable std::mutex mu_;
+  size_t alignment_boundary_ = 0;  // 0 = disabled
 
   size_t Allocate(size_t size);                 // Allocate from free_list_
   void Deallocate(size_t offset, size_t size);  // Return to free_list_

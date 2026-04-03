@@ -21,6 +21,7 @@
 // SOFTWARE.
 #include "umbp/local/umbp_client.h"
 
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -61,6 +62,13 @@ UMBPClient::UMBPClient(const UMBPConfig& config)
     pc_config.io_engine_port = dist.io_engine_port;
     pc_config.staging_buffer_size = dist.staging_buffer_size;
     pc_config.peer_service_port = dist.peer_service_port;
+    pc_config.max_mr_chunk_size = dist.max_mr_chunk_size;
+    // Allow env var override (distributed config is set programmatically,
+    // not via FromEnvironment(), so we read the env var here).
+    const char* env_chunk = std::getenv("UMBP_MAX_MR_CHUNK_SIZE");
+    if (env_chunk) {
+      pc_config.max_mr_chunk_size = static_cast<size_t>(std::stoull(env_chunk));
+    }
 
     // Export DramTier buffer so PoolClient registers it with the master at
     // Init() time, enabling remote RDMA reads into this node's DRAM.
@@ -92,6 +100,17 @@ UMBPClient::UMBPClient(const UMBPConfig& config)
 
   // Register DRAM for local zero-copy RDMA and install tier-change callback.
   if (pool_client_) {
+    // Propagate chunk metadata so that the DRAMTier allocator and
+    // LocalStorageManager produce chunk-aware location_ids.
+    dram_chunk_size_ = pool_client_->DramChunkSize();
+    if (dram_chunk_size_ > 0 && dram_chunk_size_ != SIZE_MAX) {
+      auto* dram_for_align = storage_.GetTierAs<DRAMTier>(StorageTier::CPU_DRAM);
+      if (dram_for_align) {
+        dram_for_align->SetAlignmentBoundary(dram_chunk_size_);
+      }
+      storage_.SetDramChunkSize(dram_chunk_size_);
+    }
+
     auto* dram = storage_.GetTierAs<DRAMTier>(StorageTier::CPU_DRAM);
     if (dram) {
       auto [used, total] = storage_.Capacity(StorageTier::CPU_DRAM);
@@ -152,7 +171,15 @@ void UMBPClient::MaybePublishLocal(const std::string& key, size_t size) {
   if (!dram) return;
   auto offset = dram->GetSlotOffset(key);
   if (!offset) return;
-  std::string location_id = "0:" + std::to_string(*offset);
+
+  std::string location_id;
+  if (dram_chunk_size_ > 0 && dram_chunk_size_ != SIZE_MAX) {
+    uint32_t chunk_idx = static_cast<uint32_t>(*offset / dram_chunk_size_);
+    uint64_t chunk_offset = *offset % dram_chunk_size_;
+    location_id = std::to_string(chunk_idx) + ":" + std::to_string(chunk_offset);
+  } else {
+    location_id = "0:" + std::to_string(*offset);
+  }
   pool_client_->PublishLocalBlock(key, size, location_id, TierType::DRAM);
 }
 

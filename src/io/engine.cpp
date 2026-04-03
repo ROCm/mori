@@ -468,5 +468,13 @@ bool IOEngine::PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
   return false;
 }
 
+size_t IOEngine::GetMaxMemoryRegionSize() const {
+  size_t min_size = SIZE_MAX;
+  for (const auto& [type, be] : backends) {
+    min_size = std::min(min_size, be->GetMaxMemoryRegionSize());
+  }
+  return min_size;
+}
+
 }  // namespace io
 }  // namespace mori

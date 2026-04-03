@@ -228,7 +228,6 @@ size_t ClientRegistry::UnregisterClient(const std::string& node_id) {
 // PA-3 fix: exclusive lock because we mutate last_heartbeat and tier_capacities
 ClientStatus ClientRegistry::Heartbeat(const std::string& node_id,
                                        const std::map<TierType, TierCapacity>& tier_capacities) {
-  (void)tier_capacities;
   std::unique_lock lock(mutex_);
   auto it = clients_.find(node_id);
   if (it == clients_.end()) {
@@ -238,6 +237,11 @@ ClientStatus ClientRegistry::Heartbeat(const std::string& node_id,
 
   it->second.last_heartbeat = std::chrono::steady_clock::now();
   it->second.status = ClientStatus::ALIVE;
+
+  // Update tier capacities reported by the client.
+  for (const auto& [tier, cap] : tier_capacities) {
+    it->second.tier_capacities[tier] = cap;
+  }
 
   return ClientStatus::ALIVE;
 }
