@@ -319,9 +319,7 @@ def _worker(rank, world_size, port, sizes_mb, iterations, warmup,
             dist.barrier()
             results.append(row)
 
-        del ar_copy, ar_nocopy
-
-        # rank 0 saves results and generates charts
+        # rank 0 saves results and prints tables before cleanup
         if rank == 0:
             os.makedirs(output_dir, exist_ok=True)
             json_path = os.path.join(output_dir, "overlap_sweep.json")
@@ -332,6 +330,9 @@ def _worker(rank, world_size, port, sizes_mb, iterations, warmup,
             _save_csv(results, output_dir)
             _print_summary_tables(results, gemm_m, gemm_n, gemm_k)
 
+        torch.cuda.synchronize()
+        dist.barrier()
+        del ar_copy, ar_nocopy
         torch.cuda.synchronize()
         dist.barrier()
         shmem.shmem_finalize()
