@@ -87,15 +87,44 @@ bool PoolClient::Init() {
     staging_mem_ = io_engine_->RegisterMemory(staging_buffer_.get(), config_.staging_buffer_size,
                                               -1, mori::io::MemoryLocationType::CPU);
 
+    // Determine effective chunk size for DRAM MR registration.
+    size_t device_max_mr = io_engine_->GetMaxMemoryRegionSize();
+    size_t effective_chunk = config_.max_mr_chunk_size > 0
+                                 ? std::min(config_.max_mr_chunk_size, device_max_mr)
+                                 : device_max_mr;
+    // Align to system page size.
+    size_t page_size = static_cast<size_t>(sysconf(_SC_PAGE_SIZE));
+    if (effective_chunk != SIZE_MAX && effective_chunk > page_size) {
+      effective_chunk = (effective_chunk / page_size) * page_size;
+    }
+    // If effective_chunk covers all buffers, normalize to SIZE_MAX (no chunking).
+    size_t max_buffer_size = 0;
     for (const auto& dram : config_.dram_buffers) {
-      if (dram.buffer && dram.size > 0) {
-        auto mem = io_engine_->RegisterMemory(dram.buffer, dram.size, -1,
+      max_buffer_size = std::max(max_buffer_size, dram.size);
+    }
+    if (effective_chunk >= max_buffer_size) {
+      effective_chunk = SIZE_MAX;
+    }
+    dram_chunk_size_ = effective_chunk;
+
+    if (dram_chunk_size_ != SIZE_MAX) {
+      MORI_UMBP_INFO("[PoolClient] DRAM MR chunk size: {} bytes (device_max={}, config={})",
+                     dram_chunk_size_, device_max_mr, config_.max_mr_chunk_size);
+    }
+
+    // Register DRAM buffers, splitting into chunks if needed.
+    for (const auto& dram : config_.dram_buffers) {
+      if (!dram.buffer || dram.size == 0) continue;
+      size_t chunk = (dram_chunk_size_ != SIZE_MAX) ? dram_chunk_size_ : dram.size;
+      for (size_t off = 0; off < dram.size; off += chunk) {
+        size_t sz = std::min(chunk, dram.size - off);
+        auto mem = io_engine_->RegisterMemory(static_cast<char*>(dram.buffer) + off, sz, -1,
                                               mori::io::MemoryLocationType::CPU);
         export_dram_mems_.push_back(mem);
       }
     }
 
-    MORI_UMBP_INFO("[PoolClient] IOEngine initialized on {}:{} ({} DRAM buffers)",
+    MORI_UMBP_INFO("[PoolClient] IOEngine initialized on {}:{} ({} DRAM MR chunks)",
                    config_.io_engine_host, config_.io_engine_port, export_dram_mems_.size());
   }
 
@@ -112,7 +141,7 @@ bool PoolClient::Init() {
       msgpack::sbuffer mbuf;
       msgpack::pack(mbuf, export_dram_mems_[i]);
       dram_memory_desc_bytes_list.emplace_back(mbuf.data(), mbuf.data() + mbuf.size());
-      dram_buffer_sizes.push_back(config_.dram_buffers[i].size);
+      dram_buffer_sizes.push_back(export_dram_mems_[i].size);
     }
   }
 
@@ -214,20 +243,32 @@ bool PoolClient::RegisterMemory(void* ptr, size_t size) {
     MORI_UMBP_ERROR("[PoolClient] RegisterMemory: IOEngine not available");
     return false;
   }
-  auto mem_desc = io_engine_->RegisterMemory(ptr, size, -1, mori::io::MemoryLocationType::CPU);
+  // Split into chunks matching dram_chunk_size_ to stay within MR limits.
+  size_t chunk = (dram_chunk_size_ != 0 && dram_chunk_size_ != SIZE_MAX) ? dram_chunk_size_ : size;
   std::lock_guard<std::mutex> lock(registered_mem_mutex_);
-  registered_regions_.push_back({ptr, size, mem_desc});
-  MORI_UMBP_INFO("[PoolClient] RegisterMemory: ptr={}, size={}", ptr, size);
+  size_t num_chunks = 0;
+  for (size_t off = 0; off < size; off += chunk) {
+    size_t sz = std::min(chunk, size - off);
+    auto mem_desc = io_engine_->RegisterMemory(static_cast<char*>(ptr) + off, sz, -1,
+                                               mori::io::MemoryLocationType::CPU);
+    registered_regions_.push_back({static_cast<char*>(ptr) + off, sz, mem_desc, ptr});
+    ++num_chunks;
+  }
+  MORI_UMBP_INFO("[PoolClient] RegisterMemory: ptr={}, size={}, chunks={}", ptr, size, num_chunks);
   return true;
 }
 
 void PoolClient::DeregisterMemory(void* ptr) {
   std::lock_guard<std::mutex> lock(registered_mem_mutex_);
-  auto it = std::find_if(registered_regions_.begin(), registered_regions_.end(),
-                         [ptr](const RegisteredRegion& r) { return r.base == ptr; });
-  if (it != registered_regions_.end()) {
-    if (io_engine_) io_engine_->DeregisterMemory(it->mem_desc);
-    registered_regions_.erase(it);
+  // Remove all chunk entries belonging to the same original RegisterMemory() call.
+  auto it = registered_regions_.begin();
+  while (it != registered_regions_.end()) {
+    if (it->group_base == ptr) {
+      if (io_engine_) io_engine_->DeregisterMemory(it->mem_desc);
+      it = registered_regions_.erase(it);
+    } else {
+      ++it;
+    }
   }
 }
 
