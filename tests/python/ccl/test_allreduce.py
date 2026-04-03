@@ -483,10 +483,16 @@ def _print_overlap_summary(
         seq_sum = g_ar[2] + g_gm[2]
         print(f"\n--- GEMM overlap: {label} ---")
         print(f"  Data (allreduce): {data_bytes / (1024**2):.2f} MB per rank")
-        print(f"  Sequential allreduce avg : {g_ar[2] * 1000:.3f} ms (min {g_ar[0]*1000:.3f})")
-        print(f"  Sequential GEMM avg      : {g_gm[2] * 1000:.3f} ms (min {g_gm[0]*1000:.3f})")
+        print(
+            f"  Sequential allreduce avg : {g_ar[2] * 1000:.3f} ms (min {g_ar[0]*1000:.3f})"
+        )
+        print(
+            f"  Sequential GEMM avg      : {g_gm[2] * 1000:.3f} ms (min {g_gm[0]*1000:.3f})"
+        )
         print(f"  Sum (sequential bound)   : {seq_sum * 1000:.3f} ms")
-        print(f"  Overlap wall avg         : {g_ov[2] * 1000:.3f} ms (min {g_ov[0]*1000:.3f})")
+        print(
+            f"  Overlap wall avg         : {g_ov[2] * 1000:.3f} ms (min {g_ov[0]*1000:.3f})"
+        )
         if seq_sum > 0:
             print(f"  Overlap vs sequential sum: {g_ov[2] / seq_sum:.3f}x")
 
@@ -507,6 +513,7 @@ def _test_gemm_overlap_comparison(
     gemm_m=_GEMM_M_DEFAULT,
     gemm_n=_GEMM_N_DEFAULT,
     gemm_k=_GEMM_K_DEFAULT,
+    num_stages=2,
 ):
     """SDMA (copy True/False) vs RCCL allreduce overlapped with torch.matmul.
 
@@ -571,13 +578,15 @@ def _test_gemm_overlap_comparison(
             torch.cuda.synchronize()
             if time_ar_with_wall:
                 t0 = time.perf_counter()
-                launch_ar()
+                for _ in range(num_stages):
+                    launch_ar()
                 torch.cuda.synchronize()
                 t_ar = time.perf_counter() - t0
             else:
                 ev_ar_s.record(stream_ar)
                 with torch.cuda.stream(stream_ar):
-                    launch_ar()
+                    for _ in range(num_stages):
+                        launch_ar()
                 ev_ar_e.record(stream_ar)
                 stream_ar.synchronize()
                 t_ar = ev_ar_s.elapsed_time(ev_ar_e) / 1000.0
@@ -588,7 +597,8 @@ def _test_gemm_overlap_comparison(
             torch.cuda.synchronize()
             ev_g_s.record(stream_gemm)
             with torch.cuda.stream(stream_gemm):
-                C = _run_gemm()
+                for _ in range(num_stages):
+                    C = _run_gemm()
             ev_g_e.record(stream_gemm)
             stream_gemm.synchronize()
             t_g = ev_g_s.elapsed_time(ev_g_e) / 1000.0
@@ -597,19 +607,33 @@ def _test_gemm_overlap_comparison(
             elif rank == 0:
                 _ = C.sum().item()
 
+        # Per-stage events for overlap timing and cross-stream dependencies
+        ev_g_s_list = [torch.cuda.Event(enable_timing=True) for _ in range(num_stages)]
+        ev_g_e_list = [torch.cuda.Event(enable_timing=True) for _ in range(num_stages)]
+        ev_ar_s_list = [torch.cuda.Event(enable_timing=True) for _ in range(num_stages)]
+        ev_ar_e_list = [torch.cuda.Event(enable_timing=True) for _ in range(num_stages)]
+
         for i in range(total_iters):
             torch.cuda.synchronize()
             prep_ar()
             torch.cuda.synchronize()
             ov_s.record()
-            ev_ar_s.record(stream_ar)
-            with torch.cuda.stream(stream_ar):
-                launch_ar()
-            ev_ar_e.record(stream_ar)
-            ev_g_s.record(stream_gemm)
-            with torch.cuda.stream(stream_gemm):
-                C = _run_gemm()
-            ev_g_e.record(stream_gemm)
+
+            # Enqueue all gemms on stream_gemm back-to-back
+            for s in range(num_stages):
+                ev_g_s_list[s].record(stream_gemm)
+                with torch.cuda.stream(stream_gemm):
+                    C = _run_gemm()
+                ev_g_e_list[s].record(stream_gemm)
+
+            # Enqueue all ars on stream_ar: each ar[s] waits for gemm[s]
+            for s in range(num_stages):
+                stream_ar.wait_event(ev_g_e_list[s])
+                ev_ar_s_list[s].record(stream_ar)
+                with torch.cuda.stream(stream_ar):
+                    launch_ar()
+                ev_ar_e_list[s].record(stream_ar)
+
             stream_ar.synchronize()
             stream_gemm.synchronize()
             ov_e.record()
@@ -627,7 +651,9 @@ def _test_gemm_overlap_comparison(
 
     if rank == 0:
         print(f"\n>>> Test 5: GEMM overlap (torch.matmul {gemm_m}x{gemm_k}x{gemm_n})")
-        print("    Compare SDMA allreduce vs RCCL with concurrent GEMM on another stream")
+        print(
+            "    Compare SDMA allreduce vs RCCL with concurrent GEMM on another stream"
+        )
 
     torch.cuda.synchronize()
     dist.barrier()
@@ -740,6 +766,7 @@ def _test_allreduce(
     gemm_m=_GEMM_M_DEFAULT,
     gemm_n=_GEMM_N_DEFAULT,
     gemm_k=_GEMM_K_DEFAULT,
+    num_stages=2,
 ):
     """Worker function for each process."""
 
@@ -847,6 +874,7 @@ def _test_allreduce(
                 gemm_m=gemm_m,
                 gemm_n=gemm_n,
                 gemm_k=gemm_k,
+                num_stages=num_stages,
             )
             all_ok = all_ok and ok5
 
@@ -894,6 +922,7 @@ def test_allreduce(
     gemm_m=_GEMM_M_DEFAULT,
     gemm_n=_GEMM_N_DEFAULT,
     gemm_k=_GEMM_K_DEFAULT,
+    num_stages=2,
 ):
     """Run AllReduce SDMA test."""
     os.environ.setdefault("MORI_ENABLE_SDMA", "1")
@@ -911,6 +940,7 @@ def test_allreduce(
             gemm_m,
             gemm_n,
             gemm_k,
+            num_stages,
         ),
         nprocs=world_size,
         join=True,
@@ -963,6 +993,12 @@ if __name__ == "__main__":
         default=_GEMM_K_DEFAULT,
         help="GEMM K dimension for overlap test",
     )
+    parser.add_argument(
+        "--num-stages",
+        type=int,
+        default=2,
+        help="Number of pipelined gemm+ar stages for overlap test",
+    )
     args = parser.parse_args()
     os.environ["MORI_ENABLE_SDMA"] = str(args.enable_sdma)
 
@@ -980,6 +1016,7 @@ if __name__ == "__main__":
         print(
             f"  GEMM size       : {args.gemm_m}x{args.gemm_k}x{args.gemm_n} (torch.matmul)"
         )
+        print(f"  Num stages      : {args.num_stages}")
     print("-" * 60)
 
     test_allreduce(
@@ -992,4 +1029,5 @@ if __name__ == "__main__":
         gemm_m=args.gemm_m,
         gemm_n=args.gemm_n,
         gemm_k=args.gemm_k,
+        num_stages=args.num_stages,
     )
