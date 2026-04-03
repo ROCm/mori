@@ -20,6 +20,12 @@ import sys
 import time
 import json
 import argparse
+from pathlib import Path
+
+# Allow running as `python tests/python/ccl/bench_overlap_sweep.py` from project root
+_project_root = str(Path(__file__).resolve().parents[3])
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
 
 import numpy as np
 import torch
