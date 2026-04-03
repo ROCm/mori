@@ -150,6 +150,9 @@ AllreduceSdma<T>::~AllreduceSdma() {
   if (async_in_progress_) {
     cancel_async();
   }
+  // Drain all GPU work (including in-flight SDMA transfers) before
+  // ShmemDeleter frees the symmetric memory regions they reference.
+  hipDeviceSynchronize();
   if (flags_) {
     printf("AllreduceSdma destroyed: PE %d\n", myPe_);
   }
