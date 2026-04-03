@@ -100,7 +100,7 @@ __global__ void ScatterSdmaOnlyKernel(
     HSAuint64* sig = dstMemObj->signalPtrs
         + static_cast<size_t>(sender) * numQ;
     while (core::AtomicLoadRelaxed(sig) < expected)
-      ;
+      __builtin_amdgcn_s_sleep(1);
   }
 }
 
@@ -208,7 +208,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
             HSAuint64* sig = dstMemObj->signalPtrs
                 + static_cast<size_t>(sender) * numQ;
             while (core::AtomicLoadRelaxed(sig) < expected)
-              ;
+              __builtin_amdgcn_s_sleep(1);
           }
         }
         if (threadIdx.x < static_cast<unsigned>(npes)) {
@@ -312,7 +312,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
             while (__scoped_atomic_load_n(
                        &barrier->chunks_complete,
                        __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) < ccTarget)
-              ;
+              __builtin_amdgcn_s_sleep(1);
 
             const size_t cOff = static_cast<size_t>(c) * chunkBytes;
             size_t agBytes = chunkBytes;
@@ -334,7 +334,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
           HSAuint64* sig = dstMemObj->signalPtrs
               + static_cast<size_t>(sender) * numQ + 1;
           while (core::AtomicLoadRelaxed(sig) < expected)
-            ;
+            __builtin_amdgcn_s_sleep(1);
         }
       } else {
         if (thr < npes && thr != myPe) {
@@ -349,7 +349,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
           while (__scoped_atomic_load_n(
                      &barrier->chunks_complete,
                      __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) < ccTarget)
-            ;
+            __builtin_amdgcn_s_sleep(1);
 
           uint8_t* src = reinterpret_cast<uint8_t*>(dstMemObj->localPtr)
               + static_cast<size_t>(myPe) * totalShardBytes;
@@ -364,7 +364,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
           HSAuint64* sig = dstMemObj->signalPtrs
               + static_cast<size_t>(sender) * numQ + 1;
           while (core::AtomicLoadRelaxed(sig) < expected)
-            ;
+            __builtin_amdgcn_s_sleep(1);
         }
 
       }
@@ -400,7 +400,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
               s_gather_count * static_cast<uint32_t>(gridDim.x - 1);
           while (__scoped_atomic_load_n(&barrier->ag_sync,
                                         __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) < target)
-            ;
+            __builtin_amdgcn_s_sleep(1);
         }
       }
       __syncthreads();
@@ -452,7 +452,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
         HSAuint64* sig = dstMemObj->signalPtrs
             + static_cast<size_t>(sender) * numQ + 1;
         while (core::AtomicLoadRelaxed(sig) < expected)
-          ;
+          __builtin_amdgcn_s_sleep(1);
       }
     }
   }
