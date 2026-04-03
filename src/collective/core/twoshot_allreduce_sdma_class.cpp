@@ -468,7 +468,11 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             if (scatter_mode == 1) {
                 chunk_elems = total_count;
             } else {
-                constexpr int    kTargetChunks      = 2;
+                int kTargetChunks = 2;
+                if (const char* e = getenv("MORI_PIPELINE_CHUNKS")) {
+                    int v = atoi(e);
+                    if (v >= 1 && v <= 16) kTargetChunks = v;
+                }
                 constexpr size_t kMinChunkShardBytes = 8ULL * 1024 * 1024;
                 const size_t shard_bytes =
                     (total_count / npes_) * dtype_size_;
