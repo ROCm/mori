@@ -29,9 +29,9 @@ Tests four modes (always):
   3. RCCL out-of-place (torch.distributed.all_reduce, copy + reduce)
   4. RCCL in-place     (torch.distributed.all_reduce, refill + reduce)
 
-Optional (--test-gemm-overlap): overlap wall time vs torch.matmul GEMM on a second
-stream, comparing SDMA allreduce (copy_output_to_user True and False) vs RCCL.
-Correctness is not checked in this phase (Tests 1–4 already cover it); only timing.
+Optional (--test-gemm-overlap): on two streams, N GEMMs (events after each) then
+N ARs each waiting on the matching GEMM; sequential timings use N GEMMs / N ARs per
+iteration. SDMA vs RCCL. N = _OVERLAP_CHAIN_STEPS (default 4).
 """
 
 import os
@@ -451,6 +451,9 @@ _GEMM_M_DEFAULT = 4096
 _GEMM_N_DEFAULT = 4096
 _GEMM_K_DEFAULT = 4096
 
+# Test 5: GEMM stream records event after each matmul; AR stream waits then launches AR.
+_OVERLAP_CHAIN_STEPS = 4
+
 
 def _print_overlap_summary(
     rank, npes, label, seq_ar, seq_gemm, overlap_times, data_bytes
@@ -508,12 +511,13 @@ def _test_gemm_overlap_comparison(
     gemm_n=_GEMM_N_DEFAULT,
     gemm_k=_GEMM_K_DEFAULT,
 ):
-    """SDMA (copy True/False) vs RCCL allreduce overlapped with torch.matmul.
-
-    No payload correctness checks here (Tests 1–4); only launch success and timing.
+    """SDMA (copy True/False) vs RCCL: N GEMMs on one stream, N ARs on the other
+    with CUDA event deps (GEMM i finishes → AR i starts). Same N for sequential baselines.
     """
+    n = _OVERLAP_CHAIN_STEPS
     stream_ar = torch.cuda.Stream(device=device)
     stream_gemm = torch.cuda.Stream(device=device)
+    ev_after_gemm = [torch.cuda.Event(blocking=False) for _ in range(n)]
     rccl_dtype = _RCCL_DTYPE_MAP.get(dtype, torch.float32)
     rccl_fill = (
         float(fill_value)
@@ -567,17 +571,20 @@ def _test_gemm_overlap_comparison(
 
         for i in range(total_iters):
             torch.cuda.synchronize()
-            prep_ar()
+            for _ in range(n):
+                prep_ar()
             torch.cuda.synchronize()
             if time_ar_with_wall:
                 t0 = time.perf_counter()
-                launch_ar()
+                for _ in range(n):
+                    launch_ar()
                 torch.cuda.synchronize()
                 t_ar = time.perf_counter() - t0
             else:
                 ev_ar_s.record(stream_ar)
                 with torch.cuda.stream(stream_ar):
-                    launch_ar()
+                    for _ in range(n):
+                        launch_ar()
                 ev_ar_e.record(stream_ar)
                 stream_ar.synchronize()
                 t_ar = ev_ar_s.elapsed_time(ev_ar_e) / 1000.0
@@ -588,7 +595,9 @@ def _test_gemm_overlap_comparison(
             torch.cuda.synchronize()
             ev_g_s.record(stream_gemm)
             with torch.cuda.stream(stream_gemm):
-                C = _run_gemm()
+                C = None
+                for _ in range(n):
+                    C = _run_gemm()
             ev_g_e.record(stream_gemm)
             stream_gemm.synchronize()
             t_g = ev_g_s.elapsed_time(ev_g_e) / 1000.0
@@ -599,17 +608,17 @@ def _test_gemm_overlap_comparison(
 
         for i in range(total_iters):
             torch.cuda.synchronize()
-            prep_ar()
+            for _ in range(n):
+                prep_ar()
             torch.cuda.synchronize()
             ov_s.record()
-            ev_ar_s.record(stream_ar)
-            with torch.cuda.stream(stream_ar):
-                launch_ar()
-            ev_ar_e.record(stream_ar)
-            ev_g_s.record(stream_gemm)
-            with torch.cuda.stream(stream_gemm):
-                C = _run_gemm()
-            ev_g_e.record(stream_gemm)
+            for k in range(n):
+                with torch.cuda.stream(stream_gemm):
+                    C = _run_gemm()
+                    ev_after_gemm[k].record(stream_gemm)
+                with torch.cuda.stream(stream_ar):
+                    stream_ar.wait_event(ev_after_gemm[k])
+                    launch_ar()
             stream_ar.synchronize()
             stream_gemm.synchronize()
             ov_e.record()
@@ -626,8 +635,10 @@ def _test_gemm_overlap_comparison(
         )
 
     if rank == 0:
-        print(f"\n>>> Test 5: GEMM overlap (torch.matmul {gemm_m}x{gemm_k}x{gemm_n})")
-        print("    Compare SDMA allreduce vs RCCL with concurrent GEMM on another stream")
+        print(
+            f"\n>>> Test 5: overlap — {n} GEMMs (stream GEMM) → {n} ARs (stream AR), "
+            f"torch.matmul {gemm_m}x{gemm_k}x{gemm_n}"
+        )
 
     torch.cuda.synchronize()
     dist.barrier()
@@ -660,7 +671,7 @@ def _test_gemm_overlap_comparison(
         return ok, launch, prep, False
 
     bench_one(
-        f"SDMA allreduce copy_output_to_user=True ({dtype_name}; prep fill_ untimed)",
+        f"SDMA copy=True ({dtype_name}; {n}× chain, prep untimed)",
         setup_sdma_copy_true,
     )
 
@@ -692,7 +703,7 @@ def _test_gemm_overlap_comparison(
         return ok, launch, prep, False
 
     bench_one(
-        f"SDMA allreduce copy_output_to_user=False ({dtype_name}; prep fill_ untimed)",
+        f"SDMA copy=False ({dtype_name}; {n}× chain, prep untimed)",
         setup_sdma_copy_false,
     )
 
@@ -714,7 +725,7 @@ def _test_gemm_overlap_comparison(
 
     rccl_name = str(rccl_dtype).split(".")[-1]
     bench_one(
-        f"RCCL all_reduce only ({dtype_name}→{rccl_name}; prep fill_ untimed)",
+        f"RCCL ({dtype_name}→{rccl_name}; {n}× chain, prep untimed)",
         setup_rccl,
     )
 
@@ -943,7 +954,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--test-gemm-overlap",
         action="store_true",
-        help="Run SDMA vs RCCL allreduce overlap vs torch.matmul (extra benchmark)",
+        help="SDMA vs RCCL: N GEMM→N AR chain on two streams (_OVERLAP_CHAIN_STEPS)",
     )
     parser.add_argument(
         "--gemm-m",

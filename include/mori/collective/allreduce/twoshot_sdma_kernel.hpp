@@ -283,7 +283,7 @@ __global__ void SdmaLocalReduceKernel(int myPe, int npes, const T* __restrict__ 
 // Requirement: gridDim.x <= multiProcessorCount (co-resident blocks).
 //
 // Sync AllreduceSdma::operator() uses SdmaGatherForReduceKernel + SdmaLocalReduceKernel
-// instead to keep SDMA on a 1-block launch; async still uses this fused kernel.
+// instead to keep SDMA scatter on a 1-block launch; async uses this fused kernel.
 // ============================================================================
 template <typename T>
 __global__ void SdmaReduceScatterKernel(int myPe, int npes, const T* __restrict__ input,

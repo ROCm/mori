@@ -223,8 +223,8 @@ bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
       return false;
     }
 
-    // Reduce-scatter as: SDMA gather-for-reduce (1 block) + local reduce (many blocks).
-    // Final result spread by AllGather SDMA. Async API still uses fused SdmaReduceScatterKernel.
+    // Reduce-scatter: SDMA gather-for-reduce (1 block) + local reduce (many blocks).
+    // Then AllGather SDMA (1 block). Async API uses fused SdmaReduceScatterKernel instead.
     constexpr int pack_size = packed_t<T>::P::size;
     int threads = 1024;
     int packedPerRank = static_cast<int>(((total_count / npes_ + pack_size - 1) / pack_size));
@@ -252,7 +252,6 @@ bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
       return false;
     }
 
-    // AllGather via SDMA
     AllGatherSdmaKernel<T><<<1, 512, 0, stream>>>(myPe_, npes_, output_transit_buffer_obj_,
                                                   flagsObj_, barrierPtr_, total_count);
 
