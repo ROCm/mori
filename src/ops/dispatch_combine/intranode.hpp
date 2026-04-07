@@ -144,15 +144,16 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
 
       // Write scales
       if (args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0)) {
-        index_t destScaleOffset = destTokId * config.scaleDim * config.scaleTypeSize;
-        index_t srcScaleOffset = srcTokId * config.scaleDim * config.scaleTypeSize;
+        size_t destScaleOffset = (size_t)destTokId * config.scaleDim * config.scaleTypeSize;
+        size_t srcScaleOffset = (size_t)srcTokId * config.scaleDim * config.scaleTypeSize;
         core::WarpCopy(
             args.shmemOutScalesMemObj->template GetAs<uint8_t*>(destPe) + destScaleOffset,
             args.scalesBuf + srcScaleOffset, config.scaleDim * config.scaleTypeSize);
       }
 
-      index_t srcTokOffset = srcTokId * config.hiddenDim;
-      index_t destTokOffset = destTokId * config.hiddenDim;
+      size_t srcTokOffset = (size_t)srcTokId * config.hiddenDim;
+      size_t destTokOffset = (size_t)destTokId * config.hiddenDim;
+
       core::WarpCopy(args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) + destTokOffset,
                      args.inpTokenBuf + srcTokOffset, config.hiddenDim);
     }
@@ -250,12 +251,13 @@ __device__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       for (int i = globalWarpId; i < totalRecvTokenNum; i += globalWarpNum) {
         if constexpr (!std::is_same_v<T, TokT> && std::is_same_v<TokT, core::CombineInternalFp8>) {
           core::WarpCastBf16ToCombineInternalFp8<T>(
-              args.intraNodeTokBufs.combineInp->template GetAs<TokT*>() + i * config.hiddenDim,
-              args.inpTokenBuf + i * config.hiddenDim, config.hiddenDim, laneId);
+              args.intraNodeTokBufs.combineInp->template GetAs<TokT*>() +
+                  (size_t)i * config.hiddenDim,
+              args.inpTokenBuf + (size_t)i * config.hiddenDim, config.hiddenDim, laneId);
         } else {
           core::WarpCopy(
-              args.intraNodeTokBufs.combineInp->template GetAs<T*>() + i * config.hiddenDim,
-              args.inpTokenBuf + i * config.hiddenDim, config.hiddenDim);
+              args.intraNodeTokBufs.combineInp->template GetAs<T*>() + (size_t)i * config.hiddenDim,
+              args.inpTokenBuf + (size_t)i * config.hiddenDim, config.hiddenDim);
         }
       }
     }
@@ -274,12 +276,12 @@ __device__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       uint8_t* destStagingPtr = args.intraNodeTokBufs.combineInp->template GetAs<uint8_t*>(destPe) +
                                 SendBufSlotOffset(config, myPe, destLocalTokId) * combXferBytes;
       if constexpr (!std::is_same_v<T, TokT> && std::is_same_v<TokT, core::CombineInternalFp8>) {
-        core::WarpCastBf16ToCombineInternalFp8<T>(reinterpret_cast<TokT*>(destStagingPtr),
-                                                  args.inpTokenBuf + tokenIdx * config.hiddenDim,
-                                                  config.hiddenDim, laneId);
+        core::WarpCastBf16ToCombineInternalFp8<T>(
+            reinterpret_cast<TokT*>(destStagingPtr),
+            args.inpTokenBuf + (size_t)tokenIdx * config.hiddenDim, config.hiddenDim, laneId);
       } else {
         core::WarpCopy(reinterpret_cast<T*>(destStagingPtr),
-                       args.inpTokenBuf + tokenIdx * config.hiddenDim, config.hiddenDim);
+                       args.inpTokenBuf + (size_t)tokenIdx * config.hiddenDim, config.hiddenDim);
       }
       if (args.weightsBuf) {
         core::WarpCopy(reinterpret_cast<float*>(destStagingPtr + hiddenBytes),
@@ -319,7 +321,7 @@ __device__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
         if constexpr (UseP2PRead) {
           index_t destLocalTokId = LocalTokIdFromFlatTokenIndex(config, destTokId);
           srcPtrs[j] = args.intraNodeTokBufs.combineInp->template GetAs<TokT*>(destPe) +
-                       destLocalTokId * config.hiddenDim + hiddenDimOffset;
+                       (size_t)destLocalTokId * config.hiddenDim + hiddenDimOffset;
           srcWeightsPtr[j] = args.shmemInpWeightsMemObj->template GetAs<float*>(destPe) +
                              destLocalTokId * config.numExpertPerToken;
         } else {
