@@ -293,10 +293,19 @@ class AllreduceSdma:
                 my_pe, npes, 512 * 1024 * 1024, copy_output_to_user
             )
 
-    def __call__(self, input_data, output_data, count: int, stream=None) -> bool:
-        """Execute out-of-place AllReduce SDMA operation."""
+    def __call__(self, input_data, output_data, count: int, stream=None,
+                 copy_stream=None) -> bool:
+        """Execute out-of-place AllReduce SDMA operation.
+
+        Args:
+            copy_stream: If provided and copy_output_to_user is True,
+                         the D2D copy runs on this separate stream via
+                         hipMemcpyAsync (DMA engine), overlapping with
+                         subsequent work on *stream*.
+        """
         return self._handle(
-            input_data.data_ptr(), output_data.data_ptr(), count, _stream_to_int(stream)
+            input_data.data_ptr(), output_data.data_ptr(), count,
+            _stream_to_int(stream), _stream_to_int(copy_stream)
         )
 
     def allreduce_inplace(self, data, count: int, stream=None) -> bool:

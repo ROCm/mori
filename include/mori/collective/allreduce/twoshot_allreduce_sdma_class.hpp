@@ -90,6 +90,8 @@ class AllreduceSdma {
   uint64_t pipeline_scatter_gen_ = 0;  // total SDMA ATOMIC_INC on qId=0 (serial RS/AG + pipeline scatter)
   uint64_t pipeline_ag_gen_ = 0;       // total SDMA ATOMIC_INC on qId=1 (pipeline AG only)
 
+  hipEvent_t copy_event_ = nullptr;    // cached event for copy_stream synchronization
+
   AllreduceSdma(const AllreduceSdma&) = delete;
   AllreduceSdma& operator=(const AllreduceSdma&) = delete;
 
@@ -118,7 +120,9 @@ class AllreduceSdma {
 
   ~AllreduceSdma();
 
-  bool operator()(T* input, T* output, size_t total_count, hipStream_t stream = nullptr);
+  bool operator()(T* input, T* output, size_t total_count,
+                  hipStream_t stream = nullptr,
+                  hipStream_t copy_stream = nullptr);
 
   /**
    * @brief Start asynchronous AllReduce operation (AllGather PUT phase)
@@ -172,7 +176,8 @@ class AllreduceSdma {
   bool pipelined(T* input, T* output, size_t total_count,
                  size_t chunk_elems = 0, int scatter_mode = 0,
                  hipStream_t stream = nullptr,
-                 bool external_scatter = false);
+                 bool external_scatter = false,
+                 hipStream_t copy_stream = nullptr);
 
   application::SymmMemObjPtr getFlagsObj() const { return flagsObj_; }
   void* getOutputTransitBuffer() const { return output_transit_buffer_; }

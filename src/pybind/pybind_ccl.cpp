@@ -165,12 +165,15 @@ void RegisterMoriCcl(pybind11::module_& m) {
       .def(
           "__call__",
           [](mori::collective::AllreduceSdma<uint32_t>& self, uintptr_t input_ptr,
-             uintptr_t output_ptr, size_t count, int64_t stream) -> bool {
+             uintptr_t output_ptr, size_t count, int64_t stream,
+             int64_t copy_stream) -> bool {
             return self(reinterpret_cast<uint32_t*>(input_ptr),
                         reinterpret_cast<uint32_t*>(output_ptr), count,
-                        reinterpret_cast<hipStream_t>(stream));
+                        reinterpret_cast<hipStream_t>(stream),
+                        reinterpret_cast<hipStream_t>(copy_stream));
           },
-          py::arg("input_ptr"), py::arg("output_ptr"), py::arg("count"), py::arg("stream") = 0)
+          py::arg("input_ptr"), py::arg("output_ptr"), py::arg("count"), py::arg("stream") = 0,
+          py::arg("copy_stream") = 0)
       .def(
           "pipelined",
           [](mori::collective::AllreduceSdma<uint32_t>& self, uintptr_t input_ptr,
@@ -232,11 +235,13 @@ void RegisterMoriCcl(pybind11::module_& m) {
       .def(
           "__call__",
           [](mori::collective::AllreduceSdma<half>& self, uintptr_t input_ptr, uintptr_t output_ptr,
-             size_t count, int64_t stream) -> bool {
+             size_t count, int64_t stream, int64_t copy_stream) -> bool {
             return self(reinterpret_cast<half*>(input_ptr), reinterpret_cast<half*>(output_ptr),
-                        count, reinterpret_cast<hipStream_t>(stream));
+                        count, reinterpret_cast<hipStream_t>(stream),
+                        reinterpret_cast<hipStream_t>(copy_stream));
           },
           py::arg("input_ptr"), py::arg("output_ptr"), py::arg("count"), py::arg("stream") = 0,
+          py::arg("copy_stream") = 0,
           "Execute AllReduce SDMA operation (fp16)")
       .def(
           "allreduce_inplace",
@@ -271,12 +276,14 @@ void RegisterMoriCcl(pybind11::module_& m) {
       .def(
           "__call__",
           [](mori::collective::AllreduceSdma<hip_bfloat16>& self, uintptr_t input_ptr,
-             uintptr_t output_ptr, size_t count, int64_t stream) -> bool {
+             uintptr_t output_ptr, size_t count, int64_t stream, int64_t copy_stream) -> bool {
             return self(reinterpret_cast<hip_bfloat16*>(input_ptr),
                         reinterpret_cast<hip_bfloat16*>(output_ptr), count,
-                        reinterpret_cast<hipStream_t>(stream));
+                        reinterpret_cast<hipStream_t>(stream),
+                        reinterpret_cast<hipStream_t>(copy_stream));
           },
           py::arg("input_ptr"), py::arg("output_ptr"), py::arg("count"), py::arg("stream") = 0,
+          py::arg("copy_stream") = 0,
           "Execute AllReduce SDMA operation (bf16)")
       .def(
           "allreduce_inplace",

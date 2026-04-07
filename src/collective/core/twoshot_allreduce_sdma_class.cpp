@@ -153,6 +153,10 @@ AllreduceSdma<T>::~AllreduceSdma() {
   // Drain all GPU work (including in-flight SDMA transfers) before
   // ShmemDeleter frees the symmetric memory regions they reference.
   hipDeviceSynchronize();
+  if (copy_event_) {
+    hipEventDestroy(copy_event_);
+    copy_event_ = nullptr;
+  }
   if (flags_) {
     printf("AllreduceSdma destroyed: PE %d\n", myPe_);
   }
@@ -268,13 +272,14 @@ void AllreduceSdma<T>::copy_output_to_user(T* output, size_t total_count, hipStr
 // operator()
 // ---------------------------------------------------------------------------
 template <typename T>
-bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count, hipStream_t stream) {
+bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count,
+                                  hipStream_t stream, hipStream_t copy_stream) {
   static const bool fused = []() {
       const char* e = std::getenv("MORI_PIPELINE_FUSED");
       return e && std::atoi(e) == 1;
   }();
   return pipelined(input, output, total_count, 0, 0, stream,
-                   /*external_scatter=*/!fused);
+                   /*external_scatter=*/!fused, copy_stream);
 }
 
 // ================ Async API Implementations ================
@@ -423,7 +428,8 @@ bool AllreduceSdma<T>::allreduce_inplace(T* data, size_t total_count, hipStream_
 template <typename T>
 bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                                  size_t chunk_elems, int scatter_mode,
-                                 hipStream_t stream, bool external_scatter) {
+                                 hipStream_t stream, bool external_scatter,
+                                 hipStream_t copy_stream) {
     try {
         if (total_count == 0) return true;
         if (!output_transit_buffer_) {
@@ -602,7 +608,16 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         }
 
         if (copy_output_to_user_) {
-            copy_output_to_user(output, total_count, stream);
+            if (copy_stream) {
+                if (!copy_event_) {
+                    hipEventCreateWithFlags(&copy_event_, hipEventDisableTiming);
+                }
+                hipEventRecord(copy_event_, stream);
+                hipStreamWaitEvent(copy_stream, copy_event_, 0);
+                copy_output_to_user(output, total_count, copy_stream);
+            } else {
+                copy_output_to_user(output, total_count, stream);
+            }
         }
     } catch (const std::exception& e) {
         fprintf(stderr, "PE %d: PipelinedAllReduce failed: %s\n", myPe_, e.what());
