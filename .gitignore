@@ -21,3 +21,4 @@ python/mori/spdk_proxy
 *.core
 .claude/
 .codex/
+.cache/

@@ -51,5 +51,6 @@ endfunction()
 
 if(WITH_MPI)
   # libmori_application uses std::filesystem; GNU libstdc++ needs explicit -lstdc++fs.
-  add_mori_perftest_shmem(p2p_put_bw SOURCES shmem/p2p_put_bw.cpp LIBS stdc++fs)
+  add_mori_perftest_shmem(p2p_put_bw SOURCES shmem/p2p_put_bw.cpp shmem/util.cpp LIBS stdc++fs)
+  add_mori_perftest_app(p2p_put_latency SOURCES shmem/p2p_put_latency.cpp shmem/util.cpp LIBS stdc++fs)
 endif()
