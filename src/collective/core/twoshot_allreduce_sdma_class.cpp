@@ -269,7 +269,12 @@ void AllreduceSdma<T>::copy_output_to_user(T* output, size_t total_count, hipStr
 // ---------------------------------------------------------------------------
 template <typename T>
 bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count, hipStream_t stream) {
-  return pipelined(input, output, total_count, 0, 0, stream, /*external_scatter=*/true);
+  static const bool fused = []() {
+      const char* e = std::getenv("MORI_PIPELINE_FUSED");
+      return e && std::atoi(e) == 1;
+  }();
+  return pipelined(input, output, total_count, 0, 0, stream,
+                   /*external_scatter=*/!fused);
 }
 
 // ================ Async API Implementations ================
@@ -444,11 +449,28 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             }
         }
 
-        int threads = 512;
-        if (const char* e = getenv("MORI_PIPELINE_THREADS")) {
-            int v = atoi(e);
-            if (v == 256 || v == 512 || v == 1024) threads = v;
-        }
+        struct PipelineConfig {
+            int threads;
+            int cu_limit;
+            int target_chunks;
+            PipelineConfig() : threads(512), cu_limit(0), target_chunks(2) {
+                if (const char* e = std::getenv("MORI_PIPELINE_THREADS")) {
+                    int v = std::atoi(e);
+                    if (v == 256 || v == 512 || v == 1024) threads = v;
+                }
+                if (const char* e = std::getenv("MORI_PIPELINE_CU")) {
+                    int v = std::atoi(e);
+                    if (v > 0) cu_limit = v;
+                }
+                if (const char* e = std::getenv("MORI_PIPELINE_CHUNKS")) {
+                    int v = std::atoi(e);
+                    if (v >= 1 && v <= 16) target_chunks = v;
+                }
+            }
+        };
+        static const PipelineConfig cfg;
+
+        int threads = cfg.threads;
         int packedPerRank = static_cast<int>(
             ((total_count / npes_ + pack_size - 1) / pack_size));
         int blocks = std::min(max_blocks_,
@@ -457,10 +479,8 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         if (scatter_mode == 0) {
             int comp = std::min(blocks, kMaxPipelineBlocks - 1);
             comp = std::min(comp, max_blocks_ - 1);
-            if (const char* e = getenv("MORI_PIPELINE_CU")) {
-                int v = atoi(e);
-                if (v > 0 && v < comp) comp = v;
-            }
+            if (cfg.cu_limit > 0 && cfg.cu_limit < comp)
+                comp = cfg.cu_limit;
             blocks = comp + 1;
         }
 
@@ -471,11 +491,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             if (scatter_mode == 1) {
                 chunk_elems = total_count;
             } else {
-                int kTargetChunks = 2;
-                if (const char* e = getenv("MORI_PIPELINE_CHUNKS")) {
-                    int v = atoi(e);
-                    if (v >= 1 && v <= 16) kTargetChunks = v;
-                }
+                int kTargetChunks = cfg.target_chunks;
                 constexpr size_t kMinChunkShardBytes = 8ULL * 1024 * 1024;
                 const size_t shard_bytes =
                     (total_count / npes_) * dtype_size_;

@@ -1224,7 +1224,8 @@ def _test_allreduce(
             torch.cuda.synchronize()
             dist.barrier()
             if rank == 0:
-                print(f"\n  [debug] MORI_PIPELINE_CU={os.environ.get('MORI_PIPELINE_CU', 'unset')}",
+                print(f"\n  [debug] MORI_PIPELINE_CU={os.environ.get('MORI_PIPELINE_CU', 'unset')}"
+                      f"  MORI_PIPELINE_FUSED={os.environ.get('MORI_PIPELINE_FUSED', 'unset')}",
                       flush=True)
             ok6 = _test_multi_stage_overlap(
                 rank,

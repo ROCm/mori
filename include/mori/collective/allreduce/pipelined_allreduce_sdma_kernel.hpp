@@ -207,8 +207,10 @@ __global__ void PipelinedAllReduceSdmaKernel(
                 s_scatter_by_sender[sender] + static_cast<uint64_t>(c + 1);
             HSAuint64* sig = dstMemObj->signalPtrs
                 + static_cast<size_t>(sender) * numQ;
-            while (core::AtomicLoadRelaxed(sig) < expected)
-              __builtin_amdgcn_s_sleep(1);
+            while (core::AtomicLoadRelaxed(sig) < expected) {
+              __builtin_amdgcn_s_sleep(2);
+              __builtin_amdgcn_s_sleep(2);
+            }
           }
         }
         if (threadIdx.x < static_cast<unsigned>(npes)) {
