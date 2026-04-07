@@ -1134,6 +1134,8 @@ def _test_allreduce(
             all_ok = all_ok and ok5
 
         if num_stages > 0:
+            torch.cuda.synchronize()
+            dist.barrier()
             ok6 = _test_multi_stage_overlap(
                 rank,
                 my_pe,
