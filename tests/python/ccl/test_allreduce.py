@@ -909,14 +909,14 @@ def _test_multi_stage_overlap(
                     launch_ar()
                 ev_ar_e_list[s].record(stream_ar)
 
-            if rank == 0 and i < 2:
+            if rank == 0:
                 print(f"    overlap iter {i}: syncing ...", flush=True)
             stream_ar.synchronize()
             stream_gemm.synchronize()
             ov_e.record()
             torch.cuda.synchronize()
             t_ov = ov_s.elapsed_time(ov_e) / 1000.0
-            if rank == 0 and i < 2:
+            if rank == 0:
                 print(f"    overlap iter {i}: done, t={t_ov*1000:.3f}ms", flush=True)
             if i >= warmup:
                 overlap_times.append(t_ov)
