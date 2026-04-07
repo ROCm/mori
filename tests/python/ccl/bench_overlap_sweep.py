@@ -157,133 +157,103 @@ def _worker(rank, world_size, port, sizes_mb, iterations, warmup,
         max_elems = max_data_bytes // elem_size
         max_output_buf_size = npes * (max_elems // npes + 64) * elem_size
 
-        # Create SDMA objects once with max size, reuse for all sizes
-        ar_copy = None
-        ar_nocopy = None
-        try:
-            ar_copy = AllreduceSdma(
-                my_pe, npes,
-                input_buffer_size=max_data_bytes,
-                output_buffer_size=max_output_buf_size,
-                copy_output_to_user=True, dtype=dtype,
-            )
-        except Exception as e:
-            if rank == 0:
-                print(f"  SDMA copy init FAILED: {e}")
-        try:
-            ar_nocopy = AllreduceSdma(
-                my_pe, npes,
-                input_buffer_size=max_data_bytes,
-                output_buffer_size=max_output_buf_size,
-                copy_output_to_user=False, dtype=dtype,
-            )
-        except Exception as e:
-            if rank == 0:
-                print(f"  SDMA no-copy init FAILED: {e}")
+        def _bench_sdma_mode(copy_mode, label, sizes_mb_list):
+            """Create ONE AllreduceSdma, benchmark all sizes, then destroy it.
 
-        # Warmup SDMA objects with max size
-        inp_max = torch.full((max_elems,), fill_value, dtype=dtype, device=device)
-        out_max = torch.zeros(max_elems, dtype=dtype, device=device)
-        torch.cuda.synchronize()
-        dist.barrier()
-        if ar_copy is not None:
-            ar_copy(inp_max, out_max, max_elems, stream_ar)
-            stream_ar.synchronize()
-        dist.barrier()
-        if ar_nocopy is not None:
-            ar_nocopy(inp_max, out_max, max_elems, stream_ar)
-            stream_ar.synchronize()
-        dist.barrier()
-        del inp_max, out_max
+            VMM heap shares SDMA signal arrays across objects, so only one
+            AllreduceSdma may exist at a time to keep generation counters
+            consistent with the shared signals.
+            """
+            rows = {}
+            ar = None
+            try:
+                ar = AllreduceSdma(
+                    my_pe, npes,
+                    input_buffer_size=max_data_bytes,
+                    output_buffer_size=max_output_buf_size,
+                    copy_output_to_user=copy_mode, dtype=dtype,
+                )
+            except Exception as e:
+                if rank == 0:
+                    print(f"  {label} init FAILED: {e}")
+                return rows
 
+            # warmup with max size
+            inp_w = torch.full((max_elems,), fill_value, dtype=dtype, device=device)
+            out_w = torch.zeros(max_elems, dtype=dtype, device=device)
+            torch.cuda.synchronize()
+            dist.barrier()
+            ar(inp_w, out_w, max_elems, stream_ar)
+            stream_ar.synchronize()
+            dist.barrier()
+            del inp_w, out_w
+
+            for size_mb in sizes_mb_list:
+                data_bytes = size_mb * 1024 * 1024
+                elems = data_bytes // elem_size
+                inp = torch.full((elems,), fill_value, dtype=dtype, device=device)
+                out = torch.zeros(elems, dtype=dtype, device=device)
+                cur_elems = elems
+
+                def launch_ar():
+                    return ar(inp, out, cur_elems, stream_ar)
+
+                def prep_ar():
+                    inp.fill_(fill_value)
+
+                try:
+                    torch.cuda.synchronize()
+                    dist.barrier()
+                    ok = ar(inp, out, elems, stream_ar)
+                    stream_ar.synchronize()
+                    if ok:
+                        s_ar, s_gm, ov = _bench_overlap_one(
+                            launch_ar, prep_ar,
+                            run_gemm, stream_ar, stream_gemm,
+                            iterations, warmup, False,
+                        )
+                        g_ar = _reduce_scalar_list(s_ar, rank, npes, device)
+                        g_gm = _reduce_scalar_list(s_gm, rank, npes, device)
+                        g_ov = _reduce_scalar_list(ov, rank, npes, device)
+                        rows[size_mb] = {
+                            "ar_avg": g_ar[2], "gemm_avg": g_gm[2],
+                            "overlap_avg": g_ov[2], "overlap_min": g_ov[0],
+                        }
+                        if rank == 0:
+                            print(f"  {label:14s}: overlap {g_ov[2]*1000:.3f} ms  "
+                                  f"(ar {g_ar[2]*1000:.3f}, gemm {g_gm[2]*1000:.3f})")
+                except Exception as e:
+                    if rank == 0:
+                        print(f"  {label:14s}: FAILED ({e})")
+                torch.cuda.synchronize()
+                dist.barrier()
+                del inp, out
+
+            # destroy SDMA object before creating next one
+            torch.cuda.synchronize()
+            dist.barrier()
+            del ar
+            torch.cuda.synchronize()
+            dist.barrier()
+            return rows
+
+        # --- Phase 1: SDMA copy ---
+        if rank == 0:
+            print("\n=== SDMA copy_output_to_user=True ===")
+        copy_rows = _bench_sdma_mode(True, "SDMA copy", sizes_mb)
+
+        # --- Phase 2: SDMA no-copy ---
+        if rank == 0:
+            print("\n=== SDMA copy_output_to_user=False ===")
+        nocopy_rows = _bench_sdma_mode(False, "SDMA no-copy", sizes_mb)
+
+        # --- Phase 3: RCCL ---
+        if rank == 0:
+            print("\n=== RCCL ===")
+        rccl_rows = {}
         for size_mb in sizes_mb:
             data_bytes = size_mb * 1024 * 1024
             elems = data_bytes // elem_size
-
-            if rank == 0:
-                print(f"\n--- Sweep: {size_mb} MB ({elems:,} elems) ---")
-
-            row = {"size_mb": size_mb, "elems": elems}
-            inp = torch.full((elems,), fill_value, dtype=dtype, device=device)
-            out = torch.zeros(elems, dtype=dtype, device=device)
-
-            # --- SDMA copy=True ---
-            if ar_copy is not None:
-                try:
-                    cur_elems = elems
-
-                    def launch_copy():
-                        return ar_copy(inp, out, cur_elems, stream_ar)
-
-                    def prep_copy():
-                        inp.fill_(fill_value)
-
-                    torch.cuda.synchronize()
-                    dist.barrier()
-                    ok = ar_copy(inp, out, elems, stream_ar)
-                    stream_ar.synchronize()
-                    if ok:
-                        s_ar, s_gm, ov = _bench_overlap_one(
-                            launch_copy, prep_copy,
-                            run_gemm, stream_ar, stream_gemm,
-                            iterations, warmup, False,
-                        )
-                        g_ar = _reduce_scalar_list(s_ar, rank, npes, device)
-                        g_gm = _reduce_scalar_list(s_gm, rank, npes, device)
-                        g_ov = _reduce_scalar_list(ov, rank, npes, device)
-                        row["sdma_copy_ar_avg"] = g_ar[2]
-                        row["sdma_copy_gemm_avg"] = g_gm[2]
-                        row["sdma_copy_overlap_avg"] = g_ov[2]
-                        row["sdma_copy_overlap_min"] = g_ov[0]
-                        if rank == 0:
-                            print(f"  SDMA copy    : overlap {g_ov[2]*1000:.3f} ms  "
-                                  f"(ar {g_ar[2]*1000:.3f}, gemm {g_gm[2]*1000:.3f})")
-                except Exception as e:
-                    if rank == 0:
-                        print(f"  SDMA copy    : FAILED ({e})")
-
-            torch.cuda.synchronize()
-            dist.barrier()
-
-            # --- SDMA copy=False ---
-            if ar_nocopy is not None:
-                try:
-                    cur_elems = elems
-
-                    def launch_nocopy():
-                        return ar_nocopy(inp, out, cur_elems, stream_ar)
-
-                    def prep_nocopy():
-                        inp.fill_(fill_value)
-
-                    torch.cuda.synchronize()
-                    dist.barrier()
-                    ok = ar_nocopy(inp, out, elems, stream_ar)
-                    stream_ar.synchronize()
-                    if ok:
-                        s_ar, s_gm, ov = _bench_overlap_one(
-                            launch_nocopy, prep_nocopy,
-                            run_gemm, stream_ar, stream_gemm,
-                            iterations, warmup, False,
-                        )
-                        g_ar = _reduce_scalar_list(s_ar, rank, npes, device)
-                        g_gm = _reduce_scalar_list(s_gm, rank, npes, device)
-                        g_ov = _reduce_scalar_list(ov, rank, npes, device)
-                        row["sdma_nocopy_ar_avg"] = g_ar[2]
-                        row["sdma_nocopy_gemm_avg"] = g_gm[2]
-                        row["sdma_nocopy_overlap_avg"] = g_ov[2]
-                        row["sdma_nocopy_overlap_min"] = g_ov[0]
-                        if rank == 0:
-                            print(f"  SDMA no-copy : overlap {g_ov[2]*1000:.3f} ms  "
-                                  f"(ar {g_ar[2]*1000:.3f}, gemm {g_gm[2]*1000:.3f})")
-                except Exception as e:
-                    if rank == 0:
-                        print(f"  SDMA no-copy : FAILED ({e})")
-
-            torch.cuda.synchronize()
-            dist.barrier()
-
-            # --- RCCL ---
             try:
                 buf = torch.full((elems,), fill_value, dtype=rccl_dtype, device=device)
                 dist.all_reduce(buf, op=dist.ReduceOp.SUM)
@@ -303,23 +273,34 @@ def _worker(rank, world_size, port, sizes_mb, iterations, warmup,
                 g_ar = _reduce_scalar_list(s_ar, rank, npes, device)
                 g_gm = _reduce_scalar_list(s_gm, rank, npes, device)
                 g_ov = _reduce_scalar_list(ov, rank, npes, device)
-                row["rccl_ar_avg"] = g_ar[2]
-                row["rccl_gemm_avg"] = g_gm[2]
-                row["rccl_overlap_avg"] = g_ov[2]
-                row["rccl_overlap_min"] = g_ov[0]
+                rccl_rows[size_mb] = {
+                    "ar_avg": g_ar[2], "gemm_avg": g_gm[2],
+                    "overlap_avg": g_ov[2], "overlap_min": g_ov[0],
+                }
                 if rank == 0:
-                    print(f"  RCCL         : overlap {g_ov[2]*1000:.3f} ms  "
+                    print(f"  {'RCCL':14s}: {size_mb:>4d} MB  overlap {g_ov[2]*1000:.3f} ms  "
                           f"(ar {g_ar[2]*1000:.3f}, gemm {g_gm[2]*1000:.3f})")
                 del buf
             except Exception as e:
                 if rank == 0:
-                    print(f"  RCCL         : FAILED ({e})")
-
+                    print(f"  RCCL {size_mb} MB: FAILED ({e})")
             torch.cuda.synchronize()
             dist.barrier()
+
+        # Merge results
+        for size_mb in sizes_mb:
+            row = {"size_mb": size_mb, "elems": size_mb * 1024 * 1024 // elem_size}
+            cr = copy_rows.get(size_mb, {})
+            nr = nocopy_rows.get(size_mb, {})
+            rr = rccl_rows.get(size_mb, {})
+            for k, v in cr.items():
+                row[f"sdma_copy_{k}"] = v
+            for k, v in nr.items():
+                row[f"sdma_nocopy_{k}"] = v
+            for k, v in rr.items():
+                row[f"rccl_{k}"] = v
             results.append(row)
 
-        # rank 0 saves results and prints tables before cleanup
         if rank == 0:
             os.makedirs(output_dir, exist_ok=True)
             json_path = os.path.join(output_dir, "overlap_sweep.json")
@@ -330,9 +311,6 @@ def _worker(rank, world_size, port, sizes_mb, iterations, warmup,
             _save_csv(results, output_dir)
             _print_summary_tables(results, gemm_m, gemm_n, gemm_k)
 
-        torch.cuda.synchronize()
-        dist.barrier()
-        del ar_copy, ar_nocopy
         torch.cuda.synchronize()
         dist.barrier()
         shmem.shmem_finalize()
