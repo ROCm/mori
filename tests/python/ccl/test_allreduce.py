@@ -763,13 +763,14 @@ def _bench_overlap_one_size(
     """Benchmark one (mode, size) combo.  Returns dict with timing or None."""
     _dbg = (rank == 0)
     setup_ret = setup_fn()
-    ok_c = setup_ret[0] if len(setup_ret) == 4 else False
+    ok_c = setup_ret[0] if len(setup_ret) >= 4 else False
     ok_pe = torch.tensor([1 if ok_c else 0], dtype=torch.int32, device=device)
     dist.all_reduce(ok_pe, op=dist.ReduceOp.MIN)
     if ok_pe.item() != 1:
         dist.barrier()
         return None
-    _, launch_ar, prep_ar, time_ar_with_wall = setup_ret
+    _, launch_ar, prep_ar, time_ar_with_wall = setup_ret[:4]
+    copy_stream = setup_ret[4] if len(setup_ret) > 4 else None
 
     seq_ar, seq_gemm, overlap_times = [], [], []
 
@@ -781,6 +782,8 @@ def _bench_overlap_one_size(
             t0 = time.perf_counter()
             for _ in range(num_stages):
                 launch_ar()
+            if copy_stream:
+                copy_stream.synchronize()
             torch.cuda.synchronize()
             t_ar = time.perf_counter() - t0
         else:
@@ -790,6 +793,8 @@ def _bench_overlap_one_size(
                     launch_ar()
             ev_ar_e.record(stream_ar)
             stream_ar.synchronize()
+            if copy_stream:
+                copy_stream.synchronize()
             t_ar = ev_ar_s.elapsed_time(ev_ar_e) / 1000.0
         if i >= warmup:
             seq_ar.append(t_ar)
@@ -840,8 +845,12 @@ def _bench_overlap_one_size(
             ev_ar_e_list[s].record(stream_ar)
             if not use_overlap:
                 stream_ar.synchronize()
+                if copy_stream:
+                    copy_stream.synchronize()
         if use_overlap:
             stream_ar.synchronize()
+            if copy_stream:
+                copy_stream.synchronize()
             stream_gemm.synchronize()
         ov_e.record()
         torch.cuda.synchronize()
@@ -943,15 +952,27 @@ def _test_multi_stage_overlap(
                     def setup():
                         ar = AllreduceSdma(my_pe, npes, input_buffer_size=b,
                                            output_buffer_size=o,
-                                           copy_output_to_user=True, dtype=dtype)
+                                           copy_output_to_user=False, dtype=dtype)
                         inp = torch.full((e,), fill_value, dtype=dtype, device=device)
                         out = torch.zeros(e, dtype=dtype, device=device)
+                        transit = ar.get_output_transit_buffer(dtype=dtype)
+                        s_cp = torch.cuda.Stream()
+                        ev_cp = torch.cuda.Event()
                         torch.cuda.synchronize(); dist.barrier()
                         stream_ar.synchronize()
                         ok = ar(inp, out, e, stream_ar); stream_ar.synchronize()
+                        with torch.cuda.stream(s_cp):
+                            out[:e].copy_(transit[:e])
+                        s_cp.synchronize()
                         def prep(): inp.fill_(fill_value)
-                        def launch(): return ar(inp, out, e, stream_ar)
-                        return ok, launch, prep, False
+                        def launch():
+                            ok = ar(inp, out, e, stream_ar)
+                            ev_cp.record(stream_ar)
+                            s_cp.wait_event(ev_cp)
+                            with torch.cuda.stream(s_cp):
+                                out[:e].copy_(transit[:e])
+                            return ok
+                        return ok, launch, prep, False, s_cp
                     return setup
                 setup_fn = make_setup()
             elif mode == "SDMA no-copy":
