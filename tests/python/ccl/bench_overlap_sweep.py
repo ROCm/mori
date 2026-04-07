@@ -362,12 +362,11 @@ def _print_summary_tables(results, gemm_m, gemm_n, gemm_k):
         v = r.get(key)
         return f"{v * 1000:8.3f}" if v is not None else "     N/A"
 
-    def _ratio(r, ov_key, ar_key, gemm_key):
+    def _slowdown(r, ov_key, gemm_key):
         ov = r.get(ov_key)
-        ar = r.get(ar_key)
         gm = r.get(gemm_key)
-        if ov is not None and ar is not None and gm is not None and (ar + gm) > 0:
-            return f"{ov / (ar + gm):8.3f}"
+        if ov is not None and gm is not None and gm > 0:
+            return f"{ov / gm:8.3f}"
         return "     N/A"
 
     def _speedup(r, rccl_key, sdma_key):
@@ -398,16 +397,16 @@ def _print_summary_tables(results, gemm_m, gemm_n, gemm_k):
         print(f"  {sz:>8s} | {c:>10s} | {nc:>12s} | {rc:>10s} | {sp_c:>12s} | {sp_nc:>15s}")
     print(f"  {sep}")
 
-    # Table 2: Overlap Ratio (lower = better)
-    print(f"\n  Table 2: Overlap Ratio (overlap_wall / seq_sum, lower = better)")
+    # Table 2: GEMM Slowdown (overlap_wall / seq_gemm, 1.0 = perfect hiding)
+    print(f"\n  Table 2: GEMM Slowdown (overlap_wall / seq_gemm, 1.0 = perfect hiding)")
     print(f"  {sep}")
     print(f"  {'Size':>8s} | {'SDMA copy':>10s} | {'SDMA no-copy':>12s} | {'RCCL':>10s}")
     print(f"  {sep}")
     for r in results:
         sz = f"{r['size_mb']:>6d} MB"
-        c = _ratio(r, "sdma_copy_overlap_avg", "sdma_copy_ar_avg", "sdma_copy_gemm_avg")
-        nc = _ratio(r, "sdma_nocopy_overlap_avg", "sdma_nocopy_ar_avg", "sdma_nocopy_gemm_avg")
-        rc = _ratio(r, "rccl_overlap_avg", "rccl_ar_avg", "rccl_gemm_avg")
+        c = _slowdown(r, "sdma_copy_overlap_avg", "sdma_copy_gemm_avg")
+        nc = _slowdown(r, "sdma_nocopy_overlap_avg", "sdma_nocopy_gemm_avg")
+        rc = _slowdown(r, "rccl_overlap_avg", "rccl_gemm_avg")
         print(f"  {sz:>8s} | {c:>10s} | {nc:>12s} | {rc:>10s}")
     print(f"  {sep}")
 
@@ -452,7 +451,7 @@ def main():
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--gemm-m", type=int, default=4096)
     parser.add_argument("--gemm-n", type=int, default=4096)
-    parser.add_argument("--gemm-k", type=int, default=4096)
+    parser.add_argument("--gemm-k", type=int, default=8192)
     parser.add_argument("--output-dir", type=str, default="bench_overlap_results")
     parser.add_argument("--enable-sdma", type=int, default=1, choices=[0, 1])
     args = parser.parse_args()

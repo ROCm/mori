@@ -76,6 +76,10 @@ class AnvilLib {
   bool connect(int srcDeviceId, int dstDeviceId, int numChannels = 1);
   SdmaQueue* getSdmaQueue(int srcDeviceId, int dstDeviceId, int channelIdx = 0);
 
+  // Destroy all SDMA queues. Must be called before unmapping symmetric memory
+  // to avoid GPU TLB faults from stale SDMA engine page table entries.
+  void destroyAllChannels();
+
  private:
   /*
    * OAM MAP

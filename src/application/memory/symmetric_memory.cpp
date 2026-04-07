@@ -712,6 +712,15 @@ void SymmMemManager::FinalizeVMMHeap() {
 
   int rank = bootNet.GetLocalRank();
 
+  // Drain GPU compute/copy queues, then destroy all SDMA hardware queues.
+  // SDMA queues are created via KFD (hsaKmtCreateQueue) outside the HIP runtime,
+  // so hipDeviceSynchronize alone cannot flush them. Destroying them calls
+  // hsaKmtDestroyQueue which drains pending packets and invalidates the engine's
+  // TLB entries. Without this, hipMemUnmap below triggers GPU page faults from
+  // stale SDMA TLB entries referencing the unmapped symmetric memory.
+  hipDeviceSynchronize();
+  anvil::anvil.destroyAllChannels();
+
   // Deregister per-chunk RDMA registrations and clean up resources
   RdmaDeviceContext* rdmaDeviceContext = context.GetRdmaDeviceContext();
   if (rdmaDeviceContext) {
@@ -780,13 +789,7 @@ void SymmMemManager::FinalizeVMMHeap() {
     }
   }
 
-  // Step 3: Synchronize GPU to ensure all operations are complete
-  hipError_t syncResult = hipDeviceSynchronize();
-  if (syncResult != hipSuccess) {
-    MORI_APP_WARN("FinalizeVMMHeap: hipDeviceSynchronize failed: {}", syncResult);
-  }
-
-  // Step 4: Free virtual address space (entire multi-PE space)
+  // Step 3: Free virtual address space (entire multi-PE space)
   if (vmmVirtualBasePtr) {
     size_t totalVirtualSize = vmmPerPeerSize * worldSize;
     MORI_APP_TRACE("FinalizeVMMHeap: Freeing virtual address space at {:p}, size={} bytes",
@@ -795,7 +798,7 @@ void SymmMemManager::FinalizeVMMHeap() {
     vmmVirtualBasePtr = nullptr;
   }
 
-  // Step 5: Clean up VMM heap object
+  // Step 4: Clean up VMM heap object
   if (vmmHeapObj.IsValid()) {
     // Free CPU-side memory first
     if (vmmHeapObj.cpu) {

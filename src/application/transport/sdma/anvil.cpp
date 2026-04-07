@@ -287,6 +287,13 @@ SdmaQueue* AnvilLib::getSdmaQueue(int srcDeviceId, int dstDeviceId, int channel_
   return sdma_channels_[dstDeviceId][channel_idx].get();  // TODO
 }
 
+void AnvilLib::destroyAllChannels() {
+  for (auto& p : sdma_channels_) {
+    p.second.clear();
+  }
+  sdma_channels_.clear();
+}
+
 AnvilLib& AnvilLib::getInstance() {
   // Keep pre-SDMA-collective behavior: do not run ~AnvilLib during process teardown.
   // Worker exits can otherwise stall in ROCm/HSA shutdown ordering.
