@@ -35,7 +35,16 @@ Correctness is not checked in this phase (Tests 1–4 already cover it); only ti
 """
 
 import os
+import sys
 import time
+from pathlib import Path
+
+# Ensure project root is on sys.path so "tests.python.utils" resolves
+# when running this script directly (python tests/python/ccl/test_allreduce.py).
+_PROJECT_ROOT = str(Path(__file__).resolve().parents[3])
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
 import numpy as np
 import torch
 import torch.distributed as dist
