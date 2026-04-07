@@ -811,9 +811,6 @@ def _test_multi_stage_overlap(
             )
         ok_c, launch_ar, prep_ar, time_ar_with_wall = setup_ret
 
-        if rank == 0:
-            print(f"  [{label}] setup ok={ok_c}, entering bench", flush=True)
-
         ok_pe = torch.tensor([1 if ok_c else 0], dtype=torch.int32, device=device)
         dist.all_reduce(ok_pe, op=dist.ReduceOp.MIN)
         ok_c = ok_pe.item() == 1
@@ -826,47 +823,27 @@ def _test_multi_stage_overlap(
 
         seq_ar, seq_gemm, overlap_times = [], [], []
 
-        if rank == 0:
-            print(f"  [{label}] starting seq AR ({total_iters} iters, {num_stages} stages)", flush=True)
-
         # Sequential AllReduce: num_stages rounds per iteration
         for i in range(total_iters):
             torch.cuda.synchronize()
             prep_ar()
             torch.cuda.synchronize()
-            if rank == 0 and i < 2:
-                print(f"    seq_ar iter {i}: launching {num_stages} stages ...", flush=True)
             if time_ar_with_wall:
                 t0 = time.perf_counter()
-                for s in range(num_stages):
-                    if rank == 0 and i < 2:
-                        print(f"      stage {s} launch ...", flush=True)
+                for _ in range(num_stages):
                     launch_ar()
-                    if rank == 0 and i < 2:
-                        print(f"      stage {s} launched", flush=True)
                 torch.cuda.synchronize()
                 t_ar = time.perf_counter() - t0
             else:
                 ev_ar_s.record(stream_ar)
                 with torch.cuda.stream(stream_ar):
-                    for s in range(num_stages):
-                        if rank == 0 and i < 2:
-                            print(f"      stage {s} launch ...", flush=True)
+                    for _ in range(num_stages):
                         launch_ar()
-                        if rank == 0 and i < 2:
-                            print(f"      stage {s} launched", flush=True)
                 ev_ar_e.record(stream_ar)
-                if rank == 0 and i < 2:
-                    print(f"    sync stream_ar ...", flush=True)
                 stream_ar.synchronize()
-                if rank == 0 and i < 2:
-                    print(f"    sync done, t={ev_ar_s.elapsed_time(ev_ar_e):.3f}ms", flush=True)
                 t_ar = ev_ar_s.elapsed_time(ev_ar_e) / 1000.0
             if i >= warmup:
                 seq_ar.append(t_ar)
-
-        if rank == 0:
-            print(f"  [{label}] seq AR done. Starting seq GEMM ...", flush=True)
 
         # Sequential GEMM: num_stages rounds per iteration
         for i in range(total_iters):
@@ -882,9 +859,6 @@ def _test_multi_stage_overlap(
                 seq_gemm.append(t_g)
             elif rank == 0:
                 _ = C.sum().item()
-
-        if rank == 0:
-            print(f"  [{label}] seq GEMM done. Starting overlap ...", flush=True)
 
         # Pipelined overlap: GEMM(s) -> AR(s) with cross-stream dependency
         ev_g_s_list = [torch.cuda.Event(enable_timing=True) for _ in range(num_stages)]
@@ -909,15 +883,11 @@ def _test_multi_stage_overlap(
                     launch_ar()
                 ev_ar_e_list[s].record(stream_ar)
 
-            if rank == 0:
-                print(f"    overlap iter {i}: syncing ...", flush=True)
             stream_ar.synchronize()
             stream_gemm.synchronize()
             ov_e.record()
             torch.cuda.synchronize()
             t_ov = ov_s.elapsed_time(ov_e) / 1000.0
-            if rank == 0:
-                print(f"    overlap iter {i}: done, t={t_ov*1000:.3f}ms", flush=True)
             if i >= warmup:
                 overlap_times.append(t_ov)
             elif rank == 0:
