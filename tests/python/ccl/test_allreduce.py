@@ -762,12 +762,8 @@ def _bench_overlap_one_size(
 ):
     """Benchmark one (mode, size) combo.  Returns dict with timing or None."""
     _dbg = (rank == 0)
-    if _dbg:
-        print(" setup ...", end="", flush=True)
     setup_ret = setup_fn()
     ok_c = setup_ret[0] if len(setup_ret) == 4 else False
-    if _dbg:
-        print(f" ok={ok_c}", end="", flush=True)
     ok_pe = torch.tensor([1 if ok_c else 0], dtype=torch.int32, device=device)
     dist.all_reduce(ok_pe, op=dist.ReduceOp.MIN)
     if ok_pe.item() != 1:
@@ -777,8 +773,6 @@ def _bench_overlap_one_size(
 
     seq_ar, seq_gemm, overlap_times = [], [], []
 
-    if _dbg:
-        print(" seq_ar", end="", flush=True)
     for i in range(total_iters):
         torch.cuda.synchronize()
         prep_ar()
@@ -799,14 +793,10 @@ def _bench_overlap_one_size(
             t_ar = ev_ar_s.elapsed_time(ev_ar_e) / 1000.0
         if i >= warmup:
             seq_ar.append(t_ar)
-        if _dbg and i < 3:
-            print(f"[{i}]", end="", flush=True)
 
     torch.cuda.synchronize()
     dist.barrier()
 
-    if _dbg:
-        print(" seq_gemm", end="", flush=True)
     for i in range(total_iters):
         torch.cuda.synchronize()
         ev_g_s.record(stream_gemm)
@@ -827,8 +817,9 @@ def _bench_overlap_one_size(
     ev_ar_s_list = [torch.cuda.Event(enable_timing=True) for _ in range(num_stages)]
     ev_ar_e_list = [torch.cuda.Event(enable_timing=True) for _ in range(num_stages)]
 
-    if _dbg:
-        print(" overlap", end="", flush=True)
+    elem_bytes = elems * torch.tensor([], dtype=dtype).element_size()
+    data_mb = elem_bytes / (1024 * 1024)
+    use_overlap = data_mb >= 128
     for i in range(total_iters):
         torch.cuda.synchronize()
         prep_ar()
@@ -839,19 +830,24 @@ def _bench_overlap_one_size(
             with torch.cuda.stream(stream_gemm):
                 _run_gemm()
             ev_g_e_list[s].record(stream_gemm)
-            stream_gemm.synchronize()
+            if use_overlap:
+                stream_ar.wait_event(ev_g_e_list[s])
+            else:
+                stream_gemm.synchronize()
             ev_ar_s_list[s].record(stream_ar)
             with torch.cuda.stream(stream_ar):
                 launch_ar()
             ev_ar_e_list[s].record(stream_ar)
+            if not use_overlap:
+                stream_ar.synchronize()
+        if use_overlap:
             stream_ar.synchronize()
+            stream_gemm.synchronize()
         ov_e.record()
         torch.cuda.synchronize()
         t_ov = ov_s.elapsed_time(ov_e) / 1000.0
         if i >= warmup:
             overlap_times.append(t_ov)
-        if _dbg:
-            print(f"[{i}]", end="", flush=True)
 
     dist.barrier()
 
@@ -937,8 +933,10 @@ def _test_multi_stage_overlap(
             cur_bytes = cur_elems * elem_size
             cur_out_size = npes * (cur_elems // npes + 64) * elem_size
 
+            ov_tag = "overlap" if size_mb >= 128 else "serial"
             if rank == 0:
-                print(f"  {mode:14s} | {size_mb:6d} MB ...", end="", flush=True)
+                print(f"  {mode:14s} | {size_mb:6d} MB [{ov_tag}] ...",
+                      end="", flush=True)
 
             if mode == "SDMA copy":
                 def make_setup(e=cur_elems, b=cur_bytes, o=cur_out_size):
@@ -948,15 +946,9 @@ def _test_multi_stage_overlap(
                                            copy_output_to_user=True, dtype=dtype)
                         inp = torch.full((e,), fill_value, dtype=dtype, device=device)
                         out = torch.zeros(e, dtype=dtype, device=device)
-                        if rank == 0:
-                            print(f"(sync", end="", flush=True)
                         torch.cuda.synchronize(); dist.barrier()
                         stream_ar.synchronize()
-                        if rank == 0:
-                            print(f"→warmup", end="", flush=True)
                         ok = ar(inp, out, e, stream_ar); stream_ar.synchronize()
-                        if rank == 0:
-                            print(f"→done)", end="", flush=True)
                         def prep(): inp.fill_(fill_value)
                         def launch(): return ar(inp, out, e, stream_ar)
                         return ok, launch, prep, False
@@ -970,15 +962,9 @@ def _test_multi_stage_overlap(
                                            copy_output_to_user=False, dtype=dtype)
                         inp = torch.full((e,), fill_value, dtype=dtype, device=device)
                         out = torch.zeros(e, dtype=dtype, device=device)
-                        if rank == 0:
-                            print(f"(sync", end="", flush=True)
                         torch.cuda.synchronize(); dist.barrier()
                         stream_ar.synchronize()
-                        if rank == 0:
-                            print(f"→warmup", end="", flush=True)
                         ok = ar(inp, out, e, stream_ar); stream_ar.synchronize()
-                        if rank == 0:
-                            print(f"→done)", end="", flush=True)
                         def prep(): inp.fill_(fill_value)
                         def launch(): return ar(inp, out, e, stream_ar)
                         return ok, launch, prep, False
@@ -1020,6 +1006,8 @@ def _test_multi_stage_overlap(
         print(f"\n{'=' * w}")
         print(f"  Multi-stage Overlap Summary — {num_stages} stages, "
               f"GEMM {gemm_m}x{gemm_k}x{gemm_n}")
+        print(f"  (sizes >= 128 MB use true GEMM+AR overlap; "
+              f"smaller sizes run GEMM then AR serially)")
         print(f"{'=' * w}")
 
         def _val(sm, key):
