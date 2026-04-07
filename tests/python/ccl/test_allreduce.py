@@ -802,6 +802,9 @@ def _bench_overlap_one_size(
         if _dbg and i < 3:
             print(f"[{i}]", end="", flush=True)
 
+    torch.cuda.synchronize()
+    dist.barrier()
+
     if _dbg:
         print(" seq_gemm", end="", flush=True)
     for i in range(total_iters):
@@ -815,6 +818,9 @@ def _bench_overlap_one_size(
         t_g = ev_g_s.elapsed_time(ev_g_e) / 1000.0
         if i >= warmup:
             seq_gemm.append(t_g)
+
+    torch.cuda.synchronize()
+    dist.barrier()
 
     ev_g_s_list = [torch.cuda.Event(enable_timing=True) for _ in range(num_stages)]
     ev_g_e_list = [torch.cuda.Event(enable_timing=True) for _ in range(num_stages)]
@@ -845,7 +851,7 @@ def _bench_overlap_one_size(
         t_ov = ov_s.elapsed_time(ov_e) / 1000.0
         if i >= warmup:
             overlap_times.append(t_ov)
-        if _dbg and i < 3:
+        if _dbg:
             print(f"[{i}]", end="", flush=True)
 
     dist.barrier()
