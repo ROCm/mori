@@ -833,19 +833,32 @@ def _bench_overlap_one_size(
         torch.cuda.synchronize()
         prep_ar()
         torch.cuda.synchronize()
+        if _dbg and i < 2:
+            print(f"\n    ov{i}: ", end="", flush=True)
         ov_s.record()
         for s in range(num_stages):
+            if _dbg and i < 2:
+                print(f"G{s}", end="", flush=True)
             ev_g_s_list[s].record(stream_gemm)
             with torch.cuda.stream(stream_gemm):
                 _run_gemm()
             ev_g_e_list[s].record(stream_gemm)
+            if _dbg and i < 2:
+                stream_gemm.synchronize()
+                print(f"✓", end="", flush=True)
             stream_ar.wait_event(ev_g_e_list[s])
+            if _dbg and i < 2:
+                print(f"A{s}", end="", flush=True)
             ev_ar_s_list[s].record(stream_ar)
             with torch.cuda.stream(stream_ar):
                 launch_ar()
             ev_ar_e_list[s].record(stream_ar)
-        stream_ar.synchronize()
-        stream_gemm.synchronize()
+            if _dbg and i < 2:
+                stream_ar.synchronize()
+                print(f"✓", end="", flush=True)
+        if not (_dbg and i < 2):
+            stream_ar.synchronize()
+            stream_gemm.synchronize()
         ov_e.record()
         torch.cuda.synchronize()
         t_ov = ov_s.elapsed_time(ov_e) / 1000.0
