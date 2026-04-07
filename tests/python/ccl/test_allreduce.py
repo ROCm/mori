@@ -761,8 +761,13 @@ def _bench_overlap_one_size(
     setup_fn,
 ):
     """Benchmark one (mode, size) combo.  Returns dict with timing or None."""
+    _dbg = (rank == 0)
+    if _dbg:
+        print(" setup ...", end="", flush=True)
     setup_ret = setup_fn()
     ok_c = setup_ret[0] if len(setup_ret) == 4 else False
+    if _dbg:
+        print(f" ok={ok_c}", end="", flush=True)
     ok_pe = torch.tensor([1 if ok_c else 0], dtype=torch.int32, device=device)
     dist.all_reduce(ok_pe, op=dist.ReduceOp.MIN)
     if ok_pe.item() != 1:
@@ -772,6 +777,8 @@ def _bench_overlap_one_size(
 
     seq_ar, seq_gemm, overlap_times = [], [], []
 
+    if _dbg:
+        print(" seq_ar", end="", flush=True)
     for i in range(total_iters):
         torch.cuda.synchronize()
         prep_ar()
@@ -792,7 +799,11 @@ def _bench_overlap_one_size(
             t_ar = ev_ar_s.elapsed_time(ev_ar_e) / 1000.0
         if i >= warmup:
             seq_ar.append(t_ar)
+        if _dbg and i < 3:
+            print(f"[{i}]", end="", flush=True)
 
+    if _dbg:
+        print(" seq_gemm", end="", flush=True)
     for i in range(total_iters):
         torch.cuda.synchronize()
         ev_g_s.record(stream_gemm)
@@ -810,6 +821,8 @@ def _bench_overlap_one_size(
     ev_ar_s_list = [torch.cuda.Event(enable_timing=True) for _ in range(num_stages)]
     ev_ar_e_list = [torch.cuda.Event(enable_timing=True) for _ in range(num_stages)]
 
+    if _dbg:
+        print(" overlap", end="", flush=True)
     for i in range(total_iters):
         torch.cuda.synchronize()
         prep_ar()
@@ -832,6 +845,8 @@ def _bench_overlap_one_size(
         t_ov = ov_s.elapsed_time(ov_e) / 1000.0
         if i >= warmup:
             overlap_times.append(t_ov)
+        if _dbg and i < 3:
+            print(f"[{i}]", end="", flush=True)
 
     dist.barrier()
 
@@ -928,9 +943,15 @@ def _test_multi_stage_overlap(
                                            copy_output_to_user=True, dtype=dtype)
                         inp = torch.full((e,), fill_value, dtype=dtype, device=device)
                         out = torch.zeros(e, dtype=dtype, device=device)
+                        if rank == 0:
+                            print(f"(sync", end="", flush=True)
                         torch.cuda.synchronize(); dist.barrier()
                         stream_ar.synchronize()
+                        if rank == 0:
+                            print(f"→warmup", end="", flush=True)
                         ok = ar(inp, out, e, stream_ar); stream_ar.synchronize()
+                        if rank == 0:
+                            print(f"→done)", end="", flush=True)
                         def prep(): inp.fill_(fill_value)
                         def launch(): return ar(inp, out, e, stream_ar)
                         return ok, launch, prep, False
@@ -944,9 +965,15 @@ def _test_multi_stage_overlap(
                                            copy_output_to_user=False, dtype=dtype)
                         inp = torch.full((e,), fill_value, dtype=dtype, device=device)
                         out = torch.zeros(e, dtype=dtype, device=device)
+                        if rank == 0:
+                            print(f"(sync", end="", flush=True)
                         torch.cuda.synchronize(); dist.barrier()
                         stream_ar.synchronize()
+                        if rank == 0:
+                            print(f"→warmup", end="", flush=True)
                         ok = ar(inp, out, e, stream_ar); stream_ar.synchronize()
+                        if rank == 0:
+                            print(f"→done)", end="", flush=True)
                         def prep(): inp.fill_(fill_value)
                         def launch(): return ar(inp, out, e, stream_ar)
                         return ok, launch, prep, False
@@ -1198,8 +1225,14 @@ def _test_allreduce(
             all_ok = all_ok and ok5
 
         if num_stages > 0:
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
             torch.cuda.synchronize()
             dist.barrier()
+            if rank == 0:
+                print(f"\n  [debug] MORI_PIPELINE_CU={os.environ.get('MORI_PIPELINE_CU', 'unset')}",
+                      flush=True)
             ok6 = _test_multi_stage_overlap(
                 rank,
                 my_pe,
