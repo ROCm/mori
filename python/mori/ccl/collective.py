@@ -293,19 +293,29 @@ class AllreduceSdma:
                 my_pe, npes, 512 * 1024 * 1024, copy_output_to_user
             )
 
-    def __call__(self, input_data, output_data, count: int, stream=None,
-                 copy_stream=None) -> bool:
-        """Execute out-of-place AllReduce SDMA operation.
-
-        Args:
-            copy_stream: If provided and copy_output_to_user is True,
-                         the D2D copy runs on this separate stream via
-                         hipMemcpyAsync (DMA engine), overlapping with
-                         subsequent work on *stream*.
-        """
+    def __call__(self, input_data, output_data, count: int, stream=None) -> bool:
+        """Execute out-of-place AllReduce SDMA operation."""
         return self._handle(
             input_data.data_ptr(), output_data.data_ptr(), count,
-            _stream_to_int(stream), _stream_to_int(copy_stream)
+            _stream_to_int(stream)
+        )
+
+    def set_copy_stream(self, stream):
+        """Set a dedicated stream for D2D output copy (DMA engine, zero CU usage).
+
+        When set and copy_output_to_user=True, the internal hipMemcpyAsync
+        runs on this stream instead of the AR stream.  Call once during setup.
+        """
+        self._handle.set_copy_stream(_stream_to_int(stream))
+
+    def copy_output(self, output_data, count: int, stream=None):
+        """Explicitly copy transit buffer → output via hipMemcpyAsync.
+
+        Use with copy_output_to_user=False for manual control over when/where
+        the copy runs (e.g. on a dedicated copy stream after event sync).
+        """
+        self._handle.copy_output(
+            output_data.data_ptr(), count, _stream_to_int(stream)
         )
 
     def allreduce_inplace(self, data, count: int, stream=None) -> bool:

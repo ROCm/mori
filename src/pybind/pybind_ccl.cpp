@@ -165,15 +165,12 @@ void RegisterMoriCcl(pybind11::module_& m) {
       .def(
           "__call__",
           [](mori::collective::AllreduceSdma<uint32_t>& self, uintptr_t input_ptr,
-             uintptr_t output_ptr, size_t count, int64_t stream,
-             int64_t copy_stream) -> bool {
+             uintptr_t output_ptr, size_t count, int64_t stream) -> bool {
             return self(reinterpret_cast<uint32_t*>(input_ptr),
                         reinterpret_cast<uint32_t*>(output_ptr), count,
-                        reinterpret_cast<hipStream_t>(stream),
-                        reinterpret_cast<hipStream_t>(copy_stream));
+                        reinterpret_cast<hipStream_t>(stream));
           },
-          py::arg("input_ptr"), py::arg("output_ptr"), py::arg("count"), py::arg("stream") = 0,
-          py::arg("copy_stream") = 0)
+          py::arg("input_ptr"), py::arg("output_ptr"), py::arg("count"), py::arg("stream") = 0)
       .def(
           "pipelined",
           [](mori::collective::AllreduceSdma<uint32_t>& self, uintptr_t input_ptr,
@@ -220,7 +217,23 @@ void RegisterMoriCcl(pybind11::module_& m) {
             if (ptr == nullptr) throw std::runtime_error("Output transit buffer is null");
             return py::make_tuple(reinterpret_cast<uintptr_t>(ptr), size);
           },
-          "Return (ptr, size_bytes) of the output transit buffer");
+          "Return (ptr, size_bytes) of the output transit buffer")
+      .def(
+          "set_copy_stream",
+          [](mori::collective::AllreduceSdma<uint32_t>& self, int64_t stream) {
+            self.setCopyStream(reinterpret_cast<hipStream_t>(stream));
+          },
+          py::arg("stream"),
+          "Set a dedicated stream for D2D output copy (hipMemcpyAsync / DMA engine)")
+      .def(
+          "copy_output",
+          [](mori::collective::AllreduceSdma<uint32_t>& self, uintptr_t output_ptr,
+             size_t count, int64_t stream) {
+            self.copyOutput(reinterpret_cast<uint32_t*>(output_ptr), count,
+                            reinterpret_cast<hipStream_t>(stream));
+          },
+          py::arg("output_ptr"), py::arg("count"), py::arg("stream") = 0,
+          "Copy transit buffer to user output via hipMemcpyAsync");
 
   // =========================================================================
   // AllreduceSdma (fp16)
@@ -235,13 +248,11 @@ void RegisterMoriCcl(pybind11::module_& m) {
       .def(
           "__call__",
           [](mori::collective::AllreduceSdma<half>& self, uintptr_t input_ptr, uintptr_t output_ptr,
-             size_t count, int64_t stream, int64_t copy_stream) -> bool {
+             size_t count, int64_t stream) -> bool {
             return self(reinterpret_cast<half*>(input_ptr), reinterpret_cast<half*>(output_ptr),
-                        count, reinterpret_cast<hipStream_t>(stream),
-                        reinterpret_cast<hipStream_t>(copy_stream));
+                        count, reinterpret_cast<hipStream_t>(stream));
           },
           py::arg("input_ptr"), py::arg("output_ptr"), py::arg("count"), py::arg("stream") = 0,
-          py::arg("copy_stream") = 0,
           "Execute AllReduce SDMA operation (fp16)")
       .def(
           "allreduce_inplace",
@@ -261,7 +272,21 @@ void RegisterMoriCcl(pybind11::module_& m) {
             if (ptr == nullptr) throw std::runtime_error("Output transit buffer is null");
             return py::make_tuple(reinterpret_cast<uintptr_t>(ptr), size);
           },
-          "Return (ptr, size_bytes) of the output transit buffer (fp16)");
+          "Return (ptr, size_bytes) of the output transit buffer (fp16)")
+      .def(
+          "set_copy_stream",
+          [](mori::collective::AllreduceSdma<half>& self, int64_t stream) {
+            self.setCopyStream(reinterpret_cast<hipStream_t>(stream));
+          },
+          py::arg("stream"))
+      .def(
+          "copy_output",
+          [](mori::collective::AllreduceSdma<half>& self, uintptr_t output_ptr,
+             size_t count, int64_t stream) {
+            self.copyOutput(reinterpret_cast<half*>(output_ptr), count,
+                            reinterpret_cast<hipStream_t>(stream));
+          },
+          py::arg("output_ptr"), py::arg("count"), py::arg("stream") = 0);
 
   // =========================================================================
   // AllreduceSdma (bf16)
@@ -276,14 +301,12 @@ void RegisterMoriCcl(pybind11::module_& m) {
       .def(
           "__call__",
           [](mori::collective::AllreduceSdma<hip_bfloat16>& self, uintptr_t input_ptr,
-             uintptr_t output_ptr, size_t count, int64_t stream, int64_t copy_stream) -> bool {
+             uintptr_t output_ptr, size_t count, int64_t stream) -> bool {
             return self(reinterpret_cast<hip_bfloat16*>(input_ptr),
                         reinterpret_cast<hip_bfloat16*>(output_ptr), count,
-                        reinterpret_cast<hipStream_t>(stream),
-                        reinterpret_cast<hipStream_t>(copy_stream));
+                        reinterpret_cast<hipStream_t>(stream));
           },
           py::arg("input_ptr"), py::arg("output_ptr"), py::arg("count"), py::arg("stream") = 0,
-          py::arg("copy_stream") = 0,
           "Execute AllReduce SDMA operation (bf16)")
       .def(
           "allreduce_inplace",
@@ -303,6 +326,20 @@ void RegisterMoriCcl(pybind11::module_& m) {
             if (ptr == nullptr) throw std::runtime_error("Output transit buffer is null");
             return py::make_tuple(reinterpret_cast<uintptr_t>(ptr), size);
           },
-          "Return (ptr, size_bytes) of the output transit buffer (bf16)");
+          "Return (ptr, size_bytes) of the output transit buffer (bf16)")
+      .def(
+          "set_copy_stream",
+          [](mori::collective::AllreduceSdma<hip_bfloat16>& self, int64_t stream) {
+            self.setCopyStream(reinterpret_cast<hipStream_t>(stream));
+          },
+          py::arg("stream"))
+      .def(
+          "copy_output",
+          [](mori::collective::AllreduceSdma<hip_bfloat16>& self, uintptr_t output_ptr,
+             size_t count, int64_t stream) {
+            self.copyOutput(reinterpret_cast<hip_bfloat16*>(output_ptr), count,
+                            reinterpret_cast<hipStream_t>(stream));
+          },
+          py::arg("output_ptr"), py::arg("count"), py::arg("stream") = 0);
 }
 }  // namespace mori

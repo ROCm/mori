@@ -272,14 +272,13 @@ void AllreduceSdma<T>::copy_output_to_user(T* output, size_t total_count, hipStr
 // operator()
 // ---------------------------------------------------------------------------
 template <typename T>
-bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count,
-                                  hipStream_t stream, hipStream_t copy_stream) {
+bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count, hipStream_t stream) {
   static const bool fused = []() {
       const char* e = std::getenv("MORI_PIPELINE_FUSED");
       return e && std::atoi(e) == 1;
   }();
   return pipelined(input, output, total_count, 0, 0, stream,
-                   /*external_scatter=*/!fused, copy_stream);
+                   /*external_scatter=*/!fused);
 }
 
 // ================ Async API Implementations ================
@@ -428,8 +427,7 @@ bool AllreduceSdma<T>::allreduce_inplace(T* data, size_t total_count, hipStream_
 template <typename T>
 bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                                  size_t chunk_elems, int scatter_mode,
-                                 hipStream_t stream, bool external_scatter,
-                                 hipStream_t copy_stream) {
+                                 hipStream_t stream, bool external_scatter) {
     try {
         if (total_count == 0) return true;
         if (!output_transit_buffer_) {
@@ -608,13 +606,13 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         }
 
         if (copy_output_to_user_) {
-            if (copy_stream) {
+            if (copy_stream_) {
                 if (!copy_event_) {
                     hipEventCreateWithFlags(&copy_event_, hipEventDisableTiming);
                 }
                 hipEventRecord(copy_event_, stream);
-                hipStreamWaitEvent(copy_stream, copy_event_, 0);
-                copy_output_to_user(output, total_count, copy_stream);
+                hipStreamWaitEvent(copy_stream_, copy_event_, 0);
+                copy_output_to_user(output, total_count, copy_stream_);
             } else {
                 copy_output_to_user(output, total_count, stream);
             }
@@ -624,6 +622,12 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         return false;
     }
     return true;
+}
+
+// ---------------------------------------------------------------------------
+template <typename T>
+void AllreduceSdma<T>::copyOutput(T* output, size_t total_count, hipStream_t stream) {
+  copy_output_to_user(output, total_count, stream);
 }
 
 // ---------------------------------------------------------------------------
