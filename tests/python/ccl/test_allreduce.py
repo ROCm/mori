@@ -747,35 +747,121 @@ def _test_gemm_overlap_comparison(
 
 
 # ---------------------------------------------------------------------------
-#  Test 6: Multi-stage pipelined GEMM + AllReduce overlap
+#  Test 6: Multi-stage pipelined GEMM + AllReduce overlap (with size sweep)
 # ---------------------------------------------------------------------------
+
+_SWEEP_SIZES_MB = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
+
+
+def _bench_overlap_one_size(
+    rank, my_pe, npes, elems, fill_value, dtype, device,
+    stream_ar, stream_gemm, _run_gemm,
+    ev_ar_s, ev_ar_e, ev_g_s, ev_g_e, ov_s, ov_e,
+    num_stages, total_iters, warmup,
+    setup_fn,
+):
+    """Benchmark one (mode, size) combo.  Returns dict with timing or None."""
+    setup_ret = setup_fn()
+    ok_c = setup_ret[0] if len(setup_ret) == 4 else False
+    ok_pe = torch.tensor([1 if ok_c else 0], dtype=torch.int32, device=device)
+    dist.all_reduce(ok_pe, op=dist.ReduceOp.MIN)
+    if ok_pe.item() != 1:
+        dist.barrier()
+        return None
+    _, launch_ar, prep_ar, time_ar_with_wall = setup_ret
+
+    seq_ar, seq_gemm, overlap_times = [], [], []
+
+    for i in range(total_iters):
+        torch.cuda.synchronize()
+        prep_ar()
+        torch.cuda.synchronize()
+        if time_ar_with_wall:
+            t0 = time.perf_counter()
+            for _ in range(num_stages):
+                launch_ar()
+            torch.cuda.synchronize()
+            t_ar = time.perf_counter() - t0
+        else:
+            ev_ar_s.record(stream_ar)
+            with torch.cuda.stream(stream_ar):
+                for _ in range(num_stages):
+                    launch_ar()
+            ev_ar_e.record(stream_ar)
+            stream_ar.synchronize()
+            t_ar = ev_ar_s.elapsed_time(ev_ar_e) / 1000.0
+        if i >= warmup:
+            seq_ar.append(t_ar)
+
+    for i in range(total_iters):
+        torch.cuda.synchronize()
+        ev_g_s.record(stream_gemm)
+        with torch.cuda.stream(stream_gemm):
+            for _ in range(num_stages):
+                _run_gemm()
+        ev_g_e.record(stream_gemm)
+        stream_gemm.synchronize()
+        t_g = ev_g_s.elapsed_time(ev_g_e) / 1000.0
+        if i >= warmup:
+            seq_gemm.append(t_g)
+
+    ev_g_s_list = [torch.cuda.Event(enable_timing=True) for _ in range(num_stages)]
+    ev_g_e_list = [torch.cuda.Event(enable_timing=True) for _ in range(num_stages)]
+    ev_ar_s_list = [torch.cuda.Event(enable_timing=True) for _ in range(num_stages)]
+    ev_ar_e_list = [torch.cuda.Event(enable_timing=True) for _ in range(num_stages)]
+
+    for i in range(total_iters):
+        torch.cuda.synchronize()
+        prep_ar()
+        torch.cuda.synchronize()
+        ov_s.record()
+        for s in range(num_stages):
+            ev_g_s_list[s].record(stream_gemm)
+            with torch.cuda.stream(stream_gemm):
+                _run_gemm()
+            ev_g_e_list[s].record(stream_gemm)
+            stream_ar.wait_event(ev_g_e_list[s])
+            ev_ar_s_list[s].record(stream_ar)
+            with torch.cuda.stream(stream_ar):
+                launch_ar()
+            ev_ar_e_list[s].record(stream_ar)
+        stream_ar.synchronize()
+        stream_gemm.synchronize()
+        ov_e.record()
+        torch.cuda.synchronize()
+        t_ov = ov_s.elapsed_time(ov_e) / 1000.0
+        if i >= warmup:
+            overlap_times.append(t_ov)
+
+    dist.barrier()
+
+    def _reduce(vals):
+        t = torch.tensor(
+            [min(vals), max(vals), sum(vals) / len(vals)],
+            dtype=torch.float64, device=device,
+        )
+        mn = t[0].clone(); mx = t[1].clone(); avg = t[2].clone()
+        dist.all_reduce(mn, op=dist.ReduceOp.MIN)
+        dist.all_reduce(mx, op=dist.ReduceOp.MAX)
+        dist.all_reduce(avg, op=dist.ReduceOp.SUM)
+        return mn.item(), mx.item(), avg.item() / npes
+
+    g_ar = _reduce(seq_ar)
+    g_gm = _reduce(seq_gemm)
+    g_ov = _reduce(overlap_times)
+    return {
+        "seq_ar": g_ar[2] * 1000, "seq_gemm": g_gm[2] * 1000,
+        "overlap": g_ov[2] * 1000, "overlap_min": g_ov[0] * 1000,
+    }
 
 
 def _test_multi_stage_overlap(
-    rank,
-    my_pe,
-    npes,
-    elems,
-    data_bytes,
-    output_buf_size,
-    fill_value,
-    dtype,
-    dtype_name,
-    device,
-    iterations,
-    warmup,
-    gemm_m=_GEMM_M_DEFAULT,
-    gemm_n=_GEMM_N_DEFAULT,
-    gemm_k=_GEMM_K_DEFAULT,
-    num_stages=2,
+    rank, my_pe, npes, elems, data_bytes, output_buf_size, fill_value,
+    dtype, dtype_name, device, iterations, warmup,
+    gemm_m=_GEMM_M_DEFAULT, gemm_n=_GEMM_N_DEFAULT, gemm_k=_GEMM_K_DEFAULT,
+    num_stages=2, sweep=False,
 ):
-    """Multi-stage pipelined GEMM+AllReduce overlap benchmark.
-
-    Simulates real LLM training: each iteration executes num_stages rounds of
-    GEMM followed by AllReduce in a pipelined fashion (GEMM(s) -> AR(s) with
-    cross-stream dependency).  Sequential baselines also run num_stages rounds
-    per iteration so the comparison is apples-to-apples.
-    """
+    """Multi-stage pipelined GEMM+AllReduce overlap benchmark."""
     rccl_dtype = _RCCL_DTYPE_MAP.get(dtype, torch.float32)
     rccl_fill = (
         float(fill_value)
@@ -786,10 +872,10 @@ def _test_multi_stage_overlap(
     stream_ar = torch.cuda.Stream(device=device)
     stream_gemm = torch.cuda.Stream(device=device)
     total_iters = warmup + iterations
+    elem_size = torch.tensor([], dtype=dtype).element_size()
 
     A = torch.randn(gemm_m, gemm_k, dtype=torch.float32, device=device)
     B = torch.randn(gemm_k, gemm_n, dtype=torch.float32, device=device)
-
     def _run_gemm():
         return torch.matmul(A, B)
 
@@ -800,209 +886,186 @@ def _test_multi_stage_overlap(
     ov_s = torch.cuda.Event(enable_timing=True)
     ov_e = torch.cuda.Event(enable_timing=True)
 
-    all_ok = True
+    shared = dict(
+        rank=rank, my_pe=my_pe, npes=npes, fill_value=fill_value,
+        dtype=dtype, device=device, stream_ar=stream_ar,
+        stream_gemm=stream_gemm, _run_gemm=_run_gemm,
+        ev_ar_s=ev_ar_s, ev_ar_e=ev_ar_e, ev_g_s=ev_g_s,
+        ev_g_e=ev_g_e, ov_s=ov_s, ov_e=ov_e,
+        num_stages=num_stages, total_iters=total_iters, warmup=warmup,
+    )
 
-    def bench_one(label, setup_verify_and_launch_ar):
-        nonlocal all_ok
-        setup_ret = setup_verify_and_launch_ar()
-        if len(setup_ret) != 4:
-            raise TypeError(
-                f"{label}: setup must return (ok, launch, prep, time_ar_with_wall)"
-            )
-        ok_c, launch_ar, prep_ar, time_ar_with_wall = setup_ret
-
-        ok_pe = torch.tensor([1 if ok_c else 0], dtype=torch.int32, device=device)
-        dist.all_reduce(ok_pe, op=dist.ReduceOp.MIN)
-        ok_c = ok_pe.item() == 1
-        all_ok = all_ok and ok_c
-        if not ok_c:
-            if rank == 0:
-                print(f"  [{label}] setup failed on some PE, skipping bench")
-            dist.barrier()
-            return
-
-        seq_ar, seq_gemm, overlap_times = [], [], []
-
-        # Sequential AllReduce: num_stages rounds per iteration
-        for i in range(total_iters):
-            torch.cuda.synchronize()
-            prep_ar()
-            torch.cuda.synchronize()
-            if time_ar_with_wall:
-                t0 = time.perf_counter()
-                for _ in range(num_stages):
-                    launch_ar()
-                torch.cuda.synchronize()
-                t_ar = time.perf_counter() - t0
-            else:
-                ev_ar_s.record(stream_ar)
-                with torch.cuda.stream(stream_ar):
-                    for _ in range(num_stages):
-                        launch_ar()
-                ev_ar_e.record(stream_ar)
-                stream_ar.synchronize()
-                t_ar = ev_ar_s.elapsed_time(ev_ar_e) / 1000.0
-            if i >= warmup:
-                seq_ar.append(t_ar)
-
-        # Sequential GEMM: num_stages rounds per iteration
-        for i in range(total_iters):
-            torch.cuda.synchronize()
-            ev_g_s.record(stream_gemm)
-            with torch.cuda.stream(stream_gemm):
-                for _ in range(num_stages):
-                    C = _run_gemm()
-            ev_g_e.record(stream_gemm)
-            stream_gemm.synchronize()
-            t_g = ev_g_s.elapsed_time(ev_g_e) / 1000.0
-            if i >= warmup:
-                seq_gemm.append(t_g)
-            elif rank == 0:
-                _ = C.sum().item()
-
-        # Pipelined overlap: GEMM(s) -> AR(s) with cross-stream dependency
-        ev_g_s_list = [torch.cuda.Event(enable_timing=True) for _ in range(num_stages)]
-        ev_g_e_list = [torch.cuda.Event(enable_timing=True) for _ in range(num_stages)]
-        ev_ar_s_list = [torch.cuda.Event(enable_timing=True) for _ in range(num_stages)]
-        ev_ar_e_list = [torch.cuda.Event(enable_timing=True) for _ in range(num_stages)]
-
-        for i in range(total_iters):
-            torch.cuda.synchronize()
-            prep_ar()
-            torch.cuda.synchronize()
-            ov_s.record()
-
-            for s in range(num_stages):
-                ev_g_s_list[s].record(stream_gemm)
-                with torch.cuda.stream(stream_gemm):
-                    C = _run_gemm()
-                ev_g_e_list[s].record(stream_gemm)
-                stream_ar.wait_event(ev_g_e_list[s])
-                ev_ar_s_list[s].record(stream_ar)
-                with torch.cuda.stream(stream_ar):
-                    launch_ar()
-                ev_ar_e_list[s].record(stream_ar)
-
-            stream_ar.synchronize()
-            stream_gemm.synchronize()
-            ov_e.record()
-            torch.cuda.synchronize()
-            t_ov = ov_s.elapsed_time(ov_e) / 1000.0
-            if i >= warmup:
-                overlap_times.append(t_ov)
-            elif rank == 0:
-                _ = C.sum().item()
-
-        dist.barrier()
-        _print_overlap_summary(
-            rank, npes, label, seq_ar, seq_gemm, overlap_times, data_bytes
-        )
+    single_mb = max(1, data_bytes // (1024 * 1024))
+    sizes_mb = _SWEEP_SIZES_MB if sweep else [single_mb]
 
     if rank == 0:
+        sz_str = ", ".join(f"{s}MB" for s in sizes_mb)
         print(
             f"\n>>> Test 6: Multi-stage pipelined overlap "
             f"({num_stages} stages, GEMM {gemm_m}x{gemm_k}x{gemm_n})"
         )
-        print(
-            "    Pipeline: GEMM(s)->AR(s) with cross-stream dependency per stage"
-        )
+        print(f"    Sizes: {sz_str}")
 
     torch.cuda.synchronize()
     dist.barrier()
 
-    # --- SDMA copy_output_to_user=True ---
-    def setup_sdma_copy_true():
-        ar = AllreduceSdma(
-            my_pe,
-            npes,
-            input_buffer_size=data_bytes,
-            output_buffer_size=output_buf_size,
-            copy_output_to_user=True,
-            dtype=dtype,
-        )
-        inp = torch.full((elems,), fill_value, dtype=dtype, device=device)
-        out = torch.zeros(elems, dtype=dtype, device=device)
+    results = {}  # results[(size_mb, mode)] = dict
 
-        torch.cuda.synchronize()
-        dist.barrier()
-        stream_ar.synchronize()
-        ok = ar(inp, out, elems, stream_ar)
-        stream_ar.synchronize()
+    for mode in ["SDMA copy", "SDMA no-copy", "RCCL"]:
+        for size_mb in sizes_mb:
+            cur_elems = size_mb * 1024 * 1024 // elem_size
+            cur_bytes = cur_elems * elem_size
+            cur_out_size = npes * (cur_elems // npes + 64) * elem_size
 
-        def prep():
-            inp.fill_(fill_value)
+            if rank == 0:
+                print(f"  {mode:14s} | {size_mb:6d} MB ...", end="", flush=True)
 
-        def launch():
-            return ar(inp, out, elems, stream_ar)
+            if mode == "SDMA copy":
+                def make_setup(e=cur_elems, b=cur_bytes, o=cur_out_size):
+                    def setup():
+                        ar = AllreduceSdma(my_pe, npes, input_buffer_size=b,
+                                           output_buffer_size=o,
+                                           copy_output_to_user=True, dtype=dtype)
+                        inp = torch.full((e,), fill_value, dtype=dtype, device=device)
+                        out = torch.zeros(e, dtype=dtype, device=device)
+                        torch.cuda.synchronize(); dist.barrier()
+                        stream_ar.synchronize()
+                        ok = ar(inp, out, e, stream_ar); stream_ar.synchronize()
+                        def prep(): inp.fill_(fill_value)
+                        def launch(): return ar(inp, out, e, stream_ar)
+                        return ok, launch, prep, False
+                    return setup
+                setup_fn = make_setup()
+            elif mode == "SDMA no-copy":
+                def make_setup(e=cur_elems, b=cur_bytes, o=cur_out_size):
+                    def setup():
+                        ar = AllreduceSdma(my_pe, npes, input_buffer_size=b,
+                                           output_buffer_size=o,
+                                           copy_output_to_user=False, dtype=dtype)
+                        inp = torch.full((e,), fill_value, dtype=dtype, device=device)
+                        out = torch.zeros(e, dtype=dtype, device=device)
+                        torch.cuda.synchronize(); dist.barrier()
+                        stream_ar.synchronize()
+                        ok = ar(inp, out, e, stream_ar); stream_ar.synchronize()
+                        def prep(): inp.fill_(fill_value)
+                        def launch(): return ar(inp, out, e, stream_ar)
+                        return ok, launch, prep, False
+                    return setup
+                setup_fn = make_setup()
+            else:
+                def make_setup(e=cur_elems):
+                    def setup():
+                        buf = torch.full((e,), rccl_fill, dtype=rccl_dtype, device=device)
+                        dist.all_reduce(buf, op=dist.ReduceOp.SUM)
+                        torch.cuda.synchronize()
+                        def prep(): buf.fill_(rccl_fill)
+                        def launch():
+                            dist.all_reduce(buf, op=dist.ReduceOp.SUM)
+                            return True
+                        return True, launch, prep, True
+                    return setup
+                setup_fn = make_setup()
 
-        if not ok and rank == 0:
-            print("  SDMA copy=True setup ar() failed")
-        return ok, launch, prep, False
+            r = _bench_overlap_one_size(
+                elems=cur_elems, setup_fn=setup_fn, **shared,
+            )
+            results[(size_mb, mode)] = r
+            if rank == 0:
+                if r:
+                    print(f" overlap {r['overlap']:.3f} ms  "
+                          f"(ar {r['seq_ar']:.3f}, gemm {r['seq_gemm']:.3f})",
+                          flush=True)
+                else:
+                    print(" FAILED", flush=True)
 
-    bench_one(
-        f"SDMA copy=True {num_stages}-stage ({dtype_name})",
-        setup_sdma_copy_true,
-    )
+            torch.cuda.synchronize()
+            dist.barrier()
 
-    # --- SDMA copy_output_to_user=False ---
-    def setup_sdma_copy_false():
-        ar = AllreduceSdma(
-            my_pe,
-            npes,
-            input_buffer_size=data_bytes,
-            output_buffer_size=output_buf_size,
-            copy_output_to_user=False,
-            dtype=dtype,
-        )
-        inp = torch.full((elems,), fill_value, dtype=dtype, device=device)
-        out = torch.zeros(elems, dtype=dtype, device=device)
+    # ---- Summary tables (rank 0 only) ----
+    if rank == 0:
+        modes = ["SDMA copy", "SDMA no-copy", "RCCL"]
+        w = 120
+        print(f"\n{'=' * w}")
+        print(f"  Multi-stage Overlap Summary — {num_stages} stages, "
+              f"GEMM {gemm_m}x{gemm_k}x{gemm_n}")
+        print(f"{'=' * w}")
 
-        torch.cuda.synchronize()
-        dist.barrier()
-        stream_ar.synchronize()
-        ok = ar(inp, out, elems, stream_ar)
-        stream_ar.synchronize()
+        def _val(sm, key):
+            r = results.get((sm, key))
+            return r if r else None
 
-        def prep():
-            inp.fill_(fill_value)
+        def _fmt(v, key="overlap"):
+            if v is None: return "     N/A"
+            return f"{v[key]:8.3f}"
 
-        def launch():
-            return ar(inp, out, elems, stream_ar)
+        def _pct(base_v, ref_v, key="overlap"):
+            if base_v is None or ref_v is None: return "       N/A"
+            b = base_v[key]; r = ref_v[key]
+            if r == 0: return "       N/A"
+            pct = (r - b) / r * 100
+            return f"    {pct:+.1f}%"
 
-        if not ok and rank == 0:
-            print("  SDMA copy=False setup ar() failed")
-        return ok, launch, prep, False
+        # Table 1: Overlap Wall Time
+        print(f"\n  Table 1: Overlap Wall Time (ms, avg)")
+        hdr = (f"  {'Size':>8s} | {'SDMA copy':>10s} | {'SDMA no-copy':>12s} | "
+               f"{'RCCL':>10s} | {'copy vs RCCL':>12s} | {'no-copy vs RCCL':>15s}")
+        print(f"  {'-' * (len(hdr) - 2)}")
+        print(hdr)
+        print(f"  {'-' * (len(hdr) - 2)}")
+        for sm in sizes_mb:
+            rc = _val(sm, "SDMA copy")
+            rn = _val(sm, "SDMA no-copy")
+            rr = _val(sm, "RCCL")
+            print(f"  {sm:>6d} MB | {_fmt(rc):>10s} | {_fmt(rn):>12s} | "
+                  f"{_fmt(rr):>10s} | {_pct(rc, rr):>12s} | {_pct(rn, rr):>15s}")
+        print(f"  {'-' * (len(hdr) - 2)}")
 
-    bench_one(
-        f"SDMA no-copy {num_stages}-stage ({dtype_name})",
-        setup_sdma_copy_false,
-    )
+        # Table 2: GEMM Slowdown
+        print(f"\n  Table 2: GEMM Slowdown (overlap / seq_gemm, 1.0 = perfect hiding)")
+        hdr2 = f"  {'Size':>8s} | {'SDMA copy':>10s} | {'SDMA no-copy':>12s} | {'RCCL':>10s}"
+        print(f"  {'-' * (len(hdr2) - 2)}")
+        print(hdr2)
+        print(f"  {'-' * (len(hdr2) - 2)}")
+        for sm in sizes_mb:
+            vals = []
+            for m in modes:
+                r = _val(sm, m)
+                if r and r["seq_gemm"] > 0:
+                    vals.append(f"{r['overlap'] / r['seq_gemm']:8.3f}")
+                else:
+                    vals.append("     N/A")
+            print(f"  {sm:>6d} MB | {vals[0]:>10s} | {vals[1]:>12s} | {vals[2]:>10s}")
+        print(f"  {'-' * (len(hdr2) - 2)}")
 
-    # --- RCCL ---
-    def setup_rccl():
-        buf = torch.full((elems,), rccl_fill, dtype=rccl_dtype, device=device)
+        # Table 3: Sequential AllReduce Time
+        print(f"\n  Table 3: Sequential AllReduce Time (ms, avg, {num_stages} stages)")
+        print(f"  {'-' * (len(hdr2) - 2)}")
+        print(hdr2)
+        print(f"  {'-' * (len(hdr2) - 2)}")
+        for sm in sizes_mb:
+            vals = []
+            for m in modes:
+                r = _val(sm, m)
+                vals.append(f"{r['seq_ar']:8.3f}" if r else "     N/A")
+            print(f"  {sm:>6d} MB | {vals[0]:>10s} | {vals[1]:>12s} | {vals[2]:>10s}")
+        print(f"  {'-' * (len(hdr2) - 2)}")
 
-        dist.all_reduce(buf, op=dist.ReduceOp.SUM)
-        torch.cuda.synchronize()
-
-        def prep():
-            buf.fill_(rccl_fill)
-
-        def launch():
-            dist.all_reduce(buf, op=dist.ReduceOp.SUM)
-            return True
-
-        return True, launch, prep, True
-
-    rccl_name = str(rccl_dtype).split(".")[-1]
-    bench_one(
-        f"RCCL {num_stages}-stage ({dtype_name}→{rccl_name})",
-        setup_rccl,
-    )
+        # Table 4: Sequential GEMM Time
+        print(f"\n  Table 4: Sequential GEMM Time (ms, avg, {num_stages} stages)")
+        print(f"  {'-' * (len(hdr2) - 2)}")
+        print(hdr2)
+        print(f"  {'-' * (len(hdr2) - 2)}")
+        for sm in sizes_mb:
+            vals = []
+            for m in modes:
+                r = _val(sm, m)
+                vals.append(f"{r['seq_gemm']:8.3f}" if r else "     N/A")
+            print(f"  {sm:>6d} MB | {vals[0]:>10s} | {vals[1]:>12s} | {vals[2]:>10s}")
+        print(f"  {'-' * (len(hdr2) - 2)}")
 
     torch.cuda.synchronize()
     dist.barrier()
-    return all_ok
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1023,6 +1086,7 @@ def _test_allreduce(
     gemm_n=_GEMM_N_DEFAULT,
     gemm_k=_GEMM_K_DEFAULT,
     num_stages=0,
+    sweep=False,
 ):
     """Worker function for each process."""
 
@@ -1153,6 +1217,7 @@ def _test_allreduce(
                 gemm_n=gemm_n,
                 gemm_k=gemm_k,
                 num_stages=num_stages,
+                sweep=sweep,
             )
             all_ok = all_ok and ok6
 
@@ -1201,6 +1266,7 @@ def test_allreduce(
     gemm_n=_GEMM_N_DEFAULT,
     gemm_k=_GEMM_K_DEFAULT,
     num_stages=0,
+    sweep=False,
 ):
     """Run AllReduce SDMA test."""
     os.environ.setdefault("MORI_ENABLE_SDMA", "1")
@@ -1219,6 +1285,7 @@ def test_allreduce(
             gemm_n,
             gemm_k,
             num_stages,
+            sweep,
         ),
         nprocs=world_size,
         join=True,
@@ -1277,6 +1344,11 @@ if __name__ == "__main__":
         default=0,
         help="Number of pipelined GEMM+AR stages (0=skip multi-stage test)",
     )
+    parser.add_argument(
+        "--sweep",
+        action="store_true",
+        help="Sweep multiple data sizes (1MB..1GB) in multi-stage test and print summary table",
+    )
     args = parser.parse_args()
     os.environ["MORI_ENABLE_SDMA"] = str(args.enable_sdma)
 
@@ -1296,6 +1368,8 @@ if __name__ == "__main__":
         )
     if args.num_stages > 0:
         print(f"  Multi-stage     : {args.num_stages} stages (pipelined GEMM+AR)")
+        if args.sweep:
+            print(f"  Size sweep      : {', '.join(f'{s}MB' for s in _SWEEP_SIZES_MB)}")
     print("-" * 60)
 
     test_allreduce(
@@ -1309,4 +1383,5 @@ if __name__ == "__main__":
         gemm_n=args.gemm_n,
         gemm_k=args.gemm_k,
         num_stages=args.num_stages,
+        sweep=args.sweep,
     )
