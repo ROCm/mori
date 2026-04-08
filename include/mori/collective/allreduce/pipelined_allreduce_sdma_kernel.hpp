@@ -5,15 +5,17 @@
 //
 // SCATTER_MODE=0: Single-kernel AllReduce (SDMA scatter + reduce + SDMA AG)
 //   1-chunk mode (shard < 2×kMinChunkShardBytes):
-//     Block 0: burst scatter → cc wait → SDMA AG push → AG wait.
+//     Block 0: burst scatter → cc wait → flags reduce_complete → SDMA AG → AG wait.
 //     Compute blocks: scatter-poll → reduce → wbl2+fence → chunks_complete.
 //     No signal/barrier zeroing: monotonic ATOMIC_INC + baseline protocol.
 //   Multi-chunk mode (shard ≥ 2×kMinChunkShardBytes, default 2 chunks):
-//     Block 0: burst scatter → per-chunk (cc wait → SDMA AG push) → AG wait.
+//     Block 0: burst scatter → per-chunk (cc wait → flags reduce_complete → AG) → AG wait.
 //     Compute blocks: scatter-poll → reduce → wbl2+fence → chunks_complete.
 //     Overlaps AG(c) SDMA transfer with scatter(c+1)+reduce(c+1) on CU.
 //     wbl2+CC for intermediate chunks runs on wavefront 1 (thread 64),
 //     parallel with scatter-poll on wavefront 0.
+//   reduce_complete signalling uses flagsMemObj (symmetric memory) instead of
+//   qId=0 SDMA signal, avoiding cross-iteration races with scatter signals.
 //
 // SCATTER_MODE=1: P2P read + CU AG (legacy path).
 //
@@ -116,7 +118,8 @@ __global__ void PipelinedAllReduceSdmaKernel(
     size_t elementCount,
     size_t chunkElementCount,
     uint64_t scatterBase,
-    uint64_t agBase) {
+    uint64_t agBase,
+    uint64_t reduceCompleteBase) {
 
   if (elementCount == 0 || npes <= 0) return;
 
@@ -320,22 +323,20 @@ __global__ void PipelinedAllReduceSdmaKernel(
           }
           __syncthreads();
 
-          if (thr < npes && thr != myPe) {
-            HSAuint64* rSig = dstMemObj->peerSignalPtrs[thr]
-                + static_cast<size_t>(myPe) * numQ;
-            __hip_atomic_fetch_add(rSig, 1ULL,
+          if (thr == 0) {
+            HSAuint64* myFlag =
+                reinterpret_cast<HSAuint64*>(flagsMemObj->localPtr);
+            __hip_atomic_fetch_add(myFlag, 1ULL,
                                    __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
           }
 
           if (thr < npes && thr != myPe) {
-            const int sender = thr;
+            const int pe = thr;
             const uint64_t expected =
-                s_scatter_by_sender[sender]
-                + static_cast<uint64_t>(numChunks)
-                + static_cast<uint64_t>(c + 1);
-            HSAuint64* sig = dstMemObj->signalPtrs
-                + static_cast<size_t>(sender) * numQ;
-            while (core::AtomicLoadRelaxed(sig) < expected)
+                reduceCompleteBase + static_cast<uint64_t>(c + 1);
+            HSAuint64* remoteFlag =
+                reinterpret_cast<HSAuint64*>(flagsMemObj->peerPtrs[pe]);
+            while (core::AtomicLoadRelaxed(remoteFlag) < expected)
               __builtin_amdgcn_s_sleep(1);
           }
 
@@ -381,20 +382,19 @@ __global__ void PipelinedAllReduceSdmaKernel(
         }
         __syncthreads();
 
-        if (thr < npes && thr != myPe) {
-          HSAuint64* rSig = dstMemObj->peerSignalPtrs[thr]
-              + static_cast<size_t>(myPe) * numQ;
-          __hip_atomic_fetch_add(rSig, 1ULL,
+        if (thr == 0) {
+          HSAuint64* myFlag =
+              reinterpret_cast<HSAuint64*>(flagsMemObj->localPtr);
+          __hip_atomic_fetch_add(myFlag, 1ULL,
                                  __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
         }
 
         if (thr < npes && thr != myPe) {
-          const int sender = thr;
-          const uint64_t expected =
-              s_scatter_by_sender[sender] + 2ULL;
-          HSAuint64* sig = dstMemObj->signalPtrs
-              + static_cast<size_t>(sender) * numQ;
-          while (core::AtomicLoadRelaxed(sig) < expected)
+          const int pe = thr;
+          const uint64_t expected = reduceCompleteBase + 1ULL;
+          HSAuint64* remoteFlag =
+              reinterpret_cast<HSAuint64*>(flagsMemObj->peerPtrs[pe]);
+          while (core::AtomicLoadRelaxed(remoteFlag) < expected)
             __builtin_amdgcn_s_sleep(1);
         }
 

@@ -205,6 +205,10 @@ bool AllreduceSdma<T>::ensure_buffer_size(void*& buffer,
       hipMemset(gpuSig, 0, sigSize);
       pipeline_scatter_gen_ = 0;
       pipeline_ag_gen_ = 0;
+      pipeline_reduce_gen_ = 0;
+      if (flags_) {
+        hipMemset(flags_.get(), 0, static_cast<size_t>(npes_) * sizeof(uint64_t));
+      }
     }
   }
 
@@ -550,15 +554,15 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
 
         uint64_t scatter_base = pipeline_scatter_gen_;
         uint64_t ag_base      = pipeline_ag_gen_;
+        uint64_t reduce_complete_base = pipeline_reduce_gen_;
 
         if (scatter_mode == 1) {
             PipelinedAllReduceSdmaKernel<T, 1><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
                 barrierPtr_, inputSymmObj, total_count, chunk_elems,
-                scatter_base, ag_base);
+                scatter_base, ag_base, reduce_complete_base);
         } else if (external_scatter) {
-            // 2-kernel: scatter in a 1-block kernel, then pipeline reduce+AG
             ScatterSdmaOnlyKernel<T><<<1, 512, 0, stream>>>(
                 myPe_, npes_, input, output_transit_buffer_obj_,
                 total_count, chunk_elems, scatter_base);
@@ -568,31 +572,34 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                     myPe_, npes_, input,
                     output_transit_buffer_obj_, flagsObj_,
                     barrierPtr_, application::SymmMemObjPtr{},
-                    total_count, chunk_elems, scatter_base, ag_base);
+                    total_count, chunk_elems, scatter_base, ag_base,
+                    reduce_complete_base);
             } else {
                 PipelinedAllReduceSdmaKernel<T, 0, false, true>
                     <<<blocks, threads, 0, stream>>>(
                     myPe_, npes_, input,
                     output_transit_buffer_obj_, flagsObj_,
                     barrierPtr_, application::SymmMemObjPtr{},
-                    total_count, chunk_elems, scatter_base, ag_base);
+                    total_count, chunk_elems, scatter_base, ag_base,
+                    reduce_complete_base);
             }
         } else if (multi_chunk) {
             PipelinedAllReduceSdmaKernel<T, 0, true><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
                 barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems,
-                scatter_base, ag_base);
+                scatter_base, ag_base, reduce_complete_base);
         } else {
             PipelinedAllReduceSdmaKernel<T, 0, false><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
                 barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems,
-                scatter_base, ag_base);
+                scatter_base, ag_base, reduce_complete_base);
         }
 
-        pipeline_scatter_gen_ += 2 * numChunks_host;  // per-chunk cross-PE reduce_complete barrier
-        pipeline_ag_gen_      += numChunks_host;
+        pipeline_scatter_gen_ += numChunks_host;   // scatter SDMA only (qId=0)
+        pipeline_ag_gen_      += numChunks_host;   // AG SDMA (qId=1)
+        pipeline_reduce_gen_  += numChunks_host;   // reduce_complete via flags
 
         hipError_t err = hipGetLastError();
         if (err != hipSuccess) {
