@@ -131,8 +131,8 @@ void Context::CollectHostNames() {
     const auto& [peerHost, peerPid] = hostInfo[i];
     peerInfos[i].sameHost = peerHost == myHostname;
     peerInfos[i].sameProcess = peerInfos[i].sameHost && (peerPid == pid);
-    MORI_APP_TRACE("Collected hostnames: rank {}: hostname={} pid={}", 
-                     i, peerHost, peerPid);
+    MORI_APP_TRACE("Rank {} hostname={} pid={} sameHost={} sameProcess={}", 
+       i, peerHost, peerPid, peerInfos[i].sameHost, peerInfos[i].sameProcess);
   }
 }
 
