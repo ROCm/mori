@@ -946,11 +946,28 @@ def _test_multi_stage_overlap(
 
     results = {}  # results[(size_mb, mode)] = dict
 
+    max_elems = max(sizes_mb) * 1024 * 1024 // elem_size
+    max_bytes = max_elems * elem_size
+    max_out_size = npes * (max_elems // npes + 64) * elem_size
+
     for mode in ["SDMA copy", "SDMA no-copy", "RCCL"]:
+        ar_obj = None
+        if mode in ("SDMA copy", "SDMA no-copy"):
+            _copy_user = (mode == "SDMA copy")
+            if rank == 0:
+                print(f"  [{mode}] creating AR (max buf {max(sizes_mb)} MB) ...",
+                      end="", flush=True)
+            ar_obj = AllreduceSdma(my_pe, npes, input_buffer_size=max_bytes,
+                                   output_buffer_size=max_out_size,
+                                   copy_output_to_user=_copy_user,
+                                   dtype=dtype)
+            torch.cuda.synchronize(); dist.barrier()
+            if rank == 0:
+                print(" ok", flush=True)
+
         for size_mb in sizes_mb:
             cur_elems = size_mb * 1024 * 1024 // elem_size
             cur_bytes = cur_elems * elem_size
-            cur_out_size = npes * (cur_elems // npes + 64) * elem_size
 
             ov_tag = "overlap" if size_mb >= 128 else "serial"
             if rank == 0:
@@ -958,27 +975,15 @@ def _test_multi_stage_overlap(
                       end="", flush=True)
 
             if mode in ("SDMA copy", "SDMA no-copy"):
-                _copy_user = (mode == "SDMA copy")
-                def make_setup(e=cur_elems, b=cur_bytes, o=cur_out_size,
-                               copy_out=_copy_user):
+                def make_setup(e=cur_elems, _ar=ar_obj):
                     def setup():
-                        _d = (rank == 0)
-                        if _d: print(" ctor", end="", flush=True)
-                        ar = AllreduceSdma(my_pe, npes, input_buffer_size=b,
-                                           output_buffer_size=o,
-                                           copy_output_to_user=copy_out,
-                                           dtype=dtype)
-                        if _d: print("→alloc", end="", flush=True)
                         inp = torch.full((e,), fill_value, dtype=dtype, device=device)
                         out = torch.zeros(e, dtype=dtype, device=device)
-                        if _d: print("→sync", end="", flush=True)
                         torch.cuda.synchronize(); dist.barrier()
                         stream_ar.synchronize()
-                        if _d: print("→warmup", end="", flush=True)
-                        ok = ar(inp, out, e, stream_ar); stream_ar.synchronize()
-                        if _d: print("→done", end="", flush=True)
+                        ok = _ar(inp, out, e, stream_ar); stream_ar.synchronize()
                         def prep(): inp.fill_(fill_value)
-                        def launch(): return ar(inp, out, e, stream_ar)
+                        def launch(): return _ar(inp, out, e, stream_ar)
                         return ok, launch, prep, False
                     return setup
                 setup_fn = make_setup()
@@ -1008,10 +1013,14 @@ def _test_multi_stage_overlap(
                 else:
                     print(" FAILED", flush=True)
 
-            del setup_fn
-            import gc; gc.collect()
             torch.cuda.synchronize()
             dist.barrier()
+
+        if ar_obj is not None:
+            del ar_obj
+        import gc; gc.collect()
+        torch.cuda.synchronize()
+        dist.barrier()
 
     # ---- Summary tables (rank 0 only) ----
     if rank == 0:
