@@ -90,9 +90,6 @@ class AllreduceSdma {
   uint64_t pipeline_scatter_gen_ = 0;  // total SDMA ATOMIC_INC on qId=0 (serial RS/AG + pipeline scatter)
   uint64_t pipeline_ag_gen_ = 0;       // total SDMA ATOMIC_INC on qId=1 (pipeline AG only)
 
-  hipStream_t copy_stream_ = nullptr;  // if set, D2D copy runs on this stream (DMA engine)
-  hipEvent_t copy_event_ = nullptr;    // event to sync AR stream → copy stream
-
   AllreduceSdma(const AllreduceSdma&) = delete;
   AllreduceSdma& operator=(const AllreduceSdma&) = delete;
 
@@ -176,16 +173,6 @@ class AllreduceSdma {
                  size_t chunk_elems = 0, int scatter_mode = 0,
                  hipStream_t stream = nullptr,
                  bool external_scatter = false);
-
-  void setCopyStream(hipStream_t s) { copy_stream_ = s; }
-  hipStream_t getCopyStream() const { return copy_stream_; }
-
-  /**
-   * @brief Copy transit buffer → user output using hipMemcpyAsync (DMA engine).
-   *        Caller must ensure AR has completed on the AR stream before the copy
-   *        stream executes this (e.g. via event synchronization).
-   */
-  void copyOutput(T* output, size_t total_count, hipStream_t stream);
 
   application::SymmMemObjPtr getFlagsObj() const { return flagsObj_; }
   void* getOutputTransitBuffer() const { return output_transit_buffer_; }

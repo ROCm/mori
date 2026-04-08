@@ -153,10 +153,6 @@ AllreduceSdma<T>::~AllreduceSdma() {
   // Drain all GPU work (including in-flight SDMA transfers) before
   // ShmemDeleter frees the symmetric memory regions they reference.
   hipDeviceSynchronize();
-  if (copy_event_) {
-    hipEventDestroy(copy_event_);
-    copy_event_ = nullptr;
-  }
   if (flags_) {
     printf("AllreduceSdma destroyed: PE %d\n", myPe_);
   }
@@ -606,28 +602,13 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         }
 
         if (copy_output_to_user_) {
-            if (copy_stream_) {
-                if (!copy_event_) {
-                    hipEventCreateWithFlags(&copy_event_, hipEventDisableTiming);
-                }
-                hipEventRecord(copy_event_, stream);
-                hipStreamWaitEvent(copy_stream_, copy_event_, 0);
-                copy_output_to_user(output, total_count, copy_stream_);
-            } else {
-                copy_output_to_user(output, total_count, stream);
-            }
+            copy_output_to_user(output, total_count, stream);
         }
     } catch (const std::exception& e) {
         fprintf(stderr, "PE %d: PipelinedAllReduce failed: %s\n", myPe_, e.what());
         return false;
     }
     return true;
-}
-
-// ---------------------------------------------------------------------------
-template <typename T>
-void AllreduceSdma<T>::copyOutput(T* output, size_t total_count, hipStream_t stream) {
-  copy_output_to_user(output, total_count, stream);
 }
 
 // ---------------------------------------------------------------------------

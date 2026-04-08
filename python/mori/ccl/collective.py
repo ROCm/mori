@@ -300,24 +300,6 @@ class AllreduceSdma:
             _stream_to_int(stream)
         )
 
-    def set_copy_stream(self, stream):
-        """Set a dedicated stream for D2D output copy (DMA engine, zero CU usage).
-
-        When set and copy_output_to_user=True, the internal hipMemcpyAsync
-        runs on this stream instead of the AR stream.  Call once during setup.
-        """
-        self._handle.set_copy_stream(_stream_to_int(stream))
-
-    def copy_output(self, output_data, count: int, stream=None):
-        """Explicitly copy transit buffer → output via hipMemcpyAsync.
-
-        Use with copy_output_to_user=False for manual control over when/where
-        the copy runs (e.g. on a dedicated copy stream after event sync).
-        """
-        self._handle.copy_output(
-            output_data.data_ptr(), count, _stream_to_int(stream)
-        )
-
     def allreduce_inplace(self, data, count: int, stream=None) -> bool:
         """Execute in-place AllReduce SDMA operation (result overwrites input)."""
         return self._handle.allreduce_inplace(
