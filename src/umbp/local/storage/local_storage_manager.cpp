@@ -561,25 +561,26 @@ std::optional<LocalStorageManager::TierLocationInfo> LocalStorageManager::BuildT
     return std::nullopt;
   }
 
+  TierLocationInfo info;
+  info.size = size;
+
+  // DRAM: read structured chunk location directly from DRAMTier.
+  if (tier->tier_id() == StorageTier::CPU_DRAM) {
+    auto* dram = dynamic_cast<DRAMTier*>(tier);
+    if (dram) {
+      auto loc = dram->GetSlotChunkLocation(key);
+      if (!loc) return std::nullopt;
+      info.location_id = std::to_string(loc->chunk_index) + ":" + std::to_string(loc->offset);
+      return info;
+    }
+  }
+
+  // Non-DRAM tiers: single-buffer "0:<raw_id>" format.
   auto raw_id = tier->GetLocationId(key);
   if (!raw_id.has_value()) {
     return std::nullopt;
   }
-
-  TierLocationInfo info;
-  info.size = size;
-
-  if (tier->tier_id() == StorageTier::CPU_DRAM && dram_chunk_size_ > 0 &&
-      dram_chunk_size_ != SIZE_MAX) {
-    // raw_id is the global byte offset within the DRAMTier mmap region.
-    // Translate to chunk-relative "chunk_index:chunk_offset".
-    size_t global_offset = std::stoull(*raw_id);
-    uint32_t chunk_idx = static_cast<uint32_t>(global_offset / dram_chunk_size_);
-    uint64_t chunk_offset = global_offset % dram_chunk_size_;
-    info.location_id = std::to_string(chunk_idx) + ":" + std::to_string(chunk_offset);
-  } else {
-    info.location_id = "0:" + *raw_id;
-  }
+  info.location_id = "0:" + *raw_id;
   return info;
 }
 

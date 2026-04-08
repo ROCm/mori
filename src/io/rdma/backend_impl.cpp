@@ -957,9 +957,9 @@ void RdmaBackend::InvalidateSessionsForMemory(MemoryUniqueId id) {
 }
 
 size_t RdmaBackend::GetMaxMemoryRegionSize() const {
-  // IONIC (Pensando) NICs report an incorrect max_mr_size via ibv_query_device.
-  // Cap to 4 GB for these devices.
-  static constexpr size_t kIonicMaxMrSize = 4ULL * 1024 * 1024 * 1024;
+  // IONIC (Pensando/AINIC) NICs report an incorrect max_mr_size via
+  // ibv_query_device.  Cap to 2 GB for these devices.
+  static constexpr size_t kIonicMaxMrSize = 2ULL * 1024 * 1024 * 1024;
 
   size_t min_size = SIZE_MAX;
   for (const auto& [dev, port] : rdma->GetAvailDevices()) {

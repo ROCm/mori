@@ -107,6 +107,12 @@ class LocalStorageManager {
     return dynamic_cast<T*>(GetTier(tier));
   }
 
+  // Serialize a key's location for publication to the Master.
+  // DRAM: "chunk_index:offset"    SSD: "0:<raw_id>"
+  // This is the single serialization point for published location strings.
+  std::optional<TierLocationInfo> BuildTierLocationInfo(TierBackend* tier, const std::string& key,
+                                                        size_t size);
+
  private:
   UMBPConfig config_;
   UMBPRole role_;
@@ -160,21 +166,13 @@ class LocalStorageManager {
   bool DemoteLRUForSpace(TierBackend* tier);
   bool InsertReadCacheNoWriteback(const std::string& key);
   void UpsertIndexTier(const std::string& key, StorageTier tier, size_t size_hint);
-  std::optional<TierLocationInfo> BuildTierLocationInfo(TierBackend* tier, const std::string& key,
-                                                        size_t size);
 
   void MaybeAutoPromote(const std::string& key);
-
-  // DRAM MR chunk size for location_id computation.  0 or SIZE_MAX = no chunking.
-  size_t dram_chunk_size_ = 0;
 
 #ifdef __linux__
   int EnsureProxyDaemon(const std::string& shm_name);
   int SpawnProxyDaemon(const std::string& shm_name);
 #endif
-
- public:
-  void SetDramChunkSize(size_t chunk_size) { dram_chunk_size_ = chunk_size; }
 };
 
 }  // namespace mori::umbp

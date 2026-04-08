@@ -63,8 +63,14 @@ DRAMTier::DRAMTier(size_t capacity, bool use_shm, const std::string& shm_name)
     throw std::runtime_error("mmap failed: " + std::string(strerror(errno)));
   }
 
-  // Initialize free list with entire capacity
-  free_list_.push_back({0, capacity_});
+  // Default to a single full-arena chunk.  Distributed mode may call
+  // ConfigureChunks() later to re-slice for RDMA MR size limits.
+  DramChunk chunk;
+  chunk.base = base_ptr_;
+  chunk.size = capacity_;
+  chunk.free_list.push_back({0, capacity_});
+  chunks_.push_back(std::move(chunk));
+  chunks_configured_ = true;
 }
 
 DRAMTier::~DRAMTier() {
@@ -77,92 +83,112 @@ DRAMTier::~DRAMTier() {
   }
 }
 
-void DRAMTier::SetAlignmentBoundary(size_t boundary) {
+void DRAMTier::ConfigureChunks(size_t chunk_size) {
   std::lock_guard<std::mutex> lock(mu_);
-  alignment_boundary_ = boundary;
-}
-
-size_t DRAMTier::Allocate(size_t size) {
-  // Fast reject: a single block cannot exceed one chunk.
-  if (alignment_boundary_ > 0 && size > alignment_boundary_) {
-    return static_cast<size_t>(-1);
+  if (chunks_sealed_) {
+    throw std::runtime_error(
+        "DRAMTier::ConfigureChunks: chunk layout has been sealed and cannot be reconfigured");
   }
 
-  // First-fit allocation
-  for (auto it = free_list_.begin(); it != free_list_.end(); ++it) {
-    if (it->size < size) continue;
+  chunks_.clear();
 
-    size_t offset = it->offset;
+  // chunk_size == 0, SIZE_MAX, or >= capacity_ → single full-arena chunk.
+  if (chunk_size == 0 || chunk_size >= capacity_) {
+    DramChunk chunk;
+    chunk.base = base_ptr_;
+    chunk.size = capacity_;
+    chunk.free_list.push_back({0, capacity_});
+    chunks_.push_back(std::move(chunk));
+  } else {
+    for (size_t off = 0; off < capacity_; off += chunk_size) {
+      size_t sz = std::min(chunk_size, capacity_ - off);
+      DramChunk chunk;
+      chunk.base = static_cast<char*>(base_ptr_) + off;
+      chunk.size = sz;
+      chunk.free_list.push_back({0, sz});
+      chunks_.push_back(std::move(chunk));
+    }
+  }
 
-    // Check whether this allocation would cross an alignment boundary.
-    if (alignment_boundary_ > 0) {
-      size_t chunk_end = ((offset / alignment_boundary_) + 1) * alignment_boundary_;
-      if (offset + size > chunk_end) {
-        // Would cross boundary — try allocating from the next boundary.
-        size_t aligned_start = chunk_end;
-        size_t block_end = it->offset + it->size;
-        if (aligned_start + size > block_end) {
-          continue;  // Not enough space after alignment in this free block.
-        }
-        // Split:
-        //   [it->offset, aligned_start)           → keep as free (front waste)
-        //   [aligned_start, aligned_start + size)  → allocate
-        //   [aligned_start + size, block_end)      → keep as free (tail)
-        size_t front_waste = aligned_start - it->offset;
-        size_t tail_size = block_end - (aligned_start + size);
+  chunks_configured_ = true;
+}
 
-        if (front_waste > 0) {
-          it->size = front_waste;  // shrink current block to front waste
-          if (tail_size > 0) {
-            free_list_.insert(std::next(it), {aligned_start + size, tail_size});
-          }
-        } else {
-          // front_waste == 0: offset is exactly at a boundary
-          if (tail_size > 0) {
-            it->offset = aligned_start + size;
-            it->size = tail_size;
-          } else {
-            free_list_.erase(it);
-          }
-        }
-        return aligned_start;
+void DRAMTier::SealChunkLayout() {
+  std::lock_guard<std::mutex> lock(mu_);
+  chunks_sealed_ = true;
+}
+
+std::vector<ExportableDram> DRAMTier::GetExportableChunks() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  std::vector<ExportableDram> result;
+  result.reserve(chunks_.size());
+  for (const auto& chunk : chunks_) {
+    result.push_back({chunk.base, chunk.size});
+  }
+  return result;
+}
+
+std::optional<DRAMTier::ChunkLocation> DRAMTier::GetSlotChunkLocation(
+    const std::string& key) const {
+  std::lock_guard<std::mutex> lock(mu_);
+  auto it = slots_.find(key);
+  if (it == slots_.end()) return std::nullopt;
+  return ChunkLocation{it->second.chunk_index, it->second.offset};
+}
+
+std::optional<std::pair<uint32_t, size_t>> DRAMTier::Allocate(size_t size) {
+  if (!chunks_configured_) {
+    return std::nullopt;
+  }
+
+  // Iterate chunks in ascending index order (first-fit across chunks).
+  for (uint32_t ci = 0; ci < static_cast<uint32_t>(chunks_.size()); ++ci) {
+    auto& chunk = chunks_[ci];
+
+    // Fast reject: block cannot exceed this chunk's size.
+    if (size > chunk.size) continue;
+
+    // First-fit within this chunk's free list.
+    for (auto it = chunk.free_list.begin(); it != chunk.free_list.end(); ++it) {
+      if (it->size < size) continue;
+
+      size_t offset = it->offset;
+      if (it->size == size) {
+        chunk.free_list.erase(it);
+      } else {
+        it->offset += size;
+        it->size -= size;
       }
+      return std::make_pair(ci, offset);
     }
-
-    // Normal path: allocation does not cross a boundary (or no boundary set).
-    if (it->size == size) {
-      free_list_.erase(it);
-    } else {
-      it->offset += size;
-      it->size -= size;
-    }
-    return offset;
   }
-  return static_cast<size_t>(-1);  // Allocation failed
+  return std::nullopt;
 }
 
-void DRAMTier::Deallocate(size_t offset, size_t size) {
-  // Insert into sorted position and coalesce adjacent blocks
-  auto it = free_list_.begin();
-  while (it != free_list_.end() && it->offset < offset) {
+void DRAMTier::Deallocate(uint32_t chunk_index, size_t offset, size_t size) {
+  auto& free_list = chunks_[chunk_index].free_list;
+
+  // Insert into sorted position and coalesce adjacent blocks.
+  auto it = free_list.begin();
+  while (it != free_list.end() && it->offset < offset) {
     ++it;
   }
 
-  auto new_it = free_list_.insert(it, {offset, size});
+  auto new_it = free_list.insert(it, {offset, size});
 
   // Coalesce with next block
   auto next = std::next(new_it);
-  if (next != free_list_.end() && new_it->offset + new_it->size == next->offset) {
+  if (next != free_list.end() && new_it->offset + new_it->size == next->offset) {
     new_it->size += next->size;
-    free_list_.erase(next);
+    free_list.erase(next);
   }
 
   // Coalesce with previous block
-  if (new_it != free_list_.begin()) {
+  if (new_it != free_list.begin()) {
     auto prev = std::prev(new_it);
     if (prev->offset + prev->size == new_it->offset) {
       prev->size += new_it->size;
-      free_list_.erase(new_it);
+      free_list.erase(new_it);
     }
   }
 }
@@ -182,7 +208,7 @@ void DRAMTier::EvictLRU() {
   const std::string& victim = lru_list_.back();
   auto slot_it = slots_.find(victim);
   if (slot_it != slots_.end()) {
-    Deallocate(slot_it->second.offset, slot_it->second.size);
+    Deallocate(slot_it->second.chunk_index, slot_it->second.offset, slot_it->second.size);
     used_ -= slot_it->second.size;
     slots_.erase(slot_it);
   }
@@ -196,7 +222,7 @@ bool DRAMTier::Write(const std::string& key, const void* data, size_t size) {
   // If key already exists, free its old slot first
   auto existing = slots_.find(key);
   if (existing != slots_.end()) {
-    Deallocate(existing->second.offset, existing->second.size);
+    Deallocate(existing->second.chunk_index, existing->second.offset, existing->second.size);
     used_ -= existing->second.size;
     slots_.erase(existing);
     auto lru_it = lru_map_.find(key);
@@ -208,13 +234,15 @@ bool DRAMTier::Write(const std::string& key, const void* data, size_t size) {
 
   // Try to allocate — do NOT self-evict.
   // If no space, return false so upper layer can demote keys to SSD.
-  size_t offset = Allocate(size);
-  if (offset == static_cast<size_t>(-1)) {
+  auto alloc = Allocate(size);
+  if (!alloc) {
     return false;
   }
 
-  std::memcpy(static_cast<char*>(base_ptr_) + offset, data, size);
-  slots_[key] = {offset, size};
+  chunks_sealed_ = true;
+  auto [chunk_index, offset] = *alloc;
+  std::memcpy(static_cast<char*>(chunks_[chunk_index].base) + offset, data, size);
+  slots_[key] = {chunk_index, offset, size};
   used_ += size;
   TouchLRU(key);
   return true;
@@ -231,8 +259,9 @@ bool DRAMTier::ReadIntoPtr(const std::string& key, uintptr_t dst_ptr, size_t siz
   // would produce a partially-filled KV block with no error signal.
   if (size != it->second.size) return false;
 
-  std::memcpy(reinterpret_cast<void*>(dst_ptr), static_cast<char*>(base_ptr_) + it->second.offset,
-              size);
+  const auto& slot = it->second;
+  std::memcpy(reinterpret_cast<void*>(dst_ptr),
+              static_cast<char*>(chunks_[slot.chunk_index].base) + slot.offset, size);
   TouchLRU(key);
   return true;
 }
@@ -243,9 +272,10 @@ const void* DRAMTier::ReadPtr(const std::string& key, size_t* out_size) {
   auto it = slots_.find(key);
   if (it == slots_.end()) return nullptr;
 
-  if (out_size) *out_size = it->second.size;
+  const auto& slot = it->second;
+  if (out_size) *out_size = slot.size;
   TouchLRU(key);
-  return static_cast<char*>(base_ptr_) + it->second.offset;
+  return static_cast<char*>(chunks_[slot.chunk_index].base) + slot.offset;
 }
 
 std::vector<char> DRAMTier::Read(const std::string& key) {
@@ -254,9 +284,10 @@ std::vector<char> DRAMTier::Read(const std::string& key) {
   auto it = slots_.find(key);
   if (it == slots_.end()) return {};
 
-  size_t sz = it->second.size;
-  std::vector<char> buf(sz);
-  std::memcpy(buf.data(), static_cast<char*>(base_ptr_) + it->second.offset, sz);
+  const auto& slot = it->second;
+  std::vector<char> buf(slot.size);
+  std::memcpy(buf.data(), static_cast<char*>(chunks_[slot.chunk_index].base) + slot.offset,
+              slot.size);
   TouchLRU(key);
   return buf;
 }
@@ -278,7 +309,7 @@ bool DRAMTier::Evict(const std::string& key) {
   auto it = slots_.find(key);
   if (it == slots_.end()) return false;
 
-  Deallocate(it->second.offset, it->second.size);
+  Deallocate(it->second.chunk_index, it->second.offset, it->second.size);
   used_ -= it->second.size;
   slots_.erase(it);
 
@@ -300,9 +331,16 @@ void DRAMTier::Clear() {
   slots_.clear();
   lru_list_.clear();
   lru_map_.clear();
-  free_list_.clear();
-  free_list_.push_back({0, capacity_});
   used_ = 0;
+
+  if (chunks_configured_) {
+    // Re-initialize each chunk's free list to cover its full size.
+    for (auto& chunk : chunks_) {
+      chunk.free_list.clear();
+      chunk.free_list.push_back({0, chunk.size});
+    }
+  }
+  // If chunks were never configured, the next Write() will auto-configure.
 }
 
 std::vector<std::string> DRAMTier::GetLRUCandidates(size_t max_candidates) const {
@@ -310,7 +348,6 @@ std::vector<std::string> DRAMTier::GetLRUCandidates(size_t max_candidates) const
   std::lock_guard<std::mutex> lock(mu_);
   std::vector<std::string> result;
   result.reserve(std::min(max_candidates, lru_list_.size()));
-  // Walk from the back (LRU end) up to max_candidates entries.
   auto it = lru_list_.rbegin();
   for (size_t i = 0; i < max_candidates && it != lru_list_.rend(); ++i, ++it) {
     result.push_back(*it);
@@ -328,7 +365,11 @@ std::optional<size_t> DRAMTier::GetSlotOffset(const std::string& key) const {
   std::lock_guard<std::mutex> lock(mu_);
   auto it = slots_.find(key);
   if (it == slots_.end()) return std::nullopt;
-  return it->second.offset;
+  const auto& slot = it->second;
+  // Reconstruct global offset from chunk base pointer.
+  return static_cast<size_t>(static_cast<char*>(chunks_[slot.chunk_index].base) -
+                             static_cast<char*>(base_ptr_)) +
+         slot.offset;
 }
 
 std::optional<std::string> DRAMTier::GetLocationId(const std::string& key) const {

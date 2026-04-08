@@ -93,7 +93,6 @@ class UMBPClient {
   std::unique_ptr<CopyPipeline> copy_pipeline_;
   std::unique_ptr<PoolClient> pool_client_;  // non-null iff distributed mode
   std::unique_ptr<PeerServiceServer> peer_service_;
-  size_t dram_chunk_size_ = 0;  // effective DRAM MR chunk size from PoolClient
 };
 
 }  // namespace mori::umbp

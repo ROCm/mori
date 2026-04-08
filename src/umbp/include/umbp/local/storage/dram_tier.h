@@ -31,13 +31,23 @@
 #include <utility>
 #include <vector>
 
+#include "umbp/common/config.h"
 #include "umbp/local/storage/tier_backend.h"
 
 namespace mori::umbp {
 
-// DRAM Tier: mmap pre-allocated large memory block with offset allocator
+// DRAM Tier: mmap pre-allocated large memory block with chunk-aware offset allocator.
+//
+// The arena is divided into fixed-size logical chunks, each of which maps 1:1
+// to one RDMA memory region, one master-side allocator, and one published
+// location_id.  Every block is placed entirely within one chunk.
 class DRAMTier : public TierBackend {
  public:
+  struct ChunkLocation {
+    uint32_t chunk_index = 0;
+    size_t offset = 0;
+  };
+
   DRAMTier(size_t capacity, bool use_shm = false, const std::string& shm_name = "/umbp_dram");
   ~DRAMTier() override;
 
@@ -68,16 +78,37 @@ class DRAMTier : public TierBackend {
   // the returned pointer across Evict/Write calls.
   const void* ReadPtr(const std::string& key, size_t* out_size) override;
 
-  // Accessors for distributed integration (Phase 2).
   // Returns the mmap'd base address for RDMA registration.
   void* GetBasePtr() const { return base_ptr_; }
-  // Returns the byte offset of a key's slot, or nullopt if not found.
+
+  // Returns the byte offset of a key's slot (global, across all chunks).
   std::optional<size_t> GetSlotOffset(const std::string& key) const;
 
-  // Set an alignment boundary for the offset allocator.  When set,
-  // Allocate() guarantees no returned slot crosses a multiple of this
-  // boundary.  Must be called before any allocation.
-  void SetAlignmentBoundary(size_t boundary);
+  // Re-slice the DRAM arena into fixed-size chunks for RDMA MR registration.
+  // The constructor already initializes a single full-arena chunk, so this
+  // method only needs to be called when the deployment requires smaller
+  // chunks (e.g. AINIC/Pensando 2 GB MR limit).  When chunk_size >= capacity
+  // (including SIZE_MAX or 0) the result is a single chunk.
+  //
+  // Chunk layout is a startup-time decision: ConfigureChunks() may only be
+  // called before the layout is sealed.  The layout is sealed either by
+  // SealChunkLayout() (called after distributed initialization registers
+  // MRs with the master) or by the first successful Write().  Once sealed
+  // the layout is permanently locked — Clear() does not re-enable
+  // reconfiguration.
+  void ConfigureChunks(size_t chunk_size);
+
+  // Permanently lock the current chunk layout.  Called by UMBPClient after
+  // distributed initialization so that the local layout cannot diverge
+  // from the already-registered MRs and master's buffer_index mapping.
+  // Also called implicitly by the first successful Write().
+  void SealChunkLayout();
+
+  // Return one ExportableDram per configured chunk.
+  std::vector<ExportableDram> GetExportableChunks() const;
+
+  // Return the chunk-local location of a key's slot.
+  std::optional<ChunkLocation> GetSlotChunkLocation(const std::string& key) const;
 
  private:
   void* base_ptr_;  // mmap base address
@@ -87,10 +118,11 @@ class DRAMTier : public TierBackend {
   bool use_shm_;
   std::string shm_name_;
 
-  // Simple offset allocator: key -> (offset, size)
+  // Chunk-aware slot metadata: key -> (chunk_index, offset_within_chunk, size)
   struct SlotInfo {
-    size_t offset;
-    size_t size;
+    uint32_t chunk_index = 0;
+    size_t offset = 0;
+    size_t size = 0;
   };
   std::unordered_map<std::string, SlotInfo> slots_;
 
@@ -103,15 +135,27 @@ class DRAMTier : public TierBackend {
     size_t offset;
     size_t size;
   };
-  std::list<FreeBlock> free_list_;
+
+  // Chunk layout
+  struct DramChunk {
+    void* base = nullptr;
+    size_t size = 0;
+    std::list<FreeBlock> free_list;
+  };
+  std::vector<DramChunk> chunks_;
+  bool chunks_configured_ = false;
+  bool chunks_sealed_ = false;  // set by SealChunkLayout() or first Write; never cleared
 
   mutable std::mutex mu_;
-  size_t alignment_boundary_ = 0;  // 0 = disabled
 
-  size_t Allocate(size_t size);                 // Allocate from free_list_
-  void Deallocate(size_t offset, size_t size);  // Return to free_list_
-  void EvictLRU();                              // Evict least recently used
-  void TouchLRU(const std::string& key);        // Update LRU position
+  // Allocate from chunk free lists.  Returns {chunk_index, offset} or nullopt.
+  std::optional<std::pair<uint32_t, size_t>> Allocate(size_t size);
+
+  // Return space to the chunk-local free list with coalescing.
+  void Deallocate(uint32_t chunk_index, size_t offset, size_t size);
+
+  void EvictLRU();
+  void TouchLRU(const std::string& key);
 };
 
 }  // namespace mori::umbp

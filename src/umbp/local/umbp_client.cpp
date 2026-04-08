@@ -100,21 +100,23 @@ UMBPClient::UMBPClient(const UMBPConfig& config)
 
   // Register DRAM for local zero-copy RDMA and install tier-change callback.
   if (pool_client_) {
-    // Propagate chunk metadata so that the DRAMTier allocator and
-    // LocalStorageManager produce chunk-aware location_ids.
-    dram_chunk_size_ = pool_client_->DramChunkSize();
-    if (dram_chunk_size_ > 0 && dram_chunk_size_ != SIZE_MAX) {
-      auto* dram_for_align = storage_.GetTierAs<DRAMTier>(StorageTier::CPU_DRAM);
-      if (dram_for_align) {
-        dram_for_align->SetAlignmentBoundary(dram_chunk_size_);
-      }
-      storage_.SetDramChunkSize(dram_chunk_size_);
+    // Configure DRAMTier chunk layout from the effective MR chunk size
+    // computed by PoolClient.  This makes the allocator chunk-aware so
+    // every block fits entirely within one chunk / one RDMA MR.
+    auto* dram_for_chunks = storage_.GetTierAs<DRAMTier>(StorageTier::CPU_DRAM);
+    if (dram_for_chunks) {
+      dram_for_chunks->ConfigureChunks(pool_client_->DramChunkSize());
     }
 
     auto* dram = storage_.GetTierAs<DRAMTier>(StorageTier::CPU_DRAM);
     if (dram) {
       auto [used, total] = storage_.Capacity(StorageTier::CPU_DRAM);
       pool_client_->RegisterMemory(dram->GetBasePtr(), total);
+      // Seal the chunk layout now that MRs are registered and the master
+      // has recorded the buffer_index mapping.  Any later ConfigureChunks()
+      // call (e.g. via the public Storage()/GetTierAs() accessors) would
+      // desync local placement from the RDMA/master view.
+      dram->SealChunkLayout();
     }
 
     if (config_.distributed->peer_service_port > 0 && config_.ssd.enabled &&
@@ -167,20 +169,12 @@ UMBPClient::~UMBPClient() {
 
 void UMBPClient::MaybePublishLocal(const std::string& key, size_t size) {
   if (!pool_client_) return;
-  auto* dram = storage_.GetTierAs<DRAMTier>(StorageTier::CPU_DRAM);
+  auto* dram = storage_.GetTier(StorageTier::CPU_DRAM);
   if (!dram) return;
-  auto offset = dram->GetSlotOffset(key);
-  if (!offset) return;
+  auto info = storage_.BuildTierLocationInfo(dram, key, size);
+  if (!info) return;
 
-  std::string location_id;
-  if (dram_chunk_size_ > 0 && dram_chunk_size_ != SIZE_MAX) {
-    uint32_t chunk_idx = static_cast<uint32_t>(*offset / dram_chunk_size_);
-    uint64_t chunk_offset = *offset % dram_chunk_size_;
-    location_id = std::to_string(chunk_idx) + ":" + std::to_string(chunk_offset);
-  } else {
-    location_id = "0:" + std::to_string(*offset);
-  }
-  pool_client_->PublishLocalBlock(key, size, location_id, TierType::DRAM);
+  pool_client_->PublishLocalBlock(key, size, info->location_id, TierType::DRAM);
 }
 
 bool UMBPClient::Put(const std::string& key, const void* data, size_t size) {
@@ -458,6 +452,11 @@ size_t UMBPClient::BatchExistsConsecutive(const std::vector<std::string>& keys) 
 }
 
 void UMBPClient::Clear() {
+  if (pool_client_) {
+    throw std::runtime_error(
+        "UMBPClient::Clear: not supported in distributed mode — "
+        "published locations cannot be bulk-unregistered from the master");
+  }
   index_.Clear();
   storage_.Clear();
 }
