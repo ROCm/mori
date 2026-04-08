@@ -211,7 +211,7 @@ void testOneShotSdmaAll2all() {
   printf("PE %d of %d started\n", myPe, npes);
 
   // Configuration - can adjust size as needed
-  const int elemsPerPe = 64 * 1024 * 1024;  // 64*1M elements
+  const int elemsPerPe = 8 * 1024 * 1024;  // 8M elements (256MB total for 8 PEs, fits in 4GB shmem heap)
   const size_t bytesPerPe = elemsPerPe * sizeof(uint32_t);
   const size_t totalBytes = bytesPerPe * npes;
 
