@@ -952,26 +952,15 @@ def _test_multi_stage_overlap(
                     def setup():
                         ar = AllreduceSdma(my_pe, npes, input_buffer_size=b,
                                            output_buffer_size=o,
-                                           copy_output_to_user=False, dtype=dtype)
+                                           copy_output_to_user=True, dtype=dtype)
                         inp = torch.full((e,), fill_value, dtype=dtype, device=device)
                         out = torch.zeros(e, dtype=dtype, device=device)
-                        s_cp = torch.cuda.Stream()
-                        ev_cp = torch.cuda.Event()
                         torch.cuda.synchronize(); dist.barrier()
                         stream_ar.synchronize()
                         ok = ar(inp, out, e, stream_ar); stream_ar.synchronize()
-                        ev_cp.record(stream_ar)
-                        s_cp.wait_event(ev_cp)
-                        ar.copy_output(out, e, s_cp)
-                        s_cp.synchronize()
                         def prep(): inp.fill_(fill_value)
-                        def launch():
-                            ok = ar(inp, out, e, stream_ar)
-                            ev_cp.record(stream_ar)
-                            s_cp.wait_event(ev_cp)
-                            ar.copy_output(out, e, s_cp)
-                            return ok
-                        return ok, launch, prep, False, s_cp
+                        def launch(): return ar(inp, out, e, stream_ar)
+                        return ok, launch, prep, False
                     return setup
                 setup_fn = make_setup()
             elif mode == "SDMA no-copy":
