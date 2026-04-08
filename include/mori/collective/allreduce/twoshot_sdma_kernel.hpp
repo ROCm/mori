@@ -50,7 +50,6 @@ struct alignas(128) CrossPeBarrier {
   uint32_t block_done[kMaxPipelineBlocks];
   uint32_t chunks_complete;
   uint32_t ag_gate;
-  uint32_t ag_complete;  // set by block 0 after AG; compute blocks poll before copy
 };
 
 inline int getDeviceMaxBlocks() {

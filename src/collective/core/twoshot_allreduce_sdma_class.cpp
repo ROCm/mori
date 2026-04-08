@@ -551,8 +551,6 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         uint64_t scatter_base = pipeline_scatter_gen_;
         uint64_t ag_base      = pipeline_ag_gen_;
 
-        T* userOutput = copy_output_to_user_ ? output : nullptr;
-
         if (scatter_mode == 1) {
             PipelinedAllReduceSdmaKernel<T, 1><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
@@ -560,6 +558,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                 barrierPtr_, inputSymmObj, total_count, chunk_elems,
                 scatter_base, ag_base);
         } else if (external_scatter) {
+            // 2-kernel: scatter in a 1-block kernel, then pipeline reduce+AG
             ScatterSdmaOnlyKernel<T><<<1, 512, 0, stream>>>(
                 myPe_, npes_, input, output_transit_buffer_obj_,
                 total_count, chunk_elems, scatter_base);
@@ -569,29 +568,27 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                     myPe_, npes_, input,
                     output_transit_buffer_obj_, flagsObj_,
                     barrierPtr_, application::SymmMemObjPtr{},
-                    total_count, chunk_elems, scatter_base, ag_base,
-                    userOutput);
+                    total_count, chunk_elems, scatter_base, ag_base);
             } else {
                 PipelinedAllReduceSdmaKernel<T, 0, false, true>
                     <<<blocks, threads, 0, stream>>>(
                     myPe_, npes_, input,
                     output_transit_buffer_obj_, flagsObj_,
                     barrierPtr_, application::SymmMemObjPtr{},
-                    total_count, chunk_elems, scatter_base, ag_base,
-                    userOutput);
+                    total_count, chunk_elems, scatter_base, ag_base);
             }
         } else if (multi_chunk) {
             PipelinedAllReduceSdmaKernel<T, 0, true><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
                 barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems,
-                scatter_base, ag_base, userOutput);
+                scatter_base, ag_base);
         } else {
             PipelinedAllReduceSdmaKernel<T, 0, false><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
                 barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems,
-                scatter_base, ag_base, userOutput);
+                scatter_base, ag_base);
         }
 
         pipeline_scatter_gen_ += 2 * numChunks_host;  // per-chunk cross-PE reduce_complete barrier
@@ -604,7 +601,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             return false;
         }
 
-        if (copy_output_to_user_ && scatter_mode == 1) {
+        if (copy_output_to_user_) {
             copy_output_to_user(output, total_count, stream);
         }
     } catch (const std::exception& e) {
