@@ -15,8 +15,8 @@ void PrintUsage(const char* program) {
                "  -w warmup      warmup iterations\n"
                "  -c grid_x      CUDA/HIP grid x (blocks)\n"
                "  -t threads     threads per block\n"
-               "  -s scope       thread | warp | block\n"
-               "  -B             bidirectional (both PEs run kernels; BW summed on PE 0)\n"
+               "  -s scope       thread | warp | block (put_bw: which put; put_latency: default block)\n"
+               "  -B             bidirectional (p2p_put_bw only; ignored by p2p_put_latency)\n"
                "  -h             this help\n",
                program != nullptr ? program : "program");
 }
@@ -76,26 +76,32 @@ int ParseArgs(int argc, char** argv, PerfArgs* out_args) {
   return 0;
 }
 
-void PrintTable(const char* test_name, const char* scope_name, int nblocks, int threads_per_block,
-                int warp_size, std::size_t iters, std::size_t warmup,
-                const std::vector<BandwidthSample>& rows) {
-  const char* scope_col = scope_name;
-  const char* tag = (test_name != nullptr && test_name[0] != '\0') ? test_name : "shmem_put_bw";
+void PrintPerfTable(const char* test_name, const char* scope_name, int grid_x, int block_threads,
+                    int warp_size, std::size_t iters, std::size_t warmup, PerfTableMetric metric,
+                    const std::vector<PerfTableRow>& rows) {
+  const char* scope_col =
+      (scope_name != nullptr && scope_name[0] != '\0') ? scope_name : "None";
+  const char* default_tag = (metric == PerfTableMetric::kBandwidthGbps) ? "shmem_put_bw"
+                                                                        : "shmem_put_latency";
+  const char* tag = (test_name != nullptr && test_name[0] != '\0') ? test_name : default_tag;
 
   std::printf("# %s scope=%s grid=%d block=%d warpSize=%d iters=%zu warmup=%zu\n", tag, scope_col,
-              nblocks, threads_per_block, warp_size, iters, warmup);
+              grid_x, block_threads, warp_size, iters, warmup);
 
-  // Fixed widths; size / bandwidth numeric column right-aligned (bulk put_bw: no MPPS like scalar p_bw).
   constexpr int kWSize = 14;
   constexpr int kWScope = 12;
-  constexpr int kBandwidth = 18;
-  std::printf("%-*s %-*s %-*s\n", kWSize, "size(B)", kWScope, "scope", kBandwidth, "Bandwidth (GB)");
-  for (const BandwidthSample& r : rows) {
+  constexpr int kVal = 18;
+  const char* val_header =
+      (metric == PerfTableMetric::kBandwidthGbps) ? "Bandwidth (GB)" : "latency(us)";
+  const int prec = 6;
+
+  std::printf("%-*s %-*s %-*s\n", kWSize, "size(B)", kWScope, "scope", kVal, val_header);
+  for (const PerfTableRow& r : rows) {
     if (r.skipped) {
-      std::printf("%-*zu %-*s %-*s\n", kWSize, r.size_bytes, kWScope, scope_col, kBandwidth, "skip");
+      std::printf("%-*zu %-*s %-*s\n", kWSize, r.size_bytes, kWScope, scope_col, kVal, "skip");
     } else {
-      std::printf("%-*zu %-*s %-*.6f\n", kWSize, r.size_bytes, kWScope, scope_col, kBandwidth,
-                  r.gbps);
+      std::printf("%-*zu %-*s %-*.*f\n", kWSize, r.size_bytes, kWScope, scope_col, kVal, prec,
+                  r.value);
     }
   }
   std::fflush(stdout);

@@ -61,16 +61,19 @@ int ParseArgs(int argc, char** argv, PerfArgs* out_args);
 
 void PrintUsage(const char* program);
 
-struct BandwidthSample {
+enum class PerfTableMetric { kBandwidthGbps, kLatencyUs };
+
+// One row: value is GB/s (put_bw) or µs/iter (put_latency) depending on metric.
+struct PerfTableRow {
   std::size_t size_bytes{};
-  bool skipped{};  // if true, print skip line instead of gbps
-  double gbps{}; // no need to print mpps, because we don't put 1/4/8 bytes at a time
+  bool skipped{};
+  double value{};
 };
 
-// PE 0 only. test_name: e.g. shmem_put_bw_uni / shmem_put_bw_bidi (NVSHMEM device put_bw).
-void PrintTable(const char* test_name, const char* scope_name, int nblocks, int threads_per_block,
-                int warp_size, std::size_t iters, std::size_t warmup,
-                const std::vector<BandwidthSample>& rows);
+// PE 0 only. test_name e.g. shmem_put_bw_uni / shmem_put_latency_uni; value column from metric.
+void PrintPerfTable(const char* test_name, const char* scope_name, int grid_x, int block_threads,
+                    int warp_size, std::size_t iters, std::size_t warmup, PerfTableMetric metric,
+                    const std::vector<PerfTableRow>& rows);
 
 
 inline const char* ScopeToChar(PutScope scope) {

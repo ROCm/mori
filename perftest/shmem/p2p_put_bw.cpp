@@ -286,7 +286,7 @@ int main(int argc, char** argv) {
   double* data_d = static_cast<double*>(symm);
   HIP_RUNTIME_CHECK(hipMemset(data_d, 0, args.max_size));
 
-  std::vector<BandwidthSample> bandwidth_table;
+  std::vector<PerfTableRow> bandwidth_table;
   if (my_pe == 0) {
     bandwidth_table.reserve(64);
   }
@@ -299,7 +299,7 @@ int main(int argc, char** argv) {
     size_t len_doubles = size_bytes / sizeof(double);
     if (!size_ok(scope, len_doubles, args.nblocks, args.threads_per_block, device_warp_size)) {
       if (my_pe == 0) {
-        bandwidth_table.push_back(BandwidthSample{size_bytes, true, 0.0});
+        bandwidth_table.push_back(PerfTableRow{size_bytes, true, 0.0});
       }
       ShmemBarrierAll();
       continue;
@@ -331,11 +331,11 @@ int main(int argc, char** argv) {
         double gbps_sum = 0.0;
         MPI_Reduce(&gbps_local, &gbps_sum, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
         if (my_pe == 0) {
-          bandwidth_table.push_back(BandwidthSample{size_bytes, false, gbps_sum});
+          bandwidth_table.push_back(PerfTableRow{size_bytes, false, gbps_sum});
         }
       } else {
         if (my_pe == 0) {
-          bandwidth_table.push_back(BandwidthSample{size_bytes, false, gbps});
+          bandwidth_table.push_back(PerfTableRow{size_bytes, false, gbps});
         }
       }
     }
@@ -346,8 +346,8 @@ int main(int argc, char** argv) {
   ShmemBarrierAll();
   if (my_pe == 0) {
     const char* test_name = args.bidirectional ? "shmem_put_bw_bidi" : "shmem_put_bw_uni";
-    PrintTable(test_name, scope_name, args.nblocks, args.threads_per_block, device_warp_size,
-               args.iters, args.warmup, bandwidth_table);
+    PrintPerfTable(test_name, scope_name, args.nblocks, args.threads_per_block, device_warp_size,
+                   args.iters, args.warmup, PerfTableMetric::kBandwidthGbps, bandwidth_table);
   }
 
   if (run_kernels) {
