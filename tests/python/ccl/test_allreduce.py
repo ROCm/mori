@@ -279,47 +279,30 @@ def _test_inplace(
     torch.cuda.synchronize()
     dist.barrier()
 
-    # ---------- diagnostic: outplace with copy_output_to_user=True ----------
-    ar_diag = AllreduceSdma(
-        my_pe,
-        npes,
-        input_buffer_size=data_bytes,
-        output_buffer_size=output_buf_size,
-        copy_output_to_user=True,
-        dtype=dtype,
-    )
+    # ---------- Single-shot correctness verification ----------
+    expected_val = sum((pe + 1) * 1000 for pe in range(npes))
+
+    # Step A: outplace allreduce (no copy) with the SAME AR — verify transit buffer
     diag_inp = torch.full((elems,), fill_value, dtype=dtype, device=device)
     diag_out = torch.zeros(elems, dtype=dtype, device=device)
     torch.cuda.synchronize()
-    dist.barrier()
-    ar_diag(diag_inp, diag_out, elems, stream)
+    ar(diag_inp, diag_out, elems, stream)
     stream.synchronize()
-    diag_transit = ar_diag.get_output_transit_buffer(dtype=dtype)
+    diag_transit = ar.get_output_transit_buffer(dtype=dtype)
     diag_transit_cpu = _to_numpy(diag_transit.cpu())
-    diag_out_cpu = _to_numpy(diag_out.cpu())
-    expected_val = sum((pe + 1) * 1000 for pe in range(npes))
     t_ok = np.all(diag_transit_cpu[:elems] == expected_val) if dtype in (torch.uint32, torch.int32) else np.allclose(diag_transit_cpu[:elems].astype(np.float32), expected_val, rtol=1e-2, atol=1.0)
-    o_ok = np.all(diag_out_cpu[:elems] == expected_val) if dtype in (torch.uint32, torch.int32) else np.allclose(diag_out_cpu[:elems].astype(np.float32), expected_val, rtol=1e-2, atol=1.0)
     if rank == 0:
-        print(f"  [diag] outplace+copy: transit={'PASS' if t_ok else 'FAIL'}, "
-              f"output={'PASS' if o_ok else 'FAIL'}")
-        if not t_ok:
-            bad = np.where(diag_transit_cpu[:min(elems, len(diag_transit_cpu))] != expected_val)[0]
-            print(f"    transit mismatches: {len(bad)}, first idx {bad[0]}: {diag_transit_cpu[bad[0]]}")
-        if not o_ok:
-            bad = np.where(diag_out_cpu[:min(elems, len(diag_out_cpu))] != expected_val)[0]
-            print(f"    output mismatches: {len(bad)}, first idx {bad[0]}: {diag_out_cpu[bad[0]]}")
-    del ar_diag, diag_inp, diag_out
+        print(f"  [diag-A] outplace (same AR, no copy): transit={'PASS' if t_ok else 'FAIL'}")
+    del diag_inp, diag_out
     torch.cuda.synchronize()
     dist.barrier()
 
-    # ---------- Single-shot correctness verification ----------
+    # Step B: inplace allreduce (same AR, input=output=data, with copy)
     inplace_tensor.fill_(fill_value)
     torch.cuda.synchronize()
     ar.allreduce_inplace(inplace_tensor, elems, stream)
     stream.synchronize()
 
-    # Check transit buffer FIRST (kernel result before copy)
     transit_buf = ar.get_output_transit_buffer(dtype=dtype)
     transit_cpu = _to_numpy(transit_buf.cpu())
     transit_ok = _verify_allreduce_result(
@@ -332,18 +315,15 @@ def _test_inplace(
     )
 
     if rank == 0:
-        print(f"  [diag] inplace: transit={'PASS' if transit_ok else 'FAIL'}, "
+        print(f"  [diag-B] inplace: transit={'PASS' if transit_ok else 'FAIL'}, "
               f"data={'PASS' if ok else 'FAIL'}")
         if transit_ok and not ok:
             print("  [diag] BUG IS IN copy_output_to_user!")
-        elif not transit_ok:
-            print("  [diag] BUG IS IN kernel (transit buffer already wrong)")
-            bad_t = np.where(transit_cpu[:min(elems, len(transit_cpu))] != expected_val)[0]
-            if len(bad_t) > 0:
-                print(f"    transit: {len(bad_t)} mismatches, idx {bad_t[0]}: {transit_cpu[bad_t[0]]}")
-                for shard in range(npes):
-                    s = shard * (elems // npes)
-                    print(f"    shard {shard} [idx {s}]: transit={transit_cpu[s]}, data={inp_cpu[s]}")
+        elif not transit_ok and not ok:
+            print("  [diag] transit already wrong — problem in scatter/reduce/AG with input=output")
+            for shard in range(npes):
+                s = shard * (elems // npes)
+                print(f"    shard {shard} [idx {s}]: transit={transit_cpu[s]}, data={inp_cpu[s]}")
 
     if rank == 0 and ok:
         print(f"  PE {rank}: inplace result verified (all values ~ {expected_val})")
