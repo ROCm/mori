@@ -282,22 +282,7 @@ def _test_inplace(
     # ---------- Single-shot correctness verification ----------
     expected_val = sum((pe + 1) * 1000 for pe in range(npes))
 
-    # Step A: outplace allreduce (no copy) with the SAME AR — verify transit buffer
-    diag_inp = torch.full((elems,), fill_value, dtype=dtype, device=device)
-    diag_out = torch.zeros(elems, dtype=dtype, device=device)
-    torch.cuda.synchronize()
-    ar(diag_inp, diag_out, elems, stream)
-    stream.synchronize()
-    diag_transit = ar.get_output_transit_buffer(dtype=dtype)
-    diag_transit_cpu = _to_numpy(diag_transit.cpu())
-    t_ok = np.all(diag_transit_cpu[:elems] == expected_val) if dtype in (torch.uint32, torch.int32) else np.allclose(diag_transit_cpu[:elems].astype(np.float32), expected_val, rtol=1e-2, atol=1.0)
-    if rank == 0:
-        print(f"  [diag-A] outplace (same AR, no copy): transit={'PASS' if t_ok else 'FAIL'}")
-    del diag_inp, diag_out
-    torch.cuda.synchronize()
-    dist.barrier()
-
-    # Step B: inplace allreduce (same AR, input=output=data, with copy)
+    # Test C: inplace as the FIRST call on this AR (no prior outplace)
     inplace_tensor.fill_(fill_value)
     torch.cuda.synchronize()
     ar.allreduce_inplace(inplace_tensor, elems, stream)
@@ -315,16 +300,40 @@ def _test_inplace(
     )
 
     if rank == 0:
-        print(f"  [diag-B] inplace: transit={'PASS' if transit_ok else 'FAIL'}, "
+        print(f"  [diag] inplace (1st call): transit={'PASS' if transit_ok else 'FAIL'}, "
               f"data={'PASS' if ok else 'FAIL'}")
-        if transit_ok and not ok:
-            print("  [diag] BUG IS IN copy_output_to_user!")
-        elif not transit_ok and not ok:
-            print("  [diag] transit already wrong — problem in scatter/reduce/AG with input=output")
+        if not transit_ok:
             for shard in range(npes):
                 s = shard * (elems // npes)
                 print(f"    shard {shard} [idx {s}]: transit={transit_cpu[s]}, data={inp_cpu[s]}")
 
+    # Test D: inplace as the SECOND call (transit has stale reduce result)
+    dist.barrier()
+    if rank == 0:
+        print(f"  --- testing 2nd call (transit has stale reduce from 1st call) ---")
+    inplace_tensor.fill_(fill_value)
+    torch.cuda.synchronize()
+    ar.allreduce_inplace(inplace_tensor, elems, stream)
+    stream.synchronize()
+
+    transit_buf2 = ar.get_output_transit_buffer(dtype=dtype)
+    transit_cpu2 = _to_numpy(transit_buf2.cpu())
+    transit_ok2 = _verify_allreduce_result(
+        transit_cpu2, elems, my_pe, npes, f"inplace2-transit/{dtype_name}", dtype=dtype
+    )
+    inp_cpu2 = _to_numpy(inplace_tensor.cpu())
+    ok2 = _verify_allreduce_result(
+        inp_cpu2, elems, my_pe, npes, f"inplace2/{dtype_name}", dtype=dtype
+    )
+    if rank == 0:
+        print(f"  [diag] inplace (2nd call): transit={'PASS' if transit_ok2 else 'FAIL'}, "
+              f"data={'PASS' if ok2 else 'FAIL'}")
+        if not transit_ok2:
+            for shard in range(npes):
+                s = shard * (elems // npes)
+                print(f"    shard {shard} [idx {s}]: transit={transit_cpu2[s]}, data={inp_cpu2[s]}")
+
+    ok = ok and ok2
     if rank == 0 and ok:
         print(f"  PE {rank}: inplace result verified (all values ~ {expected_val})")
 
