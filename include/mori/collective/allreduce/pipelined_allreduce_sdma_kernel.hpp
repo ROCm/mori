@@ -116,7 +116,8 @@ __global__ void PipelinedAllReduceSdmaKernel(
     size_t elementCount,
     size_t chunkElementCount,
     uint64_t scatterBase,
-    uint64_t agBase) {
+    uint64_t agBase,
+    T* userOutput = nullptr) {
 
   if (elementCount == 0 || npes <= 0) return;
 
@@ -270,6 +271,23 @@ __global__ void PipelinedAllReduceSdmaKernel(
                                __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
       }
 
+      if (userOutput != nullptr) {
+        if (threadIdx.x == 0) {
+          while (__scoped_atomic_load_n(&barrier->ag_complete,
+                     __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) == 0)
+            __builtin_amdgcn_s_sleep(1);
+        }
+        __syncthreads();
+
+        const P* src = reinterpret_cast<const P*>(dstMemObj->localPtr);
+        P* dst = reinterpret_cast<P*>(userOutput);
+        const size_t totalPacked = elementCount / pack_size;
+
+        for (size_t i = compTid; i < totalPacked; i += compStride) {
+          dst[i] = src[i];
+        }
+      }
+
     } else {
       // =================================================================
       // BLOCK 0 — Burst-Submit Scatter + AG
@@ -421,6 +439,14 @@ __global__ void PipelinedAllReduceSdmaKernel(
             __builtin_amdgcn_s_sleep(1);
         }
 
+      }
+
+      if (userOutput != nullptr) {
+        __syncthreads();
+        if (thr == 0) {
+          __hip_atomic_fetch_add(&barrier->ag_complete, 1u,
+                                 __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+        }
       }
 
     }  // end block 0 vs compute
