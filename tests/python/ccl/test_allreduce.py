@@ -1314,8 +1314,6 @@ def test_allreduce(
 ):
     """Run AllReduce SDMA test."""
     os.environ.setdefault("MORI_ENABLE_SDMA", "1")
-    if num_stages > 0 or test_gemm_overlap:
-        os.environ.setdefault("MORI_PIPELINE_CU", "64")
     port = get_free_port()
     torch.multiprocessing.spawn(
         _test_allreduce,
