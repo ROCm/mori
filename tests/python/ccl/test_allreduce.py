@@ -861,22 +861,28 @@ def _bench_overlap_one_size(
     dist.barrier()
 
     def _reduce(vals):
+        import statistics
+        sorted_v = sorted(vals)
+        med = statistics.median(sorted_v)
         t = torch.tensor(
-            [min(vals), max(vals), sum(vals) / len(vals)],
+            [min(vals), max(vals), sum(vals) / len(vals), med],
             dtype=torch.float64, device=device,
         )
-        mn = t[0].clone(); mx = t[1].clone(); avg = t[2].clone()
+        mn = t[0].clone(); mx = t[1].clone()
+        avg = t[2].clone(); med_t = t[3].clone()
         dist.all_reduce(mn, op=dist.ReduceOp.MIN)
         dist.all_reduce(mx, op=dist.ReduceOp.MAX)
         dist.all_reduce(avg, op=dist.ReduceOp.SUM)
-        return mn.item(), mx.item(), avg.item() / npes
+        dist.all_reduce(med_t, op=dist.ReduceOp.SUM)
+        return mn.item(), mx.item(), avg.item() / npes, med_t.item() / npes
 
     g_ar = _reduce(seq_ar)
     g_gm = _reduce(seq_gemm)
     g_ov = _reduce(overlap_times)
     return {
-        "seq_ar": g_ar[2] * 1000, "seq_gemm": g_gm[2] * 1000,
-        "overlap": g_ov[2] * 1000, "overlap_min": g_ov[0] * 1000,
+        "seq_ar": g_ar[3] * 1000, "seq_gemm": g_gm[3] * 1000,
+        "overlap": g_ov[3] * 1000, "overlap_min": g_ov[0] * 1000,
+        "overlap_avg": g_ov[2] * 1000,
     }
 
 
@@ -1005,6 +1011,8 @@ def _test_multi_stage_overlap(
                 else:
                     print(" FAILED", flush=True)
 
+            del setup_fn
+            import gc; gc.collect()
             torch.cuda.synchronize()
             dist.barrier()
 
@@ -1035,7 +1043,7 @@ def _test_multi_stage_overlap(
             return f"    {pct:+.1f}%"
 
         # Table 1: Overlap Wall Time
-        print(f"\n  Table 1: Overlap Wall Time (ms, avg)")
+        print(f"\n  Table 1: Overlap Wall Time (ms, median)")
         hdr = (f"  {'Size':>8s} | {'SDMA copy':>10s} | {'SDMA no-copy':>12s} | "
                f"{'RCCL':>10s} | {'copy vs RCCL':>12s} | {'no-copy vs RCCL':>15s}")
         print(f"  {'-' * (len(hdr) - 2)}")
@@ -1050,7 +1058,7 @@ def _test_multi_stage_overlap(
         print(f"  {'-' * (len(hdr) - 2)}")
 
         # Table 2: GEMM Slowdown
-        print(f"\n  Table 2: GEMM Slowdown (overlap / seq_gemm, 1.0 = perfect hiding)")
+        print(f"\n  Table 2: GEMM Slowdown (overlap / seq_gemm, 1.0 = perfect hiding, median)")
         hdr2 = f"  {'Size':>8s} | {'SDMA copy':>10s} | {'SDMA no-copy':>12s} | {'RCCL':>10s}"
         print(f"  {'-' * (len(hdr2) - 2)}")
         print(hdr2)
@@ -1067,7 +1075,7 @@ def _test_multi_stage_overlap(
         print(f"  {'-' * (len(hdr2) - 2)}")
 
         # Table 3: Sequential AllReduce Time
-        print(f"\n  Table 3: Sequential AllReduce Time (ms, avg, {num_stages} stages)")
+        print(f"\n  Table 3: Sequential AllReduce Time (ms, median, {num_stages} stages)")
         print(f"  {'-' * (len(hdr2) - 2)}")
         print(hdr2)
         print(f"  {'-' * (len(hdr2) - 2)}")
@@ -1080,7 +1088,7 @@ def _test_multi_stage_overlap(
         print(f"  {'-' * (len(hdr2) - 2)}")
 
         # Table 4: Sequential GEMM Time
-        print(f"\n  Table 4: Sequential GEMM Time (ms, avg, {num_stages} stages)")
+        print(f"\n  Table 4: Sequential GEMM Time (ms, median, {num_stages} stages)")
         print(f"  {'-' * (len(hdr2) - 2)}")
         print(hdr2)
         print(f"  {'-' * (len(hdr2) - 2)}")
