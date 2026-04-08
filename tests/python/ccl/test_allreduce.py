@@ -774,6 +774,7 @@ def _bench_overlap_one_size(
 
     seq_ar, seq_gemm, overlap_times = [], [], []
 
+    if _dbg: print(f" seq_ar", end="", flush=True)
     for i in range(total_iters):
         torch.cuda.synchronize()
         prep_ar()
@@ -798,10 +799,12 @@ def _bench_overlap_one_size(
             t_ar = ev_ar_s.elapsed_time(ev_ar_e) / 1000.0
         if i >= warmup:
             seq_ar.append(t_ar)
+        if _dbg and i < 3: print(f"[{i}]", end="", flush=True)
 
     torch.cuda.synchronize()
     dist.barrier()
 
+    if _dbg: print(f" seq_gemm", end="", flush=True)
     for i in range(total_iters):
         torch.cuda.synchronize()
         ev_g_s.record(stream_gemm)
@@ -817,6 +820,7 @@ def _bench_overlap_one_size(
     torch.cuda.synchronize()
     dist.barrier()
 
+    if _dbg: print(f" overlap", end="", flush=True)
     ev_g_s_list = [torch.cuda.Event(enable_timing=True) for _ in range(num_stages)]
     ev_g_e_list = [torch.cuda.Event(enable_timing=True) for _ in range(num_stages)]
     ev_ar_s_list = [torch.cuda.Event(enable_timing=True) for _ in range(num_stages)]
@@ -953,33 +957,26 @@ def _test_multi_stage_overlap(
                 print(f"  {mode:14s} | {size_mb:6d} MB [{ov_tag}] ...",
                       end="", flush=True)
 
-            if mode == "SDMA copy":
-                def make_setup(e=cur_elems, b=cur_bytes, o=cur_out_size):
+            if mode in ("SDMA copy", "SDMA no-copy"):
+                _copy_user = (mode == "SDMA copy")
+                def make_setup(e=cur_elems, b=cur_bytes, o=cur_out_size,
+                               copy_out=_copy_user):
                     def setup():
+                        _d = (rank == 0)
+                        if _d: print(" ctor", end="", flush=True)
                         ar = AllreduceSdma(my_pe, npes, input_buffer_size=b,
                                            output_buffer_size=o,
-                                           copy_output_to_user=True, dtype=dtype)
+                                           copy_output_to_user=copy_out,
+                                           dtype=dtype)
+                        if _d: print("→alloc", end="", flush=True)
                         inp = torch.full((e,), fill_value, dtype=dtype, device=device)
                         out = torch.zeros(e, dtype=dtype, device=device)
+                        if _d: print("→sync", end="", flush=True)
                         torch.cuda.synchronize(); dist.barrier()
                         stream_ar.synchronize()
+                        if _d: print("→warmup", end="", flush=True)
                         ok = ar(inp, out, e, stream_ar); stream_ar.synchronize()
-                        def prep(): inp.fill_(fill_value)
-                        def launch(): return ar(inp, out, e, stream_ar)
-                        return ok, launch, prep, False
-                    return setup
-                setup_fn = make_setup()
-            elif mode == "SDMA no-copy":
-                def make_setup(e=cur_elems, b=cur_bytes, o=cur_out_size):
-                    def setup():
-                        ar = AllreduceSdma(my_pe, npes, input_buffer_size=b,
-                                           output_buffer_size=o,
-                                           copy_output_to_user=False, dtype=dtype)
-                        inp = torch.full((e,), fill_value, dtype=dtype, device=device)
-                        out = torch.zeros(e, dtype=dtype, device=device)
-                        torch.cuda.synchronize(); dist.barrier()
-                        stream_ar.synchronize()
-                        ok = ar(inp, out, e, stream_ar); stream_ar.synchronize()
+                        if _d: print("→done", end="", flush=True)
                         def prep(): inp.fill_(fill_value)
                         def launch(): return ar(inp, out, e, stream_ar)
                         return ok, launch, prep, False
