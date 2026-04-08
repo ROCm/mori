@@ -591,7 +591,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                 scatter_base, ag_base);
         }
 
-        pipeline_scatter_gen_ += numChunks_host + 1;  // +1 for cross-PE reduce_complete barrier
+        pipeline_scatter_gen_ += 2 * numChunks_host;  // per-chunk cross-PE reduce_complete barrier
         pipeline_ag_gen_      += numChunks_host;
 
         hipError_t err = hipGetLastError();

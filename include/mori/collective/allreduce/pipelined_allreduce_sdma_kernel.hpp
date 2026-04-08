@@ -301,53 +301,51 @@ __global__ void PipelinedAllReduceSdmaKernel(
       }
 
       // ==============================================================
-      // Cross-PE barrier: all PEs must finish reading scatter data
-      // before any PE starts AG (AG overwrites scatter data in
-      // remote transit buffers at the same addresses).
-      // ==============================================================
-      {
-        const uint32_t ccTargetAll =
-            ccBase + static_cast<uint32_t>(numChunks * compBlocks);
-        if (thr == 0) {
-          while (__scoped_atomic_load_n(
-                     &barrier->chunks_complete,
-                     __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) < ccTargetAll)
-            __builtin_amdgcn_s_sleep(1);
-        }
-      }
-      __syncthreads();
-
-      if (thr < npes && thr != myPe) {
-        HSAuint64* rSig = dstMemObj->peerSignalPtrs[thr]
-            + static_cast<size_t>(myPe) * numQ;
-        __hip_atomic_fetch_add(rSig, 1ULL,
-                               __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
-      }
-
-      if (thr < npes && thr != myPe) {
-        const int sender = thr;
-        const uint64_t expected =
-            s_scatter_by_sender[sender]
-            + static_cast<uint64_t>(numChunks) + 1ULL;
-        HSAuint64* sig = dstMemObj->signalPtrs
-            + static_cast<size_t>(sender) * numQ;
-        while (core::AtomicLoadRelaxed(sig) < expected)
-          __builtin_amdgcn_s_sleep(1);
-      }
-
-      // ==============================================================
-      // All PEs confirmed reduce-complete — safe to AG
+      // Per-chunk cross-PE barrier + AG: for each chunk, wait until
+      // ALL PEs finish reading that chunk's scatter data, then AG.
+      // AG for chunk c overlaps with reduce of chunk c+1.
       // ==============================================================
 
       if constexpr (MULTI_CHUNK) {
-        if (thr < npes && thr != myPe) {
-          const int destPe = thr;
-          anvil::SdmaQueueDeviceHandle** dh =
-              dstMemObj->deviceHandles_d + destPe * numQ;
-          HSAuint64* rSig = dstMemObj->peerSignalPtrs[destPe]
-              + static_cast<size_t>(myPe) * numQ;
+        for (int c = 0; c < numChunks; c++) {
+          {
+            const uint32_t ccTarget =
+                ccBase + static_cast<uint32_t>((c + 1) * compBlocks);
+            if (thr == 0) {
+              while (__scoped_atomic_load_n(
+                         &barrier->chunks_complete,
+                         __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) < ccTarget)
+                __builtin_amdgcn_s_sleep(1);
+            }
+          }
+          __syncthreads();
 
-          for (int c = 0; c < numChunks; c++) {
+          if (thr < npes && thr != myPe) {
+            HSAuint64* rSig = dstMemObj->peerSignalPtrs[thr]
+                + static_cast<size_t>(myPe) * numQ;
+            __hip_atomic_fetch_add(rSig, 1ULL,
+                                   __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+          }
+
+          if (thr < npes && thr != myPe) {
+            const int sender = thr;
+            const uint64_t expected =
+                s_scatter_by_sender[sender]
+                + static_cast<uint64_t>(numChunks)
+                + static_cast<uint64_t>(c + 1);
+            HSAuint64* sig = dstMemObj->signalPtrs
+                + static_cast<size_t>(sender) * numQ;
+            while (core::AtomicLoadRelaxed(sig) < expected)
+              __builtin_amdgcn_s_sleep(1);
+          }
+
+          if (thr < npes && thr != myPe) {
+            const int destPe = thr;
+            anvil::SdmaQueueDeviceHandle** dh =
+                dstMemObj->deviceHandles_d + destPe * numQ;
+            HSAuint64* rSig = dstMemObj->peerSignalPtrs[destPe]
+                + static_cast<size_t>(myPe) * numQ;
+
             const size_t cOff = static_cast<size_t>(c) * chunkBytes;
             size_t agBytes = chunkBytes;
             if (cOff + agBytes > totalShardBytes)
@@ -371,6 +369,35 @@ __global__ void PipelinedAllReduceSdmaKernel(
             __builtin_amdgcn_s_sleep(1);
         }
       } else {
+        {
+          const uint32_t ccTarget =
+              ccBase + static_cast<uint32_t>(compBlocks);
+          if (thr == 0) {
+            while (__scoped_atomic_load_n(
+                       &barrier->chunks_complete,
+                       __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) < ccTarget)
+              __builtin_amdgcn_s_sleep(1);
+          }
+        }
+        __syncthreads();
+
+        if (thr < npes && thr != myPe) {
+          HSAuint64* rSig = dstMemObj->peerSignalPtrs[thr]
+              + static_cast<size_t>(myPe) * numQ;
+          __hip_atomic_fetch_add(rSig, 1ULL,
+                                 __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+        }
+
+        if (thr < npes && thr != myPe) {
+          const int sender = thr;
+          const uint64_t expected =
+              s_scatter_by_sender[sender] + 2ULL;
+          HSAuint64* sig = dstMemObj->signalPtrs
+              + static_cast<size_t>(sender) * numQ;
+          while (core::AtomicLoadRelaxed(sig) < expected)
+            __builtin_amdgcn_s_sleep(1);
+        }
+
         if (thr < npes && thr != myPe) {
           const int destPe = thr;
           anvil::SdmaQueueDeviceHandle** dh =
