@@ -54,4 +54,6 @@ if(WITH_MPI)
   add_mori_perftest_shmem(p2p_put_bw SOURCES shmem/p2p_put_bw.cpp shmem/util.cpp LIBS stdc++fs)
   # Host-only for now, but shmem.hpp pulls in symbols from mori_shmem (ShmemMpiInit, etc.).
   add_mori_perftest_shmem(p2p_put_latency SOURCES shmem/p2p_put_latency.cpp shmem/util.cpp LIBS stdc++fs)
+  add_mori_perftest_shmem(ring_put_bw SOURCES shmem/ring_put_bw.cpp shmem/util.cpp LIBS stdc++fs)
+  add_mori_perftest_shmem(p2p_get_bw SOURCES shmem/p2p_get_bw.cpp shmem/util.cpp LIBS stdc++fs)
 endif()

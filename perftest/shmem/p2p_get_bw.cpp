@@ -43,6 +43,7 @@ constexpr int kDefaultQpId = 1;
 constexpr float kMsToS = 1000.0f;
 constexpr double kBToGb = 1e9;
 
+// Block-scope get: each block cooperatively gets its slice from the peer.
 __global__ void bw_block(double* data_d, volatile unsigned int* counter_d, size_t len, int pe,
                          int iter) {
   int bid = blockIdx.x;
@@ -52,7 +53,7 @@ __global__ void bw_block(double* data_d, volatile unsigned int* counter_d, size_
   for (int i = 0; i < iter; i++) {
     double* slice = data_d + bid * (len / static_cast<size_t>(nblocks));
     size_t chunk_doubles = len / static_cast<size_t>(nblocks);
-    ShmemPutMemNbiBlock(slice, slice, chunk_doubles * sizeof(double), peer, kDefaultQpId);
+    ShmemGetMemNbiBlock(slice, slice, chunk_doubles * sizeof(double), peer, kDefaultQpId);
 
     bw_cross_block_barrier_round(counter_d, nblocks, i);
   }
@@ -60,6 +61,7 @@ __global__ void bw_block(double* data_d, volatile unsigned int* counter_d, size_
   bw_final_barrier_and_quiet(counter_d, nblocks, iter);
 }
 
+// Warp-scope get: each warp cooperatively gets its slice from the peer.
 __global__ void bw_warp(double* data_d, volatile unsigned int* counter_d, size_t len, int pe,
                         int iter) {
   int bid = blockIdx.x;
@@ -69,13 +71,13 @@ __global__ void bw_warp(double* data_d, volatile unsigned int* counter_d, size_t
   int warpid = tid / warpSize;
   const int peer = !pe;
 
-  size_t put_per_block = len / static_cast<size_t>(nblocks);
-  size_t put_per_warp = put_per_block / static_cast<size_t>(nwarps_per_block);
+  size_t get_per_block = len / static_cast<size_t>(nblocks);
+  size_t get_per_warp = get_per_block / static_cast<size_t>(nwarps_per_block);
 
   for (int i = 0; i < iter; i++) {
     double* slice =
-        data_d + bid * put_per_block + static_cast<size_t>(warpid) * put_per_warp;
-    ShmemPutMemNbiWarp(slice, slice, put_per_warp * sizeof(double), peer, kDefaultQpId);
+        data_d + bid * get_per_block + static_cast<size_t>(warpid) * get_per_warp;
+    ShmemGetMemNbiWarp(slice, slice, get_per_warp * sizeof(double), peer, kDefaultQpId);
 
     bw_cross_block_barrier_round(counter_d, nblocks, i);
   }
@@ -83,6 +85,7 @@ __global__ void bw_warp(double* data_d, volatile unsigned int* counter_d, size_t
   bw_final_barrier_and_quiet(counter_d, nblocks, iter);
 }
 
+// Thread-scope get: each thread independently gets its slice from the peer.
 __global__ void bw_thread(double* data_d, volatile unsigned int* counter_d, size_t len, int pe,
                           int iter) {
   int bid = blockIdx.x;
@@ -91,20 +94,19 @@ __global__ void bw_thread(double* data_d, volatile unsigned int* counter_d, size
   int nthreads = blockDim.x * blockDim.y * blockDim.z;
   const int peer = !pe;
 
-  size_t put_per_block = len / static_cast<size_t>(nblocks);
-  size_t put_per_thread = put_per_block / static_cast<size_t>(nthreads);
+  size_t get_per_block = len / static_cast<size_t>(nblocks);
+  size_t get_per_thread = get_per_block / static_cast<size_t>(nthreads);
 
   for (int i = 0; i < iter; i++) {
     double* slice =
-        data_d + bid * put_per_block + static_cast<size_t>(tid) * put_per_thread;
-    ShmemPutMemNbiThread(slice, slice, put_per_thread * sizeof(double), peer, kDefaultQpId);
+        data_d + bid * get_per_block + static_cast<size_t>(tid) * get_per_thread;
+    ShmemGetMemNbiThread(slice, slice, get_per_thread * sizeof(double), peer, kDefaultQpId);
 
     bw_cross_block_barrier_round(counter_d, nblocks, i);
   }
 
   bw_final_barrier_and_quiet(counter_d, nblocks, iter);
 }
-
 
 void launch_bw(PutScope scope, dim3 grid, dim3 block, double* data_d, unsigned int* counter_d,
                size_t len_doubles, int my_pe, int count) {
@@ -114,7 +116,8 @@ void launch_bw(PutScope scope, dim3 grid, dim3 block, double* data_d, unsigned i
                          count);
       break;
     case PutScope::kWarp:
-      hipLaunchKernelGGL(bw_warp, grid, block, 0, 0, data_d, counter_d, len_doubles, my_pe, count);
+      hipLaunchKernelGGL(bw_warp, grid, block, 0, 0, data_d, counter_d, len_doubles, my_pe,
+                         count);
       break;
     case PutScope::kThread:
       hipLaunchKernelGGL(bw_thread, grid, block, 0, 0, data_d, counter_d, len_doubles, my_pe,
@@ -127,7 +130,7 @@ void launch_bw(PutScope scope, dim3 grid, dim3 block, double* data_d, unsigned i
 
 int main(int argc, char** argv) {
 #ifndef MORI_WITH_MPI
-  std::fprintf(stderr, "mori_shmem_put_bw requires MORI_WITH_MPI (enable WITH_MPI / BUILD_EXAMPLES).\n");
+  std::fprintf(stderr, "mori_shmem_get_bw requires MORI_WITH_MPI (enable WITH_MPI / BUILD_EXAMPLES).\n");
   return 1;
 #else
 
@@ -186,13 +189,15 @@ int main(int argc, char** argv) {
   int npes = ShmemNPes();
   if (npes != 2) {
     if (my_pe == 0) {
-      std::fprintf(stderr, "mori_shmem_put_bw requires exactly 2 PEs (npes=%d)\n", npes);
+      std::fprintf(stderr, "mori_shmem_get_bw requires exactly 2 PEs (npes=%d)\n", npes);
     }
     MPI_Comm_free(&local_comm);
     ShmemFinalize();
     return 1;
   }
 
+  // In unidirectional mode only PE 0 issues gets (PE 1 is the data source).
+  // In bidirectional mode both PEs issue gets simultaneously.
   const bool run_kernels = args.bidirectional || my_pe == 0;
 
   const char* scope_name = ScopeToChar(scope);
@@ -243,12 +248,14 @@ int main(int argc, char** argv) {
     }
 
     if (run_kernels) {
+      // Warmup
       HIP_RUNTIME_CHECK(hipMemset(counter_d, 0, 2 * sizeof(unsigned int)));
       launch_bw(scope, grid, block, data_d, counter_d, len_doubles, my_pe,
                 static_cast<int>(args.warmup));
       HIP_RUNTIME_CHECK(hipGetLastError());
       HIP_RUNTIME_CHECK(hipDeviceSynchronize());
 
+      // Timed run
       HIP_RUNTIME_CHECK(hipMemset(counter_d, 0, 2 * sizeof(unsigned int)));
       HIP_RUNTIME_CHECK(hipEventRecord(start, nullptr));
       launch_bw(scope, grid, block, data_d, counter_d, len_doubles, my_pe,
@@ -282,7 +289,7 @@ int main(int argc, char** argv) {
 
   ShmemBarrierAll();
   if (my_pe == 0) {
-    const char* test_name = args.bidirectional ? "shmem_put_bw_bidi" : "shmem_put_bw_uni";
+    const char* test_name = args.bidirectional ? "shmem_get_bw_bidi" : "shmem_get_bw_uni";
     PrintPerfTable(test_name, scope_name, args.nblocks, args.threads_per_block, device_warp_size,
                    args.iters, args.warmup, PerfTableMetric::kBandwidthGbps, bandwidth_table);
   }

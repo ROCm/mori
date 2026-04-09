@@ -23,13 +23,13 @@
 
 #pragma once
 
+#include <unistd.h>
+
 #include <cassert>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
-
-#include <unistd.h>
 
 namespace mori::perftest {
 
@@ -75,7 +75,6 @@ void PrintPerfTable(const char* test_name, const char* scope_name, int grid_x, i
                     int warp_size, std::size_t iters, std::size_t warmup, PerfTableMetric metric,
                     const std::vector<PerfTableRow>& rows);
 
-
 inline const char* ScopeToChar(PutScope scope) {
   switch (scope) {
     case PutScope::kThread:
@@ -89,6 +88,32 @@ inline const char* ScopeToChar(PutScope scope) {
       assert(0);
   }
   return "None";
+}
+
+inline bool size_ok(PutScope scope, size_t size_bytes, int nblocks, int threads_per_block,
+                    int device_warp_size) {
+  if (size_bytes == 0 || size_bytes % sizeof(double) != 0) {
+    return false;
+  }
+  const size_t len = size_bytes / sizeof(double);
+  if (len % static_cast<size_t>(nblocks) != 0) {
+    return false;
+  }
+  const size_t per_block = len / static_cast<size_t>(nblocks);
+  if (scope == PutScope::kThread) {
+    return per_block % static_cast<size_t>(threads_per_block) == 0;
+  }
+  if (scope == PutScope::kWarp) {
+    if (threads_per_block % device_warp_size != 0) {
+      return false;
+    }
+    int nw = threads_per_block / device_warp_size;
+    if (nw <= 0) {
+      return false;
+    }
+    return per_block % static_cast<size_t>(nw) == 0;
+  }
+  return true;
 }
 
 }  // namespace mori::perftest

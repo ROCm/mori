@@ -15,9 +15,10 @@ void PrintUsage(const char* program) {
                "  -w warmup      warmup iterations\n"
                "  -c grid_x      CUDA/HIP grid x (blocks)\n"
                "  -t threads     threads per block\n"
-               "  -s scope       thread | warp | block (put_bw: which put; put_latency: default block)\n"
-               "  -B             bidirectional (p2p_put_bw only; ignored by p2p_put_latency)\n"
-               "  -h             this help\n",
+               "  -s scope       thread | warp | block (put_bw/ring: default block; put_latency: block)\n"
+               "  -B             bidirectional (p2p_put_bw only; ignored elsewhere)\n"
+               "  -h             this help\n"
+               "  ring_put_bw: N-PE ring; same -c/-t/-s as p2p_put_bw, peer=(pe+1)%%np.\n",
                program != nullptr ? program : "program");
 }
 
