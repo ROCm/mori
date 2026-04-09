@@ -173,8 +173,8 @@ Error MoriDispatchImpl(hipStream_t stream, EpDispatchCombineHandle* h, Dictionar
     scalesPtr = static_cast<uint8_t*>(scales.untyped_data());
   }
 
-  XPUT("MoriDispatch h: %p, input=%d topk_ids=%d hiddenDim: %d weights=%p scales=%p stream=%p",
-    h, (int)input.size_bytes(), (int)topk_ids.size_bytes(), hiddenDim, weightsPtr, scalesPtr, stream);
+  // XPUT("MoriDispatch h: %p, input=%d topk_ids=%d hiddenDim: %d weights=%p scales=%p stream=%p",
+  //   h, (int)input.size_bytes(), (int)topk_ids.size_bytes(), hiddenDim, weightsPtr, scalesPtr, stream);
 
   mori::moe::LaunchDispatch(*h, input.untyped_data(), weightsPtr, scalesPtr, topk_ids.typed_data(),
                             input.dimensions()[0], FFIType2HipType(input.element_type()), block_num,
@@ -265,11 +265,6 @@ Error GetDispatchSrcTokenId(hipStream_t stream, EpDispatchCombineHandle* h, Rema
   // NOTE here we read the whole buffer but the actual # of tokens received could be less
   // we do not want to read it since it requires explicit stream synchronization otherwise
   GpuCopy(out->untyped_data(), h->dispTokIdToSrcTokIdMemObj->Get(), out->size_bytes(), stream);
-
-  HIP_RUNTIME_CHECK(hipStreamSynchronize(stream));
-  auto ptr = h->dispTokIdToSrcTokIdMemObj->Get();
-  auto num_recv_tokens = *reinterpret_cast<int32_t*>(ptr);
-  XPUT("GetDispatchSrcTokenId synchronized rank=%d num_recv_tokens=%d", h->config.rank, num_recv_tokens);
   return Error::Success();
 }
 
@@ -307,7 +302,7 @@ ErrorOr<std::unique_ptr<EpDispatchCombineState>> EpDispatchCombineInstantiate(
     entry.resize(1);
     entry[0] = std::make_unique<EpDispatchCombineHandle>(cfg);
   }
-  auto state = std::make_unique<EpDispatchCombineState>(1);
+  auto state = std::make_unique<EpDispatchCombineState>();
   state->handles = &entry;
   return state;
 #endif // MORI_MULTITHREAD_SUPPORT

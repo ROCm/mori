@@ -101,13 +101,6 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
   int worldSize = bootNet.GetWorldSize();
   int rank = bootNet.GetLocalRank();
 
-  int device = -1;
-  HIP_RUNTIME_CHECK(hipGetDevice(&device));
-
-  MORI_SHMEM_DEBUG("RegisterSymmMemObj: localPtr={:p} size={} heap_begin={} device={}", localPtr, size, heap_begin, device);
-  MORI_SHMEM_DEBUG("RegisterSymmMemObj: worldSize={} rank={} context={:p}", worldSize, rank, 
-          reinterpret_cast<void*>(&context));
-
   SymmMemObj* cpuMemObj = new SymmMemObj();
   cpuMemObj->localPtr = localPtr;
   cpuMemObj->size = size;
@@ -189,10 +182,9 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
   std::vector<int> dstDeviceIds;
   for (int i = 0; i < worldSize; i++) {
     if (context.GetTransportType(i) != TransportType::SDMA) continue;
-    if (i == rank) continue;
     dstDeviceIds.push_back(i % 8);  // should be intra devices count
   }
-  if (dstDeviceIds.size() != 0) {
+  if (!dstDeviceIds.empty()) {
     int srcDeviceId = rank % 8;
     int numOfQueuesPerDevice = gpuMemObj->sdmaNumQueue;  // all sdma queues are inited
     // Allocate based on worldSize (not dstDeviceIds.size()) because indexing uses pe * numQ
@@ -207,7 +199,7 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
 
     for (auto& dstDeviceId : dstDeviceIds) {
       for (size_t q = 0; q < numOfQueuesPerDevice; q++) {
-        auto* anvilHandle = anvil::AnvilLib::getInstance().getSdmaQueue(srcDeviceId, dstDeviceId, q)->deviceHandle();
+        auto* anvilHandle = anvil::anvil.getSdmaQueue(srcDeviceId, dstDeviceId, q)->deviceHandle();
         HIP_RUNTIME_CHECK(
             hipMemcpy(&gpuMemObj->deviceHandles_d[dstDeviceId * numOfQueuesPerDevice + q],
                       &anvilHandle, sizeof(anvilHandle), hipMemcpyHostToDevice));
@@ -237,12 +229,11 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
     peerSignalPtrsHost[rank] = gpuMemObj->signalPtrs;
     for (int i = 0; i < worldSize; i++) {
       if (context.GetTransportType(i) != TransportType::SDMA) continue;
-      if (i == rank) continue;
-      void* mappedPtr = nullptr;
-      if (context.SameProcessP2P(i)) {
+      if (i == rank || context.SameProcessP2P(i)) {
         peerSignalPtrsHost[i] = signalInfos[i].signalPtrs;
-        mori::MoriEnablePeerAccess(rank, i);
+        if (i != rank) mori::MoriEnablePeerAccess(rank, i);
       } else {
+        void* mappedPtr = nullptr;
         HIP_RUNTIME_CHECK(
           hipIpcOpenMemHandle(&mappedPtr, signalInfos[i].handle, hipIpcMemLazyEnablePeerAccess));
         peerSignalPtrsHost[i] = reinterpret_cast<HSAuint64*>(mappedPtr);

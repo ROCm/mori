@@ -54,6 +54,40 @@ auto checkHsaError = [](hsa_status_t s, const char* msg, const char* file, int l
     }                                                                                          \
   } while (0)
 
+#if 0
+inline void checkHipError(hipError_t err, const char* msg, const char* file, int line)
+{
+   if (err != hipSuccess)
+   {
+      std::cerr << "HIP error at " << file << ":" << line << " — " << msg << "\n"
+                << "  Code: " << err << " (" << hipGetErrorString(err) << ")" << std::endl;
+      std::exit(EXIT_FAILURE);
+   }
+}
+
+#define CHECK_HIP_ERROR(cmd) checkHipError((cmd), #cmd, __FILE__, __LINE__)
+
+// Allow access to peerDeviceId from deviceId
+inline void EnablePeerAccess(int const deviceId, int const peerDeviceId)
+{
+   int canAccess;
+   CHECK_HIP_ERROR(hipDeviceCanAccessPeer(&canAccess, deviceId, peerDeviceId));
+   if (!canAccess)
+   {
+      std::cerr << "Unable to enable peer access from GPU devices " << deviceId << " to " << peerDeviceId << "\n";
+   }
+
+   CHECK_HIP_ERROR(hipSetDevice(deviceId));
+   hipError_t error = hipDeviceEnablePeerAccess(peerDeviceId, 0);
+   if (error != hipSuccess && error != hipErrorPeerAccessAlreadyEnabled)
+   {
+      std::cerr << "Unable to enable peer to peer access from " << deviceId << "  to " << peerDeviceId << " ("
+                << hipGetErrorString(error) << ")\n";
+   }
+}
+#endif
+
+
 // HSA agents
 std::vector<hsa_agent_t> cpuAgents_;
 std::vector<hsa_agent_t> gpuAgents_;
@@ -95,7 +129,13 @@ void SetUpKFD() {
 //     std::cout << "Device Id: " << m_node_props.DeviceId << std::endl;
 // }
 
-void CloseKFD() { CHECK_HSAKMT_SUCCESS(hsaKmtCloseKFD(), "hsaKmtCloseKFD() failed"); }
+void CloseKFD() { 
+  auto ret = hsaKmtCloseKFD();
+  if (ret != HSAKMT_STATUS_SUCCESS) {
+    //MORI_APP_ERROR("hsaKmtCloseKFD() failed: {:#x}", ret);
+    std::cerr << "hsaKmtCloseKFD() failed: {:#x}" << ret << std::endl;
+  }
+}
 
 // Convert a logical deviceId index to the NVML device minor number
 static const std::string getBusId(int deviceId) {
@@ -201,6 +241,7 @@ SdmaQueue::~SdmaQueue() {
 SdmaQueueDeviceHandle* SdmaQueue::deviceHandle() const { return deviceHandle_; }
 
 AnvilLib::~AnvilLib() {
+  if (!is_initialized_) return;
   std::lock_guard<std::mutex> lock(mutex_);
   for (auto& p : sdma_channels_) {
     p.second.clear();
@@ -210,7 +251,7 @@ AnvilLib::~AnvilLib() {
 }
 
 void AnvilLib::init() {
-  std::call_once(init_flag, []() {
+  std::call_once(init_flag, [this]() {
     //   std::atexit(CloseKFD); // Register cleanup
 
     // HSA
@@ -231,6 +272,7 @@ void AnvilLib::init() {
     }
 
     SetUpKFD();
+    is_initialized_ = true;
   });
 }
 
@@ -289,5 +331,7 @@ int AnvilLib::getSdmaEngineId(int srcDeviceId, int dstDeviceId) {
   // Use even engines only
   return mi300xOamMap[srcOamId][dstOamId] * 2;
 }
+
+AnvilLib& anvil = anvil.getInstance();
 
 }  // namespace anvil

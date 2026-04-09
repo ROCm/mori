@@ -148,11 +148,11 @@ void runExperiment(int srcDeviceId, int dstDeviceId, const ExperimentParams& par
   // 3. Queue Setup
   // ======================
 
-  anvil::AnvilLib::getInstance().connect(srcDeviceId, dstDeviceId);
+  anvil::anvil.connect(srcDeviceId, dstDeviceId);
 
   anvil::SdmaQueueDeviceHandle* deviceHandle_d = nullptr;
 
-  deviceHandle_d = anvil::AnvilLib::getInstance().getSdmaQueue(srcDeviceId, dstDeviceId)->deviceHandle();
+  deviceHandle_d = anvil::anvil.getSdmaQueue(srcDeviceId, dstDeviceId)->deviceHandle();
 
   // if (params.verbose)
   // {
@@ -421,7 +421,7 @@ void runExperiment(int srcDeviceId, int dstDeviceId, const ExperimentParams& par
 }
 
 int main(int argc, char** argv) {
-  anvil::AnvilLib::getInstance().init();
+  anvil::anvil.init();
 
   int srcGpuId = 2;
   int dstGPUId = 7;

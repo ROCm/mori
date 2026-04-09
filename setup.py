@@ -348,6 +348,7 @@ class CMakeBuild(build_ext):
         build_umbp_enabled = _env_flag("BUILD_UMBP", "OFF")
         build_umbp = "ON" if build_umbp_enabled else "OFF"
         build_xla_ffi_ops = os.environ.get("BUILD_XLA_FFI_OPS", "OFF")
+        build_multithread = os.environ.get("MORI_MULTITHREAD_SUPPORT", "OFF")
         with_mpi = (
             "ON"
             if (
@@ -379,6 +380,7 @@ class CMakeBuild(build_ext):
             "-DBUILD_TORCH_BOOTSTRAP=OFF",
             f"-DBUILD_XLA_FFI_OPS={build_xla_ffi_ops}",
             f"-DBUILD_OPS_DEVICE={build_ops_device}",
+            f"-DMORI_MULTITHREAD_SUPPORT={build_multithread}",
             "-B",
             str(build_dir),
             "-S",

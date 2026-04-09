@@ -178,7 +178,7 @@ void runExperiment(int srcDeviceId, const ExperimentParams& params) {
 
   for (auto& dstDeviceId : dstDeviceIds) {
     // Better performance if allocating all 8 queues
-    anvil::AnvilLib::getInstance().connect(srcDeviceId, dstDeviceId, 8);  // params.numOfQueues);
+    anvil::anvil.connect(srcDeviceId, dstDeviceId, 8);  // params.numOfQueues);
   }
 
   anvil::SdmaQueueDeviceHandle** deviceHandles_d = nullptr;
@@ -189,7 +189,7 @@ void runExperiment(int srcDeviceId, const ExperimentParams& params) {
   for (auto& dstDeviceId : dstDeviceIds) {
     for (size_t q = 0; q < params.numOfQueues; q++) {
       deviceHandles_d[queueIdx] =
-          anvil::AnvilLib::getInstance().getSdmaQueue(srcDeviceId, dstDeviceId, q)->deviceHandle();
+          anvil::anvil.getSdmaQueue(srcDeviceId, dstDeviceId, q)->deviceHandle();
       queueIdx++;
     }
   }
@@ -379,7 +379,7 @@ void runExperiment(int srcDeviceId, const ExperimentParams& params) {
 }
 
 int main(int argc, char** argv) {
-  anvil::AnvilLib::getInstance().init();
+  anvil::anvil.init();
 
   const int srcGpuId = 6;
 

@@ -137,7 +137,7 @@ void runExperiment(int srcDeviceId, int dstDeviceId, const ExperimentParams& par
   // ======================
 
   size_t totalNumQueues = params.numOfQueues;
-  anvil::AnvilLib::getInstance().connect(srcDeviceId, dstDeviceId, params.numOfQueues);
+  anvil::anvil.connect(srcDeviceId, dstDeviceId, params.numOfQueues);
 
   anvil::SdmaQueueDeviceHandle** deviceHandles_d = nullptr;
   CHECK_HIP_ERROR(
@@ -146,7 +146,7 @@ void runExperiment(int srcDeviceId, int dstDeviceId, const ExperimentParams& par
   size_t queueIdx = 0;
   for (size_t q = 0; q < params.numOfQueues; q++) {
     deviceHandles_d[queueIdx] =
-        anvil::AnvilLib::getInstance().getSdmaQueue(srcDeviceId, dstDeviceId, q)->deviceHandle();
+        anvil::anvil.getSdmaQueue(srcDeviceId, dstDeviceId, q)->deviceHandle();
 
     // if (params.verbose)
     // {
@@ -330,7 +330,7 @@ void runExperiment(int srcDeviceId, int dstDeviceId, const ExperimentParams& par
 }
 
 int main(int argc, char** argv) {
-  anvil::AnvilLib::getInstance().init();
+  anvil::anvil.init();
 
   int srcGpuId = 2;
   int dstGPUId = 7;

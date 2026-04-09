@@ -55,7 +55,17 @@ class ModuleLogger {
     }
   }
 
- public:
+  // Get logger for a specific module
+  std::shared_ptr<spdlog::logger> GetLoggerInternal(const std::string& moduleName) {
+    auto it = loggers_.find(moduleName);
+    if (it != loggers_.end()) {
+      return it->second;
+    }
+    // If not found, create with default settings
+    InitModule(moduleName);
+    return loggers_[moduleName];
+  }
+
   // Initialize a module-specific logger
   void InitModule(const std::string& moduleName, Level level = Level::ERROR) {
     // Check if logger already exists
@@ -97,24 +107,55 @@ class ModuleLogger {
     loggers_[moduleName] = logger;
   }
 
-  // Get logger for a specific module
-  std::shared_ptr<spdlog::logger> GetLogger(const std::string& moduleName) {
+  // Check if a module has environment override
+  bool HasEnvOverrideInternal(const std::string& moduleName) const {
     std::lock_guard<std::mutex> lock(mutex_);
-    auto it = loggers_.find(moduleName);
-    if (it != loggers_.end()) {
-      return it->second;
-    }
-    // If not found, create with default settings
-    InitModule(moduleName);
-    return loggers_[moduleName];
+    return envOverrides_.find(moduleName) != envOverrides_.end();
   }
 
+  // Clear environment overrides for a module
+  void ClearEnvOverrideInternal(const std::string& moduleName) { 
+    std::lock_guard<std::mutex> lock(mutex_);
+    envOverrides_.erase(moduleName); 
+  }
+
+  // Set log level with priority check (used internally for env vars)
+  void SetModuleLevelInternal(const std::string& moduleName, Level level, bool fromEnv = false) {
+    auto logger = GetLoggerInternal(moduleName);
+    logger->set_level(ConvertLevel(level));
+    if (fromEnv) {
+      envOverrides_[moduleName] = level;
+    }
+  }
+
+  // Set log level for all modules (global control)
+  void SetGlobalLevelInternal(Level level) {
+    globalLevel_ = level;
+    globalLevelSet_ = true;
+
+    // Apply to all existing loggers
+    for (auto& [name, logger] : loggers_) {
+      // Skip modules controlled by environment variables
+      if (!HasEnvOverrideInternal(name)) {
+        logger->set_level(ConvertLevel(level));
+      }
+    }
+  }
+
+  inline void InitializeLoggingInternal();
+
+ public:
+   std::shared_ptr<spdlog::logger> GetLogger(const std::string& moduleName) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return GetLoggerInternal(moduleName);
+  }
   // Set log level for a specific module
   void SetModuleLevel(const std::string& moduleName, Level level) {
+    std::lock_guard<std::mutex> lock(mutex_);
     // Check if this module is protected by environment variable
-    if (HasEnvOverride(moduleName)) {
+    if (HasEnvOverrideInternal(moduleName)) {
       // Log a warning but don't change the level
-      auto logger = GetLogger("application");  // Use application logger for warnings
+      auto logger = GetLoggerInternal("application");  // Use application logger for warnings
       logger->warn(
           "Attempted to change log level for module '{}' which is controlled by environment "
           "variable. Use ForceSetModuleLevel() to override.",
@@ -122,46 +163,24 @@ class ModuleLogger {
       return;
     }
 
-    auto logger = GetLogger(moduleName);
+    auto logger = GetLoggerInternal(moduleName);
     logger->set_level(ConvertLevel(level));
   }
 
-  // Set log level for all modules (global control)
-  void SetGlobalLevel(Level level) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    globalLevel_ = level;
-    globalLevelSet_ = true;
-
-    // Apply to all existing loggers
-    for (auto& [name, logger] : loggers_) {
-      // Skip modules controlled by environment variables
-      if (!HasEnvOverride(name)) {
-        logger->set_level(ConvertLevel(level));
-      }
-    }
-  }
-
-  // Set log level with priority check (used internally for env vars)
-  void SetModuleLevelInternal(const std::string& moduleName, Level level, bool fromEnv = false) {
-    auto logger = GetLogger(moduleName);
-    logger->set_level(ConvertLevel(level));
-    if (fromEnv) {
-      std::lock_guard<std::mutex> lock(mutex_);
-      envOverrides_[moduleName] = level;
-    }
-  }
-
-  // Check if a module has environment override
   bool HasEnvOverride(const std::string& moduleName) const {
-    return envOverrides_.find(moduleName) != envOverrides_.end();
+    std::lock_guard<std::mutex> lock(mutex_);
+    return HasEnvOverrideInternal(moduleName);
   }
 
-  // Clear environment overrides for a module
-  void ClearEnvOverride(const std::string& moduleName) { envOverrides_.erase(moduleName); }
+  void ClearEnvOverride(const std::string& moduleName) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ClearEnvOverrideInternal(moduleName);
+  }
 
   // Force set log level (ignores env protection)
   void ForceSetModuleLevel(const std::string& moduleName, Level level) {
-    auto logger = GetLogger(moduleName);
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto logger = GetLoggerInternal(moduleName);
     logger->set_level(ConvertLevel(level));
   }
 
@@ -172,10 +191,18 @@ class ModuleLogger {
   bool IsGlobalLevelSet() const { return globalLevelSet_; }
 
   // Clear global level setting (revert to individual module control)
-  void ClearGlobalLevel() { globalLevelSet_ = false; }
+  void ClearGlobalLevel() { 
+    std::lock_guard<std::mutex> lock(mutex_);
+    globalLevelSet_ = false; 
+  }
+
+  void SetGlobalLevel(Level level) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    SetGlobalLevelInternal(level);
+  }
 
   // Convert string to level
-  Level LevelFromString(const std::string& strLevel) {
+  static Level LevelFromString(const std::string& strLevel) {
     std::string lower_level = strLevel;
     std::transform(lower_level.begin(), lower_level.end(), lower_level.begin(), ::tolower);
 
@@ -188,17 +215,16 @@ class ModuleLogger {
     return Level::ERROR;
   }
 
-  // Allow access to loggers for advanced configuration
-  std::unordered_map<std::string, std::shared_ptr<spdlog::logger>>& GetLoggers() {
-    return loggers_;
-  }
+  // Initialization helper functions
+  inline void InitializeLogging(const std::string& globalLevel);
+  inline void InitializeLoggingFromEnv();
 
  private:
   std::unordered_map<std::string, std::shared_ptr<spdlog::logger>> loggers_;
   std::unordered_map<std::string, Level> envOverrides_;  // Track env variable overrides
   Level globalLevel_ = Level::ERROR;
   bool globalLevelSet_ = false;
-  std::mutex mutex_;
+  mutable std::mutex mutex_;
 
   spdlog::level::level_enum ConvertLevel(Level level) {
     switch (level) {
@@ -217,7 +243,7 @@ class ModuleLogger {
     }
     return spdlog::level::err;
   }
-};
+}; // class ModuleLogger
 
 // Module names
 namespace modules {
@@ -313,36 +339,32 @@ class ScopedTimer {
 #define MORI_FUNCTION_TIMER(module) ScopedTimer timer_instance(__PRETTY_FUNCTION__, module)
 
 // Initialization helper functions
-inline void InitializeLogging() {
-  static std::once_flag once_flag;
-  std::call_once(once_flag, []{ 
-    auto& logger = ModuleLogger::GetInstance();
-    // Initialize all modules with default ERROR level
-    logger.InitModule(modules::APPLICATION);
-    logger.InitModule(modules::IO);
-    logger.InitModule(modules::SHMEM);
-    logger.InitModule(modules::CORE);
-    logger.InitModule(modules::OPS);
-    logger.InitModule(modules::UMBP);
-  });
+void ModuleLogger::InitializeLoggingInternal() {
+  // Initialize all modules with default ERROR level
+  InitModule(modules::APPLICATION);
+  InitModule(modules::IO);
+  InitModule(modules::SHMEM);
+  InitModule(modules::CORE);
+  InitModule(modules::OPS);
+  InitModule(modules::UMBP);
 }
 
-inline void InitializeLogging(const std::string& globalLevel) {
-  InitializeLogging();
-  auto& logger = ModuleLogger::GetInstance();
-  auto level = logger.LevelFromString(globalLevel);
-  logger.SetGlobalLevel(level);
+void ModuleLogger::InitializeLogging(const std::string& globalLevel) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  InitializeLoggingInternal();
+  auto level = LevelFromString(globalLevel);
+  SetGlobalLevelInternal(level);
 }
 
-inline void InitializeLoggingFromEnv() {
-  InitializeLogging();
-  auto& logger = ModuleLogger::GetInstance();
+void ModuleLogger::InitializeLoggingFromEnv() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  InitializeLoggingInternal();
 
   // Check global log level first
   const char* globalLevel = std::getenv("MORI_GLOBAL_LOG_LEVEL");
   if (globalLevel) {
-    auto level = logger.LevelFromString(globalLevel);
-    logger.SetGlobalLevel(level);
+    auto level = LevelFromString(globalLevel);
+    SetGlobalLevelInternal(level);
     MORI_INFO(modules::APPLICATION, "Set global MORI log level to {} from MORI_GLOBAL_LOG_LEVEL",
               globalLevel);
   }
@@ -350,50 +372,50 @@ inline void InitializeLoggingFromEnv() {
   // Check module-specific log levels (these override global)
   const char* appLevel = std::getenv("MORI_APP_LOG_LEVEL");
   if (appLevel) {
-    auto level = logger.LevelFromString(appLevel);
-    logger.SetModuleLevelInternal(modules::APPLICATION, level, true);
+    auto level = LevelFromString(appLevel);
+    SetModuleLevelInternal(modules::APPLICATION, level, true);
     MORI_APP_INFO("Set APPLICATION log level to {} from MORI_APP_LOG_LEVEL", appLevel);
   }
 
   const char* ioLevel = std::getenv("MORI_IO_LOG_LEVEL");
   if (ioLevel) {
-    auto level = logger.LevelFromString(ioLevel);
-    logger.SetModuleLevelInternal(modules::IO, level, true);
+    auto level = LevelFromString(ioLevel);
+    SetModuleLevelInternal(modules::IO, level, true);
     MORI_IO_INFO("Set IO log level to {} from MORI_IO_LOG_LEVEL", ioLevel);
   }
 
   const char* shmemLevel = std::getenv("MORI_SHMEM_LOG_LEVEL");
   if (shmemLevel) {
-    auto level = logger.LevelFromString(shmemLevel);
-    logger.SetModuleLevelInternal(modules::SHMEM, level, true);
+    auto level = LevelFromString(shmemLevel);
+    SetModuleLevelInternal(modules::SHMEM, level, true);
     MORI_SHMEM_INFO("Set SHMEM log level to {} from MORI_SHMEM_LOG_LEVEL", shmemLevel);
   }
 
   const char* coreLevel = std::getenv("MORI_CORE_LOG_LEVEL");
   if (coreLevel) {
-    auto level = logger.LevelFromString(coreLevel);
-    logger.SetModuleLevelInternal(modules::CORE, level, true);
+    auto level = LevelFromString(coreLevel);
+    SetModuleLevelInternal(modules::CORE, level, true);
     MORI_CORE_INFO("Set CORE log level to {} from MORI_CORE_LOG_LEVEL", coreLevel);
   }
 
   const char* opsLevel = std::getenv("MORI_OPS_LOG_LEVEL");
   if (opsLevel) {
-    auto level = logger.LevelFromString(opsLevel);
-    logger.SetModuleLevelInternal(modules::OPS, level, true);
+    auto level = LevelFromString(opsLevel);
+    SetModuleLevelInternal(modules::OPS, level, true);
     MORI_OPS_INFO("Set OPS log level to {} from MORI_OPS_LOG_LEVEL", opsLevel);
   }
 
   const char* umbpLevel = std::getenv("MORI_UMBP_LOG_LEVEL");
   if (umbpLevel) {
-    auto level = logger.LevelFromString(umbpLevel);
-    logger.SetModuleLevelInternal(modules::UMBP, level, true);
+    auto level = LevelFromString(umbpLevel);
+    SetModuleLevelInternal(modules::UMBP, level, true);
     MORI_UMBP_INFO("Set UMBP log level to {} from MORI_UMBP_LOG_LEVEL", umbpLevel);
   }
 
   // Check for log pattern override
   const char* logPattern = std::getenv("MORI_LOG_PATTERN");
   if (logPattern) {
-    for (auto& [name, moduleLogger] : logger.GetLoggers()) {
+    for (auto& [name, moduleLogger] : loggers_) {
       moduleLogger->set_pattern(logPattern);
     }
     MORI_INFO(modules::APPLICATION, "Set custom log pattern from MORI_LOG_PATTERN: {}", logPattern);
@@ -405,7 +427,7 @@ inline void InitializeLoggingFromEnv() {
     try {
       // Create file sink and add it to all loggers
       auto file_sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(logFile, true);
-      for (auto& [name, moduleLogger] : logger.GetLoggers()) {
+      for (auto& [name, moduleLogger] : loggers_) {
         moduleLogger->sinks().push_back(file_sink);
       }
       MORI_INFO(modules::APPLICATION, "Added log file output: {}", logFile);
@@ -418,7 +440,7 @@ inline void InitializeLoggingFromEnv() {
   const char* disableLogging = std::getenv("MORI_DISABLE_LOGGING");
   if (disableLogging &&
       (std::string(disableLogging) == "1" || std::string(disableLogging) == "true")) {
-    logger.SetGlobalLevel(ModuleLogger::Level::CRITICAL);
+    SetGlobalLevelInternal(ModuleLogger::Level::CRITICAL);
     // Note: We can't log this since logging is disabled!
   }
 }

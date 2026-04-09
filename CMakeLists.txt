@@ -23,8 +23,6 @@ option(USE_ROCM "Whether to use rocm" ON)
 option(USE_BNXT "Whether to use BNXT NIC" OFF)
 option(USE_IONIC "Whether to use IONIC" OFF)
 option(BUILD_EXAMPLES "Whether to build examples" ON)
-option(BUILD_TORCH_BOOTSTRAP
-       "Build Torch process group bootstrap (requires PyTorch)" ON)
 option(WITH_MPI
        "Enable MPI support (required for mpi_bootstrap and C++ examples)"
        ${BUILD_EXAMPLES})
@@ -110,6 +108,9 @@ add_definitions(-DWARP_ACCUM_UNROLL=${WARP_ACCUM_UNROLL})
 add_definitions(-DHIP_ENABLE_WARP_SYNC_BUILTINS)
 if(USE_ROCM)
   list(APPEND CMAKE_PREFIX_PATH "/opt/rocm")
+  if(DEFINED GPU_TARGETS)
+    set(CMAKE_HIP_ARCHITECTURES "${GPU_TARGETS}")
+  endif()
   project(mori LANGUAGES HIP CXX C)
   find_package(hip REQUIRED)
   link_directories(/opt/rocm/lib)

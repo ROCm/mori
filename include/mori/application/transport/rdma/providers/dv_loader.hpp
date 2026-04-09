@@ -26,18 +26,18 @@
 #pragma once
 
 #include <dlfcn.h>
-
+#include <cstdint>
 #include <string>
 
-#include "mori/utils/mori_log.hpp"
+// #include "mori/utils/mori_log.hpp"
 
 // Load a shared library at runtime. Returns the handle, or nullptr on failure.
 inline void* DvLoadLibrary(const char* lib_name) {
   void* handle = dlopen(lib_name, RTLD_LAZY | RTLD_LOCAL);
   if (!handle) {
-    MORI_APP_TRACE("dlopen({}) failed: {}", lib_name, dlerror());
+    // MORI_APP_TRACE("dlopen({}) failed: {}", lib_name, dlerror());
   } else {
-    MORI_APP_TRACE("dlopen({}) succeeded", lib_name);
+    // MORI_APP_TRACE("dlopen({}) succeeded", lib_name);
   }
   return handle;
 }
@@ -46,7 +46,7 @@ inline void* DvLoadLibrary(const char* lib_name) {
 inline void* DvLoadSymbol(void* handle, const char* symbol_name) {
   void* sym = dlsym(handle, symbol_name);
   if (!sym) {
-    MORI_APP_WARN("dlsym({}) failed: {}", symbol_name, dlerror());
+    // MORI_APP_WARN("dlsym({}) failed: {}", symbol_name, dlerror());
   }
   return sym;
 }

@@ -89,10 +89,6 @@ class EpDispatchCombineTestCase:
         if not RUN_MULTITHREADED:
             mori.jax.shmem_init_attr(self.rank, self.world_size)
         def set_seed():
-          return jax.random.PRNGKey(777 + self.rank)
-        self.rng = jax.jit(set_seed)()
-
-        def set_seed():
             return jax.random.PRNGKey(777 + self.rank)
 
         self.rng = jax.jit(set_seed)()

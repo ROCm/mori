@@ -131,8 +131,10 @@ void Context::CollectHostNames() {
     const auto& [peerHost, peerPid] = hostInfo[i];
     peerInfos[i].sameHost = peerHost == myHostname;
     peerInfos[i].sameProcess = peerInfos[i].sameHost && (peerPid == pid);
-    MORI_APP_TRACE("Rank {} hostname={} pid={} sameHost={} sameProcess={}", 
+    if (LocalRank() == 0) {
+      MORI_APP_TRACE("Rank {} hostname={} pid={} sameHost={} sameProcess={}", 
        i, peerHost, peerPid, peerInfos[i].sameHost, peerInfos[i].sameProcess);
+    }
   }
 }
 
@@ -212,7 +214,7 @@ void Context::InitializePossibleTransports() {
   this->numQpPerPe = numQpPerPe;
   // Initialize transport
   int peerRankInNode = -1;
-  if (!IsP2PDisabled() && IsSDMAEnabled()) anvil::AnvilLib::getInstance().init();
+  if (!IsP2PDisabled() && IsSDMAEnabled()) anvil::anvil.init();
 
   int sdmaNumChannels = anvil::GetSdmaNumChannels();
   MORI_APP_INFO("SDMA num channels per GPU pair: {}", sdmaNumChannels);
@@ -237,7 +239,7 @@ void Context::InitializePossibleTransports() {
             }
             transportTypes.push_back(TransportType::SDMA);
             // Better performance if allocating all 8 queues
-            anvil::AnvilLib::getInstance().connect(LocalRank() % 8, i % 8, sdmaNumChannels);
+            anvil::anvil.connect(LocalRank() % 8, i % 8, sdmaNumChannels);
           } else {
             transportTypes.push_back(TransportType::P2P);
           }
