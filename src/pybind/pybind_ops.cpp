@@ -56,26 +56,17 @@ hipDataType IntToHipDataType(int dtype) {
   }
 }
 
-// Merged prepare + build in one call.
-// For recv-only calls (input_ptr == 0), keep the token-count state needed by
-// AsyncLL recv kernels, but clear external input/weight/index pointers so we do
-// not carry stale user tensor addresses across requests.
-int64_t PrepareAndBuildArgs(mori::moe::EpDispatchCombineHandle& handle, int64_t input_ptr,
-                            int input_dtype, int64_t num_tokens, int64_t weight_ptr,
-                            int64_t scale_ptr, int64_t indices_ptr, int rdmaBlockNum, int hiddenDim,
-                            int useExternalInpBuf) {
-  if (input_ptr != 0) {
-    handle.PrepareInference(IntToHipDataType(input_dtype), reinterpret_cast<void*>(input_ptr),
-                            nullptr, weight_ptr ? reinterpret_cast<float*>(weight_ptr) : nullptr,
-                            scale_ptr ? reinterpret_cast<uint8_t*>(scale_ptr) : nullptr,
-                            reinterpret_cast<mori::moe::index_t*>(indices_ptr), num_tokens);
-  } else {
-    const auto recv_num_tokens =
-        static_cast<mori::moe::index_t>((num_tokens > 0) ? num_tokens : handle.curRankNumToken);
-    handle.PrepareInference(HIP_R_32F, nullptr, nullptr, nullptr, nullptr, nullptr,
-                            recv_num_tokens);
-  }
+void PrepareInferenceArgs(mori::moe::EpDispatchCombineHandle& handle, int64_t input_ptr,
+                          int input_dtype, int64_t num_tokens, int64_t weight_ptr,
+                          int64_t scale_ptr, int64_t indices_ptr) {
+  handle.PrepareInference(IntToHipDataType(input_dtype), reinterpret_cast<void*>(input_ptr),
+                          nullptr, weight_ptr ? reinterpret_cast<float*>(weight_ptr) : nullptr,
+                          scale_ptr ? reinterpret_cast<uint8_t*>(scale_ptr) : nullptr,
+                          reinterpret_cast<mori::moe::index_t*>(indices_ptr), num_tokens);
+}
 
+int64_t BuildArgs(mori::moe::EpDispatchCombineHandle& handle, int rdmaBlockNum, int hiddenDim,
+                  int useExternalInpBuf) {
   thread_local mori::moe::EpDispatchCombineArgsRaw args;
   args = mori::moe::GetEpDispatchCombineArgsRaw(handle, rdmaBlockNum);
   // Runtime hidden_dim: dispatch/combine (send) calls pass hiddenDim from input tensor,
@@ -90,6 +81,16 @@ int64_t PrepareAndBuildArgs(mori::moe::EpDispatchCombineHandle& handle, int64_t 
   if (useExternalInpBuf >= 0)
     args.config.useExternalInpBuffer = static_cast<bool>(useExternalInpBuf);
   return reinterpret_cast<int64_t>(&args);
+}
+
+// Backward-compatible helper for call sites that still want a merged API.
+int64_t PrepareAndBuildArgs(mori::moe::EpDispatchCombineHandle& handle, int64_t input_ptr,
+                            int input_dtype, int64_t num_tokens, int64_t weight_ptr,
+                            int64_t scale_ptr, int64_t indices_ptr, int rdmaBlockNum, int hiddenDim,
+                            int useExternalInpBuf) {
+  PrepareInferenceArgs(handle, input_ptr, input_dtype, num_tokens, weight_ptr, scale_ptr,
+                       indices_ptr);
+  return BuildArgs(handle, rdmaBlockNum, hiddenDim, useExternalInpBuf);
 }
 
 py::tuple GetDispatchOutputPtrs(mori::moe::EpDispatchCombineHandle& handle, bool has_scales) {
@@ -244,6 +245,11 @@ void DeclareEpDispatchCombineHandle(pybind11::module& m) {
   m.def("get_dispatch_output_ptrs", &GetDispatchOutputPtrs);
   m.def("get_combine_output_ptrs", &GetCombineOutputPtrs);
   m.def("get_handle_info", &GetHandleInfo);
+  m.def("prepare_inference_args", &PrepareInferenceArgs, py::arg("handle"), py::arg("inp_ptr"),
+        py::arg("dtype"), py::arg("num_tokens"), py::arg("weight_ptr"), py::arg("scale_ptr"),
+        py::arg("indices_ptr"));
+  m.def("build_args", &BuildArgs, py::arg("handle"), py::arg("rdma_block_num") = -1,
+        py::arg("hidden_dim") = -1, py::arg("use_external_inp_buf") = -1);
   m.def("prepare_and_build_args", &PrepareAndBuildArgs, py::arg("handle"), py::arg("inp_ptr"),
         py::arg("dtype"), py::arg("num_tokens"), py::arg("weight_ptr"), py::arg("scale_ptr"),
         py::arg("indices_ptr"), py::arg("rdma_block_num") = -1, py::arg("hidden_dim") = -1,
