@@ -138,9 +138,16 @@ class EpDispatchCombineTestCase:
         torch.cuda.synchronize()
         dist.barrier()
 
-    def gen_test_data(self, use_max_token_num=False, routing="random"):
+    def gen_test_data(
+        self, use_max_token_num=False, routing="random", num_token_override=None
+    ):
         """Generate test data."""
-        if use_max_token_num:
+        if num_token_override is not None:
+            assert len(num_token_override) == self.config.world_size
+            assert min(num_token_override) >= 0
+            assert max(num_token_override) <= self.config.max_num_inp_token_per_rank
+            num_token = torch.tensor(num_token_override, device=self.device)
+        elif use_max_token_num:
             num_token = torch.tensor(
                 [
                     self.config.max_num_inp_token_per_rank
@@ -424,7 +431,11 @@ class EpDispatchCombineTestCase:
 
 
 def run_ep_dispatch_combine_test(
-    config, test_case_cls, use_max_token_num=False, routing=None
+    config,
+    test_case_cls,
+    use_max_token_num=False,
+    routing=None,
+    num_token_override=None,
 ):
     op = mori.ops.EpDispatchCombineOp(config)
     test_case = test_case_cls(config)
@@ -433,5 +444,7 @@ def run_ep_dispatch_combine_test(
         gen_kwargs["use_max_token_num"] = True
     if routing is not None:
         gen_kwargs["routing"] = routing
+    if num_token_override is not None:
+        gen_kwargs["num_token_override"] = num_token_override
     test_data = test_case.gen_test_data(**gen_kwargs)
     test_case.run_test_once(op, test_data)
