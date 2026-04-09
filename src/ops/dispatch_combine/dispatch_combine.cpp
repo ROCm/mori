@@ -170,10 +170,13 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
              config.kernelType == KernelType::InterNodeV1LL) {
     auto& bufs = shmemTokBufs.emplace<ShmemBufsInterNodeV1>();
     const int nNodes = config.worldSize / config.gpuPerNode;
+    // Staging is shared between dispatch (uses MaxXferBytesPerToken) and combine (uses FP32).
+    // Use max per-slot size to ensure both paths fit.
+    size_t maxSlotBytes = config.MaxStagingSlotBytes();
     size_t dispatchInpSize = static_cast<ssize_t>(nNodes) * config.MaxNumTokensToSendPerRank() *
                              config.MaxXferBytesPerToken();
-    size_t stagingSize = static_cast<ssize_t>(2 * nNodes) * config.MaxNumTokensToSendPerRank() *
-                         config.MaxXferBytesPerToken();
+    size_t stagingSize =
+        static_cast<ssize_t>(2 * nNodes) * config.MaxNumTokensToSendPerRank() * maxSlotBytes;
     bufs.dispatchInp = ShmemMallocAndReturnMemObjPtr(dispatchInpSize, hipDeviceMallocUncached);
     bufs.combineInp = ShmemMallocAndReturnMemObjPtr(maxStagingSize, hipDeviceMallocUncached);
     bufs.staging = ShmemMallocAndReturnMemObjPtr(stagingSize, hipDeviceMallocUncached);

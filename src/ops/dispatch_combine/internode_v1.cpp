@@ -738,8 +738,9 @@ __forceinline__ __device__ void CombineIntraNodeTyped(EpDispatchCombineArgs<T>& 
                                 destLocalTokId * config.numExpertPerToken;
       }
     }
-    core::WarpAccum<TokT, 4>(reinterpret_cast<TokT*>(stagingPtr + tokenId * tokCombXferBytes),
-                             srcPtrs, nullptr, config.numExpertPerToken, config.hiddenDim);
+    core::WarpAccumCrossType<float, TokT, 4>(
+        reinterpret_cast<float*>(stagingPtr + tokenId * tokCombXferBytes), srcPtrs, nullptr,
+        config.numExpertPerToken, config.hiddenDim);
     if (args.weightsBuf) {
       core::WarpAccum<float, 4>(
           reinterpret_cast<float*>(stagingPtr + tokenId * tokCombXferBytes + tokHiddenBytes),
@@ -791,9 +792,9 @@ __forceinline__ __device__ void CombineIntraNodeLLTyped(EpDispatchCombineArgs<T>
                                 destLocalTokId * config.numExpertPerToken;
       }
     }
-    core::WarpAccum<TokT, 4>(
-        reinterpret_cast<TokT*>(stagingPtr + tokenId * tokCombXferBytes) + hiddenDimOffset, srcPtrs,
-        nullptr, config.numExpertPerToken, hiddenDimSize);
+    core::WarpAccumCrossType<float, TokT, 4>(
+        reinterpret_cast<float*>(stagingPtr + tokenId * tokCombXferBytes) + hiddenDimOffset,
+        srcPtrs, nullptr, config.numExpertPerToken, hiddenDimSize);
     if (args.weightsBuf && (inTokenPartId == warpsPerToken - 1)) {
       core::WarpAccum<float, 4>(
           reinterpret_cast<float*>(stagingPtr + tokenId * tokCombXferBytes + tokHiddenBytes),
@@ -890,9 +891,9 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs<T>& 
                 args.interNodeDispDestTokIdMap[tokIdx * config.numExpertPerToken + laneId] = 0;
               }
 
-              core::WarpAccum<TokT, 4>(
-                  reinterpret_cast<TokT*>(stagingPtr + tokIdx * tokCombXferBytes), srcPtrs, nullptr,
-                  config.numExpertPerToken, config.hiddenDim);
+              core::WarpAccumCrossType<float, TokT, 4>(
+                  reinterpret_cast<float*>(stagingPtr + tokIdx * tokCombXferBytes), srcPtrs,
+                  nullptr, config.numExpertPerToken, config.hiddenDim);
 
               if (args.weightsBuf) {
                 core::WarpAccum<float, 4>(
@@ -1033,8 +1034,8 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs<T>
                                     destLocalTokId * config.numExpertPerToken;
           }
         }
-        core::WarpAccum<TokT, 4>(
-            reinterpret_cast<TokT*>(stagingPtr + globalTokenId * tokCombXferBytes) +
+        core::WarpAccumCrossType<float, TokT, 4>(
+            reinterpret_cast<float*>(stagingPtr + globalTokenId * tokCombXferBytes) +
                 hiddenDimOffset,
             srcPtrs, nullptr, config.numExpertPerToken, hiddenDimSize);
         if (args.weightsBuf && (inTokenPartId == 0)) {
@@ -1116,16 +1117,13 @@ template <typename T>
 inline __device__ void CombineIntraNode(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
   MORI_TRACE_SPAN(profiler, Slot::CombineIntraNode);
+  // All paths now accumulate to FP32 staging for precision.
   if (args.config.quantType == QuantType::Fp8DirectCast) {
     using TokT = core::CombineInternalFp8;
-    const size_t tokHiddenBytes = config.hiddenDim * sizeof(TokT);
-    const size_t tokCombXferBytes =
-        (args.weightsBuf == nullptr) ? tokHiddenBytes : tokHiddenBytes + weightBytes;
-    combine_impl::CombineIntraNodeTyped<TokT>(args, tokHiddenBytes, tokCombXferBytes);
+    combine_impl::CombineIntraNodeTyped<TokT>(args, combFp32HiddenBytes, combFp32XferBytes);
     return;
   }
-
-  combine_impl::CombineIntraNodeTyped<T>(args, hiddenBytes, combXferBytes);
+  combine_impl::CombineIntraNodeTyped<T>(args, combFp32HiddenBytes, combFp32XferBytes);
 }
 
 template <typename T>
@@ -1136,13 +1134,10 @@ inline __device__ void CombineIntraNodeLL(EpDispatchCombineArgs<T>& args) {
   if (args.curRankNumToken == 0) return;
   if (args.config.quantType == QuantType::Fp8DirectCast) {
     using TokT = core::CombineInternalFp8;
-    const size_t tokHiddenBytes = config.hiddenDim * sizeof(TokT);
-    const size_t tokCombXferBytes =
-        (args.weightsBuf == nullptr) ? tokHiddenBytes : tokHiddenBytes + weightBytes;
-    combine_impl::CombineIntraNodeLLTyped<TokT>(args, tokHiddenBytes, tokCombXferBytes);
+    combine_impl::CombineIntraNodeLLTyped<TokT>(args, combFp32HiddenBytes, combFp32XferBytes);
     return;
   }
-  combine_impl::CombineIntraNodeLLTyped<T>(args, hiddenBytes, combXferBytes);
+  combine_impl::CombineIntraNodeLLTyped<T>(args, combFp32HiddenBytes, combFp32XferBytes);
 }
 
 template <typename T>
@@ -1152,13 +1147,10 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
 
   if (args.config.quantType == QuantType::Fp8DirectCast) {
     using TokT = core::CombineInternalFp8;
-    const size_t tokHiddenBytes = config.hiddenDim * sizeof(TokT);
-    const size_t tokCombXferBytes =
-        (args.weightsBuf == nullptr) ? tokHiddenBytes : tokHiddenBytes + weightBytes;
-    combine_impl::CombineInterNodeTyped<TokT>(args, tokHiddenBytes, tokCombXferBytes);
+    combine_impl::CombineInterNodeTyped<TokT>(args, combFp32HiddenBytes, combFp32XferBytes);
     return;
   }
-  combine_impl::CombineInterNodeTyped<T>(args, hiddenBytes, combXferBytes);
+  combine_impl::CombineInterNodeTyped<T>(args, combFp32HiddenBytes, combFp32XferBytes);
 }
 
 template <typename T>
@@ -1167,13 +1159,10 @@ inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs<T>& args) {
   MORI_TRACE_SPAN(profiler, Slot::CombineInterNodeLL);
   if (args.config.quantType == QuantType::Fp8DirectCast) {
     using TokT = core::CombineInternalFp8;
-    const size_t tokHiddenBytes = config.hiddenDim * sizeof(TokT);
-    const size_t tokCombXferBytes =
-        (args.weightsBuf == nullptr) ? tokHiddenBytes : tokHiddenBytes + weightBytes;
-    combine_impl::CombineInterNodeLLTyped<TokT>(args, tokHiddenBytes, tokCombXferBytes);
+    combine_impl::CombineInterNodeLLTyped<TokT>(args, combFp32HiddenBytes, combFp32XferBytes);
     return;
   }
-  combine_impl::CombineInterNodeLLTyped<T>(args, hiddenBytes, combXferBytes);
+  combine_impl::CombineInterNodeLLTyped<T>(args, combFp32HiddenBytes, combFp32XferBytes);
 }
 }  // namespace v1
 
@@ -1195,19 +1184,18 @@ __global__ void EpCombineInterNodeV1Kernel(EpDispatchCombineArgs<T> args) {
 
 namespace combine_all_impl {
 
+// Staging now holds FP32 for both FP8 and non-FP8 paths.
+// CombineAll reads FP32 partials from staging, accumulates, and casts to T for output.
 template <typename T>
-__forceinline__ __device__ void EpCombineAllInternalFp8(EpDispatchCombineArgs<T>& args,
-                                                        size_t fp8HiddenBytes,
-                                                        size_t fp8CombXferBytes) {
+__forceinline__ __device__ void EpCombineAllFp32Staging(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
-  using Fp8T = core::CombineInternalFp8;
 
   extern __shared__ char sharedMem[];
-  Fp8T** srcPtrs = reinterpret_cast<Fp8T**>(sharedMem) + warpId * config.numExpertPerToken;
+  float** srcPtrs = reinterpret_cast<float**>(sharedMem) + warpId * config.numExpertPerToken;
   float** srcWeightsPtrs = reinterpret_cast<float**>(sharedMem) +
                            warpNum * config.numExpertPerToken + warpId * config.numExpertPerToken;
   uint8_t* stagingPtr = args.interNodeV1TokBufs.staging->template GetAs<uint8_t*>() +
-                        SendBufSlotOffset(config, nNodes, 0) * fp8CombXferBytes;
+                        SendBufSlotOffset(config, nNodes, 0) * combFp32XferBytes;
 
   index_t warpsPerToken = (globalWarpNum + args.curRankNumToken - 1) / args.curRankNumToken;
   index_t hiddenDimPerWarp = (config.hiddenDim + warpsPerToken - 1) / warpsPerToken;
@@ -1233,68 +1221,17 @@ __forceinline__ __device__ void EpCombineAllInternalFp8(EpDispatchCombineArgs<T>
     for (int n = 0; n < nNodes; n++) {
       if (__any(laneNode == n) && (laneId == 0)) {
         int mappedId = (n == myNode) ? tokenId : args.interNodeDispSendMap[nNodes * tokenId + n];
-        uint8_t* base = stagingPtr + SendBufSlotOffset(config, n, mappedId) * fp8CombXferBytes;
-        srcPtrs[n] = reinterpret_cast<Fp8T*>(base) + hiddenDimOffset;
-        srcWeightsPtrs[n] = reinterpret_cast<float*>(base + fp8HiddenBytes);
+        uint8_t* base = stagingPtr + SendBufSlotOffset(config, n, mappedId) * combFp32XferBytes;
+        srcPtrs[n] = reinterpret_cast<float*>(base) + hiddenDimOffset;
+        srcWeightsPtrs[n] = reinterpret_cast<float*>(base + combFp32HiddenBytes);
       }
     }
 
-    T* out = args.interNodeV1TokBufs.combineOut->template GetAs<T*>() + tokenId * config.hiddenDim +
-             hiddenDimOffset;
-    core::WarpAccumCombineInternalFp8ToBf16(out, reinterpret_cast<const Fp8T* const*>(srcPtrs),
-                                            nNodes, laneId, hiddenDimSize);
+    // Read FP32 partials from staging, accumulate, cast to T for final output
+    core::WarpAccumCrossType<T, float, 4>(args.interNodeV1TokBufs.combineOut->template GetAs<T*>() +
+                                              tokenId * config.hiddenDim + hiddenDimOffset,
+                                          srcPtrs, nullptr, nNodes, hiddenDimSize);
 
-    if (args.weightsBuf && (inTokenPartId == warpsPerToken - 1)) {
-      core::WarpAccum<float, 4>(args.shmemCombineOutWeightsMemObj->template GetAs<float*>() +
-                                    tokenId * config.numExpertPerToken,
-                                srcWeightsPtrs, nullptr, nNodes, config.numExpertPerToken);
-    }
-  }
-}
-
-template <typename T>
-__forceinline__ __device__ void EpCombineAllGeneric(EpDispatchCombineArgs<T>& args) {
-  DEF_COMMON_VARS;
-
-  extern __shared__ char sharedMem[];
-  T** srcPtrs = reinterpret_cast<T**>(sharedMem) + warpId * config.numExpertPerToken;
-  float** srcWeightsPtrs = reinterpret_cast<float**>(sharedMem) +
-                           warpNum * config.numExpertPerToken + warpId * config.numExpertPerToken;
-  uint8_t* stagingPtr = args.interNodeV1TokBufs.staging->template GetAs<uint8_t*>() +
-                        SendBufSlotOffset(config, nNodes, 0) * combXferBytes;
-
-  index_t warpsPerToken = (globalWarpNum + args.curRankNumToken - 1) / args.curRankNumToken;
-  index_t hiddenDimPerWarp = (config.hiddenDim + warpsPerToken - 1) / warpsPerToken;
-
-  for (int i = globalWarpId; i < (args.curRankNumToken * warpsPerToken); i += globalWarpNum) {
-    index_t tokenId = i / warpsPerToken;
-    index_t inTokenPartId = i % warpsPerToken;
-    index_t hiddenDimOffset = inTokenPartId * hiddenDimPerWarp;
-    index_t hiddenDimSize =
-        std::max(0, std::min(config.hiddenDim - hiddenDimOffset, hiddenDimPerWarp));
-
-    int lanePe = -1, laneNode = -1;
-    if (laneId < config.numExpertPerToken) {
-      lanePe = (args.tokenIndices[tokenId * numExpertPerToken + laneId] / config.numExpertPerRank);
-      laneNode = lanePe / config.gpuPerNode;
-    }
-
-    if (laneId < nNodes) {
-      srcPtrs[laneId] = nullptr;
-      srcWeightsPtrs[laneId] = nullptr;
-    }
-
-    for (int n = 0; n < nNodes; n++) {
-      if (__any(laneNode == n) && (laneId == 0)) {
-        int mappedId = (n == myNode) ? tokenId : args.interNodeDispSendMap[nNodes * tokenId + n];
-        uint8_t* base = stagingPtr + SendBufSlotOffset(config, n, mappedId) * combXferBytes;
-        srcPtrs[n] = reinterpret_cast<T*>(base) + hiddenDimOffset;
-        srcWeightsPtrs[n] = reinterpret_cast<float*>(base + hiddenBytes);
-      }
-    }
-    core::WarpAccum<T, 4>(args.interNodeV1TokBufs.combineOut->template GetAs<T*>() +
-                              tokenId * config.hiddenDim + hiddenDimOffset,
-                          srcPtrs, nullptr, nNodes, hiddenDimSize);
     if (args.weightsBuf && (inTokenPartId == warpsPerToken - 1)) {
       core::WarpAccum<float, 4>(args.shmemCombineOutWeightsMemObj->template GetAs<float*>() +
                                     tokenId * config.numExpertPerToken,
@@ -1315,15 +1252,8 @@ __device__ void EpCombineAll_body(EpDispatchCombineArgs<T> args) {
     if (laneId < nNodes) args.blockFlagCounter[laneId] = 0;
   }
   if (args.curRankNumToken == 0) return;
-  if (args.config.quantType == QuantType::Fp8DirectCast) {
-    using Fp8T = core::CombineInternalFp8;
-    const size_t fp8HiddenBytes = config.hiddenDim * sizeof(Fp8T);
-    const size_t fp8CombXferBytes =
-        (args.weightsBuf == nullptr) ? fp8HiddenBytes : fp8HiddenBytes + weightBytes;
-    combine_all_impl::EpCombineAllInternalFp8(args, fp8HiddenBytes, fp8CombXferBytes);
-    return;
-  }
-  combine_all_impl::EpCombineAllGeneric(args);
+  // Both FP8 and non-FP8 paths now use FP32 staging
+  combine_all_impl::EpCombineAllFp32Staging(args);
 }
 
 template <typename T>

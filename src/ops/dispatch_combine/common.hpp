@@ -60,33 +60,36 @@ inline __device__ int NullSendBufSlotOffset(const EpDispatchCombineConfig& confi
   return config.worldSize * config.MaxNumTokensToSendPerRank();
 }
 
-#define DEF_COMMON_VARS                                    \
-  const EpDispatchCombineConfig& config = args.config;     \
-  int thdId = threadIdx.x;                                 \
-  int thdNum = blockDim.x;                                 \
-  int laneId = threadIdx.x & (warpSize - 1);               \
-  int warpId = thdId / warpSize;                           \
-  int warpNum = blockDim.x / warpSize;                     \
-  int blockNum = gridDim.x;                                \
-  int blockId = blockIdx.x;                                \
-  int globalThdId = blockIdx.x * blockDim.x + threadIdx.x; \
-  int globalThdNum = gridDim.x * blockDim.x;               \
-  int globalWarpId = blockIdx.x * warpNum + warpId;        \
-  int globalWarpNum = gridDim.x * warpNum;                 \
-  int nullTokenId = NullFlatTokenIndex(config);            \
-  int myPe = config.rank;                                  \
-  int npes = config.worldSize;                             \
-  int myNode = myPe / config.gpuPerNode;                   \
-  int nNodes = npes / config.gpuPerNode;                   \
-  int numExpertPerToken = config.numExpertPerToken;        \
-  assert(numExpertPerToken < warpSize);                    \
-  size_t hiddenBytes = config.HiddenBytes(sizeof(T));      \
-  size_t indexBytes = config.IndexBytes();                 \
-  size_t weightBytes = config.WeightBytes();               \
-  size_t srcTokenIdBytes = config.SrcTokenIdBytes();       \
-  size_t scaleBytes = config.ScaleBytes();                 \
-  size_t xferBytes = config.XferBytesPerToken(sizeof(T));  \
-  size_t combXferBytes = (args.weightsBuf == nullptr) ? hiddenBytes : hiddenBytes + weightBytes;
+#define DEF_COMMON_VARS                                                                          \
+  const EpDispatchCombineConfig& config = args.config;                                           \
+  int thdId = threadIdx.x;                                                                       \
+  int thdNum = blockDim.x;                                                                       \
+  int laneId = threadIdx.x & (warpSize - 1);                                                     \
+  int warpId = thdId / warpSize;                                                                 \
+  int warpNum = blockDim.x / warpSize;                                                           \
+  int blockNum = gridDim.x;                                                                      \
+  int blockId = blockIdx.x;                                                                      \
+  int globalThdId = blockIdx.x * blockDim.x + threadIdx.x;                                       \
+  int globalThdNum = gridDim.x * blockDim.x;                                                     \
+  int globalWarpId = blockIdx.x * warpNum + warpId;                                              \
+  int globalWarpNum = gridDim.x * warpNum;                                                       \
+  int nullTokenId = NullFlatTokenIndex(config);                                                  \
+  int myPe = config.rank;                                                                        \
+  int npes = config.worldSize;                                                                   \
+  int myNode = myPe / config.gpuPerNode;                                                         \
+  int nNodes = npes / config.gpuPerNode;                                                         \
+  int numExpertPerToken = config.numExpertPerToken;                                              \
+  assert(numExpertPerToken < warpSize);                                                          \
+  size_t hiddenBytes = config.HiddenBytes(sizeof(T));                                            \
+  size_t indexBytes = config.IndexBytes();                                                       \
+  size_t weightBytes = config.WeightBytes();                                                     \
+  size_t srcTokenIdBytes = config.SrcTokenIdBytes();                                             \
+  size_t scaleBytes = config.ScaleBytes();                                                       \
+  size_t xferBytes = config.XferBytesPerToken(sizeof(T));                                        \
+  size_t combXferBytes = (args.weightsBuf == nullptr) ? hiddenBytes : hiddenBytes + weightBytes; \
+  size_t combFp32HiddenBytes = config.hiddenDim * sizeof(float);                                 \
+  size_t combFp32XferBytes =                                                                     \
+      (args.weightsBuf == nullptr) ? combFp32HiddenBytes : combFp32HiddenBytes + weightBytes;
 
 }  // namespace moe
 }  // namespace mori
