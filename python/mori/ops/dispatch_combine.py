@@ -533,6 +533,8 @@ class EpDispatchCombineOp:
         sfx = _DTYPE_SUFFIX[self._dispatch_dtype]
         kt = self.config.kernel_type.value
 
+        # Recv kernels must reuse the handle's inference pointers/state prepared by the
+        # preceding dispatch_send/dispatch call, so only rebuild raw args here.
         args_ptr = mori_cpp.build_args(self._handle, rdma_block_num=0)
         if kt == EpDispatchCombineKernelType.AsyncLL.value:
             mp = self._handle_info["multi_processor_count"]
@@ -760,6 +762,8 @@ class EpDispatchCombineOp:
         sfx = _DTYPE_SUFFIX[self._combine_dtype]
         kt = self.config.kernel_type.value
 
+        # Recv kernels must reuse the handle's inference pointers/state prepared by the
+        # preceding combine_send/combine call, so only rebuild raw args here.
         args_ptr = mori_cpp.build_args(self._handle, rdma_block_num=0)
         shared_mem = self._combine_shared_mem(actual_wpb)
         if kt == EpDispatchCombineKernelType.AsyncLL.value:
