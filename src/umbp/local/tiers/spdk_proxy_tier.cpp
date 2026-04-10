@@ -25,7 +25,7 @@
 // SpdkProxyTier: TierBackend that communicates with a multitenant spdk_proxy
 // daemon via POSIX shared memory.
 
-#include "umbp/local/storage/spdk_proxy_tier.h"
+#include "umbp/local/tiers/spdk_proxy_tier.h"
 
 #include <algorithm>
 #include <chrono>

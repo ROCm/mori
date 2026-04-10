@@ -30,7 +30,7 @@
 #include <unordered_set>
 #include <vector>
 
-#include "umbp/local/storage/segment/segment_types.h"
+#include "umbp/local/tiers/segment/segment_types.h"
 
 namespace mori::umbp::segment {
 

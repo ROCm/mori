@@ -28,7 +28,7 @@
 #include <vector>
 
 #include "umbp/local/standalone_client.h"
-#include "umbp/local/storage/ssd_tier.h"
+#include "umbp/local/tiers/ssd_tier.h"
 
 using namespace mori::umbp;
 

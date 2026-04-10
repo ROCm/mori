@@ -37,7 +37,7 @@
 #include <vector>
 
 #include "umbp/common/config.h"
-#include "umbp/local/storage/spdk_proxy_tier.h"
+#include "umbp/local/tiers/spdk_proxy_tier.h"
 
 using namespace mori::umbp;
 

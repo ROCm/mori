@@ -86,27 +86,27 @@ set(UMBP_CORE_SRCS
     storage/io/storage_io_driver.cpp
     storage/io/posix_storage_io_driver.cpp
     storage/io/io_uring_storage_io_driver.cpp
-    local/storage/copy_pipeline.cpp
-    local/storage/segment/segment_format.cpp
-    local/storage/segment/segment_index.cpp
-    local/storage/segment/segment_scanner.cpp
-    local/storage/segment/segment_writer.cpp
-    local/storage/tier_backend.cpp
-    local/storage/dram_tier.cpp
-    local/storage/ssd_tier.cpp
-    local/storage/local_storage_manager.cpp
+    local/tiers/copy_pipeline.cpp
+    local/tiers/segment/segment_format.cpp
+    local/tiers/segment/segment_index.cpp
+    local/tiers/segment/segment_scanner.cpp
+    local/tiers/segment/segment_writer.cpp
+    local/tiers/tier_backend.cpp
+    local/tiers/dram_tier.cpp
+    local/tiers/ssd_tier.cpp
+    local/tiers/local_storage_manager.cpp
     local/standalone_client.cpp
     storage/spdk/offset_allocator.cpp)
 
 # SPDK Proxy client (shared memory IPC, no SPDK dependency — Linux only)
 if(UNIX)
   list(APPEND UMBP_CORE_SRCS storage/spdk/proxy/spdk_proxy_shm.cpp
-       local/storage/spdk_proxy_tier.cpp)
+       local/tiers/spdk_proxy_tier.cpp)
 endif()
 
 if(HAVE_SPDK)
   list(APPEND UMBP_CORE_SRCS storage/spdk/spdk_env.cpp
-       local/storage/spdk_ssd_tier.cpp)
+       local/tiers/spdk_ssd_tier.cpp)
 endif()
 
 add_library(umbp_core STATIC ${UMBP_CORE_SRCS})
