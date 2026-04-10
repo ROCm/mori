@@ -48,7 +48,7 @@ __global__ void lat_thread(double* data_d, size_t len_doubles, int pe, int iter)
   }
   const int peer = !pe;
   for (int i = 0; i < iter; i++) {
-    ShmemPutMemNbiThread(data_d, data_d, len_doubles * sizeof(double), peer, kDefaultQpId);
+    ShmemGetMemNbiThread(data_d, data_d, len_doubles * sizeof(double), peer, kDefaultQpId);
     ShmemQuietThread();
   }
 }
@@ -61,7 +61,7 @@ __global__ void lat_warp(double* data_d, size_t len_doubles, int pe, int iter) {
   const int tid = lat_tid();
   const int peer = !pe;
   for (int i = 0; i < iter; i++) {
-    ShmemPutMemNbiWarp(data_d, data_d, len_doubles * sizeof(double), peer, kDefaultQpId);
+    ShmemGetMemNbiWarp(data_d, data_d, len_doubles * sizeof(double), peer, kDefaultQpId);
     __syncthreads();
     if (!tid) {
       ShmemQuietThread();
@@ -78,7 +78,7 @@ __global__ void lat_block(double* data_d, size_t len_doubles, int pe, int iter) 
   const int tid = lat_tid();
   const int peer = !pe;
   for (int i = 0; i < iter; i++) {
-    ShmemPutMemNbiBlock(data_d, data_d, len_doubles * sizeof(double), peer, kDefaultQpId);
+    ShmemGetMemNbiBlock(data_d, data_d, len_doubles * sizeof(double), peer, kDefaultQpId);
     __syncthreads();
     if (!tid) {
       ShmemQuietThread();
@@ -132,9 +132,8 @@ int main(int argc, char** argv) {
   PerfContext ctx{};
   const int init_rc = PerfInit(argc, argv, &ctx);
   if (init_rc != 0) {
-    return init_rc == 2 ? 0 : 1;
+    return init_rc;
   }
-
   PerfArgs& args = ctx.args;
   const int my_pe = ctx.my_pe;
   const int npes = ctx.npes;
@@ -223,7 +222,7 @@ int main(int argc, char** argv) {
     } else if (phase == PutScope::kBlock) {
       block_threads = args.threads_per_block;
     }
-    PrintPerfTable("shmem_put_latency_uni", ScopeToChar(phase), 1, block_threads, device_warp_size,
+    PrintPerfTable("shmem_get_latency_uni", ScopeToChar(phase), 1, block_threads, device_warp_size,
                    args.iters, args.warmup, PerfTableMetric::kLatencyUs, lat_table);
   }
   ShmemBarrierAll();

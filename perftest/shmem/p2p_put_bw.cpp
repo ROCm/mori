@@ -26,22 +26,17 @@
 #include <cstdlib>
 #include <vector>
 
-#include "util.hpp"
 #include "device_utils.hpp"
-
 #include "hip/hip_runtime.h"
 #include "mori/application/utils/check.hpp"
 #include "mori/shmem/shmem.hpp"
+#include "util.hpp"
 
 using namespace mori::application;
 using namespace mori::shmem;
 using namespace mori::perftest;
 
 namespace {
-
-constexpr int kDefaultQpId = 1;
-constexpr float kMsToS = 1000.0f;
-constexpr double kBToGb = 1e9;
 
 __global__ void bw_block(double* data_d, volatile unsigned int* counter_d, size_t len, int pe,
                          int iter) {
@@ -73,8 +68,7 @@ __global__ void bw_warp(double* data_d, volatile unsigned int* counter_d, size_t
   size_t put_per_warp = put_per_block / static_cast<size_t>(nwarps_per_block);
 
   for (int i = 0; i < iter; i++) {
-    double* slice =
-        data_d + bid * put_per_block + static_cast<size_t>(warpid) * put_per_warp;
+    double* slice = data_d + bid * put_per_block + static_cast<size_t>(warpid) * put_per_warp;
     ShmemPutMemNbiWarp(slice, slice, put_per_warp * sizeof(double), peer, kDefaultQpId);
 
     bw_cross_block_barrier_round(counter_d, nblocks, i);
@@ -95,8 +89,7 @@ __global__ void bw_thread(double* data_d, volatile unsigned int* counter_d, size
   size_t put_per_thread = put_per_block / static_cast<size_t>(nthreads);
 
   for (int i = 0; i < iter; i++) {
-    double* slice =
-        data_d + bid * put_per_block + static_cast<size_t>(tid) * put_per_thread;
+    double* slice = data_d + bid * put_per_block + static_cast<size_t>(tid) * put_per_thread;
     ShmemPutMemNbiThread(slice, slice, put_per_thread * sizeof(double), peer, kDefaultQpId);
 
     bw_cross_block_barrier_round(counter_d, nblocks, i);
@@ -105,13 +98,11 @@ __global__ void bw_thread(double* data_d, volatile unsigned int* counter_d, size
   bw_final_barrier_and_quiet(counter_d, nblocks, iter);
 }
 
-
 void launch_bw(PutScope scope, dim3 grid, dim3 block, double* data_d, unsigned int* counter_d,
                size_t len_doubles, int my_pe, int count) {
   switch (scope) {
     case PutScope::kBlock:
-      hipLaunchKernelGGL(bw_block, grid, block, 0, 0, data_d, counter_d, len_doubles, my_pe,
-                         count);
+      hipLaunchKernelGGL(bw_block, grid, block, 0, 0, data_d, counter_d, len_doubles, my_pe, count);
       break;
     case PutScope::kWarp:
       hipLaunchKernelGGL(bw_warp, grid, block, 0, 0, data_d, counter_d, len_doubles, my_pe, count);
@@ -127,97 +118,49 @@ void launch_bw(PutScope scope, dim3 grid, dim3 block, double* data_d, unsigned i
 
 int main(int argc, char** argv) {
 #ifndef MORI_WITH_MPI
-  std::fprintf(stderr, "mori_shmem_put_bw requires MORI_WITH_MPI (enable WITH_MPI / BUILD_EXAMPLES).\n");
+  std::fprintf(stderr,
+               "mori_shmem_put_bw requires MORI_WITH_MPI (enable WITH_MPI / BUILD_EXAMPLES).\n");
   return 1;
 #else
 
-  MPI_Init(&argc, &argv);
-  int mpi_world_rank = 0;
-  MPI_Comm_rank(MPI_COMM_WORLD, &mpi_world_rank);
-
-  mori::perftest::PerfArgs args{};
-  const int parse_rc = mori::perftest::ParseArgs(argc, argv, &args);
-  if (parse_rc != 0) {
-    if (mpi_world_rank == 0) {
-      mori::perftest::PrintUsage(argv[0]);
-    }
-    MPI_Finalize();
-    return parse_rc == 2 ? 0 : 1;
+  PerfContext ctx{};
+  const int init_rc = PerfInit(argc, argv, &ctx);
+  if (init_rc != 0) {
+    return init_rc;
   }
 
-  if (args.min_size > args.max_size || args.step_factor < 2 || args.nblocks < 1 ||
-      args.threads_per_block < 1) {
-    if (mpi_world_rank == 0) {
-      std::fprintf(stderr, "Invalid arguments.\n");
-    }
-    MPI_Finalize();
-    return 1;
-  }
+  PerfArgs& args = ctx.args;
+  const int my_pe = ctx.my_pe;
+  const int npes = ctx.npes;
 
-  PutScope scope = args.put_scope;
-
-  MPI_Comm local_comm;
-  MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &local_comm);
-  int local_rank = 0;
-  MPI_Comm_rank(local_comm, &local_rank);
-
-  int device_count = 0;
-  HIP_RUNTIME_CHECK(hipGetDeviceCount(&device_count));
-  int device_id = local_rank % device_count;
-  HIP_RUNTIME_CHECK(hipSetDevice(device_id));
-
-  int device_warp_size = 0;
-  HIP_RUNTIME_CHECK(
-      hipDeviceGetAttribute(&device_warp_size, hipDeviceAttributeWarpSize, device_id));
-
-  int rc = ShmemMpiInit(MPI_COMM_WORLD);
-  if (rc != 0) {
-    std::fprintf(stderr, "ShmemMpiInit failed: %d\n", rc);
-    MPI_Comm_free(&local_comm);
-    int finalized = 0;
-    MPI_Finalized(&finalized);
-    if (!finalized) {
-      MPI_Finalize();
-    }
-    return 1;
-  }
-
-  int my_pe = ShmemMyPe();
-  int npes = ShmemNPes();
   if (npes != 2) {
     if (my_pe == 0) {
       std::fprintf(stderr, "mori_shmem_put_bw requires exactly 2 PEs (npes=%d)\n", npes);
     }
-    MPI_Comm_free(&local_comm);
-    ShmemFinalize();
+    PerfFinalize(&ctx);
     return 1;
   }
 
   const bool run_kernels = args.bidirectional || my_pe == 0;
 
+  PutScope scope = args.put_scope;
   const char* scope_name = ScopeToChar(scope);
 
   dim3 grid(args.nblocks, 1, 1);
   dim3 block(args.threads_per_block, 1, 1);
 
-  unsigned int* counter_d = nullptr;
-  hipEvent_t start{};
-  hipEvent_t stop{};
+  PerfRes res;
   if (run_kernels) {
-    HIP_RUNTIME_CHECK(hipMalloc(&counter_d, 2 * sizeof(unsigned int)));
-    HIP_RUNTIME_CHECK(hipMemset(counter_d, 0, 2 * sizeof(unsigned int)));
-    HIP_RUNTIME_CHECK(hipEventCreate(&start));
-    HIP_RUNTIME_CHECK(hipEventCreate(&stop));
+    PerfResAlloc(&res);
   }
 
   void* symm = ShmemMalloc(args.max_size);
   if (!symm) {
     std::fprintf(stderr, "ShmemMalloc failed\n");
     if (run_kernels) {
-      HIP_RUNTIME_CHECK(hipFree(counter_d));
+      PerfResFree(&res);
     }
-    MPI_Comm_free(&local_comm);
-    ShmemFinalize();
+    PerfFinalize(&ctx);
     return 1;
   }
   double* data_d = static_cast<double*>(symm);
@@ -234,7 +177,7 @@ int main(int argc, char** argv) {
       continue;
     }
     size_t len_doubles = size_bytes / sizeof(double);
-    if (!size_ok(scope, size_bytes, args.nblocks, args.threads_per_block, device_warp_size)) {
+    if (!size_ok(scope, size_bytes, args.nblocks, args.threads_per_block, ctx.device_warp_size)) {
       if (my_pe == 0) {
         bandwidth_table.push_back(PerfTableRow{size_bytes, true, 0.0});
       }
@@ -243,22 +186,10 @@ int main(int argc, char** argv) {
     }
 
     if (run_kernels) {
-      HIP_RUNTIME_CHECK(hipMemset(counter_d, 0, 2 * sizeof(unsigned int)));
-      launch_bw(scope, grid, block, data_d, counter_d, len_doubles, my_pe,
-                static_cast<int>(args.warmup));
-      HIP_RUNTIME_CHECK(hipGetLastError());
-      HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-
-      HIP_RUNTIME_CHECK(hipMemset(counter_d, 0, 2 * sizeof(unsigned int)));
-      HIP_RUNTIME_CHECK(hipEventRecord(start, nullptr));
-      launch_bw(scope, grid, block, data_d, counter_d, len_doubles, my_pe,
-                static_cast<int>(args.iters));
-      HIP_RUNTIME_CHECK(hipGetLastError());
-      HIP_RUNTIME_CHECK(hipEventRecord(stop, nullptr));
-      HIP_RUNTIME_CHECK(hipEventSynchronize(stop));
-
-      float ms = 0.f;
-      HIP_RUNTIME_CHECK(hipEventElapsedTime(&ms, start, stop));
+      const float ms = RunWarmupAndTimed(res, args.warmup, args.iters, [&](int count) {
+        launch_bw(scope, grid, block, data_d, res.counter_d, len_doubles, my_pe, count);
+        HIP_RUNTIME_CHECK(hipGetLastError());
+      });
 
       const double gbps = static_cast<double>(size_bytes) /
                           (static_cast<double>(ms) * (kBToGb / (args.iters * kMsToS)));
@@ -283,18 +214,15 @@ int main(int argc, char** argv) {
   ShmemBarrierAll();
   if (my_pe == 0) {
     const char* test_name = args.bidirectional ? "shmem_put_bw_bidi" : "shmem_put_bw_uni";
-    PrintPerfTable(test_name, scope_name, args.nblocks, args.threads_per_block, device_warp_size,
+    PrintPerfTable(test_name, scope_name, args.nblocks, args.threads_per_block, ctx.device_warp_size,
                    args.iters, args.warmup, PerfTableMetric::kBandwidthGbps, bandwidth_table);
   }
 
   if (run_kernels) {
-    HIP_RUNTIME_CHECK(hipEventDestroy(start));
-    HIP_RUNTIME_CHECK(hipEventDestroy(stop));
-    HIP_RUNTIME_CHECK(hipFree(counter_d));
+    PerfResFree(&res);
   }
   ShmemFree(symm);
-  MPI_Comm_free(&local_comm);
-  ShmemFinalize();
+  PerfFinalize(&ctx);
   return 0;
 #endif
 }

@@ -23,25 +23,34 @@
 
 #pragma once
 
+#include <mpi.h>
 #include <unistd.h>
 
 #include <cassert>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <vector>
+
+#include "hip/hip_runtime.h"
 
 namespace mori::perftest {
 
 enum class PutScope { kThread, kWarp, kBlock };
 
 inline constexpr std::size_t kDefaultMinSize = 4;
-inline constexpr std::size_t kDefaultMaxSize = 1024ULL * 1024ULL * 1024ULL;
+inline constexpr std::size_t kDefaultMaxSize = 64ULL * 1024ULL * 1024ULL;
 inline constexpr std::size_t kDefaultStepFactor = 2;
 inline constexpr std::size_t kDefaultIters = 10;
 inline constexpr std::size_t kDefaultWarmup = 5;
 inline constexpr int kDefaultNumBlocks = 32;
 inline constexpr int kDefaultThreadsPerBlock = 256;
+
+inline constexpr int kDefaultQpId = 1;
+inline constexpr float kMsToS = 1000.0f;
+inline constexpr float kMsToUs = 1000.0f;
+inline constexpr double kBToGb = 1e9;
 
 struct PerfArgs {
   std::size_t min_size = kDefaultMinSize;
@@ -55,10 +64,33 @@ struct PerfArgs {
   bool bidirectional = false;
 };
 
-// Returns 0 on success, 1 on invalid option, 2 if -h was passed (exit main with 0).
-// Does not print; caller should print help (e.g. only MPI rank 0).
-int ParseArgs(int argc, char** argv, PerfArgs* out_args);
+struct PerfContext {
+  MPI_Comm local_comm;
+  int local_rank;
+  int world_rank;
+  PerfArgs args;
+  int device_count;
+  int device_warp_size;
+  int my_pe;
+  int npes;
+};
 
+int PerfInit(int argc, char** argv, struct PerfContext* ctx);
+void PerfFinalize(struct PerfContext* ctx);
+
+using LaunchFn = std::function<void(int /*count*/)>;
+
+struct PerfRes {
+  hipEvent_t start{};
+  hipEvent_t stop{};
+  unsigned int* counter_d = nullptr;
+};
+
+void PerfResAlloc(PerfRes* res);
+void PerfResFree(PerfRes* res);
+float RunWarmupAndTimed(PerfRes& res, size_t warmup, size_t iters, LaunchFn launch);
+
+int ParseArgs(int argc, char** argv, PerfArgs* out_args);
 void PrintUsage(const char* program);
 
 enum class PerfTableMetric { kBandwidthGbps, kLatencyUs };
