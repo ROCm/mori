@@ -87,6 +87,18 @@ message UnregisterResponse {
 }
 
 // ============================================================
+//  Lookup (read-only existence check, no access count side-effects)
+// ============================================================
+
+message LookupRequest {
+  string key     = 1;
+  string node_id = 2;
+}
+message LookupResponse {
+  bool found = 1;
+}
+
+// ============================================================
 //  Router
 // ============================================================
 
@@ -161,6 +173,7 @@ service UMBPMaster {
   // Block index
   rpc Register(RegisterRequest) returns (RegisterResponse);
   rpc Unregister(UnregisterRequest) returns (UnregisterResponse);
+  rpc Lookup(LookupRequest) returns (LookupResponse);
   rpc FinalizeAllocation(FinalizeRequest) returns (FinalizeResponse);
   rpc PublishLocalBlock(PublishRequest) returns (PublishResponse);
   rpc AbortAllocation(AbortAllocationRequest) returns (AbortAllocationResponse);

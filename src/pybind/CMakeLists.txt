@@ -54,7 +54,7 @@ target_link_directories(mori_pybinds PRIVATE /opt/rocm/lib)
 target_link_libraries(mori_pybinds mori_ops mori_shmem mori_io hip::host)
 
 if(BUILD_UMBP)
-  target_link_libraries(mori_pybinds umbp_core)
+  target_link_libraries(mori_pybinds umbp_core umbp_common)
   target_include_directories(mori_pybinds
                              PRIVATE ${CMAKE_SOURCE_DIR}/src/umbp/include)
   target_compile_definitions(mori_pybinds PRIVATE MORI_BUILD_UMBP)
