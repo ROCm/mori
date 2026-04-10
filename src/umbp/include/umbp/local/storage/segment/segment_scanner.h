@@ -23,7 +23,7 @@
 
 #include <string>
 
-#include "umbp/local/storage/io/storage_io_driver.h"
+#include "umbp/io/storage_io_driver.h"
 #include "umbp/local/storage/segment/segment_index.h"
 
 namespace mori::umbp::segment {
