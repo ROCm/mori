@@ -32,7 +32,7 @@
 
 #include "umbp/common/config.h"
 #include "umbp/local/block_index/local_block_index.h"
-#include "umbp/local/storage/tier_backend.h"
+#include "umbp/local/tiers/tier_backend.h"
 
 namespace mori::umbp {
 

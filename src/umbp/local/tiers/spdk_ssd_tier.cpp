@@ -27,7 +27,7 @@
 //   - RefCounted allocation handles for safe concurrent access
 //   - Auto LRU eviction on allocation failure
 
-#include "umbp/local/storage/spdk_ssd_tier.h"
+#include "umbp/local/tiers/spdk_ssd_tier.h"
 
 #include <algorithm>
 #include <cstring>

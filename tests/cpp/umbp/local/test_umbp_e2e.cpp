@@ -51,7 +51,7 @@
 #include <signal.h>
 #include <sys/wait.h>
 
-#include "umbp/local/storage/spdk_proxy_tier.h"
+#include "umbp/local/tiers/spdk_proxy_tier.h"
 #include "umbp/storage/spdk/proxy/spdk_proxy_protocol.h"
 #include "umbp/storage/spdk/proxy/spdk_proxy_shm.h"
 #endif

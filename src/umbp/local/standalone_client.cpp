@@ -25,7 +25,7 @@
 #include <string>
 
 #include "mori/utils/mori_log.hpp"
-#include "umbp/local/storage/dram_tier.h"
+#include "umbp/local/tiers/dram_tier.h"
 
 namespace mori::umbp {
 

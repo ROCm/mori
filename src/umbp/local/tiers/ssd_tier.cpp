@@ -19,7 +19,7 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#include "umbp/local/storage/ssd_tier.h"
+#include "umbp/local/tiers/ssd_tier.h"
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -30,7 +30,7 @@
 #include <stdexcept>
 #include <vector>
 
-#include "umbp/local/storage/segment/segment_format.h"
+#include "umbp/local/tiers/segment/segment_format.h"
 
 namespace fs = std::filesystem;
 
