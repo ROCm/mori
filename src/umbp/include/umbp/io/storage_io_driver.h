@@ -27,7 +27,7 @@
 #include <vector>
 
 #include "umbp/common/config.h"
-#include "umbp/local/storage/io/status.h"
+#include "umbp/io/status.h"
 
 namespace mori::umbp {
 

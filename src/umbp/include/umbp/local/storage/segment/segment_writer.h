@@ -25,7 +25,7 @@
 #include <string>
 #include <vector>
 
-#include "umbp/local/storage/io/storage_io_driver.h"
+#include "umbp/io/storage_io_driver.h"
 #include "umbp/local/storage/segment/segment_format.h"
 #include "umbp/local/storage/segment/segment_index.h"
 

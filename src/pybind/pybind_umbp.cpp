@@ -24,7 +24,7 @@
 
 #include "src/pybind/mori.hpp"
 #include "umbp/common/config.h"
-#include "umbp/local/umbp_client.h"
+#include "umbp/umbp_client.h"
 
 namespace py = pybind11;
 
@@ -130,23 +130,23 @@ void RegisterMoriUmbp(py::module_& m) {
                      &UMBPConfig::spdk_proxy_reserved_shared_bytes)
       .def_readwrite("distributed", &UMBPConfig::distributed);
 
-  py::class_<UMBPClient>(m, "UMBPClient")
-      .def(py::init<const UMBPConfig&>(), py::arg("config") = UMBPConfig{})
-      .def("put_from_ptr", &UMBPClient::PutFromPtr, py::arg("key"), py::arg("src"), py::arg("size"))
-      .def("get_into_ptr", &UMBPClient::GetIntoPtr, py::arg("key"), py::arg("dst"), py::arg("size"))
-      .def("exists", &UMBPClient::Exists, py::arg("key"))
-      .def("remove", &UMBPClient::Remove, py::arg("key"))
-      .def("batch_put_from_ptr", &UMBPClient::BatchPutFromPtr, py::arg("keys"), py::arg("ptrs"),
+  py::class_<IUMBPClient, std::unique_ptr<IUMBPClient>>(m, "UMBPClient")
+      .def(py::init([](const UMBPConfig& cfg) { return CreateUMBPClient(cfg); }),
+           py::arg("config") = UMBPConfig{})
+      .def("put_from_ptr", &IUMBPClient::Put, py::arg("key"), py::arg("src"), py::arg("size"))
+      .def("get_into_ptr", &IUMBPClient::Get, py::arg("key"), py::arg("dst"), py::arg("size"))
+      .def("exists", &IUMBPClient::Exists, py::arg("key"))
+      .def("batch_put_from_ptr", &IUMBPClient::BatchPut, py::arg("keys"), py::arg("ptrs"),
            py::arg("sizes"))
-      .def("batch_put_from_ptr_with_depth", &UMBPClient::BatchPutFromPtrWithDepth, py::arg("keys"),
+      .def("batch_put_from_ptr_with_depth", &IUMBPClient::BatchPutWithDepth, py::arg("keys"),
            py::arg("ptrs"), py::arg("sizes"), py::arg("depths"))
-      .def("batch_get_into_ptr", &UMBPClient::BatchGetIntoPtr, py::arg("keys"), py::arg("ptrs"),
+      .def("batch_get_into_ptr", &IUMBPClient::BatchGet, py::arg("keys"), py::arg("ptrs"),
            py::arg("sizes"))
-      .def("batch_exists", &UMBPClient::BatchExists, py::arg("keys"))
-      .def("batch_exists_consecutive", &UMBPClient::BatchExistsConsecutive, py::arg("keys"))
-      .def("clear", &UMBPClient::Clear)
-      .def("flush", &UMBPClient::Flush)
-      .def("is_distributed", &UMBPClient::IsDistributed);
+      .def("batch_exists", &IUMBPClient::BatchExists, py::arg("keys"))
+      .def("batch_exists_consecutive", &IUMBPClient::BatchExistsConsecutive, py::arg("keys"))
+      .def("clear", &IUMBPClient::Clear)
+      .def("flush", &IUMBPClient::Flush)
+      .def("is_distributed", &IUMBPClient::IsDistributed);
 }
 
 }  // namespace mori
