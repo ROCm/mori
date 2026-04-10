@@ -287,12 +287,4 @@ mori::umbp::LocalBlockIndex& StandaloneClient::Index() { return index_; }
 
 LocalStorageManager& StandaloneClient::Storage() { return storage_; }
 
-// ---------------------------------------------------------------------------
-// Factory implementation
-// ---------------------------------------------------------------------------
-
-std::unique_ptr<IUMBPClient> CreateUMBPClient(const UMBPConfig& config) {
-  return std::make_unique<StandaloneClient>(config);
-}
-
 }  // namespace mori::umbp
