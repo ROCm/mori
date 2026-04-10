@@ -170,6 +170,18 @@ struct mori_fp4x2_e2m1 {
 #ifdef MORI_HAS_OCP_FP
   __device__ explicit mori_fp4x2_e2m1(const __hip_bfloat162 f) : x(bfloat162_to_fp4x2_e2m1(f)) {}
   __device__ explicit mori_fp4x2_e2m1(const float2 f) : x(float2_to_fp4x2_e2m1(f)) {}
+  __device__ explicit mori_fp4x2_e2m1(const float f) : x(float2_to_fp4x2_e2m1(float2(f, 0.0f))) {}
+
+  __device__ operator float() const {
+#if defined(HIP_ENABLE_GFX950_OCP_BUILTINS) && HIP_ENABLE_GFX950_OCP_BUILTINS == 1
+    auto ret = __builtin_amdgcn_cvt_scalef32_pk_f32_fp4(x, 1.0f /* scale */, 0);
+#else
+    using namespace fcbx;
+    __amd_floatx2_storage_t ret{to_float<float, Encoding::E2M1, true>(x & 0xFu, 0),
+                                to_float<float, Encoding::E2M1, true>(x >> 4, 0)};
+#endif
+    return ret[0];
+  }
 
   __device__ operator __hip_bfloat162() const {
     union {

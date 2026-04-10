@@ -151,6 +151,17 @@ struct EpDispatchCombineConfig {
   inline __host__ __device__ size_t MaxXferBytesPerToken() const {
     return XferBytesPerToken(maxTokenTypeSize);
   }
+  // Combine accumulation uses FP32 staging for precision.
+  // Returns the per-token byte size for combine staging (fp32 hidden + float weights).
+  inline __host__ __device__ size_t CombFp32XferBytesPerToken() const {
+    return HiddenBytes(sizeof(float)) + WeightBytes();
+  }
+  // Max per-slot byte size across dispatch and combine paths (for shared staging buffer).
+  inline __host__ __device__ size_t MaxStagingSlotBytes() const {
+    size_t dispatchSlot = MaxXferBytesPerToken();
+    size_t combineSlot = CombFp32XferBytesPerToken();
+    return (dispatchSlot > combineSlot) ? dispatchSlot : combineSlot;
+  }
 };
 
 // Per-kernel-type token buffer groups.

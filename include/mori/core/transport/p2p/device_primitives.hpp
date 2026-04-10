@@ -771,6 +771,227 @@ __forceinline__ __device__ void WarpAccum(T* __restrict__ dest, T* const* __rest
 #undef WARP_ACCUM_CASE
 }
 
+// Cross-type WarpAccum: reads InT from sources, accumulates in FP32, stores as OutT.
+// When OutT == InT, equivalent to WarpAccum<T>.
+// Used for combine precision: read bf16/fp8 from combineInp, store fp32 to staging,
+// or read fp32 from staging, store bf16 to combineOut.
+
+template <typename OutT, typename InT, int VecBytes>
+__forceinline__ __device__ void WarpAccumCrossTypeDynamic(OutT* __restrict__ dest,
+                                                          InT* const* __restrict__ srcs,
+                                                          const float* __restrict__ srcScales,
+                                                          size_t accumNum, size_t nelems) {
+  // Compute element count so both load and store are >= 4 bytes for vectorization
+  constexpr int kMinBytes = 4;
+  constexpr int kElemsForIn = (kMinBytes + sizeof(InT) - 1) / sizeof(InT);
+  constexpr int kElemsForOut = (kMinBytes + sizeof(OutT) - 1) / sizeof(OutT);
+  constexpr int kElems = (kElemsForIn > kElemsForOut) ? kElemsForIn : kElemsForOut;
+  constexpr int inLoadBytes = kElems * sizeof(InT);
+  constexpr int outStoreBytes = kElems * sizeof(OutT);
+
+  using InDataType = typename VecTypeSelector<inLoadBytes>::dataType;
+  using OutDataType = typename VecTypeSelector<outStoreBytes>::dataType;
+
+  using AccumFp32Type = std::conditional_t<
+      std::is_same_v<InT, mori_fp4x2_e2m1> || std::is_same_v<OutT, mori_fp4x2_e2m1>, float2, float>;
+
+  const int laneId = threadIdx.x & (warpSize - 1);
+  const int elemsPerWarp = warpSize * kElems;
+  size_t offset = 0;
+  const size_t numIters = nelems / elemsPerWarp;
+  const size_t laneOffset = laneId * kElems;
+
+  for (size_t iter = 0; iter < numIters; ++iter) {
+    AccumFp32Type accumValFp32[kElems] = {AccumFp32Type{0}};
+#pragma unroll
+    for (int i = 0; i < accumNum; ++i) {
+      if (srcs[i] == nullptr) continue;
+      InDataType srcVal = load<inLoadBytes>(srcs[i] + offset + laneOffset);
+      float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[i];
+#pragma unroll
+      for (int j = 0; j < kElems; ++j) {
+        accumValFp32[j] += AccumFp32Type(reinterpret_cast<const InT*>(&srcVal)[j]) * srcScale;
+      }
+    }
+
+    if constexpr (std::is_same_v<AccumFp32Type, float2> && std::is_same_v<OutT, float>) {
+      // fp4x2 input: each element -> 2 floats, dest index needs 2x multiplier
+      float* destBase = dest + (offset + laneOffset) * 2;
+#pragma unroll
+      for (int j = 0; j < kElems; ++j) {
+        destBase[j * 2] = accumValFp32[j].x;
+        destBase[j * 2 + 1] = accumValFp32[j].y;
+      }
+    } else {
+      union {
+        OutDataType accumVec;
+        OutT accumVal[kElems];
+      };
+#pragma unroll
+      for (int j = 0; j < kElems; ++j) {
+        accumVal[j] = OutT(accumValFp32[j]);
+      }
+      store<outStoreBytes>(dest + offset + laneOffset, accumVec);
+    }
+    offset += elemsPerWarp;
+  }
+
+  // Remainder
+  offset += laneId;
+  while (offset < nelems) {
+    AccumFp32Type accumValFp32 = AccumFp32Type{0};
+    for (int i = 0; i < accumNum; ++i) {
+      if (srcs[i] == nullptr) continue;
+      float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[i];
+      accumValFp32 += AccumFp32Type(srcs[i][offset]) * srcScale;
+    }
+    if constexpr (std::is_same_v<AccumFp32Type, float2> && std::is_same_v<OutT, float>) {
+      dest[offset * 2] = accumValFp32.x;
+      dest[offset * 2 + 1] = accumValFp32.y;
+    } else {
+      dest[offset] = OutT(accumValFp32);
+    }
+    offset += warpSize;
+  }
+}
+
+template <typename OutT, typename InT, int VecBytes, int AccumNum>
+__forceinline__ __device__ void WarpAccumCrossTypeImpl(OutT* __restrict__ dest,
+                                                       InT* const* __restrict__ srcs,
+                                                       const float* __restrict__ srcScales,
+                                                       size_t& offset, size_t nelems) {
+  constexpr int kMinBytes = 4;
+  constexpr int kElemsForIn = (kMinBytes + sizeof(InT) - 1) / sizeof(InT);
+  constexpr int kElemsForOut = (kMinBytes + sizeof(OutT) - 1) / sizeof(OutT);
+  constexpr int kElems = (kElemsForIn > kElemsForOut) ? kElemsForIn : kElemsForOut;
+  constexpr int inLoadBytes = kElems * sizeof(InT);
+  constexpr int outStoreBytes = kElems * sizeof(OutT);
+
+  using InDataType = typename VecTypeSelector<inLoadBytes>::dataType;
+  using OutDataType = typename VecTypeSelector<outStoreBytes>::dataType;
+
+  using AccumFp32Type = std::conditional_t<
+      std::is_same_v<InT, mori_fp4x2_e2m1> || std::is_same_v<OutT, mori_fp4x2_e2m1>, float2, float>;
+
+  const int elemsPerWarp = warpSize * kElems;
+  const size_t numIters = (nelems - offset) / elemsPerWarp;
+  const int laneId = threadIdx.x & (warpSize - 1);
+  const size_t laneOffset = laneId * kElems;
+
+  float scales[AccumNum];
+  const InT* cached_srcs[AccumNum];
+#pragma unroll AccumNum
+  for (int i = 0; i < AccumNum; ++i) {
+    scales[i] = (srcScales == nullptr) ? 1.0f : srcScales[i];
+    cached_srcs[i] = srcs[i];
+  }
+
+  for (size_t iter = 0; iter < numIters; ++iter) {
+    AccumFp32Type accumValFp32[kElems] = {AccumFp32Type{0}};
+
+    InDataType srcVals[AccumNum];
+#pragma unroll AccumNum
+    for (int i = 0; i < AccumNum; ++i) {
+      if (cached_srcs[i] != nullptr)
+        srcVals[i] = load<inLoadBytes>(cached_srcs[i] + offset + laneOffset);
+    }
+
+#pragma unroll AccumNum
+    for (int i = 0; i < AccumNum; ++i) {
+      if (cached_srcs[i] != nullptr) {
+#pragma unroll
+        for (int j = 0; j < kElems; ++j) {
+          accumValFp32[j] +=
+              AccumFp32Type(reinterpret_cast<const InT*>(srcVals + i)[j]) * scales[i];
+        }
+      }
+    }
+
+    if constexpr (std::is_same_v<AccumFp32Type, float2> && std::is_same_v<OutT, float>) {
+      float* destBase = dest + (offset + laneOffset) * 2;
+#pragma unroll
+      for (int j = 0; j < kElems; ++j) {
+        destBase[j * 2] = accumValFp32[j].x;
+        destBase[j * 2 + 1] = accumValFp32[j].y;
+      }
+    } else {
+      union {
+        OutDataType accumVec;
+        OutT accumVal[kElems];
+      };
+#pragma unroll
+      for (int j = 0; j < kElems; ++j) {
+        accumVal[j] = OutT(accumValFp32[j]);
+      }
+      store<outStoreBytes>(dest + offset + laneOffset, accumVec);
+    }
+    offset += elemsPerWarp;
+  }
+}
+
+template <typename OutT, typename InT, int VecBytes, int AccumNum, int Unroll>
+__forceinline__ __device__ void WarpAccumCrossType(OutT* __restrict__ dest,
+                                                   InT* const* __restrict__ srcs,
+                                                   const float* __restrict__ srcScales,
+                                                   size_t nelems) {
+  static_assert((VecBytes <= 16) && (VecBytes >= 4) && IsPowerOf2(VecBytes));
+
+  using AccumFp32Type = std::conditional_t<
+      std::is_same_v<InT, mori_fp4x2_e2m1> || std::is_same_v<OutT, mori_fp4x2_e2m1>, float2, float>;
+
+  size_t offset = 0;
+
+  WarpAccumCrossTypeImpl<OutT, InT, VecBytes, AccumNum>(dest, srcs, srcScales, offset, nelems);
+
+  // Remainder
+  const int laneId = threadIdx.x & (warpSize - 1);
+  offset += laneId;
+  while (offset < nelems) {
+    AccumFp32Type accumValFp32 = AccumFp32Type{0};
+#pragma unroll AccumNum
+    for (int i = 0; i < AccumNum; ++i) {
+      const InT* srcPtr = srcs[i];
+      if (srcPtr == nullptr) continue;
+      float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[i];
+      accumValFp32 += AccumFp32Type(srcPtr[offset]) * srcScale;
+    }
+    if constexpr (std::is_same_v<AccumFp32Type, float2> && std::is_same_v<OutT, float>) {
+      // fp4x2 input: 1 element -> 2 floats, so dest index is offset * 2
+      dest[offset * 2] = accumValFp32.x;
+      dest[offset * 2 + 1] = accumValFp32.y;
+    } else {
+      dest[offset] = OutT(accumValFp32);
+    }
+    offset += warpSize;
+  }
+}
+
+template <typename OutT, typename InT, int VecBytes>
+__forceinline__ __device__ void WarpAccumCrossType(OutT* __restrict__ dest,
+                                                   InT* const* __restrict__ srcs,
+                                                   const float* __restrict__ srcScales,
+                                                   size_t accumNum, size_t nelems) {
+#define WARP_ACCUM_CROSS_TYPE_CASE(AccumNum)                                                    \
+  case AccumNum:                                                                                \
+    WarpAccumCrossType<OutT, InT, VecBytes, AccumNum, WARP_ACCUM_UNROLL>(dest, srcs, srcScales, \
+                                                                         nelems);               \
+    break;
+
+  switch (accumNum) {
+    WARP_ACCUM_CROSS_TYPE_CASE(1)
+    WARP_ACCUM_CROSS_TYPE_CASE(2)
+    WARP_ACCUM_CROSS_TYPE_CASE(4)
+    WARP_ACCUM_CROSS_TYPE_CASE(6)
+    WARP_ACCUM_CROSS_TYPE_CASE(8)
+    WARP_ACCUM_CROSS_TYPE_CASE(10)
+    default:
+      WarpAccumCrossTypeDynamic<OutT, InT, VecBytes>(dest, srcs, srcScales, accumNum, nelems);
+      break;
+  }
+
+#undef WARP_ACCUM_CROSS_TYPE_CASE
+}
+
 template <typename T>
 __forceinline__ __device__ void WarpCastBf16ToCombineInternalFp8(
     CombineInternalFp8* __restrict__ dst, const T* __restrict__ src, int hiddenDim, int laneId) {
