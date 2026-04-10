@@ -19,45 +19,47 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#pragma once
+#include "umbp/storage/io/storage_io_driver.h"
 
 #include <memory>
-#include <string>
+#include <unordered_set>
 
-#include "umbp/distributed/config.h"
-#include "umbp/distributed/master/client_registry.h"
-#include "umbp/distributed/master/global_block_index.h"
-#include "umbp/distributed/routing/route_get_strategy.h"
-#include "umbp/distributed/routing/route_put_strategy.h"
-#include "umbp/distributed/routing/router.h"
-
-namespace grpc_impl {
-class Server;
-}
+#include "storage_io_driver_impl.h"
 
 namespace mori::umbp {
 
-class MasterServer {
- public:
-  explicit MasterServer(MasterServerConfig config);
-  ~MasterServer();
+IoStatus StorageIoDriver::WriteBatch(const std::vector<IoWriteOp>& ops) {
+  for (const auto& op : ops) {
+    IoStatus status = WriteAt(op.fd, op.data, op.size, op.offset);
+    if (!status.ok()) return status;
+  }
+  return IoStatus::Ok();
+}
 
-  MasterServer(const MasterServer&) = delete;
-  MasterServer& operator=(const MasterServer&) = delete;
+IoStatus StorageIoDriver::ReadBatch(const std::vector<IoReadOp>& ops) {
+  for (const auto& op : ops) {
+    IoStatus status = ReadAt(op.fd, op.data, op.size, op.offset);
+    if (!status.ok()) return status;
+  }
+  return IoStatus::Ok();
+}
 
-  void Run();
-  void Shutdown();
+IoStatus StorageIoDriver::SyncMany(const std::vector<int>& fds) {
+  std::unordered_set<int> unique_fds(fds.begin(), fds.end());
+  for (int fd : unique_fds) {
+    IoStatus status = Sync(fd);
+    if (!status.ok()) return status;
+  }
+  return IoStatus::Ok();
+}
 
- private:
-  MasterServerConfig config_;
-  GlobalBlockIndex index_;
-  ClientRegistry registry_;
-  Router router_;
-
-  std::unique_ptr<grpc_impl::Server> server_;
-
-  class UMBPMasterServiceImpl;
-  std::unique_ptr<UMBPMasterServiceImpl> service_;
-};
+std::unique_ptr<StorageIoDriver> CreateStorageIoDriver(UMBPIoBackend backend,
+                                                       uint32_t queue_depth) {
+  if (backend == UMBPIoBackend::IoUring) {
+    auto driver = CreateIoUringStorageIoDriver(queue_depth);
+    if (driver && driver->Capabilities().native_async) return driver;
+  }
+  return CreatePosixStorageIoDriver();
+}
 
 }  // namespace mori::umbp

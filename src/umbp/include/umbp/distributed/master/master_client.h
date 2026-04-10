@@ -33,9 +33,9 @@
 #include <thread>
 #include <vector>
 
-#include "umbp/common/config.h"
-#include "umbp/common/types.h"
+#include "umbp/distributed/config.h"
 #include "umbp/distributed/routing/route_put_strategy.h"
+#include "umbp/distributed/types.h"
 
 namespace grpc_impl {
 class Channel;

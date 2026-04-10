@@ -33,9 +33,9 @@
 #include <vector>
 
 #include "mori/io/engine.hpp"
-#include "umbp/common/config.h"
-#include "umbp/common/types.h"
+#include "umbp/distributed/config.h"
 #include "umbp/distributed/master/master_client.h"
+#include "umbp/distributed/types.h"
 
 namespace mori::umbp {
 

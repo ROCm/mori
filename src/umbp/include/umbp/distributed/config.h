@@ -21,51 +21,68 @@
 // SOFTWARE.
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
+#include <string>
 #include <vector>
 
-#include "umbp/common/config.h"
-#include "umbp/io/status.h"
+#include "umbp/distributed/types.h"
 
 namespace mori::umbp {
 
-struct IoWriteOp {
-  int fd = -1;
-  const void* data = nullptr;
+// Forward declarations for strategy interfaces used by MasterServerConfig.
+class RouteGetStrategy;
+class RoutePutStrategy;
+
+struct ClientRegistryConfig {
+  std::chrono::seconds heartbeat_ttl{10};
+  std::chrono::seconds reaper_interval{5};
+  std::chrono::seconds allocation_ttl{30};
+  uint32_t max_missed_heartbeats = 3;
+};
+
+struct MasterClientConfig {
+  std::string master_address;
+  std::string node_id;
+  std::string node_address;
+  bool auto_heartbeat = true;
+};
+
+struct MasterServerConfig {
+  std::string listen_address = "0.0.0.0:50051";
+  ClientRegistryConfig registry_config;
+
+  std::unique_ptr<RouteGetStrategy> get_strategy;
+  std::unique_ptr<RoutePutStrategy> put_strategy;
+};
+
+struct ExportableDram {
+  void* buffer = nullptr;
   size_t size = 0;
-  uint64_t offset = 0;
 };
 
-struct IoReadOp {
-  int fd = -1;
-  void* data = nullptr;
-  size_t size = 0;
-  uint64_t offset = 0;
+struct ExportableSsd {
+  std::string dir;
+  size_t capacity = 0;
 };
 
-struct IoCapabilities {
-  bool thread_safe = true;
-  bool batch_write = false;
-  bool batch_read = false;
-  bool native_async = false;
+struct PoolClientConfig {
+  MasterClientConfig master_config;
+
+  std::string io_engine_host;
+  uint16_t io_engine_port = 0;
+
+  size_t staging_buffer_size = 64ULL * 1024 * 1024;
+
+  std::vector<ExportableDram> dram_buffers;
+  std::vector<ExportableSsd> ssd_stores;
+
+  std::map<TierType, TierCapacity> tier_capacities;
+
+  uint16_t peer_service_port = 0;
 };
-
-class StorageIoDriver {
- public:
-  virtual ~StorageIoDriver() = default;
-
-  virtual IoStatus WriteAt(int fd, const void* data, size_t size, uint64_t offset) = 0;
-  virtual IoStatus ReadAt(int fd, void* data, size_t size, uint64_t offset) = 0;
-  virtual IoStatus Sync(int fd) = 0;
-  virtual IoCapabilities Capabilities() const = 0;
-
-  virtual IoStatus WriteBatch(const std::vector<IoWriteOp>& ops);
-  virtual IoStatus ReadBatch(const std::vector<IoReadOp>& ops);
-  virtual IoStatus SyncMany(const std::vector<int>& fds);
-};
-
-std::unique_ptr<StorageIoDriver> CreateStorageIoDriver(UMBPIoBackend backend, uint32_t queue_depth);
 
 }  // namespace mori::umbp
