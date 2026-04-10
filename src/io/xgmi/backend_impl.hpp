@@ -103,6 +103,9 @@ class XgmiBackend : public Backend {
  private:
   void InitializeP2PAccess();
   std::optional<int> ResolveVisibleDeviceId(const MemoryDesc& desc) const;
+  std::optional<int> LookupVisibleDevice(const std::string& busId) const;
+  bool IsTopologyEligible(int localDeviceId, const std::string& remoteBusId) const;
+  void BuildTopologyMap();
   bool IsSameProcessEngine(const EngineKey& engineKey) const;
   bool IsSameNodeEngine(const EngineKey& engineKey) const;
   void* GetRemappedAddress(const MemoryDesc& desc, int localDeviceId);
@@ -143,6 +146,7 @@ class XgmiBackend : public Backend {
   int numDevices{0};
   std::vector<std::vector<bool>> p2pMatrix;
   std::unordered_map<std::string, int> localDeviceByBusId;
+  std::unordered_map<std::string, uint64_t> gpuTopoByBusId;  // normalized bus ID -> XGMI hive ID
 
   struct IpcHandleEntry {
     hipIpcMemHandle_t handle;

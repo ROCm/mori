@@ -22,10 +22,15 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <hip/hip_runtime_api.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <array>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -383,6 +388,315 @@ void CaseRdmaNotificationInvalidEnvKeepsConfig() {
               std::to_string(inbound.CodeUint32()) + ", msg='" + inbound.Message() + "'");
 }
 
+// Mirror of the NormalizeBusId logic in src/io/xgmi/backend_impl.cpp for testing.
+std::string TestNormalizeBusId(const std::string& busId) {
+  std::string result = busId;
+  for (auto& c : result) {
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
+  return result;
+}
+
+void CaseNormalizeBusId() {
+  Require(TestNormalizeBusId("0000:C1:00.0") == "0000:c1:00.0",
+          "uppercase hex should be lowercased");
+  Require(TestNormalizeBusId("0000:c1:00.0") == "0000:c1:00.0",
+          "already lowercase should be unchanged");
+  Require(TestNormalizeBusId("0000:AB:CD.0") == "0000:ab:cd.0",
+          "mixed case should be fully lowered");
+  Require(TestNormalizeBusId("") == "", "empty string should remain empty");
+}
+
+void CaseIsIpcHandleEmpty() {
+  constexpr size_t kSize = 64;
+  std::array<char, kSize> zeroHandle{};
+  Require(std::all_of(zeroHandle.begin(), zeroHandle.end(), [](char c) { return c == 0; }),
+          "zero-initialized handle should be empty");
+
+  std::array<char, kSize> nonZeroFirst{};
+  nonZeroFirst[0] = 1;
+  Require(!std::all_of(nonZeroFirst.begin(), nonZeroFirst.end(), [](char c) { return c == 0; }),
+          "handle with non-zero first byte should not be empty");
+
+  std::array<char, kSize> nonZeroLast{};
+  nonZeroLast[kSize - 1] = 1;
+  Require(!std::all_of(nonZeroLast.begin(), nonZeroLast.end(), [](char c) { return c == 0; }),
+          "handle with non-zero last byte should not be empty");
+}
+
+void CaseXgmiVisibleDeviceRegression() {
+  if (GetGpuCount() < 2) throw TestSkip("requires at least 2 GPUs");
+
+  IOEngineConfig cfg;
+  cfg.host = "127.0.0.1";
+  cfg.port = 0;
+  IOEngine engine("xgmi_visible_regression_engine", cfg);
+  XgmiBackendConfig xgmiCfg{};
+  engine.CreateBackend(BackendType::XGMI, xgmiCfg);
+
+  auto src = RegisterGpuMemory(&engine, 1024 * 1024, 0);
+  auto dst = RegisterGpuMemory(&engine, 1024 * 1024, 1);
+
+  TransferStatus status;
+  TransferUniqueId uid = engine.AllocateTransferUniqueId();
+  engine.Write(src.desc, 0, dst.desc, 0, 1024 * 1024, &status, uid);
+
+  std::string err;
+  Require(WaitTransferDone(&status, 5000, &err),
+          "xgmi visible-device regression transfer timeout: " + err);
+  Require(status.Succeeded(), "xgmi visible-device regression transfer failed: code=" +
+                                  std::to_string(status.CodeUint32()) + ", msg='" +
+                                  status.Message() + "'");
+}
+
+void CaseXgmiCrossEngineIpc() {
+  // Tests cross-engine XGMI IPC: two IOEngines in the same process exchange
+  // data between GPU 0 and GPU 1 using IPC handles.
+  //
+  // NOTE: This exercises the cross-engine IPC handle open/remap path but NOT
+  // the hidden-device branch (LookupVisibleDevice returns nullopt).  In a
+  // single process all GPUs are visible, so CreateSession always takes the
+  // visible-remote path.  The true hidden-device path (split HIP_VISIBLE_DEVICES)
+  // is tested by CaseXgmiHiddenDeviceSplitVisibility which launches a subprocess.
+  if (GetGpuCount() < 2) throw TestSkip("requires at least 2 GPUs");
+
+  IOEngineConfig cfgA;
+  cfgA.host = "127.0.0.1";
+  cfgA.port = 0;
+  auto engineA = std::make_unique<IOEngine>("xgmi_cross_A", cfgA);
+
+  IOEngineConfig cfgB;
+  cfgB.host = "127.0.0.1";
+  cfgB.port = 0;
+  auto engineB = std::make_unique<IOEngine>("xgmi_cross_B", cfgB);
+
+  XgmiBackendConfig xgmiCfg{};
+  engineA->CreateBackend(BackendType::XGMI, xgmiCfg);
+  engineB->CreateBackend(BackendType::XGMI, xgmiCfg);
+
+  engineA->RegisterRemoteEngine(engineB->GetEngineDesc());
+  engineB->RegisterRemoteEngine(engineA->GetEngineDesc());
+
+  constexpr size_t kSize = 1024 * 1024;
+  auto srcMem = RegisterGpuMemory(engineA.get(), kSize, 0);
+  auto dstMem = RegisterGpuMemory(engineB.get(), kSize, 1);
+
+  HIP_RUNTIME_CHECK(hipSetDevice(0));
+  HIP_RUNTIME_CHECK(hipMemset(srcMem.ptr, 0xAB, kSize));
+  HIP_RUNTIME_CHECK(hipSetDevice(1));
+  HIP_RUNTIME_CHECK(hipMemset(dstMem.ptr, 0x00, kSize));
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+
+  TransferStatus status;
+  TransferUniqueId uid = engineA->AllocateTransferUniqueId();
+  engineA->Write(srcMem.desc, 0, dstMem.desc, 0, kSize, &status, uid);
+
+  std::string err;
+  Require(WaitTransferDone(&status, 5000, &err), "xgmi cross-engine IPC transfer timeout: " + err);
+  Require(status.Succeeded(),
+          "xgmi cross-engine IPC transfer failed: code=" + std::to_string(status.CodeUint32()) +
+              ", msg='" + status.Message() + "'");
+
+  std::vector<uint8_t> hostBuf(kSize);
+  HIP_RUNTIME_CHECK(hipSetDevice(1));
+  HIP_RUNTIME_CHECK(hipMemcpy(hostBuf.data(), dstMem.ptr, kSize, hipMemcpyDeviceToHost));
+  bool allMatch = true;
+  for (size_t i = 0; i < kSize; ++i) {
+    if (hostBuf[i] != 0xAB) {
+      allMatch = false;
+      break;
+    }
+  }
+  Require(allMatch, "xgmi cross-engine IPC data verification failed");
+}
+
+// --------------------------------------------------------------------------
+// Subprocess-based hidden-device test.
+//
+// The real hidden-device path requires a bus ID that is NOT in the importing
+// process's HIP_VISIBLE_DEVICES.  In a single process all GPUs are visible, so
+// we can never trigger LookupVisibleDevice() -> nullopt.  To test it properly
+// we launch a subprocess with restricted HIP_VISIBLE_DEVICES.
+//
+// Protocol (via shared memory file in /dev/shm):
+//   1. Exporter (this process, GPU 0):  allocates GPU memory, registers it with
+//      an IOEngine to populate the IPC handle, writes a MemoryDesc blob to the
+//      shared file, and waits for the importer to signal completion.
+//   2. Importer (subprocess, HIP_VISIBLE_DEVICES=<last_gpu>):  reads the
+//      MemoryDesc, creates its own IOEngine, and does a Write from its local
+//      GPU to the exporter's memory.  The exporter's bus ID is NOT in the
+//      importer's localDeviceByBusId, so it must go through the hidden-device
+//      branch.
+// --------------------------------------------------------------------------
+int RunHiddenDeviceImporter(const char* shmPath) {
+  // This function runs in a subprocess with restricted HIP_VISIBLE_DEVICES.
+  // It only sees one GPU (the last physical GPU), while the exporter used GPU 0.
+  SetLogLevel("info");
+  int gpuCount = GetGpuCount();
+  if (gpuCount < 1) {
+    std::fprintf(stderr, "importer: no GPUs visible\n");
+    return 1;
+  }
+
+  // Read serialized MemoryDesc from shared file
+  int fd = open(shmPath, O_RDONLY);
+  if (fd < 0) {
+    std::fprintf(stderr, "importer: failed to open shm\n");
+    return 1;
+  }
+
+  // Read msgpack blob
+  char buf[4096];
+  ssize_t n = read(fd, buf, sizeof(buf));
+  close(fd);
+  if (n <= 0) {
+    std::fprintf(stderr, "importer: failed to read shm\n");
+    return 1;
+  }
+
+  // Deserialize remote MemoryDesc
+  msgpack::object_handle oh = msgpack::unpack(buf, static_cast<size_t>(n));
+  MemoryDesc remoteDesc;
+  oh.get().convert(remoteDesc);
+
+  std::fprintf(stderr, "importer: remote bus_id=%s engineKey=%s ipcHandle[0]=%d\n",
+               remoteDesc.deviceBusId.c_str(), remoteDesc.engineKey.c_str(),
+               static_cast<int>(remoteDesc.ipcHandle[0]));
+
+  // Create local engine with XGMI backend
+  IOEngineConfig cfg;
+  cfg.host = "127.0.0.1";
+  cfg.port = 0;
+  IOEngine engine("importer_engine", cfg);
+  XgmiBackendConfig xgmiCfg{};
+  engine.CreateBackend(BackendType::XGMI, xgmiCfg);
+
+  // Register the remote engine so IsSameNodeEngine returns true
+  EngineDesc remoteEngDesc;
+  remoteEngDesc.key = remoteDesc.engineKey;
+  {
+    char hostname[HOST_NAME_MAX];
+    gethostname(hostname, HOST_NAME_MAX);
+    remoteEngDesc.hostname = std::string(hostname);
+    remoteEngDesc.nodeId = remoteEngDesc.hostname;
+  }
+  remoteEngDesc.host = "127.0.0.1";
+  remoteEngDesc.port = 0;
+  remoteEngDesc.pid = 0;
+  engine.RegisterRemoteEngine(remoteEngDesc);
+
+  // Allocate local memory on device 0 (importer's only visible GPU)
+  constexpr size_t kSize = 1024 * 1024;
+  auto localMem = RegisterGpuMemory(&engine, kSize, 0);
+
+  // Fill local source with 0xCD
+  HIP_RUNTIME_CHECK(hipSetDevice(0));
+  HIP_RUNTIME_CHECK(hipMemset(localMem.ptr, 0xCD, kSize));
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+
+  // Create a session from local to remote (hidden-device path!)
+  auto session = engine.CreateSession(localMem.desc, remoteDesc);
+  if (!session.has_value()) {
+    std::fprintf(stderr, "importer: CreateSession failed\n");
+    return 1;
+  }
+
+  // Write local data to remote memory
+  TransferStatus status;
+  TransferUniqueId uid = engine.AllocateTransferUniqueId();
+  session->Write(0, 0, kSize, &status, uid);
+
+  std::string err;
+  bool ok = WaitTransferDone(&status, 5000, &err);
+  if (!ok || !status.Succeeded()) {
+    std::fprintf(stderr, "importer: transfer failed: %s\n", err.c_str());
+    return 1;
+  }
+
+  std::fprintf(stderr, "importer: transfer succeeded\n");
+
+  // Signal completion by writing "done" to shm
+  int wfd = open(shmPath, O_WRONLY | O_TRUNC);
+  if (wfd >= 0) {
+    const char* msg = "done";
+    (void)write(wfd, msg, 4);
+    close(wfd);
+  }
+
+  return 0;
+}
+
+void CaseXgmiHiddenDeviceSplitVisibility() {
+  int totalGpus = GetGpuCount();
+  if (totalGpus < 2) throw TestSkip("requires at least 2 GPUs");
+
+  // Create shared memory file for IPC
+  std::string shmPath = "/dev/shm/mori_test_hidden_" + std::to_string(getpid());
+  int shmFd = open(shmPath.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0600);
+  Require(shmFd >= 0, "failed to create shared memory file");
+
+  // Exporter: allocate on GPU 0, register, and serialize the descriptor
+  IOEngineConfig cfg;
+  cfg.host = "127.0.0.1";
+  cfg.port = 0;
+  IOEngine engine("exporter_engine", cfg);
+  XgmiBackendConfig xgmiCfg{};
+  engine.CreateBackend(BackendType::XGMI, xgmiCfg);
+
+  constexpr size_t kSize = 1024 * 1024;
+  auto exportMem = RegisterGpuMemory(&engine, kSize, 0);
+
+  // Clear export buffer
+  HIP_RUNTIME_CHECK(hipSetDevice(0));
+  HIP_RUNTIME_CHECK(hipMemset(exportMem.ptr, 0x00, kSize));
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+
+  // Serialize MemoryDesc via msgpack
+  msgpack::sbuffer sbuf;
+  msgpack::pack(sbuf, exportMem.desc);
+  ssize_t written = write(shmFd, sbuf.data(), sbuf.size());
+  close(shmFd);
+  Require(written == static_cast<ssize_t>(sbuf.size()), "failed to write descriptor to shm");
+
+  // Get our own executable path
+  char selfExe[PATH_MAX];
+  ssize_t len = readlink("/proc/self/exe", selfExe, sizeof(selfExe) - 1);
+  Require(len > 0, "failed to read /proc/self/exe");
+  selfExe[len] = '\0';
+
+  // Launch importer subprocess with the LAST GPU only visible
+  // (so GPU 0's bus ID is NOT in the importer's localDeviceByBusId)
+  std::string visibleDevices = std::to_string(totalGpus - 1);
+  std::string cmd = "HIP_VISIBLE_DEVICES=" + visibleDevices + " " + std::string(selfExe) +
+                    " --hidden-device-importer " + shmPath + " 2>&1";
+  int rc = system(cmd.c_str());
+  int exitCode = WIFEXITED(rc) ? WEXITSTATUS(rc) : -1;
+  Require(exitCode == 0, "importer subprocess failed with exit code " + std::to_string(exitCode));
+
+  // Read back the signal from shm
+  shmFd = open(shmPath.c_str(), O_RDONLY);
+  char doneBuf[8] = {};
+  if (shmFd >= 0) {
+    (void)read(shmFd, doneBuf, sizeof(doneBuf));
+    close(shmFd);
+  }
+  unlink(shmPath.c_str());
+  Require(std::string(doneBuf, 4) == "done", "importer did not signal completion");
+
+  // Verify the exporter's GPU 0 buffer now contains 0xCD (written by importer)
+  std::vector<uint8_t> hostBuf(kSize);
+  HIP_RUNTIME_CHECK(hipSetDevice(0));
+  HIP_RUNTIME_CHECK(hipMemcpy(hostBuf.data(), exportMem.ptr, kSize, hipMemcpyDeviceToHost));
+  bool allMatch = true;
+  for (size_t i = 0; i < kSize; ++i) {
+    if (hostBuf[i] != 0xCD) {
+      allMatch = false;
+      break;
+    }
+  }
+  Require(allMatch, "hidden-device data verification failed: expected 0xCD in exporter buffer");
+}
+
 void CaseXgmiInboundNotificationIsUnsupported() {
   if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
 
@@ -453,7 +767,12 @@ struct TestCase {
 
 }  // namespace
 
-int main() {
+int main(int argc, char* argv[]) {
+  // Subprocess entry point for hidden-device importer
+  if (argc >= 3 && std::string(argv[1]) == "--hidden-device-importer") {
+    return RunHiddenDeviceImporter(argv[2]);
+  }
+
   SetLogLevel("info");
   std::vector<TestCase> cases = {
       {"submission_ledger_basic", CaseSubmissionLedgerBasic},
@@ -463,6 +782,11 @@ int main() {
       {"rdma_notification_disabled_behavior", CaseRdmaNotificationDisabledBehavior},
       {"rdma_notification_env_override_disables", CaseRdmaNotificationEnvOverrideDisables},
       {"rdma_notification_invalid_env_keeps_config", CaseRdmaNotificationInvalidEnvKeepsConfig},
+      {"normalize_bus_id", CaseNormalizeBusId},
+      {"is_ipc_handle_empty", CaseIsIpcHandleEmpty},
+      {"xgmi_visible_device_regression", CaseXgmiVisibleDeviceRegression},
+      {"xgmi_cross_engine_ipc", CaseXgmiCrossEngineIpc},
+      {"xgmi_hidden_device_split_visibility", CaseXgmiHiddenDeviceSplitVisibility},
       {"xgmi_inbound_notification_is_unsupported", CaseXgmiInboundNotificationIsUnsupported},
       {"xgmi_concurrent_wait_and_poll_is_safe", CaseXgmiConcurrentWaitAndPollIsSafe},
   };
