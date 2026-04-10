@@ -28,7 +28,7 @@
 #include <string>
 #include <unordered_map>
 
-#include "umbp/common/storage_tier.h"
+#include "umbp/local/storage_tier.h"
 
 namespace mori::umbp {
 

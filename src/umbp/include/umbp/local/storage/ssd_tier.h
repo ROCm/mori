@@ -30,12 +30,12 @@
 #include <vector>
 
 #include "umbp/common/config.h"
-#include "umbp/io/status.h"
-#include "umbp/io/storage_io_driver.h"
 #include "umbp/local/storage/segment/segment_index.h"
 #include "umbp/local/storage/segment/segment_scanner.h"
 #include "umbp/local/storage/segment/segment_writer.h"
 #include "umbp/local/storage/tier_backend.h"
+#include "umbp/storage/io/status.h"
+#include "umbp/storage/io/storage_io_driver.h"
 
 namespace mori::umbp {
 

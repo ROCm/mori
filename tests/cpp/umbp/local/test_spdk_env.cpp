@@ -31,7 +31,7 @@
 #include <cstring>
 #include <vector>
 
-#include "umbp/spdk/spdk_env.h"
+#include "umbp/storage/spdk/spdk_env.h"
 
 static umbp::SpdkEnvConfig ConfigFromEnv() {
   umbp::SpdkEnvConfig cfg;

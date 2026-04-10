@@ -24,7 +24,7 @@
 #include <set>
 #include <utility>
 
-#include "umbp/common/pool_allocator.h"
+#include "umbp/distributed/pool_allocator.h"
 
 namespace {
 

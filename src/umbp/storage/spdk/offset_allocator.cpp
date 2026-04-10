@@ -24,7 +24,7 @@
 //
 // Migrated to umbp namespace for UMBP SPDK integration.
 
-#include "umbp/allocator/offset_allocator.hpp"
+#include "umbp/storage/spdk/offset_allocator.hpp"
 
 #include <cmath>
 #include <cstdio>

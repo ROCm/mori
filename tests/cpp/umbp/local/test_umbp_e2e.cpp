@@ -44,7 +44,7 @@
 #endif
 
 #include "umbp/common/config.h"
-#include "umbp/standalone/standalone_client.h"
+#include "umbp/local/standalone_client.h"
 
 #ifdef __linux__
 #include <fcntl.h>
@@ -52,8 +52,8 @@
 #include <sys/wait.h>
 
 #include "umbp/local/storage/spdk_proxy_tier.h"
-#include "umbp/proxy/spdk_proxy_protocol.h"
-#include "umbp/proxy/spdk_proxy_shm.h"
+#include "umbp/storage/spdk/proxy/spdk_proxy_protocol.h"
+#include "umbp/storage/spdk/proxy/spdk_proxy_shm.h"
 #endif
 
 using namespace mori::umbp;

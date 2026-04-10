@@ -41,9 +41,9 @@
 #include <utility>
 #include <vector>
 
-#include "umbp/allocator/offset_allocator.hpp"
 #include "umbp/common/config.h"
 #include "umbp/local/storage/tier_backend.h"
+#include "umbp/storage/spdk/offset_allocator.hpp"
 
 namespace mori {
 namespace umbp {

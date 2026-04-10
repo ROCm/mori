@@ -34,8 +34,8 @@
 #include <unordered_map>
 #include <vector>
 
-#include "umbp/common/config.h"
-#include "umbp/common/types.h"
+#include "umbp/distributed/config.h"
+#include "umbp/distributed/types.h"
 
 namespace mori::umbp {
 

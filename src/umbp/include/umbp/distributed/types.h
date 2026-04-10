@@ -27,7 +27,7 @@
 #include <string>
 #include <vector>
 
-#include "umbp/common/pool_allocator.h"
+#include "umbp/distributed/pool_allocator.h"
 
 namespace mori::umbp {
 

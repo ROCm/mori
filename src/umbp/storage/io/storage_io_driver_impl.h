@@ -24,7 +24,7 @@
 #include <cstdint>
 #include <memory>
 
-#include "umbp/io/storage_io_driver.h"
+#include "umbp/storage/io/storage_io_driver.h"
 
 namespace mori::umbp {
 
