@@ -19,47 +19,53 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#include "umbp/io/storage_io_driver.h"
+#pragma once
 
+#include <cstddef>
+#include <cstdint>
 #include <memory>
-#include <unordered_set>
+#include <vector>
 
-#include "storage_io_driver_impl.h"
+#include "umbp/common/config.h"
+#include "umbp/storage/io/status.h"
 
 namespace mori::umbp {
 
-IoStatus StorageIoDriver::WriteBatch(const std::vector<IoWriteOp>& ops) {
-  for (const auto& op : ops) {
-    IoStatus status = WriteAt(op.fd, op.data, op.size, op.offset);
-    if (!status.ok()) return status;
-  }
-  return IoStatus::Ok();
-}
+struct IoWriteOp {
+  int fd = -1;
+  const void* data = nullptr;
+  size_t size = 0;
+  uint64_t offset = 0;
+};
 
-IoStatus StorageIoDriver::ReadBatch(const std::vector<IoReadOp>& ops) {
-  for (const auto& op : ops) {
-    IoStatus status = ReadAt(op.fd, op.data, op.size, op.offset);
-    if (!status.ok()) return status;
-  }
-  return IoStatus::Ok();
-}
+struct IoReadOp {
+  int fd = -1;
+  void* data = nullptr;
+  size_t size = 0;
+  uint64_t offset = 0;
+};
 
-IoStatus StorageIoDriver::SyncMany(const std::vector<int>& fds) {
-  std::unordered_set<int> unique_fds(fds.begin(), fds.end());
-  for (int fd : unique_fds) {
-    IoStatus status = Sync(fd);
-    if (!status.ok()) return status;
-  }
-  return IoStatus::Ok();
-}
+struct IoCapabilities {
+  bool thread_safe = true;
+  bool batch_write = false;
+  bool batch_read = false;
+  bool native_async = false;
+};
 
-std::unique_ptr<StorageIoDriver> CreateStorageIoDriver(UMBPIoBackend backend,
-                                                       uint32_t queue_depth) {
-  if (backend == UMBPIoBackend::IoUring) {
-    auto driver = CreateIoUringStorageIoDriver(queue_depth);
-    if (driver && driver->Capabilities().native_async) return driver;
-  }
-  return CreatePosixStorageIoDriver();
-}
+class StorageIoDriver {
+ public:
+  virtual ~StorageIoDriver() = default;
+
+  virtual IoStatus WriteAt(int fd, const void* data, size_t size, uint64_t offset) = 0;
+  virtual IoStatus ReadAt(int fd, void* data, size_t size, uint64_t offset) = 0;
+  virtual IoStatus Sync(int fd) = 0;
+  virtual IoCapabilities Capabilities() const = 0;
+
+  virtual IoStatus WriteBatch(const std::vector<IoWriteOp>& ops);
+  virtual IoStatus ReadBatch(const std::vector<IoReadOp>& ops);
+  virtual IoStatus SyncMany(const std::vector<int>& fds);
+};
+
+std::unique_ptr<StorageIoDriver> CreateStorageIoDriver(UMBPIoBackend backend, uint32_t queue_depth);
 
 }  // namespace mori::umbp

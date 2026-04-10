@@ -83,9 +83,9 @@ endif()
 # Core static library
 set(UMBP_CORE_SRCS
     local/block_index/local_block_index.cpp
-    io/storage_io_driver.cpp
-    io/posix_storage_io_driver.cpp
-    io/io_uring_storage_io_driver.cpp
+    storage/io/storage_io_driver.cpp
+    storage/io/posix_storage_io_driver.cpp
+    storage/io/io_uring_storage_io_driver.cpp
     local/storage/copy_pipeline.cpp
     local/storage/segment/segment_format.cpp
     local/storage/segment/segment_index.cpp
@@ -96,17 +96,18 @@ set(UMBP_CORE_SRCS
     local/storage/ssd_tier.cpp
     local/storage/dummy_ssd_tier.cpp
     local/storage/local_storage_manager.cpp
-    standalone/standalone_client.cpp
-    allocator/offset_allocator.cpp)
+    local/standalone_client.cpp
+    storage/spdk/offset_allocator.cpp)
 
 # SPDK Proxy client (shared memory IPC, no SPDK dependency — Linux only)
 if(UNIX)
-  list(APPEND UMBP_CORE_SRCS proxy/spdk_proxy_shm.cpp
+  list(APPEND UMBP_CORE_SRCS storage/spdk/proxy/spdk_proxy_shm.cpp
        local/storage/spdk_proxy_tier.cpp)
 endif()
 
 if(HAVE_SPDK)
-  list(APPEND UMBP_CORE_SRCS spdk/spdk_env.cpp local/storage/spdk_ssd_tier.cpp)
+  list(APPEND UMBP_CORE_SRCS storage/spdk/spdk_env.cpp
+       local/storage/spdk_ssd_tier.cpp)
 endif()
 
 add_library(umbp_core STATIC ${UMBP_CORE_SRCS})
@@ -142,7 +143,7 @@ if(HAVE_SPDK)
            -lelf)
 
   # SPDK Proxy daemon (owns SPDK, serves ranks via SHM IPC)
-  add_executable(spdk_proxy proxy/spdk_proxy_daemon.cpp)
+  add_executable(spdk_proxy storage/spdk/proxy/spdk_proxy_daemon.cpp)
   target_link_libraries(spdk_proxy PRIVATE umbp_core)
 endif()
 

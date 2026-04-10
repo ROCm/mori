@@ -34,8 +34,8 @@
 
 #include "umbp/common/config.h"
 #include "umbp/local/storage/tier_backend.h"
-#include "umbp/proxy/spdk_proxy_protocol.h"
-#include "umbp/proxy/spdk_proxy_shm.h"
+#include "umbp/storage/spdk/proxy/spdk_proxy_protocol.h"
+#include "umbp/storage/spdk/proxy/spdk_proxy_shm.h"
 
 namespace mori {
 namespace umbp {

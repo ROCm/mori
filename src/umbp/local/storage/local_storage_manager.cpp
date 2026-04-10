@@ -42,7 +42,7 @@
 #include <unistd.h>
 
 #include "umbp/local/storage/spdk_proxy_tier.h"
-#include "umbp/proxy/spdk_proxy_shm.h"
+#include "umbp/storage/spdk/proxy/spdk_proxy_shm.h"
 #endif
 
 namespace mori::umbp {

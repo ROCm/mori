@@ -20,7 +20,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#include "umbp/proxy/spdk_proxy_shm.h"
+#include "umbp/storage/spdk/proxy/spdk_proxy_shm.h"
 
 #include <cerrno>
 #include <cstdio>

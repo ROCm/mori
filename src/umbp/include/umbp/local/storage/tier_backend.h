@@ -28,7 +28,7 @@
 #include <utility>
 #include <vector>
 
-#include "umbp/common/storage_tier.h"
+#include "umbp/local/storage_tier.h"
 
 namespace mori::umbp {
 
