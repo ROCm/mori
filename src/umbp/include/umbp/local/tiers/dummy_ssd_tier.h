@@ -29,7 +29,7 @@
 #include <utility>
 #include <vector>
 
-#include "umbp/local/storage/tier_backend.h"
+#include "umbp/local/tiers/tier_backend.h"
 
 namespace mori::umbp {
 

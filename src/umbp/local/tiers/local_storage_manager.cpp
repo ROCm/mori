@@ -19,7 +19,7 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#include "umbp/local/storage/local_storage_manager.h"
+#include "umbp/local/tiers/local_storage_manager.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -29,11 +29,11 @@
 #include <thread>
 
 #include "umbp/common/log.h"
-#include "umbp/local/storage/dram_tier.h"
-#include "umbp/local/storage/dummy_ssd_tier.h"
-#include "umbp/local/storage/ssd_tier.h"
+#include "umbp/local/tiers/dram_tier.h"
+#include "umbp/local/tiers/dummy_ssd_tier.h"
+#include "umbp/local/tiers/ssd_tier.h"
 #ifdef USE_SPDK
-#include "umbp/local/storage/spdk_ssd_tier.h"
+#include "umbp/local/tiers/spdk_ssd_tier.h"
 #endif
 #ifdef __linux__
 #include <fcntl.h>
@@ -41,7 +41,7 @@
 #include <sys/file.h>
 #include <unistd.h>
 
-#include "umbp/local/storage/spdk_proxy_tier.h"
+#include "umbp/local/tiers/spdk_proxy_tier.h"
 #include "umbp/storage/spdk/proxy/spdk_proxy_shm.h"
 #endif
 

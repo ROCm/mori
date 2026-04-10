@@ -26,8 +26,8 @@
 #include <string>
 #include <vector>
 
-#include "umbp/local/storage/dummy_ssd_tier.h"
-#include "umbp/local/storage/local_storage_manager.h"
+#include "umbp/local/tiers/dummy_ssd_tier.h"
+#include "umbp/local/tiers/local_storage_manager.h"
 
 using namespace mori::umbp;
 

@@ -21,46 +21,18 @@
 // SOFTWARE.
 #pragma once
 
-#include <atomic>
-#include <condition_variable>
-#include <cstddef>
-#include <deque>
-#include <mutex>
 #include <string>
-#include <thread>
-#include <vector>
 
-#include "umbp/common/config.h"
-#include "umbp/local/storage/local_storage_manager.h"
+#include "umbp/local/tiers/segment/segment_index.h"
+#include "umbp/storage/io/storage_io_driver.h"
 
-namespace mori::umbp {
+namespace mori::umbp::segment {
 
-class CopyPipeline {
+class Scanner {
  public:
-  CopyPipeline(LocalStorageManager& storage, const UMBPCopyPipelineConfig& config, UMBPRole role);
-  ~CopyPipeline();
-
-  bool MaybeCopyToSharedSSD(const std::string& key);
-  void MaybeBatchCopyToSharedSSD(const std::vector<std::string>& keys);
-
- private:
-  struct CopyTask {
-    std::string key;
-  };
-
-  bool EnqueueCopyToSSD(const std::string& key);
-  size_t EnqueueCopyToSSDBatch(const std::vector<std::string>& keys);
-  void CopyWorkerLoop();
-
-  LocalStorageManager& storage_;
-  UMBPCopyPipelineConfig config_;
-  UMBPRole role_;
-
-  std::atomic<bool> stop_copy_worker_{false};
-  std::vector<std::thread> copy_workers_;
-  std::mutex copy_mu_;
-  std::condition_variable copy_cv_;
-  std::deque<CopyTask> copy_queue_;
+  bool RefreshFromDisk(const std::string& dir, StorageIoDriver& io_driver, Index& index,
+                       bool read_only_shared, bool force_full_rescan,
+                       std::string* error_message) const;
 };
 
-}  // namespace mori::umbp
+}  // namespace mori::umbp::segment
