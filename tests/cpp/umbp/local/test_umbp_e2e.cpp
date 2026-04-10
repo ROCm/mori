@@ -44,7 +44,7 @@
 #endif
 
 #include "umbp/common/config.h"
-#include "umbp/local/umbp_client.h"
+#include "umbp/standalone/standalone_client.h"
 
 #ifdef __linux__
 #include <fcntl.h>
@@ -196,14 +196,14 @@ static bool test_role_from_local_rank_env() {
 
 static bool test_posix_standalone_write_read() {
   auto cfg = MakePosixConfig();
-  UMBPClient client(cfg);
+  StandaloneClient client(cfg);
 
   std::string key = "test_posix_wr_1";
   std::vector<char> data(4096, 'A');
   CHECK(client.Put(key, data.data(), data.size()));
 
   std::vector<char> buf(4096, 0);
-  CHECK(client.GetIntoPtr(key, reinterpret_cast<uintptr_t>(buf.data()), buf.size()));
+  CHECK(client.Get(key, reinterpret_cast<uintptr_t>(buf.data()), buf.size()));
   CHECK(buf == data);
 
   client.Clear();
@@ -212,7 +212,7 @@ static bool test_posix_standalone_write_read() {
 
 static bool test_posix_batch_write_read() {
   auto cfg = MakePosixConfig();
-  UMBPClient client(cfg);
+  StandaloneClient client(cfg);
 
   const int N = 100;
   const size_t sz = 8192;
@@ -227,7 +227,7 @@ static bool test_posix_batch_write_read() {
     ptrs[i] = reinterpret_cast<uintptr_t>(bufs[i].data());
   }
 
-  auto wr = client.BatchPutFromPtr(keys, ptrs, sizes);
+  auto wr = client.BatchPut(keys, ptrs, sizes);
   int write_ok = 0;
   for (auto b : wr) write_ok += b;
   CHECK(write_ok == N);
@@ -236,7 +236,7 @@ static bool test_posix_batch_write_read() {
   std::vector<uintptr_t> dst_ptrs(N);
   for (int i = 0; i < N; ++i) dst_ptrs[i] = reinterpret_cast<uintptr_t>(read_bufs[i].data());
 
-  auto rr = client.BatchGetIntoPtr(keys, dst_ptrs, sizes);
+  auto rr = client.BatchGet(keys, dst_ptrs, sizes);
   int read_ok = 0;
   for (auto b : rr) read_ok += b;
   CHECK(read_ok == N);
@@ -249,7 +249,7 @@ static bool test_posix_batch_write_read() {
 
 static bool test_posix_dedup() {
   auto cfg = MakePosixConfig();
-  UMBPClient client(cfg);
+  StandaloneClient client(cfg);
 
   std::vector<char> data(1024, 'X');
   CHECK(client.Put("dedup_key", data.data(), data.size()));
@@ -262,7 +262,7 @@ static bool test_posix_dedup() {
 
 static bool test_posix_evict() {
   auto cfg = MakePosixConfig();
-  UMBPClient client(cfg);
+  StandaloneClient client(cfg);
 
   std::vector<char> data(1024, 'E');
   CHECK(client.Put("evict_key", data.data(), data.size()));
@@ -276,7 +276,7 @@ static bool test_posix_evict() {
 
 static bool test_posix_ssd_direct_write_read() {
   auto cfg = MakePosixConfig();
-  UMBPClient client(cfg);
+  StandaloneClient client(cfg);
 
   std::vector<char> data(32768, 'S');
   auto* ssd = client.Storage().GetTier(StorageTier::LOCAL_SSD);
@@ -294,7 +294,7 @@ static bool test_posix_ssd_direct_write_read() {
 static bool test_posix_dram_evict_to_ssd() {
   // Small DRAM, force demotion to SSD
   auto cfg = MakePosixConfig(1 /* 1MB DRAM */, 256);
-  UMBPClient client(cfg);
+  StandaloneClient client(cfg);
 
   const size_t sz = 128 * 1024;  // 128KB each
   std::vector<char> data(sz, 'D');
@@ -310,7 +310,7 @@ static bool test_posix_dram_evict_to_ssd() {
     std::string key = "dram_evict_" + std::to_string(i);
     CHECK(client.Exists(key));
     std::vector<char> buf(sz, 0);
-    CHECK(client.GetIntoPtr(key, reinterpret_cast<uintptr_t>(buf.data()), sz));
+    CHECK(client.Get(key, reinterpret_cast<uintptr_t>(buf.data()), sz));
     CHECK(buf == data);
   }
 
@@ -320,7 +320,7 @@ static bool test_posix_dram_evict_to_ssd() {
 
 static bool test_posix_capacity() {
   auto cfg = MakePosixConfig(64, 256);
-  UMBPClient client(cfg);
+  StandaloneClient client(cfg);
 
   auto* dram = client.Storage().GetTier(StorageTier::CPU_DRAM);
   auto* ssd = client.Storage().GetTier(StorageTier::LOCAL_SSD);
@@ -339,10 +339,10 @@ static bool test_posix_capacity() {
 
 static bool test_posix_empty_read() {
   auto cfg = MakePosixConfig();
-  UMBPClient client(cfg);
+  StandaloneClient client(cfg);
 
   std::vector<char> buf(1024, 0);
-  CHECK(!client.GetIntoPtr("nonexistent", reinterpret_cast<uintptr_t>(buf.data()), 1024));
+  CHECK(!client.Get("nonexistent", reinterpret_cast<uintptr_t>(buf.data()), 1024));
   CHECK(!client.Exists("nonexistent"));
 
   return true;
@@ -350,7 +350,7 @@ static bool test_posix_empty_read() {
 
 static bool test_posix_large_value() {
   auto cfg = MakePosixConfig(16, 512);
-  UMBPClient client(cfg);
+  StandaloneClient client(cfg);
 
   const size_t sz = 4 * 1024 * 1024;  // 4MB
   std::vector<char> data(sz);
@@ -408,7 +408,7 @@ static bool test_spdk_standalone_write_read() {
     cfg.spdk_mem_size_mb = env_cfg.spdk_mem_size_mb;
     cfg.spdk_io_workers = env_cfg.spdk_io_workers;
 
-    UMBPClient client(cfg);
+    StandaloneClient client(cfg);
 
     auto* ssd = client.Storage().GetTier(StorageTier::LOCAL_SSD);
     if (!ssd) _exit(1);
@@ -472,7 +472,7 @@ static void TouchFile(const char* path) {
 static int leader_write_and_wait(const char*) {
   auto cfg = UMBPConfig::FromEnvironment();
   cfg.dram.capacity_bytes = 64ULL * 1024 * 1024;
-  UMBPClient client(cfg);
+  StandaloneClient client(cfg);
 
   auto* ssd = client.Storage().GetTier(StorageTier::LOCAL_SSD);
   if (!ssd) return 1;
@@ -486,7 +486,7 @@ static int leader_write_and_wait(const char*) {
   // Tell follower data is ready
   TouchFile(kLeaderReadyFile);
 
-  // Keep UMBPClient (and proxy daemon) alive until follower finishes (60s)
+  // Keep StandaloneClient (and proxy daemon) alive until follower finishes (60s)
   if (!WaitForFile(kFollowerDoneFile, 60000)) {
     fprintf(stderr, "    leader: timed out waiting for follower\n");
   }
@@ -502,7 +502,7 @@ static int follower_read_and_verify(const char*) {
 
   auto cfg = UMBPConfig::FromEnvironment();
   cfg.dram.capacity_bytes = 64ULL * 1024 * 1024;
-  UMBPClient client(cfg);
+  StandaloneClient client(cfg);
 
   auto* ssd = client.Storage().GetTier(StorageTier::LOCAL_SSD);
   if (!ssd) {
@@ -582,7 +582,7 @@ static bool test_proxy_daemon_cleanup_after_leader_exit() {
     {
       auto cfg = UMBPConfig::FromEnvironment();
       cfg.dram.capacity_bytes = 64ULL * 1024 * 1024;
-      UMBPClient client(cfg);
+      StandaloneClient client(cfg);
       auto* ssd = client.Storage().GetTier(StorageTier::LOCAL_SSD);
       if (!ssd) rc = 1;
       std::vector<char> data(4096, 'Q');
@@ -606,7 +606,7 @@ static bool test_proxy_daemon_cleanup_after_leader_exit() {
     {
       auto cfg = UMBPConfig::FromEnvironment();
       cfg.dram.capacity_bytes = 64ULL * 1024 * 1024;
-      UMBPClient client(cfg);
+      StandaloneClient client(cfg);
       auto* ssd = client.Storage().GetTier(StorageTier::LOCAL_SSD);
       if (!ssd) rc = 3;
 
@@ -648,7 +648,7 @@ static bool test_proxy_cas_rank_allocation() {
 
     auto cfg = UMBPConfig::FromEnvironment();
     cfg.dram.capacity_bytes = 64ULL * 1024 * 1024;
-    UMBPClient client(cfg);
+    StandaloneClient client(cfg);
 
     // Wait for followers to finish (max 30s)
     for (int i = 0; i < 300; ++i) {
@@ -725,7 +725,7 @@ static bool test_proxy_batch_write_read() {
     {
       auto cfg = UMBPConfig::FromEnvironment();
       cfg.dram.capacity_bytes = 64ULL * 1024 * 1024;
-      UMBPClient client(cfg);
+      StandaloneClient client(cfg);
 
       auto* ssd = client.Storage().GetTier(StorageTier::LOCAL_SSD);
       if (!ssd) rc = 1;
