@@ -302,7 +302,8 @@ add_library(
   distributed/routing/route_get_strategy.cpp
   distributed/routing/route_put_strategy.cpp
   distributed/peer/peer_service.cpp
-  distributed/pool_client.cpp)
+  distributed/pool_client.cpp
+  distributed/distributed_client.cpp)
 
 target_include_directories(
   umbp_common PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${UMBP_PROTO_GEN_DIR}
