@@ -52,7 +52,7 @@
 #include "umbp/common/log.h"
 #include "umbp/local/storage/spdk_ssd_tier.h"
 #include "umbp/local/storage/ssd_tier.h"
-#include "umbp/spdk/spdk_env.h"
+#include "umbp/storage/spdk/spdk_env.h"
 
 using namespace mori::umbp;
 using Clock = std::chrono::high_resolution_clock;

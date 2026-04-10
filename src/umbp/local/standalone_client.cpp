@@ -19,13 +19,12 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#include "umbp/standalone/standalone_client.h"
+#include "umbp/local/standalone_client.h"
 
 #include <stdexcept>
 #include <string>
 
 #include "mori/utils/mori_log.hpp"
-#include "umbp/common/types.h"
 #include "umbp/local/storage/dram_tier.h"
 
 namespace mori::umbp {

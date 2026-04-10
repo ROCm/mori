@@ -63,14 +63,14 @@
 #include <vector>
 
 #include "umbp/common/config.h"
-#include "umbp/common/storage_tier.h"
-#include "umbp/io/storage_io_driver.h"
+#include "umbp/local/standalone_client.h"
 #include "umbp/local/storage/dram_tier.h"
 #include "umbp/local/storage/local_storage_manager.h"
 #include "umbp/local/storage/segment/segment_format.h"
 #include "umbp/local/storage/spdk_proxy_tier.h"
 #include "umbp/local/storage/ssd_tier.h"
-#include "umbp/standalone/standalone_client.h"
+#include "umbp/local/storage_tier.h"
+#include "umbp/storage/io/storage_io_driver.h"
 
 using namespace mori::umbp;
 

@@ -24,7 +24,7 @@
 //
 // SPDK environment — migrated to umbp namespace.
 
-#include "umbp/spdk/spdk_env.h"
+#include "umbp/storage/spdk/spdk_env.h"
 
 #include <algorithm>
 #include <cinttypes>

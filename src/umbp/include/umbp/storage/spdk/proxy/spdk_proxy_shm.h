@@ -28,7 +28,7 @@
 #include <cstddef>
 #include <string>
 
-#include "umbp/proxy/spdk_proxy_protocol.h"
+#include "umbp/storage/spdk/proxy/spdk_proxy_protocol.h"
 
 namespace umbp {
 namespace proxy {

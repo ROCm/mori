@@ -24,7 +24,7 @@
 #include <iostream>
 #include <vector>
 
-#include "umbp/standalone/standalone_client.h"
+#include "umbp/local/standalone_client.h"
 
 using namespace mori::umbp;
 

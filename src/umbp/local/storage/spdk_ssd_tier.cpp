@@ -34,7 +34,7 @@
 #include <thread>
 
 #include "umbp/common/log.h"
-#include "umbp/spdk/spdk_env.h"
+#include "umbp/storage/spdk/spdk_env.h"
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>

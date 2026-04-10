@@ -48,13 +48,13 @@
 #include <immintrin.h>
 #endif
 
-#include "umbp/allocator/offset_allocator.hpp"
 #include "umbp/common/config.h"
 #include "umbp/common/log.h"
 #include "umbp/local/storage/spdk_ssd_tier.h"
-#include "umbp/proxy/spdk_proxy_protocol.h"
-#include "umbp/proxy/spdk_proxy_shm.h"
-#include "umbp/spdk/spdk_env.h"
+#include "umbp/storage/spdk/offset_allocator.hpp"
+#include "umbp/storage/spdk/proxy/spdk_proxy_protocol.h"
+#include "umbp/storage/spdk/proxy/spdk_proxy_shm.h"
+#include "umbp/storage/spdk/spdk_env.h"
 
 #ifdef __linux__
 #include <unistd.h>

@@ -50,7 +50,7 @@
 #include <unistd.h>
 #endif
 
-#include "umbp/standalone/standalone_client.h"
+#include "umbp/local/standalone_client.h"
 
 using namespace mori::umbp;
 

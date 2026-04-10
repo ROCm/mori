@@ -26,8 +26,8 @@
 #include <vector>
 
 #include "umbp/local/block_index/local_block_index.h"
+#include "umbp/local/standalone_client.h"
 #include "umbp/local/storage/local_storage_manager.h"
-#include "umbp/standalone/standalone_client.h"
 
 using namespace mori::umbp;
 

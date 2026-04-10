@@ -21,17 +21,12 @@
 // SOFTWARE.
 #pragma once
 
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
-#include <map>
-#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
-
-#include "umbp/common/types.h"
 
 namespace mori::umbp {
 
@@ -311,60 +306,6 @@ struct UMBPConfig {
 
     return cfg;
   }
-};
-
-// Forward declarations for strategy interfaces used by MasterServerConfig.
-class RouteGetStrategy;
-class RoutePutStrategy;
-
-// --- Distributed config structs ---
-
-struct ClientRegistryConfig {
-  std::chrono::seconds heartbeat_ttl{10};
-  std::chrono::seconds reaper_interval{5};
-  std::chrono::seconds allocation_ttl{30};
-  uint32_t max_missed_heartbeats = 3;
-};
-
-struct MasterClientConfig {
-  std::string master_address;
-  std::string node_id;
-  std::string node_address;
-  bool auto_heartbeat = true;
-};
-
-struct MasterServerConfig {
-  std::string listen_address = "0.0.0.0:50051";
-  ClientRegistryConfig registry_config;
-
-  std::unique_ptr<RouteGetStrategy> get_strategy;
-  std::unique_ptr<RoutePutStrategy> put_strategy;
-};
-
-struct ExportableDram {
-  void* buffer = nullptr;
-  size_t size = 0;
-};
-
-struct ExportableSsd {
-  std::string dir;
-  size_t capacity = 0;
-};
-
-struct PoolClientConfig {
-  MasterClientConfig master_config;
-
-  std::string io_engine_host;
-  uint16_t io_engine_port = 0;
-
-  size_t staging_buffer_size = 64ULL * 1024 * 1024;
-
-  std::vector<ExportableDram> dram_buffers;
-  std::vector<ExportableSsd> ssd_stores;
-
-  std::map<TierType, TierCapacity> tier_capacities;
-
-  uint16_t peer_service_port = 0;
 };
 
 }  // namespace mori::umbp
