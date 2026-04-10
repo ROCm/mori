@@ -19,47 +19,16 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#include "umbp/local/storage/io/storage_io_driver.h"
+#pragma once
 
+#include <cstdint>
 #include <memory>
-#include <unordered_set>
 
-#include "storage_io_driver_impl.h"
+#include "umbp/io/storage_io_driver.h"
 
 namespace mori::umbp {
 
-IoStatus StorageIoDriver::WriteBatch(const std::vector<IoWriteOp>& ops) {
-  for (const auto& op : ops) {
-    IoStatus status = WriteAt(op.fd, op.data, op.size, op.offset);
-    if (!status.ok()) return status;
-  }
-  return IoStatus::Ok();
-}
-
-IoStatus StorageIoDriver::ReadBatch(const std::vector<IoReadOp>& ops) {
-  for (const auto& op : ops) {
-    IoStatus status = ReadAt(op.fd, op.data, op.size, op.offset);
-    if (!status.ok()) return status;
-  }
-  return IoStatus::Ok();
-}
-
-IoStatus StorageIoDriver::SyncMany(const std::vector<int>& fds) {
-  std::unordered_set<int> unique_fds(fds.begin(), fds.end());
-  for (int fd : unique_fds) {
-    IoStatus status = Sync(fd);
-    if (!status.ok()) return status;
-  }
-  return IoStatus::Ok();
-}
-
-std::unique_ptr<StorageIoDriver> CreateStorageIoDriver(UMBPIoBackend backend,
-                                                       uint32_t queue_depth) {
-  if (backend == UMBPIoBackend::IoUring) {
-    auto driver = CreateIoUringStorageIoDriver(queue_depth);
-    if (driver && driver->Capabilities().native_async) return driver;
-  }
-  return CreatePosixStorageIoDriver();
-}
+std::unique_ptr<StorageIoDriver> CreatePosixStorageIoDriver();
+std::unique_ptr<StorageIoDriver> CreateIoUringStorageIoDriver(uint32_t queue_depth);
 
 }  // namespace mori::umbp

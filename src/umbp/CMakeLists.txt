@@ -83,9 +83,9 @@ endif()
 # Core static library
 set(UMBP_CORE_SRCS
     local/block_index/local_block_index.cpp
-    local/storage/io/storage_io_driver.cpp
-    local/storage/io/posix_storage_io_driver.cpp
-    local/storage/io/io_uring_storage_io_driver.cpp
+    io/storage_io_driver.cpp
+    io/posix_storage_io_driver.cpp
+    io/io_uring_storage_io_driver.cpp
     local/storage/copy_pipeline.cpp
     local/storage/segment/segment_format.cpp
     local/storage/segment/segment_index.cpp
@@ -95,7 +95,7 @@ set(UMBP_CORE_SRCS
     local/storage/dram_tier.cpp
     local/storage/ssd_tier.cpp
     local/storage/local_storage_manager.cpp
-    local/umbp_client.cpp
+    standalone/standalone_client.cpp
     allocator/offset_allocator.cpp)
 
 # SPDK Proxy client (shared memory IPC, no SPDK dependency — Linux only)
@@ -105,8 +105,7 @@ if(UNIX)
 endif()
 
 if(HAVE_SPDK)
-  list(APPEND UMBP_CORE_SRCS local/storage/spdk/spdk_env.cpp
-       local/storage/spdk_ssd_tier.cpp)
+  list(APPEND UMBP_CORE_SRCS spdk/spdk_env.cpp local/storage/spdk_ssd_tier.cpp)
 endif()
 
 add_library(umbp_core STATIC ${UMBP_CORE_SRCS})
@@ -322,9 +321,10 @@ target_link_libraries(umbp_common PUBLIC mori_logging mori_io ${_PROTOBUF_LIBS}
 
 target_compile_features(umbp_common PUBLIC cxx_std_17)
 
-# Link umbp_core → umbp_common so UMBPClient can construct PoolClient and see
-# the generated protobuf/gRPC headers during compilation.
-target_link_libraries(umbp_core PUBLIC umbp_common)
+# NOTE: umbp_core no longer depends on umbp_common.  StandaloneClient has no
+# gRPC/Protobuf dependency.  Targets that need distributed features (e.g. a
+# future DistributedClient) should link umbp_common directly.
+target_link_libraries(umbp_core PUBLIC mori_logging)
 
 # ---------- Master executable -------------------------------------------------
 
