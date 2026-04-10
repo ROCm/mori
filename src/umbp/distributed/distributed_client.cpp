@@ -23,13 +23,26 @@
 
 #include <stdexcept>
 
+#include "mori/io/engine.hpp"
+#include "umbp/distributed/config.h"
+#include "umbp/distributed/master/master_client.h"
+
 namespace mori::umbp {
 
 DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config) {
   if (!config.distributed.has_value()) {
     throw std::runtime_error("DistributedClient requires UMBPConfig::distributed to be set");
   }
-  // TODO: init MasterClient, IOEngine, PeerServiceServer
+
+  const auto& dc = config.distributed.value();
+  MasterClientConfig mc_config;
+  mc_config.master_address = dc.master_address;
+  mc_config.node_id = dc.node_id;
+  mc_config.node_address = dc.node_address;
+  mc_config.auto_heartbeat = dc.auto_heartbeat;
+  master_client_ = std::make_unique<MasterClient>(mc_config);
+
+  // TODO: init IOEngine from dc.io_engine_host / dc.io_engine_port
 }
 
 DistributedClient::~DistributedClient() { Close(); }
@@ -49,7 +62,7 @@ bool DistributedClient::Get(const std::string& /*key*/, uintptr_t /*dst*/, size_
 }
 
 bool DistributedClient::Exists(const std::string& /*key*/) const {
-  // TODO: Lookup via Master's GlobalBlockIndex
+  // TODO: MasterClient::Lookup (read-only, no access count side-effects)
   return false;
 }
 
@@ -116,7 +129,15 @@ bool DistributedClient::Flush() {
 void DistributedClient::Close() {
   if (closed_) return;
   closed_ = true;
-  // TODO: shutdown MasterClient heartbeat, IOEngine, PeerServiceServer
+
+  if (master_client_) {
+    master_client_->StopHeartbeat();
+    if (master_client_->IsRegistered()) {
+      master_client_->UnregisterSelf();
+    }
+  }
+  io_engine_.reset();
+  master_client_.reset();
 }
 
 bool DistributedClient::IsDistributed() const { return true; }

@@ -222,6 +222,38 @@ grpc::Status MasterClient::Unregister(const std::string& key, const Location& lo
   return grpc::Status::OK;
 }
 
+grpc::Status MasterClient::Lookup(const std::string& key, bool* found) {
+  if (found != nullptr) {
+    *found = false;
+  }
+
+  if (!registered_) {
+    return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
+                        "node must be registered before Lookup");
+  }
+
+  if (key.empty()) {
+    return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "key cannot be empty");
+  }
+
+  ::umbp::LookupRequest req;
+  req.set_key(key);
+  req.set_node_id(config_.node_id);
+
+  ::umbp::LookupResponse resp;
+  grpc::ClientContext ctx;
+  auto status = GetStub(stub_.get())->Lookup(&ctx, req, &resp);
+  if (!status.ok()) {
+    MORI_UMBP_ERROR("[Client] Lookup(key={}) failed: {}", key, status.error_message());
+    return status;
+  }
+
+  if (found != nullptr) {
+    *found = resp.found();
+  }
+  return grpc::Status::OK;
+}
+
 grpc::Status MasterClient::FinalizeAllocation(const std::string& key, const Location& location,
                                               const std::string& allocation_id) {
   if (!registered_) {

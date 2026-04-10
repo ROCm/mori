@@ -194,6 +194,17 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     return grpc::Status::OK;
   }
 
+  grpc::Status Lookup(grpc::ServerContext* /*context*/, const ::umbp::LookupRequest* request,
+                      ::umbp::LookupResponse* response) override {
+    if (request->key().empty()) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "key cannot be empty");
+    }
+
+    auto locations = index_.Lookup(request->key());
+    response->set_found(!locations.empty());
+    return grpc::Status::OK;
+  }
+
   grpc::Status FinalizeAllocation(grpc::ServerContext* /*context*/,
                                   const ::umbp::FinalizeRequest* request,
                                   ::umbp::FinalizeResponse* response) override {
