@@ -21,38 +21,46 @@
 // SOFTWARE.
 #pragma once
 
-#include <cstring>
+#include <atomic>
+#include <condition_variable>
+#include <cstddef>
+#include <deque>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
-#include "umbp/local/storage/segment/segment_format.h"
-#include "umbp/local/storage/segment/segment_index.h"
-#include "umbp/storage/io/storage_io_driver.h"
+#include "umbp/common/config.h"
+#include "umbp/local/tiers/local_storage_manager.h"
 
-namespace mori::umbp::segment {
+namespace mori::umbp {
 
-struct PreparedRecord {
-  std::vector<char> record;
-  WriteReservation reservation;
-};
-
-class Writer {
+class CopyPipeline {
  public:
-  explicit Writer(StorageIoDriver& io_driver) : io_driver_(io_driver) {}
+  CopyPipeline(LocalStorageManager& storage, const UMBPCopyPipelineConfig& config, UMBPRole role);
+  ~CopyPipeline();
 
-  // Phase 1 (caller holds mu_): prepare record buffer and reserve index space.
-  // Returns false if capacity is exhausted.
-  bool Prepare(const std::string& key, const void* data, size_t size, Meta* segment_meta,
-               Index& index, PreparedRecord* out) const;
-
-  // Phase 2 (caller holds io_mu_ only): write the prepared record to disk.
-  IoStatus WriteRecord(int fd, const PreparedRecord& pr, bool should_sync) const;
-
-  // Phase 2 batch variant: write multiple prepared records to disk.
-  IoStatus WriteRecords(int fd, const std::vector<PreparedRecord>& records, bool should_sync) const;
+  bool MaybeCopyToSharedSSD(const std::string& key);
+  void MaybeBatchCopyToSharedSSD(const std::vector<std::string>& keys);
 
  private:
-  StorageIoDriver& io_driver_;
+  struct CopyTask {
+    std::string key;
+  };
+
+  bool EnqueueCopyToSSD(const std::string& key);
+  size_t EnqueueCopyToSSDBatch(const std::vector<std::string>& keys);
+  void CopyWorkerLoop();
+
+  LocalStorageManager& storage_;
+  UMBPCopyPipelineConfig config_;
+  UMBPRole role_;
+
+  std::atomic<bool> stop_copy_worker_{false};
+  std::vector<std::thread> copy_workers_;
+  std::mutex copy_mu_;
+  std::condition_variable copy_cv_;
+  std::deque<CopyTask> copy_queue_;
 };
 
-}  // namespace mori::umbp::segment
+}  // namespace mori::umbp

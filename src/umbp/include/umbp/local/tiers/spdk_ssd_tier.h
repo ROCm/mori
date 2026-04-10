@@ -42,7 +42,7 @@
 #include <vector>
 
 #include "umbp/common/config.h"
-#include "umbp/local/storage/tier_backend.h"
+#include "umbp/local/tiers/tier_backend.h"
 #include "umbp/storage/spdk/offset_allocator.hpp"
 
 namespace mori {

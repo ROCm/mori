@@ -31,7 +31,7 @@
 #include "umbp/distributed/pool_client.h"
 #include "umbp/distributed/types.h"
 #include "umbp/local/block_index/local_block_index.h"
-#include "umbp/local/storage/local_storage_manager.h"
+#include "umbp/local/tiers/local_storage_manager.h"
 #include "umbp_peer.grpc.pb.h"
 
 namespace mori::umbp {

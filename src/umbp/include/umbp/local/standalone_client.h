@@ -28,8 +28,8 @@
 #include <vector>
 
 #include "umbp/local/block_index/local_block_index.h"
-#include "umbp/local/storage/copy_pipeline.h"
-#include "umbp/local/storage/local_storage_manager.h"
+#include "umbp/local/tiers/copy_pipeline.h"
+#include "umbp/local/tiers/local_storage_manager.h"
 #include "umbp/umbp_client.h"
 
 namespace mori::umbp {

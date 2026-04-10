@@ -50,7 +50,7 @@
 
 #include "umbp/common/config.h"
 #include "umbp/common/log.h"
-#include "umbp/local/storage/spdk_ssd_tier.h"
+#include "umbp/local/tiers/spdk_ssd_tier.h"
 #include "umbp/storage/spdk/offset_allocator.hpp"
 #include "umbp/storage/spdk/proxy/spdk_proxy_protocol.h"
 #include "umbp/storage/spdk/proxy/spdk_proxy_shm.h"

@@ -21,18 +21,38 @@
 // SOFTWARE.
 #pragma once
 
+#include <cstring>
 #include <string>
+#include <vector>
 
-#include "umbp/local/storage/segment/segment_index.h"
+#include "umbp/local/tiers/segment/segment_format.h"
+#include "umbp/local/tiers/segment/segment_index.h"
 #include "umbp/storage/io/storage_io_driver.h"
 
 namespace mori::umbp::segment {
 
-class Scanner {
+struct PreparedRecord {
+  std::vector<char> record;
+  WriteReservation reservation;
+};
+
+class Writer {
  public:
-  bool RefreshFromDisk(const std::string& dir, StorageIoDriver& io_driver, Index& index,
-                       bool read_only_shared, bool force_full_rescan,
-                       std::string* error_message) const;
+  explicit Writer(StorageIoDriver& io_driver) : io_driver_(io_driver) {}
+
+  // Phase 1 (caller holds mu_): prepare record buffer and reserve index space.
+  // Returns false if capacity is exhausted.
+  bool Prepare(const std::string& key, const void* data, size_t size, Meta* segment_meta,
+               Index& index, PreparedRecord* out) const;
+
+  // Phase 2 (caller holds io_mu_ only): write the prepared record to disk.
+  IoStatus WriteRecord(int fd, const PreparedRecord& pr, bool should_sync) const;
+
+  // Phase 2 batch variant: write multiple prepared records to disk.
+  IoStatus WriteRecords(int fd, const std::vector<PreparedRecord>& records, bool should_sync) const;
+
+ private:
+  StorageIoDriver& io_driver_;
 };
 
 }  // namespace mori::umbp::segment
