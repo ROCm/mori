@@ -26,9 +26,13 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cctype>
 #include <climits>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <numeric>
 #include <sstream>
@@ -62,6 +66,21 @@ int getScatterGatherKernelThreshold() {
     return INT_MAX;
   }();
   return threshold;
+}
+
+// Lowercase a PCI bus ID for consistent comparison across HIP APIs and sysfs.
+// hipDeviceGetPCIBusId may return uppercase hex (e.g. "0000:C1:00.0") while
+// sysfs directory names are lowercase ("0000:c1:00.0").
+std::string NormalizeBusId(const std::string& busId) {
+  std::string result = busId;
+  for (auto& c : result) {
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
+  return result;
+}
+
+bool IsIpcHandleEmpty(const std::array<char, kIpcHandleSize>& handle) {
+  return std::all_of(handle.begin(), handle.end(), [](char c) { return c == 0; });
 }
 
 // Keep caller-visible HIP current device unchanged across MORI internals.
@@ -549,7 +568,7 @@ void XgmiBackend::InitializeP2PAccess() {
     char busId[32] = {0};
     err = hipDeviceGetPCIBusId(busId, sizeof(busId), i);
     if (err == hipSuccess) {
-      localDeviceByBusId[std::string(busId)] = i;
+      localDeviceByBusId[NormalizeBusId(std::string(busId))] = i;
     } else {
       MORI_IO_WARN("XGMI: Failed to query PCI bus id for device {}: {}", i, hipGetErrorString(err));
     }
@@ -589,6 +608,8 @@ void XgmiBackend::InitializeP2PAccess() {
       }
     }
   }
+
+  BuildTopologyMap();
 }
 
 bool XgmiBackend::IsP2PAccessible(int srcDevice, int dstDevice) const {
@@ -596,6 +617,118 @@ bool XgmiBackend::IsP2PAccessible(int srcDevice, int dstDevice) const {
     return false;
   }
   return p2pMatrix[srcDevice][dstDevice];
+}
+
+void XgmiBackend::BuildTopologyMap() {
+  namespace fs = std::filesystem;
+
+  // Primary: parse KFD topology to get hive_id per GPU.
+  // KFD provides hive_id (shared across all GPUs in the same XGMI mesh) and
+  // location_id + domain (which encode the PCI BDF address).
+  const fs::path kfdNodes("/sys/class/kfd/kfd/topology/nodes");
+  std::error_code ec;
+  if (fs::is_directory(kfdNodes, ec)) {
+    for (const auto& nodeEntry : fs::directory_iterator(kfdNodes, ec)) {
+      if (ec) break;
+      fs::path propsFile = nodeEntry.path() / "properties";
+      std::ifstream f(propsFile);
+      if (!f.is_open()) continue;
+
+      uint64_t hiveId = 0;
+      uint64_t locationId = 0;
+      uint64_t domain = 0;
+      std::string key;
+      uint64_t val;
+      while (f >> key >> val) {
+        if (key == "hive_id")
+          hiveId = val;
+        else if (key == "location_id")
+          locationId = val;
+        else if (key == "domain")
+          domain = val;
+      }
+
+      // hive_id == 0 means CPU node or non-XGMI device
+      if (hiveId == 0 || locationId == 0) continue;
+
+      // Decode PCI BDF from location_id: bus[15:8] device[7:3] function[2:0]
+      unsigned bus = (locationId >> 8) & 0xff;
+      unsigned device = (locationId >> 3) & 0x1f;
+      unsigned function = locationId & 0x7;
+      char bdf[24];
+      std::snprintf(bdf, sizeof(bdf), "%04x:%02x:%02x.%x", static_cast<unsigned>(domain), bus,
+                    device, function);
+      gpuTopoByBusId[NormalizeBusId(std::string(bdf))] = hiveId;
+    }
+  }
+
+  if (!gpuTopoByBusId.empty()) {
+    MORI_IO_INFO("XGMI: Topology map built from KFD with {} GPU entries", gpuTopoByBusId.size());
+    return;
+  }
+
+  // Fallback: if KFD is unavailable, use xgmi_physical_id existence as a
+  // coarse hive indicator.  All devices that have xgmi_physical_id are treated
+  // as belonging to the same hive (assigned a synthetic shared hive ID of 1).
+  // This is correct for single-node MI300X where all GPUs are fully connected.
+  const fs::path sysDevices("/sys/bus/pci/devices");
+  if (!fs::is_directory(sysDevices, ec)) {
+    MORI_IO_TRACE("XGMI: sysfs PCI device directory not available, hidden-device XGMI disabled");
+    return;
+  }
+
+  for (const auto& entry : fs::directory_iterator(sysDevices, ec)) {
+    if (ec) break;
+    fs::path xgmiFile = entry.path() / "xgmi_physical_id";
+    if (!fs::exists(xgmiFile, ec)) continue;
+
+    std::ifstream f(xgmiFile);
+    int physicalId;
+    if (f.is_open() && (f >> physicalId)) {
+      std::string busId = NormalizeBusId(entry.path().filename().string());
+      gpuTopoByBusId[busId] = 1;  // synthetic shared hive ID
+    }
+  }
+
+  if (!gpuTopoByBusId.empty()) {
+    MORI_IO_INFO("XGMI: Topology map built from xgmi_physical_id fallback with {} GPU entries",
+                 gpuTopoByBusId.size());
+  }
+}
+
+std::optional<int> XgmiBackend::LookupVisibleDevice(const std::string& busId) const {
+  auto it = localDeviceByBusId.find(NormalizeBusId(busId));
+  if (it == localDeviceByBusId.end()) {
+    return std::nullopt;
+  }
+  return it->second;
+}
+
+bool XgmiBackend::IsTopologyEligible(int localDeviceId, const std::string& remoteBusId) const {
+  if (gpuTopoByBusId.empty()) {
+    return false;
+  }
+
+  // Find local device's bus ID by reverse lookup
+  std::string localBusId;
+  for (const auto& [busId, devId] : localDeviceByBusId) {
+    if (devId == localDeviceId) {
+      localBusId = busId;
+      break;
+    }
+  }
+  if (localBusId.empty()) {
+    return false;
+  }
+
+  std::string normalizedRemote = NormalizeBusId(remoteBusId);
+  auto localIt = gpuTopoByBusId.find(localBusId);
+  auto remoteIt = gpuTopoByBusId.find(normalizedRemote);
+  if (localIt == gpuTopoByBusId.end() || remoteIt == gpuTopoByBusId.end()) {
+    return false;
+  }
+
+  return localIt->second == remoteIt->second;
 }
 
 std::optional<int> XgmiBackend::ResolveVisibleDeviceId(const MemoryDesc& desc) const {
@@ -611,7 +744,7 @@ std::optional<int> XgmiBackend::ResolveVisibleDeviceId(const MemoryDesc& desc) c
     return std::nullopt;
   }
 
-  auto it = localDeviceByBusId.find(desc.deviceBusId);
+  auto it = localDeviceByBusId.find(NormalizeBusId(desc.deviceBusId));
   if (it == localDeviceByBusId.end()) {
     return std::nullopt;
   }
@@ -764,28 +897,40 @@ void XgmiBackend::BatchReadWrite(const MemoryDesc& localDest, const SizeVec& loc
 
 BackendSession* XgmiBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remote) {
   int localDevice = local.deviceId;
-  auto remoteDeviceOpt = ResolveVisibleDeviceId(remote);
-  if (!remoteDeviceOpt.has_value()) {
-    MORI_IO_WARN("XGMI: Remote memory id={} bus_id={} is not visible in local process", remote.id,
-                 remote.deviceBusId);
-    return nullptr;
-  }
-  int remoteDevice = remoteDeviceOpt.value();
   void* localAddr = GetRemappedAddress(local, localDevice);
+
+  auto visibleRemote = LookupVisibleDevice(remote.deviceBusId);
+  if (visibleRemote.has_value()) {
+    // Visible path: remote GPU is in HIP_VISIBLE_DEVICES
+    int remoteDevice = visibleRemote.value();
+    void* remoteAddr = GetRemappedAddress(remote, localDevice);
+    if (localAddr == nullptr || remoteAddr == nullptr) {
+      MORI_IO_WARN("XGMI: Failed to remap memory (local id={}, remote id={})", local.id, remote.id);
+      return nullptr;
+    }
+    bool ipcSession = (remote.engineKey != myEngKey);
+
+    if (!IsP2PAccessible(localDevice, remoteDevice)) {
+      MORI_IO_WARN("XGMI: P2P access not available between devices {} and {}", localDevice,
+                   remoteDevice);
+    }
+
+    return new XgmiBackendSession(config, localAddr, remoteAddr, localDevice, remoteDevice,
+                                  ipcSession, this, streamPool.get(), eventPool.get());
+  }
+
+  // Hidden-device path: remote GPU is not visible, use IPC on localDevice
   void* remoteAddr = GetRemappedAddress(remote, localDevice);
   if (localAddr == nullptr || remoteAddr == nullptr) {
-    MORI_IO_WARN("XGMI: Failed to remap memory (local id={}, remote id={})", local.id, remote.id);
+    MORI_IO_WARN("XGMI: Failed to remap hidden-device memory (local id={}, remote id={})", local.id,
+                 remote.id);
     return nullptr;
   }
-  bool ipcSession = (remote.engineKey != myEngKey);
 
-  if (!IsP2PAccessible(localDevice, remoteDevice)) {
-    MORI_IO_WARN("XGMI: P2P access not available between devices {} and {}", localDevice,
-                 remoteDevice);
-  }
-
-  return new XgmiBackendSession(config, localAddr, remoteAddr, localDevice, remoteDevice,
-                                ipcSession, this, streamPool.get(), eventPool.get());
+  MORI_IO_INFO("XGMI: Created hidden-device IPC session (local id={}, remote id={}, device={})",
+               local.id, remote.id, localDevice);
+  return new XgmiBackendSession(config, localAddr, remoteAddr, localDevice, localDevice, true, this,
+                                streamPool.get(), eventPool.get());
 }
 
 XgmiBackendSession* XgmiBackend::GetOrCreateSessionCached(const MemoryDesc& local,
@@ -800,13 +945,23 @@ XgmiBackendSession* XgmiBackend::GetOrCreateSessionCached(const MemoryDesc& loca
 
   void* localAddr = reinterpret_cast<void*>(local.data);
   int localDevice = local.deviceId;
-  auto remoteDeviceOpt = ResolveVisibleDeviceId(remote);
-  if (!remoteDeviceOpt.has_value()) {
-    MORI_IO_WARN("XGMI: Remote memory id={} bus_id={} is not visible in local process", remote.id,
-                 remote.deviceBusId);
-    return nullptr;
+
+  int remoteDevice;
+  bool ipcSession;
+  auto visibleRemote = LookupVisibleDevice(remote.deviceBusId);
+  if (visibleRemote.has_value()) {
+    remoteDevice = visibleRemote.value();
+    ipcSession = (remote.engineKey != myEngKey);
+    if (!IsP2PAccessible(localDevice, remoteDevice)) {
+      MORI_IO_WARN("XGMI: P2P access not available between devices {} and {}", localDevice,
+                   remoteDevice);
+    }
+  } else {
+    // Hidden-device path
+    remoteDevice = localDevice;
+    ipcSession = true;
   }
-  int remoteDevice = remoteDeviceOpt.value();
+
   void* remoteAddr = GetRemappedAddress(remote, localDevice);
   if (remoteAddr == nullptr) {
     MORI_IO_WARN(
@@ -814,12 +969,6 @@ XgmiBackendSession* XgmiBackend::GetOrCreateSessionCached(const MemoryDesc& loca
         "localDevice={}, remoteDevice={})",
         local.id, remote.id, localDevice, remoteDevice);
     return nullptr;
-  }
-  bool ipcSession = (remote.engineKey != myEngKey);
-
-  if (!IsP2PAccessible(localDevice, remoteDevice)) {
-    MORI_IO_WARN("XGMI: P2P access not available between devices {} and {}", localDevice,
-                 remoteDevice);
   }
 
   auto sess =
@@ -854,16 +1003,25 @@ bool XgmiBackend::CanHandle(const MemoryDesc& local, const MemoryDesc& remote) c
     return false;
   }
 
-  auto remoteDeviceOpt = ResolveVisibleDeviceId(remote);
-  if (!remoteDeviceOpt.has_value()) {
+  if (!IsSameNodeEngine(remote.engineKey)) {
     return false;
   }
 
-  if (!IsP2PAccessible(local.deviceId, remoteDeviceOpt.value())) {
+  if (remote.deviceBusId.empty()) {
     return false;
   }
 
-  return IsSameNodeEngine(remote.engineKey);
+  // Visible fast path: remote GPU is in this process's HIP_VISIBLE_DEVICES
+  auto visibleRemote = LookupVisibleDevice(remote.deviceBusId);
+  if (visibleRemote.has_value()) {
+    return IsP2PAccessible(local.deviceId, visibleRemote.value());
+  }
+
+  // Hidden-device path: remote GPU is not visible but may be on the same XGMI hive
+  if (IsIpcHandleEmpty(remote.ipcHandle)) {
+    return false;
+  }
+  return IsTopologyEligible(local.deviceId, remote.deviceBusId);
 }
 
 }  // namespace io
