@@ -324,9 +324,15 @@ target_link_libraries(umbp_common PUBLIC mori_logging mori_io ${_PROTOBUF_LIBS}
 target_compile_features(umbp_common PUBLIC cxx_std_17)
 
 # NOTE: umbp_core no longer depends on umbp_common.  StandaloneClient has no
-# gRPC/Protobuf dependency.  Targets that need distributed features (e.g. a
-# future DistributedClient) should link umbp_common directly.
+# gRPC/Protobuf dependency.  Targets that need distributed features should link
+# umbp_common directly.
 target_link_libraries(umbp_core PUBLIC mori_logging)
+
+# Factory: references both StandaloneClient and DistributedClient, so it belongs
+# in umbp_common (which has the distributed symbols).  Runtime switching is via
+# config.distributed.has_value().
+target_sources(umbp_common
+               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/umbp_client_factory.cpp)
 
 # ---------- Master executable -------------------------------------------------
 

@@ -29,16 +29,17 @@
 
 #include "umbp/umbp_client.h"
 
+namespace mori::io {
+class IOEngine;
+}
+
 namespace mori::umbp {
 
 class MasterClient;
-class PoolClient;
 
 /// Distributed IUMBPClient implementation — master-led global routing
 /// with RDMA/MORI-IO data plane.  All routing decisions go through the
 /// Master; this client does NOT use LocalStorageManager or LocalBlockIndex.
-///
-/// TODO: implement master-led control flow (RoutePut/RouteGet/Lookup).
 class DistributedClient : public IUMBPClient {
  public:
   explicit DistributedClient(const UMBPConfig& config);
@@ -70,7 +71,9 @@ class DistributedClient : public IUMBPClient {
  private:
   UMBPConfig config_;
   bool closed_ = false;
-  // TODO: add MasterClient, IOEngine, PeerServiceServer members
+
+  std::unique_ptr<MasterClient> master_client_;
+  std::unique_ptr<mori::io::IOEngine> io_engine_;
 };
 
 }  // namespace mori::umbp

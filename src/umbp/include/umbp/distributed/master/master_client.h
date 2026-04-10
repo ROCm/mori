@@ -75,6 +75,8 @@ class MasterClient {
   // If removed is non-null, returns 1 when removed, otherwise 0.
   grpc::Status Unregister(const std::string& key, const Location& location,
                           uint32_t* removed = nullptr);
+  // Read-only existence check (no access count side-effects).
+  grpc::Status Lookup(const std::string& key, bool* found);
   grpc::Status FinalizeAllocation(const std::string& key, const Location& location,
                                   const std::string& allocation_id);
   grpc::Status PublishLocalBlock(const std::string& key, const Location& location);
