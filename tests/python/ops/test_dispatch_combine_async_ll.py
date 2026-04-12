@@ -136,6 +136,7 @@ def _test_dispatch_combine(
     max_total_recv_tokens=0,
     routing=None,
     use_max_token_num=False,
+    num_token_override=None,
 ):
     config = _make_asyncll_config(
         rank=rank,
@@ -155,7 +156,44 @@ def _test_dispatch_combine(
         AsyncLLDispatchCombineTestCase,
         use_max_token_num=use_max_token_num,
         routing=routing,
+        num_token_override=num_token_override,
     )
+
+
+def _test_dispatch_combine_multi_iteration(
+    rank,
+    world_size,
+    data_type,
+    hidden_dim,
+    max_num_inp_token_per_rank,
+    num_experts_per_rank,
+    num_experts_per_token,
+    num_token_patterns,
+    scale_dim=0,
+    scale_type_size=1,
+    quant_type="none",
+    routing="round_robin",
+):
+    config = _make_asyncll_config(
+        rank=rank,
+        world_size=world_size,
+        data_type=data_type,
+        hidden_dim=hidden_dim,
+        max_num_inp_token_per_rank=max_num_inp_token_per_rank,
+        num_experts_per_rank=num_experts_per_rank,
+        num_experts_per_token=num_experts_per_token,
+        scale_dim=scale_dim,
+        scale_type_size=scale_type_size,
+        quant_type=quant_type,
+    )
+    op = mori.ops.EpDispatchCombineOp(config)
+    test_case = AsyncLLDispatchCombineTestCase(config)
+
+    for num_token_override in num_token_patterns:
+        test_data = test_case.gen_test_data(
+            routing=routing, num_token_override=num_token_override
+        )
+        test_case.run_test_once(op, test_data)
 
 
 @pytest.mark.parametrize("world_size", (8,))
@@ -196,6 +234,51 @@ def test_dispatch_combine(
                     scale_dim,
                     scale_type_size,
                     quant_type,
+                ],
+            )
+        )
+
+    assert_worker_results(torch_dist_process_manager, world_size)
+
+
+@pytest.mark.parametrize("world_size", (8,))
+@pytest.mark.parametrize("data_type", _all_data_types())
+@pytest.mark.parametrize("hidden_dim", (4096,))
+@pytest.mark.parametrize("num_experts_per_rank", (32,))
+@pytest.mark.parametrize("num_experts_per_token", (8,))
+def test_dispatch_combine_some_ranks_have_no_tokens_multi_iteration(
+    torch_dist_process_manager,
+    world_size,
+    data_type,
+    hidden_dim,
+    num_experts_per_rank,
+    num_experts_per_token,
+):
+    num_token_patterns = [
+        [4, 0, 3, 0, 2, 0, 1, 0],
+        [0, 5, 0, 4, 0, 3, 0, 2],
+        [6, 1, 0, 0, 5, 0, 0, 2],
+        [0, 0, 7, 1, 0, 0, 4, 3],
+    ]
+    max_num_inp_token_per_rank = max(max(pattern) for pattern in num_token_patterns)
+    routing = "round_robin"
+
+    for _ in range(world_size):
+        torch_dist_process_manager.task_queue.put(
+            (
+                _test_dispatch_combine_multi_iteration,
+                [
+                    world_size,
+                    data_type,
+                    hidden_dim,
+                    max_num_inp_token_per_rank,
+                    num_experts_per_rank,
+                    num_experts_per_token,
+                    num_token_patterns,
+                    0,  # scale_dim
+                    1,  # scale_type_size
+                    "none",  # quant_type
+                    routing,
                 ],
             )
         )
