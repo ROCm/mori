@@ -60,6 +60,29 @@ inline __device__ int NullSendBufSlotOffset(const EpDispatchCombineConfig& confi
   return config.worldSize * config.MaxNumTokensToSendPerRank();
 }
 
+// Partitions a loop over (numItems x dimSize) work across globalWarpNum warps.
+// When there are more warps than items, multiple warps collaborate on a single item
+// by splitting dimSize; when there are fewer warps, each warp handles multiple items.
+struct MultiWarpIter {
+  int warpsPerItem;
+  size_t dimPerWarp;
+  size_t dimSize;
+
+  inline __device__ MultiWarpIter(int globalWarpNum, int numItems, size_t dimSize_)
+      : dimSize(dimSize_) {
+    warpsPerItem = (globalWarpNum + numItems - 1) / numItems;
+    dimPerWarp = (dimSize + warpsPerItem - 1) / warpsPerItem;
+  }
+
+  inline __device__ void Decode(int i, int& itemId, int& inItemPartId, size_t& dimOffset,
+                                size_t& dimChunk) const {
+    itemId = i / warpsPerItem;
+    inItemPartId = i % warpsPerItem;
+    dimOffset = (size_t)inItemPartId * dimPerWarp;
+    dimChunk = (dimOffset < dimSize) ? std::min(dimSize - dimOffset, dimPerWarp) : size_t{0};
+  }
+};
+
 #define DEF_COMMON_VARS                                    \
   const EpDispatchCombineConfig& config = args.config;     \
   int thdId = threadIdx.x;                                 \
@@ -80,6 +103,7 @@ inline __device__ int NullSendBufSlotOffset(const EpDispatchCombineConfig& confi
   int nNodes = npes / config.gpuPerNode;                   \
   int numExpertPerToken = config.numExpertPerToken;        \
   assert(numExpertPerToken < warpSize);                    \
+  size_t hiddenDim = config.HiddenDimSz();                 \
   size_t hiddenBytes = config.HiddenBytes(sizeof(T));      \
   size_t indexBytes = config.IndexBytes();                 \
   size_t weightBytes = config.WeightBytes();               \

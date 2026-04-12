@@ -21,6 +21,7 @@
 # SOFTWARE.
 import os
 import pytest
+import torch
 import mori
 from tests.python.ops.dispatch_combine_test_utils import (
     _all_data_types,
@@ -31,7 +32,7 @@ from tests.python.ops.dispatch_combine_test_utils import (
     start_torch_dist_process_manager,
 )
 
-os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "6G")
+os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "32G")
 
 # Kernel-type string → (EpDispatchCombineKernelType, block_num, rdma_block_num, warp_num_per_block)
 _KERNEL_CONFIGS = {
@@ -48,45 +49,6 @@ _KERNEL_CONFIGS = {
         8,  # warp_num_per_block
     ),
 }
-
-
-class InterNodeV1DispatchCombineTestCase(EpDispatchCombineTestCase):
-    def run_test_once(self, op, test_data):
-        (
-            _,
-            all_rank_indices,
-            all_rank_input,
-            all_rank_weights,
-            all_rank_scales,
-        ) = test_data
-        (
-            dispatch_output,
-            dispatch_weights,
-            dispatch_scales,
-            dispatch_indices,
-            dispatch_recv_num_token,
-        ) = op.dispatch(
-            all_rank_input[self.config.rank],
-            all_rank_weights[self.config.rank],
-            all_rank_scales[self.config.rank],
-            all_rank_indices[self.config.rank],
-        )
-        self.sync()
-        self.check_dispatch_result(
-            op,
-            test_data,
-            dispatch_output,
-            dispatch_weights,
-            dispatch_scales,
-            dispatch_indices,
-            dispatch_recv_num_token,
-        )
-
-        combine_output, combine_output_weight = op.combine(
-            dispatch_output, dispatch_weights, dispatch_indices, call_reset=False
-        )
-        self.sync()
-        self.check_combine_result(op, test_data, combine_output, combine_output_weight)
 
 
 @pytest.fixture(scope="session")
@@ -148,6 +110,7 @@ def _test_dispatch_combine(
     max_total_recv_tokens=0,
     routing=None,
     use_max_token_num=False,
+    check_results=True,
 ):
     config = _make_internode_v1_config(
         rank=rank,
@@ -165,9 +128,10 @@ def _test_dispatch_combine(
     )
     run_ep_dispatch_combine_test(
         config,
-        InterNodeV1DispatchCombineTestCase,
+        EpDispatchCombineTestCase,
         use_max_token_num=use_max_token_num,
         routing=routing,
+        check_results=check_results,
     )
 
 
@@ -339,3 +303,48 @@ def test_dispatch_combine_max_total_recv_tokens_under_budget(
         )
 
     assert_worker_results(torch_dist_process_manager, world_size)
+
+
+# ---------------------------------------------------------------------------
+# Large token num test (InterNodeV1 / InterNodeV1LL)
+#
+# Stress-test with 65536 tokens per rank (512K tokens total across 8 ranks)
+# and hidden_dim=7168.  Only checks that dispatch+combine complete without
+# error; correctness checks are skipped because they are too slow at this scale.
+# ---------------------------------------------------------------------------
+
+
+def test_dispatch_combine_large_token_num(
+    torch_dist_process_manager,
+):
+    """Dispatch + combine with max_num_inp_token_per_rank=65536, hidden_dim=7168.
+
+    Tested for both InterNodeV1 and InterNodeV1LL kernel types.
+    Correctness is not verified — only that the kernel completes without error.
+    """
+    world_size = 8
+    for kernel_type in ("internode_v1", "internode_v1_ll"):
+        for _ in range(world_size):
+            torch_dist_process_manager.task_queue.put(
+                (
+                    _test_dispatch_combine,
+                    [
+                        world_size,
+                        kernel_type,
+                        torch.bfloat16,  # data_type
+                        7168,  # hidden_dim
+                        65536,  # max_num_inp_token_per_rank
+                        32,  # num_experts_per_rank
+                        8,  # num_experts_per_token
+                        8,  # gpu_per_node
+                        0,  # scale_dim
+                        1,  # scale_type_size
+                        0,  # max_total_recv_tokens
+                        None,  # routing
+                        True,  # use_max_token_num
+                        False,  # check_results
+                    ],
+                )
+            )
+
+        assert_worker_results(torch_dist_process_manager, world_size)
