@@ -33,11 +33,11 @@ from tests.python.ops.dispatch_combine_test_utils import (
     start_torch_dist_process_manager,
 )
 
-os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "6G")
+os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "32G")
 
 
 class AsyncLLDispatchCombineTestCase(EpDispatchCombineTestCase):
-    def run_test_once(self, op, test_data):
+    def run_test_once(self, op, test_data, check_results=True):
         (
             _,
             all_rank_indices,
@@ -60,15 +60,16 @@ class AsyncLLDispatchCombineTestCase(EpDispatchCombineTestCase):
         op.dispatch_recv()
 
         self.sync()
-        self.check_dispatch_result(
-            op,
-            test_data,
-            dispatch_output,
-            dispatch_weights,
-            dispatch_scales,
-            dispatch_indices,
-            dispatch_recv_num_token,
-        )
+        if check_results:
+            self.check_dispatch_result(
+                op,
+                test_data,
+                dispatch_output,
+                dispatch_weights,
+                dispatch_scales,
+                dispatch_indices,
+                dispatch_recv_num_token,
+            )
 
         # AsyncLL combine weight reconstruction is not exercised in the
         # reference example yet, so validate token reconstruction only.
@@ -80,7 +81,8 @@ class AsyncLLDispatchCombineTestCase(EpDispatchCombineTestCase):
         op.combine_recv()
 
         self.sync()
-        self.check_combine_result(op, test_data, combine_output, None)
+        if check_results:
+            self.check_combine_result(op, test_data, combine_output, None)
 
 
 @pytest.fixture(scope="session")
@@ -137,6 +139,7 @@ def _test_dispatch_combine(
     routing=None,
     use_max_token_num=False,
     num_token_override=None,
+    check_results=True,
 ):
     config = _make_asyncll_config(
         rank=rank,
@@ -157,6 +160,7 @@ def _test_dispatch_combine(
         use_max_token_num=use_max_token_num,
         routing=routing,
         num_token_override=num_token_override,
+        check_results=check_results,
     )
 
 

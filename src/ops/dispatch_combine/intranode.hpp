@@ -90,6 +90,7 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
 
   int myPe = config.rank;
   int npes = config.worldSize;
+  size_t hiddenDim = config.HiddenDimSz();
 
   if (args.tokenIndices && args.inpTokenBuf) {
     // Phase1: send token
@@ -151,11 +152,11 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
             args.scalesBuf + srcScaleOffset, config.scaleDim * config.scaleTypeSize);
       }
 
-      size_t srcTokOffset = (size_t)srcTokId * config.hiddenDim;
-      size_t destTokOffset = (size_t)destTokId * config.hiddenDim;
+      size_t srcTokOffset = srcTokId * hiddenDim;
+      size_t destTokOffset = destTokId * hiddenDim;
 
       core::WarpCopy(args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) + destTokOffset,
-                     args.inpTokenBuf + srcTokOffset, config.hiddenDim);
+                     args.inpTokenBuf + srcTokOffset, hiddenDim);
     }
   }
   __syncthreads();
@@ -237,7 +238,8 @@ __device__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   // Copy input to shmem registered buffer so that other GPUs can access directly
   index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
   // When TokT != T (e.g. fp8 combine), staging layout uses TokT-sized tokens
-  const size_t hiddenBytes = config.hiddenDim * sizeof(TokT);
+  const size_t hiddenDim = config.HiddenDimSz();
+  const size_t hiddenBytes = hiddenDim * sizeof(TokT);
   const size_t weightBytes =
       (args.weightsBuf == nullptr) ? 0 : config.numExpertPerToken * sizeof(float);
   const size_t combXferBytes = hiddenBytes + weightBytes;
@@ -251,13 +253,11 @@ __device__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       for (int i = globalWarpId; i < totalRecvTokenNum; i += globalWarpNum) {
         if constexpr (!std::is_same_v<T, TokT> && std::is_same_v<TokT, core::CombineInternalFp8>) {
           core::WarpCastBf16ToCombineInternalFp8<T>(
-              args.intraNodeTokBufs.combineInp->template GetAs<TokT*>() +
-                  (size_t)i * config.hiddenDim,
-              args.inpTokenBuf + (size_t)i * config.hiddenDim, config.hiddenDim, laneId);
+              args.intraNodeTokBufs.combineInp->template GetAs<TokT*>() + i * hiddenDim,
+              args.inpTokenBuf + i * hiddenDim, hiddenDim, laneId);
         } else {
-          core::WarpCopy(
-              args.intraNodeTokBufs.combineInp->template GetAs<T*>() + (size_t)i * config.hiddenDim,
-              args.inpTokenBuf + (size_t)i * config.hiddenDim, config.hiddenDim);
+          core::WarpCopy(args.intraNodeTokBufs.combineInp->template GetAs<T*>() + i * hiddenDim,
+                         args.inpTokenBuf + i * hiddenDim, hiddenDim);
         }
       }
     }
@@ -276,12 +276,12 @@ __device__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       uint8_t* destStagingPtr = args.intraNodeTokBufs.combineInp->template GetAs<uint8_t*>(destPe) +
                                 SendBufSlotOffset(config, myPe, destLocalTokId) * combXferBytes;
       if constexpr (!std::is_same_v<T, TokT> && std::is_same_v<TokT, core::CombineInternalFp8>) {
-        core::WarpCastBf16ToCombineInternalFp8<T>(
-            reinterpret_cast<TokT*>(destStagingPtr),
-            args.inpTokenBuf + (size_t)tokenIdx * config.hiddenDim, config.hiddenDim, laneId);
+        core::WarpCastBf16ToCombineInternalFp8<T>(reinterpret_cast<TokT*>(destStagingPtr),
+                                                  args.inpTokenBuf + tokenIdx * hiddenDim,
+                                                  hiddenDim, laneId);
       } else {
         core::WarpCopy(reinterpret_cast<T*>(destStagingPtr),
-                       args.inpTokenBuf + (size_t)tokenIdx * config.hiddenDim, config.hiddenDim);
+                       args.inpTokenBuf + tokenIdx * hiddenDim, hiddenDim);
       }
       if (args.weightsBuf) {
         core::WarpCopy(reinterpret_cast<float*>(destStagingPtr + hiddenBytes),
@@ -301,16 +301,13 @@ __device__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   float** srcWeightsPtr = reinterpret_cast<float**>(sharedMem) +
                           warpNum * config.numExpertPerToken + warpId * config.numExpertPerToken;
 
-  index_t warpsPerToken = (globalWarpNum + args.curRankNumToken - 1) / args.curRankNumToken;
-  index_t hiddenDimPerWarp = (config.hiddenDim + warpsPerToken - 1) / warpsPerToken;
+  MultiWarpIter mwIter(globalWarpNum, args.curRankNumToken, hiddenDim);
 
   assert(config.numExpertPerToken < warpSize);
-  for (int i = globalWarpId; i < (args.curRankNumToken * warpsPerToken); i += globalWarpNum) {
-    index_t tokenId = i / warpsPerToken;
-    index_t inTokenPartId = i % warpsPerToken;
-    index_t hiddenDimOffset = inTokenPartId * hiddenDimPerWarp;
-    index_t hiddenDimSize =
-        std::max(0, std::min(config.hiddenDim - hiddenDimOffset, hiddenDimPerWarp));
+  for (int i = globalWarpId; i < (args.curRankNumToken * mwIter.warpsPerItem); i += globalWarpNum) {
+    int tokenId, inTokenPartId;
+    size_t hiddenDimOffset, hiddenDimSize;
+    mwIter.Decode(i, tokenId, inTokenPartId, hiddenDimOffset, hiddenDimSize);
 
     // Prepare data pointers on different GPUs
     for (int j = laneId; j < config.numExpertPerToken; j += warpSize) {
@@ -321,7 +318,7 @@ __device__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
         if constexpr (UseP2PRead) {
           index_t destLocalTokId = LocalTokIdFromFlatTokenIndex(config, destTokId);
           srcPtrs[j] = args.intraNodeTokBufs.combineInp->template GetAs<TokT*>(destPe) +
-                       (size_t)destLocalTokId * config.hiddenDim + hiddenDimOffset;
+                       destLocalTokId * hiddenDim + hiddenDimOffset;
           srcWeightsPtr[j] = args.shmemInpWeightsMemObj->template GetAs<float*>(destPe) +
                              destLocalTokId * config.numExpertPerToken;
         } else {
@@ -339,8 +336,8 @@ __device__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       }
     }
 
-    T* outPtr = args.intraNodeTokBufs.combineOut->template GetAs<T*>() +
-                tokenId * config.hiddenDim + hiddenDimOffset;
+    T* outPtr = args.intraNodeTokBufs.combineOut->template GetAs<T*>() + tokenId * hiddenDim +
+                hiddenDimOffset;
 
     int validAccumCount = config.numExpertPerToken;
     if (config.worldSize <= 4) {
@@ -367,7 +364,7 @@ __device__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       core::WarpAccum<T, 4>(outPtr, srcPtrs, nullptr, validAccumCount, hiddenDimSize);
     }
 
-    if (args.weightsBuf && inTokenPartId == warpsPerToken - 1) {
+    if (args.weightsBuf && inTokenPartId == mwIter.warpsPerItem - 1) {
       core::WarpAccum<float, 4>(args.shmemCombineOutWeightsMemObj->template GetAs<float*>() +
                                     tokenId * config.numExpertPerToken,
                                 srcWeightsPtr, nullptr, config.numExpertPerToken,
