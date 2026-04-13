@@ -55,12 +55,21 @@ def _hash_tree(paths: list[Path]) -> str:
     return h.hexdigest()[:12]
 
 
-def get_cache_dir(arch: str, source_paths: list[Path], nic: str = "mlx5") -> Path:
+def get_cache_dir(
+    arch: str,
+    source_paths: list[Path],
+    nic: str = "mlx5",
+    profiler: bool = False,
+) -> Path:
     """Return the cache directory for a specific arch + NIC + content combo.
 
-    Structure: ``<cache_root>/<arch>_<nic>/<content_hash>/``
+    Structure: ``<cache_root>/<arch>_<nic>[_profiler]/<content_hash>/``
+
+    The ``profiler`` flag is encoded in the directory name so that kernels
+    compiled with ``ENABLE_PROFILER`` and without are cached separately.
     """
     content_hash = _hash_tree(source_paths)
-    d = get_cache_root() / f"{arch}_{nic}" / content_hash
+    profiler_suffix = "_profiler" if profiler else ""
+    d = get_cache_root() / f"{arch}_{nic}{profiler_suffix}" / content_hash
     d.mkdir(parents=True, exist_ok=True)
     return d
