@@ -1046,8 +1046,8 @@ def bench_dispatch_combine(
             max_num_inp_token_per_rank,
             dtype,
             hidden_dim,
-            0,  # scale_dim
-            0,  # scale_type_size
+            32,  # scale_dim
+            4,  # scale_type_size
             num_experts_per_rank,
             num_experts_per_token,
             cmd,
