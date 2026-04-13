@@ -27,6 +27,17 @@
 #include <cctype>
 #include <cstdlib>
 
+#ifdef __linux__
+#include <numaif.h>
+#include <sched.h>
+#include <unistd.h>
+
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+#endif
+
 #include "mori/io/env.hpp"
 #include "mori/io/logging.hpp"
 #include "src/io/rdma/backend_impl.hpp"
@@ -54,6 +65,82 @@ std::string QueryDeviceBusId(int deviceId) {
   }
   return result;
 }
+
+#ifdef __linux__
+// Query the NUMA node for a single page via get_mempolicy.
+// Returns -1 on failure.
+int QueryPageNuma(void* addr) {
+  int node = -1;
+  int ret = get_mempolicy(&node, nullptr, 0, addr, MPOL_F_NODE | MPOL_F_ADDR);
+  if (ret == 0 && node >= 0) return node;
+  return -1;
+}
+
+// Fallback: infer NUMA node from current CPU via sysfs.
+int NumaNodeFromCurrentCpu() {
+  int cpu = sched_getcpu();
+  if (cpu < 0) return -1;
+
+  std::string numaPath = "/sys/devices/system/node";
+  for (int n = 0; n < 256; n++) {
+    std::string cpuListPath = numaPath + "/node" + std::to_string(n) + "/cpulist";
+    std::ifstream cpuListFile(cpuListPath);
+    if (!cpuListFile.is_open()) break;
+    std::string cpuList;
+    std::getline(cpuListFile, cpuList);
+    std::istringstream ss(cpuList);
+    std::string range;
+    while (std::getline(ss, range, ',')) {
+      auto dash = range.find('-');
+      if (dash != std::string::npos) {
+        int lo = std::stoi(range.substr(0, dash));
+        int hi = std::stoi(range.substr(dash + 1));
+        if (cpu >= lo && cpu <= hi) return n;
+      } else {
+        if (std::stoi(range) == cpu) return n;
+      }
+    }
+  }
+  return -1;
+}
+
+// Resolve the NUMA node of a CPU memory region.
+// Samples first, middle, and last pages; if they disagree (interleaved buffer)
+// returns -1 to avoid pinning to an incorrect NUMA node.
+int ResolveCpuMemoryNuma(void* addr, size_t size) {
+  long pageSize = sysconf(_SC_PAGESIZE);
+  if (pageSize <= 0) pageSize = 4096;
+
+  // Collect sample offsets: first, middle, last page
+  std::vector<void*> samples;
+  samples.push_back(addr);
+  if (size > static_cast<size_t>(pageSize)) {
+    size_t midOff = (size / 2) & ~(static_cast<size_t>(pageSize) - 1);
+    samples.push_back(reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(addr) + midOff));
+    size_t lastOff = (size - 1) & ~(static_cast<size_t>(pageSize) - 1);
+    if (lastOff != midOff) {
+      samples.push_back(reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(addr) + lastOff));
+    }
+  }
+
+  int firstNode = -1;
+  for (auto* sample : samples) {
+    int node = QueryPageNuma(sample);
+    if (node < 0) continue;
+    if (firstNode < 0) {
+      firstNode = node;
+    } else if (node != firstNode) {
+      // Pages on different NUMA nodes — interleaved or split buffer
+      return -1;
+    }
+  }
+
+  if (firstNode >= 0) return firstNode;
+
+  // Fallback: infer from current CPU
+  return NumaNodeFromCurrentCpu();
+}
+#endif
 
 }  // namespace
 
@@ -269,6 +356,12 @@ MemoryDesc IOEngine::RegisterMemory(void* data, size_t size, int device, MemoryL
   memDesc.size = size;
   memDesc.loc = loc;
 
+#ifdef __linux__
+  if (loc == MemoryLocationType::CPU) {
+    memDesc.numaNode = ResolveCpuMemoryNuma(data, size);
+  }
+#endif
+
   for (auto& it : backends) {
     it.second->RegisterMemory(memDesc);
   }
@@ -298,7 +391,8 @@ Backend* IOEngine::SelectBackend(const MemoryDesc& local, const MemoryDesc& remo
     return nullptr;
   }
 
-  RouteCacheKey routeKey{remote.engineKey, local.loc, remote.loc, local.deviceId, remote.deviceId};
+  RouteCacheKey routeKey{remote.engineKey, local.loc,      remote.loc,     local.deviceId,
+                         remote.deviceId,  local.numaNode, remote.numaNode};
 
   if (auto cachedType = QueryRouteCache(routeKey); cachedType.has_value()) {
     auto cachedBackend = backends.find(cachedType.value());

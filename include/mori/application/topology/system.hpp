@@ -47,6 +47,14 @@ class TopoSystem {
   std::string MatchGpuAndNic(int id);
   std::vector<std::string> MatchAllGpusAndNics();
 
+  struct RankedNic {
+    std::string name;
+    PciBusId busId{0};
+    int nicNumaNode{-1};
+    double totalGbps{0};
+  };
+  std::vector<RankedNic> RankNicsForCpuNuma(int numaNode);
+
  private:
   void Load();
 

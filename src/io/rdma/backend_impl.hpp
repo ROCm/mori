@@ -291,6 +291,28 @@ class RdmaBackend : public Backend {
   std::unordered_map<SessionCacheKey, std::unique_ptr<RdmaBackendSession>, SessionCacheKeyHash>
       sessionCache;
   std::mutex sessionCacheMu;
+
+  // Per-(EngineKey, TopoKeyPair) builder mutex to prevent TOCTOU on CountEndpoint/BuildRdmaConn
+  struct BuilderKey {
+    EngineKey engineKey;
+    TopoKeyPair topo;
+    bool operator==(const BuilderKey& o) const {
+      return engineKey == o.engineKey && topo == o.topo;
+    }
+  };
+  struct BuilderKeyHash {
+    std::size_t operator()(const BuilderKey& k) const noexcept {
+      auto hashCombine = [](std::size_t& s, std::size_t v) {
+        s ^= v + 0x9e3779b97f4a7c15ULL + (s << 6) + (s >> 2);
+      };
+      std::size_t seed = 0;
+      hashCombine(seed, std::hash<std::string>{}(k.engineKey));
+      hashCombine(seed, std::hash<TopoKeyPair>{}(k.topo));
+      return seed;
+    }
+  };
+  std::mutex builderMapMu;
+  std::unordered_map<BuilderKey, std::unique_ptr<std::mutex>, BuilderKeyHash> builderMutexes;
 };
 
 }  // namespace io

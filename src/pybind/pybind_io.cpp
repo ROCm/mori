@@ -127,6 +127,7 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def_readonly("engine_key", &mori::io::MemoryDesc::engineKey)
       .def_readonly("id", &mori::io::MemoryDesc::id)
       .def_readonly("device_id", &mori::io::MemoryDesc::deviceId)
+      .def_readonly("numa_node", &mori::io::MemoryDesc::numaNode)
       .def_readonly("device_bus_id", &mori::io::MemoryDesc::deviceBusId)
       .def_property_readonly("data",
                              [](const mori::io::MemoryDesc& desc) -> uintptr_t {

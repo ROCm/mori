@@ -92,11 +92,36 @@ std::vector<std::pair<int, int>> RdmaManager::Search(TopoKey key) {
       if (idx >= 0 && idx < static_cast<int>(availDevices.size())) {
         return {{idx, 1}};
       }
-      MORI_IO_WARN("MORI_IO_RDMA_NIC_IDX={} out of range [0, {}), falling back to round-robin", idx,
+      MORI_IO_WARN("MORI_IO_RDMA_NIC_IDX={} out of range [0, {}), falling back", idx,
                    availDevices.size());
     }
-    int idx = (roundRobinCounter.fetch_add(1, std::memory_order_relaxed) % availDevices.size());
-    return {{idx, 1}};
+    // NUMA-aware NIC selection: returns a single candidate because all
+    // endpoints in a TopoKeyPair share one RDMA device context (lkey binding).
+    // The selection is deterministic: same NUMA node always maps to the same
+    // NIC, ordered by NUMA affinity → bandwidth → name.
+    if (key.numaNode >= 0) {
+      auto ranked = topo->RankNicsForCpuNuma(key.numaNode);
+      for (auto& r : ranked) {
+        for (int i = 0; i < static_cast<int>(availDevices.size()); i++) {
+          if (availDevices[i].first->Name() == r.name) {
+            return {{i, 1}};
+          }
+        }
+      }
+    }
+    // Fallback: rank without NUMA preference
+    {
+      auto ranked = topo->RankNicsForCpuNuma(-1);
+      for (auto& r : ranked) {
+        for (int i = 0; i < static_cast<int>(availDevices.size()); i++) {
+          if (availDevices[i].first->Name() == r.name) {
+            return {{i, 1}};
+          }
+        }
+      }
+    }
+    // Last resort: first available device
+    return {{0, 1}};
   }
   MORI_IO_ERROR(
       "topo searching for device other than CPU/GPU is not implemented yet, returning default "
@@ -593,8 +618,11 @@ void ControlPlaneServer::BuildRdmaConn(EngineKey ekey, TopoKeyPair topo) {
 
   rdma->ConnectEndpoint(ekey, devId, lep, msg.devId, msg.eph, topo, weight);
   notif->RegisterEndpointByQpn(lep.handle.qpn);
-  MORI_IO_INFO("Built RdmaConn for engine {} with topo local({},{}) remote({},{})", ekey,
-               topo.local.deviceId, topo.local.loc, topo.remote.deviceId, topo.remote.loc);
+  MORI_IO_INFO(
+      "Built RdmaConn for engine {} with topo local(dev={},numa={},loc={}) "
+      "remote(dev={},numa={},loc={})",
+      ekey, topo.local.deviceId, topo.local.numaNode, topo.local.loc, topo.remote.deviceId,
+      topo.remote.numaNode, topo.remote.loc);
   ctx->CloseEndpoint(tcph);
 }
 
@@ -883,13 +911,27 @@ BackendSession* RdmaBackend::CreateSession(const MemoryDesc& local, const Memory
 
 void RdmaBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remote,
                                 RdmaBackendSession& sess) {
-  TopoKey localKey{local.deviceId, local.loc};
-  TopoKey remoteKey{remote.deviceId, remote.loc};
+  TopoKey localKey = MakeTopoKey(local);
+  TopoKey remoteKey = MakeTopoKey(remote);
   TopoKeyPair kp{localKey, remoteKey};
 
   EngineKey ekey = remote.engineKey;
 
-  // Create a pair of endpoint if none
+  // Per-key builder mutex to prevent TOCTOU race on CountEndpoint/BuildRdmaConn
+  std::mutex* builderMu = nullptr;
+  {
+    std::lock_guard<std::mutex> mapLock(builderMapMu);
+    auto& ptr = builderMutexes[BuilderKey{ekey, kp}];
+    if (!ptr) ptr = std::make_unique<std::mutex>();
+    builderMu = ptr.get();
+  }
+  std::lock_guard<std::mutex> builderLock(*builderMu);
+
+  // Create endpoint(s) if needed. All endpoints for a given TopoKeyPair are
+  // placed on the same RDMA device because RegisterLocalMemory() produces an
+  // lkey that is only valid for QPs on that device context. Spreading QPs
+  // across different NICs would require per-device memory registration and
+  // per-endpoint MR tracking, which is a larger architectural change.
   int epNum = rdma->CountEndpoint(ekey, kp);
   for (int i = 0; i < (config.qpPerTransfer - epNum); i++) {
     server->BuildRdmaConn(ekey, kp);
@@ -899,7 +941,6 @@ void RdmaBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remot
 
   EpPairVec epSet = {eps.begin(), eps.begin() + config.qpPerTransfer};
 
-  // TODO: we assume all eps is on same device and has same ldevId/rdevId
   EpPair ep = epSet[0];
   auto localMr = rdma->GetLocalMemory(ep.ldevId, local.id);
   if (!localMr.has_value()) {

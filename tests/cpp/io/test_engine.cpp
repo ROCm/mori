@@ -760,6 +760,99 @@ void CaseXgmiConcurrentWaitAndPollIsSafe() {
               ", msg='" + status.Message() + "'");
 }
 
+void CaseMakeTopoKey() {
+  // GPU MemoryDesc: numaNode should be -1
+  MemoryDesc gpuDesc;
+  gpuDesc.deviceId = 0;
+  gpuDesc.numaNode = -1;
+  gpuDesc.loc = MemoryLocationType::GPU;
+  TopoKey gpuKey = MakeTopoKey(gpuDesc);
+  Require(gpuKey.deviceId == 0, "GPU TopoKey deviceId should be 0");
+  Require(gpuKey.numaNode == -1, "GPU TopoKey numaNode should be -1");
+  Require(gpuKey.loc == MemoryLocationType::GPU, "GPU TopoKey loc should be GPU");
+
+  // CPU MemoryDesc with specific NUMA node
+  MemoryDesc cpuDesc;
+  cpuDesc.deviceId = -1;
+  cpuDesc.numaNode = 1;
+  cpuDesc.loc = MemoryLocationType::CPU;
+  TopoKey cpuKey = MakeTopoKey(cpuDesc);
+  Require(cpuKey.deviceId == -1, "CPU TopoKey deviceId should be -1");
+  Require(cpuKey.numaNode == 1, "CPU TopoKey numaNode should be 1");
+  Require(cpuKey.loc == MemoryLocationType::CPU, "CPU TopoKey loc should be CPU");
+
+  // Different NUMA nodes → different TopoKeys
+  MemoryDesc cpuDesc2;
+  cpuDesc2.deviceId = -1;
+  cpuDesc2.numaNode = 0;
+  cpuDesc2.loc = MemoryLocationType::CPU;
+  TopoKey cpuKey2 = MakeTopoKey(cpuDesc2);
+  Require(!(cpuKey == cpuKey2), "TopoKeys with different numaNode should not be equal");
+
+  // Same NUMA node → equal TopoKeys
+  MemoryDesc cpuDesc3;
+  cpuDesc3.deviceId = -1;
+  cpuDesc3.numaNode = 1;
+  cpuDesc3.loc = MemoryLocationType::CPU;
+  TopoKey cpuKey3 = MakeTopoKey(cpuDesc3);
+  Require(cpuKey == cpuKey3, "TopoKeys with same numaNode should be equal");
+}
+
+void CaseMemDescNumaNode() {
+  // Default numaNode is -1
+  MemoryDesc desc;
+  Require(desc.numaNode == -1, "Default numaNode should be -1");
+
+  // numaNode participates in equality
+  MemoryDesc a;
+  a.engineKey = "test";
+  a.id = 1;
+  a.deviceId = -1;
+  a.numaNode = 0;
+  a.loc = MemoryLocationType::CPU;
+
+  MemoryDesc b = a;
+  Require(a == b, "Identical MemoryDescs should be equal");
+
+  b.numaNode = 1;
+  Require(!(a == b), "MemoryDescs with different numaNode should not be equal");
+
+  // msgpack round-trip preserves numaNode
+  msgpack::sbuffer buf;
+  msgpack::pack(buf, a);
+  auto oh = msgpack::unpack(buf.data(), buf.size());
+  MemoryDesc unpacked = oh.get().as<MemoryDesc>();
+  Require(unpacked.numaNode == a.numaNode,
+          "numaNode should survive msgpack round-trip, got " + std::to_string(unpacked.numaNode));
+  Require(unpacked == a, "MemoryDesc should be equal after msgpack round-trip");
+}
+
+void CaseTopoKeyHashDistinguishesNuma() {
+  // TopoKeys with different numaNode should hash differently
+  TopoKey k1{-1, 0, MemoryLocationType::CPU};
+  TopoKey k2{-1, 1, MemoryLocationType::CPU};
+
+  Require(!(k1 == k2), "TopoKeys with different numaNode should not be equal");
+
+  std::hash<TopoKey> h;
+  Require(h(k1) != h(k2),
+          "TopoKeys with different numaNode should hash differently (probabilistic)");
+
+  // Same numaNode → equal and same hash
+  TopoKey k3{-1, 0, MemoryLocationType::CPU};
+  Require(k1 == k3, "Identical TopoKeys should be equal");
+  Require(h(k1) == h(k3), "Identical TopoKeys should hash identically");
+
+  // TopoKeyPair: different NUMA nodes yield different pairs
+  TopoKeyPair p1{k1, k1};
+  TopoKeyPair p2{k2, k1};
+  Require(!(p1 == p2), "TopoKeyPairs with different local numaNode should not be equal");
+
+  std::hash<TopoKeyPair> hp;
+  Require(hp(p1) != hp(p2),
+          "TopoKeyPairs with different local numaNode should hash differently (probabilistic)");
+}
+
 struct TestCase {
   const char* name;
   std::function<void()> run;
@@ -789,6 +882,9 @@ int main(int argc, char* argv[]) {
       {"xgmi_hidden_device_split_visibility", CaseXgmiHiddenDeviceSplitVisibility},
       {"xgmi_inbound_notification_is_unsupported", CaseXgmiInboundNotificationIsUnsupported},
       {"xgmi_concurrent_wait_and_poll_is_safe", CaseXgmiConcurrentWaitAndPollIsSafe},
+      {"make_topo_key", CaseMakeTopoKey},
+      {"mem_desc_numa_node", CaseMemDescNumaNode},
+      {"topo_key_hash_distinguishes_numa", CaseTopoKeyHashDistinguishesNuma},
   };
 
   int passed = 0;

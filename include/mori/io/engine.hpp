@@ -115,11 +115,14 @@ class IOEngine {
     MemoryLocationType remoteLoc;
     int localDeviceId;
     int remoteDeviceId;
+    int localNumaNode{-1};
+    int remoteNumaNode{-1};
 
     bool operator==(const RouteCacheKey& rhs) const noexcept {
       return remoteEngineKey == rhs.remoteEngineKey && localLoc == rhs.localLoc &&
              remoteLoc == rhs.remoteLoc && localDeviceId == rhs.localDeviceId &&
-             remoteDeviceId == rhs.remoteDeviceId;
+             remoteDeviceId == rhs.remoteDeviceId && localNumaNode == rhs.localNumaNode &&
+             remoteNumaNode == rhs.remoteNumaNode;
     }
   };
 
@@ -134,6 +137,8 @@ class IOEngine {
       hashCombine(seed, std::hash<int>{}(static_cast<int>(key.remoteLoc)));
       hashCombine(seed, std::hash<int>{}(key.localDeviceId));
       hashCombine(seed, std::hash<int>{}(key.remoteDeviceId));
+      hashCombine(seed, std::hash<int>{}(key.localNumaNode));
+      hashCombine(seed, std::hash<int>{}(key.remoteNumaNode));
       return seed;
     }
   };

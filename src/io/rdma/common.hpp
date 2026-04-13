@@ -40,14 +40,19 @@ namespace io {
 /* ---------------------------------------------------------------------------------------------- */
 struct TopoKey {
   int deviceId;
+  int numaNode{-1};
   MemoryLocationType loc;
 
   bool operator==(const TopoKey& rhs) const noexcept {
-    return (deviceId == rhs.deviceId) && (loc == rhs.loc);
+    return (deviceId == rhs.deviceId) && (numaNode == rhs.numaNode) && (loc == rhs.loc);
   }
 
-  MSGPACK_DEFINE(deviceId, loc);
+  MSGPACK_DEFINE(deviceId, numaNode, loc);
 };
+
+inline TopoKey MakeTopoKey(const MemoryDesc& desc) {
+  return TopoKey{desc.deviceId, desc.numaNode, desc.loc};
+}
 
 struct TopoKeyPair {
   TopoKey local;
@@ -78,7 +83,9 @@ struct hash<mori::io::TopoKey> {
   std::size_t operator()(const mori::io::TopoKey& k) const noexcept {
     std::size_t h1 = std::hash<uint32_t>{}(k.deviceId);
     std::size_t h2 = std::hash<uint32_t>{}(static_cast<uint32_t>(k.loc));
-    return h1 ^ (h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));
+    std::size_t h3 = std::hash<int>{}(k.numaNode);
+    std::size_t seed = h1 ^ (h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));
+    return seed ^ (h3 + 0x9e3779b9 + (seed << 6) + (seed >> 2));
   }
 };
 

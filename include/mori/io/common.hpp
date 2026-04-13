@@ -94,6 +94,7 @@ struct MemoryDesc {
   EngineKey engineKey;
   MemoryUniqueId id{0};
   int deviceId{-1};
+  int numaNode{-1};
   std::string deviceBusId;
   uintptr_t data{0};
   size_t size{0};
@@ -102,11 +103,11 @@ struct MemoryDesc {
 
   constexpr bool operator==(const MemoryDesc& rhs) const noexcept {
     return (engineKey == rhs.engineKey) && (id == rhs.id) && (deviceId == rhs.deviceId) &&
-           (deviceBusId == rhs.deviceBusId) && (data == rhs.data) && (size == rhs.size) &&
-           (loc == rhs.loc);
+           (numaNode == rhs.numaNode) && (deviceBusId == rhs.deviceBusId) && (data == rhs.data) &&
+           (size == rhs.size) && (loc == rhs.loc);
   }
 
-  MSGPACK_DEFINE(engineKey, id, deviceId, deviceBusId, data, size, loc, ipcHandle);
+  MSGPACK_DEFINE(engineKey, id, deviceId, numaNode, deviceBusId, data, size, loc, ipcHandle);
 };
 
 using TransferUniqueId = uint64_t;

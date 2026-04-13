@@ -132,5 +132,40 @@ std::vector<std::string> TopoSystem::MatchAllGpusAndNics() {
   return matches;
 }
 
+std::vector<TopoSystem::RankedNic> TopoSystem::RankNicsForCpuNuma(int numaNode) {
+  auto nics = net->GetNics();
+  std::vector<RankedNic> ranked;
+  ranked.reserve(nics.size());
+
+  for (auto* nic : nics) {
+    RankedNic r;
+    r.name = nic->name;
+    r.busId = nic->busId;
+    r.totalGbps = nic->totalGbps;
+
+    TopoNodePci* nicPci = pci->Node(nic->busId);
+    r.nicNumaNode = nicPci ? nicPci->NumaNode() : -1;
+
+    ranked.push_back(r);
+  }
+
+  // Sort: same-NUMA first → higher bandwidth → stable name.
+  // NOTE: PCI-path hops are not used here because CPU NUMA nodes don't have a
+  // PCI bus ID to compute paths from. Within the same NUMA node, bandwidth and
+  // name provide a stable deterministic ordering.
+  std::sort(ranked.begin(), ranked.end(),
+            [numaNode](const RankedNic& a, const RankedNic& b) -> bool {
+              if (numaNode >= 0) {
+                bool aSame = (a.nicNumaNode == numaNode);
+                bool bSame = (b.nicNumaNode == numaNode);
+                if (aSame != bSame) return aSame;
+              }
+              if (a.totalGbps != b.totalGbps) return a.totalGbps > b.totalGbps;
+              return a.name < b.name;
+            });
+
+  return ranked;
+}
+
 }  // namespace application
 }  // namespace mori

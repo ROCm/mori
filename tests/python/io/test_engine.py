@@ -253,6 +253,32 @@ def test_mem_desc():
     assert mem_desc == unpacked_desc
 
 
+def test_mem_desc_numa_node():
+    config = IOEngineConfig(
+        host="127.0.0.1",
+        port=get_free_port(),
+    )
+    engine = IOEngine(key="engine_numa", config=config)
+    engine.create_backend(BackendType.RDMA)
+
+    # CPU tensor should have numa_node >= -1
+    cpu_tensor = torch.ones([64])
+    cpu_desc = engine.register_torch_tensor(cpu_tensor)
+    assert cpu_desc.numa_node >= -1
+
+    # GPU tensor should have numa_node == -1
+    device = torch.device("cuda", 0)
+    gpu_tensor = torch.ones([64]).to(device)
+    gpu_desc = engine.register_torch_tensor(gpu_tensor)
+    assert gpu_desc.numa_node == -1
+
+    # Verify numa_node survives msgpack round-trip
+    packed = cpu_desc.pack()
+    unpacked = MemoryDesc.unpack(packed)
+    assert unpacked.numa_node == cpu_desc.numa_node
+    assert cpu_desc == unpacked
+
+
 def wait_status(status):
     while status.InProgress():
         pass

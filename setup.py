@@ -53,6 +53,11 @@ _REQUIRED_HEADERS = [
         ("libibverbs-dev", "rdma-core-devel"),
         "InfiniBand verbs headers (needed for RDMA transport)",
     ),
+    (
+        ["/usr/include/numaif.h"],
+        ("libnuma-dev", "numactl-devel"),
+        "NUMA policy headers (needed for NUMA-aware NIC selection)",
+    ),
 ]
 
 
