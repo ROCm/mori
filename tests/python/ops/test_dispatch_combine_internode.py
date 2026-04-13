@@ -19,7 +19,6 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-import os
 import pytest
 import mori
 from tests.python.ops.dispatch_combine_test_utils import (
@@ -27,10 +26,7 @@ from tests.python.ops.dispatch_combine_test_utils import (
     _is_fp4x2_dtype,
     EpDispatchCombineTestCase,
     assert_worker_results,
-    start_torch_dist_process_manager,
 )
-
-os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "6G")
 
 
 class InterNodeDispatchCombineTestCase(EpDispatchCombineTestCase):
@@ -64,13 +60,6 @@ class InterNodeDispatchCombineTestCase(EpDispatchCombineTestCase):
 
         op.combine(dispatch_output, dispatch_weights, dispatch_indices, call_reset=True)
         self.sync()
-
-
-@pytest.fixture(scope="session")
-def torch_dist_process_manager():
-    manager = start_torch_dist_process_manager(world_size=8, disable_p2p=True)
-    yield manager
-    manager.shutdown()
 
 
 def _test_dispatch_combine(

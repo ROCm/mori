@@ -19,7 +19,6 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-import os
 import pytest
 import torch
 import mori
@@ -29,10 +28,7 @@ from tests.python.ops.dispatch_combine_test_utils import (
     EpDispatchCombineTestCase,
     assert_worker_results,
     run_ep_dispatch_combine_test,
-    start_torch_dist_process_manager,
 )
-
-os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "32G")
 
 # Kernel-type string → (EpDispatchCombineKernelType, block_num, rdma_block_num, warp_num_per_block)
 _KERNEL_CONFIGS = {
@@ -49,13 +45,6 @@ _KERNEL_CONFIGS = {
         8,  # warp_num_per_block
     ),
 }
-
-
-@pytest.fixture(scope="session")
-def torch_dist_process_manager():
-    manager = start_torch_dist_process_manager(world_size=8, disable_p2p=True)
-    yield manager
-    manager.shutdown()
 
 
 def _make_internode_v1_config(

@@ -19,9 +19,8 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-import os
-
 import mori
+import os
 import pytest
 import torch
 from tests.python.ops.dispatch_combine_test_utils import (
@@ -30,10 +29,7 @@ from tests.python.ops.dispatch_combine_test_utils import (
     EpDispatchCombineTestCase,
     assert_worker_results,
     run_ep_dispatch_combine_test,
-    start_torch_dist_process_manager,
 )
-
-os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "32G")
 
 
 class AsyncLLDispatchCombineTestCase(EpDispatchCombineTestCase):
@@ -85,13 +81,6 @@ class AsyncLLDispatchCombineTestCase(EpDispatchCombineTestCase):
             self.check_combine_result(op, test_data, combine_output, None)
 
 
-@pytest.fixture(scope="session")
-def torch_dist_process_manager():
-    manager = start_torch_dist_process_manager(world_size=8)
-    yield manager
-    manager.shutdown()
-
-
 def _make_asyncll_config(
     rank,
     world_size,
@@ -141,27 +130,31 @@ def _test_dispatch_combine(
     num_token_override=None,
     check_results=True,
 ):
-    config = _make_asyncll_config(
-        rank=rank,
-        world_size=world_size,
-        data_type=data_type,
-        hidden_dim=hidden_dim,
-        max_num_inp_token_per_rank=max_num_inp_token_per_rank,
-        num_experts_per_rank=num_experts_per_rank,
-        num_experts_per_token=num_experts_per_token,
-        scale_dim=scale_dim,
-        scale_type_size=scale_type_size,
-        quant_type=quant_type,
-        max_total_recv_tokens=max_total_recv_tokens,
-    )
-    run_ep_dispatch_combine_test(
-        config,
-        AsyncLLDispatchCombineTestCase,
-        use_max_token_num=use_max_token_num,
-        routing=routing,
-        num_token_override=num_token_override,
-        check_results=check_results,
-    )
+    os.environ["MORI_DISABLE_P2P"] = "1"
+    try:
+        config = _make_asyncll_config(
+            rank=rank,
+            world_size=world_size,
+            data_type=data_type,
+            hidden_dim=hidden_dim,
+            max_num_inp_token_per_rank=max_num_inp_token_per_rank,
+            num_experts_per_rank=num_experts_per_rank,
+            num_experts_per_token=num_experts_per_token,
+            scale_dim=scale_dim,
+            scale_type_size=scale_type_size,
+            quant_type=quant_type,
+            max_total_recv_tokens=max_total_recv_tokens,
+        )
+        run_ep_dispatch_combine_test(
+            config,
+            AsyncLLDispatchCombineTestCase,
+            use_max_token_num=use_max_token_num,
+            routing=routing,
+            num_token_override=num_token_override,
+            check_results=check_results,
+        )
+    finally:
+        os.environ.pop("MORI_DISABLE_P2P", None)
 
 
 def _test_dispatch_combine_multi_iteration(
@@ -178,26 +171,30 @@ def _test_dispatch_combine_multi_iteration(
     quant_type="none",
     routing="round_robin",
 ):
-    config = _make_asyncll_config(
-        rank=rank,
-        world_size=world_size,
-        data_type=data_type,
-        hidden_dim=hidden_dim,
-        max_num_inp_token_per_rank=max_num_inp_token_per_rank,
-        num_experts_per_rank=num_experts_per_rank,
-        num_experts_per_token=num_experts_per_token,
-        scale_dim=scale_dim,
-        scale_type_size=scale_type_size,
-        quant_type=quant_type,
-    )
-    op = mori.ops.EpDispatchCombineOp(config)
-    test_case = AsyncLLDispatchCombineTestCase(config)
-
-    for num_token_override in num_token_patterns:
-        test_data = test_case.gen_test_data(
-            routing=routing, num_token_override=num_token_override
+    os.environ["MORI_DISABLE_P2P"] = "1"
+    try:
+        config = _make_asyncll_config(
+            rank=rank,
+            world_size=world_size,
+            data_type=data_type,
+            hidden_dim=hidden_dim,
+            max_num_inp_token_per_rank=max_num_inp_token_per_rank,
+            num_experts_per_rank=num_experts_per_rank,
+            num_experts_per_token=num_experts_per_token,
+            scale_dim=scale_dim,
+            scale_type_size=scale_type_size,
+            quant_type=quant_type,
         )
-        test_case.run_test_once(op, test_data)
+        op = mori.ops.EpDispatchCombineOp(config)
+        test_case = AsyncLLDispatchCombineTestCase(config)
+
+        for num_token_override in num_token_patterns:
+            test_data = test_case.gen_test_data(
+                routing=routing, num_token_override=num_token_override
+            )
+            test_case.run_test_once(op, test_data)
+    finally:
+        os.environ.pop("MORI_DISABLE_P2P", None)
 
 
 @pytest.mark.parametrize("world_size", (8,))
