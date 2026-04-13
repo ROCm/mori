@@ -8,9 +8,7 @@
 #include "mori/application/utils/check.hpp"
 #include "mori/shmem/shmem_api.hpp"
 
-using namespace mori::shmem;
-
-namespace mori::perftest {
+namespace mori::shmem::perftest {
 
 void PrintUsage(const char* program) {
   std::fprintf(
@@ -213,4 +211,4 @@ float RunWarmupAndTimed(PerfRes& res, size_t warmup, size_t iters, LaunchFn laun
   return ms;
 }
 
-}  // namespace mori::perftest
+}  // namespace mori::shmem::perftest

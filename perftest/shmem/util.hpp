@@ -35,7 +35,7 @@
 
 #include "hip/hip_runtime.h"
 
-namespace mori::perftest {
+namespace mori::shmem::perftest {
 
 enum class PutScope { kThread, kWarp, kBlock };
 
@@ -89,6 +89,13 @@ struct PerfRes {
 void PerfResAlloc(PerfRes* res);
 void PerfResFree(PerfRes* res);
 float RunWarmupAndTimed(PerfRes& res, size_t warmup, size_t iters, LaunchFn launch);
+
+// Returns latency benchmark block thread count based on scope.
+inline int LatencyBlockThreads(PutScope scope, int threads_per_block, int device_warp_size) {
+  if (scope == PutScope::kWarp) return device_warp_size;
+  if (scope == PutScope::kBlock) return threads_per_block;
+  return 1;
+}
 
 int ParseArgs(int argc, char** argv, PerfArgs* out_args);
 void PrintUsage(const char* program);
@@ -148,4 +155,19 @@ inline bool size_ok(PutScope scope, size_t size_bytes, int nblocks, int threads_
   return true;
 }
 
-}  // namespace mori::perftest
+inline bool latency_size_ok(PutScope scope, size_t len_doubles, int threads_per_block,
+                            int device_warp_size) {
+  if (len_doubles == 0) {
+    return false;
+  }
+  if (scope == PutScope::kThread || scope == PutScope::kWarp) {
+    return true;
+  }
+  if (threads_per_block % device_warp_size != 0) {
+    return false;
+  }
+  const int nw = threads_per_block / device_warp_size;
+  return len_doubles % static_cast<size_t>(nw) == 0;
+}
+
+}  // namespace mori::shmem::perftest

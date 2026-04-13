@@ -28,10 +28,10 @@
 
 #include "mori/shmem/shmem.hpp"
 
-namespace mori::perftest {
+namespace mori::shmem::perftest {
 
 // Intra-block linear thread index.
-__device__ inline int bw_tid() {
+__device__ inline int linear_tid() {
   return threadIdx.x * blockDim.y * blockDim.z + threadIdx.y * blockDim.z + threadIdx.z;
 }
 
@@ -51,7 +51,7 @@ __device__ inline void bw_cross_block_barrier_round(volatile unsigned int* count
   // threads are still posting NBI operations, making the barrier count meaningless.
   __syncthreads();
 
-  if (!bw_tid()) {
+  if (!linear_tid()) {
     // __threadfence() — inter-CU memory ordering fence.
     // After __syncthreads() above, all NBI ops from this block are issued.
     // This fence ensures those writes are globally visible to every CU before
@@ -87,7 +87,7 @@ __device__ inline void bw_final_barrier_and_quiet(volatile unsigned int* counter
   // wait for all threads in this block to finish issuing their last NBI ops.
   __syncthreads();
 
-  if (!bw_tid()) {
+  if (!linear_tid()) {
     // __threadfence() — same role: make this block's NBI writes globally
     // visible before counting arrival.
     __threadfence();
@@ -118,4 +118,4 @@ __device__ inline void bw_final_barrier_and_quiet(volatile unsigned int* counter
   __syncthreads();
 }
 
-}  // namespace mori::perftest
+}  // namespace mori::shmem::perftest

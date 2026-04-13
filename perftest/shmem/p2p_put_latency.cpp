@@ -26,22 +26,15 @@
 #include <cstdlib>
 #include <vector>
 
+#include "device_utils.hpp"
 #include "hip/hip_runtime.h"
 #include "mori/application/utils/check.hpp"
 #include "mori/shmem/shmem.hpp"
 #include "util.hpp"
 
-using namespace mori::application;
-using namespace mori::shmem;
-using namespace mori::perftest;
+namespace mori::shmem::perftest {
 
-namespace {
-
-__device__ inline int lat_tid() {
-  return threadIdx.x * blockDim.y * blockDim.z + threadIdx.y * blockDim.z + threadIdx.z;
-}
-
-// NVSHMEM latency_kern: single thread, put_nbi + quiet each iteration.
+// Thread-scope put: single thread issues put_nbi + quiet each iteration.
 __global__ void lat_thread(double* data_d, size_t len_doubles, int pe, int iter) {
   if (blockIdx.x != 0 || threadIdx.x != 0) {
     return;
@@ -53,12 +46,12 @@ __global__ void lat_thread(double* data_d, size_t len_doubles, int pe, int iter)
   }
 }
 
-// NVSHMEM latency_kern_warp: cooperative warp put; leader quiet.
+// Warp-scope put: cooperative warp issues put_nbi; leader calls quiet.
 __global__ void lat_warp(double* data_d, size_t len_doubles, int pe, int iter) {
   if (blockIdx.x != 0) {
     return;
   }
-  const int tid = lat_tid();
+  const int tid = linear_tid();
   const int peer = !pe;
   for (int i = 0; i < iter; i++) {
     ShmemPutMemNbiWarp(data_d, data_d, len_doubles * sizeof(double), peer, kDefaultQpId);
@@ -70,12 +63,12 @@ __global__ void lat_warp(double* data_d, size_t len_doubles, int pe, int iter) {
   }
 }
 
-// NVSHMEM latency_kern_block: cooperative block put; leader quiet.
+// Block-scope put: cooperative block issues put_nbi; leader calls quiet.
 __global__ void lat_block(double* data_d, size_t len_doubles, int pe, int iter) {
   if (blockIdx.x != 0) {
     return;
   }
-  const int tid = lat_tid();
+  const int tid = linear_tid();
   const int peer = !pe;
   for (int i = 0; i < iter; i++) {
     ShmemPutMemNbiBlock(data_d, data_d, len_doubles * sizeof(double), peer, kDefaultQpId);
@@ -87,20 +80,6 @@ __global__ void lat_block(double* data_d, size_t len_doubles, int pe, int iter) 
   }
 }
 
-bool latency_size_ok(PutScope scope, size_t len_doubles, int threads_per_block,
-                     int device_warp_size) {
-  if (len_doubles == 0) {
-    return false;
-  }
-  if (scope == PutScope::kThread || scope == PutScope::kWarp) {
-    return true;
-  }
-  if (threads_per_block % device_warp_size != 0) {
-    return false;
-  }
-  const int nw = threads_per_block / device_warp_size;
-  return len_doubles % static_cast<size_t>(nw) == 0;
-}
 
 void launch_latency(PutScope scope, double* data_d, size_t len_doubles, int my_pe, int count,
                     int threads_per_block, int device_warp_size) {
@@ -119,7 +98,7 @@ void launch_latency(PutScope scope, double* data_d, size_t len_doubles, int my_p
   }
 }
 
-}  // namespace
+}  // namespace mori::shmem::perftest
 
 int main(int argc, char** argv) {
 #ifndef MORI_WITH_MPI
@@ -128,6 +107,10 @@ int main(int argc, char** argv) {
       "mori_shmem_put_latency requires MORI_WITH_MPI (enable WITH_MPI / BUILD_EXAMPLES).\n");
   return 1;
 #else
+
+  using namespace mori::application;
+  using namespace mori::shmem;
+  using namespace mori::shmem::perftest;
 
   PerfContext ctx{};
   const int init_rc = PerfInit(argc, argv, &ctx);
@@ -217,12 +200,7 @@ int main(int argc, char** argv) {
   }
 
   if (my_pe == 0) {
-    int block_threads = 1;
-    if (phase == PutScope::kWarp) {
-      block_threads = device_warp_size;
-    } else if (phase == PutScope::kBlock) {
-      block_threads = args.threads_per_block;
-    }
+    const int block_threads = LatencyBlockThreads(phase, args.threads_per_block, device_warp_size);
     PrintPerfTable("shmem_put_latency_uni", ScopeToChar(phase), 1, block_threads, device_warp_size,
                    args.iters, args.warmup, PerfTableMetric::kLatencyUs, lat_table);
   }

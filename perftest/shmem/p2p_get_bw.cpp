@@ -33,11 +33,7 @@
 #include "mori/shmem/shmem.hpp"
 #include "util.hpp"
 
-using namespace mori::application;
-using namespace mori::shmem;
-using namespace mori::perftest;
-
-namespace {
+namespace mori::shmem::perftest {
 
 // Block-scope get: each block cooperatively gets its slice from the peer.
 __global__ void bw_block(double* data_d, volatile unsigned int* counter_d, size_t len, int pe,
@@ -62,7 +58,7 @@ __global__ void bw_warp(double* data_d, volatile unsigned int* counter_d, size_t
                         int iter) {
   int bid = blockIdx.x;
   int nblocks = gridDim.x;
-  const int tid = bw_tid();
+  const int tid = linear_tid();
   int nwarps_per_block = (blockDim.x * blockDim.y * blockDim.z) / warpSize;
   int warpid = tid / warpSize;
   const int peer = !pe;
@@ -85,7 +81,7 @@ __global__ void bw_thread(double* data_d, volatile unsigned int* counter_d, size
                           int iter) {
   int bid = blockIdx.x;
   int nblocks = gridDim.x;
-  const int tid = bw_tid();
+  const int tid = linear_tid();
   int nthreads = blockDim.x * blockDim.y * blockDim.z;
   const int peer = !pe;
 
@@ -118,7 +114,7 @@ void launch_bw(PutScope scope, dim3 grid, dim3 block, double* data_d, unsigned i
   }
 }
 
-}  // namespace
+}  // namespace mori::shmem::perftest
 
 int main(int argc, char** argv) {
 #ifndef MORI_WITH_MPI
@@ -126,6 +122,10 @@ int main(int argc, char** argv) {
                "mori_shmem_get_bw requires MORI_WITH_MPI (enable WITH_MPI / BUILD_EXAMPLES).\n");
   return 1;
 #else
+
+  using namespace mori::application;
+  using namespace mori::shmem;
+  using namespace mori::shmem::perftest;
 
   PerfContext ctx{};
   const int init_rc = PerfInit(argc, argv, &ctx);
