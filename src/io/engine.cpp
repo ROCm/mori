@@ -24,6 +24,7 @@
 #include <hip/hip_runtime_api.h>
 #include <unistd.h>
 
+#include <cctype>
 #include <cstdlib>
 
 #include "mori/io/env.hpp"
@@ -47,7 +48,11 @@ std::string QueryDeviceBusId(int deviceId) {
     MORI_IO_WARN("Failed to query PCI bus id for device {}: {}", deviceId, hipGetErrorString(err));
     return "";
   }
-  return std::string(busId);
+  std::string result(busId);
+  for (auto& c : result) {
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
+  return result;
 }
 
 }  // namespace

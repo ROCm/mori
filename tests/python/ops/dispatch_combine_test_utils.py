@@ -138,9 +138,16 @@ class EpDispatchCombineTestCase:
         torch.cuda.synchronize()
         dist.barrier()
 
-    def gen_test_data(self, use_max_token_num=False, routing="random"):
+    def gen_test_data(
+        self, use_max_token_num=False, routing="random", num_token_override=None
+    ):
         """Generate test data."""
-        if use_max_token_num:
+        if num_token_override is not None:
+            assert len(num_token_override) == self.config.world_size
+            assert min(num_token_override) >= 0
+            assert max(num_token_override) <= self.config.max_num_inp_token_per_rank
+            num_token = torch.tensor(num_token_override, device=self.device)
+        elif use_max_token_num:
             num_token = torch.tensor(
                 [
                     self.config.max_num_inp_token_per_rank
@@ -377,7 +384,7 @@ class EpDispatchCombineTestCase:
                     )
                 assert weight_match
 
-    def run_test_once(self, op, test_data):
+    def run_test_once(self, op, test_data, check_results=True):
         (
             _,
             all_rank_indices,
@@ -398,15 +405,16 @@ class EpDispatchCombineTestCase:
             all_rank_indices[self.config.rank],
         )
         self.sync()
-        self.check_dispatch_result(
-            op,
-            test_data,
-            dispatch_output,
-            dispatch_weights,
-            dispatch_scales,
-            dispatch_indices,
-            dispatch_recv_num_token,
-        )
+        if check_results:
+            self.check_dispatch_result(
+                op,
+                test_data,
+                dispatch_output,
+                dispatch_weights,
+                dispatch_scales,
+                dispatch_indices,
+                dispatch_recv_num_token,
+            )
 
         total_recv_num_token = dispatch_recv_num_token[0].item()
         if not self.config.use_external_inp_buf:
@@ -420,11 +428,19 @@ class EpDispatchCombineTestCase:
             dispatch_output, dispatch_weights, dispatch_indices, call_reset=False
         )
         self.sync()
-        self.check_combine_result(op, test_data, combine_output, combine_output_weight)
+        if check_results:
+            self.check_combine_result(
+                op, test_data, combine_output, combine_output_weight
+            )
 
 
 def run_ep_dispatch_combine_test(
-    config, test_case_cls, use_max_token_num=False, routing=None
+    config,
+    test_case_cls,
+    use_max_token_num=False,
+    routing=None,
+    num_token_override=None,
+    check_results=True,
 ):
     op = mori.ops.EpDispatchCombineOp(config)
     test_case = test_case_cls(config)
@@ -433,5 +449,7 @@ def run_ep_dispatch_combine_test(
         gen_kwargs["use_max_token_num"] = True
     if routing is not None:
         gen_kwargs["routing"] = routing
+    if num_token_override is not None:
+        gen_kwargs["num_token_override"] = num_token_override
     test_data = test_case.gen_test_data(**gen_kwargs)
-    test_case.run_test_once(op, test_data)
+    test_case.run_test_once(op, test_data, check_results=check_results)

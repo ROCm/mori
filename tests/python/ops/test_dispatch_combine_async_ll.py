@@ -19,9 +19,8 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-import os
-
 import mori
+import os
 import pytest
 import torch
 from tests.python.ops.dispatch_combine_test_utils import (
@@ -30,14 +29,11 @@ from tests.python.ops.dispatch_combine_test_utils import (
     EpDispatchCombineTestCase,
     assert_worker_results,
     run_ep_dispatch_combine_test,
-    start_torch_dist_process_manager,
 )
-
-os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "6G")
 
 
 class AsyncLLDispatchCombineTestCase(EpDispatchCombineTestCase):
-    def run_test_once(self, op, test_data):
+    def run_test_once(self, op, test_data, check_results=True):
         (
             _,
             all_rank_indices,
@@ -60,15 +56,16 @@ class AsyncLLDispatchCombineTestCase(EpDispatchCombineTestCase):
         op.dispatch_recv()
 
         self.sync()
-        self.check_dispatch_result(
-            op,
-            test_data,
-            dispatch_output,
-            dispatch_weights,
-            dispatch_scales,
-            dispatch_indices,
-            dispatch_recv_num_token,
-        )
+        if check_results:
+            self.check_dispatch_result(
+                op,
+                test_data,
+                dispatch_output,
+                dispatch_weights,
+                dispatch_scales,
+                dispatch_indices,
+                dispatch_recv_num_token,
+            )
 
         # AsyncLL combine weight reconstruction is not exercised in the
         # reference example yet, so validate token reconstruction only.
@@ -80,14 +77,8 @@ class AsyncLLDispatchCombineTestCase(EpDispatchCombineTestCase):
         op.combine_recv()
 
         self.sync()
-        self.check_combine_result(op, test_data, combine_output, None)
-
-
-@pytest.fixture(scope="session")
-def torch_dist_process_manager():
-    manager = start_torch_dist_process_manager(world_size=8)
-    yield manager
-    manager.shutdown()
+        if check_results:
+            self.check_combine_result(op, test_data, combine_output, None)
 
 
 def _make_asyncll_config(
@@ -136,26 +127,74 @@ def _test_dispatch_combine(
     max_total_recv_tokens=0,
     routing=None,
     use_max_token_num=False,
+    num_token_override=None,
+    check_results=True,
 ):
-    config = _make_asyncll_config(
-        rank=rank,
-        world_size=world_size,
-        data_type=data_type,
-        hidden_dim=hidden_dim,
-        max_num_inp_token_per_rank=max_num_inp_token_per_rank,
-        num_experts_per_rank=num_experts_per_rank,
-        num_experts_per_token=num_experts_per_token,
-        scale_dim=scale_dim,
-        scale_type_size=scale_type_size,
-        quant_type=quant_type,
-        max_total_recv_tokens=max_total_recv_tokens,
-    )
-    run_ep_dispatch_combine_test(
-        config,
-        AsyncLLDispatchCombineTestCase,
-        use_max_token_num=use_max_token_num,
-        routing=routing,
-    )
+    os.environ["MORI_DISABLE_P2P"] = "1"
+    try:
+        config = _make_asyncll_config(
+            rank=rank,
+            world_size=world_size,
+            data_type=data_type,
+            hidden_dim=hidden_dim,
+            max_num_inp_token_per_rank=max_num_inp_token_per_rank,
+            num_experts_per_rank=num_experts_per_rank,
+            num_experts_per_token=num_experts_per_token,
+            scale_dim=scale_dim,
+            scale_type_size=scale_type_size,
+            quant_type=quant_type,
+            max_total_recv_tokens=max_total_recv_tokens,
+        )
+        run_ep_dispatch_combine_test(
+            config,
+            AsyncLLDispatchCombineTestCase,
+            use_max_token_num=use_max_token_num,
+            routing=routing,
+            num_token_override=num_token_override,
+            check_results=check_results,
+        )
+    finally:
+        os.environ.pop("MORI_DISABLE_P2P", None)
+
+
+def _test_dispatch_combine_multi_iteration(
+    rank,
+    world_size,
+    data_type,
+    hidden_dim,
+    max_num_inp_token_per_rank,
+    num_experts_per_rank,
+    num_experts_per_token,
+    num_token_patterns,
+    scale_dim=0,
+    scale_type_size=1,
+    quant_type="none",
+    routing="round_robin",
+):
+    os.environ["MORI_DISABLE_P2P"] = "1"
+    try:
+        config = _make_asyncll_config(
+            rank=rank,
+            world_size=world_size,
+            data_type=data_type,
+            hidden_dim=hidden_dim,
+            max_num_inp_token_per_rank=max_num_inp_token_per_rank,
+            num_experts_per_rank=num_experts_per_rank,
+            num_experts_per_token=num_experts_per_token,
+            scale_dim=scale_dim,
+            scale_type_size=scale_type_size,
+            quant_type=quant_type,
+        )
+        op = mori.ops.EpDispatchCombineOp(config)
+        test_case = AsyncLLDispatchCombineTestCase(config)
+
+        for num_token_override in num_token_patterns:
+            test_data = test_case.gen_test_data(
+                routing=routing, num_token_override=num_token_override
+            )
+            test_case.run_test_once(op, test_data)
+    finally:
+        os.environ.pop("MORI_DISABLE_P2P", None)
 
 
 @pytest.mark.parametrize("world_size", (8,))
@@ -196,6 +235,51 @@ def test_dispatch_combine(
                     scale_dim,
                     scale_type_size,
                     quant_type,
+                ],
+            )
+        )
+
+    assert_worker_results(torch_dist_process_manager, world_size)
+
+
+@pytest.mark.parametrize("world_size", (8,))
+@pytest.mark.parametrize("data_type", _all_data_types())
+@pytest.mark.parametrize("hidden_dim", (4096,))
+@pytest.mark.parametrize("num_experts_per_rank", (32,))
+@pytest.mark.parametrize("num_experts_per_token", (8,))
+def test_dispatch_combine_some_ranks_have_no_tokens_multi_iteration(
+    torch_dist_process_manager,
+    world_size,
+    data_type,
+    hidden_dim,
+    num_experts_per_rank,
+    num_experts_per_token,
+):
+    num_token_patterns = [
+        [4, 0, 3, 0, 2, 0, 1, 0],
+        [0, 5, 0, 4, 0, 3, 0, 2],
+        [6, 1, 0, 0, 5, 0, 0, 2],
+        [0, 0, 7, 1, 0, 0, 4, 3],
+    ]
+    max_num_inp_token_per_rank = max(max(pattern) for pattern in num_token_patterns)
+    routing = "round_robin"
+
+    for _ in range(world_size):
+        torch_dist_process_manager.task_queue.put(
+            (
+                _test_dispatch_combine_multi_iteration,
+                [
+                    world_size,
+                    data_type,
+                    hidden_dim,
+                    max_num_inp_token_per_rank,
+                    num_experts_per_rank,
+                    num_experts_per_token,
+                    num_token_patterns,
+                    0,  # scale_dim
+                    1,  # scale_type_size
+                    "none",  # quant_type
+                    routing,
                 ],
             )
         )

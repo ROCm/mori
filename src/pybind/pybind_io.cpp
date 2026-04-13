@@ -153,29 +153,34 @@ void RegisterMoriIo(pybind11::module_& m) {
       });
 
   py::class_<mori::io::IOEngineSession>(m, "IOEngineSession")
-      .def("AllocateTransferUniqueId", &mori::io ::IOEngineSession::AllocateTransferUniqueId)
-      .def("Read", &mori::io ::IOEngineSession::Read)
-      .def("BatchRead", &mori::io ::IOEngineSession::BatchRead)
-      .def("Write", &mori::io ::IOEngineSession::Write)
-      .def("BatchWrite", &mori::io ::IOEngineSession::BatchWrite)
-      .def("Alive", &mori::io ::IOEngineSession::Alive);
+      .def("AllocateTransferUniqueId", &mori::io::IOEngineSession::AllocateTransferUniqueId,
+           py::call_guard<py::gil_scoped_release>())
+      .def("Read", &mori::io::IOEngineSession::Read, py::call_guard<py::gil_scoped_release>())
+      .def("BatchRead", &mori::io::IOEngineSession::BatchRead,
+           py::call_guard<py::gil_scoped_release>())
+      .def("Write", &mori::io::IOEngineSession::Write, py::call_guard<py::gil_scoped_release>())
+      .def("BatchWrite", &mori::io::IOEngineSession::BatchWrite,
+           py::call_guard<py::gil_scoped_release>())
+      .def("Alive", &mori::io::IOEngineSession::Alive);
 
   py::class_<mori::io::IOEngine>(m, "IOEngine")
       .def(py::init<const mori::io::EngineKey&, const mori::io::IOEngineConfig&>())
-      .def("GetEngineDesc", &mori::io ::IOEngine::GetEngineDesc)
+      .def("GetEngineDesc", &mori::io::IOEngine::GetEngineDesc)
       .def("CreateBackend", &mori::io::IOEngine::CreateBackend)
-      .def("RemoveBackend", &mori::io ::IOEngine::RemoveBackend)
-      .def("RegisterRemoteEngine", &mori::io ::IOEngine::RegisterRemoteEngine)
-      .def("DeregisterRemoteEngine", &mori::io ::IOEngine::DeregisterRemoteEngine)
-      .def("RegisterMemory", &mori::io ::IOEngine::RegisterMemory)
-      .def("DeregisterMemory", &mori::io ::IOEngine::DeregisterMemory)
-      .def("AllocateTransferUniqueId", &mori::io ::IOEngine::AllocateTransferUniqueId)
-      .def("Read", &mori::io ::IOEngine::Read)
-      .def("BatchRead", &mori::io ::IOEngine::BatchRead)
-      .def("Write", &mori::io ::IOEngine::Write)
-      .def("BatchWrite", &mori::io ::IOEngine::BatchWrite)
+      .def("RemoveBackend", &mori::io::IOEngine::RemoveBackend)
+      .def("RegisterRemoteEngine", &mori::io::IOEngine::RegisterRemoteEngine)
+      .def("DeregisterRemoteEngine", &mori::io::IOEngine::DeregisterRemoteEngine)
+      .def("RegisterMemory", &mori::io::IOEngine::RegisterMemory)
+      .def("DeregisterMemory", &mori::io::IOEngine::DeregisterMemory)
+      .def("AllocateTransferUniqueId", &mori::io::IOEngine::AllocateTransferUniqueId,
+           py::call_guard<py::gil_scoped_release>())
+      .def("Read", &mori::io::IOEngine::Read, py::call_guard<py::gil_scoped_release>())
+      .def("BatchRead", &mori::io::IOEngine::BatchRead, py::call_guard<py::gil_scoped_release>())
+      .def("Write", &mori::io::IOEngine::Write, py::call_guard<py::gil_scoped_release>())
+      .def("BatchWrite", &mori::io::IOEngine::BatchWrite, py::call_guard<py::gil_scoped_release>())
       .def("CreateSession", &mori::io::IOEngine::CreateSession)
-      .def("PopInboundTransferStatus", &mori::io::IOEngine::PopInboundTransferStatus)
+      .def("PopInboundTransferStatus", &mori::io::IOEngine::PopInboundTransferStatus,
+           py::call_guard<py::gil_scoped_release>())
       .def("LoadScatterGatherModule", &mori::io::IOEngine::LoadScatterGatherModule);
 }
 

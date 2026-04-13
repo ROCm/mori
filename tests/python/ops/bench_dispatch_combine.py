@@ -187,6 +187,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         dispatch_warp_per_block,
         combine_block_num,
         combine_warp_per_block,
+        check=True,
     ):
         (
             all_rank_num_token,
@@ -211,15 +212,16 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             block_num=dispatch_block_num,
             warp_per_block=dispatch_warp_per_block,
         )
-        self.check_dispatch_result(
-            op,
-            test_data,
-            dispatch_output,
-            dispatch_weights,
-            dispatch_scales,
-            dispatch_indices,
-            dispatch_recv_num_token,
-        )
+        if check:
+            self.check_dispatch_result(
+                op,
+                test_data,
+                dispatch_output,
+                dispatch_weights,
+                dispatch_scales,
+                dispatch_indices,
+                dispatch_recv_num_token,
+            )
 
         total_recv_num_token = dispatch_recv_num_token[0].item()
 
@@ -248,12 +250,13 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             block_num=combine_block_num,
             warp_per_block=combine_warp_per_block,
         )
-        self.check_combine_result(
-            op,
-            test_data,
-            combine_output,
-            combine_data_type=self.combine_data_type,
-        )
+        if check:
+            self.check_combine_result(
+                op,
+                test_data,
+                combine_output,
+                combine_data_type=self.combine_data_type,
+            )
         self.sync()
         return total_recv_num_token
 
@@ -288,6 +291,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             dispatch_warp_per_block,
             combine_block_num,
             combine_warp_per_block,
+            check=False,
         )
 
         # Split dispatch/combine into two graphs so we can time each replay
@@ -430,8 +434,6 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         disp_avg_bytes_MB_list = []
         comb_avg_bytes_MB_list = []
 
-        test_data_list = [self.gen_test_data() for i in range(iters)]
-
         for i in range(iters):
             self.sync()
             (
@@ -445,7 +447,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
                 ll_mode_scale,
             ) = self.run_once_bench(
                 op,
-                test_data_list[i],
+                test_data,
                 dispatch_block_num,
                 dispatch_warp_per_block,
                 combine_block_num,
@@ -561,6 +563,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             dispatch_warp_per_block,
             combine_block_num,
             combine_warp_per_block,
+            check=False,
         )
         g = self._capture_e2e_graph(
             op,

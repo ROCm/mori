@@ -252,7 +252,7 @@ __device__ inline void ConvertDispatchOutputDevice(ConvertDispatchOutputArgs arg
   const int64_t maxNumTokenPerRank = config.maxNumInpTokenPerRank;
   const int64_t maxTokensPerExpert =
       static_cast<int64_t>(config.worldSize) * config.maxNumInpTokenPerRank;
-  const size_t hiddenBytes = static_cast<size_t>(config.hiddenDim) * config.maxTokenTypeSize;
+  const size_t hiddenBytes = config.HiddenDimSz() * config.maxTokenTypeSize;
 
   const auto* topkIdx = reinterpret_cast<const index_t*>(args.dispatchOutTopkIdx);
   const auto* dispatchSrcTokenPos = args.dispatchSrcTokenPos;
@@ -332,7 +332,7 @@ __device__ inline void ConvertDispatchOutputDevice(ConvertDispatchOutputArgs arg
 
   const int64_t maxTokensPerExpert =
       static_cast<int64_t>(config.worldSize) * config.maxNumInpTokenPerRank;
-  const size_t hiddenBytes = static_cast<size_t>(config.hiddenDim) * config.maxTokenTypeSize;
+  const size_t hiddenBytes = config.HiddenDimSz() * config.maxTokenTypeSize;
 
   const auto* topkIdx = reinterpret_cast<const index_t*>(args.dispatchOutTopkIdx);
   const auto* dispatchSrcTokenPos = args.dispatchSrcTokenPos;
@@ -434,8 +434,8 @@ __device__ inline void ConvertCombineInputDevice(ConvertCombineInputArgs& args) 
   PROFILE_COMBINE_RECORD(ts, tsCount, kTsMax, laneId);
 
   const int topk = config.numExpertPerToken;
-  const int64_t hiddenDim = config.hiddenDim;
-  const int64_t hiddenBytes = config.hiddenDim * sizeof(T);
+  const int64_t hiddenDim = (int64_t)config.HiddenDimSz();
+  const int64_t hiddenBytes = hiddenDim * sizeof(T);
 
   // Number of T elements per vector load (int4 = 16 bytes)
   constexpr int kElemsPerVec = sizeof(int4) / sizeof(T);
@@ -530,7 +530,7 @@ __device__ inline void ConvertCombineInputDevice(ConvertCombineInputArgs& args) 
   PROFILE_COMBINE_RECORD(ts, tsCount, kTsMax, laneId);
 
   const int topk = config.numExpertPerToken;
-  const int64_t hiddenDim = config.hiddenDim;
+  const int64_t hiddenDim = (int64_t)config.HiddenDimSz();
 
   auto* dispTokToEpSlotMap = args.dispTokToEpSlotMap;
   const auto* packedRecvX = reinterpret_cast<const T*>(args.packedRecvX);
