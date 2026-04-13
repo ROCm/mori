@@ -384,7 +384,7 @@ class EpDispatchCombineTestCase:
                     )
                 assert weight_match
 
-    def run_test_once(self, op, test_data):
+    def run_test_once(self, op, test_data, check_results=True):
         (
             _,
             all_rank_indices,
@@ -405,15 +405,16 @@ class EpDispatchCombineTestCase:
             all_rank_indices[self.config.rank],
         )
         self.sync()
-        self.check_dispatch_result(
-            op,
-            test_data,
-            dispatch_output,
-            dispatch_weights,
-            dispatch_scales,
-            dispatch_indices,
-            dispatch_recv_num_token,
-        )
+        if check_results:
+            self.check_dispatch_result(
+                op,
+                test_data,
+                dispatch_output,
+                dispatch_weights,
+                dispatch_scales,
+                dispatch_indices,
+                dispatch_recv_num_token,
+            )
 
         total_recv_num_token = dispatch_recv_num_token[0].item()
         if not self.config.use_external_inp_buf:
@@ -427,7 +428,10 @@ class EpDispatchCombineTestCase:
             dispatch_output, dispatch_weights, dispatch_indices, call_reset=False
         )
         self.sync()
-        self.check_combine_result(op, test_data, combine_output, combine_output_weight)
+        if check_results:
+            self.check_combine_result(
+                op, test_data, combine_output, combine_output_weight
+            )
 
 
 def run_ep_dispatch_combine_test(
@@ -436,6 +440,7 @@ def run_ep_dispatch_combine_test(
     use_max_token_num=False,
     routing=None,
     num_token_override=None,
+    check_results=True,
 ):
     op = mori.ops.EpDispatchCombineOp(config)
     test_case = test_case_cls(config)
@@ -447,4 +452,4 @@ def run_ep_dispatch_combine_test(
     if num_token_override is not None:
         gen_kwargs["num_token_override"] = num_token_override
     test_data = test_case.gen_test_data(**gen_kwargs)
-    test_case.run_test_once(op, test_data)
+    test_case.run_test_once(op, test_data, check_results=check_results)
