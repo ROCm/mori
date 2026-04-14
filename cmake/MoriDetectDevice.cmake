@@ -137,8 +137,8 @@ function(_mori_detect_device_nic out_var)
   # Find NIC libraries (needed for validation)
   find_library(
     _mori_bnxt_re_lib
-    NAMES bnxt_re bnxt_re-rdmav34
-    HINTS /usr/local/lib)
+    NAMES bnxt_re bnxt_re-rdmav59 bnxt_re-rdmav34
+    HINTS /usr/local/lib /usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu)
   find_library(
     _mori_ionic_lib
     NAMES ionic
@@ -148,24 +148,12 @@ function(_mori_detect_device_nic out_var)
     NAMES mlx5
     HINTS /usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu)
 
-  find_path(
-    _mori_bnxt_dv_hdr
-    NAMES infiniband/bnxt_re_dv.h
-    HINTS /usr/include /usr/local/include)
-  find_path(
-    _mori_bnxt_hsi_hdr
-    NAMES infiniband/bnxt_re_hsi.h
-    HINTS /usr/include /usr/local/include)
-  if(_mori_bnxt_dv_hdr AND _mori_bnxt_hsi_hdr)
-    set(_mori_bnxt_headers TRUE)
-  else()
-    set(_mori_bnxt_headers FALSE)
-  endif()
+  # bnxt headers (bnxt_re_dv.h, bnxt_re_hsi.h) are bundled in the mori source
+  # tree at include/mori/core/transport/rdma/providers/bnxt/, so no system
+  # header check is needed — only the userspace verbs provider library matters.
 
   macro(_mori_has_nic_lib _nic _result)
-    if(${_nic} STREQUAL "bnxt"
-       AND _mori_bnxt_re_lib
-       AND _mori_bnxt_headers)
+    if(${_nic} STREQUAL "bnxt" AND _mori_bnxt_re_lib)
       set(${_result} TRUE)
     elseif(${_nic} STREQUAL "ionic" AND _mori_ionic_lib)
       set(${_result} TRUE)
@@ -295,7 +283,7 @@ function(_mori_detect_device_nic out_var)
   # 1. Fallback: first available library (mlx5 preferred)
   if(_mori_mlx5_lib)
     set(_nic "mlx5")
-  elseif(_mori_bnxt_re_lib AND _mori_bnxt_headers)
+  elseif(_mori_bnxt_re_lib)
     set(_nic "bnxt")
   elseif(_mori_ionic_lib)
     set(_nic "ionic")
