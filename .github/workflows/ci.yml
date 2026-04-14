@@ -51,7 +51,9 @@ jobs:
 
       - name: Cleanup
         if: always()
-        run: docker rm -f $CONTAINER || true
+        run: |
+          docker exec $CONTAINER chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
+          docker rm -f $CONTAINER || true
 
   intranode-test:
     name: mori intranode test (${{ matrix.platform }})
@@ -169,7 +171,9 @@ jobs:
 
       - name: Cleanup
         if: always()
-        run: docker rm -f $CONTAINER || true
+        run: |
+          docker exec $CONTAINER chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
+          docker rm -f $CONTAINER || true
 
   # --------------------------------------------------------------------
   # Internode test — TODO: enable when both nodes are available
