@@ -476,16 +476,16 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
                 comb_bytes_list, torch.tensor([comb_total_bytes / (1024**2)])
             )
 
-            disp_duration_us_list.append([int(t.item()) for t in disp_dur_list])
-            disp_bandwidth_GB_list.append([int(t.item()) for t in disp_bw_list])
-            comb_duration_us_list.append([int(t.item()) for t in comb_dur_list])
-            comb_bandwidth_GB_list.append([int(t.item()) for t in comb_bw_list])
-            e2e_duration_us_list.append([int(t.item()) for t in e2e_dur_list])
+            disp_duration_us_list.append([round(t.item(), 1) for t in disp_dur_list])
+            disp_bandwidth_GB_list.append([round(t.item(), 2) for t in disp_bw_list])
+            comb_duration_us_list.append([round(t.item(), 1) for t in comb_dur_list])
+            comb_bandwidth_GB_list.append([round(t.item(), 2) for t in comb_bw_list])
+            e2e_duration_us_list.append([round(t.item(), 1) for t in e2e_dur_list])
             disp_avg_bytes_MB_list.append(
-                int(torch.tensor(disp_bytes_list).mean().item())
+                round(torch.tensor(disp_bytes_list).mean().item(), 2)
             )
             comb_avg_bytes_MB_list.append(
-                int(torch.tensor(comb_bytes_list).mean().item())
+                round(torch.tensor(comb_bytes_list).mean().item(), 2)
             )
 
         max_disp_algo_bw = 0
@@ -497,31 +497,31 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             comb_algo_bw = sum(comb_bandwidth_GB_list[i]) / self.config.world_size
             max_disp_algo_bw = max(max_disp_algo_bw, disp_algo_bw)
             max_comb_algo_bw = max(max_comb_algo_bw, comb_algo_bw)
-            disp_max_lat = max(disp_duration_us_list[i])
-            comb_max_lat = max(comb_duration_us_list[i])
-            min_disp_latency_us = min(min_disp_latency_us, disp_max_lat)
-            min_comb_latency_us = min(min_comb_latency_us, comb_max_lat)
+            disp_avg_lat = sum(disp_duration_us_list[i]) / self.config.world_size
+            comb_avg_lat = sum(comb_duration_us_list[i]) / self.config.world_size
+            min_disp_latency_us = min(min_disp_latency_us, disp_avg_lat)
+            min_comb_latency_us = min(min_comb_latency_us, comb_avg_lat)
 
         if self.config.rank == 0:
             print("Dispatch result:")
             for i, duration_us in enumerate(disp_duration_us_list):
                 algo_bw = sum(disp_bandwidth_GB_list[i]) / self.config.world_size
-                lat = max(duration_us)
+                avg_lat = sum(duration_us) / self.config.world_size
                 print(
                     f"Round {i} duration(us) {duration_us} "
                     f"bandwidth(GB/s) {disp_bandwidth_GB_list[i]} "
-                    f"avg bytes(MB) {disp_avg_bytes_MB_list[i]} lat {lat} bw {algo_bw} / {algo_bw * ll_mode_scale:.2f}"
+                    f"avg bytes(MB) {disp_avg_bytes_MB_list[i]} lat {avg_lat:.1f} bw {algo_bw:.2f} / {algo_bw * ll_mode_scale:.2f}"
                 )
 
             print()
             print("Combine result:")
             for i, duration_us in enumerate(comb_duration_us_list):
                 algo_bw = sum(comb_bandwidth_GB_list[i]) / self.config.world_size
-                lat = max(duration_us)
+                avg_lat = sum(duration_us) / self.config.world_size
                 print(
                     f"Round {i} duration(us) {duration_us} "
                     f"bandwidth(GB/s) {comb_bandwidth_GB_list[i]} "
-                    f"avg bytes(MB) {comb_avg_bytes_MB_list[i]} lat {lat} bw {algo_bw} / {algo_bw * ll_mode_scale:.2f}"
+                    f"avg bytes(MB) {comb_avg_bytes_MB_list[i]} lat {avg_lat:.1f} bw {algo_bw:.2f} / {algo_bw * ll_mode_scale:.2f}"
                 )
 
             print()
@@ -915,6 +915,8 @@ def _bench_dispatch_combine(
             best_comb_bw = 0
             best_disp_config = None
             best_comb_config = None
+            best_disp_lat = float("inf")
+            best_comb_lat = float("inf")
 
             # Common sweep uses the same block/warp for both dispatch and combine
             # to keep the search space manageable. Asymmetric configs (different
@@ -932,7 +934,7 @@ def _bench_dispatch_combine(
                         print(f"block_num={block_num}, warp_per_block={warp_per_block}")
                         print(f"{'=' * 60}")
 
-                    disp_bw, comb_bw, _, _ = benchmark.run(
+                    disp_bw, comb_bw, disp_lat, comb_lat = benchmark.run(
                         op,
                         dispatch_block_num=block_num,
                         dispatch_warp_per_block=warp_per_block,
@@ -944,9 +946,11 @@ def _bench_dispatch_combine(
                     if disp_bw > best_disp_bw:
                         best_disp_bw = disp_bw
                         best_disp_config = (block_num, warp_per_block)
+                        best_disp_lat = disp_lat
                     if comb_bw > best_comb_bw:
                         best_comb_bw = comb_bw
                         best_comb_config = (block_num, warp_per_block)
+                        best_comb_lat = comb_lat
 
             # --- Extra dispatch sweep: over-subscribe, fix combine at best ---
             if extra_disp_block_list:
@@ -967,7 +971,7 @@ def _bench_dispatch_combine(
                             )
                             print(f"{'=' * 60}")
 
-                        disp_bw, _, _, _ = benchmark.run(
+                        disp_bw, _, disp_lat, _ = benchmark.run(
                             op,
                             dispatch_block_num=block_num,
                             dispatch_warp_per_block=warp_per_block,
@@ -979,6 +983,7 @@ def _bench_dispatch_combine(
                         if disp_bw > best_disp_bw:
                             best_disp_bw = disp_bw
                             best_disp_config = (block_num, warp_per_block)
+                            best_disp_lat = disp_lat
 
             if rank == 0:
                 print(f"\n{'=' * 60}")
@@ -988,10 +993,12 @@ def _bench_dispatch_combine(
                 comb_dtype_str = str(combine_data_type).split(".")[-1]
                 print(
                     f"Best Dispatch  ({disp_dtype_str}): {best_disp_bw:.2f} GB/s "
+                    f"latency={best_disp_lat:.1f} us "
                     f"at block_num={best_disp_config[0]}, warp_per_block={best_disp_config[1]}"
                 )
                 print(
                     f"Best Combine   ({comb_dtype_str}): {best_comb_bw:.2f} GB/s "
+                    f"latency={best_comb_lat:.1f} us "
                     f"at block_num={best_comb_config[0]}, warp_per_block={best_comb_config[1]}"
                 )
                 print(f"{'=' * 60}")

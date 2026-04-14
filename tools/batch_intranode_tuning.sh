@@ -161,6 +161,14 @@ for HIDDEN_DIM in "${HIDDEN_DIM_ARRAY[@]}"; do
         REPRO_CMD="HSA_NO_SCRATCH_RECLAIM=1 python $BENCH_SCRIPT --cmd tuning --world-size $WORLD_SIZE --max-tokens $TOKENS --hidden-dim $HIDDEN_DIM --dtype $DTYPE --zero-copy $ZERO_COPY --quant-type $QUANT_TYPE"
         [[ -n "$COMBINE_DTYPE" ]] && REPRO_CMD="$REPRO_CMD --combine-dtype $COMBINE_DTYPE"
 
+        if [[ "$TOKENS" -ge 262144 ]]; then
+            export MORI_SHMEM_HEAP_SIZE="48G"
+        elif [[ "$TOKENS" -ge 65536 ]]; then
+            export MORI_SHMEM_HEAP_SIZE="24G"
+        else
+            export MORI_SHMEM_HEAP_SIZE="6G"
+        fi
+
         set +e
         timeout "$TIMEOUT" python "$BENCH_SCRIPT" \
             "${PY_COMMON_ARGS[@]}" \
