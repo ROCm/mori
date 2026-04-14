@@ -532,13 +532,19 @@ PoolClient::PeerConnection& PoolClient::GetOrConnectPeer(
   std::lock_guard<std::mutex> lock(peers_mutex_);
   auto it = peers_.find(node_id);
   if (it != peers_.end()) {
-    // Ensure dram_memories vector has the requested index populated
+    // Ensure dram_memories vector has the requested index populated.
+    // Always fill the slot when we have desc bytes, even if the vector
+    // was previously resized past this index by an out-of-order arrival.
     auto& peer = *it->second;
-    if (buffer_index >= peer.dram_memories.size() && !dram_memory_desc_bytes.empty()) {
-      peer.dram_memories.resize(buffer_index + 1);
-      auto handle = msgpack::unpack(reinterpret_cast<const char*>(dram_memory_desc_bytes.data()),
-                                    dram_memory_desc_bytes.size());
-      peer.dram_memories[buffer_index] = handle.get().as<mori::io::MemoryDesc>();
+    if (!dram_memory_desc_bytes.empty()) {
+      if (buffer_index >= peer.dram_memories.size()) {
+        peer.dram_memories.resize(buffer_index + 1);
+      }
+      if (!IsValidMemoryDesc(peer.dram_memories[buffer_index])) {
+        auto handle = msgpack::unpack(reinterpret_cast<const char*>(dram_memory_desc_bytes.data()),
+                                      dram_memory_desc_bytes.size());
+        peer.dram_memories[buffer_index] = handle.get().as<mori::io::MemoryDesc>();
+      }
     }
     return peer;
   }
