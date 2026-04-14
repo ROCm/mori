@@ -189,11 +189,11 @@ jobs:
         include:
           - platform: mi350-bnxt
             runner: [self-hosted, mi350-bnxt]
-            node1_host: cv350-zts-gtu-h25a-08
+            node1_host: 10.245.40.58
             node2_host: cv350-zts-gtu-g40e-08
             node2_port: 22
-            node1_ifname: benic5p1
-            node2_ifname: benic5p1
+            node1_ifname: fenic0
+            node2_ifname: fenic0
     timeout-minutes: 45
     steps:
       - name: Checkout
