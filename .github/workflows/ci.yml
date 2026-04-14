@@ -319,9 +319,9 @@ jobs:
           for KERNEL in v1 v1_ll; do
             for TOKENS in 64 128 1024 4096; do
               echo "=== stress kernel=$KERNEL max-tokens=$TOKENS port=$PORT ==="
-              NODE2_CMD="docker exec $CONTAINER bash $SCRIPT --rank 1 --master-addr ${{ matrix.node1_host }} --master-port $PORT --ifname ${{ matrix.node2_ifname }} --cmd stress --kernel-type $KERNEL --max-tokens $TOKENS"
+              NODE2_CMD="docker exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT --rank 1 --master-addr ${{ matrix.node1_host }} --master-port $PORT --ifname ${{ matrix.node2_ifname }} --cmd stress --kernel-type $KERNEL --max-tokens $TOKENS"
               sudo ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} "$NODE2_CMD" &
-              sudo docker exec $CONTAINER bash $SCRIPT \
+              sudo docker exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT \
                 --rank 0 --master-addr ${{ matrix.node1_host }} --master-port $PORT \
                 --ifname ${{ matrix.node1_ifname }} \
                 --cmd stress --kernel-type $KERNEL --max-tokens $TOKENS
