@@ -39,6 +39,8 @@ jobs:
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
             -w $GITHUB_WORKSPACE \
             $IMAGE sleep infinity
+          docker exec $CONTAINER \
+            git config --global --add safe.directory $GITHUB_WORKSPACE
 
       - name: Build and install mori
         run: docker exec $CONTAINER pip install .
@@ -82,6 +84,8 @@ jobs:
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
             -w $GITHUB_WORKSPACE \
             $IMAGE sleep infinity
+          docker exec $CONTAINER \
+            git config --global --add safe.directory $GITHUB_WORKSPACE
 
       - name: Install mori
         run: |
