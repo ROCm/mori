@@ -301,9 +301,9 @@ jobs:
           for KERNEL in v1 v1_ll; do
             for TOKENS in 64 128 1024 4096; do
               echo "=== bench kernel=$KERNEL max-tokens=$TOKENS port=$PORT ==="
-              NODE2_CMD="docker exec $CONTAINER bash $SCRIPT --rank 1 --master-addr ${{ matrix.node1_host }} --master-port $PORT --ifname ${{ matrix.node2_ifname }} --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS"
+              NODE2_CMD="docker exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT --rank 1 --master-addr ${{ matrix.node1_host }} --master-port $PORT --ifname ${{ matrix.node2_ifname }} --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS"
               sudo ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} "$NODE2_CMD" &
-              sudo docker exec $CONTAINER bash $SCRIPT \
+              sudo docker exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT \
                 --rank 0 --master-addr ${{ matrix.node1_host }} --master-port $PORT \
                 --ifname ${{ matrix.node1_ifname }} \
                 --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS
@@ -336,11 +336,12 @@ jobs:
           PORT=29180
           for TOKENS in 64 128; do
             echo "=== async_ll test max-tokens=$TOKENS port=$PORT ==="
-            NODE2_CMD="docker exec -e GPU_PER_NODE=8 -e MORI_DISABLE_P2P=1 $CONTAINER bash $SCRIPT --rank 1 --master-addr ${{ matrix.node1_host }} --master-port $PORT --ifname ${{ matrix.node2_ifname }} --cmd test --kernel-type async_ll --quant-type none --dtype bf16 --max-tokens $TOKENS"
+            NODE2_CMD="docker exec -e GPU_PER_NODE=8 -e MORI_DISABLE_P2P=1 -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT --rank 1 --master-addr ${{ matrix.node1_host }} --master-port $PORT --ifname ${{ matrix.node2_ifname }} --cmd test --kernel-type async_ll --quant-type none --dtype bf16 --max-tokens $TOKENS"
             sudo ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} "$NODE2_CMD" &
             sudo docker exec \
               -e GPU_PER_NODE=8 \
               -e MORI_DISABLE_P2P=1 \
+              -e MORI_INTERNODE_TIMEOUT=600 \
               $CONTAINER bash $SCRIPT \
               --rank 0 --master-addr ${{ matrix.node1_host }} --master-port $PORT \
               --ifname ${{ matrix.node1_ifname }} \
