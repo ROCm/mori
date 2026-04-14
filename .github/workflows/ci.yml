@@ -206,26 +206,26 @@ jobs:
 
       - name: Start container on node1
         run: |
-          docker rm -f $CONTAINER 2>/dev/null || true
-          ./docker/ci_run.sh --name $CONTAINER \
+          sudo docker rm -f $CONTAINER 2>/dev/null || true
+          sudo ./docker/ci_run.sh --name $CONTAINER \
             -v /root/.ssh:/root/.ssh \
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
             -w $GITHUB_WORKSPACE \
             $IMAGE sleep infinity
-          docker exec $CONTAINER \
+          sudo docker exec $CONTAINER \
             git config --global --add safe.directory $GITHUB_WORKSPACE
 
       - name: Start container on node2
         run: |
-          ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} "
+          sudo ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} "
             docker rm -f $CONTAINER 2>/dev/null || true
             mkdir -p $GITHUB_WORKSPACE
           "
-          rsync -az --exclude='.git' \
+          sudo rsync -az --exclude='.git' \
             -e "ssh -p ${{ matrix.node2_port }}" \
             $GITHUB_WORKSPACE/ \
             root@${{ matrix.node2_host }}:$GITHUB_WORKSPACE/
-          ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} "
+          sudo ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} "
             cd $GITHUB_WORKSPACE &&
             docker build --network=host -t $IMAGE -f docker/Dockerfile.dev . &&
             ./docker/ci_run.sh --name $CONTAINER \
@@ -238,12 +238,12 @@ jobs:
 
       - name: Install mori (node1)
         run: |
-          docker exec $CONTAINER bash -c \
+          sudo docker exec $CONTAINER bash -c \
             "cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install . && pip install prettytable"
 
       - name: Install mori (node2)
         run: |
-          ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} \
+          sudo ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} \
             "docker exec $CONTAINER bash -c 'cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install . && pip install prettytable'"
 
       - name: MORI-IO internode benchmark
@@ -258,8 +258,8 @@ jobs:
             printf -v BENCH_ARGS '%q ' "$@"
             echo "=== MORI-IO internode benchmark: $NAME port=$PORT ==="
             NODE2_CMD="docker exec $CONTAINER bash $SCRIPT --rank 1 --master-addr ${{ matrix.node1_host }} --master-port $PORT --ifname ${{ matrix.node2_ifname }} -- ${BENCH_ARGS}"
-            ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} "$NODE2_CMD" &
-            docker exec $CONTAINER bash $SCRIPT \
+            sudo ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} "$NODE2_CMD" &
+            sudo docker exec $CONTAINER bash $SCRIPT \
               --rank 0 --master-addr ${{ matrix.node1_host }} --master-port $PORT \
               --ifname ${{ matrix.node1_ifname }} \
               -- "$@"
@@ -302,8 +302,8 @@ jobs:
             for TOKENS in 64 128 1024 4096; do
               echo "=== bench kernel=$KERNEL max-tokens=$TOKENS port=$PORT ==="
               NODE2_CMD="docker exec $CONTAINER bash $SCRIPT --rank 1 --master-addr ${{ matrix.node1_host }} --master-port $PORT --ifname ${{ matrix.node2_ifname }} --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS"
-              ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} "$NODE2_CMD" &
-              docker exec $CONTAINER bash $SCRIPT \
+              sudo ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} "$NODE2_CMD" &
+              sudo docker exec $CONTAINER bash $SCRIPT \
                 --rank 0 --master-addr ${{ matrix.node1_host }} --master-port $PORT \
                 --ifname ${{ matrix.node1_ifname }} \
                 --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS
@@ -320,8 +320,8 @@ jobs:
             for TOKENS in 64 128 1024 4096; do
               echo "=== stress kernel=$KERNEL max-tokens=$TOKENS port=$PORT ==="
               NODE2_CMD="docker exec $CONTAINER bash $SCRIPT --rank 1 --master-addr ${{ matrix.node1_host }} --master-port $PORT --ifname ${{ matrix.node2_ifname }} --cmd stress --kernel-type $KERNEL --max-tokens $TOKENS"
-              ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} "$NODE2_CMD" &
-              docker exec $CONTAINER bash $SCRIPT \
+              sudo ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} "$NODE2_CMD" &
+              sudo docker exec $CONTAINER bash $SCRIPT \
                 --rank 0 --master-addr ${{ matrix.node1_host }} --master-port $PORT \
                 --ifname ${{ matrix.node1_ifname }} \
                 --cmd stress --kernel-type $KERNEL --max-tokens $TOKENS
@@ -337,8 +337,8 @@ jobs:
           for TOKENS in 64 128; do
             echo "=== async_ll test max-tokens=$TOKENS port=$PORT ==="
             NODE2_CMD="docker exec -e GPU_PER_NODE=8 -e MORI_DISABLE_P2P=1 $CONTAINER bash $SCRIPT --rank 1 --master-addr ${{ matrix.node1_host }} --master-port $PORT --ifname ${{ matrix.node2_ifname }} --cmd test --kernel-type async_ll --quant-type none --dtype bf16 --max-tokens $TOKENS"
-            ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} "$NODE2_CMD" &
-            docker exec \
+            sudo ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} "$NODE2_CMD" &
+            sudo docker exec \
               -e GPU_PER_NODE=8 \
               -e MORI_DISABLE_P2P=1 \
               $CONTAINER bash $SCRIPT \
@@ -353,11 +353,11 @@ jobs:
       - name: Cleanup node1
         if: always()
         run: |
-          docker exec $CONTAINER chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
-          docker rm -f $CONTAINER || true
+          sudo docker exec $CONTAINER chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
+          sudo docker rm -f $CONTAINER || true
 
       - name: Cleanup node2
         if: always()
         run: |
-          ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} \
+          sudo ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} \
             "docker rm -f $CONTAINER || true"
