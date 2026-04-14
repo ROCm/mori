@@ -20,7 +20,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: mi350-bnxt
+          - platform: MI350X_BNXT
             runner: [self-hosted, mi350-bnxt]
     timeout-minutes: 15
     steps:
@@ -65,7 +65,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: mi350-bnxt
+          - platform: MI350X_BNXT
             runner: [self-hosted, mi350-bnxt]
     timeout-minutes: 45
     steps:
@@ -181,13 +181,13 @@ jobs:
 
   internode-test:
     name: mori internode test (${{ matrix.platform }})
-    needs: [build, intranode-test]
+    needs: build
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - platform: mi350-bnxt
+          - platform: MI350X_BNXT
             runner: [self-hosted, mi350-bnxt]
             node1_host: 10.245.40.58
             node2_host: cv350-zts-gtu-g40e-08
@@ -308,6 +308,7 @@ jobs:
                 --ifname ${{ matrix.node1_ifname }} \
                 --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS
               wait
+              sleep 5
               PORT=$((PORT + 1))
             done
           done
@@ -326,6 +327,7 @@ jobs:
                 --ifname ${{ matrix.node1_ifname }} \
                 --cmd stress --kernel-type $KERNEL --max-tokens $TOKENS
               wait
+              sleep 5
               PORT=$((PORT + 1))
             done
           done
@@ -348,6 +350,7 @@ jobs:
               --cmd test --kernel-type async_ll \
               --quant-type none --dtype bf16 --max-tokens $TOKENS
             wait
+            sleep 5
             PORT=$((PORT + 1))
           done
 
