@@ -106,7 +106,7 @@ echo "[ci_run] Detected NIC type: $NIC_TYPE"
 
 read -ra NIC_MOUNTS <<< "$(nic_mount_flags "$NIC_TYPE")"
 
-exec sudo docker run \
+exec docker run \
     --group-add video \
     --network=host \
     --ulimit nproc=100000:100000 \
