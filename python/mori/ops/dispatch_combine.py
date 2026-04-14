@@ -399,7 +399,7 @@ class EpDispatchCombineOp:
         self._dispatch_dtype = input.dtype
         sfx = _DTYPE_SUFFIX[input.dtype]
 
-        args_ptr = mori_cpp.prepare_and_build_args(
+        mori_cpp.prepare_inference_args(
             self._handle,
             inp_ptr=input.data_ptr(),
             dtype=dtype_to_int(input.dtype),
@@ -407,6 +407,9 @@ class EpDispatchCombineOp:
             weight_ptr=weight_ptr,
             scale_ptr=scale_ptr,
             indices_ptr=indices.data_ptr(),
+        )
+        args_ptr = mori_cpp.build_args(
+            self._handle,
             rdma_block_num=actual_rbn,
             hidden_dim=hidden_dim,
         )
@@ -530,16 +533,9 @@ class EpDispatchCombineOp:
         sfx = _DTYPE_SUFFIX[self._dispatch_dtype]
         kt = self.config.kernel_type.value
 
-        args_ptr = mori_cpp.prepare_and_build_args(
-            self._handle,
-            inp_ptr=0,
-            dtype=0,
-            num_tokens=0,
-            weight_ptr=0,
-            scale_ptr=0,
-            indices_ptr=0,
-            rdma_block_num=0,
-        )
+        # Recv kernels must reuse the handle's inference pointers/state prepared by the
+        # preceding dispatch_send/dispatch call, so only rebuild raw args here.
+        args_ptr = mori_cpp.build_args(self._handle, rdma_block_num=0)
         if kt == EpDispatchCombineKernelType.AsyncLL.value:
             mp = self._handle_info["multi_processor_count"]
             mp_aligned = mp // self.config.world_size * self.config.world_size
@@ -583,7 +579,7 @@ class EpDispatchCombineOp:
         self._combine_dtype = input.dtype
         sfx = _DTYPE_SUFFIX[input.dtype]
 
-        args_ptr = mori_cpp.prepare_and_build_args(
+        mori_cpp.prepare_inference_args(
             self._handle,
             inp_ptr=input.data_ptr(),
             dtype=dtype_to_int(input.dtype),
@@ -591,6 +587,9 @@ class EpDispatchCombineOp:
             weight_ptr=weight_ptr,
             scale_ptr=0,
             indices_ptr=indices.data_ptr(),
+        )
+        args_ptr = mori_cpp.build_args(
+            self._handle,
             rdma_block_num=actual_rbn,
             hidden_dim=hidden_dim,
             use_external_inp_buf=use_external_inp_buf,
@@ -763,16 +762,9 @@ class EpDispatchCombineOp:
         sfx = _DTYPE_SUFFIX[self._combine_dtype]
         kt = self.config.kernel_type.value
 
-        args_ptr = mori_cpp.prepare_and_build_args(
-            self._handle,
-            inp_ptr=0,
-            dtype=0,
-            num_tokens=0,
-            weight_ptr=0,
-            scale_ptr=0,
-            indices_ptr=0,
-            rdma_block_num=0,
-        )
+        # Recv kernels must reuse the handle's inference pointers/state prepared by the
+        # preceding combine_send/combine call, so only rebuild raw args here.
+        args_ptr = mori_cpp.build_args(self._handle, rdma_block_num=0)
         shared_mem = self._combine_shared_mem(actual_wpb)
         if kt == EpDispatchCombineKernelType.AsyncLL.value:
             mp = self._handle_info["multi_processor_count"]
@@ -859,7 +851,7 @@ class EpDispatchCombineOp:
 
         set_fn(self._handle, packed_recv_x.data_ptr(), packed_recv_src_info.data_ptr())
 
-        args_ptr = mori_cpp.prepare_and_build_args(
+        mori_cpp.prepare_inference_args(
             self._handle,
             inp_ptr=input.data_ptr(),
             dtype=dtype_to_int(input.dtype),
@@ -871,6 +863,9 @@ class EpDispatchCombineOp:
                 else 0
             ),
             indices_ptr=indices.data_ptr(),
+        )
+        args_ptr = mori_cpp.build_args(
+            self._handle,
             rdma_block_num=actual_rbn,
             hidden_dim=hidden_dim,
         )
@@ -955,7 +950,7 @@ class EpDispatchCombineOp:
 
         set_fn(self._handle, input.data_ptr(), 0)
 
-        args_ptr = mori_cpp.prepare_and_build_args(
+        mori_cpp.prepare_inference_args(
             self._handle,
             inp_ptr=input.data_ptr(),
             dtype=dtype_to_int(input.dtype),
@@ -967,6 +962,9 @@ class EpDispatchCombineOp:
             ),
             scale_ptr=0,
             indices_ptr=indices.data_ptr(),
+        )
+        args_ptr = mori_cpp.build_args(
+            self._handle,
             rdma_block_num=actual_rbn,
             hidden_dim=hidden_dim,
         )

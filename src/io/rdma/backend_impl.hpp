@@ -71,16 +71,14 @@ class RdmaManager {
   int CountEndpoint(EngineKey, TopoKeyPair);
   EpPairVec GetAllEndpoint(EngineKey, TopoKeyPair);
   application::RdmaEndpoint CreateEndpoint(int devId);
-  void ConnectEndpoint(EngineKey remoteKey, int ldevId, application::RdmaEndpoint local, int rdevId,
-                       application::RdmaEndpointHandle remote, TopoKeyPair key, int weight);
-  std::optional<EpPair> GetEpPairByQpn(uint32_t qpn);
+  EndpointId ConnectEndpoint(EngineKey remoteKey, int ldevId, application::RdmaEndpoint local,
+                             int rdevId, application::RdmaEndpointHandle remote, TopoKeyPair key,
+                             int weight);
+  std::shared_ptr<EndpointRuntime> GetEndpointRuntime(EndpointId id);
+  std::vector<std::shared_ptr<EndpointRuntime>> SnapshotEndpointRuntimes();
 
   application::RdmaDeviceContext* GetRdmaDeviceContext(int devId);
   const application::ActiveDevicePortList& GetAvailDevices() const { return availDevices; }
-
-  // Endpoint enumeration
-  using EnumerateEpCallbackFunc = std::function<void(int qpn, const EpPair& ep)>;
-  void EnumerateEndpoints(const EnumerateEpCallbackFunc&);
 
  private:
   application::RdmaDeviceContext* GetOrCreateDeviceContext(int devId);
@@ -95,7 +93,8 @@ class RdmaManager {
 
   MemoryTable mTable;
   std::unordered_map<EngineKey, RemoteEngineMeta> remotes;
-  std::unordered_map<uint32_t, EpPair> epsMap;
+  std::atomic<EndpointId> nextEndpointId_{1};
+  std::unordered_map<EndpointId, std::shared_ptr<EndpointRuntime>> endpointsById_;
 
   std::unique_ptr<application::TopoSystem> topo{nullptr};
   std::atomic<uint32_t> roundRobinCounter{0};
@@ -109,8 +108,7 @@ class NotifManager {
   NotifManager(RdmaManager*, const RdmaBackendConfig&);
   ~NotifManager();
 
-  void RegisterEndpointByQpn(uint32_t qpn);
-  // void DeregisterEndpoint(EpPair*);
+  void RegisterEndpoint(const std::shared_ptr<EndpointRuntime>& rt);
 
   void RegisterDevice(int devId);
 
@@ -121,7 +119,7 @@ class NotifManager {
   void Shutdown();
 
  private:
-  void ProcessOneCqe(int qpn, const EpPair& ep);
+  void ProcessOneCqe(const std::shared_ptr<EndpointRuntime>& rt);
 
  private:
   RdmaBackendConfig config;
@@ -139,7 +137,8 @@ class NotifManager {
     void* buf;
   };
 
-  std::unordered_map<uint32_t, QpNotifContext> qpNotifCtx;
+  std::unordered_map<EndpointId, std::shared_ptr<EndpointRuntime>> registeredRuntimes_;
+  std::unordered_map<EndpointId, QpNotifContext> notifCtxById_;
   std::unordered_map<EngineKey, std::unordered_map<TransferUniqueId, int>> notifPool;
 
   std::unordered_map<TransferStatus*, int> localNotif;

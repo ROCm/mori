@@ -253,9 +253,10 @@ application::RdmaEndpoint RdmaManager::CreateEndpoint(int devId) {
   return rdmaEp;
 }
 
-void RdmaManager::ConnectEndpoint(EngineKey remoteKey, int devId, application::RdmaEndpoint local,
-                                  int rdevId, application::RdmaEndpointHandle remote,
-                                  TopoKeyPair topoKey, int weight) {
+EndpointId RdmaManager::ConnectEndpoint(EngineKey remoteKey, int devId,
+                                        application::RdmaEndpoint local, int rdevId,
+                                        application::RdmaEndpointHandle remote, TopoKeyPair topoKey,
+                                        int weight) {
   std::unique_lock<std::shared_mutex> lock(mu);
   deviceCtxs[devId]->ConnectEndpoint(local.handle, remote);
   RemoteEngineMeta& meta = remotes[remoteKey];
@@ -271,13 +272,18 @@ void RdmaManager::ConnectEndpoint(EngineKey remoteKey, int devId, application::R
             std::make_shared<std::atomic<bool>>(false),
             std::make_shared<SubmissionLedger>(config.notifPerQp)};
   meta.rTable[topoKey].push_back(ep);
-  epsMap.insert({ep.local.handle.qpn, ep});
+
+  EndpointId id = nextEndpointId_.fetch_add(1);
+  auto rt = std::make_shared<EndpointRuntime>(EndpointRuntime{id, ep});
+  endpointsById_[id] = rt;
+  return id;
 }
 
-std::optional<EpPair> RdmaManager::GetEpPairByQpn(uint32_t qpn) {
+std::shared_ptr<EndpointRuntime> RdmaManager::GetEndpointRuntime(EndpointId id) {
   std::shared_lock<std::shared_mutex> lock(mu);
-  if (epsMap.find(qpn) == epsMap.end()) return std::nullopt;
-  return epsMap[qpn];
+  auto it = endpointsById_.find(id);
+  if (it == endpointsById_.end()) return nullptr;
+  return it->second;
 }
 
 application::RdmaDeviceContext* RdmaManager::GetRdmaDeviceContext(int devId) {
@@ -285,11 +291,14 @@ application::RdmaDeviceContext* RdmaManager::GetRdmaDeviceContext(int devId) {
   return deviceCtxs[devId];
 }
 
-void RdmaManager::EnumerateEndpoints(const EnumerateEpCallbackFunc& func) {
+std::vector<std::shared_ptr<EndpointRuntime>> RdmaManager::SnapshotEndpointRuntimes() {
   std::shared_lock<std::shared_mutex> lock(mu);
-  for (auto& it : epsMap) {
-    func(it.first, it.second);
+  std::vector<std::shared_ptr<EndpointRuntime>> result;
+  result.reserve(endpointsById_.size());
+  for (auto& [_, rt] : endpointsById_) {
+    result.push_back(rt);
   }
+  return result;
 }
 
 application::RdmaDeviceContext* RdmaManager::GetOrCreateDeviceContext(int devId) {
@@ -310,28 +319,28 @@ NotifManager::NotifManager(RdmaManager* rdmaMgr, const RdmaBackendConfig& cfg)
 
 NotifManager::~NotifManager() { Shutdown(); }
 
-void NotifManager::RegisterEndpointByQpn(uint32_t qpn) {
+void NotifManager::RegisterEndpoint(const std::shared_ptr<EndpointRuntime>& rt) {
   if (config.pollCqMode == PollCqMode::EVENT) {
     epoll_event ev;
     ev.events = EPOLLIN;
-    ev.data.u32 = qpn;
-    std::optional<EpPair> ep = rdma->GetEpPairByQpn(qpn);
-    assert(ep.has_value() && ep->local.ibvHandle.compCh);
-    SYSCALL_RETURN_ZERO(epoll_ctl(epfd, EPOLL_CTL_ADD, ep->local.ibvHandle.compCh->fd, &ev));
+    ev.data.u64 = rt->id;
+    assert(rt->ep.local.ibvHandle.compCh);
+    SYSCALL_RETURN_ZERO(epoll_ctl(epfd, EPOLL_CTL_ADD, rt->ep.local.ibvHandle.compCh->fd, &ev));
   }
 
   // Skip notification setup if disabled
   if (!config.enableNotification) {
+    std::lock_guard<std::mutex> lock(mu);
+    registeredRuntimes_[rt->id] = rt;
     return;
   }
 
   std::lock_guard<std::mutex> lock(mu);
-  if (qpNotifCtx.find(qpn) != qpNotifCtx.end()) return;
+  if (notifCtxById_.find(rt->id) != notifCtxById_.end()) return;
 
-  std::optional<EpPair> ep = rdma->GetEpPairByQpn(qpn);
-  assert(ep.has_value());
+  registeredRuntimes_[rt->id] = rt;
 
-  application::RdmaDeviceContext* devCtx = rdma->GetRdmaDeviceContext(ep->ldevId);
+  application::RdmaDeviceContext* devCtx = rdma->GetRdmaDeviceContext(rt->ep.ldevId);
   assert(devCtx);
 
   void* buf;
@@ -341,9 +350,9 @@ void NotifManager::RegisterEndpointByQpn(uint32_t qpn) {
   application::RdmaMemoryRegion mr =
       devCtx->RegisterRdmaMemoryRegion(buf, config.notifPerQp * sizeof(NotifMessage));
 
-  qpNotifCtx.insert({qpn, {mr, buf}});
+  notifCtxById_.insert({rt->id, {mr, buf}});
 
-  struct ibv_qp* qp = ep->local.ibvHandle.qp;
+  struct ibv_qp* qp = rt->ep.local.ibvHandle.qp;
   assert(qp);
 
   for (uint64_t i = 0; i < config.notifPerQp; i++) {
@@ -362,8 +371,17 @@ void NotifManager::RegisterEndpointByQpn(uint32_t qpn) {
   }
 }
 
-void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
+void NotifManager::ProcessOneCqe(const std::shared_ptr<EndpointRuntime>& rt) {
+  const EpPair& ep = rt->ep;
   ibv_cq* cq = ep.local.ibvHandle.cq;
+
+  // Resolve notif context once before the CQ drain loop.
+  QpNotifContext* notifCtxPtr = nullptr;
+  if (config.enableNotification) {
+    std::lock_guard<std::mutex> lock(mu);
+    auto nit = notifCtxById_.find(rt->id);
+    if (nit != notifCtxById_.end()) notifCtxPtr = &nit->second;
+  }
 
   const int batchSize = 32;
   struct ibv_wc wc[batchSize];
@@ -394,8 +412,9 @@ void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
           if (ep.degraded && ep.degraded->load(std::memory_order_relaxed) && ep.ledger) {
             const int orphanedReleased = ep.ledger->ReleaseOrphanedByRecovery(ep.sqDepth.get());
             ep.degraded->store(false, std::memory_order_relaxed);
-            MORI_IO_WARN("ProcessOneCqe: recovered degraded EP qpn {} by releasing {} orphaned WRs",
-                         qpn, orphanedReleased);
+            MORI_IO_WARN(
+                "ProcessOneCqe: recovered degraded EP eid={} qpn={} by releasing {} orphaned WRs",
+                rt->id, ep.local.handle.qpn, orphanedReleased);
           }
         } else if (IsNotifSendWrId(wc[i].wr_id)) {
           if (ep.sqDepth) ep.sqDepth->fetch_sub(1, std::memory_order_relaxed);
@@ -423,14 +442,13 @@ void NotifManager::ProcessOneCqe(int qpn, const EpPair& ep) {
 
         std::lock_guard<std::mutex> lock(mu);
 
-        assert(qpNotifCtx.find(qpn) != qpNotifCtx.end());
-        QpNotifContext& ctx = qpNotifCtx[qpn];
+        assert(notifCtxPtr != nullptr);
+        QpNotifContext& ctx = *notifCtxPtr;
 
         // FIXME: this notif mechenism has bug when notif index is wrapped around
         uint64_t idx = wc[i].wr_id;
         NotifMessage msg = reinterpret_cast<NotifMessage*>(ctx.mr.addr)[idx];
         assert(msg.totalNum > 0);
-        // printf("recv notif for transfer %d\n", tid);
 
         EngineKey ekey = ep.remoteEngineKey;
         if (notifPool[ekey].find(msg.id) == notifPool[ekey].end()) {
@@ -492,12 +510,17 @@ void NotifManager::MainLoop() {
     while (running.load()) {
       int nfds = epoll_wait(epfd, events, maxEvents, 0 /*ms*/);
       for (int i = 0; i < nfds; ++i) {
-        uint32_t qpn = events[i].data.u32;
+        EndpointId eid = events[i].data.u64;
 
-        std::optional<EpPair> ep = rdma->GetEpPairByQpn(qpn);
-        if (!ep.has_value()) continue;
+        std::shared_ptr<EndpointRuntime> rt;
+        {
+          std::lock_guard<std::mutex> lock(mu);
+          auto it = registeredRuntimes_.find(eid);
+          if (it == registeredRuntimes_.end()) continue;
+          rt = it->second;
+        }
 
-        struct ibv_comp_channel* ch = ep->local.ibvHandle.compCh;
+        struct ibv_comp_channel* ch = rt->ep.local.ibvHandle.compCh;
 
         struct ibv_cq* cq = nullptr;
         void* evCtx = nullptr;
@@ -505,12 +528,19 @@ void NotifManager::MainLoop() {
         ibv_ack_cq_events(cq, 1);
         ibv_req_notify_cq(cq, 0);
 
-        ProcessOneCqe(qpn, ep.value());
+        ProcessOneCqe(rt);
       }
     }
   } else {
     while (running.load()) {
-      rdma->EnumerateEndpoints([this](int qpn, const EpPair& ep) { this->ProcessOneCqe(qpn, ep); });
+      auto snapshot = rdma->SnapshotEndpointRuntimes();
+      if (snapshot.empty()) {
+        std::this_thread::yield();
+        continue;
+      }
+      for (auto& rt : snapshot) {
+        ProcessOneCqe(rt);
+      }
     }
   }
 }
@@ -591,8 +621,9 @@ void ControlPlaneServer::BuildRdmaConn(EngineKey ekey, TopoKeyPair topo) {
   assert(hdr.type == MessageType::RegEndpoint);
   MessageRegEndpoint msg = p.ReadMessageRegEndpoint(hdr.len);
 
-  rdma->ConnectEndpoint(ekey, devId, lep, msg.devId, msg.eph, topo, weight);
-  notif->RegisterEndpointByQpn(lep.handle.qpn);
+  EndpointId eid = rdma->ConnectEndpoint(ekey, devId, lep, msg.devId, msg.eph, topo, weight);
+  auto ert = rdma->GetEndpointRuntime(eid);
+  notif->RegisterEndpoint(ert);
   MORI_IO_INFO("Built RdmaConn for engine {} with topo local({},{}) remote({},{})", ekey,
                topo.local.deviceId, topo.local.loc, topo.remote.deviceId, topo.remote.loc);
   ctx->CloseEndpoint(tcph);
@@ -653,8 +684,10 @@ void ControlPlaneServer::HandleControlPlaneProtocol(int fd) {
       int rdevId = msg.devId;
       auto [devId, weight] = candidates[0];
       application::RdmaEndpoint lep = rdma->CreateEndpoint(devId);
-      rdma->ConnectEndpoint(msg.ekey, devId, lep, rdevId, msg.eph, msg.topo, weight);
-      notif->RegisterEndpointByQpn(lep.handle.qpn);
+      EndpointId eid =
+          rdma->ConnectEndpoint(msg.ekey, devId, lep, rdevId, msg.eph, msg.topo, weight);
+      auto ert = rdma->GetEndpointRuntime(eid);
+      notif->RegisterEndpoint(ert);
       p.WriteMessageRegEndpoint(MessageRegEndpoint{myEngKey, msg.topo, devId, lep.handle});
       SYSCALL_RETURN_ZERO(epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL));
       break;

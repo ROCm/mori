@@ -19,7 +19,6 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-import os
 import pytest
 import mori
 import torch
@@ -29,17 +28,7 @@ from tests.python.ops.dispatch_combine_test_utils import (
     EpDispatchCombineTestCase,
     assert_worker_results,
     run_ep_dispatch_combine_test,
-    start_torch_dist_process_manager,
 )
-
-os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "4G")
-
-
-@pytest.fixture(scope="session")
-def torch_dist_process_manager():
-    manager = start_torch_dist_process_manager(world_size=8)
-    yield manager
-    manager.shutdown()
 
 
 def _make_intranode_config(
@@ -67,8 +56,8 @@ def _make_intranode_config(
         num_experts_per_rank=num_experts_per_rank,
         num_experts_per_token=num_experts_per_token,
         max_token_type_size=4,
-        block_num=40,
-        warp_num_per_block=8,
+        block_num=256,
+        warp_num_per_block=16,
         use_external_inp_buf=use_external_inp_buf,
         kernel_type=mori.ops.EpDispatchCombineKernelType.IntraNode,
         max_total_recv_tokens=max_total_recv_tokens,
@@ -91,6 +80,7 @@ def _test_dispatch_combine(
     max_total_recv_tokens=0,
     routing=None,
     use_max_token_num=False,
+    check_results=True,
 ):
     config = _make_intranode_config(
         rank=rank,
@@ -111,6 +101,7 @@ def _test_dispatch_combine(
         EpDispatchCombineTestCase,
         use_max_token_num=use_max_token_num,
         routing=routing,
+        check_results=check_results,
     )
 
 
@@ -284,62 +275,43 @@ def test_dispatch_combine_max_total_recv_tokens_under_budget(
 
 
 # ---------------------------------------------------------------------------
-# Overflow assert test (IntraNode only, isolated subprocess)
+# Large token num test (IntraNode only)
+#
+# Stress-test with 65536 tokens per rank (512K tokens total across 8 ranks)
+# and hidden_dim=7168.  Only checks that dispatch+combine complete without
+# error; correctness checks are skipped because they are too slow at this scale.
 # ---------------------------------------------------------------------------
 
 
-# def _overflow_subprocess(rank, world_size, port):
-#     """Run in a spawned subprocess so the device assert doesn't poison the main test process."""
-#     from tests.python.utils import TorchDistContext
+def test_dispatch_combine_large_token_num(
+    torch_dist_process_manager,
+):
+    """Dispatch + combine with max_num_inp_token_per_rank=65536, hidden_dim=7168.
 
-#     with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
-#         mori.shmem.shmem_torch_process_group_init("default")
-#         config = mori.ops.EpDispatchCombineConfig(
-#             data_type=torch.bfloat16,
-#             rank=rank,
-#             world_size=world_size,
-#             hidden_dim=4096,
-#             scale_dim=0,
-#             scale_type_size=1,
-#             max_token_type_size=4,
-#             max_num_inp_token_per_rank=32,
-#             num_experts_per_rank=32,
-#             num_experts_per_token=1,
-#             max_total_recv_tokens=64,  # per-PE limit = ceil(64/8) = 8
-#             block_num=40,
-#             warp_num_per_block=8,
-#             use_external_inp_buf=True,
-#             kernel_type=mori.ops.EpDispatchCombineKernelType.IntraNode,
-#         )
-#         op = mori.ops.EpDispatchCombineOp(config)
-#         test_case = EpDispatchCombineTestCase(config)
-#         # all_to_one: all tokens -> expert 0 (PE 0).
-#         # PE 0 receives 32 * 7 = 224 tokens but per-PE limit is 8 -> overflow.
-#         test_data = test_case.gen_test_data(
-#             use_max_token_num=True, routing="all_to_one"
-#         )
-#         (_, all_rank_indices, all_rank_input, all_rank_weights, all_rank_scales) = (
-#             test_data
-#         )
-#         op.dispatch(
-#             all_rank_input[rank],
-#             all_rank_weights[rank],
-#             all_rank_scales[rank],
-#             all_rank_indices[rank],
-#         )
-#         torch.cuda.synchronize()  # device assert surfaces here
+    Correctness is not verified — only that the kernel completes without error.
+    """
+    world_size = 8
+    for _ in range(world_size):
+        torch_dist_process_manager.task_queue.put(
+            (
+                _test_dispatch_combine,
+                [
+                    world_size,
+                    torch.bfloat16,  # data_type
+                    7168,  # hidden_dim
+                    65536,  # max_num_inp_token_per_rank
+                    32,  # num_experts_per_rank
+                    8,  # num_experts_per_token
+                    True,  # use_external_inp_buf
+                    0,  # scale_dim
+                    1,  # scale_type_size
+                    "none",  # quant_type
+                    0,  # max_total_recv_tokens
+                    None,  # routing
+                    True,  # use_max_token_num
+                    False,  # check_results
+                ],
+            )
+        )
 
-
-# def test_dispatch_combine_overflow_assert():
-#     """Verify per-PE overflow assert fires when routing exceeds maxTotalRecvTokens budget."""
-#     from tests.python.utils import get_free_port
-
-#     port = get_free_port()
-#     # spawn must raise due to device assert in at least one worker
-#     with pytest.raises(Exception):
-#         torch.multiprocessing.spawn(
-#             _overflow_subprocess,
-#             args=(8, port),
-#             nprocs=8,
-#             join=True,
-#         )
+    assert_worker_results(torch_dist_process_manager, world_size)

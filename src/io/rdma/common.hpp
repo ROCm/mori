@@ -192,6 +192,13 @@ struct EpPair {
   std::shared_ptr<SubmissionLedger> ledger;
 };
 
+using EndpointId = uint64_t;
+
+struct EndpointRuntime {
+  EndpointId id;
+  EpPair ep;
+};
+
 using EpPairVec = std::vector<EpPair>;
 using RouteTable = std::unordered_map<TopoKeyPair, EpPairVec>;
 using MemoryTable = std::unordered_map<MemoryKey, application::RdmaMemoryRegion>;
