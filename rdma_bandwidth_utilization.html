@@ -1,0 +1,589 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="./">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RDMA Bandwidth Utilization in Dispatch/Combine Kernels &mdash; MORI 0.1.0 documentation</title>
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
+
+  
+      <script src="_static/jquery.js?v=5d32c60e"></script>
+      <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="_static/documentation_options.js?v=01f34227"></script>
+      <script src="_static/doctools.js?v=9bcbadda"></script>
+      <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search"  style="background: #C00000" >
+
+          
+          
+          <a href="index.html" class="icon icon-home">
+            MORI
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="installation.html">Installation</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#requirements">Requirements</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#installation-methods">Installation Methods</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="installation.html#from-source">From Source</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#environment-variables">Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#verification">Verification</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#troubleshooting">Troubleshooting</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="quickstart.html">Quickstart</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-ep-dispatch-and-combine">MORI-EP: Dispatch and Combine</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-io-point-to-point-transfers">MORI-IO: Point-to-Point Transfers</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-shmem-symmetric-memory">MORI Shmem: Symmetric Memory</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-ir-device-bitcode-for-gpu-kernels">MORI-IR: Device Bitcode for GPU Kernels</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#profiling-with-mori-viz">Profiling with MORI-VIZ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#next-steps">Next Steps</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">User Guides</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-EP-GUIDE.html">MORI-EP User Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#kernel-types">1. Kernel Types</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#configuration">2. Configuration</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#epdispatchcombineconfig">EpDispatchCombineConfig</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#operator-api">3. Operator API</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#epdispatchcombineop">EpDispatchCombineOp</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#dispatch">dispatch()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#combine">combine()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#split-dispatch-combine-send-recv">Split dispatch/combine (send + recv)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#reset">reset()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#get-dispatch-src-token-pos">get_dispatch_src_token_pos()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#get-registered-combine-input-buffer">get_registered_combine_input_buffer()</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#standard-moe-compatibility-deepep">4. Standard MoE Compatibility (DeepEP)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#dispatch-standard-moe">dispatch_standard_moe()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#combine-standard-moe">combine_standard_moe()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#convert-dispatch-output">convert_dispatch_output()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#convert-combine-input">convert_combine_input()</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#initialization">5. Initialization</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#method-1-pytorch-process-group-recommended">Method 1: PyTorch Process Group (Recommended)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#method-2-unique-id-no-pytorch-distributed">Method 2: Unique ID (No PyTorch Distributed)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#launch-configuration">6. Launch Configuration</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#manual-mode-default">Manual Mode (Default)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#auto-mode">Auto Mode</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#complete-example">7. Complete Example</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#environment-variables">8. Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#benchmarking">9. Benchmarking</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#intra-node">Intra-node</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#inter-node">Inter-node</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#reference-performance-deepseek-v3-config">Reference Performance (DeepSeek V3 config)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#profiling-with-mori-viz">10. Profiling with MORI-VIZ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#framework-integration">11. Framework Integration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#build-options">Build Options</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-SHMEM-GUIDE.html">MORI Shmem Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#concepts">1. Concepts</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#symmetric-memory">Symmetric Memory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#processing-element-pe">Processing Element (PE)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#symmetric-heap">Symmetric Heap</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#initialization">2. Initialization</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#method-1-pytorch-process-group-recommended">Method 1: PyTorch Process Group (Recommended)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#method-2-unique-id-no-pytorch-distributed">Method 2: Unique ID (No PyTorch Distributed)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#method-3-mpi-communicator-c-mpi-environments">Method 3: MPI Communicator (C++ / MPI environments)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#initialization-comparison">Initialization Comparison</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#finalization">Finalization</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#query-apis">3. Query APIs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#memory-management">4. Memory Management</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#allocating-symmetric-memory">Allocating Symmetric Memory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#freeing-symmetric-memory">Freeing Symmetric Memory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#registering-existing-buffers">Registering Existing Buffers</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#p2p-address-translation">5. P2P Address Translation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#synchronization">6. Synchronization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#hip-module-init-triton-integration">7. HIP Module Init (Triton Integration)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#initialization-flags">8. Initialization Flags</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#environment-variables">Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IR-GUIDE.html">MORI-IR Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#architecture">Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#host-side-python-api">1. Host-Side Python API</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#mori-ir-framework-agnostic"><code class="docutils literal notranslate"><span class="pre">mori.ir</span></code> (framework-agnostic)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#mori-ir-triton-triton-specific-reference-backend"><code class="docutils literal notranslate"><span class="pre">mori.ir.triton</span></code> (Triton-specific reference backend)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#device-bitcode">2. Device Bitcode</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#device-functions">3. Device Functions</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#query">Query</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#point-to-point">Point-to-Point</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#putnbi-thread-warp-block">PutNbi (Thread / Warp / Block)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#putnbi-with-signal">PutNbi with Signal</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#immediate-put">Immediate Put</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#atomics">Atomics</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#wait">Wait</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#synchronization">Synchronization</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#integration-example-triton">4. Integration Example: Triton</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#integration-example-raw-bitcode-no-framework">5. Integration Example: Raw Bitcode (no framework)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#bitcode-jit-compilation">6. Bitcode JIT Compilation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#examples">7. Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#testing">8. Testing</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#known-limitations">Known Limitations</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IO-GUIDE.html">MORI-IO Introduction</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#design-concepts">Design &amp; Concepts</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#workflow">Workflow</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#architecture">Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#python-api-quick-reference">Python API Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#example-basic-read-write">Example: Basic Read/Write</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#environment-configuration">Environment &amp; Configuration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="PROFILER.html">MORI-VIZ (Visualizer)</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#overview">Overview</a></li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#instrumentation">Instrumentation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#include-headers">1. Include Headers</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#define-profiler-context">2. Define Profiler Context</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#add-trace-points">3. Add Trace Points</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#build-code-generation">Build &amp; Code Generation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#enabling-the-profiler">Enabling the Profiler</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#code-generation">Code Generation</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#python-analysis">Python Analysis</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#device-side-elapsed-time-measurement">Device-side Elapsed Time Measurement</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#viewing-the-trace">Viewing the Trace</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#best-practices">Best Practices</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Benchmarks</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-EP-BENCHMARK.html">MORI-EP Benchmark</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#intra-node">Intra-node</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#inter-node">Inter-node</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#nic-selection">NIC Selection</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#bandwidth-computation">Bandwidth Computation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#rdma-bandwidth">RDMA bandwidth</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="MORI-EP-BENCHMARK.html#algo-bw-vs-physical-bw">Algo BW vs Physical BW</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#nvl-xgmi-bandwidth">NVL / XGMI bandwidth</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#why-deepep-and-mori-rdma-token-counts-are-equivalent">Why DeepEP and Mori RDMA token counts are equivalent</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#combine">Combine</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#reference-print-bw-values-py">Reference: <code class="docutils literal notranslate"><span class="pre">print_bw_values.py</span></code></a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#profiling-ep-kernels">Profiling EP Kernels</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#analyzing-traces-with-analyze-ep-kernel-trace-py">Analyzing traces with <code class="docutils literal notranslate"><span class="pre">analyze_ep_kernel_trace.py</span></code></a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IO-BENCHMARK.html">MORI-IO Benchmark</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#benchmark-commands">Benchmark Commands</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#benchmark-arguments">Benchmark Arguments</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#results-thor2-rdma-read">Results: Thor2 RDMA Read</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#results-thor2-rdma-write">Results: Thor2 RDMA Write</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#message-size-sweep">Message Size Sweep</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#batch-size-sweep">Batch Size Sweep</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#results-cx7-rdma-batch-size-1">Results: CX7 RDMA (Batch Size = 1)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#write">Write</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#read">Read</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="api/communication.html">Communication APIs</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-ep-expert-parallelism">MORI-EP (Expert Parallelism)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-shmem-symmetric-memory">MORI Shmem (Symmetric Memory)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-io-point-to-point-i-o">MORI-IO (Point-to-Point I/O)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-ir-device-bitcode-integration">MORI-IR (Device Bitcode Integration)</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="api/profiler.html">MORI-VIZ Kernel Profiler</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#requirements">Requirements</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#usage">Usage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#export-to-perfetto">export_to_perfetto</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#c-profiler-apis">C++ Profiler APIs</a></li>
+</ul>
+</li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu"  style="background: #C00000" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="index.html">MORI</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">RDMA Bandwidth Utilization in Dispatch/Combine Kernels</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="_sources/rdma_bandwidth_utilization.md.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="rdma-bandwidth-utilization-in-dispatch-combine-kernels">
+<h1>RDMA Bandwidth Utilization in Dispatch/Combine Kernels<a class="headerlink" href="#rdma-bandwidth-utilization-in-dispatch-combine-kernels" title="Link to this heading"></a></h1>
+<section id="overview">
+<h2>Overview<a class="headerlink" href="#overview" title="Link to this heading"></a></h2>
+<p>This document explains how RDMA bandwidth is used in the <code class="docutils literal notranslate"><span class="pre">internode_v1</span></code> (and <code class="docutils literal notranslate"><span class="pre">v1_ll</span></code>) dispatch/combine kernels, and how to measure or verify that the RDMA link is being driven at full capacity.</p>
+</section>
+<hr class="docutils" />
+<section id="kernel-execution-path">
+<h2>Kernel Execution Path<a class="headerlink" href="#kernel-execution-path" title="Link to this heading"></a></h2>
+<p>Each dispatch+combine iteration consists of the following phases (as seen in the profiler trace):</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>ep_dispatch_copy_to_staging          [serial, separate kernel]
+    ↓
+EpDispatchInterNodeV1Kernel          [one kernel launch, two block groups]
+  ├─ RDMA blocks (blockId &lt; rdmaBlockNum)
+  │     dispatch_inter_node_send     → fire RDMA puts to other nodes
+  │     dispatch_inter_node_recv     → poll flags, copy received tokens into XGMI mem
+  └─ XGMI blocks (blockId &gt;= rdmaBlockNum)
+        dispatch_intra               → direct XGMI writes to intra-node peers
+  [all blocks] dispatch_sync         → barrier, signal recv counts, shmem_quiet
+    ↓
+EpCombineSync                        [serial, separate kernel]
+    combine_sync                     → copy local expert outputs into combineInp staging;
+                                       accumulate routing weights; reset dispatch counters
+    ↓
+EpCombineSyncBarrier                 [serial, 1 block × 1 warp]
+    ep_combine_sync_barrier          → cross-device barrier via RDMA AMO to every peer node;
+                                       spins until all nodes acknowledge before combine starts
+    ↓
+EpCombineInterNodeV1Kernel           [one kernel launch, two block groups]
+  ├─ RDMA blocks
+  │     combine_inter_node           → poll flags, accumulate, RDMA-send results back
+  └─ XGMI blocks
+        combine_intra_node           → accumulate intra-node contributions
+    ↓
+EpCombineAll                         [serial, separate kernel]
+    ep_combine_all                   → final weighted accumulation across all nodes into output
+</pre></div>
+</div>
+<p>The low-latency variant (<code class="docutils literal notranslate"><span class="pre">v1_ll</span></code>) has the same structure but uses
+<code class="docutils literal notranslate"><span class="pre">dispatch_inter_node_ll_send</span></code> / <code class="docutils literal notranslate"><span class="pre">_ll_recv</span></code> / <code class="docutils literal notranslate"><span class="pre">combine_inter_node_ll</span></code> / <code class="docutils literal notranslate"><span class="pre">combine_intra_node_ll</span></code>.</p>
+</section>
+<hr class="docutils" />
+<section id="what-rdma-actually-transfers">
+<h2>What RDMA Actually Transfers<a class="headerlink" href="#what-rdma-actually-transfers" title="Link to this heading"></a></h2>
+<section id="dispatch-send-dispatchinternodesend-dispatchinternodellsend">
+<h3>Dispatch send (<code class="docutils literal notranslate"><span class="pre">DispatchInterNodeSend</span></code> / <code class="docutils literal notranslate"><span class="pre">DispatchInterNodeLLSend</span></code>)<a class="headerlink" href="#dispatch-send-dispatchinternodesend-dispatchinternodellsend" title="Link to this heading"></a></h3>
+<p>Each RDMA block iterates over chunks of <code class="docutils literal notranslate"><span class="pre">warpSize</span></code> (64) local tokens and fires one
+<code class="docutils literal notranslate"><span class="pre">ShmemPutMemNbiSignalThread</span></code> call per chunk per remote node:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="nb">bytes</span> <span class="n">per</span> <span class="n">put</span> <span class="o">=</span> <span class="n">tokenNum</span> <span class="o">*</span> <span class="n">xferBytes</span>
+<span class="n">xferBytes</span>     <span class="o">=</span> <span class="n">hiddenBytes</span> <span class="o">+</span> <span class="n">indexBytes</span> <span class="o">+</span> <span class="n">weightBytes</span> <span class="o">+</span> <span class="n">scaleBytes</span> <span class="o">+</span> <span class="n">sizeof</span><span class="p">(</span><span class="n">index_t</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>The put is a 1-sided non-blocking RDMA write + remote atomic signal. QP selection rotates
+across <code class="docutils literal notranslate"><span class="pre">numQpPerPe</span></code> queue pairs:</p>
+<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="kt">int</span><span class="w"> </span><span class="n">qpId</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">tokenId</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">warpSize</span><span class="p">)</span><span class="w"> </span><span class="o">%</span><span class="w"> </span><span class="n">config</span><span class="p">.</span><span class="n">numQpPerPe</span><span class="p">;</span>
+</pre></div>
+</div>
+<p>Total bytes injected per rank per iteration (dispatch direction):</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>dispatch_rdma_bytes = curRankNumToken × xferBytes × (nNodes - 1)
+</pre></div>
+</div>
+</section>
+<section id="combine-send-combineinternodetyped-combineinternodelltyped">
+<h3>Combine send (<code class="docutils literal notranslate"><span class="pre">CombineInterNodeTyped</span></code> / <code class="docutils literal notranslate"><span class="pre">CombineInterNodeLLTyped</span></code>)<a class="headerlink" href="#combine-send-combineinternodetyped-combineinternodelltyped" title="Link to this heading"></a></h3>
+<p>After accumulating the expert outputs, the combine RDMA blocks fire one
+<code class="docutils literal notranslate"><span class="pre">ShmemPutTypeNbiWarp</span></code> per completed chunk back to the originating node:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="nb">bytes</span> <span class="n">per</span> <span class="n">put</span> <span class="o">=</span> <span class="n">thisChunkTokenNum</span> <span class="o">*</span> <span class="n">tokCombXferBytes</span>
+<span class="n">tokCombXferBytes</span> <span class="o">=</span> <span class="n">hiddenBytes</span>  <span class="p">(</span><span class="ow">or</span> <span class="n">fp8HiddenBytes</span> <span class="k">for</span> <span class="n">FP8</span> <span class="n">paths</span><span class="p">)</span>
+                 <span class="o">+</span> <span class="n">weightBytes</span>  <span class="p">(</span><span class="k">if</span> <span class="n">weightsBuf</span> <span class="o">!=</span> <span class="n">nullptr</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>Total bytes per rank per iteration (combine direction):</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>combine_rdma_bytes = curRankNumToken × tokCombXferBytes × (nNodes - 1)
+</pre></div>
+</div>
+</section>
+</section>
+<hr class="docutils" />
+<section id="theoretical-peak-vs-observed-throughput">
+<h2>Theoretical Peak vs. Observed Throughput<a class="headerlink" href="#theoretical-peak-vs-observed-throughput" title="Link to this heading"></a></h2>
+<section id="computing-theoretical-peak">
+<h3>Computing theoretical peak<a class="headerlink" href="#computing-theoretical-peak" title="Link to this heading"></a></h3>
+<p>Given a profiler trace (times in microseconds):</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">dispatch_send_duration_us</span>   <span class="o">=</span> <span class="n">wall</span><span class="o">-</span><span class="n">clock</span> <span class="n">span</span> <span class="n">of</span> <span class="n">dispatch_inter_node_send</span>
+<span class="n">combine_inter_duration_us</span>   <span class="o">=</span> <span class="n">wall</span><span class="o">-</span><span class="n">clock</span> <span class="n">span</span> <span class="n">of</span> <span class="n">combine_inter_node</span>
+</pre></div>
+</div>
+<p>Theoretical RDMA throughput check:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># Example calculation</span>
+<span class="n">hidden_dim</span>     <span class="o">=</span> <span class="mi">7168</span>            <span class="c1"># model hidden dim</span>
+<span class="n">dtype_bytes</span>    <span class="o">=</span> <span class="mi">2</span>               <span class="c1"># bf16</span>
+<span class="n">index_bytes</span>    <span class="o">=</span> <span class="n">topk</span> <span class="o">*</span> <span class="mi">4</span>       <span class="c1"># int32 per expert slot</span>
+<span class="n">weight_bytes</span>   <span class="o">=</span> <span class="n">topk</span> <span class="o">*</span> <span class="mi">4</span>       <span class="c1"># float32</span>
+<span class="n">scale_bytes</span>    <span class="o">=</span> <span class="n">scale_dim</span> <span class="o">*</span> <span class="n">scale_type_size</span>  <span class="c1"># optional</span>
+
+<span class="n">xfer_bytes_tok</span> <span class="o">=</span> <span class="n">hidden_dim</span> <span class="o">*</span> <span class="n">dtype_bytes</span> <span class="o">+</span> <span class="n">index_bytes</span> <span class="o">+</span> <span class="n">weight_bytes</span> <span class="o">+</span> <span class="n">scale_bytes</span> <span class="o">+</span> <span class="mi">4</span>
+
+<span class="n">total_send_bytes</span> <span class="o">=</span> <span class="n">cur_rank_num_token</span> <span class="o">*</span> <span class="n">xfer_bytes_tok</span> <span class="o">*</span> <span class="p">(</span><span class="n">n_nodes</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span>
+
+<span class="c1"># From trace</span>
+<span class="n">send_dur_sec</span> <span class="o">=</span> <span class="n">dispatch_send_duration_us</span> <span class="o">*</span> <span class="mf">1e-6</span>
+
+<span class="n">observed_bw_GBps</span> <span class="o">=</span> <span class="n">total_send_bytes</span> <span class="o">/</span> <span class="n">send_dur_sec</span> <span class="o">/</span> <span class="mf">1e9</span>
+
+<span class="c1"># Compare to link rating, e.g. 400 Gb/s = 50 GB/s per port</span>
+<span class="c1"># With numQpPerPe QPs the effective ceiling is still the NIC BW</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Observed RDMA send BW: </span><span class="si">{</span><span class="n">observed_bw_GBps</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2"> GB/s&quot;</span><span class="p">)</span>
+</pre></div>
+</div>
+</section>
+<section id="understanding-the-receive-side-timing">
+<h3>Understanding the receive-side timing<a class="headerlink" href="#understanding-the-receive-side-timing" title="Link to this heading"></a></h3>
+<p>The <code class="docutils literal notranslate"><span class="pre">dispatch_inter_node_recv</span></code> / <code class="docutils literal notranslate"><span class="pre">combine_inter_node</span></code> spans include both:</p>
+<ol class="arabic simple">
+<li><p><strong>Waiting (spinning)</strong> on <code class="docutils literal notranslate"><span class="pre">chunkFlag</span></code> or <code class="docutils literal notranslate"><span class="pre">nodeRecvTokenNum</span></code> flags until the remote data arrives.</p></li>
+<li><p><strong>Copying</strong> from the RDMA staging buffer into XGMI-accessible memory.</p></li>
+</ol>
+<p>A long <code class="docutils literal notranslate"><span class="pre">recv</span></code> span relative to the <code class="docutils literal notranslate"><span class="pre">send</span></code> span indicates the receiver is
+<strong>blocked waiting for data</strong> — the NIC/fabric is the bottleneck.
+A short <code class="docutils literal notranslate"><span class="pre">recv</span></code> span means the data arrived before or soon after the receiver started polling.</p>
+</section>
+</section>
+<hr class="docutils" />
+<section id="how-to-check-rdma-bandwidth-from-the-trace">
+<h2>How to Check RDMA Bandwidth from the Trace<a class="headerlink" href="#how-to-check-rdma-bandwidth-from-the-trace" title="Link to this heading"></a></h2>
+<section id="step-1-collect-a-profiler-trace">
+<h3>Step 1: Collect a profiler trace<a class="headerlink" href="#step-1-collect-a-profiler-trace" title="Link to this heading"></a></h3>
+<p>Enable the kernel profiler (requires <code class="docutils literal notranslate"><span class="pre">ENABLE_PROFILER</span></code> build flag) and run:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>analyze_trace_internode.py<span class="w"> </span>&lt;trace_rank_0_XXXXXX.json&gt;<span class="w"> </span>--out<span class="w"> </span>timeline.png
+</pre></div>
+</div>
+<p>The trace gives wall-clock spans for each kernel on each warp, merged into a
+single timeline per iteration.</p>
+</section>
+<section id="step-2-read-key-durations-from-the-text-summary">
+<h3>Step 2: Read key durations from the text summary<a class="headerlink" href="#step-2-read-key-durations-from-the-text-summary" title="Link to this heading"></a></h3>
+<p>The script prints:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>Kernel                             start      end      dur
+dispatch_inter_node_send          0.00    120.00   120.00   ← RDMA send phase
+dispatch_inter_node_recv         10.00    350.00   340.00   ← poll + copy received tokens
+dispatch_intra                    0.00    180.00   180.00   ← concurrent XGMI
+dispatch_sync                   350.00    360.00    10.00   ← barrier + shmem_quiet
+combine_sync                    360.00    400.00    40.00   ← copy outputs into staging
+ep_combine_sync_barrier         400.00    420.00    20.00   ← cross-node AMO barrier
+combine_inter_node              420.00    760.00   340.00   ← RDMA combine (concurrent)
+combine_intra_node              420.00    560.00   140.00   ← XGMI combine (concurrent)
+ep_combine_all                  760.00    810.00    50.00   ← final accumulation
+</pre></div>
+</div>
+</section>
+<section id="step-3-compute-observed-rdma-bandwidth">
+<h3>Step 3: Compute observed RDMA bandwidth<a class="headerlink" href="#step-3-compute-observed-rdma-bandwidth" title="Link to this heading"></a></h3>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># Plug in values from your config and trace</span>
+<span class="n">send_dur_us</span>        <span class="o">=</span> <span class="mf">120.0</span>        <span class="c1"># dispatch_inter_node_send wall-clock span</span>
+<span class="n">combine_dur_us</span>     <span class="o">=</span> <span class="mf">340.0</span>        <span class="c1"># combine_inter_node wall-clock span</span>
+<span class="n">cur_rank_num_token</span> <span class="o">=</span> <span class="mi">2048</span>
+<span class="n">n_nodes</span>            <span class="o">=</span> <span class="mi">4</span>
+<span class="n">hidden_dim</span>         <span class="o">=</span> <span class="mi">7168</span>
+<span class="n">dtype_bytes</span>        <span class="o">=</span> <span class="mi">2</span>            <span class="c1"># bf16</span>
+<span class="n">topk</span>               <span class="o">=</span> <span class="mi">4</span>
+<span class="n">xfer_bytes_tok</span>     <span class="o">=</span> <span class="n">hidden_dim</span> <span class="o">*</span> <span class="n">dtype_bytes</span> <span class="o">+</span> <span class="n">topk</span> <span class="o">*</span> <span class="mi">4</span> <span class="o">+</span> <span class="n">topk</span> <span class="o">*</span> <span class="mi">4</span> <span class="o">+</span> <span class="mi">4</span>
+
+<span class="n">dispatch_bytes</span> <span class="o">=</span> <span class="n">cur_rank_num_token</span> <span class="o">*</span> <span class="n">xfer_bytes_tok</span> <span class="o">*</span> <span class="p">(</span><span class="n">n_nodes</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span>
+<span class="n">combine_bytes</span>  <span class="o">=</span> <span class="n">cur_rank_num_token</span> <span class="o">*</span> <span class="n">hidden_dim</span> <span class="o">*</span> <span class="n">dtype_bytes</span> <span class="o">*</span> <span class="p">(</span><span class="n">n_nodes</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span>
+
+<span class="n">dispatch_bw_GBps</span> <span class="o">=</span> <span class="n">dispatch_bytes</span> <span class="o">/</span> <span class="p">(</span><span class="n">send_dur_us</span> <span class="o">*</span> <span class="mf">1e-6</span><span class="p">)</span> <span class="o">/</span> <span class="mf">1e9</span>
+<span class="n">combine_bw_GBps</span>  <span class="o">=</span> <span class="n">combine_bytes</span>  <span class="o">/</span> <span class="p">(</span><span class="n">combine_dur_us</span> <span class="o">*</span> <span class="mf">1e-6</span><span class="p">)</span> <span class="o">/</span> <span class="mf">1e9</span>
+
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Dispatch RDMA BW: </span><span class="si">{</span><span class="n">dispatch_bw_GBps</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2"> GB/s&quot;</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Combine  RDMA BW: </span><span class="si">{</span><span class="n">combine_bw_GBps</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2"> GB/s&quot;</span><span class="p">)</span>
+</pre></div>
+</div>
+</section>
+<section id="step-4-interpret-results">
+<h3>Step 4: Interpret results<a class="headerlink" href="#step-4-interpret-results" title="Link to this heading"></a></h3>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Observation</p></th>
+<th class="head"><p>Likely cause</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">send_dur</span></code> ≈ <code class="docutils literal notranslate"><span class="pre">dispatch_bytes</span> <span class="pre">/</span> <span class="pre">NIC_BW</span></code></p></td>
+<td><p>Send side is BW-saturated (good)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">recv_dur</span></code> &gt;&gt; <code class="docutils literal notranslate"><span class="pre">send_dur</span></code></p></td>
+<td><p>Receiver spins waiting; fabric or sender is the bottleneck</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">recv_dur</span></code> &lt;&lt; <code class="docutils literal notranslate"><span class="pre">send_dur</span></code></p></td>
+<td><p>Receiver catches up quickly; may be underloaded (small batch)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">combine_inter_dur</span></code> &gt;&gt; <code class="docutils literal notranslate"><span class="pre">combine_rdma_bytes</span> <span class="pre">/</span> <span class="pre">NIC_BW</span></code></p></td>
+<td><p>Poll loop stall or NIC contention</p></td>
+</tr>
+<tr class="row-even"><td><p>Iteration time dominated by <code class="docutils literal notranslate"><span class="pre">dispatch_sync</span></code> or <code class="docutils literal notranslate"><span class="pre">combine_sync</span></code></p></td>
+<td><p>Barrier overhead, not BW</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<hr class="docutils" />
+<section id="key-tuning-parameters-that-affect-rdma-utilization">
+<h2>Key Tuning Parameters That Affect RDMA Utilization<a class="headerlink" href="#key-tuning-parameters-that-affect-rdma-utilization" title="Link to this heading"></a></h2>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Parameter</p></th>
+<th class="head"><p>Effect</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">rdmaBlockNum</span></code></p></td>
+<td><p>More RDMA blocks → more warps driving sends concurrently</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">numQpPerPe</span></code></p></td>
+<td><p>More QPs → more in-flight RDMA operations, reduces head-of-line blocking</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">curRankNumToken</span></code> (batch size)</p></td>
+<td><p>Larger batches → longer RDMA transfers → easier to saturate</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">xferBytes</span></code> (hidden dim, topk)</p></td>
+<td><p>Larger transfer size per token → higher bandwidth per put</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">warpSize</span></code>-aligned chunks</p></td>
+<td><p>Chunk size = 64 tokens; larger chunks = fewer puts with less overhead</p></td>
+</tr>
+</tbody>
+</table>
+<section id="v1-vs-v1-ll-low-latency-tradeoff">
+<h3>v1 vs. v1_ll (low-latency) tradeoff<a class="headerlink" href="#v1-vs-v1-ll-low-latency-tradeoff" title="Link to this heading"></a></h3>
+<ul class="simple">
+<li><p><strong>v1</strong>: Each RDMA block handles a contiguous range of chunks per remote node. The recv polling is simple but may stall if chunks are out of order across nodes.</p></li>
+<li><p><strong>v1_ll</strong>: Work is distributed per <code class="docutils literal notranslate"><span class="pre">(expert,</span> <span class="pre">token,</span> <span class="pre">node)</span></code> triplet. Each warp picks up work as soon as any chunk flag signals. Better latency at small batch sizes; similar peak BW at large batches.</p></li>
+</ul>
+</section>
+</section>
+<hr class="docutils" />
+<section id="sanity-checks-from-hardware-counters-optional">
+<h2>Sanity Checks from Hardware Counters (optional)<a class="headerlink" href="#sanity-checks-from-hardware-counters-optional" title="Link to this heading"></a></h2>
+<p>If you have access to <code class="docutils literal notranslate"><span class="pre">rocprof</span></code> or equivalent:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>rocprof<span class="w"> </span>--stats<span class="w"> </span>--hip-trace<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--counter<span class="w"> </span><span class="s2">&quot;TCC_EA_RDREQ_sum,TCC_EA_WRREQ_sum&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>python<span class="w"> </span>run_dispatch_combine.py
+</pre></div>
+</div>
+<p>Cross-check the <code class="docutils literal notranslate"><span class="pre">TCC_EA_WRREQ</span></code> write request count against
+<code class="docutils literal notranslate"><span class="pre">total_sends</span> <span class="pre">=</span> <span class="pre">curRankNumToken</span> <span class="pre">/</span> <span class="pre">warpSize</span> <span class="pre">*</span> <span class="pre">nQpPerPe</span> <span class="pre">*</span> <span class="pre">(nNodes</span> <span class="pre">-</span> <span class="pre">1)</span></code>.</p>
+<p>For RDMA-specific counters (NIC-side), use the vendor tool (e.g., <code class="docutils literal notranslate"><span class="pre">perfquery</span></code> for InfiniBand or
+the AMD NIC perf tools) to observe port-level <code class="docutils literal notranslate"><span class="pre">PortXmitData</span></code> and <code class="docutils literal notranslate"><span class="pre">PortRcvData</span></code> during the run.
+If <code class="docutils literal notranslate"><span class="pre">PortXmitData</span> <span class="pre">/</span> <span class="pre">iteration_time</span></code> ≈ rated NIC bandwidth, the link is saturated.</p>
+</section>
+<hr class="docutils" />
+<section id="summary">
+<h2>Summary<a class="headerlink" href="#summary" title="Link to this heading"></a></h2>
+<p>To determine if RDMA is fully utilized:</p>
+<ol class="arabic simple">
+<li><p><strong>Collect a trace</strong> with the built-in kernel profiler.</p></li>
+<li><p><strong>Read <code class="docutils literal notranslate"><span class="pre">dispatch_inter_node_send</span></code> duration</strong> from the text summary.</p></li>
+<li><p><strong>Compute theoretical bytes</strong> sent (tokens × xferBytes × (nNodes − 1)).</p></li>
+<li><p><strong>Divide</strong> to get observed GB/s; compare to the NIC’s rated bandwidth.</p></li>
+<li><p>If observed &lt; rated by &gt;20%, look for: too few QPs, too small batch, or the recv side
+blocking the send side (check <code class="docutils literal notranslate"><span class="pre">recv</span></code> span vs. <code class="docutils literal notranslate"><span class="pre">send</span></code> span ratio).</p></li>
+</ol>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2026, AMD.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>
