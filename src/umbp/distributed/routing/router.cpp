@@ -45,6 +45,7 @@ std::optional<Location> Router::RouteGet(const std::string& key, const std::stri
 
   Location selected = get_strategy_->Select(locations, node_id);
   index_.RecordAccess(key);
+  index_.GrantLease(key, lease_duration_);
 
   MORI_UMBP_DEBUG("[Router] RouteGet key='{}': selected node={}, location={}", key,
                   selected.node_id, selected.location_id);
@@ -54,7 +55,13 @@ std::optional<Location> Router::RouteGet(const std::string& key, const std::stri
 std::optional<RoutePutResult> Router::RoutePut(const std::string& key, const std::string& node_id,
                                                uint64_t block_size) {
   auto candidates = registry_.GetAliveClients();
+  return RoutePutSingle(key, node_id, block_size, candidates);
+}
 
+std::optional<RoutePutResult> Router::RoutePutSingle(const std::string& key,
+                                                     const std::string& node_id,
+                                                     uint64_t block_size,
+                                                     std::vector<ClientRecord>& candidates) {
   if (candidates.empty()) {
     MORI_UMBP_DEBUG("[Router] RoutePut key='{}' from={}: no alive clients", key, node_id);
     return std::nullopt;
@@ -90,6 +97,26 @@ std::optional<RoutePutResult> Router::RoutePut(const std::string& key, const std
       }
     }
   }
+}
+
+std::vector<std::optional<RoutePutResult>> Router::BatchRoutePut(
+    const std::vector<std::string>& keys, const std::string& node_id,
+    const std::vector<uint64_t>& block_sizes) {
+  auto candidates = registry_.GetAliveClients();
+  std::vector<std::optional<RoutePutResult>> results(keys.size());
+  for (size_t i = 0; i < keys.size(); ++i) {
+    results[i] = RoutePutSingle(keys[i], node_id, block_sizes[i], candidates);
+  }
+  return results;
+}
+
+std::vector<std::optional<Location>> Router::BatchRouteGet(const std::vector<std::string>& keys,
+                                                           const std::string& node_id) {
+  std::vector<std::optional<Location>> results(keys.size());
+  for (size_t i = 0; i < keys.size(); ++i) {
+    results[i] = RouteGet(keys[i], node_id);
+  }
+  return results;
 }
 
 }  // namespace mori::umbp

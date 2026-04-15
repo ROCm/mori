@@ -41,6 +41,7 @@ struct ClientRegistryConfig {
   std::chrono::seconds heartbeat_ttl{10};
   std::chrono::seconds reaper_interval{5};
   std::chrono::seconds allocation_ttl{30};
+  std::chrono::seconds finalized_record_ttl{120};
   uint32_t max_missed_heartbeats = 3;
 };
 
@@ -51,9 +52,18 @@ struct MasterClientConfig {
   bool auto_heartbeat = true;
 };
 
+struct EvictionConfig {
+  double high_watermark = 0.9;
+  double low_watermark = 0.7;
+  std::chrono::seconds check_interval{5};
+  std::chrono::seconds lease_duration{10};
+  size_t evict_batch_size = 32;
+};
+
 struct MasterServerConfig {
   std::string listen_address = "0.0.0.0:50051";
   ClientRegistryConfig registry_config;
+  EvictionConfig eviction_config;
 
   std::unique_ptr<RouteGetStrategy> get_strategy;
   std::unique_ptr<RoutePutStrategy> put_strategy;
