@@ -332,11 +332,9 @@ enum class {group.enum_name} : int {{
 
 #pragma once
 
-#ifdef ENABLE_PROFILER
-
+// Slot headers are included unconditionally: each defines its INIT_CONTEXT macro
+// as ((void)0) when ENABLE_PROFILER is not set, so they are always safe to include.
 {chr(10).join(includes)}
-
-#endif  // ENABLE_PROFILER
 """
     unified_file = output_include_dir / "profiler.hpp"
 
@@ -394,8 +392,10 @@ void BindAllProfilerSlots(pybind11::module_& m) {
     if has_collision:
         all_slots_function += """
   // WARNING: Multiple modules detected. Using prefixed names to avoid collisions.
-  // If multiple modules share the same trace buffer, consider using separate buffers
-  // or manually allocating non-overlapping slot ID ranges.
+  // Each module's enums start from 0 independently; entries are inserted with
+  // "first-wins" semantics so the alphabetically-first module's names are kept
+  // for any overlapping slot IDs. For correct per-kernel traces, pass the
+  // appropriate per-kernel Slots submodule explicitly to export_to_perfetto().
 """
         for base_name, group in sorted(groups.items()):
             xmacro_name = f"{base_name.upper()}_PROFILER_SLOTS"
@@ -404,7 +404,7 @@ void BindAllProfilerSlots(pybind11::module_& m) {
   // {group.enum_name} (prefixed as "{prefix}.*")
   {{
     int counter = 0;
-#define X(name, py_str) all_slots[pybind11::int_(counter++)] = pybind11::cast(std::string("{prefix}.") + py_str);
+#define X(name, py_str) {{ auto _k = pybind11::int_(counter++); if (!all_slots.contains(_k)) all_slots[_k] = pybind11::cast(std::string("{prefix}.") + py_str); }}
     {xmacro_name}(X)
 #undef X
   }}

@@ -160,7 +160,7 @@ if(ENABLE_PROFILER)
     REQUIRED)
 
   set(PROFILER_GEN_SCRIPT
-      ${CMAKE_SOURCE_DIR}/tools/generate_profiler_bindings.py)
+      ${CMAKE_SOURCE_DIR}/tools/profiler/generate_profiler_bindings.py)
   set(PROFILER_OUTPUT_INCLUDE
       ${CMAKE_BINARY_DIR}/generated/include/mori/profiler)
   set(PROFILER_OUTPUT_PYBIND

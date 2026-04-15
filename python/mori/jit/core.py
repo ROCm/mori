@@ -28,11 +28,12 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
 
-from mori.jit.cache import get_cache_dir
+from mori.jit.cache import get_cache_dir, get_cache_root
 from mori.jit.config import (
     BuildConfig,
     detect_build_config,
@@ -173,16 +174,38 @@ def _profiler_defines() -> list[str]:
     return ["-DENABLE_PROFILER"] if is_profiler_enabled() else []
 
 
-def _find_generated_include(mori_root: Path) -> Path | None:
-    """Find the CMake-generated include directory containing mori/profiler/profiler.hpp.
+def _ensure_generated_include(mori_root: Path) -> Path:
+    """Run generate_profiler_bindings.py into the JIT cache and return the include root.
 
-    The generated headers live in build_<hostname>/generated/include/ and are
-    not part of the source tree. Returns the first matching directory found.
+    Always runs the generator (which is idempotent via write_if_changed) so that
+    profiler slot changes in source are picked up without invalidating the JIT cache.
+    Returns ``<cache_root>/generated/include/``, which must be passed as ``-I`` to hipcc.
     """
-    for gen_dir in sorted(mori_root.glob("build_*/generated/include")):
-        if (gen_dir / "mori" / "profiler" / "profiler.hpp").is_file():
-            return gen_dir
-    return None
+    gen_script = mori_root / "tools" / "profiler" / "generate_profiler_bindings.py"
+    if not gen_script.is_file():
+        raise FileNotFoundError(
+            f"Profiler binding generator not found: {gen_script}\n"
+            "JIT compilation with ENABLE_PROFILER requires the mori source tree."
+        )
+
+    out_include = get_cache_root() / "generated" / "include"
+    profiler_include_dir = out_include / "mori" / "profiler"
+    pybind_out = get_cache_root() / "generated" / "profiler_bindings.cpp"
+
+    subprocess.check_call(
+        [
+            sys.executable,
+            str(gen_script),
+            str(mori_root),
+            str(mori_root / "src"),
+            str(profiler_include_dir),
+            str(pybind_out),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.STDOUT,
+    )
+
+    return out_include
 
 
 def _collect_include_dirs(mori_root: Path) -> list[Path]:
@@ -198,11 +221,11 @@ def _collect_include_dirs(mori_root: Path) -> list[Path]:
     if mpi_inc:
         dirs.append(Path(mpi_inc))
 
-    # Add CMake-generated headers (e.g. mori/profiler/profiler.hpp) which are
-    # produced by generate_profiler_bindings.py and written to the build tree.
-    gen_inc = _find_generated_include(mori_root)
-    if gen_inc is not None:
-        dirs.append(gen_inc)
+    # Generate profiler slot headers JIT into the cache (idempotent, fast).
+    # Always included: kernel sources unconditionally include mori/profiler/profiler.hpp
+    # which lives in the generated dir. The headers have #ifdef ENABLE_PROFILER guards
+    # so they are safe to include even when profiler is disabled.
+    dirs.append(_ensure_generated_include(mori_root))
 
     return dirs
 
