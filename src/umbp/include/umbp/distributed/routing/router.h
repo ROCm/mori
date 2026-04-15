@@ -21,9 +21,12 @@
 // SOFTWARE.
 #pragma once
 
+#include <chrono>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "umbp/distributed/master/client_registry.h"
 #include "umbp/distributed/master/global_block_index.h"
@@ -56,11 +59,25 @@ class Router {
   std::optional<RoutePutResult> RoutePut(const std::string& key, const std::string& node_id,
                                          uint64_t block_size);
 
+  std::vector<std::optional<RoutePutResult>> BatchRoutePut(
+      const std::vector<std::string>& keys, const std::string& node_id,
+      const std::vector<uint64_t>& block_sizes);
+
+  std::vector<std::optional<Location>> BatchRouteGet(const std::vector<std::string>& keys,
+                                                     const std::string& node_id);
+
+  void SetLeaseDuration(std::chrono::steady_clock::duration d) { lease_duration_ = d; }
+
  private:
+  std::optional<RoutePutResult> RoutePutSingle(const std::string& key, const std::string& node_id,
+                                               uint64_t block_size,
+                                               std::vector<ClientRecord>& candidates);
+
   GlobalBlockIndex& index_;
   ClientRegistry& registry_;
   std::unique_ptr<RouteGetStrategy> get_strategy_;
   std::unique_ptr<RoutePutStrategy> put_strategy_;
+  std::chrono::steady_clock::duration lease_duration_{std::chrono::seconds{10}};
 };
 
 }  // namespace mori::umbp

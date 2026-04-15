@@ -137,6 +137,7 @@ message FinalizeRequest {
   string   key           = 2;
   Location location      = 3;
   string   allocation_id = 4;
+  int32    depth         = 5;  // -1 = not set; client must always set this field explicitly
 }
 message FinalizeResponse {
   bool finalized = 1;
@@ -161,6 +162,57 @@ message AbortAllocationResponse {
 }
 
 // ============================================================
+//  Batch RPCs
+// ============================================================
+
+message BatchRoutePutRequest {
+  string node_id = 1;
+  repeated string keys = 2;
+  repeated uint64 block_sizes = 3;
+}
+message BatchRoutePutEntry {
+  bool     found            = 1;
+  string   node_id          = 2;
+  string   node_address     = 3;
+  TierType tier             = 4;
+  string   peer_address     = 5;
+  bytes    engine_desc      = 6;
+  bytes    dram_memory_desc = 7;
+  uint64   allocated_offset = 8;
+  uint32   buffer_index     = 9;
+  string   allocation_id    = 10;
+}
+message BatchRoutePutResponse {
+  repeated BatchRoutePutEntry entries = 1;
+}
+
+message BatchRouteGetRequest {
+  string node_id = 1;
+  repeated string keys = 2;
+}
+message BatchRouteGetEntry {
+  bool     found            = 1;
+  Location source           = 2;
+  string   peer_address     = 3;
+  bytes    engine_desc      = 4;
+  bytes    dram_memory_desc = 5;
+}
+message BatchRouteGetResponse {
+  repeated BatchRouteGetEntry entries = 1;
+}
+
+message BatchFinalizeRequest {
+  string node_id = 1;
+  repeated string keys = 2;
+  repeated Location locations = 3;
+  repeated string allocation_ids = 4;
+  repeated int32 depths = 5;
+}
+message BatchFinalizeResponse {
+  repeated bool finalized = 1;
+}
+
+// ============================================================
 //  Single unified service
 // ============================================================
 
@@ -181,4 +233,9 @@ service UMBPMaster {
   // Router
   rpc RouteGet(RouteGetRequest) returns (RouteGetResponse);
   rpc RoutePut(RoutePutRequest) returns (RoutePutResponse);
+
+  // Batch
+  rpc BatchRoutePut(BatchRoutePutRequest) returns (BatchRoutePutResponse);
+  rpc BatchRouteGet(BatchRouteGetRequest) returns (BatchRouteGetResponse);
+  rpc BatchFinalizeAllocation(BatchFinalizeRequest) returns (BatchFinalizeResponse);
 }

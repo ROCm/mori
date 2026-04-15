@@ -24,6 +24,7 @@
 #include <chrono>
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -115,6 +116,24 @@ inline const char* ClientStatusName(ClientStatus s) {
       return "EXPIRED";
     default:
       return "UNKNOWN";
+  }
+}
+
+struct ParsedLocationId {
+  uint32_t buffer_index = 0;
+  uint64_t offset = 0;
+};
+
+inline std::optional<ParsedLocationId> ParseLocationId(const std::string& location_id) {
+  auto colon = location_id.find(':');
+  if (colon == std::string::npos) return std::nullopt;
+  try {
+    ParsedLocationId result;
+    result.buffer_index = static_cast<uint32_t>(std::stoul(location_id.substr(0, colon)));
+    result.offset = std::stoull(location_id.substr(colon + 1));
+    return result;
+  } catch (...) {
+    return std::nullopt;
   }
 }
 

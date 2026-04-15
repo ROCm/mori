@@ -35,7 +35,7 @@ namespace mori::umbp {
 ///
 /// Two implementations exist behind this interface:
 ///   - StandaloneClient: purely local DRAM+SSD storage, no networking.
-///   - DistributedClient (future): master-led global routing + RDMA data plane.
+///   - DistributedClient: master-led global routing + RDMA data plane.
 ///
 /// Use CreateUMBPClient() to obtain the appropriate implementation based on
 /// UMBPConfig. All methods are zero-copy and pointer-based, designed for
@@ -100,8 +100,8 @@ class IUMBPClient {
 };
 
 /// Factory: creates the appropriate IUMBPClient implementation.
-/// Currently always creates a StandaloneClient.  config.distributed is
-/// reserved for the future DistributedClient and is ignored for now.
+/// Creates StandaloneClient when config.distributed is not set,
+/// DistributedClient when it is.
 std::unique_ptr<IUMBPClient> CreateUMBPClient(const UMBPConfig& config = UMBPConfig{});
 
 }  // namespace mori::umbp

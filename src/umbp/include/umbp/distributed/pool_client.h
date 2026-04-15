@@ -85,6 +85,17 @@ class PoolClient {
   // SSD: RoutePut -> AllocateWriteSlot -> RDMA write -> CommitSsdWrite.
   bool PutRemote(const std::string& key, const void* src, size_t size);
 
+  // Batch write: single gRPC for routing + batched RDMA + single gRPC for finalize.
+  std::vector<bool> BatchPutRemote(const std::vector<std::string>& keys,
+                                   const std::vector<const void*>& srcs,
+                                   const std::vector<size_t>& sizes,
+                                   const std::vector<int>& depths = {});
+
+  // Batch read: single gRPC for routing + batched RDMA.
+  std::vector<bool> BatchGetRemote(const std::vector<std::string>& keys,
+                                   const std::vector<void*>& dsts,
+                                   const std::vector<size_t>& sizes);
+
   // Unregister a block from the Master (block no longer remotely accessible).
   bool UnregisterFromMaster(const std::string& key);
 

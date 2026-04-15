@@ -29,6 +29,15 @@ add_executable(test_umbp_pool_allocator test_pool_allocator.cpp)
 target_link_libraries(test_umbp_pool_allocator PRIVATE umbp_common gtest_main)
 add_test(NAME umbp_pool_allocator COMMAND test_umbp_pool_allocator)
 
+add_executable(test_umbp_finalize_idempotency test_finalize_idempotency.cpp)
+target_link_libraries(test_umbp_finalize_idempotency PRIVATE umbp_common
+                                                             gtest_main)
+add_test(NAME umbp_finalize_idempotency COMMAND test_umbp_finalize_idempotency)
+
+add_executable(test_umbp_eviction test_eviction.cpp)
+target_link_libraries(test_umbp_eviction PRIVATE umbp_common gtest_main)
+add_test(NAME umbp_eviction COMMAND test_umbp_eviction)
+
 find_library(_TEST_PROTOBUF_LIB NAMES protobuf libprotobuf REQUIRED)
 if(TARGET gRPC::grpc++)
   set(_TEST_GRPCPP_LIB gRPC::grpc++)
@@ -46,3 +55,13 @@ target_link_libraries(
   test_umbp_peer_service PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB}
                                  ${_TEST_GRPCPP_LIB} gtest_main)
 add_test(NAME umbp_peer_service COMMAND test_umbp_peer_service)
+
+add_executable(test_umbp_cross_node_smoke test_cross_node_smoke.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_umbp_cross_node_smoke PRIVATE -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  test_umbp_cross_node_smoke
+  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
+          gtest_main)
+add_test(NAME umbp_cross_node_smoke COMMAND test_umbp_cross_node_smoke)

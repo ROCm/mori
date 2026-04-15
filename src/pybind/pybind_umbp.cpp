@@ -24,6 +24,7 @@
 
 #include "src/pybind/mori.hpp"
 #include "umbp/common/config.h"
+#include "umbp/distributed/distributed_client.h"
 #include "umbp/umbp_client.h"
 
 namespace py = pybind11;
@@ -146,7 +147,17 @@ void RegisterMoriUmbp(py::module_& m) {
       .def("batch_exists_consecutive", &IUMBPClient::BatchExistsConsecutive, py::arg("keys"))
       .def("clear", &IUMBPClient::Clear)
       .def("flush", &IUMBPClient::Flush)
-      .def("is_distributed", &IUMBPClient::IsDistributed);
+      .def("is_distributed", &IUMBPClient::IsDistributed)
+      .def("register_memory",
+           [](IUMBPClient& self, uintptr_t ptr, size_t size) -> bool {
+             auto* dc = dynamic_cast<DistributedClient*>(&self);
+             if (dc) return dc->RegisterMemory(reinterpret_cast<void*>(ptr), size);
+             return true;
+           })
+      .def("deregister_memory", [](IUMBPClient& self, uintptr_t ptr) {
+        auto* dc = dynamic_cast<DistributedClient*>(&self);
+        if (dc) dc->DeregisterMemory(reinterpret_cast<void*>(ptr));
+      });
 }
 
 }  // namespace mori

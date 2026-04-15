@@ -169,24 +169,15 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     response->set_removed(removed ? 1u : 0u);
 
     if (removed && location.size > 0) {
-      uint32_t buffer_index = 0;
-      uint64_t offset = 0;
-      if (!location.location_id.empty()) {
-        auto colon_pos = location.location_id.find(':');
-        if (colon_pos != std::string::npos) {
-          try {
-            buffer_index =
-                static_cast<uint32_t>(std::stoul(location.location_id.substr(0, colon_pos)));
-            // DRAM: second part is numeric offset; SSD: second part is filename (offset unused)
-            if (location.tier == TierType::DRAM || location.tier == TierType::HBM) {
-              offset = std::stoull(location.location_id.substr(colon_pos + 1));
-            }
-          } catch (...) {
-          }
+      auto parsed = ParseLocationId(location.location_id);
+      if (parsed) {
+        uint64_t offset = 0;
+        if (location.tier == TierType::DRAM || location.tier == TierType::HBM) {
+          offset = parsed->offset;
         }
+        registry_.DeallocateForUnregister(location.node_id, location.tier, parsed->buffer_index,
+                                          offset, location.size);
       }
-      registry_.DeallocateForUnregister(location.node_id, location.tier, buffer_index, offset,
-                                        location.size);
     }
 
     MORI_UMBP_INFO("[Master] Unregister key: node_id={}, key={}, location_id={}, removed={}",
@@ -218,8 +209,11 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
       location.node_id = request->node_id();
     }
 
-    const bool finalized = registry_.FinalizeAllocation(request->node_id(), request->key(),
-                                                        location, request->allocation_id());
+    const bool finalized = registry_.FinalizeAllocation(location.node_id, request->key(), location,
+                                                        request->allocation_id());
+    if (finalized && request->depth() >= 0) {
+      index_.SetDepth(request->key(), request->depth());
+    }
     response->set_finalized(finalized);
     return grpc::Status::OK;
   }
@@ -275,14 +269,10 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     source->set_size(result->size);
     source->set_tier(static_cast<::umbp::TierType>(result->tier));
 
-    // Parse buffer_index from location_id (format: "buffer_index:offset")
     uint32_t buf_idx = 0;
-    auto colon = result->location_id.find(':');
-    if (colon != std::string::npos) {
-      try {
-        buf_idx = static_cast<uint32_t>(std::stoul(result->location_id.substr(0, colon)));
-      } catch (...) {
-      }
+    auto parsed = ParseLocationId(result->location_id);
+    if (parsed) {
+      buf_idx = parsed->buffer_index;
     }
 
     auto io_info = registry_.GetClientIOInfo(result->node_id, buf_idx);
@@ -329,6 +319,109 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     return grpc::Status::OK;
   }
 
+  grpc::Status BatchRoutePut(grpc::ServerContext* /*context*/,
+                             const ::umbp::BatchRoutePutRequest* request,
+                             ::umbp::BatchRoutePutResponse* response) override {
+    if (request->keys_size() != request->block_sizes_size()) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                          "keys and block_sizes must have the same length");
+    }
+
+    std::vector<std::string> keys(request->keys().begin(), request->keys().end());
+    std::vector<uint64_t> block_sizes(request->block_sizes().begin(), request->block_sizes().end());
+
+    auto results = router_.BatchRoutePut(keys, request->node_id(), block_sizes);
+
+    for (size_t i = 0; i < results.size(); ++i) {
+      auto* entry = response->add_entries();
+      if (!results[i].has_value()) {
+        entry->set_found(false);
+        continue;
+      }
+      auto& r = *results[i];
+      entry->set_found(true);
+      entry->set_node_id(r.node_id);
+      entry->set_node_address(r.node_address);
+      entry->set_tier(static_cast<::umbp::TierType>(r.tier));
+      entry->set_peer_address(r.peer_address);
+      entry->set_engine_desc(r.engine_desc_bytes.data(), r.engine_desc_bytes.size());
+      entry->set_dram_memory_desc(r.dram_memory_desc_bytes.data(), r.dram_memory_desc_bytes.size());
+      entry->set_allocated_offset(r.allocated_offset);
+      entry->set_buffer_index(r.buffer_index);
+      entry->set_allocation_id(r.allocation_id);
+    }
+
+    MORI_UMBP_INFO("[Master] BatchRoutePut: {} keys from node={}", keys.size(), request->node_id());
+    return grpc::Status::OK;
+  }
+
+  grpc::Status BatchRouteGet(grpc::ServerContext* /*context*/,
+                             const ::umbp::BatchRouteGetRequest* request,
+                             ::umbp::BatchRouteGetResponse* response) override {
+    std::vector<std::string> keys(request->keys().begin(), request->keys().end());
+
+    auto results = router_.BatchRouteGet(keys, request->node_id());
+
+    for (size_t i = 0; i < results.size(); ++i) {
+      auto* entry = response->add_entries();
+      if (!results[i].has_value()) {
+        entry->set_found(false);
+        continue;
+      }
+      const auto& loc = *results[i];
+      entry->set_found(true);
+      auto* source = entry->mutable_source();
+      source->set_node_id(loc.node_id);
+      source->set_location_id(loc.location_id);
+      source->set_size(loc.size);
+      source->set_tier(static_cast<::umbp::TierType>(loc.tier));
+
+      uint32_t buf_idx = 0;
+      auto batch_parsed = ParseLocationId(loc.location_id);
+      if (batch_parsed) {
+        buf_idx = batch_parsed->buffer_index;
+      }
+
+      auto io_info = registry_.GetClientIOInfo(loc.node_id, buf_idx);
+      if (io_info) {
+        entry->set_peer_address(io_info->peer_address);
+        entry->set_engine_desc(io_info->engine_desc_bytes.data(),
+                               io_info->engine_desc_bytes.size());
+        entry->set_dram_memory_desc(io_info->dram_memory_desc_bytes.data(),
+                                    io_info->dram_memory_desc_bytes.size());
+      }
+    }
+
+    MORI_UMBP_INFO("[Master] BatchRouteGet: {} keys from node={}", keys.size(), request->node_id());
+    return grpc::Status::OK;
+  }
+
+  grpc::Status BatchFinalizeAllocation(grpc::ServerContext* /*context*/,
+                                       const ::umbp::BatchFinalizeRequest* request,
+                                       ::umbp::BatchFinalizeResponse* response) override {
+    int n = request->keys_size();
+    if (request->locations_size() != n || request->allocation_ids_size() != n) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                          "keys, locations, and allocation_ids must have the same length");
+    }
+
+    for (int i = 0; i < n; ++i) {
+      Location location = ToLocation(request->locations(i));
+      if (location.node_id.empty()) {
+        location.node_id = request->node_id();
+      }
+      bool finalized = registry_.FinalizeAllocation(location.node_id, request->keys(i), location,
+                                                    request->allocation_ids(i));
+      if (finalized && i < request->depths_size() && request->depths(i) >= 0) {
+        index_.SetDepth(request->keys(i), request->depths(i));
+      }
+      response->add_finalized(finalized);
+    }
+
+    MORI_UMBP_INFO("[Master] BatchFinalizeAllocation: {} keys from node={}", n, request->node_id());
+    return grpc::Status::OK;
+  }
+
  private:
   ClientRegistry& registry_;
   GlobalBlockIndex& index_;
@@ -345,14 +438,18 @@ MasterServer::MasterServer(MasterServerConfig config)
       registry_(config_.registry_config, index_),
       router_(index_, registry_, std::move(config_.get_strategy), std::move(config_.put_strategy)),
       service_(std::make_unique<UMBPMasterServiceImpl>(registry_, index_, router_,
-                                                       config_.registry_config)) {
+                                                       config_.registry_config)),
+      eviction_manager_(
+          std::make_unique<EvictionManager>(index_, registry_, config_.eviction_config)) {
   index_.SetClientRegistry(&registry_);
+  router_.SetLeaseDuration(config_.eviction_config.lease_duration);
 }
 
 MasterServer::~MasterServer() { Shutdown(); }
 
 void MasterServer::Run() {
   registry_.StartReaper();
+  eviction_manager_->Start();
 
   grpc::ServerBuilder builder;
   builder.AddListeningPort(config_.listen_address, grpc::InsecureServerCredentials());
@@ -364,8 +461,10 @@ void MasterServer::Run() {
 }
 
 void MasterServer::Shutdown() {
+  if (eviction_manager_) {
+    eviction_manager_->Stop();
+  }
   if (server_) {
-    // Use a deadline so Wait() unblocks even if RPCs do not drain quickly.
     const auto deadline = std::chrono::system_clock::now() + std::chrono::seconds(3);
     MORI_UMBP_INFO("[Master] Shutting down");
     server_->Shutdown(deadline);
