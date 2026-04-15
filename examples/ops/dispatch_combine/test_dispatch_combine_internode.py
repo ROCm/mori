@@ -969,12 +969,17 @@ class EpDispatchCombineTestCase:
         )
 
     def bench_dispatch_combine(
-        self, max_num_token, block_num=-1, rdma_block_num=-1, warp_per_block=-1,
+        self,
+        max_num_token,
+        block_num=-1,
+        rdma_block_num=-1,
+        warp_per_block=-1,
         skip_verify=False,
     ):
         op = mori.ops.EpDispatchCombineOp(self.config)
         test_data = self.gen_test_data(
-            max_num_token=max_num_token, use_max_token_num=True,
+            max_num_token=max_num_token,
+            use_max_token_num=True,
             only_my_rank=skip_verify,
         )
 
