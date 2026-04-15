@@ -92,8 +92,8 @@ def _save_internode_tuning_result(
     best_disp_bw,
     best_comb_config,
     best_comb_bw,
-    best_disp_all_bw=(0.0, 0.0, 0.0),
-    best_comb_all_bw=(0.0, 0.0, 0.0),
+    best_disp_all_bw=(0.0, 0.0, 0.0, 0.0),
+    best_comb_all_bw=(0.0, 0.0, 0.0, 0.0),
 ):
     from pathlib import Path
     from mori.ops.tuning_config import (
@@ -131,6 +131,7 @@ def _save_internode_tuning_result(
         "avg_rdma_bandwidth_gbps": round(best_disp_all_bw[0], 2),
         "avg_xgmi_bandwidth_gbps": round(best_disp_all_bw[1], 2),
         "avg_ll_bandwidth_gbps": round(best_disp_all_bw[2], 2),
+        "avg_latency_us": round(best_disp_all_bw[3], 2),
     }
 
     combine_entry = {
@@ -146,6 +147,7 @@ def _save_internode_tuning_result(
         "avg_rdma_bandwidth_gbps": round(best_comb_all_bw[0], 2),
         "avg_xgmi_bandwidth_gbps": round(best_comb_all_bw[1], 2),
         "avg_ll_bandwidth_gbps": round(best_comb_all_bw[2], 2),
+        "avg_latency_us": round(best_comb_all_bw[3], 2),
     }
 
     if config_path == "auto":
@@ -1242,8 +1244,8 @@ class EpDispatchCombineTestCase:
         best_comb_bw = 0
         best_disp_config = None
         best_comb_config = None
-        best_disp_all_bw = (0.0, 0.0, 0.0)
-        best_comb_all_bw = (0.0, 0.0, 0.0)
+        best_disp_all_bw = (0.0, 0.0, 0.0, 0.0)
+        best_comb_all_bw = (0.0, 0.0, 0.0, 0.0)
 
         error_round = set()
         test_data = self.gen_test_data(
@@ -1289,15 +1291,20 @@ class EpDispatchCombineTestCase:
                         comb_bw = rank_means[:, 3].min().item()
 
                     # Avg for JSON (grand mean = PrettyTable Average)
+                    _s = self._compute_stats
+                    disp_xgmi_avg = _s(kept[:, :, 1])[2]
+                    comb_xgmi_avg = _s(kept[:, :, 4])[2]
                     disp_avg = (
-                        self._compute_stats(kept[:, :, 0])[2],
-                        self._compute_stats(kept[:, :, 1])[2],
-                        self._compute_stats(kept[:, :, 1])[2] * ll_scale,
+                        _s(kept[:, :, 0])[2],
+                        disp_xgmi_avg,
+                        disp_xgmi_avg * ll_scale,
+                        _s(kept[:, :, 2])[2],
                     )
                     comb_avg = (
-                        self._compute_stats(kept[:, :, 3])[2],
-                        self._compute_stats(kept[:, :, 4])[2],
-                        self._compute_stats(kept[:, :, 4])[2] * ll_scale,
+                        _s(kept[:, :, 3])[2],
+                        comb_xgmi_avg,
+                        comb_xgmi_avg * ll_scale,
+                        _s(kept[:, :, 5])[2],
                     )
 
                     if disp_bw > best_disp_bw:
