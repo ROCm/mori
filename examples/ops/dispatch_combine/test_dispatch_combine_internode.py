@@ -28,7 +28,7 @@ import argparse
 import time
 from tqdm import tqdm
 
-os.environ["MORI_SHMEM_HEAP_SIZE"] = "6G"
+os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "6G")
 
 kernel_type_map = {
     "v0": mori.ops.EpDispatchCombineKernelType.InterNode,
@@ -312,8 +312,9 @@ class EpDispatchCombineTestCase:
         dist.all_gather(output, padded_input)
         return output
 
-    def gen_test_data(self, max_num_token, use_max_token_num=False):
+    def gen_test_data(self, max_num_token, use_max_token_num=False, only_my_rank=False):
         hidden_dim = self.dispatch_hidden_dim
+        keep_ranks = {self.rank} if only_my_rank else set(range(self.world_size))
 
         # gen num_tokens
         if use_max_token_num:
@@ -331,7 +332,7 @@ class EpDispatchCombineTestCase:
 
         # gen indices - vectorized version for speed
         num_total_experts = self.config.num_experts_per_rank * self.config.world_size
-        all_rank_indices = []
+        all_rank_indices = [None] * self.world_size
         for r in range(self.world_size):
             num_tok = num_token[r].item()
             random_vals = torch.rand(
@@ -343,33 +344,41 @@ class EpDispatchCombineTestCase:
             indices = torch.argsort(random_vals, dim=1)[
                 :, : self.config.num_experts_per_token
             ]
-            all_rank_indices.append(indices.to(torch.int32))
+            if r in keep_ranks:
+                all_rank_indices[r] = indices.to(torch.int32)
+            del random_vals, indices
 
         # gen weights
-        all_rank_weights = [
-            torch.rand(
+        all_rank_weights = [None] * self.world_size
+        for r in range(self.world_size):
+            w = torch.rand(
                 num_token[r],
                 self.config.num_experts_per_token,
                 dtype=torch.float32,
                 generator=self.rng,
                 device=self.device,
             )
-            for r in range(self.world_size)
-        ]
+            if r in keep_ranks:
+                all_rank_weights[r] = w
+            else:
+                del w
 
         # gen scales
-        all_rank_scales = [
-            torch.rand(
+        all_rank_scales = [None] * self.world_size
+        for r in range(self.world_size):
+            s = torch.rand(
                 num_token[r],
                 self.config.scale_dim,
                 dtype=torch.float32,
                 generator=self.rng,
                 device=self.device,
             )
-            for r in range(self.world_size)
-        ]
+            if r in keep_ranks:
+                all_rank_scales[r] = s
+            else:
+                del s
 
-        all_rank_input = []
+        all_rank_input = [None] * self.world_size
         for r in range(self.world_size):
             data_fp32 = torch.randn(
                 num_token[r],
@@ -390,7 +399,11 @@ class EpDispatchCombineTestCase:
                 data = data.view(_FP4_DTYPE)
             else:
                 data = data_fp32.to(self.dispatch_data_type)
-            all_rank_input.append(data)
+            del data_fp32
+            if r in keep_ranks:
+                all_rank_input[r] = data
+            else:
+                del data
 
         return (
             num_token,
@@ -956,23 +969,26 @@ class EpDispatchCombineTestCase:
         )
 
     def bench_dispatch_combine(
-        self, max_num_token, block_num=-1, rdma_block_num=-1, warp_per_block=-1
+        self, max_num_token, block_num=-1, rdma_block_num=-1, warp_per_block=-1,
+        skip_verify=False,
     ):
         op = mori.ops.EpDispatchCombineOp(self.config)
         test_data = self.gen_test_data(
-            max_num_token=max_num_token, use_max_token_num=True
+            max_num_token=max_num_token, use_max_token_num=True,
+            only_my_rank=skip_verify,
         )
 
         repeat = 10
 
-        error_round = set()
-        for i in range(1):
-            if self.rank == 0:
-                print(f"WarmUp Round {i} begin")
-            self.run_test_once(op, test_data, error_round, i)
-        assert (
-            len(error_round) == 0
-        ), f"Warmup failed with errors in rounds: {error_round}"
+        if not skip_verify:
+            error_round = set()
+            for i in range(1):
+                if self.rank == 0:
+                    print(f"WarmUp Round {i} begin")
+                self.run_test_once(op, test_data, error_round, i)
+            assert (
+                len(error_round) == 0
+            ), f"Warmup failed with errors in rounds: {error_round}"
 
         bench_result = self.run_bench_once(
             max_num_token,
@@ -1028,15 +1044,15 @@ class EpDispatchCombineTestCase:
         comb_rdma_s = _s(kept[:, :, 3])
         comb_xgmi_s = _s(kept[:, :, 4])
 
-        disp_rdma_bw = tuple(int(v) for v in disp_rdma_s)
-        disp_bw = tuple(int(v) for v in disp_xgmi_s)
-        disp_lat = tuple(int(v) for v in _s(kept[:, :, 2]))
-        disp_ll_bw = tuple(int(v * ll_mode_scale) for v in disp_xgmi_s)
+        disp_rdma_bw = tuple(round(v, 2) for v in disp_rdma_s)
+        disp_bw = tuple(round(v, 2) for v in disp_xgmi_s)
+        disp_lat = tuple(round(v, 2) for v in _s(kept[:, :, 2]))
+        disp_ll_bw = tuple(round(v * ll_mode_scale, 2) for v in disp_xgmi_s)
 
-        comb_rdma_bw = tuple(int(v) for v in comb_rdma_s)
-        comb_bw = tuple(int(v) for v in comb_xgmi_s)
-        comb_lat = tuple(int(v) for v in _s(kept[:, :, 5]))
-        comb_ll_bw = tuple(int(v * ll_mode_scale) for v in comb_xgmi_s)
+        comb_rdma_bw = tuple(round(v, 2) for v in comb_rdma_s)
+        comb_bw = tuple(round(v, 2) for v in comb_xgmi_s)
+        comb_lat = tuple(round(v, 2) for v in _s(kept[:, :, 5]))
+        comb_ll_bw = tuple(round(v * ll_mode_scale, 2) for v in comb_xgmi_s)
 
         from prettytable import PrettyTable
 
@@ -1469,6 +1485,7 @@ def test_dispatch_combine(
     max_total_recv_tokens=0,
     hidden_dim=7168,
     save_tuning_config=None,
+    skip_verify=False,
 ):
     world_size = num_node * gpu_per_node
     node_rank = int(os.environ["RANK"])
@@ -1497,6 +1514,7 @@ def test_dispatch_combine(
                 block_num=block_num,
                 rdma_block_num=rdma_block_num,
                 warp_per_block=warp_per_block,
+                skip_verify=skip_verify,
             )
         elif cmd == "stress":
             test_case.stress_dispatch_combine()
@@ -1629,6 +1647,12 @@ parser.add_argument(
         "Use 'auto' to auto-generate filename based on GPU/dtype/EP."
     ),
 )
+parser.add_argument(
+    "--skip-verify",
+    action="store_true",
+    default=False,
+    help="Skip correctness verification in bench mode to reduce GPU memory usage.",
+)
 args_cli = parser.parse_args()
 
 if __name__ == "__main__":
@@ -1662,6 +1686,7 @@ if __name__ == "__main__":
             args_cli.max_recv_total_tokens,
             args_cli.hidden_dim,
             args_cli.save_tuning_config,
+            args_cli.skip_verify,
         ),
         nprocs=gpu_per_node,
         join=True,
