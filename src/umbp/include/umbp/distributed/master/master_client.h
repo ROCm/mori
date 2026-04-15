@@ -100,6 +100,21 @@ class MasterClient {
 
   bool IsRegistered() const { return registered_; }
 
+  // --- External KV block events ---
+  grpc::Status ReportExternalKvBlocks(const std::string& node_id,
+                                      const std::vector<std::string>& hashes, TierType tier);
+  grpc::Status RevokeExternalKvBlocks(const std::string& node_id,
+                                      const std::vector<std::string>& hashes);
+
+  struct ExternalKvNodeMatch {
+    std::string node_id;
+    std::string peer_address;
+    std::vector<std::string> matched_hashes;
+    TierType tier = TierType::UNKNOWN;
+  };
+  grpc::Status MatchExternalKv(const std::vector<std::string>& hashes,
+                               std::vector<ExternalKvNodeMatch>* out_matches);
+
  private:
   MasterClientConfig config_;
 

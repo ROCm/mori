@@ -40,6 +40,7 @@
 namespace mori::umbp {
 
 class GlobalBlockIndex;
+class ExternalKvBlockIndex;
 
 struct AllocateResult {
   std::string allocation_id;
@@ -66,6 +67,13 @@ class ClientRegistry {
   ClientRegistry& operator=(const ClientRegistry&) = delete;
 
   void SetBlockIndex(GlobalBlockIndex* index);
+
+  // ---- External KV block index (for unmanaged L1/L2 cache blocks) ----
+  void SetExternalKvBlockIndex(ExternalKvBlockIndex* index);
+  void RegisterExternalKvBlocks(const std::string& node_id, const std::vector<std::string>& hashes,
+                                TierType tier);
+  void UnregisterExternalKvBlocks(const std::string& node_id,
+                                  const std::vector<std::string>& hashes);
 
   // --- Client lifecycle ---
   // Returns false when a live node with the same id already exists.
@@ -118,6 +126,7 @@ class ClientRegistry {
  private:
   ClientRegistryConfig config_;
   GlobalBlockIndex* index_ = nullptr;
+  ExternalKvBlockIndex* external_kv_index_ = nullptr;
 
   mutable std::shared_mutex mutex_;
   std::unordered_map<std::string, ClientRecord> clients_;

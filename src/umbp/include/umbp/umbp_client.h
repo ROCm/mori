@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "umbp/common/config.h"
+#include "umbp/distributed/types.h"
 
 namespace mori::umbp {
 
@@ -97,6 +98,24 @@ class IUMBPClient {
 
   /// Returns true when the client operates in distributed (master-led) mode.
   virtual bool IsDistributed() const = 0;
+
+  // ---- External KV Events (for unmanaged L1/L2 cache blocks) ----
+
+  /// Report that this node holds the given hashes at the specified tier.
+  virtual bool ReportExternalKvBlocks(const std::vector<std::string>& hashes, TierType tier) = 0;
+
+  /// Revoke previously reported hashes from this node's entry.
+  virtual bool RevokeExternalKvBlocks(const std::vector<std::string>& hashes) = 0;
+
+  struct ExternalKvMatch {
+    std::string node_id;
+    std::string peer_address;
+    std::vector<std::string> matched_hashes;
+    TierType tier = TierType::UNKNOWN;
+  };
+
+  /// Query which nodes hold any of the given hashes.
+  virtual std::vector<ExternalKvMatch> MatchExternalKv(const std::vector<std::string>& hashes) = 0;
 };
 
 /// Factory: creates the appropriate IUMBPClient implementation.

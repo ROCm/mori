@@ -295,6 +295,7 @@ add_library(
   ${UMBP_PEER_GRPC_SRCS}
   distributed/master/global_block_index.cpp
   distributed/master/client_registry.cpp
+  distributed/master/external_kv_block_index.cpp
   distributed/master/master_server.cpp
   distributed/master/master_client.cpp
   distributed/routing/router.cpp
@@ -351,3 +352,5 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 target_link_libraries(umbp_client PRIVATE umbp_common ${_PROTOBUF_LIBS}
                                           ${_GRPCPP_LIB})
+
+add_subdirectory(tests)

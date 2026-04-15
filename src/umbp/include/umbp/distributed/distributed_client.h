@@ -68,6 +68,10 @@ class DistributedClient : public IUMBPClient {
   void Close() override;
   bool IsDistributed() const override;
 
+  bool ReportExternalKvBlocks(const std::vector<std::string>& hashes, TierType tier) override;
+  bool RevokeExternalKvBlocks(const std::vector<std::string>& hashes) override;
+  std::vector<ExternalKvMatch> MatchExternalKv(const std::vector<std::string>& hashes) override;
+
  private:
   UMBPConfig config_;
   bool closed_ = false;

@@ -480,6 +480,36 @@ MasterClient& PoolClient::Master() { return *master_client_; }
 
 bool PoolClient::IsInitialized() const { return initialized_; }
 
+bool PoolClient::ReportExternalKvBlocks(const std::vector<std::string>& hashes, TierType tier) {
+  if (!initialized_) {
+    MORI_UMBP_ERROR("[PoolClient] ReportExternalKvBlocks: not initialized");
+    return false;
+  }
+  auto status =
+      master_client_->ReportExternalKvBlocks(config_.master_config.node_id, hashes, tier);
+  return status.ok();
+}
+
+bool PoolClient::RevokeExternalKvBlocks(const std::vector<std::string>& hashes) {
+  if (!initialized_) {
+    MORI_UMBP_ERROR("[PoolClient] RevokeExternalKvBlocks: not initialized");
+    return false;
+  }
+  auto status =
+      master_client_->RevokeExternalKvBlocks(config_.master_config.node_id, hashes);
+  return status.ok();
+}
+
+bool PoolClient::MatchExternalKv(const std::vector<std::string>& hashes,
+                                 std::vector<MasterClient::ExternalKvNodeMatch>* out_matches) {
+  if (!initialized_) {
+    MORI_UMBP_ERROR("[PoolClient] MatchExternalKv: not initialized");
+    return false;
+  }
+  auto status = master_client_->MatchExternalKv(hashes, out_matches);
+  return status.ok();
+}
+
 // ---------------------------------------------------------------------------
 // Peer connection management
 // ---------------------------------------------------------------------------
