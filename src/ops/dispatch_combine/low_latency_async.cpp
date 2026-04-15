@@ -29,7 +29,10 @@
 #include <type_traits>
 
 #include "mori/core/core.hpp"
+#include "mori/core/profiler/constants.hpp"
+#include "mori/core/profiler/kernel_profiler.hpp"
 #include "mori/ops/dispatch_combine/dispatch_combine.hpp"
+#include "mori/profiler/profiler.hpp"
 #include "mori/shmem/shmem.hpp"
 #include "src/ops/dispatch_combine/common.hpp"
 
@@ -47,6 +50,8 @@ using namespace mori::shmem;
 template <typename T>
 __device__ void EpDispatchLowLatencyAsyncSendCopy_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
+  LOW_LATENCY_ASYNC_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId);
+  MORI_TRACE_SPAN(profiler, Slot::DispatchAsyncSendCopy);
   for (int i = globalWarpId; i < args.curRankNumToken * config.numExpertPerToken;
        i += globalWarpNum) {
     index_t srcTokId = i / config.numExpertPerToken;
@@ -111,6 +116,8 @@ __device__ void EpDispatchLowLatencyAsyncSendCopy_body(EpDispatchCombineArgs<T> 
 template <typename T>
 __device__ void EpDispatchLowLatencyAsyncSendCopySlotAssign_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
+  LOW_LATENCY_ASYNC_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId);
+  MORI_TRACE_SPAN(profiler, Slot::DispatchAsyncSlotAssign);
   int numEpt = config.numExpertPerToken;
   int tokensPerWarp = warpSize / numEpt;
   int expertIdx = laneId % numEpt;
@@ -151,6 +158,8 @@ __device__ void EpDispatchLowLatencyAsyncSendCopySlotAssign_body(EpDispatchCombi
 template <typename T>
 __device__ void EpDispatchLowLatencyAsyncSendCopyMultiBlock_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
+  LOW_LATENCY_ASYNC_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId);
+  MORI_TRACE_SPAN(profiler, Slot::DispatchAsyncSendCopyMultiBlock);
   index_t totalEntries = args.curRankNumToken * config.numExpertPerToken;
   index_t warpsPerToken = (globalWarpNum + totalEntries - 1) / totalEntries;
   index_t hiddenBytesPerWarp =
@@ -208,6 +217,8 @@ __device__ void EpDispatchLowLatencyAsyncSendCopyMultiBlock_body(EpDispatchCombi
 template <typename T>
 __device__ void EpDispatchLowLatencyAsyncSendTransfer_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
+  LOW_LATENCY_ASYNC_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId);
+  MORI_TRACE_SPAN(profiler, Slot::DispatchAsyncSendTransfer);
   for (int destPe = blockId; destPe < npes; destPe += blockNum) {
     for (int qpId = warpId; qpId < config.numQpPerPe; qpId += warpNum) {
       int tokenNum = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe);
@@ -237,6 +248,8 @@ __device__ void EpDispatchLowLatencyAsyncSendTransfer_body(EpDispatchCombineArgs
 template <typename T>
 __device__ void EpDispatchLowLatencyAsyncRecvTransfer_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
+  LOW_LATENCY_ASYNC_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId);
+  MORI_TRACE_SPAN(profiler, Slot::DispatchAsyncRecvTransfer);
   for (int destPe = blockId; destPe < npes; destPe += blockNum) {
     for (int qpId = warpId; qpId < config.numQpPerPe; qpId += warpNum) {
       if (laneId == 0) {
@@ -273,6 +286,8 @@ __device__ void EpDispatchLowLatencyAsyncRecvTransfer_body(EpDispatchCombineArgs
 template <typename T>
 __device__ void EpDispatchLowLatencyAsyncRecvCopyMultiBlock_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
+  LOW_LATENCY_ASYNC_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId);
+  MORI_TRACE_SPAN(profiler, Slot::DispatchAsyncRecvCopy);
 
   int blocksPerPe = blockNum / npes;
   int destPe = blockId / blocksPerPe;
@@ -380,6 +395,8 @@ __device__ void EpDispatchLowLatencyAsyncRecvCopyMultiBlock_body(EpDispatchCombi
 template <typename T, bool UseFp8DirectCast>
 __device__ void EpCombineLowLatencyAsyncSendCopy_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
+  LOW_LATENCY_ASYNC_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId);
+  MORI_TRACE_SPAN(profiler, Slot::CombineAsyncSendCopy);
   using TokT = std::conditional_t<UseFp8DirectCast, core::CombineInternalFp8, T>;
   static_assert(!UseFp8DirectCast || std::is_same_v<T, hip_bfloat16>,
                 "Fp8 direct cast combine currently only supports bf16 input");
@@ -411,6 +428,8 @@ __device__ void EpCombineLowLatencyAsyncSendCopy_body(EpDispatchCombineArgs<T> a
 template <typename T, bool UseFp8DirectCast>
 __device__ void EpCombineLowLatencyAsyncSendTransfer_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
+  LOW_LATENCY_ASYNC_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId);
+  MORI_TRACE_SPAN(profiler, Slot::CombineAsyncSendTransfer);
   using TokT = std::conditional_t<UseFp8DirectCast, core::CombineInternalFp8, T>;
   static_assert(!UseFp8DirectCast || std::is_same_v<T, hip_bfloat16>,
                 "Fp8 direct cast combine currently only supports bf16 input");
@@ -450,6 +469,8 @@ __device__ void EpCombineLowLatencyAsyncSendTransfer_body(EpDispatchCombineArgs<
 template <typename T, bool UseFp8DirectCast>
 __device__ void EpCombineLowLatencyAsyncRecvTransfer_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
+  LOW_LATENCY_ASYNC_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId);
+  MORI_TRACE_SPAN(profiler, Slot::CombineAsyncRecvTransfer);
   using TokT = std::conditional_t<UseFp8DirectCast, core::CombineInternalFp8, T>;
   static_assert(!UseFp8DirectCast || std::is_same_v<T, hip_bfloat16>,
                 "Fp8 direct cast combine currently only supports bf16 input");
@@ -489,6 +510,8 @@ __device__ void EpCombineLowLatencyAsyncRecvTransfer_body(EpDispatchCombineArgs<
 template <typename T, bool UseFp8DirectCast>
 __device__ void EpCombineLowLatencyAsyncRecvCopy_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
+  LOW_LATENCY_ASYNC_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId);
+  MORI_TRACE_SPAN(profiler, Slot::CombineAsyncRecvCopy);
   using TokT = std::conditional_t<UseFp8DirectCast, core::CombineInternalFp8, T>;
   static_assert(!UseFp8DirectCast || std::is_same_v<T, hip_bfloat16>,
                 "Fp8 direct cast combine currently only supports bf16 input");

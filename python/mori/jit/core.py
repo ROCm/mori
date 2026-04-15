@@ -28,17 +28,19 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
 
-from mori.jit.cache import get_cache_dir
+from mori.jit.cache import get_cache_dir, get_cache_root
 from mori.jit.config import (
     BuildConfig,
     detect_build_config,
     detect_nic_type,
     find_mpi_include,
     get_mori_source_root,
+    is_profiler_enabled,
 )
 
 _BC_FILENAME = "libmori_shmem_device.bc"
@@ -109,6 +111,7 @@ def _hipcc_device_bc(
         "-D__HIP_PLATFORM_AMD__",
         "-DHIP_ENABLE_WARP_SYNC_BUILTINS",
         *_nic_defines(),
+        *_profiler_defines(),
     ]
     for d in include_dirs:
         cmd.extend(["-I", str(d)])
@@ -166,6 +169,45 @@ def _nic_defines() -> list[str]:
     return []
 
 
+def _profiler_defines() -> list[str]:
+    """Return -DENABLE_PROFILER if mori was built with profiler support."""
+    return ["-DENABLE_PROFILER"] if is_profiler_enabled() else []
+
+
+def _ensure_generated_include(mori_root: Path) -> Path:
+    """Run generate_profiler_bindings.py into the JIT cache and return the include root.
+
+    Always runs the generator (which is idempotent via write_if_changed) so that
+    profiler slot changes in source are picked up without invalidating the JIT cache.
+    Returns ``<cache_root>/generated/include/``, which must be passed as ``-I`` to hipcc.
+    """
+    gen_script = mori_root / "tools" / "profiler" / "generate_profiler_bindings.py"
+    if not gen_script.is_file():
+        raise FileNotFoundError(
+            f"Profiler binding generator not found: {gen_script}\n"
+            "JIT compilation with ENABLE_PROFILER requires the mori source tree."
+        )
+
+    out_include = get_cache_root() / "generated" / "include"
+    profiler_include_dir = out_include / "mori" / "profiler"
+    pybind_out = get_cache_root() / "generated" / "profiler_bindings.cpp"
+
+    subprocess.check_call(
+        [
+            sys.executable,
+            str(gen_script),
+            str(mori_root),
+            str(mori_root / "src"),
+            str(profiler_include_dir),
+            str(pybind_out),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.STDOUT,
+    )
+
+    return out_include
+
+
 def _collect_include_dirs(mori_root: Path) -> list[Path]:
     """Gather all include directories needed for device bitcode compilation."""
     dirs = [mori_root, mori_root / "include", mori_root / "src"]
@@ -178,6 +220,12 @@ def _collect_include_dirs(mori_root: Path) -> list[Path]:
     mpi_inc = find_mpi_include()
     if mpi_inc:
         dirs.append(Path(mpi_inc))
+
+    # Generate profiler slot headers JIT into the cache (idempotent, fast).
+    # Always included: kernel sources unconditionally include mori/profiler/profiler.hpp
+    # which lives in the generated dir. The headers have #ifdef ENABLE_PROFILER guards
+    # so they are safe to include even when profiler is disabled.
+    dirs.append(_ensure_generated_include(mori_root))
 
     return dirs
 
@@ -242,6 +290,7 @@ def _hipcc_genco(
         "-D__HIP_PLATFORM_AMD__",
         "-DHIP_ENABLE_WARP_SYNC_BUILTINS",
         *_nic_defines(),
+        *_profiler_defines(),
     ]
     for d in include_dirs:
         cmd.extend(["-I", str(d)])
@@ -314,6 +363,7 @@ def compile_genco(
 
     cfg = detect_build_config()
     nic = detect_nic_type()
+    profiler = is_profiler_enabled()
     include_dirs = _collect_include_dirs(mori_root)
 
     sub_kernels = _PARALLEL_KERNEL_GROUPS.get(kernel_name)
@@ -322,7 +372,7 @@ def compile_genco(
             mori_root / "src" / "ops" / "kernels",
             mori_root / "include" / "mori",
         ]
-        cache_dir = get_cache_dir(cfg.arch, source_paths, nic)
+        cache_dir = get_cache_dir(cfg.arch, source_paths, nic, profiler=profiler)
 
         hsaco_paths = [cache_dir / f"{k}.hsaco" for k in sub_kernels]
         if all(p.is_file() for p in hsaco_paths):
@@ -367,7 +417,7 @@ def compile_genco(
         raise FileNotFoundError(f"Kernel source not found: {source}")
 
     source_paths = [source, mori_root / "include" / "mori"]
-    cache_dir = get_cache_dir(cfg.arch, source_paths, nic)
+    cache_dir = get_cache_dir(cfg.arch, source_paths, nic, profiler=profiler)
     hsaco_path = cache_dir / f"{kernel_name}.hsaco"
 
     if hsaco_path.is_file():
@@ -381,7 +431,10 @@ def compile_genco(
             return str(hsaco_path)
 
         nic = detect_nic_type()
-        print(f"[mori-jit] Compiling {kernel_name} for {cfg.arch} (nic={nic}) ...")
+        print(
+            f"[mori-jit] Compiling {kernel_name} for {cfg.arch} "
+            f"(nic={nic}, profiler={profiler}) ..."
+        )
         _hipcc_genco(cfg, source, include_dirs, hsaco_path)
         print(f"[mori-jit]   Cached: {hsaco_path}")
         _update_latest_symlink(hsaco_path)
@@ -404,12 +457,13 @@ def ensure_bitcode() -> str:
     cfg = detect_build_config()
 
     nic = detect_nic_type()
+    profiler = is_profiler_enabled()
     source_paths = [
         mori_root / "src" / "shmem" / "shmem_device_api_wrapper.cpp",
         mori_root / "include" / "mori" / "shmem",
         mori_root / "include" / "mori" / "core",
     ]
-    cache_dir = get_cache_dir(cfg.arch, source_paths, nic)
+    cache_dir = get_cache_dir(cfg.arch, source_paths, nic, profiler=profiler)
     bc_path = cache_dir / _BC_FILENAME
 
     if bc_path.is_file():
