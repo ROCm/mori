@@ -1,0 +1,164 @@
+{
+  "version": "1.0",
+  "gpu_arch": "gfx942",
+  "gpu_model": "mi308x",
+  "kernel_type": "InterNodeV1",
+  "ep_size": 16,
+  "phase": "combine",
+  "rules": [
+    {
+      "dtype": "bf16",
+      "num_tokens": 64,
+      "hidden_dim": 7168,
+      "zero_copy": false,
+      "quant_type": "fp8_direct_cast",
+      "block_num": 64,
+      "rdma_block_num": 32,
+      "warp_per_block": 8,
+      "bandwidth_gbps": 6.36
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 128,
+      "hidden_dim": 7168,
+      "zero_copy": false,
+      "quant_type": "fp8_direct_cast",
+      "block_num": 32,
+      "rdma_block_num": 16,
+      "warp_per_block": 8,
+      "bandwidth_gbps": 10.26
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 256,
+      "hidden_dim": 7168,
+      "zero_copy": false,
+      "quant_type": "fp8_direct_cast",
+      "block_num": 64,
+      "rdma_block_num": 32,
+      "warp_per_block": 8,
+      "bandwidth_gbps": 13.86
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 512,
+      "hidden_dim": 7168,
+      "zero_copy": false,
+      "quant_type": "fp8_direct_cast",
+      "block_num": 80,
+      "rdma_block_num": 40,
+      "warp_per_block": 8,
+      "bandwidth_gbps": 17.89
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 1024,
+      "hidden_dim": 7168,
+      "zero_copy": false,
+      "quant_type": "fp8_direct_cast",
+      "block_num": 80,
+      "rdma_block_num": 40,
+      "warp_per_block": 8,
+      "bandwidth_gbps": 20.52
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 2048,
+      "hidden_dim": 7168,
+      "zero_copy": false,
+      "quant_type": "fp8_direct_cast",
+      "block_num": 80,
+      "rdma_block_num": 40,
+      "warp_per_block": 8,
+      "bandwidth_gbps": 21.21
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 4096,
+      "hidden_dim": 7168,
+      "zero_copy": false,
+      "quant_type": "fp8_direct_cast",
+      "block_num": 80,
+      "rdma_block_num": 40,
+      "warp_per_block": 8,
+      "bandwidth_gbps": 21.23
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 64,
+      "hidden_dim": 7168,
+      "zero_copy": false,
+      "quant_type": "none",
+      "block_num": 64,
+      "rdma_block_num": 32,
+      "warp_per_block": 8,
+      "bandwidth_gbps": 7.26
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 128,
+      "hidden_dim": 7168,
+      "zero_copy": false,
+      "quant_type": "none",
+      "block_num": 32,
+      "rdma_block_num": 16,
+      "warp_per_block": 8,
+      "bandwidth_gbps": 12.15
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 256,
+      "hidden_dim": 7168,
+      "zero_copy": false,
+      "quant_type": "none",
+      "block_num": 80,
+      "rdma_block_num": 40,
+      "warp_per_block": 8,
+      "bandwidth_gbps": 16.72
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 512,
+      "hidden_dim": 7168,
+      "zero_copy": false,
+      "quant_type": "none",
+      "block_num": 32,
+      "rdma_block_num": 16,
+      "warp_per_block": 8,
+      "bandwidth_gbps": 20.06
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 1024,
+      "hidden_dim": 7168,
+      "zero_copy": false,
+      "quant_type": "none",
+      "block_num": 64,
+      "rdma_block_num": 32,
+      "warp_per_block": 8,
+      "bandwidth_gbps": 22.72
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 2048,
+      "hidden_dim": 7168,
+      "zero_copy": false,
+      "quant_type": "none",
+      "block_num": 64,
+      "rdma_block_num": 32,
+      "warp_per_block": 8,
+      "bandwidth_gbps": 25.3
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 4096,
+      "hidden_dim": 7168,
+      "zero_copy": false,
+      "quant_type": "none",
+      "block_num": 32,
+      "rdma_block_num": 16,
+      "warp_per_block": 8,
+      "bandwidth_gbps": 23.5
+    }
+  ]
+}

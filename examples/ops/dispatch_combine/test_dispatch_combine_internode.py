@@ -1171,11 +1171,71 @@ class EpDispatchCombineTestCase:
             comb_lat,
         )
 
+    def _select_bw_metric(self, bench_result):
+        """Select the appropriate BW metric based on kernel type.
+
+        For v1 (InterNodeV1): use RDMA bandwidth (cross-node bottleneck).
+        For v1_ll/async_ll: use LL bandwidth (XGMI * ll_mode_scale).
+        """
+        (
+            _,
+            disp_rdma_bw,
+            disp_xgmi_bw,
+            _,
+            comb_rdma_bw,
+            comb_xgmi_bw,
+            ll_mode_scale,
+        ) = bench_result
+
+        is_ll_kernel = self.config.kernel_type in (
+            mori.ops.EpDispatchCombineKernelType.InterNodeV1LL,
+            mori.ops.EpDispatchCombineKernelType.AsyncLL,
+        )
+        if is_ll_kernel:
+            disp_vals = [v * ll_mode_scale for v in disp_xgmi_bw]
+            comb_vals = [v * ll_mode_scale for v in comb_xgmi_bw]
+        else:
+            disp_vals = list(disp_rdma_bw)
+            comb_vals = list(comb_rdma_bw)
+        return disp_vals, comb_vals
+
+    def _gather_min_rank_bw(self, local_disp_bw, local_comb_bw):
+        """All-gather BW from every rank and return the min-rank average.
+
+        For inference the slowest rank is the bottleneck, so we optimise for
+        the worst-case rank's mean bandwidth across iterations.
+        """
+        disp_t = torch.tensor([local_disp_bw], dtype=torch.float64)
+        comb_t = torch.tensor([local_comb_bw], dtype=torch.float64)
+        all_disp = [torch.zeros(1, dtype=torch.float64) for _ in range(self.world_size)]
+        all_comb = [torch.zeros(1, dtype=torch.float64) for _ in range(self.world_size)]
+        dist.all_gather(all_disp, disp_t)
+        dist.all_gather(all_comb, comb_t)
+
+        all_disp_vals = [t.item() for t in all_disp]
+        all_comb_vals = [t.item() for t in all_comb]
+
+        if self.rank == 0:
+            print(
+                f"  Per-rank dispatch BW: "
+                f"min={min(all_disp_vals):.1f}  max={max(all_disp_vals):.1f}  "
+                f"avg={sum(all_disp_vals)/len(all_disp_vals):.1f}"
+            )
+            print(
+                f"  Per-rank combine  BW: "
+                f"min={min(all_comb_vals):.1f}  max={max(all_comb_vals):.1f}  "
+                f"avg={sum(all_comb_vals)/len(all_comb_vals):.1f}"
+            )
+
+        return min(all_disp_vals), min(all_comb_vals)
+
     def tuning_dispatch_combine(self, max_num_token, save_tuning_config=None):
         op = mori.ops.EpDispatchCombineOp(self.config)
         sm_count = torch.cuda.get_device_properties(
             self.rank % self.gpu_per_node
         ).multi_processor_count
+
+        tuning_scope = os.environ.get("MORI_TUNING_SCOPE", "full")
 
         block_set = set()
         pow2 = 32
@@ -1185,21 +1245,35 @@ class EpDispatchCombineTestCase:
         block_set.add(sm_count)
         block_list = sorted(block_set)
 
-        warp_list = [4, 6, 8, 12, 16]
+        if tuning_scope == "quick":
+            warp_list = [4, 8, 16]
+            _rdma_mode = "quick"
+        else:
+            warp_list = [4, 6, 8, 12, 16]
+            _rdma_mode = "full"
 
         def rdma_candidates_for(bn):
+            if _rdma_mode == "quick":
+                return [max(bn // 2, 1)]
             return sorted(
                 set(v for v in [bn // 4, bn // 2, bn * 2 // 3] if 1 <= v < bn)
             )
+
+        is_ll_kernel = self.config.kernel_type in (
+            mori.ops.EpDispatchCombineKernelType.InterNodeV1LL,
+            mori.ops.EpDispatchCombineKernelType.AsyncLL,
+        )
+        bw_label = "LL BW" if is_ll_kernel else "RDMA BW"
 
         total_configs = sum(
             len(warp_list) * len(rdma_candidates_for(bn)) for bn in block_list
         )
         if self.rank == 0:
             print(
-                f"SM count={sm_count}\n"
+                f"SM count={sm_count}, tuning_scope={tuning_scope}\n"
                 f"block_num candidates ({len(block_list)}): {block_list}\n"
                 f"warp_per_block candidates: {warp_list}\n"
+                f"BW metric: {bw_label}\n"
                 f"Total configurations: {total_configs}"
             )
 
@@ -1228,15 +1302,7 @@ class EpDispatchCombineTestCase:
                             f"block_num={bn}, warp={warp}, rdma_block_num={rdma_bn}\n"
                             f"{'=' * 60}"
                         )
-                    (
-                        _,
-                        _,
-                        disp_bandwidth,
-                        _,
-                        _,
-                        comb_bandwidth,
-                        _,
-                    ) = self.run_bench_once(
+                    bench_result = self.run_bench_once(
                         max_num_token,
                         op,
                         test_data,
@@ -1245,8 +1311,13 @@ class EpDispatchCombineTestCase:
                         rdma_block_num=rdma_bn,
                         warp_per_block=warp,
                     )
-                    disp_bw = sum(disp_bandwidth) / len(disp_bandwidth)
-                    comb_bw = sum(comb_bandwidth) / len(comb_bandwidth)
+                    disp_bw_list, comb_bw_list = self._select_bw_metric(bench_result)
+                    local_disp_bw = sum(disp_bw_list) / len(disp_bw_list)
+                    local_comb_bw = sum(comb_bw_list) / len(comb_bw_list)
+
+                    disp_bw, comb_bw = self._gather_min_rank_bw(
+                        local_disp_bw, local_comb_bw
+                    )
 
                     if disp_bw > best_disp_bw:
                         best_disp_bw = disp_bw
@@ -1255,11 +1326,17 @@ class EpDispatchCombineTestCase:
                         best_comb_bw = comb_bw
                         best_comb_config = (bn, warp, rdma_bn)
 
+                    if self.rank == 0:
+                        print(
+                            f"  >> {bw_label}: disp={disp_bw:.1f}  comb={comb_bw:.1f}  "
+                            f"(best disp={best_disp_bw:.1f}  comb={best_comb_bw:.1f})"
+                        )
+
         if self.rank == 0:
             disp_dtype_str = str(self.config.data_type).split(".")[-1]
             comb_dtype_str = str(self.combine_data_type).split(".")[-1]
             print(f"\n{'=' * 60}")
-            print("Performance Summary:")
+            print(f"Performance Summary (metric={bw_label}, aggregation=min-rank):")
             print(f"{'=' * 60}")
             print(
                 f"Best Dispatch  ({disp_dtype_str}): {best_disp_bw:.2f} GB/s "

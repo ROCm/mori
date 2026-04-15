@@ -1,0 +1,136 @@
+{
+  "version": "1.0",
+  "gpu_arch": "gfx942",
+  "gpu_model": "mi308x",
+  "kernel_type": "AsyncLL",
+  "ep_size": 16,
+  "phase": "dispatch",
+  "rules": [
+    {
+      "dtype": "fp4",
+      "num_tokens": 64,
+      "hidden_dim": 3584,
+      "block_num": 32,
+      "rdma_block_num": 16,
+      "warp_per_block": 16,
+      "bandwidth_gbps": 0.71
+    },
+    {
+      "dtype": "fp4",
+      "num_tokens": 128,
+      "hidden_dim": 3584,
+      "block_num": 32,
+      "rdma_block_num": 16,
+      "warp_per_block": 4,
+      "bandwidth_gbps": 0.78
+    },
+    {
+      "dtype": "fp4",
+      "num_tokens": 256,
+      "hidden_dim": 3584,
+      "block_num": 32,
+      "rdma_block_num": 16,
+      "warp_per_block": 4,
+      "bandwidth_gbps": 0.83
+    },
+    {
+      "dtype": "fp4",
+      "num_tokens": 512,
+      "hidden_dim": 3584,
+      "block_num": 32,
+      "rdma_block_num": 16,
+      "warp_per_block": 8,
+      "bandwidth_gbps": 0.87
+    },
+    {
+      "dtype": "fp4",
+      "num_tokens": 1024,
+      "hidden_dim": 3584,
+      "block_num": 64,
+      "rdma_block_num": 32,
+      "warp_per_block": 16,
+      "bandwidth_gbps": 0.89
+    },
+    {
+      "dtype": "fp4",
+      "num_tokens": 2048,
+      "hidden_dim": 3584,
+      "block_num": 64,
+      "rdma_block_num": 32,
+      "warp_per_block": 16,
+      "bandwidth_gbps": 0.92
+    },
+    {
+      "dtype": "fp4",
+      "num_tokens": 4096,
+      "hidden_dim": 3584,
+      "block_num": 80,
+      "rdma_block_num": 40,
+      "warp_per_block": 4,
+      "bandwidth_gbps": 0.94
+    },
+    {
+      "dtype": "fp8_e4m3_fnuz",
+      "num_tokens": 64,
+      "hidden_dim": 7168,
+      "block_num": 64,
+      "rdma_block_num": 32,
+      "warp_per_block": 8,
+      "bandwidth_gbps": 0.74
+    },
+    {
+      "dtype": "fp8_e4m3_fnuz",
+      "num_tokens": 128,
+      "hidden_dim": 7168,
+      "block_num": 64,
+      "rdma_block_num": 32,
+      "warp_per_block": 16,
+      "bandwidth_gbps": 0.81
+    },
+    {
+      "dtype": "fp8_e4m3_fnuz",
+      "num_tokens": 256,
+      "hidden_dim": 7168,
+      "block_num": 32,
+      "rdma_block_num": 16,
+      "warp_per_block": 16,
+      "bandwidth_gbps": 0.85
+    },
+    {
+      "dtype": "fp8_e4m3_fnuz",
+      "num_tokens": 512,
+      "hidden_dim": 7168,
+      "block_num": 80,
+      "rdma_block_num": 40,
+      "warp_per_block": 16,
+      "bandwidth_gbps": 0.89
+    },
+    {
+      "dtype": "fp8_e4m3_fnuz",
+      "num_tokens": 1024,
+      "hidden_dim": 7168,
+      "block_num": 80,
+      "rdma_block_num": 40,
+      "warp_per_block": 4,
+      "bandwidth_gbps": 0.92
+    },
+    {
+      "dtype": "fp8_e4m3_fnuz",
+      "num_tokens": 2048,
+      "hidden_dim": 7168,
+      "block_num": 32,
+      "rdma_block_num": 16,
+      "warp_per_block": 4,
+      "bandwidth_gbps": 0.96
+    },
+    {
+      "dtype": "fp8_e4m3_fnuz",
+      "num_tokens": 4096,
+      "hidden_dim": 7168,
+      "block_num": 80,
+      "rdma_block_num": 40,
+      "warp_per_block": 8,
+      "bandwidth_gbps": 0.97
+    }
+  ]
+}

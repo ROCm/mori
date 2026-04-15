@@ -6,27 +6,34 @@ set -euo pipefail
 #
 # Runs on the DRIVER node (rank 0). Launches the peer node (rank 1) via SSH.
 # Sweeps over (max_tokens x hidden_dim) combinations, saving tuning results
-# into a single JSON config file.
+# into JSON config files.
 #
 # Prerequisites:
 #   - Passwordless SSH from driver to peer node
 #   - Same repo path on both nodes (or set --remote-repo-root)
 #   - Network interface accessible on both nodes (--ifname)
 #
-# Usage:
-#   bash tools/batch_internode_tuning.sh \
-#       --master-addr skyriver07 --peer-host skyriver08 --ifname bond0 \
-#       --kernel-type v1
+# Usage examples:
 #
+#   # Quick test (single config, quick scope)
 #   bash tools/batch_internode_tuning.sh \
-#       --master-addr skyriver07 --peer-host skyriver08 --ifname bond0 \
-#       --kernel-type v1_ll --dtype bf16 \
-#       --tokens-list "128,512,4096" --hidden-dims "2048,7168"
+#       --master-addr skyriver07 --peer-host yutongwu@skyriver04 --ifname bond0 \
+#       --docker yutong-mori --ssh-key ~/.ssh/id_ed25519_skyriver \
+#       --kernel-type v1 --num-qp 2 --tokens-list "128" --tuning-scope quick
 #
+#   # Full tuning: v1, fp4→bf16, fp8 quant
 #   bash tools/batch_internode_tuning.sh \
-#       --master-addr skyriver07 --peer-host skyriver08 --ifname bond0 \
-#       --kernel-type async_ll --num-qp 2 \
-#       --config-output /path/to/out.json
+#       --master-addr skyriver07 --peer-host yutongwu@skyriver04 --ifname bond0 \
+#       --docker yutong-mori --ssh-key ~/.ssh/id_ed25519_skyriver \
+#       --kernel-type v1 --num-qp 2 --dtype fp4 --combine-dtype bf16 \
+#       --quant-type fp8_direct_cast --tuning-scope quick
+#
+#   # Full tuning: v1_ll, fp8→bf16
+#   bash tools/batch_internode_tuning.sh \
+#       --master-addr skyriver07 --peer-host yutongwu@skyriver04 --ifname bond0 \
+#       --docker yutong-mori --ssh-key ~/.ssh/id_ed25519_skyriver \
+#       --kernel-type v1_ll --num-qp 2 --dtype fp8_e4m3_fnuz --combine-dtype bf16 \
+#       --quant-type none --tuning-scope quick
 # ============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -42,6 +49,10 @@ MASTER_PORT=1234
 PEER_HOST=""
 IFNAME=""
 REMOTE_REPO_ROOT=""
+DOCKER=""
+SSH_KEY=""
+RDMA_SL=""
+TUNING_SCOPE="full"
 KERNEL_TYPE="v1"
 NUM_QP=1
 TOKENS_LIST="64,128,256,512,1024,2048,4096"
@@ -53,16 +64,6 @@ CONFIG_OUTPUT="auto"
 GPU_PER_NODE=8
 TIMEOUT_SEC=600
 
-# Typical tuning matrix for EP16 (2 nodes x 8 GPUs, run each separately):
-#
-#   fp4 dispatch + bf16 combine + fp8 quant:
-#     bash tools/batch_internode_tuning.sh --master-addr <host0> --peer-host <host1> --ifname bond0 \
-#         --kernel-type v1 --dtype fp4 --combine-dtype bf16 --quant-type fp8_direct_cast
-#
-#   fp8 dispatch + bf16 combine:
-#     bash tools/batch_internode_tuning.sh --master-addr <host0> --peer-host <host1> --ifname bond0 \
-#         --kernel-type v1 --dtype fp8_e4m3_fnuz --combine-dtype bf16 --quant-type none
-
 # ---- Parse args ----
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -71,6 +72,10 @@ while [[ $# -gt 0 ]]; do
         --peer-host)         PEER_HOST="$2";         shift 2 ;;
         --ifname)            IFNAME="$2";            shift 2 ;;
         --remote-repo-root)  REMOTE_REPO_ROOT="$2";  shift 2 ;;
+        --docker)            DOCKER="$2";            shift 2 ;;
+        --ssh-key)           SSH_KEY="$2";           shift 2 ;;
+        --rdma-sl)           RDMA_SL="$2";           shift 2 ;;
+        --tuning-scope)      TUNING_SCOPE="$2";      shift 2 ;;
         --kernel-type)       KERNEL_TYPE="$2";       shift 2 ;;
         --num-qp)            NUM_QP="$2";            shift 2 ;;
         --tokens-list)       TOKENS_LIST="$2";       shift 2 ;;
@@ -90,10 +95,11 @@ for var in MASTER_ADDR PEER_HOST IFNAME; do
     [[ -z "${!var}" ]] && { echo "Error: --${var,,} is required"; exit 1; }
 done
 
-# ---- Remote repo root defaults to local repo root ----
-if [[ -z "$REMOTE_REPO_ROOT" ]]; then
-    REMOTE_REPO_ROOT="$REPO_ROOT"
-fi
+[[ -z "$REMOTE_REPO_ROOT" ]] && REMOTE_REPO_ROOT="$REPO_ROOT"
+
+# ---- SSH options ----
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10)
+[[ -n "$SSH_KEY" ]] && SSH_OPTS+=(-i "$SSH_KEY")
 
 # ---- Convert comma-separated lists to arrays ----
 IFS=',' read -ra TOKEN_ARRAY <<< "$TOKENS_LIST"
@@ -103,10 +109,8 @@ IFS=',' read -ra HIDDEN_DIM_ARRAY <<< "$HIDDEN_DIMS"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 COMB_TAG="${COMBINE_DTYPE:-$DTYPE}"
 QUANT_TAG=""
-if [[ "$QUANT_TYPE" != "none" ]]; then
-    QUANT_TAG="_${QUANT_TYPE}"
-fi
-LOG_FILE="${LOG_DIR}/batch_internode_${KERNEL_TYPE}_ep$((GPU_PER_NODE*2))_${DTYPE}_${COMB_TAG}${QUANT_TAG}_${TIMESTAMP}.log"
+[[ "$QUANT_TYPE" != "none" ]] && QUANT_TAG="_${QUANT_TYPE}"
+LOG_FILE="${LOG_DIR}/batch_internode_${KERNEL_TYPE}_ep$((GPU_PER_NODE*2))_${DTYPE}_${COMB_TAG}${QUANT_TAG}_${TUNING_SCOPE}_${TIMESTAMP}.log"
 
 TOTAL_COMBOS=$(( ${#HIDDEN_DIM_ARRAY[@]} * ${#TOKEN_ARRAY[@]} ))
 
@@ -117,6 +121,10 @@ echo "============================================================"
 echo "  master_addr:         $MASTER_ADDR"
 echo "  peer_host:           $PEER_HOST"
 echo "  ifname:              $IFNAME"
+echo "  docker:              ${DOCKER:-<none, direct execution>}"
+echo "  ssh_key:             ${SSH_KEY:-<default>}"
+echo "  rdma_sl:             ${RDMA_SL:-<not set>}"
+echo "  tuning_scope:        $TUNING_SCOPE"
 echo "  kernel_type:         $KERNEL_TYPE"
 echo "  num_qp:              $NUM_QP"
 echo "  gpu_per_node:        $GPU_PER_NODE"
@@ -137,9 +145,16 @@ echo ""
 
 # ---- Verify SSH connectivity ----
 echo "Verifying SSH to $PEER_HOST ..."
-if ! ssh -o BatchMode=yes -o ConnectTimeout=5 "$PEER_HOST" "echo ok" &>/dev/null; then
-    echo "Error: Cannot SSH to $PEER_HOST (passwordless SSH required)"
-    exit 1
+if [[ -n "$DOCKER" ]]; then
+    if ! ssh "${SSH_OPTS[@]}" "$PEER_HOST" "sudo docker exec $DOCKER bash -c 'echo ok'" &>/dev/null; then
+        echo "Error: Cannot SSH to $PEER_HOST or docker exec into $DOCKER failed"
+        exit 1
+    fi
+else
+    if ! ssh "${SSH_OPTS[@]}" "$PEER_HOST" "echo ok" &>/dev/null; then
+        echo "Error: Cannot SSH to $PEER_HOST (passwordless SSH required)"
+        exit 1
+    fi
 fi
 echo "SSH OK"
 echo ""
@@ -159,12 +174,8 @@ build_py_args() {
         --dtype "$DTYPE"
         --quant-type "$QUANT_TYPE"
     )
-    if [[ -n "$COMBINE_DTYPE" ]]; then
-        ARGS+=(--combine-dtype "$COMBINE_DTYPE")
-    fi
-    if [[ -n "$SAVE_ARG" ]]; then
-        ARGS+=(--save-tuning-config "$SAVE_ARG")
-    fi
+    [[ -n "$COMBINE_DTYPE" ]] && ARGS+=(--combine-dtype "$COMBINE_DTYPE")
+    [[ -n "$SAVE_ARG" ]] && ARGS+=(--save-tuning-config "$SAVE_ARG")
     echo "${ARGS[@]}"
 }
 
@@ -174,24 +185,60 @@ build_torchrun_cmd() {
     local THE_REPO_ROOT="$2"
     local PY_ARGS="$3"
 
-    echo "cd $THE_REPO_ROOT && " \
-         "GPU_PER_NODE=$GPU_PER_NODE" \
-         "GLOO_SOCKET_IFNAME=$IFNAME" \
-         "MORI_SOCKET_IFNAME=$IFNAME" \
-         "PYTHONPATH=${THE_REPO_ROOT}/python:\${PYTHONPATH:-}" \
-         "torchrun" \
-         "--nnodes=2" \
-         "--node_rank=$NODE_RANK" \
-         "--nproc_per_node=1" \
-         "--master_addr=$MASTER_ADDR" \
-         "--master_port=$MASTER_PORT" \
-         "$INTERNODE_SCRIPT" \
-         "$PY_ARGS"
+    local ENV_VARS="GPU_PER_NODE=$GPU_PER_NODE"
+    ENV_VARS+=" GLOO_SOCKET_IFNAME=$IFNAME"
+    ENV_VARS+=" MORI_SOCKET_IFNAME=$IFNAME"
+    ENV_VARS+=" PYTHONPATH=${THE_REPO_ROOT}/python:${THE_REPO_ROOT}"
+    ENV_VARS+=" MORI_TUNING_SCOPE=$TUNING_SCOPE"
+    [[ -n "$RDMA_SL" ]] && ENV_VARS+=" MORI_RDMA_SL=$RDMA_SL"
+
+    echo "cd $THE_REPO_ROOT && $ENV_VARS" \
+         "torchrun --nnodes=2 --node_rank=$NODE_RANK --nproc_per_node=1" \
+         "--master_addr=$MASTER_ADDR --master_port=$MASTER_PORT" \
+         "$INTERNODE_SCRIPT $PY_ARGS"
 }
+
+# ---- Launch remote (rank 1) ----
+launch_peer() {
+    local CMD="$1"
+    if [[ -n "$DOCKER" ]]; then
+        ssh "${SSH_OPTS[@]}" "$PEER_HOST" \
+            "sudo docker exec -w $REMOTE_REPO_ROOT $DOCKER bash -c \"$CMD\"" &
+    else
+        ssh "${SSH_OPTS[@]}" "$PEER_HOST" "bash -lc '$CMD'" &
+    fi
+    PEER_PID=$!
+}
+
+# ---- Kill remote processes ----
+cleanup_peer() {
+    kill "$PEER_PID" 2>/dev/null || true
+    wait "$PEER_PID" 2>/dev/null || true
+    local KILL_CMD='pkill -9 -f torchrun; pkill -9 -f test_dispatch_combine_internode; pkill -9 -f "multiprocessing.spawn"'
+    if [[ -n "$DOCKER" ]]; then
+        ssh "${SSH_OPTS[@]}" "$PEER_HOST" \
+            "sudo docker exec $DOCKER bash -c '$KILL_CMD'" 2>/dev/null || true
+    else
+        ssh "${SSH_OPTS[@]}" "$PEER_HOST" "$KILL_CMD" 2>/dev/null || true
+    fi
+}
+
+# ---- Pre-run: kill residual processes ----
+echo "Cleaning up residual processes..."
+KILL_ALL='pkill -9 -f torchrun; pkill -9 -f test_dispatch_combine_internode; pkill -9 -f "multiprocessing.spawn"'
+eval "$KILL_ALL" 2>/dev/null || true
+if [[ -n "$DOCKER" ]]; then
+    ssh "${SSH_OPTS[@]}" "$PEER_HOST" \
+        "sudo docker exec $DOCKER bash -c '$KILL_ALL'" 2>/dev/null || true
+else
+    ssh "${SSH_OPTS[@]}" "$PEER_HOST" "$KILL_ALL" 2>/dev/null || true
+fi
+sleep 2
+echo "Cleanup done"
+echo ""
 
 COMBO_IDX=0
 FAILED=0
-
 HUNG_COMBOS=""
 
 for HIDDEN_DIM in "${HIDDEN_DIM_ARRAY[@]}"; do
@@ -209,43 +256,33 @@ for HIDDEN_DIM in "${HIDDEN_DIM_ARRAY[@]}"; do
         CMD_RANK0=$(build_torchrun_cmd 0 "$REPO_ROOT" "$PY_ARGS_RANK0")
         CMD_RANK1=$(build_torchrun_cmd 1 "$REMOTE_REPO_ROOT" "$PY_ARGS_RANK1")
 
-        REPRO_RANK0="HSA_NO_SCRATCH_RECLAIM=1 $CMD_RANK0"
-        REPRO_RANK1="HSA_NO_SCRATCH_RECLAIM=1 $CMD_RANK1"
-
         # Launch peer (rank 1) via SSH in background
-        ssh "$PEER_HOST" "bash -lc '$CMD_RANK1'" &
-        PEER_PID=$!
+        launch_peer "$CMD_RANK1"
+        sleep 3
 
         # Launch local (rank 0) with timeout
-        timeout "$TIMEOUT_SEC" bash -c "$CMD_RANK0"
-        EXIT_CODE=$?
+        set +e
+        timeout "$TIMEOUT_SEC" bash -c "$CMD_RANK0" 2>&1 | tee -a "$LOG_FILE"
+        EXIT_CODE=${PIPESTATUS[0]}
+        set -e
 
         if [[ $EXIT_CODE -eq 124 ]]; then
             FAILED=$((FAILED + 1))
             HUNG_COMBOS="${HUNG_COMBOS}\n  hidden_dim=$HIDDEN_DIM, max_tokens=$TOKENS"
             echo ""
             echo "!!! TIMEOUT (${TIMEOUT_SEC}s): hidden_dim=$HIDDEN_DIM, max_tokens=$TOKENS — possible kernel hang !!!"
-            echo "!!! Reproduce rank 0: $REPRO_RANK0 !!!"
-            echo "!!! Reproduce rank 1 (on $PEER_HOST): $REPRO_RANK1 !!!"
             echo ""
         elif [[ $EXIT_CODE -ne 0 ]]; then
             FAILED=$((FAILED + 1))
             echo ""
             echo "!!! FAILED (exit $EXIT_CODE): hidden_dim=$HIDDEN_DIM, max_tokens=$TOKENS !!!"
-            echo "!!! Reproduce rank 0: $REPRO_RANK0 !!!"
-            echo "!!! Reproduce rank 1 (on $PEER_HOST): $REPRO_RANK1 !!!"
             echo ""
         else
             echo "[$(date)] Completed [$COMBO_IDX/$TOTAL_COMBOS]"
         fi
 
-        # Clean up peer: kill SSH process, then remote torchrun if still alive
-        kill "$PEER_PID" 2>/dev/null || true
-        wait "$PEER_PID" 2>/dev/null || true
-        if [[ $EXIT_CODE -ne 0 ]]; then
-            ssh "$PEER_HOST" "pkill -f 'torchrun.*test_dispatch_combine_internode'" 2>/dev/null || true
-        fi
-
+        # Always cleanup peer
+        cleanup_peer
         sleep 2
     done
 done
