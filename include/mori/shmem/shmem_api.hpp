@@ -30,9 +30,12 @@
 #include <cstdint>
 
 #include "hip/hip_runtime_api.h"
-#include "mori/application/application.hpp"
 
 namespace mori {
+
+namespace application {
+class BootstrapNetwork;
+}
 namespace shmem {
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -105,9 +108,6 @@ void* ShmemMalloc(size_t size);
 void* ShmemMallocAlign(size_t alignment, size_t size);
 void* ShmemExtMallocWithFlags(size_t size, unsigned int flags);
 void ShmemFree(void*);
-
-// Note: temporary API for testing
-application::SymmMemObjPtr ShmemQueryMemObjPtr(void*);
 
 int ShmemBufferRegister(void* ptr, size_t size);
 int ShmemBufferDeregister(void* ptr, size_t size);

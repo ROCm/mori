@@ -233,6 +233,7 @@ SdmaQueue::~SdmaQueue() {
 SdmaQueueDeviceHandle* SdmaQueue::deviceHandle() const { return deviceHandle_; }
 
 AnvilLib::~AnvilLib() {
+  if (!is_initialized_) return;
   std::lock_guard<std::mutex> lock(mutex_);
   for (auto& p : sdma_channels_) {
     p.second.clear();
@@ -242,7 +243,7 @@ AnvilLib::~AnvilLib() {
 }
 
 void AnvilLib::init() {
-  std::call_once(init_flag, []() {
+  std::call_once(init_flag, [this]() {
     //   std::atexit(CloseKFD); // Register cleanup
 
     // HSA
@@ -263,6 +264,7 @@ void AnvilLib::init() {
     }
 
     SetUpKFD();
+    is_initialized_ = true;
   });
 }
 

@@ -57,8 +57,8 @@ using namespace mori::core;
 using namespace mori::shmem;
 using namespace mori::application;
 
-constexpr size_t DEFAULT_CHUNK_BYTES = 1 * 1024 * 1024;
-constexpr const char* NFS_DIR = "/data/mori";
+constexpr size_t DEFAULT_CHUNK_BYTES = 54*2*1*256*48*128 * sizeof(uint16_t);//1 * 1024 * 1024;
+constexpr const char* NFS_DIR = "/tf/mori";
 constexpr const char* UID_FILENAME = "allgather_test_uid.bin";
 constexpr int UID_POLL_INTERVAL_MS = 100;
 constexpr int UID_POLL_TIMEOUT_S = 120;
@@ -135,32 +135,39 @@ __global__ void FillPatternKernel(uint32_t* buf, size_t numElements, uint32_t se
   }
 }
 
-__global__ void AllGatherKernel(int myPe, int npes, const SymmMemObjPtr buf, size_t chunkBytes) {
-  int destPe = blockIdx.x;
-  if (destPe >= npes || destPe == myPe) return;
-
-  size_t myOffset = static_cast<size_t>(myPe) * chunkBytes;
-
+__global__ void AllGatherKernel(int myPe, int npes, int numQ, SymmMemObjPtr inBuf,
+        size_t inOfs, SymmMemObjPtr outBuf, size_t outOfs, size_t chunkSz) {
   // NYI for SDMA path
   //ShmemPutMemNbiBlock(buf, myOffset, buf, myOffset, chunkBytes, destPe);
   // ShmemPutMemNbiWarp(buf, myOffset, buf, myOffset, chunkBytes, destPe, /*qpId=*/0);
+  const int tid = threadIdx.x;
+  // so we split data sending across numQ queues
+  // each queue sends chunkBytes / numQ bytes
+  if (tid < npes * numQ) {
+    int destPe = tid / numQ;
+    int qpId = tid - destPe * numQ;
+    size_t qpChunkSz = chunkSz / numQ, qpOfs = qpId * qpChunkSz;
+    if (qpId == numQ - 1) {
+      qpChunkSz = chunkSz - (qpId * qpChunkSz);
+    }
 
-  if (threadIdx.x == 0) {
-    // printf(" rank=%d at %d\n", myPe, __LINE__);
-    ShmemPutMemNbiThread(buf, myOffset, buf, myOffset, chunkBytes, destPe, 0);
-    // //printf("rank=%d at %d\n", myPe, __LINE__);
+    size_t dstOfs = static_cast<size_t>(myPe) * chunkSz + qpOfs;
+    {
+      // printf("rank=%d sending to %d qpId=%d ofs=%zu chunkSz=%zu\n", myPe,
+      //   destPe, qpId, dstOfs, qpChunkSz);
+      ShmemPutMemNbiThread(outBuf, outOfs + dstOfs, inBuf, inOfs + qpOfs, qpChunkSz, destPe, qpId);
+    }
     // // //    enum TransportType { RDMA = 0, P2P = 1, SDMA = 2 };
     auto ttype = GetGlobalGpuStatesPtr()->transportTypes[destPe];
-    printf("transport type: %d numQ: %d\n", ttype, buf->sdmaNumQueue);
+    // printf("transport type: %d numQ: %d\n", ttype, buf->sdmaNumQueue);
     if (ttype == mori::application::SDMA) {
-       //ShmemQuietThread(destPe, buf);
-      ShmemQuietThreadKernel<mori::application::SDMA>(destPe, buf);
+       ShmemQuietThread(destPe, outBuf);
+      // ShmemQuietThreadKernel<mori::application::SDMA>(destPe, outBuf);
     }
   }
-}
-
-__global__ void BarrierKernel() {
-  ShmemBarrierAllThread();
+  if (tid == 0) {
+    ShmemBarrierAllThread();
+  }
 }
 
 __global__ void VerifyKernel(const uint32_t* buf, size_t elementsPerChunk, int npes,
@@ -226,45 +233,68 @@ static void RunAllgatherThreadedTest(size_t chunkBytes, const UniqueId& uid,
   hipStream_t stream;
   HIP_RUNTIME_CHECK(hipStreamCreate(&stream));
 
-  void* buf = ShmemMalloc(totalBytes);
-  HIP_RUNTIME_CHECK(hipMemsetAsync(buf, 0, totalBytes, stream));
+  size_t inOfs = 0, outOfs = chunkBytes;
+  void *baseBuf = ShmemMalloc(chunkBytes + totalBytes);
+  void *inBuf = static_cast<char*>(baseBuf) + inOfs;
+  void* outBuf = static_cast<char*>(baseBuf) + outOfs;
+  HIP_RUNTIME_CHECK(hipMemsetAsync(baseBuf, 0, chunkBytes + totalBytes, stream));
   HIP_RUNTIME_CHECK(hipStreamSynchronize(stream));
 
-  uint32_t* myChunk = reinterpret_cast<uint32_t*>(buf) + myPe * elementsPerChunk;
   uint32_t seed = static_cast<uint32_t>(myPe + 1);
-  constexpr int kThreads = 64;
+  constexpr int kThreads = 256;
   int fillBlocks =
       static_cast<int>(std::min<size_t>(1024, (elementsPerChunk + kThreads - 1) / kThreads));
-  FillPatternKernel<<<fillBlocks, kThreads, 0, stream>>>(myChunk, elementsPerChunk, seed);
+  FillPatternKernel<<<fillBlocks, kThreads, 0, stream>>>(reinterpret_cast<uint32_t*>(inBuf), 
+                                                         elementsPerChunk, seed);
   HIP_RUNTIME_CHECK(hipStreamSynchronize(stream));
 
   bootnet->Barrier();
+  SymmMemObjPtr baseBufObj = ShmemQueryMemObjPtr(baseBuf);
+  const uint32_t numQ = std::min(baseBufObj->sdmaNumQueue, 4u); // could be adapted to the data size
 
-  SymmMemObjPtr bufObj = ShmemQueryMemObjPtr(buf);
-  assert(bufObj.IsValid());
+  // --- Allgather benchmark ---
+  constexpr int nWarmup = 5;
+  constexpr int nRuns = 20;
 
-  // --- Allgather ---
   hipEvent_t tStart, tStop;
   HIP_RUNTIME_CHECK(hipEventCreate(&tStart));
   HIP_RUNTIME_CHECK(hipEventCreate(&tStop));
-  HIP_RUNTIME_CHECK(hipEventRecord(tStart));
 
-  bootnet->Barrier();
+  float totalMs = 0;
+  float minMs = 1e9f, maxMs = 0;
 
-  AllGatherKernel<<<npes, kThreads, 0, stream>>>(myPe, npes, bufObj, chunkBytes);
-  BarrierKernel<<<1, 1, 0, stream>>>();
-  HIP_RUNTIME_CHECK(hipStreamSynchronize(stream));
+  for (int iter = 0; iter < nWarmup + nRuns; iter++) {
+    HIP_RUNTIME_CHECK(hipMemsetAsync(outBuf, 0, totalBytes, stream));
+    HIP_RUNTIME_CHECK(hipStreamSynchronize(stream));
 
-  HIP_RUNTIME_CHECK(hipEventRecord(tStop));
-  HIP_RUNTIME_CHECK(hipEventSynchronize(tStop));
-  float elapsedMs = 0;
-  HIP_RUNTIME_CHECK(hipEventElapsedTime(&elapsedMs, tStart, tStop));
+    bootnet->Barrier();
 
-  bootnet->Barrier();
+    HIP_RUNTIME_CHECK(hipEventRecord(tStart, stream));
+    // HIP_RUNTIME_CHECK(hipMemcpyAsync(
+    //     static_cast<char*>(outBuf) + myPe * chunkBytes, inBuf, chunkBytes,
+    //     hipMemcpyDeviceToDevice, stream));
+    AllGatherKernel<<<1, kThreads, 0, stream>>>(
+         myPe, npes, numQ, baseBufObj, inOfs, baseBufObj, outOfs, chunkBytes);
+    HIP_RUNTIME_CHECK(hipEventRecord(tStop, stream));
+    HIP_RUNTIME_CHECK(hipStreamSynchronize(stream));
 
-  // std::this_thread::sleep_for(std::chrono::seconds(5));
+    float iterMs = 0;
+    HIP_RUNTIME_CHECK(hipEventElapsedTime(&iterMs, tStart, tStop));
 
-  // --- Verify ---
+    if (iter >= nWarmup) {
+      totalMs += iterMs;
+      minMs = std::min(minMs, iterMs);
+      maxMs = std::max(maxMs, iterMs);
+    }
+
+    bootnet->Barrier();
+  }
+
+  float avgMs = totalMs / nRuns;
+  double avgBw = (totalBytes / 1e9) / (avgMs / 1e3);
+  double maxBw = (totalBytes / 1e9) / (minMs / 1e3);
+
+  // --- Verify (last iteration's result) ---
   uint32_t* dErrors;
   HIP_RUNTIME_CHECK(hipMalloc(&dErrors, sizeof(uint32_t)));
   HIP_RUNTIME_CHECK(hipMemsetAsync(dErrors, 0, sizeof(uint32_t), stream));
@@ -272,7 +302,7 @@ static void RunAllgatherThreadedTest(size_t chunkBytes, const UniqueId& uid,
   size_t totalElements = static_cast<size_t>(npes) * elementsPerChunk;
   int vBlocks =
       static_cast<int>(std::min<size_t>(1024, (totalElements + kThreads - 1) / kThreads));
-  VerifyKernel<<<vBlocks, kThreads, 0, stream>>>(reinterpret_cast<const uint32_t*>(buf), elementsPerChunk,
+  VerifyKernel<<<vBlocks, kThreads, 0, stream>>>(reinterpret_cast<const uint32_t*>(outBuf), elementsPerChunk,
                                       npes, dErrors);
 
   uint32_t hErrors = 0;
@@ -280,14 +310,15 @@ static void RunAllgatherThreadedTest(size_t chunkBytes, const UniqueId& uid,
   HIP_RUNTIME_CHECK(hipStreamSynchronize(stream));
   HIP_RUNTIME_CHECK(hipFree(dErrors));
 
-  double bw = (totalBytes / 1e9) / (elapsedMs / 1e3);
-  XPUT("Rank %d: %s (%u errors), %.2f ms, %.3f GB/s",
-       myPe, hErrors == 0 ? "PASS" : "FAIL", hErrors, elapsedMs, bw);
+  XPUT("Rank %d: %s (%u errors) | %d warmup + %d runs | avg %.2f ms (%.3f GB/s) "
+       "min %.2f ms (%.3f GB/s) max %.2f ms",
+       myPe, hErrors == 0 ? "PASS" : "FAIL", hErrors,
+       nWarmup, nRuns, avgMs, avgBw, minMs, maxBw, maxMs);
 
   HIP_RUNTIME_CHECK(hipEventDestroy(tStart));
   HIP_RUNTIME_CHECK(hipEventDestroy(tStop));
   HIP_RUNTIME_CHECK(hipStreamDestroy(stream));
-  ShmemFree(buf);
+  ShmemFree(inBuf);
   ShmemFinalize();
   info.ret_code = 0;
 }

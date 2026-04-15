@@ -302,7 +302,7 @@ ErrorOr<std::unique_ptr<EpDispatchCombineState>> EpDispatchCombineInstantiate(
     entry.resize(1);
     entry[0] = std::make_unique<EpDispatchCombineHandle>(cfg);
   }
-  auto state = std::make_unique<EpDispatchCombineState>(1);
+  auto state = std::make_unique<EpDispatchCombineState>();
   state->handles = &entry;
   return state;
 #endif // MORI_MULTITHREAD_SUPPORT

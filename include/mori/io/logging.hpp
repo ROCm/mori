@@ -32,13 +32,13 @@ namespace io {
 // Legacy SetLogLevel function for backward compatibility
 inline void SetLogLevel(const std::string& strLevel) {
   try {
-    InitializeLoggingFromEnv();
+    ModuleLogger::GetInstance().InitializeLoggingFromEnv();
   } catch (...) {
   }
 
   ForceSetModuleLogLevel(modules::IO, strLevel);
 
-  auto logger = mori::ModuleLogger::GetInstance().GetLogger(modules::IO);
+  auto logger = ModuleLogger::GetInstance().GetLogger(modules::IO);
   if (logger) {
     logger->info("Set MORI-IO log level to {}", strLevel);
   }

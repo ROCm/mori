@@ -44,13 +44,13 @@ export MORI_SHMEM_MODE=STATIC_HEAP #ISOLATION #VMM_HEAP #  STATIC_HEAP
 # export MORI_SHMEM_HEAP_TYPE=normal
 export MORI_SHMEM_HEAP_SIZE=5G
 export MORI_KERNEL_DIR=/tf/mori/build/lib/gfx942_mlx5
-export MORI_APP_LOG_LEVEL=DEBUG
-export MORI_SHMEM_LOG_LEVEL=DEBUG
-export MORI_CORE_LOG_LEVEL=DEBUG
-export MORI_OPS_LOG_LEVEL=DEBUG
+# export MORI_APP_LOG_LEVEL=DEBUG
+# export MORI_SHMEM_LOG_LEVEL=DEBUG
+# export MORI_CORE_LOG_LEVEL=DEBUG
+# export MORI_OPS_LOG_LEVEL=DEBUG
 
 export MORI_DISABLE_P2P=0
-export MORI_ENABLE_SDMA=0
+export MORI_ENABLE_SDMA=1
 
 # export HIP_VISIBLE_DEVICES=0,1
 # export AMD_LOG_LEVEL=4
@@ -64,7 +64,7 @@ export LD_PRELOAD=/lib/x86_64-linux-gnu/libnuma.so.1 #:/lib/x86_64-linux-gnu/lib
 
 #mpirun --allow-run-as-root -np 2 ./build/examples/allgather_test $@
 NUM_PROCS=1
-NUM_GPUS_PER_PROCESS=2
+NUM_GPUS_PER_PROCESS=4
 
 pkill -9 -c -f allgather_test
 rm -f allgather_test_uid.bin zz*.log

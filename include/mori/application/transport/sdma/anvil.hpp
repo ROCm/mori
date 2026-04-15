@@ -107,6 +107,7 @@ class AnvilLib {
   uint64_t getKey(int A, int B) {
     return static_cast<uint64_t>(A) << 32 | static_cast<uint64_t>(B);
   }
+  bool is_initialized_ = false;
   std::unordered_map<uint64_t, std::vector<std::unique_ptr<SdmaQueue>>> sdma_channels_;
 };
 

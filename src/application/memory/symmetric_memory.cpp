@@ -189,7 +189,7 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
     if (context.GetTransportType(i) != TransportType::SDMA) continue;
     dstDeviceIds.push_back(i % 8);  // should be intra devices count
   }
-  if (dstDeviceIds.size() != 0) {
+  if (!dstDeviceIds.empty()) {
     int srcDeviceId = rank % 8;
     int numOfQueuesPerDevice = gpuMemObj->sdmaNumQueue;  // all sdma queues are inited
     // Allocate based on worldSize (not dstDeviceIds.size()) because indexing uses pe * numQ
@@ -234,12 +234,11 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
     peerSignalPtrsHost[rank] = gpuMemObj->signalPtrs;
     for (int i = 0; i < worldSize; i++) {
       if (context.GetTransportType(i) != TransportType::SDMA) continue;
-      if (i == rank) continue;
-      void* mappedPtr = nullptr;
-      if (context.SameProcessP2P(i)) {
+      if (i == rank || context.SameProcessP2P(i)) {
         peerSignalPtrsHost[i] = signalInfos[i].signalPtrs;
-        mori::MoriEnablePeerAccess(rank, i);
+        if (i != rank) mori::MoriEnablePeerAccess(rank, i);
       } else {
+        void* mappedPtr = nullptr;
         HIP_RUNTIME_CHECK(
           hipIpcOpenMemHandle(&mappedPtr, signalInfos[i].handle, hipIpcMemLazyEnablePeerAccess));
         peerSignalPtrsHost[i] = reinterpret_cast<HSAuint64*>(mappedPtr);

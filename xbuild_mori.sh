@@ -16,24 +16,23 @@ if [[ ${full} -eq 1 ]]; then
 
 #  apt-get install -y \
 #     git \
-#    ibverbs-utils \
-#     libpci-dev \
+#    ibverbs-utils libpci-dev \
 #     libdw1 \
 #     cython3 
 
 # NOTE this would screw up hipcc installation!!!
 # better install MPI manually
-#    apt-get install -y openmpi-bin libopenmpi-dev 
+#    apt-get install -y openmpi-bin libopenmpi-dev pybind11-dev
 
   rm -rf *
-  cmake -DUSE_ROCM=ON -DCMAKE_BUILD_TYPE=Debug  \
+  cmake -DUSE_ROCM=ON -DCMAKE_BUILD_TYPE=Release  \
       -DBUILD_EXAMPLES=ON -DWARP_ACCUM_UNROLL=1 -DUSE_BNXT=OFF \
       -DBUILD_APPLICATION=ON -DBUILD_SHMEM=ON -DBUILD_OPS=ON -DBUILD_IO=ON \
-      -DBUILD_PYBINDS=OFF -DBUILD_UMBP=OFF -DBUILD_TESTS=OFF -DENABLE_PROFILER=OFF \
+      -DBUILD_PYBINDS=ON -DBUILD_UMBP=OFF -DBUILD_TESTS=OFF -DENABLE_PROFILER=OFF \
       -DENABLE_DEBUG_PRINTF=OFF -DENABLE_STANDARD_MOE_ADAPT=OFF -DBUILD_OPS_DEVICE=ON \
-      -DBUILD_XLA_FFI_OPS=OFF -DWITH_MPI=ON -DMORI_MULTITHREAD_SUPPORT=ON \
+      -DBUILD_XLA_FFI_OPS=ON -DWITH_MPI=ON -DMORI_MULTITHREAD_SUPPORT=ON \
       -DBUILD_TORCH_BOOTSTRAP=OFF \
-      -DGPU_TARGETS=gfx942 .. 
+      -DGPU_TARGETS=gfx950 .. 
 fi
 
 make VERBOSE=1 -j 2>&1 | tee ../yyybuild.log
