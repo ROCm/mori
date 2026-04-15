@@ -415,15 +415,61 @@ bool ClientRegistry::FinalizeAllocation(const std::string& node_id, const std::s
       return false;
     }
 
+    auto finalized_it = finalized_allocations_.find(allocation_id);
+    if (finalized_it != finalized_allocations_.end()) {
+      if (finalized_it->second.key == key && finalized_it->second.location == location) {
+        return true;
+      }
+      MORI_UMBP_ERROR(
+          "[Registry] Idempotent FinalizeAllocation mismatch: allocation_id={}, "
+          "expected key='{}' location='{}', got key='{}' location='{}'",
+          allocation_id, finalized_it->second.key, finalized_it->second.location.location_id, key,
+          location.location_id);
+      return false;
+    }
+
     auto pending_it = pending_allocations_.find(allocation_id);
     if (pending_it == pending_allocations_.end()) {
       return false;
     }
     if (pending_it->second.node_id != node_id) {
+      MORI_UMBP_ERROR(
+          "[Registry] FinalizeAllocation: node_id mismatch for allocation '{}': "
+          "pending={}, request={}",
+          allocation_id, pending_it->second.node_id, node_id);
       return false;
+    }
+    const auto& pa = pending_it->second;
+    if (location.tier != pa.tier) {
+      MORI_UMBP_ERROR(
+          "[Registry] FinalizeAllocation: tier mismatch for allocation '{}': "
+          "expected={}, got={}",
+          allocation_id, TierTypeName(pa.tier), TierTypeName(location.tier));
+      return false;
+    }
+    if (location.size != pa.size) {
+      MORI_UMBP_ERROR(
+          "[Registry] FinalizeAllocation: size mismatch for allocation '{}': "
+          "expected={}, got={}",
+          allocation_id, pa.size, location.size);
+      return false;
+    }
+    if (pa.tier == TierType::DRAM || pa.tier == TierType::HBM) {
+      std::string expected_loc_id =
+          std::to_string(pa.buffer_index) + ":" + std::to_string(pa.offset);
+      if (location.location_id != expected_loc_id) {
+        MORI_UMBP_ERROR(
+            "[Registry] FinalizeAllocation: location_id mismatch for allocation '{}': "
+            "expected='{}', got='{}'",
+            allocation_id, expected_loc_id, location.location_id);
+        return false;
+      }
     }
 
     pending_allocations_.erase(pending_it);
+
+    finalized_allocations_[allocation_id] =
+        FinalizedRecord{key, location, std::chrono::steady_clock::now()};
   }
 
   if (index_ != nullptr) {
@@ -550,6 +596,7 @@ void ClientRegistry::ReaperLoop() {
     }
     ReapExpiredClients();
     ReapExpiredPendingAllocations();
+    ReapExpiredFinalizedRecords();
   }
 }
 
@@ -622,6 +669,19 @@ void ClientRegistry::ReapExpiredPendingAllocations() {
 
     MORI_UMBP_WARN("[Reaper] Expired pending allocation: id={}", it->second.allocation_id);
     it = pending_allocations_.erase(it);
+  }
+}
+
+void ClientRegistry::ReapExpiredFinalizedRecords() {
+  const auto now = std::chrono::steady_clock::now();
+  std::unique_lock lock(mutex_);
+  auto it = finalized_allocations_.begin();
+  while (it != finalized_allocations_.end()) {
+    if (now - it->second.finalized_at > config_.finalized_record_ttl) {
+      it = finalized_allocations_.erase(it);
+    } else {
+      ++it;
+    }
   }
 }
 

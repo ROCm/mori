@@ -78,7 +78,7 @@ class MasterClient {
   // Read-only existence check (no access count side-effects).
   grpc::Status Lookup(const std::string& key, bool* found);
   grpc::Status FinalizeAllocation(const std::string& key, const Location& location,
-                                  const std::string& allocation_id);
+                                  const std::string& allocation_id, int32_t depth = -1);
   grpc::Status PublishLocalBlock(const std::string& key, const Location& location);
   grpc::Status AbortAllocation(const std::string& node_id, const std::string& allocation_id,
                                uint64_t size);
@@ -93,6 +93,18 @@ class MasterClient {
   /// or AbortAllocation().
   grpc::Status RoutePut(const std::string& key, uint64_t block_size,
                         std::optional<RoutePutResult>* out_result);
+
+  // --- Batch RPCs ---
+  grpc::Status BatchRoutePut(const std::vector<std::string>& keys,
+                             const std::vector<uint64_t>& block_sizes,
+                             std::vector<std::optional<RoutePutResult>>* out);
+  grpc::Status BatchRouteGet(const std::vector<std::string>& keys,
+                             std::vector<std::optional<RouteGetResult>>* out);
+  grpc::Status BatchFinalizeAllocation(const std::vector<std::string>& keys,
+                                       const std::vector<Location>& locations,
+                                       const std::vector<std::string>& allocation_ids,
+                                       std::vector<bool>* out,
+                                       const std::vector<int32_t>& depths = {});
 
   // --- Heartbeat ---
   void StartHeartbeat();

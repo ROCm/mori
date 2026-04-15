@@ -156,7 +156,7 @@ endif()
 find_package(Protobuf QUIET)
 find_package(gRPC CONFIG QUIET)
 
-# This branch wires distributed PoolClient support directly into umbp_core, so
+# This branch wires distributed PoolClient support directly into umbp_common, so
 # gRPC + Protobuf are a required build dependency here.
 if(TARGET gRPC::grpc++)
   set(_GRPCPP_LIB gRPC::grpc++)
@@ -297,6 +297,7 @@ add_library(
   distributed/master/client_registry.cpp
   distributed/master/master_server.cpp
   distributed/master/master_client.cpp
+  distributed/master/eviction_manager.cpp
   distributed/routing/router.cpp
   distributed/routing/route_get_strategy.cpp
   distributed/routing/route_put_strategy.cpp

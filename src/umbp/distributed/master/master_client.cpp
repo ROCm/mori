@@ -255,7 +255,7 @@ grpc::Status MasterClient::Lookup(const std::string& key, bool* found) {
 }
 
 grpc::Status MasterClient::FinalizeAllocation(const std::string& key, const Location& location,
-                                              const std::string& allocation_id) {
+                                              const std::string& allocation_id, int32_t depth) {
   if (!registered_) {
     return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
                         "node must be registered before finalization");
@@ -267,9 +267,10 @@ grpc::Status MasterClient::FinalizeAllocation(const std::string& key, const Loca
   }
 
   ::umbp::FinalizeRequest req;
-  req.set_node_id(config_.node_id);
+  req.set_node_id(normalized_location.node_id);
   req.set_key(key);
   req.set_allocation_id(allocation_id);
+  req.set_depth(depth);
   FillProtoLocation(normalized_location, req.mutable_location());
 
   ::umbp::FinalizeResponse resp;
@@ -424,6 +425,161 @@ grpc::Status MasterClient::RoutePut(const std::string& key, uint64_t block_size,
   }
 
   MORI_UMBP_INFO("[Client] RoutePut key='{}': found={}", key, resp.found());
+  return grpc::Status::OK;
+}
+
+grpc::Status MasterClient::BatchRoutePut(const std::vector<std::string>& keys,
+                                         const std::vector<uint64_t>& block_sizes,
+                                         std::vector<std::optional<RoutePutResult>>* out) {
+  if (out != nullptr) {
+    out->clear();
+  }
+
+  if (!registered_) {
+    return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
+                        "node must be registered before BatchRoutePut");
+  }
+
+  ::umbp::BatchRoutePutRequest req;
+  req.set_node_id(config_.node_id);
+  for (const auto& k : keys) {
+    req.add_keys(k);
+  }
+  for (uint64_t sz : block_sizes) {
+    req.add_block_sizes(sz);
+  }
+
+  ::umbp::BatchRoutePutResponse resp;
+  grpc::ClientContext ctx;
+  auto status = GetStub(stub_.get())->BatchRoutePut(&ctx, req, &resp);
+
+  if (!status.ok()) {
+    MORI_UMBP_ERROR("[Client] BatchRoutePut failed: {}", status.error_message());
+    return status;
+  }
+
+  if (out != nullptr) {
+    out->resize(resp.entries_size());
+    for (int i = 0; i < resp.entries_size(); ++i) {
+      const auto& entry = resp.entries(i);
+      if (entry.found()) {
+        RoutePutResult result;
+        result.node_id = entry.node_id();
+        result.node_address = entry.node_address();
+        result.tier = static_cast<TierType>(entry.tier());
+        result.peer_address = entry.peer_address();
+        const auto& ed = entry.engine_desc();
+        result.engine_desc_bytes.assign(ed.begin(), ed.end());
+        const auto& md = entry.dram_memory_desc();
+        result.dram_memory_desc_bytes.assign(md.begin(), md.end());
+        result.allocated_offset = entry.allocated_offset();
+        result.buffer_index = entry.buffer_index();
+        result.allocation_id = entry.allocation_id();
+        (*out)[i] = std::move(result);
+      }
+    }
+  }
+
+  MORI_UMBP_INFO("[Client] BatchRoutePut: {} keys", keys.size());
+  return grpc::Status::OK;
+}
+
+grpc::Status MasterClient::BatchRouteGet(const std::vector<std::string>& keys,
+                                         std::vector<std::optional<RouteGetResult>>* out) {
+  if (out != nullptr) {
+    out->clear();
+  }
+
+  if (!registered_) {
+    return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
+                        "node must be registered before BatchRouteGet");
+  }
+
+  ::umbp::BatchRouteGetRequest req;
+  req.set_node_id(config_.node_id);
+  for (const auto& k : keys) {
+    req.add_keys(k);
+  }
+
+  ::umbp::BatchRouteGetResponse resp;
+  grpc::ClientContext ctx;
+  auto status = GetStub(stub_.get())->BatchRouteGet(&ctx, req, &resp);
+
+  if (!status.ok()) {
+    MORI_UMBP_ERROR("[Client] BatchRouteGet failed: {}", status.error_message());
+    return status;
+  }
+
+  if (out != nullptr) {
+    out->resize(resp.entries_size());
+    for (int i = 0; i < resp.entries_size(); ++i) {
+      const auto& entry = resp.entries(i);
+      if (entry.found()) {
+        RouteGetResult result;
+        result.location.node_id = entry.source().node_id();
+        result.location.location_id = entry.source().location_id();
+        result.location.size = entry.source().size();
+        result.location.tier = static_cast<TierType>(entry.source().tier());
+        result.peer_address = entry.peer_address();
+        const auto& ed = entry.engine_desc();
+        result.engine_desc_bytes.assign(ed.begin(), ed.end());
+        const auto& md = entry.dram_memory_desc();
+        result.dram_memory_desc_bytes.assign(md.begin(), md.end());
+        (*out)[i] = std::move(result);
+      }
+    }
+  }
+
+  MORI_UMBP_INFO("[Client] BatchRouteGet: {} keys", keys.size());
+  return grpc::Status::OK;
+}
+
+grpc::Status MasterClient::BatchFinalizeAllocation(const std::vector<std::string>& keys,
+                                                   const std::vector<Location>& locations,
+                                                   const std::vector<std::string>& allocation_ids,
+                                                   std::vector<bool>* out,
+                                                   const std::vector<int32_t>& depths) {
+  if (out != nullptr) {
+    out->clear();
+  }
+
+  if (!registered_) {
+    return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
+                        "node must be registered before BatchFinalizeAllocation");
+  }
+
+  ::umbp::BatchFinalizeRequest req;
+  req.set_node_id(config_.node_id);
+  for (const auto& k : keys) {
+    req.add_keys(k);
+  }
+  for (const auto& loc : locations) {
+    FillProtoLocation(loc, req.add_locations());
+  }
+  for (const auto& id : allocation_ids) {
+    req.add_allocation_ids(id);
+  }
+  for (auto d : depths) {
+    req.add_depths(d);
+  }
+
+  ::umbp::BatchFinalizeResponse resp;
+  grpc::ClientContext ctx;
+  auto status = GetStub(stub_.get())->BatchFinalizeAllocation(&ctx, req, &resp);
+
+  if (!status.ok()) {
+    MORI_UMBP_ERROR("[Client] BatchFinalizeAllocation failed: {}", status.error_message());
+    return status;
+  }
+
+  if (out != nullptr) {
+    out->resize(resp.finalized_size());
+    for (int i = 0; i < resp.finalized_size(); ++i) {
+      (*out)[i] = resp.finalized(i);
+    }
+  }
+
+  MORI_UMBP_INFO("[Client] BatchFinalizeAllocation: {} keys", keys.size());
   return grpc::Status::OK;
 }
 
