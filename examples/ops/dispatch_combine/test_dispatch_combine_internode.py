@@ -128,9 +128,9 @@ def _save_internode_tuning_result(
         "rdma_block_num": best_disp_config[2],
         "warp_per_block": best_disp_config[1],
         "bandwidth_gbps": round(best_disp_bw, 2),
-        "rdma_bandwidth_gbps": round(best_disp_all_bw[0], 2),
-        "xgmi_bandwidth_gbps": round(best_disp_all_bw[1], 2),
-        "ll_bandwidth_gbps": round(best_disp_all_bw[2], 2),
+        "avg_rdma_bandwidth_gbps": round(best_disp_all_bw[0], 2),
+        "avg_xgmi_bandwidth_gbps": round(best_disp_all_bw[1], 2),
+        "avg_ll_bandwidth_gbps": round(best_disp_all_bw[2], 2),
     }
 
     combine_entry = {
@@ -143,9 +143,9 @@ def _save_internode_tuning_result(
         "rdma_block_num": best_comb_config[2],
         "warp_per_block": best_comb_config[1],
         "bandwidth_gbps": round(best_comb_bw, 2),
-        "rdma_bandwidth_gbps": round(best_comb_all_bw[0], 2),
-        "xgmi_bandwidth_gbps": round(best_comb_all_bw[1], 2),
-        "ll_bandwidth_gbps": round(best_comb_all_bw[2], 2),
+        "avg_rdma_bandwidth_gbps": round(best_comb_all_bw[0], 2),
+        "avg_xgmi_bandwidth_gbps": round(best_comb_all_bw[1], 2),
+        "avg_ll_bandwidth_gbps": round(best_comb_all_bw[2], 2),
     }
 
     if config_path == "auto":
@@ -962,12 +962,6 @@ class EpDispatchCombineTestCase:
         )
 
         repeat = 10
-        disp_duration_us_list = []
-        disp_rdma_bandwidth_GB_list = []
-        disp_bandwidth_GB_list = []
-        comb_duration_us_list = []
-        comb_rdma_bandwidth_GB_list = []
-        comb_bandwidth_GB_list = []
 
         error_round = set()
         for i in range(1):
@@ -978,15 +972,7 @@ class EpDispatchCombineTestCase:
             len(error_round) == 0
         ), f"Warmup failed with errors in rounds: {error_round}"
 
-        (
-            disp_duration,
-            disp_rdma_bandwidth,
-            disp_bandwidth,
-            comb_duration,
-            comb_rdma_bandwidth,
-            comb_bandwidth,
-            ll_mode_scale,
-        ) = self.run_bench_once(
+        bench_result = self.run_bench_once(
             max_num_token,
             op,
             test_data,
@@ -995,93 +981,60 @@ class EpDispatchCombineTestCase:
             rdma_block_num=rdma_block_num,
             warp_per_block=warp_per_block,
         )
-
-        for i in range(repeat):
-            disp_duration_output = [torch.zeros(1) for _ in range(self.world_size)]
-            disp_rdma_bandwidth_output = [
-                torch.zeros(1) for _ in range(self.world_size)
-            ]
-            disp_bandwidth_output = [torch.zeros(1) for _ in range(self.world_size)]
-            comb_duration_output = [torch.zeros(1) for _ in range(self.world_size)]
-            comb_rdma_bandwidth_output = [
-                torch.zeros(1) for _ in range(self.world_size)
-            ]
-            comb_bandwidth_output = [torch.zeros(1) for _ in range(self.world_size)]
-
-            dist.all_gather(
-                disp_duration_output, torch.tensor([disp_duration[i] * 1000])
-            )
-            dist.all_gather(
-                disp_rdma_bandwidth_output, torch.tensor([disp_rdma_bandwidth[i]])
-            )
-            dist.all_gather(disp_bandwidth_output, torch.tensor([disp_bandwidth[i]]))
-            dist.all_gather(
-                comb_duration_output, torch.tensor([comb_duration[i] * 1000])
-            )
-            dist.all_gather(
-                comb_rdma_bandwidth_output, torch.tensor([comb_rdma_bandwidth[i]])
-            )
-            dist.all_gather(comb_bandwidth_output, torch.tensor([comb_bandwidth[i]]))
-
-            disp_duration_us_list.append([int(t.item()) for t in disp_duration_output])
-            disp_rdma_bandwidth_GB_list.append(
-                [int(t.item()) for t in disp_rdma_bandwidth_output]
-            )
-            disp_bandwidth_GB_list.append(
-                [int(t.item()) for t in disp_bandwidth_output]
-            )
-            comb_duration_us_list.append([int(t.item()) for t in comb_duration_output])
-            comb_rdma_bandwidth_GB_list.append(
-                [int(t.item()) for t in comb_rdma_bandwidth_output]
-            )
-            comb_bandwidth_GB_list.append(
-                [int(t.item()) for t in comb_bandwidth_output]
-            )
+        ll_mode_scale = bench_result[-1]
+        all_data, _ = self._all_gather_bench_data(bench_result)
+        # all_data: (repeat, world_size, 6)
+        # cols: d_rdma(0) d_xgmi(1) d_lat(2) c_rdma(3) c_xgmi(4) c_lat(5)
 
         if self.rank == 0:
-            for i in range(len(disp_duration_us_list)):
-                print(f"Round {i}")
-                print(
-                    f"  dispatch duration {disp_duration_us_list[i]} avg {sum(disp_duration_us_list[i]) / self.config.world_size:.2f} µs"
-                )
-                print(
-                    f"  rdma bandwidth {disp_rdma_bandwidth_GB_list[i]} avg {sum(disp_rdma_bandwidth_GB_list[i]) / self.config.world_size:.2f} GB/s"
-                )
-                print(
-                    f"  bandwidth {disp_bandwidth_GB_list[i]} avg {sum(disp_bandwidth_GB_list[i]) / self.config.world_size:.2f} GB/s"
-                )
-
-            for i in range(len(comb_duration_us_list)):
-                print(f"Round {i}")
-                print(
-                    f"  combine duration {comb_duration_us_list[i]} avg {sum(comb_duration_us_list[i]) / self.config.world_size:.2f} µs"
-                )
-                print(
-                    f"  rdma bandwidth {comb_rdma_bandwidth_GB_list[i]} avg {sum(comb_rdma_bandwidth_GB_list[i]) / self.config.world_size:.2f} GB/s"
-                )
-                print(
-                    f"  bandwidth {comb_bandwidth_GB_list[i]} avg {sum(comb_bandwidth_GB_list[i]) / self.config.world_size:.2f} GB/s"
-                )
+            _labels = [
+                (
+                    "dispatch",
+                    (
+                        ("duration", 2, "µs"),
+                        ("rdma bandwidth", 0, "GB/s"),
+                        ("bandwidth", 1, "GB/s"),
+                    ),
+                ),
+                (
+                    "combine",
+                    (
+                        ("duration", 5, "µs"),
+                        ("rdma bandwidth", 3, "GB/s"),
+                        ("bandwidth", 4, "GB/s"),
+                    ),
+                ),
+            ]
+            for phase, cols in _labels:
+                for i in range(all_data.shape[0]):
+                    rd = all_data[i]
+                    if cols is _labels[0][1]:
+                        print(f"Round {i}")
+                    for name, col, unit in cols:
+                        print(
+                            f"  {phase} {name} {rd[:, col].int().tolist()}"
+                            f" avg {rd[:, col].mean():.2f} {unit}"
+                        )
 
         if repeat == 1:
             return
 
-        def collect_metrics(per_round_data):
-            minv = min([min(data) for data in per_round_data])
-            maxv = max([max(data) for data in per_round_data])
-            avgl = [(sum(data) / len(data)) for data in per_round_data]
-            avgv = sum(avgl) / len(avgl)
-            return int(minv), int(maxv), int(avgv)
+        kept = all_data[1:]  # skip round 0
+        _s = self._compute_stats
+        disp_rdma_s = _s(kept[:, :, 0])
+        disp_xgmi_s = _s(kept[:, :, 1])
+        comb_rdma_s = _s(kept[:, :, 3])
+        comb_xgmi_s = _s(kept[:, :, 4])
 
-        disp_bw = collect_metrics(disp_bandwidth_GB_list[1:])
-        disp_rdma_bw = collect_metrics(disp_rdma_bandwidth_GB_list[1:])
-        disp_ll_bw = [int(e * ll_mode_scale) for e in disp_bw]
-        disp_lat = collect_metrics(disp_duration_us_list[1:])
+        disp_rdma_bw = tuple(int(v) for v in disp_rdma_s)
+        disp_bw = tuple(int(v) for v in disp_xgmi_s)
+        disp_lat = tuple(int(v) for v in _s(kept[:, :, 2]))
+        disp_ll_bw = tuple(int(v * ll_mode_scale) for v in disp_xgmi_s)
 
-        comb_bw = collect_metrics(comb_bandwidth_GB_list[1:])
-        comb_rdma_bw = collect_metrics(comb_rdma_bandwidth_GB_list[1:])
-        comb_ll_bw = [int(e * ll_mode_scale) for e in comb_bw]
-        comb_lat = collect_metrics(comb_duration_us_list[1:])
+        comb_rdma_bw = tuple(int(v) for v in comb_rdma_s)
+        comb_bw = tuple(int(v) for v in comb_xgmi_s)
+        comb_lat = tuple(int(v) for v in _s(kept[:, :, 5]))
+        comb_ll_bw = tuple(int(v * ll_mode_scale) for v in comb_xgmi_s)
 
         from prettytable import PrettyTable
 
@@ -1179,54 +1132,63 @@ class EpDispatchCombineTestCase:
             comb_lat,
         )
 
-    def _compute_all_bw(self, bench_result):
-        """Compute local-rank average RDMA / XGMI / LL BW from bench result.
+    # ------------------------------------------------------------------
+    # Shared bench data collection — used by both bench and tuning
+    # ------------------------------------------------------------------
 
-        Returns (disp_rdma, disp_xgmi, disp_ll, comb_rdma, comb_xgmi, comb_ll).
+    _GATHER_COLS = (
+        "disp_rdma",
+        "disp_xgmi",
+        "disp_lat",
+        "comb_rdma",
+        "comb_xgmi",
+        "comb_lat",
+    )
+
+    def _all_gather_bench_data(self, bench_result):
+        """Per-iteration all_gather from all ranks (packed into one call per round).
+
+        Returns (data, ll_mode_scale) where *data* has shape
+        ``(repeat, world_size, 6)`` with columns
+        [disp_rdma_bw, disp_xgmi_bw, disp_lat_us,
+         comb_rdma_bw, comb_xgmi_bw, comb_lat_us].
         """
-        (_, disp_rdma, disp_xgmi, _, comb_rdma, comb_xgmi, ll_scale) = bench_result
-
-        def _avg(lst):
-            return sum(lst) / len(lst)
-
-        return (
-            _avg(disp_rdma),
-            _avg(disp_xgmi),
-            _avg(disp_xgmi) * ll_scale,
-            _avg(comb_rdma),
-            _avg(comb_xgmi),
-            _avg(comb_xgmi) * ll_scale,
+        (disp_dur, disp_rdma, disp_xgmi, comb_dur, comb_rdma, comb_xgmi, ll_scale) = (
+            bench_result
         )
+        repeat = len(disp_dur)
 
-    def _gather_min_rank_bw(self, local_bw_tuple):
-        """All-gather all BW metrics and return min-rank for each.
+        rounds = []
+        for i in range(repeat):
+            local = torch.tensor(
+                [
+                    disp_rdma[i],
+                    disp_xgmi[i],
+                    disp_dur[i] * 1000,
+                    comb_rdma[i],
+                    comb_xgmi[i],
+                    comb_dur[i] * 1000,
+                ],
+                dtype=torch.float64,
+            )
+            gathered = [
+                torch.zeros(6, dtype=torch.float64) for _ in range(self.world_size)
+            ]
+            dist.all_gather(gathered, local)
+            rounds.append(torch.stack(gathered))
 
-        Uses a single all_gather of a packed tensor for efficiency.
-        ``local_bw_tuple`` is (d_rdma, d_xgmi, d_ll, c_rdma, c_xgmi, c_ll).
-        Returns the same 6-tuple with min across ranks.
+        return torch.stack(rounds), ll_scale  # (repeat, world_size, 6)
+
+    @staticmethod
+    def _compute_stats(data_2d):
+        """(worst, best, avg) from a (rounds, ranks) float tensor.
+
+        avg = mean of per-round rank-means (grand mean, same as PrettyTable).
         """
-        n = len(local_bw_tuple)
-        t = torch.tensor(list(local_bw_tuple), dtype=torch.float64)
-        gathered = [torch.zeros(n, dtype=torch.float64) for _ in range(self.world_size)]
-        dist.all_gather(gathered, t)
-        stacked = torch.stack(gathered)  # (world_size, n)
-        min_vals = stacked.min(dim=0).values.tolist()
-
-        is_ll_kernel = self.config.kernel_type in (
-            mori.ops.EpDispatchCombineKernelType.InterNodeV1LL,
-            mori.ops.EpDispatchCombineKernelType.AsyncLL,
-        )
-        sel_d_idx, sel_c_idx = (2, 5) if is_ll_kernel else (0, 3)
-
-        if self.rank == 0:
-            labels = ["RDMA", "XGMI", "LL"]
-            for phase, offset in [("dispatch", 0), ("combine", 3)]:
-                parts = "  ".join(
-                    f"{labels[i]}={min_vals[offset + i]:.1f}" for i in range(3)
-                )
-                print(f"  Per-rank {phase} BW (min-rank): {parts}")
-
-        return tuple(min_vals), min_vals[sel_d_idx], min_vals[sel_c_idx]
+        worst = data_2d.min().item()
+        best = data_2d.max().item()
+        avg = data_2d.mean(dim=1).mean().item()
+        return (worst, best, avg)
 
     def tuning_dispatch_combine(self, max_num_token, save_tuning_config=None):
         op = mori.ops.EpDispatchCombineOp(self.config)
@@ -1312,19 +1274,46 @@ class EpDispatchCombineTestCase:
                         rdma_block_num=rdma_bn,
                         warp_per_block=warp,
                     )
-                    local_bw = self._compute_all_bw(bench_result)
-                    all_bw, disp_bw, comb_bw = self._gather_min_rank_bw(local_bw)
+                    all_data, ll_scale = self._all_gather_bench_data(bench_result)
+                    kept = all_data[1:]  # skip round 0, same as bench
+                    # kept: (rounds, world_size, 6)
+                    # cols: d_rdma, d_xgmi, d_lat, c_rdma, c_xgmi, c_lat
+
+                    # Selection: per-rank avg across kept rounds, min rank
+                    rank_means = kept.mean(dim=0)  # (world_size, 6)
+                    if is_ll_kernel:
+                        disp_bw = (rank_means[:, 1] * ll_scale).min().item()
+                        comb_bw = (rank_means[:, 4] * ll_scale).min().item()
+                    else:
+                        disp_bw = rank_means[:, 0].min().item()
+                        comb_bw = rank_means[:, 3].min().item()
+
+                    # Avg for JSON (grand mean = PrettyTable Average)
+                    disp_avg = (
+                        self._compute_stats(kept[:, :, 0])[2],
+                        self._compute_stats(kept[:, :, 1])[2],
+                        self._compute_stats(kept[:, :, 1])[2] * ll_scale,
+                    )
+                    comb_avg = (
+                        self._compute_stats(kept[:, :, 3])[2],
+                        self._compute_stats(kept[:, :, 4])[2],
+                        self._compute_stats(kept[:, :, 4])[2] * ll_scale,
+                    )
 
                     if disp_bw > best_disp_bw:
                         best_disp_bw = disp_bw
                         best_disp_config = (bn, warp, rdma_bn)
-                        best_disp_all_bw = all_bw[:3]
+                        best_disp_all_bw = disp_avg
                     if comb_bw > best_comb_bw:
                         best_comb_bw = comb_bw
                         best_comb_config = (bn, warp, rdma_bn)
-                        best_comb_all_bw = all_bw[3:]
+                        best_comb_all_bw = comb_avg
 
                     if self.rank == 0:
+                        print(
+                            f"  disp min-rank={disp_bw:.1f}  avg={disp_avg[0]:.1f}/{disp_avg[1]:.1f}/{disp_avg[2]:.1f}"
+                            f"  |  comb min-rank={comb_bw:.1f}  avg={comb_avg[0]:.1f}/{comb_avg[1]:.1f}/{comb_avg[2]:.1f}"
+                        )
                         print(
                             f"  >> {bw_label}: disp={disp_bw:.1f}  comb={comb_bw:.1f}  "
                             f"(best disp={best_disp_bw:.1f}  comb={best_comb_bw:.1f})"
