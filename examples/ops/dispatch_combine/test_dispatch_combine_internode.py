@@ -92,8 +92,8 @@ def _save_internode_tuning_result(
     best_disp_bw,
     best_comb_config,
     best_comb_bw,
-    best_disp_all_bw=(0.0, 0.0, 0.0, 0.0),
-    best_comb_all_bw=(0.0, 0.0, 0.0, 0.0),
+    best_disp_all_bw=None,  # dict with rdma/xgmi/ll/lat stats or None
+    best_comb_all_bw=None,
 ):
     from pathlib import Path
     from mori.ops.tuning_config import (
@@ -120,6 +120,9 @@ def _save_internode_tuning_result(
         "ep_size": config.world_size,
     }
 
+    def _stats_avg(stats, key):
+        return stats[key][2] if stats else 0.0
+
     dispatch_entry = {
         "dtype": disp_dtype_str,
         "num_tokens": max_num_token,
@@ -128,10 +131,10 @@ def _save_internode_tuning_result(
         "rdma_block_num": best_disp_config[2],
         "warp_per_block": best_disp_config[1],
         "bandwidth_gbps": round(best_disp_bw, 2),
-        "avg_rdma_bandwidth_gbps": round(best_disp_all_bw[0], 2),
-        "avg_xgmi_bandwidth_gbps": round(best_disp_all_bw[1], 2),
-        "avg_ll_bandwidth_gbps": round(best_disp_all_bw[2], 2),
-        "avg_latency_us": round(best_disp_all_bw[3], 2),
+        "avg_rdma_bandwidth_gbps": round(_stats_avg(best_disp_all_bw, "rdma"), 2),
+        "avg_xgmi_bandwidth_gbps": round(_stats_avg(best_disp_all_bw, "xgmi"), 2),
+        "avg_ll_bandwidth_gbps": round(_stats_avg(best_disp_all_bw, "ll"), 2),
+        "avg_latency_us": round(_stats_avg(best_disp_all_bw, "lat"), 2),
     }
 
     combine_entry = {
@@ -144,10 +147,10 @@ def _save_internode_tuning_result(
         "rdma_block_num": best_comb_config[2],
         "warp_per_block": best_comb_config[1],
         "bandwidth_gbps": round(best_comb_bw, 2),
-        "avg_rdma_bandwidth_gbps": round(best_comb_all_bw[0], 2),
-        "avg_xgmi_bandwidth_gbps": round(best_comb_all_bw[1], 2),
-        "avg_ll_bandwidth_gbps": round(best_comb_all_bw[2], 2),
-        "avg_latency_us": round(best_comb_all_bw[3], 2),
+        "avg_rdma_bandwidth_gbps": round(_stats_avg(best_comb_all_bw, "rdma"), 2),
+        "avg_xgmi_bandwidth_gbps": round(_stats_avg(best_comb_all_bw, "xgmi"), 2),
+        "avg_ll_bandwidth_gbps": round(_stats_avg(best_comb_all_bw, "ll"), 2),
+        "avg_latency_us": round(_stats_avg(best_comb_all_bw, "lat"), 2),
     }
 
     if config_path == "auto":
@@ -1043,121 +1046,90 @@ class EpDispatchCombineTestCase:
             return
 
         kept = all_data[1:]  # skip round 0
+        disp_stats = self._build_phase_stats(kept, 0, 1, 2, ll_mode_scale)
+        comb_stats = self._build_phase_stats(kept, 3, 4, 5, ll_mode_scale)
+
+        disp_dtype_str = str(self.config.data_type).split(".")[-1]
+        comb_dtype_str = str(self.combine_data_type).split(".")[-1]
+        disp_title = f"Dispatch Performance ({disp_dtype_str})"
+        comb_title = f"Combine Performance ({comb_dtype_str})"
+        if self.combine_data_type != self.config.data_type:
+            disp_elem = torch.tensor([], dtype=self.config.data_type).element_size()
+            comb_elem = torch.tensor([], dtype=self.combine_data_type).element_size()
+            disp_title += f" ~{max_num_token * self.dispatch_hidden_dim * disp_elem / (1024**2):.1f} MB/rank"
+            comb_title += f" ~{max_num_token * self.combine_hidden_dim * comb_elem / (1024**2):.1f} MB/rank"
+
+        if self.rank == 0:
+            self._print_phase_table(disp_title, disp_stats)
+            self._print_phase_table(comb_title, comb_stats)
+
+        del op
+
+        def _to_int_tuple(s):
+            return tuple(int(v) for v in s)
+
+        return (
+            _to_int_tuple(disp_stats["xgmi"]),
+            _to_int_tuple(disp_stats["rdma"]),
+            _to_int_tuple(disp_stats["ll"]),
+            _to_int_tuple(disp_stats["lat"]),
+        ), (
+            _to_int_tuple(comb_stats["xgmi"]),
+            _to_int_tuple(comb_stats["rdma"]),
+            _to_int_tuple(comb_stats["ll"]),
+            _to_int_tuple(comb_stats["lat"]),
+        )
+
+    # ------------------------------------------------------------------
+    # Shared bench data collection — used by both bench and tuning
+    # ------------------------------------------------------------------
+
+    def _build_phase_stats(self, kept, col_rdma, col_xgmi, col_lat, ll_scale):
+        """Compute (worst, best, avg) stats for one phase from gathered data.
+
+        Returns dict with keys rdma, xgmi, ll, lat — each a (worst, best, avg) tuple.
+        Uses the same ``_compute_stats`` as PrettyTable, so values are identical.
+        """
         _s = self._compute_stats
-        disp_rdma_s = _s(kept[:, :, 0])
-        disp_xgmi_s = _s(kept[:, :, 1])
-        comb_rdma_s = _s(kept[:, :, 3])
-        comb_xgmi_s = _s(kept[:, :, 4])
+        xgmi_s = _s(kept[:, :, col_xgmi])
+        return {
+            "rdma": _s(kept[:, :, col_rdma]),
+            "xgmi": xgmi_s,
+            "ll": tuple(v * ll_scale for v in xgmi_s),
+            "lat": _s(kept[:, :, col_lat]),
+        }
 
-        disp_rdma_bw = tuple(round(v, 2) for v in disp_rdma_s)
-        disp_bw = tuple(round(v, 2) for v in disp_xgmi_s)
-        disp_lat = tuple(round(v, 2) for v in _s(kept[:, :, 2]))
-        disp_ll_bw = tuple(round(v * ll_mode_scale, 2) for v in disp_xgmi_s)
-
-        comb_rdma_bw = tuple(round(v, 2) for v in comb_rdma_s)
-        comb_bw = tuple(round(v, 2) for v in comb_xgmi_s)
-        comb_lat = tuple(round(v, 2) for v in _s(kept[:, :, 5]))
-        comb_ll_bw = tuple(round(v * ll_mode_scale, 2) for v in comb_xgmi_s)
-
+    @staticmethod
+    def _print_phase_table(title, stats):
+        """Print a PrettyTable for one phase from stats dict."""
         from prettytable import PrettyTable
 
-        disp_table = PrettyTable()
-        comb_table = PrettyTable()
-        field_names = [
+        def _i(s):
+            return tuple(int(v) for v in s)
+
+        tbl = PrettyTable()
+        tbl.title = title
+        tbl.field_names = [
             "Metrics",
             "RDMA Bandwidth (GB/s)",
             "XGMI Bandwidth (GB/s)",
             "LL Bandwidth (GB/s)",
             "Latency (us)",
         ]
-        disp_dtype_str = str(self.config.data_type).split(".")[-1]
-        comb_dtype_str = str(self.combine_data_type).split(".")[-1]
-        is_cross_type = self.combine_data_type != self.config.data_type
-
-        disp_title = f"Dispatch Performance ({disp_dtype_str})"
-        comb_title = f"Combine Performance ({comb_dtype_str})"
-        if is_cross_type:
-            disp_elem = torch.tensor([], dtype=self.config.data_type).element_size()
-            comb_elem = torch.tensor([], dtype=self.combine_data_type).element_size()
-            disp_data_mb = (
-                max_num_token * self.dispatch_hidden_dim * disp_elem / (1024**2)
-            )
-            comb_data_mb = (
-                max_num_token * self.combine_hidden_dim * comb_elem / (1024**2)
-            )
-            disp_title += f" ~{disp_data_mb:.1f} MB/rank"
-            comb_title += f" ~{comb_data_mb:.1f} MB/rank"
-
-        disp_table.title = disp_title
-        disp_table.field_names = field_names
-        disp_table.add_rows(
+        rdma, xgmi, ll, lat = (
+            _i(stats["rdma"]),
+            _i(stats["xgmi"]),
+            _i(stats["ll"]),
+            _i(stats["lat"]),
+        )
+        tbl.add_rows(
             [
-                [
-                    "Best",
-                    disp_rdma_bw[1],
-                    disp_bw[1],
-                    disp_ll_bw[1],
-                    disp_lat[0],
-                ],
-                [
-                    "Worst",
-                    disp_rdma_bw[0],
-                    disp_bw[0],
-                    disp_ll_bw[0],
-                    disp_lat[1],
-                ],
-                [
-                    "Average",
-                    disp_rdma_bw[2],
-                    disp_bw[2],
-                    disp_ll_bw[2],
-                    disp_lat[2],
-                ],
+                ["Best", rdma[1], xgmi[1], ll[1], lat[0]],
+                ["Worst", rdma[0], xgmi[0], ll[0], lat[1]],
+                ["Average", rdma[2], xgmi[2], ll[2], lat[2]],
             ]
         )
-        comb_table.field_names = field_names
-        comb_table.title = comb_title
-        comb_table.add_rows(
-            [
-                [
-                    "Best",
-                    comb_rdma_bw[1],
-                    comb_bw[1],
-                    comb_ll_bw[1],
-                    comb_lat[0],
-                ],
-                [
-                    "Worst",
-                    comb_rdma_bw[0],
-                    comb_bw[0],
-                    comb_ll_bw[0],
-                    comb_lat[1],
-                ],
-                [
-                    "Average",
-                    comb_rdma_bw[2],
-                    comb_bw[2],
-                    comb_ll_bw[2],
-                    comb_lat[2],
-                ],
-            ]
-        )
-        if self.rank == 0:
-            print(disp_table)
-            print(comb_table)
-
-        del op
-
-        return (disp_bw, disp_rdma_bw, disp_ll_bw, disp_lat), (
-            comb_bw,
-            comb_rdma_bw,
-            comb_ll_bw,
-            comb_lat,
-        )
-
-    # ------------------------------------------------------------------
-    # Shared bench data collection — used by both bench and tuning
-    # ------------------------------------------------------------------
+        print(tbl)
 
     _GATHER_COLS = (
         "disp_rdma",
@@ -1172,7 +1144,7 @@ class EpDispatchCombineTestCase:
         """Per-iteration all_gather from all ranks (packed into one call per round).
 
         Returns (data, ll_mode_scale) where *data* has shape
-        ``(repeat, world_size, 6)`` with columns
+        ``(repeat, world_size, 6)`` with full float64 precision and columns
         [disp_rdma_bw, disp_xgmi_bw, disp_lat_us,
          comb_rdma_bw, comb_xgmi_bw, comb_lat_us].
         """
@@ -1265,8 +1237,14 @@ class EpDispatchCombineTestCase:
         best_comb_bw = 0
         best_disp_config = None
         best_comb_config = None
-        best_disp_all_bw = (0.0, 0.0, 0.0, 0.0)
-        best_comb_all_bw = (0.0, 0.0, 0.0, 0.0)
+        _zero_stats = {
+            "rdma": (0, 0, 0),
+            "xgmi": (0, 0, 0),
+            "ll": (0, 0, 0),
+            "lat": (0, 0, 0),
+        }
+        best_disp_stats = dict(_zero_stats)
+        best_comb_stats = dict(_zero_stats)
 
         error_round = set()
         test_data = self.gen_test_data(
@@ -1311,59 +1289,42 @@ class EpDispatchCombineTestCase:
                         disp_bw = rank_means[:, 0].min().item()
                         comb_bw = rank_means[:, 3].min().item()
 
-                    # Avg for JSON (grand mean = PrettyTable Average)
-                    _s = self._compute_stats
-                    disp_xgmi_avg = _s(kept[:, :, 1])[2]
-                    comb_xgmi_avg = _s(kept[:, :, 4])[2]
-                    disp_avg = (
-                        _s(kept[:, :, 0])[2],
-                        disp_xgmi_avg,
-                        disp_xgmi_avg * ll_scale,
-                        _s(kept[:, :, 2])[2],
-                    )
-                    comb_avg = (
-                        _s(kept[:, :, 3])[2],
-                        comb_xgmi_avg,
-                        comb_xgmi_avg * ll_scale,
-                        _s(kept[:, :, 5])[2],
-                    )
+                    # Stats via shared code (same as bench PrettyTable)
+                    disp_stats = self._build_phase_stats(kept, 0, 1, 2, ll_scale)
+                    comb_stats = self._build_phase_stats(kept, 3, 4, 5, ll_scale)
 
                     if disp_bw > best_disp_bw:
                         best_disp_bw = disp_bw
                         best_disp_config = (bn, warp, rdma_bn)
-                        best_disp_all_bw = disp_avg
+                        best_disp_stats = disp_stats
                     if comb_bw > best_comb_bw:
                         best_comb_bw = comb_bw
                         best_comb_config = (bn, warp, rdma_bn)
-                        best_comb_all_bw = comb_avg
+                        best_comb_stats = comb_stats
 
                     if self.rank == 0:
+                        da, ca = disp_stats["xgmi"][2], comb_stats["xgmi"][2]
                         print(
-                            f"  disp min-rank={disp_bw:.1f}  avg={disp_avg[0]:.1f}/{disp_avg[1]:.1f}/{disp_avg[2]:.1f}"
-                            f"  |  comb min-rank={comb_bw:.1f}  avg={comb_avg[0]:.1f}/{comb_avg[1]:.1f}/{comb_avg[2]:.1f}"
-                        )
-                        print(
-                            f"  >> {bw_label}: disp={disp_bw:.1f}  comb={comb_bw:.1f}  "
-                            f"(best disp={best_disp_bw:.1f}  comb={best_comb_bw:.1f})"
+                            f"  disp sel={disp_bw:.1f} xgmi={da:.1f}  "
+                            f"comb sel={comb_bw:.1f} xgmi={ca:.1f}  "
+                            f"(best disp={best_disp_bw:.1f} comb={best_comb_bw:.1f})"
                         )
 
         if self.rank == 0:
             disp_dtype_str = str(self.config.data_type).split(".")[-1]
             comb_dtype_str = str(self.combine_data_type).split(".")[-1]
-            print(f"\n{'=' * 60}")
-            print(f"Performance Summary (metric={bw_label}, aggregation=min-rank):")
-            print(f"{'=' * 60}")
-            print(
-                f"Best Dispatch  ({disp_dtype_str}): {best_disp_bw:.2f} GB/s "
-                f"at block_num={best_disp_config[0]}, warp={best_disp_config[1]}, "
-                f"rdma={best_disp_config[2]}"
-            )
-            print(
-                f"Best Combine   ({comb_dtype_str}): {best_comb_bw:.2f} GB/s "
-                f"at block_num={best_comb_config[0]}, warp={best_comb_config[1]}, "
-                f"rdma={best_comb_config[2]}"
-            )
-            print(f"{'=' * 60}")
+            print(f"\n{'=' * 70}")
+            print("Tuning Result (best config chosen by slowest-rank XGMI BW)")
+            print(f"{'=' * 70}")
+            for label, dtype_s, cfg, st in [
+                ("Dispatch", disp_dtype_str, best_disp_config, best_disp_stats),
+                ("Combine ", comb_dtype_str, best_comb_config, best_comb_stats),
+            ]:
+                self._print_phase_table(
+                    f"{label} ({dtype_s}) block={cfg[0]} warp={cfg[1]} rdma={cfg[2]}",
+                    st,
+                )
+            print(f"{'=' * 70}")
 
             if save_tuning_config and best_disp_config and best_comb_config:
                 _save_internode_tuning_result(
@@ -1375,10 +1336,10 @@ class EpDispatchCombineTestCase:
                     combine_data_type=self.combine_data_type,
                     best_disp_config=best_disp_config,
                     best_disp_bw=best_disp_bw,
-                    best_disp_all_bw=best_disp_all_bw,
+                    best_disp_all_bw=best_disp_stats,
                     best_comb_config=best_comb_config,
                     best_comb_bw=best_comb_bw,
-                    best_comb_all_bw=best_comb_all_bw,
+                    best_comb_all_bw=best_comb_stats,
                 )
 
         del op
