@@ -17,21 +17,19 @@ set -euo pipefail
 #
 #   # Quick test (single config, quick scope)
 #   bash tools/batch_internode_tuning.sh \
-#       --master-addr skyriver07 --peer-host yutongwu@skyriver04 --ifname bond0 \
-#       --docker yutong-mori --ssh-key ~/.ssh/id_ed25519_skyriver \
+#       --master-addr <HOST0> --peer-host <USER>@<HOST1> --ifname <IFNAME> \
 #       --kernel-type v1 --num-qp 2 --tokens-list "128" --tuning-scope quick
 #
-#   # Full tuning: v1, fp4→bf16, fp8 quant
+#   # With docker (remote node runs inside a container)
 #   bash tools/batch_internode_tuning.sh \
-#       --master-addr skyriver07 --peer-host yutongwu@skyriver04 --ifname bond0 \
-#       --docker yutong-mori --ssh-key ~/.ssh/id_ed25519_skyriver \
+#       --master-addr <HOST0> --peer-host <USER>@<HOST1> --ifname <IFNAME> \
+#       --docker <CONTAINER> --ssh-key <SSH_KEY_PATH> \
 #       --kernel-type v1 --num-qp 2 --dtype fp4 --combine-dtype bf16 \
 #       --quant-type fp8_direct_cast --tuning-scope quick
 #
 #   # Full tuning: v1_ll, fp8→bf16
 #   bash tools/batch_internode_tuning.sh \
-#       --master-addr skyriver07 --peer-host yutongwu@skyriver04 --ifname bond0 \
-#       --docker yutong-mori --ssh-key ~/.ssh/id_ed25519_skyriver \
+#       --master-addr <HOST0> --peer-host <USER>@<HOST1> --ifname <IFNAME> \
 #       --kernel-type v1_ll --num-qp 2 --dtype fp8_e4m3_fnuz --combine-dtype bf16 \
 #       --quant-type none --tuning-scope quick
 # ============================================================================
@@ -190,6 +188,7 @@ build_torchrun_cmd() {
     ENV_VARS+=" MORI_SOCKET_IFNAME=$IFNAME"
     ENV_VARS+=" PYTHONPATH=${THE_REPO_ROOT}/python:${THE_REPO_ROOT}"
     ENV_VARS+=" MORI_TUNING_SCOPE=$TUNING_SCOPE"
+    ENV_VARS+=" OMP_NUM_THREADS=4"
     [[ -n "$RDMA_SL" ]] && ENV_VARS+=" MORI_RDMA_SL=$RDMA_SL"
 
     echo "cd $THE_REPO_ROOT && $ENV_VARS" \

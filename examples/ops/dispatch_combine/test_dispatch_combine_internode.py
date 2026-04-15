@@ -92,6 +92,8 @@ def _save_internode_tuning_result(
     best_disp_bw,
     best_comb_config,
     best_comb_bw,
+    best_disp_all_bw=(0.0, 0.0, 0.0),
+    best_comb_all_bw=(0.0, 0.0, 0.0),
 ):
     from pathlib import Path
     from mori.ops.tuning_config import (
@@ -126,6 +128,9 @@ def _save_internode_tuning_result(
         "rdma_block_num": best_disp_config[2],
         "warp_per_block": best_disp_config[1],
         "bandwidth_gbps": round(best_disp_bw, 2),
+        "rdma_bandwidth_gbps": round(best_disp_all_bw[0], 2),
+        "xgmi_bandwidth_gbps": round(best_disp_all_bw[1], 2),
+        "ll_bandwidth_gbps": round(best_disp_all_bw[2], 2),
     }
 
     combine_entry = {
@@ -138,6 +143,9 @@ def _save_internode_tuning_result(
         "rdma_block_num": best_comb_config[2],
         "warp_per_block": best_comb_config[1],
         "bandwidth_gbps": round(best_comb_bw, 2),
+        "rdma_bandwidth_gbps": round(best_comb_all_bw[0], 2),
+        "xgmi_bandwidth_gbps": round(best_comb_all_bw[1], 2),
+        "ll_bandwidth_gbps": round(best_comb_all_bw[2], 2),
     }
 
     if config_path == "auto":
@@ -1171,63 +1179,54 @@ class EpDispatchCombineTestCase:
             comb_lat,
         )
 
-    def _select_bw_metric(self, bench_result):
-        """Select the appropriate BW metric based on kernel type.
+    def _compute_all_bw(self, bench_result):
+        """Compute local-rank average RDMA / XGMI / LL BW from bench result.
 
-        For v1 (InterNodeV1): use RDMA bandwidth (cross-node bottleneck).
-        For v1_ll/async_ll: use LL bandwidth (XGMI * ll_mode_scale).
+        Returns (disp_rdma, disp_xgmi, disp_ll, comb_rdma, comb_xgmi, comb_ll).
         """
-        (
-            _,
-            disp_rdma_bw,
-            disp_xgmi_bw,
-            _,
-            comb_rdma_bw,
-            comb_xgmi_bw,
-            ll_mode_scale,
-        ) = bench_result
+        (_, disp_rdma, disp_xgmi, _, comb_rdma, comb_xgmi, ll_scale) = bench_result
+
+        def _avg(lst):
+            return sum(lst) / len(lst)
+
+        return (
+            _avg(disp_rdma),
+            _avg(disp_xgmi),
+            _avg(disp_xgmi) * ll_scale,
+            _avg(comb_rdma),
+            _avg(comb_xgmi),
+            _avg(comb_xgmi) * ll_scale,
+        )
+
+    def _gather_min_rank_bw(self, local_bw_tuple):
+        """All-gather all BW metrics and return min-rank for each.
+
+        Uses a single all_gather of a packed tensor for efficiency.
+        ``local_bw_tuple`` is (d_rdma, d_xgmi, d_ll, c_rdma, c_xgmi, c_ll).
+        Returns the same 6-tuple with min across ranks.
+        """
+        n = len(local_bw_tuple)
+        t = torch.tensor(list(local_bw_tuple), dtype=torch.float64)
+        gathered = [torch.zeros(n, dtype=torch.float64) for _ in range(self.world_size)]
+        dist.all_gather(gathered, t)
+        stacked = torch.stack(gathered)  # (world_size, n)
+        min_vals = stacked.min(dim=0).values.tolist()
 
         is_ll_kernel = self.config.kernel_type in (
             mori.ops.EpDispatchCombineKernelType.InterNodeV1LL,
             mori.ops.EpDispatchCombineKernelType.AsyncLL,
         )
-        if is_ll_kernel:
-            disp_vals = [v * ll_mode_scale for v in disp_xgmi_bw]
-            comb_vals = [v * ll_mode_scale for v in comb_xgmi_bw]
-        else:
-            disp_vals = list(disp_rdma_bw)
-            comb_vals = list(comb_rdma_bw)
-        return disp_vals, comb_vals
-
-    def _gather_min_rank_bw(self, local_disp_bw, local_comb_bw):
-        """All-gather BW from every rank and return the min-rank average.
-
-        For inference the slowest rank is the bottleneck, so we optimise for
-        the worst-case rank's mean bandwidth across iterations.
-        """
-        disp_t = torch.tensor([local_disp_bw], dtype=torch.float64)
-        comb_t = torch.tensor([local_comb_bw], dtype=torch.float64)
-        all_disp = [torch.zeros(1, dtype=torch.float64) for _ in range(self.world_size)]
-        all_comb = [torch.zeros(1, dtype=torch.float64) for _ in range(self.world_size)]
-        dist.all_gather(all_disp, disp_t)
-        dist.all_gather(all_comb, comb_t)
-
-        all_disp_vals = [t.item() for t in all_disp]
-        all_comb_vals = [t.item() for t in all_comb]
+        sel_d_idx, sel_c_idx = (2, 5) if is_ll_kernel else (0, 3)
 
         if self.rank == 0:
-            print(
-                f"  Per-rank dispatch BW: "
-                f"min={min(all_disp_vals):.1f}  max={max(all_disp_vals):.1f}  "
-                f"avg={sum(all_disp_vals)/len(all_disp_vals):.1f}"
-            )
-            print(
-                f"  Per-rank combine  BW: "
-                f"min={min(all_comb_vals):.1f}  max={max(all_comb_vals):.1f}  "
-                f"avg={sum(all_comb_vals)/len(all_comb_vals):.1f}"
-            )
+            labels = ["RDMA", "XGMI", "LL"]
+            for phase, offset in [("dispatch", 0), ("combine", 3)]:
+                parts = "  ".join(
+                    f"{labels[i]}={min_vals[offset + i]:.1f}" for i in range(3)
+                )
+                print(f"  Per-rank {phase} BW (min-rank): {parts}")
 
-        return min(all_disp_vals), min(all_comb_vals)
+        return tuple(min_vals), min_vals[sel_d_idx], min_vals[sel_c_idx]
 
     def tuning_dispatch_combine(self, max_num_token, save_tuning_config=None):
         op = mori.ops.EpDispatchCombineOp(self.config)
@@ -1281,6 +1280,8 @@ class EpDispatchCombineTestCase:
         best_comb_bw = 0
         best_disp_config = None
         best_comb_config = None
+        best_disp_all_bw = (0.0, 0.0, 0.0)
+        best_comb_all_bw = (0.0, 0.0, 0.0)
 
         error_round = set()
         test_data = self.gen_test_data(
@@ -1311,20 +1312,17 @@ class EpDispatchCombineTestCase:
                         rdma_block_num=rdma_bn,
                         warp_per_block=warp,
                     )
-                    disp_bw_list, comb_bw_list = self._select_bw_metric(bench_result)
-                    local_disp_bw = sum(disp_bw_list) / len(disp_bw_list)
-                    local_comb_bw = sum(comb_bw_list) / len(comb_bw_list)
-
-                    disp_bw, comb_bw = self._gather_min_rank_bw(
-                        local_disp_bw, local_comb_bw
-                    )
+                    local_bw = self._compute_all_bw(bench_result)
+                    all_bw, disp_bw, comb_bw = self._gather_min_rank_bw(local_bw)
 
                     if disp_bw > best_disp_bw:
                         best_disp_bw = disp_bw
                         best_disp_config = (bn, warp, rdma_bn)
+                        best_disp_all_bw = all_bw[:3]
                     if comb_bw > best_comb_bw:
                         best_comb_bw = comb_bw
                         best_comb_config = (bn, warp, rdma_bn)
+                        best_comb_all_bw = all_bw[3:]
 
                     if self.rank == 0:
                         print(
@@ -1360,8 +1358,10 @@ class EpDispatchCombineTestCase:
                     combine_data_type=self.combine_data_type,
                     best_disp_config=best_disp_config,
                     best_disp_bw=best_disp_bw,
+                    best_disp_all_bw=best_disp_all_bw,
                     best_comb_config=best_comb_config,
                     best_comb_bw=best_comb_bw,
+                    best_comb_all_bw=best_comb_all_bw,
                 )
 
         del op

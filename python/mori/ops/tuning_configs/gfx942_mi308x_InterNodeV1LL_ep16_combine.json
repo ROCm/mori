@@ -15,7 +15,10 @@
       "block_num": 64,
       "rdma_block_num": 32,
       "warp_per_block": 8,
-      "bandwidth_gbps": 36.48
+      "bandwidth_gbps": 49.0,
+      "rdma_bandwidth_gbps": 12.28,
+      "xgmi_bandwidth_gbps": 37.83,
+      "ll_bandwidth_gbps": 49.0
     },
     {
       "dtype": "bf16",
@@ -26,7 +29,10 @@
       "block_num": 64,
       "rdma_block_num": 32,
       "warp_per_block": 8,
-      "bandwidth_gbps": 52.31
+      "bandwidth_gbps": 73.74,
+      "rdma_bandwidth_gbps": 18.46,
+      "xgmi_bandwidth_gbps": 57.96,
+      "ll_bandwidth_gbps": 73.74
     },
     {
       "dtype": "bf16",
@@ -34,10 +40,13 @@
       "hidden_dim": 7168,
       "zero_copy": false,
       "quant_type": "fp8_direct_cast",
-      "block_num": 64,
-      "rdma_block_num": 32,
-      "warp_per_block": 8,
-      "bandwidth_gbps": 58.91
+      "block_num": 80,
+      "rdma_block_num": 40,
+      "warp_per_block": 16,
+      "bandwidth_gbps": 108.96,
+      "rdma_bandwidth_gbps": 27.26,
+      "xgmi_bandwidth_gbps": 85.8,
+      "ll_bandwidth_gbps": 108.96
     },
     {
       "dtype": "bf16",
@@ -45,10 +54,13 @@
       "hidden_dim": 7168,
       "zero_copy": false,
       "quant_type": "fp8_direct_cast",
-      "block_num": 80,
-      "rdma_block_num": 40,
-      "warp_per_block": 8,
-      "bandwidth_gbps": 73.49
+      "block_num": 64,
+      "rdma_block_num": 32,
+      "warp_per_block": 16,
+      "bandwidth_gbps": 150.54,
+      "rdma_bandwidth_gbps": 37.64,
+      "xgmi_bandwidth_gbps": 122.52,
+      "ll_bandwidth_gbps": 150.54
     },
     {
       "dtype": "bf16",
@@ -56,10 +68,13 @@
       "hidden_dim": 7168,
       "zero_copy": false,
       "quant_type": "fp8_direct_cast",
-      "block_num": 80,
-      "rdma_block_num": 40,
-      "warp_per_block": 8,
-      "bandwidth_gbps": 78.86
+      "block_num": 64,
+      "rdma_block_num": 32,
+      "warp_per_block": 16,
+      "bandwidth_gbps": 201.62,
+      "rdma_bandwidth_gbps": 50.41,
+      "xgmi_bandwidth_gbps": 163.92,
+      "ll_bandwidth_gbps": 201.62
     },
     {
       "dtype": "bf16",
@@ -69,8 +84,11 @@
       "quant_type": "fp8_direct_cast",
       "block_num": 80,
       "rdma_block_num": 40,
-      "warp_per_block": 8,
-      "bandwidth_gbps": 79.62
+      "warp_per_block": 16,
+      "bandwidth_gbps": 245.43,
+      "rdma_bandwidth_gbps": 61.36,
+      "xgmi_bandwidth_gbps": 201.25,
+      "ll_bandwidth_gbps": 245.43
     },
     {
       "dtype": "bf16",
@@ -80,8 +98,11 @@
       "quant_type": "fp8_direct_cast",
       "block_num": 80,
       "rdma_block_num": 40,
-      "warp_per_block": 8,
-      "bandwidth_gbps": 79.58
+      "warp_per_block": 16,
+      "bandwidth_gbps": 257.94,
+      "rdma_bandwidth_gbps": 64.49,
+      "xgmi_bandwidth_gbps": 210.2,
+      "ll_bandwidth_gbps": 257.94
     },
     {
       "dtype": "bf16",
@@ -92,7 +113,10 @@
       "block_num": 64,
       "rdma_block_num": 32,
       "warp_per_block": 4,
-      "bandwidth_gbps": 45.32
+      "bandwidth_gbps": 44.61,
+      "rdma_bandwidth_gbps": 11.18,
+      "xgmi_bandwidth_gbps": 34.66,
+      "ll_bandwidth_gbps": 44.61
     },
     {
       "dtype": "bf16",
@@ -103,7 +127,10 @@
       "block_num": 64,
       "rdma_block_num": 32,
       "warp_per_block": 8,
-      "bandwidth_gbps": 58.94
+      "bandwidth_gbps": 72.55,
+      "rdma_bandwidth_gbps": 18.16,
+      "xgmi_bandwidth_gbps": 57.39,
+      "ll_bandwidth_gbps": 72.55
     },
     {
       "dtype": "bf16",
@@ -114,7 +141,10 @@
       "block_num": 64,
       "rdma_block_num": 32,
       "warp_per_block": 8,
-      "bandwidth_gbps": 73.79
+      "bandwidth_gbps": 93.93,
+      "rdma_bandwidth_gbps": 23.5,
+      "xgmi_bandwidth_gbps": 77.34,
+      "ll_bandwidth_gbps": 93.93
     },
     {
       "dtype": "bf16",
@@ -122,10 +152,13 @@
       "hidden_dim": 7168,
       "zero_copy": false,
       "quant_type": "none",
-      "block_num": 64,
-      "rdma_block_num": 32,
+      "block_num": 80,
+      "rdma_block_num": 40,
       "warp_per_block": 8,
-      "bandwidth_gbps": 91.0
+      "bandwidth_gbps": 106.92,
+      "rdma_bandwidth_gbps": 26.74,
+      "xgmi_bandwidth_gbps": 85.66,
+      "ll_bandwidth_gbps": 106.92
     },
     {
       "dtype": "bf16",
@@ -136,7 +169,10 @@
       "block_num": 64,
       "rdma_block_num": 32,
       "warp_per_block": 8,
-      "bandwidth_gbps": 98.52
+      "bandwidth_gbps": 125.47,
+      "rdma_bandwidth_gbps": 31.37,
+      "xgmi_bandwidth_gbps": 101.85,
+      "ll_bandwidth_gbps": 125.47
     },
     {
       "dtype": "bf16",
@@ -144,10 +180,13 @@
       "hidden_dim": 7168,
       "zero_copy": false,
       "quant_type": "none",
-      "block_num": 64,
-      "rdma_block_num": 32,
-      "warp_per_block": 8,
-      "bandwidth_gbps": 107.68
+      "block_num": 32,
+      "rdma_block_num": 16,
+      "warp_per_block": 16,
+      "bandwidth_gbps": 143.36,
+      "rdma_bandwidth_gbps": 35.84,
+      "xgmi_bandwidth_gbps": 115.96,
+      "ll_bandwidth_gbps": 143.36
     },
     {
       "dtype": "bf16",
@@ -155,10 +194,13 @@
       "hidden_dim": 7168,
       "zero_copy": false,
       "quant_type": "none",
-      "block_num": 80,
-      "rdma_block_num": 40,
-      "warp_per_block": 8,
-      "bandwidth_gbps": 105.98
+      "block_num": 32,
+      "rdma_block_num": 16,
+      "warp_per_block": 16,
+      "bandwidth_gbps": 147.5,
+      "rdma_bandwidth_gbps": 36.88,
+      "xgmi_bandwidth_gbps": 120.22,
+      "ll_bandwidth_gbps": 147.5
     }
   ]
 }
