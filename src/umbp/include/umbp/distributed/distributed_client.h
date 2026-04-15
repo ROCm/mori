@@ -68,6 +68,10 @@ class DistributedClient : public IUMBPClient {
   bool RegisterMemory(uintptr_t ptr, size_t size) override;
   void DeregisterMemory(uintptr_t ptr) override;
 
+  bool ReportExternalKvBlocks(const std::vector<std::string>& hashes, TierType tier) override;
+  bool RevokeExternalKvBlocks(const std::vector<std::string>& hashes) override;
+  std::vector<ExternalKvMatch> MatchExternalKv(const std::vector<std::string>& hashes) override;
+
  private:
   UMBPConfig config_;
   void* dram_pool_ = nullptr;

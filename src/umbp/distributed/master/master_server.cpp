@@ -26,11 +26,13 @@
 #include <chrono>
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "mori/utils/mori_log.hpp"
 #include "umbp.grpc.pb.h"
 #include "umbp/common/env_time.h"
+#include "umbp/distributed/master/external_kv_block_index.h"
 #include "umbp/distributed/routing/router.h"
 
 namespace mori::umbp {
@@ -74,9 +76,14 @@ static Location ToLocation(const ::umbp::Location& proto_location) {
 // ---------------------------------------------------------------------------
 class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Service {
  public:
-  UMBPMasterServiceImpl(ClientRegistry& registry, GlobalBlockIndex& index, Router& router,
+  UMBPMasterServiceImpl(ClientRegistry& registry, GlobalBlockIndex& index,
+                        ExternalKvBlockIndex& external_kv_index, Router& router,
                         const ClientRegistryConfig& config)
-      : registry_(registry), index_(index), router_(router), config_(config) {}
+      : registry_(registry),
+        index_(index),
+        external_kv_index_(external_kv_index),
+        router_(router),
+        config_(config) {}
 
   grpc::Status RegisterClient(grpc::ServerContext* /*context*/,
                               const ::umbp::RegisterClientRequest* request,
@@ -520,9 +527,79 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     return grpc::Status::OK;
   }
 
+  grpc::Status ReportExternalKvBlocks(
+      grpc::ServerContext* /*context*/,
+      const ::umbp::ReportExternalKvBlocksRequest* request,
+      ::umbp::ReportExternalKvBlocksResponse* /*response*/) override {
+    if (request->node_id().empty()) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "node_id cannot be empty");
+    }
+    if (request->hashes_size() == 0) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "hashes cannot be empty");
+    }
+
+    std::vector<std::string> hashes(request->hashes().begin(), request->hashes().end());
+    TierType tier = static_cast<TierType>(request->tier());
+
+    registry_.RegisterExternalKvBlocks(request->node_id(), hashes, tier);
+    MORI_UMBP_INFO("[Master] ReportExternalKvBlocks: node_id={}, hashes={}, tier={}",
+                   request->node_id(), hashes.size(), TierTypeName(tier));
+    return grpc::Status::OK;
+  }
+
+  grpc::Status RevokeExternalKvBlocks(
+      grpc::ServerContext* /*context*/,
+      const ::umbp::RevokeExternalKvBlocksRequest* request,
+      ::umbp::RevokeExternalKvBlocksResponse* /*response*/) override {
+    if (request->node_id().empty()) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "node_id cannot be empty");
+    }
+    if (request->hashes_size() == 0) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "hashes cannot be empty");
+    }
+
+    std::vector<std::string> hashes(request->hashes().begin(), request->hashes().end());
+    registry_.UnregisterExternalKvBlocks(request->node_id(), hashes);
+    MORI_UMBP_INFO("[Master] RevokeExternalKvBlocks: node_id={}, hashes={}", request->node_id(),
+                   hashes.size());
+    return grpc::Status::OK;
+  }
+
+  grpc::Status MatchExternalKv(grpc::ServerContext* /*context*/,
+                               const ::umbp::MatchExternalKvRequest* request,
+                               ::umbp::MatchExternalKvResponse* response) override {
+    std::vector<std::string> hashes(request->hashes().begin(), request->hashes().end());
+
+    auto matches = external_kv_index_.Match(hashes);
+
+    // Build a node_id -> peer_address lookup from alive clients.
+    std::unordered_map<std::string, std::string> peer_map;
+    for (const auto& record : registry_.GetAliveClients()) {
+      peer_map[record.node_id] = record.peer_address;
+    }
+
+    for (auto& m : matches) {
+      auto* proto_match = response->add_matches();
+      proto_match->set_node_id(m.node_id);
+      auto peer_it = peer_map.find(m.node_id);
+      if (peer_it != peer_map.end()) {
+        proto_match->set_peer_address(peer_it->second);
+      }
+      for (const auto& hash : m.matched_hashes) {
+        proto_match->add_matched_hashes(hash);
+      }
+      proto_match->set_tier(static_cast<::umbp::TierType>(m.tier));
+    }
+
+    MORI_UMBP_INFO("[Master] MatchExternalKv: queried_hashes={}, matched_nodes={}", hashes.size(),
+                   matches.size());
+    return grpc::Status::OK;
+  }
+
  private:
   ClientRegistry& registry_;
   GlobalBlockIndex& index_;
+  ExternalKvBlockIndex& external_kv_index_;
   Router& router_;
   ClientRegistryConfig config_;
 };
@@ -533,14 +610,16 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
 MasterServer::MasterServer(MasterServerConfig config)
     : config_(std::move(config)),
       index_(),
+      external_kv_index_(),
       registry_(config_.registry_config, index_),
       router_(index_, registry_, std::move(config_.get_strategy), std::move(config_.put_strategy)),
-      service_(std::make_unique<UMBPMasterServiceImpl>(registry_, index_, router_,
-                                                       config_.registry_config)),
+      service_(std::make_unique<UMBPMasterServiceImpl>(registry_, index_, external_kv_index_,
+                                                       router_, config_.registry_config)),
       eviction_manager_(
           std::make_unique<EvictionManager>(index_, registry_, config_.eviction_config)) {
   index_.SetClientRegistry(&registry_);
   router_.SetLeaseDuration(config_.eviction_config.lease_duration);
+  registry_.SetExternalKvBlockIndex(&external_kv_index_);
 }
 
 MasterServer::~MasterServer() { Shutdown(); }

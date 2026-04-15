@@ -720,6 +720,77 @@ grpc::Status MasterClient::BatchLookup(const std::vector<std::string>& keys,
   return grpc::Status::OK;
 }
 
+grpc::Status MasterClient::ReportExternalKvBlocks(const std::string& node_id,
+                                                  const std::vector<std::string>& hashes,
+                                                  TierType tier) {
+  ::umbp::ReportExternalKvBlocksRequest req;
+  req.set_node_id(node_id);
+  for (const auto& hash : hashes) {
+    req.add_hashes(hash);
+  }
+  req.set_tier(static_cast<::umbp::TierType>(tier));
+
+  ::umbp::ReportExternalKvBlocksResponse resp;
+  grpc::ClientContext ctx;
+  auto status = GetStub(stub_.get())->ReportExternalKvBlocks(&ctx, req, &resp);
+  if (!status.ok()) {
+    MORI_UMBP_ERROR("[Client] ReportExternalKvBlocks(node={}) failed: {}", node_id,
+                    status.error_message());
+  }
+  return status;
+}
+
+grpc::Status MasterClient::RevokeExternalKvBlocks(const std::string& node_id,
+                                                  const std::vector<std::string>& hashes) {
+  ::umbp::RevokeExternalKvBlocksRequest req;
+  req.set_node_id(node_id);
+  for (const auto& hash : hashes) {
+    req.add_hashes(hash);
+  }
+
+  ::umbp::RevokeExternalKvBlocksResponse resp;
+  grpc::ClientContext ctx;
+  auto status = GetStub(stub_.get())->RevokeExternalKvBlocks(&ctx, req, &resp);
+  if (!status.ok()) {
+    MORI_UMBP_ERROR("[Client] RevokeExternalKvBlocks(node={}) failed: {}", node_id,
+                    status.error_message());
+  }
+  return status;
+}
+
+grpc::Status MasterClient::MatchExternalKv(const std::vector<std::string>& hashes,
+                                           std::vector<ExternalKvNodeMatch>* out_matches) {
+  if (out_matches != nullptr) {
+    out_matches->clear();
+  }
+
+  ::umbp::MatchExternalKvRequest req;
+  for (const auto& hash : hashes) {
+    req.add_hashes(hash);
+  }
+
+  ::umbp::MatchExternalKvResponse resp;
+  grpc::ClientContext ctx;
+  auto status = GetStub(stub_.get())->MatchExternalKv(&ctx, req, &resp);
+  if (!status.ok()) {
+    MORI_UMBP_ERROR("[Client] MatchExternalKv failed: {}", status.error_message());
+    return status;
+  }
+
+  if (out_matches != nullptr) {
+    for (const auto& proto_match : resp.matches()) {
+      ExternalKvNodeMatch m;
+      m.node_id = proto_match.node_id();
+      m.peer_address = proto_match.peer_address();
+      m.matched_hashes.assign(proto_match.matched_hashes().begin(),
+                              proto_match.matched_hashes().end());
+      m.tier = static_cast<TierType>(proto_match.tier());
+      out_matches->push_back(std::move(m));
+    }
+  }
+  return grpc::Status::OK;
+}
+
 void MasterClient::StartHeartbeat() {
   if (!registered_) {
     MORI_UMBP_WARN("[Client] StartHeartbeat ignored: not registered");

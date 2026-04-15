@@ -313,6 +313,36 @@ message BatchAbortAllocationResponse {
 //  Single unified service
 // ============================================================
 
+// ============================================================
+//  External KV Block Events (unmanaged L1/L2 cache blocks)
+// ============================================================
+
+message ReportExternalKvBlocksRequest {
+  string node_id         = 1;
+  repeated string hashes = 2;
+  TierType tier          = 3;
+}
+message ReportExternalKvBlocksResponse {}
+
+message RevokeExternalKvBlocksRequest {
+  string node_id         = 1;
+  repeated string hashes = 2;
+}
+message RevokeExternalKvBlocksResponse {}
+
+message MatchExternalKvRequest {
+  repeated string hashes = 1;
+}
+message ExternalKvNodeMatch {
+  string node_id                 = 1;
+  string peer_address            = 2;
+  repeated string matched_hashes = 3;
+  TierType tier                  = 4;
+}
+message MatchExternalKvResponse {
+  repeated ExternalKvNodeMatch matches = 1;
+}
+
 service UMBPMaster {
   // Client lifecycle
   rpc RegisterClient(RegisterClientRequest) returns (RegisterClientResponse);
@@ -337,4 +367,9 @@ service UMBPMaster {
   rpc BatchFinalizeAllocation(BatchFinalizeRequest) returns (BatchFinalizeResponse);
   rpc BatchLookup(BatchLookupRequest) returns (BatchLookupResponse);
   rpc BatchAbortAllocation(BatchAbortAllocationRequest) returns (BatchAbortAllocationResponse);
+
+  // External KV block events
+  rpc ReportExternalKvBlocks(ReportExternalKvBlocksRequest) returns (ReportExternalKvBlocksResponse);
+  rpc RevokeExternalKvBlocks(RevokeExternalKvBlocksRequest) returns (RevokeExternalKvBlocksResponse);
+  rpc MatchExternalKv(MatchExternalKvRequest) returns (MatchExternalKvResponse);
 }
