@@ -1066,7 +1066,7 @@ class EpDispatchCombineTestCase:
         del op
 
         def _to_int_tuple(s):
-            return tuple(int(v) for v in s)
+            return tuple(round(v, 2) for v in s)
 
         return (
             _to_int_tuple(disp_stats["xgmi"]),
@@ -1105,7 +1105,7 @@ class EpDispatchCombineTestCase:
         from prettytable import PrettyTable
 
         def _i(s):
-            return tuple(int(v) for v in s)
+            return tuple(round(v, 2) for v in s)
 
         tbl = PrettyTable()
         tbl.title = title
@@ -1212,7 +1212,9 @@ class EpDispatchCombineTestCase:
 
         def rdma_candidates_for(bn):
             if _rdma_mode == "quick":
-                return [max(bn // 2, 1)]
+                return sorted(
+                    set(v for v in [max(bn // 2, 1), bn * 2 // 3] if 1 <= v < bn)
+                )
             return sorted(
                 set(v for v in [bn // 4, bn // 2, bn * 2 // 3] if 1 <= v < bn)
             )

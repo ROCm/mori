@@ -1,37 +1,25 @@
 #!/usr/bin/env bash
 # ==========================================================================
-# EP InterNode Dispatch/Combine Performance Benchmark (dual-node, 16 GPUs)
+# EP InterNode Dispatch/Combine Performance Benchmark
 #
-# Sweeps over (token_count x dtype) combinations and records raw output
-# plus a best-performance summary.
+# Sweeps over (token_count x dtype) combinations using bench or tuning mode,
+# records raw output and a best-performance summary.
 #
-# Prerequisites:
-#   - Two nodes allocated via salloc, each with 8 GPUs
-#   - Docker container "yutong-dev" running on both nodes (see EP16 setup)
-#   - mori compiled inside both containers
-#
-# Usage (run from login node, NOT inside docker):
+# Usage:
 #   bash tools/bench_ep_internode_performance.sh \
-#       --node0 smci355-ccs-aus-n08-33 --node1 smci355-ccs-aus-n09-33
+#       --node0 <host0> --node1 <host1> --container <name>
 #
-#   # Custom options:
 #   bash tools/bench_ep_internode_performance.sh \
-#       --node0 <host0> --node1 <host1> \
-#       --tokens "128,4096"   \
-#       --dtypes "bf16"       \
-#       --container yutong-dev \
-#       --output-dir /tmp/ep16_bench
+#       --node0 <host0> --node1 <host1> --container <name> \
+#       --tokens "128,4096" --dtypes "bf16" --cmd tuning --tuning-scope full
 #
-# Output directory layout:
+# Output:
 #   <output-dir>/
-#     raw/                              -- full output per combo
-#       bf16_v1_ll_128.txt              -- node0 (rank0) raw output
-#       bf16_v1_ll_128_node1.txt        -- node1 raw output
-#       ...
-#     summary.txt                       -- tabular best-perf summary
-#     bench.log                         -- run log with progress
+#     raw/           -- full output per (token, dtype) combo
+#     summary.txt    -- best-performance summary table
+#     bench.log      -- run log
 # ==========================================================================
-set -euo pipefail
+set -eo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -40,68 +28,79 @@ BENCH_SCRIPT="$REPO_ROOT/examples/ops/dispatch_combine/test_dispatch_combine_int
 # ---- Defaults ----
 NODE0=""
 NODE1=""
-DOMAIN=".prov.aus.ccs.cpe.ice.amd.com"
-CONTAINER="yutong-dev"
+CONTAINER=""
+USER_NAME="${USER:-$(whoami)}"
 SMALL_TOKENS="1,2,4,8,16,32,64,128,256,512,768"
-LARGE_TOKENS="4096,8192,16384,32768,65536,131072,262144,524288"
+LARGE_TOKENS="4096,8192,16384,32768,65536,131072,262144"
 ALL_TOKENS="$SMALL_TOKENS,$LARGE_TOKENS"
 TOKENS="$ALL_TOKENS"
 DTYPES="fp8_e4m3,bf16"
+CMD="tuning"
 NUM_QP=2
 OUTPUT_DIR=""
-TIMEOUT=1800
+TIMEOUT=7200
 BASE_PORT=29000
-IFACE="enp81s0f1"
+IFACE=""
+GPU_PER_NODE=8
+TUNING_SCOPE="quick"
 
 # ---- Parse args ----
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --node0)        NODE0="$2";         shift 2 ;;
         --node1)        NODE1="$2";         shift 2 ;;
-        --domain)       DOMAIN="$2";        shift 2 ;;
         --container)    CONTAINER="$2";     shift 2 ;;
+        --user)         USER_NAME="$2";     shift 2 ;;
         --tokens)       TOKENS="$2";        shift 2 ;;
         --dtypes)       DTYPES="$2";        shift 2 ;;
+        --cmd)          CMD="$2";           shift 2 ;;
         --num-qp)       NUM_QP="$2";        shift 2 ;;
         --output-dir)   OUTPUT_DIR="$2";    shift 2 ;;
         --timeout)      TIMEOUT="$2";       shift 2 ;;
         --iface)        IFACE="$2";         shift 2 ;;
+        --gpu-per-node) GPU_PER_NODE="$2";  shift 2 ;;
+        --tuning-scope) TUNING_SCOPE="$2"; shift 2 ;;
+        -h|--help)
+            sed -n '2,/^# ====/p' "$0" | grep '^#' | sed 's/^# \?//'
+            exit 0 ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
 
-if [[ -z "$NODE0" || -z "$NODE1" ]]; then
-    echo "ERROR: --node0 and --node1 are required."
-    echo "  e.g.: bash $0 --node0 smci355-ccs-aus-n08-33 --node1 smci355-ccs-aus-n09-33"
+if [[ -z "$NODE0" || -z "$NODE1" || -z "$CONTAINER" ]]; then
+    echo "ERROR: --node0, --node1, and --container are required."
+    echo "  e.g.: bash $0 --node0 host0 --node1 host1 --container my-dev"
     exit 1
 fi
 
-NODE0_FQDN="${NODE0}${DOMAIN}"
-NODE1_FQDN="${NODE1}${DOMAIN}"
+# ---- SSH shorthand ----
+_SSH="ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10"
 
-# Resolve master address (node0 IP, resolvable from node1)
-MASTER_ADDR=$(ssh -o StrictHostKeyChecking=no "yutongwu@${NODE1_FQDN}" \
-    "getent hosts ${NODE0_FQDN} | awk '{print \$1}'" 2>/dev/null)
+# ---- Resolve master address ----
+MASTER_ADDR=$($_SSH "${USER_NAME}@${NODE1}" "getent hosts $NODE0 | awk '{print \$1}'" 2>/dev/null)
 if [[ -z "$MASTER_ADDR" ]]; then
-    echo "ERROR: Cannot resolve $NODE0_FQDN from $NODE1_FQDN"
-    exit 1
+    MASTER_ADDR=$($_SSH "${USER_NAME}@${NODE0}" "hostname -I | awk '{print \$1}'" 2>/dev/null)
+fi
+[[ -z "$MASTER_ADDR" ]] && { echo "ERROR: Cannot resolve IP for $NODE0"; exit 1; }
+
+# ---- Auto-detect network interface ----
+if [[ -z "$IFACE" ]]; then
+    IFACE=$($_SSH "${USER_NAME}@${NODE0}" "ip -o -4 addr show | grep '$MASTER_ADDR' | awk '{print \$2}'" 2>/dev/null)
+    [[ -z "$IFACE" ]] && IFACE=$($_SSH "${USER_NAME}@${NODE0}" "ip -o -4 route show default | awk '{print \$5}'" 2>/dev/null)
 fi
 
 # ---- Output directory ----
+WORLD_SIZE=$(( GPU_PER_NODE * 2 ))
 if [[ -z "$OUTPUT_DIR" ]]; then
-    OUTPUT_DIR="$REPO_ROOT/bench_results/ep16_$(date +%Y%m%d_%H%M%S)"
+    OUTPUT_DIR="$REPO_ROOT/bench_results/ep${WORLD_SIZE}_$(date +%Y%m%d_%H%M%S)"
 fi
 mkdir -p "$OUTPUT_DIR/raw"
-
 LOG="$OUTPUT_DIR/bench.log"
 SUMMARY="$OUTPUT_DIR/summary.txt"
 
-# ---- SHMEM size mapping (matches bench_ep_performance.sh) ----
+# ---- SHMEM size mapping ----
 get_shmem_size() {
     local t=$1
-    # shmem heap ≈ 3.4 × max_tokens × hidden(7168) × dtype(2) × world_size(16)
-    # EP16 limit: 262144 tokens → 192G heap (MI355X 288G VRAM)
-    # 524288 tokens would need ~460G → exceeds 288G, physically impossible
     if   (( t >= 262144 )); then echo "192G"
     elif (( t >= 131072 )); then echo "96G"
     elif (( t >= 65536  )); then echo "48G"
@@ -110,106 +109,86 @@ get_shmem_size() {
     fi
 }
 
-# ---- Kernel type: v1_ll for small tokens, v1 for large ----
 get_kernel_type() {
     local t=$1
-    if (( t >= 4096 )); then echo "v1"
-    else echo "v1_ll"
-    fi
+    if (( t >= 4096 )); then echo "v1"; else echo "v1_ll"; fi
 }
 
 # ---- GPU info ----
-GPU_INFO=$(ssh -o StrictHostKeyChecking=no "yutongwu@${NODE0_FQDN}" \
-    "docker exec $CONTAINER python3 -c \"
-import torch
-p = torch.cuda.get_device_properties(0)
-print(f'{p.name} (CU={p.multi_processor_count})')
-\"" 2>/dev/null)
+GPU_INFO=$($_SSH "${USER_NAME}@${NODE0}" \
+    "docker exec $CONTAINER python3 -c 'import torch; p=torch.cuda.get_device_properties(0); print(p.name)'" 2>/dev/null || echo "unknown")
 
 {
     echo "============================================================"
-    echo "EP16 InterNode Benchmark (dual-node, 16 GPUs)"
+    echo "EP${WORLD_SIZE} InterNode Benchmark"
     echo "============================================================"
-    echo "  GPU:           $GPU_INFO"
-    echo "  node0:         $NODE0_FQDN"
-    echo "  node1:         $NODE1_FQDN"
-    echo "  master_addr:   $MASTER_ADDR"
-    echo "  container:     $CONTAINER"
-    echo "  tokens:        $TOKENS"
-    echo "  dtypes:        $DTYPES"
-    echo "  num_qp:        $NUM_QP"
-    echo "  iface:         $IFACE"
-    echo "  output_dir:    $OUTPUT_DIR"
-    echo "  started:       $(date)"
+    echo "  GPU:         $GPU_INFO"
+    echo "  world_size:  $WORLD_SIZE"
+    echo "  cmd:         $CMD"
+    echo "  tuning_scope:$TUNING_SCOPE"
+    echo "  tokens:      $TOKENS"
+    echo "  dtypes:      $DTYPES"
+    echo "  num_qp:      $NUM_QP"
+    echo "  output_dir:  $OUTPUT_DIR"
+    echo "  started:     $(date)"
     echo "============================================================"
     echo ""
 } | tee "$LOG"
 
 # ---- Summary header ----
-printf "%-10s %-12s %-8s %-10s %-12s %-12s %-12s %-12s\n" \
-    "tokens" "dtype" "phase" "rdma_bw" "xgmi_bw" "ll_bw" "latency_us" "metric" \
+printf "%-10s %-12s %-10s %-10s %-12s %-12s %-12s %-12s %-20s\n" \
+    "tokens" "dtype" "phase" "rdma_bw" "xgmi_bw" "ll_bw" "latency_us" "metric" "config" \
     > "$SUMMARY"
 
-# ---- Build arrays ----
 IFS=',' read -ra TOKEN_ARRAY <<< "$TOKENS"
 IFS=',' read -ra DTYPE_ARRAY <<< "$DTYPES"
-
 TOTAL=$(( ${#TOKEN_ARRAY[@]} * ${#DTYPE_ARRAY[@]} ))
 IDX=0
 
-# ---- run_one: launch torchrun on both nodes, capture output ----
+# ---- run_one ----
 run_one() {
-    local ntokens=$1 kernel_type=$2 dtype=$3 shmem=$4 combine_dtype=$5 port=$6 tag=$7 tmo=$8
-    local raw_node0="$OUTPUT_DIR/raw/${tag}.txt"
-    local raw_node1="$OUTPUT_DIR/raw/${tag}_node1.txt"
+    local ntokens=$1 kernel_type=$2 dtype=$3 shmem=$4 combine_dtype=$5 port=$6 tag=$7 tmo=$8 run_cmd=$9
+    local raw0="$OUTPUT_DIR/raw/${tag}.txt"
+    local raw1="$OUTPUT_DIR/raw/${tag}_node1.txt"
 
-    local ENV_PREFIX="MORI_RDMA_SL=3 MORI_RDMA_TC=96 GPU_PER_NODE=8"
-    ENV_PREFIX+=" GLOO_SOCKET_IFNAME=$IFACE MORI_SOCKET_IFNAME=$IFACE"
-    ENV_PREFIX+=" HSA_NO_SCRATCH_RECLAIM=1 MORI_SHMEM_HEAP_SIZE=$shmem"
-    ENV_PREFIX+=" PYTHONPATH=$REPO_ROOT:$REPO_ROOT/python:\$PYTHONPATH"
+    local ENV="MORI_RDMA_SL=3 MORI_RDMA_TC=96 GPU_PER_NODE=$GPU_PER_NODE"
+    ENV+=" GLOO_SOCKET_IFNAME=$IFACE MORI_SOCKET_IFNAME=$IFACE"
+    ENV+=" HSA_NO_SCRATCH_RECLAIM=1 MORI_SHMEM_HEAP_SIZE=$shmem"
+    ENV+=" MORI_TUNING_SCOPE=$TUNING_SCOPE"
+    ENV+=" PYTHONPATH=$REPO_ROOT:$REPO_ROOT/python:\$PYTHONPATH"
 
-    local COMBINE_ARG=""
-    [[ -n "$combine_dtype" ]] && COMBINE_ARG="--combine-dtype $combine_dtype"
-
-    local TORCHRUN_CMD="cd $REPO_ROOT && $ENV_PREFIX torchrun \
+    local EXTRA=""
+    [[ -n "$combine_dtype" ]] && EXTRA+=" --combine-dtype $combine_dtype"
+    if (( ntokens >= 65536 )); then
+        EXTRA+=" --skip-verify"
+    fi
+    if [[ "$run_cmd" == "tuning" ]]; then
+        EXTRA+=" --save-tuning-config auto"
+    fi
+    local TCMD="cd $REPO_ROOT && $ENV torchrun \
         --nnodes=2 --node_rank=RANK --nproc_per_node=1 \
         --master_addr=$MASTER_ADDR --master_port=$port \
         $BENCH_SCRIPT \
         --kernel-type $kernel_type --max-tokens $ntokens \
-        --cmd bench --num-qp $NUM_QP --dtype $dtype $COMBINE_ARG"
+        --cmd $run_cmd --num-qp $NUM_QP --dtype $dtype $EXTRA"
 
-    # node1 in background
-    ssh -o StrictHostKeyChecking=no "yutongwu@${NODE1_FQDN}" \
-        "docker exec $CONTAINER bash -c '${TORCHRUN_CMD//RANK/1}'" \
-        > "$raw_node1" 2>&1 &
+    local SSH="ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10"
+    $SSH "${USER_NAME}@${NODE1}" "docker exec $CONTAINER bash -c '${TCMD//RANK/1}'" > "$raw1" 2>&1 &
     local pid1=$!
-
     sleep 2
-
-    # node0 in foreground with timeout
-    timeout "$tmo" ssh -o StrictHostKeyChecking=no "yutongwu@${NODE0_FQDN}" \
-        "docker exec $CONTAINER bash -c '${TORCHRUN_CMD//RANK/0}'" \
-        > "$raw_node0" 2>&1
+    timeout "$tmo" $SSH "${USER_NAME}@${NODE0}" "docker exec $CONTAINER bash -c '${TCMD//RANK/0}'" > "$raw0" 2>&1
     local rc=$?
 
     if [[ $rc -eq 124 ]]; then
-        ssh -o StrictHostKeyChecking=no "yutongwu@${NODE0_FQDN}" \
-            "docker exec $CONTAINER pkill -f torchrun" 2>/dev/null || true
-        ssh -o StrictHostKeyChecking=no "yutongwu@${NODE1_FQDN}" \
-            "docker exec $CONTAINER pkill -f torchrun" 2>/dev/null || true
+        $SSH "${USER_NAME}@${NODE0}" "docker exec $CONTAINER pkill -9 -f torchrun" 2>/dev/null || true
+        $SSH "${USER_NAME}@${NODE1}" "docker exec $CONTAINER pkill -9 -f torchrun" 2>/dev/null || true
     fi
     wait $pid1 2>/dev/null || true
 
-    # Ensure all GPU processes are cleaned up before next test
     sleep 3
-    ssh -o StrictHostKeyChecking=no "yutongwu@${NODE0_FQDN}" \
-        "docker exec $CONTAINER pkill -9 -f torchrun 2>/dev/null; \
-         docker exec $CONTAINER pkill -9 -f 'test_dispatch_combine\|bench_internode' 2>/dev/null" 2>/dev/null || true
-    ssh -o StrictHostKeyChecking=no "yutongwu@${NODE1_FQDN}" \
-        "docker exec $CONTAINER pkill -9 -f torchrun 2>/dev/null; \
-         docker exec $CONTAINER pkill -9 -f 'test_dispatch_combine\|bench_internode' 2>/dev/null" 2>/dev/null || true
+    $SSH "${USER_NAME}@${NODE0}" "docker exec $CONTAINER bash -c 'pkill -9 -f torchrun; pkill -9 -f test_dispatch_combine'" 2>/dev/null || true
+    $SSH "${USER_NAME}@${NODE1}" "docker exec $CONTAINER bash -c 'pkill -9 -f torchrun; pkill -9 -f test_dispatch_combine'" 2>/dev/null || true
     sleep 5
-
     return $rc
 }
 
@@ -221,33 +200,29 @@ for NTOKENS in "${TOKEN_ARRAY[@]}"; do
     for DTYPE in "${DTYPE_ARRAY[@]}"; do
         IDX=$((IDX + 1))
         TAG="${DTYPE}_${KERNEL}_${NTOKENS}"
-
-        # FP8 dispatch + BF16 combine for cross-type
         COMBINE_DTYPE=""
-        [[ "$DTYPE" == "fp8_e4m3" ]] && COMBINE_DTYPE="bf16"
-
         BASE_PORT=$((BASE_PORT + 1))
 
-        # Wait until GPUs are idle on both nodes before each test
+        # Wait until GPUs are idle
         while true; do
-            _all_clear=true
-            for _node_fqdn in "$NODE0_FQDN" "$NODE1_FQDN"; do
-                _max_use=$(ssh -o StrictHostKeyChecking=no "yutongwu@${_node_fqdn}" \
+            _clear=true
+            for _n in "$NODE0" "$NODE1"; do
+                _u=$(ssh -o StrictHostKeyChecking=no "${USER_NAME}@${_n}" \
                     'rocm-smi --showuse 2>/dev/null | grep "GPU use" | sed "s/.*: //" | sort -rn | head -1' 2>/dev/null)
-                if [[ -n "$_max_use" && "$_max_use" != "0" ]]; then
-                    _all_clear=false
-                    echo "  [wait] GPU max ${_max_use}% on $_node_fqdn, retrying in 120s...  $(date)" | tee -a "$LOG"
+                if [[ -n "$_u" && "$_u" != "0" ]]; then
+                    _clear=false
+                    echo "  [wait] GPU ${_u}% on $_n, retrying in 120s...  $(date)" | tee -a "$LOG"
                     break
                 fi
             done
-            $_all_clear && break
+            $_clear && break
             sleep 120
         done
 
-        echo "[$IDX/$TOTAL] tokens=$NTOKENS dtype=$DTYPE kernel=$KERNEL shmem=$SHMEM  $(date)" | tee -a "$LOG"
+        echo "[$IDX/$TOTAL] tokens=$NTOKENS dtype=$DTYPE kernel=$KERNEL cmd=$CMD shmem=$SHMEM  $(date)" | tee -a "$LOG"
 
         set +e
-        run_one "$NTOKENS" "$KERNEL" "$DTYPE" "$SHMEM" "$COMBINE_DTYPE" "$BASE_PORT" "$TAG" "$TIMEOUT"
+        run_one "$NTOKENS" "$KERNEL" "$DTYPE" "$SHMEM" "$COMBINE_DTYPE" "$BASE_PORT" "$TAG" "$TIMEOUT" "$CMD"
         EXIT_CODE=$?
         set -e
 
@@ -261,25 +236,33 @@ for NTOKENS in "${TOKEN_ARRAY[@]}"; do
             echo "  OK" | tee -a "$LOG"
         fi
 
-        # Extract PrettyTable results and append to log + summary
-        grep -E "Dispatch Performance|Combine Performance|Best|Worst|Average" "$RAW_FILE" 2>/dev/null | tee -a "$LOG" || true
+        # Extract results
+        grep -E "Performance Summary|Best |Dispatch Performance|Combine Performance|Best|Worst|Average" "$RAW_FILE" 2>/dev/null | tee -a "$LOG" || true
 
-        # Parse PrettyTable into structured summary
         python3 -c "
 import re, sys
 raw = open(sys.argv[1]).read()
 tokens, dtype = sys.argv[2], sys.argv[3]
+lines = raw.splitlines()
+
 phase = None
-for line in raw.splitlines():
-    if 'Dispatch Performance' in line:
-        phase = 'dispatch'
-    elif 'Combine Performance' in line:
-        phase = 'combine'
+cfg = ''
+for line in lines:
+    # Detect phase from PrettyTable title (handles both bench and tuning output)
+    # Bench:  'Dispatch Performance (float8_e4m3fn)'
+    # Tuning: 'Dispatch (float8_e4m3fn) block=96 warp=8 rdma=64'
+    tl = re.search(r'(Dispatch|Combine)\b', line)
+    if tl and ('Performance' in line or 'block=' in line):
+        phase = tl.group(1).lower()
+        cm = re.search(r'block=(\d+)\s+warp=(\d+)\s+rdma=(\d+)', line)
+        cfg = f'bn={cm.group(1)}/w={cm.group(2)}/r={cm.group(3)}' if cm else ''
+        continue
+    # Parse PrettyTable data rows
     m = re.match(r'\|\s*(Best|Worst|Average)\s*\|\s*([\d.]+)\s*\|\s*([\d.]+)\s*\|\s*([\d.]+)\s*\|\s*([\d.]+)\s*\|', line)
     if m and phase:
         metric = m.group(1).lower()
         rdma, xgmi, ll, lat = m.group(2), m.group(3), m.group(4), m.group(5)
-        print(f'{tokens:<10} {dtype:<12} {phase:<8} {rdma:<10} {xgmi:<12} {ll:<12} {lat:<12} {metric}')
+        print(f'{tokens:<10} {dtype:<12} {phase:<10} {rdma:<10} {xgmi:<12} {ll:<12} {lat:<12} {metric:<12} {cfg}')
 " "$RAW_FILE" "$NTOKENS" "$DTYPE" >> "$SUMMARY" 2>/dev/null || true
 
         echo "" | tee -a "$LOG"
