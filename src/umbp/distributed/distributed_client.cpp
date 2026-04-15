@@ -21,11 +21,13 @@
 // SOFTWARE.
 #include "umbp/distributed/distributed_client.h"
 
+#include <sys/mman.h>
+
 #include <stdexcept>
 
-#include "mori/io/engine.hpp"
+#include "mori/utils/mori_log.hpp"
+#include "umbp/common/config.h"
 #include "umbp/distributed/config.h"
-#include "umbp/distributed/master/master_client.h"
 
 namespace mori::umbp {
 
@@ -35,35 +37,64 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
   }
 
   const auto& dc = config.distributed.value();
-  MasterClientConfig mc_config;
-  mc_config.master_address = dc.master_address;
-  mc_config.node_id = dc.node_id;
-  mc_config.node_address = dc.node_address;
-  mc_config.auto_heartbeat = dc.auto_heartbeat;
-  master_client_ = std::make_unique<MasterClient>(mc_config);
 
-  // TODO: init IOEngine from dc.io_engine_host / dc.io_engine_port
+  dram_pool_size_ = config.dram.capacity_bytes;
+  dram_pool_ =
+      mmap(nullptr, dram_pool_size_, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (dram_pool_ == MAP_FAILED) {
+    dram_pool_ = nullptr;
+    throw std::runtime_error("DistributedClient: mmap failed for DRAM pool");
+  }
+
+  PoolClientConfig pc_config;
+  pc_config.master_config.master_address = dc.master_address;
+  pc_config.master_config.node_id = dc.node_id;
+  pc_config.master_config.node_address = dc.node_address;
+  pc_config.master_config.auto_heartbeat = dc.auto_heartbeat;
+  pc_config.io_engine_host = dc.io_engine_host;
+  pc_config.io_engine_port = dc.io_engine_port;
+  pc_config.staging_buffer_size = dc.staging_buffer_size;
+  pc_config.dram_buffers = {{dram_pool_, dram_pool_size_}};
+  pc_config.tier_capacities[TierType::DRAM] = {dram_pool_size_, dram_pool_size_};
+  pc_config.peer_service_port = dc.peer_service_port;
+
+  pool_client_ = std::make_unique<PoolClient>(std::move(pc_config));
+  if (!pool_client_->Init()) {
+    pool_client_.reset();
+    munmap(dram_pool_, dram_pool_size_);
+    dram_pool_ = nullptr;
+    throw std::runtime_error("DistributedClient: PoolClient::Init() failed");
+  }
+
+  MORI_UMBP_INFO("[DistributedClient] initialized — node_id={} dram_pool={}MB", dc.node_id,
+                 dram_pool_size_ / (1024 * 1024));
 }
 
 DistributedClient::~DistributedClient() { Close(); }
 
 // ---------------------------------------------------------------------------
-// Core KV Operations — stub implementations (master-led flow TODO)
+// Core KV Operations
 // ---------------------------------------------------------------------------
 
-bool DistributedClient::Put(const std::string& /*key*/, uintptr_t /*src*/, size_t /*size*/) {
-  // TODO: RoutePut -> MORI-IO write -> Register
-  return false;
+bool DistributedClient::Put(const std::string& key, uintptr_t src, size_t size) {
+  if (closing_) return false;
+  std::shared_lock lk(op_mutex_);
+  if (closed_) return false;
+  return pool_client_->PutRemote(key, reinterpret_cast<const void*>(src), size);
 }
 
-bool DistributedClient::Get(const std::string& /*key*/, uintptr_t /*dst*/, size_t /*size*/) {
-  // TODO: RouteGet -> RDMA/MORI-IO read
-  return false;
+bool DistributedClient::Get(const std::string& key, uintptr_t dst, size_t size) {
+  if (closing_) return false;
+  std::shared_lock lk(op_mutex_);
+  if (closed_) return false;
+  return pool_client_->GetRemote(key, reinterpret_cast<void*>(dst), size);
 }
 
-bool DistributedClient::Exists(const std::string& /*key*/) const {
-  // TODO: MasterClient::Lookup (read-only, no access count side-effects)
-  return false;
+bool DistributedClient::Exists(const std::string& key) const {
+  if (closing_) return false;
+  std::shared_lock lk(op_mutex_);
+  if (closed_) return false;
+  return pool_client_->ExistsRemote(key);
 }
 
 // ---------------------------------------------------------------------------
@@ -73,71 +104,114 @@ bool DistributedClient::Exists(const std::string& /*key*/) const {
 std::vector<bool> DistributedClient::BatchPut(const std::vector<std::string>& keys,
                                               const std::vector<uintptr_t>& srcs,
                                               const std::vector<size_t>& sizes) {
-  std::vector<bool> results(keys.size(), false);
-  for (size_t i = 0; i < keys.size(); ++i) {
-    results[i] = Put(keys[i], srcs[i], sizes[i]);
+  if (closing_) return std::vector<bool>(keys.size(), false);
+  std::shared_lock lk(op_mutex_);
+  if (closed_) return std::vector<bool>(keys.size(), false);
+
+  std::vector<const void*> src_ptrs(srcs.size());
+  for (size_t i = 0; i < srcs.size(); ++i) {
+    src_ptrs[i] = reinterpret_cast<const void*>(srcs[i]);
   }
-  return results;
+  return pool_client_->BatchPutRemote(keys, src_ptrs, sizes);
 }
 
 std::vector<bool> DistributedClient::BatchPutWithDepth(const std::vector<std::string>& keys,
                                                        const std::vector<uintptr_t>& srcs,
                                                        const std::vector<size_t>& sizes,
-                                                       const std::vector<int>& /*depths*/) {
-  // TODO: forward depths to Master for global eviction decisions
-  return BatchPut(keys, srcs, sizes);
+                                                       const std::vector<int>& depths) {
+  if (closing_) return std::vector<bool>(keys.size(), false);
+  std::shared_lock lk(op_mutex_);
+  if (closed_) return std::vector<bool>(keys.size(), false);
+  std::vector<const void*> src_ptrs(srcs.size());
+  for (size_t i = 0; i < srcs.size(); ++i) {
+    src_ptrs[i] = reinterpret_cast<const void*>(srcs[i]);
+  }
+  return pool_client_->BatchPutRemote(keys, src_ptrs, sizes, depths);
 }
 
 std::vector<bool> DistributedClient::BatchGet(const std::vector<std::string>& keys,
                                               const std::vector<uintptr_t>& dsts,
                                               const std::vector<size_t>& sizes) {
-  std::vector<bool> results(keys.size(), false);
-  for (size_t i = 0; i < keys.size(); ++i) {
-    results[i] = Get(keys[i], dsts[i], sizes[i]);
+  if (closing_) return std::vector<bool>(keys.size(), false);
+  std::shared_lock lk(op_mutex_);
+  if (closed_) return std::vector<bool>(keys.size(), false);
+
+  std::vector<void*> dst_ptrs(dsts.size());
+  for (size_t i = 0; i < dsts.size(); ++i) {
+    dst_ptrs[i] = reinterpret_cast<void*>(dsts[i]);
   }
-  return results;
+  return pool_client_->BatchGetRemote(keys, dst_ptrs, sizes);
 }
 
 std::vector<bool> DistributedClient::BatchExists(const std::vector<std::string>& keys) const {
+  if (closing_) return std::vector<bool>(keys.size(), false);
+  std::shared_lock lk(op_mutex_);
+  if (closed_) return std::vector<bool>(keys.size(), false);
+
   std::vector<bool> results(keys.size(), false);
   for (size_t i = 0; i < keys.size(); ++i) {
-    results[i] = Exists(keys[i]);
+    results[i] = pool_client_->ExistsRemote(keys[i]);
   }
   return results;
 }
 
 size_t DistributedClient::BatchExistsConsecutive(const std::vector<std::string>& keys) const {
+  if (closing_) return 0;
+  std::shared_lock lk(op_mutex_);
+  if (closed_) return 0;
+
   for (size_t i = 0; i < keys.size(); ++i) {
-    if (!Exists(keys[i])) return i;
+    if (!pool_client_->ExistsRemote(keys[i])) return i;
   }
   return keys.size();
+}
+
+// ---------------------------------------------------------------------------
+// RegisterMemory / DeregisterMemory
+// ---------------------------------------------------------------------------
+
+bool DistributedClient::RegisterMemory(void* ptr, size_t size) {
+  if (closing_) return false;
+  std::shared_lock lk(op_mutex_);
+  if (closed_) return false;
+  return pool_client_->RegisterMemory(ptr, size);
+}
+
+void DistributedClient::DeregisterMemory(void* ptr) {
+  if (closing_) return;
+  std::shared_lock lk(op_mutex_);
+  if (closed_) return;
+  pool_client_->DeregisterMemory(ptr);
 }
 
 // ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
 
-void DistributedClient::Clear() {
-  // TODO: clear all entries (local and/or global)
-}
+void DistributedClient::Clear() { MORI_UMBP_DEBUG("[DistributedClient] Clear() — no-op"); }
 
 bool DistributedClient::Flush() {
-  // TODO: flush pending operations
+  MORI_UMBP_DEBUG("[DistributedClient] Flush() — no-op");
   return true;
 }
 
 void DistributedClient::Close() {
+  closing_ = true;
+  std::unique_lock lk(op_mutex_);
   if (closed_) return;
   closed_ = true;
 
-  if (master_client_) {
-    master_client_->StopHeartbeat();
-    if (master_client_->IsRegistered()) {
-      master_client_->UnregisterSelf();
-    }
+  if (pool_client_) {
+    pool_client_->Shutdown();
+    pool_client_.reset();
   }
-  io_engine_.reset();
-  master_client_.reset();
+
+  if (dram_pool_) {
+    munmap(dram_pool_, dram_pool_size_);
+    dram_pool_ = nullptr;
+  }
+
+  MORI_UMBP_INFO("[DistributedClient] closed");
 }
 
 bool DistributedClient::IsDistributed() const { return true; }

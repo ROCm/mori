@@ -21,21 +21,18 @@
 // SOFTWARE.
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <shared_mutex>
 #include <string>
 #include <vector>
 
+#include "umbp/distributed/pool_client.h"
 #include "umbp/umbp_client.h"
 
-namespace mori::io {
-class IOEngine;
-}
-
 namespace mori::umbp {
-
-class MasterClient;
 
 /// Distributed IUMBPClient implementation — master-led global routing
 /// with RDMA/MORI-IO data plane.  All routing decisions go through the
@@ -68,12 +65,17 @@ class DistributedClient : public IUMBPClient {
   void Close() override;
   bool IsDistributed() const override;
 
+  bool RegisterMemory(void* ptr, size_t size);
+  void DeregisterMemory(void* ptr);
+
  private:
   UMBPConfig config_;
+  void* dram_pool_ = nullptr;
+  size_t dram_pool_size_ = 0;
+  std::unique_ptr<PoolClient> pool_client_;
+  std::atomic<bool> closing_{false};
+  mutable std::shared_mutex op_mutex_;
   bool closed_ = false;
-
-  std::unique_ptr<MasterClient> master_client_;
-  std::unique_ptr<mori::io::IOEngine> io_engine_;
 };
 
 }  // namespace mori::umbp

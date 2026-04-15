@@ -56,6 +56,12 @@ struct ClientIOInfo {
   std::vector<uint8_t> dram_memory_desc_bytes;
 };
 
+struct FinalizedRecord {
+  std::string key;
+  Location location;
+  std::chrono::steady_clock::time_point finalized_at;
+};
+
 class ClientRegistry {
  public:
   explicit ClientRegistry(const ClientRegistryConfig& config);
@@ -123,6 +129,7 @@ class ClientRegistry {
   std::unordered_map<std::string, ClientRecord> clients_;
   std::unordered_map<std::string, std::set<std::string>> client_keys_;
   std::unordered_map<std::string, PendingAllocation> pending_allocations_;
+  std::unordered_map<std::string, FinalizedRecord> finalized_allocations_;
 
   // Reaper thread
   std::thread reaper_thread_;
@@ -135,6 +142,7 @@ class ClientRegistry {
   // PA-4 fix: uses iterator-safe erase pattern.
   void ReapExpiredClients();
   void ReapExpiredPendingAllocations();
+  void ReapExpiredFinalizedRecords();
   void ReleasePendingAllocationsForNodeLocked(const std::string& node_id);
   static uint32_t ParseBufferIndex(const std::string& location_id);
   void UpdateAvailableBytesLocked(ClientRecord& record, TierType tier);

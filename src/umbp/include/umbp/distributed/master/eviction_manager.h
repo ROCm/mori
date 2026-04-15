@@ -21,46 +21,40 @@
 // SOFTWARE.
 #pragma once
 
-#include <memory>
-#include <string>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 
 #include "umbp/distributed/config.h"
-#include "umbp/distributed/master/client_registry.h"
-#include "umbp/distributed/master/eviction_manager.h"
-#include "umbp/distributed/master/global_block_index.h"
-#include "umbp/distributed/routing/route_get_strategy.h"
-#include "umbp/distributed/routing/route_put_strategy.h"
-#include "umbp/distributed/routing/router.h"
-
-namespace grpc_impl {
-class Server;
-}
 
 namespace mori::umbp {
 
-class MasterServer {
+class GlobalBlockIndex;
+class ClientRegistry;
+
+class EvictionManager {
  public:
-  explicit MasterServer(MasterServerConfig config);
-  ~MasterServer();
+  EvictionManager(GlobalBlockIndex& index, ClientRegistry& registry, const EvictionConfig& config);
+  ~EvictionManager();
 
-  MasterServer(const MasterServer&) = delete;
-  MasterServer& operator=(const MasterServer&) = delete;
+  EvictionManager(const EvictionManager&) = delete;
+  EvictionManager& operator=(const EvictionManager&) = delete;
 
-  void Run();
-  void Shutdown();
+  void Start();
+  void Stop();
 
  private:
-  MasterServerConfig config_;
-  GlobalBlockIndex index_;
-  ClientRegistry registry_;
-  Router router_;
+  void EvictionLoop();
+  void RunOnce();
 
-  std::unique_ptr<grpc_impl::Server> server_;
-
-  class UMBPMasterServiceImpl;
-  std::unique_ptr<UMBPMasterServiceImpl> service_;
-
-  std::unique_ptr<EvictionManager> eviction_manager_;
+  GlobalBlockIndex& index_;
+  ClientRegistry& registry_;
+  EvictionConfig config_;
+  std::thread thread_;
+  std::atomic<bool> running_{false};
+  std::mutex cv_mutex_;
+  std::condition_variable cv_;
 };
 
 }  // namespace mori::umbp

@@ -94,7 +94,7 @@ struct UMBPCopyPipelineConfig {
 };
 
 // User-facing distributed configuration. Set UMBPConfig::distributed to enable
-// distributed mode. Internally translated to PoolClientConfig by UMBPClient.
+// distributed mode. Internally translated to PoolClientConfig by DistributedClient.
 struct UMBPDistributedConfig {
   std::string master_address;  // e.g. "master-host:50051"
   std::string node_id;         // unique node identifier
@@ -148,8 +148,8 @@ struct UMBPConfig {
   bool follower_mode = false;
   bool force_ssd_copy_on_write = false;
 
-  // Optional distributed mode. When set, UMBPClient creates an internal
-  // PoolClient that connects to the Master and sends periodic heartbeats.
+  // Optional distributed mode. When set, DistributedClient wraps PoolClient
+  // that connects to the Master and sends periodic heartbeats.
   // nullopt (default) = local-only mode with no network dependencies.
   std::optional<UMBPDistributedConfig> distributed;
 
