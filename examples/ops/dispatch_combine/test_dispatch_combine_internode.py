@@ -1185,7 +1185,9 @@ class EpDispatchCombineTestCase:
         avg = data_2d.mean(dim=1).mean().item()
         return (worst, best, avg)
 
-    def tuning_dispatch_combine(self, max_num_token, save_tuning_config=None):
+    def tuning_dispatch_combine(
+        self, max_num_token, save_tuning_config=None, skip_verify=False
+    ):
         op = mori.ops.EpDispatchCombineOp(self.config)
         sm_count = torch.cuda.get_device_properties(
             self.rank % self.gpu_per_node
@@ -1226,7 +1228,8 @@ class EpDispatchCombineTestCase:
         )
         if self.rank == 0:
             print(
-                f"SM count={sm_count}, tuning_scope={tuning_scope}\n"
+                f"SM count={sm_count}, tuning_scope={tuning_scope}, "
+                f"skip_verify={skip_verify}\n"
                 f"block_num candidates ({len(block_list)}): {block_list}\n"
                 f"warp_per_block candidates: {warp_list}\n"
                 f"BW metric: {bw_label}\n"
@@ -1246,13 +1249,16 @@ class EpDispatchCombineTestCase:
         best_disp_stats = dict(_zero_stats)
         best_comb_stats = dict(_zero_stats)
 
-        error_round = set()
         test_data = self.gen_test_data(
-            max_num_token=max_num_token, use_max_token_num=True
+            max_num_token=max_num_token,
+            use_max_token_num=True,
+            only_my_rank=skip_verify,
         )
-        for wr_i in range(1):
-            self.run_test_once(op, test_data, error_round, wr_i)
-        assert len(error_round) == 0, f"Warmup failed: {error_round}"
+        if not skip_verify:
+            error_round = set()
+            for wr_i in range(1):
+                self.run_test_once(op, test_data, error_round, wr_i)
+            assert len(error_round) == 0, f"Warmup failed: {error_round}"
 
         config_idx = 0
         for bn in block_list:
@@ -1490,6 +1496,7 @@ def test_dispatch_combine(
             test_case.tuning_dispatch_combine(
                 max_tokens,
                 save_tuning_config=save_tuning_config,
+                skip_verify=skip_verify,
             )
         test_case.cleanup()
     elif cmd == "sweep_bench":
