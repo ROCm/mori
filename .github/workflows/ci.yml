@@ -93,13 +93,22 @@ jobs:
           docker exec $CONTAINER bash -c \
             "BUILD_EXAMPLES=ON pip install . && pip install prettytable"
 
-      - name: MORI-EP
+      - name: MORI-EP (intranode)
         run: |
           docker exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
-            cd $GITHUB_WORKSPACE
-            timeout 300 pytest tests/python/ops/test_dispatch_combine_intranode.py -v
-            timeout 300 pytest tests/python/ops/test_dispatch_combine_internode_v1.py -v
-            timeout 300 pytest tests/python/ops/test_dispatch_combine_async_ll.py -v
+            cd $GITHUB_WORKSPACE && timeout 300 pytest tests/python/ops/test_dispatch_combine_intranode.py -v
+          "
+
+      - name: MORI-EP (internode_v1)
+        run: |
+          docker exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE && timeout 300 pytest tests/python/ops/test_dispatch_combine_internode_v1.py -v
+          "
+
+      - name: MORI-EP (async_ll)
+        run: |
+          docker exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE && timeout 300 pytest tests/python/ops/test_dispatch_combine_async_ll.py -v
           "
 
       - name: MORI-EP bench
