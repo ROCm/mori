@@ -20,8 +20,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: MI350X_BNXT
-            runner: [self-hosted, mi350-bnxt]
+          - platform: MI300X_BNXT
+            runner: [self-hosted, MI300X-BNXT]
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -65,8 +65,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: MI350X_BNXT
-            runner: [self-hosted, mi350-bnxt]
+          - platform: MI300X_BNXT
+            runner: [self-hosted, MI300X-BNXT]
     timeout-minutes: 45
     steps:
       - name: Checkout
@@ -187,13 +187,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: MI350X_BNXT
-            runner: [self-hosted, mi350-bnxt]
-            node1_host: 10.245.40.58
-            node2_host: cv350-zts-gtu-g40e-08
+          - platform: MI300X_BNXT
+            runner: [self-hosted, MI300X-BNXT]
+            node1_host: 10.245.132.125
+            node2_host: 10.245.132.127
             node2_port: 22
-            node1_ifname: fenic0
-            node2_ifname: fenic0
+            node1_ifname: enp159s0np0
+            node2_ifname: enp159s0np0
     timeout-minutes: 45
     steps:
       - name: Checkout

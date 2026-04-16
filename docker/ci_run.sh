@@ -53,6 +53,22 @@ detect_nic_type() {
 
 # ── Build bind-mount flags for OOT RDMA libs ────────────────────────────────
 
+find_host_ibverbs() {
+    local candidates=(
+        /usr/lib64/libibverbs.so.1
+        /lib/x86_64-linux-gnu/libibverbs.so.1
+        /usr/lib/x86_64-linux-gnu/libibverbs.so.1
+    )
+    for c in "${candidates[@]}"; do
+        local resolved
+        resolved=$(readlink -f "$c" 2>/dev/null || true)
+        if [[ -f "$resolved" ]]; then
+            echo "$resolved"
+            return
+        fi
+    done
+}
+
 nic_mount_flags() {
     local nic_type="$1"
     local flags=()
@@ -60,16 +76,20 @@ nic_mount_flags() {
     case "$nic_type" in
         bnxt)
             local host_ibverbs
-            host_ibverbs=$(readlink -f /usr/lib64/libibverbs.so.1 2>/dev/null || true)
-            if [[ -f "$host_ibverbs" ]]; then
+            host_ibverbs=$(find_host_ibverbs)
+            if [[ -n "$host_ibverbs" ]]; then
                 flags+=(-v "$host_ibverbs:/lib/x86_64-linux-gnu/libibverbs.so.1")
             fi
-            for lib in /usr/local/lib/libbnxt_re-rdmav*.so /usr/local/lib/libbnxt_re.so; do
+            for lib in /usr/local/lib/libbnxt_re-rdmav*.so; do
+                if [[ -f "$lib" ]]; then
+                    flags+=(-v "$lib:/usr/lib/x86_64-linux-gnu/libibverbs/$(basename "$lib")")
+                fi
+            done
+            for lib in /usr/local/lib/libbnxt_re.so; do
                 if [[ -f "$lib" ]]; then
                     flags+=(-v "$lib:/usr/lib/x86_64-linux-gnu/$(basename "$lib")")
                 fi
             done
-            # Blank out the container's driver configs, then mount only bnxt
             flags+=(--tmpfs /etc/libibverbs.d:rw,size=4k)
             if [[ -f /etc/libibverbs.d/bnxt_re.driver ]]; then
                 flags+=(-v /etc/libibverbs.d/bnxt_re.driver:/etc/libibverbs.d/bnxt_re.driver)
@@ -77,8 +97,8 @@ nic_mount_flags() {
             ;;
         ionic)
             local host_ibverbs
-            host_ibverbs=$(readlink -f /usr/lib64/libibverbs.so.1 2>/dev/null || true)
-            if [[ -f "$host_ibverbs" ]]; then
+            host_ibverbs=$(find_host_ibverbs)
+            if [[ -n "$host_ibverbs" ]]; then
                 flags+=(-v "$host_ibverbs:/lib/x86_64-linux-gnu/libibverbs.so.1")
             fi
             for lib in /usr/local/lib/libionic*.so; do
@@ -92,7 +112,6 @@ nic_mount_flags() {
             fi
             ;;
         mlx5)
-            # mlx5 inbox: container's rdma-core should work; no extra mounts needed
             ;;
     esac
 
