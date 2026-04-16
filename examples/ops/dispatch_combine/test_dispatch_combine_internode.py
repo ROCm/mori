@@ -1580,7 +1580,7 @@ parser.add_argument(
 parser.add_argument(
     "--num-qp",
     type=int,
-    default=1,
+    default=2,
     help="Number of qp per processing endpoint",
 )
 parser.add_argument(
