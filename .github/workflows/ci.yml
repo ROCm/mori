@@ -10,6 +10,7 @@ concurrency:
 
 env:
   IMAGE: rocm/mori:ci
+  BASE_IMAGE: rocm/pytorch:rocm7.2.1_ubuntu24.04_py3.12_pytorch_release_2.8.0
   CONTAINER: mori_ci_${{ github.run_id }}
 
 jobs:
@@ -30,7 +31,7 @@ jobs:
           submodules: true
 
       - name: Build CI image
-        run: docker build --network=host -t $IMAGE -f docker/Dockerfile.dev .
+        run: docker build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE -t $IMAGE -f docker/Dockerfile.dev .
 
       - name: Start container
         run: |
@@ -75,7 +76,7 @@ jobs:
           submodules: true
 
       - name: Build CI image
-        run: docker build --network=host -t $IMAGE -f docker/Dockerfile.dev .
+        run: docker build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE -t $IMAGE -f docker/Dockerfile.dev .
 
       - name: Start container
         run: |
@@ -202,7 +203,7 @@ jobs:
           submodules: true
 
       - name: Build CI image
-        run: docker build --network=host -t $IMAGE -f docker/Dockerfile.dev .
+        run: docker build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE -t $IMAGE -f docker/Dockerfile.dev .
 
       - name: Start container on node1
         run: |
@@ -226,7 +227,7 @@ jobs:
             $(whoami)@${{ matrix.node2_host }}:$GITHUB_WORKSPACE/
           ssh -p ${{ matrix.node2_port }} $(whoami)@${{ matrix.node2_host }} "
             cd $GITHUB_WORKSPACE &&
-            docker build --network=host -t $IMAGE -f docker/Dockerfile.dev . &&
+            docker build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE -t $IMAGE -f docker/Dockerfile.dev . &&
             ./docker/ci_run.sh --name $CONTAINER \
               -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
               -w $GITHUB_WORKSPACE \
