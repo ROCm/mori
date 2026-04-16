@@ -127,7 +127,7 @@ cmake --build build
 
 ### Code Generation
 
-The profiler relies on a code generation script `tools/generate_profiler_bindings.py`. This script:
+The profiler relies on a code generation script `tools/profiler/generate_profiler_bindings.py`. This script:
 1.  Scans `src/` for `MORI_TRACE_*` usage.
 2.  Extracts unique slot names.
 3.  Generates C++ headers into the build directory (e.g., `build/generated/include/mori/profiler/.../slots.hpp`).

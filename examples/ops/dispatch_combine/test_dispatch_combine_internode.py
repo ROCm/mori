@@ -28,7 +28,7 @@ import argparse
 import time
 from tqdm import tqdm
 
-os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "6G")
+os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "64G")
 
 kernel_type_map = {
     "v0": mori.ops.EpDispatchCombineKernelType.InterNode,
@@ -206,6 +206,64 @@ def _save_internode_tuning_result(
         phase="combine",
     )
     print(f"Tuning config saved to: {dispatch_path} + {combine_path}")
+
+
+def compute_rdma_algo_token_count(
+    topk_idx: torch.Tensor,
+    num_experts_per_rank: int,
+    gpu_per_node: int,
+    world_size: int,
+    kernel_type=None,
+) -> int:
+    """Compute the RDMA algorithm token count using the same method as DeepEP.
+
+    DeepEP (test_internode.py lines 58-61) defines the RDMA bandwidth numerator as
+    the total number of (token, destination-node) pairs emitted by this rank,
+    counting the local node too.  This is the "algorithm bandwidth" figure — the
+    physical cross-node count is (num_nodes - 1) / num_nodes of this value.
+
+    For the v1_ll kernel, no deduplication is performed across expert slots, so
+    each token contributes one entry per node (num_token_per_rank * num_nodes).
+
+    Args:
+        topk_idx:            [T, K] int32 tensor of global expert IDs for this rank's
+                             tokens (as produced by gen_test_data; no -1 entries).
+        num_experts_per_rank: from EpDispatchCombineConfig.
+        gpu_per_node:        GPUs per node.
+        world_size:          total number of ranks.
+        kernel_type:         EpDispatchCombineKernelType (optional).  When set to
+                             InterNodeV1LL the count is num_token * num_nodes
+                             (no dedup); otherwise the deduplicating DeepEP
+                             formula is used.
+
+    Returns:
+        Integer count of (token, destination-node) pairs, equivalent to
+        DeepEP's ``rdma_idx.ne(-1).sum().item()``.
+    """
+    num_nodes = world_size // gpu_per_node
+
+    # v1_ll does not deduplicate across expert slots in the kernel, so every
+    # token contributes one entry for every node unconditionally.
+    if kernel_type == mori.ops.EpDispatchCombineKernelType.InterNodeV1LL:
+        return topk_idx.shape[0] * num_nodes
+
+    num_experts_per_node = num_experts_per_rank * gpu_per_node
+
+    # Map each selected expert to the node that owns it — mirrors DeepEP:
+    #   rdma_idx = topk_idx // (num_experts // num_nodes)
+    node_idx = (topk_idx // num_experts_per_node).long()  # [T, K]
+
+    # Mark which nodes are visited by each token (deduplicates across the K
+    # expert slots) — vectorised equivalent of DeepEP's inplace_unique followed
+    # by ne(-1).sum():
+    #   inplace_unique(rdma_idx, num_nodes)
+    #   num_rdma_token_sent = rdma_idx.ne(-1).sum().item()
+    node_presence = torch.zeros(
+        topk_idx.shape[0], num_nodes, dtype=torch.bool, device=topk_idx.device
+    )
+    node_presence.scatter_(1, node_idx, True)  # [T, num_nodes]
+
+    return node_presence.sum().item()
 
 
 class EpDispatchCombineTestCase:
@@ -870,8 +928,12 @@ class EpDispatchCombineTestCase:
                 warp_per_block=warp_per_block,
             )
             torch.cuda.synchronize()
-        total_rdma_recv_num_token = (
-            self.config.max_num_inp_token_per_rank * self.config.world_size // 8
+        total_rdma_recv_num_token = compute_rdma_algo_token_count(
+            topk_idx=all_rank_indices[self.rank],
+            num_experts_per_rank=self.config.num_experts_per_rank,
+            gpu_per_node=self.config.gpu_per_node,
+            world_size=self.config.world_size,
+            kernel_type=op.config.kernel_type,
         )
         print(
             f"rank {self.rank} recv {total_recv_num_token} tokens {total_rdma_recv_num_token} rdma tokens"
@@ -967,7 +1029,21 @@ class EpDispatchCombineTestCase:
             output_filename = (
                 f"trace_rank_{self.rank}_{time.strftime('%m%d_%H%M%S')}.json"
             )
-            mori.kernel_profiler.export_to_perfetto(my_times, output_filename)
+            # Select per-kernel slot map to avoid collision: InternodeV1 and
+            # LowLatencyAsync both define enums starting from 0, so ALL_PROFILER_SLOTS
+            # (which merges them) has low_latency_async.* overwriting internode_v1.*
+            # for slot IDs 0-9. Pass the correct per-kernel map explicitly.
+            kt = self.config.kernel_type
+            KT = mori.ops.EpDispatchCombineKernelType
+            if kt in (KT.InterNode, KT.InterNodeV1, KT.InterNodeV1LL):
+                slot_map = getattr(mori.cpp, "InternodeV1Slots", None)
+            elif kt == KT.AsyncLL:
+                slot_map = getattr(mori.cpp, "LowLatencyAsyncSlots", None)
+            else:
+                slot_map = None
+            mori.kernel_profiler.export_to_perfetto(
+                my_times, output_filename, slot_map=slot_map
+            )
             if self.rank == 0:
                 print(f"Profiling data exported to {output_filename}")
 

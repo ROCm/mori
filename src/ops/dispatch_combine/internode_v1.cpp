@@ -22,18 +22,16 @@
 
 #include "src/ops/dispatch_combine/internode_v1.hpp"
 
-#include "mori/core/core.hpp"
-#include "mori/ops/dispatch_combine/dispatch_combine.hpp"
-#include "mori/shmem/shmem.hpp"
-#include "src/ops/dispatch_combine/convert.hpp"
-#ifdef ENABLE_PROFILER
-#include "mori/core/profiler/constants.hpp"
-#include "mori/core/profiler/kernel_profiler.hpp"
-#include "mori/profiler/profiler.hpp"
-#endif
 #include <type_traits>
 
+#include "mori/core/core.hpp"
+#include "mori/core/profiler/constants.hpp"
+#include "mori/core/profiler/kernel_profiler.hpp"
+#include "mori/ops/dispatch_combine/dispatch_combine.hpp"
+#include "mori/profiler/profiler.hpp"
+#include "mori/shmem/shmem.hpp"
 #include "src/ops/dispatch_combine/common.hpp"
+#include "src/ops/dispatch_combine/convert.hpp"
 
 namespace mori {
 namespace moe {
@@ -89,6 +87,7 @@ inline __device__ void DispatchIntraNodeBlock(EpDispatchCombineArgs<T>& args, in
 template <typename T>
 inline __device__ void DispatchIntraNode(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
+  INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId);
   MORI_TRACE_SPAN(profiler, Slot::DispatchIntra);
 
   int blockOffset = args.rdmaBlockNum;
@@ -133,6 +132,7 @@ inline __device__ void DispatchIntraNode(EpDispatchCombineArgs<T>& args) {
 template <typename T, bool DEDUP>
 inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
+  INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId);
   MORI_TRACE_SPAN(profiler, Slot::DispatchInterNodeSend);
 
   int maxChunkNum = core::CeilDiv(config.MaxNumTokensToSendPerRank(), warpSize);
@@ -260,6 +260,7 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
 template <typename T>
 inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
+  INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId);
   MORI_TRACE_SPAN(profiler, Slot::DispatchInterNodeLLSend);
 
   // Then send to other nodes
@@ -329,6 +330,7 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs<T>& args) {
 template <typename T>
 inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
+  INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId);
   MORI_TRACE_SPAN(profiler, Slot::DispatchInterNodeRecv);
 
   constexpr int numRecvBlock = 8;
@@ -432,6 +434,7 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
 template <typename T>
 inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
+  INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId);
   MORI_TRACE_SPAN(profiler, Slot::DispatchInterNodeLLRecv);
 
   int maxChunkNum = core::CeilDiv(config.MaxNumTokensToSendPerRank(), warpSize);
@@ -535,6 +538,7 @@ inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs<T>& args) {
 template <typename T>
 inline __device__ void DispatchSync(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
+  INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId);
   MORI_TRACE_SPAN(profiler, Slot::DispatchSync);
 
   int nodePeOffset = myNode * config.gpuPerNode;
@@ -599,6 +603,7 @@ __global__ void EpDispatchInterNodeV1Kernel(EpDispatchCombineArgs<T> args) {
 template <typename T>
 __device__ void EpDispatchCopyToStaging_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
+  INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId);
   MORI_TRACE_SPAN(profiler, Slot::EpDispatchCopyToStaging);
   if (args.curRankNumToken == 0) return;
 
@@ -670,6 +675,7 @@ namespace v1 {
 template <typename T>
 inline __device__ void CombineSync(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
+  INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId);
   MORI_TRACE_SPAN(profiler, Slot::CombineSync);
 
   index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
@@ -1111,6 +1117,7 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs<T>
 template <typename T>
 inline __device__ void CombineIntraNode(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
+  INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId);
   MORI_TRACE_SPAN(profiler, Slot::CombineIntraNode);
   if (args.config.quantType == QuantType::Fp8DirectCast) {
     using TokT = core::CombineInternalFp8;
@@ -1127,6 +1134,7 @@ inline __device__ void CombineIntraNode(EpDispatchCombineArgs<T>& args) {
 template <typename T>
 inline __device__ void CombineIntraNodeLL(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
+  INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId);
   MORI_TRACE_SPAN(profiler, Slot::CombineIntraNodeLL);
 
   if (args.curRankNumToken == 0) return;
@@ -1144,6 +1152,7 @@ inline __device__ void CombineIntraNodeLL(EpDispatchCombineArgs<T>& args) {
 template <typename T>
 inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
+  INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId);
   MORI_TRACE_SPAN(profiler, Slot::CombineInterNode);
 
   if (args.config.quantType == QuantType::Fp8DirectCast) {
@@ -1160,6 +1169,7 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
 template <typename T>
 inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
+  INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId);
   MORI_TRACE_SPAN(profiler, Slot::CombineInterNodeLL);
   if (args.config.quantType == QuantType::Fp8DirectCast) {
     using TokT = core::CombineInternalFp8;
@@ -1298,6 +1308,7 @@ __forceinline__ __device__ void EpCombineAllGeneric(EpDispatchCombineArgs<T>& ar
 template <typename T>
 __device__ void EpCombineAll_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
+  INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId);
   MORI_TRACE_SPAN(profiler, Slot::EpCombineAll);
 
   if (globalWarpId == 0) {
@@ -1358,6 +1369,8 @@ __global__ void EpCombineSync(EpDispatchCombineArgs<T> args) {
 template <typename T>
 __device__ void EpCombineSyncBarrier_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
+  INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId);
+  MORI_TRACE_SPAN(profiler, Slot::EpCombineSyncBarrier);
   uint64_t barrierFlag = 0;
   if (laneId == 0) {
     barrierFlag = core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag);
