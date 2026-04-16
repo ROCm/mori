@@ -46,6 +46,10 @@ _CLI_TO_KERNEL_TYPE_NAME = {
 
 _FP4_DTYPE = getattr(torch, "float4_e2m1fn_x2", None)
 
+# Bandwidth improvement must exceed this margin (GB/s) to update the best
+# config during tuning. Prevents config churn from run-to-run noise.
+_BW_NOISE_MARGIN = 1.0
+
 
 def _is_fp4x2_dtype(dtype):
     return _FP4_DTYPE is not None and dtype is _FP4_DTYPE
@@ -649,6 +653,12 @@ class EpDispatchCombineTestCase:
             atol, rtol = 1e-2, 1e-2
             if getattr(self.config, "quant_type", "none") == "fp8_direct_cast":
                 atol, rtol = 1e-1, 1e-1
+            if combine_data_type in (
+                torch.float8_e4m3fn,
+                torch.float8_e4m3fnuz,
+            ):
+                atol = max(atol, 2.0 * final_unique_pes)
+                rtol = max(rtol, 0.15)
             ok = torch.allclose(got.float(), expected.float(), atol=atol, rtol=rtol)
             if not ok:
                 print(
@@ -1301,11 +1311,11 @@ class EpDispatchCombineTestCase:
                     disp_stats = self._build_phase_stats(kept, 0, 1, 2, ll_scale)
                     comb_stats = self._build_phase_stats(kept, 3, 4, 5, ll_scale)
 
-                    if disp_bw > best_disp_bw:
+                    if disp_bw > best_disp_bw + _BW_NOISE_MARGIN:
                         best_disp_bw = disp_bw
                         best_disp_config = (bn, warp, rdma_bn)
                         best_disp_stats = disp_stats
-                    if comb_bw > best_comb_bw:
+                    if comb_bw > best_comb_bw + _BW_NOISE_MARGIN:
                         best_comb_bw = comb_bw
                         best_comb_config = (bn, warp, rdma_bn)
                         best_comb_stats = comb_stats

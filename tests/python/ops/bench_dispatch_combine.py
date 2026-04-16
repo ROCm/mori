@@ -33,6 +33,8 @@ import os
 
 os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "6G")
 
+_BW_NOISE_MARGIN = 1.0
+
 
 class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
     def __init__(
@@ -943,11 +945,11 @@ def _bench_dispatch_combine(
                         skip_e2e=True,
                     )
 
-                    if disp_bw > best_disp_bw:
+                    if disp_bw > best_disp_bw + _BW_NOISE_MARGIN:
                         best_disp_bw = disp_bw
                         best_disp_config = (block_num, warp_per_block)
                         best_disp_lat = disp_lat
-                    if comb_bw > best_comb_bw:
+                    if comb_bw > best_comb_bw + _BW_NOISE_MARGIN:
                         best_comb_bw = comb_bw
                         best_comb_config = (block_num, warp_per_block)
                         best_comb_lat = comb_lat
@@ -980,7 +982,7 @@ def _bench_dispatch_combine(
                             skip_e2e=True,
                         )
 
-                        if disp_bw > best_disp_bw:
+                        if disp_bw > best_disp_bw + _BW_NOISE_MARGIN:
                             best_disp_bw = disp_bw
                             best_disp_config = (block_num, warp_per_block)
                             best_disp_lat = disp_lat
