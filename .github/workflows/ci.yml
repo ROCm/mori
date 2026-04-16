@@ -91,7 +91,7 @@ jobs:
       - name: Install mori
         run: |
           docker exec $CONTAINER bash -c \
-            "BUILD_EXAMPLES=ON pip install . && pip install prettytable"
+            "cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install -e . && pip install prettytable"
 
       - name: MORI-EP (intranode)
         run: |
@@ -248,12 +248,12 @@ jobs:
       - name: Install mori (node1)
         run: |
           docker exec $CONTAINER bash -c \
-            "cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install . && pip install prettytable"
+            "cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install -e . && pip install prettytable"
 
       - name: Install mori (node2)
         run: |
           ssh -p ${{ matrix.node2_port }} $(whoami)@${{ matrix.node2_host }} \
-            "docker exec $CONTAINER bash -c 'cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install . && pip install prettytable'"
+            "docker exec $CONTAINER bash -c 'cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install -e . && pip install prettytable'"
 
       - name: MORI-IO internode benchmark
         run: |
