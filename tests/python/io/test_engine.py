@@ -160,7 +160,8 @@ def test_engine_desc_node_id_env_override(monkeypatch):
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 1, reason="requires GPU")
-def test_rdmabackend_auto_creates_xgmi_backend_for_gpu_mem():
+def test_rdmabackend_auto_creates_xgmi_backend_for_gpu_mem(monkeypatch):
+    monkeypatch.setenv("MORI_DISABLE_AUTO_XGMI", "0")
     config = IOEngineConfig(
         host="127.0.0.1",
         port=get_free_port(),
@@ -193,7 +194,8 @@ def test_rdmabackend_auto_xgmi_can_be_disabled(monkeypatch):
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
-def test_intra_node_prefers_xgmi_after_rdma_creation():
+def test_intra_node_prefers_xgmi_after_rdma_creation(monkeypatch):
+    monkeypatch.setenv("MORI_DISABLE_AUTO_XGMI", "0")
     config = IOEngineConfig(
         host="127.0.0.1",
         port=get_free_port(),
