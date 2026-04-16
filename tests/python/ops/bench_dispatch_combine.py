@@ -598,6 +598,8 @@ def _save_intranode_tuning_result(
     best_comb_config,
     best_comb_bw,
     zero_copy=True,
+    best_disp_lat=None,
+    best_comb_lat=None,
 ):
     from pathlib import Path
     from mori.ops.tuning_config import (
@@ -630,6 +632,7 @@ def _save_intranode_tuning_result(
         "rdma_block_num": 0,
         "warp_per_block": best_disp_config[1],
         "bandwidth_gbps": round(best_disp_bw, 2),
+        "latency_us": round(best_disp_lat, 2) if best_disp_lat is not None else None,
     }
 
     combine_entry = {
@@ -642,6 +645,7 @@ def _save_intranode_tuning_result(
         "rdma_block_num": 0,
         "warp_per_block": best_comb_config[1],
         "bandwidth_gbps": round(best_comb_bw, 2),
+        "latency_us": round(best_comb_lat, 2) if best_comb_lat is not None else None,
     }
 
     if config_path == "auto":
@@ -1020,6 +1024,8 @@ def _bench_dispatch_combine(
                         best_comb_config=best_comb_config,
                         best_comb_bw=best_comb_bw,
                         zero_copy=bool(zero_copy),
+                        best_disp_lat=best_disp_lat,
+                        best_comb_lat=best_comb_lat,
                     )
 
         else:

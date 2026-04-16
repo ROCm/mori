@@ -15,6 +15,7 @@
 #   bash tools/bench_ep_performance.sh --world-size 4            # EP4
 #   bash tools/bench_ep_performance.sh --dtypes "bf16"           # bf16 only
 #   bash tools/bench_ep_performance.sh --output-dir /tmp/bench   # custom output
+#   bash tools/bench_ep_performance.sh --zero-copy 0             # non-zero-copy combine
 #
 # Output directory layout:
 #   <output-dir>/
@@ -38,6 +39,7 @@ LARGE_TOKENS="4096,8192,16384,32768,65536,131072,262144,524288"
 ALL_TOKENS="$SMALL_TOKENS,$LARGE_TOKENS"
 TOKENS="$ALL_TOKENS"
 DTYPES="fp8_e4m3,bf16"
+ZERO_COPY=1
 OUTPUT_DIR=""
 TIMEOUT=7200
 
@@ -48,6 +50,7 @@ while [[ $# -gt 0 ]]; do
         --dtypes)       DTYPES="$2";        shift 2 ;;
         --output-dir)   OUTPUT_DIR="$2";    shift 2 ;;
         --world-size)   WORLD_SIZE="$2";    shift 2 ;;
+        --zero-copy)    ZERO_COPY="$2";     shift 2 ;;
         --timeout)      TIMEOUT="$2";       shift 2 ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
     esac
@@ -94,6 +97,7 @@ print(f'{p.name} (CU={p.multi_processor_count})')
     echo "  world_size:    $WORLD_SIZE"
     echo "  tokens:        $TOKENS"
     echo "  dtypes:        $DTYPES"
+    echo "  zero_copy:     $ZERO_COPY"
     echo "  tuning_scope:  quick"
     echo "  output_dir:    $OUTPUT_DIR"
     echo "  started:       $(date)"
@@ -106,6 +110,7 @@ print(f'{p.name} (CU={p.multi_processor_count})')
     echo "# EP${WORLD_SIZE} Benchmark Summary"
     echo "# GPU: $GPU_INFO | EP$WORLD_SIZE | $(date)"
     echo "#"
+    echo "# zero_copy: $ZERO_COPY"
     echo "# columns: tokens dtype phase bw(GB/s) lat(us) block_num warp_per_block"
     echo "# bw = avg(per_rank_bw), lat = avg(per_rank_duration)"
     echo "#"
@@ -135,6 +140,7 @@ for NTOKENS in "${TOKEN_ARRAY[@]}"; do
             --world-size "$WORLD_SIZE" \
             --max-tokens "$NTOKENS" \
             --dtype "$DTYPE" \
+            --zero-copy "$ZERO_COPY" \
             2>&1 | tee "$RAW_FILE" | grep -E "Performance Summary|Best " | tee -a "$LOG"
         EXIT_CODE=${PIPESTATUS[0]}
         set -e
