@@ -191,7 +191,7 @@ jobs:
 
   internode-test:
     name: mori internode test (${{ matrix.platform }})
-    needs: build
+    needs: [build, intranode-test]
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
