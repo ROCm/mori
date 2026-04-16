@@ -58,13 +58,25 @@ COMMON_ARGS=(
 [[ -n "$DOCKER" ]]  && COMMON_ARGS+=(--docker "$DOCKER")
 [[ -n "$SSH_KEY" ]] && COMMON_ARGS+=(--ssh-key "$SSH_KEY")
 
+# Auto-detect FP8 dtype: OCP (fp8_e4m3) vs FNUZ (fp8_e4m3_fnuz)
+FP8_DTYPE=$(python3 -c "
+import torch
+if hasattr(torch, 'float8_e4m3fn'):
+    print('fp8_e4m3')
+elif hasattr(torch, 'float8_e4m3fnuz'):
+    print('fp8_e4m3_fnuz')
+else:
+    print('bf16')
+" 2>/dev/null || echo "fp8_e4m3")
+echo "Auto-detected FP8 dtype: $FP8_DTYPE"
+
 declare -A TUNING_MATRIX
 TUNING_MATRIX["v1_fp4"]="--kernel-type v1 --dtype fp4 --combine-dtype bf16 --quant-type fp8_direct_cast"
-TUNING_MATRIX["v1_fp8"]="--kernel-type v1 --dtype fp8_e4m3_fnuz --combine-dtype bf16 --quant-type none"
+TUNING_MATRIX["v1_fp8"]="--kernel-type v1 --dtype $FP8_DTYPE --combine-dtype bf16 --quant-type none"
 TUNING_MATRIX["v1_ll_fp4"]="--kernel-type v1_ll --dtype fp4 --combine-dtype bf16 --quant-type fp8_direct_cast"
-TUNING_MATRIX["v1_ll_fp8"]="--kernel-type v1_ll --dtype fp8_e4m3_fnuz --combine-dtype bf16 --quant-type none"
+TUNING_MATRIX["v1_ll_fp8"]="--kernel-type v1_ll --dtype $FP8_DTYPE --combine-dtype bf16 --quant-type none"
 TUNING_MATRIX["async_ll_fp4"]="--kernel-type async_ll --dtype fp4 --combine-dtype bf16 --quant-type fp8_direct_cast"
-TUNING_MATRIX["async_ll_fp8"]="--kernel-type async_ll --dtype fp8_e4m3_fnuz --combine-dtype bf16 --quant-type none"
+TUNING_MATRIX["async_ll_fp8"]="--kernel-type async_ll --dtype $FP8_DTYPE --combine-dtype bf16 --quant-type none"
 
 RUN_ORDER=(v1_ll_fp4 v1_ll_fp8 async_ll_fp4 async_ll_fp8 v1_fp4 v1_fp8)
 
