@@ -132,25 +132,20 @@ void RegisterMoriUmbp(py::module_& m) {
 
   py::class_<UMBPClient>(m, "UMBPClient")
       .def(py::init<const UMBPConfig&>(), py::arg("config") = UMBPConfig{})
-      .def("put_from_ptr", &UMBPClient::PutFromPtr, py::arg("key"), py::arg("src"), py::arg("size"),
-           py::call_guard<py::gil_scoped_release>())
-      .def("get_into_ptr", &UMBPClient::GetIntoPtr, py::arg("key"), py::arg("dst"), py::arg("size"),
-           py::call_guard<py::gil_scoped_release>())
-      .def("exists", &UMBPClient::Exists, py::arg("key"), py::call_guard<py::gil_scoped_release>())
-      .def("remove", &UMBPClient::Remove, py::arg("key"), py::call_guard<py::gil_scoped_release>())
+      .def("put_from_ptr", &UMBPClient::PutFromPtr, py::arg("key"), py::arg("src"), py::arg("size"))
+      .def("get_into_ptr", &UMBPClient::GetIntoPtr, py::arg("key"), py::arg("dst"), py::arg("size"))
+      .def("exists", &UMBPClient::Exists, py::arg("key"))
+      .def("remove", &UMBPClient::Remove, py::arg("key"))
       .def("batch_put_from_ptr", &UMBPClient::BatchPutFromPtr, py::arg("keys"), py::arg("ptrs"),
-           py::arg("sizes"), py::call_guard<py::gil_scoped_release>())
+           py::arg("sizes"))
       .def("batch_put_from_ptr_with_depth", &UMBPClient::BatchPutFromPtrWithDepth, py::arg("keys"),
-           py::arg("ptrs"), py::arg("sizes"), py::arg("depths"),
-           py::call_guard<py::gil_scoped_release>())
+           py::arg("ptrs"), py::arg("sizes"), py::arg("depths"))
       .def("batch_get_into_ptr", &UMBPClient::BatchGetIntoPtr, py::arg("keys"), py::arg("ptrs"),
-           py::arg("sizes"), py::call_guard<py::gil_scoped_release>())
-      .def("batch_exists", &UMBPClient::BatchExists, py::arg("keys"),
-           py::call_guard<py::gil_scoped_release>())
-      .def("batch_exists_consecutive", &UMBPClient::BatchExistsConsecutive, py::arg("keys"),
-           py::call_guard<py::gil_scoped_release>())
-      .def("clear", &UMBPClient::Clear, py::call_guard<py::gil_scoped_release>())
-      .def("flush", &UMBPClient::Flush, py::call_guard<py::gil_scoped_release>())
+           py::arg("sizes"))
+      .def("batch_exists", &UMBPClient::BatchExists, py::arg("keys"))
+      .def("batch_exists_consecutive", &UMBPClient::BatchExistsConsecutive, py::arg("keys"))
+      .def("clear", &UMBPClient::Clear)
+      .def("flush", &UMBPClient::Flush)
       .def("is_distributed", &UMBPClient::IsDistributed);
 }
 
