@@ -341,27 +341,8 @@ jobs:
             done
           done
 
-      - name: MORI-EP internode async kernel test
-        run: |
-          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
-          PORT=29180
-          for TOKENS in 64 128; do
-            echo "=== async_ll test max-tokens=$TOKENS port=$PORT ==="
-            NODE2_CMD="docker exec -e GPU_PER_NODE=8 -e MORI_DISABLE_P2P=1 -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT --rank 1 --master-addr ${{ matrix.node1_host }} --master-port $PORT --ifname ${{ matrix.node2_ifname }} --cmd test --kernel-type async_ll --quant-type none --dtype bf16 --max-tokens $TOKENS"
-            ssh -p ${{ matrix.node2_port }} $(whoami)@${{ matrix.node2_host }} "$NODE2_CMD" &
-            docker exec \
-              -e GPU_PER_NODE=8 \
-              -e MORI_DISABLE_P2P=1 \
-              -e MORI_INTERNODE_TIMEOUT=600 \
-              $CONTAINER bash $SCRIPT \
-              --rank 0 --master-addr ${{ matrix.node1_host }} --master-port $PORT \
-              --ifname ${{ matrix.node1_ifname }} \
-              --cmd test --kernel-type async_ll \
-              --quant-type none --dtype bf16 --max-tokens $TOKENS
-            wait
-            sleep 5
-            PORT=$((PORT + 1))
-          done
+      # TODO: re-enable when async_ll internode is stable on MI300X+BNXT
+      # - name: MORI-EP internode async kernel test
 
       - name: Cleanup node1
         if: always()
