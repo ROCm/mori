@@ -122,14 +122,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
     size_t chunkElementCount,
     uint64_t scatterBase,
     uint64_t agBase,
-    uint64_t reduceCompleteBase,
-    T* __restrict__ outputUserPtr) {
-  // outputUserPtr: if non-null, compute blocks perform an in-kernel
-  // transit->user copy after block 0 finishes the AG wait (signalled via
-  // barrier->ag_gate).  This replaces a host-side hipMemcpyAsync, removing
-  // launch overhead and using the full CU aggregate HBM bandwidth (~5 TB/s
-  // on MI355) rather than a single SDMA engine (~600 GB/s).  For SCATTER_MODE=1
-  // (P2P) the host still issues hipMemcpyAsync; pass nullptr there.
+    uint64_t reduceCompleteBase) {
   (void)flagsMemObj;          // retained for ABI, no longer used
   (void)reduceCompleteBase;   // retained for ABI, no longer used
 
@@ -162,9 +155,6 @@ __global__ void PipelinedAllReduceSdmaKernel(
   __shared__ uint64_t s_ag_by_sender[64];
   __shared__ uint32_t s_cc_base;
   __shared__ const P* s_pe_ptrs[8];
-  // Gate broadcast for in-kernel transit->user copy: block 0 signals
-  // barrier->ag_gate=1 when AG wait is done; compute blocks spin on it.
-  __shared__ uint32_t s_ag_gate_ready;
 
   // chunks_complete is zeroed by the host on stream BEFORE each kernel launch
   // (hipMemsetAsync in pipelined()), so this launch's atomic increments are
@@ -292,57 +282,6 @@ __global__ void PipelinedAllReduceSdmaKernel(
                                __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
       }
 
-      // =================================================================
-      // IN-KERNEL COPY: transit -> user output (if requested)
-      //
-      // Reduce is done and block 0 will eventually set barrier->ag_gate=1
-      // after all SDMA AG puts complete. We spin-wait that signal and then
-      // copy transit(dstMemObj->localPtr, npes*shardBytes) to outputUserPtr
-      // using 16-byte nontemporal loads to bypass L2 (peer slots were
-      // written by SDMA which bypasses L2 -> L2 entries from earlier
-      // reduce-reads of peer slots are stale).
-      // =================================================================
-      if (outputUserPtr != nullptr) {
-        do {
-          if (threadIdx.x == 0) {
-            s_ag_gate_ready = __scoped_atomic_load_n(
-                &barrier->ag_gate, __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE);
-          }
-          __syncthreads();
-          if (s_ag_gate_ready == 0) __builtin_amdgcn_s_sleep(1);
-        } while (s_ag_gate_ready == 0);
-
-        const size_t totalBytes =
-            elementCountPerRank * static_cast<size_t>(npes) * bytesPerElement;
-        const size_t nU16 = totalBytes >> 4;  // totalBytes / 16
-        const ulong2* __restrict__ srcU =
-            reinterpret_cast<const ulong2*>(dstMemObj->localPtr);
-        ulong2* __restrict__ dstU = reinterpret_cast<ulong2*>(outputUserPtr);
-        const size_t copyTid =
-            static_cast<size_t>(blockIdx.x - 1) * static_cast<size_t>(blockDim.x)
-            + threadIdx.x;
-        const size_t copyStride =
-            static_cast<size_t>(compBlocks) * static_cast<size_t>(blockDim.x);
-        for (size_t k = copyTid; k < nU16; k += copyStride) {
-          ulong2 v;
-          v.x = __builtin_nontemporal_load(
-              reinterpret_cast<const uint64_t*>(&srcU[k]));
-          v.y = __builtin_nontemporal_load(
-              reinterpret_cast<const uint64_t*>(&srcU[k]) + 1);
-          dstU[k] = v;
-        }
-        // Tail bytes (< 16) — block 1 thread 0..tail-1 handles byte-wise.
-        const size_t tailStart = nU16 << 4;
-        if (blockIdx.x == 1 && tailStart < totalBytes) {
-          const size_t tail = totalBytes - tailStart;
-          if (threadIdx.x < tail) {
-            reinterpret_cast<uint8_t*>(outputUserPtr)[tailStart + threadIdx.x] =
-                reinterpret_cast<const uint8_t*>(
-                    dstMemObj->localPtr)[tailStart + threadIdx.x];
-          }
-        }
-      }
-
     } else {
       // =================================================================
       // BLOCK 0 — Burst-Submit Scatter + AG
@@ -461,13 +400,6 @@ __global__ void PipelinedAllReduceSdmaKernel(
             __builtin_amdgcn_s_sleep(1);
         }
 
-      }
-
-      // AG complete: signal compute blocks to start in-kernel transit->user copy.
-      if (outputUserPtr != nullptr && thr == 0) {
-        __threadfence();
-        __scoped_atomic_store_n(&barrier->ag_gate, 1u,
-                                __ATOMIC_RELEASE, __MEMORY_SCOPE_DEVICE);
       }
 
     }  // end block 0 vs compute
