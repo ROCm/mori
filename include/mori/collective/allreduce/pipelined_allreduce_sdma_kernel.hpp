@@ -5,17 +5,20 @@
 //
 // SCATTER_MODE=0: Single-kernel AllReduce (SDMA scatter + reduce + SDMA AG)
 //   1-chunk mode (shard < 2×kMinChunkShardBytes):
-//     Block 0: burst scatter → cc wait → flags reduce_complete → SDMA AG → AG wait.
+//     Block 0: burst scatter → cc wait → SDMA AG → AG wait.
 //     Compute blocks: scatter-poll → reduce → wbl2+fence → chunks_complete.
 //     No signal/barrier zeroing: monotonic ATOMIC_INC + baseline protocol.
 //   Multi-chunk mode (shard ≥ 2×kMinChunkShardBytes, default 2 chunks):
-//     Block 0: burst scatter → per-chunk (cc wait → flags reduce_complete → AG) → AG wait.
+//     Block 0: burst scatter → per-chunk (cc wait → AG) → AG wait.
 //     Compute blocks: scatter-poll → reduce → wbl2+fence → chunks_complete.
 //     Overlaps AG(c) SDMA transfer with scatter(c+1)+reduce(c+1) on CU.
 //     wbl2+CC for intermediate chunks runs on wavefront 1 (thread 64),
 //     parallel with scatter-poll on wavefront 0.
-//   reduce_complete signalling uses flagsMemObj (symmetric memory) instead of
-//   qId=0 SDMA signal, avoiding cross-iteration races with scatter signals.
+//   AG depends only on local reduce(c) completion — AllReduce semantics do
+//   not require peer reduce to be done before this PE's AG, so there is NO
+//   cross-PE barrier. The previous flags-based reduce_complete barrier was
+//   a spin-wait deadlock source under GEMM overlap (peer block 0 suspended
+//   by scheduler while local block 0 spun on peer flag).
 //
 // SCATTER_MODE=1: P2P read + CU AG (legacy path).
 //
@@ -120,6 +123,8 @@ __global__ void PipelinedAllReduceSdmaKernel(
     uint64_t scatterBase,
     uint64_t agBase,
     uint64_t reduceCompleteBase) {
+  (void)flagsMemObj;          // retained for ABI, no longer used
+  (void)reduceCompleteBase;   // retained for ABI, no longer used
 
   if (elementCount == 0 || npes <= 0) return;
 
@@ -304,41 +309,27 @@ __global__ void PipelinedAllReduceSdmaKernel(
       }
 
       // ==============================================================
-      // Per-chunk cross-PE barrier + AG: for each chunk, wait until
-      // ALL PEs finish reading that chunk's scatter data, then AG.
-      // AG for chunk c overlaps with reduce of chunk c+1.
+      // Per-chunk AG: for each chunk, wait local reduce(c) complete,
+      // then SDMA AG(c). AG(c) overlaps with reduce(c+1) on the CU.
+      // No cross-PE barrier — AllReduce's AG only needs local reduce.
       // ==============================================================
 
       if constexpr (MULTI_CHUNK) {
+        // Per-chunk AG submit. AllReduce semantics: AG for chunk c only
+        // depends on *local* reduce(c) completion — PE-k writes its own
+        // myPe-slot to every peer's myPe-slot, no cross-PE reduce barrier
+        // needed. This avoids the flags spin-wait deadlock where peer's
+        // block 0 is suspended by GEMM on the overlap stream.
         for (int c = 0; c < numChunks; c++) {
-          {
-            const uint32_t ccTarget =
-                ccBase + static_cast<uint32_t>((c + 1) * compBlocks);
-            if (thr == 0) {
-              while (__scoped_atomic_load_n(
-                         &barrier->chunks_complete,
-                         __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) < ccTarget)
-                __builtin_amdgcn_s_sleep(1);
-            }
-          }
-          __syncthreads();
-
+          const uint32_t ccTarget =
+              ccBase + static_cast<uint32_t>((c + 1) * compBlocks);
           if (thr == 0) {
-            HSAuint64* myFlag =
-                reinterpret_cast<HSAuint64*>(flagsMemObj->localPtr);
-            __hip_atomic_fetch_add(myFlag, 1ULL,
-                                   __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
-          }
-
-          if (thr < npes && thr != myPe) {
-            const int pe = thr;
-            const uint64_t expected =
-                reduceCompleteBase + static_cast<uint64_t>(c + 1);
-            HSAuint64* remoteFlag =
-                reinterpret_cast<HSAuint64*>(flagsMemObj->peerPtrs[pe]);
-            while (core::AtomicLoadRelaxed(remoteFlag) < expected)
+            while (__scoped_atomic_load_n(
+                       &barrier->chunks_complete,
+                       __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) < ccTarget)
               __builtin_amdgcn_s_sleep(1);
           }
+          __syncthreads();
 
           if (thr < npes && thr != myPe) {
             const int destPe = thr;
@@ -370,33 +361,17 @@ __global__ void PipelinedAllReduceSdmaKernel(
             __builtin_amdgcn_s_sleep(1);
         }
       } else {
-        {
-          const uint32_t ccTarget =
-              ccBase + static_cast<uint32_t>(compBlocks);
-          if (thr == 0) {
-            while (__scoped_atomic_load_n(
-                       &barrier->chunks_complete,
-                       __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) < ccTarget)
-              __builtin_amdgcn_s_sleep(1);
-          }
-        }
-        __syncthreads();
-
+        // Single-chunk AG. Same principle as MULTI_CHUNK: AG only depends on
+        // local reduce completion, no cross-PE barrier needed.
+        const uint32_t ccTarget =
+            ccBase + static_cast<uint32_t>(compBlocks);
         if (thr == 0) {
-          HSAuint64* myFlag =
-              reinterpret_cast<HSAuint64*>(flagsMemObj->localPtr);
-          __hip_atomic_fetch_add(myFlag, 1ULL,
-                                 __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
-        }
-
-        if (thr < npes && thr != myPe) {
-          const int pe = thr;
-          const uint64_t expected = reduceCompleteBase + 1ULL;
-          HSAuint64* remoteFlag =
-              reinterpret_cast<HSAuint64*>(flagsMemObj->peerPtrs[pe]);
-          while (core::AtomicLoadRelaxed(remoteFlag) < expected)
+          while (__scoped_atomic_load_n(
+                     &barrier->chunks_complete,
+                     __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) < ccTarget)
             __builtin_amdgcn_s_sleep(1);
         }
+        __syncthreads();
 
         if (thr < npes && thr != myPe) {
           const int destPe = thr;
