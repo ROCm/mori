@@ -80,7 +80,6 @@ __global__ void lat_block(double* data_d, size_t len_doubles, int pe, int iter) 
   }
 }
 
-
 void launch_latency(PutScope scope, double* data_d, size_t len_doubles, int my_pe, int count,
                     int threads_per_block, int device_warp_size) {
   switch (scope) {
@@ -200,8 +199,9 @@ int main(int argc, char** argv) {
 
   if (my_pe == 0) {
     const int block_threads = LatencyBlockThreads(phase, args.threads_per_block, device_warp_size);
-    PrintPerfTable("p2p_get_latency unidirection", ScopeToChar(phase), 1, block_threads, device_warp_size,
-                   args.iters, args.warmup, PerfTableMetric::kLatencyUs, lat_table);
+    PrintPerfTable("p2p_get_latency unidirection", ScopeToChar(phase), 1, block_threads,
+                   device_warp_size, args.iters, args.warmup, PerfTableMetric::kLatencyUs,
+                   lat_table);
   }
   ShmemBarrierAll();
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());

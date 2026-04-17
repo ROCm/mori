@@ -1,3 +1,24 @@
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 #include "util.hpp"
 
 #include <cstdlib>
@@ -23,9 +44,9 @@ void PrintUsage(const char* program) {
       "  -c grid_x      CUDA/HIP grid x (blocks)\n"
       "  -t threads     threads per block\n"
       "  -s scope       thread | warp | block (put_bw/ring: default block; put_latency: block)\n"
+      "  -q num_qps     number of QPs to use concurrently (default 1, max MORI_NUM_QP_PER_PE)\n"
       "  -B             bidirectional (p2p_put_bw only; ignored elsewhere)\n"
-      "  -h             this help\n"
-      "  ring_put_bw: N-PE ring; same -c/-t/-s as p2p_put_bw, peer=(pe+1)%%np.\n",
+      "  -h             this help\n",
       program != nullptr ? program : "program");
 }
 
@@ -37,7 +58,7 @@ int ParseArgs(int argc, char** argv, PerfArgs* out_args) {
   *out_args = PerfArgs{};
 
   int opt = 0;
-  while ((opt = getopt(argc, argv, "hBb:e:f:n:w:c:t:s:")) != -1) {
+  while ((opt = getopt(argc, argv, "hBb:e:f:n:w:c:t:s:q:")) != -1) {
     switch (opt) {
       case 'h':
         return 2;
@@ -76,6 +97,9 @@ int ParseArgs(int argc, char** argv, PerfArgs* out_args) {
           return 1;
         }
         break;
+      case 'q':
+        out_args->num_qps = std::atoi(optarg);
+        break;
       default:
         return 1;
     }
@@ -93,30 +117,41 @@ static std::string fmt_size(std::size_t bytes) {
 
 void PrintPerfTable(const char* test_name, const char* scope_name, int grid_x, int block_threads,
                     int warp_size, std::size_t iters, std::size_t warmup, PerfTableMetric metric,
-                    const std::vector<PerfTableRow>& rows) {
+                    const std::vector<PerfTableRow>& rows, int num_qps) {
   const char* scope_col = (scope_name != nullptr && scope_name[0] != '\0') ? scope_name : "None";
   const char* default_tag =
-      (metric == PerfTableMetric::kBandwidthGbps) ? "shmem_put_bw" : "shmem_put_latency";
+      (metric == PerfTableMetric::kBandwidthGbps) ? "p2p_put_bw" : "p2p_put_latency";
   const char* tag = (test_name != nullptr && test_name[0] != '\0') ? test_name : default_tag;
 
-  std::printf("# %s scope=%s grid=%d block=%d warpSize=%d iters=%zu warmup=%zu\n", tag, scope_col,
-              grid_x, block_threads, warp_size, iters, warmup);
+  std::printf("# %s scope=%s grid=%d block=%d warpSize=%d iters=%zu warmup=%zu qps=%d\n", tag,
+              scope_col, grid_x, block_threads, warp_size, iters, warmup, num_qps);
 
-  constexpr int kWSize = 14;
-  constexpr int kWScope = 12;
-  constexpr int kVal = 18;
-  const char* val_header =
-      (metric == PerfTableMetric::kBandwidthGbps) ? "Bandwidth (GB)" : "latency(us)";
-  const int prec = 6;
+  constexpr int kWSize = 10;
+  constexpr int kWScope = 8;
+  constexpr int kVal = 16;
 
-  std::printf("%-*s %-*s %-*s\n", kWSize, "size", kWScope, "scope", kVal, val_header);
+  const bool is_bw = (metric == PerfTableMetric::kBandwidthGbps);
+  const char* val_header = is_bw ? "Bandwidth (GB/s)" : "latency";
+
+  std::printf("%-*s %-*s %*s\n", kWSize, "size", kWScope, "scope", kVal, val_header);
+
   for (const PerfTableRow& r : rows) {
     std::string sz = fmt_size(r.size_bytes);
     if (r.skipped) {
-      std::printf("%-*s %-*s %-*s\n", kWSize, sz.c_str(), kWScope, scope_col, kVal, "skip");
+      std::printf("%-*s %-*s %*s\n", kWSize, sz.c_str(), kWScope, scope_col, kVal, "skip");
+    } else if (is_bw) {
+      char buf[32];
+      std::snprintf(buf, sizeof(buf), "%.3f GB/s", r.value);
+      std::printf("%-*s %-*s %*s\n", kWSize, sz.c_str(), kWScope, scope_col, kVal, buf);
     } else {
-      std::printf("%-*s %-*s %-*.*f\n", kWSize, sz.c_str(), kWScope, scope_col, kVal, prec,
-                  r.value);
+      // Auto-scale latency: use ms when >= 1000 µs, else µs.
+      char buf[32];
+      if (r.value >= 1000.0) {
+        std::snprintf(buf, sizeof(buf), "%.3f ms", r.value / 1000.0);
+      } else {
+        std::snprintf(buf, sizeof(buf), "%.3f µs", r.value);
+      }
+      std::printf("%-*s %-*s %*s\n", kWSize, sz.c_str(), kWScope, scope_col, kVal, buf);
     }
   }
   std::fflush(stdout);
@@ -143,9 +178,9 @@ int PerfInit(int argc, char** argv, struct PerfContext* ctx) {
   }
 
   if (args.min_size > args.max_size || args.step_factor < 2 || args.iters < 1 || args.nblocks < 1 ||
-      args.threads_per_block < 1) {
+      args.threads_per_block < 1 || args.num_qps < 1) {
     if (ctx->world_rank == 0) {
-      std::fprintf(stderr, "Invalid arguments (need iters >= 1, nblocks/threads >= 1).\n");
+      std::fprintf(stderr, "Invalid arguments (need iters >= 1, nblocks/threads/qps >= 1).\n");
     }
     MPI_Finalize();
     return 1;

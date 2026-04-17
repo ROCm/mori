@@ -48,6 +48,7 @@ inline constexpr int kDefaultNumBlocks = 32;
 inline constexpr int kDefaultThreadsPerBlock = 256;
 
 inline constexpr int kDefaultQpId = 1;
+inline constexpr int kDefaultNumQps = 1;
 inline constexpr float kMsToS = 1000.0f;
 inline constexpr float kMsToUs = 1000.0f;
 inline constexpr double kBToGb = 1e9;
@@ -62,6 +63,7 @@ struct PerfArgs {
   int threads_per_block = kDefaultThreadsPerBlock;
   PutScope put_scope = PutScope::kBlock;
   bool bidirectional = false;
+  int num_qps = kDefaultNumQps;
 };
 
 struct PerfContext {
@@ -109,10 +111,10 @@ struct PerfTableRow {
   double value{};
 };
 
-// PE 0 only. test_name e.g. shmem_put_bw_uni / shmem_put_latency_uni; value column from metric.
+// PE 0 only. test_name e.g. p2p_put_bw unidirection; value column from metric.
 void PrintPerfTable(const char* test_name, const char* scope_name, int grid_x, int block_threads,
                     int warp_size, std::size_t iters, std::size_t warmup, PerfTableMetric metric,
-                    const std::vector<PerfTableRow>& rows);
+                    const std::vector<PerfTableRow>& rows, int num_qps = 1);
 
 inline const char* ScopeToChar(PutScope scope) {
   switch (scope) {
@@ -130,7 +132,7 @@ inline const char* ScopeToChar(PutScope scope) {
 }
 
 inline bool size_ok(PutScope scope, size_t size_bytes, int nblocks, int threads_per_block,
-                    int device_warp_size) {
+                    int device_warp_size, int num_qps = 1) {
   if (size_bytes == 0 || size_bytes % sizeof(double) != 0) {
     return false;
   }
@@ -150,9 +152,12 @@ inline bool size_ok(PutScope scope, size_t size_bytes, int nblocks, int threads_
     if (nw <= 0) {
       return false;
     }
-    return per_block % static_cast<size_t>(nw) == 0;
+    // Each warp's chunk must be evenly divisible across num_qps.
+    return (per_block % static_cast<size_t>(nw) == 0) &&
+           ((per_block / static_cast<size_t>(nw)) % static_cast<size_t>(num_qps) == 0);
   }
-  return true;
+  // block scope: per_block must split evenly across num_qps.
+  return per_block % static_cast<size_t>(num_qps) == 0;
 }
 
 inline bool latency_size_ok(PutScope scope, size_t len_doubles, int threads_per_block,

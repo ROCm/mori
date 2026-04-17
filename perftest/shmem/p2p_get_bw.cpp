@@ -218,7 +218,8 @@ int main(int argc, char** argv) {
 
   ShmemBarrierAll();
   if (my_pe == 0) {
-    const char* test_name = args.bidirectional ? "p2p_get_bw bidirection" : "p2p_get_bw unidirection";
+    const char* test_name =
+        args.bidirectional ? "p2p_get_bw bidirection" : "p2p_get_bw unidirection";
     PrintPerfTable(test_name, scope_name, args.nblocks, args.threads_per_block,
                    ctx.device_warp_size, args.iters, args.warmup, PerfTableMetric::kBandwidthGbps,
                    bandwidth_table);
