@@ -140,6 +140,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         combine_block_num,
         combine_warp_per_block,
         total_recv_num_token,
+        repeat=1,
     ):
         (
             _,
@@ -151,30 +152,31 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
 
         e2e_graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(e2e_graph):
-            (
-                e2e_dispatch_output,
-                _,
-                _,
-                e2e_dispatch_indices,
-                e2e_dispatch_recv_num_token,
-            ) = op.dispatch(
-                all_rank_input[self.config.rank],
-                all_rank_weights[self.config.rank],
-                # None,
-                all_rank_scales[self.config.rank],
-                all_rank_indices[self.config.rank],
-                block_num=dispatch_block_num,
-                warp_per_block=dispatch_warp_per_block,
-            )
-            e2e_combine_arg = self._get_combine_input(op, e2e_dispatch_output)
-            e2e_combine_output, _ = op.combine(
-                e2e_combine_arg,
-                # dispatch_weights,
-                None,
-                e2e_dispatch_indices,
-                block_num=combine_block_num,
-                warp_per_block=combine_warp_per_block,
-            )
+            for _ in range(repeat):
+                (
+                    e2e_dispatch_output,
+                    _,
+                    _,
+                    e2e_dispatch_indices,
+                    _,
+                ) = op.dispatch(
+                    all_rank_input[self.config.rank],
+                    all_rank_weights[self.config.rank],
+                    # None,
+                    all_rank_scales[self.config.rank],
+                    all_rank_indices[self.config.rank],
+                    block_num=dispatch_block_num,
+                    warp_per_block=dispatch_warp_per_block,
+                )
+                e2e_combine_arg = self._get_combine_input(op, e2e_dispatch_output)
+                _, _ = op.combine(
+                    e2e_combine_arg,
+                    # dispatch_weights,
+                    None,
+                    e2e_dispatch_indices,
+                    block_num=combine_block_num,
+                    warp_per_block=combine_warp_per_block,
+                )
         self.sync()
 
         return e2e_graph
@@ -318,6 +320,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
                 combine_block_num,
                 combine_warp_per_block,
                 total_recv_num_token,
+                repeat=graph_replay_iters,
             )
 
         round_start_events = [
@@ -329,24 +332,17 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         round_end_events = [
             torch.cuda.Event(enable_timing=True) for _ in range(graph_replay_iters)
         ]
-        e2e_start_events = [
-            torch.cuda.Event(enable_timing=True) for _ in range(graph_replay_iters)
-        ]
-        e2e_end_events = [
-            torch.cuda.Event(enable_timing=True) for _ in range(graph_replay_iters)
-        ]
+        e2e_start_event = torch.cuda.Event(enable_timing=True)
+        e2e_end_event = torch.cuda.Event(enable_timing=True)
 
+        dist.barrier()
+        torch.cuda.synchronize()
         for i in range(graph_replay_iters):
             round_start_events[i].record()
             dispatch_graph.replay()
             mid_events[i].record()
             combine_graph.replay()
             round_end_events[i].record()
-
-            if e2e_graph is not None:
-                e2e_start_events[i].record()
-                e2e_graph.replay()
-                e2e_end_events[i].record()
 
         torch.cuda.synchronize()
         disp_duration = (
@@ -363,13 +359,17 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             )
             / graph_replay_iters
         )
+
         if e2e_graph is not None:
+            dist.barrier()
+            torch.cuda.synchronize()
+            e2e_start_event.record()
+            e2e_graph.replay()  # contains graph_replay_iters iterations
+            e2e_end_event.record()
+
+            torch.cuda.synchronize()
             e2e_duration = (
-                sum(
-                    start_event.elapsed_time(end_event)
-                    for start_event, end_event in zip(e2e_start_events, e2e_end_events)
-                )
-                / graph_replay_iters
+                e2e_start_event.elapsed_time(e2e_end_event) / graph_replay_iters
             )
         else:
             e2e_duration = -1.0

@@ -25,25 +25,14 @@ Run the following command on each node and replace `node_rank` with its actual r
 ```bash
 export GLOO_SOCKET_IFNAME=ens14np0
 export MORI_RDMA_DEVICES=^mlx5_0,mlx5_1  # Optional: use `^` prefix to exclude specified devices
+export GPU_PER_NODE=8
 
-torchrun --nnodes=2 --node_rank=0 --nproc_per_node=8 \
+# nproc_per_node=1: the script spawns GPU_PER_NODE worker processes internally via torch.multiprocessing.spawn
+torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
     --master_addr="10.194.129.65" --master_port=1234 \
-    examples/ops/dispatch_combine/test_dispatch_combine_internode.py --bench
+    examples/ops/dispatch_combine/test_dispatch_combine_internode.py \
+    --cmd bench --num-qp 2
 ```
-
-The output includes total number of tokens received, total number of RDMA tokens received, and total bandwidth (XGMI + RDMA combined). To calculate RDMA-only bandwidth:
-
-```
-RDMA BW = Total BW × (RDMA tokens / Total tokens)
-```
-
-## NIC Selection
-
-For RoCE networks, you can specify which RDMA devices to use with the `MORI_RDMA_DEVICES` environment variable:
-
-- **Include specific devices**: `MORI_RDMA_DEVICES=mlx5_0,mlx5_1`
-- **Exclude devices**: `MORI_RDMA_DEVICES=^mlx5_2,mlx5_3` (use `^` prefix to exclude specified devices)
-- **Default**: If not set, all available RDMA devices will be used
 
 ## Bandwidth Computation
 
@@ -130,10 +119,10 @@ Look for the line:
 
 *Mori* — run the bench script with `--cmd bench`:
 ```
-torchrun --nnodes=2 --node_rank=0 --nproc_per_node=8 ... \
-    test_dispatch_combine_internode.py --max-tokens 128 --cmd bench
+GPU_PER_NODE=8 torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 ... \
+    test_dispatch_combine_internode.py --max-tokens 128 --cmd bench --num-qp 2
 ```
-Look for the line printed by `run_bench_once` (line 770):
+Look for the line printed by `run_bench_once` (line 786):
 ```
 rank 8 recv 26757 tokens 8166 rdma tokens
 ```
@@ -374,14 +363,26 @@ Run on each node, substituting `node_rank` and `master_addr` as in the [Inter-no
 ```bash
 export GLOO_SOCKET_IFNAME=ens14np0
 export MORI_RDMA_DEVICES=^mlx5_0,mlx5_1  # optional
+export GPU_PER_NODE=8
 
-torchrun --nnodes=2 --node_rank=0 --nproc_per_node=8 \
+# nproc_per_node=1: the script spawns GPU_PER_NODE worker processes internally via torch.multiprocessing.spawn
+torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
     --master_addr="10.194.129.65" --master_port=1234 \
     examples/ops/dispatch_combine/test_dispatch_combine_internode.py \
-    --cmd profile --kernel-type v1
+    --cmd profile --kernel-type v1 --num-qp 2
 ```
 
-Repeat for `--kernel-type v1_ll` and `--kernel-type async_ll`.  Traces land as `trace_rank_<rank>_<timestamp>.json` in the current working directory.
+Repeat for `--kernel-type v1_ll` and `--kernel-type async_ll`.  **Note:** `async_ll` requires `MORI_ENABLE_SDMA=1`; all other kernel types require `MORI_ENABLE_SDMA=0`:
+
+```bash
+# async_ll
+MORI_ENABLE_SDMA=1 torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
+    --master_addr="10.194.129.65" --master_port=1234 \
+    examples/ops/dispatch_combine/test_dispatch_combine_internode.py \
+    --cmd profile --kernel-type async_ll --num-qp 2
+```
+
+Traces land as `trace_rank_<rank>_<timestamp>.json` in the current working directory.
 
 ### Analyzing traces with `analyze_ep_kernel_trace.py`
 
