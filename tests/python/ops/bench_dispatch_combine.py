@@ -33,6 +33,8 @@ import os
 
 os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "6G")
 
+_BW_NOISE_MARGIN = 1.0
+
 
 class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
     def __init__(
@@ -269,6 +271,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         combine_block_num,
         combine_warp_per_block,
         graph_replay_iters=10,
+        skip_e2e=False,
     ):
         (
             _,
@@ -306,10 +309,8 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
 
         is_cross_type = self.combine_data_type != self.config.data_type
 
-        # e2e graph not supported for cross-type (graph capture cannot
-        # allocate memory for type conversion).
         e2e_graph = None
-        if not is_cross_type:
+        if not skip_e2e and not is_cross_type:
             e2e_graph = self._capture_e2e_graph(
                 op,
                 test_data,
@@ -414,6 +415,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         warmup=1,
         iters=10,
         graph_replay_iters=10,
+        skip_e2e=False,
     ):
         test_data = self.gen_test_data()
         for _ in range(warmup):
@@ -453,6 +455,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
                 combine_block_num,
                 combine_warp_per_block,
                 graph_replay_iters=graph_replay_iters,
+                skip_e2e=skip_e2e,
             )
 
             disp_dur_list = [torch.zeros(1) for _ in range(self.config.world_size)]
@@ -475,16 +478,16 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
                 comb_bytes_list, torch.tensor([comb_total_bytes / (1024**2)])
             )
 
-            disp_duration_us_list.append([int(t.item()) for t in disp_dur_list])
-            disp_bandwidth_GB_list.append([int(t.item()) for t in disp_bw_list])
-            comb_duration_us_list.append([int(t.item()) for t in comb_dur_list])
-            comb_bandwidth_GB_list.append([int(t.item()) for t in comb_bw_list])
-            e2e_duration_us_list.append([int(t.item()) for t in e2e_dur_list])
+            disp_duration_us_list.append([round(t.item(), 1) for t in disp_dur_list])
+            disp_bandwidth_GB_list.append([round(t.item(), 2) for t in disp_bw_list])
+            comb_duration_us_list.append([round(t.item(), 1) for t in comb_dur_list])
+            comb_bandwidth_GB_list.append([round(t.item(), 2) for t in comb_bw_list])
+            e2e_duration_us_list.append([round(t.item(), 1) for t in e2e_dur_list])
             disp_avg_bytes_MB_list.append(
-                int(torch.tensor(disp_bytes_list).mean().item())
+                round(torch.tensor(disp_bytes_list).mean().item(), 2)
             )
             comb_avg_bytes_MB_list.append(
-                int(torch.tensor(comb_bytes_list).mean().item())
+                round(torch.tensor(comb_bytes_list).mean().item(), 2)
             )
 
         max_disp_algo_bw = 0
@@ -496,31 +499,31 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             comb_algo_bw = sum(comb_bandwidth_GB_list[i]) / self.config.world_size
             max_disp_algo_bw = max(max_disp_algo_bw, disp_algo_bw)
             max_comb_algo_bw = max(max_comb_algo_bw, comb_algo_bw)
-            disp_max_lat = max(disp_duration_us_list[i])
-            comb_max_lat = max(comb_duration_us_list[i])
-            min_disp_latency_us = min(min_disp_latency_us, disp_max_lat)
-            min_comb_latency_us = min(min_comb_latency_us, comb_max_lat)
+            disp_avg_lat = sum(disp_duration_us_list[i]) / self.config.world_size
+            comb_avg_lat = sum(comb_duration_us_list[i]) / self.config.world_size
+            min_disp_latency_us = min(min_disp_latency_us, disp_avg_lat)
+            min_comb_latency_us = min(min_comb_latency_us, comb_avg_lat)
 
         if self.config.rank == 0:
             print("Dispatch result:")
             for i, duration_us in enumerate(disp_duration_us_list):
                 algo_bw = sum(disp_bandwidth_GB_list[i]) / self.config.world_size
-                lat = max(duration_us)
+                avg_lat = sum(duration_us) / self.config.world_size
                 print(
                     f"Round {i} duration(us) {duration_us} "
                     f"bandwidth(GB/s) {disp_bandwidth_GB_list[i]} "
-                    f"avg bytes(MB) {disp_avg_bytes_MB_list[i]} lat {lat} bw {algo_bw} / {algo_bw * ll_mode_scale:.2f}"
+                    f"avg bytes(MB) {disp_avg_bytes_MB_list[i]} lat {avg_lat:.1f} bw {algo_bw:.2f} / {algo_bw * ll_mode_scale:.2f}"
                 )
 
             print()
             print("Combine result:")
             for i, duration_us in enumerate(comb_duration_us_list):
                 algo_bw = sum(comb_bandwidth_GB_list[i]) / self.config.world_size
-                lat = max(duration_us)
+                avg_lat = sum(duration_us) / self.config.world_size
                 print(
                     f"Round {i} duration(us) {duration_us} "
                     f"bandwidth(GB/s) {comb_bandwidth_GB_list[i]} "
-                    f"avg bytes(MB) {comb_avg_bytes_MB_list[i]} lat {lat} bw {algo_bw} / {algo_bw * ll_mode_scale:.2f}"
+                    f"avg bytes(MB) {comb_avg_bytes_MB_list[i]} lat {avg_lat:.1f} bw {algo_bw:.2f} / {algo_bw * ll_mode_scale:.2f}"
                 )
 
             print()
@@ -579,6 +582,121 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
                 print(f"Round {i} begin")
             g.replay()
             torch.cuda.synchronize()
+
+
+def _save_intranode_tuning_result(
+    config_path,
+    world_size,
+    max_num_inp_token_per_rank,
+    dispatch_hidden_dim,
+    combine_hidden_dim,
+    data_type,
+    combine_data_type,
+    quant_type,
+    best_disp_config,
+    best_disp_bw,
+    best_comb_config,
+    best_comb_bw,
+    zero_copy=True,
+    best_disp_lat=None,
+    best_comb_lat=None,
+):
+    from pathlib import Path
+    from mori.ops.tuning_config import (
+        TuningConfigManager,
+        dtype_to_config_str,
+        build_config_filename,
+        quant_type_to_config_str,
+        detect_gpu_model,
+    )
+    from mori.jit.config import detect_gpu_arch
+
+    gpu_arch = detect_gpu_arch()
+    gpu_model = detect_gpu_model()
+    disp_dtype_str = dtype_to_config_str(data_type)
+    comb_dtype_str = dtype_to_config_str(combine_data_type)
+    qt_str = quant_type_to_config_str(quant_type)
+
+    metadata = {
+        "gpu_arch": gpu_arch,
+        "gpu_model": gpu_model,
+        "kernel_type": "IntraNode",
+        "ep_size": world_size,
+    }
+
+    dispatch_entry = {
+        "dtype": disp_dtype_str,
+        "num_tokens": max_num_inp_token_per_rank,
+        "hidden_dim": dispatch_hidden_dim,
+        "block_num": best_disp_config[0],
+        "rdma_block_num": 0,
+        "warp_per_block": best_disp_config[1],
+        "bandwidth_gbps": round(best_disp_bw, 2),
+        "latency_us": round(best_disp_lat, 2) if best_disp_lat is not None else None,
+    }
+
+    combine_entry = {
+        "dtype": comb_dtype_str,
+        "num_tokens": max_num_inp_token_per_rank,
+        "hidden_dim": combine_hidden_dim,
+        "zero_copy": bool(zero_copy),
+        "quant_type": qt_str,
+        "block_num": best_comb_config[0],
+        "rdma_block_num": 0,
+        "warp_per_block": best_comb_config[1],
+        "bandwidth_gbps": round(best_comb_bw, 2),
+        "latency_us": round(best_comb_lat, 2) if best_comb_lat is not None else None,
+    }
+
+    if config_path == "auto":
+        repo_tuning_dir = (
+            Path(__file__).resolve().parents[3]
+            / "python"
+            / "mori"
+            / "ops"
+            / "tuning_configs"
+        )
+        dispatch_path = str(
+            repo_tuning_dir
+            / build_config_filename(
+                gpu_arch,
+                "IntraNode",
+                world_size,
+                gpu_model,
+                "dispatch",
+            )
+        )
+        combine_path = str(
+            repo_tuning_dir
+            / build_config_filename(
+                gpu_arch,
+                "IntraNode",
+                world_size,
+                gpu_model,
+                "combine",
+            )
+        )
+    else:
+        base = config_path.rsplit(".", 1)[0] if "." in config_path else config_path
+        dispatch_path = f"{base}_dispatch.json"
+        combine_path = f"{base}_combine.json"
+
+    dispatch_metadata = {**metadata, "phase": "dispatch"}
+    combine_metadata = {**metadata, "phase": "combine"}
+
+    TuningConfigManager.save_tuning_result(
+        dispatch_path,
+        dispatch_metadata,
+        dispatch_entry,
+        phase="dispatch",
+    )
+    TuningConfigManager.save_tuning_result(
+        combine_path,
+        combine_metadata,
+        combine_entry,
+        phase="combine",
+    )
+    print(f"Tuning config saved to: {dispatch_path} + {combine_path}")
 
 
 LaunchConfig = namedtuple(
@@ -642,6 +760,7 @@ def _bench_dispatch_combine(
     combine_warp_per_block_arg=None,
     combine_data_type=None,
     max_total_recv_tokens=0,
+    save_tuning_config=None,
 ):
     if combine_data_type is None:
         combine_data_type = data_type
@@ -653,8 +772,11 @@ def _bench_dispatch_combine(
     else:
         combine_hidden_dim = hidden_dim
 
-    if quant_type == "fp8_direct_cast" and data_type is not torch.bfloat16:
-        raise ValueError("fp8_direct_cast is only supported for bfloat16 data type")
+    if quant_type == "fp8_direct_cast" and combine_data_type is not torch.bfloat16:
+        raise ValueError(
+            "fp8_direct_cast quant requires combine dtype to be bfloat16, "
+            f"got {combine_data_type}"
+        )
 
     config = mori.ops.EpDispatchCombineConfig(
         data_type=data_type,
@@ -750,40 +872,57 @@ def _bench_dispatch_combine(
                     "Warning: dispatch/combine block/warp arguments are ignored when --cmd tuning"
                 )
             sm_count = torch.cuda.get_device_properties(rank).multi_processor_count
+            tuning_scope = os.environ.get("MORI_TUNING_SCOPE", "full")
 
-            # Build full dispatch candidate set (includes over-subscribe)
-            max_disp_block_num = max(sm_count * 4, 320)
-            all_block_set = set()
-            all_block_set.update(range(32, sm_count + 1, 8))
-            pow2 = 32
-            while pow2 <= max_disp_block_num:
-                all_block_set.add(pow2)
-                pow2 <<= 1
-            for anchor in [224, 256]:
-                for delta in [-32, -16, -8, -4, -1, 0, 1, 4, 8, 16, 32]:
-                    v = anchor + delta
-                    if 32 <= v <= max_disp_block_num:
-                        all_block_set.add(v)
-            for mult in [1, 2, 3, 4]:
-                all_block_set.add(sm_count * mult)
+            if tuning_scope == "quick":
+                block_set = set()
+                pow2 = 32
+                while pow2 <= sm_count:
+                    block_set.add(pow2)
+                    pow2 <<= 1
+                block_set.add(sm_count)
+                common_block_list = sorted(block_set)
+                warp_per_block_list = [4, 8, 16]
+            else:
+                max_disp_block_num = max(sm_count * 4, 320)
+                all_block_set = set()
+                all_block_set.update(range(32, sm_count + 1, 8))
+                pow2 = 32
+                while pow2 <= max_disp_block_num:
+                    all_block_set.add(pow2)
+                    pow2 <<= 1
+                for anchor in [224, 256]:
+                    for delta in [-32, -16, -8, -4, -1, 0, 1, 4, 8, 16, 32]:
+                        v = anchor + delta
+                        if 32 <= v <= max_disp_block_num:
+                            all_block_set.add(v)
+                for mult in [1, 2, 3, 4]:
+                    all_block_set.add(sm_count * mult)
+                common_block_list = sorted(v for v in all_block_set if v <= sm_count)
+                warp_per_block_list = [4, 5, 6, 8, 10, 12, 14, 15, 16]
 
-            common_block_list = sorted(v for v in all_block_set if v <= sm_count)
-            extra_disp_block_list = sorted(v for v in all_block_set if v > sm_count)
+            # Over-subscribe disabled by default (hang risk)
+            extra_disp_block_list = []
 
-            warp_per_block_list = [4, 5, 6, 8, 10, 12, 14, 15, 16]
-
+            total_configs = len(common_block_list) * len(warp_per_block_list)
             if rank == 0:
                 print(
-                    f"SM count={sm_count}\n"
-                    f"Common block_num candidates ({len(common_block_list)}): {common_block_list}\n"
-                    f"Extra dispatch block_num candidates ({len(extra_disp_block_list)}): {extra_disp_block_list}\n"
-                    f"warp_per_block candidates: {warp_per_block_list}"
+                    f"SM count={sm_count}, tuning_scope={tuning_scope}\n"
+                    f"block_num candidates ({len(common_block_list)}): {common_block_list}\n"
+                    f"warp_per_block candidates ({len(warp_per_block_list)}): {warp_per_block_list}\n"
+                    f"Total configurations: {total_configs}"
                 )
+                if extra_disp_block_list:
+                    print(
+                        f"Extra dispatch block_num candidates ({len(extra_disp_block_list)}): {extra_disp_block_list}"
+                    )
 
             best_disp_bw = 0
             best_comb_bw = 0
             best_disp_config = None
             best_comb_config = None
+            best_disp_lat = float("inf")
+            best_comb_lat = float("inf")
 
             # Common sweep uses the same block/warp for both dispatch and combine
             # to keep the search space manageable. Asymmetric configs (different
@@ -801,20 +940,23 @@ def _bench_dispatch_combine(
                         print(f"block_num={block_num}, warp_per_block={warp_per_block}")
                         print(f"{'=' * 60}")
 
-                    disp_bw, comb_bw, _, _ = benchmark.run(
+                    disp_bw, comb_bw, disp_lat, comb_lat = benchmark.run(
                         op,
                         dispatch_block_num=block_num,
                         dispatch_warp_per_block=warp_per_block,
                         combine_block_num=block_num,
                         combine_warp_per_block=warp_per_block,
+                        skip_e2e=True,
                     )
 
-                    if disp_bw > best_disp_bw:
+                    if disp_bw > best_disp_bw + _BW_NOISE_MARGIN:
                         best_disp_bw = disp_bw
                         best_disp_config = (block_num, warp_per_block)
-                    if comb_bw > best_comb_bw:
+                        best_disp_lat = disp_lat
+                    if comb_bw > best_comb_bw + _BW_NOISE_MARGIN:
                         best_comb_bw = comb_bw
                         best_comb_config = (block_num, warp_per_block)
+                        best_comb_lat = comb_lat
 
             # --- Extra dispatch sweep: over-subscribe, fix combine at best ---
             if extra_disp_block_list:
@@ -835,17 +977,19 @@ def _bench_dispatch_combine(
                             )
                             print(f"{'=' * 60}")
 
-                        disp_bw, _, _, _ = benchmark.run(
+                        disp_bw, _, disp_lat, _ = benchmark.run(
                             op,
                             dispatch_block_num=block_num,
                             dispatch_warp_per_block=warp_per_block,
                             combine_block_num=best_comb_config[0],
                             combine_warp_per_block=best_comb_config[1],
+                            skip_e2e=True,
                         )
 
-                        if disp_bw > best_disp_bw:
+                        if disp_bw > best_disp_bw + _BW_NOISE_MARGIN:
                             best_disp_bw = disp_bw
                             best_disp_config = (block_num, warp_per_block)
+                            best_disp_lat = disp_lat
 
             if rank == 0:
                 print(f"\n{'=' * 60}")
@@ -855,13 +999,34 @@ def _bench_dispatch_combine(
                 comb_dtype_str = str(combine_data_type).split(".")[-1]
                 print(
                     f"Best Dispatch  ({disp_dtype_str}): {best_disp_bw:.2f} GB/s "
+                    f"latency={best_disp_lat:.1f} us "
                     f"at block_num={best_disp_config[0]}, warp_per_block={best_disp_config[1]}"
                 )
                 print(
                     f"Best Combine   ({comb_dtype_str}): {best_comb_bw:.2f} GB/s "
+                    f"latency={best_comb_lat:.1f} us "
                     f"at block_num={best_comb_config[0]}, warp_per_block={best_comb_config[1]}"
                 )
                 print(f"{'=' * 60}")
+
+                if save_tuning_config and best_disp_config and best_comb_config:
+                    _save_intranode_tuning_result(
+                        save_tuning_config,
+                        world_size=world_size,
+                        max_num_inp_token_per_rank=max_num_inp_token_per_rank,
+                        dispatch_hidden_dim=hidden_dim,
+                        combine_hidden_dim=combine_hidden_dim,
+                        data_type=data_type,
+                        combine_data_type=combine_data_type,
+                        quant_type=quant_type,
+                        best_disp_config=best_disp_config,
+                        best_disp_bw=best_disp_bw,
+                        best_comb_config=best_comb_config,
+                        best_comb_bw=best_comb_bw,
+                        zero_copy=bool(zero_copy),
+                        best_disp_lat=best_disp_lat,
+                        best_comb_lat=best_comb_lat,
+                    )
 
         else:
             raise ValueError(f"Unknown command: {cmd}")
@@ -883,6 +1048,7 @@ def bench_dispatch_combine(
     num_experts_per_token=8,
     combine_data_type=None,
     max_total_recv_tokens=0,
+    save_tuning_config=None,
 ):
     if combine_data_type is None:
         combine_data_type = dtype
@@ -895,8 +1061,8 @@ def bench_dispatch_combine(
             max_num_inp_token_per_rank,
             dtype,
             hidden_dim,
-            0,  # scale_dim
-            0,  # scale_type_size
+            32,  # scale_dim
+            4,  # scale_type_size
             num_experts_per_rank,
             num_experts_per_token,
             cmd,
@@ -908,6 +1074,7 @@ def bench_dispatch_combine(
             combine_warp_per_block,
             combine_data_type,
             max_total_recv_tokens,
+            save_tuning_config,
         ),
         nprocs=world_size,
         join=True,
@@ -1021,6 +1188,21 @@ if __name__ == "__main__":
             "When set, Phase 2 creates a separate op with this dtype. "
         ),
     )
+    parser.add_argument(
+        "--hidden-dim",
+        type=int,
+        default=7168,
+        help="Base hidden dimension for the model (default: 7168)",
+    )
+    parser.add_argument(
+        "--save-tuning-config",
+        type=str,
+        default=None,
+        help=(
+            "Path to save tuning results as JSON config. "
+            "Use 'auto' to auto-generate filename based on GPU/dtype/EP."
+        ),
+    )
     args = parser.parse_args()
 
     if args.num_experts_per_rank is None:
@@ -1032,7 +1214,7 @@ if __name__ == "__main__":
     dispatch_dtype = _DATA_TYPE_MAP[args.dtype]
     combine_dtype = _DATA_TYPE_MAP[combine_dtype_str]
 
-    base_hidden_dim = 7168
+    base_hidden_dim = args.hidden_dim
     dispatch_hidden_dim = (
         base_hidden_dim // 2 if _is_fp4x2_dtype(dispatch_dtype) else base_hidden_dim
     )
@@ -1040,6 +1222,7 @@ if __name__ == "__main__":
     print(
         f"Running {args.cmd} with max_tokens_per_rank: {args.max_tokens}, "
         f"dispatch_dtype: {args.dtype}, combine_dtype: {combine_dtype_str}, "
+        f"hidden_dim: {base_hidden_dim}, "
         f"world_size(EP): {args.world_size}, "
         f"num_experts_per_rank: {args.num_experts_per_rank}, "
         f"num_experts_per_token: {args.num_experts_per_token}, "
@@ -1067,4 +1250,5 @@ if __name__ == "__main__":
         num_experts_per_token=args.num_experts_per_token,
         combine_data_type=combine_dtype,
         max_total_recv_tokens=args.max_recv_total_tokens,
+        save_tuning_config=args.save_tuning_config,
     )

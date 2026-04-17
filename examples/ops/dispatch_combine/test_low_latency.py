@@ -458,8 +458,7 @@ def test_main(
 
             rank_token_counts = {}
             for i, pos in enumerate(src_token_pos[:num_total_valid_tokens]):
-                src_rank = int(pos) // config.max_num_inp_token_per_rank
-                src_id = int(pos) % config.max_num_inp_token_per_rank
+                src_rank, src_id = op.decode_send_flat_idx(int(pos))
                 recv_token = global_recv_x[i]
 
                 # Check that token values are consistent (amin == amax for first hidden-128 dims)
@@ -584,30 +583,52 @@ def test_main(
     # Separate profiling
     group.barrier()
     if multi_node:
-        dispatch_t, combine_t, dispatch_copy_t, combine_all_t = bench_kineto(
+        # Auto-discover all Ep* kernels via a short CUDA profile, then feed the
+        # collected names back into bench_kineto() for the real timing pass.
+        with suppress_stdout_stderr():
+            _disc_sched = torch.profiler.schedule(wait=1, warmup=0, active=1, repeat=1)
+            with torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CUDA], schedule=_disc_sched
+            ) as _disc_prof:
+                for _ in range(2):
+                    # Lightweight GEMM + all_reduce to avoid catching CUDA stream
+                    # tails from the previous iteration in the same profile window.
+                    _l = torch.randn((8192, 8192), dtype=torch.float, device="cuda")
+                    _r = torch.randn((8192, 8192), dtype=torch.float, device="cuda")
+                    _l @ _r
+                    dist.all_reduce(torch.ones(1, dtype=torch.float, device="cuda"))
+                    for _ in range(5):
+                        test_func(zero_copy=False, use_fp8=bench_use_fp8)
+                        torch.cuda.synchronize()
+                    torch.cuda.synchronize()
+                    _disc_prof.step()
+        _ep_kernels: list[str] = []
+        for evt in _disc_prof.key_averages():
+            name = evt.key
+            if name.startswith("EpDispatch") or name.startswith("EpCombine"):
+                if name not in _ep_kernels:
+                    _ep_kernels.append(name)
+        if not _ep_kernels:
+            raise RuntimeError(
+                "Auto-discovery did not find any Ep* kernels in the CUDA profile; "
+                "cannot measure dispatch/combine bandwidth."
+            )
+        all_kernel_names = tuple(_ep_kernels)
+
+        all_durations = bench_kineto(
             partial(
                 test_func,
                 zero_copy=False,
                 use_fp8=bench_use_fp8,
             ),
-            kernel_names=(
-                (
-                    "EpDispatchInterNodeV1Kernel",
-                    "EpCombineInterNodeV1Kernel",
-                    "EpDispatchCopyToStaging",
-                    "EpCombineAll",
-                )
-            ),
+            kernel_names=all_kernel_names,
             barrier_comm_profiling=True,
             suppress_kineto_output=True,
         )
-        print(
-            f"[rank {rank}] EpDispatchCopyToStaging avg_t={dispatch_copy_t * 1e6:.2f} us | "
-            f"EpCombineAll avg_t={combine_all_t * 1e6:.2f} us",
-            flush=True,
-        )
-        dispatch_t += dispatch_copy_t
-        combine_t += combine_all_t
+        kernel_times = {n: t for n, t in zip(all_kernel_names, all_durations)}
+
+        dispatch_t = sum(t for n, t in kernel_times.items() if "Dispatch" in n)
+        combine_t = sum(t for n, t in kernel_times.items() if "Combine" in n)
         print(
             f"[rank {rank}] Dispatch bandwidth: {num_dispatch_comm_bytes / 1e9 / dispatch_t:.2f} GB/s, avg_t={dispatch_t * 1e6:.2f} us | "
             f"Combine bandwidth: {num_combine_comm_bytes / 1e9 / combine_t:.2f} GB/s, avg_t={combine_t * 1e6:.2f} us",

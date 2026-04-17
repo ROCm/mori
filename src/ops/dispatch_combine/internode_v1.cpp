@@ -552,7 +552,8 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs<T>& args) {
       index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
       core::AtomicStoreSeqCstSystem(signal, numTokenSignal);
     }
-    if (laneId == 0) args.dispatchGridBarrier[0] = 0;
+    if (laneId == 0)
+      __hip_atomic_store(args.dispatchGridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 
     index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
     for (int destPe = nodePeOffset + laneId; destPe < (nodePeOffset + config.gpuPerNode);
@@ -569,7 +570,8 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs<T>& args) {
     if (laneId == 0) {
       args.dispTokOffsetMemObj->template GetAs<index_t*>()[0] = 0;
       atomicAdd(args.crossDeviceBarrierFlag, 1);
-      args.combineGridBarrier[1] = 0;
+      __hip_atomic_store(args.combineGridBarrier + 1, 0u, __ATOMIC_RELAXED,
+                         __HIP_MEMORY_SCOPE_AGENT);
     }
   }
 

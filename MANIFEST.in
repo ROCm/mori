@@ -7,7 +7,7 @@ prune 3rdparty/msgpack-c/.git
 include CMakeLists.txt
 recursive-include src CMakeLists.txt
 include tools/build_shmem_bitcode.sh
-recursive-include python *.py *.md *.bc
+recursive-include python *.py *.md *.bc *.json
 include pyproject.toml
 include setup.py
 include LICENSE

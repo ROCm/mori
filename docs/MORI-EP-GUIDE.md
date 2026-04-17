@@ -20,8 +20,9 @@ MORI-EP provides high-performance MoE (Mixture of Experts) dispatch and combine 
 - [7. Complete Example](#7-complete-example)
 - [8. Environment Variables](#8-environment-variables)
 - [9. Benchmarking](#9-benchmarking)
-- [10. Profiling with MORI-VIZ](#10-profiling-with-mori-viz)
-- [11. Framework Integration](#11-framework-integration)
+- [10. Tuning](#10-tuning)
+- [11. Profiling with MORI-VIZ](#11-profiling-with-mori-viz)
+- [12. Framework Integration](#12-framework-integration)
 - [Build Options](#build-options)
 - [Source Files](#source-files)
 
@@ -264,7 +265,8 @@ Get the source position of each dispatched token (for correctness verification).
 ```python
 torch.cuda.synchronize()
 src_token_pos = op.get_dispatch_src_token_pos()
-# src_token_pos[i] = src_rank * max_num_inp_token_per_rank + src_token_id
+# Encoding: src_token_pos[i] = src_rank * (world_size * max_num_inp_token_per_rank) + src_token_id
+# Use op.decode_send_flat_idx(pos) -> (src_rank, src_token_id) to decode safely.
 ```
 
 ### get_registered_combine_input_buffer()
@@ -548,7 +550,196 @@ RDMA BW = Total BW × (RDMA tokens / Total tokens)
 
 ---
 
-## 10. Profiling with MORI-VIZ
+## 10. Tuning
+
+Tuning searches for the optimal GPU launch parameters (`block_num`, `warp_per_block`, `rdma_block_num`) for each kernel/dtype/token-count combination. Results are saved to JSON config files that the auto-mode launch configuration reads at runtime.
+
+### Overview
+
+**What gets tuned:** For each combination of (kernel_type, dtype, num_tokens, hidden_dim), the tuner sweeps candidate values and picks the configuration that maximises bandwidth on the bottleneck rank.
+
+**Two-phase approach:**
+
+1. **Calibrate** — Run a small number of representative token counts (e.g. 128 and 4096) with `full` scope to explore the complete search space (~75 configs). This confirms whether the `quick` search space (~9-12 configs) covers the optimal region.
+2. **Quick sweep** — Run all token counts with `quick` scope. This is 6× faster and usually finds the same optimum because the best configs tend to cluster around the same block/warp values.
+
+The tuning scope is controlled by the `MORI_TUNING_SCOPE` environment variable (or `--tuning-scope` in the batch scripts).
+
+### Tuning Config Files
+
+Generated JSON files follow this naming convention:
+
+```
+python/mori/ops/tuning_configs/{arch}_{model}_{kernel}_ep{n}_{phase}.json
+```
+
+For example: `gfx942_mi308x_InterNodeV1_ep16_dispatch.json`
+
+Each file contains rules sorted by (dtype, hidden_dim, num_tokens):
+
+```json
+{
+  "version": "1.0",
+  "gpu_arch": "gfx942",
+  "gpu_model": "mi308x",
+  "kernel_type": "InterNodeV1",
+  "ep_size": 16,
+  "phase": "dispatch",
+  "rules": [
+    {
+      "dtype": "fp4",
+      "num_tokens": 128,
+      "hidden_dim": 3584,
+      "block_num": 64,
+      "rdma_block_num": 32,
+      "warp_per_block": 8,
+      "bandwidth_gbps": 4.13,
+      "rdma_bandwidth_gbps": 4.13,
+      "xgmi_bandwidth_gbps": 13.2,
+      "ll_bandwidth_gbps": 16.5
+    }
+  ]
+}
+```
+
+- `bandwidth_gbps` — The primary metric used for keep-best comparison (RDMA BW for v1, LL BW for v1_ll/async_ll).
+- `rdma_bandwidth_gbps` / `xgmi_bandwidth_gbps` / `ll_bandwidth_gbps` — All three BW types recorded for analysis (inter-node only).
+
+New tuning results merge into existing files using a keep-best strategy: a rule is only updated if the new bandwidth exceeds the existing one.
+
+### Intra-node Tuning
+
+Intra-node tuning runs on a single node. No SSH or multi-node setup required.
+
+**Tuning matrix** (EP2 / EP4 / EP8, 4 dtype/quant combos each = 12 groups):
+
+| EP | Dispatch dtype | Combine dtype | Quant type | Zero-copy |
+|----|---------------|---------------|------------|-----------|
+| 2, 4, 8 | fp4 | bf16 | fp8_direct_cast | yes |
+| 2, 4, 8 | fp4 | bf16 | fp8_direct_cast | no |
+| 2, 4, 8 | fp8_e4m3_fnuz | bf16 | none | yes |
+| 2, 4, 8 | fp8_e4m3_fnuz | bf16 | none | no |
+
+**Step 1: Calibrate** (optional but recommended on a new platform)
+
+Run full-scope tuning on 128 and 4096 tokens to verify quick mode covers the optimum:
+
+```bash
+# Full scope on 2 representative token counts
+bash tools/batch_intranode_tuning.sh \
+    --world-size 8 --dtype fp4 --combine-dtype bf16 \
+    --quant-type fp8_direct_cast \
+    --tokens-list "128,4096" --tuning-scope full
+```
+
+Compare the best config from full mode with a quick run on the same tokens. If they match (same block_num/warp), quick mode is safe for the full sweep.
+
+**Step 2: Quick sweep**
+
+```bash
+# Single group
+bash tools/batch_intranode_tuning.sh \
+    --world-size 8 --dtype fp4 --combine-dtype bf16 \
+    --quant-type fp8_direct_cast --tuning-scope quick
+
+# All 12 groups at once
+bash tools/run_all_intranode_tuning.sh --tuning-scope quick
+```
+
+**Scripts:**
+
+| Script | Purpose |
+|--------|---------|
+| `tools/batch_intranode_tuning.sh` | Sweep one (EP, dtype, quant, zero_copy) group across all token sizes |
+| `tools/run_all_intranode_tuning.sh` | Run all 12 intra-node groups sequentially |
+
+### Inter-node Tuning
+
+Inter-node tuning requires two nodes with passwordless SSH between them.
+
+**Prerequisites:**
+
+- Passwordless SSH from driver node (rank 0) to peer node (rank 1)
+- Same repo path on both nodes, or specify `--remote-repo-root`
+- Network interface name (`--ifname`, e.g. `bond0`, `ens50f1np1`)
+- If running inside containers: `--docker <CONTAINER>` and `--ssh-key <PATH>`
+- Kill any residual GPU processes before starting (`pkill -9 -f torchrun`)
+
+**Tuning matrix** (3 kernel types × 2 dtype combos = 6 groups):
+
+| Kernel | Dispatch dtype | Combine dtype | Quant type | BW metric for selection |
+|--------|---------------|---------------|------------|------------------------|
+| v1 | fp4 | bf16 | fp8_direct_cast | RDMA BW |
+| v1 | fp8_e4m3_fnuz | bf16 | none | RDMA BW |
+| v1_ll | fp4 | bf16 | fp8_direct_cast | LL BW |
+| v1_ll | fp8_e4m3_fnuz | bf16 | none | LL BW |
+| async_ll | fp4 | bf16 | fp8_direct_cast | LL BW |
+| async_ll | fp8_e4m3_fnuz | bf16 | none | LL BW |
+
+**Step 1: Calibrate** (on a new platform)
+
+```bash
+bash tools/batch_internode_tuning.sh \
+    --master-addr <HOST0> --peer-host <USER>@<HOST1> --ifname <IFNAME> \
+    --kernel-type v1 --num-qp 2 --dtype fp4 --combine-dtype bf16 \
+    --quant-type fp8_direct_cast \
+    --tokens-list "128,4096" --tuning-scope full
+```
+
+**Step 2: Quick sweep**
+
+```bash
+# Single group
+bash tools/batch_internode_tuning.sh \
+    --master-addr <HOST0> --peer-host <USER>@<HOST1> --ifname <IFNAME> \
+    --kernel-type v1 --num-qp 2 --dtype fp4 --combine-dtype bf16 \
+    --quant-type fp8_direct_cast --tuning-scope quick
+
+# All 6 groups at once
+bash tools/run_all_internode_tuning.sh \
+    --master-addr <HOST0> --peer-host <USER>@<HOST1> --ifname <IFNAME>
+```
+
+For docker environments, add `--docker <CONTAINER> --ssh-key <KEY>`.
+
+**Scripts:**
+
+| Script | Purpose |
+|--------|---------|
+| `tools/batch_internode_tuning.sh` | Sweep one (kernel, dtype, quant) group across all token sizes |
+| `tools/run_all_internode_tuning.sh` | Run all 6 inter-node groups sequentially |
+
+### Tuning on a New GPU Platform
+
+To tune MORI-EP on a previously unseen GPU (new arch/model):
+
+1. Build and install MORI: `pip install . --no-build-isolation`
+2. Run calibration (full scope, 128+4096 tokens) for one representative config per topology (intra-node and inter-node if applicable)
+3. Verify that quick scope produces the same best config as full scope
+4. Run the full quick sweep to generate all JSON files
+5. The generated files appear under `python/mori/ops/tuning_configs/` and are automatically loaded when `MORI_EP_LAUNCH_CONFIG_MODE=AUTO`
+
+**Expected output files** (for a gfx942 MI308X platform with EP8 intra + EP16 inter):
+
+```
+python/mori/ops/tuning_configs/
+  gfx942_mi308x_IntraNode_ep2_dispatch.json
+  gfx942_mi308x_IntraNode_ep2_combine.json
+  gfx942_mi308x_IntraNode_ep4_dispatch.json
+  gfx942_mi308x_IntraNode_ep4_combine.json
+  gfx942_mi308x_IntraNode_ep8_dispatch.json
+  gfx942_mi308x_IntraNode_ep8_combine.json
+  gfx942_mi308x_InterNodeV1_ep16_dispatch.json
+  gfx942_mi308x_InterNodeV1_ep16_combine.json
+  gfx942_mi308x_InterNodeV1LL_ep16_dispatch.json
+  gfx942_mi308x_InterNodeV1LL_ep16_combine.json
+  gfx942_mi308x_AsyncLL_ep16_dispatch.json
+  gfx942_mi308x_AsyncLL_ep16_combine.json
+```
+
+---
+
+## 11. Profiling with MORI-VIZ
 
 Build with profiling enabled:
 
@@ -571,7 +762,7 @@ Visualize at [ui.perfetto.dev](https://ui.perfetto.dev/). See [PROFILER.md](PROF
 
 ---
 
-## 11. Framework Integration
+## 12. Framework Integration
 
 MORI-EP is integrated in several LLM inference frameworks:
 
