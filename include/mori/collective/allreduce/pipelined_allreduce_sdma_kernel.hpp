@@ -5,20 +5,25 @@
 //
 // SCATTER_MODE=0: Single-kernel AllReduce (SDMA scatter + reduce + SDMA AG)
 //   1-chunk mode (shard < 2×kMinChunkShardBytes):
-//     Block 0: burst scatter → cc wait → SDMA AG → AG wait.
+//     Block 0: burst scatter → cc wait → cross-PE reduce_complete → SDMA AG → AG wait.
 //     Compute blocks: scatter-poll → reduce → wbl2+fence → chunks_complete.
-//     No signal/barrier zeroing: monotonic ATOMIC_INC + baseline protocol.
 //   Multi-chunk mode (shard ≥ 2×kMinChunkShardBytes, default 2 chunks):
-//     Block 0: burst scatter → per-chunk (cc wait → AG) → AG wait.
+//     Block 0: burst scatter → per-chunk (cc wait → cross-PE barrier → AG) → AG wait.
 //     Compute blocks: scatter-poll → reduce → wbl2+fence → chunks_complete.
 //     Overlaps AG(c) SDMA transfer with scatter(c+1)+reduce(c+1) on CU.
 //     wbl2+CC for intermediate chunks runs on wavefront 1 (thread 64),
 //     parallel with scatter-poll on wavefront 0.
-//   AG depends only on local reduce(c) completion — AllReduce semantics do
-//   not require peer reduce to be done before this PE's AG, so there is NO
-//   cross-PE barrier. The previous flags-based reduce_complete barrier was
-//   a spin-wait deadlock source under GEMM overlap (peer block 0 suspended
-//   by scheduler while local block 0 spun on peer flag).
+//
+//   Cross-PE reduce_complete barrier is REQUIRED before AG to prevent data
+//   corruption: my AG writes to peer's transit[myPe-slot] via SDMA; peer's
+//   reduce reads transit[all slots] including that slot as part of its
+//   compute. If my AG fires before peer's reduce reads, peer sees my AG
+//   value instead of the original scatter value — visible as inplace 2nd
+//   call verification failures with stale transit.
+//
+//   Barrier uses flagsMemObj (symmetric memory) + reduceCompleteBase
+//   counter — separate from qId=0 SDMA scatter signal — to avoid
+//   cross-iteration races.
 //
 // SCATTER_MODE=1: P2P read + CU AG (legacy path).
 //
@@ -123,8 +128,6 @@ __global__ void PipelinedAllReduceSdmaKernel(
     uint64_t scatterBase,
     uint64_t agBase,
     uint64_t reduceCompleteBase) {
-  (void)flagsMemObj;          // retained for ABI, no longer used
-  (void)reduceCompleteBase;   // retained for ABI, no longer used
 
   if (elementCount == 0 || npes <= 0) return;
 
@@ -313,18 +316,30 @@ __global__ void PipelinedAllReduceSdmaKernel(
       }
 
       // ==============================================================
-      // Per-chunk AG: for each chunk, wait local reduce(c) complete,
-      // then SDMA AG(c). AG(c) overlaps with reduce(c+1) on the CU.
-      // No cross-PE barrier — AllReduce's AG only needs local reduce.
+      // Per-chunk flow: for each chunk c
+      //   1. wait local reduce(c) complete  (cc_wait)
+      //   2. cross-PE barrier: wait ALL peers reduce(c) complete (flags poll)
+      //   3. SDMA AG(c)
+      //
+      // Why cross-PE barrier is REQUIRED:
+      //   My AG writes to peer's transit[myPe-slot] via SDMA. Peer's reduce
+      //   reads transit[all slots including myPe-slot-from-peer's-perspective]
+      //   as its input. If I issue AG before peer finishes reduce, peer may
+      //   read my AG-overwritten transit slot instead of the original scatter
+      //   value — corrupting peer's reduce sum.
+      //
+      //   This manifests as inplace-2nd-call verification failures when PE
+      //   timing differs enough that fast PE's AG arrives at slow PE's
+      //   transit before slow PE's reduce reads it.
+      //
+      //   The barrier uses flagsMemObj (symmetric memory) with a dedicated
+      //   counter reduceCompleteBase, separate from qId=0 SDMA scatter signal
+      //   to avoid cross-iteration races.
       // ==============================================================
 
       if constexpr (MULTI_CHUNK) {
-        // Per-chunk AG submit. AllReduce semantics: AG for chunk c only
-        // depends on *local* reduce(c) completion — PE-k writes its own
-        // myPe-slot to every peer's myPe-slot, no cross-PE reduce barrier
-        // needed. This avoids the flags spin-wait deadlock where peer's
-        // block 0 is suspended by GEMM on the overlap stream.
         for (int c = 0; c < numChunks; c++) {
+          // 1. Wait local compute blocks to finish chunk c reduce.
           const uint32_t ccTarget =
               ccBase + static_cast<uint32_t>((c + 1) * compBlocks);
           if (thr == 0) {
@@ -335,6 +350,26 @@ __global__ void PipelinedAllReduceSdmaKernel(
           }
           __syncthreads();
 
+          // 2. Cross-PE reduce_complete barrier: signal + wait all peers.
+          //    Required so my AG doesn't overwrite peer's transit slot
+          //    before peer's reduce reads it.
+          if (thr == 0) {
+            HSAuint64* myFlag =
+                reinterpret_cast<HSAuint64*>(flagsMemObj->localPtr);
+            __hip_atomic_fetch_add(myFlag, 1ULL,
+                                   __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+          }
+          if (thr < npes && thr != myPe) {
+            const int pe = thr;
+            const uint64_t expected =
+                reduceCompleteBase + static_cast<uint64_t>(c + 1);
+            HSAuint64* remoteFlag =
+                reinterpret_cast<HSAuint64*>(flagsMemObj->peerPtrs[pe]);
+            while (core::AtomicLoadRelaxed(remoteFlag) < expected)
+              __builtin_amdgcn_s_sleep(1);
+          }
+
+          // 3. SDMA AG for chunk c.
           if (thr < npes && thr != myPe) {
             const int destPe = thr;
             anvil::SdmaQueueDeviceHandle** dh =
@@ -365,8 +400,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
             __builtin_amdgcn_s_sleep(1);
         }
       } else {
-        // Single-chunk AG. Same principle as MULTI_CHUNK: AG only depends on
-        // local reduce completion, no cross-PE barrier needed.
+        // Single-chunk AG. Same barrier requirement as MULTI_CHUNK.
         const uint32_t ccTarget =
             ccBase + static_cast<uint32_t>(compBlocks);
         if (thr == 0) {
@@ -376,6 +410,22 @@ __global__ void PipelinedAllReduceSdmaKernel(
             __builtin_amdgcn_s_sleep(1);
         }
         __syncthreads();
+
+        // Cross-PE reduce_complete barrier.
+        if (thr == 0) {
+          HSAuint64* myFlag =
+              reinterpret_cast<HSAuint64*>(flagsMemObj->localPtr);
+          __hip_atomic_fetch_add(myFlag, 1ULL,
+                                 __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+        }
+        if (thr < npes && thr != myPe) {
+          const int pe = thr;
+          const uint64_t expected = reduceCompleteBase + 1ULL;
+          HSAuint64* remoteFlag =
+              reinterpret_cast<HSAuint64*>(flagsMemObj->peerPtrs[pe]);
+          while (core::AtomicLoadRelaxed(remoteFlag) < expected)
+            __builtin_amdgcn_s_sleep(1);
+        }
 
         if (thr < npes && thr != myPe) {
           const int destPe = thr;
