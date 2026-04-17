@@ -94,6 +94,7 @@ set(UMBP_CORE_SRCS
     local/storage/tier_backend.cpp
     local/storage/dram_tier.cpp
     local/storage/ssd_tier.cpp
+    local/storage/dummy_ssd_tier.cpp
     local/storage/local_storage_manager.cpp
     local/umbp_client.cpp
     allocator/offset_allocator.cpp)
