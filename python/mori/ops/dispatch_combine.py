@@ -265,36 +265,47 @@ class EpDispatchCombineOp:
 
         self.launch_config_mode = os.environ.get("MORI_EP_LAUNCH_CONFIG_MODE", "MANUAL")
         if self.launch_config_mode == "AUTO":
+            # Each entry is (block_num, rdma_block_num, warp_per_block).
+            # IntraNode dispatch and combine have different optimal launch
+            # configurations: dispatch is XGMI write-bandwidth bound and benefits
+            # from more blocks (≥256), while combine is shared-memory / per-block
+            # work bound and prefers fewer, fatter blocks (~128). Keeping a single
+            # config for both leaves performance on the table for whichever side
+            # gets the suboptimal value. We therefore split the AUTO config into
+            # a dispatch tuple and a combine tuple. Inter-node kernels keep the
+            # historical single config for both sides (no measured benefit yet).
             if (
                 self.config.kernel_type.value
                 == EpDispatchCombineKernelType.InterNodeV1.value
             ):
-                (
-                    self.auto_block_num,
-                    self.auto_rdma_block_num,
-                    self.auto_warp_per_block,
-                ) = (96, 64, 8)
+                dispatch_cfg = combine_cfg = (96, 64, 8)
             elif (
                 self.config.kernel_type.value
                 == EpDispatchCombineKernelType.InterNodeV1LL.value
             ):
-                (
-                    self.auto_block_num,
-                    self.auto_rdma_block_num,
-                    self.auto_warp_per_block,
-                ) = (256, 128, 8)
+                dispatch_cfg = combine_cfg = (256, 128, 8)
             else:
-                (
-                    self.auto_block_num,
-                    self.auto_rdma_block_num,
-                    self.auto_warp_per_block,
-                ) = (128, 0, 16)
+                # IntraNode tuned on MI355X EP2 FP4 12k tokens/rank.
+                # See PR description for full sweep data.
+                dispatch_cfg = (256, 0, 16)
+                combine_cfg = (128, 0, 16)
+            (
+                self.auto_block_num,
+                self.auto_rdma_block_num,
+                self.auto_warp_per_block,
+            ) = dispatch_cfg
+            (
+                self.auto_combine_block_num,
+                self.auto_combine_rdma_block_num,
+                self.auto_combine_warp_per_block,
+            ) = combine_cfg
         elif self.launch_config_mode == "MANUAL":
-            self.auto_block_num, self.auto_rdma_block_num, self.auto_warp_per_block = (
-                None,
-                None,
-                None,
-            )
+            self.auto_block_num = None
+            self.auto_rdma_block_num = None
+            self.auto_warp_per_block = None
+            self.auto_combine_block_num = None
+            self.auto_combine_rdma_block_num = None
+            self.auto_combine_warp_per_block = None
         else:
             raise ValueError(
                 f"invalid MORI_EP_LAUNCH_CONFIG_MODE, must be ['MANUAL', 'AUTO'], got '{self.launch_config_mode}'"
@@ -303,10 +314,20 @@ class EpDispatchCombineOp:
     # ------------------------------------------------------------------
     # Kernel launch helpers
     # ------------------------------------------------------------------
-    def _resolve_launch_params(self, block_num, rdma_block_num, warp_per_block):
-        bn = self.auto_block_num if self.auto_block_num else block_num
-        rbn = self.auto_rdma_block_num if self.auto_rdma_block_num else rdma_block_num
-        wpb = self.auto_warp_per_block if self.auto_warp_per_block else warp_per_block
+    def _resolve_launch_params(
+        self, block_num, rdma_block_num, warp_per_block, *, is_dispatch=True
+    ):
+        if is_dispatch:
+            auto_bn = self.auto_block_num
+            auto_rbn = self.auto_rdma_block_num
+            auto_wpb = self.auto_warp_per_block
+        else:
+            auto_bn = self.auto_combine_block_num
+            auto_rbn = self.auto_combine_rdma_block_num
+            auto_wpb = self.auto_combine_warp_per_block
+        bn = auto_bn if auto_bn else block_num
+        rbn = auto_rbn if auto_rbn else rdma_block_num
+        wpb = auto_wpb if auto_wpb else warp_per_block
         actual_bn = self.config.block_num if bn <= 0 else bn
         actual_rbn = self.config.rdma_block_num if rbn <= 0 else rbn
         actual_wpb = self.config.warp_num_per_block if wpb <= 0 else wpb
@@ -345,10 +366,18 @@ class EpDispatchCombineOp:
     def get_launch_config(
         self, is_dispatch=True, block_num=-1, rdma_block_num=-1, warp_per_block=-1
     ):
+        if is_dispatch:
+            auto_bn = self.auto_block_num
+            auto_rbn = self.auto_rdma_block_num
+            auto_wpb = self.auto_warp_per_block
+        else:
+            auto_bn = self.auto_combine_block_num
+            auto_rbn = self.auto_combine_rdma_block_num
+            auto_wpb = self.auto_combine_warp_per_block
         return (
-            self.auto_block_num if self.auto_block_num else block_num,
-            self.auto_rdma_block_num if self.auto_rdma_block_num else rdma_block_num,
-            self.auto_warp_per_block if self.auto_warp_per_block else warp_per_block,
+            auto_bn if auto_bn else block_num,
+            auto_rbn if auto_rbn else rdma_block_num,
+            auto_wpb if auto_wpb else warp_per_block,
         )
 
     def max_num_tokens_to_recv(self):
@@ -573,7 +602,7 @@ class EpDispatchCombineOp:
             weights.data_ptr() if weights is not None and weights.size(0) != 0 else 0
         )
         actual_bn, actual_rbn, actual_wpb = self._resolve_launch_params(
-            block_num, rdma_block_num, warp_per_block
+            block_num, rdma_block_num, warp_per_block, is_dispatch=False
         )
         stream = _current_stream()
         self._combine_dtype = input.dtype
@@ -754,7 +783,9 @@ class EpDispatchCombineOp:
         block_num: int = -1,
         warp_per_block: int = -1,
     ):
-        _, _, actual_wpb = self._resolve_launch_params(block_num, 0, warp_per_block)
+        _, _, actual_wpb = self._resolve_launch_params(
+            block_num, 0, warp_per_block, is_dispatch=False
+        )
         stream = _current_stream()
         assert hasattr(
             self, "_combine_dtype"
@@ -943,7 +974,7 @@ class EpDispatchCombineOp:
 
         hidden_dim = input.size(2)
         actual_bn, actual_rbn, actual_wpb = self._resolve_launch_params(
-            block_num, rdma_block_num, warp_per_block
+            block_num, rdma_block_num, warp_per_block, is_dispatch=False
         )
         stream = _current_stream()
         sfx = _DTYPE_SUFFIX[input.dtype]
@@ -1107,7 +1138,7 @@ class EpDispatchCombineOp:
 
         hidden_dim = packed_recv_x.size(2)
         actual_bn, _, actual_wpb = self._resolve_launch_params(
-            block_num, 0, warp_per_block
+            block_num, 0, warp_per_block, is_dispatch=False
         )
         stream = _current_stream()
         sfx = _DTYPE_SUFFIX[packed_recv_x.dtype]
