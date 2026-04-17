@@ -35,21 +35,21 @@
 1.  是否达到官方给出性能
 
 2.  是否达到硬件理论带宽：机内XGMI
-MI355X 理论XGMI带宽：7x 153.6 GB/s（双向）= 单向 76.8 GB/s/link
+    MI355X 理论XGMI带宽：7x 153.6 GB/s（双向）= 单向 76.8 GB/s/link
 
 EP8 Dispatch 理论上限推导（XGMI 实测约为理论值的 80%）：
-- XGMI 理论单向带宽 = 76.8 GB/s/link，实际有效带宽 ≈ 76.8 × 0.8 = 61.44 GB/s/link
-- 单个 GPU 总单向发送带宽 = 7 × 61.44 = 430.1 GB/s
+- XGMI 理论单向带宽 = 76.8 GB/s/link，实际有效带宽 ≈ 60 GB/s/link
+- 单个 GPU 总单向发送带宽 = 7 × 60 = 420 GB/s
 - EP8 dispatch 时 7/8 数据走 XGMI（1/8 本地不需通信）
 - bench 报告的 bw = total_recv_bytes / time（含本地数据）
-- 理论上限 = 430.1 × 8/7 ≈ **491 GB/s**
+- 理论上限 = 420 × 8/7 ≈ **480 GB/s**
 
 | 指标 | 理论上限 | 实测 | 利用率 |
 |---|---|---|---|
-| Dispatch FP8 | 491 GB/s | 377 GB/s | 77% |
-| Dispatch BF16 | 491 GB/s | 388 GB/s | 79% |
-| Combine ZC | 491 GB/s | 436 GB/s | 89% |
-| Combine Non-ZC | 491 GB/s | 366 GB/s | 75% |
+| Dispatch FP8 | 480 GB/s | 377 GB/s | 79% |
+| Dispatch BF16 | 480 GB/s | 388 GB/s | 81% |
+| Combine ZC | 480 GB/s | 436 GB/s | 91% |
+| Combine Non-ZC | 480 GB/s | 366 GB/s | 76% |
 
 3.  与N卡的DeepEP性能对比
 
