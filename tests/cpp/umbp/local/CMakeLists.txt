@@ -28,6 +28,10 @@ add_executable(test_ssd_tier test_ssd_tier.cpp)
 target_link_libraries(test_ssd_tier PRIVATE umbp_core)
 add_test(NAME test_ssd_tier COMMAND test_ssd_tier)
 
+add_executable(test_dummy_ssd_tier test_dummy_ssd_tier.cpp)
+target_link_libraries(test_dummy_ssd_tier PRIVATE umbp_core)
+add_test(NAME test_dummy_ssd_tier COMMAND test_dummy_ssd_tier)
+
 # Micro-benchmark (manual run only, not registered as a test)
 add_executable(bench_umbp_micro bench_umbp_micro.cpp)
 target_link_libraries(bench_umbp_micro PRIVATE umbp_core)
