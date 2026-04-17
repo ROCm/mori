@@ -265,6 +265,10 @@ def _copy_jit_sources(root_dir: Path) -> None:
         if src.is_dir():
             _copytree(src, jit_dir / "3rdparty" / subdir)
 
+    profiler_tools_src = root_dir / "tools" / "profiler"
+    if profiler_tools_src.is_dir():
+        _copytree(profiler_tools_src, jit_dir / "tools" / "profiler")
+
 
 _3RDPARTY_DIRS = ["3rdparty/spdlog", "3rdparty/msgpack-c"]
 
@@ -522,6 +526,7 @@ mori_package_data = [
     "_jit-sources/src/**/*.h",
     "_jit-sources/3rdparty/**/*.h",
     "_jit-sources/3rdparty/**/*.hpp",
+    "_jit-sources/tools/**/*.py",
 ]
 if _env_flag("BUILD_UMBP", "OFF"):
     mori_package_data.append("spdk_proxy")
