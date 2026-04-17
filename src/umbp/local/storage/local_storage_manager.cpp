@@ -30,6 +30,7 @@
 
 #include "umbp/common/log.h"
 #include "umbp/local/storage/dram_tier.h"
+#include "umbp/local/storage/dummy_ssd_tier.h"
 #include "umbp/local/storage/ssd_tier.h"
 #ifdef USE_SPDK
 #include "umbp/local/storage/spdk_ssd_tier.h"
@@ -497,6 +498,10 @@ LocalStorageManager::LocalStorageManager(const UMBPConfig& config,
       }
     }
 #endif
+    if (!ssd_backend && config_.ssd_backend == "dummy_storage") {
+      ssd_backend = std::make_unique<DummySsdTier>(config_.ssd.capacity_bytes);
+    }
+
     if (!ssd_backend) {
       SSDAccessMode segmented_access_mode = SSDAccessMode::ReadWrite;
       if (role_ == UMBPRole::SharedSSDFollower) {
