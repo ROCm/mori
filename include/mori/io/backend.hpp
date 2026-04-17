@@ -25,6 +25,7 @@
 
 #include "mori/io/common.hpp"
 #include "mori/io/enum.hpp"
+#include "mori/io/telemetry.hpp"
 
 namespace mori {
 namespace io {
@@ -194,6 +195,8 @@ class Backend {
                                         TransferStatus* status) = 0;
 
   virtual bool CanHandle(const MemoryDesc& local, const MemoryDesc& remote) const { return true; }
+
+  virtual TelemetrySnapshot GetTelemetrySnapshot() const { return {}; }
 };
 
 }  // namespace io

@@ -647,5 +647,11 @@ StatusCode IOEngine::WaitAll(const std::vector<TransferStatus*>& statuses, int t
   return firstError;
 }
 
+TelemetrySnapshot IOEngine::GetTelemetrySnapshot(BackendType type) const {
+  auto it = backends.find(type);
+  if (it == backends.end()) return {};
+  return it->second->GetTelemetrySnapshot();
+}
+
 }  // namespace io
 }  // namespace mori
