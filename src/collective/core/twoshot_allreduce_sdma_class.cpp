@@ -545,6 +545,21 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                         myPe_, hipGetErrorString(br));
                 return false;
             }
+        } else {
+            // SCATTER_MODE=0: zero only chunks_complete (cheap 4 bytes).
+            // Must be done BEFORE kernel launch on same stream so kernel
+            // sees chunks_complete=0 at entry.  Prevents race where compute
+            // blocks increment before block 0 reads it as a baseline.
+            hipError_t br = stream
+                ? hipMemsetAsync(&barrierPtr_->chunks_complete, 0,
+                                 sizeof(uint32_t), stream)
+                : hipMemset(&barrierPtr_->chunks_complete, 0, sizeof(uint32_t));
+            if (br != hipSuccess) {
+                fprintf(stderr,
+                        "PE %d: pipelined hipMemset(chunks_complete) failed: %s\n",
+                        myPe_, hipGetErrorString(br));
+                return false;
+            }
         }
 
         const bool multi_chunk = (chunk_elems < total_count);

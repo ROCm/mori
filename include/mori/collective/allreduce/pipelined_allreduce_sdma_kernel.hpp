@@ -156,11 +156,15 @@ __global__ void PipelinedAllReduceSdmaKernel(
   __shared__ uint32_t s_cc_base;
   __shared__ const P* s_pe_ptrs[8];
 
+  // chunks_complete is zeroed by the host on stream BEFORE each kernel launch
+  // (hipMemsetAsync in pipelined()), so this launch's atomic increments are
+  // absolute counts starting from 0. The old design read chunks_complete at
+  // kernel entry as a baseline, which had a race: compute blocks could
+  // already have incremented the counter before block 0 read it, making the
+  // baseline too large and the ccTarget unreachable — concrete cause of the
+  // probabilistic overlap-mode deadlock.
   if (threadIdx.x == 0) {
-    s_cc_base = (blockIdx.x == 0)
-        ? __scoped_atomic_load_n(
-              &barrier->chunks_complete, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE)
-        : 0u;
+    s_cc_base = 0u;
   }
   {
     const int s = static_cast<int>(threadIdx.x);
