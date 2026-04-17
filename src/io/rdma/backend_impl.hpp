@@ -39,6 +39,7 @@
 #include "mori/io/engine.hpp"
 #include "src/io/rdma/common.hpp"
 #include "src/io/rdma/executor.hpp"
+#include "src/io/rdma/telemetry.hpp"
 
 namespace mori {
 namespace io {
@@ -47,7 +48,8 @@ namespace io {
 /* ---------------------------------------------------------------------------------------------- */
 class RdmaManager {
  public:
-  RdmaManager(const RdmaBackendConfig cfg, application::RdmaContext* ctx);
+  RdmaManager(const RdmaBackendConfig cfg, application::RdmaContext* ctx,
+              TelemetryRegistry* telemetry = nullptr);
   ~RdmaManager();
 
   application::RdmaEndpointConfig GetRdmaEndpointConfig(int devId);
@@ -97,6 +99,8 @@ class RdmaManager {
 
   std::unique_ptr<application::TopoSystem> topo{nullptr};
   std::atomic<uint32_t> roundRobinCounter{0};
+
+  TelemetryRegistry* telemetry_{nullptr};
 };
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -104,7 +108,7 @@ class RdmaManager {
 /* ---------------------------------------------------------------------------------------------- */
 class NotifManager {
  public:
-  NotifManager(RdmaManager*, const RdmaBackendConfig&);
+  NotifManager(RdmaManager*, const RdmaBackendConfig&, TelemetryRegistry* telemetry = nullptr);
   ~NotifManager();
 
   void RegisterEndpoint(const std::shared_ptr<EndpointRuntime>& rt);
@@ -141,6 +145,8 @@ class NotifManager {
   std::unordered_map<EngineKey, std::unordered_map<TransferUniqueId, int>> notifPool;
 
   std::unordered_map<TransferStatus*, int> localNotif;
+
+  TelemetryRegistry* telemetry_{nullptr};
 };
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -203,7 +209,7 @@ class RdmaBackendSession : public BackendSession {
   RdmaBackendSession() = default;
   RdmaBackendSession(const RdmaBackendConfig& config, const application::RdmaMemoryRegion& local,
                      const application::RdmaMemoryRegion& remote, const EpPairVec& eps,
-                     Executor* executor);
+                     Executor* executor, TelemetryRegistry* telemetry = nullptr);
   ~RdmaBackendSession() = default;
 
   void ReadWrite(size_t localOffset, size_t remoteOffset, size_t size, TransferStatus* status,
@@ -221,6 +227,7 @@ class RdmaBackendSession : public BackendSession {
   application::RdmaMemoryRegion remote{};
   EpPairVec eps{};
   Executor* executor{nullptr};
+  TelemetryRegistry* telemetry_{nullptr};
 };
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -250,6 +257,7 @@ class RdmaBackend : public Backend {
                       bool isRead);
   BackendSession* CreateSession(const MemoryDesc& local, const MemoryDesc& remote);
   bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id, TransferStatus* status);
+  TelemetrySnapshot GetTelemetrySnapshot() const override;
 
  private:
   void CreateSession(const MemoryDesc& local, const MemoryDesc& remote, RdmaBackendSession& sess);
@@ -290,6 +298,7 @@ class RdmaBackend : public Backend {
   std::unordered_map<SessionCacheKey, std::unique_ptr<RdmaBackendSession>, SessionCacheKeyHash>
       sessionCache;
   std::mutex sessionCacheMu;
+  std::unique_ptr<TelemetryRegistry> telemetry_;
 };
 
 }  // namespace io

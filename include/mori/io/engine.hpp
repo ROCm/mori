@@ -108,6 +108,8 @@ class IOEngine {
   std::optional<IOEngineSession> CreateSession(const MemoryDesc& local, const MemoryDesc& remote);
   void LoadScatterGatherModule(const std::string& hsacoPath);
 
+  TelemetrySnapshot GetTelemetrySnapshot(BackendType type) const;
+
  private:
   struct RouteCacheKey {
     EngineKey remoteEngineKey;

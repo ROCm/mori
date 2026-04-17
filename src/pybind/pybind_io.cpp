@@ -181,7 +181,77 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def("CreateSession", &mori::io::IOEngine::CreateSession)
       .def("PopInboundTransferStatus", &mori::io::IOEngine::PopInboundTransferStatus,
            py::call_guard<py::gil_scoped_release>())
-      .def("LoadScatterGatherModule", &mori::io::IOEngine::LoadScatterGatherModule);
+      .def("LoadScatterGatherModule", &mori::io::IOEngine::LoadScatterGatherModule)
+      .def(
+          "GetTelemetrySnapshot",
+          [](const mori::io::IOEngine& self, mori::io::BackendType type) -> py::dict {
+            auto snap = self.GetTelemetrySnapshot(type);
+            auto verbs_to_dict = [](const mori::io::TelemetrySnapshot::VerbsStats& v) -> py::dict {
+              py::dict d;
+              d["bytes_posted"] = v.bytes_posted;
+              d["bytes_completed"] = v.bytes_completed;
+              d["ops_posted"] = v.ops_posted;
+              d["ops_completed"] = v.ops_completed;
+              d["cqe_errors"] = v.cqe_errors;
+              d["post_send_errors"] = v.post_send_errors;
+              d["sq_full_events"] = v.sq_full_events;
+              d["cq_polls"] = v.cq_polls;
+              d["cq_empty_polls"] = v.cq_empty_polls;
+              d["cq_utilization"] = v.cq_utilization;
+              d["poll_mode"] = v.poll_mode;
+              d["sq_depth"] = v.sq_depth;
+              d["sq_depth_hwm"] = v.sq_depth_hwm;
+              d["sq_depth_max"] = v.sq_depth_max;
+              d["rdma_latency_ewma_us"] = v.rdma_latency_ewma_us;
+              d["rdma_latency_min_us"] = v.rdma_latency_min_us;
+              d["rdma_latency_max_us"] = v.rdma_latency_max_us;
+              d["rdma_latency_sample_count"] = v.rdma_latency_sample_count;
+              return d;
+            };
+
+            py::dict result;
+
+            // API stats
+            py::dict api;
+            api["read_calls"] = snap.api.read_calls;
+            api["write_calls"] = snap.api.write_calls;
+            api["batch_read_calls"] = snap.api.batch_read_calls;
+            api["batch_write_calls"] = snap.api.batch_write_calls;
+            api["rejected_calls"] = snap.api.rejected_calls;
+            api["total_bytes_read"] = snap.api.total_bytes_read;
+            api["total_bytes_written"] = snap.api.total_bytes_written;
+            api["jct_ewma_us"] = snap.api.jct_ewma_us;
+            api["jct_min_us"] = snap.api.jct_min_us;
+            api["jct_max_us"] = snap.api.jct_max_us;
+            api["jct_sample_count"] = snap.api.jct_sample_count;
+            result["api"] = api;
+
+            // Verbs stats
+            result["verbs"] = verbs_to_dict(snap.verbs);
+
+            // Breakdown
+            py::dict breakdown;
+            breakdown["api_total_ewma_us"] = snap.breakdown.api_total_ewma_us;
+            breakdown["rdma_wall_ewma_us"] = snap.breakdown.rdma_wall_ewma_us;
+            breakdown["sw_overhead_ewma_us"] = snap.breakdown.sw_overhead_ewma_us;
+            result["breakdown"] = breakdown;
+
+            // Per-EP
+            py::list per_ep;
+            for (const auto& ep : snap.per_ep) {
+              py::dict ep_dict;
+              ep_dict["ep_id"] = ep.ep_id;
+              ep_dict["verbs"] = verbs_to_dict(ep.verbs);
+              per_ep.append(ep_dict);
+            }
+            result["per_ep"] = per_ep;
+
+            result["snapshot_tsc"] = snap.snapshot_tsc;
+            result["tsc_freq_ghz"] = snap.tsc_freq_ghz;
+
+            return result;
+          },
+          py::arg("backend_type") = mori::io::BackendType::RDMA);
 }
 
 }  // namespace mori

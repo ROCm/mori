@@ -213,3 +213,6 @@ class IOEngine:
         if found:
             return transfer_status
         return None
+
+    def get_telemetry_snapshot(self, backend_type=mori_cpp.BackendType.RDMA):
+        return self._engine.GetTelemetrySnapshot(backend_type)

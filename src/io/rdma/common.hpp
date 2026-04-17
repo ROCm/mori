@@ -35,6 +35,17 @@
 namespace mori {
 namespace io {
 
+struct EpTelemetryState;
+struct ApiCounterSet;
+
+struct TelemetryMeta {
+  uint64_t api_start_tsc{0};
+  std::atomic<uint64_t> first_post_tsc{UINT64_MAX};
+  ApiCounterSet* api_counters{nullptr};
+  uint64_t total_bytes{0};
+  bool is_read{false};
+};
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                     Common Data Structures                                     */
 /* ---------------------------------------------------------------------------------------------- */
@@ -128,11 +139,14 @@ uint64_t MakeNotifSendWrId(TransferUniqueId id);
 struct CqCallbackMeta {
   CqCallbackMeta(TransferStatus* s, TransferUniqueId id_, int n)
       : status(s), id(id_), totalBatchSize(n) {}
+  ~CqCallbackMeta();
 
   TransferStatus* status{nullptr};
   TransferUniqueId id{0};
   int totalBatchSize{0};
   std::atomic<uint32_t> finishedBatchSize{0};
+
+  std::unique_ptr<TelemetryMeta> telem;
 };
 
 // SubmissionLedger: tracks per-EP WR submissions and enables precise sqDepth release.
@@ -148,23 +162,33 @@ struct SubmissionRecord {
   SubmissionState state{SubmissionState::Posted};
   std::shared_ptr<CqCallbackMeta> meta;
   int batchSize{0};
+  uint64_t totalBytes{0};
+  uint64_t post_tsc{0};
 };
 
 class SubmissionLedger {
  public:
   explicit SubmissionLedger(uint32_t notifPerQp) : nextId_{notifPerQp} {}
 
+  void EnableTimestamping() { timestamping_ = true; }
+
   // Allocate recordId, insert Posted record, return recordId.
   uint64_t Insert(int postedWr, bool hasSignaledTail, std::shared_ptr<CqCallbackMeta> meta,
-                  int batchSize);
+                  int batchSize, uint64_t totalBytes = 0);
 
   // Insert an Orphaned record (partial post, no signaled tail).
-  void InsertOrphaned(int postedWr, std::shared_ptr<CqCallbackMeta> meta, int batchSize);
+  void InsertOrphaned(int postedWr, std::shared_ptr<CqCallbackMeta> meta, int batchSize,
+                      uint64_t totalBytes = 0);
+
+  // Record post timestamp AFTER successful ibv_post_send.
+  // If the record has already been consumed by ReleaseByCqe, this is a no-op.
+  void RecordPostTimestamp(uint64_t recordId, uint64_t tsc);
 
   // CQE path: find record by recordId, release sqDepth, return CqCallbackMeta.
   // Returns nullptr if record not found.
   std::shared_ptr<CqCallbackMeta> ReleaseByCqe(uint64_t recordId, std::atomic<int>* sqDepth,
-                                               int* outBatchSize);
+                                               int* outBatchSize, uint64_t* outTotalBytes = nullptr,
+                                               uint64_t* out_post_tsc = nullptr);
 
   // Recovery path: release only Orphaned records and keep Posted records.
   int ReleaseOrphanedByRecovery(std::atomic<int>* sqDepth);
@@ -175,6 +199,7 @@ class SubmissionLedger {
   mutable std::mutex mu_;
   uint64_t nextId_;
   std::unordered_map<uint64_t, SubmissionRecord> records_;
+  bool timestamping_{false};
 };
 
 struct EpPair {
@@ -190,6 +215,7 @@ struct EpPair {
   // Degraded flag — set on partial post without signaled tail.
   std::shared_ptr<std::atomic<bool>> degraded;
   std::shared_ptr<SubmissionLedger> ledger;
+  std::shared_ptr<EpTelemetryState> telem;
 };
 
 using EndpointId = uint64_t;

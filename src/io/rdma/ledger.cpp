@@ -20,36 +20,65 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 #include "src/io/rdma/common.hpp"
+#include "src/io/rdma/telemetry.hpp"
 
 namespace mori {
 namespace io {
 
+CqCallbackMeta::~CqCallbackMeta() = default;
+
 uint64_t SubmissionLedger::Insert(int postedWr, bool hasSignaledTail,
-                                  std::shared_ptr<CqCallbackMeta> meta, int batchSize) {
+                                  std::shared_ptr<CqCallbackMeta> meta, int batchSize,
+                                  uint64_t totalBytes) {
   std::lock_guard<std::mutex> lock(mu_);
   uint64_t id = nextId_++;
-  records_[id] = SubmissionRecord{
-      id, postedWr, hasSignaledTail, SubmissionState::Posted, std::move(meta), batchSize};
+  records_[id] = SubmissionRecord{id,
+                                  postedWr,
+                                  hasSignaledTail,
+                                  SubmissionState::Posted,
+                                  std::move(meta),
+                                  batchSize,
+                                  totalBytes,
+                                  /*post_tsc=*/0};
   return id;
 }
 
 void SubmissionLedger::InsertOrphaned(int postedWr, std::shared_ptr<CqCallbackMeta> meta,
-                                      int batchSize) {
+                                      int batchSize, uint64_t totalBytes) {
   std::lock_guard<std::mutex> lock(mu_);
   uint64_t id = nextId_++;
-  records_[id] =
-      SubmissionRecord{id, postedWr, false, SubmissionState::Orphaned, std::move(meta), batchSize};
+  records_[id] = SubmissionRecord{id,
+                                  postedWr,
+                                  false,
+                                  SubmissionState::Orphaned,
+                                  std::move(meta),
+                                  batchSize,
+                                  totalBytes,
+                                  /*post_tsc=*/0};
+}
+
+void SubmissionLedger::RecordPostTimestamp(uint64_t recordId, uint64_t tsc) {
+  if (!timestamping_) return;
+  std::lock_guard<std::mutex> lock(mu_);
+  auto it = records_.find(recordId);
+  if (it != records_.end()) {
+    it->second.post_tsc = tsc;
+  }
 }
 
 std::shared_ptr<CqCallbackMeta> SubmissionLedger::ReleaseByCqe(uint64_t recordId,
                                                                std::atomic<int>* sqDepth,
-                                                               int* outBatchSize) {
+                                                               int* outBatchSize,
+                                                               uint64_t* outTotalBytes,
+                                                               uint64_t* out_post_tsc) {
   std::lock_guard<std::mutex> lock(mu_);
   auto it = records_.find(recordId);
   if (it == records_.end()) return nullptr;
   SubmissionRecord& rec = it->second;
   if (sqDepth && rec.postedWr > 0) sqDepth->fetch_sub(rec.postedWr, std::memory_order_relaxed);
   if (outBatchSize) *outBatchSize = rec.batchSize;
+  if (outTotalBytes) *outTotalBytes = rec.totalBytes;
+  if (out_post_tsc) *out_post_tsc = rec.post_tsc;
   auto meta = std::move(rec.meta);
   records_.erase(it);
   return meta;

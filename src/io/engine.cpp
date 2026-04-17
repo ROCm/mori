@@ -474,5 +474,11 @@ bool IOEngine::PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
   return false;
 }
 
+TelemetrySnapshot IOEngine::GetTelemetrySnapshot(BackendType type) const {
+  auto it = backends.find(type);
+  if (it == backends.end()) return {};
+  return it->second->GetTelemetrySnapshot();
+}
+
 }  // namespace io
 }  // namespace mori
