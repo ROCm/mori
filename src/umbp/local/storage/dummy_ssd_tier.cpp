@@ -101,8 +101,8 @@ std::vector<std::string> DummySsdTier::GetLRUCandidates(size_t max_candidates) c
   std::lock_guard<std::mutex> lk(mu_);
   std::vector<std::string> result;
   result.reserve(std::min(max_candidates, lru_list_.size()));
-  for (auto rit = lru_list_.rbegin();
-       rit != lru_list_.rend() && result.size() < max_candidates; ++rit) {
+  for (auto rit = lru_list_.rbegin(); rit != lru_list_.rend() && result.size() < max_candidates;
+       ++rit) {
     result.push_back(*rit);
   }
   return result;
