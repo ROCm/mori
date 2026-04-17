@@ -5,6 +5,7 @@ set(MORI_IO_SOURCES
     rdma/executor.cpp
     rdma/common.cpp
     rdma/ledger.cpp
+    rdma/telemetry.cpp
     xgmi/backend_impl.cpp
     xgmi/hip_resource_pool.cpp)
 
