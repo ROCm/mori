@@ -92,6 +92,18 @@
     },
     {
       "dtype": "bf16",
+      "num_tokens": 12288,
+      "hidden_dim": 7168,
+      "zero_copy": false,
+      "quant_type": "fp8_direct_cast",
+      "block_num": 256,
+      "rdma_block_num": 0,
+      "warp_per_block": 16,
+      "bandwidth_gbps": 204.47,
+      "latency_us": 1716.85
+    },
+    {
+      "dtype": "bf16",
       "num_tokens": 64,
       "hidden_dim": 7168,
       "zero_copy": false,
@@ -173,6 +185,18 @@
       "warp_per_block": 16,
       "bandwidth_gbps": 101.9,
       "latency_us": 1148.1
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 8192,
+      "hidden_dim": 7168,
+      "zero_copy": false,
+      "quant_type": "none",
+      "block_num": 256,
+      "rdma_block_num": 0,
+      "warp_per_block": 16,
+      "bandwidth_gbps": 103.04,
+      "latency_us": 2272.75
     },
     {
       "dtype": "bf16",
