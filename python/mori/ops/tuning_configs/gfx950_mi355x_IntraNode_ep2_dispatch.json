@@ -77,6 +77,26 @@
       "latency_us": 341.55
     },
     {
+      "dtype": "fp4",
+      "num_tokens": 8192,
+      "hidden_dim": 3584,
+      "block_num": 256,
+      "rdma_block_num": 0,
+      "warp_per_block": 16,
+      "bandwidth_gbps": 89.7,
+      "latency_us": 652.65
+    },
+    {
+      "dtype": "fp4",
+      "num_tokens": 12288,
+      "hidden_dim": 3584,
+      "block_num": 256,
+      "rdma_block_num": 0,
+      "warp_per_block": 16,
+      "bandwidth_gbps": 90.94,
+      "latency_us": 965.0
+    },
+    {
       "dtype": "fp8_e4m3",
       "num_tokens": 64,
       "hidden_dim": 7168,
