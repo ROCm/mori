@@ -13,7 +13,8 @@
       "block_num": 64,
       "rdma_block_num": 0,
       "warp_per_block": 8,
-      "bandwidth_gbps": 34.0
+      "bandwidth_gbps": 32.37,
+      "latency_us": 37.31
     },
     {
       "dtype": "fp4",
@@ -22,7 +23,8 @@
       "block_num": 64,
       "rdma_block_num": 0,
       "warp_per_block": 16,
-      "bandwidth_gbps": 61.12
+      "bandwidth_gbps": 56.38,
+      "latency_us": 43.24
     },
     {
       "dtype": "fp4",
@@ -31,7 +33,8 @@
       "block_num": 64,
       "rdma_block_num": 0,
       "warp_per_block": 16,
-      "bandwidth_gbps": 85.12
+      "bandwidth_gbps": 75.53,
+      "latency_us": 64.28
     },
     {
       "dtype": "fp4",
@@ -40,7 +43,8 @@
       "block_num": 64,
       "rdma_block_num": 0,
       "warp_per_block": 16,
-      "bandwidth_gbps": 110.5
+      "bandwidth_gbps": 96.52,
+      "latency_us": 100.7
     },
     {
       "dtype": "fp4",
@@ -49,7 +53,8 @@
       "block_num": 80,
       "rdma_block_num": 0,
       "warp_per_block": 15,
-      "bandwidth_gbps": 140.12
+      "bandwidth_gbps": 121.12,
+      "latency_us": 160.28
     },
     {
       "dtype": "fp4",
@@ -58,16 +63,28 @@
       "block_num": 80,
       "rdma_block_num": 0,
       "warp_per_block": 16,
-      "bandwidth_gbps": 170.88
+      "bandwidth_gbps": 146.94,
+      "latency_us": 264.36
+    },
+    {
+      "dtype": "fp4",
+      "num_tokens": 4096,
+      "hidden_dim": 3584,
+      "block_num": 80,
+      "rdma_block_num": 0,
+      "warp_per_block": 16,
+      "bandwidth_gbps": 159.61,
+      "latency_us": 486.32
     },
     {
       "dtype": "fp8_e4m3_fnuz",
       "num_tokens": 64,
       "hidden_dim": 7168,
-      "block_num": 64,
+      "block_num": 56,
       "rdma_block_num": 0,
-      "warp_per_block": 8,
-      "bandwidth_gbps": 72.0
+      "warp_per_block": 10,
+      "bandwidth_gbps": 66.31,
+      "latency_us": 37.34
     },
     {
       "dtype": "fp8_e4m3_fnuz",
@@ -76,7 +93,8 @@
       "block_num": 64,
       "rdma_block_num": 0,
       "warp_per_block": 16,
-      "bandwidth_gbps": 114.75
+      "bandwidth_gbps": 105.93,
+      "latency_us": 46.01
     },
     {
       "dtype": "fp8_e4m3_fnuz",
@@ -85,7 +103,8 @@
       "block_num": 64,
       "rdma_block_num": 0,
       "warp_per_block": 16,
-      "bandwidth_gbps": 158.62
+      "bandwidth_gbps": 141.94,
+      "latency_us": 68.12
     },
     {
       "dtype": "fp8_e4m3_fnuz",
@@ -94,16 +113,18 @@
       "block_num": 64,
       "rdma_block_num": 0,
       "warp_per_block": 16,
-      "bandwidth_gbps": 200.75
+      "bandwidth_gbps": 180.79,
+      "latency_us": 107.55
     },
     {
       "dtype": "fp8_e4m3_fnuz",
       "num_tokens": 1024,
       "hidden_dim": 7168,
-      "block_num": 64,
+      "block_num": 80,
       "rdma_block_num": 0,
-      "warp_per_block": 16,
-      "bandwidth_gbps": 240.75
+      "warp_per_block": 15,
+      "bandwidth_gbps": 219.07,
+      "latency_us": 177.21
     },
     {
       "dtype": "fp8_e4m3_fnuz",
@@ -112,7 +133,8 @@
       "block_num": 80,
       "rdma_block_num": 0,
       "warp_per_block": 16,
-      "bandwidth_gbps": 271.0
+      "bandwidth_gbps": 250.52,
+      "latency_us": 310.21
     },
     {
       "dtype": "fp8_e4m3_fnuz",
@@ -121,7 +143,8 @@
       "block_num": 80,
       "rdma_block_num": 0,
       "warp_per_block": 16,
-      "bandwidth_gbps": 288.5
+      "bandwidth_gbps": 269.04,
+      "latency_us": 578.35
     }
   ]
 }
