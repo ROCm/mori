@@ -157,17 +157,12 @@ inline bool size_ok(PutScope scope, size_t size_bytes, int nblocks, int threads_
 
 inline bool latency_size_ok(PutScope scope, size_t len_doubles, int threads_per_block,
                             int device_warp_size) {
-  if (len_doubles == 0) {
-    return false;
-  }
-  if (scope == PutScope::kThread || scope == PutScope::kWarp) {
-    return true;
-  }
-  if (threads_per_block % device_warp_size != 0) {
-    return false;
-  }
-  const int nw = threads_per_block / device_warp_size;
-  return len_doubles % static_cast<size_t>(nw) == 0;
+  (void)scope;
+  (void)threads_per_block;
+  (void)device_warp_size;
+  // All three scopes issue a single RDMA op for the entire buffer — no per-warp
+  // splitting, so no divisibility constraint beyond non-zero length.
+  return len_doubles > 0;
 }
 
 }  // namespace mori::shmem::perftest

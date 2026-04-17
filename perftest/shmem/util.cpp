@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <string>
 
 #include "hip/hip_runtime.h"
 #include "mori/application/utils/check.hpp"
@@ -83,6 +84,13 @@ int ParseArgs(int argc, char** argv, PerfArgs* out_args) {
   return 0;
 }
 
+static std::string fmt_size(std::size_t bytes) {
+  if (bytes >= (1ULL << 30)) return std::to_string(bytes >> 30) + " GB";
+  if (bytes >= (1ULL << 20)) return std::to_string(bytes >> 20) + " MB";
+  if (bytes >= (1ULL << 10)) return std::to_string(bytes >> 10) + " KB";
+  return std::to_string(bytes) + " B";
+}
+
 void PrintPerfTable(const char* test_name, const char* scope_name, int grid_x, int block_threads,
                     int warp_size, std::size_t iters, std::size_t warmup, PerfTableMetric metric,
                     const std::vector<PerfTableRow>& rows) {
@@ -101,12 +109,13 @@ void PrintPerfTable(const char* test_name, const char* scope_name, int grid_x, i
       (metric == PerfTableMetric::kBandwidthGbps) ? "Bandwidth (GB)" : "latency(us)";
   const int prec = 6;
 
-  std::printf("%-*s %-*s %-*s\n", kWSize, "size(B)", kWScope, "scope", kVal, val_header);
+  std::printf("%-*s %-*s %-*s\n", kWSize, "size", kWScope, "scope", kVal, val_header);
   for (const PerfTableRow& r : rows) {
+    std::string sz = fmt_size(r.size_bytes);
     if (r.skipped) {
-      std::printf("%-*zu %-*s %-*s\n", kWSize, r.size_bytes, kWScope, scope_col, kVal, "skip");
+      std::printf("%-*s %-*s %-*s\n", kWSize, sz.c_str(), kWScope, scope_col, kVal, "skip");
     } else {
-      std::printf("%-*zu %-*s %-*.*f\n", kWSize, r.size_bytes, kWScope, scope_col, kVal, prec,
+      std::printf("%-*s %-*s %-*.*f\n", kWSize, sz.c_str(), kWScope, scope_col, kVal, prec,
                   r.value);
     }
   }

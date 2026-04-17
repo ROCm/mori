@@ -200,7 +200,7 @@ int main(int argc, char** argv) {
 
   if (my_pe == 0) {
     const int block_threads = LatencyBlockThreads(phase, args.threads_per_block, device_warp_size);
-    PrintPerfTable("shmem_get_latency_uni", ScopeToChar(phase), 1, block_threads, device_warp_size,
+    PrintPerfTable("p2p_get_latency unidirection", ScopeToChar(phase), 1, block_threads, device_warp_size,
                    args.iters, args.warmup, PerfTableMetric::kLatencyUs, lat_table);
   }
   ShmemBarrierAll();
