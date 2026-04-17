@@ -21,10 +21,13 @@
 # SOFTWARE.
 from mori import cpp as mori_cpp
 from mori.tensor_utils import from_gpu_ptr, dtype_to_int
+import logging
 import os
 from dataclasses import dataclass
 import torch
 import torch.distributed as dist
+
+logger = logging.getLogger(__name__)
 
 TOPK_IDX_DTYPE = torch.int32
 WARP_SIZE = 64
@@ -289,11 +292,40 @@ class EpDispatchCombineOp:
                 )
                 self._dispatch_rules = mgr.dispatch_rules or None
                 self._combine_rules = mgr.combine_rules or None
+                if logger.isEnabledFor(logging.DEBUG):
+                    if self._dispatch_rules is None and self._combine_rules is None:
+                        logger.debug(
+                            "AUTO tuning: no config for %s_%s_%s_ep%d; "
+                            "using hard-coded fallback.",
+                            gpu_arch,
+                            gpu_model,
+                            kt_str,
+                            config.world_size,
+                        )
+                    else:
+                        d_dtypes = sorted(
+                            {r["dtype"] for r in (self._dispatch_rules or [])}
+                        )
+                        c_dtypes = sorted(
+                            {r["dtype"] for r in (self._combine_rules or [])}
+                        )
+                        logger.debug(
+                            "AUTO tuning: %s_%s_%s_ep%d — "
+                            "dispatch(%d rules, dtypes=%s) combine(%d rules, dtypes=%s)",
+                            gpu_arch,
+                            gpu_model,
+                            kt_str,
+                            config.world_size,
+                            len(self._dispatch_rules or []),
+                            d_dtypes,
+                            len(self._combine_rules or []),
+                            c_dtypes,
+                        )
             except Exception as exc:
-                import logging
-
-                logging.getLogger(__name__).debug(
-                    "Failed to load tuning config: %s", exc
+                logger.warning(
+                    "AUTO tuning: failed to load config (%s); "
+                    "using hard-coded fallback.",
+                    exc,
                 )
 
             if (

@@ -583,38 +583,36 @@ def test_main(
     # Separate profiling
     group.barrier()
     if multi_node:
-        # Auto-discover all Ep kernels from profiling
-        _disc_suppress = suppress_stdout_stderr if True else empty_suppress
-        with _disc_suppress():
+        # Auto-discover all Ep* kernels via a short CUDA profile, then feed the
+        # collected names back into bench_kineto() for the real timing pass.
+        with suppress_stdout_stderr():
             _disc_sched = torch.profiler.schedule(wait=1, warmup=0, active=1, repeat=1)
             with torch.profiler.profile(
                 activities=[torch.profiler.ProfilerActivity.CUDA], schedule=_disc_sched
             ) as _disc_prof:
                 for _ in range(2):
-                    if True:
-                        _l = torch.randn((8192, 8192), dtype=torch.float, device="cuda")
-                        _r = torch.randn((8192, 8192), dtype=torch.float, device="cuda")
-                        _l @ _r
-                        dist.all_reduce(torch.ones(1, dtype=torch.float, device="cuda"))
+                    # Lightweight GEMM + all_reduce to avoid catching CUDA stream
+                    # tails from the previous iteration in the same profile window.
+                    _l = torch.randn((8192, 8192), dtype=torch.float, device="cuda")
+                    _r = torch.randn((8192, 8192), dtype=torch.float, device="cuda")
+                    _l @ _r
+                    dist.all_reduce(torch.ones(1, dtype=torch.float, device="cuda"))
                     for _ in range(5):
                         test_func(zero_copy=False, use_fp8=bench_use_fp8)
                         torch.cuda.synchronize()
                     torch.cuda.synchronize()
                     _disc_prof.step()
-        _disc_lines = (
-            _disc_prof.key_averages()
-            .table(sort_by="cuda_time_total", max_name_column_width=200)
-            .split("\n")
-        )
-        _ep_kernels = []
-        for _line in _disc_lines:
-            for _prefix in ("EpDispatch", "EpCombine"):
-                if _prefix in _line:
-                    _name = _line.split()[0]
-                    if _name not in _ep_kernels:
-                        _ep_kernels.append(_name)
-        # if rank == 0:
-        #     print(f"[rank {rank}] Discovered Ep kernels: {_ep_kernels}", flush=True)
+        _ep_kernels: list[str] = []
+        for evt in _disc_prof.key_averages():
+            name = evt.key
+            if name.startswith("EpDispatch") or name.startswith("EpCombine"):
+                if name not in _ep_kernels:
+                    _ep_kernels.append(name)
+        if not _ep_kernels:
+            raise RuntimeError(
+                "Auto-discovery did not find any Ep* kernels in the CUDA profile; "
+                "cannot measure dispatch/combine bandwidth."
+            )
         all_kernel_names = tuple(_ep_kernels)
 
         all_durations = bench_kineto(
@@ -628,10 +626,6 @@ def test_main(
             suppress_kineto_output=True,
         )
         kernel_times = {n: t for n, t in zip(all_kernel_names, all_durations)}
-        # parts_str = " | ".join(
-        #     f"{n}={t * 1e6:.2f}us" for n, t in kernel_times.items()
-        # )
-        # print(f"[rank {rank}] Per-kernel: {parts_str}", flush=True)
 
         dispatch_t = sum(t for n, t in kernel_times.items() if "Dispatch" in n)
         combine_t = sum(t for n, t in kernel_times.items() if "Combine" in n)

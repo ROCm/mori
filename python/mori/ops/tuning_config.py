@@ -392,6 +392,48 @@ class TuningConfigManager:
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _match_rules(
+        sorted_rules: list[dict],
+        dtype_str: str,
+        num_tokens: int,
+        hidden_dim: int,
+        zero_copy: bool | None,
+        quant_type: str | None,
+        *,
+        require_hidden_match: bool,
+    ) -> LaunchParams | None:
+        """Inner lookup over *sorted_rules* with optional hidden_dim filtering.
+
+        Rules are sorted by num_tokens ascending (within each dtype/hidden
+        group).  We pick the tightest ceiling match, and if num_tokens
+        exceeds the largest recorded value we clamp to that rule.
+        """
+        last_match: dict | None = None
+        for rule in sorted_rules:
+            if rule["dtype"] != dtype_str:
+                continue
+            if require_hidden_match and rule["hidden_dim"] != hidden_dim:
+                continue
+            if zero_copy is not None and rule.get("zero_copy") != zero_copy:
+                continue
+            if quant_type is not None and rule.get("quant_type") != quant_type:
+                continue
+            last_match = rule
+            if num_tokens <= rule["num_tokens"]:
+                return LaunchParams(
+                    block_num=rule["block_num"],
+                    rdma_block_num=rule["rdma_block_num"],
+                    warp_per_block=rule["warp_per_block"],
+                )
+        if last_match is not None:
+            return LaunchParams(
+                block_num=last_match["block_num"],
+                rdma_block_num=last_match["rdma_block_num"],
+                warp_per_block=last_match["warp_per_block"],
+            )
+        return None
+
+    @staticmethod
     def lookup(
         sorted_rules: list[dict],
         dtype: torch.dtype,
@@ -402,29 +444,35 @@ class TuningConfigManager:
     ) -> LaunchParams | None:
         """Find the best matching launch params.
 
-        Exact-matches dtype, hidden_dim, and (for combine) zero_copy and
-        quant_type.  Then picks the tightest (smallest) rule num_tokens
-        that is >= actual num_tokens (ceiling match).
+        Exact-matches dtype, and (for combine) zero_copy and quant_type.
+        For num_tokens, picks the tightest ceiling match; if num_tokens
+        exceeds the largest recorded value the largest rule is used (clamp).
+        Prefers an exact hidden_dim match; if none is found, falls back to
+        any matching rule ignoring hidden_dim.
         """
         dtype_str = DTYPE_TO_CONFIG_STR.get(dtype)
         if dtype_str is None:
             return None
-        for rule in sorted_rules:
-            if rule["dtype"] != dtype_str:
-                continue
-            if rule["hidden_dim"] != hidden_dim:
-                continue
-            if zero_copy is not None and rule.get("zero_copy") != zero_copy:
-                continue
-            if quant_type is not None and rule.get("quant_type") != quant_type:
-                continue
-            if num_tokens <= rule["num_tokens"]:
-                return LaunchParams(
-                    block_num=rule["block_num"],
-                    rdma_block_num=rule["rdma_block_num"],
-                    warp_per_block=rule["warp_per_block"],
-                )
-        return None
+        result = TuningConfigManager._match_rules(
+            sorted_rules,
+            dtype_str,
+            num_tokens,
+            hidden_dim,
+            zero_copy,
+            quant_type,
+            require_hidden_match=True,
+        )
+        if result is not None:
+            return result
+        return TuningConfigManager._match_rules(
+            sorted_rules,
+            dtype_str,
+            num_tokens,
+            hidden_dim,
+            zero_copy,
+            quant_type,
+            require_hidden_match=False,
+        )
 
     # ------------------------------------------------------------------
     # Tuning result persistence

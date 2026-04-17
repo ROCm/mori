@@ -265,7 +265,8 @@ Get the source position of each dispatched token (for correctness verification).
 ```python
 torch.cuda.synchronize()
 src_token_pos = op.get_dispatch_src_token_pos()
-# src_token_pos[i] = src_rank * max_num_inp_token_per_rank + src_token_id
+# Encoding: src_token_pos[i] = src_rank * (world_size * max_num_inp_token_per_rank) + src_token_id
+# Use op.decode_send_flat_idx(pos) -> (src_rank, src_token_id) to decode safely.
 ```
 
 ### get_registered_combine_input_buffer()

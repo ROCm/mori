@@ -297,6 +297,9 @@ class EpDispatchCombineTestCase:
         else:
             self.combine_hidden_dim = self.dispatch_hidden_dim
 
+        assert (
+            256 % self.world_size == 0
+        ), f"world_size={self.world_size} must divide 256 (total experts)"
         self.config = mori.ops.EpDispatchCombineConfig(
             data_type=dtype,
             rank=self.rank,
