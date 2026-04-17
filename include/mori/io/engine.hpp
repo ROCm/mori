@@ -111,6 +111,8 @@ class IOEngine {
   void LoadScatterGatherModule(const std::string& hsacoPath);
   void LoadFabricCopyModule(const std::string& hsacoPath);
 
+  TelemetrySnapshot GetTelemetrySnapshot(BackendType type) const;
+
  private:
   struct RouteCacheKey {
     EngineKey remoteEngineKey;
