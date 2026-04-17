@@ -546,17 +546,20 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                 return false;
             }
         } else {
-            // SCATTER_MODE=0: zero only chunks_complete (cheap 4 bytes).
-            // Must be done BEFORE kernel launch on same stream so kernel
-            // sees chunks_complete=0 at entry.  Prevents race where compute
-            // blocks increment before block 0 reads it as a baseline.
+            // SCATTER_MODE=0: zero chunks_complete (4B) + ag_gate (4B) = 8B.
+            // CrossPeBarrier has chunks_complete and ag_gate adjacent, so a
+            // single 8-byte memset covers both.  Must run BEFORE kernel
+            // launch on the same stream.  Zeroing chunks_complete prevents
+            // the block-0 baseline race; zeroing ag_gate is required for
+            // in-kernel transit->user copy (compute blocks spin on ag_gate).
             hipError_t br = stream
                 ? hipMemsetAsync(&barrierPtr_->chunks_complete, 0,
-                                 sizeof(uint32_t), stream)
-                : hipMemset(&barrierPtr_->chunks_complete, 0, sizeof(uint32_t));
+                                 2 * sizeof(uint32_t), stream)
+                : hipMemset(&barrierPtr_->chunks_complete, 0,
+                            2 * sizeof(uint32_t));
             if (br != hipSuccess) {
                 fprintf(stderr,
-                        "PE %d: pipelined hipMemset(chunks_complete) failed: %s\n",
+                        "PE %d: pipelined hipMemset(chunks_complete+ag_gate) failed: %s\n",
                         myPe_, hipGetErrorString(br));
                 return false;
             }
@@ -571,12 +574,17 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         uint64_t ag_base      = pipeline_ag_gen_;
         uint64_t reduce_complete_base = pipeline_reduce_gen_;
 
+        // SCATTER_MODE=0 supports in-kernel transit->user copy, avoiding
+        // the extra hipMemcpyAsync.  SCATTER_MODE=1 still uses host copy.
+        T* in_kernel_output = (scatter_mode == 0 && copy_output_to_user_)
+            ? output : nullptr;
+
         if (scatter_mode == 1) {
             PipelinedAllReduceSdmaKernel<T, 1><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
                 barrierPtr_, inputSymmObj, total_count, chunk_elems,
-                scatter_base, ag_base, reduce_complete_base);
+                scatter_base, ag_base, reduce_complete_base, nullptr);
         } else if (external_scatter) {
             ScatterSdmaOnlyKernel<T><<<1, 512, 0, stream>>>(
                 myPe_, npes_, input, output_transit_buffer_obj_,
@@ -588,7 +596,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                     output_transit_buffer_obj_, flagsObj_,
                     barrierPtr_, application::SymmMemObjPtr{},
                     total_count, chunk_elems, scatter_base, ag_base,
-                    reduce_complete_base);
+                    reduce_complete_base, in_kernel_output);
             } else {
                 PipelinedAllReduceSdmaKernel<T, 0, false, true>
                     <<<blocks, threads, 0, stream>>>(
@@ -596,20 +604,20 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                     output_transit_buffer_obj_, flagsObj_,
                     barrierPtr_, application::SymmMemObjPtr{},
                     total_count, chunk_elems, scatter_base, ag_base,
-                    reduce_complete_base);
+                    reduce_complete_base, in_kernel_output);
             }
         } else if (multi_chunk) {
             PipelinedAllReduceSdmaKernel<T, 0, true><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
                 barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems,
-                scatter_base, ag_base, reduce_complete_base);
+                scatter_base, ag_base, reduce_complete_base, in_kernel_output);
         } else {
             PipelinedAllReduceSdmaKernel<T, 0, false><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
                 barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems,
-                scatter_base, ag_base, reduce_complete_base);
+                scatter_base, ag_base, reduce_complete_base, in_kernel_output);
         }
 
         pipeline_scatter_gen_ += numChunks_host;   // scatter SDMA only (qId=0)
@@ -623,7 +631,9 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             return false;
         }
 
-        if (copy_output_to_user_) {
+        // For SCATTER_MODE=0 the kernel already copied transit -> user.
+        // Only SCATTER_MODE=1 still needs host-side copy.
+        if (copy_output_to_user_ && scatter_mode != 0) {
             copy_output_to_user(output, total_count, stream);
         }
     } catch (const std::exception& e) {
