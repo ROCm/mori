@@ -83,6 +83,14 @@ void DummySsdTier::Clear() {
   used_ = 0;
 }
 
+std::vector<char> DummySsdTier::Read(const std::string& key) {
+  std::lock_guard<std::mutex> lk(mu_);
+  auto it = keys_.find(key);
+  if (it == keys_.end()) return {};
+  TouchLRU(key);
+  return std::vector<char>(it->second, 0);
+}
+
 std::string DummySsdTier::GetLRUKey() const {
   std::lock_guard<std::mutex> lk(mu_);
   if (lru_list_.empty()) return "";

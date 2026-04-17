@@ -52,7 +52,8 @@ class DummySsdTier : public TierBackend {
   std::pair<size_t, size_t> Capacity() const override;
   void Clear() override;
 
-  // Extended interface overrides for LRU-based eviction support
+  // Extended interface overrides
+  std::vector<char> Read(const std::string& key) override;
   std::string GetLRUKey() const override;
   std::vector<std::string> GetLRUCandidates(size_t max_candidates) const override;
 
