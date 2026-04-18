@@ -270,44 +270,6 @@ def _copy_jit_sources(root_dir: Path) -> None:
         _copytree(profiler_tools_src, jit_dir / "tools" / "profiler")
 
 
-_3RDPARTY_DIRS = ["3rdparty/spdlog", "3rdparty/msgpack-c"]
-
-
-def _ensure_3rdparty(root_dir: Path) -> None:
-    """Ensure 3rdparty submodule directories exist via git submodule update."""
-    missing = [
-        d
-        for d in _3RDPARTY_DIRS
-        if not (root_dir / d).is_dir() or not any((root_dir / d).iterdir())
-    ]
-    if not missing:
-        return
-
-    for d in missing:
-        (root_dir / d).mkdir(parents=True, exist_ok=True)
-
-    try:
-        subprocess.check_call(
-            ["git", "config", "--global", "--add", "safe.directory", str(root_dir)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        subprocess.check_call(
-            ["git", "submodule", "update", "--init", "--recursive"],
-            cwd=str(root_dir),
-            stdout=subprocess.DEVNULL,
-        )
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        pass
-
-    still_missing = [d for d in _3RDPARTY_DIRS if not any((root_dir / d).iterdir())]
-    if still_missing:
-        raise RuntimeError(
-            f"Missing 3rdparty dependencies: {still_missing}. "
-            "Run 'git submodule update --init --recursive' in the source directory."
-        )
-
-
 class CMakeBuild(build_ext):
     def run(self) -> None:
         try:
@@ -332,7 +294,6 @@ class CMakeBuild(build_ext):
 
         root_dir = Path(__file__).parent
 
-        _ensure_3rdparty(root_dir)
         build_dir = root_dir / os.environ.get("MORI_PYBUILD_DIR", "build")
         build_dir.mkdir(parents=True, exist_ok=True)
 
