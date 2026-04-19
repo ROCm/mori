@@ -57,6 +57,8 @@ jobs:
     name: mori intranode test
     needs: build
     runs-on: [self-hosted, MI355X-AINIC]
+    env:
+      MORI_RDMA_DEVICES: rocep105s0,rocep121s0,rocep137s0,rocep153s0,rocep233s0,rocep249s0,rocep25s0,rocep9s0
     timeout-minutes: 45
     steps:
       - name: Checkout
@@ -71,6 +73,7 @@ jobs:
         run: |
           $CT rm -f $CONTAINER 2>/dev/null || true
           CONTAINER_RUNTIME=$CT ./docker/ci_run.sh --name $CONTAINER \
+            -e MORI_RDMA_DEVICES=$MORI_RDMA_DEVICES \
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
             -w $GITHUB_WORKSPACE \
             $IMAGE sleep infinity
@@ -312,7 +315,7 @@ jobs:
           SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
           PORT=29140
           for KERNEL in v1 v1_ll; do
-            for TOKENS in 64 128 1024; do
+            for TOKENS in 64 128 1024 2048 4096; do
               echo "=== bench kernel=$KERNEL max-tokens=$TOKENS port=$PORT ==="
               NODE2_CMD="$CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT --rank 1 --master-addr $NODE1_HOST --master-port $PORT --ifname $NODE2_IFNAME --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS"
               ssh -p $NODE2_PORT $(whoami)@$NODE2_HOST "$NODE2_CMD" &
@@ -331,7 +334,7 @@ jobs:
           SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
           PORT=29160
           for KERNEL in v1 v1_ll; do
-            for TOKENS in 64 128 1024; do
+            for TOKENS in 64 128 1024 2048 4096; do
               echo "=== stress kernel=$KERNEL max-tokens=$TOKENS port=$PORT ==="
               NODE2_CMD="$CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT --rank 1 --master-addr $NODE1_HOST --master-port $PORT --ifname $NODE2_IFNAME --cmd stress --kernel-type $KERNEL --max-tokens $TOKENS"
               ssh -p $NODE2_PORT $(whoami)@$NODE2_HOST "$NODE2_CMD" &
