@@ -348,6 +348,27 @@ jobs:
             done
           done
 
+      - name: MORI-EP internode async kernel test
+        run: |
+          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
+          PORT=29180
+          for TOKENS in 64 128; do
+            echo "=== async_ll test max-tokens=$TOKENS port=$PORT ==="
+            NODE2_CMD="$CT exec -e GPU_PER_NODE=8 -e MORI_ENABLE_SDMA=1 $CONTAINER bash $SCRIPT --rank 1 --master-addr $NODE1_HOST --master-port $PORT --ifname $NODE2_IFNAME --cmd test --kernel-type async_ll --quant-type none --dtype bf16 --max-tokens $TOKENS"
+            ssh -p $NODE2_PORT $(whoami)@$NODE2_HOST "$NODE2_CMD" &
+            $CT exec \
+              -e GPU_PER_NODE=8 \
+              -e MORI_ENABLE_SDMA=1 \
+              $CONTAINER bash $SCRIPT \
+              --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+              --ifname $NODE1_IFNAME \
+              --cmd test --kernel-type async_ll \
+              --quant-type none --dtype bf16 --max-tokens $TOKENS
+            wait
+            sleep 5
+            PORT=$((PORT + 1))
+          done
+
       - name: Cleanup node1
         if: always()
         run: |
