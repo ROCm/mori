@@ -365,7 +365,7 @@ jobs:
                 --ifname $NODE1_IFNAME \
                 --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS
               wait
-              sleep 5
+              sleep 1
               PORT=$((PORT + 1))
             done
           done
@@ -384,7 +384,7 @@ jobs:
                 --ifname $NODE1_IFNAME \
                 --cmd stress --kernel-type $KERNEL --max-tokens $TOKENS
               wait
-              sleep 5
+              sleep 1
               PORT=$((PORT + 1))
             done
           done
@@ -406,7 +406,7 @@ jobs:
               --cmd test --kernel-type async_ll \
               --quant-type none --dtype bf16 --max-tokens $TOKENS
             wait
-            sleep 5
+            sleep 1
             PORT=$((PORT + 1))
           done
 
