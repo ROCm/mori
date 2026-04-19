@@ -161,7 +161,6 @@ _NIC_LIB_NAMES: dict[str, str] = {
 }
 
 
-
 def _has_nic_lib(nic: str) -> bool:
     """Check whether the user-space RDMA verbs provider library is installed.
 
