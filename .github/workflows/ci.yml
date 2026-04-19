@@ -16,8 +16,14 @@ env:
 
 jobs:
   build:
-    name: mori build
-    runs-on: [self-hosted, MI355X-AINIC]
+    name: mori build (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: MI355X_AINIC
+            runner: [self-hosted, MI355X-AINIC]
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -54,11 +60,16 @@ jobs:
           $CT rm -f $CONTAINER || true
 
   intranode-test:
-    name: mori intranode test
+    name: mori intranode test (${{ matrix.platform }})
     needs: build
-    runs-on: [self-hosted, MI355X-AINIC]
-    env:
-      MORI_RDMA_DEVICES: rocep105s0,rocep121s0,rocep137s0,rocep153s0,rocep233s0,rocep249s0,rocep25s0,rocep9s0
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: MI355X_AINIC
+            runner: [self-hosted, MI355X-AINIC]
+            rdma_devices: rocep105s0,rocep121s0,rocep137s0,rocep153s0,rocep233s0,rocep249s0,rocep25s0,rocep9s0
     timeout-minutes: 45
     steps:
       - name: Checkout
@@ -73,7 +84,7 @@ jobs:
         run: |
           $CT rm -f $CONTAINER 2>/dev/null || true
           CONTAINER_RUNTIME=$CT ./docker/ci_run.sh --name $CONTAINER \
-            -e MORI_RDMA_DEVICES=$MORI_RDMA_DEVICES \
+            -e MORI_RDMA_DEVICES=${{ matrix.rdma_devices }} \
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
             -w $GITHUB_WORKSPACE \
             $IMAGE sleep infinity
@@ -113,13 +124,6 @@ jobs:
       # MORI-IO: skipped on MI355X-AINIC — intra-node cross-NIC RDMA loopback
       # is blocked by rail-optimized source routing. Covered by internode-test.
       # - name: MORI-IO
-      #   run: |
-      #     $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
-      #       cd $GITHUB_WORKSPACE
-      #       timeout 60 pytest tests/python/io/ -v
-      #       MORI_IO_XGMI_SCATTER_GATHER_THRESHOLD=4 \
-      #         timeout 120 pytest tests/python/io/test_discrete_buffer.py -v -k 'not performance'
-      #     "
 
       - name: MORI-IR
         run: |
@@ -144,15 +148,6 @@ jobs:
       # MORI-CPP shmem (IBGDA): skipped on MI355X-AINIC — IBGDA path requires
       # intra-node cross-NIC RDMA which is blocked by rail-optimized source routing.
       # - name: MORI-CPP shmem (IBGDA)
-      #   run: |
-      #     $CT exec $CONTAINER bash -c "
-      #       cd $GITHUB_WORKSPACE
-      #       MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_put_thread
-      #       MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_get_thread
-      #       MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_put_signal_thread
-      #       MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/atomic_nonfetch_thread
-      #       MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/atomic_fetch_thread
-      #     "
 
       - name: MORI-CCL/shmem
         run: |
@@ -185,20 +180,81 @@ jobs:
           $CT exec $CONTAINER chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
           $CT rm -f $CONTAINER || true
 
+  # TODO: add JAX intranode test once conftest.py torch dependency is resolved
+  # and gfx950 JAX image is available.
+  # jax-intranode-test:
+  #   name: mori JAX intranode test (${{ matrix.platform }})
+  #   needs: build
+  #   runs-on: ${{ matrix.runner }}
+  #   strategy:
+  #     fail-fast: false
+  #     matrix:
+  #       include:
+  #         - platform: MI355X_AINIC
+  #           runner: [self-hosted, MI355X-AINIC]
+  #   timeout-minutes: 15
+  #   steps:
+  #     - name: Checkout
+  #       uses: actions/checkout@v4
+  #       with:
+  #         submodules: true
+  #
+  #     - name: Build JAX CI image
+  #       run: $CT build --network=host --build-arg GPU_TARGET=gfx950 -t rocm/mori:jax-ci -f docker/Dockerfile.jax091-rocm711 .
+  #
+  #     - name: Start container
+  #       run: |
+  #         $CT rm -f ${CONTAINER}_jax 2>/dev/null || true
+  #         CONTAINER_RUNTIME=$CT ./docker/ci_run.sh --name ${CONTAINER}_jax \
+  #           -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
+  #           -w $GITHUB_WORKSPACE \
+  #           rocm/mori:jax-ci sleep infinity
+  #
+  #     - name: Install mori (XLA FFI)
+  #       run: |
+  #         $CT exec ${CONTAINER}_jax bash -c \
+  #           "cd $GITHUB_WORKSPACE && BUILD_XLA_FFI_OPS=ON pip install --break-system-packages -v ."
+  #
+  #     - name: MORI-EP JAX test
+  #       run: |
+  #         $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE ${CONTAINER}_jax bash -c "
+  #           cd $GITHUB_WORKSPACE
+  #           MORI_KERNEL_DIR=\$(ls -d $GITHUB_WORKSPACE/build/lib/gfx* | head -1) \
+  #           timeout 300 pytest tests/python/ops/test_dispatch_combine_jax.py -s -v
+  #         "
+  #
+  #     - name: Cleanup
+  #       if: always()
+  #       run: $CT rm -f ${CONTAINER}_jax || true
+
   internode-test:
-    name: mori internode test
+    name: mori internode test (${{ matrix.platform }})
     needs: [build, intranode-test]
-    runs-on: [self-hosted, MI355X-AINIC]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: MI355X_AINIC
+            runner: [self-hosted, MI355X-AINIC]
+            node1_host: 10.2.80.22
+            node2_host: 10.2.80.20
+            node2_port: 22
+            node1_ifname: enp193s0f1np1
+            node2_ifname: enp193s0f1np1
+            rdma_devices: rocep105s0,rocep121s0,rocep137s0,rocep153s0,rocep233s0,rocep249s0,rocep25s0,rocep9s0
+            rdma_sl: 3
+            rdma_tc: 104
     env:
-      NODE1_HOST: 10.2.80.22
-      NODE2_HOST: 10.2.80.20
-      NODE2_PORT: 22
-      NODE1_IFNAME: enp193s0f1np1
-      NODE2_IFNAME: enp193s0f1np1
-      MORI_RDMA_DEVICES: rocep105s0,rocep121s0,rocep137s0,rocep153s0,rocep233s0,rocep249s0,rocep25s0,rocep9s0
-      MORI_RDMA_SL: 3
-      MORI_RDMA_TC: 104
-      MORI_SOCKET_IFNAME: enp193s0f1np1
+      NODE1_HOST: ${{ matrix.node1_host }}
+      NODE2_HOST: ${{ matrix.node2_host }}
+      NODE2_PORT: ${{ matrix.node2_port }}
+      NODE1_IFNAME: ${{ matrix.node1_ifname }}
+      NODE2_IFNAME: ${{ matrix.node2_ifname }}
+      MORI_RDMA_DEVICES: ${{ matrix.rdma_devices }}
+      MORI_RDMA_SL: ${{ matrix.rdma_sl }}
+      MORI_RDMA_TC: ${{ matrix.rdma_tc }}
+      MORI_SOCKET_IFNAME: ${{ matrix.node1_ifname }}
     timeout-minutes: 45
     steps:
       - name: Checkout
