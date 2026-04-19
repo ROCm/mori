@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# ci_run.sh — Launch a Docker container with automatic NIC detection and
+# ci_run.sh — Launch a container with automatic NIC detection and
 # bind-mount of out-of-tree RDMA userspace libraries.
 #
 # Usage: ci_run.sh [docker-run-args...] IMAGE [cmd...]
@@ -9,7 +9,8 @@ set -euo pipefail
 #         ./docker/ci_run.sh --name mori_ci -v /home:/home rocm/mori:ci bash
 #
 # Environment:
-#   MORI_NIC_TYPE   — Override auto-detection (mlx5 | bnxt | ionic)
+#   MORI_NIC_TYPE        — Override auto-detection (mlx5 | bnxt | ionic)
+#   CONTAINER_RUNTIME    — Override runtime (docker | podman); auto-detected
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -90,9 +91,8 @@ nic_mount_flags() {
                     flags+=(-v "$lib:/usr/lib/x86_64-linux-gnu/$(basename "$lib")")
                 fi
             done
-            flags+=(--tmpfs /etc/libibverbs.d:rw,size=4k)
-            if [[ -f /etc/libibverbs.d/bnxt_re.driver ]]; then
-                flags+=(-v /etc/libibverbs.d/bnxt_re.driver:/etc/libibverbs.d/bnxt_re.driver)
+            if [[ -d /etc/libibverbs.d ]]; then
+                flags+=(-v /etc/libibverbs.d:/etc/libibverbs.d:ro)
             fi
             ;;
         ionic)
@@ -101,14 +101,29 @@ nic_mount_flags() {
             if [[ -n "$host_ibverbs" ]]; then
                 flags+=(-v "$host_ibverbs:/lib/x86_64-linux-gnu/libibverbs.so.1")
             fi
-            for lib in /usr/local/lib/libionic*.so; do
-                if [[ -f "$lib" ]]; then
-                    flags+=(-v "$lib:/usr/lib/x86_64-linux-gnu/$(basename "$lib")")
-                fi
+            local ionic_dirs=(/usr/local/lib /usr/lib/x86_64-linux-gnu)
+            for dir in "${ionic_dirs[@]}"; do
+                for lib in "$dir"/libionic*.so; do
+                    if [[ -f "$lib" ]]; then
+                        local real
+                        real=$(readlink -f "$lib")
+                        if [[ -f "$real" ]]; then
+                            flags+=(-v "$real:$real")
+                        fi
+                        flags+=(-v "$lib:/usr/lib/x86_64-linux-gnu/$(basename "$lib")")
+                    fi
+                done
             done
-            flags+=(--tmpfs /etc/libibverbs.d:rw,size=4k)
-            if [[ -f /etc/libibverbs.d/ionic.driver ]]; then
-                flags+=(-v /etc/libibverbs.d/ionic.driver:/etc/libibverbs.d/ionic.driver)
+            local provider_dir=/usr/lib/x86_64-linux-gnu/libibverbs
+            if [[ -d "$provider_dir" ]]; then
+                for lib in "$provider_dir"/libionic-rdmav*.so; do
+                    if [[ -f "$lib" ]]; then
+                        flags+=(-v "$lib:$lib")
+                    fi
+                done
+            fi
+            if [[ -d /etc/libibverbs.d ]]; then
+                flags+=(-v /etc/libibverbs.d:/etc/libibverbs.d:ro)
             fi
             ;;
         mlx5)
@@ -118,21 +133,46 @@ nic_mount_flags() {
     echo "${flags[@]}"
 }
 
+# ── Container runtime detection ───────────────────────────────────────────────
+
+detect_runtime() {
+    if [[ -n "${CONTAINER_RUNTIME:-}" ]]; then
+        echo "$CONTAINER_RUNTIME"
+        return
+    fi
+    if docker info &>/dev/null; then
+        echo "docker"
+    elif command -v podman &>/dev/null; then
+        echo "podman"
+    elif command -v docker &>/dev/null; then
+        echo "docker"
+    else
+        echo "docker"
+    fi
+}
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
+RUNTIME=$(detect_runtime)
 NIC_TYPE=$(detect_nic_type)
-echo "[ci_run] Detected NIC type: $NIC_TYPE"
+echo "[ci_run] Runtime: $RUNTIME | NIC type: $NIC_TYPE"
 
 read -ra NIC_MOUNTS <<< "$(nic_mount_flags "$NIC_TYPE")"
 
-exec docker run \
+EXTRA_ARGS=()
+if [[ "$RUNTIME" == "podman" ]]; then
+    EXTRA_ARGS+=(--security-opt label=disable)
+else
+    EXTRA_ARGS+=(--ulimit nproc=100000:100000 --pids-limit=-1)
+fi
+
+exec "$RUNTIME" run \
     --group-add video \
     --network=host \
-    --ulimit nproc=100000:100000 \
-    --pids-limit=-1 \
     --device=/dev/kfd \
     --device=/dev/dri \
     --device=/dev/infiniband \
-    -d --ipc=host --privileged -it \
+    -d --ipc=host --privileged \
+    "${EXTRA_ARGS[@]}" \
     "${NIC_MOUNTS[@]}" \
     "$@"
