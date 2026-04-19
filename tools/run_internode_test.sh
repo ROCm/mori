@@ -54,7 +54,7 @@ EXTRA_ARGS=()
 [[ -n "$QUANT_TYPE" ]] && EXTRA_ARGS+=(--quant-type "$QUANT_TYPE")
 [[ -n "$DTYPE" ]]       && EXTRA_ARGS+=(--dtype "$DTYPE")
 
-exec timeout 120 torchrun \
+exec timeout "${MORI_INTERNODE_TIMEOUT:-120}" torchrun \
   --nnodes=2 \
   --node_rank="$RANK" \
   --nproc_per_node=1 \

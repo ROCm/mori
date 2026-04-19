@@ -8,299 +8,364 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+env:
+  IMAGE: rocm/mori:ci
+  BASE_IMAGE: rocm/pytorch:rocm7.2.1_ubuntu24.04_py3.12_pytorch_release_2.8.0
+  CONTAINER: mori_ci_${{ github.run_id }}
+  CT: ${{ vars.CONTAINER_RUNTIME || 'podman' }}
+
 jobs:
   build:
-    name: mori build (platform:${{ matrix.platform }})
+    name: mori build (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
-      matrix: ${{ fromJson(vars.CI_MATRIX) }}
-    container:
-      image: rocm/pytorch-private:mori_rocm7.2_ubuntu22.04_py3.10_pytorch_bnxt_ionic
-      credentials:
-        username: ${{ secrets.DOCKER_USERNAME }}
-        password: ${{ secrets.DOCKER_PASSWORD }}
-      options: >-
-        --device=/dev/kfd --device=/dev/dri --device=/dev/infiniband
-        --group-add video --ipc=host --privileged
-    timeout-minutes: 10
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          submodules: true
-
-      - name: Build and install mori
-        run: pip install .
-
-      - name: Build and install mori (with examples)
-        run: BUILD_EXAMPLES=ON pip install .
-
-      - name: Verify installation
-        run: python -c "import mori; print('OK')"
-
-  intranode-test:
-    name: mori intranode test (platform:${{ matrix.platform }})
-    needs: build
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJson(vars.CI_MATRIX) }}
-    container:
-      image: rocm/pytorch-private:mori_rocm7.2_ubuntu22.04_py3.10_pytorch_bnxt_ionic
-      credentials:
-        username: ${{ secrets.DOCKER_USERNAME }}
-        password: ${{ secrets.DOCKER_PASSWORD }}
-      options: >-
-        --device=/dev/kfd --device=/dev/dri --device=/dev/infiniband
-        --group-add video --ipc=host --privileged
-        -v /root/.ssh:/root/.ssh
-    timeout-minutes: 45
-    env:
-      PYTHONPATH: ${{ github.workspace }}:$PYTHONPATH
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          submodules: true
-
-      - name: Install mori
-        run: |
-          cd $GITHUB_WORKSPACE
-          BUILD_EXAMPLES=ON pip install . && pip install prettytable
-
-      - name: MORI-EP
-        run: |
-          cd $GITHUB_WORKSPACE
-          timeout 300 pytest tests/python/ops/test_dispatch_combine_intranode.py -v
-          timeout 300 pytest tests/python/ops/test_dispatch_combine_internode_v1.py -v
-          timeout 300 pytest tests/python/ops/test_dispatch_combine_async_ll.py -v
-
-      - name: MORI-EP bench
-        run: |
-          cd $GITHUB_WORKSPACE
-          timeout 120 python3 tests/python/ops/bench_dispatch_combine.py
-
-      - name: MORI-IO
-        run: |
-          cd $GITHUB_WORKSPACE
-          timeout 60 pytest tests/python/io/ -v
-          MORI_IO_XGMI_SCATTER_GATHER_THRESHOLD=4 \
-            timeout 120 pytest tests/python/io/test_discrete_buffer.py -v -k 'not performance'
-
-      - name: MORI-IR
-        env:
-          HOME: /tmp
-        run: |
-          cd $GITHUB_WORKSPACE
-          timeout 60 torchrun --nproc_per_node=2 examples/shmem/ir/test_triton_shmem.py
-          timeout 60 torchrun --nproc_per_node=8 examples/shmem/ir/test_triton_allreduce.py
-          MORI_DISABLE_P2P=ON timeout 60 torchrun --nproc_per_node=8 examples/shmem/ir/test_triton_allreduce.py
-
-      - name: MORI-CPP shmem (P2P)
-        run: |
-          cd $GITHUB_WORKSPACE
-          timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_put_thread
-          timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_get_thread
-          # timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_put_imm_thread
-          timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_put_signal_thread
-          timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/atomic_nonfetch_thread
-          timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/atomic_fetch_thread
-
-      - name: MORI-CPP shmem (IBGDA)
-        run: |
-          cd $GITHUB_WORKSPACE
-          MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_put_thread
-          MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_get_thread
-          # MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_put_imm_thread
-          MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_put_signal_thread
-          MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/atomic_nonfetch_thread
-          MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/atomic_fetch_thread
-
-      - name: MORI-CCL/shmem
-        run: |
-          cd $GITHUB_WORKSPACE
-          timeout 600 pytest tests/python/shmem/test_api.py -v
-
-      - name: MORI-EP async kernel bench (intranode)
-        if: true
-        run: |
-          cd $GITHUB_WORKSPACE
-          PORT=12390
-          for TOKENS in 64 128; do
-            echo "=== async_ll bench max-tokens=$TOKENS port=$PORT ==="
-            MORI_ENABLE_SDMA=1 GPU_PER_NODE=8 \
-            timeout 120 torchrun \
-              --nnodes=1 --node_rank=0 --nproc_per_node=1 \
-              --master_addr=127.0.0.1 --master_port=$PORT \
-              examples/ops/dispatch_combine/test_dispatch_combine_internode.py \
-              --kernel-type async_ll --num-qp 2 --cmd bench \
-              --dtype bf16 --max-tokens $TOKENS
-            PORT=$((PORT + 1))
-          done
-
-  jax-intranode-test:
-    name: mori JAX intranode test (platform:${{ matrix.platform }})
-    needs: build
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJson(vars.CI_MATRIX) }}
-    container:
-      image: rocm/pytorch-private:mori_jax091_rocm711
-      credentials:
-        username: ${{ secrets.DOCKER_USERNAME }}
-        password: ${{ secrets.DOCKER_PASSWORD }}
-      options: >-
-        --device=/dev/kfd --device=/dev/dri --device=/dev/infiniband
-        --group-add video --ipc=host --privileged
+      matrix:
+        include:
+          - platform: MI355X_AINIC
+            runner: [self-hosted, MI355X-AINIC]
     timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          submodules: true
 
-      - name: Install mori (XLA FFI)
+      - name: Build CI image
+        run: $CT build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE -t $IMAGE -f docker/Dockerfile.dev .
+
+      - name: Start container
         run: |
-          cd $GITHUB_WORKSPACE
-          BUILD_XLA_FFI_OPS=ON \
-          pip install --break-system-packages -v .
+          $CT rm -f $CONTAINER 2>/dev/null || true
+          CONTAINER_RUNTIME=$CT ./docker/ci_run.sh --name $CONTAINER \
+            -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
+            -w $GITHUB_WORKSPACE \
+            $IMAGE sleep infinity
+          $CT exec $CONTAINER \
+            git config --global --add safe.directory $GITHUB_WORKSPACE
 
-      - name: MORI-EP JAX test
+      - name: Build and install mori
+        run: $CT exec $CONTAINER pip install .
+
+      - name: Build and install mori (with examples)
+        run: $CT exec $CONTAINER bash -c "BUILD_EXAMPLES=ON pip install ."
+
+      - name: Verify installation
+        run: $CT exec $CONTAINER python -c "import mori; print('OK')"
+
+      - name: Cleanup
+        if: always()
         run: |
-          cd $GITHUB_WORKSPACE
-          MORI_KERNEL_DIR=$(ls -d $GITHUB_WORKSPACE/build/lib/gfx* | head -1) \
-          timeout 300 pytest tests/python/ops/test_dispatch_combine_jax.py -s -v
+          $CT exec $CONTAINER chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
+          $CT rm -f $CONTAINER || true
 
-  internode-test:
-    name: mori internode test (platform:${{ matrix.platform }})
-    needs: [build, intranode-test]
-    if: needs.build.result == 'success'
+  intranode-test:
+    name: mori intranode test (${{ matrix.platform }})
+    needs: build
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
-      matrix: ${{ fromJson(vars.CI_MATRIX) }}
+      matrix:
+        include:
+          - platform: MI355X_AINIC
+            runner: [self-hosted, MI355X-AINIC]
+            rdma_devices: rocep105s0,rocep121s0,rocep137s0,rocep153s0,rocep233s0,rocep249s0,rocep25s0,rocep9s0
     timeout-minutes: 45
-    env:
-      IMAGE: rocm/pytorch-private:mori_rocm7.2_ubuntu22.04_py3.10_pytorch_bnxt_ionic
-      CONTAINER: mori_ci_${{ github.run_id }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           submodules: true
 
-      - name: Docker login
+      - name: Build CI image
+        run: $CT build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE -t $IMAGE -f docker/Dockerfile.dev .
+
+      - name: Start container
         run: |
-          echo '${{ secrets.DOCKER_PASSWORD }}' \
-            | docker login -u '${{ secrets.DOCKER_USERNAME }}' --password-stdin
+          $CT rm -f $CONTAINER 2>/dev/null || true
+          CONTAINER_RUNTIME=$CT ./docker/ci_run.sh --name $CONTAINER \
+            -e MORI_RDMA_DEVICES=${{ matrix.rdma_devices }} \
+            -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
+            -w $GITHUB_WORKSPACE \
+            $IMAGE sleep infinity
+          $CT exec $CONTAINER \
+            git config --global --add safe.directory $GITHUB_WORKSPACE
+
+      - name: Install mori
+        run: |
+          $CT exec $CONTAINER bash -c \
+            "cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install -e . && pip install prettytable"
+
+      - name: MORI-EP (intranode)
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE && timeout 300 pytest tests/python/ops/test_dispatch_combine_intranode.py -v
+          "
+
+      - name: MORI-EP (internode_v1)
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE && timeout 300 pytest tests/python/ops/test_dispatch_combine_internode_v1.py -v
+          "
+
+      - name: MORI-EP (async_ll)
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE && timeout 300 pytest tests/python/ops/test_dispatch_combine_async_ll.py -v
+          "
+
+      - name: MORI-EP bench
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE
+            timeout 120 python3 tests/python/ops/bench_dispatch_combine.py
+          "
+
+      # MORI-IO: skipped on MI355X-AINIC — intra-node cross-NIC RDMA loopback
+      # is blocked by rail-optimized source routing. Covered by internode-test.
+      # - name: MORI-IO
+
+      - name: MORI-IR
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE -e HOME=/tmp $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE
+            timeout 60 torchrun --nproc_per_node=2 examples/shmem/ir/test_triton_shmem.py
+            timeout 60 torchrun --nproc_per_node=8 examples/shmem/ir/test_triton_allreduce.py
+            # MORI_DISABLE_P2P=ON skipped: intra-node RDMA blocked by rail-optimized source routing
+          "
+
+      - name: MORI-CPP shmem (P2P)
+        run: |
+          $CT exec $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE
+            timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_put_thread
+            timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_get_thread
+            timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_put_signal_thread
+            timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/atomic_nonfetch_thread
+            timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/atomic_fetch_thread
+          "
+
+      # MORI-CPP shmem (IBGDA): skipped on MI355X-AINIC — IBGDA path requires
+      # intra-node cross-NIC RDMA which is blocked by rail-optimized source routing.
+      # - name: MORI-CPP shmem (IBGDA)
+
+      - name: MORI-CCL/shmem
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE
+            timeout 600 pytest tests/python/shmem/test_api.py -v
+          "
+
+      - name: MORI-EP async kernel bench (intranode)
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE
+            PORT=12390
+            for TOKENS in 64 128; do
+              echo \"=== async_ll bench max-tokens=\$TOKENS port=\$PORT ===\"
+              MORI_ENABLE_SDMA=1 GPU_PER_NODE=8 \
+              timeout 120 torchrun \
+                --nnodes=1 --node_rank=0 --nproc_per_node=1 \
+                --master_addr=127.0.0.1 --master_port=\$PORT \
+                examples/ops/dispatch_combine/test_dispatch_combine_internode.py \
+                --kernel-type async_ll --num-qp 2 --cmd bench \
+                --dtype bf16 --max-tokens \$TOKENS
+              PORT=\$((PORT + 1))
+            done
+          "
+
+      - name: Cleanup
+        if: always()
+        run: |
+          $CT exec $CONTAINER chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
+          $CT rm -f $CONTAINER || true
+
+  # TODO: add JAX intranode test once conftest.py torch dependency is resolved
+  # and gfx950 JAX image is available.
+  # jax-intranode-test:
+  #   name: mori JAX intranode test (${{ matrix.platform }})
+  #   needs: build
+  #   runs-on: ${{ matrix.runner }}
+  #   strategy:
+  #     fail-fast: false
+  #     matrix:
+  #       include:
+  #         - platform: MI355X_AINIC
+  #           runner: [self-hosted, MI355X-AINIC]
+  #   timeout-minutes: 15
+  #   steps:
+  #     - name: Checkout
+  #       uses: actions/checkout@v4
+  #       with:
+  #         submodules: true
+  #
+  #     - name: Build JAX CI image
+  #       run: $CT build --network=host --build-arg GPU_TARGET=gfx950 -t rocm/mori:jax-ci -f docker/Dockerfile.jax091-rocm711 .
+  #
+  #     - name: Start container
+  #       run: |
+  #         $CT rm -f ${CONTAINER}_jax 2>/dev/null || true
+  #         CONTAINER_RUNTIME=$CT ./docker/ci_run.sh --name ${CONTAINER}_jax \
+  #           -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
+  #           -w $GITHUB_WORKSPACE \
+  #           rocm/mori:jax-ci sleep infinity
+  #
+  #     - name: Install mori (XLA FFI)
+  #       run: |
+  #         $CT exec ${CONTAINER}_jax bash -c \
+  #           "cd $GITHUB_WORKSPACE && BUILD_XLA_FFI_OPS=ON pip install --break-system-packages -v ."
+  #
+  #     - name: MORI-EP JAX test
+  #       run: |
+  #         $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE ${CONTAINER}_jax bash -c "
+  #           cd $GITHUB_WORKSPACE
+  #           MORI_KERNEL_DIR=\$(ls -d $GITHUB_WORKSPACE/build/lib/gfx* | head -1) \
+  #           timeout 300 pytest tests/python/ops/test_dispatch_combine_jax.py -s -v
+  #         "
+  #
+  #     - name: Cleanup
+  #       if: always()
+  #       run: $CT rm -f ${CONTAINER}_jax || true
+
+  internode-test:
+    name: mori internode test (${{ matrix.platform }})
+    needs: [build, intranode-test]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: MI355X_AINIC
+            runner: [self-hosted, MI355X-AINIC]
+            node1_host: 10.2.80.22
+            node2_host: 10.2.80.20
+            node2_port: 22
+            node1_ifname: enp193s0f1np1
+            node2_ifname: enp193s0f1np1
+            rdma_devices: rocep105s0,rocep121s0,rocep137s0,rocep153s0,rocep233s0,rocep249s0,rocep25s0,rocep9s0
+            rdma_sl: 3
+            rdma_tc: 104
+    env:
+      NODE1_HOST: ${{ matrix.node1_host }}
+      NODE2_HOST: ${{ matrix.node2_host }}
+      NODE2_PORT: ${{ matrix.node2_port }}
+      NODE1_IFNAME: ${{ matrix.node1_ifname }}
+      NODE2_IFNAME: ${{ matrix.node2_ifname }}
+      MORI_RDMA_DEVICES: ${{ matrix.rdma_devices }}
+      MORI_RDMA_SL: ${{ matrix.rdma_sl }}
+      MORI_RDMA_TC: ${{ matrix.rdma_tc }}
+      MORI_SOCKET_IFNAME: ${{ matrix.node1_ifname }}
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Build CI image
+        run: $CT build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE -t $IMAGE -f docker/Dockerfile.dev .
 
       - name: Start container on node1
         run: |
-          docker rm -f $CONTAINER 2>/dev/null || true
-          docker run -d \
-            --name $CONTAINER \
-            --network=host \
-            --device=/dev/kfd --device=/dev/dri --device=/dev/infiniband \
-            --group-add video --ipc=host --privileged \
-            -v /root/.ssh:/root/.ssh \
+          $CT rm -f $CONTAINER 2>/dev/null || true
+          CONTAINER_RUNTIME=$CT ./docker/ci_run.sh --name $CONTAINER \
+            -e MORI_RDMA_DEVICES=$MORI_RDMA_DEVICES \
+            -e MORI_RDMA_SL=$MORI_RDMA_SL \
+            -e MORI_RDMA_TC=$MORI_RDMA_TC \
+            -e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME \
+            -e GLOO_SOCKET_IFNAME=$NODE1_IFNAME \
+            -e NCCL_SOCKET_IFNAME=$NODE1_IFNAME \
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
+            -w $GITHUB_WORKSPACE \
             $IMAGE sleep infinity
+          $CT exec $CONTAINER \
+            git config --global --add safe.directory $GITHUB_WORKSPACE
 
       - name: Start container on node2
         run: |
-          ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} "
-            echo '${{ secrets.DOCKER_PASSWORD }}' \
-              | docker login -u '${{ secrets.DOCKER_USERNAME }}' --password-stdin
-            docker rm -f $CONTAINER 2>/dev/null || true
+          ssh -p $NODE2_PORT $(whoami)@$NODE2_HOST "
+            $CT rm -f $CONTAINER 2>/dev/null || true
             mkdir -p $GITHUB_WORKSPACE
-            docker run -d \
-              --name $CONTAINER \
-              --network=host \
-              --device=/dev/kfd --device=/dev/dri --device=/dev/infiniband \
-              --group-add video --ipc=host --privileged \
+          "
+          rsync -az --exclude='.git' \
+            -e "ssh -p $NODE2_PORT" \
+            $GITHUB_WORKSPACE/ \
+            $(whoami)@$NODE2_HOST:$GITHUB_WORKSPACE/
+          ssh -p $NODE2_PORT $(whoami)@$NODE2_HOST "
+            cd $GITHUB_WORKSPACE &&
+            $CT build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE -t $IMAGE -f docker/Dockerfile.dev . &&
+            CONTAINER_RUNTIME=$CT ./docker/ci_run.sh --name $CONTAINER \
+              -e MORI_RDMA_DEVICES=$MORI_RDMA_DEVICES \
+              -e MORI_RDMA_SL=$MORI_RDMA_SL \
+              -e MORI_RDMA_TC=$MORI_RDMA_TC \
+              -e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME \
+              -e GLOO_SOCKET_IFNAME=$NODE2_IFNAME \
+              -e NCCL_SOCKET_IFNAME=$NODE2_IFNAME \
               -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
-              $IMAGE sleep infinity
+              -w $GITHUB_WORKSPACE \
+              $IMAGE sleep infinity &&
+            $CT exec $CONTAINER \
+              git config --global --add safe.directory $GITHUB_WORKSPACE
           "
 
-      - name: Sync source to node2
+      - name: Install mori (node1)
         run: |
-          rsync -az --exclude='.git' \
-            -e "ssh -p ${{ matrix.node2_port }}" \
-            $GITHUB_WORKSPACE/ \
-            root@${{ matrix.node2_host }}:$GITHUB_WORKSPACE/
+          $CT exec $CONTAINER bash -c \
+            "cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install -e . && pip install prettytable"
 
-      - name: Install mori and deps (node1)
+      - name: Install mori (node2)
         run: |
-          docker exec $CONTAINER \
-            bash -c "cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install . && pip install prettytable"
+          ssh -p $NODE2_PORT $(whoami)@$NODE2_HOST \
+            "$CT exec $CONTAINER bash -c 'cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install -e . && pip install prettytable'"
 
-      - name: Install mori and deps (node2)
-        run: |
-          ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} \
-            "docker exec $CONTAINER bash -c 'cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install . && pip install prettytable'"
-
-      - name: MORI-IO internode benchmark
+      - name: MORI-IO internode write sweep
         run: |
           SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_io_benchmark.sh"
-          PORT=12320
+          PORT=29120
+          echo "=== MORI-IO internode benchmark: wide-write-sweep port=$PORT ==="
+          NODE2_CMD="$CT exec $CONTAINER bash $SCRIPT --rank 1 --master-addr $NODE1_HOST --master-port $PORT --ifname $NODE2_IFNAME -- --op-type write --transfer-batch-size 128 --all --sweep-start-size 1024 --sweep-max-size 16777216 --iters 4 --enable-sess --enable-batch-transfer --num-qp-per-transfer 2 --num-worker-threads 2 --num-initiator-dev 8 --num-target-dev 8"
+          ssh -p $NODE2_PORT $(whoami)@$NODE2_HOST "$NODE2_CMD" &
+          $CT exec $CONTAINER bash $SCRIPT \
+            --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+            --ifname $NODE1_IFNAME \
+            -- --op-type write --transfer-batch-size 128 --all \
+            --sweep-start-size 1024 --sweep-max-size 16777216 --iters 4 \
+            --enable-sess --enable-batch-transfer \
+            --num-qp-per-transfer 2 --num-worker-threads 2 \
+            --num-initiator-dev 8 --num-target-dev 8
+          wait
 
-          run_case() {
-            local NAME="$1"
-            shift
-            local BENCH_ARGS
-            printf -v BENCH_ARGS '%q ' "$@"
-            echo "=== MORI-IO internode benchmark: $NAME port=$PORT ==="
-            NODE2_CMD="docker exec $CONTAINER bash $SCRIPT --rank 1 --master-addr ${{ matrix.node1_host }} --master-port $PORT --ifname ${{ matrix.node2_ifname }} -- ${BENCH_ARGS}"
-            ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} "$NODE2_CMD" &
-            docker exec $CONTAINER bash $SCRIPT \
-              --rank 0 --master-addr ${{ matrix.node1_host }} --master-port $PORT \
-              --ifname ${{ matrix.node1_ifname }} \
-              -- "$@"
-            wait
-            PORT=$((PORT + 1))
-          }
-
-          run_case "wide-write-sweep" \
-            --op-type write \
-            --transfer-batch-size 128 \
-            --all \
-            --sweep-start-size 1024 \
-            --sweep-max-size 16777216 \
-            --iters 4 \
-            --enable-sess \
-            --enable-batch-transfer \
-            --num-qp-per-transfer 2 \
-            --num-worker-threads 2 \
-            --num-initiator-dev 8 \
-            --num-target-dev 8
-
-          run_case "batch-session-read-event-noncontig" \
-            --op-type read \
-            --buffer-size 4096 \
-            --transfer-batch-size 128 \
-            --iters 8 \
-            --enable-batch-transfer \
-            --enable-sess \
-            --poll_cq_mode event \
-            --num-qp-per-transfer 2 \
-            --num-worker-threads 2 \
-            --num-initiator-dev 8 \
-            --num-target-dev 8
+      - name: MORI-IO internode read
+        run: |
+          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_io_benchmark.sh"
+          PORT=29121
+          echo "=== MORI-IO internode benchmark: batch-session-read port=$PORT ==="
+          NODE2_CMD="$CT exec $CONTAINER bash $SCRIPT --rank 1 --master-addr $NODE1_HOST --master-port $PORT --ifname $NODE2_IFNAME -- --op-type read --buffer-size 4096 --transfer-batch-size 128 --iters 8 --enable-batch-transfer --enable-sess --poll_cq_mode event --num-qp-per-transfer 2 --num-worker-threads 2 --num-initiator-dev 8 --num-target-dev 8"
+          ssh -p $NODE2_PORT $(whoami)@$NODE2_HOST "$NODE2_CMD" &
+          $CT exec $CONTAINER bash $SCRIPT \
+            --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+            --ifname $NODE1_IFNAME \
+            -- --op-type read --buffer-size 4096 --transfer-batch-size 128 --iters 8 \
+            --enable-batch-transfer --enable-sess --poll_cq_mode event \
+            --num-qp-per-transfer 2 --num-worker-threads 2 \
+            --num-initiator-dev 8 --num-target-dev 8
+          wait
 
       - name: MORI-EP internode normal kernel bench
         run: |
           SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
-          PORT=12340
+          PORT=29140
           for KERNEL in v1 v1_ll; do
-            for TOKENS in 64 128 1024 4096; do
+            for TOKENS in 64 128 1024 2048 4096; do
               echo "=== bench kernel=$KERNEL max-tokens=$TOKENS port=$PORT ==="
-              NODE2_CMD="docker exec $CONTAINER bash $SCRIPT --rank 1 --master-addr ${{ matrix.node1_host }} --master-port $PORT --ifname ${{ matrix.node2_ifname }} --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS"
-              ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} "$NODE2_CMD" &
-              docker exec $CONTAINER bash $SCRIPT \
-                --rank 0 --master-addr ${{ matrix.node1_host }} --master-port $PORT \
-                --ifname ${{ matrix.node1_ifname }} \
+              NODE2_CMD="$CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT --rank 1 --master-addr $NODE1_HOST --master-port $PORT --ifname $NODE2_IFNAME --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS"
+              ssh -p $NODE2_PORT $(whoami)@$NODE2_HOST "$NODE2_CMD" &
+              $CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT \
+                --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+                --ifname $NODE1_IFNAME \
                 --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS
               wait
+              sleep 1
               PORT=$((PORT + 1))
             done
           done
@@ -308,17 +373,18 @@ jobs:
       - name: MORI-EP internode normal kernel stress
         run: |
           SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
-          PORT=12360
+          PORT=29160
           for KERNEL in v1 v1_ll; do
-            for TOKENS in 64 128 1024 4096; do
+            for TOKENS in 64 128 1024 2048 4096; do
               echo "=== stress kernel=$KERNEL max-tokens=$TOKENS port=$PORT ==="
-              NODE2_CMD="docker exec $CONTAINER bash $SCRIPT --rank 1 --master-addr ${{ matrix.node1_host }} --master-port $PORT --ifname ${{ matrix.node2_ifname }} --cmd stress --kernel-type $KERNEL --max-tokens $TOKENS"
-              ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} "$NODE2_CMD" &
-              docker exec $CONTAINER bash $SCRIPT \
-                --rank 0 --master-addr ${{ matrix.node1_host }} --master-port $PORT \
-                --ifname ${{ matrix.node1_ifname }} \
+              NODE2_CMD="$CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT --rank 1 --master-addr $NODE1_HOST --master-port $PORT --ifname $NODE2_IFNAME --cmd stress --kernel-type $KERNEL --max-tokens $TOKENS"
+              ssh -p $NODE2_PORT $(whoami)@$NODE2_HOST "$NODE2_CMD" &
+              $CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT \
+                --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+                --ifname $NODE1_IFNAME \
                 --cmd stress --kernel-type $KERNEL --max-tokens $TOKENS
               wait
+              sleep 1
               PORT=$((PORT + 1))
             done
           done
@@ -326,29 +392,32 @@ jobs:
       - name: MORI-EP internode async kernel test
         run: |
           SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
-          PORT=12380
+          PORT=29180
           for TOKENS in 64 128; do
             echo "=== async_ll test max-tokens=$TOKENS port=$PORT ==="
-            NODE2_CMD="docker exec -e GPU_PER_NODE=8 -e MORI_DISABLE_P2P=1 $CONTAINER bash $SCRIPT --rank 1 --master-addr ${{ matrix.node1_host }} --master-port $PORT --ifname ${{ matrix.node2_ifname }} --cmd test --kernel-type async_ll --quant-type none --dtype bf16 --max-tokens $TOKENS"
-            ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} "$NODE2_CMD" &
-            docker exec \
+            NODE2_CMD="$CT exec -e GPU_PER_NODE=8 -e MORI_ENABLE_SDMA=1 $CONTAINER bash $SCRIPT --rank 1 --master-addr $NODE1_HOST --master-port $PORT --ifname $NODE2_IFNAME --cmd test --kernel-type async_ll --quant-type none --dtype bf16 --max-tokens $TOKENS"
+            ssh -p $NODE2_PORT $(whoami)@$NODE2_HOST "$NODE2_CMD" &
+            $CT exec \
               -e GPU_PER_NODE=8 \
-              -e MORI_DISABLE_P2P=1 \
+              -e MORI_ENABLE_SDMA=1 \
               $CONTAINER bash $SCRIPT \
-              --rank 0 --master-addr ${{ matrix.node1_host }} --master-port $PORT \
-              --ifname ${{ matrix.node1_ifname }} \
+              --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+              --ifname $NODE1_IFNAME \
               --cmd test --kernel-type async_ll \
               --quant-type none --dtype bf16 --max-tokens $TOKENS
             wait
+            sleep 1
             PORT=$((PORT + 1))
           done
 
-      - name: Cleanup node1 container
-        if: always()
-        run: docker rm -f $CONTAINER || true
-
-      - name: Cleanup node2 container
+      - name: Cleanup node1
         if: always()
         run: |
-          ssh -p ${{ matrix.node2_port }} root@${{ matrix.node2_host }} \
-            "docker rm -f $CONTAINER || true"
+          $CT exec $CONTAINER chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
+          $CT rm -f $CONTAINER || true
+
+      - name: Cleanup node2
+        if: always()
+        run: |
+          ssh -p $NODE2_PORT $(whoami)@$NODE2_HOST \
+            "$CT rm -f $CONTAINER || true"

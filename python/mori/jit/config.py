@@ -160,28 +160,17 @@ _NIC_LIB_NAMES: dict[str, str] = {
     "ionic": "libionic.so",
 }
 
-_BNXT_REQUIRED_HEADERS = ["infiniband/bnxt_re_dv.h", "infiniband/bnxt_re_hsi.h"]
-
-_HEADER_SEARCH_PATHS = [
-    "/usr/include",
-    "/usr/local/include",
-]
-
 
 def _has_nic_lib(nic: str) -> bool:
-    """Check whether the user-space RDMA library (and headers for bnxt) are installed."""
+    """Check whether the user-space RDMA verbs provider library is installed.
+
+    bnxt headers (bnxt_re_dv.h, bnxt_re_hsi.h) are bundled in the mori source
+    tree, so only the shared library needs to be present on the system.
+    """
     lib_name = _NIC_LIB_NAMES.get(nic)
     if not lib_name:
         return False
-    if not any(os.path.exists(os.path.join(d, lib_name)) for d in _LIB_SEARCH_PATHS):
-        return False
-    if nic == "bnxt":
-        for hdr in _BNXT_REQUIRED_HEADERS:
-            if not any(
-                os.path.exists(os.path.join(d, hdr)) for d in _HEADER_SEARCH_PATHS
-            ):
-                return False
-    return True
+    return any(os.path.exists(os.path.join(d, lib_name)) for d in _LIB_SEARCH_PATHS)
 
 
 def _classify_ib_device(dev_path: str) -> str | None:

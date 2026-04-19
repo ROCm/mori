@@ -145,9 +145,12 @@ struct BnxtDvApi {
   void* handle = nullptr;
 
   bool Load() {
-    handle = DvLoadLibrary("libbnxt_re-rdmav34.so");
+    handle = DvLoadLibrary("libbnxt_re.so");
     if (!handle) {
-      handle = DvLoadLibrary("libbnxt_re.so");
+      handle = DvLoadLibrary("libbnxt_re-rdmav59.so");
+    }
+    if (!handle) {
+      handle = DvLoadLibrary("libbnxt_re-rdmav34.so");
     }
     if (!handle) return false;
 
