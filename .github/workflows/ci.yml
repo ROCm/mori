@@ -318,53 +318,38 @@ jobs:
           ssh -p $NODE2_PORT $(whoami)@$NODE2_HOST \
             "$CT exec $CONTAINER bash -c 'cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install -e . && pip install prettytable'"
 
-      - name: MORI-IO internode benchmark
+      - name: MORI-IO internode write sweep
         run: |
           SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_io_benchmark.sh"
           PORT=29120
+          echo "=== MORI-IO internode benchmark: wide-write-sweep port=$PORT ==="
+          NODE2_CMD="$CT exec $CONTAINER bash $SCRIPT --rank 1 --master-addr $NODE1_HOST --master-port $PORT --ifname $NODE2_IFNAME -- --op-type write --transfer-batch-size 128 --all --sweep-start-size 1024 --sweep-max-size 16777216 --iters 4 --enable-sess --enable-batch-transfer --num-qp-per-transfer 2 --num-worker-threads 2 --num-initiator-dev 8 --num-target-dev 8"
+          ssh -p $NODE2_PORT $(whoami)@$NODE2_HOST "$NODE2_CMD" &
+          $CT exec $CONTAINER bash $SCRIPT \
+            --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+            --ifname $NODE1_IFNAME \
+            -- --op-type write --transfer-batch-size 128 --all \
+            --sweep-start-size 1024 --sweep-max-size 16777216 --iters 4 \
+            --enable-sess --enable-batch-transfer \
+            --num-qp-per-transfer 2 --num-worker-threads 2 \
+            --num-initiator-dev 8 --num-target-dev 8
+          wait
 
-          run_case() {
-            local NAME="$1"
-            shift
-            local BENCH_ARGS
-            printf -v BENCH_ARGS '%q ' "$@"
-            echo "=== MORI-IO internode benchmark: $NAME port=$PORT ==="
-            NODE2_CMD="$CT exec $CONTAINER bash $SCRIPT --rank 1 --master-addr $NODE1_HOST --master-port $PORT --ifname $NODE2_IFNAME -- ${BENCH_ARGS}"
-            ssh -p $NODE2_PORT $(whoami)@$NODE2_HOST "$NODE2_CMD" &
-            $CT exec $CONTAINER bash $SCRIPT \
-              --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
-              --ifname $NODE1_IFNAME \
-              -- "$@"
-            wait
-            PORT=$((PORT + 1))
-          }
-
-          run_case "wide-write-sweep" \
-            --op-type write \
-            --transfer-batch-size 128 \
-            --all \
-            --sweep-start-size 1024 \
-            --sweep-max-size 16777216 \
-            --iters 4 \
-            --enable-sess \
-            --enable-batch-transfer \
-            --num-qp-per-transfer 2 \
-            --num-worker-threads 2 \
-            --num-initiator-dev 8 \
-            --num-target-dev 8
-
-          run_case "batch-session-read-event-noncontig" \
-            --op-type read \
-            --buffer-size 4096 \
-            --transfer-batch-size 128 \
-            --iters 8 \
-            --enable-batch-transfer \
-            --enable-sess \
-            --poll_cq_mode event \
-            --num-qp-per-transfer 2 \
-            --num-worker-threads 2 \
-            --num-initiator-dev 8 \
-            --num-target-dev 8
+      - name: MORI-IO internode read
+        run: |
+          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_io_benchmark.sh"
+          PORT=29121
+          echo "=== MORI-IO internode benchmark: batch-session-read port=$PORT ==="
+          NODE2_CMD="$CT exec $CONTAINER bash $SCRIPT --rank 1 --master-addr $NODE1_HOST --master-port $PORT --ifname $NODE2_IFNAME -- --op-type read --buffer-size 4096 --transfer-batch-size 128 --iters 8 --enable-batch-transfer --enable-sess --poll_cq_mode event --num-qp-per-transfer 2 --num-worker-threads 2 --num-initiator-dev 8 --num-target-dev 8"
+          ssh -p $NODE2_PORT $(whoami)@$NODE2_HOST "$NODE2_CMD" &
+          $CT exec $CONTAINER bash $SCRIPT \
+            --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+            --ifname $NODE1_IFNAME \
+            -- --op-type read --buffer-size 4096 --transfer-batch-size 128 --iters 8 \
+            --enable-batch-transfer --enable-sess --poll_cq_mode event \
+            --num-qp-per-transfer 2 --num-worker-threads 2 \
+            --num-initiator-dev 8 --num-target-dev 8
+          wait
 
       - name: MORI-EP internode normal kernel bench
         run: |
