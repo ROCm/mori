@@ -181,10 +181,8 @@ def _ensure_generated_include(mori_root: Path) -> Path:
     profiler slot changes in source are picked up without invalidating the JIT cache.
     Returns ``<cache_root>/generated/include/``, which must be passed as ``-I`` to hipcc.
 
-    When the generator script is not available (e.g. wheel install without
-    the full source tree), a minimal stub header is created so that kernel
-    sources can still ``#include "mori/profiler/profiler.hpp"`` with the
-    ``ENABLE_PROFILER`` guard evaluating to nothing.
+    Raises FileNotFoundError if the generator script is not present (e.g. wheel
+    install without the full source tree) — ENABLE_PROFILER requires the source tree.
     """
     gen_script = mori_root / "tools" / "profiler" / "generate_profiler_bindings.py"
 
@@ -192,27 +190,24 @@ def _ensure_generated_include(mori_root: Path) -> Path:
     profiler_include_dir = out_include / "mori" / "profiler"
     pybind_out = get_cache_root() / "generated" / "profiler_bindings.cpp"
 
-    if gen_script.is_file():
-        subprocess.check_call(
-            [
-                sys.executable,
-                str(gen_script),
-                str(mori_root),
-                str(mori_root / "src"),
-                str(profiler_include_dir),
-                str(pybind_out),
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.STDOUT,
+    if not gen_script.is_file():
+        raise FileNotFoundError(
+            f"Profiler binding generator not found: {gen_script}\n"
+            "JIT compilation with ENABLE_PROFILER requires the mori source tree."
         )
-    else:
-        profiler_include_dir.mkdir(parents=True, exist_ok=True)
-        stub = profiler_include_dir / "profiler.hpp"
-        if not stub.is_file():
-            stub.write_text(
-                "// Auto-generated stub — profiler source tree not available\n"
-                "#pragma once\n"
-            )
+
+    subprocess.check_call(
+        [
+            sys.executable,
+            str(gen_script),
+            str(mori_root),
+            str(mori_root / "src"),
+            str(profiler_include_dir),
+            str(pybind_out),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.STDOUT,
+    )
 
     return out_include
 
