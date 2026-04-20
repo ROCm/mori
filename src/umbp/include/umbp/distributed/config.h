@@ -43,6 +43,12 @@ struct ClientRegistryConfig {
   std::chrono::seconds allocation_ttl{30};
   std::chrono::seconds finalized_record_ttl{120};
   uint32_t max_missed_heartbeats = 3;
+
+  // Default DRAM/HBM page_size used by every PageBitmapAllocator the
+  // registry creates when the registering Client does not specify its own
+  // (RegisterClientRequest.dram_page_size == 0).  All nodes within the same
+  // tier must agree on page_size.
+  uint64_t default_dram_page_size = 2ULL * 1024 * 1024;  // 2 MiB
 };
 
 struct MasterClientConfig {
@@ -93,6 +99,12 @@ struct PoolClientConfig {
   std::map<TierType, TierCapacity> tier_capacities;
 
   uint16_t peer_service_port = 0;
+
+  // Page size used by Master's PageBitmapAllocator for this node's DRAM/HBM
+  // tier.  Reported via RegisterClient.  Same value applies to both DRAM
+  // and HBM.  Master's ClientRegistry falls back to its own
+  // `default_dram_page_size` if this is left at 0.  Defaults to 2 MiB.
+  uint64_t dram_page_size = 2ULL * 1024 * 1024;
 };
 
 }  // namespace mori::umbp

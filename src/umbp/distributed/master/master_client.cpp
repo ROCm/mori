@@ -62,7 +62,7 @@ grpc::Status MasterClient::RegisterSelf(
     const std::vector<uint8_t>& engine_desc_bytes,
     const std::vector<std::vector<uint8_t>>& dram_memory_desc_bytes_list,
     const std::vector<uint64_t>& dram_buffer_sizes,
-    const std::vector<uint64_t>& ssd_store_capacities) {
+    const std::vector<uint64_t>& ssd_store_capacities, uint64_t dram_page_size) {
   if (registered_) {
     return grpc::Status(grpc::StatusCode::ALREADY_EXISTS, "node is already registered");
   }
@@ -91,11 +91,9 @@ grpc::Status MasterClient::RegisterSelf(
     req.add_ssd_store_capacities(cap);
   }
 
-  // Backward compat: also set legacy single field if there's exactly one buffer
-  if (dram_memory_desc_bytes_list.size() == 1) {
-    req.set_dram_memory_desc(dram_memory_desc_bytes_list[0].data(),
-                             dram_memory_desc_bytes_list[0].size());
-  }
+  // Per-node DRAM/HBM page_size override.  Master treats 0 as "fall back to
+  // ClientRegistryConfig.default_dram_page_size".
+  req.set_dram_page_size(dram_page_size);
 
   ::umbp::RegisterClientResponse resp;
   grpc::ClientContext ctx;
@@ -374,8 +372,14 @@ grpc::Status MasterClient::RouteGet(const std::string& key,
     result.peer_address = resp.peer_address();
     const auto& ed = resp.engine_desc();
     result.engine_desc_bytes.assign(ed.begin(), ed.end());
-    const auto& md = resp.dram_memory_desc();
-    result.dram_memory_desc_bytes.assign(md.begin(), md.end());
+    result.dram_memory_descs.reserve(resp.dram_memory_descs_size());
+    for (const auto& bd : resp.dram_memory_descs()) {
+      BufferMemoryDescBytes b;
+      b.buffer_index = bd.buffer_index();
+      b.desc_bytes.assign(bd.desc().begin(), bd.desc().end());
+      result.dram_memory_descs.push_back(std::move(b));
+    }
+    result.page_size = resp.page_size();
     *out_result = result;
   }
 
@@ -416,11 +420,20 @@ grpc::Status MasterClient::RoutePut(const std::string& key, uint64_t block_size,
     result.peer_address = resp.peer_address();
     const auto& ed = resp.engine_desc();
     result.engine_desc_bytes.assign(ed.begin(), ed.end());
-    const auto& md = resp.dram_memory_desc();
-    result.dram_memory_desc_bytes.assign(md.begin(), md.end());
-    result.allocated_offset = resp.allocated_offset();
-    result.buffer_index = resp.buffer_index();
     result.allocation_id = resp.allocation_id();
+    result.location_id = resp.location_id();
+    result.pages.reserve(resp.pages_size());
+    for (const auto& p : resp.pages()) {
+      result.pages.push_back({p.buffer_index(), p.page_index()});
+    }
+    result.dram_memory_descs.reserve(resp.dram_memory_descs_size());
+    for (const auto& bd : resp.dram_memory_descs()) {
+      BufferMemoryDescBytes b;
+      b.buffer_index = bd.buffer_index();
+      b.desc_bytes.assign(bd.desc().begin(), bd.desc().end());
+      result.dram_memory_descs.push_back(std::move(b));
+    }
+    result.page_size = resp.page_size();
     *out_result = result;
   }
 
@@ -470,11 +483,20 @@ grpc::Status MasterClient::BatchRoutePut(const std::vector<std::string>& keys,
         result.peer_address = entry.peer_address();
         const auto& ed = entry.engine_desc();
         result.engine_desc_bytes.assign(ed.begin(), ed.end());
-        const auto& md = entry.dram_memory_desc();
-        result.dram_memory_desc_bytes.assign(md.begin(), md.end());
-        result.allocated_offset = entry.allocated_offset();
-        result.buffer_index = entry.buffer_index();
         result.allocation_id = entry.allocation_id();
+        result.location_id = entry.location_id();
+        result.pages.reserve(entry.pages_size());
+        for (const auto& p : entry.pages()) {
+          result.pages.push_back({p.buffer_index(), p.page_index()});
+        }
+        result.dram_memory_descs.reserve(entry.dram_memory_descs_size());
+        for (const auto& bd : entry.dram_memory_descs()) {
+          BufferMemoryDescBytes b;
+          b.buffer_index = bd.buffer_index();
+          b.desc_bytes.assign(bd.desc().begin(), bd.desc().end());
+          result.dram_memory_descs.push_back(std::move(b));
+        }
+        result.page_size = entry.page_size();
         (*out)[i] = std::move(result);
       }
     }
@@ -523,8 +545,14 @@ grpc::Status MasterClient::BatchRouteGet(const std::vector<std::string>& keys,
         result.peer_address = entry.peer_address();
         const auto& ed = entry.engine_desc();
         result.engine_desc_bytes.assign(ed.begin(), ed.end());
-        const auto& md = entry.dram_memory_desc();
-        result.dram_memory_desc_bytes.assign(md.begin(), md.end());
+        result.dram_memory_descs.reserve(entry.dram_memory_descs_size());
+        for (const auto& bd : entry.dram_memory_descs()) {
+          BufferMemoryDescBytes b;
+          b.buffer_index = bd.buffer_index();
+          b.desc_bytes.assign(bd.desc().begin(), bd.desc().end());
+          result.dram_memory_descs.push_back(std::move(b));
+        }
+        result.page_size = entry.page_size();
         (*out)[i] = std::move(result);
       }
     }

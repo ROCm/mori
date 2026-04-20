@@ -55,9 +55,9 @@ class PoolClient {
   bool RegisterMemory(void* ptr, size_t size);
   void DeregisterMemory(void* ptr);
 
-  // Phase 2: DRAM-only methods for UMBPClient integration.
-  // UMBPClient handles local storage directly and calls these for cluster
-  // interactions only. PoolClient never touches local storage.
+  // DRAM-only methods for UMBPClient integration.  UMBPClient handles local
+  // storage directly and calls these for cluster interactions only;
+  // PoolClient never touches local storage.
 
   // Register an already-written local block with the Master so remote nodes
   // can discover it. UMBPClient provides the location_id (e.g. "0:<offset>").
@@ -148,10 +148,38 @@ class PoolClient {
                                    const std::vector<uint8_t>& dram_memory_desc_bytes,
                                    uint32_t buffer_index = 0);
 
+  // Hydrate `peer.dram_memories[bd.buffer_index]` for every entry in
+  // `descs`.  Idempotent: already-cached entries are left alone since
+  // MemoryDesc is immutable.  Used by Put/Get paths to absorb the
+  // RoutePut/RouteGet response `dram_memory_descs` list before issuing
+  // RDMA.  Caller MUST NOT hold peers_mutex_; this helper acquires it.
+  void EnsureBufferDescsCached(PeerConnection& peer,
+                               const std::vector<BufferMemoryDescBytes>& descs);
+
   bool RemoteDramWrite(PeerConnection& peer, uint32_t buffer_index, const void* src, size_t size,
                        uint64_t offset, bool zero_copy);
   bool RemoteDramRead(PeerConnection& peer, uint32_t buffer_index, void* dst, size_t size,
                       uint64_t offset, bool zero_copy);
+
+  // Multi-page scatter-gather variants used by Put/Get when the master hands
+  // back more than one PageLocation.  Pages may span multiple buffer_indices
+  // (Strategy 3 of PageBitmapAllocator).  The caller MUST have already
+  // populated `peer.dram_memories[buffer_index]` for every buffer_index in
+  // `pages` (typically via EnsureBufferDescsCached).
+  //
+  // Source layout: pages[i] receives src[i*page_size .. (i+1)*page_size).
+  // We require `size == pages.size() * page_size`; partial last-page is
+  // rejected (PageBitmapAllocator already rounds up to a full page so a
+  // partial tail would only happen on caller bug).
+  //
+  // Internally groups by buffer_index, builds one (localOffsets[k],
+  // remoteOffsets[k], sizes[k]) batch per distinct buffer (= IOEngine's
+  // outer N), and issues a single BatchWrite/BatchRead.  All-or-nothing:
+  // if any sub-transfer fails the call returns false (no retry).
+  bool RemoteDramScatterWrite(PeerConnection& peer, const std::vector<PageLocation>& pages,
+                              uint64_t page_size, const void* src, size_t size, bool zero_copy);
+  bool RemoteDramScatterRead(PeerConnection& peer, const std::vector<PageLocation>& pages,
+                             uint64_t page_size, void* dst, size_t size, bool zero_copy);
   bool EnsurePeerServiceConnection(PeerConnection& peer);
   bool RemoteSsdWrite(PeerConnection& peer, const std::string& key, const void* src, size_t size,
                       bool zero_copy, uint32_t store_index = 0,

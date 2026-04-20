@@ -78,7 +78,7 @@ void EvictionManager::EvictionLoop() {
 }
 
 void EvictionManager::RunOnce() {
-  // Phase 0: determine overloaded nodes
+  // Step 1: determine overloaded nodes
   auto clients = registry_.GetAliveClients();
 
   using NodeTierKey = GlobalBlockIndex::NodeTierKey;
@@ -124,7 +124,7 @@ void EvictionManager::RunOnce() {
     return;
   }
 
-  // Phase 2: sort and select victims (no lock)
+  // Step 2: sort and select victims (no lock)
   std::sort(candidates.begin(), candidates.end(),
             [](const EvictionCandidate& a, const EvictionCandidate& b) {
               if (a.last_accessed_at != b.last_accessed_at) {
@@ -161,7 +161,7 @@ void EvictionManager::RunOnce() {
 
   MORI_UMBP_INFO("[EvictionManager] Selected {} victims for eviction", victims.size());
 
-  // Phase 3: evict in batches (write lock + yield between batches)
+  // Step 3: evict in batches (write lock + yield between batches)
   size_t total_evicted = 0;
   for (size_t i = 0; i < victims.size(); i += config_.evict_batch_size) {
     if (!running_.load(std::memory_order_relaxed)) {
@@ -176,19 +176,10 @@ void EvictionManager::RunOnce() {
     total_evicted += evicted.size();
 
     for (const auto& entry : evicted) {
-      auto parsed = ParseLocationId(entry.location.location_id);
-      if (!parsed) {
-        MORI_UMBP_ERROR(
-            "[EvictionManager] Failed to parse location_id '{}' for key, skipping deallocation",
-            entry.location.location_id);
-        continue;
-      }
-      uint64_t offset = 0;
-      if (entry.location.tier == TierType::DRAM || entry.location.tier == TierType::HBM) {
-        offset = parsed->offset;
-      }
-      registry_.DeallocateForUnregister(entry.location.node_id, entry.location.tier,
-                                        parsed->buffer_index, offset, entry.size);
+      // ClientRegistry::DeallocateForUnregister parses location_id internally:
+      // DRAM/HBM uses the page-bitmap "0:p3,4;1:p0" format via
+      // ParseDramLocationId; SSD uses the buffer-index-prefix format.
+      registry_.DeallocateForUnregister(entry.location.node_id, entry.location);
     }
 
     if (end < victims.size()) {

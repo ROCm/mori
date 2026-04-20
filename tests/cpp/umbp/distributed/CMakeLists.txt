@@ -29,6 +29,12 @@ add_executable(test_umbp_pool_allocator test_pool_allocator.cpp)
 target_link_libraries(test_umbp_pool_allocator PRIVATE umbp_common gtest_main)
 add_test(NAME umbp_pool_allocator COMMAND test_umbp_pool_allocator)
 
+add_executable(test_umbp_page_bitmap_allocator test_page_bitmap_allocator.cpp)
+target_link_libraries(test_umbp_page_bitmap_allocator PRIVATE umbp_common
+                                                              gtest_main)
+add_test(NAME umbp_page_bitmap_allocator
+         COMMAND test_umbp_page_bitmap_allocator)
+
 add_executable(test_umbp_finalize_idempotency test_finalize_idempotency.cpp)
 target_link_libraries(test_umbp_finalize_idempotency PRIVATE umbp_common
                                                              gtest_main)

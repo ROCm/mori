@@ -22,11 +22,28 @@
 #include "umbp/distributed/master/client_registry.h"
 
 #include <algorithm>
+#include <cassert>
+#include <set>
 
 #include "mori/utils/mori_log.hpp"
 #include "umbp/distributed/master/global_block_index.h"
+#include "umbp/distributed/page_bitmap_allocator.h"
 
 namespace mori::umbp {
+
+namespace {
+
+constexpr uint64_t kBytesPerMB = 1024ULL * 1024;
+
+// Round-up integer division: how many `page_size` pages cover `size` bytes.
+uint32_t PagesForSize(uint64_t size, uint64_t page_size) {
+  if (page_size == 0) return 0;
+  return static_cast<uint32_t>((size + page_size - 1) / page_size);
+}
+
+bool IsDramOrHbm(TierType t) { return t == TierType::DRAM || t == TierType::HBM; }
+
+}  // namespace
 
 ClientRegistry::ClientRegistry(const ClientRegistryConfig& config) : config_(config) {}
 
@@ -54,9 +71,14 @@ uint32_t ClientRegistry::ParseBufferIndex(const std::string& location_id) {
 
 void ClientRegistry::UpdateAvailableBytesLocked(ClientRecord& record, TierType tier) {
   uint64_t total_avail = 0;
-  if (tier == TierType::DRAM || tier == TierType::HBM) {
-    for (auto& alloc : record.dram_allocators) {
-      total_avail += alloc.AvailableBytes();
+  if (IsDramOrHbm(tier)) {
+    auto it = record.page_allocators.find(tier);
+    if (it != record.page_allocators.end() && it->second) {
+      total_avail = it->second->AvailableBytes();
+    } else {
+      // No allocator for this tier (e.g. it was never registered) — treat as
+      // zero available; do NOT touch tier_capacities[tier] in that case.
+      return;
     }
   } else if (tier == TierType::SSD) {
     for (auto& alloc : record.ssd_allocators) {
@@ -66,6 +88,25 @@ void ClientRegistry::UpdateAvailableBytesLocked(ClientRecord& record, TierType t
   record.tier_capacities[tier].available_bytes = total_avail;
 }
 
+void ClientRegistry::DeallocatePendingLocked(const PendingAllocation& pending) {
+  auto client_it = clients_.find(pending.node_id);
+  if (client_it == clients_.end()) return;
+  auto& record = client_it->second;
+
+  if (IsDramOrHbm(pending.tier)) {
+    auto alloc_it = record.page_allocators.find(pending.tier);
+    if (alloc_it != record.page_allocators.end() && alloc_it->second) {
+      alloc_it->second->Deallocate(pending.pages);
+      UpdateAvailableBytesLocked(record, pending.tier);
+    }
+  } else if (pending.tier == TierType::SSD) {
+    if (pending.ssd_store_index < record.ssd_allocators.size()) {
+      record.ssd_allocators[pending.ssd_store_index].Deallocate(0, pending.size);
+      UpdateAvailableBytesLocked(record, TierType::SSD);
+    }
+  }
+}
+
 void ClientRegistry::ReleasePendingAllocationsForNodeLocked(const std::string& node_id) {
   auto it = pending_allocations_.begin();
   while (it != pending_allocations_.end()) {
@@ -73,24 +114,7 @@ void ClientRegistry::ReleasePendingAllocationsForNodeLocked(const std::string& n
       ++it;
       continue;
     }
-
-    auto client_it = clients_.find(node_id);
-    if (client_it != clients_.end()) {
-      auto& record = client_it->second;
-      if (it->second.tier == TierType::DRAM || it->second.tier == TierType::HBM) {
-        if (it->second.buffer_index < record.dram_allocators.size()) {
-          record.dram_allocators[it->second.buffer_index].Deallocate(it->second.offset,
-                                                                     it->second.size);
-          UpdateAvailableBytesLocked(record, it->second.tier);
-        }
-      } else if (it->second.tier == TierType::SSD) {
-        if (it->second.buffer_index < record.ssd_allocators.size()) {
-          record.ssd_allocators[it->second.buffer_index].Deallocate(it->second.offset,
-                                                                    it->second.size);
-          UpdateAvailableBytesLocked(record, it->second.tier);
-        }
-      }
-    }
+    DeallocatePendingLocked(it->second);
     it = pending_allocations_.erase(it);
   }
 }
@@ -101,7 +125,7 @@ bool ClientRegistry::RegisterClient(
     const std::vector<uint8_t>& engine_desc_bytes,
     const std::vector<std::vector<uint8_t>>& dram_memory_desc_bytes_list,
     const std::vector<uint64_t>& dram_buffer_sizes,
-    const std::vector<uint64_t>& ssd_store_capacities) {
+    const std::vector<uint64_t>& ssd_store_capacities, uint64_t dram_page_size) {
   std::unique_lock lock(mutex_);
   auto now = std::chrono::steady_clock::now();
 
@@ -132,34 +156,38 @@ bool ClientRegistry::RegisterClient(
   record.engine_desc_bytes = engine_desc_bytes;
   record.dram_memory_desc_bytes_list = dram_memory_desc_bytes_list;
 
-  const bool enable_remote_dram =
-      std::any_of(tier_capacities.begin(), tier_capacities.end(), [](const auto& entry) {
-        const auto tier = entry.first;
-        const auto& cap = entry.second;
-        return (tier == TierType::HBM || tier == TierType::DRAM) && cap.total_bytes > 0 &&
-               cap.available_bytes > 0;
-      });
+  // Build a per-tier PageBitmapAllocator for every DRAM/HBM tier that has
+  // non-zero advertised capacity.  The Client may request a per-node
+  // page_size at registration time; 0 falls back to the registry-wide
+  // default (refactor-master-page-allocator.md §10 / Q6 — same value for
+  // DRAM & HBM).
+  const uint64_t effective_page_size =
+      (dram_page_size > 0) ? dram_page_size : config_.default_dram_page_size;
+  for (auto check_tier : {TierType::HBM, TierType::DRAM}) {
+    auto cap_it = tier_capacities.find(check_tier);
+    if (cap_it == tier_capacities.end() || cap_it->second.total_bytes == 0) {
+      continue;
+    }
 
-  // Per-buffer DRAM allocators
-  if (!dram_buffer_sizes.empty() && enable_remote_dram) {
-    for (size_t i = 0; i < dram_buffer_sizes.size(); ++i) {
-      PoolAllocator alloc;
-      alloc.total_size = dram_buffer_sizes[i];
-      alloc.offset_tracker = PoolAllocator::OffsetTracker{};
-      record.dram_allocators.push_back(std::move(alloc));
+    std::vector<uint64_t> buffer_sizes;
+    if (!dram_buffer_sizes.empty()) {
+      // Multi-buffer registration path.  Both DRAM and HBM currently share
+      // the same dram_buffer_sizes list (consistent with PoolClientConfig
+      // .dram_buffers); a future per-tier split would add separate inputs.
+      buffer_sizes = dram_buffer_sizes;
+    } else {
+      // Single-buffer fallback: synthesize one buffer sized at the
+      // advertised total capacity.  Wasted bytes (if total_bytes is not a
+      // multiple of page_size) are simply unaddressable.
+      buffer_sizes.push_back(cap_it->second.total_bytes);
     }
-  } else if (enable_remote_dram) {
-    // Backward compat: single allocator from tier_capacities (DRAM or HBM)
-    for (auto check_tier : {TierType::HBM, TierType::DRAM}) {
-      auto cap_it = tier_capacities.find(check_tier);
-      if (cap_it != tier_capacities.end() && cap_it->second.total_bytes > 0 &&
-          cap_it->second.available_bytes > 0) {
-        PoolAllocator alloc;
-        alloc.total_size = cap_it->second.total_bytes;
-        alloc.offset_tracker = PoolAllocator::OffsetTracker{};
-        record.dram_allocators.push_back(std::move(alloc));
-      }
-    }
+
+    auto allocator = std::make_shared<PageBitmapAllocator>(effective_page_size, buffer_sizes);
+    record.page_allocators[check_tier] = allocator;
+    // Re-derive tier_capacities[check_tier].available_bytes from the
+    // allocator immediately so subsequent RoutePut decisions use the same
+    // ground truth as Heartbeat will produce.
+    record.tier_capacities[check_tier].available_bytes = allocator->AvailableBytes();
   }
 
   // Per-store SSD allocators (capacity-only, no OffsetTracker)
@@ -179,16 +207,17 @@ bool ClientRegistry::RegisterClient(
     }
   }
 
+  const size_t dram_buffer_count =
+      record.page_allocators.empty() ? 0u : record.page_allocators.begin()->second->NumBuffers();
   clients_[node_id] = std::move(record);
   client_keys_[node_id];
 
-  MORI_UMBP_INFO("[Registry] Registered node: {} at {} (dram_buffers={}, ssd_stores={})", node_id,
-                 node_address,
-                 dram_buffer_sizes.empty() ? (tier_capacities.count(TierType::DRAM) ? 1u : 0u)
-                                           : static_cast<unsigned>(dram_buffer_sizes.size()),
-                 static_cast<unsigned>(ssd_store_capacities.empty()
-                                           ? (tier_capacities.count(TierType::SSD) ? 1u : 0u)
-                                           : ssd_store_capacities.size()));
+  MORI_UMBP_INFO(
+      "[Registry] Registered node: {} at {} (page_size={}KB, dram_buffers={}, ssd_stores={})",
+      node_id, node_address, effective_page_size / 1024, dram_buffer_count,
+      static_cast<unsigned>(ssd_store_capacities.empty()
+                                ? (tier_capacities.count(TierType::SSD) ? 1u : 0u)
+                                : ssd_store_capacities.size()));
   return true;
 }
 
@@ -225,7 +254,13 @@ size_t ClientRegistry::UnregisterClient(const std::string& node_id) {
   return keys_removed;
 }
 
-// PA-3 fix: exclusive lock because we mutate last_heartbeat and tier_capacities
+// Heartbeat — owner of `available_bytes` differs by tier:
+//   DRAM/HBM: Master is the owner.  Client's reported `available_bytes` is
+//             ignored; Master recomputes it from the page allocator.
+//             total_bytes mutations are also rejected (logged with throttle
+//             so a flapping client cannot spam every second).
+//   SSD:      Client is the owner; the whole TierCapacity entry is accepted
+//             verbatim.
 ClientStatus ClientRegistry::Heartbeat(const std::string& node_id,
                                        const std::map<TierType, TierCapacity>& tier_capacities) {
   std::unique_lock lock(mutex_);
@@ -235,9 +270,41 @@ ClientStatus ClientRegistry::Heartbeat(const std::string& node_id,
     return ClientStatus::UNKNOWN;
   }
 
-  it->second.last_heartbeat = std::chrono::steady_clock::now();
-  it->second.status = ClientStatus::ALIVE;
-  it->second.tier_capacities = tier_capacities;
+  auto& record = it->second;
+  record.last_heartbeat = std::chrono::steady_clock::now();
+  record.status = ClientStatus::ALIVE;
+
+  for (const auto& kv : tier_capacities) {
+    const TierType tier = kv.first;
+    const TierCapacity& reported = kv.second;
+    if (IsDramOrHbm(tier)) {
+      auto& stored = record.tier_capacities[tier];
+      if (reported.total_bytes != stored.total_bytes) {
+        // Throttled WARN: log once per distinct reported total_bytes value
+        // so a flapping client doesn't spam the log every heartbeat tick.
+        if (!record.dram_total_mismatch_logged ||
+            record.last_logged_dram_total != reported.total_bytes) {
+          MORI_UMBP_WARN(
+              "[Registry] DRAM/HBM total_bytes change ignored: node={} tier={} stored={}MB "
+              "reported={}MB (hot resize is not yet supported)",
+              node_id, TierTypeName(tier), stored.total_bytes / kBytesPerMB,
+              reported.total_bytes / kBytesPerMB);
+          record.dram_total_mismatch_logged = true;
+          record.last_logged_dram_total = reported.total_bytes;
+        }
+      } else if (record.dram_total_mismatch_logged) {
+        MORI_UMBP_INFO("[Registry] DRAM/HBM total back in sync: node={} tier={} total={}MB",
+                       node_id, TierTypeName(tier), reported.total_bytes / kBytesPerMB);
+        record.dram_total_mismatch_logged = false;
+      }
+      // Master is the source of truth for available_bytes — recompute even
+      // if the Client tried to report something different.
+      UpdateAvailableBytesLocked(record, tier);
+    } else if (tier == TierType::SSD) {
+      // SSD is Client-owned; accept verbatim.
+      record.tier_capacities[tier] = reported;
+    }
+  }
 
   return ClientStatus::ALIVE;
 }
@@ -316,33 +383,51 @@ std::optional<AllocateResult> ClientRegistry::AllocateForPut(const std::string& 
 
   auto& record = it->second;
 
-  if (tier == TierType::DRAM || tier == TierType::HBM) {
-    for (uint32_t i = 0; i < record.dram_allocators.size(); ++i) {
-      auto offset = record.dram_allocators[i].Allocate(size);
-      if (offset) {
-        UpdateAvailableBytesLocked(record, tier);
+  if (IsDramOrHbm(tier)) {
+    auto alloc_it = record.page_allocators.find(tier);
+    if (alloc_it == record.page_allocators.end() || !alloc_it->second) {
+      return std::nullopt;
+    }
+    auto& allocator = *alloc_it->second;
+    const uint32_t num_pages = PagesForSize(size, allocator.PageSize());
+    if (num_pages == 0) return std::nullopt;
 
-        AllocateResult result;
-        result.allocation_id =
-            record.node_id + ":" + std::to_string(next_allocation_id_.fetch_add(1));
-        result.peer_address = record.peer_address;
-        result.engine_desc_bytes = record.engine_desc_bytes;
-        if (i < record.dram_memory_desc_bytes_list.size())
-          result.dram_memory_desc_bytes = record.dram_memory_desc_bytes_list[i];
-        result.allocated_offset = *offset;
-        result.buffer_index = i;
-        pending_allocations_[result.allocation_id] =
-            PendingAllocation{result.allocation_id,
-                              record.node_id,
-                              tier,
-                              i,
-                              *offset,
-                              size,
-                              std::chrono::steady_clock::now()};
-        return result;
+    auto alloc = allocator.Allocate(num_pages);
+    if (!alloc) return std::nullopt;
+
+    UpdateAvailableBytesLocked(record, tier);
+
+    AllocateResult result;
+    result.allocation_id = record.node_id + ":" + std::to_string(next_allocation_id_.fetch_add(1));
+    result.peer_address = record.peer_address;
+    result.engine_desc_bytes = record.engine_desc_bytes;
+    result.location_id = alloc->location_id;
+    result.pages = alloc->pages;
+    result.page_size = allocator.PageSize();
+
+    // Build the deduplicated descriptor list for every distinct buffer_index
+    // referenced in `pages`.  Map keeps it sorted ascending for free.
+    //
+    // Note: when the caller registered with an empty
+    // dram_memory_desc_bytes_list (common in unit tests that exercise only
+    // the bookkeeping side of the allocator) we leave dram_memory_descs
+    // empty here — the Client-facing build assertion lives in
+    // GetDramMemoryDescsForPages where it can also catch the RouteGet path.
+    std::map<uint32_t, std::vector<uint8_t>> by_buf;
+    for (const auto& p : alloc->pages) {
+      if (p.buffer_index < record.dram_memory_desc_bytes_list.size()) {
+        by_buf[p.buffer_index] = record.dram_memory_desc_bytes_list[p.buffer_index];
       }
     }
-    return std::nullopt;
+    result.dram_memory_descs.reserve(by_buf.size());
+    for (auto& [buf_idx, bytes] : by_buf) {
+      result.dram_memory_descs.push_back({buf_idx, std::move(bytes)});
+    }
+
+    pending_allocations_[result.allocation_id] = PendingAllocation{
+        result.allocation_id, record.node_id,         tier, result.location_id,
+        result.pages,         /*ssd_store_index=*/0u, size, std::chrono::steady_clock::now()};
+    return result;
   }
 
   if (tier == TierType::SSD) {
@@ -356,16 +441,16 @@ std::optional<AllocateResult> ClientRegistry::AllocateForPut(const std::string& 
             record.node_id + ":" + std::to_string(next_allocation_id_.fetch_add(1));
         result.peer_address = record.peer_address;
         result.engine_desc_bytes = record.engine_desc_bytes;
-        if (!record.dram_memory_desc_bytes_list.empty())
-          result.dram_memory_desc_bytes = record.dram_memory_desc_bytes_list[0];
-        result.allocated_offset = 0;
-        result.buffer_index = i;
+        // SSD path leaves location_id / pages / dram_memory_descs empty;
+        // CommitSsdWrite will generate the real location_id later.
+        result.ssd_store_index = i;
         pending_allocations_[result.allocation_id] =
             PendingAllocation{result.allocation_id,
                               record.node_id,
                               tier,
+                              /*location_id=*/{},
+                              /*pages=*/{},
                               i,
-                              0,
                               size,
                               std::chrono::steady_clock::now()};
         return result;
@@ -377,9 +462,7 @@ std::optional<AllocateResult> ClientRegistry::AllocateForPut(const std::string& 
   return std::nullopt;
 }
 
-void ClientRegistry::DeallocateForUnregister(const std::string& node_id, TierType tier,
-                                             uint32_t buffer_index, uint64_t offset,
-                                             uint64_t size) {
+void ClientRegistry::DeallocateForUnregister(const std::string& node_id, const Location& location) {
   std::unique_lock lock(mutex_);
   auto it = clients_.find(node_id);
   if (it == clients_.end()) {
@@ -388,15 +471,23 @@ void ClientRegistry::DeallocateForUnregister(const std::string& node_id, TierTyp
 
   auto& record = it->second;
 
-  if (tier == TierType::DRAM || tier == TierType::HBM) {
-    if (buffer_index < record.dram_allocators.size()) {
-      record.dram_allocators[buffer_index].Deallocate(offset, size);
-      UpdateAvailableBytesLocked(record, tier);
+  if (IsDramOrHbm(location.tier)) {
+    auto parsed = ParseDramLocationId(location.location_id);
+    if (!parsed) {
+      MORI_UMBP_ERROR(
+          "[Registry] DeallocateForUnregister: malformed DRAM/HBM location_id '{}', skipping",
+          location.location_id);
+      return;
     }
-  } else if (tier == TierType::SSD) {
-    if (buffer_index < record.ssd_allocators.size()) {
-      record.ssd_allocators[buffer_index].Deallocate(offset, size);
-      UpdateAvailableBytesLocked(record, tier);
+    auto alloc_it = record.page_allocators.find(location.tier);
+    if (alloc_it == record.page_allocators.end() || !alloc_it->second) return;
+    alloc_it->second->Deallocate(parsed->pages);
+    UpdateAvailableBytesLocked(record, location.tier);
+  } else if (location.tier == TierType::SSD) {
+    const uint32_t store_idx = ParseBufferIndex(location.location_id);
+    if (store_idx < record.ssd_allocators.size()) {
+      record.ssd_allocators[store_idx].Deallocate(0, location.size);
+      UpdateAvailableBytesLocked(record, TierType::SSD);
     }
   }
 }
@@ -454,14 +545,15 @@ bool ClientRegistry::FinalizeAllocation(const std::string& node_id, const std::s
           allocation_id, pa.size, location.size);
       return false;
     }
-    if (pa.tier == TierType::DRAM || pa.tier == TierType::HBM) {
-      std::string expected_loc_id =
-          std::to_string(pa.buffer_index) + ":" + std::to_string(pa.offset);
-      if (location.location_id != expected_loc_id) {
+    if (IsDramOrHbm(pa.tier)) {
+      // location_id must equal the canonical page-bitmap string handed out
+      // at AllocateForPut time.  Catches stale clients accidentally
+      // finalizing with the legacy "<buf>:<offset>" format.
+      if (location.location_id != pa.location_id) {
         MORI_UMBP_ERROR(
             "[Registry] FinalizeAllocation: location_id mismatch for allocation '{}': "
             "expected='{}', got='{}'",
-            allocation_id, expected_loc_id, location.location_id);
+            allocation_id, pa.location_id, location.location_id);
         return false;
       }
     }
@@ -502,6 +594,10 @@ bool ClientRegistry::PublishLocalBlock(const std::string& node_id, const std::st
       }
       UpdateAvailableBytesLocked(client_it->second, TierType::SSD);
     }
+    // DRAM/HBM: PublishLocalBlock does not pre-reserve capacity in the
+    // page-bitmap allocator; the caller is expected to have produced
+    // location_id from a prior AllocateForPut (or to be publishing a
+    // location whose pages are already accounted for).
   }
 
   if (index_ != nullptr) {
@@ -522,28 +618,10 @@ bool ClientRegistry::AbortAllocation(const std::string& node_id, const std::stri
     return false;
   }
 
-  auto client_it = clients_.find(node_id);
-  if (client_it == clients_.end()) {
-    pending_allocations_.erase(pending_it);
-    return false;
-  }
-
-  auto pending = pending_it->second;
+  PendingAllocation pending = pending_it->second;
   pending_allocations_.erase(pending_it);
 
-  if (pending.tier == TierType::DRAM || pending.tier == TierType::HBM) {
-    if (pending.buffer_index < client_it->second.dram_allocators.size()) {
-      client_it->second.dram_allocators[pending.buffer_index].Deallocate(pending.offset,
-                                                                         pending.size);
-      UpdateAvailableBytesLocked(client_it->second, pending.tier);
-    }
-  } else if (pending.tier == TierType::SSD) {
-    if (pending.buffer_index < client_it->second.ssd_allocators.size()) {
-      client_it->second.ssd_allocators[pending.buffer_index].Deallocate(pending.offset,
-                                                                        pending.size);
-      UpdateAvailableBytesLocked(client_it->second, pending.tier);
-    }
-  }
+  DeallocatePendingLocked(pending);
   return true;
 }
 
@@ -564,6 +642,55 @@ std::optional<ClientIOInfo> ClientRegistry::GetClientIOInfo(const std::string& n
     info.dram_memory_desc_bytes = it->second.dram_memory_desc_bytes_list[0];
   }
   return info;
+}
+
+std::optional<std::vector<BufferMemoryDescBytes>> ClientRegistry::GetDramMemoryDescsForPages(
+    const std::string& node_id, const std::vector<PageLocation>& pages) const {
+  std::shared_lock lock(mutex_);
+  auto it = clients_.find(node_id);
+  if (it == clients_.end() || it->second.status != ClientStatus::ALIVE) {
+    return std::nullopt;
+  }
+
+  std::set<uint32_t> seen;
+  std::vector<BufferMemoryDescBytes> result;
+  for (const auto& p : pages) {
+    if (!seen.insert(p.buffer_index).second) continue;  // already collected
+    if (p.buffer_index < it->second.dram_memory_desc_bytes_list.size()) {
+      const auto& bytes = it->second.dram_memory_desc_bytes_list[p.buffer_index];
+      // Only emit non-empty descs.  Empty entries occur in test fixtures
+      // that do not bother packing real MemoryDescs; surfacing them here
+      // would just produce zero-byte protobuf entries the Client cannot
+      // unpack.
+      if (!bytes.empty()) {
+        result.push_back({p.buffer_index, bytes});
+      }
+    }
+    // If the desc list is shorter than the buffer_index, leave it out: the
+    // Client falls through to its no-desc error path which is a clear
+    // structured failure (no crash, no silent corruption).  This can happen
+    // in unit tests that build the registry with empty
+    // dram_memory_desc_bytes_list.
+  }
+  // Result is grouped by buffer_index ascending because std::set iterates in
+  // sorted order, so the protocol's "deduplicated + ascending" requirement
+  // is satisfied here without an extra sort.
+  return result;
+}
+
+std::optional<uint64_t> ClientRegistry::GetNodeDramPageSize(const std::string& node_id,
+                                                            TierType tier) const {
+  if (!IsDramOrHbm(tier)) return std::nullopt;
+  std::shared_lock lock(mutex_);
+  auto it = clients_.find(node_id);
+  if (it == clients_.end() || it->second.status != ClientStatus::ALIVE) {
+    return std::nullopt;
+  }
+  auto alloc_it = it->second.page_allocators.find(tier);
+  if (alloc_it == it->second.page_allocators.end() || !alloc_it->second) {
+    return std::nullopt;
+  }
+  return alloc_it->second->PageSize();
 }
 
 void ClientRegistry::StartReaper() {
@@ -649,24 +776,7 @@ void ClientRegistry::ReapExpiredPendingAllocations() {
       ++it;
       continue;
     }
-
-    auto client_it = clients_.find(it->second.node_id);
-    if (client_it != clients_.end()) {
-      if (it->second.tier == TierType::DRAM || it->second.tier == TierType::HBM) {
-        if (it->second.buffer_index < client_it->second.dram_allocators.size()) {
-          client_it->second.dram_allocators[it->second.buffer_index].Deallocate(it->second.offset,
-                                                                                it->second.size);
-          UpdateAvailableBytesLocked(client_it->second, it->second.tier);
-        }
-      } else if (it->second.tier == TierType::SSD) {
-        if (it->second.buffer_index < client_it->second.ssd_allocators.size()) {
-          client_it->second.ssd_allocators[it->second.buffer_index].Deallocate(it->second.offset,
-                                                                               it->second.size);
-          UpdateAvailableBytesLocked(client_it->second, it->second.tier);
-        }
-      }
-    }
-
+    DeallocatePendingLocked(it->second);
     MORI_UMBP_WARN("[Reaper] Expired pending allocation: id={}", it->second.allocation_id);
     it = pending_allocations_.erase(it);
   }

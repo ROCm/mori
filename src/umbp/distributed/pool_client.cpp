@@ -44,6 +44,14 @@ std::optional<ParsedLocationId> ParseLocationIdWithLog(const std::string& locati
   return result;
 }
 
+std::optional<ParsedDramLocation> ParseDramLocationIdWithLog(const std::string& location_id) {
+  auto result = ParseDramLocationId(location_id);
+  if (!result) {
+    MORI_UMBP_ERROR("[PoolClient] Failed to parse DRAM/HBM location_id: {}", location_id);
+  }
+  return result;
+}
+
 bool IsValidMemoryDesc(const mori::io::MemoryDesc& desc) { return desc.size > 0; }
 }  // namespace
 
@@ -52,7 +60,8 @@ PoolClient::PoolClient(PoolClientConfig config) : config_(std::move(config)) {}
 PoolClient::~PoolClient() { Shutdown(); }
 
 bool PoolClient::Init() {
-  if (initialized_) return true;
+  bool expected = false;
+  if (!initialized_.compare_exchange_strong(expected, true)) return true;
 
   master_client_ = std::make_unique<MasterClient>(config_.master_config);
 
@@ -131,11 +140,12 @@ bool PoolClient::Init() {
     ssd_store_capacities.push_back(store.capacity);
   }
 
-  auto status = master_client_->RegisterSelf(config_.tier_capacities, peer_address,
-                                             engine_desc_bytes, dram_memory_desc_bytes_list,
-                                             dram_buffer_sizes, ssd_store_capacities);
+  auto status = master_client_->RegisterSelf(
+      config_.tier_capacities, peer_address, engine_desc_bytes, dram_memory_desc_bytes_list,
+      dram_buffer_sizes, ssd_store_capacities, config_.dram_page_size);
   if (!status.ok()) {
     MORI_UMBP_ERROR("[PoolClient] RegisterSelf failed: {}", status.error_message());
+    initialized_ = false;
     return false;
   }
 
@@ -143,7 +153,6 @@ bool PoolClient::Init() {
     master_client_->StartHeartbeat();
   }
 
-  initialized_ = true;
   MORI_UMBP_INFO("[PoolClient] Initialized node_id='{}'", config_.master_config.node_id);
   return true;
 }
@@ -236,7 +245,7 @@ std::optional<std::pair<mori::io::MemoryDesc, size_t>> PoolClient::FindRegistere
 }
 
 // ---------------------------------------------------------------------------
-// Phase 2: DRAM-only methods for UMBPClient integration
+// DRAM-only methods for UMBPClient integration
 // ---------------------------------------------------------------------------
 
 bool PoolClient::RegisterWithMaster(const std::string& key, size_t size,
@@ -358,10 +367,10 @@ bool PoolClient::IsRegistered(const std::string& key) const {
 bool PoolClient::ExistsRemote(const std::string& key) {
   if (!initialized_) return false;
 
-  std::optional<RouteGetResult> result;
-  auto status = master_client_->RouteGet(key, &result);
+  bool found = false;
+  auto status = master_client_->Lookup(key, &found);
   if (!status.ok()) return false;
-  return result.has_value();
+  return found;
 }
 
 bool PoolClient::GetRemote(const std::string& key, void* dst, size_t size) {
@@ -381,34 +390,68 @@ bool PoolClient::GetRemote(const std::string& key, void* dst, size_t size) {
   const auto& loc = result->location;
 
   bool is_local = (loc.node_id == config_.master_config.node_id);
-  if (is_local) {
-    auto parsed = ParseLocationIdWithLog(loc.location_id);
+  if (loc.tier == TierType::DRAM || loc.tier == TierType::HBM) {
+    auto parsed = ParseDramLocationIdWithLog(loc.location_id);
     if (!parsed) return false;
-    if (parsed->buffer_index >= config_.dram_buffers.size()) {
-      MORI_UMBP_ERROR("[PoolClient] local Get: invalid buffer_index {}", parsed->buffer_index);
+    if (result->page_size == 0) {
+      MORI_UMBP_ERROR("[PoolClient] GetRemote: master returned page_size=0 for DRAM/HBM target");
       return false;
     }
-    auto& dram = config_.dram_buffers[parsed->buffer_index];
-    if (!dram.buffer || size > loc.size || size > dram.size || parsed->offset > dram.size - size) {
-      MORI_UMBP_ERROR("[PoolClient] local Get: OOB offset={} size={} buf_size={}", parsed->offset,
-                      size, dram.size);
+    const uint64_t page_size = result->page_size;
+    const size_t num_pages = parsed->pages.size();
+    if (num_pages == 0) {
+      MORI_UMBP_ERROR("[PoolClient] GetRemote: empty pages list, key='{}'", key);
       return false;
     }
-    std::memcpy(dst, static_cast<const char*>(dram.buffer) + parsed->offset, size);
-    return true;
-  }
+    if (size != num_pages * page_size) {
+      // PageBitmapAllocator always rounds Put requests up to a full page,
+      // so the symmetrical Get must be addressed in the same page units.
+      // Partial-tail support would relax this; not implemented yet.
+      MORI_UMBP_ERROR("[PoolClient] GetRemote: size {} != pages * page_size ({} * {}) for key='{}'",
+                      size, num_pages, page_size, key);
+      return false;
+    }
 
-  if (loc.tier == TierType::DRAM) {
-    auto parsed = ParseLocationIdWithLog(loc.location_id);
-    if (!parsed) return false;
+    if (is_local) {
+      // Local-node short-circuit: copy each page from this node's own
+      // exportable buffers; no RDMA round-trip needed.
+      char* dst_bytes = static_cast<char*>(dst);
+      for (size_t i = 0; i < num_pages; ++i) {
+        const auto& p = parsed->pages[i];
+        if (p.buffer_index >= config_.dram_buffers.size()) {
+          MORI_UMBP_ERROR("[PoolClient] local Get: invalid buffer_index {}", p.buffer_index);
+          return false;
+        }
+        auto& dram = config_.dram_buffers[p.buffer_index];
+        const uint64_t off = static_cast<uint64_t>(p.page_index) * page_size;
+        if (!dram.buffer || page_size > dram.size || off > dram.size - page_size) {
+          MORI_UMBP_ERROR("[PoolClient] local Get: OOB buf={} off={} page_size={} buf_size={}",
+                          p.buffer_index, off, page_size, dram.size);
+          return false;
+        }
+        std::memcpy(dst_bytes + i * page_size, static_cast<const char*>(dram.buffer) + off,
+                    page_size);
+      }
+      return true;
+    }
+
+    const auto& first_bd = result->dram_memory_descs.empty()
+                               ? std::vector<uint8_t>{}
+                               : result->dram_memory_descs.front().desc_bytes;
+    const uint32_t first_bd_idx = result->dram_memory_descs.empty()
+                                      ? parsed->pages.front().buffer_index
+                                      : result->dram_memory_descs.front().buffer_index;
     auto& peer = GetOrConnectPeer(loc.node_id, result->peer_address, result->engine_desc_bytes,
-                                  result->dram_memory_desc_bytes, parsed->buffer_index);
-    return RemoteDramRead(peer, parsed->buffer_index, dst, size, parsed->offset, false);
+                                  first_bd, first_bd_idx);
+    EnsureBufferDescsCached(peer, result->dram_memory_descs);
+    return RemoteDramScatterRead(peer, parsed->pages, page_size, dst, size, false);
   }
 
   if (loc.tier == TierType::SSD) {
+    // SSD path: dram_memory_descs list is empty for SSD tier; use the legacy
+    // GetOrConnectPeer signature which only relies on engine_desc_bytes.
     auto& peer = GetOrConnectPeer(loc.node_id, result->peer_address, result->engine_desc_bytes,
-                                  result->dram_memory_desc_bytes);
+                                  /*dram_memory_desc_bytes=*/{});
     return RemoteSsdRead(peer, key, loc.location_id, dst, size, false);
   }
 
@@ -434,33 +477,75 @@ bool PoolClient::PutRemote(const std::string& key, const void* src, size_t size)
     return false;
   }
 
-  // DRAM-only: reject SSD targets (Phase 6 will add SSD support)
+  // DRAM-only path: SSD target routing is rejected here (Put-to-SSD goes
+  // through a separate code path).
   if (result->tier != TierType::DRAM) {
     MORI_UMBP_WARN("[PoolClient] PutRemote: target tier is {} (DRAM-only supported)",
                    TierTypeName(result->tier));
     return false;
   }
 
+  // Full scatter-gather: single-page is the trivial N=1, K=1 case and goes
+  // through the same code path as multi-page.
+  if (result->page_size == 0) {
+    MORI_UMBP_ERROR("[PoolClient] PutRemote: master returned page_size=0 for DRAM target");
+    master_client_->AbortAllocation(result->node_id, result->allocation_id, size);
+    return false;
+  }
+  const uint64_t page_size = result->page_size;
+  const size_t num_pages = result->pages.size();
+  if (num_pages == 0) {
+    MORI_UMBP_ERROR("[PoolClient] PutRemote: master returned empty pages list, key='{}'", key);
+    master_client_->AbortAllocation(result->node_id, result->allocation_id, size);
+    return false;
+  }
+  if (size != num_pages * page_size) {
+    // Master rounds Put requests up to a full page in PageBitmapAllocator;
+    // any mismatch here means a Master/Client bug.  Fail loudly and abort
+    // the allocation so the page slots are immediately reclaimable.
+    MORI_UMBP_ERROR("[PoolClient] PutRemote: size {} != pages * page_size ({} * {}) for key='{}'",
+                    size, num_pages, page_size, key);
+    master_client_->AbortAllocation(result->node_id, result->allocation_id, size);
+    return false;
+  }
+
   bool is_local = (result->node_id == config_.master_config.node_id);
   if (is_local) {
-    if (result->buffer_index >= config_.dram_buffers.size()) {
-      MORI_UMBP_ERROR("[PoolClient] local Put: invalid buffer_index {}", result->buffer_index);
-      master_client_->AbortAllocation(result->node_id, result->allocation_id, size);
-      return false;
+    // Local-node short-circuit: copy each page directly into our own
+    // exportable buffers.  Bounds-check every page; on any failure abort
+    // the whole allocation (no partial-write commits).
+    const char* src_bytes = static_cast<const char*>(src);
+    for (size_t i = 0; i < num_pages; ++i) {
+      const auto& p = result->pages[i];
+      if (p.buffer_index >= config_.dram_buffers.size()) {
+        MORI_UMBP_ERROR("[PoolClient] local Put: invalid buffer_index {}", p.buffer_index);
+        master_client_->AbortAllocation(result->node_id, result->allocation_id, size);
+        return false;
+      }
+      auto& dram = config_.dram_buffers[p.buffer_index];
+      const uint64_t off = static_cast<uint64_t>(p.page_index) * page_size;
+      if (!dram.buffer || page_size > dram.size || off > dram.size - page_size) {
+        MORI_UMBP_ERROR("[PoolClient] local Put: OOB buf={} off={} page_size={} buf_size={}",
+                        p.buffer_index, off, page_size, dram.size);
+        master_client_->AbortAllocation(result->node_id, result->allocation_id, size);
+        return false;
+      }
+      std::memcpy(static_cast<char*>(dram.buffer) + off, src_bytes + i * page_size, page_size);
     }
-    auto& dram = config_.dram_buffers[result->buffer_index];
-    if (!dram.buffer || size > dram.size || result->allocated_offset > dram.size - size) {
-      MORI_UMBP_ERROR("[PoolClient] local Put: OOB offset={} size={} buf_size={}",
-                      result->allocated_offset, size, dram.size);
-      master_client_->AbortAllocation(result->node_id, result->allocation_id, size);
-      return false;
-    }
-    std::memcpy(static_cast<char*>(dram.buffer) + result->allocated_offset, src, size);
   } else {
+    // Hydrate every buffer's MemoryDesc up front from the response's
+    // dram_memory_descs list (deduplicated, ascending), then issue a single
+    // scatter-gather BatchWrite covering every page.
+    const auto& first_bd = result->dram_memory_descs.empty()
+                               ? std::vector<uint8_t>{}
+                               : result->dram_memory_descs.front().desc_bytes;
+    const uint32_t first_bd_idx = result->dram_memory_descs.empty()
+                                      ? result->pages.front().buffer_index
+                                      : result->dram_memory_descs.front().buffer_index;
     auto& peer = GetOrConnectPeer(result->node_id, result->peer_address, result->engine_desc_bytes,
-                                  result->dram_memory_desc_bytes, result->buffer_index);
-    bool ok =
-        RemoteDramWrite(peer, result->buffer_index, src, size, result->allocated_offset, false);
+                                  first_bd, first_bd_idx);
+    EnsureBufferDescsCached(peer, result->dram_memory_descs);
+    bool ok = RemoteDramScatterWrite(peer, result->pages, page_size, src, size, false);
     if (!ok) {
       master_client_->AbortAllocation(result->node_id, result->allocation_id, size);
       return false;
@@ -469,8 +554,9 @@ bool PoolClient::PutRemote(const std::string& key, const void* src, size_t size)
 
   Location location;
   location.node_id = result->node_id;
-  location.location_id =
-      std::to_string(result->buffer_index) + ":" + std::to_string(result->allocated_offset);
+  // Use the canonical page-bitmap location_id Master handed back so Finalize
+  // matches what's stored in pending_allocations_ exactly.
+  location.location_id = result->location_id;
   location.size = size;
   location.tier = result->tier;
 
@@ -524,11 +610,12 @@ std::vector<bool> PoolClient::BatchPutRemote(const std::vector<std::string>& key
   };
   std::vector<PendingFinalize> pending;
 
-  struct RemoteItem {
-    size_t original_idx;
-  };
-  std::unordered_map<std::string, std::vector<RemoteItem>> peer_groups;
-
+  // Each entry uses the scatter-gather helpers; single-page is N=1, K=1.
+  // TODO(perf): merge multiple entries' RDMA into a single BatchWrite to
+  // amortize completion latency across the whole batch.  Only safe when
+  // every entry targets the same peer; needs careful zero-copy detection
+  // across heterogeneous src registrations.  For now we issue one
+  // BatchWrite per entry — correct, but not maximally efficient.
   for (size_t i = 0; i < n; ++i) {
     if (!routes[i].has_value()) continue;
     auto& r = *routes[i];
@@ -536,137 +623,69 @@ std::vector<bool> PoolClient::BatchPutRemote(const std::vector<std::string>& key
       master_client_->AbortAllocation(r.node_id, r.allocation_id, sizes[i]);
       continue;
     }
+    if (r.pages.empty() || r.page_size == 0) {
+      MORI_UMBP_ERROR("[PoolClient] BatchPutRemote: empty pages or zero page_size, key='{}'",
+                      keys[i]);
+      master_client_->AbortAllocation(r.node_id, r.allocation_id, sizes[i]);
+      continue;
+    }
+    if (sizes[i] != r.pages.size() * r.page_size) {
+      MORI_UMBP_ERROR(
+          "[PoolClient] BatchPutRemote: size {} != pages * page_size ({} * {}) for key='{}'",
+          sizes[i], r.pages.size(), r.page_size, keys[i]);
+      master_client_->AbortAllocation(r.node_id, r.allocation_id, sizes[i]);
+      continue;
+    }
 
+    bool wrote = false;
     if (r.node_id == config_.master_config.node_id) {
-      if (r.buffer_index >= config_.dram_buffers.size()) {
-        MORI_UMBP_ERROR("[PoolClient] BatchPutRemote local: invalid buffer_index {}",
-                        r.buffer_index);
-        master_client_->AbortAllocation(r.node_id, r.allocation_id, sizes[i]);
-        continue;
-      }
-      auto& dram = config_.dram_buffers[r.buffer_index];
-      if (!dram.buffer || sizes[i] > dram.size || r.allocated_offset > dram.size - sizes[i]) {
-        MORI_UMBP_ERROR("[PoolClient] BatchPutRemote local: OOB offset={} size={} buf_size={}",
-                        r.allocated_offset, sizes[i], dram.size);
-        master_client_->AbortAllocation(r.node_id, r.allocation_id, sizes[i]);
-        continue;
-      }
-      std::memcpy(static_cast<char*>(dram.buffer) + r.allocated_offset, srcs[i], sizes[i]);
-
-      Location loc;
-      loc.node_id = r.node_id;
-      loc.location_id = std::to_string(r.buffer_index) + ":" + std::to_string(r.allocated_offset);
-      loc.size = sizes[i];
-      loc.tier = r.tier;
-      pending.push_back({i, loc, r.allocation_id});
-      results[i] = true;
-    } else {
-      peer_groups[r.node_id].push_back({i});
-    }
-  }
-
-  for (auto& [node_id, items] : peer_groups) {
-    for (auto& item : items) {
-      auto& r = *routes[item.original_idx];
-      GetOrConnectPeer(node_id, r.peer_address, r.engine_desc_bytes, r.dram_memory_desc_bytes,
-                       r.buffer_index);
-    }
-    auto& first_r = *routes[items[0].original_idx];
-    auto& peer = GetOrConnectPeer(node_id, first_r.peer_address, first_r.engine_desc_bytes,
-                                  first_r.dram_memory_desc_bytes, first_r.buffer_index);
-
-    struct ZeroCopyEntry {
-      size_t item_pos;
-      mori::io::MemoryDesc local_mem;
-      size_t local_offset;
-    };
-    std::vector<ZeroCopyEntry> zc_entries;
-    std::vector<size_t> staging_positions;
-
-    for (size_t j = 0; j < items.size(); ++j) {
-      auto reg = FindRegisteredMemory(srcs[items[j].original_idx], sizes[items[j].original_idx]);
-      if (reg) {
-        zc_entries.push_back({j, reg->first, reg->second});
-      } else {
-        staging_positions.push_back(j);
-      }
-    }
-
-    if (!zc_entries.empty() && io_engine_) {
-      const size_t zc_count = zc_entries.size();
-      mori::io::MemDescVec local_descs;
-      mori::io::BatchSizeVec local_offsets;
-      mori::io::MemDescVec remote_descs;
-      mori::io::BatchSizeVec remote_offsets;
-      mori::io::BatchSizeVec batch_sizes;
-      std::vector<mori::io::TransferStatus> statuses(zc_count);
-      mori::io::TransferStatusPtrVec status_ptrs;
-      mori::io::TransferUniqueIdVec uids;
-
-      bool build_ok = true;
-      for (size_t k = 0; k < zc_count; ++k) {
-        auto& zc = zc_entries[k];
-        auto& r = *routes[items[zc.item_pos].original_idx];
-        if (r.buffer_index >= peer.dram_memories.size() ||
-            !IsValidMemoryDesc(peer.dram_memories[r.buffer_index])) {
-          build_ok = false;
+      bool oob = false;
+      const char* src_bytes = static_cast<const char*>(srcs[i]);
+      for (size_t k = 0; k < r.pages.size() && !oob; ++k) {
+        const auto& p = r.pages[k];
+        if (p.buffer_index >= config_.dram_buffers.size()) {
+          MORI_UMBP_ERROR("[PoolClient] BatchPutRemote local: invalid buffer_index {}",
+                          p.buffer_index);
+          oob = true;
           break;
         }
-        local_descs.push_back(zc.local_mem);
-        local_offsets.push_back({zc.local_offset});
-        remote_descs.push_back(peer.dram_memories[r.buffer_index]);
-        remote_offsets.push_back({r.allocated_offset});
-        batch_sizes.push_back({sizes[items[zc.item_pos].original_idx]});
-        status_ptrs.push_back(&statuses[k]);
-        uids.push_back(io_engine_->AllocateTransferUniqueId());
-      }
-
-      if (build_ok) {
-        io_engine_->BatchWrite(local_descs, local_offsets, remote_descs, remote_offsets,
-                               batch_sizes, status_ptrs, uids);
-        for (size_t k = 0; k < zc_count; ++k) {
-          statuses[k].Wait();
-          size_t idx = items[zc_entries[k].item_pos].original_idx;
-          auto& r = *routes[idx];
-          if (statuses[k].Succeeded()) {
-            Location loc;
-            loc.node_id = r.node_id;
-            loc.location_id =
-                std::to_string(r.buffer_index) + ":" + std::to_string(r.allocated_offset);
-            loc.size = sizes[idx];
-            loc.tier = r.tier;
-            pending.push_back({idx, loc, r.allocation_id});
-            results[idx] = true;
-          } else {
-            MORI_UMBP_ERROR("[PoolClient] BatchPutRemote: zero-copy write failed for key '{}'",
-                            keys[idx]);
-            master_client_->AbortAllocation(r.node_id, r.allocation_id, sizes[idx]);
-          }
+        auto& dram = config_.dram_buffers[p.buffer_index];
+        const uint64_t off = static_cast<uint64_t>(p.page_index) * r.page_size;
+        if (!dram.buffer || r.page_size > dram.size || off > dram.size - r.page_size) {
+          MORI_UMBP_ERROR(
+              "[PoolClient] BatchPutRemote local: OOB buf={} off={} page_size={} buf_size={}",
+              p.buffer_index, off, r.page_size, dram.size);
+          oob = true;
+          break;
         }
-      } else {
-        for (auto& zc : zc_entries) staging_positions.push_back(zc.item_pos);
+        std::memcpy(static_cast<char*>(dram.buffer) + off, src_bytes + k * r.page_size,
+                    r.page_size);
       }
+      wrote = !oob;
     } else {
-      for (auto& zc : zc_entries) staging_positions.push_back(zc.item_pos);
+      const auto& first_bd = r.dram_memory_descs.empty() ? std::vector<uint8_t>{}
+                                                         : r.dram_memory_descs.front().desc_bytes;
+      const uint32_t first_bd_idx = r.dram_memory_descs.empty()
+                                        ? r.pages.front().buffer_index
+                                        : r.dram_memory_descs.front().buffer_index;
+      auto& peer =
+          GetOrConnectPeer(r.node_id, r.peer_address, r.engine_desc_bytes, first_bd, first_bd_idx);
+      EnsureBufferDescsCached(peer, r.dram_memory_descs);
+      wrote = RemoteDramScatterWrite(peer, r.pages, r.page_size, srcs[i], sizes[i], false);
     }
 
-    for (auto j : staging_positions) {
-      size_t idx = items[j].original_idx;
-      auto& r = *routes[idx];
-      bool ok =
-          RemoteDramWrite(peer, r.buffer_index, srcs[idx], sizes[idx], r.allocated_offset, false);
-      if (ok) {
-        Location loc;
-        loc.node_id = r.node_id;
-        loc.location_id = std::to_string(r.buffer_index) + ":" + std::to_string(r.allocated_offset);
-        loc.size = sizes[idx];
-        loc.tier = r.tier;
-        pending.push_back({idx, loc, r.allocation_id});
-        results[idx] = true;
-      } else {
-        master_client_->AbortAllocation(r.node_id, r.allocation_id, sizes[idx]);
-      }
+    if (!wrote) {
+      master_client_->AbortAllocation(r.node_id, r.allocation_id, sizes[i]);
+      continue;
     }
+
+    Location loc;
+    loc.node_id = r.node_id;
+    loc.location_id = r.location_id;
+    loc.size = sizes[i];
+    loc.tier = r.tier;
+    pending.push_back({i, loc, r.allocation_id});
+    results[i] = true;
   }
 
   if (!pending.empty()) {
@@ -692,30 +711,18 @@ std::vector<bool> PoolClient::BatchPutRemote(const std::vector<std::string>& key
     }
 
     std::vector<bool> fin_results;
-    grpc::Status fin_status;
-    for (int attempt = 0; attempt < 3; ++attempt) {
-      fin_results.clear();
-      fin_status = master_client_->BatchFinalizeAllocation(fin_keys, fin_locs, fin_aids,
-                                                           &fin_results, fin_depths);
-      if (fin_status.ok() && fin_results.size() == pending.size()) break;
-      if (attempt < 2) {
-        MORI_UMBP_WARN("[PoolClient] BatchFinalizeAllocation attempt {} failed, retrying",
-                       attempt + 1);
-      }
+    auto fin_status = master_client_->BatchFinalizeAllocation(fin_keys, fin_locs, fin_aids,
+                                                              &fin_results, fin_depths);
+    if (!fin_status.ok()) {
+      MORI_UMBP_ERROR("[PoolClient] BatchPutRemote: BatchFinalizeAllocation failed: {}",
+                      fin_status.error_message());
     }
-    if (fin_status.ok() && fin_results.size() == pending.size()) {
-      for (size_t i = 0; i < pending.size(); ++i) {
-        if (fin_results[i]) {
-          std::lock_guard<std::mutex> lock(cache_mutex_);
-          cluster_locations_[fin_keys[i]] = fin_locs[i];
-        } else {
-          results[pending[i].original_idx] = false;
-          master_client_->AbortAllocation(fin_locs[i].node_id, fin_aids[i], fin_locs[i].size);
-        }
-      }
-    } else {
-      MORI_UMBP_ERROR("[PoolClient] BatchPutRemote: BatchFinalizeAllocation failed");
-      for (size_t i = 0; i < pending.size(); ++i) {
+    for (size_t i = 0; i < pending.size(); ++i) {
+      bool ok = (i < fin_results.size()) && fin_results[i];
+      if (ok) {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        cluster_locations_[fin_keys[i]] = fin_locs[i];
+      } else {
         results[pending[i].original_idx] = false;
         master_client_->AbortAllocation(fin_locs[i].node_id, fin_aids[i], fin_locs[i].size);
       }
@@ -749,130 +756,66 @@ std::vector<bool> PoolClient::BatchGetRemote(const std::vector<std::string>& key
     return results;
   }
 
-  struct ParsedRoute {
-    uint32_t buffer_index;
-    uint64_t offset;
-  };
-  std::vector<std::optional<ParsedRoute>> parsed_routes(n);
-
-  struct RemoteItem {
-    size_t original_idx;
-  };
-  std::unordered_map<std::string, std::vector<RemoteItem>> peer_groups;
-
+  // Per-entry scatter-gather BatchRead; single-page is N=1, K=1.
+  // TODO(perf): merge multiple entries' RDMA into a single BatchRead
+  // (mirror of the BatchPut TODO above).
   for (size_t i = 0; i < n; ++i) {
     if (!routes[i].has_value()) continue;
-    auto& loc = routes[i]->location;
-    if (loc.tier != TierType::DRAM) continue;
+    auto& r = *routes[i];
+    auto& loc = r.location;
+    if (loc.tier != TierType::DRAM && loc.tier != TierType::HBM) continue;
 
-    auto parsed = ParseLocationIdWithLog(loc.location_id);
+    auto parsed = ParseDramLocationIdWithLog(loc.location_id);
     if (!parsed) continue;
-    parsed_routes[i] = ParsedRoute{parsed->buffer_index, parsed->offset};
+    if (parsed->pages.empty() || r.page_size == 0) {
+      MORI_UMBP_ERROR(
+          "[PoolClient] BatchGetRemote: empty pages or zero page_size, key='{}' location_id='{}'",
+          keys[i], loc.location_id);
+      continue;
+    }
+    if (sizes[i] != parsed->pages.size() * r.page_size) {
+      MORI_UMBP_ERROR(
+          "[PoolClient] BatchGetRemote: size {} != pages * page_size ({} * {}) for key='{}'",
+          sizes[i], parsed->pages.size(), r.page_size, keys[i]);
+      continue;
+    }
 
     if (loc.node_id == config_.master_config.node_id) {
-      if (parsed->buffer_index >= config_.dram_buffers.size()) {
-        MORI_UMBP_ERROR("[PoolClient] BatchGetRemote local: invalid buffer_index {}",
-                        parsed->buffer_index);
-        continue;
-      }
-      auto& dram = config_.dram_buffers[parsed->buffer_index];
-      if (!dram.buffer || sizes[i] > loc.size || sizes[i] > dram.size ||
-          parsed->offset > dram.size - sizes[i]) {
-        MORI_UMBP_ERROR("[PoolClient] BatchGetRemote local: OOB offset={} size={} buf_size={}",
-                        parsed->offset, sizes[i], dram.size);
-        continue;
-      }
-      std::memcpy(dsts[i], static_cast<const char*>(dram.buffer) + parsed->offset, sizes[i]);
-      results[i] = true;
-    } else {
-      peer_groups[loc.node_id].push_back({i});
-    }
-  }
-
-  for (auto& [node_id, items] : peer_groups) {
-    for (auto& item : items) {
-      auto& r = *routes[item.original_idx];
-      auto& pr = *parsed_routes[item.original_idx];
-      GetOrConnectPeer(node_id, r.peer_address, r.engine_desc_bytes, r.dram_memory_desc_bytes,
-                       pr.buffer_index);
-    }
-    auto& first_r = *routes[items[0].original_idx];
-    auto& first_pr = *parsed_routes[items[0].original_idx];
-    auto& peer = GetOrConnectPeer(node_id, first_r.peer_address, first_r.engine_desc_bytes,
-                                  first_r.dram_memory_desc_bytes, first_pr.buffer_index);
-
-    struct ZeroCopyEntry {
-      size_t item_pos;
-      mori::io::MemoryDesc local_mem;
-      size_t local_offset;
-    };
-    std::vector<ZeroCopyEntry> zc_entries;
-    std::vector<size_t> staging_positions;
-
-    for (size_t j = 0; j < items.size(); ++j) {
-      auto reg = FindRegisteredMemory(dsts[items[j].original_idx], sizes[items[j].original_idx]);
-      if (reg) {
-        zc_entries.push_back({j, reg->first, reg->second});
-      } else {
-        staging_positions.push_back(j);
-      }
-    }
-
-    if (!zc_entries.empty() && io_engine_) {
-      const size_t zc_count = zc_entries.size();
-      mori::io::MemDescVec local_descs;
-      mori::io::BatchSizeVec local_offsets;
-      mori::io::MemDescVec remote_descs;
-      mori::io::BatchSizeVec remote_offsets;
-      mori::io::BatchSizeVec batch_sizes;
-      std::vector<mori::io::TransferStatus> statuses(zc_count);
-      mori::io::TransferStatusPtrVec status_ptrs;
-      mori::io::TransferUniqueIdVec uids;
-
-      bool build_ok = true;
-      for (size_t k = 0; k < zc_count; ++k) {
-        auto& zc = zc_entries[k];
-        size_t idx = items[zc.item_pos].original_idx;
-        auto& pr = *parsed_routes[idx];
-        if (pr.buffer_index >= peer.dram_memories.size() ||
-            !IsValidMemoryDesc(peer.dram_memories[pr.buffer_index])) {
-          build_ok = false;
+      bool oob = false;
+      char* dst_bytes = static_cast<char*>(dsts[i]);
+      for (size_t k = 0; k < parsed->pages.size() && !oob; ++k) {
+        const auto& p = parsed->pages[k];
+        if (p.buffer_index >= config_.dram_buffers.size()) {
+          MORI_UMBP_ERROR("[PoolClient] BatchGetRemote local: invalid buffer_index {}",
+                          p.buffer_index);
+          oob = true;
           break;
         }
-        local_descs.push_back(zc.local_mem);
-        local_offsets.push_back({zc.local_offset});
-        remote_descs.push_back(peer.dram_memories[pr.buffer_index]);
-        remote_offsets.push_back({pr.offset});
-        batch_sizes.push_back({sizes[idx]});
-        status_ptrs.push_back(&statuses[k]);
-        uids.push_back(io_engine_->AllocateTransferUniqueId());
-      }
-
-      if (build_ok) {
-        io_engine_->BatchRead(local_descs, local_offsets, remote_descs, remote_offsets, batch_sizes,
-                              status_ptrs, uids);
-        for (size_t k = 0; k < zc_count; ++k) {
-          statuses[k].Wait();
-          size_t idx = items[zc_entries[k].item_pos].original_idx;
-          if (statuses[k].Succeeded()) {
-            results[idx] = true;
-          } else {
-            MORI_UMBP_ERROR("[PoolClient] BatchGetRemote: zero-copy read failed for key '{}'",
-                            keys[idx]);
-          }
+        auto& dram = config_.dram_buffers[p.buffer_index];
+        const uint64_t off = static_cast<uint64_t>(p.page_index) * r.page_size;
+        if (!dram.buffer || r.page_size > dram.size || off > dram.size - r.page_size) {
+          MORI_UMBP_ERROR(
+              "[PoolClient] BatchGetRemote local: OOB buf={} off={} page_size={} buf_size={}",
+              p.buffer_index, off, r.page_size, dram.size);
+          oob = true;
+          break;
         }
-      } else {
-        for (auto& zc : zc_entries) staging_positions.push_back(zc.item_pos);
+        std::memcpy(dst_bytes + k * r.page_size, static_cast<const char*>(dram.buffer) + off,
+                    r.page_size);
       }
-    } else {
-      for (auto& zc : zc_entries) staging_positions.push_back(zc.item_pos);
+      results[i] = !oob;
+      continue;
     }
 
-    for (auto j : staging_positions) {
-      size_t idx = items[j].original_idx;
-      auto& pr = *parsed_routes[idx];
-      results[idx] = RemoteDramRead(peer, pr.buffer_index, dsts[idx], sizes[idx], pr.offset, false);
-    }
+    const auto& first_bd = r.dram_memory_descs.empty() ? std::vector<uint8_t>{}
+                                                       : r.dram_memory_descs.front().desc_bytes;
+    const uint32_t first_bd_idx = r.dram_memory_descs.empty()
+                                      ? parsed->pages.front().buffer_index
+                                      : r.dram_memory_descs.front().buffer_index;
+    auto& peer =
+        GetOrConnectPeer(loc.node_id, r.peer_address, r.engine_desc_bytes, first_bd, first_bd_idx);
+    EnsureBufferDescsCached(peer, r.dram_memory_descs);
+    results[i] = RemoteDramScatterRead(peer, parsed->pages, r.page_size, dsts[i], sizes[i], false);
   }
 
   return results;
@@ -895,11 +838,15 @@ PoolClient::PeerConnection& PoolClient::GetOrConnectPeer(
   if (it != peers_.end()) {
     // Ensure dram_memories vector has the requested index populated
     auto& peer = *it->second;
-    if (buffer_index >= peer.dram_memories.size() && !dram_memory_desc_bytes.empty()) {
-      peer.dram_memories.resize(buffer_index + 1);
-      auto handle = msgpack::unpack(reinterpret_cast<const char*>(dram_memory_desc_bytes.data()),
-                                    dram_memory_desc_bytes.size());
-      peer.dram_memories[buffer_index] = handle.get().as<mori::io::MemoryDesc>();
+    if (!dram_memory_desc_bytes.empty()) {
+      if (buffer_index >= peer.dram_memories.size()) {
+        peer.dram_memories.resize(buffer_index + 1);
+      }
+      if (!IsValidMemoryDesc(peer.dram_memories[buffer_index])) {
+        auto handle = msgpack::unpack(reinterpret_cast<const char*>(dram_memory_desc_bytes.data()),
+                                      dram_memory_desc_bytes.size());
+        peer.dram_memories[buffer_index] = handle.get().as<mori::io::MemoryDesc>();
+      }
     }
     return peer;
   }
@@ -929,6 +876,29 @@ PoolClient::PeerConnection& PoolClient::GetOrConnectPeer(
   auto* raw = peer.get();
   peers_.emplace(node_id, std::move(peer));
   return *raw;
+}
+
+void PoolClient::EnsureBufferDescsCached(PeerConnection& peer,
+                                         const std::vector<BufferMemoryDescBytes>& descs) {
+  if (descs.empty()) return;
+  std::lock_guard<std::mutex> lock(peers_mutex_);
+  for (const auto& bd : descs) {
+    if (bd.desc_bytes.empty()) continue;
+    if (bd.buffer_index >= peer.dram_memories.size()) {
+      peer.dram_memories.resize(bd.buffer_index + 1);
+    }
+    if (!IsValidMemoryDesc(peer.dram_memories[bd.buffer_index])) {
+      // MemoryDesc is immutable: once cached, never overwrite the entry.
+      try {
+        auto handle = msgpack::unpack(reinterpret_cast<const char*>(bd.desc_bytes.data()),
+                                      bd.desc_bytes.size());
+        peer.dram_memories[bd.buffer_index] = handle.get().as<mori::io::MemoryDesc>();
+      } catch (const std::exception& e) {
+        MORI_UMBP_ERROR("[PoolClient] Failed to unpack DRAM MemoryDesc for buffer_index {}: {}",
+                        bd.buffer_index, e.what());
+      }
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1055,10 +1025,255 @@ bool PoolClient::RemoteDramRead(PeerConnection& peer, uint32_t buffer_index, voi
 }
 
 // ---------------------------------------------------------------------------
+// Remote DRAM scatter-gather path (multi-page Put/Get)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Group `pages` (positionally) by buffer_index, preserving the original
+// page-list ordering as the *source* layout.  For each distinct
+// buffer_index encountered (in first-seen order), emit one entry in
+// `groups` containing the indices `i` (into `pages`) that target that
+// buffer.  buffer_indices_out preserves the same first-seen order so the
+// outer N for IOEngine batch ops follows the same iteration pattern.
+struct ScatterGroup {
+  uint32_t buffer_index;
+  std::vector<size_t> src_page_indices;  // indices into the original `pages` vector
+};
+
+std::vector<ScatterGroup> GroupPagesByBuffer(const std::vector<PageLocation>& pages) {
+  std::vector<ScatterGroup> groups;
+  std::unordered_map<uint32_t, size_t> buf_to_group;
+  groups.reserve(pages.size());
+  for (size_t i = 0; i < pages.size(); ++i) {
+    uint32_t bi = pages[i].buffer_index;
+    auto it = buf_to_group.find(bi);
+    if (it == buf_to_group.end()) {
+      buf_to_group.emplace(bi, groups.size());
+      groups.push_back({bi, {}});
+      it = buf_to_group.find(bi);
+    }
+    groups[it->second].src_page_indices.push_back(i);
+  }
+  return groups;
+}
+
+}  // namespace
+
+// Build the IOEngine BatchWrite/Read parameter shape from a list of
+// pages + a single local MemoryDesc + the page offset within `local_mem`.
+//
+// Returns `false` if any page targets a buffer_index that has not been
+// hydrated in `peer.dram_memories` (meaning the caller forgot to
+// EnsureBufferDescsCached).
+bool PoolClient::RemoteDramScatterWrite(PeerConnection& peer,
+                                        const std::vector<PageLocation>& pages, uint64_t page_size,
+                                        const void* src, size_t size, bool zero_copy) {
+  if (!io_engine_) return false;
+  if (pages.empty() || page_size == 0) {
+    MORI_UMBP_ERROR("[PoolClient] ScatterWrite: empty pages or page_size=0");
+    return false;
+  }
+  if (size != pages.size() * page_size) {
+    MORI_UMBP_ERROR("[PoolClient] ScatterWrite: size {} != {} * {}", size, pages.size(), page_size);
+    return false;
+  }
+
+  // Resolve local source: zero-copy registered region, else staging buffer.
+  // FindRegisteredMemory checks the *whole* src range (not per-page) — that
+  // matches both the spec and the existing RemoteDramWrite semantics.
+  mori::io::MemoryDesc local_mem;
+  size_t local_base_offset = 0;
+  bool used_zero_copy = false;
+  std::unique_lock<std::mutex> staging_lock(staging_mutex_, std::defer_lock);
+  if (zero_copy) {
+    auto reg = FindRegisteredMemory(src, size);
+    if (reg) {
+      local_mem = reg->first;
+      local_base_offset = reg->second;
+      used_zero_copy = true;
+    } else {
+      MORI_UMBP_WARN(
+          "[PoolClient] ScatterWrite zero_copy=true but pointer not registered, "
+          "falling back to staging");
+    }
+  }
+  if (!used_zero_copy) {
+    if (size > config_.staging_buffer_size) {
+      MORI_UMBP_ERROR("[PoolClient] ScatterWrite: size {} exceeds staging_buffer_size {}", size,
+                      config_.staging_buffer_size);
+      return false;
+    }
+    staging_lock.lock();
+    std::memcpy(staging_buffer_.get(), src, size);
+    local_mem = staging_mem_;
+    local_base_offset = 0;
+  }
+
+  auto groups = GroupPagesByBuffer(pages);
+  const size_t N = groups.size();
+  mori::io::MemDescVec local_descs(N, local_mem);
+  mori::io::MemDescVec remote_descs;
+  mori::io::BatchSizeVec local_offsets(N), remote_offsets(N), sizes_v(N);
+  remote_descs.reserve(N);
+  for (size_t k = 0; k < N; ++k) {
+    const auto& g = groups[k];
+    if (g.buffer_index >= peer.dram_memories.size() ||
+        !IsValidMemoryDesc(peer.dram_memories[g.buffer_index])) {
+      MORI_UMBP_ERROR("[PoolClient] ScatterWrite: buffer_index {} not hydrated on peer",
+                      g.buffer_index);
+      return false;
+    }
+    remote_descs.push_back(peer.dram_memories[g.buffer_index]);
+    auto& l_off = local_offsets[k];
+    auto& r_off = remote_offsets[k];
+    auto& sz = sizes_v[k];
+    l_off.reserve(g.src_page_indices.size());
+    r_off.reserve(g.src_page_indices.size());
+    sz.reserve(g.src_page_indices.size());
+    for (size_t spi : g.src_page_indices) {
+      l_off.push_back(local_base_offset + spi * page_size);
+      r_off.push_back(static_cast<uint64_t>(pages[spi].page_index) * page_size);
+      sz.push_back(page_size);
+    }
+  }
+
+  // Allocate per-pair status + ids.  IOEngine writes status pointers, so
+  // hold the storage in a vector with a stable address while waiting.
+  std::vector<mori::io::TransferStatus> statuses(N);
+  mori::io::TransferStatusPtrVec status_ptrs(N);
+  mori::io::TransferUniqueIdVec ids(N);
+  for (size_t k = 0; k < N; ++k) {
+    status_ptrs[k] = &statuses[k];
+    ids[k] = io_engine_->AllocateTransferUniqueId();
+  }
+
+  MORI_UMBP_DEBUG("[PoolClient] ScatterWrite start: pages={}, groups={}, zero_copy={}",
+                  pages.size(), N, used_zero_copy);
+  io_engine_->BatchWrite(local_descs, local_offsets, remote_descs, remote_offsets, sizes_v,
+                         status_ptrs, ids);
+
+  bool all_ok = true;
+  for (size_t k = 0; k < N; ++k) {
+    statuses[k].Wait();
+    if (!statuses[k].Succeeded()) {
+      MORI_UMBP_ERROR("[PoolClient] ScatterWrite group {} (buf={}) failed: uid={}, {}", k,
+                      groups[k].buffer_index, ids[k], statuses[k].Message());
+      all_ok = false;
+    }
+  }
+  if (all_ok) {
+    MORI_UMBP_DEBUG("[PoolClient] ScatterWrite done: pages={}, groups={}", pages.size(), N);
+  }
+  return all_ok;
+}
+
+bool PoolClient::RemoteDramScatterRead(PeerConnection& peer, const std::vector<PageLocation>& pages,
+                                       uint64_t page_size, void* dst, size_t size, bool zero_copy) {
+  if (!io_engine_) return false;
+  if (pages.empty() || page_size == 0) {
+    MORI_UMBP_ERROR("[PoolClient] ScatterRead: empty pages or page_size=0");
+    return false;
+  }
+  if (size != pages.size() * page_size) {
+    MORI_UMBP_ERROR("[PoolClient] ScatterRead: size {} != {} * {}", size, pages.size(), page_size);
+    return false;
+  }
+
+  mori::io::MemoryDesc local_mem;
+  size_t local_base_offset = 0;
+  bool used_zero_copy = false;
+  std::unique_lock<std::mutex> staging_lock(staging_mutex_, std::defer_lock);
+  if (zero_copy) {
+    auto reg = FindRegisteredMemory(dst, size);
+    if (reg) {
+      local_mem = reg->first;
+      local_base_offset = reg->second;
+      used_zero_copy = true;
+    } else {
+      MORI_UMBP_WARN(
+          "[PoolClient] ScatterRead zero_copy=true but pointer not registered, "
+          "falling back to staging");
+    }
+  }
+  if (!used_zero_copy) {
+    if (size > config_.staging_buffer_size) {
+      MORI_UMBP_ERROR("[PoolClient] ScatterRead: size {} exceeds staging_buffer_size {}", size,
+                      config_.staging_buffer_size);
+      return false;
+    }
+    staging_lock.lock();
+    local_mem = staging_mem_;
+    local_base_offset = 0;
+  }
+
+  auto groups = GroupPagesByBuffer(pages);
+  const size_t N = groups.size();
+  mori::io::MemDescVec local_descs(N, local_mem);
+  mori::io::MemDescVec remote_descs;
+  mori::io::BatchSizeVec local_offsets(N), remote_offsets(N), sizes_v(N);
+  remote_descs.reserve(N);
+  for (size_t k = 0; k < N; ++k) {
+    const auto& g = groups[k];
+    if (g.buffer_index >= peer.dram_memories.size() ||
+        !IsValidMemoryDesc(peer.dram_memories[g.buffer_index])) {
+      MORI_UMBP_ERROR("[PoolClient] ScatterRead: buffer_index {} not hydrated on peer",
+                      g.buffer_index);
+      return false;
+    }
+    remote_descs.push_back(peer.dram_memories[g.buffer_index]);
+    auto& l_off = local_offsets[k];
+    auto& r_off = remote_offsets[k];
+    auto& sz = sizes_v[k];
+    l_off.reserve(g.src_page_indices.size());
+    r_off.reserve(g.src_page_indices.size());
+    sz.reserve(g.src_page_indices.size());
+    for (size_t spi : g.src_page_indices) {
+      l_off.push_back(local_base_offset + spi * page_size);
+      r_off.push_back(static_cast<uint64_t>(pages[spi].page_index) * page_size);
+      sz.push_back(page_size);
+    }
+  }
+
+  std::vector<mori::io::TransferStatus> statuses(N);
+  mori::io::TransferStatusPtrVec status_ptrs(N);
+  mori::io::TransferUniqueIdVec ids(N);
+  for (size_t k = 0; k < N; ++k) {
+    status_ptrs[k] = &statuses[k];
+    ids[k] = io_engine_->AllocateTransferUniqueId();
+  }
+
+  MORI_UMBP_DEBUG("[PoolClient] ScatterRead start: pages={}, groups={}, zero_copy={}", pages.size(),
+                  N, used_zero_copy);
+  io_engine_->BatchRead(local_descs, local_offsets, remote_descs, remote_offsets, sizes_v,
+                        status_ptrs, ids);
+
+  bool all_ok = true;
+  for (size_t k = 0; k < N; ++k) {
+    statuses[k].Wait();
+    if (!statuses[k].Succeeded()) {
+      MORI_UMBP_ERROR("[PoolClient] ScatterRead group {} (buf={}) failed: uid={}, {}", k,
+                      groups[k].buffer_index, ids[k], statuses[k].Message());
+      all_ok = false;
+    }
+  }
+  if (!all_ok) return false;
+
+  // For staging-fallback path, copy from staging to caller's dst.  We held
+  // the staging mutex across the whole BatchRead so the buffer is intact.
+  if (!used_zero_copy) {
+    std::memcpy(dst, staging_buffer_.get(), size);
+  }
+  MORI_UMBP_DEBUG("[PoolClient] ScatterRead done: pages={}, groups={}", pages.size(), N);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
 // Remote SSD path (RDMA + PeerService gRPC coordination)
 // ---------------------------------------------------------------------------
 
 bool PoolClient::EnsurePeerServiceConnection(PeerConnection& peer) {
+  std::lock_guard<std::mutex> lock(peer.ssd_op_mutex);
   if (peer.peer_stub) return true;
   if (peer.peer_address.empty()) {
     MORI_UMBP_ERROR("[PoolClient] No peer_address for PeerService connection");
@@ -1105,19 +1320,9 @@ bool PoolClient::RemoteSsdWrite(PeerConnection& peer, const std::string& key, co
     return false;
   }
   auto& staging_remote_mem = peer.ssd_staging_mem;
-
-  {
-    std::lock_guard<std::mutex> lock(peer.ssd_op_mutex);
-    if (!peer.peer_stub) {
-      auto channel = grpc::CreateChannel(peer.peer_address, grpc::InsecureChannelCredentials());
-      auto s = ::umbp::UMBPPeer::NewStub(channel);
-      peer.peer_stub = std::unique_ptr<void, void (*)(void*)>(
-          s.release(), +[](void* p) { delete static_cast<::umbp::UMBPPeer::Stub*>(p); });
-    }
-  }
   auto* stub = static_cast<::umbp::UMBPPeer::Stub*>(peer.peer_stub.get());
 
-  // Phase 0: Pre-allocate a write slot on the remote peer
+  // Step 1: Pre-allocate a write slot on the remote peer
   ::umbp::AllocateWriteSlotRequest alloc_req;
   alloc_req.set_size(size);
   ::umbp::AllocateWriteSlotResponse alloc_resp;
@@ -1129,7 +1334,7 @@ bool PoolClient::RemoteSsdWrite(PeerConnection& peer, const std::string& key, co
   }
   uint64_t write_offset = alloc_resp.staging_offset();
 
-  // Phase 1: RDMA write data into the allocated staging slot
+  // Step 2: RDMA write data into the allocated staging slot
   {
     bool used_zero_copy = false;
     if (zero_copy) {
@@ -1172,7 +1377,7 @@ bool PoolClient::RemoteSsdWrite(PeerConnection& peer, const std::string& key, co
     }
   }
 
-  // Phase 2: CommitSsdWrite with lease_id (slot is released by server on completion)
+  // Step 3: CommitSsdWrite with lease_id (slot is released by server on completion)
   ::umbp::CommitSsdWriteRequest req;
   req.set_key(key);
   req.set_staging_offset(write_offset);
@@ -1211,19 +1416,9 @@ bool PoolClient::RemoteSsdRead(PeerConnection& peer, const std::string& key,
     return false;
   }
   auto& staging_remote_mem = peer.ssd_staging_mem;
-
-  {
-    std::lock_guard<std::mutex> lock(peer.ssd_op_mutex);
-    if (!peer.peer_stub) {
-      auto channel = grpc::CreateChannel(peer.peer_address, grpc::InsecureChannelCredentials());
-      auto s = ::umbp::UMBPPeer::NewStub(channel);
-      peer.peer_stub = std::unique_ptr<void, void (*)(void*)>(
-          s.release(), +[](void* p) { delete static_cast<::umbp::UMBPPeer::Stub*>(p); });
-    }
-  }
   auto* stub = static_cast<::umbp::UMBPPeer::Stub*>(peer.peer_stub.get());
 
-  // Phase 1: PrepareSsdRead — server allocates a slot and loads SSD data
+  // Step 1: PrepareSsdRead — server allocates a slot and loads SSD data
   ::umbp::PrepareSsdReadRequest req;
   req.set_key(key);
   req.set_ssd_location_id(location_id);
@@ -1241,7 +1436,7 @@ bool PoolClient::RemoteSsdRead(PeerConnection& peer, const std::string& key,
     return false;
   }
 
-  // Phase 2: RDMA read from the allocated staging slot
+  // Step 2: RDMA read from the allocated staging slot
   bool rdma_ok = false;
   if (zero_copy) {
     auto reg = FindRegisteredMemory(dst, size);
@@ -1292,7 +1487,7 @@ bool PoolClient::RemoteSsdRead(PeerConnection& peer, const std::string& key,
     rdma_ok = true;
   }
 
-  // Phase 3: Release staging slot (with lightweight retry)
+  // Step 3: Release staging slot (with lightweight retry)
   if (resp.lease_id() > 0) {
     for (int attempt = 0; attempt < 2; ++attempt) {
       ::umbp::ReleaseSsdLeaseRequest rel_req;

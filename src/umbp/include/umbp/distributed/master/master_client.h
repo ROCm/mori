@@ -47,7 +47,10 @@ struct RouteGetResult {
   Location location;
   std::string peer_address;
   std::vector<uint8_t> engine_desc_bytes;
-  std::vector<uint8_t> dram_memory_desc_bytes;
+
+  // DRAM/HBM only; empty for SSD tier.
+  std::vector<BufferMemoryDescBytes> dram_memory_descs;
+  uint64_t page_size = 0;
 };
 
 class MasterClient {
@@ -60,12 +63,17 @@ class MasterClient {
 
   // --- Client lifecycle ---
   // Register with master. If auto_heartbeat, starts heartbeat thread.
+  // `dram_page_size` is the page size the Client wants Master's
+  // PageBitmapAllocator to use for this node's DRAM/HBM tier (per Q6, the
+  // same value applies to both tiers).  0 means "use Master's
+  // ClientRegistryConfig.default_dram_page_size".  Set from
+  // PoolClientConfig.dram_page_size at the call site.
   grpc::Status RegisterSelf(
       const std::map<TierType, TierCapacity>& tier_capacities, const std::string& peer_address = "",
       const std::vector<uint8_t>& engine_desc_bytes = {},
       const std::vector<std::vector<uint8_t>>& dram_memory_desc_bytes_list = {},
       const std::vector<uint64_t>& dram_buffer_sizes = {},
-      const std::vector<uint64_t>& ssd_store_capacities = {});
+      const std::vector<uint64_t>& ssd_store_capacities = {}, uint64_t dram_page_size = 0);
   grpc::Status UnregisterSelf();
 
   // --- Block index ---
