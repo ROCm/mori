@@ -5,13 +5,15 @@ FROM ghcr.io/rocm/jax-base-ubu24.rocm711:latest AS builder
 
 ARG JAX_BRANCH=rocm-jaxlib-v0.9.1
 ARG BAZEL_VERSION=7.7.0
-ARG GPU_TARGET=gfx942
+ARG GPU_TARGET=gfx942,gfx950
 ARG ROCM_VERSION=7
 
 # Install build tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
         wget \
-        patchelf && \
+        patchelf \
+        clang-18 \
+        libc6-dev && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Install Bazel

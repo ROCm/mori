@@ -28,7 +28,9 @@
 #include "mori/core/profiler/constants.hpp"
 #include "mori/core/profiler/kernel_profiler.hpp"
 #include "mori/ops/dispatch_combine/dispatch_combine.hpp"
+#ifdef ENABLE_PROFILER
 #include "mori/profiler/profiler.hpp"
+#endif
 #include "mori/shmem/shmem.hpp"
 #include "src/ops/dispatch_combine/common.hpp"
 #include "src/ops/dispatch_combine/convert.hpp"
