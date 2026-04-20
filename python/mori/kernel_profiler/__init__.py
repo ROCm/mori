@@ -179,7 +179,10 @@ def export_to_perfetto(
 
     if not raw_events:
         warnings.warn(
-            "No trace events found in buffer. The profiler might not have been used."
+            "No trace events found in buffer. Possible causes: "
+            "(1) the kernel does not have profiler instrumentation, or "
+            "(2) the JIT cache was built without ENABLE_PROFILER set "
+            "(clear ~/.mori and re-run with ENABLE_PROFILER=1)."
         )
         return
 
