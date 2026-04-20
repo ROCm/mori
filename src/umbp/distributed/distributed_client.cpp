@@ -24,6 +24,7 @@
 #include <stdexcept>
 
 #include "mori/io/engine.hpp"
+#include "mori/utils/mori_log.hpp"
 #include "umbp/distributed/config.h"
 #include "umbp/distributed/master/master_client.h"
 
@@ -41,6 +42,16 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
   mc_config.node_address = dc.node_address;
   mc_config.auto_heartbeat = dc.auto_heartbeat;
   master_client_ = std::make_unique<MasterClient>(mc_config);
+
+  // Register this node with the master so it is considered "alive" before
+  // any ReportExternalKvBlocks calls are made.  Empty tier_capacities is
+  // correct here: DistributedClient is used for external KV event reporting
+  // only; it does not own DRAM/SSD storage tiers.
+  auto reg_status = master_client_->RegisterSelf({});
+  if (!reg_status.ok()) {
+    MORI_UMBP_WARN("[DistributedClient] RegisterSelf failed (will retry on heartbeat): {}",
+                   reg_status.error_message());
+  }
 
   // TODO: init IOEngine from dc.io_engine_host / dc.io_engine_port
 }

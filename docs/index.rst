@@ -33,6 +33,7 @@ MORI Documentation
 
    api/communication
    api/profiler
+   api/umbp
 
 Components
 ----------

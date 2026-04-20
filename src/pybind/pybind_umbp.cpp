@@ -191,13 +191,37 @@ void RegisterMoriUmbp(py::module_& m) {
       });
 
   py::class_<MasterClient>(m, "UMBPMasterClient")
-      .def(py::init([](const std::string& master_address) {
+      .def(py::init([](const std::string& master_address, const std::string& node_id,
+                       const std::string& node_address) {
              MasterClientConfig cfg;
              cfg.master_address = master_address;
+             cfg.node_id = node_id;
+             cfg.node_address = node_address;
              cfg.auto_heartbeat = false;
              return std::make_unique<MasterClient>(cfg);
            }),
-           py::arg("master_address"))
+           py::arg("master_address"), py::arg("node_id") = std::string{},
+           py::arg("node_address") = std::string{})
+      .def(
+          "register_self",
+          [](MasterClient& self,
+             const std::map<TierType, std::pair<uint64_t, uint64_t>>& tier_capacities) {
+            std::map<TierType, TierCapacity> caps;
+            for (const auto& [tier, total_avail] : tier_capacities) {
+              caps[tier] = {total_avail.first, total_avail.second};
+            }
+            auto status = self.RegisterSelf(caps);
+            if (!status.ok())
+              throw std::runtime_error("RegisterSelf failed: " + status.error_message());
+          },
+          py::arg("tier_capacities") = std::map<TierType, std::pair<uint64_t, uint64_t>>{})
+      .def("unregister_self",
+           [](MasterClient& self) {
+             auto status = self.UnregisterSelf();
+             if (!status.ok())
+               throw std::runtime_error("UnregisterSelf failed: " + status.error_message());
+           })
+      .def("is_registered", &MasterClient::IsRegistered)
       .def(
           "report_external_kv_blocks",
           [](MasterClient& self, const std::string& node_id,

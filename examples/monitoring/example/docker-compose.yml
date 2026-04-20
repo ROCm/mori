@@ -1,0 +1,41 @@
+version: "3.8"
+
+# Example consumer stack that includes mori's monitoring fragments.
+# Run from this directory:
+#   docker compose up -d
+#
+# Then open:
+#   Grafana:    http://localhost:3000   (UMBP dashboard auto-loaded)
+#   Prometheus: http://localhost:9090
+
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      # Main config — delegates scrape jobs to conf.d/
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # Mori scrape fragment
+      - ../umbp_master.scrape.yml:/etc/prometheus/conf.d/umbp_master.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=15d"
+
+  grafana:
+    image: grafana/grafana:latest
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+    volumes:
+      # Mori dashboard JSON
+      - ../grafana/dashboards:/var/lib/grafana/dashboards/mori:ro
+      # Mori provisioning fragments
+      - ../grafana/provisioning/dashboards/mori.yml:/etc/grafana/provisioning/dashboards/mori.yml:ro
+      # Datasource: point Grafana at the local Prometheus
+      - ./grafana-datasource.yml:/etc/grafana/provisioning/datasources/prometheus.yml:ro
+    depends_on:
+      - prometheus

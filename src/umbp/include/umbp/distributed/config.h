@@ -53,6 +53,7 @@ struct MasterClientConfig {
 
 struct MasterServerConfig {
   std::string listen_address = "0.0.0.0:50051";
+  int metrics_port = 9091;
   ClientRegistryConfig registry_config;
 
   std::unique_ptr<RouteGetStrategy> get_strategy;

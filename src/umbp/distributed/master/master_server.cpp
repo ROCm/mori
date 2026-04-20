@@ -32,9 +32,11 @@
 #include "mori/utils/mori_log.hpp"
 #include "umbp.grpc.pb.h"
 #include "umbp/distributed/master/external_kv_block_index.h"
+#include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/routing/router.h"
 
 namespace mori::umbp {
+
 
 static Location ToLocation(const ::umbp::Location& proto_location) {
   Location location;
@@ -52,12 +54,14 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
  public:
   UMBPMasterServiceImpl(ClientRegistry& registry, GlobalBlockIndex& index,
                         ExternalKvBlockIndex& external_kv_index, Router& router,
-                        const ClientRegistryConfig& config)
+                        const ClientRegistryConfig& config,
+                        mori::metrics::MetricsServer* metrics)
       : registry_(registry),
         index_(index),
         external_kv_index_(external_kv_index),
         router_(router),
-        config_(config) {}
+        config_(config),
+        metrics_(metrics) {}
 
   grpc::Status RegisterClient(grpc::ServerContext* /*context*/,
                               const ::umbp::RegisterClientRequest* request,
@@ -353,6 +357,20 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     registry_.RegisterExternalKvBlocks(request->node_id(), hashes, tier);
     MORI_UMBP_INFO("[Master] ReportExternalKvBlocks: node_id={}, hashes={}, tier={}",
                    request->node_id(), hashes.size(), TierTypeName(tier));
+
+    if (metrics_) {
+      metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_REPORT_TOTAL,
+                           MORI_UMBP_METRIC_EXT_KV_REPORT_TOTAL_HELP);
+      metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_REPORT_BLOCKS_TOTAL,
+                           MORI_UMBP_METRIC_EXT_KV_REPORT_BLOCKS_TOTAL_HELP,
+                           static_cast<uint64_t>(hashes.size()));
+      const size_t kv_count = external_kv_index_.GetKvCount(request->node_id());
+      metrics_->setGauge(MORI_UMBP_METRIC_EXT_KV_LIVE_COUNT_PREFIX +
+                             mori::metrics::MetricsServer::SanitizeName(request->node_id()),
+                         MORI_UMBP_METRIC_EXT_KV_LIVE_COUNT_HELP_PREFIX + request->node_id(),
+                         static_cast<double>(kv_count));
+    }
+
     return grpc::Status::OK;
   }
 
@@ -371,6 +389,20 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     registry_.UnregisterExternalKvBlocks(request->node_id(), hashes);
     MORI_UMBP_INFO("[Master] RevokeExternalKvBlocks: node_id={}, hashes={}", request->node_id(),
                    hashes.size());
+
+    if (metrics_) {
+      metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_REVOKE_TOTAL,
+                           MORI_UMBP_METRIC_EXT_KV_REVOKE_TOTAL_HELP);
+      metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_REVOKE_BLOCKS_TOTAL,
+                           MORI_UMBP_METRIC_EXT_KV_REVOKE_BLOCKS_TOTAL_HELP,
+                           static_cast<uint64_t>(hashes.size()));
+      const size_t kv_count = external_kv_index_.GetKvCount(request->node_id());
+      metrics_->setGauge(MORI_UMBP_METRIC_EXT_KV_LIVE_COUNT_PREFIX +
+                             mori::metrics::MetricsServer::SanitizeName(request->node_id()),
+                         MORI_UMBP_METRIC_EXT_KV_LIVE_COUNT_HELP_PREFIX + request->node_id(),
+                         static_cast<double>(kv_count));
+    }
+
     return grpc::Status::OK;
   }
 
@@ -400,10 +432,29 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
       proto_match->set_tier(static_cast<::umbp::TierType>(m.tier));
     }
 
-    MORI_UMBP_INFO("[Master] MatchExternalKv: queried_hashes={}, matched_nodes={}", hashes.size(),
-                   matches.size());
+    size_t total_matched_blocks = 0;
+    for (const auto& m : matches) {
+      total_matched_blocks += m.matched_hashes.size();
+    }
+
+    MORI_UMBP_INFO("[Master] MatchExternalKv: queried_hashes={}, matched_nodes={}, matched_blocks={}",
+                   hashes.size(), matches.size(), total_matched_blocks);
+
+    if (metrics_) {
+      metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_MATCH_TOTAL,
+                           MORI_UMBP_METRIC_EXT_KV_MATCH_TOTAL_HELP);
+      metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_MATCH_QUERIED_BLOCKS_TOTAL,
+                           MORI_UMBP_METRIC_EXT_KV_MATCH_QUERIED_BLOCKS_TOTAL_HELP,
+                           static_cast<uint64_t>(hashes.size()));
+      metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_MATCH_MATCHED_BLOCKS_TOTAL,
+                           MORI_UMBP_METRIC_EXT_KV_MATCH_MATCHED_BLOCKS_TOTAL_HELP,
+                           static_cast<uint64_t>(total_matched_blocks));
+    }
+
     return grpc::Status::OK;
   }
+
+  void SetMetrics(mori::metrics::MetricsServer* metrics) { metrics_ = metrics; }
 
  private:
   ClientRegistry& registry_;
@@ -411,6 +462,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
   ExternalKvBlockIndex& external_kv_index_;
   Router& router_;
   ClientRegistryConfig config_;
+  mori::metrics::MetricsServer* metrics_ = nullptr;
 };
 
 // ---------------------------------------------------------------------------
@@ -423,7 +475,8 @@ MasterServer::MasterServer(MasterServerConfig config)
       registry_(config_.registry_config, index_),
       router_(index_, registry_, std::move(config_.get_strategy), std::move(config_.put_strategy)),
       service_(std::make_unique<UMBPMasterServiceImpl>(registry_, index_, external_kv_index_,
-                                                       router_, config_.registry_config)) {
+                                                       router_, config_.registry_config,
+                                                       nullptr)) {
   index_.SetClientRegistry(&registry_);
   registry_.SetExternalKvBlockIndex(&external_kv_index_);
 }
@@ -431,6 +484,10 @@ MasterServer::MasterServer(MasterServerConfig config)
 MasterServer::~MasterServer() { Shutdown(); }
 
 void MasterServer::Run() {
+  metrics_server_ = std::make_unique<mori::metrics::MetricsServer>(config_.metrics_port);
+  service_->SetMetrics(metrics_server_.get());
+  MORI_UMBP_INFO("[Master] Metrics server listening on port {}", config_.metrics_port);
+
   registry_.StartReaper();
 
   grpc::ServerBuilder builder;

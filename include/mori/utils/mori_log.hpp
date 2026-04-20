@@ -222,7 +222,8 @@ constexpr const char* IO = "io";
 constexpr const char* SHMEM = "shmem";
 constexpr const char* CORE = "core";
 constexpr const char* OPS = "ops";
-constexpr const char* UMBP = "umbp";
+constexpr const char* UMBP    = "umbp";
+constexpr const char* METRICS = "metrics";
 }  // namespace modules
 
 // Macro helpers
@@ -281,6 +282,13 @@ constexpr const char* UMBP = "umbp";
 #define MORI_UMBP_ERROR(...) MORI_ERROR(mori::modules::UMBP, __VA_ARGS__)
 #define MORI_UMBP_CRITICAL(...) MORI_CRITICAL(mori::modules::UMBP, __VA_ARGS__)
 
+#define MORI_METRICS_TRACE(...) MORI_TRACE(mori::modules::METRICS, __VA_ARGS__)
+#define MORI_METRICS_DEBUG(...) MORI_DEBUG(mori::modules::METRICS, __VA_ARGS__)
+#define MORI_METRICS_INFO(...) MORI_INFO(mori::modules::METRICS, __VA_ARGS__)
+#define MORI_METRICS_WARN(...) MORI_WARN(mori::modules::METRICS, __VA_ARGS__)
+#define MORI_METRICS_ERROR(...) MORI_ERROR(mori::modules::METRICS, __VA_ARGS__)
+#define MORI_METRICS_CRITICAL(...) MORI_CRITICAL(mori::modules::METRICS, __VA_ARGS__)
+
 // Scoped Timer class
 class ScopedTimer {
  public:
@@ -319,6 +327,7 @@ inline void InitializeLogging() {
   logger.InitModule(modules::CORE);
   logger.InitModule(modules::OPS);
   logger.InitModule(modules::UMBP);
+  logger.InitModule(modules::METRICS);
 }
 
 inline void InitializeLogging(const std::string& globalLevel) {
