@@ -28,6 +28,7 @@
 #include <limits>
 #include <shared_mutex>
 #include <stdexcept>
+#include <string>
 
 #include "mori/io/env.hpp"
 #include "mori/io/logging.hpp"
@@ -44,6 +45,98 @@ static void ValidateRdmaNotificationConfig(const RdmaBackendConfig& config) {
         "Invalid RDMA config: notifPerQp must be >= 1 when notification is "
         "enabled");
   }
+}
+
+enum class CqeFailureOrigin : uint8_t {
+  BatchTransfer = 0,
+  NotificationSend,
+  NotificationRecv,
+  Unknown,
+};
+
+struct CqeFailureAdvice {
+  const char* statusText{nullptr};
+  std::string hint;
+
+  bool HasHint() const { return !hint.empty(); }
+
+  std::string ComposeStatusMessage() const {
+    std::string message = statusText != nullptr ? statusText : "unknown";
+    if (hint.empty()) return message;
+    message += " Hint: ";
+    message += hint;
+    return message;
+  }
+};
+
+static void LogAsyncTransferFailureIfNeeded(internal::IoCallDiagnostics* diagnostics, uint32_t code,
+                                            const std::string& message) {
+  if (diagnostics == nullptr || diagnostics->Label() == nullptr) return;
+
+  internal::IoFailureKind failureKind = diagnostics->CurrentFailureKind();
+  if (failureKind != internal::IoFailureKind::FlushCascade ||
+      !diagnostics->TryMarkLogged(failureKind)) {
+    return;
+  }
+
+  MORI_IO_DEBUG("{} error {} message {}", diagnostics->Label(), code, message);
+}
+
+static CqeFailureOrigin ClassifyCqeFailureOrigin(uint64_t wrId, uint32_t notifPerQp) {
+  if (IsNotifSendWrId(wrId)) return CqeFailureOrigin::NotificationSend;
+  if (wrId < notifPerQp) return CqeFailureOrigin::NotificationRecv;
+  return CqeFailureOrigin::BatchTransfer;
+}
+
+static CqeFailureAdvice DescribeCqeFailure(ibv_wc_status status, CqeFailureOrigin origin,
+                                           const RdmaBackendConfig& config) {
+  CqeFailureAdvice advice{ibv_wc_status_str(status), {}};
+  switch (status) {
+    case IBV_WC_RETRY_EXC_ERR:
+      advice.hint =
+          "transport retry limit exceeded; check peer liveness/connectivity, verify GID "
+          "selection (unset or correct MORI_IB_GID_INDEX), and if running RoCE verify QoS "
+          "settings such as MORI_IO_SL/MORI_IO_TC or MORI_RDMA_SL/MORI_RDMA_TC.";
+      break;
+    case IBV_WC_RNR_RETRY_EXC_ERR:
+      if (origin == CqeFailureOrigin::NotificationSend) {
+        advice.hint =
+            "receiver not ready for SEND completions; if notifications are enabled, ensure the "
+            "peer pre-posts enough RECV WRs. Try increasing notifPerQp / MORI_IO_QP_MAX_RECV_WR "
+            "(current notifPerQp=" +
+            std::to_string(config.notifPerQp) +
+            "), or set MORI_IO_ENABLE_NOTIFICATION=0 if inbound notification is not required.";
+      } else {
+        advice.hint =
+            "receiver not ready; check the peer receive path. If this is related to MORI "
+            "notifications, increase notifPerQp / MORI_IO_QP_MAX_RECV_WR or disable "
+            "MORI_IO_ENABLE_NOTIFICATION when inbound notification is not required.";
+      }
+      break;
+    case IBV_WC_LOC_PROT_ERR:
+      advice.hint =
+          "local protection error; verify the local buffer is still registered with MORI, lkey "
+          "matches the posted WR, and transfer offsets/lengths stay within the registered range.";
+      break;
+    case IBV_WC_LOC_LEN_ERR:
+      advice.hint =
+          "local length error; verify SGE lengths and transfer offsets stay within the registered "
+          "local MR bounds.";
+      break;
+    case IBV_WC_REM_ACCESS_ERR:
+      advice.hint =
+          "remote access error; verify the remote buffer is still registered, rkey/permissions "
+          "allow this operation, and remote offsets/lengths stay within the registered range.";
+      break;
+    case IBV_WC_REM_OP_ERR:
+      advice.hint =
+          "remote operation error; verify both peers use compatible verbs/QP state and the remote "
+          "endpoint supports the requested RDMA operation.";
+      break;
+    default:
+      break;
+  }
+  return advice;
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -274,7 +367,7 @@ EndpointId RdmaManager::ConnectEndpoint(EngineKey remoteKey, int devId,
   meta.rTable[topoKey].push_back(ep);
 
   EndpointId id = nextEndpointId_.fetch_add(1);
-  auto rt = std::make_shared<EndpointRuntime>(EndpointRuntime{id, ep});
+  auto rt = std::make_shared<EndpointRuntime>(id, ep);
   endpointsById_[id] = rt;
   return id;
 }
@@ -371,9 +464,11 @@ void NotifManager::RegisterEndpoint(const std::shared_ptr<EndpointRuntime>& rt) 
   }
 }
 
-void NotifManager::ProcessOneCqe(const std::shared_ptr<EndpointRuntime>& rt) {
+NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
+    const std::shared_ptr<EndpointRuntime>& rt) {
   const EpPair& ep = rt->ep;
   ibv_cq* cq = ep.local.ibvHandle.cq;
+  FlushDrainStats flushDrain;
 
   // Resolve notif context once before the CQ drain loop.
   QpNotifContext* notifCtxPtr = nullptr;
@@ -390,23 +485,51 @@ void NotifManager::ProcessOneCqe(const std::shared_ptr<EndpointRuntime>& rt) {
   while ((n = ibv_poll_cq(cq, batchSize, wc)) > 0) {
     for (int i = 0; i < n; ++i) {
       if (wc[i].status != IBV_WC_SUCCESS) {
-        MORI_IO_ERROR("ProcessOneCqe: CQE error: wr_id={} status={}({}) qp_num={} vendor_err={}",
-                      wc[i].wr_id, static_cast<uint32_t>(wc[i].status),
-                      ibv_wc_status_str(wc[i].status), wc[i].qp_num, wc[i].vendor_err);
+        const bool isFlush = (wc[i].status == IBV_WC_WR_FLUSH_ERR);
+        const CqeFailureOrigin failureOrigin =
+            ClassifyCqeFailureOrigin(wc[i].wr_id, config.notifPerQp);
+        const CqeFailureAdvice failureAdvice =
+            isFlush ? CqeFailureAdvice{ibv_wc_status_str(wc[i].status), {}}
+                    : DescribeCqeFailure(wc[i].status, failureOrigin, config);
+
+        if (isFlush) {
+          flushDrain.Record(wc[i].qp_num);
+          MORI_IO_DEBUG("ProcessOneCqe: flush error #{}: wr_id={} qp_num={}", flushDrain.count,
+                        wc[i].wr_id, wc[i].qp_num);
+        } else {
+          // Non-flush error: this is the root cause — always log at ERROR.
+          if (failureAdvice.HasHint()) {
+            MORI_IO_ERROR(
+                "ProcessOneCqe: [ROOT CAUSE] CQE error: wr_id={} status={}({}) qp_num={} "
+                "vendor_err={} hint={}",
+                wc[i].wr_id, static_cast<uint32_t>(wc[i].status), failureAdvice.statusText,
+                wc[i].qp_num, wc[i].vendor_err, failureAdvice.hint);
+          } else {
+            MORI_IO_ERROR(
+                "ProcessOneCqe: [ROOT CAUSE] CQE error: wr_id={} status={}({}) qp_num={} "
+                "vendor_err={}",
+                wc[i].wr_id, static_cast<uint32_t>(wc[i].status), failureAdvice.statusText,
+                wc[i].qp_num, wc[i].vendor_err);
+          }
+        }
 
         int mergedBatchSize = 0;
         auto meta = ep.ledger
                         ? ep.ledger->ReleaseByCqe(wc[i].wr_id, ep.sqDepth.get(), &mergedBatchSize)
                         : nullptr;
         if (meta) {
-          uint32_t finishedBefore = meta->finishedBatchSize.fetch_add(mergedBatchSize);
+          (void)meta->finishedBatchSize.fetch_add(mergedBatchSize);
+          if (isFlush) {
+            meta->diagnostics.MarkFlushCascade();
+          } else {
+            meta->diagnostics.MarkRootCause();
+          }
+          LogAsyncTransferFailureIfNeeded(&meta->diagnostics,
+                                          static_cast<uint32_t>(StatusCode::ERR_RDMA_OP),
+                                          failureAdvice.ComposeStatusMessage());
           TransferStatus* statusPtr = meta->status;
           if (statusPtr != nullptr) {
-            statusPtr->Update(StatusCode::ERR_RDMA_OP, ibv_wc_status_str(wc[i].status));
-            MORI_IO_ERROR("ProcessOneCqe: batch transfer {} failed, status={}({}), finished={}/{}",
-                          meta->id, static_cast<uint32_t>(wc[i].status),
-                          ibv_wc_status_str(wc[i].status), finishedBefore + mergedBatchSize,
-                          meta->totalBatchSize);
+            statusPtr->Update(StatusCode::ERR_RDMA_OP, failureAdvice.ComposeStatusMessage());
             meta->status = nullptr;
           }
           if (ep.degraded && ep.degraded->load(std::memory_order_relaxed) && ep.ledger) {
@@ -418,17 +541,23 @@ void NotifManager::ProcessOneCqe(const std::shared_ptr<EndpointRuntime>& rt) {
           }
         } else if (IsNotifSendWrId(wc[i].wr_id)) {
           if (ep.sqDepth) ep.sqDepth->fetch_sub(1, std::memory_order_relaxed);
-          MORI_IO_WARN(
-              "ProcessOneCqe: failed notification SEND CQE, transfer_id={}, released 1 sqDepth",
-              ExtractTransferIdFromWrId(wc[i].wr_id));
+          if (!isFlush) {
+            MORI_IO_WARN(
+                "ProcessOneCqe: failed notification SEND CQE, transfer_id={}, released 1 sqDepth",
+                ExtractTransferIdFromWrId(wc[i].wr_id));
+          }
         } else if (wc[i].wr_id < config.notifPerQp) {
-          MORI_IO_WARN("ProcessOneCqe: failed notification RECV CQE, wr_id={} (recv_idx)",
-                       wc[i].wr_id);
+          if (!isFlush) {
+            MORI_IO_WARN("ProcessOneCqe: failed notification RECV CQE, wr_id={} (recv_idx)",
+                         wc[i].wr_id);
+          }
         } else {
-          MORI_IO_WARN(
-              "ProcessOneCqe: failed CQE wr_id={} in ledger range but no record found, "
-              "sqDepth may be stale",
-              wc[i].wr_id);
+          if (!isFlush) {
+            MORI_IO_WARN(
+                "ProcessOneCqe: failed CQE wr_id={} in ledger range but no record found, "
+                "sqDepth may be stale",
+                wc[i].wr_id);
+          }
         }
         continue;
       }
@@ -501,6 +630,48 @@ void NotifManager::ProcessOneCqe(const std::shared_ptr<EndpointRuntime>& rt) {
       }
     }
   }
+
+  if (!flushDrain.Empty()) {
+    MORI_IO_DEBUG("ProcessOneCqe: drain — {} flush errors on eid={} qp_num={}", flushDrain.count,
+                  rt->id, flushDrain.firstQpNum);
+  }
+  return flushDrain;
+}
+
+void NotifManager::EmitFlushSummaryIfNeeded(const FlushRoundStats& roundStats) {
+  if (roundStats.Empty()) {
+    flushSummaryStreak_ = 0;
+    return;
+  }
+
+  flushSummaryStreak_++;
+  const bool shouldLog =
+      (flushSummaryStreak_ == 1) ||
+      (flushSummaryStreak_ < 64 && (flushSummaryStreak_ & (flushSummaryStreak_ - 1)) == 0) ||
+      (flushSummaryStreak_ % 1000 == 0);
+
+  if (shouldLog) {
+    if (flushSummaryStreak_ == 1) {
+      MORI_IO_ERROR(
+          "CQ poll round summary: {} flush errors across {} endpoint(s); "
+          "representative eid={} qp_num={}. "
+          "Flush errors are cascaded from QP(s) entering Error State. "
+          "Check: (1) peer process alive, (2) PFC / network congestion, "
+          "(3) ibv_devinfo / dmesg for HW errors",
+          roundStats.total, roundStats.endpointCount, roundStats.sampleEndpointId,
+          roundStats.sampleQpNum);
+    } else {
+      MORI_IO_WARN(
+          "CQ poll round summary: {} flush errors across {} endpoint(s); "
+          "representative eid={} qp_num={}; in "
+          "consecutive flush round #{} (rate-limited). "
+          "Flush errors are cascaded from QP(s) entering Error State. "
+          "Check: (1) peer process alive, (2) PFC / network congestion, "
+          "(3) ibv_devinfo / dmesg for HW errors",
+          roundStats.total, roundStats.endpointCount, roundStats.sampleEndpointId,
+          roundStats.sampleQpNum, flushSummaryStreak_);
+    }
+  }
 }
 
 void NotifManager::MainLoop() {
@@ -508,6 +679,8 @@ void NotifManager::MainLoop() {
     constexpr int maxEvents = 128;
     epoll_event events[maxEvents];
     while (running.load()) {
+      FlushRoundStats roundStats;
+      bool handledCqEvent = false;
       int nfds = epoll_wait(epfd, events, maxEvents, 0 /*ms*/);
       for (int i = 0; i < nfds; ++i) {
         EndpointId eid = events[i].data.u64;
@@ -528,19 +701,26 @@ void NotifManager::MainLoop() {
         ibv_ack_cq_events(cq, 1);
         ibv_req_notify_cq(cq, 0);
 
-        ProcessOneCqe(rt);
+        handledCqEvent = true;
+        roundStats.Merge(rt->id, ProcessOneCqe(rt));
+      }
+      if (handledCqEvent) {
+        EmitFlushSummaryIfNeeded(roundStats);
       }
     }
   } else {
     while (running.load()) {
       auto snapshot = rdma->SnapshotEndpointRuntimes();
       if (snapshot.empty()) {
+        EmitFlushSummaryIfNeeded(FlushRoundStats{});
         std::this_thread::yield();
         continue;
       }
+      FlushRoundStats roundStats;
       for (auto& rt : snapshot) {
-        ProcessOneCqe(rt);
+        roundStats.Merge(rt->id, ProcessOneCqe(rt));
       }
+      EmitFlushSummaryIfNeeded(roundStats);
     }
   }
 }
@@ -780,6 +960,7 @@ void RdmaBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size
   MORI_IO_FUNCTION_TIMER;
   status->SetCode(StatusCode::IN_PROGRESS);
   auto callbackMeta = std::make_shared<CqCallbackMeta>(status, id, 1);
+  internal::PublishCurrentIoCallDiagnostics(callbackMeta);
 
   RdmaOpRet ret =
       RdmaReadWrite(eps, local, localOffset, remote, remoteOffset, size, callbackMeta, id, isRead);
@@ -802,6 +983,7 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
   MORI_IO_FUNCTION_TIMER;
   status->SetCode(StatusCode::IN_PROGRESS);
   auto callbackMeta = std::make_shared<CqCallbackMeta>(status, id, sizes.size());
+  internal::PublishCurrentIoCallDiagnostics(callbackMeta);
   RdmaOpRet ret;
   if (executor) {
     ExecutorReq req{eps,          local, localOffsets,         remote, remoteOffsets, sizes,

@@ -22,6 +22,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <functional>
 #include <msgpack.hpp>
 #include <mutex>
