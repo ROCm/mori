@@ -14,7 +14,9 @@ set_target_properties(
              INSTALL_RPATH "$ORIGIN"
              BUILD_WITH_INSTALL_RPATH TRUE)
 
-target_link_libraries(mori_ops PUBLIC mori_profiler_interface)
+if(ENABLE_PROFILER)
+  target_link_libraries(mori_ops PUBLIC mori_profiler_interface)
+endif()
 
 # ---------------------------------------------------------------------------
 # BUILD_OPS_DEVICE: AOT compile EP kernels to .hsaco launch.cpp is always
@@ -38,7 +40,8 @@ if(BUILD_OPS_DEVICE)
 
   set(_extra_defs "")
   if(ENABLE_PROFILER)
-    list(APPEND _extra_defs "-DENABLE_PROFILER")
+    list(APPEND _extra_defs "-DENABLE_PROFILER"
+         "-I${CMAKE_BINARY_DIR}/generated/include")
   endif()
   if(ENABLE_STANDARD_MOE_ADAPT)
     list(APPEND _extra_defs "-DENABLE_STANDARD_MOE_ADAPT")
@@ -74,8 +77,7 @@ if(BUILD_OPS_DEVICE)
         ${HIPCC_EXECUTABLE} --genco "--offload-arch=${GPU_TARGETS}" -std=c++17
         -O2 -D__HIP_PLATFORM_AMD__ -DHIP_ENABLE_WARP_SYNC_BUILTINS ${_nic_defs}
         ${_extra_defs} -I${CMAKE_SOURCE_DIR}/include -I${CMAKE_SOURCE_DIR}
-        -I${CMAKE_SOURCE_DIR}/3rdparty/spdlog/include
-        -I${CMAKE_BINARY_DIR}/generated/include ${_mpi_includes}
+        -I${CMAKE_SOURCE_DIR}/3rdparty/spdlog/include ${_mpi_includes}
         ${_ksrc_path} -o ${_hsaco_output}
       DEPENDS ${_ksrc_path}
       COMMENT "AOT compiling ${_ksrc} -> ${_arch_nic}/${_kname}.hsaco"
@@ -84,7 +86,9 @@ if(BUILD_OPS_DEVICE)
   endforeach()
 
   add_custom_target(mori_ops_kernels ALL DEPENDS ${_all_hsaco_outputs})
-  add_dependencies(mori_ops_kernels generate_profiler_bindings)
+  if(ENABLE_PROFILER)
+    add_dependencies(mori_ops_kernels generate_profiler_bindings)
+  endif()
   add_dependencies(mori_ops mori_ops_kernels)
 
   install(FILES ${_all_hsaco_outputs} DESTINATION "lib/${_arch_nic}")

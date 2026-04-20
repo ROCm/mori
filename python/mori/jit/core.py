@@ -230,11 +230,11 @@ def _collect_include_dirs(mori_root: Path) -> list[Path]:
     if mpi_inc:
         dirs.append(Path(mpi_inc))
 
-    # Generate profiler slot headers JIT into the cache (idempotent, fast).
-    # Always included: kernel sources unconditionally include mori/profiler/profiler.hpp
-    # which lives in the generated dir. The headers have #ifdef ENABLE_PROFILER guards
-    # so they are safe to include even when profiler is disabled.
-    dirs.append(_ensure_generated_include(mori_root))
+    # Profiler slot headers are only needed when ENABLE_PROFILER is set;
+    # kernel sources wrap profiler calls with IF_ENABLE_PROFILER() so the
+    # generated header is not required when profiling is disabled.
+    if is_profiler_enabled():
+        dirs.append(_ensure_generated_include(mori_root))
 
     return dirs
 
