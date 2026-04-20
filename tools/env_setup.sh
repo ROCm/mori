@@ -8,7 +8,7 @@
 #   dcqcn  — configure DCQCN on all ionic ROCE devices only
 #   all    — both (default)
 #
-# Requires: nicctl, root
+# Requires: nicctl
 
 IONIC_VENDOR_ID="0x1dd8"
 
@@ -25,8 +25,6 @@ query_ionic_devices() {
         [[ "$vendor" == "$IONIC_VENDOR_ID" ]] && echo "$dev"
     done
 }
-
-[[ $EUID -eq 0 ]] || { die "please run as root"; return 2>/dev/null || exit 1; }
 
 IONIC_DEVS=$(query_ionic_devices)
 if [[ -z "$IONIC_DEVS" ]]; then
