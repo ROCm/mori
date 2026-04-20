@@ -37,7 +37,7 @@ command -v nicctl &>/dev/null || { die "ionic devices found but nicctl not avail
 
 mori_env_setup() {
     local qos
-    qos=$(nicctl show qos) || die "nicctl show qos failed"
+    qos=$(sudo nicctl show qos) || die "nicctl show qos failed"
 
     local class_type
     class_type=$(echo "$qos" | grep "Classification type" | head -1 | awk '{print $NF}')
@@ -72,7 +72,7 @@ mori_env_setup() {
 setup_dcqcn() {
     local dev
     for dev in $IONIC_DEVS; do
-        nicctl update dcqcn -r "$dev" -i 1 \
+        sudo nicctl update dcqcn -r "$dev" -i 1 \
             --token-bucket-size 800000 \
             --ai-rate 160 \
             --alpha-update-interval 1 \

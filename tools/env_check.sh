@@ -43,7 +43,7 @@ query_rdma_devices() {
     if [[ -z "$host" || "$host" == "localhost" || "$host" == "127.0.0.1" ]]; then
         ibv_devices 2>/dev/null | awk '/^\s+[a-z]/ && $1 != "device" {print $1}'
     else
-        ssh -o ConnectTimeout=5 "$host" "ibv_devices 2>/dev/null" \
+        ssh -o ConnectTimeout=5 "$(whoami)"@"$host" "ibv_devices 2>/dev/null" \
             | awk '/^\s+[a-z]/ && $1 != "device" {print $1}'
     fi
 }
@@ -61,7 +61,7 @@ run_ib_bw_test() {
     if [[ "$server_host" == "localhost" || "$server_host" == "127.0.0.1" ]]; then
         ib_write_bw -d "$server_dev" $ib_args &>/dev/null &
     else
-        ssh "$server_host" "ib_write_bw -d $server_dev $ib_args" &>/dev/null &
+        ssh "$(whoami)"@"$server_host" "ib_write_bw -d $server_dev $ib_args" &>/dev/null &
     fi
     local server_pid=$!
     sleep 1
@@ -100,7 +100,7 @@ run_ib_lat_test() {
     local label="$client_dev -> $server_dev@$server_host"
     local ib_args="-x 1 -p $port -s $LAT_MSG_SIZE -n $LAT_ITERS --sl $MORI_RDMA_SL"
 
-    ssh "$server_host" "ib_write_lat -d $server_dev $ib_args" &>/dev/null &
+    ssh "$(whoami)"@"$server_host" "ib_write_lat -d $server_dev $ib_args" &>/dev/null &
     local server_pid=$!
     sleep 1
 
@@ -132,11 +132,11 @@ check_versions() {
     step "check ainic firmware and driver version"
 
     local fw_output sw_output
-    fw_output=$(nicctl show version firmware)
-    sw_output=$(nicctl show version host-software)
+    fw_output=$(sudo nicctl show version firmware)
+    sw_output=$(sudo nicctl show version host-software)
 
     local fw_versions fw_count
-    fw_versions=$(echo "$fw_output" | grep "Firmware-A" | awk '{print $NF}' | sort -u)
+    fw_versions=$(echo "$fw_output" | grep -i "firmware" | awk '{print $NF}' | sort -u)
     fw_count=$(echo "$fw_versions" | wc -l)
     if [[ $fw_count -ne 1 ]]; then
         log_warn "firmware versions not consistent across NICs:"
@@ -160,7 +160,7 @@ check_qos() {
     step "check QoS and derive SL/TC"
 
     local qos_output
-    qos_output=$(nicctl show qos)
+    qos_output=$(sudo nicctl show qos)
 
     # classification type
     local class_type
@@ -209,7 +209,7 @@ check_dcqcn() {
     step "check DCQCN"
 
     local dcqcn_output
-    dcqcn_output=$(nicctl show dcqcn)
+    dcqcn_output=$(sudo nicctl show dcqcn)
 
     local total
     total=$(echo "$dcqcn_output" | grep -c "ROCE device")
@@ -302,7 +302,7 @@ check_inter_node_lat() {
 # ============================= main =============================
 
 require_cmd nicctl
-[[ $EUID -eq 0 ]] || die "please run as root"
+# [[ $EUID -eq 0 ]] || die "please run as root"
 
 LOCAL_DEVS=()
 
