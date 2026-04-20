@@ -219,15 +219,11 @@ jobs:
           $CT exec ${CONTAINER}_jax bash -c \
             "cd $GITHUB_WORKSPACE && BUILD_XLA_FFI_OPS=ON pip install --break-system-packages ."
 
-      - name: Precompile JIT kernels (needed by XLA FFI C++ AutoLoad)
-        run: |
-          $CT exec ${CONTAINER}_jax bash -c \
-            "MORI_PRECOMPILE=1 python3 -c 'import mori'"
-
       - name: MORI-EP JAX test
         run: |
           $CT exec ${CONTAINER}_jax bash -c "
             cd $GITHUB_WORKSPACE
+            MORI_KERNEL_DIR=\$(ls -d $GITHUB_WORKSPACE/build/lib/gfx* | head -1) \
             timeout 300 pytest tests/python/ops/test_dispatch_combine_jax.py -s -v
           "
 
