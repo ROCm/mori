@@ -195,7 +195,10 @@ struct EpPair {
 using EndpointId = uint64_t;
 
 struct EndpointRuntime {
-  EndpointId id;
+  EndpointRuntime() = default;
+  EndpointRuntime(EndpointId id_, const EpPair& ep_) : id(id_), ep(ep_) {}
+
+  EndpointId id{0};
   EpPair ep;
 };
 

@@ -118,7 +118,39 @@ class NotifManager {
   void Shutdown();
 
  private:
-  void ProcessOneCqe(const std::shared_ptr<EndpointRuntime>& rt);
+  struct FlushDrainStats {
+    uint64_t count{0};
+    uint32_t firstQpNum{0};
+
+    void Record(uint32_t qpNum) {
+      if (count == 0) firstQpNum = qpNum;
+      count++;
+    }
+
+    bool Empty() const { return count == 0; }
+  };
+
+  struct FlushRoundStats {
+    uint64_t total{0};
+    uint32_t endpointCount{0};
+    EndpointId sampleEndpointId{0};
+    uint32_t sampleQpNum{0};
+
+    void Merge(EndpointId eid, const FlushDrainStats& drain) {
+      if (drain.Empty()) return;
+      if (total == 0) {
+        sampleEndpointId = eid;
+        sampleQpNum = drain.firstQpNum;
+      }
+      total += drain.count;
+      endpointCount++;
+    }
+
+    bool Empty() const { return total == 0; }
+  };
+
+  FlushDrainStats ProcessOneCqe(const std::shared_ptr<EndpointRuntime>& rt);
+  void EmitFlushSummaryIfNeeded(const FlushRoundStats& roundStats);
 
  private:
   RdmaBackendConfig config;
@@ -141,6 +173,10 @@ class NotifManager {
   std::unordered_map<EngineKey, std::unordered_map<TransferUniqueId, int>> notifPool;
 
   std::unordered_map<TransferStatus*, int> localNotif;
+
+  // Accessed only by the single NotifManager poll loop thread to rate-limit
+  // repeated summaries for the same consecutive flush episode.
+  uint64_t flushSummaryStreak_{0};
 };
 
 /* ---------------------------------------------------------------------------------------------- */

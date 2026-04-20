@@ -21,17 +21,156 @@
 // SOFTWARE.
 #include "src/io/rdma/common.hpp"
 
+#include <cerrno>
 #include <chrono>
 #include <cstdlib>
 #include <limits>
 #include <numeric>
 #include <thread>
+#include <utility>
 
 #include "mori/io/env.hpp"
 #include "mori/io/logging.hpp"
 
 namespace mori {
 namespace io {
+
+enum class SqReserveFailureKind : uint8_t {
+  None = 0,
+  Degraded,
+  ExceedsCapacity,
+  Timeout,
+};
+
+enum class PostSendOpKind : uint8_t {
+  BatchData = 0,
+  Notification,
+};
+
+static int GetSqBackoffTimeoutUs() {
+  static const int kBackoffTimeoutUs = []() {
+    int v = 10000;
+    env::Override("MORI_IO_SQ_BACKOFF_TIMEOUT_US", v, mori::env::detail::ParsePositiveInt);
+    return v;
+  }();
+  return kBackoffTimeoutUs;
+}
+
+static void SetSqReserveFailureKind(SqReserveFailureKind* out, SqReserveFailureKind kind) {
+  if (out != nullptr) *out = kind;
+}
+
+static void AppendHint(std::string* message, const std::string& hint) {
+  if (message == nullptr || hint.empty()) return;
+  message->append(" Hint: ");
+  message->append(hint);
+}
+
+static std::string BuildNotifyHint() {
+  return "consider increasing notifPerQp / MORI_IO_QP_MAX_RECV_WR, or setting "
+         "MORI_IO_ENABLE_NOTIFICATION=0 if inbound notification is not required";
+}
+
+static std::string BuildSqDepthHint(const EpPair& ep, size_t qpCount, int effectivePostBatchSize,
+                                    PostSendOpKind opKind, SqReserveFailureKind failureKind) {
+  if (failureKind == SqReserveFailureKind::Degraded) return {};
+
+  if (opKind == PostSendOpKind::Notification) {
+    std::string hint;
+    if (failureKind == SqReserveFailureKind::Timeout) {
+      hint =
+          "if notification SEND completions are expected to drain shortly, try increasing "
+          "MORI_IO_SQ_BACKOFF_TIMEOUT_US (current value " +
+          std::to_string(GetSqBackoffTimeoutUs()) +
+          " us); otherwise try increasing MORI_IO_QP_MAX_SEND_WR";
+    } else {
+      hint = "try increasing MORI_IO_QP_MAX_SEND_WR";
+    }
+    hint += ", and " + BuildNotifyHint() + ".";
+    return hint;
+  }
+
+  std::string hint;
+  if (failureKind == SqReserveFailureKind::Timeout) {
+    hint =
+        "if completions are expected to drain shortly, try increasing "
+        "MORI_IO_SQ_BACKOFF_TIMEOUT_US (current value " +
+        std::to_string(GetSqBackoffTimeoutUs()) + " us); otherwise try increasing ";
+  } else {
+    hint = "try increasing ";
+  }
+
+  hint += "MORI_IO_QP_MAX_SEND_WR";
+  if (effectivePostBatchSize > 0) {
+    hint += ", reducing RdmaBackendConfig::postBatchSize (current effective value " +
+            std::to_string(effectivePostBatchSize) + ")";
+  }
+  if (qpCount > 0) {
+    hint += ", or increasing RdmaBackendConfig::qpPerTransfer (current transfer uses " +
+            std::to_string(qpCount) + " QP(s)) if additional QPs are available";
+  }
+  hint += ". Current per-QP send WR limit is " + std::to_string(ep.maxSqDepth) + ".";
+  return hint;
+}
+
+static std::string BuildPostSendFailureHint(int ret, const EpPair& ep, size_t qpCount,
+                                            int effectivePostBatchSize, const ibv_send_wr* badWr,
+                                            PostSendOpKind opKind) {
+  if (ret == ENOMEM) {
+    std::string hint;
+    if (opKind == PostSendOpKind::Notification) {
+      hint =
+          "provider reported ENOMEM while posting notification SENDs; try increasing "
+          "MORI_IO_QP_MAX_SEND_WR and MORI_IO_QP_MAX_CQE";
+      hint += ", and " + BuildNotifyHint();
+      hint += ".";
+      return hint;
+    }
+
+    hint =
+        "provider reported ENOMEM while posting WRs; try increasing MORI_IO_QP_MAX_SEND_WR and "
+        "MORI_IO_QP_MAX_CQE";
+    if (effectivePostBatchSize > 0) {
+      hint += ", reducing RdmaBackendConfig::postBatchSize (current effective value " +
+              std::to_string(effectivePostBatchSize) + ")";
+    }
+    if (qpCount > 0) {
+      hint += ", or increasing RdmaBackendConfig::qpPerTransfer (current transfer uses " +
+              std::to_string(qpCount) + " QP(s)) if additional QPs are available";
+    }
+    hint += ".";
+    return hint;
+  }
+
+  if (ret == EINVAL) {
+    if (opKind == PostSendOpKind::Notification) {
+      std::string hint =
+          "provider rejected the notification SEND as invalid; verify notification is enabled on "
+          "both peers and the endpoint/QP is still healthy";
+      hint += ", or disable MORI_IO_ENABLE_NOTIFICATION if inbound notification is not required";
+      hint += ".";
+      return hint;
+    }
+
+    if (badWr != nullptr && static_cast<uint32_t>(badWr->num_sge) > ep.local.handle.maxSge) {
+      return "the failing WR uses num_sge=" + std::to_string(badWr->num_sge) +
+             ", which exceeds endpoint max_send_sge=" + std::to_string(ep.local.handle.maxSge) +
+             "; reduce scatter/gather fan-out or, if the device supports it, increase "
+             "MORI_IO_QP_MAX_MSG_SGE / MORI_IO_QP_MAX_SGE.";
+    }
+
+    std::string hint =
+        "provider rejected the WR as invalid; verify WR flags/opcode, lkey/rkey, and scatter/"
+        "gather layout";
+    if (badWr != nullptr) {
+      hint += " (failing WR num_sge=" + std::to_string(badWr->num_sge) + ")";
+    }
+    hint += ".";
+    return hint;
+  }
+
+  return {};
+}
 
 uint64_t MakeNotifSendWrId(TransferUniqueId id) {
   if ((id & kNotifSendWrIdTag) != 0) {
@@ -45,13 +184,15 @@ uint64_t MakeNotifSendWrId(TransferUniqueId id) {
 // SQ depth is an admission counter only. It does not publish data dependencies
 // across threads, so relaxed atomics are sufficient for correctness.
 static bool TryReserveSqDepth(const EpPair& ep, int wrCount, int epId, const char* opTag,
-                              std::string* errMsg) {
+                              std::string* errMsg, SqReserveFailureKind* failureKind = nullptr) {
   if (wrCount <= 0 || !ep.sqDepth) return true;
   if (ep.degraded && ep.degraded->load(std::memory_order_relaxed)) {
+    SetSqReserveFailureKind(failureKind, SqReserveFailureKind::Degraded);
     if (errMsg) *errMsg = "EP is degraded, rejecting new submissions";
     return false;
   }
   if (wrCount > ep.maxSqDepth) {
+    SetSqReserveFailureKind(failureKind, SqReserveFailureKind::ExceedsCapacity);
     MORI_IO_WARN("SQ request exceeds capacity ({}): ep={} requested={} max={}", opTag, epId,
                  wrCount, ep.maxSqDepth);
     if (errMsg) {
@@ -61,11 +202,7 @@ static bool TryReserveSqDepth(const EpPair& ep, int wrCount, int epId, const cha
     }
     return false;
   }
-  static const int kBackoffTimeoutUs = []() {
-    int v = 10000;
-    env::Override("MORI_IO_SQ_BACKOFF_TIMEOUT_US", v, mori::env::detail::ParsePositiveInt);
-    return v;
-  }();
+  const int kBackoffTimeoutUs = GetSqBackoffTimeoutUs();
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::microseconds(kBackoffTimeoutUs);
   int backoff = 0;
@@ -75,11 +212,13 @@ static bool TryReserveSqDepth(const EpPair& ep, int wrCount, int epId, const cha
     // Re-check degraded state while waiting to avoid accepting new submissions
     // after another thread has marked this EP as degraded.
     if (ep.degraded && ep.degraded->load(std::memory_order_relaxed)) {
+      SetSqReserveFailureKind(failureKind, SqReserveFailureKind::Degraded);
       if (errMsg) *errMsg = "EP is degraded, rejecting new submissions";
       return false;
     }
     if (cur + wrCount > ep.maxSqDepth) {
       if (std::chrono::steady_clock::now() >= deadline) {
+        SetSqReserveFailureKind(failureKind, SqReserveFailureKind::Timeout);
         MORI_IO_WARN(
             "SQ full timeout ({}): ep={} depth={} requested={} max={} after {} us (backoff={})",
             opTag, epId, cur, wrCount, ep.maxSqDepth, kBackoffTimeoutUs, backoff);
@@ -127,7 +266,10 @@ RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* status, Trans
   std::string reserveErr;
   int reserved = 0;
   for (size_t i = 0; i < eps.size(); i++) {
-    if (!TryReserveSqDepth(eps[i], 1, i, "notify", &reserveErr)) {
+    SqReserveFailureKind reserveFailure = SqReserveFailureKind::None;
+    if (!TryReserveSqDepth(eps[i], 1, i, "notify", &reserveErr, &reserveFailure)) {
+      AppendHint(&reserveErr, BuildSqDepthHint(eps[i], eps.size(), -1, PostSendOpKind::Notification,
+                                               reserveFailure));
       for (int j = 0; j < reserved; ++j) ReleaseSqDepth(eps[j], 1);
       return {StatusCode::ERR_RDMA_OP, reserveErr};
     }
@@ -157,8 +299,11 @@ RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* status, Trans
       if (bad_wr == &wr) ReleaseSqDepth(eps[i], 1);
       // Any remaining endpoints are reserved but not posted yet.
       for (int j = i + 1; j < eps.size(); ++j) ReleaseSqDepth(eps[j], 1);
-      return {StatusCode::ERR_RDMA_OP,
-              "ibv_post_send (notify) failed with " + std::to_string(ret) + ": " + strerror(ret)};
+      std::string message =
+          "ibv_post_send (notify) failed with " + std::to_string(ret) + ": " + strerror(ret);
+      AppendHint(&message, BuildPostSendFailureHint(ret, eps[i], eps.size(), -1, bad_wr,
+                                                    PostSendOpKind::Notification));
+      return {StatusCode::ERR_RDMA_OP, std::move(message)};
     }
   }
 
@@ -311,7 +456,10 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
     // Reserve SQ depth for this batch; blocks with backoff if the SQ is full,
     // waiting for CQEs from earlier signaled WRs to drain depth.
     std::string reserveErr;
-    if (!TryReserveSqDepth(eps[epId], batchWrNum, epId, "batch", &reserveErr)) {
+    SqReserveFailureKind reserveFailure = SqReserveFailureKind::None;
+    if (!TryReserveSqDepth(eps[epId], batchWrNum, epId, "batch", &reserveErr, &reserveFailure)) {
+      AppendHint(&reserveErr, BuildSqDepthHint(eps[epId], epNum, postBatchSize,
+                                               PostSendOpKind::BatchData, reserveFailure));
       return {StatusCode::ERR_RDMA_OP, reserveErr};
     }
 
@@ -420,10 +568,12 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
         }
       }
 
-      return {StatusCode::ERR_RDMA_OP, "ibv_post_send failed with " + std::to_string(ret) + ": " +
-                                           strerror(ret) + " (posted " +
-                                           std::to_string(postedCount) + "/" +
-                                           std::to_string(batchWrNum) + " WRs)"};
+      std::string message = "ibv_post_send failed with " + std::to_string(ret) + ": " +
+                            strerror(ret) + " (posted " + std::to_string(postedCount) + "/" +
+                            std::to_string(batchWrNum) + " WRs)";
+      AppendHint(&message, BuildPostSendFailureHint(ret, eps[epId], epNum, postBatchSize, badWr,
+                                                    PostSendOpKind::BatchData));
+      return {StatusCode::ERR_RDMA_OP, std::move(message)};
     }
 
     if (needSignal) {

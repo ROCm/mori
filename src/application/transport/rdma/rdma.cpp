@@ -176,19 +176,37 @@ GidSelectionResult AutoSelectGidIndex(ibv_context* context, uint32_t portId,
   result.gidIdx = configuredGidIdx;
   if (!context) return result;
 
+  int gidTableLen = portAttr ? static_cast<int>(portAttr->gid_tbl_len) : 0;
+
   if (configuredGidIdx >= 0) {
     result.fromUser = true;
     if (QueryGidAtIndex(context, portId, configuredGidIdx, portAttr, &result.gid,
                         &result.gidType)) {
       result.valid = true;
     } else {
-      MORI_APP_WARN("Failed to query user-specified gid index {} on port {}", configuredGidIdx,
-                    portId);
+      if (gidTableLen > 0 && configuredGidIdx >= gidTableLen) {
+        MORI_APP_WARN(
+            "Failed to query user-specified gid index {} on port {}: index is outside the "
+            "device-reported gid table length {}. Hint: unset MORI_IB_GID_INDEX to let MORI "
+            "auto-select a valid GID, or choose an index in [0, {}).",
+            configuredGidIdx, portId, gidTableLen, gidTableLen);
+      } else if (gidTableLen > 0) {
+        MORI_APP_WARN(
+            "Failed to query user-specified gid index {} on port {}. Hint: unset "
+            "MORI_IB_GID_INDEX to let MORI auto-select a valid GID, or choose a valid entry "
+            "from the device gid table (reported length {}).",
+            configuredGidIdx, portId, gidTableLen);
+      } else {
+        MORI_APP_WARN(
+            "Failed to query user-specified gid index {} on port {}. Hint: unset "
+            "MORI_IB_GID_INDEX to let MORI auto-select a valid GID, or inspect available "
+            "indices with show_gids / ibv_devinfo and choose a valid one.",
+            configuredGidIdx, portId);
+      }
     }
     return result;
   }
 
-  int gidTableLen = portAttr ? static_cast<int>(portAttr->gid_tbl_len) : 0;
   if (gidTableLen <= 0) gidTableLen = 128;  // Conservative fallback
 
   int bestScore = INT_MIN;
@@ -229,7 +247,11 @@ GidSelectionResult AutoSelectGidIndex(ibv_context* context, uint32_t portId,
     MORI_APP_TRACE("Auto-selected GID index {} (type={}) on port {}", bestIdx,
                    static_cast<int>(bestType), portId);
   } else {
-    MORI_APP_ERROR("Failed to auto-detect a valid GID on port {}", portId);
+    MORI_APP_ERROR(
+        "Failed to auto-detect a valid GID on port {}. Hint: inspect available GIDs with "
+        "show_gids / ibv_devinfo, then set MORI_IB_GID_INDEX to a valid entry if auto-selection "
+        "is unsuitable for this environment.",
+        portId);
   }
 
   return result;

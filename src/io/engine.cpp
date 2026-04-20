@@ -26,16 +26,31 @@
 
 #include <cctype>
 #include <cstdlib>
+#include <utility>
 
 #include "mori/io/env.hpp"
 #include "mori/io/logging.hpp"
 #include "src/io/rdma/backend_impl.hpp"
+#include "src/io/transfer_status_internal.hpp"
 #include "src/io/xgmi/backend_impl.hpp"
 
 namespace mori {
 namespace io {
 
 namespace {
+
+inline bool HasRdmaFlushCascade(const TransferStatus* status) {
+  return status != nullptr && internal::TransferStatusAccess::HasRdmaFlushCascade(*status);
+}
+
+template <typename... Args>
+inline void LogTransferFailure(const TransferStatus* status, const char* fmt, Args&&... args) {
+  if (HasRdmaFlushCascade(status)) {
+    MORI_IO_DEBUG(fmt, std::forward<Args>(args)...);
+  } else {
+    MORI_IO_ERROR(fmt, std::forward<Args>(args)...);
+  }
+}
 
 std::string QueryDeviceBusId(int deviceId) {
   if (deviceId < 0) {
@@ -69,7 +84,8 @@ void IOEngineSession::Read(size_t localOffset, size_t remoteOffset, size_t size,
   MORI_IO_FUNCTION_TIMER;
   backendSess->Read(localOffset, remoteOffset, size, status, id);
   if (status->Failed()) {
-    MORI_IO_ERROR("Session read error {} message {}", status->CodeUint32(), status->Message());
+    LogTransferFailure(status, "Session read error {} message {}", status->CodeUint32(),
+                       status->Message());
   }
 }
 
@@ -78,7 +94,8 @@ void IOEngineSession::Write(size_t localOffset, size_t remoteOffset, size_t size
   MORI_IO_FUNCTION_TIMER;
   backendSess->Write(localOffset, remoteOffset, size, status, id);
   if (status->Failed()) {
-    MORI_IO_ERROR("Session write error {} message {}", status->CodeUint32(), status->Message());
+    LogTransferFailure(status, "Session write error {} message {}", status->CodeUint32(),
+                       status->Message());
   }
   return;
 }
@@ -88,8 +105,8 @@ void IOEngineSession::BatchRead(const SizeVec& localOffsets, const SizeVec& remo
   MORI_IO_FUNCTION_TIMER;
   backendSess->BatchRead(localOffsets, remoteOffsets, sizes, status, id);
   if (status->Failed()) {
-    MORI_IO_ERROR("Session batch read error {} message {}", status->CodeUint32(),
-                  status->Message());
+    LogTransferFailure(status, "Session batch read error {} message {}", status->CodeUint32(),
+                       status->Message());
   }
 }
 
@@ -99,8 +116,8 @@ void IOEngineSession::BatchWrite(const SizeVec& localOffsets, const SizeVec& rem
   MORI_IO_FUNCTION_TIMER;
   backendSess->BatchWrite(localOffsets, remoteOffsets, sizes, status, id);
   if (status->Failed()) {
-    MORI_IO_ERROR("Session batch write error {} message {}", status->CodeUint32(),
-                  status->Message());
+    LogTransferFailure(status, "Session batch write error {} message {}", status->CodeUint32(),
+                       status->Message());
   }
 }
 
@@ -374,7 +391,8 @@ void IOEngine::Read(const MemoryDesc& localDest, size_t localOffset, const Memor
   SELECT_BACKEND_AND_RETURN_IF_NONE(localDest, remoteSrc, status, backend);
   backend->Read(localDest, localOffset, remoteSrc, remoteOffset, size, status, id);
   if (status->Failed()) {
-    MORI_IO_ERROR("Engine read error {} message {}", status->CodeUint32(), status->Message());
+    LogTransferFailure(status, "Engine read error {} message {}", status->CodeUint32(),
+                       status->Message());
   }
 }
 
@@ -386,7 +404,8 @@ void IOEngine::Write(const MemoryDesc& localSrc, size_t localOffset, const Memor
   SELECT_BACKEND_AND_RETURN_IF_NONE(localSrc, remoteDest, status, backend);
   backend->Write(localSrc, localOffset, remoteDest, remoteOffset, size, status, id);
   if (status->Failed()) {
-    MORI_IO_ERROR("Engine write error {} message {}", status->CodeUint32(), status->Message());
+    LogTransferFailure(status, "Engine write error {} message {}", status->CodeUint32(),
+                       status->Message());
   }
 }
 
@@ -409,8 +428,8 @@ void IOEngine::BatchRead(const MemDescVec& localDest, const BatchSizeVec& localO
     backend->BatchRead(localDest[i], localOffsets[i], remoteSrc[i], remoteOffsets[i], sizes[i],
                        status[i], ids[i]);
     if (status[i]->Failed()) {
-      MORI_IO_ERROR("Engine batch read error {} message {}", status[i]->CodeUint32(),
-                    status[i]->Message());
+      LogTransferFailure(status[i], "Engine batch read error {} message {}",
+                         status[i]->CodeUint32(), status[i]->Message());
     }
   }
 }
@@ -434,8 +453,8 @@ void IOEngine::BatchWrite(const MemDescVec& localSrc, const BatchSizeVec& localO
     backend->BatchWrite(localSrc[i], localOffsets[i], remoteDest[i], remoteOffsets[i], sizes[i],
                         status[i], ids[i]);
     if (status[i]->Failed()) {
-      MORI_IO_ERROR("Engine batch write error {} message {}", status[i]->CodeUint32(),
-                    status[i]->Message());
+      LogTransferFailure(status[i], "Engine batch write error {} message {}",
+                         status[i]->CodeUint32(), status[i]->Message());
     }
   }
 }
