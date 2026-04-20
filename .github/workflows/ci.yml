@@ -223,7 +223,6 @@ jobs:
         run: |
           $CT exec ${CONTAINER}_jax bash -c "
             cd $GITHUB_WORKSPACE
-            MORI_KERNEL_DIR=\$(ls -d $GITHUB_WORKSPACE/build/lib/gfx*_ionic 2>/dev/null | head -1) \
             timeout 300 pytest tests/python/ops/test_dispatch_combine_jax.py -s -v
           "
 
