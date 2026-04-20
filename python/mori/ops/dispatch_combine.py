@@ -163,53 +163,33 @@ except AttributeError:
 _PTR_SIZE = 8
 
 
-_compiled_hsaco: dict[str, str] = {}
-
-
 def warmup_jit_kernels(kernel_type):
     """Pre-compile kernels for a kernel_type. Call from main process before spawning workers."""
-    from mori.jit.core import compile_genco
+    from mori.ops._jit_loader import ensure_compiled, _compiled_hsaco
 
     if kernel_type not in _KERNEL_TYPE_TO_HIP:
         raise ValueError(f"Unknown kernel_type: {kernel_type}")
     hip_name = _KERNEL_TYPE_TO_HIP[kernel_type]
-    if hip_name not in _compiled_hsaco:
-        _compiled_hsaco[hip_name] = compile_genco(hip_name)
-    return _compiled_hsaco[hip_name]
+    ensure_compiled(hip_name)
+    return _compiled_hsaco.get(hip_name)
 
 
 def _ensure_jit_kernels(kernel_type):
     """Ensure the required kernels for this kernel_type are JIT-compiled."""
-    try:
-        from mori.jit.core import compile_genco
-
-        if kernel_type not in _KERNEL_TYPE_TO_HIP:
-            raise ValueError(f"Unknown kernel_type: {kernel_type}")
-        hip_name = _KERNEL_TYPE_TO_HIP[kernel_type]
-        if hip_name not in _compiled_hsaco:
-            _compiled_hsaco[hip_name] = compile_genco(hip_name)
-    except Exception as e:
-        import warnings
-
-        warnings.warn(f"[mori] JIT kernel compilation skipped: {e}")
-
-
-def _load_hip_modules(kernel_type):
-    """Load HipModule(s) for the given kernel_type and init shmem gpu states."""
-    from mori.jit.hip_driver import HipModule
+    from mori.ops._jit_loader import ensure_compiled
 
     if kernel_type not in _KERNEL_TYPE_TO_HIP:
         raise ValueError(f"Unknown kernel_type: {kernel_type}")
-    hip_name = _KERNEL_TYPE_TO_HIP[kernel_type]
-    hsaco = _compiled_hsaco.get(hip_name)
-    if hsaco is None:
-        raise RuntimeError(
-            f"Kernels for {hip_name} not compiled. Call _ensure_jit_kernels first."
-        )
+    ensure_compiled(_KERNEL_TYPE_TO_HIP[kernel_type])
 
-    mod = HipModule(hsaco)
-    mori_cpp.shmem_module_init(mod._module.value)
-    return mod
+
+def _load_hip_modules(kernel_type):
+    """Load HipModule for the given kernel_type and init shmem gpu states."""
+    from mori.ops._jit_loader import load_hip_module
+
+    if kernel_type not in _KERNEL_TYPE_TO_HIP:
+        raise ValueError(f"Unknown kernel_type: {kernel_type}")
+    return load_hip_module(_KERNEL_TYPE_TO_HIP[kernel_type], init_shmem=True)
 
 
 class EpDispatchCombineOp:
@@ -248,6 +228,10 @@ class EpDispatchCombineOp:
 
         self._dispatch_out_ptrs = mori_cpp.get_dispatch_output_ptrs(self._handle, True)
         self._combine_out_ptrs = mori_cpp.get_combine_output_ptrs(self._handle, True)
+
+        self.local_expert_count = torch.zeros(
+            config.num_experts_per_rank, dtype=torch.int32, device="cuda"
+        )
 
         self._reset_func = _cpp_dispatch_combine_factory("launch_reset")
         self._get_dispatch_src_token_pos_func = _cpp_dispatch_combine_factory(
@@ -487,6 +471,7 @@ class EpDispatchCombineOp:
         block_num: int = -1,
         rdma_block_num: int = -1,
         warp_per_block: int = -1,
+        call_local_expert_count: bool = False,
     ):
         hidden_dim = input.size(1)
         weight_ptr = weights.data_ptr() if weights is not None else 0
@@ -589,6 +574,18 @@ class EpDispatchCombineOp:
         else:
             raise ValueError(f"Unsupported dispatch kernel_type: {kt}")
 
+        if call_local_expert_count and kt != EpDispatchCombineKernelType.AsyncLL.value:
+            from mori.ops.local_expert_count import launch_local_expert_count
+
+            _, _, _, outI_ptr, total_ptr = self._dispatch_out_ptrs
+            launch_local_expert_count(
+                self._cpp_config,
+                outI_ptr,
+                total_ptr,
+                self.local_expert_count.data_ptr(),
+                stream=stream,
+            )
+
         out_ptr, outW_ptr, outS_ptr, outI_ptr, total_ptr = self._dispatch_out_ptrs
         max_recv = self._cpp_config.max_num_tokens_to_recv()
         out = from_gpu_ptr(out_ptr, (max_recv, hidden_dim), input.dtype)
@@ -615,6 +612,7 @@ class EpDispatchCombineOp:
         indices: torch.Tensor,
         block_num: int = -1,
         warp_per_block: int = -1,
+        call_local_expert_count: bool = False,
     ):
         return self.dispatch(
             input,
@@ -629,6 +627,7 @@ class EpDispatchCombineOp:
         self,
         block_num: int = -1,
         warp_per_block: int = -1,
+        call_local_expert_count: bool = False,
     ):
         if hasattr(self, "_cached_dispatch_launch"):
             _, _, actual_wpb = self._cached_dispatch_launch
@@ -662,6 +661,18 @@ class EpDispatchCombineOp:
         else:
             raise ValueError(
                 f"dispatch_recv only supports AsyncLL, got kernel_type={kt}"
+            )
+
+        if call_local_expert_count:
+            from mori.ops.local_expert_count import launch_local_expert_count
+
+            _, _, _, outI_ptr, total_ptr = self._dispatch_out_ptrs
+            launch_local_expert_count(
+                self._cpp_config,
+                outI_ptr,
+                total_ptr,
+                self.local_expert_count.data_ptr(),
+                stream=stream,
             )
 
     def combine(

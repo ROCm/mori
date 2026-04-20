@@ -90,6 +90,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         dispatch_warp_per_block,
         combine_block_num,
         combine_warp_per_block,
+        call_local_expert_count=False,
     ):
         (
             _,
@@ -115,6 +116,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
                 all_rank_indices[self.config.rank],
                 block_num=dispatch_block_num,
                 warp_per_block=dispatch_warp_per_block,
+                call_local_expert_count=call_local_expert_count,
             )
 
         combine_input = self._get_combine_input(op, dispatch_output)
@@ -142,6 +144,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         combine_block_num,
         combine_warp_per_block,
         total_recv_num_token,
+        call_local_expert_count=False,
     ):
         (
             _,
@@ -167,6 +170,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
                 all_rank_indices[self.config.rank],
                 block_num=dispatch_block_num,
                 warp_per_block=dispatch_warp_per_block,
+                call_local_expert_count=call_local_expert_count,
             )
             e2e_combine_arg = self._get_combine_input(op, e2e_dispatch_output)
             e2e_combine_output, _ = op.combine(
@@ -190,6 +194,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         combine_block_num,
         combine_warp_per_block,
         check=True,
+        call_local_expert_count=False,
     ):
         (
             all_rank_num_token,
@@ -213,6 +218,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             all_rank_indices[self.config.rank],
             block_num=dispatch_block_num,
             warp_per_block=dispatch_warp_per_block,
+            call_local_expert_count=call_local_expert_count,
         )
         if check:
             self.check_dispatch_result(
@@ -272,6 +278,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         combine_warp_per_block,
         graph_replay_iters=10,
         skip_e2e=False,
+        call_local_expert_count=False,
     ):
         (
             _,
@@ -294,6 +301,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             combine_block_num,
             combine_warp_per_block,
             check=False,
+            call_local_expert_count=call_local_expert_count,
         )
 
         # Split dispatch/combine into two graphs so we can time each replay
@@ -305,6 +313,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             dispatch_warp_per_block,
             combine_block_num,
             combine_warp_per_block,
+            call_local_expert_count=call_local_expert_count,
         )
 
         is_cross_type = self.combine_data_type != self.config.data_type
@@ -319,6 +328,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
                 combine_block_num,
                 combine_warp_per_block,
                 total_recv_num_token,
+                call_local_expert_count=call_local_expert_count,
             )
 
         round_start_events = [
@@ -416,6 +426,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         iters=10,
         graph_replay_iters=10,
         skip_e2e=False,
+        call_local_expert_count=False,
     ):
         test_data = self.gen_test_data()
         for _ in range(warmup):
@@ -426,6 +437,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
                 dispatch_warp_per_block,
                 combine_block_num,
                 combine_warp_per_block,
+                call_local_expert_count=call_local_expert_count,
             )
 
         disp_duration_us_list = []
@@ -456,6 +468,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
                 combine_warp_per_block,
                 graph_replay_iters=graph_replay_iters,
                 skip_e2e=skip_e2e,
+                call_local_expert_count=call_local_expert_count,
             )
 
             disp_dur_list = [torch.zeros(1) for _ in range(self.config.world_size)]
@@ -551,6 +564,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         dispatch_warp_per_block,
         combine_block_num,
         combine_warp_per_block,
+        call_local_expert_count=False,
     ):
         if self.combine_data_type != self.config.data_type:
             raise ValueError(
@@ -566,6 +580,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             combine_block_num,
             combine_warp_per_block,
             check=False,
+            call_local_expert_count=call_local_expert_count,
         )
         g = self._capture_e2e_graph(
             op,
@@ -575,6 +590,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             combine_block_num,
             combine_warp_per_block,
             total_recv_num_token,
+            call_local_expert_count=call_local_expert_count,
         )
         torch.cuda.synchronize()
         for i in range(135):
@@ -761,6 +777,7 @@ def _bench_dispatch_combine(
     combine_data_type=None,
     max_total_recv_tokens=0,
     save_tuning_config=None,
+    call_local_expert_count=False,
 ):
     if combine_data_type is None:
         combine_data_type = data_type
@@ -840,6 +857,7 @@ def _bench_dispatch_combine(
                 dispatch_warp_per_block=dispatch_warp_per_block,
                 combine_block_num=combine_block_num,
                 combine_warp_per_block=combine_warp_per_block,
+                call_local_expert_count=call_local_expert_count,
             )
 
         elif cmd == "stress":
@@ -856,6 +874,7 @@ def _bench_dispatch_combine(
                 dispatch_warp_per_block=dispatch_warp_per_block,
                 combine_block_num=combine_block_num,
                 combine_warp_per_block=combine_warp_per_block,
+                call_local_expert_count=call_local_expert_count,
             )
 
         elif cmd == "tuning":
@@ -947,6 +966,7 @@ def _bench_dispatch_combine(
                         combine_block_num=block_num,
                         combine_warp_per_block=warp_per_block,
                         skip_e2e=True,
+                        call_local_expert_count=call_local_expert_count,
                     )
 
                     if disp_bw > best_disp_bw + _BW_NOISE_MARGIN:
@@ -984,6 +1004,7 @@ def _bench_dispatch_combine(
                             combine_block_num=best_comb_config[0],
                             combine_warp_per_block=best_comb_config[1],
                             skip_e2e=True,
+                            call_local_expert_count=call_local_expert_count,
                         )
 
                         if disp_bw > best_disp_bw + _BW_NOISE_MARGIN:
@@ -1049,6 +1070,7 @@ def bench_dispatch_combine(
     combine_data_type=None,
     max_total_recv_tokens=0,
     save_tuning_config=None,
+    call_local_expert_count=False,
 ):
     if combine_data_type is None:
         combine_data_type = dtype
@@ -1075,6 +1097,7 @@ def bench_dispatch_combine(
             combine_data_type,
             max_total_recv_tokens,
             save_tuning_config,
+            call_local_expert_count,
         ),
         nprocs=world_size,
         join=True,
@@ -1203,6 +1226,12 @@ if __name__ == "__main__":
             "Use 'auto' to auto-generate filename based on GPU/dtype/EP."
         ),
     )
+    parser.add_argument(
+        "--local-expert-count",
+        action="store_true",
+        default=False,
+        help="Call the local_expert_count kernel after each dispatch.",
+    )
     args = parser.parse_args()
 
     if args.num_experts_per_rank is None:
@@ -1251,4 +1280,5 @@ if __name__ == "__main__":
         combine_data_type=combine_dtype,
         max_total_recv_tokens=args.max_recv_total_tokens,
         save_tuning_config=args.save_tuning_config,
+        call_local_expert_count=args.local_expert_count,
     )

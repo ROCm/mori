@@ -24,6 +24,6 @@ from .dispatch_combine import (
     EpDispatchCombineConfig,
     EpDispatchCombineOp,
 )
-from .ops import (
-    cast,
+from .local_expert_count import (
+    launch_local_expert_count,
 )

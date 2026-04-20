@@ -511,6 +511,15 @@ static_assert(sizeof(EpDispatchCombineArgsRaw) == sizeof(EpDispatchCombineArgs<h
 EpDispatchCombineArgsRaw GetEpDispatchCombineArgsRaw(const EpDispatchCombineHandle& handle,
                                                      int rdmaBlockNum);
 
+struct LocalExpertCountArgs {
+  const index_t* indices;
+  const index_t* totalRecvTokenNum;
+  int rank;
+  int numExpertPerRank;
+  int numExpertPerToken;
+  int* localExpertCount;
+};
+
 #ifdef ENABLE_STANDARD_MOE_ADAPT
 struct ConvertDispatchOutputArgs {
   EpDispatchCombineConfig config;

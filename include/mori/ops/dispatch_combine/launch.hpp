@@ -92,6 +92,10 @@ void LaunchDispatchRecv(EpDispatchCombineHandle& handle, int block_num = -1,
 void LaunchCombineRecv(EpDispatchCombineHandle& handle, int block_num = -1, int warp_per_block = -1,
                        hipStream_t stream = 0);
 
+void LaunchLocalExpertCount(const EpDispatchCombineConfig& config, const index_t* indices,
+                            const index_t* total_recv_token_num, int* local_expert_count,
+                            int block_num = -1, int warp_per_block = -1, hipStream_t stream = 0);
+
 // Reset internal state between iterations
 void LaunchReset(EpDispatchCombineHandle& handle, hipStream_t stream = 0);
 
