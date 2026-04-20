@@ -22,6 +22,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <functional>
 #include <msgpack.hpp>
 #include <mutex>
@@ -34,9 +35,6 @@
 
 namespace mori {
 namespace io {
-namespace internal {
-struct TransferStatusAccess;
-}
 
 struct BackendBitmap {
   uint32_t bits{0};
@@ -141,10 +139,7 @@ struct TransferStatus {
   bool Succeeded() { return Code() == StatusCode::SUCCESS; }
   bool Failed() { return Code() > StatusCode::ERR_BEGIN; }
 
-  void SetCode(enum StatusCode val) {
-    if (val <= StatusCode::ERR_BEGIN) diagnosticFlags.store(0, std::memory_order_relaxed);
-    code.store(val, std::memory_order_release);
-  }
+  void SetCode(enum StatusCode val) { code.store(val, std::memory_order_release); }
   void SetMessage(const std::string& val) {
     std::lock_guard<std::mutex> lock(msgMu);
     msg = val;
@@ -175,15 +170,10 @@ struct TransferStatus {
   }
 
   std::atomic<StatusCode> code{StatusCode::INIT};
-  // Internal-only diagnostic bits used by IO backend implementations. They are
-  // intentionally not part of the public error contract.
-  std::atomic<uint32_t> diagnosticFlags{0};
   mutable std::mutex msgMu;
   std::string msg;
   std::function<void()> waitCallback;
   std::function<void()> progressCallback;
-
-  friend struct internal::TransferStatusAccess;
 };
 
 using SizeVec = std::vector<size_t>;

@@ -30,8 +30,8 @@
 
 #include "mori/io/env.hpp"
 #include "mori/io/logging.hpp"
+#include "src/io/call_diagnostics_internal.hpp"
 #include "src/io/rdma/backend_impl.hpp"
-#include "src/io/transfer_status_internal.hpp"
 #include "src/io/xgmi/backend_impl.hpp"
 
 namespace mori {
@@ -39,13 +39,18 @@ namespace io {
 
 namespace {
 
-inline bool HasRdmaFlushCascade(const TransferStatus* status) {
-  return status != nullptr && internal::TransferStatusAccess::HasRdmaFlushCascade(*status);
-}
-
 template <typename... Args>
-inline void LogTransferFailure(const TransferStatus* status, const char* fmt, Args&&... args) {
-  if (HasRdmaFlushCascade(status)) {
+inline void LogTransferFailure(const std::shared_ptr<internal::IoCallDiagnostics>& diagnostics,
+                               const char* fmt, Args&&... args) {
+  internal::IoFailureKind failureKind =
+      diagnostics ? diagnostics->CurrentFailureKind() : internal::IoFailureKind::None;
+  if (failureKind == internal::IoFailureKind::None) {
+    failureKind = internal::IoFailureKind::RootCause;
+  }
+  if (diagnostics && !diagnostics->TryMarkLogged(failureKind)) {
+    return;
+  }
+  if (failureKind == internal::IoFailureKind::FlushCascade) {
     MORI_IO_DEBUG(fmt, std::forward<Args>(args)...);
   } else {
     MORI_IO_ERROR(fmt, std::forward<Args>(args)...);
@@ -82,9 +87,11 @@ TransferUniqueId IOEngineSession::AllocateTransferUniqueId() {
 void IOEngineSession::Read(size_t localOffset, size_t remoteOffset, size_t size,
                            TransferStatus* status, TransferUniqueId id) {
   MORI_IO_FUNCTION_TIMER;
+  std::shared_ptr<internal::IoCallDiagnostics> diagnostics;
+  internal::ScopedIoCallDiagnosticsCapture capture(&diagnostics, "Session read");
   backendSess->Read(localOffset, remoteOffset, size, status, id);
   if (status->Failed()) {
-    LogTransferFailure(status, "Session read error {} message {}", status->CodeUint32(),
+    LogTransferFailure(diagnostics, "Session read error {} message {}", status->CodeUint32(),
                        status->Message());
   }
 }
@@ -92,9 +99,11 @@ void IOEngineSession::Read(size_t localOffset, size_t remoteOffset, size_t size,
 void IOEngineSession::Write(size_t localOffset, size_t remoteOffset, size_t size,
                             TransferStatus* status, TransferUniqueId id) {
   MORI_IO_FUNCTION_TIMER;
+  std::shared_ptr<internal::IoCallDiagnostics> diagnostics;
+  internal::ScopedIoCallDiagnosticsCapture capture(&diagnostics, "Session write");
   backendSess->Write(localOffset, remoteOffset, size, status, id);
   if (status->Failed()) {
-    LogTransferFailure(status, "Session write error {} message {}", status->CodeUint32(),
+    LogTransferFailure(diagnostics, "Session write error {} message {}", status->CodeUint32(),
                        status->Message());
   }
   return;
@@ -103,9 +112,11 @@ void IOEngineSession::Write(size_t localOffset, size_t remoteOffset, size_t size
 void IOEngineSession::BatchRead(const SizeVec& localOffsets, const SizeVec& remoteOffsets,
                                 const SizeVec& sizes, TransferStatus* status, TransferUniqueId id) {
   MORI_IO_FUNCTION_TIMER;
+  std::shared_ptr<internal::IoCallDiagnostics> diagnostics;
+  internal::ScopedIoCallDiagnosticsCapture capture(&diagnostics, "Session batch read");
   backendSess->BatchRead(localOffsets, remoteOffsets, sizes, status, id);
   if (status->Failed()) {
-    LogTransferFailure(status, "Session batch read error {} message {}", status->CodeUint32(),
+    LogTransferFailure(diagnostics, "Session batch read error {} message {}", status->CodeUint32(),
                        status->Message());
   }
 }
@@ -114,9 +125,11 @@ void IOEngineSession::BatchWrite(const SizeVec& localOffsets, const SizeVec& rem
                                  const SizeVec& sizes, TransferStatus* status,
                                  TransferUniqueId id) {
   MORI_IO_FUNCTION_TIMER;
+  std::shared_ptr<internal::IoCallDiagnostics> diagnostics;
+  internal::ScopedIoCallDiagnosticsCapture capture(&diagnostics, "Session batch write");
   backendSess->BatchWrite(localOffsets, remoteOffsets, sizes, status, id);
   if (status->Failed()) {
-    LogTransferFailure(status, "Session batch write error {} message {}", status->CodeUint32(),
+    LogTransferFailure(diagnostics, "Session batch write error {} message {}", status->CodeUint32(),
                        status->Message());
   }
 }
@@ -387,11 +400,13 @@ std::string IOEngine::ResolveNodeId(const std::string& hostname) const {
 void IOEngine::Read(const MemoryDesc& localDest, size_t localOffset, const MemoryDesc& remoteSrc,
                     size_t remoteOffset, size_t size, TransferStatus* status, TransferUniqueId id) {
   MORI_IO_FUNCTION_TIMER;
+  std::shared_ptr<internal::IoCallDiagnostics> diagnostics;
+  internal::ScopedIoCallDiagnosticsCapture capture(&diagnostics, "Engine read");
   Backend* backend = nullptr;
   SELECT_BACKEND_AND_RETURN_IF_NONE(localDest, remoteSrc, status, backend);
   backend->Read(localDest, localOffset, remoteSrc, remoteOffset, size, status, id);
   if (status->Failed()) {
-    LogTransferFailure(status, "Engine read error {} message {}", status->CodeUint32(),
+    LogTransferFailure(diagnostics, "Engine read error {} message {}", status->CodeUint32(),
                        status->Message());
   }
 }
@@ -400,11 +415,13 @@ void IOEngine::Write(const MemoryDesc& localSrc, size_t localOffset, const Memor
                      size_t remoteOffset, size_t size, TransferStatus* status,
                      TransferUniqueId id) {
   MORI_IO_FUNCTION_TIMER;
+  std::shared_ptr<internal::IoCallDiagnostics> diagnostics;
+  internal::ScopedIoCallDiagnosticsCapture capture(&diagnostics, "Engine write");
   Backend* backend = nullptr;
   SELECT_BACKEND_AND_RETURN_IF_NONE(localSrc, remoteDest, status, backend);
   backend->Write(localSrc, localOffset, remoteDest, remoteOffset, size, status, id);
   if (status->Failed()) {
-    LogTransferFailure(status, "Engine write error {} message {}", status->CodeUint32(),
+    LogTransferFailure(diagnostics, "Engine write error {} message {}", status->CodeUint32(),
                        status->Message());
   }
 }
@@ -423,12 +440,14 @@ void IOEngine::BatchRead(const MemDescVec& localDest, const BatchSizeVec& localO
   assert(batchSize == ids.size());
 
   for (size_t i = 0; i < batchSize; i++) {
+    std::shared_ptr<internal::IoCallDiagnostics> diagnostics;
+    internal::ScopedIoCallDiagnosticsCapture capture(&diagnostics, "Engine batch read");
     Backend* backend = nullptr;
     SELECT_BACKEND_AND_RETURN_IF_NONE(localDest[i], remoteSrc[i], status[i], backend);
     backend->BatchRead(localDest[i], localOffsets[i], remoteSrc[i], remoteOffsets[i], sizes[i],
                        status[i], ids[i]);
     if (status[i]->Failed()) {
-      LogTransferFailure(status[i], "Engine batch read error {} message {}",
+      LogTransferFailure(diagnostics, "Engine batch read error {} message {}",
                          status[i]->CodeUint32(), status[i]->Message());
     }
   }
@@ -448,12 +467,14 @@ void IOEngine::BatchWrite(const MemDescVec& localSrc, const BatchSizeVec& localO
   assert(batchSize == ids.size());
 
   for (size_t i = 0; i < batchSize; i++) {
+    std::shared_ptr<internal::IoCallDiagnostics> diagnostics;
+    internal::ScopedIoCallDiagnosticsCapture capture(&diagnostics, "Engine batch write");
     Backend* backend = nullptr;
     SELECT_BACKEND_AND_RETURN_IF_NONE(localSrc[i], remoteDest[i], status[i], backend);
     backend->BatchWrite(localSrc[i], localOffsets[i], remoteDest[i], remoteOffsets[i], sizes[i],
                         status[i], ids[i]);
     if (status[i]->Failed()) {
-      LogTransferFailure(status[i], "Engine batch write error {} message {}",
+      LogTransferFailure(diagnostics, "Engine batch write error {} message {}",
                          status[i]->CodeUint32(), status[i]->Message());
     }
   }

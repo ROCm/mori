@@ -33,7 +33,6 @@
 #include "mori/io/env.hpp"
 #include "mori/io/logging.hpp"
 #include "src/io/rdma/protocol.hpp"
-#include "src/io/transfer_status_internal.hpp"
 namespace mori {
 namespace io {
 
@@ -69,6 +68,19 @@ struct CqeFailureAdvice {
     return message;
   }
 };
+
+static void LogAsyncTransferFailureIfNeeded(internal::IoCallDiagnostics* diagnostics, uint32_t code,
+                                            const std::string& message) {
+  if (diagnostics == nullptr || diagnostics->Label() == nullptr) return;
+
+  internal::IoFailureKind failureKind = diagnostics->CurrentFailureKind();
+  if (failureKind != internal::IoFailureKind::FlushCascade ||
+      !diagnostics->TryMarkLogged(failureKind)) {
+    return;
+  }
+
+  MORI_IO_DEBUG("{} error {} message {}", diagnostics->Label(), code, message);
+}
 
 static CqeFailureOrigin ClassifyCqeFailureOrigin(uint64_t wrId, uint32_t notifPerQp) {
   if (IsNotifSendWrId(wrId)) return CqeFailureOrigin::NotificationSend;
@@ -506,18 +518,18 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
                         ? ep.ledger->ReleaseByCqe(wc[i].wr_id, ep.sqDepth.get(), &mergedBatchSize)
                         : nullptr;
         if (meta) {
-          uint32_t finishedBefore = meta->finishedBatchSize.fetch_add(mergedBatchSize);
+          (void)meta->finishedBatchSize.fetch_add(mergedBatchSize);
+          if (isFlush) {
+            meta->diagnostics.MarkFlushCascade();
+          } else {
+            meta->diagnostics.MarkRootCause();
+          }
+          LogAsyncTransferFailureIfNeeded(&meta->diagnostics,
+                                          static_cast<uint32_t>(StatusCode::ERR_RDMA_OP),
+                                          failureAdvice.ComposeStatusMessage());
           TransferStatus* statusPtr = meta->status;
           if (statusPtr != nullptr) {
-            if (isFlush) internal::TransferStatusAccess::MarkRdmaFlushCascade(statusPtr);
             statusPtr->Update(StatusCode::ERR_RDMA_OP, failureAdvice.ComposeStatusMessage());
-            if (!isFlush) {
-              MORI_IO_ERROR(
-                  "ProcessOneCqe: [ROOT CAUSE] batch transfer {} failed, status={}({}), "
-                  "finished={}/{}",
-                  meta->id, static_cast<uint32_t>(wc[i].status), failureAdvice.statusText,
-                  finishedBefore + mergedBatchSize, meta->totalBatchSize);
-            }
             meta->status = nullptr;
           }
           if (ep.degraded && ep.degraded->load(std::memory_order_relaxed) && ep.ledger) {
@@ -668,6 +680,7 @@ void NotifManager::MainLoop() {
     epoll_event events[maxEvents];
     while (running.load()) {
       FlushRoundStats roundStats;
+      bool handledCqEvent = false;
       int nfds = epoll_wait(epfd, events, maxEvents, 0 /*ms*/);
       for (int i = 0; i < nfds; ++i) {
         EndpointId eid = events[i].data.u64;
@@ -688,9 +701,12 @@ void NotifManager::MainLoop() {
         ibv_ack_cq_events(cq, 1);
         ibv_req_notify_cq(cq, 0);
 
+        handledCqEvent = true;
         roundStats.Merge(rt->id, ProcessOneCqe(rt));
       }
-      EmitFlushSummaryIfNeeded(roundStats);
+      if (handledCqEvent) {
+        EmitFlushSummaryIfNeeded(roundStats);
+      }
     }
   } else {
     while (running.load()) {
@@ -944,6 +960,7 @@ void RdmaBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size
   MORI_IO_FUNCTION_TIMER;
   status->SetCode(StatusCode::IN_PROGRESS);
   auto callbackMeta = std::make_shared<CqCallbackMeta>(status, id, 1);
+  internal::PublishCurrentIoCallDiagnostics(callbackMeta);
 
   RdmaOpRet ret =
       RdmaReadWrite(eps, local, localOffset, remote, remoteOffset, size, callbackMeta, id, isRead);
@@ -966,6 +983,7 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
   MORI_IO_FUNCTION_TIMER;
   status->SetCode(StatusCode::IN_PROGRESS);
   auto callbackMeta = std::make_shared<CqCallbackMeta>(status, id, sizes.size());
+  internal::PublishCurrentIoCallDiagnostics(callbackMeta);
   RdmaOpRet ret;
   if (executor) {
     ExecutorReq req{eps,          local, localOffsets,         remote, remoteOffsets, sizes,

@@ -31,6 +31,7 @@
 #include "mori/io/common.hpp"
 #include "mori/io/enum.hpp"
 #include "mori/io/msgpack_adaptor.hpp"
+#include "src/io/call_diagnostics_internal.hpp"
 
 namespace mori {
 namespace io {
@@ -133,6 +134,7 @@ struct CqCallbackMeta {
   TransferUniqueId id{0};
   int totalBatchSize{0};
   std::atomic<uint32_t> finishedBatchSize{0};
+  internal::IoCallDiagnostics diagnostics{};
 };
 
 // SubmissionLedger: tracks per-EP WR submissions and enables precise sqDepth release.
