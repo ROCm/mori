@@ -50,6 +50,23 @@ MSGPACK_API_VERSION_NAMESPACE(MSGPACK_DEFAULT_API_NS) {
   };
 
   template <>
+  struct pack<mori::io::StatusCode> {
+    template <typename Stream>
+    msgpack::packer<Stream>& operator()(msgpack::packer<Stream>& o, mori::io::StatusCode v) const {
+      o.pack(static_cast<uint32_t>(v));
+      return o;
+    }
+  };
+
+  template <>
+  struct convert<mori::io::StatusCode> {
+    const msgpack::object& operator()(const msgpack::object& o, mori::io::StatusCode& v) const {
+      v = static_cast<mori::io::StatusCode>(o.as<uint32_t>());
+      return o;
+    }
+  };
+
+  template <>
   struct pack<mori::io::MemoryLocationType> {
     template <typename Stream>
     msgpack::packer<Stream>& operator()(msgpack::packer<Stream>& o,

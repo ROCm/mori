@@ -25,6 +25,7 @@
 
 #include <cassert>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -210,6 +211,8 @@ class RdmaDeviceContext {
 
   virtual RdmaMemoryRegion RegisterRdmaMemoryRegion(void* ptr, size_t size,
                                                     int accessFlag = MR_DEFAULT_ACCESS_FLAG);
+  virtual std::optional<RdmaMemoryRegion> TryRegisterRdmaMemoryRegion(
+      void* ptr, size_t size, int accessFlag = MR_DEFAULT_ACCESS_FLAG);
   virtual RdmaMemoryRegion RegisterRdmaMemoryRegionDmabuf(void* ptr, size_t size, int dmabuf_fd,
                                                           int accessFlag = MR_DEFAULT_ACCESS_FLAG);
   virtual void DeregisterRdmaMemoryRegion(void* ptr);
@@ -248,6 +251,7 @@ class RdmaDeviceContext {
 
  private:
   RdmaDevice* device;
+  std::mutex mrPoolMu_;
   std::unordered_map<void*, ibv_mr*> mrPool;
 };
 

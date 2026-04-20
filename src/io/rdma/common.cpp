@@ -21,6 +21,7 @@
 // SOFTWARE.
 #include "src/io/rdma/common.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
@@ -582,6 +583,295 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
     }
     MORI_IO_TRACE("ibv_post_send ep index {} batch index range [{}, {})", epId, st, end);
   }
+  return {StatusCode::IN_PROGRESS, ""};
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                              RdmaLocalMemoryRegistration                                       */
+/* ---------------------------------------------------------------------------------------------- */
+RdmaLocalMemoryRegistration::RdmaLocalMemoryRegistration(RdmaMemoryLayout layout,
+                                                         application::RdmaDeviceContext* devCtx)
+    : layout_(std::move(layout)), devCtx_(devCtx) {}
+
+RdmaLocalMemoryRegistration::~RdmaLocalMemoryRegistration() {
+  if (!devCtx_) return;
+  for (auto& chunk : layout_.chunks) {
+    devCtx_->DeregisterRdmaMemoryRegion(reinterpret_cast<void*>(chunk.mr.addr));
+  }
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                                  Slice Resolution Algorithm                                    */
+/* ---------------------------------------------------------------------------------------------- */
+static size_t FindContainingChunk(const std::vector<RdmaMemoryChunk>& chunks, size_t offset) {
+  size_t lo = 0, hi = chunks.size();
+  while (lo + 1 < hi) {
+    size_t mid = lo + (hi - lo) / 2;
+    if (chunks[mid].offset <= offset)
+      lo = mid;
+    else
+      hi = mid;
+  }
+  return lo;
+}
+
+std::vector<RdmaTransferSlice> ResolveTransferSlices(const RdmaMemoryLayout& local,
+                                                     size_t localOffset,
+                                                     const RdmaMemoryLayout& remote,
+                                                     size_t remoteOffset, size_t totalSize) {
+  if (totalSize == 0) return {};
+
+  if (localOffset > local.logicalSize || totalSize > local.logicalSize - localOffset ||
+      remoteOffset > remote.logicalSize || totalSize > remote.logicalSize - remoteOffset) {
+    return {};
+  }
+
+  std::vector<RdmaTransferSlice> slices;
+  size_t estChunks = (local.chunks.size() > 1 || remote.chunks.size() > 1) ? 4 : 1;
+  slices.reserve(estChunks);
+
+  size_t li = FindContainingChunk(local.chunks, localOffset);
+  size_t ri = FindContainingChunk(remote.chunks, remoteOffset);
+  size_t remaining = totalSize;
+
+  while (remaining > 0) {
+    const auto& lc = local.chunks[li];
+    const auto& rc = remote.chunks[ri];
+
+    uintptr_t localAddr = local.baseAddr + localOffset;
+    uintptr_t remoteAddr = remote.baseAddr + remoteOffset;
+
+    size_t localChunkEnd = lc.offset + lc.mr.length;
+    size_t remoteChunkEnd = rc.offset + rc.mr.length;
+
+    size_t localAvail = localChunkEnd - localOffset;
+    size_t remoteAvail = remoteChunkEnd - remoteOffset;
+
+    size_t sliceLen = std::min({remaining, localAvail, remoteAvail,
+                                static_cast<size_t>(std::numeric_limits<uint32_t>::max())});
+
+    slices.push_back(
+        {localAddr, lc.mr.lkey, remoteAddr, rc.mr.rkey, static_cast<uint32_t>(sliceLen)});
+
+    remaining -= sliceLen;
+    localOffset += sliceLen;
+    remoteOffset += sliceLen;
+
+    if (localOffset >= localChunkEnd && remaining > 0) ++li;
+    if (remoteOffset >= remoteChunkEnd && remaining > 0) ++ri;
+  }
+
+  return slices;
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                               RdmaBatchReadWriteResolved                                       */
+/* ---------------------------------------------------------------------------------------------- */
+RdmaOpRet RdmaBatchReadWriteResolved(const EpPairVec& eps,
+                                     const std::vector<RdmaTransferSlice>& slices,
+                                     std::shared_ptr<CqCallbackMeta> callbackMeta,
+                                     TransferUniqueId id, bool isRead, int postBatchSize) {
+  MORI_IO_FUNCTION_TIMER;
+
+  size_t batchSize = slices.size();
+  if (batchSize == 0) return {StatusCode::SUCCESS, ""};
+  if (eps.empty()) return {StatusCode::ERR_INVALID_ARGS, "no endpoints"};
+
+  struct MergedWorkRequest {
+    ibv_send_wr wr{};
+    std::vector<ibv_sge> sges;
+    size_t totalRemoteLength{0};
+    size_t mergedSlices{1};
+  };
+
+  const uint32_t maxSge = std::max(eps[0].local.handle.maxSge, 1u);
+
+  std::vector<MergedWorkRequest> mergedWrs;
+  mergedWrs.reserve(batchSize);
+
+  auto start_new_wr = [&](const RdmaTransferSlice& s) {
+    mergedWrs.emplace_back();
+    MergedWorkRequest& mwr = mergedWrs.back();
+    mwr.sges.reserve(maxSge);
+    mwr.sges.push_back(ibv_sge{.addr = s.localAddr, .length = s.len, .lkey = s.localLkey});
+    mwr.totalRemoteLength = s.len;
+
+    mwr.wr.sg_list = mwr.sges.data();
+    mwr.wr.num_sge = 1;
+    mwr.wr.opcode = isRead ? IBV_WR_RDMA_READ : IBV_WR_RDMA_WRITE;
+    mwr.wr.send_flags = 0;
+    mwr.wr.wr.rdma.remote_addr = s.remoteAddr;
+    mwr.wr.wr.rdma.rkey = s.remoteRkey;
+  };
+
+  for (size_t i = 0; i < batchSize; ++i) {
+    const RdmaTransferSlice& s = slices[i];
+    bool merged = false;
+
+    if (!mergedWrs.empty()) {
+      MergedWorkRequest& last = mergedWrs.back();
+      uint64_t expectedRemote = last.wr.wr.rdma.remote_addr + last.totalRemoteLength;
+      if (expectedRemote == s.remoteAddr && last.wr.wr.rdma.rkey == s.remoteRkey) {
+        ibv_sge& lastSge = last.sges.back();
+        bool localContig = (lastSge.addr + lastSge.length) == s.localAddr;
+        bool sameLkey = lastSge.lkey == s.localLkey;
+
+        if (localContig && sameLkey) {
+          uint64_t newLen = static_cast<uint64_t>(lastSge.length) + s.len;
+          if (newLen <= std::numeric_limits<uint32_t>::max()) {
+            lastSge.length = static_cast<uint32_t>(newLen);
+            last.mergedSlices++;
+            last.totalRemoteLength += s.len;
+            merged = true;
+          }
+        }
+        if (!merged && last.sges.size() < maxSge) {
+          last.sges.push_back(ibv_sge{.addr = s.localAddr, .length = s.len, .lkey = s.localLkey});
+          last.wr.num_sge = static_cast<int>(last.sges.size());
+          last.mergedSlices++;
+          last.totalRemoteLength += s.len;
+          merged = true;
+        }
+      }
+    }
+    if (!merged) start_new_wr(s);
+  }
+
+  // Stabilize sg_list pointers after all merging is complete.
+  for (auto& mwr : mergedWrs) {
+    mwr.wr.sg_list = mwr.sges.data();
+  }
+
+  size_t mergedWrCount = mergedWrs.size();
+  size_t epNum = eps.size();
+  size_t epBatchSz = (mergedWrCount + epNum - 1) / epNum;
+
+  if (postBatchSize == -1) {
+    postBatchSize = (epBatchSz > static_cast<size_t>(std::numeric_limits<int>::max()))
+                        ? std::numeric_limits<int>::max()
+                        : static_cast<int>(epBatchSz);
+  }
+  {
+    int minMaxSqDepth = std::numeric_limits<int>::max();
+    for (size_t epId = 0; epId < epNum; ++epId) {
+      if (eps[epId].sqDepth && eps[epId].maxSqDepth > 0)
+        minMaxSqDepth = std::min(minMaxSqDepth, eps[epId].maxSqDepth);
+    }
+    if (minMaxSqDepth != std::numeric_limits<int>::max() && postBatchSize > minMaxSqDepth)
+      postBatchSize = minMaxSqDepth;
+  }
+  if (postBatchSize <= 0) postBatchSize = 1;
+  int numPostBatch = (mergedWrCount + postBatchSize - 1) / postBatchSize;
+
+  std::vector<int> epWrsSinceSignal(epNum, 0);
+  std::vector<size_t> epMergedSinceSignal(epNum, 0);
+
+  for (int i = 0; i < numPostBatch; i++) {
+    int st = i * postBatchSize;
+    int end = std::min(static_cast<size_t>(st) + postBatchSize, mergedWrCount);
+    if (end - st == 0) break;
+    int epId = i % epNum;
+    int batchWrNum = end - st;
+
+    std::string reserveErr;
+    SqReserveFailureKind reserveFailure = SqReserveFailureKind::None;
+    if (!TryReserveSqDepth(eps[epId], batchWrNum, epId, "resolved-batch", &reserveErr,
+                           &reserveFailure)) {
+      AppendHint(&reserveErr, BuildSqDepthHint(eps[epId], epNum, postBatchSize,
+                                               PostSendOpKind::BatchData, reserveFailure));
+      return {StatusCode::ERR_RDMA_OP, reserveErr};
+    }
+
+    size_t mergedSliceSize = 0;
+    for (int j = st; j < end; j++) {
+      mergedWrs[j].wr.wr_id = 0;
+      mergedWrs[j].wr.next = (j + 1 < end) ? &mergedWrs[j + 1].wr : nullptr;
+      mergedSliceSize += mergedWrs[j].mergedSlices;
+    }
+
+    epWrsSinceSignal[epId] += batchWrNum;
+    epMergedSinceSignal[epId] += mergedSliceSize;
+
+    bool isLastBatchForEp = ((i + epNum) >= numPostBatch);
+    bool sqNearFull = eps[epId].sqDepth && (epWrsSinceSignal[epId] >= eps[epId].maxSqDepth);
+    bool needSignal = isLastBatchForEp || sqNearFull;
+
+    ibv_send_wr& last = mergedWrs[end - 1].wr;
+    uint64_t recordId = 0;
+    if (needSignal) {
+      if (!eps[epId].ledger) {
+        ReleaseSqDepth(eps[epId], batchWrNum);
+        return {StatusCode::ERR_RDMA_OP,
+                "submission ledger is not initialized for signaled WR tracking"};
+      }
+      recordId = eps[epId].ledger->Insert(epWrsSinceSignal[epId], true, callbackMeta,
+                                          static_cast<int>(epMergedSinceSignal[epId]));
+      last.wr_id = recordId;
+      last.send_flags = IBV_SEND_SIGNALED;
+    }
+
+    ibv_send_wr* badWr = nullptr;
+    int ret = ibv_post_send(eps[epId].local.ibvHandle.qp, &mergedWrs[st].wr, &badWr);
+    if (ret != 0) {
+      int postedCount = 0;
+      if (badWr != nullptr) {
+        ibv_send_wr* cur = &mergedWrs[st].wr;
+        while (cur != nullptr && cur != badWr && postedCount < batchWrNum) {
+          ++postedCount;
+          cur = cur->next;
+        }
+      }
+      postedCount = std::max(0, std::min(postedCount, batchWrNum));
+      int unpostedCount = batchWrNum - postedCount;
+      if (unpostedCount > 0) {
+        ReleaseSqDepth(eps[epId], unpostedCount);
+        epWrsSinceSignal[epId] = std::max(0, epWrsSinceSignal[epId] - unpostedCount);
+        size_t mergedUnposted = 0;
+        for (int j = st + postedCount; j < end; ++j) mergedUnposted += mergedWrs[j].mergedSlices;
+        epMergedSinceSignal[epId] = epMergedSinceSignal[epId] >= mergedUnposted
+                                        ? epMergedSinceSignal[epId] - mergedUnposted
+                                        : 0;
+      }
+
+      bool lastWasPosted = (postedCount == batchWrNum);
+      if (needSignal && lastWasPosted) {
+        // signaled WR posted; CQ path owns release
+      } else if (needSignal) {
+        int dummy = 0;
+        eps[epId].ledger->ReleaseByCqe(recordId, nullptr, &dummy);
+      }
+
+      if (postedCount > 0 && (!needSignal || !lastWasPosted)) {
+        if (eps[epId].degraded) eps[epId].degraded->store(true, std::memory_order_relaxed);
+        if (eps[epId].ledger)
+          eps[epId].ledger->InsertOrphaned(epWrsSinceSignal[epId], callbackMeta,
+                                           static_cast<int>(epMergedSinceSignal[epId]));
+      }
+
+      for (size_t otherEpId = 0; otherEpId < epNum; ++otherEpId) {
+        if (static_cast<int>(otherEpId) == epId) continue;
+        if (epWrsSinceSignal[otherEpId] <= 0) continue;
+        if (eps[otherEpId].degraded)
+          eps[otherEpId].degraded->store(true, std::memory_order_relaxed);
+        if (eps[otherEpId].ledger)
+          eps[otherEpId].ledger->InsertOrphaned(epWrsSinceSignal[otherEpId], callbackMeta,
+                                                static_cast<int>(epMergedSinceSignal[otherEpId]));
+      }
+
+      std::string message = "ibv_post_send (resolved) failed with " + std::to_string(ret) + ": " +
+                            strerror(ret) + " (posted " + std::to_string(postedCount) + "/" +
+                            std::to_string(batchWrNum) + " WRs)";
+      AppendHint(&message, BuildPostSendFailureHint(ret, eps[epId], epNum, postBatchSize, badWr,
+                                                    PostSendOpKind::BatchData));
+      return {StatusCode::ERR_RDMA_OP, std::move(message)};
+    }
+
+    if (needSignal) {
+      epWrsSinceSignal[epId] = 0;
+      epMergedSinceSignal[epId] = 0;
+    }
+  }
+
   return {StatusCode::IN_PROGRESS, ""};
 }
 

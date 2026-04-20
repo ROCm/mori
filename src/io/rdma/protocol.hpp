@@ -35,6 +35,7 @@ namespace io {
 enum class MessageType : uint8_t {
   RegEndpoint = 0,
   AskMemoryRegion = 1,
+  AskMemoryLayout = 2,
 };
 
 struct MessageHeader {
@@ -47,7 +48,8 @@ struct MessageRegEndpoint {
   TopoKeyPair topo;
   int devId;
   application::RdmaEndpointHandle eph;
-  MSGPACK_DEFINE(ekey, topo, devId, eph);
+  int requestedRemoteDevId{-1};
+  MSGPACK_DEFINE(ekey, topo, devId, eph, requestedRemoteDevId);
 };
 
 struct MessageAskMemoryRegion {
@@ -61,6 +63,30 @@ struct MessageAskMemoryRegion {
 struct MessageBuildConn {
   EngineKey key;
   MSGPACK_DEFINE(key);
+};
+
+struct RdmaRemoteMemoryChunkWire {
+  uint64_t offset;
+  uint64_t addr;
+  uint32_t rkey;
+  uint64_t length;
+  MSGPACK_DEFINE(offset, addr, rkey, length);
+};
+
+struct MessageAskMemoryLayoutRequest {
+  EngineKey ekey;
+  MemoryUniqueId id;
+  MSGPACK_DEFINE(ekey, id);
+};
+
+struct MessageAskMemoryLayoutResponse {
+  EngineKey ekey;
+  MemoryUniqueId id;
+  StatusCode code;
+  std::string message;
+  int rdmaDevId;
+  std::vector<RdmaRemoteMemoryChunkWire> chunks;
+  MSGPACK_DEFINE(ekey, id, code, message, rdmaDevId, chunks);
 };
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -79,6 +105,12 @@ class Protocol {
 
   MessageAskMemoryRegion ReadMessageAskMemoryRegion(size_t len);
   void WriteMessageAskMemoryRegion(const MessageAskMemoryRegion&);
+
+  MessageAskMemoryLayoutRequest ReadMessageAskMemoryLayoutRequest(size_t len);
+  void WriteMessageAskMemoryLayoutRequest(const MessageAskMemoryLayoutRequest&);
+
+  MessageAskMemoryLayoutResponse ReadMessageAskMemoryLayoutResponse(size_t len);
+  void WriteMessageAskMemoryLayoutResponse(const MessageAskMemoryLayoutResponse&);
 
  private:
   application::TCPEndpoint ep;

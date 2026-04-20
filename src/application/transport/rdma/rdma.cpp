@@ -318,6 +318,7 @@ RdmaDeviceContext::RdmaDeviceContext(RdmaDevice* device, ibv_pd* inPd) : device(
 }
 
 RdmaDeviceContext::~RdmaDeviceContext() {
+  std::lock_guard<std::mutex> lock(mrPoolMu_);
   for (auto& it : mrPool) {
     ibv_dereg_mr(it.second);
   }
@@ -343,7 +344,34 @@ application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegion(void* 
   }
   MORI_APP_TRACE("RegisterRdmaMemoryRegion, addr:{}, size:{}, lkey:{}, rkey:{}\n", ptr, size,
                  mr->lkey, mr->rkey);
-  mrPool.insert({ptr, mr});
+  {
+    std::lock_guard<std::mutex> lock(mrPoolMu_);
+    mrPool.insert({ptr, mr});
+  }
+  application::RdmaMemoryRegion handle;
+  handle.addr = reinterpret_cast<uintptr_t>(ptr);
+  handle.lkey = mr->lkey;
+  handle.rkey = mr->rkey;
+  handle.length = mr->length;
+  return handle;
+}
+
+std::optional<application::RdmaMemoryRegion> RdmaDeviceContext::TryRegisterRdmaMemoryRegion(
+    void* ptr, size_t size, int accessFlag) {
+  int effectiveAccessFlag = MaybeAddRelaxedOrderingFlag(accessFlag);
+  ibv_mr* mr = ibv_reg_mr(pd, ptr, size, effectiveAccessFlag);
+  if (!mr) {
+    MORI_APP_ERROR(
+        "TryRegisterRdmaMemoryRegion failed: addr:{}, size:{}, accessFlag:{}, errno:{} ({})", ptr,
+        size, effectiveAccessFlag, errno, strerror(errno));
+    return std::nullopt;
+  }
+  MORI_APP_TRACE("TryRegisterRdmaMemoryRegion, addr:{}, size:{}, lkey:{}, rkey:{}\n", ptr, size,
+                 mr->lkey, mr->rkey);
+  {
+    std::lock_guard<std::mutex> lock(mrPoolMu_);
+    mrPool.insert({ptr, mr});
+  }
   application::RdmaMemoryRegion handle;
   handle.addr = reinterpret_cast<uintptr_t>(ptr);
   handle.lkey = mr->lkey;
@@ -369,7 +397,10 @@ application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionDmabuf(
   MORI_APP_TRACE(
       "RegisterRdmaMemoryRegionDmabuf, addr:{}, size:{}, dmabuf_fd:{}, lkey:{}, rkey:{}\n", ptr,
       size, dmabuf_fd, mr->lkey, mr->rkey);
-  mrPool.insert({ptr, mr});
+  {
+    std::lock_guard<std::mutex> lock(mrPoolMu_);
+    mrPool.insert({ptr, mr});
+  }
   application::RdmaMemoryRegion handle;
   handle.addr = reinterpret_cast<uintptr_t>(ptr);
   handle.lkey = mr->lkey;
@@ -379,10 +410,11 @@ application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionDmabuf(
 }
 
 void RdmaDeviceContext::DeregisterRdmaMemoryRegion(void* ptr) {
-  if (mrPool.find(ptr) == mrPool.end()) return;
-  ibv_mr* mr = mrPool[ptr];
-  ibv_dereg_mr(mr);
-  mrPool.erase(ptr);
+  std::lock_guard<std::mutex> lock(mrPoolMu_);
+  auto it = mrPool.find(ptr);
+  if (it == mrPool.end()) return;
+  ibv_dereg_mr(it->second);
+  mrPool.erase(it);
 }
 
 ibv_srq* RdmaDeviceContext::CreateRdmaSrqIfNx(const RdmaEndpointConfig& config) {

@@ -76,5 +76,35 @@ void Protocol::WriteMessageAskMemoryRegion(const MessageAskMemoryRegion& msg) {
   SYSCALL_RETURN_ZERO(ep.Send(buf.data(), buf.size()));
 }
 
+MessageAskMemoryLayoutRequest Protocol::ReadMessageAskMemoryLayoutRequest(size_t len) {
+  std::vector<char> buf(len);
+  SYSCALL_RETURN_ZERO(ep.Recv(buf.data(), len));
+  auto out = msgpack::unpack(buf.data(), len);
+  return out.get().as<MessageAskMemoryLayoutRequest>();
+}
+
+void Protocol::WriteMessageAskMemoryLayoutRequest(const MessageAskMemoryLayoutRequest& msg) {
+  msgpack::sbuffer buf;
+  msgpack::pack(buf, msg);
+  uint32_t len = static_cast<uint32_t>(buf.size());
+  WriteMessageHeader({MessageType::AskMemoryLayout, len});
+  SYSCALL_RETURN_ZERO(ep.Send(buf.data(), buf.size()));
+}
+
+MessageAskMemoryLayoutResponse Protocol::ReadMessageAskMemoryLayoutResponse(size_t len) {
+  std::vector<char> buf(len);
+  SYSCALL_RETURN_ZERO(ep.Recv(buf.data(), len));
+  auto out = msgpack::unpack(buf.data(), len);
+  return out.get().as<MessageAskMemoryLayoutResponse>();
+}
+
+void Protocol::WriteMessageAskMemoryLayoutResponse(const MessageAskMemoryLayoutResponse& msg) {
+  msgpack::sbuffer buf;
+  msgpack::pack(buf, msg);
+  uint32_t len = static_cast<uint32_t>(buf.size());
+  WriteMessageHeader({MessageType::AskMemoryLayout, len});
+  SYSCALL_RETURN_ZERO(ep.Send(buf.data(), buf.size()));
+}
+
 }  // namespace io
 }  // namespace mori
