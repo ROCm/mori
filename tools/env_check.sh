@@ -12,6 +12,8 @@ LAT_MSG_SIZE=2      # bytes (small message for latency)
 LAT_ITERS=5000      # iterations for latency test
 TEST_DURATION=2     # seconds
 IB_PORT=18515       # base port for ib_write_bw / ib_write_lat
+MORI_RDMA_SL=0      # overwritten by check_qos()
+MORI_RDMA_TC=0      # overwritten by check_qos()
 
 # ============================ helpers ===========================
 
@@ -155,7 +157,7 @@ check_versions() {
 }
 
 check_qos() {
-    step "check QoS"
+    step "check QoS and derive SL/TC"
 
     local qos_output
     qos_output=$(nicctl show qos)
@@ -167,42 +169,40 @@ check_qos() {
     log_ok "classification type : DSCP"
 
     # no-drop priority
-    ND_PRIO=$(echo "$qos_output" | grep "PFC no-drop priorities" | head -1 | awk '{print $NF}')
-    [[ -n "$ND_PRIO" ]] || die "cannot find PFC no-drop priority"
-    log_ok "no-drop priority : $ND_PRIO"
+    local nd_prio
+    nd_prio=$(echo "$qos_output" | grep "PFC no-drop priorities" | head -1 | awk '{print $NF}')
+    [[ -n "$nd_prio" ]] || die "cannot find PFC no-drop priority"
+    log_ok "no-drop priority : $nd_prio"
 
     # PFC bitmap
     local pfc_bitmap
     pfc_bitmap=$(echo "$qos_output" | grep "PFC priority bitmap" | head -1 | awk '{print $NF}')
     [[ -n "$pfc_bitmap" && "$pfc_bitmap" != "0x0" ]] || die "PFC is not enabled (bitmap=$pfc_bitmap)"
-    (( pfc_bitmap & (1 << ND_PRIO) )) || die "PFC bitmap $pfc_bitmap does not cover priority $ND_PRIO"
-    log_ok "PFC enabled for priority $ND_PRIO (bitmap=$pfc_bitmap)"
+    (( pfc_bitmap & (1 << nd_prio) )) || die "PFC bitmap $pfc_bitmap does not cover priority $nd_prio"
+    log_ok "PFC enabled for priority $nd_prio (bitmap=$pfc_bitmap)"
 
     # scheduling info
     local sched_line
-    sched_line=$(echo "$qos_output" | grep -E "^\s+${ND_PRIO}\s+" | head -1)
+    sched_line=$(echo "$qos_output" | grep -E "^\s+${nd_prio}\s+" | head -1)
     if [[ -n "$sched_line" ]]; then
-        log_ok "scheduling for priority $ND_PRIO : $(echo "$sched_line" | awk '{print $2}')  bandwidth=$(echo "$sched_line" | awk '{print $3}')"
+        log_ok "scheduling for priority $nd_prio : $(echo "$sched_line" | awk '{print $2}')  bw=$(echo "$sched_line" | awk '{print $3}')"
     else
-        log_warn "cannot find scheduling info for priority $ND_PRIO"
+        log_warn "cannot find scheduling info for priority $nd_prio"
     fi
 
     # DSCP -> traffic class
-    # example line: "    DSCP : 24, 26, 46 ==> priority : 0"
-    local dscp_line nd_dscp tc
-    dscp_line=$(echo "$qos_output" | grep "DSCP" | grep "==>" | grep -v "bitmap" | grep ": ${ND_PRIO}$" | head -1)
+    local dscp_line nd_dscp
+    dscp_line=$(echo "$qos_output" | grep "DSCP" | grep "==>" | grep -v "bitmap" | grep ": ${nd_prio}$" | head -1)
     nd_dscp=$(echo "$dscp_line" | awk -F': ' '{print $2}' | grep -o '[0-9]*' | head -1)
-    [[ -n "$nd_dscp" ]] || die "cannot find DSCP mapped to no-drop priority $ND_PRIO"
+    [[ -n "$nd_dscp" ]] || die "cannot find DSCP mapped to no-drop priority $nd_prio"
 
-    # TC = DSCP << 2 (DSCP sits in the upper 6 bits of the 8-bit TC field)
-    tc=$(( nd_dscp * 4 ))
-
-    export MORI_RDMA_SL=$ND_PRIO
-    export MORI_RDMA_TC=$tc
+    # TC = DSCP << 2 (DSCP occupies the upper 6 bits of the 8-bit TC/TOS field)
+    MORI_RDMA_SL="$nd_prio"
+    MORI_RDMA_TC=$(( nd_dscp * 4 ))
 
     log_ok "no-drop DSCP     : $nd_dscp"
-    log_ok "traffic class    : $tc"
-    log_ok "MORI_RDMA_SL=$MORI_RDMA_SL  MORI_RDMA_TC=$MORI_RDMA_TC"
+    log_ok "traffic class    : $MORI_RDMA_TC"
+    log_ok "SL=$MORI_RDMA_SL  TC=$MORI_RDMA_TC"
 }
 
 check_dcqcn() {
