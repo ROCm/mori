@@ -190,6 +190,7 @@ jobs:
         include:
           - platform: MI355X_AINIC
             runner: [self-hosted, MI355X-AINIC]
+            rdma_devices: rocep105s0,rocep121s0,rocep137s0,rocep153s0,rocep233s0,rocep249s0,rocep25s0,rocep9s0
     timeout-minutes: 90
     steps:
       - name: Checkout
@@ -199,7 +200,7 @@ jobs:
 
       - name: Build JAX CI image
         run: |
-          $CT build --network=host \
+          $CT build --network=host --isolation=chroot \
             --build-arg GPU_TARGET=gfx950 \
             -t rocm/mori:jax-ci \
             -f docker/Dockerfile.jax091-rocm711 .
@@ -208,6 +209,7 @@ jobs:
         run: |
           $CT rm -f ${CONTAINER}_jax 2>/dev/null || true
           CONTAINER_RUNTIME=$CT ./docker/ci_run.sh --name ${CONTAINER}_jax \
+            -e MORI_RDMA_DEVICES=${{ matrix.rdma_devices }} \
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
             -w $GITHUB_WORKSPACE \
             rocm/mori:jax-ci sleep infinity
@@ -221,7 +223,7 @@ jobs:
         run: |
           $CT exec ${CONTAINER}_jax bash -c "
             cd $GITHUB_WORKSPACE
-            MORI_KERNEL_DIR=\$(ls -d $GITHUB_WORKSPACE/build/lib/gfx* | head -1) \
+            MORI_KERNEL_DIR=\$(ls -d $GITHUB_WORKSPACE/build/lib/gfx*_ionic 2>/dev/null | head -1) \
             timeout 300 pytest tests/python/ops/test_dispatch_combine_jax.py -s -v
           "
 
