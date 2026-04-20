@@ -34,7 +34,11 @@ namespace mori::umbp {
 namespace {
 
 constexpr uint64_t GB = 1024ULL * 1024 * 1024;
-constexpr uint64_t BLOCK_SIZE = 4096;
+// Phase 1 page-bitmap allocator default page_size is 2 MiB; FinalizeAllocation
+// now requires the caller to send back the canonical page-string location_id
+// returned by AllocateForPut.  The allocator rounds size up to whole pages,
+// so any size in (0, 2 MiB] reserves exactly 1 page.
+constexpr uint64_t BLOCK_SIZE = 2ULL * 1024 * 1024;  // 1 page
 
 Location MakeLocation(const std::string& node_id, const std::string& location_id, uint64_t size,
                       TierType tier) {
@@ -56,7 +60,7 @@ class FinalizeIdempotencyTest : public ::testing::Test {
   void SetUp() override {
     index_.SetClientRegistry(&registry_);
     registry_.RegisterClient("node-a", "addr-a", MakeTierCapacities(80 * GB, 40 * GB), "peer-a", {},
-                             {}, {80 * GB});
+                             {}, {}, {80 * GB});
   }
 
   GlobalBlockIndex index_;
@@ -67,9 +71,7 @@ TEST_F(FinalizeIdempotencyTest, ConsistentReplay) {
   auto alloc = registry_.AllocateForPut("node-a", TierType::HBM, BLOCK_SIZE);
   ASSERT_TRUE(alloc.has_value());
 
-  std::string loc_id =
-      std::to_string(alloc->buffer_index) + ":" + std::to_string(alloc->allocated_offset);
-  Location loc = MakeLocation("node-a", loc_id, BLOCK_SIZE, TierType::HBM);
+  Location loc = MakeLocation("node-a", alloc->location_id, BLOCK_SIZE, TierType::HBM);
 
   EXPECT_TRUE(registry_.FinalizeAllocation("node-a", "key-1", loc, alloc->allocation_id));
   EXPECT_TRUE(registry_.FinalizeAllocation("node-a", "key-1", loc, alloc->allocation_id));
@@ -79,9 +81,7 @@ TEST_F(FinalizeIdempotencyTest, InconsistentReplay) {
   auto alloc = registry_.AllocateForPut("node-a", TierType::HBM, BLOCK_SIZE);
   ASSERT_TRUE(alloc.has_value());
 
-  std::string loc_id =
-      std::to_string(alloc->buffer_index) + ":" + std::to_string(alloc->allocated_offset);
-  Location loc = MakeLocation("node-a", loc_id, BLOCK_SIZE, TierType::HBM);
+  Location loc = MakeLocation("node-a", alloc->location_id, BLOCK_SIZE, TierType::HBM);
 
   EXPECT_TRUE(registry_.FinalizeAllocation("node-a", "key-1", loc, alloc->allocation_id));
   EXPECT_FALSE(registry_.FinalizeAllocation("node-a", "key-DIFFERENT", loc, alloc->allocation_id));
@@ -91,13 +91,12 @@ TEST_F(FinalizeIdempotencyTest, InconsistentLocation) {
   auto alloc = registry_.AllocateForPut("node-a", TierType::HBM, BLOCK_SIZE);
   ASSERT_TRUE(alloc.has_value());
 
-  std::string loc_id =
-      std::to_string(alloc->buffer_index) + ":" + std::to_string(alloc->allocated_offset);
-  Location loc = MakeLocation("node-a", loc_id, BLOCK_SIZE, TierType::HBM);
+  Location loc = MakeLocation("node-a", alloc->location_id, BLOCK_SIZE, TierType::HBM);
 
   EXPECT_TRUE(registry_.FinalizeAllocation("node-a", "key-1", loc, alloc->allocation_id));
 
-  Location different_loc = MakeLocation("node-a", "99:99999", BLOCK_SIZE, TierType::HBM);
+  // Different location_id (canonical page format) than the one returned.
+  Location different_loc = MakeLocation("node-a", "99:p99", BLOCK_SIZE, TierType::HBM);
   EXPECT_FALSE(
       registry_.FinalizeAllocation("node-a", "key-1", different_loc, alloc->allocation_id));
 }
@@ -106,22 +105,20 @@ TEST_F(FinalizeIdempotencyTest, LocationValidation) {
   auto alloc = registry_.AllocateForPut("node-a", TierType::HBM, BLOCK_SIZE);
   ASSERT_TRUE(alloc.has_value());
 
-  Location wrong_loc = MakeLocation("node-a", "999:999999", BLOCK_SIZE, TierType::HBM);
+  Location wrong_loc = MakeLocation("node-a", "999:p999", BLOCK_SIZE, TierType::HBM);
   EXPECT_FALSE(registry_.FinalizeAllocation("node-a", "key-1", wrong_loc, alloc->allocation_id));
 }
 
 TEST_F(FinalizeIdempotencyTest, CrossNodeFinalize) {
   registry_.RegisterClient("node-b", "addr-b", MakeTierCapacities(80 * GB, 40 * GB), "peer-b", {},
-                           {}, {80 * GB});
+                           {}, {}, {80 * GB});
 
   auto router = std::make_unique<Router>(index_, registry_);
   auto result = router->RoutePut("key-cross", "node-a", BLOCK_SIZE);
   ASSERT_TRUE(result.has_value());
 
   std::string target_node = result->node_id;
-  std::string loc_id =
-      std::to_string(result->buffer_index) + ":" + std::to_string(result->allocated_offset);
-  Location loc = MakeLocation(target_node, loc_id, BLOCK_SIZE, TierType::HBM);
+  Location loc = MakeLocation(target_node, result->location_id, BLOCK_SIZE, TierType::HBM);
 
   EXPECT_TRUE(registry_.FinalizeAllocation(target_node, "key-cross", loc, result->allocation_id));
 
@@ -134,9 +131,7 @@ TEST_F(FinalizeIdempotencyTest, DepthWrittenToIndex) {
   auto alloc = registry_.AllocateForPut("node-a", TierType::HBM, BLOCK_SIZE);
   ASSERT_TRUE(alloc.has_value());
 
-  std::string loc_id =
-      std::to_string(alloc->buffer_index) + ":" + std::to_string(alloc->allocated_offset);
-  Location loc = MakeLocation("node-a", loc_id, BLOCK_SIZE, TierType::HBM);
+  Location loc = MakeLocation("node-a", alloc->location_id, BLOCK_SIZE, TierType::HBM);
 
   ASSERT_TRUE(registry_.FinalizeAllocation("node-a", "depth-key", loc, alloc->allocation_id));
 

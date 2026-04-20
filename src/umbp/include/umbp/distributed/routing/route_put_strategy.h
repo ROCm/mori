@@ -30,7 +30,22 @@
 
 namespace mori::umbp {
 
-/// Result returned by RoutePutStrategy::Select.
+/// Result returned by RoutePutStrategy::Select and the Router::RoutePut path.
+///
+/// The strategy fills in only the placement-related fields (node_id,
+/// node_address, tier) — Router::RoutePut then drives ClientRegistry
+/// .AllocateForPut to populate everything below the divider.
+///
+/// DRAM/HBM layout under the new page-bitmap allocator:
+///   `location_id`         canonical "0:p3,4;1:p0" string for this Put
+///   `pages`               structured form of the same page set
+///   `dram_memory_descs`   deduplicated MemoryDesc bytes for every distinct
+///                         buffer_index referenced by `pages`
+///   `page_size`           page size of the source allocator (bytes)
+///
+/// SSD layout (legacy capacity-only allocator):
+///   The above DRAM/HBM fields are left empty / zero.  Allocation_id is
+///   still set, and ssd_store_index identifies which SSD store was reserved.
 struct RoutePutResult {
   std::string node_id;
   std::string node_address;
@@ -38,10 +53,16 @@ struct RoutePutResult {
 
   std::string peer_address;
   std::vector<uint8_t> engine_desc_bytes;
-  std::vector<uint8_t> dram_memory_desc_bytes;
-  uint64_t allocated_offset = 0;
-  uint32_t buffer_index = 0;
   std::string allocation_id;
+
+  // DRAM/HBM only.
+  std::string location_id;
+  std::vector<PageLocation> pages;
+  std::vector<BufferMemoryDescBytes> dram_memory_descs;
+  uint64_t page_size = 0;
+
+  // SSD only.
+  uint32_t ssd_store_index = 0;
 };
 
 /// Abstract interface for RoutePut node placement.
