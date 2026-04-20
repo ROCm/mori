@@ -25,6 +25,7 @@
 
 #include <stdexcept>
 
+#include "mori/io/engine.hpp"
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/config.h"
 #include "umbp/distributed/config.h"

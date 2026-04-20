@@ -60,6 +60,9 @@ class ExternalKvBlockIndex {
   // Return per-node matches across all queried hashes.
   std::vector<NodeMatch> Match(const std::vector<std::string>& hashes) const;
 
+  // Return the number of live KV blocks registered for a node.
+  size_t GetKvCount(const std::string& node_id) const;
+
  private:
   // hash -> (node_id -> tier)
   mutable std::shared_mutex mutex_;

@@ -95,4 +95,15 @@ std::vector<ExternalKvBlockIndex::NodeMatch> ExternalKvBlockIndex::Match(
   return result;
 }
 
+size_t ExternalKvBlockIndex::GetKvCount(const std::string& node_id) const {
+  std::shared_lock lock(mutex_);
+  size_t count = 0;
+  for (const auto& [hash, nodes] : entries_) {
+    if (nodes.count(node_id)) {
+      ++count;
+    }
+  }
+  return count;
+}
+
 }  // namespace mori::umbp

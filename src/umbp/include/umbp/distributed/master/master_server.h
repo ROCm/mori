@@ -24,6 +24,7 @@
 #include <memory>
 #include <string>
 
+#include "mori/metrics/prometheus_metrics_server.hpp"
 #include "umbp/distributed/config.h"
 #include "umbp/distributed/master/client_registry.h"
 #include "umbp/distributed/master/eviction_manager.h"
@@ -57,6 +58,7 @@ class MasterServer {
   ClientRegistry registry_;
   Router router_;
 
+  std::unique_ptr<mori::metrics::MetricsServer> metrics_server_;
   std::unique_ptr<grpc_impl::Server> server_;
 
   class UMBPMasterServiceImpl;

@@ -1,0 +1,13 @@
+# Grafana dashboard provisioning fragment for mori/UMBP.
+# Drop this file into /etc/grafana/provisioning/dashboards/ and
+# mount mori/monitoring/grafana/dashboards/ to the path below.
+apiVersion: 1
+
+providers:
+  - name: mori
+    folder: UMBP
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards/mori
