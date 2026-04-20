@@ -39,12 +39,14 @@ Usage::
 
 from mori.ir.ops import MORI_DEVICE_FUNCTIONS, SIGNAL_SET, SIGNAL_ADD
 
+
 # ExternFunction is provided by FlyDSL (Part B).
 # We use a lazy import so mori.ir.flydsl can be imported without FlyDSL installed;
 # ExternFunction is only needed when building a @flyc.kernel.
 def _get_extern_cls():
     try:
         from flydsl.expr.extern import ExternFunction
+
         return ExternFunction
     except ImportError as e:
         raise ImportError(
@@ -59,10 +61,10 @@ def _build_all():
     ns = {}
     for name, meta in MORI_DEVICE_FUNCTIONS.items():
         ns[name] = ExternFunction(
-            symbol    = meta["symbol"],
-            arg_types = meta["args"],
-            ret_type  = meta["ret"],
-            is_pure   = meta.get("pure", False),
+            symbol=meta["symbol"],
+            arg_types=meta["args"],
+            ret_type=meta["ret"],
+            is_pure=meta.get("pure", False),
         )
     return ns
 
