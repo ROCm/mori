@@ -504,7 +504,8 @@ if __name__ == "__main__":
 | `MORI_SHMEM_HEAP_SIZE` | — | Symmetric heap size (e.g., `"6G"`, `"2G"`). Must be set before shmem init. |
 | `MORI_RDMA_DEVICES` | all available | RDMA NIC selection. Include: `mlx5_0,mlx5_1`. Exclude: `^mlx5_2,mlx5_3` |
 | `MORI_EP_LAUNCH_CONFIG_MODE` | `"MANUAL"` | Launch config mode: `"MANUAL"` or `"AUTO"` |
-| `GLOO_SOCKET_IFNAME` | — | TCP interface for torch distributed (e.g., `ens14np0`) |
+| `ENABLE_PROFILER` | `""` (disabled) | Enable kernel profiler for JIT-compiled kernels. Set to `ON`, `1`, `true`, or `yes` to enable. Must also build with `ENABLE_PROFILER=ON`. |
+| `GLOO_SOCKET_IFNAME` | — | TCP interface for torch distributed (e.g., `enp81s0f1`) |
 | `MASTER_ADDR` | — | Torch distributed master address |
 | `MASTER_PORT` | — | Torch distributed master port |
 
@@ -524,10 +525,10 @@ python3 tests/python/ops/bench_dispatch_combine.py
 Run on each node (replace `node_rank` and `master_addr`):
 
 ```bash
-export GLOO_SOCKET_IFNAME=ens14np0
+export GLOO_SOCKET_IFNAME=enp81s0f1
 export MORI_RDMA_DEVICES=^mlx5_0,mlx5_1  # Optional: exclude specific NICs
 
-torchrun --nnodes=2 --node_rank=0 --nproc_per_node=8 \
+torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
     --master_addr="10.194.129.65" --master_port=1234 \
     examples/ops/dispatch_combine/test_dispatch_combine_internode.py --bench
 ```
