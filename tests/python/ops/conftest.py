@@ -22,14 +22,15 @@
 import os
 
 import pytest
-from tests.python.ops.dispatch_combine_test_utils import (
-    start_torch_dist_process_manager,
-)
 
 
 @pytest.fixture(scope="session")
 def torch_dist_process_manager():
     """Single shared worker pool for all ops tests."""
+    from tests.python.ops.dispatch_combine_test_utils import (
+        start_torch_dist_process_manager,
+    )
+
     manager = start_torch_dist_process_manager(world_size=8)
     yield manager
     manager.shutdown()

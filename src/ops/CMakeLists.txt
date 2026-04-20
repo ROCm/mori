@@ -40,7 +40,8 @@ if(BUILD_OPS_DEVICE)
 
   set(_extra_defs "")
   if(ENABLE_PROFILER)
-    list(APPEND _extra_defs "-DENABLE_PROFILER")
+    list(APPEND _extra_defs "-DENABLE_PROFILER"
+         "-I${CMAKE_BINARY_DIR}/generated/include")
   endif()
   if(ENABLE_STANDARD_MOE_ADAPT)
     list(APPEND _extra_defs "-DENABLE_STANDARD_MOE_ADAPT")
@@ -86,6 +87,9 @@ if(BUILD_OPS_DEVICE)
   endforeach()
 
   add_custom_target(mori_ops_kernels ALL DEPENDS ${_all_hsaco_outputs})
+  if(ENABLE_PROFILER)
+    add_dependencies(mori_ops_kernels generate_profiler_bindings)
+  endif()
   add_dependencies(mori_ops mori_ops_kernels)
 
   install(FILES ${_all_hsaco_outputs} DESTINATION "lib/${_arch_nic}")

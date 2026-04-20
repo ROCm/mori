@@ -182,17 +182,21 @@ def _ensure_generated_include(mori_root: Path) -> Path:
     Always runs the generator (which is idempotent via write_if_changed) so that
     profiler slot changes in source are picked up without invalidating the JIT cache.
     Returns ``<cache_root>/generated/include/``, which must be passed as ``-I`` to hipcc.
+
+    Raises FileNotFoundError if the generator script is not present (e.g. wheel
+    install without the full source tree) — ENABLE_PROFILER requires the source tree.
     """
     gen_script = mori_root / "tools" / "profiler" / "generate_profiler_bindings.py"
+
+    out_include = get_cache_root() / "generated" / "include"
+    profiler_include_dir = out_include / "mori" / "profiler"
+    pybind_out = get_cache_root() / "generated" / "profiler_bindings.cpp"
+
     if not gen_script.is_file():
         raise FileNotFoundError(
             f"Profiler binding generator not found: {gen_script}\n"
             "JIT compilation with ENABLE_PROFILER requires the mori source tree."
         )
-
-    out_include = get_cache_root() / "generated" / "include"
-    profiler_include_dir = out_include / "mori" / "profiler"
-    pybind_out = get_cache_root() / "generated" / "profiler_bindings.cpp"
 
     subprocess.check_call(
         [
@@ -223,11 +227,11 @@ def _collect_include_dirs(mori_root: Path) -> list[Path]:
     if mpi_inc:
         dirs.append(Path(mpi_inc))
 
-    # Generate profiler slot headers JIT into the cache (idempotent, fast).
-    # Always included: kernel sources unconditionally include mori/profiler/profiler.hpp
-    # which lives in the generated dir. The headers have #ifdef ENABLE_PROFILER guards
-    # so they are safe to include even when profiler is disabled.
-    dirs.append(_ensure_generated_include(mori_root))
+    # Profiler slot headers are only needed when ENABLE_PROFILER is set;
+    # kernel sources wrap profiler calls with IF_ENABLE_PROFILER() so the
+    # generated header is not required when profiling is disabled.
+    if is_profiler_enabled():
+        dirs.append(_ensure_generated_include(mori_root))
 
     return dirs
 
