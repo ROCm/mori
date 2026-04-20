@@ -271,13 +271,21 @@ def _copy_jit_sources(root_dir: Path) -> None:
 
 
 _3RDPARTY_DIRS = ["3rdparty/spdlog", "3rdparty/msgpack-c"]
+_3RDPARTY_DIRS_UMBP = ["3rdparty/spdk"]
 
 
-def _ensure_3rdparty(root_dir: Path) -> None:
-    """Ensure 3rdparty submodule directories exist via git submodule update."""
+def _ensure_3rdparty(root_dir: Path, extra_dirs: list[str] | None = None) -> None:
+    """Ensure 3rdparty submodule directories exist via git submodule update.
+
+    Only the submodules in *required_dirs* are initialised.  Pass extra_dirs to
+    opt-in to optional submodules (e.g. ``_3RDPARTY_DIRS_UMBP`` when
+    BUILD_UMBP=ON).  SPDK is intentionally excluded from the default set
+    because it is large and only needed for UMBP builds.
+    """
+    required_dirs = _3RDPARTY_DIRS + (extra_dirs or [])
     missing = [
         d
-        for d in _3RDPARTY_DIRS
+        for d in required_dirs
         if not (root_dir / d).is_dir() or not any((root_dir / d).iterdir())
     ]
     if not missing:
@@ -293,14 +301,14 @@ def _ensure_3rdparty(root_dir: Path) -> None:
             stderr=subprocess.DEVNULL,
         )
         subprocess.check_call(
-            ["git", "submodule", "update", "--init", "--recursive"],
+            ["git", "submodule", "update", "--init", "--recursive"] + missing,
             cwd=str(root_dir),
             stdout=subprocess.DEVNULL,
         )
     except (subprocess.CalledProcessError, FileNotFoundError):
         pass
 
-    still_missing = [d for d in _3RDPARTY_DIRS if not any((root_dir / d).iterdir())]
+    still_missing = [d for d in required_dirs if not any((root_dir / d).iterdir())]
     if still_missing:
         raise RuntimeError(
             f"Missing 3rdparty dependencies: {still_missing}. "
@@ -332,7 +340,8 @@ class CMakeBuild(build_ext):
 
         root_dir = Path(__file__).parent
 
-        _ensure_3rdparty(root_dir)
+        extra = _3RDPARTY_DIRS_UMBP if _env_flag("BUILD_UMBP", "OFF") else []
+        _ensure_3rdparty(root_dir, extra_dirs=extra)
         build_dir = root_dir / os.environ.get("MORI_PYBUILD_DIR", "build")
         build_dir.mkdir(parents=True, exist_ok=True)
 
