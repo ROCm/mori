@@ -153,56 +153,59 @@ add_library(mori_logging INTERFACE)
 target_include_directories(mori_logging INTERFACE include)
 target_link_libraries(mori_logging INTERFACE spdlog::spdlog)
 
-if(ENABLE_PROFILER)
-  find_package(
-    Python3
-    COMPONENTS Interpreter
-    REQUIRED)
+# ---------------------------------------------------------------------------
+# Profiler slot header generation (always needed — kernel sources
+# unconditionally #include "mori/profiler/profiler.hpp"; the generated
+# headers use #ifdef ENABLE_PROFILER guards so they are safe when OFF)
+# ---------------------------------------------------------------------------
+find_package(
+  Python3
+  COMPONENTS Interpreter
+  REQUIRED)
 
-  set(PROFILER_GEN_SCRIPT
-      ${CMAKE_SOURCE_DIR}/tools/profiler/generate_profiler_bindings.py)
-  set(PROFILER_OUTPUT_INCLUDE
-      ${CMAKE_BINARY_DIR}/generated/include/mori/profiler)
-  set(PROFILER_OUTPUT_PYBIND
-      ${CMAKE_BINARY_DIR}/generated/src/pybind/profiler_bindings_generated.cpp)
+set(PROFILER_GEN_SCRIPT
+    ${CMAKE_SOURCE_DIR}/tools/profiler/generate_profiler_bindings.py)
+set(PROFILER_OUTPUT_INCLUDE
+    ${CMAKE_BINARY_DIR}/generated/include/mori/profiler)
+set(PROFILER_OUTPUT_PYBIND
+    ${CMAKE_BINARY_DIR}/generated/src/pybind/profiler_bindings_generated.cpp)
 
-  file(GLOB_RECURSE KERNEL_SOURCES ${CMAKE_SOURCE_DIR}/src/ops/*.cpp)
+file(GLOB_RECURSE KERNEL_SOURCES ${CMAKE_SOURCE_DIR}/src/ops/*.cpp)
 
-  message(STATUS "Generating profiler bindings at configure time...")
-  execute_process(
-    COMMAND
-      ${Python3_EXECUTABLE} ${PROFILER_GEN_SCRIPT} ${CMAKE_SOURCE_DIR}
-      ${CMAKE_SOURCE_DIR}/src ${PROFILER_OUTPUT_INCLUDE}
-      ${PROFILER_OUTPUT_PYBIND}
-    RESULT_VARIABLE PROFILER_GEN_RESULT
-    OUTPUT_VARIABLE PROFILER_GEN_OUTPUT
-    ERROR_VARIABLE PROFILER_GEN_ERROR)
+message(STATUS "Generating profiler slot headers at configure time...")
+execute_process(
+  COMMAND
+    ${Python3_EXECUTABLE} ${PROFILER_GEN_SCRIPT} ${CMAKE_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/src ${PROFILER_OUTPUT_INCLUDE}
+    ${PROFILER_OUTPUT_PYBIND}
+  RESULT_VARIABLE PROFILER_GEN_RESULT
+  OUTPUT_VARIABLE PROFILER_GEN_OUTPUT
+  ERROR_VARIABLE PROFILER_GEN_ERROR)
 
-  if(NOT PROFILER_GEN_RESULT EQUAL 0)
-    message(
-      FATAL_ERROR
-        "Failed to generate profiler bindings:\nSTDOUT:\n${PROFILER_GEN_OUTPUT}\nSTDERR:\n${PROFILER_GEN_ERROR}"
-    )
-  endif()
-
-  add_custom_command(
-    OUTPUT ${PROFILER_OUTPUT_PYBIND}
-    COMMAND
-      ${Python3_EXECUTABLE} ${PROFILER_GEN_SCRIPT} ${CMAKE_SOURCE_DIR}
-      ${CMAKE_SOURCE_DIR}/src ${PROFILER_OUTPUT_INCLUDE}
-      ${PROFILER_OUTPUT_PYBIND}
-    DEPENDS ${KERNEL_SOURCES} ${PROFILER_GEN_SCRIPT}
-    COMMENT "Regenerating profiler bindings..."
-    VERBATIM)
-
-  add_custom_target(generate_profiler_bindings
-                    DEPENDS ${PROFILER_OUTPUT_PYBIND})
-
-  add_library(mori_profiler_interface INTERFACE)
-  target_include_directories(mori_profiler_interface
-                             INTERFACE ${CMAKE_BINARY_DIR}/generated/include)
-  add_dependencies(mori_profiler_interface generate_profiler_bindings)
+if(NOT PROFILER_GEN_RESULT EQUAL 0)
+  message(
+    FATAL_ERROR
+      "Failed to generate profiler bindings:\nSTDOUT:\n${PROFILER_GEN_OUTPUT}\nSTDERR:\n${PROFILER_GEN_ERROR}"
+  )
 endif()
+
+add_custom_command(
+  OUTPUT ${PROFILER_OUTPUT_PYBIND}
+  COMMAND
+    ${Python3_EXECUTABLE} ${PROFILER_GEN_SCRIPT} ${CMAKE_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/src ${PROFILER_OUTPUT_INCLUDE}
+    ${PROFILER_OUTPUT_PYBIND}
+  DEPENDS ${KERNEL_SOURCES} ${PROFILER_GEN_SCRIPT}
+  COMMENT "Regenerating profiler bindings..."
+  VERBATIM)
+
+add_custom_target(generate_profiler_bindings
+                  DEPENDS ${PROFILER_OUTPUT_PYBIND})
+
+add_library(mori_profiler_interface INTERFACE)
+target_include_directories(mori_profiler_interface
+                           INTERFACE ${CMAKE_BINARY_DIR}/generated/include)
+add_dependencies(mori_profiler_interface generate_profiler_bindings)
 
 if(BUILD_EXAMPLES)
   set(BUILD_APPLICATION ON)
