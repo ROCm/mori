@@ -94,7 +94,7 @@ jobs:
       - name: Install mori
         run: |
           $CT exec $CONTAINER bash -c \
-            "cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install -e . && pip install prettytable"
+            "cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install . && pip install prettytable"
 
       - name: MORI-EP (intranode)
         run: |
@@ -180,52 +180,54 @@ jobs:
           $CT exec $CONTAINER chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
           $CT rm -f $CONTAINER || true
 
-  # TODO: add JAX intranode test once conftest.py torch dependency is resolved
-  # and gfx950 JAX image is available.
-  # jax-intranode-test:
-  #   name: mori JAX intranode test (${{ matrix.platform }})
-  #   needs: build
-  #   runs-on: ${{ matrix.runner }}
-  #   strategy:
-  #     fail-fast: false
-  #     matrix:
-  #       include:
-  #         - platform: MI355X_AINIC
-  #           runner: [self-hosted, MI355X-AINIC]
-  #   timeout-minutes: 15
-  #   steps:
-  #     - name: Checkout
-  #       uses: actions/checkout@v4
-  #       with:
-  #         submodules: true
-  #
-  #     - name: Build JAX CI image
-  #       run: $CT build --network=host --build-arg GPU_TARGET=gfx950 -t rocm/mori:jax-ci -f docker/Dockerfile.jax091-rocm711 .
-  #
-  #     - name: Start container
-  #       run: |
-  #         $CT rm -f ${CONTAINER}_jax 2>/dev/null || true
-  #         CONTAINER_RUNTIME=$CT ./docker/ci_run.sh --name ${CONTAINER}_jax \
-  #           -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
-  #           -w $GITHUB_WORKSPACE \
-  #           rocm/mori:jax-ci sleep infinity
-  #
-  #     - name: Install mori (XLA FFI)
-  #       run: |
-  #         $CT exec ${CONTAINER}_jax bash -c \
-  #           "cd $GITHUB_WORKSPACE && BUILD_XLA_FFI_OPS=ON pip install --break-system-packages -v ."
-  #
-  #     - name: MORI-EP JAX test
-  #       run: |
-  #         $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE ${CONTAINER}_jax bash -c "
-  #           cd $GITHUB_WORKSPACE
-  #           MORI_KERNEL_DIR=\$(ls -d $GITHUB_WORKSPACE/build/lib/gfx* | head -1) \
-  #           timeout 300 pytest tests/python/ops/test_dispatch_combine_jax.py -s -v
-  #         "
-  #
-  #     - name: Cleanup
-  #       if: always()
-  #       run: $CT rm -f ${CONTAINER}_jax || true
+  jax-intranode-test:
+    name: mori JAX intranode test (${{ matrix.platform }})
+    needs: build
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: MI355X_AINIC
+            runner: [self-hosted, MI355X-AINIC]
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Build JAX CI image
+        run: |
+          $CT build --network=host \
+            --build-arg GPU_TARGET=gfx950 \
+            -t rocm/mori:jax-ci \
+            -f docker/Dockerfile.jax091-rocm711 .
+
+      - name: Start container
+        run: |
+          $CT rm -f ${CONTAINER}_jax 2>/dev/null || true
+          CONTAINER_RUNTIME=$CT ./docker/ci_run.sh --name ${CONTAINER}_jax \
+            -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
+            -w $GITHUB_WORKSPACE \
+            rocm/mori:jax-ci sleep infinity
+
+      - name: Install mori (XLA FFI)
+        run: |
+          $CT exec ${CONTAINER}_jax bash -c \
+            "cd $GITHUB_WORKSPACE && BUILD_XLA_FFI_OPS=ON pip install --break-system-packages ."
+
+      - name: MORI-EP JAX test
+        run: |
+          $CT exec ${CONTAINER}_jax bash -c "
+            cd $GITHUB_WORKSPACE
+            MORI_KERNEL_DIR=\$(ls -d $GITHUB_WORKSPACE/build/lib/gfx* | head -1) \
+            timeout 300 pytest tests/python/ops/test_dispatch_combine_jax.py -s -v
+          "
+
+      - name: Cleanup
+        if: always()
+        run: $CT rm -f ${CONTAINER}_jax || true
 
   internode-test:
     name: mori internode test (${{ matrix.platform }})
@@ -311,12 +313,12 @@ jobs:
       - name: Install mori (node1)
         run: |
           $CT exec $CONTAINER bash -c \
-            "cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install -e . && pip install prettytable"
+            "cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install . && pip install prettytable"
 
       - name: Install mori (node2)
         run: |
           ssh -p $NODE2_PORT $(whoami)@$NODE2_HOST \
-            "$CT exec $CONTAINER bash -c 'cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install -e . && pip install prettytable'"
+            "$CT exec $CONTAINER bash -c 'cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install . && pip install prettytable'"
 
       - name: MORI-IO internode write sweep
         run: |
