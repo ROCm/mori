@@ -444,7 +444,9 @@ bool PoolClient::GetRemote(const std::string& key, void* dst, size_t size) {
     auto& peer = GetOrConnectPeer(loc.node_id, result->peer_address, result->engine_desc_bytes,
                                   first_bd, first_bd_idx);
     EnsureBufferDescsCached(peer, result->dram_memory_descs);
-    return RemoteDramScatterRead(peer, parsed->pages, page_size, dst, size, false);
+    // zero_copy=true: try registered DRAM region first, fall back to staging
+    // (with `staging_buffer_size` cap) only when caller did not pre-register.
+    return RemoteDramScatterRead(peer, parsed->pages, page_size, dst, size, true);
   }
 
   if (loc.tier == TierType::SSD) {
@@ -452,7 +454,7 @@ bool PoolClient::GetRemote(const std::string& key, void* dst, size_t size) {
     // GetOrConnectPeer signature which only relies on engine_desc_bytes.
     auto& peer = GetOrConnectPeer(loc.node_id, result->peer_address, result->engine_desc_bytes,
                                   /*dram_memory_desc_bytes=*/{});
-    return RemoteSsdRead(peer, key, loc.location_id, dst, size, false);
+    return RemoteSsdRead(peer, key, loc.location_id, dst, size, true);
   }
 
   MORI_UMBP_WARN("[PoolClient] GetRemote: key '{}' is on unsupported tier {}", key,
@@ -545,7 +547,9 @@ bool PoolClient::PutRemote(const std::string& key, const void* src, size_t size)
     auto& peer = GetOrConnectPeer(result->node_id, result->peer_address, result->engine_desc_bytes,
                                   first_bd, first_bd_idx);
     EnsureBufferDescsCached(peer, result->dram_memory_descs);
-    bool ok = RemoteDramScatterWrite(peer, result->pages, page_size, src, size, false);
+    // zero_copy=true: try registered DRAM region first, fall back to staging
+    // (with `staging_buffer_size` cap) only when caller did not pre-register.
+    bool ok = RemoteDramScatterWrite(peer, result->pages, page_size, src, size, true);
     if (!ok) {
       master_client_->AbortAllocation(result->node_id, result->allocation_id, size);
       return false;
@@ -671,7 +675,9 @@ std::vector<bool> PoolClient::BatchPutRemote(const std::vector<std::string>& key
       auto& peer =
           GetOrConnectPeer(r.node_id, r.peer_address, r.engine_desc_bytes, first_bd, first_bd_idx);
       EnsureBufferDescsCached(peer, r.dram_memory_descs);
-      wrote = RemoteDramScatterWrite(peer, r.pages, r.page_size, srcs[i], sizes[i], false);
+      // zero_copy=true: prefer pre-registered host buffers; staging fallback
+      // remains for callers that did not register.
+      wrote = RemoteDramScatterWrite(peer, r.pages, r.page_size, srcs[i], sizes[i], true);
     }
 
     if (!wrote) {
@@ -815,7 +821,9 @@ std::vector<bool> PoolClient::BatchGetRemote(const std::vector<std::string>& key
     auto& peer =
         GetOrConnectPeer(loc.node_id, r.peer_address, r.engine_desc_bytes, first_bd, first_bd_idx);
     EnsureBufferDescsCached(peer, r.dram_memory_descs);
-    results[i] = RemoteDramScatterRead(peer, parsed->pages, r.page_size, dsts[i], sizes[i], false);
+    // zero_copy=true: prefer pre-registered host buffers; staging fallback
+    // remains for callers that did not register.
+    results[i] = RemoteDramScatterRead(peer, parsed->pages, r.page_size, dsts[i], sizes[i], true);
   }
 
   return results;
