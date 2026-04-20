@@ -37,6 +37,16 @@ std::map<TierType, TierCapacity> MakeTierCapacities(uint64_t total_bytes,
   return {{TierType::HBM, TierCapacity{total_bytes, available_bytes}}};
 }
 
+// Small page_size for legacy tests that hard-code byte-precision values.
+// Phase 1 derives DRAM/HBM `available_bytes` from the page allocator, so
+// the registered totals must be a multiple of `default_dram_page_size` for
+// the legacy expectations to keep holding.
+ClientRegistryConfig MakeSmallPageConfig(uint64_t page_size = 1) {
+  ClientRegistryConfig config;
+  config.default_dram_page_size = page_size;
+  return config;
+}
+
 const ClientRecord* FindClient(const std::vector<ClientRecord>& clients, const std::string& id) {
   for (const auto& client : clients) {
     if (client.node_id == id) {
@@ -84,7 +94,10 @@ TEST(ClientRegistryTest, RegisterMultiple) {
 }
 
 TEST(ClientRegistryTest, GetAliveClients) {
-  ClientRegistry registry(ClientRegistryConfig{});
+  // Use page_size=1 so that registered totals map 1:1 to page counts and the
+  // legacy assertions ("registered N bytes → available N bytes") still hold
+  // without rewriting the per-byte arithmetic in this test.
+  ClientRegistry registry(MakeSmallPageConfig());
 
   EXPECT_TRUE(registry.RegisterClient("c1", "host-a:8080", MakeTierCapacities(80, 64)));
   EXPECT_TRUE(registry.RegisterClient("c2", "host-b:8080", MakeTierCapacities(96, 32)));
@@ -104,12 +117,15 @@ TEST(ClientRegistryTest, GetAliveClients) {
 
   ASSERT_TRUE(c1->tier_capacities.count(TierType::HBM) > 0);
   ASSERT_TRUE(c2->tier_capacities.count(TierType::HBM) > 0);
-  EXPECT_EQ(c1->tier_capacities.at(TierType::HBM).available_bytes, 64u);
-  EXPECT_EQ(c2->tier_capacities.at(TierType::HBM).available_bytes, 32u);
+  // Phase 1: available_bytes is allocator-derived; right after Register the
+  // bitmap is empty, so available_bytes == total_bytes (Client's reported
+  // available_bytes is intentionally ignored).
+  EXPECT_EQ(c1->tier_capacities.at(TierType::HBM).available_bytes, 80u);
+  EXPECT_EQ(c2->tier_capacities.at(TierType::HBM).available_bytes, 96u);
 }
 
 TEST(ClientRegistryTest, ReRegisterAliveRejected) {
-  ClientRegistry registry(ClientRegistryConfig{});
+  ClientRegistry registry(MakeSmallPageConfig());
 
   EXPECT_TRUE(registry.RegisterClient("c1", "a1", MakeTierCapacities(80, 64)));
   EXPECT_FALSE(registry.RegisterClient("c1", "a2", MakeTierCapacities(80, 32)));
@@ -120,11 +136,12 @@ TEST(ClientRegistryTest, ReRegisterAliveRejected) {
   EXPECT_EQ(clients[0].node_id, "c1");
   EXPECT_EQ(clients[0].node_address, "a1");
   ASSERT_TRUE(clients[0].tier_capacities.count(TierType::HBM) > 0);
-  EXPECT_EQ(clients[0].tier_capacities.at(TierType::HBM).available_bytes, 64u);
+  // Allocator-derived: empty bitmap -> available == total.
+  EXPECT_EQ(clients[0].tier_capacities.at(TierType::HBM).available_bytes, 80u);
 }
 
 TEST(ClientRegistryTest, ReRegisterExpiredAllowed) {
-  ClientRegistryConfig config;
+  ClientRegistryConfig config = MakeSmallPageConfig();
   config.heartbeat_ttl = std::chrono::seconds(1);
   config.max_missed_heartbeats = 1;
   config.reaper_interval = std::chrono::seconds(10);
@@ -143,7 +160,10 @@ TEST(ClientRegistryTest, ReRegisterExpiredAllowed) {
   EXPECT_EQ(clients[0].node_address, "a2");
   EXPECT_EQ(clients[0].status, ClientStatus::ALIVE);
   ASSERT_TRUE(clients[0].tier_capacities.count(TierType::HBM) > 0);
-  EXPECT_EQ(clients[0].tier_capacities.at(TierType::HBM).available_bytes, 32u);
+  // Re-registration recreates the allocator with the new total — bitmap is
+  // empty again, so available == total (regardless of what the Client tried
+  // to report for `available_bytes`).
+  EXPECT_EQ(clients[0].tier_capacities.at(TierType::HBM).available_bytes, 80u);
 }
 
 TEST(ClientRegistryTest, UnregisterExisting) {
@@ -195,6 +215,12 @@ TEST(ClientRegistryTest, HeartbeatUnknown) {
 }
 
 TEST(ClientRegistryTest, HeartbeatUpdatesCapacities) {
+  // Phase 1 #2 fix: for DRAM/HBM tiers Master is the source of truth for
+  // available_bytes — the Client's reported value is intentionally ignored,
+  // and `available_bytes` is recomputed from the page-bitmap allocator.
+  // Total here is 80 bytes, but our allocator's page_size is 2 MiB so the
+  // backward-compat single-buffer path produces total_pages=0, making the
+  // allocator's AvailableBytes() == 0.  We assert exactly that.
   ClientRegistry registry(ClientRegistryConfig{});
   EXPECT_TRUE(registry.RegisterClient("c1", "addr", MakeTierCapacities(80, 80)));
 
@@ -202,7 +228,37 @@ TEST(ClientRegistryTest, HeartbeatUpdatesCapacities) {
   const auto clients = registry.GetAliveClients();
   ASSERT_EQ(clients.size(), 1u);
   ASSERT_TRUE(clients[0].tier_capacities.count(TierType::HBM) > 0);
-  EXPECT_EQ(clients[0].tier_capacities.at(TierType::HBM).available_bytes, 32u);
+  EXPECT_EQ(clients[0].tier_capacities.at(TierType::HBM).available_bytes, 0u);
+}
+
+TEST(ClientRegistryTest, HeartbeatDoesNotOverwriteDramAvailable) {
+  // §3.2 regression test: even after a Client falsely reports a fresh
+  // available_bytes value via Heartbeat, the Master must keep its
+  // allocator-derived view as the truth.
+  ClientRegistryConfig config;
+  config.default_dram_page_size = 4u;  // tiny page so the test fits in 80 B
+  ClientRegistry registry(config);
+
+  // Register with an HBM tier sized at 80 bytes total / 80 bytes free.
+  EXPECT_TRUE(registry.RegisterClient("c1", "addr", MakeTierCapacities(80, 80)));
+
+  // Reserve 1 page (4 bytes worth → rounded up to 1 page) → bitmap should
+  // mark 4 bytes used; Master-reported available should therefore be 76.
+  auto alloc = registry.AllocateForPut("c1", TierType::HBM, /*size=*/4);
+  ASSERT_TRUE(alloc.has_value());
+
+  // Now the Client misreports a far-too-large available_bytes value.  Master
+  // must ignore that and recompute from the allocator state instead.
+  ASSERT_EQ(registry.Heartbeat("c1", MakeTierCapacities(80, /*available=*/12345)),
+            ClientStatus::ALIVE);
+
+  const auto clients = registry.GetAliveClients();
+  ASSERT_EQ(clients.size(), 1u);
+  ASSERT_TRUE(clients[0].tier_capacities.count(TierType::HBM) > 0);
+  // Allocator: total_pages = 80 / 4 = 20 pages, used 1 → free 19 → 76 bytes.
+  EXPECT_EQ(clients[0].tier_capacities.at(TierType::HBM).available_bytes, 76u);
+  // total_bytes is unchanged (resize is rejected with a throttled WARN).
+  EXPECT_EQ(clients[0].tier_capacities.at(TierType::HBM).total_bytes, 80u);
 }
 
 TEST(ClientRegistryTest, ReaperExpiresClient) {

@@ -68,7 +68,7 @@ class DRAMTier : public TierBackend {
   // the returned pointer across Evict/Write calls.
   const void* ReadPtr(const std::string& key, size_t* out_size) override;
 
-  // Accessors for distributed integration (Phase 2).
+  // Accessors for distributed integration.
   // Returns the mmap'd base address for RDMA registration.
   void* GetBasePtr() const { return base_ptr_; }
   // Returns the byte offset of a key's slot, or nullopt if not found.

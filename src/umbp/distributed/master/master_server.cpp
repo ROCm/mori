@@ -67,15 +67,9 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     const auto& engine_desc_str = request->engine_desc();
     std::vector<uint8_t> engine_desc_bytes(engine_desc_str.begin(), engine_desc_str.end());
 
-    // Multi-buffer: prefer repeated field, fall back to legacy single field
     std::vector<std::vector<uint8_t>> dram_memory_desc_bytes_list;
-    if (request->dram_memory_descs_size() > 0) {
-      for (const auto& desc : request->dram_memory_descs()) {
-        dram_memory_desc_bytes_list.emplace_back(desc.begin(), desc.end());
-      }
-    } else if (!request->dram_memory_desc().empty()) {
-      const auto& legacy = request->dram_memory_desc();
-      dram_memory_desc_bytes_list.emplace_back(legacy.begin(), legacy.end());
+    for (const auto& desc : request->dram_memory_descs()) {
+      dram_memory_desc_bytes_list.emplace_back(desc.begin(), desc.end());
     }
 
     std::vector<uint64_t> dram_buffer_sizes(request->dram_buffer_sizes().begin(),
@@ -86,7 +80,8 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
 
     const bool registered = registry_.RegisterClient(
         request->node_id(), request->node_address(), caps, request->peer_address(),
-        engine_desc_bytes, dram_memory_desc_bytes_list, dram_buffer_sizes, ssd_store_capacities);
+        engine_desc_bytes, dram_memory_desc_bytes_list, dram_buffer_sizes, ssd_store_capacities,
+        request->dram_page_size());
     if (!registered) {
       return grpc::Status(grpc::StatusCode::ALREADY_EXISTS,
                           "node is already alive and cannot be re-registered");
@@ -169,15 +164,9 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     response->set_removed(removed ? 1u : 0u);
 
     if (removed && location.size > 0) {
-      auto parsed = ParseLocationId(location.location_id);
-      if (parsed) {
-        uint64_t offset = 0;
-        if (location.tier == TierType::DRAM || location.tier == TierType::HBM) {
-          offset = parsed->offset;
-        }
-        registry_.DeallocateForUnregister(location.node_id, location.tier, parsed->buffer_index,
-                                          offset, location.size);
-      }
+      // Registry parses both the page-bitmap "0:p3,4;1:p0" DRAM/HBM format
+      // and the SSD format from location.location_id, so pass it through.
+      registry_.DeallocateForUnregister(location.node_id, location);
     }
 
     MORI_UMBP_INFO("[Master] Unregister key: node_id={}, key={}, location_id={}, removed={}",
@@ -269,19 +258,33 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     source->set_size(result->size);
     source->set_tier(static_cast<::umbp::TierType>(result->tier));
 
-    uint32_t buf_idx = 0;
-    auto parsed = ParseLocationId(result->location_id);
-    if (parsed) {
-      buf_idx = parsed->buffer_index;
-    }
-
-    auto io_info = registry_.GetClientIOInfo(result->node_id, buf_idx);
+    auto io_info = registry_.GetClientIOInfo(result->node_id, /*buffer_index=*/0);
     if (io_info) {
       response->set_peer_address(io_info->peer_address);
       response->set_engine_desc(io_info->engine_desc_bytes.data(),
                                 io_info->engine_desc_bytes.size());
-      response->set_dram_memory_desc(io_info->dram_memory_desc_bytes.data(),
-                                     io_info->dram_memory_desc_bytes.size());
+    }
+
+    if (result->tier == TierType::DRAM || result->tier == TierType::HBM) {
+      auto parsed = ParseDramLocationId(result->location_id);
+      if (parsed) {
+        auto descs = registry_.GetDramMemoryDescsForPages(result->node_id, parsed->pages);
+        if (descs) {
+          for (const auto& bd : *descs) {
+            auto* proto_bd = response->add_dram_memory_descs();
+            proto_bd->set_buffer_index(bd.buffer_index);
+            proto_bd->set_desc(bd.desc_bytes.data(), bd.desc_bytes.size());
+          }
+        }
+        // page_size of the source node's DRAM/HBM allocator.  Falls back to
+        // the registry-wide default if the source node has no live allocator
+        // (e.g. it expired between RouteGet's index lookup and this query).
+        auto src_ps = registry_.GetNodeDramPageSize(result->node_id, result->tier);
+        response->set_page_size(src_ps.value_or(config_.default_dram_page_size));
+      } else {
+        MORI_UMBP_ERROR("[Master] RouteGet: malformed DRAM/HBM location_id '{}' for key='{}'",
+                        result->location_id, request->key());
+      }
     }
 
     MORI_UMBP_INFO("[Master] RouteGet key='{}': node={}, location={}", request->key(),
@@ -307,15 +310,24 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     response->set_tier(static_cast<::umbp::TierType>(result->tier));
     response->set_peer_address(result->peer_address);
     response->set_engine_desc(result->engine_desc_bytes.data(), result->engine_desc_bytes.size());
-    response->set_dram_memory_desc(result->dram_memory_desc_bytes.data(),
-                                   result->dram_memory_desc_bytes.size());
-    response->set_allocated_offset(result->allocated_offset);
-    response->set_buffer_index(result->buffer_index);
     response->set_allocation_id(result->allocation_id);
 
-    MORI_UMBP_INFO("[Master] RoutePut key='{}': target_node={}, tier={}, buffer={}, offset={}",
-                   request->key(), result->node_id, TierTypeName(result->tier),
-                   result->buffer_index, result->allocated_offset);
+    response->set_location_id(result->location_id);
+    for (const auto& p : result->pages) {
+      auto* proto_p = response->add_pages();
+      proto_p->set_buffer_index(p.buffer_index);
+      proto_p->set_page_index(p.page_index);
+    }
+    for (const auto& bd : result->dram_memory_descs) {
+      auto* proto_bd = response->add_dram_memory_descs();
+      proto_bd->set_buffer_index(bd.buffer_index);
+      proto_bd->set_desc(bd.desc_bytes.data(), bd.desc_bytes.size());
+    }
+    response->set_page_size(result->page_size);
+
+    MORI_UMBP_INFO("[Master] RoutePut key='{}': target_node={}, tier={}, location='{}', pages={}",
+                   request->key(), result->node_id, TierTypeName(result->tier), result->location_id,
+                   result->pages.size());
     return grpc::Status::OK;
   }
 
@@ -345,10 +357,20 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
       entry->set_tier(static_cast<::umbp::TierType>(r.tier));
       entry->set_peer_address(r.peer_address);
       entry->set_engine_desc(r.engine_desc_bytes.data(), r.engine_desc_bytes.size());
-      entry->set_dram_memory_desc(r.dram_memory_desc_bytes.data(), r.dram_memory_desc_bytes.size());
-      entry->set_allocated_offset(r.allocated_offset);
-      entry->set_buffer_index(r.buffer_index);
       entry->set_allocation_id(r.allocation_id);
+
+      entry->set_location_id(r.location_id);
+      for (const auto& p : r.pages) {
+        auto* proto_p = entry->add_pages();
+        proto_p->set_buffer_index(p.buffer_index);
+        proto_p->set_page_index(p.page_index);
+      }
+      for (const auto& bd : r.dram_memory_descs) {
+        auto* proto_bd = entry->add_dram_memory_descs();
+        proto_bd->set_buffer_index(bd.buffer_index);
+        proto_bd->set_desc(bd.desc_bytes.data(), bd.desc_bytes.size());
+      }
+      entry->set_page_size(r.page_size);
     }
 
     MORI_UMBP_INFO("[Master] BatchRoutePut: {} keys from node={}", keys.size(), request->node_id());
@@ -376,19 +398,31 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
       source->set_size(loc.size);
       source->set_tier(static_cast<::umbp::TierType>(loc.tier));
 
-      uint32_t buf_idx = 0;
-      auto batch_parsed = ParseLocationId(loc.location_id);
-      if (batch_parsed) {
-        buf_idx = batch_parsed->buffer_index;
-      }
-
-      auto io_info = registry_.GetClientIOInfo(loc.node_id, buf_idx);
+      auto io_info = registry_.GetClientIOInfo(loc.node_id, /*buffer_index=*/0);
       if (io_info) {
         entry->set_peer_address(io_info->peer_address);
         entry->set_engine_desc(io_info->engine_desc_bytes.data(),
                                io_info->engine_desc_bytes.size());
-        entry->set_dram_memory_desc(io_info->dram_memory_desc_bytes.data(),
-                                    io_info->dram_memory_desc_bytes.size());
+      }
+
+      if (loc.tier == TierType::DRAM || loc.tier == TierType::HBM) {
+        auto parsed = ParseDramLocationId(loc.location_id);
+        if (parsed) {
+          auto descs = registry_.GetDramMemoryDescsForPages(loc.node_id, parsed->pages);
+          if (descs) {
+            for (const auto& bd : *descs) {
+              auto* proto_bd = entry->add_dram_memory_descs();
+              proto_bd->set_buffer_index(bd.buffer_index);
+              proto_bd->set_desc(bd.desc_bytes.data(), bd.desc_bytes.size());
+            }
+          }
+          auto src_ps = registry_.GetNodeDramPageSize(loc.node_id, loc.tier);
+          entry->set_page_size(src_ps.value_or(config_.default_dram_page_size));
+        } else {
+          MORI_UMBP_ERROR(
+              "[Master] BatchRouteGet: malformed DRAM/HBM location_id '{}' for key='{}'",
+              loc.location_id, request->keys(static_cast<int>(i)));
+        }
       }
     }
 

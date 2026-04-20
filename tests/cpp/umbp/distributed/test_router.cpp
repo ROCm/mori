@@ -43,6 +43,11 @@ Location MakeLoc(const std::string& node_id, const std::string& loc_id, uint64_t
   return loc;
 }
 
+// Phase 1: ClientRegistry derives DRAM/HBM `available_bytes` from the
+// PageBitmapAllocator (which is empty right after RegisterClient), so the
+// `*_avail` arguments are accepted only to keep the existing test cases
+// readable; the registry overrides whatever we pass to whatever the
+// allocator reports.
 std::map<TierType, TierCapacity> MakeCaps(uint64_t hbm_total, uint64_t hbm_avail,
                                           uint64_t dram_total = 0, uint64_t dram_avail = 0) {
   std::map<TierType, TierCapacity> caps;
@@ -129,8 +134,10 @@ TEST_F(RouterTest, RoutePutSelectsAliveNodeWithCapacity) {
 }
 
 TEST_F(RouterTest, RoutePutPicksMostAvailableNode) {
-  registry_.RegisterClient("node-a", "addr-a", MakeCaps(80 * GB, 10 * GB));
-  registry_.RegisterClient("node-b", "addr-b", MakeCaps(80 * GB, 60 * GB));
+  // Phase 1: allocator's available_bytes == registered total_bytes (empty
+  // bitmap), so we vary `total_bytes` to vary "most available".
+  registry_.RegisterClient("node-a", "addr-a", MakeCaps(10 * GB, 10 * GB));
+  registry_.RegisterClient("node-b", "addr-b", MakeCaps(60 * GB, 60 * GB));
 
   auto result = router_->RoutePut("key-1", "requester", 4096);
   ASSERT_TRUE(result.has_value());
@@ -138,7 +145,9 @@ TEST_F(RouterTest, RoutePutPicksMostAvailableNode) {
 }
 
 TEST_F(RouterTest, RoutePutFallsThroughTiers) {
-  registry_.RegisterClient("node-a", "addr-a", MakeCaps(80 * GB, 0, 512 * GB, 200 * GB));
+  // Phase 1: setting HBM total_bytes=0 means RegisterClient builds no HBM
+  // PageBitmapAllocator and the strategy sees zero HBM available.
+  registry_.RegisterClient("node-a", "addr-a", MakeCaps(0, 0, 512 * GB, 512 * GB));
 
   auto result = router_->RoutePut("key-1", "requester", 4096);
   ASSERT_TRUE(result.has_value());
@@ -146,7 +155,9 @@ TEST_F(RouterTest, RoutePutFallsThroughTiers) {
 }
 
 TEST_F(RouterTest, RoutePutReturnsNulloptWhenAllFull) {
-  registry_.RegisterClient("node-a", "addr-a", MakeCaps(80 * GB, 0));
+  // No allocator is built when total_bytes == 0, so the strategy can find
+  // no tier with capacity.
+  registry_.RegisterClient("node-a", "addr-a", MakeCaps(0, 0));
 
   auto result = router_->RoutePut("key-1", "requester", 4096);
   EXPECT_FALSE(result.has_value());
