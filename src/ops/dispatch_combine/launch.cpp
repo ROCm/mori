@@ -579,6 +579,43 @@ void LaunchCombineRecv(EpDispatchCombineHandle& handle, int block_num, int warp_
 }
 
 // -----------------------------------------------------------------------
+// LaunchLocalExpertCount
+// -----------------------------------------------------------------------
+void LaunchLocalExpertCount(const EpDispatchCombineConfig& config, const index_t* indices,
+                            const index_t* total_recv_token_num, int* local_expert_count,
+                            int block_num, int warp_per_block, hipStream_t stream) {
+  ensure_loaded();
+
+  if (indices == nullptr || total_recv_token_num == nullptr || local_expert_count == nullptr) {
+    throw std::runtime_error(
+        "LaunchLocalExpertCount requires non-null indices, total_recv_token_num, and output");
+  }
+
+  const int wpb = (warp_per_block <= 0) ? config.warpNumPerBlock : warp_per_block;
+  const int bn = (block_num <= 0) ? config.blockNum : block_num;
+  if (wpb <= 0 || bn <= 0) {
+    throw std::runtime_error("LaunchLocalExpertCount requires positive block and warp settings");
+  }
+
+  const hipError_t memset_err = hipMemsetAsync(
+      local_expert_count, 0, static_cast<size_t>(config.numExpertPerRank) * sizeof(int), stream);
+  if (memset_err != hipSuccess) {
+    throw std::runtime_error("hipMemsetAsync failed for LaunchLocalExpertCount: " +
+                             std::string(hipGetErrorString(memset_err)));
+  }
+
+  LocalExpertCountArgs args{indices,
+                            total_recv_token_num,
+                            config.rank,
+                            config.numExpertPerRank,
+                            config.numExpertPerToken,
+                            local_expert_count};
+  KernelRegistry::Instance().Launch("LocalExpertCountKernel", static_cast<unsigned int>(bn),
+                                    WARP_SIZE * static_cast<unsigned int>(wpb), 0, stream, &args,
+                                    sizeof(args));
+}
+
+// -----------------------------------------------------------------------
 // LaunchReset
 // -----------------------------------------------------------------------
 void LaunchReset(EpDispatchCombineHandle& handle, hipStream_t stream) {

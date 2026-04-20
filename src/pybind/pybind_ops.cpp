@@ -25,6 +25,7 @@
 
 #include <cassert>
 
+#include "mori/ops/dispatch_combine/launch.hpp"
 #include "mori/ops/ops.hpp"
 #include "mori/pybind/profiler_registry.hpp"
 #include "mori/utils/hip_helper.hpp"
@@ -197,6 +198,16 @@ void LaunchReset(mori::moe::EpDispatchCombineHandle& handle, int64_t stream) {
   handle.LaunchReset(reinterpret_cast<hipStream_t>(stream));
 }
 
+void PyLaunchLocalExpertCount(const mori::moe::EpDispatchCombineConfig& config, int64_t indices_ptr,
+                              int64_t total_recv_token_num_ptr, int64_t local_expert_count_ptr,
+                              int block_num, int warp_per_block, int64_t stream) {
+  mori::moe::LaunchLocalExpertCount(
+      config, reinterpret_cast<const mori::moe::index_t*>(indices_ptr),
+      reinterpret_cast<const mori::moe::index_t*>(total_recv_token_num_ptr),
+      reinterpret_cast<int*>(local_expert_count_ptr), block_num, warp_per_block,
+      reinterpret_cast<hipStream_t>(stream));
+}
+
 py::tuple GetDispatchSrcTokenId(mori::moe::EpDispatchCombineHandle& handle) {
   return py::make_tuple(
       reinterpret_cast<int64_t>(
@@ -341,6 +352,11 @@ void RegisterMoriOps(py::module_& m) {
 
   m.def("get_cur_device_wall_clock_freq_mhz", &GetCurDeviceWallClockFreqMhz,
         "Returns clock frequency of current device's wall clock");
+
+  m.def("launch_local_expert_count", &PyLaunchLocalExpertCount, py::arg("config"),
+        py::arg("indices_ptr"), py::arg("total_recv_token_num_ptr"),
+        py::arg("local_expert_count_ptr"), py::arg("block_num") = -1,
+        py::arg("warp_per_block") = -1, py::arg("stream") = 0);
 }
 
 }  // namespace mori

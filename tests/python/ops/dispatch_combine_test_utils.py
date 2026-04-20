@@ -434,6 +434,70 @@ class EpDispatchCombineTestCase:
             )
 
 
+def check_local_expert_count(op, dispatch_indices, dispatch_recv_num_token):
+    """Verify op.local_expert_count matches a CPU reference computed from dispatch outputs.
+
+    For each of the ``total_recv`` received tokens, any expert index ``e`` that
+    maps to the local rank (``e // num_experts_per_rank == rank``) contributes
+    one count to ``local_expert_count[e % num_experts_per_rank]``.
+    """
+    rank = op.config.rank
+    num_experts_per_rank = op.config.num_experts_per_rank
+    total_recv = dispatch_recv_num_token[0].item()
+    received_indices = dispatch_indices[:total_recv].cpu()
+    expected = torch.zeros(num_experts_per_rank, dtype=torch.int32)
+    for tok_idx in range(total_recv):
+        for e in received_indices[tok_idx].tolist():
+            if e // num_experts_per_rank == rank:
+                expected[e % num_experts_per_rank] += 1
+    actual = op.local_expert_count.cpu()
+    assert torch.equal(actual, expected), (
+        f"Rank {rank}: local_expert_count mismatch:\n"
+        f"  got:      {actual.tolist()}\n"
+        f"  expected: {expected.tolist()}"
+    )
+
+
+def run_ep_dispatch_local_expert_count_test(config):
+    """Run a dispatch + local_expert_count test for any kernel type.
+
+    Handles both single-call kernels (IntraNode, InterNodeV1/LL) and the
+    split-phase AsyncLL kernel (dispatch_send + dispatch_recv).  After the
+    kernel completes, verifies ``op.local_expert_count`` against a CPU
+    reference computed from the received indices.
+    """
+    op = mori.ops.EpDispatchCombineOp(config)
+    test_case = EpDispatchCombineTestCase(config)
+    test_data = test_case.gen_test_data()
+
+    (_, all_rank_indices, all_rank_input, all_rank_weights, all_rank_scales) = test_data
+    rank = config.rank
+
+    kt = config.kernel_type
+    asyncll_type = mori.ops.EpDispatchCombineKernelType.AsyncLL
+    if kt.value == asyncll_type.value:
+        # AsyncLL: recv kernels fill the output indices, so local_expert_count
+        # must be requested on dispatch_recv (not dispatch_send).
+        (_, _, _, dispatch_indices, dispatch_recv_num_token) = op.dispatch_send(
+            all_rank_input[rank],
+            all_rank_weights[rank],
+            all_rank_scales[rank],
+            all_rank_indices[rank],
+        )
+        op.dispatch_recv(call_local_expert_count=True)
+    else:
+        (_, _, _, dispatch_indices, dispatch_recv_num_token) = op.dispatch(
+            all_rank_input[rank],
+            all_rank_weights[rank],
+            all_rank_scales[rank],
+            all_rank_indices[rank],
+            call_local_expert_count=True,
+        )
+
+    torch.cuda.synchronize()
+    check_local_expert_count(op, dispatch_indices, dispatch_recv_num_token)
+
+
 def run_ep_dispatch_combine_test(
     config,
     test_case_cls,

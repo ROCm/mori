@@ -56,8 +56,9 @@ if(BUILD_OPS_DEVICE)
   endif()
 
   # Kernel sources
-  set(_kernel_sources ep_intranode.hip ep_internode.hip ep_internode_v1.hip
-                      ep_internode_v1ll.hip ep_async_ll.hip)
+  set(_kernel_sources
+      ep_intranode.hip ep_internode.hip ep_internode_v1.hip
+      ep_internode_v1ll.hip ep_async_ll.hip ep_local_expert_count.hip)
 
   # Output to build/lib/<arch>_<nic>/ (matches JIT cache layout)
   set(_arch_nic "${GPU_TARGETS}_${MORI_DEVICE_NIC}")
