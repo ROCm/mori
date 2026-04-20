@@ -60,16 +60,24 @@ def get_cache_dir(
     source_paths: list[Path],
     nic: str = "mlx5",
     profiler: bool = False,
+    *,
+    cov: int | None = None,
 ) -> Path:
     """Return the cache directory for a specific arch + NIC + content combo.
 
-    Structure: ``<cache_root>/<arch>_<nic>[_profiler]/<content_hash>/``
+    Structure: <cache_root>/<arch>_<nic>[_profiler][_cov<N>]/<content_hash>/
 
-    The ``profiler`` flag is encoded in the directory name so that kernels
-    compiled with ``ENABLE_PROFILER`` and without are cached separately.
+    Args:
+        profiler: When True, appends '_profiler' to the directory name so that
+                  kernels compiled with ENABLE_PROFILER are cached separately.
+        cov: AMDGPU code object version. When specified, the version is
+             included in the directory name to separate bitcode compiled
+             with different ABI versions (e.g. cov5 for Triton, cov6 for
+             FlyDSL).  None omits the suffix for backward compatibility.
     """
     content_hash = _hash_tree(source_paths)
     profiler_suffix = "_profiler" if profiler else ""
-    d = get_cache_root() / f"{arch}_{nic}{profiler_suffix}" / content_hash
+    cov_suffix = f"_cov{cov}" if cov is not None else ""
+    d = get_cache_root() / f"{arch}_{nic}{profiler_suffix}{cov_suffix}" / content_hash
     d.mkdir(parents=True, exist_ok=True)
     return d
