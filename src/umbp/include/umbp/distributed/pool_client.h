@@ -78,6 +78,17 @@ class PoolClient {
   // Fetch a block from a remote node via RDMA.
   // DRAM: RouteGet -> direct RDMA read.
   // SSD: RouteGet -> PeerService PrepareSsdRead (SSD->staging slot) -> RDMA read.
+  //
+  // `size` MUST equal the byte size committed at Put time (Master tracks
+  // it in Location.size and returns it via RouteGet).  Mismatch is a
+  // contract violation — the call fails fast with a clear error rather
+  // than silently truncating the last page or pulling stale tail bytes.
+  //
+  // The caller is responsible for tracking the original Put size (e.g.
+  // alongside the key in its own metadata).  `Lookup` deliberately does
+  // not return size to keep that RPC cheap and side-effect-free; querying
+  // size via `RouteGet` would create a lease as a side effect, which is
+  // exactly what `Lookup` was introduced to avoid (see issue #9).
   bool GetRemote(const std::string& key, void* dst, size_t size);
 
   // Write a block to a remote node via RDMA.
@@ -92,6 +103,9 @@ class PoolClient {
                                    const std::vector<int>& depths = {});
 
   // Batch read: single gRPC for routing + batched RDMA.
+  // Same per-entry size contract as GetRemote: sizes[i] MUST equal the
+  // stored Location.size for keys[i].  Per-entry mismatch fails just that
+  // entry (results[i]=false); other entries are unaffected.
   std::vector<bool> BatchGetRemote(const std::vector<std::string>& keys,
                                    const std::vector<void*>& dsts,
                                    const std::vector<size_t>& sizes);
@@ -167,10 +181,11 @@ class PoolClient {
   // populated `peer.dram_memories[buffer_index]` for every buffer_index in
   // `pages` (typically via EnsureBufferDescsCached).
   //
-  // Source layout: pages[i] receives src[i*page_size .. (i+1)*page_size).
-  // We require `size == pages.size() * page_size`; partial last-page is
-  // rejected (PageBitmapAllocator already rounds up to a full page so a
-  // partial tail would only happen on caller bug).
+  // Source layout: pages[i] receives src[i*page_size .. min((i+1)*page_size, size)).
+  // We accept any `size` in ((N-1)*page_size, N*page_size] where N =
+  // pages.size().  PageBitmapAllocator rounds up to ceil(size/page_size)
+  // pages, so the *last* logical page is partially filled when size is not
+  // a multiple of page_size; only that page's real bytes are transferred.
   //
   // Internally groups by buffer_index, builds one (localOffsets[k],
   // remoteOffsets[k], sizes[k]) batch per distinct buffer (= IOEngine's
