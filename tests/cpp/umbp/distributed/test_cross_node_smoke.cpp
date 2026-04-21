@@ -367,6 +367,109 @@ TEST_F(CrossNodeMultiPage, CrossBufferScatterPutGet) {
   EXPECT_FALSE(client_a_->PutRemote("xbuf-overflow", src.data(), kPayload));
 }
 
+// ---------------------------------------------------------------------------
+// Partial-tail tests.  Master allocates ceil(size / page_size) pages even
+// when size is not page-aligned; the last page is partially filled.  These
+// tests guard against silently truncating valid bytes or pulling stale
+// tail bytes back into the caller's buffer.
+// ---------------------------------------------------------------------------
+
+TEST_F(CrossNodeMultiPage, PartialTailSinglePage) {
+  // size < page_size: single allocation, partial tail = size.  Covers the
+  // N=1 fast path through both PutRemote/GetRemote and the scatter helper.
+  StartMaster();
+  client_a_ = MakeClient("node-a", io_port_a_, NodeSetup{{kPageSize / 2}}, &owned_a_);
+  client_b_ = MakeClient("node-b", io_port_b_, NodeSetup{{kPageSize}}, &owned_b_);
+
+  constexpr size_t kPayload = 1234;  // arbitrary, < kPageSize
+  std::vector<char> src(kPayload);
+  for (size_t i = 0; i < kPayload; ++i) src[i] = static_cast<char>((i * 13 + 7) & 0xFF);
+
+  ASSERT_TRUE(client_a_->PutRemote("pt-1", src.data(), kPayload));
+
+  // Sentinel bytes after `dst` validate that GetRemote does not write past
+  // `size` (would catch a regression that copied a full page back).
+  constexpr char kSentinel = 0x5A;
+  std::vector<char> dst(kPayload + 64, kSentinel);
+  ASSERT_TRUE(client_a_->GetRemote("pt-1", dst.data(), kPayload));
+  EXPECT_EQ(std::memcmp(src.data(), dst.data(), kPayload), 0);
+  for (size_t i = kPayload; i < dst.size(); ++i) {
+    EXPECT_EQ(dst[i], kSentinel) << "Get wrote past requested size at offset " << i;
+  }
+}
+
+TEST_F(CrossNodeMultiPage, PartialTailMultiPageSameBuffer) {
+  // 2 full pages + a partial tail in a single contiguous buffer (Strategy 1).
+  StartMaster();
+  client_a_ = MakeClient("node-a", io_port_a_, NodeSetup{{kPageSize / 2}}, &owned_a_);
+  client_b_ = MakeClient("node-b", io_port_b_, NodeSetup{{kPageSize * 4}}, &owned_b_);
+
+  constexpr size_t kTail = 333;
+  constexpr size_t kPayload = kPageSize * 2 + kTail;
+  std::vector<char> src(kPayload);
+  for (size_t i = 0; i < kPayload; ++i) src[i] = static_cast<char>((i * 31 + 1) & 0xFF);
+
+  ASSERT_TRUE(client_a_->PutRemote("pt-mp", src.data(), kPayload));
+
+  constexpr char kSentinel = 0xA5;
+  std::vector<char> dst(kPayload + 64, kSentinel);
+  ASSERT_TRUE(client_a_->GetRemote("pt-mp", dst.data(), kPayload));
+  EXPECT_EQ(std::memcmp(src.data(), dst.data(), kPayload), 0);
+  for (size_t i = kPayload; i < dst.size(); ++i) {
+    EXPECT_EQ(dst[i], kSentinel) << "Get wrote past requested size at offset " << i;
+  }
+}
+
+TEST_F(CrossNodeMultiPage, PartialTailCrossBufferScatter) {
+  // Strategy 3: target has two single-page buffers; payload = 1 page + tail
+  // forces cross-buffer scatter where the *last* logical page (carrying the
+  // partial tail) lands in a different buffer group than the first page.
+  // Regression guard: scatter helpers must identify "last page" by spi
+  // (global page index), not by the position inside a group.
+  StartMaster();
+  client_a_ = MakeClient("node-a", io_port_a_, NodeSetup{{kPageSize / 2}}, &owned_a_);
+  client_b_ = MakeClient("node-b", io_port_b_, NodeSetup{{kPageSize, kPageSize}}, &owned_b_);
+
+  constexpr size_t kTail = 777;
+  constexpr size_t kPayload = kPageSize + kTail;
+  std::vector<char> src(kPayload);
+  for (size_t i = 0; i < kPayload; ++i) src[i] = static_cast<char>((i * 53 + 3) & 0xFF);
+
+  ASSERT_TRUE(client_a_->PutRemote("pt-xbuf", src.data(), kPayload));
+
+  constexpr char kSentinel = 0x3C;
+  std::vector<char> dst(kPayload + 64, kSentinel);
+  ASSERT_TRUE(client_a_->GetRemote("pt-xbuf", dst.data(), kPayload));
+  EXPECT_EQ(std::memcmp(src.data(), dst.data(), kPayload), 0);
+  for (size_t i = kPayload; i < dst.size(); ++i) {
+    EXPECT_EQ(dst[i], kSentinel) << "Get wrote past requested size at offset " << i;
+  }
+}
+
+TEST_F(CrossNodeMultiPage, PartialTailGetSizeMismatchRejected) {
+  // Contract: GetRemote must reject `size != Location.size`.  Without this
+  // check the partial-tail code path would either truncate valid bytes
+  // (size < stored) or pull stale bytes from the unused tail of the last
+  // page (size > stored, still inside the page window).
+  StartMaster();
+  client_a_ = MakeClient("node-a", io_port_a_, NodeSetup{{kPageSize / 2}}, &owned_a_);
+  client_b_ = MakeClient("node-b", io_port_b_, NodeSetup{{kPageSize}}, &owned_b_);
+
+  constexpr size_t kPayload = 999;
+  std::vector<char> src(kPayload, 'X');
+  ASSERT_TRUE(client_a_->PutRemote("pt-mismatch", src.data(), kPayload));
+
+  // Asking for the rounded-up cap (1 full page) is in the page window but
+  // != stored size; must fail rather than leaking the unused tail bytes.
+  std::vector<char> dst(kPageSize, 0);
+  EXPECT_FALSE(client_a_->GetRemote("pt-mismatch", dst.data(), kPageSize));
+  // Asking for fewer bytes than stored must also fail (would truncate).
+  EXPECT_FALSE(client_a_->GetRemote("pt-mismatch", dst.data(), kPayload - 1));
+  // Sanity: the correct size still works.
+  ASSERT_TRUE(client_a_->GetRemote("pt-mismatch", dst.data(), kPayload));
+  EXPECT_EQ(std::memcmp(src.data(), dst.data(), kPayload), 0);
+}
+
 TEST_F(CrossNodeMultiPage, MultiPageDiscretePutGet) {
   // Strategy 2: same buffer, discrete (non-contiguous) free pages.
   //
