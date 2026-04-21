@@ -1491,7 +1491,7 @@ void RdmaBackend::ReadWrite(const MemoryDesc& localDest, size_t localOffset,
                             TransferStatus* status, TransferUniqueId id, bool isRead) {
   MORI_IO_FUNCTION_TIMER;
   try {
-    auto sess = GetOrCreateSessionCached(localDest, remoteSrc);
+    RdmaBackendSession* sess = GetOrCreateSessionCached(localDest, remoteSrc);
     sess->ReadWrite(localOffset, remoteOffset, size, status, id, isRead);
   } catch (const std::exception& e) {
     MORI_IO_ERROR("RdmaBackend::ReadWrite failed: {}", e.what());
@@ -1513,7 +1513,7 @@ void RdmaBackend::BatchReadWrite(const MemoryDesc& localDest, const SizeVec& loc
   }
 
   try {
-    auto sess = GetOrCreateSessionCached(localDest, remoteSrc);
+    RdmaBackendSession* sess = GetOrCreateSessionCached(localDest, remoteSrc);
     sess->BatchReadWrite(localOffsets, remoteOffsets, sizes, status, id, isRead);
   } catch (const std::exception& e) {
     MORI_IO_ERROR("RdmaBackend::BatchReadWrite failed: {}", e.what());
@@ -1582,20 +1582,20 @@ bool RdmaBackend::PopInboundTransferStatus(EngineKey remote, TransferUniqueId id
   return notif->PopInboundTransferStatus(remote, id, status);
 }
 
-std::shared_ptr<RdmaBackendSession> RdmaBackend::GetOrCreateSessionCached(
-    const MemoryDesc& local, const MemoryDesc& remote) {
+RdmaBackendSession* RdmaBackend::GetOrCreateSessionCached(const MemoryDesc& local,
+                                                          const MemoryDesc& remote) {
   SessionCacheKey key{remote.engineKey, local.id, remote.id};
   {
     std::lock_guard<std::mutex> lock(sessionCacheMu);
     auto it = sessionCache.find(key);
-    if (it != sessionCache.end()) return it->second;
+    if (it != sessionCache.end()) return it->second.get();
   }
   auto newSess = CreateSessionImpl(local, remote);
   std::lock_guard<std::mutex> lock(sessionCacheMu);
   auto it = sessionCache.find(key);
-  if (it != sessionCache.end()) return it->second;
+  if (it != sessionCache.end()) return it->second.get();
   auto [emplacedIt, inserted] = sessionCache.emplace(key, std::move(newSess));
-  return emplacedIt->second;
+  return emplacedIt->second.get();
 }
 
 void RdmaBackend::InvalidateSessionsForMemory(MemoryUniqueId id) {

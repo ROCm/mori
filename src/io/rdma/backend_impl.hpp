@@ -340,8 +340,10 @@ class RdmaBackend : public Backend {
       return seed;
     }
   };
-  std::shared_ptr<RdmaBackendSession> GetOrCreateSessionCached(const MemoryDesc& local,
-                                                               const MemoryDesc& remote);
+  // Cache map owns lifetime via stored shared_ptr; raw return avoids per-call
+  // atomic inc/dec on the hot path. DeregisterMemory must not race with
+  // active transfers.
+  RdmaBackendSession* GetOrCreateSessionCached(const MemoryDesc& local, const MemoryDesc& remote);
   void InvalidateSessionsForMemory(MemoryUniqueId id);
 
  private:
