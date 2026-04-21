@@ -400,6 +400,26 @@ bool PoolClient::ExistsRemote(const std::string& key) {
   return found;
 }
 
+std::vector<bool> PoolClient::BatchExistsRemote(const std::vector<std::string>& keys) {
+  std::vector<bool> results(keys.size(), false);
+  if (!initialized_ || keys.empty()) return results;
+
+  std::vector<bool> found;
+  auto status = master_client_->BatchLookup(keys, &found);
+  if (!status.ok()) {
+    MORI_UMBP_ERROR("[PoolClient] BatchExistsRemote: BatchLookup failed: {}",
+                    status.error_message());
+    return results;
+  }
+  if (found.size() != keys.size()) {
+    MORI_UMBP_ERROR("[PoolClient] BatchExistsRemote: result count mismatch ({} vs {})",
+                    found.size(), keys.size());
+    return results;
+  }
+  results = std::move(found);
+  return results;
+}
+
 bool PoolClient::GetRemote(const std::string& key, void* dst, size_t size) {
   if (!initialized_) {
     MORI_UMBP_ERROR("[PoolClient] Not initialized");

@@ -210,6 +210,18 @@ std::vector<Location> GlobalBlockIndex::Lookup(const std::string& key) const {
   return it->second.locations;
 }
 
+std::vector<bool> GlobalBlockIndex::BatchLookupExists(const std::vector<std::string>& keys) const {
+  std::vector<bool> results(keys.size(), false);
+  if (keys.empty()) return results;
+
+  std::shared_lock lock(mutex_);
+  for (size_t i = 0; i < keys.size(); ++i) {
+    auto it = entries_.find(keys[i]);
+    results[i] = (it != entries_.end()) && !it->second.locations.empty();
+  }
+  return results;
+}
+
 std::optional<BlockMetrics> GlobalBlockIndex::GetMetrics(const std::string& key) const {
   std::shared_lock lock(mutex_);
 

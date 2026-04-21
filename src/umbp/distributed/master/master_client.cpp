@@ -611,6 +611,47 @@ grpc::Status MasterClient::BatchFinalizeAllocation(const std::vector<std::string
   return grpc::Status::OK;
 }
 
+grpc::Status MasterClient::BatchLookup(const std::vector<std::string>& keys,
+                                       std::vector<bool>* out) {
+  if (out != nullptr) {
+    out->clear();
+  }
+
+  if (!registered_) {
+    return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
+                        "node must be registered before BatchLookup");
+  }
+
+  if (keys.empty()) {
+    return grpc::Status::OK;
+  }
+
+  ::umbp::BatchLookupRequest req;
+  req.set_node_id(config_.node_id);
+  for (const auto& k : keys) {
+    req.add_keys(k);
+  }
+
+  ::umbp::BatchLookupResponse resp;
+  grpc::ClientContext ctx;
+  auto status = GetStub(stub_.get())->BatchLookup(&ctx, req, &resp);
+
+  if (!status.ok()) {
+    MORI_UMBP_ERROR("[Client] BatchLookup failed: {}", status.error_message());
+    return status;
+  }
+
+  if (out != nullptr) {
+    out->resize(resp.found_size());
+    for (int i = 0; i < resp.found_size(); ++i) {
+      (*out)[i] = resp.found(i);
+    }
+  }
+
+  MORI_UMBP_DEBUG("[Client] BatchLookup: {} keys", keys.size());
+  return grpc::Status::OK;
+}
+
 void MasterClient::StartHeartbeat() {
   if (!registered_) {
     MORI_UMBP_WARN("[Client] StartHeartbeat ignored: not registered");
