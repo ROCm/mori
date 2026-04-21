@@ -20,13 +20,13 @@ python3 tests/python/ops/bench_dispatch_combine.py
 
 ## Inter-node
 
-Run the following command on each node and replace `node_rank` with its actual rank. `master_addr` should be the IP of the rank 0 node. `GLOO_SOCKET_IFNAME` should be set to the TCP socket interface you want to use.
+Run the following command on each node and replace `node_rank` with its actual rank. `master_addr` should be the hostname or IP of the rank 0 node. `GLOO_SOCKET_IFNAME` should be set to the TCP socket interface you want to use.
 
 ```bash
-export GLOO_SOCKET_IFNAME=ens14np0
+export GLOO_SOCKET_IFNAME=enp81s0f1
 export MORI_RDMA_DEVICES=^mlx5_0,mlx5_1  # Optional: use `^` prefix to exclude specified devices
 
-torchrun --nnodes=2 --node_rank=0 --nproc_per_node=8 \
+torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
     --master_addr="10.194.129.65" --master_port=1234 \
     examples/ops/dispatch_combine/test_dispatch_combine_internode.py --bench
 ```
@@ -372,10 +372,11 @@ rm -rf ~/.mori
 Run on each node, substituting `node_rank` and `master_addr` as in the [Inter-node](#inter-node) section.  Use `--cmd profile` and pass the desired kernel type via `--kernel-type`:
 
 ```bash
-export GLOO_SOCKET_IFNAME=ens14np0
+export ENABLE_PROFILER=ON
+export GLOO_SOCKET_IFNAME=enp81s0f1
 export MORI_RDMA_DEVICES=^mlx5_0,mlx5_1  # optional
 
-torchrun --nnodes=2 --node_rank=0 --nproc_per_node=8 \
+torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
     --master_addr="10.194.129.65" --master_port=1234 \
     examples/ops/dispatch_combine/test_dispatch_combine_internode.py \
     --cmd profile --kernel-type v1

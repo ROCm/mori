@@ -255,18 +255,13 @@ def detect_nic_type() -> str:
 
 
 def is_profiler_enabled() -> bool:
-    """Detect whether mori was built with ENABLE_PROFILER.
+    """Return True if the ENABLE_PROFILER environment variable is set to a truthy value.
 
-    Checks the compiled C++ extension for a profiler-only symbol
-    (``get_debug_time_buf``) so the result reflects the actual build,
-    not an environment variable that may be absent at inference time.
+    Accepted truthy values (case-insensitive): ``1``, ``true``, ``yes``, ``on``.
+    Any other value (including unset, ``0``, ``false``, ``no``, ``off``) is treated as disabled.
     """
-    try:
-        import mori.cpp  # type: ignore[import]
-
-        return hasattr(mori.cpp, "get_debug_time_buf")
-    except ImportError:
-        return False
+    val = os.environ.get("ENABLE_PROFILER", "")
+    return val.lower() in ("1", "true", "yes", "on")
 
 
 def detect_build_config() -> BuildConfig:
