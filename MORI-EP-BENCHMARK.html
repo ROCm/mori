@@ -222,10 +222,13 @@
 <ul class="current">
 <li class="toctree-l1 current"><a class="current reference internal" href="#">MORI-EP Benchmark</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="#table-of-contents">Table of Contents</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#intra-node">Intra-node</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#inter-node">Inter-node</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#nic-selection">NIC Selection</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#bandwidth-computation">Bandwidth Computation</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#intra-node">Intra-node</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#profiling-intranode-kernels">Profiling intranode kernels</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#inter-node">Inter-node</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#nic-selection">NIC Selection</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#bandwidth-computation">Bandwidth Computation</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#rdma-bandwidth">RDMA bandwidth</a><ul>
 <li class="toctree-l4"><a class="reference internal" href="#algo-bw-vs-physical-bw">Algo BW vs Physical BW</a></li>
 </ul>
@@ -234,9 +237,7 @@
 <li class="toctree-l3"><a class="reference internal" href="#why-deepep-and-mori-rdma-token-counts-are-equivalent">Why DeepEP and Mori RDMA token counts are equivalent</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#combine">Combine</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#reference-print-bw-values-py">Reference: <code class="docutils literal notranslate"><span class="pre">print_bw_values.py</span></code></a></li>
-</ul>
-</li>
-<li class="toctree-l2"><a class="reference internal" href="#profiling-ep-kernels">Profiling EP Kernels</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#profiling-internode-kernels">Profiling Internode Kernels</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#analyzing-traces-with-analyze-ep-kernel-trace-py">Analyzing traces with <code class="docutils literal notranslate"><span class="pre">analyze_ep_kernel_trace.py</span></code></a></li>
 </ul>
 </li>
@@ -307,11 +308,18 @@
 <section id="table-of-contents">
 <h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading"></a></h2>
 <ul class="simple">
-<li><p><a class="reference internal" href="#intra-node"><span class="xref myst">Intra-node</span></a></p></li>
-<li><p><a class="reference internal" href="#inter-node"><span class="xref myst">Inter-node</span></a></p></li>
+<li><p><a class="reference internal" href="#intra-node"><span class="xref myst">Intra-node</span></a></p>
+<ul>
+<li><p><a class="reference internal" href="#profiling-intranode-kernels"><span class="xref myst">Profiling intranode kernels</span></a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#inter-node"><span class="xref myst">Inter-node</span></a></p>
+<ul>
 <li><p><a class="reference internal" href="#nic-selection"><span class="xref myst">NIC Selection</span></a></p></li>
 <li><p><a class="reference internal" href="#bandwidth-computation"><span class="xref myst">Bandwidth Computation</span></a></p></li>
-<li><p><a class="reference internal" href="#profiling-ep-kernels"><span class="xref myst">Profiling EP Kernels</span></a></p></li>
+<li><p><a class="reference internal" href="#profiling-internode-kernels"><span class="xref myst">Profiling Internode Kernels</span></a></p></li>
+</ul>
+</li>
 </ul>
 </section>
 <section id="intra-node">
@@ -323,6 +331,25 @@
 python3<span class="w"> </span>tests/python/ops/bench_dispatch_combine.py
 </pre></div>
 </div>
+<section id="profiling-intranode-kernels">
+<h3>Profiling intranode kernels<a class="headerlink" href="#profiling-intranode-kernels" title="Link to this heading"></a></h3>
+<p><strong>1. Build with profiler enabled</strong></p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">ENABLE_PROFILER</span><span class="o">=</span>ON<span class="w"> </span>pip3<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </span>.<span class="w"> </span>--no-build-isolation<span class="w"> </span>-v
+</pre></div>
+</div>
+<p><strong>2. Clear the JIT cache</strong></p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>rm<span class="w"> </span>-rf<span class="w"> </span>~/.mori
+</pre></div>
+</div>
+<p><strong>3. Run the profiling job</strong></p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">ENABLE_PROFILER</span><span class="o">=</span>ON
+
+torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">1</span><span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>tests/python/ops/bench_dispatch_combine.py<span class="w"> </span>--cmd<span class="w"> </span>profile
+</pre></div>
+</div>
+<p>Traces land as <code class="docutils literal notranslate"><span class="pre">trace_intranode_rank&lt;rank&gt;_&lt;timestamp&gt;.json</span></code> in the current working directory — one file per rank.  Open them in <a class="reference external" href="https://ui.perfetto.dev">Perfetto UI</a> or analyze with <code class="docutils literal notranslate"><span class="pre">analyze_ep_kernel_trace.py</span></code> as described in the <a class="reference internal" href="#profiling-ep-kernels"><span class="xref myst">Profiling EP Kernels</span></a> section.</p>
+</section>
 </section>
 <section id="inter-node">
 <h2>Inter-node<a class="headerlink" href="#inter-node" title="Link to this heading"></a></h2>
@@ -339,9 +366,8 @@ torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">
 <div class="highlight-default notranslate"><div class="highlight"><pre><span></span>RDMA BW = Total BW × (RDMA tokens / Total tokens)
 </pre></div>
 </div>
-</section>
 <section id="nic-selection">
-<h2>NIC Selection<a class="headerlink" href="#nic-selection" title="Link to this heading"></a></h2>
+<h3>NIC Selection<a class="headerlink" href="#nic-selection" title="Link to this heading"></a></h3>
 <p>For RoCE networks, you can specify which RDMA devices to use with the <code class="docutils literal notranslate"><span class="pre">MORI_RDMA_DEVICES</span></code> environment variable:</p>
 <ul class="simple">
 <li><p><strong>Include specific devices</strong>: <code class="docutils literal notranslate"><span class="pre">MORI_RDMA_DEVICES=mlx5_0,mlx5_1</span></code></p></li>
@@ -350,8 +376,9 @@ torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">
 </ul>
 </section>
 <section id="bandwidth-computation">
-<h2>Bandwidth Computation<a class="headerlink" href="#bandwidth-computation" title="Link to this heading"></a></h2>
+<h3>Bandwidth Computation<a class="headerlink" href="#bandwidth-computation" title="Link to this heading"></a></h3>
 <p>Two fabrics are measured: <strong>RDMA</strong> (inter-node) and <strong>NVL/XGMI</strong> (intra-node).</p>
+</section>
 <hr class="docutils" />
 <section id="rdma-bandwidth">
 <h3>RDMA bandwidth<a class="headerlink" href="#rdma-bandwidth" title="Link to this heading"></a></h3>
@@ -668,10 +695,9 @@ Each token can map to the same node via multiple expert slots; both implementati
 </pre></div>
 </div>
 </section>
-</section>
 <hr class="docutils" />
-<section id="profiling-ep-kernels">
-<h2>Profiling EP Kernels<a class="headerlink" href="#profiling-ep-kernels" title="Link to this heading"></a></h2>
+<section id="profiling-internode-kernels">
+<h3>Profiling Internode Kernels<a class="headerlink" href="#profiling-internode-kernels" title="Link to this heading"></a></h3>
 <p>Mori ships a profiler that emits Perfetto-compatible JSON traces for each EP kernel invocation.</p>
 <p><strong>1. Build with profiler enabled</strong></p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">cd</span><span class="w"> </span>/apps/ditian12/mori
@@ -695,6 +721,7 @@ torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">
 </pre></div>
 </div>
 <p>Repeat for <code class="docutils literal notranslate"><span class="pre">--kernel-type</span> <span class="pre">v1_ll</span></code> and <code class="docutils literal notranslate"><span class="pre">--kernel-type</span> <span class="pre">async_ll</span></code>.  Traces land as <code class="docutils literal notranslate"><span class="pre">trace_rank_&lt;rank&gt;_&lt;timestamp&gt;.json</span></code> in the current working directory.</p>
+</section>
 <section id="analyzing-traces-with-analyze-ep-kernel-trace-py">
 <h3>Analyzing traces with <code class="docutils literal notranslate"><span class="pre">analyze_ep_kernel_trace.py</span></code><a class="headerlink" href="#analyzing-traces-with-analyze-ep-kernel-trace-py" title="Link to this heading"></a></h3>
 <p><a class="reference download internal" download="" href="_downloads/3d366d3f7cc7bc0fad6f2222e7e22275/analyze_ep_kernel_trace.py"><span class="xref download myst">tools/profiler/analyze_ep_kernel_trace.py</span></a> parses a single <code class="docutils literal notranslate"><span class="pre">trace_rank_*.json</span></code> file and produces a Gantt-style PNG showing how EP kernels overlap within each dispatch+combine iteration.</p>
