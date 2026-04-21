@@ -146,7 +146,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
     uint64_t scatterBase,
     uint64_t agBase,
     uint64_t reduceCompleteBase,
-    uint64_t* phase_ts = nullptr) {
+    uint64_t* phase_ts) {
 
   ar_write_phase_ts(phase_ts, 0);  // phase 0: kernel entry
 
