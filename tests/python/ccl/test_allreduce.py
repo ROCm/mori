@@ -995,7 +995,16 @@ def _bench_overlap_one_size(
             n_samples = 5
             all_phase_deltas = []     # block-0 phases, only populated on rank 0
             all_cb_phase_deltas = []  # compute-block-1 phases, only populated on rank 0
+            all_copy_timings = []     # copy-path timings, only populated on rank 0
             stage_med_ar0 = []        # only populated on rank 0
+
+            # Turn on copy-path timing too. We only parse it for AR[0] (same
+            # gating logic as phase timing): enable before AR[0] submit,
+            # disable right after so AR[1..N-1] don't overwrite the events.
+            try:
+                ar_obj.enable_copy_timing(True)
+            except Exception:
+                pass
 
             for _sample in range(n_samples):
                 # Sync all ranks before each sample so AR[0] cold path is
@@ -1010,10 +1019,14 @@ def _bench_overlap_one_size(
                 ev_ar0_s = torch.cuda.Event(enable_timing=True)
                 ev_ar0_e = torch.cuda.Event(enable_timing=True)
 
-                # Enable phase timing ONLY for AR[0]'s submit. Disable right
-                # after so AR[1..N-1] kernels receive phase_ts=nullptr and
-                # don't overwrite AR[0]'s timestamps in the buffer.
+                # Enable phase timing + copy timing ONLY for AR[0]'s submit.
+                # Disable right after so AR[1..N-1] don't overwrite buffers
+                # in the class (both are single-slot per AR call).
                 ar_obj.enable_phase_timing(True)
+                try:
+                    ar_obj.enable_copy_timing(True)
+                except Exception:
+                    pass
                 ev_g0_s.record(stream_gemm)
                 with torch.cuda.stream(stream_gemm):
                     _run_gemm()
@@ -1024,6 +1037,10 @@ def _bench_overlap_one_size(
                     launch_ar()       # AR[0] submitted with phase_ts_d_
                 ev_ar0_e.record(stream_ar)
                 ar_obj.enable_phase_timing(False)  # must disable BEFORE submitting AR[1+]
+                try:
+                    ar_obj.enable_copy_timing(False)
+                except Exception:
+                    pass
 
                 # Immediately submit AR[1..N-1] (no phase timing). This
                 # reproduces real overlap-loop state where AR[0] runs with
@@ -1045,6 +1062,14 @@ def _bench_overlap_one_size(
                 dist.barrier()
                 ts = ar_obj.get_phase_timestamps()
                 last_nc = ar_obj.get_last_num_chunks()
+
+                # Read copy timing for AR[0] (stream already synced above).
+                try:
+                    ct = ar_obj.get_copy_timing_ms()
+                    if len(ct) == 2 and rank == 0:
+                        all_copy_timings.append(ct)
+                except Exception:
+                    pass
 
                 if rank == 0:
                     # Convert raw cycles to ms using AR[0] event duration as anchor.
@@ -1108,6 +1133,18 @@ def _bench_overlap_one_size(
                 else:
                     print(f"  --- Block 1 (compute block) timestamps all zero: kernel was "
                           f"not built with compute-block instrumentation ---")
+
+                if len(all_copy_timings) > 0:
+                    host_us_vals = [v[0] for v in all_copy_timings]
+                    gpu_ms_vals = [v[1] for v in all_copy_timings]
+                    host_us_med = _st.median(host_us_vals)
+                    gpu_ms_med = _st.median(gpu_ms_vals)
+                    print(f"  --- Copy-path (baseline: single hipMemcpyAsync in copy_output_to_user) ---")
+                    print(f"    host-side hipMemcpyAsync() call:      {host_us_med:7.2f} us")
+                    print(f"    gpu-side copy kernel wall:            {gpu_ms_med:7.3f} ms")
+                else:
+                    print(f"  --- Copy-path timing unavailable "
+                          f"(copy_output_to_user path not hit or api unavailable) ---")
                 print()
         except Exception as e:
             if rank == 0:

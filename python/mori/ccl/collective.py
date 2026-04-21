@@ -363,3 +363,25 @@ class AllreduceSdma:
         Needed to parse get_phase_timestamps()'s layout.
         """
         return self._handle.get_last_num_chunks()
+
+    # --- Copy-path timing (baseline: single hipMemcpyAsync) ---------------
+    def enable_copy_timing(self, on: bool):
+        """Enable per-call copy-path timing (hipMemcpyAsync host us + gpu ms)."""
+        self._handle.enable_copy_timing(on)
+
+    def get_copy_timing_ms(self) -> list:
+        """Return [host_us, gpu_ms] for the most recent copy_output_to_user()
+        call. Baseline has a single hipMemcpyAsync so len() == 2.
+
+        host_us: wall time spent inside the host hipMemcpyAsync() API call
+        gpu_ms:  wall time between events recorded before/after the copy on
+                 the stream (= actual GPU copy kernel runtime).
+
+        Call AFTER the stream has been synchronized.
+        """
+        return list(self._handle.get_copy_timing_ms())
+
+    def get_copy_timing_last_num_chunks(self) -> int:
+        """Baseline always returns 1 (single copy). Reserved for path B to
+        indicate number of chunked copies."""
+        return self._handle.get_copy_timing_last_num_chunks()

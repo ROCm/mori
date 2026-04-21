@@ -26,6 +26,7 @@
 #include <hip/hip_fp16.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -157,9 +158,63 @@ AllreduceSdma<T>::~AllreduceSdma() {
     hipFree(phase_ts_d_);
     phase_ts_d_ = nullptr;
   }
+  if (copy_start_event_) {
+    hipEventDestroy(copy_start_event_);
+    copy_start_event_ = nullptr;
+  }
+  if (copy_end_event_) {
+    hipEventDestroy(copy_end_event_);
+    copy_end_event_ = nullptr;
+  }
   if (flags_) {
     printf("AllreduceSdma destroyed: PE %d\n", myPe_);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Copy-path instrumentation (baseline: single hipMemcpyAsync)
+// Rule R0: we cannot change the copy strategy without having numbers for
+// the current (baseline) copy first.  This block establishes those numbers.
+// ---------------------------------------------------------------------------
+template <typename T>
+void AllreduceSdma<T>::enable_copy_timing(bool on) {
+  if (on == copy_timing_enabled_) return;
+  if (on) {
+    if (copy_start_event_ == nullptr) {
+      hipError_t e = hipEventCreateWithFlags(&copy_start_event_, hipEventDefault);
+      if (e != hipSuccess) {
+        fprintf(stderr, "PE %d: copy_start_event create failed: %s\n",
+                myPe_, hipGetErrorString(e));
+        return;
+      }
+    }
+    if (copy_end_event_ == nullptr) {
+      hipError_t e = hipEventCreateWithFlags(&copy_end_event_, hipEventDefault);
+      if (e != hipSuccess) {
+        fprintf(stderr, "PE %d: copy_end_event create failed: %s\n",
+                myPe_, hipGetErrorString(e));
+        hipEventDestroy(copy_start_event_);
+        copy_start_event_ = nullptr;
+        return;
+      }
+    }
+    copy_timing_enabled_ = true;
+    copy_timing_recorded_ = false;
+    printf("PE %d: copy timing ENABLED (baseline: single hipMemcpyAsync)\n", myPe_);
+  } else {
+    copy_timing_enabled_ = false;
+  }
+}
+
+template <typename T>
+std::vector<double> AllreduceSdma<T>::get_copy_timing_ms() {
+  std::vector<double> out;
+  if (!copy_timing_enabled_ || !copy_timing_recorded_) return out;
+  float ms = 0.0f;
+  hipError_t e = hipEventElapsedTime(&ms, copy_start_event_, copy_end_event_);
+  out.push_back(copy_timing_host_us_);
+  out.push_back(e == hipSuccess ? static_cast<double>(ms) : -1.0);
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -302,10 +357,26 @@ void AllreduceSdma<T>::copy_output_to_user(T* output, size_t total_count, hipStr
   if (!output) throw std::runtime_error("Output pointer is null");
   if (!output_transit_buffer_) throw std::runtime_error("Output transit buffer is null");
 
+  const bool do_timing = copy_timing_enabled_ && stream != nullptr;
+  if (do_timing) {
+    hipEventRecord(copy_start_event_, stream);
+  }
+  auto host_t0 = do_timing ? std::chrono::steady_clock::now()
+                           : std::chrono::steady_clock::time_point{};
+
   hipError_t err =
       stream
           ? hipMemcpyAsync(output, output_transit_buffer_, bytes, hipMemcpyDeviceToDevice, stream)
           : hipMemcpy(output, output_transit_buffer_, bytes, hipMemcpyDeviceToDevice);
+
+  if (do_timing) {
+    auto host_t1 = std::chrono::steady_clock::now();
+    copy_timing_host_us_ =
+        std::chrono::duration<double, std::micro>(host_t1 - host_t0).count();
+    hipEventRecord(copy_end_event_, stream);
+    copy_timing_recorded_ = true;
+  }
+
   if (err != hipSuccess) {
     fprintf(stderr, "PE %d: copy_output_to_user failed: %s\n", myPe_, hipGetErrorString(err));
     throw std::runtime_error("Output copy failed");

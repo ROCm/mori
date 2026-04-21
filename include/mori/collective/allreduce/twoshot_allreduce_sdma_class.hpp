@@ -101,6 +101,19 @@ class AllreduceSdma {
   uint64_t* phase_ts_d_ = nullptr;  // device buffer, capacity kPhaseTsCapacity * uint64_t
   int last_num_chunks_ = 0;  // numChunks used by the most recent pipelined() call
 
+  // ---------------------------------------------------------------------
+  // Copy-path instrumentation (diagnostic; baseline uses a single
+  // hipMemcpyAsync in copy_output_to_user()). When enabled, we record a
+  // hipEvent_t before and after that call, plus chrono around the host API
+  // invocation. This is the ONLY way to prove how much time the copy
+  // contributes, *before* we change the copy strategy (see rule R0).
+  // ---------------------------------------------------------------------
+  bool copy_timing_enabled_ = false;
+  hipEvent_t copy_start_event_ = nullptr;
+  hipEvent_t copy_end_event_ = nullptr;
+  double copy_timing_host_us_ = 0.0;   // populated each copy_output_to_user() call
+  bool copy_timing_recorded_ = false;  // indicates events were submitted
+
   AllreduceSdma(const AllreduceSdma&) = delete;
   AllreduceSdma& operator=(const AllreduceSdma&) = delete;
 
@@ -212,6 +225,19 @@ class AllreduceSdma {
   //   2 + 3*numChunks:   AG wait done
   //   3 + 3*numChunks:   block 0 exit
   std::vector<uint64_t> get_phase_timestamps();
+
+  // --- Copy-path instrumentation (baseline: single hipMemcpyAsync) ---
+  // Enable to record a {start,end} hipEvent around the hipMemcpyAsync in
+  // copy_output_to_user(), plus chrono around the host API call. Read back
+  // via get_copy_timing_ms() after the stream is synchronized.
+  // Layout of the returned vector (length 2):
+  //   [0]: host-side microseconds spent inside hipMemcpyAsync() host call
+  //   [1]: GPU-side milliseconds between pre/post events (copy kernel wall)
+  // get_copy_timing_last_num_chunks() returns 1 (baseline is a single copy).
+  void enable_copy_timing(bool on);
+  bool is_copy_timing_enabled() const { return copy_timing_enabled_; }
+  std::vector<double> get_copy_timing_ms();
+  int get_copy_timing_last_num_chunks() const { return 1; }
 };
 
 }  // namespace collective
