@@ -993,8 +993,9 @@ def _bench_overlap_one_size(
     if ar_phase_timing and ar_obj is not None and use_overlap:
         try:
             n_samples = 5
-            all_phase_deltas = []   # only populated on rank 0
-            stage_med_ar0 = []      # only populated on rank 0
+            all_phase_deltas = []     # block-0 phases, only populated on rank 0
+            all_cb_phase_deltas = []  # compute-block-1 phases, only populated on rank 0
+            stage_med_ar0 = []        # only populated on rank 0
 
             for _sample in range(n_samples):
                 # Sync all ranks before each sample so AR[0] cold path is
@@ -1065,6 +1066,22 @@ def _bench_overlap_one_size(
                     phases["AG-wait-done→exit"] = (ts[3 + 3 * last_nc] - ts[2 + 3 * last_nc]) * cy_to_ms
                     all_phase_deltas.append(phases)
 
+                    # Compute-block-1 phase breakdown (slots 10..11+3*nc).
+                    # Only present if kernel was built with compute-block
+                    # instrumentation; slots 10+ will be 0 otherwise.
+                    if ts[10] != 0 and ts[11 + 3 * last_nc] != 0:
+                        cb_events = [(10, "entry")]
+                        for c in range(last_nc):
+                            cb_events.append((11 + 3 * c + 0, f"c{c}-loop"))
+                            cb_events.append((11 + 3 * c + 1, f"c{c}-sct-poll-done"))
+                            cb_events.append((11 + 3 * c + 2, f"c{c}-reduce-done"))
+                        cb_events.append((11 + 3 * last_nc, "cb-exit"))
+                        cb_phases = {}
+                        for i in range(1, len(cb_events)):
+                            label = f"{cb_events[i-1][1]}→{cb_events[i][1]}"
+                            cb_phases[label] = (ts[cb_events[i][0]] - ts[cb_events[i-1][0]]) * cy_to_ms
+                        all_cb_phase_deltas.append(cb_phases)
+
             if rank == 0 and len(all_phase_deltas) > 0:
                 import statistics as _st
                 phase_keys = list(all_phase_deltas[0].keys())
@@ -1073,12 +1090,24 @@ def _bench_overlap_one_size(
                 print(f"\n  === AR[0] Phase Breakdown [{timeline_label}]  "
                       f"N={num_stages}  numChunks={last_nc}  "
                       f"(median of {n_samples} samples, ms) ===")
+                print(f"  --- Block 0 (scatter/barrier/AG-submit orchestration) ---")
                 print(f"  AR[0] total (event):                  {ar0_med:7.3f} ms")
-                print(f"  sum of phase deltas:                  "
+                print(f"  sum of block-0 phase deltas:          "
                       f"{sum(med.values()):7.3f} ms")
-                print(f"  ----- phase breakdown -----")
                 for k, v in med.items():
                     print(f"    {k:<35s} {v:7.3f} ms")
+
+                if len(all_cb_phase_deltas) > 0:
+                    cb_keys = list(all_cb_phase_deltas[0].keys())
+                    cb_med = {k: _st.median([d[k] for d in all_cb_phase_deltas]) for k in cb_keys}
+                    print(f"  --- Block 1 (first compute block: dispatch / scatter-poll / reduce) ---")
+                    print(f"  sum of compute-block phase deltas:    "
+                          f"{sum(cb_med.values()):7.3f} ms")
+                    for k, v in cb_med.items():
+                        print(f"    {k:<35s} {v:7.3f} ms")
+                else:
+                    print(f"  --- Block 1 (compute block) timestamps all zero: kernel was "
+                          f"not built with compute-block instrumentation ---")
                 print()
         except Exception as e:
             if rank == 0:

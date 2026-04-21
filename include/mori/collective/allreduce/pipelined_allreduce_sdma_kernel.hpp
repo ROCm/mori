@@ -60,6 +60,18 @@ __device__ inline void ar_write_phase_ts(uint64_t* ts, int idx) {
     ts[idx] = __builtin_amdgcn_s_memtime();
   }
 }
+
+// Same as ar_write_phase_ts but only the first compute block (block 1) writes.
+// Used to measure compute-block-internal phases (dispatch latency, scatter-poll
+// wait, reduce execution, fetch_add). Block 1 slots use idx 10..17:
+//   10: compute block entry
+//   11 + 3c + {0,1,2}: chunk c {loop-start, scatter-poll done, reduce done}
+//   11 + 3*numChunks: compute block exit (after final fetch_add)
+__device__ inline void ar_write_phase_ts_cb1(uint64_t* ts, int idx) {
+  if (ts != nullptr && blockIdx.x == 1 && threadIdx.x == 0) {
+    ts[idx] = __builtin_amdgcn_s_memtime();
+  }
+}
 // ---------------------------------------------------------------------------
 
 // ============================================================================
@@ -218,6 +230,8 @@ __global__ void PipelinedAllReduceSdmaKernel(
       // =================================================================
       // COMPUTE BLOCKS (1..N): scatter-poll → reduce → chunks_complete
       // =================================================================
+      ar_write_phase_ts_cb1(phase_ts, 10);  // compute block entry (block 1 thr 0)
+
       const size_t compTid =
           static_cast<size_t>(blockIdx.x - 1) * static_cast<size_t>(blockDim.x)
           + threadIdx.x;
@@ -225,6 +239,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
           static_cast<size_t>(compBlocks) * static_cast<size_t>(blockDim.x);
 
       for (int c = 0; c < numChunks; c++) {
+        ar_write_phase_ts_cb1(phase_ts, 11 + 3 * c + 0);  // chunk c: loop start
         const size_t off = static_cast<size_t>(c) * packedChunkPerRank;
 
         if (c > 0 && threadIdx.x == 64) {
@@ -249,6 +264,8 @@ __global__ void PipelinedAllReduceSdmaKernel(
             }
           }
         }
+        ar_write_phase_ts_cb1(phase_ts, 11 + 3 * c + 1);  // chunk c: scatter-poll done
+
         if (threadIdx.x < static_cast<unsigned>(npes)) {
           const int pe = static_cast<int>(threadIdx.x);
           s_pe_ptrs[pe] = (pe == myPe)
@@ -295,6 +312,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
         }
 
         __syncthreads();
+        ar_write_phase_ts_cb1(phase_ts, 11 + 3 * c + 2);  // chunk c: reduce done
       }
 
       if (threadIdx.x == 0) {
@@ -305,6 +323,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
         __hip_atomic_fetch_add(&barrier->chunks_complete, 1u,
                                __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
       }
+      ar_write_phase_ts_cb1(phase_ts, 11 + 3 * numChunks);  // compute block exit
 
     } else {
       // =================================================================
