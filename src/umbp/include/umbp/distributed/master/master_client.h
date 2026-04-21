@@ -113,6 +113,11 @@ class MasterClient {
                                        const std::vector<std::string>& allocation_ids,
                                        std::vector<bool>* out,
                                        const std::vector<int32_t>& depths = {});
+  // Read-only batch existence check (no access-count / lease side-effects).
+  // `out` is cleared on entry; on wire error it remains empty and the
+  // returned Status carries the failure.  On success, `*out` is resized to
+  // keys.size() and populated parallel to keys.
+  grpc::Status BatchLookup(const std::vector<std::string>& keys, std::vector<bool>* out);
 
   // --- Heartbeat ---
   void StartHeartbeat();

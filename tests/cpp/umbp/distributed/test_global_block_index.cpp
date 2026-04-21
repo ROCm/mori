@@ -181,6 +181,62 @@ TEST(BlockIndexTest, BatchRegisterAndBatchUnregister) {
   EXPECT_TRUE(index.Lookup("key-2").empty());
 }
 
+TEST(BlockIndexTest, BatchLookupExistsMatchesSingleLookup) {
+  GlobalBlockIndex index;
+
+  index.Register("node-a", "key-1", MakeLocation("node-a", "loc-1", 1024, TierType::HBM));
+  index.Register("node-a", "key-2", MakeLocation("node-a", "loc-2", 2048, TierType::DRAM));
+  // key-3 intentionally never registered.
+
+  const std::vector<std::string> keys = {"key-1", "key-2", "key-3", ""};
+
+  const auto batch = index.BatchLookupExists(keys);
+  ASSERT_EQ(batch.size(), keys.size());
+  for (size_t i = 0; i < keys.size(); ++i) {
+    const bool single = !index.Lookup(keys[i]).empty();
+    EXPECT_EQ(batch[i], single) << "keys[" << i << "]='" << keys[i] << "'";
+  }
+
+  EXPECT_TRUE(index.BatchLookupExists({}).empty());
+}
+
+TEST(BlockIndexTest, BatchLookupExistsHasNoMetricsSideEffects) {
+  GlobalBlockIndex index;
+
+  index.Register("node-a", "key-1", MakeLocation("node-a", "loc-1", 1024, TierType::HBM));
+  index.Register("node-a", "key-2", MakeLocation("node-a", "loc-2", 2048, TierType::DRAM));
+
+  const auto before_k1 = index.GetMetrics("key-1");
+  const auto before_k2 = index.GetMetrics("key-2");
+  ASSERT_TRUE(before_k1.has_value());
+  ASSERT_TRUE(before_k2.has_value());
+
+  // Sleep so that any RecordAccess side-effect would bump last_accessed_at
+  // above the captured baseline (RecordAccess uses steady_clock::now()).
+  std::this_thread::sleep_for(std::chrono::milliseconds(2));
+
+  const std::vector<std::string> keys = {"key-1", "key-2", "key-missing"};
+  for (int i = 0; i < 5; ++i) {
+    const auto found = index.BatchLookupExists(keys);
+    ASSERT_EQ(found.size(), keys.size());
+    EXPECT_TRUE(found[0]);
+    EXPECT_TRUE(found[1]);
+    EXPECT_FALSE(found[2]);
+  }
+
+  const auto after_k1 = index.GetMetrics("key-1");
+  const auto after_k2 = index.GetMetrics("key-2");
+  ASSERT_TRUE(after_k1.has_value());
+  ASSERT_TRUE(after_k2.has_value());
+
+  // Same read-only contract as single Lookup (#9): access_count and
+  // last_accessed_at must not move when we merely probe existence.
+  EXPECT_EQ(after_k1->access_count, before_k1->access_count);
+  EXPECT_EQ(after_k2->access_count, before_k2->access_count);
+  EXPECT_EQ(after_k1->last_accessed_at, before_k1->last_accessed_at);
+  EXPECT_EQ(after_k2->last_accessed_at, before_k2->last_accessed_at);
+}
+
 TEST(BlockIndexTest, ClientRegistryUnregisterCleansIndexEntriesForClient) {
   GlobalBlockIndex index;
   ClientRegistry registry(ClientRegistryConfig{}, index);

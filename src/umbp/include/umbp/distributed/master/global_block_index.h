@@ -115,6 +115,12 @@ class GlobalBlockIndex {
   // --- Queries ---
   std::vector<Location> Lookup(const std::string& key) const;
 
+  // Batched existence check — single shared_lock acquisition for the whole
+  // batch.  Semantics match Lookup(): read-only, no access-count or lease
+  // side-effects.  Returns a vector parallel to `keys` where entry i is
+  // true iff the key has at least one registered Location.
+  std::vector<bool> BatchLookupExists(const std::vector<std::string>& keys) const;
+
   // Returns metrics for a key, or nullopt if the key doesn't exist.
   std::optional<BlockMetrics> GetMetrics(const std::string& key) const;
 
