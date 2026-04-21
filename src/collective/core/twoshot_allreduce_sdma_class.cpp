@@ -296,19 +296,48 @@ void AllreduceSdma<T>::copy_input_to_transit(T* input, size_t total_count, hipSt
 
 // copy_output_to_user implementation
 // For AllReduce: output is total_count elements (same size as input, NOT npes * total_count)
+//
+// Uses ArLocalBlitKernel (custom D2D copy kernel with low CU footprint) instead
+// of hipMemcpyAsync. hipMemcpyAsync for D2D runs as __amd_rocclr_copyBuffer
+// which uses many blocks (~256), heavily competing with AR reduce and
+// concurrent GEMM for CU. Our kernel uses only kBlitBlocks blocks with uint4
+// vectorized loads to still saturate HBM bandwidth.
 template <typename T>
 void AllreduceSdma<T>::copy_output_to_user(T* output, size_t total_count, hipStream_t stream) {
   size_t bytes = total_count * dtype_size_;
   if (!output) throw std::runtime_error("Output pointer is null");
   if (!output_transit_buffer_) throw std::runtime_error("Output transit buffer is null");
 
-  hipError_t err =
-      stream
-          ? hipMemcpyAsync(output, output_transit_buffer_, bytes, hipMemcpyDeviceToDevice, stream)
-          : hipMemcpy(output, output_transit_buffer_, bytes, hipMemcpyDeviceToDevice);
-  if (err != hipSuccess) {
-    fprintf(stderr, "PE %d: copy_output_to_user failed: %s\n", myPe_, hipGetErrorString(err));
-    throw std::runtime_error("Output copy failed");
+  if (stream != nullptr) {
+    // Configurable via MORI_COPY_BLOCKS (default 16). Small block count
+    // reduces CU contention; uint4 vectorization keeps HBM saturated.
+    static const int kBlitBlocks = []() {
+      const char* e = std::getenv("MORI_COPY_BLOCKS");
+      if (e) {
+        int v = std::atoi(e);
+        if (v > 0 && v <= 256) return v;
+      }
+      return 16;
+    }();
+    static const int kBlitThreads = 512;
+    ArLocalBlitKernel<<<kBlitBlocks, kBlitThreads, 0, stream>>>(
+        static_cast<void*>(output),
+        static_cast<const void*>(output_transit_buffer_),
+        bytes);
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+      fprintf(stderr, "PE %d: ArLocalBlitKernel launch failed: %s\n",
+              myPe_, hipGetErrorString(err));
+      throw std::runtime_error("Output copy failed");
+    }
+  } else {
+    hipError_t err =
+        hipMemcpy(output, output_transit_buffer_, bytes, hipMemcpyDeviceToDevice);
+    if (err != hipSuccess) {
+      fprintf(stderr, "PE %d: copy_output_to_user (sync) failed: %s\n",
+              myPe_, hipGetErrorString(err));
+      throw std::runtime_error("Output copy failed");
+    }
   }
 }
 
