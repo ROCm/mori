@@ -136,12 +136,31 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t /*input_buffer_size*/
     }
   }
 
+  // ---- Chunk-level pipeline infrastructure (path B) ----
+  // Dedicated stream + event + device counter so per-chunk copies can run
+  // concurrently with the AR kernel's work on later chunks.
+  hipError_t se = hipStreamCreateWithFlags(&copy_stream_, hipStreamNonBlocking);
+  if (se != hipSuccess)
+    throw std::runtime_error("Failed to create copy_stream for chunk pipeline");
+  se = hipEventCreateWithFlags(&copy_done_event_, hipEventDisableTiming);
+  if (se != hipSuccess)
+    throw std::runtime_error("Failed to create copy_done_event");
+  // Allocate 1x uint32 as chunk-ready counter. Uncached so kernel atomic
+  // writes are immediately visible to host-side hipStreamWaitValue32.
+  se = hipExtMallocWithFlags((void**)&chunk_ready_counter_d_, sizeof(uint32_t),
+                             hipDeviceMallocUncached);
+  if (se != hipSuccess || chunk_ready_counter_d_ == nullptr)
+    throw std::runtime_error("Failed to alloc chunk_ready_counter (uncached)");
+  hipMemset(chunk_ready_counter_d_, 0, sizeof(uint32_t));
+
   printf("AllreduceSdma(SDMA) initialized: PE %d of %d, max_blocks=%d\n", myPe_, npes_,
          max_blocks_);
   printf("  Flags: %zu bytes at %p\n", flagsSize, flags_.get());
   printf("  Barrier: %zu bytes at %p\n", barrierSize, bMem);
   printf("  Output transit buffer: %.2f MB at %p\n",
          output_transit_buffer_size_ / (1024.0 * 1024.0), output_transit_buffer_);
+  printf("  Copy stream: %p, chunk_ready_counter: %p\n",
+         copy_stream_, chunk_ready_counter_d_);
 }
 
 // ---------------------------------------------------------------------------
@@ -156,6 +175,18 @@ AllreduceSdma<T>::~AllreduceSdma() {
   if (phase_ts_d_) {
     hipFree(phase_ts_d_);
     phase_ts_d_ = nullptr;
+  }
+  if (chunk_ready_counter_d_) {
+    hipFree(chunk_ready_counter_d_);
+    chunk_ready_counter_d_ = nullptr;
+  }
+  if (copy_done_event_) {
+    hipEventDestroy(copy_done_event_);
+    copy_done_event_ = nullptr;
+  }
+  if (copy_stream_) {
+    hipStreamDestroy(copy_stream_);
+    copy_stream_ = nullptr;
   }
   if (flags_) {
     printf("AllreduceSdma destroyed: PE %d\n", myPe_);
@@ -620,12 +651,21 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         uint64_t* phase_ts_ptr = phase_timing_enabled_ ? phase_ts_d_ : nullptr;
         last_num_chunks_ = numChunks_host;
 
+        // Chunk-level pipeline (path B): enable when scatter_mode=0 and
+        // copy_output_to_user_=true. Kernel emits chunk-ready signal per
+        // chunk so host can dispatch per-chunk copy concurrently.
+        const bool chunked_copy_enabled =
+            copy_output_to_user_ && (scatter_mode == 0);
+        uint32_t* chunk_counter_for_kernel =
+            chunked_copy_enabled ? chunk_ready_counter_d_ : nullptr;
+
         if (scatter_mode == 1) {
             PipelinedAllReduceSdmaKernel<T, 1><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
                 barrierPtr_, inputSymmObj, total_count, chunk_elems,
-                scatter_base, ag_base, reduce_complete_base, phase_ts_ptr);
+                scatter_base, ag_base, reduce_complete_base, phase_ts_ptr,
+                /*chunk_ready_counter=*/nullptr);
         } else if (external_scatter) {
             ScatterSdmaOnlyKernel<T><<<1, 512, 0, stream>>>(
                 myPe_, npes_, input, output_transit_buffer_obj_,
@@ -637,7 +677,8 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                     output_transit_buffer_obj_, flagsObj_,
                     barrierPtr_, application::SymmMemObjPtr{},
                     total_count, chunk_elems, scatter_base, ag_base,
-                    reduce_complete_base, phase_ts_ptr);
+                    reduce_complete_base, phase_ts_ptr,
+                    chunk_counter_for_kernel);
             } else {
                 PipelinedAllReduceSdmaKernel<T, 0, false, true>
                     <<<blocks, threads, 0, stream>>>(
@@ -645,20 +686,23 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                     output_transit_buffer_obj_, flagsObj_,
                     barrierPtr_, application::SymmMemObjPtr{},
                     total_count, chunk_elems, scatter_base, ag_base,
-                    reduce_complete_base, phase_ts_ptr);
+                    reduce_complete_base, phase_ts_ptr,
+                    chunk_counter_for_kernel);
             }
         } else if (multi_chunk) {
             PipelinedAllReduceSdmaKernel<T, 0, true><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
                 barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems,
-                scatter_base, ag_base, reduce_complete_base, phase_ts_ptr);
+                scatter_base, ag_base, reduce_complete_base, phase_ts_ptr,
+                chunk_counter_for_kernel);
         } else {
             PipelinedAllReduceSdmaKernel<T, 0, false><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
                 barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems,
-                scatter_base, ag_base, reduce_complete_base, phase_ts_ptr);
+                scatter_base, ag_base, reduce_complete_base, phase_ts_ptr,
+                chunk_counter_for_kernel);
         }
 
         pipeline_scatter_gen_ += numChunks_host;   // scatter SDMA only (qId=0)
@@ -673,7 +717,73 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         }
 
         if (copy_output_to_user_) {
-            copy_output_to_user(output, total_count, stream);
+            if (chunked_copy_enabled) {
+                // Per-chunk dispatch: for each chunk c, wait kernel's
+                // chunk-ready signal and launch an npes-shard strided copy
+                // on copy_stream_, overlapping with kernel's chunk c+1 work.
+                const size_t element_size = dtype_size_;
+                constexpr int pack_size = packed_t<T>::P::size;
+                const size_t element_count_per_rank =
+                    ((total_count / static_cast<size_t>(npes_) +
+                      static_cast<size_t>(pack_size) - 1U) /
+                     static_cast<size_t>(pack_size)) *
+                    static_cast<size_t>(pack_size);
+                const size_t shard_bytes = element_count_per_rank * element_size;
+                const size_t chunk_per_rank =
+                    ((chunk_elems / static_cast<size_t>(npes_) +
+                      static_cast<size_t>(pack_size) - 1U) /
+                     static_cast<size_t>(pack_size)) *
+                    static_cast<size_t>(pack_size);
+                const size_t chunk_shard_bytes = chunk_per_rank * element_size;
+
+                char* src_base = static_cast<char*>(output_transit_buffer_);
+                char* dst_base = reinterpret_cast<char*>(output);
+
+                for (int c = 0; c < numChunks_host; ++c) {
+                    // Wait: kernel's chunk-ready counter >= prev_gen + c + 1
+                    uint32_t expected =
+                        chunk_ready_gen_ + static_cast<uint32_t>(c) + 1u;
+                    hipError_t we = hipStreamWaitValue32(
+                        copy_stream_,
+                        static_cast<void*>(chunk_ready_counter_d_),
+                        expected,
+                        hipStreamWaitValueGte,
+                        0xFFFFFFFFu);
+                    if (we != hipSuccess) {
+                        fprintf(stderr,
+                                "PE %d: hipStreamWaitValue32(c=%d, exp=%u) failed: %s\n",
+                                myPe_, c, expected, hipGetErrorString(we));
+                        return false;
+                    }
+                    // 2D copy for chunk c: height=npes shards, width=chunk_shard_bytes,
+                    // pitch=shard_bytes (both src and dst layout is the same).
+                    size_t c_off = static_cast<size_t>(c) * chunk_shard_bytes;
+                    size_t width = chunk_shard_bytes;
+                    if (c_off + width > shard_bytes) width = shard_bytes - c_off;
+                    if (width == 0) continue;
+                    hipError_t me = hipMemcpy2DAsync(
+                        dst_base + c_off, shard_bytes,
+                        src_base + c_off, shard_bytes,
+                        width, static_cast<size_t>(npes_),
+                        hipMemcpyDeviceToDevice, copy_stream_);
+                    if (me != hipSuccess) {
+                        fprintf(stderr,
+                                "PE %d: hipMemcpy2DAsync(c=%d) failed: %s\n",
+                                myPe_, c, hipGetErrorString(me));
+                        return false;
+                    }
+                }
+
+                chunk_ready_gen_ += static_cast<uint32_t>(numChunks_host);
+
+                // Record copy_done on copy_stream, then main stream waits so
+                // the next pipelined() call's AR cannot overwrite transit
+                // buffer before this call's copy has finished reading it.
+                hipEventRecord(copy_done_event_, copy_stream_);
+                hipStreamWaitEvent(stream, copy_done_event_, 0);
+            } else {
+                copy_output_to_user(output, total_count, stream);
+            }
         }
     } catch (const std::exception& e) {
         fprintf(stderr, "PE %d: PipelinedAllReduce failed: %s\n", myPe_, e.what());

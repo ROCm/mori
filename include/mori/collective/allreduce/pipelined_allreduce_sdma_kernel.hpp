@@ -158,7 +158,8 @@ __global__ void PipelinedAllReduceSdmaKernel(
     uint64_t scatterBase,
     uint64_t agBase,
     uint64_t reduceCompleteBase,
-    uint64_t* phase_ts) {
+    uint64_t* phase_ts,
+    uint32_t* chunk_ready_counter) {
 
   ar_write_phase_ts(phase_ts, 0);  // phase 0: kernel entry
 
@@ -432,18 +433,31 @@ __global__ void PipelinedAllReduceSdmaKernel(
             core::SdmaPutThread(src, dst, agBytes, dh, rSig, numQ, 1);
           }
           ar_write_phase_ts(phase_ts, 2 + 3 * c + 2);  // chunk c: AG submit done
-        }
 
-        if (thr < npes && thr != myPe) {
-          const int sender = thr;
-          const uint64_t expected =
-              s_ag_by_sender[sender] + static_cast<uint64_t>(numChunks);
-          HSAuint64* sig = dstMemObj->signalPtrs
-              + static_cast<size_t>(sender) * numQ + 1;
-          while (core::AtomicLoadRelaxed(sig) < expected)
-            __builtin_amdgcn_s_sleep(1);
+          // 4. Per-chunk AG wait: wait ALL peers finish AG for chunk c.
+          //    Previously this was done once after the whole for-loop for
+          //    all chunks; moved inside so host can start chunk-c copy as
+          //    soon as chunk-c data is ready in local transit.
+          if (thr < npes && thr != myPe) {
+            const int sender = thr;
+            const uint64_t expected =
+                s_ag_by_sender[sender] + static_cast<uint64_t>(c + 1);
+            HSAuint64* sig = dstMemObj->signalPtrs
+                + static_cast<size_t>(sender) * numQ + 1;
+            while (core::AtomicLoadRelaxed(sig) < expected)
+              __builtin_amdgcn_s_sleep(1);
+          }
+          __syncthreads();
+
+          // 5. Emit chunk-ready signal for host so it can dispatch the
+          //    chunk-c copy on a dedicated stream (overlapping with the
+          //    next chunk's scatter/reduce/AG work).
+          if (thr == 0 && chunk_ready_counter != nullptr) {
+            __hip_atomic_fetch_add(chunk_ready_counter, 1u,
+                                   __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+          }
         }
-        ar_write_phase_ts(phase_ts, 2 + 3 * numChunks);  // AG wait done (all peers)
+        ar_write_phase_ts(phase_ts, 2 + 3 * numChunks);  // all chunks AG wait + signal done
       } else {
         // Single-chunk AG. Same barrier requirement as MULTI_CHUNK.
         const uint32_t ccTarget =
@@ -496,6 +510,13 @@ __global__ void PipelinedAllReduceSdmaKernel(
               + static_cast<size_t>(sender) * numQ + 1;
           while (core::AtomicLoadRelaxed(sig) < expected)
             __builtin_amdgcn_s_sleep(1);
+        }
+        __syncthreads();
+
+        // Emit chunk-ready signal for host (single-chunk = 1 signal).
+        if (thr == 0 && chunk_ready_counter != nullptr) {
+          __hip_atomic_fetch_add(chunk_ready_counter, 1u,
+                                 __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
         }
         ar_write_phase_ts(phase_ts, 5);  // AG wait done (single-chunk, numChunks=1)
 

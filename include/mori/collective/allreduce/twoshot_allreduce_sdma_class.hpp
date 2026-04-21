@@ -92,6 +92,15 @@ class AllreduceSdma {
   uint64_t pipeline_ag_gen_ = 0;       // total SDMA ATOMIC_INC on qId=1 (pipeline AG only)
   uint64_t pipeline_reduce_gen_ = 0;   // reduce_complete counter via flagsMemObj (per-chunk barrier)
 
+  // Chunk-level pipeline (path B): kernel emits chunk-ready signal per chunk;
+  // host waits on each via hipStreamWaitValue32 and dispatches per-chunk copy
+  // on copy_stream_ (hipMemcpy2DAsync for npes-shard strided copy) so it
+  // overlaps with the kernel's work on subsequent chunks.
+  uint32_t* chunk_ready_counter_d_ = nullptr;  // device uint32, atomic_inc'd by kernel per chunk
+  uint32_t chunk_ready_gen_ = 0;               // host-side running total of expected counter
+  hipStream_t copy_stream_ = nullptr;          // dedicated stream for per-chunk copy
+  hipEvent_t copy_done_event_ = nullptr;       // copy_stream -> main: all chunk copies done
+
   // Phase-level timestamp instrumentation (optional, diagnostic).
   // When enabled, block 0 thread 0 of PipelinedAllReduceSdmaKernel writes
   // __builtin_amdgcn_s_memtime() at each phase boundary to phase_ts_d_.
