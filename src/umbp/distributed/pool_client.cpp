@@ -814,9 +814,8 @@ std::vector<bool> PoolClient::BatchGetRemote(const std::vector<std::string>& key
     // the comment in GetRemote for why the page-window check alone is
     // insufficient with partial-last-page support.
     if (sizes[i] != loc.size) {
-      MORI_UMBP_ERROR(
-          "[PoolClient] BatchGetRemote: caller size {} != stored size {} for key='{}'",
-          sizes[i], loc.size, keys[i]);
+      MORI_UMBP_ERROR("[PoolClient] BatchGetRemote: caller size {} != stored size {} for key='{}'",
+                      sizes[i], loc.size, keys[i]);
       continue;
     }
     if (loc.tier != TierType::DRAM && loc.tier != TierType::HBM) continue;
