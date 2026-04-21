@@ -1187,6 +1187,7 @@ def _test_multi_stage_overlap(
     dtype, dtype_name, device, iterations, warmup,
     gemm_m=_GEMM_M_DEFAULT, gemm_n=_GEMM_N_DEFAULT, gemm_k=_GEMM_K_DEFAULT,
     num_stages=2, sweep=False, timeline_dump=False, ar_phase_timing=False,
+    ar_priority=0, gemm_priority=0,
 ):
     """Multi-stage pipelined GEMM+AllReduce overlap benchmark."""
     rccl_dtype = _RCCL_DTYPE_MAP.get(dtype, torch.float32)
@@ -1196,8 +1197,21 @@ def _test_multi_stage_overlap(
         else fill_value
     )
 
-    stream_ar = torch.cuda.Stream(device=device)
-    stream_gemm = torch.cuda.Stream(device=device)
+    # Query device's supported priority range (HIP: [low, high], low = most-negative = highest priority).
+    # torch.cuda.Stream(priority=...) takes negative values for higher priority.
+    if rank == 0 and (ar_priority != 0 or gemm_priority != 0):
+        try:
+            low, high = torch.cuda.get_stream_priority_range()
+            print(f"  [priority] stream priority range supported: [{low}(highest), {high}(lowest)]"
+                  f"; using ar_priority={ar_priority} gemm_priority={gemm_priority}",
+                  flush=True)
+        except Exception as e:
+            print(f"  [priority] get_stream_priority_range failed: {e}; "
+                  f"using ar_priority={ar_priority} gemm_priority={gemm_priority}",
+                  flush=True)
+
+    stream_ar = torch.cuda.Stream(device=device, priority=ar_priority)
+    stream_gemm = torch.cuda.Stream(device=device, priority=gemm_priority)
     total_iters = warmup + iterations
     elem_size = torch.tensor([], dtype=dtype).element_size()
 
@@ -1430,6 +1444,8 @@ def _test_allreduce(
     sweep=False,
     timeline_dump=False,
     ar_phase_timing=False,
+    ar_priority=0,
+    gemm_priority=0,
 ):
     """Worker function for each process."""
 
@@ -1570,6 +1586,8 @@ def _test_allreduce(
                 sweep=sweep,
                 timeline_dump=timeline_dump,
                 ar_phase_timing=ar_phase_timing,
+                ar_priority=ar_priority,
+                gemm_priority=gemm_priority,
             )
             all_ok = all_ok and ok6
 
@@ -1621,6 +1639,8 @@ def test_allreduce(
     sweep=False,
     timeline_dump=False,
     ar_phase_timing=False,
+    ar_priority=0,
+    gemm_priority=0,
 ):
     """Run AllReduce SDMA test."""
     os.environ.setdefault("MORI_ENABLE_SDMA", "1")
@@ -1642,6 +1662,8 @@ def test_allreduce(
             sweep,
             timeline_dump,
             ar_phase_timing,
+            ar_priority,
+            gemm_priority,
         ),
         nprocs=world_size,
         join=True,
@@ -1720,6 +1742,22 @@ if __name__ == "__main__":
              "AG-submit, AG-wait. Use together with --timeline and a single size "
              "(e.g. --elems 67108864) for clear output.",
     )
+    parser.add_argument(
+        "--ar-priority",
+        type=int,
+        default=0,
+        help="Set stream_ar priority (HIP supports -1=high, 0=normal, range "
+             "queryable via hipDeviceGetStreamPriorityRange). Set -1 to test "
+             "whether giving AR stream higher priority reduces GEMM-AR CU "
+             "contention (exploratory).",
+    )
+    parser.add_argument(
+        "--gemm-priority",
+        type=int,
+        default=0,
+        help="Set stream_gemm priority. Set 0 (normal) while --ar-priority=-1 "
+             "to let AR preempt GEMM for CU resources.",
+    )
     args = parser.parse_args()
     os.environ["MORI_ENABLE_SDMA"] = str(args.enable_sdma)
 
@@ -1759,4 +1797,6 @@ if __name__ == "__main__":
         sweep=args.sweep,
         timeline_dump=args.timeline,
         ar_phase_timing=args.ar_phase_timing,
+        ar_priority=args.ar_priority,
+        gemm_priority=args.gemm_priority,
     )
