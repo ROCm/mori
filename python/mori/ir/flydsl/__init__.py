@@ -22,12 +22,9 @@
 """
 mori.ir.flydsl — FlyDSL integration for mori shmem device API.
 
-Quick start::
+Quick start (automatic integration via compile_helper)::
 
     from mori.ir import flydsl as mori_shmem
-    from mori.ir.flydsl import get_bitcode_path, install_hook
-
-    install_hook()
 
     @flyc.kernel
     def my_kernel(buf: fx.Tensor):
@@ -35,9 +32,9 @@ Quick start::
         mori_shmem.putmem_nbi_warp(buf, buf, 64, (pe + 1) % 2, 0)
         mori_shmem.quiet_thread_pe((pe + 1) % 2)
 
-Usage (with shmem compile helper)::
-
-    kernel_callable = compile_shmem_kernel(my_kernel, dummy_args, chip="gfx942")
+FlyDSL automatically detects mori shmem symbols and uses
+``compile_helper.prepare_compile()`` to obtain bitcode paths and
+post-load processors.  No manual hook installation required.
 """
 
 from .ops import *  # noqa: F401,F403

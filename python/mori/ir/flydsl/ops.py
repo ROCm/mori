@@ -45,13 +45,13 @@ from mori.ir.ops import MORI_DEVICE_FUNCTIONS, SIGNAL_SET, SIGNAL_ADD
 # ExternFunction is only needed when building a @flyc.kernel.
 def _get_extern_cls():
     try:
-        from flydsl.expr.extern import ExternFunction
+        from flydsl.compiler.extern import ExternFunction
 
         return ExternFunction
     except ImportError as e:
         raise ImportError(
-            "flydsl.expr.extern not found. "
-            "Make sure FlyDSL is installed and flydsl/expr/extern.py exists."
+            "flydsl.compiler.extern not found. "
+            "Make sure FlyDSL is installed and flydsl/compiler/extern.py exists."
         ) from e
 
 
