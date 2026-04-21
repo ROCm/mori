@@ -2,13 +2,14 @@
 #
 # env_setup.sh — setup ionic NIC environment for mori.
 #
-# Usage:  source env_setup.sh [mori|dcqcn|all]
+# Steps (in order):
+#   1. setup_pfc         — configure PFC / DSCP / scheduling on all ionic ports
+#   2. setup_dcqcn       — configure DCQCN on all ionic ROCE devices
+#   3. mori_env_setup    — export MORI_RDMA_SL / MORI_RDMA_TC from QoS config
 #
-#   mori   — export MORI_RDMA_SL / MORI_RDMA_TC only
-#   dcqcn  — configure DCQCN on all ionic ROCE devices only
-#   all    — both (default)
+# Usage:  source env_setup.sh
 #
-# Requires: nicctl
+# Requires: nicctl, sudo
 
 IONIC_VENDOR_ID="0x1dd8"
 
@@ -32,6 +33,37 @@ if [[ -z "$IONIC_DEVS" ]]; then
     return 2>/dev/null || exit 0
 fi
 command -v nicctl &>/dev/null || { die "ionic devices found but nicctl not available"; return 2>/dev/null || exit 1; }
+
+setup_pfc() {
+    sudo nicctl update qos --classification-type dscp                          || { die "set classification-type failed"; return 1; }
+    sudo nicctl update port --all --pause-type pfc --rx-pause enable --tx-pause enable || { die "set pause failed"; return 1; }
+    sudo nicctl update qos dscp-to-priority --dscp 26 --priority 3             || { die "map DSCP 26 -> priority 3 failed"; return 1; }
+    sudo nicctl update qos dscp-to-priority --dscp 48 --priority 6             || { die "map DSCP 48 -> priority 6 failed"; return 1; }
+    sudo nicctl update qos pfc --priority 3 --no-drop enable                   || { die "enable PFC no-drop on priority 3 failed"; return 1; }
+    sudo nicctl update qos scheduling --priority 0,3,6 --dwrr 10,90,0 --rate-limit 0,0,0 || { die "set scheduling failed"; return 1; }
+    sudo nicctl update port --all --admin-state up                             || { die "set admin-state up failed"; return 1; }
+    log_ok "PFC / DSCP / scheduling configured"
+}
+
+setup_dcqcn() {
+    local dev
+    for dev in $IONIC_DEVS; do
+        sudo nicctl update dcqcn -r "$dev" -i 1 \
+            --token-bucket-size 800000 \
+            --ai-rate 160 \
+            --alpha-update-interval 1 \
+            --alpha-update-g 512 \
+            --initial-alpha-value 64 \
+            --rate-increase-byte-count 431068 \
+            --hai-rate 300 \
+            --rate-reduce-monitor-period 1 \
+            --rate-increase-threshold 1 \
+            --rate-increase-interval 1 \
+            --cnp-dscp 46 \
+            || { die "DCQCN setup failed for $dev"; return 1; }
+        log_ok "DCQCN configured on $dev"
+    done
+}
 
 mori_env_setup() {
     local qos
@@ -67,34 +99,7 @@ mori_env_setup() {
     log_ok "export MORI_RDMA_TC=$MORI_RDMA_TC"
 }
 
-setup_dcqcn() {
-    local dev
-    for dev in $IONIC_DEVS; do
-        sudo nicctl update dcqcn -r "$dev" -i 1 \
-            --token-bucket-size 800000 \
-            --ai-rate 160 \
-            --alpha-update-interval 1 \
-            --alpha-update-g 512 \
-            --initial-alpha-value 64 \
-            --rate-increase-byte-count 431068 \
-            --hai-rate 300 \
-            --rate-reduce-monitor-period 1 \
-            --rate-increase-threshold 1 \
-            --rate-increase-interval 1 \
-            --cnp-dscp 46 \
-            || { die "DCQCN setup failed for $dev"; return 1; }
-        log_ok "DCQCN configured on $dev"
-    done
-}
+setup_pfc && setup_dcqcn && mori_env_setup
 
-MODE="${1:-all}"
-
-case "$MODE" in
-    mori)  mori_env_setup ;;
-    dcqcn) setup_dcqcn ;;
-    all)   mori_env_setup; setup_dcqcn ;;
-    *)     echo "Usage: source env_setup.sh [mori|dcqcn|all]" ;;
-esac
-
-unset -f mori_env_setup setup_dcqcn query_ionic_devices log_ok log_warn die
-unset IONIC_VENDOR_ID IONIC_DEVS MODE GREEN RED YELLOW NC
+unset -f setup_pfc setup_dcqcn mori_env_setup query_ionic_devices log_ok log_warn die
+unset IONIC_VENDOR_ID IONIC_DEVS GREEN RED YELLOW NC
