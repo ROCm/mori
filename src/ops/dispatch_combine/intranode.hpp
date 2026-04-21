@@ -24,10 +24,15 @@
 #include <type_traits>
 
 #include "mori/core/core.hpp"
+#include "mori/core/profiler/constants.hpp"
+#include "mori/core/profiler/kernel_profiler.hpp"
 #include "mori/ops/dispatch_combine/dispatch_combine.hpp"
 #include "mori/shmem/shmem.hpp"
 #include "src/ops/dispatch_combine/common.hpp"
 #include "src/ops/dispatch_combine/convert.hpp"
+#ifdef ENABLE_PROFILER
+#include "mori/profiler/profiler.hpp"
+#endif
 
 namespace mori {
 namespace moe {
@@ -91,6 +96,11 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   int myPe = config.rank;
   int npes = config.worldSize;
   size_t hiddenDim = config.HiddenDimSz();
+
+  IF_ENABLE_PROFILER(
+      INTRANODE_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
+  MORI_TRACE_SEQ(seq, profiler);
+  MORI_TRACE_NEXT(seq, Slot::DispatchSendTokens);
 
   if (args.tokenIndices && args.inpTokenBuf) {
     // Phase1: send token
@@ -163,6 +173,7 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   if (thdId == 0) atomicAdd(args.dispatchGridBarrier, 1);
 
   // Send token num & token to expert mapping to other ranks
+  MORI_TRACE_NEXT(seq, Slot::DispatchNotifyPeer);
   if (globalWarpId == 0) {
     for (int destPe = laneId; destPe < npes; destPe += warpSize) {
       // Wait until all tokens are sent
@@ -179,6 +190,7 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
 
   // Phase 2: recv token
   // Each warp wait until sender finished by waiting token number signal
+  MORI_TRACE_NEXT(seq, Slot::DispatchWaitPeerToken);
   index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
   if (globalWarpId == 0) {
     for (int destPe = laneId; destPe < npes; destPe += warpSize) {
@@ -233,6 +245,11 @@ __device__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
 
   int myPe = config.rank;
   int npes = config.worldSize;
+
+  IF_ENABLE_PROFILER(
+      INTRANODE_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
+  MORI_TRACE_SEQ(seq, profiler);
+  MORI_TRACE_NEXT(seq, Slot::CombineCopyInput);
 
   const uint64_t crossDeviceBarrierFlag = args.crossDeviceBarrierFlag[0];
   // Copy input to shmem registered buffer so that other GPUs can access directly
@@ -292,10 +309,12 @@ __device__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   }
 
   // Make sure copy on all GPUs are finished
+  MORI_TRACE_NEXT(seq, Slot::CombineBarrier);
   CrossDeviceBarrierIntraNodeKernel(args, crossDeviceBarrierFlag);
   *args.totalRecvTokenNum = 0;
   if (args.curRankNumToken == 0) return;
 
+  MORI_TRACE_NEXT(seq, Slot::CombineAccum);
   extern __shared__ char sharedMem[];
   TokT** srcPtrs = reinterpret_cast<TokT**>(sharedMem) + warpId * config.numExpertPerToken;
   float** srcWeightsPtr = reinterpret_cast<float**>(sharedMem) +

@@ -145,6 +145,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         combine_warp_per_block,
         total_recv_num_token,
         call_local_expert_count=False,
+        graph_replay_iters=1,
     ):
         (
             _,
@@ -156,31 +157,32 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
 
         e2e_graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(e2e_graph):
-            (
-                e2e_dispatch_output,
-                _,
-                _,
-                e2e_dispatch_indices,
-                e2e_dispatch_recv_num_token,
-            ) = op.dispatch(
-                all_rank_input[self.config.rank],
-                all_rank_weights[self.config.rank],
-                # None,
-                all_rank_scales[self.config.rank],
-                all_rank_indices[self.config.rank],
-                block_num=dispatch_block_num,
-                warp_per_block=dispatch_warp_per_block,
-                call_local_expert_count=call_local_expert_count,
-            )
-            e2e_combine_arg = self._get_combine_input(op, e2e_dispatch_output)
-            e2e_combine_output, _ = op.combine(
-                e2e_combine_arg,
-                # dispatch_weights,
-                None,
-                e2e_dispatch_indices,
-                block_num=combine_block_num,
-                warp_per_block=combine_warp_per_block,
-            )
+            for _ in range(graph_replay_iters):
+                (
+                    e2e_dispatch_output,
+                    _,
+                    _,
+                    e2e_dispatch_indices,
+                    e2e_dispatch_recv_num_token,
+                ) = op.dispatch(
+                    all_rank_input[self.config.rank],
+                    all_rank_weights[self.config.rank],
+                    # None,
+                    all_rank_scales[self.config.rank],
+                    all_rank_indices[self.config.rank],
+                    block_num=dispatch_block_num,
+                    warp_per_block=dispatch_warp_per_block,
+                    call_local_expert_count=call_local_expert_count,
+                )
+                e2e_combine_arg = self._get_combine_input(op, e2e_dispatch_output)
+                e2e_combine_output, _ = op.combine(
+                    e2e_combine_arg,
+                    # dispatch_weights,
+                    None,
+                    e2e_dispatch_indices,
+                    block_num=combine_block_num,
+                    warp_per_block=combine_warp_per_block,
+                )
         self.sync()
 
         return e2e_graph
@@ -329,6 +331,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
                 combine_warp_per_block,
                 total_recv_num_token,
                 call_local_expert_count=call_local_expert_count,
+                graph_replay_iters=graph_replay_iters,
             )
 
         round_start_events = [
@@ -340,13 +343,10 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         round_end_events = [
             torch.cuda.Event(enable_timing=True) for _ in range(graph_replay_iters)
         ]
-        e2e_start_events = [
-            torch.cuda.Event(enable_timing=True) for _ in range(graph_replay_iters)
-        ]
-        e2e_end_events = [
-            torch.cuda.Event(enable_timing=True) for _ in range(graph_replay_iters)
-        ]
+        e2e_start_events = [torch.cuda.Event(enable_timing=True)]
+        e2e_end_events = [torch.cuda.Event(enable_timing=True)]
 
+        dist.barrier()
         for i in range(graph_replay_iters):
             round_start_events[i].record()
             dispatch_graph.replay()
@@ -354,10 +354,13 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             combine_graph.replay()
             round_end_events[i].record()
 
-            if e2e_graph is not None:
-                e2e_start_events[i].record()
-                e2e_graph.replay()
-                e2e_end_events[i].record()
+        torch.cuda.synchronize()
+
+        if e2e_graph is not None:
+            dist.barrier()
+            e2e_start_events[0].record()
+            e2e_graph.replay()
+            e2e_end_events[0].record()
 
         torch.cuda.synchronize()
         disp_duration = (
@@ -376,11 +379,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         )
         if e2e_graph is not None:
             e2e_duration = (
-                sum(
-                    start_event.elapsed_time(end_event)
-                    for start_event, end_event in zip(e2e_start_events, e2e_end_events)
-                )
-                / graph_replay_iters
+                e2e_start_events[0].elapsed_time(e2e_end_events[0]) / graph_replay_iters
             )
         else:
             e2e_duration = -1.0
@@ -556,6 +555,67 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             min_disp_latency_us,
             min_comb_latency_us,
         )
+
+    def profile(
+        self,
+        op,
+        dispatch_block_num,
+        dispatch_warp_per_block,
+        combine_block_num,
+        combine_warp_per_block,
+        warmup=5,
+        capture_iters=3,
+        call_local_expert_count=False,
+    ):
+        """Warmup, then capture capture_iters dispatch+combine iters and export per-warp Perfetto traces."""
+        if not hasattr(op, "get_debug_time_buf"):
+            raise RuntimeError(
+                "To use --cmd profile, re-compile Mori with ENABLE_PROFILER=ON"
+            )
+        test_data = self.gen_test_data()
+
+        # Warm-up: run several iters to JIT-compile and reach steady state
+        for _ in range(warmup):
+            self.run_once_test(
+                op,
+                test_data,
+                dispatch_block_num,
+                dispatch_warp_per_block,
+                combine_block_num,
+                combine_warp_per_block,
+                check=False,
+                call_local_expert_count=call_local_expert_count,
+            )
+
+        # Clear the trace buffer, then run capture_iters profiled iterations
+        trace_buf = op.get_debug_time_buf()
+        trace_buf.zero_()
+        if hasattr(mori.cpp, "get_debug_time_offset"):
+            op.get_debug_time_offset().zero_()
+
+        for _ in range(capture_iters):
+            self.run_once_test(
+                op,
+                test_data,
+                dispatch_block_num,
+                dispatch_warp_per_block,
+                combine_block_num,
+                combine_warp_per_block,
+                check=False,
+                call_local_expert_count=call_local_expert_count,
+            )
+
+        import time
+
+        output_filename = f"trace_intranode_rank{self.config.rank}_{time.strftime('%m%d_%H%M%S')}.json"
+        slot_map = getattr(mori.cpp, "IntranodeSlots", None)
+        mori.kernel_profiler.export_to_perfetto(
+            trace_buf, output_filename, slot_map=slot_map
+        )
+        if self.config.rank == 0:
+            print(
+                f"Profiling trace exported to {output_filename} ({capture_iters} iters)"
+            )
 
     def stress(
         self,
@@ -877,6 +937,22 @@ def _bench_dispatch_combine(
                 call_local_expert_count=call_local_expert_count,
             )
 
+        elif cmd == "profile":
+            if rank == 0:
+                print(f"\n{'=' * 60}")
+                print(
+                    f"Profiling with dispatch_block_num={dispatch_block_num}, dispatch_warp_per_block={dispatch_warp_per_block} combine_block_num={combine_block_num}, combine_warp_per_block={combine_warp_per_block}"
+                )
+                print(f"{'=' * 60}")
+            benchmark.profile(
+                op,
+                dispatch_block_num=dispatch_block_num,
+                dispatch_warp_per_block=dispatch_warp_per_block,
+                combine_block_num=combine_block_num,
+                combine_warp_per_block=combine_warp_per_block,
+                call_local_expert_count=call_local_expert_count,
+            )
+
         elif cmd == "tuning":
             if rank == 0 and any(
                 x is not None
@@ -1133,8 +1209,8 @@ if __name__ == "__main__":
         "--cmd",
         type=str,
         default="bench",
-        choices=["bench", "stress", "tuning"],
-        help="Available subcommands: bench (single config), stress (stress test), tuning (test multiple configs)",
+        choices=["bench", "stress", "tuning", "profile"],
+        help="Available subcommands: bench (single config), stress (stress test), tuning (test multiple configs), profile (export Perfetto trace; requires ENABLE_PROFILER=ON build)",
     )
     parser.add_argument(
         "--zero-copy",
