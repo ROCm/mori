@@ -589,16 +589,9 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
 /* ---------------------------------------------------------------------------------------------- */
 /*                              RdmaLocalMemoryRegistration                                       */
 /* ---------------------------------------------------------------------------------------------- */
-RdmaLocalMemoryRegistration::RdmaLocalMemoryRegistration(RdmaMemoryLayout layout,
-                                                         application::RdmaDeviceContext* devCtx)
-    : layout_(std::move(layout)), devCtx_(devCtx) {}
-
-RdmaLocalMemoryRegistration::~RdmaLocalMemoryRegistration() {
-  if (!devCtx_) return;
-  for (auto& chunk : layout_.chunks) {
-    devCtx_->DeregisterRdmaMemoryRegion(reinterpret_cast<void*>(chunk.mr.addr));
-  }
-}
+RdmaLocalMemoryRegistration::RdmaLocalMemoryRegistration(
+    RdmaMemoryLayout layout, std::vector<application::RdmaOwnedMr> ownedMrs)
+    : layout_(std::move(layout)), ownedMrs_(std::move(ownedMrs)) {}
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                  Slice Resolution Algorithm                                    */
@@ -664,18 +657,69 @@ std::vector<RdmaTransferSlice> ResolveTransferSlices(const RdmaMemoryLayout& loc
   return slices;
 }
 
+static std::vector<ResolvedLaneWork> BuildResolvedLaneWork(size_t totalSlices, size_t epCount,
+                                                           size_t maxLanes) {
+  std::vector<ResolvedLaneWork> lanes;
+  if (totalSlices == 0 || epCount == 0) return lanes;
+
+  size_t laneCount = epCount;
+  if (maxLanes > 0) laneCount = std::min(laneCount, maxLanes);
+  laneCount = std::min(laneCount, totalSlices);
+  if (laneCount == 0) return lanes;
+
+  lanes.reserve(laneCount);
+  size_t begin = 0;
+  size_t base = totalSlices / laneCount;
+  size_t remainder = totalSlices % laneCount;
+  for (size_t laneIdx = 0; laneIdx < laneCount; ++laneIdx) {
+    size_t laneSize = base + (laneIdx < remainder ? 1 : 0);
+    size_t end = begin + laneSize;
+    lanes.push_back({static_cast<int>(laneIdx), begin, end});
+    begin = end;
+  }
+  return lanes;
+}
+
+ResolvedTransferPlan BuildResolvedTransferPlan(const EpPairVec& eps, const RdmaMemoryLayout& local,
+                                               const SizeVec& localOffsets,
+                                               const RdmaMemoryLayout& remote,
+                                               const SizeVec& remoteOffsets, const SizeVec& sizes,
+                                               size_t maxLanes) {
+  ResolvedTransferPlan plan;
+  if ((localOffsets.size() != remoteOffsets.size()) || (sizes.size() != remoteOffsets.size())) {
+    return plan;
+  }
+
+  for (size_t i = 0; i < sizes.size(); ++i) {
+    auto slices = ResolveTransferSlices(local, localOffsets[i], remote, remoteOffsets[i], sizes[i]);
+    if (slices.empty() && sizes[i] > 0) {
+      plan.slices.clear();
+      plan.lanes.clear();
+      return plan;
+    }
+    plan.slices.insert(plan.slices.end(), slices.begin(), slices.end());
+  }
+  if (plan.slices.empty()) return plan;
+
+  size_t laneCap = maxLanes > 0 ? maxLanes : eps.size();
+  plan.lanes = BuildResolvedLaneWork(plan.slices.size(), eps.size(), laneCap);
+  return plan;
+}
+
 /* ---------------------------------------------------------------------------------------------- */
-/*                               RdmaBatchReadWriteResolved                                       */
+/*                              Resolved Slice Lane Submission                                    */
 /* ---------------------------------------------------------------------------------------------- */
-RdmaOpRet RdmaBatchReadWriteResolved(const EpPairVec& eps,
-                                     const std::vector<RdmaTransferSlice>& slices,
-                                     std::shared_ptr<CqCallbackMeta> callbackMeta,
-                                     TransferUniqueId id, bool isRead, int postBatchSize) {
+RdmaOpRet RdmaPostResolvedSlicesToSingleEp(const EpPair& ep,
+                                           const std::vector<RdmaTransferSlice>& slices,
+                                           size_t begin, size_t end,
+                                           std::shared_ptr<CqCallbackMeta> callbackMeta,
+                                           TransferUniqueId id, bool isRead, int postBatchSize) {
   MORI_IO_FUNCTION_TIMER;
 
-  size_t batchSize = slices.size();
-  if (batchSize == 0) return {StatusCode::SUCCESS, ""};
-  if (eps.empty()) return {StatusCode::ERR_INVALID_ARGS, "no endpoints"};
+  if (begin > end || end > slices.size()) {
+    return {StatusCode::ERR_INVALID_ARGS, "resolved slice range is invalid"};
+  }
+  if (begin == end) return {StatusCode::SUCCESS, ""};
 
   struct MergedWorkRequest {
     ibv_send_wr wr{};
@@ -684,134 +728,123 @@ RdmaOpRet RdmaBatchReadWriteResolved(const EpPairVec& eps,
     size_t mergedSlices{1};
   };
 
-  const uint32_t maxSge = std::max(eps[0].local.handle.maxSge, 1u);
-
+  const uint32_t maxSge = std::max(ep.local.handle.maxSge, 1u);
   std::vector<MergedWorkRequest> mergedWrs;
-  mergedWrs.reserve(batchSize);
+  mergedWrs.reserve(end - begin);
 
-  auto start_new_wr = [&](const RdmaTransferSlice& s) {
+  auto startNewWr = [&](const RdmaTransferSlice& slice) {
     mergedWrs.emplace_back();
     MergedWorkRequest& mwr = mergedWrs.back();
     mwr.sges.reserve(maxSge);
-    mwr.sges.push_back(ibv_sge{.addr = s.localAddr, .length = s.len, .lkey = s.localLkey});
-    mwr.totalRemoteLength = s.len;
+    mwr.sges.push_back(
+        ibv_sge{.addr = slice.localAddr, .length = slice.len, .lkey = slice.localLkey});
+    mwr.totalRemoteLength = slice.len;
 
     mwr.wr.sg_list = mwr.sges.data();
     mwr.wr.num_sge = 1;
     mwr.wr.opcode = isRead ? IBV_WR_RDMA_READ : IBV_WR_RDMA_WRITE;
     mwr.wr.send_flags = 0;
-    mwr.wr.wr.rdma.remote_addr = s.remoteAddr;
-    mwr.wr.wr.rdma.rkey = s.remoteRkey;
+    mwr.wr.wr.rdma.remote_addr = slice.remoteAddr;
+    mwr.wr.wr.rdma.rkey = slice.remoteRkey;
   };
 
-  for (size_t i = 0; i < batchSize; ++i) {
-    const RdmaTransferSlice& s = slices[i];
+  for (size_t idx = begin; idx < end; ++idx) {
+    const RdmaTransferSlice& slice = slices[idx];
     bool merged = false;
 
     if (!mergedWrs.empty()) {
       MergedWorkRequest& last = mergedWrs.back();
       uint64_t expectedRemote = last.wr.wr.rdma.remote_addr + last.totalRemoteLength;
-      if (expectedRemote == s.remoteAddr && last.wr.wr.rdma.rkey == s.remoteRkey) {
+      if (expectedRemote == slice.remoteAddr && last.wr.wr.rdma.rkey == slice.remoteRkey) {
         ibv_sge& lastSge = last.sges.back();
-        bool localContig = (lastSge.addr + lastSge.length) == s.localAddr;
-        bool sameLkey = lastSge.lkey == s.localLkey;
+        bool localContig = (lastSge.addr + lastSge.length) == slice.localAddr;
+        bool sameLkey = lastSge.lkey == slice.localLkey;
 
         if (localContig && sameLkey) {
-          uint64_t newLen = static_cast<uint64_t>(lastSge.length) + s.len;
+          uint64_t newLen = static_cast<uint64_t>(lastSge.length) + slice.len;
           if (newLen <= std::numeric_limits<uint32_t>::max()) {
             lastSge.length = static_cast<uint32_t>(newLen);
             last.mergedSlices++;
-            last.totalRemoteLength += s.len;
+            last.totalRemoteLength += slice.len;
             merged = true;
           }
         }
         if (!merged && last.sges.size() < maxSge) {
-          last.sges.push_back(ibv_sge{.addr = s.localAddr, .length = s.len, .lkey = s.localLkey});
+          last.sges.push_back(
+              ibv_sge{.addr = slice.localAddr, .length = slice.len, .lkey = slice.localLkey});
           last.wr.num_sge = static_cast<int>(last.sges.size());
           last.mergedSlices++;
-          last.totalRemoteLength += s.len;
+          last.totalRemoteLength += slice.len;
           merged = true;
         }
       }
     }
-    if (!merged) start_new_wr(s);
+    if (!merged) startNewWr(slice);
   }
 
-  // Stabilize sg_list pointers after all merging is complete.
   for (auto& mwr : mergedWrs) {
     mwr.wr.sg_list = mwr.sges.data();
   }
 
   size_t mergedWrCount = mergedWrs.size();
-  size_t epNum = eps.size();
-  size_t epBatchSz = (mergedWrCount + epNum - 1) / epNum;
-
   if (postBatchSize == -1) {
-    postBatchSize = (epBatchSz > static_cast<size_t>(std::numeric_limits<int>::max()))
+    postBatchSize = (mergedWrCount > static_cast<size_t>(std::numeric_limits<int>::max()))
                         ? std::numeric_limits<int>::max()
-                        : static_cast<int>(epBatchSz);
+                        : static_cast<int>(mergedWrCount);
   }
-  {
-    int minMaxSqDepth = std::numeric_limits<int>::max();
-    for (size_t epId = 0; epId < epNum; ++epId) {
-      if (eps[epId].sqDepth && eps[epId].maxSqDepth > 0)
-        minMaxSqDepth = std::min(minMaxSqDepth, eps[epId].maxSqDepth);
-    }
-    if (minMaxSqDepth != std::numeric_limits<int>::max() && postBatchSize > minMaxSqDepth)
-      postBatchSize = minMaxSqDepth;
+  if (ep.sqDepth && ep.maxSqDepth > 0 && postBatchSize > ep.maxSqDepth) {
+    postBatchSize = ep.maxSqDepth;
   }
   if (postBatchSize <= 0) postBatchSize = 1;
   int numPostBatch = (mergedWrCount + postBatchSize - 1) / postBatchSize;
 
-  std::vector<int> epWrsSinceSignal(epNum, 0);
-  std::vector<size_t> epMergedSinceSignal(epNum, 0);
+  int wrsSinceSignal = 0;
+  size_t slicesSinceSignal = 0;
 
-  for (int i = 0; i < numPostBatch; i++) {
-    int st = i * postBatchSize;
-    int end = std::min(static_cast<size_t>(st) + postBatchSize, mergedWrCount);
-    if (end - st == 0) break;
-    int epId = i % epNum;
-    int batchWrNum = end - st;
+  for (int batchIdx = 0; batchIdx < numPostBatch; ++batchIdx) {
+    int st = batchIdx * postBatchSize;
+    int batchEnd = std::min(static_cast<size_t>(st) + postBatchSize, mergedWrCount);
+    int batchWrNum = batchEnd - st;
+    if (batchWrNum <= 0) break;
 
     std::string reserveErr;
     SqReserveFailureKind reserveFailure = SqReserveFailureKind::None;
-    if (!TryReserveSqDepth(eps[epId], batchWrNum, epId, "resolved-batch", &reserveErr,
-                           &reserveFailure)) {
-      AppendHint(&reserveErr, BuildSqDepthHint(eps[epId], epNum, postBatchSize,
-                                               PostSendOpKind::BatchData, reserveFailure));
+    if (!TryReserveSqDepth(ep, batchWrNum, 0, "resolved-lane", &reserveErr, &reserveFailure)) {
+      AppendHint(&reserveErr,
+                 BuildSqDepthHint(ep, 1, postBatchSize, PostSendOpKind::BatchData, reserveFailure));
       return {StatusCode::ERR_RDMA_OP, reserveErr};
     }
 
     size_t mergedSliceSize = 0;
-    for (int j = st; j < end; j++) {
-      mergedWrs[j].wr.wr_id = 0;
-      mergedWrs[j].wr.next = (j + 1 < end) ? &mergedWrs[j + 1].wr : nullptr;
-      mergedSliceSize += mergedWrs[j].mergedSlices;
+    for (int wrIdx = st; wrIdx < batchEnd; ++wrIdx) {
+      mergedWrs[wrIdx].wr.wr_id = 0;
+      mergedWrs[wrIdx].wr.next = (wrIdx + 1 < batchEnd) ? &mergedWrs[wrIdx + 1].wr : nullptr;
+      mergedSliceSize += mergedWrs[wrIdx].mergedSlices;
     }
 
-    epWrsSinceSignal[epId] += batchWrNum;
-    epMergedSinceSignal[epId] += mergedSliceSize;
+    wrsSinceSignal += batchWrNum;
+    slicesSinceSignal += mergedSliceSize;
 
-    bool isLastBatchForEp = ((i + epNum) >= numPostBatch);
-    bool sqNearFull = eps[epId].sqDepth && (epWrsSinceSignal[epId] >= eps[epId].maxSqDepth);
-    bool needSignal = isLastBatchForEp || sqNearFull;
+    bool isLastBatch = (batchIdx + 1 == numPostBatch);
+    bool sqNearFull = ep.sqDepth && (wrsSinceSignal >= ep.maxSqDepth);
+    bool needSignal = isLastBatch || sqNearFull;
 
-    ibv_send_wr& last = mergedWrs[end - 1].wr;
+    ibv_send_wr& last = mergedWrs[batchEnd - 1].wr;
     uint64_t recordId = 0;
     if (needSignal) {
-      if (!eps[epId].ledger) {
-        ReleaseSqDepth(eps[epId], batchWrNum);
+      if (!ep.ledger) {
+        ReleaseSqDepth(ep, batchWrNum);
         return {StatusCode::ERR_RDMA_OP,
                 "submission ledger is not initialized for signaled WR tracking"};
       }
-      recordId = eps[epId].ledger->Insert(epWrsSinceSignal[epId], true, callbackMeta,
-                                          static_cast<int>(epMergedSinceSignal[epId]));
+      recordId = ep.ledger->Insert(wrsSinceSignal, true, callbackMeta,
+                                   static_cast<int>(slicesSinceSignal));
       last.wr_id = recordId;
       last.send_flags = IBV_SEND_SIGNALED;
     }
 
     ibv_send_wr* badWr = nullptr;
-    int ret = ibv_post_send(eps[epId].local.ibvHandle.qp, &mergedWrs[st].wr, &badWr);
+    int ret = ibv_post_send(ep.local.ibvHandle.qp, &mergedWrs[st].wr, &badWr);
     if (ret != 0) {
       int postedCount = 0;
       if (badWr != nullptr) {
@@ -824,54 +857,80 @@ RdmaOpRet RdmaBatchReadWriteResolved(const EpPairVec& eps,
       postedCount = std::max(0, std::min(postedCount, batchWrNum));
       int unpostedCount = batchWrNum - postedCount;
       if (unpostedCount > 0) {
-        ReleaseSqDepth(eps[epId], unpostedCount);
-        epWrsSinceSignal[epId] = std::max(0, epWrsSinceSignal[epId] - unpostedCount);
+        ReleaseSqDepth(ep, unpostedCount);
+        wrsSinceSignal = std::max(0, wrsSinceSignal - unpostedCount);
         size_t mergedUnposted = 0;
-        for (int j = st + postedCount; j < end; ++j) mergedUnposted += mergedWrs[j].mergedSlices;
-        epMergedSinceSignal[epId] = epMergedSinceSignal[epId] >= mergedUnposted
-                                        ? epMergedSinceSignal[epId] - mergedUnposted
-                                        : 0;
+        for (int wrIdx = st + postedCount; wrIdx < batchEnd; ++wrIdx) {
+          mergedUnposted += mergedWrs[wrIdx].mergedSlices;
+        }
+        slicesSinceSignal =
+            slicesSinceSignal >= mergedUnposted ? slicesSinceSignal - mergedUnposted : 0;
       }
 
       bool lastWasPosted = (postedCount == batchWrNum);
-      if (needSignal && lastWasPosted) {
-        // signaled WR posted; CQ path owns release
-      } else if (needSignal) {
+      if (needSignal && !lastWasPosted) {
         int dummy = 0;
-        eps[epId].ledger->ReleaseByCqe(recordId, nullptr, &dummy);
+        ep.ledger->ReleaseByCqe(recordId, nullptr, &dummy);
       }
 
       if (postedCount > 0 && (!needSignal || !lastWasPosted)) {
-        if (eps[epId].degraded) eps[epId].degraded->store(true, std::memory_order_relaxed);
-        if (eps[epId].ledger)
-          eps[epId].ledger->InsertOrphaned(epWrsSinceSignal[epId], callbackMeta,
-                                           static_cast<int>(epMergedSinceSignal[epId]));
+        if (ep.degraded) ep.degraded->store(true, std::memory_order_relaxed);
+        if (ep.ledger) {
+          ep.ledger->InsertOrphaned(wrsSinceSignal, callbackMeta,
+                                    static_cast<int>(slicesSinceSignal));
+        }
       }
 
-      for (size_t otherEpId = 0; otherEpId < epNum; ++otherEpId) {
-        if (static_cast<int>(otherEpId) == epId) continue;
-        if (epWrsSinceSignal[otherEpId] <= 0) continue;
-        if (eps[otherEpId].degraded)
-          eps[otherEpId].degraded->store(true, std::memory_order_relaxed);
-        if (eps[otherEpId].ledger)
-          eps[otherEpId].ledger->InsertOrphaned(epWrsSinceSignal[otherEpId], callbackMeta,
-                                                static_cast<int>(epMergedSinceSignal[otherEpId]));
-      }
-
-      std::string message = "ibv_post_send (resolved) failed with " + std::to_string(ret) + ": " +
-                            strerror(ret) + " (posted " + std::to_string(postedCount) + "/" +
+      std::string message = "ibv_post_send (resolved lane) failed with " + std::to_string(ret) +
+                            ": " + strerror(ret) + " (posted " + std::to_string(postedCount) + "/" +
                             std::to_string(batchWrNum) + " WRs)";
-      AppendHint(&message, BuildPostSendFailureHint(ret, eps[epId], epNum, postBatchSize, badWr,
+      AppendHint(&message, BuildPostSendFailureHint(ret, ep, 1, postBatchSize, badWr,
                                                     PostSendOpKind::BatchData));
       return {StatusCode::ERR_RDMA_OP, std::move(message)};
     }
 
     if (needSignal) {
-      epWrsSinceSignal[epId] = 0;
-      epMergedSinceSignal[epId] = 0;
+      wrsSinceSignal = 0;
+      slicesSinceSignal = 0;
+    }
+    MORI_IO_TRACE("ibv_post_send resolved lane task {} batch range [{}, {})", id, st, batchEnd);
+  }
+
+  return {StatusCode::IN_PROGRESS, ""};
+}
+
+RdmaOpRet RdmaSubmitResolvedTransferPlanInline(const EpPairVec& eps,
+                                               const std::vector<RdmaTransferSlice>& slices,
+                                               const std::vector<ResolvedLaneWork>& lanes,
+                                               std::shared_ptr<CqCallbackMeta> callbackMeta,
+                                               TransferUniqueId id, bool isRead,
+                                               int postBatchSize) {
+  MORI_IO_FUNCTION_TIMER;
+
+  if (slices.empty()) return {StatusCode::SUCCESS, ""};
+  if (eps.empty()) return {StatusCode::ERR_INVALID_ARGS, "no endpoints"};
+  if (lanes.empty()) return {StatusCode::ERR_INVALID_ARGS, "resolved transfer lanes are empty"};
+
+  bool hasFail = false;
+  int numSucc = 0;
+  RdmaOpRet failedRet;
+
+  for (const auto& lane : lanes) {
+    if (lane.epId < 0 || static_cast<size_t>(lane.epId) >= eps.size()) {
+      return {StatusCode::ERR_INVALID_ARGS, "resolved lane endpoint is invalid"};
+    }
+    RdmaOpRet ret = RdmaPostResolvedSlicesToSingleEp(eps[lane.epId], slices, lane.begin, lane.end,
+                                                     callbackMeta, id, isRead, postBatchSize);
+    if (ret.Failed()) {
+      hasFail = true;
+      failedRet = ret;
+    } else if (ret.Succeeded()) {
+      numSucc++;
     }
   }
 
+  if (hasFail) return failedRet;
+  if (numSucc == static_cast<int>(lanes.size())) return {StatusCode::SUCCESS, ""};
   return {StatusCode::IN_PROGRESS, ""};
 }
 

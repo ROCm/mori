@@ -34,8 +34,7 @@ namespace io {
 /* ---------------------------------------------------------------------------------------------- */
 enum class MessageType : uint8_t {
   RegEndpoint = 0,
-  AskMemoryRegion = 1,
-  AskMemoryLayout = 2,
+  AskMemoryLayout = 1,
 };
 
 struct MessageHeader {
@@ -43,21 +42,21 @@ struct MessageHeader {
   uint32_t len;
 };
 
-struct MessageRegEndpoint {
+struct MessageRegEndpointRequest {
   EngineKey ekey;
   TopoKeyPair topo;
-  int devId;
-  application::RdmaEndpointHandle eph;
-  int requestedRemoteDevId{-1};
-  MSGPACK_DEFINE(ekey, topo, devId, eph, requestedRemoteDevId);
+  int initiatorLocalDevId{-1};
+  int expectedResponderLocalDevId{-1};
+  application::RdmaEndpointHandle initiatorEph;
+  MSGPACK_DEFINE(ekey, topo, initiatorLocalDevId, expectedResponderLocalDevId, initiatorEph);
 };
 
-struct MessageAskMemoryRegion {
-  EngineKey ekey;
-  int devId;
-  MemoryUniqueId id;
-  application::RdmaMemoryRegion mr;
-  MSGPACK_DEFINE(ekey, devId, id, mr);
+struct MessageRegEndpointResponse {
+  StatusCode code{StatusCode::ERR_BAD_STATE};
+  std::string message;
+  int responderLocalDevId{-1};
+  application::RdmaEndpointHandle responderEph{};
+  MSGPACK_DEFINE(code, message, responderLocalDevId, responderEph);
 };
 
 struct MessageBuildConn {
@@ -100,11 +99,11 @@ class Protocol {
   MessageHeader ReadMessageHeader();
   void WriteMessageHeader(const MessageHeader&);
 
-  MessageRegEndpoint ReadMessageRegEndpoint(size_t len);
-  void WriteMessageRegEndpoint(const MessageRegEndpoint&);
+  MessageRegEndpointRequest ReadMessageRegEndpointRequest(size_t len);
+  void WriteMessageRegEndpointRequest(const MessageRegEndpointRequest&);
 
-  MessageAskMemoryRegion ReadMessageAskMemoryRegion(size_t len);
-  void WriteMessageAskMemoryRegion(const MessageAskMemoryRegion&);
+  MessageRegEndpointResponse ReadMessageRegEndpointResponse(size_t len);
+  void WriteMessageRegEndpointResponse(const MessageRegEndpointResponse&);
 
   MessageAskMemoryLayoutRequest ReadMessageAskMemoryLayoutRequest(size_t len);
   void WriteMessageAskMemoryLayoutRequest(const MessageAskMemoryLayoutRequest&);

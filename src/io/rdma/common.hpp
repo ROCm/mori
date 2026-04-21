@@ -61,6 +61,16 @@ struct TopoKeyPair {
   MSGPACK_DEFINE(local, remote);
 };
 
+struct ExactRouteKey {
+  TopoKeyPair topo;
+  int ldevId{-1};
+  int rdevId{-1};
+
+  bool operator==(const ExactRouteKey& rhs) const noexcept {
+    return topo == rhs.topo && ldevId == rhs.ldevId && rdevId == rhs.rdevId;
+  }
+};
+
 struct MemoryKey {
   int devId;
   MemoryUniqueId id;
@@ -89,6 +99,18 @@ struct hash<mori::io::TopoKeyPair> {
     std::size_t h1 = std::hash<mori::io::TopoKey>{}(kp.local);
     std::size_t h2 = std::hash<mori::io::TopoKey>{}(kp.remote);
     return h1 ^ (h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));
+  }
+};
+
+template <>
+struct hash<mori::io::ExactRouteKey> {
+  std::size_t operator()(const mori::io::ExactRouteKey& key) const noexcept {
+    std::size_t h1 = std::hash<mori::io::TopoKeyPair>{}(key.topo);
+    std::size_t h2 = std::hash<int>{}(key.ldevId);
+    std::size_t h3 = std::hash<int>{}(key.rdevId);
+    h1 ^= h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2);
+    h1 ^= h3 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2);
+    return h1;
   }
 };
 
@@ -208,7 +230,7 @@ struct EndpointRuntime {
 };
 
 using EpPairVec = std::vector<EpPair>;
-using RouteTable = std::unordered_map<TopoKeyPair, EpPairVec>;
+using RouteTable = std::unordered_map<ExactRouteKey, EpPairVec>;
 using MemoryTable = std::unordered_map<MemoryKey, application::RdmaMemoryRegion>;
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -230,8 +252,9 @@ struct RdmaMemoryLayout {
 
 class RdmaLocalMemoryRegistration {
  public:
-  RdmaLocalMemoryRegistration(RdmaMemoryLayout layout, application::RdmaDeviceContext* devCtx);
-  ~RdmaLocalMemoryRegistration();
+  RdmaLocalMemoryRegistration(RdmaMemoryLayout layout,
+                              std::vector<application::RdmaOwnedMr> ownedMrs);
+  ~RdmaLocalMemoryRegistration() = default;
 
   const RdmaMemoryLayout& Layout() const { return layout_; }
   void MarkInvalidated() const { invalidated_.store(true, std::memory_order_release); }
@@ -239,7 +262,7 @@ class RdmaLocalMemoryRegistration {
 
  private:
   RdmaMemoryLayout layout_;
-  application::RdmaDeviceContext* devCtx_;
+  std::vector<application::RdmaOwnedMr> ownedMrs_;
   mutable std::atomic<bool> invalidated_{false};
 };
 
@@ -255,10 +278,26 @@ struct RdmaTransferSlice {
   uint32_t len;
 };
 
+struct ResolvedLaneWork {
+  int epId{-1};
+  size_t begin{0};
+  size_t end{0};
+};
+
+struct ResolvedTransferPlan {
+  std::vector<RdmaTransferSlice> slices;
+  std::vector<ResolvedLaneWork> lanes;
+};
+
 std::vector<RdmaTransferSlice> ResolveTransferSlices(const RdmaMemoryLayout& local,
                                                      size_t localOffset,
                                                      const RdmaMemoryLayout& remote,
                                                      size_t remoteOffset, size_t totalSize);
+ResolvedTransferPlan BuildResolvedTransferPlan(const EpPairVec& eps, const RdmaMemoryLayout& local,
+                                               const SizeVec& localOffsets,
+                                               const RdmaMemoryLayout& remote,
+                                               const SizeVec& remoteOffsets, const SizeVec& sizes,
+                                               size_t maxLanes = 0);
 
 struct RemoteEngineMeta {
   EngineKey key;
@@ -330,10 +369,19 @@ inline RdmaOpRet RdmaWrite(const EpPairVec& eps, const application::RdmaMemoryRe
                        false);
 }
 
-RdmaOpRet RdmaBatchReadWriteResolved(const EpPairVec& eps,
-                                     const std::vector<RdmaTransferSlice>& slices,
-                                     std::shared_ptr<CqCallbackMeta> callbackMeta,
-                                     TransferUniqueId id, bool isRead, int postBatchSize = -1);
+RdmaOpRet RdmaPostResolvedSlicesToSingleEp(const EpPair& ep,
+                                           const std::vector<RdmaTransferSlice>& slices,
+                                           size_t begin, size_t end,
+                                           std::shared_ptr<CqCallbackMeta> callbackMeta,
+                                           TransferUniqueId id, bool isRead,
+                                           int postBatchSize = -1);
+
+RdmaOpRet RdmaSubmitResolvedTransferPlanInline(const EpPairVec& eps,
+                                               const std::vector<RdmaTransferSlice>& slices,
+                                               const std::vector<ResolvedLaneWork>& lanes,
+                                               std::shared_ptr<CqCallbackMeta> callbackMeta,
+                                               TransferUniqueId id, bool isRead,
+                                               int postBatchSize = -1);
 
 }  // namespace io
 }  // namespace mori

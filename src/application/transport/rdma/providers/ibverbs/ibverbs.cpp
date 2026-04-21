@@ -21,6 +21,8 @@
 // SOFTWARE.
 #include "mori/application/transport/rdma/providers/ibverbs/ibverbs.hpp"
 
+#include <algorithm>
+
 #include "mori/application/utils/check.hpp"
 #include "mori/utils/mori_log.hpp"
 namespace mori {
@@ -33,6 +35,7 @@ IBVerbsDeviceContext::IBVerbsDeviceContext(RdmaDevice* rdma_device, ibv_pd* inPd
     : RdmaDeviceContext(rdma_device, inPd) {}
 
 IBVerbsDeviceContext::~IBVerbsDeviceContext() {
+  std::lock_guard<std::mutex> lock(epPoolMu_);
   for (auto& it : qpPool) ibv_destroy_qp(it.second);
   for (auto& it : cqPool) ibv_destroy_cq(it.second);
   for (auto* compCh : compChPool) {
@@ -98,16 +101,43 @@ RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& 
   if (config.enableSrq)
     assert(endpoint.ibvHandle.srq && (endpoint.ibvHandle.qp->srq == endpoint.ibvHandle.srq));
 
-  cqPool.insert({endpoint.ibvHandle.cq, endpoint.ibvHandle.cq});
-  qpPool.insert({endpoint.ibvHandle.qp->qp_num, endpoint.ibvHandle.qp});
-  if (endpoint.ibvHandle.compCh) {
-    compChPool.push_back(endpoint.ibvHandle.compCh);
+  {
+    std::lock_guard<std::mutex> lock(epPoolMu_);
+    cqPool.insert({endpoint.ibvHandle.cq, endpoint.ibvHandle.cq});
+    qpPool.insert({endpoint.ibvHandle.qp->qp_num, endpoint.ibvHandle.qp});
+    if (endpoint.ibvHandle.compCh) {
+      compChPool.push_back(endpoint.ibvHandle.compCh);
+    }
   }
   return endpoint;
 }
 
+void IBVerbsDeviceContext::DestroyRdmaEndpoint(const RdmaEndpoint& endpoint) {
+  std::lock_guard<std::mutex> lock(epPoolMu_);
+
+  auto qpIt = qpPool.find(endpoint.handle.qpn);
+  if (qpIt != qpPool.end()) {
+    ibv_destroy_qp(qpIt->second);
+    qpPool.erase(qpIt);
+  }
+
+  auto cqIt = cqPool.find(endpoint.ibvHandle.cq);
+  if (cqIt != cqPool.end()) {
+    ibv_destroy_cq(cqIt->second);
+    cqPool.erase(cqIt);
+  }
+
+  if (endpoint.ibvHandle.compCh != nullptr) {
+    auto chIt = std::find(compChPool.begin(), compChPool.end(), endpoint.ibvHandle.compCh);
+    if (chIt != compChPool.end()) compChPool.erase(chIt);
+    ibv_destroy_comp_channel(endpoint.ibvHandle.compCh);
+  }
+}
+
 void IBVerbsDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
                                            const RdmaEndpointHandle& remote, uint32_t qpId) {
+  std::lock_guard<std::mutex> lock(epPoolMu_);
+
   ibv_qp_attr attr;
   int flags;
 

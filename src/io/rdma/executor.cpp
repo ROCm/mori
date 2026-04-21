@@ -79,7 +79,7 @@ void MultithreadExecutor::Worker::MainLoop() {
 
   MORI_IO_INFO("worker {} enter main loop, running on core {}", workerId, sched_getcpu());
 
-  Task task{nullptr, 0, 0, 0};
+  Task task;
   while (true) {
     {
       std::unique_lock<std::mutex> lock(mu);
@@ -93,23 +93,42 @@ void MultithreadExecutor::Worker::MainLoop() {
       q.pop();
     }
 
-    SizeVec tLoclOffsets(task.req->localOffsets.begin() + task.begin,
-                         task.req->localOffsets.begin() + task.end);
-    SizeVec tRemoteOffsets(task.req->remoteOffsets.begin() + task.begin,
-                           task.req->remoteOffsets.begin() + task.end);
-    SizeVec tSizes(task.req->sizes.begin() + task.begin, task.req->sizes.begin() + task.end);
+    RdmaOpRet ret;
+    TransferUniqueId taskId = 0;
 
-    RdmaOpRet ret = mori::io::RdmaBatchReadWrite(
-        {task.req->eps[task.epId]}, task.req->local, tLoclOffsets, task.req->remote, tRemoteOffsets,
-        tSizes, task.req->callbackMeta, task.req->id, task.req->isRead, task.req->postBatchSize);
+    if (task.kind == Task::Kind::SingleMr) {
+      SizeVec tLoclOffsets(task.singleReq->localOffsets.begin() + task.begin,
+                           task.singleReq->localOffsets.begin() + task.end);
+      SizeVec tRemoteOffsets(task.singleReq->remoteOffsets.begin() + task.begin,
+                             task.singleReq->remoteOffsets.begin() + task.end);
+      SizeVec tSizes(task.singleReq->sizes.begin() + task.begin,
+                     task.singleReq->sizes.begin() + task.end);
+
+      ret = mori::io::RdmaBatchReadWrite({task.singleReq->eps[task.epId]}, task.singleReq->local,
+                                         tLoclOffsets, task.singleReq->remote, tRemoteOffsets,
+                                         tSizes, task.singleReq->callbackMeta, task.singleReq->id,
+                                         task.singleReq->isRead, task.singleReq->postBatchSize);
+      taskId = task.singleReq->id;
+    } else {
+      ret = mori::io::RdmaPostResolvedSlicesToSingleEp(
+          task.resolvedReq->eps[task.epId], task.resolvedReq->slices, task.begin, task.end,
+          task.resolvedReq->callbackMeta, task.resolvedReq->id, task.resolvedReq->isRead,
+          task.resolvedReq->postBatchSize);
+      taskId = task.resolvedReq->id;
+    }
+
     task.ret.set_value(ret);
-    MORI_IO_TRACE("Worker {} execute task {} begin {} end {} ret code {}", workerId, task.req->id,
+    MORI_IO_TRACE("Worker {} execute task {} begin {} end {} ret code {}", workerId, taskId,
                   task.begin, task.end, static_cast<uint32_t>(ret.code));
   }
 }
 
 void MultithreadExecutor::Worker::Submit(Task&& task) {
   MORI_IO_FUNCTION_TIMER;
+  TransferUniqueId taskId =
+      task.kind == Task::Kind::SingleMr ? task.singleReq->id : task.resolvedReq->id;
+  size_t begin = task.begin;
+  size_t end = task.end;
   {
     std::lock_guard<std::mutex> lock(mu);
     if (!running.load()) {
@@ -119,8 +138,7 @@ void MultithreadExecutor::Worker::Submit(Task&& task) {
     q.push(std::move(task));
     cond.notify_all();
   }
-  MORI_IO_TRACE("Submit to worker {} task {} begin {} end {}", workerId, task.req->id, task.begin,
-                task.end);
+  MORI_IO_TRACE("Submit to worker {} task {} begin {} end {}", workerId, taskId, begin, end);
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -135,19 +153,19 @@ MultithreadExecutor::MultithreadExecutor(int n) : numWorker(n) {
 
 MultithreadExecutor::~MultithreadExecutor() { Shutdown(); }
 
-std::vector<std::pair<int, int>> MultithreadExecutor::SplitWork(const ExecutorReq& req) {
-  int numEps = req.eps.size();
-  int totalBatchSize = req.sizes.size();
+std::vector<std::pair<size_t, size_t>> MultithreadExecutor::SplitWork(const ExecutorReq& req) {
+  size_t numEps = req.eps.size();
+  size_t totalBatchSize = req.sizes.size();
 
   assert(numEps > 0);
 
-  int numActiveWorkers = std::min(numEps, numWorker);
-  int perWorkerBatchSize = (totalBatchSize + numActiveWorkers - 1) / numActiveWorkers;
+  size_t numActiveWorkers = std::min(numEps, static_cast<size_t>(numWorker));
+  size_t perWorkerBatchSize = (totalBatchSize + numActiveWorkers - 1) / numActiveWorkers;
 
-  std::vector<std::pair<int, int>> splits;
-  for (int i = 0; i < numActiveWorkers; i++) {
-    int begin = i * perWorkerBatchSize;
-    int end = std::min(begin + perWorkerBatchSize, totalBatchSize);
+  std::vector<std::pair<size_t, size_t>> splits;
+  for (size_t i = 0; i < numActiveWorkers; i++) {
+    size_t begin = i * perWorkerBatchSize;
+    size_t end = std::min(begin + perWorkerBatchSize, totalBatchSize);
     splits.push_back({begin, end});
     if (end >= totalBatchSize) break;
   }
@@ -159,11 +177,11 @@ RdmaOpRet MultithreadExecutor::RdmaBatchReadWrite(const ExecutorReq& req) {
   MORI_IO_FUNCTION_TIMER;
 
   auto splits = SplitWork(req);
-  int numSplits = splits.size();
+  size_t numSplits = splits.size();
   std::vector<std::future<RdmaOpRet>> futs;
 
-  for (int i = 0; i < numSplits; i++) {
-    Task task{&req, i, splits[i].first, splits[i].second};
+  for (size_t i = 0; i < numSplits; i++) {
+    Task task{&req, static_cast<int>(i), splits[i].first, splits[i].second};
     futs.push_back(std::move(task.ret.get_future()));
     pool[i]->Submit(std::move(task));
   }
@@ -187,6 +205,39 @@ RdmaOpRet MultithreadExecutor::RdmaBatchReadWrite(const ExecutorReq& req) {
   }
 
   MORI_IO_TRACE("MultithreadExecutor submit request for RdmaBatchReadWrite done");
+  return {StatusCode::IN_PROGRESS, ""};
+}
+
+RdmaOpRet MultithreadExecutor::RdmaBatchReadWriteResolved(const ResolvedExecutorReq& req) {
+  MORI_IO_FUNCTION_TIMER;
+
+  if (req.slices.empty()) return {StatusCode::SUCCESS, ""};
+  if (req.lanes.empty()) return {StatusCode::ERR_INVALID_ARGS, "resolved transfer lanes are empty"};
+
+  std::vector<std::future<RdmaOpRet>> futs;
+  futs.reserve(req.lanes.size());
+
+  for (size_t i = 0; i < req.lanes.size(); ++i) {
+    const auto& lane = req.lanes[i];
+    Task task{&req, lane.epId, lane.begin, lane.end};
+    futs.push_back(std::move(task.ret.get_future()));
+    pool[i % pool.size()]->Submit(std::move(task));
+  }
+
+  bool hasFail = false;
+  int numSucc = 0;
+  RdmaOpRet failedRet;
+  for (auto& fut : futs) {
+    RdmaOpRet ret = fut.get();
+    if (ret.Failed()) {
+      hasFail = true;
+      failedRet = ret;
+    } else if (ret.Succeeded()) {
+      numSucc++;
+    }
+  }
+  if (hasFail) return failedRet;
+  if (numSucc == static_cast<int>(req.lanes.size())) return {StatusCode::SUCCESS, ""};
   return {StatusCode::IN_PROGRESS, ""};
 }
 

@@ -67,12 +67,17 @@ class RdmaManager {
   void DeregisterRemoteLayout(EngineKey, MemoryUniqueId);
 
   // Endpoint management APIs
-  int CountEndpoint(EngineKey, TopoKeyPair);
-  EpPairVec GetAllEndpoint(EngineKey, TopoKeyPair);
+  int CountEndpoint(EngineKey, const ExactRouteKey&);
+  EpPairVec GetAllEndpoint(EngineKey, const ExactRouteKey&);
   application::RdmaEndpoint CreateEndpoint(int devId);
-  EndpointId ConnectEndpoint(EngineKey remoteKey, int ldevId, application::RdmaEndpoint local,
-                             int rdevId, application::RdmaEndpointHandle remote, TopoKeyPair key,
-                             int weight);
+  bool IsValidRdmaDeviceId(int devId) const;
+  void ConnectLocalEndpoint(int ldevId, const application::RdmaEndpoint& local,
+                            const application::RdmaEndpointHandle& remote);
+  void DestroyEndpoint(int devId, const application::RdmaEndpoint& endpoint);
+  EndpointId PublishEndpoint(EngineKey remoteKey, const ExactRouteKey& key,
+                             application::RdmaEndpoint local,
+                             application::RdmaEndpointHandle remote, int weight);
+  bool UnpublishEndpoint(EngineKey remoteKey, const ExactRouteKey& key, EndpointId id);
   std::shared_ptr<EndpointRuntime> GetEndpointRuntime(EndpointId id);
   std::vector<std::shared_ptr<EndpointRuntime>> SnapshotEndpointRuntimes();
 
@@ -116,6 +121,7 @@ class NotifManager {
   ~NotifManager();
 
   void RegisterEndpoint(const std::shared_ptr<EndpointRuntime>& rt);
+  void UnregisterEndpoint(const std::shared_ptr<EndpointRuntime>& rt);
 
   void RegisterDevice(int devId);
 
@@ -206,7 +212,7 @@ class ControlPlaneServer {
   void DeregisterRemoteEngine(const EngineDesc&);
 
   // Endpoint management
-  void BuildRdmaConn(EngineKey, TopoKeyPair, int ldevId = -1, int rdevId = -1);
+  void BuildRdmaConn(EngineKey, const ExactRouteKey&);
 
   // MemoryRegion management
   void RegisterMemory(MemoryDesc&);
