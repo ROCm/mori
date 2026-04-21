@@ -995,15 +995,7 @@ def _bench_overlap_one_size(
             n_samples = 5
             all_phase_deltas = []     # block-0 phases, only populated on rank 0
             all_cb_phase_deltas = []  # compute-block-1 phases, only populated on rank 0
-            all_copy_timings = []     # chunk-copy timings, only populated on rank 0
             stage_med_ar0 = []        # only populated on rank 0
-
-            # Enable chunk-copy timing too (path B diagnostics). Safe no-op
-            # if the build doesn't have the API (fall back gracefully).
-            try:
-                ar_obj.enable_copy_timing(True)
-            except Exception:
-                pass
 
             for _sample in range(n_samples):
                 # Sync all ranks before each sample so AR[0] cold path is
@@ -1018,15 +1010,10 @@ def _bench_overlap_one_size(
                 ev_ar0_s = torch.cuda.Event(enable_timing=True)
                 ev_ar0_e = torch.cuda.Event(enable_timing=True)
 
-                # Enable phase timing + copy timing ONLY for AR[0]'s submit.
-                # Disable both right after so AR[1..N-1] don't overwrite the
-                # buffers/events in the class (kernel reads the flag when
-                # queueing onto stream_ar; host reads the flag in copy path).
+                # Enable phase timing ONLY for AR[0]'s submit. Disable right
+                # after so AR[1..N-1] kernels receive phase_ts=nullptr and
+                # don't overwrite AR[0]'s timestamps in the buffer.
                 ar_obj.enable_phase_timing(True)
-                try:
-                    ar_obj.enable_copy_timing(True)
-                except Exception:
-                    pass
                 ev_g0_s.record(stream_gemm)
                 with torch.cuda.stream(stream_gemm):
                     _run_gemm()
@@ -1037,10 +1024,6 @@ def _bench_overlap_one_size(
                     launch_ar()       # AR[0] submitted with phase_ts_d_
                 ev_ar0_e.record(stream_ar)
                 ar_obj.enable_phase_timing(False)  # must disable BEFORE submitting AR[1+]
-                try:
-                    ar_obj.enable_copy_timing(False)
-                except Exception:
-                    pass
 
                 # Immediately submit AR[1..N-1] (no phase timing). This
                 # reproduces real overlap-loop state where AR[0] runs with
@@ -1062,16 +1045,6 @@ def _bench_overlap_one_size(
                 dist.barrier()
                 ts = ar_obj.get_phase_timestamps()
                 last_nc = ar_obj.get_last_num_chunks()
-
-                # Read copy timings for AR[0]'s call (stream_ar.synchronize()
-                # above waits on copy_done_event_ so copy_stream is also done).
-                try:
-                    ct = ar_obj.get_copy_timing_ms()
-                    ct_nc = ar_obj.get_copy_timing_last_num_chunks()
-                    if len(ct) == ct_nc * 4 and rank == 0:
-                        all_copy_timings.append((ct_nc, ct))
-                except Exception:
-                    pass
 
                 if rank == 0:
                     # Convert raw cycles to ms using AR[0] event duration as anchor.
@@ -1135,31 +1108,6 @@ def _bench_overlap_one_size(
                 else:
                     print(f"  --- Block 1 (compute block) timestamps all zero: kernel was "
                           f"not built with compute-block instrumentation ---")
-
-                if len(all_copy_timings) > 0:
-                    ct_nc_ref = all_copy_timings[0][0]
-                    # All samples should have identical numChunks; if not,
-                    # just use whichever is in sample 0.
-                    per_chunk_vals = [[[] for _ in range(4)] for _ in range(ct_nc_ref)]
-                    for (nc, v) in all_copy_timings:
-                        if nc != ct_nc_ref:
-                            continue
-                        for c in range(nc):
-                            for k in range(4):
-                                per_chunk_vals[c][k].append(v[c * 4 + k])
-                    print(f"  --- Chunk-copy pipeline (path B): wait + hipMemcpy2DAsync per chunk ---")
-                    print(f"  {'chunk':<6} {'host-wait(us)':>14} {'gpu-wait(ms)':>14}"
-                          f" {'host-copy(us)':>14} {'gpu-copy(ms)':>14}")
-                    total_copy_ms = 0.0
-                    for c in range(ct_nc_ref):
-                        medians = [
-                            _st.median(per_chunk_vals[c][k]) if per_chunk_vals[c][k] else 0.0
-                            for k in range(4)
-                        ]
-                        print(f"  c{c:<5d} {medians[0]:14.2f} {medians[1]:14.3f}"
-                              f" {medians[2]:14.2f} {medians[3]:14.3f}")
-                        total_copy_ms += medians[3]
-                    print(f"  sum(gpu copy ms) over {ct_nc_ref} chunks:  {total_copy_ms:7.3f} ms")
                 print()
         except Exception as e:
             if rank == 0:

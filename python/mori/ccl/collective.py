@@ -363,24 +363,3 @@ class AllreduceSdma:
         Needed to parse get_phase_timestamps()'s layout.
         """
         return self._handle.get_last_num_chunks()
-
-    # --- Chunk-copy timing (path B diagnostics) -----------------------------
-    def enable_copy_timing(self, on: bool):
-        """Enable per-chunk copy-pipeline timing (wait + hipMemcpy2DAsync)."""
-        self._handle.enable_copy_timing(on)
-
-    def get_copy_timing_ms(self) -> list:
-        """Return per-chunk copy timings from the most recent pipelined() call.
-
-        Layout per chunk c (4 values):
-          [c*4+0]: host-side us spent in hipStreamWaitValue32
-          [c*4+1]: gpu-side ms wait latency (wait released - wait issued)
-          [c*4+2]: host-side us spent in hipMemcpy2DAsync
-          [c*4+3]: gpu-side ms copy wall (copy ended - wait released)
-
-        Length = 4 * num_chunks. Call after stream is synchronized.
-        """
-        return list(self._handle.get_copy_timing_ms())
-
-    def get_copy_timing_last_num_chunks(self) -> int:
-        return self._handle.get_copy_timing_last_num_chunks()

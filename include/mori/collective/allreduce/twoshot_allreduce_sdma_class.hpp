@@ -101,22 +101,6 @@ class AllreduceSdma {
   hipStream_t copy_stream_ = nullptr;          // dedicated stream for per-chunk copy
   hipEvent_t copy_done_event_ = nullptr;       // copy_stream -> main: all chunk copies done
 
-  // Per-chunk copy instrumentation. For each chunk c we record 3 events on
-  // copy_stream_: before waitValue32, after waitValue32 (= wait released),
-  // after hipMemcpy2DAsync (= copy ended). Diff gives us:
-  //   wait_latency = ev[c*3+1] - ev[c*3+0]  (= how long host-visible wait took)
-  //   copy_runtime = ev[c*3+2] - ev[c*3+1]  (= actual 2D copy kernel wall)
-  // Host-side submit latency is measured by chrono::steady_clock around each
-  // host call and stored in copy_host_submit_us_ arrays.
-  static constexpr int kMaxCopyChunks = 8;          // supports up to 8 chunks
-  bool copy_timing_enabled_ = false;
-  int copy_timing_last_num_chunks_ = 0;
-  hipEvent_t copy_timing_events_[kMaxCopyChunks * 3] = {};
-  // Host-side submit latencies in microseconds for the most recent call:
-  //   [c*2+0]: us spent inside hipStreamWaitValue32 host call
-  //   [c*2+1]: us spent inside hipMemcpy2DAsync host call
-  double copy_timing_host_us_[kMaxCopyChunks * 2] = {};
-
   // Phase-level timestamp instrumentation (optional, diagnostic).
   // When enabled, block 0 thread 0 of PipelinedAllReduceSdmaKernel writes
   // __builtin_amdgcn_s_memtime() at each phase boundary to phase_ts_d_.
@@ -237,22 +221,6 @@ class AllreduceSdma {
   //   2 + 3*numChunks:   AG wait done
   //   3 + 3*numChunks:   block 0 exit
   std::vector<uint64_t> get_phase_timestamps();
-
-  // --- Chunk-level copy timing instrumentation (path B diagnostics) ---
-  // Enable to start recording per-chunk wait/copy timings. Events are
-  // recorded on copy_stream_ during each pipelined() call; read back via
-  // get_copy_timing_ms() AFTER the main stream has been synchronized.
-  void enable_copy_timing(bool on);
-  bool is_copy_timing_enabled() const { return copy_timing_enabled_; }
-
-  // Returns per-chunk timings from the most recent pipelined() call:
-  //   [c*4 + 0]: host-side us spent in hipStreamWaitValue32 for chunk c
-  //   [c*4 + 1]: GPU-side ms wait latency (wait released - wait started)
-  //   [c*4 + 2]: host-side us spent in hipMemcpy2DAsync for chunk c
-  //   [c*4 + 3]: GPU-side ms copy runtime (copy ended - wait released)
-  // Length = 4 * last_num_chunks. Call after stream has sync'd.
-  std::vector<double> get_copy_timing_ms();
-  int get_copy_timing_last_num_chunks() const { return copy_timing_last_num_chunks_; }
 };
 
 }  // namespace collective

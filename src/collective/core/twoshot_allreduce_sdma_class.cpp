@@ -26,7 +26,6 @@
 #include <hip/hip_fp16.h>
 
 #include <algorithm>
-#include <chrono>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -181,12 +180,6 @@ AllreduceSdma<T>::~AllreduceSdma() {
     hipFree(chunk_ready_counter_d_);
     chunk_ready_counter_d_ = nullptr;
   }
-  for (int i = 0; i < kMaxCopyChunks * 3; ++i) {
-    if (copy_timing_events_[i]) {
-      hipEventDestroy(copy_timing_events_[i]);
-      copy_timing_events_[i] = nullptr;
-    }
-  }
   if (copy_done_event_) {
     hipEventDestroy(copy_done_event_);
     copy_done_event_ = nullptr;
@@ -198,60 +191,6 @@ AllreduceSdma<T>::~AllreduceSdma() {
   if (flags_) {
     printf("AllreduceSdma destroyed: PE %d\n", myPe_);
   }
-}
-
-// ---------------------------------------------------------------------------
-// Chunk-copy timing instrumentation (path B diagnostics)
-// ---------------------------------------------------------------------------
-template <typename T>
-void AllreduceSdma<T>::enable_copy_timing(bool on) {
-  if (on == copy_timing_enabled_) return;
-  if (on) {
-    for (int i = 0; i < kMaxCopyChunks * 3; ++i) {
-      if (copy_timing_events_[i] == nullptr) {
-        hipError_t e = hipEventCreateWithFlags(&copy_timing_events_[i],
-                                               hipEventDefault);
-        if (e != hipSuccess) {
-          fprintf(stderr, "PE %d: copy timing event create failed: %s\n",
-                  myPe_, hipGetErrorString(e));
-          // Clean up already-created ones
-          for (int j = 0; j < i; ++j) {
-            hipEventDestroy(copy_timing_events_[j]);
-            copy_timing_events_[j] = nullptr;
-          }
-          return;
-        }
-      }
-    }
-    copy_timing_enabled_ = true;
-    printf("PE %d: chunk-copy timing ENABLED (%d event slots)\n",
-           myPe_, kMaxCopyChunks * 3);
-  } else {
-    copy_timing_enabled_ = false;
-  }
-}
-
-template <typename T>
-std::vector<double> AllreduceSdma<T>::get_copy_timing_ms() {
-  std::vector<double> out;
-  if (!copy_timing_enabled_ || copy_timing_last_num_chunks_ == 0) return out;
-  const int nc = copy_timing_last_num_chunks_;
-  if (nc > kMaxCopyChunks) return out;
-  out.reserve(nc * 4);
-  for (int c = 0; c < nc; ++c) {
-    float ms_wait_gpu = 0.0f, ms_copy_gpu = 0.0f;
-    hipError_t e1 = hipEventElapsedTime(&ms_wait_gpu,
-                                        copy_timing_events_[c * 3 + 0],
-                                        copy_timing_events_[c * 3 + 1]);
-    hipError_t e2 = hipEventElapsedTime(&ms_copy_gpu,
-                                        copy_timing_events_[c * 3 + 1],
-                                        copy_timing_events_[c * 3 + 2]);
-    out.push_back(copy_timing_host_us_[c * 2 + 0]);       // host us: waitValue32 call
-    out.push_back(e1 == hipSuccess ? ms_wait_gpu : -1.0); // gpu ms: wait latency
-    out.push_back(copy_timing_host_us_[c * 2 + 1]);       // host us: hipMemcpy2DAsync call
-    out.push_back(e2 == hipSuccess ? ms_copy_gpu : -1.0); // gpu ms: copy runtime
-  }
-  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -800,47 +739,21 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                 char* src_base = static_cast<char*>(output_transit_buffer_);
                 char* dst_base = reinterpret_cast<char*>(output);
 
-                const bool time_this_call =
-                    copy_timing_enabled_ &&
-                    numChunks_host <= kMaxCopyChunks;
-                if (time_this_call) {
-                    copy_timing_last_num_chunks_ = numChunks_host;
-                }
-
                 for (int c = 0; c < numChunks_host; ++c) {
-                    // Optional timing: record ev[3c+0] before wait.
-                    if (time_this_call) {
-                        hipEventRecord(copy_timing_events_[c * 3 + 0],
-                                       copy_stream_);
-                    }
                     // Wait: kernel's chunk-ready counter >= prev_gen + c + 1
                     uint32_t expected =
                         chunk_ready_gen_ + static_cast<uint32_t>(c) + 1u;
-                    auto host_t0 = time_this_call
-                        ? std::chrono::steady_clock::now()
-                        : std::chrono::steady_clock::time_point{};
                     hipError_t we = hipStreamWaitValue32(
                         copy_stream_,
                         static_cast<void*>(chunk_ready_counter_d_),
                         expected,
                         hipStreamWaitValueGte,
                         0xFFFFFFFFu);
-                    if (time_this_call) {
-                        auto host_t1 = std::chrono::steady_clock::now();
-                        copy_timing_host_us_[c * 2 + 0] =
-                            std::chrono::duration<double, std::micro>(
-                                host_t1 - host_t0).count();
-                    }
                     if (we != hipSuccess) {
                         fprintf(stderr,
                                 "PE %d: hipStreamWaitValue32(c=%d, exp=%u) failed: %s\n",
                                 myPe_, c, expected, hipGetErrorString(we));
                         return false;
-                    }
-                    // Optional timing: record ev[3c+1] after wait (= wait released on GPU).
-                    if (time_this_call) {
-                        hipEventRecord(copy_timing_events_[c * 3 + 1],
-                                       copy_stream_);
                     }
                     // 2D copy for chunk c: height=npes shards, width=chunk_shard_bytes,
                     // pitch=shard_bytes (both src and dst layout is the same).
@@ -848,31 +761,16 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                     size_t width = chunk_shard_bytes;
                     if (c_off + width > shard_bytes) width = shard_bytes - c_off;
                     if (width == 0) continue;
-                    auto host_t2 = time_this_call
-                        ? std::chrono::steady_clock::now()
-                        : std::chrono::steady_clock::time_point{};
                     hipError_t me = hipMemcpy2DAsync(
                         dst_base + c_off, shard_bytes,
                         src_base + c_off, shard_bytes,
                         width, static_cast<size_t>(npes_),
                         hipMemcpyDeviceToDevice, copy_stream_);
-                    if (time_this_call) {
-                        auto host_t3 = std::chrono::steady_clock::now();
-                        copy_timing_host_us_[c * 2 + 1] =
-                            std::chrono::duration<double, std::micro>(
-                                host_t3 - host_t2).count();
-                    }
                     if (me != hipSuccess) {
                         fprintf(stderr,
                                 "PE %d: hipMemcpy2DAsync(c=%d) failed: %s\n",
                                 myPe_, c, hipGetErrorString(me));
                         return false;
-                    }
-                    // Optional timing: record ev[3c+2] after 2D copy issued
-                    // (completion event; elapsed_time from ev[3c+1] gives copy wall).
-                    if (time_this_call) {
-                        hipEventRecord(copy_timing_events_[c * 3 + 2],
-                                       copy_stream_);
                     }
                 }
 
