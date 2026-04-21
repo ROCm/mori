@@ -326,11 +326,11 @@ python3<span class="w"> </span>tests/python/ops/bench_dispatch_combine.py
 </section>
 <section id="inter-node">
 <h2>Inter-node<a class="headerlink" href="#inter-node" title="Link to this heading"></a></h2>
-<p>Run the following command on each node and replace <code class="docutils literal notranslate"><span class="pre">node_rank</span></code> with its actual rank. <code class="docutils literal notranslate"><span class="pre">master_addr</span></code> should be the IP of the rank 0 node. <code class="docutils literal notranslate"><span class="pre">GLOO_SOCKET_IFNAME</span></code> should be set to the TCP socket interface you want to use.</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">GLOO_SOCKET_IFNAME</span><span class="o">=</span>ens14np0
+<p>Run the following command on each node and replace <code class="docutils literal notranslate"><span class="pre">node_rank</span></code> with its actual rank. <code class="docutils literal notranslate"><span class="pre">master_addr</span></code> should be the hostname or IP of the rank 0 node. <code class="docutils literal notranslate"><span class="pre">GLOO_SOCKET_IFNAME</span></code> should be set to the TCP socket interface you want to use.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">GLOO_SOCKET_IFNAME</span><span class="o">=</span>enp81s0f1
 <span class="nb">export</span><span class="w"> </span><span class="nv">MORI_RDMA_DEVICES</span><span class="o">=</span>^mlx5_0,mlx5_1<span class="w">  </span><span class="c1"># Optional: use `^` prefix to exclude specified devices</span>
 
-torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">2</span><span class="w"> </span>--node_rank<span class="o">=</span><span class="m">0</span><span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">2</span><span class="w"> </span>--node_rank<span class="o">=</span><span class="m">0</span><span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--master_addr<span class="o">=</span><span class="s2">&quot;10.194.129.65&quot;</span><span class="w"> </span>--master_port<span class="o">=</span><span class="m">1234</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>examples/ops/dispatch_combine/test_dispatch_combine_internode.py<span class="w"> </span>--bench
 </pre></div>
@@ -684,10 +684,11 @@ Each token can map to the same node via multiple expert slots; both implementati
 </div>
 <p><strong>3. Run the profiling job</strong></p>
 <p>Run on each node, substituting <code class="docutils literal notranslate"><span class="pre">node_rank</span></code> and <code class="docutils literal notranslate"><span class="pre">master_addr</span></code> as in the <a class="reference internal" href="#inter-node"><span class="xref myst">Inter-node</span></a> section.  Use <code class="docutils literal notranslate"><span class="pre">--cmd</span> <span class="pre">profile</span></code> and pass the desired kernel type via <code class="docutils literal notranslate"><span class="pre">--kernel-type</span></code>:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">GLOO_SOCKET_IFNAME</span><span class="o">=</span>ens14np0
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">ENABLE_PROFILER</span><span class="o">=</span>ON
+<span class="nb">export</span><span class="w"> </span><span class="nv">GLOO_SOCKET_IFNAME</span><span class="o">=</span>enp81s0f1
 <span class="nb">export</span><span class="w"> </span><span class="nv">MORI_RDMA_DEVICES</span><span class="o">=</span>^mlx5_0,mlx5_1<span class="w">  </span><span class="c1"># optional</span>
 
-torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">2</span><span class="w"> </span>--node_rank<span class="o">=</span><span class="m">0</span><span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">2</span><span class="w"> </span>--node_rank<span class="o">=</span><span class="m">0</span><span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--master_addr<span class="o">=</span><span class="s2">&quot;10.194.129.65&quot;</span><span class="w"> </span>--master_port<span class="o">=</span><span class="m">1234</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>examples/ops/dispatch_combine/test_dispatch_combine_internode.py<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--cmd<span class="w"> </span>profile<span class="w"> </span>--kernel-type<span class="w"> </span>v1

@@ -1016,15 +1016,19 @@
 <td><p><code class="docutils literal notranslate"><span class="pre">&quot;MANUAL&quot;</span></code></p></td>
 <td><p>Launch config mode: <code class="docutils literal notranslate"><span class="pre">&quot;MANUAL&quot;</span></code> or <code class="docutils literal notranslate"><span class="pre">&quot;AUTO&quot;</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">GLOO_SOCKET_IFNAME</span></code></p></td>
-<td><p>—</p></td>
-<td><p>TCP interface for torch distributed (e.g., <code class="docutils literal notranslate"><span class="pre">ens14np0</span></code>)</p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ENABLE_PROFILER</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&quot;&quot;</span></code> (disabled)</p></td>
+<td><p>Enable kernel profiler for JIT-compiled kernels. Set to <code class="docutils literal notranslate"><span class="pre">ON</span></code>, <code class="docutils literal notranslate"><span class="pre">1</span></code>, <code class="docutils literal notranslate"><span class="pre">true</span></code>, or <code class="docutils literal notranslate"><span class="pre">yes</span></code> to enable. Must also build with <code class="docutils literal notranslate"><span class="pre">ENABLE_PROFILER=ON</span></code>.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MASTER_ADDR</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">GLOO_SOCKET_IFNAME</span></code></p></td>
+<td><p>—</p></td>
+<td><p>TCP interface for torch distributed (e.g., <code class="docutils literal notranslate"><span class="pre">enp81s0f1</span></code>)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MASTER_ADDR</span></code></p></td>
 <td><p>—</p></td>
 <td><p>Torch distributed master address</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MASTER_PORT</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MASTER_PORT</span></code></p></td>
 <td><p>—</p></td>
 <td><p>Torch distributed master port</p></td>
 </tr>
@@ -1044,10 +1048,10 @@ python3<span class="w"> </span>tests/python/ops/bench_dispatch_combine.py
 <section id="inter-node">
 <h3>Inter-node<a class="headerlink" href="#inter-node" title="Link to this heading"></a></h3>
 <p>Run on each node (replace <code class="docutils literal notranslate"><span class="pre">node_rank</span></code> and <code class="docutils literal notranslate"><span class="pre">master_addr</span></code>):</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">GLOO_SOCKET_IFNAME</span><span class="o">=</span>ens14np0
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">GLOO_SOCKET_IFNAME</span><span class="o">=</span>enp81s0f1
 <span class="nb">export</span><span class="w"> </span><span class="nv">MORI_RDMA_DEVICES</span><span class="o">=</span>^mlx5_0,mlx5_1<span class="w">  </span><span class="c1"># Optional: exclude specific NICs</span>
 
-torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">2</span><span class="w"> </span>--node_rank<span class="o">=</span><span class="m">0</span><span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">2</span><span class="w"> </span>--node_rank<span class="o">=</span><span class="m">0</span><span class="w"> </span>--nproc_per_node<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--master_addr<span class="o">=</span><span class="s2">&quot;10.194.129.65&quot;</span><span class="w"> </span>--master_port<span class="o">=</span><span class="m">1234</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>examples/ops/dispatch_combine/test_dispatch_combine_internode.py<span class="w"> </span>--bench
 </pre></div>
