@@ -55,7 +55,7 @@ struct RouteGetResult {
 
 class MasterClient {
  public:
-  explicit MasterClient(const MasterClientConfig& config);
+  explicit MasterClient(const UMBPMasterClientConfig& config);
   ~MasterClient();
 
   MasterClient(const MasterClient&) = delete;
@@ -126,7 +126,7 @@ class MasterClient {
   bool IsRegistered() const { return registered_; }
 
  private:
-  MasterClientConfig config_;
+  UMBPMasterClientConfig config_;
 
   std::shared_ptr<grpc_impl::Channel> channel_;
   // Use void* to avoid exposing generated stub type in header.

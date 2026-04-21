@@ -52,7 +52,7 @@ int main(int argc, char** argv) {
   if (argc > 2) node_id = argv[2];
   if (argc > 3) node_addr = argv[3];
 
-  mori::umbp::MasterClientConfig config;
+  mori::umbp::UMBPMasterClientConfig config;
   config.master_address = master_addr;
   config.node_id = node_id;
   config.node_address = node_addr;

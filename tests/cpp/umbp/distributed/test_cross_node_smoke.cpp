@@ -86,8 +86,8 @@ class CrossNodeSmoke : public ::testing::Test {
     cfg_a.master_config.node_id = "node-a";
     cfg_a.master_config.node_address = "127.0.0.1";
     cfg_a.master_config.master_address = master_addr;
-    cfg_a.io_engine_host = "0.0.0.0";
-    cfg_a.io_engine_port = io_port_a_;
+    cfg_a.io_engine.host = "0.0.0.0";
+    cfg_a.io_engine.port = io_port_a_;
     cfg_a.dram_buffers = {{buf_a_, kBlockSize}};
     cfg_a.tier_capacities = {{TierType::DRAM, {kBlockSize, kBlockSize}}};
     cfg_a.dram_page_size = kBlockSize;
@@ -98,8 +98,8 @@ class CrossNodeSmoke : public ::testing::Test {
     cfg_b.master_config.node_id = "node-b";
     cfg_b.master_config.node_address = "127.0.0.1";
     cfg_b.master_config.master_address = master_addr;
-    cfg_b.io_engine_host = "0.0.0.0";
-    cfg_b.io_engine_port = io_port_b_;
+    cfg_b.io_engine.host = "0.0.0.0";
+    cfg_b.io_engine.port = io_port_b_;
     cfg_b.dram_buffers = {{buf_b_, kBufSize}};
     cfg_b.tier_capacities = {{TierType::DRAM, {kBufSize, kBufSize}}};
     cfg_b.dram_page_size = kBlockSize;
@@ -137,12 +137,12 @@ class CrossNodeSmoke : public ::testing::Test {
 TEST_F(CrossNodeSmoke, PutGetWithRDMA) {
   std::memset(caller_buf_, 0xAB, kBlockSize);
 
-  ASSERT_TRUE(client_a_->PutRemote("rdma-key", caller_buf_, kBlockSize));
-  EXPECT_TRUE(client_a_->ExistsRemote("rdma-key"));
-  EXPECT_TRUE(client_b_->ExistsRemote("rdma-key"));
+  ASSERT_TRUE(client_a_->Put("rdma-key", caller_buf_, kBlockSize));
+  EXPECT_TRUE(client_a_->Exists("rdma-key"));
+  EXPECT_TRUE(client_b_->Exists("rdma-key"));
 
   std::memset(read_buf_, 0, kBlockSize);
-  ASSERT_TRUE(client_b_->GetRemote("rdma-key", read_buf_, kBlockSize));
+  ASSERT_TRUE(client_b_->Get("rdma-key", read_buf_, kBlockSize));
   EXPECT_EQ(std::memcmp(caller_buf_, read_buf_, kBlockSize), 0);
 }
 
@@ -158,15 +158,15 @@ TEST_F(CrossNodeSmoke, BatchPutGetWithRDMA) {
   std::vector<const void*> srcs = {src1, src2, src3};
   std::vector<size_t> sizes = {kBlockSize, kBlockSize, kBlockSize};
 
-  auto put_results = client_a_->BatchPutRemote(keys, srcs, sizes);
+  auto put_results = client_a_->BatchPut(keys, srcs, sizes);
   ASSERT_EQ(put_results.size(), 3u);
   for (size_t i = 0; i < 3; ++i) {
     EXPECT_TRUE(put_results[i]) << "put failed for " << keys[i];
   }
 
   for (const auto& key : keys) {
-    EXPECT_TRUE(client_a_->ExistsRemote(key));
-    EXPECT_TRUE(client_b_->ExistsRemote(key));
+    EXPECT_TRUE(client_a_->Exists(key));
+    EXPECT_TRUE(client_b_->Exists(key));
   }
 
   auto* dst1 = static_cast<char*>(read_buf_);
@@ -175,7 +175,7 @@ TEST_F(CrossNodeSmoke, BatchPutGetWithRDMA) {
   std::memset(read_buf_, 0, kBlockSize * 3);
 
   std::vector<void*> dsts = {dst1, dst2, dst3};
-  auto get_results = client_b_->BatchGetRemote(keys, dsts, sizes);
+  auto get_results = client_b_->BatchGet(keys, dsts, sizes);
   ASSERT_EQ(get_results.size(), 3u);
   for (size_t i = 0; i < 3; ++i) {
     EXPECT_TRUE(get_results[i]) << "get failed for " << keys[i];
@@ -187,14 +187,14 @@ TEST_F(CrossNodeSmoke, BatchPutGetWithRDMA) {
 
 TEST_F(CrossNodeSmoke, FinalizeIdempotentE2E) {
   std::memset(caller_buf_, 0xCD, kBlockSize);
-  ASSERT_TRUE(client_a_->PutRemote("idem-key", caller_buf_, kBlockSize));
-  EXPECT_TRUE(client_a_->ExistsRemote("idem-key"));
+  ASSERT_TRUE(client_a_->Put("idem-key", caller_buf_, kBlockSize));
+  EXPECT_TRUE(client_a_->Exists("idem-key"));
 
-  ASSERT_TRUE(client_a_->PutRemote("idem-key", caller_buf_, kBlockSize));
-  EXPECT_TRUE(client_b_->ExistsRemote("idem-key"));
+  ASSERT_TRUE(client_a_->Put("idem-key", caller_buf_, kBlockSize));
+  EXPECT_TRUE(client_b_->Exists("idem-key"));
 
   std::memset(read_buf_, 0, kBlockSize);
-  ASSERT_TRUE(client_b_->GetRemote("idem-key", read_buf_, kBlockSize));
+  ASSERT_TRUE(client_b_->Get("idem-key", read_buf_, kBlockSize));
   EXPECT_EQ(std::memcmp(caller_buf_, read_buf_, kBlockSize), 0);
 }
 
@@ -211,16 +211,16 @@ TEST_F(CrossNodeSmoke, DepthPropagation) {
   std::vector<size_t> sizes = {kBlockSize, kBlockSize, kBlockSize};
   std::vector<int> depths = {5, 10, 15};
 
-  auto results = client_a_->BatchPutRemote(keys, srcs, sizes, depths);
+  auto results = client_a_->BatchPut(keys, srcs, sizes, depths);
   ASSERT_EQ(results.size(), 3u);
   for (size_t i = 0; i < 3; ++i) {
     EXPECT_TRUE(results[i]) << "put with depth failed for " << keys[i];
-    EXPECT_TRUE(client_a_->ExistsRemote(keys[i]));
+    EXPECT_TRUE(client_a_->Exists(keys[i]));
   }
 
   auto* dst1 = static_cast<char*>(read_buf_);
   std::memset(dst1, 0, kBlockSize);
-  ASSERT_TRUE(client_b_->GetRemote("d1", dst1, kBlockSize));
+  ASSERT_TRUE(client_b_->Get("d1", dst1, kBlockSize));
   EXPECT_EQ(std::memcmp(src1, dst1, kBlockSize), 0);
 }
 
@@ -275,8 +275,8 @@ class CrossNodeMultiPage : public ::testing::Test {
     cfg.master_config.node_id = node_id;
     cfg.master_config.node_address = "127.0.0.1";
     cfg.master_config.master_address = "localhost:" + std::to_string(master_port_);
-    cfg.io_engine_host = "0.0.0.0";
-    cfg.io_engine_port = io_port;
+    cfg.io_engine.host = "0.0.0.0";
+    cfg.io_engine.port = io_port;
     cfg.dram_page_size = kPageSize;
     uint64_t total = 0;
     for (size_t sz : setup.buffer_sizes) {
@@ -330,12 +330,12 @@ TEST_F(CrossNodeMultiPage, MultiPageSameBufferPutGet) {
   std::vector<char> src(kPayload);
   for (size_t i = 0; i < kPayload; ++i) src[i] = static_cast<char>(i & 0xFF);
 
-  ASSERT_TRUE(client_a_->PutRemote("mp-same-buf", src.data(), kPayload));
-  EXPECT_TRUE(client_a_->ExistsRemote("mp-same-buf"));
-  EXPECT_TRUE(client_b_->ExistsRemote("mp-same-buf"));
+  ASSERT_TRUE(client_a_->Put("mp-same-buf", src.data(), kPayload));
+  EXPECT_TRUE(client_a_->Exists("mp-same-buf"));
+  EXPECT_TRUE(client_b_->Exists("mp-same-buf"));
 
   std::vector<char> dst(kPayload, 0);
-  ASSERT_TRUE(client_a_->GetRemote("mp-same-buf", dst.data(), kPayload));
+  ASSERT_TRUE(client_a_->Get("mp-same-buf", dst.data(), kPayload));
   EXPECT_EQ(std::memcmp(src.data(), dst.data(), kPayload), 0);
 }
 
@@ -353,18 +353,18 @@ TEST_F(CrossNodeMultiPage, CrossBufferScatterPutGet) {
   std::vector<char> src(kPayload);
   for (size_t i = 0; i < kPayload; ++i) src[i] = static_cast<char>((i * 7) & 0xFF);
 
-  ASSERT_TRUE(client_a_->PutRemote("xbuf-key", src.data(), kPayload));
-  EXPECT_TRUE(client_a_->ExistsRemote("xbuf-key"));
-  EXPECT_TRUE(client_b_->ExistsRemote("xbuf-key"));
+  ASSERT_TRUE(client_a_->Put("xbuf-key", src.data(), kPayload));
+  EXPECT_TRUE(client_a_->Exists("xbuf-key"));
+  EXPECT_TRUE(client_b_->Exists("xbuf-key"));
 
   std::vector<char> dst(kPayload, 0);
-  ASSERT_TRUE(client_a_->GetRemote("xbuf-key", dst.data(), kPayload));
+  ASSERT_TRUE(client_a_->Get("xbuf-key", dst.data(), kPayload));
   EXPECT_EQ(std::memcmp(src.data(), dst.data(), kPayload), 0);
 
   // Sanity: a second multi-page Put on top of an exhausted cross-buffer
   // pool fails (no pages left), surfacing the "no suitable target" path
   // through to the caller.
-  EXPECT_FALSE(client_a_->PutRemote("xbuf-overflow", src.data(), kPayload));
+  EXPECT_FALSE(client_a_->Put("xbuf-overflow", src.data(), kPayload));
 }
 
 // ---------------------------------------------------------------------------
@@ -376,7 +376,7 @@ TEST_F(CrossNodeMultiPage, CrossBufferScatterPutGet) {
 
 TEST_F(CrossNodeMultiPage, PartialTailSinglePage) {
   // size < page_size: single allocation, partial tail = size.  Covers the
-  // N=1 fast path through both PutRemote/GetRemote and the scatter helper.
+  // N=1 fast path through both Put/Get and the scatter helper.
   StartMaster();
   client_a_ = MakeClient("node-a", io_port_a_, NodeSetup{{kPageSize / 2}}, &owned_a_);
   client_b_ = MakeClient("node-b", io_port_b_, NodeSetup{{kPageSize}}, &owned_b_);
@@ -385,13 +385,13 @@ TEST_F(CrossNodeMultiPage, PartialTailSinglePage) {
   std::vector<char> src(kPayload);
   for (size_t i = 0; i < kPayload; ++i) src[i] = static_cast<char>((i * 13 + 7) & 0xFF);
 
-  ASSERT_TRUE(client_a_->PutRemote("pt-1", src.data(), kPayload));
+  ASSERT_TRUE(client_a_->Put("pt-1", src.data(), kPayload));
 
-  // Sentinel bytes after `dst` validate that GetRemote does not write past
+  // Sentinel bytes after `dst` validate that Get does not write past
   // `size` (would catch a regression that copied a full page back).
   constexpr char kSentinel = 0x5A;
   std::vector<char> dst(kPayload + 64, kSentinel);
-  ASSERT_TRUE(client_a_->GetRemote("pt-1", dst.data(), kPayload));
+  ASSERT_TRUE(client_a_->Get("pt-1", dst.data(), kPayload));
   EXPECT_EQ(std::memcmp(src.data(), dst.data(), kPayload), 0);
   for (size_t i = kPayload; i < dst.size(); ++i) {
     EXPECT_EQ(dst[i], kSentinel) << "Get wrote past requested size at offset " << i;
@@ -409,11 +409,11 @@ TEST_F(CrossNodeMultiPage, PartialTailMultiPageSameBuffer) {
   std::vector<char> src(kPayload);
   for (size_t i = 0; i < kPayload; ++i) src[i] = static_cast<char>((i * 31 + 1) & 0xFF);
 
-  ASSERT_TRUE(client_a_->PutRemote("pt-mp", src.data(), kPayload));
+  ASSERT_TRUE(client_a_->Put("pt-mp", src.data(), kPayload));
 
   constexpr char kSentinel = 0xA5;
   std::vector<char> dst(kPayload + 64, kSentinel);
-  ASSERT_TRUE(client_a_->GetRemote("pt-mp", dst.data(), kPayload));
+  ASSERT_TRUE(client_a_->Get("pt-mp", dst.data(), kPayload));
   EXPECT_EQ(std::memcmp(src.data(), dst.data(), kPayload), 0);
   for (size_t i = kPayload; i < dst.size(); ++i) {
     EXPECT_EQ(dst[i], kSentinel) << "Get wrote past requested size at offset " << i;
@@ -435,11 +435,11 @@ TEST_F(CrossNodeMultiPage, PartialTailCrossBufferScatter) {
   std::vector<char> src(kPayload);
   for (size_t i = 0; i < kPayload; ++i) src[i] = static_cast<char>((i * 53 + 3) & 0xFF);
 
-  ASSERT_TRUE(client_a_->PutRemote("pt-xbuf", src.data(), kPayload));
+  ASSERT_TRUE(client_a_->Put("pt-xbuf", src.data(), kPayload));
 
   constexpr char kSentinel = 0x3C;
   std::vector<char> dst(kPayload + 64, kSentinel);
-  ASSERT_TRUE(client_a_->GetRemote("pt-xbuf", dst.data(), kPayload));
+  ASSERT_TRUE(client_a_->Get("pt-xbuf", dst.data(), kPayload));
   EXPECT_EQ(std::memcmp(src.data(), dst.data(), kPayload), 0);
   for (size_t i = kPayload; i < dst.size(); ++i) {
     EXPECT_EQ(dst[i], kSentinel) << "Get wrote past requested size at offset " << i;
@@ -447,7 +447,7 @@ TEST_F(CrossNodeMultiPage, PartialTailCrossBufferScatter) {
 }
 
 TEST_F(CrossNodeMultiPage, PartialTailGetSizeMismatchRejected) {
-  // Contract: GetRemote must reject `size != Location.size`.  Without this
+  // Contract: Get must reject `size != Location.size`.  Without this
   // check the partial-tail code path would either truncate valid bytes
   // (size < stored) or pull stale bytes from the unused tail of the last
   // page (size > stored, still inside the page window).
@@ -457,16 +457,16 @@ TEST_F(CrossNodeMultiPage, PartialTailGetSizeMismatchRejected) {
 
   constexpr size_t kPayload = 999;
   std::vector<char> src(kPayload, 'X');
-  ASSERT_TRUE(client_a_->PutRemote("pt-mismatch", src.data(), kPayload));
+  ASSERT_TRUE(client_a_->Put("pt-mismatch", src.data(), kPayload));
 
   // Asking for the rounded-up cap (1 full page) is in the page window but
   // != stored size; must fail rather than leaking the unused tail bytes.
   std::vector<char> dst(kPageSize, 0);
-  EXPECT_FALSE(client_a_->GetRemote("pt-mismatch", dst.data(), kPageSize));
+  EXPECT_FALSE(client_a_->Get("pt-mismatch", dst.data(), kPageSize));
   // Asking for fewer bytes than stored must also fail (would truncate).
-  EXPECT_FALSE(client_a_->GetRemote("pt-mismatch", dst.data(), kPayload - 1));
+  EXPECT_FALSE(client_a_->Get("pt-mismatch", dst.data(), kPayload - 1));
   // Sanity: the correct size still works.
-  ASSERT_TRUE(client_a_->GetRemote("pt-mismatch", dst.data(), kPayload));
+  ASSERT_TRUE(client_a_->Get("pt-mismatch", dst.data(), kPayload));
   EXPECT_EQ(std::memcmp(src.data(), dst.data(), kPayload), 0);
 }
 
@@ -496,9 +496,9 @@ TEST_F(CrossNodeMultiPage, MultiPageDiscretePutGet) {
   std::vector<char> page_a(kPageSize, 'A');
   std::vector<char> page_b(kPageSize, 'B');
   std::vector<char> page_c(kPageSize, 'C');
-  ASSERT_TRUE(client_a_->PutRemote("disc-A", page_a.data(), kPageSize));
-  ASSERT_TRUE(client_a_->PutRemote("disc-B", page_b.data(), kPageSize));
-  ASSERT_TRUE(client_a_->PutRemote("disc-C", page_c.data(), kPageSize));
+  ASSERT_TRUE(client_a_->Put("disc-A", page_a.data(), kPageSize));
+  ASSERT_TRUE(client_a_->Put("disc-B", page_b.data(), kPageSize));
+  ASSERT_TRUE(client_a_->Put("disc-C", page_c.data(), kPageSize));
 
   // Free pages 0 and 2 — leaves the buffer with two non-contiguous free
   // slots which is exactly the Strategy 2 trigger condition.
@@ -507,10 +507,10 @@ TEST_F(CrossNodeMultiPage, MultiPageDiscretePutGet) {
 
   std::vector<char> payload(kPageSize * 2);
   for (size_t i = 0; i < payload.size(); ++i) payload[i] = static_cast<char>((i * 11) & 0xFF);
-  ASSERT_TRUE(client_a_->PutRemote("disc-2page", payload.data(), payload.size()));
+  ASSERT_TRUE(client_a_->Put("disc-2page", payload.data(), payload.size()));
 
   std::vector<char> dst(payload.size(), 0);
-  ASSERT_TRUE(client_a_->GetRemote("disc-2page", dst.data(), payload.size()));
+  ASSERT_TRUE(client_a_->Get("disc-2page", dst.data(), payload.size()));
   EXPECT_EQ(std::memcmp(payload.data(), dst.data(), payload.size()), 0);
 }
 

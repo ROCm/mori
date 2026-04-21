@@ -93,10 +93,10 @@ bool PoolClient::Init() {
   master_client_ = std::make_unique<MasterClient>(config_.master_config);
 
   // Initialize IO Engine for RDMA data plane
-  if (config_.io_engine_port > 0) {
+  if (config_.io_engine.port > 0) {
     mori::io::IOEngineConfig io_cfg;
-    io_cfg.host = config_.io_engine_host;
-    io_cfg.port = config_.io_engine_port;
+    io_cfg.host = config_.io_engine.host;
+    io_cfg.port = config_.io_engine.port;
 
     io_engine_ = std::make_unique<mori::io::IOEngine>(config_.master_config.node_id, io_cfg);
 
@@ -117,7 +117,7 @@ bool PoolClient::Init() {
     }
 
     MORI_UMBP_INFO("[PoolClient] IOEngine initialized on {}:{} ({} DRAM buffers)",
-                   config_.io_engine_host, config_.io_engine_port, export_dram_mems_.size());
+                   config_.io_engine.host, config_.io_engine.port, export_dram_mems_.size());
   }
 
   // Pack EngineDesc and per-buffer MemoryDesc for registration
@@ -157,8 +157,8 @@ bool PoolClient::Init() {
   // configured address here so the Master can route peer SSD traffic.
   std::string peer_address;
   if (config_.peer_service_port > 0 && !config_.ssd_stores.empty()) {
-    std::string host = config_.io_engine_host.empty() ? config_.master_config.node_address
-                                                      : config_.io_engine_host;
+    std::string host = config_.io_engine.host.empty() ? config_.master_config.node_address
+                                                      : config_.io_engine.host;
     peer_address = host + ":" + std::to_string(config_.peer_service_port);
   }
 
@@ -391,7 +391,7 @@ bool PoolClient::IsRegistered(const std::string& key) const {
   return cluster_locations_.find(key) != cluster_locations_.end();
 }
 
-bool PoolClient::ExistsRemote(const std::string& key) {
+bool PoolClient::Exists(const std::string& key) {
   if (!initialized_) return false;
 
   bool found = false;
@@ -400,27 +400,26 @@ bool PoolClient::ExistsRemote(const std::string& key) {
   return found;
 }
 
-std::vector<bool> PoolClient::BatchExistsRemote(const std::vector<std::string>& keys) {
+std::vector<bool> PoolClient::BatchExists(const std::vector<std::string>& keys) {
   std::vector<bool> results(keys.size(), false);
   if (!initialized_ || keys.empty()) return results;
 
   std::vector<bool> found;
   auto status = master_client_->BatchLookup(keys, &found);
   if (!status.ok()) {
-    MORI_UMBP_ERROR("[PoolClient] BatchExistsRemote: BatchLookup failed: {}",
-                    status.error_message());
+    MORI_UMBP_ERROR("[PoolClient] BatchExists: BatchLookup failed: {}", status.error_message());
     return results;
   }
   if (found.size() != keys.size()) {
-    MORI_UMBP_ERROR("[PoolClient] BatchExistsRemote: result count mismatch ({} vs {})",
-                    found.size(), keys.size());
+    MORI_UMBP_ERROR("[PoolClient] BatchExists: result count mismatch ({} vs {})", found.size(),
+                    keys.size());
     return results;
   }
   results = std::move(found);
   return results;
 }
 
-bool PoolClient::GetRemote(const std::string& key, void* dst, size_t size) {
+bool PoolClient::Get(const std::string& key, void* dst, size_t size) {
   if (!initialized_) {
     MORI_UMBP_ERROR("[PoolClient] Not initialized");
     return false;
@@ -429,7 +428,7 @@ bool PoolClient::GetRemote(const std::string& key, void* dst, size_t size) {
   std::optional<RouteGetResult> result;
   auto status = master_client_->RouteGet(key, &result);
   if (!status.ok()) {
-    MORI_UMBP_ERROR("[PoolClient] GetRemote RouteGet failed: {}", status.error_message());
+    MORI_UMBP_ERROR("[PoolClient] Get RouteGet failed: {}", status.error_message());
     return false;
   }
   if (!result.has_value()) return false;
@@ -443,7 +442,7 @@ bool PoolClient::GetRemote(const std::string& key, void* dst, size_t size) {
   // either truncating valid data or pulling stale tail bytes into `dst`.
   if (size != loc.size) {
     MORI_UMBP_ERROR(
-        "[PoolClient] GetRemote: caller size {} != stored size {} for key='{}' "
+        "[PoolClient] Get: caller size {} != stored size {} for key='{}' "
         "(caller must pass the same size that was used at Put time)",
         size, loc.size, key);
     return false;
@@ -454,18 +453,18 @@ bool PoolClient::GetRemote(const std::string& key, void* dst, size_t size) {
     auto parsed = ParseDramLocationIdWithLog(loc.location_id);
     if (!parsed) return false;
     if (result->page_size == 0) {
-      MORI_UMBP_ERROR("[PoolClient] GetRemote: master returned page_size=0 for DRAM/HBM target");
+      MORI_UMBP_ERROR("[PoolClient] Get: master returned page_size=0 for DRAM/HBM target");
       return false;
     }
     const uint64_t page_size = result->page_size;
     const size_t num_pages = parsed->pages.size();
     if (num_pages == 0) {
-      MORI_UMBP_ERROR("[PoolClient] GetRemote: empty pages list, key='{}'", key);
+      MORI_UMBP_ERROR("[PoolClient] Get: empty pages list, key='{}'", key);
       return false;
     }
     // Note: no `size in ((N-1)*ps, N*ps]` check here — it is implied by
     // `size == loc.size` (verified above) plus the master-side invariant
-    // that PutRemote stored num_pages = ceil(loc.size / page_size).  The
+    // that Put stored num_pages = ceil(loc.size / page_size).  The
     // page-level OOB checks below catch any remaining inconsistency before
     // it can corrupt memory.
     if (is_local) {
@@ -514,12 +513,12 @@ bool PoolClient::GetRemote(const std::string& key, void* dst, size_t size) {
     return RemoteSsdRead(peer, key, loc.location_id, dst, size, true);
   }
 
-  MORI_UMBP_WARN("[PoolClient] GetRemote: key '{}' is on unsupported tier {}", key,
+  MORI_UMBP_WARN("[PoolClient] Get: key '{}' is on unsupported tier {}", key,
                  TierTypeName(loc.tier));
   return false;
 }
 
-bool PoolClient::PutRemote(const std::string& key, const void* src, size_t size) {
+bool PoolClient::Put(const std::string& key, const void* src, size_t size) {
   if (!initialized_) {
     MORI_UMBP_ERROR("[PoolClient] Not initialized");
     return false;
@@ -528,18 +527,18 @@ bool PoolClient::PutRemote(const std::string& key, const void* src, size_t size)
   std::optional<RoutePutResult> result;
   auto status = master_client_->RoutePut(key, size, &result);
   if (!status.ok()) {
-    MORI_UMBP_ERROR("[PoolClient] PutRemote RoutePut failed: {}", status.error_message());
+    MORI_UMBP_ERROR("[PoolClient] Put RoutePut failed: {}", status.error_message());
     return false;
   }
   if (!result.has_value()) {
-    MORI_UMBP_ERROR("[PoolClient] PutRemote: no suitable target");
+    MORI_UMBP_ERROR("[PoolClient] Put: no suitable target");
     return false;
   }
 
   // DRAM-only path: SSD target routing is rejected here (Put-to-SSD goes
   // through a separate code path).
   if (result->tier != TierType::DRAM) {
-    MORI_UMBP_WARN("[PoolClient] PutRemote: target tier is {} (DRAM-only supported)",
+    MORI_UMBP_WARN("[PoolClient] Put: target tier is {} (DRAM-only supported)",
                    TierTypeName(result->tier));
     return false;
   }
@@ -547,14 +546,14 @@ bool PoolClient::PutRemote(const std::string& key, const void* src, size_t size)
   // Full scatter-gather: single-page is the trivial N=1, K=1 case and goes
   // through the same code path as multi-page.
   if (result->page_size == 0) {
-    MORI_UMBP_ERROR("[PoolClient] PutRemote: master returned page_size=0 for DRAM target");
+    MORI_UMBP_ERROR("[PoolClient] Put: master returned page_size=0 for DRAM target");
     master_client_->AbortAllocation(result->node_id, result->allocation_id, size);
     return false;
   }
   const uint64_t page_size = result->page_size;
   const size_t num_pages = result->pages.size();
   if (num_pages == 0) {
-    MORI_UMBP_ERROR("[PoolClient] PutRemote: master returned empty pages list, key='{}'", key);
+    MORI_UMBP_ERROR("[PoolClient] Put: master returned empty pages list, key='{}'", key);
     master_client_->AbortAllocation(result->node_id, result->allocation_id, size);
     return false;
   }
@@ -562,9 +561,8 @@ bool PoolClient::PutRemote(const std::string& key, const void* src, size_t size)
     // Master rounds Put requests up to ceil(size/page_size) pages.  We
     // accept anything in ((N-1)*ps, N*ps]; the last logical page may be
     // partially filled.  Outside that window means a Master/Client bug.
-    MORI_UMBP_ERROR(
-        "[PoolClient] PutRemote: size {} not in allocation window ({}..{}] for key='{}'", size,
-        (num_pages - 1) * page_size, num_pages * page_size, key);
+    MORI_UMBP_ERROR("[PoolClient] Put: size {} not in allocation window ({}..{}] for key='{}'",
+                    size, (num_pages - 1) * page_size, num_pages * page_size, key);
     master_client_->AbortAllocation(result->node_id, result->allocation_id, size);
     return false;
   }
@@ -626,7 +624,7 @@ bool PoolClient::PutRemote(const std::string& key, const void* src, size_t size)
 
   status = master_client_->FinalizeAllocation(key, location, result->allocation_id);
   if (!status.ok()) {
-    MORI_UMBP_ERROR("[PoolClient] PutRemote FinalizeAllocation failed: {}", status.error_message());
+    MORI_UMBP_ERROR("[PoolClient] Put FinalizeAllocation failed: {}", status.error_message());
     master_client_->AbortAllocation(result->node_id, result->allocation_id, size);
     return false;
   }
@@ -639,15 +637,15 @@ bool PoolClient::PutRemote(const std::string& key, const void* src, size_t size)
   return true;
 }
 
-std::vector<bool> PoolClient::BatchPutRemote(const std::vector<std::string>& keys,
-                                             const std::vector<const void*>& srcs,
-                                             const std::vector<size_t>& sizes,
-                                             const std::vector<int>& depths) {
+std::vector<bool> PoolClient::BatchPut(const std::vector<std::string>& keys,
+                                       const std::vector<const void*>& srcs,
+                                       const std::vector<size_t>& sizes,
+                                       const std::vector<int>& depths) {
   const size_t n = keys.size();
   std::vector<bool> results(n, false);
   if (!initialized_ || n == 0) return results;
   if (srcs.size() != n || sizes.size() != n) {
-    MORI_UMBP_ERROR("[PoolClient] BatchPutRemote: mismatched vector sizes");
+    MORI_UMBP_ERROR("[PoolClient] BatchPut: mismatched vector sizes");
     return results;
   }
 
@@ -657,13 +655,11 @@ std::vector<bool> PoolClient::BatchPutRemote(const std::vector<std::string>& key
   std::vector<std::optional<RoutePutResult>> routes;
   auto status = master_client_->BatchRoutePut(keys, block_sizes, &routes);
   if (!status.ok()) {
-    MORI_UMBP_ERROR("[PoolClient] BatchPutRemote: BatchRoutePut failed: {}",
-                    status.error_message());
+    MORI_UMBP_ERROR("[PoolClient] BatchPut: BatchRoutePut failed: {}", status.error_message());
     return results;
   }
   if (routes.size() != n) {
-    MORI_UMBP_ERROR("[PoolClient] BatchPutRemote: route count mismatch ({} vs {})", routes.size(),
-                    n);
+    MORI_UMBP_ERROR("[PoolClient] BatchPut: route count mismatch ({} vs {})", routes.size(), n);
     return results;
   }
 
@@ -688,15 +684,14 @@ std::vector<bool> PoolClient::BatchPutRemote(const std::vector<std::string>& key
       continue;
     }
     if (r.pages.empty() || r.page_size == 0) {
-      MORI_UMBP_ERROR("[PoolClient] BatchPutRemote: empty pages or zero page_size, key='{}'",
-                      keys[i]);
+      MORI_UMBP_ERROR("[PoolClient] BatchPut: empty pages or zero page_size, key='{}'", keys[i]);
       master_client_->AbortAllocation(r.node_id, r.allocation_id, sizes[i]);
       continue;
     }
     if (!SizeMatchesAllocation(sizes[i], r.pages.size(), r.page_size)) {
       MORI_UMBP_ERROR(
-          "[PoolClient] BatchPutRemote: size {} not in allocation window ({}..{}] for key='{}'",
-          sizes[i], (r.pages.size() - 1) * r.page_size, r.pages.size() * r.page_size, keys[i]);
+          "[PoolClient] BatchPut: size {} not in allocation window ({}..{}] for key='{}'", sizes[i],
+          (r.pages.size() - 1) * r.page_size, r.pages.size() * r.page_size, keys[i]);
       master_client_->AbortAllocation(r.node_id, r.allocation_id, sizes[i]);
       continue;
     }
@@ -708,17 +703,15 @@ std::vector<bool> PoolClient::BatchPutRemote(const std::vector<std::string>& key
       for (size_t k = 0; k < r.pages.size() && !oob; ++k) {
         const auto& p = r.pages[k];
         if (p.buffer_index >= config_.dram_buffers.size()) {
-          MORI_UMBP_ERROR("[PoolClient] BatchPutRemote local: invalid buffer_index {}",
-                          p.buffer_index);
+          MORI_UMBP_ERROR("[PoolClient] BatchPut local: invalid buffer_index {}", p.buffer_index);
           oob = true;
           break;
         }
         auto& dram = config_.dram_buffers[p.buffer_index];
         const uint64_t off = static_cast<uint64_t>(p.page_index) * r.page_size;
         if (!dram.buffer || r.page_size > dram.size || off > dram.size - r.page_size) {
-          MORI_UMBP_ERROR(
-              "[PoolClient] BatchPutRemote local: OOB buf={} off={} page_size={} buf_size={}",
-              p.buffer_index, off, r.page_size, dram.size);
+          MORI_UMBP_ERROR("[PoolClient] BatchPut local: OOB buf={} off={} page_size={} buf_size={}",
+                          p.buffer_index, off, r.page_size, dram.size);
           oob = true;
           break;
         }
@@ -780,7 +773,7 @@ std::vector<bool> PoolClient::BatchPutRemote(const std::vector<std::string>& key
     auto fin_status = master_client_->BatchFinalizeAllocation(fin_keys, fin_locs, fin_aids,
                                                               &fin_results, fin_depths);
     if (!fin_status.ok()) {
-      MORI_UMBP_ERROR("[PoolClient] BatchPutRemote: BatchFinalizeAllocation failed: {}",
+      MORI_UMBP_ERROR("[PoolClient] BatchPut: BatchFinalizeAllocation failed: {}",
                       fin_status.error_message());
     }
     for (size_t i = 0; i < pending.size(); ++i) {
@@ -798,27 +791,25 @@ std::vector<bool> PoolClient::BatchPutRemote(const std::vector<std::string>& key
   return results;
 }
 
-std::vector<bool> PoolClient::BatchGetRemote(const std::vector<std::string>& keys,
-                                             const std::vector<void*>& dsts,
-                                             const std::vector<size_t>& sizes) {
+std::vector<bool> PoolClient::BatchGet(const std::vector<std::string>& keys,
+                                       const std::vector<void*>& dsts,
+                                       const std::vector<size_t>& sizes) {
   const size_t n = keys.size();
   std::vector<bool> results(n, false);
   if (!initialized_ || n == 0) return results;
   if (dsts.size() != n || sizes.size() != n) {
-    MORI_UMBP_ERROR("[PoolClient] BatchGetRemote: mismatched vector sizes");
+    MORI_UMBP_ERROR("[PoolClient] BatchGet: mismatched vector sizes");
     return results;
   }
 
   std::vector<std::optional<RouteGetResult>> routes;
   auto status = master_client_->BatchRouteGet(keys, &routes);
   if (!status.ok()) {
-    MORI_UMBP_ERROR("[PoolClient] BatchGetRemote: BatchRouteGet failed: {}",
-                    status.error_message());
+    MORI_UMBP_ERROR("[PoolClient] BatchGet: BatchRouteGet failed: {}", status.error_message());
     return results;
   }
   if (routes.size() != n) {
-    MORI_UMBP_ERROR("[PoolClient] BatchGetRemote: route count mismatch ({} vs {})", routes.size(),
-                    n);
+    MORI_UMBP_ERROR("[PoolClient] BatchGet: route count mismatch ({} vs {})", routes.size(), n);
     return results;
   }
 
@@ -829,12 +820,12 @@ std::vector<bool> PoolClient::BatchGetRemote(const std::vector<std::string>& key
     if (!routes[i].has_value()) continue;
     auto& r = *routes[i];
     auto& loc = r.location;
-    // Same contract as GetRemote: caller's `sizes[i]` must match the byte
+    // Same contract as Get: caller's `sizes[i]` must match the byte
     // size committed at Put time (Master tracks it in Location.size).  See
-    // the comment in GetRemote for why the page-window check alone is
+    // the comment in Get for why the page-window check alone is
     // insufficient with partial-last-page support.
     if (sizes[i] != loc.size) {
-      MORI_UMBP_ERROR("[PoolClient] BatchGetRemote: caller size {} != stored size {} for key='{}'",
+      MORI_UMBP_ERROR("[PoolClient] BatchGet: caller size {} != stored size {} for key='{}'",
                       sizes[i], loc.size, keys[i]);
       continue;
     }
@@ -844,7 +835,7 @@ std::vector<bool> PoolClient::BatchGetRemote(const std::vector<std::string>& key
     if (!parsed) continue;
     if (parsed->pages.empty() || r.page_size == 0) {
       MORI_UMBP_ERROR(
-          "[PoolClient] BatchGetRemote: empty pages or zero page_size, key='{}' location_id='{}'",
+          "[PoolClient] BatchGet: empty pages or zero page_size, key='{}' location_id='{}'",
           keys[i], loc.location_id);
       continue;
     }
@@ -856,17 +847,15 @@ std::vector<bool> PoolClient::BatchGetRemote(const std::vector<std::string>& key
       for (size_t k = 0; k < parsed->pages.size() && !oob; ++k) {
         const auto& p = parsed->pages[k];
         if (p.buffer_index >= config_.dram_buffers.size()) {
-          MORI_UMBP_ERROR("[PoolClient] BatchGetRemote local: invalid buffer_index {}",
-                          p.buffer_index);
+          MORI_UMBP_ERROR("[PoolClient] BatchGet local: invalid buffer_index {}", p.buffer_index);
           oob = true;
           break;
         }
         auto& dram = config_.dram_buffers[p.buffer_index];
         const uint64_t off = static_cast<uint64_t>(p.page_index) * r.page_size;
         if (!dram.buffer || r.page_size > dram.size || off > dram.size - r.page_size) {
-          MORI_UMBP_ERROR(
-              "[PoolClient] BatchGetRemote local: OOB buf={} off={} page_size={} buf_size={}",
-              p.buffer_index, off, r.page_size, dram.size);
+          MORI_UMBP_ERROR("[PoolClient] BatchGet local: OOB buf={} off={} page_size={} buf_size={}",
+                          p.buffer_index, off, r.page_size, dram.size);
           oob = true;
           break;
         }

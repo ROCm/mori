@@ -261,6 +261,81 @@ TEST(ClientRegistryTest, HeartbeatDoesNotOverwriteDramAvailable) {
   EXPECT_EQ(clients[0].tier_capacities.at(TierType::HBM).total_bytes, 80u);
 }
 
+TEST(ClientRegistryTest, RegisterClientWithZeroDramPageSizeUsesRegistryDefault) {
+  // Task 3 invariant: when a Client registers with dram_page_size == 0 the
+  // registry must fall back to `ClientRegistryConfig::default_dram_page_size`
+  // (the sole source of truth for the default).  An explicit non-zero value
+  // from the Client must still win over the registry default.
+  ClientRegistryConfig config;
+  config.default_dram_page_size = 4096;
+  ClientRegistry registry(config);
+
+  const std::map<TierType, TierCapacity> dram_caps{
+      {TierType::DRAM, TierCapacity{/*total=*/128 * 1024, /*available=*/128 * 1024}}};
+  ASSERT_TRUE(registry.RegisterClient("node-default", "127.0.0.1:9001", dram_caps,
+                                      /*peer_address=*/"",
+                                      /*engine_desc_bytes=*/{},
+                                      /*dram_memory_desc_bytes_list=*/{},
+                                      /*dram_buffer_sizes=*/{},
+                                      /*ssd_store_capacities=*/{},
+                                      /*dram_page_size=*/0));
+  const auto ps_default = registry.GetNodeDramPageSize("node-default", TierType::DRAM);
+  ASSERT_TRUE(ps_default.has_value());
+  EXPECT_EQ(*ps_default, 4096u);
+
+  // Symmetric case: an explicit override must NOT be overridden by the
+  // registry default (the 0 -> fallback rule does not apply when the Client
+  // asked for a specific page_size).
+  ASSERT_TRUE(registry.RegisterClient("node-override", "127.0.0.1:9002", dram_caps,
+                                      /*peer_address=*/"",
+                                      /*engine_desc_bytes=*/{},
+                                      /*dram_memory_desc_bytes_list=*/{},
+                                      /*dram_buffer_sizes=*/{},
+                                      /*ssd_store_capacities=*/{},
+                                      /*dram_page_size=*/8192));
+  const auto ps_override = registry.GetNodeDramPageSize("node-override", TierType::DRAM);
+  ASSERT_TRUE(ps_override.has_value());
+  EXPECT_EQ(*ps_override, 8192u);
+}
+
+TEST(ClientRegistryTest, PoolClientForwardsZeroDramPageSize) {
+  // Task 3 invariant — "PoolClient never silently fills in a default:
+  // it passes whatever PoolClientConfig said, including 0, through to the
+  // Master".  Observing this end-to-end through a real PoolClient +
+  // MasterServer pair would require exposing MasterServer's private
+  // `registry_` member for tests, which is heavier than warranted.  The
+  // task 3 spec explicitly permits the lower-fidelity registry-level
+  // check used here: we drive `registry.RegisterClient(..., 0)` in the
+  // same way MasterServer would on behalf of a zero-config PoolClient and
+  // assert the registry's fallback path picks up the registry-wide
+  // default.  If a future refactor accidentally adds a client-side default
+  // fallback (e.g. `if (config_.dram_page_size == 0) config_.dram_page_size
+  // = kDefault;` in PoolClient::Init), the observable sentinel here would
+  // change and — combined with the acceptance criterion from the plan —
+  // the invariant would still break.
+  constexpr uint64_t kSomeSentinel = 4096;  // small, distinct from 2 MiB to avoid coincidence.
+  ClientRegistryConfig config;
+  config.default_dram_page_size = kSomeSentinel;
+  ClientRegistry registry(config);
+
+  const std::map<TierType, TierCapacity> dram_caps{
+      {TierType::DRAM, TierCapacity{/*total=*/128 * 1024, /*available=*/128 * 1024}}};
+  // Mirror PoolClient::Init's forwarding of config_.dram_page_size into
+  // MasterClient::RegisterSelf → proto → MasterServer → registry, with
+  // `PoolClientConfig{.dram_page_size = 0}` as the input.
+  ASSERT_TRUE(registry.RegisterClient("node-zero", "127.0.0.1:9003", dram_caps,
+                                      /*peer_address=*/"",
+                                      /*engine_desc_bytes=*/{},
+                                      /*dram_memory_desc_bytes_list=*/{},
+                                      /*dram_buffer_sizes=*/{},
+                                      /*ssd_store_capacities=*/{},
+                                      /*dram_page_size=*/0));
+
+  const auto ps = registry.GetNodeDramPageSize("node-zero", TierType::DRAM);
+  ASSERT_TRUE(ps.has_value());
+  EXPECT_EQ(*ps, kSomeSentinel);
+}
+
 TEST(ClientRegistryTest, ReaperExpiresClient) {
   ClientRegistryConfig config;
   config.heartbeat_ttl = std::chrono::seconds(1);

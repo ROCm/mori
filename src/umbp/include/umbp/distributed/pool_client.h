@@ -70,14 +70,14 @@ class PoolClient {
   bool AbortAllocation(const std::string& node_id, TierType tier, const std::string& allocation_id,
                        uint64_t size);
 
-  // Check whether a block exists on any remote node (RouteGet without RDMA).
-  bool ExistsRemote(const std::string& key);
+  // Check whether a block exists in the cluster (local or remote, no RDMA).
+  bool Exists(const std::string& key);
 
   // Batched existence check — single BatchLookup gRPC for the whole batch.
-  // Same semantics as ExistsRemote (no access-count / lease side-effects).
+  // Same semantics as Exists (no access-count / lease side-effects).
   // On wire error all entries are false.  Returns a vector parallel to
   // `keys`.
-  std::vector<bool> BatchExistsRemote(const std::vector<std::string>& keys);
+  std::vector<bool> BatchExists(const std::vector<std::string>& keys);
 
   bool IsRegistered(const std::string& key) const;
 
@@ -95,26 +95,24 @@ class PoolClient {
   // not return size to keep that RPC cheap and side-effect-free; querying
   // size via `RouteGet` would create a lease as a side effect, which is
   // exactly what `Lookup` was introduced to avoid (see issue #9).
-  bool GetRemote(const std::string& key, void* dst, size_t size);
+  bool Get(const std::string& key, void* dst, size_t size);
 
   // Write a block to a remote node via RDMA.
   // DRAM: RoutePut -> direct RDMA write.
   // SSD: RoutePut -> AllocateWriteSlot -> RDMA write -> CommitSsdWrite.
-  bool PutRemote(const std::string& key, const void* src, size_t size);
+  bool Put(const std::string& key, const void* src, size_t size);
 
   // Batch write: single gRPC for routing + batched RDMA + single gRPC for finalize.
-  std::vector<bool> BatchPutRemote(const std::vector<std::string>& keys,
-                                   const std::vector<const void*>& srcs,
-                                   const std::vector<size_t>& sizes,
-                                   const std::vector<int>& depths = {});
+  std::vector<bool> BatchPut(const std::vector<std::string>& keys,
+                             const std::vector<const void*>& srcs, const std::vector<size_t>& sizes,
+                             const std::vector<int>& depths = {});
 
   // Batch read: single gRPC for routing + batched RDMA.
-  // Same per-entry size contract as GetRemote: sizes[i] MUST equal the
+  // Same per-entry size contract as Get: sizes[i] MUST equal the
   // stored Location.size for keys[i].  Per-entry mismatch fails just that
   // entry (results[i]=false); other entries are unaffected.
-  std::vector<bool> BatchGetRemote(const std::vector<std::string>& keys,
-                                   const std::vector<void*>& dsts,
-                                   const std::vector<size_t>& sizes);
+  std::vector<bool> BatchGet(const std::vector<std::string>& keys, const std::vector<void*>& dsts,
+                             const std::vector<size_t>& sizes);
 
   // Unregister a block from the Master (block no longer remotely accessible).
   bool UnregisterFromMaster(const std::string& key);

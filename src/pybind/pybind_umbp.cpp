@@ -93,14 +93,22 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("worker_threads", &UMBPCopyPipelineConfig::worker_threads)
       .def_readwrite("batch_max_ops", &UMBPCopyPipelineConfig::batch_max_ops);
 
+  py::class_<UMBPMasterClientConfig>(m, "UMBPMasterClientConfig")
+      .def(py::init<>())
+      .def_readwrite("master_address", &UMBPMasterClientConfig::master_address)
+      .def_readwrite("node_id", &UMBPMasterClientConfig::node_id)
+      .def_readwrite("node_address", &UMBPMasterClientConfig::node_address)
+      .def_readwrite("auto_heartbeat", &UMBPMasterClientConfig::auto_heartbeat);
+
+  py::class_<UMBPIoEngineConfig>(m, "UMBPIoEngineConfig")
+      .def(py::init<>())
+      .def_readwrite("host", &UMBPIoEngineConfig::host)
+      .def_readwrite("port", &UMBPIoEngineConfig::port);
+
   py::class_<UMBPDistributedConfig>(m, "UMBPDistributedConfig")
       .def(py::init<>())
-      .def_readwrite("master_address", &UMBPDistributedConfig::master_address)
-      .def_readwrite("node_id", &UMBPDistributedConfig::node_id)
-      .def_readwrite("node_address", &UMBPDistributedConfig::node_address)
-      .def_readwrite("auto_heartbeat", &UMBPDistributedConfig::auto_heartbeat)
-      .def_readwrite("io_engine_host", &UMBPDistributedConfig::io_engine_host)
-      .def_readwrite("io_engine_port", &UMBPDistributedConfig::io_engine_port)
+      .def_readwrite("master_config", &UMBPDistributedConfig::master_config)
+      .def_readwrite("io_engine", &UMBPDistributedConfig::io_engine)
       .def_readwrite("staging_buffer_size", &UMBPDistributedConfig::staging_buffer_size)
       .def_readwrite("peer_service_port", &UMBPDistributedConfig::peer_service_port)
       .def_readwrite("cache_remote_fetches", &UMBPDistributedConfig::cache_remote_fetches)

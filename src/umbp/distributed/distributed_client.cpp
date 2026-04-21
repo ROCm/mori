@@ -46,24 +46,10 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
     throw std::runtime_error("DistributedClient: mmap failed for DRAM pool");
   }
 
-  PoolClientConfig pc_config;
-  pc_config.master_config.master_address = dc.master_address;
-  pc_config.master_config.node_id = dc.node_id;
-  pc_config.master_config.node_address = dc.node_address;
-  pc_config.master_config.auto_heartbeat = dc.auto_heartbeat;
-  pc_config.io_engine_host = dc.io_engine_host;
-  pc_config.io_engine_port = dc.io_engine_port;
-  pc_config.staging_buffer_size = dc.staging_buffer_size;
-  pc_config.dram_buffers = {{dram_pool_, dram_pool_size_}};
-  pc_config.tier_capacities[TierType::DRAM] = {dram_pool_size_, dram_pool_size_};
-  pc_config.peer_service_port = dc.peer_service_port;
-  // Forward the per-node DRAM/HBM page size override to PoolClient so it
-  // reaches the Master's PageBitmapAllocator at RegisterClient time.  When
-  // dc.dram_page_size == 0, the Master falls back to its registry-wide
-  // ClientRegistryConfig::default_dram_page_size (2 MiB).
-  if (dc.dram_page_size > 0) {
-    pc_config.dram_page_size = dc.dram_page_size;
-  }
+  auto pc_config = ToPoolClientConfig(
+      dc,
+      /*dram_buffers=*/{{dram_pool_, dram_pool_size_}},
+      /*tier_capacities=*/{{TierType::DRAM, {dram_pool_size_, dram_pool_size_}}});
 
   pool_client_ = std::make_unique<PoolClient>(std::move(pc_config));
   if (!pool_client_->Init()) {
@@ -73,8 +59,8 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
     throw std::runtime_error("DistributedClient: PoolClient::Init() failed");
   }
 
-  MORI_UMBP_INFO("[DistributedClient] initialized — node_id={} dram_pool={}MB", dc.node_id,
-                 dram_pool_size_ / (1024 * 1024));
+  MORI_UMBP_INFO("[DistributedClient] initialized — node_id={} dram_pool={}MB",
+                 dc.master_config.node_id, dram_pool_size_ / (1024 * 1024));
 }
 
 DistributedClient::~DistributedClient() { Close(); }
@@ -87,21 +73,21 @@ bool DistributedClient::Put(const std::string& key, uintptr_t src, size_t size) 
   if (closing_) return false;
   std::shared_lock lk(op_mutex_);
   if (closed_) return false;
-  return pool_client_->PutRemote(key, reinterpret_cast<const void*>(src), size);
+  return pool_client_->Put(key, reinterpret_cast<const void*>(src), size);
 }
 
 bool DistributedClient::Get(const std::string& key, uintptr_t dst, size_t size) {
   if (closing_) return false;
   std::shared_lock lk(op_mutex_);
   if (closed_) return false;
-  return pool_client_->GetRemote(key, reinterpret_cast<void*>(dst), size);
+  return pool_client_->Get(key, reinterpret_cast<void*>(dst), size);
 }
 
 bool DistributedClient::Exists(const std::string& key) const {
   if (closing_) return false;
   std::shared_lock lk(op_mutex_);
   if (closed_) return false;
-  return pool_client_->ExistsRemote(key);
+  return pool_client_->Exists(key);
 }
 
 // ---------------------------------------------------------------------------
@@ -119,7 +105,7 @@ std::vector<bool> DistributedClient::BatchPut(const std::vector<std::string>& ke
   for (size_t i = 0; i < srcs.size(); ++i) {
     src_ptrs[i] = reinterpret_cast<const void*>(srcs[i]);
   }
-  return pool_client_->BatchPutRemote(keys, src_ptrs, sizes);
+  return pool_client_->BatchPut(keys, src_ptrs, sizes);
 }
 
 std::vector<bool> DistributedClient::BatchPutWithDepth(const std::vector<std::string>& keys,
@@ -133,7 +119,7 @@ std::vector<bool> DistributedClient::BatchPutWithDepth(const std::vector<std::st
   for (size_t i = 0; i < srcs.size(); ++i) {
     src_ptrs[i] = reinterpret_cast<const void*>(srcs[i]);
   }
-  return pool_client_->BatchPutRemote(keys, src_ptrs, sizes, depths);
+  return pool_client_->BatchPut(keys, src_ptrs, sizes, depths);
 }
 
 std::vector<bool> DistributedClient::BatchGet(const std::vector<std::string>& keys,
@@ -147,7 +133,7 @@ std::vector<bool> DistributedClient::BatchGet(const std::vector<std::string>& ke
   for (size_t i = 0; i < dsts.size(); ++i) {
     dst_ptrs[i] = reinterpret_cast<void*>(dsts[i]);
   }
-  return pool_client_->BatchGetRemote(keys, dst_ptrs, sizes);
+  return pool_client_->BatchGet(keys, dst_ptrs, sizes);
 }
 
 std::vector<bool> DistributedClient::BatchExists(const std::vector<std::string>& keys) const {
@@ -158,7 +144,7 @@ std::vector<bool> DistributedClient::BatchExists(const std::vector<std::string>&
   // Single batched gRPC instead of N per-key Lookup RPCs (was the #5
   // bottleneck — sglang probes with batch_size=128 used to emit 128
   // roundtrips per BatchExists call).
-  return pool_client_->BatchExistsRemote(keys);
+  return pool_client_->BatchExists(keys);
 }
 
 size_t DistributedClient::BatchExistsConsecutive(const std::vector<std::string>& keys) const {
@@ -168,9 +154,9 @@ size_t DistributedClient::BatchExistsConsecutive(const std::vector<std::string>&
 
   // One batched gRPC, then scan the parallel result vector for the first
   // missing key.  A wire failure or size mismatch surfaces as an all-false
-  // vector from BatchExistsRemote and we return 0 (same failure posture as
-  // the old loop-over-ExistsRemote path).
-  auto found = pool_client_->BatchExistsRemote(keys);
+  // vector from BatchExists and we return 0 (same failure posture as
+  // the old loop-over-Exists path).
+  auto found = pool_client_->BatchExists(keys);
   for (size_t i = 0; i < found.size(); ++i) {
     if (!found[i]) return i;
   }
