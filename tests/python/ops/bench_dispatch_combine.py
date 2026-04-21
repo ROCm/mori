@@ -172,6 +172,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
                     all_rank_indices[self.config.rank],
                     block_num=dispatch_block_num,
                     warp_per_block=dispatch_warp_per_block,
+                    call_local_expert_count=call_local_expert_count,
                 )
                 e2e_combine_arg = self._get_combine_input(op, e2e_dispatch_output)
                 e2e_combine_output, _ = op.combine(
@@ -342,12 +343,8 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         round_end_events = [
             torch.cuda.Event(enable_timing=True) for _ in range(graph_replay_iters)
         ]
-        e2e_start_events = [
-            torch.cuda.Event(enable_timing=True) for _ in range(graph_replay_iters)
-        ]
-        e2e_end_events = [
-            torch.cuda.Event(enable_timing=True) for _ in range(graph_replay_iters)
-        ]
+        e2e_start_events = [torch.cuda.Event(enable_timing=True)]
+        e2e_end_events = [torch.cuda.Event(enable_timing=True)]
 
         dist.barrier()
         for i in range(graph_replay_iters):
@@ -571,7 +568,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         call_local_expert_count=False,
     ):
         """Warmup, then capture capture_iters dispatch+combine iters and export per-warp Perfetto traces."""
-        if not hasattr(mori.cpp, "get_debug_time_buf"):
+        if not hasattr(op, "get_debug_time_buf"):
             raise RuntimeError(
                 "To use --cmd profile, re-compile Mori with ENABLE_PROFILER=ON"
             )
