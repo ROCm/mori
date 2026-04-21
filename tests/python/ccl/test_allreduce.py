@@ -1004,14 +1004,15 @@ def _bench_overlap_one_size(
                 torch.cuda.synchronize()
                 dist.barrier()
 
-                # All ranks enable phase timing (rank-local buffer on each).
-                ar_obj.enable_phase_timing(True)
-
-                # GEMM[0] on stream_gemm, AR[0] on stream_ar, like overlap loop.
                 ev_g0_s = torch.cuda.Event(enable_timing=True)
                 ev_g0_e = torch.cuda.Event(enable_timing=True)
                 ev_ar0_s = torch.cuda.Event(enable_timing=True)
                 ev_ar0_e = torch.cuda.Event(enable_timing=True)
+
+                # Enable phase timing ONLY for AR[0]'s submit. Disable right
+                # after so AR[1..N-1] kernels receive phase_ts=nullptr and
+                # don't overwrite AR[0]'s timestamps in the buffer.
+                ar_obj.enable_phase_timing(True)
                 ev_g0_s.record(stream_gemm)
                 with torch.cuda.stream(stream_gemm):
                     _run_gemm()
@@ -1019,16 +1020,14 @@ def _bench_overlap_one_size(
                 stream_ar.wait_event(ev_g0_e)
                 ev_ar0_s.record(stream_ar)
                 with torch.cuda.stream(stream_ar):
-                    launch_ar()
+                    launch_ar()       # AR[0] submitted with phase_ts_d_
                 ev_ar0_e.record(stream_ar)
-                stream_ar.synchronize()  # AR[0] done; phase_ts_d_ now has data
+                ar_obj.enable_phase_timing(False)  # must disable BEFORE submitting AR[1+]
 
-                # Read own rank's timestamps BEFORE AR[1] can overwrite.
-                ts = ar_obj.get_phase_timestamps()
-                last_nc = ar_obj.get_last_num_chunks()
-                ar_obj.enable_phase_timing(False)
-
-                # All ranks: continue AR[1..N-1] untimed to drain pipeline.
+                # Immediately submit AR[1..N-1] (no phase timing). This
+                # reproduces real overlap-loop state where AR[0] runs with
+                # AR[1+] already queued on stream_ar — the key scheduling
+                # condition we're trying to diagnose.
                 for s in range(1, num_stages):
                     tmp_ev = torch.cuda.Event()
                     with torch.cuda.stream(stream_gemm):
@@ -1037,9 +1036,14 @@ def _bench_overlap_one_size(
                     stream_ar.wait_event(tmp_ev)
                     with torch.cuda.stream(stream_ar):
                         launch_ar()
+
+                # Sync everything, then read AR[0]'s phase timestamps (buffer
+                # is intact because only AR[0] had phase_ts != nullptr).
                 stream_ar.synchronize()
                 stream_gemm.synchronize()
                 dist.barrier()
+                ts = ar_obj.get_phase_timestamps()
+                last_nc = ar_obj.get_last_num_chunks()
 
                 if rank == 0:
                     # Convert raw cycles to ms using AR[0] event duration as anchor.
