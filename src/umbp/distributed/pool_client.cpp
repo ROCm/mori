@@ -53,6 +53,33 @@ std::optional<ParsedDramLocation> ParseDramLocationIdWithLog(const std::string& 
 }
 
 bool IsValidMemoryDesc(const mori::io::MemoryDesc& desc) { return desc.size > 0; }
+
+// Bytes belonging to the i-th logical page in a Put/Get of `total_size`
+// bytes spread across `num_pages` pages of `page_size` each.  Master rounds
+// the request up: num_pages = ceil(total_size / page_size).  Thus every
+// page except possibly the last is full; the last carries the remaining
+// (total_size - (num_pages-1)*page_size) bytes, which is in (0, page_size].
+//
+// The caller MUST have already verified `total_size <= num_pages * page_size`
+// and `total_size > (num_pages-1) * page_size` (i.e. master's rounding is
+// consistent with what we asked for).  Passing total_size==0 / num_pages==0
+// is undefined here; gate at the call site.
+inline uint64_t LogicalPageBytes(size_t i, size_t num_pages, uint64_t page_size,
+                                 size_t total_size) {
+  return (i + 1 == num_pages) ? (total_size - i * page_size) : page_size;
+}
+
+// True iff `size` is consistent with master's "round up to whole pages"
+// allocation: ceil(size/page_size) must equal num_pages, and num_pages > 0.
+// Allows the last page to be partially filled.
+inline bool SizeMatchesAllocation(size_t size, size_t num_pages, uint64_t page_size) {
+  if (page_size == 0 || num_pages == 0 || size == 0) return false;
+  if (size > num_pages * page_size) return false;
+  // size must be > (num_pages-1) * page_size, otherwise master allocated
+  // more pages than the request needed (would indicate a master bug).
+  if (size <= (num_pages - 1) * page_size) return false;
+  return true;
+}
 }  // namespace
 
 PoolClient::PoolClient(PoolClientConfig config) : config_(std::move(config)) {}
@@ -389,6 +416,19 @@ bool PoolClient::GetRemote(const std::string& key, void* dst, size_t size) {
 
   const auto& loc = result->location;
 
+  // Caller's `size` must match the byte size that was committed at Put time
+  // (Master tracks it in Location.size).  The page-window check further
+  // down would otherwise silently accept any `size` in ((N-1)*ps, N*ps],
+  // and the partial-last-page logic would copy the wrong number of bytes,
+  // either truncating valid data or pulling stale tail bytes into `dst`.
+  if (size != loc.size) {
+    MORI_UMBP_ERROR(
+        "[PoolClient] GetRemote: caller size {} != stored size {} for key='{}' "
+        "(caller must pass the same size that was used at Put time)",
+        size, loc.size, key);
+    return false;
+  }
+
   bool is_local = (loc.node_id == config_.master_config.node_id);
   if (loc.tier == TierType::DRAM || loc.tier == TierType::HBM) {
     auto parsed = ParseDramLocationIdWithLog(loc.location_id);
@@ -403,18 +443,15 @@ bool PoolClient::GetRemote(const std::string& key, void* dst, size_t size) {
       MORI_UMBP_ERROR("[PoolClient] GetRemote: empty pages list, key='{}'", key);
       return false;
     }
-    if (size != num_pages * page_size) {
-      // PageBitmapAllocator always rounds Put requests up to a full page,
-      // so the symmetrical Get must be addressed in the same page units.
-      // Partial-tail support would relax this; not implemented yet.
-      MORI_UMBP_ERROR("[PoolClient] GetRemote: size {} != pages * page_size ({} * {}) for key='{}'",
-                      size, num_pages, page_size, key);
-      return false;
-    }
-
+    // Note: no `size in ((N-1)*ps, N*ps]` check here — it is implied by
+    // `size == loc.size` (verified above) plus the master-side invariant
+    // that PutRemote stored num_pages = ceil(loc.size / page_size).  The
+    // page-level OOB checks below catch any remaining inconsistency before
+    // it can corrupt memory.
     if (is_local) {
       // Local-node short-circuit: copy each page from this node's own
-      // exportable buffers; no RDMA round-trip needed.
+      // exportable buffers; no RDMA round-trip needed.  The last logical
+      // page may be partial — copy only its real bytes.
       char* dst_bytes = static_cast<char*>(dst);
       for (size_t i = 0; i < num_pages; ++i) {
         const auto& p = parsed->pages[i];
@@ -429,8 +466,8 @@ bool PoolClient::GetRemote(const std::string& key, void* dst, size_t size) {
                           p.buffer_index, off, page_size, dram.size);
           return false;
         }
-        std::memcpy(dst_bytes + i * page_size, static_cast<const char*>(dram.buffer) + off,
-                    page_size);
+        const uint64_t bytes = LogicalPageBytes(i, num_pages, page_size, size);
+        std::memcpy(dst_bytes + i * page_size, static_cast<const char*>(dram.buffer) + off, bytes);
       }
       return true;
     }
@@ -501,12 +538,13 @@ bool PoolClient::PutRemote(const std::string& key, const void* src, size_t size)
     master_client_->AbortAllocation(result->node_id, result->allocation_id, size);
     return false;
   }
-  if (size != num_pages * page_size) {
-    // Master rounds Put requests up to a full page in PageBitmapAllocator;
-    // any mismatch here means a Master/Client bug.  Fail loudly and abort
-    // the allocation so the page slots are immediately reclaimable.
-    MORI_UMBP_ERROR("[PoolClient] PutRemote: size {} != pages * page_size ({} * {}) for key='{}'",
-                    size, num_pages, page_size, key);
+  if (!SizeMatchesAllocation(size, num_pages, page_size)) {
+    // Master rounds Put requests up to ceil(size/page_size) pages.  We
+    // accept anything in ((N-1)*ps, N*ps]; the last logical page may be
+    // partially filled.  Outside that window means a Master/Client bug.
+    MORI_UMBP_ERROR(
+        "[PoolClient] PutRemote: size {} not in allocation window ({}..{}] for key='{}'", size,
+        (num_pages - 1) * page_size, num_pages * page_size, key);
     master_client_->AbortAllocation(result->node_id, result->allocation_id, size);
     return false;
   }
@@ -515,7 +553,8 @@ bool PoolClient::PutRemote(const std::string& key, const void* src, size_t size)
   if (is_local) {
     // Local-node short-circuit: copy each page directly into our own
     // exportable buffers.  Bounds-check every page; on any failure abort
-    // the whole allocation (no partial-write commits).
+    // the whole allocation (no partial-write commits).  Last logical page
+    // may be partial — only copy its real bytes.
     const char* src_bytes = static_cast<const char*>(src);
     for (size_t i = 0; i < num_pages; ++i) {
       const auto& p = result->pages[i];
@@ -532,7 +571,8 @@ bool PoolClient::PutRemote(const std::string& key, const void* src, size_t size)
         master_client_->AbortAllocation(result->node_id, result->allocation_id, size);
         return false;
       }
-      std::memcpy(static_cast<char*>(dram.buffer) + off, src_bytes + i * page_size, page_size);
+      const uint64_t bytes = LogicalPageBytes(i, num_pages, page_size, size);
+      std::memcpy(static_cast<char*>(dram.buffer) + off, src_bytes + i * page_size, bytes);
     }
   } else {
     // Hydrate every buffer's MemoryDesc up front from the response's
@@ -633,10 +673,10 @@ std::vector<bool> PoolClient::BatchPutRemote(const std::vector<std::string>& key
       master_client_->AbortAllocation(r.node_id, r.allocation_id, sizes[i]);
       continue;
     }
-    if (sizes[i] != r.pages.size() * r.page_size) {
+    if (!SizeMatchesAllocation(sizes[i], r.pages.size(), r.page_size)) {
       MORI_UMBP_ERROR(
-          "[PoolClient] BatchPutRemote: size {} != pages * page_size ({} * {}) for key='{}'",
-          sizes[i], r.pages.size(), r.page_size, keys[i]);
+          "[PoolClient] BatchPutRemote: size {} not in allocation window ({}..{}] for key='{}'",
+          sizes[i], (r.pages.size() - 1) * r.page_size, r.pages.size() * r.page_size, keys[i]);
       master_client_->AbortAllocation(r.node_id, r.allocation_id, sizes[i]);
       continue;
     }
@@ -662,8 +702,8 @@ std::vector<bool> PoolClient::BatchPutRemote(const std::vector<std::string>& key
           oob = true;
           break;
         }
-        std::memcpy(static_cast<char*>(dram.buffer) + off, src_bytes + k * r.page_size,
-                    r.page_size);
+        const uint64_t bytes = LogicalPageBytes(k, r.pages.size(), r.page_size, sizes[i]);
+        std::memcpy(static_cast<char*>(dram.buffer) + off, src_bytes + k * r.page_size, bytes);
       }
       wrote = !oob;
     } else {
@@ -769,6 +809,16 @@ std::vector<bool> PoolClient::BatchGetRemote(const std::vector<std::string>& key
     if (!routes[i].has_value()) continue;
     auto& r = *routes[i];
     auto& loc = r.location;
+    // Same contract as GetRemote: caller's `sizes[i]` must match the byte
+    // size committed at Put time (Master tracks it in Location.size).  See
+    // the comment in GetRemote for why the page-window check alone is
+    // insufficient with partial-last-page support.
+    if (sizes[i] != loc.size) {
+      MORI_UMBP_ERROR(
+          "[PoolClient] BatchGetRemote: caller size {} != stored size {} for key='{}'",
+          sizes[i], loc.size, keys[i]);
+      continue;
+    }
     if (loc.tier != TierType::DRAM && loc.tier != TierType::HBM) continue;
 
     auto parsed = ParseDramLocationIdWithLog(loc.location_id);
@@ -779,13 +829,8 @@ std::vector<bool> PoolClient::BatchGetRemote(const std::vector<std::string>& key
           keys[i], loc.location_id);
       continue;
     }
-    if (sizes[i] != parsed->pages.size() * r.page_size) {
-      MORI_UMBP_ERROR(
-          "[PoolClient] BatchGetRemote: size {} != pages * page_size ({} * {}) for key='{}'",
-          sizes[i], parsed->pages.size(), r.page_size, keys[i]);
-      continue;
-    }
-
+    // Note: no allocation-window check here — implied by sizes[i]==loc.size
+    // (verified above) + master-side num_pages=ceil(loc.size/page_size).
     if (loc.node_id == config_.master_config.node_id) {
       bool oob = false;
       char* dst_bytes = static_cast<char*>(dsts[i]);
@@ -806,8 +851,9 @@ std::vector<bool> PoolClient::BatchGetRemote(const std::vector<std::string>& key
           oob = true;
           break;
         }
+        const uint64_t bytes = LogicalPageBytes(k, parsed->pages.size(), r.page_size, sizes[i]);
         std::memcpy(dst_bytes + k * r.page_size, static_cast<const char*>(dram.buffer) + off,
-                    r.page_size);
+                    bytes);
       }
       results[i] = !oob;
       continue;
@@ -1082,8 +1128,10 @@ bool PoolClient::RemoteDramScatterWrite(PeerConnection& peer,
     MORI_UMBP_ERROR("[PoolClient] ScatterWrite: empty pages or page_size=0");
     return false;
   }
-  if (size != pages.size() * page_size) {
-    MORI_UMBP_ERROR("[PoolClient] ScatterWrite: size {} != {} * {}", size, pages.size(), page_size);
+  // Allow partial last page: size in ((N-1)*ps, N*ps].
+  if (!SizeMatchesAllocation(size, pages.size(), page_size)) {
+    MORI_UMBP_ERROR("[PoolClient] ScatterWrite: size {} not in allocation window ({}..{}]", size,
+                    (pages.size() - 1) * page_size, pages.size() * page_size);
     return false;
   }
 
@@ -1142,7 +1190,8 @@ bool PoolClient::RemoteDramScatterWrite(PeerConnection& peer,
     for (size_t spi : g.src_page_indices) {
       l_off.push_back(local_base_offset + spi * page_size);
       r_off.push_back(static_cast<uint64_t>(pages[spi].page_index) * page_size);
-      sz.push_back(page_size);
+      // Last logical page may be partial — only RDMA-write its real bytes.
+      sz.push_back(LogicalPageBytes(spi, pages.size(), page_size, size));
     }
   }
 
@@ -1183,8 +1232,10 @@ bool PoolClient::RemoteDramScatterRead(PeerConnection& peer, const std::vector<P
     MORI_UMBP_ERROR("[PoolClient] ScatterRead: empty pages or page_size=0");
     return false;
   }
-  if (size != pages.size() * page_size) {
-    MORI_UMBP_ERROR("[PoolClient] ScatterRead: size {} != {} * {}", size, pages.size(), page_size);
+  // Allow partial last page: size in ((N-1)*ps, N*ps].
+  if (!SizeMatchesAllocation(size, pages.size(), page_size)) {
+    MORI_UMBP_ERROR("[PoolClient] ScatterRead: size {} not in allocation window ({}..{}]", size,
+                    (pages.size() - 1) * page_size, pages.size() * page_size);
     return false;
   }
 
@@ -1239,7 +1290,8 @@ bool PoolClient::RemoteDramScatterRead(PeerConnection& peer, const std::vector<P
     for (size_t spi : g.src_page_indices) {
       l_off.push_back(local_base_offset + spi * page_size);
       r_off.push_back(static_cast<uint64_t>(pages[spi].page_index) * page_size);
-      sz.push_back(page_size);
+      // Last logical page may be partial — only RDMA-read its real bytes.
+      sz.push_back(LogicalPageBytes(spi, pages.size(), page_size, size));
     }
   }
 
