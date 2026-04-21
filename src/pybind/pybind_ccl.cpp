@@ -217,7 +217,19 @@ void RegisterMoriCcl(pybind11::module_& m) {
             if (ptr == nullptr) throw std::runtime_error("Output transit buffer is null");
             return py::make_tuple(reinterpret_cast<uintptr_t>(ptr), size);
           },
-          "Return (ptr, size_bytes) of the output transit buffer");
+          "Return (ptr, size_bytes) of the output transit buffer")
+      .def("enable_phase_timing",
+           &mori::collective::AllreduceSdma<uint32_t>::enable_phase_timing,
+           py::arg("on"),
+           "Enable/disable per-phase timestamp instrumentation for pipelined()")
+      .def("get_phase_timestamps",
+           &mori::collective::AllreduceSdma<uint32_t>::get_phase_timestamps,
+           "Return the most recent pipelined() call's per-phase GPU timestamps "
+           "(32 slots, raw s_memtime cycles; slots 0..3+3*numChunks populated)")
+      .def("get_last_num_chunks",
+           &mori::collective::AllreduceSdma<uint32_t>::get_last_num_chunks,
+           "Return numChunks used by the most recent pipelined() call; "
+           "needed to parse the phase_timestamps layout");
 
   // =========================================================================
   // AllreduceSdma (fp16)
@@ -256,7 +268,13 @@ void RegisterMoriCcl(pybind11::module_& m) {
             if (ptr == nullptr) throw std::runtime_error("Output transit buffer is null");
             return py::make_tuple(reinterpret_cast<uintptr_t>(ptr), size);
           },
-          "Return (ptr, size_bytes) of the output transit buffer (fp16)");
+          "Return (ptr, size_bytes) of the output transit buffer (fp16)")
+      .def("enable_phase_timing",
+           &mori::collective::AllreduceSdma<half>::enable_phase_timing, py::arg("on"))
+      .def("get_phase_timestamps",
+           &mori::collective::AllreduceSdma<half>::get_phase_timestamps)
+      .def("get_last_num_chunks",
+           &mori::collective::AllreduceSdma<half>::get_last_num_chunks);
 
   // =========================================================================
   // AllreduceSdma (bf16)
@@ -296,6 +314,13 @@ void RegisterMoriCcl(pybind11::module_& m) {
             if (ptr == nullptr) throw std::runtime_error("Output transit buffer is null");
             return py::make_tuple(reinterpret_cast<uintptr_t>(ptr), size);
           },
-          "Return (ptr, size_bytes) of the output transit buffer (bf16)");
+          "Return (ptr, size_bytes) of the output transit buffer (bf16)")
+      .def("enable_phase_timing",
+           &mori::collective::AllreduceSdma<hip_bfloat16>::enable_phase_timing,
+           py::arg("on"))
+      .def("get_phase_timestamps",
+           &mori::collective::AllreduceSdma<hip_bfloat16>::get_phase_timestamps)
+      .def("get_last_num_chunks",
+           &mori::collective::AllreduceSdma<hip_bfloat16>::get_last_num_chunks);
 }
 }  // namespace mori

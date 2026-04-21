@@ -28,6 +28,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 #include "mori/application/application.hpp"
 #include "mori/collective/collective_pub.hpp"
@@ -90,6 +91,15 @@ class AllreduceSdma {
   uint64_t pipeline_scatter_gen_ = 0;  // total SDMA ATOMIC_INC on qId=0 (scatter only)
   uint64_t pipeline_ag_gen_ = 0;       // total SDMA ATOMIC_INC on qId=1 (pipeline AG only)
   uint64_t pipeline_reduce_gen_ = 0;   // reduce_complete counter via flagsMemObj (per-chunk barrier)
+
+  // Phase-level timestamp instrumentation (optional, diagnostic).
+  // When enabled, block 0 thread 0 of PipelinedAllReduceSdmaKernel writes
+  // __builtin_amdgcn_s_memtime() at each phase boundary to phase_ts_d_.
+  // Host calls get_phase_timestamps() to read back. See kernel header for slot layout.
+  static constexpr size_t kPhaseTsCapacity = 32;
+  bool phase_timing_enabled_ = false;
+  uint64_t* phase_ts_d_ = nullptr;  // device buffer, capacity kPhaseTsCapacity * uint64_t
+  int last_num_chunks_ = 0;  // numChunks used by the most recent pipelined() call
 
   AllreduceSdma(const AllreduceSdma&) = delete;
   AllreduceSdma& operator=(const AllreduceSdma&) = delete;
@@ -183,6 +193,25 @@ class AllreduceSdma {
   }
 
   void resetFlags();
+
+  // --- Phase-level timestamp instrumentation ---
+  // Call enable(true) once before benchmarking; each subsequent pipelined()
+  // call will write per-phase timestamps into a device buffer. Call
+  // get_phase_timestamps() after the kernel completes (ensure stream synced)
+  // to read back the most recent call's timestamps.
+  void enable_phase_timing(bool on);
+  bool is_phase_timing_enabled() const { return phase_timing_enabled_; }
+  int get_last_num_chunks() const { return last_num_chunks_; }
+
+  // Returns a vector of length kPhaseTsCapacity. Each slot is a raw
+  // __builtin_amdgcn_s_memtime() value in GPU memory-clock cycles.
+  // Slot layout (see pipelined_allreduce_sdma_kernel.hpp for details):
+  //   0: kernel entry
+  //   1: scatter submit done
+  //   2 + 3*c + {0,1,2}: chunk c {compute-wait, cross-PE-barrier, AG-submit} done
+  //   2 + 3*numChunks:   AG wait done
+  //   3 + 3*numChunks:   block 0 exit
+  std::vector<uint64_t> get_phase_timestamps();
 };
 
 }  // namespace collective

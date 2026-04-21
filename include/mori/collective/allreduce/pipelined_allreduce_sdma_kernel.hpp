@@ -44,6 +44,24 @@ namespace collective {
 static_assert(kMaxPipelineBlocks <= 385,
               "compute block count must fit in grid launch");
 
+// ---- Phase-level timestamp instrumentation (optional) ----------------------
+// When phase_ts != nullptr, block 0 thread 0 writes __builtin_amdgcn_s_memtime()
+// at each phase boundary. Used to diagnose per-phase cost of AR[0] cold path.
+// Slot layout (see file-level comment for PipelinedAllReduceSdmaKernel):
+//   0: kernel entry
+//   1: scatter submit done
+//   2 + 3*c + {0,1,2}: chunk c {compute-wait, cross-PE-barrier, AG-submit} done
+//   2 + 3*numChunks:   AG wait done (all peers)
+//   3 + 3*numChunks:   block 0 exit
+static constexpr int kArPhaseTsCapacity = 32;
+
+__device__ inline void ar_write_phase_ts(uint64_t* ts, int idx) {
+  if (ts != nullptr && blockIdx.x == 0 && threadIdx.x == 0) {
+    ts[idx] = __builtin_amdgcn_s_memtime();
+  }
+}
+// ---------------------------------------------------------------------------
+
 // ============================================================================
 // ScatterSdmaOnlyKernel — 1-block kernel that submits SDMA scatter to all
 // peers and waits for all incoming scatter data.  Paired with
@@ -127,7 +145,10 @@ __global__ void PipelinedAllReduceSdmaKernel(
     size_t chunkElementCount,
     uint64_t scatterBase,
     uint64_t agBase,
-    uint64_t reduceCompleteBase) {
+    uint64_t reduceCompleteBase,
+    uint64_t* phase_ts = nullptr) {
+
+  ar_write_phase_ts(phase_ts, 0);  // phase 0: kernel entry
 
   if (elementCount == 0 || npes <= 0) return;
 
@@ -314,6 +335,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
           }
         }
       }
+      ar_write_phase_ts(phase_ts, 1);  // phase 1: scatter submit done (block 0 thr 0)
 
       // ==============================================================
       // Per-chunk flow: for each chunk c
@@ -349,6 +371,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
               __builtin_amdgcn_s_sleep(1);
           }
           __syncthreads();
+          ar_write_phase_ts(phase_ts, 2 + 3 * c + 0);  // chunk c: compute-wait done
 
           // 2. Cross-PE reduce_complete barrier: signal + wait all peers.
           //    Required so my AG doesn't overwrite peer's transit slot
@@ -368,6 +391,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
             while (core::AtomicLoadRelaxed(remoteFlag) < expected)
               __builtin_amdgcn_s_sleep(1);
           }
+          ar_write_phase_ts(phase_ts, 2 + 3 * c + 1);  // chunk c: cross-PE barrier done
 
           // 3. SDMA AG for chunk c.
           if (thr < npes && thr != myPe) {
@@ -388,6 +412,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
                 + static_cast<size_t>(myPe) * totalShardBytes + cOff;
             core::SdmaPutThread(src, dst, agBytes, dh, rSig, numQ, 1);
           }
+          ar_write_phase_ts(phase_ts, 2 + 3 * c + 2);  // chunk c: AG submit done
         }
 
         if (thr < npes && thr != myPe) {
@@ -399,6 +424,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
           while (core::AtomicLoadRelaxed(sig) < expected)
             __builtin_amdgcn_s_sleep(1);
         }
+        ar_write_phase_ts(phase_ts, 2 + 3 * numChunks);  // AG wait done (all peers)
       } else {
         // Single-chunk AG. Same barrier requirement as MULTI_CHUNK.
         const uint32_t ccTarget =
@@ -410,6 +436,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
             __builtin_amdgcn_s_sleep(1);
         }
         __syncthreads();
+        ar_write_phase_ts(phase_ts, 2);  // chunk 0: compute-wait done
 
         // Cross-PE reduce_complete barrier.
         if (thr == 0) {
@@ -426,6 +453,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
           while (core::AtomicLoadRelaxed(remoteFlag) < expected)
             __builtin_amdgcn_s_sleep(1);
         }
+        ar_write_phase_ts(phase_ts, 3);  // chunk 0: cross-PE barrier done
 
         if (thr < npes && thr != myPe) {
           const int destPe = thr;
@@ -440,6 +468,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
               + static_cast<size_t>(myPe) * totalShardBytes;
           core::SdmaPutThread(src, dst, totalShardBytes, dh, rSig, numQ, 1);
         }
+        ar_write_phase_ts(phase_ts, 4);  // chunk 0: AG submit done
 
         if (thr < npes && thr != myPe) {
           const int sender = thr;
@@ -449,8 +478,11 @@ __global__ void PipelinedAllReduceSdmaKernel(
           while (core::AtomicLoadRelaxed(sig) < expected)
             __builtin_amdgcn_s_sleep(1);
         }
+        ar_write_phase_ts(phase_ts, 5);  // AG wait done (single-chunk, numChunks=1)
 
       }
+
+      ar_write_phase_ts(phase_ts, 3 + 3 * numChunks);  // block 0 exit
 
     }  // end block 0 vs compute
 

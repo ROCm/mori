@@ -333,3 +333,33 @@ class AllreduceSdma:
             dtype = self.dtype
         ptr, size_bytes = self._handle.get_output_transit_buffer()
         return _ptr_to_tensor(ptr, size_bytes, dtype)
+
+    # --- Phase-level timestamp instrumentation (diagnostic) -----------------
+    def enable_phase_timing(self, on: bool):
+        """Enable/disable per-phase timestamp recording for pipelined AR kernel.
+
+        When enabled, block 0 thread 0 of PipelinedAllReduceSdmaKernel writes
+        __builtin_amdgcn_s_memtime() at each phase boundary. Read back with
+        get_phase_timestamps() after the stream has synchronized.
+        """
+        self._handle.enable_phase_timing(on)
+
+    def get_phase_timestamps(self) -> list:
+        """Return per-phase GPU timestamps (list of 32 uint64 cycles) from the
+        most recent pipelined() call. Stream must be synchronized before call.
+
+        Slot layout (see kernel header for details):
+          0: kernel entry
+          1: scatter submit done
+          2 + 3*c + {0,1,2}: chunk c {compute-wait, cross-PE-barrier, AG-submit} done
+          2 + 3*numChunks:   AG wait done (all peers)
+          3 + 3*numChunks:   block 0 exit
+        """
+        return self._handle.get_phase_timestamps()
+
+    def get_last_num_chunks(self) -> int:
+        """Return numChunks used by the most recent pipelined() call.
+
+        Needed to parse get_phase_timestamps()'s layout.
+        """
+        return self._handle.get_last_num_chunks()

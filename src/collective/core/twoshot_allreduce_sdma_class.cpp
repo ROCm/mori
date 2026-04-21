@@ -153,9 +153,53 @@ AllreduceSdma<T>::~AllreduceSdma() {
   // Drain all GPU work (including in-flight SDMA transfers) before
   // ShmemDeleter frees the symmetric memory regions they reference.
   hipDeviceSynchronize();
+  if (phase_ts_d_) {
+    hipFree(phase_ts_d_);
+    phase_ts_d_ = nullptr;
+  }
   if (flags_) {
     printf("AllreduceSdma destroyed: PE %d\n", myPe_);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Phase-level timestamp instrumentation
+// ---------------------------------------------------------------------------
+template <typename T>
+void AllreduceSdma<T>::enable_phase_timing(bool on) {
+  if (on == phase_timing_enabled_) return;
+  if (on) {
+    if (phase_ts_d_ == nullptr) {
+      hipError_t err = hipMalloc(&phase_ts_d_, kPhaseTsCapacity * sizeof(uint64_t));
+      if (err != hipSuccess) {
+        fprintf(stderr, "PE %d: enable_phase_timing: hipMalloc failed: %s\n",
+                myPe_, hipGetErrorString(err));
+        phase_ts_d_ = nullptr;
+        return;
+      }
+      hipMemset(phase_ts_d_, 0, kPhaseTsCapacity * sizeof(uint64_t));
+    }
+    phase_timing_enabled_ = true;
+    printf("PE %d: phase timing ENABLED (device buf %p, cap=%zu slots)\n",
+           myPe_, phase_ts_d_, kPhaseTsCapacity);
+  } else {
+    phase_timing_enabled_ = false;
+    printf("PE %d: phase timing DISABLED\n", myPe_);
+  }
+}
+
+template <typename T>
+std::vector<uint64_t> AllreduceSdma<T>::get_phase_timestamps() {
+  std::vector<uint64_t> result(kPhaseTsCapacity, 0);
+  if (phase_ts_d_ == nullptr) return result;
+  hipError_t err = hipMemcpy(result.data(), phase_ts_d_,
+                             kPhaseTsCapacity * sizeof(uint64_t),
+                             hipMemcpyDeviceToHost);
+  if (err != hipSuccess) {
+    fprintf(stderr, "PE %d: get_phase_timestamps: hipMemcpy failed: %s\n",
+            myPe_, hipGetErrorString(err));
+  }
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -571,12 +615,17 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         uint64_t ag_base      = pipeline_ag_gen_;
         uint64_t reduce_complete_base = pipeline_reduce_gen_;
 
+        // Phase timing buffer (nullptr unless instrumentation enabled).
+        // Block 0 thread 0 writes __builtin_amdgcn_s_memtime() at each phase.
+        uint64_t* phase_ts_ptr = phase_timing_enabled_ ? phase_ts_d_ : nullptr;
+        last_num_chunks_ = numChunks_host;
+
         if (scatter_mode == 1) {
             PipelinedAllReduceSdmaKernel<T, 1><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
                 barrierPtr_, inputSymmObj, total_count, chunk_elems,
-                scatter_base, ag_base, reduce_complete_base);
+                scatter_base, ag_base, reduce_complete_base, phase_ts_ptr);
         } else if (external_scatter) {
             ScatterSdmaOnlyKernel<T><<<1, 512, 0, stream>>>(
                 myPe_, npes_, input, output_transit_buffer_obj_,
@@ -588,7 +637,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                     output_transit_buffer_obj_, flagsObj_,
                     barrierPtr_, application::SymmMemObjPtr{},
                     total_count, chunk_elems, scatter_base, ag_base,
-                    reduce_complete_base);
+                    reduce_complete_base, phase_ts_ptr);
             } else {
                 PipelinedAllReduceSdmaKernel<T, 0, false, true>
                     <<<blocks, threads, 0, stream>>>(
@@ -596,20 +645,20 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                     output_transit_buffer_obj_, flagsObj_,
                     barrierPtr_, application::SymmMemObjPtr{},
                     total_count, chunk_elems, scatter_base, ag_base,
-                    reduce_complete_base);
+                    reduce_complete_base, phase_ts_ptr);
             }
         } else if (multi_chunk) {
             PipelinedAllReduceSdmaKernel<T, 0, true><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
                 barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems,
-                scatter_base, ag_base, reduce_complete_base);
+                scatter_base, ag_base, reduce_complete_base, phase_ts_ptr);
         } else {
             PipelinedAllReduceSdmaKernel<T, 0, false><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
                 barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems,
-                scatter_base, ag_base, reduce_complete_base);
+                scatter_base, ag_base, reduce_complete_base, phase_ts_ptr);
         }
 
         pipeline_scatter_gen_ += numChunks_host;   // scatter SDMA only (qId=0)

@@ -805,6 +805,7 @@ def _bench_overlap_one_size(
     setup_fn,
     timeline_dump=False,
     timeline_label="",
+    ar_phase_timing=False,
 ):
     """Benchmark one (mode, size) combo.  Returns dict with timing or None."""
     _dbg = (rank == 0)
@@ -817,6 +818,8 @@ def _bench_overlap_one_size(
         return None
     _, launch_ar, prep_ar, time_ar_with_wall = setup_ret[:4]
     copy_stream = setup_ret[4] if len(setup_ret) > 4 else None
+    # Optional: AllreduceSdma object, used for --ar-phase-timing. None for RCCL.
+    ar_obj = setup_ret[5] if len(setup_ret) > 5 else None
 
     seq_ar, seq_gemm, overlap_times = [], [], []
     timeline_samples = []  # populated when timeline_dump=True; one dict per measure iter
@@ -979,6 +982,105 @@ def _bench_overlap_one_size(
               f"(last AR, runs after all GEMMs)")
         print()
 
+    # ------------------------------------------------------------------
+    # AR-kernel phase-level breakdown (SDMA only; requires rebuilt kernel)
+    #
+    # Runs one extra overlap iteration with phase-timing enabled for AR[0],
+    # then disables timing and runs the remaining AR[1..N-1] normally. AR[0]
+    # phase timestamps are memcpy'd to host right after stream_ar sync so
+    # subsequent AR kernels cannot overwrite them.
+    # ------------------------------------------------------------------
+    if ar_phase_timing and rank == 0 and ar_obj is not None and use_overlap:
+        try:
+            # Aggregate 5 samples so per-phase delta is less noisy.
+            n_samples = 5
+            all_phase_deltas = []  # list of (dict phase_name -> ms) per sample
+            stage_med_ar0 = []     # AR[0] duration reported by event timeline
+
+            for _sample in range(n_samples):
+                torch.cuda.synchronize()
+                prep_ar()
+                torch.cuda.synchronize()
+                # Enable phase timing for AR[0] only
+                ar_obj.enable_phase_timing(True)
+                # Run GEMM[0] + AR[0], sync, then disable, then continue
+                ev_g0_s = torch.cuda.Event(enable_timing=True)
+                ev_g0_e = torch.cuda.Event(enable_timing=True)
+                ev_ar0_s = torch.cuda.Event(enable_timing=True)
+                ev_ar0_e = torch.cuda.Event(enable_timing=True)
+                ev_g0_s.record(stream_gemm)
+                with torch.cuda.stream(stream_gemm):
+                    _run_gemm()
+                ev_g0_e.record(stream_gemm)
+                stream_ar.wait_event(ev_g0_e)
+                ev_ar0_s.record(stream_ar)
+                with torch.cuda.stream(stream_ar):
+                    launch_ar()
+                ev_ar0_e.record(stream_ar)
+                stream_ar.synchronize()  # AR[0] done, phase_ts_d_ has data
+                ts = ar_obj.get_phase_timestamps()
+                last_nc = ar_obj.get_last_num_chunks()
+                ar_obj.enable_phase_timing(False)
+                # Continue AR[1..N-1] normally (untimed) to drain pipeline
+                for s in range(1, num_stages):
+                    tmp_ev = torch.cuda.Event()
+                    with torch.cuda.stream(stream_gemm):
+                        _run_gemm()
+                    tmp_ev.record(stream_gemm)
+                    stream_ar.wait_event(tmp_ev)
+                    with torch.cuda.stream(stream_ar):
+                        launch_ar()
+                stream_ar.synchronize()
+                stream_gemm.synchronize()
+
+                # Convert raw cycles to ms using AR[0] event-measured duration as anchor
+                ar0_dur_ms = ev_ar0_s.elapsed_time(ev_ar0_e)  # ms (torch event = ms)
+                stage_med_ar0.append(ar0_dur_ms)
+                entry_cy = ts[0]
+                exit_cy = ts[3 + 3 * last_nc]
+                total_cy = exit_cy - entry_cy if exit_cy > entry_cy else 1
+                # tick-to-ms conversion: total_cy ticks → ar0_dur_ms (≈ kernel wall)
+                cy_to_ms = ar0_dur_ms / float(total_cy) if total_cy > 0 else 0.0
+
+                # Build per-phase breakdown (ms)
+                phases = {}
+                # phase 0 = entry, phase 1 = scatter_done,
+                # for c in 0..nc-1: phase 2+3c+0/1/2 = compute-wait/barrier/ag-submit,
+                # phase 2+3nc = ag-wait-done, phase 3+3nc = exit
+                phases["entry→scatter_done"] = (ts[1] - ts[0]) * cy_to_ms
+                for c in range(last_nc):
+                    prev = ts[1] if c == 0 else ts[2 + 3 * (c - 1) + 2]
+                    phases[f"c{c}:scatter→compute-wait"] = (ts[2 + 3 * c + 0] - prev) * cy_to_ms
+                    phases[f"c{c}:compute-wait→barrier"] = (ts[2 + 3 * c + 1] - ts[2 + 3 * c + 0]) * cy_to_ms
+                    phases[f"c{c}:barrier→AG-submit"] = (ts[2 + 3 * c + 2] - ts[2 + 3 * c + 1]) * cy_to_ms
+                phases[f"AG-submit→AG-wait-done"] = (ts[2 + 3 * last_nc] - ts[2 + 3 * (last_nc - 1) + 2]) * cy_to_ms
+                phases["AG-wait-done→exit"] = (ts[3 + 3 * last_nc] - ts[2 + 3 * last_nc]) * cy_to_ms
+                all_phase_deltas.append(phases)
+
+            import statistics as _st
+
+            # Median across samples
+            phase_keys = list(all_phase_deltas[0].keys())
+            med = {k: _st.median([d[k] for d in all_phase_deltas]) for k in phase_keys}
+            ar0_med = _st.median(stage_med_ar0)
+
+            print(f"\n  === AR[0] Phase Breakdown [{timeline_label}]  "
+                  f"N={num_stages}  numChunks={last_nc}  "
+                  f"(median of {n_samples} samples, ms) ===")
+            print(f"  AR[0] total (event):                  {ar0_med:7.3f} ms")
+            print(f"  sum of phase deltas:                  "
+                  f"{sum(med.values()):7.3f} ms")
+            print(f"  ----- phase breakdown -----")
+            for k, v in med.items():
+                print(f"    {k:<35s} {v:7.3f} ms")
+            print()
+        except Exception as e:
+            print(f"  [WARN] phase-timing failed: {e}")
+            try:
+                ar_obj.enable_phase_timing(False)
+            except Exception:
+                pass
+
     dist.barrier()
 
     def _reduce(vals):
@@ -1011,7 +1113,7 @@ def _test_multi_stage_overlap(
     rank, my_pe, npes, elems, data_bytes, output_buf_size, fill_value,
     dtype, dtype_name, device, iterations, warmup,
     gemm_m=_GEMM_M_DEFAULT, gemm_n=_GEMM_N_DEFAULT, gemm_k=_GEMM_K_DEFAULT,
-    num_stages=2, sweep=False, timeline_dump=False,
+    num_stages=2, sweep=False, timeline_dump=False, ar_phase_timing=False,
 ):
     """Multi-stage pipelined GEMM+AllReduce overlap benchmark."""
     rccl_dtype = _RCCL_DTYPE_MAP.get(dtype, torch.float32)
@@ -1046,6 +1148,7 @@ def _test_multi_stage_overlap(
         ev_g_e=ev_g_e, ov_s=ov_s, ov_e=ov_e,
         num_stages=num_stages, total_iters=total_iters, warmup=warmup,
         timeline_dump=timeline_dump,
+        ar_phase_timing=ar_phase_timing,
     )
 
     single_mb = max(1, data_bytes // (1024 * 1024))
@@ -1102,7 +1205,9 @@ def _test_multi_stage_overlap(
                         ok = _ar(inp, out, e, stream_ar); stream_ar.synchronize()
                         def prep(): inp.fill_(fill_value)
                         def launch(): return _ar(inp, out, e, stream_ar)
-                        return ok, launch, prep, False
+                        # Return tuple slot 5 (copy_stream) = None,
+                        # slot 6 = ar_obj so _bench can call enable_phase_timing
+                        return ok, launch, prep, False, None, _ar
                     return setup
                 setup_fn = make_setup()
             else:
@@ -1251,6 +1356,7 @@ def _test_allreduce(
     num_stages=0,
     sweep=False,
     timeline_dump=False,
+    ar_phase_timing=False,
 ):
     """Worker function for each process."""
 
@@ -1390,6 +1496,7 @@ def _test_allreduce(
                 num_stages=num_stages,
                 sweep=sweep,
                 timeline_dump=timeline_dump,
+                ar_phase_timing=ar_phase_timing,
             )
             all_ok = all_ok and ok6
 
@@ -1440,6 +1547,7 @@ def test_allreduce(
     num_stages=0,
     sweep=False,
     timeline_dump=False,
+    ar_phase_timing=False,
 ):
     """Run AllReduce SDMA test."""
     os.environ.setdefault("MORI_ENABLE_SDMA", "1")
@@ -1460,6 +1568,7 @@ def test_allreduce(
             num_stages,
             sweep,
             timeline_dump,
+            ar_phase_timing,
         ),
         nprocs=world_size,
         join=True,
@@ -1529,6 +1638,15 @@ if __name__ == "__main__":
         help="Dump per-stage GEMM/AR timeline (median of measure iters) for each "
              "(mode, size) combo in multi-stage test. Useful for overlap analysis.",
     )
+    parser.add_argument(
+        "--ar-phase-timing",
+        action="store_true",
+        help="Enable kernel-internal phase timestamps for SDMA AR[0] (requires "
+             "rebuilt mori with instrumented kernel). Prints per-phase ms "
+             "breakdown: entry→scatter_done, compute-wait, cross-PE-barrier, "
+             "AG-submit, AG-wait. Use together with --timeline and a single size "
+             "(e.g. --elems 67108864) for clear output.",
+    )
     args = parser.parse_args()
     os.environ["MORI_ENABLE_SDMA"] = str(args.enable_sdma)
 
@@ -1567,4 +1685,5 @@ if __name__ == "__main__":
         num_stages=args.num_stages,
         sweep=args.sweep,
         timeline_dump=args.timeline,
+        ar_phase_timing=args.ar_phase_timing,
     )
