@@ -279,6 +279,17 @@ message BatchFinalizeResponse {
   repeated bool finalized = 1;
 }
 
+// Batch existence check — read-only, no access-count / lease side-effects.
+// Matches Lookup semantics, batched.
+message BatchLookupRequest {
+  string node_id = 1;
+  repeated string keys = 2;
+}
+message BatchLookupResponse {
+  // Parallel to BatchLookupRequest.keys; found[i] corresponds to keys[i].
+  repeated bool found = 1;
+}
+
 // ============================================================
 //  Single unified service
 // ============================================================
@@ -305,4 +316,5 @@ service UMBPMaster {
   rpc BatchRoutePut(BatchRoutePutRequest) returns (BatchRoutePutResponse);
   rpc BatchRouteGet(BatchRouteGetRequest) returns (BatchRouteGetResponse);
   rpc BatchFinalizeAllocation(BatchFinalizeRequest) returns (BatchFinalizeResponse);
+  rpc BatchLookup(BatchLookupRequest) returns (BatchLookupResponse);
 }

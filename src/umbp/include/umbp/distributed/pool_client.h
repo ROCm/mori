@@ -73,6 +73,12 @@ class PoolClient {
   // Check whether a block exists on any remote node (RouteGet without RDMA).
   bool ExistsRemote(const std::string& key);
 
+  // Batched existence check — single BatchLookup gRPC for the whole batch.
+  // Same semantics as ExistsRemote (no access-count / lease side-effects).
+  // On wire error all entries are false.  Returns a vector parallel to
+  // `keys`.
+  std::vector<bool> BatchExistsRemote(const std::vector<std::string>& keys);
+
   bool IsRegistered(const std::string& key) const;
 
   // Fetch a block from a remote node via RDMA.

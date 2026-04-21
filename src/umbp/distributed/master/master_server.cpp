@@ -430,6 +430,22 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     return grpc::Status::OK;
   }
 
+  grpc::Status BatchLookup(grpc::ServerContext* /*context*/,
+                           const ::umbp::BatchLookupRequest* request,
+                           ::umbp::BatchLookupResponse* response) override {
+    std::vector<std::string> keys(request->keys().begin(), request->keys().end());
+    // Single shared_lock on the index for the whole batch.  Read-only:
+    // no access-count bump and no lease grant (same semantics as Lookup).
+    auto found = index_.BatchLookupExists(keys);
+    response->mutable_found()->Reserve(static_cast<int>(found.size()));
+    for (bool f : found) {
+      response->add_found(f);
+    }
+
+    MORI_UMBP_DEBUG("[Master] BatchLookup: {} keys from node={}", keys.size(), request->node_id());
+    return grpc::Status::OK;
+  }
+
   grpc::Status BatchFinalizeAllocation(grpc::ServerContext* /*context*/,
                                        const ::umbp::BatchFinalizeRequest* request,
                                        ::umbp::BatchFinalizeResponse* response) override {

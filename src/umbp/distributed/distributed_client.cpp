@@ -155,11 +155,10 @@ std::vector<bool> DistributedClient::BatchExists(const std::vector<std::string>&
   std::shared_lock lk(op_mutex_);
   if (closed_) return std::vector<bool>(keys.size(), false);
 
-  std::vector<bool> results(keys.size(), false);
-  for (size_t i = 0; i < keys.size(); ++i) {
-    results[i] = pool_client_->ExistsRemote(keys[i]);
-  }
-  return results;
+  // Single batched gRPC instead of N per-key Lookup RPCs (was the #5
+  // bottleneck — sglang probes with batch_size=128 used to emit 128
+  // roundtrips per BatchExists call).
+  return pool_client_->BatchExistsRemote(keys);
 }
 
 size_t DistributedClient::BatchExistsConsecutive(const std::vector<std::string>& keys) const {
@@ -167,8 +166,13 @@ size_t DistributedClient::BatchExistsConsecutive(const std::vector<std::string>&
   std::shared_lock lk(op_mutex_);
   if (closed_) return 0;
 
-  for (size_t i = 0; i < keys.size(); ++i) {
-    if (!pool_client_->ExistsRemote(keys[i])) return i;
+  // One batched gRPC, then scan the parallel result vector for the first
+  // missing key.  A wire failure or size mismatch surfaces as an all-false
+  // vector from BatchExistsRemote and we return 0 (same failure posture as
+  // the old loop-over-ExistsRemote path).
+  auto found = pool_client_->BatchExistsRemote(keys);
+  for (size_t i = 0; i < found.size(); ++i) {
+    if (!found[i]) return i;
   }
   return keys.size();
 }
