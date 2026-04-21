@@ -1,5 +1,8 @@
 #!/bin/bash
 #
+# TODO: adapt for MLX (Mellanox/NVIDIA) and BRCM (Broadcom) NICs —
+#       currently ionic-specific (PFC/DSCP setup, DCQCN config, device enumeration).
+#
 # env_setup.sh — setup ionic NIC environment for mori.
 #
 # Steps (in order):

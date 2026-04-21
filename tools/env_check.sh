@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# TODO: adapt for MLX (Mellanox/NVIDIA) and BRCM (Broadcom) NICs —
+#       currently ionic-specific (device detection, PFC/DCQCN knobs, port enumeration).
+
 set -uo pipefail
 
 # ============================ config ============================
