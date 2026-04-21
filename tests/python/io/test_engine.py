@@ -750,6 +750,105 @@ def test_rdma_chunked_session_invalidates_on_deregister_and_reregisters_same_ten
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
+def test_rdma_chunked_large_buffer_cross_boundary():
+    """End-to-end test for chunked registration of a buffer larger than the
+    chunk-size cap, with a transfer that straddles a chunk boundary.
+
+    Why an explicit ``MORI_IO_RDMA_MR_CHUNK_SIZE`` override:
+    NICs like AMD AINIC (ionic) report ``max_mr_size = 0xffffffffffffffff``
+    via ``ibv_query_device_ex``, but the actual hardware/firmware soft limit
+    is much smaller (~2 GiB). The chunked materialization path normally uses
+    the queried ``max_mr_size``, so on such NICs we cannot rely on the
+    "natural" chunked path being triggered without an override. The override
+    forces a 1 GiB chunk, which is comfortably below ionic's real limit and
+    above any reasonable single-page allocation, so registration of a
+    1.05 GiB tensor produces exactly two chunks and a transfer that crosses
+    the 1 GiB boundary exercises the resolved (multi-slice) data path.
+    """
+    chunk_size = 1 << 30  # 1 GiB
+    extra = 64 << 20  # 64 MiB tail in chunk1
+    total_bytes = chunk_size + extra
+    free0, _ = torch.cuda.mem_get_info(0)
+    free1, _ = torch.cuda.mem_get_info(1)
+    if free0 < total_bytes + (256 << 20) or free1 < total_bytes + (256 << 20):
+        pytest.skip(
+            f"requires ~{(total_bytes + (256 << 20)) >> 20} MiB free per GPU; "
+            f"have free0={free0 >> 20} MiB free1={free1 >> 20} MiB"
+        )
+
+    with temporary_env("MORI_IO_RDMA_MR_CHUNK_SIZE", str(chunk_size)):
+        initiator, target = create_connected_engine_pair(
+            "chunked_large_buffer",
+            qp_per_transfer=2,
+            post_batch_size=-1,
+            num_worker_threads=2,
+            enable_notification=True,
+        )
+
+        initiator_mem = None
+        target_mem = None
+        sess = None
+        try:
+            initiator_tensor = torch.full(
+                (total_bytes,), 0xAA, dtype=torch.uint8, device=torch.device("cuda", 0)
+            )
+            target_tensor = torch.full(
+                (total_bytes,), 0xCC, dtype=torch.uint8, device=torch.device("cuda", 1)
+            )
+
+            # Spike a 4 MiB region centered on the 1 GiB chunk boundary with a
+            # deterministic, aperiodic pattern so any cross-chunk slicing bug
+            # (including arbitrary byte/word shifts) shows up in the byte
+            # compare. Each 4-byte word encodes its own position index so the
+            # pattern is unique up to 4 GiB of payload, well above the 4 MiB
+            # spike size.
+            spike_size = 4 << 20  # 4 MiB
+            assert spike_size % 4 == 0
+            spike_lo = chunk_size - (spike_size // 2)
+            spike_hi = chunk_size + (spike_size // 2)
+            pattern = torch.arange(
+                spike_size // 4, dtype=torch.int32, device=initiator_tensor.device
+            ).view(torch.uint8)
+            initiator_tensor[spike_lo:spike_hi].copy_(pattern)
+
+            initiator_mem, target_mem = register_explicit_mem(
+                (initiator, target), initiator_tensor, target_tensor
+            )
+
+            sess = initiator.create_session(initiator_mem, target_mem)
+            assert sess is not None
+            assert sess.alive()
+
+            uid = sess.allocate_transfer_uid()
+            status = sess.write(spike_lo, spike_lo, spike_size, uid)
+            wait_status(status)
+            assert status.Succeeded(), status.Message()
+
+            inbound = wait_inbound_status_with_timeout(
+                target, initiator.get_engine_desc().key, uid, timeout_s=10.0
+            )
+            assert inbound is not None
+            assert inbound.Succeeded(), inbound.Message()
+
+            # The spike region (which crosses the 1 GiB chunk boundary) must
+            # match byte-for-byte after the cross-chunk transfer.
+            spike_target = target_tensor[spike_lo:spike_hi].cpu()
+            spike_expected = pattern.cpu()
+            assert torch.equal(
+                spike_target, spike_expected
+            ), "boundary-crossing data corrupted"
+
+            # Spot check that areas outside the transfer were untouched.
+            assert target_tensor[0].item() == 0xCC
+            assert target_tensor[spike_lo - 1].item() == 0xCC
+            assert target_tensor[spike_hi].item() == 0xCC
+            assert target_tensor[total_bytes - 1].item() == 0xCC
+        finally:
+            del sess
+            cleanup_engine_pair(initiator, target, [initiator_mem], [target_mem])
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
 def test_rdma_chunked_inflight_dereg_keeps_registration_alive():
     """In-flight transfers must keep their underlying chunk MRs alive even when
     the user deregisters the local memory mid-flight.
