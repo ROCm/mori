@@ -803,6 +803,8 @@ def _bench_overlap_one_size(
     ev_ar_s, ev_ar_e, ev_g_s, ev_g_e, ov_s, ov_e,
     num_stages, total_iters, warmup,
     setup_fn,
+    timeline_dump=False,
+    timeline_label="",
 ):
     """Benchmark one (mode, size) combo.  Returns dict with timing or None."""
     _dbg = (rank == 0)
@@ -817,6 +819,7 @@ def _bench_overlap_one_size(
     copy_stream = setup_ret[4] if len(setup_ret) > 4 else None
 
     seq_ar, seq_gemm, overlap_times = [], [], []
+    timeline_samples = []  # populated when timeline_dump=True; one dict per measure iter
 
     if _dbg: print(f" seq_ar", end="", flush=True)
     for i in range(total_iters):
@@ -905,6 +908,76 @@ def _bench_overlap_one_size(
         t_ov = ov_s.elapsed_time(ov_e) / 1000.0
         if i >= warmup:
             overlap_times.append(t_ov)
+            if timeline_dump and rank == 0:
+                # Per-stage offsets relative to ov_s (ms), median across measure iters
+                iter_sample = {
+                    "wall": ov_s.elapsed_time(ov_e),
+                    "stages": [
+                        {
+                            "g_start": ov_s.elapsed_time(ev_g_s_list[s]),
+                            "g_end": ov_s.elapsed_time(ev_g_e_list[s]),
+                            "a_start": ov_s.elapsed_time(ev_ar_s_list[s]),
+                            "a_end": ov_s.elapsed_time(ev_ar_e_list[s]),
+                        }
+                        for s in range(num_stages)
+                    ],
+                }
+                timeline_samples.append(iter_sample)
+
+    if timeline_dump and rank == 0 and len(timeline_samples) > 0:
+        import statistics as _stats
+        n = len(timeline_samples)
+
+        def _med(values):
+            return _stats.median(values)
+
+        print(f"\n  === Per-Stage Timeline [{timeline_label}]  "
+              f"N={num_stages}  size={data_mb:.0f} MB  "
+              f"use_overlap={use_overlap}  samples={n} (median ms from ov_s) ===")
+        print(f"  {'stage':>5s} | "
+              f"{'GEMM start':>10s} {'GEMM end':>10s} {'GEMM dur':>9s} | "
+              f"{'AR start':>9s} {'AR end':>9s} {'AR dur':>8s}")
+        print(f"  {'-' * 5} | {'-' * 10} {'-' * 10} {'-' * 9} | "
+              f"{'-' * 9} {'-' * 9} {'-' * 8}")
+        stage_med = []
+        for s in range(num_stages):
+            g_st = _med([x["stages"][s]["g_start"] for x in timeline_samples])
+            g_en = _med([x["stages"][s]["g_end"] for x in timeline_samples])
+            a_st = _med([x["stages"][s]["a_start"] for x in timeline_samples])
+            a_en = _med([x["stages"][s]["a_end"] for x in timeline_samples])
+            stage_med.append((g_st, g_en, a_st, a_en))
+            print(f"  {s:>5d} | "
+                  f"{g_st:>10.3f} {g_en:>10.3f} {g_en - g_st:>9.3f} | "
+                  f"{a_st:>9.3f} {a_en:>9.3f} {a_en - a_st:>8.3f}")
+
+        # Pair-wise overlap: AR[s] vs GEMM[s+1]
+        print(f"\n  === Overlap Pairs: AR[s] vs GEMM[s+1] ===")
+        print(f"  {'pair':>12s} | {'overlap ms':>10s} | {'AR dur':>8s} | "
+              f"{'GEMM dur':>9s} | {'hide % of min':>14s}")
+        for s in range(num_stages - 1):
+            _, _, a_st, a_en = stage_med[s]
+            g_st, g_en, _, _ = stage_med[s + 1]
+            ov_lo = max(a_st, g_st)
+            ov_hi = min(a_en, g_en)
+            ov_len = max(0.0, ov_hi - ov_lo)
+            a_len = a_en - a_st
+            g_len = g_en - g_st
+            denom = min(a_len, g_len)
+            pct = (ov_len / denom * 100.0) if denom > 0 else 0.0
+            print(f"  AR[{s}]-GEMM[{s+1}] | "
+                  f"{ov_len:>10.3f} | {a_len:>8.3f} | "
+                  f"{g_len:>9.3f} | {pct:>13.1f}%")
+
+        wall_med = _med([x["wall"] for x in timeline_samples])
+        print(f"\n  === Totals ===")
+        print(f"  median wall:        {wall_med:.3f} ms")
+        # Edge (non-overlap) time estimate: GEMM[0] solo + AR[N-1] solo (if bottleneck)
+        g0_len = stage_med[0][1] - stage_med[0][0]
+        ar_last_len = stage_med[-1][3] - stage_med[-1][2]
+        print(f"  GEMM[0] duration:   {g0_len:.3f} ms   (first GEMM, runs before any AR)")
+        print(f"  AR[{num_stages-1}] duration:      {ar_last_len:.3f} ms   "
+              f"(last AR, runs after all GEMMs)")
+        print()
 
     dist.barrier()
 
@@ -938,7 +1011,7 @@ def _test_multi_stage_overlap(
     rank, my_pe, npes, elems, data_bytes, output_buf_size, fill_value,
     dtype, dtype_name, device, iterations, warmup,
     gemm_m=_GEMM_M_DEFAULT, gemm_n=_GEMM_N_DEFAULT, gemm_k=_GEMM_K_DEFAULT,
-    num_stages=2, sweep=False,
+    num_stages=2, sweep=False, timeline_dump=False,
 ):
     """Multi-stage pipelined GEMM+AllReduce overlap benchmark."""
     rccl_dtype = _RCCL_DTYPE_MAP.get(dtype, torch.float32)
@@ -972,6 +1045,7 @@ def _test_multi_stage_overlap(
         ev_ar_s=ev_ar_s, ev_ar_e=ev_ar_e, ev_g_s=ev_g_s,
         ev_g_e=ev_g_e, ov_s=ov_s, ov_e=ov_e,
         num_stages=num_stages, total_iters=total_iters, warmup=warmup,
+        timeline_dump=timeline_dump,
     )
 
     single_mb = max(1, data_bytes // (1024 * 1024))
@@ -1046,7 +1120,9 @@ def _test_multi_stage_overlap(
                 setup_fn = make_setup()
 
             r = _bench_overlap_one_size(
-                elems=cur_elems, setup_fn=setup_fn, **shared,
+                elems=cur_elems, setup_fn=setup_fn,
+                timeline_label=f"{mode} {size_mb}MB",
+                **shared,
             )
             results[(size_mb, mode)] = r
             if rank == 0:
@@ -1174,6 +1250,7 @@ def _test_allreduce(
     gemm_k=_GEMM_K_DEFAULT,
     num_stages=0,
     sweep=False,
+    timeline_dump=False,
 ):
     """Worker function for each process."""
 
@@ -1312,6 +1389,7 @@ def _test_allreduce(
                 gemm_k=gemm_k,
                 num_stages=num_stages,
                 sweep=sweep,
+                timeline_dump=timeline_dump,
             )
             all_ok = all_ok and ok6
 
@@ -1361,6 +1439,7 @@ def test_allreduce(
     gemm_k=_GEMM_K_DEFAULT,
     num_stages=0,
     sweep=False,
+    timeline_dump=False,
 ):
     """Run AllReduce SDMA test."""
     os.environ.setdefault("MORI_ENABLE_SDMA", "1")
@@ -1380,6 +1459,7 @@ def test_allreduce(
             gemm_k,
             num_stages,
             sweep,
+            timeline_dump,
         ),
         nprocs=world_size,
         join=True,
@@ -1443,6 +1523,12 @@ if __name__ == "__main__":
         action="store_true",
         help="Sweep multiple data sizes (1MB..1GB) in multi-stage test and print summary table",
     )
+    parser.add_argument(
+        "--timeline",
+        action="store_true",
+        help="Dump per-stage GEMM/AR timeline (median of measure iters) for each "
+             "(mode, size) combo in multi-stage test. Useful for overlap analysis.",
+    )
     args = parser.parse_args()
     os.environ["MORI_ENABLE_SDMA"] = str(args.enable_sdma)
 
@@ -1480,4 +1566,5 @@ if __name__ == "__main__":
         gemm_k=args.gemm_k,
         num_stages=args.num_stages,
         sweep=args.sweep,
+        timeline_dump=args.timeline,
     )
