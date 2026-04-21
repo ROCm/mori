@@ -22,6 +22,7 @@
 import pytest
 import os
 import time
+import gc
 from contextlib import contextmanager
 from tests.python.utils import get_free_port
 import torch
@@ -297,6 +298,38 @@ def alloc_and_register_mem(engine_pair, shape):
     return tensor1, tensor2, initiator_mem, target_mem
 
 
+def register_explicit_mem(engine_pair, initiator_tensor, target_tensor):
+    initiator, target = engine_pair
+    initiator_mem = initiator.register_torch_tensor(initiator_tensor)
+    target_mem = target.register_torch_tensor(target_tensor)
+    return initiator_mem, target_mem
+
+
+def cleanup_engine_pair(initiator, target, initiator_mems=(), target_mems=()):
+    if initiator is not None:
+        for mem in initiator_mems:
+            if mem is None:
+                continue
+            try:
+                initiator.deregister_memory(mem)
+            except Exception:
+                pass
+    if target is not None:
+        for mem in target_mems:
+            if mem is None:
+                continue
+            try:
+                target.deregister_memory(mem)
+            except Exception:
+                pass
+
+    del initiator
+    del target
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def check_transfer_result(
     engine_pair,
     initiator_status,
@@ -490,6 +523,346 @@ def test_notification_disabled():
         initiator.get_engine_desc().key, transfer_uid
     )
     assert inbound_status is None  # No notification received
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
+@pytest.mark.parametrize("op_type", ("write", "read"))
+def test_rdma_chunked_session_transfer_crosses_multiple_chunks(op_type):
+    with temporary_env("MORI_IO_RDMA_MR_CHUNK_SIZE", "64"):
+        initiator, target = create_connected_engine_pair(
+            "chunked_single",
+            qp_per_transfer=2,
+            post_batch_size=-1,
+            num_worker_threads=1,
+            enable_notification=True,
+        )
+        initiator_mem = None
+        target_mem = None
+        sess = None
+
+        try:
+            total_bytes = 256
+            local_offset = 48
+            transfer_size = 160
+
+            if op_type == "write":
+                initiator_tensor = torch.arange(
+                    total_bytes, dtype=torch.uint8, device=torch.device("cuda", 0)
+                )
+                target_tensor = torch.full(
+                    (total_bytes,),
+                    0xA5,
+                    dtype=torch.uint8,
+                    device=torch.device("cuda", 1),
+                )
+            else:
+                initiator_tensor = torch.full(
+                    (total_bytes,),
+                    0x5A,
+                    dtype=torch.uint8,
+                    device=torch.device("cuda", 0),
+                )
+                target_tensor = torch.arange(
+                    total_bytes, dtype=torch.uint8, device=torch.device("cuda", 1)
+                )
+
+            initiator_before = initiator_tensor.clone()
+            target_before = target_tensor.clone()
+            initiator_mem, target_mem = register_explicit_mem(
+                (initiator, target), initiator_tensor, target_tensor
+            )
+
+            sess = initiator.create_session(initiator_mem, target_mem)
+            assert sess is not None
+            assert sess.alive()
+
+            transfer_uid = sess.allocate_transfer_uid()
+            op = sess.write if op_type == "write" else sess.read
+            status = op(local_offset, local_offset, transfer_size, transfer_uid)
+
+            wait_status(status)
+            assert status.Succeeded(), status.Message()
+
+            inbound = wait_inbound_status_with_timeout(
+                target, initiator.get_engine_desc().key, transfer_uid, timeout_s=3.0
+            )
+            assert (
+                inbound is not None
+            ), "Expected inbound notification for chunked transfer"
+            assert inbound.Succeeded(), inbound.Message()
+
+            if op_type == "write":
+                expected_target = target_before.clone()
+                expected_target[local_offset : local_offset + transfer_size] = (
+                    initiator_before[local_offset : local_offset + transfer_size]
+                )
+                assert torch.equal(target_tensor.cpu(), expected_target.cpu())
+                assert torch.equal(initiator_tensor.cpu(), initiator_before.cpu())
+            else:
+                expected_initiator = initiator_before.clone()
+                expected_initiator[local_offset : local_offset + transfer_size] = (
+                    target_before[local_offset : local_offset + transfer_size]
+                )
+                assert torch.equal(initiator_tensor.cpu(), expected_initiator.cpu())
+                assert torch.equal(target_tensor.cpu(), target_before.cpu())
+        finally:
+            del sess
+            cleanup_engine_pair(initiator, target, [initiator_mem], [target_mem])
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
+def test_rdma_chunked_multithread_batch_crosses_chunks():
+    with temporary_env("MORI_IO_RDMA_MR_CHUNK_SIZE", "64"):
+        initiator, target = create_connected_engine_pair(
+            "chunked_multhd",
+            qp_per_transfer=2,
+            post_batch_size=-1,
+            num_worker_threads=2,
+            enable_notification=True,
+        )
+        initiator_mem = None
+        target_mem = None
+        sess = None
+
+        try:
+            total_bytes = 512
+            initiator_tensor = torch.arange(
+                total_bytes, dtype=torch.uint8, device=torch.device("cuda", 0)
+            )
+            target_tensor = torch.full(
+                (total_bytes,), 0x11, dtype=torch.uint8, device=torch.device("cuda", 1)
+            )
+            target_before = target_tensor.clone()
+
+            initiator_mem, target_mem = register_explicit_mem(
+                (initiator, target), initiator_tensor, target_tensor
+            )
+
+            sess = initiator.create_session(initiator_mem, target_mem)
+            assert sess is not None
+            assert sess.alive()
+
+            offsets = [16, 112, 208, 304]
+            sizes = [96, 96, 96, 96]
+            transfer_uid = sess.allocate_transfer_uid()
+            status = sess.batch_write(offsets, offsets, sizes, transfer_uid)
+
+            wait_status(status)
+            assert status.Succeeded(), status.Message()
+
+            inbound = wait_inbound_status_with_timeout(
+                target, initiator.get_engine_desc().key, transfer_uid, timeout_s=3.0
+            )
+            assert (
+                inbound is not None
+            ), "Expected inbound notification for chunked multithread batch"
+            assert inbound.Succeeded(), inbound.Message()
+
+            expected_target = target_before.clone()
+            for offset, size in zip(offsets, sizes):
+                expected_target[offset : offset + size] = initiator_tensor[
+                    offset : offset + size
+                ]
+            assert torch.equal(target_tensor.cpu(), expected_target.cpu())
+        finally:
+            del sess
+            cleanup_engine_pair(initiator, target, [initiator_mem], [target_mem])
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
+def test_rdma_chunked_session_invalidates_on_deregister_and_reregisters_same_tensor():
+    with temporary_env("MORI_IO_RDMA_MR_CHUNK_SIZE", "64"):
+        initiator, target = create_connected_engine_pair(
+            "chunked_reregister",
+            qp_per_transfer=2,
+            post_batch_size=-1,
+            num_worker_threads=1,
+            enable_notification=True,
+        )
+        initiator_mem = None
+        re_registered_mem = None
+        target_mem = None
+        sess = None
+        recovered_sess = None
+
+        try:
+            total_bytes = 256
+            initiator_tensor = torch.arange(
+                total_bytes, dtype=torch.uint8, device=torch.device("cuda", 0)
+            )
+            target_tensor = torch.zeros(
+                total_bytes, dtype=torch.uint8, device=torch.device("cuda", 1)
+            )
+
+            initiator_mem, target_mem = register_explicit_mem(
+                (initiator, target), initiator_tensor, target_tensor
+            )
+
+            sess = initiator.create_session(initiator_mem, target_mem)
+            assert sess is not None
+            assert sess.alive()
+
+            first_uid = sess.allocate_transfer_uid()
+            first_status = sess.write(0, 0, total_bytes, first_uid)
+            wait_status(first_status)
+            assert first_status.Succeeded(), first_status.Message()
+            inbound = wait_inbound_status_with_timeout(
+                target, initiator.get_engine_desc().key, first_uid, timeout_s=3.0
+            )
+            assert inbound is not None
+            assert inbound.Succeeded(), inbound.Message()
+            assert torch.equal(initiator_tensor.cpu(), target_tensor.cpu())
+
+            target_tensor.zero_()
+            initiator.deregister_memory(initiator_mem)
+            initiator_mem = None
+
+            assert not sess.alive()
+            stale_uid = sess.allocate_transfer_uid()
+            stale_status = sess.write(0, 0, total_bytes, stale_uid)
+            assert stale_status.Failed()
+            assert stale_status.Code() == StatusCode.ERR_INVALID_ARGS
+            assert "deregistered" in stale_status.Message().lower()
+
+            re_registered_mem = initiator.register_torch_tensor(initiator_tensor)
+            assert re_registered_mem.data == initiator_tensor.data_ptr()
+
+            recovered_sess = initiator.create_session(re_registered_mem, target_mem)
+            assert recovered_sess is not None
+            assert recovered_sess.alive()
+
+            recovered_uid = recovered_sess.allocate_transfer_uid()
+            recovered_status = recovered_sess.write(0, 0, total_bytes, recovered_uid)
+            wait_status(recovered_status)
+            assert recovered_status.Succeeded(), recovered_status.Message()
+            inbound = wait_inbound_status_with_timeout(
+                target, initiator.get_engine_desc().key, recovered_uid, timeout_s=3.0
+            )
+            assert inbound is not None
+            assert inbound.Succeeded(), inbound.Message()
+            assert torch.equal(initiator_tensor.cpu(), target_tensor.cpu())
+        finally:
+            del sess
+            del recovered_sess
+            cleanup_engine_pair(
+                initiator, target, [initiator_mem, re_registered_mem], [target_mem]
+            )
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
+def test_rdma_chunked_inflight_dereg_keeps_registration_alive():
+    """In-flight transfers must keep their underlying chunk MRs alive even when
+    the user deregisters the local memory mid-flight.
+
+    Validates the ``CqCallbackMeta::localRegRef`` ownership anchor: if the
+    anchor is missing, deregistering the local memory (which removes the
+    manager's and session cache's references to ``RdmaLocalMemoryRegistration``)
+    would tear down the chunk MRs while WRs are still pending in the SQ, and
+    those in-flight WRs would surface ``LOC_PROT_ERR`` on completion.
+
+    With the patch, the registration object stays alive until the last
+    in-flight transfer's ``CqCallbackMeta`` is released, so all submissions
+    must complete cleanly. Re-registering the same tensor afterward must work
+    against the now-fresh MR set.
+    """
+    with temporary_env("MORI_IO_RDMA_MR_CHUNK_SIZE", "64"):
+        initiator, target = create_connected_engine_pair(
+            "chunked_inflight_dereg",
+            qp_per_transfer=2,
+            post_batch_size=-1,
+            num_worker_threads=1,
+            enable_notification=True,
+        )
+
+        initiator_mem = None
+        target_mem = None
+        re_registered_mem = None
+        recovered_sess = None
+        statuses = []
+
+        try:
+            # Force the resolved (multi-slice) path: small chunk size so each
+            # 4 KiB transfer fans out to ~64 slices, giving the SQ enough
+            # outstanding work that deregistration races with completion.
+            total_bytes = 4096
+            initiator_tensor = torch.arange(
+                total_bytes, dtype=torch.uint8, device=torch.device("cuda", 0)
+            )
+            target_tensor = torch.zeros(
+                total_bytes, dtype=torch.uint8, device=torch.device("cuda", 1)
+            )
+
+            initiator_mem, target_mem = register_explicit_mem(
+                (initiator, target), initiator_tensor, target_tensor
+            )
+
+            # Use the cached path (engine.write) on purpose: when we
+            # deregister, InvalidateSessionsForMemory drops the cache's
+            # session ref so the CqCallbackMeta::localRegRef anchor is the
+            # ONLY thing keeping the registration alive.
+            num_inflight = 64
+            for _ in range(num_inflight):
+                uid = initiator.allocate_transfer_uid()
+                statuses.append(
+                    initiator.write(initiator_mem, 0, target_mem, 0, total_bytes, uid)
+                )
+
+            # Race the deregister against the in-flight WRs. We do NOT wait
+            # before this call.
+            initiator.deregister_memory(initiator_mem)
+            initiator_mem = None  # avoid double-deregister in cleanup
+
+            # All in-flight transfers must still complete successfully. Failure
+            # here (typically with LOC_PROT_ERR) means the chunk MRs got torn
+            # down while WRs were still pending.
+            for i, s in enumerate(statuses):
+                wait_status(s)
+                assert s.Succeeded(), (
+                    f"in-flight transfer #{i} failed after dereg: "
+                    f"code={s.Code()} msg={s.Message()}"
+                )
+            # Final state of target is the last successful write.
+            assert torch.equal(initiator_tensor.cpu(), target_tensor.cpu())
+
+            # Re-registering the same tensor (same data_ptr) at this point
+            # must yield a fresh registration backed by NEW chunk MRs. With
+            # the old address-keyed mrPool, this case used to silently reuse
+            # the stale MR slot; with owned MRs each registration owns its
+            # own ibv_mr* via RAII.
+            target_tensor.zero_()
+            re_registered_mem = initiator.register_torch_tensor(initiator_tensor)
+            assert re_registered_mem.data == initiator_tensor.data_ptr()
+
+            recovered_sess = initiator.create_session(re_registered_mem, target_mem)
+            assert recovered_sess is not None
+            assert recovered_sess.alive()
+
+            recovered_uid = recovered_sess.allocate_transfer_uid()
+            recovered_status = recovered_sess.write(0, 0, total_bytes, recovered_uid)
+            wait_status(recovered_status)
+            assert recovered_status.Succeeded(), recovered_status.Message()
+            inbound = wait_inbound_status_with_timeout(
+                target,
+                initiator.get_engine_desc().key,
+                recovered_uid,
+                timeout_s=3.0,
+            )
+            assert inbound is not None
+            assert inbound.Succeeded(), inbound.Message()
+            assert torch.equal(initiator_tensor.cpu(), target_tensor.cpu())
+        finally:
+            # IMPORTANT: do not clear `statuses` until every transfer has
+            # finished waiting above. CqCallbackMeta keeps a raw pointer to
+            # each TransferStatus, so dropping a status while its WR is still
+            # pending would race with the CQ poll thread.
+            statuses.clear()
+            del recovered_sess
+            cleanup_engine_pair(
+                initiator,
+                target,
+                [initiator_mem, re_registered_mem],
+                [target_mem],
+            )
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
