@@ -593,41 +593,5 @@ __global__ void PipelinedAllReduceSdmaKernel(
 
 }
 
-// ============================================================================
-// ArLocalBlitKernel — low-CU-footprint D2D copy kernel to replace
-// hipMemcpyAsync (which runs as __amd_rocclr_copyBuffer CU blit kernel with
-// many blocks, heavily competing with reduce/GEMM for CU).
-//
-// Uses 16 B (uint4) vectorized loads+stores so a small block count can still
-// saturate HBM bandwidth. Default launch config: <<<16, 512>>> consumes
-// far less CU than stock hipMemcpyAsync (~256 blocks), freeing CU for
-// concurrent GEMM and reduce work.
-// ============================================================================
-__global__ __launch_bounds__(512)
-void ArLocalBlitKernel(void* __restrict__ dst_raw,
-                       const void* __restrict__ src_raw,
-                       size_t total_bytes) {
-  using V = uint4;  // 16 B SIMD load/store
-  const size_t vec_count = total_bytes / sizeof(V);
-  const size_t tid =
-      static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x)
-      + threadIdx.x;
-  const size_t stride =
-      static_cast<size_t>(gridDim.x) * static_cast<size_t>(blockDim.x);
-
-  const V* __restrict__ src = reinterpret_cast<const V*>(src_raw);
-  V* __restrict__ dst = reinterpret_cast<V*>(dst_raw);
-  for (size_t i = tid; i < vec_count; i += stride) {
-    dst[i] = src[i];
-  }
-  // Byte-wise tail if total_bytes not a multiple of 16.
-  const size_t tail_start = vec_count * sizeof(V);
-  const char* src_b = reinterpret_cast<const char*>(src_raw);
-  char* dst_b = reinterpret_cast<char*>(dst_raw);
-  for (size_t i = tail_start + tid; i < total_bytes; i += stride) {
-    dst_b[i] = src_b[i];
-  }
-}
-
 }  // namespace collective
 }  // namespace mori
