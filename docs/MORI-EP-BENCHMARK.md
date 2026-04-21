@@ -3,10 +3,11 @@
 ## Table of Contents
 
 - [Intra-node](#intra-node)
+  - [Profiling intranode kernels](#profiling-intranode-kernels)
 - [Inter-node](#inter-node)
-- [NIC Selection](#nic-selection)
-- [Bandwidth Computation](#bandwidth-computation)
-- [Profiling EP Kernels](#profiling-ep-kernels)
+  - [NIC Selection](#nic-selection)
+  - [Bandwidth Computation](#bandwidth-computation)
+  - [Profiling Internode Kernels](#profiling-internode-kernels)
 
 ## Intra-node
 
@@ -17,6 +18,31 @@ export PYTHONPATH=/path/to/mori:$PYTHONPATH
 # Benchmark performance
 python3 tests/python/ops/bench_dispatch_combine.py
 ```
+
+### Profiling intranode kernels
+
+**1. Build with profiler enabled**
+
+```bash
+ENABLE_PROFILER=ON pip3 install -e . --no-build-isolation -v
+```
+
+**2. Clear the JIT cache**
+
+```bash
+rm -rf ~/.mori
+```
+
+**3. Run the profiling job**
+
+```bash
+export ENABLE_PROFILER=ON
+
+torchrun --nnodes=1 --nproc_per_node=8 \
+    tests/python/ops/bench_dispatch_combine.py --cmd profile
+```
+
+Traces land as `trace_intranode_rank<rank>_<timestamp>.json` in the current working directory — one file per rank.  Open them in [Perfetto UI](https://ui.perfetto.dev) or analyze with `analyze_ep_kernel_trace.py` as described in the [Profiling EP Kernels](#profiling-ep-kernels) section.
 
 ## Inter-node
 
@@ -37,7 +63,7 @@ The output includes total number of tokens received, total number of RDMA tokens
 RDMA BW = Total BW × (RDMA tokens / Total tokens)
 ```
 
-## NIC Selection
+### NIC Selection
 
 For RoCE networks, you can specify which RDMA devices to use with the `MORI_RDMA_DEVICES` environment variable:
 
@@ -45,7 +71,7 @@ For RoCE networks, you can specify which RDMA devices to use with the `MORI_RDMA
 - **Exclude devices**: `MORI_RDMA_DEVICES=^mlx5_2,mlx5_3` (use `^` prefix to exclude specified devices)
 - **Default**: If not set, all available RDMA devices will be used
 
-## Bandwidth Computation
+### Bandwidth Computation
 
 Two fabrics are measured: **RDMA** (inter-node) and **NVL/XGMI** (intra-node).
 
@@ -350,7 +376,7 @@ if __name__ == '__main__':
 
 ---
 
-## Profiling EP Kernels
+### Profiling Internode Kernels
 
 Mori ships a profiler that emits Perfetto-compatible JSON traces for each EP kernel invocation.
 
