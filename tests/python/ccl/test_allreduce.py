@@ -990,6 +990,11 @@ def _bench_overlap_one_size(
     # the AR kernel will hang forever on scatter/AG signal waits because
     # peers never submit their corresponding SDMA ops.
     # ------------------------------------------------------------------
+    # phase_target_stage controls WHICH AR kernel gets its phase timestamps
+    # read. default 0 (AR[0], cold path); set via --ar-phase-stage=N to
+    # instrument AR[N] and compare (e.g. AR[2] as "warm/no-GEMM-contention").
+    import os as _os_mod
+    phase_target_stage = int(_os_mod.environ.get("MORI_PHASE_TARGET_STAGE", "0"))
     if ar_phase_timing and ar_obj is not None and use_overlap:
         try:
             n_samples = 5
@@ -1006,64 +1011,59 @@ def _bench_overlap_one_size(
             except Exception:
                 pass
 
+            if rank == 0 and phase_target_stage != 0:
+                print(f"  [phase-timing] targeting AR[{phase_target_stage}] "
+                      f"(set via MORI_PHASE_TARGET_STAGE)", flush=True)
+
             for _sample in range(n_samples):
-                # Sync all ranks before each sample so AR[0] cold path is
+                # Sync all ranks before each sample so cold path is
                 # measured from the same starting point on every PE.
                 torch.cuda.synchronize()
                 prep_ar()
                 torch.cuda.synchronize()
                 dist.barrier()
 
-                ev_g0_s = torch.cuda.Event(enable_timing=True)
-                ev_g0_e = torch.cuda.Event(enable_timing=True)
-                ev_ar0_s = torch.cuda.Event(enable_timing=True)
-                ev_ar0_e = torch.cuda.Event(enable_timing=True)
+                tgt_ar_s = torch.cuda.Event(enable_timing=True)
+                tgt_ar_e = torch.cuda.Event(enable_timing=True)
 
-                # Enable phase timing + copy timing ONLY for AR[0]'s submit.
-                # Disable right after so AR[1..N-1] don't overwrite buffers
-                # in the class (both are single-slot per AR call).
-                ar_obj.enable_phase_timing(True)
-                try:
-                    ar_obj.enable_copy_timing(True)
-                except Exception:
-                    pass
-                ev_g0_s.record(stream_gemm)
-                with torch.cuda.stream(stream_gemm):
-                    _run_gemm()
-                ev_g0_e.record(stream_gemm)
-                stream_ar.wait_event(ev_g0_e)
-                ev_ar0_s.record(stream_ar)
-                with torch.cuda.stream(stream_ar):
-                    launch_ar()       # AR[0] submitted with phase_ts_d_
-                ev_ar0_e.record(stream_ar)
-                ar_obj.enable_phase_timing(False)  # must disable BEFORE submitting AR[1+]
-                try:
-                    ar_obj.enable_copy_timing(False)
-                except Exception:
-                    pass
+                # Iterate over all stages; only enable phase+copy timing
+                # exactly at stage == phase_target_stage. Pattern matches
+                # the main overlap loop so scheduling state at the target
+                # stage reproduces the real-run condition.
+                for s in range(num_stages):
+                    if s == phase_target_stage:
+                        ar_obj.enable_phase_timing(True)
+                        try:
+                            ar_obj.enable_copy_timing(True)
+                        except Exception:
+                            pass
 
-                # Immediately submit AR[1..N-1] (no phase timing). This
-                # reproduces real overlap-loop state where AR[0] runs with
-                # AR[1+] already queued on stream_ar — the key scheduling
-                # condition we're trying to diagnose.
-                for s in range(1, num_stages):
-                    tmp_ev = torch.cuda.Event()
+                    tmp_g_ev = torch.cuda.Event()
                     with torch.cuda.stream(stream_gemm):
                         _run_gemm()
-                    tmp_ev.record(stream_gemm)
-                    stream_ar.wait_event(tmp_ev)
+                    tmp_g_ev.record(stream_gemm)
+                    stream_ar.wait_event(tmp_g_ev)
+
+                    if s == phase_target_stage:
+                        tgt_ar_s.record(stream_ar)
                     with torch.cuda.stream(stream_ar):
                         launch_ar()
+                    if s == phase_target_stage:
+                        tgt_ar_e.record(stream_ar)
+                        ar_obj.enable_phase_timing(False)
+                        try:
+                            ar_obj.enable_copy_timing(False)
+                        except Exception:
+                            pass
 
-                # Sync everything, then read AR[0]'s phase timestamps (buffer
-                # is intact because only AR[0] had phase_ts != nullptr).
+                # Sync everything, then read target stage's phase timestamps.
                 stream_ar.synchronize()
                 stream_gemm.synchronize()
                 dist.barrier()
                 ts = ar_obj.get_phase_timestamps()
                 last_nc = ar_obj.get_last_num_chunks()
 
-                # Read copy timing for AR[0] (stream already synced above).
+                # Read copy timing for target stage.
                 try:
                     ct = ar_obj.get_copy_timing_ms()
                     if len(ct) == 2 and rank == 0:
@@ -1072,8 +1072,8 @@ def _bench_overlap_one_size(
                     pass
 
                 if rank == 0:
-                    # Convert raw cycles to ms using AR[0] event duration as anchor.
-                    ar0_dur_ms = ev_ar0_s.elapsed_time(ev_ar0_e)
+                    # Convert raw cycles to ms using target AR event duration.
+                    ar0_dur_ms = tgt_ar_s.elapsed_time(tgt_ar_e)
                     stage_med_ar0.append(ar0_dur_ms)
                     entry_cy = ts[0]
                     exit_cy = ts[3 + 3 * last_nc]
@@ -1112,11 +1112,11 @@ def _bench_overlap_one_size(
                 phase_keys = list(all_phase_deltas[0].keys())
                 med = {k: _st.median([d[k] for d in all_phase_deltas]) for k in phase_keys}
                 ar0_med = _st.median(stage_med_ar0)
-                print(f"\n  === AR[0] Phase Breakdown [{timeline_label}]  "
+                print(f"\n  === AR[{phase_target_stage}] Phase Breakdown [{timeline_label}]  "
                       f"N={num_stages}  numChunks={last_nc}  "
                       f"(median of {n_samples} samples, ms) ===")
                 print(f"  --- Block 0 (scatter/barrier/AG-submit orchestration) ---")
-                print(f"  AR[0] total (event):                  {ar0_med:7.3f} ms")
+                print(f"  AR[{phase_target_stage}] total (event):                  {ar0_med:7.3f} ms")
                 print(f"  sum of block-0 phase deltas:          "
                       f"{sum(med.values()):7.3f} ms")
                 for k, v in med.items():
