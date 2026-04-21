@@ -27,8 +27,10 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "umbp/common/config.h"
 #include "umbp/distributed/types.h"
 
 namespace mori::umbp {
@@ -44,18 +46,13 @@ struct ClientRegistryConfig {
   std::chrono::seconds finalized_record_ttl{120};
   uint32_t max_missed_heartbeats = 3;
 
-  // Default DRAM/HBM page_size used by every PageBitmapAllocator the
-  // registry creates when the registering Client does not specify its own
-  // (RegisterClientRequest.dram_page_size == 0).  All nodes within the same
-  // tier must agree on page_size.
+  // Sole source of truth for the DRAM/HBM page_size used by every
+  // PageBitmapAllocator the registry creates when the registering Client
+  // did not specify its own (RegisterClientRequest.dram_page_size == 0).
+  // All nodes within the same tier must agree on page_size.  Upper layers
+  // (UMBPDistributedConfig / PoolClientConfig) default their
+  // `dram_page_size` to 0 and rely on this value to materialize.
   uint64_t default_dram_page_size = 2ULL * 1024 * 1024;  // 2 MiB
-};
-
-struct MasterClientConfig {
-  std::string master_address;
-  std::string node_id;
-  std::string node_address;
-  bool auto_heartbeat = true;
 };
 
 struct EvictionConfig {
@@ -86,10 +83,8 @@ struct ExportableSsd {
 };
 
 struct PoolClientConfig {
-  MasterClientConfig master_config;
-
-  std::string io_engine_host;
-  uint16_t io_engine_port = 0;
+  UMBPMasterClientConfig master_config;
+  UMBPIoEngineConfig io_engine;
 
   size_t staging_buffer_size = 64ULL * 1024 * 1024;
 
@@ -102,9 +97,34 @@ struct PoolClientConfig {
 
   // Page size used by Master's PageBitmapAllocator for this node's DRAM/HBM
   // tier.  Reported via RegisterClient.  Same value applies to both DRAM
-  // and HBM.  Master's ClientRegistry falls back to its own
-  // `default_dram_page_size` if this is left at 0.  Defaults to 2 MiB.
-  uint64_t dram_page_size = 2ULL * 1024 * 1024;
+  // and HBM.  Forwarded unmodified to MasterClient::RegisterSelf by
+  // PoolClient::Init — PoolClient MUST NOT substitute a default here.
+  // 0 = delegate to Master's ClientRegistryConfig::default_dram_page_size
+  // (2 MiB by default).  Set to an explicit byte count to override.
+  uint64_t dram_page_size = 0;
 };
+
+// Lower a user-facing UMBPDistributedConfig to the internal PoolClientConfig.
+// Kept as a free function (not a member of UMBPDistributedConfig) so that
+// common/config.h does not need to include distributed/config.h — the
+// dependency is one-directional: distributed/config.h -> common/config.h.
+// DRAM buffers and tier capacities are caller-supplied because they live in
+// DistributedClient (pool mmap'd memory), not in the user-facing config.
+inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
+                                           std::vector<ExportableDram> dram_buffers,
+                                           std::map<TierType, TierCapacity> tier_capacities) {
+  PoolClientConfig pc;
+  pc.master_config = dc.master_config;
+  pc.io_engine = dc.io_engine;
+  pc.staging_buffer_size = dc.staging_buffer_size;
+  pc.peer_service_port = dc.peer_service_port;
+  // 0 propagates through PoolClient -> MasterClient::RegisterSelf ->
+  // proto -> ClientRegistry, where it is interpreted as "use the
+  // registry-wide default_dram_page_size".
+  pc.dram_page_size = dc.dram_page_size;
+  pc.dram_buffers = std::move(dram_buffers);
+  pc.tier_capacities = std::move(tier_capacities);
+  return pc;
+}
 
 }  // namespace mori::umbp

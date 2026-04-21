@@ -42,7 +42,7 @@ static void FillProtoLocation(const Location& location, ::umbp::Location* proto_
   proto_location->set_tier(static_cast<::umbp::TierType>(location.tier));
 }
 
-MasterClient::MasterClient(const MasterClientConfig& config)
+MasterClient::MasterClient(const UMBPMasterClientConfig& config)
     : config_(config),
       stub_(nullptr, [](void* p) { delete static_cast<::umbp::UMBPMaster::Stub*>(p); }) {
   channel_ = grpc::CreateChannel(config.master_address, grpc::InsecureChannelCredentials());
