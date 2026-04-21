@@ -214,13 +214,14 @@ def main():
 
     all_usages = []
     scanned_files = 0
-    for cpp_file in source_dir.rglob("*.cpp"):
-        scanned_files += 1
-        usages = extract_slots_from_file(cpp_file)
-        if usages:
-            unique_slots = len(set(u.slot_name for u in usages))
-            print(f"  ✓ {cpp_file.relative_to(source_dir)}: {unique_slots} slot(s)")
-            all_usages.extend(usages)
+    for pattern in ("*.cpp", "*.hpp"):
+        for cpp_file in source_dir.rglob(pattern):
+            scanned_files += 1
+            usages = extract_slots_from_file(cpp_file)
+            if usages:
+                unique_slots = len(set(u.slot_name for u in usages))
+                print(f"  ✓ {cpp_file.relative_to(source_dir)}: {unique_slots} slot(s)")
+                all_usages.extend(usages)
 
     print(f"\n  Scanned {scanned_files} file(s), found {len(all_usages)} slot usage(s)")
 
