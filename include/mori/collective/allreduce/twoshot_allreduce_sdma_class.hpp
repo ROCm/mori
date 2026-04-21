@@ -80,20 +80,6 @@ class AllreduceSdma {
   hipStream_t async_stream_;
   double async_start_time_;
 
-  // Dedicated stream for transit->user output copy (hipMemcpyAsync).
-  // The copy uses the same underlying __amd_rocclr_copyBuffer CU blit kernel
-  // but on a separate stream, so copy[s] can overlap with GEMM[s+1] on
-  // stream_gemm instead of extending stream_ar's critical path.
-  // Ordering is enforced by events:
-  //   - ar_done_event_: recorded on main (ar) stream after AR kernel,
-  //     waited on copy_stream_ before launching the copy
-  //   - copy_done_event_: recorded on copy_stream_ after the copy,
-  //     waited on main stream so the next pipelined() call's AR cannot
-  //     overwrite transit before the previous copy has read it
-  hipStream_t copy_stream_ = nullptr;
-  hipEvent_t ar_done_event_ = nullptr;
-  hipEvent_t copy_done_event_ = nullptr;
-
   // Copy mode flag: if true, copy output_transit_buffer to user output buffer
   // if false, user should directly use output_transit_buffer
   bool copy_output_to_user_;

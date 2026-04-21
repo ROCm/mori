@@ -136,30 +136,12 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t /*input_buffer_size*/
     }
   }
 
-  // Create a dedicated non-blocking stream + events for transit->user copy.
-  // Lets copy[s] overlap with GEMM[s+1] on stream_gemm instead of extending
-  // the main stream_ar critical path.
-  hipError_t ce = hipStreamCreateWithFlags(&copy_stream_, hipStreamNonBlocking);
-  if (ce != hipSuccess) {
-    fprintf(stderr, "PE %d: hipStreamCreateWithFlags failed: %s\n",
-            myPe_, hipGetErrorString(ce));
-    throw std::runtime_error("Failed to create copy_stream");
-  }
-  ce = hipEventCreateWithFlags(&ar_done_event_, hipEventDisableTiming);
-  if (ce != hipSuccess)
-    throw std::runtime_error("Failed to create ar_done_event");
-  ce = hipEventCreateWithFlags(&copy_done_event_, hipEventDisableTiming);
-  if (ce != hipSuccess)
-    throw std::runtime_error("Failed to create copy_done_event");
-
   printf("AllreduceSdma(SDMA) initialized: PE %d of %d, max_blocks=%d\n", myPe_, npes_,
          max_blocks_);
   printf("  Flags: %zu bytes at %p\n", flagsSize, flags_.get());
   printf("  Barrier: %zu bytes at %p\n", barrierSize, bMem);
   printf("  Output transit buffer: %.2f MB at %p\n",
          output_transit_buffer_size_ / (1024.0 * 1024.0), output_transit_buffer_);
-  printf("  Copy stream: %p, events: ar_done=%p copy_done=%p\n",
-         copy_stream_, ar_done_event_, copy_done_event_);
 }
 
 // ---------------------------------------------------------------------------
@@ -174,18 +156,6 @@ AllreduceSdma<T>::~AllreduceSdma() {
   if (phase_ts_d_) {
     hipFree(phase_ts_d_);
     phase_ts_d_ = nullptr;
-  }
-  if (copy_done_event_) {
-    hipEventDestroy(copy_done_event_);
-    copy_done_event_ = nullptr;
-  }
-  if (ar_done_event_) {
-    hipEventDestroy(ar_done_event_);
-    ar_done_event_ = nullptr;
-  }
-  if (copy_stream_) {
-    hipStreamDestroy(copy_stream_);
-    copy_stream_ = nullptr;
   }
   if (flags_) {
     printf("AllreduceSdma destroyed: PE %d\n", myPe_);
@@ -326,73 +296,19 @@ void AllreduceSdma<T>::copy_input_to_transit(T* input, size_t total_count, hipSt
 
 // copy_output_to_user implementation
 // For AllReduce: output is total_count elements (same size as input, NOT npes * total_count)
-//
-// Runs hipMemcpyAsync (which executes as __amd_rocclr_copyBuffer CU blit kernel)
-// on a dedicated copy_stream_ so it can overlap with subsequent GEMM work on
-// stream_gemm, instead of extending the main stream's critical path.
-// Event dependency chain:
-//   main -> ar_done_event_ -> copy_stream_ -> hipMemcpyAsync ->
-//         copy_done_event_ -> main (so next AR waits for copy to finish
-//                              before overwriting transit buffer)
 template <typename T>
 void AllreduceSdma<T>::copy_output_to_user(T* output, size_t total_count, hipStream_t stream) {
   size_t bytes = total_count * dtype_size_;
   if (!output) throw std::runtime_error("Output pointer is null");
   if (!output_transit_buffer_) throw std::runtime_error("Output transit buffer is null");
 
-  if (stream != nullptr && copy_stream_ != nullptr &&
-      ar_done_event_ != nullptr && copy_done_event_ != nullptr) {
-    // 1. On main stream: signal AR kernel completed (transit has valid data).
-    hipError_t err = hipEventRecord(ar_done_event_, stream);
-    if (err != hipSuccess) {
-      fprintf(stderr, "PE %d: hipEventRecord(ar_done) failed: %s\n",
-              myPe_, hipGetErrorString(err));
-      throw std::runtime_error("copy_output_to_user: event record failed");
-    }
-    // 2. copy_stream waits for AR kernel to finish.
-    err = hipStreamWaitEvent(copy_stream_, ar_done_event_, 0);
-    if (err != hipSuccess) {
-      fprintf(stderr, "PE %d: hipStreamWaitEvent(copy_stream, ar_done) failed: %s\n",
-              myPe_, hipGetErrorString(err));
-      throw std::runtime_error("copy_output_to_user: wait event failed");
-    }
-    // 3. Launch copy on copy_stream (runs as CU blit kernel but on a
-    //    separate stream, so it can overlap with GEMM on stream_gemm).
-    err = hipMemcpyAsync(output, output_transit_buffer_, bytes,
-                         hipMemcpyDeviceToDevice, copy_stream_);
-    if (err != hipSuccess) {
-      fprintf(stderr, "PE %d: hipMemcpyAsync on copy_stream failed: %s\n",
-              myPe_, hipGetErrorString(err));
-      throw std::runtime_error("Output copy failed");
-    }
-    // 4. Signal copy complete on copy_stream.
-    err = hipEventRecord(copy_done_event_, copy_stream_);
-    if (err != hipSuccess) {
-      fprintf(stderr, "PE %d: hipEventRecord(copy_done) failed: %s\n",
-              myPe_, hipGetErrorString(err));
-      throw std::runtime_error("copy_output_to_user: copy_done record failed");
-    }
-    // 5. Main stream waits for copy to finish. This ensures the next
-    //    pipelined() call's AR kernel (which writes transit) won't start
-    //    until the previous copy (which reads transit) is done.
-    err = hipStreamWaitEvent(stream, copy_done_event_, 0);
-    if (err != hipSuccess) {
-      fprintf(stderr, "PE %d: hipStreamWaitEvent(main, copy_done) failed: %s\n",
-              myPe_, hipGetErrorString(err));
-      throw std::runtime_error("copy_output_to_user: main wait failed");
-    }
-  } else {
-    // Fallback: synchronous D2D on main stream.
-    hipError_t err =
-        stream
-            ? hipMemcpyAsync(output, output_transit_buffer_, bytes,
-                             hipMemcpyDeviceToDevice, stream)
-            : hipMemcpy(output, output_transit_buffer_, bytes, hipMemcpyDeviceToDevice);
-    if (err != hipSuccess) {
-      fprintf(stderr, "PE %d: copy_output_to_user fallback failed: %s\n",
-              myPe_, hipGetErrorString(err));
-      throw std::runtime_error("Output copy failed");
-    }
+  hipError_t err =
+      stream
+          ? hipMemcpyAsync(output, output_transit_buffer_, bytes, hipMemcpyDeviceToDevice, stream)
+          : hipMemcpy(output, output_transit_buffer_, bytes, hipMemcpyDeviceToDevice);
+  if (err != hipSuccess) {
+    fprintf(stderr, "PE %d: copy_output_to_user failed: %s\n", myPe_, hipGetErrorString(err));
+    throw std::runtime_error("Output copy failed");
   }
 }
 
