@@ -158,9 +158,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
     uint64_t scatterBase,
     uint64_t agBase,
     uint64_t reduceCompleteBase,
-    uint64_t* phase_ts,
-    T* userOutputPtr,
-    uint64_t localCopyBase) {
+    uint64_t* phase_ts) {
 
   ar_write_phase_ts(phase_ts, 0);  // phase 0: kernel entry
 
@@ -501,45 +499,6 @@ __global__ void PipelinedAllReduceSdmaKernel(
         }
         ar_write_phase_ts(phase_ts, 5);  // AG wait done (single-chunk, numChunks=1)
 
-      }
-
-      // ==============================================================
-      // In-kernel local SDMA copy: transit → user output.
-      // Replaces host-side hipMemcpyAsync (which runs as CU blit kernel
-      // __amd_rocclr_copyBuffer, competing with GEMM/reduce for CU).
-      // This path uses qId=2 (scatter=0, AG=1), submits a local SDMA put
-      // (src & dst both on self GPU). Only block 0 thread 0 submits;
-      // spin-waits self-signal until completion, then exits block 0.
-      //
-      // Enabled when userOutputPtr != nullptr AND numQ >= 3.
-      // Host must pass nullptr to skip (e.g., copy_output_to_user=false
-      // or scatter_mode=1 legacy path).
-      // ==============================================================
-      if (userOutputPtr != nullptr && numQ >= 3 && npes > 1) {
-        if (thr == 0) {
-          constexpr uint32_t kLocalCopyQId = 2u;
-          // SDMA queues are all allocated on the local GPU regardless of the
-          // peer index (see anvil.cpp hsaKmtCreateQueueExt with localNodeId).
-          // Reusing a non-self peer's queue handle array is safe; qId=2 does
-          // not conflict with scatter (qId=0) or AG (qId=1) on that queue.
-          const int queuePe = (myPe + 1) % npes;
-          anvil::SdmaQueueDeviceHandle** dh_local =
-              dstMemObj->deviceHandles_d + static_cast<size_t>(queuePe) * numQ;
-          // Signal lives in local signal space; use myPe*numQ slot so no
-          // cross-rank writer targets it (scatter/AG from peers go to
-          // sender*numQ+{0,1} with sender != myPe).
-          HSAuint64* selfSig = dstMemObj->signalPtrs
-              + static_cast<size_t>(myPe) * numQ;
-          uint8_t* src = reinterpret_cast<uint8_t*>(dstMemObj->localPtr);
-          uint8_t* dst = reinterpret_cast<uint8_t*>(userOutputPtr);
-          const size_t copyBytes =
-              static_cast<size_t>(npes) * totalShardBytes;
-          core::SdmaPutThread(src, dst, copyBytes, dh_local, selfSig, numQ,
-                              kLocalCopyQId);
-          const uint64_t expected = localCopyBase + 1ULL;
-          while (core::AtomicLoadRelaxed(selfSig + kLocalCopyQId) < expected)
-            __builtin_amdgcn_s_sleep(1);
-        }
       }
 
       ar_write_phase_ts(phase_ts, 3 + 3 * numChunks);  // block 0 exit

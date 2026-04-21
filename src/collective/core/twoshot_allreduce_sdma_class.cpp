@@ -614,27 +614,18 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         uint64_t scatter_base = pipeline_scatter_gen_;
         uint64_t ag_base      = pipeline_ag_gen_;
         uint64_t reduce_complete_base = pipeline_reduce_gen_;
-        uint64_t local_copy_base = pipeline_local_copy_gen_;
 
         // Phase timing buffer (nullptr unless instrumentation enabled).
         // Block 0 thread 0 writes __builtin_amdgcn_s_memtime() at each phase.
         uint64_t* phase_ts_ptr = phase_timing_enabled_ ? phase_ts_d_ : nullptr;
         last_num_chunks_ = numChunks_host;
 
-        // In-kernel local SDMA copy (transit -> user output) avoids CU blit
-        // kernel contention that hipMemcpyAsync would introduce on the main
-        // stream. Enabled only for scatter_mode=0 + copy_output_to_user_=true,
-        // since scatter_mode=1 path has different completion semantics.
-        const bool use_in_kernel_copy = copy_output_to_user_ && (scatter_mode == 0);
-        T* user_out_ptr = use_in_kernel_copy ? output : nullptr;
-
         if (scatter_mode == 1) {
             PipelinedAllReduceSdmaKernel<T, 1><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
                 barrierPtr_, inputSymmObj, total_count, chunk_elems,
-                scatter_base, ag_base, reduce_complete_base, phase_ts_ptr,
-                /*userOutputPtr=*/nullptr, /*localCopyBase=*/0ULL);
+                scatter_base, ag_base, reduce_complete_base, phase_ts_ptr);
         } else if (external_scatter) {
             ScatterSdmaOnlyKernel<T><<<1, 512, 0, stream>>>(
                 myPe_, npes_, input, output_transit_buffer_obj_,
@@ -646,8 +637,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                     output_transit_buffer_obj_, flagsObj_,
                     barrierPtr_, application::SymmMemObjPtr{},
                     total_count, chunk_elems, scatter_base, ag_base,
-                    reduce_complete_base, phase_ts_ptr,
-                    user_out_ptr, local_copy_base);
+                    reduce_complete_base, phase_ts_ptr);
             } else {
                 PipelinedAllReduceSdmaKernel<T, 0, false, true>
                     <<<blocks, threads, 0, stream>>>(
@@ -655,31 +645,25 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                     output_transit_buffer_obj_, flagsObj_,
                     barrierPtr_, application::SymmMemObjPtr{},
                     total_count, chunk_elems, scatter_base, ag_base,
-                    reduce_complete_base, phase_ts_ptr,
-                    user_out_ptr, local_copy_base);
+                    reduce_complete_base, phase_ts_ptr);
             }
         } else if (multi_chunk) {
             PipelinedAllReduceSdmaKernel<T, 0, true><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
                 barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems,
-                scatter_base, ag_base, reduce_complete_base, phase_ts_ptr,
-                user_out_ptr, local_copy_base);
+                scatter_base, ag_base, reduce_complete_base, phase_ts_ptr);
         } else {
             PipelinedAllReduceSdmaKernel<T, 0, false><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
                 barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems,
-                scatter_base, ag_base, reduce_complete_base, phase_ts_ptr,
-                user_out_ptr, local_copy_base);
+                scatter_base, ag_base, reduce_complete_base, phase_ts_ptr);
         }
 
         pipeline_scatter_gen_ += numChunks_host;   // scatter SDMA only (qId=0)
         pipeline_ag_gen_      += numChunks_host;   // AG SDMA (qId=1)
         pipeline_reduce_gen_  += numChunks_host;   // reduce_complete via flags
-        if (use_in_kernel_copy) {
-            pipeline_local_copy_gen_ += 1;          // kernel did 1 local SDMA put on qId=2
-        }
 
         hipError_t err = hipGetLastError();
         if (err != hipSuccess) {
@@ -688,9 +672,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             return false;
         }
 
-        // If the kernel did the local transit->user copy itself, skip the host-side
-        // hipMemcpyAsync (which would run as __amd_rocclr_copyBuffer blit on CU).
-        if (copy_output_to_user_ && !use_in_kernel_copy) {
+        if (copy_output_to_user_) {
             copy_output_to_user(output, total_count, stream);
         }
     } catch (const std::exception& e) {

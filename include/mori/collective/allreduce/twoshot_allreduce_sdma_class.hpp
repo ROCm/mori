@@ -91,7 +91,6 @@ class AllreduceSdma {
   uint64_t pipeline_scatter_gen_ = 0;  // total SDMA ATOMIC_INC on qId=0 (scatter only)
   uint64_t pipeline_ag_gen_ = 0;       // total SDMA ATOMIC_INC on qId=1 (pipeline AG only)
   uint64_t pipeline_reduce_gen_ = 0;   // reduce_complete counter via flagsMemObj (per-chunk barrier)
-  uint64_t pipeline_local_copy_gen_ = 0;  // total SDMA ATOMIC_INC on qId=2 (in-kernel local copy)
 
   // Phase-level timestamp instrumentation (optional, diagnostic).
   // When enabled, block 0 thread 0 of PipelinedAllReduceSdmaKernel writes
