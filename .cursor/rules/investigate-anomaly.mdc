@@ -1,0 +1,43 @@
+---
+description: 发现异常数据必须定位到具体机制；用 timestamp/instrumentation 追细节；一次性收集所有相关日志
+alwaysApply: true
+---
+
+# 异常数据必须定位到机制
+
+## 触发条件
+
+遇到以下任一立即启动定位流程，不得跳过：
+
+- 实测数字偏离理论模型（例：AR[0] 比 steady AR 多 1 ms）
+- 同一指标随参数呈现跳变 / outlier / 不合理分布（例：N=2 → N=3 的 +0.58 ms）
+- 任何"跟公式对不上的 ms / 百分比 / 计数"
+
+## 硬性规则
+
+1. **禁止用委婉词绕过异常**：不得写"可能是冷启动 / L2 cold / 大概 / 应该 / 估计"。必须明说"我不知道 X，要加 [timestamp / instrumentation / trace] 定位"。
+2. **必须追到具体机制才停手**：定位手段（按需逐级加强）：
+   - (a) 现有 log / 测量工具里找更细粒度数据
+   - (b) 加代码 instrumentation（timestamp、phase marker、counter）
+   - (c) 上 profiler（rocprof / nsight / perf）
+   - (d) 改测量代码分 phase 单独测
+3. **细节清单必须完整**：分析前先列出**所有**实测数据点，每条要么能解释、要么明确标"未定位，需 [具体方法] 验证"。不允许只挑关键数据讲、绕开 outlier。
+4. **一次搜索所有相关证据**：定位问题时不看一个 log 就下结论。一次扫完所有相关 log / transcript / CSV / commit message / 代码路径，把候选证据都摆出来再收敛。
+
+## 定位流程模板
+
+对一个异常（例：AR[0] extra = 1.05 ms）：
+
+1. **量化**：实测 = X，预期 = Y，差 = Z
+2. **列所有候选假设** + 每个假设的 signature
+3. **给出区分方法**：哪个数据 / 命令 / 工具能 confirm 或 reject 每个假设
+4. **执行取证**
+5. **只保留被证据支撑的一个解释**，其他明确 reject（不能并列保留）
+
+## 反模式
+
+| 错误 | 正确 |
+|------|------|
+| "AR[0] 多 1 ms 可能是冷 cache" | "AR[0] 多 1 ms，未定位，加 phase-level timestamp 区分 scatter/barrier/AG 哪一段" |
+| "2-stage 下 SDMA 赢大概是因为 overlap 效率" | 先把 wall = GEMM[0] + AR[0] + AR[1] 精确分解，看差值来自哪段 |
+| 只看最近一份 transcript / log | 列出所有 transcript、log、CSV、commit，逐份扫完再下结论 |
