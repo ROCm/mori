@@ -93,17 +93,26 @@ struct UMBPCopyPipelineConfig {
   size_t batch_max_ops = 128;
 };
 
-// User-facing distributed configuration. Set UMBPConfig::distributed to enable
-// distributed mode. Internally translated to PoolClientConfig by DistributedClient.
-struct UMBPDistributedConfig {
+// Master-control-plane client parameters.  Shared between user-facing
+// UMBPDistributedConfig and the internal PoolClientConfig/MasterClient.
+struct UMBPMasterClientConfig {
   std::string master_address;  // e.g. "master-host:50051"
   std::string node_id;         // unique node identifier
   std::string node_address;    // this node's reachable address for peers
-
   bool auto_heartbeat = true;  // start heartbeat thread on Init
+};
 
-  std::string io_engine_host;   // RDMA engine hostname
-  uint16_t io_engine_port = 0;  // RDMA engine port (0 = no RDMA)
+// RDMA IO-engine endpoint parameters.
+struct UMBPIoEngineConfig {
+  std::string host;   // RDMA engine hostname (formerly UMBPDistributedConfig::io_engine_host)
+  uint16_t port = 0;  // RDMA engine port; 0 = no RDMA (formerly io_engine_port)
+};
+
+// User-facing distributed configuration. Set UMBPConfig::distributed to enable
+// distributed mode. Internally translated to PoolClientConfig by DistributedClient.
+struct UMBPDistributedConfig {
+  UMBPMasterClientConfig master_config;
+  UMBPIoEngineConfig io_engine;
 
   size_t staging_buffer_size = 64ULL * 1024 * 1024;  // 64 MB
 
@@ -113,10 +122,11 @@ struct UMBPDistributedConfig {
 
   // Page size used by Master's PageBitmapAllocator for this node's DRAM/HBM
   // tier.  Reported via RegisterClient.  Same value applies to both DRAM
-  // and HBM.  Master's ClientRegistry falls back to its own
-  // `default_dram_page_size` if this is left at 0.  Defaults to 2 MiB.
-  // Forwarded to PoolClientConfig::dram_page_size by DistributedClient.
-  uint64_t dram_page_size = 2ULL * 1024 * 1024;
+  // and HBM.  Forwarded to PoolClientConfig::dram_page_size by
+  // DistributedClient unmodified.
+  // 0 = delegate to Master's ClientRegistryConfig::default_dram_page_size
+  // (2 MiB by default).  Set to an explicit byte count to override.
+  uint64_t dram_page_size = 0;
 };
 
 struct UMBPConfig {
@@ -206,16 +216,18 @@ struct UMBPConfig {
     }
     if (distributed.has_value()) {
       const auto& d = distributed.value();
-      if (d.master_address.empty()) {
-        if (error_message) *error_message = "distributed.master_address must not be empty";
+      if (d.master_config.master_address.empty()) {
+        if (error_message)
+          *error_message = "distributed.master_config.master_address must not be empty";
         return false;
       }
-      if (d.node_id.empty()) {
-        if (error_message) *error_message = "distributed.node_id must not be empty";
+      if (d.master_config.node_id.empty()) {
+        if (error_message) *error_message = "distributed.master_config.node_id must not be empty";
         return false;
       }
-      if (d.node_address.empty()) {
-        if (error_message) *error_message = "distributed.node_address must not be empty";
+      if (d.master_config.node_address.empty()) {
+        if (error_message)
+          *error_message = "distributed.master_config.node_address must not be empty";
         return false;
       }
     }
