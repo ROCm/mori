@@ -53,6 +53,9 @@ static_assert(kMaxPipelineBlocks <= 385,
 //   2 + 3*c + {0,1,2}: chunk c {compute-wait, cross-PE-barrier, AG-submit} done
 //   2 + 3*numChunks:   AG wait done (all peers)
 //   3 + 3*numChunks:   block 0 exit
+//   --- post-AG wait instrumentation (E' prototype) ---
+//   30: block 0 post_ag_flag set (after AG wait done, before block 0 exit)
+//   31: compute block 1 post_ag_flag observed (spin-wait finished)
 static constexpr int kArPhaseTsCapacity = 32;
 
 __device__ inline void ar_write_phase_ts(uint64_t* ts, int idx) {
@@ -158,7 +161,13 @@ __global__ void PipelinedAllReduceSdmaKernel(
     uint64_t scatterBase,
     uint64_t agBase,
     uint64_t reduceCompleteBase,
-    uint64_t* phase_ts) {
+    uint64_t* phase_ts,
+    uint32_t* post_ag_flag /* nullptr = old behavior; non-null = Stage 1 E'
+                              prototype: compute blocks stay alive after
+                              reduce until block 0 sets this flag (after AG
+                              wait done). Used to measure how much CU
+                              occupancy during AG wait costs the overlap
+                              benchmark (GEMM variability, wall time). */ ) {
 
   ar_write_phase_ts(phase_ts, 0);  // phase 0: kernel entry
 
@@ -323,6 +332,24 @@ __global__ void PipelinedAllReduceSdmaKernel(
         __hip_atomic_fetch_add(&barrier->chunks_complete, 1u,
                                __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
       }
+
+      // ---- Stage 1 E' prototype: compute blocks wait for block 0's AG
+      // wait to complete (do not exit CU early). This measures the cost
+      // of compute blocks staying alive during AG wait; no copy is done
+      // here yet (that comes in Stage 2 once this cost is confirmed
+      // acceptable via real wall measurement). ----------------------
+      if (post_ag_flag != nullptr) {
+        if (threadIdx.x == 0) {
+          while (__hip_atomic_load_n(
+                     post_ag_flag,
+                     __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) == 0) {
+            __builtin_amdgcn_s_sleep(2);
+          }
+        }
+        __syncthreads();
+        ar_write_phase_ts_cb1(phase_ts, 31);  // post_ag_flag observed
+      }
+
       ar_write_phase_ts_cb1(phase_ts, 11 + 3 * numChunks);  // compute block exit
 
     } else {
@@ -444,6 +471,15 @@ __global__ void PipelinedAllReduceSdmaKernel(
             __builtin_amdgcn_s_sleep(1);
         }
         ar_write_phase_ts(phase_ts, 2 + 3 * numChunks);  // AG wait done (all peers)
+
+        // Stage 1 E' prototype: release compute blocks that were
+        // spin-waiting post-reduce.
+        if (post_ag_flag != nullptr && threadIdx.x == 0) {
+          __threadfence();
+          __hip_atomic_store_n(post_ag_flag, 1u,
+                               __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+          ar_write_phase_ts(phase_ts, 30);  // post_ag_flag set
+        }
       } else {
         // Single-chunk AG. Same barrier requirement as MULTI_CHUNK.
         const uint32_t ccTarget =
@@ -499,6 +535,13 @@ __global__ void PipelinedAllReduceSdmaKernel(
         }
         ar_write_phase_ts(phase_ts, 5);  // AG wait done (single-chunk, numChunks=1)
 
+        // Stage 1 E' prototype (single-chunk path).
+        if (post_ag_flag != nullptr && threadIdx.x == 0) {
+          __threadfence();
+          __hip_atomic_store_n(post_ag_flag, 1u,
+                               __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+          ar_write_phase_ts(phase_ts, 30);  // post_ag_flag set
+        }
       }
 
       ar_write_phase_ts(phase_ts, 3 + 3 * numChunks);  // block 0 exit

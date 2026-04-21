@@ -114,6 +114,19 @@ class AllreduceSdma {
   double copy_timing_host_us_ = 0.0;   // populated each copy_output_to_user() call
   bool copy_timing_recorded_ = false;  // indicates events were submitted
 
+  // ---------------------------------------------------------------------
+  // Post-AG wait prototype (Stage 1 of E' — in-kernel post-AG CU copy).
+  // When post_ag_wait_enabled_ is true, kernel launches are given a device
+  // uint32 flag buffer. Compute blocks wait on this flag after their
+  // reduce phase (instead of exiting early); block 0 sets the flag once
+  // AG wait completes. Stage 1 does NOT do any copy yet — it only measures
+  // how much "compute blocks stay alive during AG wait" costs in terms of
+  // wall time and GEMM interference. If the cost is acceptable, Stage 2
+  // adds the in-kernel transit→user_output copy inside the post-AG phase.
+  // ---------------------------------------------------------------------
+  bool post_ag_wait_enabled_ = false;
+  uint32_t* post_ag_flag_d_ = nullptr;  // device uint32, reset to 0 each call
+
   AllreduceSdma(const AllreduceSdma&) = delete;
   AllreduceSdma& operator=(const AllreduceSdma&) = delete;
 
@@ -238,6 +251,13 @@ class AllreduceSdma {
   bool is_copy_timing_enabled() const { return copy_timing_enabled_; }
   std::vector<double> get_copy_timing_ms();
   int get_copy_timing_last_num_chunks() const { return 1; }
+
+  // --- Post-AG wait prototype (Stage 1 of E') ---
+  // Toggle whether compute blocks stay alive waiting for AG done.
+  // Stage 1: compute blocks just spin and exit (cost measurement).
+  // Stage 2 (future): compute blocks do in-kernel copy during the spin.
+  void enable_post_ag_wait(bool on);
+  bool is_post_ag_wait_enabled() const { return post_ag_wait_enabled_; }
 };
 
 }  // namespace collective

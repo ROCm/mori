@@ -385,3 +385,14 @@ class AllreduceSdma:
         """Baseline always returns 1 (single copy). Reserved for path B to
         indicate number of chunked copies."""
         return self._handle.get_copy_timing_last_num_chunks()
+
+    def enable_post_ag_wait(self, on: bool):
+        """Stage 1 of E' prototype: compute blocks stay alive during AG wait.
+
+        When enabled, AR kernel's compute blocks (block 1..N) do NOT exit
+        after their reduce phase; instead they spin-wait on a device flag
+        that block 0 sets once AG wait completes. This is a cost-measurement
+        step — no in-kernel copy is performed yet. Compare wall time with
+        and without to see if compute blocks holding CUs hurts overlap.
+        """
+        self._handle.enable_post_ag_wait(on)

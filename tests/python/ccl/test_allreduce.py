@@ -1269,6 +1269,15 @@ def _test_multi_stage_overlap(
                                    output_buffer_size=max_out_size,
                                    copy_output_to_user=_copy_user,
                                    dtype=dtype)
+            # Stage 1 E' prototype: compute blocks stay alive during AG wait.
+            # Enable via env MORI_POST_AG_WAIT=1 (off by default).
+            if os.environ.get("MORI_POST_AG_WAIT", "0") == "1":
+                try:
+                    ar_obj.enable_post_ag_wait(True)
+                except Exception as e:
+                    if rank == 0:
+                        print(f"  [warn] enable_post_ag_wait failed: {e}",
+                              flush=True)
             torch.cuda.synchronize(); dist.barrier()
             if rank == 0:
                 print(" ok", flush=True)

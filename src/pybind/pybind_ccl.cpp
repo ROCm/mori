@@ -240,7 +240,12 @@ void RegisterMoriCcl(pybind11::module_& m) {
            "single hipMemcpyAsync in copy_output_to_user)")
       .def("get_copy_timing_last_num_chunks",
            &mori::collective::AllreduceSdma<uint32_t>::get_copy_timing_last_num_chunks,
-           "Baseline always returns 1 (copy is a single call, not chunked)");
+           "Baseline always returns 1 (copy is a single call, not chunked)")
+      .def("enable_post_ag_wait",
+           &mori::collective::AllreduceSdma<uint32_t>::enable_post_ag_wait,
+           py::arg("on"),
+           "Stage 1 of E' prototype: compute blocks wait for AG done "
+           "instead of exiting; measures CU occupancy cost");
 
   // =========================================================================
   // AllreduceSdma (fp16)
@@ -291,7 +296,9 @@ void RegisterMoriCcl(pybind11::module_& m) {
       .def("get_copy_timing_ms",
            &mori::collective::AllreduceSdma<half>::get_copy_timing_ms)
       .def("get_copy_timing_last_num_chunks",
-           &mori::collective::AllreduceSdma<half>::get_copy_timing_last_num_chunks);
+           &mori::collective::AllreduceSdma<half>::get_copy_timing_last_num_chunks)
+      .def("enable_post_ag_wait",
+           &mori::collective::AllreduceSdma<half>::enable_post_ag_wait, py::arg("on"));
 
   // =========================================================================
   // AllreduceSdma (bf16)
@@ -345,6 +352,9 @@ void RegisterMoriCcl(pybind11::module_& m) {
       .def("get_copy_timing_ms",
            &mori::collective::AllreduceSdma<hip_bfloat16>::get_copy_timing_ms)
       .def("get_copy_timing_last_num_chunks",
-           &mori::collective::AllreduceSdma<hip_bfloat16>::get_copy_timing_last_num_chunks);
+           &mori::collective::AllreduceSdma<hip_bfloat16>::get_copy_timing_last_num_chunks)
+      .def("enable_post_ag_wait",
+           &mori::collective::AllreduceSdma<hip_bfloat16>::enable_post_ag_wait,
+           py::arg("on"));
 }
 }  // namespace mori
