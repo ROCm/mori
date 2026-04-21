@@ -209,7 +209,11 @@ void AllreduceSdma<T>::enable_copy_timing(bool on) {
 template <typename T>
 std::vector<double> AllreduceSdma<T>::get_copy_timing_ms() {
   std::vector<double> out;
-  if (!copy_timing_enabled_ || !copy_timing_recorded_) return out;
+  // Do NOT gate on copy_timing_enabled_ here: callers typically disable the
+  // flag before reading (to stop subsequent kernels from overwriting events)
+  // and only the "recorded" flag reflects whether events hold valid data.
+  if (!copy_timing_recorded_) return out;
+  if (copy_start_event_ == nullptr || copy_end_event_ == nullptr) return out;
   float ms = 0.0f;
   hipError_t e = hipEventElapsedTime(&ms, copy_start_event_, copy_end_event_);
   out.push_back(copy_timing_host_us_);
