@@ -58,6 +58,33 @@ alwaysApply: true
 - 用的测量方法是否能反映真实行为？（e.g. `hipMemcpyAsync` 真走 SDMA 还是 CU blit？有没有 trace 验证？）
 - 是否还有根本性机制（内存访问模式 / 调度方式 / 内存拓扑）没看过？
 
+### R7. 性能对比只看"与当前主 API 同语义"的路径
+
+当前 SDMA AllReduce 的主 API = `copy_output_to_user=True` 路径：用户传自己的
+output tensor，AR 调用返回后**直接从该 output tensor 读结果**。这条路径才是对标
+RCCL `dist.all_reduce(tensor)` 的 drop-in 替代语义。
+
+**禁止**把下列路径拿来当"已超 RCCL"的证据或收工理由：
+
+- ❌ `copy_output_to_user=False` + `get_output_transit_buffer()` 读结果
+  - 理由：该 API 要求用户框架层感知 transit buffer、手动替换 tensor 来源、
+    处理 ownership / 生命周期；**不是 RCCL 的 drop-in replacement**，违反
+    "对标 RCCL 使用方式"的前提。
+- ❌ "no-copy 模式 wall 7.xxx ms 已经超 RCCL" 类陈述
+  - 理由：该模式用户 output tensor 未被写入，结果不在用户 tensor 里，不是可用 API 形态。
+- ❌ 任何要求调用方代码修改 / 替换 tensor 指针 / 额外 sync / 额外 register 步骤的
+  "优化"方案都不算达标。
+
+**只接受**下列作为"目标已达成"的证据：
+
+- ✅ 默认调用 `AllreduceSdma(copy_output_to_user=True)(input, output, ...)` 后，
+  output tensor 立刻可用，且 multi-stage overlap wall < RCCL wall
+- ✅ 内部实现可以任意改（double-buffer / 独立 stream / kernel 改写 / lazy shmem
+  register 用户 output 等），**但对用户调用方必须零感知、零代码改动**。
+
+**任何"规避"这条规则的措辞（"只需要用户稍微改一下 API 调用"、"这个开销 user
+也能接受"）都视为违规，必须重新读这条规则**。
+
 ## 工作流模板（每轮都走这个）
 
 ```
