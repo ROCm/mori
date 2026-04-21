@@ -57,6 +57,13 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
   pc_config.dram_buffers = {{dram_pool_, dram_pool_size_}};
   pc_config.tier_capacities[TierType::DRAM] = {dram_pool_size_, dram_pool_size_};
   pc_config.peer_service_port = dc.peer_service_port;
+  // Forward the per-node DRAM/HBM page size override to PoolClient so it
+  // reaches the Master's PageBitmapAllocator at RegisterClient time.  When
+  // dc.dram_page_size == 0, the Master falls back to its registry-wide
+  // ClientRegistryConfig::default_dram_page_size (2 MiB).
+  if (dc.dram_page_size > 0) {
+    pc_config.dram_page_size = dc.dram_page_size;
+  }
 
   pool_client_ = std::make_unique<PoolClient>(std::move(pc_config));
   if (!pool_client_->Init()) {

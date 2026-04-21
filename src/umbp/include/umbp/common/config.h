@@ -110,6 +110,13 @@ struct UMBPDistributedConfig {
   uint16_t peer_service_port = 0;  // gRPC peer service port
 
   bool cache_remote_fetches = true;  // cache remotely-fetched blocks locally
+
+  // Page size used by Master's PageBitmapAllocator for this node's DRAM/HBM
+  // tier.  Reported via RegisterClient.  Same value applies to both DRAM
+  // and HBM.  Master's ClientRegistry falls back to its own
+  // `default_dram_page_size` if this is left at 0.  Defaults to 2 MiB.
+  // Forwarded to PoolClientConfig::dram_page_size by DistributedClient.
+  uint64_t dram_page_size = 2ULL * 1024 * 1024;
 };
 
 struct UMBPConfig {
