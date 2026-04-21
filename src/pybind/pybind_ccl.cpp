@@ -229,7 +229,17 @@ void RegisterMoriCcl(pybind11::module_& m) {
       .def("get_last_num_chunks",
            &mori::collective::AllreduceSdma<uint32_t>::get_last_num_chunks,
            "Return numChunks used by the most recent pipelined() call; "
-           "needed to parse the phase_timestamps layout");
+           "needed to parse the phase_timestamps layout")
+      .def("enable_copy_timing",
+           &mori::collective::AllreduceSdma<uint32_t>::enable_copy_timing,
+           py::arg("on"),
+           "Enable per-chunk copy-pipeline timing (waitValue32/hipMemcpy2DAsync)")
+      .def("get_copy_timing_ms",
+           &mori::collective::AllreduceSdma<uint32_t>::get_copy_timing_ms,
+           "Return per-chunk copy timings from most recent pipelined() call; "
+           "layout per chunk: [host_wait_us, gpu_wait_ms, host_copy_us, gpu_copy_ms]")
+      .def("get_copy_timing_last_num_chunks",
+           &mori::collective::AllreduceSdma<uint32_t>::get_copy_timing_last_num_chunks);
 
   // =========================================================================
   // AllreduceSdma (fp16)
@@ -274,7 +284,13 @@ void RegisterMoriCcl(pybind11::module_& m) {
       .def("get_phase_timestamps",
            &mori::collective::AllreduceSdma<half>::get_phase_timestamps)
       .def("get_last_num_chunks",
-           &mori::collective::AllreduceSdma<half>::get_last_num_chunks);
+           &mori::collective::AllreduceSdma<half>::get_last_num_chunks)
+      .def("enable_copy_timing",
+           &mori::collective::AllreduceSdma<half>::enable_copy_timing, py::arg("on"))
+      .def("get_copy_timing_ms",
+           &mori::collective::AllreduceSdma<half>::get_copy_timing_ms)
+      .def("get_copy_timing_last_num_chunks",
+           &mori::collective::AllreduceSdma<half>::get_copy_timing_last_num_chunks);
 
   // =========================================================================
   // AllreduceSdma (bf16)
@@ -321,6 +337,13 @@ void RegisterMoriCcl(pybind11::module_& m) {
       .def("get_phase_timestamps",
            &mori::collective::AllreduceSdma<hip_bfloat16>::get_phase_timestamps)
       .def("get_last_num_chunks",
-           &mori::collective::AllreduceSdma<hip_bfloat16>::get_last_num_chunks);
+           &mori::collective::AllreduceSdma<hip_bfloat16>::get_last_num_chunks)
+      .def("enable_copy_timing",
+           &mori::collective::AllreduceSdma<hip_bfloat16>::enable_copy_timing,
+           py::arg("on"))
+      .def("get_copy_timing_ms",
+           &mori::collective::AllreduceSdma<hip_bfloat16>::get_copy_timing_ms)
+      .def("get_copy_timing_last_num_chunks",
+           &mori::collective::AllreduceSdma<hip_bfloat16>::get_copy_timing_last_num_chunks);
 }
 }  // namespace mori
