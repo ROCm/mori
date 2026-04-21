@@ -985,25 +985,29 @@ def _bench_overlap_one_size(
     # ------------------------------------------------------------------
     # AR-kernel phase-level breakdown (SDMA only; requires rebuilt kernel)
     #
-    # Runs one extra overlap iteration with phase-timing enabled for AR[0],
-    # then disables timing and runs the remaining AR[1..N-1] normally. AR[0]
-    # phase timestamps are memcpy'd to host right after stream_ar sync so
-    # subsequent AR kernels cannot overwrite them.
+    # COLLECTIVE: every rank must participate in the AR launch; only rank 0
+    # reads/prints its own phase_ts buffer. Without collective participation
+    # the AR kernel will hang forever on scatter/AG signal waits because
+    # peers never submit their corresponding SDMA ops.
     # ------------------------------------------------------------------
-    if ar_phase_timing and rank == 0 and ar_obj is not None and use_overlap:
+    if ar_phase_timing and ar_obj is not None and use_overlap:
         try:
-            # Aggregate 5 samples so per-phase delta is less noisy.
             n_samples = 5
-            all_phase_deltas = []  # list of (dict phase_name -> ms) per sample
-            stage_med_ar0 = []     # AR[0] duration reported by event timeline
+            all_phase_deltas = []   # only populated on rank 0
+            stage_med_ar0 = []      # only populated on rank 0
 
             for _sample in range(n_samples):
+                # Sync all ranks before each sample so AR[0] cold path is
+                # measured from the same starting point on every PE.
                 torch.cuda.synchronize()
                 prep_ar()
                 torch.cuda.synchronize()
-                # Enable phase timing for AR[0] only
+                dist.barrier()
+
+                # All ranks enable phase timing (rank-local buffer on each).
                 ar_obj.enable_phase_timing(True)
-                # Run GEMM[0] + AR[0], sync, then disable, then continue
+
+                # GEMM[0] on stream_gemm, AR[0] on stream_ar, like overlap loop.
                 ev_g0_s = torch.cuda.Event(enable_timing=True)
                 ev_g0_e = torch.cuda.Event(enable_timing=True)
                 ev_ar0_s = torch.cuda.Event(enable_timing=True)
@@ -1017,11 +1021,14 @@ def _bench_overlap_one_size(
                 with torch.cuda.stream(stream_ar):
                     launch_ar()
                 ev_ar0_e.record(stream_ar)
-                stream_ar.synchronize()  # AR[0] done, phase_ts_d_ has data
+                stream_ar.synchronize()  # AR[0] done; phase_ts_d_ now has data
+
+                # Read own rank's timestamps BEFORE AR[1] can overwrite.
                 ts = ar_obj.get_phase_timestamps()
                 last_nc = ar_obj.get_last_num_chunks()
                 ar_obj.enable_phase_timing(False)
-                # Continue AR[1..N-1] normally (untimed) to drain pipeline
+
+                # All ranks: continue AR[1..N-1] untimed to drain pipeline.
                 for s in range(1, num_stages):
                     tmp_ev = torch.cuda.Event()
                     with torch.cuda.stream(stream_gemm):
@@ -1032,50 +1039,46 @@ def _bench_overlap_one_size(
                         launch_ar()
                 stream_ar.synchronize()
                 stream_gemm.synchronize()
+                dist.barrier()
 
-                # Convert raw cycles to ms using AR[0] event-measured duration as anchor
-                ar0_dur_ms = ev_ar0_s.elapsed_time(ev_ar0_e)  # ms (torch event = ms)
-                stage_med_ar0.append(ar0_dur_ms)
-                entry_cy = ts[0]
-                exit_cy = ts[3 + 3 * last_nc]
-                total_cy = exit_cy - entry_cy if exit_cy > entry_cy else 1
-                # tick-to-ms conversion: total_cy ticks → ar0_dur_ms (≈ kernel wall)
-                cy_to_ms = ar0_dur_ms / float(total_cy) if total_cy > 0 else 0.0
+                if rank == 0:
+                    # Convert raw cycles to ms using AR[0] event duration as anchor.
+                    ar0_dur_ms = ev_ar0_s.elapsed_time(ev_ar0_e)
+                    stage_med_ar0.append(ar0_dur_ms)
+                    entry_cy = ts[0]
+                    exit_cy = ts[3 + 3 * last_nc]
+                    total_cy = exit_cy - entry_cy if exit_cy > entry_cy else 1
+                    cy_to_ms = ar0_dur_ms / float(total_cy) if total_cy > 0 else 0.0
 
-                # Build per-phase breakdown (ms)
-                phases = {}
-                # phase 0 = entry, phase 1 = scatter_done,
-                # for c in 0..nc-1: phase 2+3c+0/1/2 = compute-wait/barrier/ag-submit,
-                # phase 2+3nc = ag-wait-done, phase 3+3nc = exit
-                phases["entry→scatter_done"] = (ts[1] - ts[0]) * cy_to_ms
-                for c in range(last_nc):
-                    prev = ts[1] if c == 0 else ts[2 + 3 * (c - 1) + 2]
-                    phases[f"c{c}:scatter→compute-wait"] = (ts[2 + 3 * c + 0] - prev) * cy_to_ms
-                    phases[f"c{c}:compute-wait→barrier"] = (ts[2 + 3 * c + 1] - ts[2 + 3 * c + 0]) * cy_to_ms
-                    phases[f"c{c}:barrier→AG-submit"] = (ts[2 + 3 * c + 2] - ts[2 + 3 * c + 1]) * cy_to_ms
-                phases[f"AG-submit→AG-wait-done"] = (ts[2 + 3 * last_nc] - ts[2 + 3 * (last_nc - 1) + 2]) * cy_to_ms
-                phases["AG-wait-done→exit"] = (ts[3 + 3 * last_nc] - ts[2 + 3 * last_nc]) * cy_to_ms
-                all_phase_deltas.append(phases)
+                    phases = {}
+                    phases["entry→scatter_done"] = (ts[1] - ts[0]) * cy_to_ms
+                    for c in range(last_nc):
+                        prev = ts[1] if c == 0 else ts[2 + 3 * (c - 1) + 2]
+                        phases[f"c{c}:scatter→compute-wait"] = (ts[2 + 3 * c + 0] - prev) * cy_to_ms
+                        phases[f"c{c}:compute-wait→barrier"] = (ts[2 + 3 * c + 1] - ts[2 + 3 * c + 0]) * cy_to_ms
+                        phases[f"c{c}:barrier→AG-submit"] = (ts[2 + 3 * c + 2] - ts[2 + 3 * c + 1]) * cy_to_ms
+                    phases[f"AG-submit→AG-wait-done"] = (ts[2 + 3 * last_nc] - ts[2 + 3 * (last_nc - 1) + 2]) * cy_to_ms
+                    phases["AG-wait-done→exit"] = (ts[3 + 3 * last_nc] - ts[2 + 3 * last_nc]) * cy_to_ms
+                    all_phase_deltas.append(phases)
 
-            import statistics as _st
-
-            # Median across samples
-            phase_keys = list(all_phase_deltas[0].keys())
-            med = {k: _st.median([d[k] for d in all_phase_deltas]) for k in phase_keys}
-            ar0_med = _st.median(stage_med_ar0)
-
-            print(f"\n  === AR[0] Phase Breakdown [{timeline_label}]  "
-                  f"N={num_stages}  numChunks={last_nc}  "
-                  f"(median of {n_samples} samples, ms) ===")
-            print(f"  AR[0] total (event):                  {ar0_med:7.3f} ms")
-            print(f"  sum of phase deltas:                  "
-                  f"{sum(med.values()):7.3f} ms")
-            print(f"  ----- phase breakdown -----")
-            for k, v in med.items():
-                print(f"    {k:<35s} {v:7.3f} ms")
-            print()
+            if rank == 0 and len(all_phase_deltas) > 0:
+                import statistics as _st
+                phase_keys = list(all_phase_deltas[0].keys())
+                med = {k: _st.median([d[k] for d in all_phase_deltas]) for k in phase_keys}
+                ar0_med = _st.median(stage_med_ar0)
+                print(f"\n  === AR[0] Phase Breakdown [{timeline_label}]  "
+                      f"N={num_stages}  numChunks={last_nc}  "
+                      f"(median of {n_samples} samples, ms) ===")
+                print(f"  AR[0] total (event):                  {ar0_med:7.3f} ms")
+                print(f"  sum of phase deltas:                  "
+                      f"{sum(med.values()):7.3f} ms")
+                print(f"  ----- phase breakdown -----")
+                for k, v in med.items():
+                    print(f"    {k:<35s} {v:7.3f} ms")
+                print()
         except Exception as e:
-            print(f"  [WARN] phase-timing failed: {e}")
+            if rank == 0:
+                print(f"  [WARN] phase-timing failed: {e}")
             try:
                 ar_obj.enable_phase_timing(False)
             except Exception:
