@@ -175,6 +175,82 @@ AllreduceSdma<T>::~AllreduceSdma() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// D' prototype: lazy shmem-register user output buffer
+// ---------------------------------------------------------------------------
+template <typename T>
+void AllreduceSdma<T>::enable_register_user_output(bool on) {
+  if (on == register_user_output_enabled_) return;
+  register_user_output_enabled_ = on;
+  if (on) {
+    printf("PE %d: register_user_output ENABLED (D' lazy shmem register, "
+           "cache cap=%zu)\n", myPe_, kUserOutputCacheCap);
+  }
+}
+
+template <typename T>
+bool AllreduceSdma<T>::register_user_output(void* ptr, size_t size) {
+  if (ptr == nullptr || size == 0) {
+    last_register_us_ = 0.0;
+    last_register_was_hit_ = false;
+    return false;
+  }
+  UserOutputCacheKey key{ptr, size};
+
+  auto it = user_output_cache_.find(key);
+  if (it != user_output_cache_.end() && it->second.IsValid()) {
+    // Cache hit: move to MRU front
+    user_output_cache_lru_.remove(key);
+    user_output_cache_lru_.push_front(key);
+    last_register_us_ = 0.0;
+    last_register_was_hit_ = true;
+    cache_hits_++;
+    return true;
+  }
+
+  // Cache miss: collective register.
+  auto t0 = std::chrono::steady_clock::now();
+  application::SymmMemObjPtr obj = shmem::ShmemSymmetricRegister(ptr, size);
+  auto t1 = std::chrono::steady_clock::now();
+  last_register_us_ =
+      std::chrono::duration<double, std::micro>(t1 - t0).count();
+  last_register_was_hit_ = false;
+  cache_misses_++;
+
+  if (!obj.IsValid()) {
+    fprintf(stderr, "PE %d: ShmemSymmetricRegister(user output %p, %zu bytes) "
+                    "failed (invalid obj after %.2f us)\n",
+            myPe_, ptr, size, last_register_us_);
+    return false;
+  }
+
+  // Insert into cache with LRU eviction.
+  while (user_output_cache_.size() >= kUserOutputCacheCap
+         && !user_output_cache_lru_.empty()) {
+    auto evict_key = user_output_cache_lru_.back();
+    user_output_cache_lru_.pop_back();
+    auto ev = user_output_cache_.find(evict_key);
+    if (ev != user_output_cache_.end()) {
+      // Deregistering is a collective; for safety in this prototype we
+      // just drop the handle (shmem will still hold peer mappings until
+      // shutdown). An explicit Deregister call would be nicer but
+      // complicates the host path; leave as TODO.
+      user_output_cache_.erase(ev);
+    }
+  }
+
+  user_output_cache_[key] = obj;
+  user_output_cache_lru_.push_front(key);
+  if (myPe_ == 0) {
+    printf("PE 0: user output register MISS (ptr=%p, size=%zu, %.1f us); "
+           "cache now size=%zu, hits=%llu, misses=%llu\n",
+           ptr, size, last_register_us_, user_output_cache_.size(),
+           (unsigned long long)cache_hits_,
+           (unsigned long long)cache_misses_);
+  }
+  return true;
+}
+
 template <typename T>
 void AllreduceSdma<T>::enable_post_ag_wait(bool on) {
   if (on == post_ag_wait_enabled_) return;

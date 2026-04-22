@@ -27,7 +27,9 @@
 #include <mpi.h>
 
 #include <cstdint>
+#include <list>
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 #include "mori/application/application.hpp"
@@ -126,6 +128,50 @@ class AllreduceSdma {
   // ---------------------------------------------------------------------
   bool post_ag_wait_enabled_ = false;
   uint32_t* post_ag_flag_d_ = nullptr;  // device uint32, reset to 0 each call
+
+  // ---------------------------------------------------------------------
+  // D' prototype: lazy-register user output buffer as shmem symmetric
+  // memory so AR kernel can AG directly to it, skipping the transit
+  // buffer AND the external hipMemcpyAsync entirely.
+  //
+  // Register is a collective call (3 allgathers + IPC open over N peers),
+  // so it is expensive (~ms). We maintain a small LRU cache keyed by
+  // the user output ptr + size. When the same output is reused across
+  // calls (typical in training loops), the cache hits and the fast path
+  // costs 0 extra host time.
+  //
+  // When register_user_output_enabled_ is true AND the cache lookup
+  // returns a valid SymmMemObj, pipelined() uses it as the kernel's
+  // destination symm obj instead of output_transit_buffer_obj_. Otherwise
+  // falls back to the transit + copy_output_to_user path (baseline).
+  //
+  // Cache size is intentionally small (LRU) to bound VRAM metadata
+  // overhead; only a few distinct output ptrs are usually seen.
+  // ---------------------------------------------------------------------
+  bool register_user_output_enabled_ = false;
+  static constexpr size_t kUserOutputCacheCap = 4;
+  struct UserOutputCacheKey {
+    void* ptr;
+    size_t size;
+    bool operator==(const UserOutputCacheKey& o) const {
+      return ptr == o.ptr && size == o.size;
+    }
+  };
+  struct UserOutputCacheKeyHash {
+    size_t operator()(const UserOutputCacheKey& k) const noexcept {
+      return std::hash<void*>()(k.ptr) ^ (std::hash<size_t>()(k.size) << 1);
+    }
+  };
+  std::unordered_map<UserOutputCacheKey,
+                     application::SymmMemObjPtr,
+                     UserOutputCacheKeyHash> user_output_cache_;
+  std::list<UserOutputCacheKey> user_output_cache_lru_;  // front = MRU
+
+  // Instrumentation: last register() / lookup stats
+  double last_register_us_ = 0.0;       // host wall of most recent register
+  bool last_register_was_hit_ = false;  // true = cache hit, false = miss (did register)
+  uint64_t cache_hits_ = 0;
+  uint64_t cache_misses_ = 0;
 
   AllreduceSdma(const AllreduceSdma&) = delete;
   AllreduceSdma& operator=(const AllreduceSdma&) = delete;
@@ -258,6 +304,27 @@ class AllreduceSdma {
   // Stage 2 (future): compute blocks do in-kernel copy during the spin.
   void enable_post_ag_wait(bool on);
   bool is_post_ag_wait_enabled() const { return post_ag_wait_enabled_; }
+
+  // --- D' prototype: lazy-register user output as symm memory --------
+  // Turn on/off the fast path. When on, pipelined() tries to use the
+  // user output buffer directly as the AR kernel's destination symm
+  // memory. Register is a collective call — all ranks must enable/call
+  // with the same size for this to work (AR semantics already require
+  // symmetric output sizes, so this lines up).
+  void enable_register_user_output(bool on);
+  bool is_register_user_output_enabled() const { return register_user_output_enabled_; }
+
+  // Pre-register a user output buffer. All ranks must call collectively
+  // with the same size. Returns true on success. Caller can call this
+  // before entering the hot loop to guarantee cache hits during benchmarking.
+  bool register_user_output(void* ptr, size_t size);
+
+  // Diagnostic: read back the last register() host us (0 on cache hit),
+  // whether last lookup was a hit, and cumulative hit/miss counters.
+  double last_register_us() const { return last_register_us_; }
+  bool last_register_was_hit() const { return last_register_was_hit_; }
+  uint64_t cache_hits() const { return cache_hits_; }
+  uint64_t cache_misses() const { return cache_misses_; }
 };
 
 }  // namespace collective

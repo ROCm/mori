@@ -245,7 +245,27 @@ void RegisterMoriCcl(pybind11::module_& m) {
            &mori::collective::AllreduceSdma<uint32_t>::enable_post_ag_wait,
            py::arg("on"),
            "Stage 1 of E' prototype: compute blocks wait for AG done "
-           "instead of exiting; measures CU occupancy cost");
+           "instead of exiting; measures CU occupancy cost")
+      .def("enable_register_user_output",
+           &mori::collective::AllreduceSdma<uint32_t>::enable_register_user_output,
+           py::arg("on"),
+           "D' prototype: enable lazy-register-user-output fast path")
+      .def("register_user_output",
+           [](mori::collective::AllreduceSdma<uint32_t>& self,
+              uintptr_t ptr, size_t size) {
+             return self.register_user_output(reinterpret_cast<void*>(ptr), size);
+           },
+           py::arg("ptr"), py::arg("size"),
+           "Collective call: register a user output buffer as symm memory. "
+           "All ranks must call with the same size. Returns true on success.")
+      .def("last_register_us",
+           &mori::collective::AllreduceSdma<uint32_t>::last_register_us)
+      .def("last_register_was_hit",
+           &mori::collective::AllreduceSdma<uint32_t>::last_register_was_hit)
+      .def("cache_hits",
+           &mori::collective::AllreduceSdma<uint32_t>::cache_hits)
+      .def("cache_misses",
+           &mori::collective::AllreduceSdma<uint32_t>::cache_misses);
 
   // =========================================================================
   // AllreduceSdma (fp16)
@@ -298,7 +318,22 @@ void RegisterMoriCcl(pybind11::module_& m) {
       .def("get_copy_timing_last_num_chunks",
            &mori::collective::AllreduceSdma<half>::get_copy_timing_last_num_chunks)
       .def("enable_post_ag_wait",
-           &mori::collective::AllreduceSdma<half>::enable_post_ag_wait, py::arg("on"));
+           &mori::collective::AllreduceSdma<half>::enable_post_ag_wait, py::arg("on"))
+      .def("enable_register_user_output",
+           &mori::collective::AllreduceSdma<half>::enable_register_user_output,
+           py::arg("on"))
+      .def("register_user_output",
+           [](mori::collective::AllreduceSdma<half>& self,
+              uintptr_t ptr, size_t size) {
+             return self.register_user_output(reinterpret_cast<void*>(ptr), size);
+           },
+           py::arg("ptr"), py::arg("size"))
+      .def("last_register_us",
+           &mori::collective::AllreduceSdma<half>::last_register_us)
+      .def("cache_hits",
+           &mori::collective::AllreduceSdma<half>::cache_hits)
+      .def("cache_misses",
+           &mori::collective::AllreduceSdma<half>::cache_misses);
 
   // =========================================================================
   // AllreduceSdma (bf16)
@@ -355,6 +390,21 @@ void RegisterMoriCcl(pybind11::module_& m) {
            &mori::collective::AllreduceSdma<hip_bfloat16>::get_copy_timing_last_num_chunks)
       .def("enable_post_ag_wait",
            &mori::collective::AllreduceSdma<hip_bfloat16>::enable_post_ag_wait,
-           py::arg("on"));
+           py::arg("on"))
+      .def("enable_register_user_output",
+           &mori::collective::AllreduceSdma<hip_bfloat16>::enable_register_user_output,
+           py::arg("on"))
+      .def("register_user_output",
+           [](mori::collective::AllreduceSdma<hip_bfloat16>& self,
+              uintptr_t ptr, size_t size) {
+             return self.register_user_output(reinterpret_cast<void*>(ptr), size);
+           },
+           py::arg("ptr"), py::arg("size"))
+      .def("last_register_us",
+           &mori::collective::AllreduceSdma<hip_bfloat16>::last_register_us)
+      .def("cache_hits",
+           &mori::collective::AllreduceSdma<hip_bfloat16>::cache_hits)
+      .def("cache_misses",
+           &mori::collective::AllreduceSdma<hip_bfloat16>::cache_misses);
 }
 }  // namespace mori
