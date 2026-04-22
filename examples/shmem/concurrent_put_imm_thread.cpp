@@ -130,6 +130,8 @@ void ConcurrentPutImmThread() {
   SymmMemObjPtr buffObj1 = ShmemQueryMemObjPtr(buff1);
   assert(buffObj1.IsValid());
 
+  MPI_Barrier(MPI_COMM_WORLD);
+
   if (myPe == 0) {
     printf("Running legacy API test...\n");
   }
