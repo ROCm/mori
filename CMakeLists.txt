@@ -38,6 +38,8 @@ option(ENABLE_PROFILER "Enable kernel profiling" OFF)
 option(ENABLE_DEBUG_PRINTF "Enable debug printf in device kernels" OFF)
 option(ENABLE_STANDARD_MOE_ADAPT "Enable standard moe adapt" OFF)
 option(BUILD_OPS_DEVICE "AOT compile EP kernels to .hsaco(requires hipcc)" OFF)
+option(MORI_MULTITHREAD_SUPPORT
+       "Enable single-process multi-thread multi-GPU support in mori_shmem" OFF)
 
 # ---------------------------------------------------------------------------
 # Host NIC: all vendor-specific dv libraries (mlx5, bnxt_re, ionic) are loaded

@@ -81,41 +81,51 @@ std::string GetLocalIP() {
   return localIP;
 }
 
-std::string Context::HostName() const { return hostnames[LocalRank()]; }
-
 bool Context::CanUseP2P(int destRank) const {
   if (destRank == LocalRank()) {
     return false;  // Cannot use P2P with self
   }
-  // Check if on the same node by comparing hostnames
-  // Note: IsP2PDisabled only affects transport type selection (peerPtrs),
-  // but we still maintain P2P data path in p2pPeerPtrs
-  return HostName() == hostnames[destRank];
+  return peerInfos[destRank].sameHost;
+}
+
+bool Context::SameProcessP2P(int destRank) const {
+  if (destRank == LocalRank()) {
+    return false;
+  }
+  return peerInfos[destRank].sameProcess;
 }
 
 void Context::CollectHostNames() {
   char hostname[HOST_NAME_MAX];
   gethostname(hostname, HOST_NAME_MAX);
-
   std::string localIP = GetLocalIP();
-  std::string hostIdentifier = std::string(hostname) + ":" + localIP;
 
-  constexpr int IDENTIFIER_MAX = HOST_NAME_MAX + INET_ADDRSTRLEN;
-  std::vector<char> globalIdentifiers(IDENTIFIER_MAX * WorldSize());
-  // Create a non-const buffer for Allgather
-  char localBuffer[IDENTIFIER_MAX];
-  strncpy(localBuffer, hostIdentifier.c_str(), IDENTIFIER_MAX - 1);
-  localBuffer[IDENTIFIER_MAX - 1] = '\0';
-  bootNet.Allgather(localBuffer, globalIdentifiers.data(), IDENTIFIER_MAX);
+  // Pack pid + "hostname:ip" into a fixed-size buffer for Allgather.
+  // Using a fixed layout avoids string parsing ambiguity.
+  constexpr int kPidSize = sizeof(pid_t);
+  constexpr int kStrMax = HOST_NAME_MAX + INET_ADDRSTRLEN + 2;  // +2 for ':' and '\0'
+  constexpr int kRecordSize = kPidSize + kStrMax;
 
+  pid_t myPid = getpid();
+  char localBuffer[kRecordSize];
+  memcpy(localBuffer, &myPid, kPidSize);
+  snprintf(localBuffer + kPidSize, kStrMax, "%s:%s", hostname, localIP.c_str());
+
+  std::vector<char> global(kRecordSize * WorldSize());
+  bootNet.Allgather(localBuffer, global.data(), kRecordSize);
+
+  myHostname = std::string(localBuffer + kPidSize);
+  peerInfos.resize(WorldSize());
   for (int i = 0; i < WorldSize(); i++) {
-    hostnames.push_back(&globalIdentifiers.data()[i * IDENTIFIER_MAX]);
-  }
-
-  if (LocalRank() == 0) {
-    MORI_APP_TRACE("Collected hostnames:");
-    for (int i = 0; i < hostnames.size(); i++) {
-      MORI_APP_TRACE("  rank {}: {}", i, hostnames[i]);
+    const char* rec = global.data() + i * kRecordSize;
+    pid_t peerPid;
+    memcpy(&peerPid, rec, kPidSize);
+    std::string peerHost(rec + kPidSize);
+    peerInfos[i].sameHost = (peerHost == myHostname);
+    peerInfos[i].sameProcess = peerInfos[i].sameHost && (peerPid == myPid);
+    if (LocalRank() == 0) {
+      MORI_APP_TRACE("rank {} hostname={} pid={} sameHost={} sameProcess={}", i, peerHost, peerPid,
+                     peerInfos[i].sameHost, peerInfos[i].sameProcess);
     }
   }
 }
@@ -127,7 +137,7 @@ bool IsSDMAEnabled() { return env::IsEnvVarEnabled("MORI_ENABLE_SDMA"); }
 void Context::InitializePossibleTransports() {
   // Find my rank in node
   for (int i = 0; i <= LocalRank(); i++) {
-    if (HostName() == hostnames[i]) rankInNode++;
+    if (peerInfos[i].sameHost) rankInNode++;
   }
   assert(rankInNode < 8);
 
@@ -204,7 +214,7 @@ void Context::InitializePossibleTransports() {
   for (int i = 0; i < WorldSize(); i++) {
     // Check P2P availability
     if (!IsP2PDisabled()) {
-      if (HostName() == hostnames[i]) {
+      if (peerInfos[i].sameHost) {
         peerRankInNode++;
 
         // TODO: should use TopoSystemGpu to determine if peer access is enabled, but that requires

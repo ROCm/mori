@@ -70,6 +70,13 @@ add_shmem_example(test_p2p_direct_access SOURCES
                   shmem/test_p2p_direct_access.cpp)
 add_shmem_example(sdma_put_test SOURCES shmem/sdma_put_test.cpp)
 
+# Multi-thread multi-GPU exploration (requires MORI_MULTITHREAD_SUPPORT)
+if(MORI_MULTITHREAD_SUPPORT)
+  add_shmem_example(multithread_multi_gpu SOURCES shmem/multithread_multi_gpu.cpp)
+  target_compile_definitions(multithread_multi_gpu PRIVATE MORI_MULTITHREAD_SUPPORT)
+  target_link_libraries(multithread_multi_gpu stdc++fs)
+endif()
+
 # --- Application examples ---
 add_executable(context application/context.cpp)
 target_link_libraries(context mori_application hip::host hip::device)

@@ -66,9 +66,14 @@ class ModuleLogger {
       // Use existing logger
       logger = existing_logger;
     } else {
-      // Create new logger
-      logger = spdlog::stdout_color_mt(moduleName);
-      logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%P] [%n] [%^%l%$] %v");
+      // spdlog::stdout_color_mt throws if another thread already registered the same name
+      // between our spdlog::get() check and this call — catch and fall back to the winner.
+      try {
+        logger = spdlog::stdout_color_mt(moduleName);
+        logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%P] [%n] [%^%l%$] %v");
+      } catch (const spdlog::spdlog_ex&) {
+        logger = spdlog::get(moduleName);
+      }
     }
 
     // Determine the log level priority: env var > global setting > provided level

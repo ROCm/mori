@@ -124,11 +124,16 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
       static_cast<hipIpcMemHandle_t*>(calloc(worldSize, sizeof(hipIpcMemHandle_t)));
   bootNet.Allgather(&handle, cpuMemObj->ipcMemHandles, sizeof(hipIpcMemHandle_t));
 
-  // Open IPC handles for all same-node peers to establish P2P data path
-  // This happens regardless of transport type selection
+  // Open IPC handles for all same-node peers to establish P2P data path.
+  // Skip same-process peers: hipIpcOpenMemHandle fails within the same process;
+  // the peer's pointer is already valid and can be used directly.
   for (int i = 0; i < worldSize; i++) {
     if (!context.CanUseP2P(i)) continue;
-
+    if (context.SameProcessP2P(i)) {
+      // Direct pointer access — no IPC handle needed within the same process.
+      cpuMemObj->p2pPeerPtrs[i] = cpuMemObj->peerPtrs[i];
+      continue;
+    }
     HIP_RUNTIME_CHECK(hipIpcOpenMemHandle(reinterpret_cast<void**>(&cpuMemObj->p2pPeerPtrs[i]),
                                           cpuMemObj->ipcMemHandles[i],
                                           hipIpcMemLazyEnablePeerAccess));

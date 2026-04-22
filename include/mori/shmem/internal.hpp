@@ -21,6 +21,7 @@
 // SOFTWARE.
 #pragma once
 
+#include <array>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -81,34 +82,7 @@ struct MemoryStates {
   application::SymmMemObjPtr vmmHeapObj;  // SymmMemObj for the entire heap
 };
 
-enum ShmemStatesStatus {
-  New = 0,
-  Initialized = 1,
-  Finalized = 2,
-};
-
-struct ShmemStates {
-  ShmemStatesStatus status{ShmemStatesStatus::New};
-  ShmemMode mode{ShmemMode::StaticHeap};  // Default to static heap mode
-  BootStates* bootStates{nullptr};
-  RdmaStates* rdmaStates{nullptr};
-  MemoryStates* memoryStates{nullptr};
-
-  // This is a temporary API for debugging only
-  void CheckStatusValid() {
-    if (status == ShmemStatesStatus::New) {
-      std::cout
-          << "Shmem state is not initialized, initialize it by calling ShmemMpiInitialize first."
-          << std::endl;
-      assert(false);
-    }
-    if (status == ShmemStatesStatus::Finalized) {
-      std::cout << "Shmem state has been finalized." << std::endl;
-      assert(false);
-    }
-  }
-};
-
+// GpuStates must be declared before ModuleStates and ShmemStates which embed it.
 struct GpuStates {
   int rank{-1};
   int worldSize{-1};
@@ -124,6 +98,43 @@ struct GpuStates {
   uintptr_t heapEndAddr{0};                   // End address of symmetric heap (base + size)
   application::SymmMemObj* heapObj{nullptr};  // Pointer to the heap's SymmMemObj on device
   uint64_t* internalSyncPtr{nullptr};         // Pointer to the internal synchronization object
+};
+
+enum ShmemStatesStatus {
+  New = 0,
+  Initialized = 1,
+  Finalized = 2,
+};
+
+// Per-GPU JIT module state (HIP module handle + device symbol pointers)
+struct ModuleStates {
+  hipModule_t module{nullptr};
+  GpuStates* gpuStatesPtr{nullptr};  // device-side globalGpuStates address in JIT module
+  hipFunction_t barrierFunc{nullptr};
+};
+
+struct ShmemStates {
+  ShmemStatesStatus status{ShmemStatesStatus::New};
+  ShmemMode mode{ShmemMode::StaticHeap};  // Default to static heap mode
+  BootStates* bootStates{nullptr};
+  RdmaStates* rdmaStates{nullptr};
+  MemoryStates* memoryStates{nullptr};
+  ModuleStates moduleStates;  // JIT module state for this GPU
+  GpuStates gpuStates;        // host-side copy of device GpuStates for this GPU
+
+  // This is a temporary API for debugging only
+  void CheckStatusValid() {
+    if (status == ShmemStatesStatus::New) {
+      std::cout
+          << "Shmem state is not initialized, initialize it by calling ShmemMpiInitialize first."
+          << std::endl;
+      assert(false);
+    }
+    if (status == ShmemStatesStatus::Finalized) {
+      std::cout << "Shmem state has been finalized." << std::endl;
+      assert(false);
+    }
+  }
 };
 
 // Changed from __constant__ to __device__ to allow hipMemcpyToSymbol updates (like rocshmem)
@@ -144,18 +155,26 @@ struct RemoteAddrInfo {
 };
 
 // Internal functions shared between init.cpp and runtime.cpp
-void CopyGpuStatesToDevice(const GpuStates* gpuStates);
-void FinalizeRuntime();
-extern GpuStates s_hostGpuStatesCopy;
+void CopyGpuStatesToDevice(ShmemStates* states);
+void FinalizeRuntime(ShmemStates* states);
+
+// Max GPUs per node (fixed array avoids deque resize/realloc issues)
+static constexpr int kMaxGpusPerNode = 8;
 
 class ShmemStatesSingleton {
  public:
   ShmemStatesSingleton(const ShmemStatesSingleton& obj) = delete;
 
-  static ShmemStates* GetInstance() {
-    static ShmemStates states;
-    return &states;
-  }
+  static ShmemStates* GetInstance();
+
+ private:
+#ifdef MORI_MULTITHREAD_SUPPORT
+  // One ShmemStates slot per GPU, indexed by hipGetDevice().
+  // std::array gives stable addresses (no realloc unlike deque/vector).
+  std::array<ShmemStates, kMaxGpusPerNode> states_{};
+  std::mutex mutex_;
+  ShmemStatesSingleton() = default;
+#endif
 };
 
 }  // namespace shmem
