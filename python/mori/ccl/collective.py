@@ -397,6 +397,17 @@ class AllreduceSdma:
         """
         self._handle.enable_post_ag_wait(on)
 
+    def enable_hbm_noise(self, on: bool):
+        """τ'' (perf_history Entry 15): during the post-AG spin-wait, have
+        all threads of each compute block read from the input buffer to
+        generate HBM traffic. Keeps the memory controller active, which
+        restores SDMA AG to full throughput even when no GEMM is running
+        in parallel (i.e. on AR[N-1] at the tail of the pipeline).
+
+        Requires enable_post_ag_wait(True); otherwise it is a no-op.
+        """
+        self._handle.enable_hbm_noise(on)
+
     # --- D' fast path: lazy-register user output (see perf_history Entry 10)
     def enable_register_user_output(self, on: bool):
         """Enable the D' fast-path lookup in pipelined(). When on, if the

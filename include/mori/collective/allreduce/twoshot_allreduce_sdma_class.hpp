@@ -129,6 +129,14 @@ class AllreduceSdma {
   bool post_ag_wait_enabled_ = false;
   uint32_t* post_ag_flag_d_ = nullptr;  // device uint32, reset to 0 each call
 
+  // τ'' direction (perf_history Entry 15): when both post_ag_wait_enabled_
+  // and hbm_noise_enabled_ are true, compute blocks spend their post-reduce
+  // spin-wait reading from the `input` buffer (instead of s_sleep). This
+  // keeps HBM / memory controller active during AG wait, which prevents the
+  // ~2× SDMA AG throughput drop observed on AR[N-1] (no parallel GEMM to
+  // provide HBM activity). Must be used together with post_ag_wait.
+  bool hbm_noise_enabled_ = false;
+
   // ---------------------------------------------------------------------
   // D' prototype: lazy-register user output buffer as shmem symmetric
   // memory so AR kernel can AG directly to it, skipping the transit
@@ -304,6 +312,14 @@ class AllreduceSdma {
   // Stage 2 (future): compute blocks do in-kernel copy during the spin.
   void enable_post_ag_wait(bool on);
   bool is_post_ag_wait_enabled() const { return post_ag_wait_enabled_; }
+
+  // --- τ'' in-kernel HBM noise during AG wait (perf_history Entry 15) ---
+  // Turn compute-block spin-wait into HBM reads of `input` buffer to keep
+  // memory controller active and SDMA AG at full throughput. Requires
+  // post_ag_wait to also be enabled (otherwise compute blocks exit early
+  // and there's no spin to use for noise).
+  void enable_hbm_noise(bool on);
+  bool is_hbm_noise_enabled() const { return hbm_noise_enabled_; }
 
   // --- D' prototype: lazy-register user output as symm memory --------
   // Turn on/off the fast path. When on, pipelined() tries to use the

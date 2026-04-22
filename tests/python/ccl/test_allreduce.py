@@ -946,122 +946,53 @@ def _bench_overlap_one_size(
     elem_bytes = elems * torch.tensor([], dtype=dtype).element_size()
     data_mb = elem_bytes / (1024 * 1024)
     use_overlap = data_mb >= 128
-
-    # ν direction: skip per-iter torch.cuda.synchronize() to avoid draining
-    # SDMA queue / cooling SDMA engine between iters. Hypothesis: AR[0]'s
-    # c?:barrier→AG-submit cold-path cost (~0.25ms/chunk per Entry 4) is
-    # caused by the between-iter sync draining SDMA state. If true, AR[0]
-    # should stabilize at AR[2]-like numbers (~0.02ms/chunk). Entry 14
-    # closed τ (cross-stream HBM doesn't warm SDMA); ν tests a different
-    # mechanism: keep SDMA queue state itself alive across iters.
-    #
-    # Implementation: use **per-iter** event arrays (one ov_s/ov_e per iter,
-    # per-stage events per iter too for timeline). Submit all iters back-to-
-    # back with stream ordering (prep_ar → AR on stream_ar; GEMM on stream_
-    # gemm; cross-stream sync via events). Sync ONCE at the end to drain;
-    # then read elapsed_time from the completed events in bulk.
-    skip_iter_sync = os.environ.get("MORI_SKIP_ITER_SYNC", "0") == "1"
-    if skip_iter_sync and rank == 0:
-        print(" (ν: skip iter sync)", end="", flush=True)
-
-    if skip_iter_sync:
-        ov_s_arr = [torch.cuda.Event(enable_timing=True) for _ in range(total_iters)]
-        ov_e_arr = [torch.cuda.Event(enable_timing=True) for _ in range(total_iters)]
-        ev_g_s_arr = [[torch.cuda.Event(enable_timing=True) for _ in range(num_stages)]
-                      for _ in range(total_iters)]
-        ev_g_e_arr = [[torch.cuda.Event(enable_timing=True) for _ in range(num_stages)]
-                      for _ in range(total_iters)]
-        ev_ar_s_arr = [[torch.cuda.Event(enable_timing=True) for _ in range(num_stages)]
-                       for _ in range(total_iters)]
-        ev_ar_e_arr = [[torch.cuda.Event(enable_timing=True) for _ in range(num_stages)]
-                       for _ in range(total_iters)]
-
     for i in range(total_iters):
-        # Pick per-iter events (ν) or shared events (baseline)
-        if skip_iter_sync:
-            cur_ov_s, cur_ov_e = ov_s_arr[i], ov_e_arr[i]
-            cur_evgs, cur_evge = ev_g_s_arr[i], ev_g_e_arr[i]
-            cur_evars, cur_evare = ev_ar_s_arr[i], ev_ar_e_arr[i]
-        else:
-            cur_ov_s, cur_ov_e = ov_s, ov_e
-            cur_evgs, cur_evge = ev_g_s_list, ev_g_e_list
-            cur_evars, cur_evare = ev_ar_s_list, ev_ar_e_list
-
-        if skip_iter_sync:
-            # prep_ar on stream_ar; AR kernels serialize after it via stream order.
-            with torch.cuda.stream(stream_ar):
-                prep_ar()
-        else:
-            torch.cuda.synchronize()
-            prep_ar()
-            torch.cuda.synchronize()
-        cur_ov_s.record(stream_ar if skip_iter_sync else None)
+        torch.cuda.synchronize()
+        prep_ar()
+        torch.cuda.synchronize()
+        ov_s.record()
         for s in range(num_stages):
-            cur_evgs[s].record(stream_gemm)
+            ev_g_s_list[s].record(stream_gemm)
             with torch.cuda.stream(stream_gemm):
                 _run_gemm()
-            cur_evge[s].record(stream_gemm)
+            ev_g_e_list[s].record(stream_gemm)
             if use_overlap:
-                stream_ar.wait_event(cur_evge[s])
+                stream_ar.wait_event(ev_g_e_list[s])
             else:
                 stream_gemm.synchronize()
-            cur_evars[s].record(stream_ar)
+            ev_ar_s_list[s].record(stream_ar)
             with torch.cuda.stream(stream_ar):
                 launch_ar()
-            cur_evare[s].record(stream_ar)
+            ev_ar_e_list[s].record(stream_ar)
             if not use_overlap:
                 stream_ar.synchronize()
                 if copy_stream:
                     copy_stream.synchronize()
 
-        if use_overlap and not skip_iter_sync:
+        if use_overlap:
             stream_ar.synchronize()
             if copy_stream:
                 copy_stream.synchronize()
             stream_gemm.synchronize()
-        cur_ov_e.record(stream_ar if skip_iter_sync else None)
-        if not skip_iter_sync:
-            torch.cuda.synchronize()
-            t_ov = cur_ov_s.elapsed_time(cur_ov_e) / 1000.0
-            if i >= warmup:
-                overlap_times.append(t_ov)
-                if timeline_dump and rank == 0:
-                    iter_sample = {
-                        "wall": cur_ov_s.elapsed_time(cur_ov_e),
-                        "stages": [
-                            {
-                                "g_start": cur_ov_s.elapsed_time(cur_evgs[s]),
-                                "g_end": cur_ov_s.elapsed_time(cur_evge[s]),
-                                "a_start": cur_ov_s.elapsed_time(cur_evars[s]),
-                                "a_end": cur_ov_s.elapsed_time(cur_evare[s]),
-                            }
-                            for s in range(num_stages)
-                        ],
-                    }
-                    timeline_samples.append(iter_sample)
-
-    # ν mode: drain ONCE at the end, then read per-iter elapsed_time in bulk.
-    # This is the whole point of ν — between-iter stream/SDMA state kept warm.
-    if skip_iter_sync:
+        ov_e.record()
         torch.cuda.synchronize()
-        for i in range(total_iters):
-            t_ov = ov_s_arr[i].elapsed_time(ov_e_arr[i]) / 1000.0
-            if i >= warmup:
-                overlap_times.append(t_ov)
-                if timeline_dump and rank == 0:
-                    iter_sample = {
-                        "wall": ov_s_arr[i].elapsed_time(ov_e_arr[i]),
-                        "stages": [
-                            {
-                                "g_start": ov_s_arr[i].elapsed_time(ev_g_s_arr[i][s]),
-                                "g_end": ov_s_arr[i].elapsed_time(ev_g_e_arr[i][s]),
-                                "a_start": ov_s_arr[i].elapsed_time(ev_ar_s_arr[i][s]),
-                                "a_end": ov_s_arr[i].elapsed_time(ev_ar_e_arr[i][s]),
-                            }
-                            for s in range(num_stages)
-                        ],
-                    }
-                    timeline_samples.append(iter_sample)
+        t_ov = ov_s.elapsed_time(ov_e) / 1000.0
+        if i >= warmup:
+            overlap_times.append(t_ov)
+            if timeline_dump and rank == 0:
+                iter_sample = {
+                    "wall": ov_s.elapsed_time(ov_e),
+                    "stages": [
+                        {
+                            "g_start": ov_s.elapsed_time(ev_g_s_list[s]),
+                            "g_end": ov_s.elapsed_time(ev_g_e_list[s]),
+                            "a_start": ov_s.elapsed_time(ev_ar_s_list[s]),
+                            "a_end": ov_s.elapsed_time(ev_ar_e_list[s]),
+                        }
+                        for s in range(num_stages)
+                    ],
+                }
+                timeline_samples.append(iter_sample)
 
     if timeline_dump and rank == 0 and len(timeline_samples) > 0:
         import statistics as _stats
@@ -1422,12 +1353,25 @@ def _test_multi_stage_overlap(
                                    dtype=dtype)
             # Stage 1 E' prototype: compute blocks stay alive during AG wait.
             # Enable via env MORI_POST_AG_WAIT=1 (off by default).
-            if os.environ.get("MORI_POST_AG_WAIT", "0") == "1":
+            # MORI_HBM_NOISE=1 also implicitly enables post_ag_wait (required
+            # because τ'' HBM-read loop lives inside that spin-wait).
+            _want_post_ag = (
+                os.environ.get("MORI_POST_AG_WAIT", "0") == "1"
+                or os.environ.get("MORI_HBM_NOISE", "0") == "1"
+            )
+            if _want_post_ag:
                 try:
                     ar_obj.enable_post_ag_wait(True)
                 except Exception as e:
                     if rank == 0:
                         print(f"  [warn] enable_post_ag_wait failed: {e}",
+                              flush=True)
+            if os.environ.get("MORI_HBM_NOISE", "0") == "1":
+                try:
+                    ar_obj.enable_hbm_noise(True)
+                except Exception as e:
+                    if rank == 0:
+                        print(f"  [warn] enable_hbm_noise failed: {e}",
                               flush=True)
             torch.cuda.synchronize(); dist.barrier()
             if rank == 0:

@@ -272,6 +272,25 @@ void AllreduceSdma<T>::enable_post_ag_wait(bool on) {
   }
 }
 
+template <typename T>
+void AllreduceSdma<T>::enable_hbm_noise(bool on) {
+  if (on == hbm_noise_enabled_) return;
+  hbm_noise_enabled_ = on;
+  if (on) {
+    printf("PE %d: hbm_noise ENABLED (τ'' — compute-block HBM reads during "
+           "AG wait to keep MC active; requires post_ag_wait=on)\n",
+           myPe_);
+    if (!post_ag_wait_enabled_) {
+      fprintf(stderr,
+              "PE %d: WARNING hbm_noise requires post_ag_wait=on (currently "
+              "off). HBM noise will be a no-op until post_ag_wait is on.\n",
+              myPe_);
+    }
+  } else {
+    printf("PE %d: hbm_noise DISABLED\n", myPe_);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Copy-path instrumentation (baseline: single hipMemcpyAsync)
 // Rule R0: we cannot change the copy strategy without having numbers for
@@ -805,6 +824,8 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
           hipMemsetAsync(post_ag_flag_d_, 0, sizeof(uint32_t), stream);
           post_ag_flag_ptr = post_ag_flag_d_;
         }
+        // τ'' direction: HBM noise inside post-AG spin-wait (kernel arg).
+        const bool hbm_noise_local = hbm_noise_enabled_ && post_ag_wait_enabled_;
 
         if (scatter_mode == 1) {
             PipelinedAllReduceSdmaKernel<T, 1><<<blocks, threads, 0, stream>>>(
@@ -812,7 +833,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                 output_transit_buffer_obj_, flagsObj_,
                 barrierPtr_, inputSymmObj, total_count, chunk_elems,
                 scatter_base, ag_base, reduce_complete_base, phase_ts_ptr,
-                post_ag_flag_ptr);
+                post_ag_flag_ptr, hbm_noise_local);
         } else if (external_scatter) {
             ScatterSdmaOnlyKernel<T><<<1, 512, 0, stream>>>(
                 myPe_, npes_, input, output_transit_buffer_obj_,
@@ -825,7 +846,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                     barrierPtr_, application::SymmMemObjPtr{},
                     total_count, chunk_elems, scatter_base, ag_base,
                     reduce_complete_base, phase_ts_ptr,
-                    post_ag_flag_ptr);
+                    post_ag_flag_ptr, hbm_noise_local);
             } else {
                 PipelinedAllReduceSdmaKernel<T, 0, false, true>
                     <<<blocks, threads, 0, stream>>>(
@@ -834,7 +855,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                     barrierPtr_, application::SymmMemObjPtr{},
                     total_count, chunk_elems, scatter_base, ag_base,
                     reduce_complete_base, phase_ts_ptr,
-                    post_ag_flag_ptr);
+                    post_ag_flag_ptr, hbm_noise_local);
             }
         } else if (multi_chunk) {
             PipelinedAllReduceSdmaKernel<T, 0, true><<<blocks, threads, 0, stream>>>(
@@ -842,14 +863,14 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                 output_transit_buffer_obj_, flagsObj_,
                 barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems,
                 scatter_base, ag_base, reduce_complete_base, phase_ts_ptr,
-                post_ag_flag_ptr);
+                post_ag_flag_ptr, hbm_noise_local);
         } else {
             PipelinedAllReduceSdmaKernel<T, 0, false><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
                 barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems,
                 scatter_base, ag_base, reduce_complete_base, phase_ts_ptr,
-                post_ag_flag_ptr);
+                post_ag_flag_ptr, hbm_noise_local);
         }
 
         pipeline_scatter_gen_ += numChunks_host;   // scatter SDMA only (qId=0)

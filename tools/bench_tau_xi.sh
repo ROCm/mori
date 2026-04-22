@@ -7,10 +7,13 @@
 # History:
 #   - v1..v2: τ (MORI_KEEP_HBM_HOT) + ξ (MORI_AR_WARMUP) — both FAILED
 #     (perf_history.md Entry 14), reverted.
-#   - v3 (current): ν direction — skip per-iter torch.cuda.synchronize()
-#     to keep SDMA engine warm across iters. Hypothesis: AR[0]'s
-#     c?:barrier→AG-submit cold-path (~0.25ms/chunk = 0.45ms/AR per
-#     Entry 4 vs AR[2] warm) is caused by iter-sync draining SDMA state.
+#   - v3: ν (MORI_SKIP_ITER_SYNC) — FAILED, measurement artifact
+#     (perf_history.md Entry 15), reverted.
+#   - v4 (current): τ'' (MORI_HBM_NOISE) — compute blocks read from input
+#     during AG-wait spin, generating HBM traffic to keep memory
+#     controller active. Hypothesis: AR[N-1] AG is ~2× slower
+#     (1.08ms vs 0.55ms on AR[0..N-2]) because no parallel GEMM
+#     provides HBM activity. In-kernel HBM noise closes the gap.
 #
 # Usage (inside ROCm container):
 #   cd /home/fizhang/test/mori
@@ -105,17 +108,21 @@ run_variant_extra() {
   echo "========== HEAD =========="
   git log -1 --oneline
 
+  # τ'' needs both MORI_POST_AG_WAIT=1 AND MORI_HBM_NOISE=1 (MORI_HBM_NOISE
+  # alone also implicitly enables post_ag_wait via Python test harness).
+  TAU2_ENV="MORI_POST_AG_WAIT=1 MORI_HBM_NOISE=1"
+
   run_variant "BASELINE" ""
-  run_variant "NU"       "MORI_SKIP_ITER_SYNC=1"
+  run_variant "TAU2"     "$TAU2_ENV"
 
   run_variant_extra "BASELINE_TIMELINE" "" --timeline
-  run_variant_extra "NU_TIMELINE"       "MORI_SKIP_ITER_SYNC=1" --timeline
+  run_variant_extra "TAU2_TIMELINE"     "$TAU2_ENV" --timeline
 
   run_variant_extra "BASELINE_AR0_PHASE" "MORI_PHASE_TARGET_STAGE=0" --ar-phase-timing
-  run_variant_extra "NU_AR0_PHASE"       "MORI_SKIP_ITER_SYNC=1 MORI_PHASE_TARGET_STAGE=0" --ar-phase-timing
+  run_variant_extra "TAU2_AR0_PHASE"     "$TAU2_ENV MORI_PHASE_TARGET_STAGE=0" --ar-phase-timing
 
   run_variant_extra "BASELINE_AR3_PHASE" "MORI_PHASE_TARGET_STAGE=3" --ar-phase-timing
-  run_variant_extra "NU_AR3_PHASE"       "MORI_SKIP_ITER_SYNC=1 MORI_PHASE_TARGET_STAGE=3" --ar-phase-timing
+  run_variant_extra "TAU2_AR3_PHASE"     "$TAU2_ENV MORI_PHASE_TARGET_STAGE=3" --ar-phase-timing
 } | tee "$LOG"
 
 echo
@@ -142,32 +149,32 @@ PHASE_RE="(\[[0-9]\] total|entry.*scatter_done|scatter.*compute-wait|compute-wai
 
 echo
 echo "---- [2] per-stage median (BASELINE_TIMELINE) ----"
-awk '/========== BASELINE_TIMELINE ==========/,/========== NU_TIMELINE ==========/' "$LOG" \
+awk '/========== BASELINE_TIMELINE ==========/,/========== TAU2_TIMELINE ==========/' "$LOG" \
   | grep -E "stage \|| *[0-3] \||median wall|AR\[[0-3]\] duration|AR\[.\]-GEMM" || true
 
 echo
-echo "---- [3] per-stage median (NU_TIMELINE) ----"
-awk '/========== NU_TIMELINE ==========/,/========== BASELINE_AR0_PHASE ==========/' "$LOG" \
+echo "---- [3] per-stage median (TAU2_TIMELINE) ----"
+awk '/========== TAU2_TIMELINE ==========/,/========== BASELINE_AR0_PHASE ==========/' "$LOG" \
   | grep -E "stage \|| *[0-3] \||median wall|AR\[[0-3]\] duration|AR\[.\]-GEMM" || true
 
 echo
 echo "---- [4] BASELINE AR[0] phase ----"
-awk '/========== BASELINE_AR0_PHASE ==========/,/========== NU_AR0_PHASE ==========/' "$LOG" \
+awk '/========== BASELINE_AR0_PHASE ==========/,/========== TAU2_AR0_PHASE ==========/' "$LOG" \
   | grep -E "$PHASE_RE" || true
 
 echo
-echo "---- [5] NU AR[0] phase ----"
-awk '/========== NU_AR0_PHASE ==========/,/========== BASELINE_AR3_PHASE ==========/' "$LOG" \
+echo "---- [5] TAU2 AR[0] phase ----"
+awk '/========== TAU2_AR0_PHASE ==========/,/========== BASELINE_AR3_PHASE ==========/' "$LOG" \
   | grep -E "$PHASE_RE" || true
 
 echo
 echo "---- [6] BASELINE AR[3] phase ----"
-awk '/========== BASELINE_AR3_PHASE ==========/,/========== NU_AR3_PHASE ==========/' "$LOG" \
+awk '/========== BASELINE_AR3_PHASE ==========/,/========== TAU2_AR3_PHASE ==========/' "$LOG" \
   | grep -E "$PHASE_RE" || true
 
 echo
-echo "---- [7] NU AR[3] phase ----"
-awk '/========== NU_AR3_PHASE ==========/,0' "$LOG" \
+echo "---- [7] TAU2 AR[3] phase (KEY TARGET) ----"
+awk '/========== TAU2_AR3_PHASE ==========/,0' "$LOG" \
   | grep -E "$PHASE_RE" || true
 
 echo

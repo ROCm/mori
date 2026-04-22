@@ -504,6 +504,56 @@ Summarized here for quick lookup; exact commits in git log:
 
 ---
 
+## Entry 15 — ν (skip iter sync) FAILED, reveals true mechanism
+- **Date**: 2026-04-22
+- **Commit**: `623f61a4` (ν impl), `b56918ba` (baseline)
+- **Scenario**: `tools/bench_tau_xi.sh` with `MORI_SKIP_ITER_SYNC=1`
+- **Numbers (median wall ms, copy mode)**:
+  | label | copy | RCCL | vs RCCL | AR[0] total | AR[3] total |
+  |---|---|---|---|---|---|
+  | BASELINE | 7.797 | 7.637 | +2.1% | 2.264 ms | 1.314 ms |
+  | NU       | 5.247 | 5.684 | -7.7% *(artifact)* | 2.266 ms | 1.314 ms |
+- **Mechanism analysis — ν FAILED as measurement artifact**:
+  1. Wall diff 2.55ms is **fake gain**: ν mode has `ov_s.record(stream_ar)`
+     capturing only stream_ar (no sync → stream_gemm runs decoupled ahead,
+     timing shows GEMM start at -342ms relative to ov_s).
+  2. RCCL wall (same measurement infra) **also** drops (7.637 → 5.684),
+     confirming the drop is measurement-methodology-induced, not real gain.
+  3. **AR[0] and AR[3] phase breakdowns are byte-for-byte identical**
+     between BASELINE and NU → SDMA engine state unchanged.
+     `torch.cuda.synchronize()` between iters is NOT the cause of AR[0]
+     cold-path overhead.
+  4. **Reverted** at commit `<this>`.
+- **Revised mechanism hypothesis (from AR[0] vs AR[3] phase data)**:
+  The gap between AR[0] cold and AR[3] warm is dominated by:
+  1. **AR[0] c?:scatter→compute-wait** 0.46 + 0.36 = **0.82 ms**
+     (vs AR[3] 0.11 + 0.09 = 0.20 ms). This is compute-block reduce
+     blocked by CU contention from parallel GEMM[1]. AR[0] runs during
+     GEMM[1], GEMM[1] steals CUs from AR[0]'s reduce. AR[3] has no parallel
+     GEMM → fast reduce.
+  2. **AR[3] AG-submit→AG-wait-done** = **1.082 ms** (vs AR[0] 0.566 ms).
+     AR[3] AG is 2× slower than AR[0/1/2]. Surprising: warm-path AR is
+     SLOWER than cold-path AR in this phase. Mechanism: during AR[0..N-2]
+     AG wait there is a parallel GEMM generating HBM traffic, which keeps
+     memory controller active, SDMA sees full bandwidth. During AR[N-1]
+     AG wait there is NO parallel activity, HBM is quiet, memory
+     controller drops into a low-power / idle state, SDMA throughput
+     halves. Per-chunk AG sat bandwidth: 128MB / 0.55ms ≈ 230 GB/s in
+     "active" state; 128MB / 1.08ms ≈ 118 GB/s in "idle" state. 2× gap.
+- **τ'' proposal (next direction, see kernel commit)**:
+  - In-kernel HBM noise during AG wait. Compute blocks (which already
+    exist as `post_ag_wait` spin-wait in Stage 1 E') read from `input`
+    buffer in their spin-wait loop, generating HBM traffic from within
+    the AR kernel itself. No external GEMM needed.
+  - Expected gain: AR[N-1] AG 1.082 → 0.55ms, save ~0.5ms on wall.
+    Gap to RCCL is 0.16ms; gain/gap = 3×. **Satisfies R8**.
+  - Requires `MORI_POST_AG_WAIT=1 MORI_HBM_NOISE=1`. Implementation is
+    one spin-loop variant added to kernel; no correctness risk because
+    the noise loop only reads (no writes) from `input` which is read-only
+    from AR's semantic perspective.
+
+---
+
 ## Entry 14 — τ (keep-HBM-hot) + ξ (AR warmup) both FAILED
 - **Date**: 2026-04-22
 - **Commit**: `95c663f8` (τ + ξ benchmark impl), measurement at `b56918ba`
@@ -571,5 +621,6 @@ Summarized here for quick lookup; exact commits in git log:
 | 2026-04-22 | _projected 7.381_ | _7.562_ | **_-2.4% (超 RCCL)_** | D' steady state projection (Entry 10) — **invalidated by Entry 11 correctness fail** |
 | 2026-04-22 | — | — | — | D' Step 2 **REVERTED** (Entry 11): PyTorch caching allocator incompatible with `hipIpcOpenMemHandle` semantics; direction closed pending shmem refactor |
 | 2026-04-22 | 7.789 | 7.582 | **+2.7%** | Entry 14 baseline (τ=ξ=off). Both τ and ξ failed; reverted |
+| 2026-04-22 | 7.797 | 7.637 | **+2.1%** | Entry 15 baseline (ν fail confirmed); τ'' proposal pending |
 
 **Target**: SDMA copy ≤ RCCL (gap ≤ 0). Currently outstanding.
