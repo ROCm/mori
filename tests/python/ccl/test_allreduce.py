@@ -1156,6 +1156,21 @@ def _bench_overlap_one_size(
                         phases[f"c{c}:barrier→AG-submit"] = (ts[2 + 3 * c + 2] - ts[2 + 3 * c + 1]) * cy_to_ms
                     phases[f"AG-submit→AG-wait-done"] = (ts[2 + 3 * last_nc] - ts[2 + 3 * (last_nc - 1) + 2]) * cy_to_ms
                     phases["AG-wait-done→exit"] = (ts[3 + 3 * last_nc] - ts[2 + 3 * last_nc]) * cy_to_ms
+
+                    # Stage 2b-0 leftover: per-chunk AG done timestamps
+                    # (slot 20+c). Shows when each chunk's AG signals arrived
+                    # at block 0. Delta between c0→c1 AG done reveals whether
+                    # the SDMA queue saturates bandwidth (large delta =
+                    # serial, small delta = parallel / queue saturated
+                    # already).
+                    for c in range(last_nc):
+                        if (20 + c) < len(ts) and ts[20 + c] != 0:
+                            # since AG for chunk c is submitted at ts[2+3c+2],
+                            # delta = AG done - AG submit = physical SDMA
+                            # transfer time for chunk c
+                            submit_t = ts[2 + 3 * c + 2]
+                            done_t   = ts[20 + c]
+                            phases[f"c{c}:AG-submit→AG-done (per-chunk)"] = (done_t - submit_t) * cy_to_ms
                     all_phase_deltas.append(phases)
 
                     # Compute-block-1 phase breakdown (slots 10..11+3*nc).
