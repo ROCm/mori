@@ -58,24 +58,14 @@ id -un
 pwd
 echo "SIZE_MB=$SIZE_MB NUM_STAGES=$NUM_STAGES ITERATIONS=$ITERATIONS WARMUP=$WARMUP PIPELINE_CU=$PIPELINE_CU ELEMS=$ELEMS"
 
-# Build deps (we use --no-build-isolation which skips pyproject.toml auto-fetch,
-# so we must pre-install cmake / ninja / pybind11 ourselves).
-BUILD_PIPS=()
-command -v cmake >/dev/null 2>&1 || BUILD_PIPS+=("cmake>=3.20")
-command -v ninja >/dev/null 2>&1 || BUILD_PIPS+=("ninja")
-python3 -c "import pybind11" 2>/dev/null || BUILD_PIPS+=("pybind11")
-if [ "${#BUILD_PIPS[@]}" -gt 0 ]; then
-  echo "installing missing build deps: ${BUILD_PIPS[*]}"
-  pip install "${BUILD_PIPS[@]}" >/dev/null
-fi
-command -v cmake   >/dev/null || { echo "MISSING: cmake";   exit 1; }
-command -v ninja   >/dev/null || { echo "MISSING: ninja";   exit 1; }
+# Build deps are declared in pyproject.toml's [build-system].requires
+# (cmake, ninja, pybind11, setuptools, wheel). pip installs them
+# automatically in an isolated env — do NOT pass --no-build-isolation
+# (that flag skips the auto-fetch and leaves the build broken if system
+# is missing cmake/ninja/pybind11).
 command -v python3 >/dev/null || { echo "MISSING: python3"; exit 1; }
-python3 -c "import pybind11; print('pybind11:', pybind11.__version__)"
-cmake --version | head -1
-ninja  --version
 
-# rocm-smi / HIP / GPU presence
+# Runtime: rocm-smi / HIP / GPU presence
 rocm-smi --showproductname 2>&1 | grep -E "GPU\[.\].*(Card Series|GFX)" | head -4 || true
 python3 -c "import torch; assert torch.cuda.is_available(), 'HIP not available'; print('devices:', torch.cuda.device_count())"
 
@@ -91,7 +81,9 @@ fi
 if [ "$SKIP_BUILD" != "1" ]; then
   echo
   echo "==================== [pip install] ===================="
-  pip install -e . --no-build-isolation
+  # No --no-build-isolation: let pip fetch pyproject.toml build deps
+  # (cmake / ninja / pybind11 etc.) into an isolated env automatically.
+  pip install -e .
 fi
 
 LOG="/tmp/perf_tau_xi_$(date +%s).log"
