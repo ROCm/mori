@@ -169,21 +169,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
                               reduce until block 0 sets this flag (after AG
                               wait done). Used to measure how much CU
                               occupancy during AG wait costs the overlap
-                              benchmark (GEMM variability, wall time). */,
-    T* user_output_direct = nullptr /* Plan A (perf_history Entry 18):
-                                       when non-null AND MULTI_CHUNK,
-                                       block 0 SKIPS SDMA AG and compute
-                                       blocks perform CU XGMI AG: each
-                                       block reads from one peer's
-                                       transit[peer_slot] via P2P pointer
-                                       and writes directly into
-                                       user_output[peer_slot]. Measured
-                                       CU XGMI read BW = 370 GB/s at 16
-                                       blocks/peer for 32 MB shards, so
-                                       AG+copy 1.175 ms → ~0.61 ms.
-                                       Host MUST skip external
-                                       hipMemcpyAsync when passing
-                                       non-null. */ ) {
+                              benchmark (GEMM variability, wall time). */ ) {
 
   ar_write_phase_ts(phase_ts, 0);  // phase 0: kernel entry
 
@@ -361,82 +347,6 @@ __global__ void PipelinedAllReduceSdmaKernel(
         ar_write_phase_ts_cb1(phase_ts, 31);  // post_ag_flag observed
       }
 
-      // ================================================================
-      // Plan A (perf_history Entry 18): CU XGMI AG + direct write to
-      // user_output. Runs only when user_output_direct != nullptr AND
-      // MULTI_CHUNK. Requires post_ag_flag to coordinate "cross-PE
-      // reduce barrier done" — set by block 0 after all chunks' barriers.
-      //
-      // Block → peer assignment: blocks [peer*kBppA, (peer+1)*kBppA) are
-      // assigned to peer. kBppA = 16 (validated best-BW at 32 MB/peer by
-      // cu_xgmi_bench: 370 GB/s, saturated at 16). With compBlocks=160
-      // and npes=8, that's 128 copy workers + 32 idle.
-      //
-      // For peer == myPe: my shard is already in local transit[myPe_slot]
-      // (reduce result). Local copy transit → user_output[myPe_slot].
-      // For peer != myPe: XGMI load peer_transit[peer_slot] via
-      // dstMemObj->peerPtrs[peer] and write user_output[peer_slot].
-      //
-      // The post_ag_flag gate above is critical: compute blocks must
-      // NOT XGMI-load peer_transit[peer_slot] until all peers finished
-      // their reduce (peer_transit[peer_slot] is written by peer's
-      // reduce, not by any scatter, so waiting for cross-PE reduce
-      // barrier is sufficient — no extra AG signal needed).
-      // ================================================================
-      if constexpr (MULTI_CHUNK) {
-        if (user_output_direct != nullptr && compBlocks > 0) {
-          constexpr int kBppA = 16;
-          const int cbId = static_cast<int>(blockIdx.x) - 1;
-          const int peer = cbId / kBppA;
-          const int posInPeer = cbId % kBppA;
-          const bool active = (peer < npes) && (posInPeer < kBppA);
-
-          if (active) {
-            using vec_t = ulonglong2;  // 16 B
-            static_assert(sizeof(vec_t) == 16, "vec_t must be 16B");
-
-            const size_t peerOffset =
-                static_cast<size_t>(peer) * totalShardBytes;
-            // peerPtrs is uintptr_t[], localPtr is void*; normalize to
-            // uintptr_t base then cast to uint8_t* with offset.
-            const uintptr_t srcBaseAddr = (peer == myPe)
-                ? reinterpret_cast<uintptr_t>(dstMemObj->localPtr)
-                : dstMemObj->peerPtrs[peer];
-            const uint8_t* srcBase =
-                reinterpret_cast<const uint8_t*>(srcBaseAddr) + peerOffset;
-            uint8_t* dstBase =
-                reinterpret_cast<uint8_t*>(user_output_direct) + peerOffset;
-
-            const size_t totalVecs = totalShardBytes / sizeof(vec_t);
-            const size_t vecsPerBlock =
-                (totalVecs + kBppA - 1) / kBppA;
-            const size_t vStart =
-                static_cast<size_t>(posInPeer) * vecsPerBlock;
-            const size_t vEnd =
-                (vStart + vecsPerBlock > totalVecs) ? totalVecs
-                                                     : (vStart + vecsPerBlock);
-
-            const vec_t* src = reinterpret_cast<const vec_t*>(srcBase);
-            vec_t* dst = reinterpret_cast<vec_t*>(dstBase);
-
-            for (size_t v = vStart + threadIdx.x; v < vEnd;
-                 v += blockDim.x) {
-              dst[v] = src[v];
-            }
-            // Tail bytes (only last-pos block of last peer).
-            const size_t tailStart = totalVecs * sizeof(vec_t);
-            if (tailStart < totalShardBytes
-                && peer == npes - 1 && posInPeer == kBppA - 1) {
-              for (size_t t = tailStart + threadIdx.x;
-                   t < totalShardBytes; t += blockDim.x) {
-                dstBase[t] = srcBase[t];
-              }
-            }
-            __syncthreads();
-          }
-        }
-      }
-
       ar_write_phase_ts_cb1(phase_ts, 11 + 3 * numChunks);  // compute block exit
 
     } else {
@@ -526,56 +436,45 @@ __global__ void PipelinedAllReduceSdmaKernel(
           }
           ar_write_phase_ts(phase_ts, 2 + 3 * c + 1);  // chunk c: cross-PE barrier done
 
-          // 3. SDMA AG for chunk c. SKIPPED when user_output_direct != nullptr
-          //    (plan A: compute blocks do CU XGMI AG + direct write instead).
-          if (user_output_direct == nullptr) {
-            if (thr < npes && thr != myPe) {
-              const int destPe = thr;
-              anvil::SdmaQueueDeviceHandle** dh =
-                  dstMemObj->deviceHandles_d + destPe * numQ;
-              HSAuint64* rSig = dstMemObj->peerSignalPtrs[destPe]
-                  + static_cast<size_t>(myPe) * numQ;
+          // 3. SDMA AG for chunk c.
+          if (thr < npes && thr != myPe) {
+            const int destPe = thr;
+            anvil::SdmaQueueDeviceHandle** dh =
+                dstMemObj->deviceHandles_d + destPe * numQ;
+            HSAuint64* rSig = dstMemObj->peerSignalPtrs[destPe]
+                + static_cast<size_t>(myPe) * numQ;
 
-              const size_t cOff = static_cast<size_t>(c) * chunkBytes;
-              size_t agBytes = chunkBytes;
-              if (cOff + agBytes > totalShardBytes)
-                agBytes = totalShardBytes - cOff;
+            const size_t cOff = static_cast<size_t>(c) * chunkBytes;
+            size_t agBytes = chunkBytes;
+            if (cOff + agBytes > totalShardBytes)
+              agBytes = totalShardBytes - cOff;
 
-              uint8_t* src = reinterpret_cast<uint8_t*>(dstMemObj->localPtr)
-                  + static_cast<size_t>(myPe) * totalShardBytes + cOff;
-              uint8_t* dst = reinterpret_cast<uint8_t*>(dstMemObj->peerPtrs[destPe])
-                  + static_cast<size_t>(myPe) * totalShardBytes + cOff;
-              core::SdmaPutThread(src, dst, agBytes, dh, rSig, numQ, 1);
-            }
+            uint8_t* src = reinterpret_cast<uint8_t*>(dstMemObj->localPtr)
+                + static_cast<size_t>(myPe) * totalShardBytes + cOff;
+            uint8_t* dst = reinterpret_cast<uint8_t*>(dstMemObj->peerPtrs[destPe])
+                + static_cast<size_t>(myPe) * totalShardBytes + cOff;
+            core::SdmaPutThread(src, dst, agBytes, dh, rSig, numQ, 1);
           }
           ar_write_phase_ts(phase_ts, 2 + 3 * c + 2);  // chunk c: AG submit done
         }
 
-        // Per-chunk AG wait. Also skipped under plan A (compute blocks
-        // do their own cross-peer wait via flag after reduce).
-        if (user_output_direct == nullptr) {
-          for (int c = 0; c < numChunks; c++) {
-            if (thr < npes && thr != myPe) {
-              const int sender = thr;
-              const uint64_t expected_c =
-                  s_ag_by_sender[sender] + static_cast<uint64_t>(c + 1);
-              HSAuint64* sig = dstMemObj->signalPtrs
-                  + static_cast<size_t>(sender) * numQ + 1;
-              while (core::AtomicLoadRelaxed(sig) < expected_c)
-                __builtin_amdgcn_s_sleep(1);
-            }
-            __syncthreads();
-            if (phase_ts != nullptr && threadIdx.x == 0 && (20 + c) < kArPhaseTsCapacity) {
-              phase_ts[20 + c] = __builtin_amdgcn_s_memtime();  // chunk c AG done
-            }
+        for (int c = 0; c < numChunks; c++) {
+          if (thr < npes && thr != myPe) {
+            const int sender = thr;
+            const uint64_t expected_c =
+                s_ag_by_sender[sender] + static_cast<uint64_t>(c + 1);
+            HSAuint64* sig = dstMemObj->signalPtrs
+                + static_cast<size_t>(sender) * numQ + 1;
+            while (core::AtomicLoadRelaxed(sig) < expected_c)
+              __builtin_amdgcn_s_sleep(1);
+          }
+          __syncthreads();
+          if (phase_ts != nullptr && threadIdx.x == 0 && (20 + c) < kArPhaseTsCapacity) {
+            phase_ts[20 + c] = __builtin_amdgcn_s_memtime();  // chunk c AG done
           }
         }
-        ar_write_phase_ts(phase_ts, 2 + 3 * numChunks);  // AG wait done (or skipped)
+        ar_write_phase_ts(phase_ts, 2 + 3 * numChunks);  // AG wait done
 
-        // Release compute blocks waiting post-reduce. Under plan A this
-        // also means "cross-PE reduce barrier is done, safe to XGMI load
-        // peer transits". Block 0's role finishes here; compute blocks
-        // do the CU XGMI AG + direct-write-to-user_output phase below.
         if (post_ag_flag != nullptr && threadIdx.x == 0) {
           __threadfence();
           __hip_atomic_store(post_ag_flag, 1u,
@@ -736,6 +635,299 @@ __global__ void PipelinedAllReduceSdmaKernel(
     }
   }
 
+}
+
+// ============================================================================
+// PipelinedCuAgKernel — "Plan A / direct-output" slim kernel (perf_history
+// Entry 18). NO SDMA AG code at all — relies on a preceding
+// ScatterSdmaOnlyKernel to have already started the SDMA scatter phase.
+//
+// Compiler-wise, this is a SEPARATE function from PipelinedAllReduceSdmaKernel
+// so the scalar / vector register budget is dedicated to reduce + CU XGMI AG
+// code. The single-kernel approach (plan A v1) added the CU XGMI AG inline
+// and the compiler's register allocator serialized previously parallel reduce
+// ops, making reduce 4× slower. This separate kernel avoids that.
+//
+// Phases (all in this one kernel, but CU-only; SDMA scatter runs in parallel
+// on the SDMA engine from the preceding kernel):
+//   1. Compute blocks: poll peer scatter signals; reduce chunk c → transit
+//      [myPe slot]; fetch_add chunks_complete.
+//   2. Block 0: wait chunks_complete ≥ target; cross-PE reduce barrier
+//      (fetch_add myFlag + wait peer flags). No SDMA AG.
+//   3. Block 0: set post_ag_flag = 1 (signals compute blocks that all peers
+//      have finished their reduce → safe to XGMI load peer transits).
+//   4. Compute blocks: after post_ag_flag observed, do CU XGMI AG — each
+//      block assigned to one peer (kBppA=16 per peer; validated 370 GB/s in
+//      examples/sdma/cu_xgmi_bench), read peer_transit[peer_slot] via P2P
+//      pointer and write directly into user_output[peer_slot]. For
+//      peer==myPe, read local transit[myPe_slot] and copy locally.
+// ============================================================================
+template <typename T>
+__global__ void PipelinedCuAgKernel(
+    int myPe, int npes,
+    const T* __restrict__ input,
+    const application::SymmMemObjPtr dstMemObj,
+    const application::SymmMemObjPtr flagsMemObj,
+    CrossPeBarrier* __restrict__ barrier,
+    T* __restrict__ user_output,
+    size_t elementCount,
+    size_t chunkElementCount,
+    uint64_t scatterBase,
+    uint64_t reduceCompleteBase,
+    uint64_t* phase_ts,
+    uint32_t* post_ag_flag) {
+
+  ar_write_phase_ts(phase_ts, 0);  // entry
+
+  if (elementCount == 0 || npes <= 0) return;
+
+  using P = typename packed_t<T>::P;
+  using A = typename packed_t<T>::A;
+  constexpr int pack_size = P::size;
+
+  const size_t elementCountPerRank =
+      ((elementCount / npes + pack_size - 1) / pack_size) * pack_size;
+  const size_t chunkPerRank =
+      ((chunkElementCount / npes + pack_size - 1) / pack_size) * pack_size;
+  const size_t bytesPerElement = sizeof(T);
+  const size_t packedPerRank = elementCountPerRank / pack_size;
+  const size_t packedChunkPerRank = chunkPerRank / pack_size;
+
+  if (elementCountPerRank == 0 || chunkPerRank == 0) return;
+
+  const int numChunks =
+      static_cast<int>((packedPerRank + packedChunkPerRank - 1) / packedChunkPerRank);
+  const size_t totalShardBytes = elementCountPerRank * bytesPerElement;
+
+  P* __restrict__ buf = reinterpret_cast<P*>(dstMemObj->localPtr);
+  const uint32_t numQ = dstMemObj->sdmaNumQueue;
+  const int compBlocks = static_cast<int>(gridDim.x) - 1;
+
+  __shared__ uint64_t s_scatter_by_sender[64];
+  __shared__ uint32_t s_cc_base;
+  __shared__ const P* s_pe_ptrs[8];
+
+  if (threadIdx.x == 0) s_cc_base = 0u;
+  {
+    const int s = static_cast<int>(threadIdx.x);
+    if (s < npes && s != myPe) {
+      s_scatter_by_sender[s] = scatterBase;
+    }
+  }
+  __syncthreads();
+
+  if (blockIdx.x != 0) {
+    // ---- Compute blocks: scatter-poll → reduce → chunks_complete ----
+    ar_write_phase_ts_cb1(phase_ts, 10);
+
+    const size_t compTid =
+        static_cast<size_t>(blockIdx.x - 1) * static_cast<size_t>(blockDim.x)
+        + threadIdx.x;
+    const size_t compStride =
+        static_cast<size_t>(compBlocks) * static_cast<size_t>(blockDim.x);
+
+    for (int c = 0; c < numChunks; c++) {
+      ar_write_phase_ts_cb1(phase_ts, 11 + 3 * c + 0);
+      const size_t off = static_cast<size_t>(c) * packedChunkPerRank;
+
+      if (c > 0 && threadIdx.x == 64) {
+#if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
+        asm volatile("buffer_wbl2" ::: "memory");
+#endif
+        __threadfence();
+        __hip_atomic_fetch_add(&barrier->chunks_complete, 1u,
+                               __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+      }
+      if (threadIdx.x < static_cast<unsigned>(npes - 1)) {
+        const int idx = static_cast<int>(threadIdx.x);
+        const int sender = idx < myPe ? idx : idx + 1;
+        const uint64_t expected =
+            s_scatter_by_sender[sender] + static_cast<uint64_t>(c + 1);
+        HSAuint64* sig = dstMemObj->signalPtrs
+            + static_cast<size_t>(sender) * numQ;
+        while (core::AtomicLoadRelaxed(sig) < expected) {
+          __builtin_amdgcn_s_sleep(2);
+          __builtin_amdgcn_s_sleep(2);
+        }
+      }
+      ar_write_phase_ts_cb1(phase_ts, 11 + 3 * c + 1);
+
+      if (threadIdx.x < static_cast<unsigned>(npes)) {
+        const int pe = static_cast<int>(threadIdx.x);
+        s_pe_ptrs[pe] = (pe == myPe)
+            ? reinterpret_cast<const P*>(input)
+                + static_cast<size_t>(myPe) * packedPerRank + off
+            : buf + static_cast<size_t>(pe) * packedPerRank + off;
+      }
+      __syncthreads();
+
+      {
+        size_t cnt = packedChunkPerRank;
+        if (off + cnt > packedPerRank) cnt = packedPerRank - off;
+
+        P* __restrict__ myDst =
+            buf + static_cast<size_t>(myPe) * packedPerRank + off;
+
+        size_t k = compTid;
+        for (; k + compStride < cnt; k += compStride * 2) {
+          A acc0 = upcast_v<typename P::type, pack_size>(s_pe_ptrs[0][k]);
+          A acc1 = upcast_v<typename P::type, pack_size>(
+              s_pe_ptrs[0][k + compStride]);
+          for (int pe = 1; pe < npes; ++pe) {
+            packed_assign_add(
+                acc0,
+                upcast_v<typename P::type, pack_size>(s_pe_ptrs[pe][k]));
+            packed_assign_add(
+                acc1,
+                upcast_v<typename P::type, pack_size>(
+                    s_pe_ptrs[pe][k + compStride]));
+          }
+          myDst[k] = downcast_v<typename P::type, pack_size>(acc0);
+          myDst[k + compStride] =
+              downcast_v<typename P::type, pack_size>(acc1);
+        }
+        if (k < cnt) {
+          A acc = upcast_v<typename P::type, pack_size>(s_pe_ptrs[0][k]);
+          for (int pe = 1; pe < npes; ++pe) {
+            packed_assign_add(
+                acc,
+                upcast_v<typename P::type, pack_size>(s_pe_ptrs[pe][k]));
+          }
+          myDst[k] = downcast_v<typename P::type, pack_size>(acc);
+        }
+      }
+
+      __syncthreads();
+      ar_write_phase_ts_cb1(phase_ts, 11 + 3 * c + 2);
+    }
+
+    if (threadIdx.x == 0) {
+#if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
+      asm volatile("buffer_wbl2" ::: "memory");
+#endif
+      __threadfence();
+      __hip_atomic_fetch_add(&barrier->chunks_complete, 1u,
+                             __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+    }
+
+    // Wait for post_ag_flag (cross-PE reduce barrier done signal from block 0).
+    if (post_ag_flag != nullptr) {
+      if (threadIdx.x == 0) {
+        while (__hip_atomic_load(
+                   post_ag_flag,
+                   __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) == 0u) {
+          __builtin_amdgcn_s_sleep(2);
+        }
+      }
+      __syncthreads();
+      ar_write_phase_ts_cb1(phase_ts, 31);
+    }
+
+    // ---- Phase 4: CU XGMI AG + direct write user_output ----
+    // Each peer gets bpp blocks (bounded above by 16, the bench-optimal
+    // saturation point per cu_xgmi_bench @ 32 MB shard = 370 GB/s).
+    // Adaptive for small compBlocks so every peer gets at least 1 worker.
+    if (compBlocks > 0 && user_output != nullptr) {
+      int bpp = compBlocks / npes;
+      if (bpp > 16) bpp = 16;
+      if (bpp < 1)  bpp = 1;
+      const int totalWorkers = npes * bpp;
+      const int cbId = static_cast<int>(blockIdx.x) - 1;
+      const int peer = (cbId < totalWorkers) ? (cbId / bpp) : npes;  // peer==npes → idle
+      const int posInPeer = (cbId < totalWorkers) ? (cbId % bpp) : 0;
+
+      if (peer < npes) {
+        using vec_t = ulonglong2;  // 16 B
+        static_assert(sizeof(vec_t) == 16, "vec_t must be 16B");
+
+        const size_t peerOffset =
+            static_cast<size_t>(peer) * totalShardBytes;
+        const uintptr_t srcBaseAddr = (peer == myPe)
+            ? reinterpret_cast<uintptr_t>(dstMemObj->localPtr)
+            : dstMemObj->peerPtrs[peer];
+        const uint8_t* srcBase =
+            reinterpret_cast<const uint8_t*>(srcBaseAddr) + peerOffset;
+        uint8_t* dstBase =
+            reinterpret_cast<uint8_t*>(user_output) + peerOffset;
+
+        const size_t totalVecs = totalShardBytes / sizeof(vec_t);
+        const size_t vecsPerBlock =
+            (totalVecs + bpp - 1) / bpp;
+        const size_t vStart =
+            static_cast<size_t>(posInPeer) * vecsPerBlock;
+        const size_t vEnd =
+            (vStart + vecsPerBlock > totalVecs) ? totalVecs
+                                                 : (vStart + vecsPerBlock);
+
+        const vec_t* src = reinterpret_cast<const vec_t*>(srcBase);
+        vec_t* dst = reinterpret_cast<vec_t*>(dstBase);
+
+        for (size_t v = vStart + threadIdx.x; v < vEnd; v += blockDim.x) {
+          dst[v] = src[v];
+        }
+        const size_t tailStart = totalVecs * sizeof(vec_t);
+        if (tailStart < totalShardBytes
+            && peer == npes - 1 && posInPeer == bpp - 1) {
+          for (size_t t = tailStart + threadIdx.x;
+               t < totalShardBytes; t += blockDim.x) {
+            dstBase[t] = srcBase[t];
+          }
+        }
+        __syncthreads();
+      }
+    }
+
+    ar_write_phase_ts_cb1(phase_ts, 11 + 3 * numChunks);  // compute block exit
+
+  } else {
+    // ---- Block 0: wait compute blocks + cross-PE reduce barrier ----
+    const int thr = static_cast<int>(threadIdx.x);
+    const uint32_t ccBase = s_cc_base;
+
+    ar_write_phase_ts(phase_ts, 1);  // placeholder, scatter already done externally
+
+    for (int c = 0; c < numChunks; c++) {
+      const uint32_t ccTarget =
+          ccBase + static_cast<uint32_t>((c + 1) * compBlocks);
+      if (thr == 0) {
+        while (__scoped_atomic_load_n(
+                   &barrier->chunks_complete,
+                   __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) < ccTarget)
+          __builtin_amdgcn_s_sleep(1);
+      }
+      __syncthreads();
+      ar_write_phase_ts(phase_ts, 2 + 3 * c + 0);
+
+      if (thr == 0) {
+        HSAuint64* myFlag =
+            reinterpret_cast<HSAuint64*>(flagsMemObj->localPtr);
+        __hip_atomic_fetch_add(myFlag, 1ULL,
+                               __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+      }
+      if (thr < npes && thr != myPe) {
+        const int pe = thr;
+        const uint64_t expected =
+            reduceCompleteBase + static_cast<uint64_t>(c + 1);
+        HSAuint64* remoteFlag =
+            reinterpret_cast<HSAuint64*>(flagsMemObj->peerPtrs[pe]);
+        while (core::AtomicLoadRelaxed(remoteFlag) < expected)
+          __builtin_amdgcn_s_sleep(1);
+      }
+      ar_write_phase_ts(phase_ts, 2 + 3 * c + 1);
+      // No SDMA AG submit; leave slot 2+3*c+2 unused
+    }
+    ar_write_phase_ts(phase_ts, 2 + 3 * numChunks);  // barriers all done
+
+    // Signal compute blocks: safe to XGMI load peer transits.
+    if (post_ag_flag != nullptr && threadIdx.x == 0) {
+      __threadfence_system();
+      __hip_atomic_store(post_ag_flag, 1u,
+                         __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+      ar_write_phase_ts(phase_ts, 30);
+    }
+
+    ar_write_phase_ts(phase_ts, 3 + 3 * numChunks);  // block 0 exit
+  }
 }
 
 }  // namespace collective

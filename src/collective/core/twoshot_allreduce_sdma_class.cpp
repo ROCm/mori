@@ -829,22 +829,39 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
           post_ag_flag_ptr = post_ag_flag_d_;
         }
 
-        // Plan A: direct-output CU XGMI AG (perf_history Entry 18).
-        // Active only on MULTI_CHUNK + copy_output_to_user path.
-        T* direct_out_ptr = nullptr;
-        bool skip_external_copy = false;
-        if (direct_output_enabled_ && copy_output_to_user_ && multi_chunk) {
-          direct_out_ptr = output;
-          skip_external_copy = true;
-        }
+        // Plan A (2-kernel variant, perf_history Entry 18 v2): when
+        // direct_output is on AND we're on the copy_output_to_user
+        // MULTI_CHUNK path, split the AR into:
+        //   Kernel 1: ScatterSdmaOnlyKernel (SDMA scatter only, no CU)
+        //   Kernel 2: PipelinedCuAgKernel (CU reduce + cross-PE barrier
+        //              + CU XGMI AG + direct write user_output; NO SDMA AG)
+        // This isolates the CU-heavy reduce+AG phase into its own kernel
+        // so its register budget is not shared with SDMA AG code (that
+        // was the failure mode of plan A v1 single-kernel, which made
+        // reduce 4× slower due to register pressure).
+        const bool use_plan_a = direct_output_enabled_
+            && copy_output_to_user_ && multi_chunk;
+        bool skip_external_copy = use_plan_a;
 
-        if (scatter_mode == 1) {
+        if (use_plan_a) {
+            // Kernel 1: SDMA scatter only.
+            ScatterSdmaOnlyKernel<T><<<1, 512, 0, stream>>>(
+                myPe_, npes_, input, output_transit_buffer_obj_,
+                total_count, chunk_elems, scatter_base);
+            // Kernel 2: CU reduce + CU XGMI AG + direct write.
+            PipelinedCuAgKernel<T><<<blocks, threads, 0, stream>>>(
+                myPe_, npes_, input,
+                output_transit_buffer_obj_, flagsObj_, barrierPtr_,
+                output /* user_output direct target */,
+                total_count, chunk_elems, scatter_base, reduce_complete_base,
+                phase_ts_ptr, post_ag_flag_ptr);
+        } else if (scatter_mode == 1) {
             PipelinedAllReduceSdmaKernel<T, 1><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
                 barrierPtr_, inputSymmObj, total_count, chunk_elems,
                 scatter_base, ag_base, reduce_complete_base, phase_ts_ptr,
-                post_ag_flag_ptr, direct_out_ptr);
+                post_ag_flag_ptr);
         } else if (external_scatter) {
             ScatterSdmaOnlyKernel<T><<<1, 512, 0, stream>>>(
                 myPe_, npes_, input, output_transit_buffer_obj_,
@@ -857,7 +874,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                     barrierPtr_, application::SymmMemObjPtr{},
                     total_count, chunk_elems, scatter_base, ag_base,
                     reduce_complete_base, phase_ts_ptr,
-                    post_ag_flag_ptr, direct_out_ptr);
+                    post_ag_flag_ptr);
             } else {
                 PipelinedAllReduceSdmaKernel<T, 0, false, true>
                     <<<blocks, threads, 0, stream>>>(
@@ -866,7 +883,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                     barrierPtr_, application::SymmMemObjPtr{},
                     total_count, chunk_elems, scatter_base, ag_base,
                     reduce_complete_base, phase_ts_ptr,
-                    post_ag_flag_ptr, direct_out_ptr);
+                    post_ag_flag_ptr);
             }
         } else if (multi_chunk) {
             PipelinedAllReduceSdmaKernel<T, 0, true><<<blocks, threads, 0, stream>>>(
@@ -874,18 +891,22 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                 output_transit_buffer_obj_, flagsObj_,
                 barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems,
                 scatter_base, ag_base, reduce_complete_base, phase_ts_ptr,
-                post_ag_flag_ptr, direct_out_ptr);
+                post_ag_flag_ptr);
         } else {
             PipelinedAllReduceSdmaKernel<T, 0, false><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
                 barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems,
                 scatter_base, ag_base, reduce_complete_base, phase_ts_ptr,
-                post_ag_flag_ptr, direct_out_ptr);
+                post_ag_flag_ptr);
         }
 
         pipeline_scatter_gen_ += numChunks_host;   // scatter SDMA only (qId=0)
-        pipeline_ag_gen_      += numChunks_host;   // AG SDMA (qId=1)
+        // Plan A skips SDMA AG, so no qId=1 signal increments — don't
+        // advance pipeline_ag_gen_ either (it tracks SDMA AG counter).
+        if (!use_plan_a) {
+          pipeline_ag_gen_ += numChunks_host;      // AG SDMA (qId=1)
+        }
         pipeline_reduce_gen_  += numChunks_host;   // reduce_complete via flags
 
         hipError_t err = hipGetLastError();
