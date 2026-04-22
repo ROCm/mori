@@ -52,24 +52,17 @@ fi
 
 if [ "$SKIP_BUILD" != "1" ]; then
   echo
-  echo "==================== [build examples] ===================="
-  # Rebuild mori with BUILD_EXAMPLES=ON (default in CMakeLists but OFF in pip)
-  BUILD_DIR="$REPO/build"
-  mkdir -p "$BUILD_DIR"
-  cd "$BUILD_DIR"
-  cmake .. \
-    -G Ninja \
-    -DUSE_ROCM=ON \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DGPU_TARGETS=gfx950 \
-    -DBUILD_EXAMPLES=ON \
-    -DWITH_MPI=ON 2>&1 | tail -20
-  ninja sdma_self_copy_test cu_xgmi_bench 2>&1 | tail -20
-  cd "$REPO"
+  echo "==================== [pip install with BUILD_EXAMPLES=ON] ===================="
+  # Re-use the existing pip build infra; just flip BUILD_EXAMPLES to ON so
+  # the example binaries (sdma_self_copy_test, cu_xgmi_bench) get produced
+  # alongside the python module. No raw cmake tricks.
+  BUILD_EXAMPLES=ON pip install -e .
 fi
 
-SDMA_BIN="$REPO/build/examples/sdma_self_copy_test"
-XGMI_BIN="$REPO/build/examples/cu_xgmi_bench"
+# Locate example binaries — pip/setup.py puts them inside the build tree used
+# by setuptools. Resolve by glob.
+SDMA_BIN="$(find "$REPO" -path "*/build*" -name sdma_self_copy_test -type f 2>/dev/null | head -1)"
+XGMI_BIN="$(find "$REPO" -path "*/build*" -name cu_xgmi_bench       -type f 2>/dev/null | head -1)"
 
 [ -x "$SDMA_BIN" ] || { echo "MISSING: $SDMA_BIN"; exit 1; }
 [ -x "$XGMI_BIN" ] || { echo "MISSING: $XGMI_BIN"; exit 1; }
