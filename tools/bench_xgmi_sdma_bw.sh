@@ -64,33 +64,33 @@ fi
 SDMA_BIN="$(find "$REPO" -path "*/build*" -name sdma_self_copy_test -type f 2>/dev/null | head -1)"
 XGMI_BIN="$(find "$REPO" -path "*/build*" -name cu_xgmi_bench       -type f 2>/dev/null | head -1)"
 
-[ -x "$SDMA_BIN" ] || { echo "MISSING: $SDMA_BIN"; exit 1; }
-[ -x "$XGMI_BIN" ] || { echo "MISSING: $XGMI_BIN"; exit 1; }
+echo "SDMA_BIN = ${SDMA_BIN:-NOT_FOUND}"
+echo "XGMI_BIN = ${XGMI_BIN:-NOT_FOUND}"
+[ -x "$XGMI_BIN" ] || { echo "MISSING: $XGMI_BIN (cu_xgmi_bench)"; exit 1; }
 
 LOG=/tmp/xgmi_sdma_bw_$(date +%s).log
 
 echo
-echo "==================== [run sdma_self_copy_test] ===================="
-echo "LOG -> $LOG"
+echo "==================== [run] LOG -> $LOG ===================="
 {
-  echo "##########################################"
-  echo "## SDMA self-copy + hipMemcpy D2D BW"
-  echo "## multi-q SDMA (64 queues per thread), sweep sizes 1-256 MB"
-  echo "##########################################"
-  echo
-  mpirun -n 8 --allow-run-as-root \
-    -x HIP_VISIBLE_DEVICES \
-    "$SDMA_BIN" 2>&1
-
-  echo
   echo "##########################################"
   echo "## CU XGMI multi-peer read BW"
   echo "## sweep bytes-per-peer 1-64 MB, blocks/peer 1-32"
   echo "##########################################"
   echo
-  mpirun -n 8 --allow-run-as-root \
-    -x HIP_VISIBLE_DEVICES \
-    "$XGMI_BIN" 2>&1
+  mpirun -n 8 --allow-run-as-root "$XGMI_BIN" 2>&1
+
+  # sdma_self_copy_test has a pre-existing bug that faults on multi-GPU
+  # (not our concern for this decision — SDMA self-copy BW is only plan B
+  # data, plan A depends only on CU XGMI BW).
+  if [ -x "$SDMA_BIN" ]; then
+    echo
+    echo "##########################################"
+    echo "## SDMA self-copy BW (may fault on multi-GPU — existing bug)"
+    echo "##########################################"
+    echo
+    mpirun -n 8 --allow-run-as-root "$SDMA_BIN" 2>&1 || echo "(sdma_self_copy_test faulted; skipped)"
+  fi
 } | tee "$LOG"
 
 echo
@@ -98,12 +98,16 @@ echo "################################################################"
 echo "## SUMMARY (auto-extracted)"
 echo "################################################################"
 echo
-echo "--- SDMA self-copy @ 256 MB (plan B viability) ---"
-grep -E "^\s*256\.[0-9] " "$LOG" | head -2 || true
+echo "--- CU XGMI load @ 32 MB/peer (AR per-peer shard, plan A viability) ---"
+awk '/per-peer bytes = 32 MB/,/per-peer bytes = 64 MB/' "$LOG" | grep -v "per-peer bytes = 64" || true
 
 echo
-echo "--- CU XGMI load @ 32 MB/peer (AR per-peer shard, plan A viability) ---"
-awk '/per-peer bytes = 32 MB/,/per-peer bytes = 64 MB/' "$LOG" | head -8 || true
+echo "--- CU XGMI load @ 64 MB/peer ---"
+awk '/per-peer bytes = 64 MB/,0' "$LOG" | head -8 || true
+
+echo
+echo "--- SDMA self-copy @ 256 MB (plan B, may be missing if fault) ---"
+grep -E "^\s+256\.[0-9]\s" "$LOG" | head -2 || echo "(no data)"
 
 echo
 echo "LOG: $LOG"
