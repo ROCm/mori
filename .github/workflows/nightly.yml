@@ -1,0 +1,174 @@
+name: Nightly Wheel Build
+
+on:
+  schedule:
+    - cron: '0 16 * * *'  # daily 00:00 Beijing (UTC+8)
+  workflow_dispatch:       # manual trigger
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: rocm/mori:ci
+  BASE_IMAGE: rocm/pytorch:rocm7.2.1_ubuntu24.04_py3.12_pytorch_release_2.8.0
+  CT: docker
+
+jobs:
+  build-wheel:
+    name: wheel (py${{ matrix.python }})
+    runs-on: [self-hosted, MI355X-AINIC-TW]
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build CI image
+        run: $CT build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE -t $IMAGE -f docker/Dockerfile.dev .
+
+      - name: Build wheel
+        run: |
+          DATE=$(date +%Y%m%d)
+          SHA=$(git rev-parse --short HEAD)
+          VERSION="${DATE}+${SHA}"
+          PY=${{ matrix.python }}
+
+          $CT run --rm --network=host \
+            -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE -w $GITHUB_WORKSPACE \
+            -v ${{ runner.temp }}/dist:/tmp/dist \
+            $IMAGE bash -c "
+              git config --global --add safe.directory '*'
+
+              if [ '$PY' != '3.12' ]; then
+                apt-get update -qq
+                apt-get install -y -qq software-properties-common > /dev/null 2>&1
+                add-apt-repository -y ppa:deadsnakes/ppa > /dev/null 2>&1
+                apt-get update -qq
+                apt-get install -y -qq python${PY} python${PY}-dev python${PY}-venv > /dev/null 2>&1
+                python${PY} -m ensurepip --upgrade > /dev/null 2>&1
+                python${PY} -m pip install --upgrade pip wheel setuptools pybind11 cmake ninja > /dev/null 2>&1
+              fi
+
+              echo 'Building wheel for Python ${PY}, version=${VERSION}'
+              SETUPTOOLS_SCM_PRETEND_VERSION=${VERSION} \
+                python${PY} -m pip wheel --no-deps -w /tmp/dist .
+            "
+
+          echo "=== produced ==="
+          ls -lh ${{ runner.temp }}/dist/
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-cp${{ matrix.python }}
+          path: ${{ runner.temp }}/dist/*.whl
+          retention-days: 30
+
+      - name: Cleanup
+        if: always()
+        run: |
+          $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE $IMAGE \
+              chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
+
+  deploy-nightly:
+    name: deploy to gh-pages
+    needs: build-wheel
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          merge-multiple: true
+          path: ./wheels
+
+      - name: List wheels
+        run: ls -lh ./wheels/
+
+      - name: Checkout gh-pages
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: gh-pages
+
+      - name: Add wheels and prune old ones
+        run: |
+          mkdir -p gh-pages/nightly
+          cp ./wheels/*.whl gh-pages/nightly/
+
+          # Prune wheels older than 30 days (by filename date prefix)
+          CUTOFF=$(date -d '30 days ago' +%Y%m%d 2>/dev/null || date -v-30d +%Y%m%d)
+          cd gh-pages/nightly
+          for f in amd_mori-*.whl; do
+            [ -f "$f" ] || continue
+            FILE_DATE=$(echo "$f" | sed -n 's/amd_mori-\([0-9]\{8\}\).*/\1/p')
+            if [ -n "$FILE_DATE" ] && [ "$FILE_DATE" -lt "$CUTOFF" ] 2>/dev/null; then
+              echo "Pruning old wheel: $f"
+              rm "$f"
+            fi
+          done
+          cd -
+
+      - name: Generate index.html
+        run: |
+          cd gh-pages/nightly
+          cat > index.html << 'HEADER'
+          <!DOCTYPE html>
+          <html><head>
+          <meta charset="utf-8">
+          <title>MoRI Nightly Wheels</title>
+          <style>
+            body { font-family: -apple-system, sans-serif; max-width: 960px; margin: 2em auto; padding: 0 1em; }
+            h1 { border-bottom: 1px solid #ddd; padding-bottom: 0.3em; }
+            table { border-collapse: collapse; width: 100%; }
+            th, td { text-align: left; padding: 6px 12px; border-bottom: 1px solid #eee; }
+            th { background: #f6f8fa; }
+            a { color: #0366d6; text-decoration: none; }
+            a:hover { text-decoration: underline; }
+            code { background: #f0f0f0; padding: 2px 6px; border-radius: 3px; font-size: 0.9em; }
+            .install { background: #f6f8fa; padding: 1em; border-radius: 6px; margin: 1em 0; }
+          </style>
+          </head><body>
+          <h1>MoRI Nightly Wheels</h1>
+          <div class="install">
+          <strong>Install latest nightly:</strong><br>
+          <code>pip install --find-links https://rocm.github.io/mori/nightly/ amd_mori</code>
+          </div>
+          <table>
+          <tr><th>Date</th><th>Commit</th><th>Python</th><th>Wheel</th><th>Size</th></tr>
+          HEADER
+
+          for f in $(ls -r amd_mori-*.whl 2>/dev/null); do
+            SIZE=$(du -h "$f" | cut -f1)
+            # Parse: amd_mori-20260423+9c7b3b0-cp312-cp312-linux_x86_64.whl
+            VER=$(echo "$f" | sed 's/amd_mori-\(.*\)-cp.*/\1/')
+            FILE_DATE=$(echo "$VER" | cut -d'+' -f1)
+            COMMIT=$(echo "$VER" | cut -d'+' -f2)
+            PRETTY_DATE="${FILE_DATE:0:4}-${FILE_DATE:4:2}-${FILE_DATE:6:2}"
+            PYTAG=$(echo "$f" | sed 's/.*-\(cp[0-9]*\)-cp.*/\1/')
+            echo "<tr><td>${PRETTY_DATE}</td><td><code>${COMMIT}</code></td><td>${PYTAG}</td><td><a href=\"${f}\">${f}</a></td><td>${SIZE}</td></tr>" >> index.html
+          done
+
+          cat >> index.html << 'FOOTER'
+          </table>
+          <p style="color:#888; margin-top:2em; font-size:0.85em">
+          Auto-generated by <a href="https://github.com/ROCm/mori/actions/workflows/nightly.yml">nightly.yml</a>.
+          Wheels older than 30 days are automatically pruned.
+          </p>
+          </body></html>
+          FOOTER
+
+      - name: Deploy to gh-pages
+        run: |
+          cd gh-pages
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add nightly/
+          git diff --cached --quiet && echo "No changes to deploy" && exit 0
+          git commit -m "nightly: add wheels $(date +%Y-%m-%d)"
+          git push
