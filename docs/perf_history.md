@@ -361,6 +361,29 @@ Summarized here for quick lookup; exact commits in git log:
 
 ---
 
+## Entry 13 — ρ' (increase chunk density) FAILED (2026-04-22)
+- **Scenario**: `MORI_PIPELINE_CHUNKS=2/4/8` env var, 4-stage 256MB overlap
+- **Results**:
+  | chunks | SDMA copy | SDMA no-copy |
+  |---|---|---|
+  | 2 (baseline) | 7.783 | 7.359 |
+  | 4 | 7.783 | 7.427 |
+  | 8 | 7.838 | 7.479 |
+- **Conclusion**: Chunk density increase has **zero gain on copy wall** and
+  slightly worsens no-copy wall (more submit overhead + more per-chunk barriers).
+- **Hypothesis refuted**: "SDMA engine stays hot with denser submission" is
+  wrong. Packet density alone doesn't keep engine hot.
+- **Refined mechanism hypothesis (needs further validation)**:
+  - Multi-stage AR[0] (0.614ms AG) vs Single-stage AR[0] (1.086ms AG) 差异
+    根源**不是** stream_ar 内部 submission 密度，而是 **cross-stream HBM 流量**
+  - Multi-stage 下 `stream_gemm` 上 GEMM[1..3] 在 AR[0] 期间持续产生 HBM 流量，
+    让 **memory controller / SDMA engine 保持 hot**
+  - Single-stage 或 AR[last]（multi-stage）下无 cross-stream 活动 → engine 进入
+    low-power wait → next packet dispatch latency +0.5 ms
+  - **ρ' 只在 stream_ar 内加密度没用，需要 cross-stream activity**
+
+---
+
 ## Entry 12.1 — Direction θ (multi-qId AG) FAILED IN IMPLEMENTATION (2026-04-22)
 - **Commits**: `1df5a9b1` (impl) + `c11c4870` (test) → reverted `219647a5`, `c3eccaa0`
 - **Correctness**: ✅ PASSED (Test 1b with MORI_AG_MULTI_Q=1)
