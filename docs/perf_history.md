@@ -305,6 +305,62 @@ Summarized here for quick lookup; exact commits in git log:
 
 ---
 
+---
+
+## Entry 11 — D' Step 2 (fast path) CORRECTNESS FAIL, REVERTED
+- **Date**: 2026-04-22
+- **Commits**: `fa1565a1` (Step 2 fast path, BUGGY) → reverted `6a544229`
+- **Test 1b** (copy_output_to_user=True, fast path ON) **all 8 PE FAIL**:
+  ```
+  PE 0 first mismatch at idx 0: got 1000 (expected 36000)
+  PE 1..7 first mismatch at idx 0: got 0 (expected 36000)
+  ```
+  - PE 0 gets only its own scattered shard (self-send doesn't go through SDMA)
+  - PE 1..7 get literally zero data — remote PE's SDMA puts went to
+    wrong addresses, target `output_tensor` never received them
+
+- **Root cause (mechanism-level, not "I guess")**:
+  - `ShmemSymmetricRegister(ptr, size)` internally calls `hipIpcGetMemHandle`
+    on `ptr` and `hipIpcOpenMemHandle` on peer handles
+  - `hipIpcOpenMemHandle` always returns the **allocation base** pointer
+    on the remote side, NOT the per-tensor data_ptr
+  - PyTorch caching allocator: `tensor.data_ptr()` is an **offset within**
+    a larger allocation block. `data_ptr() != allocation_base`
+  - So when mori stores `peer_ptrs[i] = p2p_peer_pointer_from_ipc`, it
+    actually has peer's ALLOCATION BASE, not peer's tensor start
+  - AR kernel's SDMA puts `write to peer's data_ptr + offset` but the
+    peer sees that address as pointing into OTHER data (or out-of-bounds)
+
+- **Evidence that the bug is in ptr mapping, not ptr validity**:
+  - `register_user_output` returned `ok=True` (register succeeded)
+  - Every PE entered fast path (kernel got ar_dst_obj = user_output symm)
+  - Scatter SDMA submissions happened (no HIP launch error)
+  - But output tensor on peers is unchanged → writes landed elsewhere
+
+- **Why `shmem::ShmemMalloc` works but `hipMalloc`/PyTorch tensor doesn't**:
+  - `ShmemMalloc` allocates inside a known shmem heap whose base is tracked
+  - The assumption `ptr = allocation_base` holds for shmem-heap allocs
+  - PyTorch tensor breaks this assumption; caching allocator subdivides
+    blocks allocated via `hipMalloc`
+
+- **What a fix would require (NOT attempted in this session)**:
+  - Every rank allgathers (allocation_base, offset_from_base) instead of
+    just ptr. After IPC open, compute `peer_ptr = peer_base + peer_offset`.
+  - On PyTorch side: need `hipDrvMemGetAddressRange(ptr)` or equivalent to
+    get the allocation base. Must handle aliasing, pinned allocations, etc.
+  - This is a `mori/shmem` library-level refactor, out of scope for this
+    session's goal.
+
+- **Conclusion**: **D' direction is not viable under PyTorch's default
+  caching allocator without a shmem-library IPC refactor**. Revert the
+  Step 2 kernel launch change; keep the Python `enable_register_user_output`
+  API as a no-op placeholder for future offset-aware register.
+- **Direction D' closed** for now. Pinning hopes on a correct implementation
+  requires rewriting `mori/shmem/application/memory/symmetric_memory.cpp`
+  to be offset-aware.
+
+---
+
 ## Running gap-to-target tally
 
 | date | best SDMA copy wall | RCCL median | gap | notes |
@@ -314,6 +370,7 @@ Summarized here for quick lookup; exact commits in git log:
 | 2026-04-22 | 7.744 | 7.672 | +0.9% | CU=220 (optimal); gap dominated by RCCL run noise |
 | 2026-04-22 | 8.940 | 7.424 | **+20.4% (WORSE)** | Stage 2b-1 catastrophic, reverted |
 | 2026-04-22 | 7.765 | 7.433 | +4.5% | Stage 2b-0 clean, baseline restored |
-| 2026-04-22 | _projected 7.381_ | _7.562_ | **_-2.4% (超 RCCL)_** | D' steady state projection (Entry 10) — pending Step 2 impl |
+| 2026-04-22 | _projected 7.381_ | _7.562_ | **_-2.4% (超 RCCL)_** | D' steady state projection (Entry 10) — **invalidated by Entry 11 correctness fail** |
+| 2026-04-22 | — | — | — | D' Step 2 **REVERTED** (Entry 11): PyTorch caching allocator incompatible with `hipIpcOpenMemHandle` semantics; direction closed pending shmem refactor |
 
 **Target**: SDMA copy ≤ RCCL (gap ≤ 0). Currently outstanding.
