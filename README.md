@@ -10,7 +10,7 @@
 
 ## Introduction
 
-<img src="docs/mori_arch_20250819_v0.png">
+<img src="docs/mori_arch_20260422_v1.jpg">
 
 **MORI** (**Mo**dular **R**DMA **I**nterface) is a **bottom-up, modular, and composable framework** for building high-performance communication applications with a strong focus on **RDMA + GPU integration**. Inspired by the role of MLIR in compiler infrastructure, MORI provides reusable and extensible building blocks that make it **easier for developers to adopt advanced techniques** such as IBGDA (Infiniband GPUDirect Async) and GDS (GPUDirect Storage).
 
@@ -21,6 +21,7 @@ To help developers get started quickly, MORI also includes a suite of optimized 
     - MORI-EP: intra and inter-node dispatch/combine kernels with SOTA performance.
     - MORI-IO: point-to-point communication library with ultra-low overhead
     - MORI-CCL: lightweight and flexible collective communication library designed for highly customized use cases such as latency-sensitive or resource-constrained environment
+    - MORI-UMBP: unified memory & bandwidth pool with tiered storage and distributed key-value access for scalable memory management
 - Framework
     - High-performance building blocks for IBGDA / P2P and more​
     - Modular & composable components for developing communication applications, such as transport management, topology detection and etc.
