@@ -340,9 +340,9 @@ __global__ void PipelinedAllReduceSdmaKernel(
       // acceptable via real wall measurement). ----------------------
       if (post_ag_flag != nullptr) {
         if (threadIdx.x == 0) {
-          while (__hip_atomic_load_n(
+          while (__hip_atomic_load(
                      post_ag_flag,
-                     __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) == 0) {
+                     __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) == 0u) {
             __builtin_amdgcn_s_sleep(2);
           }
         }
@@ -476,8 +476,8 @@ __global__ void PipelinedAllReduceSdmaKernel(
         // spin-waiting post-reduce.
         if (post_ag_flag != nullptr && threadIdx.x == 0) {
           __threadfence();
-          __hip_atomic_store_n(post_ag_flag, 1u,
-                               __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+          __hip_atomic_store(post_ag_flag, 1u,
+                             __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
           ar_write_phase_ts(phase_ts, 30);  // post_ag_flag set
         }
       } else {
@@ -538,8 +538,8 @@ __global__ void PipelinedAllReduceSdmaKernel(
         // Stage 1 E' prototype (single-chunk path).
         if (post_ag_flag != nullptr && threadIdx.x == 0) {
           __threadfence();
-          __hip_atomic_store_n(post_ag_flag, 1u,
-                               __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+          __hip_atomic_store(post_ag_flag, 1u,
+                             __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
           ar_write_phase_ts(phase_ts, 30);  // post_ag_flag set
         }
       }
