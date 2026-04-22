@@ -102,6 +102,14 @@ struct PoolClientConfig {
   // 0 = delegate to Master's ClientRegistryConfig::default_dram_page_size
   // (2 MiB by default).  Set to an explicit byte count to override.
   uint64_t dram_page_size = 0;
+
+  // Maximum bytes per single RDMA MR.  Forwarded from
+  // UMBPDistributedConfig::max_mr_chunk_size by ToPoolClientConfig().
+  // See UMBPDistributedConfig::max_mr_chunk_size for semantics.
+  // PoolClient::Init() splits each entry of `dram_buffers` into
+  // ceil(size / effective_chunk) sub-buffers before registering, where
+  // effective_chunk = min(this value if >0, IOEngine::GetMaxMemoryRegionSize()).
+  size_t max_mr_chunk_size = 0;
 };
 
 // Lower a user-facing UMBPDistributedConfig to the internal PoolClientConfig.
@@ -122,6 +130,7 @@ inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
   // proto -> ClientRegistry, where it is interpreted as "use the
   // registry-wide default_dram_page_size".
   pc.dram_page_size = dc.dram_page_size;
+  pc.max_mr_chunk_size = dc.max_mr_chunk_size;
   pc.dram_buffers = std::move(dram_buffers);
   pc.tier_capacities = std::move(tier_capacities);
   return pc;

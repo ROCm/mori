@@ -166,6 +166,13 @@ class Backend {
                                         TransferStatus* status) = 0;
 
   virtual bool CanHandle(const MemoryDesc& local, const MemoryDesc& remote) const { return true; }
+
+  // Largest single memory region the backend can register in one call.
+  // Returns SIZE_MAX when the backend imposes no known limit.  Callers
+  // (notably umbp's PoolClient) use this to decide whether to split a
+  // large registration request into multiple smaller MRs that round-robin
+  // across NICs.  See refactor/umbp-dual-scheme-abc large-MR doc.
+  virtual size_t GetMaxMemoryRegionSize() const { return SIZE_MAX; }
 };
 
 }  // namespace io

@@ -100,6 +100,17 @@ struct MemoryDesc {
   MemoryLocationType loc;
   std::array<char, kIpcHandleSize> ipcHandle{};
 
+  // Local-only registration policy.  When true, the RDMA backend will widen
+  // the underlying ibv_reg_mr to the surrounding system page boundary (see
+  // RdmaDeviceContext::RegisterRdmaMemoryRegionPageAligned).  Required by NIC
+  // firmwares (notably AMD AINIC/Pensando ionic) that reject partial-page MRs
+  // even when the per-context pin budget is otherwise fine.
+  //
+  // NOT serialized over the wire — peers don't care how this node decided to
+  // register the MR.  The lkey/rkey they receive references the actual ibv_mr
+  // and stays valid for any SGE address inside its reported range.
+  bool pageAlignedRegistration{false};
+
   constexpr bool operator==(const MemoryDesc& rhs) const noexcept {
     return (engineKey == rhs.engineKey) && (id == rhs.id) && (deviceId == rhs.deviceId) &&
            (deviceBusId == rhs.deviceBusId) && (data == rhs.data) && (size == rhs.size) &&

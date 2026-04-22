@@ -87,6 +87,17 @@ class IOEngine {
   void DeregisterRemoteEngine(const EngineDesc&);
 
   MemoryDesc RegisterMemory(void* data, size_t size, int device, MemoryLocationType loc);
+
+  // Same as RegisterMemory(), but instructs the RDMA backend to widen the
+  // underlying ibv_reg_mr to the surrounding system page boundary.  Use when
+  // the NIC firmware (e.g. AMD AINIC/Pensando ionic) cannot pin partial pages,
+  // OR when the caller buffer's start/end may not be page-aligned but the
+  // surrounding page(s) are guaranteed to be mapped (mmap'd / cudaHostAlloc'd
+  // / cudaHostRegister'd buffers satisfy this).  The returned MemoryDesc
+  // still reports the caller-supplied (data, size); no other API on this
+  // class needs to change.
+  MemoryDesc RegisterMemoryPageAligned(void* data, size_t size, int device, MemoryLocationType loc);
+
   void DeregisterMemory(const MemoryDesc& desc);
 
   TransferUniqueId AllocateTransferUniqueId();
@@ -107,6 +118,13 @@ class IOEngine {
 
   std::optional<IOEngineSession> CreateSession(const MemoryDesc& local, const MemoryDesc& remote);
   void LoadScatterGatherModule(const std::string& hsacoPath);
+
+  // Smallest GetMaxMemoryRegionSize() across all configured backends.
+  // SIZE_MAX means no backend reported a known cap.  Wrappers (umbp's
+  // PoolClient) call this to decide an effective MR chunk size before
+  // RegisterMemory() so registrations stay below per-NIC firmware caps
+  // (see AMD AINIC / Pensando ionic § per-context CPU pin budget).
+  size_t GetMaxMemoryRegionSize() const;
 
  private:
   struct RouteCacheKey {

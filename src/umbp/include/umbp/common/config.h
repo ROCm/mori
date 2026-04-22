@@ -127,6 +127,21 @@ struct UMBPDistributedConfig {
   // 0 = delegate to Master's ClientRegistryConfig::default_dram_page_size
   // (2 MiB by default).  Set to an explicit byte count to override.
   uint64_t dram_page_size = 0;
+
+  // Maximum bytes per single RDMA MR registration.  When > 0 each
+  // exportable DRAM buffer is split into ceil(size/max_mr_chunk_size)
+  // chunks before being passed to mori-io::RegisterMemory(), and every
+  // chunk becomes its own MemoryDesc.  This both keeps each ibv_reg_mr
+  // call below the firmware's per-context CPU pin budget (ionic ≈ 2 GiB
+  // safe / 1-33 GiB observed) and lets mori-io's per-MemoryDesc NIC
+  // round-robin spread pin pressure across all available NICs.
+  //
+  // 0 (default) = use min(ibv_device_attr.max_mr_size across all NICs) as
+  // returned by mori::io::IOEngine::GetMaxMemoryRegionSize() (with a
+  // hard 2 GiB cap on Pensando/AINIC vendor_id).  SIZE_MAX is treated as
+  // "no chunking" — the whole buffer becomes a single MR.
+  // Env override: UMBP_MAX_MR_CHUNK_SIZE (bytes).
+  size_t max_mr_chunk_size = 0;
 };
 
 struct UMBPConfig {

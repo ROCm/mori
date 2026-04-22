@@ -24,8 +24,10 @@
 #include <hip/hip_runtime_api.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <limits>
 
 #include "mori/io/env.hpp"
 #include "mori/io/logging.hpp"
@@ -280,6 +282,30 @@ MemoryDesc IOEngine::RegisterMemory(void* data, size_t size, int device, MemoryL
   return memDesc;
 }
 
+MemoryDesc IOEngine::RegisterMemoryPageAligned(void* data, size_t size, int device,
+                                               MemoryLocationType loc) {
+  MemoryDesc memDesc;
+  memDesc.engineKey = desc.key;
+  memDesc.id = nextMemUid.fetch_add(1, std::memory_order_relaxed);
+  memDesc.deviceId = device;
+  if (loc == MemoryLocationType::GPU) {
+    memDesc.deviceBusId = QueryDeviceBusId(device);
+  }
+  memDesc.data = reinterpret_cast<uintptr_t>(data);
+  memDesc.size = size;
+  memDesc.loc = loc;
+  memDesc.pageAlignedRegistration = true;
+
+  for (auto& it : backends) {
+    it.second->RegisterMemory(memDesc);
+  }
+
+  memPool.insert({memDesc.id, memDesc});
+  MORI_IO_TRACE("Register page-aligned memory address {} size {} device {} loc {} with id {}", data,
+                size, device, static_cast<uint32_t>(loc), memDesc.id);
+  return memDesc;
+}
+
 void IOEngine::DeregisterMemory(const MemoryDesc& desc) {
   for (auto& it : backends) {
     it.second->DeregisterMemory(desc);
@@ -472,6 +498,14 @@ bool IOEngine::PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
     if (popped) return true;
   }
   return false;
+}
+
+size_t IOEngine::GetMaxMemoryRegionSize() const {
+  size_t cap = std::numeric_limits<size_t>::max();
+  for (const auto& [type, be] : backends) {
+    cap = std::min(cap, be->GetMaxMemoryRegionSize());
+  }
+  return cap;
 }
 
 }  // namespace io

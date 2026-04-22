@@ -23,7 +23,9 @@
 
 #include <sys/mman.h>
 
+#include <cstdlib>
 #include <stdexcept>
+#include <string>
 
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/config.h"
@@ -36,7 +38,25 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
     throw std::runtime_error("DistributedClient requires UMBPConfig::distributed to be set");
   }
 
-  const auto& dc = config.distributed.value();
+  // Apply runtime env override on top of the programmatically-set
+  // max_mr_chunk_size before lowering to PoolClientConfig.  We mutate the
+  // local copy `dc_effective` rather than the caller's config to keep the
+  // original UMBPConfig observably const.  The split itself happens later
+  // inside PoolClient::Init(), where the IOEngine is available to query
+  // GetMaxMemoryRegionSize().  Env var format: bytes (decimal).  0 / unset
+  // = fall through to the device-reported cap.
+  UMBPDistributedConfig dc_effective = config.distributed.value();
+  if (const char* env_chunk = std::getenv("UMBP_MAX_MR_CHUNK_SIZE")) {
+    try {
+      dc_effective.max_mr_chunk_size = static_cast<size_t>(std::stoull(env_chunk));
+    } catch (const std::exception& e) {
+      MORI_UMBP_WARN(
+          "[DistributedClient] UMBP_MAX_MR_CHUNK_SIZE='{}' is not a valid byte count: {} "
+          "(falling back to config / device cap)",
+          env_chunk, e.what());
+    }
+  }
+  const auto& dc = dc_effective;
 
   dram_pool_size_ = config.dram.capacity_bytes;
   dram_pool_ =
@@ -46,6 +66,11 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
     throw std::runtime_error("DistributedClient: mmap failed for DRAM pool");
   }
 
+  // Hand the full pool to PoolClient as a SINGLE logical exportable
+  // buffer.  PoolClient::Init() will (post-IOEngine-creation) split this
+  // entry into ceil(dram_pool_size_ / effective_chunk) sub-buffers and
+  // register each as its own MemoryDesc — that's what spreads pin pressure
+  // across NICs and stays under the per-context CPU pin cap on ionic.
   auto pc_config = ToPoolClientConfig(
       dc,
       /*dram_buffers=*/{{dram_pool_, dram_pool_size_}},

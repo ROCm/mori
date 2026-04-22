@@ -356,6 +356,48 @@ application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionDmabuf(
   return handle;
 }
 
+application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionPageAligned(
+    void* ptr, size_t size, int accessFlag) {
+  // Round [ptr, ptr+size) out to whole system pages so ibv_reg_mr always pins
+  // full pages.  See header for why this matters on AMD AINIC / Pensando ionic.
+  // PRECONDITION: caller guarantees the surrounding page(s) are mapped.
+  long page_size_long = sysconf(_SC_PAGE_SIZE);
+  size_t page_size = page_size_long > 0 ? static_cast<size_t>(page_size_long) : 4096;
+
+  uintptr_t user_addr = reinterpret_cast<uintptr_t>(ptr);
+  uintptr_t aligned_addr = user_addr - (user_addr % page_size);
+  size_t head_padding = user_addr - aligned_addr;
+  size_t aligned_size_raw = head_padding + size;
+  size_t aligned_size = (aligned_size_raw + page_size - 1) / page_size * page_size;
+  void* aligned_ptr = reinterpret_cast<void*>(aligned_addr);
+
+  int effectiveAccessFlag = MaybeAddRelaxedOrderingFlag(accessFlag);
+  ibv_mr* mr = ibv_reg_mr(pd, aligned_ptr, aligned_size, effectiveAccessFlag);
+  if (!mr) {
+    MORI_APP_ERROR(
+        "RegisterRdmaMemoryRegionPageAligned failed! user_addr:{}, user_size:{}, "
+        "aligned_addr:{}, aligned_size:{}, accessFlag:{}, errno:{} ({})",
+        ptr, size, aligned_ptr, aligned_size, effectiveAccessFlag, errno, strerror(errno));
+    std::abort();
+  }
+  MORI_APP_TRACE(
+      "RegisterRdmaMemoryRegionPageAligned, user_addr:{}, user_size:{}, aligned_addr:{}, "
+      "aligned_size:{}, lkey:{}, rkey:{}\n",
+      ptr, size, aligned_ptr, aligned_size, mr->lkey, mr->rkey);
+  // Key by user ptr so DeregisterRdmaMemoryRegion(user_ptr) still works.
+  mrPool.insert({ptr, mr});
+  // Return USER-visible (addr, length).  The lkey/rkey reference the larger
+  // ibv_mr; verbs accepts any SGE address within [aligned_addr,
+  // aligned_addr + aligned_size), so SGE = user_addr + offset stays valid
+  // without callers needing to know about the alignment.
+  application::RdmaMemoryRegion handle;
+  handle.addr = user_addr;
+  handle.lkey = mr->lkey;
+  handle.rkey = mr->rkey;
+  handle.length = size;
+  return handle;
+}
+
 void RdmaDeviceContext::DeregisterRdmaMemoryRegion(void* ptr) {
   if (mrPool.find(ptr) == mrPool.end()) return;
   ibv_mr* mr = mrPool[ptr];

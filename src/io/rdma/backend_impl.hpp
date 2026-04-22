@@ -79,6 +79,11 @@ class RdmaManager {
 
   application::RdmaDeviceContext* GetRdmaDeviceContext(int devId);
 
+  // Read-only access to the (device, port) list this manager is using.
+  // Used by RdmaBackend::GetMaxMemoryRegionSize() to query each device's
+  // max_mr_size attribute.
+  const application::ActiveDevicePortList& GetAvailDevices() const { return availDevices; }
+
  private:
   application::RdmaDeviceContext* GetOrCreateDeviceContext(int devId);
 
@@ -250,6 +255,12 @@ class RdmaBackend : public Backend {
                       bool isRead);
   BackendSession* CreateSession(const MemoryDesc& local, const MemoryDesc& remote);
   bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id, TransferStatus* status);
+
+  // Smallest reliable single-MR size across all NICs this backend manages.
+  // For Pensando/AINIC ("ionic") devices the kernel-reported max_mr_size
+  // is misleading (advertises ~SIZE_MAX, but per-context CPU pin budget
+  // bites at a few GiB) — clamp to a known-safe 2 GiB.
+  size_t GetMaxMemoryRegionSize() const override;
 
  private:
   void CreateSession(const MemoryDesc& local, const MemoryDesc& remote, RdmaBackendSession& sess);

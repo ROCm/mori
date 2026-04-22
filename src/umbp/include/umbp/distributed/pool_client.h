@@ -23,6 +23,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -206,17 +207,42 @@ class PoolClient {
   bool RemoteSsdRead(PeerConnection& peer, const std::string& key, const std::string& location_id,
                      void* dst, size_t size, bool zero_copy);
 
-  // Zero-copy registered memory regions
+  // Zero-copy registered memory regions.
+  //
+  // One user RegisterMemory(ptr, size) call may create N RegisteredRegion
+  // entries when ptr+size exceeds the effective per-MR cap.  All entries
+  // produced by the same call share `group_base = ptr`; that's what
+  // DeregisterMemory(ptr) uses to find and release every chunk.
+  //
+  // Page alignment is handled inside mori-io (via
+  // IOEngine::RegisterMemoryPageAligned), so `base` / `size` here are the
+  // caller-visible chunk start / length and FindRegisteredMemory returns
+  // offsets relative to `base`.
   struct RegisteredRegion {
     void* base;
     size_t size;
     mori::io::MemoryDesc mem_desc;
+    void* group_base;
   };
   std::mutex registered_mem_mutex_;
   std::vector<RegisteredRegion> registered_regions_;
 
+  // Returns (mem_desc, offset_within_chunk) when [ptr, ptr+size) is fully
+  // contained inside ONE registered chunk.  Returns nullopt when the range
+  // straddles a chunk boundary or no chunk contains it — caller falls back
+  // to staging.  This matches the original semantics: zero-copy requires
+  // one contiguous registered MR for the whole range.
   std::optional<std::pair<mori::io::MemoryDesc, size_t>> FindRegisteredMemory(const void* ptr,
                                                                               size_t size);
+
+  // Effective per-MR chunk size used at Init() time.  Computed as
+  //   min(config_.max_mr_chunk_size if > 0, io_engine_->GetMaxMemoryRegionSize())
+  // and aligned down to the system page size when finite.  SIZE_MAX
+  // (== std::numeric_limits<size_t>::max()) means "no chunking".
+  // Captured once at Init() and reused by the user-facing
+  // RegisterMemory(ptr, size) so the export DRAM path and the user
+  // pre-register path never disagree on chunk sizing.
+  size_t mr_chunk_size_{std::numeric_limits<size_t>::max()};
 
   mutable std::mutex cache_mutex_;
   std::unordered_map<std::string, Location> cluster_locations_;

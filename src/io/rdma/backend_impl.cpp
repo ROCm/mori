@@ -117,7 +117,12 @@ application::RdmaMemoryRegion RdmaManager::RegisterLocalMemory(int devId, const 
   std::unique_lock<std::shared_mutex> lock(mu);
   MemoryKey key{devId, desc.id};
   application::RdmaDeviceContext* devCtx = GetOrCreateDeviceContext(devId);
-  mTable[key] = devCtx->RegisterRdmaMemoryRegion(reinterpret_cast<void*>(desc.data), desc.size);
+  void* ptr = reinterpret_cast<void*>(desc.data);
+  if (desc.pageAlignedRegistration) {
+    mTable[key] = devCtx->RegisterRdmaMemoryRegionPageAligned(ptr, desc.size);
+  } else {
+    mTable[key] = devCtx->RegisterRdmaMemoryRegion(ptr, desc.size);
+  }
   return mTable[key];
 }
 
@@ -987,6 +992,32 @@ void RdmaBackend::InvalidateSessionsForMemory(MemoryUniqueId id) {
       ++it;
     }
   }
+}
+
+size_t RdmaBackend::GetMaxMemoryRegionSize() const {
+  // AMD AINIC (Pensando "ionic") reports max_mr_size = ~UINT64_MAX via
+  // ibv_query_device, but the firmware's per-context CPU pin budget
+  // empirically caps a single ibv_pd at ~1-33 GiB depending on THP
+  // coverage / process state.  2 GiB is the largest single MR that has
+  // never been observed to fail in production sglang+umbp loads
+  // (see tests/python/io/repro_chunked_registration_failure.py §10).
+  static constexpr size_t kIonicMaxMrSize = 2ULL * 1024 * 1024 * 1024;
+
+  size_t cap = std::numeric_limits<size_t>::max();
+  for (const auto& [dev, port] : rdma->GetAvailDevices()) {
+    const auto* attr = dev->GetDeviceAttr();
+    if (attr == nullptr) continue;
+
+    size_t devCap = static_cast<size_t>(attr->orig_attr.max_mr_size);
+    if (attr->orig_attr.vendor_id ==
+        static_cast<uint32_t>(application::RdmaDeviceVendorId::Pensando)) {
+      devCap = kIonicMaxMrSize;
+    }
+    if (devCap > 0) {
+      cap = std::min(cap, devCap);
+    }
+  }
+  return cap;
 }
 
 }  // namespace io

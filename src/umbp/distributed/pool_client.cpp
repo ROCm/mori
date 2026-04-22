@@ -25,8 +25,10 @@
 #include <grpcpp/grpcpp.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <msgpack.hpp>
 
 #include "mori/io/backend.hpp"
@@ -80,6 +82,40 @@ inline bool SizeMatchesAllocation(size_t size, size_t num_pages, uint64_t page_s
   if (size <= (num_pages - 1) * page_size) return false;
   return true;
 }
+
+// Compute the actual MR chunk size to use given (a) device cap and (b)
+// caller-supplied override.  Returns SIZE_MAX when no chunking is needed
+// (no caller override AND no device cap).  Result is aligned down to the
+// system page size to keep MR registrations page-aligned (ibv_reg_mr does
+// not strictly require it but it matches kernel pinning granularity and
+// avoids splitting THP-coalesced 2 MiB pages across MRs).  Floored at
+// kMinChunk so we never produce absurdly tiny MRs from a misconfigured
+// override.
+constexpr size_t kMinChunk = 64ULL * 1024 * 1024;  // 64 MiB floor
+
+size_t ComputeEffectiveMrChunkSize(size_t configured_chunk, size_t device_cap) {
+  size_t effective = std::numeric_limits<size_t>::max();
+  if (configured_chunk > 0) effective = std::min(effective, configured_chunk);
+  if (device_cap > 0) effective = std::min(effective, device_cap);
+  if (effective == std::numeric_limits<size_t>::max()) return effective;
+
+  long page_size_long = sysconf(_SC_PAGE_SIZE);
+  if (page_size_long > 0) {
+    auto page_size = static_cast<size_t>(page_size_long);
+    if (effective > page_size) {
+      effective = (effective / page_size) * page_size;
+    }
+  }
+  if (effective < kMinChunk) {
+    MORI_UMBP_WARN(
+        "[PoolClient] effective MR chunk size {} below minimum {} bytes; clamping up. "
+        "Check UMBP_MAX_MR_CHUNK_SIZE / max_mr_chunk_size and device max_mr_size.",
+        effective, kMinChunk);
+    effective = kMinChunk;
+  }
+  return effective;
+}
+
 }  // namespace
 
 PoolClient::PoolClient(PoolClientConfig config) : config_(std::move(config)) {}
@@ -108,15 +144,45 @@ bool PoolClient::Init() {
     staging_mem_ = io_engine_->RegisterMemory(staging_buffer_.get(), config_.staging_buffer_size,
                                               -1, mori::io::MemoryLocationType::CPU);
 
+    // Determine the effective MR chunk size now that the RDMA backend
+    // knows the device-side cap, then SLICE every entry of
+    // config_.dram_buffers into ceil(size / chunk) sub-buffers in place.
+    // After this, config_.dram_buffers.size() == number of MRs we'll
+    // register; downstream code that indexes by buffer_index (local
+    // Get/Put short-circuit, master page bitmap) will see the chunked
+    // layout naturally.
+    const size_t device_cap = io_engine_->GetMaxMemoryRegionSize();
+    mr_chunk_size_ = ComputeEffectiveMrChunkSize(config_.max_mr_chunk_size, device_cap);
+
+    if (mr_chunk_size_ != std::numeric_limits<size_t>::max()) {
+      std::vector<ExportableDram> chunked;
+      chunked.reserve(config_.dram_buffers.size());
+      for (const auto& dram : config_.dram_buffers) {
+        if (!dram.buffer || dram.size == 0) continue;
+        for (size_t off = 0; off < dram.size; off += mr_chunk_size_) {
+          size_t sz = std::min(mr_chunk_size_, dram.size - off);
+          chunked.push_back({static_cast<char*>(dram.buffer) + off, sz});
+        }
+      }
+      if (chunked.size() != config_.dram_buffers.size()) {
+        MORI_UMBP_INFO(
+            "[PoolClient] DRAM MR chunking: {} input buffer(s) -> {} chunks "
+            "(chunk_size={} bytes, device_cap={}, configured={})",
+            config_.dram_buffers.size(), chunked.size(), mr_chunk_size_, device_cap,
+            config_.max_mr_chunk_size);
+      }
+      config_.dram_buffers = std::move(chunked);
+    }
+
     for (const auto& dram : config_.dram_buffers) {
       if (dram.buffer && dram.size > 0) {
-        auto mem = io_engine_->RegisterMemory(dram.buffer, dram.size, -1,
-                                              mori::io::MemoryLocationType::CPU);
+        auto mem = io_engine_->RegisterMemoryPageAligned(dram.buffer, dram.size, -1,
+                                                         mori::io::MemoryLocationType::CPU);
         export_dram_mems_.push_back(mem);
       }
     }
 
-    MORI_UMBP_INFO("[PoolClient] IOEngine initialized on {}:{} ({} DRAM buffers)",
+    MORI_UMBP_INFO("[PoolClient] IOEngine initialized on {}:{} ({} DRAM MR(s))",
                    config_.io_engine.host, config_.io_engine.port, export_dram_mems_.size());
   }
 
@@ -235,26 +301,67 @@ bool PoolClient::RegisterMemory(void* ptr, size_t size) {
     MORI_UMBP_ERROR("[PoolClient] RegisterMemory: IOEngine not available");
     return false;
   }
+  if (!ptr || size == 0) {
+    MORI_UMBP_ERROR("[PoolClient] RegisterMemory: rejecting ptr={} size={}", ptr, size);
+    return false;
+  }
+
+  // Slice the user buffer using the same effective chunk size that the
+  // export DRAM path uses, so per-NIC pin pressure is symmetric and a
+  // sufficiently large user-registered region (e.g. sglang HostKVCache)
+  // does not trip the per-context CPU pin cap.  When mr_chunk_size_ is
+  // SIZE_MAX (no device cap, no override), `chunk` collapses to the full
+  // size and we register a single MR — preserving pre-chunking behavior.
+  //
+  // Page alignment of each MR is delegated to
+  // IOEngine::RegisterMemoryPageAligned() in mori-io: it widens every
+  // ibv_reg_mr to the surrounding system page boundary so the kernel pin
+  // path operates on whole pages (required by AMD AINIC/Pensando ionic).
+  // The returned MemoryDesc still describes the caller-visible (ptr, size),
+  // so the simple inclusion check in FindRegisteredMemory below is correct.
+  const size_t chunk =
+      (mr_chunk_size_ == std::numeric_limits<size_t>::max()) ? size : mr_chunk_size_;
+
   std::lock_guard<std::mutex> lock(registered_mem_mutex_);
+  // Dedup: if any chunk in this group is already present, treat the whole
+  // call as a no-op.  Matches the prior single-buffer dedup contract.
   for (auto& reg : registered_regions_) {
-    if (reg.base == ptr) {
+    if (reg.group_base == ptr) {
       MORI_UMBP_DEBUG("[PoolClient] RegisterMemory: ptr={} already registered, skipping", ptr);
       return true;
     }
   }
-  auto mem_desc = io_engine_->RegisterMemory(ptr, size, -1, mori::io::MemoryLocationType::CPU);
-  registered_regions_.push_back({ptr, size, mem_desc});
-  MORI_UMBP_INFO("[PoolClient] RegisterMemory: ptr={}, size={}", ptr, size);
+
+  size_t num_chunks = 0;
+  for (size_t off = 0; off < size; off += chunk) {
+    size_t sz = std::min(chunk, size - off);
+    void* chunk_ptr = static_cast<char*>(ptr) + off;
+    auto mem_desc =
+        io_engine_->RegisterMemoryPageAligned(chunk_ptr, sz, -1, mori::io::MemoryLocationType::CPU);
+    registered_regions_.push_back({chunk_ptr, sz, mem_desc, ptr});
+    ++num_chunks;
+  }
+  MORI_UMBP_INFO("[PoolClient] RegisterMemory: ptr={}, size={}, chunks={} (chunk_size={})", ptr,
+                 size, num_chunks, chunk);
   return true;
 }
 
 void PoolClient::DeregisterMemory(void* ptr) {
   std::lock_guard<std::mutex> lock(registered_mem_mutex_);
-  auto it = std::find_if(registered_regions_.begin(), registered_regions_.end(),
-                         [ptr](const RegisteredRegion& r) { return r.base == ptr; });
-  if (it != registered_regions_.end()) {
-    if (io_engine_) io_engine_->DeregisterMemory(it->mem_desc);
-    registered_regions_.erase(it);
+  // Remove every chunk that was produced by the matching RegisterMemory()
+  // call (identified by group_base == ptr).
+  size_t removed = 0;
+  for (auto it = registered_regions_.begin(); it != registered_regions_.end();) {
+    if (it->group_base == ptr) {
+      if (io_engine_) io_engine_->DeregisterMemory(it->mem_desc);
+      it = registered_regions_.erase(it);
+      ++removed;
+    } else {
+      ++it;
+    }
+  }
+  if (removed == 0) {
+    MORI_UMBP_DEBUG("[PoolClient] DeregisterMemory: ptr={} not registered", ptr);
   }
 }
 
@@ -262,6 +369,9 @@ std::optional<std::pair<mori::io::MemoryDesc, size_t>> PoolClient::FindRegistere
     const void* ptr, size_t size) {
   auto addr = reinterpret_cast<uintptr_t>(ptr);
   std::lock_guard<std::mutex> lock(registered_mem_mutex_);
+  // Zero-copy is only safe when the entire [ptr, ptr+size) range fits
+  // inside ONE registered chunk's MR.  Page widening lives in mori-io now,
+  // so the offset returned here is the natural (addr - chunk_base).
   for (auto& reg : registered_regions_) {
     auto base = reinterpret_cast<uintptr_t>(reg.base);
     if (addr >= base && size <= reg.size && (addr - base) <= reg.size - size) {

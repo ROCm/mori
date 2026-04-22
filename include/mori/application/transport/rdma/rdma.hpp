@@ -212,6 +212,26 @@ class RdmaDeviceContext {
                                                     int accessFlag = MR_DEFAULT_ACCESS_FLAG);
   virtual RdmaMemoryRegion RegisterRdmaMemoryRegionDmabuf(void* ptr, size_t size, int dmabuf_fd,
                                                           int accessFlag = MR_DEFAULT_ACCESS_FLAG);
+
+  // Same contract as RegisterRdmaMemoryRegion, but the underlying ibv_reg_mr
+  // call is widened to the surrounding system page boundary (round `ptr` down,
+  // round `ptr+size` up to a multiple of sysconf(_SC_PAGE_SIZE)).  This makes
+  // the kernel pin path operate on whole pages — required by some NIC
+  // firmwares (notably AMD AINIC/Pensando ionic) that reject partial-page MRs
+  // with ENOMEM even when the per-context pin budget is otherwise available.
+  //
+  // The returned RdmaMemoryRegion still reports the caller-supplied
+  // (addr, length) so SGE construction (`addr + offset`) works unchanged;
+  // only the underlying ibv_mr is larger.  `DeregisterRdmaMemoryRegion(ptr)`
+  // releases the MR using the same caller-supplied `ptr`.
+  //
+  // PRECONDITION: every byte in [AlignDown(ptr, page), AlignUp(ptr+size, page))
+  // must be part of a valid mapping in this process.  Callers that pass
+  // mmap'd / cudaHostAlloc'd / cudaHostRegister'd buffers (whole-page
+  // allocations) satisfy this naturally.
+  virtual RdmaMemoryRegion RegisterRdmaMemoryRegionPageAligned(
+      void* ptr, size_t size, int accessFlag = MR_DEFAULT_ACCESS_FLAG);
+
   virtual void DeregisterRdmaMemoryRegion(void* ptr);
 
   // TODO: query gid entry by ibv_query_gid_table
