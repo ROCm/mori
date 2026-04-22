@@ -167,32 +167,44 @@ RCCL `dist.all_reduce(tensor)` 的 drop-in 替代语义。
 
 若引用不出 2 条数据，说明数据不足，**先补打点**，不强行推进方案。
 
-### R11. 批量对比实验必须统一到单一 log 文件 + 给出可复现的提取命令
+### R11. 批量对比实验 = 单一可复现 shell block（跑测 + 提取 + 打印对比 一次完成）
 
 **触发**：一次给用户 ≥ 2 条对比命令（例如 baseline vs 方案 A vs 方案 B vs 组合）。
 
-**不得**：
-- ❌ 把 4 条命令分别贴给用户，让用户手动把 4 段输出拼回给自己
-- ❌ 让用户用 `| tail -5` / `| grep` 只筛出部分信息，后续想再看别的字段就要重跑
-- ❌ 只给测试命令、不给提取命令，让用户 scroll 几千行 log 自己找数字
+**硬性要求 —— 用户只 copy-paste 一次就能得到对比结果**：
 
-**必须**：
-1. **一条 shell 流程**（for 循环 / bash block / shell script）把所有对比变体跑完，
-   **全部**输出 `tee -a "$LOG"` 到**同一个 log 文件**。每段前用明显分隔符
-   `========== <label> ==========` 标注，便于后续 `awk/grep` 按 label 定位。
-2. **log 文件名含时间戳**（`/tmp/perf_<topic>_$(date +%s).log`），
-   避免多次运行相互覆盖。
-3. **在命令末尾 `echo "LOG: $LOG"`**，用户贴回来时我能直接知道文件路径。
-4. **提供配套的"提取命令"**（同样 copy-paste 能跑），至少包含：
-   - 按 label 分组提取关键指标行（例如 `256 MB |` wall 行）
-   - 提取 phase breakdown 的关键 phase（`AG-submit→AG-wait-done` 等）
-   - 若某方向通过要立刻查的字段（例如 GEMM dur、copy host us）
-5. **用户只需要贴 2 段**：log 文件完整内容（或提取命令的输出）+ 提取命令输出。
-   不需要用户做任何手工筛选或拼接。
+1. **跑测 + 提取 + 打印对比表在同一个 shell block 内**（单次 copy-paste 完成）：
+   ```bash
+   LOG=/tmp/perf_<topic>_$(date +%s).log
+   { ...循环跑所有变体...tee 到 $LOG... } | tee "$LOG"
+   # 紧接着（同一 block 内）：
+   awk/grep 从 $LOG 提取并直接打印对比表（用户无需再粘一次命令）
+   echo "LOG: $LOG"
+   ```
+2. **所有变体输出**重定向到**同一个 `$LOG` 文件**（`tee "$LOG"`），
+   每段前用 `========== <LABEL> ==========` 分隔，便于 `awk` 按 label 切段。
+3. **log 文件名含时间戳**（`/tmp/perf_<topic>_$(date +%s).log`），避免覆盖。
+4. **block 末尾 `echo "LOG: $LOG"`**，用户贴回结果时我能直接定位。
+5. **提取逻辑内嵌在同一 block**，至少自动打印：
+   - 各 label 的关键指标对比（wall ms / phase ms / gap vs RCCL）
+   - per-phase breakdown 里 gap 最大的 phase
+   - 机制假设对应的 side-metric（例如 GEMM dur、AG-submit→AG-wait-done）
+6. **用户只需要贴回 1 段输出**（stdout 的全部内容，含对比表）。
+   不得要求用户"然后再跑下面这条提取命令"。
 
-**反模式（本会话发生过）**：给出 4 条独立 `... | grep -E "256 MB \|"` 命令，
-用户要手动把 4 段输出拼回来，丢失 timeline / breakdown 等上下文信息。
-按 R11 必须改成：1 个 shell block + 1 个 LOG 路径 + 1 组 awk/grep 提取命令。
+**反模式（必须避免）**：
+
+| ❌ 错误 | ✅ 正确 |
+|--------|--------|
+| 给用户 4 条独立 `python test ... \| grep wall` 命令，让用户逐条跑 | 1 个 bash for 循环跑 4 变体，tee 到 $LOG |
+| "然后请再跑下面这条 awk/grep 从 $LOG 提取" | awk/grep 内嵌在同一 block，紧跟 tee 之后 |
+| 只给测试命令，让用户 scroll 几千行 log 找数字 | block 末尾直接打印 ready-to-read 的对比表 |
+| 让用户手工把 4 段 stdout 拼到一起贴回来 | 一次 `tee "$LOG"` + 一次提取 = 一次粘贴 |
+| 多次 pip install / source env 散落在各 label 之间 | 1 次 pip install + 1 次 git pull 放在 block 开头 |
+
+**本会话发生过的违规**：R11 首版要求"单一 log + 提取命令"，但把"跑"和"提取"
+分成**两次** copy-paste，等价于让用户跑两次 shell。按更新后的 R11，必须在
+**同一 block** 内完成"跑 → tee → 立刻 awk/grep → 打印对比表"，用户只贴一次结果。
 
 ## 工作流模板（每轮都走这个）
 
