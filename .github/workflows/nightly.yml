@@ -4,6 +4,9 @@ on:
   schedule:
     - cron: '0 16 * * *'  # daily 00:00 Beijing (UTC+8)
   workflow_dispatch:       # manual trigger
+  pull_request:            # TODO: remove after first successful run
+    paths:
+      - '.github/workflows/nightly.yml'
 
 concurrency:
   group: nightly-${{ github.ref }}
@@ -76,6 +79,7 @@ jobs:
   deploy-nightly:
     name: deploy to gh-pages
     needs: build-wheel
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: write
