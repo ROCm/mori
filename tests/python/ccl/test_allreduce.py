@@ -705,12 +705,6 @@ def _test_gemm_overlap_comparison(
             copy_output_to_user=True,
             dtype=dtype,
         )
-        # Stage 2b-1: env-controlled auto-enable (covers Test 2 correctness).
-        if os.environ.get("MORI_POST_AG_WAIT", "0") == "1":
-            try:
-                ar._handle.enable_post_ag_wait(True)
-            except Exception as e:
-                print(f"[warn] enable_post_ag_wait failed: {e}", flush=True)
         inp = torch.full((elems,), fill_value, dtype=dtype, device=device)
         out = torch.zeros(elems, dtype=dtype, device=device)
 
