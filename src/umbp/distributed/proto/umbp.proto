@@ -290,6 +290,25 @@ message BatchLookupResponse {
   repeated bool found = 1;
 }
 
+// Batch rollback of pending allocations.  Each entry carries its own
+// target `node_id` (the node owning the pending lease), mirroring the
+// single-item AbortAllocationRequest semantics so a single request can
+// roll back pendings across heterogeneous target nodes in one RPC.
+message BatchAbortAllocationEntry {
+  string node_id       = 1;  // target node whose lease should be rolled back
+  string allocation_id = 2;
+  uint64 size          = 3;
+}
+message BatchAbortAllocationRequest {
+  repeated BatchAbortAllocationEntry entries = 1;
+}
+message BatchAbortAllocationResponse {
+  // Parallel to request.entries; per-entry false is not an error
+  // (racy reap / double-abort / EXPIRED node), same as single-item
+  // AbortAllocationResponse.aborted semantics.
+  repeated bool aborted = 1;
+}
+
 // ============================================================
 //  Single unified service
 // ============================================================
@@ -317,4 +336,5 @@ service UMBPMaster {
   rpc BatchRouteGet(BatchRouteGetRequest) returns (BatchRouteGetResponse);
   rpc BatchFinalizeAllocation(BatchFinalizeRequest) returns (BatchFinalizeResponse);
   rpc BatchLookup(BatchLookupRequest) returns (BatchLookupResponse);
+  rpc BatchAbortAllocation(BatchAbortAllocationRequest) returns (BatchAbortAllocationResponse);
 }
