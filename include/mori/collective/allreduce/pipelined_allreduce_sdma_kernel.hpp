@@ -375,86 +375,91 @@ __global__ void PipelinedAllReduceSdmaKernel(
       // ----------------------------------------------------------------
       if constexpr (MULTI_CHUNK) {
         if (user_output_for_copy != nullptr && compBlocks > 0) {
+          // E'' v2: assign ONE block per peer (the first cb_id in each
+          // peer group) to do the full 32 MB copy; other blocks idle
+          // via cheap s_sleep. Rationale (data from v1): when 20 blocks
+          // per peer all read+write in parallel, local HBM contends with
+          // SDMA AG inbound writes and AG wait goes +0.048 ms, wiping
+          // out the copy saving. With 1 block per peer the HBM pressure
+          // drops ~20×; 1 block with 256 threads × 16 B = 4 KB per
+          // spin iter → 32 MB in ~8K iters × ~100 ns = ~0.8 ms — still
+          // hides inside AG wait (~1 ms) by a comfortable margin.
           using vec_t = ulonglong2;  // 16 B
           static_assert(sizeof(vec_t) == 16, "vec_t must be 16B");
 
           const int cb_id = static_cast<int>(blockIdx.x) - 1;
-          // Assign peer by round-robin: blocks [p*compBlocks/npes,
-          // (p+1)*compBlocks/npes) handle peer p. Guarantees every peer
-          // gets at least 1 block when compBlocks >= npes.
-          int peer;
-          int first_cb_for_peer;
-          int last_cb_for_peer;  // exclusive
-          if (compBlocks >= npes) {
-            peer = (cb_id * npes) / compBlocks;
-            if (peer >= npes) peer = npes - 1;
-            first_cb_for_peer = (peer * compBlocks) / npes;
-            last_cb_for_peer = ((peer + 1) * compBlocks) / npes;
-            if (last_cb_for_peer > compBlocks) last_cb_for_peer = compBlocks;
-          } else {
-            // Fallback: each block handles (npes / compBlocks) peers
-            // sequentially — rare (compBlocks < 8 means CU=1..7).
-            peer = cb_id % npes;
-            first_cb_for_peer = cb_id;
-            last_cb_for_peer = cb_id + 1;
-          }
-          const int my_pos = cb_id - first_cb_for_peer;
-          const int cb_count_for_peer = last_cb_for_peer - first_cb_for_peer;
+          // Each peer has exactly 1 copy-worker block. Its cb_id =
+          // peer * compBlocks / npes (integer arithmetic; one block
+          // per peer).
+          // cb_id → peer assignment (as copy-worker): peer = cb_id *
+          // npes / compBlocks. That block is the worker for its peer.
+          const int peer =
+              (compBlocks >= npes)
+                  ? (cb_id * npes) / compBlocks
+                  : (cb_id % npes);
+          const int first_cb_for_peer =
+              (compBlocks >= npes)
+                  ? (peer * compBlocks) / npes
+                  : cb_id;
+          const bool is_copy_worker = (cb_id == first_cb_for_peer);
 
-          // Wait peer's AG signal (skip for myPe since its shard is
-          // already in transit after reduce).
-          if (peer != myPe) {
-            if (threadIdx.x == 0) {
-              const uint64_t expected =
-                  agBase + static_cast<uint64_t>(numChunks);
-              HSAuint64* sig = dstMemObj->signalPtrs
-                  + static_cast<size_t>(peer) * numQ + 1u;
-              while (core::AtomicLoadRelaxed(sig) < expected)
-                __builtin_amdgcn_s_sleep(1);
+          if (is_copy_worker) {
+            // Wait peer's AG signal (skip for myPe, transit already
+            // has reduced result).
+            if (peer != myPe) {
+              if (threadIdx.x == 0) {
+                const uint64_t expected =
+                    agBase + static_cast<uint64_t>(numChunks);
+                HSAuint64* sig = dstMemObj->signalPtrs
+                    + static_cast<size_t>(peer) * numQ + 1u;
+                while (core::AtomicLoadRelaxed(sig) < expected)
+                  __builtin_amdgcn_s_sleep(1);
+              }
+              __syncthreads();
             }
-            __syncthreads();
-          }
-          ar_write_phase_ts_cb1(phase_ts, 30);  // peer-signal-observed
+            ar_write_phase_ts_cb1(phase_ts, 30);  // peer-signal-observed
 
-          // Distribute this peer's shard (totalShardBytes) among the
-          // blocks in its group.
-          const size_t peer_off =
-              static_cast<size_t>(peer) * totalShardBytes;
-          const uint8_t* src_base =
-              reinterpret_cast<const uint8_t*>(dstMemObj->localPtr)
-              + peer_off;
-          uint8_t* dst_base =
-              reinterpret_cast<uint8_t*>(user_output_for_copy) + peer_off;
+            const size_t peer_off =
+                static_cast<size_t>(peer) * totalShardBytes;
+            const uint8_t* src_base =
+                reinterpret_cast<const uint8_t*>(dstMemObj->localPtr)
+                + peer_off;
+            uint8_t* dst_base =
+                reinterpret_cast<uint8_t*>(user_output_for_copy) + peer_off;
 
-          const size_t total_vecs = totalShardBytes / sizeof(vec_t);
-          const size_t vecs_per_block =
-              (total_vecs + cb_count_for_peer - 1) / cb_count_for_peer;
-          const size_t v_start =
-              static_cast<size_t>(my_pos) * vecs_per_block;
-          const size_t v_end =
-              (v_start + vecs_per_block > total_vecs)
-                  ? total_vecs
-                  : (v_start + vecs_per_block);
+            const size_t total_vecs = totalShardBytes / sizeof(vec_t);
+            const vec_t* src_vec =
+                reinterpret_cast<const vec_t*>(src_base);
+            vec_t* dst_vec = reinterpret_cast<vec_t*>(dst_base);
 
-          const vec_t* src_vec =
-              reinterpret_cast<const vec_t*>(src_base);
-          vec_t* dst_vec = reinterpret_cast<vec_t*>(dst_base);
-
-          for (size_t v = v_start + threadIdx.x; v < v_end;
-               v += blockDim.x) {
-            dst_vec[v] = src_vec[v];
-          }
-          // Tail bytes (should be zero in practice because
-          // totalShardBytes is a multiple of 16 for any sensible AR).
-          const size_t tail_start = total_vecs * sizeof(vec_t);
-          if (tail_start < totalShardBytes && my_pos + 1 == cb_count_for_peer) {
+            for (size_t v = threadIdx.x; v < total_vecs; v += blockDim.x) {
+              dst_vec[v] = src_vec[v];
+            }
+            // Tail bytes.
+            const size_t tail_start = total_vecs * sizeof(vec_t);
             for (size_t t = tail_start + threadIdx.x;
                  t < totalShardBytes; t += blockDim.x) {
               dst_base[t] = src_base[t];
             }
+            __syncthreads();
+            ar_write_phase_ts_cb1(phase_ts, 31);  // peer-copy-done
+          } else {
+            // Idle block: cheap spin on post_ag_flag if provided so
+            // the block stays alive until AG done (keeps CU occupancy
+            // uniform across compute blocks; matches Stage 1 E' cost
+            // characterization). If post_ag_flag is null, the block
+            // just exits immediately as before (legacy no-copy path).
+            if (post_ag_flag != nullptr) {
+              if (threadIdx.x == 0) {
+                while (__hip_atomic_load(
+                           post_ag_flag,
+                           __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) == 0u) {
+                  __builtin_amdgcn_s_sleep(2);
+                }
+              }
+              __syncthreads();
+            }
           }
-          __syncthreads();
-          ar_write_phase_ts_cb1(phase_ts, 31);  // peer-copy-done
         } else if (post_ag_flag != nullptr) {
           // Legacy Stage-1 spin-wait path (E' prototype, for cost meas.)
           if (threadIdx.x == 0) {
