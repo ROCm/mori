@@ -22,7 +22,7 @@
 """
 mori.ir.flydsl — FlyDSL integration for mori shmem device API.
 
-Quick start (automatic integration via compile_helper)::
+Usage::
 
     from mori.ir import flydsl as mori_shmem
 
@@ -39,6 +39,5 @@ post-load processors.  No manual hook installation required.
 
 from .ops import *  # noqa: F401,F403
 from .ops import __all__ as _ops_all
-from .runtime import get_bitcode_path, install_hook
 
-__all__ = _ops_all + ["get_bitcode_path", "install_hook"]
+__all__ = list(_ops_all)

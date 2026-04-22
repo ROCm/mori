@@ -20,55 +20,40 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 """
-FlyDSL-specific runtime helpers for mori shmem integration.
+Deprecated FlyDSL runtime helpers — retained only for backward compatibility.
 
-  - ``get_bitcode_path()``  — returns the path to libmori_shmem_device.bc
-
-For compile-time integration, prefer :func:`mori.ir.flydsl.compile_helper.prepare_compile`
-which returns bitcode paths and post-load processors in a single call.
+All functionality has moved to :mod:`mori.ir.flydsl.compile_helper`.
+Use :func:`~mori.ir.flydsl.compile_helper.prepare_compile` instead.
 """
 
 import warnings
 
-from mori.ir.bitcode import find_bitcode
-
 
 def get_bitcode_path() -> str:
-    """Return the path to libmori_shmem_device.bc (compiled with cov=6 for FlyDSL ABI).
-
-    Usage::
-
-        from mori.ir.flydsl import get_bitcode_path
-        bc = get_bitcode_path()
-    """
+    """Deprecated: use ``compile_helper.prepare_compile()`` instead."""
+    warnings.warn(
+        "get_bitcode_path() is deprecated. Use "
+        "mori.ir.flydsl.compile_helper.prepare_compile() instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    from mori.ir.bitcode import find_bitcode
     return find_bitcode(cov=6)
 
 
 def install_hook() -> None:
-    """Deprecated: use ``mori.ir.flydsl.compile_helper.prepare_compile()`` instead.
-
-    FlyDSL now uses a post-load processor model and no longer requires
-    a global hook.  This function is retained for backward compatibility
-    but is a no-op.
-    """
+    """Deprecated no-op. FlyDSL uses post-load processors automatically."""
     warnings.warn(
-        "install_hook() is deprecated. FlyDSL now uses post-load processors "
-        "via mori.ir.flydsl.compile_helper.prepare_compile().",
+        "install_hook() is deprecated and is a no-op.",
         DeprecationWarning,
         stacklevel=2,
     )
 
 
 def install_jit_hook() -> None:
-    """Deprecated: use ``mori.ir.flydsl.compile_helper.prepare_compile()`` instead.
-
-    FlyDSL now uses a post-load processor model that initializes
-    ``globalGpuStates`` per-artifact instead of via a global hook.
-    This function is retained for backward compatibility but is a no-op.
-    """
+    """Deprecated no-op. FlyDSL uses post-load processors automatically."""
     warnings.warn(
-        "install_jit_hook() is deprecated. FlyDSL now uses post-load processors "
-        "via mori.ir.flydsl.compile_helper.prepare_compile().",
+        "install_jit_hook() is deprecated and is a no-op.",
         DeprecationWarning,
         stacklevel=2,
     )
