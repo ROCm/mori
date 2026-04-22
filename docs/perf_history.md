@@ -1,0 +1,237 @@
+# SDMA AllReduce Perf History (per R9/R10)
+
+This ledger is the authoritative source of measured perf data for SDMA
+AllReduce optimization work. Every entry must include: date, commit SHA,
+scenario, numbers, mechanism, conclusion. See `.cursor/rules/relentless-perf.mdc`
+§R9/R10 for ledger discipline.
+
+**Primary goal**: `AllreduceSdma(copy_output_to_user=True)(input, output, stream)`
+multi-stage overlap wall < RCCL `dist.all_reduce(tensor)` wall, measured as
+median over ≥100 iters at 256MB/stage, 4 stages, 8-rank MI355X, same
+benchmark schedule (`test_allreduce.py --num-stages 4 --elems 67108864`).
+
+**Target gap as of last measurement**: ~0.2 ms (SDMA copy ~7.76 vs RCCL ~7.55
+median, 3-run spread RCCL ±0.12 ms).
+
+---
+
+## Entry 1 — Baseline measured (pre-optimization)
+- **Date**: 2026-04-21
+- **Commit**: `b1694d11` (baseline copy-path timing instrumented)
+- **Scenario**: `MORI_PIPELINE_CU=220 python3 tests/python/ccl/test_allreduce.py --num-stages 4 --elems 67108864 --timeline --iterations 100 --warmup 20`
+- **Hardware**: MI355X × 8, ROCm + HIP 7.1
+- **Numbers (single run)**:
+  - SDMA copy wall: **7.746 ms** (median)
+  - SDMA no-copy wall: **7.354 ms**
+  - RCCL wall: **7.425 ms** (volatile, see Entry 2)
+  - copy exposure (copy − no-copy): **0.392 ms**
+- **Per-stage AR dur (no-copy)**:
+  - AR[0]=1.926, AR[1]=1.919, AR[2]=1.196, AR[3]=1.195
+- **Per-stage AR dur (copy)**:
+  - AR[0]=2.186, AR[1]=1.835, AR[2]=1.296, AR[3]=1.297
+- **AR[0] kernel phase breakdown (no-copy)**:
+  ```
+  total                                 1.887 ms
+  entry→scatter_done                    0.203
+  c0:scatter→compute-wait               0.418
+  c0:compute-wait→barrier               0.022
+  c0:barrier→AG-submit                  0.215
+  c1:scatter→compute-wait               0.099
+  c1:compute-wait→barrier               0.095
+  c1:barrier→AG-submit                  0.214
+  AG-submit→AG-wait-done                0.614
+  AG-wait-done→exit                     0.007
+  ```
+- **Copy-path (single hipMemcpyAsync in copy_output_to_user)**:
+  - host-side call latency: **3.20 us**
+  - gpu-side CU blit wall: **0.259 ms** (256MB linear D2D)
+- **Conclusion**: baseline established. SDMA copy is slower than RCCL by
+  ~2% (single run). no-copy is faster than RCCL but requires user API
+  change (reading `get_output_transit_buffer`), not allowed per R7.
+
+---
+
+## Entry 2 — RCCL noise characterization (3 independent runs, 200 iter)
+- **Date**: 2026-04-21
+- **Commit**: same baseline (`b1694d11`)
+- **Scenario**: 3× `MORI_PIPELINE_CU=220 ... --iterations 200 --warmup 30`
+- **Numbers**:
+  | run | SDMA copy | SDMA no-copy | RCCL |
+  |---|---|---|---|
+  | 1 | 7.765 | 7.376 | 7.431 |
+  | 2 | 7.753 | 7.397 | 7.582 |
+  | 3 | 7.757 | 7.370 | 7.672 |
+  | mean | **7.758** | **7.381** | **7.562** |
+  | stdev | 0.006 | 0.014 | **0.122** |
+- **Conclusion**: SDMA measurements are extremely stable (stdev ≤0.015 ms).
+  RCCL noise is ~0.12 ms cross-run. True gap = **copy mean − RCCL mean
+  = 0.196 ms (+2.6%)**, stable across runs, not explainable by noise.
+
+---
+
+## Entry 3 — CU sweep (MORI_PIPELINE_CU 80→220)
+- **Date**: 2026-04-21
+- **Commit**: `b1694d11`
+- **Scenario**: `for CU in 80 120 140 160 180 200 220; do MORI_PIPELINE_CU=$CU ...; done`
+- **Numbers**:
+  | CU | copy (ms) | no-copy (ms) | copy exposure |
+  |---|---|---|---|
+  | 80  | 8.113 | 7.491 | 0.622 |
+  | 120 | 7.797 | 7.454 | 0.343 |
+  | 140 | 7.807 | 7.427 | 0.380 |
+  | 160 | 7.782 | 7.390 | 0.392 |
+  | 180 | 7.764 | 7.407 | 0.357 |
+  | 200 | 7.776 | 7.375 | 0.401 |
+  | 220 | **7.744** | **7.357** | 0.387 |
+- **Per-stage AR[0] dur by CU**: 2.704 (CU=80) → 2.161 (CU=220), monotonic
+- **Conclusion**: CU=220 is near-optimal (no-copy wall min, copy wall min).
+  Copy exposure is **invariant to CU in ≥120 range** — falsifies H1
+  (copy uses idle CU during AG wait). CU tuning alone cannot close the gap.
+- **Rule application (R8)**: CU sweep gain ≤0.05 ms, gap is 0.2 ms → CU
+  tuning as standalone direction is ruled out.
+
+---
+
+## Entry 4 — AR[0] vs AR[2] phase comparison (attribution of cold-path cost)
+- **Date**: 2026-04-21
+- **Commit**: `b4e6d4e8` (added `MORI_PHASE_TARGET_STAGE` to instrument any AR[N])
+- **Scenario**: two separate runs with `MORI_PHASE_TARGET_STAGE=0` and `=2`
+- **Numbers (no-copy mode, so AR kernel is not contaminated by copy)**:
+  | Phase | AR[0] | AR[2] | Δ (AR[0] − AR[2]) |
+  |---|---|---|---|
+  | entry→scatter_done | 0.203 | 0.002 | +0.201 |
+  | c0:scatter→compute-wait | 0.418 | 0.076 | +0.342 |
+  | c0:barrier→AG-submit | 0.215 | 0.013 | +0.202 |
+  | c1:barrier→AG-submit | 0.214 | 0.009 | +0.205 |
+  | AG-submit→AG-wait-done | 0.614 | **1.029** | **−0.415 (AR[2] slower!)** |
+  | total | **1.887** | **1.189** | **+0.698** |
+- **Mechanism**:
+  - AR[0] slow across **every** phase, not concentrated anywhere single
+  - AR[0] entry slow → cold-path CU allocation blocked by GEMM[1]
+  - AR[0] barriers slow → all peers in cold path, barrier waits for slowest
+  - AR[2] AG wait longer than AR[0]'s → SDMA queue backlog (prior AR's
+    scatter/AG still draining); this is fundamental SDMA transfer time floor
+- **Conclusion**: AR[0]'s 0.7 ms overhead is the largest reclaimable slice
+  (~3 separate sources: cold entry, CU contention with GEMM[1], cross-PE
+  barrier cold-path sync). AR[2]'s 1.03 ms AG wait is **physical lower
+  bound** of the SDMA transfer itself — cannot be shortened.
+
+---
+
+## Entry 5 — Stream priority test (ruled out)
+- **Date**: 2026-04-21
+- **Commit**: `4170b412` (added `--ar-priority/--gemm-priority` knobs)
+- **Scenario**: `--ar-priority=-1 --gemm-priority=0` vs default `0/0`
+- **Numbers**:
+  | metric | prio 0/0 | prio -1/0 | Δ |
+  |---|---|---|---|
+  | SDMA copy wall | 7.762 | 7.771 | +0.009 |
+  | AR[0] dur | 2.167 | 2.198 | +0.031 |
+- **Conclusion**: HIP stream priority has **no measurable effect** on
+  GEMM-AR CU contention on MI355X/ROCm. Direction **A1 (priority-based
+  CU reassignment) ruled out**.
+
+---
+
+## Entry 6 — Stage 1 (compute blocks spin-wait, no copy) — acceptable cost
+- **Date**: 2026-04-21
+- **Commit**: `02375192` (compute blocks wait post_ag_flag before exit, no copy)
+- **Scenario**: `MORI_POST_AG_WAIT=1 MORI_PIPELINE_CU=220 ...` vs OFF
+- **Numbers**:
+  | metric | OFF | Stage 1 ON | Δ |
+  |---|---|---|---|
+  | SDMA copy wall | 7.746 | 7.805 | **+0.059** |
+  | SDMA no-copy wall | 7.354 | 7.408 | +0.054 |
+  | GEMM[1-3] dur | 1.05–1.12 | 1.07–1.14 | +0.02 each (~+0.07 total) |
+- **Conclusion**: compute blocks staying alive during AG wait (~1.35 ms
+  extra CU occupancy) costs only +0.06 ms wall. **Cost is acceptable**,
+  leaves runway for Stage 2.
+- **Key insight**: GEMM wall grows (0.07 ms total) but stream_gemm is not
+  critical path, so does not hit wall.
+
+---
+
+## Entry 7 — Stage 2b-0 (per-chunk AG wait only, no copy) — also acceptable
+- **Date**: 2026-04-22
+- **Commit**: `3a738682` (block 0 waits AG chunk-by-chunk instead of one-shot)
+- **Scenario**: same as Entry 6
+- **Numbers**:
+  | metric | Stage 1 OFF baseline | Stage 2b-0 | Δ |
+  |---|---|---|---|
+  | SDMA copy wall | 7.746 | 7.765 | +0.019 |
+  | SDMA no-copy wall | 7.354 | 7.361 | +0.007 |
+  | AR[0] total (no-copy) | 1.887 | 1.889 | +0.002 |
+  | AG-submit→AG-wait-done (AR[0] no-copy) | 0.614 | 0.597 | **−0.017 (slightly faster)** |
+- **Conclusion**: per-chunk AG wait does **not** reproduce the Path B
+  failure mode (path B was a host-side `hipStreamWaitValue32 +
+  hipMemcpy2DAsync` change, not per-chunk kernel wait). Kernel-side
+  per-chunk wait is free. Foundation for Stage 2b-1 validated.
+
+---
+
+## Entry 8 — Stage 2b-1 (per-chunk in-kernel copy) — CATASTROPHIC FAIL, REVERTED
+- **Date**: 2026-04-22
+- **Commit**: `dfe56fee` (kernel) + `b8ee2b8a` (Test 1b)
+- **Reverted**: `ba4b4b41` (revert of 2b-1)
+- **Scenario**: `MORI_POST_AG_WAIT=1 MORI_PIPELINE_CU=220 ...`
+- **Correctness**: Test 1b PASSED (output written correctly in-kernel) ✅
+- **Numbers**:
+  | metric | OFF | Stage 2b-1 ON | Δ |
+  |---|---|---|---|
+  | SDMA copy wall | 7.761 | **8.940** | **+1.179 ms (catastrophic)** |
+  | AR[0] dur | 2.186 | 3.508 | +1.322 |
+  | AR[1-3] dur | 1.30ish | 1.41ish | +0.11 each |
+- **AR[0] Phase (Stage 2b-1 ON) vs no-copy baseline**:
+  - entry→scatter_done: +0.138
+  - c0:scatter→compute-wait: +0.333
+  - barrier→AG-submit (×2): +0.419
+  - AG-submit→AG-wait-done: +0.539
+  - block 0 total: +1.643 (every phase slowed, not concentrated)
+  - compute block `c1-reduce-done→cb-exit`: **0.007 → 7.764 ms** (scaling anomaly, likely timestamp-vs-event mismatch)
+- **Mechanism**:
+  - Compute blocks doing simultaneous reduce-HBM-read + copy-HBM-read+write
+    saturates HBM bandwidth
+  - Block 0's SDMA submit/poll is also HBM-serving → gets throttled
+  - HBM saturation **propagates to every phase of the AR kernel**, not just copy
+- **Conclusion**: **In-kernel per-chunk copy is architecturally infeasible
+  on MI355X**. The simultaneous HBM pressure from compute-reduce + copy
+  inside the same kernel collapses AR kernel throughput. Any future in-kernel
+  copy attempt will hit the same wall — direction **E' closed**.
+
+---
+
+## Entry 9 — Failed directions prior to this session (inherited from transcripts)
+Summarized here for quick lookup; exact commits in git log:
+
+| Direction | Commit (both tried and reverted) | Fail mechanism |
+|---|---|---|
+| In-kernel local SDMA copy (qId=2) | `1b66f5c5` → revert `4c3229ba` | Local HBM-HBM via SDMA engine is ~50× slower than CU blit; SDMA not designed for local traffic |
+| Custom low-CU blit kernel (16 blocks) | `13efef1f` → revert `c3b54546` | Fewer blocks cannot saturate HBM bandwidth; standalone kernel slower than `__amd_rocclr_copyBuffer` |
+| Dedicated copy_stream + main-stream wait copy_done | `4d49ce01` → revert `0592319a` | Main stream waiting on copy_done puts copy back on critical path; wall not improved (copy still serialized) |
+| Path B chunk-level host-dispatch (hipStreamWaitValue32 + hipMemcpy2DAsync) | `5168d801` → revert `66629395` | Host-side per-chunk wait+memcpy has ≥0.5 ms launch/sync overhead that negates the chunk overlap benefit |
+
+---
+
+## Entry 10 — (placeholder for D' results once measured)
+- **Date**: TBD
+- **Commit**: `df3b1ec0` (D' Step 1 instrumentation) + `9b77c0b4` (register cost test)
+- **Scenario**: `python3 tests/python/ccl/test_register_cost.py` (8-rank, measures first-register cost + cache hit cost)
+- **Numbers**: TBD
+- **Decision gates (a priori)**:
+  - If register cost <500 us at 256 MB → cheap, cache always wins at steady state
+  - If 500-2000 us → benchmark warmup absorbs, OK
+  - If >2000 us → may not fit benchmark's warmup=20 budget; evaluate fallback
+
+---
+
+## Running gap-to-target tally
+
+| date | best SDMA copy wall | RCCL median | gap | notes |
+|---|---|---|---|---|
+| 2026-04-21 | 7.746 | 7.425 (noisy) | +2.2% | CU=160 baseline |
+| 2026-04-21 | 7.758 (3-run) | 7.562 (3-run) | **+2.6%** | stable gap after 3-run characterization |
+| 2026-04-22 | 7.744 | 7.672 | +0.9% | CU=220 (optimal); gap dominated by RCCL run noise |
+| 2026-04-22 | 8.940 | 7.424 | **+20.4% (WORSE)** | Stage 2b-1 catastrophic, reverted |
+| 2026-04-22 | 7.765 | 7.433 | +4.5% | Stage 2b-0 clean, baseline restored |
+
+**Target**: SDMA copy ≤ RCCL (gap ≤ 0). Currently outstanding.

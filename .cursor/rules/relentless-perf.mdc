@@ -121,17 +121,60 @@ RCCL `dist.all_reduce(tensor)` 的 drop-in 替代语义。
 而 gap 是 0.2 ms —— gain < gap，按 R8 应立即跳过 B 直接上 gain ≥ gap 的方向。
 **现在开始必须按 R8 执行**。
 
+### R9. 查询并记录历史测试中有价值的时间数据
+
+每次有价值的实测数据（wall / phase / gain / loss / side-effect）**必须沉淀到 repo
+内的 perf_history.md**（推荐路径 `docs/perf_history.md`），至少记录：
+
+- **日期 + HEAD SHA**（或 commit 范围）
+- **场景**：test 命令行 + 关键 env var（`MORI_PIPELINE_CU`、`MORI_POST_AG_WAIT`、`MORI_PHASE_TARGET_STAGE` 等）、size、stages、iter、warmup
+- **指标 + 数字**：wall（copy / no-copy / RCCL）；per-stage AR dur；AR[0] Phase breakdown；copy host us / gpu ms；register us 等
+- **机制解释**：gain 来自哪个机制 / loss 来自 X / side-effect 分析
+- **结论**：验证通过 / 验证失败（具体 kill-switch 触发）/ 归入哪个方向的基线
+
+**每次新优化方案设计前，必须先查 `perf_history.md`**：
+
+- 已经 fail 的方向（有数据否定过的）不得再走，除非有新机制解释为何此次会不同
+- 已知瓶颈数字（各 phase ms 上限 / 下限）作为**预期 gain 估算的依据**（R8 的 gain 推算不得凭空猜）
+- 找可以**复用已有数据**的地方，不重复跑耗时实验
+
+**每次完成 perf 相关的 commit 时**：
+
+- commit message 必须指向 `perf_history.md` 的**新增条目**（例如 "see perf_history.md §entry-N"）
+- `perf_history.md` 的新条目必须包含**该 commit 的 SHA**（形成双向链接）
+- 若 revert 某个失败尝试，`perf_history.md` 的条目里标注 "REVERTED at <SHA>" 并简述原因
+
+**反模式**：
+
+| ❌ 错误 | ✅ 正确 |
+|--------|--------|
+| 本次估算 gain 靠"我记得之前测过"，没查 | 先 grep `perf_history.md` 找到具体数字再引用 |
+| 跑新实验前没看过已有数据 | 先读 ledger 最新 3-5 条，看瓶颈定位 |
+| 实测完数字只贴在对话里 | 立即 commit 到 ledger，再回复用户 |
+| "这个方向之前试过失败" —— 但找不到具体原因 | ledger 里查具体失败 commit + 机制 |
+
+### R10. 历史数据作为优化方案的必要输入
+
+每个新方案的提案/回复中必须**至少引用 2 条历史数据**作为依据：
+- 1 条支持 "这个方向能 work" 的机制论据
+- 1 条支持 "预期 gain 数字" 的量化依据
+
+若引用不出 2 条数据，说明数据不足，**先补打点**，不强行推进方案。
+
 ## 工作流模板（每轮都走这个）
 
 ```
 while 距目标 gap > 0:
-    0)  相关 phase 有没有打点？没有 → 先加打点 → commit → 跑 baseline → 记录数据
-    1)  数据分析当前 wall breakdown，找最大 gap 所在 phase
-    2)  列出 3-5 个该 phase 的可能机制假设，每个估算预期 gain (R8)
-    3)  按预期 gain 排序，选 gain 最大且 gain ≥ gap × 1.5 的方向（R8）
+    0)  查 perf_history.md（R9）：已知瓶颈、已 fail 方向、可复用数据
+    1)  相关 phase 有没有打点？没有 → 先加打点 → commit → 跑 baseline → 记录数据
+    2)  数据分析当前 wall breakdown，找最大 gap 所在 phase
+    3)  列出 3-5 个该 phase 的可能机制假设，每个估算预期 gain (R8)
+        每个方向引用 ≥2 条历史数据作为依据 (R10)
+    4)  按预期 gain 排序，选 gain 最大且 gain ≥ gap × 1.5 的方向（R8）
         若所有方向 gain < gap：先找 gain 更大的新方向，不急着动手
-    4)  实施前必须先打点验证该方向的关键假设（R0）
-    5)  实测 before/after（必须用打点数据，不得用"肉眼/直觉"）
+    5)  实施前必须先打点验证该方向的关键假设（R0）
+    6)  实测 before/after（必须用打点数据，不得用"肉眼/直觉"）
+    7)  实测结果写入 perf_history.md（R9），双向 link commit SHA
     if 达标:                → 收工，总结根因
     if 部分改善但未达标:    → 保留改动，回 (1) 找下一大 gap
     if 倒退或无变化:        → 立刻 revert，从数据否定该假设，回 (2)
