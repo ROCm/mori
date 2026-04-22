@@ -109,6 +109,45 @@ TEST_F(FinalizeIdempotencyTest, LocationValidation) {
   EXPECT_FALSE(registry_.FinalizeAllocation("node-a", "key-1", wrong_loc, alloc->allocation_id));
 }
 
+// Regression for Plan `abort_allocation_cleanup` §2: on field-level mismatch
+// FinalizeAllocation must auto-release the pending allocation's pages (no
+// Abort RPC from the client).  We drive the allocator to full capacity then
+// trigger a mismatched finalize and assert the freed slot is immediately
+// reusable by the next AllocateForPut.
+TEST(FinalizeAutoRollback, MismatchReleasesPagesImmediately) {
+  GlobalBlockIndex index;
+  ClientRegistry registry{ClientRegistryConfig{}, index};
+  index.SetClientRegistry(&registry);
+
+  // Single-page capacity on node-r so we can prove the released page is the
+  // only thing keeping the next allocation alive.
+  const uint64_t capacity = BLOCK_SIZE;
+  registry.RegisterClient("node-r", "addr-r", {{TierType::HBM, TierCapacity{capacity, capacity}}},
+                          "peer-r", {}, {}, {}, {capacity});
+
+  auto first = registry.AllocateForPut("node-r", TierType::HBM, BLOCK_SIZE);
+  ASSERT_TRUE(first.has_value());
+
+  // Capacity is now exhausted: a fresh AllocateForPut must fail.
+  ASSERT_FALSE(registry.AllocateForPut("node-r", TierType::HBM, BLOCK_SIZE).has_value());
+
+  // Drive a size mismatch at finalize -> master auto-rolls back the pending.
+  Location wrong_size = MakeLocation("node-r", first->location_id, BLOCK_SIZE / 2, TierType::HBM);
+  EXPECT_FALSE(
+      registry.FinalizeAllocation("node-r", "key-autoroll", wrong_size, first->allocation_id));
+
+  // Capacity must be fully reclaimed now that the mismatch auto-rolled back.
+  auto second = registry.AllocateForPut("node-r", TierType::HBM, BLOCK_SIZE);
+  EXPECT_TRUE(second.has_value());
+  EXPECT_NE(second->allocation_id, first->allocation_id);
+
+  // The dead allocation_id stays dead: subsequent finalize attempts with the
+  // stale id see pending-not-found and return false without touching the
+  // newly-allocated pending.
+  Location replay = MakeLocation("node-r", first->location_id, BLOCK_SIZE, TierType::HBM);
+  EXPECT_FALSE(registry.FinalizeAllocation("node-r", "key-autoroll", replay, first->allocation_id));
+}
+
 TEST_F(FinalizeIdempotencyTest, CrossNodeFinalize) {
   registry_.RegisterClient("node-b", "addr-b", MakeTierCapacities(80 * GB, 40 * GB), "peer-b", {},
                            {}, {}, {80 * GB});

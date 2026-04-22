@@ -69,17 +69,9 @@ inline uint64_t LogicalPageBytes(size_t i, size_t num_pages, uint64_t page_size,
   return (i + 1 == num_pages) ? (total_size - i * page_size) : page_size;
 }
 
-// True iff `size` is consistent with master's "round up to whole pages"
-// allocation: ceil(size/page_size) must equal num_pages, and num_pages > 0.
-// Allows the last page to be partially filled.
-inline bool SizeMatchesAllocation(size_t size, size_t num_pages, uint64_t page_size) {
-  if (page_size == 0 || num_pages == 0 || size == 0) return false;
-  if (size > num_pages * page_size) return false;
-  // size must be > (num_pages-1) * page_size, otherwise master allocated
-  // more pages than the request needed (would indicate a master bug).
-  if (size <= (num_pages - 1) * page_size) return false;
-  return true;
-}
+// SizeMatchesAllocation is now defined in umbp/distributed/types.h so Master
+// and Client share the exact same allocation-window predicate.
+
 }  // namespace
 
 PoolClient::PoolClient(PoolClientConfig config) : config_(std::move(config)) {}
@@ -545,40 +537,47 @@ bool PoolClient::Put(const std::string& key, const void* src, size_t size) {
 
   // Full scatter-gather: single-page is the trivial N=1, K=1 case and goes
   // through the same code path as multi-page.
+  // The three checks below are defensive: they assert Master-side allocation
+  // invariants (non-zero page_size, non-empty pages list, size within the
+  // allocation window).  Master's AllocateForPut enforces these before
+  // creating a pending, so correct Master never produces a response that
+  // trips them.  We still log+fail on violation to catch future regressions,
+  // but do NOT call AbortAllocation: if Master is correct, there is no
+  // pending to roll back; if Master is buggy enough to emit a malformed
+  // response, the pending (if any) will be collected by the allocation-TTL
+  // reaper.  See Plan `abort_allocation_cleanup` for rationale.
   if (result->page_size == 0) {
     MORI_UMBP_ERROR("[PoolClient] Put: master returned page_size=0 for DRAM target");
-    master_client_->AbortAllocation(result->node_id, result->allocation_id, size);
     return false;
   }
   const uint64_t page_size = result->page_size;
   const size_t num_pages = result->pages.size();
   if (num_pages == 0) {
     MORI_UMBP_ERROR("[PoolClient] Put: master returned empty pages list, key='{}'", key);
-    master_client_->AbortAllocation(result->node_id, result->allocation_id, size);
     return false;
   }
   if (!SizeMatchesAllocation(size, num_pages, page_size)) {
-    // Master rounds Put requests up to ceil(size/page_size) pages.  We
-    // accept anything in ((N-1)*ps, N*ps]; the last logical page may be
-    // partially filled.  Outside that window means a Master/Client bug.
     MORI_UMBP_ERROR("[PoolClient] Put: size {} not in allocation window ({}..{}] for key='{}'",
                     size, (num_pages - 1) * page_size, num_pages * page_size, key);
-    master_client_->AbortAllocation(result->node_id, result->allocation_id, size);
     return false;
   }
 
   bool is_local = (result->node_id == config_.master_config.node_id);
   if (is_local) {
     // Local-node short-circuit: copy each page directly into our own
-    // exportable buffers.  Bounds-check every page; on any failure abort
-    // the whole allocation (no partial-write commits).  Last logical page
-    // may be partial — only copy its real bytes.
+    // exportable buffers.  The two bounds checks below assert that Master's
+    // PageBitmapAllocator stayed within the buffer topology this Client
+    // registered with — they are master-invariant in nature (same family as
+    // the page_size/pages/SizeMatchesAllocation guards above) and thus no
+    // AbortAllocation is sent on violation: a correct Master never produces
+    // an out-of-range page; a misconfigured Client (post-register dram_buffers
+    // drift) is a local protocol violation that the master-side reaper will
+    // collect via the allocation-TTL path.
     const char* src_bytes = static_cast<const char*>(src);
     for (size_t i = 0; i < num_pages; ++i) {
       const auto& p = result->pages[i];
       if (p.buffer_index >= config_.dram_buffers.size()) {
         MORI_UMBP_ERROR("[PoolClient] local Put: invalid buffer_index {}", p.buffer_index);
-        master_client_->AbortAllocation(result->node_id, result->allocation_id, size);
         return false;
       }
       auto& dram = config_.dram_buffers[p.buffer_index];
@@ -586,7 +585,6 @@ bool PoolClient::Put(const std::string& key, const void* src, size_t size) {
       if (!dram.buffer || page_size > dram.size || off > dram.size - page_size) {
         MORI_UMBP_ERROR("[PoolClient] local Put: OOB buf={} off={} page_size={} buf_size={}",
                         p.buffer_index, off, page_size, dram.size);
-        master_client_->AbortAllocation(result->node_id, result->allocation_id, size);
         return false;
       }
       const uint64_t bytes = LogicalPageBytes(i, num_pages, page_size, size);
@@ -624,8 +622,17 @@ bool PoolClient::Put(const std::string& key, const void* src, size_t size) {
 
   status = master_client_->FinalizeAllocation(key, location, result->allocation_id);
   if (!status.ok()) {
+    // Two failure shapes funnel into !status.ok() here:
+    //   (a) Master rejected with finalized==false: for tier/size/location_id
+    //       mismatch master already auto-rolled back the pending; for the
+    //       other rejection paths (pending-not-found, idempotent-mismatch,
+    //       node_id mismatch, node not ALIVE) there is no pending owned by
+    //       this node to collect.
+    //   (b) gRPC transport error: master may or may not have processed the
+    //       request; in the worst case a pending is left over and gets
+    //       collected by the allocation-TTL reaper.  Accepted as a known
+    //       trade-off (see Plan `abort_allocation_cleanup` §"已知行为变化").
     MORI_UMBP_ERROR("[PoolClient] Put FinalizeAllocation failed: {}", status.error_message());
-    master_client_->AbortAllocation(result->node_id, result->allocation_id, size);
     return false;
   }
 
@@ -679,32 +686,43 @@ std::vector<bool> PoolClient::BatchPut(const std::vector<std::string>& keys,
   for (size_t i = 0; i < n; ++i) {
     if (!routes[i].has_value()) continue;
     auto& r = *routes[i];
-    if (r.tier != TierType::DRAM) {
-      master_client_->AbortAllocation(r.node_id, r.allocation_id, sizes[i]);
-      continue;
-    }
-    if (r.pages.empty() || r.page_size == 0) {
-      MORI_UMBP_ERROR("[PoolClient] BatchPut: empty pages or zero page_size, key='{}'", keys[i]);
-      master_client_->AbortAllocation(r.node_id, r.allocation_id, sizes[i]);
+    // Defensive gates below assert Master-side invariants (DRAM tier for
+    // BatchPut, non-empty pages with non-zero page_size, size within the
+    // allocation window).  Master's AllocateForPut + RoutePut strategy
+    // ensure these hold; we log+skip on any violation to catch regressions
+    // without bringing down the whole batch.  We intentionally do NOT call
+    // AbortAllocation here — correct Master produces no pending in these
+    // paths, and a buggy Master's stale pending will be collected by the
+    // allocation-TTL reaper.  See Plan `abort_allocation_cleanup`.
+    if (r.tier != TierType::DRAM || r.pages.empty() || r.page_size == 0) {
+      MORI_UMBP_ERROR(
+          "[PoolClient] BatchPut: unexpected route for key='{}': tier={}, pages={}, page_size={}",
+          keys[i], TierTypeName(r.tier), r.pages.size(), r.page_size);
       continue;
     }
     if (!SizeMatchesAllocation(sizes[i], r.pages.size(), r.page_size)) {
       MORI_UMBP_ERROR(
           "[PoolClient] BatchPut: size {} not in allocation window ({}..{}] for key='{}'", sizes[i],
           (r.pages.size() - 1) * r.page_size, r.pages.size() * r.page_size, keys[i]);
-      master_client_->AbortAllocation(r.node_id, r.allocation_id, sizes[i]);
       continue;
     }
 
     bool wrote = false;
+    bool local_invariant_violated = false;
     if (r.node_id == config_.master_config.node_id) {
-      bool oob = false;
+      // Local-node short-circuit.  buffer_index / OOB checks here are
+      // master-invariant in nature (Master's PageBitmapAllocator stays
+      // within the buffer topology this Client registered with); we log+skip
+      // on violation but do NOT send AbortAllocation, mirroring Put().  The
+      // separate `local_invariant_violated` flag distinguishes these from a
+      // genuine local memcpy/RDMA failure (none possible here on the local
+      // path, but kept for symmetry with the remote branch below).
       const char* src_bytes = static_cast<const char*>(srcs[i]);
-      for (size_t k = 0; k < r.pages.size() && !oob; ++k) {
+      for (size_t k = 0; k < r.pages.size() && !local_invariant_violated; ++k) {
         const auto& p = r.pages[k];
         if (p.buffer_index >= config_.dram_buffers.size()) {
           MORI_UMBP_ERROR("[PoolClient] BatchPut local: invalid buffer_index {}", p.buffer_index);
-          oob = true;
+          local_invariant_violated = true;
           break;
         }
         auto& dram = config_.dram_buffers[p.buffer_index];
@@ -712,13 +730,13 @@ std::vector<bool> PoolClient::BatchPut(const std::vector<std::string>& keys,
         if (!dram.buffer || r.page_size > dram.size || off > dram.size - r.page_size) {
           MORI_UMBP_ERROR("[PoolClient] BatchPut local: OOB buf={} off={} page_size={} buf_size={}",
                           p.buffer_index, off, r.page_size, dram.size);
-          oob = true;
+          local_invariant_violated = true;
           break;
         }
         const uint64_t bytes = LogicalPageBytes(k, r.pages.size(), r.page_size, sizes[i]);
         std::memcpy(static_cast<char*>(dram.buffer) + off, src_bytes + k * r.page_size, bytes);
       }
-      wrote = !oob;
+      wrote = !local_invariant_violated;
     } else {
       const auto& first_bd = r.dram_memory_descs.empty() ? std::vector<uint8_t>{}
                                                          : r.dram_memory_descs.front().desc_bytes;
@@ -734,7 +752,18 @@ std::vector<bool> PoolClient::BatchPut(const std::vector<std::string>& keys,
     }
 
     if (!wrote) {
-      master_client_->AbortAllocation(r.node_id, r.allocation_id, sizes[i]);
+      // Remote scatter-write path (`RemoteDramScatterWrite` returned false):
+      // master has reserved pages but the local memcpy/RDMA path could not
+      // commit the data, so we owe master an explicit rollback.  Note that
+      // RemoteDramScatterWrite also returns false on its own internal
+      // pre-checks (page_size==0, size-window mismatch, etc.); those would
+      // also reach here and Abort -- harmless because the pending exists.
+      // Local-path invariant violations (see flag setup above) deliberately
+      // skip Abort: they share the master-invariant rationale of the early
+      // checks above and rely on TTL/reap if a stale pending ever exists.
+      if (!local_invariant_violated) {
+        master_client_->AbortAllocation(r.node_id, r.allocation_id, sizes[i]);
+      }
       continue;
     }
 
@@ -782,8 +811,12 @@ std::vector<bool> PoolClient::BatchPut(const std::vector<std::string>& keys,
         std::lock_guard<std::mutex> lock(cache_mutex_);
         cluster_locations_[fin_keys[i]] = fin_locs[i];
       } else {
+        // Master auto-rolls back the pending on field-level mismatch inside
+        // FinalizeAllocation; other false paths (pending-not-found /
+        // idempotent-mismatch / node_id mismatch / non-ALIVE node) either
+        // have no pending to collect or rely on node-reap cleanup.  No
+        // AbortAllocation RPC needed.
         results[pending[i].original_idx] = false;
-        master_client_->AbortAllocation(fin_locs[i].node_id, fin_aids[i], fin_locs[i].size);
       }
     }
   }

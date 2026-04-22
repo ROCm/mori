@@ -313,4 +313,19 @@ inline std::optional<ParsedDramLocation> ParseDramLocationId(const std::string& 
   return parsed;
 }
 
+// True iff `size` is consistent with Master's "round up to whole pages"
+// allocation: ceil(size / page_size) must equal num_pages, and num_pages > 0.
+// Equivalent to: size > (num_pages - 1) * page_size  AND  size <= num_pages * page_size.
+// Allows the last logical page to be partially filled.
+//
+// Shared between Master's AllocateForPut post-allocation invariant guard
+// and Client-side Put/BatchPut defensive checks so both sides agree on the
+// exact allocation window.
+inline bool SizeMatchesAllocation(uint64_t size, size_t num_pages, uint64_t page_size) {
+  if (page_size == 0 || num_pages == 0 || size == 0) return false;
+  if (size > num_pages * page_size) return false;
+  if (size <= (num_pages - 1) * page_size) return false;
+  return true;
+}
+
 }  // namespace mori::umbp
