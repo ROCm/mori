@@ -265,12 +265,7 @@ void RegisterMoriCcl(pybind11::module_& m) {
       .def("cache_hits",
            &mori::collective::AllreduceSdma<uint32_t>::cache_hits)
       .def("cache_misses",
-           &mori::collective::AllreduceSdma<uint32_t>::cache_misses)
-      .def("enable_ag_multi_q",
-           &mori::collective::AllreduceSdma<uint32_t>::enable_ag_multi_q,
-           py::arg("on"),
-           "Direction θ: enable multi-qId parallel AG for MULTI_CHUNK. "
-           "Must be called BEFORE the first pipelined() call.");
+           &mori::collective::AllreduceSdma<uint32_t>::cache_misses);
 
   // =========================================================================
   // AllreduceSdma (fp16)
@@ -338,10 +333,7 @@ void RegisterMoriCcl(pybind11::module_& m) {
       .def("cache_hits",
            &mori::collective::AllreduceSdma<half>::cache_hits)
       .def("cache_misses",
-           &mori::collective::AllreduceSdma<half>::cache_misses)
-      .def("enable_ag_multi_q",
-           &mori::collective::AllreduceSdma<half>::enable_ag_multi_q,
-           py::arg("on"));
+           &mori::collective::AllreduceSdma<half>::cache_misses);
 
   // =========================================================================
   // AllreduceSdma (bf16)
@@ -413,9 +405,6 @@ void RegisterMoriCcl(pybind11::module_& m) {
       .def("cache_hits",
            &mori::collective::AllreduceSdma<hip_bfloat16>::cache_hits)
       .def("cache_misses",
-           &mori::collective::AllreduceSdma<hip_bfloat16>::cache_misses)
-      .def("enable_ag_multi_q",
-           &mori::collective::AllreduceSdma<hip_bfloat16>::enable_ag_multi_q,
-           py::arg("on"));
+           &mori::collective::AllreduceSdma<hip_bfloat16>::cache_misses);
 }
 }  // namespace mori
