@@ -955,37 +955,60 @@ def _bench_overlap_one_size(
     # closed τ (cross-stream HBM doesn't warm SDMA); ν tests a different
     # mechanism: keep SDMA queue state itself alive across iters.
     #
-    # To remove iter syncs safely, prep_ar must be ordered on stream_ar
-    # so AR kernels see the right input. We use ev_prep events to chain.
+    # Implementation: use **per-iter** event arrays (one ov_s/ov_e per iter,
+    # per-stage events per iter too for timeline). Submit all iters back-to-
+    # back with stream ordering (prep_ar → AR on stream_ar; GEMM on stream_
+    # gemm; cross-stream sync via events). Sync ONCE at the end to drain;
+    # then read elapsed_time from the completed events in bulk.
     skip_iter_sync = os.environ.get("MORI_SKIP_ITER_SYNC", "0") == "1"
     if skip_iter_sync and rank == 0:
         print(" (ν: skip iter sync)", end="", flush=True)
 
+    if skip_iter_sync:
+        ov_s_arr = [torch.cuda.Event(enable_timing=True) for _ in range(total_iters)]
+        ov_e_arr = [torch.cuda.Event(enable_timing=True) for _ in range(total_iters)]
+        ev_g_s_arr = [[torch.cuda.Event(enable_timing=True) for _ in range(num_stages)]
+                      for _ in range(total_iters)]
+        ev_g_e_arr = [[torch.cuda.Event(enable_timing=True) for _ in range(num_stages)]
+                      for _ in range(total_iters)]
+        ev_ar_s_arr = [[torch.cuda.Event(enable_timing=True) for _ in range(num_stages)]
+                       for _ in range(total_iters)]
+        ev_ar_e_arr = [[torch.cuda.Event(enable_timing=True) for _ in range(num_stages)]
+                       for _ in range(total_iters)]
+
     for i in range(total_iters):
+        # Pick per-iter events (ν) or shared events (baseline)
         if skip_iter_sync:
-            # prep_ar runs on stream_ar so AR kernel is serialized after it
-            # (no cross-stream sync required). Between iters we rely on
-            # stream ordering alone — no torch.cuda.synchronize().
+            cur_ov_s, cur_ov_e = ov_s_arr[i], ov_e_arr[i]
+            cur_evgs, cur_evge = ev_g_s_arr[i], ev_g_e_arr[i]
+            cur_evars, cur_evare = ev_ar_s_arr[i], ev_ar_e_arr[i]
+        else:
+            cur_ov_s, cur_ov_e = ov_s, ov_e
+            cur_evgs, cur_evge = ev_g_s_list, ev_g_e_list
+            cur_evars, cur_evare = ev_ar_s_list, ev_ar_e_list
+
+        if skip_iter_sync:
+            # prep_ar on stream_ar; AR kernels serialize after it via stream order.
             with torch.cuda.stream(stream_ar):
                 prep_ar()
         else:
             torch.cuda.synchronize()
             prep_ar()
             torch.cuda.synchronize()
-        ov_s.record(stream_ar if skip_iter_sync else None)
+        cur_ov_s.record(stream_ar if skip_iter_sync else None)
         for s in range(num_stages):
-            ev_g_s_list[s].record(stream_gemm)
+            cur_evgs[s].record(stream_gemm)
             with torch.cuda.stream(stream_gemm):
                 _run_gemm()
-            ev_g_e_list[s].record(stream_gemm)
+            cur_evge[s].record(stream_gemm)
             if use_overlap:
-                stream_ar.wait_event(ev_g_e_list[s])
+                stream_ar.wait_event(cur_evge[s])
             else:
                 stream_gemm.synchronize()
-            ev_ar_s_list[s].record(stream_ar)
+            cur_evars[s].record(stream_ar)
             with torch.cuda.stream(stream_ar):
                 launch_ar()
-            ev_ar_e_list[s].record(stream_ar)
+            cur_evare[s].record(stream_ar)
             if not use_overlap:
                 stream_ar.synchronize()
                 if copy_stream:
@@ -996,27 +1019,49 @@ def _bench_overlap_one_size(
             if copy_stream:
                 copy_stream.synchronize()
             stream_gemm.synchronize()
-        ov_e.record(stream_ar if skip_iter_sync else None)
+        cur_ov_e.record(stream_ar if skip_iter_sync else None)
         if not skip_iter_sync:
             torch.cuda.synchronize()
-        t_ov = ov_s.elapsed_time(ov_e) / 1000.0
-        if i >= warmup:
-            overlap_times.append(t_ov)
-            if timeline_dump and rank == 0:
-                # Per-stage offsets relative to ov_s (ms), median across measure iters
-                iter_sample = {
-                    "wall": ov_s.elapsed_time(ov_e),
-                    "stages": [
-                        {
-                            "g_start": ov_s.elapsed_time(ev_g_s_list[s]),
-                            "g_end": ov_s.elapsed_time(ev_g_e_list[s]),
-                            "a_start": ov_s.elapsed_time(ev_ar_s_list[s]),
-                            "a_end": ov_s.elapsed_time(ev_ar_e_list[s]),
-                        }
-                        for s in range(num_stages)
-                    ],
-                }
-                timeline_samples.append(iter_sample)
+            t_ov = cur_ov_s.elapsed_time(cur_ov_e) / 1000.0
+            if i >= warmup:
+                overlap_times.append(t_ov)
+                if timeline_dump and rank == 0:
+                    iter_sample = {
+                        "wall": cur_ov_s.elapsed_time(cur_ov_e),
+                        "stages": [
+                            {
+                                "g_start": cur_ov_s.elapsed_time(cur_evgs[s]),
+                                "g_end": cur_ov_s.elapsed_time(cur_evge[s]),
+                                "a_start": cur_ov_s.elapsed_time(cur_evars[s]),
+                                "a_end": cur_ov_s.elapsed_time(cur_evare[s]),
+                            }
+                            for s in range(num_stages)
+                        ],
+                    }
+                    timeline_samples.append(iter_sample)
+
+    # ν mode: drain ONCE at the end, then read per-iter elapsed_time in bulk.
+    # This is the whole point of ν — between-iter stream/SDMA state kept warm.
+    if skip_iter_sync:
+        torch.cuda.synchronize()
+        for i in range(total_iters):
+            t_ov = ov_s_arr[i].elapsed_time(ov_e_arr[i]) / 1000.0
+            if i >= warmup:
+                overlap_times.append(t_ov)
+                if timeline_dump and rank == 0:
+                    iter_sample = {
+                        "wall": ov_s_arr[i].elapsed_time(ov_e_arr[i]),
+                        "stages": [
+                            {
+                                "g_start": ov_s_arr[i].elapsed_time(ev_g_s_arr[i][s]),
+                                "g_end": ov_s_arr[i].elapsed_time(ev_g_e_arr[i][s]),
+                                "a_start": ov_s_arr[i].elapsed_time(ev_ar_s_arr[i][s]),
+                                "a_end": ov_s_arr[i].elapsed_time(ev_ar_e_arr[i][s]),
+                            }
+                            for s in range(num_stages)
+                        ],
+                    }
+                    timeline_samples.append(iter_sample)
 
     if timeline_dump and rank == 0 and len(timeline_samples) > 0:
         import statistics as _stats
