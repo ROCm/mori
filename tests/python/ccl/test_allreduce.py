@@ -246,6 +246,73 @@ def _test_outplace(
     return ok
 
 
+def _test_copy_to_user_verify(
+    rank, my_pe, npes, elems, data_bytes, output_buf_size, fill_value,
+    dtype, dtype_name, device, stream, iterations, warmup,
+):
+    """Test 1b: copy_output_to_user=True correctness.
+
+    Covers the D' fast path when MORI_REGISTER_USER_OUTPUT=1: the user
+    output tensor is shmem-registered, AR kernel writes directly into it,
+    external hipMemcpyAsync is skipped. Result is read from the USER'S
+    output tensor and validated against expected allreduce sum.
+    """
+    if rank == 0:
+        print(f"\n>>> Test 1b: Copy-to-user (copy_output_to_user=True, "
+              f"+ MORI_REGISTER_USER_OUTPUT if set, {dtype_name})")
+
+    ar = AllreduceSdma(
+        my_pe, npes,
+        input_buffer_size=data_bytes,
+        output_buffer_size=output_buf_size,
+        copy_output_to_user=True,
+        dtype=dtype,
+    )
+    if os.environ.get("MORI_REGISTER_USER_OUTPUT", "0") == "1":
+        try:
+            ar.enable_register_user_output(True)
+        except Exception as e:
+            if rank == 0:
+                print(f"  [warn] enable_register_user_output failed: {e}",
+                      flush=True)
+
+    input_tensor = torch.full((elems,), fill_value, dtype=dtype, device=device)
+    output_tensor = torch.zeros(elems, dtype=dtype, device=device)
+
+    # Pre-register (collective) so fast path is hit on every call
+    if os.environ.get("MORI_REGISTER_USER_OUTPUT", "0") == "1":
+        try:
+            ar.register_user_output(output_tensor.data_ptr(),
+                                    output_tensor.numel() * output_tensor.element_size())
+        except Exception as e:
+            if rank == 0:
+                print(f"  [warn] register_user_output failed: {e}",
+                      flush=True)
+
+    torch.cuda.synchronize(); dist.barrier()
+
+    def _bench():
+        return ar(input_tensor, output_tensor, elems, stream)
+
+    times = _run_benchmark(_bench, iterations, warmup, stream, rank)
+
+    out_cpu = _to_numpy(output_tensor.cpu())
+    ok = _verify_allreduce_result(
+        out_cpu, elems, my_pe, npes, f"copy_to_user/{dtype_name}", dtype=dtype
+    )
+    if rank == 0 and ok:
+        hits = ar._handle.cache_hits()
+        misses = ar._handle.cache_misses()
+        print(f"  PE {rank}: copy-to-user correctness PASSED  "
+              f"(cache hits={hits}, misses={misses})", flush=True)
+
+    dist.barrier()
+    _print_stats(times, data_bytes, npes, rank, f"Copy-to-user ({dtype_name})")
+
+    del ar
+    return ok
+
+
 def _test_inplace(
     rank,
     my_pe,
@@ -1523,6 +1590,10 @@ def _test_allreduce(
             iterations,
             warmup,
         )
+        ok1b = _test_copy_to_user_verify(
+            rank, my_pe, npes, elems, data_bytes, output_buf_size, fill_value,
+            dtype, dtype_name, device, stream, iterations, warmup,
+        )
         ok2 = _test_inplace(
             rank,
             my_pe,
@@ -1567,7 +1638,7 @@ def _test_allreduce(
             warmup,
         )
 
-        all_ok = ok1 and ok2 and ok3 and ok4
+        all_ok = ok1 and ok1b and ok2 and ok3 and ok4
 
         if test_gemm_overlap:
             ok5 = _test_gemm_overlap_comparison(
