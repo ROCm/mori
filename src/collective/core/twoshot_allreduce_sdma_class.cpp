@@ -738,7 +738,12 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             if (scatter_mode == 1) {
                 chunk_elems = total_count;
             } else {
-                int kTargetChunks = cfg.target_chunks;
+                // Plan B (direct_output) uses more chunks to feed the β
+                // pipeline (default 8 per user's plan). Other modes keep
+                // cfg.target_chunks (default 2; env MORI_PIPELINE_CHUNKS).
+                int kTargetChunks =
+                    (direct_output_enabled_ && copy_output_to_user_)
+                        ? 8 : cfg.target_chunks;
                 constexpr size_t kMinChunkShardBytes = 8ULL * 1024 * 1024;
                 const size_t shard_bytes =
                     (total_count / npes_) * dtype_size_;
@@ -844,17 +849,19 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         bool skip_external_copy = use_plan_a;
 
         if (use_plan_a) {
-            // Kernel 1: SDMA scatter only.
+            // Plan B (user's 2-kernel design, perf_history Entry 18 v3):
+            // K1 = SDMA scatter, K2 = per-chunk CU pipeline (reduce → AG
+            // → copy) with β block partition to hide CU copy behind next
+            // chunk's reduce+AG.
             ScatterSdmaOnlyKernel<T><<<1, 512, 0, stream>>>(
                 myPe_, npes_, input, output_transit_buffer_obj_,
                 total_count, chunk_elems, scatter_base);
-            // Kernel 2: CU reduce + CU XGMI AG + direct write.
-            PipelinedCuAgKernel<T><<<blocks, threads, 0, stream>>>(
+            PipelinedCuReduceAgCopyKernel<T><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_, barrierPtr_,
-                output /* user_output direct target */,
-                total_count, chunk_elems, scatter_base, reduce_complete_base,
-                phase_ts_ptr, post_ag_flag_ptr);
+                output,
+                total_count, chunk_elems, scatter_base, ag_base,
+                reduce_complete_base, phase_ts_ptr);
         } else if (scatter_mode == 1) {
             PipelinedAllReduceSdmaKernel<T, 1><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
@@ -901,12 +908,11 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                 post_ag_flag_ptr);
         }
 
-        pipeline_scatter_gen_ += numChunks_host;   // scatter SDMA only (qId=0)
-        // Plan A skips SDMA AG, so no qId=1 signal increments — don't
-        // advance pipeline_ag_gen_ either (it tracks SDMA AG counter).
-        if (!use_plan_a) {
-          pipeline_ag_gen_ += numChunks_host;      // AG SDMA (qId=1)
-        }
+        pipeline_scatter_gen_ += numChunks_host;   // scatter SDMA (qId=0)
+        // Plan B also uses qId=1 signal counter (R-group CU does atomic
+        // fetch_add on peer's signalPtrs[myPe*numQ+1]), same increment
+        // pattern as SDMA AG. So advance pipeline_ag_gen_ in both paths.
+        pipeline_ag_gen_      += numChunks_host;   // AG (qId=1)
         pipeline_reduce_gen_  += numChunks_host;   // reduce_complete via flags
 
         hipError_t err = hipGetLastError();
