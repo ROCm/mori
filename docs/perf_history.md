@@ -361,6 +361,45 @@ Summarized here for quick lookup; exact commits in git log:
 
 ---
 
+## Entry 12.1 — Direction θ (multi-qId AG) FAILED IN IMPLEMENTATION (2026-04-22)
+- **Commits**: `1df5a9b1` (impl) + `c11c4870` (test) → reverted `219647a5`, `c3eccaa0`
+- **Correctness**: ✅ PASSED (Test 1b with MORI_AG_MULTI_Q=1)
+- **Perf (3-run clean env)**:
+  - OFF: SDMA copy = 7.770 ms
+  - ON θ: SDMA copy = 7.794 ms
+  - **Δ ≈ +0.024 ms (noise, no gain)**
+- **Direct measurement shows θ mechanism works but gain is absorbed**:
+  - OFF AR[0] (c0/c1 use same qId=1, FIFO serial):
+    - c0 submit-to-done: 0.643 ms
+    - c1 submit-to-done: 0.700 ms
+    - c1 global done = c0 submit + 1.219 ms (last to finish)
+  - ON θ (c0→qId=1, c1→qId=2, parallel):
+    - c0 submit-to-done: **1.193 ms** (+0.55 ms vs OFF!)
+    - c1 submit-to-done: 0.745 ms
+    - max done global = c0 submit + 1.193 ms
+  - **Total AG window shrinks only from 1.219 → 1.193 = 0.026 ms**
+- **Why Entry 12's gain prediction (0.5 ms) was wrong**:
+  - Entry 12 measured AR[2] warm path where c0/c1 submits were only 0.078 ms apart
+  - AR[0] cold path has **c0↔c1 submit interval of 0.52 ms** (scatter, barrier, etc
+    happen in between chunks' submits), which naturally overlaps with c0 AG transfer
+  - "Serial FIFO" in single-qId mode isn't actually bottlenecking because the
+    submit spacing already pipelines transfers
+  - Adding a second qId **doubles per-chunk transfer time** (HBM port contention
+    or SDMA engine cross-queue interference) — exactly cancelling the parallel gain
+- **Machine-level conclusion**:
+  - MI355X SDMA engine is **effectively bandwidth-saturated per-link** once the
+    chunk submit interval is ≥ chunk transfer time
+  - Multi-qId only helps when submit interval ≪ transfer time (e.g., AR[2] warm
+    where intervals are tens of us); but those cases are short-duration and contribute
+    little to wall time
+  - **Direction θ (multi-qId AG) closed** for the current AR structure
+- **Rule lesson (R6 reflection)**: Entry 12's ONE datapoint (AR[2] warm) led to a
+  gain extrapolation that didn't hold for the AR[0] cold path where it actually
+  mattered. Future R10 references must use the relevant stage's data, not the
+  most-convenient datapoint.
+
+---
+
 ## Entry 12 — Per-chunk AG timing proves single SDMA queue is strictly FIFO (not pipelined)
 - **Date**: 2026-04-22
 - **Commit**: `d56bbe29` (per-chunk AG-done display), data from AR[2] warm path
