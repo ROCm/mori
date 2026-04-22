@@ -16,6 +16,7 @@ env:
   IMAGE: rocm/mori:ci
   BASE_IMAGE: rocm/pytorch:rocm7.2.1_ubuntu24.04_py3.12_pytorch_release_2.8.0
   CT: docker
+  CONTAINER: mori_nightly_${{ github.run_id }}
 
 jobs:
   build-wheel:
@@ -24,7 +25,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.10", "3.11", "3.12", "3.13"]
+        python: ["3.10", "3.12"]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -76,9 +77,148 @@ jobs:
           $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE $IMAGE \
               chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
 
+  test-wheel:
+    name: test (py${{ matrix.python }})
+    needs: build-wheel
+    runs-on: [self-hosted, MI355X-AINIC-TW]
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12"]
+        include:
+          - python: "3.10"
+            artifact: wheel-cp3.10
+          - python: "3.12"
+            artifact: wheel-cp3.12
+    env:
+      MORI_RDMA_DEVICES: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
+      MORI_RDMA_SL: 3
+      MORI_RDMA_TC: 104
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Download wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ runner.temp }}/wheel
+
+      - name: Build CI image
+        run: $CT build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE -t $IMAGE -f docker/Dockerfile.dev .
+
+      - name: Start container
+        run: |
+          $CT rm -f $CONTAINER 2>/dev/null || true
+          CONTAINER_RUNTIME=$CT ./docker/ci_run.sh --name $CONTAINER \
+            -e MORI_RDMA_DEVICES=$MORI_RDMA_DEVICES \
+            -e MORI_RDMA_SL=$MORI_RDMA_SL \
+            -e MORI_RDMA_TC=$MORI_RDMA_TC \
+            -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
+            -v ${{ runner.temp }}/wheel:/tmp/wheel:ro \
+            -w $GITHUB_WORKSPACE \
+            $IMAGE sleep infinity
+          $CT exec $CONTAINER \
+            git config --global --add safe.directory $GITHUB_WORKSPACE
+
+      - name: Install from wheel
+        run: |
+          PY=${{ matrix.python }}
+          $CT exec $CONTAINER bash -c "
+            if [ '$PY' != '3.12' ]; then
+              apt-get update -qq
+              apt-get install -y -qq software-properties-common > /dev/null 2>&1
+              add-apt-repository -y ppa:deadsnakes/ppa > /dev/null 2>&1
+              apt-get update -qq
+              apt-get install -y -qq python${PY} python${PY}-dev python${PY}-venv > /dev/null 2>&1
+              python${PY} -m ensurepip --upgrade > /dev/null 2>&1
+              python${PY} -m pip install --upgrade pip > /dev/null 2>&1
+            fi
+            python${PY} -m pip install /tmp/wheel/*.whl
+            python${PY} -m pip install prettytable pytest
+            python${PY} -c 'import mori; print(\"mori imported OK\")'
+          "
+
+      - name: MORI-EP (intranode)
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE && timeout 300 pytest tests/python/ops/test_dispatch_combine_intranode.py -v
+          "
+
+      - name: MORI-EP (internode_v1)
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE && timeout 300 pytest tests/python/ops/test_dispatch_combine_internode_v1.py -v
+          "
+
+      - name: MORI-EP (async_ll)
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE && timeout 300 pytest tests/python/ops/test_dispatch_combine_async_ll.py -v
+          "
+
+      - name: MORI-EP bench
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE
+            timeout 120 python3 tests/python/ops/bench_dispatch_combine.py
+          "
+
+      - name: MORI-IO
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE
+            timeout 60 pytest tests/python/io/ -v
+            MORI_IO_XGMI_SCATTER_GATHER_THRESHOLD=4 \
+              timeout 120 pytest tests/python/io/test_discrete_buffer.py -v -k 'not performance'
+          "
+
+      - name: MORI-IR
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE -e HOME=/tmp $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE
+            timeout 60 torchrun --nproc_per_node=2 examples/shmem/ir/test_triton_shmem.py
+            timeout 60 torchrun --nproc_per_node=8 examples/shmem/ir/test_triton_allreduce.py
+            MORI_DISABLE_P2P=ON timeout 60 torchrun --nproc_per_node=8 examples/shmem/ir/test_triton_allreduce.py
+          "
+
+      - name: MORI-CCL/shmem
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE
+            timeout 600 pytest tests/python/shmem/test_api.py -v
+          "
+
+      - name: MORI-EP async kernel bench (intranode)
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE
+            PORT=12390
+            for TOKENS in 64 128; do
+              echo \"=== async_ll bench max-tokens=\$TOKENS port=\$PORT ===\"
+              MORI_ENABLE_SDMA=1 GPU_PER_NODE=8 \
+              timeout 120 torchrun \
+                --nnodes=1 --node_rank=0 --nproc_per_node=1 \
+                --master_addr=127.0.0.1 --master_port=\$PORT \
+                examples/ops/dispatch_combine/test_dispatch_combine_internode.py \
+                --kernel-type async_ll --num-qp 2 --cmd bench \
+                --dtype bf16 --max-tokens \$TOKENS
+              PORT=\$((PORT + 1))
+            done
+          "
+
+      - name: Cleanup
+        if: always()
+        run: |
+          $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE $IMAGE \
+              chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
+          $CT rm -f $CONTAINER || true
+
   deploy-nightly:
     name: deploy to gh-pages
-    needs: build-wheel
+    needs: test-wheel
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
@@ -105,7 +245,6 @@ jobs:
           mkdir -p gh-pages/nightly
           cp ./wheels/*.whl gh-pages/nightly/
 
-          # Prune wheels older than 30 days (by filename date prefix)
           CUTOFF=$(date -d '30 days ago' +%Y%m%d 2>/dev/null || date -v-30d +%Y%m%d)
           cd gh-pages/nightly
           for f in amd_mori-*.whl; do
@@ -149,7 +288,6 @@ jobs:
 
           for f in $(ls -r amd_mori-*.whl 2>/dev/null); do
             SIZE=$(du -h "$f" | cut -f1)
-            # Parse: amd_mori-20260423+9c7b3b0-cp312-cp312-linux_x86_64.whl
             VER=$(echo "$f" | sed 's/amd_mori-\(.*\)-cp.*/\1/')
             FILE_DATE=$(echo "$VER" | cut -d'+' -f1)
             COMMIT=$(echo "$VER" | cut -d'+' -f2)
@@ -162,7 +300,7 @@ jobs:
           </table>
           <p style="color:#888; margin-top:2em; font-size:0.85em">
           Auto-generated by <a href="https://github.com/ROCm/mori/actions/workflows/nightly.yml">nightly.yml</a>.
-          Wheels older than 30 days are automatically pruned.
+          Wheels older than 30 days are automatically pruned. Only wheels that pass full test suite are published.
           </p>
           </body></html>
           FOOTER
