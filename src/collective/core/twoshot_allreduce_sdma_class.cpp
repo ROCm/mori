@@ -275,20 +275,25 @@ void AllreduceSdma<T>::enable_post_ag_wait(bool on) {
 template <typename T>
 void AllreduceSdma<T>::enable_hbm_noise(bool on) {
   if (on == hbm_noise_enabled_) return;
+  const bool first_enable = on && !hbm_noise_ever_enabled_;
   hbm_noise_enabled_ = on;
   if (on) {
-    printf("PE %d: hbm_noise ENABLED (τ'' — compute-block HBM reads during "
-           "AG wait to keep MC active; requires post_ag_wait=on)\n",
+    hbm_noise_ever_enabled_ = true;
+  }
+  if (first_enable) {
+    printf("PE %d: hbm_noise ENABLED (τ'' v2 — heavy HBM-read loop during "
+           "post-AG spin; compiled-in 128 reads/iter/thread)\n",
            myPe_);
     if (!post_ag_wait_enabled_) {
       fprintf(stderr,
               "PE %d: WARNING hbm_noise requires post_ag_wait=on (currently "
-              "off). HBM noise will be a no-op until post_ag_wait is on.\n",
+              "off). HBM noise is a no-op until post_ag_wait is on.\n",
               myPe_);
     }
-  } else {
-    printf("PE %d: hbm_noise DISABLED\n", myPe_);
   }
+  // No per-call log for subsequent toggles — callers flip this per AR
+  // launch (only for the last AR[N-1] in a pipelined chain) so spam
+  // would overwhelm the log otherwise.
 }
 
 // ---------------------------------------------------------------------------

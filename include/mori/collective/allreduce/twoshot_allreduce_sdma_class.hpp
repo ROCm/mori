@@ -135,7 +135,10 @@ class AllreduceSdma {
   // keeps HBM / memory controller active during AG wait, which prevents the
   // ~2× SDMA AG throughput drop observed on AR[N-1] (no parallel GEMM to
   // provide HBM activity). Must be used together with post_ag_wait.
+  // ever_enabled_ is used to print the ENABLED banner only once per object
+  // (callers may toggle this per-call for last-AR-only noise).
   bool hbm_noise_enabled_ = false;
+  bool hbm_noise_ever_enabled_ = false;
 
   // ---------------------------------------------------------------------
   // D' prototype: lazy-register user output buffer as shmem symmetric

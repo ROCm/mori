@@ -361,37 +361,53 @@ __global__ void PipelinedAllReduceSdmaKernel(
       // ---------------------------------------------------------------
       if (post_ag_flag != nullptr) {
         if (hbm_noise_enabled) {
-          // All threads of the compute block read from input to generate
-          // HBM traffic. Uses volatile to prevent compiler eliminating
-          // the loads; accumulator is written to a dead slot once to
-          // keep the loads observable.
-          volatile const uint8_t* noise_buf =
-              reinterpret_cast<const uint8_t*>(input);
-          const size_t noise_total_bytes = elementCount * sizeof(T);
-          const size_t stride = 128;  // 1 cache line
-          const size_t tid_global =
-              static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-          const size_t step =
-              static_cast<size_t>(gridDim.x) * blockDim.x * stride;
-          size_t off = (tid_global * stride) %
-                       (noise_total_bytes > 0 ? noise_total_bytes : 1);
-          uint32_t acc = 0;
-          while (__hip_atomic_load(
-                     post_ag_flag,
-                     __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) == 0u) {
-            if (noise_total_bytes > 0) {
-              acc ^= noise_buf[off];
-              off += step;
-              if (off >= noise_total_bytes) off %= noise_total_bytes;
+          // τ'' v2: heavy HBM noise. Each thread reads 128 uint32 per
+          // spin iter (512 B per thread per iter; at 160 blocks × 256
+          // threads × 1 iter/~1us ≈ ~200 GB/s — matches GEMM HBM BW).
+          // Prior v1 read 1 byte per iter (~1 GB/s total) which was
+          // insufficient to keep the memory controller active (Entry 15
+          // follow-up data showed AR[3] AG 1.083 → 1.021, only 6%
+          // improvement). This version aims for true GEMM-class BW.
+          volatile const uint32_t* noise_buf_u32 =
+              reinterpret_cast<const uint32_t*>(input);
+          const size_t total_u32 =
+              elementCount * sizeof(T) / sizeof(uint32_t);
+          if (total_u32 > 0) {
+            const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x
+                             + threadIdx.x;
+            const size_t gstride = static_cast<size_t>(gridDim.x) * blockDim.x;
+            size_t base = tid % total_u32;
+            uint32_t acc = 0;
+            constexpr int kReadsPerIter = 128;
+            while (__hip_atomic_load(
+                       post_ag_flag,
+                       __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) == 0u) {
+              #pragma unroll
+              for (int k = 0; k < kReadsPerIter; k++) {
+                size_t idx = base + static_cast<size_t>(k) * gstride;
+                if (idx >= total_u32) idx %= total_u32;
+                acc ^= noise_buf_u32[idx];
+              }
+              base += static_cast<size_t>(kReadsPerIter) * gstride;
+              if (base >= total_u32) base %= total_u32;
             }
-          }
-          __syncthreads();
-          // Dead-store guard: keep the reads observable to the compiler.
-          // acc is essentially random; the condition is never true so
-          // no actual write occurs at runtime, but the compiler must
-          // preserve the loads because acc's value is used.
-          if (threadIdx.x == 0 && acc == 0xFFFFFFFFu) {
-            phase_ts[kArPhaseTsCapacity - 1] = static_cast<uint64_t>(acc);
+            __syncthreads();
+            // Dead-store guard: force the compiler to actually emit the
+            // reads (acc is used). Condition effectively never true.
+            if (threadIdx.x == 0 && acc == 0xFFFFFFFFu) {
+              phase_ts[kArPhaseTsCapacity - 1] = static_cast<uint64_t>(acc);
+            }
+          } else {
+            // No input to read from (shouldn't happen for real runs);
+            // fall back to the cheap sleep-spin.
+            if (threadIdx.x == 0) {
+              while (__hip_atomic_load(
+                         post_ag_flag,
+                         __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) == 0u) {
+                __builtin_amdgcn_s_sleep(2);
+              }
+            }
+            __syncthreads();
           }
         } else {
           if (threadIdx.x == 0) {
