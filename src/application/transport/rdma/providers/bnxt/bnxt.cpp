@@ -227,8 +227,8 @@ BnxtQpContainer::BnxtQpContainer(ibv_context* context, const RdmaEndpointConfig&
         hipExtMallocWithFlags(&rqUmemAddr, qpMemInfo.rq_len, hipDeviceMallocUncached));
     HIP_RUNTIME_CHECK(hipMemset(rqUmemAddr, 0, qpMemInfo.rq_len));
   } else {
-    err = posix_memalign(&rqUmemAddr, config.alignment, qpMemInfo.sq_len);
-    memset(rqUmemAddr, 0, qpMemInfo.sq_len);
+    err = posix_memalign(&rqUmemAddr, config.alignment, qpMemInfo.rq_len);
+    memset(rqUmemAddr, 0, qpMemInfo.rq_len);
     assert(!err);
   }
   qpMemInfo.rq_va = reinterpret_cast<uint64_t>(rqUmemAddr);
@@ -395,7 +395,7 @@ void BnxtQpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& local_handle,
 
   memcpy(&attr.ah_attr.grh.dgid, remote_handle.eth.gid, 16);
   attr.ah_attr.grh.sgid_index = local_handle.eth.gidIdx;
-  attr.ah_attr.grh.hop_limit = 1;
+  attr.ah_attr.grh.hop_limit = 255;
   attr.ah_attr.is_global = 1;
   attr.ah_attr.port_num = config.portId;
   attr.ah_attr.sl = ReadRdmaServiceLevelEnv().value_or(1);

@@ -741,7 +741,7 @@ inline __device__ int PollCq<ProviderType::BNXT>(WorkQueueHandle& wqHandle,
 template <>
 inline __device__ void UpdateCqDbrRecord<ProviderType::BNXT>(CompletionQueueHandle& cq,
                                                              uint32_t consIdx) {
-  uint8_t flags = ((consIdx + 1) / cq.cqeNum) & (1UL << BNXT_RE_FLAG_EPOCH_HEAD_SHIFT);
+  uint8_t flags = (((consIdx + 1) / cq.cqeNum) & 0x1) << BNXT_RE_FLAG_EPOCH_HEAD_SHIFT;
   uint32_t epoch = (flags & BNXT_RE_FLAG_EPOCH_TAIL_MASK) << BNXT_RE_DB_EPOCH_TAIL_SHIFT;
   // uint64_t dbrVal = bnxt_re_init_db_hdr(((consIdx + 1) | epoch), 0, flags, BNXT_RE_QUE_TYPE_CQ);
   uint64_t dbrVal =
