@@ -230,6 +230,8 @@ jobs:
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
             -w $GITHUB_WORKSPACE \
             rocm/mori:jax-ci sleep infinity
+          $CT exec ${CONTAINER}_jax \
+            git config --global --add safe.directory $GITHUB_WORKSPACE
 
       - name: Install mori (XLA FFI)
         run: |
