@@ -732,18 +732,29 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         }
 
         if (chunk_elems == 0) {
-            size_t min_chunk = std::max<size_t>(
-                static_cast<size_t>(pack_size) * npes_,
-                (512ULL * 1024 / dtype_size_) * npes_);
             if (scatter_mode == 1) {
                 chunk_elems = total_count;
+            } else if (direct_output_enabled_ && copy_output_to_user_) {
+                // Plan B (perf_history Entry 18): β-pipeline needs multi
+                // chunks to hide CU copy behind next chunk's reduce+AG.
+                // User-specified default = 8. Skip the 8 MB/chunk-shard
+                // minimum check (that heuristic was for SDMA AG cold-path
+                // cost, not applicable to our CU AG path). MORI_DIRECT_CHUNKS
+                // env can override (range 2..16).
+                int target = 8;
+                if (const char* e = std::getenv("MORI_DIRECT_CHUNKS")) {
+                    int v = std::atoi(e);
+                    if (v >= 2 && v <= 16) target = v;
+                }
+                chunk_elems = total_count / target;
+                // Minimum sanity: at least pack_size * npes per chunk.
+                size_t min_chunk = static_cast<size_t>(pack_size) * npes_;
+                if (chunk_elems < min_chunk) chunk_elems = min_chunk;
             } else {
-                // Plan B (direct_output) uses more chunks to feed the β
-                // pipeline (default 8 per user's plan). Other modes keep
-                // cfg.target_chunks (default 2; env MORI_PIPELINE_CHUNKS).
-                int kTargetChunks =
-                    (direct_output_enabled_ && copy_output_to_user_)
-                        ? 8 : cfg.target_chunks;
+                size_t min_chunk = std::max<size_t>(
+                    static_cast<size_t>(pack_size) * npes_,
+                    (512ULL * 1024 / dtype_size_) * npes_);
+                int kTargetChunks = cfg.target_chunks;
                 constexpr size_t kMinChunkShardBytes = 8ULL * 1024 * 1024;
                 const size_t shard_bytes =
                     (total_count / npes_) * dtype_size_;
@@ -754,9 +765,9 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                 } else {
                     chunk_elems = total_count;
                 }
+                if (chunk_elems < min_chunk)
+                    chunk_elems = min_chunk;
             }
-            if (chunk_elems < min_chunk)
-                chunk_elems = min_chunk;
         }
         size_t align = static_cast<size_t>(pack_size * npes_);
         chunk_elems = ((chunk_elems + align - 1) / align) * align;
@@ -853,6 +864,15 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             // K1 = SDMA scatter, K2 = per-chunk CU pipeline (reduce → AG
             // → copy) with β block partition to hide CU copy behind next
             // chunk's reduce+AG.
+            static thread_local bool s_plan_b_announced = false;
+            if (!s_plan_b_announced) {
+                printf("PE %d: Plan B active — ScatterSdmaOnlyKernel + "
+                       "PipelinedCuReduceAgCopyKernel; chunks=%d, blocks=%d, "
+                       "threads=%d, chunk_elems=%zu\n",
+                       myPe_, numChunks_host, blocks, threads,
+                       static_cast<size_t>(chunk_elems));
+                s_plan_b_announced = true;
+            }
             ScatterSdmaOnlyKernel<T><<<1, 512, 0, stream>>>(
                 myPe_, npes_, input, output_transit_buffer_obj_,
                 total_count, chunk_elems, scatter_base);
