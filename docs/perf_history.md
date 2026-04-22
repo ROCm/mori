@@ -409,6 +409,35 @@ Summarized here for quick lookup; exact commits in git log:
   throughput is the binding constraint, not queue count or parallelism.
 - AR[2]'s 51% utilization (low vs AR[0]'s 85%) is explained by **queue backlog**
   from prior AR calls' lingering SDMA submissions. Not a BW issue.
+
+### Update 3 — backlog hypothesis REFUTED by single-stage test (2026-04-22)
+- Ran `--num-stages 1 --elems 67108864 --iterations 20` to test AR[0] when
+  there's no prior or subsequent AR (truly "clean" SDMA queue, no backlog):
+  - single-stage AR[0] AG-submit→AG-wait-done: **1.086 ms** (slower than
+    multi-stage AR[0] 0.614 ms despite having zero backlog)
+  - c0 per-chunk AG done: 0.583 ms, c1 per-chunk AG done: 1.086 ms
+- **This refutes the "AR[2] slow because of queue backlog" reading**: AR[0]
+  with NO work upstream is actually even slower (1.086 ms) than AR[0] with
+  3 subsequent AR kernels queued up (0.614 ms).
+- **Correct mechanism (new hypothesis, needs validation)**: **SDMA engine
+  latency degrades when submission is sparse**. When multi-stage has
+  AR[1..3] kernels already queued on stream_ar, the SDMA queue stays
+  "hot" (additional packets keep flowing through the engine). When a
+  single AR[0] runs alone (single-stage, or AR[last] in multi-stage), the
+  SDMA engine processes the packet, drains, and enters low-power wait for
+  the next packet; next-packet dispatch latency adds ~0.5 ms per chunk.
+- **Correct gap decomposition**:
+  - AR[0] multi-stage = 0.614 ms ≈ 85% SDMA engine peak (HOT queue)
+  - AR[2]/AR[3]/single-stage AR[0] = 1.029/1.086 ms ≈ 50% peak (COLD engine dispatch overhead)
+  - Single-chunk physical transfer time is only ~0.26 ms; the remaining
+    0.5-0.8 ms is engine wake-up/dispatch between chunk packets
+- **New directions suggested by this mechanism**:
+  - ρ'（增加 chunk 密度）: reduce chunk_elems (numChunks=4 or 8 instead of 2)
+    → submissions denser → SDMA engine stays hot → AR[2]/AR[3] AG could drop
+    from 1.03 ms → close to 0.6 ms = save **0.4 ms per AR × 2 AR = 0.8 ms wall**
+  - σ（keep SDMA queue hot in kernel）: at kernel end, insert a small
+    dummy SDMA op so the engine doesn't enter low-power state before next
+    AR's submit. Measure if subsequent AR gets 0.6 ms AG-wait instead of 1.0 ms.
 - **Rule lesson (R6 reflection)**: Entry 12's ONE datapoint (AR[2] warm) led to a
   gain extrapolation that didn't hold for the AR[0] cold path where it actually
   mattered. Future R10 references must use the relevant stage's data, not the
