@@ -293,18 +293,6 @@ class AllreduceSdma:
                 my_pe, npes, 512 * 1024 * 1024, copy_output_to_user
             )
 
-        # Stage 2b-1 auto-enable via env: if MORI_POST_AG_WAIT=1 and the
-        # AR object is in copy-to-user mode, turn on the in-kernel post-AG
-        # copy path for every call. Lets all existing tests (correctness
-        # + perf) exercise the new path without rewiring each test setup.
-        import os as _os_mod_init
-        if (copy_output_to_user
-                and _os_mod_init.environ.get("MORI_POST_AG_WAIT", "0") == "1"):
-            try:
-                self._handle.enable_post_ag_wait(True)
-            except Exception as e:
-                print(f"[warn] auto-enable post_ag_wait failed: {e}", flush=True)
-
     def __call__(self, input_data, output_data, count: int, stream=None) -> bool:
         """Execute out-of-place AllReduce SDMA operation."""
         return self._handle(
