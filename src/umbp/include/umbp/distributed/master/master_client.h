@@ -119,6 +119,22 @@ class MasterClient {
   // keys.size() and populated parallel to keys.
   grpc::Status BatchLookup(const std::vector<std::string>& keys, std::vector<bool>* out);
 
+  // One entry of a BatchAbortAllocation request.  `node_id` is the target
+  // node owning the pending lease (not the caller); matches the single-item
+  // AbortAllocation semantics.
+  struct BatchAbortEntry {
+    std::string node_id;
+    std::string allocation_id;
+    uint64_t size;
+  };
+  // Batched rollback of pending allocations.  Semantics align with
+  // BatchFinalizeAllocation: wire success returns Status::OK and fills
+  // *out parallel to `entries`; per-entry false is not an error (racy
+  // reap / double-abort / EXPIRED node).  Callers use it as best-effort
+  // cleanup; TTL reaper covers the rest.
+  grpc::Status BatchAbortAllocation(const std::vector<BatchAbortEntry>& entries,
+                                    std::vector<bool>* out);
+
   // --- Heartbeat ---
   void StartHeartbeat();
   void StopHeartbeat();

@@ -71,3 +71,16 @@ target_link_libraries(
   PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
           gtest_main)
 add_test(NAME umbp_cross_node_smoke COMMAND test_umbp_cross_node_smoke)
+
+add_executable(test_umbp_pool_client_batch_abort
+               test_pool_client_batch_abort.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_umbp_pool_client_batch_abort PRIVATE
+                      -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  test_umbp_pool_client_batch_abort
+  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
+          gtest_main)
+add_test(NAME umbp_pool_client_batch_abort
+         COMMAND test_umbp_pool_client_batch_abort)

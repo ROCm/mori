@@ -611,6 +611,53 @@ grpc::Status MasterClient::BatchFinalizeAllocation(const std::vector<std::string
   return grpc::Status::OK;
 }
 
+grpc::Status MasterClient::BatchAbortAllocation(const std::vector<BatchAbortEntry>& entries,
+                                                std::vector<bool>* out) {
+  if (out != nullptr) {
+    out->clear();
+  }
+
+  if (!registered_) {
+    return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
+                        "node must be registered before BatchAbortAllocation");
+  }
+
+  if (entries.empty()) {
+    return grpc::Status::OK;
+  }
+
+  ::umbp::BatchAbortAllocationRequest req;
+  for (const auto& e : entries) {
+    auto* proto_e = req.add_entries();
+    proto_e->set_node_id(e.node_id);
+    proto_e->set_allocation_id(e.allocation_id);
+    proto_e->set_size(e.size);
+  }
+
+  ::umbp::BatchAbortAllocationResponse resp;
+  grpc::ClientContext ctx;
+  auto status = GetStub(stub_.get())->BatchAbortAllocation(&ctx, req, &resp);
+
+  if (!status.ok()) {
+    MORI_UMBP_ERROR("[Client] BatchAbortAllocation ({} entries) failed: {}", entries.size(),
+                    status.error_message());
+    return status;
+  }
+
+  // Semantics align with BatchFinalizeAllocation: wire OK → fill out,
+  // do NOT promote any per-entry false to an RPC-level error.  Per-entry
+  // false is a normal race (already reaped / double-abort / EXPIRED).
+  if (out != nullptr) {
+    out->resize(resp.aborted_size());
+    for (int i = 0; i < resp.aborted_size(); ++i) {
+      (*out)[i] = resp.aborted(i);
+    }
+  }
+
+  MORI_UMBP_INFO("[Client] BatchAbortAllocation: {} entries", entries.size());
+  return grpc::Status::OK;
+}
+
 grpc::Status MasterClient::BatchLookup(const std::vector<std::string>& keys,
                                        std::vector<bool>* out) {
   if (out != nullptr) {

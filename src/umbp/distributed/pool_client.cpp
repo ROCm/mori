@@ -31,6 +31,7 @@
 
 #include "mori/io/backend.hpp"
 #include "mori/utils/mori_log.hpp"
+#include "umbp/distributed/obs_counters.h"
 #include "umbp_peer.grpc.pb.h"
 
 namespace mori::umbp {
@@ -336,6 +337,7 @@ bool PoolClient::AbortAllocation(const std::string& node_id, TierType /*tier*/,
     return false;
   }
 
+  MORI_UMBP_OBS_INC(abort_allocation_calls_);
   auto status = master_client_->AbortAllocation(node_id, allocation_id, size);
   if (!status.ok()) {
     MORI_UMBP_ERROR("[PoolClient] AbortAllocation failed for node '{}' allocation '{}': {}",
@@ -607,6 +609,7 @@ bool PoolClient::Put(const std::string& key, const void* src, size_t size) {
     // (with `staging_buffer_size` cap) only when caller did not pre-register.
     bool ok = RemoteDramScatterWrite(peer, result->pages, page_size, src, size, true);
     if (!ok) {
+      MORI_UMBP_OBS_INC(abort_allocation_calls_);
       master_client_->AbortAllocation(result->node_id, result->allocation_id, size);
       return false;
     }
@@ -676,6 +679,15 @@ std::vector<bool> PoolClient::BatchPut(const std::vector<std::string>& keys,
     std::string allocation_id;
   };
   std::vector<PendingFinalize> pending;
+
+  // Failed-write aborts are accumulated and flushed once at the end via a
+  // single BatchAbortAllocation RPC (instead of N per-item AbortAllocation
+  // calls in the worst case).  Trade-off: pending-lease visibility on master
+  // extends to batch_end + BatchFinalize RTT.  Default allocation TTL (30s)
+  // >> typical batch latency, so TTL reaper compensates any edge race
+  // (`aborted=false` is not an error; see BatchAbortAllocation contract).
+  std::vector<MasterClient::BatchAbortEntry> pending_aborts;
+  pending_aborts.reserve(n);
 
   // Each entry uses the scatter-gather helpers; single-page is N=1, K=1.
   // TODO(perf): merge multiple entries' RDMA into a single BatchWrite to
@@ -761,8 +773,11 @@ std::vector<bool> PoolClient::BatchPut(const std::vector<std::string>& keys,
       // Local-path invariant violations (see flag setup above) deliberately
       // skip Abort: they share the master-invariant rationale of the early
       // checks above and rely on TTL/reap if a stale pending ever exists.
+      //
+      // Accumulate into pending_aborts for a single end-of-batch
+      // BatchAbortAllocation flush (see bottom of this function).
       if (!local_invariant_violated) {
-        master_client_->AbortAllocation(r.node_id, r.allocation_id, sizes[i]);
+        pending_aborts.push_back({r.node_id, r.allocation_id, sizes[i]});
       }
       continue;
     }
@@ -818,6 +833,24 @@ std::vector<bool> PoolClient::BatchPut(const std::vector<std::string>& keys,
         // AbortAllocation RPC needed.
         results[pending[i].original_idx] = false;
       }
+    }
+  }
+
+  // End-of-batch abort flush for write-failed items.  A single gRPC
+  // covers all target nodes (each entry carries its own node_id).  A
+  // wire-level failure here leaves all pendings for TTL reaper to
+  // reclaim — same trade-off as single-item Put()'s FinalizeAllocation
+  // error branch.  Per-entry aborted=false is a normal race (reaped /
+  // double-abort / EXPIRED) and is not treated as an error.
+  if (!pending_aborts.empty()) {
+    MORI_UMBP_OBS_INC(batch_abort_allocation_calls_);
+    MORI_UMBP_OBS_ADD(batch_abort_allocation_entries_, pending_aborts.size());
+    std::vector<bool> abort_results;
+    auto abort_status = master_client_->BatchAbortAllocation(pending_aborts, &abort_results);
+    if (!abort_status.ok()) {
+      MORI_UMBP_ERROR(
+          "[PoolClient] BatchPut: BatchAbortAllocation failed: {} ({} entries -> TTL reaper)",
+          abort_status.error_message(), pending_aborts.size());
     }
   }
 

@@ -9,6 +9,12 @@ set(SPDK_PKG_CONFIG_PATH
     CACHE STRING "Custom pkg-config path for SPDK")
 option(USE_SPDK "Enable SPDK support (auto-detected by default)" ON)
 
+# Test/bench-only observability counters inside distributed PoolClient (RPC
+# call/entry counts for assertion).  OFF in release — increment call sites
+# compile away to (void)0 via MORI_UMBP_OBS_INC.
+option(MORI_UMBP_OBS_COUNTERS
+       "Enable PoolClient observability counters for tests/bench" OFF)
+
 set(HAVE_SPDK FALSE)
 if(USE_SPDK)
   find_package(PkgConfig QUIET)
@@ -324,6 +330,10 @@ target_link_libraries(umbp_common PUBLIC mori_logging mori_io ${_PROTOBUF_LIBS}
                                          ${_GRPCPP_LIB})
 
 target_compile_features(umbp_common PUBLIC cxx_std_17)
+
+if(MORI_UMBP_OBS_COUNTERS)
+  target_compile_definitions(umbp_common PUBLIC MORI_UMBP_OBS_COUNTERS)
+endif()
 
 # NOTE: umbp_core no longer depends on umbp_common.  StandaloneClient has no
 # gRPC/Protobuf dependency.  Targets that need distributed features should link
