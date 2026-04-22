@@ -396,3 +396,19 @@ class AllreduceSdma:
         and without to see if compute blocks holding CUs hurts overlap.
         """
         self._handle.enable_post_ag_wait(on)
+
+    # --- D' fast path: lazy-register user output (see perf_history Entry 10)
+    def enable_register_user_output(self, on: bool):
+        """Enable the D' fast-path lookup in pipelined(). When on, if the
+        caller's output tensor has been pre-registered (see
+        register_user_output), AR kernel writes directly to it and the
+        external hipMemcpyAsync is skipped. Zero effect if no entry is
+        pre-registered (falls back to baseline transit+copy path)."""
+        self._handle.enable_register_user_output(on)
+
+    def register_user_output(self, ptr: int, size: int) -> bool:
+        """Collective: pre-register a user output buffer as shmem symmetric
+        memory. All ranks must call with the same size; ptr may differ per
+        rank. Returns True on success. Cached for later lookup by pipelined().
+        """
+        return self._handle.register_user_output(ptr, size)
