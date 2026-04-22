@@ -323,6 +323,41 @@ hipcc 找不到 → `exit 1` 直接把用户**登录的 bash session 杀了**；
 - [ ] 如果有，顶层是否已被 `bash <<'EOF' ... EOF` 或 `( ... )` 包起来？
 - [ ] 如果 preflight 的某个 `command -v` 失败，用户的 shell/容器会不会退？
 
+### R15. 一旦和用户达成方案一致，必须 **严格按该方案** 执行，不得擅自合并、替换或修改细节
+
+**触发**：用户提出具体方案或方案选项，和助手对齐了某个方案（即使只是一句 "OK 做这个"）后的实施阶段。
+
+**背景事故（本会话）**：用户提出方案 B：
+- Phase 1: CU P2P 读远端 + 求和 + 写远端 transit
+- Phase 2: **异步 SDMA 拷贝** transit → user_output
+- 1 个 CU 等 flag
+
+然后用户说 "现在不是 2-KERNEL 吗，第 1 个只做 SCATTER，第 2 个 WAIT FLAG，并 AR，这不是定好的方案吗"
+对齐方案后，我擅自实施成 **方案 A + 方案 B 混合**：
+- Kernel 1: SDMA scatter (方案 A)
+- Kernel 2: CU reduce + CU XGMI AG + **直接 CU 写 user_output** (方案 A 的手法)
+
+没有用方案 B 的 "SDMA 拷贝" 路径。这是严重偏离达成一致的方案。
+
+**硬性要求**：
+1. **在实施前，把方案拆解成明确的 phase 列表**，每个 phase 说明：
+   - 用什么硬件（CU / SDMA engine / XGMI）
+   - 数据流向（local read / remote read / local write / remote write）
+   - 退出时机（kernel exit / return from function / continue）
+2. **把拆解结果发给用户确认**，一句 "下面按这个做：...（拆解）..." 并等用户明确回复 OK，再动手。
+3. **实施过程中若发现方案需调整**（比如遇到未预料的技术限制），**必须停下来告诉用户**，解释为什么要调整，等用户决定。不得假设 "换个做法也行"。
+4. **在 commit message 里必须明确说清楚这次 commit 实现的是哪个方案的哪个 phase**。commit 的改动不匹配已一致方案时，绝不提交。
+
+**反模式（本会话踩过）**：
+- ❌ 用户说方案 B，我写了 "方案 A v2"，commit 说 "plan A v2 two-kernel" — 方案名都错了
+- ❌ 实施过程中我发现方案 B 的 SDMA 本地 copy 有 60 GB/s 瓶颈 → 我改成 CU 直写，**没告诉用户就改了**
+- ❌ 用户问 "这不是定好的方案吗"，我才意识到自己偏离了
+
+**self-check before each commit**：
+- [ ] 这次 commit 的每个改动是否都在已一致方案的 phase 拆解范围内？
+- [ ] 如果发现方案需要调整，是否已 STOP 并问了用户？
+- [ ] commit message 是否明确对应一致方案的某个具体 phase？
+
 ### R14. 超过 10 行的 shell 必须落到 repo 的 `tools/*.sh` 脚本文件，不得 copy-paste
 
 **触发**：任何给用户的 shell block >= 10 行，或包含 **any** 以下特征：
