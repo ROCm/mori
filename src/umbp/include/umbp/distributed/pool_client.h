@@ -67,6 +67,13 @@ class PoolClient {
                           TierType tier, const std::string& allocation_id);
   bool PublishLocalBlock(const std::string& key, size_t size, const std::string& location_id,
                          TierType tier);
+  // Roll back a pending allocation on the Master.  Only call this AFTER
+  // Master has handed out a successful allocation (RoutePut / AllocateForPut)
+  // AND the local-side commit work (memcpy / RDMA / FinalizeAllocation)
+  // failed.  Do NOT call to defend against malformed Master responses or
+  // Master-side validation rejections -- those are handled by Master
+  // internally (AllocateForPut invariant guard, FinalizeAllocation
+  // auto-rollback) and reaching for Abort on top of them is redundant.
   bool AbortAllocation(const std::string& node_id, TierType tier, const std::string& allocation_id,
                        uint64_t size);
 
