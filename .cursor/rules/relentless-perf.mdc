@@ -175,21 +175,28 @@ RCCL `dist.all_reduce(tensor)` 的 drop-in 替代语义。
 
 1. **跑测 + 提取 + 打印对比表在同一个 shell block 内**（单次 copy-paste 完成）：
    ```bash
+   set -euo pipefail              # fail-fast: 任一步 error 立刻 abort
+   cd <repo> && git pull ...      # rebuild 前置
+   pip install -e . --no-build-isolation   # NO | tail -N ！失败要让 exit code 暴露
    LOG=/tmp/perf_<topic>_$(date +%s).log
-   { ...循环跑所有变体...tee 到 $LOG... } | tee "$LOG"
+   { ...循环跑所有变体... } | tee "$LOG"
    # 紧接着（同一 block 内）：
    awk/grep 从 $LOG 提取并直接打印对比表（用户无需再粘一次命令）
    echo "LOG: $LOG"
    ```
-2. **所有变体输出**重定向到**同一个 `$LOG` 文件**（`tee "$LOG"`），
+2. **必须 `set -euo pipefail` 开头**。否则 `pip install ... | tail -3` 在 pip
+   失败时 tail 仍 exit 0，`&&` 放行后续测试命令，白跑几分钟得到空输出。
+3. **`pip install` 不得带 `| tail -N`**（会吞掉 exit code）。让它的 stdout/stderr
+   直接输出到终端（tee 到 $LOG），失败时立刻停止；日志里自带完整 build error。
+4. **所有变体输出**重定向到**同一个 `$LOG` 文件**（`tee "$LOG"`），
    每段前用 `========== <LABEL> ==========` 分隔，便于 `awk` 按 label 切段。
-3. **log 文件名含时间戳**（`/tmp/perf_<topic>_$(date +%s).log`），避免覆盖。
-4. **block 末尾 `echo "LOG: $LOG"`**，用户贴回结果时我能直接定位。
-5. **提取逻辑内嵌在同一 block**，至少自动打印：
+5. **log 文件名含时间戳**（`/tmp/perf_<topic>_$(date +%s).log`），避免覆盖。
+6. **block 末尾 `echo "LOG: $LOG"`**，用户贴回结果时我能直接定位。
+7. **提取逻辑内嵌在同一 block**，至少自动打印：
    - 各 label 的关键指标对比（wall ms / phase ms / gap vs RCCL）
    - per-phase breakdown 里 gap 最大的 phase
    - 机制假设对应的 side-metric（例如 GEMM dur、AG-submit→AG-wait-done）
-6. **用户只需要贴回 1 段输出**（stdout 的全部内容，含对比表）。
+8. **用户只需要贴回 1 段输出**（stdout 的全部内容，含对比表）。
    不得要求用户"然后再跑下面这条提取命令"。
 
 **反模式（必须避免）**：
@@ -201,10 +208,13 @@ RCCL `dist.all_reduce(tensor)` 的 drop-in 替代语义。
 | 只给测试命令，让用户 scroll 几千行 log 找数字 | block 末尾直接打印 ready-to-read 的对比表 |
 | 让用户手工把 4 段 stdout 拼到一起贴回来 | 一次 `tee "$LOG"` + 一次提取 = 一次粘贴 |
 | 多次 pip install / source env 散落在各 label 之间 | 1 次 pip install + 1 次 git pull 放在 block 开头 |
+| `pip install ... 2>&1 \| tail -3` 后用 `&&` 串联测试 | 不 pipe tail；用 `set -euo pipefail` 保 exit-code 生效 |
+| 用户贴回"pip build failed"后继续输出空 label，我没看出 | `set -e` 后第一条 fail 立刻 abort，不白跑 |
 
-**本会话发生过的违规**：R11 首版要求"单一 log + 提取命令"，但把"跑"和"提取"
-分成**两次** copy-paste，等价于让用户跑两次 shell。按更新后的 R11，必须在
-**同一 block** 内完成"跑 → tee → 立刻 awk/grep → 打印对比表"，用户只贴一次结果。
+**本会话发生过的违规**：
+- R11 v1：给"跑"+"提取"两个 block，要求用户贴两次 → v2 已合并为一个 block。
+- R11 v2：`pip install ... | tail -3 && <后续>` → tail 吞掉 exit code，build
+  failed 还继续跑测试，用户看到假的"空 OFF 段"。**必须用 `set -euo pipefail`**。
 
 ## 工作流模板（每轮都走这个）
 
