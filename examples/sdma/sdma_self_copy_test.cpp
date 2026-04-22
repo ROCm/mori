@@ -86,6 +86,21 @@ __global__ void SdmaSelfCopyKernel(const SymmMemObjPtr srcObj, void* dst, size_t
 
 void testSdmaSelfCopy() {
   MPI_Init(NULL, NULL);
+
+  // Bind each MPI rank to a distinct GPU before ShmemMpiInit.
+  // Without this, all 8 ranks default to GPU 0 and the first shmem alloc
+  // plus SDMA queue init fault at nil. Matches the pattern in
+  // examples/shmem/test_p2p_direct_access.cpp.
+  MPI_Comm localComm;
+  MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL,
+                      &localComm);
+  int localRank = 0;
+  MPI_Comm_rank(localComm, &localRank);
+  int deviceCount = 0;
+  CHECK_HIP(hipGetDeviceCount(&deviceCount));
+  CHECK_HIP(hipSetDevice(localRank % deviceCount));
+  MPI_Comm_free(&localComm);
+
   int status = ShmemMpiInit(MPI_COMM_WORLD);
   assert(!status);
 
