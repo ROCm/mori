@@ -35,7 +35,7 @@
 
 #include "hip/hip_runtime.h"
 
-namespace mori::shmem::perftest {
+namespace mori::shmem::benchmark {
 
 enum class PutScope { kThread, kWarp, kBlock };
 
@@ -104,7 +104,7 @@ void PrintUsage(const char* program);
 
 enum class PerfTableMetric { kBandwidthGbps, kLatencyUs };
 
-// One row: value is GB/s (put_bw) or µs/iter (put_latency) depending on metric.
+// One row: value is GB/s (put_bw) or us/iter (put_latency) depending on metric.
 struct PerfTableRow {
   std::size_t size_bytes{};
   bool skipped{};
@@ -170,4 +170,4 @@ inline bool latency_size_ok(PutScope scope, size_t len_doubles, int threads_per_
   return len_doubles > 0;
 }
 
-}  // namespace mori::shmem::perftest
+}  // namespace mori::shmem::benchmark

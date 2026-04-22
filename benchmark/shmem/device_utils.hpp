@@ -20,7 +20,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-// Device-side bandwidth test helpers shared across all bw perftests.
+// Device-side bandwidth test helpers shared across all bw benchmarks.
 // Include this header only from device (.cpp/.hip) translation units, NOT from
 // util.cpp, to avoid duplicate __global__ kernel symbols at link time.
 
@@ -28,7 +28,7 @@
 
 #include "mori/shmem/shmem.hpp"
 
-namespace mori::shmem::perftest {
+namespace mori::shmem::benchmark {
 
 // Intra-block linear thread index.
 __device__ inline int linear_tid() {
@@ -118,4 +118,4 @@ __device__ inline void bw_final_barrier_and_quiet(volatile unsigned int* counter
   __syncthreads();
 }
 
-}  // namespace mori::shmem::perftest
+}  // namespace mori::shmem::benchmark

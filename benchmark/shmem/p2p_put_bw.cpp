@@ -32,7 +32,7 @@
 #include "mori/shmem/shmem.hpp"
 #include "util.hpp"
 
-namespace mori::shmem::perftest {
+namespace mori::shmem::benchmark {
 
 __global__ void bw_block(double* data_d, volatile unsigned int* counter_d, size_t len, int pe,
                          int iter) {
@@ -110,23 +110,23 @@ void launch_bw(PutScope scope, dim3 grid, dim3 block, double* data_d, unsigned i
   }
 }
 
-}  // namespace mori::shmem::perftest
+}  // namespace mori::shmem::benchmark
 
 int main(int argc, char** argv) {
 #ifndef MORI_WITH_MPI
   std::fprintf(stderr,
-               "mori_shmem_put_bw requires MORI_WITH_MPI (enable WITH_MPI / BUILD_EXAMPLES).\n");
+               "mori_shmem_put_bw requires MORI_WITH_MPI (enable WITH_MPI / BUILD_BENCHMARK).\n");
   return 1;
 #else
 
   using namespace mori::application;
   using namespace mori::shmem;
-  using namespace mori::shmem::perftest;
+  using namespace mori::shmem::benchmark;
 
   PerfContext ctx{};
   const int init_rc = PerfInit(argc, argv, &ctx);
   if (init_rc != 0) {
-    return init_rc;
+    return init_rc == 2 ? 0 : 1;
   }
 
   PerfArgs& args = ctx.args;

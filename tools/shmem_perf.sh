@@ -11,7 +11,7 @@ TESTTYPE="${1:?Usage: $0 <bw|lat|sweep> <output_file> [extra args...]}"
 OUTPUT="${2:?Usage: $0 <bw|lat|sweep> <output_file> [extra args...]}"
 shift 2
 
-BINDIR="$(cd "$(dirname "$0")/../build/perftest" && pwd)"
+BINDIR="$(cd "$(dirname "$0")/../build/benchmark" && pwd)"
 MPI="mpirun --allow-run-as-root -np 2"
 
 # Threads per block and warp size (match binary defaults)

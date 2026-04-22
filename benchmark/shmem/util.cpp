@@ -30,7 +30,7 @@
 #include "mori/application/utils/check.hpp"
 #include "mori/shmem/shmem_api.hpp"
 
-namespace mori::shmem::perftest {
+namespace mori::shmem::benchmark {
 
 void PrintUsage(const char* program) {
   std::fprintf(
@@ -57,6 +57,25 @@ int ParseArgs(int argc, char** argv, PerfArgs* out_args) {
 
   *out_args = PerfArgs{};
 
+  auto parse_size = [](const char* s) -> std::size_t {
+    char* end = nullptr;
+    std::size_t val = std::strtoul(s, &end, 0);
+    if (end && *end != '\0') {
+      switch (*end | 0x20) {  // tolower
+        case 'k':
+          val <<= 10;
+          break;
+        case 'm':
+          val <<= 20;
+          break;
+        case 'g':
+          val <<= 30;
+          break;
+      }
+    }
+    return val;
+  };
+
   int opt = 0;
   while ((opt = getopt(argc, argv, "hBb:e:f:n:w:c:t:s:q:")) != -1) {
     switch (opt) {
@@ -66,10 +85,10 @@ int ParseArgs(int argc, char** argv, PerfArgs* out_args) {
         out_args->bidirectional = true;
         break;
       case 'b':
-        out_args->min_size = static_cast<std::size_t>(std::strtoul(optarg, nullptr, 0));
+        out_args->min_size = parse_size(optarg);
         break;
       case 'e':
-        out_args->max_size = static_cast<std::size_t>(std::strtoul(optarg, nullptr, 0));
+        out_args->max_size = parse_size(optarg);
         break;
       case 'f':
         out_args->step_factor = static_cast<std::size_t>(std::strtoul(optarg, nullptr, 0));
@@ -109,10 +128,24 @@ int ParseArgs(int argc, char** argv, PerfArgs* out_args) {
 }
 
 static std::string fmt_size(std::size_t bytes) {
-  if (bytes >= (1ULL << 30)) return std::to_string(bytes >> 30) + " GB";
-  if (bytes >= (1ULL << 20)) return std::to_string(bytes >> 20) + " MB";
-  if (bytes >= (1ULL << 10)) return std::to_string(bytes >> 10) + " KB";
-  return std::to_string(bytes) + " B";
+  char buf[16];
+  std::size_t val;
+  const char* unit;
+  if (bytes >= (1ULL << 30)) {
+    val = bytes >> 30;
+    unit = "GB";
+  } else if (bytes >= (1ULL << 20)) {
+    val = bytes >> 20;
+    unit = "MB";
+  } else if (bytes >= (1ULL << 10)) {
+    val = bytes >> 10;
+    unit = "KB";
+  } else {
+    val = bytes;
+    unit = "B ";
+  }
+  std::snprintf(buf, sizeof(buf), "%3zu %s", val, unit);
+  return buf;
 }
 
 void PrintPerfTable(const char* test_name, const char* scope_name, int grid_x, int block_threads,
@@ -128,30 +161,21 @@ void PrintPerfTable(const char* test_name, const char* scope_name, int grid_x, i
 
   constexpr int kWSize = 10;
   constexpr int kWScope = 8;
-  constexpr int kVal = 16;
+  constexpr int kWNum = 12;
 
   const bool is_bw = (metric == PerfTableMetric::kBandwidthGbps);
-  const char* val_header = is_bw ? "Bandwidth (GB/s)" : "latency";
+  const char* num_header = is_bw ? "Bandwidth" : "Latency";
+  const char* unit_str = is_bw ? "GB/s" : "us";
 
-  std::printf("%-*s %-*s %*s\n", kWSize, "size", kWScope, "scope", kVal, val_header);
+  std::printf("%-*s %-*s %*s %s\n", kWSize, "size", kWScope, "scope", kWNum, num_header, unit_str);
 
   for (const PerfTableRow& r : rows) {
     std::string sz = fmt_size(r.size_bytes);
     if (r.skipped) {
-      std::printf("%-*s %-*s %*s\n", kWSize, sz.c_str(), kWScope, scope_col, kVal, "skip");
-    } else if (is_bw) {
-      char buf[32];
-      std::snprintf(buf, sizeof(buf), "%.3f GB/s", r.value);
-      std::printf("%-*s %-*s %*s\n", kWSize, sz.c_str(), kWScope, scope_col, kVal, buf);
+      std::printf("%-*s %-*s %*s\n", kWSize, sz.c_str(), kWScope, scope_col, kWNum, "skip");
     } else {
-      // Auto-scale latency: use ms when >= 1000 µs, else µs.
-      char buf[32];
-      if (r.value >= 1000.0) {
-        std::snprintf(buf, sizeof(buf), "%.3f ms", r.value / 1000.0);
-      } else {
-        std::snprintf(buf, sizeof(buf), "%.3f µs", r.value);
-      }
-      std::printf("%-*s %-*s %*s\n", kWSize, sz.c_str(), kWScope, scope_col, kVal, buf);
+      std::printf("%-*s %-*s %*.3f %s\n", kWSize, sz.c_str(), kWScope, scope_col, kWNum, r.value,
+                  unit_str);
     }
   }
   std::fflush(stdout);
@@ -174,7 +198,7 @@ int PerfInit(int argc, char** argv, struct PerfContext* ctx) {
       PrintUsage(argv[0]);
     }
     MPI_Finalize();
-    return rc == 2 ? 0 : 1;
+    return rc;  // 2 = help shown, 1 = bad args; caller must not call PerfFinalize
   }
 
   if (args.min_size > args.max_size || args.step_factor < 2 || args.iters < 1 || args.nblocks < 1 ||
@@ -255,4 +279,4 @@ float RunWarmupAndTimed(PerfRes& res, size_t warmup, size_t iters, LaunchFn laun
   return ms;
 }
 
-}  // namespace mori::shmem::perftest
+}  // namespace mori::shmem::benchmark

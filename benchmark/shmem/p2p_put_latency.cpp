@@ -32,7 +32,7 @@
 #include "mori/shmem/shmem.hpp"
 #include "util.hpp"
 
-namespace mori::shmem::perftest {
+namespace mori::shmem::benchmark {
 
 // Thread-scope put: single thread issues put_nbi + quiet each iteration.
 __global__ void lat_thread(double* data_d, size_t len_doubles, int pe, int iter) {
@@ -97,19 +97,19 @@ void launch_latency(PutScope scope, double* data_d, size_t len_doubles, int my_p
   }
 }
 
-}  // namespace mori::shmem::perftest
+}  // namespace mori::shmem::benchmark
 
 int main(int argc, char** argv) {
 #ifndef MORI_WITH_MPI
   std::fprintf(
       stderr,
-      "mori_shmem_put_latency requires MORI_WITH_MPI (enable WITH_MPI / BUILD_EXAMPLES).\n");
+      "mori_shmem_put_latency requires MORI_WITH_MPI (enable WITH_MPI / BUILD_BENCHMARK).\n");
   return 1;
 #else
 
   using namespace mori::application;
   using namespace mori::shmem;
-  using namespace mori::shmem::perftest;
+  using namespace mori::shmem::benchmark;
 
   PerfContext ctx{};
   const int init_rc = PerfInit(argc, argv, &ctx);
