@@ -59,19 +59,20 @@ if [ "$SKIP_BUILD" != "1" ]; then
   BUILD_EXAMPLES=ON pip install -e .
 fi
 
-# Locate example binaries — pip/setup.py puts them inside the build tree used
-# by setuptools. Resolve by glob.
-SDMA_BIN="$(find "$REPO" -path "*/build*" -name sdma_self_copy_test -type f 2>/dev/null | head -1)"
-XGMI_BIN="$(find "$REPO" -path "*/build*" -name cu_xgmi_bench       -type f 2>/dev/null | head -1)"
-
-echo "SDMA_BIN = ${SDMA_BIN:-NOT_FOUND}"
+# Locate my cu_xgmi_bench binary (sdma_self_copy_test is a pre-existing
+# broken example that faults under multi-GPU mpirun — not needed for
+# plan A decision; skip entirely).
+XGMI_BIN="$(find "$REPO" -path "*/build*" -name cu_xgmi_bench -type f 2>/dev/null | head -1)"
 echo "XGMI_BIN = ${XGMI_BIN:-NOT_FOUND}"
-[ -x "$XGMI_BIN" ] || { echo "MISSING: $XGMI_BIN (cu_xgmi_bench)"; exit 1; }
+[ -x "$XGMI_BIN" ] || {
+  echo "MISSING cu_xgmi_bench. Re-run with SKIP_BUILD=0 to build examples."
+  exit 1
+}
 
 LOG=/tmp/xgmi_sdma_bw_$(date +%s).log
 
 echo
-echo "==================== [run] LOG -> $LOG ===================="
+echo "==================== [run cu_xgmi_bench] LOG -> $LOG ===================="
 {
   echo "##########################################"
   echo "## CU XGMI multi-peer read BW"
@@ -79,18 +80,6 @@ echo "==================== [run] LOG -> $LOG ===================="
   echo "##########################################"
   echo
   mpirun -n 8 --allow-run-as-root "$XGMI_BIN" 2>&1
-
-  # sdma_self_copy_test has a pre-existing bug that faults on multi-GPU
-  # (not our concern for this decision — SDMA self-copy BW is only plan B
-  # data, plan A depends only on CU XGMI BW).
-  if [ -x "$SDMA_BIN" ]; then
-    echo
-    echo "##########################################"
-    echo "## SDMA self-copy BW (may fault on multi-GPU — existing bug)"
-    echo "##########################################"
-    echo
-    mpirun -n 8 --allow-run-as-root "$SDMA_BIN" 2>&1 || echo "(sdma_self_copy_test faulted; skipped)"
-  fi
 } | tee "$LOG"
 
 echo
@@ -106,8 +95,8 @@ echo "--- CU XGMI load @ 64 MB/peer ---"
 awk '/per-peer bytes = 64 MB/,0' "$LOG" | head -8 || true
 
 echo
-echo "--- SDMA self-copy @ 256 MB (plan B, may be missing if fault) ---"
-grep -E "^\s+256\.[0-9]\s" "$LOG" | head -2 || echo "(no data)"
+echo "--- best XGMI BW across all sweeps ---"
+awk '/XGMI_Read_BW/,0' "$LOG" | grep -E "^\s+[0-9]+\.[0-9]" | sort -k3 -n -r | head -3 || true
 
 echo
 echo "LOG: $LOG"
