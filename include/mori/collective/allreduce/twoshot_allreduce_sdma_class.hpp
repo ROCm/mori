@@ -129,14 +129,6 @@ class AllreduceSdma {
   bool post_ag_wait_enabled_ = false;
   uint32_t* post_ag_flag_d_ = nullptr;  // device uint32, reset to 0 each call
 
-  // E'' direction (perf_history Entry 17): when inkernel_copy_enabled_ is
-  // true and `copy_output_to_user` is on, pipelined() passes the user
-  // output buffer to the AR kernel; compute blocks copy the per-peer
-  // transit shards into user_output during block 0's AG wait. The
-  // external hipMemcpyAsync is SKIPPED. Must only be used on the
-  // MULTI_CHUNK path (kernel-side enforcement via constexpr branch).
-  bool inkernel_copy_enabled_ = false;
-
   // ---------------------------------------------------------------------
   // D' prototype: lazy-register user output buffer as shmem symmetric
   // memory so AR kernel can AG directly to it, skipping the transit
@@ -312,15 +304,6 @@ class AllreduceSdma {
   // Stage 2 (future): compute blocks do in-kernel copy during the spin.
   void enable_post_ag_wait(bool on);
   bool is_post_ag_wait_enabled() const { return post_ag_wait_enabled_; }
-
-  // --- E'' in-kernel copy (perf_history Entry 17) ------------------
-  // When on AND copy_output_to_user is on, the AR kernel's compute
-  // blocks copy transit → user_output during block 0's AG wait (the
-  // external hipMemcpyAsync is skipped). Only applies to the
-  // MULTI_CHUNK path (size >= 2 chunks). For single-chunk the legacy
-  // external copy path is used regardless of this flag.
-  void enable_inkernel_copy(bool on);
-  bool is_inkernel_copy_enabled() const { return inkernel_copy_enabled_; }
 
   // --- D' prototype: lazy-register user output as symm memory --------
   // Turn on/off the fast path. When on, pipelined() tries to use the

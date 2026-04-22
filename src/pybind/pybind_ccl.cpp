@@ -246,12 +246,6 @@ void RegisterMoriCcl(pybind11::module_& m) {
            py::arg("on"),
            "Stage 1 of E' prototype: compute blocks wait for AG done "
            "instead of exiting; measures CU occupancy cost")
-      .def("enable_inkernel_copy",
-           &mori::collective::AllreduceSdma<uint32_t>::enable_inkernel_copy,
-           py::arg("on"),
-           "E'' (Entry 17): compute blocks copy transit→user_output "
-           "during AG wait; skips the external hipMemcpyAsync. "
-           "Requires copy_output_to_user=on and MULTI_CHUNK path.")
       .def("enable_register_user_output",
            &mori::collective::AllreduceSdma<uint32_t>::enable_register_user_output,
            py::arg("on"),
@@ -325,8 +319,6 @@ void RegisterMoriCcl(pybind11::module_& m) {
            &mori::collective::AllreduceSdma<half>::get_copy_timing_last_num_chunks)
       .def("enable_post_ag_wait",
            &mori::collective::AllreduceSdma<half>::enable_post_ag_wait, py::arg("on"))
-      .def("enable_inkernel_copy",
-           &mori::collective::AllreduceSdma<half>::enable_inkernel_copy, py::arg("on"))
       .def("enable_register_user_output",
            &mori::collective::AllreduceSdma<half>::enable_register_user_output,
            py::arg("on"))
@@ -398,9 +390,6 @@ void RegisterMoriCcl(pybind11::module_& m) {
            &mori::collective::AllreduceSdma<hip_bfloat16>::get_copy_timing_last_num_chunks)
       .def("enable_post_ag_wait",
            &mori::collective::AllreduceSdma<hip_bfloat16>::enable_post_ag_wait,
-           py::arg("on"))
-      .def("enable_inkernel_copy",
-           &mori::collective::AllreduceSdma<hip_bfloat16>::enable_inkernel_copy,
            py::arg("on"))
       .def("enable_register_user_output",
            &mori::collective::AllreduceSdma<hip_bfloat16>::enable_register_user_output,

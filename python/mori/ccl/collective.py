@@ -397,21 +397,6 @@ class AllreduceSdma:
         """
         self._handle.enable_post_ag_wait(on)
 
-    def enable_inkernel_copy(self, on: bool):
-        """E'' (perf_history Entry 17): during block 0's AG wait, compute
-        blocks copy transit→user_output per peer shard (each block bound
-        to one peer, waits its AG signal, then copies its slice). The
-        external `hipMemcpyAsync(output, transit)` is skipped — 4 ARs × 0.35
-        ms = ~1.4 ms of copy overhead collapses into ~0 ms (hidden in the
-        1.08 ms AG wait window).
-
-        Requires copy_output_to_user=True at construction and the
-        MULTI_CHUNK path (buffers ≥ 2 chunks, i.e. typically ≥64 MB).
-        User API is unchanged — the output tensor still receives the final
-        AR result by the time the stream is synchronized.
-        """
-        self._handle.enable_inkernel_copy(on)
-
     # --- D' fast path: lazy-register user output (see perf_history Entry 10)
     def enable_register_user_output(self, on: bool):
         """Enable the D' fast-path lookup in pipelined(). When on, if the

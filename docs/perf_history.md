@@ -504,7 +504,66 @@ Summarized here for quick lookup; exact commits in git log:
 
 ---
 
-## Entry 17 — E'' in-kernel copy (user-proposed) — hypothesis
+## Entry 17 — E'' in-kernel copy FAILED (all 3 variants), fundamental HBM contention
+- **Date**: 2026-04-22
+- **Commits**: `c00eedcd` (E'' v1, 20 blocks/peer), `efba6f6b` (E'' v2, 1 block/peer), `53eb011b` (E'' v3, 8 blocks/peer); reverted at this commit.
+- **User-proposed direction**: AG data already goes to local transit
+  (shmem); move the transit→user_output copy INTO the AR kernel, have
+  compute blocks do it during block 0's AG wait. No shmem register of
+  user_output needed, avoiding D' failure.
+- **Data (AR[3] phase, 256 MB, multi-stage overlap)**:
+  | variant | blocks/peer | active copy blocks | AR[3] AG wait | AR[3] cb-exit | Wall Δ |
+  |---|---|---|---|---|---|
+  | BASELINE | — | — | 1.080 ms | 0.001 ms | — |
+  | E'' v1 | 20 | 160 | 1.127 (+0.05) | 0.245 ms | **+0.16 ms** |
+  | E'' v2 | 1 | 8 | **2.639 (+1.56)** | **9.774 ms** | **+7.54 ms (×2)** |
+  | E'' v3 | 8 | 64 | 1.258 (+0.18) | 0.632 ms | **+0.67 ms** |
+- **Mechanism analysis**:
+  - v1 (20 blocks/peer, 160 copy-workers): **HBM contention with SDMA AG**.
+    160 blocks × 256 threads = 40K in-flight HBM requests compete with
+    the SDMA engine's inbound AG writes (~224 MB into local HBM over
+    1 ms window). AG wait is slowed by 0.05 ms — small per-AR but adds
+    up across 4 ARs, exceeds the 0.095 ms per-AR external copy saving.
+  - v2 (1 block/peer, 8 copy-workers): **HBM bandwidth starvation**.
+    A single block with 256 threads cannot saturate HBM (needs ~4K
+    in-flight requests on CDNA). Each load stalls waiting for HBM
+    queue, giving ~2.5 MB/s effective. 32 MB / block = ~13 ms per
+    copy. Catastrophic; AG also slows by +1.56 ms (mechanism unclear —
+    likely the compute blocks' long spin holds CU resources and creates
+    some systemic bottleneck).
+  - v3 (8 blocks/peer, 64 copy-workers): **intermediate fails too**.
+    Better than v1+v2 per-call but still +0.18 ms AG slowdown. Net
+    +0.67 ms wall regression (4 ARs × ~0.17 ms).
+  - **Fundamental physics**: on MI355X, SDMA engine and CU both access
+    the same HBM controller. ANY substantial CU HBM activity during
+    SDMA AG will slow AG by a proportional amount. The external
+    hipMemcpyAsync (CU blit, 0.095-0.259 ms per AR) runs AFTER AG done,
+    so it doesn't contend; moving it INTO AG wait window trades one
+    hidden cost for another that partially competes with AG.
+  - **Net accounting** (v3, best of bad options):
+    - External copy saved: 4 × ~0.15 ms = 0.60 ms
+    - AG slowdown due to in-kernel copy: 4 × ~0.17 ms = 0.68 ms
+    - Net: −0.08 ms save in theory, but other timing shifts (AR[0] /
+      AR[2] / AR[3] each +0.2 ms) make wall +0.67 ms worse in practice.
+- **Conclusion**:
+  - E'' direction **closed** at all 3 variants. Reverted fully.
+  - **In-kernel copy during AG wait is not viable** on this architecture
+    without a way to prevent the copy from competing with SDMA for HBM
+    bandwidth. (E.g., if CU→HBM and SDMA→HBM used physically separate
+    channels, this would work. They don't on MI355X.)
+- **Remaining candidates** (all previously evaluated or blocked):
+  - **D'' (revised D')**: user-explicit `ar.register_output(tensor)`
+    API; no allocator interplay issue. Breaks full drop-in, but only
+    adds one optional API call. Expected -0.37 ms if cache hits.
+  - **π' (copy on separate SDMA stream with double-buffered transit)**:
+    2× transit memory; cross-stream event sync; still SDMA+SDMA HBM
+    sharing but they can multi-queue. Complex.
+  - **Status quo**: accept the 0.37 ms (5%) gap; SDMA AR is already
+    competitive with RCCL on large sizes and faster on no-copy path.
+
+---
+
+## Entry 17-original — E'' in-kernel copy (user-proposed) — hypothesis
 - **Date**: 2026-04-22
 - **Commit**: this commit
 - **User proposal**: AG destination stays as local transit (shmem, unchanged).
@@ -725,5 +784,6 @@ Summarized here for quick lookup; exact commits in git log:
 | 2026-04-22 | 7.789 | 7.582 | **+2.7%** | Entry 14 baseline (τ=ξ=off). Both τ and ξ failed; reverted |
 | 2026-04-22 | 7.797 | 7.637 | **+2.1%** | Entry 15 baseline (ν fail confirmed); τ'' proposal pending |
 | 2026-04-22 | 8.319 | 7.433 | **+11.9%** | Entry 16: τ'' FAILED in both v1 & v2; no-copy mode already beats RCCL by 0.5ms → copy cost is the only lever left |
+| 2026-04-22 | 7.806 | 7.424 | **+5.1%** | Entry 17: E'' user-proposed, 3 variants ALL FAILED. In-kernel copy during AG wait hits fundamental HBM contention with SDMA engine on MI355X |
 
 **Target**: SDMA copy ≤ RCCL (gap ≤ 0). Currently outstanding.

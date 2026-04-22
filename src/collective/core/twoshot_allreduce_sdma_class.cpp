@@ -252,26 +252,6 @@ bool AllreduceSdma<T>::register_user_output(void* ptr, size_t size) {
 }
 
 template <typename T>
-void AllreduceSdma<T>::enable_inkernel_copy(bool on) {
-  if (on == inkernel_copy_enabled_) return;
-  inkernel_copy_enabled_ = on;
-  if (on) {
-    printf("PE %d: inkernel_copy ENABLED (E'' — compute blocks copy "
-           "transit→user_output during AG wait, skipping external "
-           "hipMemcpyAsync; MULTI_CHUNK only, copy_output_to_user=%d)\n",
-           myPe_, int(copy_output_to_user_));
-    if (!copy_output_to_user_) {
-      fprintf(stderr,
-              "PE %d: WARNING inkernel_copy requires copy_output_to_user=on "
-              "(currently off). inkernel_copy will be a no-op.\n",
-              myPe_);
-    }
-  } else {
-    printf("PE %d: inkernel_copy DISABLED\n", myPe_);
-  }
-}
-
-template <typename T>
 void AllreduceSdma<T>::enable_post_ag_wait(bool on) {
   if (on == post_ag_wait_enabled_) return;
   if (on) {
@@ -826,25 +806,13 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
           post_ag_flag_ptr = post_ag_flag_d_;
         }
 
-        // E'' in-kernel copy (perf_history Entry 17): when enabled AND we
-        // are on the copy_output_to_user path AND this call is MULTI_CHUNK,
-        // pass the user output pointer to the kernel. Compute blocks will
-        // copy transit→output during AG wait, replacing the external
-        // hipMemcpyAsync below (which we skip via `skip_external_copy`).
-        void* inkernel_copy_dst = nullptr;
-        bool skip_external_copy = false;
-        if (inkernel_copy_enabled_ && copy_output_to_user_ && multi_chunk) {
-          inkernel_copy_dst = reinterpret_cast<void*>(output);
-          skip_external_copy = true;
-        }
-
         if (scatter_mode == 1) {
             PipelinedAllReduceSdmaKernel<T, 1><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
                 barrierPtr_, inputSymmObj, total_count, chunk_elems,
                 scatter_base, ag_base, reduce_complete_base, phase_ts_ptr,
-                post_ag_flag_ptr, inkernel_copy_dst);
+                post_ag_flag_ptr);
         } else if (external_scatter) {
             ScatterSdmaOnlyKernel<T><<<1, 512, 0, stream>>>(
                 myPe_, npes_, input, output_transit_buffer_obj_,
@@ -857,7 +825,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                     barrierPtr_, application::SymmMemObjPtr{},
                     total_count, chunk_elems, scatter_base, ag_base,
                     reduce_complete_base, phase_ts_ptr,
-                    post_ag_flag_ptr, inkernel_copy_dst);
+                    post_ag_flag_ptr);
             } else {
                 PipelinedAllReduceSdmaKernel<T, 0, false, true>
                     <<<blocks, threads, 0, stream>>>(
@@ -866,7 +834,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                     barrierPtr_, application::SymmMemObjPtr{},
                     total_count, chunk_elems, scatter_base, ag_base,
                     reduce_complete_base, phase_ts_ptr,
-                    post_ag_flag_ptr, inkernel_copy_dst);
+                    post_ag_flag_ptr);
             }
         } else if (multi_chunk) {
             PipelinedAllReduceSdmaKernel<T, 0, true><<<blocks, threads, 0, stream>>>(
@@ -874,14 +842,14 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                 output_transit_buffer_obj_, flagsObj_,
                 barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems,
                 scatter_base, ag_base, reduce_complete_base, phase_ts_ptr,
-                post_ag_flag_ptr, inkernel_copy_dst);
+                post_ag_flag_ptr);
         } else {
             PipelinedAllReduceSdmaKernel<T, 0, false><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
                 barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems,
                 scatter_base, ag_base, reduce_complete_base, phase_ts_ptr,
-                post_ag_flag_ptr, inkernel_copy_dst);
+                post_ag_flag_ptr);
         }
 
         pipeline_scatter_gen_ += numChunks_host;   // scatter SDMA only (qId=0)
@@ -895,7 +863,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             return false;
         }
 
-        if (copy_output_to_user_ && !skip_external_copy) {
+        if (copy_output_to_user_) {
             copy_output_to_user(output, total_count, stream);
         }
     } catch (const std::exception& e) {

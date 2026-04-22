@@ -1360,15 +1360,6 @@ def _test_multi_stage_overlap(
                     if rank == 0:
                         print(f"  [warn] enable_post_ag_wait failed: {e}",
                               flush=True)
-            # E'' in-kernel copy during AG wait (perf_history Entry 17).
-            # Enable via env MORI_INKERNEL_COPY=1 (off by default).
-            if os.environ.get("MORI_INKERNEL_COPY", "0") == "1":
-                try:
-                    ar_obj.enable_inkernel_copy(True)
-                except Exception as e:
-                    if rank == 0:
-                        print(f"  [warn] enable_inkernel_copy failed: {e}",
-                              flush=True)
             torch.cuda.synchronize(); dist.barrier()
             if rank == 0:
                 print(" ok", flush=True)
