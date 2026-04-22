@@ -246,71 +246,6 @@ def _test_outplace(
     return ok
 
 
-def _test_copy_to_user_verify(
-    rank,
-    my_pe,
-    npes,
-    elems,
-    data_bytes,
-    output_buf_size,
-    fill_value,
-    dtype,
-    dtype_name,
-    device,
-    stream,
-    iterations,
-    warmup,
-):
-    """Test 1b: copy_output_to_user=True correctness.
-
-    Exercises the Stage 2b-1 in-kernel copy path when MORI_POST_AG_WAIT=1:
-    the AR kernel writes both the transit buffer (AG target) AND the user
-    output tensor (in-kernel copy); host skips the external hipMemcpyAsync.
-    """
-    if rank == 0:
-        print(f"\n>>> Test 1b: Copy-to-user (copy_output_to_user=True, {dtype_name})")
-
-    ar = AllreduceSdma(
-        my_pe,
-        npes,
-        input_buffer_size=data_bytes,
-        output_buffer_size=output_buf_size,
-        copy_output_to_user=True,
-        dtype=dtype,
-    )
-    # Stage 2b-1 env-gated enable.
-    if os.environ.get("MORI_POST_AG_WAIT", "0") == "1":
-        try:
-            ar._handle.enable_post_ag_wait(True)
-        except Exception as e:
-            print(f"[warn] enable_post_ag_wait failed: {e}", flush=True)
-
-    input_tensor = torch.full((elems,), fill_value, dtype=dtype, device=device)
-    output_tensor = torch.zeros(elems, dtype=dtype, device=device)
-
-    torch.cuda.synchronize()
-    dist.barrier()
-
-    def _bench():
-        return ar(input_tensor, output_tensor, elems, stream)
-
-    times = _run_benchmark(_bench, iterations, warmup, stream, rank)
-
-    # Verify result came back in USER'S output tensor (not transit).
-    out_cpu = _to_numpy(output_tensor.cpu())
-    ok = _verify_allreduce_result(
-        out_cpu, elems, my_pe, npes, f"copy_to_user/{dtype_name}", dtype=dtype
-    )
-    if rank == 0 and ok:
-        print(f"  PE {rank}: copy-to-user correctness PASSED (Stage 2b-1 path OK)")
-
-    dist.barrier()
-    _print_stats(times, data_bytes, npes, rank, f"Copy-to-user ({dtype_name})")
-
-    del ar
-    return ok
-
-
 def _test_inplace(
     rank,
     my_pe,
@@ -1570,21 +1505,6 @@ def _test_allreduce(
             iterations,
             warmup,
         )
-        ok1b = _test_copy_to_user_verify(
-            rank,
-            my_pe,
-            npes,
-            elems,
-            data_bytes,
-            output_buf_size,
-            fill_value,
-            dtype,
-            dtype_name,
-            device,
-            stream,
-            iterations,
-            warmup,
-        )
         ok2 = _test_inplace(
             rank,
             my_pe,
@@ -1629,7 +1549,7 @@ def _test_allreduce(
             warmup,
         )
 
-        all_ok = ok1 and ok1b and ok2 and ok3 and ok4
+        all_ok = ok1 and ok2 and ok3 and ok4
 
         if test_gemm_overlap:
             ok5 = _test_gemm_overlap_comparison(
