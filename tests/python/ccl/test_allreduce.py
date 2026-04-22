@@ -275,6 +275,13 @@ def _test_copy_to_user_verify(
             if rank == 0:
                 print(f"  [warn] enable_register_user_output failed: {e}",
                       flush=True)
+    # Direction θ: multi-qId AG correctness check
+    if os.environ.get("MORI_AG_MULTI_Q", "0") == "1":
+        try:
+            ar.enable_ag_multi_q(True)
+        except Exception as e:
+            if rank == 0:
+                print(f"  [warn] enable_ag_multi_q failed: {e}", flush=True)
 
     input_tensor = torch.full((elems,), fill_value, dtype=dtype, device=device)
     output_tensor = torch.zeros(elems, dtype=dtype, device=device)
