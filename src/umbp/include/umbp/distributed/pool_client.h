@@ -131,6 +131,19 @@ class PoolClient {
   MasterClient& Master();
   bool IsInitialized() const;
 
+  // Observability counters — members always exist (ABI stable) but only
+  // increment when built with -DMORI_UMBP_OBS_COUNTERS.  Release builds
+  // leave them at 0 and pay zero CPU cost at increment call sites.
+  uint64_t AbortAllocationCallsCount() const {
+    return abort_allocation_calls_.load(std::memory_order_relaxed);
+  }
+  uint64_t BatchAbortAllocationCallsCount() const {
+    return batch_abort_allocation_calls_.load(std::memory_order_relaxed);
+  }
+  uint64_t BatchAbortAllocationEntriesCount() const {
+    return batch_abort_allocation_entries_.load(std::memory_order_relaxed);
+  }
+
  private:
   PoolClientConfig config_;
   std::atomic<bool> initialized_{false};
@@ -227,6 +240,13 @@ class PoolClient {
 
   mutable std::mutex cache_mutex_;
   std::unordered_map<std::string, Location> cluster_locations_;
+
+  // Observability counters.  See header-top MORI_UMBP_OBS_COUNTERS macro
+  // in obs_counters.h; declared unconditionally so class layout does not
+  // differ between release and test builds.
+  std::atomic<uint64_t> abort_allocation_calls_{0};
+  std::atomic<uint64_t> batch_abort_allocation_calls_{0};
+  std::atomic<uint64_t> batch_abort_allocation_entries_{0};
 };
 
 }  // namespace mori::umbp

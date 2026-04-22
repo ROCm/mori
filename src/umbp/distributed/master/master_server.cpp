@@ -472,6 +472,27 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     return grpc::Status::OK;
   }
 
+  grpc::Status BatchAbortAllocation(grpc::ServerContext* /*context*/,
+                                    const ::umbp::BatchAbortAllocationRequest* request,
+                                    ::umbp::BatchAbortAllocationResponse* response) override {
+    // Per-entry loop mirrors BatchFinalizeAllocation: each entry carries
+    // its own target node_id, and registry_.AbortAllocation is idempotent
+    // on racy failure (not-found / already-reaped returns false, which is
+    // not an error at the RPC layer).
+    const int n = request->entries_size();
+    response->mutable_aborted()->Reserve(n);
+    for (const auto& e : request->entries()) {
+      if (e.node_id().empty() || e.allocation_id().empty()) {
+        response->add_aborted(false);
+        continue;
+      }
+      const bool aborted = registry_.AbortAllocation(e.node_id(), e.allocation_id(), e.size());
+      response->add_aborted(aborted);
+    }
+    MORI_UMBP_INFO("[Master] BatchAbortAllocation: {} entries", n);
+    return grpc::Status::OK;
+  }
+
  private:
   ClientRegistry& registry_;
   GlobalBlockIndex& index_;
