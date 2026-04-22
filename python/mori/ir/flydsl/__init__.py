@@ -36,9 +36,9 @@ Recommended usage (qualified access keeps the lazy-init guarantee)::
 
    Avoid ``from mori.ir.flydsl import *`` — it iterates ``__all__`` and
    eagerly materialises every :class:`ExternFunction`, which defeats
-   the lazy-init design and forces the ~20s cold-cache bitcode build
-   (see :func:`prepare`) on import.  Use the qualified form above or
-   explicit names (``from mori.ir.flydsl import my_pe, n_pes``).
+   the lazy-init design and forces the one-time mori shmem bitcode
+   build (see :func:`prepare`) on import.  Use the qualified form
+   above or explicit names (``from mori.ir.flydsl import my_pe, n_pes``).
 
 Architecture:
 
@@ -50,6 +50,24 @@ Architecture:
 * FlyDSL's compiler picks the metadata up through
   ``CompilationContext`` populated by :class:`ExternFunction`, so no
   ``mori`` import ever happens on FlyDSL's JIT path.
+
+Pickling / disk cache contract
+------------------------------
+
+:class:`ExternFunction` instances (i.e. ``mori.ir.flydsl.my_pe``,
+``n_pes``, ``putmem_nbi_warp``, ...) are **not picklable**.  They are
+module-level singletons built from ``MORI_DEVICE_FUNCTIONS`` and are
+meant to be looked up fresh in each process via ``import`` / attribute
+access.
+
+FlyDSL's ``CompiledArtifact`` disk cache does **not** rely on pickling
+these objects.  It only serialises the ``module_init_fn`` callable
+(here, ``mori.shmem.shmem_module_init``) by its fully-qualified
+``module:qualname`` string, and re-imports it on cache hit.  As long as
+mori's module-init callable stays a top-level function (not a
+``functools.partial`` / lambda / bound method), the disk cache round-
+trips correctly.  See ``FlyDSL/python/flydsl/compiler/jit_executor.py``
+for the callable-serialisation helpers.
 """
 
 from mori.ir.ops import SIGNAL_SET, SIGNAL_ADD  # cheap constants, no FlyDSL trigger
@@ -60,23 +78,43 @@ from . import ops as _ops  # importing the submodule does NOT call _ensure_ops
 def prepare() -> None:
     """Eagerly resolve mori shmem bitcode and build every ExternFunction.
 
-    Call this once at process startup (e.g. in ``main()``) so the first
-    kernel launch does not pay the cold-cache cost of JIT-compiling
+    Call this once at process startup (e.g. in ``main()``) so the
+    first kernel launch does not pay the one-time cost of building
     ``libmori_shmem_device.bc``.
+
+    What :func:`prepare` actually does
+    ----------------------------------
+
+    1. ``mori.jit.core.ensure_bitcode`` — invokes ``hipcc`` to compile
+       the mori shmem device C++ sources into ``libmori_shmem_device.bc``
+       once per (arch, NIC, COV).  The resulting artifact is a
+       **mori-side** build product shared across *every* FlyDSL kernel
+       that subsequently calls a mori shmem op.
+    2. Instantiates one :class:`ExternFunction` per entry in
+       ``MORI_DEVICE_FUNCTIONS`` so later attribute lookups on this
+       package (``mori.ir.flydsl.my_pe`` etc.) are pure dict lookups.
+
+    This is *not* FlyDSL's per-kernel JIT cache.  FlyDSL's MLIR→LLVM
+    JIT is orthogonal and paid lazily the first time each
+    ``@flyc.kernel`` is invoked; :func:`prepare` only warms the
+    **mori-side** bitcode that every such kernel will later link
+    against via ``link_libs``.
 
     Cost model
     ----------
-    * Cold JIT cache: ~15-20s (hipcc compiles the **mori shmem device
-      bitcode**, not FlyDSL's kernel — see ``mori.jit.core.ensure_bitcode``).
-    * Warm cache (same arch / NIC / cov on the machine): microseconds.
-    * The cache is shared across processes and users that share the
-      same ``MORI_CACHE_DIR`` (default ``~/.cache/mori/...``).
 
-    Operationally you may prefer to warm the cache offline via
-    ``MORI_PRECOMPILE=1 python -c 'import mori'`` during image build /
-    CI; :func:`prepare` is the in-process equivalent and is safe to
-    call multiple times (idempotent — the underlying caches make
-    subsequent calls a no-op).
+    * Cold path (no ``libmori_shmem_device.bc`` on disk for this
+      arch/NIC/COV): ~15-20 s, dominated by ``hipcc``.  Intentionally
+      off the kernel-launch critical path so that the first
+      ``@flyc.kernel`` call stays fast.
+    * Warm path (cache hit): microseconds.  :func:`prepare` is
+      idempotent — repeated calls are dict lookups after the first.
+    * The bitcode cache lives under ``MORI_CACHE_DIR`` (default
+      ``~/.cache/mori/...``) and is shared across processes and users
+      on the same host.
+
+    Alternatively, warm the cache offline during image build / CI
+    with ``MORI_PRECOMPILE=1 python -c 'import mori'``.
     """
     _ops._ensure_ops()
 

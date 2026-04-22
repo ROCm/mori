@@ -43,17 +43,22 @@ from functools import lru_cache
 from typing import Callable, Optional
 
 # Signature contract for the post-load module initializer.  Matches
-# ``mori.shmem.api.shmem_module_init(hip_module: int) -> None``; any
-# future addition (stream handle, device id, …) must go through this
-# alias so mismatches surface at import time instead of at first
-# kernel launch.
+# ``mori.shmem.shmem_module_init(hip_module: int) -> None``; routing
+# future additions (stream handle, device id, …) through this alias
+# surfaces mismatches at import time instead of at first kernel
+# launch.
 ModuleInitFn = Callable[[int], None]
 
-# gfx9xx currently all use COV 6 for the FlyDSL ABI.  When future archs
-# diverge, replace this constant with an arch-keyed lookup inside
-# :func:`get_flydsl_compile_info` — the ``arch`` parameter is already
-# wired through so callers don't need to change.
+# FlyDSL's mori-shmem bitcode ABI.  Every supported arch currently
+# ships COV 6; if a future arch needs a different value, turn this
+# constant into a dict keyed by arch and add the arch to
+# ``_SUPPORTED_ARCHS`` below.
 _DEFAULT_FLYDSL_COV = 6
+
+# Archs this integration layer accepts.  Keep intentionally narrow:
+# every entry here implies that ``libmori_shmem_device.bc`` is known
+# to build and run correctly on that arch with ``_DEFAULT_FLYDSL_COV``.
+_SUPPORTED_ARCHS: frozenset = frozenset({"gfx942", "gfx950"})
 
 
 @dataclass(frozen=True)
@@ -62,7 +67,6 @@ class FlyDSLCompileInfo:
     mori shmem device functions."""
 
     bitcode_path: str
-    cov: int
     module_init_fn: ModuleInitFn
 
 
@@ -71,21 +75,30 @@ def get_flydsl_compile_info(arch: Optional[str] = None) -> FlyDSLCompileInfo:
     """Resolve bitcode + module-init callable for the FlyDSL backend.
 
     Args:
-        arch: Optional GPU arch override (e.g. ``"gfx942"``).  Currently
-            unused — all supported archs share ``cov=6`` — but the
-            parameter is part of the stable API so future arch-keyed
-            cov selection does not require touching callers in
-            :mod:`mori.ir.flydsl.ops`.
+        arch: GPU arch.  Must be ``None`` or one of
+            ``_SUPPORTED_ARCHS`` (currently ``{"gfx942", "gfx950"}``).
+            All supported archs share ``cov=6`` today so ``arch`` is a
+            runtime no-op; it exists so typos fail loudly and so
+            per-arch dispatch can be wired in without changing call
+            sites.
 
-    Results are cached by ``arch`` (via :func:`functools.lru_cache`),
-    so repeated calls are free and tests can invalidate the cache with
+    Results are cached per ``arch``; tests can invalidate with
     ``get_flydsl_compile_info.cache_clear()``.
 
     Raises:
+        ValueError: if ``arch`` is not in ``_SUPPORTED_ARCHS`` (and not ``None``).
         ImportError: if the ``mori.shmem`` C extension is unavailable.
         FileNotFoundError: from :func:`mori.ir.bitcode.find_bitcode` if
             no bitcode can be located or JIT-built.
     """
+    if arch is not None and arch not in _SUPPORTED_ARCHS:
+        raise ValueError(
+            f"Unsupported arch {arch!r}; expected None or one of "
+            f"{sorted(_SUPPORTED_ARCHS)}."
+        )
+
+    # Deferred import: keeps ``import mori.ir.flydsl`` free of heavy
+    # subpackage loads (matches the lazy-init idiom of the package).
     from mori.ir.bitcode import find_bitcode
 
     try:
@@ -98,9 +111,7 @@ def get_flydsl_compile_info(arch: Optional[str] = None) -> FlyDSLCompileInfo:
             "`pip install -e mori/`."
         ) from exc
 
-    cov = _DEFAULT_FLYDSL_COV
     return FlyDSLCompileInfo(
-        bitcode_path=find_bitcode(cov=cov),
-        cov=cov,
+        bitcode_path=find_bitcode(cov=_DEFAULT_FLYDSL_COV),
         module_init_fn=ms.shmem_module_init,
     )

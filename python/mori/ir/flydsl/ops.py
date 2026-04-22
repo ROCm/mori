@@ -35,6 +35,17 @@ Usage::
         pe  = mori_shmem.my_pe()
         npe = mori_shmem.n_pes()
         mori_shmem.quiet_thread_pe(pe)
+
+Note
+----
+
+The :class:`ExternFunction` instances this module exposes are
+module-level singletons and are **not picklable**.  FlyDSL's
+``CompiledArtifact`` on-disk cache round-trips compiled kernels by
+serialising ``module_init_fn`` as a ``module:qualname`` string (and
+re-importing it on cache hit), not by pickling the ExternFunction
+itself — so as long as :func:`mori.shmem.shmem_module_init` stays a
+top-level callable, the cache works correctly across runs.
 """
 
 from mori.ir.ops import MORI_DEVICE_FUNCTIONS, SIGNAL_SET, SIGNAL_ADD
@@ -73,6 +84,11 @@ def _build_all():
             symbol=meta["symbol"],
             arg_types=meta["args"],
             ret_type=meta["ret"],
+            # Forward mori's pure-function declaration (currently only
+            # n_pes).  FlyDSL will lower this to llvm.func readnone /
+            # willreturn attributes once extern-attribute support lands,
+            # enabling CSE / LICM for the affected calls.
+            is_pure=meta.get("pure", False),
             bitcode_path=info.bitcode_path,
             module_init_fn=info.module_init_fn,
         )
