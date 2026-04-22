@@ -1278,6 +1278,17 @@ def _test_multi_stage_overlap(
                     if rank == 0:
                         print(f"  [warn] enable_post_ag_wait failed: {e}",
                               flush=True)
+            # D' fast path (Step 2): enable lookup of pre-registered user
+            # output buffers. Actual register() calls happen later in
+            # make_setup() once the output tensor is allocated. Copy-mode
+            # only; the no-copy mode keeps the transit-buffer semantic.
+            if _copy_user and os.environ.get("MORI_REGISTER_USER_OUTPUT", "0") == "1":
+                try:
+                    ar_obj.enable_register_user_output(True)
+                except Exception as e:
+                    if rank == 0:
+                        print(f"  [warn] enable_register_user_output failed: {e}",
+                              flush=True)
             torch.cuda.synchronize(); dist.barrier()
             if rank == 0:
                 print(" ok", flush=True)
@@ -1292,11 +1303,24 @@ def _test_multi_stage_overlap(
                       end="", flush=True)
 
             if mode in ("SDMA copy", "SDMA no-copy"):
-                def make_setup(e=cur_elems, _ar=ar_obj):
+                def make_setup(e=cur_elems, _ar=ar_obj, _mode=mode):
                     def setup():
                         inp = torch.full((e,), fill_value, dtype=dtype, device=device)
                         out = torch.zeros(e, dtype=dtype, device=device)
                         torch.cuda.synchronize(); dist.barrier()
+                        # D' Step 2: pre-register user output so AR kernel
+                        # writes directly to it (skips transit + ext copy).
+                        # COLLECTIVE call — all ranks must hit this with the
+                        # same size. Only for SDMA copy mode (not no-copy).
+                        if (_mode == "SDMA copy"
+                                and os.environ.get("MORI_REGISTER_USER_OUTPUT", "0") == "1"):
+                            try:
+                                _ar._handle.register_user_output(
+                                    out.data_ptr(), out.numel() * out.element_size())
+                            except Exception as e2:
+                                if rank == 0:
+                                    print(f"  [warn] pre-register user output failed: {e2}",
+                                          flush=True)
                         stream_ar.synchronize()
                         ok = _ar(inp, out, e, stream_ar); stream_ar.synchronize()
                         def prep(): inp.fill_(fill_value)

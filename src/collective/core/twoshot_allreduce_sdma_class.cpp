@@ -806,22 +806,58 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
           post_ag_flag_ptr = post_ag_flag_d_;
         }
 
+        // ------------------------------------------------------------
+        // Step 2 D' fast path: if the user has pre-registered this output
+        // buffer via register_user_output() (collective call), lookup will
+        // return a valid SymmMemObjPtr. We then pass that as the AR kernel's
+        // dstMemObj — kernel scatters/AGs directly into the user output
+        // buffer, skipping the transit buffer AND the external
+        // hipMemcpyAsync in copy_output_to_user().
+        //
+        // Lookup is strictly local (no collective), safe in the hot path.
+        // Miss → silently falls back to the transit+copy baseline path.
+        // This preserves R7 "zero-感知" for users who don't opt in.
+        //
+        // See docs/perf_history.md Entry 10 for register cost measurement
+        // (avg 1.1ms miss, 0us hit → hot-path collective register would be
+        // unsafe; pre-register pattern is the safe contract).
+        // ------------------------------------------------------------
+        application::SymmMemObjPtr ar_dst_obj = output_transit_buffer_obj_;
+        bool d_fast_path = false;
+        if (register_user_output_enabled_
+              && copy_output_to_user_
+              && output != nullptr) {
+          size_t user_output_bytes = total_count * dtype_size_;
+          UserOutputCacheKey key{static_cast<void*>(output), user_output_bytes};
+          auto it = user_output_cache_.find(key);
+          if (it != user_output_cache_.end() && it->second.IsValid()) {
+            ar_dst_obj = it->second;
+            d_fast_path = true;
+            cache_hits_++;
+            // Bump LRU
+            user_output_cache_lru_.remove(key);
+            user_output_cache_lru_.push_front(key);
+          } else {
+            cache_misses_++;
+          }
+        }
+
         if (scatter_mode == 1) {
             PipelinedAllReduceSdmaKernel<T, 1><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
-                output_transit_buffer_obj_, flagsObj_,
+                ar_dst_obj, flagsObj_,
                 barrierPtr_, inputSymmObj, total_count, chunk_elems,
                 scatter_base, ag_base, reduce_complete_base, phase_ts_ptr,
                 post_ag_flag_ptr);
         } else if (external_scatter) {
             ScatterSdmaOnlyKernel<T><<<1, 512, 0, stream>>>(
-                myPe_, npes_, input, output_transit_buffer_obj_,
+                myPe_, npes_, input, ar_dst_obj,
                 total_count, chunk_elems, scatter_base);
             if (multi_chunk) {
                 PipelinedAllReduceSdmaKernel<T, 0, true, true>
                     <<<blocks, threads, 0, stream>>>(
                     myPe_, npes_, input,
-                    output_transit_buffer_obj_, flagsObj_,
+                    ar_dst_obj, flagsObj_,
                     barrierPtr_, application::SymmMemObjPtr{},
                     total_count, chunk_elems, scatter_base, ag_base,
                     reduce_complete_base, phase_ts_ptr,
@@ -830,7 +866,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                 PipelinedAllReduceSdmaKernel<T, 0, false, true>
                     <<<blocks, threads, 0, stream>>>(
                     myPe_, npes_, input,
-                    output_transit_buffer_obj_, flagsObj_,
+                    ar_dst_obj, flagsObj_,
                     barrierPtr_, application::SymmMemObjPtr{},
                     total_count, chunk_elems, scatter_base, ag_base,
                     reduce_complete_base, phase_ts_ptr,
@@ -839,14 +875,14 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         } else if (multi_chunk) {
             PipelinedAllReduceSdmaKernel<T, 0, true><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
-                output_transit_buffer_obj_, flagsObj_,
+                ar_dst_obj, flagsObj_,
                 barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems,
                 scatter_base, ag_base, reduce_complete_base, phase_ts_ptr,
                 post_ag_flag_ptr);
         } else {
             PipelinedAllReduceSdmaKernel<T, 0, false><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
-                output_transit_buffer_obj_, flagsObj_,
+                ar_dst_obj, flagsObj_,
                 barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems,
                 scatter_base, ag_base, reduce_complete_base, phase_ts_ptr,
                 post_ag_flag_ptr);
@@ -863,7 +899,9 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             return false;
         }
 
-        if (copy_output_to_user_) {
+        // D' fast path: kernel already wrote user output (ar_dst_obj was
+        // user output's SymmMemObj). Skip the external hipMemcpyAsync.
+        if (copy_output_to_user_ && !d_fast_path) {
             copy_output_to_user(output, total_count, stream);
         }
     } catch (const std::exception& e) {
