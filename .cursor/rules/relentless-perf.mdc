@@ -323,6 +323,47 @@ hipcc 找不到 → `exit 1` 直接把用户**登录的 bash session 杀了**；
 - [ ] 如果有，顶层是否已被 `bash <<'EOF' ... EOF` 或 `( ... )` 包起来？
 - [ ] 如果 preflight 的某个 `command -v` 失败，用户的 shell/容器会不会退？
 
+### R14. 超过 10 行的 shell 必须落到 repo 的 `tools/*.sh` 脚本文件，不得 copy-paste
+
+**触发**：任何给用户的 shell block >= 10 行，或包含 **any** 以下特征：
+- 多步 preflight（`command -v cmake/hipcc/...`）
+- 循环跑多个变体（for label in ...）
+- here-doc / 多层引号 / awk 内嵌 `$LOG` 等复杂 quoting
+- 需要 `set -euo pipefail`
+
+**必须**：
+1. **把脚本写进 repo**（`tools/<topic>.sh`），一次写对、commit、push。
+2. **参数全部在脚本里硬编码正确**（`--iterations` 不是 `--iters`、
+   `--elems <N>` 不是 `--sweep <N>` 等），用 env var 提供少量可调参数
+   （`SIZE_MB=256`、`ITERATIONS=100` 等）。脚本顶部 usage 注释写清楚。
+3. **给用户的只是一行调用**：`bash tools/<topic>.sh`（或最多加环境变量覆盖）。
+4. **所有 preflight、build、run、extract 全在脚本里**，用户不需要记任何引用。
+5. **脚本内**满足 R11 / R12 / R13 全部要求（preflight + set -euo pipefail +
+   隔离在自己进程 + 内嵌 awk 对比表）。
+
+**禁止**：
+- ❌ 在回复里粘贴 > 10 行 bash（尤其含 `bash <<'EOF' ... EOF` 或 `awk` 块）
+- ❌ 每次改动都重发完整 shell block（改进脚本即可，用户跑同一行）
+- ❌ 把参数错误（如 `--iters` vs `--iterations`）埋在粘贴的 block 里反复出 bug
+
+**反模式（本会话踩过）**：
+- v1..v3 我连续三轮给用户粘贴 60+ 行 bash，每次一个新 bug（tail 吞 exit / set -e
+  污染 session / 参数名拼错），每次都要让用户重跑。按 R14 必须落到
+  `tools/bench_<topic>.sh` 一次写对，后续只改脚本不改调用。
+
+**Usage 注释最小模板**（脚本顶部）：
+```sh
+# Usage:
+#   bash tools/<topic>.sh
+# Env overrides (optional):
+#   VAR_A=... VAR_B=...
+# Runs: <preflight> -> <build> -> <N variants> -> <extraction table>
+# Output: /tmp/<topic>_<timestamp>.log
+```
+
+**反馈闭环**：若脚本跑出 bug，**改脚本**（git commit），用户 `git pull && bash tools/<topic>.sh`，
+绝不再让用户粘大段新 bash。
+
 ## 工作流模板（每轮都走这个）
 
 ```
