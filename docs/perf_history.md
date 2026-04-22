@@ -286,6 +286,23 @@ Summarized here for quick lookup; exact commits in git log:
     fails OR cache miss + would-exceed-cap, fall through to baseline
     transit+copy path, no regression vs current).
 
+### Update (2026-04-22) — Step 2 partial rollout
+
+- Commit `fa1565a1` (C++ Step 2 path selection) + `e5c70de9` (wrapper methods)
+- Additional data from `test_allreduce.py` benchmark setup (4 MB, single call
+  via `_bench_overlap_one_size` `setup()`): **register MISS = 2398 us**
+  — 2× the isolated test_register_cost measurement above.
+- Divergence root cause (hypothesis, unverified): benchmark runs set up
+  AR+register inside `setup()`, concurrent with other PE-local tensor
+  allocation; `ShmemSymmetricRegister`'s internal `bootNet.Allgather` may
+  suffer contention with `torch.distributed` (Gloo) initialization or other
+  host activity in the first benchmark seconds.
+- Impact on break-even: 2.4ms / 0.39ms ≈ **6 iters** to pay back (still well
+  within warmup=20 budget). Still **viable** for benchmark; concerning for
+  very-short-lived user sessions.
+- Action item: **always pre-register in the setup phase, not the hot loop**.
+  benchmark's `make_setup()` already does this.
+
 ---
 
 ## Running gap-to-target tally
