@@ -39,14 +39,15 @@ Usage::
 
 from mori.ir.ops import MORI_DEVICE_FUNCTIONS, SIGNAL_SET, SIGNAL_ADD
 
+from .compile_helper import get_flydsl_compile_info
 
-# ExternFunction is provided by FlyDSL (Part B).
-# We use a lazy import so mori.ir.flydsl can be imported without FlyDSL installed;
-# ExternFunction is only needed when building a @flyc.kernel.
+
+_all_ops = None
+
+
 def _get_extern_cls():
     try:
         from flydsl.compiler.extern import ExternFunction
-
         return ExternFunction
     except ImportError as e:
         raise ImportError(
@@ -56,20 +57,42 @@ def _get_extern_cls():
 
 
 def _build_all():
-    """Populate module globals from MORI_DEVICE_FUNCTIONS."""
+    """Create ExternFunction wrappers from MORI_DEVICE_FUNCTIONS.
+
+    Each wrapper carries (bitcode_path, module_init_fn) sourced from
+    :func:`compile_helper.get_flydsl_compile_info`, so the FlyDSL JIT
+    pipeline receives everything it needs via ``CompilationContext``
+    without ever importing mori from its compiler path.
+    """
     ExternFunction = _get_extern_cls()
+    info = get_flydsl_compile_info()
+
     ns = {}
     for name, meta in MORI_DEVICE_FUNCTIONS.items():
         ns[name] = ExternFunction(
             symbol=meta["symbol"],
             arg_types=meta["args"],
             ret_type=meta["ret"],
-            is_pure=meta.get("pure", False),
+            bitcode_path=info.bitcode_path,
+            module_init_fn=info.module_init_fn,
         )
     return ns
 
 
-_all_ops = _build_all()
-globals().update(_all_ops)
+def _ensure_ops():
+    global _all_ops
+    if _all_ops is None:
+        _all_ops = _build_all()
+        globals().update(_all_ops)
+    return _all_ops
 
-__all__ = list(_all_ops.keys()) + ["SIGNAL_SET", "SIGNAL_ADD"]
+
+def __getattr__(name):
+    """Lazy init: FlyDSL is only required when an op is first accessed."""
+    ops = _ensure_ops()
+    if name in ops:
+        return ops[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+__all__ = list(MORI_DEVICE_FUNCTIONS.keys()) + ["SIGNAL_SET", "SIGNAL_ADD"]

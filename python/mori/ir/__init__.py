@@ -19,14 +19,12 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-# Copyright (c) Advanced Micro Devices, Inc. All rights reserved.
-# MIT License
 """
 mori.ir — Mori device IR layer.
 
 Provides framework-agnostic access to the shmem device bitcode and
 function ABI metadata, plus framework-specific integration sub-packages
-(``mori.ir.triton``, and in the future ``mori.ir.flydsl``, etc.).
+(``mori.ir.triton``, ``mori.ir.flydsl``).
 
 Quick start (no framework dependency)::
 

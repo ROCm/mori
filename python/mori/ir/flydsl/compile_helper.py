@@ -20,78 +20,87 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 """
-Compile helper for FlyDSL <-> Mori shmem integration.
+Mori-side compile metadata for the FlyDSL backend.
 
-Provides :func:`prepare_compile` as the single entry point for FlyDSL to
-obtain bitcode paths and post-load processors without hard-coding any
-Mori-internal details (symbol prefixes, COV versions, etc.).
+This module is the **single source of truth** for everything FlyDSL needs
+to know at compile time in order to use mori shmem device functions:
+the LLVM bitcode path (with the correct code-object version), the
+post-load initialiser, and any future per-arch knobs.
+
+The consumer is ``mori.ir.flydsl.ops`` which calls
+:func:`get_flydsl_compile_info` once on first access and attaches the
+metadata to every :class:`ExternFunction` wrapper.  FlyDSL's compiler
+path is intentionally *not* expected to import this file — the metadata
+reaches it through ``CompilationContext`` populated by ExternFunction.
+
+Keeping this layer lets mori evolve its bitcode selection (per-arch COV
+mapping, NIC variants, JIT fallback, …) without touching ``ops.py`` or
+any FlyDSL code.
 """
 
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Set
+from functools import lru_cache
+from typing import Callable, Optional
 
-# gfx9xx all use COV 6 for FlyDSL ABI
+# Signature contract for the post-load module initializer.  Matches
+# ``mori.shmem.api.shmem_module_init(hip_module: int) -> None``; any
+# future addition (stream handle, device id, …) must go through this
+# alias so mismatches surface at import time instead of at first
+# kernel launch.
+ModuleInitFn = Callable[[int], None]
+
+# gfx9xx currently all use COV 6 for the FlyDSL ABI.  When future archs
+# diverge, replace this constant with an arch-keyed lookup inside
+# :func:`get_flydsl_compile_info` — the ``arch`` parameter is already
+# wired through so callers don't need to change.
 _DEFAULT_FLYDSL_COV = 6
 
 
-def _build_known_symbols() -> frozenset:
-    from mori.ir.ops import MORI_DEVICE_FUNCTIONS
-    return frozenset(m["symbol"] for m in MORI_DEVICE_FUNCTIONS.values())
+@dataclass(frozen=True)
+class FlyDSLCompileInfo:
+    """Everything FlyDSL needs in order to compile a kernel that uses
+    mori shmem device functions."""
+
+    bitcode_path: str
+    cov: int
+    module_init_fn: ModuleInitFn
 
 
-_known_symbols: Optional[frozenset] = None
+@lru_cache(maxsize=None)
+def get_flydsl_compile_info(arch: Optional[str] = None) -> FlyDSLCompileInfo:
+    """Resolve bitcode + module-init callable for the FlyDSL backend.
 
+    Args:
+        arch: Optional GPU arch override (e.g. ``"gfx942"``).  Currently
+            unused — all supported archs share ``cov=6`` — but the
+            parameter is part of the stable API so future arch-keyed
+            cov selection does not require touching callers in
+            :mod:`mori.ir.flydsl.ops`.
 
-def _get_known_symbols() -> frozenset:
-    global _known_symbols
-    if _known_symbols is None:
-        _known_symbols = _build_known_symbols()
-    return _known_symbols
+    Results are cached by ``arch`` (via :func:`functools.lru_cache`),
+    so repeated calls are free and tests can invalidate the cache with
+    ``get_flydsl_compile_info.cache_clear()``.
 
-
-@dataclass
-class ShmemCompileInfo:
-    """Information returned by :func:`prepare_compile`."""
-    link_libs: List[str]
-    module_init_fn: Callable
-
-
-def prepare_compile(
-    extern_symbols: Set[str],
-    arch: str = "gfx942",
-) -> Optional[ShmemCompileInfo]:
-    """Determine whether *extern_symbols* require mori shmem support.
-
-    Returns a :class:`ShmemCompileInfo` with the bitcode path and a
-    module-init callable if shmem symbols are detected, or ``None``
-    otherwise.  FlyDSL should pass ``link_libs`` to the MLIR compiler
-    and invoke ``module_init_fn(hip_module)`` on each loaded GPU module.
+    Raises:
+        ImportError: if the ``mori.shmem`` C extension is unavailable.
+        FileNotFoundError: from :func:`mori.ir.bitcode.find_bitcode` if
+            no bitcode can be located or JIT-built.
     """
-    known = _get_known_symbols()
-    if not extern_symbols & known:
-        return None
-
     from mori.ir.bitcode import find_bitcode
-    bc_path = find_bitcode(cov=_DEFAULT_FLYDSL_COV)
 
     try:
         import mori.shmem as ms
     except ImportError as exc:
         raise ImportError(
-            "Kernel uses mori shmem symbols but 'mori' is not installed.\n"
-            "  pip install: git clone https://github.com/ROCm/mori && cd mori && pip install -e ."
+            "mori.shmem is unavailable (the C extension likely failed "
+            "to build or is missing from this environment).  Reinstall "
+            "mori on a host with HIP/RCCL available, e.g. "
+            "`pip install -e mori/`."
         ) from exc
 
-    return ShmemCompileInfo(
-        link_libs=[bc_path],
+    cov = _DEFAULT_FLYDSL_COV
+    return FlyDSLCompileInfo(
+        bitcode_path=find_bitcode(cov=cov),
+        cov=cov,
         module_init_fn=ms.shmem_module_init,
     )
-
-
-def restore_processors() -> List[Callable]:
-    """Re-create post-load processors after deserialization."""
-    try:
-        import mori.shmem as ms
-        return [ms.shmem_module_init]
-    except ImportError:
-        return []

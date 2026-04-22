@@ -19,8 +19,6 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-# Copyright (c) Advanced Micro Devices, Inc. All rights reserved.
-# MIT License
 """
 Locate the mori shmem device bitcode (libmori_shmem_device.bc).
 
