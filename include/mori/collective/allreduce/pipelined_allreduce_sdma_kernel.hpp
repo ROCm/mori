@@ -53,6 +53,8 @@ static_assert(kMaxPipelineBlocks <= 385,
 //   2 + 3*c + {0,1,2}: chunk c {compute-wait, cross-PE-barrier, AG-submit} done
 //   2 + 3*numChunks:   AG wait done (all peers)
 //   3 + 3*numChunks:   block 0 exit
+//   --- Stage 2b-0 per-chunk AG completion timestamps (E' prototype) ---
+//   20 + c: block 0 observed chunk c's AG completion (MULTI_CHUNK path)
 //   --- post-AG wait instrumentation (E' prototype) ---
 //   30: block 0 post_ag_flag set (after AG wait done, before block 0 exit)
 //   31: compute block 1 post_ag_flag observed (spin-wait finished)
@@ -461,14 +463,32 @@ __global__ void PipelinedAllReduceSdmaKernel(
           ar_write_phase_ts(phase_ts, 2 + 3 * c + 2);  // chunk c: AG submit done
         }
 
-        if (thr < npes && thr != myPe) {
-          const int sender = thr;
-          const uint64_t expected =
-              s_ag_by_sender[sender] + static_cast<uint64_t>(numChunks);
-          HSAuint64* sig = dstMemObj->signalPtrs
-              + static_cast<size_t>(sender) * numQ + 1;
-          while (core::AtomicLoadRelaxed(sig) < expected)
-            __builtin_amdgcn_s_sleep(1);
+        // Stage 2b-0: per-chunk AG wait. Instead of waiting for all chunks
+        // to land in a single loop, wait chunk-by-chunk so we can know the
+        // exact completion time of each chunk. This is the foundation for
+        // Stage 2b-1 (compute-block per-chunk in-kernel copy).
+        //
+        // Kernel wall impact: each extra chunk adds one __syncthreads() plus
+        // its own sleep/poll loop. Should be on the order of tens of us;
+        // if this pushes kernel wall up significantly (>0.1 ms), it
+        // reproduces the Path B failure mode and we must revert.
+        //
+        // Per-chunk timestamps are written to slot 20+c (c=0..numChunks-1)
+        // for Stage 2b-0b analysis of AG completion timing distribution.
+        for (int c = 0; c < numChunks; c++) {
+          if (thr < npes && thr != myPe) {
+            const int sender = thr;
+            const uint64_t expected_c =
+                s_ag_by_sender[sender] + static_cast<uint64_t>(c + 1);
+            HSAuint64* sig = dstMemObj->signalPtrs
+                + static_cast<size_t>(sender) * numQ + 1;
+            while (core::AtomicLoadRelaxed(sig) < expected_c)
+              __builtin_amdgcn_s_sleep(1);
+          }
+          __syncthreads();
+          if (phase_ts != nullptr && threadIdx.x == 0 && (20 + c) < kArPhaseTsCapacity) {
+            phase_ts[20 + c] = __builtin_amdgcn_s_memtime();  // chunk c AG done
+          }
         }
         ar_write_phase_ts(phase_ts, 2 + 3 * numChunks);  // AG wait done (all peers)
 
