@@ -573,9 +573,32 @@ void MasterClient::HeartbeatLoop() {
                      ClientStatusName(server_status));
 
       if (resp.status() == ::umbp::CLIENT_STATUS_UNKNOWN) {
-        MORI_UMBP_WARN(
-            "[Client] Master does not recognize us; "
-            "re-registration needed");
+        MORI_UMBP_WARN("[Client] Master does not recognize us; re-registering...");
+        registered_ = false;
+        ::umbp::RegisterClientRequest re_req;
+        re_req.set_node_id(config_.node_id);
+        re_req.set_node_address(config_.node_address);
+        {
+          std::lock_guard lock(caps_mutex_);
+          for (const auto& [tier, cap] : current_capacities_) {
+            auto* tc = re_req.add_tier_capacities();
+            tc->set_tier(static_cast<::umbp::TierType>(tier));
+            tc->set_total_capacity_bytes(cap.total_bytes);
+            tc->set_available_capacity_bytes(cap.available_bytes);
+          }
+        }
+        ::umbp::RegisterClientResponse re_resp;
+        grpc::ClientContext re_ctx;
+        auto re_status = GetStub(stub_.get())->RegisterClient(&re_ctx, re_req, &re_resp);
+        if (re_status.ok()) {
+          registered_ = true;
+          MORI_UMBP_INFO("[Client] Re-registered with master after UNKNOWN status");
+        } else if (re_status.error_code() == grpc::StatusCode::ALREADY_EXISTS) {
+          registered_ = true;
+          MORI_UMBP_INFO("[Client] Already registered with master");
+        } else {
+          MORI_UMBP_WARN("[Client] Re-registration failed: {}", re_status.error_message());
+        }
       }
     }
   }
