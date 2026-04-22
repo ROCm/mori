@@ -215,6 +215,61 @@ RCCL `dist.all_reduce(tensor)` 的 drop-in 替代语义。
 - R11 v1：给"跑"+"提取"两个 block，要求用户贴两次 → v2 已合并为一个 block。
 - R11 v2：`pip install ... | tail -3 && <后续>` → tail 吞掉 exit code，build
   failed 还继续跑测试，用户看到假的"空 OFF 段"。**必须用 `set -euo pipefail`**。
+- R11 v3：pip install 之前没做 toolchain preflight（cmake/hip/gpu 可用性），
+  build 直接因 `cmake not found` 失败，用户浪费一轮运行 —— 按 R12 补前置检查。
+
+### R12. 给出 shell block 之前必须做**环境 preflight**
+
+**触发**：任何需要用户在远端机器/容器运行的 shell block（尤其涉及 compile、
+HIP、multi-gpu、MPI、特殊驱动 / sudo 等）。
+
+**硬性要求**：shell block 的**第一段**必须是 preflight，失败即退（不跑后面）：
+
+```bash
+set -euo pipefail
+
+# 0. 当前在哪台机 / 容器内外 / 是不是 root
+hostname; id -un; pwd
+
+# 1. 编译工具链（按本任务所需）
+command -v cmake  >/dev/null || { echo "MISSING: cmake";  exit 1; }
+command -v hipcc  >/dev/null || { echo "MISSING: hipcc";  exit 1; }
+command -v python3>/dev/null || { echo "MISSING: python3";exit 1; }
+cmake --version | head -1
+hipcc --version 2>/dev/null | head -2 || true
+
+# 2. 运行时 —— GPU / HIP 可用
+rocm-smi --showproductname 2>&1 | head -5
+python3 -c "import torch; \
+  assert torch.cuda.is_available(), 'HIP not available'; \
+  print('devices:', torch.cuda.device_count())"
+
+# 3. 代码状态：当前 SHA、是否 clean、是否 on 预期 branch
+git -C "$REPO" rev-parse --abbrev-ref HEAD
+git -C "$REPO" log -1 --oneline
+git -C "$REPO" status --short || true
+```
+
+**不得**：
+- ❌ 直接 `pip install -e .` 然后指望 cmake / hipcc / torch.cuda 都 ready
+- ❌ 把环境假设隐式写在注释里（"请先进容器"），不 preflight 就往下跑
+- ❌ preflight 失败时继续往下（所以必须 `set -e`，不能用 `||true` 吞掉）
+
+**已知的易错项**（本会话踩过的）：
+- 用户在跳板机 `user@host:~$` 而非容器 `root@host:/path#` → preflight 输出
+  `hostname`/`id` 能立即暴露
+- 容器里 `cmake` / `hipcc` 缺失 → preflight 输出 `MISSING:` 并 exit 1
+- `ulimit -l` 不 unlimited 导致 HIP 初始化失败 → preflight 输出 `torch.cuda.device_count()=0`
+  立即退，不让用户错以为是代码 bug
+- 残留 zombie 进程占 GPU → `rocm-smi --showpids` 可以加到 preflight 里报警
+
+**反模式**：
+| ❌ 错误 | ✅ 正确 |
+|--------|--------|
+| "请确保你在容器内运行" 写在注释 | `hostname; id -un` 作为 preflight 第一行 |
+| pip install 失败了我才问"你装 cmake 了吗" | preflight 已经检查 cmake |
+| 空输出 OFF 段才发现 pip install 失败 | preflight 在 pip 之前 exit 1 了 |
+| 跨轮对话默认用户环境没变 | 每个 shell block 都自带 preflight，不靠记忆
 
 ## 工作流模板（每轮都走这个）
 
