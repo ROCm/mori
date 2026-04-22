@@ -946,6 +946,35 @@ def _bench_overlap_one_size(
     elem_bytes = elems * torch.tensor([], dtype=dtype).element_size()
     data_mb = elem_bytes / (1024 * 1024)
     use_overlap = data_mb >= 128
+
+    # τ direction: keep HBM / SDMA engine hot during AR[last]. When
+    # MORI_KEEP_HBM_HOT=1, submit an extra GEMM on stream_gemm AFTER
+    # GEMM[num_stages-1] so that stream_gemm is busy with HBM traffic
+    # while stream_ar's AR[last] is doing its AG wait (see perf_history
+    # Entry 13: single-stage AR[0] AG is 0.47ms slower than multi-stage
+    # AR[0] because the latter has GEMM[1..3] providing cross-stream
+    # HBM activity).
+    keep_hbm_hot = os.environ.get("MORI_KEEP_HBM_HOT", "0") == "1"
+
+    # ξ direction: AR[0] cold-path warmup. When MORI_AR_WARMUP=1, do
+    # one dummy AR call before the measurement loop to warm up SDMA
+    # queue/CU cache/peer signal buffers (see perf_history Entry 4:
+    # AR[0] cold is ~3x slower per-phase vs AR[2] warm).
+    if os.environ.get("MORI_AR_WARMUP", "0") == "1" and ar_obj is not None:
+        try:
+            # Extra AR call to warm up state machinery; not counted in timing.
+            prep_ar()
+            launch_ar()
+            stream_ar.synchronize()
+            if copy_stream:
+                copy_stream.synchronize()
+            dist.barrier()
+            if rank == 0:
+                print(" (ξ warmup ok)", end="", flush=True)
+        except Exception as _e:
+            if rank == 0:
+                print(f" (ξ warmup failed: {_e})", end="", flush=True)
+
     for i in range(total_iters):
         torch.cuda.synchronize()
         prep_ar()
@@ -960,6 +989,20 @@ def _bench_overlap_one_size(
                 stream_ar.wait_event(ev_g_e_list[s])
             else:
                 stream_gemm.synchronize()
+
+            # τ: BEFORE AR[last]'s submit, queue extra GEMMs on
+            # stream_gemm so that GEMM keeps running in parallel with
+            # AR[last]'s AG wait. This keeps HBM / SDMA engine "hot"
+            # per the hypothesis in perf_history Entry 13. Placement
+            # here (inside loop, before launch_ar) ensures extras are
+            # queued BEFORE AR[last] starts, so they run concurrent
+            # with AR[last] on different streams. The extras finish
+            # before or around stream_ar end, so they don't extend wall.
+            if keep_hbm_hot and use_overlap and s == num_stages - 1:
+                for _ in range(2):
+                    with torch.cuda.stream(stream_gemm):
+                        _run_gemm()
+
             ev_ar_s_list[s].record(stream_ar)
             with torch.cuda.stream(stream_ar):
                 launch_ar()
@@ -968,6 +1011,7 @@ def _bench_overlap_one_size(
                 stream_ar.synchronize()
                 if copy_stream:
                     copy_stream.synchronize()
+
         if use_overlap:
             stream_ar.synchronize()
             if copy_stream:
