@@ -946,20 +946,6 @@ def _bench_overlap_one_size(
     elem_bytes = elems * torch.tensor([], dtype=dtype).element_size()
     data_mb = elem_bytes / (1024 * 1024)
     use_overlap = data_mb >= 128
-
-    # τ'' gating: when MORI_HBM_NOISE=1, only enable HBM noise on the LAST
-    # AR of each iter. AR[0..N-2] already have parallel GEMM providing
-    # natural HBM activity — adding kernel-internal noise there just
-    # contends for HBM bandwidth with GEMM, slowing both (see Entry 15
-    # second round where blanket-enable was -0.4ms wall). AR[N-1] has no
-    # parallel GEMM, so noise during its AG wait keeps MC active without
-    # contention.
-    _tau2_last_only = (
-        os.environ.get("MORI_HBM_NOISE", "0") == "1"
-        and ar_obj is not None
-        and hasattr(ar_obj, "enable_hbm_noise")
-    )
-
     for i in range(total_iters):
         torch.cuda.synchronize()
         prep_ar()
@@ -974,11 +960,6 @@ def _bench_overlap_one_size(
                 stream_ar.wait_event(ev_g_e_list[s])
             else:
                 stream_gemm.synchronize()
-            if _tau2_last_only:
-                try:
-                    ar_obj.enable_hbm_noise(s == num_stages - 1)
-                except Exception:
-                    pass
             ev_ar_s_list[s].record(stream_ar)
             with torch.cuda.stream(stream_ar):
                 launch_ar()
@@ -1372,25 +1353,12 @@ def _test_multi_stage_overlap(
                                    dtype=dtype)
             # Stage 1 E' prototype: compute blocks stay alive during AG wait.
             # Enable via env MORI_POST_AG_WAIT=1 (off by default).
-            # MORI_HBM_NOISE=1 also implicitly enables post_ag_wait (required
-            # because τ'' HBM-read loop lives inside that spin-wait).
-            _want_post_ag = (
-                os.environ.get("MORI_POST_AG_WAIT", "0") == "1"
-                or os.environ.get("MORI_HBM_NOISE", "0") == "1"
-            )
-            if _want_post_ag:
+            if os.environ.get("MORI_POST_AG_WAIT", "0") == "1":
                 try:
                     ar_obj.enable_post_ag_wait(True)
                 except Exception as e:
                     if rank == 0:
                         print(f"  [warn] enable_post_ag_wait failed: {e}",
-                              flush=True)
-            if os.environ.get("MORI_HBM_NOISE", "0") == "1":
-                try:
-                    ar_obj.enable_hbm_noise(True)
-                except Exception as e:
-                    if rank == 0:
-                        print(f"  [warn] enable_hbm_noise failed: {e}",
                               flush=True)
             torch.cuda.synchronize(); dist.barrier()
             if rank == 0:

@@ -9,11 +9,13 @@
 #     (perf_history.md Entry 14), reverted.
 #   - v3: ν (MORI_SKIP_ITER_SYNC) — FAILED, measurement artifact
 #     (perf_history.md Entry 15), reverted.
-#   - v4 (current): τ'' (MORI_HBM_NOISE) — compute blocks read from input
-#     during AG-wait spin, generating HBM traffic to keep memory
-#     controller active. Hypothesis: AR[N-1] AG is ~2× slower
-#     (1.08ms vs 0.55ms on AR[0..N-2]) because no parallel GEMM
-#     provides HBM activity. In-kernel HBM noise closes the gap.
+#   - v4: τ'' (MORI_HBM_NOISE) — FAILED, HBM noise doesn't speed up AG
+#     (perf_history.md Entry 16), reverted.
+#   - v5 (current): baseline-only, for clean post-revert measurement.
+#     Real bottleneck identified: 4 × hipMemcpyAsync output copies
+#     (0.35ms each on stream_ar, serialized with next AR). No-copy
+#     SDMA already beats RCCL by 0.5ms. Next direction: π' (copy on
+#     separate stream via SDMA + double-buffered transit).
 #
 # Usage (inside ROCm container):
 #   cd /home/fizhang/test/mori
@@ -108,21 +110,10 @@ run_variant_extra() {
   echo "========== HEAD =========="
   git log -1 --oneline
 
-  # τ'' needs both MORI_POST_AG_WAIT=1 AND MORI_HBM_NOISE=1 (MORI_HBM_NOISE
-  # alone also implicitly enables post_ag_wait via Python test harness).
-  TAU2_ENV="MORI_POST_AG_WAIT=1 MORI_HBM_NOISE=1"
-
   run_variant "BASELINE" ""
-  run_variant "TAU2"     "$TAU2_ENV"
-
-  run_variant_extra "BASELINE_TIMELINE" "" --timeline
-  run_variant_extra "TAU2_TIMELINE"     "$TAU2_ENV" --timeline
-
+  run_variant_extra "BASELINE_TIMELINE"  "" --timeline
   run_variant_extra "BASELINE_AR0_PHASE" "MORI_PHASE_TARGET_STAGE=0" --ar-phase-timing
-  run_variant_extra "TAU2_AR0_PHASE"     "$TAU2_ENV MORI_PHASE_TARGET_STAGE=0" --ar-phase-timing
-
   run_variant_extra "BASELINE_AR3_PHASE" "MORI_PHASE_TARGET_STAGE=3" --ar-phase-timing
-  run_variant_extra "TAU2_AR3_PHASE"     "$TAU2_ENV MORI_PHASE_TARGET_STAGE=3" --ar-phase-timing
 } | tee "$LOG"
 
 echo
@@ -149,32 +140,17 @@ PHASE_RE="(\[[0-9]\] total|entry.*scatter_done|scatter.*compute-wait|compute-wai
 
 echo
 echo "---- [2] per-stage median (BASELINE_TIMELINE) ----"
-awk '/========== BASELINE_TIMELINE ==========/,/========== TAU2_TIMELINE ==========/' "$LOG" \
+awk '/========== BASELINE_TIMELINE ==========/,/========== BASELINE_AR0_PHASE ==========/' "$LOG" \
   | grep -E "stage \|| *[0-3] \||median wall|AR\[[0-3]\] duration|AR\[.\]-GEMM" || true
 
 echo
-echo "---- [3] per-stage median (TAU2_TIMELINE) ----"
-awk '/========== TAU2_TIMELINE ==========/,/========== BASELINE_AR0_PHASE ==========/' "$LOG" \
-  | grep -E "stage \|| *[0-3] \||median wall|AR\[[0-3]\] duration|AR\[.\]-GEMM" || true
-
-echo
-echo "---- [4] BASELINE AR[0] phase ----"
-awk '/========== BASELINE_AR0_PHASE ==========/,/========== TAU2_AR0_PHASE ==========/' "$LOG" \
+echo "---- [3] BASELINE AR[0] phase ----"
+awk '/========== BASELINE_AR0_PHASE ==========/,/========== BASELINE_AR3_PHASE ==========/' "$LOG" \
   | grep -E "$PHASE_RE" || true
 
 echo
-echo "---- [5] TAU2 AR[0] phase ----"
-awk '/========== TAU2_AR0_PHASE ==========/,/========== BASELINE_AR3_PHASE ==========/' "$LOG" \
-  | grep -E "$PHASE_RE" || true
-
-echo
-echo "---- [6] BASELINE AR[3] phase ----"
-awk '/========== BASELINE_AR3_PHASE ==========/,/========== TAU2_AR3_PHASE ==========/' "$LOG" \
-  | grep -E "$PHASE_RE" || true
-
-echo
-echo "---- [7] TAU2 AR[3] phase (KEY TARGET) ----"
-awk '/========== TAU2_AR3_PHASE ==========/,0' "$LOG" \
+echo "---- [4] BASELINE AR[3] phase ----"
+awk '/========== BASELINE_AR3_PHASE ==========/,0' "$LOG" \
   | grep -E "$PHASE_RE" || true
 
 echo

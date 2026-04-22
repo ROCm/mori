@@ -169,17 +169,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
                               reduce until block 0 sets this flag (after AG
                               wait done). Used to measure how much CU
                               occupancy during AG wait costs the overlap
-                              benchmark (GEMM variability, wall time). */,
-    bool hbm_noise_enabled = false /* τ'' direction (see perf_history Entry
-                                       15): when true AND post_ag_flag is
-                                       non-null, compute blocks read input
-                                       buffer in their spin-wait loop to
-                                       keep HBM / memory controller active
-                                       during AG wait. This matters most on
-                                       the last AR in an overlap chain (no
-                                       parallel GEMM to provide HBM activity
-                                       otherwise). Expected gain: AR[N-1] AG
-                                       ~1.08ms → ~0.55ms. */ ) {
+                              benchmark (GEMM variability, wall time). */ ) {
 
   ar_write_phase_ts(phase_ts, 0);  // phase 0: kernel entry
 
@@ -360,65 +350,14 @@ __global__ void PipelinedAllReduceSdmaKernel(
       // MC active via in-kernel reads closes that gap.
       // ---------------------------------------------------------------
       if (post_ag_flag != nullptr) {
-        if (hbm_noise_enabled) {
-          // τ'' v2: heavy HBM noise. Each thread reads 128 uint32 per
-          // spin iter (512 B per thread per iter; at 160 blocks × 256
-          // threads × 1 iter/~1us ≈ ~200 GB/s — matches GEMM HBM BW).
-          // Prior v1 read 1 byte per iter (~1 GB/s total) which was
-          // insufficient to keep the memory controller active (Entry 15
-          // follow-up data showed AR[3] AG 1.083 → 1.021, only 6%
-          // improvement). This version aims for true GEMM-class BW.
-          volatile const uint32_t* noise_buf_u32 =
-              reinterpret_cast<const uint32_t*>(input);
-          const size_t total_u32 =
-              elementCount * sizeof(T) / sizeof(uint32_t);
-          if (total_u32 > 0) {
-            const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x
-                             + threadIdx.x;
-            const size_t gstride = static_cast<size_t>(gridDim.x) * blockDim.x;
-            size_t base = tid % total_u32;
-            uint32_t acc = 0;
-            constexpr int kReadsPerIter = 128;
-            while (__hip_atomic_load(
-                       post_ag_flag,
-                       __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) == 0u) {
-              #pragma unroll
-              for (int k = 0; k < kReadsPerIter; k++) {
-                size_t idx = base + static_cast<size_t>(k) * gstride;
-                if (idx >= total_u32) idx %= total_u32;
-                acc ^= noise_buf_u32[idx];
-              }
-              base += static_cast<size_t>(kReadsPerIter) * gstride;
-              if (base >= total_u32) base %= total_u32;
-            }
-            __syncthreads();
-            // Dead-store guard: force the compiler to actually emit the
-            // reads (acc is used). Condition effectively never true.
-            if (threadIdx.x == 0 && acc == 0xFFFFFFFFu) {
-              phase_ts[kArPhaseTsCapacity - 1] = static_cast<uint64_t>(acc);
-            }
-          } else {
-            // No input to read from (shouldn't happen for real runs);
-            // fall back to the cheap sleep-spin.
-            if (threadIdx.x == 0) {
-              while (__hip_atomic_load(
-                         post_ag_flag,
-                         __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) == 0u) {
-                __builtin_amdgcn_s_sleep(2);
-              }
-            }
-            __syncthreads();
+        if (threadIdx.x == 0) {
+          while (__hip_atomic_load(
+                     post_ag_flag,
+                     __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) == 0u) {
+            __builtin_amdgcn_s_sleep(2);
           }
-        } else {
-          if (threadIdx.x == 0) {
-            while (__hip_atomic_load(
-                       post_ag_flag,
-                       __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) == 0u) {
-              __builtin_amdgcn_s_sleep(2);
-            }
-          }
-          __syncthreads();
         }
+        __syncthreads();
         ar_write_phase_ts_cb1(phase_ts, 31);  // post_ag_flag observed
       }
 

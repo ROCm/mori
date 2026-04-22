@@ -504,6 +504,54 @@ Summarized here for quick lookup; exact commits in git log:
 
 ---
 
+## Entry 16 — τ'' (in-kernel HBM noise) FAILED, refocus on copy cost
+- **Date**: 2026-04-22
+- **Commit**: `0f6f4920` (τ'' v1), `4c57e2c0` (τ'' v2 — heavy noise + per-call gating)
+- **Scenario**: `tools/bench_tau_xi.sh` with `MORI_POST_AG_WAIT=1 MORI_HBM_NOISE=1`
+- **Numbers (median wall ms, copy mode)** v1 (blanket enable, 1 byte/iter noise):
+  | label | copy | RCCL | AR[3] AG |
+  |---|---|---|---|
+  | BASELINE | 7.787 | 7.418 | 1.083 ms |
+  | TAU2 v1  | 8.212 | 7.446 | 1.021 ms (-0.06) |
+  Wall **+0.425 ms worse** (AR[0/1/2] got longer because HBM noise during
+  their AG contends with parallel GEMM[s+1] reading HBM for matmul).
+- **Numbers (v2 — heavy noise 512B/iter/thread, gated to AR[N-1] only)**:
+  | label | copy | RCCL | AR[3] AG |
+  |---|---|---|---|
+  | BASELINE | 8.319 | 7.433 | 1.078 ms |
+  | TAU2 v2  | 8.378 | 7.429 | 1.107 ms (+0.03) |
+  AR[3] AG **unchanged** (noise amount & per-call gating didn't help).
+  **Mechanism refuted** at the data level: HBM memory-controller idle state
+  is NOT the cause of AR[N-1] AG being 2× slower than AR[0..N-2] AG.
+- **Reverted** at this commit (all τ'' kernel / class / pybind / Python changes).
+- **True bottleneck identified (from same run's no-copy numbers)**:
+  | Mode | wall | Δ vs RCCL |
+  |---|---|---|
+  | SDMA **no-copy** | 6.933 | **-0.50 ms (WINS)** |
+  | RCCL | 7.433 | — |
+  | SDMA copy | 8.319 | +0.89 ms (loses) |
+  The SDMA collective itself (sans copy) is already **faster than RCCL
+  by 0.5 ms**. The entire ~1.4 ms "SDMA vs RCCL" gap is the **4 ×
+  `hipMemcpyAsync` output copies** (~0.35 ms each, all on stream_ar,
+  all serialize with the next AR). The AG-speed chase is a dead end;
+  the copy overhead is the only remaining lever.
+- **New direction candidates**:
+  - **π'**: move `hipMemcpyAsync` to a dedicated SDMA copy queue (not CU
+    blit, not stream_ar) so AR[N+1] kernel launches immediately after
+    AR[N] kernel exits, with copy running in parallel. Expected gain:
+    (#copies - 1) × 0.35 ≈ 1.05 ms if all but last hide perfectly.
+    Historical attempt in this session used CU-blit on separate stream
+    (failed due to CU contention); a pure-SDMA implementation has not
+    been tried.
+  - **D'' (fresh attempt)**: only pre-register output for identical
+    (ptr,size) pairs seen at hot-loop time. Previous D' attempt hit
+    PyTorch caching allocator offset mismatch with `hipIpcOpenMemHandle`;
+    a registry keyed on `(ptr, size, pid)` with an explicit collective
+    setup called from user code could bypass that.
+  - **μ': in-kernel direct-to-user-output AG**. Similar to D' but the AR
+    kernel does the final write itself rather than via `hipMemcpyAsync`.
+    Also requires symm memory for user output.
+
 ## Entry 15 — ν (skip iter sync) FAILED, reveals true mechanism
 - **Date**: 2026-04-22
 - **Commit**: `623f61a4` (ν impl), `b56918ba` (baseline)
@@ -622,5 +670,6 @@ Summarized here for quick lookup; exact commits in git log:
 | 2026-04-22 | — | — | — | D' Step 2 **REVERTED** (Entry 11): PyTorch caching allocator incompatible with `hipIpcOpenMemHandle` semantics; direction closed pending shmem refactor |
 | 2026-04-22 | 7.789 | 7.582 | **+2.7%** | Entry 14 baseline (τ=ξ=off). Both τ and ξ failed; reverted |
 | 2026-04-22 | 7.797 | 7.637 | **+2.1%** | Entry 15 baseline (ν fail confirmed); τ'' proposal pending |
+| 2026-04-22 | 8.319 | 7.433 | **+11.9%** | Entry 16: τ'' FAILED in both v1 & v2; no-copy mode already beats RCCL by 0.5ms → copy cost is the only lever left |
 
 **Target**: SDMA copy ≤ RCCL (gap ≤ 0). Currently outstanding.
