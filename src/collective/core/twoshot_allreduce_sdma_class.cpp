@@ -180,17 +180,19 @@ void AllreduceSdma<T>::enable_post_ag_wait(bool on) {
   if (on == post_ag_wait_enabled_) return;
   if (on) {
     if (post_ag_flag_d_ == nullptr) {
-      hipError_t e = hipMalloc(&post_ag_flag_d_, sizeof(uint32_t));
+      size_t flag_bytes = kMaxPostAgChunks * sizeof(uint32_t);
+      hipError_t e = hipMalloc(&post_ag_flag_d_, flag_bytes);
       if (e != hipSuccess) {
-        fprintf(stderr, "PE %d: hipMalloc(post_ag_flag) failed: %s\n",
-                myPe_, hipGetErrorString(e));
+        fprintf(stderr, "PE %d: hipMalloc(post_ag_flag[%d]) failed: %s\n",
+                myPe_, kMaxPostAgChunks, hipGetErrorString(e));
         return;
       }
-      hipMemset(post_ag_flag_d_, 0, sizeof(uint32_t));
+      hipMemset(post_ag_flag_d_, 0, flag_bytes);
     }
     post_ag_wait_enabled_ = true;
-    printf("PE %d: post_ag_wait ENABLED (Stage 1 prototype, flag at %p)\n",
-           myPe_, post_ag_flag_d_);
+    printf("PE %d: post_ag_wait ENABLED (Stage 2b-1 in-kernel copy, "
+           "flag array at %p, size=%d chunks)\n",
+           myPe_, post_ag_flag_d_, kMaxPostAgChunks);
   } else {
     post_ag_wait_enabled_ = false;
   }
@@ -720,14 +722,29 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         uint64_t* phase_ts_ptr = phase_timing_enabled_ ? phase_ts_d_ : nullptr;
         last_num_chunks_ = numChunks_host;
 
-        // Stage 1 E' prototype: pass post_ag_flag to kernel when enabled.
-        // Reset the flag to 0 on the same stream before kernel launch so the
-        // kernel's compute blocks observe 0 initially and only release when
-        // block 0 stores 1 after AG wait done.
+        // Stage 2b-1 E' path: pass per-chunk post_ag_flag array + user
+        // output ptr to kernel. Block 0 sets flag[c]=1 after chunk c's
+        // AG completes; compute blocks copy transit[chunk c]→output_user
+        // as soon as each flag is seen, overlapping copy with remaining
+        // AG waits. When enabled AND copy_output_to_user_ is true, host
+        // skips the external hipMemcpyAsync at pipelined() exit.
+        //
+        // Reset the full flag array to 0 on the same stream before the
+        // kernel launch so stale 1s from a prior call don't cause the
+        // compute blocks to skip waiting.
         uint32_t* post_ag_flag_ptr = nullptr;
+        T* output_user_ptr = nullptr;
         if (post_ag_wait_enabled_ && post_ag_flag_d_ != nullptr) {
-          hipMemsetAsync(post_ag_flag_d_, 0, sizeof(uint32_t), stream);
+          hipMemsetAsync(post_ag_flag_d_, 0,
+                         kMaxPostAgChunks * sizeof(uint32_t), stream);
           post_ag_flag_ptr = post_ag_flag_d_;
+          // Only pass user output to kernel when copy-to-user semantics
+          // are requested. For copy_output_to_user_=false (zero-copy API)
+          // we keep transit as the final buffer and compute blocks do
+          // not perform in-kernel copy.
+          if (copy_output_to_user_) {
+            output_user_ptr = output;
+          }
         }
 
         if (scatter_mode == 1) {
@@ -736,7 +753,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                 output_transit_buffer_obj_, flagsObj_,
                 barrierPtr_, inputSymmObj, total_count, chunk_elems,
                 scatter_base, ag_base, reduce_complete_base, phase_ts_ptr,
-                post_ag_flag_ptr);
+                post_ag_flag_ptr, output_user_ptr);
         } else if (external_scatter) {
             ScatterSdmaOnlyKernel<T><<<1, 512, 0, stream>>>(
                 myPe_, npes_, input, output_transit_buffer_obj_,
@@ -749,7 +766,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                     barrierPtr_, application::SymmMemObjPtr{},
                     total_count, chunk_elems, scatter_base, ag_base,
                     reduce_complete_base, phase_ts_ptr,
-                    post_ag_flag_ptr);
+                    post_ag_flag_ptr, output_user_ptr);
             } else {
                 PipelinedAllReduceSdmaKernel<T, 0, false, true>
                     <<<blocks, threads, 0, stream>>>(
@@ -758,7 +775,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                     barrierPtr_, application::SymmMemObjPtr{},
                     total_count, chunk_elems, scatter_base, ag_base,
                     reduce_complete_base, phase_ts_ptr,
-                    post_ag_flag_ptr);
+                    post_ag_flag_ptr, output_user_ptr);
             }
         } else if (multi_chunk) {
             PipelinedAllReduceSdmaKernel<T, 0, true><<<blocks, threads, 0, stream>>>(
@@ -766,14 +783,14 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                 output_transit_buffer_obj_, flagsObj_,
                 barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems,
                 scatter_base, ag_base, reduce_complete_base, phase_ts_ptr,
-                post_ag_flag_ptr);
+                post_ag_flag_ptr, output_user_ptr);
         } else {
             PipelinedAllReduceSdmaKernel<T, 0, false><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
                 barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems,
                 scatter_base, ag_base, reduce_complete_base, phase_ts_ptr,
-                post_ag_flag_ptr);
+                post_ag_flag_ptr, output_user_ptr);
         }
 
         pipeline_scatter_gen_ += numChunks_host;   // scatter SDMA only (qId=0)
@@ -787,7 +804,10 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             return false;
         }
 
-        if (copy_output_to_user_) {
+        // Stage 2b-1: when post_ag_wait in-kernel copy is active (kernel
+        // already wrote user output), skip the external hipMemcpyAsync.
+        // output_user_ptr is non-null iff the kernel did the copy.
+        if (copy_output_to_user_ && output_user_ptr == nullptr) {
             copy_output_to_user(output, total_count, stream);
         }
     } catch (const std::exception& e) {
