@@ -58,7 +58,7 @@ def _make_intranode_config(
         num_experts_per_token=num_experts_per_token,
         max_token_type_size=4,
         block_num=256,
-        warp_num_per_block=16,
+        warp_num_per_block=4,
         use_external_inp_buf=use_external_inp_buf,
         kernel_type=mori.ops.EpDispatchCombineKernelType.IntraNode,
         max_total_recv_tokens=max_total_recv_tokens,
