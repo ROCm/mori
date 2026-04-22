@@ -393,6 +393,22 @@ Summarized here for quick lookup; exact commits in git log:
     where intervals are tens of us); but those cases are short-duration and contribute
     little to wall time
   - **Direction θ (multi-qId AG) closed** for the current AR structure
+
+### Update 2 — confirmed via `examples/sdma/sdma_bw.cpp` calibration (2026-04-22)
+- Ran `sdma_bw` (shader-initiated SDMA, same mechanism as `core::SdmaPutThread`
+  used in AR kernel — packet built in shader, transfer executed by SDMA engine;
+  NOT CU blit):
+  - 1 src GPU → 7 dest GPUs concurrent, single queue per dest, size 1 KB → 1 GB
+  - 256 MB: **427.7 GB/s total** (= **61 GB/s per link**)
+  - 1 GB:   428.4 GB/s (saturated)
+- AR AG phase BW utilization (using this SDMA-engine peak):
+  - AR[0] (cold): 224 MB ingress / 0.614 ms = **365 GB/s (85% of peak)**
+  - AR[2] (warm, backlog):   224 MB / 1.029 ms = **218 GB/s (51% of peak)**
+- This empirically confirms the theoretical reasoning: **AR[0] AG phase is
+  already 85% peak**. Multi-qId (θ) cannot help — the SDMA engine's per-link
+  throughput is the binding constraint, not queue count or parallelism.
+- AR[2]'s 51% utilization (low vs AR[0]'s 85%) is explained by **queue backlog**
+  from prior AR calls' lingering SDMA submissions. Not a BW issue.
 - **Rule lesson (R6 reflection)**: Entry 12's ONE datapoint (AR[2] warm) led to a
   gain extrapolation that didn't hold for the AR[0] cold path where it actually
   mattered. Future R10 references must use the relevant stage's data, not the
