@@ -1,36 +1,33 @@
 #!/usr/bin/env bash
 # tools/bench_tau_xi.sh
 # -----------------------------------------------------------------------------
-# A/B benchmark for direction τ (MORI_KEEP_HBM_HOT) and ξ (MORI_AR_WARMUP) on
-# Test 6 (multi-stage pipelined GEMM+AR overlap) @ 256MB.
+# A/B benchmark for direction ν (MORI_SKIP_ITER_SYNC) on Test 6
+# (multi-stage pipelined GEMM+AR overlap) @ 256MB.
 #
-# Design goals:
-#   - one command:  bash tools/bench_tau_xi.sh
-#   - preflight: hostname / cmake / python3 / torch.cuda before any build
-#   - fail-fast: set -euo pipefail; bad env => abort, not "empty OFF section"
-#   - isolated: script runs as its own bash process; set -e does NOT kill
-#               the interactive shell that invoked it (see relentless-perf R13)
-#   - self-contained: args hardcoded correctly (this is where --iters vs
-#                     --iterations, --sweep vs --elems mistakes get fixed once)
-#   - tee to a single log; inline awk extracts the comparison table
+# History:
+#   - v1..v2: τ (MORI_KEEP_HBM_HOT) + ξ (MORI_AR_WARMUP) — both FAILED
+#     (perf_history.md Entry 14), reverted.
+#   - v3 (current): ν direction — skip per-iter torch.cuda.synchronize()
+#     to keep SDMA engine warm across iters. Hypothesis: AR[0]'s
+#     c?:barrier→AG-submit cold-path (~0.25ms/chunk = 0.45ms/AR per
+#     Entry 4 vs AR[2] warm) is caused by iter-sync draining SDMA state.
 #
-# Usage (inside ROCm container, after "cd /home/fizhang/test/mori"):
+# Usage (inside ROCm container):
+#   cd /home/fizhang/test/mori
 #   bash tools/bench_tau_xi.sh
 #
 # Overridable env vars (optional):
-#   REPO         (default: current directory)
-#   SIZE_MB      (default: 256)   -> AR buffer size per PE
+#   REPO         (default: $(pwd))
+#   SIZE_MB      (default: 256)
 #   NUM_STAGES   (default: 4)
 #   ITERATIONS   (default: 100)
 #   WARMUP       (default: 20)
 #   PIPELINE_CU  (default: 160)
-#   SKIP_PULL    (default: 0; set 1 to skip `git pull`)
-#   SKIP_BUILD   (default: 0; set 1 to skip `pip install -e .`)
+#   SKIP_PULL    (default: 0; set 1 to skip git pull)
+#   SKIP_BUILD   (default: 0; set 1 to skip pip install -e .)
 # -----------------------------------------------------------------------------
 set -euo pipefail
 
-# Default REPO = this script's parent's parent (= repo root),
-# so user can run `bash tools/bench_tau_xi.sh` or an absolute path.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${REPO:=$(cd "$SCRIPT_DIR/.." && pwd)}"
 : "${SIZE_MB:=256}"
@@ -40,16 +37,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${PIPELINE_CU:=160}"
 : "${SKIP_PULL:=0}"
 : "${SKIP_BUILD:=0}"
-# uint32 = 4 bytes; elements per PE for a given size in MiB:
-ELEMS=$(( SIZE_MB * 1024 * 1024 / 4 ))
+ELEMS=$(( SIZE_MB * 1024 * 1024 / 4 ))   # uint32 = 4 bytes
 
 cd "$REPO"
-
-# Sanity: we should be in the mori repo root
 [ -f "setup.py" ] || [ -f "pyproject.toml" ] || {
-  echo "ERROR: REPO=$REPO does not look like mori root (no setup.py/pyproject.toml)."
-  echo "Run from repo root, or set REPO=/path/to/mori"
-  exit 1
+  echo "ERROR: REPO=$REPO does not look like mori root"; exit 1;
 }
 
 echo "==================== [preflight] ===================="
@@ -58,17 +50,9 @@ id -un
 pwd
 echo "SIZE_MB=$SIZE_MB NUM_STAGES=$NUM_STAGES ITERATIONS=$ITERATIONS WARMUP=$WARMUP PIPELINE_CU=$PIPELINE_CU ELEMS=$ELEMS"
 
-# Build deps are declared in pyproject.toml's [build-system].requires
-# (cmake, ninja, pybind11, setuptools, wheel). pip installs them
-# automatically in an isolated env — do NOT pass --no-build-isolation
-# (that flag skips the auto-fetch and leaves the build broken if system
-# is missing cmake/ninja/pybind11).
 command -v python3 >/dev/null || { echo "MISSING: python3"; exit 1; }
-
-# Runtime: rocm-smi / HIP / GPU presence
 rocm-smi --showproductname 2>&1 | grep -E "GPU\[.\].*(Card Series|GFX)" | head -4 || true
 python3 -c "import torch; assert torch.cuda.is_available(), 'HIP not available'; print('devices:', torch.cuda.device_count())"
-
 git rev-parse --abbrev-ref HEAD
 git log -1 --oneline
 
@@ -81,12 +65,10 @@ fi
 if [ "$SKIP_BUILD" != "1" ]; then
   echo
   echo "==================== [pip install] ===================="
-  # No --no-build-isolation: let pip fetch pyproject.toml build deps
-  # (cmake / ninja / pybind11 etc.) into an isolated env automatically.
   pip install -e .
 fi
 
-LOG="/tmp/perf_tau_xi_$(date +%s).log"
+LOG="/tmp/perf_$(date +%s).log"
 echo
 echo "==================== [run] LOG=$LOG ===================="
 
@@ -123,20 +105,17 @@ run_variant_extra() {
   echo "========== HEAD =========="
   git log -1 --oneline
 
-  run_variant "OFF"     ""
-  run_variant "TAU"     "MORI_KEEP_HBM_HOT=1"
-  run_variant "XI"      "MORI_AR_WARMUP=1"
-  run_variant "TAU_XI"  "MORI_KEEP_HBM_HOT=1 MORI_AR_WARMUP=1"
+  run_variant "BASELINE" ""
+  run_variant "NU"       "MORI_SKIP_ITER_SYNC=1"
 
-  run_variant_extra "TAU_XI_TIMELINE" "MORI_KEEP_HBM_HOT=1 MORI_AR_WARMUP=1" --timeline
+  run_variant_extra "BASELINE_TIMELINE" "" --timeline
+  run_variant_extra "NU_TIMELINE"       "MORI_SKIP_ITER_SYNC=1" --timeline
 
-  run_variant_extra "AR0_PHASE_TAU_XI" \
-    "MORI_KEEP_HBM_HOT=1 MORI_AR_WARMUP=1 MORI_PHASE_TARGET_STAGE=0" \
-    --ar-phase-timing
+  run_variant_extra "BASELINE_AR0_PHASE" "MORI_PHASE_TARGET_STAGE=0" --ar-phase-timing
+  run_variant_extra "NU_AR0_PHASE"       "MORI_SKIP_ITER_SYNC=1 MORI_PHASE_TARGET_STAGE=0" --ar-phase-timing
 
-  run_variant_extra "AR3_PHASE_TAU_XI" \
-    "MORI_KEEP_HBM_HOT=1 MORI_AR_WARMUP=1 MORI_PHASE_TARGET_STAGE=3" \
-    --ar-phase-timing
+  run_variant_extra "BASELINE_AR3_PHASE" "MORI_PHASE_TARGET_STAGE=3" --ar-phase-timing
+  run_variant_extra "NU_AR3_PHASE"       "MORI_SKIP_ITER_SYNC=1 MORI_PHASE_TARGET_STAGE=3" --ar-phase-timing
 } | tee "$LOG"
 
 echo
@@ -144,7 +123,6 @@ echo "################################################################"
 echo "## COMPARE TABLE (auto-extracted from $LOG)"
 echo "################################################################"
 
-# grep-style pattern used by awk to locate the "${SIZE_MB} MB |" summary row
 SZ_PAT="^[[:space:]]*${SIZE_MB} MB \\|"
 
 echo
@@ -154,23 +132,43 @@ awk -v pat="$SZ_PAT" '
     gsub(/=/, ""); gsub(/^ +| +$/, "");
     lbl = $0
   }
-  $0 ~ pat { printf "  %-22s %s\n", lbl, $0 }
+  $0 ~ pat { printf "  %-25s %s\n", lbl, $0 }
 ' "$LOG"
 
+# Phase breakdown extraction: use ".*" to span the unicode arrow character
+# (→ is 3 bytes in UTF-8; a single "." only matches 1 byte, so earlier
+# patterns like "entry.scatter_done" silently failed to match).
+PHASE_RE="(\[[0-9]\] total|entry.*scatter_done|scatter.*compute-wait|compute-wait.*barrier|barrier.*AG-submit|AG-submit.*AG-wait-done|AG-wait-done.*exit|reduce-done|host-side hipMemcpy|gpu-side copy)"
+
 echo
-echo "---- [2] per-stage (TAU_XI_TIMELINE) ----"
-awk '/========== TAU_XI_TIMELINE/,/========== AR0_PHASE_TAU_XI/' "$LOG" \
+echo "---- [2] per-stage median (BASELINE_TIMELINE) ----"
+awk '/========== BASELINE_TIMELINE ==========/,/========== NU_TIMELINE ==========/' "$LOG" \
   | grep -E "stage \|| *[0-3] \||median wall|AR\[[0-3]\] duration|AR\[.\]-GEMM" || true
 
 echo
-echo "---- [3] AR[0] phase (TAU_XI) ----"
-awk '/========== AR0_PHASE_TAU_XI/,/========== AR3_PHASE_TAU_XI/' "$LOG" \
-  | grep -E "AR\[0\] total|entry.scatter_done|scatter.compute-wait|compute-wait.barrier|barrier.AG-submit|AG-submit.AG-wait-done|reduce-done|host-side hipMemcpy|gpu-side copy" || true
+echo "---- [3] per-stage median (NU_TIMELINE) ----"
+awk '/========== NU_TIMELINE ==========/,/========== BASELINE_AR0_PHASE ==========/' "$LOG" \
+  | grep -E "stage \|| *[0-3] \||median wall|AR\[[0-3]\] duration|AR\[.\]-GEMM" || true
 
 echo
-echo "---- [4] AR[3] phase (TAU_XI, key target) ----"
-awk '/========== AR3_PHASE_TAU_XI/,0' "$LOG" \
-  | grep -E "AR\[3\] total|entry.scatter_done|scatter.compute-wait|compute-wait.barrier|barrier.AG-submit|AG-submit.AG-wait-done|reduce-done|host-side hipMemcpy|gpu-side copy" || true
+echo "---- [4] BASELINE AR[0] phase ----"
+awk '/========== BASELINE_AR0_PHASE ==========/,/========== NU_AR0_PHASE ==========/' "$LOG" \
+  | grep -E "$PHASE_RE" || true
+
+echo
+echo "---- [5] NU AR[0] phase ----"
+awk '/========== NU_AR0_PHASE ==========/,/========== BASELINE_AR3_PHASE ==========/' "$LOG" \
+  | grep -E "$PHASE_RE" || true
+
+echo
+echo "---- [6] BASELINE AR[3] phase ----"
+awk '/========== BASELINE_AR3_PHASE ==========/,/========== NU_AR3_PHASE ==========/' "$LOG" \
+  | grep -E "$PHASE_RE" || true
+
+echo
+echo "---- [7] NU AR[3] phase ----"
+awk '/========== NU_AR3_PHASE ==========/,0' "$LOG" \
+  | grep -E "$PHASE_RE" || true
 
 echo
 echo "LOG: $LOG"

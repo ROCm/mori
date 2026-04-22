@@ -947,39 +947,32 @@ def _bench_overlap_one_size(
     data_mb = elem_bytes / (1024 * 1024)
     use_overlap = data_mb >= 128
 
-    # τ direction: keep HBM / SDMA engine hot during AR[last]. When
-    # MORI_KEEP_HBM_HOT=1, submit an extra GEMM on stream_gemm AFTER
-    # GEMM[num_stages-1] so that stream_gemm is busy with HBM traffic
-    # while stream_ar's AR[last] is doing its AG wait (see perf_history
-    # Entry 13: single-stage AR[0] AG is 0.47ms slower than multi-stage
-    # AR[0] because the latter has GEMM[1..3] providing cross-stream
-    # HBM activity).
-    keep_hbm_hot = os.environ.get("MORI_KEEP_HBM_HOT", "0") == "1"
-
-    # ξ direction: AR[0] cold-path warmup. When MORI_AR_WARMUP=1, do
-    # one dummy AR call before the measurement loop to warm up SDMA
-    # queue/CU cache/peer signal buffers (see perf_history Entry 4:
-    # AR[0] cold is ~3x slower per-phase vs AR[2] warm).
-    if os.environ.get("MORI_AR_WARMUP", "0") == "1" and ar_obj is not None:
-        try:
-            # Extra AR call to warm up state machinery; not counted in timing.
-            prep_ar()
-            launch_ar()
-            stream_ar.synchronize()
-            if copy_stream:
-                copy_stream.synchronize()
-            dist.barrier()
-            if rank == 0:
-                print(" (ξ warmup ok)", end="", flush=True)
-        except Exception as _e:
-            if rank == 0:
-                print(f" (ξ warmup failed: {_e})", end="", flush=True)
+    # ν direction: skip per-iter torch.cuda.synchronize() to avoid draining
+    # SDMA queue / cooling SDMA engine between iters. Hypothesis: AR[0]'s
+    # c?:barrier→AG-submit cold-path cost (~0.25ms/chunk per Entry 4) is
+    # caused by the between-iter sync draining SDMA state. If true, AR[0]
+    # should stabilize at AR[2]-like numbers (~0.02ms/chunk). Entry 14
+    # closed τ (cross-stream HBM doesn't warm SDMA); ν tests a different
+    # mechanism: keep SDMA queue state itself alive across iters.
+    #
+    # To remove iter syncs safely, prep_ar must be ordered on stream_ar
+    # so AR kernels see the right input. We use ev_prep events to chain.
+    skip_iter_sync = os.environ.get("MORI_SKIP_ITER_SYNC", "0") == "1"
+    if skip_iter_sync and rank == 0:
+        print(" (ν: skip iter sync)", end="", flush=True)
 
     for i in range(total_iters):
-        torch.cuda.synchronize()
-        prep_ar()
-        torch.cuda.synchronize()
-        ov_s.record()
+        if skip_iter_sync:
+            # prep_ar runs on stream_ar so AR kernel is serialized after it
+            # (no cross-stream sync required). Between iters we rely on
+            # stream ordering alone — no torch.cuda.synchronize().
+            with torch.cuda.stream(stream_ar):
+                prep_ar()
+        else:
+            torch.cuda.synchronize()
+            prep_ar()
+            torch.cuda.synchronize()
+        ov_s.record(stream_ar if skip_iter_sync else None)
         for s in range(num_stages):
             ev_g_s_list[s].record(stream_gemm)
             with torch.cuda.stream(stream_gemm):
@@ -989,20 +982,6 @@ def _bench_overlap_one_size(
                 stream_ar.wait_event(ev_g_e_list[s])
             else:
                 stream_gemm.synchronize()
-
-            # τ: BEFORE AR[last]'s submit, queue extra GEMMs on
-            # stream_gemm so that GEMM keeps running in parallel with
-            # AR[last]'s AG wait. This keeps HBM / SDMA engine "hot"
-            # per the hypothesis in perf_history Entry 13. Placement
-            # here (inside loop, before launch_ar) ensures extras are
-            # queued BEFORE AR[last] starts, so they run concurrent
-            # with AR[last] on different streams. The extras finish
-            # before or around stream_ar end, so they don't extend wall.
-            if keep_hbm_hot and use_overlap and s == num_stages - 1:
-                for _ in range(2):
-                    with torch.cuda.stream(stream_gemm):
-                        _run_gemm()
-
             ev_ar_s_list[s].record(stream_ar)
             with torch.cuda.stream(stream_ar):
                 launch_ar()
@@ -1012,13 +991,14 @@ def _bench_overlap_one_size(
                 if copy_stream:
                     copy_stream.synchronize()
 
-        if use_overlap:
+        if use_overlap and not skip_iter_sync:
             stream_ar.synchronize()
             if copy_stream:
                 copy_stream.synchronize()
             stream_gemm.synchronize()
-        ov_e.record()
-        torch.cuda.synchronize()
+        ov_e.record(stream_ar if skip_iter_sync else None)
+        if not skip_iter_sync:
+            torch.cuda.synchronize()
         t_ov = ov_s.elapsed_time(ov_e) / 1000.0
         if i >= warmup:
             overlap_times.append(t_ov)

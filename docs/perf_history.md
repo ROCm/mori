@@ -504,6 +504,61 @@ Summarized here for quick lookup; exact commits in git log:
 
 ---
 
+## Entry 14 — τ (keep-HBM-hot) + ξ (AR warmup) both FAILED
+- **Date**: 2026-04-22
+- **Commit**: `95c663f8` (τ + ξ benchmark impl), measurement at `b56918ba`
+- **Scenario**: `tools/bench_tau_xi.sh` (MORI_PIPELINE_CU=160, 256MB, 4 stages, 100 iters)
+- **Numbers (median wall ms, copy mode)**:
+  | label | copy | no-copy | RCCL | Δ copy vs OFF |
+  |---|---|---|---|---|
+  | OFF     | 7.789 | 7.413 | 7.582 | — |
+  | TAU     | 8.424 | 8.072 | 8.468 | **+0.635** |
+  | XI      | 7.789 | 7.417 | 7.666 | 0 |
+  | TAU_XI  | 8.419 | 8.070 | 8.471 | +0.630 |
+- **AR[3] duration (key target for τ)**:
+  - OFF baseline not re-captured but Entry 4 shows AR[2] AG ~1.1 ms
+  - TAU timeline shows AR[3] = 1.303 ms (τ did NOT shrink AG phase)
+- **Mechanism analysis**:
+  - **τ fail root cause**: the 2 extra GEMMs on stream_gemm forced
+    `stream_gemm.synchronize()` at ov_e.record() to wait for them,
+    extending wall by ~0.63 ms. Worse, AR[3] AG phase was NOT
+    accelerated — τ hypothesis "cross-stream HBM activity keeps SDMA
+    engine hot" is **refuted** at the direct AR[3] level.
+  - **ξ fail root cause**: benchmark already has 10-iter warmup loop
+    that equally warms AR[0] cold-path. An extra single AR call before
+    the measurement loop adds nothing. AR[0] `entry→scatter_done`
+    (~0.22 ms cold-path overhead) is NOT due to first-call staleness
+    but to **per-measurement-iter prep_ar + torch.cuda.synchronize**
+    which drains and cools SDMA queues between iters.
+  - **Refined understanding**: The cold-path in AR[0] is an
+    **intra-iter** phenomenon (driven by `torch.cuda.synchronize()`
+    between iters draining SDMA queues), not an inter-run phenomenon.
+    Warming before the loop starts doesn't help because each iter
+    re-cools. True fix would be: don't synchronize between iters
+    (breaks isolation), OR reduce the submit→doorbell latency inside
+    the kernel when queue is cold.
+- **Conclusion**:
+  - τ direction **closed**: extra GEMM on stream_gemm strictly extends
+    wall; no hidden gain elsewhere.
+  - ξ direction **closed**: warmup before loop is equivalent to the
+    existing warmup iters; no new gain available at host level.
+  - **Reverted** at commit: Python `_bench_overlap_one_size`
+    `MORI_KEEP_HBM_HOT` / `MORI_AR_WARMUP` paths removed.
+- **New evidence for next direction** (Entry 4 revisited with TAU_XI
+  AR[0] data):
+  - AR[0] `c0:barrier→AG-submit` = **0.247 ms** per chunk (×2 chunks
+    = 0.494 ms) vs AR[2/3] warm = **0.021 ms** per chunk (×2 = 0.042
+    ms). Delta = **0.452 ms**.
+  - This is the dominant AR[0] cold-path cost, NOT entry overhead.
+  - Mechanism: SDMA ring doorbell / packet submission from kernel-land
+    is slow when queue is cold (~250 us), fast when queue has recent
+    traffic (~20 us). Likely an SDMA engine kickoff latency, not a
+    ring fullness or CU contention issue.
+  - This **elevates σ direction** (keep SDMA queue warm **between**
+    AR iters, not just once before loop) to top priority.
+
+---
+
 ## Running gap-to-target tally
 
 | date | best SDMA copy wall | RCCL median | gap | notes |
@@ -515,5 +570,6 @@ Summarized here for quick lookup; exact commits in git log:
 | 2026-04-22 | 7.765 | 7.433 | +4.5% | Stage 2b-0 clean, baseline restored |
 | 2026-04-22 | _projected 7.381_ | _7.562_ | **_-2.4% (超 RCCL)_** | D' steady state projection (Entry 10) — **invalidated by Entry 11 correctness fail** |
 | 2026-04-22 | — | — | — | D' Step 2 **REVERTED** (Entry 11): PyTorch caching allocator incompatible with `hipIpcOpenMemHandle` semantics; direction closed pending shmem refactor |
+| 2026-04-22 | 7.789 | 7.582 | **+2.7%** | Entry 14 baseline (τ=ξ=off). Both τ and ξ failed; reverted |
 
 **Target**: SDMA copy ≤ RCCL (gap ≤ 0). Currently outstanding.
