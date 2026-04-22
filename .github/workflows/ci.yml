@@ -56,7 +56,8 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          $CT exec $CONTAINER chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
+          $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE $BASE_IMAGE \
+              chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
           $CT rm -f $CONTAINER || true
 
   intranode-test:
@@ -199,7 +200,8 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          $CT exec $CONTAINER chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
+          $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE $IMAGE \
+              chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
           $CT rm -f $CONTAINER || true
 
   jax-intranode-test:
@@ -256,7 +258,10 @@ jobs:
 
       - name: Cleanup
         if: always()
-        run: $CT rm -f ${CONTAINER}_jax || true
+        run: |
+          $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE rocm/mori:jax-ci \
+              chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
+          $CT rm -f ${CONTAINER}_jax || true
 
   internode-test:
     name: mori internode test (${{ matrix.platform }})
