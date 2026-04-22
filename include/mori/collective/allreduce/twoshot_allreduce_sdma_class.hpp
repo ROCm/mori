@@ -115,24 +115,17 @@ class AllreduceSdma {
   bool copy_timing_recorded_ = false;  // indicates events were submitted
 
   // ---------------------------------------------------------------------
-  // Post-AG in-kernel copy prototype (E' path).
-  // When post_ag_wait_enabled_ is true, the AR kernel receives a per-chunk
-  // device flag array (size = kMaxPostAgChunks, reset to 0 before each
-  // launch) plus the user's output tensor pointer. Block 0 sets
-  // post_ag_flag[c] = 1 when chunk c's AG completes on all peers;
-  // compute blocks wait on each flag[c] in turn and copy the chunk's
-  // transit region to the user output buffer in-kernel. This overlaps
-  // chunk c's CU-side copy with block 0's wait on chunk c+1's AG,
-  // eliminating the external hipMemcpyAsync in copy_output_to_user().
-  //
-  // Stage 2b: adds per-chunk flag + in-kernel copy to Stage 1's
-  // spin-wait; kernel wall becomes max(AG wait + last chunk's CU copy).
-  // When enabled AND copy_output_to_user_ is true, host skips the
-  // external hipMemcpyAsync at pipelined() exit.
+  // Post-AG wait prototype (Stage 1 of E' — in-kernel post-AG CU copy).
+  // When post_ag_wait_enabled_ is true, kernel launches are given a device
+  // uint32 flag buffer. Compute blocks wait on this flag after their
+  // reduce phase (instead of exiting early); block 0 sets the flag once
+  // AG wait completes. Stage 1 does NOT do any copy yet — it only measures
+  // how much "compute blocks stay alive during AG wait" costs in terms of
+  // wall time and GEMM interference. If the cost is acceptable, Stage 2
+  // adds the in-kernel transit→user_output copy inside the post-AG phase.
   // ---------------------------------------------------------------------
   bool post_ag_wait_enabled_ = false;
-  static constexpr int kMaxPostAgChunks = 32;
-  uint32_t* post_ag_flag_d_ = nullptr;  // device array of kMaxPostAgChunks uint32
+  uint32_t* post_ag_flag_d_ = nullptr;  // device uint32, reset to 0 each call
 
   AllreduceSdma(const AllreduceSdma&) = delete;
   AllreduceSdma& operator=(const AllreduceSdma&) = delete;

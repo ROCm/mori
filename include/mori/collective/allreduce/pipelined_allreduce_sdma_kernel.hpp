@@ -164,17 +164,12 @@ __global__ void PipelinedAllReduceSdmaKernel(
     uint64_t agBase,
     uint64_t reduceCompleteBase,
     uint64_t* phase_ts,
-    uint32_t* post_ag_flag /* nullptr = old behavior; non-null =
-                              per-chunk flag array (size >= numChunks).
-                              Block 0 sets post_ag_flag[c] = 1 after
-                              chunk c's AG wait completes. Compute
-                              blocks may use this to start in-kernel
-                              copy of chunk c while block 0 is still
-                              waiting for later chunks' AG. */,
-    T* output_user /* Stage 2b-1: when non-null AND post_ag_flag non-null,
-                      compute blocks copy transit → output_user per-chunk
-                      after flag[c] is set, eliminating the external
-                      hipMemcpyAsync in copy_output_to_user. */ ) {
+    uint32_t* post_ag_flag /* nullptr = old behavior; non-null = Stage 1 E'
+                              prototype: compute blocks stay alive after
+                              reduce until block 0 sets this flag (after AG
+                              wait done). Used to measure how much CU
+                              occupancy during AG wait costs the overlap
+                              benchmark (GEMM variability, wall time). */ ) {
 
   ar_write_phase_ts(phase_ts, 0);  // phase 0: kernel entry
 
@@ -340,53 +335,21 @@ __global__ void PipelinedAllReduceSdmaKernel(
                                __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
       }
 
-      // ---- Stage 2b-1: per-chunk post-AG copy from transit to user
-      // output. Compute blocks loop through chunks; for each chunk c we
-      // wait for post_ag_flag[c] to be set by block 0 (chunk c's AG
-      // completed on all peers), then copy the chunk's transit region
-      // (npes shards × chunkPerRank elements) to the user output buffer.
-      // Chunk c's copy overlaps with block 0 waiting for chunk c+1's
-      // AG, so the last chunk's copy is the only one that extends the
-      // kernel wall beyond the AG-wait critical path. ----------------
-      if (post_ag_flag != nullptr && output_user != nullptr) {
-        const T* __restrict__ transit_T =
-            reinterpret_cast<const T*>(dstMemObj->localPtr);
-        T* __restrict__ out_T = output_user;
-
-        const size_t chunkElemsPerRank_T = chunkPerRank;  // elements per pe-slot per chunk
-        const size_t elemPerRank_T = elementCountPerRank;  // full pe-slot size
-
-        for (int c = 0; c < numChunks; c++) {
-          if (threadIdx.x == 0) {
-            while (__hip_atomic_load(
-                       &post_ag_flag[c],
-                       __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) == 0u) {
-              __builtin_amdgcn_s_sleep(2);
-            }
+      // ---- Stage 1 E' prototype: compute blocks wait for block 0's AG
+      // wait to complete (do not exit CU early). This measures the cost
+      // of compute blocks staying alive during AG wait; no copy is done
+      // here yet (that comes in Stage 2 once this cost is confirmed
+      // acceptable via real wall measurement). ----------------------
+      if (post_ag_flag != nullptr) {
+        if (threadIdx.x == 0) {
+          while (__hip_atomic_load(
+                     post_ag_flag,
+                     __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) == 0u) {
+            __builtin_amdgcn_s_sleep(2);
           }
-          __syncthreads();
-          if (c == 0) {
-            ar_write_phase_ts_cb1(phase_ts, 31);  // first chunk flag observed
-          }
-
-          // Copy chunk c: for each pe-slot, copy [c*chunkElemsPerRank_T,
-          // c*chunkElemsPerRank_T + chunkElemsPerRank_T) to user_output
-          // at the same offset.
-          const size_t inner_off = static_cast<size_t>(c) * chunkElemsPerRank_T;
-          const size_t c_elements_total =
-              static_cast<size_t>(npes) * chunkElemsPerRank_T;
-
-          for (size_t k = compTid; k < c_elements_total; k += compStride) {
-            const size_t pe_i = k / chunkElemsPerRank_T;
-            const size_t inner = k % chunkElemsPerRank_T;
-            const size_t inner_abs = inner_off + inner;
-            if (inner_abs >= elemPerRank_T) continue;  // tail
-            const size_t idx = pe_i * elemPerRank_T + inner_abs;
-            if (idx >= elementCount) continue;         // overall tail
-            out_T[idx] = transit_T[idx];
-          }
-          __syncthreads();
         }
+        __syncthreads();
+        ar_write_phase_ts_cb1(phase_ts, 31);  // post_ag_flag observed
       }
 
       ar_write_phase_ts_cb1(phase_ts, 11 + 3 * numChunks);  // compute block exit
@@ -500,10 +463,18 @@ __global__ void PipelinedAllReduceSdmaKernel(
           ar_write_phase_ts(phase_ts, 2 + 3 * c + 2);  // chunk c: AG submit done
         }
 
-        // Stage 2b-0/1: per-chunk AG wait + per-chunk flag set. After
-        // chunk c's AG completes, release compute blocks waiting on
-        // flag[c] so they can start copying chunk c while block 0 still
-        // waits for later chunks' AG.
+        // Stage 2b-0: per-chunk AG wait. Instead of waiting for all chunks
+        // to land in a single loop, wait chunk-by-chunk so we can know the
+        // exact completion time of each chunk. This is the foundation for
+        // Stage 2b-1 (compute-block per-chunk in-kernel copy).
+        //
+        // Kernel wall impact: each extra chunk adds one __syncthreads() plus
+        // its own sleep/poll loop. Should be on the order of tens of us;
+        // if this pushes kernel wall up significantly (>0.1 ms), it
+        // reproduces the Path B failure mode and we must revert.
+        //
+        // Per-chunk timestamps are written to slot 20+c (c=0..numChunks-1)
+        // for Stage 2b-0b analysis of AG completion timing distribution.
         for (int c = 0; c < numChunks; c++) {
           if (thr < npes && thr != myPe) {
             const int sender = thr;
@@ -518,17 +489,16 @@ __global__ void PipelinedAllReduceSdmaKernel(
           if (phase_ts != nullptr && threadIdx.x == 0 && (20 + c) < kArPhaseTsCapacity) {
             phase_ts[20 + c] = __builtin_amdgcn_s_memtime();  // chunk c AG done
           }
-          // Stage 2b-1: set per-chunk post_ag_flag to release compute
-          // blocks that are waiting to copy this chunk.
-          if (post_ag_flag != nullptr && threadIdx.x == 0) {
-            __threadfence();
-            __hip_atomic_store(&post_ag_flag[c], 1u,
-                               __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
-          }
         }
         ar_write_phase_ts(phase_ts, 2 + 3 * numChunks);  // AG wait done (all peers)
-        if (phase_ts != nullptr && threadIdx.x == 0) {
-          phase_ts[30] = __builtin_amdgcn_s_memtime();  // all flags set
+
+        // Stage 1 E' prototype: release compute blocks that were
+        // spin-waiting post-reduce.
+        if (post_ag_flag != nullptr && threadIdx.x == 0) {
+          __threadfence();
+          __hip_atomic_store(post_ag_flag, 1u,
+                             __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+          ar_write_phase_ts(phase_ts, 30);  // post_ag_flag set
         }
       } else {
         // Single-chunk AG. Same barrier requirement as MULTI_CHUNK.
@@ -585,13 +555,12 @@ __global__ void PipelinedAllReduceSdmaKernel(
         }
         ar_write_phase_ts(phase_ts, 5);  // AG wait done (single-chunk, numChunks=1)
 
-        // Stage 2b-1 (single-chunk path): set flag[0] so compute blocks
-        // can copy chunk 0 (= whole transit) to user output.
+        // Stage 1 E' prototype (single-chunk path).
         if (post_ag_flag != nullptr && threadIdx.x == 0) {
           __threadfence();
-          __hip_atomic_store(&post_ag_flag[0], 1u,
+          __hip_atomic_store(post_ag_flag, 1u,
                              __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
-          ar_write_phase_ts(phase_ts, 30);  // post_ag_flag[0] set
+          ar_write_phase_ts(phase_ts, 30);  // post_ag_flag set
         }
       }
 
