@@ -395,6 +395,28 @@ std::optional<AllocateResult> ClientRegistry::AllocateForPut(const std::string& 
     auto alloc = allocator.Allocate(num_pages);
     if (!alloc) return std::nullopt;
 
+    // Post-allocation invariant guard: these conditions MUST hold for any
+    // correct PageBitmapAllocator implementation (page_size is fixed > 0 at
+    // construction; Allocate(num_pages>0) succeeds iff it returns exactly
+    // num_pages slots; PagesForSize is the same round-up formula as
+    // SizeMatchesAllocation).  Kept as a defensive fail-fast so a future
+    // allocator regression surfaces here with a clear ERROR instead of
+    // bubbling up to the Client as a silent malformed RoutePut response.
+    //
+    // On violation: free the just-allocated pages and return nullopt (no
+    // pending created, no allocation_id consumed).
+    const uint64_t page_size = allocator.PageSize();
+    if (page_size == 0 || alloc->pages.empty() ||
+        !SizeMatchesAllocation(size, alloc->pages.size(), page_size)) {
+      MORI_UMBP_ERROR(
+          "[Registry] AllocateForPut invariant violated: node={} tier={} size={} "
+          "num_pages={} page_size={} (PageBitmapAllocator returned inconsistent result)",
+          node_id, TierTypeName(tier), size, alloc->pages.size(), page_size);
+      allocator.Deallocate(alloc->pages);
+      UpdateAvailableBytesLocked(record, tier);
+      return std::nullopt;
+    }
+
     UpdateAvailableBytesLocked(record, tier);
 
     AllocateResult result;
@@ -403,7 +425,7 @@ std::optional<AllocateResult> ClientRegistry::AllocateForPut(const std::string& 
     result.engine_desc_bytes = record.engine_desc_bytes;
     result.location_id = alloc->location_id;
     result.pages = alloc->pages;
-    result.page_size = allocator.PageSize();
+    result.page_size = page_size;
 
     // Build the deduplicated descriptor list for every distinct buffer_index
     // referenced in `pages`.  Map keeps it sorted ascending for free.
@@ -492,6 +514,14 @@ void ClientRegistry::DeallocateForUnregister(const std::string& node_id, const L
   }
 }
 
+// Contract: on tier/size/location_id mismatch, master auto-rolls back the
+// pending allocation and returns false.  The allocation_id is then dead:
+// subsequent FinalizeAllocation calls with the same id see
+// pending-not-found + no finalized record, and return false.  Client
+// callers must route/allocate afresh rather than retrying the same id.
+// On ALL false paths, the Client does NOT need to send AbortAllocation:
+// either master already cleaned up the pending itself (mismatch paths),
+// or there never was a pending owned by this node_id to clean up.
 bool ClientRegistry::FinalizeAllocation(const std::string& node_id, const std::string& key,
                                         const Location& location,
                                         const std::string& allocation_id) {
@@ -531,18 +561,28 @@ bool ClientRegistry::FinalizeAllocation(const std::string& node_id, const std::s
       return false;
     }
     const auto& pa = pending_it->second;
+    // On any of the three field-level mismatches below, master auto-rolls
+    // back the pending: the Client cannot successfully finalize this
+    // allocation_id ever again (parameters are wrong), so there is no point
+    // waiting for TTL to reap it.  Client therefore does NOT need to send a
+    // follow-up AbortAllocation RPC.  Once this allocation_id hits a
+    // mismatch, it is permanently dead -- caller must re-route/re-allocate.
     if (location.tier != pa.tier) {
       MORI_UMBP_ERROR(
           "[Registry] FinalizeAllocation: tier mismatch for allocation '{}': "
-          "expected={}, got={}",
+          "expected={}, got={} (auto-rolling back pending)",
           allocation_id, TierTypeName(pa.tier), TierTypeName(location.tier));
+      DeallocatePendingLocked(pa);
+      pending_allocations_.erase(pending_it);
       return false;
     }
     if (location.size != pa.size) {
       MORI_UMBP_ERROR(
           "[Registry] FinalizeAllocation: size mismatch for allocation '{}': "
-          "expected={}, got={}",
+          "expected={}, got={} (auto-rolling back pending)",
           allocation_id, pa.size, location.size);
+      DeallocatePendingLocked(pa);
+      pending_allocations_.erase(pending_it);
       return false;
     }
     if (IsDramOrHbm(pa.tier)) {
@@ -552,8 +592,10 @@ bool ClientRegistry::FinalizeAllocation(const std::string& node_id, const std::s
       if (location.location_id != pa.location_id) {
         MORI_UMBP_ERROR(
             "[Registry] FinalizeAllocation: location_id mismatch for allocation '{}': "
-            "expected='{}', got='{}'",
+            "expected='{}', got='{}' (auto-rolling back pending)",
             allocation_id, pa.location_id, location.location_id);
+        DeallocatePendingLocked(pa);
+        pending_allocations_.erase(pending_it);
         return false;
       }
     }
@@ -612,9 +654,19 @@ bool ClientRegistry::AbortAllocation(const std::string& node_id, const std::stri
   std::unique_lock lock(mutex_);
   auto pending_it = pending_allocations_.find(allocation_id);
   if (pending_it == pending_allocations_.end()) {
+    // Normal race: reaper TTL, concurrent FinalizeAllocation mismatch-
+    // rollback, or a duplicate Abort RPC all reach here.  Not an error.
+    MORI_UMBP_DEBUG(
+        "[Registry] AbortAllocation: allocation '{}' not found (already reaped/finalized/aborted)",
+        allocation_id);
     return false;
   }
   if (pending_it->second.node_id != node_id) {
+    // Protocol violation: caller is asking to roll back another node's
+    // allocation.  Refuse and surface for the operator.
+    MORI_UMBP_WARN(
+        "[Registry] AbortAllocation: node_id mismatch for allocation '{}': pending={}, request={}",
+        allocation_id, pending_it->second.node_id, node_id);
     return false;
   }
 
