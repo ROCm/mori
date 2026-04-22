@@ -231,15 +231,60 @@ Summarized here for quick lookup; exact commits in git log:
 
 ---
 
-## Entry 10 — (placeholder for D' results once measured)
-- **Date**: TBD
-- **Commit**: `df3b1ec0` (D' Step 1 instrumentation) + `9b77c0b4` (register cost test)
-- **Scenario**: `python3 tests/python/ccl/test_register_cost.py` (8-rank, measures first-register cost + cache hit cost)
-- **Numbers**: TBD
-- **Decision gates (a priori)**:
-  - If register cost <500 us at 256 MB → cheap, cache always wins at steady state
-  - If 500-2000 us → benchmark warmup absorbs, OK
-  - If >2000 us → may not fit benchmark's warmup=20 budget; evaluate fallback
+## Entry 10 — D' Step 1 measured: ShmemSymmetricRegister host us cost
+- **Date**: 2026-04-22
+- **Commits**: `df3b1ec0` (API + LRU cache), `9b77c0b4` (cost test),
+  `aa857af9` (test dist init fix)
+- **Scenario**: `python3 tests/python/ccl/test_register_cost.py` (8-rank, measures
+  first-register cost vs cache-hit cost for 5 sizes 1→256 MB)
+- **Numbers** (C++ chrono around `shmem::ShmemSymmetricRegister`):
+
+  | size (MB) | MISS (us) | HIT (us) |
+  |---|---|---|
+  | 1   | 1068.1 | 0.0 |
+  | 16  |  940.1 | 0.0 |
+  | 64  | 1037.6 | 0.0 |
+  | 128 | 1264.3 | 0.0 |
+  | 256 | 1276.1 | 0.0 |
+  | avg | **~1120** | **0** |
+
+- **Mechanism observations**:
+  - Register cost is **essentially size-independent** (940→1276 us across
+    256× size range). Dominated by the 3× `bootNet.Allgather` collective
+    overhead (pointers, IPC handles, rkeys) + `hipIpcOpenMemHandle` × N peers.
+  - Cache hit is **truly free** (0 us C++ chrono; 1.7 us python-level
+    wall = Python dispatch overhead only).
+
+- **Decision gates (a priori, from Entry 10 preamble)**:
+  - <500 us → cheap. **Missed this gate** (actual ~1100 us).
+  - 500-2000 us → benchmark warmup can absorb. **Hit this gate** ✅.
+  - >2000 us → may not fit. **Not triggered**.
+
+- **Gain/gap analysis (per R8, referencing R9 ledger)**:
+  - Target gap = 0.196 ms (Entry 2: 3-run RCCL stable gap)
+  - Copy exposure reclaimable = 0.392 ms (Entry 1: copy wall − no-copy wall)
+  - Break-even N_iters = register_cost_ms / copy_exposure_ms
+    = 1.12 / 0.392 ≈ **3 iters** to pay back one register
+  - benchmark's `--warmup 20` easily absorbs this in warmup phase
+  - Steady state (post-warmup): cache hit, zero register overhead, gain ≈ 0.4 ms
+
+- **D' projected wall** (steady state, referencing Entry 2):
+  - stream_ar runs AR kernel directly writing user output (no transit copy)
+  - wall ≈ no-copy wall = **7.381 ms**
+  - vs RCCL median 7.562 ms = **超 0.181 ms (-2.4%)** ✅ meets primary goal
+
+- **Conclusion**: Step 1 validates D' is viable for benchmark-style
+  workloads (stable output ptr + warmup). **Decision: proceed to Step 2**
+  (change AR kernel destination from transit to user_output_symm when
+  cache hit; host skips `copy_output_to_user`).
+
+- **Known risk for real user workloads**:
+  - If user allocates a fresh output tensor every call AND cache evicts it,
+    cost is +1.1 ms per AR call, which exceeds the saved 0.4 ms → net loss.
+  - Mitigation: (a) cache size 4 handles most pytorch-caching-allocator
+    reuse; (b) Step 2 implementation will include fallback (if register
+    fails OR cache miss + would-exceed-cap, fall through to baseline
+    transit+copy path, no regression vs current).
 
 ---
 
@@ -252,5 +297,6 @@ Summarized here for quick lookup; exact commits in git log:
 | 2026-04-22 | 7.744 | 7.672 | +0.9% | CU=220 (optimal); gap dominated by RCCL run noise |
 | 2026-04-22 | 8.940 | 7.424 | **+20.4% (WORSE)** | Stage 2b-1 catastrophic, reverted |
 | 2026-04-22 | 7.765 | 7.433 | +4.5% | Stage 2b-0 clean, baseline restored |
+| 2026-04-22 | _projected 7.381_ | _7.562_ | **_-2.4% (超 RCCL)_** | D' steady state projection (Entry 10) — pending Step 2 impl |
 
 **Target**: SDMA copy ≤ RCCL (gap ≤ 0). Currently outstanding.
