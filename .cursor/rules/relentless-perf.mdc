@@ -271,6 +271,58 @@ git -C "$REPO" status --short || true
 | 空输出 OFF 段才发现 pip install 失败 | preflight 在 pip 之前 exit 1 了 |
 | 跨轮对话默认用户环境没变 | 每个 shell block 都自带 preflight，不靠记忆
 
+### R13. `set -e` / `exit` 必须隔离在 subshell / here-doc，不得污染用户的交互 session
+
+**背景事故（本会话）**：R11 v3 教用户在交互 shell 顶层 `set -euo pipefail`，
+然后跟一串 `command -v cmake || exit 1` / `command -v hipcc || exit 1`。
+hipcc 找不到 → `exit 1` 直接把用户**登录的 bash session 杀了**；在容器里等价于
+**退出容器**。用户还以为是我命令写错。
+
+**硬性要求**：凡是给用户粘贴的 "preflight + 多步跑" 类 shell block，
+必须满足以下**至少一种**隔离方式：
+
+1. **Here-doc 到 `bash`（首选）**：
+   ```bash
+   bash <<'RUN_ALL'
+   set -euo pipefail
+   ... preflight ...
+   ... build ...
+   ... run + tee ...
+   ... awk/grep 打印对比表 ...
+   RUN_ALL
+   ```
+   优点：单次 copy-paste 不破坏用户 session；bash 子进程失败只影响它自己。
+
+2. **命令组 `(...)` subshell**：
+   ```bash
+   (
+     set -euo pipefail
+     ... 全部步骤 ...
+   )
+   ```
+   注意：**不要**写成 `{ ...; }` 复合命令（那是当前 shell，`exit` 会退 session）。
+
+3. **写成 `.sh` 文件后 `bash script.sh`**：
+   适合步骤 > 20 行的大脚本，可复用。
+
+**禁止**：
+- ❌ 在**粘贴给用户的顶层**直接写 `set -e` / `exit 1`（会杀用户 shell）
+- ❌ 用 `{ ...; }` 冒充 subshell（**不是** subshell）
+- ❌ `|| exit 1` 在用户交互 shell 里出现 —— 必须 `|| { echo ...; return 1; }`
+  放在函数 / subshell 内部
+
+**反模式**：
+| ❌ 错误 | ✅ 正确 |
+|--------|--------|
+| `set -e; command -v cmake \|\| exit 1` 贴到用户 shell 顶层 | `bash <<'EOF' … EOF` 包起来 |
+| `{ set -e; pip install...; }` | `( set -e; pip install...; )` 或 here-doc |
+| "如果哪步挂了，重开终端"（已经晚了） | 一开始就 subshell 隔离，不挂 session |
+
+**self-check before sending shell block**：
+- [ ] 我这段脚本里是否有 `set -e` / `exit N`？
+- [ ] 如果有，顶层是否已被 `bash <<'EOF' ... EOF` 或 `( ... )` 包起来？
+- [ ] 如果 preflight 的某个 `command -v` 失败，用户的 shell/容器会不会退？
+
 ## 工作流模板（每轮都走这个）
 
 ```
