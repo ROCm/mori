@@ -12,7 +12,7 @@ env:
   IMAGE: rocm/mori:ci
   BASE_IMAGE: rocm/pytorch:rocm7.2.1_ubuntu24.04_py3.12_pytorch_release_2.8.0
   CONTAINER: mori_ci_${{ github.run_id }}
-  CT: ${{ vars.CONTAINER_RUNTIME || 'podman' }}
+  CT: docker
 
 jobs:
   build:
@@ -23,7 +23,7 @@ jobs:
       matrix:
         include:
           - platform: MI355X_AINIC
-            runner: [self-hosted, MI355X-AINIC]
+            runner: [self-hosted, MI355X-AINIC-TW]
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -56,7 +56,8 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          $CT exec $CONTAINER chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
+          $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE $BASE_IMAGE \
+              chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
           $CT rm -f $CONTAINER || true
 
   intranode-test:
@@ -68,8 +69,14 @@ jobs:
       matrix:
         include:
           - platform: MI355X_AINIC
-            runner: [self-hosted, MI355X-AINIC]
-            rdma_devices: rocep105s0,rocep121s0,rocep137s0,rocep153s0,rocep233s0,rocep249s0,rocep25s0,rocep9s0
+            runner: [self-hosted, MI355X-AINIC-TW]
+            rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
+            rdma_sl: 3
+            rdma_tc: 104
+    env:
+      MORI_RDMA_DEVICES: ${{ matrix.rdma_devices }}
+      MORI_RDMA_SL: ${{ matrix.rdma_sl }}
+      MORI_RDMA_TC: ${{ matrix.rdma_tc }}
     timeout-minutes: 45
     steps:
       - name: Checkout
@@ -84,7 +91,9 @@ jobs:
         run: |
           $CT rm -f $CONTAINER 2>/dev/null || true
           CONTAINER_RUNTIME=$CT ./docker/ci_run.sh --name $CONTAINER \
-            -e MORI_RDMA_DEVICES=${{ matrix.rdma_devices }} \
+            -e MORI_RDMA_DEVICES=$MORI_RDMA_DEVICES \
+            -e MORI_RDMA_SL=$MORI_RDMA_SL \
+            -e MORI_RDMA_TC=$MORI_RDMA_TC \
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
             -w $GITHUB_WORKSPACE \
             $IMAGE sleep infinity
@@ -121,9 +130,14 @@ jobs:
             timeout 120 python3 tests/python/ops/bench_dispatch_combine.py
           "
 
-      # MORI-IO: skipped on MI355X-AINIC — intra-node cross-NIC RDMA loopback
-      # is blocked by rail-optimized source routing. Covered by internode-test.
-      # - name: MORI-IO
+      - name: MORI-IO
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE
+            timeout 60 pytest tests/python/io/ -v
+            MORI_IO_XGMI_SCATTER_GATHER_THRESHOLD=4 \
+              timeout 120 pytest tests/python/io/test_discrete_buffer.py -v -k 'not performance'
+          "
 
       - name: MORI-IR
         run: |
@@ -131,7 +145,7 @@ jobs:
             cd $GITHUB_WORKSPACE
             timeout 60 torchrun --nproc_per_node=2 examples/shmem/ir/test_triton_shmem.py
             timeout 60 torchrun --nproc_per_node=8 examples/shmem/ir/test_triton_allreduce.py
-            # MORI_DISABLE_P2P=ON skipped: intra-node RDMA blocked by rail-optimized source routing
+            MORI_DISABLE_P2P=ON timeout 60 torchrun --nproc_per_node=8 examples/shmem/ir/test_triton_allreduce.py
           "
 
       - name: MORI-CPP shmem (P2P)
@@ -140,14 +154,23 @@ jobs:
             cd $GITHUB_WORKSPACE
             timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_put_thread
             timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_get_thread
+            timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_put_imm_thread
             timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_put_signal_thread
             timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/atomic_nonfetch_thread
             timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/atomic_fetch_thread
           "
 
-      # MORI-CPP shmem (IBGDA): skipped on MI355X-AINIC — IBGDA path requires
-      # intra-node cross-NIC RDMA which is blocked by rail-optimized source routing.
-      # - name: MORI-CPP shmem (IBGDA)
+      - name: MORI-CPP shmem (IBGDA)
+        run: |
+          $CT exec $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE
+            MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_put_thread
+            MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_get_thread
+            MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_put_imm_thread
+            MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_put_signal_thread
+            MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/atomic_nonfetch_thread
+            MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/atomic_fetch_thread
+          "
 
       - name: MORI-CCL/shmem
         run: |
@@ -177,7 +200,8 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          $CT exec $CONTAINER chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
+          $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE $IMAGE \
+              chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
           $CT rm -f $CONTAINER || true
 
   jax-intranode-test:
@@ -189,8 +213,8 @@ jobs:
       matrix:
         include:
           - platform: MI355X_AINIC
-            runner: [self-hosted, MI355X-AINIC]
-            rdma_devices: rocep105s0,rocep121s0,rocep137s0,rocep153s0,rocep233s0,rocep249s0,rocep25s0,rocep9s0
+            runner: [self-hosted, MI355X-AINIC-TW]
+            rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
     timeout-minutes: 90
     steps:
       - name: Checkout
@@ -216,6 +240,8 @@ jobs:
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
             -w $GITHUB_WORKSPACE \
             rocm/mori:jax-ci sleep infinity
+          $CT exec ${CONTAINER}_jax \
+            git config --global --add safe.directory $GITHUB_WORKSPACE
 
       - name: Install mori (XLA FFI)
         run: |
@@ -232,11 +258,14 @@ jobs:
 
       - name: Cleanup
         if: always()
-        run: $CT rm -f ${CONTAINER}_jax || true
+        run: |
+          $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE rocm/mori:jax-ci \
+              chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
+          $CT rm -f ${CONTAINER}_jax || true
 
   internode-test:
     name: mori internode test (${{ matrix.platform }})
-    needs: [build, intranode-test]
+    needs: build
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -253,6 +282,7 @@ jobs:
             rdma_sl: 3
             rdma_tc: 104
     env:
+      CT: podman  # internode runners (MI355X-AINIC) only have podman
       NODE1_HOST: ${{ matrix.node1_host }}
       NODE2_HOST: ${{ matrix.node2_host }}
       NODE2_PORT: ${{ matrix.node2_port }}
