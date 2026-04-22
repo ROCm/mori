@@ -187,16 +187,35 @@ median, 3-run spread RCCL ±0.12 ms).
   - barrier→AG-submit (×2): +0.419
   - AG-submit→AG-wait-done: +0.539
   - block 0 total: +1.643 (every phase slowed, not concentrated)
-  - compute block `c1-reduce-done→cb-exit`: **0.007 → 7.764 ms** (scaling anomaly, likely timestamp-vs-event mismatch)
+  - compute block `c1-reduce-done→cb-exit`: **0.007 → 7.764 ms** (scaling anomaly,
+    block 0 exit cycle much earlier than compute block exit, cy_to_ms mis-scaling)
+- **AR[2] Phase (Stage 2b-1 ON) vs no-copy baseline**:
+  - total: 1.189 → **1.412 ms** (+0.218, copy barely hidden)
+  - AG-submit→AG-wait-done: 1.029 → 1.140 (+0.111, slightly throttled)
+  - compute block `c1-reduce-done→cb-exit`: 0.001 → **1.655 ms**
+    (compute block does spin+copy here; ~0.5 ms per-chunk copy × 2 + sync)
+  - Block 1 total: 0.136 → 1.831 (+1.695)
+- **Critical comparison AR[0] vs AR[2] in ON mode**:
+  - AR[0] cb-exit phase: 7.764 ms
+  - AR[2] cb-exit phase: 1.655 ms
+  - delta **6.1 ms** purely explained by GEMM[1] CU contention with
+    AR[0]'s compute blocks doing HBM-heavy in-kernel copy
 - **Mechanism**:
   - Compute blocks doing simultaneous reduce-HBM-read + copy-HBM-read+write
-    saturates HBM bandwidth
+    saturates HBM bandwidth within the kernel
   - Block 0's SDMA submit/poll is also HBM-serving → gets throttled
+  - When AR[s] also has to share CU with GEMM[s+1] (AR[0]/AR[1] case),
+    the effect is **compounded** — CU-contention × HBM-contention ×
+    cold-path all pile up
   - HBM saturation **propagates to every phase of the AR kernel**, not just copy
 - **Conclusion**: **In-kernel per-chunk copy is architecturally infeasible
-  on MI355X**. The simultaneous HBM pressure from compute-reduce + copy
-  inside the same kernel collapses AR kernel throughput. Any future in-kernel
-  copy attempt will hit the same wall — direction **E' closed**.
+  on MI355X** when same kernel does HBM-heavy reduce AND HBM-heavy copy.
+  Any future in-kernel copy direction must either:
+  - (a) ensure copy does not coincide with reduce HBM usage (e.g., copy only
+    after reduce is fully idle, which equals just serializing → no gain), or
+  - (b) use an engine other than CU for the local copy (SDMA-local is 50× slower
+    per Entry 9; no other DMA engine currently available)
+  Direction **E' (in-kernel copy) closed** on this hardware.
 
 ---
 
