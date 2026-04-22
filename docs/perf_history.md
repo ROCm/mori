@@ -361,6 +361,42 @@ Summarized here for quick lookup; exact commits in git log:
 
 ---
 
+## Entry 12 — Per-chunk AG timing proves single SDMA queue is strictly FIFO (not pipelined)
+- **Date**: 2026-04-22
+- **Commit**: `d56bbe29` (per-chunk AG-done display), data from AR[2] warm path
+- **Scenario**: `MORI_PIPELINE_CU=220 MORI_PHASE_TARGET_STAGE=2 --num-stages 4 --elems 67108864 --ar-phase-timing`
+- **Numbers** (AR[2], SDMA copy mode, warm / no GEMM contention):
+  - `c0:AG-submit→AG-done (per-chunk)`:  **0.591 ms**
+  - `c1:AG-submit→AG-done (per-chunk)`:  **1.098 ms**
+  - `AG-submit→AG-wait-done` (total):    **1.098 ms**
+  - Submit delta (c0 → c1 submit): only 0.078 ms apart
+- **Analysis**:
+  - c1 completion is 0.507 ms later than c0 completion
+  - 0.507 ms ≈ 1 chunk's physical transfer time — exactly what single-queue
+    FIFO serial execution predicts
+  - If a single queue **saturated HBM bandwidth with pipelined transfers**,
+    c0 and c1 would complete ~simultaneously (c1_done ≈ c0_done ≈ 0.6ms).
+    Data **decisively refutes** that hypothesis.
+  - SDMA hardware architecture: each queue = one DMA channel; within a
+    queue ops are strictly FIFO (no per-channel pipelining); to parallelize
+    chunks one must use **multiple queues** (i.e. multiple channels).
+- **Conclusion**: **Direction θ (multi-qId AG) has real gain potential**.
+  - Expected per-chunk AG time going from 0.591+0.591=1.098 ms
+    serialized → max(0.591, 0.591)=0.591 ms parallel (two queues)
+  - Save ≈ 0.5 ms per AR kernel's AG wait phase
+  - Per Entry 4, AR[0] AG wait is 0.614 ms (cold path); splitting two
+    chunks over two queues would roughly halve that too (0.3 ms per chunk)
+  - Gap=0.196 ms. Gain (conservative 0.3 ms / optimistic 0.8 ms) / gap =
+    1.5× – 4×. **Satisfies R8**.
+- **Implementation plan (Step 2)**:
+  - MULTI_CHUNK AG: chunk c uses `qId = 1 + (c % (numQ - 1))`
+    (so c0→qId=1, c1→qId=2; numQ ≥ 3 required)
+  - AG wait: per-chunk wait on peer's `signalPtrs[peer*numQ + qId_of_chunk]`
+  - scatter stays on qId=0 (unchanged)
+  - Verify `dstMemObj->sdmaNumQueue >= 3` (default 8 per `anvil::GetSdmaNumChannels`)
+
+---
+
 ## Running gap-to-target tally
 
 | date | best SDMA copy wall | RCCL median | gap | notes |
