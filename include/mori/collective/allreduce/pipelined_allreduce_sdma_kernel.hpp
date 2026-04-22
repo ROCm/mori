@@ -397,12 +397,13 @@ __global__ void PipelinedAllReduceSdmaKernel(
 
             const size_t peerOffset =
                 static_cast<size_t>(peer) * totalShardBytes;
+            // peerPtrs is uintptr_t[], localPtr is void*; normalize to
+            // uintptr_t base then cast to uint8_t* with offset.
+            const uintptr_t srcBaseAddr = (peer == myPe)
+                ? reinterpret_cast<uintptr_t>(dstMemObj->localPtr)
+                : dstMemObj->peerPtrs[peer];
             const uint8_t* srcBase =
-                reinterpret_cast<const uint8_t*>(
-                    (peer == myPe)
-                        ? dstMemObj->localPtr          // local read for myPe
-                        : dstMemObj->peerPtrs[peer])   // XGMI read for others
-                + peerOffset;
+                reinterpret_cast<const uint8_t*>(srcBaseAddr) + peerOffset;
             uint8_t* dstBase =
                 reinterpret_cast<uint8_t*>(user_output_direct) + peerOffset;
 
