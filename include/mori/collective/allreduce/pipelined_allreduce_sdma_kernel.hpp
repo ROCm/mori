@@ -169,7 +169,21 @@ __global__ void PipelinedAllReduceSdmaKernel(
                               reduce until block 0 sets this flag (after AG
                               wait done). Used to measure how much CU
                               occupancy during AG wait costs the overlap
-                              benchmark (GEMM variability, wall time). */ ) {
+                              benchmark (GEMM variability, wall time). */,
+    void* user_output_for_copy = nullptr /* E'' direction (perf_history
+                                            Entry 17): when non-null AND
+                                            MULTI_CHUNK, compute blocks
+                                            copy `transit[peer_shard] →
+                                            user_output[peer_shard]` for
+                                            each peer as soon as that
+                                            peer's AG signal arrives. The
+                                            copies run in parallel with
+                                            block 0's AG wait, hiding the
+                                            external hipMemcpyAsync cost.
+                                            Caller MUST skip the external
+                                            copy when passing a non-null
+                                            pointer (class-side gated by
+                                            inkernel_copy_enabled_). */ ) {
 
   ar_write_phase_ts(phase_ts, 0);  // phase 0: kernel entry
 
@@ -335,21 +349,126 @@ __global__ void PipelinedAllReduceSdmaKernel(
                                __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
       }
 
-      // ---- Stage 1 E' prototype: compute blocks wait for block 0's AG
-      // wait to complete (do not exit CU early). This measures the cost
-      // of compute blocks staying alive during AG wait; no copy is done
-      // here yet (that comes in Stage 2 once this cost is confirmed
-      // acceptable via real wall measurement).
+      // ---- E'' in-kernel copy (perf_history Entry 17) ----------------
+      // When user_output_for_copy != nullptr AND MULTI_CHUNK, compute
+      // blocks cooperatively copy `transit[peer_shard] →
+      // user_output[peer_shard]` for every peer (and for myPe's shard
+      // from the already-reduced transit). This runs during block 0's
+      // AG wait, so the 0.35 ms external hipMemcpyAsync is replaced by
+      // in-kernel work that overlaps AG perfectly.
       //
-      // τ'' extension: when hbm_noise_enabled is true, all threads in
-      // the compute block read from `input` buffer during the spin-wait
-      // so the memory controller stays active (instead of thread-0-only
-      // s_sleep). Motivation: perf_history Entry 13/14 — AR[N-1]'s AG is
-      // ~2× slower than AR[0..N-2]'s because the latter have natural HBM
-      // activity from parallel GEMM while AR[N-1] doesn't. Keeping the
-      // MC active via in-kernel reads closes that gap.
-      // ---------------------------------------------------------------
-      if (post_ag_flag != nullptr) {
+      // Block → peer assignment: each compute block is statically bound
+      // to exactly one peer (round-robin by cb_id). Within each peer's
+      // shard, assigned blocks split the work. When a peer != myPe, the
+      // block first waits for peer's AG signal (signalPtrs[peer*numQ+1]
+      // >= agBase + numChunks); for peer == myPe the data is already
+      // in transit after reduce, so no wait.
+      //
+      // Preconditions (enforced by the class):
+      //   - MULTI_CHUNK path (this branch)
+      //   - totalShardBytes % 16 == 0 (true for any fp16/bf16/fp32 AR
+      //     whose shard is a multiple of 8 elements, always holds in
+      //     practice for collective shapes)
+      //   - user_output_for_copy is 16 B aligned (PyTorch allocator is
+      //     ≥256 B aligned; we assume 16 B here)
+      //   - compBlocks >= 1 (always, otherwise no compute blocks)
+      // ----------------------------------------------------------------
+      if constexpr (MULTI_CHUNK) {
+        if (user_output_for_copy != nullptr && compBlocks > 0) {
+          using vec_t = ulonglong2;  // 16 B
+          static_assert(sizeof(vec_t) == 16, "vec_t must be 16B");
+
+          const int cb_id = static_cast<int>(blockIdx.x) - 1;
+          // Assign peer by round-robin: blocks [p*compBlocks/npes,
+          // (p+1)*compBlocks/npes) handle peer p. Guarantees every peer
+          // gets at least 1 block when compBlocks >= npes.
+          int peer;
+          int first_cb_for_peer;
+          int last_cb_for_peer;  // exclusive
+          if (compBlocks >= npes) {
+            peer = (cb_id * npes) / compBlocks;
+            if (peer >= npes) peer = npes - 1;
+            first_cb_for_peer = (peer * compBlocks) / npes;
+            last_cb_for_peer = ((peer + 1) * compBlocks) / npes;
+            if (last_cb_for_peer > compBlocks) last_cb_for_peer = compBlocks;
+          } else {
+            // Fallback: each block handles (npes / compBlocks) peers
+            // sequentially — rare (compBlocks < 8 means CU=1..7).
+            peer = cb_id % npes;
+            first_cb_for_peer = cb_id;
+            last_cb_for_peer = cb_id + 1;
+          }
+          const int my_pos = cb_id - first_cb_for_peer;
+          const int cb_count_for_peer = last_cb_for_peer - first_cb_for_peer;
+
+          // Wait peer's AG signal (skip for myPe since its shard is
+          // already in transit after reduce).
+          if (peer != myPe) {
+            if (threadIdx.x == 0) {
+              const uint64_t expected =
+                  agBase + static_cast<uint64_t>(numChunks);
+              HSAuint64* sig = dstMemObj->signalPtrs
+                  + static_cast<size_t>(peer) * numQ + 1u;
+              while (core::AtomicLoadRelaxed(sig) < expected)
+                __builtin_amdgcn_s_sleep(1);
+            }
+            __syncthreads();
+          }
+          ar_write_phase_ts_cb1(phase_ts, 30);  // peer-signal-observed
+
+          // Distribute this peer's shard (totalShardBytes) among the
+          // blocks in its group.
+          const size_t peer_off =
+              static_cast<size_t>(peer) * totalShardBytes;
+          const uint8_t* src_base =
+              reinterpret_cast<const uint8_t*>(dstMemObj->localPtr)
+              + peer_off;
+          uint8_t* dst_base =
+              reinterpret_cast<uint8_t*>(user_output_for_copy) + peer_off;
+
+          const size_t total_vecs = totalShardBytes / sizeof(vec_t);
+          const size_t vecs_per_block =
+              (total_vecs + cb_count_for_peer - 1) / cb_count_for_peer;
+          const size_t v_start =
+              static_cast<size_t>(my_pos) * vecs_per_block;
+          const size_t v_end =
+              (v_start + vecs_per_block > total_vecs)
+                  ? total_vecs
+                  : (v_start + vecs_per_block);
+
+          const vec_t* src_vec =
+              reinterpret_cast<const vec_t*>(src_base);
+          vec_t* dst_vec = reinterpret_cast<vec_t*>(dst_base);
+
+          for (size_t v = v_start + threadIdx.x; v < v_end;
+               v += blockDim.x) {
+            dst_vec[v] = src_vec[v];
+          }
+          // Tail bytes (should be zero in practice because
+          // totalShardBytes is a multiple of 16 for any sensible AR).
+          const size_t tail_start = total_vecs * sizeof(vec_t);
+          if (tail_start < totalShardBytes && my_pos + 1 == cb_count_for_peer) {
+            for (size_t t = tail_start + threadIdx.x;
+                 t < totalShardBytes; t += blockDim.x) {
+              dst_base[t] = src_base[t];
+            }
+          }
+          __syncthreads();
+          ar_write_phase_ts_cb1(phase_ts, 31);  // peer-copy-done
+        } else if (post_ag_flag != nullptr) {
+          // Legacy Stage-1 spin-wait path (E' prototype, for cost meas.)
+          if (threadIdx.x == 0) {
+            while (__hip_atomic_load(
+                       post_ag_flag,
+                       __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) == 0u) {
+              __builtin_amdgcn_s_sleep(2);
+            }
+          }
+          __syncthreads();
+          ar_write_phase_ts_cb1(phase_ts, 31);
+        }
+      } else if (post_ag_flag != nullptr) {
+        // Non-MULTI_CHUNK: legacy Stage-1 spin-wait path.
         if (threadIdx.x == 0) {
           while (__hip_atomic_load(
                      post_ag_flag,
@@ -358,7 +477,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
           }
         }
         __syncthreads();
-        ar_write_phase_ts_cb1(phase_ts, 31);  // post_ag_flag observed
+        ar_write_phase_ts_cb1(phase_ts, 31);
       }
 
       ar_write_phase_ts_cb1(phase_ts, 11 + 3 * numChunks);  // compute block exit

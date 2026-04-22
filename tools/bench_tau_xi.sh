@@ -11,11 +11,12 @@
 #     (perf_history.md Entry 15), reverted.
 #   - v4: τ'' (MORI_HBM_NOISE) — FAILED, HBM noise doesn't speed up AG
 #     (perf_history.md Entry 16), reverted.
-#   - v5 (current): baseline-only, for clean post-revert measurement.
-#     Real bottleneck identified: 4 × hipMemcpyAsync output copies
-#     (0.35ms each on stream_ar, serialized with next AR). No-copy
-#     SDMA already beats RCCL by 0.5ms. Next direction: π' (copy on
-#     separate stream via SDMA + double-buffered transit).
+#   - v5: baseline-only, for clean post-revert measurement.
+#   - v6 (current): E'' (MORI_INKERNEL_COPY=1) — compute blocks copy
+#     transit→user_output during block 0's AG wait, replacing the
+#     external hipMemcpyAsync. User API unchanged (output tensor still
+#     receives AR result by the time stream syncs). Expected: 4 ×
+#     0.35 ms copy → hidden inside 1.08 ms AG wait.
 #
 # Usage (inside ROCm container):
 #   cd /home/fizhang/test/mori
@@ -110,10 +111,19 @@ run_variant_extra() {
   echo "========== HEAD =========="
   git log -1 --oneline
 
+  E2_ENV="MORI_INKERNEL_COPY=1"
+
   run_variant "BASELINE" ""
+  run_variant "E2"       "$E2_ENV"
+
   run_variant_extra "BASELINE_TIMELINE"  "" --timeline
+  run_variant_extra "E2_TIMELINE"        "$E2_ENV" --timeline
+
   run_variant_extra "BASELINE_AR0_PHASE" "MORI_PHASE_TARGET_STAGE=0" --ar-phase-timing
+  run_variant_extra "E2_AR0_PHASE"       "$E2_ENV MORI_PHASE_TARGET_STAGE=0" --ar-phase-timing
+
   run_variant_extra "BASELINE_AR3_PHASE" "MORI_PHASE_TARGET_STAGE=3" --ar-phase-timing
+  run_variant_extra "E2_AR3_PHASE"       "$E2_ENV MORI_PHASE_TARGET_STAGE=3" --ar-phase-timing
 } | tee "$LOG"
 
 echo
@@ -140,17 +150,32 @@ PHASE_RE="(\[[0-9]\] total|entry.*scatter_done|scatter.*compute-wait|compute-wai
 
 echo
 echo "---- [2] per-stage median (BASELINE_TIMELINE) ----"
-awk '/========== BASELINE_TIMELINE ==========/,/========== BASELINE_AR0_PHASE ==========/' "$LOG" \
+awk '/========== BASELINE_TIMELINE ==========/,/========== E2_TIMELINE ==========/' "$LOG" \
   | grep -E "stage \|| *[0-3] \||median wall|AR\[[0-3]\] duration|AR\[.\]-GEMM" || true
 
 echo
-echo "---- [3] BASELINE AR[0] phase ----"
-awk '/========== BASELINE_AR0_PHASE ==========/,/========== BASELINE_AR3_PHASE ==========/' "$LOG" \
+echo "---- [3] per-stage median (E2_TIMELINE) ----"
+awk '/========== E2_TIMELINE ==========/,/========== BASELINE_AR0_PHASE ==========/' "$LOG" \
+  | grep -E "stage \|| *[0-3] \||median wall|AR\[[0-3]\] duration|AR\[.\]-GEMM" || true
+
+echo
+echo "---- [4] BASELINE AR[0] phase ----"
+awk '/========== BASELINE_AR0_PHASE ==========/,/========== E2_AR0_PHASE ==========/' "$LOG" \
   | grep -E "$PHASE_RE" || true
 
 echo
-echo "---- [4] BASELINE AR[3] phase ----"
-awk '/========== BASELINE_AR3_PHASE ==========/,0' "$LOG" \
+echo "---- [5] E2 AR[0] phase ----"
+awk '/========== E2_AR0_PHASE ==========/,/========== BASELINE_AR3_PHASE ==========/' "$LOG" \
+  | grep -E "$PHASE_RE" || true
+
+echo
+echo "---- [6] BASELINE AR[3] phase ----"
+awk '/========== BASELINE_AR3_PHASE ==========/,/========== E2_AR3_PHASE ==========/' "$LOG" \
+  | grep -E "$PHASE_RE" || true
+
+echo
+echo "---- [7] E2 AR[3] phase (KEY TARGET — expect no external hipMemcpy) ----"
+awk '/========== E2_AR3_PHASE ==========/,0' "$LOG" \
   | grep -E "$PHASE_RE" || true
 
 echo

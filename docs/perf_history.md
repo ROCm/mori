@@ -504,6 +504,60 @@ Summarized here for quick lookup; exact commits in git log:
 
 ---
 
+## Entry 17 — E'' in-kernel copy (user-proposed) — hypothesis
+- **Date**: 2026-04-22
+- **Commit**: this commit
+- **User proposal**: AG destination stays as local transit (shmem, unchanged).
+  But the `transit → user_output` step is moved INTO the AR kernel: compute
+  blocks (idle after reduce) copy per-peer shards during block 0's AG wait.
+  The external `hipMemcpyAsync` is removed.
+- **Why it's different from prior failed directions**:
+  - D' (closed, Entry 11): required registering user_output as shmem symm
+    memory (peer AG write-target); failed on PyTorch allocator +
+    `hipIpcOpenMemHandle` offset semantics. E'' **does not require symm
+    registration of user_output** — the compute-block copy is purely
+    local HBM→HBM and uses whatever pointer the AR call received.
+  - E' Stage 2b-1 (closed, Entry 8): per-chunk copy interleaved WITH
+    reduce → reduce+copy both hit HBM/CU at the same time → +1.18 ms
+    regression. E'' does copy **strictly AFTER all-chunks reduce is
+    done**, so there is no reduce/copy overlap on the same HBM; it only
+    overlaps with block 0's AG wait (SDMA write to peer HBM, not local
+    HBM read).
+- **Design**:
+  - Kernel param `void* user_output_for_copy` added; `nullptr` → legacy path.
+  - Each compute block (blockIdx.x >= 1) is statically assigned 1 peer by
+    `peer = cb_id * npes / compBlocks` (round-robin). Blocks assigned to
+    the same peer split that peer's shard bytes evenly. With compBlocks=160
+    and npes=8, each peer gets 20 blocks.
+  - If peer == myPe: transit[myPe_slot] already has this PE's reduce
+    result; copy can start as soon as reduce completes (no wait).
+  - If peer != myPe: thread 0 spins on `signalPtrs[peer*numQ+1] >=
+    agBase+numChunks`; once observed, all threads in the block do a
+    vectorized (ulonglong2 = 16B) copy of their assigned slice of the
+    peer's 32 MB shard.
+- **Expected numbers** (256 MB, 4 ARs, CU=160):
+  - AR[N-1] kernel: AG wait 1.08 ms, copy ~15 us (per peer) × 7 peers
+    copying in parallel (different blocks) → all 256 MB copied within
+    ~20 us starting from respective peer signal arrivals → fully hidden
+    inside 1.08 ms AG wait.
+  - Per-AR saving vs baseline: 0.35 ms (external hipMemcpyAsync removed).
+  - 4 ARs × 0.35 = **1.4 ms total wall saving**; wall 8.32 → ~6.92 ms.
+  - **6.92 < RCCL 7.43** → target met (≥ 0.5 ms headroom).
+- **Risks to verify**:
+  - HBM bandwidth: AG inbound (224 MB written to local HBM over AG wait)
+    + compute-block copy (256 MB read + 256 MB write). Total ~740 MB /
+    1.08 ms ≈ 700 GB/s on local HBM, well within MI355X HBM peak.
+  - Alignment: user_output assumed ≥16 B aligned (PyTorch allocator is
+    ≥256 B, Torch tensor data_ptr aligned).
+  - Correctness: compute-block copy writes to user_output only after the
+    relevant peer's AG signal is observed. Same signal semantics as the
+    existing per-chunk AG wait (which is already verified correct on
+    this codepath). Block 0 exits when its AG wait ends; compute blocks
+    exit after all copies done. Kernel total = max(block-0 AG wait,
+    slowest block copy end).
+
+---
+
 ## Entry 16 — τ'' (in-kernel HBM noise) FAILED, refocus on copy cost
 - **Date**: 2026-04-22
 - **Commit**: `0f6f4920` (τ'' v1), `4c57e2c0` (τ'' v2 — heavy noise + per-call gating)
