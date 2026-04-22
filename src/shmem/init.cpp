@@ -742,7 +742,9 @@ int ShmemFinalize() {
   FinalizeHeap(states);
   FinalizeAllStates(states);
 
-  states->status = ShmemStatesStatus::Finalized;
+  // Reset to New so the slot can be reused (e.g. SPMT test suites that run
+  // multiple init/finalize cycles in the same process on the same GPU).
+  states->status = ShmemStatesStatus::New;
   MORI_SHMEM_INFO("Shmem finalization completed");
   return 0;
 }

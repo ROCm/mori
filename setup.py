@@ -354,6 +354,7 @@ class CMakeBuild(build_ext):
         enable_debug_printf = os.environ.get("ENABLE_DEBUG_PRINTF", "OFF")
 
         enable_standard_moe_adapt = os.environ.get("ENABLE_STANDARD_MOE_ADAPT", "OFF")
+        multithread_support = os.environ.get("MORI_MULTITHREAD_SUPPORT", "OFF")
         gpu_archs = _get_gpu_archs()
         print(f"[mori] GPU architecture: {gpu_archs}")
         build_examples = os.environ.get("BUILD_EXAMPLES", "OFF")
@@ -392,6 +393,7 @@ class CMakeBuild(build_ext):
             "-DBUILD_TORCH_BOOTSTRAP=OFF",
             f"-DBUILD_XLA_FFI_OPS={build_xla_ffi_ops}",
             f"-DBUILD_OPS_DEVICE={build_ops_device}",
+            f"-DMORI_MULTITHREAD_SUPPORT={multithread_support}",
             "-B",
             str(build_dir),
             "-S",
