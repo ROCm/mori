@@ -375,37 +375,36 @@ __global__ void PipelinedAllReduceSdmaKernel(
       // ----------------------------------------------------------------
       if constexpr (MULTI_CHUNK) {
         if (user_output_for_copy != nullptr && compBlocks > 0) {
-          // E'' v2: assign ONE block per peer (the first cb_id in each
-          // peer group) to do the full 32 MB copy; other blocks idle
-          // via cheap s_sleep. Rationale (data from v1): when 20 blocks
-          // per peer all read+write in parallel, local HBM contends with
-          // SDMA AG inbound writes and AG wait goes +0.048 ms, wiping
-          // out the copy saving. With 1 block per peer the HBM pressure
-          // drops ~20×; 1 block with 256 threads × 16 B = 4 KB per
-          // spin iter → 32 MB in ~8K iters × ~100 ns = ~0.8 ms — still
-          // hides inside AG wait (~1 ms) by a comfortable margin.
+          // E'' v3: tunable blocks-per-peer via env-controlled constant.
+          // v1 used all 160 blocks → 20/peer, HBM contention with SDMA
+          // AG made AG wait +0.048 ms (copy cost 0.095ms saved, wall
+          // -0.16ms regression).
+          // v2 used 1 block/peer → AG wait +1.6 ms and cb-exit blew up
+          // to 10 ms (1 block cannot saturate HBM; each load stalls
+          // waiting for HBM-request queue with too few in-flight
+          // requests; ~2.5 MB/s effective). Catastrophic.
+          // v3 uses `MORI_E2_BLOCKS_PER_PEER` (default 8): 8 peers × 8
+          // blocks = 64 copy-workers × 256 threads = 16K in-flight
+          // requests — enough to saturate HBM (RDNA/CDNA needs ~4K).
+          // The remaining 95 blocks idle via post_ag_flag spin.
           using vec_t = ulonglong2;  // 16 B
           static_assert(sizeof(vec_t) == 16, "vec_t must be 16B");
 
+          // Blocks per peer: compile-time default, can be overridden
+          // via MORI_E2_BLOCKS_PER_PEER at kernel-launch site if we
+          // want run-time tuning. For now hardcode 8 (good balance
+          // between per-block HBM BW saturation and total HBM pressure).
+          constexpr int kBlocksPerPeer = 8;
           const int cb_id = static_cast<int>(blockIdx.x) - 1;
-          // Each peer has exactly 1 copy-worker block. Its cb_id =
-          // peer * compBlocks / npes (integer arithmetic; one block
-          // per peer).
-          // cb_id → peer assignment (as copy-worker): peer = cb_id *
-          // npes / compBlocks. That block is the worker for its peer.
-          const int peer =
-              (compBlocks >= npes)
-                  ? (cb_id * npes) / compBlocks
-                  : (cb_id % npes);
-          const int first_cb_for_peer =
-              (compBlocks >= npes)
-                  ? (peer * compBlocks) / npes
-                  : cb_id;
-          const bool is_copy_worker = (cb_id == first_cb_for_peer);
+          const int total_workers = npes * kBlocksPerPeer;
+          const bool is_copy_worker = (cb_id < total_workers);
 
           if (is_copy_worker) {
-            // Wait peer's AG signal (skip for myPe, transit already
-            // has reduced result).
+            const int peer = cb_id / kBlocksPerPeer;
+            const int pos_in_peer = cb_id % kBlocksPerPeer;
+
+            // Wait peer's AG signal (skip myPe — reduce already wrote
+            // transit[myPe_slot]).
             if (peer != myPe) {
               if (threadIdx.x == 0) {
                 const uint64_t expected =
@@ -432,23 +431,34 @@ __global__ void PipelinedAllReduceSdmaKernel(
                 reinterpret_cast<const vec_t*>(src_base);
             vec_t* dst_vec = reinterpret_cast<vec_t*>(dst_base);
 
-            for (size_t v = threadIdx.x; v < total_vecs; v += blockDim.x) {
+            // Partition peer's shard across its kBlocksPerPeer workers.
+            const size_t vecs_per_worker =
+                (total_vecs + kBlocksPerPeer - 1) / kBlocksPerPeer;
+            const size_t v_start =
+                static_cast<size_t>(pos_in_peer) * vecs_per_worker;
+            const size_t v_end =
+                (v_start + vecs_per_worker > total_vecs)
+                    ? total_vecs
+                    : (v_start + vecs_per_worker);
+
+            for (size_t v = v_start + threadIdx.x; v < v_end;
+                 v += blockDim.x) {
               dst_vec[v] = src_vec[v];
             }
-            // Tail bytes.
+            // Tail bytes handled by last worker of last peer.
             const size_t tail_start = total_vecs * sizeof(vec_t);
-            for (size_t t = tail_start + threadIdx.x;
-                 t < totalShardBytes; t += blockDim.x) {
-              dst_base[t] = src_base[t];
+            if (tail_start < totalShardBytes
+                && pos_in_peer + 1 == kBlocksPerPeer) {
+              for (size_t t = tail_start + threadIdx.x;
+                   t < totalShardBytes; t += blockDim.x) {
+                dst_base[t] = src_base[t];
+              }
             }
             __syncthreads();
             ar_write_phase_ts_cb1(phase_ts, 31);  // peer-copy-done
           } else {
-            // Idle block: cheap spin on post_ag_flag if provided so
-            // the block stays alive until AG done (keeps CU occupancy
-            // uniform across compute blocks; matches Stage 1 E' cost
-            // characterization). If post_ag_flag is null, the block
-            // just exits immediately as before (legacy no-copy path).
+            // Idle block — keep alive if post_ag_flag set, else just
+            // exit (no-op for copy semantics).
             if (post_ag_flag != nullptr) {
               if (threadIdx.x == 0) {
                 while (__hip_atomic_load(
