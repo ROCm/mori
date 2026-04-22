@@ -36,7 +36,7 @@ namespace mori::umbp {
 
 /// Distributed IUMBPClient implementation — master-led global routing
 /// with RDMA/MORI-IO data plane.  All routing decisions go through the
-/// Master; this client does NOT use LocalStorageManager or LocalBlockIndex.
+/// Master; this client does not use LocalStorageManager or LocalBlockIndex.
 class DistributedClient : public IUMBPClient {
  public:
   explicit DistributedClient(const UMBPConfig& config);

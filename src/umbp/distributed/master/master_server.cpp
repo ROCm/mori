@@ -123,6 +123,9 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
                           "node is already alive and cannot be re-registered");
     }
 
+    UpdateClientCountMetric();
+    UpdateClientCapacityMetrics(request->node_id(), caps);
+
     // Recommend heartbeat = heartbeat_ttl / divisor (default 2 => half TTL).
     auto interval_ms =
         static_cast<uint64_t>(config_.heartbeat_ttl.count() * 1000) / HeartbeatIntervalDivisor();
@@ -136,6 +139,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
                                 ::umbp::UnregisterClientResponse* response) override {
     size_t removed = registry_.UnregisterClient(request->node_id());
     response->set_keys_removed(static_cast<uint32_t>(removed));
+    UpdateClientCountMetric();
     return grpc::Status::OK;
   }
 
@@ -151,6 +155,8 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
 
     ClientStatus status = registry_.Heartbeat(request->node_id(), caps);
     response->set_status(static_cast<::umbp::ClientStatus>(status));
+
+    UpdateClientCapacityMetrics(request->node_id(), caps);
 
     MORI_UMBP_INFO("[Master] Heartbeat received: node_id={}, tiers={}, status={}",
                    request->node_id(), request->tier_capacities_size(), ClientStatusName(status));
@@ -219,6 +225,13 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
 
     auto locations = index_.Lookup(request->key());
     response->set_found(!locations.empty());
+    if (metrics_) {
+      for (const auto& loc : locations) {
+        auto safe_node = mori::metrics::MetricsServer::SanitizeName(loc.node_id);
+        metrics_->addCounter(std::string(MORI_UMBP_METRIC_CLIENT_LOOKUP_PREFIX) + safe_node,
+                             std::string(MORI_UMBP_METRIC_CLIENT_LOOKUP_HELP_PREFIX) + loc.node_id);
+      }
+    }
     return grpc::Status::OK;
   }
 
@@ -324,6 +337,12 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
       }
     }
 
+    if (metrics_) {
+      auto safe_node = mori::metrics::MetricsServer::SanitizeName(result->node_id);
+      metrics_->addCounter(std::string(MORI_UMBP_METRIC_CLIENT_ROUTE_GET_PREFIX) + safe_node,
+                           std::string(MORI_UMBP_METRIC_CLIENT_ROUTE_GET_HELP_PREFIX) +
+                               result->node_id);
+    }
     MORI_UMBP_INFO("[Master] RouteGet key='{}': node={}, location={}", request->key(),
                    result->node_id, result->location_id);
     return grpc::Status::OK;
@@ -362,6 +381,12 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     }
     response->set_page_size(result->page_size);
 
+    if (metrics_) {
+      auto safe_node = mori::metrics::MetricsServer::SanitizeName(result->node_id);
+      metrics_->addCounter(std::string(MORI_UMBP_METRIC_CLIENT_ROUTE_PUT_PREFIX) + safe_node,
+                           std::string(MORI_UMBP_METRIC_CLIENT_ROUTE_PUT_HELP_PREFIX) +
+                               result->node_id);
+    }
     MORI_UMBP_INFO("[Master] RoutePut key='{}': target_node={}, tier={}, location='{}', pages={}",
                    request->key(), result->node_id, TierTypeName(result->tier), result->location_id,
                    result->pages.size());
@@ -647,6 +672,29 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
   void SetMetrics(mori::metrics::MetricsServer* metrics) { metrics_ = metrics; }
 
  private:
+  void UpdateClientCountMetric() {
+    if (!metrics_) return;
+    metrics_->setGauge(MORI_UMBP_METRIC_CLIENT_COUNT, MORI_UMBP_METRIC_CLIENT_COUNT_HELP,
+                       static_cast<double>(registry_.GetAliveClients().size()));
+  }
+
+  void UpdateClientCapacityMetrics(const std::string& node_id,
+                                   const std::map<TierType, TierCapacity>& caps) {
+    if (!metrics_) return;
+    auto safe_node = mori::metrics::MetricsServer::SanitizeName(node_id);
+    for (const auto& [tier, cap] : caps) {
+      const char* tier_name = TierTypeName(tier);
+      std::string suffix = safe_node + "_" + tier_name;
+      metrics_->setGauge(std::string(MORI_UMBP_METRIC_CLIENT_CAPACITY_TOTAL_PREFIX) + suffix,
+                         std::string(MORI_UMBP_METRIC_CLIENT_CAPACITY_TOTAL_HELP_PREFIX) + node_id +
+                             " " + tier_name,
+                         static_cast<double>(cap.total_bytes));
+      metrics_->setGauge(std::string(MORI_UMBP_METRIC_CLIENT_CAPACITY_AVAIL_PREFIX) + suffix,
+                         std::string(MORI_UMBP_METRIC_CLIENT_CAPACITY_AVAIL_HELP_PREFIX) + node_id +
+                             " " + tier_name,
+                         static_cast<double>(cap.available_bytes));
+    }
+  }
   ClientRegistry& registry_;
   GlobalBlockIndex& index_;
   ExternalKvBlockIndex& external_kv_index_;
@@ -679,6 +727,8 @@ MasterServer::~MasterServer() { Shutdown(); }
 void MasterServer::Run() {
   metrics_server_ = std::make_unique<mori::metrics::MetricsServer>(config_.metrics_port);
   service_->SetMetrics(metrics_server_.get());
+  metrics_server_->setGauge(MORI_UMBP_METRIC_CLIENT_COUNT, MORI_UMBP_METRIC_CLIENT_COUNT_HELP,
+                            0.0);
   MORI_UMBP_INFO("[Master] Metrics server listening on port {}", config_.metrics_port);
 
   registry_.StartReaper();

@@ -21,7 +21,9 @@
 // SOFTWARE.
 #include "umbp/distributed/distributed_client.h"
 
+#include <map>
 #include <sys/mman.h>
+
 
 #include <stdexcept>
 
