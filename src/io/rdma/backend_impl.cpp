@@ -299,6 +299,43 @@ std::shared_ptr<const RdmaLocalMemoryRegistration> RdmaManager::GetOrMaterialize
   }
 
   // Chunked registration
+  //
+  // On AMD AINIC (ionic, vendor_id 0x1dd8 / Pensando), the firmware silently
+  // drops the last ~64 bytes of any RDMA WRITE that lands on a chunked MR's
+  // tail when the user-supplied buffer's base VA is NOT 4 KiB page-aligned.
+  // The CQE reports IBV_WC_SUCCESS but the destination bytes retain their
+  // pre-write content. Triggered specifically when:
+  //   1. CPU memory (kernel pin path; GPU goes through dmabuf importer)
+  //   2. Per-chunk MR size >= 1 GiB (firmware path switch)
+  //   3. Buffer base not page-aligned, so MR_a's last bytes share a 4 KiB
+  //      kernel page with MR_b's first bytes (the chunked path produces
+  //      adjacent MRs from one buffer)
+  //
+  // Cross-platform verification: Mellanox mlx5 (vendor 0x02c9) and Broadcom
+  // bnxt_re (vendor 0x14e4) tested CLEAN with the same workload, so this
+  // guard is gated on Pensando vendor id.
+  //
+  // PyTorch's CPU caching allocator returns 64-byte-aligned but non-page-
+  // aligned pointers (typically ending in 0x...040), which trips the bug.
+  // mmap(2), shm_open + mmap, and posix_memalign(PAGESIZE, ...) all return
+  // page-aligned pointers and are safe.
+  if (desc.loc == MemoryLocationType::CPU) {
+    const bool isIonic = (devCtx->GetRdmaDevice()->GetDeviceAttr()->orig_attr.vendor_id ==
+                          static_cast<uint32_t>(application::RdmaDeviceVendorId::Pensando));
+    if (isIonic && (desc.data % PAGESIZE) != 0) {
+      MORI_IO_ERROR(
+          "Chunked CPU registration on ionic requires a 4 KiB page-aligned "
+          "base address. Memory id={} starts at 0x{:x} (offset 0x{:x} into "
+          "a 4 KiB page). Allocate via mmap, shm_open + mmap, or "
+          "posix_memalign(PAGESIZE, ...). PyTorch CPU tensors are NOT page-"
+          "aligned and trigger an ionic firmware bug that silently corrupts "
+          "cross-MR writes.",
+          desc.id, desc.data, desc.data % PAGESIZE);
+      throw std::runtime_error(
+          "Chunked CPU registration on ionic requires page-aligned base address");
+    }
+  }
+
   size_t numChunks = (desc.size + chunkSize - 1) / chunkSize;
   std::vector<RdmaMemoryChunk> chunks;
   std::vector<application::RdmaOwnedMr> ownedMrs;

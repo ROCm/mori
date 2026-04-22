@@ -964,6 +964,151 @@ def test_rdma_chunked_inflight_dereg_keeps_registration_alive():
             )
 
 
+def _likely_ionic_nic():
+    """Heuristic: returns True if this test is likely to run on AMD AINIC (ionic).
+
+    Checks ``MORI_RDMA_DEVICES`` first, then falls back to /sys/class/infiniband.
+    Returns False conservatively when the answer is ambiguous (e.g. mixed
+    vendors with no env override) so the test only enforces the
+    ionic-specific guard when we're confident the test will hit ionic.
+    """
+    env = os.environ.get("MORI_RDMA_DEVICES", "").strip()
+    if env:
+        first = env.split(",")[0].strip().lower()
+        return first.startswith("ionic")
+    try:
+        devs = os.listdir("/sys/class/infiniband")
+    except OSError:
+        return False
+    has_ionic = any(d.startswith("ionic") for d in devs)
+    has_other = any(d.startswith(("mlx", "bnxt")) for d in devs)
+    return has_ionic and not has_other
+
+
+def test_rdma_chunked_cpu_registration_requires_page_aligned_base():
+    """Verify mori-io refuses non-page-aligned chunked CPU registration on ionic.
+
+    On AMD AINIC (ionic, vendor 0x1dd8 / Pensando), the firmware silently
+    drops the last ~64 bytes of any RDMA WRITE landing on a chunked CPU MR's
+    tail when the user-supplied buffer's base VA is NOT 4 KiB page-aligned
+    (so MR_a's last bytes share a 4 KiB kernel page with MR_b's first bytes).
+    The CQE reports IBV_WC_SUCCESS but bytes go missing. mori-io's chunked
+    materialization path refuses such registrations so the user gets a loud
+    failure instead of silent corruption.
+
+    Cross-platform verification: Mellanox mlx5 (vendor 0x02c9) and Broadcom
+    bnxt_re (vendor 0x14e4) tested clean with the same workload, so the
+    guard is gated on Pensando vendor id.
+
+    This test:
+      - allocates a non-page-aligned CPU buffer (a Python-managed buffer
+        large enough to be sliced into a non-page-aligned region, mimicking
+        the shape PyTorch's CPU caching allocator returns)
+      - forces the chunked path via ``MORI_IO_RDMA_MR_CHUNK_SIZE``
+      - asserts that on ionic ``create_session`` returns ``None`` (the
+        guard threw, ``RdmaBackend::CreateSession`` caught and returned
+        nullptr) and on other NICs it succeeds (no guard, no bug).
+
+    Avoids ``ctypes.CDLL("libc.so.6")`` so the test runs on musl-based
+    distros (Alpine etc.) where the glibc SONAME is absent.
+    """
+    import ctypes
+
+    PAGE_SIZE = 4096
+    OFFSET_INTO_PAGE = 64  # mimic PyTorch's 64-byte tensor metadata padding
+
+    # Small buffer (16 MiB) and even smaller chunk (8 MiB) so the chunked
+    # path fires regardless of NIC pin caps and the test stays fast.
+    nbytes = 16 * 1024 * 1024
+    chunk_size = 8 * 1024 * 1024
+
+    # Allocate slightly oversized Python-managed buffers so we can carve out
+    # a (page-aligned + 64-byte offset) interior pointer that is guaranteed
+    # NOT to be 4 KiB page-aligned. Python keeps the underlying ctypes
+    # storage alive as long as the c_char_Array_* objects do, so we pin them
+    # to local variables for the duration of the test.
+    over_alloc = nbytes + 2 * PAGE_SIZE
+    src_storage = ctypes.create_string_buffer(over_alloc)
+    dst_storage = ctypes.create_string_buffer(over_alloc)
+
+    def non_page_aligned_ptr(storage):
+        base = ctypes.addressof(storage)
+        page_aligned = (base + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1)
+        return page_aligned + OFFSET_INTO_PAGE
+
+    src_ptr = non_page_aligned_ptr(src_storage)
+    dst_ptr = non_page_aligned_ptr(dst_storage)
+    assert (
+        src_ptr % PAGE_SIZE != 0
+    ), "test setup error: src_ptr unexpectedly page-aligned"
+    assert (
+        dst_ptr % PAGE_SIZE != 0
+    ), "test setup error: dst_ptr unexpectedly page-aligned"
+    # Sanity: the non-aligned interior must still fit the requested nbytes
+    # within the over-allocated storage.
+    assert src_ptr + nbytes <= ctypes.addressof(src_storage) + over_alloc
+    assert dst_ptr + nbytes <= ctypes.addressof(dst_storage) + over_alloc
+
+    is_ionic = _likely_ionic_nic()
+    src_mem = None
+    dst_mem = None
+    sess = None
+    initiator = None
+    target = None
+    try:
+        with temporary_env("MORI_IO_RDMA_MR_CHUNK_SIZE", str(chunk_size)):
+            initiator, target = create_connected_engine_pair(
+                "page_align_guard",
+                qp_per_transfer=1,
+                post_batch_size=-1,
+                num_worker_threads=1,
+                enable_notification=False,
+            )
+
+            src_mem = initiator.register_memory(
+                src_ptr, nbytes, -1, MemoryLocationType.CPU
+            )
+            dst_mem = target.register_memory(
+                dst_ptr, nbytes, -1, MemoryLocationType.CPU
+            )
+
+            # create_session triggers materialization on both sides; the
+            # chunked CPU registration path's guard runs here.
+            sess = initiator.create_session(src_mem, dst_mem)
+
+            if is_ionic:
+                assert sess is None, (
+                    "Expected create_session to fail (return None) on ionic with a "
+                    "non-page-aligned CPU buffer + chunked path; got a valid session, "
+                    "which means the page-alignment guard in "
+                    "RdmaManager::GetOrMaterializeLocalRegistration did NOT trigger. "
+                    "If you intended to relax the guard, update both the C++ guard and "
+                    "this test."
+                )
+            else:
+                assert sess is not None, (
+                    "Expected create_session to succeed on a non-ionic NIC with a "
+                    "non-page-aligned CPU buffer (the page-alignment guard is "
+                    "ionic-specific). create_session returned None — either the guard "
+                    "is now applying to non-ionic NICs (intentional?), or registration "
+                    "failed for an unrelated reason. Check the engine error log."
+                )
+    finally:
+        if sess is not None:
+            del sess
+        if src_mem is not None and initiator is not None:
+            try:
+                initiator.deregister_memory(src_mem)
+            except Exception:
+                pass
+        if dst_mem is not None and target is not None:
+            try:
+                target.deregister_memory(dst_mem)
+            except Exception:
+                pass
+        # src_storage / dst_storage go out of scope here; Python frees them.
+
+
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
 def test_multithread_batch_error_path_is_recoverable():
     """Regression for callback meta ownership on error paths.
