@@ -412,3 +412,14 @@ class AllreduceSdma:
         rank. Returns True on success. Cached for later lookup by pipelined().
         """
         return self._handle.register_user_output(ptr, size)
+
+    # --- Direction θ: multi-qId parallel AG -----------------------------
+    def enable_ag_multi_q(self, on: bool):
+        """Enable multi-qId parallel AG in MULTI_CHUNK AR kernel.
+
+        When on, chunk c's AG uses SDMA qId = 1+(c%(numQ-1)) so chunks
+        transfer in parallel on separate queues. Must be called BEFORE
+        the first pipelined() call on this object (signal counter
+        semantics change). See docs/perf_history.md Entry 12.
+        """
+        self._handle.enable_ag_multi_q(on)

@@ -1360,6 +1360,14 @@ def _test_multi_stage_overlap(
                     if rank == 0:
                         print(f"  [warn] enable_post_ag_wait failed: {e}",
                               flush=True)
+            # Direction θ: multi-qId AG. Must be before first pipelined() call.
+            if os.environ.get("MORI_AG_MULTI_Q", "0") == "1":
+                try:
+                    ar_obj.enable_ag_multi_q(True)
+                except Exception as e:
+                    if rank == 0:
+                        print(f"  [warn] enable_ag_multi_q failed: {e}",
+                              flush=True)
             torch.cuda.synchronize(); dist.barrier()
             if rank == 0:
                 print(" ok", flush=True)

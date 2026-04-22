@@ -169,7 +169,17 @@ __global__ void PipelinedAllReduceSdmaKernel(
                               reduce until block 0 sets this flag (after AG
                               wait done). Used to measure how much CU
                               occupancy during AG wait costs the overlap
-                              benchmark (GEMM variability, wall time). */ ) {
+                              benchmark (GEMM variability, wall time). */,
+    bool ag_multi_q = false /* direction θ: when true, MULTI_CHUNK AG uses
+                               a different qId per chunk
+                               (qId = 1 + (c % (numQ - 1))) so chunks
+                               transfer in parallel on separate SDMA
+                               queues; expected signal value per qId is
+                               agBase+1 (once per call) instead of
+                               agBase+numChunks. Assumes numChunks ≤
+                               numQ - 1 and that pipeline_ag_gen_ on
+                               host side increments by 1 per call when
+                               this mode is on (class-level flag). */ ) {
 
   ar_write_phase_ts(phase_ts, 0);  // phase 0: kernel entry
 
@@ -441,7 +451,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
           }
           ar_write_phase_ts(phase_ts, 2 + 3 * c + 1);  // chunk c: cross-PE barrier done
 
-          // 3. SDMA AG for chunk c.
+          // 3. SDMA AG for chunk c. qId depends on ag_multi_q flag.
           if (thr < npes && thr != myPe) {
             const int destPe = thr;
             anvil::SdmaQueueDeviceHandle** dh =
@@ -458,7 +468,9 @@ __global__ void PipelinedAllReduceSdmaKernel(
                 + static_cast<size_t>(myPe) * totalShardBytes + cOff;
             uint8_t* dst = reinterpret_cast<uint8_t*>(dstMemObj->peerPtrs[destPe])
                 + static_cast<size_t>(myPe) * totalShardBytes + cOff;
-            core::SdmaPutThread(src, dst, agBytes, dh, rSig, numQ, 1);
+            const uint32_t agQId =
+                ag_multi_q ? (1u + static_cast<uint32_t>(c % (numQ - 1))) : 1u;
+            core::SdmaPutThread(src, dst, agBytes, dh, rSig, numQ, agQId);
           }
           ar_write_phase_ts(phase_ts, 2 + 3 * c + 2);  // chunk c: AG submit done
         }
@@ -478,10 +490,18 @@ __global__ void PipelinedAllReduceSdmaKernel(
         for (int c = 0; c < numChunks; c++) {
           if (thr < npes && thr != myPe) {
             const int sender = thr;
-            const uint64_t expected_c =
-                s_ag_by_sender[sender] + static_cast<uint64_t>(c + 1);
+            // Direction θ: when multi-q mode is on, each chunk's AG lands
+            // on a different peer signal slot (sender*numQ + agQId). Each
+            // qId sees exactly 1 increment per pipelined() call, so the
+            // expected value is agBase+1 (vs agBase+(c+1) in single-q mode
+            // where all chunks share qId=1 and inc it numChunks times).
+            const uint32_t agQId =
+                ag_multi_q ? (1u + static_cast<uint32_t>(c % (numQ - 1))) : 1u;
+            const uint64_t expected_c = ag_multi_q
+                ? (s_ag_by_sender[sender] + 1ULL)
+                : (s_ag_by_sender[sender] + static_cast<uint64_t>(c + 1));
             HSAuint64* sig = dstMemObj->signalPtrs
-                + static_cast<size_t>(sender) * numQ + 1;
+                + static_cast<size_t>(sender) * numQ + agQId;
             while (core::AtomicLoadRelaxed(sig) < expected_c)
               __builtin_amdgcn_s_sleep(1);
           }

@@ -149,6 +149,13 @@ class AllreduceSdma {
   // overhead; only a few distinct output ptrs are usually seen.
   // ---------------------------------------------------------------------
   bool register_user_output_enabled_ = false;
+
+  // Direction θ (see docs/perf_history.md Entry 12): when enabled, the
+  // MULTI_CHUNK AR kernel distributes AG chunks across multiple SDMA
+  // queues (chunk c → qId=1+(c%(numQ-1))) to exploit parallel bandwidth.
+  // Must be set BEFORE the first pipelined() call to avoid signal counter
+  // corruption (qId accumulation semantics change).
+  bool ag_multi_q_ = false;
   static constexpr size_t kUserOutputCacheCap = 4;
   struct UserOutputCacheKey {
     void* ptr;
@@ -313,6 +320,12 @@ class AllreduceSdma {
   // symmetric output sizes, so this lines up).
   void enable_register_user_output(bool on);
   bool is_register_user_output_enabled() const { return register_user_output_enabled_; }
+
+  // Direction θ: enable multi-qId AG. Must be called BEFORE the first
+  // pipelined() call on this object (per-qId signal counter semantics
+  // change; switching mid-stream would desync peer signals).
+  void enable_ag_multi_q(bool on);
+  bool is_ag_multi_q_enabled() const { return ag_multi_q_; }
 
   // Pre-register a user output buffer. All ranks must call collectively
   // with the same size. Returns true on success. Caller can call this

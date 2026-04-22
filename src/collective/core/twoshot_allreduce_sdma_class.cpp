@@ -252,6 +252,28 @@ bool AllreduceSdma<T>::register_user_output(void* ptr, size_t size) {
 }
 
 template <typename T>
+void AllreduceSdma<T>::enable_ag_multi_q(bool on) {
+  if (on == ag_multi_q_) return;
+  if (pipeline_ag_gen_ != 0) {
+    // Mid-stream switching would leave the class's signal counter out of
+    // sync with actual per-qId peer signals. Require a fresh object for
+    // mode changes.
+    fprintf(stderr,
+            "PE %d: enable_ag_multi_q(%d) called after first AR (pipeline_ag_gen_=%llu); "
+            "ignored. Set the flag BEFORE the first pipelined() call.\n",
+            myPe_, int(on), (unsigned long long)pipeline_ag_gen_);
+    return;
+  }
+  ag_multi_q_ = on;
+  if (on) {
+    printf("PE %d: ag_multi_q ENABLED (direction θ: multi-qId parallel AG for MULTI_CHUNK)\n",
+           myPe_);
+  } else {
+    printf("PE %d: ag_multi_q DISABLED\n", myPe_);
+  }
+}
+
+template <typename T>
 void AllreduceSdma<T>::enable_post_ag_wait(bool on) {
   if (on == post_ag_wait_enabled_) return;
   if (on) {
@@ -806,13 +828,20 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
           post_ag_flag_ptr = post_ag_flag_d_;
         }
 
+        // Direction θ: when ag_multi_q_ is true, MULTI_CHUNK AG distributes
+        // chunks across multiple SDMA qIds (1, 2, ..., numChunks) so they
+        // transfer in parallel. See Entry 12 in docs/perf_history.md for
+        // the measurement that motivates this (single-qId serializes chunks
+        // at ~0.59ms each, multi-qId should bring AG wait to max chunk time).
+        const bool ag_multi_q_local = ag_multi_q_ && multi_chunk;
+
         if (scatter_mode == 1) {
             PipelinedAllReduceSdmaKernel<T, 1><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
                 barrierPtr_, inputSymmObj, total_count, chunk_elems,
                 scatter_base, ag_base, reduce_complete_base, phase_ts_ptr,
-                post_ag_flag_ptr);
+                post_ag_flag_ptr, ag_multi_q_local);
         } else if (external_scatter) {
             ScatterSdmaOnlyKernel<T><<<1, 512, 0, stream>>>(
                 myPe_, npes_, input, output_transit_buffer_obj_,
@@ -825,7 +854,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                     barrierPtr_, application::SymmMemObjPtr{},
                     total_count, chunk_elems, scatter_base, ag_base,
                     reduce_complete_base, phase_ts_ptr,
-                    post_ag_flag_ptr);
+                    post_ag_flag_ptr, ag_multi_q_local);
             } else {
                 PipelinedAllReduceSdmaKernel<T, 0, false, true>
                     <<<blocks, threads, 0, stream>>>(
@@ -834,7 +863,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                     barrierPtr_, application::SymmMemObjPtr{},
                     total_count, chunk_elems, scatter_base, ag_base,
                     reduce_complete_base, phase_ts_ptr,
-                    post_ag_flag_ptr);
+                    post_ag_flag_ptr, ag_multi_q_local);
             }
         } else if (multi_chunk) {
             PipelinedAllReduceSdmaKernel<T, 0, true><<<blocks, threads, 0, stream>>>(
@@ -842,18 +871,21 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                 output_transit_buffer_obj_, flagsObj_,
                 barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems,
                 scatter_base, ag_base, reduce_complete_base, phase_ts_ptr,
-                post_ag_flag_ptr);
+                post_ag_flag_ptr, ag_multi_q_local);
         } else {
             PipelinedAllReduceSdmaKernel<T, 0, false><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
                 barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems,
                 scatter_base, ag_base, reduce_complete_base, phase_ts_ptr,
-                post_ag_flag_ptr);
+                post_ag_flag_ptr, ag_multi_q_local);
         }
 
         pipeline_scatter_gen_ += numChunks_host;   // scatter SDMA only (qId=0)
-        pipeline_ag_gen_      += numChunks_host;   // AG SDMA (qId=1)
+        // AG counter: under multi_q mode each qId increments only once per
+        // call (per-chunk distributed across qIds); under single-q mode
+        // qId=1 increments numChunks times per call.
+        pipeline_ag_gen_      += ag_multi_q_local ? 1 : numChunks_host;
         pipeline_reduce_gen_  += numChunks_host;   // reduce_complete via flags
 
         hipError_t err = hipGetLastError();
