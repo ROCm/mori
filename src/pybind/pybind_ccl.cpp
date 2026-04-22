@@ -246,6 +246,13 @@ void RegisterMoriCcl(pybind11::module_& m) {
            py::arg("on"),
            "Stage 1 of E' prototype: compute blocks wait for AG done "
            "instead of exiting; measures CU occupancy cost")
+      .def("enable_direct_output",
+           &mori::collective::AllreduceSdma<uint32_t>::enable_direct_output,
+           py::arg("on"),
+           "Plan A (Entry 18): CU XGMI AG + direct write to user_output, "
+           "skips SDMA AG and external hipMemcpyAsync. Requires MULTI_CHUNK "
+           "and copy_output_to_user=on. Auto-enables post_ag_wait for "
+           "cross-PE reduce barrier gating.")
       .def("enable_register_user_output",
            &mori::collective::AllreduceSdma<uint32_t>::enable_register_user_output,
            py::arg("on"),
@@ -319,6 +326,8 @@ void RegisterMoriCcl(pybind11::module_& m) {
            &mori::collective::AllreduceSdma<half>::get_copy_timing_last_num_chunks)
       .def("enable_post_ag_wait",
            &mori::collective::AllreduceSdma<half>::enable_post_ag_wait, py::arg("on"))
+      .def("enable_direct_output",
+           &mori::collective::AllreduceSdma<half>::enable_direct_output, py::arg("on"))
       .def("enable_register_user_output",
            &mori::collective::AllreduceSdma<half>::enable_register_user_output,
            py::arg("on"))
@@ -390,6 +399,9 @@ void RegisterMoriCcl(pybind11::module_& m) {
            &mori::collective::AllreduceSdma<hip_bfloat16>::get_copy_timing_last_num_chunks)
       .def("enable_post_ag_wait",
            &mori::collective::AllreduceSdma<hip_bfloat16>::enable_post_ag_wait,
+           py::arg("on"))
+      .def("enable_direct_output",
+           &mori::collective::AllreduceSdma<hip_bfloat16>::enable_direct_output,
            py::arg("on"))
       .def("enable_register_user_output",
            &mori::collective::AllreduceSdma<hip_bfloat16>::enable_register_user_output,

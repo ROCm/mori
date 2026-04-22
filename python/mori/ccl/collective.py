@@ -397,6 +397,21 @@ class AllreduceSdma:
         """
         self._handle.enable_post_ag_wait(on)
 
+    def enable_direct_output(self, on: bool):
+        """Plan A (perf_history Entry 18): CU XGMI AG + direct write to
+        user_output. Replaces the SDMA AG phase (~1.08 ms on AR[3]) and the
+        external hipMemcpyAsync (~0.1 ms) with a single in-kernel CU-driven
+        XGMI load from peer transits + direct write to user_output
+        (~0.61 ms measured CU XGMI BW = 370 GB/s at 16 blocks/peer).
+
+        Requires copy_output_to_user=True at construction and the
+        MULTI_CHUNK path (buffers ≥ 2 chunks). User API unchanged —
+        output tensor receives the final AR result once the stream syncs.
+        Auto-enables post_ag_wait (needed as a cross-PE reduce barrier
+        gating signal to compute blocks).
+        """
+        self._handle.enable_direct_output(on)
+
     # --- D' fast path: lazy-register user output (see perf_history Entry 10)
     def enable_register_user_output(self, on: bool):
         """Enable the D' fast-path lookup in pipelined(). When on, if the

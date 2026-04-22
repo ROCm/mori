@@ -1360,6 +1360,15 @@ def _test_multi_stage_overlap(
                     if rank == 0:
                         print(f"  [warn] enable_post_ag_wait failed: {e}",
                               flush=True)
+            # Plan A: CU XGMI direct-output AR (perf_history Entry 18).
+            # Enable via env MORI_DIRECT_OUTPUT=1 (off by default).
+            if os.environ.get("MORI_DIRECT_OUTPUT", "0") == "1":
+                try:
+                    ar_obj.enable_direct_output(True)
+                except Exception as e:
+                    if rank == 0:
+                        print(f"  [warn] enable_direct_output failed: {e}",
+                              flush=True)
             torch.cuda.synchronize(); dist.barrier()
             if rank == 0:
                 print(" ok", flush=True)

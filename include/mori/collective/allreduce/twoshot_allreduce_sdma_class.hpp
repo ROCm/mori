@@ -129,6 +129,17 @@ class AllreduceSdma {
   bool post_ag_wait_enabled_ = false;
   uint32_t* post_ag_flag_d_ = nullptr;  // device uint32, reset to 0 each call
 
+  // Plan A (perf_history Entry 18): when direct_output_enabled_ is true
+  // AND copy_output_to_user_ is true AND the call is MULTI_CHUNK,
+  // pipelined() passes the user output pointer directly to the kernel,
+  // block 0 SKIPS SDMA AG, and compute blocks do CU XGMI AG (read peer
+  // transit via P2P pointer) + direct write to user_output. The external
+  // hipMemcpyAsync is SKIPPED.
+  // Requires post_ag_wait mechanism (to gate compute blocks until all
+  // peers' reduce barriers are complete) — enabled automatically when
+  // direct_output is on.
+  bool direct_output_enabled_ = false;
+
   // ---------------------------------------------------------------------
   // D' prototype: lazy-register user output buffer as shmem symmetric
   // memory so AR kernel can AG directly to it, skipping the transit
@@ -304,6 +315,17 @@ class AllreduceSdma {
   // Stage 2 (future): compute blocks do in-kernel copy during the spin.
   void enable_post_ag_wait(bool on);
   bool is_post_ag_wait_enabled() const { return post_ag_wait_enabled_; }
+
+  // --- Plan A: direct-output CU XGMI AG (perf_history Entry 18) ---
+  // When on AND copy_output_to_user is on, the AR kernel's compute
+  // blocks replace SDMA AG + external hipMemcpyAsync with CU XGMI reads
+  // from peer transits + direct writes to user_output. Measured CU
+  // XGMI BW = 370 GB/s (at 16 blocks/peer, 32 MB/peer shard), so the
+  // 1.18 ms AG+copy phase should drop to ~0.61 ms per AR.
+  // Only applies to MULTI_CHUNK path; single-chunk falls back to
+  // legacy SDMA AG regardless of this flag.
+  void enable_direct_output(bool on);
+  bool is_direct_output_enabled() const { return direct_output_enabled_; }
 
   // --- D' prototype: lazy-register user output as symm memory --------
   // Turn on/off the fast path. When on, pipelined() tries to use the

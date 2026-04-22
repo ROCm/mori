@@ -5,18 +5,15 @@
 # (multi-stage pipelined GEMM+AR overlap) @ 256MB.
 #
 # History:
-#   - v1..v2: τ (MORI_KEEP_HBM_HOT) + ξ (MORI_AR_WARMUP) — both FAILED
-#     (perf_history.md Entry 14), reverted.
-#   - v3: ν (MORI_SKIP_ITER_SYNC) — FAILED, measurement artifact
-#     (perf_history.md Entry 15), reverted.
-#   - v4: τ'' (MORI_HBM_NOISE) — FAILED, HBM noise doesn't speed up AG
-#     (perf_history.md Entry 16), reverted.
-#   - v5: baseline-only, for clean post-revert measurement.
-#   - v6: E'' (MORI_INKERNEL_COPY=1) FAILED — HBM contention between
-#     CU copy and SDMA AG made AG wait +0.05~0.2 ms per AR regardless
-#     of block count (v1=20/peer:+0.05, v2=1/peer:+1.5, v3=8/peer:+0.18).
-#     Net wall regression, reverted. See perf_history Entry 17.
-#   - v7 (current): baseline-only again.
+#   - v1..v6: τ/ξ/ν/τ''/E'' all FAILED, reverted. See perf_history
+#     Entries 14-17.
+#   - v7: baseline-only.
+#   - v8 (current): DIRECT (MORI_DIRECT_OUTPUT=1) — plan A per
+#     perf_history Entry 18. CU XGMI AG + direct write user_output,
+#     skips SDMA AG and external hipMemcpyAsync. Measured CU XGMI BW
+#     = 370 GB/s at 16 blocks/peer → expected AR[3] total ~0.8 ms
+#     (vs 1.3 ms baseline), ~0.5 ms/AR saving, wall 7.79 → ~6.5-6.7 ms
+#     (superior to RCCL 7.42).
 #
 # Usage (inside ROCm container):
 #   cd /home/fizhang/test/mori
@@ -111,10 +108,19 @@ run_variant_extra() {
   echo "========== HEAD =========="
   git log -1 --oneline
 
+  DIR_ENV="MORI_DIRECT_OUTPUT=1"
+
   run_variant "BASELINE" ""
+  run_variant "DIRECT"   "$DIR_ENV"
+
   run_variant_extra "BASELINE_TIMELINE"  "" --timeline
+  run_variant_extra "DIRECT_TIMELINE"    "$DIR_ENV" --timeline
+
   run_variant_extra "BASELINE_AR0_PHASE" "MORI_PHASE_TARGET_STAGE=0" --ar-phase-timing
+  run_variant_extra "DIRECT_AR0_PHASE"   "$DIR_ENV MORI_PHASE_TARGET_STAGE=0" --ar-phase-timing
+
   run_variant_extra "BASELINE_AR3_PHASE" "MORI_PHASE_TARGET_STAGE=3" --ar-phase-timing
+  run_variant_extra "DIRECT_AR3_PHASE"   "$DIR_ENV MORI_PHASE_TARGET_STAGE=3" --ar-phase-timing
 } | tee "$LOG"
 
 echo
@@ -141,17 +147,32 @@ PHASE_RE="(\[[0-9]\] total|entry.*scatter_done|scatter.*compute-wait|compute-wai
 
 echo
 echo "---- [2] per-stage median (BASELINE_TIMELINE) ----"
-awk '/========== BASELINE_TIMELINE ==========/,/========== BASELINE_AR0_PHASE ==========/' "$LOG" \
+awk '/========== BASELINE_TIMELINE ==========/,/========== DIRECT_TIMELINE ==========/' "$LOG" \
   | grep -E "stage \|| *[0-3] \||median wall|AR\[[0-3]\] duration|AR\[.\]-GEMM" || true
 
 echo
-echo "---- [3] BASELINE AR[0] phase ----"
-awk '/========== BASELINE_AR0_PHASE ==========/,/========== BASELINE_AR3_PHASE ==========/' "$LOG" \
+echo "---- [3] per-stage median (DIRECT_TIMELINE) ----"
+awk '/========== DIRECT_TIMELINE ==========/,/========== BASELINE_AR0_PHASE ==========/' "$LOG" \
+  | grep -E "stage \|| *[0-3] \||median wall|AR\[[0-3]\] duration|AR\[.\]-GEMM" || true
+
+echo
+echo "---- [4] BASELINE AR[0] phase ----"
+awk '/========== BASELINE_AR0_PHASE ==========/,/========== DIRECT_AR0_PHASE ==========/' "$LOG" \
   | grep -E "$PHASE_RE" || true
 
 echo
-echo "---- [4] BASELINE AR[3] phase ----"
-awk '/========== BASELINE_AR3_PHASE ==========/,0' "$LOG" \
+echo "---- [5] DIRECT AR[0] phase ----"
+awk '/========== DIRECT_AR0_PHASE ==========/,/========== BASELINE_AR3_PHASE ==========/' "$LOG" \
+  | grep -E "$PHASE_RE" || true
+
+echo
+echo "---- [6] BASELINE AR[3] phase ----"
+awk '/========== BASELINE_AR3_PHASE ==========/,/========== DIRECT_AR3_PHASE ==========/' "$LOG" \
+  | grep -E "$PHASE_RE" || true
+
+echo
+echo "---- [7] DIRECT AR[3] phase (KEY — expect ~0.8 ms total, no hipMemcpy) ----"
+awk '/========== DIRECT_AR3_PHASE ==========/,0' "$LOG" \
   | grep -E "$PHASE_RE" || true
 
 echo

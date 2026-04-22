@@ -169,7 +169,21 @@ __global__ void PipelinedAllReduceSdmaKernel(
                               reduce until block 0 sets this flag (after AG
                               wait done). Used to measure how much CU
                               occupancy during AG wait costs the overlap
-                              benchmark (GEMM variability, wall time). */ ) {
+                              benchmark (GEMM variability, wall time). */,
+    T* user_output_direct = nullptr /* Plan A (perf_history Entry 18):
+                                       when non-null AND MULTI_CHUNK,
+                                       block 0 SKIPS SDMA AG and compute
+                                       blocks perform CU XGMI AG: each
+                                       block reads from one peer's
+                                       transit[peer_slot] via P2P pointer
+                                       and writes directly into
+                                       user_output[peer_slot]. Measured
+                                       CU XGMI read BW = 370 GB/s at 16
+                                       blocks/peer for 32 MB shards, so
+                                       AG+copy 1.175 ms → ~0.61 ms.
+                                       Host MUST skip external
+                                       hipMemcpyAsync when passing
+                                       non-null. */ ) {
 
   ar_write_phase_ts(phase_ts, 0);  // phase 0: kernel entry
 
@@ -347,6 +361,81 @@ __global__ void PipelinedAllReduceSdmaKernel(
         ar_write_phase_ts_cb1(phase_ts, 31);  // post_ag_flag observed
       }
 
+      // ================================================================
+      // Plan A (perf_history Entry 18): CU XGMI AG + direct write to
+      // user_output. Runs only when user_output_direct != nullptr AND
+      // MULTI_CHUNK. Requires post_ag_flag to coordinate "cross-PE
+      // reduce barrier done" — set by block 0 after all chunks' barriers.
+      //
+      // Block → peer assignment: blocks [peer*kBppA, (peer+1)*kBppA) are
+      // assigned to peer. kBppA = 16 (validated best-BW at 32 MB/peer by
+      // cu_xgmi_bench: 370 GB/s, saturated at 16). With compBlocks=160
+      // and npes=8, that's 128 copy workers + 32 idle.
+      //
+      // For peer == myPe: my shard is already in local transit[myPe_slot]
+      // (reduce result). Local copy transit → user_output[myPe_slot].
+      // For peer != myPe: XGMI load peer_transit[peer_slot] via
+      // dstMemObj->peerPtrs[peer] and write user_output[peer_slot].
+      //
+      // The post_ag_flag gate above is critical: compute blocks must
+      // NOT XGMI-load peer_transit[peer_slot] until all peers finished
+      // their reduce (peer_transit[peer_slot] is written by peer's
+      // reduce, not by any scatter, so waiting for cross-PE reduce
+      // barrier is sufficient — no extra AG signal needed).
+      // ================================================================
+      if constexpr (MULTI_CHUNK) {
+        if (user_output_direct != nullptr && compBlocks > 0) {
+          constexpr int kBppA = 16;
+          const int cbId = static_cast<int>(blockIdx.x) - 1;
+          const int peer = cbId / kBppA;
+          const int posInPeer = cbId % kBppA;
+          const bool active = (peer < npes) && (posInPeer < kBppA);
+
+          if (active) {
+            using vec_t = ulonglong2;  // 16 B
+            static_assert(sizeof(vec_t) == 16, "vec_t must be 16B");
+
+            const size_t peerOffset =
+                static_cast<size_t>(peer) * totalShardBytes;
+            const uint8_t* srcBase =
+                reinterpret_cast<const uint8_t*>(
+                    (peer == myPe)
+                        ? dstMemObj->localPtr          // local read for myPe
+                        : dstMemObj->peerPtrs[peer])   // XGMI read for others
+                + peerOffset;
+            uint8_t* dstBase =
+                reinterpret_cast<uint8_t*>(user_output_direct) + peerOffset;
+
+            const size_t totalVecs = totalShardBytes / sizeof(vec_t);
+            const size_t vecsPerBlock =
+                (totalVecs + kBppA - 1) / kBppA;
+            const size_t vStart =
+                static_cast<size_t>(posInPeer) * vecsPerBlock;
+            const size_t vEnd =
+                (vStart + vecsPerBlock > totalVecs) ? totalVecs
+                                                     : (vStart + vecsPerBlock);
+
+            const vec_t* src = reinterpret_cast<const vec_t*>(srcBase);
+            vec_t* dst = reinterpret_cast<vec_t*>(dstBase);
+
+            for (size_t v = vStart + threadIdx.x; v < vEnd;
+                 v += blockDim.x) {
+              dst[v] = src[v];
+            }
+            // Tail bytes (only last-pos block of last peer).
+            const size_t tailStart = totalVecs * sizeof(vec_t);
+            if (tailStart < totalShardBytes
+                && peer == npes - 1 && posInPeer == kBppA - 1) {
+              for (size_t t = tailStart + threadIdx.x;
+                   t < totalShardBytes; t += blockDim.x) {
+                dstBase[t] = srcBase[t];
+              }
+            }
+            __syncthreads();
+          }
+        }
+      }
+
       ar_write_phase_ts_cb1(phase_ts, 11 + 3 * numChunks);  // compute block exit
 
     } else {
@@ -436,59 +525,56 @@ __global__ void PipelinedAllReduceSdmaKernel(
           }
           ar_write_phase_ts(phase_ts, 2 + 3 * c + 1);  // chunk c: cross-PE barrier done
 
-          // 3. SDMA AG for chunk c.
-          if (thr < npes && thr != myPe) {
-            const int destPe = thr;
-            anvil::SdmaQueueDeviceHandle** dh =
-                dstMemObj->deviceHandles_d + destPe * numQ;
-            HSAuint64* rSig = dstMemObj->peerSignalPtrs[destPe]
-                + static_cast<size_t>(myPe) * numQ;
+          // 3. SDMA AG for chunk c. SKIPPED when user_output_direct != nullptr
+          //    (plan A: compute blocks do CU XGMI AG + direct write instead).
+          if (user_output_direct == nullptr) {
+            if (thr < npes && thr != myPe) {
+              const int destPe = thr;
+              anvil::SdmaQueueDeviceHandle** dh =
+                  dstMemObj->deviceHandles_d + destPe * numQ;
+              HSAuint64* rSig = dstMemObj->peerSignalPtrs[destPe]
+                  + static_cast<size_t>(myPe) * numQ;
 
-            const size_t cOff = static_cast<size_t>(c) * chunkBytes;
-            size_t agBytes = chunkBytes;
-            if (cOff + agBytes > totalShardBytes)
-              agBytes = totalShardBytes - cOff;
+              const size_t cOff = static_cast<size_t>(c) * chunkBytes;
+              size_t agBytes = chunkBytes;
+              if (cOff + agBytes > totalShardBytes)
+                agBytes = totalShardBytes - cOff;
 
-            uint8_t* src = reinterpret_cast<uint8_t*>(dstMemObj->localPtr)
-                + static_cast<size_t>(myPe) * totalShardBytes + cOff;
-            uint8_t* dst = reinterpret_cast<uint8_t*>(dstMemObj->peerPtrs[destPe])
-                + static_cast<size_t>(myPe) * totalShardBytes + cOff;
-            core::SdmaPutThread(src, dst, agBytes, dh, rSig, numQ, 1);
+              uint8_t* src = reinterpret_cast<uint8_t*>(dstMemObj->localPtr)
+                  + static_cast<size_t>(myPe) * totalShardBytes + cOff;
+              uint8_t* dst = reinterpret_cast<uint8_t*>(dstMemObj->peerPtrs[destPe])
+                  + static_cast<size_t>(myPe) * totalShardBytes + cOff;
+              core::SdmaPutThread(src, dst, agBytes, dh, rSig, numQ, 1);
+            }
           }
           ar_write_phase_ts(phase_ts, 2 + 3 * c + 2);  // chunk c: AG submit done
         }
 
-        // Stage 2b-0: per-chunk AG wait. Instead of waiting for all chunks
-        // to land in a single loop, wait chunk-by-chunk so we can know the
-        // exact completion time of each chunk. This is the foundation for
-        // Stage 2b-1 (compute-block per-chunk in-kernel copy).
-        //
-        // Kernel wall impact: each extra chunk adds one __syncthreads() plus
-        // its own sleep/poll loop. Should be on the order of tens of us;
-        // if this pushes kernel wall up significantly (>0.1 ms), it
-        // reproduces the Path B failure mode and we must revert.
-        //
-        // Per-chunk timestamps are written to slot 20+c (c=0..numChunks-1)
-        // for Stage 2b-0b analysis of AG completion timing distribution.
-        for (int c = 0; c < numChunks; c++) {
-          if (thr < npes && thr != myPe) {
-            const int sender = thr;
-            const uint64_t expected_c =
-                s_ag_by_sender[sender] + static_cast<uint64_t>(c + 1);
-            HSAuint64* sig = dstMemObj->signalPtrs
-                + static_cast<size_t>(sender) * numQ + 1;
-            while (core::AtomicLoadRelaxed(sig) < expected_c)
-              __builtin_amdgcn_s_sleep(1);
-          }
-          __syncthreads();
-          if (phase_ts != nullptr && threadIdx.x == 0 && (20 + c) < kArPhaseTsCapacity) {
-            phase_ts[20 + c] = __builtin_amdgcn_s_memtime();  // chunk c AG done
+        // Per-chunk AG wait. Also skipped under plan A (compute blocks
+        // do their own cross-peer wait via flag after reduce).
+        if (user_output_direct == nullptr) {
+          for (int c = 0; c < numChunks; c++) {
+            if (thr < npes && thr != myPe) {
+              const int sender = thr;
+              const uint64_t expected_c =
+                  s_ag_by_sender[sender] + static_cast<uint64_t>(c + 1);
+              HSAuint64* sig = dstMemObj->signalPtrs
+                  + static_cast<size_t>(sender) * numQ + 1;
+              while (core::AtomicLoadRelaxed(sig) < expected_c)
+                __builtin_amdgcn_s_sleep(1);
+            }
+            __syncthreads();
+            if (phase_ts != nullptr && threadIdx.x == 0 && (20 + c) < kArPhaseTsCapacity) {
+              phase_ts[20 + c] = __builtin_amdgcn_s_memtime();  // chunk c AG done
+            }
           }
         }
-        ar_write_phase_ts(phase_ts, 2 + 3 * numChunks);  // AG wait done (all peers)
+        ar_write_phase_ts(phase_ts, 2 + 3 * numChunks);  // AG wait done (or skipped)
 
-        // Stage 1 E' prototype: release compute blocks that were
-        // spin-waiting post-reduce.
+        // Release compute blocks waiting post-reduce. Under plan A this
+        // also means "cross-PE reduce barrier is done, safe to XGMI load
+        // peer transits". Block 0's role finishes here; compute blocks
+        // do the CU XGMI AG + direct-write-to-user_output phase below.
         if (post_ag_flag != nullptr && threadIdx.x == 0) {
           __threadfence();
           __hip_atomic_store(post_ag_flag, 1u,
