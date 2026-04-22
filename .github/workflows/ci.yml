@@ -70,6 +70,12 @@ jobs:
           - platform: MI355X_AINIC
             runner: [self-hosted, MI355X-AINIC-TW]
             rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
+            rdma_sl: 3
+            rdma_tc: 104
+    env:
+      MORI_RDMA_DEVICES: ${{ matrix.rdma_devices }}
+      MORI_RDMA_SL: ${{ matrix.rdma_sl }}
+      MORI_RDMA_TC: ${{ matrix.rdma_tc }}
     timeout-minutes: 45
     steps:
       - name: Checkout
@@ -84,7 +90,9 @@ jobs:
         run: |
           $CT rm -f $CONTAINER 2>/dev/null || true
           CONTAINER_RUNTIME=$CT ./docker/ci_run.sh --name $CONTAINER \
-            -e MORI_RDMA_DEVICES=${{ matrix.rdma_devices }} \
+            -e MORI_RDMA_DEVICES=$MORI_RDMA_DEVICES \
+            -e MORI_RDMA_SL=$MORI_RDMA_SL \
+            -e MORI_RDMA_TC=$MORI_RDMA_TC \
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
             -w $GITHUB_WORKSPACE \
             $IMAGE sleep infinity
@@ -252,7 +260,7 @@ jobs:
 
   internode-test:
     name: mori internode test (${{ matrix.platform }})
-    needs: [build, intranode-test]
+    needs: build
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
