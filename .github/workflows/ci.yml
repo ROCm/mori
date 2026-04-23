@@ -227,6 +227,11 @@ jobs:
           - platform: MI355X_AINIC
             runner: [self-hosted, MI355X-AINIC-TW]
             rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
+            gpu_arch: gfx950
+          - platform: MI300X_BNXT
+            runner: [self-hosted, MI300X-BNXT]
+            rdma_devices: bnxt_re0,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re7,bnxt_re8,bnxt_re9
+            gpu_arch: gfx942
     timeout-minutes: 90
     steps:
       - name: Checkout
@@ -236,7 +241,7 @@ jobs:
 
       - name: Build JAX CI image
         run: |
-          BUILD_ARGS="--network=host --build-arg GPU_TARGET=gfx950"
+          BUILD_ARGS="--network=host --build-arg GPU_TARGET=${{ matrix.gpu_arch }}"
           if [ "$CT" = "podman" ]; then
             BUILD_ARGS="$BUILD_ARGS --isolation=chroot"
           fi
