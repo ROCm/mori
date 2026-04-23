@@ -24,6 +24,8 @@ jobs:
         include:
           - platform: MI355X_AINIC
             runner: [self-hosted, MI355X-AINIC-TW]
+          - platform: MI300X_BNXT
+            runner: [self-hosted, MI300X-BNXT]
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -71,6 +73,11 @@ jobs:
           - platform: MI355X_AINIC
             runner: [self-hosted, MI355X-AINIC-TW]
             rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
+            rdma_sl: 3
+            rdma_tc: 104
+          - platform: MI300X_BNXT
+            runner: [self-hosted, MI300X-BNXT]
+            rdma_devices: bnxt_re0,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re7,bnxt_re8,bnxt_re9
             rdma_sl: 3
             rdma_tc: 104
     env:
@@ -281,8 +288,20 @@ jobs:
             rdma_devices: rocep105s0,rocep121s0,rocep137s0,rocep153s0,rocep233s0,rocep249s0,rocep25s0,rocep9s0
             rdma_sl: 3
             rdma_tc: 104
+            ct: podman
+          - platform: MI300X_BNXT
+            runner: [self-hosted, MI300X-BNXT]
+            node1_host: 10.245.128.61
+            node2_host: 10.245.128.59
+            node2_port: 22
+            node1_ifname: enp159s0np0
+            node2_ifname: enp159s0np0
+            rdma_devices: bnxt_re0,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re7,bnxt_re8,bnxt_re9
+            rdma_sl: 3
+            rdma_tc: 104
+            ct: docker
     env:
-      CT: podman  # internode runners (MI355X-AINIC) only have podman
+      CT: ${{ matrix.ct }}
       NODE1_HOST: ${{ matrix.node1_host }}
       NODE2_HOST: ${{ matrix.node2_host }}
       NODE2_PORT: ${{ matrix.node2_port }}
