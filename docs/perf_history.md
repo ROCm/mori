@@ -875,28 +875,21 @@ regardless of today's RCCL variance.
   - Updated comments documenting Plan A design
 
 ### Next step (Step 2)
-User to run in Linux container (`smci355-ccs-aus-m01-33`):
+User runs in Linux container (`smci355-ccs-aus-m01-33`):
+
+```bash
+cd /home/fizhang/test/mori && bash tools/bench_plan_a.sh
 ```
-cd /home/fizhang/test/mori && git pull origin sdma-test
-# build
-pip install -e . --no-build-isolation
 
-# Plan A wall (iter=100)
-MORI_PIPELINE_CU=160 MORI_DIRECT_OUTPUT=1 python3 \
-  tests/python/ccl/test_allreduce.py --num-stages 4 --elems 67108864 \
-  --iterations 100 --warmup 20 2>&1 | tee /tmp/plan_a_wall.log
-
-# Plan A phase timing (iter=3)
-MORI_PIPELINE_CU=160 MORI_DIRECT_OUTPUT=1 MORI_PHASE_TARGET_STAGE=0 \
-  python3 tests/python/ccl/test_allreduce.py --num-stages 4 \
-  --elems 67108864 --iterations 3 --warmup 2 --ar-phase-timing \
-  2>&1 | tee /tmp/plan_a_phase.log
-
-# Extract for reply
-grep -E "Plan A active|overlap|seq_ar|seq_gemm|RCCL|vs RCCL" /tmp/plan_a_wall.log
-grep -E "chunk [0-9]|entry|exit|barrier|AG|compute-wait|reduce|cb-exit" \
-  /tmp/plan_a_phase.log | head -80
-```
+`tools/bench_plan_a.sh` (added in this commit) handles:
+- preflight (hipcc / cmake / python3 / torch.cuda)
+- `git pull origin sdma-test`
+- **build**: `BUILD_EXAMPLES=ON BUILD_TESTS=ON pip3 install .` (correct
+  form; pybind11 is a build-time dep from `pyproject.toml` and gets
+  auto-installed by pip's build-isolation, which `--no-build-isolation`
+  wrongly bypasses — that caused a failed build in the first attempt)
+- Runs BASELINE + PLAN_A wall (iter=100) + AR[0] phase timing both
+- Prints comparison table at end
 
 Compare `overlap` to BASELINE 7.802 / RCCL 7.565 / RCCL Entry 18 7.422.
 All Test 6 variants (copy/no-copy/RCCL) must correctness-pass.

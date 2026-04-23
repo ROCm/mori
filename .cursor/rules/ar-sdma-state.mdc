@@ -114,27 +114,13 @@ HEAD = **`e7050bc6`** (本次 commit).
 
 ## 下一步行动 (R0 分步)
 
-**Step 2 (user 跑实测)**:
+**Step 2 (user 跑实测)**: 一条命令:
 
 ```bash
-cd /home/fizhang/test/mori && git pull origin sdma-test
-pip install -e . --no-build-isolation
-
-# Plan A wall (iter=100)
-MORI_PIPELINE_CU=160 MORI_DIRECT_OUTPUT=1 python3 \
-  tests/python/ccl/test_allreduce.py --num-stages 4 --elems 67108864 \
-  --iterations 100 --warmup 20 2>&1 | tee /tmp/plan_a_wall.log
-
-# Plan A phase timing (iter=3)
-MORI_PIPELINE_CU=160 MORI_DIRECT_OUTPUT=1 MORI_PHASE_TARGET_STAGE=0 \
-  python3 tests/python/ccl/test_allreduce.py --num-stages 4 \
-  --elems 67108864 --iterations 3 --warmup 2 --ar-phase-timing \
-  2>&1 | tee /tmp/plan_a_phase.log
-
-# 结果提取
-grep -E "Plan A active|overlap|seq_ar|seq_gemm|RCCL|vs RCCL" /tmp/plan_a_wall.log
-grep -E "chunk [0-9]|entry|exit|barrier|AG|compute-wait|reduce|cb-exit" /tmp/plan_a_phase.log | head -80
+cd /home/fizhang/test/mori && bash tools/bench_plan_a.sh
 ```
+
+脚本 `tools/bench_plan_a.sh` 做了: preflight + `git pull origin sdma-test` + **正确 build** (`BUILD_EXAMPLES=ON BUILD_TESTS=ON pip3 install .`) + BASELINE/PLAN_A wall + AR[0] phase timing + 对比表.
 
 **收到实测数据后**:
 1. 更新 Entry 19 (记录 Plan A 实测 wall + phase breakdown)
@@ -146,20 +132,35 @@ grep -E "chunk [0-9]|entry|exit|barrier|AG|compute-wait|reduce|cb-exit" /tmp/pla
 
 ## 关键命令速查
 
+### Build (容器内)
+
+**正确命令**:
 ```bash
-# 跑 BASELINE (iter=100, 30 秒)
-cd /home/fizhang/test/mori && \
-  MORI_PIPELINE_CU=160 python3 tests/python/ccl/test_allreduce.py \
+BUILD_EXAMPLES=ON BUILD_TESTS=ON pip3 install .
+```
+
+**错误命令** (会失败):
+- `pip install -e . --no-build-isolation` — bypass build-isolation, pybind11 (build-time dep from `pyproject.toml`) 不会被装, cmake configure 找不到 `pybind11` include dir 失败.
+- `pip install -e .` — editable 可能也 OK (需测试), 但缺 BUILD_EXAMPLES/BUILD_TESTS flag.
+
+### Tests
+
+```bash
+# 完整 Plan A bench (build + BASELINE + PLAN_A + phase, 含对比表)
+bash tools/bench_plan_a.sh
+
+# 只跑 BASELINE (iter=100, 30 秒, skip build if 已 build)
+SKIP_BUILD=1 SKIP_PULL=1 bash tools/bench_plan_a.sh  # 不完全是 baseline-only, 脚本内会跑 BASELINE+PLAN_A
+
+# 手动跑 BASELINE
+cd /home/fizhang/test/mori && MORI_PIPELINE_CU=160 python3 tests/python/ccl/test_allreduce.py \
     --num-stages 4 --elems 67108864 --iterations 100 --warmup 20
 
-# 跑 Plan A DIRECT
+# 手动跑 Plan A DIRECT
 MORI_PIPELINE_CU=160 MORI_DIRECT_OUTPUT=1 python3 tests/python/ccl/test_allreduce.py \
     --num-stages 4 --elems 67108864 --iterations 100 --warmup 20
 
 # Phase timing (iter=3 足够)
-MORI_PIPELINE_CU=160 MORI_PHASE_TARGET_STAGE=0 python3 tests/python/ccl/test_allreduce.py \
+MORI_PIPELINE_CU=160 MORI_DIRECT_OUTPUT=1 MORI_PHASE_TARGET_STAGE=0 python3 tests/python/ccl/test_allreduce.py \
     --num-stages 4 --elems 67108864 --iterations 3 --warmup 2 --ar-phase-timing
-
-# 完整 bench (BASELINE + DIRECT, 多变体)
-bash tools/bench_tau_xi.sh
 ```
