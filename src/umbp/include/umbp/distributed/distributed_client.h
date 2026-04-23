@@ -65,8 +65,8 @@ class DistributedClient : public IUMBPClient {
   void Close() override;
   bool IsDistributed() const override;
 
-  bool RegisterMemory(void* ptr, size_t size);
-  void DeregisterMemory(void* ptr);
+  bool RegisterMemory(uintptr_t ptr, size_t size) override;
+  void DeregisterMemory(uintptr_t ptr) override;
 
  private:
   UMBPConfig config_;

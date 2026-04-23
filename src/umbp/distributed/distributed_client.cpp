@@ -167,18 +167,18 @@ size_t DistributedClient::BatchExistsConsecutive(const std::vector<std::string>&
 // RegisterMemory / DeregisterMemory
 // ---------------------------------------------------------------------------
 
-bool DistributedClient::RegisterMemory(void* ptr, size_t size) {
+bool DistributedClient::RegisterMemory(uintptr_t ptr, size_t size) {
   if (closing_) return false;
   std::shared_lock lk(op_mutex_);
   if (closed_) return false;
-  return pool_client_->RegisterMemory(ptr, size);
+  return pool_client_->RegisterMemory(reinterpret_cast<void*>(ptr), size);
 }
 
-void DistributedClient::DeregisterMemory(void* ptr) {
+void DistributedClient::DeregisterMemory(uintptr_t ptr) {
   if (closing_) return;
   std::shared_lock lk(op_mutex_);
   if (closed_) return;
-  pool_client_->DeregisterMemory(ptr);
+  pool_client_->DeregisterMemory(reinterpret_cast<void*>(ptr));
 }
 
 // ---------------------------------------------------------------------------

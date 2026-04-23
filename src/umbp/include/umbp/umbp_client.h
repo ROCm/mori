@@ -97,6 +97,18 @@ class IUMBPClient {
 
   /// Returns true when the client operates in distributed (master-led) mode.
   virtual bool IsDistributed() const = 0;
+
+  // ---- Optional zero-copy hooks ----
+  //
+  // Register a host buffer for zero-copy RDMA transfers.  Standalone
+  // mode needs no registration (CPU-local memcpy), so the default
+  // implementation is a no-op returning true.  DistributedClient
+  // overrides to pin + export the buffer through IOEngine.  Implementers
+  // that *do* require registration MUST override; callers may treat a
+  // `true` return as "registered or not-needed", and `false` as a hard
+  // failure that must be surfaced.
+  virtual bool RegisterMemory(uintptr_t /*ptr*/, size_t /*size*/) { return true; }
+  virtual void DeregisterMemory(uintptr_t /*ptr*/) {}
 };
 
 /// Factory: creates the appropriate IUMBPClient implementation.
