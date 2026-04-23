@@ -1,0 +1,137 @@
+---
+description: SDMA AllReduce 优化任务当前状态速览 — 每次开启关于 SDMA AR 性能的新会话必读
+alwaysApply: true
+---
+
+# SDMA AllReduce 优化 · 当前状态速览 (2026-04-23)
+
+**本文档是 SDMA AR perf 优化任务跨 session 的"活"状态文件**. 每次新会话开始前必读.
+
+关联文件:
+- `.cursor/rules/relentless-perf.mdc` — 方法论规则 (R0-R15)
+- `docs/perf_history.md` — 所有历史 Entry (1-18) 含数据
+
+---
+
+## 硬性目标 (不可放弃, 按 R4)
+
+`AllreduceSdma(copy_output_to_user=True)(input, output, stream)` 的 multi-stage overlap wall **≤ RCCL `dist.all_reduce(tensor)` wall**.
+
+测量: 256MB / stage × 4 stages × 8-rank MI355X, `tests/python/ccl/test_allreduce.py --num-stages 4 --elems 67108864 --iterations 100 --warmup 20`, median over ≥100 iters.
+
+---
+
+## 当前性能数据 (2026-04-23, HEAD=5f0072e7)
+
+| 变体 | overlap wall | seq_ar | vs RCCL overlap |
+|---|---|---|---|
+| **BASELINE** (SDMA copy) | **7.798** ms | 5.188 | +5.1% (差 0.376 ms) |
+| **SDMA no-copy** (reference, 非 drop-in) | 7.402 ms | 4.775 | -0.3% (已超 RCCL, 但违反 R7) |
+| **RCCL** | 7.422 ms | 5.129 | — |
+| **Plan B (DIRECT)** | 8.955 ms | 5.538 | **+19.6% (+1.16ms WORSE)** |
+
+**Target gap**: 当前 0.376 ms (BASELINE). 需消除至 ≤ 0.
+
+---
+
+## 根因 (一句话, 反复确认过)
+
+SDMA two-shot 算法比 RCCL ring **多一步 256MB copy (transit → user_output)**, 这是 CU blit (`hipMemcpyAsync` D2D, 走 CU 不走 SDMA engine), 每 stage gpu wall 0.26 ms, 4 stages 累积 1.04 ms, overlap 下暴露 0.4 ms. 这是 **唯一** 的 gap.
+
+**算法本体对比** (Entry 16 验证):
+- SDMA no-copy (scatter + reduce + AG) = **6.93 ms** (胜 RCCL 0.5 ms)
+- RCCL all_reduce = 7.43 ms
+- 差距全部在 "最后那步 copy 到 user_output", RCCL 算法里根本没有这一步.
+
+---
+
+## 已验证 FAILED 的方向 (不得重试, 除非有新机制证据)
+
+| 方向 | Entry | 失败原因 |
+|---|---|---|
+| τ (MORI_KEEP_HBM_HOT) | 14 | HBM hot keep 对 AG 无加速 |
+| ξ (MORI_AR_WARMUP) | 14 | pre-warm 对 cold path 无加速 |
+| ν (MORI_SKIP_ITER_SYNC) | 15 | 测量 artifact, 非真实 gain |
+| τ'' (MORI_HBM_NOISE) | 16 | HBM noise 对 AG 无影响 |
+| E'' (MORI_INKERNEL_COPY) | 17 | compute block 在 AG wait 时 copy → HBM 争用 |
+| D' (shmem register user_output) | 11 | PyTorch caching allocator + `hipIpcOpenMemHandle` offset 语义冲突 → correctness fail |
+| **Plan A/B (K1 SDMA scatter + K2 CU reduce+AG+copy)** | **18** | **CU XGMI push AG 比 SDMA AG 慢 + CU 和 GEMM 抢 CU. wall +1.16ms 退化. β partition 7:1 不合理且无数据支撑.** |
+| CU sweep (80..220) | 3 | copy exposure 在 CU ≥120 下 invariant |
+| 压 kernel priority | 5 | priority 对 wall 无 measurable effect |
+
+**关键教训** (R6):
+- cu_xgmi_bench 测 370 GB/s 是 CU XGMI **read**, 不是 Plan B 实际用的 CU XGMI **write (push)**. Micro-bench 必须匹配使用方向.
+- Micro-bench 独占 GPU 下的 BW 不能直接外推到 overlap (CU 和 GEMM 争) 场景.
+- Plan B copy phase timing `slot 11+3c+2` 由 `ar_write_phase_ts_cb1` 写入, 但该 helper 只让 blockIdx==1 写, R-block 不进 C-group → copy timing 永远 0, **开发全程从未测过 copy wall, 违反 R0**.
+
+---
+
+## 未验证方向 (候选, 按 R3 ≥ 3 条)
+
+| # | 方向 | 做法 | 预期收益 | 主要风险 | 状态 |
+|---|---|---|---|---|---|
+| 1 | **π'** | copy 移到独立 SDMA queue + 双缓冲 transit, 下次 AR 不等上次 copy | (N-1)×0.35 = 1.05 ms | +256MB 内存, 需第 3 个 SDMA queue | Entry 16 提出, **从未实施** |
+| 2 | **D''** | 显式 `register_user_output(ptr, size)` collective API, user hot-loop 前一次调用 | 消掉整个 copy → wall ~6.93ms | user API 需显式管理 lifetime | 待实施 |
+| 3 | **μ'** | ring/tree 算法替换 two-shot, 直接写 user_output (仿 RCCL 无 transit) | 和 RCCL 打平 | 算法完全重写 | 待实施 |
+| 4 | **Plan B v2** | 调 β partition + 修 phase timing bug + 补 CU push micro-bench | 理论 0.24 ms gain → wall 7.56ms (小幅超 RCCL) | CU 和 GEMM 争用 (根本缺陷) | 代码仍在 HEAD, user 指示暂保留 |
+
+---
+
+## 代码当前状态
+
+HEAD = `5f0072e7`, working tree clean.
+
+- Plan A/B 相关代码 **未 revert** (user 指示保留, debug β partition).
+- Plan B kernel = `PipelinedCuReduceAgCopyKernel` 在 `include/mori/collective/allreduce/pipelined_allreduce_sdma_kernel.hpp` L641-918.
+- Plan B 激活方式 = `MORI_DIRECT_OUTPUT=1` env var.
+- 外部 trigger: `tests/python/ccl/test_allreduce.py` 的 Test 6 setup 读 `MORI_DIRECT_OUTPUT` 调 `ar_obj.enable_direct_output(True)`.
+- bench script: `tools/bench_tau_xi.sh` 有 BASELINE + DIRECT 两个变体.
+- micro-bench: `examples/sdma/cu_xgmi_bench.cpp` (只有 read 方向, 需补 write 方向).
+
+---
+
+## 下一步行动建议 (按优先级)
+
+**如果继续调 Plan B (R4 不放弃)**:
+1. 修 phase timing bug: 加 `ar_write_phase_ts_cbC(ts, idx, nR)` helper, 让 blockIdx==nR+1 (C-group first block) 写 copy done
+2. β partition 可配置: `MORI_PLAN_B_NR` env var, kernel signature 加 `int nR_override` 参数, 默认按理论 `nR = compBlocks * 6 / 10` (60:40 R:C)
+3. 补 CU XGMI **write (push)** micro-bench (扩展 `cu_xgmi_bench.cpp`)
+4. 跑 phase sweep (iter=3 + `--ar-phase-timing`), 看每 phase 实测 μs
+5. 扫 nR ∈ {60, 80, 96, 110, 120} 找最优
+6. iter=100 验证 overlap wall
+
+**如果 revert Plan B**:
+1. `git checkout 5699f028 -- src/ include/ python/ tests/ tools/bench_tau_xi.sh` (7 个文件)
+2. 保留 `examples/sdma/cu_xgmi_bench.cpp`, `tools/bench_xgmi_sdma_bw.sh`, `.cursor/rules/` (micro-bench infra + rule)
+3. commit "revert(plan A/B): ... see perf_history Entry 18"
+4. 转向 π' 或 D''
+
+**最可能达标的方向**: **D''** (消掉整个 copy → wall 6.93ms, 超 RCCL 0.5ms). 最大的 blocker 是 PyTorch allocator 生命周期. 可以通过 user 显式 register + explicit lifetime bind 绕开.
+
+---
+
+## 关键命令速查
+
+```bash
+# 跑 BASELINE (iter=100, 30 秒)
+cd /home/fizhang/test/mori && \
+  MORI_PIPELINE_CU=160 python3 tests/python/ccl/test_allreduce.py \
+    --num-stages 4 --elems 67108864 --iterations 100 --warmup 20
+
+# 跑 Plan B DIRECT
+MORI_PIPELINE_CU=160 MORI_DIRECT_OUTPUT=1 python3 tests/python/ccl/test_allreduce.py \
+    --num-stages 4 --elems 67108864 --iterations 100 --warmup 20
+
+# Phase timing (iter=3 足够)
+MORI_PIPELINE_CU=160 MORI_PHASE_TARGET_STAGE=0 python3 tests/python/ccl/test_allreduce.py \
+    --num-stages 4 --elems 67108864 --iterations 3 --warmup 2 --ar-phase-timing
+
+# 完整 bench (BASELINE + DIRECT, 6 变体)
+bash tools/bench_tau_xi.sh
+
+# 提取 Table 1 对比
+for v in BASELINE DIRECT; do
+  echo "=== $v ==="
+  grep -n "256 MB" /tmp/${v}.log | grep "|"
+done
+```

@@ -785,5 +785,51 @@ Summarized here for quick lookup; exact commits in git log:
 | 2026-04-22 | 7.797 | 7.637 | **+2.1%** | Entry 15 baseline (ν fail confirmed); τ'' proposal pending |
 | 2026-04-22 | 8.319 | 7.433 | **+11.9%** | Entry 16: τ'' FAILED in both v1 & v2; no-copy mode already beats RCCL by 0.5ms → copy cost is the only lever left |
 | 2026-04-22 | 7.806 | 7.424 | **+5.1%** | Entry 17: E'' user-proposed, 3 variants ALL FAILED. In-kernel copy during AG wait hits fundamental HBM contention with SDMA engine on MI355X |
+| 2026-04-23 | 7.798 | 7.422 | **+5.1%** | Entry 18 baseline (Plan A/B 对照组, iter=100) |
+| 2026-04-23 | **8.955** | 7.489 | **+19.6% (WORSE)** | Entry 18: Plan A/B FAILED, wall +1.16ms 退化. CU AG + GEMM 抢 CU. 代码未 revert(user 指示暂保留,debug β partition 比例)|
 
 **Target**: SDMA copy ≤ RCCL (gap ≤ 0). Currently outstanding.
+
+---
+
+## Entry 18 — Plan A/B (K1=SDMA scatter + K2=CU reduce+AG+copy) FAILED
+- **Date**: 2026-04-23
+- **Commits**: `ec612289` (A v1), `c652a66c` (A fix), `392165ef` (A v2 2-kernel), `d5143321` (B v3 β partition), `5f0072e7` (B min-chunk fix) — **代码仍在 HEAD, 未 revert**
+- **Context**: 承接 Entry 16/17 → "SDMA no-copy 已超 RCCL 0.5ms, 唯一 gap 是 4 × hipMemcpyAsync copy". Entry 17 E'' (CU 在 AG wait 时 copy) 因 HBM 争用失败. 本次试图让 K2 全 CU 做 reduce+AG+copy, pipeline 隐藏 copy, 不再有外部 hipMemcpyAsync.
+- **Design (user-specified plan)**:
+  - K1 = `ScatterSdmaOnlyKernel` (SDMA scatter, 1 block 512 threads)
+  - K2 = `PipelinedCuReduceAgCopyKernel` (blocks=161, threads=512):
+    - block 0: 仅打 phase_ts 然后退出 (浪费 1 block)
+    - R-group (blocks 1..nR): reduce chunk c + CU XGMI **push** AG chunk c to all peers
+    - C-group (blocks nR+1..nR+nC): copy chunk c-1 from local transit → user_output
+  - 默认 numChunks=8, β partition = 7:1 (nR=140, nC=20)
+  - `copy_output_to_user=True` 时跳过外部 hipMemcpyAsync (skip_external_copy=true)
+- **Measured data (256MB, 4 stages, iter=100)**:
+  | 变体 | overlap wall | seq_ar | seq_gemm | overlap/seq_gemm | vs RCCL |
+  |---|---|---|---|---|---|
+  | BASELINE | 7.798 | 5.188 | 3.674 | 2.122 | **+5.1%** (差 0.376ms) |
+  | **DIRECT (Plan B)** | **8.955** | 5.538 | 3.676 | **2.436** | **+19.6%** (差 1.466ms, **+1.16ms WORSE**) |
+  | RCCL | 7.422 / 7.489 | 5.129 / 5.134 | 3.678 / 3.680 | 2.018 / 2.035 | — |
+  - All Tests PASSED correctness (Test 1/1b/2/3/4/6 全过)
+- **Mechanism analysis — 双重失败**:
+  1. **seq_ar 层面就慢了 0.088 ms/AR** (5.538 vs 5.188, 4 stages → 0.35ms). 说明**即使不和 GEMM 争**, CU AG push + CU copy 本身也比 SDMA AG + hipMemcpyAsync 慢. CU XGMI push 没有硬件 DMA 优化, 28MB/chunk/180GB/s ≈ 155μs vs SDMA AG ~130μs/chunk (warm).
+  2. **overlap 额外退化 0.81 ms**: CU 做 AG+copy 时占满 compute unit (Plan B 用 140 blocks × 512 threads = 71680 CU threads), GEMM overlap 打不满. overlap/seq_gemm 2.12 → 2.44.
+- **Root cause**: micro-bench 决策 (cu_xgmi_bench 370 GB/s) **测的是 CU XGMI read (pull), 不是 Plan B 实际用的 CU XGMI write (push)**. 方向不匹配. CU push BW 从未测过. **违反 R0 + R6**.
+- **已确认可做的 instrumentation bug (R0 违规)**:
+  - `PipelinedCuReduceAgCopyKernel` 的 phase timing: copy done slot `11+3c+2` 由 `ar_write_phase_ts_cb1` 写入, 但该 helper 只让 blockIdx==1 (R-group 第一个 block) 写, 而 R-block 从不进入 C-group 代码路径. **copy phase timing 永远是 0, 开发全程从未测过 copy wall**.
+- **User 指出的设计质疑 (未解决)**:
+  1. AG 方向: **push 正确** (pull 时机难确定, 需额外 per-chunk signal 等待)
+  2. **β partition 7:1 (140:20) 不合理, 且无数据支撑**. 理论估算 (BW: 本地 HBM 400 GB/s, XGMI push ~180 GB/s):
+     - reduce = 36MB / (nR × 400/160 GB/s) ≈ 90μs × 160/nR
+     - AG push = 28MB / (nR × 180/160) ≈ 155μs × 160/nR
+     - copy = 64MB / (nC × 400/160) ≈ 160μs × 160/nC
+     - 同步条件 (R-group reduce+AG = C-group copy): nR:nC ≈ **60:40** (而非 87.5:12.5)
+- **Code status**: 代码在 `5f0072e7` HEAD **未 revert** (user 指示保留 Plan B 代码继续调试分区).
+- **Next step options (待 user 决定)**:
+  1. **调 Plan B**: 修 phase timing bug → 改 nR 为可配置 (默认 96) → 补 CU XGMI push micro-bench → 跑 phase sweep → 找最优 nR → 对比 wall. 理论最优 Plan B 单次 AR = 1.24ms vs baseline 1.30ms → 每 AR 省 ~0.06ms, 4 AR 省 0.24ms → overlap wall 7.56ms (优于 RCCL 7.42 的 0.14ms, 勉强达标).
+  2. **Revert Plan B → π' 方向**: copy 移到独立 SDMA queue + 双缓冲 transit, 下次 AR 不等上次 copy. Entry 16 提出, 未实施. 预期收益 1.05ms (3 个 copy 完全 hide, 1 个 tail 暴露 0.35ms).
+  3. **Revert Plan B → D'' 方向**: 显式 `register_user_output(ptr, size)` API, user 显式管理生命周期, 消掉整个 copy 步骤. Entry 11 D' 失败因 PyTorch allocator auto-release; D'' 由 user 控制避开.
+- **Rule violation reflection (R0/R6)**:
+  - cu_xgmi_bench 测错方向 (read 而非 write) → micro-bench 必须匹配实际使用方向
+  - copy phase 从未打点却已开发 5 个 commits (Plan A/B 全系列) → 违反 "先打点后改"
+  - β partition 7:1 基于错误 data volume comment ("AG 是 copy 7×"), 实际 copy 64MB > AG 28MB
