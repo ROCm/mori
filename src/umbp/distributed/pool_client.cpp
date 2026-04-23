@@ -25,6 +25,7 @@
 #include <grpcpp/grpcpp.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <msgpack.hpp>
@@ -72,6 +73,11 @@ inline uint64_t LogicalPageBytes(size_t i, size_t num_pages, uint64_t page_size,
 
 // SizeMatchesAllocation is now defined in umbp/distributed/types.h so Master
 // and Client share the exact same allocation-window predicate.
+
+// Min interval between two batch-level "src not registered" WARNs from the
+// same PoolClient instance.  60s matches typical operator-noise tolerance
+// and survives one batch's worth of per-entry triggers in the same call.
+constexpr int64_t kBatchPutStagingWarnIntervalNs = static_cast<int64_t>(60) * 1000 * 1000 * 1000;
 
 }  // namespace
 
@@ -647,6 +653,21 @@ bool PoolClient::Put(const std::string& key, const void* src, size_t size) {
   return true;
 }
 
+bool PoolClient::ShouldEmitBatchPutStagingWarn() {
+  const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch())
+                          .count();
+  int64_t prev = last_batch_put_staging_warn_ns_.load(std::memory_order_relaxed);
+  // First emit unconditionally (prev == 0); afterwards gate on interval.
+  while (prev == 0 || now - prev > kBatchPutStagingWarnIntervalNs) {
+    if (last_batch_put_staging_warn_ns_.compare_exchange_weak(prev, now,
+                                                              std::memory_order_relaxed)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 std::vector<bool> PoolClient::BatchPut(const std::vector<std::string>& keys,
                                        const std::vector<const void*>& srcs,
                                        const std::vector<size_t>& sizes,
@@ -750,6 +771,20 @@ std::vector<bool> PoolClient::BatchPut(const std::vector<std::string>& keys,
       }
       wrote = !local_invariant_violated;
     } else {
+      // Surface the silent staging fallback at batch granularity (see
+      // distributed-known-issues.md #12).  RemoteDramScatterWrite has its
+      // own per-call WARN inside the staging branch; the message below is
+      // distinct ("BatchPut: src not registered for key=") so log filters
+      // can target the batch-level signal without coupling to that path.
+      // Throttled per-PoolClient at 60s to avoid spam on repeated batches.
+      if (!FindRegisteredMemory(srcs[i], sizes[i]).has_value() && ShouldEmitBatchPutStagingWarn()) {
+        MORI_UMBP_WARN(
+            "[PoolClient] BatchPut: src not registered for key='{}', falling "
+            "back to staging path (serial). Subsequent occurrences in the "
+            "next 60s are suppressed. Call RegisterMemory() on the host "
+            "buffer to enable zero-copy batch.",
+            keys[i]);
+      }
       const auto& first_bd = r.dram_memory_descs.empty() ? std::vector<uint8_t>{}
                                                          : r.dram_memory_descs.front().desc_bytes;
       const uint32_t first_bd_idx = r.dram_memory_descs.empty()

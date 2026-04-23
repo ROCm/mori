@@ -247,6 +247,14 @@ class PoolClient {
   std::atomic<uint64_t> abort_allocation_calls_{0};
   std::atomic<uint64_t> batch_abort_allocation_calls_{0};
   std::atomic<uint64_t> batch_abort_allocation_entries_{0};
+
+  // Throttle state for the batch-level WARN emitted when BatchPut sees
+  // an unregistered src and falls back to the per-item staging path
+  // (distributed-known-issues.md #12).  Per-instance so unit tests get
+  // fresh state with each fresh PoolClient.  Stores the steady_clock
+  // ns timestamp of the last emitted warning; 0 means "never emitted".
+  std::atomic<int64_t> last_batch_put_staging_warn_ns_{0};
+  bool ShouldEmitBatchPutStagingWarn();
 };
 
 }  // namespace mori::umbp
