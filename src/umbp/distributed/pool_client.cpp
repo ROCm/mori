@@ -234,6 +234,13 @@ bool PoolClient::RegisterMemory(void* ptr, size_t size) {
     MORI_UMBP_ERROR("[PoolClient] RegisterMemory: IOEngine not available");
     return false;
   }
+  // Reject null / zero-sized ranges up front.  IOEngine::RegisterMemory
+  // does not null-check and downstream RDMA bookkeeping assumes a
+  // non-empty region; surface this as a caller error instead of crashing.
+  if (ptr == nullptr || size == 0) {
+    MORI_UMBP_ERROR("[PoolClient] RegisterMemory: invalid args ptr={}, size={}", ptr, size);
+    return false;
+  }
   std::lock_guard<std::mutex> lock(registered_mem_mutex_);
   for (auto& reg : registered_regions_) {
     if (reg.base == ptr) {
@@ -248,6 +255,7 @@ bool PoolClient::RegisterMemory(void* ptr, size_t size) {
 }
 
 void PoolClient::DeregisterMemory(void* ptr) {
+  if (ptr == nullptr) return;
   std::lock_guard<std::mutex> lock(registered_mem_mutex_);
   auto it = std::find_if(registered_regions_.begin(), registered_regions_.end(),
                          [ptr](const RegisteredRegion& r) { return r.base == ptr; });
