@@ -113,7 +113,7 @@ jobs:
       - name: Install mori
         run: |
           $CT exec $CONTAINER bash -c \
-            "cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install . && pip install prettytable"
+            "cd $GITHUB_WORKSPACE && BUILD_BENCHMARK=ON BUILD_EXAMPLES=ON pip install . && pip install prettytable"
 
       - name: MORI-EP (intranode)
         run: |
@@ -156,6 +156,26 @@ jobs:
             timeout 60 torchrun --nproc_per_node=2 examples/shmem/ir/test_triton_shmem.py
             timeout 60 torchrun --nproc_per_node=8 examples/shmem/ir/test_triton_allreduce.py
             MORI_DISABLE_P2P=ON timeout 60 torchrun --nproc_per_node=8 examples/shmem/ir/test_triton_allreduce.py
+          "
+
+      - name: MORI-CPP shmem_benchmark (P2P)
+        run: |
+          $CT exec $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE
+            timeout 60 mpirun --allow-run-as-root  -np 2 ./build/benchmark/p2p_put_bw
+            timeout 60 mpirun --allow-run-as-root  -np 2 ./build/benchmark/p2p_get_bw
+            timeout 60 mpirun --allow-run-as-root  -np 2 ./build/benchmark/p2p_put_latency
+            timeout 60 mpirun --allow-run-as-root  -np 2 ./build/benchmark/p2p_get_latency
+          "
+      
+      - name: MORI-CPP shmem_benchmark (RDMA)
+        run: |
+          $CT exec $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE
+            MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/benchmark/p2p_put_bw
+            MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/benchmark/p2p_get_bw
+            MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/benchmark/p2p_put_latency
+            MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/benchmark/p2p_get_latency
           "
 
       - name: MORI-CPP shmem (P2P)
