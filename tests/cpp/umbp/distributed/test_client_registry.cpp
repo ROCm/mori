@@ -21,6 +21,7 @@
 // SOFTWARE.
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <map>
 #include <string>
@@ -28,6 +29,7 @@
 #include <vector>
 
 #include "umbp/distributed/master/client_registry.h"
+#include "umbp/distributed/master/global_block_index.h"
 
 namespace mori::umbp {
 namespace {
@@ -425,6 +427,121 @@ TEST(ClientRegistryTest, DestructorStopsReaper) {
     EXPECT_TRUE(registry.RegisterClient("c1", "addr", MakeTierCapacities(80, 64)));
   }
   SUCCEED();
+}
+
+// --- TrackKey / UntrackKey coverage (known-issue #6 fix) ---
+//
+// These tests exercise the three-phase locking introduced to move
+// index_->Lookup() out of the registry unique_lock:
+//   Phase 1: shared_lock — load `idx` + client existence check
+//   Phase 2: no registry lock — ownership Lookup on the loaded `idx`
+//   Phase 3: unique_lock — re-check client + mutate client_keys_
+// The Phase 3 re-check is what prevents a racing unregister from leaving
+// a stale entry in client_keys_ via operator[]; TrackKeyConcurrentUnregisterRace
+// is the regression guard for that invariant.
+
+TEST(ClientRegistryTest, TrackKeyNoOpForUnknownNode) {
+  // Phase 1 existence check: TrackKey for an unknown node_id must not
+  // create any client_keys_ entry via operator[].  Observable via the
+  // keys_removed return of UnregisterClient after we later register the
+  // same node: fresh register does NOT clear a pre-existing client_keys_
+  // entry (see client_registry.cpp: `client_keys_[node_id];` is operator[],
+  // not erase), so a leaked entry would survive and produce >0 here.
+  ClientRegistry registry(MakeSmallPageConfig());
+  ASSERT_TRUE(registry.RegisterClient("known", "a", MakeTierCapacities(80, 64)));
+
+  registry.TrackKey("unknown", "K");
+
+  ASSERT_TRUE(registry.RegisterClient("unknown", "a", MakeTierCapacities(80, 64)));
+  EXPECT_EQ(registry.UnregisterClient("unknown"), 0u);
+}
+
+TEST(ClientRegistryTest, TrackKeyRequiresIndexOwnership) {
+  // Phase 2 ownership check: TrackKey(A, K) must refuse to insert when
+  // the index reports no location owned by A for key K.
+  ClientRegistry registry(MakeSmallPageConfig());
+  GlobalBlockIndex index;
+  registry.SetBlockIndex(&index);
+  index.SetClientRegistry(&registry);
+
+  ASSERT_TRUE(registry.RegisterClient("A", "a", MakeTierCapacities(80, 64)));
+  ASSERT_TRUE(registry.RegisterClient("B", "b", MakeTierCapacities(80, 64)));
+
+  // Only B owns K in the index.  The auto-Track from BatchRegister inserts
+  // K into client_keys_["B"].
+  const Location locB{"B", "0:p0", 4, TierType::HBM};
+  index.Register("B", "K", locB);
+
+  // Now manually Track A for the same K — A doesn't own it.
+  registry.TrackKey("A", "K");
+
+  // A should still have zero tracked keys; B should have exactly one.
+  EXPECT_EQ(registry.UnregisterClient("A"), 0u);
+  EXPECT_EQ(registry.UnregisterClient("B"), 1u);
+
+  index.SetClientRegistry(nullptr);
+  registry.SetBlockIndex(nullptr);
+}
+
+TEST(ClientRegistryTest, TrackKeyConcurrentUnregisterRace) {
+  // Regression guard for the Phase 3 re-check: stress TrackKey against a
+  // concurrent UnregisterClient.  If Phase 3 skipped the clients_.find
+  // re-check, a TrackKey thread whose Phase 1+2 observed A as alive could
+  // reach Phase 3 after UnregisterClient released its lock, and then
+  // operator[] would resurrect client_keys_["A"] with K.  Fresh Register
+  // does not clear that stale set (see `client_keys_[node_id];` in
+  // RegisterClient), so a subsequent UnregisterClient would return >0.
+  //
+  // With the fix, Phase 3's clients_.find(A) fails after unregister and
+  // the insert is skipped; the final UnregisterClient must return 0.
+  ClientRegistry registry(MakeSmallPageConfig());
+  GlobalBlockIndex index;
+  registry.SetBlockIndex(&index);
+
+  // Mask the TrackKey callback so the initial BatchRegister only populates
+  // the index — tracking is driven manually from the worker threads below.
+  index.SetClientRegistry(nullptr);
+  ASSERT_TRUE(registry.RegisterClient("A", "a", MakeTierCapacities(80, 64)));
+  const Location locA{"A", "0:p0", 4, TierType::HBM};
+  ASSERT_EQ(index.BatchRegister("A", {{"K", locA}}), 1u);
+  index.SetClientRegistry(&registry);
+
+  constexpr int kThreads = 8;
+  constexpr int kIterations = 200;
+  std::atomic<bool> go{false};
+  std::vector<std::thread> track_threads;
+  track_threads.reserve(kThreads);
+  for (int i = 0; i < kThreads; ++i) {
+    track_threads.emplace_back([&] {
+      while (!go.load(std::memory_order_acquire)) {
+      }
+      for (int j = 0; j < kIterations; ++j) {
+        registry.TrackKey("A", "K");
+      }
+    });
+  }
+
+  std::thread unreg_thread([&] {
+    while (!go.load(std::memory_order_acquire)) {
+    }
+    registry.UnregisterClient("A");
+  });
+
+  go.store(true, std::memory_order_release);
+  for (auto& t : track_threads) t.join();
+  unreg_thread.join();
+
+  EXPECT_FALSE(registry.IsClientAlive("A"));
+
+  // Phase 3 invariant: no stale client_keys_["A"] entry may have been
+  // created by a TrackKey whose Phase 3 ran after UnregisterClient
+  // erased client_keys_["A"].  Re-register then Unregister to surface
+  // any leak.
+  ASSERT_TRUE(registry.RegisterClient("A", "a", MakeTierCapacities(80, 64)));
+  EXPECT_EQ(registry.UnregisterClient("A"), 0u);
+
+  index.SetClientRegistry(nullptr);
+  registry.SetBlockIndex(nullptr);
 }
 
 }  // namespace mori::umbp
