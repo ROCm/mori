@@ -796,7 +796,7 @@ Summarized here for quick lookup; exact commits in git log:
 - **Date**: 2026-04-24
 - **Baseline reference SHA**: `5f0072e7` (code HEAD at measurement time) /
   `d975cc60` (docs + rule HEAD)
-- **Plan A commit SHA**: `f2118347` (replaces Plan B's
+- **Plan A commit SHA**: `e7050bc6` (replaces Plan B's
   `PipelinedCuReduceAgCopyKernel` with new `PipelinedXGMIPullKernel`;
   host layer `use_plan_a` branch switched to Plan A kernel + ag_sync reset)
 - **Context**: Entry 18 established Plan B (CU push AG + CU copy) failed
