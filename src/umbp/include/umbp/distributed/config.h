@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "umbp/common/config.h"
+#include "umbp/common/env_time.h"
 #include "umbp/distributed/types.h"
 
 namespace mori::umbp {
@@ -45,6 +46,23 @@ struct ClientRegistryConfig {
   std::chrono::seconds allocation_ttl{30};
   std::chrono::seconds finalized_record_ttl{120};
   uint32_t max_missed_heartbeats = 3;
+
+  // Overlay UMBP_* env vars on top of the defaults.  Fields are left
+  // untouched when the corresponding env is unset or invalid.
+  static ClientRegistryConfig FromEnvironment() {
+    ClientRegistryConfig cfg;
+    cfg.heartbeat_ttl =
+        GetEnvSeconds("UMBP_HEARTBEAT_TTL_SEC", cfg.heartbeat_ttl, /*min_allowed=*/1);
+    cfg.reaper_interval =
+        GetEnvSeconds("UMBP_REAPER_INTERVAL_SEC", cfg.reaper_interval, /*min_allowed=*/1);
+    cfg.allocation_ttl =
+        GetEnvSeconds("UMBP_ALLOCATION_TTL_SEC", cfg.allocation_ttl, /*min_allowed=*/1);
+    cfg.finalized_record_ttl =
+        GetEnvSeconds("UMBP_FINALIZED_RECORD_TTL_SEC", cfg.finalized_record_ttl, /*min_allowed=*/1);
+    cfg.max_missed_heartbeats =
+        GetEnvUint32("UMBP_MAX_MISSED_HEARTBEATS", cfg.max_missed_heartbeats, /*min_allowed=*/1);
+    return cfg;
+  }
 
   // Sole source of truth for the DRAM/HBM page_size used by every
   // PageBitmapAllocator the registry creates when the registering Client
@@ -61,6 +79,17 @@ struct EvictionConfig {
   std::chrono::seconds check_interval{5};
   std::chrono::seconds lease_duration{10};
   size_t evict_batch_size = 32;
+
+  // Only timing fields are env-overridable here; watermarks and batch size
+  // have dedicated tuning paths and are intentionally excluded.
+  static EvictionConfig FromEnvironment() {
+    EvictionConfig cfg;
+    cfg.check_interval =
+        GetEnvSeconds("UMBP_EVICTION_CHECK_INTERVAL_SEC", cfg.check_interval, /*min_allowed=*/1);
+    cfg.lease_duration =
+        GetEnvSeconds("UMBP_LEASE_DURATION_SEC", cfg.lease_duration, /*min_allowed=*/1);
+    return cfg;
+  }
 };
 
 struct MasterServerConfig {
@@ -70,6 +99,17 @@ struct MasterServerConfig {
 
   std::unique_ptr<RouteGetStrategy> get_strategy;
   std::unique_ptr<RoutePutStrategy> put_strategy;
+
+  // Composes ClientRegistryConfig::FromEnvironment() and
+  // EvictionConfig::FromEnvironment().  listen_address is NOT read from env
+  // here; callers (e.g. bin/master_main.cpp) apply argv overrides after
+  // this call so the CLI remains the source of truth.
+  //
+  // Definition is out-of-line in master_server.cpp because this struct owns
+  // std::unique_ptr<RouteGetStrategy> with a forward-declared T; an inline
+  // body would force ~MasterServerConfig to be instantiated in every TU
+  // that includes this header.
+  static MasterServerConfig FromEnvironment();
 };
 
 struct ExportableDram {

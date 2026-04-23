@@ -171,6 +171,10 @@ See `examples/io/example.py` for more complete examples including batch transfer
 | `RdmaBackendConfig.enable_notification` | Enable target-side completion notifications (default `True`) |
 | `IOEngineConfig.port = 0` | Auto-bind to a free port |
 
+UMBP (the upper-layer cache pool) exposes a separate set of runtime-tunable
+env vars for distributed master / pool client / SPDK proxy timing. Those are
+out of scope for MORI-IO; see [`src/umbp/doc/runtime-env-vars.md`](../src/umbp/doc/runtime-env-vars.md).
+
 ## Source Files
 
 | File | Description |

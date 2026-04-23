@@ -2,6 +2,13 @@ add_executable(test_umbp_types test_types.cpp)
 target_link_libraries(test_umbp_types PRIVATE umbp_common gtest_main)
 add_test(NAME umbp_types COMMAND test_umbp_types)
 
+# env_time helpers are header-only; tests only exercise the parser path. NOTE:
+# Production callers cache results in function-local statics that cannot be
+# reset mid-process; any multi-value business test must fork.
+add_executable(test_umbp_env_time test_env_time.cpp)
+target_link_libraries(test_umbp_env_time PRIVATE umbp_common gtest_main)
+add_test(NAME umbp_env_time COMMAND test_umbp_env_time)
+
 add_executable(test_umbp_client_registry test_client_registry.cpp)
 target_link_libraries(test_umbp_client_registry PRIVATE umbp_common gtest_main)
 add_test(NAME umbp_client_registry COMMAND test_umbp_client_registry)

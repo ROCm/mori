@@ -28,6 +28,7 @@
 #include <cstring>
 
 #include "mori/utils/mori_log.hpp"
+#include "umbp/common/env_time.h"
 #include "umbp/distributed/pool_client.h"
 #include "umbp/distributed/types.h"
 #include "umbp/local/block_index/local_block_index.h"
@@ -37,6 +38,13 @@
 namespace mori::umbp {
 
 namespace {
+// Shared with master_server.cpp via UMBP_GRPC_SHUTDOWN_DEADLINE_SEC.
+std::chrono::seconds GrpcShutdownDeadline() {
+  static const auto v =
+      GetEnvSeconds("UMBP_GRPC_SHUTDOWN_DEADLINE_SEC", std::chrono::seconds(3), /*min_allowed=*/1);
+  return v;
+}
+
 struct StagingSlot {
   bool in_use = false;
   uint64_t lease_id = 0;
@@ -388,7 +396,7 @@ bool PeerServiceServer::Start(uint16_t port) {
 
 void PeerServiceServer::Stop() {
   if (server_) {
-    const auto deadline = std::chrono::system_clock::now() + std::chrono::seconds(3);
+    const auto deadline = std::chrono::system_clock::now() + GrpcShutdownDeadline();
     MORI_UMBP_INFO("[PeerService] Shutting down");
     server_->Shutdown(deadline);
     server_.reset();

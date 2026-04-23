@@ -32,6 +32,7 @@
 
 #include "mori/io/backend.hpp"
 #include "mori/utils/mori_log.hpp"
+#include "umbp/common/env_time.h"
 #include "umbp/distributed/obs_counters.h"
 #include "umbp_peer.grpc.pb.h"
 
@@ -75,9 +76,24 @@ inline uint64_t LogicalPageBytes(size_t i, size_t num_pages, uint64_t page_size,
 // and Client share the exact same allocation-window predicate.
 
 // Min interval between two batch-level "src not registered" WARNs from the
-// same PoolClient instance.  60s matches typical operator-noise tolerance
-// and survives one batch's worth of per-entry triggers in the same call.
-constexpr int64_t kBatchPutStagingWarnIntervalNs = static_cast<int64_t>(60) * 1000 * 1000 * 1000;
+// same PoolClient instance.  Default 60s matches typical operator-noise
+// tolerance; override via UMBP_BATCH_PUT_WARN_INTERVAL_SEC.
+int64_t BatchPutStagingWarnIntervalNs() {
+  static const int64_t v =
+      GetEnvSeconds("UMBP_BATCH_PUT_WARN_INTERVAL_SEC", std::chrono::seconds(60),
+                    /*min_allowed=*/1)
+          .count() *
+      1000LL * 1000LL * 1000LL;
+  return v;
+}
+
+// Number of ReleaseSsdLease RPC attempts before giving up.  Default 2.
+// Returns uint32_t to avoid a silent sign flip when the env is set to a
+// value above INT_MAX; the loop variable below matches.
+uint32_t ReleaseLeaseMaxRetries() {
+  static const uint32_t v = GetEnvUint32("UMBP_RELEASE_LEASE_MAX_RETRIES", 2, /*min_allowed=*/1);
+  return v;
+}
 
 }  // namespace
 
@@ -667,7 +683,7 @@ bool PoolClient::ShouldEmitBatchPutStagingWarn() {
                           .count();
   int64_t prev = last_batch_put_staging_warn_ns_.load(std::memory_order_relaxed);
   // First emit unconditionally (prev == 0); afterwards gate on interval.
-  while (prev == 0 || now - prev > kBatchPutStagingWarnIntervalNs) {
+  while (prev == 0 || now - prev > BatchPutStagingWarnIntervalNs()) {
     if (last_batch_put_staging_warn_ns_.compare_exchange_weak(prev, now,
                                                               std::memory_order_relaxed)) {
       return true;
@@ -1649,7 +1665,8 @@ bool PoolClient::RemoteSsdRead(PeerConnection& peer, const std::string& key,
       MORI_UMBP_ERROR("[PoolClient] RemoteSsdRead RDMA failed: uid={}, {}", uid, status.Message());
       // Release slot even on failure
       if (resp.lease_id() > 0) {
-        for (int attempt = 0; attempt < 2; ++attempt) {
+        const uint32_t max_retries = ReleaseLeaseMaxRetries();
+        for (uint32_t attempt = 0; attempt < max_retries; ++attempt) {
           ::umbp::ReleaseSsdLeaseRequest rel_req;
           rel_req.set_lease_id(resp.lease_id());
           ::umbp::ReleaseSsdLeaseResponse rel_resp;
@@ -1666,7 +1683,8 @@ bool PoolClient::RemoteSsdRead(PeerConnection& peer, const std::string& key,
 
   // Step 3: Release staging slot (with lightweight retry)
   if (resp.lease_id() > 0) {
-    for (int attempt = 0; attempt < 2; ++attempt) {
+    const uint32_t max_retries = ReleaseLeaseMaxRetries();
+    for (uint32_t attempt = 0; attempt < max_retries; ++attempt) {
       ::umbp::ReleaseSsdLeaseRequest rel_req;
       rel_req.set_lease_id(resp.lease_id());
       ::umbp::ReleaseSsdLeaseResponse rel_resp;

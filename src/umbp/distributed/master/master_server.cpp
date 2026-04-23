@@ -30,9 +30,35 @@
 
 #include "mori/utils/mori_log.hpp"
 #include "umbp.grpc.pb.h"
+#include "umbp/common/env_time.h"
 #include "umbp/distributed/routing/router.h"
 
 namespace mori::umbp {
+
+namespace {
+// Recommended-heartbeat interval = heartbeat_ttl / divisor.  Kept at 2 by
+// default (interval = half the TTL).  Overridable via
+// UMBP_HEARTBEAT_INTERVAL_DIVISOR; min_allowed=1 guards against div-by-zero.
+uint32_t HeartbeatIntervalDivisor() {
+  static const uint32_t v = GetEnvUint32("UMBP_HEARTBEAT_INTERVAL_DIVISOR", 2, /*min_allowed=*/1);
+  return v;
+}
+
+std::chrono::seconds GrpcShutdownDeadline() {
+  static const auto v =
+      GetEnvSeconds("UMBP_GRPC_SHUTDOWN_DEADLINE_SEC", std::chrono::seconds(3), /*min_allowed=*/1);
+  return v;
+}
+}  // namespace
+
+// Out-of-line to keep config.h free of RouteGetStrategy / RoutePutStrategy
+// includes; see the declaration in umbp/distributed/config.h.
+MasterServerConfig MasterServerConfig::FromEnvironment() {
+  MasterServerConfig cfg;
+  cfg.registry_config = ClientRegistryConfig::FromEnvironment();
+  cfg.eviction_config = EvictionConfig::FromEnvironment();
+  return cfg;
+}
 
 static Location ToLocation(const ::umbp::Location& proto_location) {
   Location location;
@@ -87,8 +113,9 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
                           "node is already alive and cannot be re-registered");
     }
 
-    // Recommend heartbeat at half the TTL
-    auto interval_ms = static_cast<uint64_t>(config_.heartbeat_ttl.count() * 1000) / 2;
+    // Recommend heartbeat = heartbeat_ttl / divisor (default 2 => half TTL).
+    auto interval_ms =
+        static_cast<uint64_t>(config_.heartbeat_ttl.count() * 1000) / HeartbeatIntervalDivisor();
     response->set_heartbeat_interval_ms(interval_ms);
 
     return grpc::Status::OK;
@@ -536,7 +563,7 @@ void MasterServer::Shutdown() {
     eviction_manager_->Stop();
   }
   if (server_) {
-    const auto deadline = std::chrono::system_clock::now() + std::chrono::seconds(3);
+    const auto deadline = std::chrono::system_clock::now() + GrpcShutdownDeadline();
     MORI_UMBP_INFO("[Master] Shutting down");
     server_->Shutdown(deadline);
     server_.reset();

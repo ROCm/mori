@@ -23,6 +23,7 @@
 #include "umbp/storage/spdk/proxy/spdk_proxy_shm.h"
 
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 
@@ -34,8 +35,22 @@
 #include <unistd.h>
 #endif
 
+#include "umbp/common/env_time.h"
+
 namespace umbp {
 namespace proxy {
+
+namespace {
+// Cached once per process on first call; see env_time.h for semantics.
+uint64_t HeartbeatStaleMs() {
+  static const uint64_t v = static_cast<uint64_t>(
+      mori::umbp::GetEnvMilliseconds("UMBP_SPDK_PROXY_HEARTBEAT_STALE_MS",
+                                     std::chrono::milliseconds(kDefaultHeartbeatStaleMs),
+                                     /*min_allowed=*/1)
+          .count());
+  return v;
+}
+}  // namespace
 
 ProxyShmRegion::~ProxyShmRegion() { Detach(); }
 
@@ -382,7 +397,7 @@ int ProxyShmRegion::ProbeExisting(const std::string& name) {
   if (!ValidateHeaderLayout(hdr, probe.Size(), &error_message)) return -2;
 
   uint64_t hb = hdr->proxy_heartbeat_ms.load(std::memory_order_acquire);
-  if (hb != 0 && (NowEpochMs() - hb) >= kHeartbeatStaleMs) return -1;
+  if (hb != 0 && (NowEpochMs() - hb) >= HeartbeatStaleMs()) return -1;
 
   uint32_t st = hdr->state.load(std::memory_order_acquire);
   if (st == static_cast<uint32_t>(ProxyState::READY)) return 1;

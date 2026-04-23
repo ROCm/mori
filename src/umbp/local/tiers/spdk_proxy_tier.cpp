@@ -33,6 +33,7 @@
 #include <cstring>
 #include <thread>
 
+#include "umbp/common/env_time.h"
 #include "umbp/common/log.h"
 
 #ifdef __linux__
@@ -45,6 +46,23 @@ namespace mori {
 namespace umbp {
 
 using namespace ::umbp::proxy;
+
+namespace {
+uint64_t HeartbeatStaleMs() {
+  static const uint64_t v =
+      static_cast<uint64_t>(GetEnvMilliseconds("UMBP_SPDK_PROXY_HEARTBEAT_STALE_MS",
+                                               std::chrono::milliseconds(kDefaultHeartbeatStaleMs),
+                                               /*min_allowed=*/1)
+                                .count());
+  return v;
+}
+
+std::chrono::milliseconds ProxyPollInterval() {
+  static const auto v = GetEnvMilliseconds("UMBP_SPDK_PROXY_POLL_INTERVAL_MS",
+                                           std::chrono::milliseconds(100), /*min_allowed=*/1);
+  return v;
+}
+}  // namespace
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
@@ -204,7 +222,7 @@ bool SpdkProxyTier::WaitForProxy(const std::string& shm_name, int timeout_ms) {
 #endif
         {
           uint64_t hb = hdr->proxy_heartbeat_ms.load(std::memory_order_acquire);
-          if (hb == 0 || (NowEpochMs() - hb) < kHeartbeatStaleMs) {
+          if (hb == 0 || (NowEpochMs() - hb) < HeartbeatStaleMs()) {
             return true;
           }
         }
@@ -220,7 +238,7 @@ bool SpdkProxyTier::WaitForProxy(const std::string& shm_name, int timeout_ms) {
       return false;
     }
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    std::this_thread::sleep_for(ProxyPollInterval());
   }
 }
 
@@ -233,7 +251,7 @@ bool SpdkProxyTier::IsProxyAlive() const {
   uint64_t hb = hdr->proxy_heartbeat_ms.load(std::memory_order_relaxed);
   if (hb == 0) return true;
   uint64_t now = NowEpochMs();
-  return (now - hb) < kHeartbeatStaleMs;
+  return (now - hb) < HeartbeatStaleMs();
 }
 
 // ---------------------------------------------------------------------------
