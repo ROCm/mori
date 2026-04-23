@@ -28,6 +28,7 @@
 
 #include "mori/utils/mori_log.hpp"
 #include "umbp.grpc.pb.h"
+#include "umbp/common/env_time.h"
 
 namespace mori::umbp {
 
@@ -36,10 +37,16 @@ namespace {
 //   - UnregisterClient in UnregisterSelf (called from ~MasterClient).
 //   - Every Heartbeat in HeartbeatLoop (hot path, but its latency is
 //     charged to ~MasterClient via StopHeartbeat()'s join()).
-// 3 s covers normal master response + one kernel retransmission while
-// still letting the destructor return promptly when master is dead.
-// See distributed-known-issues.md #7.
-constexpr int kMasterRpcShutdownTimeoutMs = 3000;
+// Default 3 s covers normal master response + one kernel retransmission
+// while still letting the destructor return promptly when master is dead.
+// Override via UMBP_RPC_SHUTDOWN_TIMEOUT_MS.  See distributed-known-issues.md #7.
+int RpcShutdownTimeoutMs() {
+  static const int v =
+      static_cast<int>(GetEnvMilliseconds("UMBP_RPC_SHUTDOWN_TIMEOUT_MS",
+                                          std::chrono::milliseconds(3000), /*min_allowed=*/1)
+                           .count());
+  return v;
+}
 }  // namespace
 
 // Helper: get the typed stub from the opaque pointer
@@ -147,7 +154,7 @@ grpc::Status MasterClient::UnregisterSelf() {
   ::umbp::UnregisterClientResponse resp;
   grpc::ClientContext ctx;
   ctx.set_deadline(std::chrono::system_clock::now() +
-                   std::chrono::milliseconds(kMasterRpcShutdownTimeoutMs));
+                   std::chrono::milliseconds(RpcShutdownTimeoutMs()));
   auto status = GetStub(stub_.get())->UnregisterClient(&ctx, req, &resp);
 
   if (status.ok()) {
@@ -780,7 +787,7 @@ void MasterClient::HeartbeatLoop() {
     // Bound this RPC so an unreachable master cannot trap StopHeartbeat()
     // (which join()s this thread) past the destructor budget.
     ctx.set_deadline(std::chrono::system_clock::now() +
-                     std::chrono::milliseconds(kMasterRpcShutdownTimeoutMs));
+                     std::chrono::milliseconds(RpcShutdownTimeoutMs()));
     auto status = GetStub(stub_.get())->Heartbeat(&ctx, req, &resp);
 
     if (!status.ok()) {

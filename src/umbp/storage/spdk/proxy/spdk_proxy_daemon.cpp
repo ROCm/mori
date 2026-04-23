@@ -49,6 +49,7 @@
 #endif
 
 #include "umbp/common/config.h"
+#include "umbp/common/env_time.h"
 #include "umbp/common/log.h"
 #include "umbp/local/tiers/spdk_ssd_tier.h"
 #include "umbp/storage/spdk/offset_allocator.hpp"
@@ -73,6 +74,34 @@ namespace {
 
 std::atomic<bool> g_running{true};
 std::string g_shm_name;
+
+// Timing knobs resolved once from env on first use.
+std::chrono::milliseconds BusyYieldInterval() {
+  static const auto v = GetEnvMilliseconds("UMBP_SPDK_PROXY_BUSY_YIELD_MS",
+                                           std::chrono::milliseconds(1), /*min_allowed=*/1);
+  return v;
+}
+
+int64_t HeartbeatIntervalMs() {
+  static const int64_t v = GetEnvMilliseconds("UMBP_SPDK_PROXY_HEARTBEAT_INTERVAL_MS",
+                                              std::chrono::milliseconds(500), /*min_allowed=*/1)
+                               .count();
+  return v;
+}
+
+int64_t ReapIntervalSec() {
+  static const int64_t v =
+      GetEnvSeconds("UMBP_SPDK_PROXY_REAP_INTERVAL_SEC", std::chrono::seconds(5),
+                    /*min_allowed=*/1)
+          .count();
+  return v;
+}
+
+std::chrono::seconds InitFailSleep() {
+  static const auto v = GetEnvSeconds("UMBP_SPDK_PROXY_INIT_FAIL_SLEEP_SEC",
+                                      std::chrono::seconds(2), /*min_allowed=*/0);
+  return v;
+}
 
 size_t AlignUp(size_t value, size_t alignment) {
   if (alignment == 0) return value;
@@ -423,7 +452,7 @@ class TenantRegistry {
     if (!write_back_ || !tenant.wb_queue_started) return;
     while (true) {
       while (tenant.inflight_wb_workers.load(std::memory_order_acquire) > 0) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        std::this_thread::sleep_for(BusyYieldInterval());
       }
       tenant.wb_queue.Drain();
       if (tenant.inflight_wb_workers.load(std::memory_order_acquire) == 0) break;
@@ -432,11 +461,11 @@ class TenantRegistry {
 
   void WaitForTenantIdle(TenantRuntime& tenant) {
     while (tenant.inflight_batch_workers.load(std::memory_order_acquire) > 0) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      std::this_thread::sleep_for(BusyYieldInterval());
     }
     WaitForTenantWritebackDrained(tenant);
     while (tenant.inflight_batch_workers.load(std::memory_order_acquire) > 0) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      std::this_thread::sleep_for(BusyYieldInterval());
     }
   }
 
@@ -1080,13 +1109,13 @@ void PollLoop(ProxyShmRegion& shm, TenantRegistry& tenants, ChannelDmaPool* chan
     uint64_t now_ms = NowEpochMs();
 
     auto since_hb = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_heartbeat);
-    if (since_hb.count() > 500) {
+    if (since_hb.count() > HeartbeatIntervalMs()) {
       hdr->proxy_heartbeat_ms.store(now_ms, std::memory_order_relaxed);
       last_heartbeat = now;
     }
 
     auto since_reap = std::chrono::duration_cast<std::chrono::seconds>(now - last_reap);
-    if (since_reap.count() >= 5) {
+    if (since_reap.count() >= ReapIntervalSec()) {
 #ifdef __linux__
       for (uint32_t c = 0; c < max_channels; ++c) {
         if (batch_inflight[c].load(std::memory_order_relaxed)) continue;
@@ -1254,7 +1283,7 @@ int main(int argc, char** argv) {
   if (rc != 0 || !env.IsInitialized()) {
     fprintf(stderr, "spdk_proxy: SpdkEnv init failed rc=%d\n", rc);
     hdr->state.store(static_cast<uint32_t>(ProxyState::ERROR), std::memory_order_release);
-    std::this_thread::sleep_for(std::chrono::seconds(2));
+    std::this_thread::sleep_for(InitFailSleep());
     shm.Detach();
     return 1;
   }
