@@ -166,6 +166,14 @@ jobs:
             timeout 60 mpirun --allow-run-as-root  -np 2 ./build/benchmark/p2p_get_bw
             timeout 60 mpirun --allow-run-as-root  -np 2 ./build/benchmark/p2p_put_latency
             timeout 60 mpirun --allow-run-as-root  -np 2 ./build/benchmark/p2p_get_latency
+            timeout 60 mpirun --allow-run-as-root  -np 2 ./build/benchmark/p2p_put_bw -s warp
+            timeout 60 mpirun --allow-run-as-root  -np 2 ./build/benchmark/p2p_get_bw -s warp
+            timeout 60 mpirun --allow-run-as-root  -np 2 ./build/benchmark/p2p_put_latency -s warp
+            timeout 60 mpirun --allow-run-as-root  -np 2 ./build/benchmark/p2p_get_latency -s warp
+            timeout 60 mpirun --allow-run-as-root  -np 2 ./build/benchmark/p2p_put_bw -s thread
+            timeout 60 mpirun --allow-run-as-root  -np 2 ./build/benchmark/p2p_get_bw -s thread
+            timeout 60 mpirun --allow-run-as-root  -np 2 ./build/benchmark/p2p_put_latency -s thread
+            timeout 60 mpirun --allow-run-as-root  -np 2 ./build/benchmark/p2p_get_latency -s thread
           "
 
       - name: MORI-CPP shmem_benchmark (RDMA)
@@ -176,6 +184,14 @@ jobs:
             MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/benchmark/p2p_get_bw
             MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/benchmark/p2p_put_latency
             MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/benchmark/p2p_get_latency
+            MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/benchmark/p2p_put_bw -s warp
+            MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/benchmark/p2p_get_bw -s warp
+            MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/benchmark/p2p_put_latency -s warp
+            MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/benchmark/p2p_get_latency -s warp
+            MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/benchmark/p2p_put_bw -s thread
+            MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/benchmark/p2p_get_bw -s thread
+            MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/benchmark/p2p_put_latency -s thread
+            MORI_DISABLE_P2P=ON timeout 60 mpirun --allow-run-as-root -np 2 ./build/benchmark/p2p_get_latency -s thread
           "
 
       - name: MORI-CPP shmem (P2P)
