@@ -24,6 +24,8 @@ jobs:
         include:
           - platform: MI355X_AINIC
             runner: [self-hosted, MI355X-AINIC-TW]
+          - platform: MI300X_BNXT
+            runner: [self-hosted, MI300X-BNXT]
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -56,9 +58,9 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
+          $CT rm -f $CONTAINER || true
           $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE $BASE_IMAGE \
               chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
-          $CT rm -f $CONTAINER || true
 
   intranode-test:
     name: mori intranode test (${{ matrix.platform }})
@@ -73,10 +75,17 @@ jobs:
             rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
             rdma_sl: 3
             rdma_tc: 104
+          - platform: MI300X_BNXT
+            runner: [self-hosted, MI300X-BNXT]
+            rdma_devices: bnxt_re0,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re7,bnxt_re8,bnxt_re9
+            rdma_sl: 3
+            rdma_tc: 104
+            socket_ifname: enp159s0np0
     env:
       MORI_RDMA_DEVICES: ${{ matrix.rdma_devices }}
       MORI_RDMA_SL: ${{ matrix.rdma_sl }}
       MORI_RDMA_TC: ${{ matrix.rdma_tc }}
+      MORI_SOCKET_IFNAME: ${{ matrix.socket_ifname }}
     timeout-minutes: 45
     steps:
       - name: Checkout
@@ -94,6 +103,7 @@ jobs:
             -e MORI_RDMA_DEVICES=$MORI_RDMA_DEVICES \
             -e MORI_RDMA_SL=$MORI_RDMA_SL \
             -e MORI_RDMA_TC=$MORI_RDMA_TC \
+            ${MORI_SOCKET_IFNAME:+-e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME} \
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
             -w $GITHUB_WORKSPACE \
             $IMAGE sleep infinity
@@ -200,9 +210,11 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE $IMAGE \
-              chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
           $CT rm -f $CONTAINER || true
+          if $CT image inspect $IMAGE &>/dev/null; then
+            $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE $IMAGE \
+                chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
+          fi
 
   jax-intranode-test:
     name: mori JAX intranode test (${{ matrix.platform }})
@@ -215,6 +227,11 @@ jobs:
           - platform: MI355X_AINIC
             runner: [self-hosted, MI355X-AINIC-TW]
             rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
+            gpu_arch: gfx950
+          - platform: MI300X_BNXT
+            runner: [self-hosted, MI300X-BNXT]
+            rdma_devices: bnxt_re0,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re7,bnxt_re8,bnxt_re9
+            gpu_arch: gfx942
     timeout-minutes: 90
     steps:
       - name: Checkout
@@ -224,7 +241,7 @@ jobs:
 
       - name: Build JAX CI image
         run: |
-          BUILD_ARGS="--network=host --build-arg GPU_TARGET=gfx950"
+          BUILD_ARGS="--network=host --build-arg GPU_TARGET=${{ matrix.gpu_arch }}"
           if [ "$CT" = "podman" ]; then
             BUILD_ARGS="$BUILD_ARGS --isolation=chroot"
           fi
@@ -259,9 +276,11 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE rocm/mori:jax-ci \
-              chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
           $CT rm -f ${CONTAINER}_jax || true
+          if $CT image inspect rocm/mori:jax-ci &>/dev/null; then
+            $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE rocm/mori:jax-ci \
+                chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
+          fi
 
   internode-test:
     name: mori internode test (${{ matrix.platform }})
@@ -281,8 +300,21 @@ jobs:
             rdma_devices: rocep105s0,rocep121s0,rocep137s0,rocep153s0,rocep233s0,rocep249s0,rocep25s0,rocep9s0
             rdma_sl: 3
             rdma_tc: 104
+            ct: podman
+          - platform: MI300X_BNXT
+            runner: [self-hosted, MI300X-BNXT]
+            node1_host: 10.245.128.61
+            node2_host: 10.245.128.59
+            node2_port: 22
+            node1_ifname: enp159s0np0
+            node2_ifname: enp159s0np0
+            rdma_devices: bnxt_re0,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re7,bnxt_re8,bnxt_re9
+            rdma_sl: 3
+            rdma_tc: 104
+            ct: docker
     env:
-      CT: podman  # internode runners (MI355X-AINIC) only have podman
+      CT: ${{ matrix.ct }}
+      SSH_OPTS: -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
       NODE1_HOST: ${{ matrix.node1_host }}
       NODE2_HOST: ${{ matrix.node2_host }}
       NODE2_PORT: ${{ matrix.node2_port }}
@@ -320,15 +352,15 @@ jobs:
 
       - name: Start container on node2
         run: |
-          ssh -p $NODE2_PORT $(whoami)@$NODE2_HOST "
+          ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "
             $CT rm -f $CONTAINER 2>/dev/null || true
             mkdir -p $GITHUB_WORKSPACE
           "
           rsync -az --exclude='.git' \
-            -e "ssh -p $NODE2_PORT" \
+            -e "ssh $SSH_OPTS -p $NODE2_PORT" \
             $GITHUB_WORKSPACE/ \
             $(whoami)@$NODE2_HOST:$GITHUB_WORKSPACE/
-          ssh -p $NODE2_PORT $(whoami)@$NODE2_HOST "
+          ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "
             cd $GITHUB_WORKSPACE &&
             $CT build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE -t $IMAGE -f docker/Dockerfile.dev . &&
             CONTAINER_RUNTIME=$CT ./docker/ci_run.sh --name $CONTAINER \
@@ -352,7 +384,7 @@ jobs:
 
       - name: Install mori (node2)
         run: |
-          ssh -p $NODE2_PORT $(whoami)@$NODE2_HOST \
+          ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST \
             "$CT exec $CONTAINER bash -c 'cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install . && pip install prettytable'"
 
       - name: MORI-IO internode write sweep
@@ -361,7 +393,7 @@ jobs:
           PORT=29120
           echo "=== MORI-IO internode benchmark: wide-write-sweep port=$PORT ==="
           NODE2_CMD="$CT exec $CONTAINER bash $SCRIPT --rank 1 --master-addr $NODE1_HOST --master-port $PORT --ifname $NODE2_IFNAME -- --op-type write --transfer-batch-size 128 --all --sweep-start-size 1024 --sweep-max-size 16777216 --iters 4 --enable-sess --enable-batch-transfer --num-qp-per-transfer 2 --num-worker-threads 2 --num-initiator-dev 8 --num-target-dev 8"
-          ssh -p $NODE2_PORT $(whoami)@$NODE2_HOST "$NODE2_CMD" &
+          ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "$NODE2_CMD" &
           $CT exec $CONTAINER bash $SCRIPT \
             --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
             --ifname $NODE1_IFNAME \
@@ -378,7 +410,7 @@ jobs:
           PORT=29121
           echo "=== MORI-IO internode benchmark: batch-session-read port=$PORT ==="
           NODE2_CMD="$CT exec $CONTAINER bash $SCRIPT --rank 1 --master-addr $NODE1_HOST --master-port $PORT --ifname $NODE2_IFNAME -- --op-type read --buffer-size 4096 --transfer-batch-size 128 --iters 8 --enable-batch-transfer --enable-sess --poll_cq_mode event --num-qp-per-transfer 2 --num-worker-threads 2 --num-initiator-dev 8 --num-target-dev 8"
-          ssh -p $NODE2_PORT $(whoami)@$NODE2_HOST "$NODE2_CMD" &
+          ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "$NODE2_CMD" &
           $CT exec $CONTAINER bash $SCRIPT \
             --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
             --ifname $NODE1_IFNAME \
@@ -396,7 +428,7 @@ jobs:
             for TOKENS in 64 128 1024 2048 4096; do
               echo "=== bench kernel=$KERNEL max-tokens=$TOKENS port=$PORT ==="
               NODE2_CMD="$CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT --rank 1 --master-addr $NODE1_HOST --master-port $PORT --ifname $NODE2_IFNAME --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS"
-              ssh -p $NODE2_PORT $(whoami)@$NODE2_HOST "$NODE2_CMD" &
+              ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "$NODE2_CMD" &
               $CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT \
                 --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
                 --ifname $NODE1_IFNAME \
@@ -415,7 +447,7 @@ jobs:
             for TOKENS in 64 128 1024 2048 4096; do
               echo "=== stress kernel=$KERNEL max-tokens=$TOKENS port=$PORT ==="
               NODE2_CMD="$CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT --rank 1 --master-addr $NODE1_HOST --master-port $PORT --ifname $NODE2_IFNAME --cmd stress --kernel-type $KERNEL --max-tokens $TOKENS"
-              ssh -p $NODE2_PORT $(whoami)@$NODE2_HOST "$NODE2_CMD" &
+              ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "$NODE2_CMD" &
               $CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT \
                 --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
                 --ifname $NODE1_IFNAME \
@@ -432,11 +464,12 @@ jobs:
           PORT=29180
           for TOKENS in 64 128; do
             echo "=== async_ll test max-tokens=$TOKENS port=$PORT ==="
-            NODE2_CMD="$CT exec -e GPU_PER_NODE=8 -e MORI_ENABLE_SDMA=1 $CONTAINER bash $SCRIPT --rank 1 --master-addr $NODE1_HOST --master-port $PORT --ifname $NODE2_IFNAME --cmd test --kernel-type async_ll --quant-type none --dtype bf16 --max-tokens $TOKENS"
-            ssh -p $NODE2_PORT $(whoami)@$NODE2_HOST "$NODE2_CMD" &
+            NODE2_CMD="$CT exec -e GPU_PER_NODE=8 -e MORI_ENABLE_SDMA=1 -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT --rank 1 --master-addr $NODE1_HOST --master-port $PORT --ifname $NODE2_IFNAME --cmd test --kernel-type async_ll --quant-type none --dtype bf16 --max-tokens $TOKENS"
+            ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "$NODE2_CMD" &
             $CT exec \
               -e GPU_PER_NODE=8 \
               -e MORI_ENABLE_SDMA=1 \
+              -e MORI_INTERNODE_TIMEOUT=600 \
               $CONTAINER bash $SCRIPT \
               --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
               --ifname $NODE1_IFNAME \
@@ -450,11 +483,15 @@ jobs:
       - name: Cleanup node1
         if: always()
         run: |
-          $CT exec $CONTAINER chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
           $CT rm -f $CONTAINER || true
+          if $CT image inspect $IMAGE &>/dev/null; then
+            $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE $IMAGE \
+                chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
+          fi
 
       - name: Cleanup node2
         if: always()
         run: |
-          ssh -p $NODE2_PORT $(whoami)@$NODE2_HOST \
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -p $NODE2_PORT $(whoami)@$NODE2_HOST \
             "$CT rm -f $CONTAINER || true"
