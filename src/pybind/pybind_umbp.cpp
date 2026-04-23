@@ -157,16 +157,8 @@ void RegisterMoriUmbp(py::module_& m) {
       .def("clear", &IUMBPClient::Clear)
       .def("flush", &IUMBPClient::Flush)
       .def("is_distributed", &IUMBPClient::IsDistributed)
-      .def("register_memory",
-           [](IUMBPClient& self, uintptr_t ptr, size_t size) -> bool {
-             auto* dc = dynamic_cast<DistributedClient*>(&self);
-             if (dc) return dc->RegisterMemory(reinterpret_cast<void*>(ptr), size);
-             return true;
-           })
-      .def("deregister_memory", [](IUMBPClient& self, uintptr_t ptr) {
-        auto* dc = dynamic_cast<DistributedClient*>(&self);
-        if (dc) dc->DeregisterMemory(reinterpret_cast<void*>(ptr));
-      });
+      .def("register_memory", &IUMBPClient::RegisterMemory, py::arg("ptr"), py::arg("size"))
+      .def("deregister_memory", &IUMBPClient::DeregisterMemory, py::arg("ptr"));
 }
 
 }  // namespace mori
