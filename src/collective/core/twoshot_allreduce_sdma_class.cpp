@@ -845,38 +845,49 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
           post_ag_flag_ptr = post_ag_flag_d_;
         }
 
-        // Plan A (2-kernel variant, perf_history Entry 18 v2): when
-        // direct_output is on AND we're on the copy_output_to_user
-        // MULTI_CHUNK path, split the AR into:
-        //   Kernel 1: ScatterSdmaOnlyKernel (SDMA scatter only, no CU)
-        //   Kernel 2: PipelinedCuAgKernel (CU reduce + cross-PE barrier
-        //              + CU XGMI AG + direct write user_output; NO SDMA AG)
-        // This isolates the CU-heavy reduce+AG phase into its own kernel
-        // so its register budget is not shared with SDMA AG code (that
-        // was the failure mode of plan A v1 single-kernel, which made
-        // reduce 4× slower due to register pressure).
+        // Plan A (2-kernel, XGMI-pull AG, strict per user spec — see
+        // perf_history Entry 19): when direct_output is on AND we're on
+        // the copy_output_to_user MULTI_CHUNK path, split the AR into:
+        //   Kernel 1: ScatterSdmaOnlyKernel (SDMA scatter only, no CU).
+        //   Kernel 2: PipelinedXGMIPullKernel (CU reduce → cross-PE
+        //              barrier → CU XGMI pull + direct write user_output;
+        //              no SDMA AG, no external hipMemcpyAsync).
+        // Replaces Plan B (R/C-group β partition, CU push AG + CU copy)
+        // which failed by +1.16 ms wall (Entry 18) — CU-GEMM contention
+        // and CU XGMI push is slower than SDMA AG.
         const bool use_plan_a = direct_output_enabled_
             && copy_output_to_user_ && multi_chunk;
         bool skip_external_copy = use_plan_a;
 
         if (use_plan_a) {
-            // Plan B (user's 2-kernel design, perf_history Entry 18 v3):
-            // K1 = SDMA scatter, K2 = per-chunk CU pipeline (reduce → AG
-            // → copy) with β block partition to hide CU copy behind next
-            // chunk's reduce+AG.
-            static thread_local bool s_plan_b_announced = false;
-            if (!s_plan_b_announced) {
-                printf("PE %d: Plan B active — ScatterSdmaOnlyKernel + "
-                       "PipelinedCuReduceAgCopyKernel; chunks=%d, blocks=%d, "
+            // Plan A needs both chunks_complete AND ag_sync reset to 0.
+            // ag_sync is block 0 → compute blocks signal for cross-PE
+            // barrier completion. Expand memset to cover both fields.
+            // (SCATTER_MODE=0 else-branch only zeroed chunks_complete.)
+            hipError_t br2 = stream
+                ? hipMemsetAsync(&barrierPtr_->ag_sync, 0,
+                                 sizeof(uint32_t), stream)
+                : hipMemset(&barrierPtr_->ag_sync, 0, sizeof(uint32_t));
+            if (br2 != hipSuccess) {
+                fprintf(stderr,
+                        "PE %d: Plan A hipMemset(ag_sync) failed: %s\n",
+                        myPe_, hipGetErrorString(br2));
+                return false;
+            }
+
+            static thread_local bool s_plan_a_announced = false;
+            if (!s_plan_a_announced) {
+                printf("PE %d: Plan A active — ScatterSdmaOnlyKernel + "
+                       "PipelinedXGMIPullKernel; chunks=%d, blocks=%d, "
                        "threads=%d, chunk_elems=%zu\n",
                        myPe_, numChunks_host, blocks, threads,
                        static_cast<size_t>(chunk_elems));
-                s_plan_b_announced = true;
+                s_plan_a_announced = true;
             }
             ScatterSdmaOnlyKernel<T><<<1, 512, 0, stream>>>(
                 myPe_, npes_, input, output_transit_buffer_obj_,
                 total_count, chunk_elems, scatter_base);
-            PipelinedCuReduceAgCopyKernel<T><<<blocks, threads, 0, stream>>>(
+            PipelinedXGMIPullKernel<T><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_, barrierPtr_,
                 output,
@@ -929,10 +940,11 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         }
 
         pipeline_scatter_gen_ += numChunks_host;   // scatter SDMA (qId=0)
-        // Plan B also uses qId=1 signal counter (R-group CU does atomic
-        // fetch_add on peer's signalPtrs[myPe*numQ+1]), same increment
-        // pattern as SDMA AG. So advance pipeline_ag_gen_ in both paths.
-        pipeline_ag_gen_      += numChunks_host;   // AG (qId=1)
+        // Plan A does NOT use SDMA AG signal (qId=1); AG is replaced by CU
+        // XGMI pull which is synchronized via CrossPeBarrier.ag_sync (per
+        // launch). Still advance pipeline_ag_gen_ so baseline path's
+        // sub-launches (if interleaved) keep consistent counters.
+        pipeline_ag_gen_      += numChunks_host;   // AG (qId=1, unused in Plan A)
         pipeline_reduce_gen_  += numChunks_host;   // reduce_complete via flags
 
         hipError_t err = hipGetLastError();

@@ -792,6 +792,117 @@ Summarized here for quick lookup; exact commits in git log:
 
 ---
 
+## Entry 19 — Plan A (PipelinedXGMIPullKernel) baseline reference + kernel swap
+- **Date**: 2026-04-24
+- **Baseline reference SHA**: `5f0072e7` (code HEAD at measurement time) /
+  `d975cc60` (docs + rule HEAD)
+- **Plan A commit SHA**: `f2118347` (replaces Plan B's
+  `PipelinedCuReduceAgCopyKernel` with new `PipelinedXGMIPullKernel`;
+  host layer `use_plan_a` branch switched to Plan A kernel + ag_sync reset)
+- **Context**: Entry 18 established Plan B (CU push AG + CU copy) failed
+  by +1.16 ms wall. User-specified fix: switch to **strict Plan A per
+  transcript `c0921e01` L1055** — K1 SDMA scatter (免 CU), K2 CU reduce +
+  cross-PE barrier + **CU XGMI pull** peer transits + direct write
+  user_output (no external hipMemcpyAsync, no push AG, no β partition).
+  Uses **方式 2** (单写 transit + unified AG loop): reduce writes only
+  local `transit[myPe slot]`; AG loop is unified over all slots including
+  self (peerPtrs[myPe] == localPtr → local-to-local copy for self).
+
+### Baseline reference data (SDMA copy path, HEAD `5f0072e7`, iter=100)
+- Command: `MORI_PIPELINE_CU=160 python3 tests/python/ccl/test_allreduce.py
+  --num-stages 4 --elems 67108864 --iterations 100 --warmup 20`
+- Scenario: 256 MB / stage × 4 stages, 8-rank MI355X, multi-stage overlap
+
+| variant | overlap (ms) | seq_ar | seq_gemm | vs RCCL |
+|---|---|---|---|---|
+| SDMA copy | **7.802** | 5.190 | 3.672 | **+0.237 ms (+3.1%)** |
+| SDMA no-copy | 7.402 | 4.774 | 3.675 | -2.2% |
+| RCCL | **7.565** | 5.133 | 3.676 | — |
+
+**Note**: Entry 18 RCCL = 7.422 ms (yesterday); today RCCL = 7.565 ms.
+Gap against SDMA copy drops from +0.376 → +0.237 solely because RCCL
+ran slower. RCCL has run-to-run noise (Entry 15 also saw jumps). Plan A
+target: **wall ≤ min(7.422, 7.565) = 7.422 ms** (保险) to claim success
+regardless of today's RCCL variance.
+
+### Phase timing reference (SDMA copy AR[0], iter=3 warmup=2)
+- Command: `MORI_PIPELINE_CU=160 MORI_PHASE_TARGET_STAGE=0 ...
+  --iterations 3 --warmup 2 --ar-phase-timing`
+
+| Phase (AR[0], mean of 2 iters) | ms | 性质 |
+|---|---|---|
+| entry → scatter_done (K2 wait scatter) | 0.20 | EXTERNAL_SCATTER wait |
+| c0: scatter → compute-wait | 0.45 | block 0 observes CB reduce done c0 |
+| c0: compute-wait → barrier | 0.14 | cross-PE barrier c0 |
+| c0: barrier → AG-submit | 0.11 | SDMA AG packet dispatch |
+| c1: scatter → compute-wait | 0.31 | reduce c1 on CB |
+| c1: compute-wait → barrier | 0.16 | |
+| c1: barrier → AG-submit | 0.21 | |
+| **AG-submit → AG-wait-done** | **0.54** | SDMA AG total wait (→ replaced) |
+| c0 AG per-chunk done | 0.72 | |
+| c1 AG per-chunk done | 0.53 | |
+| CB1 reduce c0 (sct-poll→reduce-done) | 0.29 | |
+| CB1 reduce c1 | 0.42 | |
+
+### Plan A expected vs baseline
+
+| Phase | BASELINE | Plan A 预期 | Δ |
+|---|---|---|---|
+| Reduce c0/c1 | 0.29 / 0.42 | ≈ same (single store vs baseline) | ~0 |
+| Cross-PE barrier (c0+c1) | 0.30 total | same mechanism | 0 |
+| AG phase | **SDMA 0.54 ms** | **CU XGMI pull 256MB + local write** | new measurement |
+| External hipMemcpyAsync/AR | ~0.35 ms (Entry 16) | **removed** | **-0.35 ms/AR × 4 = -1.4 ms wall** |
+| CU-GEMM contention | 0 (SDMA免CU) | new CU occupancy during AG | +0.3-0.5 ms (< Plan B's 0.81) |
+
+### Theoretical gain (R10 historical refs)
+- Entry 16: "4 AR × 0.35 ms hipMemcpyAsync = 1.4 ms" → eliminated
+- Entry 18: Plan B overlap regression 0.81 ms upper bound on CU-GEMM contention
+- Plan A wall = 7.802 − 1.4 + 0.3-0.5 = **6.7 – 6.9 ms**
+- Expected gap vs RCCL (7.422 or 7.565) = **-0.5 to -0.9 ms (SUPER)** if CU
+  XGMI pull BW at 256 MB/8 PE ≈ Entry 18 micro-bench 370 GB/s
+
+### Code changes in this commit
+- `include/mori/collective/allreduce/pipelined_allreduce_sdma_kernel.hpp`:
+  - Removed `PipelinedCuReduceAgCopyKernel` (Plan B, β partition)
+  - Added `PipelinedXGMIPullKernel` (Plan A, unified all-CB flow,
+    方式 2 single-write + unified AG pull)
+- `src/collective/core/twoshot_allreduce_sdma_class.cpp`:
+  - `use_plan_a` branch: switched K2 launch to `PipelinedXGMIPullKernel`
+  - Added `hipMemsetAsync(&barrierPtr_->ag_sync, 0, sizeof(uint32_t))`
+    before launch (Plan A uses ag_sync for block 0 → compute blocks
+    AG-ready signaling; zero init required)
+  - Updated Plan A branch announce log (from "Plan B" to "Plan A")
+  - Updated comments documenting Plan A design
+
+### Next step (Step 2)
+User to run in Linux container (`smci355-ccs-aus-m01-33`):
+```
+cd /home/fizhang/test/mori && git pull origin sdma-test
+# build
+pip install -e . --no-build-isolation
+
+# Plan A wall (iter=100)
+MORI_PIPELINE_CU=160 MORI_DIRECT_OUTPUT=1 python3 \
+  tests/python/ccl/test_allreduce.py --num-stages 4 --elems 67108864 \
+  --iterations 100 --warmup 20 2>&1 | tee /tmp/plan_a_wall.log
+
+# Plan A phase timing (iter=3)
+MORI_PIPELINE_CU=160 MORI_DIRECT_OUTPUT=1 MORI_PHASE_TARGET_STAGE=0 \
+  python3 tests/python/ccl/test_allreduce.py --num-stages 4 \
+  --elems 67108864 --iterations 3 --warmup 2 --ar-phase-timing \
+  2>&1 | tee /tmp/plan_a_phase.log
+
+# Extract for reply
+grep -E "Plan A active|overlap|seq_ar|seq_gemm|RCCL|vs RCCL" /tmp/plan_a_wall.log
+grep -E "chunk [0-9]|entry|exit|barrier|AG|compute-wait|reduce|cb-exit" \
+  /tmp/plan_a_phase.log | head -80
+```
+
+Compare `overlap` to BASELINE 7.802 / RCCL 7.565 / RCCL Entry 18 7.422.
+All Test 6 variants (copy/no-copy/RCCL) must correctness-pass.
+
+---
+
 ## Entry 18 — Plan A/B (K1=SDMA scatter + K2=CU reduce+AG+copy) FAILED
 - **Date**: 2026-04-23
 - **Commits**: `ec612289` (A v1), `c652a66c` (A fix), `392165ef` (A v2 2-kernel), `d5143321` (B v3 β partition), `5f0072e7` (B min-chunk fix) — **代码仍在 HEAD, 未 revert**

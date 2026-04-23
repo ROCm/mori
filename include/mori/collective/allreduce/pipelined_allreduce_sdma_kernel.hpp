@@ -638,47 +638,59 @@ __global__ void PipelinedAllReduceSdmaKernel(
 }
 
 // ============================================================================
-// PipelinedCuReduceAgCopyKernel — plan B (2-kernel, β partition).
+// PipelinedXGMIPullKernel — Plan A (2-kernel, strict spec per user design).
 //
 // Paired with ScatterSdmaOnlyKernel which must be launched FIRST on the same
 // stream (SDMA scatter runs on the SDMA engine; this kernel runs on CU only).
 //
-// Per-chunk 3-stage CU pipeline, ALL work CU-based (no SDMA AG, no SDMA
-// copy, no external hipMemcpyAsync):
-//   Stage 1 (reduce): poll scatter signals for chunk c, reduce chunk c
-//                     (read local transit[all peer slots for chunk c],
-//                      sum in registers, write local transit[myPe slot]).
-//   Stage 2 (AG)    : CU XGMI write my reduced chunk c shard to all peer
-//                     transits at their [myPe slot, chunk c region].
-//                     Carries a signal increment on remote side.
-//   Stage 3 (copy)  : poll AG signals for chunk c from all peers; then
-//                     local copy transit[all slots, chunk c region] →
-//                     user_output[all slots, chunk c region].
+// Per-chunk flow (all compute blocks participate uniformly — NO β partition;
+// plan B's R-group/C-group split removed):
 //
-// β block partition (to hide copy behind next chunk's reduce+AG):
-//   - Group R (reduce+AG): ceil(7/8 * compBlocks) blocks.
-//   - Group C (copy)     : compBlocks - R.
-//   Per iteration c ∈ [0, numChunks):
-//     R-blocks  : stage 1 + stage 2 for chunk c
-//     C-blocks  : stage 3 for chunk c-1  (skipped at c==0; extra tail
-//                 iteration at c==numChunks covers final chunk)
-//   This pipelines copy against reduce+AG; last chunk's copy runs alone
-//   at the tail (partial expose).
+//   Stage 1 (reduce):
+//     Compute blocks wait scatter signals for chunk c, read local
+//     transit[all peer slots, chunk c region], sum in registers, write
+//     ONLY to local transit[myPe slot, chunk c region]. (方式 2: no double
+//     write to user_output; self-slot copy happens uniformly in Stage 3.)
+//
+//   Stage 2 (barrier):
+//     Compute blocks: buffer_wbl2 + threadfence_system +
+//       fetch_add(chunks_complete)  — makes reduce result visible to
+//       peers via XGMI and to block 0 for counting.
+//     Block 0: wait chunks_complete ≥ (c+1)*compBlocks; do cross-PE
+//       reduce_complete barrier via flagsMemObj; then fetch_add(ag_sync)
+//       so compute blocks know chunk c's peer transits are now safe to
+//       XGMI-read.
+//
+//   Stage 3 (AG via CU XGMI pull):
+//     Compute blocks wait ag_sync ≥ c+1. Each block takes slot p =
+//     cb_id % npes, pos = cb_id / npes (at compBlocks=160, npes=8 that's
+//     20 blocks per slot). Cross-XGMI load peer[p].transit[p slot, chunk c
+//     region] → local user_output[p slot, chunk c region]. For p == myPe,
+//     peerPtrs[myPe] == localPtr so the same code path is a local-to-local
+//     copy (reduce just wrote that region so it's L2-hot).
+//
+// Compared to PipelinedAllReduceSdmaKernel<T,0,true,true> (baseline
+// EXTERNAL_SCATTER + MULTI_CHUNK SDMA path): stages 1 + 2 are identical
+// except no per-chunk SDMA AG submit/wait; stage 3 replaces SDMA AG with
+// CU XGMI pull + direct write to user_output, eliminating the external
+// hipMemcpyAsync (~0.35 ms/AR per perf_history Entry 16).
 // ============================================================================
 template <typename T>
-__global__ void PipelinedCuReduceAgCopyKernel(
+__global__ void PipelinedXGMIPullKernel(
     int myPe, int npes,
     const T* __restrict__ input,
-    const application::SymmMemObjPtr dstMemObj,
-    const application::SymmMemObjPtr flagsMemObj,
-    CrossPeBarrier* __restrict__ barrier,
-    T* __restrict__ user_output,
+    const application::SymmMemObjPtr dstMemObj,     // transit (symm)
+    const application::SymmMemObjPtr flagsMemObj,   // cross-PE reduce_complete flag
+    CrossPeBarrier* __restrict__ barrier,           // chunks_complete + ag_sync
+    T* __restrict__ user_output,                    // user-provided output tensor
     size_t elementCount,
     size_t chunkElementCount,
     uint64_t scatterBase,
-    uint64_t agBase,               // CU AG signal counter base (per-peer signalPtrs)
-    uint64_t reduceCompleteBase,   // unused here; kept for API symmetry
+    uint64_t agBase,               // unused in Plan A (kept for API symmetry)
+    uint64_t reduceCompleteBase,
     uint64_t* phase_ts) {
+
+  (void)agBase;
 
   ar_write_phase_ts(phase_ts, 0);
 
@@ -706,212 +718,223 @@ __global__ void PipelinedCuReduceAgCopyKernel(
   const uint32_t numQ = dstMemObj->sdmaNumQueue;
   const int compBlocks = static_cast<int>(gridDim.x) - 1;
 
-  // β partition: R-blocks do reduce+AG, C-blocks do copy of previous chunk.
-  // Ratio tuned by data volume (AG: ~7× copy data), so 7:1. Min 1 each.
-  int nR = (compBlocks * 7 + 7) / 8;
-  if (nR < 1) nR = 1;
-  if (nR > compBlocks - 1) nR = compBlocks - 1;
-  const int nC = compBlocks - nR;
-
   __shared__ uint64_t s_scatter_by_sender[64];
-  __shared__ const P* s_pe_ptrs[8];
+  __shared__ const P* s_pe_ptrs[8];              // peer transit localPtr view for reduce
+  __shared__ uintptr_t s_peer_transit_base[8];   // peer transit peerPtrs[p] for AG pull
 
-  {
+  if (threadIdx.x < 64) {
     const int s = static_cast<int>(threadIdx.x);
-    if (s < npes && s != myPe) s_scatter_by_sender[s] = scatterBase;
+    if (s < npes && s != myPe) {
+      s_scatter_by_sender[s] = scatterBase;
+    }
+    if (s < npes) {
+      s_peer_transit_base[s] = dstMemObj->peerPtrs[s];
+    }
   }
   __syncthreads();
 
+  // =========================================================================
+  // Block 0 — orchestrator: per-chunk cc-wait + cross-PE barrier + ag_sync signal
+  // =========================================================================
   if (blockIdx.x == 0) {
-    // Block 0 has no coordination work here (AG signal polling is done by
-    // C-blocks themselves). Just record phase_ts and exit.
-    ar_write_phase_ts(phase_ts, 1);
+    const int thr = static_cast<int>(threadIdx.x);
+
+    for (int c = 0; c < numChunks; c++) {
+      // 1. Wait all compute blocks to finish reduce for chunk c.
+      const uint32_t ccTarget =
+          static_cast<uint32_t>((c + 1) * compBlocks);
+      if (thr == 0) {
+        while (__scoped_atomic_load_n(
+                   &barrier->chunks_complete,
+                   __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) < ccTarget)
+          __builtin_amdgcn_s_sleep(1);
+      }
+      __syncthreads();
+      ar_write_phase_ts(phase_ts, 2 + 3 * c + 0);  // chunk c compute-wait done
+
+      // 2. Cross-PE reduce_complete barrier. Same mechanism as baseline
+      //    (PipelinedAllReduceSdmaKernel). Required so my XGMI pull later
+      //    reads peer's post-reduce transit[peer slot], not pre-reduce
+      //    scatter value.
+      if (thr == 0) {
+        HSAuint64* myFlag =
+            reinterpret_cast<HSAuint64*>(flagsMemObj->localPtr);
+        __hip_atomic_fetch_add(myFlag, 1ULL,
+                               __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+      }
+      if (thr < npes && thr != myPe) {
+        const int pe = thr;
+        const uint64_t expected =
+            reduceCompleteBase + static_cast<uint64_t>(c + 1);
+        HSAuint64* remoteFlag =
+            reinterpret_cast<HSAuint64*>(flagsMemObj->peerPtrs[pe]);
+        while (core::AtomicLoadRelaxed(remoteFlag) < expected)
+          __builtin_amdgcn_s_sleep(1);
+      }
+      __syncthreads();
+      ar_write_phase_ts(phase_ts, 2 + 3 * c + 1);  // chunk c cross-PE barrier done
+
+      // 3. Signal compute blocks: chunk c's peer transits are now safe
+      //    to XGMI-read. ag_sync is zeroed by host before launch.
+      if (thr == 0) {
+        __threadfence();
+        __hip_atomic_fetch_add(&barrier->ag_sync, 1u,
+                               __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+      }
+      ar_write_phase_ts(phase_ts, 2 + 3 * c + 2);  // chunk c ag_sync signaled
+    }
+
+    ar_write_phase_ts(phase_ts, 3 + 3 * numChunks);  // block 0 exit
     return;
   }
 
-  const int cb_id = static_cast<int>(blockIdx.x) - 1;
-  const bool is_R = (cb_id < nR);
-  const int  r_id = is_R ? cb_id : -1;         // 0..nR-1
-  const int  c_id = is_R ? -1 : (cb_id - nR);  // 0..nC-1
+  // =========================================================================
+  // Compute blocks — scatter-poll + reduce + fence + ag_sync wait + XGMI pull
+  // =========================================================================
+  ar_write_phase_ts_cb1(phase_ts, 10);  // compute block entry
 
-  ar_write_phase_ts_cb1(phase_ts, 10);
+  const size_t compTid =
+      static_cast<size_t>(blockIdx.x - 1) * static_cast<size_t>(blockDim.x)
+      + threadIdx.x;
+  const size_t compStride =
+      static_cast<size_t>(compBlocks) * static_cast<size_t>(blockDim.x);
 
-  // Iterate chunks 0..numChunks. R-blocks do reduce+AG of chunk c;
-  // C-blocks do copy of chunk c-1 (and at c==numChunks, copy chunk numChunks-1).
-  for (int c = 0; c <= numChunks; c++) {
-    // ---- R-group : reduce + AG of chunk c (skip at c==numChunks) ----
-    if (is_R && c < numChunks) {
-      // Stage 1: wait scatter signals for chunk c from all peers
-      const size_t off = static_cast<size_t>(c) * packedChunkPerRank;
-      if (threadIdx.x < static_cast<unsigned>(npes - 1)) {
-        const int idx = static_cast<int>(threadIdx.x);
-        const int sender = idx < myPe ? idx : idx + 1;
-        const uint64_t expected =
-            s_scatter_by_sender[sender] + static_cast<uint64_t>(c + 1);
-        HSAuint64* sig = dstMemObj->signalPtrs
-            + static_cast<size_t>(sender) * numQ;
-        while (core::AtomicLoadRelaxed(sig) < expected) {
-          __builtin_amdgcn_s_sleep(2);
+  for (int c = 0; c < numChunks; c++) {
+    ar_write_phase_ts_cb1(phase_ts, 11 + 3 * c + 0);  // chunk c loop start
+    const size_t off = static_cast<size_t>(c) * packedChunkPerRank;
+
+    // 1. Wait scatter signals for chunk c from all peers (EXTERNAL_SCATTER:
+    //    K1 ScatterSdmaOnlyKernel submits scatter; we wait signals).
+    if (threadIdx.x < static_cast<unsigned>(npes - 1)) {
+      const int idx = static_cast<int>(threadIdx.x);
+      const int sender = idx < myPe ? idx : idx + 1;
+      const uint64_t expected =
+          s_scatter_by_sender[sender] + static_cast<uint64_t>(c + 1);
+      HSAuint64* sig = dstMemObj->signalPtrs
+          + static_cast<size_t>(sender) * numQ;
+      while (core::AtomicLoadRelaxed(sig) < expected) {
+        __builtin_amdgcn_s_sleep(2);
+      }
+    }
+    ar_write_phase_ts_cb1(phase_ts, 11 + 3 * c + 1);  // chunk c scatter-poll done
+
+    // 2. Prepare peer source pointers for reduce. Own slot reads from
+    //    input (self-scatter elided); other slots from local transit.
+    if (threadIdx.x < static_cast<unsigned>(npes)) {
+      const int pe = static_cast<int>(threadIdx.x);
+      s_pe_ptrs[pe] = (pe == myPe)
+          ? reinterpret_cast<const P*>(input)
+              + static_cast<size_t>(myPe) * packedPerRank + off
+          : buf + static_cast<size_t>(pe) * packedPerRank + off;
+    }
+    __syncthreads();
+
+    // 3. Reduce → write ONLY to local transit[myPe slot, chunk c region]
+    //    (方式 2: no double write; self-slot copy happens uniformly in AG).
+    {
+      size_t cnt = packedChunkPerRank;
+      if (off + cnt > packedPerRank) cnt = packedPerRank - off;
+
+      P* __restrict__ myDst =
+          buf + static_cast<size_t>(myPe) * packedPerRank + off;
+
+      size_t k = compTid;
+      for (; k + compStride < cnt; k += compStride * 2) {
+        A acc0 = upcast_v<typename P::type, pack_size>(s_pe_ptrs[0][k]);
+        A acc1 = upcast_v<typename P::type, pack_size>(
+            s_pe_ptrs[0][k + compStride]);
+        for (int pe = 1; pe < npes; ++pe) {
+          packed_assign_add(
+              acc0,
+              upcast_v<typename P::type, pack_size>(s_pe_ptrs[pe][k]));
+          packed_assign_add(
+              acc1,
+              upcast_v<typename P::type, pack_size>(
+                  s_pe_ptrs[pe][k + compStride]));
         }
+        myDst[k] = downcast_v<typename P::type, pack_size>(acc0);
+        myDst[k + compStride] =
+            downcast_v<typename P::type, pack_size>(acc1);
       }
-      if (threadIdx.x < static_cast<unsigned>(npes)) {
-        const int pe = static_cast<int>(threadIdx.x);
-        s_pe_ptrs[pe] = (pe == myPe)
-            ? reinterpret_cast<const P*>(input)
-                + static_cast<size_t>(myPe) * packedPerRank + off
-            : buf + static_cast<size_t>(pe) * packedPerRank + off;
-      }
-      __syncthreads();
-
-      // Stage 1: reduce chunk c (R-group split across nR blocks × blockDim.x)
-      {
-        const size_t rTid =
-            static_cast<size_t>(r_id) * static_cast<size_t>(blockDim.x)
-            + threadIdx.x;
-        const size_t rStride =
-            static_cast<size_t>(nR) * static_cast<size_t>(blockDim.x);
-
-        size_t cnt = packedChunkPerRank;
-        if (off + cnt > packedPerRank) cnt = packedPerRank - off;
-
-        P* __restrict__ myDst =
-            buf + static_cast<size_t>(myPe) * packedPerRank + off;
-
-        for (size_t k = rTid; k < cnt; k += rStride) {
-          A acc = upcast_v<typename P::type, pack_size>(s_pe_ptrs[0][k]);
-          for (int pe = 1; pe < npes; ++pe) {
-            packed_assign_add(
-                acc,
-                upcast_v<typename P::type, pack_size>(s_pe_ptrs[pe][k]));
-          }
-          myDst[k] = downcast_v<typename P::type, pack_size>(acc);
+      if (k < cnt) {
+        A acc = upcast_v<typename P::type, pack_size>(s_pe_ptrs[0][k]);
+        for (int pe = 1; pe < npes; ++pe) {
+          packed_assign_add(
+              acc,
+              upcast_v<typename P::type, pack_size>(s_pe_ptrs[pe][k]));
         }
+        myDst[k] = downcast_v<typename P::type, pack_size>(acc);
       }
-      __syncthreads();
-      if (threadIdx.x == 0) {
+    }
+    __syncthreads();
+    ar_write_phase_ts_cb1(phase_ts, 11 + 3 * c + 2);  // chunk c reduce done
+
+    // 4. wbl2 + threadfence_system + fetch_add(chunks_complete) — makes
+    //    our reduced transit[myPe slot] visible system-scope (so peers can
+    //    XGMI read it) and signals block 0 to advance to cross-PE barrier.
+    if (threadIdx.x == 0) {
 #if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
-        asm volatile("buffer_wbl2" ::: "memory");
+      asm volatile("buffer_wbl2" ::: "memory");
 #endif
-        __threadfence_system();
-      }
-      __syncthreads();
-      ar_write_phase_ts_cb1(phase_ts, 11 + 3 * c + 0);  // reduce chunk c done
+      __threadfence_system();
+      __hip_atomic_fetch_add(&barrier->chunks_complete, 1u,
+                             __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+    }
+    __syncthreads();
 
-      // Stage 2: AG — CU XGMI write my reduced chunk c shard to all peer
-      // transits' [myPe slot, chunk c region]. Carries signal increment
-      // on each peer's signalPtrs[myPe*numQ + 1] (AG qId=1).
-      using vec_t = ulonglong2;  // 16 B
+    // 5. Wait block 0's ag_sync ≥ c+1 (cross-PE barrier done for chunk c).
+    if (threadIdx.x == 0) {
+      while (__scoped_atomic_load_n(
+                 &barrier->ag_sync,
+                 __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) <
+             static_cast<uint32_t>(c + 1)) {
+        __builtin_amdgcn_s_sleep(1);
+      }
+    }
+    __syncthreads();
+
+    // 6. CU XGMI pull + write user_output, all slots unified (方式 2).
+    //    Slot assignment: slot = cb_id % npes, pos = cb_id / npes.
+    //    For p == myPe, peerPtrs[myPe] == localPtr → local copy path.
+    {
+      using vec_t = ulonglong2;  // 16 B vectorized
       const size_t cOff = static_cast<size_t>(c) * chunkBytes;
       size_t agBytes = chunkBytes;
       if (cOff + agBytes > totalShardBytes) agBytes = totalShardBytes - cOff;
       const size_t totalVecs = agBytes / sizeof(vec_t);
-      const int peersOther = npes - 1;
-      // Assign each R-block to one destination peer via round-robin.
-      // R-blocks write one-to-many: each (r_id % peersOther) → peer.
-      if (peersOther > 0) {
-        int peerSlot = r_id % peersOther;
-        int destPe = peerSlot < myPe ? peerSlot : peerSlot + 1;
 
-        const uint8_t* localSrc =
-            reinterpret_cast<const uint8_t*>(buf)
-            + static_cast<size_t>(myPe) * totalShardBytes + cOff;
-        uintptr_t peerBase = dstMemObj->peerPtrs[destPe];
-        uint8_t* remoteDst =
-            reinterpret_cast<uint8_t*>(peerBase)
-            + static_cast<size_t>(myPe) * totalShardBytes + cOff;
+      const int cb_id = static_cast<int>(blockIdx.x) - 1;
+      const int slot = cb_id % npes;
+      const int blocks_per_slot_floor = compBlocks / npes;
+      const int extra = compBlocks - blocks_per_slot_floor * npes;
+      const int pos_in_slot = cb_id / npes;
+      const int blocks_on_this_slot = (slot < extra)
+          ? blocks_per_slot_floor + 1 : blocks_per_slot_floor;
 
-        // How many R-blocks share destPe?
-        int blocks_per_peer_up = (nR + peersOther - 1) / peersOther;
-        int pos_in_peer = r_id / peersOther;
-
-        const vec_t* src = reinterpret_cast<const vec_t*>(localSrc);
-        vec_t* dst = reinterpret_cast<vec_t*>(remoteDst);
+      if (blocks_on_this_slot > 0 && pos_in_slot < blocks_on_this_slot) {
         const size_t vecsPerBlock =
-            (totalVecs + blocks_per_peer_up - 1) / blocks_per_peer_up;
+            (totalVecs + blocks_on_this_slot - 1) / blocks_on_this_slot;
         const size_t vStart =
-            static_cast<size_t>(pos_in_peer) * vecsPerBlock;
+            static_cast<size_t>(pos_in_slot) * vecsPerBlock;
         const size_t vEnd =
             (vStart + vecsPerBlock > totalVecs) ? totalVecs
                                                 : (vStart + vecsPerBlock);
+
+        const uint8_t* src =
+            reinterpret_cast<const uint8_t*>(s_peer_transit_base[slot])
+            + static_cast<size_t>(slot) * totalShardBytes + cOff;
+        uint8_t* dst =
+            reinterpret_cast<uint8_t*>(user_output)
+            + static_cast<size_t>(slot) * totalShardBytes + cOff;
+
+        const vec_t* sVec = reinterpret_cast<const vec_t*>(src);
+        vec_t* dVec = reinterpret_cast<vec_t*>(dst);
         for (size_t v = vStart + threadIdx.x; v < vEnd; v += blockDim.x) {
-          dst[v] = src[v];
-        }
-        __syncthreads();
-        // Signal peer that we've written our chunk c shard.
-        // Use one thread in this block to increment peer's signal.
-        // Only one R-block per peer (the lowest pos_in_peer==0 one)
-        // performs the signal increment to avoid double-counting.
-        if (pos_in_peer == 0 && threadIdx.x == 0) {
-          __threadfence_system();
-          HSAuint64* peerSig = dstMemObj->peerSignalPtrs[destPe]
-              + static_cast<size_t>(myPe) * numQ + 1u;
-          __hip_atomic_fetch_add(peerSig, 1ULL,
-                                 __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+          dVec[v] = sVec[v];
         }
       }
-      ar_write_phase_ts_cb1(phase_ts, 11 + 3 * c + 1);  // AG chunk c submit done
+      __syncthreads();
     }
-
-    // ---- C-group : copy chunk (c-1) from local transit to user_output ----
-    // copy_c = c-1; active when 0 < c <= numChunks (both start and tail).
-    if (!is_R) {
-      int copy_c = c - 1;
-      if (copy_c >= 0 && copy_c < numChunks) {
-        // Wait for all peers' AG signals for chunk copy_c on my side.
-        // Each peer writes 1 signal per chunk. My signalPtrs[peer*numQ+1]
-        // should have reached agBase + (copy_c+1) once peer finished.
-        if (threadIdx.x < static_cast<unsigned>(npes - 1)) {
-          const int idx = static_cast<int>(threadIdx.x);
-          const int sender = idx < myPe ? idx : idx + 1;
-          const uint64_t expected =
-              agBase + static_cast<uint64_t>(copy_c + 1);
-          HSAuint64* sig = dstMemObj->signalPtrs
-              + static_cast<size_t>(sender) * numQ + 1u;
-          while (core::AtomicLoadRelaxed(sig) < expected) {
-            __builtin_amdgcn_s_sleep(2);
-          }
-        }
-        __syncthreads();
-
-        // Local copy: transit[all slots, chunk copy_c region]
-        //           → user_output[all slots, chunk copy_c region].
-        using vec_t = ulonglong2;
-        const size_t cOff = static_cast<size_t>(copy_c) * chunkBytes;
-        size_t copyBytes = chunkBytes;
-        if (cOff + copyBytes > totalShardBytes)
-          copyBytes = totalShardBytes - cOff;
-        // Each peer slot is totalShardBytes; we copy one chunk region
-        // from each of npes slots.
-        for (int pe = 0; pe < npes; pe++) {
-          const size_t slotOff =
-              static_cast<size_t>(pe) * totalShardBytes + cOff;
-          const uint8_t* src =
-              reinterpret_cast<const uint8_t*>(buf) + slotOff;
-          uint8_t* dst =
-              reinterpret_cast<uint8_t*>(user_output) + slotOff;
-          const size_t totalVecs = copyBytes / sizeof(vec_t);
-          const size_t vecsPerBlock =
-              (totalVecs + nC - 1) / nC;
-          const size_t vStart =
-              static_cast<size_t>(c_id) * vecsPerBlock;
-          const size_t vEnd =
-              (vStart + vecsPerBlock > totalVecs) ? totalVecs
-                                                   : (vStart + vecsPerBlock);
-          const vec_t* sVec = reinterpret_cast<const vec_t*>(src);
-          vec_t* dVec = reinterpret_cast<vec_t*>(dst);
-          for (size_t v = vStart + threadIdx.x; v < vEnd; v += blockDim.x) {
-            dVec[v] = sVec[v];
-          }
-        }
-        __syncthreads();
-        ar_write_phase_ts_cb1(phase_ts, 11 + 3 * copy_c + 2);  // copy chunk done
-      }
-    }
-    // No global sync between iterations — R and C groups advance
-    // independently. Correctness relies on:
-    //   - R waits scatter sig (peer wrote my transit for chunk c)
-    //   - C waits AG sig (peer wrote my transit for chunk copy_c, same
-    //     event set but from AG not scatter).
   }
 
   ar_write_phase_ts_cb1(phase_ts, 11 + 3 * numChunks);  // compute block exit
