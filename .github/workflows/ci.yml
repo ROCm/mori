@@ -167,7 +167,7 @@ jobs:
             timeout 60 mpirun --allow-run-as-root  -np 2 ./build/benchmark/p2p_put_latency
             timeout 60 mpirun --allow-run-as-root  -np 2 ./build/benchmark/p2p_get_latency
           "
-      
+
       - name: MORI-CPP shmem_benchmark (RDMA)
         run: |
           $CT exec $CONTAINER bash -c "
