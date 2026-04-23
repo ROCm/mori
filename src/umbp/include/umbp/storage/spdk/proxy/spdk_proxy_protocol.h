@@ -54,7 +54,12 @@ static constexpr uint32_t kTenantFlagActive = 1u << 0;
 static constexpr uint32_t kTenantFlagReaping = 1u << 1;
 
 static constexpr const char* kDefaultShmName = "/umbp_spdk_proxy";
-static constexpr uint64_t kHeartbeatStaleMs = 5000;
+// Default stale threshold for the proxy heartbeat in the SHM header.
+// Runtime value is overridable via UMBP_SPDK_PROXY_HEARTBEAT_STALE_MS;
+// see the consumer TUs (spdk_proxy_shm.cpp, spdk_proxy_tier.cpp,
+// spdk_proxy_daemon.cpp) for the resolver. Kept here only as the numeric
+// default so this protocol header stays free of env/log dependencies.
+static constexpr uint64_t kDefaultHeartbeatStaleMs = 5000;
 
 inline uint64_t NowEpochMs() {
   return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
