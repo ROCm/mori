@@ -1654,14 +1654,16 @@ class MasterClient {
 ### 9.1 BlockIndex Thread Safety
 
 - Single `std::shared_mutex` protecting `entries_`.
-  - `Lookup`, `GetMetrics`: shared (read) lock
-  - `Register`, `Unregister`, `UnregisterByNode`, `RecordAccess`: exclusive (write) lock
+  - `Lookup`, `GetMetrics`, `BatchLookupExists`, `RecordAccess`: shared (read) lock
+  - `Register`, `Unregister`, `UnregisterByNode`: exclusive (write) lock
   - `BatchRegister`, `BatchUnregister`: exclusive (write) lock — held for
     the entire batch to avoid per-item lock/unlock overhead
 
-- **Note:** `RecordAccess` takes an exclusive lock on every RouteGet, which
-  adds contention on the read path. Acceptable for the prototype. If it becomes
-  a bottleneck, use atomic counters or batch the updates.
+- **`RecordAccess` is read-only at the lock layer:** as of the #1 fix it
+  takes a shared lock and updates `last_accessed_rep` / `atomic_access_count`
+  via `std::atomic` stores (`global_block_index.cpp::RecordAccess`,
+  `BlockEntry::RecordAccessAtomic`). Earlier drafts of this section
+  described `RecordAccess` as exclusive; that is now stale.
 
 - **Batch lock duration:** A large batch (e.g., 1000 entries) holds the exclusive
   lock for longer than a single Register call. This blocks all concurrent Lookup
@@ -1678,19 +1680,39 @@ class MasterClient {
 
 ### 9.3 Lock Ordering
 
-To avoid deadlocks between ClientRegistry and BlockIndex:
+**Principle (stable):** No path may simultaneously hold both the
+`ClientRegistry` mutex and the `BlockIndex` mutex in a way that creates a
+cycle. Concretely: any code that needs to touch both must release the first
+lock before acquiring the second. This rules out the only deadlock geometry
+between the two subsystems regardless of which direction a given path goes.
 
-```
-  Lock ordering: ClientRegistry mutex → BlockIndex mutex
-                 (never acquire ClientRegistry lock while holding BlockIndex lock)
-```
+**Current implementation snapshot:**
 
-- `BlockIndex.Register()` acquires BlockIndex lock first, then calls
-  `registry_->TrackKey()` which acquires registry lock. TrackKey only touches
-  `client_keys_`, not `clients_`.
-- The Reaper acquires registry write lock, then calls `index_.UnregisterByNode()`
-  which acquires BlockIndex lock. This follows: registry → index.
-- No path acquires index lock → registry lock (guaranteed by design).
+- `BlockIndex.{Register, Unregister, UnregisterByNode, BatchRegister,
+  BatchUnregister, EvictEntries}` acquire the BlockIndex lock, mutate
+  `entries_`, **release** the BlockIndex lock, then call
+  `registry_->TrackKey()` / `UntrackKey()`.
+- `ClientRegistry.{TrackKey, UntrackKey}` (post #6 fix) run in three phases:
+
+  ```
+  Phase 1: registry shared_lock → load `idx = index_`, check `clients_.find`, release
+  Phase 2: no registry lock     → idx->Lookup(key) (acquires BlockIndex shared lock internally)
+  Phase 3: registry unique_lock → re-check clients_.find, mutate client_keys_
+  ```
+
+  Phase 1's shared_lock pairs with `SetBlockIndex`'s unique_lock so the
+  `index_` pointer is published safely; Phase 3's re-check closes the
+  unregister race window opened by Phase 2.
+- `ClientRegistry.{UnregisterClient, ReapExpiredClients,
+  FinalizeAllocation, PublishLocalBlock}` acquire the registry unique_lock,
+  mutate registry-side state, **release** the registry lock, then call
+  `index_->{UnregisterByNode, Register}`.
+- `Heartbeat` / `AllocateForPut` only touch the registry unique_lock; they
+  never reach the `index_`.
+
+No path acquires both locks at once. If the future B-track refactor
+(`client_keys_` independent mutex, see distributed-known-issues.md follow-ups)
+lands, only this snapshot needs to be updated; the principle above stays.
 
 ### 9.4 Router Thread Safety
 
@@ -1973,6 +1995,15 @@ The same race exists in `BatchRegister` (Section 3.4.7).
 **Fix:** Either call `TrackKey` while still holding the BlockIndex lock (requires
 careful lock ordering — see PA-6), or use a separate lightweight lock that serializes
 Track/Untrack operations against Register/Unregister for the same key.
+
+**As of #6 (2026-04-23):** the race window is **narrowed but not eliminated**.
+`TrackKey` / `UntrackKey` now re-do the index `Lookup` after releasing the
+registry lock (Phase 2 in §9.3), as defense-in-depth against exactly the
+TOCTOU described above; Phase 3's `clients_.find` re-check additionally
+prevents `operator[]` from leaking an empty `client_keys_[node_id]` entry
+when the client unregisters concurrently. The residual stale-entry race
+remains benign and self-heals via `UnregisterClient` / `ReapExpiredClients`
+— see distributed-known-issues.md #6 "假设 4" for the full argument.
 
 ### PA-6. Lock ordering description contradicts pseudocode [MEDIUM]
 

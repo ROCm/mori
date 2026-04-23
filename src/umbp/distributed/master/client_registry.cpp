@@ -309,14 +309,25 @@ ClientStatus ClientRegistry::Heartbeat(const std::string& node_id,
   return ClientStatus::ALIVE;
 }
 
+// #6 fix: index_->Lookup() is moved out of the registry unique_lock to avoid
+// blocking Heartbeat / AllocateForPut.  Phase 1 (shared_lock) loads the
+// index_ pointer and checks client existence; Phase 2 does the ownership
+// Lookup with no registry lock held; Phase 3 (unique_lock) re-checks the
+// client and mutates client_keys_.  Pairing the index_ load with the
+// shared_lock is what makes the lock-free Phase 2 read safe against a
+// concurrent SetBlockIndex (see client_registry.h assumption #3).
 void ClientRegistry::TrackKey(const std::string& node_id, const std::string& key) {
-  std::unique_lock lock(mutex_);
-  if (clients_.find(node_id) == clients_.end()) {
-    return;
+  GlobalBlockIndex* idx = nullptr;
+  {
+    std::shared_lock lock(mutex_);
+    if (clients_.find(node_id) == clients_.end()) {
+      return;
+    }
+    idx = index_;
   }
 
-  if (index_ != nullptr) {
-    const auto locations = index_->Lookup(key);
+  if (idx != nullptr) {
+    const auto locations = idx->Lookup(key);
     const bool owns_key =
         std::any_of(locations.begin(), locations.end(),
                     [&node_id](const Location& location) { return location.node_id == node_id; });
@@ -325,18 +336,25 @@ void ClientRegistry::TrackKey(const std::string& node_id, const std::string& key
     }
   }
 
+  std::unique_lock lock(mutex_);
+  // Re-check after the lock-free window: the client may have been
+  // unregistered concurrently.  Without this we would resurrect an empty
+  // set via operator[] on a dead node_id.
+  if (clients_.find(node_id) == clients_.end()) {
+    return;
+  }
   client_keys_[node_id].insert(key);
 }
 
 void ClientRegistry::UntrackKey(const std::string& node_id, const std::string& key) {
-  std::unique_lock lock(mutex_);
-  auto it = client_keys_.find(node_id);
-  if (it == client_keys_.end()) {
-    return;
+  GlobalBlockIndex* idx = nullptr;
+  {
+    std::shared_lock lock(mutex_);
+    idx = index_;
   }
 
-  if (index_ != nullptr) {
-    const auto locations = index_->Lookup(key);
+  if (idx != nullptr) {
+    const auto locations = idx->Lookup(key);
     const bool still_owns_key =
         std::any_of(locations.begin(), locations.end(),
                     [&node_id](const Location& location) { return location.node_id == node_id; });
@@ -345,6 +363,11 @@ void ClientRegistry::UntrackKey(const std::string& node_id, const std::string& k
     }
   }
 
+  std::unique_lock lock(mutex_);
+  auto it = client_keys_.find(node_id);
+  if (it == client_keys_.end()) {
+    return;
+  }
   it->second.erase(key);
   if (it->second.empty()) {
     client_keys_.erase(it);
