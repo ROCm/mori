@@ -23,12 +23,24 @@
 
 #include <grpcpp/grpcpp.h>
 
+#include <chrono>
 #include <system_error>
 
 #include "mori/utils/mori_log.hpp"
 #include "umbp.grpc.pb.h"
 
 namespace mori::umbp {
+
+namespace {
+// Bounds every RPC on the client-owned shutdown-sensitive path:
+//   - UnregisterClient in UnregisterSelf (called from ~MasterClient).
+//   - Every Heartbeat in HeartbeatLoop (hot path, but its latency is
+//     charged to ~MasterClient via StopHeartbeat()'s join()).
+// 3 s covers normal master response + one kernel retransmission while
+// still letting the destructor return promptly when master is dead.
+// See distributed-known-issues.md #7.
+constexpr int kMasterRpcShutdownTimeoutMs = 3000;
+}  // namespace
 
 // Helper: get the typed stub from the opaque pointer
 static ::umbp::UMBPMaster::Stub* GetStub(void* ptr) {
@@ -134,6 +146,8 @@ grpc::Status MasterClient::UnregisterSelf() {
 
   ::umbp::UnregisterClientResponse resp;
   grpc::ClientContext ctx;
+  ctx.set_deadline(std::chrono::system_clock::now() +
+                   std::chrono::milliseconds(kMasterRpcShutdownTimeoutMs));
   auto status = GetStub(stub_.get())->UnregisterClient(&ctx, req, &resp);
 
   if (status.ok()) {
@@ -763,6 +777,10 @@ void MasterClient::HeartbeatLoop() {
 
     ::umbp::HeartbeatResponse resp;
     grpc::ClientContext ctx;
+    // Bound this RPC so an unreachable master cannot trap StopHeartbeat()
+    // (which join()s this thread) past the destructor budget.
+    ctx.set_deadline(std::chrono::system_clock::now() +
+                     std::chrono::milliseconds(kMasterRpcShutdownTimeoutMs));
     auto status = GetStub(stub_.get())->Heartbeat(&ctx, req, &resp);
 
     if (!status.ok()) {

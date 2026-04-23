@@ -96,3 +96,16 @@ target_link_libraries(
           gtest_main)
 add_test(NAME umbp_pool_client_batch_put
          COMMAND test_umbp_pool_client_batch_put)
+
+add_executable(test_umbp_master_client_lifecycle
+               test_master_client_lifecycle.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_umbp_master_client_lifecycle PRIVATE
+                      -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  test_umbp_master_client_lifecycle
+  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
+          gtest_main)
+add_test(NAME umbp_master_client_lifecycle
+         COMMAND test_umbp_master_client_lifecycle)
