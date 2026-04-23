@@ -58,9 +58,9 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
+          $CT rm -f $CONTAINER || true
           $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE $BASE_IMAGE \
               chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
-          $CT rm -f $CONTAINER || true
 
   intranode-test:
     name: mori intranode test (${{ matrix.platform }})
@@ -210,9 +210,9 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
+          $CT rm -f $CONTAINER || true
           $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE $IMAGE \
               chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
-          $CT rm -f $CONTAINER || true
 
   jax-intranode-test:
     name: mori JAX intranode test (${{ matrix.platform }})
@@ -269,9 +269,9 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
+          $CT rm -f ${CONTAINER}_jax || true
           $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE rocm/mori:jax-ci \
               chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
-          $CT rm -f ${CONTAINER}_jax || true
 
   internode-test:
     name: mori internode test (${{ matrix.platform }})
@@ -454,11 +454,12 @@ jobs:
           PORT=29180
           for TOKENS in 64 128; do
             echo "=== async_ll test max-tokens=$TOKENS port=$PORT ==="
-            NODE2_CMD="$CT exec -e GPU_PER_NODE=8 -e MORI_ENABLE_SDMA=1 $CONTAINER bash $SCRIPT --rank 1 --master-addr $NODE1_HOST --master-port $PORT --ifname $NODE2_IFNAME --cmd test --kernel-type async_ll --quant-type none --dtype bf16 --max-tokens $TOKENS"
+            NODE2_CMD="$CT exec -e GPU_PER_NODE=8 -e MORI_ENABLE_SDMA=1 -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT --rank 1 --master-addr $NODE1_HOST --master-port $PORT --ifname $NODE2_IFNAME --cmd test --kernel-type async_ll --quant-type none --dtype bf16 --max-tokens $TOKENS"
             ssh -p $NODE2_PORT $(whoami)@$NODE2_HOST "$NODE2_CMD" &
             $CT exec \
               -e GPU_PER_NODE=8 \
               -e MORI_ENABLE_SDMA=1 \
+              -e MORI_INTERNODE_TIMEOUT=600 \
               $CONTAINER bash $SCRIPT \
               --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
               --ifname $NODE1_IFNAME \
@@ -472,8 +473,9 @@ jobs:
       - name: Cleanup node1
         if: always()
         run: |
-          $CT exec $CONTAINER chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
           $CT rm -f $CONTAINER || true
+          $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE $IMAGE \
+              chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
 
       - name: Cleanup node2
         if: always()
