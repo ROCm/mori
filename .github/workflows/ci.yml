@@ -211,8 +211,10 @@ jobs:
         if: always()
         run: |
           $CT rm -f $CONTAINER || true
-          $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE $IMAGE \
-              chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
+          if $CT image inspect $IMAGE &>/dev/null; then
+            $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE $IMAGE \
+                chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
+          fi
 
   jax-intranode-test:
     name: mori JAX intranode test (${{ matrix.platform }})
@@ -270,8 +272,10 @@ jobs:
         if: always()
         run: |
           $CT rm -f ${CONTAINER}_jax || true
-          $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE rocm/mori:jax-ci \
-              chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
+          if $CT image inspect rocm/mori:jax-ci &>/dev/null; then
+            $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE rocm/mori:jax-ci \
+                chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
+          fi
 
   internode-test:
     name: mori internode test (${{ matrix.platform }})
@@ -474,8 +478,10 @@ jobs:
         if: always()
         run: |
           $CT rm -f $CONTAINER || true
-          $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE $IMAGE \
-              chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
+          if $CT image inspect $IMAGE &>/dev/null; then
+            $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE $IMAGE \
+                chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
+          fi
 
       - name: Cleanup node2
         if: always()
