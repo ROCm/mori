@@ -34,6 +34,7 @@ option(BUILD_PYBINDS "Whether to build mori python bindings" ON)
 option(BUILD_XLA_FFI_OPS "Whether to build mori xla ffi python bindings" OFF)
 option(BUILD_UMBP "Whether to build UMBP (Unified Memory/Bandwidth Pool)" OFF)
 option(BUILD_TESTS "Whether to build mori CPP tests" ON)
+option(BUILD_BENCHMARK "Whether to build benchmark targets" OFF)
 option(ENABLE_PROFILER "Enable kernel profiling" OFF)
 option(ENABLE_DEBUG_PRINTF "Enable debug printf in device kernels" OFF)
 option(ENABLE_STANDARD_MOE_ADAPT "Enable standard moe adapt" OFF)
@@ -207,6 +208,19 @@ endif()
 if(BUILD_EXAMPLES)
   set(BUILD_APPLICATION ON)
   add_subdirectory(examples)
+endif()
+
+if(BUILD_BENCHMARK)
+  if(NOT BUILD_APPLICATION)
+    message(FATAL_ERROR "BUILD_BENCHMARK=ON requires BUILD_APPLICATION=ON")
+  endif()
+  if(NOT BUILD_SHMEM)
+    message(
+      WARNING
+        "BUILD_BENCHMARK=ON with BUILD_SHMEM=OFF: add_mori_benchmark_shmem targets will fail until BUILD_SHMEM is enabled"
+    )
+  endif()
+  add_subdirectory(benchmark)
 endif()
 
 if(BUILD_APPLICATION)
