@@ -51,16 +51,22 @@ __global__ void ReduceScatterSdmaPutKernel(int myPe, int npes, T* input,
                                            size_t elementCountPerRank) {
   const size_t bytesPerElement = sizeof(T);
   const size_t bytesPerPeer = elementCountPerRank * bytesPerElement;
+  const int numQueues = dstMemObj->sdmaNumQueue;
+  if (numQueues <= 0) {
+    return;
+  }
 
   const size_t threadLinearId =
       static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + threadIdx.x;
 
-  if (threadLinearId < npes * dstMemObj->sdmaNumQueue) {
-    int qId = threadLinearId % dstMemObj->sdmaNumQueue;
-    int remotePe = threadLinearId / dstMemObj->sdmaNumQueue;
+  if (threadLinearId < npes * numQueues) {
+    int qId = threadLinearId % numQueues;
+    int remotePe = threadLinearId / numQueues;
 
-    const size_t sendBytesBase = bytesPerPeer / 8;
-    size_t sendBytes = (qId == 7) ? (bytesPerPeer - 7 * sendBytesBase) : sendBytesBase;
+    const size_t sendBytesBase = bytesPerPeer / static_cast<size_t>(numQueues);
+    size_t sendBytes =
+        (qId == numQueues - 1) ? (bytesPerPeer - static_cast<size_t>(numQueues - 1) * sendBytesBase)
+                               : sendBytesBase;
 
     // Source: shard for remotePe in my input, split by queue
     size_t srcByteOffset = remotePe * bytesPerPeer + qId * sendBytesBase;
@@ -72,11 +78,11 @@ __global__ void ReduceScatterSdmaPutKernel(int myPe, int npes, T* input,
     uint8_t* dstPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe]) + destByteOffset;
 
     anvil::SdmaQueueDeviceHandle** devicehandles =
-        dest->deviceHandles_d + remotePe * dest->sdmaNumQueue;
-    HSAuint64* signals = dest->signalPtrs + remotePe * dest->sdmaNumQueue;
-    HSAuint64* expectedSignals = dest->expectSignalsPtr + remotePe * dest->sdmaNumQueue;
+        dest->deviceHandles_d + remotePe * numQueues;
+    HSAuint64* signals = dest->signalPtrs + remotePe * numQueues;
+    HSAuint64* expectedSignals = dest->expectSignalsPtr + remotePe * numQueues;
     core::SdmaPutThread(srcPtr, dstPtr, sendBytes, devicehandles, signals, expectedSignals,
-                        dest->sdmaNumQueue, qId);
+                        numQueues, qId);
   }
 }
 
@@ -310,16 +316,22 @@ __global__ void AllGatherReducedSdmaPutKernel(int myPe, int npes,
                                               size_t elementCountPerRank) {
   const size_t bytesPerElement = sizeof(T);
   const size_t bytesPerPeer = elementCountPerRank * bytesPerElement;
+  const int numQueues = dstMemObj->sdmaNumQueue;
+  if (numQueues <= 0) {
+    return;
+  }
 
   const size_t threadLinearId =
       static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + threadIdx.x;
 
-  if (threadLinearId < npes * dstMemObj->sdmaNumQueue) {
-    int qId = threadLinearId % dstMemObj->sdmaNumQueue;
-    int remotePe = threadLinearId / dstMemObj->sdmaNumQueue;
+  if (threadLinearId < npes * numQueues) {
+    int qId = threadLinearId % numQueues;
+    int remotePe = threadLinearId / numQueues;
 
-    const size_t sendBytesBase = bytesPerPeer / 8;
-    size_t sendBytes = (qId == 7) ? (bytesPerPeer - 7 * sendBytesBase) : sendBytesBase;
+    const size_t sendBytesBase = bytesPerPeer / static_cast<size_t>(numQueues);
+    size_t sendBytes =
+        (qId == numQueues - 1) ? (bytesPerPeer - static_cast<size_t>(numQueues - 1) * sendBytesBase)
+                               : sendBytesBase;
 
     // Both source and destination are at slot myPe, split by queue
     size_t byteOffset = myPe * bytesPerPeer + qId * sendBytesBase;
@@ -330,11 +342,11 @@ __global__ void AllGatherReducedSdmaPutKernel(int myPe, int npes,
     uint8_t* dstPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe]) + byteOffset;
 
     anvil::SdmaQueueDeviceHandle** devicehandles =
-        dest->deviceHandles_d + remotePe * dest->sdmaNumQueue;
-    HSAuint64* signals = dest->signalPtrs + remotePe * dest->sdmaNumQueue;
-    HSAuint64* expectedSignals = dest->expectSignalsPtr + remotePe * dest->sdmaNumQueue;
+        dest->deviceHandles_d + remotePe * numQueues;
+    HSAuint64* signals = dest->signalPtrs + remotePe * numQueues;
+    HSAuint64* expectedSignals = dest->expectSignalsPtr + remotePe * numQueues;
     core::SdmaPutThread(srcPtr, dstPtr, sendBytes, devicehandles, signals, expectedSignals,
-                        dest->sdmaNumQueue, qId);
+                        numQueues, qId);
   }
 }
 

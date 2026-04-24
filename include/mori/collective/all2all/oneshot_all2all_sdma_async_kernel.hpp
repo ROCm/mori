@@ -54,32 +54,36 @@ __global__ void OneShotAll2allSdmaAsyncPutKernel(int myPe, int npes, T* input,
   const size_t bytesPerElement = sizeof(T);
   const size_t bytesPerPeer = elementCount * bytesPerElement;
   const size_t elemsPerPeer = elementCount;
+  const int numQueues = dstMemObj->sdmaNumQueue;
+  if (numQueues <= 0) {
+    return;
+  }
 
   int warpId = threadLinearId / warpSize;
   const int laneId = threadIdx.x % warpSize;
 
-  if (threadLinearId < npes * dstMemObj->sdmaNumQueue) {
-    int qId = threadLinearId % dstMemObj->sdmaNumQueue;
-    int targetPe = threadLinearId / dstMemObj->sdmaNumQueue;
-    const size_t sendBytes_rand = bytesPerPeer / 8;
-    size_t destByteOffset = myPe * bytesPerPeer + qId * sendBytes_rand;
-    size_t srcByteOffset = targetPe * bytesPerPeer + qId * sendBytes_rand;
+  if (threadLinearId < npes * numQueues) {
+    int qId = threadLinearId % numQueues;
+    int targetPe = threadLinearId / numQueues;
+    const size_t sendBytesBase = bytesPerPeer / static_cast<size_t>(numQueues);
+    size_t destByteOffset = myPe * bytesPerPeer + qId * sendBytesBase;
+    size_t srcByteOffset = targetPe * bytesPerPeer + qId * sendBytesBase;
     size_t sendBytes = 0;
 
-    if (qId == 7)
-      sendBytes = bytesPerPeer - 7 * sendBytes_rand;
+    if (qId == numQueues - 1)
+      sendBytes = bytesPerPeer - static_cast<size_t>(numQueues - 1) * sendBytesBase;
     else
-      sendBytes = sendBytes_rand;
+      sendBytes = sendBytesBase;
 
     application::SymmMemObjPtr dest = dstMemObj;
     uint8_t* srcPtr = reinterpret_cast<uint8_t*>(inputData) + srcByteOffset;
     uint8_t* dstPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[targetPe] + destByteOffset);
     anvil::SdmaQueueDeviceHandle** devicehandles =
-        dest->deviceHandles_d + targetPe * dest->sdmaNumQueue;
-    HSAuint64* signals = dest->signalPtrs + targetPe * dest->sdmaNumQueue;
-    HSAuint64* expectedSignals = dest->expectSignalsPtr + targetPe * dest->sdmaNumQueue;
+        dest->deviceHandles_d + targetPe * numQueues;
+    HSAuint64* signals = dest->signalPtrs + targetPe * numQueues;
+    HSAuint64* expectedSignals = dest->expectSignalsPtr + targetPe * numQueues;
     core::SdmaPutThread(srcPtr, dstPtr, sendBytes, devicehandles, signals, expectedSignals,
-                        dest->sdmaNumQueue, qId);
+                        numQueues, qId);
   }
 }
 

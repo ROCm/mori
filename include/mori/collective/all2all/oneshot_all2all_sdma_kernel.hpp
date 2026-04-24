@@ -54,27 +54,31 @@ __global__ void OneShotAll2allSdmaKernel(
 
   const size_t bytesPerElement = sizeof(T);
   const size_t bytesPerPeer = elementCount * bytesPerElement;
+  const int numQueues = outputTransitMemObj->sdmaNumQueue;
+  if (numQueues <= 0) {
+    return;
+  }
 
   // Key modification: each thread is responsible for sending its own data to other PEs
-  if (threadLinearId < npes * outputTransitMemObj->sdmaNumQueue) {
-    int qId = threadLinearId % outputTransitMemObj->sdmaNumQueue;
-    int targetPe = threadLinearId / outputTransitMemObj->sdmaNumQueue;
+  if (threadLinearId < npes * numQueues) {
+    int qId = threadLinearId % numQueues;
+    int targetPe = threadLinearId / numQueues;
 
     // Calculate bytes to send
-    const size_t sendBytes_rand = bytesPerPeer / 8;
+    const size_t sendBytesBase = bytesPerPeer / static_cast<size_t>(numQueues);
     size_t srcByteOffset =
-        targetPe * bytesPerPeer + qId * sendBytes_rand;  // Read from input transit buffer
+        targetPe * bytesPerPeer + qId * sendBytesBase;  // Read from input transit buffer
     size_t destByteOffset =
         myPe * bytesPerPeer +
-        qId * sendBytes_rand;  // Write to targetPe's position in output transit buffer
+        qId * sendBytesBase;  // Write to targetPe's position in output transit buffer
     // printf("myPe:%u, threadLinearId:%u, srcByteOffset:0x%x, destByteOffset:0x%x\n", myPe,
     // threadLinearId, srcByteOffset, destByteOffset);
     size_t sendBytes = 0;
 
-    if (qId == 7) {
-      sendBytes = bytesPerPeer - 7 * sendBytes_rand;
+    if (qId == numQueues - 1) {
+      sendBytes = bytesPerPeer - static_cast<size_t>(numQueues - 1) * sendBytesBase;
     } else {
-      sendBytes = sendBytes_rand;
+      sendBytes = sendBytesBase;
     }
 
     // Send my data to target PE
@@ -82,11 +86,11 @@ __global__ void OneShotAll2allSdmaKernel(
     uint8_t* srcPtr = reinterpret_cast<uint8_t*>(inputData) + srcByteOffset;
     uint8_t* dstPtr = reinterpret_cast<uint8_t*>(dest->peerPtrs[targetPe] + destByteOffset);
     anvil::SdmaQueueDeviceHandle** devicehandles =
-        dest->deviceHandles_d + targetPe * dest->sdmaNumQueue;
-    HSAuint64* signals = dest->signalPtrs + targetPe * dest->sdmaNumQueue;
-    HSAuint64* expectedSignals = dest->expectSignalsPtr + targetPe * dest->sdmaNumQueue;
+        dest->deviceHandles_d + targetPe * numQueues;
+    HSAuint64* signals = dest->signalPtrs + targetPe * numQueues;
+    HSAuint64* expectedSignals = dest->expectSignalsPtr + targetPe * numQueues;
     core::SdmaPutThread(srcPtr, dstPtr, sendBytes, devicehandles, signals, expectedSignals,
-                        dest->sdmaNumQueue, qId);
+                        numQueues, qId);
   }
 
   // Synchronization and flag setting
