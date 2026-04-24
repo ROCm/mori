@@ -55,9 +55,6 @@ __global__ void OneShotAll2allSdmaKernel(
   const size_t bytesPerElement = sizeof(T);
   const size_t bytesPerPeer = elementCount * bytesPerElement;
   const int numQueues = outputTransitMemObj->sdmaNumQueue;
-  if (numQueues <= 0) {
-    return;
-  }
 
   // Key modification: each thread is responsible for sending its own data to other PEs
   if (threadLinearId < npes * numQueues) {

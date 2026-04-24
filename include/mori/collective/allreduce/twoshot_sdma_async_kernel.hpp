@@ -52,9 +52,6 @@ __global__ void ReduceScatterSdmaPutKernel(int myPe, int npes, T* input,
   const size_t bytesPerElement = sizeof(T);
   const size_t bytesPerPeer = elementCountPerRank * bytesPerElement;
   const int numQueues = dstMemObj->sdmaNumQueue;
-  if (numQueues <= 0) {
-    return;
-  }
 
   const size_t threadLinearId =
       static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + threadIdx.x;
@@ -317,9 +314,6 @@ __global__ void AllGatherReducedSdmaPutKernel(int myPe, int npes,
   const size_t bytesPerElement = sizeof(T);
   const size_t bytesPerPeer = elementCountPerRank * bytesPerElement;
   const int numQueues = dstMemObj->sdmaNumQueue;
-  if (numQueues <= 0) {
-    return;
-  }
 
   const size_t threadLinearId =
       static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + threadIdx.x;

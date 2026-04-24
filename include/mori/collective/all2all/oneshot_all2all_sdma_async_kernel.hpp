@@ -55,9 +55,6 @@ __global__ void OneShotAll2allSdmaAsyncPutKernel(int myPe, int npes, T* input,
   const size_t bytesPerPeer = elementCount * bytesPerElement;
   const size_t elemsPerPeer = elementCount;
   const int numQueues = dstMemObj->sdmaNumQueue;
-  if (numQueues <= 0) {
-    return;
-  }
 
   int warpId = threadLinearId / warpSize;
   const int laneId = threadIdx.x % warpSize;
