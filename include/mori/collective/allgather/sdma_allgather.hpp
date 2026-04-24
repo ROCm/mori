@@ -22,8 +22,8 @@
 #pragma once
 
 #include <hip/hip_runtime.h>
-#include <mpi.h>
 
+#include "mori/collective/core/wall_time.hpp"
 #include "oneshot_sdma_kernel.hpp"
 
 namespace mori {
@@ -53,7 +53,7 @@ double Allgather_sdma(T* input, T* output, size_t total_count, hipStream_t strea
   assert(outPutBuffObj.IsValid());
   assert(flagsObj.IsValid());
 
-  double start = MPI_Wtime();
+  double start = CollectiveWallTime();
   OneShotAllGatherSdmaKernel<T>
       <<<1, 512>>>(myPe, npes, input, inPutBuffObj, outPutBuffObj, flagsObj, total_count);
 
@@ -70,7 +70,7 @@ double Allgather_sdma(T* input, T* output, size_t total_count, hipStream_t strea
     return -1.0;
   }
 
-  double end = MPI_Wtime();
+  double end = CollectiveWallTime();
 
   // shmem::ShmemFree(flags);
   return end - start;

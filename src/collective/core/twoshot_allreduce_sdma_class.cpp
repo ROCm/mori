@@ -269,7 +269,7 @@ bool AllreduceSdma<T>::start_async(T* input, T* output, size_t total_count, hipS
   async_output_ = output;
   async_total_count_ = total_count;
   async_stream_ = stream;
-  async_start_time_ = MPI_Wtime();
+  async_start_time_ = CollectiveWallTime();
 
   try {
     size_t elementCountPerRank = total_count / npes_;
@@ -348,7 +348,7 @@ double AllreduceSdma<T>::wait_async(hipStream_t stream) {
       }
     }
 
-    double end_time = MPI_Wtime();
+    double end_time = CollectiveWallTime();
     double duration = end_time - async_start_time_;
 
     async_in_progress_ = false;

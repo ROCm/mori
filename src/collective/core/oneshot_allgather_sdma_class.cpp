@@ -203,7 +203,7 @@ bool AllgatherSdma<T>::start_async(T* input, T* output, size_t total_count, hipS
   async_output_ = output;
   async_total_count_ = total_count;
   async_stream_ = stream;
-  async_start_time_ = MPI_Wtime();
+  async_start_time_ = CollectiveWallTime();
   async_flag_token_ = call_seq_.fetch_add(1, std::memory_order_relaxed) + 1;
 
   try {
@@ -275,7 +275,7 @@ double AllgatherSdma<T>::wait_async(hipStream_t stream) {
       (void)hipDeviceSynchronize();
     }
 
-    double end_time = MPI_Wtime();
+    double end_time = CollectiveWallTime();
     double duration = end_time - async_start_time_;
 
     async_in_progress_ = false;

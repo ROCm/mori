@@ -1,16 +1,19 @@
-find_package(MPI REQUIRED)
-
 # Source files list
 set(COLLECTIVE_SOURCES
-    core/topology_detector.cpp
-    core/allreduce_manager.cpp
     core/oneshot_all2all_sdma_class.cpp
     core/oneshot_allgather_sdma_class.cpp
     core/twoshot_allreduce_sdma_class.cpp
-    inter_node/executors/ring_1d_executor.cpp
-    inter_node/executors/one_shot_executor.cpp
     # Note: intra_node_executor is header-only template class
 )
+
+if(WITH_MPI)
+  find_package(MPI REQUIRED)
+  list(APPEND COLLECTIVE_SOURCES
+       core/topology_detector.cpp
+       core/allreduce_manager.cpp
+       inter_node/executors/ring_1d_executor.cpp
+       inter_node/executors/one_shot_executor.cpp)
+endif()
 
 add_library(mori_collective SHARED ${COLLECTIVE_SOURCES})
 
@@ -42,7 +45,11 @@ endif()
 
 target_link_libraries(
   mori_collective
-  PUBLIC mori_shmem mori_application mori_logging MPI::MPI_CXX
+  PUBLIC mori_shmem mori_application mori_logging
   PRIVATE hip::host hip::device)
+
+if(WITH_MPI)
+  target_link_libraries(mori_collective PUBLIC MPI::MPI_CXX)
+endif()
 
 target_include_directories(mori_collective PUBLIC ${CMAKE_SOURCE_DIR}/include)

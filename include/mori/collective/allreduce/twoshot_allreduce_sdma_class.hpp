@@ -24,13 +24,13 @@
 #define TWOSHOT_ALLREDUCE_SDMA_CLASS_HPP
 
 #include <hip/hip_runtime.h>
-#include <mpi.h>
 
 #include <cstdint>
 #include <memory>
 
 #include "mori/application/application.hpp"
 #include "mori/collective/collective_pub.hpp"
+#include "mori/collective/core/wall_time.hpp"
 #include "mori/shmem/shmem.hpp"
 
 namespace mori {

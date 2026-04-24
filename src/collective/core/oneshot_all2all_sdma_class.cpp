@@ -150,7 +150,7 @@ bool All2allSdma<T>::start_async(T* input, T* output, size_t total_count, hipStr
   async_output_ = output;
   async_total_count_ = total_count;
   async_stream_ = stream;
-  async_start_time_ = MPI_Wtime();
+  async_start_time_ = CollectiveWallTime();
 
   try {
     // Step 1: Copy input data to input transit buffer
@@ -241,7 +241,7 @@ double All2allSdma<T>::wait_async(hipStream_t stream) {
     }
 
     // Calculate total execution time
-    double end_time = MPI_Wtime();
+    double end_time = CollectiveWallTime();
     double duration = end_time - async_start_time_;
 
     printf("PE %d: Async All2All completed in %.6f seconds\n", myPe_, duration);
@@ -411,7 +411,7 @@ double All2allSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
   }
 
   // Execute All2All operation
-  double start = MPI_Wtime();
+  double start = CollectiveWallTime();
 
   hipError_t sync_err = hipSuccess;
   try {
@@ -472,7 +472,7 @@ double All2allSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
     return -1.0;
   }
 
-  double end = MPI_Wtime();
+  double end = CollectiveWallTime();
   double duration = end - start;
 
   return duration;

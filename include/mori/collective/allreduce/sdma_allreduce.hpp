@@ -22,8 +22,8 @@
 #pragma once
 
 #include <hip/hip_runtime.h>
-#include <mpi.h>
 
+#include "mori/collective/core/wall_time.hpp"
 #include "twoshot_sdma_kernel.hpp"
 
 namespace mori {
@@ -93,7 +93,7 @@ double Allreduce_sdma(T* input, T* output, size_t total_count, hipStream_t strea
   int blocks = std::min(kMaxBlocks, (partSize + threadsPerRank - 1) / threadsPerRank);
   if (blocks < 1) blocks = 1;
 
-  double start = MPI_Wtime();
+  double start = CollectiveWallTime();
   ReduceScatterKernel<T><<<blocks, threads, 0, stream>>>(myPe, npes, inPutBuffObj, transitObj,
                                                          barrierObj, total_count);
   AllGatherSdmaKernel<T>
@@ -112,7 +112,7 @@ double Allreduce_sdma(T* input, T* output, size_t total_count, hipStream_t strea
     return -1.0;
   }
 
-  double end = MPI_Wtime();
+  double end = CollectiveWallTime();
 
   // Copy result from transit buffer to user output (first total_count elements)
   hipError_t copy_err =
