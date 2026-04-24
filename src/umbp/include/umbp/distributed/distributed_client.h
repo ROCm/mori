@@ -36,7 +36,7 @@ namespace mori::umbp {
 
 /// Distributed IUMBPClient implementation — master-led global routing
 /// with RDMA/MORI-IO data plane.  All routing decisions go through the
-/// Master; this client does NOT use LocalStorageManager or LocalBlockIndex.
+/// Master; this client does not use LocalStorageManager or LocalBlockIndex.
 class DistributedClient : public IUMBPClient {
  public:
   explicit DistributedClient(const UMBPConfig& config);
@@ -67,6 +67,10 @@ class DistributedClient : public IUMBPClient {
 
   bool RegisterMemory(uintptr_t ptr, size_t size) override;
   void DeregisterMemory(uintptr_t ptr) override;
+
+  bool ReportExternalKvBlocks(const std::vector<std::string>& hashes, TierType tier) override;
+  bool RevokeExternalKvBlocks(const std::vector<std::string>& hashes) override;
+  std::vector<ExternalKvMatch> MatchExternalKv(const std::vector<std::string>& hashes) override;
 
  private:
   UMBPConfig config_;

@@ -23,8 +23,10 @@
 
 #include <sys/mman.h>
 
+#include <map>
 #include <stdexcept>
 
+#include "mori/io/engine.hpp"
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/config.h"
 #include "umbp/distributed/config.h"
@@ -212,5 +214,36 @@ void DistributedClient::Close() {
 }
 
 bool DistributedClient::IsDistributed() const { return true; }
+
+bool DistributedClient::ReportExternalKvBlocks(const std::vector<std::string>& hashes,
+                                               TierType tier) {
+  if (!pool_client_) return false;
+  return pool_client_->ReportExternalKvBlocks(hashes, tier);
+}
+
+bool DistributedClient::RevokeExternalKvBlocks(const std::vector<std::string>& hashes) {
+  if (!pool_client_) return false;
+  return pool_client_->RevokeExternalKvBlocks(hashes);
+}
+
+std::vector<IUMBPClient::ExternalKvMatch> DistributedClient::MatchExternalKv(
+    const std::vector<std::string>& hashes) {
+  if (!pool_client_) return {};
+
+  std::vector<MasterClient::ExternalKvNodeMatch> raw;
+  if (!pool_client_->MatchExternalKv(hashes, &raw)) return {};
+
+  std::vector<IUMBPClient::ExternalKvMatch> result;
+  result.reserve(raw.size());
+  for (auto& r : raw) {
+    IUMBPClient::ExternalKvMatch m;
+    m.node_id = std::move(r.node_id);
+    m.peer_address = std::move(r.peer_address);
+    m.matched_hashes = std::move(r.matched_hashes);
+    m.tier = r.tier;
+    result.push_back(std::move(m));
+  }
+  return result;
+}
 
 }  // namespace mori::umbp

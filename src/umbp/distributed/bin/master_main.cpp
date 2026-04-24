@@ -40,6 +40,12 @@ int main(int argc, char** argv) {
   }
   const std::string address = config.listen_address;
 
+  int metrics_port = 9091;
+  if (argc > 2) {
+    metrics_port = std::stoi(argv[2]);
+  }
+  config.metrics_port = metrics_port;
+
   MORI_UMBP_INFO(
       "[Master] Resolved timing: heartbeat_ttl={}s reaper_interval={}s "
       "allocation_ttl={}s finalized_record_ttl={}s max_missed={} "
@@ -85,7 +91,7 @@ int main(int argc, char** argv) {
     }
   });
 
-  MORI_UMBP_INFO("[Master] Starting UMBP master on {}", address);
+  MORI_UMBP_INFO("[Master] Starting UMBP master on {}, metrics port {}", address, metrics_port);
   server.Run();  // blocks until Shutdown
 
   stop_signal_waiter = true;

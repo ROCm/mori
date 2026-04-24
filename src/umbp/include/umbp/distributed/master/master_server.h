@@ -24,9 +24,11 @@
 #include <memory>
 #include <string>
 
+#include "mori/metrics/prometheus_metrics_server.hpp"
 #include "umbp/distributed/config.h"
 #include "umbp/distributed/master/client_registry.h"
 #include "umbp/distributed/master/eviction_manager.h"
+#include "umbp/distributed/master/external_kv_block_index.h"
 #include "umbp/distributed/master/global_block_index.h"
 #include "umbp/distributed/routing/route_get_strategy.h"
 #include "umbp/distributed/routing/route_put_strategy.h"
@@ -52,9 +54,11 @@ class MasterServer {
  private:
   MasterServerConfig config_;
   GlobalBlockIndex index_;
+  ExternalKvBlockIndex external_kv_index_;
   ClientRegistry registry_;
   Router router_;
 
+  std::unique_ptr<mori::metrics::MetricsServer> metrics_server_;
   std::unique_ptr<grpc_impl::Server> server_;
 
   class UMBPMasterServiceImpl;

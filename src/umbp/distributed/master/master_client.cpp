@@ -720,6 +720,77 @@ grpc::Status MasterClient::BatchLookup(const std::vector<std::string>& keys,
   return grpc::Status::OK;
 }
 
+grpc::Status MasterClient::ReportExternalKvBlocks(const std::string& node_id,
+                                                  const std::vector<std::string>& hashes,
+                                                  TierType tier) {
+  ::umbp::ReportExternalKvBlocksRequest req;
+  req.set_node_id(node_id);
+  for (const auto& hash : hashes) {
+    req.add_hashes(hash);
+  }
+  req.set_tier(static_cast<::umbp::TierType>(tier));
+
+  ::umbp::ReportExternalKvBlocksResponse resp;
+  grpc::ClientContext ctx;
+  auto status = GetStub(stub_.get())->ReportExternalKvBlocks(&ctx, req, &resp);
+  if (!status.ok()) {
+    MORI_UMBP_ERROR("[Client] ReportExternalKvBlocks(node={}) failed: {}", node_id,
+                    status.error_message());
+  }
+  return status;
+}
+
+grpc::Status MasterClient::RevokeExternalKvBlocks(const std::string& node_id,
+                                                  const std::vector<std::string>& hashes) {
+  ::umbp::RevokeExternalKvBlocksRequest req;
+  req.set_node_id(node_id);
+  for (const auto& hash : hashes) {
+    req.add_hashes(hash);
+  }
+
+  ::umbp::RevokeExternalKvBlocksResponse resp;
+  grpc::ClientContext ctx;
+  auto status = GetStub(stub_.get())->RevokeExternalKvBlocks(&ctx, req, &resp);
+  if (!status.ok()) {
+    MORI_UMBP_ERROR("[Client] RevokeExternalKvBlocks(node={}) failed: {}", node_id,
+                    status.error_message());
+  }
+  return status;
+}
+
+grpc::Status MasterClient::MatchExternalKv(const std::vector<std::string>& hashes,
+                                           std::vector<ExternalKvNodeMatch>* out_matches) {
+  if (out_matches != nullptr) {
+    out_matches->clear();
+  }
+
+  ::umbp::MatchExternalKvRequest req;
+  for (const auto& hash : hashes) {
+    req.add_hashes(hash);
+  }
+
+  ::umbp::MatchExternalKvResponse resp;
+  grpc::ClientContext ctx;
+  auto status = GetStub(stub_.get())->MatchExternalKv(&ctx, req, &resp);
+  if (!status.ok()) {
+    MORI_UMBP_ERROR("[Client] MatchExternalKv failed: {}", status.error_message());
+    return status;
+  }
+
+  if (out_matches != nullptr) {
+    for (const auto& proto_match : resp.matches()) {
+      ExternalKvNodeMatch m;
+      m.node_id = proto_match.node_id();
+      m.peer_address = proto_match.peer_address();
+      m.matched_hashes.assign(proto_match.matched_hashes().begin(),
+                              proto_match.matched_hashes().end());
+      m.tier = static_cast<TierType>(proto_match.tier());
+      out_matches->push_back(std::move(m));
+    }
+  }
+  return grpc::Status::OK;
+}
+
 void MasterClient::StartHeartbeat() {
   if (!registered_) {
     MORI_UMBP_WARN("[Client] StartHeartbeat ignored: not registered");
@@ -799,9 +870,32 @@ void MasterClient::HeartbeatLoop() {
                      ClientStatusName(server_status));
 
       if (resp.status() == ::umbp::CLIENT_STATUS_UNKNOWN) {
-        MORI_UMBP_WARN(
-            "[Client] Master does not recognize us; "
-            "re-registration needed");
+        MORI_UMBP_WARN("[Client] Master does not recognize us; re-registering...");
+        registered_ = false;
+        ::umbp::RegisterClientRequest re_req;
+        re_req.set_node_id(config_.node_id);
+        re_req.set_node_address(config_.node_address);
+        {
+          std::lock_guard lock(caps_mutex_);
+          for (const auto& [tier, cap] : current_capacities_) {
+            auto* tc = re_req.add_tier_capacities();
+            tc->set_tier(static_cast<::umbp::TierType>(tier));
+            tc->set_total_capacity_bytes(cap.total_bytes);
+            tc->set_available_capacity_bytes(cap.available_bytes);
+          }
+        }
+        ::umbp::RegisterClientResponse re_resp;
+        grpc::ClientContext re_ctx;
+        auto re_status = GetStub(stub_.get())->RegisterClient(&re_ctx, re_req, &re_resp);
+        if (re_status.ok()) {
+          registered_ = true;
+          MORI_UMBP_INFO("[Client] Re-registered with master after UNKNOWN status");
+        } else if (re_status.error_code() == grpc::StatusCode::ALREADY_EXISTS) {
+          registered_ = true;
+          MORI_UMBP_INFO("[Client] Already registered with master");
+        } else {
+          MORI_UMBP_WARN("[Client] Re-registration failed: {}", re_status.error_message());
+        }
       }
     }
   }
