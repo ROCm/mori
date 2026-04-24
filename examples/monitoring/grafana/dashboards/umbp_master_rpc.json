@@ -1,0 +1,370 @@
+{
+  "title": "UMBP Master - RPC API Metrics",
+  "uid": "c8d21e74-f3b2-4a96-a8e5-7b0f19e3c485",
+  "tags": [
+    "umbp",
+    "rpc"
+  ],
+  "schemaVersion": 36,
+  "refresh": "5s",
+  "time": {
+    "from": "now-5m",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "type": "datasource",
+        "name": "datasource",
+        "label": "Data Source",
+        "pluginId": "prometheus",
+        "current": {
+          "text": "Prometheus",
+          "value": "PBFA97CFB590B2093"
+        },
+        "hide": 0,
+        "query": "prometheus"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Block Management API Rates (Register / Unregister / Finalize / Publish / Abort)",
+      "description": "Rate of single-key block management API calls received by the master.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(mori_umbp_register_total[30s])",
+          "legendFormat": "Register/s",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(mori_umbp_unregister_total[30s])",
+          "legendFormat": "Unregister/s",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(mori_umbp_finalize_allocation_total[30s])",
+          "legendFormat": "FinalizeAllocation/s",
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(mori_umbp_publish_local_block_total[30s])",
+          "legendFormat": "PublishLocalBlock/s",
+          "refId": "D"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(mori_umbp_abort_allocation_total[30s])",
+          "legendFormat": "AbortAllocation/s",
+          "refId": "E"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Block Management API Totals",
+      "description": "Cumulative total calls since master start.",
+      "type": "stat",
+      "gridPos": {
+        "h": 4,
+        "w": 24,
+        "x": 0,
+        "y": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "mori_umbp_register_total",
+          "legendFormat": "Register",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "mori_umbp_unregister_total",
+          "legendFormat": "Unregister",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "mori_umbp_finalize_allocation_total",
+          "legendFormat": "FinalizeAllocation",
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "mori_umbp_publish_local_block_total",
+          "legendFormat": "PublishLocalBlock",
+          "refId": "D"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "mori_umbp_abort_allocation_total",
+          "legendFormat": "AbortAllocation",
+          "refId": "E"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Per-Client BatchRoutePut Rate (entries/s)",
+      "description": "Rate of successfully routed BatchRoutePut entries per target client.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 12
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate({__name__=~\"mori_umbp_client_batch_route_put_total_.+\"}[30s])",
+          "legendFormat": "{{__name__}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Per-Client BatchRouteGet Rate (hits/s)",
+      "description": "Rate of BatchRouteGet hits served per client.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 12
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate({__name__=~\"mori_umbp_client_batch_route_get_total_.+\"}[30s])",
+          "legendFormat": "{{__name__}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "BatchLookup Rate and Hit Rate",
+      "description": "BatchLookup call rate and the fraction of queried keys that were found.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 20
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "hit rate" },
+            "properties": [
+              { "id": "unit", "value": "percentunit" },
+              { "id": "custom.axisPlacement", "value": "right" }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(mori_umbp_batch_lookup_total[30s])",
+          "legendFormat": "calls/s",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(mori_umbp_batch_lookup_found_total[30s]) / rate(mori_umbp_batch_lookup_keys_total[30s])",
+          "legendFormat": "hit rate",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Batch Block Management API Rates",
+      "description": "Rate of batch block management calls (BatchFinalizeAllocation, BatchAbortAllocation).",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 20
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(mori_umbp_batch_finalize_allocation_total[30s])",
+          "legendFormat": "BatchFinalizeAllocation calls/s",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(mori_umbp_batch_finalize_allocation_keys_total[30s])",
+          "legendFormat": "BatchFinalizeAllocation keys/s",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(mori_umbp_batch_abort_allocation_total[30s])",
+          "legendFormat": "BatchAbortAllocation calls/s",
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(mori_umbp_batch_abort_allocation_entries_total[30s])",
+          "legendFormat": "BatchAbortAllocation entries/s",
+          "refId": "D"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Avg Keys per Batch Call",
+      "description": "Average number of keys/entries per BatchLookup, BatchFinalizeAllocation, and BatchAbortAllocation call.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 28
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(mori_umbp_batch_lookup_keys_total[30s]) / rate(mori_umbp_batch_lookup_total[30s])",
+          "legendFormat": "avg keys/BatchLookup",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(mori_umbp_batch_finalize_allocation_keys_total[30s]) / rate(mori_umbp_batch_finalize_allocation_total[30s])",
+          "legendFormat": "avg keys/BatchFinalizeAllocation",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(mori_umbp_batch_abort_allocation_entries_total[30s]) / rate(mori_umbp_batch_abort_allocation_total[30s])",
+          "legendFormat": "avg entries/BatchAbortAllocation",
+          "refId": "C"
+        }
+      ]
+    }
+  ]
+}

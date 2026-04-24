@@ -302,6 +302,7 @@ add_library(
   ${UMBP_PEER_GRPC_SRCS}
   distributed/master/global_block_index.cpp
   distributed/master/client_registry.cpp
+  distributed/master/external_kv_block_index.cpp
   distributed/master/master_server.cpp
   distributed/master/master_client.cpp
   distributed/master/eviction_manager.cpp
@@ -326,7 +327,7 @@ if(NOT EXISTS "${_PROTOBUF_COMPAT_DIR}/google")
 endif()
 target_include_directories(umbp_common BEFORE PUBLIC "${_PROTOBUF_COMPAT_DIR}")
 
-target_link_libraries(umbp_common PUBLIC mori_logging mori_io ${_PROTOBUF_LIBS}
+target_link_libraries(umbp_common PUBLIC mori_logging mori_io mori_metrics ${_PROTOBUF_LIBS}
                                          ${_GRPCPP_LIB})
 
 target_compile_features(umbp_common PUBLIC cxx_std_17)
@@ -363,3 +364,5 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 target_link_libraries(umbp_client PRIVATE umbp_common ${_PROTOBUF_LIBS}
                                           ${_GRPCPP_LIB})
+
+add_subdirectory(tests)

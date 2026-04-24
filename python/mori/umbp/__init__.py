@@ -83,6 +83,8 @@ from mori.cpp import (
     UMBPSsdConfig,
     UMBPEvictionConfig,
     UMBPDurabilityConfig,
+    UMBPTierType,
+    UMBPExternalKvMatch,
 )
 
 __all__ = [
@@ -98,4 +100,6 @@ __all__ = [
     "UMBPRole",
     "UMBPSsdConfig",
     "UMBPEvictionConfig",
+    "UMBPTierType",
+    "UMBPExternalKvMatch",
 ]

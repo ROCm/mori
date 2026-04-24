@@ -26,6 +26,7 @@
 #include <set>
 
 #include "mori/utils/mori_log.hpp"
+#include "umbp/distributed/master/external_kv_block_index.h"
 #include "umbp/distributed/master/global_block_index.h"
 #include "umbp/distributed/page_bitmap_allocator.h"
 
@@ -55,6 +56,30 @@ ClientRegistry::~ClientRegistry() { StopReaper(); }
 void ClientRegistry::SetBlockIndex(GlobalBlockIndex* index) {
   std::unique_lock lock(mutex_);
   index_ = index;
+}
+
+void ClientRegistry::SetExternalKvBlockIndex(ExternalKvBlockIndex* index) {
+  std::unique_lock lock(mutex_);
+  external_kv_index_ = index;
+}
+
+void ClientRegistry::RegisterExternalKvBlocks(const std::string& node_id,
+                                              const std::vector<std::string>& hashes,
+                                              TierType tier) {
+  if (!IsClientAlive(node_id)) {
+    MORI_UMBP_WARN("[Registry] RegisterExternalKvBlocks rejected: node not alive: {}", node_id);
+    return;
+  }
+  if (external_kv_index_ != nullptr) {
+    external_kv_index_->Register(node_id, hashes, tier);
+  }
+}
+
+void ClientRegistry::UnregisterExternalKvBlocks(const std::string& node_id,
+                                                const std::vector<std::string>& hashes) {
+  if (external_kv_index_ != nullptr) {
+    external_kv_index_->Unregister(node_id, hashes);
+  }
 }
 
 uint32_t ClientRegistry::ParseBufferIndex(const std::string& location_id) {
@@ -248,6 +273,10 @@ size_t ClientRegistry::UnregisterClient(const std::string& node_id) {
     for (const auto& key : keys_to_cleanup) {
       index_->UnregisterByNode(key, node_id);
     }
+  }
+
+  if (external_kv_index_ != nullptr) {
+    external_kv_index_->UnregisterByNode(node_id);
   }
 
   MORI_UMBP_INFO("[Registry] Unregistered node: {} (keys_removed={})", node_id, keys_removed);
@@ -838,6 +867,13 @@ void ClientRegistry::ReapExpiredClients() {
       for (const auto& key : keys_to_cleanup) {
         index_->UnregisterByNode(key, dead_id);
       }
+    }
+  }
+
+  if (external_kv_index_ != nullptr) {
+    for (const auto& [dead_id, keys_to_cleanup] : reap_cleanup) {
+      (void)keys_to_cleanup;
+      external_kv_index_->UnregisterByNode(dead_id);
     }
   }
 }

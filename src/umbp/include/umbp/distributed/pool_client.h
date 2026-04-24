@@ -144,6 +144,12 @@ class PoolClient {
     return batch_abort_allocation_entries_.load(std::memory_order_relaxed);
   }
 
+  // ---- External KV block events ----
+  bool ReportExternalKvBlocks(const std::vector<std::string>& hashes, TierType tier);
+  bool RevokeExternalKvBlocks(const std::vector<std::string>& hashes);
+  bool MatchExternalKv(const std::vector<std::string>& hashes,
+                       std::vector<MasterClient::ExternalKvNodeMatch>* out_matches);
+
  private:
   PoolClientConfig config_;
   std::atomic<bool> initialized_{false};

@@ -64,6 +64,16 @@ class StandaloneClient : public IUMBPClient {
   void Close() override;
   bool IsDistributed() const override;
 
+  bool ReportExternalKvBlocks(const std::vector<std::string>& /*hashes*/,
+                              TierType /*tier*/) override {
+    return true;
+  }
+  bool RevokeExternalKvBlocks(const std::vector<std::string>& /*hashes*/) override { return true; }
+  std::vector<ExternalKvMatch> MatchExternalKv(
+      const std::vector<std::string>& /*hashes*/) override {
+    return {};
+  }
+
   // ---- Extra methods (not in IUMBPClient, for C++ tests and debugging) ----
 
   bool Put(const std::string& key, const void* data, size_t size);

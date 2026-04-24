@@ -439,6 +439,10 @@ class CMakeBuild(build_ext):
                 build_dir / "src/collective/libmori_collective.so",
                 root_dir / "python/mori/libmori_collective.so",
             ),
+            (
+                build_dir / "src/metrics/libmori_metrics.so",
+                root_dir / "python/mori/libmori_metrics.so",
+            ),
         ]
         for src_path, dst_path in files_to_copy:
             shutil.copyfile(src_path, dst_path)
@@ -532,6 +536,7 @@ mori_package_data = [
     "libmori_io.so",
     "libmori_application.so",
     "libmori_collective.so",
+    "libmori_metrics.so",
     "spdk_proxy",
     "umbp_master",
     "_jit-sources/include/**/*.hpp",
