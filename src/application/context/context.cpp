@@ -97,8 +97,9 @@ void Context::CollectHostNames() {
   char hostname[HOST_NAME_MAX];
   gethostname(hostname, HOST_NAME_MAX);
 
-  std::string localIP = GetLocalIP();
-  std::string hostIdentifier = std::string(hostname) + ":" + localIP;
+  // Keep node identity stable across ranks on the same machine.
+  // Using hostname+IP can split local ranks when different NICs are selected.
+  std::string hostIdentifier = std::string(hostname);
 
   constexpr int IDENTIFIER_MAX = HOST_NAME_MAX + INET_ADDRSTRLEN;
   std::vector<char> globalIdentifiers(IDENTIFIER_MAX * WorldSize());

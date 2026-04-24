@@ -30,6 +30,7 @@ _LAZY_SUBMODULES = {
     "io",
     "ir",
     "kernel_profiler",
+    "ccl",
 }
 
 

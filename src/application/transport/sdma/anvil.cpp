@@ -30,8 +30,7 @@
 #include "mori/application/transport/sdma/anvil.hpp"
 
 #include <fstream>
-
-#include "mori/utils/mori_log.hpp"
+#include <iostream>
 
 namespace anvil {
 
@@ -46,12 +45,13 @@ auto checkHsaError = [](hsa_status_t s, const char* msg, const char* file, int l
 
 #define CHECK_HSA_ERROR(cmd) checkHsaError((cmd), #cmd, __FILE__, __LINE__)
 
-#define CHECK_HSAKMT_SUCCESS(call, msg)                                                        \
-  do {                                                                                         \
-    if ((call) != HSAKMT_STATUS_SUCCESS) {                                                     \
-      MORI_APP_ERROR("ERROR code: {} {} (File: {}, Line: {})", call, msg, __FILE__, __LINE__); \
-      exit(EXIT_FAILURE);                                                                      \
-    }                                                                                          \
+#define CHECK_HSAKMT_SUCCESS(call, msg)                                                       \
+  do {                                                                                        \
+    if ((call) != HSAKMT_STATUS_SUCCESS) {                                                    \
+      std::cout << "ERROR code: " << std::dec << call << " " << msg << " (File: " << __FILE__ \
+                << ", Line: " << __LINE__ << ")" << std::endl;                                \
+      exit(EXIT_FAILURE);                                                                     \
+    }                                                                                         \
   } while (0)
 
 #if 0
@@ -97,7 +97,7 @@ hsa_status_t rocm_hsa_agent_callback(hsa_agent_t agent, hsa_device_type_t target
   hsa_device_type_t device_type{};
   hsa_status_t status{hsa_agent_get_info(agent, HSA_AGENT_INFO_DEVICE, &device_type)};
   if (status != HSA_STATUS_SUCCESS) {
-    MORI_APP_ERROR("Failure to get device type: {:#x}", status);
+    printf("Failure to get device type: 0x%x", status);
     return status;
   }
   if (device_type == target_device_type) {
@@ -128,7 +128,7 @@ void SetUpKFD() {
 //     std::cout << "Device Id: " << m_node_props.DeviceId << std::endl;
 // }
 
-void CloseKFD() { CHECK_HSAKMT_SUCCESS(hsaKmtCloseKFD(), "hsaKmtCloseKFD() failed"); }
+void CloseKFD() { (void)hsaKmtCloseKFD(); }
 
 // Convert a logical deviceId index to the NVML device minor number
 static const std::string getBusId(int deviceId) {
@@ -156,7 +156,7 @@ SdmaQueue::SdmaQueue(int localDeviceId, int remoteDeviceId, hsa_agent_t& localAg
   uint32_t localNodeId;
   hsa_status_t status = hsa_agent_get_info(localAgent, HSA_AGENT_INFO_NODE, &localNodeId);
   if (status != HSA_STATUS_SUCCESS) {
-    MORI_APP_ERROR("Failure to get device info: {:#x}", status);
+    printf("Failure to get device info: 0x%x", status);
     // return status;
   }
 
@@ -176,8 +176,8 @@ SdmaQueue::SdmaQueue(int localDeviceId, int remoteDeviceId, hsa_agent_t& localAg
   memFlags.ui32.ExecuteAccess = 1;
   memFlags.ui32.Uncached = 1;
 
-  MORI_APP_INFO("Allocating SDMA Queue Buffer for device: {} remote device: {} engineId: {}",
-                localDeviceId, remoteDeviceId, engineId);
+  // std::cout << "Allocating SDMA Queue Buffer for device: " << localNodeId << std::endl <<
+  // std::flush;
 
   CHECK_HSAKMT_SUCCESS(hsaKmtAllocMemory(localNodeId, SDMA_QUEUE_SIZE, memFlags, &queueBuffer_),
                        "Failed");
@@ -190,9 +190,7 @@ SdmaQueue::SdmaQueue(int localDeviceId, int remoteDeviceId, hsa_agent_t& localAg
   CHECK_HSAKMT_SUCCESS(hsaKmtCreateQueueExt(localNodeId, HSA_QUEUE_SDMA_BY_ENG_ID,
                                             DEFAULT_QUEUE_PERCENTAGE, DEFAULT_PRIORITY, engineId,
                                             queueBuffer_, SDMA_QUEUE_SIZE, nullptr, &queue_),
-                       fmt::format("hsaKmtCreateQueueExt failed: localDevice={}, remoteDevice={}, "
-                                   "localNodeId={}, engineId={}",
-                                   localDeviceId, remoteDeviceId, localNodeId, engineId));
+                       "Failed");
 
   // Populate Device Handle
   // TODO uncached
@@ -248,17 +246,17 @@ void AnvilLib::init() {
     // HSA
     hsa_status_t status{hsa_init()};
     if (status != HSA_STATUS_SUCCESS) {
-      MORI_APP_ERROR("Failure to open HSA connection: {:#x}", status);
+      printf("Failure to open HSA connection: 0x%x", status);
       // return 1;
     }
     status = hsa_iterate_agents(&rocm_hsa_gpu_agent_callback, &gpuAgents_);
     if (status != HSA_STATUS_SUCCESS && status != HSA_STATUS_INFO_BREAK) {
-      MORI_APP_ERROR("Failure to iterate HSA GPU agents: {:#x}", status);
+      printf("Failure to iterate HSA agents: 0x%x", status);
       // return 1;
     }
     status = hsa_iterate_agents(&rocm_hsa_cpu_agent_callback, &cpuAgents_);
     if (status != HSA_STATUS_SUCCESS && status != HSA_STATUS_INFO_BREAK) {
-      MORI_APP_ERROR("Failure to iterate HSA CPU agents: {:#x}", status);
+      printf("Failure to iterate HSA agents: 0x%x", status);
       // return 1;
     }
 
@@ -268,8 +266,8 @@ void AnvilLib::init() {
 
 bool AnvilLib::connect(int srcDeviceId, int dstDeviceId, int numChannels) {
   uint32_t engineId = getSdmaEngineId(srcDeviceId, dstDeviceId);  // + 1) * 2;
-  MORI_APP_INFO("Connect from {} to {} with {} channels using engine {}", srcDeviceId, dstDeviceId,
-                numChannels, engineId);
+  // std::cout << "Connect from " << srcDeviceId << " to " << dstDeviceId << " with " << numChannels
+  //           << " channels using engine " << engineId << std::endl;
   for (int c = 0; c < numChannels; ++c) {
     sdma_channels_[dstDeviceId].emplace_back(
         std::make_unique<SdmaQueue>(srcDeviceId, dstDeviceId, gpuAgents_[srcDeviceId], engineId));
@@ -290,6 +288,8 @@ SdmaQueue* AnvilLib::getSdmaQueue(int srcDeviceId, int dstDeviceId, int channel_
 }
 
 AnvilLib& AnvilLib::getInstance() {
+  // Keep pre-SDMA-collective behavior: do not run ~AnvilLib during process teardown.
+  // Worker exits can otherwise stall in ROCm/HSA shutdown ordering.
   static AnvilLib* instance;
   if (instance == nullptr) {
     instance = new AnvilLib();

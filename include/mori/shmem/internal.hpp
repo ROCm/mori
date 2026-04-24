@@ -127,6 +127,7 @@ struct GpuStates {
 };
 
 // Changed from __constant__ to __device__ to allow hipMemcpyToSymbol updates (like rocshmem)
+// Default visibility so JIT EP (MORI_DEFINE_GPU_STATES) matches this declaration.
 extern __device__ __attribute__((visibility("default"))) GpuStates globalGpuStates;
 
 static __device__ GpuStates* GetGlobalGpuStatesPtr() { return &globalGpuStates; }
