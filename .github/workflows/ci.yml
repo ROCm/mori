@@ -428,8 +428,17 @@ jobs:
           SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_io_benchmark.sh"
           PORT=29120
           echo "=== MORI-IO internode benchmark: wide-write-sweep port=$PORT ==="
-          NODE2_CMD="$CT exec $CONTAINER bash $SCRIPT --rank 1 --master-addr $NODE1_HOST --master-port $PORT --ifname $NODE2_IFNAME -- --op-type write --transfer-batch-size 128 --all --sweep-start-size 1024 --sweep-max-size 16777216 --iters 4 --enable-sess --enable-batch-transfer --num-qp-per-transfer 2 --num-worker-threads 2 --num-initiator-dev 8 --num-target-dev 8"
-          ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "$NODE2_CMD" &
+          NODE2_CMD=(
+            $CT exec $CONTAINER bash $SCRIPT
+            --rank 1 --master-addr $NODE1_HOST --master-port $PORT
+            --ifname $NODE2_IFNAME
+            -- --op-type write --transfer-batch-size 128 --all
+            --sweep-start-size 1024 --sweep-max-size 16777216 --iters 4
+            --enable-sess --enable-batch-transfer
+            --num-qp-per-transfer 2 --num-worker-threads 2
+            --num-initiator-dev 8 --num-target-dev 8
+          )
+          ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
           $CT exec $CONTAINER bash $SCRIPT \
             --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
             --ifname $NODE1_IFNAME \
@@ -445,8 +454,16 @@ jobs:
           SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_io_benchmark.sh"
           PORT=29121
           echo "=== MORI-IO internode benchmark: batch-session-read port=$PORT ==="
-          NODE2_CMD="$CT exec $CONTAINER bash $SCRIPT --rank 1 --master-addr $NODE1_HOST --master-port $PORT --ifname $NODE2_IFNAME -- --op-type read --buffer-size 4096 --transfer-batch-size 128 --iters 8 --enable-batch-transfer --enable-sess --poll_cq_mode event --num-qp-per-transfer 2 --num-worker-threads 2 --num-initiator-dev 8 --num-target-dev 8"
-          ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "$NODE2_CMD" &
+          NODE2_CMD=(
+            $CT exec $CONTAINER bash $SCRIPT
+            --rank 1 --master-addr $NODE1_HOST --master-port $PORT
+            --ifname $NODE2_IFNAME
+            -- --op-type read --buffer-size 4096 --transfer-batch-size 128 --iters 8
+            --enable-batch-transfer --enable-sess --poll_cq_mode event
+            --num-qp-per-transfer 2 --num-worker-threads 2
+            --num-initiator-dev 8 --num-target-dev 8
+          )
+          ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
           $CT exec $CONTAINER bash $SCRIPT \
             --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
             --ifname $NODE1_IFNAME \
@@ -463,8 +480,13 @@ jobs:
           for KERNEL in v1 v1_ll; do
             for TOKENS in 64 128 1024 2048 4096; do
               echo "=== bench kernel=$KERNEL max-tokens=$TOKENS port=$PORT ==="
-              NODE2_CMD="$CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT --rank 1 --master-addr $NODE1_HOST --master-port $PORT --ifname $NODE2_IFNAME --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS"
-              ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "$NODE2_CMD" &
+              NODE2_CMD=(
+                $CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT
+                --rank 1 --master-addr $NODE1_HOST --master-port $PORT
+                --ifname $NODE2_IFNAME
+                --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS
+              )
+              ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
               $CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT \
                 --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
                 --ifname $NODE1_IFNAME \
@@ -482,8 +504,13 @@ jobs:
           for KERNEL in v1 v1_ll; do
             for TOKENS in 64 128 1024 2048 4096; do
               echo "=== stress kernel=$KERNEL max-tokens=$TOKENS port=$PORT ==="
-              NODE2_CMD="$CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT --rank 1 --master-addr $NODE1_HOST --master-port $PORT --ifname $NODE2_IFNAME --cmd stress --kernel-type $KERNEL --max-tokens $TOKENS"
-              ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "$NODE2_CMD" &
+              NODE2_CMD=(
+                $CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT
+                --rank 1 --master-addr $NODE1_HOST --master-port $PORT
+                --ifname $NODE2_IFNAME
+                --cmd stress --kernel-type $KERNEL --max-tokens $TOKENS
+              )
+              ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
               $CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT \
                 --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
                 --ifname $NODE1_IFNAME \
@@ -500,8 +527,16 @@ jobs:
           PORT=29180
           for TOKENS in 64 128; do
             echo "=== async_ll test max-tokens=$TOKENS port=$PORT ==="
-            NODE2_CMD="$CT exec -e GPU_PER_NODE=8 -e MORI_ENABLE_SDMA=1 -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT --rank 1 --master-addr $NODE1_HOST --master-port $PORT --ifname $NODE2_IFNAME --cmd test --kernel-type async_ll --quant-type none --dtype bf16 --max-tokens $TOKENS"
-            ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "$NODE2_CMD" &
+            NODE2_CMD=(
+              $CT exec
+              -e GPU_PER_NODE=8 -e MORI_ENABLE_SDMA=1 -e MORI_INTERNODE_TIMEOUT=600
+              $CONTAINER bash $SCRIPT
+              --rank 1 --master-addr $NODE1_HOST --master-port $PORT
+              --ifname $NODE2_IFNAME
+              --cmd test --kernel-type async_ll
+              --quant-type none --dtype bf16 --max-tokens $TOKENS
+            )
+            ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
             $CT exec \
               -e GPU_PER_NODE=8 \
               -e MORI_ENABLE_SDMA=1 \
