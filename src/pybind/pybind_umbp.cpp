@@ -49,8 +49,8 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("matched_hashes", &IUMBPClient::ExternalKvMatch::matched_hashes)
       .def_readwrite("tier", &IUMBPClient::ExternalKvMatch::tier)
       .def("__repr__", [](const IUMBPClient::ExternalKvMatch& m) {
-        return "<UMBPExternalKvMatch node_id='" + m.node_id + "' matched=" +
-               std::to_string(m.matched_hashes.size()) + ">";
+        return "<UMBPExternalKvMatch node_id='" + m.node_id +
+               "' matched=" + std::to_string(m.matched_hashes.size()) + ">";
       });
 
   py::enum_<UMBPRole>(m, "UMBPRole")
@@ -180,12 +180,10 @@ void RegisterMoriUmbp(py::module_& m) {
       .def("is_distributed", &IUMBPClient::IsDistributed)
       .def("register_memory", &IUMBPClient::RegisterMemory, py::arg("ptr"), py::arg("size"))
       .def("deregister_memory", &IUMBPClient::DeregisterMemory, py::arg("ptr"))
-      .def("report_external_kv_blocks", &IUMBPClient::ReportExternalKvBlocks,
-           py::arg("hashes"), py::arg("tier"))
-      .def("revoke_external_kv_blocks", &IUMBPClient::RevokeExternalKvBlocks,
-           py::arg("hashes"))
-      .def("match_external_kv", &IUMBPClient::MatchExternalKv,
-           py::arg("hashes"));
+      .def("report_external_kv_blocks", &IUMBPClient::ReportExternalKvBlocks, py::arg("hashes"),
+           py::arg("tier"))
+      .def("revoke_external_kv_blocks", &IUMBPClient::RevokeExternalKvBlocks, py::arg("hashes"))
+      .def("match_external_kv", &IUMBPClient::MatchExternalKv, py::arg("hashes"));
 
   // UMBPMasterClient is a read-only query client for the UMBP master.
   // It is intended solely for information lookup (e.g. matching external KV
@@ -198,14 +196,14 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("matched_hashes", &MasterClient::ExternalKvNodeMatch::matched_hashes)
       .def_readwrite("tier", &MasterClient::ExternalKvNodeMatch::tier)
       .def("__repr__", [](const MasterClient::ExternalKvNodeMatch& m) {
-        return "<UMBPExternalKvNodeMatch node_id='" + m.node_id + "' matched=" +
-               std::to_string(m.matched_hashes.size()) + ">";
+        return "<UMBPExternalKvNodeMatch node_id='" + m.node_id +
+               "' matched=" + std::to_string(m.matched_hashes.size()) + ">";
       });
 
   py::class_<MasterClient>(m, "UMBPMasterClient")
       .def(py::init([](const std::string& master_address, const std::string& node_id,
                        const std::string& node_address) {
-             MasterClientConfig cfg;
+             UMBPMasterClientConfig cfg;
              cfg.master_address = master_address;
              cfg.node_id = node_id;
              cfg.node_address = node_address;
@@ -236,12 +234,11 @@ void RegisterMoriUmbp(py::module_& m) {
       .def("is_registered", &MasterClient::IsRegistered)
       .def(
           "report_external_kv_blocks",
-          [](MasterClient& self, const std::string& node_id,
-             const std::vector<std::string>& hashes, TierType tier) {
+          [](MasterClient& self, const std::string& node_id, const std::vector<std::string>& hashes,
+             TierType tier) {
             auto status = self.ReportExternalKvBlocks(node_id, hashes, tier);
             if (!status.ok())
-              throw std::runtime_error("ReportExternalKvBlocks failed: " +
-                                       status.error_message());
+              throw std::runtime_error("ReportExternalKvBlocks failed: " + status.error_message());
           },
           py::arg("node_id"), py::arg("hashes"), py::arg("tier"))
       .def(
@@ -250,8 +247,7 @@ void RegisterMoriUmbp(py::module_& m) {
              const std::vector<std::string>& hashes) {
             auto status = self.RevokeExternalKvBlocks(node_id, hashes);
             if (!status.ok())
-              throw std::runtime_error("RevokeExternalKvBlocks failed: " +
-                                       status.error_message());
+              throw std::runtime_error("RevokeExternalKvBlocks failed: " + status.error_message());
           },
           py::arg("node_id"), py::arg("hashes"))
       .def(
@@ -260,8 +256,7 @@ void RegisterMoriUmbp(py::module_& m) {
             std::vector<MasterClient::ExternalKvNodeMatch> matches;
             auto status = self.MatchExternalKv(hashes, &matches);
             if (!status.ok())
-              throw std::runtime_error("MatchExternalKv failed: " +
-                                       status.error_message());
+              throw std::runtime_error("MatchExternalKv failed: " + status.error_message());
             return matches;
           },
           py::arg("hashes"));

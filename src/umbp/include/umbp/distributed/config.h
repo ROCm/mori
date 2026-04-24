@@ -94,7 +94,7 @@ struct EvictionConfig {
 
 struct MasterServerConfig {
   std::string listen_address = "0.0.0.0:50051";
-  int metrics_port = 9091;
+  int metrics_port = 0;  // 0 = disabled; set to a positive port to enable
   ClientRegistryConfig registry_config;
   EvictionConfig eviction_config;
 

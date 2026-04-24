@@ -79,8 +79,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
  public:
   UMBPMasterServiceImpl(ClientRegistry& registry, GlobalBlockIndex& index,
                         ExternalKvBlockIndex& external_kv_index, Router& router,
-                        const ClientRegistryConfig& config,
-                        mori::metrics::MetricsServer* metrics)
+                        const ClientRegistryConfig& config, mori::metrics::MetricsServer* metrics)
       : registry_(registry),
         index_(index),
         external_kv_index_(external_kv_index),
@@ -185,6 +184,9 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     MORI_UMBP_INFO("[Master] Register key: node_id={}, key={}, location_id={}, size={}, tier={}",
                    request->node_id(), request->key(), location.location_id, location.size,
                    TierTypeName(location.tier));
+    if (metrics_) {
+      metrics_->addCounter(MORI_UMBP_METRIC_REGISTER_TOTAL, MORI_UMBP_METRIC_REGISTER_TOTAL_HELP);
+    }
     return grpc::Status::OK;
   }
 
@@ -214,6 +216,10 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
 
     MORI_UMBP_INFO("[Master] Unregister key: node_id={}, key={}, location_id={}, removed={}",
                    request->node_id(), request->key(), location.location_id, response->removed());
+    if (metrics_) {
+      metrics_->addCounter(MORI_UMBP_METRIC_UNREGISTER_TOTAL,
+                           MORI_UMBP_METRIC_UNREGISTER_TOTAL_HELP);
+    }
     return grpc::Status::OK;
   }
 
@@ -254,6 +260,10 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
       index_.SetDepth(request->key(), request->depth());
     }
     response->set_finalized(finalized);
+    if (metrics_) {
+      metrics_->addCounter(MORI_UMBP_METRIC_FINALIZE_ALLOCATION_TOTAL,
+                           MORI_UMBP_METRIC_FINALIZE_ALLOCATION_TOTAL_HELP);
+    }
     return grpc::Status::OK;
   }
 
@@ -272,6 +282,10 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     const bool published =
         registry_.PublishLocalBlock(request->node_id(), request->key(), location);
     response->set_published(published);
+    if (metrics_) {
+      metrics_->addCounter(MORI_UMBP_METRIC_PUBLISH_LOCAL_BLOCK_TOTAL,
+                           MORI_UMBP_METRIC_PUBLISH_LOCAL_BLOCK_TOTAL_HELP);
+    }
     return grpc::Status::OK;
   }
 
@@ -286,6 +300,10 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     const bool aborted =
         registry_.AbortAllocation(request->node_id(), request->allocation_id(), request->size());
     response->set_aborted(aborted);
+    if (metrics_) {
+      metrics_->addCounter(MORI_UMBP_METRIC_ABORT_ALLOCATION_TOTAL,
+                           MORI_UMBP_METRIC_ABORT_ALLOCATION_TOTAL_HELP);
+    }
     return grpc::Status::OK;
   }
 
@@ -339,9 +357,9 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
 
     if (metrics_) {
       auto safe_node = mori::metrics::MetricsServer::SanitizeName(result->node_id);
-      metrics_->addCounter(std::string(MORI_UMBP_METRIC_CLIENT_ROUTE_GET_PREFIX) + safe_node,
-                           std::string(MORI_UMBP_METRIC_CLIENT_ROUTE_GET_HELP_PREFIX) +
-                               result->node_id);
+      metrics_->addCounter(
+          std::string(MORI_UMBP_METRIC_CLIENT_ROUTE_GET_PREFIX) + safe_node,
+          std::string(MORI_UMBP_METRIC_CLIENT_ROUTE_GET_HELP_PREFIX) + result->node_id);
     }
     MORI_UMBP_INFO("[Master] RouteGet key='{}': node={}, location={}", request->key(),
                    result->node_id, result->location_id);
@@ -383,9 +401,9 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
 
     if (metrics_) {
       auto safe_node = mori::metrics::MetricsServer::SanitizeName(result->node_id);
-      metrics_->addCounter(std::string(MORI_UMBP_METRIC_CLIENT_ROUTE_PUT_PREFIX) + safe_node,
-                           std::string(MORI_UMBP_METRIC_CLIENT_ROUTE_PUT_HELP_PREFIX) +
-                               result->node_id);
+      metrics_->addCounter(
+          std::string(MORI_UMBP_METRIC_CLIENT_ROUTE_PUT_PREFIX) + safe_node,
+          std::string(MORI_UMBP_METRIC_CLIENT_ROUTE_PUT_HELP_PREFIX) + result->node_id);
     }
     MORI_UMBP_INFO("[Master] RoutePut key='{}': target_node={}, tier={}, location='{}', pages={}",
                    request->key(), result->node_id, TierTypeName(result->tier), result->location_id,
@@ -435,6 +453,17 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
       entry->set_page_size(r.page_size);
     }
 
+    if (metrics_) {
+      for (size_t i = 0; i < results.size(); ++i) {
+        if (results[i].has_value()) {
+          auto safe_node = mori::metrics::MetricsServer::SanitizeName(results[i]->node_id);
+          metrics_->addCounter(
+              std::string(MORI_UMBP_METRIC_CLIENT_BATCH_ROUTE_PUT_PREFIX) + safe_node,
+              std::string(MORI_UMBP_METRIC_CLIENT_BATCH_ROUTE_PUT_HELP_PREFIX) +
+                  results[i]->node_id);
+        }
+      }
+    }
     MORI_UMBP_INFO("[Master] BatchRoutePut: {} keys from node={}", keys.size(), request->node_id());
     return grpc::Status::OK;
   }
@@ -488,6 +517,17 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
       }
     }
 
+    if (metrics_) {
+      for (size_t i = 0; i < results.size(); ++i) {
+        if (results[i].has_value()) {
+          auto safe_node = mori::metrics::MetricsServer::SanitizeName(results[i]->node_id);
+          metrics_->addCounter(
+              std::string(MORI_UMBP_METRIC_CLIENT_BATCH_ROUTE_GET_PREFIX) + safe_node,
+              std::string(MORI_UMBP_METRIC_CLIENT_BATCH_ROUTE_GET_HELP_PREFIX) +
+                  results[i]->node_id);
+        }
+      }
+    }
     MORI_UMBP_INFO("[Master] BatchRouteGet: {} keys from node={}", keys.size(), request->node_id());
     return grpc::Status::OK;
   }
@@ -504,6 +544,19 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
       response->add_found(f);
     }
 
+    if (metrics_) {
+      uint64_t found_count = 0;
+      for (bool f : found) {
+        if (f) ++found_count;
+      }
+      metrics_->addCounter(MORI_UMBP_METRIC_BATCH_LOOKUP_TOTAL,
+                           MORI_UMBP_METRIC_BATCH_LOOKUP_TOTAL_HELP);
+      metrics_->addCounter(MORI_UMBP_METRIC_BATCH_LOOKUP_KEYS_TOTAL,
+                           MORI_UMBP_METRIC_BATCH_LOOKUP_KEYS_TOTAL_HELP,
+                           static_cast<uint64_t>(keys.size()));
+      metrics_->addCounter(MORI_UMBP_METRIC_BATCH_LOOKUP_FOUND_TOTAL,
+                           MORI_UMBP_METRIC_BATCH_LOOKUP_FOUND_TOTAL_HELP, found_count);
+    }
     MORI_UMBP_DEBUG("[Master] BatchLookup: {} keys from node={}", keys.size(), request->node_id());
     return grpc::Status::OK;
   }
@@ -530,6 +583,13 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
       response->add_finalized(finalized);
     }
 
+    if (metrics_) {
+      metrics_->addCounter(MORI_UMBP_METRIC_BATCH_FINALIZE_ALLOCATION_TOTAL,
+                           MORI_UMBP_METRIC_BATCH_FINALIZE_ALLOCATION_TOTAL_HELP);
+      metrics_->addCounter(MORI_UMBP_METRIC_BATCH_FINALIZE_ALLOCATION_KEYS_TOTAL,
+                           MORI_UMBP_METRIC_BATCH_FINALIZE_ALLOCATION_KEYS_TOTAL_HELP,
+                           static_cast<uint64_t>(n));
+    }
     MORI_UMBP_INFO("[Master] BatchFinalizeAllocation: {} keys from node={}", n, request->node_id());
     return grpc::Status::OK;
   }
@@ -551,13 +611,19 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
       const bool aborted = registry_.AbortAllocation(e.node_id(), e.allocation_id(), e.size());
       response->add_aborted(aborted);
     }
+    if (metrics_) {
+      metrics_->addCounter(MORI_UMBP_METRIC_BATCH_ABORT_ALLOCATION_TOTAL,
+                           MORI_UMBP_METRIC_BATCH_ABORT_ALLOCATION_TOTAL_HELP);
+      metrics_->addCounter(MORI_UMBP_METRIC_BATCH_ABORT_ALLOCATION_ENTRIES_TOTAL,
+                           MORI_UMBP_METRIC_BATCH_ABORT_ALLOCATION_ENTRIES_TOTAL_HELP,
+                           static_cast<uint64_t>(n));
+    }
     MORI_UMBP_INFO("[Master] BatchAbortAllocation: {} entries", n);
     return grpc::Status::OK;
   }
 
   grpc::Status ReportExternalKvBlocks(
-      grpc::ServerContext* /*context*/,
-      const ::umbp::ReportExternalKvBlocksRequest* request,
+      grpc::ServerContext* /*context*/, const ::umbp::ReportExternalKvBlocksRequest* request,
       ::umbp::ReportExternalKvBlocksResponse* /*response*/) override {
     if (request->node_id().empty()) {
       return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "node_id cannot be empty");
@@ -590,8 +656,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
   }
 
   grpc::Status RevokeExternalKvBlocks(
-      grpc::ServerContext* /*context*/,
-      const ::umbp::RevokeExternalKvBlocksRequest* request,
+      grpc::ServerContext* /*context*/, const ::umbp::RevokeExternalKvBlocksRequest* request,
       ::umbp::RevokeExternalKvBlocksResponse* /*response*/) override {
     if (request->node_id().empty()) {
       return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "node_id cannot be empty");
@@ -652,8 +717,9 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
       total_matched_blocks += m.matched_hashes.size();
     }
 
-    MORI_UMBP_INFO("[Master] MatchExternalKv: queried_hashes={}, matched_nodes={}, matched_blocks={}",
-                   hashes.size(), matches.size(), total_matched_blocks);
+    MORI_UMBP_INFO(
+        "[Master] MatchExternalKv: queried_hashes={}, matched_nodes={}, matched_blocks={}",
+        hashes.size(), matches.size(), total_matched_blocks);
 
     if (metrics_) {
       metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_MATCH_TOTAL,
@@ -713,8 +779,7 @@ MasterServer::MasterServer(MasterServerConfig config)
       registry_(config_.registry_config, index_),
       router_(index_, registry_, std::move(config_.get_strategy), std::move(config_.put_strategy)),
       service_(std::make_unique<UMBPMasterServiceImpl>(registry_, index_, external_kv_index_,
-                                                       router_, config_.registry_config,
-                                                       nullptr)),
+                                                       router_, config_.registry_config, nullptr)),
       eviction_manager_(
           std::make_unique<EvictionManager>(index_, registry_, config_.eviction_config)) {
   index_.SetClientRegistry(&registry_);
@@ -722,14 +787,24 @@ MasterServer::MasterServer(MasterServerConfig config)
   registry_.SetExternalKvBlockIndex(&external_kv_index_);
 }
 
-MasterServer::~MasterServer() { Shutdown(); }
+MasterServer::~MasterServer() {
+  // Shutdown() signals gRPC to stop but does not reset server_.  The
+  // destructor is the single site that calls server_.reset(), ensuring the
+  // grpc::Server object outlives any thread that is still inside Wait().
+  // Callers that start Run() in a separate thread MUST join that thread
+  // before destroying MasterServer (i.e., before reaching this destructor).
+  Shutdown();
+  server_.reset();
+}
 
 void MasterServer::Run() {
-  metrics_server_ = std::make_unique<mori::metrics::MetricsServer>(config_.metrics_port);
-  service_->SetMetrics(metrics_server_.get());
-  metrics_server_->setGauge(MORI_UMBP_METRIC_CLIENT_COUNT, MORI_UMBP_METRIC_CLIENT_COUNT_HELP,
-                            0.0);
-  MORI_UMBP_INFO("[Master] Metrics server listening on port {}", config_.metrics_port);
+  if (config_.metrics_port > 0) {
+    metrics_server_ = std::make_unique<mori::metrics::MetricsServer>(config_.metrics_port);
+    service_->SetMetrics(metrics_server_.get());
+    metrics_server_->setGauge(MORI_UMBP_METRIC_CLIENT_COUNT, MORI_UMBP_METRIC_CLIENT_COUNT_HELP,
+                              0.0);
+    MORI_UMBP_INFO("[Master] Metrics server listening on port {}", config_.metrics_port);
+  }
 
   registry_.StartReaper();
   eviction_manager_->Start();
@@ -751,7 +826,9 @@ void MasterServer::Shutdown() {
     const auto deadline = std::chrono::system_clock::now() + GrpcShutdownDeadline();
     MORI_UMBP_INFO("[Master] Shutting down");
     server_->Shutdown(deadline);
-    server_.reset();
+    // Intentionally do NOT reset server_ here — the thread running Run()/Wait()
+    // may not have returned yet.  server_.reset() is deferred to ~MasterServer(),
+    // which callers must invoke only after joining the server thread.
   }
   registry_.StopReaper();
 }

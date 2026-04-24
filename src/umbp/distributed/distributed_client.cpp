@@ -21,10 +21,9 @@
 // SOFTWARE.
 #include "umbp/distributed/distributed_client.h"
 
-#include <map>
 #include <sys/mman.h>
 
-
+#include <map>
 #include <stdexcept>
 
 #include "mori/io/engine.hpp"
@@ -218,26 +217,21 @@ bool DistributedClient::IsDistributed() const { return true; }
 
 bool DistributedClient::ReportExternalKvBlocks(const std::vector<std::string>& hashes,
                                                TierType tier) {
-  if (!master_client_) return false;
-  const std::string& node_id = config_.distributed->node_id;
-  auto status = master_client_->ReportExternalKvBlocks(node_id, hashes, tier);
-  return status.ok();
+  if (!pool_client_) return false;
+  return pool_client_->ReportExternalKvBlocks(hashes, tier);
 }
 
 bool DistributedClient::RevokeExternalKvBlocks(const std::vector<std::string>& hashes) {
-  if (!master_client_) return false;
-  const std::string& node_id = config_.distributed->node_id;
-  auto status = master_client_->RevokeExternalKvBlocks(node_id, hashes);
-  return status.ok();
+  if (!pool_client_) return false;
+  return pool_client_->RevokeExternalKvBlocks(hashes);
 }
 
 std::vector<IUMBPClient::ExternalKvMatch> DistributedClient::MatchExternalKv(
     const std::vector<std::string>& hashes) {
-  if (!master_client_) return {};
+  if (!pool_client_) return {};
 
   std::vector<MasterClient::ExternalKvNodeMatch> raw;
-  auto status = master_client_->MatchExternalKv(hashes, &raw);
-  if (!status.ok()) return {};
+  if (!pool_client_->MatchExternalKv(hashes, &raw)) return {};
 
   std::vector<IUMBPClient::ExternalKvMatch> result;
   result.reserve(raw.size());
