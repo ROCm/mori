@@ -83,9 +83,7 @@ def _normalize_cuda_device(device):
     elif isinstance(device, str):
         device = torch.device(device)
     elif not isinstance(device, torch.device):
-        raise TypeError(
-            "device must be a CUDA tensor, torch.device, int, str, or None"
-        )
+        raise TypeError("device must be a CUDA tensor, torch.device, int, str, or None")
 
     if device.type != "cuda":
         raise ValueError("device must refer to a CUDA device")

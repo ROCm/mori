@@ -1,17 +1,14 @@
 # Source files list
 set(COLLECTIVE_SOURCES
-    core/oneshot_all2all_sdma_class.cpp
-    core/oneshot_allgather_sdma_class.cpp
+    core/oneshot_all2all_sdma_class.cpp core/oneshot_allgather_sdma_class.cpp
     core/twoshot_allreduce_sdma_class.cpp
     # Note: intra_node_executor is header-only template class
 )
 
 if(WITH_MPI)
   find_package(MPI REQUIRED)
-  list(APPEND COLLECTIVE_SOURCES
-       core/topology_detector.cpp
-       core/allreduce_manager.cpp
-       inter_node/executors/ring_1d_executor.cpp
+  list(APPEND COLLECTIVE_SOURCES core/topology_detector.cpp
+       core/allreduce_manager.cpp inter_node/executors/ring_1d_executor.cpp
        inter_node/executors/one_shot_executor.cpp)
 endif()
 

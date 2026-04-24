@@ -75,8 +75,7 @@ __global__ void OneShotAllGatherSdmaAsyncPutKernel(int myPe, int npes, T* input,
     uint8_t* srcPtr = reinterpret_cast<uint8_t*>(inputData) + srcByteOffset;
     uint8_t* dstPtr =
         reinterpret_cast<uint8_t*>(dest->peerPtrs[remotePe]) + dstBaseOffset + destByteOffset;
-    anvil::SdmaQueueDeviceHandle** devicehandles =
-        dest->deviceHandles_d + remotePe * numQueues;
+    anvil::SdmaQueueDeviceHandle** devicehandles = dest->deviceHandles_d + remotePe * numQueues;
     HSAuint64* signals = dest->signalPtrs + remotePe * numQueues;
     HSAuint64* expectedSignals = dest->expectSignalsPtr + remotePe * numQueues;
     core::SdmaPutThread(srcPtr, dstPtr, sendBytes, devicehandles, signals, expectedSignals,
