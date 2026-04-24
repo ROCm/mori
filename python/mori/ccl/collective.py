@@ -29,7 +29,9 @@ _TORCH_DTYPE_TO_NUMPY = {
     torch.uint32: "<u4",
     torch.int32: "<i4",
     torch.float16: "<f2",
-    torch.bfloat16: "V2",
+    # torch.as_tensor() cannot materialize bf16 from a raw "void" CUDA array
+    # interface view, so expose it as uint16 and reinterpret via .view().
+    torch.bfloat16: "<u2",
     torch.float32: "<f4",
 }
 
