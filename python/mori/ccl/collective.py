@@ -58,17 +58,53 @@ class _GpuBufferView:
         }
 
 
-def _ptr_to_tensor(ptr: int, size_bytes: int, dtype=torch.uint32):
+def _ptr_to_tensor(ptr: int, size_bytes: int, dtype=torch.uint32, device=None):
     """Wrap a raw GPU pointer as a 1-D torch CUDA tensor (zero-copy view)."""
     elem_size = torch.tensor([], dtype=dtype).element_size()
     num_elements = size_bytes // elem_size
     typestr = _TORCH_DTYPE_TO_NUMPY.get(dtype, "<u4")
     buf = _GpuBufferView(ptr, (num_elements,), typestr)
+    device = _normalize_cuda_device(device) or torch.device("cuda")
     if dtype == torch.bfloat16:
-        raw = torch.as_tensor(buf, device="cuda").view(torch.bfloat16)
+        raw = torch.as_tensor(buf, device=device).view(torch.bfloat16)
     else:
-        raw = torch.as_tensor(buf, device="cuda")
+        raw = torch.as_tensor(buf, device=device)
     return raw
+
+
+def _normalize_cuda_device(device):
+    """Resolve a CUDA tensor/device spec into a torch.device."""
+    if device is None:
+        return None
+    if isinstance(device, torch.Tensor):
+        device = device.device
+    elif isinstance(device, int):
+        device = torch.device(f"cuda:{device}")
+    elif isinstance(device, str):
+        device = torch.device(device)
+    elif not isinstance(device, torch.device):
+        raise TypeError(
+            "device must be a CUDA tensor, torch.device, int, str, or None"
+        )
+
+    if device.type != "cuda":
+        raise ValueError("device must refer to a CUDA device")
+    return device
+
+
+def _resolve_transit_view_args(dtype, device, fallback_dtype):
+    """Support both the new dtype= API and legacy device= calls."""
+    if device is None and dtype is not None and not isinstance(dtype, torch.dtype):
+        device = dtype
+        dtype = None
+
+    if isinstance(device, torch.Tensor) and dtype is None:
+        dtype = device.dtype
+
+    if dtype is None:
+        dtype = fallback_dtype
+
+    return dtype, _normalize_cuda_device(device)
 
 
 def _cpp_all2all_factory(entity_name: str):
@@ -138,14 +174,16 @@ class All2allSdma:
     def reset_flags(self):
         self._handle.reset_flags()
 
-    def get_output_transit_buffer(self, dtype=torch.uint32):
+    def get_output_transit_buffer(self, dtype=None, device=None):
         """Get output transit buffer as a PyTorch CUDA tensor (zero-copy view).
 
         Args:
-            dtype: torch.dtype for the returned tensor view (default torch.uint32).
+            dtype: torch.dtype for the returned tensor view.
+            device: Optional CUDA tensor/device for legacy compatibility.
         """
+        dtype, device = _resolve_transit_view_args(dtype, device, torch.uint32)
         ptr, size_bytes = self._handle.get_output_transit_buffer()
-        return _ptr_to_tensor(ptr, size_bytes, dtype)
+        return _ptr_to_tensor(ptr, size_bytes, dtype, device)
 
 
 def _cpp_allgather_factory(entity_name: str):
@@ -219,14 +257,17 @@ class AllgatherSdma:
     def reset_flags(self):
         self._handle.reset_flags()
 
-    def get_output_transit_buffer(self, dtype=torch.uint32):
+    def get_output_transit_buffer(self, dtype=None, device=None):
         """Get output transit buffer as a PyTorch CUDA tensor (zero-copy view)."""
+        dtype, device = _resolve_transit_view_args(dtype, device, torch.uint32)
         ptr, size_bytes = self._handle.get_output_transit_buffer()
-        return _ptr_to_tensor(ptr, size_bytes, dtype)
+        return _ptr_to_tensor(ptr, size_bytes, dtype, device)
 
     def register_output_buffer(self, tensor):
         """Register a CUDA tensor as direct SDMA output target (collective)."""
-        self._handle.register_output_buffer(tensor.data_ptr(), tensor.nbytes())
+        self._handle.register_output_buffer(
+            tensor.data_ptr(), tensor.numel() * tensor.element_size()
+        )
 
     def deregister_output_buffer(self, tensor):
         """Deregister a previously registered output buffer (collective)."""
@@ -248,13 +289,14 @@ class AllreduceSdma:
       Stage 1: ReduceScatter -- each rank reduces its shard across all peers
       Stage 2: AllGather -- broadcast reduced shards to all peers via SDMA
 
-    Supported dtypes: torch.uint32, torch.int32, torch.float16, torch.bfloat16
+    Supported dtypes: torch.uint32, torch.int32, torch.float32, torch.float16,
+    torch.bfloat16
     """
 
     _HANDLE_MAP = {
         torch.uint32: "AllreduceSdmaHandle",
-        torch.int32: "AllreduceSdmaHandle",
-        torch.float32: "AllreduceSdmaHandle",
+        torch.int32: "AllreduceSdmaHandleInt32",
+        torch.float32: "AllreduceSdmaHandleFp32",
         torch.float16: "AllreduceSdmaHandleFp16",
         torch.bfloat16: "AllreduceSdmaHandleBf16",
     }
@@ -324,13 +366,13 @@ class AllreduceSdma:
     def reset_flags(self):
         self._handle.reset_flags()
 
-    def get_output_transit_buffer(self, dtype=None):
+    def get_output_transit_buffer(self, dtype=None, device=None):
         """Get output transit buffer as a PyTorch CUDA tensor (zero-copy view).
 
         Args:
             dtype: torch.dtype for the view. Defaults to self.dtype.
+            device: Optional CUDA tensor/device for legacy compatibility.
         """
-        if dtype is None:
-            dtype = self.dtype
+        dtype, device = _resolve_transit_view_args(dtype, device, self.dtype)
         ptr, size_bytes = self._handle.get_output_transit_buffer()
-        return _ptr_to_tensor(ptr, size_bytes, dtype)
+        return _ptr_to_tensor(ptr, size_bytes, dtype, device)
