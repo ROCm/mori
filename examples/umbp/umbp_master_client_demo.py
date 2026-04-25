@@ -1,3 +1,24 @@
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+#
+# MIT License
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 """
 End-to-end demo: start an umbp_master server subprocess, exercise
 UMBPMasterClient against it, then shut down cleanly.
@@ -53,6 +74,7 @@ if not MASTER_BIN.is_file():
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -124,12 +146,13 @@ def registered_client(master_address: str, node_id: str, tier_caps: dict):
 # Demo
 # ---------------------------------------------------------------------------
 
+
 def run_demo(master_address: str) -> None:
     from mori.cpp import UMBPMasterClient, UMBPTierType
 
     _1GB = 1 * 1024 * 1024 * 1024
     DRAM_CAPS = {UMBPTierType.DRAM: (_1GB, _1GB)}
-    HBM_CAPS  = {UMBPTierType.HBM:  (_1GB, _1GB)}
+    HBM_CAPS = {UMBPTierType.HBM: (_1GB, _1GB)}
 
     # ------------------------------------------------------------------
     # Scenario 1 – single node: report then match
@@ -144,7 +167,9 @@ def run_demo(master_address: str) -> None:
         matches = ca.match_external_kv(hashes_a)
         assert len(matches) == 1, f"expected 1 match, got {len(matches)}"
         m = matches[0]
-        print(f"[match]  node_id={m.node_id}  tier={m.tier}  matched={len(m.matched_hashes)} blocks")
+        print(
+            f"[match]  node_id={m.node_id}  tier={m.tier}  matched={len(m.matched_hashes)} blocks"
+        )
         assert m.node_id == "node-a"
         assert m.tier == UMBPTierType.DRAM
         assert set(m.matched_hashes) == set(hashes_a)
@@ -155,8 +180,10 @@ def run_demo(master_address: str) -> None:
     print("\n--- Scenario 2: multi-node, mixed tiers ---")
     shared_hashes = [f"shared-{i:04d}" for i in range(4)]
 
-    with registered_client(master_address, "node-b", DRAM_CAPS) as cb, \
-         registered_client(master_address, "node-c", HBM_CAPS)  as cc:
+    with (
+        registered_client(master_address, "node-b", DRAM_CAPS) as cb,
+        registered_client(master_address, "node-c", HBM_CAPS) as cc,
+    ):
 
         cb.report_external_kv_blocks("node-b", shared_hashes, UMBPTierType.DRAM)
         cc.report_external_kv_blocks("node-c", shared_hashes, UMBPTierType.HBM)
@@ -175,7 +202,7 @@ def run_demo(master_address: str) -> None:
     print("\n--- Scenario 3: revoke ---")
     hashes_d = [f"evict-{i:04d}" for i in range(6)]
     to_revoke = hashes_d[:3]
-    to_keep   = hashes_d[3:]
+    to_keep = hashes_d[3:]
 
     with registered_client(master_address, "node-d", DRAM_CAPS) as cd:
         cd.report_external_kv_blocks("node-d", hashes_d, UMBPTierType.DRAM)
@@ -183,16 +210,22 @@ def run_demo(master_address: str) -> None:
         print(f"[node-d] revoked {len(to_revoke)} blocks, kept {len(to_keep)}")
 
         kept_matches = {
-            h for m in cd.match_external_kv(to_keep)
-            if m.node_id == "node-d" for h in m.matched_hashes
+            h
+            for m in cd.match_external_kv(to_keep)
+            if m.node_id == "node-d"
+            for h in m.matched_hashes
         }
         revoked_matches = {
-            h for m in cd.match_external_kv(to_revoke)
-            if m.node_id == "node-d" for h in m.matched_hashes
+            h
+            for m in cd.match_external_kv(to_revoke)
+            if m.node_id == "node-d"
+            for h in m.matched_hashes
         }
-        assert kept_matches == set(to_keep),   f"kept mismatch: {kept_matches}"
-        assert revoked_matches == set(),        f"revoked still present: {revoked_matches}"
-        print(f"[check]  kept={len(kept_matches)} blocks visible, revoked=0 blocks visible  ✓")
+        assert kept_matches == set(to_keep), f"kept mismatch: {kept_matches}"
+        assert revoked_matches == set(), f"revoked still present: {revoked_matches}"
+        print(
+            f"[check]  kept={len(kept_matches)} blocks visible, revoked=0 blocks visible  ✓"
+        )
 
     # ------------------------------------------------------------------
     # Scenario 4 – query with no server match returns empty list

@@ -1017,8 +1017,7 @@ bool PoolClient::ReportExternalKvBlocks(const std::vector<std::string>& hashes, 
     MORI_UMBP_ERROR("[PoolClient] ReportExternalKvBlocks: not initialized");
     return false;
   }
-  auto status =
-      master_client_->ReportExternalKvBlocks(config_.master_config.node_id, hashes, tier);
+  auto status = master_client_->ReportExternalKvBlocks(config_.master_config.node_id, hashes, tier);
   return status.ok();
 }
 
@@ -1027,8 +1026,7 @@ bool PoolClient::RevokeExternalKvBlocks(const std::vector<std::string>& hashes) 
     MORI_UMBP_ERROR("[PoolClient] RevokeExternalKvBlocks: not initialized");
     return false;
   }
-  auto status =
-      master_client_->RevokeExternalKvBlocks(config_.master_config.node_id, hashes);
+  auto status = master_client_->RevokeExternalKvBlocks(config_.master_config.node_id, hashes);
   return status.ok();
 }
 

@@ -327,8 +327,8 @@ if(NOT EXISTS "${_PROTOBUF_COMPAT_DIR}/google")
 endif()
 target_include_directories(umbp_common BEFORE PUBLIC "${_PROTOBUF_COMPAT_DIR}")
 
-target_link_libraries(umbp_common PUBLIC mori_logging mori_io mori_metrics ${_PROTOBUF_LIBS}
-                                         ${_GRPCPP_LIB})
+target_link_libraries(umbp_common PUBLIC mori_logging mori_io mori_metrics
+                                         ${_PROTOBUF_LIBS} ${_GRPCPP_LIB})
 
 target_compile_features(umbp_common PUBLIC cxx_std_17)
 

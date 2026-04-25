@@ -9,6 +9,27 @@
 // copies of the Software, and to permit persons to whom the Software is
 // furnished to do so, subject to the following conditions:
 //
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
 // The above copyright notice and this permission notice shall be included in
 // all copies or substantial portions of the Software.
 //
@@ -46,39 +67,34 @@ MetricsServer::MetricsServer(int port) : port_(port) {
 
   server_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
   if (server_fd_ < 0) {
-    throw std::runtime_error("[metrics] socket() failed: " +
-                             std::string(std::strerror(errno)));
+    throw std::runtime_error("[metrics] socket() failed: " + std::string(std::strerror(errno)));
   }
 
   int opt = 1;
   ::setsockopt(server_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
   sockaddr_in addr{};
-  addr.sin_family      = AF_INET;
+  addr.sin_family = AF_INET;
   addr.sin_addr.s_addr = INADDR_ANY;
-  addr.sin_port        = htons(static_cast<uint16_t>(port_));
+  addr.sin_port = htons(static_cast<uint16_t>(port_));
 
-  if (::bind(server_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) <
-      0) {
+  if (::bind(server_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
     ::close(server_fd_);
     server_fd_ = -1;
-    throw std::runtime_error("[metrics] bind() on port " +
-                             std::to_string(port_) +
+    throw std::runtime_error("[metrics] bind() on port " + std::to_string(port_) +
                              " failed: " + std::strerror(errno));
   }
 
   if (::listen(server_fd_, 16) < 0) {
     ::close(server_fd_);
     server_fd_ = -1;
-    throw std::runtime_error("[metrics] listen() failed: " +
-                             std::string(std::strerror(errno)));
+    throw std::runtime_error("[metrics] listen() failed: " + std::string(std::strerror(errno)));
   }
 
   running_.store(true, std::memory_order_relaxed);
   accept_thread_ = std::thread(&MetricsServer::acceptLoop, this);
 
-  MORI_INFO(modules::METRICS,
-            "Prometheus metrics server listening on http://0.0.0.0:{}/metrics",
+  MORI_INFO(modules::METRICS, "Prometheus metrics server listening on http://0.0.0.0:{}/metrics",
             port_);
 }
 
@@ -114,32 +130,30 @@ std::string MetricsServer::SanitizeName(std::string_view s) {
 // Public metric update API
 // ---------------------------------------------------------------------------
 
-void MetricsServer::setGauge(std::string_view name, std::string_view help,
-                             double value) {
+void MetricsServer::setGauge(std::string_view name, std::string_view help, double value) {
   std::lock_guard<std::mutex> lk(mutex_);
-  auto& entry   = gauges_[std::string(name)];
-  entry.help     = help;
-  entry.value    = value;
+  auto& entry = gauges_[std::string(name)];
+  entry.help = help;
+  entry.value = value;
 }
 
-void MetricsServer::addCounter(std::string_view name, std::string_view help,
-                               uint64_t delta) {
+void MetricsServer::addCounter(std::string_view name, std::string_view help, uint64_t delta) {
   std::lock_guard<std::mutex> lk(mutex_);
-  auto& entry   = counters_[std::string(name)];
-  entry.help     = help;
-  entry.value   += delta;
+  auto& entry = counters_[std::string(name)];
+  entry.help = help;
+  entry.value += delta;
 }
 
 void MetricsServer::observe(std::string_view name, std::string_view help,
                             const std::vector<double>& bounds, double value) {
   std::lock_guard<std::mutex> lk(mutex_);
   auto key = std::string(name);
-  auto it  = histograms_.find(key);
+  auto it = histograms_.find(key);
 
   if (it == histograms_.end()) {
     // First observation: initialise the histogram layout.
     HistogramEntry entry;
-    entry.help   = help;
+    entry.help = help;
     entry.bounds = bounds;
     entry.bucket_counts.assign(bounds.size(), 0u);
     histograms_.emplace(key, std::move(entry));
@@ -186,12 +200,11 @@ std::string MetricsServer::serializeLocked() const {
 
     // Explicit upper-bound buckets (already cumulative in bucket_counts).
     for (std::size_t i = 0; i < h.bounds.size(); ++i) {
-      out << name << "_bucket{le=\"" << h.bounds[i] << "\"} "
-          << h.bucket_counts[i] << "\n";
+      out << name << "_bucket{le=\"" << h.bounds[i] << "\"} " << h.bucket_counts[i] << "\n";
     }
     // +Inf bucket == total observation count.
     out << name << "_bucket{le=\"+Inf\"} " << h.count << "\n";
-    out << name << "_sum "   << h.sum   << "\n";
+    out << name << "_sum " << h.sum << "\n";
     out << name << "_count " << h.count << "\n\n";
   }
 
@@ -208,8 +221,7 @@ void MetricsServer::acceptLoop() {
     if (client_fd < 0) {
       // Either the server fd was closed (shutdown) or a transient error.
       if (!running_.load(std::memory_order_relaxed)) break;
-      MORI_WARN(modules::METRICS, "accept() returned error: {}",
-                std::strerror(errno));
+      MORI_WARN(modules::METRICS, "accept() returned error: {}", std::strerror(errno));
       continue;
     }
     handleClient(client_fd);
@@ -226,22 +238,25 @@ void MetricsServer::handleClient(int client_fd) {
 
   if (std::strncmp(buf, "GET /metrics", 12) == 0) {
     std::lock_guard<std::mutex> lk(mutex_);
-    body   = serializeLocked();
+    body = serializeLocked();
     status = "200 OK";
   } else if (std::strncmp(buf, "GET /", 5) == 0) {
-    body   = "Try GET /metrics\n";
+    body = "Try GET /metrics\n";
     status = "404 Not Found";
   } else {
-    body   = "Bad Request\n";
+    body = "Bad Request\n";
     status = "400 Bad Request";
   }
 
-  std::string response =
-      "HTTP/1.1 " + status + "\r\n"
-      "Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n"
-      "Content-Length: " + std::to_string(body.size()) + "\r\n"
-      "Connection: close\r\n"
-      "\r\n" + body;
+  std::string response = "HTTP/1.1 " + status +
+                         "\r\n"
+                         "Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n"
+                         "Content-Length: " +
+                         std::to_string(body.size()) +
+                         "\r\n"
+                         "Connection: close\r\n"
+                         "\r\n" +
+                         body;
 
   ::write(client_fd, response.data(), response.size());
   ::close(client_fd);

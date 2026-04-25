@@ -9,6 +9,27 @@
 // copies of the Software, and to permit persons to whom the Software is
 // furnished to do so, subject to the following conditions:
 //
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
 // The above copyright notice and this permission notice shall be included in
 // all copies or substantial portions of the Software.
 //
@@ -20,9 +41,8 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
 // IN THE SOFTWARE.
 
-#include "mori/metrics/prometheus_metrics_server.hpp"
-
 #include <arpa/inet.h>
+#include <gtest/gtest.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -32,7 +52,7 @@
 #include <thread>
 #include <vector>
 
-#include <gtest/gtest.h>
+#include "mori/metrics/prometheus_metrics_server.hpp"
 
 namespace mori::metrics {
 
@@ -46,8 +66,8 @@ static std::string httpGet(int port, const std::string& path) {
   EXPECT_GE(fd, 0);
 
   sockaddr_in addr{};
-  addr.sin_family      = AF_INET;
-  addr.sin_port        = htons(static_cast<uint16_t>(port));
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(static_cast<uint16_t>(port));
   addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
   EXPECT_EQ(::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
@@ -58,8 +78,7 @@ static std::string httpGet(int port, const std::string& path) {
   std::string response;
   char buf[4096];
   ssize_t n;
-  while ((n = ::read(fd, buf, sizeof(buf))) > 0)
-    response.append(buf, static_cast<std::size_t>(n));
+  while ((n = ::read(fd, buf, sizeof(buf))) > 0) response.append(buf, static_cast<std::size_t>(n));
 
   ::close(fd);
   return response;
@@ -85,9 +104,9 @@ static int freePort() {
   ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
   sockaddr_in addr{};
-  addr.sin_family      = AF_INET;
+  addr.sin_family = AF_INET;
   addr.sin_addr.s_addr = INADDR_ANY;
-  addr.sin_port        = 0;
+  addr.sin_port = 0;
   ::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
 
   socklen_t len = sizeof(addr);
@@ -103,7 +122,7 @@ static int freePort() {
 class PrometheusMetricsServerTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    port_   = freePort();
+    port_ = freePort();
     server_ = std::make_unique<MetricsServer>(port_);
     // Give the accept loop a moment to start.
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -111,11 +130,11 @@ class PrometheusMetricsServerTest : public ::testing::Test {
 
   void TearDown() override { server_.reset(); }
 
-  std::string scrape()            { return httpBody(httpGet(port_, "/metrics")); }
-  std::string scrapeRaw()         { return httpGet(port_, "/metrics"); }
+  std::string scrape() { return httpBody(httpGet(port_, "/metrics")); }
+  std::string scrapeRaw() { return httpGet(port_, "/metrics"); }
   std::string scrapeRaw(const std::string& path) { return httpGet(port_, path); }
 
-  int                            port_{};
+  int port_{};
   std::unique_ptr<MetricsServer> server_;
 };
 
@@ -228,8 +247,8 @@ TEST_F(PrometheusMetricsServerTest, HistogramAppearsInOutput) {
   auto body = scrape();
   EXPECT_NE(body.find("# TYPE test_hist histogram"), std::string::npos);
   EXPECT_NE(body.find("test_hist_bucket"), std::string::npos);
-  EXPECT_NE(body.find("test_hist_sum"),    std::string::npos);
-  EXPECT_NE(body.find("test_hist_count"),  std::string::npos);
+  EXPECT_NE(body.find("test_hist_sum"), std::string::npos);
+  EXPECT_NE(body.find("test_hist_count"), std::string::npos);
 }
 
 TEST_F(PrometheusMetricsServerTest, HistogramInfBucketEqualsCount) {
@@ -237,7 +256,7 @@ TEST_F(PrometheusMetricsServerTest, HistogramInfBucketEqualsCount) {
   server_->observe("inf_hist", "Inf bucket", {0.1, 1.0}, 0.05);
   auto body = scrape();
   EXPECT_NE(body.find("inf_hist_bucket{le=\"+Inf\"} 2"), std::string::npos);
-  EXPECT_NE(body.find("inf_hist_count 2"),               std::string::npos);
+  EXPECT_NE(body.find("inf_hist_count 2"), std::string::npos);
 }
 
 TEST_F(PrometheusMetricsServerTest, HistogramBucketsAreCumulative) {
@@ -245,15 +264,15 @@ TEST_F(PrometheusMetricsServerTest, HistogramBucketsAreCumulative) {
   server_->observe("cum_hist", "Cumulative", {0.01, 0.1, 1.0}, 0.05);
   auto body = scrape();
   EXPECT_NE(body.find("cum_hist_bucket{le=\"0.01\"} 0"), std::string::npos);
-  EXPECT_NE(body.find("cum_hist_bucket{le=\"0.1\"} 1"),  std::string::npos);
-  EXPECT_NE(body.find("cum_hist_bucket{le=\"1\"} 1"),    std::string::npos);
+  EXPECT_NE(body.find("cum_hist_bucket{le=\"0.1\"} 1"), std::string::npos);
+  EXPECT_NE(body.find("cum_hist_bucket{le=\"1\"} 1"), std::string::npos);
 }
 
 TEST_F(PrometheusMetricsServerTest, HistogramSumAndCount) {
   server_->observe("sum_hist", "Sum/count", {1.0, 10.0}, 2.0);
   server_->observe("sum_hist", "Sum/count", {1.0, 10.0}, 3.0);
   auto body = scrape();
-  EXPECT_NE(body.find("sum_hist_sum 5"),   std::string::npos);
+  EXPECT_NE(body.find("sum_hist_sum 5"), std::string::npos);
   EXPECT_NE(body.find("sum_hist_count 2"), std::string::npos);
 }
 
@@ -264,7 +283,7 @@ TEST_F(PrometheusMetricsServerTest, HistogramBoundsInitialisedOnFirstCall) {
   server_->observe("init_hist", "Init", {999.0}, 0.5);
   auto body = scrape();
   // The original bound 1.0 must be present, 999 must not.
-  EXPECT_NE(body.find("le=\"1\""),   std::string::npos);
+  EXPECT_NE(body.find("le=\"1\""), std::string::npos);
   EXPECT_EQ(body.find("le=\"999\""), std::string::npos);
 }
 
@@ -274,7 +293,7 @@ TEST_F(PrometheusMetricsServerTest, HistogramBoundsInitialisedOnFirstCall) {
 
 TEST_F(PrometheusMetricsServerTest, ConcurrentUpdatesDoNotCrash) {
   constexpr int kThreads = 8;
-  constexpr int kIters   = 500;
+  constexpr int kIters = 500;
 
   std::vector<std::thread> threads;
   threads.reserve(kThreads);
@@ -285,8 +304,7 @@ TEST_F(PrometheusMetricsServerTest, ConcurrentUpdatesDoNotCrash) {
         server_->setGauge("concurrent_gauge", "Concurrent gauge",
                           static_cast<double>(t * kIters + i));
         server_->addCounter("concurrent_counter", "Concurrent counter");
-        server_->observe("concurrent_hist", "Concurrent histogram",
-                         {0.1, 1.0, 10.0},
+        server_->observe("concurrent_hist", "Concurrent histogram", {0.1, 1.0, 10.0},
                          static_cast<double>(i % 10) * 0.1);
       }
     });
@@ -296,14 +314,13 @@ TEST_F(PrometheusMetricsServerTest, ConcurrentUpdatesDoNotCrash) {
 
   // After all writers finish, a scrape must succeed without crashing.
   auto body = scrape();
-  EXPECT_NE(body.find("concurrent_gauge"),   std::string::npos);
+  EXPECT_NE(body.find("concurrent_gauge"), std::string::npos);
   EXPECT_NE(body.find("concurrent_counter"), std::string::npos);
-  EXPECT_NE(body.find("concurrent_hist"),    std::string::npos);
+  EXPECT_NE(body.find("concurrent_hist"), std::string::npos);
 
   // Counter must equal kThreads * kIters.
   const uint64_t expected = static_cast<uint64_t>(kThreads) * kIters;
-  EXPECT_NE(body.find("concurrent_counter " + std::to_string(expected)),
-            std::string::npos);
+  EXPECT_NE(body.find("concurrent_counter " + std::to_string(expected)), std::string::npos);
 }
 
 // ---------------------------------------------------------------------------

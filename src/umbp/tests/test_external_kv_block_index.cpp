@@ -32,7 +32,8 @@ namespace mori::umbp {
 
 // ---- Helpers ----------------------------------------------------------------
 
-static std::vector<std::string> SortedNodeIds(const std::vector<ExternalKvBlockIndex::NodeMatch>& ms) {
+static std::vector<std::string> SortedNodeIds(
+    const std::vector<ExternalKvBlockIndex::NodeMatch>& ms) {
   std::vector<std::string> ids;
   for (const auto& m : ms) ids.push_back(m.node_id);
   std::sort(ids.begin(), ids.end());
