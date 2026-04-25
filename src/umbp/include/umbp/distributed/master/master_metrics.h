@@ -70,6 +70,8 @@
 
 #define MORI_UMBP_METRIC_EXT_KV_LIVE_COUNT_PREFIX "mori_umbp_external_kv_live_count_"
 #define MORI_UMBP_METRIC_EXT_KV_LIVE_COUNT_HELP_PREFIX "Live external KV block count for node "
+#define MORI_UMBP_METRIC_EXT_KV_LIVE_COUNT "mori_umbp_external_kv_live_count"
+#define MORI_UMBP_METRIC_EXT_KV_LIVE_COUNT_HELP "Live external KV block count"
 
 // --- Alive client count (gauge) --------------------------------------------
 
@@ -81,21 +83,31 @@
 
 #define MORI_UMBP_METRIC_CLIENT_CAPACITY_TOTAL_PREFIX "mori_umbp_client_capacity_total_bytes_"
 #define MORI_UMBP_METRIC_CLIENT_CAPACITY_TOTAL_HELP_PREFIX "Total capacity bytes for client "
+#define MORI_UMBP_METRIC_CLIENT_CAPACITY_TOTAL "mori_umbp_client_capacity_total_bytes"
+#define MORI_UMBP_METRIC_CLIENT_CAPACITY_TOTAL_HELP "Total capacity bytes"
 
 #define MORI_UMBP_METRIC_CLIENT_CAPACITY_AVAIL_PREFIX "mori_umbp_client_capacity_available_bytes_"
 #define MORI_UMBP_METRIC_CLIENT_CAPACITY_AVAIL_HELP_PREFIX "Available capacity bytes for client "
+#define MORI_UMBP_METRIC_CLIENT_CAPACITY_AVAIL "mori_umbp_client_capacity_available_bytes"
+#define MORI_UMBP_METRIC_CLIENT_CAPACITY_AVAIL_HELP "Available capacity bytes"
 
 // --- Per-client RPC call counters ------------------------------------------
 // Full name: prefix + sanitized_node_id
 
 #define MORI_UMBP_METRIC_CLIENT_ROUTE_PUT_PREFIX "mori_umbp_client_route_put_total_"
 #define MORI_UMBP_METRIC_CLIENT_ROUTE_PUT_HELP_PREFIX "Total RoutePut calls targeting client "
+#define MORI_UMBP_METRIC_CLIENT_ROUTE_PUT "mori_umbp_client_route_put_total"
+#define MORI_UMBP_METRIC_CLIENT_ROUTE_PUT_HELP "Total RoutePut calls targeting client"
 
 #define MORI_UMBP_METRIC_CLIENT_ROUTE_GET_PREFIX "mori_umbp_client_route_get_total_"
 #define MORI_UMBP_METRIC_CLIENT_ROUTE_GET_HELP_PREFIX "Total RouteGet hits served by client "
+#define MORI_UMBP_METRIC_CLIENT_ROUTE_GET "mori_umbp_client_route_get_total"
+#define MORI_UMBP_METRIC_CLIENT_ROUTE_GET_HELP "Total RouteGet hits served by client"
 
 #define MORI_UMBP_METRIC_CLIENT_LOOKUP_PREFIX "mori_umbp_client_lookup_total_"
 #define MORI_UMBP_METRIC_CLIENT_LOOKUP_HELP_PREFIX "Total Lookup (exists) hits for keys on client "
+#define MORI_UMBP_METRIC_CLIENT_LOOKUP "mori_umbp_client_lookup_total"
+#define MORI_UMBP_METRIC_CLIENT_LOOKUP_HELP "Total Lookup (exists) hits for keys on client"
 
 // --- Per-client batch RPC call counters ------------------------------------
 // Full name: prefix + sanitized_node_id
@@ -103,10 +115,14 @@
 #define MORI_UMBP_METRIC_CLIENT_BATCH_ROUTE_PUT_PREFIX "mori_umbp_client_batch_route_put_total_"
 #define MORI_UMBP_METRIC_CLIENT_BATCH_ROUTE_PUT_HELP_PREFIX \
   "Total BatchRoutePut entries targeting client "
+#define MORI_UMBP_METRIC_CLIENT_BATCH_ROUTE_PUT "mori_umbp_client_batch_route_put_total"
+#define MORI_UMBP_METRIC_CLIENT_BATCH_ROUTE_PUT_HELP "Total BatchRoutePut entries targeting client"
 
 #define MORI_UMBP_METRIC_CLIENT_BATCH_ROUTE_GET_PREFIX "mori_umbp_client_batch_route_get_total_"
 #define MORI_UMBP_METRIC_CLIENT_BATCH_ROUTE_GET_HELP_PREFIX \
   "Total BatchRouteGet hits served by client "
+#define MORI_UMBP_METRIC_CLIENT_BATCH_ROUTE_GET "mori_umbp_client_batch_route_get_total"
+#define MORI_UMBP_METRIC_CLIENT_BATCH_ROUTE_GET_HELP "Total BatchRouteGet hits served by client"
 
 // --- Core block management API call counters --------------------------------
 
