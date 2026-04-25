@@ -95,11 +95,16 @@ class MetricsServer {
   // Metric update API (all methods are thread-safe)
   // ------------------------------------------------------------------
 
+  using Labels = std::vector<std::pair<std::string, std::string>>;
+
   // Overwrite the current value of a gauge.
   void setGauge(std::string_view name, std::string_view help, double value);
+  void setGauge(std::string_view name, std::string_view help, const Labels& labels, double value);
 
   // Add `delta` to a monotonically-increasing counter (default delta = 1).
   void addCounter(std::string_view name, std::string_view help, uint64_t delta = 1);
+  void addCounter(std::string_view name, std::string_view help, const Labels& labels,
+                  uint64_t delta = 1);
 
   // Record one histogram observation.
   // `bounds` is an ascending list of finite upper-bound values; the implicit
@@ -126,6 +131,16 @@ class MetricsServer {
   struct CounterEntry {
     std::string help;
     uint64_t value{0};
+  };
+
+  struct LabeledCounterFamily {
+    std::string help;
+    std::map<std::string, uint64_t> series;
+  };
+
+  struct LabeledGaugeFamily {
+    std::string help;
+    std::map<std::string, double> series;
   };
 
   struct HistogramEntry {
@@ -158,6 +173,8 @@ class MetricsServer {
   std::map<std::string, GaugeEntry> gauges_;
   std::map<std::string, CounterEntry> counters_;
   std::map<std::string, HistogramEntry> histograms_;
+  std::map<std::string, LabeledGaugeFamily> labeled_gauges_;
+  std::map<std::string, LabeledCounterFamily> labeled_counters_;
 };
 
 }  // namespace metrics

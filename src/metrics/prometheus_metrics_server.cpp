@@ -173,6 +173,39 @@ void MetricsServer::observe(std::string_view name, std::string_view help,
 }
 
 // ---------------------------------------------------------------------------
+// Labeled metric API
+// ---------------------------------------------------------------------------
+
+static std::string FormatLabels(const mori::metrics::MetricsServer::Labels& labels) {
+  if (labels.empty()) return "";
+  std::string s = "{";
+  for (std::size_t i = 0; i < labels.size(); ++i) {
+    if (i > 0) s += ",";
+    s += labels[i].first + "=\"" + labels[i].second + "\"";
+  }
+  s += "}";
+  return s;
+}
+
+void MetricsServer::addCounter(std::string_view name, std::string_view help, const Labels& labels,
+                               uint64_t delta) {
+  auto label_str = FormatLabels(labels);
+  std::lock_guard<std::mutex> lk(mutex_);
+  auto& family = labeled_counters_[std::string(name)];
+  family.help = help;
+  family.series[label_str] += delta;
+}
+
+void MetricsServer::setGauge(std::string_view name, std::string_view help, const Labels& labels,
+                             double value) {
+  auto label_str = FormatLabels(labels);
+  std::lock_guard<std::mutex> lk(mutex_);
+  auto& family = labeled_gauges_[std::string(name)];
+  family.help = help;
+  family.series[label_str] = value;
+}
+
+// ---------------------------------------------------------------------------
 // Serialisation (Prometheus text format 0.0.4)
 // ---------------------------------------------------------------------------
 
@@ -191,6 +224,26 @@ std::string MetricsServer::serializeLocked() const {
     out << "# HELP " << name << " " << c.help << "\n";
     out << "# TYPE " << name << " counter\n";
     out << name << " " << c.value << "\n\n";
+  }
+
+  // Labeled gauges
+  for (const auto& [name, family] : labeled_gauges_) {
+    out << "# HELP " << name << " " << family.help << "\n";
+    out << "# TYPE " << name << " gauge\n";
+    for (const auto& [label_str, value] : family.series) {
+      out << name << label_str << " " << value << "\n";
+    }
+    out << "\n";
+  }
+
+  // Labeled counters
+  for (const auto& [name, family] : labeled_counters_) {
+    out << "# HELP " << name << " " << family.help << "\n";
+    out << "# TYPE " << name << " counter\n";
+    for (const auto& [label_str, value] : family.series) {
+      out << name << label_str << " " << value << "\n";
+    }
+    out << "\n";
   }
 
   // Histograms

@@ -233,9 +233,8 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     response->set_found(!locations.empty());
     if (metrics_) {
       for (const auto& loc : locations) {
-        auto safe_node = mori::metrics::MetricsServer::SanitizeName(loc.node_id);
-        metrics_->addCounter(std::string(MORI_UMBP_METRIC_CLIENT_LOOKUP_PREFIX) + safe_node,
-                             std::string(MORI_UMBP_METRIC_CLIENT_LOOKUP_HELP_PREFIX) + loc.node_id);
+        metrics_->addCounter(MORI_UMBP_METRIC_CLIENT_LOOKUP, MORI_UMBP_METRIC_CLIENT_LOOKUP_HELP,
+                             {{"node", loc.node_id}});
       }
     }
     return grpc::Status::OK;
@@ -356,10 +355,8 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     }
 
     if (metrics_) {
-      auto safe_node = mori::metrics::MetricsServer::SanitizeName(result->node_id);
-      metrics_->addCounter(
-          std::string(MORI_UMBP_METRIC_CLIENT_ROUTE_GET_PREFIX) + safe_node,
-          std::string(MORI_UMBP_METRIC_CLIENT_ROUTE_GET_HELP_PREFIX) + result->node_id);
+      metrics_->addCounter(MORI_UMBP_METRIC_CLIENT_ROUTE_GET,
+                           MORI_UMBP_METRIC_CLIENT_ROUTE_GET_HELP, {{"node", result->node_id}});
     }
     MORI_UMBP_INFO("[Master] RouteGet key='{}': node={}, location={}", request->key(),
                    result->node_id, result->location_id);
@@ -400,10 +397,8 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     response->set_page_size(result->page_size);
 
     if (metrics_) {
-      auto safe_node = mori::metrics::MetricsServer::SanitizeName(result->node_id);
-      metrics_->addCounter(
-          std::string(MORI_UMBP_METRIC_CLIENT_ROUTE_PUT_PREFIX) + safe_node,
-          std::string(MORI_UMBP_METRIC_CLIENT_ROUTE_PUT_HELP_PREFIX) + result->node_id);
+      metrics_->addCounter(MORI_UMBP_METRIC_CLIENT_ROUTE_PUT,
+                           MORI_UMBP_METRIC_CLIENT_ROUTE_PUT_HELP, {{"node", result->node_id}});
     }
     MORI_UMBP_INFO("[Master] RoutePut key='{}': target_node={}, tier={}, location='{}', pages={}",
                    request->key(), result->node_id, TierTypeName(result->tier), result->location_id,
@@ -456,11 +451,9 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     if (metrics_) {
       for (size_t i = 0; i < results.size(); ++i) {
         if (results[i].has_value()) {
-          auto safe_node = mori::metrics::MetricsServer::SanitizeName(results[i]->node_id);
-          metrics_->addCounter(
-              std::string(MORI_UMBP_METRIC_CLIENT_BATCH_ROUTE_PUT_PREFIX) + safe_node,
-              std::string(MORI_UMBP_METRIC_CLIENT_BATCH_ROUTE_PUT_HELP_PREFIX) +
-                  results[i]->node_id);
+          metrics_->addCounter(MORI_UMBP_METRIC_CLIENT_BATCH_ROUTE_PUT,
+                               MORI_UMBP_METRIC_CLIENT_BATCH_ROUTE_PUT_HELP,
+                               {{"node", results[i]->node_id}});
         }
       }
     }
@@ -520,11 +513,9 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     if (metrics_) {
       for (size_t i = 0; i < results.size(); ++i) {
         if (results[i].has_value()) {
-          auto safe_node = mori::metrics::MetricsServer::SanitizeName(results[i]->node_id);
-          metrics_->addCounter(
-              std::string(MORI_UMBP_METRIC_CLIENT_BATCH_ROUTE_GET_PREFIX) + safe_node,
-              std::string(MORI_UMBP_METRIC_CLIENT_BATCH_ROUTE_GET_HELP_PREFIX) +
-                  results[i]->node_id);
+          metrics_->addCounter(MORI_UMBP_METRIC_CLIENT_BATCH_ROUTE_GET,
+                               MORI_UMBP_METRIC_CLIENT_BATCH_ROUTE_GET_HELP,
+                               {{"node", results[i]->node_id}});
         }
       }
     }
@@ -641,14 +632,14 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
 
     if (metrics_) {
       metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_REPORT_TOTAL,
-                           MORI_UMBP_METRIC_EXT_KV_REPORT_TOTAL_HELP);
+                           MORI_UMBP_METRIC_EXT_KV_REPORT_TOTAL_HELP,
+                           {{"node", request->node_id()}});
       metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_REPORT_BLOCKS_TOTAL,
                            MORI_UMBP_METRIC_EXT_KV_REPORT_BLOCKS_TOTAL_HELP,
-                           static_cast<uint64_t>(hashes.size()));
+                           {{"node", request->node_id()}}, static_cast<uint64_t>(hashes.size()));
       const size_t kv_count = external_kv_index_.GetKvCount(request->node_id());
-      metrics_->setGauge(MORI_UMBP_METRIC_EXT_KV_LIVE_COUNT_PREFIX +
-                             mori::metrics::MetricsServer::SanitizeName(request->node_id()),
-                         MORI_UMBP_METRIC_EXT_KV_LIVE_COUNT_HELP_PREFIX + request->node_id(),
+      metrics_->setGauge(MORI_UMBP_METRIC_EXT_KV_LIVE_COUNT,
+                         MORI_UMBP_METRIC_EXT_KV_LIVE_COUNT_HELP, {{"node", request->node_id()}},
                          static_cast<double>(kv_count));
     }
 
@@ -672,14 +663,14 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
 
     if (metrics_) {
       metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_REVOKE_TOTAL,
-                           MORI_UMBP_METRIC_EXT_KV_REVOKE_TOTAL_HELP);
+                           MORI_UMBP_METRIC_EXT_KV_REVOKE_TOTAL_HELP,
+                           {{"node", request->node_id()}});
       metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_REVOKE_BLOCKS_TOTAL,
                            MORI_UMBP_METRIC_EXT_KV_REVOKE_BLOCKS_TOTAL_HELP,
-                           static_cast<uint64_t>(hashes.size()));
+                           {{"node", request->node_id()}}, static_cast<uint64_t>(hashes.size()));
       const size_t kv_count = external_kv_index_.GetKvCount(request->node_id());
-      metrics_->setGauge(MORI_UMBP_METRIC_EXT_KV_LIVE_COUNT_PREFIX +
-                             mori::metrics::MetricsServer::SanitizeName(request->node_id()),
-                         MORI_UMBP_METRIC_EXT_KV_LIVE_COUNT_HELP_PREFIX + request->node_id(),
+      metrics_->setGauge(MORI_UMBP_METRIC_EXT_KV_LIVE_COUNT,
+                         MORI_UMBP_METRIC_EXT_KV_LIVE_COUNT_HELP, {{"node", request->node_id()}},
                          static_cast<double>(kv_count));
     }
 
@@ -747,17 +738,14 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
   void UpdateClientCapacityMetrics(const std::string& node_id,
                                    const std::map<TierType, TierCapacity>& caps) {
     if (!metrics_) return;
-    auto safe_node = mori::metrics::MetricsServer::SanitizeName(node_id);
     for (const auto& [tier, cap] : caps) {
       const char* tier_name = TierTypeName(tier);
-      std::string suffix = safe_node + "_" + tier_name;
-      metrics_->setGauge(std::string(MORI_UMBP_METRIC_CLIENT_CAPACITY_TOTAL_PREFIX) + suffix,
-                         std::string(MORI_UMBP_METRIC_CLIENT_CAPACITY_TOTAL_HELP_PREFIX) + node_id +
-                             " " + tier_name,
+      mori::metrics::MetricsServer::Labels labels = {{"node", node_id}, {"tier", tier_name}};
+      metrics_->setGauge(MORI_UMBP_METRIC_CLIENT_CAPACITY_TOTAL,
+                         MORI_UMBP_METRIC_CLIENT_CAPACITY_TOTAL_HELP, labels,
                          static_cast<double>(cap.total_bytes));
-      metrics_->setGauge(std::string(MORI_UMBP_METRIC_CLIENT_CAPACITY_AVAIL_PREFIX) + suffix,
-                         std::string(MORI_UMBP_METRIC_CLIENT_CAPACITY_AVAIL_HELP_PREFIX) + node_id +
-                             " " + tier_name,
+      metrics_->setGauge(MORI_UMBP_METRIC_CLIENT_CAPACITY_AVAIL,
+                         MORI_UMBP_METRIC_CLIENT_CAPACITY_AVAIL_HELP, labels,
                          static_cast<double>(cap.available_bytes));
     }
   }
