@@ -12,5 +12,6 @@ RUN apt-get update && \
     git ibverbs-utils libibverbs-dev \
     openmpi-bin libopenmpi-dev \
     libpci-dev libdw1 locales \
-    libgrpc-dev libgrpc++-dev libprotobuf-dev protobuf-compiler-grpc && \
+    libgrpc-dev libgrpc++-dev libprotobuf-dev protobuf-compiler-grpc \
+    cmake && \
     rm -rf /var/lib/apt/lists/*
