@@ -327,7 +327,7 @@ jobs:
       matrix:
         include:
           - platform: MI355X_AINIC
-            runner: [self-hosted, MI355X-AINIC]
+            runner: [self-hosted, MI355X-AINIC-TW]
     timeout-minutes: 30
     steps:
       - name: Checkout
