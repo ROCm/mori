@@ -21,6 +21,8 @@
 // SOFTWARE.
 #pragma once
 
+#include <grpcpp/server.h>
+
 #include <memory>
 #include <string>
 
@@ -33,10 +35,6 @@
 #include "umbp/distributed/routing/route_get_strategy.h"
 #include "umbp/distributed/routing/route_put_strategy.h"
 #include "umbp/distributed/routing/router.h"
-
-namespace grpc_impl {
-class Server;
-}
 
 namespace mori::umbp {
 
@@ -59,7 +57,7 @@ class MasterServer {
   Router router_;
 
   std::unique_ptr<mori::metrics::MetricsServer> metrics_server_;
-  std::unique_ptr<grpc_impl::Server> server_;
+  std::unique_ptr<grpc::Server> server_;
 
   class UMBPMasterServiceImpl;
   std::unique_ptr<UMBPMasterServiceImpl> service_;
