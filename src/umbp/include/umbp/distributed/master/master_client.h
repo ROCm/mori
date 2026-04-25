@@ -21,6 +21,7 @@
 // SOFTWARE.
 #pragma once
 
+#include <grpcpp/channel.h>
 #include <grpcpp/support/status.h>
 
 #include <atomic>
@@ -36,10 +37,6 @@
 #include "umbp/distributed/config.h"
 #include "umbp/distributed/routing/route_put_strategy.h"
 #include "umbp/distributed/types.h"
-
-namespace grpc_impl {
-class Channel;
-}
 
 namespace mori::umbp {
 
@@ -159,7 +156,7 @@ class MasterClient {
  private:
   UMBPMasterClientConfig config_;
 
-  std::shared_ptr<grpc_impl::Channel> channel_;
+  std::shared_ptr<grpc::Channel> channel_;
   // Use void* to avoid exposing generated stub type in header.
   // Cast to UMBPMaster::Stub* in the .cpp file.
   std::unique_ptr<void, void (*)(void*)> stub_;

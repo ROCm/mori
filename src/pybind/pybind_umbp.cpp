@@ -164,26 +164,37 @@ void RegisterMoriUmbp(py::module_& m) {
   py::class_<IUMBPClient, std::unique_ptr<IUMBPClient>>(m, "UMBPClient")
       .def(py::init([](const UMBPConfig& cfg) { return CreateUMBPClient(cfg); }),
            py::arg("config") = UMBPConfig{})
-      .def("put_from_ptr", &IUMBPClient::Put, py::arg("key"), py::arg("src"), py::arg("size"))
-      .def("get_into_ptr", &IUMBPClient::Get, py::arg("key"), py::arg("dst"), py::arg("size"))
-      .def("exists", &IUMBPClient::Exists, py::arg("key"))
+      // All I/O-path methods release the GIL: they block on RDMA, SSD, or gRPC
+      // and never call back into Python, so releasing is always safe.
+      .def("put_from_ptr", &IUMBPClient::Put, py::arg("key"), py::arg("src"), py::arg("size"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("get_into_ptr", &IUMBPClient::Get, py::arg("key"), py::arg("dst"), py::arg("size"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("exists", &IUMBPClient::Exists, py::arg("key"), py::call_guard<py::gil_scoped_release>())
       .def("batch_put_from_ptr", &IUMBPClient::BatchPut, py::arg("keys"), py::arg("ptrs"),
-           py::arg("sizes"))
+           py::arg("sizes"), py::call_guard<py::gil_scoped_release>())
       .def("batch_put_from_ptr_with_depth", &IUMBPClient::BatchPutWithDepth, py::arg("keys"),
-           py::arg("ptrs"), py::arg("sizes"), py::arg("depths"))
+           py::arg("ptrs"), py::arg("sizes"), py::arg("depths"),
+           py::call_guard<py::gil_scoped_release>())
       .def("batch_get_into_ptr", &IUMBPClient::BatchGet, py::arg("keys"), py::arg("ptrs"),
-           py::arg("sizes"))
-      .def("batch_exists", &IUMBPClient::BatchExists, py::arg("keys"))
-      .def("batch_exists_consecutive", &IUMBPClient::BatchExistsConsecutive, py::arg("keys"))
-      .def("clear", &IUMBPClient::Clear)
-      .def("flush", &IUMBPClient::Flush)
-      .def("is_distributed", &IUMBPClient::IsDistributed)
-      .def("register_memory", &IUMBPClient::RegisterMemory, py::arg("ptr"), py::arg("size"))
-      .def("deregister_memory", &IUMBPClient::DeregisterMemory, py::arg("ptr"))
+           py::arg("sizes"), py::call_guard<py::gil_scoped_release>())
+      .def("batch_exists", &IUMBPClient::BatchExists, py::arg("keys"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("batch_exists_consecutive", &IUMBPClient::BatchExistsConsecutive, py::arg("keys"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("clear", &IUMBPClient::Clear, py::call_guard<py::gil_scoped_release>())
+      .def("flush", &IUMBPClient::Flush, py::call_guard<py::gil_scoped_release>())
+      .def("is_distributed", &IUMBPClient::IsDistributed)  // pure getter, no I/O
+      .def("register_memory", &IUMBPClient::RegisterMemory, py::arg("ptr"), py::arg("size"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("deregister_memory", &IUMBPClient::DeregisterMemory, py::arg("ptr"),
+           py::call_guard<py::gil_scoped_release>())
       .def("report_external_kv_blocks", &IUMBPClient::ReportExternalKvBlocks, py::arg("hashes"),
-           py::arg("tier"))
-      .def("revoke_external_kv_blocks", &IUMBPClient::RevokeExternalKvBlocks, py::arg("hashes"))
-      .def("match_external_kv", &IUMBPClient::MatchExternalKv, py::arg("hashes"));
+           py::arg("tier"), py::call_guard<py::gil_scoped_release>())
+      .def("revoke_external_kv_blocks", &IUMBPClient::RevokeExternalKvBlocks, py::arg("hashes"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("match_external_kv", &IUMBPClient::MatchExternalKv, py::arg("hashes"),
+           py::call_guard<py::gil_scoped_release>());
 
   // UMBPMasterClient is a read-only query client for the UMBP master.
   // It is intended solely for information lookup (e.g. matching external KV
@@ -224,14 +235,17 @@ void RegisterMoriUmbp(py::module_& m) {
             if (!status.ok())
               throw std::runtime_error("RegisterSelf failed: " + status.error_message());
           },
-          py::arg("tier_capacities") = std::map<TierType, std::pair<uint64_t, uint64_t>>{})
-      .def("unregister_self",
-           [](MasterClient& self) {
-             auto status = self.UnregisterSelf();
-             if (!status.ok())
-               throw std::runtime_error("UnregisterSelf failed: " + status.error_message());
-           })
-      .def("is_registered", &MasterClient::IsRegistered)
+          py::arg("tier_capacities") = std::map<TierType, std::pair<uint64_t, uint64_t>>{},
+          py::call_guard<py::gil_scoped_release>())
+      .def(
+          "unregister_self",
+          [](MasterClient& self) {
+            auto status = self.UnregisterSelf();
+            if (!status.ok())
+              throw std::runtime_error("UnregisterSelf failed: " + status.error_message());
+          },
+          py::call_guard<py::gil_scoped_release>())
+      .def("is_registered", &MasterClient::IsRegistered)  // pure getter, no I/O
       .def(
           "report_external_kv_blocks",
           [](MasterClient& self, const std::string& node_id, const std::vector<std::string>& hashes,
@@ -240,7 +254,8 @@ void RegisterMoriUmbp(py::module_& m) {
             if (!status.ok())
               throw std::runtime_error("ReportExternalKvBlocks failed: " + status.error_message());
           },
-          py::arg("node_id"), py::arg("hashes"), py::arg("tier"))
+          py::arg("node_id"), py::arg("hashes"), py::arg("tier"),
+          py::call_guard<py::gil_scoped_release>())
       .def(
           "revoke_external_kv_blocks",
           [](MasterClient& self, const std::string& node_id,
@@ -249,7 +264,7 @@ void RegisterMoriUmbp(py::module_& m) {
             if (!status.ok())
               throw std::runtime_error("RevokeExternalKvBlocks failed: " + status.error_message());
           },
-          py::arg("node_id"), py::arg("hashes"))
+          py::arg("node_id"), py::arg("hashes"), py::call_guard<py::gil_scoped_release>())
       .def(
           "match_external_kv",
           [](MasterClient& self, const std::vector<std::string>& hashes) {
@@ -259,7 +274,7 @@ void RegisterMoriUmbp(py::module_& m) {
               throw std::runtime_error("MatchExternalKv failed: " + status.error_message());
             return matches;
           },
-          py::arg("hashes"));
+          py::arg("hashes"), py::call_guard<py::gil_scoped_release>());
 }
 
 }  // namespace mori
