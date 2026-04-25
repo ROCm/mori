@@ -222,7 +222,7 @@ constexpr const char* IO = "io";
 constexpr const char* SHMEM = "shmem";
 constexpr const char* CORE = "core";
 constexpr const char* OPS = "ops";
-constexpr const char* UMBP    = "umbp";
+constexpr const char* UMBP = "umbp";
 constexpr const char* METRICS = "metrics";
 }  // namespace modules
 
