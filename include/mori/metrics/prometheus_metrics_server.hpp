@@ -113,6 +113,8 @@ class MetricsServer {
   // `bounds` and reuse the stored layout.
   void observe(std::string_view name, std::string_view help, const std::vector<double>& bounds,
                double value);
+  void observe(std::string_view name, std::string_view help, const Labels& labels,
+               const std::vector<double>& bounds, double value);
 
   // ------------------------------------------------------------------
   // Accessors
@@ -151,6 +153,17 @@ class MetricsServer {
     double sum{0.0};
   };
 
+  struct LabeledHistogramFamily {
+    std::string help;
+    struct Series {
+      std::vector<double> bounds;
+      std::vector<uint64_t> bucket_counts;
+      uint64_t count{0};
+      double sum{0.0};
+    };
+    std::map<std::string, Series> series;
+  };
+
   // ---- internal helpers ---------------------------------------------
 
   // Serialise all metrics to Prometheus text format (caller must hold mutex_).
@@ -175,6 +188,7 @@ class MetricsServer {
   std::map<std::string, HistogramEntry> histograms_;
   std::map<std::string, LabeledGaugeFamily> labeled_gauges_;
   std::map<std::string, LabeledCounterFamily> labeled_counters_;
+  std::map<std::string, LabeledHistogramFamily> labeled_histograms_;
 };
 
 }  // namespace metrics

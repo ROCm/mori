@@ -116,3 +116,12 @@ target_link_libraries(
           gtest_main)
 add_test(NAME umbp_master_client_lifecycle
          COMMAND test_umbp_master_client_lifecycle)
+
+add_executable(test_umbp_client_metrics test_umbp_client_metrics.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_umbp_client_metrics PRIVATE -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  test_umbp_client_metrics PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB}
+                                   ${_TEST_GRPCPP_LIB} gtest)
+add_test(NAME umbp_client_metrics COMMAND test_umbp_client_metrics)

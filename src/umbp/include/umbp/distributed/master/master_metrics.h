@@ -124,6 +124,16 @@
 #define MORI_UMBP_METRIC_CLIENT_BATCH_ROUTE_GET "mori_umbp_client_batch_route_get_total"
 #define MORI_UMBP_METRIC_CLIENT_BATCH_ROUTE_GET_HELP "Total BatchRouteGet hits served by client"
 
+// --- Per-client traffic byte counters (reported by clients) ----------------
+
+#define MORI_UMBP_METRIC_CLIENT_PUT_BYTES_TOTAL "mori_umbp_client_put_bytes_total"
+#define MORI_UMBP_METRIC_CLIENT_PUT_BYTES_TOTAL_HELP \
+  "Total bytes written per client split by local/remote traffic"
+
+#define MORI_UMBP_METRIC_CLIENT_GET_BYTES_TOTAL "mori_umbp_client_get_bytes_total"
+#define MORI_UMBP_METRIC_CLIENT_GET_BYTES_TOTAL_HELP \
+  "Total bytes read per client split by local/remote traffic"
+
 // --- Core block management API call counters --------------------------------
 
 #define MORI_UMBP_METRIC_REGISTER_TOTAL "mori_umbp_register_total"
@@ -177,3 +187,15 @@
   "mori_umbp_batch_abort_allocation_entries_total"
 #define MORI_UMBP_METRIC_BATCH_ABORT_ALLOCATION_ENTRIES_TOTAL_HELP \
   "Total entries processed across all BatchAbortAllocation calls"
+
+// --- Per-client batch bandwidth histograms (reported by clients) -----------
+
+#define MORI_UMBP_METRIC_CLIENT_BATCH_PUT_BANDWIDTH "mori_umbp_client_batch_put_bandwidth_gibps"
+#define MORI_UMBP_METRIC_CLIENT_BATCH_PUT_BANDWIDTH_HELP                                           \
+  "BatchPut e2e call bandwidth in GiB/s (successful bytes only, split by client and local/remote " \
+  "traffic)"
+
+#define MORI_UMBP_METRIC_CLIENT_BATCH_GET_BANDWIDTH "mori_umbp_client_batch_get_bandwidth_gibps"
+#define MORI_UMBP_METRIC_CLIENT_BATCH_GET_BANDWIDTH_HELP                                           \
+  "BatchGet e2e call bandwidth in GiB/s (successful bytes only, split by client and local/remote " \
+  "traffic)"

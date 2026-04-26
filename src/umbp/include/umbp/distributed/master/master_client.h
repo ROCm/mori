@@ -32,6 +32,8 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "umbp/distributed/config.h"
@@ -52,6 +54,8 @@ struct RouteGetResult {
 
 class MasterClient {
  public:
+  using Labels = std::vector<std::pair<std::string, std::string>>;
+
   explicit MasterClient(const UMBPMasterClientConfig& config);
   ~MasterClient();
 
@@ -136,6 +140,15 @@ class MasterClient {
   void StartHeartbeat();
   void StopHeartbeat();
 
+  // --- Client-side metrics ---
+  // Buffer a counter delta. Flushed to master via ReportMetrics RPC periodically.
+  void AddCounter(std::string name, std::string help, Labels labels, double delta);
+  // Buffer a gauge value (last write wins between flushes).
+  void SetGauge(std::string name, std::string help, Labels labels, double value);
+  // Buffer a histogram observation.
+  void Observe(std::string name, std::string help, Labels labels, std::vector<double> bounds,
+               double value);
+
   bool IsRegistered() const { return registered_; }
 
   // --- External KV block events ---
@@ -174,6 +187,37 @@ class MasterClient {
   std::map<TierType, TierCapacity> current_capacities_;
 
   void HeartbeatLoop();
+
+  // --- Metrics buffering ---
+  struct PendingSample {
+    std::string name;
+    std::string help;
+    Labels labels;
+    double value = 0.0;
+  };
+  struct PendingHistogram {
+    std::string name;
+    std::string help;
+    Labels labels;
+    std::vector<double> bounds;
+    double value = 0.0;
+  };
+
+  std::mutex metrics_mutex_;
+  std::unordered_map<std::string, PendingSample> pending_counters_;
+  std::unordered_map<std::string, PendingSample> pending_gauges_;
+  std::vector<PendingHistogram> pending_histograms_;
+
+  uint64_t metrics_interval_ms_ = 1000;
+
+  std::thread metrics_thread_;
+  std::atomic<bool> metrics_running_{false};
+  std::mutex metrics_cv_mutex_;
+  std::condition_variable metrics_cv_;
+
+  void StartMetricsReporting();
+  void StopMetricsReporting();
+  void MetricsLoop();
 };
 
 }  // namespace mori::umbp

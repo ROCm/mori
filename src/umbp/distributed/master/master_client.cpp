@@ -29,6 +29,7 @@
 #include "mori/utils/mori_log.hpp"
 #include "umbp.grpc.pb.h"
 #include "umbp/common/env_time.h"
+#include "umbp/distributed/master/master_metrics.h"
 
 namespace mori::umbp {
 
@@ -45,6 +46,14 @@ int RpcShutdownTimeoutMs() {
       static_cast<int>(GetEnvMilliseconds("UMBP_RPC_SHUTDOWN_TIMEOUT_MS",
                                           std::chrono::milliseconds(3000), /*min_allowed=*/1)
                            .count());
+  return v;
+}
+
+uint64_t MetricsReportIntervalMs() {
+  static const uint64_t v =
+      static_cast<uint64_t>(GetEnvMilliseconds("UMBP_METRICS_REPORT_INTERVAL_MS",
+                                               std::chrono::milliseconds(1000), /*min_allowed=*/1)
+                                .count());
   return v;
 }
 }  // namespace
@@ -66,10 +75,12 @@ MasterClient::MasterClient(const UMBPMasterClientConfig& config)
       stub_(nullptr, [](void* p) { delete static_cast<::umbp::UMBPMaster::Stub*>(p); }) {
   channel_ = grpc::CreateChannel(config.master_address, grpc::InsecureChannelCredentials());
   stub_.reset(::umbp::UMBPMaster::NewStub(channel_).release());
+  metrics_interval_ms_ = MetricsReportIntervalMs();
   MORI_UMBP_INFO("[Client] Created, master={}", config.master_address);
 }
 
 MasterClient::~MasterClient() {
+  StopMetricsReporting();
   StopHeartbeat();
   if (registered_) {
     UnregisterSelf();
@@ -137,6 +148,7 @@ grpc::Status MasterClient::RegisterSelf(
   if (config_.auto_heartbeat) {
     StartHeartbeat();
   }
+  StartMetricsReporting();
 
   return grpc::Status::OK;
 }
@@ -897,6 +909,174 @@ void MasterClient::HeartbeatLoop() {
           MORI_UMBP_WARN("[Client] Re-registration failed: {}", re_status.error_message());
         }
       }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+//  Client-side metrics: buffering API
+// ---------------------------------------------------------------------------
+
+namespace {
+std::string MetricKey(const std::string& name, const MasterClient::Labels& labels) {
+  std::string key = name;
+  for (const auto& [k, v] : labels) {
+    key += '|';
+    key += k;
+    key += '=';
+    key += v;
+  }
+  return key;
+}
+}  // namespace
+
+void MasterClient::AddCounter(std::string name, std::string help, Labels labels, double delta) {
+  std::lock_guard lock(metrics_mutex_);
+  auto key = MetricKey(name, labels);
+  auto& s = pending_counters_[key];
+  s.name = std::move(name);
+  s.help = std::move(help);
+  s.labels = std::move(labels);
+  s.value += delta;
+}
+
+void MasterClient::SetGauge(std::string name, std::string help, Labels labels, double value) {
+  std::lock_guard lock(metrics_mutex_);
+  auto key = MetricKey(name, labels);
+  auto& s = pending_gauges_[key];
+  s.name = std::move(name);
+  s.help = std::move(help);
+  s.labels = std::move(labels);
+  s.value = value;
+}
+
+void MasterClient::Observe(std::string name, std::string help, Labels labels,
+                           std::vector<double> bounds, double value) {
+  std::lock_guard lock(metrics_mutex_);
+  pending_histograms_.push_back(
+      {std::move(name), std::move(help), std::move(labels), std::move(bounds), value});
+}
+
+// ---------------------------------------------------------------------------
+//  Client-side metrics: background flush thread
+// ---------------------------------------------------------------------------
+
+void MasterClient::StartMetricsReporting() {
+  if (!registered_) {
+    MORI_UMBP_WARN("[Client] StartMetricsReporting ignored: not registered");
+    return;
+  }
+  if (metrics_running_) {
+    return;
+  }
+  metrics_running_ = true;
+  try {
+    metrics_thread_ = std::thread(&MasterClient::MetricsLoop, this);
+  } catch (const std::system_error& e) {
+    metrics_running_ = false;
+    MORI_UMBP_ERROR("[Client] Failed to start metrics thread: {}", e.what());
+    return;
+  }
+  MORI_UMBP_INFO("[Client] Metrics reporting thread started (interval={}ms)", metrics_interval_ms_);
+}
+
+void MasterClient::StopMetricsReporting() {
+  if (!metrics_running_) {
+    return;
+  }
+  metrics_running_ = false;
+  metrics_cv_.notify_one();
+  if (metrics_thread_.joinable()) {
+    metrics_thread_.join();
+  }
+  MORI_UMBP_INFO("[Client] Metrics reporting thread stopped");
+}
+
+void MasterClient::MetricsLoop() {
+  while (metrics_running_) {
+    {
+      std::unique_lock lock(metrics_cv_mutex_);
+      metrics_cv_.wait_for(lock, std::chrono::milliseconds(metrics_interval_ms_),
+                           [this] { return !metrics_running_.load(); });
+    }
+    if (!metrics_running_) break;
+
+    // Swap out all pending samples under lock; send without holding lock.
+    std::unordered_map<std::string, PendingSample> counters;
+    std::unordered_map<std::string, PendingSample> gauges;
+    std::vector<PendingHistogram> histograms;
+    {
+      std::lock_guard lock(metrics_mutex_);
+      counters.swap(pending_counters_);
+      gauges.swap(pending_gauges_);
+      histograms.swap(pending_histograms_);
+    }
+
+    if (counters.empty() && gauges.empty() && histograms.empty()) continue;
+
+    // Log every flush so we know the thread is alive and what it's sending.
+    {
+      double put_bytes = 0, get_bytes = 0;
+      for (const auto& [k, s] : counters) {
+        if (s.name == MORI_UMBP_METRIC_CLIENT_PUT_BYTES_TOTAL) put_bytes += s.value;
+        if (s.name == MORI_UMBP_METRIC_CLIENT_GET_BYTES_TOTAL) get_bytes += s.value;
+      }
+      MORI_UMBP_INFO(
+          "[Client] MetricsLoop flush: node={} counters={} gauges={} histograms={} "
+          "put_bytes_delta={:.0f} get_bytes_delta={:.0f}",
+          config_.node_id, counters.size(), gauges.size(), histograms.size(), put_bytes, get_bytes);
+    }
+
+    ::umbp::ReportMetricsRequest req;
+    req.set_node_id(config_.node_id);
+
+    for (const auto& [key, s] : counters) {
+      auto* sample = req.add_metrics();
+      sample->set_name(s.name);
+      sample->set_help(s.help);
+      for (const auto& [k, v] : s.labels) {
+        auto* l = sample->add_labels();
+        l->set_name(k);
+        l->set_value(v);
+      }
+      sample->set_counter_delta(s.value);
+    }
+    for (const auto& [key, s] : gauges) {
+      auto* sample = req.add_metrics();
+      sample->set_name(s.name);
+      sample->set_help(s.help);
+      for (const auto& [k, v] : s.labels) {
+        auto* l = sample->add_labels();
+        l->set_name(k);
+        l->set_value(v);
+      }
+      sample->set_gauge_value(s.value);
+    }
+    for (const auto& h : histograms) {
+      auto* sample = req.add_metrics();
+      sample->set_name(h.name);
+      sample->set_help(h.help);
+      for (const auto& [k, v] : h.labels) {
+        auto* l = sample->add_labels();
+        l->set_name(k);
+        l->set_value(v);
+      }
+      auto* hist = sample->mutable_histogram();
+      for (double b : h.bounds) hist->add_bounds(b);
+      hist->set_value(h.value);
+    }
+
+    ::umbp::ReportMetricsResponse resp;
+    grpc::ClientContext ctx;
+    ctx.set_deadline(std::chrono::system_clock::now() +
+                     std::chrono::milliseconds(RpcShutdownTimeoutMs()));
+    auto status = GetStub(stub_.get())->ReportMetrics(&ctx, req, &resp);
+    if (!status.ok()) {
+      MORI_UMBP_WARN("[Client] ReportMetrics RPC failed: node_id={}, error={}", config_.node_id,
+                     status.error_message());
+    } else {
+      MORI_UMBP_INFO("[Client] ReportMetrics RPC ok: node_id={} samples={}", config_.node_id,
+                     req.metrics_size());
     }
   }
 }

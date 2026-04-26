@@ -1,0 +1,375 @@
+{
+  "title": "UMBP Master - Data Rate & Bandwidth",
+  "uid": "311999d5-2a44-4ab7-884",
+  "tags": [
+    "umbp",
+    "bandwidth",
+    "data-rate"
+  ],
+  "schemaVersion": 36,
+  "refresh": "5s",
+  "time": {
+    "from": "now-5m",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "type": "datasource",
+        "name": "datasource",
+        "label": "Data Source",
+        "pluginId": "prometheus",
+        "current": {
+          "text": "Prometheus",
+          "value": "PBFA97CFB590B2093"
+        },
+        "hide": 0,
+        "query": "prometheus"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 14,
+      "title": "Per-Client Write Data Rate (bytes/s)",
+      "description": "Write data rate per client broken down by local vs remote traffic.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "min": 0
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(mori_umbp_client_put_bytes_total[30s])",
+          "legendFormat": "{{node}} {{traffic}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "title": "Per-Client Read Data Rate (bytes/s)",
+      "description": "Read data rate per client broken down by local vs remote traffic.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "min": 0
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(mori_umbp_client_get_bytes_total[30s])",
+          "legendFormat": "{{node}} {{traffic}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "title": "Total Data Rate (bytes/s)",
+      "description": "Aggregate read and write data rate across all clients, split by local vs remote traffic.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "min": 0
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (traffic) (rate(mori_umbp_client_put_bytes_total[30s]))",
+          "legendFormat": "write {{traffic}}",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (traffic) (rate(mori_umbp_client_get_bytes_total[30s]))",
+          "legendFormat": "read {{traffic}}",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 17,
+      "title": "BatchPut Per-Call Bandwidth - Local (GiB/s)",
+      "description": "Mean BatchPut bandwidth (GiB/s, e2e call duration) for local traffic, per client.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "min": 0
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(mori_umbp_client_batch_put_bandwidth_gibps_sum{traffic=\"local\"}[30s]) / rate(mori_umbp_client_batch_put_bandwidth_gibps_count{traffic=\"local\"}[30s])",
+          "legendFormat": "{{client}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 18,
+      "title": "BatchPut Per-Call Bandwidth - Remote (GiB/s)",
+      "description": "Mean BatchPut bandwidth (GiB/s, e2e call duration) for remote traffic, per client.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "min": 0
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(mori_umbp_client_batch_put_bandwidth_gibps_sum{traffic=\"remote\"}[30s]) / rate(mori_umbp_client_batch_put_bandwidth_gibps_count{traffic=\"remote\"}[30s])",
+          "legendFormat": "{{client}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 19,
+      "title": "BatchGet Per-Call Bandwidth - Local (GiB/s)",
+      "description": "Mean BatchGet bandwidth (GiB/s, e2e call duration) for local traffic, per client.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 24
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "min": 0
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(mori_umbp_client_batch_get_bandwidth_gibps_sum{traffic=\"local\"}[30s]) / rate(mori_umbp_client_batch_get_bandwidth_gibps_count{traffic=\"local\"}[30s])",
+          "legendFormat": "{{client}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "title": "BatchGet Per-Call Bandwidth - Remote (GiB/s)",
+      "description": "Mean BatchGet bandwidth (GiB/s, e2e call duration) for remote traffic, per client.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 24
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "min": 0
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(mori_umbp_client_batch_get_bandwidth_gibps_sum{traffic=\"remote\"}[30s]) / rate(mori_umbp_client_batch_get_bandwidth_gibps_count{traffic=\"remote\"}[30s])",
+          "legendFormat": "{{client}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 21,
+      "title": "Global BatchPut Per-Call Bandwidth (GiB/s, all clients)",
+      "description": "Global bandwidth aggregated across all clients and traffic types (local+remote). Mean is exact (sum/count); percentiles use histogram_quantile over aggregated buckets.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 32
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "min": 0
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(mori_umbp_client_batch_put_bandwidth_gibps_sum[30s])) / sum(rate(mori_umbp_client_batch_put_bandwidth_gibps_count[30s]))",
+          "legendFormat": "mean",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.50, sum by (le)(rate(mori_umbp_client_batch_put_bandwidth_gibps_bucket[30s])))",
+          "legendFormat": "p50",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.90, sum by (le)(rate(mori_umbp_client_batch_put_bandwidth_gibps_bucket[30s])))",
+          "legendFormat": "p90",
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le)(rate(mori_umbp_client_batch_put_bandwidth_gibps_bucket[30s])))",
+          "legendFormat": "p95",
+          "refId": "D"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le)(rate(mori_umbp_client_batch_put_bandwidth_gibps_bucket[30s])))",
+          "legendFormat": "p99",
+          "refId": "E"
+        }
+      ]
+    },
+    {
+      "id": 22,
+      "title": "Global BatchGet Per-Call Bandwidth (GiB/s, all clients)",
+      "description": "Global bandwidth aggregated across all clients and traffic types (local+remote). Mean is exact (sum/count); percentiles use histogram_quantile over aggregated buckets.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 32
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "min": 0
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(mori_umbp_client_batch_get_bandwidth_gibps_sum[30s])) / sum(rate(mori_umbp_client_batch_get_bandwidth_gibps_count[30s]))",
+          "legendFormat": "mean",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.50, sum by (le)(rate(mori_umbp_client_batch_get_bandwidth_gibps_bucket[30s])))",
+          "legendFormat": "p50",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.90, sum by (le)(rate(mori_umbp_client_batch_get_bandwidth_gibps_bucket[30s])))",
+          "legendFormat": "p90",
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le)(rate(mori_umbp_client_batch_get_bandwidth_gibps_bucket[30s])))",
+          "legendFormat": "p95",
+          "refId": "D"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le)(rate(mori_umbp_client_batch_get_bandwidth_gibps_bucket[30s])))",
+          "legendFormat": "p99",
+          "refId": "E"
+        }
+      ]
+    }
+  ]
+}

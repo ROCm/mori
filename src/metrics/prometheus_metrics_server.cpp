@@ -176,6 +176,27 @@ void MetricsServer::observe(std::string_view name, std::string_view help,
 // Labeled metric API
 // ---------------------------------------------------------------------------
 
+static std::string FormatLabels(
+    const mori::metrics::MetricsServer::Labels& labels);  // forward decl
+
+void MetricsServer::observe(std::string_view name, std::string_view help, const Labels& labels,
+                            const std::vector<double>& bounds, double value) {
+  auto label_str = FormatLabels(labels);
+  std::lock_guard<std::mutex> lk(mutex_);
+  auto& family = labeled_histograms_[std::string(name)];
+  family.help = help;
+  auto& s = family.series[label_str];
+  if (s.bounds.empty()) {
+    s.bounds = bounds;
+    s.bucket_counts.assign(bounds.size(), 0u);
+  }
+  for (std::size_t i = 0; i < s.bounds.size(); ++i) {
+    if (value <= s.bounds[i]) s.bucket_counts[i]++;
+  }
+  s.count++;
+  s.sum += value;
+}
+
 static std::string FormatLabels(const mori::metrics::MetricsServer::Labels& labels) {
   if (labels.empty()) return "";
   std::string s = "{";
@@ -259,6 +280,25 @@ std::string MetricsServer::serializeLocked() const {
     out << name << "_bucket{le=\"+Inf\"} " << h.count << "\n";
     out << name << "_sum " << h.sum << "\n";
     out << name << "_count " << h.count << "\n\n";
+  }
+
+  // Labeled histograms
+  for (const auto& [name, family] : labeled_histograms_) {
+    out << "# HELP " << name << " " << family.help << "\n";
+    out << "# TYPE " << name << " histogram\n";
+    for (const auto& [label_str, h] : family.series) {
+      // label_str is "{k=\"v\",...}" or ""; strip "}" to insert le label.
+      std::string bucket_prefix =
+          label_str.empty() ? "{" : label_str.substr(0, label_str.size() - 1) + ",";
+      for (std::size_t i = 0; i < h.bounds.size(); ++i) {
+        out << name << "_bucket" << bucket_prefix << "le=\"" << h.bounds[i] << "\"} "
+            << h.bucket_counts[i] << "\n";
+      }
+      out << name << "_bucket" << bucket_prefix << "le=\"+Inf\"} " << h.count << "\n";
+      out << name << "_sum" << label_str << " " << h.sum << "\n";
+      out << name << "_count" << label_str << " " << h.count << "\n";
+    }
+    out << "\n";
   }
 
   return out.str();

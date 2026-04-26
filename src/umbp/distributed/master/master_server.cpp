@@ -726,6 +726,55 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     return grpc::Status::OK;
   }
 
+  grpc::Status ReportMetrics(grpc::ServerContext* /*context*/,
+                             const ::umbp::ReportMetricsRequest* request,
+                             ::umbp::ReportMetricsResponse* /*response*/) override {
+    if (!metrics_) return grpc::Status::OK;
+
+    // Log each batch so we can confirm receipt and see put/get byte deltas.
+    {
+      double put_bytes = 0, get_bytes = 0;
+      for (const auto& s : request->metrics()) {
+        if (s.name() == MORI_UMBP_METRIC_CLIENT_PUT_BYTES_TOTAL &&
+            s.value_case() == ::umbp::MetricSample::kCounterDelta)
+          put_bytes += s.counter_delta();
+        if (s.name() == MORI_UMBP_METRIC_CLIENT_GET_BYTES_TOTAL &&
+            s.value_case() == ::umbp::MetricSample::kCounterDelta)
+          get_bytes += s.counter_delta();
+      }
+      MORI_UMBP_INFO(
+          "[Master] ReportMetrics: node={} samples={} put_bytes_delta={:.0f} "
+          "get_bytes_delta={:.0f}",
+          request->node_id(), request->metrics_size(), put_bytes, get_bytes);
+    }
+
+    mori::metrics::MetricsServer::Labels base = {{"node", request->node_id()}};
+
+    for (const auto& s : request->metrics()) {
+      mori::metrics::MetricsServer::Labels labels = base;
+      for (const auto& l : s.labels()) {
+        labels.push_back({l.name(), l.value()});
+      }
+      switch (s.value_case()) {
+        case ::umbp::MetricSample::kCounterDelta:
+          metrics_->addCounter(s.name(), s.help(), labels,
+                               static_cast<uint64_t>(s.counter_delta()));
+          break;
+        case ::umbp::MetricSample::kGaugeValue:
+          metrics_->setGauge(s.name(), s.help(), labels, s.gauge_value());
+          break;
+        case ::umbp::MetricSample::kHistogram: {
+          std::vector<double> bounds(s.histogram().bounds().begin(), s.histogram().bounds().end());
+          metrics_->observe(s.name(), s.help(), labels, bounds, s.histogram().value());
+          break;
+        }
+        default:
+          break;
+      }
+    }
+    return grpc::Status::OK;
+  }
+
   void SetMetrics(mori::metrics::MetricsServer* metrics) { metrics_ = metrics; }
 
  private:

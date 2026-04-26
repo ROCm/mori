@@ -304,6 +304,10 @@ class ScopedTimer {
     MORI_DEBUG(module_, "ScopedTimer [{}] took {} ns", name_, duration);
   }
 
+  double ElapsedSeconds() const {
+    return std::chrono::duration<double>(Clock::now() - start_).count();
+  }
+
   ScopedTimer(const ScopedTimer&) = delete;
   ScopedTimer& operator=(const ScopedTimer&) = delete;
 
