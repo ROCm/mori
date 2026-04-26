@@ -33,12 +33,39 @@
 #include "mori/io/backend.hpp"
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/env_time.h"
+#include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/obs_counters.h"
 #include "umbp_peer.grpc.pb.h"
 
 namespace mori::umbp {
 
 namespace {
+
+// Bandwidth histogram bounds: 1 GiB/s steps from 0 to 3 TiB/s (3072 buckets).
+const std::vector<double>& BatchBandwidthBoundsGiBps() {
+  static const std::vector<double> kBounds = []() {
+    std::vector<double> b;
+    b.reserve(3 * 1024);
+    for (int i = 1; i <= 3 * 1024; ++i) b.push_back(static_cast<double>(i));
+    return b;
+  }();
+  return kBounds;
+}
+
+void ObserveBatchBandwidth(MasterClient& mc, const std::string& metric_name,
+                           const std::string& metric_help, const std::string& client_id,
+                           double bytes_local, double bytes_remote, double elapsed_s) {
+  if (elapsed_s <= 0) return;
+  constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
+  const auto& bounds = BatchBandwidthBoundsGiBps();
+  if (bytes_local > 0)
+    mc.Observe(metric_name, metric_help, {{"client", client_id}, {"traffic", "local"}}, bounds,
+               bytes_local / kGiB / elapsed_s);
+  if (bytes_remote > 0)
+    mc.Observe(metric_name, metric_help, {{"client", client_id}, {"traffic", "remote"}}, bounds,
+               bytes_remote / kGiB / elapsed_s);
+}
+
 std::optional<ParsedLocationId> ParseLocationIdWithLog(const std::string& location_id) {
   auto result = ParseLocationId(location_id);
   if (!result) {
@@ -512,6 +539,11 @@ bool PoolClient::Get(const std::string& key, void* dst, size_t size) {
         const uint64_t bytes = LogicalPageBytes(i, num_pages, page_size, size);
         std::memcpy(dst_bytes + i * page_size, static_cast<const char*>(dram.buffer) + off, bytes);
       }
+      MORI_UMBP_INFO("[PoolClient] Get: recording get_bytes key='{}' size={} traffic=local", key,
+                     size);
+      master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_GET_BYTES_TOTAL,
+                                 MORI_UMBP_METRIC_CLIENT_GET_BYTES_TOTAL_HELP,
+                                 {{"traffic", "local"}}, static_cast<double>(size));
       return true;
     }
 
@@ -526,7 +558,13 @@ bool PoolClient::Get(const std::string& key, void* dst, size_t size) {
     EnsureBufferDescsCached(peer, result->dram_memory_descs);
     // zero_copy=true: try registered DRAM region first, fall back to staging
     // (with `staging_buffer_size` cap) only when caller did not pre-register.
-    return RemoteDramScatterRead(peer, parsed->pages, page_size, dst, size, true);
+    bool ok = RemoteDramScatterRead(peer, parsed->pages, page_size, dst, size, true);
+    if (ok) {
+      master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_GET_BYTES_TOTAL,
+                                 MORI_UMBP_METRIC_CLIENT_GET_BYTES_TOTAL_HELP,
+                                 {{"traffic", "remote"}}, static_cast<double>(size));
+    }
+    return ok;
   }
 
   if (loc.tier == TierType::SSD) {
@@ -534,7 +572,13 @@ bool PoolClient::Get(const std::string& key, void* dst, size_t size) {
     // GetOrConnectPeer signature which only relies on engine_desc_bytes.
     auto& peer = GetOrConnectPeer(loc.node_id, result->peer_address, result->engine_desc_bytes,
                                   /*dram_memory_desc_bytes=*/{});
-    return RemoteSsdRead(peer, key, loc.location_id, dst, size, true);
+    bool ok = RemoteSsdRead(peer, key, loc.location_id, dst, size, true);
+    if (ok) {
+      master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_GET_BYTES_TOTAL,
+                                 MORI_UMBP_METRIC_CLIENT_GET_BYTES_TOTAL_HELP,
+                                 {{"traffic", "remote"}}, static_cast<double>(size));
+    }
+    return ok;
   }
 
   MORI_UMBP_WARN("[PoolClient] Get: key '{}' is on unsupported tier {}", key,
@@ -669,6 +713,12 @@ bool PoolClient::Put(const std::string& key, const void* src, size_t size) {
     return false;
   }
 
+  MORI_UMBP_INFO("[PoolClient] Put: recording put_bytes key='{}' size={} traffic={}", key, size,
+                 is_local ? "local" : "remote");
+  master_client_->AddCounter(
+      MORI_UMBP_METRIC_CLIENT_PUT_BYTES_TOTAL, MORI_UMBP_METRIC_CLIENT_PUT_BYTES_TOTAL_HELP,
+      {{"traffic", is_local ? "local" : "remote"}}, static_cast<double>(size));
+
   {
     std::lock_guard<std::mutex> lock(cache_mutex_);
     cluster_locations_[key] = location;
@@ -703,6 +753,9 @@ std::vector<bool> PoolClient::BatchPut(const std::vector<std::string>& keys,
     MORI_UMBP_ERROR("[PoolClient] BatchPut: mismatched vector sizes");
     return results;
   }
+
+  ScopedTimer timer("BatchPut", mori::modules::UMBP);
+  double bw_bytes_local = 0, bw_bytes_remote = 0;
 
   std::vector<uint64_t> block_sizes(n);
   for (size_t i = 0; i < n; ++i) block_sizes[i] = sizes[i];
@@ -873,15 +926,27 @@ std::vector<bool> PoolClient::BatchPut(const std::vector<std::string>& keys,
     }
 
     std::vector<bool> fin_results;
+    MORI_UMBP_INFO("[PoolClient] BatchPut: calling BatchFinalizeAllocation for {} items",
+                   pending.size());
     auto fin_status = master_client_->BatchFinalizeAllocation(fin_keys, fin_locs, fin_aids,
                                                               &fin_results, fin_depths);
     if (!fin_status.ok()) {
       MORI_UMBP_ERROR("[PoolClient] BatchPut: BatchFinalizeAllocation failed: {}",
                       fin_status.error_message());
     }
+    size_t put_ok = 0, put_fail = 0;
+    double put_bytes_local = 0, put_bytes_remote = 0;
     for (size_t i = 0; i < pending.size(); ++i) {
       bool ok = (i < fin_results.size()) && fin_results[i];
       if (ok) {
+        const bool is_local = pending[i].location.node_id == config_.master_config.node_id;
+        put_ok++;
+        (is_local ? put_bytes_local : put_bytes_remote) +=
+            static_cast<double>(pending[i].location.size);
+        master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_PUT_BYTES_TOTAL,
+                                   MORI_UMBP_METRIC_CLIENT_PUT_BYTES_TOTAL_HELP,
+                                   {{"traffic", is_local ? "local" : "remote"}},
+                                   static_cast<double>(pending[i].location.size));
         std::lock_guard<std::mutex> lock(cache_mutex_);
         cluster_locations_[fin_keys[i]] = fin_locs[i];
       } else {
@@ -891,8 +956,15 @@ std::vector<bool> PoolClient::BatchPut(const std::vector<std::string>& keys,
         // have no pending to collect or rely on node-reap cleanup.  No
         // AbortAllocation RPC needed.
         results[pending[i].original_idx] = false;
+        put_fail++;
       }
     }
+    MORI_UMBP_INFO(
+        "[PoolClient] BatchPut: finalize done ok={} fail={} "
+        "put_bytes_local={:.0f} put_bytes_remote={:.0f}",
+        put_ok, put_fail, put_bytes_local, put_bytes_remote);
+    bw_bytes_local = put_bytes_local;
+    bw_bytes_remote = put_bytes_remote;
   }
 
   // End-of-batch abort flush for write-failed items.  A single gRPC
@@ -913,6 +985,10 @@ std::vector<bool> PoolClient::BatchPut(const std::vector<std::string>& keys,
     }
   }
 
+  ObserveBatchBandwidth(*master_client_, MORI_UMBP_METRIC_CLIENT_BATCH_PUT_BANDWIDTH,
+                        MORI_UMBP_METRIC_CLIENT_BATCH_PUT_BANDWIDTH_HELP, NodeId(), bw_bytes_local,
+                        bw_bytes_remote, timer.ElapsedSeconds());
+
   return results;
 }
 
@@ -926,6 +1002,9 @@ std::vector<bool> PoolClient::BatchGet(const std::vector<std::string>& keys,
     MORI_UMBP_ERROR("[PoolClient] BatchGet: mismatched vector sizes");
     return results;
   }
+
+  ScopedTimer timer("BatchGet", mori::modules::UMBP);
+  double bw_bytes_local = 0, bw_bytes_remote = 0;
 
   std::vector<std::optional<RouteGetResult>> routes;
   auto status = master_client_->BatchRouteGet(keys, &routes);
@@ -989,6 +1068,14 @@ std::vector<bool> PoolClient::BatchGet(const std::vector<std::string>& keys,
                     bytes);
       }
       results[i] = !oob;
+      if (!oob) {
+        MORI_UMBP_INFO("[PoolClient] BatchGet: recording get_bytes key='{}' size={} traffic=local",
+                       keys[i], sizes[i]);
+        master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_GET_BYTES_TOTAL,
+                                   MORI_UMBP_METRIC_CLIENT_GET_BYTES_TOTAL_HELP,
+                                   {{"traffic", "local"}}, static_cast<double>(sizes[i]));
+        bw_bytes_local += static_cast<double>(sizes[i]);
+      }
       continue;
     }
 
@@ -1003,7 +1090,22 @@ std::vector<bool> PoolClient::BatchGet(const std::vector<std::string>& keys,
     // zero_copy=true: prefer pre-registered host buffers; staging fallback
     // remains for callers that did not register.
     results[i] = RemoteDramScatterRead(peer, parsed->pages, r.page_size, dsts[i], sizes[i], true);
+    if (results[i]) {
+      MORI_UMBP_INFO("[PoolClient] BatchGet: recording get_bytes key='{}' size={} traffic=remote",
+                     keys[i], sizes[i]);
+      master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_GET_BYTES_TOTAL,
+                                 MORI_UMBP_METRIC_CLIENT_GET_BYTES_TOTAL_HELP,
+                                 {{"traffic", "remote"}}, static_cast<double>(sizes[i]));
+      bw_bytes_remote += static_cast<double>(sizes[i]);
+    } else {
+      MORI_UMBP_WARN("[PoolClient] BatchGet: RemoteDramScatterRead failed for key='{}' size={}",
+                     keys[i], sizes[i]);
+    }
   }
+
+  ObserveBatchBandwidth(*master_client_, MORI_UMBP_METRIC_CLIENT_BATCH_GET_BANDWIDTH,
+                        MORI_UMBP_METRIC_CLIENT_BATCH_GET_BANDWIDTH_HELP, NodeId(), bw_bytes_local,
+                        bw_bytes_remote, timer.ElapsedSeconds());
 
   return results;
 }
