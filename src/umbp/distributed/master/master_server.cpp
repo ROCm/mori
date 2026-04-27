@@ -847,9 +847,12 @@ void MasterServer::Run() {
   eviction_manager_->Start();
 
   grpc::ServerBuilder builder;
-  builder.AddListeningPort(config_.listen_address, grpc::InsecureServerCredentials());
+  int selected_port = 0;
+  builder.AddListeningPort(config_.listen_address, grpc::InsecureServerCredentials(),
+                           &selected_port);
   builder.RegisterService(service_.get());
   server_ = builder.BuildAndStart();
+  bound_port_.store(static_cast<uint16_t>(selected_port));
 
   MORI_UMBP_INFO("[Master] Listening on {}", config_.listen_address);
   server_->Wait();
