@@ -23,6 +23,8 @@
 
 #include <grpcpp/server.h>
 
+#include <atomic>
+#include <cstdint>
 #include <memory>
 #include <string>
 
@@ -49,6 +51,11 @@ class MasterServer {
   void Run();
   void Shutdown();
 
+  // Returns the port the gRPC server is actually listening on.  Useful when
+  // listen_address specifies port 0 (OS-assigned).  Returns 0 until Run()
+  // has called BuildAndStart().
+  uint16_t GetBoundPort() const { return bound_port_.load(); }
+
  private:
   MasterServerConfig config_;
   GlobalBlockIndex index_;
@@ -63,6 +70,8 @@ class MasterServer {
   std::unique_ptr<UMBPMasterServiceImpl> service_;
 
   std::unique_ptr<EvictionManager> eviction_manager_;
+
+  std::atomic<uint16_t> bound_port_{0};
 };
 
 }  // namespace mori::umbp
