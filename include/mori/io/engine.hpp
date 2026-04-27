@@ -108,6 +108,10 @@ class IOEngine {
   std::optional<IOEngineSession> CreateSession(const MemoryDesc& local, const MemoryDesc& remote);
   void LoadScatterGatherModule(const std::string& hsacoPath);
 
+  // Returns the minimum max_mr_size across all RDMA backends/devices.
+  // SIZE_MAX means no known limit.
+  size_t GetMaxMemoryRegionSize() const;
+
  private:
   struct RouteCacheKey {
     EngineKey remoteEngineKey;

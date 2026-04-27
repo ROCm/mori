@@ -107,6 +107,12 @@ class LocalStorageManager {
     return dynamic_cast<T*>(GetTier(tier));
   }
 
+  // Serialize a key's location for publication to the Master.
+  // DRAM: "chunk_index:offset"    SSD: "0:<raw_id>"
+  // This is the single serialization point for published location strings.
+  std::optional<TierLocationInfo> BuildTierLocationInfo(TierBackend* tier, const std::string& key,
+                                                        size_t size);
+
  private:
   UMBPConfig config_;
   UMBPRole role_;
@@ -160,8 +166,6 @@ class LocalStorageManager {
   bool DemoteLRUForSpace(TierBackend* tier);
   bool InsertReadCacheNoWriteback(const std::string& key);
   void UpsertIndexTier(const std::string& key, StorageTier tier, size_t size_hint);
-  static std::optional<TierLocationInfo> BuildTierLocationInfo(TierBackend* tier,
-                                                               const std::string& key, size_t size);
 
   void MaybeAutoPromote(const std::string& key);
 

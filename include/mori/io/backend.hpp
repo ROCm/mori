@@ -166,6 +166,10 @@ class Backend {
                                         TransferStatus* status) = 0;
 
   virtual bool CanHandle(const MemoryDesc& local, const MemoryDesc& remote) const { return true; }
+
+  // Returns the maximum memory region size the backend can register in a
+  // single ibv_reg_mr call.  SIZE_MAX means no known limit.
+  virtual size_t GetMaxMemoryRegionSize() const { return SIZE_MAX; }
 };
 
 }  // namespace io
