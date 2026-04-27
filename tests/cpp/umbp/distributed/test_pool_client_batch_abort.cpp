@@ -37,11 +37,8 @@
 
 #include <gtest/gtest.h>
 
-#include <atomic>
 #include <chrono>
-#include <cstdlib>
 #include <cstring>
-#include <ctime>
 #include <memory>
 #include <optional>
 #include <string>
@@ -61,26 +58,12 @@ constexpr size_t kBlockSize = kPageSize;
 constexpr size_t kRemoteCap = 8 << 20;  // 8 MiB of DRAM on target
 constexpr size_t kCallerBuf = 1 << 20;  // 1 MiB caller src region
 
-static uint16_t AllocPort() {
-  static std::atomic<uint16_t> next{0};
-  if (next.load() == 0) {
-    std::srand(static_cast<unsigned>(std::time(nullptr)));
-    next.store(static_cast<uint16_t>(52500 + (std::rand() % 3500)));
-  }
-  return next.fetch_add(50);
-}
-
 // 2-node fixture: a caller with no local DRAM (forces remote routing)
 // and a target node owning all the DRAM capacity.  Caller pre-registers
 // a src region so BatchPut happy-path takes the zero-copy branch.
 class BatchAbortTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    uint16_t base = AllocPort();
-    master_port_ = base;
-    io_port_caller_ = base + 1;
-    io_port_target_ = base + 2;
-
     caller_buf_ = std::malloc(kCallerBuf);
     target_buf_ = std::malloc(kRemoteCap);
     ASSERT_NE(caller_buf_, nullptr);
@@ -89,11 +72,14 @@ class BatchAbortTest : public ::testing::Test {
     std::memset(target_buf_, 0, kRemoteCap);
 
     MasterServerConfig master_cfg;
-    master_cfg.listen_address = "0.0.0.0:" + std::to_string(master_port_);
+    master_cfg.listen_address = "0.0.0.0:0";
     master_ = std::make_unique<MasterServer>(std::move(master_cfg));
     server_thread_ = std::thread([this] { master_->Run(); });
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    master_addr_ = "localhost:" + std::to_string(master_port_);
+    for (int i = 0; i < 50 && master_->GetBoundPort() == 0; ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_NE(master_->GetBoundPort(), 0) << "Master failed to start";
+    master_addr_ = "localhost:" + std::to_string(master_->GetBoundPort());
 
     // Caller: tiny local DRAM, zero practical capacity — every RoutePut
     // lands on the target node.
@@ -104,7 +90,7 @@ class BatchAbortTest : public ::testing::Test {
     cfg_caller.master_config.node_address = "127.0.0.1";
     cfg_caller.master_config.master_address = master_addr_;
     cfg_caller.io_engine.host = "0.0.0.0";
-    cfg_caller.io_engine.port = io_port_caller_;
+    cfg_caller.io_engine.port = 0;
     cfg_caller.dram_page_size = kPageSize;
     cfg_caller.dram_buffers = {{caller_local_, kBlockSize}};
     cfg_caller.tier_capacities = {{TierType::DRAM, {kBlockSize, kBlockSize}}};
@@ -117,7 +103,7 @@ class BatchAbortTest : public ::testing::Test {
     cfg_target.master_config.node_address = "127.0.0.1";
     cfg_target.master_config.master_address = master_addr_;
     cfg_target.io_engine.host = "0.0.0.0";
-    cfg_target.io_engine.port = io_port_target_;
+    cfg_target.io_engine.port = 0;
     cfg_target.dram_page_size = kPageSize;
     cfg_target.dram_buffers = {{target_buf_, kRemoteCap}};
     cfg_target.tier_capacities = {{TierType::DRAM, {kRemoteCap, kRemoteCap}}};
@@ -152,9 +138,6 @@ class BatchAbortTest : public ::testing::Test {
     return ids;
   }
 
-  uint16_t master_port_ = 0;
-  uint16_t io_port_caller_ = 0;
-  uint16_t io_port_target_ = 0;
   void* caller_buf_ = nullptr;
   void* caller_local_ = nullptr;
   void* target_buf_ = nullptr;

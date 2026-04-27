@@ -105,7 +105,7 @@ struct UMBPMasterClientConfig {
 // RDMA IO-engine endpoint parameters.
 struct UMBPIoEngineConfig {
   std::string host;   // RDMA engine hostname (formerly UMBPDistributedConfig::io_engine_host)
-  uint16_t port = 0;  // RDMA engine port; 0 = no RDMA (formerly io_engine_port)
+  uint16_t port = 0;  // RDMA engine port; 0 = OS-assigned ephemeral port (formerly io_engine_port)
 };
 
 // User-facing distributed configuration. Set UMBPConfig::distributed to enable

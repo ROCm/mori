@@ -134,8 +134,9 @@ bool PoolClient::Init() {
 
   master_client_ = std::make_unique<MasterClient>(config_.master_config);
 
-  // Initialize IO Engine for RDMA data plane
-  if (config_.io_engine.port > 0) {
+  // Initialize IO Engine for RDMA data plane.
+  // host non-empty signals intent to use RDMA; port=0 means OS-assigned ephemeral port.
+  if (!config_.io_engine.host.empty()) {
     mori::io::IOEngineConfig io_cfg;
     io_cfg.host = config_.io_engine.host;
     io_cfg.port = config_.io_engine.port;
