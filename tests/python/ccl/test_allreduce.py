@@ -632,6 +632,7 @@ def _print_overlap_summary(
 
 
 
+def _test_gemm_overlap_comparison(
     rank,
     my_pe,
     npes,
@@ -647,7 +648,7 @@ def _print_overlap_summary(
     gemm_m=_GEMM_M_DEFAULT,
     gemm_n=_GEMM_N_DEFAULT,
     gemm_k=_GEMM_K_DEFAULT,
-):def _test_gemm_overlap_comparison(
+):
     """SDMA (copy True/False) vs RCCL allreduce overlapped with torch.matmul.
 
     No payload correctness checks here (Tests 1–4); only launch success and timing.
