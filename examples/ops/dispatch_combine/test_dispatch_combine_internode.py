@@ -28,7 +28,7 @@ import argparse
 import time
 from tqdm import tqdm
 
-os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "64G")
+os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "16G")
 
 kernel_type_map = {
     "v0": mori.ops.EpDispatchCombineKernelType.InterNode,
