@@ -19,10 +19,27 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#pragma once
 
-#include "mori/application/application_device_types.hpp"
-#include "mori/application/transport/p2p/p2p.hpp"
-#include "mori/application/transport/rdma/rdma.hpp"
+#include "mori/application/transport/rdma/providers/dv_loader.hpp"
 
-// TransportType is defined in application_device_types.hpp
+#include <dlfcn.h>
+
+#include "mori/utils/mori_log.hpp"
+
+void* DvLoadLibrary(const char* lib_name) {
+  void* handle = dlopen(lib_name, RTLD_LAZY | RTLD_LOCAL);
+  if (!handle) {
+    MORI_APP_TRACE("dlopen({}) failed: {}", lib_name, dlerror());
+  } else {
+    MORI_APP_TRACE("dlopen({}) succeeded", lib_name);
+  }
+  return handle;
+}
+
+void* DvLoadSymbol(void* handle, const char* symbol_name) {
+  void* sym = dlsym(handle, symbol_name);
+  if (!sym) {
+    MORI_APP_WARN("dlsym({}) failed: {}", symbol_name, dlerror());
+  }
+  return sym;
+}

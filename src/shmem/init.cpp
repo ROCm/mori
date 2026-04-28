@@ -355,12 +355,24 @@ static void CopyRdmaEndpointsToGpu(GpuStates* gpuStates, const ShmemStates* stat
 
   size_t numEndpoints = gpuStates->worldSize * gpuStates->numQpPerPe;
 
-  // Allocate and copy endpoints
-  HIP_RUNTIME_CHECK(
-      hipMalloc(&gpuStates->rdmaEndpoints, sizeof(application::RdmaEndpoint) * numEndpoints));
-  HIP_RUNTIME_CHECK(hipMemcpy(
-      gpuStates->rdmaEndpoints, states->rdmaStates->commContext->GetRdmaEndpoints().data(),
-      sizeof(application::RdmaEndpoint) * numEndpoints, hipMemcpyHostToDevice));
+  // Allocate and copy endpoints.
+  // Convert from host-side application::RdmaEndpoint (which contains ibverbs handles and QP
+  // connection parameters unused by device kernels) to the GPU-side ShmemRdmaEndpoint that
+  // only contains the fields device kernels actually access.
+  HIP_RUNTIME_CHECK(hipMalloc(&gpuStates->rdmaEndpoints, sizeof(ShmemRdmaEndpoint) * numEndpoints));
+  {
+    const auto& hostEndpoints = states->rdmaStates->commContext->GetRdmaEndpoints();
+    std::vector<ShmemRdmaEndpoint> shmemEndpoints(numEndpoints);
+    for (size_t i = 0; i < numEndpoints; i++) {
+      shmemEndpoints[i].vendorId = hostEndpoints[i].vendorId;
+      shmemEndpoints[i].qpn = hostEndpoints[i].handle.qpn;
+      shmemEndpoints[i].wqHandle = hostEndpoints[i].wqHandle;
+      shmemEndpoints[i].cqHandle = hostEndpoints[i].cqHandle;
+      shmemEndpoints[i].atomicIbuf = hostEndpoints[i].atomicIbuf;
+    }
+    HIP_RUNTIME_CHECK(hipMemcpy(gpuStates->rdmaEndpoints, shmemEndpoints.data(),
+                                sizeof(ShmemRdmaEndpoint) * numEndpoints, hipMemcpyHostToDevice));
+  }
 
   // Allocate and initialize endpoint locks
   size_t lockSize = numEndpoints * sizeof(uint32_t);

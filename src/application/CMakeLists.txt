@@ -50,6 +50,7 @@ list(
   APPEND
   MORI_APP_SOURCES
   transport/rdma/rdma.cpp
+  transport/rdma/providers/dv_loader.cpp
   transport/rdma/providers/mlx5/mlx5.cpp
   transport/rdma/providers/bnxt/bnxt.cpp
   transport/rdma/providers/ionic/ionic.cpp

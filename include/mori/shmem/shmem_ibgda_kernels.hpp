@@ -23,7 +23,7 @@
 
 #include <assert.h>
 
-#include "mori/application/application.hpp"
+#include "mori/application/application_device_types.hpp"
 #include "mori/core/core.hpp"
 #include "mori/shmem/internal.hpp"
 #include "mori/shmem/shmem_api.hpp"
@@ -47,7 +47,7 @@ namespace shmem {
 
 #define DISPATCH_PROVIDER_TYPE(func, ...)                             \
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();               \
-  application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;     \
+  ShmemRdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;             \
   core::ProviderType prvdType = ep[pe].GetProviderType();             \
   if (DISPATCH_MLX5 && prvdType == core::ProviderType::MLX5) {        \
     func<core::ProviderType::MLX5>(__VA_ARGS__);                      \
@@ -174,7 +174,7 @@ inline __device__ void VmmLookupRemote(uintptr_t addr, int pe, uintptr_t& out_ra
 inline __device__ void ShmemQuietThreadKernelSerialImpl(int pe, int qpId) {
   if (core::GetActiveLaneNum() != 0) return;
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
-  application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
+  ShmemRdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
   core::WorkQueueHandle& wq = ep[epIndex].wqHandle;
   core::CompletionQueueHandle& cq = ep[epIndex].cqHandle;
@@ -287,7 +287,7 @@ inline __device__ void ShmemQuietThreadKernelPsdImpl(int pe, int qpId) {
 
 inline __device__ void ShmemQuietThreadKernelMlnxImpl(int pe, int qpId) {
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
-  application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
+  ShmemRdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
   core::WorkQueueHandle& wq = ep[epIndex].wqHandle;
   core::CompletionQueueHandle& cq = ep[epIndex].cqHandle;
@@ -410,7 +410,7 @@ inline __device__ void ShmemQuietThreadKernel<application::TransportType::RDMA>(
 template <>
 inline __device__ void ShmemQuietThreadKernel<application::TransportType::RDMA>(int pe, int qpId) {
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
-  application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
+  ShmemRdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   int rank = globalGpuStates->rank;
   if (pe == rank) return;
   if (globalGpuStates->transportTypes[pe] != application::TransportType::RDMA) return;
@@ -429,11 +429,11 @@ inline __device__ void ShmemPutMemNbiThreadKernelImpl(const application::SymmMem
   if (bytes == 0) return;
 
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
-  application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
+  ShmemRdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
   core::WorkQueueHandle* wq = &ep[epIndex].wqHandle;
   core::CompletionQueueHandle* cq = &ep[epIndex].cqHandle;
-  uint32_t qpn = ep[epIndex].handle.qpn;
+  uint32_t qpn = ep[epIndex].qpn;
 
   bool needsChunking = globalGpuStates->useVMMHeap;
   size_t currentOffset = 0;
@@ -672,11 +672,11 @@ inline __device__ void ShmemPutSizeImmNbiThreadKernelImpl(const application::Sym
     raddr = dest->peerPtrs[pe] + destOffset;
     rkey = dest->peerRkeys[pe];
   }
-  application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
+  ShmemRdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
   core::WorkQueueHandle* wq = &ep[epIndex].wqHandle;
   core::CompletionQueueHandle* cq = &ep[epIndex].cqHandle;
-  uint32_t qpn = ep[epIndex].handle.qpn;
+  uint32_t qpn = ep[epIndex].qpn;
 
   uint64_t activemask = core::GetActiveLaneMask();
   uint8_t num_active_lanes = core::GetActiveLaneCount(activemask);
@@ -813,11 +813,11 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelImpl(
   // assert(sourceOffset + bytes <= source->size && destOffset + bytes <= dest->size);
 
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
-  application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
+  ShmemRdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
   core::WorkQueueHandle* wq = &ep[epIndex].wqHandle;
   core::CompletionQueueHandle* cq = &ep[epIndex].cqHandle;
-  uint32_t qpn = ep[epIndex].handle.qpn;
+  uint32_t qpn = ep[epIndex].qpn;
 
   bool needsChunking = globalGpuStates->useVMMHeap;
   size_t currentOffset = 0;
@@ -1175,11 +1175,11 @@ inline __device__ void ShmemAtomicSizeNonFetchThreadKernelImpl(
   // assert(destOffset + bytes <= dest->size);
 
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
-  application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
+  ShmemRdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
   core::WorkQueueHandle* wq = &ep[epIndex].wqHandle;
   core::CompletionQueueHandle* cq = &ep[epIndex].cqHandle;
-  uint32_t qpn = ep[epIndex].handle.qpn;
+  uint32_t qpn = ep[epIndex].qpn;
   core::IbufHandle* ibuf = &ep[epIndex].atomicIbuf;
 
   // Get correct rkey for VMM heap or use direct rkey for Isolation/Static Heap
@@ -1360,11 +1360,11 @@ inline __device__ T ShmemAtomicTypeFetchThreadKernelImpl(const application::Symm
                                                          int qpId) {
   // assert(destOffset + bytes <= dest->size);
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
-  application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
+  ShmemRdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
   core::WorkQueueHandle* wq = &ep[epIndex].wqHandle;
   core::CompletionQueueHandle* cq = &ep[epIndex].cqHandle;
-  uint32_t qpn = ep[epIndex].handle.qpn;
+  uint32_t qpn = ep[epIndex].qpn;
   core::IbufHandle* ibuf = &ep[epIndex].atomicIbuf;
 
   uint64_t activemask = core::GetActiveLaneMask();
@@ -1595,11 +1595,11 @@ inline __device__ void ShmemPutMemNbiThreadKernelAddrImpl(const void* dest, cons
   if (bytes == 0) return;
 
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
-  application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
+  ShmemRdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
   core::WorkQueueHandle* wq = &ep[epIndex].wqHandle;
   core::CompletionQueueHandle* cq = &ep[epIndex].cqHandle;
-  uint32_t qpn = ep[epIndex].handle.qpn;
+  uint32_t qpn = ep[epIndex].qpn;
 
   // Determine if chunking is needed (VMM heap mode)
   bool needsChunking = globalGpuStates->useVMMHeap;
@@ -1809,11 +1809,11 @@ inline __device__ void ShmemPutSizeImmNbiThreadKernelAddrImpl(const void* dest, 
   if (bytes == 0) return;
 
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
-  application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
+  ShmemRdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
   core::WorkQueueHandle* wq = &ep[epIndex].wqHandle;
   core::CompletionQueueHandle* cq = &ep[epIndex].cqHandle;
-  uint32_t qpn = ep[epIndex].handle.qpn;
+  uint32_t qpn = ep[epIndex].qpn;
 
   // Convert addresses to remote addresses (supports both Static Heap and VMM Heap)
   uintptr_t raddr;
@@ -1948,11 +1948,11 @@ inline __device__ void ShmemPutMemNbiSignalThreadKernelAddrImpl(
   if (bytes == 0) return;
 
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
-  application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
+  ShmemRdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
   core::WorkQueueHandle* wq = &ep[epIndex].wqHandle;
   core::CompletionQueueHandle* cq = &ep[epIndex].cqHandle;
-  uint32_t qpn = ep[epIndex].handle.qpn;
+  uint32_t qpn = ep[epIndex].qpn;
 
   // Determine if chunking is needed (VMM heap mode)
   bool needsChunking = globalGpuStates->useVMMHeap;
@@ -2290,11 +2290,11 @@ inline __device__ void ShmemAtomicSizeNonFetchThreadKernelAddrImpl(const void* d
   if (bytes == 0) return;
 
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
-  application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
+  ShmemRdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
   core::WorkQueueHandle* wq = &ep[epIndex].wqHandle;
   core::CompletionQueueHandle* cq = &ep[epIndex].cqHandle;
-  uint32_t qpn = ep[epIndex].handle.qpn;
+  uint32_t qpn = ep[epIndex].qpn;
   core::IbufHandle* ibuf = &ep[epIndex].atomicIbuf;
 
   // Convert addresses to remote addresses (supports both Static Heap and VMM Heap)
@@ -2439,11 +2439,11 @@ inline __device__ T ShmemAtomicTypeFetchThreadKernelAddrImpl(const void* dest, v
                                                              core::atomicType amoType, int pe,
                                                              int qpId) {
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
-  application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
+  ShmemRdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
   core::WorkQueueHandle* wq = &ep[epIndex].wqHandle;
   core::CompletionQueueHandle* cq = &ep[epIndex].cqHandle;
-  uint32_t qpn = ep[epIndex].handle.qpn;
+  uint32_t qpn = ep[epIndex].qpn;
   core::IbufHandle* ibuf = &ep[epIndex].atomicIbuf;
 
   uint64_t activemask = core::GetActiveLaneMask();
@@ -2629,11 +2629,11 @@ inline __device__ void ShmemGetMemNbiThreadKernelImpl(const application::SymmMem
   if (bytes == 0) return;
 
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
-  application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
+  ShmemRdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
   core::WorkQueueHandle* wq = &ep[epIndex].wqHandle;
   core::CompletionQueueHandle* cq = &ep[epIndex].cqHandle;
-  uint32_t qpn = ep[epIndex].handle.qpn;
+  uint32_t qpn = ep[epIndex].qpn;
 
   bool needsChunking = globalGpuStates->useVMMHeap;
   size_t currentOffset = 0;
@@ -2845,11 +2845,11 @@ inline __device__ void ShmemGetMemNbiThreadKernelAddrImpl(void* dest, const void
   if (bytes == 0) return;
 
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
-  application::RdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
+  ShmemRdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
   core::WorkQueueHandle* wq = &ep[epIndex].wqHandle;
   core::CompletionQueueHandle* cq = &ep[epIndex].cqHandle;
-  uint32_t qpn = ep[epIndex].handle.qpn;
+  uint32_t qpn = ep[epIndex].qpn;
 
   bool needsChunking = globalGpuStates->useVMMHeap;
 

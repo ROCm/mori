@@ -21,6 +21,8 @@
 // SOFTWARE.
 #pragma once
 
+// RdmaDeviceVendorId and RdmaMemoryRegion are defined in application_device_types.hpp
+// so that device (HIP/CUDA) compilation units can use them without ibverbs/STL dependencies.
 #include <unistd.h>
 
 #include <cassert>
@@ -32,9 +34,9 @@
 #include <vector>
 
 #include "infiniband/verbs.h"
+#include "mori/application/application_device_types.hpp"
 #include "mori/core/transport/rdma/rdma.hpp"
 #include "mori/hip_compat.hpp"
-// #include "mori/core/transport/rdma/primitives.hpp"
 
 namespace mori {
 namespace application {
@@ -49,12 +51,8 @@ enum class RdmaBackendType : uint32_t {
   IBVerbs = 2,
 };
 
-enum class RdmaDeviceVendorId : uint32_t {
-  Unknown = 0,
-  Mellanox = 0x02c9,
-  Broadcom = 0x14E4,
-  Pensando = 0x1dd8,
-};
+// RdmaDeviceVendorId is defined in application_device_types.hpp (included above).
+// template helper for vendor ID conversion stays here (host-only use):
 
 template <typename T>
 RdmaDeviceVendorId ToRdmaDeviceVendorId(T v) {
@@ -150,12 +148,7 @@ struct WorkQueueAttrs {
   uint32_t offset{0};
 };
 
-struct RdmaMemoryRegion {
-  uintptr_t addr{0};
-  uint32_t lkey{0};
-  uint32_t rkey{0};
-  size_t length{0};
-};
+// RdmaMemoryRegion is defined in application_device_types.hpp (included above).
 
 struct RdmaEndpoint {
   RdmaDeviceVendorId vendorId{RdmaDeviceVendorId::Unknown};

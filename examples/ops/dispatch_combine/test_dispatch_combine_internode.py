@@ -28,7 +28,7 @@ import argparse
 import time
 from tqdm import tqdm
 
-os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "64G")
+os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "16G")
 
 kernel_type_map = {
     "v0": mori.ops.EpDispatchCombineKernelType.InterNode,
@@ -1237,7 +1237,7 @@ class EpDispatchCombineTestCase:
         [disp_rdma_bw, disp_xgmi_bw, disp_lat_us,
          comb_rdma_bw, comb_xgmi_bw, comb_lat_us].
         """
-        (disp_dur, disp_rdma, disp_xgmi, comb_dur, comb_rdma, comb_xgmi, ll_scale) = (
+        disp_dur, disp_rdma, disp_xgmi, comb_dur, comb_rdma, comb_xgmi, ll_scale = (
             bench_result
         )
         repeat = len(disp_dur)
