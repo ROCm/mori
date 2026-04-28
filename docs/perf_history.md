@@ -1065,6 +1065,55 @@ recover enough gap; the next viable directions are still:
 
 ---
 
+## Entry 24 — Plan A v3 chunk-density sweep (16 chunks) FAILED
+- **Date**: 2026-04-29
+- **Commit under test**: `4de2c44a` / Plan A v2 code path
+- **Command**: `SKIP_BUILD=1 VARIANTS="96:32 128:48" MORI_DIRECT_CHUNKS=16 bash tools/bench_plan_a_sweep.sh`
+- **Scenario**: 256MB / stage × 4 stages, 8-rank MI355X, `ITERATIONS=50`, `WARMUP=10`
+- **All variants correctness PASSED**
+
+| variant | Plan A active | wall | seq_ar | GEMM slowdown | RCCL wall (same run) | gap vs RCCL |
+|---|---|---:|---:|---:|---:|---:|
+| `CU96_NR32`, chunks=16 | blocks=97, nR=32, nA=64, chunk_elems=4194304 | 8.728 | 5.273 | 2.377 | 7.442 | +1.286 |
+| `CU128_NR48`, chunks=16 | blocks=129, nR=48, nA=80, chunk_elems=4194304 | 8.701 | 5.339 | 2.369 | 7.577 | +1.124 |
+
+### Comparison vs chunks=8 (Entry 23)
+
+| split | chunks=8 wall | chunks=16 wall | chunks=8 seq_ar | chunks=16 seq_ar | chunks=8 slowdown | chunks=16 slowdown |
+|---|---:|---:|---:|---:|---:|---:|
+| 96/32 | 8.568 | **8.728** | 5.104 | **5.273** | 2.331 | **2.377** |
+| 128/48 | 8.467 | **8.701** | 5.137 | **5.339** | 2.304 | **2.369** |
+
+### Mechanism
+
+The "shorter CU burst" hypothesis is refuted. Increasing chunk count from 8
+to 16 makes both sides worse:
+- `seq_ar` worsens by +0.17 to +0.20 ms (more per-chunk barrier/sync overhead)
+- GEMM slowdown worsens by +0.046 to +0.065 (more frequent CU wake/dispatch and
+  synchronization, not less contention)
+- wall worsens by +0.16 to +0.23 ms
+
+Plan A's bottleneck is not just burst granularity; it is the fact that the AG
+path performs substantial CU XGMI pull + local user_output write during the
+GEMM overlap window. Smaller chunks add overhead without making that CU work
+sparse enough to match RCCL.
+
+### Conclusion
+
+Plan A v3 chunk-density tuning is closed. Best Plan A remains Entry 23
+`CU128_NR48, chunks=8`: 8.467 ms, still +0.873 ms worse than RCCL. Do not spend
+more iterations on Plan A CU scheduling unless a new mechanism appears.
+
+Because user ruled out explicit `register_user_output` (D'') due to non-reused
+buffers, the next candidate is **π' / local SDMA copy path**:
+- keep current SDMA scatter + reduce + SDMA AG (no extra CU work)
+- replace external `hipMemcpyAsync` CU blit transit→user_output with an internal
+  local SDMA copy path, or run that copy on a separate SDMA queue with double
+  buffering so later AR kernels do not wait on previous copy
+- does not require user buffer reuse or API change
+
+---
+
 ## Entry 19 — Plan A (PipelinedXGMIPullKernel) baseline reference + kernel swap
 - **Date**: 2026-04-24
 - **Baseline reference SHA**: `5f0072e7` (code HEAD at measurement time) /
