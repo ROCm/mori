@@ -30,9 +30,12 @@
 #include <cstdint>
 
 #include "hip/hip_runtime_api.h"
-#include "mori/application/application.hpp"
-
+#include "mori/application/symm_mem_obj_fwd.hpp"
 namespace mori {
+
+namespace application {
+class BootstrapNetwork;
+} 
 namespace shmem {
 
 /* ---------------------------------------------------------------------------------------------- */

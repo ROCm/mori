@@ -32,6 +32,7 @@
 #include "mori/application/bootstrap/bootstrap.hpp"
 #include "mori/application/context/context.hpp"
 #include "mori/application/memory/va_manager.hpp"
+#include "mori/application/symm_mem_obj_fwd.hpp"
 #include "mori/application/transport/sdma/anvil.hpp"
 #include "mori/application/transport/transport.hpp"
 #include "mori/hip_compat.hpp"
@@ -105,23 +106,6 @@ struct SymmMemObj {
   inline __device__ __host__ T GetAs(int pe) const {
     return reinterpret_cast<T>(p2pPeerPtrs[pe]);
   }
-};
-
-struct SymmMemObjPtr {
-  SymmMemObj* cpu{nullptr};
-  SymmMemObj* gpu{nullptr};
-
-  bool IsValid() { return (cpu != nullptr) && (gpu != nullptr); }
-
-#if defined(__HIPCC__) || defined(__CUDACC__)
-  __host__ SymmMemObj* operator->() { return cpu; }
-  __device__ SymmMemObj* operator->() { return gpu; }
-  __host__ const SymmMemObj* operator->() const { return cpu; }
-  __device__ const SymmMemObj* operator->() const { return gpu; }
-#else
-  SymmMemObj* operator->() { return cpu; }
-  const SymmMemObj* operator->() const { return cpu; }
-#endif
 };
 
 class SymmMemManager {
@@ -236,6 +220,7 @@ class SymmMemManager {
                              size_t chunksNeeded, int rank, int worldSize, int currentDev);
   void RegisterRdmaChunks(size_t startChunk, size_t chunksNeeded, int rank, int worldSize);
 };
-
+  
 }  // namespace application
+
 }  // namespace mori
