@@ -792,6 +792,81 @@ Summarized here for quick lookup; exact commits in git log:
 
 ---
 
+## Entry 20 — Plan A FAILED (+1.58 ms vs RCCL); root cause is CU-as-AG architectural mismatch with GEMM overlap
+- **Date**: 2026-04-28
+- **Plan A code SHA**: `611c2f2c` (post-fix; chain `e7050bc6` Plan A swap + `bb8911f4` test syntax fix + `9db1d420` stuck instrumentation + `611c2f2c` phase_ts capacity 32→128)
+- **Bench command**: `bash tools/bench_plan_a.sh` — env `MORI_PIPELINE_CU=160 MORI_DIRECT_OUTPUT=1`, `--num-stages 4 --elems 67108864 --iterations 50 --warmup 10` (wall) + `--iterations 3 --warmup 2 --ar-phase-timing` (phase)
+- **All Test 1/1b/2/3/4/5/6 PASSED correctness on Plan A path**
+
+### Wall data (256 MB / stage × 4 stages, MI355X 8-rank, today)
+
+| variant | overlap wall | seq_ar | seq_gemm | overlap/seq_gemm | vs RCCL |
+|---|---|---|---|---|---|
+| **Plan A** (SDMA copy + Plan A active) | **9.084 ms** | 5.845 | 4.129 | **2.200** | **+21.1% (+1.581 ms WORSE)** |
+| SDMA no-copy (baseline path, no Plan A) | 7.355 ms | 4.801 | 3.991 | 1.843 | -2.0% |
+| RCCL today | 7.503 ms | 5.133 | 3.977 | 1.887 | — |
+
+vs Entry 19 BASELINE (no Plan A) 7.802 ms: **Plan A 慢 1.28 ms (+16.4%)**.
+
+### Root cause analysis (mechanism, not just numbers)
+
+**The fundamental architectural mismatch**: Plan A moves the AllGather phase from the SDMA engine (an independent hardware unit) to the CU (which GEMM also needs). In the multi-stage GEMM+AR overlap test (Test 6), AR and GEMM run concurrently — any algorithm whose AR phase fights GEMM for CU loses overlap.
+
+**Mechanism 1: CU AG breaks chunk-level pipeline (seq_ar +0.66 ms)**
+
+BASELINE chunk pipeline (depth 2):
+```
+CU:    [reduce c0] [reduce c1] [reduce c2] ...    ← 一直占着 CU 做 reduce
+SDMA:              [AG c0    ] [AG c1    ] ...    ← 独立 SDMA engine 做 AG
+```
+SDMA AG runs on a separate hardware engine, so chunk c+1 reduce on CU runs in parallel with chunk c SDMA AG. Each chunk's wall ≈ max(reduce, SDMA AG).
+
+Plan A chunk timeline (depth 1):
+```
+CU:    [reduce c0][barrier][AG_pull c0][reduce c1][barrier][AG_pull c1]...
+```
+CU XGMI pull AG occupies the same CU hardware, so the next chunk's reduce cannot start until the current chunk's AG pull completes. Strict serial. Per-chunk wall ≈ reduce + barrier + AG_pull instead of max(...).
+
+Per-chunk phase data (block 0 c1..c7 deltas, c0 was garbage from slot-1 unwritten): **0.30 ms/chunk** in Plan A. 8 chunks × 0.30 = 2.4 ms upper bound for one AR. seq_ar 5.845 / 4 = 1.46 ms/AR matches the per-chunk depth-1 estimate (some overlap still happens between block 0 barrier and CB AG pull).
+
+**Mechanism 2: CU占用密度 with GEMM overlap (overlap +1.28 ms / 4 AR = +0.32 ms/AR)**
+
+CU occupation per AR by algorithm:
+
+| algorithm | per-AR CU work | overlap/seq_gemm ratio (measured) |
+|---|---|---|
+| RCCL ring | sparse: 14 steps × ~0.05 ms reduce, idle in between | **1.89** (today) |
+| BASELINE SDMA AG | dense reduce only (~0.30 ms) | **2.12** (Entry 19) |
+| Plan A CU pull AG + write user_output | reduce + barrier + pull + local write (~1.0 ms) | **2.20** (today) |
+| Plan B CU push AG + CU copy | reduce + push + copy (~0.95 ms) | **2.44** (Entry 18) |
+
+**Monotone relationship: more CU occupancy in AR phase → larger GEMM extension in overlap → larger wall**. This is observed across 4 algorithms with different CU usage patterns. Plan A 2.20 is the third-worst point on this curve. RCCL wins because its ring is intrinsically pipelined and CU usage is sparse.
+
+**Why RCCL ring is fast**: each of 14 steps does receive 32MB → reduce 32MB → send 32MB. Reduce step takes ~0.05 ms of CU. Between steps the CU is idle (XGMI traffic moving). Sparse CU occupancy → low GEMM contention → overlap/seq_gemm 1.89 (the lowest).
+
+**Conclusion**: Plan A failure is **architectural, not implementation**. No vectorize/partition/CU-count tuning can recover 1.58 ms (Mechanism 2 alone is 1.28 ms wall regression, fundamentally tied to CU sharing with GEMM). Plan B (Entry 18) failed via the same mechanism (overlap/seq_gemm 2.44, even worse). **Any CU-based AG approach loses to BASELINE/RCCL in the overlap scenario** because BASELINE's SDMA AG is essentially "free CU time" (the SDMA engine is otherwise idle and not contended by GEMM).
+
+### Lessons (R6 reflection)
+
+- **R10 historical reference miss**: Entry 19 predicted Plan A wall 6.7-6.9 ms with "0.3-0.5 ms CU-GEMM contention upper bound from Plan B's 0.81 regression". Actual contention 1.28 ms (3x prediction). Reason: Plan A's CU AG pull is **3x more CU-intensive than Plan B's CU push** (Plan A also does the local write to user_output that Plan B left for a separate C-group). Should have enumerated the CU work breakdown, not extrapolated from one prior data point.
+- **R6 reflection on architecture choice**: any future scheme that moves AG/copy onto CU during GEMM overlap should be rejected up-front by mechanism reasoning, not benchmarked. The "CU-occupancy ↔ overlap-ratio" data series across BASELINE/Plan A/Plan B is now solid enough to predict any new candidate.
+- **R0 / phase timing OOB bug fixed in this commit chain**: kArPhaseTsCapacity 32 → 128 with bound check on helpers (`611c2f2c`). slot 11+3*numChunks=35 OOB at numChunks=8 corrupted CrossPeBarrier sync state and deadlocked the next launch. Was the trigger for the original 30-min NCCL watchdog timeouts seen in early Plan A runs; root cause not Plan A logic itself.
+
+### Closed direction
+
+**Plan A — PipelinedXGMIPullKernel**: failed +1.58 ms vs RCCL. Mechanism is architectural CU contention with GEMM. Code retained at HEAD pending user decision on revert vs. extracting useful instrumentation pieces.
+
+### Remaining viable directions (must keep SDMA AG to avoid CU contention)
+
+| # | direction | mechanism | predicted gain | blocker |
+|---|---|---|---|---|
+| 1 | **D''** | SDMA AG writes directly to user_output (register user_output as symm memory), eliminate transit→user_output copy entirely | 1.4 ms (4 × 0.35 ms hipMemcpyAsync removed) → wall ~6.93 ms (-0.5 ms vs RCCL) | user must call `register_user_output(ptr,size)` once before hot loop; D' (Entry 11) failed on PyTorch caching allocator + IPC offset, but D'' lets user control lifetime explicitly |
+| 2 | **π'** | move transit→user_output copy onto a separate SDMA queue with double-buffered transit; next AR doesn't wait for prior copy | (N-1) × 0.35 = 1.05 ms (3 of 4 copies hidden, last tail exposed) → wall ~6.75 ms | needs a 3rd SDMA queue; +256 MB transit memory |
+
+Both keep SDMA AG → no CU contention → consistent with the mechanism above.
+
+---
+
 ## Entry 19 — Plan A (PipelinedXGMIPullKernel) baseline reference + kernel swap
 - **Date**: 2026-04-24
 - **Baseline reference SHA**: `5f0072e7` (code HEAD at measurement time) /
