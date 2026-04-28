@@ -1116,7 +1116,7 @@ buffers, the next candidate is **π' / local SDMA copy path**:
 
 ## Entry 25 — Add Test 6 continuous-iters mode to model real continuous workload
 - **Date**: 2026-04-29
-- **Commit**: _this commit_
+- **Commit**: `2ff3e94f`
 - **User correction**: real workload is continuous (e.g. 100 consecutive
   requests/micro-batches), not isolated finite 4-stage benchmark iterations.
   Current Test 6 finite mode has `torch.cuda.synchronize()` at the start/end
