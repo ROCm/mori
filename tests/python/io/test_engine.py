@@ -22,6 +22,7 @@
 import pytest
 import os
 import time
+import gc
 from contextlib import contextmanager
 from tests.python.utils import get_free_port
 import torch
@@ -297,6 +298,38 @@ def alloc_and_register_mem(engine_pair, shape):
     return tensor1, tensor2, initiator_mem, target_mem
 
 
+def register_explicit_mem(engine_pair, initiator_tensor, target_tensor):
+    initiator, target = engine_pair
+    initiator_mem = initiator.register_torch_tensor(initiator_tensor)
+    target_mem = target.register_torch_tensor(target_tensor)
+    return initiator_mem, target_mem
+
+
+def cleanup_engine_pair(initiator, target, initiator_mems=(), target_mems=()):
+    if initiator is not None:
+        for mem in initiator_mems:
+            if mem is None:
+                continue
+            try:
+                initiator.deregister_memory(mem)
+            except Exception:
+                pass
+    if target is not None:
+        for mem in target_mems:
+            if mem is None:
+                continue
+            try:
+                target.deregister_memory(mem)
+            except Exception:
+                pass
+
+    del initiator
+    del target
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def check_transfer_result(
     engine_pair,
     initiator_status,
@@ -490,6 +523,590 @@ def test_notification_disabled():
         initiator.get_engine_desc().key, transfer_uid
     )
     assert inbound_status is None  # No notification received
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
+@pytest.mark.parametrize("op_type", ("write", "read"))
+def test_rdma_chunked_session_transfer_crosses_multiple_chunks(op_type):
+    with temporary_env("MORI_IO_RDMA_MR_CHUNK_SIZE", "64"):
+        initiator, target = create_connected_engine_pair(
+            "chunked_single",
+            qp_per_transfer=2,
+            post_batch_size=-1,
+            num_worker_threads=1,
+            enable_notification=True,
+        )
+        initiator_mem = None
+        target_mem = None
+        sess = None
+
+        try:
+            total_bytes = 256
+            local_offset = 48
+            transfer_size = 160
+
+            if op_type == "write":
+                initiator_tensor = torch.arange(
+                    total_bytes, dtype=torch.uint8, device=torch.device("cuda", 0)
+                )
+                target_tensor = torch.full(
+                    (total_bytes,),
+                    0xA5,
+                    dtype=torch.uint8,
+                    device=torch.device("cuda", 1),
+                )
+            else:
+                initiator_tensor = torch.full(
+                    (total_bytes,),
+                    0x5A,
+                    dtype=torch.uint8,
+                    device=torch.device("cuda", 0),
+                )
+                target_tensor = torch.arange(
+                    total_bytes, dtype=torch.uint8, device=torch.device("cuda", 1)
+                )
+
+            initiator_before = initiator_tensor.clone()
+            target_before = target_tensor.clone()
+            initiator_mem, target_mem = register_explicit_mem(
+                (initiator, target), initiator_tensor, target_tensor
+            )
+
+            sess = initiator.create_session(initiator_mem, target_mem)
+            assert sess is not None
+            assert sess.alive()
+
+            transfer_uid = sess.allocate_transfer_uid()
+            op = sess.write if op_type == "write" else sess.read
+            status = op(local_offset, local_offset, transfer_size, transfer_uid)
+
+            wait_status(status)
+            assert status.Succeeded(), status.Message()
+
+            inbound = wait_inbound_status_with_timeout(
+                target, initiator.get_engine_desc().key, transfer_uid, timeout_s=3.0
+            )
+            assert (
+                inbound is not None
+            ), "Expected inbound notification for chunked transfer"
+            assert inbound.Succeeded(), inbound.Message()
+
+            if op_type == "write":
+                expected_target = target_before.clone()
+                expected_target[local_offset : local_offset + transfer_size] = (
+                    initiator_before[local_offset : local_offset + transfer_size]
+                )
+                assert torch.equal(target_tensor.cpu(), expected_target.cpu())
+                assert torch.equal(initiator_tensor.cpu(), initiator_before.cpu())
+            else:
+                expected_initiator = initiator_before.clone()
+                expected_initiator[local_offset : local_offset + transfer_size] = (
+                    target_before[local_offset : local_offset + transfer_size]
+                )
+                assert torch.equal(initiator_tensor.cpu(), expected_initiator.cpu())
+                assert torch.equal(target_tensor.cpu(), target_before.cpu())
+        finally:
+            del sess
+            cleanup_engine_pair(initiator, target, [initiator_mem], [target_mem])
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
+def test_rdma_chunked_multithread_batch_crosses_chunks():
+    with temporary_env("MORI_IO_RDMA_MR_CHUNK_SIZE", "64"):
+        initiator, target = create_connected_engine_pair(
+            "chunked_multhd",
+            qp_per_transfer=2,
+            post_batch_size=-1,
+            num_worker_threads=2,
+            enable_notification=True,
+        )
+        initiator_mem = None
+        target_mem = None
+        sess = None
+
+        try:
+            total_bytes = 512
+            initiator_tensor = torch.arange(
+                total_bytes, dtype=torch.uint8, device=torch.device("cuda", 0)
+            )
+            target_tensor = torch.full(
+                (total_bytes,), 0x11, dtype=torch.uint8, device=torch.device("cuda", 1)
+            )
+            target_before = target_tensor.clone()
+
+            initiator_mem, target_mem = register_explicit_mem(
+                (initiator, target), initiator_tensor, target_tensor
+            )
+
+            sess = initiator.create_session(initiator_mem, target_mem)
+            assert sess is not None
+            assert sess.alive()
+
+            offsets = [16, 112, 208, 304]
+            sizes = [96, 96, 96, 96]
+            transfer_uid = sess.allocate_transfer_uid()
+            status = sess.batch_write(offsets, offsets, sizes, transfer_uid)
+
+            wait_status(status)
+            assert status.Succeeded(), status.Message()
+
+            inbound = wait_inbound_status_with_timeout(
+                target, initiator.get_engine_desc().key, transfer_uid, timeout_s=3.0
+            )
+            assert (
+                inbound is not None
+            ), "Expected inbound notification for chunked multithread batch"
+            assert inbound.Succeeded(), inbound.Message()
+
+            expected_target = target_before.clone()
+            for offset, size in zip(offsets, sizes):
+                expected_target[offset : offset + size] = initiator_tensor[
+                    offset : offset + size
+                ]
+            assert torch.equal(target_tensor.cpu(), expected_target.cpu())
+        finally:
+            del sess
+            cleanup_engine_pair(initiator, target, [initiator_mem], [target_mem])
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
+def test_rdma_chunked_session_invalidates_on_deregister_and_reregisters_same_tensor():
+    with temporary_env("MORI_IO_RDMA_MR_CHUNK_SIZE", "64"):
+        initiator, target = create_connected_engine_pair(
+            "chunked_reregister",
+            qp_per_transfer=2,
+            post_batch_size=-1,
+            num_worker_threads=1,
+            enable_notification=True,
+        )
+        initiator_mem = None
+        re_registered_mem = None
+        target_mem = None
+        sess = None
+        recovered_sess = None
+
+        try:
+            total_bytes = 256
+            initiator_tensor = torch.arange(
+                total_bytes, dtype=torch.uint8, device=torch.device("cuda", 0)
+            )
+            target_tensor = torch.zeros(
+                total_bytes, dtype=torch.uint8, device=torch.device("cuda", 1)
+            )
+
+            initiator_mem, target_mem = register_explicit_mem(
+                (initiator, target), initiator_tensor, target_tensor
+            )
+
+            sess = initiator.create_session(initiator_mem, target_mem)
+            assert sess is not None
+            assert sess.alive()
+
+            first_uid = sess.allocate_transfer_uid()
+            first_status = sess.write(0, 0, total_bytes, first_uid)
+            wait_status(first_status)
+            assert first_status.Succeeded(), first_status.Message()
+            inbound = wait_inbound_status_with_timeout(
+                target, initiator.get_engine_desc().key, first_uid, timeout_s=3.0
+            )
+            assert inbound is not None
+            assert inbound.Succeeded(), inbound.Message()
+            assert torch.equal(initiator_tensor.cpu(), target_tensor.cpu())
+
+            target_tensor.zero_()
+            initiator.deregister_memory(initiator_mem)
+            initiator_mem = None
+
+            assert not sess.alive()
+            stale_uid = sess.allocate_transfer_uid()
+            stale_status = sess.write(0, 0, total_bytes, stale_uid)
+            assert stale_status.Failed()
+            assert stale_status.Code() == StatusCode.ERR_INVALID_ARGS
+            assert "deregistered" in stale_status.Message().lower()
+
+            re_registered_mem = initiator.register_torch_tensor(initiator_tensor)
+            assert re_registered_mem.data == initiator_tensor.data_ptr()
+
+            recovered_sess = initiator.create_session(re_registered_mem, target_mem)
+            assert recovered_sess is not None
+            assert recovered_sess.alive()
+
+            recovered_uid = recovered_sess.allocate_transfer_uid()
+            recovered_status = recovered_sess.write(0, 0, total_bytes, recovered_uid)
+            wait_status(recovered_status)
+            assert recovered_status.Succeeded(), recovered_status.Message()
+            inbound = wait_inbound_status_with_timeout(
+                target, initiator.get_engine_desc().key, recovered_uid, timeout_s=3.0
+            )
+            assert inbound is not None
+            assert inbound.Succeeded(), inbound.Message()
+            assert torch.equal(initiator_tensor.cpu(), target_tensor.cpu())
+        finally:
+            del sess
+            del recovered_sess
+            cleanup_engine_pair(
+                initiator, target, [initiator_mem, re_registered_mem], [target_mem]
+            )
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
+def test_rdma_chunked_large_buffer_cross_boundary():
+    """End-to-end test for chunked registration of a buffer larger than the
+    chunk-size cap, with a transfer that straddles a chunk boundary.
+
+    Why an explicit ``MORI_IO_RDMA_MR_CHUNK_SIZE`` override:
+    NICs like AMD AINIC (ionic) report ``max_mr_size = 0xffffffffffffffff``
+    via ``ibv_query_device_ex``, but the actual hardware/firmware soft limit
+    is much smaller (~2 GiB). The chunked materialization path normally uses
+    the queried ``max_mr_size``, so on such NICs we cannot rely on the
+    "natural" chunked path being triggered without an override. The override
+    forces a 1 GiB chunk, which is comfortably below ionic's real limit and
+    above any reasonable single-page allocation, so registration of a
+    1.05 GiB tensor produces exactly two chunks and a transfer that crosses
+    the 1 GiB boundary exercises the resolved (multi-slice) data path.
+    """
+    chunk_size = 1 << 30  # 1 GiB
+    extra = 64 << 20  # 64 MiB tail in chunk1
+    total_bytes = chunk_size + extra
+    free0, _ = torch.cuda.mem_get_info(0)
+    free1, _ = torch.cuda.mem_get_info(1)
+    if free0 < total_bytes + (256 << 20) or free1 < total_bytes + (256 << 20):
+        pytest.skip(
+            f"requires ~{(total_bytes + (256 << 20)) >> 20} MiB free per GPU; "
+            f"have free0={free0 >> 20} MiB free1={free1 >> 20} MiB"
+        )
+
+    with temporary_env("MORI_IO_RDMA_MR_CHUNK_SIZE", str(chunk_size)):
+        initiator, target = create_connected_engine_pair(
+            "chunked_large_buffer",
+            qp_per_transfer=2,
+            post_batch_size=-1,
+            num_worker_threads=2,
+            enable_notification=True,
+        )
+
+        initiator_mem = None
+        target_mem = None
+        sess = None
+        try:
+            initiator_tensor = torch.full(
+                (total_bytes,), 0xAA, dtype=torch.uint8, device=torch.device("cuda", 0)
+            )
+            target_tensor = torch.full(
+                (total_bytes,), 0xCC, dtype=torch.uint8, device=torch.device("cuda", 1)
+            )
+
+            # Spike a 4 MiB region centered on the 1 GiB chunk boundary with a
+            # deterministic, aperiodic pattern so any cross-chunk slicing bug
+            # (including arbitrary byte/word shifts) shows up in the byte
+            # compare. Each 4-byte word encodes its own position index so the
+            # pattern is unique up to 4 GiB of payload, well above the 4 MiB
+            # spike size.
+            spike_size = 4 << 20  # 4 MiB
+            assert spike_size % 4 == 0
+            spike_lo = chunk_size - (spike_size // 2)
+            spike_hi = chunk_size + (spike_size // 2)
+            pattern = torch.arange(
+                spike_size // 4, dtype=torch.int32, device=initiator_tensor.device
+            ).view(torch.uint8)
+            initiator_tensor[spike_lo:spike_hi].copy_(pattern)
+
+            initiator_mem, target_mem = register_explicit_mem(
+                (initiator, target), initiator_tensor, target_tensor
+            )
+
+            sess = initiator.create_session(initiator_mem, target_mem)
+            assert sess is not None
+            assert sess.alive()
+
+            uid = sess.allocate_transfer_uid()
+            status = sess.write(spike_lo, spike_lo, spike_size, uid)
+            wait_status(status)
+            assert status.Succeeded(), status.Message()
+
+            inbound = wait_inbound_status_with_timeout(
+                target, initiator.get_engine_desc().key, uid, timeout_s=10.0
+            )
+            assert inbound is not None
+            assert inbound.Succeeded(), inbound.Message()
+
+            # The spike region (which crosses the 1 GiB chunk boundary) must
+            # match byte-for-byte after the cross-chunk transfer.
+            spike_target = target_tensor[spike_lo:spike_hi].cpu()
+            spike_expected = pattern.cpu()
+            assert torch.equal(
+                spike_target, spike_expected
+            ), "boundary-crossing data corrupted"
+
+            # Spot check that areas outside the transfer were untouched.
+            assert target_tensor[0].item() == 0xCC
+            assert target_tensor[spike_lo - 1].item() == 0xCC
+            assert target_tensor[spike_hi].item() == 0xCC
+            assert target_tensor[total_bytes - 1].item() == 0xCC
+        finally:
+            del sess
+            cleanup_engine_pair(initiator, target, [initiator_mem], [target_mem])
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
+def test_rdma_chunked_inflight_dereg_keeps_registration_alive():
+    """In-flight transfers must keep their underlying chunk MRs alive even when
+    the user deregisters the local memory mid-flight.
+
+    Validates the ``CqCallbackMeta::localRegRef`` ownership anchor: if the
+    anchor is missing, deregistering the local memory (which removes the
+    manager's and session cache's references to ``RdmaLocalMemoryRegistration``)
+    would tear down the chunk MRs while WRs are still pending in the SQ, and
+    those in-flight WRs would surface ``LOC_PROT_ERR`` on completion.
+
+    With the patch, the registration object stays alive until the last
+    in-flight transfer's ``CqCallbackMeta`` is released, so all submissions
+    must complete cleanly. Re-registering the same tensor afterward must work
+    against the now-fresh MR set.
+    """
+    with temporary_env("MORI_IO_RDMA_MR_CHUNK_SIZE", "64"):
+        initiator, target = create_connected_engine_pair(
+            "chunked_inflight_dereg",
+            qp_per_transfer=2,
+            post_batch_size=-1,
+            num_worker_threads=1,
+            enable_notification=True,
+        )
+
+        initiator_mem = None
+        target_mem = None
+        re_registered_mem = None
+        recovered_sess = None
+        statuses = []
+
+        try:
+            # Force the resolved (multi-slice) path: small chunk size so each
+            # 4 KiB transfer fans out to ~64 slices, giving the SQ enough
+            # outstanding work that deregistration races with completion.
+            total_bytes = 4096
+            initiator_tensor = torch.arange(
+                total_bytes, dtype=torch.uint8, device=torch.device("cuda", 0)
+            )
+            target_tensor = torch.zeros(
+                total_bytes, dtype=torch.uint8, device=torch.device("cuda", 1)
+            )
+
+            initiator_mem, target_mem = register_explicit_mem(
+                (initiator, target), initiator_tensor, target_tensor
+            )
+
+            # Use the cached path (engine.write) on purpose: when we
+            # deregister, InvalidateSessionsForMemory drops the cache's
+            # session ref so the CqCallbackMeta::localRegRef anchor is the
+            # ONLY thing keeping the registration alive.
+            num_inflight = 64
+            for _ in range(num_inflight):
+                uid = initiator.allocate_transfer_uid()
+                statuses.append(
+                    initiator.write(initiator_mem, 0, target_mem, 0, total_bytes, uid)
+                )
+
+            # Race the deregister against the in-flight WRs. We do NOT wait
+            # before this call.
+            initiator.deregister_memory(initiator_mem)
+            initiator_mem = None  # avoid double-deregister in cleanup
+
+            # All in-flight transfers must still complete successfully. Failure
+            # here (typically with LOC_PROT_ERR) means the chunk MRs got torn
+            # down while WRs were still pending.
+            for i, s in enumerate(statuses):
+                wait_status(s)
+                assert s.Succeeded(), (
+                    f"in-flight transfer #{i} failed after dereg: "
+                    f"code={s.Code()} msg={s.Message()}"
+                )
+            # Final state of target is the last successful write.
+            assert torch.equal(initiator_tensor.cpu(), target_tensor.cpu())
+
+            # Re-registering the same tensor (same data_ptr) at this point
+            # must yield a fresh registration backed by NEW chunk MRs. With
+            # the old address-keyed mrPool, this case used to silently reuse
+            # the stale MR slot; with owned MRs each registration owns its
+            # own ibv_mr* via RAII.
+            target_tensor.zero_()
+            re_registered_mem = initiator.register_torch_tensor(initiator_tensor)
+            assert re_registered_mem.data == initiator_tensor.data_ptr()
+
+            recovered_sess = initiator.create_session(re_registered_mem, target_mem)
+            assert recovered_sess is not None
+            assert recovered_sess.alive()
+
+            recovered_uid = recovered_sess.allocate_transfer_uid()
+            recovered_status = recovered_sess.write(0, 0, total_bytes, recovered_uid)
+            wait_status(recovered_status)
+            assert recovered_status.Succeeded(), recovered_status.Message()
+            inbound = wait_inbound_status_with_timeout(
+                target,
+                initiator.get_engine_desc().key,
+                recovered_uid,
+                timeout_s=3.0,
+            )
+            assert inbound is not None
+            assert inbound.Succeeded(), inbound.Message()
+            assert torch.equal(initiator_tensor.cpu(), target_tensor.cpu())
+        finally:
+            # IMPORTANT: do not clear `statuses` until every transfer has
+            # finished waiting above. CqCallbackMeta keeps a raw pointer to
+            # each TransferStatus, so dropping a status while its WR is still
+            # pending would race with the CQ poll thread.
+            statuses.clear()
+            del recovered_sess
+            cleanup_engine_pair(
+                initiator,
+                target,
+                [initiator_mem, re_registered_mem],
+                [target_mem],
+            )
+
+
+def _likely_ionic_nic():
+    """Heuristic: returns True if this test is likely to run on AMD AINIC (ionic).
+
+    Checks ``MORI_RDMA_DEVICES`` first, then falls back to /sys/class/infiniband.
+    Returns False conservatively when the answer is ambiguous (e.g. mixed
+    vendors with no env override) so the test only enforces the
+    ionic-specific guard when we're confident the test will hit ionic.
+    """
+    env = os.environ.get("MORI_RDMA_DEVICES", "").strip()
+    if env:
+        first = env.split(",")[0].strip().lower()
+        return first.startswith("ionic")
+    try:
+        devs = os.listdir("/sys/class/infiniband")
+    except OSError:
+        return False
+    has_ionic = any(d.startswith("ionic") for d in devs)
+    has_other = any(d.startswith(("mlx", "bnxt")) for d in devs)
+    return has_ionic and not has_other
+
+
+def test_rdma_chunked_cpu_registration_requires_page_aligned_base():
+    """Verify mori-io refuses non-page-aligned chunked CPU registration on ionic.
+
+    On AMD AINIC (ionic, vendor 0x1dd8 / Pensando), the firmware silently
+    drops the last ~64 bytes of any RDMA WRITE landing on a chunked CPU MR's
+    tail when the user-supplied buffer's base VA is NOT 4 KiB page-aligned
+    (so MR_a's last bytes share a 4 KiB kernel page with MR_b's first bytes).
+    The CQE reports IBV_WC_SUCCESS but bytes go missing. mori-io's chunked
+    materialization path refuses such registrations so the user gets a loud
+    failure instead of silent corruption.
+
+    Cross-platform verification: Mellanox mlx5 (vendor 0x02c9) and Broadcom
+    bnxt_re (vendor 0x14e4) tested clean with the same workload, so the
+    guard is gated on Pensando vendor id.
+
+    This test:
+      - allocates a non-page-aligned CPU buffer (a Python-managed buffer
+        large enough to be sliced into a non-page-aligned region, mimicking
+        the shape PyTorch's CPU caching allocator returns)
+      - forces the chunked path via ``MORI_IO_RDMA_MR_CHUNK_SIZE``
+      - asserts that on ionic ``create_session`` returns ``None`` (the
+        guard threw, ``RdmaBackend::CreateSession`` caught and returned
+        nullptr) and on other NICs it succeeds (no guard, no bug).
+
+    Avoids ``ctypes.CDLL("libc.so.6")`` so the test runs on musl-based
+    distros (Alpine etc.) where the glibc SONAME is absent.
+    """
+    import ctypes
+
+    PAGE_SIZE = 4096
+    OFFSET_INTO_PAGE = 64  # mimic PyTorch's 64-byte tensor metadata padding
+
+    # Small buffer (16 MiB) and even smaller chunk (8 MiB) so the chunked
+    # path fires regardless of NIC pin caps and the test stays fast.
+    nbytes = 16 * 1024 * 1024
+    chunk_size = 8 * 1024 * 1024
+
+    # Allocate slightly oversized Python-managed buffers so we can carve out
+    # a (page-aligned + 64-byte offset) interior pointer that is guaranteed
+    # NOT to be 4 KiB page-aligned. Python keeps the underlying ctypes
+    # storage alive as long as the c_char_Array_* objects do, so we pin them
+    # to local variables for the duration of the test.
+    over_alloc = nbytes + 2 * PAGE_SIZE
+    src_storage = ctypes.create_string_buffer(over_alloc)
+    dst_storage = ctypes.create_string_buffer(over_alloc)
+
+    def non_page_aligned_ptr(storage):
+        base = ctypes.addressof(storage)
+        page_aligned = (base + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1)
+        return page_aligned + OFFSET_INTO_PAGE
+
+    src_ptr = non_page_aligned_ptr(src_storage)
+    dst_ptr = non_page_aligned_ptr(dst_storage)
+    assert (
+        src_ptr % PAGE_SIZE != 0
+    ), "test setup error: src_ptr unexpectedly page-aligned"
+    assert (
+        dst_ptr % PAGE_SIZE != 0
+    ), "test setup error: dst_ptr unexpectedly page-aligned"
+    # Sanity: the non-aligned interior must still fit the requested nbytes
+    # within the over-allocated storage.
+    assert src_ptr + nbytes <= ctypes.addressof(src_storage) + over_alloc
+    assert dst_ptr + nbytes <= ctypes.addressof(dst_storage) + over_alloc
+
+    is_ionic = _likely_ionic_nic()
+    src_mem = None
+    dst_mem = None
+    sess = None
+    initiator = None
+    target = None
+    try:
+        with temporary_env("MORI_IO_RDMA_MR_CHUNK_SIZE", str(chunk_size)):
+            initiator, target = create_connected_engine_pair(
+                "page_align_guard",
+                qp_per_transfer=1,
+                post_batch_size=-1,
+                num_worker_threads=1,
+                enable_notification=False,
+            )
+
+            src_mem = initiator.register_memory(
+                src_ptr, nbytes, -1, MemoryLocationType.CPU
+            )
+            dst_mem = target.register_memory(
+                dst_ptr, nbytes, -1, MemoryLocationType.CPU
+            )
+
+            # create_session triggers materialization on both sides; the
+            # chunked CPU registration path's guard runs here.
+            sess = initiator.create_session(src_mem, dst_mem)
+
+            if is_ionic:
+                assert sess is None, (
+                    "Expected create_session to fail (return None) on ionic with a "
+                    "non-page-aligned CPU buffer + chunked path; got a valid session, "
+                    "which means the page-alignment guard in "
+                    "RdmaManager::GetOrMaterializeLocalRegistration did NOT trigger. "
+                    "If you intended to relax the guard, update both the C++ guard and "
+                    "this test."
+                )
+            else:
+                assert sess is not None, (
+                    "Expected create_session to succeed on a non-ionic NIC with a "
+                    "non-page-aligned CPU buffer (the page-alignment guard is "
+                    "ionic-specific). create_session returned None — either the guard "
+                    "is now applying to non-ionic NICs (intentional?), or registration "
+                    "failed for an unrelated reason. Check the engine error log."
+                )
+    finally:
+        if sess is not None:
+            del sess
+        if src_mem is not None and initiator is not None:
+            try:
+                initiator.deregister_memory(src_mem)
+            except Exception:
+                pass
+        if dst_mem is not None and target is not None:
+            try:
+                target.deregister_memory(dst_mem)
+            except Exception:
+                pass
+        # src_storage / dst_storage go out of scope here; Python frees them.
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")

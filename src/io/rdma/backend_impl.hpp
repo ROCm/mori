@@ -55,32 +55,38 @@ class RdmaManager {
   // Topology APIs
   std::vector<std::pair<int, int>> Search(TopoKey);
 
-  // Local memory management APIs
-  std::optional<application::RdmaMemoryRegion> GetLocalMemory(int ldevId, MemoryUniqueId);
-  application::RdmaMemoryRegion RegisterLocalMemory(int ldevId, const MemoryDesc& desc);
-  void DeregisterLocalMemory(int ldevId, const MemoryDesc& desc);
+  // Chunked local memory registration
+  std::shared_ptr<const RdmaLocalMemoryRegistration> GetOrMaterializeLocalRegistration(
+      const MemoryDesc& desc);
+  void DeregisterLocalRegistration(const MemoryDesc& desc);
 
-  // Remote memory management APIs
-  std::optional<application::RdmaMemoryRegion> GetRemoteMemory(EngineKey, int remRdmaDevId,
-                                                               MemoryUniqueId);
-  void RegisterRemoteMemory(EngineKey, int remRdmaDevId, MemoryUniqueId,
-                            application::RdmaMemoryRegion);
-  void DeregisterRemoteMemory(EngineKey, int remRdmaDevId, MemoryUniqueId);
+  // Remote layout management
+  std::shared_ptr<const RdmaRemoteMemoryLayout> GetRemoteLayout(EngineKey, MemoryUniqueId);
+  void RegisterRemoteLayout(EngineKey, MemoryUniqueId,
+                            std::shared_ptr<const RdmaRemoteMemoryLayout>);
+  void DeregisterRemoteLayout(EngineKey, MemoryUniqueId);
 
   // Endpoint management APIs
-  int CountEndpoint(EngineKey, TopoKeyPair);
-  EpPairVec GetAllEndpoint(EngineKey, TopoKeyPair);
+  int CountEndpoint(EngineKey, const ExactRouteKey&);
+  EpPairVec GetAllEndpoint(EngineKey, const ExactRouteKey&);
   application::RdmaEndpoint CreateEndpoint(int devId);
-  EndpointId ConnectEndpoint(EngineKey remoteKey, int ldevId, application::RdmaEndpoint local,
-                             int rdevId, application::RdmaEndpointHandle remote, TopoKeyPair key,
-                             int weight);
+  bool IsValidRdmaDeviceId(int devId) const;
+  void ConnectLocalEndpoint(int ldevId, const application::RdmaEndpoint& local,
+                            const application::RdmaEndpointHandle& remote);
+  void DestroyEndpoint(int devId, const application::RdmaEndpoint& endpoint);
+  EndpointId PublishEndpoint(EngineKey remoteKey, const ExactRouteKey& key,
+                             application::RdmaEndpoint local,
+                             application::RdmaEndpointHandle remote, int weight);
+  bool UnpublishEndpoint(EngineKey remoteKey, const ExactRouteKey& key, EndpointId id);
   std::shared_ptr<EndpointRuntime> GetEndpointRuntime(EndpointId id);
   std::vector<std::shared_ptr<EndpointRuntime>> SnapshotEndpointRuntimes();
 
   application::RdmaDeviceContext* GetRdmaDeviceContext(int devId);
+  size_t GetEffectiveChunkSize(application::RdmaDeviceContext* devCtx);
 
  private:
   application::RdmaDeviceContext* GetOrCreateDeviceContext(int devId);
+  int PickRdmaDeviceForMemory(const MemoryDesc& desc);
 
  private:
   RdmaBackendConfig config;
@@ -90,7 +96,14 @@ class RdmaManager {
   application::ActiveDevicePortList availDevices;
   std::vector<application::RdmaDeviceContext*> deviceCtxs;
 
-  MemoryTable mTable;
+  // Per-memory device affinity: pinned on first materialization
+  std::unordered_map<MemoryUniqueId, int> memoryDeviceAffinity_;
+  // Local registration cache: MemoryUniqueId -> immutable registration
+  std::unordered_map<MemoryUniqueId, std::shared_ptr<const RdmaLocalMemoryRegistration>>
+      localRegistrations_;
+  // Per-memory single-flight mutex for materialization
+  std::unordered_map<MemoryUniqueId, std::shared_ptr<std::mutex>> materializationMutexes_;
+
   std::unordered_map<EngineKey, RemoteEngineMeta> remotes;
   std::atomic<EndpointId> nextEndpointId_{1};
   std::unordered_map<EndpointId, std::shared_ptr<EndpointRuntime>> endpointsById_;
@@ -108,6 +121,7 @@ class NotifManager {
   ~NotifManager();
 
   void RegisterEndpoint(const std::shared_ptr<EndpointRuntime>& rt);
+  void UnregisterEndpoint(const std::shared_ptr<EndpointRuntime>& rt);
 
   void RegisterDevice(int devId);
 
@@ -198,12 +212,13 @@ class ControlPlaneServer {
   void DeregisterRemoteEngine(const EngineDesc&);
 
   // Endpoint management
-  void BuildRdmaConn(EngineKey, TopoKeyPair);
+  void BuildRdmaConn(EngineKey, const ExactRouteKey&);
 
   // MemoryRegion management
   void RegisterMemory(MemoryDesc&);
   void DeregisterMemory(const MemoryDesc&);
-  application::RdmaMemoryRegion AskRemoteMemoryRegion(EngineKey, int rdevId, MemoryUniqueId);
+  std::shared_ptr<const RdmaRemoteMemoryLayout> AskRemoteMemoryLayout(EngineKey, MemoryUniqueId,
+                                                                      size_t expectedSize);
 
   // Server management
   void MainLoop();
@@ -234,12 +249,23 @@ class ControlPlaneServer {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                       RdmaBackendSession                                       */
 /* ---------------------------------------------------------------------------------------------- */
+struct RdmaResolvedLocalMemory {
+  bool singleMrFastPath{false};
+  application::RdmaMemoryRegion singleMr{};
+  std::shared_ptr<const RdmaLocalMemoryRegistration> registration;
+};
+
+struct RdmaResolvedRemoteMemory {
+  bool singleMrFastPath{false};
+  application::RdmaMemoryRegion singleMr{};
+  std::shared_ptr<const RdmaRemoteMemoryLayout> layout;
+};
+
 class RdmaBackendSession : public BackendSession {
  public:
   RdmaBackendSession() = default;
-  RdmaBackendSession(const RdmaBackendConfig& config, const application::RdmaMemoryRegion& local,
-                     const application::RdmaMemoryRegion& remote, const EpPairVec& eps,
-                     Executor* executor);
+  RdmaBackendSession(const RdmaBackendConfig& config, RdmaResolvedLocalMemory local,
+                     RdmaResolvedRemoteMemory remote, const EpPairVec& eps, Executor* executor);
   ~RdmaBackendSession() = default;
 
   void ReadWrite(size_t localOffset, size_t remoteOffset, size_t size, TransferStatus* status,
@@ -252,9 +278,11 @@ class RdmaBackendSession : public BackendSession {
   bool Alive() const;
 
  private:
+  bool UseFastPath(const SizeVec& sizes) const;
+
   RdmaBackendConfig config{};
-  application::RdmaMemoryRegion local{};
-  application::RdmaMemoryRegion remote{};
+  RdmaResolvedLocalMemory local{};
+  RdmaResolvedRemoteMemory remote{};
   EpPairVec eps{};
   Executor* executor{nullptr};
 };
@@ -288,10 +316,11 @@ class RdmaBackend : public Backend {
   bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id, TransferStatus* status);
 
  private:
-  void CreateSession(const MemoryDesc& local, const MemoryDesc& remote, RdmaBackendSession& sess);
+  std::shared_ptr<RdmaBackendSession> CreateSessionImpl(const MemoryDesc& local,
+                                                        const MemoryDesc& remote);
   // Session cache helpers
   struct SessionCacheKey {
-    EngineKey remoteEngineKey;  // use remote memory's engine key
+    EngineKey remoteEngineKey;
     MemoryUniqueId localMemId;
     MemoryUniqueId remoteMemId;
     bool operator==(const SessionCacheKey& o) const {
@@ -302,7 +331,6 @@ class RdmaBackend : public Backend {
   struct SessionCacheKeyHash {
     std::size_t operator()(const SessionCacheKey& k) const noexcept {
       auto hash_combine = [](std::size_t& seed, std::size_t v) {
-        // 64-bit variant of boost::hash_combine / splitmix64 inspired
         seed ^= v + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
       };
       std::size_t seed = 0;
@@ -312,6 +340,9 @@ class RdmaBackend : public Backend {
       return seed;
     }
   };
+  // Cache map owns lifetime via stored shared_ptr; raw return avoids per-call
+  // atomic inc/dec on the hot path. DeregisterMemory must not race with
+  // active transfers.
   RdmaBackendSession* GetOrCreateSessionCached(const MemoryDesc& local, const MemoryDesc& remote);
   void InvalidateSessionsForMemory(MemoryUniqueId id);
 
@@ -322,8 +353,7 @@ class RdmaBackend : public Backend {
   std::unique_ptr<NotifManager> notif{nullptr};
   std::unique_ptr<ControlPlaneServer> server{nullptr};
   std::unique_ptr<Executor> executor{nullptr};
-  // session cache
-  std::unordered_map<SessionCacheKey, std::unique_ptr<RdmaBackendSession>, SessionCacheKeyHash>
+  std::unordered_map<SessionCacheKey, std::shared_ptr<RdmaBackendSession>, SessionCacheKeyHash>
       sessionCache;
   std::mutex sessionCacheMu;
 };

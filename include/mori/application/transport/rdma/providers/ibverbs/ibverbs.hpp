@@ -33,10 +33,13 @@ class IBVerbsDeviceContext : public RdmaDeviceContext {
   ~IBVerbsDeviceContext() override;
 
   virtual RdmaEndpoint CreateRdmaEndpoint(const RdmaEndpointConfig&) override;
+  virtual void DestroyRdmaEndpoint(const RdmaEndpoint& endpoint) override;
   virtual void ConnectEndpoint(const RdmaEndpointHandle& local, const RdmaEndpointHandle& remote,
                                uint32_t qpId = 0) override;
 
  private:
+  // Create/Connect/Destroy all touch these pools; keep provider-local synchronization explicit.
+  std::mutex epPoolMu_;
   std::unordered_map<void*, ibv_cq*> cqPool;
   std::unordered_map<uint32_t, ibv_qp*> qpPool;
   std::vector<ibv_comp_channel*> compChPool;

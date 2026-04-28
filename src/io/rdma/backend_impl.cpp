@@ -154,6 +154,8 @@ RdmaManager::RdmaManager(const RdmaBackendConfig cfg, application::RdmaContext* 
 }
 
 RdmaManager::~RdmaManager() {
+  localRegistrations_.clear();
+
   for (auto* devCtx : deviceCtxs) {
     if (devCtx != nullptr) {
       delete devCtx;
@@ -198,70 +200,229 @@ std::vector<std::pair<int, int>> RdmaManager::Search(TopoKey key) {
 }
 
 /* ----------------------------------- Local Memory Management ---------------------------------- */
-std::optional<application::RdmaMemoryRegion> RdmaManager::GetLocalMemory(int devId,
-                                                                         MemoryUniqueId id) {
-  std::shared_lock<std::shared_mutex> lock(mu);
-  MemoryKey key{devId, id};
-  if (mTable.find(key) == mTable.end()) return std::nullopt;
-  return mTable[key];
+int RdmaManager::PickRdmaDeviceForMemory(const MemoryDesc& desc) {
+  TopoKey tkey{desc.deviceId, desc.loc};
+  auto candidates = Search(tkey);
+  assert(!candidates.empty());
+  return candidates[0].first;
 }
 
-application::RdmaMemoryRegion RdmaManager::RegisterLocalMemory(int devId, const MemoryDesc& desc) {
-  std::unique_lock<std::shared_mutex> lock(mu);
-  MemoryKey key{devId, desc.id};
-  application::RdmaDeviceContext* devCtx = GetOrCreateDeviceContext(devId);
-  mTable[key] = devCtx->RegisterRdmaMemoryRegion(reinterpret_cast<void*>(desc.data), desc.size);
-  return mTable[key];
-}
+size_t RdmaManager::GetEffectiveChunkSize(application::RdmaDeviceContext* devCtx) {
+  auto* device = devCtx->GetRdmaDevice();
+  const auto* attr = device->GetDeviceAttr();
+  size_t deviceMaxMrSize = static_cast<size_t>(attr->orig_attr.max_mr_size);
 
-void RdmaManager::DeregisterLocalMemory(int devId, const MemoryDesc& desc) {
-  std::unique_lock<std::shared_mutex> lock(mu);
-  MemoryKey key{devId, desc.id};
-  if (mTable.find(key) != mTable.end()) {
-    deviceCtxs[devId]->DeregisterRdmaMemoryRegion(reinterpret_cast<void*>(desc.data));
-    mTable.erase(key);
+  size_t effective = deviceMaxMrSize;
+  const char* envOverride = std::getenv("MORI_IO_RDMA_MR_CHUNK_SIZE");
+  if (envOverride) {
+    size_t overrideVal = std::strtoull(envOverride, nullptr, 10);
+    if (overrideVal > 0) {
+      effective = (deviceMaxMrSize > 0) ? std::min(deviceMaxMrSize, overrideVal) : overrideVal;
+    }
   }
+  return effective;
 }
 
-/* ---------------------------------- Remote Memory Management ---------------------------------- */
-std::optional<application::RdmaMemoryRegion> RdmaManager::GetRemoteMemory(EngineKey ekey,
-                                                                          int remRdmaDevId,
-                                                                          MemoryUniqueId id) {
-  std::shared_lock<std::shared_mutex> lock(mu);
-  MemoryKey key{remRdmaDevId, id};
-  RemoteEngineMeta& remote = remotes[ekey];
-  if (remote.mTable.find(key) == remote.mTable.end()) {
-    return std::nullopt;
+std::shared_ptr<const RdmaLocalMemoryRegistration> RdmaManager::GetOrMaterializeLocalRegistration(
+    const MemoryDesc& desc) {
+  // Fast path: check if already materialized
+  {
+    std::shared_lock<std::shared_mutex> lock(mu);
+    auto it = localRegistrations_.find(desc.id);
+    if (it != localRegistrations_.end()) return it->second;
   }
-  return remote.mTable[key];
+
+  // Get or create per-memory mutex for single-flight materialization
+  std::shared_ptr<std::mutex> matMu;
+  {
+    std::unique_lock<std::shared_mutex> lock(mu);
+    auto& ptr = materializationMutexes_[desc.id];
+    if (!ptr) ptr = std::make_shared<std::mutex>();
+    matMu = ptr;
+  }
+
+  std::lock_guard<std::mutex> matLock(*matMu);
+
+  // Re-check after acquiring the per-memory lock
+  {
+    std::shared_lock<std::shared_mutex> lock(mu);
+    auto it = localRegistrations_.find(desc.id);
+    if (it != localRegistrations_.end()) return it->second;
+  }
+
+  // Pin device affinity
+  int rdmaDevId;
+  {
+    std::unique_lock<std::shared_mutex> lock(mu);
+    auto affIt = memoryDeviceAffinity_.find(desc.id);
+    if (affIt != memoryDeviceAffinity_.end()) {
+      rdmaDevId = affIt->second;
+    } else {
+      rdmaDevId = PickRdmaDeviceForMemory(desc);
+      memoryDeviceAffinity_[desc.id] = rdmaDevId;
+    }
+  }
+
+  // Compute chunk plan and register MRs outside the manager lock
+  application::RdmaDeviceContext* devCtx;
+  {
+    std::unique_lock<std::shared_mutex> lock(mu);
+    devCtx = GetOrCreateDeviceContext(rdmaDevId);
+  }
+
+  size_t chunkSize = GetEffectiveChunkSize(devCtx);
+  if (chunkSize == 0 || desc.size <= chunkSize) {
+    // Try single MR first
+    auto ownedMr = devCtx->TryRegisterOwnedMr(reinterpret_cast<void*>(desc.data), desc.size);
+    if (ownedMr.has_value()) {
+      RdmaMemoryLayout layout;
+      layout.rdmaDevId = rdmaDevId;
+      layout.baseAddr = desc.data;
+      layout.logicalSize = desc.size;
+      layout.chunks.push_back({0, ownedMr->Region()});
+
+      std::vector<application::RdmaOwnedMr> ownedMrs;
+      ownedMrs.push_back(std::move(*ownedMr));
+
+      auto reg =
+          std::make_shared<RdmaLocalMemoryRegistration>(std::move(layout), std::move(ownedMrs));
+      std::unique_lock<std::shared_mutex> lock(mu);
+      localRegistrations_[desc.id] = reg;
+      return reg;
+    }
+    if (chunkSize == 0) {
+      MORI_IO_ERROR("Failed to register single MR for memory {} and no chunk size available",
+                    desc.id);
+      throw std::runtime_error("Failed to register RDMA memory region");
+    }
+    // Fall through to chunked registration
+  }
+
+  // Chunked registration
+  //
+  // On AMD AINIC (ionic, vendor_id 0x1dd8 / Pensando), the firmware silently
+  // drops the last ~64 bytes of any RDMA WRITE that lands on a chunked MR's
+  // tail when the user-supplied buffer's base VA is NOT 4 KiB page-aligned.
+  // The CQE reports IBV_WC_SUCCESS but the destination bytes retain their
+  // pre-write content. Triggered specifically when:
+  //   1. CPU memory (kernel pin path; GPU goes through dmabuf importer)
+  //   2. Per-chunk MR size >= 1 GiB (firmware path switch)
+  //   3. Buffer base not page-aligned, so MR_a's last bytes share a 4 KiB
+  //      kernel page with MR_b's first bytes (the chunked path produces
+  //      adjacent MRs from one buffer)
+  //
+  // Cross-platform verification: Mellanox mlx5 (vendor 0x02c9) and Broadcom
+  // bnxt_re (vendor 0x14e4) tested CLEAN with the same workload, so this
+  // guard is gated on Pensando vendor id.
+  //
+  // PyTorch's CPU caching allocator returns 64-byte-aligned but non-page-
+  // aligned pointers (typically ending in 0x...040), which trips the bug.
+  // mmap(2), shm_open + mmap, and posix_memalign(PAGESIZE, ...) all return
+  // page-aligned pointers and are safe.
+  if (desc.loc == MemoryLocationType::CPU) {
+    const bool isIonic = (devCtx->GetRdmaDevice()->GetDeviceAttr()->orig_attr.vendor_id ==
+                          static_cast<uint32_t>(application::RdmaDeviceVendorId::Pensando));
+    if (isIonic && (desc.data % PAGESIZE) != 0) {
+      MORI_IO_ERROR(
+          "Chunked CPU registration on ionic requires a 4 KiB page-aligned "
+          "base address. Memory id={} starts at 0x{:x} (offset 0x{:x} into "
+          "a 4 KiB page). Allocate via mmap, shm_open + mmap, or "
+          "posix_memalign(PAGESIZE, ...). PyTorch CPU tensors are NOT page-"
+          "aligned and trigger an ionic firmware bug that silently corrupts "
+          "cross-MR writes.",
+          desc.id, desc.data, desc.data % PAGESIZE);
+      throw std::runtime_error(
+          "Chunked CPU registration on ionic requires page-aligned base address");
+    }
+  }
+
+  size_t numChunks = (desc.size + chunkSize - 1) / chunkSize;
+  std::vector<RdmaMemoryChunk> chunks;
+  std::vector<application::RdmaOwnedMr> ownedMrs;
+  chunks.reserve(numChunks);
+  ownedMrs.reserve(numChunks);
+
+  for (size_t i = 0; i < numChunks; ++i) {
+    size_t offset = i * chunkSize;
+    size_t len = std::min(chunkSize, desc.size - offset);
+    void* ptr = reinterpret_cast<void*>(desc.data + offset);
+
+    auto ownedMr = devCtx->TryRegisterOwnedMr(ptr, len);
+    if (!ownedMr.has_value()) {
+      MORI_IO_ERROR("Chunk registration failed for memory {}: chunk {}/{} offset={} len={}",
+                    desc.id, i, numChunks, offset, len);
+      throw std::runtime_error("Failed to register RDMA memory chunk");
+    }
+    chunks.push_back({offset, ownedMr->Region()});
+    ownedMrs.push_back(std::move(*ownedMr));
+  }
+
+  RdmaMemoryLayout layout;
+  layout.rdmaDevId = rdmaDevId;
+  layout.baseAddr = desc.data;
+  layout.logicalSize = desc.size;
+  layout.chunks = std::move(chunks);
+
+  auto reg = std::make_shared<RdmaLocalMemoryRegistration>(std::move(layout), std::move(ownedMrs));
+  std::unique_lock<std::shared_mutex> lock(mu);
+  localRegistrations_[desc.id] = reg;
+  MORI_IO_INFO("Materialized local registration for memory {}: {} chunk(s) on rdmaDevId {}",
+               desc.id, reg->Layout().chunks.size(), rdmaDevId);
+  return reg;
 }
 
-void RdmaManager::RegisterRemoteMemory(EngineKey ekey, int remRdmaDevId, MemoryUniqueId id,
-                                       application::RdmaMemoryRegion mr) {
+void RdmaManager::DeregisterLocalRegistration(const MemoryDesc& desc) {
   std::unique_lock<std::shared_mutex> lock(mu);
-  MemoryKey key{remRdmaDevId, id};
-  RemoteEngineMeta& remote = remotes[ekey];
-  remote.mTable[key] = mr;
+  auto it = localRegistrations_.find(desc.id);
+  if (it != localRegistrations_.end()) {
+    it->second->MarkInvalidated();
+    localRegistrations_.erase(it);
+  }
+  memoryDeviceAffinity_.erase(desc.id);
 }
 
-void RdmaManager::DeregisterRemoteMemory(EngineKey ekey, int remRdmaDevId, MemoryUniqueId id) {
+/* ---------------------------------- Remote Layout Management ---------------------------------- */
+std::shared_ptr<const RdmaRemoteMemoryLayout> RdmaManager::GetRemoteLayout(EngineKey ekey,
+                                                                           MemoryUniqueId id) {
+  std::shared_lock<std::shared_mutex> lock(mu);
+  auto remIt = remotes.find(ekey);
+  if (remIt == remotes.end()) return nullptr;
+  auto it = remIt->second.remoteLayouts.find(id);
+  if (it == remIt->second.remoteLayouts.end()) return nullptr;
+  return it->second;
+}
+
+void RdmaManager::RegisterRemoteLayout(EngineKey ekey, MemoryUniqueId id,
+                                       std::shared_ptr<const RdmaRemoteMemoryLayout> layout) {
   std::unique_lock<std::shared_mutex> lock(mu);
-  RemoteEngineMeta& remote = remotes[ekey];
-  MemoryKey key{remRdmaDevId, id};
-  if (remote.mTable.find(key) != remote.mTable.end()) {
-    remote.mTable.erase(key);
+  remotes[ekey].remoteLayouts[id] = std::move(layout);
+}
+
+void RdmaManager::DeregisterRemoteLayout(EngineKey ekey, MemoryUniqueId id) {
+  std::unique_lock<std::shared_mutex> lock(mu);
+  auto remIt = remotes.find(ekey);
+  if (remIt != remotes.end()) {
+    remIt->second.remoteLayouts.erase(id);
   }
 }
 
 /* ------------------------------------- Endpoint Management ------------------------------------ */
-int RdmaManager::CountEndpoint(EngineKey engine, TopoKeyPair key) {
+int RdmaManager::CountEndpoint(EngineKey engine, const ExactRouteKey& key) {
   std::shared_lock<std::shared_mutex> lock(mu);
-  return remotes[engine].rTable[key].size();
+  auto remoteIt = remotes.find(engine);
+  if (remoteIt == remotes.end()) return 0;
+  auto routeIt = remoteIt->second.rTable.find(key);
+  if (routeIt == remoteIt->second.rTable.end()) return 0;
+  return routeIt->second.size();
 }
 
-EpPairVec RdmaManager::GetAllEndpoint(EngineKey engine, TopoKeyPair key) {
+EpPairVec RdmaManager::GetAllEndpoint(EngineKey engine, const ExactRouteKey& key) {
   std::shared_lock<std::shared_mutex> lock(mu);
-  return remotes[engine].rTable[key];
+  auto remoteIt = remotes.find(engine);
+  if (remoteIt == remotes.end()) return {};
+  auto routeIt = remoteIt->second.rTable.find(key);
+  if (routeIt == remoteIt->second.rTable.end()) return {};
+  return routeIt->second;
 }
 
 application::RdmaEndpointConfig RdmaManager::GetRdmaEndpointConfig(int devId) {
@@ -346,17 +507,34 @@ application::RdmaEndpoint RdmaManager::CreateEndpoint(int devId) {
   return rdmaEp;
 }
 
-EndpointId RdmaManager::ConnectEndpoint(EngineKey remoteKey, int devId,
-                                        application::RdmaEndpoint local, int rdevId,
-                                        application::RdmaEndpointHandle remote, TopoKeyPair topoKey,
-                                        int weight) {
+bool RdmaManager::IsValidRdmaDeviceId(int devId) const {
+  std::shared_lock<std::shared_mutex> lock(mu);
+  return devId >= 0 && devId < static_cast<int>(availDevices.size());
+}
+
+void RdmaManager::ConnectLocalEndpoint(int ldevId, const application::RdmaEndpoint& local,
+                                       const application::RdmaEndpointHandle& remote) {
   std::unique_lock<std::shared_mutex> lock(mu);
-  deviceCtxs[devId]->ConnectEndpoint(local.handle, remote);
+  deviceCtxs[ldevId]->ConnectEndpoint(local.handle, remote);
+}
+
+void RdmaManager::DestroyEndpoint(int devId, const application::RdmaEndpoint& endpoint) {
+  std::unique_lock<std::shared_mutex> lock(mu);
+  if (devId < 0 || devId >= static_cast<int>(deviceCtxs.size()) || deviceCtxs[devId] == nullptr) {
+    return;
+  }
+  deviceCtxs[devId]->DestroyRdmaEndpoint(endpoint);
+}
+
+EndpointId RdmaManager::PublishEndpoint(EngineKey remoteKey, const ExactRouteKey& key,
+                                        application::RdmaEndpoint local,
+                                        application::RdmaEndpointHandle remote, int weight) {
+  std::unique_lock<std::shared_mutex> lock(mu);
   RemoteEngineMeta& meta = remotes[remoteKey];
-  auto epConfig = GetRdmaEndpointConfig(devId);
+  auto epConfig = GetRdmaEndpointConfig(key.ldevId);
   EpPair ep{weight,
-            devId,
-            rdevId,
+            key.ldevId,
+            key.rdevId,
             remoteKey,
             local,
             remote,
@@ -364,12 +542,35 @@ EndpointId RdmaManager::ConnectEndpoint(EngineKey remoteKey, int devId,
             static_cast<int>(epConfig.maxMsgsNum),
             std::make_shared<std::atomic<bool>>(false),
             std::make_shared<SubmissionLedger>(config.notifPerQp)};
-  meta.rTable[topoKey].push_back(ep);
+  meta.rTable[key].push_back(ep);
 
   EndpointId id = nextEndpointId_.fetch_add(1);
   auto rt = std::make_shared<EndpointRuntime>(id, ep);
   endpointsById_[id] = rt;
   return id;
+}
+
+bool RdmaManager::UnpublishEndpoint(EngineKey remoteKey, const ExactRouteKey& key, EndpointId id) {
+  std::unique_lock<std::shared_mutex> lock(mu);
+
+  auto rtIt = endpointsById_.find(id);
+  if (rtIt == endpointsById_.end()) return false;
+  uint32_t localQpn = rtIt->second->ep.local.handle.qpn;
+  endpointsById_.erase(rtIt);
+
+  auto remoteIt = remotes.find(remoteKey);
+  if (remoteIt == remotes.end()) return false;
+  auto routeIt = remoteIt->second.rTable.find(key);
+  if (routeIt == remoteIt->second.rTable.end()) return false;
+
+  auto& eps = routeIt->second;
+  auto epIt = std::remove_if(eps.begin(), eps.end(), [localQpn](const EpPair& ep) {
+    return ep.local.handle.qpn == localQpn;
+  });
+  bool removed = epIt != eps.end();
+  eps.erase(epIt, eps.end());
+  if (eps.empty()) remoteIt->second.rTable.erase(routeIt);
+  return removed;
 }
 
 std::shared_ptr<EndpointRuntime> RdmaManager::GetEndpointRuntime(EndpointId id) {
@@ -413,6 +614,8 @@ NotifManager::NotifManager(RdmaManager* rdmaMgr, const RdmaBackendConfig& cfg)
 NotifManager::~NotifManager() { Shutdown(); }
 
 void NotifManager::RegisterEndpoint(const std::shared_ptr<EndpointRuntime>& rt) {
+  if (!rt) return;
+
   if (config.pollCqMode == PollCqMode::EVENT) {
     epoll_event ev;
     ev.events = EPOLLIN;
@@ -462,6 +665,36 @@ void NotifManager::RegisterEndpoint(const std::shared_ptr<EndpointRuntime>& rt) 
     struct ibv_recv_wr* bad = nullptr;
     SYSCALL_RETURN_ZERO(ibv_post_recv(qp, &wr, &bad));
   }
+}
+
+void NotifManager::UnregisterEndpoint(const std::shared_ptr<EndpointRuntime>& rt) {
+  if (!rt) return;
+
+  if (config.pollCqMode == PollCqMode::EVENT && rt->ep.local.ibvHandle.compCh != nullptr) {
+    SYSCALL_RETURN_ZERO_IGNORE_ERROR(
+        epoll_ctl(epfd, EPOLL_CTL_DEL, rt->ep.local.ibvHandle.compCh->fd, NULL), ENOENT);
+  }
+
+  QpNotifContext notifCtx{};
+  bool hasNotifCtx = false;
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    registeredRuntimes_.erase(rt->id);
+    auto it = notifCtxById_.find(rt->id);
+    if (it != notifCtxById_.end()) {
+      notifCtx = it->second;
+      notifCtxById_.erase(it);
+      hasNotifCtx = true;
+    }
+  }
+
+  if (!hasNotifCtx) return;
+
+  application::RdmaDeviceContext* devCtx = rdma->GetRdmaDeviceContext(rt->ep.ldevId);
+  if (devCtx != nullptr) {
+    devCtx->DeregisterRdmaMemoryRegion(reinterpret_cast<void*>(notifCtx.mr.addr));
+  }
+  free(notifCtx.buf);
 }
 
 NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
@@ -780,33 +1013,77 @@ void ControlPlaneServer::DeregisterRemoteEngine(const EngineDesc& rdesc) {
   engines.erase(rdesc.key);
 }
 
-void ControlPlaneServer::BuildRdmaConn(EngineKey ekey, TopoKeyPair topo) {
-  application::TCPEndpointHandle tcph;
-  {
-    std::lock_guard<std::mutex> lock(mu);
-    assert((engines.find(ekey) != engines.end()) && "register engine first");
-    EngineDesc& rdesc = engines[ekey];
-    tcph = ctx->Connect(rdesc.host, rdesc.port);
+void ControlPlaneServer::BuildRdmaConn(EngineKey ekey, const ExactRouteKey& key) {
+  application::TCPEndpointHandle tcph{};
+  bool tcpConnected = false;
+  bool localEpCreated = false;
+  bool published = false;
+  EndpointId eid = 0;
+  application::RdmaEndpoint lep;
+  std::shared_ptr<EndpointRuntime> ert;
+
+  try {
+    {
+      std::lock_guard<std::mutex> lock(mu);
+      assert((engines.find(ekey) != engines.end()) && "register engine first");
+      EngineDesc& rdesc = engines[ekey];
+      tcph = ctx->Connect(rdesc.host, rdesc.port);
+      tcpConnected = true;
+    }
+
+    if (!rdma->IsValidRdmaDeviceId(key.ldevId)) {
+      throw std::runtime_error("invalid initiator local RDMA device id " +
+                               std::to_string(key.ldevId));
+    }
+    if (!rdma->IsValidRdmaDeviceId(key.rdevId)) {
+      throw std::runtime_error("invalid responder local RDMA device id " +
+                               std::to_string(key.rdevId));
+    }
+
+    lep = rdma->CreateEndpoint(key.ldevId);
+    localEpCreated = true;
+
+    Protocol p(tcph);
+    p.WriteMessageRegEndpointRequest({myEngKey, key.topo, key.ldevId, key.rdevId, lep.handle});
+    MessageHeader hdr = p.ReadMessageHeader();
+    if (hdr.type != MessageType::RegEndpoint) {
+      throw std::runtime_error("unexpected control-plane response type " +
+                               std::to_string(static_cast<uint8_t>(hdr.type)));
+    }
+
+    MessageRegEndpointResponse msg = p.ReadMessageRegEndpointResponse(hdr.len);
+    if (msg.code != StatusCode::SUCCESS) {
+      throw std::runtime_error("RegEndpoint failed: " + msg.message);
+    }
+    if (msg.responderLocalDevId != key.rdevId) {
+      throw std::runtime_error("RegEndpoint responder local dev mismatch: expected " +
+                               std::to_string(key.rdevId) + " got " +
+                               std::to_string(msg.responderLocalDevId));
+    }
+
+    rdma->ConnectLocalEndpoint(key.ldevId, lep, msg.responderEph);
+    eid = rdma->PublishEndpoint(ekey, key, lep, msg.responderEph, 1);
+    published = true;
+    ert = rdma->GetEndpointRuntime(eid);
+    if (!ert) throw std::runtime_error("failed to resolve published endpoint runtime");
+    notif->RegisterEndpoint(ert);
+    localEpCreated = false;
+    MORI_IO_INFO("Built exact RdmaConn for engine {} local({},{}) remote({},{}) pair({}->{})", ekey,
+                 key.topo.local.deviceId, key.topo.local.loc, key.topo.remote.deviceId,
+                 key.topo.remote.loc, key.ldevId, key.rdevId);
+  } catch (...) {
+    if (published) {
+      notif->UnregisterEndpoint(ert);
+      if (!rdma->UnpublishEndpoint(ekey, key, eid)) {
+        MORI_IO_WARN("Failed to unpublish initiator endpoint {} for exact route cleanup", eid);
+      }
+    }
+    if (localEpCreated) rdma->DestroyEndpoint(key.ldevId, lep);
+    if (tcpConnected) ctx->CloseEndpoint(tcph);
+    throw;
   }
 
-  auto candidates = rdma->Search(topo.local);
-  assert(!candidates.empty());
-  auto [devId, weight] = candidates[0];
-
-  application::RdmaEndpoint lep = rdma->CreateEndpoint(devId);
-
-  Protocol p(tcph);
-  p.WriteMessageRegEndpoint({myEngKey, topo, devId, lep.handle});
-  MessageHeader hdr = p.ReadMessageHeader();
-  assert(hdr.type == MessageType::RegEndpoint);
-  MessageRegEndpoint msg = p.ReadMessageRegEndpoint(hdr.len);
-
-  EndpointId eid = rdma->ConnectEndpoint(ekey, devId, lep, msg.devId, msg.eph, topo, weight);
-  auto ert = rdma->GetEndpointRuntime(eid);
-  notif->RegisterEndpoint(ert);
-  MORI_IO_INFO("Built RdmaConn for engine {} with topo local({},{}) remote({},{})", ekey,
-               topo.local.deviceId, topo.local.loc, topo.remote.deviceId, topo.remote.loc);
-  ctx->CloseEndpoint(tcph);
+  if (tcpConnected) ctx->CloseEndpoint(tcph);
 }
 
 void ControlPlaneServer::RegisterMemory(MemoryDesc& desc) {
@@ -819,8 +1096,8 @@ void ControlPlaneServer::DeregisterMemory(const MemoryDesc& desc) {
   mems.erase(desc.id);
 }
 
-application::RdmaMemoryRegion ControlPlaneServer::AskRemoteMemoryRegion(EngineKey ekey, int rdevId,
-                                                                        MemoryUniqueId id) {
+std::shared_ptr<const RdmaRemoteMemoryLayout> ControlPlaneServer::AskRemoteMemoryLayout(
+    EngineKey ekey, MemoryUniqueId id, size_t expectedSize) {
   application::TCPEndpointHandle tcph;
   {
     std::lock_guard<std::mutex> lock(mu);
@@ -830,12 +1107,58 @@ application::RdmaMemoryRegion ControlPlaneServer::AskRemoteMemoryRegion(EngineKe
   }
 
   Protocol p(tcph);
-  p.WriteMessageAskMemoryRegion({ekey, rdevId, id, {}});
+  p.WriteMessageAskMemoryLayoutRequest({ekey, id});
   MessageHeader hdr = p.ReadMessageHeader();
-  assert(hdr.type == MessageType::AskMemoryRegion);
-  MessageAskMemoryRegion msg = p.ReadMessageAskMemoryRegion(hdr.len);
+  if (hdr.type != MessageType::AskMemoryLayout) {
+    ctx->CloseEndpoint(tcph);
+    throw std::runtime_error("AskRemoteMemoryLayout: unexpected message type " +
+                             std::to_string(static_cast<uint8_t>(hdr.type)));
+  }
+  MessageAskMemoryLayoutResponse msg = p.ReadMessageAskMemoryLayoutResponse(hdr.len);
+  ctx->CloseEndpoint(tcph);
 
-  return msg.mr;
+  if (msg.code != StatusCode::SUCCESS) {
+    MORI_IO_ERROR("AskRemoteMemoryLayout failed for memory {}: code={} message={}", id,
+                  static_cast<uint32_t>(msg.code), msg.message);
+    throw std::runtime_error("Remote memory layout materialization failed: " + msg.message);
+  }
+
+  // Validate chunk coverage
+  RdmaMemoryLayout layout;
+  layout.rdmaDevId = msg.rdmaDevId;
+  layout.logicalSize = 0;
+  layout.baseAddr = 0;
+  for (auto& cw : msg.chunks) {
+    application::RdmaMemoryRegion mr;
+    mr.addr = static_cast<uintptr_t>(cw.addr);
+    mr.rkey = cw.rkey;
+    mr.lkey = 0;
+    mr.length = static_cast<size_t>(cw.length);
+    layout.chunks.push_back({static_cast<size_t>(cw.offset), mr});
+    if (layout.baseAddr == 0) layout.baseAddr = mr.addr;
+    layout.logicalSize += mr.length;
+  }
+
+  if (layout.chunks.empty()) {
+    throw std::runtime_error("Remote memory layout for id " + std::to_string(id) +
+                             " returned zero chunks");
+  }
+  if (layout.logicalSize != expectedSize) {
+    throw std::runtime_error("Remote memory layout size mismatch for id " + std::to_string(id) +
+                             ": expected " + std::to_string(expectedSize) + " got " +
+                             std::to_string(layout.logicalSize));
+  }
+  size_t expectedOffset = 0;
+  for (const auto& c : layout.chunks) {
+    if (c.offset != expectedOffset) {
+      throw std::runtime_error("Remote memory layout for id " + std::to_string(id) +
+                               " has non-contiguous chunks: expected offset " +
+                               std::to_string(expectedOffset) + " got " + std::to_string(c.offset));
+    }
+    expectedOffset += c.mr.length;
+  }
+
+  return std::make_shared<RdmaRemoteMemoryLayout>(RdmaRemoteMemoryLayout{std::move(layout)});
 }
 
 void ControlPlaneServer::AcceptRemoteEngineConn() {
@@ -858,33 +1181,94 @@ void ControlPlaneServer::HandleControlPlaneProtocol(int fd) {
 
   switch (hdr.type) {
     case MessageType::RegEndpoint: {
-      MessageRegEndpoint msg = p.ReadMessageRegEndpoint(hdr.len);
-      auto candidates = rdma->Search(msg.topo.remote);
-      assert(!candidates.empty());
-      int rdevId = msg.devId;
-      auto [devId, weight] = candidates[0];
-      application::RdmaEndpoint lep = rdma->CreateEndpoint(devId);
-      EndpointId eid =
-          rdma->ConnectEndpoint(msg.ekey, devId, lep, rdevId, msg.eph, msg.topo, weight);
-      auto ert = rdma->GetEndpointRuntime(eid);
-      notif->RegisterEndpoint(ert);
-      p.WriteMessageRegEndpoint(MessageRegEndpoint{myEngKey, msg.topo, devId, lep.handle});
-      SYSCALL_RETURN_ZERO(epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL));
+      MessageRegEndpointRequest msg = p.ReadMessageRegEndpointRequest(hdr.len);
+      application::RdmaEndpoint lep;
+      bool localEpCreated = false;
+      bool published = false;
+      int devId = -1;
+      EndpointId eid = 0;
+      ExactRouteKey reverseKey{};
+      std::shared_ptr<EndpointRuntime> ert;
+
+      try {
+        if (msg.initiatorLocalDevId < 0) {
+          throw std::runtime_error("invalid initiator local RDMA device id");
+        }
+        devId = msg.expectedResponderLocalDevId;
+        if (!rdma->IsValidRdmaDeviceId(devId)) {
+          throw std::runtime_error("invalid responder local RDMA device id " +
+                                   std::to_string(devId));
+        }
+
+        reverseKey.topo = {msg.topo.remote, msg.topo.local};
+        reverseKey.ldevId = devId;
+        reverseKey.rdevId = msg.initiatorLocalDevId;
+
+        lep = rdma->CreateEndpoint(devId);
+        localEpCreated = true;
+        rdma->ConnectLocalEndpoint(devId, lep, msg.initiatorEph);
+        p.WriteMessageRegEndpointResponse({StatusCode::SUCCESS, "", devId, lep.handle});
+      } catch (const std::exception& e) {
+        if (localEpCreated) rdma->DestroyEndpoint(devId, lep);
+        try {
+          p.WriteMessageRegEndpointResponse({StatusCode::ERR_RDMA_OP, e.what(), -1, {}});
+        } catch (...) {
+        }
+        SYSCALL_RETURN_ZERO_IGNORE_ERROR(epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL), ENOENT);
+        break;
+      }
+
+      try {
+        eid = rdma->PublishEndpoint(msg.ekey, reverseKey, lep, msg.initiatorEph, 1);
+        published = true;
+        ert = rdma->GetEndpointRuntime(eid);
+        if (!ert) throw std::runtime_error("failed to resolve published endpoint runtime");
+        notif->RegisterEndpoint(ert);
+        localEpCreated = false;
+      } catch (const std::exception& e) {
+        if (published) {
+          notif->UnregisterEndpoint(ert);
+          if (!rdma->UnpublishEndpoint(msg.ekey, reverseKey, eid)) {
+            MORI_IO_WARN("Failed to unpublish responder endpoint {} for exact route cleanup", eid);
+          }
+        }
+        if (localEpCreated) rdma->DestroyEndpoint(devId, lep);
+        MORI_IO_ERROR("RegEndpoint responder post-response setup failed: {}", e.what());
+      }
+      SYSCALL_RETURN_ZERO_IGNORE_ERROR(epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL), ENOENT);
       break;
     }
-    case MessageType::AskMemoryRegion: {
-      std::lock_guard<std::mutex> lock(mu);
-      MessageAskMemoryRegion msg = p.ReadMessageAskMemoryRegion(hdr.len);
-      if (mems.find(msg.id) != mems.end()) {
-        MemoryDesc& desc = mems[msg.id];
-        auto localMr = rdma->GetLocalMemory(msg.devId, msg.id);
-        if (!localMr.has_value()) {
-          localMr = rdma->RegisterLocalMemory(msg.devId, desc);
+    case MessageType::AskMemoryLayout: {
+      MessageAskMemoryLayoutRequest req = p.ReadMessageAskMemoryLayoutRequest(hdr.len);
+      MemoryDesc desc;
+      bool found = false;
+      {
+        std::lock_guard<std::mutex> lock(mu);
+        auto it = mems.find(req.id);
+        if (it != mems.end()) {
+          desc = it->second;
+          found = true;
         }
-        p.WriteMessageAskMemoryRegion({msg.ekey, msg.devId, msg.id, *localMr});
-      } else {
-        // TODO: we should add status code for NOT_FOUND
-        p.WriteMessageAskMemoryRegion({msg.ekey, msg.devId, msg.id, {}});
+      }
+      if (!found) {
+        p.WriteMessageAskMemoryLayoutResponse(
+            {req.ekey, req.id, StatusCode::ERR_NOT_FOUND, "memory not found", -1, {}});
+        break;
+      }
+      try {
+        auto reg = rdma->GetOrMaterializeLocalRegistration(desc);
+        const auto& layout = reg->Layout();
+        std::vector<RdmaRemoteMemoryChunkWire> wireChunks;
+        wireChunks.reserve(layout.chunks.size());
+        for (const auto& c : layout.chunks) {
+          wireChunks.push_back({static_cast<uint64_t>(c.offset), static_cast<uint64_t>(c.mr.addr),
+                                c.mr.rkey, static_cast<uint64_t>(c.mr.length)});
+        }
+        p.WriteMessageAskMemoryLayoutResponse(
+            {req.ekey, req.id, StatusCode::SUCCESS, "", layout.rdmaDevId, std::move(wireChunks)});
+      } catch (const std::exception& e) {
+        p.WriteMessageAskMemoryLayoutResponse(
+            {req.ekey, req.id, StatusCode::ERR_RDMA_OP, e.what(), -1, {}});
       }
       break;
     }
@@ -949,31 +1333,68 @@ void ControlPlaneServer::Shutdown() {
 /*                                       RdmaBackendSession */
 /* ----------------------------------------------------------------------------------------------
  */
-RdmaBackendSession::RdmaBackendSession(const RdmaBackendConfig& config,
-                                       const application::RdmaMemoryRegion& l,
-                                       const application::RdmaMemoryRegion& r, const EpPairVec& e,
+RdmaBackendSession::RdmaBackendSession(const RdmaBackendConfig& config, RdmaResolvedLocalMemory l,
+                                       RdmaResolvedRemoteMemory r, const EpPairVec& e,
                                        Executor* exec)
-    : config(config), local(l), remote(r), eps(e), executor(exec) {}
+    : config(config), local(std::move(l)), remote(std::move(r)), eps(e), executor(exec) {}
+
+bool RdmaBackendSession::UseFastPath(const SizeVec& sizes) const {
+  if (!local.singleMrFastPath || !remote.singleMrFastPath) return false;
+  for (auto s : sizes) {
+    if (s > std::numeric_limits<uint32_t>::max()) return false;
+  }
+  return true;
+}
 
 void RdmaBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size_t size,
                                    TransferStatus* status, TransferUniqueId id, bool isRead) {
   MORI_IO_FUNCTION_TIMER;
-  status->SetCode(StatusCode::IN_PROGRESS);
-  auto callbackMeta = std::make_shared<CqCallbackMeta>(status, id, 1);
-  internal::PublishCurrentIoCallDiagnostics(callbackMeta);
-
-  RdmaOpRet ret =
-      RdmaReadWrite(eps, local, localOffset, remote, remoteOffset, size, callbackMeta, id, isRead);
-
-  assert(!ret.Init());
-  if (ret.Failed() || ret.Succeeded()) {
-    status->Update(ret.code, ret.message);
+  if (local.registration && local.registration->Invalidated()) {
+    status->Update(StatusCode::ERR_INVALID_ARGS, "local memory has been deregistered");
+    return;
   }
-  if (!ret.Failed() && config.enableNotification) {
-    RdmaOpRet notifRet = RdmaNotifyTransfer(eps, status, id);
-    if (notifRet.Failed()) {
-      status->Update(notifRet.code, notifRet.message);
+  status->SetCode(StatusCode::IN_PROGRESS);
+
+  if (local.singleMrFastPath && remote.singleMrFastPath &&
+      size <= std::numeric_limits<uint32_t>::max()) {
+    auto callbackMeta = std::make_shared<CqCallbackMeta>(status, id, 1);
+    callbackMeta->localRegRef = local.registration;
+    internal::PublishCurrentIoCallDiagnostics(callbackMeta);
+    RdmaOpRet ret = RdmaReadWrite(eps, local.singleMr, localOffset, remote.singleMr, remoteOffset,
+                                  size, callbackMeta, id, isRead);
+    assert(!ret.Init());
+    if (ret.Failed() || ret.Succeeded()) status->Update(ret.code, ret.message);
+  } else {
+    size_t maxResolvedLanes =
+        executor ? std::min(eps.size(), static_cast<size_t>(executor->MaxParallelTasks()))
+                 : eps.size();
+    auto plan =
+        BuildResolvedTransferPlan(eps, local.registration->Layout(), {localOffset},
+                                  remote.layout->layout, {remoteOffset}, {size}, maxResolvedLanes);
+    if (plan.slices.empty() && size > 0) {
+      status->Update(StatusCode::ERR_INVALID_ARGS, "length out of range");
+      return;
     }
+    auto callbackMeta =
+        std::make_shared<CqCallbackMeta>(status, id, static_cast<int>(plan.slices.size()));
+    callbackMeta->localRegRef = local.registration;
+    internal::PublishCurrentIoCallDiagnostics(callbackMeta);
+    RdmaOpRet ret;
+    if (executor) {
+      ResolvedExecutorReq req{eps, plan.slices,          plan.lanes, callbackMeta,
+                              id,  config.postBatchSize, isRead};
+      ret = executor->RdmaBatchReadWriteResolved(req);
+    } else {
+      ret = RdmaSubmitResolvedTransferPlanInline(eps, plan.slices, plan.lanes, callbackMeta, id,
+                                                 isRead, config.postBatchSize);
+    }
+    assert(!ret.Init());
+    if (ret.Failed() || ret.Succeeded()) status->Update(ret.code, ret.message);
+  }
+
+  if (!status->Failed() && config.enableNotification) {
+    RdmaOpRet notifRet = RdmaNotifyTransfer(eps, status, id);
+    if (notifRet.Failed()) status->Update(notifRet.code, notifRet.message);
   }
 }
 
@@ -981,31 +1402,66 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
                                         const SizeVec& sizes, TransferStatus* status,
                                         TransferUniqueId id, bool isRead) {
   MORI_IO_FUNCTION_TIMER;
+  if (local.registration && local.registration->Invalidated()) {
+    status->Update(StatusCode::ERR_INVALID_ARGS, "local memory has been deregistered");
+    return;
+  }
   status->SetCode(StatusCode::IN_PROGRESS);
-  auto callbackMeta = std::make_shared<CqCallbackMeta>(status, id, sizes.size());
-  internal::PublishCurrentIoCallDiagnostics(callbackMeta);
-  RdmaOpRet ret;
-  if (executor) {
-    ExecutorReq req{eps,          local, localOffsets,         remote, remoteOffsets, sizes,
-                    callbackMeta, id,    config.postBatchSize, isRead};
-    ret = executor->RdmaBatchReadWrite(req);
-  } else {
-    ret = RdmaBatchReadWrite(eps, local, localOffsets, remote, remoteOffsets, sizes, callbackMeta,
-                             id, isRead, config.postBatchSize);
-  }
-  assert(!ret.Init());
-  if (ret.Failed() || ret.Succeeded()) {
-    status->Update(ret.code, ret.message);
-  }
-  if (!ret.Failed() && config.enableNotification) {
-    RdmaOpRet notifRet = RdmaNotifyTransfer(eps, status, id);
-    if (notifRet.Failed()) {
-      status->Update(notifRet.code, notifRet.message);
+
+  if (UseFastPath(sizes)) {
+    auto callbackMeta = std::make_shared<CqCallbackMeta>(status, id, sizes.size());
+    callbackMeta->localRegRef = local.registration;
+    internal::PublishCurrentIoCallDiagnostics(callbackMeta);
+    RdmaOpRet ret;
+    if (executor) {
+      ExecutorReq req{eps,   local.singleMr, localOffsets, remote.singleMr,      remoteOffsets,
+                      sizes, callbackMeta,   id,           config.postBatchSize, isRead};
+      ret = executor->RdmaBatchReadWrite(req);
+    } else {
+      ret = RdmaBatchReadWrite(eps, local.singleMr, localOffsets, remote.singleMr, remoteOffsets,
+                               sizes, callbackMeta, id, isRead, config.postBatchSize);
     }
+    assert(!ret.Init());
+    if (ret.Failed() || ret.Succeeded()) status->Update(ret.code, ret.message);
+  } else {
+    size_t maxResolvedLanes =
+        executor ? std::min(eps.size(), static_cast<size_t>(executor->MaxParallelTasks()))
+                 : eps.size();
+    auto plan =
+        BuildResolvedTransferPlan(eps, local.registration->Layout(), localOffsets,
+                                  remote.layout->layout, remoteOffsets, sizes, maxResolvedLanes);
+    if (plan.slices.empty() &&
+        std::any_of(sizes.begin(), sizes.end(), [](size_t sz) { return sz > 0; })) {
+      status->Update(StatusCode::ERR_INVALID_ARGS, "length out of range");
+      return;
+    }
+    auto callbackMeta =
+        std::make_shared<CqCallbackMeta>(status, id, static_cast<int>(plan.slices.size()));
+    callbackMeta->localRegRef = local.registration;
+    internal::PublishCurrentIoCallDiagnostics(callbackMeta);
+    RdmaOpRet ret;
+    if (executor) {
+      ResolvedExecutorReq req{eps, plan.slices,          plan.lanes, callbackMeta,
+                              id,  config.postBatchSize, isRead};
+      ret = executor->RdmaBatchReadWriteResolved(req);
+    } else {
+      ret = RdmaSubmitResolvedTransferPlanInline(eps, plan.slices, plan.lanes, callbackMeta, id,
+                                                 isRead, config.postBatchSize);
+    }
+    assert(!ret.Init());
+    if (ret.Failed() || ret.Succeeded()) status->Update(ret.code, ret.message);
+  }
+
+  if (!status->Failed() && config.enableNotification) {
+    RdmaOpRet notifRet = RdmaNotifyTransfer(eps, status, id);
+    if (notifRet.Failed()) status->Update(notifRet.code, notifRet.message);
   }
 }
 
-bool RdmaBackendSession::Alive() const { return true; }
+bool RdmaBackendSession::Alive() const {
+  return local.registration != nullptr && !local.registration->Invalidated() &&
+         remote.layout != nullptr;
+}
 
 /* ----------------------------------------------------------------------------------------------
  */
@@ -1048,6 +1504,7 @@ RdmaBackend::~RdmaBackend() {
   if (executor.get() != nullptr) {
     executor->Shutdown();
   }
+  sessionCache.clear();
 }
 
 void RdmaBackend::RegisterRemoteEngine(const EngineDesc& rdesc) {
@@ -1062,6 +1519,7 @@ void RdmaBackend::RegisterMemory(MemoryDesc& desc) { server->RegisterMemory(desc
 
 void RdmaBackend::DeregisterMemory(const MemoryDesc& desc) {
   server->DeregisterMemory(desc);
+  rdma->DeregisterLocalRegistration(desc);
   InvalidateSessionsForMemory(desc.id);
 }
 
@@ -1069,8 +1527,13 @@ void RdmaBackend::ReadWrite(const MemoryDesc& localDest, size_t localOffset,
                             const MemoryDesc& remoteSrc, size_t remoteOffset, size_t size,
                             TransferStatus* status, TransferUniqueId id, bool isRead) {
   MORI_IO_FUNCTION_TIMER;
-  RdmaBackendSession* sess = GetOrCreateSessionCached(localDest, remoteSrc);
-  sess->ReadWrite(localOffset, remoteOffset, size, status, id, isRead);
+  try {
+    RdmaBackendSession* sess = GetOrCreateSessionCached(localDest, remoteSrc);
+    sess->ReadWrite(localOffset, remoteOffset, size, status, id, isRead);
+  } catch (const std::exception& e) {
+    MORI_IO_ERROR("RdmaBackend::ReadWrite failed: {}", e.what());
+    status->Update(StatusCode::ERR_RDMA_OP, e.what());
+  }
 }
 
 void RdmaBackend::BatchReadWrite(const MemoryDesc& localDest, const SizeVec& localOffsets,
@@ -1086,51 +1549,69 @@ void RdmaBackend::BatchReadWrite(const MemoryDesc& localDest, const SizeVec& loc
     return;
   }
 
-  RdmaBackendSession* sess = GetOrCreateSessionCached(localDest, remoteSrc);
-  sess->BatchReadWrite(localOffsets, remoteOffsets, sizes, status, id, isRead);
+  try {
+    RdmaBackendSession* sess = GetOrCreateSessionCached(localDest, remoteSrc);
+    sess->BatchReadWrite(localOffsets, remoteOffsets, sizes, status, id, isRead);
+  } catch (const std::exception& e) {
+    MORI_IO_ERROR("RdmaBackend::BatchReadWrite failed: {}", e.what());
+    status->Update(StatusCode::ERR_RDMA_OP, e.what());
+  }
 }
 
 BackendSession* RdmaBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remote) {
-  RdmaBackendSession* sess = new RdmaBackendSession();
-  CreateSession(local, remote, *sess);
-  return sess;
+  try {
+    auto sess = CreateSessionImpl(local, remote);
+    return new RdmaBackendSession(std::move(*sess));
+  } catch (const std::exception& e) {
+    MORI_IO_ERROR("RdmaBackend::CreateSession failed: {}", e.what());
+    return nullptr;
+  }
 }
 
-void RdmaBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remote,
-                                RdmaBackendSession& sess) {
+std::shared_ptr<RdmaBackendSession> RdmaBackend::CreateSessionImpl(const MemoryDesc& local,
+                                                                   const MemoryDesc& remote) {
+  // 1. Materialize local registration (pins local.rdmaDevId)
+  auto localReg = rdma->GetOrMaterializeLocalRegistration(local);
+  const auto& localLayout = localReg->Layout();
+
+  // 2. Fetch remote layout (gets remote.rdmaDevId)
+  EngineKey ekey = remote.engineKey;
+  auto remoteLayout = rdma->GetRemoteLayout(ekey, remote.id);
+  if (!remoteLayout) {
+    remoteLayout = server->AskRemoteMemoryLayout(ekey, remote.id, remote.size);
+    rdma->RegisterRemoteLayout(ekey, remote.id, remoteLayout);
+  }
+
+  // 3. Create/reuse endpoints for the exact (ldevId, rdevId) pair
   TopoKey localKey{local.deviceId, local.loc};
   TopoKey remoteKey{remote.deviceId, remote.loc};
   TopoKeyPair kp{localKey, remoteKey};
+  ExactRouteKey exactKey{kp, localLayout.rdmaDevId, remoteLayout->layout.rdmaDevId};
 
-  EngineKey ekey = remote.engineKey;
-
-  // Create a pair of endpoint if none
-  int epNum = rdma->CountEndpoint(ekey, kp);
-  for (int i = 0; i < (config.qpPerTransfer - epNum); i++) {
-    server->BuildRdmaConn(ekey, kp);
+  EpPairVec epSet = rdma->GetAllEndpoint(ekey, exactKey);
+  while (static_cast<int>(epSet.size()) < config.qpPerTransfer) {
+    server->BuildRdmaConn(ekey, exactKey);
+    epSet = rdma->GetAllEndpoint(ekey, exactKey);
   }
-  EpPairVec eps = rdma->GetAllEndpoint(ekey, kp);
-  assert(!eps.empty());
+  epSet.resize(config.qpPerTransfer);
 
-  EpPairVec epSet = {eps.begin(), eps.begin() + config.qpPerTransfer};
-
-  // TODO: we assume all eps is on same device and has same ldevId/rdevId
-  EpPair ep = epSet[0];
-  auto localMr = rdma->GetLocalMemory(ep.ldevId, local.id);
-  if (!localMr.has_value()) {
-    localMr = rdma->RegisterLocalMemory(ep.ldevId, local);
+  // 4. Build resolved memory descriptors with single-MR fast path detection
+  RdmaResolvedLocalMemory resolvedLocal;
+  resolvedLocal.registration = localReg;
+  if (localLayout.IsSingleChunk()) {
+    resolvedLocal.singleMrFastPath = true;
+    resolvedLocal.singleMr = localLayout.chunks[0].mr;
   }
 
-  auto remoteMr = rdma->GetRemoteMemory(ekey, ep.rdevId, remote.id);
-  if (!remoteMr.has_value()) {
-    remoteMr = server->AskRemoteMemoryRegion(ekey, ep.rdevId, remote.id);
-    // TODO: protocol should return status code
-    // Currently we check member equality to ensure correct memory region
-    assert(remoteMr->length == remote.size);
-    rdma->RegisterRemoteMemory(ekey, ep.rdevId, remote.id, remoteMr.value());
+  RdmaResolvedRemoteMemory resolvedRemote;
+  resolvedRemote.layout = remoteLayout;
+  if (remoteLayout->layout.IsSingleChunk()) {
+    resolvedRemote.singleMrFastPath = true;
+    resolvedRemote.singleMr = remoteLayout->layout.chunks[0].mr;
   }
 
-  sess = RdmaBackendSession(config, localMr.value(), remoteMr.value(), epSet, executor.get());
+  return std::make_shared<RdmaBackendSession>(config, std::move(resolvedLocal),
+                                              std::move(resolvedRemote), epSet, executor.get());
 }
 
 bool RdmaBackend::PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
@@ -1144,18 +1625,12 @@ RdmaBackendSession* RdmaBackend::GetOrCreateSessionCached(const MemoryDesc& loca
   {
     std::lock_guard<std::mutex> lock(sessionCacheMu);
     auto it = sessionCache.find(key);
-    if (it != sessionCache.end()) {
-      return it->second.get();
-    }
+    if (it != sessionCache.end()) return it->second.get();
   }
-  // create outside lock (CreateSession may allocate / block); then insert
-  auto newSess = std::make_unique<RdmaBackendSession>();
-  CreateSession(local, remote, *newSess);
+  auto newSess = CreateSessionImpl(local, remote);
   std::lock_guard<std::mutex> lock(sessionCacheMu);
   auto it = sessionCache.find(key);
-  if (it != sessionCache.end()) {
-    return it->second.get();
-  }
+  if (it != sessionCache.end()) return it->second.get();
   auto [emplacedIt, inserted] = sessionCache.emplace(key, std::move(newSess));
   return emplacedIt->second.get();
 }

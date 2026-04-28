@@ -22,6 +22,7 @@
 #pragma once
 
 #include <condition_variable>
+#include <cstdint>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -50,6 +51,16 @@ struct ExecutorReq {
   bool isRead;
 };
 
+struct ResolvedExecutorReq {
+  const EpPairVec& eps;
+  const std::vector<RdmaTransferSlice>& slices;
+  const std::vector<ResolvedLaneWork>& lanes;
+  std::shared_ptr<CqCallbackMeta> callbackMeta;
+  TransferUniqueId id;
+  int postBatchSize;
+  bool isRead;
+};
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                            Executor                                            */
 /* ---------------------------------------------------------------------------------------------- */
@@ -60,7 +71,9 @@ class Executor {
 
   virtual void Start() = 0;
   virtual void Shutdown() = 0;
+  virtual int MaxParallelTasks() const = 0;
   virtual RdmaOpRet RdmaBatchReadWrite(const ExecutorReq& req) = 0;
+  virtual RdmaOpRet RdmaBatchReadWriteResolved(const ResolvedExecutorReq& req) = 0;
 };
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -72,22 +85,31 @@ class MultithreadExecutor : public Executor {
   ~MultithreadExecutor();
 
   RdmaOpRet RdmaBatchReadWrite(const ExecutorReq& req);
+  RdmaOpRet RdmaBatchReadWriteResolved(const ResolvedExecutorReq& req);
   void Start();
   void Shutdown();
+  int MaxParallelTasks() const { return numWorker; }
 
  private:
   struct Task {
-    const ExecutorReq* req;
+    enum class Kind : uint8_t { SingleMr, Resolved };
+
+    Kind kind{Kind::SingleMr};
+    const ExecutorReq* singleReq{nullptr};
+    const ResolvedExecutorReq* resolvedReq{nullptr};
     int epId{-1};
-    int begin{-1};
-    int end{-1};
+    size_t begin{0};
+    size_t end{0};
     std::promise<RdmaOpRet> ret;
 
-    Task(const ExecutorReq* req_, int epId_, int begin_, int end_)
-        : req(req_), epId(epId_), begin(begin_), end(end_) {}
+    Task() = default;
+    Task(const ExecutorReq* req_, int epId_, size_t begin_, size_t end_)
+        : kind(Kind::SingleMr), singleReq(req_), epId(epId_), begin(begin_), end(end_) {}
+    Task(const ResolvedExecutorReq* req_, int epId_, size_t begin_, size_t end_)
+        : kind(Kind::Resolved), resolvedReq(req_), epId(epId_), begin(begin_), end(end_) {}
   };
 
-  std::vector<std::pair<int, int>> SplitWork(const ExecutorReq& req);
+  std::vector<std::pair<size_t, size_t>> SplitWork(const ExecutorReq& req);
 
   class Worker {
    public:

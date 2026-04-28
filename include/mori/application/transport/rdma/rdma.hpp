@@ -27,6 +27,7 @@
 
 #include <cassert>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -150,6 +151,27 @@ struct WorkQueueAttrs {
 
 // RdmaMemoryRegion is defined in application_device_types.hpp (included above).
 
+class RdmaOwnedMr {
+ public:
+  RdmaOwnedMr() = default;
+  RdmaOwnedMr(RdmaMemoryRegion region, ibv_mr* raw);
+  RdmaOwnedMr(RdmaOwnedMr&& other) noexcept;
+  RdmaOwnedMr& operator=(RdmaOwnedMr&& other) noexcept;
+  RdmaOwnedMr(const RdmaOwnedMr&) = delete;
+  RdmaOwnedMr& operator=(const RdmaOwnedMr&) = delete;
+  ~RdmaOwnedMr();
+
+  const RdmaMemoryRegion& Region() const { return region_; }
+  explicit operator bool() const { return raw_ != nullptr; }
+
+ private:
+  void Reset() noexcept;
+
+ private:
+  RdmaMemoryRegion region_{};
+  ibv_mr* raw_{nullptr};
+};
+
 struct RdmaEndpoint {
   RdmaDeviceVendorId vendorId{RdmaDeviceVendorId::Unknown};
   RdmaEndpointHandle handle;
@@ -203,9 +225,16 @@ class RdmaDeviceContext {
 
   virtual RdmaMemoryRegion RegisterRdmaMemoryRegion(void* ptr, size_t size,
                                                     int accessFlag = MR_DEFAULT_ACCESS_FLAG);
+  virtual std::optional<RdmaMemoryRegion> TryRegisterRdmaMemoryRegion(
+      void* ptr, size_t size, int accessFlag = MR_DEFAULT_ACCESS_FLAG);
+  virtual std::optional<RdmaOwnedMr> TryRegisterOwnedMr(void* ptr, size_t size,
+                                                        int accessFlag = MR_DEFAULT_ACCESS_FLAG);
+  virtual std::optional<RdmaOwnedMr> TryRegisterOwnedMrDmabuf(
+      void* ptr, size_t size, int dmabuf_fd, int accessFlag = MR_DEFAULT_ACCESS_FLAG);
   virtual RdmaMemoryRegion RegisterRdmaMemoryRegionDmabuf(void* ptr, size_t size, int dmabuf_fd,
                                                           int accessFlag = MR_DEFAULT_ACCESS_FLAG);
   virtual void DeregisterRdmaMemoryRegion(void* ptr);
+  virtual void DestroyRdmaEndpoint(const RdmaEndpoint&);
 
   // TODO: query gid entry by ibv_query_gid_table
   virtual RdmaEndpoint CreateRdmaEndpoint(const RdmaEndpointConfig&) {
@@ -241,6 +270,7 @@ class RdmaDeviceContext {
 
  private:
   RdmaDevice* device;
+  std::mutex mrPoolMu_;
   std::unordered_map<void*, ibv_mr*> mrPool;
 };
 
