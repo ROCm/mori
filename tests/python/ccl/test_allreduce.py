@@ -884,6 +884,7 @@ def _bench_overlap_one_size(
     timeline_dump=False,
     timeline_label="",
     ar_phase_timing=False,
+    continuous_iters=0,
 ):
     """Benchmark one (mode, size) combo.  Returns dict with timing or None."""
     _dbg = (rank == 0)
@@ -957,29 +958,50 @@ def _bench_overlap_one_size(
     elem_bytes = elems * torch.tensor([], dtype=dtype).element_size()
     data_mb = elem_bytes / (1024 * 1024)
     use_overlap = data_mb >= 128
-    for i in range(total_iters):
+    if continuous_iters > 0:
+        if timeline_dump and rank == 0:
+            print("  [continuous] --timeline is ignored in continuous-iters mode",
+                  flush=True)
+        if _dbg:
+            print(f" continuous({continuous_iters})", end="", flush=True)
+
+        def run_one_pipeline():
+            for s in range(num_stages):
+                ev_g_e_list[s].record(stream_gemm)
+                with torch.cuda.stream(stream_gemm):
+                    _run_gemm()
+                ev_g_e_list[s].record(stream_gemm)
+                if use_overlap:
+                    stream_ar.wait_event(ev_g_e_list[s])
+                else:
+                    stream_gemm.synchronize()
+                with torch.cuda.stream(stream_ar):
+                    launch_ar()
+                if not use_overlap:
+                    stream_ar.synchronize()
+                    if copy_stream:
+                        copy_stream.synchronize()
+
+        # Untimed warmup blocks. This keeps the continuous measured window
+        # free of between-iteration sync, while still warming kernels/queues.
         torch.cuda.synchronize()
         prep_ar()
         torch.cuda.synchronize()
-        ov_s.record()
-        for s in range(num_stages):
-            ev_g_s_list[s].record(stream_gemm)
-            with torch.cuda.stream(stream_gemm):
-                _run_gemm()
-            ev_g_e_list[s].record(stream_gemm)
-            if use_overlap:
-                stream_ar.wait_event(ev_g_e_list[s])
-            else:
-                stream_gemm.synchronize()
-            ev_ar_s_list[s].record(stream_ar)
-            with torch.cuda.stream(stream_ar):
-                launch_ar()
-            ev_ar_e_list[s].record(stream_ar)
-            if not use_overlap:
-                stream_ar.synchronize()
-                if copy_stream:
-                    copy_stream.synchronize()
+        for _ in range(max(1, warmup)):
+            run_one_pipeline()
+        if use_overlap:
+            stream_ar.synchronize()
+            if copy_stream:
+                copy_stream.synchronize()
+            stream_gemm.synchronize()
+        torch.cuda.synchronize()
+        dist.barrier()
 
+        prep_ar()
+        torch.cuda.synchronize()
+        ov_s.record()
+        for _ in range(continuous_iters):
+            run_one_pipeline()
         if use_overlap:
             stream_ar.synchronize()
             if copy_stream:
@@ -987,23 +1009,56 @@ def _bench_overlap_one_size(
             stream_gemm.synchronize()
         ov_e.record()
         torch.cuda.synchronize()
-        t_ov = ov_s.elapsed_time(ov_e) / 1000.0
-        if i >= warmup:
-            overlap_times.append(t_ov)
-            if timeline_dump and rank == 0:
-                iter_sample = {
-                    "wall": ov_s.elapsed_time(ov_e),
-                    "stages": [
-                        {
-                            "g_start": ov_s.elapsed_time(ev_g_s_list[s]),
-                            "g_end": ov_s.elapsed_time(ev_g_e_list[s]),
-                            "a_start": ov_s.elapsed_time(ev_ar_s_list[s]),
-                            "a_end": ov_s.elapsed_time(ev_ar_e_list[s]),
-                        }
-                        for s in range(num_stages)
-                    ],
-                }
-                timeline_samples.append(iter_sample)
+        overlap_times.append(ov_s.elapsed_time(ov_e) / 1000.0 /
+                             float(continuous_iters))
+    else:
+        for i in range(total_iters):
+            torch.cuda.synchronize()
+            prep_ar()
+            torch.cuda.synchronize()
+            ov_s.record()
+            for s in range(num_stages):
+                ev_g_s_list[s].record(stream_gemm)
+                with torch.cuda.stream(stream_gemm):
+                    _run_gemm()
+                ev_g_e_list[s].record(stream_gemm)
+                if use_overlap:
+                    stream_ar.wait_event(ev_g_e_list[s])
+                else:
+                    stream_gemm.synchronize()
+                ev_ar_s_list[s].record(stream_ar)
+                with torch.cuda.stream(stream_ar):
+                    launch_ar()
+                ev_ar_e_list[s].record(stream_ar)
+                if not use_overlap:
+                    stream_ar.synchronize()
+                    if copy_stream:
+                        copy_stream.synchronize()
+
+            if use_overlap:
+                stream_ar.synchronize()
+                if copy_stream:
+                    copy_stream.synchronize()
+                stream_gemm.synchronize()
+            ov_e.record()
+            torch.cuda.synchronize()
+            t_ov = ov_s.elapsed_time(ov_e) / 1000.0
+            if i >= warmup:
+                overlap_times.append(t_ov)
+                if timeline_dump and rank == 0:
+                    iter_sample = {
+                        "wall": ov_s.elapsed_time(ov_e),
+                        "stages": [
+                            {
+                                "g_start": ov_s.elapsed_time(ev_g_s_list[s]),
+                                "g_end": ov_s.elapsed_time(ev_g_e_list[s]),
+                                "a_start": ov_s.elapsed_time(ev_ar_s_list[s]),
+                                "a_end": ov_s.elapsed_time(ev_ar_e_list[s]),
+                            }
+                            for s in range(num_stages)
+                        ],
+                    }
+                    timeline_samples.append(iter_sample)
 
     if timeline_dump and rank == 0 and len(timeline_samples) > 0:
         import statistics as _stats
@@ -1313,6 +1368,7 @@ def _test_multi_stage_overlap(
     gemm_m=_GEMM_M_DEFAULT, gemm_n=_GEMM_N_DEFAULT, gemm_k=_GEMM_K_DEFAULT,
     num_stages=2, sweep=False, timeline_dump=False, ar_phase_timing=False,
     ar_priority=0, gemm_priority=0,
+    continuous_iters=0,
 ):
     """Multi-stage pipelined GEMM+AllReduce overlap benchmark."""
     rccl_dtype = _RCCL_DTYPE_MAP.get(dtype, torch.float32)
@@ -1361,6 +1417,7 @@ def _test_multi_stage_overlap(
         num_stages=num_stages, total_iters=total_iters, warmup=warmup,
         timeline_dump=timeline_dump,
         ar_phase_timing=ar_phase_timing,
+        continuous_iters=continuous_iters,
     )
 
     single_mb = max(1, data_bytes // (1024 * 1024))
@@ -1368,9 +1425,11 @@ def _test_multi_stage_overlap(
 
     if rank == 0:
         sz_str = ", ".join(f"{s}MB" for s in sizes_mb)
+        cont = (f", continuous-iters={continuous_iters}"
+                if continuous_iters > 0 else "")
         print(
             f"\n>>> Test 6: Multi-stage pipelined overlap "
-            f"({num_stages} stages, GEMM {gemm_m}x{gemm_k}x{gemm_n})"
+            f"({num_stages} stages, GEMM {gemm_m}x{gemm_k}x{gemm_n}{cont})"
         )
         print(f"    Sizes: {sz_str}")
 
@@ -1484,6 +1543,10 @@ def _test_multi_stage_overlap(
         print(f"\n{'=' * w}")
         print(f"  Multi-stage Overlap Summary — {num_stages} stages, "
               f"GEMM {gemm_m}x{gemm_k}x{gemm_n}")
+        if continuous_iters > 0:
+            print(f"  Continuous mode: overlap wall is total wall / "
+                  f"{continuous_iters} back-to-back multi-stage iterations "
+                  f"(no per-iteration sync)")
         print(f"  (sizes >= 128 MB use true GEMM+AR overlap; "
               f"smaller sizes run GEMM then AR serially)")
         print(f"{'=' * w}")
@@ -1589,6 +1652,7 @@ def _test_allreduce(
     ar_phase_timing=False,
     ar_priority=0,
     gemm_priority=0,
+    continuous_iters=0,
 ):
     """Worker function for each process."""
 
@@ -1735,6 +1799,7 @@ def _test_allreduce(
                 ar_phase_timing=ar_phase_timing,
                 ar_priority=ar_priority,
                 gemm_priority=gemm_priority,
+                continuous_iters=continuous_iters,
             )
             all_ok = all_ok and ok6
 
@@ -1788,6 +1853,7 @@ def test_allreduce(
     ar_phase_timing=False,
     ar_priority=0,
     gemm_priority=0,
+    continuous_iters=0,
 ):
     """Run AllReduce SDMA test."""
     os.environ.setdefault("MORI_ENABLE_SDMA", "1")
@@ -1811,6 +1877,7 @@ def test_allreduce(
             ar_phase_timing,
             ar_priority,
             gemm_priority,
+            continuous_iters,
         ),
         nprocs=world_size,
         join=True,
@@ -1905,6 +1972,15 @@ if __name__ == "__main__":
         help="Set stream_gemm priority. Set 0 (normal) while --ar-priority=-1 "
              "to let AR preempt GEMM for CU resources.",
     )
+    parser.add_argument(
+        "--continuous-iters",
+        type=int,
+        default=0,
+        help="For Test 6 overlap timing, run this many multi-stage iterations "
+             "back-to-back inside one measured window with no per-iteration "
+             "torch.cuda.synchronize(). Reports wall per iteration. Models "
+             "continuous serving workloads; 0 keeps the finite per-iteration mode.",
+    )
     args = parser.parse_args()
     os.environ["MORI_ENABLE_SDMA"] = str(args.enable_sdma)
 
@@ -1924,6 +2000,8 @@ if __name__ == "__main__":
         )
     if args.num_stages > 0:
         print(f"  Multi-stage     : {args.num_stages} stages (pipelined GEMM+AR)")
+        if args.continuous_iters > 0:
+            print(f"  Continuous iters: {args.continuous_iters} (Test 6 overlap only)")
         if args.sweep:
             print(f"  Size sweep      : {', '.join(f'{s}MB' for s in _SWEEP_SIZES_MB)}")
     if args.num_stages > 0 or args.test_gemm_overlap:
@@ -1946,4 +2024,5 @@ if __name__ == "__main__":
         ar_phase_timing=args.ar_phase_timing,
         ar_priority=args.ar_priority,
         gemm_priority=args.gemm_priority,
+        continuous_iters=args.continuous_iters,
     )

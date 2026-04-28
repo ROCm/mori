@@ -1114,6 +1114,58 @@ buffers, the next candidate is **π' / local SDMA copy path**:
 
 ---
 
+## Entry 25 — Add Test 6 continuous-iters mode to model real continuous workload
+- **Date**: 2026-04-29
+- **Commit**: _this commit_
+- **User correction**: real workload is continuous (e.g. 100 consecutive
+  requests/micro-batches), not isolated finite 4-stage benchmark iterations.
+  Current Test 6 finite mode has `torch.cuda.synchronize()` at the start/end
+  of every measured iteration, so the last AR/copy tail is exposed every
+  iteration. In continuous serving, that tail can overlap the next iteration's
+  GEMM[0].
+
+### Implementation
+
+Added CLI flag:
+```bash
+--continuous-iters N
+```
+
+Only affects Test 6 overlap timing:
+- `seq_ar` and `seq_gemm` are still measured with the existing finite method
+  for decomposition.
+- overlap timing becomes one long measured window:
+  - untimed warmup: `warmup` multi-stage pipelines back-to-back
+  - measured: `N` multi-stage pipelines back-to-back
+  - no `torch.cuda.synchronize()` between those N pipelines
+  - reported overlap wall = total measured wall / N
+
+This directly tests whether current finite-mode SDMA copy loses only because
+the per-iteration tail copy is repeatedly exposed.
+
+### Usage
+
+```bash
+cd /home/fizhang/test/mori && git pull origin sdma-test
+SKIP_BUILD=1 CONTINUOUS_ITERS=100 ITERATIONS=1 WARMUP=1 bash tools/bench_plan_a.sh
+```
+
+Manual baseline:
+```bash
+MORI_PIPELINE_CU=160 python3 tests/python/ccl/test_allreduce.py \
+  --num-stages 4 --elems 67108864 --iterations 1 --warmup 1 \
+  --continuous-iters 100
+```
+
+### Expected decision
+
+If continuous-mode **SDMA copy wall < RCCL wall**, then no kernel change is
+needed for the real workload; the finite Test 6 target was overly pessimistic.
+If continuous-mode SDMA copy is still slower, the remaining gap is not just
+tail-copy exposure and requires algorithm/copy-path work.
+
+---
+
 ## Entry 19 — Plan A (PipelinedXGMIPullKernel) baseline reference + kernel swap
 - **Date**: 2026-04-24
 - **Baseline reference SHA**: `5f0072e7` (code HEAD at measurement time) /

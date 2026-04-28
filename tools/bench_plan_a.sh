@@ -18,6 +18,7 @@
 #   ITERATIONS   (default: 100)
 #   WARMUP       (default: 20)
 #   PIPELINE_CU  (default: 160)
+#   CONTINUOUS_ITERS (default: 0; set 100 to use Test 6 continuous mode)
 #   SKIP_PULL    (default: 0; set 1 to skip git pull)
 #   SKIP_BUILD   (default: 0; set 1 to skip rebuild)
 #
@@ -36,6 +37,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${ITERATIONS:=100}"
 : "${WARMUP:=20}"
 : "${PIPELINE_CU:=160}"
+: "${CONTINUOUS_ITERS:=0}"
 : "${SKIP_PULL:=0}"
 : "${SKIP_BUILD:=0}"
 ELEMS=$(( SIZE_MB * 1024 * 1024 / 4 ))   # uint32 = 4 bytes
@@ -49,7 +51,7 @@ echo "==================== [preflight] ===================="
 hostname
 id -un
 pwd
-echo "SIZE_MB=$SIZE_MB NUM_STAGES=$NUM_STAGES ITERATIONS=$ITERATIONS WARMUP=$WARMUP PIPELINE_CU=$PIPELINE_CU ELEMS=$ELEMS"
+echo "SIZE_MB=$SIZE_MB NUM_STAGES=$NUM_STAGES ITERATIONS=$ITERATIONS WARMUP=$WARMUP PIPELINE_CU=$PIPELINE_CU CONTINUOUS_ITERS=$CONTINUOUS_ITERS ELEMS=$ELEMS"
 
 command -v python3 >/dev/null || { echo "MISSING: python3"; exit 1; }
 command -v cmake   >/dev/null || { echo "MISSING: cmake"; exit 1; }
@@ -84,7 +86,8 @@ run_variant() {
     --num-stages "$NUM_STAGES" \
     --elems "$ELEMS" \
     --iterations "$ITERATIONS" \
-    --warmup "$WARMUP" 2>&1
+    --warmup "$WARMUP" \
+    --continuous-iters "$CONTINUOUS_ITERS" 2>&1
 }
 
 run_variant_extra() {
@@ -100,6 +103,7 @@ run_variant_extra() {
     --elems "$ELEMS" \
     --iterations "$ITERATIONS" \
     --warmup "$WARMUP" \
+    --continuous-iters "$CONTINUOUS_ITERS" \
     "$@" 2>&1
 }
 

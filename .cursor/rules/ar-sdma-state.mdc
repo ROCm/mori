@@ -9,7 +9,7 @@ alwaysApply: true
 
 关联文件:
 - `.cursor/rules/relentless-perf.mdc` — 方法论规则 (R0-R15)
-- `docs/perf_history.md` — 所有历史 Entry (1-24) 含数据
+- `docs/perf_history.md` — 所有历史 Entry (1-25) 含数据
 
 ---
 
@@ -52,6 +52,19 @@ alwaysApply: true
 | CU128_NR48, chunks=16 | 8.701 | 5.339 | 2.369 | 7.577 | +1.124 |
 
 **Interpretation**: Increasing chunk count 8→16 worsens wall, seq_ar, and GEMM slowdown. "shorter CU burst" hypothesis is refuted. Plan A chunk-density tuning is closed.
+
+### Continuous workload mode added (Entry 25)
+
+User clarified real workload is continuous (e.g. 100 consecutive requests), not
+isolated finite 4-stage benchmark iterations. Test 6 now supports:
+
+```bash
+--continuous-iters N
+```
+
+Only Test 6 overlap timing changes: it measures N multi-stage pipelines
+back-to-back in one window and reports wall/N, with no per-iteration sync. This
+tests whether finite-mode tail copy exposure is the real reason SDMA copy loses.
 
 ### Plan A v1 实测 (Entry 20, **已知不是 pipelined 实现**)
 
@@ -165,28 +178,18 @@ HEAD = **`f744d41a`** (Plan A v2 R/A-group pipeline implementation)
 
 ---
 
-## 下一步行动 (Entry 20 之后)
+## 下一步行动
 
-**Plan A v2 sweep 已完成 (Entry 23)**. Best split 128/48 still loses by
-+0.873ms. Next recommended action:
-
-A) **π' / local SDMA copy**: keep SDMA AG; replace or hide transit→user_output
-copy using SDMA rather than CU. No user buffer reuse assumption.
-
-B) Plan A only if a new mechanism appears; CU/R split and chunks=16 are both
-insufficient.
-
-**Step 2: sweep CU/R split if default improves but not enough**
+**First run continuous-mode benchmark before more kernel work**:
 
 ```bash
-MORI_PLAN_A_CU=80  MORI_PLAN_A_NR=24  ...
-MORI_PLAN_A_CU=96  MORI_PLAN_A_NR=32  ...
-MORI_PLAN_A_CU=128 MORI_PLAN_A_NR=48  ...
+cd /home/fizhang/test/mori && git pull origin sdma-test
+SKIP_BUILD=1 CONTINUOUS_ITERS=100 ITERATIONS=1 WARMUP=1 bash tools/bench_plan_a.sh
 ```
 
-**Step 3: phase timing**
-
-`--ar-phase-timing` now prints a `Plan A A-group` section from slots 49/50+.
+Decision:
+- If continuous SDMA copy < RCCL: finite Test 6 is pessimistic; current baseline/Plan A may be enough for real workload.
+- If continuous SDMA copy still > RCCL: tail-copy exposure is not the only issue; continue with local SDMA copy / algorithm work.
 
 ---
 
@@ -208,6 +211,9 @@ BUILD_EXAMPLES=ON BUILD_TESTS=ON pip3 install .
 ```bash
 # 完整 Plan A bench (build + BASELINE + PLAN_A + phase, 含对比表)
 bash tools/bench_plan_a.sh
+
+# 连续真实 workload 模式 (100 个 4-stage pipeline 连续测 wall/iter)
+CONTINUOUS_ITERS=100 ITERATIONS=1 WARMUP=1 SKIP_BUILD=1 bash tools/bench_plan_a.sh
 
 # 只跑 BASELINE (iter=100, 30 秒, skip build if 已 build)
 SKIP_BUILD=1 SKIP_PULL=1 bash tools/bench_plan_a.sh  # 不完全是 baseline-only, 脚本内会跑 BASELINE+PLAN_A
