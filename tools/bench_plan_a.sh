@@ -134,7 +134,7 @@ awk -v pat="$SZ_PAT" '
 ' "$LOG"
 
 # Phase timing patterns (matches baseline AND Plan A slot names)
-PHASE_RE="(\[[0-9]\] total|entry.*scatter_done|scatter.*compute-wait|compute-wait.*barrier|barrier.*AG-submit|AG-submit.*AG-wait-done|ag_sync signaled|AG-wait-done.*exit|reduce-done|cb-exit|host-side hipMemcpy|gpu-side copy|per-chunk)"
+PHASE_RE="(\[[0-9]\] total|entry.*scatter_done|scatter.*compute-wait|compute-wait.*barrier|barrier.*AG-submit|AG-submit.*AG-wait-done|ag_sync signaled|AG-wait-done.*exit|reduce-done|cb-exit|ag-ready|pull-done|ag-exit|AG-pull|host-side hipMemcpy|gpu-side copy|per-chunk)"
 
 echo
 echo "---- [2] BASELINE AR[0] phase ----"

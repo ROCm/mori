@@ -953,6 +953,59 @@ Entry 18 best).
 
 ---
 
+## Entry 22 — Plan A v2 default 96/32 result: seq_ar fixed, gap now entirely GEMM overlap contention
+- **Date**: 2026-04-29
+- **Commit under test**: `f744d41a` / docs follow-up `5a6c0b6d`
+- **Config**: default Plan A v2 split, `MORI_PLAN_A_CU=96`, `MORI_PLAN_A_NR=32`
+  (log should show `blocks=97, nR=32, nA=64`)
+- **Command**: `MORI_PIPELINE_CU=160 MORI_DIRECT_OUTPUT=1 python3 tests/python/ccl/test_allreduce.py --num-stages 4 --elems 67108864 --iterations 50 --warmup 10`
+
+| variant | overlap wall | seq_ar | seq_gemm | overlap/seq_gemm | vs RCCL |
+|---|---|---|---|---|---|
+| **Plan A v2 default** | **8.570 ms** | **5.105** | 3.674 | **2.333** | **+14.9% (+1.111 ms WORSE)** |
+| SDMA no-copy | 7.418 ms | 4.775 | 3.673 | 2.020 | +0.5% |
+| RCCL | 7.459 ms | 5.129 | 3.675 | 2.029 | — |
+
+### Mechanism update
+
+Plan A v2 fixed the main v1 implementation bug:
+- v1 seq_ar = 5.845 ms
+- v2 seq_ar = **5.105 ms**
+- improvement = **0.740 ms** over 4 ARs (= 0.185 ms/AR)
+- v2 seq_ar is now slightly **faster than RCCL** (5.105 vs 5.129)
+
+The algorithmic AR work is no longer the blocker. The remaining gap is overlap:
+- Plan A v2 overlap wall = 8.570 ms
+- RCCL overlap wall = 7.459 ms
+- gap = **1.111 ms**
+- Plan A v2 overlap/seq_gemm = **2.333**
+- RCCL overlap/seq_gemm = **2.029**
+
+Root cause now: Plan A still uses too much CU during AR, starving GEMM. This is
+now tunable via `MORI_PLAN_A_CU` and `MORI_PLAN_A_NR`; v2 default used 96 compute
+blocks and still over-contended GEMM.
+
+### Next experiment
+
+Added `tools/bench_plan_a_sweep.sh` to sweep CU/R split with one command.
+Default variants:
+- `80:24`
+- `96:32`
+- `112:40`
+- `128:48`
+
+Run:
+```bash
+cd /home/fizhang/test/mori && git pull origin sdma-test
+SKIP_BUILD=1 bash tools/bench_plan_a_sweep.sh
+```
+
+Decision rule:
+- If lower CU improves wall while seq_ar remains near RCCL (~5.13 ms), keep reducing CU.
+- If seq_ar grows faster than GEMM contention shrinks, use the best wall split.
+
+---
+
 ## Entry 19 — Plan A (PipelinedXGMIPullKernel) baseline reference + kernel swap
 - **Date**: 2026-04-24
 - **Baseline reference SHA**: `5f0072e7` (code HEAD at measurement time) /
