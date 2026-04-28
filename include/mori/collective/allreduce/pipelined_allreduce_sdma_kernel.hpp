@@ -144,8 +144,17 @@ __global__ void ScatterSdmaOnlyKernel(
         scatterBase + static_cast<uint64_t>(numChunks);
     HSAuint64* sig = dstMemObj->signalPtrs
         + static_cast<size_t>(sender) * numQ;
-    while (core::AtomicLoadRelaxed(sig) < expected)
+    uint64_t stuck = 0;
+    while (core::AtomicLoadRelaxed(sig) < expected) {
       __builtin_amdgcn_s_sleep(1);
+      if (++stuck >= 100000000ULL) {
+        printf("[STUCK] PE %d K1 thr %d scatter-wait sender=%d expected=%llu got=%llu\n",
+               myPe, thr, sender,
+               (unsigned long long)expected,
+               (unsigned long long)core::AtomicLoadRelaxed(sig));
+        stuck = 0;
+      }
+    }
   }
 }
 
@@ -744,10 +753,20 @@ __global__ void PipelinedXGMIPullKernel(
       const uint32_t ccTarget =
           static_cast<uint32_t>((c + 1) * compBlocks);
       if (thr == 0) {
+        uint64_t stuck = 0;
         while (__scoped_atomic_load_n(
                    &barrier->chunks_complete,
-                   __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) < ccTarget)
+                   __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) < ccTarget) {
           __builtin_amdgcn_s_sleep(1);
+          if (++stuck >= 100000000ULL) {
+            printf("[STUCK] PE %d K2 b0 chunk %d wait chunks_complete expected=%u got=%u\n",
+                   myPe, c, ccTarget,
+                   __scoped_atomic_load_n(
+                       &barrier->chunks_complete,
+                       __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE));
+            stuck = 0;
+          }
+        }
       }
       __syncthreads();
       ar_write_phase_ts(phase_ts, 2 + 3 * c + 0);  // chunk c compute-wait done
@@ -768,8 +787,17 @@ __global__ void PipelinedXGMIPullKernel(
             reduceCompleteBase + static_cast<uint64_t>(c + 1);
         HSAuint64* remoteFlag =
             reinterpret_cast<HSAuint64*>(flagsMemObj->peerPtrs[pe]);
-        while (core::AtomicLoadRelaxed(remoteFlag) < expected)
+        uint64_t stuck = 0;
+        while (core::AtomicLoadRelaxed(remoteFlag) < expected) {
           __builtin_amdgcn_s_sleep(1);
+          if (++stuck >= 100000000ULL) {
+            printf("[STUCK] PE %d K2 b0 thr %d chunk %d cross-PE-barrier peer=%d expected=%llu got=%llu\n",
+                   myPe, thr, c, pe,
+                   (unsigned long long)expected,
+                   (unsigned long long)core::AtomicLoadRelaxed(remoteFlag));
+            stuck = 0;
+          }
+        }
       }
       __syncthreads();
       ar_write_phase_ts(phase_ts, 2 + 3 * c + 1);  // chunk c cross-PE barrier done
@@ -812,8 +840,18 @@ __global__ void PipelinedXGMIPullKernel(
           s_scatter_by_sender[sender] + static_cast<uint64_t>(c + 1);
       HSAuint64* sig = dstMemObj->signalPtrs
           + static_cast<size_t>(sender) * numQ;
+      uint64_t stuck = 0;
       while (core::AtomicLoadRelaxed(sig) < expected) {
         __builtin_amdgcn_s_sleep(2);
+        if (++stuck >= 50000000ULL) {
+          if (blockIdx.x == 1) {
+            printf("[STUCK] PE %d K2 CB b%d thr %d chunk %d scatter-wait sender=%d expected=%llu got=%llu\n",
+                   myPe, (int)blockIdx.x, (int)threadIdx.x, c, sender,
+                   (unsigned long long)expected,
+                   (unsigned long long)core::AtomicLoadRelaxed(sig));
+          }
+          stuck = 0;
+        }
       }
     }
     ar_write_phase_ts_cb1(phase_ts, 11 + 3 * c + 1);  // chunk c scatter-poll done
@@ -884,11 +922,22 @@ __global__ void PipelinedXGMIPullKernel(
 
     // 5. Wait block 0's ag_sync ≥ c+1 (cross-PE barrier done for chunk c).
     if (threadIdx.x == 0) {
+      uint64_t stuck = 0;
       while (__scoped_atomic_load_n(
                  &barrier->ag_sync,
                  __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) <
              static_cast<uint32_t>(c + 1)) {
         __builtin_amdgcn_s_sleep(1);
+        if (++stuck >= 100000000ULL) {
+          if (blockIdx.x == 1) {
+            printf("[STUCK] PE %d K2 CB b%d chunk %d wait ag_sync expected=%u got=%u\n",
+                   myPe, (int)blockIdx.x, c, (uint32_t)(c + 1),
+                   __scoped_atomic_load_n(
+                       &barrier->ag_sync,
+                       __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE));
+          }
+          stuck = 0;
+        }
       }
     }
     __syncthreads();
