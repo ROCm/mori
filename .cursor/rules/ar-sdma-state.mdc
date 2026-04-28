@@ -115,7 +115,7 @@ SDMA two-shot 算法比 RCCL 多一步 **256MB transit → user_output copy** (�
 
 ## 代码当前状态
 
-HEAD = **`22cb5846`** (Plan A v2 R/A-group pipeline implementation)
+HEAD = **`f744d41a`** (Plan A v2 R/A-group pipeline implementation)
 
 `MORI_DIRECT_OUTPUT=1` 激活 Plan A v2 path; 不开则走 BASELINE.
 
@@ -127,7 +127,7 @@ HEAD = **`22cb5846`** (Plan A v2 R/A-group pipeline implementation)
 | `bb8911f4` | StrReplace 误删 `def _test_gemm_overlap_comparison(` 行 → SyntaxError; restore |
 | `9db1d420` | 加 STUCK instrumentation 到 5 个 wait 循环 (debug) |
 | `611c2f2c` | **关键 fix**: kArPhaseTsCapacity 32 → 128. 之前 numChunks=8 时 CB1 写 slot 11+3*8=35 OOB → 破坏 CrossPeBarrier 邻居内存 → 死锁. helpers 加 bound check |
-| `22cb5846` | Plan A v2: K2 split R-group/A-group; default `MORI_PLAN_A_CU=96`, `MORI_PLAN_A_NR=CU/3`; test parser prints A-group slots |
+| `f744d41a` | Plan A v2: K2 split R-group/A-group; default `MORI_PLAN_A_CU=96`, `MORI_PLAN_A_NR=CU/3`; test parser prints A-group slots |
 
 ### 测量工具
 

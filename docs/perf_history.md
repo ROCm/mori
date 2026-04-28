@@ -869,7 +869,7 @@ Both keep SDMA AG → no CU contention → consistent with the mechanism above.
 
 ## Entry 21 — Plan A v2 implementation: split K2 into R-group reduce and A-group XGMI-pull pipeline
 - **Date**: 2026-04-29
-- **Commit**: `22cb5846`
+- **Commit**: `f744d41a`
 - **Why this exists**: Entry 20 correctly measured the first Plan A implementation
   as **9.084 ms** (worse than RCCL 7.503 ms), but the implementation was not
   the user-intended "CU pipelined" Plan A. The kernel serialized:
