@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <stdexcept>
 
+#include "mori/application/application.hpp"
 #include "mori/core/core.hpp"
 #include "mori/shmem/shmem_api.hpp"
 #include "mori/utils/env_utils.hpp"
