@@ -1006,6 +1006,65 @@ Decision rule:
 
 ---
 
+## Entry 23 — Plan A v2 CU/R split sweep: best 128/48 still +0.87 ms worse than RCCL
+- **Date**: 2026-04-29
+- **Commit under test**: `4de2c44a` (sweep script + Plan A v2)
+- **Command**: `SKIP_BUILD=1 bash tools/bench_plan_a_sweep.sh`
+- **Scenario**: 256MB / stage × 4 stages, 8-rank MI355X, `ITERATIONS=50`, `WARMUP=10`
+- **All four variants correctness PASSED**
+
+| variant | Plan A active | wall | seq_ar | GEMM slowdown | RCCL wall (same run) | gap vs RCCL |
+|---|---|---:|---:|---:|---:|---:|
+| `CU80_NR24` | blocks=81, nR=24, nA=56 | 8.757 | 5.202 | 2.383 | 7.596 | +1.161 |
+| `CU96_NR32` | blocks=97, nR=32, nA=64 | 8.568 | 5.104 | 2.331 | 7.432 | +1.136 |
+| `CU112_NR40` | blocks=113, nR=40, nA=72 | 8.488 | 5.113 | 2.310 | 7.462 | +1.026 |
+| **`CU128_NR48`** | blocks=129, nR=48, nA=80 | **8.467** | 5.137 | **2.304** | 7.594 | **+0.873** |
+
+### Observations
+
+1. Lower CU did **not** improve overlap. It worsened both wall and GEMM slowdown:
+   - CU80 wall 8.757, slowdown 2.383
+   - CU128 wall 8.467, slowdown 2.304
+   This refutes the hypothesis that simply lowering Plan A CU occupancy fixes
+   the GEMM contention problem.
+
+2. `seq_ar` is no longer the blocker:
+   - All variants are near RCCL seq_ar (~5.12 ms)
+   - Best wall variant CU128 has seq_ar 5.137 vs RCCL 5.125 (same run),
+     only +0.012 ms.
+
+3. The remaining gap is entirely overlap quality:
+   - Best Plan A slowdown 2.304 vs RCCL 2.067 (same CU128 run)
+   - wall gap +0.873 ms even when sequential AR is equal to RCCL.
+
+4. Increasing CU from 80→128 improves wall, but slope is too small to close
+   the remaining gap:
+   - wall improves 0.290 ms over +48 CU
+   - remaining gap at CU128 is still 0.873 ms
+   - linear extrapolation would need >140 additional CU, impossible on this
+     setup and likely to worsen GEMM contention.
+
+### Mechanism
+
+Plan A v2 fixed the chunk-serialization bug, but the A-group still performs
+large CU XGMI pull + local write during the same window where GEMM needs CU.
+The AR algorithm itself is competitive (`seq_ar ~= RCCL`), but the overlap
+schedule is not: Plan A occupies CU too continuously, while RCCL ring has
+sparser CU bursts between communication steps.
+
+### Conclusion
+
+Plan A v2 remains **not sufficient** for the hard target
+`copy_output_to_user=True wall < RCCL wall`. Best measured wall is 8.467 ms
+vs RCCL 7.594 ms (+0.873 ms worse). Further CU/R split tuning is unlikely to
+recover enough gap; the next viable directions are still:
+- **D''**: explicit `register_user_output(ptr,size)` so SDMA AG directly writes
+  user_output (eliminate copy without adding CU work)
+- **π'**: keep SDMA AG and move transit→user_output copy to independent SDMA
+  queue with double-buffered transit
+
+---
+
 ## Entry 19 — Plan A (PipelinedXGMIPullKernel) baseline reference + kernel swap
 - **Date**: 2026-04-24
 - **Baseline reference SHA**: `5f0072e7` (code HEAD at measurement time) /
