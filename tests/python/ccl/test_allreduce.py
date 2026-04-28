@@ -301,10 +301,20 @@ def _test_copy_to_user_verify(
         out_cpu, elems, my_pe, npes, f"copy_to_user/{dtype_name}", dtype=dtype
     )
     if rank == 0 and ok:
-        hits = ar._handle.cache_hits()
-        misses = ar._handle.cache_misses()
-        print(f"  PE {rank}: copy-to-user correctness PASSED  "
-              f"(cache hits={hits}, misses={misses})", flush=True)
+        # cache_hits/cache_misses are pybind methods only present when the
+        # current build wired them into the AllreduceSdmaHandle binding.
+        # Guard with hasattr so a stale/older .so does not crash rank 0
+        # (otherwise the AttributeError tears down the whole spawn group
+        # via TCPStore master shutdown — see Plan A bench failure 2026-04-28).
+        if hasattr(ar._handle, "cache_hits") and hasattr(ar._handle,
+                                                        "cache_misses"):
+            hits = ar._handle.cache_hits()
+            misses = ar._handle.cache_misses()
+            cache_msg = f"  (cache hits={hits}, misses={misses})"
+        else:
+            cache_msg = "  (cache stats unavailable on this build)"
+        print(f"  PE {rank}: copy-to-user correctness PASSED{cache_msg}",
+              flush=True)
 
     dist.barrier()
     _print_stats(times, data_bytes, npes, rank, f"Copy-to-user ({dtype_name})")
@@ -621,7 +631,7 @@ def _print_overlap_summary(
             print(f"  Overlap vs sequential sum: {g_ov[2] / seq_sum:.3f}x")
 
 
-def _test_gemm_overlap_comparison(
+
     rank,
     my_pe,
     npes,
@@ -637,7 +647,7 @@ def _test_gemm_overlap_comparison(
     gemm_m=_GEMM_M_DEFAULT,
     gemm_n=_GEMM_N_DEFAULT,
     gemm_k=_GEMM_K_DEFAULT,
-):
+):def _test_gemm_overlap_comparison(
     """SDMA (copy True/False) vs RCCL allreduce overlapped with torch.matmul.
 
     No payload correctness checks here (Tests 1–4); only launch success and timing.
