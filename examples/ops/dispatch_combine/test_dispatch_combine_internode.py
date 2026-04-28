@@ -1237,7 +1237,7 @@ class EpDispatchCombineTestCase:
         [disp_rdma_bw, disp_xgmi_bw, disp_lat_us,
          comb_rdma_bw, comb_xgmi_bw, comb_lat_us].
         """
-        (disp_dur, disp_rdma, disp_xgmi, comb_dur, comb_rdma, comb_xgmi, ll_scale) = (
+        disp_dur, disp_rdma, disp_xgmi, comb_dur, comb_rdma, comb_xgmi, ll_scale = (
             bench_result
         )
         repeat = len(disp_dur)
