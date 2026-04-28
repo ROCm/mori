@@ -25,7 +25,7 @@
 
 #include <type_traits>
 
-#include "mori/application/application.hpp"
+#include "mori/application/application_device_types.hpp"
 #include "mori/core/core.hpp"
 #include "mori/shmem/internal.hpp"
 #include "mori/shmem/shmem_api.hpp"

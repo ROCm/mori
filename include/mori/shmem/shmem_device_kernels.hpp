@@ -21,7 +21,7 @@
 // SOFTWARE.
 #pragma once
 
-#include "mori/application/application.hpp"
+#include "mori/application/application_device_types.hpp"
 
 namespace mori {
 namespace shmem {

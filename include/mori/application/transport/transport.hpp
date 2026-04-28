@@ -21,13 +21,8 @@
 // SOFTWARE.
 #pragma once
 
+#include "mori/application/application_device_types.hpp"
 #include "mori/application/transport/p2p/p2p.hpp"
 #include "mori/application/transport/rdma/rdma.hpp"
 
-namespace mori {
-namespace application {
-
-enum TransportType { RDMA = 0, P2P = 1, SDMA = 2 };
-
-}  // namespace application
-}  // namespace mori
+// TransportType is defined in application_device_types.hpp

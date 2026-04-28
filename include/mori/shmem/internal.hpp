@@ -21,6 +21,13 @@
 // SOFTWARE.
 #pragma once
 
+// Device-safe includes: no STL, no ibverbs, safe for HIP/CUDA device compilation.
+#include "mori/application/application_device_types.hpp"
+#include "mori/hip_compat.hpp"
+
+// Host-only includes: STL, ibverbs, application management classes.
+// Guarded so device compilation units (.hip files) do not pull them in.
+#if !defined(__HIPCC__) && !defined(__CUDACC__)
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -28,10 +35,16 @@
 
 #include "mori/application/application.hpp"
 #include "mori/application/bootstrap/bootstrap.hpp"
-#include "mori/hip_compat.hpp"
+#endif
 
 namespace mori {
 namespace shmem {
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                               Host-only shmem state structures                                 */
+/* ---------------------------------------------------------------------------------------------- */
+
+#if !defined(__HIPCC__) && !defined(__CUDACC__)
 
 // Shmem operation mode
 enum class ShmemMode {
@@ -109,12 +122,43 @@ struct ShmemStates {
   }
 };
 
+#endif  // !defined(__HIPCC__) && !defined(__CUDACC__)
+
+/* ---------------------------------------------------------------------------------------------- */
+/*                          Device-safe GPU-side structures */
+/* ---------------------------------------------------------------------------------------------- */
+
+// GPU-side RDMA endpoint: only the fields used by device kernels.
+// Excludes host-only fields: ibvHandle (ibverbs objects) and unused handle sub-fields (psn, portId,
+// mac, gid). Only qpn from handle is needed by device kernels (for doorbell posting).
+// Populated from application::RdmaEndpoint by init.cpp before hipMemcpy to device.
+struct ShmemRdmaEndpoint {
+  application::RdmaDeviceVendorId vendorId{application::RdmaDeviceVendorId::Unknown};
+  uint32_t qpn{0};  // QP number — extracted from application::RdmaEndpoint::handle.qpn
+  core::WorkQueueHandle wqHandle;
+  core::CompletionQueueHandle cqHandle;
+  core::IbufHandle atomicIbuf;
+
+  __device__ __host__ core::ProviderType GetProviderType() {
+    if (vendorId == application::RdmaDeviceVendorId::Mellanox) {
+      return core::ProviderType::MLX5;
+    } else if (vendorId == application::RdmaDeviceVendorId::Broadcom) {
+      return core::ProviderType::BNXT;
+    } else if (vendorId == application::RdmaDeviceVendorId::Pensando) {
+      return core::ProviderType::PSD;
+    } else {
+      assert(false);
+      return core::ProviderType::Unknown;
+    }
+  }
+};
+
 struct GpuStates {
   int rank{-1};
   int worldSize{-1};
   int numQpPerPe{4};  // Default to 4 QPs per peer, consistent with Context default
   application::TransportType* transportTypes{nullptr};
-  application::RdmaEndpoint* rdmaEndpoints{nullptr};
+  ShmemRdmaEndpoint* rdmaEndpoints{nullptr};
   uint32_t* endpointLock{nullptr};
 
   // Heap information (supports both static and VMM modes)
@@ -144,6 +188,12 @@ struct RemoteAddrInfo {
   __device__ RemoteAddrInfo(uintptr_t r, uintptr_t k) : raddr(r), rkey(k), valid(true) {}
 };
 
+/* ---------------------------------------------------------------------------------------------- */
+/*                               Host-only internal functions                                     */
+/* ---------------------------------------------------------------------------------------------- */
+
+#if !defined(__HIPCC__) && !defined(__CUDACC__)
+
 // Internal functions shared between init.cpp and runtime.cpp
 void CopyGpuStatesToDevice(const GpuStates* gpuStates);
 void FinalizeRuntime();
@@ -158,6 +208,8 @@ class ShmemStatesSingleton {
     return &states;
   }
 };
+
+#endif  // !defined(__HIPCC__) && !defined(__CUDACC__)
 
 }  // namespace shmem
 }  // namespace mori
