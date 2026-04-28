@@ -22,7 +22,7 @@
 #pragma once
 
 // #include "mori/application/transport/rdma/rdma.hpp"
-#include "primitives.hpp"
+#include "mori/core/transport/rdma/core_device_types.hpp"
 
 // using namespace mori::application;
 

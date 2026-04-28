@@ -147,6 +147,7 @@ struct ShmemRdmaEndpoint {
     } else if (vendorId == application::RdmaDeviceVendorId::Pensando) {
       return core::ProviderType::PSD;
     } else {
+      MORI_PRINTF("ShmemRdmaEndpoint: unknown vendorId %u\n", static_cast<uint32_t>(vendorId));
       assert(false);
       return core::ProviderType::Unknown;
     }
