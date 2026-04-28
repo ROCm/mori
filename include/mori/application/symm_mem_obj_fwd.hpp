@@ -44,5 +44,5 @@ struct SymmMemObjPtr {
   const SymmMemObj* operator->() const { return cpu; }
 #endif
 };
-} // namespace application
-} // namespace mori
+}  // namespace application
+}  // namespace mori

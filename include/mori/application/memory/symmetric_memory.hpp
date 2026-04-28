@@ -220,7 +220,7 @@ class SymmMemManager {
                              size_t chunksNeeded, int rank, int worldSize, int currentDev);
   void RegisterRdmaChunks(size_t startChunk, size_t chunksNeeded, int rank, int worldSize);
 };
-  
+
 }  // namespace application
 
 }  // namespace mori

@@ -151,7 +151,8 @@ set(SPDLOG_BUILD_BENCH
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 add_subdirectory(3rdparty/spdlog)
 # Hide spdlog symbols from other libraries to avoid symbol conflicts
-target_compile_options(spdlog PRIVATE -fvisibility=hidden -fvisibility-inlines-hidden)
+target_compile_options(spdlog PRIVATE -fvisibility=hidden
+                                      -fvisibility-inlines-hidden)
 
 add_library(mori_logging INTERFACE)
 target_include_directories(mori_logging INTERFACE include)

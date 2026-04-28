@@ -26,12 +26,12 @@
 #include <algorithm>
 #include <stdexcept>
 
+#include "mori/application/application.hpp"
 #include "mori/core/core.hpp"
 #include "mori/shmem/shmem_api.hpp"
 #include "mori/utils/env_utils.hpp"
 #include "mori/utils/hip_helper.hpp"
 #include "mori/utils/mori_log.hpp"
-#include "mori/application/application.hpp"
 
 namespace mori {
 namespace moe {

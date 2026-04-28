@@ -35,7 +35,7 @@ namespace mori {
 
 namespace application {
 class BootstrapNetwork;
-} 
+}
 namespace shmem {
 
 /* ---------------------------------------------------------------------------------------------- */
