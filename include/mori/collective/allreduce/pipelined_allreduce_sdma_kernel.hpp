@@ -58,10 +58,15 @@ static_assert(kMaxPipelineBlocks <= 385,
 //   --- post-AG wait instrumentation (E' prototype) ---
 //   30: block 0 post_ag_flag set (after AG wait done, before block 0 exit)
 //   31: compute block 1 post_ag_flag observed (spin-wait finished)
-static constexpr int kArPhaseTsCapacity = 32;
+// MUST stay in sync with kPhaseTsCapacity in twoshot_allreduce_sdma_class.hpp.
+// 128 leaves headroom up to numChunks ~= 38. Was 32 which OOB'd in Plan A
+// (CB1 max slot 11 + 3*numChunks = 35 at numChunks=8) and corrupted adjacent
+// device memory, breaking CrossPeBarrier sync state → deadlock. See Entry 19.
+static constexpr int kArPhaseTsCapacity = 128;
 
 __device__ inline void ar_write_phase_ts(uint64_t* ts, int idx) {
-  if (ts != nullptr && blockIdx.x == 0 && threadIdx.x == 0) {
+  if (ts != nullptr && blockIdx.x == 0 && threadIdx.x == 0 &&
+      static_cast<unsigned>(idx) < static_cast<unsigned>(kArPhaseTsCapacity)) {
     ts[idx] = __builtin_amdgcn_s_memtime();
   }
 }
@@ -73,7 +78,8 @@ __device__ inline void ar_write_phase_ts(uint64_t* ts, int idx) {
 //   11 + 3c + {0,1,2}: chunk c {loop-start, scatter-poll done, reduce done}
 //   11 + 3*numChunks: compute block exit (after final fetch_add)
 __device__ inline void ar_write_phase_ts_cb1(uint64_t* ts, int idx) {
-  if (ts != nullptr && blockIdx.x == 1 && threadIdx.x == 0) {
+  if (ts != nullptr && blockIdx.x == 1 && threadIdx.x == 0 &&
+      static_cast<unsigned>(idx) < static_cast<unsigned>(kArPhaseTsCapacity)) {
     ts[idx] = __builtin_amdgcn_s_memtime();
   }
 }
