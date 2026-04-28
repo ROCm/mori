@@ -27,6 +27,7 @@
 
 #include <dlfcn.h>
 
+#include <cstdint>
 #include <string>
 
 // Load a shared library at runtime. Returns the handle, or nullptr on failure.
