@@ -1078,6 +1078,7 @@ def _bench_overlap_one_size(
             n_samples = 5
             all_phase_deltas = []     # block-0 phases, only populated on rank 0
             all_cb_phase_deltas = []  # compute-block-1 phases, only populated on rank 0
+            all_ag_phase_deltas = []  # Plan A first AG-pull block phases, rank 0 only
             all_copy_timings = []     # copy-path timings, only populated on rank 0
             stage_med_ar0 = []        # only populated on rank 0
 
@@ -1154,14 +1155,22 @@ def _bench_overlap_one_size(
                     ar0_dur_ms = tgt_ar_s.elapsed_time(tgt_ar_e)
                     stage_med_ar0.append(ar0_dur_ms)
                     entry_cy = ts[0]
-                    exit_cy = ts[3 + 3 * last_nc]
+                    exit_candidates = [ts[3 + 3 * last_nc]]
+                    if (11 + 3 * last_nc) < len(ts) and ts[11 + 3 * last_nc] != 0:
+                        exit_candidates.append(ts[11 + 3 * last_nc])
+                    if (50 + 3 * last_nc) < len(ts) and ts[50 + 3 * last_nc] != 0:
+                        exit_candidates.append(ts[50 + 3 * last_nc])
+                    exit_cy = max(exit_candidates)
                     total_cy = exit_cy - entry_cy if exit_cy > entry_cy else 1
                     cy_to_ms = ar0_dur_ms / float(total_cy) if total_cy > 0 else 0.0
 
                     phases = {}
-                    phases["entry→scatter_done"] = (ts[1] - ts[0]) * cy_to_ms
+                    if ts[1] != 0:
+                        phases["entry→scatter_done"] = (ts[1] - ts[0]) * cy_to_ms
                     for c in range(last_nc):
-                        prev = ts[1] if c == 0 else ts[2 + 3 * (c - 1) + 2]
+                        prev = ts[1] if (c == 0 and ts[1] != 0) else (
+                            ts[0] if c == 0 else ts[2 + 3 * (c - 1) + 2]
+                        )
                         phases[f"c{c}:scatter→compute-wait"] = (ts[2 + 3 * c + 0] - prev) * cy_to_ms
                         phases[f"c{c}:compute-wait→barrier"] = (ts[2 + 3 * c + 1] - ts[2 + 3 * c + 0]) * cy_to_ms
                         phases[f"c{c}:barrier→AG-submit"] = (ts[2 + 3 * c + 2] - ts[2 + 3 * c + 1]) * cy_to_ms
@@ -1200,6 +1209,20 @@ def _bench_overlap_one_size(
                             cb_phases[label] = (ts[cb_events[i][0]] - ts[cb_events[i-1][0]]) * cy_to_ms
                         all_cb_phase_deltas.append(cb_phases)
 
+                    # Plan A v2 A-group (first AG-pull block) phase breakdown.
+                    if (50 + 3 * last_nc) < len(ts) and ts[49] != 0 and ts[50 + 3 * last_nc] != 0:
+                        ag_events = [(49, "entry")]
+                        for c in range(last_nc):
+                            ag_events.append((50 + 3 * c + 0, f"c{c}-ag-wait-start"))
+                            ag_events.append((50 + 3 * c + 1, f"c{c}-ag-ready"))
+                            ag_events.append((50 + 3 * c + 2, f"c{c}-pull-done"))
+                        ag_events.append((50 + 3 * last_nc, "ag-exit"))
+                        ag_phases = {}
+                        for i in range(1, len(ag_events)):
+                            label = f"{ag_events[i-1][1]}→{ag_events[i][1]}"
+                            ag_phases[label] = (ts[ag_events[i][0]] - ts[ag_events[i-1][0]]) * cy_to_ms
+                        all_ag_phase_deltas.append(ag_phases)
+
             if rank == 0 and len(all_phase_deltas) > 0:
                 import statistics as _st
                 phase_keys = list(all_phase_deltas[0].keys())
@@ -1226,6 +1249,15 @@ def _bench_overlap_one_size(
                 else:
                     print(f"  --- Block 1 (compute block) timestamps all zero: kernel was "
                           f"not built with compute-block instrumentation ---")
+
+                if len(all_ag_phase_deltas) > 0:
+                    ag_keys = list(all_ag_phase_deltas[0].keys())
+                    ag_med = {k: _st.median([d[k] for d in all_ag_phase_deltas]) for k in ag_keys}
+                    print(f"  --- Plan A A-group (first AG-pull block) ---")
+                    print(f"  sum of AG-pull-block phase deltas:     "
+                          f"{sum(ag_med.values()):7.3f} ms")
+                    for k, v in ag_med.items():
+                        print(f"    {k:<35s} {v:7.3f} ms")
 
                 if len(all_copy_timings) > 0:
                     host_us_vals = [v[0] for v in all_copy_timings]

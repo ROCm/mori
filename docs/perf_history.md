@@ -867,6 +867,92 @@ Both keep SDMA AG → no CU contention → consistent with the mechanism above.
 
 ---
 
+## Entry 21 — Plan A v2 implementation: split K2 into R-group reduce and A-group XGMI-pull pipeline
+- **Date**: 2026-04-29
+- **Commit**: `22cb5846`
+- **Why this exists**: Entry 20 correctly measured the first Plan A implementation
+  as **9.084 ms** (worse than RCCL 7.503 ms), but the implementation was not
+  the user-intended "CU pipelined" Plan A. The kernel serialized:
+  `reduce(c) -> barrier(c) -> XGMI_pull(c) -> reduce(c+1)`. That loses the
+  intended overlap between pulling chunk `c` and reducing chunk `c+1`.
+
+### Implementation delta
+
+K1 remains unchanged:
+- `ScatterSdmaOnlyKernel`: SDMA push input shards to peer transit.
+
+K2 `PipelinedXGMIPullKernel` is changed from all-CB serial loop to two compute
+groups:
+
+| group | blocks | work |
+|---|---|---|
+| Block 0 | 1 | wait `chunks_complete == (c+1)*nR`, cross-PE reduce_complete barrier, signal `ag_sync` |
+| R-group | `nR` | wait scatter signal, reduce chunk `c` into local `transit[myPe slot]`, fence, `fetch_add(chunks_complete)` |
+| A-group | `nA = compBlocks - nR` | wait `ag_sync >= c+1`, XGMI pull `peer[p].transit[p slot][chunk c]` to `user_output[p slot][chunk c]` |
+
+This restores the intended pipeline:
+```
+R-group: reduce0 -> reduce1 -> reduce2 -> ...
+A-group:           pull0   -> pull1   -> ...
+```
+
+### CU pressure controls
+
+User pointed out 161 blocks/CUs likely starves GEMM. Host now uses separate
+Plan A knobs:
+- `MORI_PLAN_A_CU` (default **96**) caps total Plan A compute blocks
+  (not counting block 0). This leaves more CUs for GEMM than the previous
+  160-block default.
+- `MORI_PLAN_A_NR` (default `MORI_PLAN_A_CU/3`) sets R-group size; A-group
+  gets the remaining blocks. Default R:A ~= 1:2 because AG pull reads+writes
+  more bytes than reduce writes.
+- Host clamps `nA >= npes` so every output slot has at least one A block.
+
+### Instrumentation
+
+- Existing R-group slots (`10`, `11+3c+{0,1,2}`, `11+3*numChunks`) still report
+  first R-block reduce phases.
+- New A-group slots:
+  - `49`: first A-block entry
+  - `50+3c+0`: chunk c AG wait start
+  - `50+3c+1`: chunk c `ag_sync` observed
+  - `50+3c+2`: chunk c pull done
+  - `50+3*numChunks`: first A-block exit
+- `test_allreduce.py --ar-phase-timing` now prints a "Plan A A-group" section
+  when those slots are populated.
+
+### Test plan
+
+Build:
+```bash
+BUILD_EXAMPLES=ON BUILD_TESTS=ON pip3 install .
+```
+
+First run correctness + wall at default 96/32 split:
+```bash
+MORI_PIPELINE_CU=160 MORI_DIRECT_OUTPUT=1 python3 tests/python/ccl/test_allreduce.py \
+  --num-stages 4 --elems 67108864 --iterations 50 --warmup 10
+```
+
+Then sweep CU split using same command:
+```bash
+MORI_PLAN_A_CU=80  MORI_PLAN_A_NR=24 ...
+MORI_PLAN_A_CU=96  MORI_PLAN_A_NR=32 ...
+MORI_PLAN_A_CU=128 MORI_PLAN_A_NR=48 ...
+```
+
+Measure AR[0] phase with:
+```bash
+MORI_PIPELINE_CU=160 MORI_DIRECT_OUTPUT=1 MORI_PHASE_TARGET_STAGE=0 \
+  python3 tests/python/ccl/test_allreduce.py --num-stages 4 --elems 67108864 \
+  --iterations 3 --warmup 2 --ar-phase-timing
+```
+
+Success target remains: Plan A wall < RCCL wall (~7.50 ms today, 7.42 ms
+Entry 18 best).
+
+---
+
 ## Entry 19 — Plan A (PipelinedXGMIPullKernel) baseline reference + kernel swap
 - **Date**: 2026-04-24
 - **Baseline reference SHA**: `5f0072e7` (code HEAD at measurement time) /

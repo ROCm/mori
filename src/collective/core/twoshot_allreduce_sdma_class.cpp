@@ -256,9 +256,6 @@ void AllreduceSdma<T>::enable_direct_output(bool on) {
   if (on == direct_output_enabled_) return;
   direct_output_enabled_ = on;
   if (on) {
-    // Plan A relies on post_ag_flag to gate compute blocks until all
-    // peers' reduce barriers are done; enable it automatically.
-    if (!post_ag_wait_enabled_) enable_post_ag_wait(true);
     printf("PE %d: direct_output ENABLED (plan A — CU XGMI AG + direct "
            "write user_output; skips SDMA AG and external hipMemcpyAsync; "
            "MULTI_CHUNK only, copy_output_to_user=%d)\n",
@@ -860,6 +857,29 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         bool skip_external_copy = use_plan_a;
 
         if (use_plan_a) {
+            int plan_a_comp = blocks - 1;
+            // Plan A v2 uses CU for both reduce and AG-pull. Do not default
+            // to all 160 CUs: that starves the overlapped GEMM. Keep a
+            // tunable cap so we can sweep the AR/GEMM balance.
+            int plan_a_cu = 96;
+            if (const char* e = std::getenv("MORI_PLAN_A_CU")) {
+                int v = std::atoi(e);
+                if (v >= 2) plan_a_cu = v;
+            }
+            if (plan_a_cu < plan_a_comp) plan_a_comp = plan_a_cu;
+            // Need at least 1 R block and npes A blocks (one per output slot).
+            if (plan_a_comp < npes_ + 1) plan_a_comp = npes_ + 1;
+
+            int plan_a_nR = plan_a_comp / 3;  // default R:A ~= 1:2
+            if (const char* e = std::getenv("MORI_PLAN_A_NR")) {
+                int v = std::atoi(e);
+                if (v > 0) plan_a_nR = v;
+            }
+            if (plan_a_nR < 1) plan_a_nR = 1;
+            if (plan_a_nR > plan_a_comp - npes_) plan_a_nR = plan_a_comp - npes_;
+            const int plan_a_nA = plan_a_comp - plan_a_nR;
+            const int plan_a_blocks = plan_a_comp + 1;
+
             // Plan A needs both chunks_complete AND ag_sync reset to 0.
             // ag_sync is block 0 → compute blocks signal for cross-PE
             // barrier completion. Expand memset to cover both fields.
@@ -879,20 +899,22 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             if (!s_plan_a_announced) {
                 printf("PE %d: Plan A active — ScatterSdmaOnlyKernel + "
                        "PipelinedXGMIPullKernel; chunks=%d, blocks=%d, "
-                       "threads=%d, chunk_elems=%zu\n",
-                       myPe_, numChunks_host, blocks, threads,
-                       static_cast<size_t>(chunk_elems));
+                       "threads=%d, chunk_elems=%zu, nR=%d, nA=%d "
+                       "(MORI_PLAN_A_CU=%d)\n",
+                       myPe_, numChunks_host, plan_a_blocks, threads,
+                       static_cast<size_t>(chunk_elems), plan_a_nR, plan_a_nA,
+                       plan_a_comp);
                 s_plan_a_announced = true;
             }
             ScatterSdmaOnlyKernel<T><<<1, 512, 0, stream>>>(
                 myPe_, npes_, input, output_transit_buffer_obj_,
                 total_count, chunk_elems, scatter_base);
-            PipelinedXGMIPullKernel<T><<<blocks, threads, 0, stream>>>(
+            PipelinedXGMIPullKernel<T><<<plan_a_blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_, barrierPtr_,
                 output,
                 total_count, chunk_elems, scatter_base, ag_base,
-                reduce_complete_base, phase_ts_ptr);
+                reduce_complete_base, plan_a_nR, phase_ts_ptr);
         } else if (scatter_mode == 1) {
             PipelinedAllReduceSdmaKernel<T, 1><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
