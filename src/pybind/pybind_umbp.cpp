@@ -22,12 +22,16 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <cstdint>
+#include <sstream>
+
 #include "src/pybind/mori.hpp"
 #include "umbp/common/config.h"
 #include "umbp/distributed/config.h"
 #include "umbp/distributed/distributed_client.h"
 #include "umbp/distributed/master/master_client.h"
 #include "umbp/distributed/types.h"
+#include "umbp/local/host_mem_allocator.h"
 #include "umbp/umbp_client.h"
 
 namespace py = pybind11;
@@ -35,6 +39,49 @@ namespace py = pybind11;
 namespace mori {
 using namespace umbp;
 void RegisterMoriUmbp(py::module_& m) {
+  py::enum_<HostBufferBacking>(m, "UMBPHostBufferBacking")
+      .value("Anonymous", HostBufferBacking::kAnonymous)
+      .value("AnonymousHugetlb", HostBufferBacking::kAnonymousHugetlb)
+      .export_values();
+
+  py::class_<HostBufferHandle>(m, "UMBPHostBufferHandle")
+      .def(py::init<>())
+      .def_property_readonly(
+          "ptr",
+          [](const HostBufferHandle& handle) { return reinterpret_cast<uintptr_t>(handle.ptr); })
+      .def_readonly("requested_size", &HostBufferHandle::requested_size)
+      .def_readonly("mapped_size", &HostBufferHandle::mapped_size)
+      .def_readonly("actual_backing", &HostBufferHandle::actual_backing)
+      .def_readonly("actual_alignment", &HostBufferHandle::actual_alignment)
+      .def("__bool__", &HostBufferHandle::valid)
+      .def("__repr__", [](const HostBufferHandle& handle) {
+        std::ostringstream oss;
+        oss << "<UMBPHostBufferHandle ptr=0x" << std::hex << reinterpret_cast<uintptr_t>(handle.ptr)
+            << std::dec << " requested_size=" << handle.requested_size
+            << " mapped_size=" << handle.mapped_size << ">";
+        return oss.str();
+      });
+
+  py::class_<HostMemAllocator>(m, "UMBPHostMemAllocator")
+      .def(py::init<>())
+      .def(
+          "alloc",
+          [](HostMemAllocator& self, size_t size, HostBufferBacking backing, size_t hugepage_size,
+             int numa_node, bool prefault) {
+            HostBufferOptions opts;
+            opts.backing = backing;
+            opts.hugepage_size = hugepage_size;
+            opts.numa_node = numa_node;
+            opts.prefault = prefault;
+            return self.Alloc(size, opts);
+          },
+          py::arg("size"), py::arg("backing") = HostBufferBacking::kAnonymous,
+          py::arg("hugepage_size") = size_t{2ULL * 1024 * 1024}, py::arg("numa_node") = -1,
+          py::arg("prefault") = true, py::call_guard<py::gil_scoped_release>())
+      .def(
+          "free", [](HostMemAllocator& self, HostBufferHandle& handle) { self.Free(handle); },
+          py::arg("handle"), py::call_guard<py::gil_scoped_release>());
+
   py::enum_<TierType>(m, "UMBPTierType")
       .value("Unknown", TierType::UNKNOWN)
       .value("HBM", TierType::HBM)
