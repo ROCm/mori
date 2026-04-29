@@ -1553,6 +1553,34 @@ corrected continuous no-prep setup.
 
 ---
 
+## Entry 33 — `--ar-priority -1` continuous no-prep: no measurable effect
+- **Date**: 2026-04-29
+- **Command**: `MORI_CONTINUOUS_PREP=0 MORI_PIPELINE_CU=160 python3 tests/python/ccl/test_allreduce.py --num-stages 4 --elems 67108864 --iterations 1 --warmup 1 --continuous-iters 100 --ar-priority -1`
+- **Scenario**: corrected continuous no-prep, 256MB × 4 stages, 8 ranks.
+- **All correctness checks PASSED**
+
+| mode | wall | seq_ar | seq_gemm | slowdown | gap vs RCCL |
+|---|---:|---:|---:|---:|---:|
+| SDMA copy | 7.145 | 5.202 | 4.355 | 1.641 | +1.334 |
+| **SDMA no-copy** | **6.567** | **4.776** | 4.167 | **1.576** | **+0.756** |
+| RCCL | 5.811 | 5.139 | 4.139 | 1.404 | — |
+
+### Comparison to Entry 32 baseline priority
+
+Entry 32 (normal priority) no-copy wall was stable at 6.558–6.580 ms; RCCL
+normal wall was 5.790–5.809 ms (excluding outlier). Entry 33 with
+`--ar-priority -1` gives no-copy 6.567 and RCCL 5.811 — within the same range.
+
+### Conclusion
+
+Stream priority does **not** fix the continuous backlog mechanism. Likely reason:
+priority affects scheduling of pending kernels but does not preempt already
+running GEMM kernels enough to change the SDMA AR service time. Next experiment:
+sweep `MORI_PIPELINE_CU=192/224` to see whether more reduce blocks can reduce
+SDMA AR service time under GEMM.
+
+---
+
 ## Entry 19 — Plan A (PipelinedXGMIPullKernel) baseline reference + kernel swap
 - **Date**: 2026-04-24
 - **Baseline reference SHA**: `5f0072e7` (code HEAD at measurement time) /

@@ -9,7 +9,7 @@ alwaysApply: true
 
 关联文件:
 - `.cursor/rules/relentless-perf.mdc` — 方法论规则 (R0-R15)
-- `docs/perf_history.md` — 所有历史 Entry (1-32) 含数据
+- `docs/perf_history.md` — 所有历史 Entry (1-33) 含数据
 - Latest mechanism finding: Entry 31 continuous timeline shows SDMA no-copy
   GEMM remains ~1.0ms/stage, but SDMA AR service time becomes ~2.0ms/stage
   under GEMM, so stream_ar backlog grows. RCCL stabilizes both GEMM/AR around
@@ -145,6 +145,19 @@ Mechanism: SDMA no-copy does not slow GEMM; GEMM outruns / starves SDMA AR.
 stream_gemm produces stages every ~1.0ms while stream_ar consumes each stage
 in ~2.0ms, causing backlog. Need improve SDMA AR service time under GEMM or
 rebalance priority/CU so stage rates match.
+
+### `--ar-priority -1` result (Entry 33)
+
+Corrected continuous no-prep with AR stream high priority:
+
+| mode | wall | seq_ar | seq_gemm | slowdown | vs RCCL |
+|---|---:|---:|---:|---:|---:|
+| SDMA copy | 7.145 | 5.202 | 4.355 | 1.641 | +1.334 |
+| SDMA no-copy | 6.567 | 4.776 | 4.167 | 1.576 | +0.756 |
+| RCCL | 5.811 | 5.139 | 4.139 | 1.404 | — |
+
+This is within Entry 32 normal-priority range (no-copy 6.558–6.580, RCCL
+5.790–5.809). **Priority has no measurable effect**.
 
 ### Plan A v1 实测 (Entry 20, **已知不是 pipelined 实现**)
 
