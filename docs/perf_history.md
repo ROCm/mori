@@ -1935,6 +1935,51 @@ dominates.
 
 ---
 
+## Entry 42 — `MORI_GROUPED_REDUCE_BARRIER=2` FAILED correctness; reverted immediately
+- **Date**: 2026-04-30
+- **Implementation commit**: `4f74e663`
+- **Revert commit**: `2dc20476`
+- **Command**: `MORI_CONTINUOUS_PREP=0 MORI_PIPELINE_CU=224 MORI_PIPELINE_CHUNKS=4 MORI_GROUPED_REDUCE_BARRIER=2 ... --continuous-iters 100 --continuous-phase-iter 5 --continuous-phase-stage 0`
+
+### Result
+
+Correctness failed before any perf conclusion:
+```text
+PE 0 [outplace/uint32]: FAILED! Expected 36000, got 34816 mismatches.
+First mismatch at idx 194560: 253000
+PE 0 [inplace2-transit/uint32]: FAILED! Expected 36000, got 53504 mismatches.
+First mismatch at idx 2048: 93000
+PE 0 [inplace2/uint32]: FAILED! Expected 36000, got 53504 mismatches.
+```
+
+Perf numbers from that invalid run were also unusable:
+```text
+SDMA no-copy 11.268 ms
+RCCL 13.815 ms
+```
+
+### Mechanism
+
+Grouped barrier was intended as a middle ground:
+```text
+reduce c0,c1 -> one barrier -> AG c0,c1
+reduce c2,c3 -> one barrier -> AG c2,c3
+```
+
+But this violates the original per-chunk safety invariant. Peers may begin
+reducing chunk `c1` while another PE has already AG-written chunk `c0` into
+the peer's transit slot in the same group, and the shared transit / ordering
+assumptions are no longer protected per chunk. The observed stale/incorrect
+transit values match this class of race.
+
+### Conclusion
+
+`MORI_GROUPED_REDUCE_BARRIER` is closed. It was reverted immediately (R5).
+Do not retry grouped barriers without a new correctness proof and explicit
+per-chunk ownership separation.
+
+---
+
 ## Entry 19 — Plan A (PipelinedXGMIPullKernel) baseline reference + kernel swap
 - **Date**: 2026-04-24
 - **Baseline reference SHA**: `5f0072e7` (code HEAD at measurement time) /
