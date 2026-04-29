@@ -1910,6 +1910,41 @@ goal.
 
 ---
 
+## Entry 49 — Implement integer accumulator fast path for uint32/int32 pipeline reduce
+- **Date**: 2026-04-30
+- **Commit**: _this commit_
+- **Motivation**: Continuous phase timing shows the pipeline reduce phase is a
+  major part of AR service time under GEMM. For the current benchmark dtype
+  (`uint32`), the baseline reduce path still used `packed_t<T>::A = float`,
+  converting integer inputs to float, accumulating in float, and converting
+  back. This is unnecessary for uint32/int32 and adds CU work in the exact
+  phase that is limiting stream_ar service rate.
+
+### Implementation
+
+In `PipelinedAllReduceSdmaKernel` compute-block reduce:
+- if `P::type` is `uint32_t` or `int32_t`, accumulate directly in packed integer
+  registers (`P`) with `packed_assign_add`
+- otherwise keep the existing float-accumulator path
+
+Default semantics remain unchanged for other dtypes.
+
+### Test command
+
+```bash
+MORI_CONTINUOUS_PREP=0 MORI_PIPELINE_CU=224 MORI_PIPELINE_CHUNKS=4 \
+python3 tests/python/ccl/test_allreduce.py --num-stages 4 --elems 67108864 \
+  --iterations 1 --warmup 1 --continuous-iters 100 \
+  --continuous-phase-iter 5 --continuous-phase-stage 0
+```
+
+Success signature:
+- correctness passes
+- `SDMA no-copy` wall improves below Entry 34 best 6.390 ms
+- phase `R-block reduce` times drop from ~0.39/0.40 ms for first chunks
+
+---
+
 ## Entry 40 — Implement experimental multi-q SDMA AG (`MORI_MULTI_Q_AG=1`)
 - **Date**: 2026-04-29
 - **Commit**: _this commit_

@@ -31,6 +31,7 @@
 
 #include <hip/hip_runtime.h>
 #include <cstddef>
+#include <type_traits>
 
 #include "mori/shmem/shmem.hpp"
 #include "mori/core/transport/rdma/device_primitives.hpp"
@@ -331,31 +332,52 @@ __global__ void PipelinedAllReduceSdmaKernel(
               buf + static_cast<size_t>(myPe) * packedPerRank + off;
 
           size_t k = compTid;
-          for (; k + compStride < cnt; k += compStride * 2) {
-            A acc0 = upcast_v<typename P::type, pack_size>(s_pe_ptrs[0][k]);
-            A acc1 = upcast_v<typename P::type, pack_size>(
-                s_pe_ptrs[0][k + compStride]);
-            for (int pe = 1; pe < npes; ++pe) {
-              packed_assign_add(
-                  acc0,
-                  upcast_v<typename P::type, pack_size>(s_pe_ptrs[pe][k]));
-              packed_assign_add(
-                  acc1,
-                  upcast_v<typename P::type, pack_size>(
-                      s_pe_ptrs[pe][k + compStride]));
+          if constexpr (std::is_same<typename P::type, uint32_t>::value ||
+                        std::is_same<typename P::type, int32_t>::value) {
+            for (; k + compStride < cnt; k += compStride * 2) {
+              P acc0 = s_pe_ptrs[0][k];
+              P acc1 = s_pe_ptrs[0][k + compStride];
+              for (int pe = 1; pe < npes; ++pe) {
+                packed_assign_add(acc0, s_pe_ptrs[pe][k]);
+                packed_assign_add(acc1, s_pe_ptrs[pe][k + compStride]);
+              }
+              myDst[k] = acc0;
+              myDst[k + compStride] = acc1;
             }
-            myDst[k] = downcast_v<typename P::type, pack_size>(acc0);
-            myDst[k + compStride] =
-                downcast_v<typename P::type, pack_size>(acc1);
-          }
-          if (k < cnt) {
-            A acc = upcast_v<typename P::type, pack_size>(s_pe_ptrs[0][k]);
-            for (int pe = 1; pe < npes; ++pe) {
-              packed_assign_add(
-                  acc,
-                  upcast_v<typename P::type, pack_size>(s_pe_ptrs[pe][k]));
+            if (k < cnt) {
+              P acc = s_pe_ptrs[0][k];
+              for (int pe = 1; pe < npes; ++pe) {
+                packed_assign_add(acc, s_pe_ptrs[pe][k]);
+              }
+              myDst[k] = acc;
             }
-            myDst[k] = downcast_v<typename P::type, pack_size>(acc);
+          } else {
+            for (; k + compStride < cnt; k += compStride * 2) {
+              A acc0 = upcast_v<typename P::type, pack_size>(s_pe_ptrs[0][k]);
+              A acc1 = upcast_v<typename P::type, pack_size>(
+                  s_pe_ptrs[0][k + compStride]);
+              for (int pe = 1; pe < npes; ++pe) {
+                packed_assign_add(
+                    acc0,
+                    upcast_v<typename P::type, pack_size>(s_pe_ptrs[pe][k]));
+                packed_assign_add(
+                    acc1,
+                    upcast_v<typename P::type, pack_size>(
+                        s_pe_ptrs[pe][k + compStride]));
+              }
+              myDst[k] = downcast_v<typename P::type, pack_size>(acc0);
+              myDst[k + compStride] =
+                  downcast_v<typename P::type, pack_size>(acc1);
+            }
+            if (k < cnt) {
+              A acc = upcast_v<typename P::type, pack_size>(s_pe_ptrs[0][k]);
+              for (int pe = 1; pe < npes; ++pe) {
+                packed_assign_add(
+                    acc,
+                    upcast_v<typename P::type, pack_size>(s_pe_ptrs[pe][k]));
+              }
+              myDst[k] = downcast_v<typename P::type, pack_size>(acc);
+            }
           }
         }
 
