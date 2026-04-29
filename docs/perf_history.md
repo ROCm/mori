@@ -1581,6 +1581,48 @@ SDMA AR service time under GEMM.
 
 ---
 
+## Entry 34 — Continuous no-copy with `MORI_PIPELINE_CHUNKS=4`: small improvement, still +0.58 ms vs RCCL
+- **Date**: 2026-04-29
+- **Command**: `MORI_CONTINUOUS_PREP=0 MORI_PIPELINE_CU=224 MORI_PIPELINE_CHUNKS=4 python3 tests/python/ccl/test_allreduce.py --num-stages 4 --elems 67108864 --iterations 1 --warmup 1 --continuous-iters 100`
+- **Scenario**: corrected continuous no-prep, 256MB × 4 stages, 8 ranks.
+- **All correctness checks PASSED**
+
+| mode | continuous wall | seq_ar | seq_gemm | slowdown | gap vs RCCL |
+|---|---:|---:|---:|---:|---:|
+| SDMA copy | 7.389 | 5.227 | 4.334 | 1.705 | +1.580 |
+| **SDMA no-copy** | **6.390** | **4.811** | 4.168 | **1.533** | **+0.581** |
+| RCCL | **5.809** | 5.139 | 4.128 | 1.407 | — |
+
+### Interpretation
+
+`MORI_PIPELINE_CHUNKS=4` at high CU gives a small improvement over the stable
+2-chunk no-copy baseline:
+- Entry 32 normal no-copy: 6.558–6.580 ms
+- Entry 34 chunks=4 no-copy: **6.390 ms**
+- improvement: ~0.17 ms
+
+The remaining gap is still **+0.581 ms**. Increasing chunk density from 2 to 4
+appears to improve AR service cadence under GEMM, but not enough. Copy mode
+worsens because the external copy remains and more chunk/barrier overhead is
+added.
+
+### Next experiment
+
+Sweep chunk count around this setting:
+```bash
+for ch in 6 8 12; do
+  MORI_CONTINUOUS_PREP=0 MORI_PIPELINE_CU=224 MORI_PIPELINE_CHUNKS=$ch \
+    python3 tests/python/ccl/test_allreduce.py --num-stages 4 \
+    --elems 67108864 --iterations 1 --warmup 1 --continuous-iters 100
+done
+```
+
+If chunks=6/8 improves no-copy further, continue until barrier overhead turns
+it around. If all regress, best known setting is `PIPELINE_CU=224,
+PIPELINE_CHUNKS=4`.
+
+---
+
 ## Entry 19 — Plan A (PipelinedXGMIPullKernel) baseline reference + kernel swap
 - **Date**: 2026-04-24
 - **Baseline reference SHA**: `5f0072e7` (code HEAD at measurement time) /

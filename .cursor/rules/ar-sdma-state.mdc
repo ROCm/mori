@@ -159,6 +159,17 @@ Corrected continuous no-prep with AR stream high priority:
 This is within Entry 32 normal-priority range (no-copy 6.558–6.580, RCCL
 5.790–5.809). **Priority has no measurable effect**.
 
+### `PIPELINE_CU=224, PIPELINE_CHUNKS=4` result (Entry 34)
+
+| mode | wall | seq_ar | seq_gemm | slowdown | vs RCCL |
+|---|---:|---:|---:|---:|---:|
+| SDMA copy | 7.389 | 5.227 | 4.334 | 1.705 | +1.580 |
+| SDMA no-copy | **6.390** | 4.811 | 4.168 | **1.533** | **+0.581** |
+| RCCL | 5.809 | 5.139 | 4.128 | 1.407 | — |
+
+Chunks=4 at high CU improves no-copy by ~0.17ms vs 2-chunk baseline, but still
+leaves +0.581ms gap. Next sweep chunks 6/8/12 at CU=224.
+
 ### Plan A v1 实测 (Entry 20, **已知不是 pipelined 实现**)
 
 | 变体 | overlap wall | seq_ar | seq_gemm | overlap/seq_gemm | vs RCCL |
@@ -277,23 +288,15 @@ HEAD = **`061dd561`** (`--continuous-timeline-samples` implementation)
 
 ## 下一步行动
 
-Next run: test whether more AR resources / priority can reduce SDMA AR service
-time under GEMM:
+Next run: sweep chunks around the best known CU=224 setting:
 
 ```bash
 cd /home/fizhang/test/mori && git pull origin sdma-test
-SKIP_BUILD=1 MORI_CONTINUOUS_PREP=0 PIPELINE_CU=192 CONTINUOUS_ITERS=100 ITERATIONS=1 WARMUP=1 \
-  bash tools/bench_plan_a.sh
-SKIP_BUILD=1 MORI_CONTINUOUS_PREP=0 PIPELINE_CU=224 CONTINUOUS_ITERS=100 ITERATIONS=1 WARMUP=1 \
-  bash tools/bench_plan_a.sh
-```
-
-If CU sweep does not reduce no-copy wall, test stream priority:
-
-```bash
-MORI_CONTINUOUS_PREP=0 MORI_PIPELINE_CU=160 python3 tests/python/ccl/test_allreduce.py \
-  --num-stages 4 --elems 67108864 --iterations 1 --warmup 1 \
-  --continuous-iters 100 --ar-priority -1
+for ch in 6 8 12; do
+  MORI_CONTINUOUS_PREP=0 MORI_PIPELINE_CU=224 MORI_PIPELINE_CHUNKS=$ch \
+    python3 tests/python/ccl/test_allreduce.py --num-stages 4 \
+    --elems 67108864 --iterations 1 --warmup 1 --continuous-iters 100
+done
 ```
 
 ---
