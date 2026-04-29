@@ -1089,14 +1089,14 @@ def _bench_overlap_one_size(
                 CB_BASE = 88
                 A_BASE = 144
                 entry = ts[0]
-                exit_candidates = []
-                for idx in (3 + 3 * nc,
-                            CB_BASE + 1 + 3 * nc,
-                            A_BASE + 1 + 3 * nc):
-                    if idx < len(ts) and ts[idx] != 0:
-                        exit_candidates.append(ts[idx])
-                if entry != 0 and len(exit_candidates) > 0:
-                    exit_t = max(exit_candidates)
+                # Calibrate cycles->ms from block-0's own timestamp domain.
+                # s_memtime values from different CUs (block0 vs CB/A blocks)
+                # can have large per-CU epoch offsets, so never mix CB/A exit
+                # timestamps into the block0 duration. Previous code used max()
+                # across block0/CB/A exits and collapsed all decoded deltas to 0.
+                block0_exit_idx = 3 + 3 * nc
+                if entry != 0 and block0_exit_idx < len(ts) and ts[block0_exit_idx] != 0:
+                    exit_t = ts[block0_exit_idx]
                     total_cy = exit_t - entry if exit_t > entry else 1
                     cy_to_ms = dur_ms / float(total_cy)
                     print("  decoded block0 phases:")
@@ -1347,14 +1347,13 @@ def _bench_overlap_one_size(
                     ar0_dur_ms = tgt_ar_s.elapsed_time(tgt_ar_e)
                     stage_med_ar0.append(ar0_dur_ms)
                     entry_cy = ts[0]
-                    exit_candidates = [ts[3 + 3 * last_nc]]
+                    # Calibrate cycles->ms from block-0's own timestamp domain.
+                    # Do not mix CB/A timestamps here: s_memtime epochs can
+                    # differ by CU, and using max(CB/A exits) makes all phase
+                    # deltas print as 0.000.
                     cb_exit_idx = CB_BASE + 1 + 3 * last_nc
                     a_exit_idx = A_BASE + 1 + 3 * last_nc
-                    if cb_exit_idx < len(ts) and ts[cb_exit_idx] != 0:
-                        exit_candidates.append(ts[cb_exit_idx])
-                    if a_exit_idx < len(ts) and ts[a_exit_idx] != 0:
-                        exit_candidates.append(ts[a_exit_idx])
-                    exit_cy = max(exit_candidates)
+                    exit_cy = ts[3 + 3 * last_nc]
                     total_cy = exit_cy - entry_cy if exit_cy > entry_cy else 1
                     cy_to_ms = ar0_dur_ms / float(total_cy) if total_cy > 0 else 0.0
 
