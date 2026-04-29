@@ -967,14 +967,23 @@ def _bench_overlap_one_size(
             prep_s = "prep" if continuous_do_prep else "no-prep"
             print(f" continuous({continuous_iters},{prep_s})", end="", flush=True)
 
-        def run_one_pipeline():
+        # Do not reuse the same event objects across continuous iterations.
+        # The CPU enqueues all iterations quickly; re-recording an event before
+        # a previously enqueued stream_ar.wait_event(event) has executed can
+        # make that wait observe the later record. Allocate unique GEMM-done
+        # events per logical iteration/stage so AR[i,s] waits on GEMM[i,s].
+        cont_g_done = [
+            [torch.cuda.Event(enable_timing=False) for _ in range(num_stages)]
+            for _ in range(max(continuous_iters, max(1, warmup)))
+        ]
+
+        def run_one_pipeline(iter_idx):
             for s in range(num_stages):
-                ev_g_e_list[s].record(stream_gemm)
                 with torch.cuda.stream(stream_gemm):
                     _run_gemm()
-                ev_g_e_list[s].record(stream_gemm)
+                cont_g_done[iter_idx][s].record(stream_gemm)
                 if use_overlap:
-                    stream_ar.wait_event(ev_g_e_list[s])
+                    stream_ar.wait_event(cont_g_done[iter_idx][s])
                 else:
                     stream_gemm.synchronize()
                 with torch.cuda.stream(stream_ar):
@@ -987,11 +996,11 @@ def _bench_overlap_one_size(
         # Untimed warmup blocks. This keeps the continuous measured window
         # free of between-iteration sync, while still warming kernels/queues.
         torch.cuda.synchronize()
-        for _ in range(max(1, warmup)):
+        for wi in range(max(1, warmup)):
             if continuous_do_prep:
                 with torch.cuda.stream(stream_ar):
                     prep_ar()
-            run_one_pipeline()
+            run_one_pipeline(wi)
         if use_overlap:
             stream_ar.synchronize()
             if copy_stream:
@@ -1002,11 +1011,11 @@ def _bench_overlap_one_size(
 
         torch.cuda.synchronize()
         ov_s.record()
-        for _ in range(continuous_iters):
+        for ci in range(continuous_iters):
             if continuous_do_prep:
                 with torch.cuda.stream(stream_ar):
                     prep_ar()
-            run_one_pipeline()
+            run_one_pipeline(ci)
         if use_overlap:
             stream_ar.synchronize()
             if copy_stream:

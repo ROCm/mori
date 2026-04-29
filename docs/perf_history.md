@@ -1295,6 +1295,39 @@ extra 256MB HBM fill/copy kernel. A follow-up test flag
 `MORI_CONTINUOUS_PREP=0` skips this per-iteration prep to isolate whether the
 gap is a benchmark-prep artifact or true AR/GEMM overlap loss.
 
+### Superseded
+
+Entry 27 still has a continuous-mode event-reuse bug: it reuses the same
+`ev_g_e_list[s]` event across all 100 logical iterations. Because the host
+enqueues all iterations quickly, the event can be re-recorded before an earlier
+`stream_ar.wait_event(event)` executes, so AR[i,s] may wait on a later GEMM
+event instead of GEMM[i,s]. Treat Entry 27 numbers as invalid pending Entry 28.
+
+---
+
+## Entry 28 — Fix continuous event reuse bug; allocate per-iteration GEMM-done events
+- **Date**: 2026-04-29
+- **Commit**: `12f068b0`
+- **Bug**: `--continuous-iters` reused `ev_g_e_list[s]` across all logical
+  iterations. In continuous mode there is no per-iteration sync, so the CPU
+  enqueue loop can re-record the same event before earlier stream waits execute.
+  This means `stream_ar.wait_event(ev_g_e_list[s])` does not necessarily wait
+  for the matching GEMM of the same logical iteration/stage.
+- **Fix**: allocate `cont_g_done[iter][stage]` unique events in continuous mode
+  and make AR[i,s] wait on `cont_g_done[i][s]`.
+- **Re-run required**:
+
+```bash
+cd /home/fizhang/test/mori && git pull origin sdma-test
+SKIP_BUILD=1 MORI_CONTINUOUS_PREP=0 CONTINUOUS_ITERS=100 ITERATIONS=1 WARMUP=1 \
+  bash tools/bench_plan_a.sh
+```
+
+Then run with prep enabled:
+```bash
+SKIP_BUILD=1 CONTINUOUS_ITERS=100 ITERATIONS=1 WARMUP=1 bash tools/bench_plan_a.sh
+```
+
 ---
 
 ## Entry 19 — Plan A (PipelinedXGMIPullKernel) baseline reference + kernel swap

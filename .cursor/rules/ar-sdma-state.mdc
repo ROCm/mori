@@ -66,7 +66,7 @@ Only Test 6 overlap timing changes: it measures N multi-stage pipelines
 back-to-back in one window and reports wall/N, with no per-iteration sync. This
 tests whether finite-mode tail copy exposure is the real reason SDMA copy loses.
 
-### Continuous 100x result (Entry 26 invalid + Entry 27 corrected)
+### Continuous 100x result (Entry 26/27 invalid; Entry 28 fix pending re-run)
 
 | block | mode | continuous wall/iter | seq_ar | seq_gemm | slowdown | vs RCCL |
 |---|---|---:|---:|---:|---:|---:|
@@ -89,9 +89,11 @@ once before the 100 measured pipelines.
 | PLAN_A | Plan A copy | 7.642 | 5.120 | 4.331 | 1.765 | +1.398 |
 | PLAN_A | RCCL | 6.244 | 5.131 | 4.109 | 1.520 | — |
 
-Corrected conclusion: continuous tail-copy exposure is reduced but not enough.
-Even no-copy trails RCCL by +0.473ms due to worse overlap quality (slowdown
-1.614 vs RCCL 1.511), while seq_ar itself is faster (4.786 vs RCCL 5.145).
+**Entry 27 also invalid**: it fixed prep, but reused the same GEMM-done Event
+objects across 100 continuous iterations. Host enqueues all iterations quickly;
+re-recording an event before an earlier `stream_ar.wait_event(event)` executes
+can make AR[i,s] wait on a later GEMM event. Entry 28 fixes this by allocating
+unique `cont_g_done[iter][stage]` events. Re-run required.
 
 ### Plan A v1 实测 (Entry 20, **已知不是 pipelined 实现**)
 
@@ -184,7 +186,7 @@ SDMA two-shot 算法比 RCCL 多一步 **256MB transit → user_output copy** (�
 
 ## 代码当前状态
 
-HEAD = **`0965c2e1`** (continuous mode fixed to enqueue prep_ar per logical iteration)
+HEAD = **`12f068b0`** (continuous mode fixes event reuse with per-iteration/stage GEMM-done events)
 
 `MORI_DIRECT_OUTPUT=1` 激活 Plan A v2 path; 不开则走 BASELINE.
 
@@ -199,6 +201,7 @@ HEAD = **`0965c2e1`** (continuous mode fixed to enqueue prep_ar per logical iter
 | `f744d41a` | Plan A v2: K2 split R-group/A-group; default `MORI_PLAN_A_CU=96`, `MORI_PLAN_A_NR=CU/3`; test parser prints A-group slots |
 | `2ff3e94f` | Test 6 adds `--continuous-iters` to measure real continuous workload wall/iter |
 | `0965c2e1` | Fix continuous mode: enqueue `prep_ar()` once per logical iteration on `stream_ar` |
+| `12f068b0` | Fix continuous event reuse: unique `cont_g_done[iter][stage]` events |
 
 ### 测量工具
 
@@ -209,10 +212,19 @@ HEAD = **`0965c2e1`** (continuous mode fixed to enqueue prep_ar per logical iter
 
 ## 下一步行动
 
-Continuous test completed (Entry 27). Next target: explain/fix why continuous
-SDMA **no-copy** is faster sequentially than RCCL (4.786 vs 5.145) but slower
-in overlap (6.725 vs 6.252). The gap is overlap scheduling/interaction, not AR
-compute or final copy alone.
+Re-run continuous after Entry 28 event fix:
+
+```bash
+cd /home/fizhang/test/mori && git pull origin sdma-test
+SKIP_BUILD=1 MORI_CONTINUOUS_PREP=0 CONTINUOUS_ITERS=100 ITERATIONS=1 WARMUP=1 \
+  bash tools/bench_plan_a.sh
+```
+
+Then run with prep enabled:
+
+```bash
+SKIP_BUILD=1 CONTINUOUS_ITERS=100 ITERATIONS=1 WARMUP=1 bash tools/bench_plan_a.sh
+```
 
 ---
 
