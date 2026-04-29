@@ -1723,6 +1723,41 @@ layout fix.
 
 ---
 
+## Entry 37 — `MORI_COPY_KERNEL=1` vectorized copy kernel: copy wall improves but total wall only -0.057 ms
+- **Date**: 2026-04-29
+- **Commit under test**: `62ec03f6`
+- **Command**: baseline vs `MORI_COPY_KERNEL=1`, corrected continuous no-prep,
+  `MORI_PIPELINE_CU=224`, `MORI_PIPELINE_CHUNKS=4`, `--continuous-iters 100`,
+  `--ar-phase-timing`.
+- **All correctness checks PASSED**
+
+| variant | gpu-side copy wall | SDMA copy wall | SDMA no-copy wall | RCCL wall | copy gap vs RCCL |
+|---|---:|---:|---:|---:|---:|
+| baseline hipMemcpyAsync | 0.388 ms | 6.988 | 6.388 | 5.793 | +1.195 |
+| `MORI_COPY_KERNEL=1` | **0.285 ms** | **6.931** | 6.387 | 5.797 | +1.134 |
+
+### Interpretation
+
+The custom vectorized D2D copy kernel is correct and reduces measured copy wall
+by **0.103 ms** (0.388 → 0.285 ms), but total copy-mode wall improves only
+**0.057 ms** (6.988 → 6.931 ms). This is useful but far from enough; the
+remaining copy-mode gap vs RCCL is still **+1.13 ms**.
+
+The no-copy wall is unchanged (6.388/6.387), confirming the copy kernel only
+affects `copy_output_to_user=True`.
+
+### Next experiment
+
+Sweep copy-kernel geometry:
+- `MORI_COPY_KERNEL_BLOCKS={512,1024,2048,4096}`
+- `MORI_COPY_KERNEL_THREADS={128,256,512}`
+
+Success target for this path would need copy wall < ~0.15 ms and a much larger
+total wall reduction. If geometry cannot beat 0.285 ms materially, the copy
+kernel path is insufficient.
+
+---
+
 ## Entry 19 — Plan A (PipelinedXGMIPullKernel) baseline reference + kernel swap
 - **Date**: 2026-04-24
 - **Baseline reference SHA**: `5f0072e7` (code HEAD at measurement time) /
