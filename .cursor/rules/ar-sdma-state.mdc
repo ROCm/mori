@@ -189,9 +189,10 @@ batching all AG after all reduce. Reverted; only phase slot fix kept.
 
 ### Copy kernel experiment (Entry 37)
 
-`MORI_COPY_KERNEL=1` vectorized copy kernel is correct and reduces copy wall
-0.388 → 0.285 ms, but total copy-mode wall only improves 6.988 → 6.931 ms
-(-0.057 ms). Needs geometry sweep if continuing; not enough as-is.
+`MORI_COPY_KERNEL=1` vectorized copy kernel is correct and reduces copy wall.
+Geometry sweep (Entry 38) best: 4096 blocks × 512 threads → **0.180 ms** copy
+wall (vs hipMemcpyAsync 0.388 ms, default copy kernel 0.285 ms). Need full
+end-to-end wall with this best geometry.
 
 ### Plan A v1 实测 (Entry 20, **已知不是 pipelined 实现**)
 

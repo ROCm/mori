@@ -1758,6 +1758,55 @@ kernel path is insufficient.
 
 ---
 
+## Entry 38 — `MORI_COPY_KERNEL` geometry sweep: best 4096×512 gives 0.180 ms copy wall
+- **Date**: 2026-04-29
+- **Commit under test**: `62ec03f6`
+- **Command**: sweep `MORI_COPY_KERNEL_BLOCKS={512,1024,2048,4096}` and
+  `MORI_COPY_KERNEL_THREADS={128,256,512}` with corrected continuous no-prep,
+  `MORI_PIPELINE_CU=224`, `MORI_PIPELINE_CHUNKS=4`, `--continuous-iters 100`,
+  `--ar-phase-timing`.
+- **All variants correctness PASSED**
+
+| blocks | threads | gpu-side copy wall |
+|---:|---:|---:|
+| 512 | 128 | 0.732 |
+| 512 | 256 | 0.340 |
+| 512 | 512 | 0.300 |
+| 1024 | 128 | 0.343 |
+| 1024 | 256 | 0.338 |
+| 1024 | 512 | 0.228 |
+| 2048 | 128 | 0.321 |
+| 2048 | 256 | 0.234 |
+| 2048 | 512 | 0.196 |
+| 4096 | 128 | 0.272 |
+| 4096 | 256 | 0.200 |
+| **4096** | **512** | **0.180** |
+
+### Interpretation
+
+Geometry matters. Best observed copy wall is **0.180 ms** at 4096 blocks × 512
+threads, vs:
+- baseline `hipMemcpyAsync` from Entry 37: 0.388 ms
+- default copy kernel 1024×256 from Entry 37: 0.285 ms
+
+This is a **0.208 ms/AR** improvement in the copy timing measurement relative
+to baseline hipMemcpyAsync. Need a full Table 1-4 run with the best geometry to
+see how much of this copy improvement translates to continuous end-to-end wall.
+
+### Next command
+
+```bash
+MORI_CONTINUOUS_PREP=0 MORI_PIPELINE_CU=224 MORI_PIPELINE_CHUNKS=4 \
+MORI_COPY_KERNEL=1 MORI_COPY_KERNEL_BLOCKS=4096 MORI_COPY_KERNEL_THREADS=512 \
+python3 tests/python/ccl/test_allreduce.py --num-stages 4 --elems 67108864 \
+  --iterations 1 --warmup 1 --continuous-iters 100 --ar-phase-timing
+```
+
+Compare SDMA copy wall against Entry 34/37 baseline. If SDMA copy wall drops by
+~0.2–0.4 ms, keep this geometry as the default for `MORI_COPY_KERNEL=1`.
+
+---
+
 ## Entry 19 — Plan A (PipelinedXGMIPullKernel) baseline reference + kernel swap
 - **Date**: 2026-04-24
 - **Baseline reference SHA**: `5f0072e7` (code HEAD at measurement time) /
