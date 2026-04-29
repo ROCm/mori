@@ -242,6 +242,17 @@ Correctness passes but no performance gain:
 Best known no-copy remains Entry 34 `CU224,chunks4`: 6.390 ms. Separate AG is
 closed as standalone optimization.
 
+### Max-CU sweep (Entry 47)
+
+| CU | no-copy wall | RCCL wall | gap |
+|---:|---:|---:|---:|
+| 224 | 6.415 | 5.793 | +0.622 |
+| 240 | 6.386 | 5.797 | +0.589 |
+| 255 | 6.369 | 5.809 | +0.560 |
+
+CU scaling gives only 0.046ms improvement from 224→255. Existing kernels cannot
+close the remaining +0.56ms gap via resource/knob tuning.
+
 ### Multi-q SDMA AG implemented (Entry 40)
 
 `MORI_MULTI_Q_AG=1` distributes AG chunks over qId `1 + c % min(numQ-1,15)`
@@ -340,7 +351,7 @@ SDMA two-shot 算法比 RCCL 多一步 **256MB transit → user_output copy** (�
 
 ## 代码当前状态
 
-HEAD = **`18b26810`** (`MORI_SEPARATE_AG_BUFFER=1` experiment)
+HEAD = **current docs through Entry 47** (existing kernels exhausted; next requires new fullmesh channelized algorithm)
 
 `MORI_DIRECT_OUTPUT=1` 激活 Plan A v2 path; 不开则走 BASELINE.
 
@@ -365,6 +376,8 @@ HEAD = **`18b26810`** (`MORI_SEPARATE_AG_BUFFER=1` experiment)
 | `2dc20476` | Revert failed `MORI_GROUPED_REDUCE_BARRIER=2` experiment |
 | `3a6bc7bc` | Expose existing single-kernel fullmesh micro-pipeline as `MORI_FULLMESH_PIPE=1` |
 | `18b26810` | Add `MORI_SEPARATE_AG_BUFFER=1` separate internal AG/output buffer experiment |
+| `0be0ef00` | Entry 46: separate AG buffer correctness passes but no perf gain |
+| `fe9ed5f1` | Entry 47: max-CU sweep shows existing kernels still +0.56ms gap |
 
 ### 测量工具
 
@@ -375,16 +388,9 @@ HEAD = **`18b26810`** (`MORI_SEPARATE_AG_BUFFER=1` experiment)
 
 ## 下一步行动
 
-Next run:
-
-```bash
-cd /home/fizhang/test/mori && git pull origin sdma-test
-BUILD_EXAMPLES=ON BUILD_TESTS=ON pip3 install .
-MORI_CONTINUOUS_PREP=0 MORI_PIPELINE_CU=224 MORI_PIPELINE_CHUNKS=4 \
-MORI_SEPARATE_AG_BUFFER=1 python3 tests/python/ccl/test_allreduce.py \
-  --num-stages 4 --elems 67108864 --iterations 1 --warmup 1 \
-  --continuous-iters 100 --continuous-phase-iter 5 --continuous-phase-stage 0
-```
+Next implementation direction: new fullmesh channelized algorithm. Existing
+two-shot/fullmesh knobs are exhausted (priority, CU, chunks, multi-q,
+barrier variants, separate AG, copy kernel, fullmesh alias).
 
 ---
 

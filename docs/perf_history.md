@@ -2150,6 +2150,42 @@ solution.
 
 ---
 
+## Entry 47 — Max-CU sweep (224/240/255): tiny gain only; existing two-shot/fullmesh kernel cannot close gap
+- **Date**: 2026-04-30
+- **Command**: corrected continuous no-prep, `MORI_PIPELINE_CHUNKS=4`,
+  `MORI_PIPELINE_CU={224,240,255}`, `--continuous-iters 100`
+- **All correctness checks PASSED**
+
+| CU | SDMA no-copy wall | SDMA seq_ar | SDMA seq_gemm | RCCL wall | RCCL seq_ar | RCCL seq_gemm | gap |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 224 | 6.415 | 4.820 | 4.174 | 5.793 | 5.127 | 4.138 | +0.622 |
+| 240 | 6.386 | 4.816 | 4.193 | 5.797 | 5.132 | 4.198 | +0.589 |
+| 255 | **6.369** | 4.836 | 4.172 | 5.809 | 5.132 | 4.119 | **+0.560** |
+
+### Interpretation
+
+Raising CU from 224 to 255 gives only **0.046 ms** wall improvement
+(6.415 → 6.369) while the remaining gap is still **+0.56 ms**. The slope is too
+small to close the gap by resource scaling. Existing two-shot/fullmesh kernels
+are now at their practical CU limit and still cannot match RCCL steady-state
+overlap.
+
+### Conclusion
+
+Parameter tuning of the existing kernels is exhausted:
+- priority: no effect (Entry 33)
+- chunks: best at 4, larger regresses (Entries 34/35)
+- CU: max 255 still +0.56 ms (Entry 47)
+- multi-q AG: regresses (Entry 41)
+- barrier batching/grouping: failed/regressed correctness/perf (Entries 36/42)
+- copy kernel: improves copy wall but not enough (Entries 37-39)
+- existing fullmesh fused path: no breakthrough (Entry 44)
+
+Next required step is a genuinely new fullmesh channelized algorithm (not just
+parameter tuning of the two-shot pipeline).
+
+---
+
 ## Entry 19 — Plan A (PipelinedXGMIPullKernel) baseline reference + kernel swap
 - **Date**: 2026-04-24
 - **Baseline reference SHA**: `5f0072e7` (code HEAD at measurement time) /
