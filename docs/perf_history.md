@@ -1666,7 +1666,7 @@ service time.
 
 ## Entry 36 — Implement `MORI_BATCH_REDUCE_BARRIER=1` to test removing per-chunk reduce_complete barriers
 - **Date**: 2026-04-29
-- **Commit**: _this commit_
+- **Commit**: `18b26810`
 - **Motivation**: Continuous phase timing for `PIPELINE_CU=224, CHUNKS=4`
   identified substantial per-chunk control overhead (cross-PE reduce_complete
   barrier + AG submit/signaling + final AG wait). Chunk count >4 regressed
