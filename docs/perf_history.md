@@ -1307,7 +1307,7 @@ event instead of GEMM[i,s]. Treat Entry 27 numbers as invalid pending Entry 28.
 
 ## Entry 28 — Fix continuous event reuse bug; allocate per-iteration GEMM-done events
 - **Date**: 2026-04-29
-- **Commit**: `12f068b0`
+- **Commit**: `60b8ba56`
 - **Bug**: `--continuous-iters` reused `ev_g_e_list[s]` across all logical
   iterations. In continuous mode there is no per-iteration sync, so the CPU
   enqueue loop can re-record the same event before earlier stream waits execute.
