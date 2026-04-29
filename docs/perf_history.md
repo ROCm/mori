@@ -1206,13 +1206,20 @@ state, RCCL's pipeline throughput is substantially better. The problem moved
 from "hide copy tail" to "SDMA two-shot steady-state algorithm throughput and
 overlap are worse than RCCL".
 
-### Caveat / follow-up fix
+### Caveat / follow-up fixes
 
 `tools/bench_plan_a.sh` incorrectly passed `CONTINUOUS_ITERS=100` into the
 `--ar-phase-timing` diagnostic runs, producing meaningless all-zero/gibberish
 phase tables. A follow-up commit changes `run_variant_extra()` to force
 `--continuous-iters 0` for phase/timeline diagnostics. The Table 1-4 continuous
 wall data above are still valid.
+
+Second caveat found after comparing finite timeline: the first implementation
+called `prep_ar()` only once before the 100 measured continuous pipelines. Real
+continuous workload has fresh input per request. A follow-up changes continuous
+mode to enqueue `prep_ar()` once per logical iteration on `stream_ar`, without a
+global sync. The original Entry 26 wall data should be treated as invalid until
+re-run with that fix.
 
 ### Next direction
 

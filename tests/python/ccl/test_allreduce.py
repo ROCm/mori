@@ -985,9 +985,9 @@ def _bench_overlap_one_size(
         # Untimed warmup blocks. This keeps the continuous measured window
         # free of between-iteration sync, while still warming kernels/queues.
         torch.cuda.synchronize()
-        prep_ar()
-        torch.cuda.synchronize()
         for _ in range(max(1, warmup)):
+            with torch.cuda.stream(stream_ar):
+                prep_ar()
             run_one_pipeline()
         if use_overlap:
             stream_ar.synchronize()
@@ -997,10 +997,11 @@ def _bench_overlap_one_size(
         torch.cuda.synchronize()
         dist.barrier()
 
-        prep_ar()
         torch.cuda.synchronize()
         ov_s.record()
         for _ in range(continuous_iters):
+            with torch.cuda.stream(stream_ar):
+                prep_ar()
             run_one_pipeline()
         if use_overlap:
             stream_ar.synchronize()

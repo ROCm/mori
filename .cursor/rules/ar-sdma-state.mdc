@@ -76,10 +76,11 @@ tests whether finite-mode tail copy exposure is the real reason SDMA copy loses.
 | PLAN_A | Plan A copy | 7.565 | 5.111 | 4.328 | 1.748 | +1.731 |
 | PLAN_A | RCCL | 5.834 | 5.126 | 4.121 | 1.416 | — |
 
-**Conclusion**: finite-tail-copy hypothesis FAILED. Continuous SDMA copy still
-loses by +1.3ms, and even continuous no-copy loses by +0.735ms. The remaining
-problem is SDMA two-shot steady-state throughput/overlap vs RCCL, not just copy
-tail exposure.
+**Status**: these numbers are now marked **invalid pending re-run**. The first
+continuous implementation only called `prep_ar()` once before the 100 measured
+pipelines. Real continuous workload has fresh input per request. Current code
+enqueues `prep_ar()` once per logical iteration on `stream_ar` without global
+sync; re-run required.
 
 ### Plan A v1 实测 (Entry 20, **已知不是 pipelined 实现**)
 
@@ -203,9 +204,12 @@ cd /home/fizhang/test/mori && git pull origin sdma-test
 SKIP_BUILD=1 CONTINUOUS_ITERS=100 ITERATIONS=1 WARMUP=1 bash tools/bench_plan_a.sh
 ```
 
-Continuous test already ran (Entry 26) and SDMA still loses. Next step:
-investigate why continuous SDMA **no-copy** (6.571ms) is slower than RCCL
-(5.836ms). This is algorithm throughput/scheduling, not final copy.
+Re-run continuous after fix:
+
+```bash
+cd /home/fizhang/test/mori && git pull origin sdma-test
+SKIP_BUILD=1 CONTINUOUS_ITERS=100 ITERATIONS=1 WARMUP=1 bash tools/bench_plan_a.sh
+```
 
 ---
 
