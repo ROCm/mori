@@ -1980,6 +1980,44 @@ per-chunk ownership separation.
 
 ---
 
+## Entry 43 — Expose existing single-kernel fullmesh micro-pipeline as `MORI_FULLMESH_PIPE=1`
+- **Date**: 2026-04-30
+- **Commit**: _this commit_
+- **Why**: User chose fullmesh over ring. Current code already has a closer
+  fullmesh micro-pipeline path: `PipelinedAllReduceSdmaKernel<T,0,true,false>`
+  (`external_scatter=false`) where one kernel does fullmesh scatter submission,
+  per-chunk reduce, per-chunk cross-PE barrier, and per-chunk SDMA AG. This is
+  the first fullmesh experiment before writing a completely new kernel.
+
+### Implementation
+
+`AllreduceSdma::operator()` now treats:
+```bash
+MORI_FULLMESH_PIPE=1
+```
+as an alias for the old experimental `MORI_PIPELINE_FUSED=1`, forcing:
+```text
+pipelined(..., external_scatter=false)
+```
+
+Default remains unchanged.
+
+### Test command
+
+```bash
+cd /home/fizhang/test/mori && git pull origin sdma-test
+BUILD_EXAMPLES=ON BUILD_TESTS=ON pip3 install .
+MORI_CONTINUOUS_PREP=0 MORI_FULLMESH_PIPE=1 MORI_PIPELINE_CU=224 \
+MORI_PIPELINE_CHUNKS=4 python3 tests/python/ccl/test_allreduce.py \
+  --num-stages 4 --elems 67108864 --iterations 1 --warmup 1 \
+  --continuous-iters 100 --continuous-phase-iter 5 --continuous-phase-stage 0
+```
+
+Compare against best known two-kernel fullmesh:
+`MORI_PIPELINE_CU=224, MORI_PIPELINE_CHUNKS=4`, no-copy 6.390 ms.
+
+---
+
 ## Entry 19 — Plan A (PipelinedXGMIPullKernel) baseline reference + kernel swap
 - **Date**: 2026-04-24
 - **Baseline reference SHA**: `5f0072e7` (code HEAD at measurement time) /

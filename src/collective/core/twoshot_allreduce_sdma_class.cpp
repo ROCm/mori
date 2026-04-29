@@ -598,6 +598,9 @@ void AllreduceSdma<T>::copy_output_to_user(T* output, size_t total_count, hipStr
 template <typename T>
 bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count, hipStream_t stream) {
   static const bool fused = []() {
+      if (const char* e = std::getenv("MORI_FULLMESH_PIPE")) {
+          if (std::atoi(e) == 1) return true;
+      }
       const char* e = std::getenv("MORI_PIPELINE_FUSED");
       return e && std::atoi(e) == 1;
   }();
