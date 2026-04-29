@@ -194,6 +194,17 @@ Geometry sweep (Entry 38) best: 4096 blocks × 512 threads → **0.180 ms** copy
 wall (vs hipMemcpyAsync 0.388 ms, default copy kernel 0.285 ms). Need full
 end-to-end wall with this best geometry.
 
+### Best copy kernel full run (Entry 39)
+
+| mode | wall | seq_ar | seq_gemm | slowdown | vs RCCL |
+|---|---:|---:|---:|---:|---:|
+| SDMA copy + best copy kernel | **7.216** | 5.204 | 4.373 | 1.650 | +1.408 |
+| SDMA no-copy | 6.376 | 4.807 | 4.237 | 1.505 | +0.568 |
+| RCCL | 5.808 | 5.130 | 4.199 | 1.383 | — |
+
+Copy wall is 0.179ms, but copy-mode wall is still +1.408ms vs RCCL and
++0.840ms vs no-copy. Custom CU copy kernel is insufficient as final solution.
+
 ### Plan A v1 实测 (Entry 20, **已知不是 pipelined 实现**)
 
 | 变体 | overlap wall | seq_ar | seq_gemm | overlap/seq_gemm | vs RCCL |
@@ -285,7 +296,7 @@ SDMA two-shot 算法比 RCCL 多一步 **256MB transit → user_output copy** (�
 
 ## 代码当前状态
 
-HEAD = **`62ec03f6`** (vectorized `MORI_COPY_KERNEL=1` copy path; batch barrier reverted earlier)
+HEAD = **`89ac70fc`** (copy-kernel Entry 37 docs; code commit `62ec03f6`)
 
 `MORI_DIRECT_OUTPUT=1` 激活 Plan A v2 path; 不开则走 BASELINE.
 
@@ -302,6 +313,7 @@ HEAD = **`62ec03f6`** (vectorized `MORI_COPY_KERNEL=1` copy path; batch barrier 
 | `0965c2e1` | Fix continuous mode: enqueue `prep_ar()` once per logical iteration on `stream_ar` |
 | `60b8ba56` | Fix continuous event reuse: unique `cont_g_done[iter][stage]` events |
 | `061dd561` | Add `--continuous-timeline-samples` to print per-iter/stage GEMM/AR timing |
+| `62ec03f6` | Add opt-in `MORI_COPY_KERNEL=1` vectorized D2D output copy kernel |
 | `413c75d2` | Disjoint phase slot ranges for chunks>=4 |
 | `3a83139f` | Revert failed `MORI_BATCH_REDUCE_BARRIER` experiment, keep phase slot fix |
 | `62ec03f6` | Add opt-in `MORI_COPY_KERNEL=1` vectorized D2D output copy kernel |
@@ -315,24 +327,8 @@ HEAD = **`62ec03f6`** (vectorized `MORI_COPY_KERNEL=1` copy path; batch barrier 
 
 ## 下一步行动
 
-Next run: sweep `MORI_COPY_KERNEL` geometry or continue phase diagnosis. Current
-copy-kernel default improved GPU copy wall 0.388→0.285ms but total wall only
--0.057ms (Entry 37), not enough yet.
-
-Geometry sweep example:
-
-```bash
-cd /home/fizhang/test/mori && git pull origin sdma-test
-for b in 512 1024 2048 4096; do
-  for t in 128 256 512; do
-    MORI_CONTINUOUS_PREP=0 MORI_PIPELINE_CU=224 MORI_PIPELINE_CHUNKS=4 \
-    MORI_COPY_KERNEL=1 MORI_COPY_KERNEL_BLOCKS=$b MORI_COPY_KERNEL_THREADS=$t \
-      python3 tests/python/ccl/test_allreduce.py --num-stages 4 \
-      --elems 67108864 --iterations 1 --warmup 1 --continuous-iters 100 \
-      --ar-phase-timing
-  done
-done
-```
+Next: custom copy kernel is not enough. Need mechanism that avoids extra CU
+copy work in overlap window or changes AR/GEMM scheduling/algorithm.
 
 ---
 

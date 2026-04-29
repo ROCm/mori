@@ -1807,6 +1807,50 @@ Compare SDMA copy wall against Entry 34/37 baseline. If SDMA copy wall drops by
 
 ---
 
+## Entry 39 — Best copy kernel geometry full run: copy wall 0.179 ms, total wall still +1.41 ms vs RCCL
+- **Date**: 2026-04-29
+- **Commit under test**: `62ec03f6` + docs follow-ups
+- **Command**: corrected continuous no-prep, `MORI_PIPELINE_CU=224`,
+  `MORI_PIPELINE_CHUNKS=4`, `MORI_COPY_KERNEL=1`,
+  `MORI_COPY_KERNEL_BLOCKS=4096`, `MORI_COPY_KERNEL_THREADS=512`,
+  `--continuous-iters 100 --ar-phase-timing`.
+- **Correctness PASSED**
+
+| mode | wall | seq_ar | seq_gemm | slowdown | gap vs RCCL |
+|---|---:|---:|---:|---:|---:|
+| **SDMA copy + best copy kernel** | **7.216** | 5.204 | 4.373 | 1.650 | **+1.408** |
+| SDMA no-copy | 6.376 | 4.807 | 4.237 | 1.505 | +0.568 |
+| RCCL | 5.808 | 5.130 | 4.199 | 1.383 | — |
+
+Copy timing:
+- best copy kernel GPU wall: **0.179 ms**
+- baseline hipMemcpyAsync from Entry 37: 0.388 ms
+- improvement in copy timing: **0.209 ms**
+
+### Interpretation
+
+The copy kernel now makes the isolated copy operation significantly faster,
+but end-to-end copy-mode wall is still far from RCCL:
+- SDMA copy wall = 7.216 ms
+- RCCL wall = 5.808 ms
+- gap = **+1.408 ms**
+
+The copy-mode wall is also **0.840 ms slower than no-copy** (7.216 vs 6.376),
+far larger than the measured copy kernel wall 0.179 ms. This means the copy
+kernel's CU work / stream occupancy hurts overlap beyond its own measured
+duration. It improves copy timing but does not solve the dominant overlap
+problem.
+
+### Conclusion
+
+The vectorized copy-kernel path is insufficient as a final solution. Even with
+the best observed geometry (4096×512), it does not bring copy mode close to
+RCCL. The remaining work is not just making the local copy faster; it is
+avoiding additional CU occupancy / preserving overlap quality while still
+writing user_output.
+
+---
+
 ## Entry 19 — Plan A (PipelinedXGMIPullKernel) baseline reference + kernel swap
 - **Date**: 2026-04-24
 - **Baseline reference SHA**: `5f0072e7` (code HEAD at measurement time) /
