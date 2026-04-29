@@ -230,6 +230,18 @@ symmetric buffer instead of overwriting the scatter/reduce transit. This safely
 skips waiting on peers' reduce_complete flags before AG because AG no longer
 corrupts peer reduce input. Default off; test pending.
 
+### Separate AG buffer result (Entry 46)
+
+Correctness passes but no performance gain:
+
+| mode | wall | seq_ar | slowdown | vs RCCL |
+|---|---:|---:|---:|---:|
+| SDMA no-copy + separate AG | 6.407 | 4.816 | 1.543 | +0.613 |
+| RCCL | 5.794 | 5.134 | 1.414 | — |
+
+Best known no-copy remains Entry 34 `CU224,chunks4`: 6.390 ms. Separate AG is
+closed as standalone optimization.
+
 ### Multi-q SDMA AG implemented (Entry 40)
 
 `MORI_MULTI_Q_AG=1` distributes AG chunks over qId `1 + c % min(numQ-1,15)`

@@ -2106,6 +2106,50 @@ Success signature:
 
 ---
 
+## Entry 46 — `MORI_SEPARATE_AG_BUFFER=1` result: correctness passes but no performance gain
+- **Date**: 2026-04-30
+- **Commit under test**: `18b26810` / docs follow-up `64b811b7`
+- **Command**: `MORI_CONTINUOUS_PREP=0 MORI_PIPELINE_CU=224 MORI_PIPELINE_CHUNKS=4 MORI_SEPARATE_AG_BUFFER=1 ... --continuous-iters 100 --continuous-phase-iter 5 --continuous-phase-stage 0`
+- **All correctness checks PASSED**
+
+| mode | wall | seq_ar | seq_gemm | slowdown | gap vs RCCL |
+|---|---:|---:|---:|---:|---:|
+| SDMA copy + separate AG | 7.020 | 5.258 | 4.340 | 1.617 | +1.226 |
+| **SDMA no-copy + separate AG** | **6.407** | **4.816** | 4.151 | **1.543** | **+0.613** |
+| RCCL | **5.794** | 5.134 | 4.099 | 1.414 | — |
+
+Compare best known:
+- Entry 34 no-copy (`CU=224, chunks=4`): **6.390 ms**
+- Entry 46 separate AG no-copy: **6.407 ms**
+- essentially equal / slight regression.
+
+### Phase evidence (no-copy, iter=5 stage=0)
+
+```text
+event = 2.022 ms
+c0: compute-wait 0.574, barrier 0.110, submit/signal 0.083
+c1: compute-wait 0.053, barrier 0.247, submit/signal 0.159
+c2: compute-wait 0.001, barrier 0.080, submit/signal 0.159
+c3: compute-wait 0.014, barrier 0.046, submit/signal 0.082
+ag_wait 0.342
+R-block reduce: c0 0.449, c1 0.363, c2 0.134, c3 0.160
+```
+
+### Interpretation
+
+Separate AG buffer removes the correctness reason for waiting on peers before
+AG, but it does not improve wall. The bottleneck remains a mix of local reduce
+service time, barrier/control, and AG wait; simply moving AG writes to another
+internal buffer is insufficient.
+
+### Conclusion
+
+Close `MORI_SEPARATE_AG_BUFFER` as ineffective for performance. It may remain
+useful as a building block for future algorithms, but it is not a standalone
+solution.
+
+---
+
 ## Entry 19 — Plan A (PipelinedXGMIPullKernel) baseline reference + kernel swap
 - **Date**: 2026-04-24
 - **Baseline reference SHA**: `5f0072e7` (code HEAD at measurement time) /
