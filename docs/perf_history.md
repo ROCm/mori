@@ -1506,6 +1506,53 @@ accelerates, aiming for a balanced stage rate around RCCL's ~1.45 ms/stage.
 
 ---
 
+## Entry 32 — Continuous no-copy vs RCCL 5-run stability: SDMA gap is stable ~0.75 ms, RCCL has one outlier
+- **Date**: 2026-04-29
+- **Commit under test**: `061dd561` / docs follow-ups
+- **Command**: five independent runs of
+  `MORI_CONTINUOUS_PREP=0 MORI_PIPELINE_CU=160 python3 tests/python/ccl/test_allreduce.py --num-stages 4 --elems 67108864 --iterations 1 --warmup 1 --continuous-iters 100`
+- **Scenario**: corrected continuous no-prep, 256MB × 4 stages, 8 ranks.
+
+| run | SDMA no-copy wall | SDMA seq_ar | SDMA seq_gemm | RCCL wall | RCCL seq_ar | RCCL seq_gemm | gap (SDMA-RCCL) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 6.558 | 4.785 | 4.180 | 5.808 | 5.140 | 4.151 | +0.750 |
+| 2 | 6.564 | 4.776 | 4.201 | 5.798 | 5.124 | 4.165 | +0.766 |
+| 3 | 6.559 | 4.781 | 4.200 | 5.809 | 5.121 | 4.135 | +0.750 |
+| 4 | 6.580 | 4.779 | 4.164 | 5.790 | 5.140 | 4.125 | +0.790 |
+| 5 | 6.562 | 4.788 | 4.151 | **13.314 outlier** | 5.132 | 4.112 | n/a |
+
+### Interpretation
+
+Ignoring the single RCCL outlier in run 5, the corrected continuous no-prep gap
+is stable:
+- SDMA no-copy wall: 6.558–6.580 ms
+- RCCL wall: 5.790–5.809 ms
+- gap: **+0.75 to +0.79 ms**
+
+This confirms Entry 31's mechanism is stable, not a one-off artifact: SDMA
+no-copy has faster sequential AR (~4.78 ms vs RCCL ~5.13 ms), but its continuous
+overlap wall is worse because AR service time under concurrent GEMM is worse
+and backlog grows.
+
+### Next experiment
+
+Test stream priority in this exact corrected continuous setup:
+```bash
+MORI_CONTINUOUS_PREP=0 MORI_PIPELINE_CU=160 python3 tests/python/ccl/test_allreduce.py \
+  --num-stages 4 --elems 67108864 --iterations 1 --warmup 1 \
+  --continuous-iters 100 --ar-priority -1
+```
+
+Success signature:
+- SDMA no-copy wall drops toward RCCL (~5.8 ms)
+- SDMA no-copy seq_ar stays similar or improves
+- GEMM seq time may increase slightly; that is acceptable if total wall drops.
+
+If priority has no effect, sweep `MORI_PIPELINE_CU=192/224` in the same
+corrected continuous no-prep setup.
+
+---
+
 ## Entry 19 — Plan A (PipelinedXGMIPullKernel) baseline reference + kernel swap
 - **Date**: 2026-04-24
 - **Baseline reference SHA**: `5f0072e7` (code HEAD at measurement time) /

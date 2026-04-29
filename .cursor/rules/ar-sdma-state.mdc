@@ -9,7 +9,7 @@ alwaysApply: true
 
 关联文件:
 - `.cursor/rules/relentless-perf.mdc` — 方法论规则 (R0-R15)
-- `docs/perf_history.md` — 所有历史 Entry (1-30) 含数据
+- `docs/perf_history.md` — 所有历史 Entry (1-32) 含数据
 - Latest mechanism finding: Entry 31 continuous timeline shows SDMA no-copy
   GEMM remains ~1.0ms/stage, but SDMA AR service time becomes ~2.0ms/stage
   under GEMM, so stream_ar backlog grows. RCCL stabilizes both GEMM/AR around
