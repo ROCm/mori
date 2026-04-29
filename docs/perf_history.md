@@ -1330,6 +1330,69 @@ SKIP_BUILD=1 CONTINUOUS_ITERS=100 ITERATIONS=1 WARMUP=1 bash tools/bench_plan_a.
 
 ---
 
+## Entry 29 — Continuous 100x after event fix: no-copy still loses; overlap quality is root gap
+- **Date**: 2026-04-29
+- **Commit under test**: `60b8ba56` / docs follow-up `04c77185`
+- **Commands**:
+  - no-prep: `MORI_CONTINUOUS_PREP=0 SKIP_BUILD=1 CONTINUOUS_ITERS=100 ITERATIONS=1 WARMUP=1 bash tools/bench_plan_a.sh`
+  - prep: `SKIP_BUILD=1 CONTINUOUS_ITERS=100 ITERATIONS=1 WARMUP=1 bash tools/bench_plan_a.sh`
+- **All correctness checks PASSED**
+
+### No-prep continuous (isolates AR/GEMM scheduling; no synthetic input fill)
+
+| block | mode | wall/iter | slowdown | seq_ar | seq_gemm | gap vs RCCL |
+|---|---|---:|---:|---:|---:|---:|
+| BASELINE | SDMA copy | 7.118 | 1.656 | 5.198 | 4.298 | +1.327 |
+| BASELINE | **SDMA no-copy** | **6.567** | **1.587** | **4.774** | 4.137 | **+0.776** |
+| BASELINE | RCCL | 5.791 | 1.396 | 5.130 | 4.150 | — |
+| PLAN_A | Plan A copy | 7.563 | 1.742 | 5.120 | 4.342 | +1.757 |
+| PLAN_A | Plan A no-copy | 6.552 | 1.568 | 4.776 | 4.177 | +0.746 |
+| PLAN_A | RCCL | 5.806 | 1.402 | 5.132 | 4.141 | — |
+
+### Prep-enabled continuous (fresh input per logical iter)
+
+| block | mode | wall/iter | slowdown | seq_ar | seq_gemm | gap vs RCCL |
+|---|---|---:|---:|---:|---:|---:|
+| BASELINE | SDMA copy | 7.236 | 1.672 | 5.194 | 4.327 | +1.009 |
+| BASELINE | **SDMA no-copy** | **6.726** | **1.605** | **4.776** | 4.191 | **+0.499** |
+| BASELINE | RCCL | 6.227 | 1.507 | 5.125 | 4.131 | — |
+| PLAN_A | Plan A copy | 7.640 | 1.765 | 5.106 | 4.328 | +1.405 |
+| PLAN_A | Plan A no-copy | 6.736 | 1.611 | 4.791 | 4.183 | +0.501 |
+| PLAN_A | RCCL | 6.235 | 1.506 | 5.138 | 4.140 | — |
+
+### Mechanism
+
+The measurement bug is fixed (unique GEMM-done events per iter/stage) and prep
+is isolated. Both no-prep and prep-enabled runs show the same structural fact:
+
+1. **SDMA no-copy is faster sequentially than RCCL**:
+   - no-prep: 4.774 vs 5.130 (SDMA faster by 0.356 ms)
+   - prep: 4.776 vs 5.125 (SDMA faster by 0.349 ms)
+
+2. **SDMA no-copy overlaps worse with GEMM**:
+   - no-prep slowdown: 1.587 vs RCCL 1.396
+   - prep slowdown: 1.605 vs RCCL 1.507
+
+3. The overlap-quality penalty dominates the sequential AR advantage:
+   - no-prep: `4.137 * (1.587 - 1.396) = 0.790 ms`, matching the measured
+     no-copy gap +0.776 ms.
+   - prep: `4.191 * (1.605 - 1.507) = 0.411 ms`, close to measured +0.499 ms.
+
+Therefore the current bottleneck is **not copy tail** and **not sequential AR
+speed**. It is that SDMA no-copy degrades GEMM overlap more than RCCL does.
+RCCL's sequential AR is slower, but its overlap schedule is better.
+
+### Next target
+
+Need a continuous-mode timeline (not finite phase) that reports per-iteration
+and per-stage GEMM/AR start/end for a small sample window, using unique events
+per iter/stage, to see whether:
+- SDMA no-copy AR occupies a longer continuous interval and blocks future GEMMs
+- SDMA engine/HBM traffic slows GEMM kernels directly
+- stream ordering in continuous mode creates larger bubbles for SDMA than RCCL
+
+---
+
 ## Entry 19 — Plan A (PipelinedXGMIPullKernel) baseline reference + kernel swap
 - **Date**: 2026-04-24
 - **Baseline reference SHA**: `5f0072e7` (code HEAD at measurement time) /

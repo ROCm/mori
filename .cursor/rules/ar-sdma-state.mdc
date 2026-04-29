@@ -9,7 +9,7 @@ alwaysApply: true
 
 关联文件:
 - `.cursor/rules/relentless-perf.mdc` — 方法论规则 (R0-R15)
-- `docs/perf_history.md` — 所有历史 Entry (1-26) 含数据
+- `docs/perf_history.md` — 所有历史 Entry (1-29) 含数据
 
 ---
 
@@ -66,7 +66,7 @@ Only Test 6 overlap timing changes: it measures N multi-stage pipelines
 back-to-back in one window and reports wall/N, with no per-iteration sync. This
 tests whether finite-mode tail copy exposure is the real reason SDMA copy loses.
 
-### Continuous 100x result (Entry 26/27 invalid; Entry 28 fix pending re-run)
+### Continuous 100x result (Entry 26/27 invalid; Entry 29 corrected after Entry 28 event fix)
 
 | block | mode | continuous wall/iter | seq_ar | seq_gemm | slowdown | vs RCCL |
 |---|---|---:|---:|---:|---:|---:|
@@ -94,6 +94,25 @@ objects across 100 continuous iterations. Host enqueues all iterations quickly;
 re-recording an event before an earlier `stream_ar.wait_event(event)` executes
 can make AR[i,s] wait on a later GEMM event. Entry 28 fixes this by allocating
 unique `cont_g_done[iter][stage]` events. Re-run required.
+
+**Entry 29 corrected after unique-event fix**:
+
+No-prep:
+| mode | wall | seq_ar | seq_gemm | slowdown | vs RCCL |
+|---|---:|---:|---:|---:|---:|
+| SDMA copy | 7.118 | 5.198 | 4.298 | 1.656 | +1.327 |
+| SDMA no-copy | 6.567 | 4.774 | 4.137 | 1.587 | +0.776 |
+| RCCL | 5.791 | 5.130 | 4.150 | 1.396 | — |
+
+Prep-enabled:
+| mode | wall | seq_ar | seq_gemm | slowdown | vs RCCL |
+|---|---:|---:|---:|---:|---:|
+| SDMA copy | 7.236 | 5.194 | 4.327 | 1.672 | +1.009 |
+| SDMA no-copy | 6.726 | 4.776 | 4.191 | 1.605 | +0.499 |
+| RCCL | 6.227 | 5.125 | 4.131 | 1.507 | — |
+
+Mechanism: SDMA no-copy is faster sequentially than RCCL (~4.77 vs ~5.13 ms)
+but worse in overlap (slowdown 1.59-1.61 vs RCCL 1.40-1.51).
 
 ### Plan A v1 实测 (Entry 20, **已知不是 pipelined 实现**)
 
@@ -212,19 +231,14 @@ HEAD = **`60b8ba56`** (continuous mode fixes event reuse with per-iteration/stag
 
 ## 下一步行动
 
-Re-run continuous after Entry 28 event fix:
+Need continuous-mode timeline/instrumentation to explain why SDMA no-copy has
+faster seq_ar but worse overlap than RCCL:
+- SDMA no-copy seq_ar ~4.77 ms vs RCCL ~5.13 ms (faster)
+- SDMA no-copy slowdown 1.59-1.61 vs RCCL 1.40-1.51 (worse)
 
-```bash
-cd /home/fizhang/test/mori && git pull origin sdma-test
-SKIP_BUILD=1 MORI_CONTINUOUS_PREP=0 CONTINUOUS_ITERS=100 ITERATIONS=1 WARMUP=1 \
-  bash tools/bench_plan_a.sh
-```
-
-Then run with prep enabled:
-
-```bash
-SKIP_BUILD=1 CONTINUOUS_ITERS=100 ITERATIONS=1 WARMUP=1 bash tools/bench_plan_a.sh
-```
+Candidate next experiment: add continuous timeline sample with unique
+per-iter/stage events for the first few continuous iterations, printing GEMM
+and AR start/end pairs for SDMA no-copy and RCCL.
 
 ---
 
