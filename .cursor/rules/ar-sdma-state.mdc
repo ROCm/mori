@@ -223,6 +223,13 @@ Phase shows `ag_wait=0.364ms`, not dominant; time is spread across
 compute/reduce, barrier, and submit/control. Close multi-q unless future phase
 again shows AG wait dominates.
 
+### Separate AG buffer implemented (Entry 45)
+
+`MORI_SEPARATE_AG_BUFFER=1` makes SDMA AG write into a separate internal
+symmetric buffer instead of overwriting the scatter/reduce transit. This safely
+skips waiting on peers' reduce_complete flags before AG because AG no longer
+corrupts peer reduce input. Default off; test pending.
+
 ### Multi-q SDMA AG implemented (Entry 40)
 
 `MORI_MULTI_Q_AG=1` distributes AG chunks over qId `1 + c % min(numQ-1,15)`
@@ -321,7 +328,7 @@ SDMA two-shot 算法比 RCCL 多一步 **256MB transit → user_output copy** (�
 
 ## 代码当前状态
 
-HEAD = **`3a6bc7bc`** (`MORI_FULLMESH_PIPE=1` alias for single-kernel fullmesh micro-pipeline)
+HEAD = **待 push** (`MORI_SEPARATE_AG_BUFFER=1` experiment)
 
 `MORI_DIRECT_OUTPUT=1` 激活 Plan A v2 path; 不开则走 BASELINE.
 
@@ -345,6 +352,7 @@ HEAD = **`3a6bc7bc`** (`MORI_FULLMESH_PIPE=1` alias for single-kernel fullmesh m
 | `62ec03f6` | Add opt-in `MORI_COPY_KERNEL=1` vectorized D2D output copy kernel |
 | `2dc20476` | Revert failed `MORI_GROUPED_REDUCE_BARRIER=2` experiment |
 | `3a6bc7bc` | Expose existing single-kernel fullmesh micro-pipeline as `MORI_FULLMESH_PIPE=1` |
+| **待 push** | Add `MORI_SEPARATE_AG_BUFFER=1` separate internal AG/output buffer experiment |
 
 ### 测量工具
 
@@ -360,8 +368,8 @@ Next run:
 ```bash
 cd /home/fizhang/test/mori && git pull origin sdma-test
 BUILD_EXAMPLES=ON BUILD_TESTS=ON pip3 install .
-MORI_CONTINUOUS_PREP=0 MORI_FULLMESH_PIPE=1 MORI_PIPELINE_CU=224 \
-MORI_PIPELINE_CHUNKS=4 python3 tests/python/ccl/test_allreduce.py \
+MORI_CONTINUOUS_PREP=0 MORI_PIPELINE_CU=224 MORI_PIPELINE_CHUNKS=4 \
+MORI_SEPARATE_AG_BUFFER=1 python3 tests/python/ccl/test_allreduce.py \
   --num-stages 4 --elems 67108864 --iterations 1 --warmup 1 \
   --continuous-iters 100 --continuous-phase-iter 5 --continuous-phase-stage 0
 ```

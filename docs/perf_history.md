@@ -2058,6 +2058,54 @@ reduce/communication cadence more substantially.
 
 ---
 
+## Entry 45 — Implement `MORI_SEPARATE_AG_BUFFER=1` to remove per-chunk cross-PE reduce barrier safely
+- **Date**: 2026-04-30
+- **Commit**: _this commit_
+- **Motivation**: Grouped/batch reduce barriers failed because AG writes reused
+  the same transit slots that peer reduce may still read. A safe way to remove
+  the cross-PE reduce_complete wait is to make AG write into a separate internal
+  symmetric buffer, not the scatter/reduce transit buffer.
+
+### Implementation
+
+Add env:
+```bash
+MORI_SEPARATE_AG_BUFFER=1
+```
+
+When enabled for `scatter_mode=0` baseline:
+- allocate/register a second internal symmetric buffer using `input_transit_buffer_`
+  as AG/output staging
+- reduce still reads/writes the original `output_transit_buffer_`
+- SDMA AG writes to the separate AG buffer
+- block0 still increments `reduce_complete` generation counters for monotonic
+  protocol compatibility, but skips waiting on peers' reduce_complete flags
+  because AG no longer overwrites the peer's reduce input
+- `copy_output_to_user()` copies from the separate AG buffer
+- `get_output_transit_buffer()` returns the separate AG buffer so no-copy tests
+  remain correct
+
+Default path remains unchanged.
+
+### Test command
+
+```bash
+cd /home/fizhang/test/mori && git pull origin sdma-test
+BUILD_EXAMPLES=ON BUILD_TESTS=ON pip3 install .
+MORI_CONTINUOUS_PREP=0 MORI_PIPELINE_CU=224 MORI_PIPELINE_CHUNKS=4 \
+MORI_SEPARATE_AG_BUFFER=1 python3 tests/python/ccl/test_allreduce.py \
+  --num-stages 4 --elems 67108864 --iterations 1 --warmup 1 \
+  --continuous-iters 100 --continuous-phase-iter 5 --continuous-phase-stage 0
+```
+
+Success signature:
+- correctness passes
+- no-copy wall below Entry 34 best 6.390 ms
+- phase barrier time drops substantially without grouped-barrier correctness
+  failure
+
+---
+
 ## Entry 19 — Plan A (PipelinedXGMIPullKernel) baseline reference + kernel swap
 - **Date**: 2026-04-24
 - **Baseline reference SHA**: `5f0072e7` (code HEAD at measurement time) /

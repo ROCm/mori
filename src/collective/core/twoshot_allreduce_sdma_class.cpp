@@ -64,6 +64,11 @@ inline bool UseCopyKernel() {
     return e && e[0] == '1' && e[1] == '\0';
 }
 
+inline bool SdmaSeparateAgBuffer() {
+    const char* e = std::getenv("MORI_SEPARATE_AG_BUFFER");
+    return e && e[0] == '1' && e[1] == '\0';
+}
+
 inline int CopyKernelBlocks() {
     if (const char* e = std::getenv("MORI_COPY_KERNEL_BLOCKS")) {
         int v = std::atoi(e);
@@ -553,6 +558,8 @@ void AllreduceSdma<T>::copy_output_to_user(T* output, size_t total_count, hipStr
   size_t bytes = total_count * dtype_size_;
   if (!output) throw std::runtime_error("Output pointer is null");
   if (!output_transit_buffer_) throw std::runtime_error("Output transit buffer is null");
+  void* copy_src = (SdmaSeparateAgBuffer() && input_transit_buffer_ != nullptr)
+      ? input_transit_buffer_ : output_transit_buffer_;
 
   const bool do_timing = copy_timing_enabled_ && stream != nullptr;
   if (do_timing) {
@@ -563,19 +570,19 @@ void AllreduceSdma<T>::copy_output_to_user(T* output, size_t total_count, hipStr
 
   hipError_t err = hipSuccess;
   if (UseCopyKernel()) {
-    const uintptr_t src_addr = reinterpret_cast<uintptr_t>(output_transit_buffer_);
+    const uintptr_t src_addr = reinterpret_cast<uintptr_t>(copy_src);
     const uintptr_t dst_addr = reinterpret_cast<uintptr_t>(output);
     const bool aligned16 = ((src_addr | dst_addr | bytes) & (sizeof(uint4) - 1)) == 0;
     D2DVectorCopyKernel<<<CopyKernelBlocks(), CopyKernelThreads(), 0, stream>>>(
-        output_transit_buffer_, output, bytes, aligned16);
+        copy_src, output, bytes, aligned16);
     err = hipGetLastError();
     if (err == hipSuccess && stream == nullptr) {
       err = hipDeviceSynchronize();
     }
   } else {
     err = stream
-        ? hipMemcpyAsync(output, output_transit_buffer_, bytes, hipMemcpyDeviceToDevice, stream)
-        : hipMemcpy(output, output_transit_buffer_, bytes, hipMemcpyDeviceToDevice);
+        ? hipMemcpyAsync(output, copy_src, bytes, hipMemcpyDeviceToDevice, stream)
+        : hipMemcpy(output, copy_src, bytes, hipMemcpyDeviceToDevice);
   }
 
   if (do_timing) {
@@ -856,6 +863,23 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         size_t align = static_cast<size_t>(pack_size * npes_);
         chunk_elems = ((chunk_elems + align - 1) / align) * align;
 
+        application::SymmMemObjPtr agDstObj = {};
+        if (SdmaSeparateAgBuffer() && scatter_mode == 0) {
+            if (!ensure_buffer_size(input_transit_buffer_, input_transit_buffer_ptr_,
+                                    input_transit_buffer_size_, input_transit_buffer_obj_,
+                                    transit_used, "separate AG output buffer")) {
+                return false;
+            }
+            agDstObj = input_transit_buffer_obj_;
+            static thread_local bool s_sep_ag_announced = false;
+            if (!s_sep_ag_announced) {
+                printf("PE %d: MORI_SEPARATE_AG_BUFFER=1 (AG writes to separate "
+                       "internal symm buffer; copy/no-copy reads from it)\n",
+                       myPe_);
+                s_sep_ag_announced = true;
+            }
+        }
+
         application::SymmMemObjPtr inputSymmObj = {};
         if (scatter_mode == 1) {
             size_t required_input_size = total_count * dtype_size_;
@@ -1014,7 +1038,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         } else if (scatter_mode == 1) {
             PipelinedAllReduceSdmaKernel<T, 1><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
-                output_transit_buffer_obj_, flagsObj_,
+                output_transit_buffer_obj_, agDstObj, flagsObj_,
                 barrierPtr_, inputSymmObj, total_count, chunk_elems,
                 scatter_base, ag_base, pipeline_ag_gen_by_q_d_,
                 reduce_complete_base, phase_ts_ptr, multi_q_ag,
@@ -1027,7 +1051,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                 PipelinedAllReduceSdmaKernel<T, 0, true, true>
                     <<<blocks, threads, 0, stream>>>(
                     myPe_, npes_, input,
-                    output_transit_buffer_obj_, flagsObj_,
+                    output_transit_buffer_obj_, agDstObj, flagsObj_,
                     barrierPtr_, application::SymmMemObjPtr{},
                     total_count, chunk_elems, scatter_base, ag_base,
                     pipeline_ag_gen_by_q_d_, reduce_complete_base, phase_ts_ptr,
@@ -1037,7 +1061,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                 PipelinedAllReduceSdmaKernel<T, 0, false, true>
                     <<<blocks, threads, 0, stream>>>(
                     myPe_, npes_, input,
-                    output_transit_buffer_obj_, flagsObj_,
+                    output_transit_buffer_obj_, agDstObj, flagsObj_,
                     barrierPtr_, application::SymmMemObjPtr{},
                     total_count, chunk_elems, scatter_base, ag_base,
                     pipeline_ag_gen_by_q_d_, reduce_complete_base, phase_ts_ptr,
@@ -1047,7 +1071,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         } else if (multi_chunk) {
             PipelinedAllReduceSdmaKernel<T, 0, true><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
-                output_transit_buffer_obj_, flagsObj_,
+                output_transit_buffer_obj_, agDstObj, flagsObj_,
                 barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems,
                 scatter_base, ag_base, pipeline_ag_gen_by_q_d_,
                 reduce_complete_base, phase_ts_ptr, multi_q_ag,
@@ -1055,7 +1079,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         } else {
             PipelinedAllReduceSdmaKernel<T, 0, false><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
-                output_transit_buffer_obj_, flagsObj_,
+                output_transit_buffer_obj_, agDstObj, flagsObj_,
                 barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems,
                 scatter_base, ag_base, pipeline_ag_gen_by_q_d_,
                 reduce_complete_base, phase_ts_ptr, multi_q_ag,

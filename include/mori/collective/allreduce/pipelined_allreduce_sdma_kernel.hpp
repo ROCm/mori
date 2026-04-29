@@ -187,6 +187,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
     int myPe, int npes,
     const T* __restrict__ input,
     const application::SymmMemObjPtr dstMemObj,
+    const application::SymmMemObjPtr agDstMemObj,
     const application::SymmMemObjPtr flagsMemObj,
     CrossPeBarrier* __restrict__ barrier,
     const application::SymmMemObjPtr inputSymmObj,
@@ -229,7 +230,9 @@ __global__ void PipelinedAllReduceSdmaKernel(
   const size_t totalShardBytes = elementCountPerRank * bytesPerElement;
 
   P* __restrict__ buf = reinterpret_cast<P*>(dstMemObj->localPtr);
+  const bool separateAgBuffer = (agDstMemObj.gpu != nullptr);
   const uint32_t numQ = dstMemObj->sdmaNumQueue;
+  const uint32_t agNumQ = separateAgBuffer ? agDstMemObj->sdmaNumQueue : numQ;
   const int compBlocks = static_cast<int>(gridDim.x) - 1;
 
   __shared__ uint64_t s_scatter_by_sender[64];
@@ -459,7 +462,7 @@ __global__ void PipelinedAllReduceSdmaKernel(
             __hip_atomic_fetch_add(myFlag, 1ULL,
                                    __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
           }
-          if (thr < npes && thr != myPe) {
+          if (!separateAgBuffer && thr < npes && thr != myPe) {
             const int pe = thr;
             const uint64_t expected =
                 reduceCompleteBase + static_cast<uint64_t>(c + 1);
@@ -473,15 +476,17 @@ __global__ void PipelinedAllReduceSdmaKernel(
           // 3. SDMA AG for chunk c.
           if (thr < npes && thr != myPe) {
             const int destPe = thr;
+            const application::SymmMemObjPtr agObj =
+                separateAgBuffer ? agDstMemObj : dstMemObj;
             anvil::SdmaQueueDeviceHandle** dh =
-                dstMemObj->deviceHandles_d + destPe * numQ;
-            const uint32_t qSpan = (numQ > 1)
-                ? ((numQ - 1u) < 15u ? (numQ - 1u) : 15u) : 1u;
+                agObj->deviceHandles_d + destPe * agNumQ;
+            const uint32_t qSpan = (agNumQ > 1)
+                ? ((agNumQ - 1u) < 15u ? (agNumQ - 1u) : 15u) : 1u;
             const uint32_t agQ = (multi_q_ag && qSpan > 1)
                 ? static_cast<uint32_t>(1 + (c % static_cast<int>(qSpan)))
                 : 1u;
-            HSAuint64* rSig = dstMemObj->peerSignalPtrs[destPe]
-                + static_cast<size_t>(myPe) * numQ;
+            HSAuint64* rSig = agObj->peerSignalPtrs[destPe]
+                + static_cast<size_t>(myPe) * agNumQ;
 
             const size_t cOff = static_cast<size_t>(c) * chunkBytes;
             size_t agBytes = chunkBytes;
@@ -490,9 +495,9 @@ __global__ void PipelinedAllReduceSdmaKernel(
 
             uint8_t* src = reinterpret_cast<uint8_t*>(dstMemObj->localPtr)
                 + static_cast<size_t>(myPe) * totalShardBytes + cOff;
-            uint8_t* dst = reinterpret_cast<uint8_t*>(dstMemObj->peerPtrs[destPe])
+            uint8_t* dst = reinterpret_cast<uint8_t*>(agObj->peerPtrs[destPe])
                 + static_cast<size_t>(myPe) * totalShardBytes + cOff;
-            core::SdmaPutThread(src, dst, agBytes, dh, rSig, numQ, agQ);
+            core::SdmaPutThread(src, dst, agBytes, dh, rSig, agNumQ, agQ);
           }
           ar_write_phase_ts(phase_ts, 2 + 3 * c + 2);  // chunk c: AG submit done
         }
@@ -500,19 +505,21 @@ __global__ void PipelinedAllReduceSdmaKernel(
         for (int c = 0; c < numChunks; c++) {
           if (thr < npes && thr != myPe) {
             const int sender = thr;
-            const uint32_t qSpan = (numQ > 1)
-                ? ((numQ - 1u) < 15u ? (numQ - 1u) : 15u) : 1u;
-            const uint32_t agQ = (multi_q_ag && qSpan > 1)
-                ? static_cast<uint32_t>(1 + (c % static_cast<int>(qSpan)))
-                : 1u;
-            const uint64_t qBase = (multi_q_ag && agBaseByQ != nullptr)
-                ? agBaseByQ[agQ] : s_ag_by_sender[sender];
-            const uint64_t qCount = (multi_q_ag && qSpan > 1)
-                ? static_cast<uint64_t>(c / static_cast<int>(qSpan) + 1)
-                : static_cast<uint64_t>(c + 1);
-            const uint64_t expected_c = qBase + qCount;
-            HSAuint64* sig = dstMemObj->signalPtrs
-                + static_cast<size_t>(sender) * numQ + agQ;
+              const uint32_t qSpan = (agNumQ > 1)
+                  ? ((agNumQ - 1u) < 15u ? (agNumQ - 1u) : 15u) : 1u;
+              const uint32_t agQ = (multi_q_ag && qSpan > 1)
+                  ? static_cast<uint32_t>(1 + (c % static_cast<int>(qSpan)))
+                  : 1u;
+              const uint64_t qBase = (multi_q_ag && agBaseByQ != nullptr)
+                  ? agBaseByQ[agQ] : s_ag_by_sender[sender];
+              const uint64_t qCount = (multi_q_ag && qSpan > 1)
+                  ? static_cast<uint64_t>(c / static_cast<int>(qSpan) + 1)
+                  : static_cast<uint64_t>(c + 1);
+              const uint64_t expected_c = qBase + qCount;
+              const application::SymmMemObjPtr agObj =
+                  separateAgBuffer ? agDstMemObj : dstMemObj;
+              HSAuint64* sig = agObj->signalPtrs
+                  + static_cast<size_t>(sender) * agNumQ + agQ;
             while (core::AtomicLoadRelaxed(sig) < expected_c)
               __builtin_amdgcn_s_sleep(1);
           }

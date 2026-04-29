@@ -28,6 +28,7 @@
 
 #include <cstdint>
 #include <array>
+#include <cstdlib>
 #include <list>
 #include <memory>
 #include <unordered_map>
@@ -284,9 +285,27 @@ class AllreduceSdma {
                  bool external_scatter = false);
 
   application::SymmMemObjPtr getFlagsObj() const { return flagsObj_; }
-  void* getOutputTransitBuffer() const { return output_transit_buffer_; }
-  size_t getOutputTransitBufferSize() const { return output_transit_buffer_size_; }
+  void* getOutputTransitBuffer() const {
+    const char* e = std::getenv("MORI_SEPARATE_AG_BUFFER");
+    if (e && std::atoi(e) == 1 && input_transit_buffer_ != nullptr) {
+      return input_transit_buffer_;
+    }
+    return output_transit_buffer_;
+  }
+  size_t getOutputTransitBufferSize() const {
+    const char* e = std::getenv("MORI_SEPARATE_AG_BUFFER");
+    if (e && std::atoi(e) == 1 && input_transit_buffer_ != nullptr) {
+      return input_transit_buffer_size_;
+    }
+    return output_transit_buffer_size_;
+  }
   application::SymmMemObjPtr getOutputTransitBufferObj() const {
+    const char* e = std::getenv("MORI_SEPARATE_AG_BUFFER");
+    if (e && std::atoi(e) == 1 &&
+        input_transit_buffer_obj_.cpu != nullptr &&
+        input_transit_buffer_obj_.gpu != nullptr) {
+      return input_transit_buffer_obj_;
+    }
     return output_transit_buffer_obj_;
   }
 
