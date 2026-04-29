@@ -1664,6 +1664,51 @@ service time.
 
 ---
 
+## Entry 36 — Implement `MORI_BATCH_REDUCE_BARRIER=1` to test removing per-chunk reduce_complete barriers
+- **Date**: 2026-04-29
+- **Commit**: _this commit_
+- **Motivation**: Continuous phase timing for `PIPELINE_CU=224, CHUNKS=4`
+  identified substantial per-chunk control overhead (cross-PE reduce_complete
+  barrier + AG submit/signaling + final AG wait). Chunk count >4 regressed
+  (Entry 35), so the next test is to reduce control overhead rather than
+  increasing chunk density.
+
+### Implementation
+
+Add env:
+```bash
+MORI_BATCH_REDUCE_BARRIER=1
+```
+
+Only affects baseline `PipelinedAllReduceSdmaKernel<T,0,true*>` multi-chunk
+path (Plan A kernel unchanged). Default path is unchanged.
+
+With the env enabled:
+1. compute blocks reduce all chunks and increment `chunks_complete` per chunk
+   as before
+2. block 0 waits once for `numChunks * compBlocks`
+3. block 0 does one cross-PE reduce_complete barrier by adding `numChunks` to
+   the flag and waiting peers to reach `reduceCompleteBase + numChunks`
+4. block 0 submits all chunks' SDMA AG packets back-to-back
+5. block 0 waits all AG signals as before
+
+This removes per-chunk reduce_complete barriers, at the cost of losing
+`reduce(c+1)` vs `AG(c)` overlap. Test decides which effect dominates in
+corrected continuous steady-state.
+
+### Test command
+
+```bash
+MORI_CONTINUOUS_PREP=0 MORI_PIPELINE_CU=224 MORI_PIPELINE_CHUNKS=4 \
+MORI_BATCH_REDUCE_BARRIER=1 python3 tests/python/ccl/test_allreduce.py \
+  --num-stages 4 --elems 67108864 --iterations 1 --warmup 1 \
+  --continuous-iters 100
+```
+
+Compare SDMA no-copy wall against Entry 34 best (6.390 ms) and RCCL (~5.809 ms).
+
+---
+
 ## Entry 19 — Plan A (PipelinedXGMIPullKernel) baseline reference + kernel swap
 - **Date**: 2026-04-24
 - **Baseline reference SHA**: `5f0072e7` (code HEAD at measurement time) /
