@@ -66,7 +66,7 @@ Only Test 6 overlap timing changes: it measures N multi-stage pipelines
 back-to-back in one window and reports wall/N, with no per-iteration sync. This
 tests whether finite-mode tail copy exposure is the real reason SDMA copy loses.
 
-### Continuous 100x result (Entry 26)
+### Continuous 100x result (Entry 26 invalid + Entry 27 corrected)
 
 | block | mode | continuous wall/iter | seq_ar | seq_gemm | slowdown | vs RCCL |
 |---|---|---:|---:|---:|---:|---:|
@@ -76,11 +76,22 @@ tests whether finite-mode tail copy exposure is the real reason SDMA copy loses.
 | PLAN_A | Plan A copy | 7.565 | 5.111 | 4.328 | 1.748 | +1.731 |
 | PLAN_A | RCCL | 5.834 | 5.126 | 4.121 | 1.416 | — |
 
-**Status**: these numbers are now marked **invalid pending re-run**. The first
-continuous implementation only called `prep_ar()` once before the 100 measured
-pipelines. Real continuous workload has fresh input per request. Current code
-enqueues `prep_ar()` once per logical iteration on `stream_ar` without global
-sync; re-run required.
+**Entry 26 invalid**: first continuous implementation only called `prep_ar()`
+once before the 100 measured pipelines.
+
+**Entry 27 corrected** (`0965c2e1`, prep per logical iter on `stream_ar`):
+
+| block | mode | continuous wall/iter | seq_ar | seq_gemm | slowdown | vs RCCL |
+|---|---|---:|---:|---:|---:|---:|
+| BASELINE | SDMA copy | 7.251 | 5.196 | 4.328 | 1.675 | +0.999 |
+| BASELINE | SDMA no-copy | 6.725 | 4.786 | 4.166 | 1.614 | +0.473 |
+| BASELINE | RCCL | 6.252 | 5.145 | 4.137 | 1.511 | — |
+| PLAN_A | Plan A copy | 7.642 | 5.120 | 4.331 | 1.765 | +1.398 |
+| PLAN_A | RCCL | 6.244 | 5.131 | 4.109 | 1.520 | — |
+
+Corrected conclusion: continuous tail-copy exposure is reduced but not enough.
+Even no-copy trails RCCL by +0.473ms due to worse overlap quality (slowdown
+1.614 vs RCCL 1.511), while seq_ar itself is faster (4.786 vs RCCL 5.145).
 
 ### Plan A v1 实测 (Entry 20, **已知不是 pipelined 实现**)
 
@@ -173,7 +184,7 @@ SDMA two-shot 算法比 RCCL 多一步 **256MB transit → user_output copy** (�
 
 ## 代码当前状态
 
-HEAD = **`2ff3e94f`** (adds Test 6 `--continuous-iters` steady-state mode on top of Plan A v2)
+HEAD = **`0965c2e1`** (continuous mode fixed to enqueue prep_ar per logical iteration)
 
 `MORI_DIRECT_OUTPUT=1` 激活 Plan A v2 path; 不开则走 BASELINE.
 
@@ -187,6 +198,7 @@ HEAD = **`2ff3e94f`** (adds Test 6 `--continuous-iters` steady-state mode on top
 | `611c2f2c` | **关键 fix**: kArPhaseTsCapacity 32 → 128. 之前 numChunks=8 时 CB1 写 slot 11+3*8=35 OOB → 破坏 CrossPeBarrier 邻居内存 → 死锁. helpers 加 bound check |
 | `f744d41a` | Plan A v2: K2 split R-group/A-group; default `MORI_PLAN_A_CU=96`, `MORI_PLAN_A_NR=CU/3`; test parser prints A-group slots |
 | `2ff3e94f` | Test 6 adds `--continuous-iters` to measure real continuous workload wall/iter |
+| `0965c2e1` | Fix continuous mode: enqueue `prep_ar()` once per logical iteration on `stream_ar` |
 
 ### 测量工具
 
@@ -197,19 +209,10 @@ HEAD = **`2ff3e94f`** (adds Test 6 `--continuous-iters` steady-state mode on top
 
 ## 下一步行动
 
-**First run continuous-mode benchmark before more kernel work**:
-
-```bash
-cd /home/fizhang/test/mori && git pull origin sdma-test
-SKIP_BUILD=1 CONTINUOUS_ITERS=100 ITERATIONS=1 WARMUP=1 bash tools/bench_plan_a.sh
-```
-
-Re-run continuous after fix:
-
-```bash
-cd /home/fizhang/test/mori && git pull origin sdma-test
-SKIP_BUILD=1 CONTINUOUS_ITERS=100 ITERATIONS=1 WARMUP=1 bash tools/bench_plan_a.sh
-```
+Continuous test completed (Entry 27). Next target: explain/fix why continuous
+SDMA **no-copy** is faster sequentially than RCCL (4.786 vs 5.145) but slower
+in overlap (6.725 vs 6.252). The gap is overlap scheduling/interaction, not AR
+compute or final copy alone.
 
 ---
 

@@ -1231,6 +1231,62 @@ copy.
 
 ---
 
+## Entry 27 — Corrected continuous 100x (prep per logical iter): SDMA still loses, but gap shrinks
+- **Date**: 2026-04-29
+- **Commit under test**: `0965c2e1` (continuous mode fixed to enqueue
+  `prep_ar()` once per logical iteration on `stream_ar`, without global sync)
+- **Command**: `SKIP_BUILD=1 CONTINUOUS_ITERS=100 ITERATIONS=1 WARMUP=1 bash tools/bench_plan_a.sh`
+- **All correctness checks PASSED**
+
+### Corrected continuous wall data
+
+From `BASELINE` block:
+
+| mode | continuous wall/iter | seq_ar | seq_gemm | slowdown | gap vs RCCL |
+|---|---:|---:|---:|---:|---:|
+| **SDMA copy** | **7.251 ms** | 5.196 | 4.328 | 1.675 | **+0.999 ms** |
+| **SDMA no-copy** | **6.725 ms** | 4.786 | 4.166 | 1.614 | **+0.473 ms** |
+| RCCL | **6.252 ms** | 5.145 | 4.137 | 1.511 | — |
+
+From `PLAN_A` block:
+
+| mode | continuous wall/iter | seq_ar | seq_gemm | slowdown | gap vs RCCL |
+|---|---:|---:|---:|---:|---:|
+| Plan A copy | 7.642 ms | 5.120 | 4.331 | 1.765 | +1.398 ms |
+| Plan A no-copy | 6.734 ms | 4.774 | 4.196 | 1.605 | +0.490 ms |
+| RCCL | 6.244 ms | 5.131 | 4.109 | 1.520 | — |
+
+### Interpretation
+
+Fixing continuous prep changed the numbers materially vs Entry 26:
+- Baseline SDMA copy gap improved from +1.307 ms → **+0.999 ms**
+- SDMA no-copy gap improved from +0.735 ms → **+0.473 ms**
+- Plan A still worse than baseline copy (+1.398 ms vs RCCL)
+
+The corrected continuous measurement still shows:
+1. **Copy is not the only gap**:
+   - copy - no-copy = 7.251 - 6.725 = **0.526 ms**
+   - no-copy still trails RCCL by **0.473 ms**
+2. **No-copy AR algorithm is faster sequentially, but worse in overlap**:
+   - no-copy seq_ar 4.786 ms vs RCCL 5.145 ms (SDMA no-copy is **0.359 ms faster**)
+   - no-copy slowdown 1.614 vs RCCL 1.511 (SDMA no-copy has worse overlap quality)
+3. **Remaining problem after removing copy is overlap scheduling**, not AR
+   compute itself. Approx overlap-quality penalty:
+   `4.166 * (1.614 - 1.511) ≈ 0.43 ms`, matching the no-copy gap 0.473 ms.
+
+### Next target
+
+To beat RCCL in continuous real workload, two things are needed:
+- remove/hide about **0.526 ms** copy gap (copy path)
+- reduce no-copy overlap penalty by about **0.47 ms** (scheduling/overlap)
+
+Plan A does not solve either in current form. The next useful experiment is to
+measure continuous no-copy timeline/phase cleanly (finite phase is not enough)
+or design an AR scheduling change that makes SDMA no-copy overlap more like
+RCCL while keeping the faster seq_ar.
+
+---
+
 ## Entry 19 — Plan A (PipelinedXGMIPullKernel) baseline reference + kernel swap
 - **Date**: 2026-04-24
 - **Baseline reference SHA**: `5f0072e7` (code HEAD at measurement time) /
