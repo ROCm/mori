@@ -10,6 +10,13 @@ multi-stage overlap wall < RCCL `dist.all_reduce(tensor)` wall, measured as
 median over ≥100 iters at 256MB/stage, 4 stages, 8-rank MI355X, same
 benchmark schedule (`test_allreduce.py --num-stages 4 --elems 67108864`).
 
+**Final success criterion is COPY VS RCCL only**:
+- ✅ Only `copy_output_to_user=True` / `SDMA copy` wall < RCCL wall counts as success.
+- ❌ `SDMA no-copy` beating RCCL does not count; it is diagnostic / upper-bound data.
+- ❌ Solutions requiring users to read transit buffers, reuse output buffers, explicitly
+  register user output, or change tensor/lifetime semantics are not drop-in and do not
+  satisfy the goal.
+
 **Target gap as of last measurement**: ~0.2 ms (SDMA copy ~7.76 vs RCCL ~7.55
 median, 3-run spread RCCL ±0.12 ms).
 

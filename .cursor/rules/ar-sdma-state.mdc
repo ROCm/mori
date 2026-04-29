@@ -23,6 +23,14 @@ alwaysApply: true
 
 测量: 256MB / stage × 4 stages × 8-rank MI355X, `tests/python/ccl/test_allreduce.py --num-stages 4 --elems 67108864 --iterations 100 --warmup 20`, median over ≥100 iters.
 
+**最终判据只看 SDMA copy vs RCCL**:
+- ✅ `copy_output_to_user=True` / `SDMA copy` wall < RCCL wall 才算达标。
+- ❌ `SDMA no-copy` 超 RCCL 不算达标，只能作为诊断/上限参考。
+- ❌ 任何要求用户读 transit buffer、复用 output buffer、显式 register user_output、
+  或改变调用方 tensor/lifetime 语义的方案都不算 drop-in。
+- 当前所有优化提案、实验和结论都必须服务于 **COPY VS RCCL**，不能把 no-copy
+  结果当成目标完成。
+
 ---
 
 ## 当前性能数据 (2026-04-29, Plan A v2 待测)
