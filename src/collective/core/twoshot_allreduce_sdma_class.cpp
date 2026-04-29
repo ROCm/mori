@@ -914,6 +914,17 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             const char* e = std::getenv("MORI_MULTI_Q_AG");
             return e && std::atoi(e) == 1;
         }();
+        int reduce_barrier_group_size = 1;
+        if (const char* e = std::getenv("MORI_GROUPED_REDUCE_BARRIER")) {
+            int v = std::atoi(e);
+            if (v > 1) reduce_barrier_group_size = v;
+        }
+        static thread_local bool s_grouped_barrier_announced = false;
+        if (reduce_barrier_group_size > 1 && !s_grouped_barrier_announced) {
+            printf("PE %d: MORI_GROUPED_REDUCE_BARRIER=%d\n",
+                   myPe_, reduce_barrier_group_size);
+            s_grouped_barrier_announced = true;
+        }
         if (multi_q_ag && pipeline_ag_gen_by_q_d_ != nullptr) {
             hipMemcpyAsync(pipeline_ag_gen_by_q_d_, pipeline_ag_gen_by_q_.data(),
                            kMaxTrackedSdmaQueues * sizeof(uint64_t),
@@ -1015,6 +1026,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                 barrierPtr_, inputSymmObj, total_count, chunk_elems,
                 scatter_base, ag_base, pipeline_ag_gen_by_q_d_,
                 reduce_complete_base, phase_ts_ptr, multi_q_ag,
+                reduce_barrier_group_size,
                 post_ag_flag_ptr);
         } else if (external_scatter) {
             ScatterSdmaOnlyKernel<T><<<1, 512, 0, stream>>>(
@@ -1029,6 +1041,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                     total_count, chunk_elems, scatter_base, ag_base,
                     pipeline_ag_gen_by_q_d_, reduce_complete_base, phase_ts_ptr,
                     multi_q_ag,
+                    reduce_barrier_group_size,
                     post_ag_flag_ptr);
             } else {
                 PipelinedAllReduceSdmaKernel<T, 0, false, true>
@@ -1039,6 +1052,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                     total_count, chunk_elems, scatter_base, ag_base,
                     pipeline_ag_gen_by_q_d_, reduce_complete_base, phase_ts_ptr,
                     multi_q_ag,
+                    reduce_barrier_group_size,
                     post_ag_flag_ptr);
             }
         } else if (multi_chunk) {
@@ -1048,6 +1062,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                 barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems,
                 scatter_base, ag_base, pipeline_ag_gen_by_q_d_,
                 reduce_complete_base, phase_ts_ptr, multi_q_ag,
+                reduce_barrier_group_size,
                 post_ag_flag_ptr);
         } else {
             PipelinedAllReduceSdmaKernel<T, 0, false><<<blocks, threads, 0, stream>>>(
@@ -1056,6 +1071,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                 barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems,
                 scatter_base, ag_base, pipeline_ag_gen_by_q_d_,
                 reduce_complete_base, phase_ts_ptr, multi_q_ag,
+                reduce_barrier_group_size,
                 post_ag_flag_ptr);
         }
 
