@@ -1438,6 +1438,74 @@ Compare SDMA no-copy and RCCL sections:
 
 ---
 
+## Entry 31 — Continuous timeline root cause: SDMA no-copy AR service time slows under GEMM, causing stream_ar backlog
+- **Date**: 2026-04-29
+- **Commit under test**: `061dd561` / docs follow-up `aab5370b`
+- **Command**: `MORI_CONTINUOUS_PREP=0 ... --continuous-iters 20 --continuous-timeline-samples 6`
+- **Scenario**: 256MB / stage × 4 stages, continuous mode, no synthetic prep.
+
+### Summary tables from run
+
+| mode | continuous wall | seq_ar | seq_gemm | slowdown |
+|---|---:|---:|---:|---:|
+| SDMA copy | 7.060 | 5.204 | 4.346 | 1.625 |
+| **SDMA no-copy** | **6.474** | **4.783** | 4.146 | **1.561** |
+| RCCL | **5.868** | 5.135 | 4.113 | **1.427** |
+
+### Timeline evidence
+
+For SDMA no-copy, GEMM remains fast (~1.0 ms/stage), but each AR stage takes
+~2.0 ms in the sampled continuous overlap window and the AR-GEMM gap grows
+linearly:
+
+| iter/stage | GEMM dur | AR dur | AR-GEMM gap |
+|---|---:|---:|---:|
+| 0/0 | 1.021 | 1.781 | 0.011 |
+| 0/1 | 1.008 | 2.088 | 0.790 |
+| 0/2 | 1.050 | 2.117 | 1.820 |
+| 0/3 | 1.083 | 2.070 | 2.859 |
+| 1/0 | 1.039 | 2.029 | 3.895 |
+| 5/3 | 0.966 | 2.138 | 24.568 |
+
+For RCCL, after the first two transient stages, GEMM and AR both stabilize
+around 1.4-1.5 ms/stage and AR-GEMM gap stays bounded (~0.5-0.6 ms):
+
+| iter/stage | GEMM dur | AR dur | AR-GEMM gap |
+|---|---:|---:|---:|
+| 1/0 | 1.435 | 1.418 | 0.596 |
+| 1/1 | 1.490 | 1.489 | 0.529 |
+| 2/0 | 1.411 | 1.389 | 0.609 |
+| 5/3 | 1.466 | 1.465 | 0.544 |
+
+### Mechanism
+
+The bottleneck is **not** that SDMA no-copy slows GEMM. In fact, GEMM remains
+~1.0 ms/stage under SDMA no-copy, faster than under RCCL (~1.45 ms/stage).
+
+The bottleneck is that **SDMA no-copy AR service time becomes ~2.0 ms/stage
+when overlapped with GEMM**, much slower than its isolated sequential rate
+(`seq_ar/4 ≈ 1.20 ms/stage`). Since GEMM produces a stage every ~1.0 ms and
+stream_ar consumes one stage every ~2.0 ms, the AR queue backlog grows
+linearly. RCCL instead balances both streams at ~1.4-1.5 ms/stage, so no
+unbounded backlog appears.
+
+This means the next optimization must improve SDMA AR service time under GEMM
+or intentionally shift resources/priority so GEMM slows slightly and AR
+accelerates, aiming for a balanced stage rate around RCCL's ~1.45 ms/stage.
+
+### Next experiments
+
+1. Sweep `MORI_PIPELINE_CU` upward in continuous no-copy/copy baseline (e.g.
+   160, 192, 224) to see if more reduce blocks reduce AR service time enough
+   to shrink backlog. This is a new mechanism vs prior CU sweep because prior
+   measurements were finite/copy-exposure oriented, not corrected continuous
+   timeline.
+2. Test `--ar-priority -1` in corrected continuous mode. Prior priority tests
+   had little effect in finite mode, but the current mechanism is specifically
+   stream_ar starvation under continuous GEMM production.
+
+---
+
 ## Entry 19 — Plan A (PipelinedXGMIPullKernel) baseline reference + kernel swap
 - **Date**: 2026-04-24
 - **Baseline reference SHA**: `5f0072e7` (code HEAD at measurement time) /

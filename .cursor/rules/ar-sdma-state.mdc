@@ -10,6 +10,10 @@ alwaysApply: true
 关联文件:
 - `.cursor/rules/relentless-perf.mdc` — 方法论规则 (R0-R15)
 - `docs/perf_history.md` — 所有历史 Entry (1-30) 含数据
+- Latest mechanism finding: Entry 31 continuous timeline shows SDMA no-copy
+  GEMM remains ~1.0ms/stage, but SDMA AR service time becomes ~2.0ms/stage
+  under GEMM, so stream_ar backlog grows. RCCL stabilizes both GEMM/AR around
+  ~1.4-1.5ms/stage.
 
 ---
 
@@ -125,6 +129,22 @@ When used with `--continuous-iters`, it prints GEMM/AR start/end for the first
 N continuous iterations with unique per-iter/stage timing events. Use this to
 localize whether SDMA no-copy gap comes from longer GEMM durations, AR queueing,
 or stream scheduling bubbles.
+
+### Continuous timeline root cause (Entry 31)
+
+SDMA no-copy timeline:
+- GEMM dur stays ~1.0 ms/stage
+- AR dur is ~2.0 ms/stage
+- AR-GEMM gap grows linearly from 0.011 ms to 24.568 ms by iter5/stage3
+
+RCCL timeline:
+- after transient, GEMM dur and AR dur both ~1.4-1.5 ms/stage
+- AR-GEMM gap stays bounded ~0.5-0.6 ms
+
+Mechanism: SDMA no-copy does not slow GEMM; GEMM outruns / starves SDMA AR.
+stream_gemm produces stages every ~1.0ms while stream_ar consumes each stage
+in ~2.0ms, causing backlog. Need improve SDMA AR service time under GEMM or
+rebalance priority/CU so stage rates match.
 
 ### Plan A v1 实测 (Entry 20, **已知不是 pipelined 实现**)
 
@@ -244,16 +264,24 @@ HEAD = **`061dd561`** (`--continuous-timeline-samples` implementation)
 
 ## 下一步行动
 
-Run continuous timeline:
+Next run: test whether more AR resources / priority can reduce SDMA AR service
+time under GEMM:
 
 ```bash
 cd /home/fizhang/test/mori && git pull origin sdma-test
-SKIP_BUILD=1 MORI_CONTINUOUS_PREP=0 python3 tests/python/ccl/test_allreduce.py \
-  --num-stages 4 --elems 67108864 --iterations 1 --warmup 1 \
-  --continuous-iters 20 --continuous-timeline-samples 6
+SKIP_BUILD=1 MORI_CONTINUOUS_PREP=0 PIPELINE_CU=192 CONTINUOUS_ITERS=100 ITERATIONS=1 WARMUP=1 \
+  bash tools/bench_plan_a.sh
+SKIP_BUILD=1 MORI_CONTINUOUS_PREP=0 PIPELINE_CU=224 CONTINUOUS_ITERS=100 ITERATIONS=1 WARMUP=1 \
+  bash tools/bench_plan_a.sh
 ```
 
-Inspect SDMA no-copy and RCCL `Continuous Timeline` sections.
+If CU sweep does not reduce no-copy wall, test stream priority:
+
+```bash
+MORI_CONTINUOUS_PREP=0 MORI_PIPELINE_CU=160 python3 tests/python/ccl/test_allreduce.py \
+  --num-stages 4 --elems 67108864 --iterations 1 --warmup 1 \
+  --continuous-iters 100 --ar-priority -1
+```
 
 ---
 
