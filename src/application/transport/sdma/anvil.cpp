@@ -275,8 +275,8 @@ bool AnvilLib::connect(int srcDeviceId, int dstDeviceId, int numChannels) {
     sdma_channels_[getKey(srcDeviceId, dstDeviceId)].emplace_back(
         std::make_unique<SdmaQueue>(srcDeviceId, dstDeviceId, gpuAgents_[srcDeviceId], engineId));
   }
-  MORI_APP_INFO("Connect from {} to {} with {} channels using engine {} num channels {}", srcDeviceId, dstDeviceId,
-    numChannels, engineId, sdma_channels_.size());
+  // MORI_APP_INFO("Connect from {} to {} with {} channels using engine {} num channels {}", srcDeviceId, dstDeviceId,
+  //   numChannels, engineId, sdma_channels_.size());
 
   return true;
 }

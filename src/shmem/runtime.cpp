@@ -50,6 +50,7 @@ using BarrierLauncher = void (*)(hipStream_t);
 static BarrierLauncher s_staticBarrierLauncher = nullptr;
 
 void RegisterGpuStatesAddrProvider(GpuStatesAddrProvider provider) {
+  // NOTE NOTE: need to add a mutex to protect this vector ??
   s_gpuStatesAddrProviders.push_back(provider);
 }
 
@@ -117,7 +118,6 @@ void FinalizeRuntime(ShmemStates* states) {
     moduleStates.gpuStatesPtr = nullptr;
     moduleStates.barrierFunc = nullptr;
   }
-  s_hostGpuStatesCopy = {};
   s_gpuStatesAddrProviders.clear();
 }
 

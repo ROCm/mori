@@ -52,13 +52,14 @@
 #include "mori/application/bootstrap/socket_bootstrap.hpp"
 #include "mori/application/utils/check.hpp"
 #include "mori/shmem/shmem.hpp"
+#include "mori/shmem/internal.hpp"
 
 using namespace mori::core;
 using namespace mori::shmem;
 using namespace mori::application;
 
 constexpr size_t DEFAULT_CHUNK_BYTES = 54*2*1*256*48*128 * sizeof(uint16_t);//1 * 1024 * 1024;
-constexpr const char* NFS_DIR = "/tf/mori";
+constexpr const char* NFS_DIR = "/data/mori";
 constexpr const char* UID_FILENAME = "allgather_test_uid.bin";
 constexpr int UID_POLL_INTERVAL_MS = 100;
 constexpr int UID_POLL_TIMEOUT_S = 120;
@@ -215,9 +216,6 @@ static void RunAllgatherThreadedTest(size_t chunkBytes, const UniqueId& uid,
     return;
   }
 
-  auto* states = ShmemStatesSingleton::GetInstance();
-  states->CheckStatusValid();
-  auto* bootnet = states->bootStates->bootNet;
   int myPe = ShmemMyPe();
   int npes = ShmemNPes();
 
@@ -228,7 +226,7 @@ static void RunAllgatherThreadedTest(size_t chunkBytes, const UniqueId& uid,
     XPUT("allgather_test: %d PEs rank: %d, %zu bytes/PE (%zu KB), %zu bytes total",
          npes, info.rank, chunkBytes, chunkBytes / 1024, totalBytes);
   }
-  bootnet->Barrier();
+  ShmemBarrierAll();
 
   hipStream_t stream;
   HIP_RUNTIME_CHECK(hipStreamCreate(&stream));
@@ -248,7 +246,7 @@ static void RunAllgatherThreadedTest(size_t chunkBytes, const UniqueId& uid,
                                                          elementsPerChunk, seed);
   HIP_RUNTIME_CHECK(hipStreamSynchronize(stream));
 
-  bootnet->Barrier();
+  ShmemBarrierAll();
   SymmMemObjPtr baseBufObj = ShmemQueryMemObjPtr(baseBuf);
   const uint32_t numQ = std::min(baseBufObj->sdmaNumQueue, 4u); // could be adapted to the data size
 
@@ -267,7 +265,7 @@ static void RunAllgatherThreadedTest(size_t chunkBytes, const UniqueId& uid,
     HIP_RUNTIME_CHECK(hipMemsetAsync(outBuf, 0, totalBytes, stream));
     HIP_RUNTIME_CHECK(hipStreamSynchronize(stream));
 
-    bootnet->Barrier();
+    ShmemBarrierAll();
 
     HIP_RUNTIME_CHECK(hipEventRecord(tStart, stream));
     // HIP_RUNTIME_CHECK(hipMemcpyAsync(
@@ -287,7 +285,7 @@ static void RunAllgatherThreadedTest(size_t chunkBytes, const UniqueId& uid,
       maxMs = std::max(maxMs, iterMs);
     }
 
-    bootnet->Barrier();
+    ShmemBarrierAll();
   }
 
   float avgMs = totalMs / nRuns;
