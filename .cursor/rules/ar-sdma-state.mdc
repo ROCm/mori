@@ -386,6 +386,8 @@ HEAD = **current docs through Entry 47** (existing kernels exhausted; next requi
 | `18b26810` | Add `MORI_SEPARATE_AG_BUFFER=1` separate internal AG/output buffer experiment |
 | `0be0ef00` | Entry 46: separate AG buffer correctness passes but no perf gain |
 | `fe9ed5f1` | Entry 47: max-CU sweep shows existing kernels still +0.56ms gap |
+| `3a6bc7bc` | Entry 44: existing single-kernel fullmesh pipe no breakthrough (no-copy 6.406) |
+| `50ab72aa` | Entry 44 ledger for `MORI_FULLMESH_PIPE=1` result |
 
 ### 测量工具
 

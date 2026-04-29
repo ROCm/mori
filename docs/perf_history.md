@@ -1858,6 +1858,58 @@ writing user_output.
 
 ---
 
+## Entry 48 — Final current best COPY vs RCCL check: SDMA copy still +1.02 ms worse
+- **Date**: 2026-04-30
+- **Commit under test**: `62ec03f6` copy-kernel code + current branch docs/fixes
+- **Command**: corrected continuous no-prep, `MORI_PIPELINE_CU=224`,
+  `MORI_PIPELINE_CHUNKS=4`, `MORI_COPY_KERNEL=1`,
+  `MORI_COPY_KERNEL_BLOCKS=4096`, `MORI_COPY_KERNEL_THREADS=512`,
+  `--continuous-iters 100 --ar-phase-timing`
+- **All correctness checks PASSED**
+
+| mode | wall | seq_ar | seq_gemm | slowdown | gap vs RCCL |
+|---|---:|---:|---:|---:|---:|
+| **SDMA copy (best current)** | **6.817** | 5.202 | 4.360 | 1.563 | **+1.020** |
+| SDMA no-copy | 6.410 | 4.810 | 4.156 | 1.543 | +0.613 |
+| RCCL | **5.797** | 5.127 | 4.151 | 1.396 | — |
+
+Copy timing:
+```text
+gpu-side copy kernel wall: 0.180 ms
+```
+
+### Interpretation
+
+This is the current best known copy-mode stack:
+- CU=224
+- chunks=4
+- best vectorized copy kernel geometry 4096×512
+
+It still fails the final success criterion (**COPY VS RCCL**):
+```text
+SDMA copy 6.817 ms vs RCCL 5.797 ms => +1.020 ms worse
+```
+
+Even no-copy remains +0.613 ms worse, so the final gap is not just output copy.
+Copy is now only ~0.407 ms above no-copy in wall (6.817 - 6.410), but no-copy
+itself trails RCCL because SDMA AR overlap quality is worse.
+
+### Conclusion
+
+All incremental two-shot / existing-fullmesh knobs are insufficient for the
+drop-in copy target:
+- no-copy best remains slower than RCCL in corrected continuous mode
+- copy kernel improves local copy but cannot close copy-mode gap
+- fullmesh alias, multi-q AG, separate AG buffer, priority, chunk sweeps, and
+  barrier variants do not reach target
+
+Next required work: implement a new fullmesh channelized algorithm that produces
+`user_output` without a separate large copy while keeping AR/GEMM service rates
+balanced. Current two-shot structure is exhausted for the final COPY VS RCCL
+goal.
+
+---
+
 ## Entry 40 — Implement experimental multi-q SDMA AG (`MORI_MULTI_Q_AG=1`)
 - **Date**: 2026-04-29
 - **Commit**: _this commit_
