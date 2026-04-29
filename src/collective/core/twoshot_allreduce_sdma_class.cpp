@@ -59,6 +59,55 @@ inline bool SdmaShouldZeroTransit() {
     return false;
 }
 
+inline bool UseCopyKernel() {
+    const char* e = std::getenv("MORI_COPY_KERNEL");
+    return e && e[0] == '1' && e[1] == '\0';
+}
+
+inline int CopyKernelBlocks() {
+    if (const char* e = std::getenv("MORI_COPY_KERNEL_BLOCKS")) {
+        int v = std::atoi(e);
+        if (v > 0) return v;
+    }
+    return 1024;
+}
+
+inline int CopyKernelThreads() {
+    if (const char* e = std::getenv("MORI_COPY_KERNEL_THREADS")) {
+        int v = std::atoi(e);
+        if (v == 128 || v == 256 || v == 512) return v;
+    }
+    return 256;
+}
+
+__global__ void D2DVectorCopyKernel(const void* __restrict__ src_void,
+                                    void* __restrict__ dst_void,
+                                    size_t bytes,
+                                    bool aligned16) {
+    const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
+    const uint8_t* __restrict__ src_b = static_cast<const uint8_t*>(src_void);
+    uint8_t* __restrict__ dst_b = static_cast<uint8_t*>(dst_void);
+
+    if (aligned16) {
+        const size_t n_vec = bytes / sizeof(uint4);
+        const uint4* __restrict__ src = reinterpret_cast<const uint4*>(src_b);
+        uint4* __restrict__ dst = reinterpret_cast<uint4*>(dst_b);
+        for (size_t i = tid; i < n_vec; i += stride) {
+            dst[i] = src[i];
+        }
+        const size_t tail = bytes - n_vec * sizeof(uint4);
+        const size_t base = n_vec * sizeof(uint4);
+        for (size_t i = tid; i < tail; i += stride) {
+            dst_b[base + i] = src_b[base + i];
+        }
+    } else {
+        for (size_t i = tid; i < bytes; i += stride) {
+            dst_b[i] = src_b[i];
+        }
+    }
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -493,10 +542,22 @@ void AllreduceSdma<T>::copy_output_to_user(T* output, size_t total_count, hipStr
   auto host_t0 = do_timing ? std::chrono::steady_clock::now()
                            : std::chrono::steady_clock::time_point{};
 
-  hipError_t err =
-      stream
-          ? hipMemcpyAsync(output, output_transit_buffer_, bytes, hipMemcpyDeviceToDevice, stream)
-          : hipMemcpy(output, output_transit_buffer_, bytes, hipMemcpyDeviceToDevice);
+  hipError_t err = hipSuccess;
+  if (UseCopyKernel()) {
+    const uintptr_t src_addr = reinterpret_cast<uintptr_t>(output_transit_buffer_);
+    const uintptr_t dst_addr = reinterpret_cast<uintptr_t>(output);
+    const bool aligned16 = ((src_addr | dst_addr | bytes) & (sizeof(uint4) - 1)) == 0;
+    D2DVectorCopyKernel<<<CopyKernelBlocks(), CopyKernelThreads(), 0, stream>>>(
+        output_transit_buffer_, output, bytes, aligned16);
+    err = hipGetLastError();
+    if (err == hipSuccess && stream == nullptr) {
+      err = hipDeviceSynchronize();
+    }
+  } else {
+    err = stream
+        ? hipMemcpyAsync(output, output_transit_buffer_, bytes, hipMemcpyDeviceToDevice, stream)
+        : hipMemcpy(output, output_transit_buffer_, bytes, hipMemcpyDeviceToDevice);
+  }
 
   if (do_timing) {
     auto host_t1 = std::chrono::steady_clock::now();
