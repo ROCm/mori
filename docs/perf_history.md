@@ -1395,7 +1395,7 @@ per iter/stage, to see whether:
 
 ## Entry 30 — Add continuous timeline samples for rate/root-cause localization
 - **Date**: 2026-04-29
-- **Commit**: `39534c94`
+- **Commit**: `061dd561`
 - **Purpose**: localize why continuous SDMA no-copy has faster `seq_ar` than
   RCCL but worse overlap wall. Need per-iteration/stage GEMM and AR start/end
   times in continuous mode, not finite per-iteration timeline.
