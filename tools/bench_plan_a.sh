@@ -97,13 +97,15 @@ run_variant_extra() {
   echo "========== $label =========="
   echo "ENV: MORI_PIPELINE_CU=$PIPELINE_CU $envs"
   echo "extra_args: $*"
+  # Phase/timeline diagnostics must stay finite. Continuous mode deliberately
+  # changes the timing window and makes per-stage phase parsing misleading.
   # shellcheck disable=SC2086
   env MORI_PIPELINE_CU="$PIPELINE_CU" $envs python3 tests/python/ccl/test_allreduce.py \
     --num-stages "$NUM_STAGES" \
     --elems "$ELEMS" \
     --iterations "$ITERATIONS" \
     --warmup "$WARMUP" \
-    --continuous-iters "$CONTINUOUS_ITERS" \
+    --continuous-iters 0 \
     "$@" 2>&1
 }
 

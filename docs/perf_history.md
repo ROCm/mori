@@ -1166,6 +1166,64 @@ tail-copy exposure and requires algorithm/copy-path work.
 
 ---
 
+## Entry 26 — Continuous 100x measurement: finite-tail hypothesis FAILED; RCCL still much faster
+- **Date**: 2026-04-29
+- **Commit under test**: `2ff3e94f` / script before follow-up fix
+- **Command**: `CONTINUOUS_ITERS=100 ITERATIONS=1 WARMUP=1 bash tools/bench_plan_a.sh`
+- **Scenario**: Test 6 overlap is reported as wall per iteration across 100
+  consecutive 4-stage pipelines with no inter-iteration sync.
+- **All correctness checks PASSED**
+
+### Continuous wall data
+
+From `BASELINE` block:
+
+| mode | continuous wall/iter | seq_ar | seq_gemm | slowdown |
+|---|---:|---:|---:|---:|
+| **SDMA copy (baseline)** | **7.143 ms** | 5.197 | 4.307 | 1.658 |
+| SDMA no-copy | 6.571 ms | 4.778 | 4.136 | 1.589 |
+| RCCL | **5.836 ms** | 5.127 | 4.213 | 1.385 |
+
+From `PLAN_A` block:
+
+| mode | continuous wall/iter | seq_ar | seq_gemm | slowdown |
+|---|---:|---:|---:|---:|
+| **Plan A copy** | **7.565 ms** | 5.111 | 4.328 | 1.748 |
+| Plan A no-copy | 6.571 ms | 4.772 | 4.154 | 1.582 |
+| RCCL | **5.834 ms** | 5.126 | 4.121 | 1.416 |
+
+### Interpretation
+
+The "finite 4-stage benchmark repeatedly exposes tail copy" hypothesis is
+refuted for the current implementation:
+- Baseline SDMA copy is still **+1.307 ms slower** than RCCL in continuous mode
+  (7.143 vs 5.836).
+- Even SDMA no-copy is **+0.735 ms slower** than RCCL (6.571 vs 5.836).
+- Plan A copy is worse: 7.565 vs RCCL 5.834 (+1.731 ms).
+
+Therefore the finite-mode gap is not just final-tail copy exposure. In steady
+state, RCCL's pipeline throughput is substantially better. The problem moved
+from "hide copy tail" to "SDMA two-shot steady-state algorithm throughput and
+overlap are worse than RCCL".
+
+### Caveat / follow-up fix
+
+`tools/bench_plan_a.sh` incorrectly passed `CONTINUOUS_ITERS=100` into the
+`--ar-phase-timing` diagnostic runs, producing meaningless all-zero/gibberish
+phase tables. A follow-up commit changes `run_variant_extra()` to force
+`--continuous-iters 0` for phase/timeline diagnostics. The Table 1-4 continuous
+wall data above are still valid.
+
+### Next direction
+
+Plan A / copy-tail hiding should be deprioritized. The next useful investigation
+is why continuous SDMA no-copy (6.571 ms) is slower than RCCL (5.836 ms) despite
+the finite no-copy data previously looking competitive. That points to the
+two-shot SDMA algorithm's steady-state scheduling/throughput, not the final
+copy.
+
+---
+
 ## Entry 19 — Plan A (PipelinedXGMIPullKernel) baseline reference + kernel swap
 - **Date**: 2026-04-24
 - **Baseline reference SHA**: `5f0072e7` (code HEAD at measurement time) /
