@@ -64,6 +64,8 @@ constexpr const char* UID_FILENAME = "allgather_test_uid.bin";
 constexpr int UID_POLL_INTERVAL_MS = 100;
 constexpr int UID_POLL_TIMEOUT_S = 120;
 
+#define USE_MORI_REGISTERED_BUFFER 1
+
 #define XPUT(fmt, ...) fprintf(stderr, fmt "\n", ##__VA_ARGS__)
 #define XHERE XPUT("ZZZZ %d", __LINE__)
 
@@ -232,7 +234,19 @@ static void RunAllgatherThreadedTest(size_t chunkBytes, const UniqueId& uid,
   HIP_RUNTIME_CHECK(hipStreamCreate(&stream));
 
   size_t inOfs = 0, outOfs = chunkBytes;
-  void *baseBuf = ShmemMalloc(chunkBytes + totalBytes);
+  
+  void *baseBuf = nullptr;
+  SymmMemObjPtr baseBufObj{};
+  if (USE_MORI_REGISTERED_BUFFER) {
+    HIP_RUNTIME_CHECK(hipMalloc(&baseBuf, chunkBytes + totalBytes));
+    baseBufObj = ShmemSymmetricRegister(baseBuf, chunkBytes + totalBytes);
+  } else {
+    baseBuf = ShmemMalloc(chunkBytes + totalBytes);
+    baseBufObj = ShmemQueryMemObjPtr(baseBuf);
+  }
+
+  XPUT("%d: baseBuf: %p baseBufObj: %p", myPe, baseBuf, baseBufObj->localPtr);
+  
   void *inBuf = static_cast<char*>(baseBuf) + inOfs;
   void* outBuf = static_cast<char*>(baseBuf) + outOfs;
   HIP_RUNTIME_CHECK(hipMemsetAsync(baseBuf, 0, chunkBytes + totalBytes, stream));
@@ -247,7 +261,6 @@ static void RunAllgatherThreadedTest(size_t chunkBytes, const UniqueId& uid,
   HIP_RUNTIME_CHECK(hipStreamSynchronize(stream));
 
   ShmemBarrierAll();
-  SymmMemObjPtr baseBufObj = ShmemQueryMemObjPtr(baseBuf);
   const uint32_t numQ = std::min(baseBufObj->sdmaNumQueue, 4u); // could be adapted to the data size
 
   // --- Allgather benchmark ---
@@ -316,7 +329,12 @@ static void RunAllgatherThreadedTest(size_t chunkBytes, const UniqueId& uid,
   HIP_RUNTIME_CHECK(hipEventDestroy(tStart));
   HIP_RUNTIME_CHECK(hipEventDestroy(tStop));
   HIP_RUNTIME_CHECK(hipStreamDestroy(stream));
-  ShmemFree(inBuf);
+  if (USE_MORI_REGISTERED_BUFFER) {
+    ShmemSymmetricDeregister(baseBuf, chunkBytes + totalBytes);
+    HIP_RUNTIME_CHECK(hipFree(baseBuf));
+  } else {
+    ShmemFree(baseBuf);
+  }
   ShmemFinalize();
   info.ret_code = 0;
 }

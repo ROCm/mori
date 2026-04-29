@@ -109,6 +109,6 @@ else()
 endif()
 
 # Export only mori symbols (to avoid leaking spdlog symbols)
-target_link_options(mori_application PRIVATE
-    "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/mori_exports.lds"
-)
+# target_link_options(mori_application PRIVATE
+#     "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/mori_exports.lds"
+# )
