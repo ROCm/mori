@@ -2018,6 +2018,46 @@ Compare against best known two-kernel fullmesh:
 
 ---
 
+## Entry 44 — `MORI_FULLMESH_PIPE=1` result: correctness passes, performance matches best two-kernel but does not improve
+- **Date**: 2026-04-30
+- **Commit under test**: `3a6bc7bc`
+- **Command**: `MORI_CONTINUOUS_PREP=0 MORI_FULLMESH_PIPE=1 MORI_PIPELINE_CU=224 MORI_PIPELINE_CHUNKS=4 ... --continuous-iters 100 --continuous-phase-iter 5 --continuous-phase-stage 0`
+- **All correctness checks PASSED**
+
+| mode | wall | seq_ar | seq_gemm | slowdown | gap vs RCCL |
+|---|---:|---:|---:|---:|---:|
+| SDMA copy + fullmesh pipe | 7.027 | 5.245 | 4.339 | 1.620 | +1.218 |
+| **SDMA no-copy + fullmesh pipe** | **6.406** | **4.812** | 4.166 | **1.538** | **+0.597** |
+| RCCL | **5.809** | 5.373 | 4.202 | 1.383 | — |
+
+Compare best prior two-kernel setting:
+- Entry 34: `PIPELINE_CU=224, CHUNKS=4`, no-copy **6.390 ms**
+- Entry 44: `MORI_FULLMESH_PIPE=1`, no-copy **6.406 ms**
+- essentially equal (within noise), no breakthrough.
+
+### Phase evidence (no-copy, iter=5 stage=0)
+
+```text
+event = 2.019 ms
+c0: compute-wait 0.563, barrier 0.052, submit/signal 0.149
+c1: compute-wait 0.173, barrier 0.052, submit/signal 0.148
+c2: compute-wait 0.049, barrier 0.031, submit/signal 0.142
+c3: compute-wait 0.014, barrier 0.046, submit/signal 0.169
+ag_wait 0.275
+R-block reduce: c0 0.387, c1 0.397, c2 0.402, c3 0.072
+```
+
+### Interpretation
+
+The existing single-kernel fullmesh micro-pipeline is correct and no worse than
+the current best two-kernel setup, but it does not fix the fundamental cadence
+gap. The steady-state AR event is still ~2.0 ms. The largest component is
+compute/reduce/compute-wait, not AG wait. This confirms that merely moving K1
+scatter into the same kernel is insufficient; a new algorithm must change the
+reduce/communication cadence more substantially.
+
+---
+
 ## Entry 19 — Plan A (PipelinedXGMIPullKernel) baseline reference + kernel swap
 - **Date**: 2026-04-24
 - **Baseline reference SHA**: `5f0072e7` (code HEAD at measurement time) /
