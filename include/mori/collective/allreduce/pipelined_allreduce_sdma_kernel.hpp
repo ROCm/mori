@@ -54,15 +54,18 @@ static_assert(kMaxPipelineBlocks <= 385,
 //   2 + 3*numChunks:   AG wait done (all peers)
 //   3 + 3*numChunks:   block 0 exit
 //   --- Stage 2b-0 per-chunk AG completion timestamps (E' prototype) ---
-//   20 + c: block 0 observed chunk c's AG completion (MULTI_CHUNK path)
+//   kArPhaseAgDoneBase + c: block 0 observed chunk c's AG completion
 //   --- post-AG wait instrumentation (E' prototype) ---
 //   30: block 0 post_ag_flag set (after AG wait done, before block 0 exit)
 //   31: compute block 1 post_ag_flag observed (spin-wait finished)
 // MUST stay in sync with kPhaseTsCapacity in twoshot_allreduce_sdma_class.hpp.
-// 128 leaves headroom up to numChunks ~= 38. Was 32 which OOB'd in Plan A
+// 256 leaves headroom for block0 + AG-done + CB + A-group slots. Was 32 which OOB'd in Plan A
 // (CB1 max slot 11 + 3*numChunks = 35 at numChunks=8) and corrupted adjacent
 // device memory, breaking CrossPeBarrier sync state → deadlock. See Entry 19.
-static constexpr int kArPhaseTsCapacity = 128;
+static constexpr int kArPhaseTsCapacity = 256;
+static constexpr int kArPhaseAgDoneBase = 64;
+static constexpr int kArPhaseCbBase = 88;
+static constexpr int kArPhaseABase = 144;
 
 __device__ inline void ar_write_phase_ts(uint64_t* ts, int idx) {
   if (ts != nullptr && blockIdx.x == 0 && threadIdx.x == 0 &&
@@ -73,27 +76,28 @@ __device__ inline void ar_write_phase_ts(uint64_t* ts, int idx) {
 
 // Same as ar_write_phase_ts but only the first compute block (block 1) writes.
 // Used to measure compute-block-internal phases (dispatch latency, scatter-poll
-// wait, reduce execution, fetch_add). Block 1 slots use idx 10..17:
-//   10: compute block entry
-//   11 + 3c + {0,1,2}: chunk c {loop-start, scatter-poll done, reduce done}
-//   11 + 3*numChunks: compute block exit (after final fetch_add)
+// wait, reduce execution, fetch_add). Call sites pass the historical logical
+// layout (10, 11+3c+...), but the helper remaps it to kArPhaseCbBase+...
+// so it never collides with block-0 slots when numChunks >= 4.
 __device__ inline void ar_write_phase_ts_cb1(uint64_t* ts, int idx) {
+  const int mapped = kArPhaseCbBase + (idx - 10);
   if (ts != nullptr && blockIdx.x == 1 && threadIdx.x == 0 &&
-      static_cast<unsigned>(idx) < static_cast<unsigned>(kArPhaseTsCapacity)) {
-    ts[idx] = __builtin_amdgcn_s_memtime();
+      idx >= 10 &&
+      static_cast<unsigned>(mapped) < static_cast<unsigned>(kArPhaseTsCapacity)) {
+    ts[mapped] = __builtin_amdgcn_s_memtime();
   }
 }
 
 // Same timestamp helper for the first AG-pull block in Plan A v2.
-// Slots use base 50:
-//   49: first AG-pull block entry
-//   50 + 3c + {0,1,2}: chunk c {ag-wait-start, ag-ready, pull-done}
-//   50 + 3*numChunks: first AG-pull block exit
+// Call sites pass logical slots 49 / 50+3c+..., but the helper remaps them
+// to kArPhaseABase+... to avoid colliding with CB slots.
 __device__ inline void ar_write_phase_ts_cbA(uint64_t* ts, int idx, int nR) {
+  const int mapped = kArPhaseABase + (idx - 49);
   if (ts != nullptr && blockIdx.x == static_cast<unsigned>(nR + 1) &&
       threadIdx.x == 0 &&
-      static_cast<unsigned>(idx) < static_cast<unsigned>(kArPhaseTsCapacity)) {
-    ts[idx] = __builtin_amdgcn_s_memtime();
+      idx >= 49 &&
+      static_cast<unsigned>(mapped) < static_cast<unsigned>(kArPhaseTsCapacity)) {
+    ts[mapped] = __builtin_amdgcn_s_memtime();
   }
 }
 // ---------------------------------------------------------------------------
@@ -497,8 +501,10 @@ __global__ void PipelinedAllReduceSdmaKernel(
               __builtin_amdgcn_s_sleep(1);
           }
           __syncthreads();
-          if (phase_ts != nullptr && threadIdx.x == 0 && (20 + c) < kArPhaseTsCapacity) {
-            phase_ts[20 + c] = __builtin_amdgcn_s_memtime();  // chunk c AG done
+          if (phase_ts != nullptr && threadIdx.x == 0 &&
+              (kArPhaseAgDoneBase + c) < kArPhaseTsCapacity) {
+            phase_ts[kArPhaseAgDoneBase + c] =
+                __builtin_amdgcn_s_memtime();  // chunk c AG done
           }
         }
         ar_write_phase_ts(phase_ts, 2 + 3 * numChunks);  // AG wait done

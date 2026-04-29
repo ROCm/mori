@@ -98,16 +98,17 @@ class AllreduceSdma {
   // When enabled, block 0 thread 0 of PipelinedAllReduceSdmaKernel writes
   // __builtin_amdgcn_s_memtime() at each phase boundary to phase_ts_d_.
   // Host calls get_phase_timestamps() to read back. See kernel header for slot layout.
-  // Capacity must hold:
-  //   baseline kernel: max slot 3 + 3*numChunks (<=27 at numChunks=8) +
-  //                    20+c (<=27 at numChunks=8) + post_ag_flag slots 30,31
-  //   Plan A K2 CB1:  max slot 11 + 3*numChunks (=35 at numChunks=8,
-  //                    grows linearly with numChunks)
-  // 128 leaves headroom up to numChunks ~= 38; was 32 which OOB'd at
-  // numChunks=8 (Plan A) and broke barrier memory → deadlock.
+  // Capacity must hold disjoint phase ranges from
+  // pipelined_allreduce_sdma_kernel.hpp:
+  //   block0 range: historical slots 0..3+3*numChunks
+  //   AG-done range: base 64
+  //   first compute/R-block range: base 88
+  //   first Plan-A A-block range: base 144
+  // 256 leaves headroom for up to ~32 chunks across all ranges. Was 32 which
+  // OOB'd at numChunks=8 (Plan A) and broke barrier memory → deadlock.
   // MUST stay in sync with kArPhaseTsCapacity in
   // pipelined_allreduce_sdma_kernel.hpp.
-  static constexpr size_t kPhaseTsCapacity = 128;
+  static constexpr size_t kPhaseTsCapacity = 256;
   bool phase_timing_enabled_ = false;
   uint64_t* phase_ts_d_ = nullptr;  // device buffer, capacity kPhaseTsCapacity * uint64_t
   int last_num_chunks_ = 0;  // numChunks used by the most recent pipelined() call

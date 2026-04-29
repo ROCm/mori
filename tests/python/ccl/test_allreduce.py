@@ -1085,9 +1085,14 @@ def _bench_overlap_one_size(
                 print("  raw nonzero slots:")
                 for i, v in nonzero[:80]:
                     print(f"    slot[{i:02d}] = {v}")
+                AG_DONE_BASE = 64
+                CB_BASE = 88
+                A_BASE = 144
                 entry = ts[0]
                 exit_candidates = []
-                for idx in (3 + 3 * nc, 11 + 3 * nc, 50 + 3 * nc):
+                for idx in (3 + 3 * nc,
+                            CB_BASE + 1 + 3 * nc,
+                            A_BASE + 1 + 3 * nc):
                     if idx < len(ts) and ts[idx] != 0:
                         exit_candidates.append(ts[idx])
                 if entry != 0 and len(exit_candidates) > 0:
@@ -1108,17 +1113,17 @@ def _bench_overlap_one_size(
                                   f"submit/signal {(ts[a+2]-ts[a+1])*cy_to_ms:.3f} ms")
                     if (2 + 3 * nc) < len(ts) and ts[2 + 3 * nc] != 0:
                         print(f"    ag_wait {(ts[2+3*nc]-ts[2+3*(nc-1)+2])*cy_to_ms:.3f} ms")
-                    if 10 < len(ts) and ts[10] != 0:
+                    if CB_BASE < len(ts) and ts[CB_BASE] != 0:
                         print("  decoded first R/compute block phases:")
                         for c in range(nc):
-                            a = 11 + 3 * c
+                            a = CB_BASE + 1 + 3 * c
                             if a + 2 < len(ts) and ts[a] != 0:
                                 print(f"    c{c}: loop->poll {(ts[a+1]-ts[a])*cy_to_ms:.3f} "
                                       f"reduce {(ts[a+2]-ts[a+1])*cy_to_ms:.3f} ms")
-                    if 49 < len(ts) and ts[49] != 0:
+                    if A_BASE < len(ts) and ts[A_BASE] != 0:
                         print("  decoded first A/pull block phases:")
                         for c in range(nc):
-                            a = 50 + 3 * c
+                            a = A_BASE + 1 + 3 * c
                             if a + 2 < len(ts) and ts[a] != 0:
                                 print(f"    c{c}: wait {(ts[a+1]-ts[a])*cy_to_ms:.3f} "
                                       f"pull {(ts[a+2]-ts[a+1])*cy_to_ms:.3f} ms")
@@ -1335,15 +1340,20 @@ def _bench_overlap_one_size(
                     pass
 
                 if rank == 0:
+                    AG_DONE_BASE = 64
+                    CB_BASE = 88
+                    A_BASE = 144
                     # Convert raw cycles to ms using target AR event duration.
                     ar0_dur_ms = tgt_ar_s.elapsed_time(tgt_ar_e)
                     stage_med_ar0.append(ar0_dur_ms)
                     entry_cy = ts[0]
                     exit_candidates = [ts[3 + 3 * last_nc]]
-                    if (11 + 3 * last_nc) < len(ts) and ts[11 + 3 * last_nc] != 0:
-                        exit_candidates.append(ts[11 + 3 * last_nc])
-                    if (50 + 3 * last_nc) < len(ts) and ts[50 + 3 * last_nc] != 0:
-                        exit_candidates.append(ts[50 + 3 * last_nc])
+                    cb_exit_idx = CB_BASE + 1 + 3 * last_nc
+                    a_exit_idx = A_BASE + 1 + 3 * last_nc
+                    if cb_exit_idx < len(ts) and ts[cb_exit_idx] != 0:
+                        exit_candidates.append(ts[cb_exit_idx])
+                    if a_exit_idx < len(ts) and ts[a_exit_idx] != 0:
+                        exit_candidates.append(ts[a_exit_idx])
                     exit_cy = max(exit_candidates)
                     total_cy = exit_cy - entry_cy if exit_cy > entry_cy else 1
                     cy_to_ms = ar0_dur_ms / float(total_cy) if total_cy > 0 else 0.0
@@ -1368,25 +1378,25 @@ def _bench_overlap_one_size(
                     # serial, small delta = parallel / queue saturated
                     # already).
                     for c in range(last_nc):
-                        if (20 + c) < len(ts) and ts[20 + c] != 0:
+                        if (AG_DONE_BASE + c) < len(ts) and ts[AG_DONE_BASE + c] != 0:
                             # since AG for chunk c is submitted at ts[2+3c+2],
                             # delta = AG done - AG submit = physical SDMA
                             # transfer time for chunk c
                             submit_t = ts[2 + 3 * c + 2]
-                            done_t   = ts[20 + c]
+                            done_t   = ts[AG_DONE_BASE + c]
                             phases[f"c{c}:AG-submit→AG-done (per-chunk)"] = (done_t - submit_t) * cy_to_ms
                     all_phase_deltas.append(phases)
 
                     # Compute-block-1 phase breakdown (slots 10..11+3*nc).
                     # Only present if kernel was built with compute-block
                     # instrumentation; slots 10+ will be 0 otherwise.
-                    if ts[10] != 0 and ts[11 + 3 * last_nc] != 0:
-                        cb_events = [(10, "entry")]
+                    if CB_BASE < len(ts) and ts[CB_BASE] != 0 and cb_exit_idx < len(ts) and ts[cb_exit_idx] != 0:
+                        cb_events = [(CB_BASE, "entry")]
                         for c in range(last_nc):
-                            cb_events.append((11 + 3 * c + 0, f"c{c}-loop"))
-                            cb_events.append((11 + 3 * c + 1, f"c{c}-sct-poll-done"))
-                            cb_events.append((11 + 3 * c + 2, f"c{c}-reduce-done"))
-                        cb_events.append((11 + 3 * last_nc, "cb-exit"))
+                            cb_events.append((CB_BASE + 1 + 3 * c + 0, f"c{c}-loop"))
+                            cb_events.append((CB_BASE + 1 + 3 * c + 1, f"c{c}-sct-poll-done"))
+                            cb_events.append((CB_BASE + 1 + 3 * c + 2, f"c{c}-reduce-done"))
+                        cb_events.append((cb_exit_idx, "cb-exit"))
                         cb_phases = {}
                         for i in range(1, len(cb_events)):
                             label = f"{cb_events[i-1][1]}→{cb_events[i][1]}"
@@ -1394,13 +1404,13 @@ def _bench_overlap_one_size(
                         all_cb_phase_deltas.append(cb_phases)
 
                     # Plan A v2 A-group (first AG-pull block) phase breakdown.
-                    if (50 + 3 * last_nc) < len(ts) and ts[49] != 0 and ts[50 + 3 * last_nc] != 0:
-                        ag_events = [(49, "entry")]
+                    if a_exit_idx < len(ts) and A_BASE < len(ts) and ts[A_BASE] != 0 and ts[a_exit_idx] != 0:
+                        ag_events = [(A_BASE, "entry")]
                         for c in range(last_nc):
-                            ag_events.append((50 + 3 * c + 0, f"c{c}-ag-wait-start"))
-                            ag_events.append((50 + 3 * c + 1, f"c{c}-ag-ready"))
-                            ag_events.append((50 + 3 * c + 2, f"c{c}-pull-done"))
-                        ag_events.append((50 + 3 * last_nc, "ag-exit"))
+                            ag_events.append((A_BASE + 1 + 3 * c + 0, f"c{c}-ag-wait-start"))
+                            ag_events.append((A_BASE + 1 + 3 * c + 1, f"c{c}-ag-ready"))
+                            ag_events.append((A_BASE + 1 + 3 * c + 2, f"c{c}-pull-done"))
+                        ag_events.append((a_exit_idx, "ag-exit"))
                         ag_phases = {}
                         for i in range(1, len(ag_events)):
                             label = f"{ag_events[i-1][1]}→{ag_events[i][1]}"
