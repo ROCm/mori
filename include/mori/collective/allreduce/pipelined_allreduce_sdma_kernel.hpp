@@ -198,7 +198,6 @@ __global__ void PipelinedAllReduceSdmaKernel(
     uint64_t reduceCompleteBase,
     uint64_t* phase_ts,
     bool multi_q_ag,
-    int reduce_barrier_group_size,
     uint32_t* post_ag_flag /* nullptr = old behavior; non-null = Stage 1 E'
                               prototype: compute blocks stay alive after
                               reduce until block 0 sets this flag (after AG
@@ -438,111 +437,6 @@ __global__ void PipelinedAllReduceSdmaKernel(
       // ==============================================================
 
       if constexpr (MULTI_CHUNK) {
-        if (reduce_barrier_group_size > 1 &&
-            reduce_barrier_group_size < numChunks) {
-          // Experimental grouped barrier: reduce a small group of chunks,
-          // run one cross-PE reduce_complete barrier for that group, then
-          // submit that group's AG packets. This reduces per-chunk barrier
-          // overhead while preserving some reduce/AG pipeline across groups.
-          for (int g = 0; g < numChunks; g += reduce_barrier_group_size) {
-            const int gEnd =
-                (g + reduce_barrier_group_size < numChunks)
-                    ? (g + reduce_barrier_group_size)
-                    : numChunks;
-            const int gCount = gEnd - g;
-            const uint32_t ccTarget =
-                ccBase + static_cast<uint32_t>(gEnd * compBlocks);
-            if (thr == 0) {
-              while (__scoped_atomic_load_n(
-                         &barrier->chunks_complete,
-                         __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) < ccTarget)
-                __builtin_amdgcn_s_sleep(1);
-            }
-            __syncthreads();
-            ar_write_phase_ts(phase_ts, 2 + 3 * (gEnd - 1) + 0);
-
-            if (thr == 0) {
-              HSAuint64* myFlag =
-                  reinterpret_cast<HSAuint64*>(flagsMemObj->localPtr);
-              __hip_atomic_fetch_add(myFlag,
-                                     static_cast<unsigned long long>(gCount),
-                                     __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
-            }
-            if (thr < npes && thr != myPe) {
-              const int pe = thr;
-              const uint64_t expected =
-                  reduceCompleteBase + static_cast<uint64_t>(gEnd);
-              HSAuint64* remoteFlag =
-                  reinterpret_cast<HSAuint64*>(flagsMemObj->peerPtrs[pe]);
-              while (core::AtomicLoadRelaxed(remoteFlag) < expected)
-                __builtin_amdgcn_s_sleep(1);
-            }
-            __syncthreads();
-            ar_write_phase_ts(phase_ts, 2 + 3 * (gEnd - 1) + 1);
-
-            for (int c = g; c < gEnd; c++) {
-              if (thr < npes && thr != myPe) {
-                const int destPe = thr;
-                anvil::SdmaQueueDeviceHandle** dh =
-                    dstMemObj->deviceHandles_d + destPe * numQ;
-                const uint32_t qSpan = (numQ > 1)
-                    ? ((numQ - 1u) < 15u ? (numQ - 1u) : 15u) : 1u;
-                const uint32_t agQ = (multi_q_ag && qSpan > 1)
-                    ? static_cast<uint32_t>(1 + (c % static_cast<int>(qSpan)))
-                    : 1u;
-                HSAuint64* rSig = dstMemObj->peerSignalPtrs[destPe]
-                    + static_cast<size_t>(myPe) * numQ;
-
-                const size_t cOff = static_cast<size_t>(c) * chunkBytes;
-                size_t agBytes = chunkBytes;
-                if (cOff + agBytes > totalShardBytes)
-                  agBytes = totalShardBytes - cOff;
-
-                uint8_t* src = reinterpret_cast<uint8_t*>(dstMemObj->localPtr)
-                    + static_cast<size_t>(myPe) * totalShardBytes + cOff;
-                uint8_t* dst = reinterpret_cast<uint8_t*>(dstMemObj->peerPtrs[destPe])
-                    + static_cast<size_t>(myPe) * totalShardBytes + cOff;
-                core::SdmaPutThread(src, dst, agBytes, dh, rSig, numQ, agQ);
-              }
-              ar_write_phase_ts(phase_ts, 2 + 3 * c + 2);
-            }
-          }
-
-          for (int c = 0; c < numChunks; c++) {
-            if (thr < npes && thr != myPe) {
-              const int sender = thr;
-              const uint32_t qSpan = (numQ > 1)
-                  ? ((numQ - 1u) < 15u ? (numQ - 1u) : 15u) : 1u;
-              const uint32_t agQ = (multi_q_ag && qSpan > 1)
-                  ? static_cast<uint32_t>(1 + (c % static_cast<int>(qSpan)))
-                  : 1u;
-              const uint64_t qBase = (multi_q_ag && agBaseByQ != nullptr)
-                  ? agBaseByQ[agQ] : s_ag_by_sender[sender];
-              const uint64_t qCount = (multi_q_ag && qSpan > 1)
-                  ? static_cast<uint64_t>(c / static_cast<int>(qSpan) + 1)
-                  : static_cast<uint64_t>(c + 1);
-              const uint64_t expected_c = qBase + qCount;
-              HSAuint64* sig = dstMemObj->signalPtrs
-                  + static_cast<size_t>(sender) * numQ + agQ;
-              while (core::AtomicLoadRelaxed(sig) < expected_c)
-                __builtin_amdgcn_s_sleep(1);
-            }
-            __syncthreads();
-            if (phase_ts != nullptr && threadIdx.x == 0 &&
-                (kArPhaseAgDoneBase + c) < kArPhaseTsCapacity) {
-              phase_ts[kArPhaseAgDoneBase + c] =
-                  __builtin_amdgcn_s_memtime();
-            }
-          }
-          ar_write_phase_ts(phase_ts, 2 + 3 * numChunks);
-
-          if (post_ag_flag != nullptr && threadIdx.x == 0) {
-            __threadfence();
-            __hip_atomic_store(post_ag_flag, 1u,
-                               __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
-            ar_write_phase_ts(phase_ts, 30);
-          }
-        } else {
         for (int c = 0; c < numChunks; c++) {
           // 1. Wait local compute blocks to finish chunk c reduce.
           const uint32_t ccTarget =
@@ -636,7 +530,6 @@ __global__ void PipelinedAllReduceSdmaKernel(
           __hip_atomic_store(post_ag_flag, 1u,
                              __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
           ar_write_phase_ts(phase_ts, 30);  // post_ag_flag set
-        }
         }
       } else {
         // Single-chunk AG. Same barrier requirement as MULTI_CHUNK.
