@@ -1707,6 +1707,20 @@ MORI_BATCH_REDUCE_BARRIER=1 python3 tests/python/ccl/test_allreduce.py \
 
 Compare SDMA no-copy wall against Entry 34 best (6.390 ms) and RCCL (~5.809 ms).
 
+### Result / revert
+
+User run:
+```text
+SDMA no-copy 49.456 ms (ar 8.605, gemm 7.295)
+RCCL 59.237 ms outlier (ar 51.927, gemm 12.892)
+```
+
+Even ignoring the RCCL outlier, SDMA no-copy itself is catastrophically worse
+than Entry 34 best (49.456 vs 6.390 ms). The experiment destroyed SDMA
+pipeline behavior by losing reduce(c+1)/AG(c) overlap and batching AG after all
+reduces. This path is **reverted in the next commit**; keep only the phase slot
+layout fix.
+
 ---
 
 ## Entry 19 — Plan A (PipelinedXGMIPullKernel) baseline reference + kernel swap

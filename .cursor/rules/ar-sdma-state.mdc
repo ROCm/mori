@@ -170,12 +170,11 @@ This is within Entry 32 normal-priority range (no-copy 6.558–6.580, RCCL
 Chunks=4 at high CU improves no-copy by ~0.17ms vs 2-chunk baseline, but still
 leaves +0.581ms gap. Next sweep chunks 6/8/12 at CU=224.
 
-### Batch reduce barrier experiment implemented (Entry 36)
+### Batch reduce barrier experiment (Entry 36) — FAILED / reverted
 
-`MORI_BATCH_REDUCE_BARRIER=1` batches all per-chunk reduce_complete barriers
-into one cross-PE barrier, then submits all chunk SDMA AG packets. Default path
-unchanged. This directly tests whether per-chunk barrier/control overhead is
-worth removing despite losing reduce(c+1)/AG(c) overlap.
+`MORI_BATCH_REDUCE_BARRIER=1` produced SDMA no-copy **49.456 ms** (catastrophic,
+vs Entry 34 best 6.390 ms). It destroyed the reduce(c+1)/AG(c) pipeline by
+batching all AG after all reduce. Reverted; only phase slot fix kept.
 
 ### Plan A v1 实测 (Entry 20, **已知不是 pipelined 实现**)
 
@@ -268,7 +267,7 @@ SDMA two-shot 算法比 RCCL 多一步 **256MB transit → user_output copy** (�
 
 ## 代码当前状态
 
-HEAD = **待 push** (`MORI_BATCH_REDUCE_BARRIER=1` experiment + phase slot fix)
+HEAD = **待 push** (batch barrier reverted; phase slot fix kept)
 
 `MORI_DIRECT_OUTPUT=1` 激活 Plan A v2 path; 不开则走 BASELINE.
 
@@ -285,7 +284,7 @@ HEAD = **待 push** (`MORI_BATCH_REDUCE_BARRIER=1` experiment + phase slot fix)
 | `0965c2e1` | Fix continuous mode: enqueue `prep_ar()` once per logical iteration on `stream_ar` |
 | `60b8ba56` | Fix continuous event reuse: unique `cont_g_done[iter][stage]` events |
 | `061dd561` | Add `--continuous-timeline-samples` to print per-iter/stage GEMM/AR timing |
-| **待 push** | Disjoint phase slot ranges for chunks>=4; add `MORI_BATCH_REDUCE_BARRIER=1` |
+| **待 push** | Disjoint phase slot ranges for chunks>=4; reverted failed `MORI_BATCH_REDUCE_BARRIER` experiment |
 
 ### 测量工具
 
@@ -296,15 +295,15 @@ HEAD = **待 push** (`MORI_BATCH_REDUCE_BARRIER=1` experiment + phase slot fix)
 
 ## 下一步行动
 
-Next run:
+Next run (after rebuild, phase decode should be valid):
 
 ```bash
 cd /home/fizhang/test/mori && git pull origin sdma-test
 BUILD_EXAMPLES=ON BUILD_TESTS=ON pip3 install .
 MORI_CONTINUOUS_PREP=0 MORI_PIPELINE_CU=224 MORI_PIPELINE_CHUNKS=4 \
-MORI_BATCH_REDUCE_BARRIER=1 python3 tests/python/ccl/test_allreduce.py \
+python3 tests/python/ccl/test_allreduce.py \
   --num-stages 4 --elems 67108864 --iterations 1 --warmup 1 \
-  --continuous-iters 100
+  --continuous-iters 20 --continuous-phase-iter 5 --continuous-phase-stage 0
 ```
 
 ---
