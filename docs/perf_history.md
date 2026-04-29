@@ -1393,6 +1393,51 @@ per iter/stage, to see whether:
 
 ---
 
+## Entry 30 — Add continuous timeline samples for rate/root-cause localization
+- **Date**: 2026-04-29
+- **Commit**: `39534c94`
+- **Purpose**: localize why continuous SDMA no-copy has faster `seq_ar` than
+  RCCL but worse overlap wall. Need per-iteration/stage GEMM and AR start/end
+  times in continuous mode, not finite per-iteration timeline.
+
+### Implementation
+
+Added CLI:
+```bash
+--continuous-timeline-samples N
+```
+
+When `--continuous-iters > 0`, the first `N` continuous iterations record:
+- GEMM start/end per stage
+- AR start/end per stage
+- `AR-GEMM gap = AR_start - GEMM_end`
+
+Uses the same unique per-iteration/stage event model from Entry 28, so the
+timeline preserves correct dependencies.
+
+### Usage
+
+No-prep rate localization:
+```bash
+MORI_CONTINUOUS_PREP=0 MORI_PIPELINE_CU=160 python3 tests/python/ccl/test_allreduce.py \
+  --num-stages 4 --elems 67108864 --iterations 1 --warmup 1 \
+  --continuous-iters 20 --continuous-timeline-samples 6
+```
+
+With prep enabled:
+```bash
+MORI_PIPELINE_CU=160 python3 tests/python/ccl/test_allreduce.py \
+  --num-stages 4 --elems 67108864 --iterations 1 --warmup 1 \
+  --continuous-iters 20 --continuous-timeline-samples 6
+```
+
+Compare SDMA no-copy and RCCL sections:
+- If SDMA no-copy GEMM durations are longer than RCCL, SDMA/HBM traffic slows GEMM.
+- If AR-GEMM gaps / AR queueing are larger for SDMA, stream scheduling/order is the issue.
+- If both are similar but wall differs, inspect tail/edge intervals beyond sampled rows.
+
+---
+
 ## Entry 19 — Plan A (PipelinedXGMIPullKernel) baseline reference + kernel swap
 - **Date**: 2026-04-24
 - **Baseline reference SHA**: `5f0072e7` (code HEAD at measurement time) /

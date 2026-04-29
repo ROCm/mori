@@ -885,6 +885,7 @@ def _bench_overlap_one_size(
     timeline_label="",
     ar_phase_timing=False,
     continuous_iters=0,
+    continuous_timeline_samples=0,
 ):
     """Benchmark one (mode, size) combo.  Returns dict with timing or None."""
     _dbg = (rank == 0)
@@ -960,9 +961,9 @@ def _bench_overlap_one_size(
     use_overlap = data_mb >= 128
     if continuous_iters > 0:
         continuous_do_prep = os.environ.get("MORI_CONTINUOUS_PREP", "1") != "0"
-        if timeline_dump and rank == 0:
-            print("  [continuous] --timeline is ignored in continuous-iters mode",
-                  flush=True)
+        if timeline_dump and rank == 0 and continuous_timeline_samples <= 0:
+            print("  [continuous] --timeline is ignored unless "
+                  "--continuous-timeline-samples > 0", flush=True)
         if _dbg:
             prep_s = "prep" if continuous_do_prep else "no-prep"
             print(f" continuous({continuous_iters},{prep_s})", end="", flush=True)
@@ -976,18 +977,47 @@ def _bench_overlap_one_size(
             [torch.cuda.Event(enable_timing=False) for _ in range(num_stages)]
             for _ in range(max(continuous_iters, max(1, warmup)))
         ]
+        n_cont_samples = min(max(0, continuous_timeline_samples),
+                             continuous_iters)
+        cont_g_s = [
+            [torch.cuda.Event(enable_timing=True) for _ in range(num_stages)]
+            for _ in range(n_cont_samples)
+        ]
+        cont_g_e = [
+            [torch.cuda.Event(enable_timing=True) for _ in range(num_stages)]
+            for _ in range(n_cont_samples)
+        ]
+        cont_a_s = [
+            [torch.cuda.Event(enable_timing=True) for _ in range(num_stages)]
+            for _ in range(n_cont_samples)
+        ]
+        cont_a_e = [
+            [torch.cuda.Event(enable_timing=True) for _ in range(num_stages)]
+            for _ in range(n_cont_samples)
+        ]
 
         def run_one_pipeline(iter_idx):
             for s in range(num_stages):
+                if iter_idx < n_cont_samples:
+                    cont_g_s[iter_idx][s].record(stream_gemm)
                 with torch.cuda.stream(stream_gemm):
                     _run_gemm()
-                cont_g_done[iter_idx][s].record(stream_gemm)
+                if iter_idx < n_cont_samples:
+                    cont_g_e[iter_idx][s].record(stream_gemm)
+                    wait_ev = cont_g_e[iter_idx][s]
+                else:
+                    cont_g_done[iter_idx][s].record(stream_gemm)
+                    wait_ev = cont_g_done[iter_idx][s]
                 if use_overlap:
-                    stream_ar.wait_event(cont_g_done[iter_idx][s])
+                    stream_ar.wait_event(wait_ev)
                 else:
                     stream_gemm.synchronize()
+                if iter_idx < n_cont_samples:
+                    cont_a_s[iter_idx][s].record(stream_ar)
                 with torch.cuda.stream(stream_ar):
                     launch_ar()
+                if iter_idx < n_cont_samples:
+                    cont_a_e[iter_idx][s].record(stream_ar)
                 if not use_overlap:
                     stream_ar.synchronize()
                     if copy_stream:
@@ -1025,6 +1055,24 @@ def _bench_overlap_one_size(
         torch.cuda.synchronize()
         overlap_times.append(ov_s.elapsed_time(ov_e) / 1000.0 /
                              float(continuous_iters))
+        if rank == 0 and n_cont_samples > 0:
+            print(f"\n  === Continuous Timeline [{timeline_label}] "
+                  f"samples={n_cont_samples}/{continuous_iters}, "
+                  f"N={num_stages}, size={data_mb:.0f} MB ===")
+            print(f"  {'iter':>4s} {'stage':>5s} | "
+                  f"{'GEMM st':>8s} {'GEMM end':>8s} {'GEMM dur':>8s} | "
+                  f"{'AR st':>8s} {'AR end':>8s} {'AR dur':>8s} | "
+                  f"{'AR-GEMM gap':>11s}")
+            for it in range(n_cont_samples):
+                for s in range(num_stages):
+                    gs = ov_s.elapsed_time(cont_g_s[it][s])
+                    ge = ov_s.elapsed_time(cont_g_e[it][s])
+                    ars = ov_s.elapsed_time(cont_a_s[it][s])
+                    are = ov_s.elapsed_time(cont_a_e[it][s])
+                    print(f"  {it:4d} {s:5d} | "
+                          f"{gs:8.3f} {ge:8.3f} {ge-gs:8.3f} | "
+                          f"{ars:8.3f} {are:8.3f} {are-ars:8.3f} | "
+                          f"{ars-ge:11.3f}")
     else:
         for i in range(total_iters):
             torch.cuda.synchronize()
@@ -1383,6 +1431,7 @@ def _test_multi_stage_overlap(
     num_stages=2, sweep=False, timeline_dump=False, ar_phase_timing=False,
     ar_priority=0, gemm_priority=0,
     continuous_iters=0,
+    continuous_timeline_samples=0,
 ):
     """Multi-stage pipelined GEMM+AllReduce overlap benchmark."""
     rccl_dtype = _RCCL_DTYPE_MAP.get(dtype, torch.float32)
@@ -1432,6 +1481,7 @@ def _test_multi_stage_overlap(
         timeline_dump=timeline_dump,
         ar_phase_timing=ar_phase_timing,
         continuous_iters=continuous_iters,
+        continuous_timeline_samples=continuous_timeline_samples,
     )
 
     single_mb = max(1, data_bytes // (1024 * 1024))
@@ -1667,6 +1717,7 @@ def _test_allreduce(
     ar_priority=0,
     gemm_priority=0,
     continuous_iters=0,
+    continuous_timeline_samples=0,
 ):
     """Worker function for each process."""
 
@@ -1814,6 +1865,7 @@ def _test_allreduce(
                 ar_priority=ar_priority,
                 gemm_priority=gemm_priority,
                 continuous_iters=continuous_iters,
+                continuous_timeline_samples=continuous_timeline_samples,
             )
             all_ok = all_ok and ok6
 
@@ -1868,6 +1920,7 @@ def test_allreduce(
     ar_priority=0,
     gemm_priority=0,
     continuous_iters=0,
+    continuous_timeline_samples=0,
 ):
     """Run AllReduce SDMA test."""
     os.environ.setdefault("MORI_ENABLE_SDMA", "1")
@@ -1892,6 +1945,7 @@ def test_allreduce(
             ar_priority,
             gemm_priority,
             continuous_iters,
+            continuous_timeline_samples,
         ),
         nprocs=world_size,
         join=True,
@@ -1995,6 +2049,14 @@ if __name__ == "__main__":
              "torch.cuda.synchronize(). Reports wall per iteration. Models "
              "continuous serving workloads; 0 keeps the finite per-iteration mode.",
     )
+    parser.add_argument(
+        "--continuous-timeline-samples",
+        type=int,
+        default=0,
+        help="When --continuous-iters > 0, record GEMM/AR start/end events for "
+             "the first N continuous iterations and print a per-iteration "
+             "timeline. Uses unique events per iter/stage.",
+    )
     args = parser.parse_args()
     os.environ["MORI_ENABLE_SDMA"] = str(args.enable_sdma)
 
@@ -2016,6 +2078,8 @@ if __name__ == "__main__":
         print(f"  Multi-stage     : {args.num_stages} stages (pipelined GEMM+AR)")
         if args.continuous_iters > 0:
             print(f"  Continuous iters: {args.continuous_iters} (Test 6 overlap only)")
+            if args.continuous_timeline_samples > 0:
+                print(f"  Continuous trace: first {args.continuous_timeline_samples} iters")
         if args.sweep:
             print(f"  Size sweep      : {', '.join(f'{s}MB' for s in _SWEEP_SIZES_MB)}")
     if args.num_stages > 0 or args.test_gemm_overlap:
@@ -2039,4 +2103,5 @@ if __name__ == "__main__":
         ar_priority=args.ar_priority,
         gemm_priority=args.gemm_priority,
         continuous_iters=args.continuous_iters,
+        continuous_timeline_samples=args.continuous_timeline_samples,
     )
