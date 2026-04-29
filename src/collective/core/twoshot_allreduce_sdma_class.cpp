@@ -359,6 +359,10 @@ void AllreduceSdma<T>::enable_phase_timing(bool on) {
       }
       hipMemset(phase_ts_d_, 0, kPhaseTsCapacity * sizeof(uint64_t));
     }
+    // Clear on every enable, not only first allocation. Phase timing may be
+    // toggled for one selected launch inside a continuous stream; stale slots
+    // from a prior launch make the host-side breakdown meaningless.
+    hipMemset(phase_ts_d_, 0, kPhaseTsCapacity * sizeof(uint64_t));
     phase_timing_enabled_ = true;
     printf("PE %d: phase timing ENABLED (device buf %p, cap=%zu slots)\n",
            myPe_, phase_ts_d_, kPhaseTsCapacity);

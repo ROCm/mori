@@ -886,6 +886,8 @@ def _bench_overlap_one_size(
     ar_phase_timing=False,
     continuous_iters=0,
     continuous_timeline_samples=0,
+    continuous_phase_iter=-1,
+    continuous_phase_stage=0,
 ):
     """Benchmark one (mode, size) combo.  Returns dict with timing or None."""
     _dbg = (rank == 0)
@@ -967,6 +969,14 @@ def _bench_overlap_one_size(
         if _dbg:
             prep_s = "prep" if continuous_do_prep else "no-prep"
             print(f" continuous({continuous_iters},{prep_s})", end="", flush=True)
+        do_cont_phase = (
+            ar_obj is not None
+            and continuous_phase_iter >= 0
+            and 0 <= continuous_phase_stage < num_stages
+            and continuous_phase_iter < continuous_iters
+        )
+        cont_phase_s = torch.cuda.Event(enable_timing=True) if do_cont_phase else None
+        cont_phase_e = torch.cuda.Event(enable_timing=True) if do_cont_phase else None
 
         # Do not reuse the same event objects across continuous iterations.
         # The CPU enqueues all iterations quickly; re-recording an event before
@@ -1014,8 +1024,14 @@ def _bench_overlap_one_size(
                     stream_gemm.synchronize()
                 if iter_idx < n_cont_samples:
                     cont_a_s[iter_idx][s].record(stream_ar)
+                if do_cont_phase and iter_idx == continuous_phase_iter and s == continuous_phase_stage:
+                    cont_phase_s.record(stream_ar)
+                    ar_obj.enable_phase_timing(True)
                 with torch.cuda.stream(stream_ar):
                     launch_ar()
+                if do_cont_phase and iter_idx == continuous_phase_iter and s == continuous_phase_stage:
+                    cont_phase_e.record(stream_ar)
+                    ar_obj.enable_phase_timing(False)
                 if iter_idx < n_cont_samples:
                     cont_a_e[iter_idx][s].record(stream_ar)
                 if not use_overlap:
@@ -1055,6 +1071,57 @@ def _bench_overlap_one_size(
         torch.cuda.synchronize()
         overlap_times.append(ov_s.elapsed_time(ov_e) / 1000.0 /
                              float(continuous_iters))
+        if rank == 0 and do_cont_phase:
+            ts = ar_obj.get_phase_timestamps()
+            nc = ar_obj.get_last_num_chunks()
+            dur_ms = cont_phase_s.elapsed_time(cont_phase_e)
+            nonzero = [(i, int(v)) for i, v in enumerate(ts) if int(v) != 0]
+            print(f"\n  === Continuous AR Phase [{timeline_label}] "
+                  f"iter={continuous_phase_iter} stage={continuous_phase_stage} "
+                  f"numChunks={nc} event={dur_ms:.3f} ms ===")
+            if len(nonzero) == 0:
+                print("  phase_ts all zero (instrumentation did not write)")
+            else:
+                print("  raw nonzero slots:")
+                for i, v in nonzero[:80]:
+                    print(f"    slot[{i:02d}] = {v}")
+                entry = ts[0]
+                exit_candidates = []
+                for idx in (3 + 3 * nc, 11 + 3 * nc, 50 + 3 * nc):
+                    if idx < len(ts) and ts[idx] != 0:
+                        exit_candidates.append(ts[idx])
+                if entry != 0 and len(exit_candidates) > 0:
+                    exit_t = max(exit_candidates)
+                    total_cy = exit_t - entry if exit_t > entry else 1
+                    cy_to_ms = dur_ms / float(total_cy)
+                    print("  decoded block0 phases:")
+                    if ts[1] != 0:
+                        print(f"    entry->scatter_done {(ts[1]-ts[0])*cy_to_ms:.3f} ms")
+                    for c in range(nc):
+                        a = 2 + 3 * c
+                        if a + 2 < len(ts) and ts[a] != 0:
+                            prev = ts[1] if c == 0 and ts[1] != 0 else (
+                                ts[0] if c == 0 else ts[2 + 3 * (c - 1) + 2]
+                            )
+                            print(f"    c{c}: prev->compute {(ts[a]-prev)*cy_to_ms:.3f} "
+                                  f"barrier {(ts[a+1]-ts[a])*cy_to_ms:.3f} "
+                                  f"submit/signal {(ts[a+2]-ts[a+1])*cy_to_ms:.3f} ms")
+                    if (2 + 3 * nc) < len(ts) and ts[2 + 3 * nc] != 0:
+                        print(f"    ag_wait {(ts[2+3*nc]-ts[2+3*(nc-1)+2])*cy_to_ms:.3f} ms")
+                    if 10 < len(ts) and ts[10] != 0:
+                        print("  decoded first R/compute block phases:")
+                        for c in range(nc):
+                            a = 11 + 3 * c
+                            if a + 2 < len(ts) and ts[a] != 0:
+                                print(f"    c{c}: loop->poll {(ts[a+1]-ts[a])*cy_to_ms:.3f} "
+                                      f"reduce {(ts[a+2]-ts[a+1])*cy_to_ms:.3f} ms")
+                    if 49 < len(ts) and ts[49] != 0:
+                        print("  decoded first A/pull block phases:")
+                        for c in range(nc):
+                            a = 50 + 3 * c
+                            if a + 2 < len(ts) and ts[a] != 0:
+                                print(f"    c{c}: wait {(ts[a+1]-ts[a])*cy_to_ms:.3f} "
+                                      f"pull {(ts[a+2]-ts[a+1])*cy_to_ms:.3f} ms")
         if rank == 0 and n_cont_samples > 0:
             print(f"\n  === Continuous Timeline [{timeline_label}] "
                   f"samples={n_cont_samples}/{continuous_iters}, "
@@ -1432,6 +1499,8 @@ def _test_multi_stage_overlap(
     ar_priority=0, gemm_priority=0,
     continuous_iters=0,
     continuous_timeline_samples=0,
+    continuous_phase_iter=-1,
+    continuous_phase_stage=0,
 ):
     """Multi-stage pipelined GEMM+AllReduce overlap benchmark."""
     rccl_dtype = _RCCL_DTYPE_MAP.get(dtype, torch.float32)
@@ -1482,6 +1551,8 @@ def _test_multi_stage_overlap(
         ar_phase_timing=ar_phase_timing,
         continuous_iters=continuous_iters,
         continuous_timeline_samples=continuous_timeline_samples,
+        continuous_phase_iter=continuous_phase_iter,
+        continuous_phase_stage=continuous_phase_stage,
     )
 
     single_mb = max(1, data_bytes // (1024 * 1024))
@@ -1718,6 +1789,8 @@ def _test_allreduce(
     gemm_priority=0,
     continuous_iters=0,
     continuous_timeline_samples=0,
+    continuous_phase_iter=-1,
+    continuous_phase_stage=0,
 ):
     """Worker function for each process."""
 
@@ -1866,6 +1939,8 @@ def _test_allreduce(
                 gemm_priority=gemm_priority,
                 continuous_iters=continuous_iters,
                 continuous_timeline_samples=continuous_timeline_samples,
+                continuous_phase_iter=continuous_phase_iter,
+                continuous_phase_stage=continuous_phase_stage,
             )
             all_ok = all_ok and ok6
 
@@ -1921,6 +1996,8 @@ def test_allreduce(
     gemm_priority=0,
     continuous_iters=0,
     continuous_timeline_samples=0,
+    continuous_phase_iter=-1,
+    continuous_phase_stage=0,
 ):
     """Run AllReduce SDMA test."""
     os.environ.setdefault("MORI_ENABLE_SDMA", "1")
@@ -1946,6 +2023,8 @@ def test_allreduce(
             gemm_priority,
             continuous_iters,
             continuous_timeline_samples,
+            continuous_phase_iter,
+            continuous_phase_stage,
         ),
         nprocs=world_size,
         join=True,
@@ -2057,6 +2136,19 @@ if __name__ == "__main__":
              "the first N continuous iterations and print a per-iteration "
              "timeline. Uses unique events per iter/stage.",
     )
+    parser.add_argument(
+        "--continuous-phase-iter",
+        type=int,
+        default=-1,
+        help="When --continuous-iters > 0 and mode is SDMA, enable kernel "
+             "phase timing for this logical iteration only (-1 disables).",
+    )
+    parser.add_argument(
+        "--continuous-phase-stage",
+        type=int,
+        default=0,
+        help="Stage index for --continuous-phase-iter.",
+    )
     args = parser.parse_args()
     os.environ["MORI_ENABLE_SDMA"] = str(args.enable_sdma)
 
@@ -2080,6 +2172,9 @@ if __name__ == "__main__":
             print(f"  Continuous iters: {args.continuous_iters} (Test 6 overlap only)")
             if args.continuous_timeline_samples > 0:
                 print(f"  Continuous trace: first {args.continuous_timeline_samples} iters")
+            if args.continuous_phase_iter >= 0:
+                print(f"  Continuous phase: iter {args.continuous_phase_iter}, "
+                      f"stage {args.continuous_phase_stage}")
         if args.sweep:
             print(f"  Size sweep      : {', '.join(f'{s}MB' for s in _SWEEP_SIZES_MB)}")
     if args.num_stages > 0 or args.test_gemm_overlap:
@@ -2104,4 +2199,6 @@ if __name__ == "__main__":
         gemm_priority=args.gemm_priority,
         continuous_iters=args.continuous_iters,
         continuous_timeline_samples=args.continuous_timeline_samples,
+        continuous_phase_iter=args.continuous_phase_iter,
+        continuous_phase_stage=args.continuous_phase_stage,
     )

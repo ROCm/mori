@@ -1623,6 +1623,47 @@ PIPELINE_CHUNKS=4`.
 
 ---
 
+## Entry 35 — Continuous chunk sweep 6/8/12: chunks=4 remains best; chunk tuning closed
+- **Date**: 2026-04-29
+- **Command**:
+  `for ch in 6 8 12; MORI_CONTINUOUS_PREP=0 MORI_PIPELINE_CU=224 MORI_PIPELINE_CHUNKS=$ch ... --continuous-iters 100`
+- **Scenario**: corrected continuous no-prep, 256MB × 4 stages, 8 ranks.
+
+| chunks | SDMA no-copy wall | SDMA seq_ar | SDMA seq_gemm | RCCL wall | RCCL seq_ar | RCCL seq_gemm | gap |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4 (Entry 34) | **6.390** | 4.811 | 4.168 | 5.809 | 5.139 | 4.128 | +0.581 |
+| 6 | 8.980 | 5.496 | 4.593 | **13.278 outlier** | 5.763 | 4.565 | n/a |
+| 8 | 6.649 | 4.813 | 4.189 | 5.799 | 5.128 | 4.143 | +0.850 |
+| 12 | 6.653 | 4.818 | 4.180 | 5.790 | 5.126 | 4.133 | +0.863 |
+
+### Interpretation
+
+`chunks=8/12` both regress vs `chunks=4`:
+- no-copy wall 6.649/6.653 vs 6.390
+- seq_ar stays similar (~4.81), but overlap wall worsens
+
+`chunks=6` run is not usable for gap because RCCL wall 13.278 is an outlier,
+but SDMA no-copy also regressed badly to 8.980, so it is not a candidate.
+
+### Conclusion
+
+Chunk tuning is closed. Best known continuous no-copy setting:
+`MORI_PIPELINE_CU=224`, `MORI_PIPELINE_CHUNKS=4`, wall **6.390 ms**, still
+**+0.581 ms** slower than RCCL.
+
+The remaining gap is not solved by:
+- stream priority (`--ar-priority -1`, Entry 33)
+- more CU alone (Entries 32/34 context)
+- chunk count beyond 4 (Entry 35)
+
+Next viable direction: change the continuous scheduling model so stream_ar
+does not accumulate backlog, e.g. intentionally throttle GEMM / insert
+cross-stream pacing so GEMM production rate matches SDMA AR service rate, or
+move from two-shot to a ring-like algorithm with more balanced per-stage AR
+service time.
+
+---
+
 ## Entry 19 — Plan A (PipelinedXGMIPullKernel) baseline reference + kernel swap
 - **Date**: 2026-04-24
 - **Baseline reference SHA**: `5f0072e7` (code HEAD at measurement time) /
