@@ -1945,6 +1945,54 @@ Success signature:
 
 ---
 
+## Entry 50 — Integer reduce fast path: phase reduce improves, end-to-end wall unchanged
+- **Date**: 2026-04-30
+- **Commit under test**: `9ae490e4`
+- **Command**: `MORI_CONTINUOUS_PREP=0 MORI_PIPELINE_CU=224 MORI_PIPELINE_CHUNKS=4 ... --continuous-iters 100 --continuous-phase-iter 5 --continuous-phase-stage 0`
+- **All correctness checks PASSED**
+
+| mode | wall | seq_ar | seq_gemm | slowdown | gap vs RCCL |
+|---|---:|---:|---:|---:|---:|
+| SDMA copy | 7.034 | 5.227 | 4.350 | 1.617 | +1.224 |
+| **SDMA no-copy** | **6.388** | **4.816** | 4.242 | **1.506** | **+0.578** |
+| RCCL | **5.810** | 5.133 | 4.141 | 1.403 | — |
+
+### Phase evidence (no-copy, iter=5 stage=0)
+
+```text
+event = 1.917 ms
+c0: compute-wait 0.340, barrier 0.264, submit/signal 0.113
+c1: compute-wait 0.001, barrier 0.181, submit/signal 0.159
+c2: compute-wait 0.015, barrier 0.031, submit/signal 0.009
+c3: compute-wait 0.015, barrier 0.168, submit/signal 0.153
+ag_wait 0.347
+R-block reduce: c0 0.152, c1 0.142, c2 0.159, c3 0.141
+```
+
+### Interpretation
+
+The integer accumulator fast path works at the phase level:
+- prior no-copy reduce chunks were around ~0.38–0.40 ms for early chunks
+- now all four reduce chunks are around **0.14–0.16 ms**
+
+But end-to-end no-copy wall is essentially unchanged:
+- Entry 34 best no-copy: 6.390 ms
+- Entry 50 no-copy: **6.388 ms**
+
+The bottleneck shifted/was already dominated by barrier + submit/control +
+AG wait + stream backlog, not pure integer reduce ALU. The change is still
+worth keeping (less CU work, cleaner uint32 path), but it does not close the
+COPY VS RCCL target.
+
+### Next implication
+
+Further optimizing reduce arithmetic is unlikely to recover the remaining
+~0.58 ms no-copy gap. The remaining gap is control/scheduling/cadence. A new
+fullmesh channelized algorithm must reduce barrier/submit cadence overhead and
+avoid long AR service bursts, while still producing `user_output` for copy mode.
+
+---
+
 ## Entry 40 — Implement experimental multi-q SDMA AG (`MORI_MULTI_Q_AG=1`)
 - **Date**: 2026-04-29
 - **Commit**: _this commit_

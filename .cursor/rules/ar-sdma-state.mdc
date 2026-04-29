@@ -250,6 +250,19 @@ Correctness passes but no performance gain:
 Best known no-copy remains Entry 34 `CU224,chunks4`: 6.390 ms. Separate AG is
 closed as standalone optimization.
 
+### Integer reduce fast path (Entry 50)
+
+`uint32/int32` pipeline reduce now accumulates in packed integer registers
+instead of float. Phase improves, but wall does not:
+
+| mode | wall | seq_ar | slowdown | vs RCCL |
+|---|---:|---:|---:|---:|
+| SDMA no-copy | **6.388** | 4.816 | 1.506 | +0.578 |
+| RCCL | 5.810 | 5.133 | 1.403 | — |
+
+Phase no-copy R-block reduce drops to ~0.14–0.16ms/chunk, but end-to-end stays
+near Entry 34 best 6.390ms. Reduce ALU is no longer the main bottleneck.
+
 ### Max-CU sweep (Entry 47)
 
 | CU | no-copy wall | RCCL wall | gap |
@@ -359,7 +372,7 @@ SDMA two-shot 算法比 RCCL 多一步 **256MB transit → user_output copy** (�
 
 ## 代码当前状态
 
-HEAD = **current docs through Entry 47** (existing kernels exhausted; next requires new fullmesh channelized algorithm)
+HEAD = **`9ae490e4`** (integer reduce fast path; docs through Entry 50)
 
 `MORI_DIRECT_OUTPUT=1` 激活 Plan A v2 path; 不开则走 BASELINE.
 
@@ -386,6 +399,7 @@ HEAD = **current docs through Entry 47** (existing kernels exhausted; next requi
 | `18b26810` | Add `MORI_SEPARATE_AG_BUFFER=1` separate internal AG/output buffer experiment |
 | `0be0ef00` | Entry 46: separate AG buffer correctness passes but no perf gain |
 | `fe9ed5f1` | Entry 47: max-CU sweep shows existing kernels still +0.56ms gap |
+| `9ae490e4` | Integer packed accumulator fast path for uint32/int32 pipeline reduce |
 | `3a6bc7bc` | Entry 44: existing single-kernel fullmesh pipe no breakthrough (no-copy 6.406) |
 | `50ab72aa` | Entry 44 ledger for `MORI_FULLMESH_PIPE=1` result |
 
