@@ -9,7 +9,7 @@ alwaysApply: true
 
 关联文件:
 - `.cursor/rules/relentless-perf.mdc` — 方法论规则 (R0-R15)
-- `docs/perf_history.md` — 所有历史 Entry (1-37) 含数据
+- `docs/perf_history.md` — 所有历史 Entry (1-41) 含数据
 - Latest mechanism finding: Entry 31 continuous timeline shows SDMA no-copy
   GEMM remains ~1.0ms/stage, but SDMA AR service time becomes ~2.0ms/stage
   under GEMM, so stream_ar backlog grows. RCCL stabilizes both GEMM/AR around
@@ -204,6 +204,20 @@ end-to-end wall with this best geometry.
 
 Copy wall is 0.179ms, but copy-mode wall is still +1.408ms vs RCCL and
 +0.840ms vs no-copy. Custom CU copy kernel is insufficient as final solution.
+
+### Multi-q AG result (Entry 41)
+
+`MORI_MULTI_Q_AG=1` correctness passes but regresses current best:
+
+| mode | wall | seq_ar | slowdown | vs RCCL |
+|---|---:|---:|---:|---:|
+| SDMA no-copy + multi-q AG | 6.469 | 4.894 | 1.553 | +0.675 |
+| RCCL | 5.794 | 5.148 | 1.393 | — |
+
+Best prior no-copy (`CU224,chunks4`) was 6.390, so multi-q regresses +0.079ms.
+Phase shows `ag_wait=0.364ms`, not dominant; time is spread across
+compute/reduce, barrier, and submit/control. Close multi-q unless future phase
+again shows AG wait dominates.
 
 ### Multi-q SDMA AG implemented (Entry 40)
 

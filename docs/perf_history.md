@@ -1893,6 +1893,48 @@ Success signature:
 
 ---
 
+## Entry 41 — `MORI_MULTI_Q_AG=1` result: correctness passes but wall regresses vs chunks=4 best
+- **Date**: 2026-04-30
+- **Commit under test**: `3e379594`
+- **Command**: `MORI_CONTINUOUS_PREP=0 MORI_PIPELINE_CU=224 MORI_PIPELINE_CHUNKS=4 MORI_MULTI_Q_AG=1 ... --continuous-iters 100 --continuous-phase-iter 5 --continuous-phase-stage 0`
+- **All correctness checks PASSED**
+
+| mode | wall | seq_ar | seq_gemm | slowdown | gap vs RCCL |
+|---|---:|---:|---:|---:|---:|
+| SDMA copy + multi-q AG | 7.070 | 5.302 | 4.344 | 1.628 | +1.276 |
+| **SDMA no-copy + multi-q AG** | **6.469** | **4.894** | 4.166 | **1.553** | **+0.675** |
+| RCCL | 5.794 | 5.148 | 4.160 | 1.393 | — |
+
+Compare best prior no-copy setting:
+- Entry 34 `CU=224, chunks=4`, no multi-q: **6.390 ms**
+- Entry 41 multi-q: **6.469 ms**
+- regression: **+0.079 ms**
+
+### Phase evidence (no-copy, continuous iter=5 stage=0)
+
+```text
+event = 2.122 ms
+c0: compute-wait 0.545, barrier 0.040, submit/signal 0.218
+c1: compute-wait 0.056, barrier 0.110, submit/signal 0.167
+c2: compute-wait 0.008, barrier 0.182, submit/signal 0.167
+c3: compute-wait 0.009, barrier 0.023, submit/signal 0.104
+ag_wait 0.364
+R-block reduce: c0 0.432, c1 0.333, c2 0.094, c3 0.158
+```
+
+`ag_wait` is not the dominant bottleneck after chunks=4; reducing queue
+serialization does not improve wall. The remaining per-stage time is spread
+across compute-wait/reduce, cross-PE barrier, and SDMA submit/control. Multi-q
+adds complexity / generation tracking and slightly worsens wall.
+
+### Conclusion
+
+Close `MORI_MULTI_Q_AG` as ineffective for the current best setting. Keep it
+off by default; do not pursue unless a new phase profile shows AG wait again
+dominates.
+
+---
+
 ## Entry 19 — Plan A (PipelinedXGMIPullKernel) baseline reference + kernel swap
 - **Date**: 2026-04-24
 - **Baseline reference SHA**: `5f0072e7` (code HEAD at measurement time) /
