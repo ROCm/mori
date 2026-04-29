@@ -1851,6 +1851,48 @@ writing user_output.
 
 ---
 
+## Entry 40 — Implement experimental multi-q SDMA AG (`MORI_MULTI_Q_AG=1`)
+- **Date**: 2026-04-29
+- **Commit**: _this commit_
+- **Motivation**: Corrected continuous phase timing with
+  `PIPELINE_CU=224, CHUNKS=4` shows SDMA no-copy steady-state AR still spends
+  ~1 ms in AG wait. The current baseline submits every chunk's AG on qId=1,
+  so the SDMA queue serializes chunks. Earlier Entry 12 already proved a single
+  SDMA queue is FIFO and multi-q AG has real gain potential.
+
+### Implementation
+
+Add env:
+```bash
+MORI_MULTI_Q_AG=1
+```
+
+When enabled in `PipelinedAllReduceSdmaKernel`:
+- scatter stays on qId=0
+- AG chunk `c` uses qId `1 + c % min(numQ-1, 15)`
+- wait for chunk `c` reads `signalPtrs[sender*numQ + qId]`
+- host maintains per-q AG generation counters in
+  `pipeline_ag_gen_by_q_[16]` and copies them to device before launch, avoiding
+  unsafe per-launch signal resets
+
+Default path remains unchanged.
+
+### Test command
+
+```bash
+MORI_CONTINUOUS_PREP=0 MORI_PIPELINE_CU=224 MORI_PIPELINE_CHUNKS=4 \
+MORI_MULTI_Q_AG=1 python3 tests/python/ccl/test_allreduce.py \
+  --num-stages 4 --elems 67108864 --iterations 1 --warmup 1 \
+  --continuous-iters 100 --continuous-phase-iter 5 --continuous-phase-stage 0
+```
+
+Success signature:
+- `SDMA no-copy` wall drops below Entry 34 best 6.390 ms
+- phase `ag_wait` drops below ~1.0 ms
+- correctness passes
+
+---
+
 ## Entry 19 — Plan A (PipelinedXGMIPullKernel) baseline reference + kernel swap
 - **Date**: 2026-04-24
 - **Baseline reference SHA**: `5f0072e7` (code HEAD at measurement time) /

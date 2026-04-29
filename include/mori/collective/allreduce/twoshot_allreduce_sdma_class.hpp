@@ -27,6 +27,7 @@
 #include <mpi.h>
 
 #include <cstdint>
+#include <array>
 #include <list>
 #include <memory>
 #include <unordered_map>
@@ -93,6 +94,10 @@ class AllreduceSdma {
   uint64_t pipeline_scatter_gen_ = 0;  // total SDMA ATOMIC_INC on qId=0 (scatter only)
   uint64_t pipeline_ag_gen_ = 0;       // total SDMA ATOMIC_INC on qId=1 (pipeline AG only)
   uint64_t pipeline_reduce_gen_ = 0;   // reduce_complete counter via flagsMemObj (per-chunk barrier)
+  static constexpr int kMaxTrackedSdmaQueues = 16;
+  std::array<uint64_t, kMaxTrackedSdmaQueues> pipeline_ag_gen_by_q_{};  // for MORI_MULTI_Q_AG
+  uint64_t* pipeline_ag_gen_by_q_d_ = nullptr;
+  uint32_t sdma_num_queue_ = 0;
 
   // Phase-level timestamp instrumentation (optional, diagnostic).
   // When enabled, block 0 thread 0 of PipelinedAllReduceSdmaKernel writes

@@ -181,9 +181,18 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t /*input_buffer_size*/
     hipMemcpy(&gpuNumQ, &(output_transit_buffer_obj_.gpu->sdmaNumQueue),
               sizeof(uint32_t), hipMemcpyDeviceToHost);
     if (gpuSig && gpuNumQ > 0) {
+      sdma_num_queue_ = gpuNumQ;
       size_t sigSize = static_cast<size_t>(npes_) * gpuNumQ * sizeof(HSAuint64);
       hipMemset(gpuSig, 0, sigSize);
     }
+  hipError_t agBaseAlloc =
+      hipMalloc(&pipeline_ag_gen_by_q_d_,
+                kMaxTrackedSdmaQueues * sizeof(uint64_t));
+  if (agBaseAlloc != hipSuccess) {
+      throw std::runtime_error("Failed to allocate pipeline_ag_gen_by_q_d_");
+  }
+  hipMemset(pipeline_ag_gen_by_q_d_, 0,
+            kMaxTrackedSdmaQueues * sizeof(uint64_t));
   }
 
   printf("AllreduceSdma(SDMA) initialized: PE %d of %d, max_blocks=%d\n", myPe_, npes_,
@@ -206,6 +215,10 @@ AllreduceSdma<T>::~AllreduceSdma() {
   if (phase_ts_d_) {
     hipFree(phase_ts_d_);
     phase_ts_d_ = nullptr;
+  }
+  if (pipeline_ag_gen_by_q_d_) {
+    hipFree(pipeline_ag_gen_by_q_d_);
+    pipeline_ag_gen_by_q_d_ = nullptr;
   }
   if (copy_start_event_) {
     hipEventDestroy(copy_start_event_);
@@ -478,10 +491,16 @@ bool AllreduceSdma<T>::ensure_buffer_size(void*& buffer,
     hipMemcpy(&gpuNumQ, &(buffer_obj.gpu->sdmaNumQueue),
               sizeof(uint32_t), hipMemcpyDeviceToHost);
     if (gpuSig && gpuNumQ > 0) {
+      sdma_num_queue_ = gpuNumQ;
       size_t sigSize = static_cast<size_t>(npes_) * gpuNumQ * sizeof(HSAuint64);
       hipMemset(gpuSig, 0, sigSize);
       pipeline_scatter_gen_ = 0;
       pipeline_ag_gen_ = 0;
+      pipeline_ag_gen_by_q_.fill(0);
+      if (pipeline_ag_gen_by_q_d_) {
+        hipMemset(pipeline_ag_gen_by_q_d_, 0,
+                  kMaxTrackedSdmaQueues * sizeof(uint64_t));
+      }
       pipeline_reduce_gen_ = 0;
       if (flags_) {
         hipMemset(flags_.get(), 0, static_cast<size_t>(npes_) * sizeof(uint64_t));
@@ -891,6 +910,15 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         uint64_t scatter_base = pipeline_scatter_gen_;
         uint64_t ag_base      = pipeline_ag_gen_;
         uint64_t reduce_complete_base = pipeline_reduce_gen_;
+        const bool multi_q_ag = []() {
+            const char* e = std::getenv("MORI_MULTI_Q_AG");
+            return e && std::atoi(e) == 1;
+        }();
+        if (multi_q_ag && pipeline_ag_gen_by_q_d_ != nullptr) {
+            hipMemcpyAsync(pipeline_ag_gen_by_q_d_, pipeline_ag_gen_by_q_.data(),
+                           kMaxTrackedSdmaQueues * sizeof(uint64_t),
+                           hipMemcpyHostToDevice, stream);
+        }
 
         // Phase timing buffer (nullptr unless instrumentation enabled).
         // Block 0 thread 0 writes __builtin_amdgcn_s_memtime() at each phase.
@@ -985,7 +1013,8 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
                 barrierPtr_, inputSymmObj, total_count, chunk_elems,
-                scatter_base, ag_base, reduce_complete_base, phase_ts_ptr,
+                scatter_base, ag_base, pipeline_ag_gen_by_q_d_,
+                reduce_complete_base, phase_ts_ptr, multi_q_ag,
                 post_ag_flag_ptr);
         } else if (external_scatter) {
             ScatterSdmaOnlyKernel<T><<<1, 512, 0, stream>>>(
@@ -998,7 +1027,8 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                     output_transit_buffer_obj_, flagsObj_,
                     barrierPtr_, application::SymmMemObjPtr{},
                     total_count, chunk_elems, scatter_base, ag_base,
-                    reduce_complete_base, phase_ts_ptr,
+                    pipeline_ag_gen_by_q_d_, reduce_complete_base, phase_ts_ptr,
+                    multi_q_ag,
                     post_ag_flag_ptr);
             } else {
                 PipelinedAllReduceSdmaKernel<T, 0, false, true>
@@ -1007,7 +1037,8 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                     output_transit_buffer_obj_, flagsObj_,
                     barrierPtr_, application::SymmMemObjPtr{},
                     total_count, chunk_elems, scatter_base, ag_base,
-                    reduce_complete_base, phase_ts_ptr,
+                    pipeline_ag_gen_by_q_d_, reduce_complete_base, phase_ts_ptr,
+                    multi_q_ag,
                     post_ag_flag_ptr);
             }
         } else if (multi_chunk) {
@@ -1015,14 +1046,16 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
                 barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems,
-                scatter_base, ag_base, reduce_complete_base, phase_ts_ptr,
+                scatter_base, ag_base, pipeline_ag_gen_by_q_d_,
+                reduce_complete_base, phase_ts_ptr, multi_q_ag,
                 post_ag_flag_ptr);
         } else {
             PipelinedAllReduceSdmaKernel<T, 0, false><<<blocks, threads, 0, stream>>>(
                 myPe_, npes_, input,
                 output_transit_buffer_obj_, flagsObj_,
                 barrierPtr_, application::SymmMemObjPtr{}, total_count, chunk_elems,
-                scatter_base, ag_base, reduce_complete_base, phase_ts_ptr,
+                scatter_base, ag_base, pipeline_ag_gen_by_q_d_,
+                reduce_complete_base, phase_ts_ptr, multi_q_ag,
                 post_ag_flag_ptr);
         }
 
@@ -1032,6 +1065,17 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         // launch). Still advance pipeline_ag_gen_ so baseline path's
         // sub-launches (if interleaved) keep consistent counters.
         pipeline_ag_gen_      += numChunks_host;   // AG (qId=1, unused in Plan A)
+        if (multi_q_ag && sdma_num_queue_ > 1) {
+            const uint32_t usable_q = std::min<uint32_t>(
+                sdma_num_queue_ - 1,
+                static_cast<uint32_t>(kMaxTrackedSdmaQueues - 1));
+            for (int c = 0; c < numChunks_host; c++) {
+                const uint32_t q = 1u + static_cast<uint32_t>(c) % usable_q;
+                pipeline_ag_gen_by_q_[q]++;
+            }
+        } else {
+            pipeline_ag_gen_by_q_[1] += static_cast<uint64_t>(numChunks_host);
+        }
         pipeline_reduce_gen_  += numChunks_host;   // reduce_complete via flags
 
         hipError_t err = hipGetLastError();

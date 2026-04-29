@@ -205,6 +205,13 @@ end-to-end wall with this best geometry.
 Copy wall is 0.179ms, but copy-mode wall is still +1.408ms vs RCCL and
 +0.840ms vs no-copy. Custom CU copy kernel is insufficient as final solution.
 
+### Multi-q SDMA AG implemented (Entry 40)
+
+`MORI_MULTI_Q_AG=1` distributes AG chunks over qId `1 + c % min(numQ-1,15)`
+instead of serializing all chunks on qId=1. Host tracks per-q AG generation
+counters to avoid unsafe signal resets. Default path unchanged. This targets
+the ~1ms AG wait seen in continuous phase timing.
+
 ### Plan A v1 实测 (Entry 20, **已知不是 pipelined 实现**)
 
 | 变体 | overlap wall | seq_ar | seq_gemm | overlap/seq_gemm | vs RCCL |
@@ -296,7 +303,7 @@ SDMA two-shot 算法比 RCCL 多一步 **256MB transit → user_output copy** (�
 
 ## 代码当前状态
 
-HEAD = **`89ac70fc`** (copy-kernel Entry 37 docs; code commit `62ec03f6`)
+HEAD = **待 push** (`MORI_MULTI_Q_AG=1` experiment)
 
 `MORI_DIRECT_OUTPUT=1` 激活 Plan A v2 path; 不开则走 BASELINE.
 
@@ -314,6 +321,7 @@ HEAD = **`89ac70fc`** (copy-kernel Entry 37 docs; code commit `62ec03f6`)
 | `60b8ba56` | Fix continuous event reuse: unique `cont_g_done[iter][stage]` events |
 | `061dd561` | Add `--continuous-timeline-samples` to print per-iter/stage GEMM/AR timing |
 | `62ec03f6` | Add opt-in `MORI_COPY_KERNEL=1` vectorized D2D output copy kernel |
+| **待 push** | Add experimental `MORI_MULTI_Q_AG=1` SDMA AG over multiple qIds |
 | `413c75d2` | Disjoint phase slot ranges for chunks>=4 |
 | `3a83139f` | Revert failed `MORI_BATCH_REDUCE_BARRIER` experiment, keep phase slot fix |
 | `62ec03f6` | Add opt-in `MORI_COPY_KERNEL=1` vectorized D2D output copy kernel |
@@ -327,8 +335,16 @@ HEAD = **`89ac70fc`** (copy-kernel Entry 37 docs; code commit `62ec03f6`)
 
 ## 下一步行动
 
-Next: custom copy kernel is not enough. Need mechanism that avoids extra CU
-copy work in overlap window or changes AR/GEMM scheduling/algorithm.
+Next run:
+
+```bash
+cd /home/fizhang/test/mori && git pull origin sdma-test
+BUILD_EXAMPLES=ON BUILD_TESTS=ON pip3 install .
+MORI_CONTINUOUS_PREP=0 MORI_PIPELINE_CU=224 MORI_PIPELINE_CHUNKS=4 \
+MORI_MULTI_Q_AG=1 python3 tests/python/ccl/test_allreduce.py \
+  --num-stages 4 --elems 67108864 --iterations 1 --warmup 1 \
+  --continuous-iters 100 --continuous-phase-iter 5 --continuous-phase-stage 0
+```
 
 ---
 
