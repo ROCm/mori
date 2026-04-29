@@ -1285,6 +1285,16 @@ measure continuous no-copy timeline/phase cleanly (finite phase is not enough)
 or design an AR scheduling change that makes SDMA no-copy overlap more like
 RCCL while keeping the faster seq_ar.
 
+### Immediate hypothesis to test
+
+The corrected continuous mode includes `prep_ar()` inside the measured window
+once per logical iteration. In this synthetic benchmark `prep_ar()` is a 256MB
+`fill_` on `stream_ar`; finite `seq_ar/seq_gemm` do **not** include that cost.
+The no-copy continuous gap vs RCCL is ~0.47ms, which is the right order for an
+extra 256MB HBM fill/copy kernel. A follow-up test flag
+`MORI_CONTINUOUS_PREP=0` skips this per-iteration prep to isolate whether the
+gap is a benchmark-prep artifact or true AR/GEMM overlap loss.
+
 ---
 
 ## Entry 19 — Plan A (PipelinedXGMIPullKernel) baseline reference + kernel swap

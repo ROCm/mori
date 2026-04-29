@@ -959,11 +959,13 @@ def _bench_overlap_one_size(
     data_mb = elem_bytes / (1024 * 1024)
     use_overlap = data_mb >= 128
     if continuous_iters > 0:
+        continuous_do_prep = os.environ.get("MORI_CONTINUOUS_PREP", "1") != "0"
         if timeline_dump and rank == 0:
             print("  [continuous] --timeline is ignored in continuous-iters mode",
                   flush=True)
         if _dbg:
-            print(f" continuous({continuous_iters})", end="", flush=True)
+            prep_s = "prep" if continuous_do_prep else "no-prep"
+            print(f" continuous({continuous_iters},{prep_s})", end="", flush=True)
 
         def run_one_pipeline():
             for s in range(num_stages):
@@ -986,8 +988,9 @@ def _bench_overlap_one_size(
         # free of between-iteration sync, while still warming kernels/queues.
         torch.cuda.synchronize()
         for _ in range(max(1, warmup)):
-            with torch.cuda.stream(stream_ar):
-                prep_ar()
+            if continuous_do_prep:
+                with torch.cuda.stream(stream_ar):
+                    prep_ar()
             run_one_pipeline()
         if use_overlap:
             stream_ar.synchronize()
@@ -1000,8 +1003,9 @@ def _bench_overlap_one_size(
         torch.cuda.synchronize()
         ov_s.record()
         for _ in range(continuous_iters):
-            with torch.cuda.stream(stream_ar):
-                prep_ar()
+            if continuous_do_prep:
+                with torch.cuda.stream(stream_ar):
+                    prep_ar()
             run_one_pipeline()
         if use_overlap:
             stream_ar.synchronize()
