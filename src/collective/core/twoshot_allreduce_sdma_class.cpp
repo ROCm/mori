@@ -974,9 +974,40 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         // and CU XGMI push is slower than SDMA AG.
         const bool use_plan_a = direct_output_enabled_
             && copy_output_to_user_ && multi_chunk;
-        bool skip_external_copy = use_plan_a;
+        const bool use_fullmesh_chan = []() {
+            const char* e = std::getenv("MORI_FULLMESH_CHAN");
+            return e && std::atoi(e) == 1;
+        }() && copy_output_to_user_ && multi_chunk && scatter_mode == 0;
+        bool skip_external_copy = use_plan_a || use_fullmesh_chan;
 
-        if (use_plan_a) {
+        if (use_fullmesh_chan) {
+            if (!agDstObj.IsValid()) {
+                if (!ensure_buffer_size(input_transit_buffer_, input_transit_buffer_ptr_,
+                                        input_transit_buffer_size_, input_transit_buffer_obj_,
+                                        transit_used, "fullmesh channel AG buffer")) {
+                    return false;
+                }
+                agDstObj = input_transit_buffer_obj_;
+            }
+            hipError_t br_full = stream
+                ? hipMemsetAsync(barrierPtr_, 0, sizeof(CrossPeBarrier), stream)
+                : hipMemset(barrierPtr_, 0, sizeof(CrossPeBarrier));
+            if (br_full != hipSuccess) {
+                fprintf(stderr, "PE %d: fullmesh channel barrier reset failed: %s\n",
+                        myPe_, hipGetErrorString(br_full));
+                return false;
+            }
+            static thread_local bool s_fullmesh_chan_announced = false;
+            if (!s_fullmesh_chan_announced) {
+                printf("PE %d: MORI_FULLMESH_CHAN=1 — chunked scatter/reduce/AG/copy "
+                       "kernel; chunks=%d, blocks=%d, threads=%d\n",
+                       myPe_, numChunks_host, blocks, threads);
+                s_fullmesh_chan_announced = true;
+            }
+            FullMeshChannelizedAllReduceKernel<T><<<blocks, threads, 0, stream>>>(
+                myPe_, npes_, input, output_transit_buffer_obj_, agDstObj,
+                barrierPtr_, output, total_count, chunk_elems, scatter_base, ag_base);
+        } else if (use_plan_a) {
             int plan_a_comp = blocks - 1;
             // Plan A v2 uses CU for both reduce and AG-pull. Do not default
             // to all 160 CUs: that starves the overlapped GEMM. Keep a

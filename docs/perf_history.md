@@ -1993,6 +1993,51 @@ avoid long AR service bursts, while still producing `user_output` for copy mode.
 
 ---
 
+## Entry 51 — Implement correctness-first `MORI_FULLMESH_CHAN=1` fullmesh channelized MVP
+- **Date**: 2026-04-30
+- **Commit**: _this commit_
+- **Goal**: start a genuinely new fullmesh channelized path for the final
+  drop-in copy target. This is not the old `MORI_FULLMESH_PIPE=1` alias; it is
+  a new kernel that writes `user_output` inside the allreduce path.
+
+### Implementation
+
+Add env:
+```bash
+MORI_FULLMESH_CHAN=1
+```
+
+Active only for `copy_output_to_user=True`, `scatter_mode=0`, multi-chunk calls.
+Default path unchanged.
+
+New kernel `FullMeshChannelizedAllReduceKernel` loops over chunks:
+1. block0 fullmesh SDMA scatters chunk `c` into `output_transit_buffer_`
+2. compute blocks reduce chunk `c` into `output_transit_buffer_[myPe]`
+3. block0 fullmesh SDMA AGs chunk `c` into separate internal symmetric AG buffer
+4. compute blocks locally copy chunk `c` from AG buffer to `user_output`
+
+Remote writes never target `user_output` and never overwrite the scatter/reduce
+input transit. The path skips the external `copy_output_to_user()` because the
+kernel writes user output directly.
+
+### Test command
+
+```bash
+cd /home/fizhang/test/mori && git pull origin sdma-test
+BUILD_EXAMPLES=ON BUILD_TESTS=ON pip3 install .
+MORI_CONTINUOUS_PREP=0 MORI_FULLMESH_CHAN=1 MORI_PIPELINE_CU=224 \
+MORI_PIPELINE_CHUNKS=4 python3 tests/python/ccl/test_allreduce.py \
+  --num-stages 4 --elems 67108864 --iterations 1 --warmup 1 \
+  --continuous-iters 100
+```
+
+Success criteria:
+- `SDMA copy` correctness passes
+- `SDMA copy` wall improves over current best copy (Entry 48: 6.817 ms)
+- eventually beat RCCL (~5.8 ms)
+
+---
+
 ## Entry 40 — Implement experimental multi-q SDMA AG (`MORI_MULTI_Q_AG=1`)
 - **Date**: 2026-04-29
 - **Commit**: _this commit_
