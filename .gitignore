@@ -23,3 +23,6 @@ python/mori/spdk_proxy
 .codex/
 .cache/
 CMakeFiles/
+
+# Bundled tools/*.sh files copied into the package at build time
+python/mori/tools/*.sh
