@@ -44,7 +44,7 @@ require_cmd() {
 query_rdma_devices() {
     local host="${1:-}"
     if [[ -z "$host" || "$host" == "localhost" || "$host" == "127.0.0.1" ]]; then
-        ibv_devices 2>/dev/null | awk '/^\s+[a-z]/ && $1 != "device" {print $1}'
+        ibv_devices 2>/dev/null | awk 'NR>2 && NF {print $1}'
     else
         ssh -o ConnectTimeout=5 "$(whoami)"@"$host" "ibv_devices 2>/dev/null" \
             | awk '/^\s+[a-z]/ && $1 != "device" {print $1}'
