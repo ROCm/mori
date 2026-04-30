@@ -321,6 +321,22 @@ Decomposition for this run:
 
 This re-confirms COPY vs RCCL is still far from target after closing copy-pipe.
 
+### Finite phase-timing run (Entry 58)
+
+Finite `--ar-phase-timing` run (`iterations=20`, `warmup=5`) produced:
+
+| mode | wall | seq_ar | slowdown | vs RCCL |
+|---|---:|---:|---:|---:|
+| **SDMA copy** | **7.751** | 5.222 | 2.107 | **+0.266 ms** |
+| SDMA no-copy | 7.299 | 4.802 | 1.987 | **-0.186 ms** |
+| RCCL | 7.485 | 5.126 | 2.037 | — |
+
+In finite mode, no-copy beats RCCL and copy loses only by the materialization
+gap (`copy - no-copy = +0.452 ms`). The pasted output did not include
+`Copy-path` lines, so copy wall vs overlap disturbance is still not localized.
+The bench script now runs `BASELINE_PHASE_STAGE0` by default to extract those
+copy timing lines.
+
 ### Integer reduce fast path (Entry 50)
 
 `uint32/int32` pipeline reduce now accumulates in packed integer registers
@@ -448,6 +464,8 @@ HEAD after latest pull includes the Entry 57 script summary fix: copy-pipe is
 skipped by default, `MORI_SDMA_AG_COPY_PIPE=1` alone is ignored unless
 `MORI_ALLOW_FAILED_COPY_PIPE=1` is also set, and the bench script prints
 wall/slowdown/seq_ar/seq_gemm rows with derived gaps.
+Latest script update also runs finite `BASELINE_PHASE_STAGE0` copy timing by
+default (`RUN_PHASE_TIMING=1`).
 
 `MORI_DIRECT_OUTPUT=1` 激活 Plan A v2 path; 不开则走 BASELINE.
 `MORI_SDMA_AG_COPY_PIPE=1` 激活 K1 scatter + K2 R-reduce / SDMA-AG / C-copy pipeline.

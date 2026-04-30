@@ -2098,6 +2098,60 @@ overlap quality.
 
 ---
 
+## Entry 58 — Finite phase-timing run: no-copy beats RCCL, copy still loses
+- **Date**: 2026-04-30
+- **Command**: requested finite `--ar-phase-timing` run with
+  `MORI_CONTINUOUS_PREP=0`, `MORI_PIPELINE_CU=224`,
+  `MORI_PIPELINE_CHUNKS=4`, `MORI_PHASE_TARGET_STAGE=0`,
+  `--num-stages 4`, `--elems 67108864`, `--iterations 20`, `--warmup 5`
+- **All correctness checks PASSED**
+- **Missing evidence**: the pasted output did not include the `Copy-path`
+  section, so this entry cannot locate whether the output-copy penalty is
+  device copy wall or overlap interference.
+
+### Result
+
+| mode | wall | slowdown | seq_ar | seq_gemm | gap vs RCCL |
+|---|---:|---:|---:|---:|---:|
+| **SDMA copy** | **7.751** | 2.107 | 5.222 | 3.678 | **+0.266** |
+| SDMA no-copy | 7.299 | 1.987 | 4.802 | 3.675 | **-0.186** |
+| RCCL | 7.485 | 2.037 | 5.126 | 3.675 | — |
+
+### Decomposition
+
+```text
+SDMA copy - RCCL    = 7.751 - 7.485 = +0.266 ms
+SDMA no-copy - RCCL = 7.299 - 7.485 = -0.186 ms
+SDMA copy - no-copy = 7.751 - 7.299 = +0.452 ms
+```
+
+Finite mode differs from continuous Entry 57:
+- finite no-copy is faster than RCCL by `0.186 ms`
+- finite copy loses only by `0.266 ms`
+- the remaining finite-mode miss is entirely output materialization
+
+### Script update
+
+`tools/bench_sdma_ag_copy_pipe.sh` now optionally runs a finite
+`BASELINE_PHASE_STAGE0` pass (`RUN_PHASE_TIMING=1`, default) with
+`--ar-phase-timing`, `PHASE_ITERATIONS=20`, and `PHASE_WARMUP=5`, so future logs
+automatically include the `Copy-path` lines needed to localize this penalty.
+
+### Next evidence needed
+
+Run the updated script and inspect:
+```text
+--- Copy-path (baseline: single hipMemcpyAsync in copy_output_to_user) ---
+host-side hipMemcpyAsync() call
+gpu-side copy kernel wall
+```
+
+If `gpu-side copy kernel wall` is near `0.45 ms`, finite-mode loss is the
+materialization copy itself. If it is much smaller, the loss is copy-induced
+overlap disturbance.
+
+---
+
 ## Entry 49 — Implement integer accumulator fast path for uint32/int32 pipeline reduce
 - **Date**: 2026-04-30
 - **Commit**: _this commit_

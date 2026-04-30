@@ -5,6 +5,7 @@
 # Env overrides:
 #   REPO=/home/fizhang/test/mori SIZE_MB=256 NUM_STAGES=4 CONTINUOUS_ITERS=100 \
 #   PIPELINE_CU=224 PIPELINE_CHUNKS=4 RUN_PIPE=0 PIPE_NRS="112 144 176 200" \
+#   RUN_PHASE_TIMING=1 PHASE_ITERATIONS=20 PHASE_WARMUP=5 \
 #   SKIP_PULL=0 SKIP_BUILD=0 bash tools/bench_sdma_ag_copy_pipe.sh
 #
 # Runs: preflight -> optional git pull -> optional build -> baseline COPY/RCCL.
@@ -26,6 +27,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${PIPELINE_CHUNKS:=4}"
 : "${RUN_PIPE:=0}"
 : "${PIPE_NRS:=112 144 176 200}"
+: "${RUN_PHASE_TIMING:=1}"
+: "${PHASE_ITERATIONS:=20}"
+: "${PHASE_WARMUP:=5}"
 : "${SKIP_PULL:=0}"
 : "${SKIP_BUILD:=0}"
 
@@ -55,7 +59,7 @@ rocm-smi --showproductname 2>&1 | head -8 || true
 git rev-parse --abbrev-ref HEAD
 git log -1 --oneline
 git status --short || true
-echo "SIZE_MB=$SIZE_MB NUM_STAGES=$NUM_STAGES ELEMS=$ELEMS CONTINUOUS_ITERS=$CONTINUOUS_ITERS PIPELINE_CU=$PIPELINE_CU PIPELINE_CHUNKS=$PIPELINE_CHUNKS RUN_PIPE=$RUN_PIPE PIPE_NRS=$PIPE_NRS"
+echo "SIZE_MB=$SIZE_MB NUM_STAGES=$NUM_STAGES ELEMS=$ELEMS CONTINUOUS_ITERS=$CONTINUOUS_ITERS PIPELINE_CU=$PIPELINE_CU PIPELINE_CHUNKS=$PIPELINE_CHUNKS RUN_PIPE=$RUN_PIPE PIPE_NRS=$PIPE_NRS RUN_PHASE_TIMING=$RUN_PHASE_TIMING PHASE_ITERATIONS=$PHASE_ITERATIONS PHASE_WARMUP=$PHASE_WARMUP"
 
 if [ "$SKIP_PULL" != "1" ]; then
   echo
@@ -88,6 +92,20 @@ run_case() {
     --continuous-phase-stage 0 2>&1
 }
 
+run_phase_case() {
+  local label="$1"
+  shift
+  echo
+  echo "========== $label =========="
+  echo "ENV: $*"
+  env "$@" python3 tests/python/ccl/test_allreduce.py \
+    --num-stages "$NUM_STAGES" \
+    --elems "$ELEMS" \
+    --iterations "$PHASE_ITERATIONS" \
+    --warmup "$PHASE_WARMUP" \
+    --ar-phase-timing 2>&1
+}
+
 {
   echo "========== HEAD =========="
   git log -1 --oneline
@@ -112,6 +130,14 @@ run_case() {
     echo "========== PIPE_DISABLED =========="
     echo "MORI_SDMA_AG_COPY_PIPE is skipped by default: Entry 56 shows K1 chunk=3 signal stuck at 3/4."
     echo "Set RUN_PIPE=1 only for targeted debugging."
+  fi
+
+  if [ "$RUN_PHASE_TIMING" = "1" ]; then
+    run_phase_case "BASELINE_PHASE_STAGE0" \
+      MORI_CONTINUOUS_PREP=0 \
+      MORI_PIPELINE_CU="$PIPELINE_CU" \
+      MORI_PIPELINE_CHUNKS="$PIPELINE_CHUNKS" \
+      MORI_PHASE_TARGET_STAGE=0
   fi
 } | tee "$LOG"
 
@@ -144,7 +170,7 @@ awk -v size="$SIZE_MB" '
 
 echo
 echo "---- raw phase/copy lines ----"
-grep -E "MORI_SDMA_AG_COPY_PIPE|Table 1:|copy vs RCCL|host-side hipMemcpy|gpu-side copy|AR\\[[0-3]\\] duration|median wall" "$LOG" || true
+grep -E "MORI_SDMA_AG_COPY_PIPE|Table 1:|copy vs RCCL|Copy-path|host-side hipMemcpy|gpu-side copy|AR\\[[0-3]\\] duration|median wall" "$LOG" || true
 
 echo
 echo "LOG: $LOG"
