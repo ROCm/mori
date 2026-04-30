@@ -114,6 +114,12 @@ EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config_
   config.enableSdma = env::IsEnvVarEnabled("MORI_ENABLE_SDMA");
   MORI_OPS_INFO("EpDispatchCombine SDMA {} (currently only effective for AsyncLL kernel type)",
                 config.enableSdma ? "enabled" : "disabled");
+  if (config.kernelType == KernelType::AsyncLL && !config.enableSdma && config.rank == 0) {
+    MORI_OPS_WARN(
+        "Mori AsyncLL is selected but SDMA is disabled. AsyncLL without SDMA uses compute units "
+        "for communication, which provides little overlap benefit and can severely degrade "
+        "performance. Use a non-AsyncLL kernel path or set MORI_ENABLE_SDMA=1.");
+  }
   if (config.maxTotalRecvTokens > 0) {
     int worstCase = config.worldSize * config.maxNumInpTokenPerRank;
     if (config.maxTotalRecvTokens > worstCase) {
