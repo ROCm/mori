@@ -35,6 +35,7 @@
 #include "mori/io/engine.hpp"
 #include "umbp/distributed/config.h"
 #include "umbp/distributed/master/master_client.h"
+#include "umbp/distributed/obs_counters.h"
 #include "umbp/distributed/types.h"
 
 namespace mori::umbp {
@@ -42,7 +43,12 @@ namespace mori::umbp {
 class PoolClient {
  public:
   explicit PoolClient(PoolClientConfig config);
-  ~PoolClient();
+  // Destructor is virtual under MORI_UMBP_TESTING to match the conditional
+  // virtuality of IssueBatchWrite (avoids -Wnon-virtual-dtor and supports
+  // safe deletion through a base pointer in test subclasses).  In release
+  // builds the destructor is non-virtual; PoolClient is not designed to be
+  // a public base class outside testing.
+  MORI_UMBP_TEST_VIRTUAL ~PoolClient();
 
   PoolClient(const PoolClient&) = delete;
   PoolClient& operator=(const PoolClient&) = delete;
@@ -109,7 +115,9 @@ class PoolClient {
   // SSD: RoutePut -> AllocateWriteSlot -> RDMA write -> CommitSsdWrite.
   bool Put(const std::string& key, const void* src, size_t size);
 
-  // Batch write: single gRPC for routing + batched RDMA + single gRPC for finalize.
+  // Batch write: single BatchRoutePut, fused per-peer BatchWrite (3-phase
+  // pipeline overlapping NIC and CPU work), single BatchFinalizeAllocation,
+  // and a single BatchAbortAllocation flush for failures.
   std::vector<bool> BatchPut(const std::vector<std::string>& keys,
                              const std::vector<const void*>& srcs, const std::vector<size_t>& sizes,
                              const std::vector<int>& depths = {});
@@ -132,8 +140,8 @@ class PoolClient {
   bool IsInitialized() const;
 
   // Observability counters — members always exist (ABI stable) but only
-  // increment when built with -DMORI_UMBP_OBS_COUNTERS.  Release builds
-  // leave them at 0 and pay zero CPU cost at increment call sites.
+  // increment when built with -DMORI_UMBP_TESTING.  Release builds leave
+  // them at 0 and pay zero CPU cost at increment call sites.
   uint64_t AbortAllocationCallsCount() const {
     return abort_allocation_calls_.load(std::memory_order_relaxed);
   }
@@ -142,6 +150,19 @@ class PoolClient {
   }
   uint64_t BatchAbortAllocationEntriesCount() const {
     return batch_abort_allocation_entries_.load(std::memory_order_relaxed);
+  }
+  // BatchPut RDMA fusion observability.  Primary metric:
+  //   items_per_pair = BatchPutItemsCount / BatchPutIoEnginePairsCount
+  // is the NIC-layer WR-batching proxy (upper bound; backend may split
+  // each pair into a few ibv_post_send by postBatchSize).  Secondary:
+  // io_engine_calls captures CPU-side IOEngine::BatchWrite invocation count.
+  uint64_t BatchPutCallsCount() const { return batch_put_calls_.load(std::memory_order_relaxed); }
+  uint64_t BatchPutItemsCount() const { return batch_put_items_.load(std::memory_order_relaxed); }
+  uint64_t BatchPutIoEngineCallsCount() const {
+    return batch_put_io_engine_calls_.load(std::memory_order_relaxed);
+  }
+  uint64_t BatchPutIoEnginePairsCount() const {
+    return batch_put_io_engine_pairs_.load(std::memory_order_relaxed);
   }
 
   // ---- External KV block events ----
@@ -198,6 +219,12 @@ class PoolClient {
   void EnsureBufferDescsCached(PeerConnection& peer,
                                const std::vector<BufferMemoryDescBytes>& descs);
 
+  // No-lock variant: caller MUST hold peers_mutex_.  Used by BatchPut
+  // fused path to combine hydrate + snapshot under a single critical
+  // section.
+  void EnsureBufferDescsCachedLocked(PeerConnection& peer,
+                                     const std::vector<BufferMemoryDescBytes>& descs);
+
   bool RemoteDramWrite(PeerConnection& peer, uint32_t buffer_index, const void* src, size_t size,
                        uint64_t offset, bool zero_copy);
   bool RemoteDramRead(PeerConnection& peer, uint32_t buffer_index, void* dst, size_t size,
@@ -223,6 +250,94 @@ class PoolClient {
                               uint64_t page_size, const void* src, size_t size, bool zero_copy);
   bool RemoteDramScatterRead(PeerConnection& peer, const std::vector<PageLocation>& pages,
                              uint64_t page_size, void* dst, size_t size, bool zero_copy);
+
+  // BatchPut RDMA fusion internals.  All declared here because they
+  // reference each other and need access to private members
+  // (FindRegisteredMemory, peers_mutex_, IssueBatchWrite).  Structural
+  // contract:
+  //   - PlanPeerForBatchPut is the ONLY helper that takes PeerConnection&
+  //     and may read peer.dram_memories[].
+  //   - SubmitFusedBucket / WaitFusedBucket / MapBucketFailures take only
+  //     FusedBucket& and never touch peer state.  Snapshots travel via
+  //     FusedPair.remote_mem.
+  struct BatchPutItemPlan {
+    enum class Kind {
+      SKIPPED,                // master-invariant violation, no Abort
+      LOCAL,                  // same-node memcpy
+      REMOTE_ZC,              // fused per-peer BatchWrite
+      REMOTE_STG,             // legacy staging fallback (serial)
+      REMOTE_ZC_PREP_FAILED,  // snapshot found buf not hydrated, owe Abort
+    };
+    size_t idx{0};
+    Kind kind{Kind::SKIPPED};
+    // Common (set when route validation passes):
+    std::string peer_node_id;
+    std::string allocation_id;
+    uint64_t page_size{0};
+    size_t bytes_total{0};
+    // REMOTE_ZC only:
+    mori::io::MemoryDesc local_mem{};
+    size_t local_base_off{0};
+    // Set after Phase 2/3.  Drives BatchFinalize inclusion.
+    bool wrote{false};
+  };
+  struct FusedPair {
+    uint32_t remote_buf_idx{0};
+    mori::io::MemoryDesc remote_mem{};  // snapshotted under peers_mutex_
+    mori::io::MemoryDesc local_mem{};
+    std::vector<uint64_t> local_offsets;
+    std::vector<uint64_t> remote_offsets;
+    std::vector<uint64_t> sizes;
+    std::vector<size_t> contributing_items;  // indices into batch input vectors
+  };
+  struct FusedBucket {
+    std::string peer_node_id;
+    std::vector<FusedPair> pairs;
+    std::vector<mori::io::TransferStatus> statuses;
+    std::vector<mori::io::TransferUniqueId> ids;
+    std::vector<bool> submitted;  // per pair; false skips Wait + Aborts items
+  };
+
+  // Phase 1 helper.  Holds peers_mutex_ for the entire hydrate + snapshot
+  // window so peer.dram_memories[] reads are consistent and FusedPair.
+  // remote_mem carries a stable copy.  Mutates plans[] for items whose
+  // buffer_index turns out unhydrated (kind = REMOTE_ZC_PREP_FAILED).
+  void PlanPeerForBatchPut(PeerConnection& peer,
+                           const std::vector<std::optional<RoutePutResult>>& routes,
+                           const std::vector<size_t>& peer_item_indices,
+                           const std::vector<std::string>& keys, const std::vector<size_t>& sizes,
+                           std::vector<BatchPutItemPlan>& plans, FusedBucket& out_bucket);
+
+  // Phase 1 submit.  Calls IssueBatchWrite under fire-and-return contract.
+  // Sets bucket.submitted[k]=true for each pair successfully posted; on
+  // exception during prep (uid alloc / vector resize / engine error) the
+  // remaining pairs stay submitted=false and Phase 3 routes their items
+  // straight to pending_aborts.
+  void SubmitFusedBucket(FusedBucket& bucket);
+
+  // Phase 3 helpers.  Stateless w.r.t. PoolClient (declared static); the
+  // signature deliberately excludes PeerConnection& - structural
+  // enforcement that no peer.dram_memories[] access leaks past Phase 1.
+  static void WaitFusedBucket(FusedBucket& bucket);
+  // Bucket is non-const because TransferStatus::Succeeded() / Message()
+  // are non-const (they may poll progress callbacks); MapBucketFailures
+  // does not actually mutate per-pair state besides reading status.
+  static void MapBucketFailures(FusedBucket& bucket, const std::vector<BatchPutItemPlan>& plans,
+                                std::vector<bool>& results,
+                                std::vector<MasterClient::BatchAbortEntry>& pending_aborts);
+
+  // Test seam for BatchPut RDMA fusion failure injection.  Forwards to
+  // io_engine_->BatchWrite under release builds; in MORI_UMBP_TESTING
+  // builds it is `virtual` so a test subclass can override and synthesize
+  // pair-level failures (see test_pool_client_batch_put_fused.cpp
+  // PartialPairFailure).  See obs_counters.h for the build-mode contract.
+  MORI_UMBP_TEST_VIRTUAL void IssueBatchWrite(const mori::io::MemDescVec& local_src,
+                                              const mori::io::BatchSizeVec& local_offsets,
+                                              const mori::io::MemDescVec& remote_dest,
+                                              const mori::io::BatchSizeVec& remote_offsets,
+                                              const mori::io::BatchSizeVec& sizes,
+                                              mori::io::TransferStatusPtrVec& statuses,
+                                              mori::io::TransferUniqueIdVec& ids);
   bool EnsurePeerServiceConnection(PeerConnection& peer);
   bool RemoteSsdWrite(PeerConnection& peer, const std::string& key, const void* src, size_t size,
                       bool zero_copy, uint32_t store_index = 0,
@@ -245,18 +360,24 @@ class PoolClient {
   mutable std::mutex cache_mutex_;
   std::unordered_map<std::string, Location> cluster_locations_;
 
-  // Observability counters.  See header-top MORI_UMBP_OBS_COUNTERS macro
-  // in obs_counters.h; declared unconditionally so class layout does not
-  // differ between release and test builds.
+  // Observability counters.  See MORI_UMBP_TESTING macro in
+  // obs_counters.h; declared unconditionally so class layout (atomics +
+  // getters) is ABI-stable between release and test builds; only the
+  // increment call sites are gated.
   std::atomic<uint64_t> abort_allocation_calls_{0};
   std::atomic<uint64_t> batch_abort_allocation_calls_{0};
   std::atomic<uint64_t> batch_abort_allocation_entries_{0};
+  // BatchPut fusion counters.
+  std::atomic<uint64_t> batch_put_calls_{0};
+  std::atomic<uint64_t> batch_put_items_{0};
+  std::atomic<uint64_t> batch_put_io_engine_calls_{0};
+  std::atomic<uint64_t> batch_put_io_engine_pairs_{0};
 
   // Throttle state for the batch-level WARN emitted when BatchPut sees
-  // an unregistered src and falls back to the per-item staging path
-  // (distributed-known-issues.md #12).  Per-instance so unit tests get
-  // fresh state with each fresh PoolClient.  Stores the steady_clock
-  // ns timestamp of the last emitted warning; 0 means "never emitted".
+  // an unregistered src and falls back to the per-item staging path.
+  // Per-instance so unit tests get fresh state with each fresh
+  // PoolClient.  Stores the steady_clock ns timestamp of the last
+  // emitted warning; 0 means "never emitted".
   std::atomic<int64_t> last_batch_put_staging_warn_ns_{0};
   bool ShouldEmitBatchPutStagingWarn();
 };

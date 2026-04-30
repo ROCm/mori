@@ -184,8 +184,7 @@ bool ClientRegistry::RegisterClient(
   // Build a per-tier PageBitmapAllocator for every DRAM/HBM tier that has
   // non-zero advertised capacity.  The Client may request a per-node
   // page_size at registration time; 0 falls back to the registry-wide
-  // default (refactor-master-page-allocator.md §10 / Q6 — same value for
-  // DRAM & HBM).
+  // default (same value for DRAM & HBM).
   const uint64_t effective_page_size =
       (dram_page_size > 0) ? dram_page_size : config_.default_dram_page_size;
   for (auto check_tier : {TierType::HBM, TierType::DRAM}) {

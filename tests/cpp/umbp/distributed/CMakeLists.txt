@@ -104,6 +104,31 @@ target_link_libraries(
 add_test(NAME umbp_pool_client_batch_put
          COMMAND test_umbp_pool_client_batch_put)
 
+add_executable(test_umbp_pool_client_batch_put_fused
+               test_pool_client_batch_put_fused.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_umbp_pool_client_batch_put_fused PRIVATE
+                      -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  test_umbp_pool_client_batch_put_fused
+  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
+          gtest_main)
+add_test(NAME umbp_pool_client_batch_put_fused
+         COMMAND test_umbp_pool_client_batch_put_fused)
+
+# PoolClient::BatchPut micro-bench (standalone executable, not a CTest target).
+# Reports items_per_pair / wall_ms / GiB/s; useful for integration regression
+# tracking and NIC tuning.
+add_executable(bench_umbp_pool_client_batch_put bench_pool_client_batch_put.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(bench_umbp_pool_client_batch_put PRIVATE
+                      -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  bench_umbp_pool_client_batch_put
+  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB})
+
 add_executable(test_umbp_master_client_lifecycle
                test_master_client_lifecycle.cpp)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")

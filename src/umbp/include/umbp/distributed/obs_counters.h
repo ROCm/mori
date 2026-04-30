@@ -21,20 +21,36 @@
 // SOFTWARE.
 #pragma once
 
-// Observability counter gate.  Release build leaves MORI_UMBP_OBS_COUNTERS
-// undefined and increments compile away to (void)0 — zero CPU cost.  Tests
-// and benches enable it via target_compile_definitions(MORI_UMBP_OBS_COUNTERS).
+// Test/bench-only build switch (renamed from MORI_UMBP_OBS_COUNTERS in v2.1.2).
 //
-// Atomic counter members and their public getters are declared
-// unconditionally (ABI stable across test/release builds); only the
-// increment call sites are gated.  Usage:
+// MORI_UMBP_TESTING covers TWO orthogonal responsibilities, gated by the same
+// macro because both are exercised only by the same downstream targets:
 //
+//   1. Observability counter increments.  Atomic counter members and their
+//      public getters are declared unconditionally (ABI stable across
+//      test/release builds); only the increment call sites are gated, so
+//      release builds pay zero CPU cost and getters return 0.
+//
+//   2. Test seams.  Selected private members (e.g. PoolClient::IssueBatchWrite)
+//      are declared `virtual` only when the macro is defined, allowing test
+//      subclasses to inject failures.  Release builds keep them as plain
+//      members for inlining.
+//
+// Build implication: test/release object files MUST NOT be mixed-linked.
+// Toggling MORI_UMBP_TESTING changes class layout (vtable presence) and ABI.
+// The CI test target builds with -DMORI_UMBP_TESTING=ON unconditionally;
+// production release leaves it OFF.
+//
+// Usage:
 //   MORI_UMBP_OBS_INC(some_counter_);
 //   MORI_UMBP_OBS_ADD(some_counter_, n);
-#ifdef MORI_UMBP_OBS_COUNTERS
+//   MORI_UMBP_TEST_VIRTUAL void Foo();   // virtual under -DMORI_UMBP_TESTING
+#ifdef MORI_UMBP_TESTING
 #define MORI_UMBP_OBS_INC(counter) (counter).fetch_add(1, std::memory_order_relaxed)
 #define MORI_UMBP_OBS_ADD(counter, n) (counter).fetch_add((n), std::memory_order_relaxed)
+#define MORI_UMBP_TEST_VIRTUAL virtual
 #else
 #define MORI_UMBP_OBS_INC(counter) ((void)0)
 #define MORI_UMBP_OBS_ADD(counter, n) ((void)0)
+#define MORI_UMBP_TEST_VIRTUAL
 #endif
