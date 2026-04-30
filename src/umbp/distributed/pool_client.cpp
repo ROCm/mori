@@ -548,14 +548,7 @@ bool PoolClient::Get(const std::string& key, void* dst, size_t size) {
       return true;
     }
 
-    const auto& first_bd = result->dram_memory_descs.empty()
-                               ? std::vector<uint8_t>{}
-                               : result->dram_memory_descs.front().desc_bytes;
-    const uint32_t first_bd_idx = result->dram_memory_descs.empty()
-                                      ? parsed->pages.front().buffer_index
-                                      : result->dram_memory_descs.front().buffer_index;
-    auto& peer = GetOrConnectPeer(loc.node_id, result->peer_address, result->engine_desc_bytes,
-                                  first_bd, first_bd_idx);
+    auto& peer = GetOrConnectPeer(loc.node_id, result->peer_address, result->engine_desc_bytes);
     EnsureBufferDescsCached(peer, result->dram_memory_descs);
     // zero_copy=true: try registered DRAM region first, fall back to staging
     // (with `staging_buffer_size` cap) only when caller did not pre-register.
@@ -569,10 +562,9 @@ bool PoolClient::Get(const std::string& key, void* dst, size_t size) {
   }
 
   if (loc.tier == TierType::SSD) {
-    // SSD path: dram_memory_descs list is empty for SSD tier; use the legacy
-    // GetOrConnectPeer signature which only relies on engine_desc_bytes.
-    auto& peer = GetOrConnectPeer(loc.node_id, result->peer_address, result->engine_desc_bytes,
-                                  /*dram_memory_desc_bytes=*/{});
+    // SSD path: dram_memory_descs list is empty for SSD tier; only the
+    // engine_desc is needed to establish the IOEngine endpoint.
+    auto& peer = GetOrConnectPeer(loc.node_id, result->peer_address, result->engine_desc_bytes);
     bool ok = RemoteSsdRead(peer, key, loc.location_id, dst, size, true);
     if (ok) {
       master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_GET_BYTES_TOTAL,
@@ -671,14 +663,7 @@ bool PoolClient::Put(const std::string& key, const void* src, size_t size) {
     // Hydrate every buffer's MemoryDesc up front from the response's
     // dram_memory_descs list (deduplicated, ascending), then issue a single
     // scatter-gather BatchWrite covering every page.
-    const auto& first_bd = result->dram_memory_descs.empty()
-                               ? std::vector<uint8_t>{}
-                               : result->dram_memory_descs.front().desc_bytes;
-    const uint32_t first_bd_idx = result->dram_memory_descs.empty()
-                                      ? result->pages.front().buffer_index
-                                      : result->dram_memory_descs.front().buffer_index;
-    auto& peer = GetOrConnectPeer(result->node_id, result->peer_address, result->engine_desc_bytes,
-                                  first_bd, first_bd_idx);
+    auto& peer = GetOrConnectPeer(result->node_id, result->peer_address, result->engine_desc_bytes);
     EnsureBufferDescsCached(peer, result->dram_memory_descs);
     // zero_copy=true: try registered DRAM region first, fall back to staging
     // (with `staging_buffer_size` cap) only when caller did not pre-register.
@@ -863,13 +848,7 @@ std::vector<bool> PoolClient::BatchPut(const std::vector<std::string>& keys,
             "buffer to enable zero-copy batch.",
             keys[i]);
       }
-      const auto& first_bd = r.dram_memory_descs.empty() ? std::vector<uint8_t>{}
-                                                         : r.dram_memory_descs.front().desc_bytes;
-      const uint32_t first_bd_idx = r.dram_memory_descs.empty()
-                                        ? r.pages.front().buffer_index
-                                        : r.dram_memory_descs.front().buffer_index;
-      auto& peer =
-          GetOrConnectPeer(r.node_id, r.peer_address, r.engine_desc_bytes, first_bd, first_bd_idx);
+      auto& peer = GetOrConnectPeer(r.node_id, r.peer_address, r.engine_desc_bytes);
       EnsureBufferDescsCached(peer, r.dram_memory_descs);
       // zero_copy=true: prefer pre-registered host buffers; staging fallback
       // remains for callers that did not register.
@@ -1080,13 +1059,7 @@ std::vector<bool> PoolClient::BatchGet(const std::vector<std::string>& keys,
       continue;
     }
 
-    const auto& first_bd = r.dram_memory_descs.empty() ? std::vector<uint8_t>{}
-                                                       : r.dram_memory_descs.front().desc_bytes;
-    const uint32_t first_bd_idx = r.dram_memory_descs.empty()
-                                      ? parsed->pages.front().buffer_index
-                                      : r.dram_memory_descs.front().buffer_index;
-    auto& peer =
-        GetOrConnectPeer(loc.node_id, r.peer_address, r.engine_desc_bytes, first_bd, first_bd_idx);
+    auto& peer = GetOrConnectPeer(loc.node_id, r.peer_address, r.engine_desc_bytes);
     EnsureBufferDescsCached(peer, r.dram_memory_descs);
     // zero_copy=true: prefer pre-registered host buffers; staging fallback
     // remains for callers that did not register.
@@ -1149,24 +1122,11 @@ bool PoolClient::MatchExternalKv(const std::vector<std::string>& hashes,
 
 PoolClient::PeerConnection& PoolClient::GetOrConnectPeer(
     const std::string& node_id, const std::string& peer_address,
-    const std::vector<uint8_t>& engine_desc_bytes,
-    const std::vector<uint8_t>& dram_memory_desc_bytes, uint32_t buffer_index) {
+    const std::vector<uint8_t>& engine_desc_bytes) {
   std::lock_guard<std::mutex> lock(peers_mutex_);
   auto it = peers_.find(node_id);
   if (it != peers_.end()) {
-    // Ensure dram_memories vector has the requested index populated
-    auto& peer = *it->second;
-    if (!dram_memory_desc_bytes.empty()) {
-      if (buffer_index >= peer.dram_memories.size()) {
-        peer.dram_memories.resize(buffer_index + 1);
-      }
-      if (!IsValidMemoryDesc(peer.dram_memories[buffer_index])) {
-        auto handle = msgpack::unpack(reinterpret_cast<const char*>(dram_memory_desc_bytes.data()),
-                                      dram_memory_desc_bytes.size());
-        peer.dram_memories[buffer_index] = handle.get().as<mori::io::MemoryDesc>();
-      }
-    }
-    return peer;
+    return *it->second;
   }
 
   auto peer = std::make_unique<PeerConnection>();
@@ -1179,13 +1139,6 @@ PoolClient::PeerConnection& PoolClient::GetOrConnectPeer(
     io_engine_->RegisterRemoteEngine(peer->engine_desc);
     peer->engine_registered = true;
     MORI_UMBP_INFO("[PoolClient] Registered remote engine for node '{}'", node_id);
-  }
-
-  if (!dram_memory_desc_bytes.empty()) {
-    peer->dram_memories.resize(buffer_index + 1);
-    auto handle = msgpack::unpack(reinterpret_cast<const char*>(dram_memory_desc_bytes.data()),
-                                  dram_memory_desc_bytes.size());
-    peer->dram_memories[buffer_index] = handle.get().as<mori::io::MemoryDesc>();
   }
 
   // PeerService connection (stub + staging MemoryDesc) is lazy-initialized
@@ -1231,16 +1184,24 @@ bool PoolClient::RemoteDramWrite(PeerConnection& peer, uint32_t buffer_index, co
                     config_.staging_buffer_size);
     return false;
   }
-  if (buffer_index >= peer.dram_memories.size() ||
-      !IsValidMemoryDesc(peer.dram_memories[buffer_index])) {
-    MORI_UMBP_ERROR("[PoolClient] RemoteDramWrite: invalid buffer_index {} (size={}, valid={})",
-                    buffer_index, peer.dram_memories.size(),
-                    buffer_index < peer.dram_memories.size()
-                        ? IsValidMemoryDesc(peer.dram_memories[buffer_index])
-                        : false);
-    return false;
+  // Snapshot the remote MemoryDesc under peers_mutex_ so subsequent RDMA does
+  // not race with concurrent EnsureBufferDescsCached resize on dram_memories.
+  // MemoryDesc is immutable ("once cached, never overwrite"), so a value copy
+  // remains valid for the lifetime of this call.
+  mori::io::MemoryDesc remote_mem;
+  {
+    std::lock_guard<std::mutex> lock(peers_mutex_);
+    if (buffer_index >= peer.dram_memories.size() ||
+        !IsValidMemoryDesc(peer.dram_memories[buffer_index])) {
+      MORI_UMBP_ERROR("[PoolClient] RemoteDramWrite: invalid buffer_index {} (size={}, valid={})",
+                      buffer_index, peer.dram_memories.size(),
+                      buffer_index < peer.dram_memories.size()
+                          ? IsValidMemoryDesc(peer.dram_memories[buffer_index])
+                          : false);
+      return false;
+    }
+    remote_mem = peer.dram_memories[buffer_index];
   }
-  auto& remote_mem = peer.dram_memories[buffer_index];
 
   if (zero_copy) {
     auto reg = FindRegisteredMemory(src, size);
@@ -1290,16 +1251,24 @@ bool PoolClient::RemoteDramRead(PeerConnection& peer, uint32_t buffer_index, voi
                     config_.staging_buffer_size);
     return false;
   }
-  if (buffer_index >= peer.dram_memories.size() ||
-      !IsValidMemoryDesc(peer.dram_memories[buffer_index])) {
-    MORI_UMBP_ERROR("[PoolClient] RemoteDramRead: invalid buffer_index {} (size={}, valid={})",
-                    buffer_index, peer.dram_memories.size(),
-                    buffer_index < peer.dram_memories.size()
-                        ? IsValidMemoryDesc(peer.dram_memories[buffer_index])
-                        : false);
-    return false;
+  // Snapshot the remote MemoryDesc under peers_mutex_ so subsequent RDMA does
+  // not race with concurrent EnsureBufferDescsCached resize on dram_memories.
+  // MemoryDesc is immutable ("once cached, never overwrite"), so a value copy
+  // remains valid for the lifetime of this call.
+  mori::io::MemoryDesc remote_mem;
+  {
+    std::lock_guard<std::mutex> lock(peers_mutex_);
+    if (buffer_index >= peer.dram_memories.size() ||
+        !IsValidMemoryDesc(peer.dram_memories[buffer_index])) {
+      MORI_UMBP_ERROR("[PoolClient] RemoteDramRead: invalid buffer_index {} (size={}, valid={})",
+                      buffer_index, peer.dram_memories.size(),
+                      buffer_index < peer.dram_memories.size()
+                          ? IsValidMemoryDesc(peer.dram_memories[buffer_index])
+                          : false);
+      return false;
+    }
+    remote_mem = peer.dram_memories[buffer_index];
   }
-  auto& remote_mem = peer.dram_memories[buffer_index];
 
   if (zero_copy) {
     auto reg = FindRegisteredMemory(dst, size);
@@ -1432,19 +1401,32 @@ bool PoolClient::RemoteDramScatterWrite(PeerConnection& peer,
 
   auto groups = GroupPagesByBuffer(pages);
   const size_t N = groups.size();
-  mori::io::MemDescVec local_descs(N, local_mem);
+
+  // Snapshot remote MemoryDescs under peers_mutex_ to avoid racing with
+  // concurrent EnsureBufferDescsCached resize on dram_memories.  MemoryDesc
+  // is immutable ("once cached, never overwrite"), so value copies remain
+  // valid for the rest of this call.
   mori::io::MemDescVec remote_descs;
-  mori::io::BatchSizeVec local_offsets(N), remote_offsets(N), sizes_v(N);
   remote_descs.reserve(N);
+  {
+    std::lock_guard<std::mutex> lock(peers_mutex_);
+    for (size_t k = 0; k < N; ++k) {
+      const auto& g = groups[k];
+      if (g.buffer_index >= peer.dram_memories.size() ||
+          !IsValidMemoryDesc(peer.dram_memories[g.buffer_index])) {
+        MORI_UMBP_ERROR("[PoolClient] ScatterWrite: buffer_index {} not hydrated on peer",
+                        g.buffer_index);
+        return false;
+      }
+      remote_descs.push_back(peer.dram_memories[g.buffer_index]);
+    }
+  }
+
+  // Build local/remote offsets and per-pair sizes off-lock.
+  mori::io::MemDescVec local_descs(N, local_mem);
+  mori::io::BatchSizeVec local_offsets(N), remote_offsets(N), sizes_v(N);
   for (size_t k = 0; k < N; ++k) {
     const auto& g = groups[k];
-    if (g.buffer_index >= peer.dram_memories.size() ||
-        !IsValidMemoryDesc(peer.dram_memories[g.buffer_index])) {
-      MORI_UMBP_ERROR("[PoolClient] ScatterWrite: buffer_index {} not hydrated on peer",
-                      g.buffer_index);
-      return false;
-    }
-    remote_descs.push_back(peer.dram_memories[g.buffer_index]);
     auto& l_off = local_offsets[k];
     auto& r_off = remote_offsets[k];
     auto& sz = sizes_v[k];
@@ -1532,19 +1514,32 @@ bool PoolClient::RemoteDramScatterRead(PeerConnection& peer, const std::vector<P
 
   auto groups = GroupPagesByBuffer(pages);
   const size_t N = groups.size();
-  mori::io::MemDescVec local_descs(N, local_mem);
+
+  // Snapshot remote MemoryDescs under peers_mutex_ to avoid racing with
+  // concurrent EnsureBufferDescsCached resize on dram_memories.  MemoryDesc
+  // is immutable ("once cached, never overwrite"), so value copies remain
+  // valid for the rest of this call.
   mori::io::MemDescVec remote_descs;
-  mori::io::BatchSizeVec local_offsets(N), remote_offsets(N), sizes_v(N);
   remote_descs.reserve(N);
+  {
+    std::lock_guard<std::mutex> lock(peers_mutex_);
+    for (size_t k = 0; k < N; ++k) {
+      const auto& g = groups[k];
+      if (g.buffer_index >= peer.dram_memories.size() ||
+          !IsValidMemoryDesc(peer.dram_memories[g.buffer_index])) {
+        MORI_UMBP_ERROR("[PoolClient] ScatterRead: buffer_index {} not hydrated on peer",
+                        g.buffer_index);
+        return false;
+      }
+      remote_descs.push_back(peer.dram_memories[g.buffer_index]);
+    }
+  }
+
+  // Build local/remote offsets and per-pair sizes off-lock.
+  mori::io::MemDescVec local_descs(N, local_mem);
+  mori::io::BatchSizeVec local_offsets(N), remote_offsets(N), sizes_v(N);
   for (size_t k = 0; k < N; ++k) {
     const auto& g = groups[k];
-    if (g.buffer_index >= peer.dram_memories.size() ||
-        !IsValidMemoryDesc(peer.dram_memories[g.buffer_index])) {
-      MORI_UMBP_ERROR("[PoolClient] ScatterRead: buffer_index {} not hydrated on peer",
-                      g.buffer_index);
-      return false;
-    }
-    remote_descs.push_back(peer.dram_memories[g.buffer_index]);
     auto& l_off = local_offsets[k];
     auto& r_off = remote_offsets[k];
     auto& sz = sizes_v[k];
