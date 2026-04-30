@@ -1,0 +1,14 @@
+---
+description: Keep SDMA perf work moving without waiting for repeated user nudges
+alwaysApply: true
+---
+
+# 不许停在“等用户催”
+
+用户已明确要求：不要反复停下来等催促。涉及 SDMA AllReduce 性能任务时：
+
+- 每轮回复前必须已经推进一个具体动作：改代码、改脚本、记录 ledger、提交/推送用户明确要求过的工作，或给出下一条可直接运行的测试。
+- 如果上一轮拿到测试结果，下一步必须立刻做三件事：量化 gap、写入 `docs/perf_history.md` / `.cursor/rules/ar-sdma-state.mdc`、按收益最高的方向继续实现或加打点。
+- 已证伪方向必须关闭并加 guard，不能继续让用户重复跑会挂或无效的命令。
+- 除非更高优先级规则要求等待确认，不要用“是否继续/要不要我做”作为结尾；直接执行下一步。
+- 若系统/工具限制导致不能跑远端测试，必须把 repo 内脚本更新到用户一条命令可跑，并继续做本地可完成的代码/文档推进。

@@ -374,6 +374,22 @@ Therefore final target still requires both: eliminate/hide output
 materialization and fix SDMA two-shot cadence/overlap. Copy-only optimization
 cannot close the continuous gap alone.
 
+### Local SDMA output copy implemented (Entry 60)
+
+`MORI_OUTPUT_SDMA_COPY=1` replaces `copy_output_to_user()`'s external
+`hipMemcpyAsync`/CU copy with an internal one-block local SDMA copy from the
+final symmetric transit buffer to the user output pointer.
+
+Why first:
+- Entry 59 finite GPU copy wall = **0.383 ms**
+- Entry 59 continuous copy penalty = **0.613 ms**
+- Entry 59 continuous no-copy cadence gap = **0.455 ms**
+
+Expected best-case gain is about `0.383 ms`; this is not enough to beat RCCL
+alone, but it is the highest-value drop-in subproblem and preserves user API.
+Next run must compare `BASELINE` vs `SDMA_OUTPUT_COPY`; keep only if wall
+improves, otherwise revert and record.
+
 ### Integer reduce fast path (Entry 50)
 
 `uint32/int32` pipeline reduce now accumulates in packed integer registers
@@ -505,6 +521,8 @@ Latest script update also runs finite `BASELINE_PHASE_STAGE0` copy timing by
 default (`RUN_PHASE_TIMING=1`).
 Entry 59 data shows finite output copy GPU wall is `0.383 ms` and continuous
 target gap is still `+1.068 ms`.
+Entry 60 adds `MORI_OUTPUT_SDMA_COPY=1`; `tools/bench_sdma_ag_copy_pipe.sh`
+runs `SDMA_OUTPUT_COPY` by default.
 
 `MORI_DIRECT_OUTPUT=1` 激活 Plan A v2 path; 不开则走 BASELINE.
 `MORI_SDMA_AG_COPY_PIPE=1` 激活 K1 scatter + K2 R-reduce / SDMA-AG / C-copy pipeline.

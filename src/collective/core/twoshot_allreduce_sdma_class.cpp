@@ -64,6 +64,11 @@ inline bool UseCopyKernel() {
     return e && e[0] == '1' && e[1] == '\0';
 }
 
+inline bool UseSdmaOutputCopy() {
+    const char* e = std::getenv("MORI_OUTPUT_SDMA_COPY");
+    return e && e[0] == '1' && e[1] == '\0';
+}
+
 inline bool SdmaSeparateAgBuffer() {
     const char* e = std::getenv("MORI_SEPARATE_AG_BUFFER");
     return e && e[0] == '1' && e[1] == '\0';
@@ -111,6 +116,36 @@ __global__ void D2DVectorCopyKernel(const void* __restrict__ src_void,
             dst_b[i] = src_b[i];
         }
     }
+}
+
+__global__ void SdmaLocalOutputCopyKernel(const application::SymmMemObjPtr srcObj,
+                                          void* __restrict__ dst_void,
+                                          size_t bytes,
+                                          int myPe) {
+    const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const uint32_t numQ = srcObj->sdmaNumQueue < 64u ? srcObj->sdmaNumQueue : 64u;
+    if (numQ == 0) return;
+    if (tid >= static_cast<size_t>(numQ) || bytes == 0) return;
+
+    const uint32_t qId = static_cast<uint32_t>(tid);
+    const size_t chunk = bytes / static_cast<size_t>(numQ);
+    const size_t offset = static_cast<size_t>(qId) * chunk;
+    const size_t copy_bytes =
+        (qId + 1 == numQ) ? (bytes - offset) : chunk;
+
+    anvil::SdmaQueueDeviceHandle** dh =
+        srcObj->deviceHandles_d + static_cast<size_t>(myPe) * numQ;
+    HSAuint64* signal =
+        srcObj->signalPtrs + static_cast<size_t>(myPe) * numQ;
+    uint8_t* src = reinterpret_cast<uint8_t*>(srcObj->localPtr) + offset;
+    uint8_t* dst = reinterpret_cast<uint8_t*>(dst_void) + offset;
+
+    core::SdmaPutThread(src, dst, copy_bytes, dh, signal, numQ, qId);
+    HSAuint64 expected =
+        __hip_atomic_fetch_add(
+            srcObj->expectSignalsPtr + static_cast<size_t>(myPe) * numQ + qId,
+            1ULL, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) + 1ULL;
+    anvil::waitForSignal(signal + qId, expected);
 }
 
 }  // namespace
@@ -606,8 +641,10 @@ void AllreduceSdma<T>::copy_output_to_user(T* output, size_t total_count, hipStr
   size_t bytes = total_count * dtype_size_;
   if (!output) throw std::runtime_error("Output pointer is null");
   if (!output_transit_buffer_) throw std::runtime_error("Output transit buffer is null");
-  void* copy_src = (SdmaSeparateAgBuffer() && input_transit_buffer_ != nullptr)
-      ? input_transit_buffer_ : output_transit_buffer_;
+  const bool use_separate_ag_src = SdmaSeparateAgBuffer() && input_transit_buffer_ != nullptr;
+  void* copy_src = use_separate_ag_src ? input_transit_buffer_ : output_transit_buffer_;
+  application::SymmMemObjPtr copy_src_obj =
+      use_separate_ag_src ? input_transit_buffer_obj_ : output_transit_buffer_obj_;
 
   const bool do_timing = copy_timing_enabled_ && stream != nullptr;
   if (do_timing) {
@@ -622,7 +659,18 @@ void AllreduceSdma<T>::copy_output_to_user(T* output, size_t total_count, hipStr
                            : std::chrono::steady_clock::time_point{};
 
   hipError_t err = hipSuccess;
-  if (UseCopyKernel()) {
+  if (UseSdmaOutputCopy()) {
+    if (!copy_src_obj.IsValid()) {
+      fprintf(stderr, "PE %d: MORI_OUTPUT_SDMA_COPY source object is invalid\n", myPe_);
+      throw std::runtime_error("SDMA output copy source object invalid");
+    }
+    SdmaLocalOutputCopyKernel<<<1, 64, 0, stream>>>(
+        copy_src_obj, output, bytes, myPe_);
+    err = hipGetLastError();
+    if (err == hipSuccess && stream == nullptr) {
+      err = hipDeviceSynchronize();
+    }
+  } else if (UseCopyKernel()) {
     const uintptr_t src_addr = reinterpret_cast<uintptr_t>(copy_src);
     const uintptr_t dst_addr = reinterpret_cast<uintptr_t>(output);
     const bool aligned16 = ((src_addr | dst_addr | bytes) & (sizeof(uint4) - 1)) == 0;

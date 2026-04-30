@@ -4,7 +4,8 @@
 #
 # Env overrides:
 #   REPO=/home/fizhang/test/mori SIZE_MB=256 NUM_STAGES=4 CONTINUOUS_ITERS=100 \
-#   PIPELINE_CU=224 PIPELINE_CHUNKS=4 RUN_PIPE=0 PIPE_NRS="112 144 176 200" \
+#   PIPELINE_CU=224 PIPELINE_CHUNKS=4 RUN_OUTPUT_SDMA_COPY=1 \
+#   RUN_PIPE=0 PIPE_NRS="112 144 176 200" \
 #   RUN_PHASE_TIMING=1 PHASE_ITERATIONS=20 PHASE_WARMUP=5 \
 #   SKIP_PULL=0 SKIP_BUILD=0 bash tools/bench_sdma_ag_copy_pipe.sh
 #
@@ -25,6 +26,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${CONTINUOUS_ITERS:=100}"
 : "${PIPELINE_CU:=224}"
 : "${PIPELINE_CHUNKS:=4}"
+: "${RUN_OUTPUT_SDMA_COPY:=1}"
 : "${RUN_PIPE:=0}"
 : "${PIPE_NRS:=112 144 176 200}"
 : "${RUN_PHASE_TIMING:=1}"
@@ -59,7 +61,7 @@ rocm-smi --showproductname 2>&1 | head -8 || true
 git rev-parse --abbrev-ref HEAD
 git log -1 --oneline
 git status --short || true
-echo "SIZE_MB=$SIZE_MB NUM_STAGES=$NUM_STAGES ELEMS=$ELEMS CONTINUOUS_ITERS=$CONTINUOUS_ITERS PIPELINE_CU=$PIPELINE_CU PIPELINE_CHUNKS=$PIPELINE_CHUNKS RUN_PIPE=$RUN_PIPE PIPE_NRS=$PIPE_NRS RUN_PHASE_TIMING=$RUN_PHASE_TIMING PHASE_ITERATIONS=$PHASE_ITERATIONS PHASE_WARMUP=$PHASE_WARMUP"
+echo "SIZE_MB=$SIZE_MB NUM_STAGES=$NUM_STAGES ELEMS=$ELEMS CONTINUOUS_ITERS=$CONTINUOUS_ITERS PIPELINE_CU=$PIPELINE_CU PIPELINE_CHUNKS=$PIPELINE_CHUNKS RUN_OUTPUT_SDMA_COPY=$RUN_OUTPUT_SDMA_COPY RUN_PIPE=$RUN_PIPE PIPE_NRS=$PIPE_NRS RUN_PHASE_TIMING=$RUN_PHASE_TIMING PHASE_ITERATIONS=$PHASE_ITERATIONS PHASE_WARMUP=$PHASE_WARMUP"
 
 if [ "$SKIP_PULL" != "1" ]; then
   echo
@@ -115,6 +117,14 @@ run_phase_case() {
     MORI_PIPELINE_CU="$PIPELINE_CU" \
     MORI_PIPELINE_CHUNKS="$PIPELINE_CHUNKS"
 
+  if [ "$RUN_OUTPUT_SDMA_COPY" = "1" ]; then
+    run_case "SDMA_OUTPUT_COPY" \
+      MORI_CONTINUOUS_PREP=0 \
+      MORI_OUTPUT_SDMA_COPY=1 \
+      MORI_PIPELINE_CU="$PIPELINE_CU" \
+      MORI_PIPELINE_CHUNKS="$PIPELINE_CHUNKS"
+  fi
+
   if [ "$RUN_PIPE" = "1" ]; then
     for nr in $PIPE_NRS; do
       run_case "PIPE_NR_${nr}" \
@@ -138,6 +148,14 @@ run_phase_case() {
       MORI_PIPELINE_CU="$PIPELINE_CU" \
       MORI_PIPELINE_CHUNKS="$PIPELINE_CHUNKS" \
       MORI_PHASE_TARGET_STAGE=0
+    if [ "$RUN_OUTPUT_SDMA_COPY" = "1" ]; then
+      run_phase_case "SDMA_OUTPUT_COPY_PHASE_STAGE0" \
+        MORI_CONTINUOUS_PREP=0 \
+        MORI_OUTPUT_SDMA_COPY=1 \
+        MORI_PIPELINE_CU="$PIPELINE_CU" \
+        MORI_PIPELINE_CHUNKS="$PIPELINE_CHUNKS" \
+        MORI_PHASE_TARGET_STAGE=0
+    fi
   fi
 } | tee "$LOG"
 
@@ -170,7 +188,7 @@ awk -v size="$SIZE_MB" '
 
 echo
 echo "---- raw phase/copy lines ----"
-grep -E "MORI_SDMA_AG_COPY_PIPE|Table 1:|copy vs RCCL|Copy-path|host-side hipMemcpy|gpu-side copy|AR\\[[0-3]\\] duration|median wall" "$LOG" || true
+grep -E "MORI_OUTPUT_SDMA_COPY|MORI_SDMA_AG_COPY_PIPE|Table 1:|copy vs RCCL|Copy-path|host-side hipMemcpy|gpu-side copy|AR\\[[0-3]\\] duration|median wall" "$LOG" || true
 
 echo
 echo "LOG: $LOG"

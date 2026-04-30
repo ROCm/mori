@@ -2233,6 +2233,73 @@ Do not resume `MORI_SDMA_AG_COPY_PIPE`; it remains closed by Entry 56.
 
 ---
 
+## Entry 60 — Implement `MORI_OUTPUT_SDMA_COPY=1` internal local-SDMA output copy
+- **Date**: 2026-04-30
+- **Commit**: _this commit_
+- **Why this direction**:
+  - Entry 59 measured finite output copy GPU wall = **0.383 ms**
+  - Entry 59 measured continuous copy penalty = **0.613 ms**
+  - Entry 59 measured continuous no-copy cadence gap = **0.455 ms**
+  - Therefore replacing the CU/`hipMemcpyAsync` output materialization with
+    internal local SDMA is the highest-value drop-in subproblem that can be
+    implemented without changing user API.
+
+### Implementation
+
+Add env:
+```bash
+MORI_OUTPUT_SDMA_COPY=1
+```
+
+When enabled, `copy_output_to_user()` launches `SdmaLocalOutputCopyKernel`
+instead of `hipMemcpyAsync` or `D2DVectorCopyKernel`.
+
+Flow:
+1. Source is the current final-result symmetric buffer:
+   - `output_transit_buffer_obj_`, or
+   - `input_transit_buffer_obj_` when `MORI_SEPARATE_AG_BUFFER=1`
+2. One block uses the source object's local SDMA queues.
+3. Each queue copies a disjoint byte slice from symmetric source to the user
+   output pointer.
+4. The kernel waits on per-queue local SDMA signals before completing, so
+   existing stream ordering and copy timing events remain valid.
+
+This is drop-in: user still calls
+`AllreduceSdma(copy_output_to_user=True)(input, output, stream)` and reads the
+same `output` tensor after the call.
+
+### Test command
+
+```bash
+git pull origin sdma-test
+bash tools/bench_sdma_ag_copy_pipe.sh
+```
+
+The script now runs:
+- `BASELINE`
+- `SDMA_OUTPUT_COPY` (`MORI_OUTPUT_SDMA_COPY=1`)
+- finite phase/copy timing for both paths
+
+### Success criteria
+
+Primary:
+```text
+SDMA_OUTPUT_COPY wall < BASELINE wall
+```
+
+Expected gain from Entry 59:
+```text
+best case ~= 0.383 ms physical GPU copy wall
+continuous baseline gap 1.068 ms -> expected remaining gap ~= 0.685 ms
+```
+
+This alone is not expected to beat RCCL because Entry 59 still has a
+`+0.455 ms` no-copy cadence gap. If SDMA output copy improves wall, keep it and
+continue with cadence/algorithm work. If it regresses or hangs, revert this
+implementation and record the failure.
+
+---
+
 ## Entry 49 — Implement integer accumulator fast path for uint32/int32 pipeline reduce
 - **Date**: 2026-04-30
 - **Commit**: _this commit_
