@@ -47,7 +47,7 @@ query_rdma_devices() {
         ibv_devices 2>/dev/null | awk 'NR>2 && NF {print $1}'
     else
         ssh -o ConnectTimeout=5 "$(whoami)"@"$host" "ibv_devices 2>/dev/null" \
-            | awk '/^\s+[a-z]/ && $1 != "device" {print $1}'
+            | awk 'NR>2 && NF {print $1}'
     fi
 }
 
@@ -85,7 +85,7 @@ run_ib_bw_test() {
     fi
 
     if [[ "$check" == "true" ]]; then
-        if (( $(echo "$bw >= $BW_THRESHOLD" | bc -l) )); then
+        if awk "BEGIN{exit !($bw >= $BW_THRESHOLD)}"; then
             log_ok "$label : ${bw} Gbps"
         else
             log_fail "$label : ${bw} Gbps (threshold: ${BW_THRESHOLD} Gbps)"; return 1
@@ -122,7 +122,7 @@ run_ib_lat_test() {
         log_fail "$label : cannot parse latency"; return 1
     fi
 
-    if (( $(echo "$avg_lat <= $LAT_THRESHOLD" | bc -l) )); then
+    if awk "BEGIN{exit !($avg_lat <= $LAT_THRESHOLD)}"; then
         log_ok "$label : ${avg_lat} us"
     else
         log_fail "$label : ${avg_lat} us (threshold: ${LAT_THRESHOLD} us)"; return 1
@@ -171,41 +171,100 @@ check_qos() {
     [[ "$class_type" == "DSCP" ]] || die "classification type is '$class_type', expected 'DSCP'"
     log_ok "classification type : DSCP"
 
-    # no-drop priority
-    local nd_prio
-    nd_prio=$(echo "$qos_output" | grep "PFC no-drop priorities" | head -1 | awk '{print $NF}')
-    [[ -n "$nd_prio" ]] || die "cannot find PFC no-drop priority"
-    log_ok "no-drop priority : $nd_prio"
+    # no-drop priorities (may be a comma-separated list, e.g. "0,3")
+    local nd_prio_raw
+    nd_prio_raw=$(echo "$qos_output" | grep "PFC no-drop priorities" | head -1 | awk '{print $NF}')
+    [[ -n "$nd_prio_raw" ]] || die "cannot find PFC no-drop priority"
+    local nd_prios=()
+    IFS=',' read -ra nd_prios <<< "$nd_prio_raw"
+    log_ok "no-drop priorities : ${nd_prios[*]}"
 
-    # PFC bitmap
+    # PFC bitmap must cover every no-drop priority
     local pfc_bitmap
     pfc_bitmap=$(echo "$qos_output" | grep "PFC priority bitmap" | head -1 | awk '{print $NF}')
     [[ -n "$pfc_bitmap" && "$pfc_bitmap" != "0x0" ]] || die "PFC is not enabled (bitmap=$pfc_bitmap)"
-    (( pfc_bitmap & (1 << nd_prio) )) || die "PFC bitmap $pfc_bitmap does not cover priority $nd_prio"
-    log_ok "PFC enabled for priority $nd_prio (bitmap=$pfc_bitmap)"
+    local p
+    for p in "${nd_prios[@]}"; do
+        (( pfc_bitmap & (1 << p) )) || die "PFC bitmap $pfc_bitmap does not cover priority $p"
+    done
+    log_ok "PFC enabled for priorities ${nd_prios[*]} (bitmap=$pfc_bitmap)"
 
-    # scheduling info
-    local sched_line
-    sched_line=$(echo "$qos_output" | grep -E "^\s+${nd_prio}\s+" | head -1)
-    if [[ -n "$sched_line" ]]; then
-        log_ok "scheduling for priority $nd_prio : $(echo "$sched_line" | awk '{print $2}')  bw=$(echo "$sched_line" | awk '{print $3}')"
-    else
-        log_warn "cannot find scheduling info for priority $nd_prio"
-    fi
+    # For each no-drop priority, look up scheduling info and the DSCP list,
+    # then pick the priority with the largest bandwidth share as our RDMA SL.
+    local best_prio="" best_bw=-1 best_dscp=""
+    for p in "${nd_prios[@]}"; do
+        # Scheduling table rows look like:  "    3         DWRR        90        N/A"
+        local sched_line sched_type sched_bw
+        sched_line=$(echo "$qos_output" \
+            | grep -E "^[[:space:]]+${p}[[:space:]]+(DWRR|SP|STRICT)[[:space:]]+" \
+            | head -1)
+        if [[ -z "$sched_line" ]]; then
+            log_warn "cannot find scheduling info for priority $p"
+            continue
+        fi
+        sched_type=$(echo "$sched_line" | awk '{print $2}')
+        sched_bw=$(echo "$sched_line"   | awk '{print $3}')
+        log_ok "scheduling for priority $p : $sched_type bw=${sched_bw}%"
 
-    # DSCP -> traffic class
-    local dscp_line nd_dscp
-    dscp_line=$(echo "$qos_output" | grep "DSCP" | grep "==>" | grep -v "bitmap" | grep ": ${nd_prio}$" | head -1)
-    nd_dscp=$(echo "$dscp_line" | awk -F': ' '{print $2}' | grep -o '[0-9]*' | head -1)
-    [[ -n "$nd_dscp" ]] || die "cannot find DSCP mapped to no-drop priority $nd_prio"
+        # DSCP list lines look like:  "    DSCP                      : 24, 46 ==> priority : 0"
+        # (skip the "DSCP bitmap ..." variant)
+        local dscp_line dscp_list first_dscp
+        dscp_line=$(echo "$qos_output" \
+            | grep -E "^[[:space:]]+DSCP[[:space:]]+:" \
+            | grep -E "==>[[:space:]]+priority[[:space:]]+:[[:space:]]+${p}[[:space:]]*$" \
+            | head -1)
+        if [[ -z "$dscp_line" ]]; then
+            log_warn "cannot find DSCP list for priority $p"
+            continue
+        fi
+        # extract the chunk between "DSCP : " and " ==>"
+        dscp_list=$(echo "$dscp_line" | sed -E 's/.*DSCP[[:space:]]+:[[:space:]]*//; s/[[:space:]]*==>.*//')
+
+        # Pick a DSCP for this priority. Preference order:
+        #   1) DSCP 26 (RoCEv2 convention; also what env_setup.sh explicitly maps)
+        #   2) first concrete (non-range) token
+        #   3) first range's lower bound
+        local picked="" tok lo hi _toks=()
+        IFS=',' read -ra _toks <<< "$dscp_list"
+        for tok in "${_toks[@]}"; do
+            tok=$(echo "$tok" | tr -d ' ')
+            if [[ "$tok" == *-* ]]; then
+                lo=${tok%-*}; hi=${tok#*-}
+                if (( 26 >= lo && 26 <= hi )); then picked=26; break; fi
+            elif [[ "$tok" == "26" ]]; then
+                picked=26; break
+            fi
+        done
+        if [[ -z "$picked" ]]; then
+            for tok in "${_toks[@]}"; do
+                tok=$(echo "$tok" | tr -d ' ')
+                if [[ "$tok" != *-* && -n "$tok" ]]; then picked="$tok"; break; fi
+            done
+        fi
+        if [[ -z "$picked" ]]; then
+            tok=$(echo "$dscp_list" | awk -F',' '{print $1}' | tr -d ' ')
+            picked=${tok%-*}
+        fi
+        first_dscp="$picked"
+        if [[ -z "$first_dscp" ]]; then
+            log_warn "cannot parse DSCP list '$dscp_list' for priority $p"
+            continue
+        fi
+        log_ok "priority $p : DSCPs=[$dscp_list] -> picking DSCP $first_dscp"
+
+        if (( sched_bw > best_bw )); then
+            best_bw="$sched_bw"
+            best_prio="$p"
+            best_dscp="$first_dscp"
+        fi
+    done
+
+    [[ -n "$best_prio" ]] || die "could not derive SL/TC from QoS info"
 
     # TC = DSCP << 2 (DSCP occupies the upper 6 bits of the 8-bit TC/TOS field)
-    MORI_RDMA_SL="$nd_prio"
-    MORI_RDMA_TC=$(( nd_dscp * 4 ))
-
-    log_ok "no-drop DSCP     : $nd_dscp"
-    log_ok "traffic class    : $MORI_RDMA_TC"
-    log_ok "SL=$MORI_RDMA_SL  TC=$MORI_RDMA_TC"
+    MORI_RDMA_SL="$best_prio"
+    MORI_RDMA_TC=$(( best_dscp * 4 ))
+    log_ok "selected SL=$MORI_RDMA_SL  TC=$MORI_RDMA_TC  (priority $best_prio, DSCP $best_dscp, bw=${best_bw}%)"
 }
 
 check_dcqcn() {

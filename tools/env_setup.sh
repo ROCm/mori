@@ -24,7 +24,7 @@ die()      { echo -e "${RED}[FAIL]${NC} $*"; return 1; }
 
 query_ionic_devices() {
     local dev vendor
-    for dev in $(ibv_devices 2>/dev/null | awk '/^\s+[a-z]/ && $1 != "device" {print $1}'); do
+    for dev in $(ibv_devices 2>/dev/null | awk 'NR>2 && NF {print $1}'); do
         vendor=$(cat "/sys/class/infiniband/$dev/device/vendor" 2>/dev/null)
         [[ "$vendor" == "$IONIC_VENDOR_ID" ]] && echo "$dev"
     done
@@ -36,6 +36,30 @@ if [[ -z "$IONIC_DEVS" ]]; then
     return 2>/dev/null || exit 0
 fi
 command -v nicctl &>/dev/null || { die "ionic devices found but nicctl not available"; return 2>/dev/null || exit 1; }
+
+# Wipe all QoS configuration back to a clean "best-effort only" state.
+# Idiom adapted from the AMD Pollara 400 ops guide.
+# Self-contained — safe to call after `source env_setup.sh` has unset its helpers.
+reset_qos() {
+    local p
+    # 1) disable PFC no-drop on all 8 priorities (silently — some are already off)
+    for p in 0 1 2 3 4 5 6 7; do
+        sudo nicctl update qos pfc --priority "$p" --no-drop disable &>/dev/null
+    done
+    # 2) toggle classification type pcp <-> dscp to flush stale DSCP state
+    sudo nicctl update qos --classification-type pcp  &>/dev/null
+    sudo nicctl update qos --classification-type dscp &>/dev/null
+    # 3) collapse every DSCP back to priority 0 in a single call (range syntax)
+    if ! sudo nicctl update qos dscp-to-priority --dscp 0-63 --priority 0; then
+        echo -e "\033[0;31m[FAIL]\033[0m reset DSCP 0-63 -> priority 0 failed" >&2
+        return 1
+    fi
+    # 4) collapse scheduling so priority 0 owns the link
+    sudo nicctl update qos scheduling --priority 0,1,2,3,4,5,6,7 \
+        --dwrr 100,0,0,0,0,0,0,0 --rate-limit 0,0,0,0,0,0,0,0 &>/dev/null \
+        || echo -e "\033[0;33m[WARN]\033[0m reset scheduling failed (continuing)" >&2
+    echo -e "\033[0;32m[OK]\033[0m   QoS reset: all DSCPs -> priority 0, PFC no-drop disabled, scheduling collapsed"
+}
 
 setup_pfc() {
     sudo nicctl update qos --classification-type dscp                          || { die "set classification-type failed"; return 1; }
