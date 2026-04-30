@@ -2074,6 +2074,31 @@ placement without adding a big local copy phase.
 
 ---
 
+## Entry 53 — `MORI_FULLMESH_CHAN=1` repeat run: stable no breakthrough
+- **Date**: 2026-04-30
+- **Commit under test**: `3571144c` path (current branch)
+- **Command**: `MORI_CONTINUOUS_PREP=0 MORI_FULLMESH_CHAN=1 MORI_PIPELINE_CU=224 MORI_PIPELINE_CHUNKS=4 ... --continuous-iters 100`
+- **All correctness checks PASSED**
+
+| mode | wall | seq_ar | seq_gemm | slowdown | gap vs RCCL |
+|---|---:|---:|---:|---:|---:|
+| **SDMA copy + fullmesh chan MVP** | **7.037** | 5.238 | 4.351 | 1.617 | **+1.230** |
+| SDMA no-copy + fullmesh chan MVP | 6.399 | 4.810 | 4.224 | 1.515 | +0.592 |
+| RCCL | **5.807** | 5.151 | 4.121 | 1.409 | — |
+
+### Interpretation
+
+This repeat is more favorable than Entry 52's first run (copy 7.037 vs 7.400),
+but still fails COPY VS RCCL by **+1.23 ms** and is still not better than the
+best existing copy stack (Entry 48: 6.817). No-copy remains near the known best
+range but still trails RCCL by ~0.6 ms.
+
+The conclusion is unchanged: the current `FullMeshChannelizedAllReduceKernel`
+is correctness-valid but too simple. It still has a per-chunk local copy/output
+phase and does not create the balanced service cadence RCCL achieves.
+
+---
+
 ## Entry 40 — Implement experimental multi-q SDMA AG (`MORI_MULTI_Q_AG=1`)
 - **Date**: 2026-04-29
 - **Commit**: _this commit_

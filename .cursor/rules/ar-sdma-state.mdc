@@ -257,6 +257,10 @@ closed as standalone optimization.
 copy wall 7.400, no-copy 6.413, RCCL 5.801. It is not sufficient, but remains
 the base for any future fullmesh channelized algorithm work.
 
+Repeat run (Entry 53): copy 7.037, no-copy 6.399, RCCL 5.807. Better than the
+first run but still fails COPY VS RCCL by +1.23ms and remains worse than best
+copy stack (Entry 48: 6.817).
+
 ### Integer reduce fast path (Entry 50)
 
 `uint32/int32` pipeline reduce now accumulates in packed integer registers
