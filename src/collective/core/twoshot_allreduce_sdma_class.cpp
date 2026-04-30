@@ -662,12 +662,12 @@ void AllreduceSdma<T>::copy_output_to_user(T* output, size_t total_count, hipStr
 // ---------------------------------------------------------------------------
 template <typename T>
 bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count, hipStream_t stream) {
-  static const bool fused = []() {
+  static const bool fused = []() -> bool {
       if (const char* e = std::getenv("MORI_FULLMESH_PIPE")) {
           if (std::atoi(e) == 1) return true;
       }
       const char* e = std::getenv("MORI_PIPELINE_FUSED");
-      return e && std::atoi(e) == 1;
+      return e != nullptr && std::atoi(e) == 1;
   }();
   return pipelined(input, output, total_count, 0, 0, stream,
                    /*external_scatter=*/!fused);
@@ -995,9 +995,9 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         uint64_t scatter_base = pipeline_scatter_gen_;
         uint64_t ag_base      = pipeline_ag_gen_;
         uint64_t reduce_complete_base = pipeline_reduce_gen_;
-        const bool multi_q_ag = []() {
+        const bool multi_q_ag = []() -> bool {
             const char* e = std::getenv("MORI_MULTI_Q_AG");
-            return e && std::atoi(e) == 1;
+            return e != nullptr && std::atoi(e) == 1;
         }();
         if (multi_q_ag && pipeline_ag_gen_by_q_d_ != nullptr) {
             hipError_t gen_copy = hipMemcpyAsync(
@@ -1046,13 +1046,13 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         // and CU XGMI push is slower than SDMA AG.
         const bool use_plan_a = direct_output_enabled_
             && copy_output_to_user_ && multi_chunk;
-        const bool use_fullmesh_chan = []() {
+        const bool use_fullmesh_chan = []() -> bool {
             const char* e = std::getenv("MORI_FULLMESH_CHAN");
-            return e && std::atoi(e) == 1;
+            return e != nullptr && std::atoi(e) == 1;
         }() && copy_output_to_user_ && multi_chunk && scatter_mode == 0;
-        const bool use_sdma_ag_copy_pipe = []() {
+        const bool use_sdma_ag_copy_pipe = []() -> bool {
             const char* e = std::getenv("MORI_SDMA_AG_COPY_PIPE");
-            return e && std::atoi(e) == 1;
+            return e != nullptr && std::atoi(e) == 1;
         }() && copy_output_to_user_ && multi_chunk && scatter_mode == 0;
         bool skip_external_copy = use_plan_a || use_fullmesh_chan || use_sdma_ag_copy_pipe;
 
