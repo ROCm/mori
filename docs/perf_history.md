@@ -2350,6 +2350,72 @@ baseline.
 
 ---
 
+## Entry 62 — Guarded baseline after Entry 61 fix remains stable; copy wall 0.354 ms
+- **Date**: 2026-04-30
+- **Commit under test**: `4ca2d7f8`
+- **Command**: `bash tools/bench_sdma_ag_copy_pipe.sh`
+- **Log**: `/tmp/perf_sdma_ag_copy_pipe_1777563973.log`
+- **Config**: default guarded script (`RUN_OUTPUT_SDMA_COPY=0`,
+  `RUN_PIPE=0`, `RUN_PHASE_TIMING=1`), `MORI_CONTINUOUS_PREP=0`,
+  `MORI_PIPELINE_CU=224`, `MORI_PIPELINE_CHUNKS=4`
+
+### Continuous result
+
+| mode | wall | slowdown | seq_ar | seq_gemm | gap vs RCCL |
+|---|---:|---:|---:|---:|---:|
+| **SDMA copy** | **6.875** | 1.577 | 5.241 | 4.359 | **+1.053** |
+| SDMA no-copy | 6.259 | 1.476 | 4.821 | 4.240 | +0.437 |
+| RCCL | 5.822 | 1.413 | 5.127 | 4.120 | — |
+
+Continuous decomposition:
+```text
+SDMA copy - RCCL    = 6.875 - 5.822 = +1.053 ms
+SDMA no-copy - RCCL = 6.259 - 5.822 = +0.437 ms
+SDMA copy - no-copy = 6.875 - 6.259 = +0.616 ms
+```
+
+### Finite phase/copy result
+
+| mode | wall | slowdown | seq_ar | seq_gemm | gap vs RCCL |
+|---|---:|---:|---:|---:|---:|
+| **SDMA copy** | **7.768** | 2.114 | 5.218 | 3.674 | **+0.355** |
+| SDMA no-copy | 7.285 | 1.981 | 4.806 | 3.678 | -0.128 |
+| RCCL | 7.413 | 2.018 | 5.127 | 3.673 | — |
+
+Copy timing:
+```text
+host-side hipMemcpyAsync() call: 3.50 us
+gpu-side copy kernel wall:      0.354 ms
+```
+
+### Interpretation
+
+This run validates the Entry 61 guard: default script no longer enters
+`MORI_OUTPUT_SDMA_COPY=1` and does not hang. The baseline numbers are consistent
+with Entry 59:
+- physical GPU copy wall is `0.354 ms`
+- continuous output materialization penalty is `0.616 ms`
+- continuous no-copy cadence gap is `0.437 ms`
+
+### Script safety update
+
+`tools/bench_sdma_ag_copy_pipe.sh` now wraps each benchmark case in
+`timeout --signal=TERM "$CASE_TIMEOUT_SEC"` with default `CASE_TIMEOUT_SEC=900`.
+This keeps future opt-in experiments such as `RUN_OUTPUT_SDMA_COPY=1` from
+hanging indefinitely; the log remains available for diagnosis.
+
+### Next validation
+
+Run the fixed output-SDMA-copy path explicitly:
+```bash
+RUN_OUTPUT_SDMA_COPY=1 bash tools/bench_sdma_ag_copy_pipe.sh
+```
+
+If it times out or fails, revert the `MORI_OUTPUT_SDMA_COPY` implementation. If
+it completes, compare `SDMA_OUTPUT_COPY derived` against `BASELINE derived`.
+
+---
+
 ## Entry 49 — Implement integer accumulator fast path for uint32/int32 pipeline reduce
 - **Date**: 2026-04-30
 - **Commit**: _this commit_

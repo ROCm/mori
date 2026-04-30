@@ -7,7 +7,7 @@
 #   PIPELINE_CU=224 PIPELINE_CHUNKS=4 RUN_OUTPUT_SDMA_COPY=0 \
 #   RUN_PIPE=0 PIPE_NRS="112 144 176 200" \
 #   RUN_PHASE_TIMING=1 PHASE_ITERATIONS=20 PHASE_WARMUP=5 \
-#   SKIP_PULL=0 SKIP_BUILD=0 bash tools/bench_sdma_ag_copy_pipe.sh
+#   CASE_TIMEOUT_SEC=900 SKIP_PULL=0 SKIP_BUILD=0 bash tools/bench_sdma_ag_copy_pipe.sh
 #
 # Runs: preflight -> optional git pull -> optional build -> baseline COPY/RCCL.
 # RUN_PIPE=1 also runs the deprecated MORI_SDMA_AG_COPY_PIPE nR sweep with
@@ -32,6 +32,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${RUN_PHASE_TIMING:=1}"
 : "${PHASE_ITERATIONS:=20}"
 : "${PHASE_WARMUP:=5}"
+: "${CASE_TIMEOUT_SEC:=900}"
 : "${SKIP_PULL:=0}"
 : "${SKIP_BUILD:=0}"
 
@@ -50,6 +51,7 @@ command -v python3 >/dev/null || { echo "MISSING: python3"; exit 1; }
 command -v git >/dev/null || { echo "MISSING: git"; exit 1; }
 command -v cmake >/dev/null || { echo "MISSING: cmake"; exit 1; }
 command -v hipcc >/dev/null || { echo "MISSING: hipcc"; exit 1; }
+command -v timeout >/dev/null || { echo "MISSING: timeout"; exit 1; }
 cmake --version | head -1
 hipcc --version 2>/dev/null | head -2 || true
 python3 - <<'PY'
@@ -61,7 +63,7 @@ rocm-smi --showproductname 2>&1 | head -8 || true
 git rev-parse --abbrev-ref HEAD
 git log -1 --oneline
 git status --short || true
-echo "SIZE_MB=$SIZE_MB NUM_STAGES=$NUM_STAGES ELEMS=$ELEMS CONTINUOUS_ITERS=$CONTINUOUS_ITERS PIPELINE_CU=$PIPELINE_CU PIPELINE_CHUNKS=$PIPELINE_CHUNKS RUN_OUTPUT_SDMA_COPY=$RUN_OUTPUT_SDMA_COPY RUN_PIPE=$RUN_PIPE PIPE_NRS=$PIPE_NRS RUN_PHASE_TIMING=$RUN_PHASE_TIMING PHASE_ITERATIONS=$PHASE_ITERATIONS PHASE_WARMUP=$PHASE_WARMUP"
+echo "SIZE_MB=$SIZE_MB NUM_STAGES=$NUM_STAGES ELEMS=$ELEMS CONTINUOUS_ITERS=$CONTINUOUS_ITERS PIPELINE_CU=$PIPELINE_CU PIPELINE_CHUNKS=$PIPELINE_CHUNKS RUN_OUTPUT_SDMA_COPY=$RUN_OUTPUT_SDMA_COPY RUN_PIPE=$RUN_PIPE PIPE_NRS=$PIPE_NRS RUN_PHASE_TIMING=$RUN_PHASE_TIMING PHASE_ITERATIONS=$PHASE_ITERATIONS PHASE_WARMUP=$PHASE_WARMUP CASE_TIMEOUT_SEC=$CASE_TIMEOUT_SEC"
 
 if [ "$SKIP_PULL" != "1" ]; then
   echo
@@ -84,7 +86,7 @@ run_case() {
   echo
   echo "========== $label =========="
   echo "ENV: $*"
-  env "$@" python3 tests/python/ccl/test_allreduce.py \
+  timeout --signal=TERM "$CASE_TIMEOUT_SEC" env "$@" python3 tests/python/ccl/test_allreduce.py \
     --num-stages "$NUM_STAGES" \
     --elems "$ELEMS" \
     --iterations "$ITERATIONS" \
@@ -100,7 +102,7 @@ run_phase_case() {
   echo
   echo "========== $label =========="
   echo "ENV: $*"
-  env "$@" python3 tests/python/ccl/test_allreduce.py \
+  timeout --signal=TERM "$CASE_TIMEOUT_SEC" env "$@" python3 tests/python/ccl/test_allreduce.py \
     --num-stages "$NUM_STAGES" \
     --elems "$ELEMS" \
     --iterations "$PHASE_ITERATIONS" \

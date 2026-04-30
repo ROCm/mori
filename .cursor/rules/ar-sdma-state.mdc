@@ -397,6 +397,15 @@ Fix attempt: do not touch `expectSignalsPtr`; read local signal and wait for
 `RUN_OUTPUT_SDMA_COPY=1 bash tools/bench_sdma_ag_copy_pipe.sh` only for targeted
 debug of the fixed path.
 
+Entry 62 guarded baseline on `4ca2d7f8` is stable:
+- continuous SDMA copy `6.875`, no-copy `6.259`, RCCL `5.822`
+- continuous copy gap `+1.053 ms`
+- continuous no-copy cadence gap `+0.437 ms`
+- finite GPU copy wall `0.354 ms`
+
+Script now wraps each benchmark case in `timeout --signal=TERM` with
+`CASE_TIMEOUT_SEC=900`, so opt-in experiments cannot hang forever.
+
 ### Integer reduce fast path (Entry 50)
 
 `uint32/int32` pipeline reduce now accumulates in packed integer registers
@@ -530,6 +539,7 @@ Entry 59 data shows finite output copy GPU wall is `0.383 ms` and continuous
 target gap is still `+1.068 ms`.
 Entry 60 adds `MORI_OUTPUT_SDMA_COPY=1`; `tools/bench_sdma_ag_copy_pipe.sh`
 keeps it opt-in after Entry 61 hang (`RUN_OUTPUT_SDMA_COPY=0` by default).
+Entry 62 adds per-case timeout to the script.
 
 `MORI_DIRECT_OUTPUT=1` 激活 Plan A v2 path; 不开则走 BASELINE.
 `MORI_SDMA_AG_COPY_PIPE=1` 激活 K1 scatter + K2 R-reduce / SDMA-AG / C-copy pipeline.
