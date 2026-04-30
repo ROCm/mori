@@ -669,6 +669,21 @@ bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
       const char* e = std::getenv("MORI_PIPELINE_FUSED");
       return e != nullptr && std::atoi(e) == 1;
   }();
+  static const bool p2p_fused = []() -> bool {
+      const char* e = std::getenv("MORI_P2P_FUSED");
+      return e != nullptr && std::atoi(e) == 1;
+  }();
+  if (p2p_fused) {
+      static thread_local bool s_p2p_announced = false;
+      if (!s_p2p_announced) {
+          printf("PE %d: MORI_P2P_FUSED=1 — using SCATTER_MODE=1 legacy "
+                 "P2P-read + CU-AG fused path\n",
+                 myPe_);
+          s_p2p_announced = true;
+      }
+      return pipelined(input, output, total_count, 0, 1, stream,
+                       /*external_scatter=*/false);
+  }
   return pipelined(input, output, total_count, 0, 0, stream,
                    /*external_scatter=*/!fused);
 }

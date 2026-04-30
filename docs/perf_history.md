@@ -2486,6 +2486,53 @@ a slow post-copy path.
 
 ---
 
+## Entry 64 — Expose legacy `SCATTER_MODE=1` as `MORI_P2P_FUSED=1` for cadence validation
+- **Date**: 2026-05-01
+- **Commit**: _this commit_
+- **Why this direction**:
+  - Entry 62 baseline continuous gap remains:
+    - copy gap `+1.053 ms`
+    - no-copy cadence gap `+0.437 ms`
+    - finite GPU copy wall `0.354 ms`
+  - Entry 63 closed local SDMA output copy (`4.550 ms` copy wall, much worse).
+  - Existing code already has a legacy `SCATTER_MODE=1` kernel that changes the
+    cadence: P2P read from symmetric input + CU AG fused path. It is not the
+    final solution because it adds input-to-symmetric copy and uses CU for AG,
+    but it is the fastest existing way to get evidence about a non-two-shot
+    cadence under the same Test 6 harness.
+
+### Implementation
+
+Add env:
+```bash
+MORI_P2P_FUSED=1
+```
+
+`AllreduceSdma::operator()` routes to:
+```text
+pipelined(input, output, total_count, chunk_elems=0, scatter_mode=1)
+```
+
+The script `tools/bench_sdma_ag_copy_pipe.sh` now runs `P2P_FUSED` and
+`P2P_FUSED_PHASE_STAGE0` by default, protected by the existing per-case timeout.
+
+### Expected result / kill switch
+
+This path is risky:
+- it copies input to a symmetric input buffer before the kernel,
+- it uses CU for allgather/write traffic,
+- prior Plan A/B data show CU-heavy paths can hurt GEMM overlap.
+
+Success criterion:
+```text
+P2P_FUSED no-copy gap vs RCCL < BASELINE no-copy gap vs RCCL
+```
+
+If `P2P_FUSED` regresses wall, hangs, or fails correctness, close it and do not
+use it as the next algorithm basis.
+
+---
+
 ## Entry 49 — Implement integer accumulator fast path for uint32/int32 pipeline reduce
 - **Date**: 2026-04-30
 - **Commit**: _this commit_

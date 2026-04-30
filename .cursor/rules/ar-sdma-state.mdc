@@ -547,6 +547,23 @@ target gap is still `+1.068 ms`.
 Entry 63 removes failed `MORI_OUTPUT_SDMA_COPY=1`; `tools/bench_sdma_ag_copy_pipe.sh`
 is back to baseline/RCCL + phase timing only. Entry 62 per-case timeout remains.
 
+### P2P fused cadence probe implemented (Entry 64)
+
+`MORI_P2P_FUSED=1` exposes existing legacy `SCATTER_MODE=1`:
+`pipelined(..., scatter_mode=1)`.
+
+Purpose: collect evidence on a cadence-changing path after Entry 62 shows
+baseline continuous no-copy still trails RCCL by `+0.437 ms`.
+
+Known risks:
+- copies input into symmetric input buffer before kernel
+- uses CU for AG/write traffic
+- prior CU-heavy Plan A/B variants hurt GEMM overlap
+
+Script now runs `P2P_FUSED` and `P2P_FUSED_PHASE_STAGE0` by default with
+per-case timeout. Keep only if no-copy gap improves vs baseline; otherwise
+close it.
+
 `MORI_DIRECT_OUTPUT=1` 激活 Plan A v2 path; 不开则走 BASELINE.
 `MORI_SDMA_AG_COPY_PIPE=1` 激活 K1 scatter + K2 R-reduce / SDMA-AG / C-copy pipeline.
 
