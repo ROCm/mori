@@ -23,8 +23,8 @@
 FlyDSL-specific runtime helpers for mori shmem integration.
 
   - ``get_bitcode_path()``  — returns the path to libmori_shmem_device.bc
-  - ``install_hook()``      — installs the FlyDSL post-compile hook that calls
-                              ``shmem_module_init`` to inject ``globalGpuStates``
+  - ``shmem_module_init()`` — initializes ``globalGpuStates`` for a loaded
+                              FlyDSL HIP module
 """
 
 from mori.ir.bitcode import find_bitcode
@@ -41,50 +41,23 @@ def get_bitcode_path() -> str:
     return find_bitcode(cov=6)
 
 
+def shmem_module_init(hip_module: int):
+    """Initialize globalGpuStates in a FlyDSL-loaded HIP module."""
+    import mori.shmem as ms
+
+    return ms.shmem_module_init(hip_module)
+
+
 def install_hook() -> None:
-    """Install FlyDSL post-compile hook for mori shmem.
+    """Compatibility no-op.
 
-    The hook calls ``mori.shmem.shmem_module_init(hip_module)`` after each
-    shmem kernel compilation so that the ``globalGpuStates`` device symbol is
-    properly initialized inside the compiled GPU module.
-
-    Call once before any shmem kernel launch::
-
-        from mori.ir.flydsl import install_hook
-        install_hook()
+    Modern FlyDSL integration attaches ``shmem_module_init`` directly through
+    ``link_extern(..., module_init_fn=...)`` when constructing the extern
+    wrappers, so no global hook installation is required.
     """
-    try:
-        from flydsl.compiler import shmem_compile as sc
-    except ImportError:
-        raise ImportError(
-            "flydsl.compiler.shmem_compile not found. "
-            "Make sure FlyDSL is installed with shmem support."
-        )
-
-    def _hook(hip_module: int) -> None:
-        import mori.shmem as ms
-
-        ms.shmem_module_init(hip_module)
-
-    sc._shmem_post_compile_hook = _hook
+    return None
 
 
 def install_jit_hook() -> None:
-    """Install FlyDSL JIT module-load hook for mori shmem.
-
-    When called, registers a callback in libfly_jit_runtime.so so that
-    every GPU module loaded by flyc.jit automatically gets its
-    ``globalGpuStates`` initialized via ``shmem_module_init``.
-
-    Call once before any shmem kernel launch via ``flyc.jit``::
-
-        from mori.ir.flydsl.runtime import install_jit_hook
-        install_jit_hook()
-
-    Note: If using ``@flyc.jit`` with ``ExternFunction`` that declares
-    ``mori_shmem_*`` symbols, the hook is installed automatically.
-    This function provides an explicit entry point for manual control.
-    """
-    from flydsl.compiler.jit_executor import _ensure_shmem_hook
-
-    _ensure_shmem_hook()
+    """Compatibility alias for :func:`install_hook`."""
+    return install_hook()

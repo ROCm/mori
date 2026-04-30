@@ -25,10 +25,6 @@ mori.ir.flydsl — FlyDSL integration for mori shmem device API.
 Quick start::
 
     from mori.ir import flydsl as mori_shmem
-    from mori.ir.flydsl import get_bitcode_path, install_hook
-
-    install_hook()
-
     @flyc.kernel
     def my_kernel(buf: fx.Tensor):
         pe = mori_shmem.my_pe()
@@ -42,6 +38,6 @@ Usage (with shmem compile helper)::
 
 from .ops import *  # noqa: F401,F403
 from .ops import __all__ as _ops_all
-from .runtime import get_bitcode_path, install_hook
+from .runtime import get_bitcode_path, install_hook, shmem_module_init
 
-__all__ = _ops_all + ["get_bitcode_path", "install_hook"]
+__all__ = _ops_all + ["get_bitcode_path", "install_hook", "shmem_module_init"]
