@@ -960,6 +960,210 @@ void PoolClient::SubmitFusedBucket(FusedBucket& bucket) {
   for (size_t k : ok_pairs) bucket.submitted[k] = true;
 }
 
+// ---------------------------------------------------------------------------
+// BatchGet (3-phase RDMA fusion) helpers
+// ---------------------------------------------------------------------------
+//
+// Mirror of BatchPut helpers above with three structural simplifications:
+//   1. No allocation_id / pending_aborts: Get has no master reservation.
+//   2. Kind set is one fewer (no REMOTE_ZC_PREP_FAILED) — snapshot miss
+//      degrades to SKIPPED (no Abort owed).
+//   3. MapBucketFailuresRead emits per-item GET_BYTES on Wait success
+//      and accumulates bw_bytes_remote for the single end-of-batch
+//      ObserveBatchBandwidth call.  Metrics fire ONLY when every
+//      contributing pair for that item succeeded.
+//
+// FusedPair / FusedBucket / WaitFusedBucket are reused from BatchPut;
+// in the Read direction, FusedPair.local_mem is the NIC *write*
+// destination (caller dst), FusedPair.remote_mem is the NIC *read*
+// source.
+
+void PoolClient::PlanPeerForBatchGet(PeerConnection& peer,
+                                     const std::vector<std::optional<RouteGetResult>>& routes,
+                                     const std::vector<size_t>& peer_item_indices,
+                                     const std::vector<std::string>& keys,
+                                     std::vector<BatchGetItemPlan>& plans,
+                                     FusedBucket& out_bucket) {
+  // Hydrate + snapshot under a single peers_mutex_ window (mirror of
+  // PlanPeerForBatchPut).  Pages were pre-parsed in Phase 1a into
+  // plans[orig_idx].parsed_pages, avoiding a second ParseDramLocationId
+  // here.
+  struct PerItemSnapshot {
+    size_t orig_idx;
+    std::vector<mori::io::MemoryDesc> remote_mems;  // one per parsed_page
+  };
+  std::vector<PerItemSnapshot> snaps;
+  snaps.reserve(peer_item_indices.size());
+
+  {
+    std::lock_guard<std::mutex> lock(peers_mutex_);
+    for (size_t orig_idx : peer_item_indices) {
+      const auto& r = *routes[orig_idx];
+      EnsureBufferDescsCachedLocked(peer, r.dram_memory_descs);
+      const auto& parsed_pages = plans[orig_idx].parsed_pages;
+      PerItemSnapshot snap;
+      snap.orig_idx = orig_idx;
+      snap.remote_mems.reserve(parsed_pages.size());
+      bool ok = true;
+      for (const auto& p : parsed_pages) {
+        if (p.buffer_index >= peer.dram_memories.size() ||
+            !IsValidMemoryDesc(peer.dram_memories[p.buffer_index])) {
+          MORI_UMBP_ERROR(
+              "[PoolClient] BatchGet: buffer_index {} not hydrated on peer '{}' for key='{}'",
+              p.buffer_index, peer.peer_address, keys[orig_idx]);
+          ok = false;
+          break;
+        }
+        snap.remote_mems.push_back(peer.dram_memories[p.buffer_index]);
+      }
+      if (!ok) {
+        // Get has no Abort debt — degrade to SKIPPED so item is omitted
+        // from any FusedPair and Phase 3 leaves results[orig_idx]=false.
+        plans[orig_idx].kind = BatchGetItemPlan::Kind::SKIPPED;
+        continue;
+      }
+      snaps.push_back(std::move(snap));
+    }
+  }
+
+  using PairKey = std::tuple<mori::io::MemoryUniqueId, uint32_t, uint64_t>;
+  struct PairKeyHash {
+    size_t operator()(const PairKey& k) const noexcept {
+      return std::hash<uint64_t>{}(static_cast<uint64_t>(std::get<0>(k))) ^
+             (std::hash<uint32_t>{}(std::get<1>(k)) << 1) ^
+             (std::hash<uint64_t>{}(std::get<2>(k)) << 2);
+    }
+  };
+  std::unordered_map<PairKey, size_t, PairKeyHash> key_to_pair;
+
+  for (const auto& snap : snaps) {
+    const auto& plan = plans[snap.orig_idx];
+    const auto& parsed_pages = plan.parsed_pages;
+    for (size_t pi = 0; pi < parsed_pages.size(); ++pi) {
+      const auto& p = parsed_pages[pi];
+      PairKey key{plan.local_mem.id, p.buffer_index, plan.page_size};
+      auto it = key_to_pair.find(key);
+      if (it == key_to_pair.end()) {
+        FusedPair pair;
+        pair.remote_buf_idx = p.buffer_index;
+        pair.remote_mem = snap.remote_mems[pi];
+        pair.local_mem = plan.local_mem;
+        out_bucket.pairs.push_back(std::move(pair));
+        it = key_to_pair.emplace(key, out_bucket.pairs.size() - 1).first;
+      }
+      auto& pair = out_bucket.pairs[it->second];
+      const uint64_t local_off = plan.local_base_off + pi * plan.page_size;
+      const uint64_t remote_off = static_cast<uint64_t>(p.page_index) * plan.page_size;
+      const uint64_t bytes =
+          LogicalPageBytes(pi, parsed_pages.size(), plan.page_size, plan.bytes_total);
+      pair.local_offsets.push_back(local_off);
+      pair.remote_offsets.push_back(remote_off);
+      pair.sizes.push_back(bytes);
+      if (pair.contributing_items.empty() || pair.contributing_items.back() != snap.orig_idx) {
+        pair.contributing_items.push_back(snap.orig_idx);
+      }
+    }
+  }
+}
+
+void PoolClient::SubmitFusedBucketRead(FusedBucket& bucket) {
+  const size_t N = bucket.pairs.size();
+  bucket.submitted.assign(N, false);
+  if (N == 0) return;
+
+  bucket.statuses = std::vector<mori::io::TransferStatus>(N);
+  bucket.ids.assign(N, 0);
+
+  std::vector<size_t> ok_pairs;
+  ok_pairs.reserve(N);
+  for (size_t k = 0; k < N; ++k) {
+    try {
+      bucket.ids[k] = io_engine_->AllocateTransferUniqueId();
+      ok_pairs.push_back(k);
+    } catch (const std::exception& e) {
+      MORI_UMBP_ERROR("[PoolClient] BatchGet: submit prep failed for peer '{}' pair {}: {}",
+                      bucket.peer_node_id, k, e.what());
+    }
+  }
+  if (ok_pairs.empty()) return;
+
+  const size_t M = ok_pairs.size();
+  mori::io::MemDescVec local_descs(M);
+  mori::io::MemDescVec remote_descs(M);
+  mori::io::BatchSizeVec local_offsets(M);
+  mori::io::BatchSizeVec remote_offsets(M);
+  mori::io::BatchSizeVec sizes_v(M);
+  mori::io::TransferStatusPtrVec status_ptrs(M);
+  mori::io::TransferUniqueIdVec sub_ids(M);
+  for (size_t i = 0; i < M; ++i) {
+    const size_t k = ok_pairs[i];
+    auto& pair = bucket.pairs[k];
+    local_descs[i] = pair.local_mem;
+    remote_descs[i] = pair.remote_mem;
+    local_offsets[i] = pair.local_offsets;
+    remote_offsets[i] = pair.remote_offsets;
+    sizes_v[i] = pair.sizes;
+    status_ptrs[i] = &bucket.statuses[k];
+    sub_ids[i] = bucket.ids[k];
+  }
+
+  MORI_UMBP_OBS_INC(batch_get_io_engine_calls_);
+  MORI_UMBP_OBS_ADD(batch_get_io_engine_pairs_, M);
+  MORI_UMBP_DEBUG("[PoolClient] BatchGet: IssueBatchRead peer='{}' pairs={}/{}",
+                  bucket.peer_node_id, M, N);
+  try {
+    IssueBatchRead(local_descs, local_offsets, remote_descs, remote_offsets, sizes_v, status_ptrs,
+                   sub_ids);
+  } catch (...) {
+    for (size_t k : ok_pairs) bucket.statuses[k].Wait();
+    throw;
+  }
+  for (size_t k : ok_pairs) bucket.submitted[k] = true;
+}
+
+void PoolClient::MapBucketFailuresRead(FusedBucket& bucket,
+                                       const std::vector<BatchGetItemPlan>& plans,
+                                       const std::vector<size_t>& sizes, std::vector<bool>& results,
+                                       double* bw_bytes_remote_accum, MasterClient* master_client) {
+  // Per-item AND across all pairs that touched it (mirror of
+  // MapBucketFailures).  No pending_aborts collection — Get has no
+  // reservation.  Per-item GET_BYTES counter + bw_bytes_remote
+  // accumulation happen here only for items that succeeded across ALL
+  // their contributing pairs (no metric for items whose any pair Failed,
+  // matching the legacy single Get behavior).
+  std::unordered_map<size_t, bool> item_ok;
+  for (size_t k = 0; k < bucket.pairs.size(); ++k) {
+    const bool pair_ok = bucket.submitted[k] && bucket.statuses[k].Succeeded();
+    if (!pair_ok && bucket.submitted[k]) {
+      MORI_UMBP_ERROR("[PoolClient] BatchGet: fused pair {} (peer={}, buf={}) failed: uid={}, {}",
+                      k, bucket.peer_node_id, bucket.pairs[k].remote_buf_idx, bucket.ids[k],
+                      bucket.statuses[k].Message());
+    }
+    for (size_t orig_idx : bucket.pairs[k].contributing_items) {
+      auto [it, inserted] = item_ok.try_emplace(orig_idx, pair_ok);
+      if (!inserted) it->second = it->second && pair_ok;
+    }
+  }
+  for (auto& [orig_idx, ok] : item_ok) {
+    if (ok) {
+      results[orig_idx] = true;
+      const double bytes = static_cast<double>(sizes[orig_idx]);
+      *bw_bytes_remote_accum += bytes;
+      if (master_client != nullptr) {
+        master_client->AddCounter(MORI_UMBP_METRIC_CLIENT_GET_BYTES_TOTAL,
+                                  MORI_UMBP_METRIC_CLIENT_GET_BYTES_TOTAL_HELP,
+                                  {{"traffic", "remote"}}, bytes);
+      }
+    } else {
+      results[orig_idx] = false;
+      MORI_UMBP_WARN(
+          "[PoolClient] BatchGet: fused ZC item idx={} on peer='{}' failed (caller dst content "
+          "undefined per legacy contract)",
+          orig_idx, plans[orig_idx].peer_node_id);
+    }
+  }
+}
+
 std::vector<bool> PoolClient::BatchPut(const std::vector<std::string>& keys,
                                        const std::vector<const void*>& srcs,
                                        const std::vector<size_t>& sizes,
@@ -1250,6 +1454,30 @@ std::vector<bool> PoolClient::BatchPut(const std::vector<std::string>& keys,
   return results;
 }
 
+// ---------------------------------------------------------------------------
+// BatchGet (3-phase RDMA fusion; mirror of BatchPut)
+// ---------------------------------------------------------------------------
+//
+// Phase 0  : BatchRouteGet (one gRPC).
+// Phase 1a : Per-item classify into LOCAL / REMOTE_ZC / REMOTE_STG / SKIPPED;
+//            pre-parse loc.location_id into plans[i].parsed_pages so the
+//            per-peer loop in Phase 1b/c does not re-parse.  Validates
+//            master partial-fill cases (peer_address / engine_desc_bytes /
+//            dram_memory_descs / page_size) BEFORE tagging REMOTE_*.
+//            FindRegisteredMemory acquired here BEFORE peers_mutex_ to
+//            keep the same global lock order as BatchPut.
+// Phase 1b : Per-peer plan + snapshot under peers_mutex_, build FusedBucket.
+// Phase 1c : Per-bucket SubmitFusedBucketRead (fire-and-return).
+// Phase 2  : LOCAL memcpy + REMOTE_STG legacy serial path - CPU work that
+//            overlaps with NIC RDMA in flight from Phase 1c.  STG path is
+//            self-contained (Read -> Wait -> memcpy(dst, staging) inside
+//            RemoteDramScatterRead); its Wait is independent of Phase 3.
+// Phase 3  : Wait every submitted ZC pair, map per-item success/failure,
+//            emit per-item GET_BYTES counter for ZC successes only.
+//
+// Failure handling: Get has no master reservation, so SKIPPED / pair-failure /
+// STG-failure all simply leave results[i]=false (no Abort RPC tail).
+// caller dst[i] content on failure is undefined per legacy contract.
 std::vector<bool> PoolClient::BatchGet(const std::vector<std::string>& keys,
                                        const std::vector<void*>& dsts,
                                        const std::vector<size_t>& sizes) {
@@ -1262,8 +1490,10 @@ std::vector<bool> PoolClient::BatchGet(const std::vector<std::string>& keys,
   }
 
   ScopedTimer timer("BatchGet", mori::modules::UMBP);
+  MORI_UMBP_OBS_INC(batch_get_calls_);
   double bw_bytes_local = 0, bw_bytes_remote = 0;
 
+  // Phase 0: route.
   std::vector<std::optional<RouteGetResult>> routes;
   auto status = master_client_->BatchRouteGet(keys, &routes);
   if (!status.ok()) {
@@ -1275,17 +1505,25 @@ std::vector<bool> PoolClient::BatchGet(const std::vector<std::string>& keys,
     return results;
   }
 
-  // Per-entry scatter-gather BatchRead; single-page is N=1, K=1.
-  // TODO(perf): merge multiple entries' RDMA into a single BatchRead
-  // (mirror of the BatchPut TODO above).
+  std::vector<BatchGetItemPlan> plans(n);
+  std::unordered_map<std::string, std::vector<size_t>> zc_by_peer;
+  std::vector<size_t> stg_indices;
+  std::vector<size_t> local_indices;
+
+  // Phase 1a: classify.  registered_mem_mutex_ acquired here (in
+  // FindRegisteredMemory) BEFORE peers_mutex_ is taken in Phase 1b -
+  // single global lock order, mirror of BatchPut.
+  const std::string& self_node_id = config_.master_config.node_id;
   for (size_t i = 0; i < n; ++i) {
+    plans[i].idx = i;
     if (!routes[i].has_value()) continue;
-    auto& r = *routes[i];
-    auto& loc = r.location;
-    // Same contract as Get: caller's `sizes[i]` must match the byte
-    // size committed at Put time (Master tracks it in Location.size).  See
-    // the comment in Get for why the page-window check alone is
-    // insufficient with partial-last-page support.
+    const auto& r = *routes[i];
+    const auto& loc = r.location;
+    // Master tracks size at Put time; caller MUST pass the same size.
+    // Issue #9 background: Lookup deliberately doesn't return size to
+    // stay side-effect-free.  Without this check, the partial-last-page
+    // logic in LogicalPageBytes would silently truncate or pull stale
+    // tail bytes.  Per-item failure (continue), not whole-batch.
     if (sizes[i] != loc.size) {
       MORI_UMBP_ERROR("[PoolClient] BatchGet: caller size {} != stored size {} for key='{}'",
                       sizes[i], loc.size, keys[i]);
@@ -1301,59 +1539,145 @@ std::vector<bool> PoolClient::BatchGet(const std::vector<std::string>& keys,
           keys[i], loc.location_id);
       continue;
     }
-    // Note: no allocation-window check here — implied by sizes[i]==loc.size
-    // (verified above) + master-side num_pages=ceil(loc.size/page_size).
-    if (loc.node_id == config_.master_config.node_id) {
-      bool oob = false;
-      char* dst_bytes = static_cast<char*>(dsts[i]);
-      for (size_t k = 0; k < parsed->pages.size() && !oob; ++k) {
-        const auto& p = parsed->pages[k];
-        if (p.buffer_index >= config_.dram_buffers.size()) {
-          MORI_UMBP_ERROR("[PoolClient] BatchGet local: invalid buffer_index {}", p.buffer_index);
-          oob = true;
-          break;
-        }
-        auto& dram = config_.dram_buffers[p.buffer_index];
-        const uint64_t off = static_cast<uint64_t>(p.page_index) * r.page_size;
-        if (!dram.buffer || r.page_size > dram.size || off > dram.size - r.page_size) {
-          MORI_UMBP_ERROR("[PoolClient] BatchGet local: OOB buf={} off={} page_size={} buf_size={}",
-                          p.buffer_index, off, r.page_size, dram.size);
-          oob = true;
-          break;
-        }
-        const uint64_t bytes = LogicalPageBytes(k, parsed->pages.size(), r.page_size, sizes[i]);
-        std::memcpy(dst_bytes + k * r.page_size, static_cast<const char*>(dram.buffer) + off,
-                    bytes);
-      }
-      results[i] = !oob;
-      if (!oob) {
-        MORI_UMBP_INFO("[PoolClient] BatchGet: recording get_bytes key='{}' size={} traffic=local",
-                       keys[i], sizes[i]);
-        master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_GET_BYTES_TOTAL,
-                                   MORI_UMBP_METRIC_CLIENT_GET_BYTES_TOTAL_HELP,
-                                   {{"traffic", "local"}}, static_cast<double>(sizes[i]));
-        bw_bytes_local += static_cast<double>(sizes[i]);
-      }
+    plans[i].parsed_pages = std::move(parsed->pages);
+    plans[i].peer_node_id = loc.node_id;
+    plans[i].page_size = r.page_size;
+    plans[i].bytes_total = sizes[i];
+
+    if (loc.node_id == self_node_id) {
+      plans[i].kind = BatchGetItemPlan::Kind::LOCAL;
+      local_indices.push_back(i);
       continue;
     }
 
-    auto& peer = GetOrConnectPeer(loc.node_id, r.peer_address, r.engine_desc_bytes);
-    EnsureBufferDescsCached(peer, r.dram_memory_descs);
-    // zero_copy=true: prefer pre-registered host buffers; staging fallback
-    // remains for callers that did not register.
-    results[i] = RemoteDramScatterRead(peer, parsed->pages, r.page_size, dsts[i], sizes[i], true);
-    if (results[i]) {
-      MORI_UMBP_INFO("[PoolClient] BatchGet: recording get_bytes key='{}' size={} traffic=remote",
-                     keys[i], sizes[i]);
-      master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_GET_BYTES_TOTAL,
-                                 MORI_UMBP_METRIC_CLIENT_GET_BYTES_TOTAL_HELP,
-                                 {{"traffic", "remote"}}, static_cast<double>(sizes[i]));
-      bw_bytes_remote += static_cast<double>(sizes[i]);
+    // Remote: validate master partial-fill BEFORE tagging REMOTE_*.
+    // engine_desc_bytes and dram_memory_descs are the real RDMA
+    // prerequisites; if either is empty, the BatchRead will fail with a
+    // less actionable error inside the engine path.  peer_address is
+    // ONLY used by the PeerService/SSD path (GetOrConnectPeer stashes
+    // it but DRAM RDMA never reads it back), so an empty peer_address
+    // is legitimate for clients that didn't expose PeerService and
+    // MUST NOT be a SKIPPED trigger here.
+    if (r.engine_desc_bytes.empty() || r.dram_memory_descs.empty()) {
+      MORI_UMBP_ERROR(
+          "[PoolClient] BatchGet: master partial-fill for key='{}' (engine_desc_bytes={}, "
+          "dram_memory_descs={}); SKIPPED",
+          keys[i], r.engine_desc_bytes.empty() ? "EMPTY" : "ok",
+          r.dram_memory_descs.empty() ? "EMPTY" : "ok");
+      plans[i].kind = BatchGetItemPlan::Kind::SKIPPED;
+      continue;
+    }
+
+    auto reg = FindRegisteredMemory(dsts[i], sizes[i]);
+    if (reg.has_value()) {
+      plans[i].kind = BatchGetItemPlan::Kind::REMOTE_ZC;
+      plans[i].local_mem = reg->first;
+      plans[i].local_base_off = reg->second;
+      zc_by_peer[loc.node_id].push_back(i);
+      MORI_UMBP_OBS_INC(batch_get_items_);
     } else {
-      MORI_UMBP_WARN("[PoolClient] BatchGet: RemoteDramScatterRead failed for key='{}' size={}",
-                     keys[i], sizes[i]);
+      plans[i].kind = BatchGetItemPlan::Kind::REMOTE_STG;
+      stg_indices.push_back(i);
     }
   }
+
+  // Phase 1b/c: per-peer plan + submit.  Mirror of BatchPut: outer
+  // try/catch is REQUIRED.  On any throw, drain every already-pushed
+  // bucket so in-flight RDMA completions don't dereference destroyed
+  // bucket.statuses storage during stack unwind (UAF).
+  std::vector<FusedBucket> buckets;
+  buckets.reserve(zc_by_peer.size());
+  bool phase1_threw = false;
+  try {
+    for (auto& [peer_id, indices] : zc_by_peer) {
+      if (indices.empty()) continue;
+      const auto& r0 = *routes[indices[0]];
+      auto& peer = GetOrConnectPeer(peer_id, r0.peer_address, r0.engine_desc_bytes);
+      FusedBucket bucket;
+      bucket.peer_node_id = peer_id;
+      PlanPeerForBatchGet(peer, routes, indices, keys, plans, bucket);
+      if (bucket.pairs.empty()) continue;
+      SubmitFusedBucketRead(bucket);
+      buckets.push_back(std::move(bucket));
+    }
+  } catch (const std::exception& e) {
+    MORI_UMBP_ERROR("[PoolClient] BatchGet: Phase 1 threw: {} ({} bucket(s) drained)", e.what(),
+                    buckets.size());
+    for (auto& bucket : buckets) WaitFusedBucket(bucket);
+    phase1_threw = true;
+  }
+
+  // Phase 2a: LOCAL memcpy.  Runs while ZC RDMA is in flight on the NIC.
+  // OOB on the local path is a master-invariant violation - log and skip
+  // (results[i] stays false), matching legacy semantics.  Per-item
+  // GET_BYTES counter emitted on success (traffic=local).
+  for (size_t orig_idx : local_indices) {
+    const auto& parsed_pages = plans[orig_idx].parsed_pages;
+    const uint64_t page_size = plans[orig_idx].page_size;
+    const size_t bytes_total = plans[orig_idx].bytes_total;
+    char* dst_bytes = static_cast<char*>(dsts[orig_idx]);
+    bool oob = false;
+    for (size_t k = 0; k < parsed_pages.size() && !oob; ++k) {
+      const auto& p = parsed_pages[k];
+      if (p.buffer_index >= config_.dram_buffers.size()) {
+        MORI_UMBP_ERROR("[PoolClient] BatchGet local: invalid buffer_index {}", p.buffer_index);
+        oob = true;
+        break;
+      }
+      auto& dram = config_.dram_buffers[p.buffer_index];
+      const uint64_t off = static_cast<uint64_t>(p.page_index) * page_size;
+      if (!dram.buffer || page_size > dram.size || off > dram.size - page_size) {
+        MORI_UMBP_ERROR("[PoolClient] BatchGet local: OOB buf={} off={} page_size={} buf_size={}",
+                        p.buffer_index, off, page_size, dram.size);
+        oob = true;
+        break;
+      }
+      const uint64_t bytes = LogicalPageBytes(k, parsed_pages.size(), page_size, bytes_total);
+      std::memcpy(dst_bytes + k * page_size, static_cast<const char*>(dram.buffer) + off, bytes);
+    }
+    if (!oob) {
+      results[orig_idx] = true;
+      const double bytes_d = static_cast<double>(bytes_total);
+      bw_bytes_local += bytes_d;
+      master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_GET_BYTES_TOTAL,
+                                 MORI_UMBP_METRIC_CLIENT_GET_BYTES_TOTAL_HELP,
+                                 {{"traffic", "local"}}, bytes_d);
+    }
+  }
+
+  // Phase 2b: REMOTE_STG via legacy per-item scatter-read (zero_copy=false).
+  // Note: STG path is self-contained — RemoteDramScatterRead does Read -> Wait ->
+  // memcpy(dst, staging) internally with staging_mutex_ held; its Wait is
+  // INDEPENDENT of the Phase 3 ZC Wait below.
+  for (size_t orig_idx : stg_indices) {
+    const auto& r = *routes[orig_idx];
+    auto& peer = GetOrConnectPeer(r.location.node_id, r.peer_address, r.engine_desc_bytes);
+    EnsureBufferDescsCached(peer, r.dram_memory_descs);
+    bool ok = RemoteDramScatterRead(peer, plans[orig_idx].parsed_pages, plans[orig_idx].page_size,
+                                    dsts[orig_idx], sizes[orig_idx], /*zero_copy=*/false);
+    if (ok) {
+      results[orig_idx] = true;
+      const double bytes_d = static_cast<double>(sizes[orig_idx]);
+      bw_bytes_remote += bytes_d;
+      master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_GET_BYTES_TOTAL,
+                                 MORI_UMBP_METRIC_CLIENT_GET_BYTES_TOTAL_HELP,
+                                 {{"traffic", "remote"}}, bytes_d);
+    } else {
+      MORI_UMBP_WARN("[PoolClient] BatchGet: REMOTE_STG ScatterRead failed for key='{}' size={}",
+                     keys[orig_idx], sizes[orig_idx]);
+    }
+  }
+
+  // Phase 3: Wait + map ZC failures.  When phase1_threw, the buckets were
+  // already drained in the catch above and all REMOTE_ZC items are
+  // considered failed - leave results[i]=false (no Abort needed for Get).
+  if (!phase1_threw) {
+    for (auto& bucket : buckets) {
+      WaitFusedBucket(bucket);
+      MapBucketFailuresRead(bucket, plans, sizes, results, &bw_bytes_remote, master_client_.get());
+    }
+  }
+  // No Master RPC tail (no Finalize, no Abort) — Get has no reservation.
 
   ObserveBatchBandwidth(*master_client_, MORI_UMBP_METRIC_CLIENT_BATCH_GET_BANDWIDTH,
                         MORI_UMBP_METRIC_CLIENT_BATCH_GET_BANDWIDTH_HELP, NodeId(), bw_bytes_local,
@@ -1479,6 +1803,19 @@ void PoolClient::IssueBatchWrite(const mori::io::MemDescVec& local_src,
   // under MORI_UMBP_TESTING to inject pair-level failures.
   io_engine_->BatchWrite(local_src, local_offsets, remote_dest, remote_offsets, sizes, statuses,
                          ids);
+}
+
+void PoolClient::IssueBatchRead(const mori::io::MemDescVec& local_dest,
+                                const mori::io::BatchSizeVec& local_offsets,
+                                const mori::io::MemDescVec& remote_src,
+                                const mori::io::BatchSizeVec& remote_offsets,
+                                const mori::io::BatchSizeVec& sizes,
+                                mori::io::TransferStatusPtrVec& statuses,
+                                mori::io::TransferUniqueIdVec& ids) {
+  // Default forward-to-engine implementation.  Test subclasses override
+  // under MORI_UMBP_TESTING to inject pair-level Read failures.
+  io_engine_->BatchRead(local_dest, local_offsets, remote_src, remote_offsets, sizes, statuses,
+                        ids);
 }
 
 // ---------------------------------------------------------------------------

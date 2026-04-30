@@ -164,6 +164,17 @@ class PoolClient {
   uint64_t BatchPutIoEnginePairsCount() const {
     return batch_put_io_engine_pairs_.load(std::memory_order_relaxed);
   }
+  // BatchGet RDMA fusion observability (mirror of BatchPut counters).
+  // Primary metric:
+  //   items_per_pair = BatchGetItemsCount / BatchGetIoEnginePairsCount
+  uint64_t BatchGetCallsCount() const { return batch_get_calls_.load(std::memory_order_relaxed); }
+  uint64_t BatchGetItemsCount() const { return batch_get_items_.load(std::memory_order_relaxed); }
+  uint64_t BatchGetIoEngineCallsCount() const {
+    return batch_get_io_engine_calls_.load(std::memory_order_relaxed);
+  }
+  uint64_t BatchGetIoEnginePairsCount() const {
+    return batch_get_io_engine_pairs_.load(std::memory_order_relaxed);
+  }
 
   // ---- External KV block events ----
   bool ReportExternalKvBlocks(const std::vector<std::string>& hashes, TierType tier);
@@ -326,6 +337,63 @@ class PoolClient {
                                 std::vector<bool>& results,
                                 std::vector<MasterClient::BatchAbortEntry>& pending_aborts);
 
+  // BatchGet RDMA fusion internals (mirror of BatchPut, 3-phase pipeline:
+  // BatchRouteGet -> per-peer fused BatchRead fire-and-return -> Wait).
+  // FusedPair / FusedBucket types are reused from BatchPut above; in the
+  // BatchRead path, FusedPair.local_mem is the NIC *write* destination
+  // (caller dst), FusedPair.remote_mem is the NIC *read* source (peer buf).
+  //
+  // Kind set is one fewer than BatchPut: no REMOTE_ZC_PREP_FAILED because
+  // Get has no master-side reservation to abort on snapshot miss.
+  struct BatchGetItemPlan {
+    enum class Kind {
+      SKIPPED,     // route invalid / size mismatch / parse fail / OOB / snapshot miss
+      LOCAL,       // same-node memcpy
+      REMOTE_ZC,   // fused per-peer BatchRead
+      REMOTE_STG,  // legacy staging fallback (serial, post-Wait memcpy)
+    };
+    size_t idx{0};
+    Kind kind{Kind::SKIPPED};
+    std::string peer_node_id;
+    uint64_t page_size{0};
+    size_t bytes_total{0};
+    // Pre-parsed in Phase 1a, reused by Phase 1b/c per-peer loop and by
+    // Phase 2 LOCAL/STG paths to avoid re-parsing loc.location_id.
+    std::vector<PageLocation> parsed_pages;
+    // REMOTE_ZC only:
+    mori::io::MemoryDesc local_mem{};
+    size_t local_base_off{0};
+  };
+
+  // Phase 1b/c helper.  Holds peers_mutex_ for the entire hydrate +
+  // snapshot window so peer.dram_memories[] reads are consistent and
+  // FusedPair.remote_mem carries a stable copy.  May mutate plans[] for
+  // items whose buffer_index turns out unhydrated (kind = SKIPPED; no
+  // Abort owed for Get).
+  void PlanPeerForBatchGet(PeerConnection& peer,
+                           const std::vector<std::optional<RouteGetResult>>& routes,
+                           const std::vector<size_t>& peer_item_indices,
+                           const std::vector<std::string>& keys,
+                           std::vector<BatchGetItemPlan>& plans, FusedBucket& out_bucket);
+
+  // Phase 1 submit for Read direction.  Calls IssueBatchRead under
+  // fire-and-return contract.  bucket.statuses MUST be sized to
+  // bucket.pairs.size() before any &statuses[k] is taken, mirroring
+  // SubmitFusedBucket; otherwise vector relocation invalidates pointers
+  // already handed to the IO engine.
+  void SubmitFusedBucketRead(FusedBucket& bucket);
+
+  // Phase 3 mapper for Read direction.  Differs from MapBucketFailures
+  // in two ways: (1) no pending_aborts out-parameter (Get has no
+  // reservation to abort), (2) emits per-item GET_BYTES counter for ZC
+  // successes and accumulates bw_bytes_remote into the out parameter
+  // for the single end-of-batch ObserveBatchBandwidth call.  Metrics
+  // are emitted ONLY for items whose every contributing pair Wait
+  // succeeded; failed items get results[orig_idx]=false and no metric.
+  static void MapBucketFailuresRead(FusedBucket& bucket, const std::vector<BatchGetItemPlan>& plans,
+                                    const std::vector<size_t>& sizes, std::vector<bool>& results,
+                                    double* bw_bytes_remote_accum, MasterClient* master_client);
+
   // Test seam for BatchPut RDMA fusion failure injection.  Forwards to
   // io_engine_->BatchWrite under release builds; in MORI_UMBP_TESTING
   // builds it is `virtual` so a test subclass can override and synthesize
@@ -338,6 +406,18 @@ class PoolClient {
                                               const mori::io::BatchSizeVec& sizes,
                                               mori::io::TransferStatusPtrVec& statuses,
                                               mori::io::TransferUniqueIdVec& ids);
+  // Test seam for BatchGet RDMA fusion failure injection.  Forwards to
+  // io_engine_->BatchRead; in MORI_UMBP_TESTING builds it is `virtual`
+  // so a test subclass can synthesize pair-level Read failures (see
+  // test_pool_client_batch_get_fused.cpp PartialPairFailure).  Build-mode
+  // contract identical to IssueBatchWrite (obs_counters.h).
+  MORI_UMBP_TEST_VIRTUAL void IssueBatchRead(const mori::io::MemDescVec& local_dest,
+                                             const mori::io::BatchSizeVec& local_offsets,
+                                             const mori::io::MemDescVec& remote_src,
+                                             const mori::io::BatchSizeVec& remote_offsets,
+                                             const mori::io::BatchSizeVec& sizes,
+                                             mori::io::TransferStatusPtrVec& statuses,
+                                             mori::io::TransferUniqueIdVec& ids);
   bool EnsurePeerServiceConnection(PeerConnection& peer);
   bool RemoteSsdWrite(PeerConnection& peer, const std::string& key, const void* src, size_t size,
                       bool zero_copy, uint32_t store_index = 0,
@@ -372,6 +452,11 @@ class PoolClient {
   std::atomic<uint64_t> batch_put_items_{0};
   std::atomic<uint64_t> batch_put_io_engine_calls_{0};
   std::atomic<uint64_t> batch_put_io_engine_pairs_{0};
+  // BatchGet fusion counters (mirror of BatchPut).
+  std::atomic<uint64_t> batch_get_calls_{0};
+  std::atomic<uint64_t> batch_get_items_{0};
+  std::atomic<uint64_t> batch_get_io_engine_calls_{0};
+  std::atomic<uint64_t> batch_get_io_engine_pairs_{0};
 
   // Throttle state for the batch-level WARN emitted when BatchPut sees
   // an unregistered src and falls back to the per-item staging path.
