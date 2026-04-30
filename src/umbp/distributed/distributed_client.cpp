@@ -40,6 +40,18 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
 
   const auto& dc = config.distributed.value();
 
+  // TODO(distributed-ssd): remove or narrow this guard once DistributedClient
+  // actually wires in ssd_stores + PeerService for the distributed data path.
+  if (config_.ssd.enabled) {
+    MORI_UMBP_WARN(
+        "[DistributedClient] SSD tier is currently not wired in distributed "
+        "mode (node_id={}); ignoring ssd.enabled={} ssd.capacity_bytes={} "
+        "and running DRAM-only.",
+        dc.master_config.node_id, config_.ssd.enabled, config_.ssd.capacity_bytes);
+    config_.ssd.enabled = false;
+    config_.ssd.capacity_bytes = 0;
+  }
+
   dram_pool_size_ = config.dram.capacity_bytes;
   dram_pool_ =
       mmap(nullptr, dram_pool_size_, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);

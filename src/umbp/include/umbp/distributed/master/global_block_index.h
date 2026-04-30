@@ -124,6 +124,11 @@ class GlobalBlockIndex {
   // Returns metrics for a key, or nullopt if the key doesn't exist.
   std::optional<BlockMetrics> GetMetrics(const std::string& key) const;
 
+  // Returns the prefix-aware depth recorded for `key` (set by
+  // BatchFinalizeAllocation depths[]), or nullopt if the key doesn't
+  // exist.  Test-facing read-only accessor.
+  std::optional<int32_t> GetDepth(const std::string& key) const;
+
   // --- Eviction ---
 
   struct NodeTierKey {

@@ -254,6 +254,13 @@ void GlobalBlockIndex::SetDepth(const std::string& key, int32_t depth) {
   }
 }
 
+std::optional<int32_t> GlobalBlockIndex::GetDepth(const std::string& key) const {
+  std::shared_lock lock(mutex_);
+  auto it = entries_.find(key);
+  if (it == entries_.end()) return std::nullopt;
+  return it->second.depth;
+}
+
 std::vector<EvictionCandidate> GlobalBlockIndex::FindEvictionCandidates(
     const std::set<NodeTierKey>& overloaded_node_tiers) const {
   std::vector<EvictionCandidate> candidates;

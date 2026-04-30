@@ -202,6 +202,15 @@ TEST_F(CrossNodeSmoke, DepthPropagation) {
     EXPECT_TRUE(client_a_->Exists(keys[i]));
   }
 
+  // Master-side depth propagation assertion (v2.1.2 R2-C).  Catches
+  // fin_depths[] vs pending[] alignment bugs that the BatchPut fused
+  // path could regress when reordering items between phases.
+  for (size_t i = 0; i < keys.size(); ++i) {
+    auto d = master_->GetBlockDepthForTest(keys[i]);
+    ASSERT_TRUE(d.has_value()) << "master has no entry for " << keys[i];
+    EXPECT_EQ(*d, depths[i]) << "depth mismatch for " << keys[i];
+  }
+
   auto* dst1 = static_cast<char*>(read_buf_);
   std::memset(dst1, 0, kBlockSize);
   ASSERT_TRUE(client_b_->Get("d1", dst1, kBlockSize));

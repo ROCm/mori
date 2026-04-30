@@ -20,12 +20,11 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-// Tests for the destructor wall-time bound added by
-// distributed-known-issues.md #7.  A fake UMBPMaster service that
-// answers RegisterClient quickly but blocks Heartbeat / UnregisterClient
-// stands in for an unreachable master.  ~MasterClient must return
-// within (Heartbeat 3 s + UnregisterClient 3 s + slack) thanks to the
-// per-RPC ClientContext deadlines on the shutdown path.
+// Tests for the destructor wall-time bound.  A fake UMBPMaster service
+// that answers RegisterClient quickly but blocks Heartbeat /
+// UnregisterClient stands in for an unreachable master.  ~MasterClient
+// must return within (Heartbeat 3 s + UnregisterClient 3 s + slack)
+// thanks to the per-RPC ClientContext deadlines on the shutdown path.
 
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/server_builder.h>

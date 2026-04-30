@@ -20,8 +20,8 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-// Tests for the BatchAbortAllocation refactor
-// (distributed-known-issues #19).  Two layers of coverage:
+// Tests for batched rollback of pending allocations.  Two layers of
+// coverage:
 //   1. Master-level RPC wiring: build up pending allocations via RoutePut
 //      and roll them back through BatchAbortAllocation, verifying the
 //      parallel `aborted[]` flags for valid / already-reaped / unknown /
@@ -29,7 +29,7 @@
 //   2. BatchPut integration contract: the happy path must issue ZERO
 //      BatchAbortAllocation RPCs (observability counters stay at 0).
 //
-// Counter assertions require building with -DMORI_UMBP_OBS_COUNTERS=ON.
+// Counter assertions require building with -DMORI_UMBP_TESTING=ON.
 // When compiled without the flag the counter getters are always-zero
 // and the EXPECT_EQ(..., 0u) assertions still pass (they degenerate to
 // 0 == 0); behavioral assertions (aborted[] flags, BatchPut success)

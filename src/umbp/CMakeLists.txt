@@ -9,11 +9,14 @@ set(SPDK_PKG_CONFIG_PATH
     CACHE STRING "Custom pkg-config path for SPDK")
 option(USE_SPDK "Enable SPDK support (auto-detected by default)" ON)
 
-# Test/bench-only observability counters inside distributed PoolClient (RPC
-# call/entry counts for assertion).  OFF in release — increment call sites
-# compile away to (void)0 via MORI_UMBP_OBS_INC.
-option(MORI_UMBP_OBS_COUNTERS
-       "Enable PoolClient observability counters for tests/bench" OFF)
+# Test/bench-only build switch.  Covers (1) observability counter increments
+# inside distributed PoolClient and (2) virtual test seams (e.g.
+# IssueBatchWrite) used by failure-injection unit tests.  OFF in release —
+# counters compile away to (void)0; seams stay non-virtual for inlining.
+# Toggling this option changes class layout (vtable presence): test/release
+# object files MUST NOT be mixed-linked.
+option(MORI_UMBP_TESTING
+       "Enable PoolClient counters + virtual test seams for tests/bench" OFF)
 
 set(HAVE_SPDK FALSE)
 if(USE_SPDK)
@@ -333,8 +336,8 @@ target_link_libraries(umbp_common PUBLIC mori_logging mori_io mori_metrics
 
 target_compile_features(umbp_common PUBLIC cxx_std_17)
 
-if(MORI_UMBP_OBS_COUNTERS)
-  target_compile_definitions(umbp_common PUBLIC MORI_UMBP_OBS_COUNTERS)
+if(MORI_UMBP_TESTING)
+  target_compile_definitions(umbp_common PUBLIC MORI_UMBP_TESTING)
 endif()
 
 # NOTE: umbp_core no longer depends on umbp_common.  StandaloneClient has no

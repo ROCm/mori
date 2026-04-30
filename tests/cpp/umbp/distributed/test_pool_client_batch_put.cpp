@@ -20,8 +20,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-// Tests for the batch-level "src not registered" WARN added by
-// distributed-known-issues.md #12.  Three scenarios:
+// Tests for the batch-level "src not registered" WARN.  Three scenarios:
 //   1. Cross-node BatchPut with un-registered caller src → exactly one
 //      batch-level WARN per PoolClient instance, suppressed for 60s on
 //      subsequent batches.

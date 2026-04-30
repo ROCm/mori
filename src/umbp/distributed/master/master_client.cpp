@@ -40,7 +40,7 @@ namespace {
 //     charged to ~MasterClient via StopHeartbeat()'s join()).
 // Default 3 s covers normal master response + one kernel retransmission
 // while still letting the destructor return promptly when master is dead.
-// Override via UMBP_RPC_SHUTDOWN_TIMEOUT_MS.  See distributed-known-issues.md #7.
+// Override via UMBP_RPC_SHUTDOWN_TIMEOUT_MS.
 int RpcShutdownTimeoutMs() {
   static const int v =
       static_cast<int>(GetEnvMilliseconds("UMBP_RPC_SHUTDOWN_TIMEOUT_MS",

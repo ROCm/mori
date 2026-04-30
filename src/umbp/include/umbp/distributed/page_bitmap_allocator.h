@@ -51,7 +51,7 @@ struct AllocResult {
 // physical buffer registered by the Client at RegisterClient time); each
 // BufferState carries an independent `vector<bool>` bitmap.
 //
-// Allocation strategy (see refactor-master-page-allocator.md §6.4):
+// Allocation strategy:
 //   1. same-buffer continuous run  (best — single-RDMA-friendly)
 //   2. same-buffer discrete pages  (in-buffer scatter-gather)
 //   3. cross-buffer discrete pages (cross-buffer scatter-gather, fallback)
