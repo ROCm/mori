@@ -127,7 +127,20 @@ void IBVerbsDeviceContext::ConnectEndpoint(const RdmaEndpointHandle& local,
   assert(portAttr);
   // RTR
   attr.qp_state = IBV_QPS_RTR;
-  attr.path_mtu = portAttr->active_mtu;
+  {
+    ibv_mtu path_mtu = portAttr->active_mtu;
+    const char* envMtu = std::getenv("MORI_IB_PATH_MTU");
+    if (envMtu != nullptr) {
+      int mtuBytes = std::atoi(envMtu);
+      if      (mtuBytes == 256)  path_mtu = IBV_MTU_256;
+      else if (mtuBytes == 512)  path_mtu = IBV_MTU_512;
+      else if (mtuBytes == 1024) path_mtu = IBV_MTU_1024;
+      else if (mtuBytes == 2048) path_mtu = IBV_MTU_2048;
+      else if (mtuBytes == 4096) path_mtu = IBV_MTU_4096;
+      MORI_APP_INFO("MORI_IB_PATH_MTU override: {} bytes (ibv_mtu={})", mtuBytes, (int)path_mtu);
+    }
+    attr.path_mtu = path_mtu;
+  }
   attr.dest_qp_num = remote.qpn;
   attr.rq_psn = 0;
   attr.max_dest_rd_atomic = devAttr->orig_attr.max_qp_rd_atom;
