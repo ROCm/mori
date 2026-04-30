@@ -2300,6 +2300,56 @@ implementation and record the failure.
 
 ---
 
+## Entry 61 — `MORI_OUTPUT_SDMA_COPY=1` first run hangs after Test 1b; guard and fix signal accounting
+- **Date**: 2026-04-30
+- **Failing commit under test**: `60b333fa`
+- **Command**: `bash tools/bench_sdma_ag_copy_pipe.sh`
+- **Variant**: script default `RUN_OUTPUT_SDMA_COPY=1`
+
+### Observed failure
+
+The run reached Test 1 and Test 1b. Test 1 passed, and PE0 reported Test 1b
+copy-to-user correctness passed:
+```text
+>>> Test 1: Out-of-place (copy_output_to_user=False, uint32)
+  PE 0: output_tensor correctly untouched (all zeros)
+...
+>>> Test 1b: Copy-to-user (copy_output_to_user=True, + MORI_REGISTER_USER_OUTPUT if set, uint32)
+  Warmup 1/1: 5.731 ms
+  PE 0: copy-to-user correctness PASSED  (cache hits=0, misses=0)
+```
+
+The process then stopped progressing before the Test 1b performance summary /
+next test. This is not a valid performance result.
+
+### Code side effect removed
+
+The first `SdmaLocalOutputCopyKernel` implementation updated
+`srcObj->expectSignalsPtr` for the output-transit symmetric object. That object
+is also used by other SDMA collective phases. Output-copy instrumentation must
+not mutate the object's global expected-signal bookkeeping.
+
+### Fix
+
+The kernel now avoids `expectSignalsPtr`. For each local SDMA queue it:
+1. reads the current local signal value,
+2. submits the copy + atomic increment,
+3. waits for `current + 1`.
+
+`tools/bench_sdma_ag_copy_pipe.sh` also defaults `RUN_OUTPUT_SDMA_COPY=0` after
+this failure. To debug the fixed path, run explicitly with:
+```bash
+RUN_OUTPUT_SDMA_COPY=1 bash tools/bench_sdma_ag_copy_pipe.sh
+```
+
+### Status
+
+`MORI_OUTPUT_SDMA_COPY=1` remains experimental and opt-in. It is not accepted
+until a full run prints all summary tables without hanging and improves wall vs
+baseline.
+
+---
+
 ## Entry 49 — Implement integer accumulator fast path for uint32/int32 pipeline reduce
 - **Date**: 2026-04-30
 - **Commit**: _this commit_

@@ -140,11 +140,8 @@ __global__ void SdmaLocalOutputCopyKernel(const application::SymmMemObjPtr srcOb
     uint8_t* src = reinterpret_cast<uint8_t*>(srcObj->localPtr) + offset;
     uint8_t* dst = reinterpret_cast<uint8_t*>(dst_void) + offset;
 
+    HSAuint64 expected = core::AtomicLoadRelaxed(signal + qId) + 1ULL;
     core::SdmaPutThread(src, dst, copy_bytes, dh, signal, numQ, qId);
-    HSAuint64 expected =
-        __hip_atomic_fetch_add(
-            srcObj->expectSignalsPtr + static_cast<size_t>(myPe) * numQ + qId,
-            1ULL, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) + 1ULL;
     anvil::waitForSignal(signal + qId, expected);
 }
 

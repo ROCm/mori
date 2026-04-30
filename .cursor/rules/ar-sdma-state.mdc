@@ -390,6 +390,13 @@ alone, but it is the highest-value drop-in subproblem and preserves user API.
 Next run must compare `BASELINE` vs `SDMA_OUTPUT_COPY`; keep only if wall
 improves, otherwise revert and record.
 
+Entry 61 first run on `60b333fa` hung after Test 1b correctness passed. The
+implementation had a bad side effect: it mutated `srcObj->expectSignalsPtr`.
+Fix attempt: do not touch `expectSignalsPtr`; read local signal and wait for
+`current+1`. Script default is now `RUN_OUTPUT_SDMA_COPY=0`; use
+`RUN_OUTPUT_SDMA_COPY=1 bash tools/bench_sdma_ag_copy_pipe.sh` only for targeted
+debug of the fixed path.
+
 ### Integer reduce fast path (Entry 50)
 
 `uint32/int32` pipeline reduce now accumulates in packed integer registers
@@ -522,7 +529,7 @@ default (`RUN_PHASE_TIMING=1`).
 Entry 59 data shows finite output copy GPU wall is `0.383 ms` and continuous
 target gap is still `+1.068 ms`.
 Entry 60 adds `MORI_OUTPUT_SDMA_COPY=1`; `tools/bench_sdma_ag_copy_pipe.sh`
-runs `SDMA_OUTPUT_COPY` by default.
+keeps it opt-in after Entry 61 hang (`RUN_OUTPUT_SDMA_COPY=0` by default).
 
 `MORI_DIRECT_OUTPUT=1` 激活 Plan A v2 path; 不开则走 BASELINE.
 `MORI_SDMA_AG_COPY_PIPE=1` 激活 K1 scatter + K2 R-reduce / SDMA-AG / C-copy pipeline.
