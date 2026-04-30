@@ -1,0 +1,8 @@
+# Main Prometheus config.
+# Component scrape jobs live in conf.d/ — drop a *.yml fragment there to add a new target.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 30s
+
+scrape_config_files:
+  - /etc/prometheus/conf.d/*.yml

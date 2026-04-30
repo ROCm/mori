@@ -33,9 +33,9 @@
 #include <vector>
 
 #include "mori/io/engine.hpp"
-#include "umbp/common/config.h"
-#include "umbp/common/types.h"
+#include "umbp/distributed/config.h"
 #include "umbp/distributed/master/master_client.h"
+#include "umbp/distributed/types.h"
 
 namespace mori::umbp {
 
@@ -55,9 +55,9 @@ class PoolClient {
   bool RegisterMemory(void* ptr, size_t size);
   void DeregisterMemory(void* ptr);
 
-  // Phase 2: DRAM-only methods for UMBPClient integration.
-  // UMBPClient handles local storage directly and calls these for cluster
-  // interactions only. PoolClient never touches local storage.
+  // DRAM-only methods for UMBPClient integration.  UMBPClient handles local
+  // storage directly and calls these for cluster interactions only;
+  // PoolClient never touches local storage.
 
   // Register an already-written local block with the Master so remote nodes
   // can discover it. UMBPClient provides the location_id (e.g. "0:<offset>").
@@ -67,23 +67,59 @@ class PoolClient {
                           TierType tier, const std::string& allocation_id);
   bool PublishLocalBlock(const std::string& key, size_t size, const std::string& location_id,
                          TierType tier);
+  // Roll back a pending allocation on the Master.  Only call this AFTER
+  // Master has handed out a successful allocation (RoutePut / AllocateForPut)
+  // AND the local-side commit work (memcpy / RDMA / FinalizeAllocation)
+  // failed.  Do NOT call to defend against malformed Master responses or
+  // Master-side validation rejections -- those are handled by Master
+  // internally (AllocateForPut invariant guard, FinalizeAllocation
+  // auto-rollback) and reaching for Abort on top of them is redundant.
   bool AbortAllocation(const std::string& node_id, TierType tier, const std::string& allocation_id,
                        uint64_t size);
 
-  // Check whether a block exists on any remote node (RouteGet without RDMA).
-  bool ExistsRemote(const std::string& key);
+  // Check whether a block exists in the cluster (local or remote, no RDMA).
+  bool Exists(const std::string& key);
+
+  // Batched existence check — single BatchLookup gRPC for the whole batch.
+  // Same semantics as Exists (no access-count / lease side-effects).
+  // On wire error all entries are false.  Returns a vector parallel to
+  // `keys`.
+  std::vector<bool> BatchExists(const std::vector<std::string>& keys);
 
   bool IsRegistered(const std::string& key) const;
 
   // Fetch a block from a remote node via RDMA.
   // DRAM: RouteGet -> direct RDMA read.
   // SSD: RouteGet -> PeerService PrepareSsdRead (SSD->staging slot) -> RDMA read.
-  bool GetRemote(const std::string& key, void* dst, size_t size);
+  //
+  // `size` MUST equal the byte size committed at Put time (Master tracks
+  // it in Location.size and returns it via RouteGet).  Mismatch is a
+  // contract violation — the call fails fast with a clear error rather
+  // than silently truncating the last page or pulling stale tail bytes.
+  //
+  // The caller is responsible for tracking the original Put size (e.g.
+  // alongside the key in its own metadata).  `Lookup` deliberately does
+  // not return size to keep that RPC cheap and side-effect-free; querying
+  // size via `RouteGet` would create a lease as a side effect, which is
+  // exactly what `Lookup` was introduced to avoid (see issue #9).
+  bool Get(const std::string& key, void* dst, size_t size);
 
   // Write a block to a remote node via RDMA.
   // DRAM: RoutePut -> direct RDMA write.
   // SSD: RoutePut -> AllocateWriteSlot -> RDMA write -> CommitSsdWrite.
-  bool PutRemote(const std::string& key, const void* src, size_t size);
+  bool Put(const std::string& key, const void* src, size_t size);
+
+  // Batch write: single gRPC for routing + batched RDMA + single gRPC for finalize.
+  std::vector<bool> BatchPut(const std::vector<std::string>& keys,
+                             const std::vector<const void*>& srcs, const std::vector<size_t>& sizes,
+                             const std::vector<int>& depths = {});
+
+  // Batch read: single gRPC for routing + batched RDMA.
+  // Same per-entry size contract as Get: sizes[i] MUST equal the
+  // stored Location.size for keys[i].  Per-entry mismatch fails just that
+  // entry (results[i]=false); other entries are unaffected.
+  std::vector<bool> BatchGet(const std::vector<std::string>& keys, const std::vector<void*>& dsts,
+                             const std::vector<size_t>& sizes);
 
   // Unregister a block from the Master (block no longer remotely accessible).
   bool UnregisterFromMaster(const std::string& key);
@@ -94,6 +130,25 @@ class PoolClient {
 
   MasterClient& Master();
   bool IsInitialized() const;
+
+  // Observability counters — members always exist (ABI stable) but only
+  // increment when built with -DMORI_UMBP_OBS_COUNTERS.  Release builds
+  // leave them at 0 and pay zero CPU cost at increment call sites.
+  uint64_t AbortAllocationCallsCount() const {
+    return abort_allocation_calls_.load(std::memory_order_relaxed);
+  }
+  uint64_t BatchAbortAllocationCallsCount() const {
+    return batch_abort_allocation_calls_.load(std::memory_order_relaxed);
+  }
+  uint64_t BatchAbortAllocationEntriesCount() const {
+    return batch_abort_allocation_entries_.load(std::memory_order_relaxed);
+  }
+
+  // ---- External KV block events ----
+  bool ReportExternalKvBlocks(const std::vector<std::string>& hashes, TierType tier);
+  bool RevokeExternalKvBlocks(const std::vector<std::string>& hashes);
+  bool MatchExternalKv(const std::vector<std::string>& hashes,
+                       std::vector<MasterClient::ExternalKvNodeMatch>* out_matches);
 
  private:
   PoolClientConfig config_;
@@ -133,14 +188,41 @@ class PoolClient {
   std::unordered_map<std::string, std::unique_ptr<PeerConnection>> peers_;
 
   PeerConnection& GetOrConnectPeer(const std::string& node_id, const std::string& peer_address,
-                                   const std::vector<uint8_t>& engine_desc_bytes,
-                                   const std::vector<uint8_t>& dram_memory_desc_bytes,
-                                   uint32_t buffer_index = 0);
+                                   const std::vector<uint8_t>& engine_desc_bytes);
+
+  // Hydrate `peer.dram_memories[bd.buffer_index]` for every entry in
+  // `descs`.  Idempotent: already-cached entries are left alone since
+  // MemoryDesc is immutable.  Used by Put/Get paths to absorb the
+  // RoutePut/RouteGet response `dram_memory_descs` list before issuing
+  // RDMA.  Caller MUST NOT hold peers_mutex_; this helper acquires it.
+  void EnsureBufferDescsCached(PeerConnection& peer,
+                               const std::vector<BufferMemoryDescBytes>& descs);
 
   bool RemoteDramWrite(PeerConnection& peer, uint32_t buffer_index, const void* src, size_t size,
                        uint64_t offset, bool zero_copy);
   bool RemoteDramRead(PeerConnection& peer, uint32_t buffer_index, void* dst, size_t size,
                       uint64_t offset, bool zero_copy);
+
+  // Multi-page scatter-gather variants used by Put/Get when the master hands
+  // back more than one PageLocation.  Pages may span multiple buffer_indices
+  // (Strategy 3 of PageBitmapAllocator).  The caller MUST have already
+  // populated `peer.dram_memories[buffer_index]` for every buffer_index in
+  // `pages` (typically via EnsureBufferDescsCached).
+  //
+  // Source layout: pages[i] receives src[i*page_size .. min((i+1)*page_size, size)).
+  // We accept any `size` in ((N-1)*page_size, N*page_size] where N =
+  // pages.size().  PageBitmapAllocator rounds up to ceil(size/page_size)
+  // pages, so the *last* logical page is partially filled when size is not
+  // a multiple of page_size; only that page's real bytes are transferred.
+  //
+  // Internally groups by buffer_index, builds one (localOffsets[k],
+  // remoteOffsets[k], sizes[k]) batch per distinct buffer (= IOEngine's
+  // outer N), and issues a single BatchWrite/BatchRead.  All-or-nothing:
+  // if any sub-transfer fails the call returns false (no retry).
+  bool RemoteDramScatterWrite(PeerConnection& peer, const std::vector<PageLocation>& pages,
+                              uint64_t page_size, const void* src, size_t size, bool zero_copy);
+  bool RemoteDramScatterRead(PeerConnection& peer, const std::vector<PageLocation>& pages,
+                             uint64_t page_size, void* dst, size_t size, bool zero_copy);
   bool EnsurePeerServiceConnection(PeerConnection& peer);
   bool RemoteSsdWrite(PeerConnection& peer, const std::string& key, const void* src, size_t size,
                       bool zero_copy, uint32_t store_index = 0,
@@ -162,6 +244,21 @@ class PoolClient {
 
   mutable std::mutex cache_mutex_;
   std::unordered_map<std::string, Location> cluster_locations_;
+
+  // Observability counters.  See header-top MORI_UMBP_OBS_COUNTERS macro
+  // in obs_counters.h; declared unconditionally so class layout does not
+  // differ between release and test builds.
+  std::atomic<uint64_t> abort_allocation_calls_{0};
+  std::atomic<uint64_t> batch_abort_allocation_calls_{0};
+  std::atomic<uint64_t> batch_abort_allocation_entries_{0};
+
+  // Throttle state for the batch-level WARN emitted when BatchPut sees
+  // an unregistered src and falls back to the per-item staging path
+  // (distributed-known-issues.md #12).  Per-instance so unit tests get
+  // fresh state with each fresh PoolClient.  Stores the steady_clock
+  // ns timestamp of the last emitted warning; 0 means "never emitted".
+  std::atomic<int64_t> last_batch_put_staging_warn_ns_{0};
+  bool ShouldEmitBatchPutStagingWarn();
 };
 
 }  // namespace mori::umbp

@@ -21,6 +21,7 @@
 // SOFTWARE.
 #pragma once
 
+#include <grpcpp/channel.h>
 #include <grpcpp/support/status.h>
 
 #include <atomic>
@@ -31,15 +32,13 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
-#include "umbp/common/config.h"
-#include "umbp/common/types.h"
+#include "umbp/distributed/config.h"
 #include "umbp/distributed/routing/route_put_strategy.h"
-
-namespace grpc_impl {
-class Channel;
-}
+#include "umbp/distributed/types.h"
 
 namespace mori::umbp {
 
@@ -47,12 +46,17 @@ struct RouteGetResult {
   Location location;
   std::string peer_address;
   std::vector<uint8_t> engine_desc_bytes;
-  std::vector<uint8_t> dram_memory_desc_bytes;
+
+  // DRAM/HBM only; empty for SSD tier.
+  std::vector<BufferMemoryDescBytes> dram_memory_descs;
+  uint64_t page_size = 0;
 };
 
 class MasterClient {
  public:
-  explicit MasterClient(const MasterClientConfig& config);
+  using Labels = std::vector<std::pair<std::string, std::string>>;
+
+  explicit MasterClient(const UMBPMasterClientConfig& config);
   ~MasterClient();
 
   MasterClient(const MasterClient&) = delete;
@@ -60,12 +64,17 @@ class MasterClient {
 
   // --- Client lifecycle ---
   // Register with master. If auto_heartbeat, starts heartbeat thread.
+  // `dram_page_size` is the page size the Client wants Master's
+  // PageBitmapAllocator to use for this node's DRAM/HBM tier (per Q6, the
+  // same value applies to both tiers).  0 means "use Master's
+  // ClientRegistryConfig.default_dram_page_size".  Set from
+  // PoolClientConfig.dram_page_size at the call site.
   grpc::Status RegisterSelf(
       const std::map<TierType, TierCapacity>& tier_capacities, const std::string& peer_address = "",
       const std::vector<uint8_t>& engine_desc_bytes = {},
       const std::vector<std::vector<uint8_t>>& dram_memory_desc_bytes_list = {},
       const std::vector<uint64_t>& dram_buffer_sizes = {},
-      const std::vector<uint64_t>& ssd_store_capacities = {});
+      const std::vector<uint64_t>& ssd_store_capacities = {}, uint64_t dram_page_size = 0);
   grpc::Status UnregisterSelf();
 
   // --- Block index ---
@@ -75,8 +84,10 @@ class MasterClient {
   // If removed is non-null, returns 1 when removed, otherwise 0.
   grpc::Status Unregister(const std::string& key, const Location& location,
                           uint32_t* removed = nullptr);
+  // Read-only existence check (no access count side-effects).
+  grpc::Status Lookup(const std::string& key, bool* found);
   grpc::Status FinalizeAllocation(const std::string& key, const Location& location,
-                                  const std::string& allocation_id);
+                                  const std::string& allocation_id, int32_t depth = -1);
   grpc::Status PublishLocalBlock(const std::string& key, const Location& location);
   grpc::Status AbortAllocation(const std::string& node_id, const std::string& allocation_id,
                                uint64_t size);
@@ -92,16 +103,73 @@ class MasterClient {
   grpc::Status RoutePut(const std::string& key, uint64_t block_size,
                         std::optional<RoutePutResult>* out_result);
 
+  // --- Batch RPCs ---
+  grpc::Status BatchRoutePut(const std::vector<std::string>& keys,
+                             const std::vector<uint64_t>& block_sizes,
+                             std::vector<std::optional<RoutePutResult>>* out);
+  grpc::Status BatchRouteGet(const std::vector<std::string>& keys,
+                             std::vector<std::optional<RouteGetResult>>* out);
+  grpc::Status BatchFinalizeAllocation(const std::vector<std::string>& keys,
+                                       const std::vector<Location>& locations,
+                                       const std::vector<std::string>& allocation_ids,
+                                       std::vector<bool>* out,
+                                       const std::vector<int32_t>& depths = {});
+  // Read-only batch existence check (no access-count / lease side-effects).
+  // `out` is cleared on entry; on wire error it remains empty and the
+  // returned Status carries the failure.  On success, `*out` is resized to
+  // keys.size() and populated parallel to keys.
+  grpc::Status BatchLookup(const std::vector<std::string>& keys, std::vector<bool>* out);
+
+  // One entry of a BatchAbortAllocation request.  `node_id` is the target
+  // node owning the pending lease (not the caller); matches the single-item
+  // AbortAllocation semantics.
+  struct BatchAbortEntry {
+    std::string node_id;
+    std::string allocation_id;
+    uint64_t size;
+  };
+  // Batched rollback of pending allocations.  Semantics align with
+  // BatchFinalizeAllocation: wire success returns Status::OK and fills
+  // *out parallel to `entries`; per-entry false is not an error (racy
+  // reap / double-abort / EXPIRED node).  Callers use it as best-effort
+  // cleanup; TTL reaper covers the rest.
+  grpc::Status BatchAbortAllocation(const std::vector<BatchAbortEntry>& entries,
+                                    std::vector<bool>* out);
+
   // --- Heartbeat ---
   void StartHeartbeat();
   void StopHeartbeat();
 
+  // --- Client-side metrics ---
+  // Buffer a counter delta. Flushed to master via ReportMetrics RPC periodically.
+  void AddCounter(std::string name, std::string help, Labels labels, double delta);
+  // Buffer a gauge value (last write wins between flushes).
+  void SetGauge(std::string name, std::string help, Labels labels, double value);
+  // Buffer a histogram observation.
+  void Observe(std::string name, std::string help, Labels labels, std::vector<double> bounds,
+               double value);
+
   bool IsRegistered() const { return registered_; }
 
- private:
-  MasterClientConfig config_;
+  // --- External KV block events ---
+  grpc::Status ReportExternalKvBlocks(const std::string& node_id,
+                                      const std::vector<std::string>& hashes, TierType tier);
+  grpc::Status RevokeExternalKvBlocks(const std::string& node_id,
+                                      const std::vector<std::string>& hashes);
 
-  std::shared_ptr<grpc_impl::Channel> channel_;
+  struct ExternalKvNodeMatch {
+    std::string node_id;
+    std::string peer_address;
+    std::vector<std::string> matched_hashes;
+    TierType tier = TierType::UNKNOWN;
+  };
+  grpc::Status MatchExternalKv(const std::vector<std::string>& hashes,
+                               std::vector<ExternalKvNodeMatch>* out_matches);
+
+ private:
+  UMBPMasterClientConfig config_;
+
+  std::shared_ptr<grpc::Channel> channel_;
   // Use void* to avoid exposing generated stub type in header.
   // Cast to UMBPMaster::Stub* in the .cpp file.
   std::unique_ptr<void, void (*)(void*)> stub_;
@@ -119,6 +187,37 @@ class MasterClient {
   std::map<TierType, TierCapacity> current_capacities_;
 
   void HeartbeatLoop();
+
+  // --- Metrics buffering ---
+  struct PendingSample {
+    std::string name;
+    std::string help;
+    Labels labels;
+    double value = 0.0;
+  };
+  struct PendingHistogram {
+    std::string name;
+    std::string help;
+    Labels labels;
+    std::vector<double> bounds;
+    double value = 0.0;
+  };
+
+  std::mutex metrics_mutex_;
+  std::unordered_map<std::string, PendingSample> pending_counters_;
+  std::unordered_map<std::string, PendingSample> pending_gauges_;
+  std::vector<PendingHistogram> pending_histograms_;
+
+  uint64_t metrics_interval_ms_ = 1000;
+
+  std::thread metrics_thread_;
+  std::atomic<bool> metrics_running_{false};
+  std::mutex metrics_cv_mutex_;
+  std::condition_variable metrics_cv_;
+
+  void StartMetricsReporting();
+  void StopMetricsReporting();
+  void MetricsLoop();
 };
 
 }  // namespace mori::umbp

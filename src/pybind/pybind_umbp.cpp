@@ -22,15 +22,84 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <cstdint>
+#include <sstream>
+
 #include "src/pybind/mori.hpp"
 #include "umbp/common/config.h"
-#include "umbp/local/umbp_client.h"
+#include "umbp/distributed/config.h"
+#include "umbp/distributed/distributed_client.h"
+#include "umbp/distributed/master/master_client.h"
+#include "umbp/distributed/types.h"
+#include "umbp/local/host_mem_allocator.h"
+#include "umbp/umbp_client.h"
 
 namespace py = pybind11;
 
 namespace mori {
 using namespace umbp;
 void RegisterMoriUmbp(py::module_& m) {
+  py::enum_<HostBufferBacking>(m, "UMBPHostBufferBacking")
+      .value("Anonymous", HostBufferBacking::kAnonymous)
+      .value("AnonymousHugetlb", HostBufferBacking::kAnonymousHugetlb)
+      .export_values();
+
+  py::class_<HostBufferHandle>(m, "UMBPHostBufferHandle")
+      .def(py::init<>())
+      .def_property_readonly(
+          "ptr",
+          [](const HostBufferHandle& handle) { return reinterpret_cast<uintptr_t>(handle.ptr); })
+      .def_readonly("requested_size", &HostBufferHandle::requested_size)
+      .def_readonly("mapped_size", &HostBufferHandle::mapped_size)
+      .def_readonly("actual_backing", &HostBufferHandle::actual_backing)
+      .def_readonly("actual_alignment", &HostBufferHandle::actual_alignment)
+      .def("__bool__", &HostBufferHandle::valid)
+      .def("__repr__", [](const HostBufferHandle& handle) {
+        std::ostringstream oss;
+        oss << "<UMBPHostBufferHandle ptr=0x" << std::hex << reinterpret_cast<uintptr_t>(handle.ptr)
+            << std::dec << " requested_size=" << handle.requested_size
+            << " mapped_size=" << handle.mapped_size << ">";
+        return oss.str();
+      });
+
+  py::class_<HostMemAllocator>(m, "UMBPHostMemAllocator")
+      .def(py::init<>())
+      .def(
+          "alloc",
+          [](HostMemAllocator& self, size_t size, HostBufferBacking backing, size_t hugepage_size,
+             int numa_node, bool prefault) {
+            HostBufferOptions opts;
+            opts.backing = backing;
+            opts.hugepage_size = hugepage_size;
+            opts.numa_node = numa_node;
+            opts.prefault = prefault;
+            return self.Alloc(size, opts);
+          },
+          py::arg("size"), py::arg("backing") = HostBufferBacking::kAnonymous,
+          py::arg("hugepage_size") = size_t{2ULL * 1024 * 1024}, py::arg("numa_node") = -1,
+          py::arg("prefault") = true, py::call_guard<py::gil_scoped_release>())
+      .def(
+          "free", [](HostMemAllocator& self, HostBufferHandle& handle) { self.Free(handle); },
+          py::arg("handle"), py::call_guard<py::gil_scoped_release>());
+
+  py::enum_<TierType>(m, "UMBPTierType")
+      .value("Unknown", TierType::UNKNOWN)
+      .value("HBM", TierType::HBM)
+      .value("DRAM", TierType::DRAM)
+      .value("SSD", TierType::SSD)
+      .export_values();
+
+  py::class_<IUMBPClient::ExternalKvMatch>(m, "UMBPExternalKvMatch")
+      .def(py::init<>())
+      .def_readwrite("node_id", &IUMBPClient::ExternalKvMatch::node_id)
+      .def_readwrite("peer_address", &IUMBPClient::ExternalKvMatch::peer_address)
+      .def_readwrite("matched_hashes", &IUMBPClient::ExternalKvMatch::matched_hashes)
+      .def_readwrite("tier", &IUMBPClient::ExternalKvMatch::tier)
+      .def("__repr__", [](const IUMBPClient::ExternalKvMatch& m) {
+        return "<UMBPExternalKvMatch node_id='" + m.node_id +
+               "' matched=" + std::to_string(m.matched_hashes.size()) + ">";
+      });
+
   py::enum_<UMBPRole>(m, "UMBPRole")
       .value("Standalone", UMBPRole::Standalone)
       .value("SharedSSDLeader", UMBPRole::SharedSSDLeader)
@@ -92,17 +161,26 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("worker_threads", &UMBPCopyPipelineConfig::worker_threads)
       .def_readwrite("batch_max_ops", &UMBPCopyPipelineConfig::batch_max_ops);
 
+  py::class_<UMBPMasterClientConfig>(m, "UMBPMasterClientConfig")
+      .def(py::init<>())
+      .def_readwrite("master_address", &UMBPMasterClientConfig::master_address)
+      .def_readwrite("node_id", &UMBPMasterClientConfig::node_id)
+      .def_readwrite("node_address", &UMBPMasterClientConfig::node_address)
+      .def_readwrite("auto_heartbeat", &UMBPMasterClientConfig::auto_heartbeat);
+
+  py::class_<UMBPIoEngineConfig>(m, "UMBPIoEngineConfig")
+      .def(py::init<>())
+      .def_readwrite("host", &UMBPIoEngineConfig::host)
+      .def_readwrite("port", &UMBPIoEngineConfig::port);
+
   py::class_<UMBPDistributedConfig>(m, "UMBPDistributedConfig")
       .def(py::init<>())
-      .def_readwrite("master_address", &UMBPDistributedConfig::master_address)
-      .def_readwrite("node_id", &UMBPDistributedConfig::node_id)
-      .def_readwrite("node_address", &UMBPDistributedConfig::node_address)
-      .def_readwrite("auto_heartbeat", &UMBPDistributedConfig::auto_heartbeat)
-      .def_readwrite("io_engine_host", &UMBPDistributedConfig::io_engine_host)
-      .def_readwrite("io_engine_port", &UMBPDistributedConfig::io_engine_port)
+      .def_readwrite("master_config", &UMBPDistributedConfig::master_config)
+      .def_readwrite("io_engine", &UMBPDistributedConfig::io_engine)
       .def_readwrite("staging_buffer_size", &UMBPDistributedConfig::staging_buffer_size)
       .def_readwrite("peer_service_port", &UMBPDistributedConfig::peer_service_port)
-      .def_readwrite("cache_remote_fetches", &UMBPDistributedConfig::cache_remote_fetches);
+      .def_readwrite("cache_remote_fetches", &UMBPDistributedConfig::cache_remote_fetches)
+      .def_readwrite("dram_page_size", &UMBPDistributedConfig::dram_page_size);
 
   py::class_<UMBPConfig>(m, "UMBPConfig")
       .def(py::init<>())
@@ -130,23 +208,120 @@ void RegisterMoriUmbp(py::module_& m) {
                      &UMBPConfig::spdk_proxy_reserved_shared_bytes)
       .def_readwrite("distributed", &UMBPConfig::distributed);
 
-  py::class_<UMBPClient>(m, "UMBPClient")
-      .def(py::init<const UMBPConfig&>(), py::arg("config") = UMBPConfig{})
-      .def("put_from_ptr", &UMBPClient::PutFromPtr, py::arg("key"), py::arg("src"), py::arg("size"))
-      .def("get_into_ptr", &UMBPClient::GetIntoPtr, py::arg("key"), py::arg("dst"), py::arg("size"))
-      .def("exists", &UMBPClient::Exists, py::arg("key"))
-      .def("remove", &UMBPClient::Remove, py::arg("key"))
-      .def("batch_put_from_ptr", &UMBPClient::BatchPutFromPtr, py::arg("keys"), py::arg("ptrs"),
-           py::arg("sizes"))
-      .def("batch_put_from_ptr_with_depth", &UMBPClient::BatchPutFromPtrWithDepth, py::arg("keys"),
-           py::arg("ptrs"), py::arg("sizes"), py::arg("depths"))
-      .def("batch_get_into_ptr", &UMBPClient::BatchGetIntoPtr, py::arg("keys"), py::arg("ptrs"),
-           py::arg("sizes"))
-      .def("batch_exists", &UMBPClient::BatchExists, py::arg("keys"))
-      .def("batch_exists_consecutive", &UMBPClient::BatchExistsConsecutive, py::arg("keys"))
-      .def("clear", &UMBPClient::Clear)
-      .def("flush", &UMBPClient::Flush)
-      .def("is_distributed", &UMBPClient::IsDistributed);
+  py::class_<IUMBPClient, std::unique_ptr<IUMBPClient>>(m, "UMBPClient")
+      .def(py::init([](const UMBPConfig& cfg) { return CreateUMBPClient(cfg); }),
+           py::arg("config") = UMBPConfig{})
+      // All I/O-path methods release the GIL: they block on RDMA, SSD, or gRPC
+      // and never call back into Python, so releasing is always safe.
+      .def("put_from_ptr", &IUMBPClient::Put, py::arg("key"), py::arg("src"), py::arg("size"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("get_into_ptr", &IUMBPClient::Get, py::arg("key"), py::arg("dst"), py::arg("size"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("exists", &IUMBPClient::Exists, py::arg("key"), py::call_guard<py::gil_scoped_release>())
+      .def("batch_put_from_ptr", &IUMBPClient::BatchPut, py::arg("keys"), py::arg("ptrs"),
+           py::arg("sizes"), py::call_guard<py::gil_scoped_release>())
+      .def("batch_put_from_ptr_with_depth", &IUMBPClient::BatchPutWithDepth, py::arg("keys"),
+           py::arg("ptrs"), py::arg("sizes"), py::arg("depths"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("batch_get_into_ptr", &IUMBPClient::BatchGet, py::arg("keys"), py::arg("ptrs"),
+           py::arg("sizes"), py::call_guard<py::gil_scoped_release>())
+      .def("batch_exists", &IUMBPClient::BatchExists, py::arg("keys"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("batch_exists_consecutive", &IUMBPClient::BatchExistsConsecutive, py::arg("keys"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("clear", &IUMBPClient::Clear, py::call_guard<py::gil_scoped_release>())
+      .def("flush", &IUMBPClient::Flush, py::call_guard<py::gil_scoped_release>())
+      .def("is_distributed", &IUMBPClient::IsDistributed)  // pure getter, no I/O
+      .def("register_memory", &IUMBPClient::RegisterMemory, py::arg("ptr"), py::arg("size"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("deregister_memory", &IUMBPClient::DeregisterMemory, py::arg("ptr"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("report_external_kv_blocks", &IUMBPClient::ReportExternalKvBlocks, py::arg("hashes"),
+           py::arg("tier"), py::call_guard<py::gil_scoped_release>())
+      .def("revoke_external_kv_blocks", &IUMBPClient::RevokeExternalKvBlocks, py::arg("hashes"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("match_external_kv", &IUMBPClient::MatchExternalKv, py::arg("hashes"),
+           py::call_guard<py::gil_scoped_release>());
+
+  // UMBPMasterClient is a read-only query client for the UMBP master.
+  // It is intended solely for information lookup (e.g. matching external KV
+  // blocks) and does not register with the master, send heartbeats, or mutate
+  // any master state.
+  py::class_<MasterClient::ExternalKvNodeMatch>(m, "UMBPExternalKvNodeMatch")
+      .def(py::init<>())
+      .def_readwrite("node_id", &MasterClient::ExternalKvNodeMatch::node_id)
+      .def_readwrite("peer_address", &MasterClient::ExternalKvNodeMatch::peer_address)
+      .def_readwrite("matched_hashes", &MasterClient::ExternalKvNodeMatch::matched_hashes)
+      .def_readwrite("tier", &MasterClient::ExternalKvNodeMatch::tier)
+      .def("__repr__", [](const MasterClient::ExternalKvNodeMatch& m) {
+        return "<UMBPExternalKvNodeMatch node_id='" + m.node_id +
+               "' matched=" + std::to_string(m.matched_hashes.size()) + ">";
+      });
+
+  py::class_<MasterClient>(m, "UMBPMasterClient")
+      .def(py::init([](const std::string& master_address, const std::string& node_id,
+                       const std::string& node_address) {
+             UMBPMasterClientConfig cfg;
+             cfg.master_address = master_address;
+             cfg.node_id = node_id;
+             cfg.node_address = node_address;
+             cfg.auto_heartbeat = false;
+             return std::make_unique<MasterClient>(cfg);
+           }),
+           py::arg("master_address"), py::arg("node_id") = std::string{},
+           py::arg("node_address") = std::string{})
+      .def(
+          "register_self",
+          [](MasterClient& self,
+             const std::map<TierType, std::pair<uint64_t, uint64_t>>& tier_capacities) {
+            std::map<TierType, TierCapacity> caps;
+            for (const auto& [tier, total_avail] : tier_capacities) {
+              caps[tier] = {total_avail.first, total_avail.second};
+            }
+            auto status = self.RegisterSelf(caps);
+            if (!status.ok())
+              throw std::runtime_error("RegisterSelf failed: " + status.error_message());
+          },
+          py::arg("tier_capacities") = std::map<TierType, std::pair<uint64_t, uint64_t>>{},
+          py::call_guard<py::gil_scoped_release>())
+      .def(
+          "unregister_self",
+          [](MasterClient& self) {
+            auto status = self.UnregisterSelf();
+            if (!status.ok())
+              throw std::runtime_error("UnregisterSelf failed: " + status.error_message());
+          },
+          py::call_guard<py::gil_scoped_release>())
+      .def("is_registered", &MasterClient::IsRegistered)  // pure getter, no I/O
+      .def(
+          "report_external_kv_blocks",
+          [](MasterClient& self, const std::string& node_id, const std::vector<std::string>& hashes,
+             TierType tier) {
+            auto status = self.ReportExternalKvBlocks(node_id, hashes, tier);
+            if (!status.ok())
+              throw std::runtime_error("ReportExternalKvBlocks failed: " + status.error_message());
+          },
+          py::arg("node_id"), py::arg("hashes"), py::arg("tier"),
+          py::call_guard<py::gil_scoped_release>())
+      .def(
+          "revoke_external_kv_blocks",
+          [](MasterClient& self, const std::string& node_id,
+             const std::vector<std::string>& hashes) {
+            auto status = self.RevokeExternalKvBlocks(node_id, hashes);
+            if (!status.ok())
+              throw std::runtime_error("RevokeExternalKvBlocks failed: " + status.error_message());
+          },
+          py::arg("node_id"), py::arg("hashes"), py::call_guard<py::gil_scoped_release>())
+      .def(
+          "match_external_kv",
+          [](MasterClient& self, const std::vector<std::string>& hashes) {
+            std::vector<MasterClient::ExternalKvNodeMatch> matches;
+            auto status = self.MatchExternalKv(hashes, &matches);
+            if (!status.ok())
+              throw std::runtime_error("MatchExternalKv failed: " + status.error_message());
+            return matches;
+          },
+          py::arg("hashes"), py::call_guard<py::gil_scoped_release>());
 }
 
 }  // namespace mori

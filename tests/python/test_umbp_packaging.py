@@ -46,12 +46,17 @@ def _write_fake_mori_package(tmp_path: Path, proxy_mode: int) -> Path:
                 "class UMBPDistributedConfig: pass",
                 "class UMBPDramConfig: pass",
                 "class UMBPDurabilityMode: pass",
+                "class UMBPHostBufferBacking: pass",
+                "class UMBPHostBufferHandle: pass",
+                "class UMBPHostMemAllocator: pass",
                 "class UMBPIoBackend: pass",
                 "class UMBPIoConfig: pass",
                 "class UMBPRole: pass",
                 "class UMBPSsdConfig: pass",
                 "class UMBPEvictionConfig: pass",
                 "class UMBPDurabilityConfig: pass",
+                "class UMBPTierType: pass",
+                "class UMBPExternalKvMatch: pass",
             ]
         ),
         encoding="utf-8",
@@ -74,6 +79,7 @@ def _import_umbp_in_subprocess(
 ) -> dict[str, str]:
     env = os.environ.copy()
     env.pop("UMBP_SPDK_PROXY_BIN", None)
+    env.pop("UMBP_MASTER_BIN", None)
     env.update(extra_env)
     env["PYTHONPATH"] = str(tmp_path)
 

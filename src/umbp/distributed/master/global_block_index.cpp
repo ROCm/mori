@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <chrono>
 #include <mutex>
+#include <set>
 #include <unordered_set>
 
 #include "umbp/distributed/master/client_registry.h"
@@ -104,6 +105,8 @@ size_t GlobalBlockIndex::BatchRegister(
         entry.metrics.created_at = now;
         entry.metrics.last_accessed_at = now;
         entry.metrics.access_count = 0;
+        entry.last_accessed_rep.store(now.time_since_epoch().count(), std::memory_order_release);
+        entry.atomic_access_count.store(0, std::memory_order_relaxed);
       }
 
       auto it = std::find(entry.locations.begin(), entry.locations.end(), location);
@@ -114,6 +117,8 @@ size_t GlobalBlockIndex::BatchRegister(
       entry.locations.push_back(location);
       entry.metrics.last_accessed_at = now;
       ++entry.metrics.access_count;
+      entry.last_accessed_rep.store(now.time_since_epoch().count(), std::memory_order_release);
+      entry.atomic_access_count.fetch_add(1, std::memory_order_relaxed);
       ++inserted;
 
       if (keys_seen.insert(key).second) {
@@ -184,15 +189,14 @@ size_t GlobalBlockIndex::BatchUnregister(
 }
 
 void GlobalBlockIndex::RecordAccess(const std::string& key) {
-  std::unique_lock lock(mutex_);
+  std::shared_lock lock(mutex_);
 
   auto it = entries_.find(key);
   if (it == entries_.end()) {
     return;
   }
 
-  it->second.metrics.last_accessed_at = std::chrono::steady_clock::now();
-  ++it->second.metrics.access_count;
+  it->second.RecordAccessAtomic();
 }
 
 std::vector<Location> GlobalBlockIndex::Lookup(const std::string& key) const {
@@ -206,6 +210,18 @@ std::vector<Location> GlobalBlockIndex::Lookup(const std::string& key) const {
   return it->second.locations;
 }
 
+std::vector<bool> GlobalBlockIndex::BatchLookupExists(const std::vector<std::string>& keys) const {
+  std::vector<bool> results(keys.size(), false);
+  if (keys.empty()) return results;
+
+  std::shared_lock lock(mutex_);
+  for (size_t i = 0; i < keys.size(); ++i) {
+    auto it = entries_.find(keys[i]);
+    results[i] = (it != entries_.end()) && !it->second.locations.empty();
+  }
+  return results;
+}
+
 std::optional<BlockMetrics> GlobalBlockIndex::GetMetrics(const std::string& key) const {
   std::shared_lock lock(mutex_);
 
@@ -214,7 +230,105 @@ std::optional<BlockMetrics> GlobalBlockIndex::GetMetrics(const std::string& key)
     return std::nullopt;
   }
 
-  return it->second.metrics;
+  BlockMetrics result = it->second.metrics;
+  result.last_accessed_at = it->second.GetLastAccessed();
+  result.access_count = it->second.atomic_access_count.load(std::memory_order_acquire);
+  return result;
+}
+
+void GlobalBlockIndex::GrantLease(const std::string& key,
+                                  std::chrono::steady_clock::duration duration) {
+  std::shared_lock lock(mutex_);
+
+  auto it = entries_.find(key);
+  if (it != entries_.end()) {
+    it->second.GrantLease(duration);
+  }
+}
+
+void GlobalBlockIndex::SetDepth(const std::string& key, int32_t depth) {
+  std::unique_lock lock(mutex_);
+  auto it = entries_.find(key);
+  if (it != entries_.end()) {
+    it->second.depth = depth;
+  }
+}
+
+std::vector<EvictionCandidate> GlobalBlockIndex::FindEvictionCandidates(
+    const std::set<NodeTierKey>& overloaded_node_tiers) const {
+  std::vector<EvictionCandidate> candidates;
+  std::shared_lock lock(mutex_);
+
+  for (const auto& [key, entry] : entries_) {
+    if (entry.IsLeased()) {
+      continue;
+    }
+    for (const auto& loc : entry.locations) {
+      if (overloaded_node_tiers.count({loc.node_id, loc.tier})) {
+        EvictionCandidate c;
+        c.key = key;
+        c.location = loc;
+        c.last_accessed_at = entry.GetLastAccessed();
+        c.depth = entry.depth;
+        c.size = loc.size;
+        candidates.push_back(std::move(c));
+      }
+    }
+  }
+
+  return candidates;
+}
+
+std::vector<EvictionCandidate> GlobalBlockIndex::EvictEntries(
+    const std::vector<EvictionCandidate>& victims) {
+  std::vector<EvictionCandidate> evicted;
+  std::vector<std::pair<std::string, std::string>> keys_to_untrack;
+  ClientRegistry* registry = nullptr;
+
+  {
+    std::unique_lock lock(mutex_);
+    registry = registry_;
+
+    for (const auto& victim : victims) {
+      auto it = entries_.find(victim.key);
+      if (it == entries_.end()) {
+        continue;
+      }
+
+      auto& entry = it->second;
+      if (entry.IsLeased()) {
+        continue;
+      }
+
+      auto& locs = entry.locations;
+      auto loc_it = std::find(locs.begin(), locs.end(), victim.location);
+      if (loc_it == locs.end()) {
+        continue;
+      }
+
+      locs.erase(loc_it);
+      evicted.push_back(victim);
+
+      const bool has_remaining_for_node = std::any_of(
+          locs.begin(), locs.end(),
+          [&victim](const Location& loc) { return loc.node_id == victim.location.node_id; });
+      if (!has_remaining_for_node) {
+        keys_to_untrack.emplace_back(victim.location.node_id, victim.key);
+      }
+
+      if (locs.empty()) {
+        entries_.erase(it);
+      }
+    }
+  }
+
+  if (registry != nullptr) {
+    for (const auto& [node_id, key] : keys_to_untrack) {
+      registry->UntrackKey(node_id, key);
+    }
+  }
+
+  return evicted;
 }
 
 }  // namespace mori::umbp

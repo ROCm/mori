@@ -63,14 +63,14 @@
 #include <vector>
 
 #include "umbp/common/config.h"
-#include "umbp/common/storage_tier.h"
-#include "umbp/local/storage/dram_tier.h"
-#include "umbp/local/storage/io/storage_io_driver.h"
-#include "umbp/local/storage/local_storage_manager.h"
-#include "umbp/local/storage/segment/segment_format.h"
-#include "umbp/local/storage/spdk_proxy_tier.h"
-#include "umbp/local/storage/ssd_tier.h"
-#include "umbp/local/umbp_client.h"
+#include "umbp/local/standalone_client.h"
+#include "umbp/local/storage_tier.h"
+#include "umbp/local/tiers/dram_tier.h"
+#include "umbp/local/tiers/local_storage_manager.h"
+#include "umbp/local/tiers/segment/segment_format.h"
+#include "umbp/local/tiers/spdk_proxy_tier.h"
+#include "umbp/local/tiers/ssd_tier.h"
+#include "umbp/storage/io/storage_io_driver.h"
 
 using namespace mori::umbp;
 
@@ -1008,7 +1008,7 @@ struct E2EHostBuffer {
     }
   }
 
-  // Separate read buffer with the same layout for BatchGetIntoPtr.
+  // Separate read buffer with the same layout for BatchGet.
   static void MakeReadMeta(size_t count, size_t keys_per_page, size_t value_size,
                            std::vector<char>& buf, std::vector<uintptr_t>& ptrs,
                            std::vector<size_t>& sizes) {
@@ -2440,7 +2440,7 @@ static void BenchStorageIoDriver(const BenchConfig& cfg,
 }
 
 // ---------------------------------------------------------------------------
-// H. Concurrent Scaling (UMBPClient Put + Get)
+// H. Concurrent Scaling (StandaloneClient Put + Get)
 // ---------------------------------------------------------------------------
 static void BenchConcurrent(const BenchConfig& cfg, const std::vector<std::string>& keys,
                             const std::vector<std::vector<char>>& values,
@@ -2455,7 +2455,7 @@ static void BenchConcurrent(const BenchConfig& cfg, const std::vector<std::strin
     UMBPConfig ucfg = MakeStandaloneClientConfig(cfg, tmp.path + "/ssd", cfg.dram_capacity);
 
     fs::create_directories(ucfg.ssd.storage_dir);
-    UMBPClient client(ucfg);
+    StandaloneClient client(ucfg);
 
     size_t keys_per_thread = keys.size() / static_cast<size_t>(nthreads);
     if (keys_per_thread == 0) continue;
@@ -2518,7 +2518,7 @@ static void BenchConcurrent(const BenchConfig& cfg, const std::vector<std::strin
       std::vector<char> wbuf(cfg.value_size);
       for (size_t w = 0; w < cfg.warmup_iters; ++w) {
         for (size_t i = 0; i < keys.size(); ++i) {
-          client.GetIntoPtr(keys[i], reinterpret_cast<uintptr_t>(wbuf.data()), wbuf.size());
+          client.Get(keys[i], reinterpret_cast<uintptr_t>(wbuf.data()), wbuf.size());
         }
       }
 
@@ -2538,8 +2538,7 @@ static void BenchConcurrent(const BenchConfig& cfg, const std::vector<std::strin
             size_t end = start + keys_per_thread;
             for (size_t i = start; i < end; ++i) {
               auto t0 = Clock::now();
-              bool ok =
-                  client.GetIntoPtr(keys[i], reinterpret_cast<uintptr_t>(buf.data()), buf.size());
+              bool ok = client.Get(keys[i], reinterpret_cast<uintptr_t>(buf.data()), buf.size());
               auto t1 = Clock::now();
               thread_tallies[t].AddOp(ok, cfg.value_size,
                                       std::chrono::duration<double, std::micro>(t1 - t0).count());
@@ -2577,7 +2576,7 @@ static void BenchLeaderMode(const BenchConfig& cfg, const std::vector<std::strin
 
     // Warmup
     for (size_t w = 0; w < cfg.warmup_iters; ++w) {
-      UMBPClient client(ucfg);
+      StandaloneClient client(ucfg);
       for (size_t i = 0; i < keys.size(); ++i) {
         client.Put(keys[i], values[i].data(), values[i].size());
       }
@@ -2590,7 +2589,7 @@ static void BenchLeaderMode(const BenchConfig& cfg, const std::vector<std::strin
     for (size_t m = 0; m < cfg.measure_iters; ++m) {
       auto iter_start = Clock::now();
       {
-        UMBPClient client(ucfg);
+        StandaloneClient client(ucfg);
         for (size_t i = 0; i < keys.size(); ++i) {
           auto t0 = Clock::now();
           bool ok = client.Put(keys[i], values[i].data(), values[i].size());
@@ -2633,7 +2632,7 @@ static void BenchCapacityPressure(const BenchConfig& cfg, const std::vector<std:
 
   // No pressure: first half, DRAM not full
   {
-    UMBPClient client(ucfg);
+    StandaloneClient client(ucfg);
 
     // Warmup
     for (size_t w = 0; w < cfg.warmup_iters; ++w) {
@@ -2665,7 +2664,7 @@ static void BenchCapacityPressure(const BenchConfig& cfg, const std::vector<std:
 
   // Under pressure: write all keys, second half triggers eviction
   {
-    UMBPClient client(ucfg);
+    StandaloneClient client(ucfg);
 
     // Warmup
     for (size_t w = 0; w < cfg.warmup_iters; ++w) {
@@ -2702,7 +2701,7 @@ static void BenchCapacityPressure(const BenchConfig& cfg, const std::vector<std:
 }
 
 // ---------------------------------------------------------------------------
-// K. E2E UMBPClient Benchmark (sglang connector simulation)
+// K. E2E StandaloneClient Benchmark (sglang connector simulation)
 // ---------------------------------------------------------------------------
 static void BenchE2E(const BenchConfig& cfg, const E2EConfig& e2e,
                      std::vector<BenchResult>& results) {
@@ -2714,7 +2713,7 @@ static void BenchE2E(const BenchConfig& cfg, const E2EConfig& e2e,
   std::string variant_label = mode_str + "/" + std::to_string(e2e.batch_pages) + "pg/" +
                               std::to_string(value_size / 1024) + "KB";
 
-  PrintSectionTitle("E2E UMBPClient (" + variant_label + ")");
+  PrintSectionTitle("E2E StandaloneClient (" + variant_label + ")");
   std::printf("  mode          = %s\n", mode_str.c_str());
   std::printf("  num_layers    = %zu\n", e2e.num_layers);
   if (e2e.mode == E2EModelMode::MLA) {
@@ -2770,7 +2769,7 @@ static void BenchE2E(const BenchConfig& cfg, const E2EConfig& e2e,
   PrintTableHeader(OutputTableKind::Detail);
 
   // Helper: fill all pages into a client (untimed).
-  auto FillAll = [&](UMBPClient& client) {
+  auto FillAll = [&](StandaloneClient& client) {
     for (size_t b = 0; b < e2e.num_pages; b += e2e.batch_pages) {
       size_t count = std::min(e2e.batch_pages, e2e.num_pages - b);
       auto keys = keygen.KeysForPages(b, count);
@@ -2778,12 +2777,12 @@ static void BenchE2E(const BenchConfig& cfg, const E2EConfig& e2e,
       std::vector<size_t> sizes;
       host_buf.GetBatchMeta(b, count, ptrs, sizes);
       auto depths = GenerateDepths(e2e, b, count);
-      client.BatchPutFromPtrWithDepth(keys, ptrs, sizes, depths);
+      client.BatchPutWithDepth(keys, ptrs, sizes, depths);
     }
   };
 
   // Helper: fill pages [0, num_pages) via BatchPut, collecting per-page metrics.
-  auto FillAllTimed = [&](UMBPClient& client, size_t num_pages, bench::ResultTally& tally) {
+  auto FillAllTimed = [&](StandaloneClient& client, size_t num_pages, bench::ResultTally& tally) {
     for (size_t b = 0; b < num_pages; b += e2e.batch_pages) {
       size_t count = std::min(e2e.batch_pages, num_pages - b);
       auto keys = keygen.KeysForPages(b, count);
@@ -2792,7 +2791,7 @@ static void BenchE2E(const BenchConfig& cfg, const E2EConfig& e2e,
       host_buf.GetBatchMeta(b, count, ptrs, sizes);
       auto depths = GenerateDepths(e2e, b, count);
       auto t0 = Clock::now();
-      auto batch_results = client.BatchPutFromPtrWithDepth(keys, ptrs, sizes, depths);
+      auto batch_results = client.BatchPutWithDepth(keys, ptrs, sizes, depths);
       auto t1 = Clock::now();
       size_t ok_pages = bench::CountSuccessfulPages(batch_results, keys_per_page);
       tally.AddSample(count, ok_pages, count * keys_per_page * value_size,
@@ -2801,7 +2800,7 @@ static void BenchE2E(const BenchConfig& cfg, const E2EConfig& e2e,
     }
   };
 
-  auto FillAllTimedDedup = [&](UMBPClient& client, size_t num_pages, size_t prefill_pages,
+  auto FillAllTimedDedup = [&](StandaloneClient& client, size_t num_pages, size_t prefill_pages,
                                bench::ResultTally& tally) {
     for (size_t b = 0; b < num_pages; b += e2e.batch_pages) {
       size_t count = std::min(e2e.batch_pages, num_pages - b);
@@ -2811,7 +2810,7 @@ static void BenchE2E(const BenchConfig& cfg, const E2EConfig& e2e,
       host_buf.GetBatchMeta(b, count, ptrs, sizes);
       auto depths = GenerateDepths(e2e, b, count);
       auto t0 = Clock::now();
-      auto batch_results = client.BatchPutFromPtrWithDepth(keys, ptrs, sizes, depths);
+      auto batch_results = client.BatchPutWithDepth(keys, ptrs, sizes, depths);
       auto t1 = Clock::now();
 
       size_t ok_pages = bench::CountSuccessfulPages(batch_results, keys_per_page);
@@ -2831,14 +2830,14 @@ static void BenchE2E(const BenchConfig& cfg, const E2EConfig& e2e,
   std::vector<uintptr_t> read_ptrs;
   std::vector<size_t> read_sizes;
 
-  auto ReadAllTimed = [&](UMBPClient& client, size_t num_pages, bench::ResultTally& tally) {
+  auto ReadAllTimed = [&](StandaloneClient& client, size_t num_pages, bench::ResultTally& tally) {
     for (size_t b = 0; b < num_pages; b += e2e.batch_pages) {
       size_t count = std::min(e2e.batch_pages, num_pages - b);
       auto keys = keygen.KeysForPages(b, count);
       E2EHostBuffer::MakeReadMeta(count, keys_per_page, value_size, read_buf, read_ptrs,
                                   read_sizes);
       auto t0 = Clock::now();
-      auto batch_results = client.BatchGetIntoPtr(keys, read_ptrs, read_sizes);
+      auto batch_results = client.BatchGet(keys, read_ptrs, read_sizes);
       auto t1 = Clock::now();
       size_t ok_pages = bench::CountSuccessfulPages(batch_results, keys_per_page);
       tally.AddSample(count, ok_pages, count * keys_per_page * value_size,
@@ -2848,23 +2847,23 @@ static void BenchE2E(const BenchConfig& cfg, const E2EConfig& e2e,
   };
 
   // Helper: read all pages [0, num_pages) without timing (for warmup).
-  auto ReadAll = [&](UMBPClient& client, size_t num_pages) {
+  auto ReadAll = [&](StandaloneClient& client, size_t num_pages) {
     for (size_t b = 0; b < num_pages; b += e2e.batch_pages) {
       size_t count = std::min(e2e.batch_pages, num_pages - b);
       auto keys = keygen.KeysForPages(b, count);
       E2EHostBuffer::MakeReadMeta(count, keys_per_page, value_size, read_buf, read_ptrs,
                                   read_sizes);
-      client.BatchGetIntoPtr(keys, read_ptrs, read_sizes);
+      client.BatchGet(keys, read_ptrs, read_sizes);
     }
   };
 
   // ---------------------------------------------------------------
-  // (a) E2E BatchSet — fresh writes via BatchPutFromPtrWithDepth
+  // (a) E2E BatchSet — fresh writes via BatchPutWithDepth
   // ---------------------------------------------------------------
   {
     ScopedTempDir tmp(cfg.base_dir + "/e2e_batchset");
     UMBPConfig ucfg = MakeDramOnlyConfig();
-    UMBPClient client(ucfg);
+    StandaloneClient client(ucfg);
 
     // Warmup
     for (size_t w = 0; w < cfg.warmup_iters; ++w) {
@@ -2886,12 +2885,12 @@ static void BenchE2E(const BenchConfig& cfg, const E2EConfig& e2e,
   }
 
   // ---------------------------------------------------------------
-  // (b) E2E BatchGet — read-back via BatchGetIntoPtr
+  // (b) E2E BatchGet — read-back via BatchGet
   // ---------------------------------------------------------------
   {
     ScopedTempDir tmp(cfg.base_dir + "/e2e_batchget");
     UMBPConfig ucfg = MakeDramOnlyConfig();
-    UMBPClient client(ucfg);
+    StandaloneClient client(ucfg);
     FillAll(client);
 
     for (size_t w = 0; w < cfg.warmup_iters; ++w) ReadAll(client, e2e.num_pages);
@@ -2910,7 +2909,7 @@ static void BenchE2E(const BenchConfig& cfg, const E2EConfig& e2e,
   {
     ScopedTempDir tmp(cfg.base_dir + "/e2e_exists");
     UMBPConfig ucfg = MakeDramOnlyConfig();
-    UMBPClient client(ucfg);
+    StandaloneClient client(ucfg);
 
     // Fill first half of pages to test early-stop behavior.
     size_t fill_pages = e2e.num_pages / 2;
@@ -2921,7 +2920,7 @@ static void BenchE2E(const BenchConfig& cfg, const E2EConfig& e2e,
       std::vector<size_t> sizes;
       host_buf.GetBatchMeta(b, count, ptrs, sizes);
       auto depths = GenerateDepths(e2e, b, count);
-      client.BatchPutFromPtrWithDepth(keys, ptrs, sizes, depths);
+      client.BatchPutWithDepth(keys, ptrs, sizes, depths);
     }
 
     // Query all pages — consecutive hits stop at fill_pages boundary.
@@ -2963,7 +2962,7 @@ static void BenchE2E(const BenchConfig& cfg, const E2EConfig& e2e,
     size_t prefill_pages = static_cast<size_t>(e2e.num_pages * e2e.dedup_ratio);
 
     // Helper: clear and re-seed prefix pages in a client.
-    auto SeedPrefix = [&](UMBPClient& c) {
+    auto SeedPrefix = [&](StandaloneClient& c) {
       c.Clear();
       // FillAll variant with partial page count (untimed).
       for (size_t b = 0; b < prefill_pages; b += e2e.batch_pages) {
@@ -2973,13 +2972,13 @@ static void BenchE2E(const BenchConfig& cfg, const E2EConfig& e2e,
         std::vector<size_t> sizes;
         host_buf.GetBatchMeta(b, count, ptrs, sizes);
         auto depths = GenerateDepths(e2e, b, count);
-        c.BatchPutFromPtrWithDepth(keys, ptrs, sizes, depths);
+        c.BatchPutWithDepth(keys, ptrs, sizes, depths);
       }
     };
 
     // Warmup
     {
-      UMBPClient client(ucfg);
+      StandaloneClient client(ucfg);
       for (size_t w = 0; w < cfg.warmup_iters; ++w) {
         SeedPrefix(client);
         FillAll(client);
@@ -2989,7 +2988,7 @@ static void BenchE2E(const BenchConfig& cfg, const E2EConfig& e2e,
     bench::ResultTally tally;
     tally.ReserveLatencySamples(e2e.num_pages * e2e_iters);
 
-    UMBPClient client(ucfg);
+    StandaloneClient client(ucfg);
     auto run_start = Clock::now();
     for (size_t m = 0; m < e2e_iters; ++m) {
       SeedPrefix(client);
@@ -3010,7 +3009,7 @@ static void BenchE2E(const BenchConfig& cfg, const E2EConfig& e2e,
   {
     ScopedTempDir tmp(cfg.base_dir + "/e2e_prefetch");
     UMBPConfig ucfg = MakeDramOnlyConfig();
-    UMBPClient client(ucfg);
+    StandaloneClient client(ucfg);
     FillAll(client);
 
     // Warmup
@@ -3039,7 +3038,7 @@ static void BenchE2E(const BenchConfig& cfg, const E2EConfig& e2e,
         auto keys = keygen.KeysForPages(b, count);
         E2EHostBuffer::MakeReadMeta(count, keys_per_page, value_size, read_buf, read_ptrs,
                                     read_sizes);
-        client.BatchGetIntoPtr(keys, read_ptrs, read_sizes);
+        client.BatchGet(keys, read_ptrs, read_sizes);
       }
 
       auto t1 = Clock::now();
@@ -3070,7 +3069,7 @@ static void BenchE2E(const BenchConfig& cfg, const E2EConfig& e2e,
 
     // --- Write under capacity pressure ---
     {
-      UMBPClient client(ucfg);
+      StandaloneClient client(ucfg);
 
       // Warmup
       for (size_t w = 0; w < cfg.warmup_iters; ++w) {
@@ -3095,7 +3094,7 @@ static void BenchE2E(const BenchConfig& cfg, const E2EConfig& e2e,
 
     // --- Read-back (early pages evicted to SSD) ---
     {
-      UMBPClient client(ucfg);
+      StandaloneClient client(ucfg);
       FillAll(client);  // first half evicted to SSD, second half in DRAM
 
       for (size_t w = 0; w < cfg.warmup_iters; ++w) ReadAll(client, e2e.num_pages);
@@ -3116,7 +3115,7 @@ static void BenchE2E(const BenchConfig& cfg, const E2EConfig& e2e,
   // (g) E2E Leader Mode — SharedSSDLeader with async copy pipeline.
   //
   //     Mirrors sglang MLA + TP>1 deployment:
-  //     BatchPutFromPtrWithDepth writes to DRAM, CopyPipeline async-copies to SSD.
+  //     BatchPutWithDepth writes to DRAM, CopyPipeline async-copies to SSD.
   //     Compares sync vs async copy throughput.
   // ---------------------------------------------------------------
   {
@@ -3129,7 +3128,7 @@ static void BenchE2E(const BenchConfig& cfg, const E2EConfig& e2e,
 
       // Warmup — construct+destroy client so destructor drains async queue.
       for (size_t w = 0; w < cfg.warmup_iters; ++w) {
-        UMBPClient client(ucfg);
+        StandaloneClient client(ucfg);
         FillAll(client);
       }
 
@@ -3141,7 +3140,7 @@ static void BenchE2E(const BenchConfig& cfg, const E2EConfig& e2e,
         bench::ResultTally iter_tally;
         auto iter_start = Clock::now();
         {
-          UMBPClient client(ucfg);  // fresh client per iter (destructor drains async)
+          StandaloneClient client(ucfg);  // fresh client per iter (destructor drains async)
           FillAllTimed(client, e2e.num_pages, iter_tally);
         }
         auto iter_end = Clock::now();
@@ -3174,7 +3173,7 @@ static void BenchE2E(const BenchConfig& cfg, const E2EConfig& e2e,
       UMBPConfig leader_cfg =
           MakeLeaderClientConfig(cfg, ssd_dir, total_data * 2, false, total_data * 2);
       fs::create_directories(leader_cfg.ssd.storage_dir);
-      UMBPClient leader(leader_cfg);
+      StandaloneClient leader(leader_cfg);
       FillAll(leader);
       // Leader destructor drains copy pipeline, ensuring all data is on SSD.
     }
@@ -3182,7 +3181,7 @@ static void BenchE2E(const BenchConfig& cfg, const E2EConfig& e2e,
     // Step 2: Follower reads from SSD.
     UMBPConfig follower_cfg =
         MakeFollowerClientConfig(cfg, ssd_dir, total_data * 2, total_data * 2);
-    UMBPClient follower(follower_cfg);
+    StandaloneClient follower(follower_cfg);
 
     for (size_t w = 0; w < cfg.warmup_iters; ++w) ReadAll(follower, e2e.num_pages);
 
@@ -3585,9 +3584,9 @@ int main(int argc, char* argv[]) {
   std::vector<BenchResult> results;
 
   // SPDK anchor — keeps the proxy daemon alive for the entire benchmark run.
-  // All subsequent UMBPClient instances probe the existing proxy and reuse it
+  // All subsequent StandaloneClient instances probe the existing proxy and reuse it
   // instead of spawning new ones (see LocalStorageManager proxy probe logic).
-  std::unique_ptr<UMBPClient> spdk_anchor;
+  std::unique_ptr<StandaloneClient> spdk_anchor;
   TierBackend* ext_ssd = nullptr;
   if (IsSpdk(cfg)) {
     const char* pci = std::getenv("UMBP_SPDK_NVME_PCI");
@@ -3604,7 +3603,7 @@ int main(int argc, char* argv[]) {
     acfg.role = UMBPRole::SharedSSDLeader;
     acfg.copy_pipeline.async_enabled = false;
     acfg.eviction.auto_promote_on_read = false;
-    spdk_anchor = std::make_unique<UMBPClient>(acfg);
+    spdk_anchor = std::make_unique<StandaloneClient>(acfg);
     ext_ssd = spdk_anchor->Storage().GetTier(StorageTier::LOCAL_SSD);
     if (!ext_ssd || !dynamic_cast<SpdkProxyTier*>(ext_ssd)) {
       std::fprintf(stderr,
@@ -3626,7 +3625,7 @@ int main(int argc, char* argv[]) {
   BenchDurability(cfg, keys, values, results);
   BenchStorageIoDriver(cfg, values, results);
 
-  // Phase 3: client-level — each creates own UMBPClient that reuses the
+  // Phase 3: client-level — each creates own StandaloneClient that reuses the
   // anchor's proxy (probed as alive, no respawn needed).
   BenchCopyToSSD(cfg, keys, values, results);
   BenchConcurrent(cfg, keys, values, results);

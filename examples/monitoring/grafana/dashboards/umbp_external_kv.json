@@ -1,0 +1,172 @@
+{
+  "title": "UMBP Master - External KV Metrics",
+  "uid": "5f4e34f0-d80a-49a7-8af4-28a0dc82991e",
+  "tags": [
+    "umbp",
+    "external-kv"
+  ],
+  "schemaVersion": 36,
+  "refresh": "5s",
+  "time": {
+    "from": "now-5m",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "type": "datasource",
+        "name": "datasource",
+        "label": "Data Source",
+        "pluginId": "prometheus",
+        "current": {
+          "text": "Prometheus",
+          "value": "PBFA97CFB590B2093"
+        },
+        "hide": 0,
+        "query": "prometheus"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "External KV API Call Rates",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "ops" } },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum(rate(mori_umbp_external_kv_report_total[30s]))",
+          "legendFormat": "report/s (all)",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum(rate(mori_umbp_external_kv_revoke_total[30s]))",
+          "legendFormat": "revoke/s (all)",
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "rate(mori_umbp_external_kv_match_total[30s])",
+          "legendFormat": "match/s",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Per-Client Report/Revoke Rate",
+      "description": "Rate of Report and Revoke external KV calls per client node.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "ops", "min": 0 } },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "rate(mori_umbp_external_kv_report_total[30s])",
+          "legendFormat": "report {{node}}",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "rate(mori_umbp_external_kv_revoke_total[30s])",
+          "legendFormat": "revoke {{node}}",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "All-Client Total Report/Revoke Rate",
+      "description": "Summed rate of Report and Revoke calls across all client nodes.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "ops", "min": 0 } },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum(rate(mori_umbp_external_kv_report_total[30s]))",
+          "legendFormat": "total report/s",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum(rate(mori_umbp_external_kv_revoke_total[30s]))",
+          "legendFormat": "total revoke/s",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Live External KV Block Count per Node",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 16 },
+      "fieldConfig": { "defaults": { "min": 0, "unit": "short" } },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "mori_umbp_external_kv_live_count",
+          "legendFormat": "{{node}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Avg KV Blocks per Report / Revoke Call",
+      "description": "Average number of KV blocks carried in each Report or Revoke RPC call.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 24 },
+      "fieldConfig": { "defaults": { "min": 0, "unit": "short" } },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum(rate(mori_umbp_external_kv_report_blocks_total[30s])) / sum(rate(mori_umbp_external_kv_report_total[30s]))",
+          "legendFormat": "avg blocks/report",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum(rate(mori_umbp_external_kv_revoke_blocks_total[30s])) / sum(rate(mori_umbp_external_kv_revoke_total[30s]))",
+          "legendFormat": "avg blocks/revoke",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Avg Matched Blocks per Match Call",
+      "description": "Average number of KV blocks matched per MatchExternalKv call.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "fieldConfig": { "defaults": { "min": 0, "unit": "short" } },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "rate(mori_umbp_external_kv_match_matched_blocks_total[30s]) / rate(mori_umbp_external_kv_match_total[30s])",
+          "legendFormat": "avg matched blocks/call",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Match Hit Rate",
+      "description": "Hit rate: matched blocks divided by queried blocks per MatchExternalKv call.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "fieldConfig": { "defaults": { "min": 0, "unit": "percentunit" } },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "rate(mori_umbp_external_kv_match_matched_blocks_total[30s]) / rate(mori_umbp_external_kv_match_queried_blocks_total[30s])",
+          "legendFormat": "hit rate",
+          "refId": "A"
+        }
+      ]
+    }
+  ]
+}

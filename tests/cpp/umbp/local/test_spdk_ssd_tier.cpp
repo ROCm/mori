@@ -32,7 +32,7 @@
 #include <vector>
 
 #include "umbp/common/config.h"
-#include "umbp/local/storage/spdk_ssd_tier.h"
+#include "umbp/local/tiers/spdk_ssd_tier.h"
 
 using namespace mori::umbp;
 

@@ -21,19 +21,22 @@
 // SOFTWARE.
 #pragma once
 
+#include <grpcpp/server.h>
+
+#include <atomic>
+#include <cstdint>
 #include <memory>
 #include <string>
 
-#include "umbp/common/config.h"
+#include "mori/metrics/prometheus_metrics_server.hpp"
+#include "umbp/distributed/config.h"
 #include "umbp/distributed/master/client_registry.h"
+#include "umbp/distributed/master/eviction_manager.h"
+#include "umbp/distributed/master/external_kv_block_index.h"
 #include "umbp/distributed/master/global_block_index.h"
 #include "umbp/distributed/routing/route_get_strategy.h"
 #include "umbp/distributed/routing/route_put_strategy.h"
 #include "umbp/distributed/routing/router.h"
-
-namespace grpc_impl {
-class Server;
-}
 
 namespace mori::umbp {
 
@@ -48,16 +51,27 @@ class MasterServer {
   void Run();
   void Shutdown();
 
+  // Returns the port the gRPC server is actually listening on.  Useful when
+  // listen_address specifies port 0 (OS-assigned).  Returns 0 until Run()
+  // has called BuildAndStart().
+  uint16_t GetBoundPort() const { return bound_port_.load(); }
+
  private:
   MasterServerConfig config_;
   GlobalBlockIndex index_;
+  ExternalKvBlockIndex external_kv_index_;
   ClientRegistry registry_;
   Router router_;
 
-  std::unique_ptr<grpc_impl::Server> server_;
+  std::unique_ptr<mori::metrics::MetricsServer> metrics_server_;
+  std::unique_ptr<grpc::Server> server_;
 
   class UMBPMasterServiceImpl;
   std::unique_ptr<UMBPMasterServiceImpl> service_;
+
+  std::unique_ptr<EvictionManager> eviction_manager_;
+
+  std::atomic<uint16_t> bound_port_{0};
 };
 
 }  // namespace mori::umbp

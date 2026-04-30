@@ -20,7 +20,10 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 #include <csignal>
+#include <cstdlib>
+#include <string>
 #include <thread>
+#include <vector>
 
 #include "mori/utils/mori_log.hpp"
 #include "umbp/distributed/master/master_client.h"
@@ -30,6 +33,24 @@ static volatile std::sig_atomic_t g_running = 1;
 static void SignalHandler(int /*signum*/) { g_running = 0; }
 
 static bool IsRunning() { return g_running != 0; }
+
+// Generate a batch of synthetic KV hashes for simulation purposes.
+// Each hash is a hex-formatted 16-character string derived from the node id,
+// iteration number, and index within the batch.
+static std::vector<std::string> MakeHashes(const std::string& node_id, uint64_t iteration,
+                                           int count) {
+  std::vector<std::string> hashes;
+  hashes.reserve(count);
+  for (int i = 0; i < count; ++i) {
+    char buf[32];
+    // Simple deterministic hash: mix node_id length, iteration, and index.
+    uint64_t val = (static_cast<uint64_t>(node_id.size()) * 1000003ULL) ^
+                   (iteration * 6364136223846793005ULL) ^ static_cast<uint64_t>(i);
+    std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(val));
+    hashes.emplace_back(buf);
+  }
+  return hashes;
+}
 
 static bool SleepInterruptible(std::chrono::seconds total) {
   constexpr auto kStep = std::chrono::milliseconds(100);
@@ -52,7 +73,7 @@ int main(int argc, char** argv) {
   if (argc > 2) node_id = argv[2];
   if (argc > 3) node_addr = argv[3];
 
-  mori::umbp::MasterClientConfig config;
+  mori::umbp::UMBPMasterClientConfig config;
   config.master_address = master_addr;
   config.node_id = node_id;
   config.node_address = node_addr;
@@ -79,8 +100,14 @@ int main(int argc, char** argv) {
   constexpr auto kOperationInterval = std::chrono::seconds(3);
   uint64_t iteration = 0;
 
-  MORI_UMBP_INFO("[Client] Starting RoutePut -> Register -> RouteGet demo as '{}'. Ctrl+C to stop.",
-                 node_id);
+  MORI_UMBP_INFO(
+      "[Client] Starting RoutePut -> Register -> RouteGet + External KV simulation as '{}'. "
+      "Ctrl+C to stop.",
+      node_id);
+
+  // Tracks the hashes currently reported as live external KV blocks so we can
+  // revoke them on the next cycle, simulating KV cache eviction.
+  std::vector<std::string> live_ext_kv_hashes;
 
   while (IsRunning()) {
     ++iteration;
@@ -159,6 +186,49 @@ int main(int argc, char** argv) {
     } else {
       MORI_UMBP_INFO("[Client] Iteration {} Unregister(key={}) removed={}", iteration, key,
                      removed);
+    }
+
+    // ---- Step 6: External KV simulation ----
+    // Revoke the previous batch (simulates KV cache eviction), then report a
+    // fresh batch (simulates new KV cache tokens being prefilled).
+    constexpr int kExtKvBatchSize = 10;
+
+    if (!live_ext_kv_hashes.empty()) {
+      auto revoke_status = client.RevokeExternalKvBlocks(node_id, live_ext_kv_hashes);
+      if (revoke_status.ok()) {
+        MORI_UMBP_INFO("[Client] Iteration {} RevokeExternalKvBlocks: revoked {} hashes", iteration,
+                       live_ext_kv_hashes.size());
+      } else {
+        MORI_UMBP_WARN("[Client] Iteration {} RevokeExternalKvBlocks failed: {}", iteration,
+                       revoke_status.error_message());
+      }
+    }
+
+    live_ext_kv_hashes = MakeHashes(node_id, iteration, kExtKvBatchSize);
+    auto report_status =
+        client.ReportExternalKvBlocks(node_id, live_ext_kv_hashes, mori::umbp::TierType::HBM);
+    if (report_status.ok()) {
+      MORI_UMBP_INFO("[Client] Iteration {} ReportExternalKvBlocks: reported {} hashes", iteration,
+                     live_ext_kv_hashes.size());
+    } else {
+      MORI_UMBP_WARN("[Client] Iteration {} ReportExternalKvBlocks failed: {}", iteration,
+                     report_status.error_message());
+      live_ext_kv_hashes.clear();
+    }
+
+    // Query back the hashes we just reported to exercise MatchExternalKv.
+    std::vector<mori::umbp::MasterClient::ExternalKvNodeMatch> matches;
+    auto match_status = client.MatchExternalKv(live_ext_kv_hashes, &matches);
+    if (match_status.ok()) {
+      size_t total_matched = 0;
+      for (const auto& m : matches) total_matched += m.matched_hashes.size();
+      MORI_UMBP_INFO(
+          "[Client] Iteration {} MatchExternalKv: queried={}, matched_nodes={}, "
+          "total_matched_hashes={}",
+          iteration, live_ext_kv_hashes.size(), matches.size(), total_matched);
+    } else {
+      MORI_UMBP_WARN("[Client] Iteration {} MatchExternalKv failed: {}", iteration,
+                     match_status.error_message());
     }
 
     if (!SleepInterruptible(kOperationInterval)) break;

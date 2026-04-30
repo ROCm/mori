@@ -8,6 +8,10 @@ target_link_libraries(test_umbp_local_storage_manager PRIVATE umbp_core)
 add_test(NAME umbp_local_storage_manager
          COMMAND test_umbp_local_storage_manager)
 
+add_executable(test_umbp_host_mem_allocator test_host_mem_allocator.cpp)
+target_link_libraries(test_umbp_host_mem_allocator PRIVATE umbp_core)
+add_test(NAME umbp_host_mem_allocator COMMAND test_umbp_host_mem_allocator)
+
 add_executable(test_umbp_local_client test_umbp_client.cpp)
 target_link_libraries(test_umbp_local_client PRIVATE umbp_core)
 add_test(NAME umbp_local_client COMMAND test_umbp_local_client)

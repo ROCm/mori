@@ -24,7 +24,7 @@
 #include <iostream>
 #include <vector>
 
-#include "umbp/local/umbp_client.h"
+#include "umbp/local/standalone_client.h"
 
 using namespace mori::umbp;
 
@@ -35,14 +35,14 @@ void test_put_get() {
   config.dram.capacity_bytes = 1 * 1024 * 1024;
   config.ssd.enabled = false;
 
-  UMBPClient client(config);
+  StandaloneClient client(config);
 
   std::vector<char> data(4096, 'A');
   assert(client.Put("key1", data.data(), data.size()));
   assert(client.Exists("key1"));
 
   std::vector<char> buf(4096, 0);
-  assert(client.GetIntoPtr("key1", reinterpret_cast<uintptr_t>(buf.data()), buf.size()));
+  assert(client.Get("key1", reinterpret_cast<uintptr_t>(buf.data()), buf.size()));
   assert(buf == data);
 
   std::cout << "PASSED" << std::endl;
@@ -55,7 +55,7 @@ void test_put_dedup() {
   config.dram.capacity_bytes = 1 * 1024 * 1024;
   config.ssd.enabled = false;
 
-  UMBPClient client(config);
+  StandaloneClient client(config);
 
   std::vector<char> data(4096, 'B');
   assert(client.Put("key1", data.data(), data.size()));
@@ -66,7 +66,7 @@ void test_put_dedup() {
 
   // Data should still be original (dedup skipped write)
   std::vector<char> buf(4096, 0);
-  assert(client.GetIntoPtr("key1", reinterpret_cast<uintptr_t>(buf.data()), buf.size()));
+  assert(client.Get("key1", reinterpret_cast<uintptr_t>(buf.data()), buf.size()));
   assert(buf == data);  // Original data, not data2
 
   std::cout << "PASSED" << std::endl;
@@ -79,7 +79,7 @@ void test_remove() {
   config.dram.capacity_bytes = 1 * 1024 * 1024;
   config.ssd.enabled = false;
 
-  UMBPClient client(config);
+  StandaloneClient client(config);
 
   std::vector<char> data(4096, 'D');
   assert(client.Put("key1", data.data(), data.size()));
@@ -99,7 +99,7 @@ void test_batch_put_get() {
   config.dram.capacity_bytes = 1 * 1024 * 1024;
   config.ssd.enabled = false;
 
-  UMBPClient client(config);
+  StandaloneClient client(config);
 
   const int N = 10;
   std::vector<std::string> keys;
@@ -114,7 +114,7 @@ void test_batch_put_get() {
     sizes.push_back(1024);
   }
 
-  auto put_results = client.BatchPutFromPtr(keys, ptrs, sizes);
+  auto put_results = client.BatchPut(keys, ptrs, sizes);
   for (int i = 0; i < N; ++i) {
     assert(put_results[i]);
   }
@@ -132,7 +132,7 @@ void test_batch_put_get() {
     dst_ptrs.push_back(reinterpret_cast<uintptr_t>(read_bufs[i].data()));
   }
 
-  auto get_results = client.BatchGetIntoPtr(keys, dst_ptrs, sizes);
+  auto get_results = client.BatchGet(keys, dst_ptrs, sizes);
   for (int i = 0; i < N; ++i) {
     assert(get_results[i]);
     assert(read_bufs[i] == all_data[i]);
@@ -148,7 +148,7 @@ void test_clear() {
   config.dram.capacity_bytes = 1 * 1024 * 1024;
   config.ssd.enabled = false;
 
-  UMBPClient client(config);
+  StandaloneClient client(config);
 
   std::vector<char> data(4096, 'E');
   client.Put("key1", data.data(), data.size());
@@ -170,15 +170,15 @@ void test_put_from_ptr_get_into_ptr() {
   config.dram.capacity_bytes = 1 * 1024 * 1024;
   config.ssd.enabled = false;
 
-  UMBPClient client(config);
+  StandaloneClient client(config);
 
   std::vector<char> data(8192, 'Z');
   uintptr_t src = reinterpret_cast<uintptr_t>(data.data());
-  assert(client.PutFromPtr("ptr_key", src, data.size()));
+  assert(client.Put("ptr_key", src, data.size()));
 
   std::vector<char> buf(8192, 0);
   uintptr_t dst = reinterpret_cast<uintptr_t>(buf.data());
-  assert(client.GetIntoPtr("ptr_key", dst, buf.size()));
+  assert(client.Get("ptr_key", dst, buf.size()));
   assert(buf == data);
 
   std::cout << "PASSED" << std::endl;
@@ -193,7 +193,7 @@ void test_dram_full_demote_with_index() {
   config.ssd.storage_dir = "/tmp/umbp_test_client_demote";
   config.ssd.capacity_bytes = 10 * 1024 * 1024;
 
-  UMBPClient client(config);
+  StandaloneClient client(config);
 
   // Fill DRAM: 2 x 512 bytes
   std::vector<char> d1(512, 'A');
@@ -220,7 +220,7 @@ void test_dram_full_demote_with_index() {
 
   // Data integrity: read k1 back from SSD
   std::vector<char> buf(512, 0);
-  assert(client.GetIntoPtr("k1", reinterpret_cast<uintptr_t>(buf.data()), buf.size()));
+  assert(client.Get("k1", reinterpret_cast<uintptr_t>(buf.data()), buf.size()));
   assert(buf == d1);
 
   client.Clear();
@@ -236,7 +236,7 @@ void test_batch_get_ssd_tier() {
   config.ssd.storage_dir = "/tmp/umbp_test_batch_get_ssd";
   config.ssd.capacity_bytes = 10 * 1024 * 1024;
 
-  UMBPClient client(config);
+  StandaloneClient client(config);
 
   // Write 10 x 512-byte values; DRAM holds ~2, rest auto-demote to SSD.
   constexpr int N = 10;
@@ -257,7 +257,7 @@ void test_batch_get_ssd_tier() {
     ptrs[i] = reinterpret_cast<uintptr_t>(bufs[i].data());
   }
 
-  auto results = client.BatchGetIntoPtr(keys, ptrs, sizes);
+  auto results = client.BatchGet(keys, ptrs, sizes);
   for (int i = 0; i < N; ++i) {
     assert(results[i]);
     assert(bufs[i] == data[i]);
@@ -288,7 +288,7 @@ void test_batch_get_follower() {
   std::vector<std::vector<char>> data(N);
 
   {
-    UMBPClient leader(leader_cfg);
+    StandaloneClient leader(leader_cfg);
     for (int i = 0; i < N; ++i) {
       keys[i] = "follower_batch_" + std::to_string(i);
       data[i].assign(kSize, static_cast<char>('P' + i));
@@ -296,7 +296,7 @@ void test_batch_get_follower() {
     }
   }  // leader destructor drains copy pipeline
 
-  // Follower: reads from shared SSD via BatchGetIntoPtr.
+  // Follower: reads from shared SSD via BatchGet.
   UMBPConfig follower_cfg;
   follower_cfg.dram.capacity_bytes = 1024 * 1024;
   follower_cfg.ssd.enabled = true;
@@ -305,7 +305,7 @@ void test_batch_get_follower() {
   follower_cfg.role = UMBPRole::SharedSSDFollower;
   follower_cfg.follower_mode = true;
 
-  UMBPClient follower(follower_cfg);
+  StandaloneClient follower(follower_cfg);
 
   std::vector<std::vector<char>> bufs(N, std::vector<char>(kSize, 0));
   std::vector<uintptr_t> ptrs(N);
@@ -314,7 +314,7 @@ void test_batch_get_follower() {
     ptrs[i] = reinterpret_cast<uintptr_t>(bufs[i].data());
   }
 
-  auto results = follower.BatchGetIntoPtr(keys, ptrs, sizes);
+  auto results = follower.BatchGet(keys, ptrs, sizes);
   for (int i = 0; i < N; ++i) {
     assert(results[i]);
     assert(bufs[i] == data[i]);
@@ -325,7 +325,7 @@ void test_batch_get_follower() {
 }
 
 int main() {
-  std::cout << "=== UMBPClient Tests ===" << std::endl;
+  std::cout << "=== StandaloneClient Tests ===" << std::endl;
   test_put_get();
   test_put_dedup();
   test_remove();
@@ -335,6 +335,6 @@ int main() {
   test_dram_full_demote_with_index();
   test_batch_get_ssd_tier();
   test_batch_get_follower();
-  std::cout << "All UMBPClient tests passed!" << std::endl;
+  std::cout << "All StandaloneClient tests passed!" << std::endl;
   return 0;
 }

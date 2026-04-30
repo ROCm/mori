@@ -20,7 +20,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 //
-// umbp_bench: End-to-end benchmark using UMBPClient (full stack).
+// umbp_bench: End-to-end benchmark using StandaloneClient (full stack).
 //
 // Modes:
 //   Throughput (default):
@@ -50,7 +50,7 @@
 #include <unistd.h>
 #endif
 
-#include "umbp/local/umbp_client.h"
+#include "umbp/local/standalone_client.h"
 
 using namespace mori::umbp;
 
@@ -104,7 +104,7 @@ struct alignas(64) BenchCoord {
 // ---------------------------------------------------------------------------
 // Single-rank benchmark: same process writes and reads (original behavior)
 // ---------------------------------------------------------------------------
-static BenchResult RunBatch(UMBPClient& client, int rank_id, const std::string& session,
+static BenchResult RunBatch(StandaloneClient& client, int rank_id, const std::string& session,
                             size_t value_size, int count, int iterations) {
   std::string prefix =
       "bench_r" + std::to_string(rank_id) + "_" + session + "_" + std::to_string(value_size) + "_";
@@ -222,8 +222,8 @@ static BenchResult RunBatch(UMBPClient& client, int rank_id, const std::string& 
 //   Phase 3: Barrier — sync before next size
 // ---------------------------------------------------------------------------
 #ifdef __linux__
-static BenchResult RunBatchPhased(UMBPClient& client, int rank_id, size_t value_size, int count,
-                                  int iterations, int size_idx, BenchCoord* coord) {
+static BenchResult RunBatchPhased(StandaloneClient& client, int rank_id, size_t value_size,
+                                  int count, int iterations, int size_idx, BenchCoord* coord) {
   std::string session(coord->session);
   std::string prefix = "bench_" + session + "_" + std::to_string(value_size) + "_";
 
@@ -367,7 +367,7 @@ static void PrintResults(int rank_id, int num_ranks, const char* role_str, const
                          const std::vector<BenchResult>& results) {
   printf("\n");
   printf("========================================================\n");
-  printf(" UMBPClient E2E Benchmark — rank=%d/%d role=%s backend=%s\n", rank_id, num_ranks,
+  printf(" StandaloneClient E2E Benchmark — rank=%d/%d role=%s backend=%s\n", rank_id, num_ranks,
          role_str, backend);
   printf("========================================================\n");
   printf("  %8s  %6s  %10s  %10s  %12s\n", "ValSize", "Count", "Write MB/s", "ColdRd MB/s",
@@ -413,7 +413,7 @@ static int RunBenchmarkProcess(int rank_id, int num_ranks, int pipe_fd, void* co
   auto cfg = UMBPConfig::FromEnvironment();
   cfg.dram.capacity_bytes = 64ULL * 1024 * 1024;
 
-  UMBPClient client(cfg);
+  StandaloneClient client(cfg);
 
   UMBPRole role = cfg.ResolveRole();
   const char* role_str = (role == UMBPRole::Standalone)        ? "Standalone"
@@ -485,7 +485,7 @@ static LatencyStats ComputeStats(std::vector<double>& samples_us) {
 static int RunLatencyBench() {
   auto cfg = UMBPConfig::FromEnvironment();
   cfg.dram.capacity_bytes = 64ULL * 1024 * 1024;
-  UMBPClient client(cfg);
+  StandaloneClient client(cfg);
 
   auto* ssd = client.Storage().GetTier(StorageTier::LOCAL_SSD);
   if (!ssd) {

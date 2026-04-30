@@ -23,12 +23,40 @@
 
 #include <grpcpp/grpcpp.h>
 
+#include <chrono>
 #include <system_error>
 
 #include "mori/utils/mori_log.hpp"
 #include "umbp.grpc.pb.h"
+#include "umbp/common/env_time.h"
+#include "umbp/distributed/master/master_metrics.h"
 
 namespace mori::umbp {
+
+namespace {
+// Bounds every RPC on the client-owned shutdown-sensitive path:
+//   - UnregisterClient in UnregisterSelf (called from ~MasterClient).
+//   - Every Heartbeat in HeartbeatLoop (hot path, but its latency is
+//     charged to ~MasterClient via StopHeartbeat()'s join()).
+// Default 3 s covers normal master response + one kernel retransmission
+// while still letting the destructor return promptly when master is dead.
+// Override via UMBP_RPC_SHUTDOWN_TIMEOUT_MS.  See distributed-known-issues.md #7.
+int RpcShutdownTimeoutMs() {
+  static const int v =
+      static_cast<int>(GetEnvMilliseconds("UMBP_RPC_SHUTDOWN_TIMEOUT_MS",
+                                          std::chrono::milliseconds(3000), /*min_allowed=*/1)
+                           .count());
+  return v;
+}
+
+uint64_t MetricsReportIntervalMs() {
+  static const uint64_t v =
+      static_cast<uint64_t>(GetEnvMilliseconds("UMBP_METRICS_REPORT_INTERVAL_MS",
+                                               std::chrono::milliseconds(1000), /*min_allowed=*/1)
+                                .count());
+  return v;
+}
+}  // namespace
 
 // Helper: get the typed stub from the opaque pointer
 static ::umbp::UMBPMaster::Stub* GetStub(void* ptr) {
@@ -42,15 +70,17 @@ static void FillProtoLocation(const Location& location, ::umbp::Location* proto_
   proto_location->set_tier(static_cast<::umbp::TierType>(location.tier));
 }
 
-MasterClient::MasterClient(const MasterClientConfig& config)
+MasterClient::MasterClient(const UMBPMasterClientConfig& config)
     : config_(config),
       stub_(nullptr, [](void* p) { delete static_cast<::umbp::UMBPMaster::Stub*>(p); }) {
   channel_ = grpc::CreateChannel(config.master_address, grpc::InsecureChannelCredentials());
   stub_.reset(::umbp::UMBPMaster::NewStub(channel_).release());
+  metrics_interval_ms_ = MetricsReportIntervalMs();
   MORI_UMBP_INFO("[Client] Created, master={}", config.master_address);
 }
 
 MasterClient::~MasterClient() {
+  StopMetricsReporting();
   StopHeartbeat();
   if (registered_) {
     UnregisterSelf();
@@ -62,7 +92,7 @@ grpc::Status MasterClient::RegisterSelf(
     const std::vector<uint8_t>& engine_desc_bytes,
     const std::vector<std::vector<uint8_t>>& dram_memory_desc_bytes_list,
     const std::vector<uint64_t>& dram_buffer_sizes,
-    const std::vector<uint64_t>& ssd_store_capacities) {
+    const std::vector<uint64_t>& ssd_store_capacities, uint64_t dram_page_size) {
   if (registered_) {
     return grpc::Status(grpc::StatusCode::ALREADY_EXISTS, "node is already registered");
   }
@@ -91,11 +121,9 @@ grpc::Status MasterClient::RegisterSelf(
     req.add_ssd_store_capacities(cap);
   }
 
-  // Backward compat: also set legacy single field if there's exactly one buffer
-  if (dram_memory_desc_bytes_list.size() == 1) {
-    req.set_dram_memory_desc(dram_memory_desc_bytes_list[0].data(),
-                             dram_memory_desc_bytes_list[0].size());
-  }
+  // Per-node DRAM/HBM page_size override.  Master treats 0 as "fall back to
+  // ClientRegistryConfig.default_dram_page_size".
+  req.set_dram_page_size(dram_page_size);
 
   ::umbp::RegisterClientResponse resp;
   grpc::ClientContext ctx;
@@ -120,6 +148,7 @@ grpc::Status MasterClient::RegisterSelf(
   if (config_.auto_heartbeat) {
     StartHeartbeat();
   }
+  StartMetricsReporting();
 
   return grpc::Status::OK;
 }
@@ -136,6 +165,8 @@ grpc::Status MasterClient::UnregisterSelf() {
 
   ::umbp::UnregisterClientResponse resp;
   grpc::ClientContext ctx;
+  ctx.set_deadline(std::chrono::system_clock::now() +
+                   std::chrono::milliseconds(RpcShutdownTimeoutMs()));
   auto status = GetStub(stub_.get())->UnregisterClient(&ctx, req, &resp);
 
   if (status.ok()) {
@@ -222,8 +253,40 @@ grpc::Status MasterClient::Unregister(const std::string& key, const Location& lo
   return grpc::Status::OK;
 }
 
+grpc::Status MasterClient::Lookup(const std::string& key, bool* found) {
+  if (found != nullptr) {
+    *found = false;
+  }
+
+  if (!registered_) {
+    return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
+                        "node must be registered before Lookup");
+  }
+
+  if (key.empty()) {
+    return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "key cannot be empty");
+  }
+
+  ::umbp::LookupRequest req;
+  req.set_key(key);
+  req.set_node_id(config_.node_id);
+
+  ::umbp::LookupResponse resp;
+  grpc::ClientContext ctx;
+  auto status = GetStub(stub_.get())->Lookup(&ctx, req, &resp);
+  if (!status.ok()) {
+    MORI_UMBP_ERROR("[Client] Lookup(key={}) failed: {}", key, status.error_message());
+    return status;
+  }
+
+  if (found != nullptr) {
+    *found = resp.found();
+  }
+  return grpc::Status::OK;
+}
+
 grpc::Status MasterClient::FinalizeAllocation(const std::string& key, const Location& location,
-                                              const std::string& allocation_id) {
+                                              const std::string& allocation_id, int32_t depth) {
   if (!registered_) {
     return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
                         "node must be registered before finalization");
@@ -235,9 +298,10 @@ grpc::Status MasterClient::FinalizeAllocation(const std::string& key, const Loca
   }
 
   ::umbp::FinalizeRequest req;
-  req.set_node_id(config_.node_id);
+  req.set_node_id(normalized_location.node_id);
   req.set_key(key);
   req.set_allocation_id(allocation_id);
+  req.set_depth(depth);
   FillProtoLocation(normalized_location, req.mutable_location());
 
   ::umbp::FinalizeResponse resp;
@@ -341,8 +405,14 @@ grpc::Status MasterClient::RouteGet(const std::string& key,
     result.peer_address = resp.peer_address();
     const auto& ed = resp.engine_desc();
     result.engine_desc_bytes.assign(ed.begin(), ed.end());
-    const auto& md = resp.dram_memory_desc();
-    result.dram_memory_desc_bytes.assign(md.begin(), md.end());
+    result.dram_memory_descs.reserve(resp.dram_memory_descs_size());
+    for (const auto& bd : resp.dram_memory_descs()) {
+      BufferMemoryDescBytes b;
+      b.buffer_index = bd.buffer_index();
+      b.desc_bytes.assign(bd.desc().begin(), bd.desc().end());
+      result.dram_memory_descs.push_back(std::move(b));
+    }
+    result.page_size = resp.page_size();
     *out_result = result;
   }
 
@@ -383,15 +453,353 @@ grpc::Status MasterClient::RoutePut(const std::string& key, uint64_t block_size,
     result.peer_address = resp.peer_address();
     const auto& ed = resp.engine_desc();
     result.engine_desc_bytes.assign(ed.begin(), ed.end());
-    const auto& md = resp.dram_memory_desc();
-    result.dram_memory_desc_bytes.assign(md.begin(), md.end());
-    result.allocated_offset = resp.allocated_offset();
-    result.buffer_index = resp.buffer_index();
     result.allocation_id = resp.allocation_id();
+    result.location_id = resp.location_id();
+    result.pages.reserve(resp.pages_size());
+    for (const auto& p : resp.pages()) {
+      result.pages.push_back({p.buffer_index(), p.page_index()});
+    }
+    result.dram_memory_descs.reserve(resp.dram_memory_descs_size());
+    for (const auto& bd : resp.dram_memory_descs()) {
+      BufferMemoryDescBytes b;
+      b.buffer_index = bd.buffer_index();
+      b.desc_bytes.assign(bd.desc().begin(), bd.desc().end());
+      result.dram_memory_descs.push_back(std::move(b));
+    }
+    result.page_size = resp.page_size();
     *out_result = result;
   }
 
   MORI_UMBP_INFO("[Client] RoutePut key='{}': found={}", key, resp.found());
+  return grpc::Status::OK;
+}
+
+grpc::Status MasterClient::BatchRoutePut(const std::vector<std::string>& keys,
+                                         const std::vector<uint64_t>& block_sizes,
+                                         std::vector<std::optional<RoutePutResult>>* out) {
+  if (out != nullptr) {
+    out->clear();
+  }
+
+  if (!registered_) {
+    return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
+                        "node must be registered before BatchRoutePut");
+  }
+
+  ::umbp::BatchRoutePutRequest req;
+  req.set_node_id(config_.node_id);
+  for (const auto& k : keys) {
+    req.add_keys(k);
+  }
+  for (uint64_t sz : block_sizes) {
+    req.add_block_sizes(sz);
+  }
+
+  ::umbp::BatchRoutePutResponse resp;
+  grpc::ClientContext ctx;
+  auto status = GetStub(stub_.get())->BatchRoutePut(&ctx, req, &resp);
+
+  if (!status.ok()) {
+    MORI_UMBP_ERROR("[Client] BatchRoutePut failed: {}", status.error_message());
+    return status;
+  }
+
+  if (out != nullptr) {
+    out->resize(resp.entries_size());
+    for (int i = 0; i < resp.entries_size(); ++i) {
+      const auto& entry = resp.entries(i);
+      if (entry.found()) {
+        RoutePutResult result;
+        result.node_id = entry.node_id();
+        result.node_address = entry.node_address();
+        result.tier = static_cast<TierType>(entry.tier());
+        result.peer_address = entry.peer_address();
+        const auto& ed = entry.engine_desc();
+        result.engine_desc_bytes.assign(ed.begin(), ed.end());
+        result.allocation_id = entry.allocation_id();
+        result.location_id = entry.location_id();
+        result.pages.reserve(entry.pages_size());
+        for (const auto& p : entry.pages()) {
+          result.pages.push_back({p.buffer_index(), p.page_index()});
+        }
+        result.dram_memory_descs.reserve(entry.dram_memory_descs_size());
+        for (const auto& bd : entry.dram_memory_descs()) {
+          BufferMemoryDescBytes b;
+          b.buffer_index = bd.buffer_index();
+          b.desc_bytes.assign(bd.desc().begin(), bd.desc().end());
+          result.dram_memory_descs.push_back(std::move(b));
+        }
+        result.page_size = entry.page_size();
+        (*out)[i] = std::move(result);
+      }
+    }
+  }
+
+  MORI_UMBP_INFO("[Client] BatchRoutePut: {} keys", keys.size());
+  return grpc::Status::OK;
+}
+
+grpc::Status MasterClient::BatchRouteGet(const std::vector<std::string>& keys,
+                                         std::vector<std::optional<RouteGetResult>>* out) {
+  if (out != nullptr) {
+    out->clear();
+  }
+
+  if (!registered_) {
+    return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
+                        "node must be registered before BatchRouteGet");
+  }
+
+  ::umbp::BatchRouteGetRequest req;
+  req.set_node_id(config_.node_id);
+  for (const auto& k : keys) {
+    req.add_keys(k);
+  }
+
+  ::umbp::BatchRouteGetResponse resp;
+  grpc::ClientContext ctx;
+  auto status = GetStub(stub_.get())->BatchRouteGet(&ctx, req, &resp);
+
+  if (!status.ok()) {
+    MORI_UMBP_ERROR("[Client] BatchRouteGet failed: {}", status.error_message());
+    return status;
+  }
+
+  if (out != nullptr) {
+    out->resize(resp.entries_size());
+    for (int i = 0; i < resp.entries_size(); ++i) {
+      const auto& entry = resp.entries(i);
+      if (entry.found()) {
+        RouteGetResult result;
+        result.location.node_id = entry.source().node_id();
+        result.location.location_id = entry.source().location_id();
+        result.location.size = entry.source().size();
+        result.location.tier = static_cast<TierType>(entry.source().tier());
+        result.peer_address = entry.peer_address();
+        const auto& ed = entry.engine_desc();
+        result.engine_desc_bytes.assign(ed.begin(), ed.end());
+        result.dram_memory_descs.reserve(entry.dram_memory_descs_size());
+        for (const auto& bd : entry.dram_memory_descs()) {
+          BufferMemoryDescBytes b;
+          b.buffer_index = bd.buffer_index();
+          b.desc_bytes.assign(bd.desc().begin(), bd.desc().end());
+          result.dram_memory_descs.push_back(std::move(b));
+        }
+        result.page_size = entry.page_size();
+        (*out)[i] = std::move(result);
+      }
+    }
+  }
+
+  MORI_UMBP_INFO("[Client] BatchRouteGet: {} keys", keys.size());
+  return grpc::Status::OK;
+}
+
+grpc::Status MasterClient::BatchFinalizeAllocation(const std::vector<std::string>& keys,
+                                                   const std::vector<Location>& locations,
+                                                   const std::vector<std::string>& allocation_ids,
+                                                   std::vector<bool>* out,
+                                                   const std::vector<int32_t>& depths) {
+  if (out != nullptr) {
+    out->clear();
+  }
+
+  if (!registered_) {
+    return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
+                        "node must be registered before BatchFinalizeAllocation");
+  }
+
+  ::umbp::BatchFinalizeRequest req;
+  req.set_node_id(config_.node_id);
+  for (const auto& k : keys) {
+    req.add_keys(k);
+  }
+  for (const auto& loc : locations) {
+    FillProtoLocation(loc, req.add_locations());
+  }
+  for (const auto& id : allocation_ids) {
+    req.add_allocation_ids(id);
+  }
+  for (auto d : depths) {
+    req.add_depths(d);
+  }
+
+  ::umbp::BatchFinalizeResponse resp;
+  grpc::ClientContext ctx;
+  auto status = GetStub(stub_.get())->BatchFinalizeAllocation(&ctx, req, &resp);
+
+  if (!status.ok()) {
+    MORI_UMBP_ERROR("[Client] BatchFinalizeAllocation failed: {}", status.error_message());
+    return status;
+  }
+
+  if (out != nullptr) {
+    out->resize(resp.finalized_size());
+    for (int i = 0; i < resp.finalized_size(); ++i) {
+      (*out)[i] = resp.finalized(i);
+    }
+  }
+
+  MORI_UMBP_INFO("[Client] BatchFinalizeAllocation: {} keys", keys.size());
+  return grpc::Status::OK;
+}
+
+grpc::Status MasterClient::BatchAbortAllocation(const std::vector<BatchAbortEntry>& entries,
+                                                std::vector<bool>* out) {
+  if (out != nullptr) {
+    out->clear();
+  }
+
+  if (!registered_) {
+    return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
+                        "node must be registered before BatchAbortAllocation");
+  }
+
+  if (entries.empty()) {
+    return grpc::Status::OK;
+  }
+
+  ::umbp::BatchAbortAllocationRequest req;
+  for (const auto& e : entries) {
+    auto* proto_e = req.add_entries();
+    proto_e->set_node_id(e.node_id);
+    proto_e->set_allocation_id(e.allocation_id);
+    proto_e->set_size(e.size);
+  }
+
+  ::umbp::BatchAbortAllocationResponse resp;
+  grpc::ClientContext ctx;
+  auto status = GetStub(stub_.get())->BatchAbortAllocation(&ctx, req, &resp);
+
+  if (!status.ok()) {
+    MORI_UMBP_ERROR("[Client] BatchAbortAllocation ({} entries) failed: {}", entries.size(),
+                    status.error_message());
+    return status;
+  }
+
+  // Semantics align with BatchFinalizeAllocation: wire OK → fill out,
+  // do NOT promote any per-entry false to an RPC-level error.  Per-entry
+  // false is a normal race (already reaped / double-abort / EXPIRED).
+  if (out != nullptr) {
+    out->resize(resp.aborted_size());
+    for (int i = 0; i < resp.aborted_size(); ++i) {
+      (*out)[i] = resp.aborted(i);
+    }
+  }
+
+  MORI_UMBP_INFO("[Client] BatchAbortAllocation: {} entries", entries.size());
+  return grpc::Status::OK;
+}
+
+grpc::Status MasterClient::BatchLookup(const std::vector<std::string>& keys,
+                                       std::vector<bool>* out) {
+  if (out != nullptr) {
+    out->clear();
+  }
+
+  if (!registered_) {
+    return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
+                        "node must be registered before BatchLookup");
+  }
+
+  if (keys.empty()) {
+    return grpc::Status::OK;
+  }
+
+  ::umbp::BatchLookupRequest req;
+  req.set_node_id(config_.node_id);
+  for (const auto& k : keys) {
+    req.add_keys(k);
+  }
+
+  ::umbp::BatchLookupResponse resp;
+  grpc::ClientContext ctx;
+  auto status = GetStub(stub_.get())->BatchLookup(&ctx, req, &resp);
+
+  if (!status.ok()) {
+    MORI_UMBP_ERROR("[Client] BatchLookup failed: {}", status.error_message());
+    return status;
+  }
+
+  if (out != nullptr) {
+    out->resize(resp.found_size());
+    for (int i = 0; i < resp.found_size(); ++i) {
+      (*out)[i] = resp.found(i);
+    }
+  }
+
+  MORI_UMBP_DEBUG("[Client] BatchLookup: {} keys", keys.size());
+  return grpc::Status::OK;
+}
+
+grpc::Status MasterClient::ReportExternalKvBlocks(const std::string& node_id,
+                                                  const std::vector<std::string>& hashes,
+                                                  TierType tier) {
+  ::umbp::ReportExternalKvBlocksRequest req;
+  req.set_node_id(node_id);
+  for (const auto& hash : hashes) {
+    req.add_hashes(hash);
+  }
+  req.set_tier(static_cast<::umbp::TierType>(tier));
+
+  ::umbp::ReportExternalKvBlocksResponse resp;
+  grpc::ClientContext ctx;
+  auto status = GetStub(stub_.get())->ReportExternalKvBlocks(&ctx, req, &resp);
+  if (!status.ok()) {
+    MORI_UMBP_ERROR("[Client] ReportExternalKvBlocks(node={}) failed: {}", node_id,
+                    status.error_message());
+  }
+  return status;
+}
+
+grpc::Status MasterClient::RevokeExternalKvBlocks(const std::string& node_id,
+                                                  const std::vector<std::string>& hashes) {
+  ::umbp::RevokeExternalKvBlocksRequest req;
+  req.set_node_id(node_id);
+  for (const auto& hash : hashes) {
+    req.add_hashes(hash);
+  }
+
+  ::umbp::RevokeExternalKvBlocksResponse resp;
+  grpc::ClientContext ctx;
+  auto status = GetStub(stub_.get())->RevokeExternalKvBlocks(&ctx, req, &resp);
+  if (!status.ok()) {
+    MORI_UMBP_ERROR("[Client] RevokeExternalKvBlocks(node={}) failed: {}", node_id,
+                    status.error_message());
+  }
+  return status;
+}
+
+grpc::Status MasterClient::MatchExternalKv(const std::vector<std::string>& hashes,
+                                           std::vector<ExternalKvNodeMatch>* out_matches) {
+  if (out_matches != nullptr) {
+    out_matches->clear();
+  }
+
+  ::umbp::MatchExternalKvRequest req;
+  for (const auto& hash : hashes) {
+    req.add_hashes(hash);
+  }
+
+  ::umbp::MatchExternalKvResponse resp;
+  grpc::ClientContext ctx;
+  auto status = GetStub(stub_.get())->MatchExternalKv(&ctx, req, &resp);
+  if (!status.ok()) {
+    MORI_UMBP_ERROR("[Client] MatchExternalKv failed: {}", status.error_message());
+    return status;
+  }
+
+  if (out_matches != nullptr) {
+    for (const auto& proto_match : resp.matches()) {
+      ExternalKvNodeMatch m;
+      m.node_id = proto_match.node_id();
+      m.peer_address = proto_match.peer_address();
+      m.matched_hashes.assign(proto_match.matched_hashes().begin(),
+                              proto_match.matched_hashes().end());
+      m.tier = static_cast<TierType>(proto_match.tier());
+      out_matches->push_back(std::move(m));
+    }
+  }
   return grpc::Status::OK;
 }
 
@@ -459,6 +867,10 @@ void MasterClient::HeartbeatLoop() {
 
     ::umbp::HeartbeatResponse resp;
     grpc::ClientContext ctx;
+    // Bound this RPC so an unreachable master cannot trap StopHeartbeat()
+    // (which join()s this thread) past the destructor budget.
+    ctx.set_deadline(std::chrono::system_clock::now() +
+                     std::chrono::milliseconds(RpcShutdownTimeoutMs()));
     auto status = GetStub(stub_.get())->Heartbeat(&ctx, req, &resp);
 
     if (!status.ok()) {
@@ -470,10 +882,201 @@ void MasterClient::HeartbeatLoop() {
                      ClientStatusName(server_status));
 
       if (resp.status() == ::umbp::CLIENT_STATUS_UNKNOWN) {
-        MORI_UMBP_WARN(
-            "[Client] Master does not recognize us; "
-            "re-registration needed");
+        MORI_UMBP_WARN("[Client] Master does not recognize us; re-registering...");
+        registered_ = false;
+        ::umbp::RegisterClientRequest re_req;
+        re_req.set_node_id(config_.node_id);
+        re_req.set_node_address(config_.node_address);
+        {
+          std::lock_guard lock(caps_mutex_);
+          for (const auto& [tier, cap] : current_capacities_) {
+            auto* tc = re_req.add_tier_capacities();
+            tc->set_tier(static_cast<::umbp::TierType>(tier));
+            tc->set_total_capacity_bytes(cap.total_bytes);
+            tc->set_available_capacity_bytes(cap.available_bytes);
+          }
+        }
+        ::umbp::RegisterClientResponse re_resp;
+        grpc::ClientContext re_ctx;
+        auto re_status = GetStub(stub_.get())->RegisterClient(&re_ctx, re_req, &re_resp);
+        if (re_status.ok()) {
+          registered_ = true;
+          MORI_UMBP_INFO("[Client] Re-registered with master after UNKNOWN status");
+        } else if (re_status.error_code() == grpc::StatusCode::ALREADY_EXISTS) {
+          registered_ = true;
+          MORI_UMBP_INFO("[Client] Already registered with master");
+        } else {
+          MORI_UMBP_WARN("[Client] Re-registration failed: {}", re_status.error_message());
+        }
       }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+//  Client-side metrics: buffering API
+// ---------------------------------------------------------------------------
+
+namespace {
+std::string MetricKey(const std::string& name, const MasterClient::Labels& labels) {
+  std::string key = name;
+  for (const auto& [k, v] : labels) {
+    key += '|';
+    key += k;
+    key += '=';
+    key += v;
+  }
+  return key;
+}
+}  // namespace
+
+void MasterClient::AddCounter(std::string name, std::string help, Labels labels, double delta) {
+  std::lock_guard lock(metrics_mutex_);
+  auto key = MetricKey(name, labels);
+  auto& s = pending_counters_[key];
+  s.name = std::move(name);
+  s.help = std::move(help);
+  s.labels = std::move(labels);
+  s.value += delta;
+}
+
+void MasterClient::SetGauge(std::string name, std::string help, Labels labels, double value) {
+  std::lock_guard lock(metrics_mutex_);
+  auto key = MetricKey(name, labels);
+  auto& s = pending_gauges_[key];
+  s.name = std::move(name);
+  s.help = std::move(help);
+  s.labels = std::move(labels);
+  s.value = value;
+}
+
+void MasterClient::Observe(std::string name, std::string help, Labels labels,
+                           std::vector<double> bounds, double value) {
+  std::lock_guard lock(metrics_mutex_);
+  pending_histograms_.push_back(
+      {std::move(name), std::move(help), std::move(labels), std::move(bounds), value});
+}
+
+// ---------------------------------------------------------------------------
+//  Client-side metrics: background flush thread
+// ---------------------------------------------------------------------------
+
+void MasterClient::StartMetricsReporting() {
+  if (!registered_) {
+    MORI_UMBP_WARN("[Client] StartMetricsReporting ignored: not registered");
+    return;
+  }
+  if (metrics_running_) {
+    return;
+  }
+  metrics_running_ = true;
+  try {
+    metrics_thread_ = std::thread(&MasterClient::MetricsLoop, this);
+  } catch (const std::system_error& e) {
+    metrics_running_ = false;
+    MORI_UMBP_ERROR("[Client] Failed to start metrics thread: {}", e.what());
+    return;
+  }
+  MORI_UMBP_INFO("[Client] Metrics reporting thread started (interval={}ms)", metrics_interval_ms_);
+}
+
+void MasterClient::StopMetricsReporting() {
+  if (!metrics_running_) {
+    return;
+  }
+  metrics_running_ = false;
+  metrics_cv_.notify_one();
+  if (metrics_thread_.joinable()) {
+    metrics_thread_.join();
+  }
+  MORI_UMBP_INFO("[Client] Metrics reporting thread stopped");
+}
+
+void MasterClient::MetricsLoop() {
+  while (metrics_running_) {
+    {
+      std::unique_lock lock(metrics_cv_mutex_);
+      metrics_cv_.wait_for(lock, std::chrono::milliseconds(metrics_interval_ms_),
+                           [this] { return !metrics_running_.load(); });
+    }
+    if (!metrics_running_) break;
+
+    // Swap out all pending samples under lock; send without holding lock.
+    std::unordered_map<std::string, PendingSample> counters;
+    std::unordered_map<std::string, PendingSample> gauges;
+    std::vector<PendingHistogram> histograms;
+    {
+      std::lock_guard lock(metrics_mutex_);
+      counters.swap(pending_counters_);
+      gauges.swap(pending_gauges_);
+      histograms.swap(pending_histograms_);
+    }
+
+    if (counters.empty() && gauges.empty() && histograms.empty()) continue;
+
+    // Log every flush so we know the thread is alive and what it's sending.
+    {
+      double put_bytes = 0, get_bytes = 0;
+      for (const auto& [k, s] : counters) {
+        if (s.name == MORI_UMBP_METRIC_CLIENT_PUT_BYTES_TOTAL) put_bytes += s.value;
+        if (s.name == MORI_UMBP_METRIC_CLIENT_GET_BYTES_TOTAL) get_bytes += s.value;
+      }
+      MORI_UMBP_INFO(
+          "[Client] MetricsLoop flush: node={} counters={} gauges={} histograms={} "
+          "put_bytes_delta={:.0f} get_bytes_delta={:.0f}",
+          config_.node_id, counters.size(), gauges.size(), histograms.size(), put_bytes, get_bytes);
+    }
+
+    ::umbp::ReportMetricsRequest req;
+    req.set_node_id(config_.node_id);
+
+    for (const auto& [key, s] : counters) {
+      auto* sample = req.add_metrics();
+      sample->set_name(s.name);
+      sample->set_help(s.help);
+      for (const auto& [k, v] : s.labels) {
+        auto* l = sample->add_labels();
+        l->set_name(k);
+        l->set_value(v);
+      }
+      sample->set_counter_delta(s.value);
+    }
+    for (const auto& [key, s] : gauges) {
+      auto* sample = req.add_metrics();
+      sample->set_name(s.name);
+      sample->set_help(s.help);
+      for (const auto& [k, v] : s.labels) {
+        auto* l = sample->add_labels();
+        l->set_name(k);
+        l->set_value(v);
+      }
+      sample->set_gauge_value(s.value);
+    }
+    for (const auto& h : histograms) {
+      auto* sample = req.add_metrics();
+      sample->set_name(h.name);
+      sample->set_help(h.help);
+      for (const auto& [k, v] : h.labels) {
+        auto* l = sample->add_labels();
+        l->set_name(k);
+        l->set_value(v);
+      }
+      auto* hist = sample->mutable_histogram();
+      for (double b : h.bounds) hist->add_bounds(b);
+      hist->set_value(h.value);
+    }
+
+    ::umbp::ReportMetricsResponse resp;
+    grpc::ClientContext ctx;
+    ctx.set_deadline(std::chrono::system_clock::now() +
+                     std::chrono::milliseconds(RpcShutdownTimeoutMs()));
+    auto status = GetStub(stub_.get())->ReportMetrics(&ctx, req, &resp);
+    if (!status.ok()) {
+      MORI_UMBP_WARN("[Client] ReportMetrics RPC failed: node_id={}, error={}", config_.node_id,
+                     status.error_message());
+    } else {
+      MORI_UMBP_INFO("[Client] ReportMetrics RPC ok: node_id={} samples={}", config_.node_id,
+                     req.metrics_size());
     }
   }
 }
