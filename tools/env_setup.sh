@@ -64,10 +64,13 @@ reset_qos() {
 setup_pfc() {
     sudo nicctl update qos --classification-type dscp                          || { die "set classification-type failed"; return 1; }
     sudo nicctl update port --all --pause-type pfc --rx-pause enable --tx-pause enable || { die "set pause failed"; return 1; }
+    # Define scheduling FIRST so subsequent dscp-to-priority calls can target
+    # priorities 0/3/6 (nicctl rejects DSCP -> priority N if priority N has
+    # no scheduling configured yet).
+    sudo nicctl update qos scheduling --priority 0,3,6 --dwrr 10,90,0 --rate-limit 0,0,0 || { die "set scheduling failed"; return 1; }
     sudo nicctl update qos dscp-to-priority --dscp 26 --priority 3             || { die "map DSCP 26 -> priority 3 failed"; return 1; }
     sudo nicctl update qos dscp-to-priority --dscp 48 --priority 6             || { die "map DSCP 48 -> priority 6 failed"; return 1; }
     sudo nicctl update qos pfc --priority 3 --no-drop enable                   || { die "enable PFC no-drop on priority 3 failed"; return 1; }
-    sudo nicctl update qos scheduling --priority 0,3,6 --dwrr 10,90,0 --rate-limit 0,0,0 || { die "set scheduling failed"; return 1; }
     sudo nicctl update port --all --admin-state up                             || { die "set admin-state up failed"; return 1; }
     log_ok "PFC / DSCP / scheduling configured"
 }
