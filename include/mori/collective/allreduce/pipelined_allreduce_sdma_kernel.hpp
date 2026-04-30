@@ -182,6 +182,79 @@ __global__ void ScatterSdmaOnlyKernel(
   }
 }
 
+// Same data movement as ScatterSdmaOnlyKernel, but waits after each chunk.
+// This is used by experimental copy-pipe paths where burst-submitting all
+// chunks on qId=0 has been observed to leave the final signal short.
+template <typename T>
+__global__ void ScatterSdmaOnlyWaitEachChunkKernel(
+    int myPe, int npes,
+    const T* __restrict__ input,
+    const application::SymmMemObjPtr dstMemObj,
+    size_t elementCount,
+    size_t chunkElementCount,
+    uint64_t scatterBase) {
+
+  using P = typename packed_t<T>::P;
+  constexpr int pack_size = P::size;
+
+  const size_t elementCountPerRank =
+      ((elementCount / npes + pack_size - 1) / pack_size) * pack_size;
+  const size_t chunkPerRank =
+      ((chunkElementCount / npes + pack_size - 1) / pack_size) * pack_size;
+  const size_t bytesPerElement = sizeof(T);
+  const size_t packedPerRank = elementCountPerRank / pack_size;
+  const size_t packedChunkPerRank = chunkPerRank / pack_size;
+
+  if (elementCountPerRank == 0 || chunkPerRank == 0) return;
+
+  const int numChunks =
+      static_cast<int>((packedPerRank + packedChunkPerRank - 1) / packedChunkPerRank);
+  const size_t chunkBytes = chunkPerRank * bytesPerElement;
+  const size_t totalShardBytes = elementCountPerRank * bytesPerElement;
+  const uint32_t numQ = dstMemObj->sdmaNumQueue;
+  const int thr = static_cast<int>(threadIdx.x);
+
+  for (int c = 0; c < numChunks; c++) {
+    const size_t cOff = static_cast<size_t>(c) * chunkBytes;
+    size_t actualBytes = chunkBytes;
+    if (cOff + actualBytes > totalShardBytes)
+      actualBytes = totalShardBytes - cOff;
+
+    if (thr < npes && thr != myPe) {
+      const int destPe = thr;
+      anvil::SdmaQueueDeviceHandle** dh =
+          dstMemObj->deviceHandles_d + destPe * numQ;
+      HSAuint64* rSig = dstMemObj->peerSignalPtrs[destPe]
+          + static_cast<size_t>(myPe) * numQ;
+      uint8_t* src = reinterpret_cast<uint8_t*>(const_cast<T*>(input))
+          + static_cast<size_t>(destPe) * totalShardBytes + cOff;
+      uint8_t* dst = reinterpret_cast<uint8_t*>(dstMemObj->peerPtrs[destPe])
+          + static_cast<size_t>(myPe) * totalShardBytes + cOff;
+      core::SdmaPutThread(src, dst, actualBytes, dh, rSig, numQ, 0);
+    }
+    __syncthreads();
+
+    if (thr < npes && thr != myPe) {
+      const int sender = thr;
+      const uint64_t expected = scatterBase + static_cast<uint64_t>(c + 1);
+      HSAuint64* sig = dstMemObj->signalPtrs
+          + static_cast<size_t>(sender) * numQ;
+      uint64_t stuck = 0;
+      while (core::AtomicLoadRelaxed(sig) < expected) {
+        __builtin_amdgcn_s_sleep(1);
+        if (++stuck >= 100000000ULL) {
+          printf("[STUCK] PE %d K1-chunked thr %d chunk=%d scatter-wait sender=%d expected=%llu got=%llu\n",
+                 myPe, thr, c, sender,
+                 (unsigned long long)expected,
+                 (unsigned long long)core::AtomicLoadRelaxed(sig));
+          stuck = 0;
+        }
+      }
+    }
+    __syncthreads();
+  }
+}
+
 template <typename T, int SCATTER_MODE = 0, bool MULTI_CHUNK = false,
           bool EXTERNAL_SCATTER = false>
 __global__ void PipelinedAllReduceSdmaKernel(

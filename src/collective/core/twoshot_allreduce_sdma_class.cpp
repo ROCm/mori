@@ -1089,7 +1089,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                        myPe_, numChunks_host, blocks, pipe_nR, pipe_comp - pipe_nR);
                 s_pipe_announced = true;
             }
-            ScatterSdmaOnlyKernel<T><<<1, 512, 0, stream>>>(
+            ScatterSdmaOnlyWaitEachChunkKernel<T><<<1, 512, 0, stream>>>(
                 myPe_, npes_, input, output_transit_buffer_obj_,
                 total_count, chunk_elems, scatter_base);
             PipelinedSdmaAgCopyKernel<T><<<blocks, threads, 0, stream>>>(
