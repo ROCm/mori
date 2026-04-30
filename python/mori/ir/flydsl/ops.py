@@ -38,33 +38,38 @@ Usage::
 """
 
 from mori.ir.ops import MORI_DEVICE_FUNCTIONS, SIGNAL_SET, SIGNAL_ADD
+from mori.ir.flydsl.runtime import get_bitcode_path, shmem_module_init
 
 
-# ExternFunction is provided by FlyDSL (Part B).
-# We use a lazy import so mori.ir.flydsl can be imported without FlyDSL installed;
-# ExternFunction is only needed when building a @flyc.kernel.
-def _get_extern_cls():
+def _get_flydsl_extern_helpers():
+    """Load FlyDSL extern helpers lazily so importing mori does not require FlyDSL."""
     try:
-        from flydsl.expr.extern import ExternFunction
+        from flydsl.expr.extern import ffi
+        from flydsl.compiler.extern_link import link_extern
 
-        return ExternFunction
+        return ffi, link_extern
     except ImportError as e:
         raise ImportError(
-            "flydsl.expr.extern not found. "
-            "Make sure FlyDSL is installed and flydsl/expr/extern.py exists."
+            "FlyDSL extern helpers not found. Make sure FlyDSL provides "
+            "flydsl.expr.extern.ffi and flydsl.compiler.extern_link.link_extern."
         ) from e
 
 
 def _build_all():
     """Populate module globals from MORI_DEVICE_FUNCTIONS."""
-    ExternFunction = _get_extern_cls()
+    ffi, link_extern = _get_flydsl_extern_helpers()
+    bitcode_path = get_bitcode_path()
     ns = {}
     for name, meta in MORI_DEVICE_FUNCTIONS.items():
-        ns[name] = ExternFunction(
-            symbol=meta["symbol"],
-            arg_types=meta["args"],
-            ret_type=meta["ret"],
-            is_pure=meta.get("pure", False),
+        ns[name] = link_extern(
+            ffi(
+                meta["symbol"],
+                meta["args"],
+                meta["ret"],
+                is_pure=meta.get("pure", False),
+            ),
+            bitcode_path=bitcode_path,
+            module_init_fn=shmem_module_init,
         )
     return ns
 
