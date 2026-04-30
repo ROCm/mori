@@ -29,6 +29,38 @@ FlyDSL-specific runtime helpers for mori shmem integration.
 
 from mori.ir.bitcode import find_bitcode
 
+_FLYDSL_COV = 6
+_FLYDSL_ROCDL_ABI = 600
+
+
+def _check_flydsl_rocdl_abi() -> None:
+    """Verify FlyDSL still lowers ROCm code objects with ABI 600.
+
+    Mori's FlyDSL device bitcode is compiled with code object version 6.  The
+    matching FlyDSL `rocdl-attach-target` option is `abi=600`; if either side
+    changes, linked kernels can compile but fail later at HIP module load time.
+    """
+    try:
+        from flydsl.compiler.backends import get_backend
+
+        backend = get_backend()
+        fragments = backend.pipeline_fragments(compile_hints={})
+    except Exception as exc:
+        raise RuntimeError(
+            "Unable to inspect FlyDSL ROCm backend ABI settings"
+        ) from exc
+
+    attach_fragments = [frag for frag in fragments if "rocdl-attach-target" in frag]
+    if not attach_fragments:
+        raise RuntimeError("FlyDSL ROCm pipeline has no rocdl-attach-target pass")
+
+    expected = f"abi={_FLYDSL_ROCDL_ABI}"
+    if not any(expected in frag for frag in attach_fragments):
+        raise RuntimeError(
+            "MORI FlyDSL bitcode is built with cov=6 and requires FlyDSL "
+            f"rocdl-attach-target {expected}; got: {attach_fragments}"
+        )
+
 
 def get_bitcode_path() -> str:
     """Return the path to libmori_shmem_device.bc (compiled with cov=6 for FlyDSL ABI).
@@ -38,7 +70,8 @@ def get_bitcode_path() -> str:
         from mori.ir.flydsl import get_bitcode_path
         bc = get_bitcode_path()
     """
-    return find_bitcode(cov=6)
+    _check_flydsl_rocdl_abi()
+    return find_bitcode(cov=_FLYDSL_COV)
 
 
 def shmem_module_init(hip_module: int):
