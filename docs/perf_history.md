@@ -1995,7 +1995,7 @@ avoid long AR service bursts, while still producing `user_output` for copy mode.
 
 ## Entry 51 — Implement correctness-first `MORI_FULLMESH_CHAN=1` fullmesh channelized MVP
 - **Date**: 2026-04-30
-- **Commit**: _this commit_
+- **Commit**: `3571144c`
 - **Goal**: start a genuinely new fullmesh channelized path for the final
   drop-in copy target. This is not the old `MORI_FULLMESH_PIPE=1` alias; it is
   a new kernel that writes `user_output` inside the allreduce path.
