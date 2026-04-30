@@ -337,6 +337,43 @@ gap (`copy - no-copy = +0.452 ms`). The pasted output did not include
 The bench script now runs `BASELINE_PHASE_STAGE0` by default to extract those
 copy timing lines.
 
+### Copy timing localized (Entry 59)
+
+Updated script on `e4b48667` produced both continuous and finite phase/copy
+data:
+
+Continuous:
+
+| mode | wall | seq_ar | slowdown | vs RCCL |
+|---|---:|---:|---:|---:|
+| **SDMA copy** | **6.861** | 5.243 | 1.582 | **+1.068 ms** |
+| SDMA no-copy | 6.248 | 4.810 | 1.503 | +0.455 ms |
+| RCCL | 5.793 | 5.135 | 1.386 | — |
+
+Finite `BASELINE_PHASE_STAGE0`:
+
+| mode | wall | seq_ar | slowdown | vs RCCL |
+|---|---:|---:|---:|---:|
+| **SDMA copy** | **7.761** | 5.222 | 2.108 | **+0.338 ms** |
+| SDMA no-copy | 7.297 | 4.804 | 1.983 | -0.126 ms |
+| RCCL | 7.423 | 5.128 | 2.018 | — |
+
+Copy timing:
+```text
+host-side hipMemcpyAsync() call: 3.45 us
+gpu-side copy kernel wall:      0.383 ms
+```
+
+Mechanism:
+- finite copy penalty = `7.761 - 7.297 = 0.464 ms`, mostly physical copy
+  `0.383 ms`
+- continuous copy penalty = `6.861 - 6.248 = 0.613 ms`
+- continuous no-copy gap = `6.248 - 5.793 = 0.455 ms`
+
+Therefore final target still requires both: eliminate/hide output
+materialization and fix SDMA two-shot cadence/overlap. Copy-only optimization
+cannot close the continuous gap alone.
+
 ### Integer reduce fast path (Entry 50)
 
 `uint32/int32` pipeline reduce now accumulates in packed integer registers
@@ -466,6 +503,8 @@ skipped by default, `MORI_SDMA_AG_COPY_PIPE=1` alone is ignored unless
 wall/slowdown/seq_ar/seq_gemm rows with derived gaps.
 Latest script update also runs finite `BASELINE_PHASE_STAGE0` copy timing by
 default (`RUN_PHASE_TIMING=1`).
+Entry 59 data shows finite output copy GPU wall is `0.383 ms` and continuous
+target gap is still `+1.068 ms`.
 
 `MORI_DIRECT_OUTPUT=1` 激活 Plan A v2 path; 不开则走 BASELINE.
 `MORI_SDMA_AG_COPY_PIPE=1` 激活 K1 scatter + K2 R-reduce / SDMA-AG / C-copy pipeline.

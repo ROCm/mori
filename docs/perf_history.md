@@ -2152,6 +2152,87 @@ overlap disturbance.
 
 ---
 
+## Entry 59 — Copy timing localizes finite loss: GPU copy wall is 0.383 ms
+- **Date**: 2026-04-30
+- **Commit under test**: `e4b48667`
+- **Command**: `bash tools/bench_sdma_ag_copy_pipe.sh`
+- **Log**: `/tmp/perf_sdma_ag_copy_pipe_1777557625.log`
+- **Config**:
+  - continuous section: `MORI_CONTINUOUS_PREP=0`, `MORI_PIPELINE_CU=224`,
+    `MORI_PIPELINE_CHUNKS=4`, `--continuous-iters 100`
+  - finite phase section: `BASELINE_PHASE_STAGE0`,
+    `--iterations 20`, `--warmup 5`, `--ar-phase-timing`
+- **All correctness checks PASSED** (from the test summary in the pasted output)
+
+### Continuous result
+
+| mode | wall | slowdown | seq_ar | seq_gemm | gap vs RCCL |
+|---|---:|---:|---:|---:|---:|
+| **SDMA copy** | **6.861** | 1.582 | 5.243 | 4.337 | **+1.068** |
+| SDMA no-copy | 6.248 | 1.503 | 4.810 | 4.158 | +0.455 |
+| RCCL | 5.793 | 1.386 | 5.135 | 4.179 | — |
+
+Continuous decomposition:
+```text
+SDMA copy - RCCL    = 6.861 - 5.793 = +1.068 ms
+SDMA no-copy - RCCL = 6.248 - 5.793 = +0.455 ms
+SDMA copy - no-copy = 6.861 - 6.248 = +0.613 ms
+```
+
+### Finite phase/copy result
+
+| mode | wall | slowdown | seq_ar | seq_gemm | gap vs RCCL |
+|---|---:|---:|---:|---:|---:|
+| **SDMA copy** | **7.761** | 2.108 | 5.222 | 3.681 | **+0.338** |
+| SDMA no-copy | 7.297 | 1.983 | 4.804 | 3.680 | -0.126 |
+| RCCL | 7.423 | 2.018 | 5.128 | 3.679 | — |
+
+Finite decomposition:
+```text
+SDMA copy - RCCL    = 7.761 - 7.423 = +0.338 ms
+SDMA no-copy - RCCL = 7.297 - 7.423 = -0.126 ms
+SDMA copy - no-copy = 7.761 - 7.297 = +0.464 ms
+```
+
+Copy timing:
+```text
+host-side hipMemcpyAsync() call: 3.45 us
+gpu-side copy kernel wall:      0.383 ms
+```
+
+### Mechanism
+
+Finite-mode copy penalty (`0.464 ms`) is mostly the physical output copy
+(`0.383 ms`), with only `0.081 ms` remaining for event/tail/overlap
+disturbance. In continuous mode, copy penalty is larger (`0.613 ms`), so the
+extra continuous exposure is:
+```text
+0.613 - 0.383 = 0.230 ms
+```
+
+The full continuous gap still has two live components:
+```text
+output materialization / copy exposure ~= +0.613 ms
+no-copy overlap-quality penalty        = +0.455 ms
+total copy-vs-RCCL gap                 = +1.068 ms
+```
+
+### Conclusion
+
+This confirms the materialization copy is real and measurable (`0.383 ms` GPU
+wall), not a host-call artifact (`3.45 us`). But removing/hiding only this copy
+is not enough for the continuous target because no-copy still trails RCCL by
+`0.455 ms`.
+
+The next implementation direction must either:
+- eliminate the output copy and also improve cadence, or
+- replace the two-shot cadence with an algorithm that writes `user_output`
+directly while matching RCCL's overlap behavior.
+
+Do not resume `MORI_SDMA_AG_COPY_PIPE`; it remains closed by Entry 56.
+
+---
+
 ## Entry 49 — Implement integer accumulator fast path for uint32/int32 pipeline reduce
 - **Date**: 2026-04-30
 - **Commit**: _this commit_
