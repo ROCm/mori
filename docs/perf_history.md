@@ -1963,6 +1963,51 @@ Therefore any successful final solution must address **both**:
 
 ---
 
+## Entry 55 — Fix `MORI_SDMA_AG_COPY_PIPE=1` K1 scatter hang at signal 3/4
+- **Date**: 2026-04-30
+- **Failing commit under test**: `23b7978b`
+- **Fix commit**: `19192f89`
+- **Command**: `bash tools/bench_sdma_ag_copy_pipe.sh`
+- **Variant**: `MORI_SDMA_AG_COPY_PIPE=1`, `MORI_PIPELINE_CU=224`,
+  `MORI_PIPELINE_CHUNKS=4`, first sweep point `MORI_SDMA_AG_COPY_NR=112`
+
+### Observed failure
+
+The copy-pipe branch reached its first enabled run and hung in K1 scatter:
+```text
+PE 4: MORI_SDMA_AG_COPY_PIPE=1 — K1 scatter + K2 R-reduce / SDMA-AG / C-copy pipeline; chunks=4, blocks=225, nR=112, nC=112
+[STUCK] PE 4 K1 thr 0 scatter-wait sender=0 expected=4 got=3
+[STUCK] PE 4 K1 thr 1 scatter-wait sender=1 expected=4 got=3
+[STUCK] PE 7 K1 thr 0 scatter-wait sender=0 expected=4 got=3
+```
+
+The evidence is specific: K1 expected the fourth qId=0 scatter signal
+(`scatterBase + numChunks = 4`) but multiple peers stayed at `3`. This happened
+before K2 reduce/AG/copy could run, so no performance conclusion is valid.
+
+### Fix
+
+`MORI_SDMA_AG_COPY_PIPE=1` now uses
+`ScatterSdmaOnlyWaitEachChunkKernel`, which submits scatter for chunk `c`, waits
+for incoming signal `scatterBase + c + 1`, then advances to the next chunk.
+
+Default baseline, external-scatter, and Plan A still use the original
+burst-submit `ScatterSdmaOnlyKernel`; this fix is scoped only to the
+copy-pipe experiment.
+
+### Next validation
+
+Re-run:
+```bash
+git pull origin sdma-test
+bash tools/bench_sdma_ag_copy_pipe.sh
+```
+
+If the pipe path still hangs, the next evidence to capture is the new
+`K1-chunked` stuck line, which includes the exact chunk index.
+
+---
+
 ## Entry 49 — Implement integer accumulator fast path for uint32/int32 pipeline reduce
 - **Date**: 2026-04-30
 - **Commit**: _this commit_
