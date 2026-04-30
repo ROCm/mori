@@ -9,7 +9,7 @@ alwaysApply: true
 
 关联文件:
 - `.cursor/rules/relentless-perf.mdc` — 方法论规则 (R0-R15)
-- `docs/perf_history.md` — 所有历史 Entry (1-53) 含数据
+- `docs/perf_history.md` — 所有历史 Entry (1-54) 含数据
 - Latest mechanism finding: Entry 31 continuous timeline shows SDMA no-copy
   GEMM remains ~1.0ms/stage, but SDMA AR service time becomes ~2.0ms/stage
   under GEMM, so stream_ar backlog grows. RCCL stabilizes both GEMM/AR around
@@ -260,6 +260,23 @@ the base for any future fullmesh channelized algorithm work.
 Repeat run (Entry 53): copy 7.037, no-copy 6.399, RCCL 5.807. Better than the
 first run but still fails COPY VS RCCL by +1.23ms and remains worse than best
 copy stack (Entry 48: 6.817).
+
+### Clean final gap decomposition (Entry 54)
+
+Default path with `CU=224, chunks=4`, corrected continuous no-prep:
+
+| mode | wall | seq_ar | slowdown | vs RCCL |
+|---|---:|---:|---:|---:|
+| **SDMA copy** | **7.032** | 5.236 | 1.618 | **+1.239** |
+| SDMA no-copy | 6.416 | 4.831 | 1.545 | +0.623 |
+| RCCL | 5.793 | 5.139 | 1.407 | — |
+
+Root cause has two independent pieces:
+1. output materialization penalty: copy - no-copy = **+0.616ms**
+2. no-copy overlap-quality penalty: no-copy - RCCL = **+0.623ms**
+
+Final solution must solve both: write user_output without a large extra CU copy
+AND improve AR/GEMM cadence.
 
 ### Integer reduce fast path (Entry 50)
 

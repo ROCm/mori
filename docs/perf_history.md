@@ -1910,6 +1910,59 @@ goal.
 
 ---
 
+## Entry 54 — Clean default COPY vs RCCL decomposition: two independent gaps (copy + overlap quality)
+- **Date**: 2026-04-30
+- **Commit under test**: current `sdma-test` HEAD after default-off experiments
+- **Command**: default path (no experimental env except `MORI_CONTINUOUS_PREP=0`,
+  `MORI_PIPELINE_CU=224`, `MORI_PIPELINE_CHUNKS=4`), continuous 100, phase timing.
+- **All correctness checks PASSED**
+
+| mode | wall | seq_ar | seq_gemm | slowdown | gap vs RCCL |
+|---|---:|---:|---:|---:|---:|
+| **SDMA copy** | **7.032** | 5.236 | 4.347 | 1.618 | **+1.239** |
+| SDMA no-copy | 6.416 | 4.831 | 4.153 | 1.545 | +0.623 |
+| RCCL | **5.793** | 5.139 | 4.116 | 1.407 | — |
+
+Copy timing:
+```text
+gpu-side copy kernel wall (baseline hipMemcpyAsync path): 0.403 ms
+```
+
+### Decomposition
+
+Total copy-mode gap:
+```text
+SDMA copy - RCCL = 7.032 - 5.793 = +1.239 ms
+```
+
+It splits into two independent parts:
+1. **output-copy penalty**:
+   ```text
+   SDMA copy - SDMA no-copy = 7.032 - 6.416 = +0.616 ms
+   ```
+   This includes the measured local output copy (~0.403 ms) plus extra overlap
+   disturbance from running that copy on CU/HBM.
+2. **no-copy overlap-quality penalty**:
+   ```text
+   SDMA no-copy - RCCL = 6.416 - 5.793 = +0.623 ms
+   ```
+   SDMA no-copy is faster sequentially (`4.831` vs RCCL `5.139`), but its
+   overlap is worse (`slowdown 1.545` vs RCCL `1.407`).
+
+### Root cause
+
+The final COPY-vs-RCCL miss is **not a single copy problem**. It is:
+- ~0.62 ms from needing to materialize user `output` (copy path)
+- ~0.62 ms from SDMA two-shot overlap/cadence being worse than RCCL even in
+  no-copy mode
+
+Therefore any successful final solution must address **both**:
+1. produce user_output without a separate large CU copy, and
+2. improve AR/GEMM service-rate matching so no-copy-equivalent path does not
+   trail RCCL by ~0.6 ms.
+
+---
+
 ## Entry 49 — Implement integer accumulator fast path for uint32/int32 pipeline reduce
 - **Date**: 2026-04-30
 - **Commit**: _this commit_
