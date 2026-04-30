@@ -250,6 +250,13 @@ Correctness passes but no performance gain:
 Best known no-copy remains Entry 34 `CU224,chunks4`: 6.390 ms. Separate AG is
 closed as standalone optimization.
 
+### Fullmesh channelized MVP (Entry 51/52)
+
+`MORI_FULLMESH_CHAN=1` is a new correctness-first kernel that writes
+`user_output` in-kernel. It passed correctness but did not improve performance:
+copy wall 7.400, no-copy 6.413, RCCL 5.801. It is not sufficient, but remains
+the base for any future fullmesh channelized algorithm work.
+
 ### Integer reduce fast path (Entry 50)
 
 `uint32/int32` pipeline reduce now accumulates in packed integer registers
@@ -372,7 +379,7 @@ SDMA two-shot 算法比 RCCL 多一步 **256MB transit → user_output copy** (�
 
 ## 代码当前状态
 
-HEAD = **`3571144c`** (`MORI_FULLMESH_CHAN=1` new fullmesh channelized MVP)
+HEAD = **`3571144c`** (`MORI_FULLMESH_CHAN=1` new fullmesh channelized MVP; docs through Entry 52)
 
 `MORI_DIRECT_OUTPUT=1` 激活 Plan A v2 path; 不开则走 BASELINE.
 

@@ -2038,6 +2038,42 @@ Success criteria:
 
 ---
 
+## Entry 52 — `MORI_FULLMESH_CHAN=1` result: correctness passes, no performance breakthrough
+- **Date**: 2026-04-30
+- **Commit under test**: `3571144c` / docs follow-up `294e1876`
+- **Command**: `MORI_CONTINUOUS_PREP=0 MORI_FULLMESH_CHAN=1 MORI_PIPELINE_CU=224 MORI_PIPELINE_CHUNKS=4 ... --continuous-iters 100`
+- **All correctness checks PASSED**
+
+| mode | wall | seq_ar | seq_gemm | slowdown | gap vs RCCL |
+|---|---:|---:|---:|---:|---:|
+| **SDMA copy + fullmesh chan MVP** | **7.400** | 5.231 | 4.344 | 1.703 | **+1.599** |
+| SDMA no-copy + fullmesh chan MVP | 6.413 | 4.830 | 4.252 | 1.508 | +0.612 |
+| RCCL | **5.801** | 5.120 | 4.127 | 1.406 | — |
+
+### Comparison to best known settings
+
+| path | SDMA copy wall | SDMA no-copy wall |
+|---|---:|---:|
+| Entry 48 best copy stack | **6.817** | 6.410 |
+| Entry 34 best no-copy stack | — | **6.390** |
+| Entry 52 fullmesh chan MVP | 7.400 | 6.413 |
+
+### Interpretation
+
+The correctness-first fullmesh channelized MVP is correct but slower than the
+best existing copy path and essentially equal to best no-copy. It writes
+`user_output` inside the kernel, but doing so with the current simple
+scatter->reduce->AG->copy-per-chunk schedule adds too much local copy/CU work
+and does not improve cadence enough.
+
+### Conclusion
+
+This MVP does not solve COPY VS RCCL. A successful new algorithm must go beyond
+this simple chunk loop: it needs true channel/peer pipelining and output
+placement without adding a big local copy phase.
+
+---
+
 ## Entry 40 — Implement experimental multi-q SDMA AG (`MORI_MULTI_Q_AG=1`)
 - **Date**: 2026-04-29
 - **Commit**: _this commit_
