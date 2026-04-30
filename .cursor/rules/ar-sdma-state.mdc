@@ -374,7 +374,7 @@ Therefore final target still requires both: eliminate/hide output
 materialization and fix SDMA two-shot cadence/overlap. Copy-only optimization
 cannot close the continuous gap alone.
 
-### Local SDMA output copy implemented (Entry 60)
+### Local SDMA output copy failed and reverted (Entry 60/61/63)
 
 `MORI_OUTPUT_SDMA_COPY=1` replaces `copy_output_to_user()`'s external
 `hipMemcpyAsync`/CU copy with an internal one-block local SDMA copy from the
@@ -385,17 +385,23 @@ Why first:
 - Entry 59 continuous copy penalty = **0.613 ms**
 - Entry 59 continuous no-copy cadence gap = **0.455 ms**
 
-Expected best-case gain is about `0.383 ms`; this is not enough to beat RCCL
-alone, but it is the highest-value drop-in subproblem and preserves user API.
-Next run must compare `BASELINE` vs `SDMA_OUTPUT_COPY`; keep only if wall
-improves, otherwise revert and record.
+Entry 63 proves this direction failed:
 
-Entry 61 first run on `60b333fa` hung after Test 1b correctness passed. The
-implementation had a bad side effect: it mutated `srcObj->expectSignalsPtr`.
-Fix attempt: do not touch `expectSignalsPtr`; read local signal and wait for
-`current+1`. Script default is now `RUN_OUTPUT_SDMA_COPY=0`; use
-`RUN_OUTPUT_SDMA_COPY=1 bash tools/bench_sdma_ag_copy_pipe.sh` only for targeted
-debug of the fixed path.
+| label | copy wall | copy penalty | seq_ar |
+|---|---:|---:|---:|
+| BASELINE | 6.862 | 0.613 | 5.235 |
+| **SDMA_OUTPUT_COPY** | **23.694** | **17.447** | **22.676** |
+
+Finite copy timing:
+```text
+BASELINE gpu-side copy wall:          0.363 ms
+SDMA_OUTPUT_COPY gpu-side copy wall:  4.550 ms
+```
+
+Mechanism: local SDMA output copy itself is ~4.5ms per AR, matching
+`17.361 / 4 = 4.34ms` finite copy penalty. It is much slower than baseline
+`hipMemcpyAsync` CU copy. Implementation and script entry are removed. Do not
+retry local SDMA output copy without new micro-bench evidence.
 
 Entry 62 guarded baseline on `4ca2d7f8` is stable:
 - continuous SDMA copy `6.875`, no-copy `6.259`, RCCL `5.822`
@@ -507,6 +513,7 @@ SDMA two-shot 算法比 RCCL 多一步 **256MB transit → user_output copy** (�
 | **Plan B** (K1 SDMA scatter + K2 CU reduce+**push**AG+CU copy) | **18** | CU AG + GEMM 抢 CU. wall +1.16 ms 退化. overlap/seq_gemm 2.44 |
 | **Plan A v1** (K1 SDMA scatter + K2 串行 reduce→pull) | **20** | implementation 没做 pipeline: `reduce(c)->pull(c)->reduce(c+1)` 串行, wall **+1.58 ms vs RCCL**. **不能用来否定 Plan A v2** |
 | **SDMA AG copy-pipe** (`MORI_SDMA_AG_COPY_PIPE=1`) | **55/56** | correctness hang before K2: K1 scatter signal stuck `chunk=3 expected=4 got=3`; skipped by default |
+| **Local SDMA output copy** (`MORI_OUTPUT_SDMA_COPY=1`) | **63** | copy kernel wall **4.550 ms** vs baseline **0.363 ms**; copy penalty **17.447 ms**, reverted |
 | CU sweep (80..220) | 3 | copy exposure 在 CU ≥120 下 invariant |
 | 压 kernel priority | 5 | priority 对 wall 无 measurable effect |
 
@@ -537,9 +544,8 @@ Latest script update also runs finite `BASELINE_PHASE_STAGE0` copy timing by
 default (`RUN_PHASE_TIMING=1`).
 Entry 59 data shows finite output copy GPU wall is `0.383 ms` and continuous
 target gap is still `+1.068 ms`.
-Entry 60 adds `MORI_OUTPUT_SDMA_COPY=1`; `tools/bench_sdma_ag_copy_pipe.sh`
-keeps it opt-in after Entry 61 hang (`RUN_OUTPUT_SDMA_COPY=0` by default).
-Entry 62 adds per-case timeout to the script.
+Entry 63 removes failed `MORI_OUTPUT_SDMA_COPY=1`; `tools/bench_sdma_ag_copy_pipe.sh`
+is back to baseline/RCCL + phase timing only. Entry 62 per-case timeout remains.
 
 `MORI_DIRECT_OUTPUT=1` 激活 Plan A v2 path; 不开则走 BASELINE.
 `MORI_SDMA_AG_COPY_PIPE=1` 激活 K1 scatter + K2 R-reduce / SDMA-AG / C-copy pipeline.

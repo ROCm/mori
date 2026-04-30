@@ -2416,6 +2416,76 @@ it completes, compare `SDMA_OUTPUT_COPY derived` against `BASELINE derived`.
 
 ---
 
+## Entry 63 — `MORI_OUTPUT_SDMA_COPY=1` FAILED: local SDMA output copy is ~4.55 ms and reverted
+- **Date**: 2026-05-01
+- **Failing commit under test**: `4ca2d7f8` / implementation from `60b333fa`
+- **Command**: `RUN_OUTPUT_SDMA_COPY=1 bash tools/bench_sdma_ag_copy_pipe.sh`
+- **Log**: `/tmp/perf_sdma_ag_copy_pipe_1777564405.log`
+- **All correctness checks reached summary for the timed run**, but performance
+  was catastrophically worse.
+
+### Result
+
+Continuous:
+
+| label | SDMA copy wall | SDMA no-copy | RCCL | copy_gap | no_copy_gap | copy_penalty |
+|---|---:|---:|---:|---:|---:|---:|
+| BASELINE | 6.862 | 6.249 | 5.806 | +1.056 | +0.443 | +0.613 |
+| **SDMA_OUTPUT_COPY** | **23.694** | 6.247 | 5.808 | **+17.886** | +0.439 | **+17.447** |
+
+Finite phase/copy:
+
+| label | SDMA copy wall | SDMA no-copy | RCCL | copy_gap | no_copy_gap | copy_penalty |
+|---|---:|---:|---:|---:|---:|---:|
+| BASELINE_PHASE_STAGE0 | 7.756 | 7.304 | 7.424 | +0.332 | -0.120 | +0.452 |
+| **SDMA_OUTPUT_COPY_PHASE_STAGE0** | **24.640** | 7.279 | 7.421 | **+17.219** | -0.142 | **+17.361** |
+
+Copy timing:
+```text
+BASELINE gpu-side copy kernel wall:          0.363 ms
+SDMA_OUTPUT_COPY gpu-side copy kernel wall:  4.550 ms
+```
+
+### Mechanism
+
+The regression is the local SDMA output copy itself:
+```text
+SDMA_OUTPUT_COPY finite copy penalty = 17.361 ms over 4 stages
+17.361 / 4 = 4.34 ms per AR
+measured gpu-side copy kernel wall = 4.550 ms
+```
+
+This matches the observed continuous `seq_ar_ms` jump:
+```text
+BASELINE seq_ar_ms         = 5.235
+SDMA_OUTPUT_COPY seq_ar_ms = 22.676
+delta                     = 17.441 ms
+```
+
+Therefore this is not a host overhead issue and not a cadence-only artifact.
+The internal local SDMA output-copy kernel is much slower than the baseline
+`hipMemcpyAsync` CU copy (`0.36 ms`), so the direction is closed.
+
+### Action
+
+Revert/remove the `MORI_OUTPUT_SDMA_COPY` implementation and script entry.
+Do not retry local SDMA output copy unless a new micro-bench shows a different
+local SDMA mechanism with bandwidth comparable to the baseline copy wall.
+
+### Remaining target
+
+After revert, current baseline remains:
+```text
+continuous SDMA copy - RCCL    ~= +1.05 ms
+continuous SDMA no-copy - RCCL ~= +0.44 ms
+finite GPU copy wall          ~= 0.35-0.38 ms
+```
+
+The next direction must change AR/GEMM cadence and/or write user output without
+a slow post-copy path.
+
+---
+
 ## Entry 49 — Implement integer accumulator fast path for uint32/int32 pipeline reduce
 - **Date**: 2026-04-30
 - **Commit**: _this commit_
