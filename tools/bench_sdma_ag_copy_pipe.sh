@@ -121,13 +121,24 @@ echo "## COPY VS RCCL SUMMARY (auto-extracted from $LOG)"
 echo "################################################################"
 
 awk -v size="$SIZE_MB" '
+  /Table 1: Overlap Wall Time/ { table = "wall_ms"; next }
+  /Table 2: GEMM Slowdown/ { table = "slowdown"; next }
+  /Table 3: Sequential AllReduce Time/ { table = "seq_ar_ms"; next }
+  /Table 4: Sequential GEMM Time/ { table = "seq_gemm_ms"; next }
   /^========== [A-Z0-9_]+ ==========$/ {
     label = $0
     gsub(/=/, "", label)
     gsub(/^ +| +$/, "", label)
   }
   $1 == size && $2 == "MB" && $3 == "|" {
-    printf "%-16s %s\n", label, $0
+    printf "%-16s %-12s %s\n", label, table, $0
+    if (table == "wall_ms") {
+      copy = $4 + 0.0
+      nocopy = $6 + 0.0
+      rccl = $8 + 0.0
+      printf "%-16s %-12s copy_gap=%.3f ms no_copy_gap=%.3f ms copy_penalty=%.3f ms\n",
+             label, "derived", copy - rccl, nocopy - rccl, copy - nocopy
+    }
   }
 ' "$LOG"
 

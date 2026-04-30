@@ -304,6 +304,23 @@ COPY-vs-RCCL target. It produced no valid perf data and is skipped by default in
 runtime path also requires `MORI_ALLOW_FAILED_COPY_PIPE=1`; `MORI_SDMA_AG_COPY_PIPE=1`
 alone is ignored to avoid accidental hangs.
 
+### Guarded baseline rerun (Entry 57)
+
+`tools/bench_sdma_ag_copy_pipe.sh` on `44cfad81` skipped copy-pipe and measured
+the guarded default baseline:
+
+| mode | wall | seq_ar | slowdown | vs RCCL |
+|---|---:|---:|---:|---:|
+| **SDMA copy** | **7.272** | 5.246 | 1.676 | **+1.465 ms** |
+| SDMA no-copy | 6.246 | 4.814 | 1.505 | +0.439 ms |
+| RCCL | 5.807 | 5.132 | 1.393 | — |
+
+Decomposition for this run:
+- output materialization: copy - no-copy = **+1.026 ms**
+- no-copy overlap quality: no-copy - RCCL = **+0.439 ms**
+
+This re-confirms COPY vs RCCL is still far from target after closing copy-pipe.
+
 ### Integer reduce fast path (Entry 50)
 
 `uint32/int32` pipeline reduce now accumulates in packed integer registers
@@ -427,9 +444,10 @@ SDMA two-shot 算法比 RCCL 多一步 **256MB transit → user_output copy** (�
 
 ## 代码当前状态
 
-HEAD after latest pull includes the Entry 56 guard: copy-pipe is skipped by
-default and `MORI_SDMA_AG_COPY_PIPE=1` alone is ignored unless
-`MORI_ALLOW_FAILED_COPY_PIPE=1` is also set.
+HEAD after latest pull includes the Entry 57 script summary fix: copy-pipe is
+skipped by default, `MORI_SDMA_AG_COPY_PIPE=1` alone is ignored unless
+`MORI_ALLOW_FAILED_COPY_PIPE=1` is also set, and the bench script prints
+wall/slowdown/seq_ar/seq_gemm rows with derived gaps.
 
 `MORI_DIRECT_OUTPUT=1` 激活 Plan A v2 path; 不开则走 BASELINE.
 `MORI_SDMA_AG_COPY_PIPE=1` 激活 K1 scatter + K2 R-reduce / SDMA-AG / C-copy pipeline.

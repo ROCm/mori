@@ -2049,6 +2049,55 @@ direction must change the algorithm/cadence, not keep patching copy-pipe K1.
 
 ---
 
+## Entry 57 — Baseline after copy-pipe guard: COPY still trails RCCL by +1.465 ms
+- **Date**: 2026-04-30
+- **Commit under test**: `44cfad81`
+- **Command**: `bash tools/bench_sdma_ag_copy_pipe.sh`
+- **Log**: `/tmp/perf_sdma_ag_copy_pipe_1777548326.log`
+- **Config**: `MORI_CONTINUOUS_PREP=0`, `MORI_PIPELINE_CU=224`,
+  `MORI_PIPELINE_CHUNKS=4`, `--num-stages 4`, `--elems 67108864`,
+  `--continuous-iters 100`
+- **Note**: `MORI_SDMA_AG_COPY_PIPE` was skipped by default as intended:
+  ```text
+  MORI_SDMA_AG_COPY_PIPE is skipped by default: Entry 56 shows K1 chunk=3 signal stuck at 3/4.
+  ```
+
+### Result
+
+| mode | wall | slowdown | seq_ar | seq_gemm | gap vs RCCL |
+|---|---:|---:|---:|---:|---:|
+| **SDMA copy** | **7.272** | 1.676 | 5.246 | 4.339 | **+1.465** |
+| SDMA no-copy | 6.246 | 1.505 | 4.814 | 4.150 | +0.439 |
+| RCCL | 5.807 | 1.393 | 5.132 | 4.168 | — |
+
+### Decomposition
+
+```text
+SDMA copy - RCCL    = 7.272 - 5.807 = +1.465 ms
+SDMA no-copy - RCCL = 6.246 - 5.807 = +0.439 ms
+SDMA copy - no-copy = 7.272 - 6.246 = +1.026 ms
+```
+
+This run confirms the Entry 54 conclusion under the guarded script: the final
+COPY-vs-RCCL target is still missed by more than 1 ms. Both terms remain active:
+the output materialization penalty is large in this run, and no-copy overlap
+quality still trails RCCL.
+
+### Script fix
+
+The auto-summary previously printed all four benchmark tables with the same
+`BASELINE` label. `tools/bench_sdma_ag_copy_pipe.sh` now tags extracted rows as
+`wall_ms`, `slowdown`, `seq_ar_ms`, or `seq_gemm_ms`, and prints derived
+`copy_gap`, `no_copy_gap`, and `copy_penalty` from the wall table.
+
+### Next direction
+
+Do not return to `MORI_SDMA_AG_COPY_PIPE`. The remaining gap requires an
+algorithm/cadence change that addresses both output materialization and no-copy
+overlap quality.
+
+---
+
 ## Entry 49 — Implement integer accumulator fast path for uint32/int32 pipeline reduce
 - **Date**: 2026-04-30
 - **Commit**: _this commit_
