@@ -2008,6 +2008,47 @@ If the pipe path still hangs, the next evidence to capture is the new
 
 ---
 
+## Entry 56 — `MORI_SDMA_AG_COPY_PIPE=1` still hangs after wait-each-chunk K1; close direction
+- **Date**: 2026-04-30
+- **Commit under test**: `3953bc6a` / fix code `19192f89`
+- **Command**: `bash tools/bench_sdma_ag_copy_pipe.sh`
+- **Variant**: `MORI_SDMA_AG_COPY_PIPE=1`, `MORI_PIPELINE_CU=224`,
+  `MORI_PIPELINE_CHUNKS=4`, first sweep point `MORI_SDMA_AG_COPY_NR=112`
+
+### Observed failure
+
+The wait-each-chunk K1 narrowed the failure but did not fix correctness:
+```text
+PE 6: MORI_SDMA_AG_COPY_PIPE=1 — K1 scatter + K2 R-reduce / SDMA-AG / C-copy pipeline; chunks=4, blocks=225, nR=112, nC=112
+[STUCK] PE 6 K1-chunked thr 0 chunk=3 scatter-wait sender=0 expected=4 got=3
+```
+
+The failure is still before K2. Because the new K1 submits and waits one chunk
+at a time, the remaining mechanism is not burst-submitting all chunks. The
+specific missing event is the fourth scatter signal from sender 0 to PE 6.
+
+### Conclusion
+
+`MORI_SDMA_AG_COPY_PIPE=1` is closed as a correctness-failing direction for the
+COPY-vs-RCCL target. It produced no valid performance data and should not be run
+by default.
+
+`tools/bench_sdma_ag_copy_pipe.sh` now leaves this path off unless
+`RUN_PIPE=1` is explicitly set. The implementation is also guarded: setting
+`MORI_SDMA_AG_COPY_PIPE=1` alone is ignored after this entry; targeted debugging
+must also set `MORI_ALLOW_FAILED_COPY_PIPE=1`. This avoids wasting remote runs
+on a known hang while preserving the failing path for targeted debugging if
+needed.
+
+### Next direction
+
+Return to the Entry 54 decomposition: the live gap is still SDMA copy
+`7.032 ms` vs RCCL `5.793 ms` = `+1.239 ms`, split into output materialization
+`+0.616 ms` and no-copy overlap-quality `+0.623 ms`. The next implementable
+direction must change the algorithm/cadence, not keep patching copy-pipe K1.
+
+---
+
 ## Entry 49 — Implement integer accumulator fast path for uint32/int32 pipeline reduce
 - **Date**: 2026-04-30
 - **Commit**: _this commit_

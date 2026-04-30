@@ -1050,10 +1050,28 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             const char* e = std::getenv("MORI_FULLMESH_CHAN");
             return e != nullptr && std::atoi(e) == 1;
         }() && copy_output_to_user_ && multi_chunk && scatter_mode == 0;
-        const bool use_sdma_ag_copy_pipe = []() -> bool {
+        const bool request_sdma_ag_copy_pipe = []() -> bool {
             const char* e = std::getenv("MORI_SDMA_AG_COPY_PIPE");
             return e != nullptr && std::atoi(e) == 1;
-        }() && copy_output_to_user_ && multi_chunk && scatter_mode == 0;
+        }();
+        const bool allow_failed_copy_pipe = []() -> bool {
+            const char* e = std::getenv("MORI_ALLOW_FAILED_COPY_PIPE");
+            return e != nullptr && std::atoi(e) == 1;
+        }();
+        if (request_sdma_ag_copy_pipe && !allow_failed_copy_pipe) {
+            static thread_local bool s_pipe_disabled_announced = false;
+            if (!s_pipe_disabled_announced) {
+                printf("PE %d: MORI_SDMA_AG_COPY_PIPE=1 ignored: Entry 56 "
+                       "closed this path after K1 scatter hung at chunk=3 "
+                       "expected=4 got=3. Set MORI_ALLOW_FAILED_COPY_PIPE=1 "
+                       "only for targeted debugging.\n",
+                       myPe_);
+                s_pipe_disabled_announced = true;
+            }
+        }
+        const bool use_sdma_ag_copy_pipe = request_sdma_ag_copy_pipe
+            && allow_failed_copy_pipe && copy_output_to_user_ && multi_chunk
+            && scatter_mode == 0;
         bool skip_external_copy = use_plan_a || use_fullmesh_chan || use_sdma_ag_copy_pipe;
 
         if (use_sdma_ag_copy_pipe) {

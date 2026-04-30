@@ -4,11 +4,13 @@
 #
 # Env overrides:
 #   REPO=/home/fizhang/test/mori SIZE_MB=256 NUM_STAGES=4 CONTINUOUS_ITERS=100 \
-#   PIPELINE_CU=224 PIPELINE_CHUNKS=4 PIPE_NRS="112 144 176 200" \
+#   PIPELINE_CU=224 PIPELINE_CHUNKS=4 RUN_PIPE=0 PIPE_NRS="112 144 176 200" \
 #   SKIP_PULL=0 SKIP_BUILD=0 bash tools/bench_sdma_ag_copy_pipe.sh
 #
-# Runs: preflight -> optional git pull -> optional build -> baseline COPY/RCCL
-# -> MORI_SDMA_AG_COPY_PIPE nR sweep -> auto-extracted COPY vs RCCL table.
+# Runs: preflight -> optional git pull -> optional build -> baseline COPY/RCCL.
+# RUN_PIPE=1 also runs the deprecated MORI_SDMA_AG_COPY_PIPE nR sweep with
+# MORI_ALLOW_FAILED_COPY_PIPE=1. That path is off by default after Entry 56
+# showed it still hangs in K1 scatter chunk 3.
 # Output: /tmp/perf_sdma_ag_copy_pipe_<timestamp>.log
 
 set -euo pipefail
@@ -22,6 +24,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${CONTINUOUS_ITERS:=100}"
 : "${PIPELINE_CU:=224}"
 : "${PIPELINE_CHUNKS:=4}"
+: "${RUN_PIPE:=0}"
 : "${PIPE_NRS:=112 144 176 200}"
 : "${SKIP_PULL:=0}"
 : "${SKIP_BUILD:=0}"
@@ -52,7 +55,7 @@ rocm-smi --showproductname 2>&1 | head -8 || true
 git rev-parse --abbrev-ref HEAD
 git log -1 --oneline
 git status --short || true
-echo "SIZE_MB=$SIZE_MB NUM_STAGES=$NUM_STAGES ELEMS=$ELEMS CONTINUOUS_ITERS=$CONTINUOUS_ITERS PIPELINE_CU=$PIPELINE_CU PIPELINE_CHUNKS=$PIPELINE_CHUNKS PIPE_NRS=$PIPE_NRS"
+echo "SIZE_MB=$SIZE_MB NUM_STAGES=$NUM_STAGES ELEMS=$ELEMS CONTINUOUS_ITERS=$CONTINUOUS_ITERS PIPELINE_CU=$PIPELINE_CU PIPELINE_CHUNKS=$PIPELINE_CHUNKS RUN_PIPE=$RUN_PIPE PIPE_NRS=$PIPE_NRS"
 
 if [ "$SKIP_PULL" != "1" ]; then
   echo
@@ -94,14 +97,22 @@ run_case() {
     MORI_PIPELINE_CU="$PIPELINE_CU" \
     MORI_PIPELINE_CHUNKS="$PIPELINE_CHUNKS"
 
-  for nr in $PIPE_NRS; do
-    run_case "PIPE_NR_${nr}" \
-      MORI_CONTINUOUS_PREP=0 \
-      MORI_SDMA_AG_COPY_PIPE=1 \
-      MORI_SDMA_AG_COPY_NR="$nr" \
-      MORI_PIPELINE_CU="$PIPELINE_CU" \
-      MORI_PIPELINE_CHUNKS="$PIPELINE_CHUNKS"
-  done
+  if [ "$RUN_PIPE" = "1" ]; then
+    for nr in $PIPE_NRS; do
+      run_case "PIPE_NR_${nr}" \
+        MORI_CONTINUOUS_PREP=0 \
+        MORI_SDMA_AG_COPY_PIPE=1 \
+        MORI_ALLOW_FAILED_COPY_PIPE=1 \
+        MORI_SDMA_AG_COPY_NR="$nr" \
+        MORI_PIPELINE_CU="$PIPELINE_CU" \
+        MORI_PIPELINE_CHUNKS="$PIPELINE_CHUNKS"
+    done
+  else
+    echo
+    echo "========== PIPE_DISABLED =========="
+    echo "MORI_SDMA_AG_COPY_PIPE is skipped by default: Entry 56 shows K1 chunk=3 signal stuck at 3/4."
+    echo "Set RUN_PIPE=1 only for targeted debugging."
+  fi
 } | tee "$LOG"
 
 echo
