@@ -188,9 +188,7 @@ class PoolClient {
   std::unordered_map<std::string, std::unique_ptr<PeerConnection>> peers_;
 
   PeerConnection& GetOrConnectPeer(const std::string& node_id, const std::string& peer_address,
-                                   const std::vector<uint8_t>& engine_desc_bytes,
-                                   const std::vector<uint8_t>& dram_memory_desc_bytes,
-                                   uint32_t buffer_index = 0);
+                                   const std::vector<uint8_t>& engine_desc_bytes);
 
   // Hydrate `peer.dram_memories[bd.buffer_index]` for every entry in
   // `descs`.  Idempotent: already-cached entries are left alone since
