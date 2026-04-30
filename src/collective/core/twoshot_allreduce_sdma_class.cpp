@@ -181,23 +181,32 @@ AllreduceSdma<T>::AllreduceSdma(int myPe, int npes, size_t /*input_buffer_size*/
   {
     HSAuint64* gpuSig = nullptr;
     uint32_t   gpuNumQ = 0;
-    hipMemcpy(&gpuSig, &(output_transit_buffer_obj_.gpu->signalPtrs),
-              sizeof(HSAuint64*), hipMemcpyDeviceToHost);
-    hipMemcpy(&gpuNumQ, &(output_transit_buffer_obj_.gpu->sdmaNumQueue),
-              sizeof(uint32_t), hipMemcpyDeviceToHost);
+    hipError_t sigCopy = hipMemcpy(&gpuSig, &(output_transit_buffer_obj_.gpu->signalPtrs),
+                                   sizeof(HSAuint64*), hipMemcpyDeviceToHost);
+    hipError_t numQCopy = hipMemcpy(&gpuNumQ, &(output_transit_buffer_obj_.gpu->sdmaNumQueue),
+                                    sizeof(uint32_t), hipMemcpyDeviceToHost);
+    if (sigCopy != hipSuccess || numQCopy != hipSuccess) {
+      throw std::runtime_error("Failed to read output transit SDMA metadata");
+    }
     if (gpuSig && gpuNumQ > 0) {
       sdma_num_queue_ = gpuNumQ;
       size_t sigSize = static_cast<size_t>(npes_) * gpuNumQ * sizeof(HSAuint64);
-      hipMemset(gpuSig, 0, sigSize);
+      hipError_t sigZero = hipMemset(gpuSig, 0, sigSize);
+      if (sigZero != hipSuccess) {
+        throw std::runtime_error("Failed to zero output transit SDMA signals");
+      }
     }
-  hipError_t agBaseAlloc =
-      hipMalloc(&pipeline_ag_gen_by_q_d_,
-                kMaxTrackedSdmaQueues * sizeof(uint64_t));
-  if (agBaseAlloc != hipSuccess) {
+    hipError_t agBaseAlloc =
+        hipMalloc(&pipeline_ag_gen_by_q_d_,
+                  kMaxTrackedSdmaQueues * sizeof(uint64_t));
+    if (agBaseAlloc != hipSuccess) {
       throw std::runtime_error("Failed to allocate pipeline_ag_gen_by_q_d_");
-  }
-  hipMemset(pipeline_ag_gen_by_q_d_, 0,
-            kMaxTrackedSdmaQueues * sizeof(uint64_t));
+    }
+    hipError_t agBaseZero = hipMemset(pipeline_ag_gen_by_q_d_, 0,
+                                      kMaxTrackedSdmaQueues * sizeof(uint64_t));
+    if (agBaseZero != hipSuccess) {
+      throw std::runtime_error("Failed to zero pipeline_ag_gen_by_q_d_");
+    }
   }
 
   printf("AllreduceSdma(SDMA) initialized: PE %d of %d, max_blocks=%d\n", myPe_, npes_,
@@ -216,25 +225,25 @@ AllreduceSdma<T>::~AllreduceSdma() {
   }
   // Drain all GPU work (including in-flight SDMA transfers) before
   // ShmemDeleter frees the symmetric memory regions they reference.
-  hipDeviceSynchronize();
+  (void)hipDeviceSynchronize();
   if (phase_ts_d_) {
-    hipFree(phase_ts_d_);
+    (void)hipFree(phase_ts_d_);
     phase_ts_d_ = nullptr;
   }
   if (pipeline_ag_gen_by_q_d_) {
-    hipFree(pipeline_ag_gen_by_q_d_);
+    (void)hipFree(pipeline_ag_gen_by_q_d_);
     pipeline_ag_gen_by_q_d_ = nullptr;
   }
   if (copy_start_event_) {
-    hipEventDestroy(copy_start_event_);
+    (void)hipEventDestroy(copy_start_event_);
     copy_start_event_ = nullptr;
   }
   if (copy_end_event_) {
-    hipEventDestroy(copy_end_event_);
+    (void)hipEventDestroy(copy_end_event_);
     copy_end_event_ = nullptr;
   }
   if (post_ag_flag_d_) {
-    hipFree(post_ag_flag_d_);
+    (void)hipFree(post_ag_flag_d_);
     post_ag_flag_d_ = nullptr;
   }
   if (flags_) {
@@ -349,7 +358,14 @@ void AllreduceSdma<T>::enable_post_ag_wait(bool on) {
                 myPe_, hipGetErrorString(e));
         return;
       }
-      hipMemset(post_ag_flag_d_, 0, sizeof(uint32_t));
+      hipError_t z = hipMemset(post_ag_flag_d_, 0, sizeof(uint32_t));
+      if (z != hipSuccess) {
+        fprintf(stderr, "PE %d: hipMemset(post_ag_flag) failed: %s\n",
+                myPe_, hipGetErrorString(z));
+        (void)hipFree(post_ag_flag_d_);
+        post_ag_flag_d_ = nullptr;
+        return;
+      }
     }
     post_ag_wait_enabled_ = true;
     printf("PE %d: post_ag_wait ENABLED (Stage 1 prototype, flag at %p)\n",
@@ -381,7 +397,7 @@ void AllreduceSdma<T>::enable_copy_timing(bool on) {
       if (e != hipSuccess) {
         fprintf(stderr, "PE %d: copy_end_event create failed: %s\n",
                 myPe_, hipGetErrorString(e));
-        hipEventDestroy(copy_start_event_);
+        (void)hipEventDestroy(copy_start_event_);
         copy_start_event_ = nullptr;
         return;
       }
@@ -424,12 +440,24 @@ void AllreduceSdma<T>::enable_phase_timing(bool on) {
         phase_ts_d_ = nullptr;
         return;
       }
-      hipMemset(phase_ts_d_, 0, kPhaseTsCapacity * sizeof(uint64_t));
+      hipError_t z = hipMemset(phase_ts_d_, 0, kPhaseTsCapacity * sizeof(uint64_t));
+      if (z != hipSuccess) {
+        fprintf(stderr, "PE %d: enable_phase_timing: initial hipMemset failed: %s\n",
+                myPe_, hipGetErrorString(z));
+        (void)hipFree(phase_ts_d_);
+        phase_ts_d_ = nullptr;
+        return;
+      }
     }
     // Clear on every enable, not only first allocation. Phase timing may be
     // toggled for one selected launch inside a continuous stream; stale slots
     // from a prior launch make the host-side breakdown meaningless.
-    hipMemset(phase_ts_d_, 0, kPhaseTsCapacity * sizeof(uint64_t));
+    hipError_t z = hipMemset(phase_ts_d_, 0, kPhaseTsCapacity * sizeof(uint64_t));
+    if (z != hipSuccess) {
+      fprintf(stderr, "PE %d: enable_phase_timing: hipMemset failed: %s\n",
+              myPe_, hipGetErrorString(z));
+      return;
+    }
     phase_timing_enabled_ = true;
     printf("PE %d: phase timing ENABLED (device buf %p, cap=%zu slots)\n",
            myPe_, phase_ts_d_, kPhaseTsCapacity);
@@ -491,24 +519,44 @@ bool AllreduceSdma<T>::ensure_buffer_size(void*& buffer,
   {
     HSAuint64* gpuSig = nullptr;
     uint32_t   gpuNumQ = 0;
-    hipMemcpy(&gpuSig, &(buffer_obj.gpu->signalPtrs),
-              sizeof(HSAuint64*), hipMemcpyDeviceToHost);
-    hipMemcpy(&gpuNumQ, &(buffer_obj.gpu->sdmaNumQueue),
-              sizeof(uint32_t), hipMemcpyDeviceToHost);
+    hipError_t sigCopy = hipMemcpy(&gpuSig, &(buffer_obj.gpu->signalPtrs),
+                                   sizeof(HSAuint64*), hipMemcpyDeviceToHost);
+    hipError_t numQCopy = hipMemcpy(&gpuNumQ, &(buffer_obj.gpu->sdmaNumQueue),
+                                    sizeof(uint32_t), hipMemcpyDeviceToHost);
+    if (sigCopy != hipSuccess || numQCopy != hipSuccess) {
+      fprintf(stderr, "PE %d: Failed to read %s SDMA metadata\n", myPe_, buffer_name);
+      return false;
+    }
     if (gpuSig && gpuNumQ > 0) {
       sdma_num_queue_ = gpuNumQ;
       size_t sigSize = static_cast<size_t>(npes_) * gpuNumQ * sizeof(HSAuint64);
-      hipMemset(gpuSig, 0, sigSize);
+      hipError_t sigZero = hipMemset(gpuSig, 0, sigSize);
+      if (sigZero != hipSuccess) {
+        fprintf(stderr, "PE %d: Failed to zero %s SDMA signals: %s\n",
+                myPe_, buffer_name, hipGetErrorString(sigZero));
+        return false;
+      }
       pipeline_scatter_gen_ = 0;
       pipeline_ag_gen_ = 0;
       pipeline_ag_gen_by_q_.fill(0);
       if (pipeline_ag_gen_by_q_d_) {
-        hipMemset(pipeline_ag_gen_by_q_d_, 0,
-                  kMaxTrackedSdmaQueues * sizeof(uint64_t));
+        hipError_t genZero = hipMemset(pipeline_ag_gen_by_q_d_, 0,
+                                       kMaxTrackedSdmaQueues * sizeof(uint64_t));
+        if (genZero != hipSuccess) {
+          fprintf(stderr, "PE %d: Failed to zero multi-q AG generations: %s\n",
+                  myPe_, hipGetErrorString(genZero));
+          return false;
+        }
       }
       pipeline_reduce_gen_ = 0;
       if (flags_) {
-        hipMemset(flags_.get(), 0, static_cast<size_t>(npes_) * sizeof(uint64_t));
+        hipError_t flagZero =
+            hipMemset(flags_.get(), 0, static_cast<size_t>(npes_) * sizeof(uint64_t));
+        if (flagZero != hipSuccess) {
+          fprintf(stderr, "PE %d: Failed to zero flags after %s realloc: %s\n",
+                  myPe_, buffer_name, hipGetErrorString(flagZero));
+          return false;
+        }
       }
     }
   }
@@ -563,7 +611,12 @@ void AllreduceSdma<T>::copy_output_to_user(T* output, size_t total_count, hipStr
 
   const bool do_timing = copy_timing_enabled_ && stream != nullptr;
   if (do_timing) {
-    hipEventRecord(copy_start_event_, stream);
+    hipError_t rec = hipEventRecord(copy_start_event_, stream);
+    if (rec != hipSuccess) {
+      fprintf(stderr, "PE %d: copy_start_event record failed: %s\n",
+              myPe_, hipGetErrorString(rec));
+      throw std::runtime_error("Copy timing start event failed");
+    }
   }
   auto host_t0 = do_timing ? std::chrono::steady_clock::now()
                            : std::chrono::steady_clock::time_point{};
@@ -589,7 +642,12 @@ void AllreduceSdma<T>::copy_output_to_user(T* output, size_t total_count, hipStr
     auto host_t1 = std::chrono::steady_clock::now();
     copy_timing_host_us_ =
         std::chrono::duration<double, std::micro>(host_t1 - host_t0).count();
-    hipEventRecord(copy_end_event_, stream);
+    hipError_t rec = hipEventRecord(copy_end_event_, stream);
+    if (rec != hipSuccess) {
+      fprintf(stderr, "PE %d: copy_end_event record failed: %s\n",
+              myPe_, hipGetErrorString(rec));
+      throw std::runtime_error("Copy timing end event failed");
+    }
     copy_timing_recorded_ = true;
   }
 
@@ -942,9 +1000,16 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             return e && std::atoi(e) == 1;
         }();
         if (multi_q_ag && pipeline_ag_gen_by_q_d_ != nullptr) {
-            hipMemcpyAsync(pipeline_ag_gen_by_q_d_, pipeline_ag_gen_by_q_.data(),
-                           kMaxTrackedSdmaQueues * sizeof(uint64_t),
-                           hipMemcpyHostToDevice, stream);
+            hipError_t gen_copy = hipMemcpyAsync(
+                pipeline_ag_gen_by_q_d_, pipeline_ag_gen_by_q_.data(),
+                kMaxTrackedSdmaQueues * sizeof(uint64_t),
+                hipMemcpyHostToDevice, stream);
+            if (gen_copy != hipSuccess) {
+                fprintf(stderr,
+                        "PE %d: pipelined multi-q AG generation copy failed: %s\n",
+                        myPe_, hipGetErrorString(gen_copy));
+                return false;
+            }
         }
 
         // Phase timing buffer (nullptr unless instrumentation enabled).
@@ -958,8 +1023,15 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         // block 0 stores 1 after AG wait done.
         uint32_t* post_ag_flag_ptr = nullptr;
         if (post_ag_wait_enabled_ && post_ag_flag_d_ != nullptr) {
-          hipMemsetAsync(post_ag_flag_d_, 0, sizeof(uint32_t), stream);
-          post_ag_flag_ptr = post_ag_flag_d_;
+            hipError_t post_ag_reset =
+                hipMemsetAsync(post_ag_flag_d_, 0, sizeof(uint32_t), stream);
+            if (post_ag_reset != hipSuccess) {
+                fprintf(stderr,
+                        "PE %d: post-AG wait flag reset failed: %s\n",
+                        myPe_, hipGetErrorString(post_ag_reset));
+                return false;
+            }
+            post_ag_flag_ptr = post_ag_flag_d_;
         }
 
         // Plan A (2-kernel, XGMI-pull AG, strict per user spec — see
