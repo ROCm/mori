@@ -9,7 +9,7 @@ alwaysApply: true
 
 关联文件:
 - `.cursor/rules/relentless-perf.mdc` — 方法论规则 (R0-R15)
-- `docs/perf_history.md` — 所有历史 Entry (1-44) 含数据
+- `docs/perf_history.md` — 所有历史 Entry (1-53) 含数据
 - Latest mechanism finding: Entry 31 continuous timeline shows SDMA no-copy
   GEMM remains ~1.0ms/stage, but SDMA AR service time becomes ~2.0ms/stage
   under GEMM, so stream_ar backlog grows. RCCL stabilizes both GEMM/AR around
@@ -410,6 +410,7 @@ HEAD = **`3571144c`** (`MORI_FULLMESH_CHAN=1` new fullmesh channelized MVP; docs
 | `3a6bc7bc` | Entry 44: existing single-kernel fullmesh pipe no breakthrough (no-copy 6.406) |
 | `50ab72aa` | Entry 44 ledger for `MORI_FULLMESH_PIPE=1` result |
 | `3571144c` | Add new `MORI_FULLMESH_CHAN=1` fullmesh channelized MVP writing user_output in-kernel |
+| `e288699d` | Entry 52: fullmesh channelized MVP correctness passes but no perf breakthrough |
 
 ### 测量工具
 

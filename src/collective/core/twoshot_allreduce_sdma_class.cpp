@@ -978,9 +978,52 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             const char* e = std::getenv("MORI_FULLMESH_CHAN");
             return e && std::atoi(e) == 1;
         }() && copy_output_to_user_ && multi_chunk && scatter_mode == 0;
-        bool skip_external_copy = use_plan_a || use_fullmesh_chan;
+        const bool use_sdma_ag_copy_pipe = []() {
+            const char* e = std::getenv("MORI_SDMA_AG_COPY_PIPE");
+            return e && std::atoi(e) == 1;
+        }() && copy_output_to_user_ && multi_chunk && scatter_mode == 0;
+        bool skip_external_copy = use_plan_a || use_fullmesh_chan || use_sdma_ag_copy_pipe;
 
-        if (use_fullmesh_chan) {
+        if (use_sdma_ag_copy_pipe) {
+            if (!agDstObj.IsValid()) {
+                if (!ensure_buffer_size(input_transit_buffer_, input_transit_buffer_ptr_,
+                                        input_transit_buffer_size_, input_transit_buffer_obj_,
+                                        transit_used, "SDMA AG copy-pipe buffer")) {
+                    return false;
+                }
+                agDstObj = input_transit_buffer_obj_;
+            }
+            hipError_t br_pipe = stream
+                ? hipMemsetAsync(barrierPtr_, 0, sizeof(CrossPeBarrier), stream)
+                : hipMemset(barrierPtr_, 0, sizeof(CrossPeBarrier));
+            if (br_pipe != hipSuccess) {
+                fprintf(stderr, "PE %d: SDMA AG copy-pipe barrier reset failed: %s\n",
+                        myPe_, hipGetErrorString(br_pipe));
+                return false;
+            }
+            int pipe_comp = blocks - 1;
+            int pipe_nR = pipe_comp / 2;
+            if (const char* e = std::getenv("MORI_SDMA_AG_COPY_NR")) {
+                int v = std::atoi(e);
+                if (v > 0) pipe_nR = v;
+            }
+            if (pipe_nR < 1) pipe_nR = 1;
+            if (pipe_nR > pipe_comp - 1) pipe_nR = pipe_comp - 1;
+            static thread_local bool s_pipe_announced = false;
+            if (!s_pipe_announced) {
+                printf("PE %d: MORI_SDMA_AG_COPY_PIPE=1 — K1 scatter + K2 "
+                       "R-reduce / SDMA-AG / C-copy pipeline; chunks=%d, "
+                       "blocks=%d, nR=%d, nC=%d\n",
+                       myPe_, numChunks_host, blocks, pipe_nR, pipe_comp - pipe_nR);
+                s_pipe_announced = true;
+            }
+            ScatterSdmaOnlyKernel<T><<<1, 512, 0, stream>>>(
+                myPe_, npes_, input, output_transit_buffer_obj_,
+                total_count, chunk_elems, scatter_base);
+            PipelinedSdmaAgCopyKernel<T><<<blocks, threads, 0, stream>>>(
+                myPe_, npes_, input, output_transit_buffer_obj_, agDstObj,
+                barrierPtr_, output, total_count, chunk_elems, ag_base, pipe_nR);
+        } else if (use_fullmesh_chan) {
             if (!agDstObj.IsValid()) {
                 if (!ensure_buffer_size(input_transit_buffer_, input_transit_buffer_ptr_,
                                         input_transit_buffer_size_, input_transit_buffer_obj_,

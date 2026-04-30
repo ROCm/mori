@@ -2281,6 +2281,57 @@ reduce/communication cadence more substantially.
 
 ---
 
+## Entry 53 — Implement `MORI_SDMA_AG_COPY_PIPE=1`: K1 scatter + K2 R-reduce / SDMA-AG / C-copy pipeline
+- **Date**: 2026-04-30
+- **Commit**: _this commit_
+- **Goal**: continue fullmesh channelized work for the **COPY VS RCCL** target.
+  The Entry 51 MVP wrote user_output inside the kernel but serialized
+  scatter/reduce/AG/copy per chunk and was too slow. Entry 53 splits K2 into
+  R-group and C-group so local output copy can overlap later reduce.
+
+### Implementation
+
+Add env:
+```bash
+MORI_SDMA_AG_COPY_PIPE=1
+```
+
+Active only for `copy_output_to_user=True`, `scatter_mode=0`, multi-chunk calls.
+Default path unchanged.
+
+Flow:
+1. K1 `ScatterSdmaOnlyKernel`: fullmesh SDMA scatter all chunks to transit
+2. K2 `PipelinedSdmaAgCopyKernel`:
+   - R-group: reduce chunk `c` into `transit[myPe]`
+   - block0: wait reduce(c), SDMA AG chunk `c` into separate internal AG buffer,
+     wait incoming AG(c), then signal `ag_sync=c+1`
+   - C-group: wait `ag_sync(c)`, copy AG buffer chunk `c` to `user_output`
+
+This preserves drop-in copy semantics without remote writes to user_output, and
+tries to overlap local output copy with later reduce work.
+
+Knob:
+```bash
+MORI_SDMA_AG_COPY_NR=<R-group blocks>
+```
+default `nR = (blocks-1)/2`.
+
+### Test command
+
+```bash
+cd /home/fizhang/test/mori && git pull origin sdma-test
+BUILD_EXAMPLES=ON BUILD_TESTS=ON pip3 install .
+MORI_CONTINUOUS_PREP=0 MORI_SDMA_AG_COPY_PIPE=1 MORI_PIPELINE_CU=224 \
+MORI_PIPELINE_CHUNKS=4 python3 tests/python/ccl/test_allreduce.py \
+  --num-stages 4 --elems 67108864 --iterations 1 --warmup 1 \
+  --continuous-iters 100
+```
+
+Success target: SDMA copy wall below Entry 48 best current copy (6.817 ms) and
+eventually below RCCL (~5.8 ms).
+
+---
+
 ## Entry 45 — Implement `MORI_SEPARATE_AG_BUFFER=1` to remove per-chunk cross-PE reduce barrier safely
 - **Date**: 2026-04-30
 - **Commit**: _this commit_

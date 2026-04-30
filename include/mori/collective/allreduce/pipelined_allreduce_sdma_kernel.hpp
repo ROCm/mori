@@ -1282,5 +1282,178 @@ __global__ void FullMeshChannelizedAllReduceKernel(
   }
 }
 
+// ============================================================================
+// PipelinedSdmaAgCopyKernel — copy-mode pipeline using SDMA AG + local copy.
+//
+// Paired with ScatterSdmaOnlyKernel (K1). K2 splits compute blocks into:
+//   block0: wait R-group reduce(c), SDMA AG(c) to separate agObj, wait incoming
+//           AG(c), then signal ag_sync=c+1
+//   R-group: reduce chunk c from transit into transit[myPe]
+//   C-group: wait ag_sync(c), copy agObj[all slots, c] -> user_output[all slots, c]
+//
+// This keeps remote writes off user_output and avoids a final monolithic
+// transit->user_output copy by pipelining local output writes with later reduce.
+// ============================================================================
+template <typename T>
+__global__ void PipelinedSdmaAgCopyKernel(
+    int myPe, int npes,
+    const T* __restrict__ input,
+    const application::SymmMemObjPtr transitObj,
+    const application::SymmMemObjPtr agObj,
+    CrossPeBarrier* __restrict__ barrier,
+    T* __restrict__ user_output,
+    size_t elementCount,
+    size_t chunkElementCount,
+    uint64_t agBase,
+    int nR_requested) {
+  if (elementCount == 0 || npes <= 0) return;
+
+  using P = typename packed_t<T>::P;
+  using A = typename packed_t<T>::A;
+  constexpr int pack_size = P::size;
+
+  const size_t elementCountPerRank =
+      ((elementCount / npes + pack_size - 1) / pack_size) * pack_size;
+  const size_t chunkPerRank =
+      ((chunkElementCount / npes + pack_size - 1) / pack_size) * pack_size;
+  const size_t bytesPerElement = sizeof(T);
+  const size_t packedPerRank = elementCountPerRank / pack_size;
+  const size_t packedChunkPerRank = chunkPerRank / pack_size;
+  if (elementCountPerRank == 0 || chunkPerRank == 0) return;
+
+  const int numChunks =
+      static_cast<int>((packedPerRank + packedChunkPerRank - 1) / packedChunkPerRank);
+  const size_t chunkBytes = chunkPerRank * bytesPerElement;
+  const size_t totalShardBytes = elementCountPerRank * bytesPerElement;
+  const int compBlocks = static_cast<int>(gridDim.x) - 1;
+  int nR = nR_requested;
+  if (nR < 1) nR = 1;
+  if (nR > compBlocks - 1) nR = compBlocks - 1;
+  const int nC = compBlocks - nR;
+
+  P* __restrict__ transit = reinterpret_cast<P*>(transitObj->localPtr);
+  P* __restrict__ agBuf = reinterpret_cast<P*>(agObj->localPtr);
+  P* __restrict__ outP = reinterpret_cast<P*>(user_output);
+  const uint32_t agNumQ = agObj->sdmaNumQueue;
+
+  __shared__ const P* s_pe_ptrs[8];
+
+  if (blockIdx.x == 0) {
+    const int thr = static_cast<int>(threadIdx.x);
+    for (int c = 0; c < numChunks; ++c) {
+      const uint32_t reduceTarget = static_cast<uint32_t>((c + 1) * nR);
+      if (thr == 0) {
+        while (__scoped_atomic_load_n(&barrier->chunks_complete,
+                                      __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) < reduceTarget)
+          __builtin_amdgcn_s_sleep(1);
+      }
+      __syncthreads();
+
+      const size_t cOffBytes = static_cast<size_t>(c) * chunkBytes;
+      size_t agBytes = chunkBytes;
+      if (cOffBytes + agBytes > totalShardBytes) agBytes = totalShardBytes - cOffBytes;
+
+      if (thr < npes && thr != myPe && agBytes > 0) {
+        const int destPe = thr;
+        anvil::SdmaQueueDeviceHandle** dh =
+            agObj->deviceHandles_d + destPe * agNumQ;
+        HSAuint64* rSig = agObj->peerSignalPtrs[destPe]
+            + static_cast<size_t>(myPe) * agNumQ + 1;
+        uint8_t* src = reinterpret_cast<uint8_t*>(transitObj->localPtr)
+            + static_cast<size_t>(myPe) * totalShardBytes + cOffBytes;
+        uint8_t* dst = reinterpret_cast<uint8_t*>(agObj->peerPtrs[destPe])
+            + static_cast<size_t>(myPe) * totalShardBytes + cOffBytes;
+        core::SdmaPutThread(src, dst, agBytes, dh, rSig, agNumQ, 1);
+      }
+      __syncthreads();
+
+      if (thr < npes && thr != myPe) {
+        const int sender = thr;
+        const uint64_t expected = agBase + static_cast<uint64_t>(c + 1);
+        HSAuint64* sig = agObj->signalPtrs + static_cast<size_t>(sender) * agNumQ + 1;
+        while (core::AtomicLoadRelaxed(sig) < expected)
+          __builtin_amdgcn_s_sleep(1);
+      }
+      __syncthreads();
+      if (thr == 0) {
+        __threadfence();
+        __hip_atomic_store(&barrier->ag_sync, static_cast<uint32_t>(c + 1),
+                           __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+      }
+    }
+    return;
+  }
+
+  const int cb_id = static_cast<int>(blockIdx.x) - 1;
+  const bool is_R = cb_id < nR;
+  if (is_R) {
+    const size_t rTid =
+        static_cast<size_t>(cb_id) * static_cast<size_t>(blockDim.x) + threadIdx.x;
+    const size_t rStride = static_cast<size_t>(nR) * static_cast<size_t>(blockDim.x);
+    for (int c = 0; c < numChunks; ++c) {
+      const size_t off = static_cast<size_t>(c) * packedChunkPerRank;
+      size_t cnt = packedChunkPerRank;
+      if (off + cnt > packedPerRank) cnt = packedPerRank - off;
+      if (threadIdx.x < static_cast<unsigned>(npes)) {
+        const int pe = static_cast<int>(threadIdx.x);
+        s_pe_ptrs[pe] = (pe == myPe)
+            ? reinterpret_cast<const P*>(input) + static_cast<size_t>(myPe) * packedPerRank + off
+            : transit + static_cast<size_t>(pe) * packedPerRank + off;
+      }
+      __syncthreads();
+      P* __restrict__ myDst = transit + static_cast<size_t>(myPe) * packedPerRank + off;
+      for (size_t k = rTid; k < cnt; k += rStride) {
+        if constexpr (std::is_same<typename P::type, uint32_t>::value ||
+                      std::is_same<typename P::type, int32_t>::value) {
+          P acc = s_pe_ptrs[0][k];
+          for (int pe = 1; pe < npes; ++pe) packed_assign_add(acc, s_pe_ptrs[pe][k]);
+          myDst[k] = acc;
+        } else {
+          A acc = upcast_v<typename P::type, pack_size>(s_pe_ptrs[0][k]);
+          for (int pe = 1; pe < npes; ++pe)
+            packed_assign_add(acc, upcast_v<typename P::type, pack_size>(s_pe_ptrs[pe][k]));
+          myDst[k] = downcast_v<typename P::type, pack_size>(acc);
+        }
+      }
+      __syncthreads();
+      if (threadIdx.x == 0) {
+#if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
+        asm volatile("buffer_wbl2" ::: "memory");
+#endif
+        __threadfence_system();
+        __hip_atomic_fetch_add(&barrier->chunks_complete, 1u,
+                               __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+      }
+      __syncthreads();
+    }
+    return;
+  }
+
+  const int c_id = cb_id - nR;
+  for (int c = 0; c < numChunks; ++c) {
+    if (threadIdx.x == 0) {
+      while (__hip_atomic_load(&barrier->ag_sync, __ATOMIC_ACQUIRE,
+                               __HIP_MEMORY_SCOPE_AGENT) < static_cast<uint32_t>(c + 1))
+        __builtin_amdgcn_s_sleep(1);
+    }
+    __syncthreads();
+
+    const size_t off = static_cast<size_t>(c) * packedChunkPerRank;
+    size_t cnt = packedChunkPerRank;
+    if (off + cnt > packedPerRank) cnt = packedPerRank - off;
+    const size_t totalCnt = static_cast<size_t>(npes) * cnt;
+    const size_t cTid =
+        static_cast<size_t>(c_id) * static_cast<size_t>(blockDim.x) + threadIdx.x;
+    const size_t cStride = static_cast<size_t>(nC) * static_cast<size_t>(blockDim.x);
+    for (size_t linear = cTid; linear < totalCnt; linear += cStride) {
+      const size_t pe = linear / cnt;
+      const size_t elem = linear - pe * cnt;
+      outP[pe * packedPerRank + off + elem] =
+          agBuf[pe * packedPerRank + off + elem];
+    }
+    __syncthreads();
+  }
+}
+
 }  // namespace collective
 }  // namespace mori
