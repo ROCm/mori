@@ -3259,6 +3259,48 @@ Valid output must show `npes=8`.
 
 ---
 
+## Entry 80 — Multi-ring XGMI lane data: reverse lanes are required; 6F6R best but not saturated
+- **Date**: 2026-05-01
+- **Commit under test**: `4eb72381`
+- **Command**: `bash tools/bench_multiring_xgmi.sh`
+- **Log**: `/tmp/perf_multiring_xgmi_1777628740.log`
+- **Validity**: valid multi-GPU run (`npes=8`)
+
+### Result
+
+```text
+MB/lane lanes  blk/lane  GB/s    avg_ms
+16      1F/0R  8          47.89  0.326
+16      3F/0R  8         142.37  0.329
+16      3F/3R  8         276.19  0.339
+16      4F/4R  8         212.33  0.589
+16      6F/6R  8         312.18  0.601
+```
+
+### Mechanism
+
+The data confirms the user's constraint:
+- 3 forward-only lanes do not fill bandwidth: `3F0R = 142.37 GB/s`
+- adding reverse lanes almost doubles bandwidth: `3F3R = 276.19 GB/s`
+- more lanes are not monotonic: `4F4R = 212.33 GB/s` is worse than `3F3R`
+- `6F6R = 312.18 GB/s` is best among tested configs, but still below the
+  bandwidth needed to make full-peer-read/direct-copy style competitive.
+
+### Script fix
+
+The run was valid, but the auto-summary did not print rows because the `lanes`
+column contains spaced formatting like `1F/0   R`. `tools/bench_multiring_xgmi.sh`
+now matches that format.
+
+### Consequence for ring kernel design
+
+Do not implement a single ring or 3 forward-only rings. Initial dedicated
+intranode ring/shard direct-output kernel should use bidirectional lanes, with
+`6F6R` as the first tested lane schedule and `3F3R` as the lower-pressure
+comparison.
+
+---
+
 ## Entry 49 — Implement integer accumulator fast path for uint32/int32 pipeline reduce
 - **Date**: 2026-04-30
 - **Commit**: _this commit_
