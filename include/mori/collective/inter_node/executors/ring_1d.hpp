@@ -79,16 +79,49 @@ Ring1DAllReduceExecutor<T>::Ring1DAllReduceExecutor(int num_ranks, int rank,
 
 template <typename T>
 int Ring1DAllReduceExecutor<T>::Execute(T* input, T* output, size_t count, hipStream_t stream) {
-  int status = ReduceScatter(input, output, count, stream);
+  if (count == 0) {
+    return 0;
+  }
+
+  const size_t bytes = count * sizeof(T);
+  void* ringInput = shmem::ShmemMalloc(bytes);
+  void* ringOutput = shmem::ShmemMalloc(bytes);
+  if (ringInput == nullptr || ringOutput == nullptr) {
+    if (ringInput != nullptr) shmem::ShmemFree(ringInput);
+    if (ringOutput != nullptr) shmem::ShmemFree(ringOutput);
+    return -1;
+  }
+
+  hipError_t copyIn = hipMemcpyAsync(ringInput, input, bytes, hipMemcpyDeviceToDevice, stream);
+  if (copyIn != hipSuccess) {
+    shmem::ShmemFree(ringInput);
+    shmem::ShmemFree(ringOutput);
+    return -1;
+  }
+
+  int status = ReduceScatter(static_cast<T*>(ringInput), static_cast<T*>(ringOutput), count, stream);
   if (status != 0) {
+    shmem::ShmemFree(ringInput);
+    shmem::ShmemFree(ringOutput);
     return status;
   }
 
-  status = AllGather(input, output, count, stream);
+  status = AllGather(static_cast<T*>(ringOutput), static_cast<T*>(ringOutput), count, stream);
   if (status != 0) {
+    shmem::ShmemFree(ringInput);
+    shmem::ShmemFree(ringOutput);
     return status;
   }
 
+  hipError_t copyOut = hipMemcpyAsync(output, ringOutput, bytes, hipMemcpyDeviceToDevice, stream);
+  if (copyOut != hipSuccess) {
+    shmem::ShmemFree(ringInput);
+    shmem::ShmemFree(ringOutput);
+    return -1;
+  }
+
+  shmem::ShmemFree(ringInput);
+  shmem::ShmemFree(ringOutput);
   return status;
 }
 

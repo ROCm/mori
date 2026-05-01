@@ -675,6 +675,13 @@ initialized`. Classification: implementation/integration bug, not ring
 mechanism failure. Fix: `Ring1DAllReduceExecutor` uses constructor
 `rank/numRanks` instead of `TopologyDetector::GetMyPe/GetNPes`.
 
+Entry 76 second ring run hit GPU nil pointer fault. Classification:
+implementation/integration bug, not ring mechanism failure. Cause: ring executor
+directly registered PyTorch user tensors as symmetric memory, same risk class as
+old D'. Fix: ring probe now uses internal `ShmemMalloc` symmetric buffers for
+input/output and copies to/from user tensors. This adds copies, so it is only a
+correctness/dataflow probe, not final performance shape.
+
 Entry 72 adds `tools/bench_chunked_direct_sweep.sh` so chunked-direct is not
 judged from one fixed point. Default sweep:
 `CU224/chunks2`, `CU224/chunks4`, `CU160/chunks4`, `CU112/chunks4`,

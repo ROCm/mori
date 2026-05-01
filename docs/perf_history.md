@@ -3074,6 +3074,54 @@ The next result can classify the actual ring executor mechanism.
 
 ---
 
+## Entry 76 — Fix ring probe nil fault by using internal symmetric buffers
+- **Date**: 2026-05-01
+- **Failing commit under test**: `a42c6870`
+- **Command**: `bash tools/bench_sdma_ag_copy_pipe.sh`
+
+### Failure
+
+After fixing the `TopologyDetector` assert, `MORI_RING_EXECUTOR=1` reached the
+kernel path but faulted:
+```text
+Memory access fault by GPU ... on address (nil). Reason: Unknown.
+```
+
+### Classification
+
+This is another **implementation/integration bug**, not ring performance data.
+`Ring1DAllReduceExecutor` directly registered PyTorch user `input/output`
+tensors with `ShmemSymmetricRegister`. That is the same class of risk already
+seen in the old D' path: user tensors / allocator offsets are not a reliable
+drop-in symmetric-memory basis for this probe.
+
+### Fix
+
+For the ring probe only, `Ring1DAllReduceExecutor::Execute` now:
+1. allocates internal symmetric `ringInput` / `ringOutput` buffers with
+   `ShmemMalloc`,
+2. copies user input into `ringInput`,
+3. runs `ReduceScatter` and `AllGather` on internal symmetric buffers,
+4. copies `ringOutput` back to user output,
+5. frees the internal buffers.
+
+This adds extra copies, so it is not the final performance shape. It is only to
+validate ring executor correctness/dataflow without crashing on user tensor
+registration.
+
+### Next validation
+
+Re-run:
+```bash
+git pull origin sdma-test
+bash tools/bench_sdma_ag_copy_pipe.sh
+```
+
+If correctness passes, classify ring executor performance separately from these
+temporary input/output copies.
+
+---
+
 ## Entry 49 — Implement integer accumulator fast path for uint32/int32 pipeline reduce
 - **Date**: 2026-04-30
 - **Commit**: _this commit_
