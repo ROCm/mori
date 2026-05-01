@@ -2934,6 +2934,64 @@ Classification:
 
 ---
 
+## Entry 73 — Chunked direct sweep: chunking helps only partially; full-peer-read mechanism remains wrong
+- **Date**: 2026-05-01
+- **Commit under test**: `f5c6efdb`
+- **Command**: `bash tools/bench_chunked_direct_sweep.sh`
+- **Log**: `/tmp/perf_chunked_direct_sweep_1777619687.log`
+- **All variants correctness PASSED**
+
+### Result
+
+| label | copy wall | no-copy | RCCL | copy_gap | no_copy_gap | copy_penalty | seq_ar copy | slowdown copy |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| BASELINE | 6.871 | 6.247 | 5.800 | +1.071 | +0.447 | +0.624 | 5.221 | 1.583 |
+| CD_CU224_CH2 | 31.024 | 6.248 | 5.818 | +25.206 | +0.430 | +24.776 | 30.948 | 7.165 |
+| CD_CU224_CH4 | 33.965 | 6.251 | 5.808 | +28.157 | +0.443 | +27.714 | 34.669 | 7.803 |
+| CD_CU160_CH4 | 28.030 | 6.293 | 5.807 | +22.223 | +0.486 | +21.737 | 27.692 | 6.456 |
+| **CD_CU112_CH4** | **23.770** | 6.427 | 5.814 | **+17.956** | +0.613 | **+17.343** | **22.246** | 5.492 |
+| CD_CU224_CH8 | 28.780 | 6.505 | 5.810 | +22.970 | +0.695 | +22.275 | 28.120 | 6.624 |
+
+### Classification
+
+This is a **scheme-incomplete / mechanism-not-yet-right** result:
+- correctness passes for all variants, so the ready/direct-output plumbing works.
+- chunking + reducing CU helps compared to full one-shot:
+  ```text
+  ONESHOT_DIRECT seq_ar = 28.496 ms
+  best chunked seq_ar   = 22.246 ms (CD_CU112_CH4)
+  improvement           = 6.250 ms
+  ```
+- but even the best chunked variant is far from baseline:
+  ```text
+  baseline seq_ar       = 5.221 ms
+  best chunked seq_ar   = 22.246 ms
+  remaining regression  = +17.025 ms
+  ```
+
+### Mechanism
+
+The problem is not a single fixed CU/chunk choice. The sweep changed both CU and
+chunk count, but all direct chunk variants remain dominated by the same work:
+each output chunk still P2P-reads that chunk from all peers. Splitting the full
+peer-read into chunks lowers service time versus `ONESHOT_DIRECT`, but total
+bytes and CU/XGMI pressure remain too high.
+
+The `CD_CU224_CH8` run also reveals a chunking implementation issue: the log
+announced `chunks=1`, because the existing host chunk heuristic forces
+single-chunk when `chunk_shard_bytes < 8MB`. That should be fixed for future
+experiments, but the existing data already rules out the current
+full-peer-read-per-chunk mechanism as a performance solution.
+
+### Next direction
+
+Do not continue tuning `MORI_CHUNKED_DIRECT` as a final candidate. Keep the
+correctness/ready/direct-output plumbing, but replace full-peer-read-per-chunk
+with true ring/shard exchange so each step moves/reduces one shard instead of
+reading every peer's shard locally.
+
+---
+
 ## Entry 49 — Implement integer accumulator fast path for uint32/int32 pipeline reduce
 - **Date**: 2026-04-30
 - **Commit**: _this commit_

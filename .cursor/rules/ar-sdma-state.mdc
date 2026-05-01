@@ -647,6 +647,19 @@ Script now runs `CHUNKED_DIRECT` and `CHUNKED_DIRECT_PHASE_STAGE0` by default.
 If chunking reduces seq_ar substantially, proceed to ring/shard exchange. If it
 does not, close full-peer-read-per-chunk and implement true ring.
 
+Entry 73 chunked-direct sweep:
+
+| label | copy wall | copy penalty | seq_ar copy |
+|---|---:|---:|---:|
+| BASELINE | 6.871 | 0.624 | 5.221 |
+| ONESHOT_DIRECT | 28.676 | 22.430 | 28.496 |
+| **best chunked (CU112/ch4)** | **23.770** | **17.343** | **22.246** |
+
+Classification: ready/direct-output plumbing works, but full-peer-read per
+chunk is still fundamentally too much. Chunking improves vs full one-shot by
+`6.25 ms` seq_ar, but remains `+17.025 ms` slower than baseline seq_ar. Next
+must be true ring/shard exchange, not more full-peer-read tuning.
+
 Entry 72 adds `tools/bench_chunked_direct_sweep.sh` so chunked-direct is not
 judged from one fixed point. Default sweep:
 `CU224/chunks2`, `CU224/chunks4`, `CU160/chunks4`, `CU112/chunks4`,
