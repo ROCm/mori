@@ -682,6 +682,12 @@ old D'. Fix: ring probe now uses internal `ShmemMalloc` symmetric buffers for
 input/output and copies to/from user tensors. This adds copies, so it is only a
 correctness/dataflow probe, not final performance shape.
 
+Entry 77: ring executor still nil-faults after internal buffers. Classification
+remains implementation/integration bug in reusing inter-node executor inside
+AllreduceSdma path, not ring mechanism data. `RUN_RING_EXECUTOR=0` by default.
+Next direction: dedicated intranode ring/shard direct-output kernel using
+AllreduceSdma-owned buffers/flags/barriers.
+
 Entry 72 adds `tools/bench_chunked_direct_sweep.sh` so chunked-direct is not
 judged from one fixed point. Default sweep:
 `CU224/chunks2`, `CU224/chunks4`, `CU160/chunks4`, `CU112/chunks4`,

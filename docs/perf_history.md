@@ -3122,6 +3122,47 @@ temporary input/output copies.
 
 ---
 
+## Entry 77 — Ring executor still nil-faults after internal buffers; close executor reuse
+- **Date**: 2026-05-01
+- **Failing commit under test**: `a92ab772`
+- **Command**: `bash tools/bench_sdma_ag_copy_pipe.sh`
+
+### Failure
+
+`MORI_RING_EXECUTOR=1` still faults:
+```text
+Memory access fault by GPU ... on address (nil). Reason: Unknown.
+```
+
+This happens after:
+1. removing `TopologyDetector` dependency (Entry 75),
+2. avoiding direct PyTorch user tensor registration by copying through internal
+   `ShmemMalloc` buffers (Entry 76).
+
+### Classification
+
+This remains an **implementation/integration bug** in reusing the existing
+inter-node `Ring1DAllReduceExecutor` inside the `AllreduceSdma` Test 6 path. It
+is not valid ring performance data.
+
+The existing executor and kernels depend on shmem device state / object layout
+assumptions that are not satisfied by this reuse path. Continuing to patch this
+executor is low-value relative to writing a dedicated intranode ring/direct
+kernel in the AllreduceSdma code path.
+
+### Action
+
+`tools/bench_sdma_ag_copy_pipe.sh` now defaults `RUN_RING_EXECUTOR=0`.
+Do not use `MORI_RING_EXECUTOR=1` as the next performance candidate.
+
+### Next direction
+
+Implement a dedicated intranode ring/shard direct-output kernel that uses the
+known-good `AllreduceSdma` symmetric buffers / flags / barriers instead of
+inter-node executor abstractions.
+
+---
+
 ## Entry 49 — Implement integer accumulator fast path for uint32/int32 pipeline reduce
 - **Date**: 2026-04-30
 - **Commit**: _this commit_
