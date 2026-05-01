@@ -1050,6 +1050,10 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             const char* e = std::getenv("MORI_FULLMESH_CHAN");
             return e != nullptr && std::atoi(e) == 1;
         }() && copy_output_to_user_ && multi_chunk && scatter_mode == 0;
+        const bool use_oneshot_direct = []() -> bool {
+            const char* e = std::getenv("MORI_ONESHOT_DIRECT");
+            return e != nullptr && std::atoi(e) == 1;
+        }() && copy_output_to_user_ && scatter_mode == 0;
         const bool request_sdma_ag_copy_pipe = []() -> bool {
             const char* e = std::getenv("MORI_SDMA_AG_COPY_PIPE");
             return e != nullptr && std::atoi(e) == 1;
@@ -1072,9 +1076,33 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         const bool use_sdma_ag_copy_pipe = request_sdma_ag_copy_pipe
             && allow_failed_copy_pipe && copy_output_to_user_ && multi_chunk
             && scatter_mode == 0;
-        bool skip_external_copy = use_plan_a || use_fullmesh_chan || use_sdma_ag_copy_pipe;
+        bool skip_external_copy =
+            use_plan_a || use_fullmesh_chan || use_sdma_ag_copy_pipe || use_oneshot_direct;
 
-        if (use_sdma_ag_copy_pipe) {
+        if (use_oneshot_direct) {
+            const size_t required_input_size = total_count * dtype_size_;
+            if (!ensure_buffer_size(input_transit_buffer_, input_transit_buffer_ptr_,
+                                    input_transit_buffer_size_, input_transit_buffer_obj_,
+                                    required_input_size, "oneshot direct input buffer")) {
+                return false;
+            }
+            copy_input_to_transit(input, total_count, stream);
+            const int od_threads = threads;
+            int od_blocks = std::min(max_blocks_,
+                                     (packedPerRank + od_threads - 1) / od_threads);
+            if (od_blocks < 1) od_blocks = 1;
+            if (cfg.cu_limit > 0 && cfg.cu_limit < od_blocks) od_blocks = cfg.cu_limit;
+            static thread_local bool s_od_announced = false;
+            if (!s_od_announced) {
+                printf("PE %d: MORI_ONESHOT_DIRECT=1 — one-kernel direct-output "
+                       "P2P-read allreduce; blocks=%d threads=%d\n",
+                       myPe_, od_blocks, od_threads);
+                s_od_announced = true;
+            }
+            OneShotDirectOutputKernel<T><<<od_blocks, od_threads, 0, stream>>>(
+                myPe_, npes_, input_transit_buffer_obj_, flagsObj_, output,
+                total_count, pipeline_reduce_gen_, phase_ts_ptr);
+        } else if (use_sdma_ag_copy_pipe) {
             if (!agDstObj.IsValid()) {
                 if (!ensure_buffer_size(input_transit_buffer_, input_transit_buffer_ptr_,
                                         input_transit_buffer_size_, input_transit_buffer_obj_,
@@ -1250,24 +1278,28 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                 post_ag_flag_ptr);
         }
 
-        pipeline_scatter_gen_ += numChunks_host;   // scatter SDMA (qId=0)
-        // Plan A does NOT use SDMA AG signal (qId=1); AG is replaced by CU
-        // XGMI pull which is synchronized via CrossPeBarrier.ag_sync (per
-        // launch). Still advance pipeline_ag_gen_ so baseline path's
-        // sub-launches (if interleaved) keep consistent counters.
-        pipeline_ag_gen_      += numChunks_host;   // AG (qId=1, unused in Plan A)
-        if (multi_q_ag && sdma_num_queue_ > 1) {
-            const uint32_t usable_q = std::min<uint32_t>(
-                sdma_num_queue_ - 1,
-                static_cast<uint32_t>(kMaxTrackedSdmaQueues - 1));
-            for (int c = 0; c < numChunks_host; c++) {
-                const uint32_t q = 1u + static_cast<uint32_t>(c) % usable_q;
-                pipeline_ag_gen_by_q_[q]++;
-            }
+        if (use_oneshot_direct) {
+            pipeline_reduce_gen_ += 1;  // ready flag in flagsObj_
         } else {
-            pipeline_ag_gen_by_q_[1] += static_cast<uint64_t>(numChunks_host);
+            pipeline_scatter_gen_ += numChunks_host;   // scatter SDMA (qId=0)
+            // Plan A does NOT use SDMA AG signal (qId=1); AG is replaced by CU
+            // XGMI pull which is synchronized via CrossPeBarrier.ag_sync (per
+            // launch). Still advance pipeline_ag_gen_ so baseline path's
+            // sub-launches (if interleaved) keep consistent counters.
+            pipeline_ag_gen_      += numChunks_host;   // AG (qId=1, unused in Plan A)
+            if (multi_q_ag && sdma_num_queue_ > 1) {
+                const uint32_t usable_q = std::min<uint32_t>(
+                    sdma_num_queue_ - 1,
+                    static_cast<uint32_t>(kMaxTrackedSdmaQueues - 1));
+                for (int c = 0; c < numChunks_host; c++) {
+                    const uint32_t q = 1u + static_cast<uint32_t>(c) % usable_q;
+                    pipeline_ag_gen_by_q_[q]++;
+                }
+            } else {
+                pipeline_ag_gen_by_q_[1] += static_cast<uint64_t>(numChunks_host);
+            }
+            pipeline_reduce_gen_  += numChunks_host;   // reduce_complete via flags
         }
-        pipeline_reduce_gen_  += numChunks_host;   // reduce_complete via flags
 
         hipError_t err = hipGetLastError();
         if (err != hipSuccess) {

@@ -2687,6 +2687,99 @@ log.
 
 ---
 
+## Entry 68 — Cadence baseline data: SDMA AR service time is slower than GEMM production
+- **Date**: 2026-05-01
+- **Log**: `/tmp/perf_cadence_baseline_1777607446.log`
+- **Command**: `EXTRACT_ONLY_LOG=/tmp/perf_cadence_baseline_1777607446.log bash tools/bench_cadence_baseline.sh`
+
+### Summary
+
+```text
+wall_ms   SDMA copy 6.872 | SDMA no-copy 6.248 | RCCL 5.793
+seq_ar_ms SDMA copy 5.223 | SDMA no-copy 4.817 | RCCL 5.133
+seq_gemm  SDMA copy 4.366 | SDMA no-copy 4.217 | RCCL 4.100
+```
+
+Timeline:
+```text
+SDMA copy    avg_ar_dur=2.226 ms max_ar_dur=2.448 ms max_ar_gemm_gap=37.142 ms
+SDMA no-copy avg_ar_dur=1.937 ms max_ar_dur=2.083 ms max_ar_gemm_gap=29.098 ms
+RCCL         avg_ar_dur=1.457 ms max_ar_dur=2.249 ms max_ar_gemm_gap=1.268 ms
+```
+
+### Mechanism
+
+GEMM produces one stage roughly every `~1.0 ms`, while SDMA no-copy consumes a
+stage in `~1.94 ms`. Therefore stream_ar backlog grows almost linearly:
+```text
+SDMA no-copy AR-GEMM gap: 0.011 ms -> 29.098 ms over 32 sampled stages
+SDMA copy    AR-GEMM gap: 0.013 ms -> 37.142 ms over 32 sampled stages
+RCCL         AR-GEMM gap: stays <= 1.268 ms over 32 sampled stages
+```
+
+This is the core continuous-mode failure: even no-copy cannot keep up with GEMM
+cadence, while RCCL nearly does.
+
+### Consequence
+
+The next implementation must reduce per-stage AR service time or change how
+work is serviced. Copy-only fixes cannot solve the target. Wrapper paths around
+existing two-shot / legacy fused kernels have already failed (Entries 63/65), so
+the next probe must be a new direct-output/cadence kernel.
+
+---
+
+## Entry 69 — Implement `MORI_ONESHOT_DIRECT=1` correctness-first direct-output cadence probe
+- **Date**: 2026-05-01
+- **Commit**: _this commit_
+- **Why**: Entry 68 shows the AR service bottleneck directly:
+  - SDMA no-copy `avg_ar_dur=1.937 ms`
+  - RCCL `avg_ar_dur=1.457 ms`
+  - SDMA backlog grows to `29.098 ms`, RCCL stays near `1.268 ms`
+
+### Implementation
+
+Add env:
+```bash
+MORI_ONESHOT_DIRECT=1
+```
+
+For `copy_output_to_user=True`, `AllreduceSdma::operator()` routes to a new
+`OneShotDirectOutputKernel`:
+1. copy local input into an internal symmetric input buffer,
+2. kernel signals local input ready using `flagsObj_`,
+3. waits for every peer ready flag,
+4. reads all peer input buffers directly,
+5. writes the full reduced result to the user `output` tensor.
+
+This is correctness-first and opt-in. It is not expected to be optimal because
+every PE reads the full buffer from every peer, but it is a genuine
+direct-output non-two-shot cadence probe, unlike the closed wrapper paths.
+
+`tools/bench_sdma_ag_copy_pipe.sh` now runs:
+- `BASELINE`
+- `ONESHOT_DIRECT`
+- `BASELINE_PHASE_STAGE0`
+- `ONESHOT_DIRECT_PHASE_STAGE0`
+
+### Success / failure classification
+
+This is not an automatic-revert-on-slow experiment. Classify by data:
+- **implementation bug**: correctness fail, hang, or ready-flag timing broken.
+- **scheme incomplete**: correctness passes but service time is dominated by
+  full-buffer peer reads; then use data to design chunked/ring direct-output.
+- **mechanism wrong**: direct full peer-read service time is worse and gives no
+  useful cadence signal; close this probe.
+
+Primary evidence to inspect:
+```text
+ONESHOT_DIRECT derived copy_gap/no_copy_gap/copy_penalty
+ONESHOT_DIRECT seq_ar_ms
+ONESHOT_DIRECT_PHASE_STAGE0 phase timing
+```
+
+---
+
 ## Entry 49 — Implement integer accumulator fast path for uint32/int32 pipeline reduce
 - **Date**: 2026-04-30
 - **Commit**: _this commit_

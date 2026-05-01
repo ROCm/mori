@@ -596,6 +596,27 @@ logs can be re-extracted without rerun:
 EXTRACT_ONLY_LOG=/tmp/perf_cadence_baseline_1777607446.log bash tools/bench_cadence_baseline.sh
 ```
 
+Entry 68 cadence data:
+- SDMA copy avg AR dur `2.226 ms`, max backlog `37.142 ms`
+- SDMA no-copy avg AR dur `1.937 ms`, max backlog `29.098 ms`
+- RCCL avg AR dur `1.457 ms`, max backlog `1.268 ms`
+
+Conclusion: GEMM produces work at ~1ms/stage, SDMA no-copy consumes at ~1.94ms,
+so backlog grows linearly. Copy-only fixes cannot solve target.
+
+### One-shot direct-output probe implemented (Entry 69)
+
+`MORI_ONESHOT_DIRECT=1` adds a correctness-first direct-output non-two-shot
+kernel for `copy_output_to_user=True`:
+1. local input -> internal symmetric input buffer
+2. ready flag barrier across PEs
+3. P2P-read all peer inputs
+4. write full reduced result to user output
+
+Script now runs `ONESHOT_DIRECT` and `ONESHOT_DIRECT_PHASE_STAGE0` by default.
+Classify result as implementation bug / scheme incomplete / mechanism wrong
+before deciding whether to guard, fix, or close.
+
 `MORI_DIRECT_OUTPUT=1` 激活 Plan A v2 path; 不开则走 BASELINE.
 `MORI_SDMA_AG_COPY_PIPE=1` 激活 K1 scatter + K2 R-reduce / SDMA-AG / C-copy pipeline.
 
