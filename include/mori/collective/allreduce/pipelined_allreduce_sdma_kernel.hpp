@@ -376,6 +376,192 @@ __global__ void MultiLaneDirectOutputKernel(
   __syncthreads();
   ar_write_phase_ts(phase_ts, 2);
 }
+
+template <typename T>
+__global__ void RingShardReduceScatterRoundKernel(
+    int myPe, int npes,
+    const application::SymmMemObjPtr accumObj,
+    const application::SymmMemObjPtr recvObj,
+    CrossPeBarrier* __restrict__ barrier,
+    size_t elementCount,
+    int round,
+    uint64_t signalBase) {
+  if (elementCount == 0 || npes <= 1) return;
+
+  using P = typename packed_t<T>::P;
+  using A = typename packed_t<T>::A;
+  constexpr int pack_size = P::size;
+  const size_t elemsPerShard =
+      (elementCount + static_cast<size_t>(npes) - 1) / static_cast<size_t>(npes);
+  const size_t packedPerShard =
+      (elemsPerShard + static_cast<size_t>(pack_size) - 1) /
+      static_cast<size_t>(pack_size);
+  const size_t packedTotal =
+      (elementCount + static_cast<size_t>(pack_size) - 1) /
+      static_cast<size_t>(pack_size);
+  const int next = (myPe + 1) % npes;
+  const int prev = (myPe - 1 + npes) % npes;
+  const int sendShard = (myPe - round + npes) % npes;
+  const int recvShard = (myPe - round - 1 + npes) % npes;
+  const size_t sendOff = static_cast<size_t>(sendShard) * packedPerShard;
+  const size_t recvOff = static_cast<size_t>(recvShard) * packedPerShard;
+  size_t recvCnt = packedPerShard;
+  if (recvOff + recvCnt > packedTotal) recvCnt = packedTotal - recvOff;
+  size_t sendCnt = packedPerShard;
+  if (sendOff + sendCnt > packedTotal) sendCnt = packedTotal - sendOff;
+  const size_t sendBytes = sendCnt * sizeof(P);
+  const uint32_t numQ = recvObj->sdmaNumQueue;
+  constexpr uint32_t qId = 0;
+
+  if (blockIdx.x == 0) {
+    if (threadIdx.x == 0 && sendBytes > 0) {
+      anvil::SdmaQueueDeviceHandle** dh =
+          recvObj->deviceHandles_d + static_cast<size_t>(next) * numQ;
+      HSAuint64* rSig = recvObj->peerSignalPtrs[next]
+          + static_cast<size_t>(myPe) * numQ;
+      uint8_t* src = reinterpret_cast<uint8_t*>(accumObj->localPtr)
+          + sendOff * sizeof(P);
+      uint8_t* dst = reinterpret_cast<uint8_t*>(recvObj->peerPtrs[next])
+          + sendOff * sizeof(P);
+      core::SdmaPutThread(src, dst, sendBytes, dh, rSig, numQ, qId);
+    }
+    if (threadIdx.x == 0) {
+      const uint64_t expected = signalBase + static_cast<uint64_t>(round + 1);
+      HSAuint64* sig = recvObj->signalPtrs + static_cast<size_t>(prev) * numQ + qId;
+      uint64_t stuck = 0;
+      while (core::AtomicLoadRelaxed(sig) < expected) {
+        __builtin_amdgcn_s_sleep(1);
+        if (++stuck >= 100000000ULL) {
+          printf("[STUCK] PE %d RING_RS round=%d prev=%d expected=%llu got=%llu\n",
+                 myPe, round, prev, (unsigned long long)expected,
+                 (unsigned long long)core::AtomicLoadRelaxed(sig));
+          stuck = 0;
+        }
+      }
+      __threadfence();
+      __hip_atomic_store(&barrier->flag, 1u, __ATOMIC_RELEASE,
+                         __HIP_MEMORY_SCOPE_AGENT);
+    }
+  }
+
+  while (__hip_atomic_load(&barrier->flag, __ATOMIC_ACQUIRE,
+                           __HIP_MEMORY_SCOPE_AGENT) < 1u) {
+    __builtin_amdgcn_s_sleep(1);
+  }
+
+  const size_t linear =
+      static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + threadIdx.x;
+  const size_t stride =
+      static_cast<size_t>(gridDim.x) * static_cast<size_t>(blockDim.x);
+  P* __restrict__ accum = reinterpret_cast<P*>(accumObj->localPtr) + recvOff;
+  const P* __restrict__ recv = reinterpret_cast<const P*>(recvObj->localPtr) + recvOff;
+
+  if constexpr (std::is_same<typename P::type, uint32_t>::value ||
+                std::is_same<typename P::type, int32_t>::value) {
+    for (size_t k = linear; k < recvCnt; k += stride) {
+      P v = accum[k];
+      packed_assign_add(v, recv[k]);
+      accum[k] = v;
+    }
+  } else {
+    for (size_t k = linear; k < recvCnt; k += stride) {
+      A v = upcast_v<typename P::type, pack_size>(accum[k]);
+      packed_assign_add(v, upcast_v<typename P::type, pack_size>(recv[k]));
+      accum[k] = downcast_v<typename P::type, pack_size>(v);
+    }
+  }
+}
+
+template <typename T>
+__global__ void RingShardAllGatherRoundKernel(
+    int myPe, int npes,
+    const application::SymmMemObjPtr accumObj,
+    const application::SymmMemObjPtr recvObj,
+    CrossPeBarrier* __restrict__ barrier,
+    T* __restrict__ user_output,
+    size_t elementCount,
+    int round,
+    uint64_t signalBase) {
+  if (elementCount == 0 || npes <= 1) return;
+
+  using P = typename packed_t<T>::P;
+  constexpr int pack_size = P::size;
+  const size_t elemsPerShard =
+      (elementCount + static_cast<size_t>(npes) - 1) / static_cast<size_t>(npes);
+  const size_t packedPerShard =
+      (elemsPerShard + static_cast<size_t>(pack_size) - 1) /
+      static_cast<size_t>(pack_size);
+  const size_t packedTotal =
+      (elementCount + static_cast<size_t>(pack_size) - 1) /
+      static_cast<size_t>(pack_size);
+  const int next = (myPe + 1) % npes;
+  const int prev = (myPe - 1 + npes) % npes;
+  const int sendShard = (myPe - round + 1 + npes) % npes;
+  const int recvShard = (myPe - round + npes) % npes;
+  const size_t sendOff = static_cast<size_t>(sendShard) * packedPerShard;
+  const size_t recvOff = static_cast<size_t>(recvShard) * packedPerShard;
+  size_t recvCnt = packedPerShard;
+  if (recvOff + recvCnt > packedTotal) recvCnt = packedTotal - recvOff;
+  size_t sendCnt = packedPerShard;
+  if (sendOff + sendCnt > packedTotal) sendCnt = packedTotal - sendOff;
+  const size_t sendBytes = sendCnt * sizeof(P);
+  const uint32_t numQ = recvObj->sdmaNumQueue;
+  constexpr uint32_t qId = 1;
+
+  if (blockIdx.x == 0) {
+    if (threadIdx.x == 0 && sendBytes > 0) {
+      anvil::SdmaQueueDeviceHandle** dh =
+          recvObj->deviceHandles_d + static_cast<size_t>(next) * numQ;
+      HSAuint64* rSig = recvObj->peerSignalPtrs[next]
+          + static_cast<size_t>(myPe) * numQ;
+      uint8_t* src = reinterpret_cast<uint8_t*>(accumObj->localPtr)
+          + sendOff * sizeof(P);
+      uint8_t* dst = reinterpret_cast<uint8_t*>(recvObj->peerPtrs[next])
+          + sendOff * sizeof(P);
+      core::SdmaPutThread(src, dst, sendBytes, dh, rSig, numQ, qId);
+    }
+    if (threadIdx.x == 0) {
+      const uint64_t expected = signalBase + static_cast<uint64_t>(round + 1);
+      HSAuint64* sig = recvObj->signalPtrs + static_cast<size_t>(prev) * numQ + qId;
+      uint64_t stuck = 0;
+      while (core::AtomicLoadRelaxed(sig) < expected) {
+        __builtin_amdgcn_s_sleep(1);
+        if (++stuck >= 100000000ULL) {
+          printf("[STUCK] PE %d RING_AG round=%d prev=%d expected=%llu got=%llu\n",
+                 myPe, round, prev, (unsigned long long)expected,
+                 (unsigned long long)core::AtomicLoadRelaxed(sig));
+          stuck = 0;
+        }
+      }
+      __threadfence();
+      __hip_atomic_store(&barrier->flag, 1u, __ATOMIC_RELEASE,
+                         __HIP_MEMORY_SCOPE_AGENT);
+    }
+  }
+
+  while (__hip_atomic_load(&barrier->flag, __ATOMIC_ACQUIRE,
+                           __HIP_MEMORY_SCOPE_AGENT) < 1u) {
+    __builtin_amdgcn_s_sleep(1);
+  }
+
+  const size_t linear =
+      static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + threadIdx.x;
+  const size_t stride =
+      static_cast<size_t>(gridDim.x) * static_cast<size_t>(blockDim.x);
+  P* __restrict__ accum = reinterpret_cast<P*>(accumObj->localPtr) + recvOff;
+  P* __restrict__ outP = reinterpret_cast<P*>(user_output) + recvOff;
+  const P* __restrict__ recv = reinterpret_cast<const P*>(recvObj->localPtr) + recvOff;
+  for (size_t k = linear; k < recvCnt; k += stride) {
+    const P v = recv[k];
+    accum[k] = v;
+    outP[k] = v;
+  }
+  P* __restrict__ outSend = reinterpret_cast<P*>(user_output) + sendOff;
+  const P* __restrict__ accumSend = reinterpret_cast<const P*>(accumObj->localPtr) + sendOff;
+  for (size_t k = linear; k < sendCnt; k += stride) {
+    outSend[k] = accumSend[k];
+  }
+}
 // ---------------------------------------------------------------------------
 
 // ============================================================================

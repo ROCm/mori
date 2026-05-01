@@ -760,6 +760,18 @@ bidirectional lanes, every output element still reads all peers, causing huge
 CU/XGMI pressure. Close `MORI_MULTILANE_DIRECT` as performance candidate; next
 implementation must be true ring/shard exchange.
 
+### Dedicated ring/shard direct prototype implemented (Entry 84)
+
+`MORI_RING_SHARD_DIRECT=1` is the first dedicated AllreduceSdma ring/shard
+direct-output prototype:
+- uses `input_transit_buffer_obj_` as accumulation buffer
+- uses `output_transit_buffer_obj_` as per-round receive staging
+- launches reduce-scatter rounds over SDMA neighbor sends
+- launches allgather rounds and writes shards directly to user output
+
+This is no longer a wrapper around old ring executor and no longer full-peer
+read. First test should classify implementation bugs vs ring mechanism.
+
 ### 当前执行纪律更新
 
 用户明确要求：催促或状态问题不能只回复状态。每轮必须实际推进 repo 变更、

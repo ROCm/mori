@@ -3447,6 +3447,49 @@ every lane reading every peer.
 
 ---
 
+## Entry 84 — Implement `MORI_RING_SHARD_DIRECT=1` dedicated ring/shard direct-output prototype
+- **Date**: 2026-05-01
+- **Commit**: _this commit_
+- **Why**: Entries 70/73/83 closed full-peer-read direct-output variants. Entry
+  77 closed reuse of `Ring1DAllReduceExecutor` due integration faults. The next
+  path must be a dedicated AllreduceSdma kernel using known-good buffers,
+  signals, and barriers.
+
+### Implementation
+
+Add env:
+```bash
+MORI_RING_SHARD_DIRECT=1
+```
+
+Host path:
+1. copy user input into `input_transit_buffer_obj_` as the ring accumulation
+   buffer,
+2. use `output_transit_buffer_obj_` as the per-round receive staging buffer,
+3. launch `RingShardReduceScatterRoundKernel` for `npes-1` rounds,
+4. launch `RingShardAllGatherRoundKernel` for `npes-1` rounds,
+5. write gathered shards directly into user `output`.
+
+This avoids:
+- existing inter-node executor abstractions,
+- direct PyTorch tensor symmetric registration,
+- full-peer-read-per-output-element direct kernels.
+
+`tools/bench_sdma_ag_copy_pipe.sh` now runs:
+- `BASELINE`
+- `RING_SHARD_DIRECT`
+- `BASELINE_PHASE_STAGE0`
+- `RING_SHARD_DIRECT_PHASE_STAGE0`
+
+### Classification expectation
+
+First run may expose implementation bugs in round indexing / signal generation /
+shard placement. If correctness fails, classify as implementation bug and fix.
+If correctness passes but is slow, use `seq_ar` and phase timing to decide
+whether the ring/shard mechanism is incomplete or wrong.
+
+---
+
 ## Entry 49 — Implement integer accumulator fast path for uint32/int32 pipeline reduce
 - **Date**: 2026-04-30
 - **Commit**: _this commit_

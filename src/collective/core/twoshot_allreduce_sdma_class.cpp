@@ -1113,6 +1113,10 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             const char* e = std::getenv("MORI_MULTILANE_DIRECT");
             return e != nullptr && std::atoi(e) == 1;
         }() && copy_output_to_user_ && scatter_mode == 0;
+        const bool use_ring_shard_direct = []() -> bool {
+            const char* e = std::getenv("MORI_RING_SHARD_DIRECT");
+            return e != nullptr && std::atoi(e) == 1;
+        }() && copy_output_to_user_ && scatter_mode == 0;
         const bool allow_failed_oneshot_direct = []() -> bool {
             const char* e = std::getenv("MORI_ALLOW_FAILED_ONESHOT_DIRECT");
             return e != nullptr && std::atoi(e) == 1;
@@ -1154,9 +1158,56 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             && scatter_mode == 0;
         bool skip_external_copy =
             use_plan_a || use_fullmesh_chan || use_sdma_ag_copy_pipe ||
-            use_oneshot_direct || use_chunked_direct || use_multilane_direct;
+            use_oneshot_direct || use_chunked_direct || use_multilane_direct ||
+            use_ring_shard_direct;
 
-        if (use_multilane_direct) {
+        if (use_ring_shard_direct) {
+            const size_t required_input_size = total_count * dtype_size_;
+            if (!ensure_buffer_size(input_transit_buffer_, input_transit_buffer_ptr_,
+                                    input_transit_buffer_size_, input_transit_buffer_obj_,
+                                    required_input_size, "ring shard accum buffer")) {
+                return false;
+            }
+            copy_input_to_transit(input, total_count, stream);
+            hipError_t zrecv = stream
+                ? hipMemsetAsync(output_transit_buffer_, 0, transit_used, stream)
+                : hipMemset(output_transit_buffer_, 0, transit_used);
+            if (zrecv != hipSuccess) {
+                fprintf(stderr, "PE %d: ring shard recv zero failed: %s\n",
+                        myPe_, hipGetErrorString(zrecv));
+                return false;
+            }
+            const int rs_threads = threads;
+            int rs_blocks = std::min(max_blocks_,
+                                     (packedPerRank + rs_threads - 1) / rs_threads);
+            if (rs_blocks < 1) rs_blocks = 1;
+            if (cfg.cu_limit > 0 && cfg.cu_limit < rs_blocks) rs_blocks = cfg.cu_limit;
+            static thread_local bool s_rs_announced = false;
+            if (!s_rs_announced) {
+                printf("PE %d: MORI_RING_SHARD_DIRECT=1 — dedicated ring/shard "
+                       "direct-output probe; blocks=%d threads=%d\n",
+                       myPe_, rs_blocks, rs_threads);
+                s_rs_announced = true;
+            }
+            for (int r = 0; r < npes_ - 1; ++r) {
+                hipError_t bz = stream
+                    ? hipMemsetAsync(&barrierPtr_->flag, 0, sizeof(uint32_t), stream)
+                    : hipMemset(&barrierPtr_->flag, 0, sizeof(uint32_t));
+                if (bz != hipSuccess) return false;
+                RingShardReduceScatterRoundKernel<T><<<rs_blocks, rs_threads, 0, stream>>>(
+                    myPe_, npes_, input_transit_buffer_obj_, output_transit_buffer_obj_,
+                    barrierPtr_, total_count, r, pipeline_scatter_gen_);
+            }
+            for (int r = 0; r < npes_ - 1; ++r) {
+                hipError_t bz = stream
+                    ? hipMemsetAsync(&barrierPtr_->flag, 0, sizeof(uint32_t), stream)
+                    : hipMemset(&barrierPtr_->flag, 0, sizeof(uint32_t));
+                if (bz != hipSuccess) return false;
+                RingShardAllGatherRoundKernel<T><<<rs_blocks, rs_threads, 0, stream>>>(
+                    myPe_, npes_, input_transit_buffer_obj_, output_transit_buffer_obj_,
+                    barrierPtr_, output, total_count, r, pipeline_ag_gen_);
+            }
+        } else if (use_multilane_direct) {
             const size_t required_input_size = total_count * dtype_size_;
             if (!ensure_buffer_size(input_transit_buffer_, input_transit_buffer_ptr_,
                                     input_transit_buffer_size_, input_transit_buffer_obj_,
@@ -1413,6 +1464,9 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
 
         if (use_oneshot_direct || use_multilane_direct) {
             pipeline_reduce_gen_ += 1;  // ready flag in flagsObj_
+        } else if (use_ring_shard_direct) {
+            pipeline_scatter_gen_ += static_cast<uint64_t>(npes_ - 1);
+            pipeline_ag_gen_ += static_cast<uint64_t>(npes_ - 1);
         } else if (use_chunked_direct) {
             pipeline_reduce_gen_ += static_cast<uint64_t>(numChunks_host);
         } else {
