@@ -647,6 +647,16 @@ Script now runs `CHUNKED_DIRECT` and `CHUNKED_DIRECT_PHASE_STAGE0` by default.
 If chunking reduces seq_ar substantially, proceed to ring/shard exchange. If it
 does not, close full-peer-read-per-chunk and implement true ring.
 
+Entry 72 adds `tools/bench_chunked_direct_sweep.sh` so chunked-direct is not
+judged from one fixed point. Default sweep:
+`CU224/chunks2`, `CU224/chunks4`, `CU160/chunks4`, `CU112/chunks4`,
+`CU224/chunks8`.
+
+Run:
+```bash
+bash tools/bench_chunked_direct_sweep.sh
+```
+
 `MORI_DIRECT_OUTPUT=1` 激活 Plan A v2 path; 不开则走 BASELINE.
 `MORI_SDMA_AG_COPY_PIPE=1` 激活 K1 scatter + K2 R-reduce / SDMA-AG / C-copy pipeline.
 

@@ -2887,6 +2887,53 @@ closed.
 
 ---
 
+## Entry 72 — Add chunked-direct sweep script to avoid single-point probing
+- **Date**: 2026-05-01
+- **Commit**: _this commit_
+- **Why**: Entry 71 added `MORI_CHUNKED_DIRECT=1`, but a single fixed
+  `CU=224,chunks=4` point is not enough to classify the scheme. Per the updated
+  R5 rule, poor performance must be separated into implementation bug, incomplete
+  scheme, or mechanism error. A small sweep can distinguish:
+  - chunk granularity too coarse/fine,
+  - CU overuse hurting GEMM,
+  - direct-output plumbing itself being too slow.
+
+### Implementation
+
+Add:
+```bash
+tools/bench_chunked_direct_sweep.sh
+```
+
+Default variants:
+```text
+BASELINE:      CU=224, chunks=4
+CD_CU224_CH2:  CU=224, chunks=2
+CD_CU224_CH4:  CU=224, chunks=4
+CD_CU160_CH4:  CU=160, chunks=4
+CD_CU112_CH4:  CU=112, chunks=4
+CD_CU224_CH8:  CU=224, chunks=8
+```
+
+The script runs build once, executes all variants with per-case timeout, and
+extracts wall/slowdown/seq_ar/seq_gemm plus derived copy/no-copy gaps.
+
+### Command
+
+```bash
+git pull origin sdma-test
+bash tools/bench_chunked_direct_sweep.sh
+```
+
+Classification:
+- if at least one chunked variant substantially improves over full one-shot
+  (`seq_ar=28.496 ms`) but remains worse than baseline, the scheme is incomplete
+  and should become ring/shard exchange;
+- if all variants remain near full one-shot cost, the full-peer-read-per-chunk
+  mechanism is wrong and should be closed.
+
+---
+
 ## Entry 49 — Implement integer accumulator fast path for uint32/int32 pipeline reduce
 - **Date**: 2026-04-30
 - **Commit**: _this commit_
