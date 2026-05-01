@@ -2640,6 +2640,53 @@ kernel implementation.
 
 ---
 
+## Entry 67 — Fix cadence summary extraction (timeline AR columns were parsed wrong)
+- **Date**: 2026-05-01
+- **Failing script commit**: `6f56e298`
+- **User log**: `/tmp/perf_cadence_baseline_1777607446.log`
+
+### Observed issue
+
+The script printed:
+```text
+timeline samples=96 avg_ar_dur=0.000 ms max_ar_dur=0.000 ms max_ar_gemm_gap=0.000 ms
+```
+
+But the raw log did include continuous timeline tables:
+```text
+iter stage | GEMM st GEMM end GEMM dur | AR st AR end AR dur | AR-GEMM gap
+```
+
+### Root cause
+
+`tools/bench_cadence_baseline.sh` parsed the wrong awk fields. For a data row,
+the correct columns are:
+```text
+$10 = AR dur
+$12 = AR-GEMM gap
+```
+
+The previous script used `$11` and `$13`, which correspond to the separator
+pipe / empty field after awk splitting, producing zeros.
+
+### Fix
+
+The script now:
+- parses `AR dur` from `$10`
+- parses `AR-GEMM gap` from `$12`
+- prints per-label timeline summaries (`SDMA copy`, `SDMA no-copy`, `RCCL`)
+- supports extract-only mode:
+
+```bash
+EXTRACT_ONLY_LOG=/tmp/perf_cadence_baseline_1777607446.log \
+  bash tools/bench_cadence_baseline.sh
+```
+
+No benchmark rerun is needed to recover the cadence summary from an existing
+log.
+
+---
+
 ## Entry 49 — Implement integer accumulator fast path for uint32/int32 pipeline reduce
 - **Date**: 2026-04-30
 - **Commit**: _this commit_

@@ -5,7 +5,8 @@
 # Env overrides:
 #   REPO=/home/fizhang/test/mori SIZE_MB=256 NUM_STAGES=4 CONTINUOUS_ITERS=100 \
 #   TIMELINE_SAMPLES=8 PIPELINE_CU=224 PIPELINE_CHUNKS=4 \
-#   CASE_TIMEOUT_SEC=900 SKIP_PULL=0 SKIP_BUILD=0 bash tools/bench_cadence_baseline.sh
+#   CASE_TIMEOUT_SEC=900 SKIP_PULL=0 SKIP_BUILD=0 \
+#   EXTRACT_ONLY_LOG=/tmp/existing.log bash tools/bench_cadence_baseline.sh
 #
 # Runs: preflight -> optional git pull -> optional build -> baseline continuous
 # timeline + phase/copy timing. Extracts AR service/backlog/copy evidence for
@@ -28,6 +29,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${CASE_TIMEOUT_SEC:=900}"
 : "${SKIP_PULL:=0}"
 : "${SKIP_BUILD:=0}"
+: "${EXTRACT_ONLY_LOG:=}"
 
 ELEMS=$(( SIZE_MB * 1024 * 1024 / 4 ))
 
@@ -64,13 +66,11 @@ if [ "$SKIP_PULL" != "1" ]; then
   git log -1 --oneline
 fi
 
-if [ "$SKIP_BUILD" != "1" ]; then
+if [ "$SKIP_BUILD" != "1" ] && [ -z "$EXTRACT_ONLY_LOG" ]; then
   echo
   echo "==================== [pip install] ===================="
   pip install -e .
 fi
-
-LOG="/tmp/perf_cadence_baseline_$(date +%s).log"
 
 run_case() {
   local label="$1"
@@ -90,14 +90,21 @@ run_case() {
     --timeline 2>&1
 }
 
-{
-  echo "========== HEAD =========="
-  git log -1 --oneline
-  run_case "BASELINE_TIMELINE_PHASE" \
-    MORI_CONTINUOUS_PREP=0 \
-    MORI_PIPELINE_CU="$PIPELINE_CU" \
-    MORI_PIPELINE_CHUNKS="$PIPELINE_CHUNKS"
-} | tee "$LOG"
+if [ -n "$EXTRACT_ONLY_LOG" ]; then
+  LOG="$EXTRACT_ONLY_LOG"
+  [ -f "$LOG" ] || { echo "ERROR: EXTRACT_ONLY_LOG=$LOG not found"; exit 1; }
+  echo "==================== [extract-only] LOG=$LOG ===================="
+else
+  LOG="/tmp/perf_cadence_baseline_$(date +%s).log"
+  {
+    echo "========== HEAD =========="
+    git log -1 --oneline
+    run_case "BASELINE_TIMELINE_PHASE" \
+      MORI_CONTINUOUS_PREP=0 \
+      MORI_PIPELINE_CU="$PIPELINE_CU" \
+      MORI_PIPELINE_CHUNKS="$PIPELINE_CHUNKS"
+  } | tee "$LOG"
+fi
 
 echo
 echo "################################################################"
@@ -112,22 +119,32 @@ awk '
   $1 == "256" && $2 == "MB" && $3 == "|" {
     printf "%-12s %s\n", table, $0
   }
-  /Continuous Timeline/ { in_timeline = 1; next }
+  /Continuous Timeline \[/ {
+    timeline_label = $0
+    sub(/^.*\[/, "", timeline_label)
+    sub(/\].*$/, "", timeline_label)
+    in_timeline = 1
+    next
+  }
   in_timeline && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 == "|" {
-    ar_dur = $11 + 0.0
-    gap = $13 + 0.0
-    if (ar_dur > max_ar) max_ar = ar_dur
-    if (gap > max_gap) max_gap = gap
-    sum_ar += ar_dur
-    n_ar += 1
+    # Fields after awk splitting:
+    # iter stage | GEMM_st GEMM_end GEMM_dur | AR_st AR_end AR_dur | AR-GEMM_gap
+    #   $1   $2  $3   $4      $5       $6   $7  $8    $9    $10  $11    $12
+    key = timeline_label
+    ar_dur = $10 + 0.0
+    gap = $12 + 0.0
+    if (!(key in n_ar) || ar_dur > max_ar[key]) max_ar[key] = ar_dur
+    if (!(key in n_ar) || gap > max_gap[key]) max_gap[key] = gap
+    sum_ar[key] += ar_dur
+    n_ar[key] += 1
   }
   /Copy-path/ { copy_section = 1 }
   copy_section && /host-side hipMemcpyAsync/ { host_us = $(NF-1) }
   copy_section && /gpu-side copy kernel wall/ { copy_ms = $(NF-1); copy_section = 0 }
   END {
-    if (n_ar > 0) {
-      printf "timeline     samples=%d avg_ar_dur=%.3f ms max_ar_dur=%.3f ms max_ar_gemm_gap=%.3f ms\n",
-             n_ar, sum_ar / n_ar, max_ar, max_gap
+    for (key in n_ar) {
+      printf "timeline     %-20s samples=%d avg_ar_dur=%.3f ms max_ar_dur=%.3f ms max_ar_gemm_gap=%.3f ms\n",
+             key, n_ar[key], sum_ar[key] / n_ar[key], max_ar[key], max_gap[key]
     }
     if (copy_ms != "") {
       printf "copy_timing  host_us=%s gpu_copy_ms=%s\n", host_us, copy_ms
@@ -137,6 +154,6 @@ awk '
 
 echo
 echo "---- raw key lines ----"
-grep -E "Table 1:|copy vs RCCL|Continuous Timeline|AR-GEMM gap|Copy-path|host-side hipMemcpy|gpu-side copy|decoded block0 phases|decoded first R/compute block phases|AR\\[[0-3]\\] duration" "$LOG" || true
+grep -E "Table 1:|copy vs RCCL|Continuous Timeline|AR-GEMM gap|^[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+\\||Copy-path|host-side hipMemcpy|gpu-side copy|decoded block0 phases|decoded first R/compute block phases|AR\\[[0-3]\\] duration" "$LOG" || true
 echo
 echo "LOG: $LOG"

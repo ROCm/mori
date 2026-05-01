@@ -589,6 +589,13 @@ Run:
 bash tools/bench_cadence_baseline.sh
 ```
 
+Entry 67 fixed the script extraction: timeline `AR dur` is awk `$10` and
+`AR-GEMM gap` is `$12` (previously parsed as `$11/$13`, yielding zeros). Existing
+logs can be re-extracted without rerun:
+```bash
+EXTRACT_ONLY_LOG=/tmp/perf_cadence_baseline_1777607446.log bash tools/bench_cadence_baseline.sh
+```
+
 `MORI_DIRECT_OUTPUT=1` 激活 Plan A v2 path; 不开则走 BASELINE.
 `MORI_SDMA_AG_COPY_PIPE=1` 激活 K1 scatter + K2 R-reduce / SDMA-AG / C-copy pipeline.
 
