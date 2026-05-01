@@ -670,6 +670,11 @@ must be true ring/shard exchange, not more full-peer-read tuning.
 fix the existing executor or write a dedicated intranode direct-output ring
 kernel.
 
+Entry 75 first ring run failed before perf with `TopologyDetector not
+initialized`. Classification: implementation/integration bug, not ring
+mechanism failure. Fix: `Ring1DAllReduceExecutor` uses constructor
+`rank/numRanks` instead of `TopologyDetector::GetMyPe/GetNPes`.
+
 Entry 72 adds `tools/bench_chunked_direct_sweep.sh` so chunked-direct is not
 judged from one fixed point. Default sweep:
 `CU224/chunks2`, `CU224/chunks4`, `CU160/chunks4`, `CU112/chunks4`,

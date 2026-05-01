@@ -3032,6 +3032,48 @@ write a dedicated intranode direct-output ring kernel.
 
 ---
 
+## Entry 75 — Fix ring executor probe topology initialization bug
+- **Date**: 2026-05-01
+- **Failing commit under test**: `4d3b1464`
+- **Command**: `bash tools/bench_sdma_ag_copy_pipe.sh`
+
+### Failure
+
+The `MORI_RING_EXECUTOR=1` probe aborted before producing performance data:
+```text
+python3: ... topology_detector.cpp:108:
+static int mori::collective::TopologyDetector::GetMyPe():
+Assertion `initialized && "TopologyDetector not initialized"' failed.
+```
+
+### Classification
+
+This is an **implementation/integration bug**, not a ring mechanism result.
+`AllreduceSdma` already has `myPe_` and `npes_`, but `Ring1DAllReduceExecutor`
+ignored the constructor arguments and called global `TopologyDetector::GetMyPe`
+/ `GetNPes`, which are not initialized in the Python Test 6 path.
+
+### Fix
+
+`Ring1DAllReduceExecutor::{ReduceScatter,AllGather}` now use the executor's
+constructor fields:
+```text
+myPe = rank
+npes = numRanks
+```
+
+### Next validation
+
+Re-run:
+```bash
+git pull origin sdma-test
+bash tools/bench_sdma_ag_copy_pipe.sh
+```
+
+The next result can classify the actual ring executor mechanism.
+
+---
+
 ## Entry 49 — Implement integer accumulator fast path for uint32/int32 pipeline reduce
 - **Date**: 2026-04-30
 - **Commit**: _this commit_

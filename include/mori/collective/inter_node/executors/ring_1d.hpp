@@ -95,8 +95,8 @@ int Ring1DAllReduceExecutor<T>::Execute(T* input, T* output, size_t count, hipSt
 template <typename T>
 int Ring1DAllReduceExecutor<T>::ReduceScatter(T* input, T* output, size_t total_count,
                                               hipStream_t stream) {
-  int myPe = TopologyDetector::GetMyPe();
-  int npes = TopologyDetector::GetNPes();
+  int myPe = rank;
+  int npes = numRanks;
   size_t dtype_size = sizeof(T);
   void* tempOutput = nullptr;
   application::SymmMemObjPtr recvMemObj;
@@ -136,8 +136,8 @@ int Ring1DAllReduceExecutor<T>::ReduceScatter(T* input, T* output, size_t total_
 template <typename T>
 int Ring1DAllReduceExecutor<T>::AllGather(T* input, T* output, size_t total_count,
                                           hipStream_t stream) {
-  int myPe = TopologyDetector::GetMyPe();
-  int npes = TopologyDetector::GetNPes();
+  int myPe = rank;
+  int npes = numRanks;
   size_t dtype_size = sizeof(T);
 
   application::SymmMemObjPtr memObj =
