@@ -378,6 +378,30 @@ application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionDmabuf(
   return handle;
 }
 
+application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionDmabufIova0(
+    void* ptr, size_t size, int dmabuf_fd, int accessFlag) {
+  int effectiveAccessFlag = MaybeAddRelaxedOrderingFlag(accessFlag);
+  ibv_mr* mr = ibv_reg_dmabuf_mr(pd, 0, size, 0, dmabuf_fd, effectiveAccessFlag);
+  if (!mr) {
+    MORI_APP_ERROR(
+        "RegisterRdmaMemoryRegionDmabufIova0 failed! addr:{}, size:{}, dmabuf_fd:{}, "
+        "accessFlag:{}, errno:{} ({})",
+        ptr, size, dmabuf_fd, effectiveAccessFlag, errno, strerror(errno));
+    std::abort();
+  }
+  MORI_APP_TRACE(
+      "RegisterRdmaMemoryRegionDmabufIova0, addr:{}, size:{}, dmabuf_fd:{}, iova:0, lkey:{}, "
+      "rkey:{}",
+      ptr, size, dmabuf_fd, mr->lkey, mr->rkey);
+  mrPool.insert({ptr, mr});
+  application::RdmaMemoryRegion handle;
+  handle.addr = 0;
+  handle.lkey = mr->lkey;
+  handle.rkey = mr->rkey;
+  handle.length = mr->length;
+  return handle;
+}
+
 void RdmaDeviceContext::DeregisterRdmaMemoryRegion(void* ptr) {
   if (mrPool.find(ptr) == mrPool.end()) return;
   ibv_mr* mr = mrPool[ptr];
