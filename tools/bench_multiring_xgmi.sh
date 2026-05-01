@@ -8,6 +8,7 @@
 #   bash tools/bench_multiring_xgmi.sh
 
 set -euo pipefail
+ulimit -c 0 || true
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${REPO:=$(cd "$SCRIPT_DIR/.." && pwd)}"
@@ -33,6 +34,12 @@ command -v python3 >/dev/null || { echo "MISSING: python3"; exit 1; }
 command -v cmake >/dev/null || { echo "MISSING: cmake"; exit 1; }
 command -v hipcc >/dev/null || { echo "MISSING: hipcc"; exit 1; }
 command -v mpirun >/dev/null || { echo "MISSING: mpirun"; exit 1; }
+FREE_KB=$(df -Pk /tmp "$REPO" | awk 'NR>1 {if (min=="" || $4<min) min=$4} END {print min+0}')
+if [ "$FREE_KB" -lt $((20 * 1024 * 1024)) ]; then
+  echo "ERROR: low disk space; min free across /tmp and repo is ${FREE_KB} KB (<20GB)"
+  df -h /tmp "$REPO"
+  exit 1
+fi
 cmake --version | head -1
 hipcc --version 2>/dev/null | head -2 || true
 mpirun --version 2>&1 | head -1

@@ -743,6 +743,10 @@ Run:
 bash tools/bench_multilane_direct_sweep.sh
 ```
 
+Entry 82: first multilane sweep failed due to environment, not kernel data:
+`LLVM ERROR ... No space left on device`. Bench scripts now disable core dumps
+with `ulimit -c 0` and fail fast if `/tmp` or repo has <20GB free.
+
 ### 当前执行纪律更新
 
 用户明确要求：催促或状态问题不能只回复状态。每轮必须实际推进 repo 变更、

@@ -3364,6 +3364,50 @@ Classification:
 
 ---
 
+## Entry 82 — Add disk/core-dump preflight after LLVM no-space failure
+- **Date**: 2026-05-01
+- **Failing command**: `bash tools/bench_multilane_direct_sweep.sh`
+
+### Failure
+
+The run failed before producing valid performance data:
+```text
+LLVM ERROR: IO failure on output stream: No space left on device
+torch.multiprocessing.spawn.ProcessExitedException: process 2 terminated with exit code 1
+```
+
+### Classification
+
+This is an environment/preflight failure, not a kernel performance result.
+Disk/core dump output filled the filesystem before the benchmark could complete.
+
+### Fix
+
+Updated benchmark scripts:
+- `tools/bench_multilane_direct_sweep.sh`
+- `tools/bench_sdma_ag_copy_pipe.sh`
+- `tools/bench_cadence_baseline.sh`
+- `tools/bench_chunked_direct_sweep.sh`
+- `tools/bench_multiring_xgmi.sh`
+
+Each script now:
+```bash
+ulimit -c 0
+df -Pk /tmp "$REPO"
+```
+and exits before running if free space across `/tmp` and repo is less than
+20GB. This prevents invalid runs and repeated GPU core dump disk exhaustion.
+
+### Next validation
+
+Free disk space, then rerun:
+```bash
+git pull origin sdma-test
+bash tools/bench_multilane_direct_sweep.sh
+```
+
+---
+
 ## Entry 49 — Implement integer accumulator fast path for uint32/int32 pipeline reduce
 - **Date**: 2026-04-30
 - **Commit**: _this commit_
