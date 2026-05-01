@@ -209,6 +209,5 @@ int main(int argc, char** argv) {
   CHECK_HIP(hipStreamDestroy(stream));
   MPI_Barrier(MPI_COMM_WORLD);
   ShmemFinalize();
-  MPI_Finalize();
   return 0;
 }

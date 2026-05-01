@@ -710,6 +710,11 @@ Run before deciding final dedicated ring lane count:
 bash tools/bench_multiring_xgmi.sh
 ```
 
+Entry 79 fixed the benchmark harness: first run had invalid `npes=1` because
+the script did not use `mpirun`; it also double-called `MPI_Finalize`. Script
+now uses `mpirun -np 8 --allow-run-as-root`, and the example relies on
+`ShmemFinalize()` for MPI finalization. Valid output must show `npes=8`.
+
 ### 当前执行纪律更新
 
 用户明确要求：催促或状态问题不能只回复状态。每轮必须实际推进 repo 变更、

@@ -3214,6 +3214,51 @@ dedicated intranode ring/shard direct-output kernel.
 
 ---
 
+## Entry 79 — Fix multi-ring bench launch: use 8 MPI ranks and avoid double finalize
+- **Date**: 2026-05-01
+- **Failing commit under test**: `b5767be0`
+- **Command**: `bash tools/bench_multiring_xgmi.sh`
+
+### Failure
+
+The first run printed:
+```text
+npes=1
+...
+*** The MPI_Finalize() function was called after MPI_FINALIZE was invoked.
+```
+
+### Classification
+
+This is a benchmark harness bug, not bandwidth data:
+- `npes=1` means the script launched `multiring_xgmi_bench` directly instead of
+  under `mpirun -np 8`, so the lane bandwidth numbers were invalid.
+- The example called `MPI_Finalize()` after `ShmemFinalize()`. In MPI bootstrap
+  mode, `ShmemFinalize()` already finalizes MPI, causing double finalize.
+
+### Fix
+
+`tools/bench_multiring_xgmi.sh` now runs:
+```bash
+mpirun -np "$NPROCS" --allow-run-as-root "$EXE"
+```
+with default `NPROCS=8`.
+
+`examples/sdma/multiring_xgmi_bench.cpp` no longer calls `MPI_Finalize()` after
+`ShmemFinalize()`.
+
+### Next validation
+
+Re-run:
+```bash
+git pull origin sdma-test
+bash tools/bench_multiring_xgmi.sh
+```
+
+Valid output must show `npes=8`.
+
+---
+
 ## Entry 49 — Implement integer accumulator fast path for uint32/int32 pipeline reduce
 - **Date**: 2026-04-30
 - **Commit**: _this commit_

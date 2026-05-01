@@ -16,6 +16,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${MORI_MR_BLOCKS_PER_LANE:=8}"
 : "${MORI_MR_WARMUP:=5}"
 : "${MORI_MR_ITERS:=20}"
+: "${NPROCS:=8}"
 : "${SKIP_PULL:=0}"
 : "${SKIP_BUILD:=0}"
 
@@ -31,8 +32,10 @@ pwd
 command -v python3 >/dev/null || { echo "MISSING: python3"; exit 1; }
 command -v cmake >/dev/null || { echo "MISSING: cmake"; exit 1; }
 command -v hipcc >/dev/null || { echo "MISSING: hipcc"; exit 1; }
+command -v mpirun >/dev/null || { echo "MISSING: mpirun"; exit 1; }
 cmake --version | head -1
 hipcc --version 2>/dev/null | head -2 || true
+mpirun --version 2>&1 | head -1
 python3 - <<'PY'
 import torch
 assert torch.cuda.is_available(), "HIP not available"
@@ -40,7 +43,7 @@ print("devices:", torch.cuda.device_count())
 PY
 git rev-parse --abbrev-ref HEAD
 git log -1 --oneline
-echo "MORI_MR_LANES=$MORI_MR_LANES MORI_MR_MB_PER_LANE=$MORI_MR_MB_PER_LANE MORI_MR_BLOCKS_PER_LANE=$MORI_MR_BLOCKS_PER_LANE"
+echo "NPROCS=$NPROCS MORI_MR_LANES=$MORI_MR_LANES MORI_MR_MB_PER_LANE=$MORI_MR_MB_PER_LANE MORI_MR_BLOCKS_PER_LANE=$MORI_MR_BLOCKS_PER_LANE"
 
 if [ "$SKIP_PULL" != "1" ]; then
   echo
@@ -72,7 +75,7 @@ env MORI_MR_LANES="$MORI_MR_LANES" \
     MORI_MR_BLOCKS_PER_LANE="$MORI_MR_BLOCKS_PER_LANE" \
     MORI_MR_WARMUP="$MORI_MR_WARMUP" \
     MORI_MR_ITERS="$MORI_MR_ITERS" \
-    "$EXE" 2>&1 | tee "$LOG"
+    mpirun -np "$NPROCS" --allow-run-as-root "$EXE" 2>&1 | tee "$LOG"
 
 echo
 echo "################################################################"
