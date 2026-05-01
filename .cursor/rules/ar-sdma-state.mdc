@@ -747,6 +747,19 @@ Entry 82: first multilane sweep failed due to environment, not kernel data:
 `LLVM ERROR ... No space left on device`. Bench scripts now disable core dumps
 with `ulimit -c 0` and fail fast if `/tmp` or repo has <20GB free.
 
+Entry 83 valid multilane sweep:
+```text
+BASELINE seq_ar 5.220 ms
+ML_3F3R_B8 seq_ar 135.773 ms
+ML_6F6R_B8 seq_ar 271.837 ms
+ML_3F3R_B16 seq_ar 196.665 ms
+ML_6F6R_B16 seq_ar 302.316 ms
+```
+Classification: mechanism failure for full-peer-read direct output. Even with
+bidirectional lanes, every output element still reads all peers, causing huge
+CU/XGMI pressure. Close `MORI_MULTILANE_DIRECT` as performance candidate; next
+implementation must be true ring/shard exchange.
+
 ### 当前执行纪律更新
 
 用户明确要求：催促或状态问题不能只回复状态。每轮必须实际推进 repo 变更、

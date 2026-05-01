@@ -3408,6 +3408,45 @@ bash tools/bench_multilane_direct_sweep.sh
 
 ---
 
+## Entry 83 — Multilane direct sweep: bidirectional lanes do not fix full-peer-read cost
+- **Date**: 2026-05-01
+- **Commit under test**: `f4fd3477`
+- **Command**: `bash tools/bench_multilane_direct_sweep.sh`
+- **Log**: `/tmp/perf_multilane_direct_sweep_1777631876.log`
+- **All variants correctness PASSED**
+
+### Result
+
+| label | copy wall | no-copy | RCCL | copy_gap | no_copy_gap | copy_penalty | seq_ar copy |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| BASELINE | 7.270 | 6.245 | 5.816 | +1.454 | +0.429 | +1.025 | 5.220 |
+| ML_3F3R_B8 | 136.304 | 6.247 | 5.822 | +130.482 | +0.425 | +130.057 | 135.773 |
+| ML_6F6R_B8 | 270.255 | 6.243 | 5.803 | +264.452 | +0.440 | +264.012 | 271.837 |
+| ML_3F3R_B16 | 196.457 | 6.248 | 5.807 | +190.650 | +0.441 | +190.209 | 196.665 |
+| ML_6F6R_B16 | 304.640 | 6.254 | 5.794 | +298.846 | +0.460 | +298.386 | 302.316 |
+
+### Classification
+
+This is a **mechanism failure for full-peer-read direct output**, not a
+correctness bug:
+- all variants pass correctness,
+- bidirectional lanes were used,
+- but copy-path `seq_ar` explodes from baseline `5.220 ms` to `135-302 ms`.
+
+The root cause is still the same as Entry 73, but worse: each output element is
+still produced by reading all peers. Multi-lane partitioning changed traversal
+and parallelism, but did not reduce the total peer-read work; it increased CU /
+XGMI pressure massively.
+
+### Conclusion
+
+Close `MORI_MULTILANE_DIRECT` as a performance candidate. It should remain only
+as a debug probe if needed. The next implementation must be true ring/shard
+exchange where each lane moves/reduces one shard through neighbors rather than
+every lane reading every peer.
+
+---
+
 ## Entry 49 — Implement integer accumulator fast path for uint32/int32 pipeline reduce
 - **Date**: 2026-04-30
 - **Commit**: _this commit_
