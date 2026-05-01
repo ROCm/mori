@@ -49,6 +49,10 @@ if(BUILD_OPS_DEVICE AND WITH_MPI)
                         hip::host ${MPI_CXX_LIBRARIES})
 endif()
 
+if(BUILD_XSHMEM)
+  add_subdirectory(xshmem)
+endif()
+
 if(BUILD_UMBP)
   add_subdirectory(umbp)
 endif()

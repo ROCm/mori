@@ -205,6 +205,9 @@ class RdmaDeviceContext {
                                                     int accessFlag = MR_DEFAULT_ACCESS_FLAG);
   virtual RdmaMemoryRegion RegisterRdmaMemoryRegionDmabuf(void* ptr, size_t size, int dmabuf_fd,
                                                           int accessFlag = MR_DEFAULT_ACCESS_FLAG);
+  virtual RdmaMemoryRegion RegisterRdmaMemoryRegionDmabufIova0(void* ptr, size_t size,
+                                                                int dmabuf_fd,
+                                                                int accessFlag = MR_DEFAULT_ACCESS_FLAG);
   virtual void DeregisterRdmaMemoryRegion(void* ptr);
 
   // TODO: query gid entry by ibv_query_gid_table
