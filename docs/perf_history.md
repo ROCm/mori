@@ -2780,6 +2780,64 @@ ONESHOT_DIRECT_PHASE_STAGE0 phase timing
 
 ---
 
+## Entry 70 — `MORI_ONESHOT_DIRECT=1` full-peer-read probe is too coarse; guard and continue with chunked/ring direct-output
+- **Date**: 2026-05-01
+- **Commit under test**: `5e9f778a`
+- **Command**: `bash tools/bench_sdma_ag_copy_pipe.sh`
+- **Log**: `/tmp/perf_sdma_ag_copy_pipe_1777614947.log`
+
+### Result
+
+Continuous:
+
+| label | SDMA copy wall | SDMA no-copy | RCCL | copy_gap | no_copy_gap | copy_penalty | seq_ar copy |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| BASELINE | 6.862 | 6.262 | 5.793 | +1.069 | +0.469 | +0.600 | 5.234 |
+| **ONESHOT_DIRECT** | **28.676** | 6.246 | 5.799 | **+22.877** | +0.447 | **+22.430** | **28.496** |
+
+Finite phase:
+
+| label | SDMA copy wall | SDMA no-copy | RCCL | copy_gap | no_copy_gap | copy_penalty | seq_ar copy |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| BASELINE_PHASE_STAGE0 | 7.754 | 7.308 | 7.659 | +0.095 | -0.351 | +0.446 | 5.219 |
+| **ONESHOT_DIRECT_PHASE_STAGE0** | **29.645** | 7.303 | 7.441 | **+22.204** | -0.138 | **+22.342** | **29.093** |
+
+### Classification
+
+This is not a correctness failure and not a host/copy timing artifact. It is a
+**scheme-incomplete / coarse-mechanism failure**:
+- correctness reaches summary,
+- no-copy baseline remains normal,
+- the direct-output copy path `seq_ar` jumps from `5.234 ms` to `28.496 ms`,
+- the implemented probe reads every peer's full 256MB input and writes full
+  output in one service unit.
+
+The probe validates that naive full-peer-read direct output is not viable, but
+does not disprove chunked/ring direct-output. The reusable pieces are:
+- ready-flag barrier,
+- direct write to user output,
+- phase plumbing for direct-output path.
+
+### Action
+
+Guard the full-peer-read probe:
+```bash
+MORI_ONESHOT_DIRECT=1
+MORI_ALLOW_FAILED_ONESHOT_DIRECT=1
+```
+
+`tools/bench_sdma_ag_copy_pipe.sh` defaults `RUN_ONESHOT_DIRECT=0` after this
+entry. Do not rerun this full one-shot form as a performance candidate.
+
+### Next direction
+
+Build a chunked/ring direct-output variant: keep direct user output semantics,
+but avoid one AR service unit reading all peer buffers. The target from Entry 68
+is to reduce average AR service from SDMA no-copy `1.937 ms` toward RCCL
+`1.457 ms` while not reintroducing a post-copy.
+
+---
+
 ## Entry 49 — Implement integer accumulator fast path for uint32/int32 pipeline reduce
 - **Date**: 2026-04-30
 - **Commit**: _this commit_

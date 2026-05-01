@@ -1050,10 +1050,27 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             const char* e = std::getenv("MORI_FULLMESH_CHAN");
             return e != nullptr && std::atoi(e) == 1;
         }() && copy_output_to_user_ && multi_chunk && scatter_mode == 0;
-        const bool use_oneshot_direct = []() -> bool {
+        const bool request_oneshot_direct = []() -> bool {
             const char* e = std::getenv("MORI_ONESHOT_DIRECT");
             return e != nullptr && std::atoi(e) == 1;
-        }() && copy_output_to_user_ && scatter_mode == 0;
+        }();
+        const bool allow_failed_oneshot_direct = []() -> bool {
+            const char* e = std::getenv("MORI_ALLOW_FAILED_ONESHOT_DIRECT");
+            return e != nullptr && std::atoi(e) == 1;
+        }();
+        if (request_oneshot_direct && !allow_failed_oneshot_direct) {
+            static thread_local bool s_oneshot_disabled_announced = false;
+            if (!s_oneshot_disabled_announced) {
+                printf("PE %d: MORI_ONESHOT_DIRECT=1 ignored: Entry 70 showed "
+                       "full-peer-read direct output has seq_ar ~28.5 ms. Set "
+                       "MORI_ALLOW_FAILED_ONESHOT_DIRECT=1 only for targeted "
+                       "debugging.\n",
+                       myPe_);
+                s_oneshot_disabled_announced = true;
+            }
+        }
+        const bool use_oneshot_direct = request_oneshot_direct
+            && allow_failed_oneshot_direct && copy_output_to_user_ && scatter_mode == 0;
         const bool request_sdma_ag_copy_pipe = []() -> bool {
             const char* e = std::getenv("MORI_SDMA_AG_COPY_PIPE");
             return e != nullptr && std::atoi(e) == 1;

@@ -617,6 +617,22 @@ Script now runs `ONESHOT_DIRECT` and `ONESHOT_DIRECT_PHASE_STAGE0` by default.
 Classify result as implementation bug / scheme incomplete / mechanism wrong
 before deciding whether to guard, fix, or close.
 
+Entry 70 result: full-peer-read one-shot is too coarse.
+
+| label | copy wall | copy penalty | seq_ar copy |
+|---|---:|---:|---:|
+| BASELINE | 6.862 | 0.600 | 5.234 |
+| **ONESHOT_DIRECT** | **28.676** | **22.430** | **28.496** |
+
+Classification: scheme-incomplete / coarse-mechanism failure, not correctness
+bug. It proves naive full-peer-read direct output is not viable, but does not
+disprove chunked/ring direct-output. Runtime path now requires
+`MORI_ALLOW_FAILED_ONESHOT_DIRECT=1`; script default is
+`RUN_ONESHOT_DIRECT=0`.
+
+Next direction: chunked/ring direct-output variant to reduce AR service time
+from SDMA no-copy `1.937 ms` toward RCCL `1.457 ms` without post-copy.
+
 `MORI_DIRECT_OUTPUT=1` 激活 Plan A v2 path; 不开则走 BASELINE.
 `MORI_SDMA_AG_COPY_PIPE=1` 激活 K1 scatter + K2 R-reduce / SDMA-AG / C-copy pipeline.
 
