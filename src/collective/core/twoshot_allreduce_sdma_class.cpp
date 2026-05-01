@@ -75,6 +75,26 @@ inline bool UseRingExecutorProbe() {
     return e && e[0] == '1' && e[1] == '\0';
 }
 
+struct DirectLaneSpec {
+    int forward;
+    int reverse;
+};
+
+inline DirectLaneSpec ParseDirectLaneSpec(const char* s) {
+    DirectLaneSpec spec{3, 3};
+    if (s == nullptr || s[0] == '\0') return spec;
+    int f = 0;
+    int r = 0;
+    if (std::sscanf(s, "%dF%dR", &f, &r) == 2 ||
+        std::sscanf(s, "%df%dr", &f, &r) == 2) {
+        if (f + r > 0) return DirectLaneSpec{f, r};
+    }
+    if (std::sscanf(s, "%d", &f) == 1 && f > 0) {
+        return DirectLaneSpec{f, 0};
+    }
+    return spec;
+}
+
 inline int CopyKernelBlocks() {
     if (const char* e = std::getenv("MORI_COPY_KERNEL_BLOCKS")) {
         int v = std::atoi(e);
@@ -1089,6 +1109,10 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             const char* e = std::getenv("MORI_CHUNKED_DIRECT");
             return e != nullptr && std::atoi(e) == 1;
         }() && copy_output_to_user_ && scatter_mode == 0;
+        const bool use_multilane_direct = []() -> bool {
+            const char* e = std::getenv("MORI_MULTILANE_DIRECT");
+            return e != nullptr && std::atoi(e) == 1;
+        }() && copy_output_to_user_ && scatter_mode == 0;
         const bool allow_failed_oneshot_direct = []() -> bool {
             const char* e = std::getenv("MORI_ALLOW_FAILED_ONESHOT_DIRECT");
             return e != nullptr && std::atoi(e) == 1;
@@ -1130,9 +1154,40 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             && scatter_mode == 0;
         bool skip_external_copy =
             use_plan_a || use_fullmesh_chan || use_sdma_ag_copy_pipe ||
-            use_oneshot_direct || use_chunked_direct;
+            use_oneshot_direct || use_chunked_direct || use_multilane_direct;
 
-        if (use_chunked_direct) {
+        if (use_multilane_direct) {
+            const size_t required_input_size = total_count * dtype_size_;
+            if (!ensure_buffer_size(input_transit_buffer_, input_transit_buffer_ptr_,
+                                    input_transit_buffer_size_, input_transit_buffer_obj_,
+                                    required_input_size, "multilane direct input buffer")) {
+                return false;
+            }
+            copy_input_to_transit(input, total_count, stream);
+            const DirectLaneSpec lanes =
+                ParseDirectLaneSpec(std::getenv("MORI_MULTILANE_DIRECT_LANES"));
+            int blocks_per_lane = 8;
+            if (const char* e = std::getenv("MORI_MULTILANE_BLOCKS_PER_LANE")) {
+                int v = std::atoi(e);
+                if (v > 0) blocks_per_lane = v;
+            }
+            const int lane_count = lanes.forward + lanes.reverse;
+            const int ml_threads = threads;
+            int ml_blocks = lane_count * blocks_per_lane;
+            if (ml_blocks < lane_count) ml_blocks = lane_count;
+            if (ml_blocks > max_blocks_) ml_blocks = max_blocks_;
+            static thread_local bool s_ml_announced = false;
+            if (!s_ml_announced) {
+                printf("PE %d: MORI_MULTILANE_DIRECT=1 — direct-output "
+                       "multi-lane P2P-read allreduce; lanes=%dF/%dR blocks=%d threads=%d\n",
+                       myPe_, lanes.forward, lanes.reverse, ml_blocks, ml_threads);
+                s_ml_announced = true;
+            }
+            MultiLaneDirectOutputKernel<T><<<ml_blocks, ml_threads, 0, stream>>>(
+                myPe_, npes_, input_transit_buffer_obj_, flagsObj_, output,
+                total_count, lanes.forward, lanes.reverse, blocks_per_lane,
+                pipeline_reduce_gen_, phase_ts_ptr);
+        } else if (use_chunked_direct) {
             const size_t required_input_size = total_count * dtype_size_;
             if (!ensure_buffer_size(input_transit_buffer_, input_transit_buffer_ptr_,
                                     input_transit_buffer_size_, input_transit_buffer_obj_,
@@ -1356,7 +1411,7 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                 post_ag_flag_ptr);
         }
 
-        if (use_oneshot_direct) {
+        if (use_oneshot_direct || use_multilane_direct) {
             pipeline_reduce_gen_ += 1;  // ready flag in flagsObj_
         } else if (use_chunked_direct) {
             pipeline_reduce_gen_ += static_cast<uint64_t>(numChunks_host);

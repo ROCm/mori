@@ -3301,6 +3301,69 @@ comparison.
 
 ---
 
+## Entry 81 — Implement `MORI_MULTILANE_DIRECT=1` using 3F3R/6F6R lane schedules
+- **Date**: 2026-05-01
+- **Commit**: _this commit_
+- **Why**: Entry 80 shows bidirectional lanes are required:
+  - `3F0R = 142.37 GB/s`
+  - `3F3R = 276.19 GB/s`
+  - `6F6R = 312.18 GB/s`
+
+Entry 70/73 proved full-buffer and chunked full-peer-read service are too
+coarse, but they also proved direct-output/ready plumbing can be correct. This
+entry tests whether partitioning the output index space across forward/reverse
+lanes improves the direct-output service time.
+
+### Implementation
+
+Add envs:
+```bash
+MORI_MULTILANE_DIRECT=1
+MORI_MULTILANE_DIRECT_LANES=3F3R   # or 6F6R
+MORI_MULTILANE_BLOCKS_PER_LANE=8
+```
+
+`MultiLaneDirectOutputKernel`:
+- partitions output packed elements across lane IDs,
+- each lane owns disjoint output indices, so no atomics are needed,
+- forward lanes traverse peers in `myPe+hop` order,
+- reverse lanes traverse peers in `myPe-hop` order,
+- each lane writes directly to user `output`.
+
+This is still a probe: each output element still reads all peers. The purpose is
+to test whether bidirectional lane scheduling reduces service time enough to
+justify the next true ring/shard implementation.
+
+### Sweep script
+
+Add:
+```bash
+tools/bench_multilane_direct_sweep.sh
+```
+
+Default variants:
+```text
+ML_3F3R_B8
+ML_6F6R_B8
+ML_3F3R_B16
+ML_6F6R_B16
+```
+
+### Command
+
+```bash
+git pull origin sdma-test
+bash tools/bench_multilane_direct_sweep.sh
+```
+
+Classification:
+- If seq_ar drops far below chunked direct (`best = 22.246 ms`) but remains above
+  baseline, proceed to true ring/shard exchange.
+- If seq_ar remains near chunked/full-peer-read cost, close multi-lane
+  full-peer-read and implement ring/shard directly.
+
+---
+
 ## Entry 49 — Implement integer accumulator fast path for uint32/int32 pipeline reduce
 - **Date**: 2026-04-30
 - **Commit**: _this commit_

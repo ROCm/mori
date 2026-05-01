@@ -728,6 +728,21 @@ Conclusion: 3 forward lanes are insufficient; reverse lanes are required.
 Dedicated ring/shard kernel should start with bidirectional lanes: compare
 `3F3R` vs `6F6R`, not single ring / 3F-only.
 
+### Multi-lane direct-output probe implemented (Entry 81)
+
+`MORI_MULTILANE_DIRECT=1` uses Entry 80 lane schedules inside AllreduceSdma:
+`3F3R` and `6F6R`.
+
+It partitions output indices across lane IDs and uses forward/reverse peer
+traversal orders. This is still full-peer-read per output element, but avoids
+one lane doing all directions; it tests whether bidirectional lane scheduling
+reduces service time enough to justify true ring/shard implementation.
+
+Run:
+```bash
+bash tools/bench_multilane_direct_sweep.sh
+```
+
 ### 当前执行纪律更新
 
 用户明确要求：催促或状态问题不能只回复状态。每轮必须实际推进 repo 变更、

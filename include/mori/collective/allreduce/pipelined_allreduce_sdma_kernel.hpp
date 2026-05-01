@@ -278,6 +278,104 @@ __global__ void ChunkedDirectOutputKernel(
   __syncthreads();
   ar_write_phase_ts(phase_ts, 2);
 }
+
+// Multi-lane direct-output probe. Lanes partition the output index space and
+// traverse peers in forward/reverse order to exercise bidirectional XGMI while
+// preserving correctness (each output element is produced by exactly one lane).
+template <typename T>
+__global__ void MultiLaneDirectOutputKernel(
+    int myPe, int npes,
+    const application::SymmMemObjPtr inputObj,
+    const application::SymmMemObjPtr flagsMemObj,
+    T* __restrict__ user_output,
+    size_t elementCount,
+    int forwardLanes,
+    int reverseLanes,
+    int blocksPerLane,
+    uint64_t readyBase,
+    uint64_t* phase_ts) {
+  ar_write_phase_ts(phase_ts, 0);
+  if (elementCount == 0 || npes <= 0) return;
+
+  using P = typename packed_t<T>::P;
+  using A = typename packed_t<T>::A;
+  constexpr int pack_size = P::size;
+  const size_t packedCount =
+      (elementCount + static_cast<size_t>(pack_size) - 1) /
+      static_cast<size_t>(pack_size);
+  const int laneCount = forwardLanes + reverseLanes;
+  if (laneCount <= 0 || blocksPerLane <= 0) return;
+
+  if (blockIdx.x == 0) {
+    const int tid = static_cast<int>(threadIdx.x);
+    if (tid == 0) {
+      HSAuint64* myFlag = reinterpret_cast<HSAuint64*>(flagsMemObj->localPtr);
+      __hip_atomic_fetch_add(myFlag, 1ULL,
+                             __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+    __syncthreads();
+    if (tid < npes && tid != myPe) {
+      const uint64_t expected = readyBase + 1ULL;
+      HSAuint64* peerFlag = reinterpret_cast<HSAuint64*>(flagsMemObj->peerPtrs[tid]);
+      uint64_t stuck = 0;
+      while (core::AtomicLoadRelaxed(peerFlag) < expected) {
+        __builtin_amdgcn_s_sleep(1);
+        if (++stuck >= 100000000ULL) {
+          printf("[STUCK] PE %d MULTILANE_DIRECT wait peer=%d expected=%llu got=%llu\n",
+                 myPe, tid, (unsigned long long)expected,
+                 (unsigned long long)core::AtomicLoadRelaxed(peerFlag));
+          stuck = 0;
+        }
+      }
+    }
+    __syncthreads();
+    ar_write_phase_ts(phase_ts, 1);
+  }
+  __syncthreads();
+
+  const int blockId = static_cast<int>(blockIdx.x);
+  const int lane = blockId / blocksPerLane;
+  const int posInLane = blockId - lane * blocksPerLane;
+  if (lane >= laneCount) return;
+  const bool reverse = lane >= forwardLanes;
+  const size_t laneLinear =
+      static_cast<size_t>(posInLane) * static_cast<size_t>(blockDim.x) + threadIdx.x;
+  const size_t laneStride =
+      static_cast<size_t>(blocksPerLane) * static_cast<size_t>(blockDim.x);
+
+  P* __restrict__ outP = reinterpret_cast<P*>(user_output);
+
+  if constexpr (std::is_same<typename P::type, uint32_t>::value ||
+                std::is_same<typename P::type, int32_t>::value) {
+    for (size_t logical = laneLinear;; logical += laneStride) {
+      const size_t idx = static_cast<size_t>(lane) + logical * static_cast<size_t>(laneCount);
+      if (idx >= packedCount) break;
+      const P* self = reinterpret_cast<const P*>(inputObj->peerPtrs[myPe]);
+      P acc = self[idx];
+      for (int hop = 1; hop < npes; ++hop) {
+        const int pe = reverse ? (myPe - hop + npes) % npes : (myPe + hop) % npes;
+        const P* pp = reinterpret_cast<const P*>(inputObj->peerPtrs[pe]);
+        packed_assign_add(acc, pp[idx]);
+      }
+      outP[idx] = acc;
+    }
+  } else {
+    for (size_t logical = laneLinear;; logical += laneStride) {
+      const size_t idx = static_cast<size_t>(lane) + logical * static_cast<size_t>(laneCount);
+      if (idx >= packedCount) break;
+      const P* self = reinterpret_cast<const P*>(inputObj->peerPtrs[myPe]);
+      A acc = upcast_v<typename P::type, pack_size>(self[idx]);
+      for (int hop = 1; hop < npes; ++hop) {
+        const int pe = reverse ? (myPe - hop + npes) % npes : (myPe + hop) % npes;
+        const P* pp = reinterpret_cast<const P*>(inputObj->peerPtrs[pe]);
+        packed_assign_add(acc, upcast_v<typename P::type, pack_size>(pp[idx]));
+      }
+      outP[idx] = downcast_v<typename P::type, pack_size>(acc);
+    }
+  }
+  __syncthreads();
+  ar_write_phase_ts(phase_ts, 2);
+}
 // ---------------------------------------------------------------------------
 
 // ============================================================================
