@@ -36,6 +36,7 @@
 #include "mori/collective/allreduce/twoshot_sdma_async_kernel.hpp"
 #include "mori/collective/allreduce/twoshot_sdma_kernel.hpp"
 #include "mori/collective/allreduce/pipelined_allreduce_sdma_kernel.hpp"
+#include "mori/collective/inter_node/executors/ring_1d.hpp"
 #include "mori/shmem/shmem.hpp"
 
 namespace mori {
@@ -66,6 +67,11 @@ inline bool UseCopyKernel() {
 
 inline bool SdmaSeparateAgBuffer() {
     const char* e = std::getenv("MORI_SEPARATE_AG_BUFFER");
+    return e && e[0] == '1' && e[1] == '\0';
+}
+
+inline bool UseRingExecutorProbe() {
+    const char* e = std::getenv("MORI_RING_EXECUTOR");
     return e && e[0] == '1' && e[1] == '\0';
 }
 
@@ -662,6 +668,31 @@ void AllreduceSdma<T>::copy_output_to_user(T* output, size_t total_count, hipStr
 // ---------------------------------------------------------------------------
 template <typename T>
 bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count, hipStream_t stream) {
+  if (UseRingExecutorProbe()) {
+    static thread_local bool s_ring_announced = false;
+    if (!s_ring_announced) {
+      printf("PE %d: MORI_RING_EXECUTOR=1 — using Ring1DAllReduceExecutor probe\n",
+             myPe_);
+      s_ring_announced = true;
+    }
+    try {
+      AllReduceConfig cfg;
+      cfg.threadsPerBlock = 512;
+      cfg.maxBlocks = max_blocks_;
+      Ring1DAllReduceExecutor<T> exec(npes_, myPe_, cfg);
+      int status = exec.Execute(input, output, total_count, stream);
+      if (status != 0) {
+        fprintf(stderr, "PE %d: Ring1DAllReduceExecutor failed with status %d\n",
+                myPe_, status);
+        return false;
+      }
+      return true;
+    } catch (const std::exception& e) {
+      fprintf(stderr, "PE %d: Ring1DAllReduceExecutor exception: %s\n",
+              myPe_, e.what());
+      return false;
+    }
+  }
   static const bool fused = []() -> bool {
       if (const char* e = std::getenv("MORI_FULLMESH_PIPE")) {
           if (std::atoi(e) == 1) return true;

@@ -660,6 +660,16 @@ chunk is still fundamentally too much. Chunking improves vs full one-shot by
 `6.25 ms` seq_ar, but remains `+17.025 ms` slower than baseline seq_ar. Next
 must be true ring/shard exchange, not more full-peer-read tuning.
 
+### Ring executor probe added (Entry 74)
+
+`MORI_RING_EXECUTOR=1` exposes existing `Ring1DAllReduceExecutor` through
+`AllreduceSdma::operator()` as a true ring/shard mechanism probe.
+
+`tools/bench_sdma_ag_copy_pipe.sh` now runs `RING_EXECUTOR` and
+`RING_EXECUTOR_PHASE_STAGE0` by default. Use its result to decide whether to
+fix the existing executor or write a dedicated intranode direct-output ring
+kernel.
+
 Entry 72 adds `tools/bench_chunked_direct_sweep.sh` so chunked-direct is not
 judged from one fixed point. Default sweep:
 `CU224/chunks2`, `CU224/chunks4`, `CU160/chunks4`, `CU112/chunks4`,

@@ -2992,6 +2992,46 @@ reading every peer's shard locally.
 
 ---
 
+## Entry 74 — Add `MORI_RING_EXECUTOR=1` existing ring/shard executor probe
+- **Date**: 2026-05-01
+- **Commit**: _this commit_
+- **Why**: Entry 73 shows full-peer-read per chunk remains too expensive.
+  The next required mechanism is true ring/shard exchange. The repo already has
+  `Ring1DAllReduceExecutor`, so expose it first as a probe before writing a new
+  ring kernel from scratch.
+
+### Implementation
+
+Add env:
+```bash
+MORI_RING_EXECUTOR=1
+```
+
+`AllreduceSdma::operator()` bypasses the SDMA two-shot path and calls:
+```text
+Ring1DAllReduceExecutor<T>::Execute(input, output, total_count, stream)
+```
+
+`tools/bench_sdma_ag_copy_pipe.sh` now runs:
+- `BASELINE`
+- `RING_EXECUTOR`
+- `BASELINE_PHASE_STAGE0`
+- `RING_EXECUTOR_PHASE_STAGE0`
+
+### Classification
+
+This probes the ring/shard mechanism already in the repo. If it fails
+correctness or is slow, classify:
+- implementation bug if the executor's dataflow is wrong,
+- scheme incomplete if registration/copies dominate but ring stages show useful
+  service behavior,
+- mechanism wrong only if ring/shard itself is shown worse with valid timing.
+
+The result will decide whether to fix existing `Ring1DAllReduceExecutor` or
+write a dedicated intranode direct-output ring kernel.
+
+---
+
 ## Entry 49 — Implement integer accumulator fast path for uint32/int32 pipeline reduce
 - **Date**: 2026-04-30
 - **Commit**: _this commit_
