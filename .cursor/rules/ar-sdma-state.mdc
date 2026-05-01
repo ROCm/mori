@@ -688,6 +688,16 @@ AllreduceSdma path, not ring mechanism data. `RUN_RING_EXECUTOR=0` by default.
 Next direction: dedicated intranode ring/shard direct-output kernel using
 AllreduceSdma-owned buffers/flags/barriers.
 
+### 当前执行纪律更新
+
+用户明确要求：催促或状态问题不能只回复状态。每轮必须实际推进 repo 变更、
+脚本、打点或 ledger，并提交/推送。见
+`.cursor/rules/no-stall-perf-loop.mdc`。
+
+当前唯一活跃实现方向：dedicated AllreduceSdma intranode ring/shard
+direct-output kernel。已关闭方向不得再默认跑：copy-pipe、local SDMA output
+copy、P2P fused、full one-shot、chunked full-peer-read、复用 Ring executor。
+
 Entry 72 adds `tools/bench_chunked_direct_sweep.sh` so chunked-direct is not
 judged from one fixed point. Default sweep:
 `CU224/chunks2`, `CU224/chunks4`, `CU160/chunks4`, `CU112/chunks4`,
