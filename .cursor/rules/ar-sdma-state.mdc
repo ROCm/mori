@@ -572,6 +572,23 @@ It worsens no-copy cadence instead of improving it. Mechanism: `seq_ar`
 increases by about `+2.2 ms` (4.807 -> 7.016), consistent with input-to-symm
 copy plus CU AG/write traffic. The env branch and script variants are removed.
 
+### Cadence baseline script added (Entry 66)
+
+After closing wrapper directions, next work is a genuinely new cadence/direct
+output algorithm. R0 requires before-data, so `tools/bench_cadence_baseline.sh`
+was added.
+
+It runs baseline with continuous timeline + phase/copy timing and extracts:
+- wall/slowdown/seq_ar/seq_gemm
+- timeline avg/max AR duration
+- max AR-GEMM backlog
+- copy timing host us / GPU copy ms
+
+Run:
+```bash
+bash tools/bench_cadence_baseline.sh
+```
+
 `MORI_DIRECT_OUTPUT=1` 激活 Plan A v2 path; 不开则走 BASELINE.
 `MORI_SDMA_AG_COPY_PIPE=1` 激活 K1 scatter + K2 R-reduce / SDMA-AG / C-copy pipeline.
 

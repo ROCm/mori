@@ -2589,6 +2589,57 @@ two-shot / legacy fused kernels.
 
 ---
 
+## Entry 66 — Add cadence baseline script before new algorithm work
+- **Date**: 2026-05-01
+- **Commit**: _this commit_
+- **Why**: Entries 63 and 65 closed the remaining wrapper directions:
+  - local SDMA output copy is too slow (`4.550 ms` copy wall)
+  - legacy P2P fused worsens no-copy gap (`+0.456 -> +0.969 ms`)
+
+The next implementation must be a genuinely new algorithm/cadence path. Per R0,
+the immediate prerequisite is a reproducible before-data script that captures:
+- continuous wall/copy/no-copy/RCCL summary,
+- timeline AR service time and AR-GEMM backlog,
+- phase/copy timing.
+
+### Implementation
+
+Add:
+```bash
+tools/bench_cadence_baseline.sh
+```
+
+It runs one baseline case with:
+```bash
+MORI_CONTINUOUS_PREP=0
+MORI_PIPELINE_CU=224
+MORI_PIPELINE_CHUNKS=4
+--continuous-iters 100
+--continuous-timeline-samples 8
+--continuous-phase-iter 5
+--continuous-phase-stage 0
+--timeline
+```
+
+It auto-extracts:
+```text
+wall_ms / slowdown / seq_ar_ms / seq_gemm_ms
+timeline avg_ar_dur / max_ar_dur / max_ar_gemm_gap
+copy_timing host_us / gpu_copy_ms
+```
+
+### Command
+
+```bash
+git pull origin sdma-test
+bash tools/bench_cadence_baseline.sh
+```
+
+The output is the required before-data for the next direct-output/new-cadence
+kernel implementation.
+
+---
+
 ## Entry 49 — Implement integer accumulator fast path for uint32/int32 pipeline reduce
 - **Date**: 2026-04-30
 - **Commit**: _this commit_
