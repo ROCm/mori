@@ -2533,6 +2533,62 @@ use it as the next algorithm basis.
 
 ---
 
+## Entry 65 — `MORI_P2P_FUSED=1` FAILED: legacy P2P fused path worsens no-copy cadence
+- **Date**: 2026-05-01
+- **Failing commit under test**: `174c3fab`
+- **Command**: `bash tools/bench_sdma_ag_copy_pipe.sh`
+- **Log**: `/tmp/perf_sdma_ag_copy_pipe_1777604658.log`
+
+### Result
+
+Continuous:
+
+| label | SDMA copy wall | SDMA no-copy | RCCL | copy_gap | no_copy_gap | copy_penalty | seq_ar copy | seq_ar no-copy |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| BASELINE | 6.859 | 6.250 | 5.794 | +1.065 | +0.456 | +0.609 | 5.246 | 4.807 |
+| **P2P_FUSED** | **7.181** | **6.769** | 5.800 | **+1.381** | **+0.969** | +0.412 | **7.549** | **7.016** |
+
+Finite phase:
+
+| label | SDMA copy wall | SDMA no-copy | RCCL | copy_gap | no_copy_gap | copy_penalty | seq_ar copy | seq_ar no-copy |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| BASELINE_PHASE_STAGE0 | 7.741 | 7.281 | 7.442 | +0.299 | -0.161 | +0.460 | 5.215 | 4.799 |
+| **P2P_FUSED_PHASE_STAGE0** | **8.235** | **7.875** | 7.545 | **+0.690** | **+0.330** | +0.360 | **7.391** | **6.989** |
+
+### Mechanism
+
+The cadence probe failed the success criterion. It was supposed to reduce the
+baseline no-copy gap (`+0.456 ms`), but instead increased it to `+0.969 ms`.
+
+The regression is not output copy. The `seq_ar` cost itself jumps:
+```text
+continuous no-copy seq_ar: 4.807 -> 7.016  (+2.209 ms)
+finite no-copy seq_ar:     4.799 -> 6.989  (+2.190 ms)
+```
+
+This matches the expected risk from Entry 64: `SCATTER_MODE=1` copies input to a
+symmetric buffer and uses CU for AG/write traffic. It changes cadence, but in
+the wrong direction.
+
+### Action
+
+Remove the `MORI_P2P_FUSED` env branch and script variants. Do not use legacy
+`SCATTER_MODE=1` as the next algorithm basis.
+
+### Remaining target
+
+After closing this path, the live baseline remains:
+```text
+continuous SDMA copy - RCCL    ~= +1.05 ms
+continuous SDMA no-copy - RCCL ~= +0.44-0.46 ms
+finite GPU copy wall          ~= 0.35-0.38 ms
+```
+
+The next direction must be a new algorithm, not a wrapper around existing
+two-shot / legacy fused kernels.
+
+---
+
 ## Entry 49 — Implement integer accumulator fast path for uint32/int32 pipeline reduce
 - **Date**: 2026-04-30
 - **Commit**: _this commit_
