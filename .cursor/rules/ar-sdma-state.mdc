@@ -633,6 +633,20 @@ disprove chunked/ring direct-output. Runtime path now requires
 Next direction: chunked/ring direct-output variant to reduce AR service time
 from SDMA no-copy `1.937 ms` toward RCCL `1.457 ms` without post-copy.
 
+### Chunked direct-output probe implemented (Entry 71)
+
+`MORI_CHUNKED_DIRECT=1` reuses the direct-output ready-flag plumbing but avoids
+one full-buffer peer read. It launches one kernel per `MORI_PIPELINE_CHUNKS`
+chunk; each kernel reads only that chunk from all peers and writes that chunk to
+user output.
+
+Purpose: distinguish whether Entry 70 failed only because service granularity
+was too coarse. Compare against `ONESHOT_DIRECT seq_ar_ms=28.496 ms`.
+
+Script now runs `CHUNKED_DIRECT` and `CHUNKED_DIRECT_PHASE_STAGE0` by default.
+If chunking reduces seq_ar substantially, proceed to ring/shard exchange. If it
+does not, close full-peer-read-per-chunk and implement true ring.
+
 `MORI_DIRECT_OUTPUT=1` 激活 Plan A v2 path; 不开则走 BASELINE.
 `MORI_SDMA_AG_COPY_PIPE=1` 激活 K1 scatter + K2 R-reduce / SDMA-AG / C-copy pipeline.
 

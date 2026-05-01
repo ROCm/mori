@@ -2838,6 +2838,55 @@ is to reduce average AR service from SDMA no-copy `1.937 ms` toward RCCL
 
 ---
 
+## Entry 71 — Implement `MORI_CHUNKED_DIRECT=1`: chunked direct-output service probe
+- **Date**: 2026-05-01
+- **Commit**: _this commit_
+- **Why**: Entry 70 classified `MORI_ONESHOT_DIRECT=1` as scheme-incomplete /
+  too coarse:
+  - full-peer-read copy path `seq_ar=28.496 ms`
+  - correctness reached summary, so the ready-flag/direct-output plumbing is
+    usable
+  - the problem is one AR service unit reading the full 256MB from every peer
+
+### Implementation
+
+Add env:
+```bash
+MORI_CHUNKED_DIRECT=1
+```
+
+Host path:
+1. copy local input into the internal symmetric input buffer,
+2. launch `ChunkedDirectOutputKernel` once per existing `MORI_PIPELINE_CHUNKS`
+   chunk,
+3. each chunk kernel waits for peer ready flags for that chunk,
+4. reads only that chunk from all peer input buffers,
+5. writes only that chunk into user `output`.
+
+This keeps direct-output semantics but reduces service granularity versus full
+one-shot. It is still a probe, not the final ring algorithm: it reads all peers
+for a chunk instead of doing reduce-scatter/ring exchange.
+
+`tools/bench_sdma_ag_copy_pipe.sh` now runs:
+- `BASELINE`
+- `CHUNKED_DIRECT`
+- `BASELINE_PHASE_STAGE0`
+- `CHUNKED_DIRECT_PHASE_STAGE0`
+
+### Classification criteria
+
+Compare against Entry 70:
+```text
+ONESHOT_DIRECT seq_ar_ms = 28.496 ms
+```
+
+If chunking significantly reduces `seq_ar_ms`, the ready/direct-output plumbing
+is useful and next step is ring/shard exchange. If it remains much slower than
+baseline, the full-peer-read-per-chunk mechanism is still wrong and should be
+closed.
+
+---
+
 ## Entry 49 — Implement integer accumulator fast path for uint32/int32 pipeline reduce
 - **Date**: 2026-04-30
 - **Commit**: _this commit_

@@ -1054,6 +1054,10 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             const char* e = std::getenv("MORI_ONESHOT_DIRECT");
             return e != nullptr && std::atoi(e) == 1;
         }();
+        const bool use_chunked_direct = []() -> bool {
+            const char* e = std::getenv("MORI_CHUNKED_DIRECT");
+            return e != nullptr && std::atoi(e) == 1;
+        }() && copy_output_to_user_ && scatter_mode == 0;
         const bool allow_failed_oneshot_direct = []() -> bool {
             const char* e = std::getenv("MORI_ALLOW_FAILED_ONESHOT_DIRECT");
             return e != nullptr && std::atoi(e) == 1;
@@ -1094,9 +1098,35 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             && allow_failed_copy_pipe && copy_output_to_user_ && multi_chunk
             && scatter_mode == 0;
         bool skip_external_copy =
-            use_plan_a || use_fullmesh_chan || use_sdma_ag_copy_pipe || use_oneshot_direct;
+            use_plan_a || use_fullmesh_chan || use_sdma_ag_copy_pipe ||
+            use_oneshot_direct || use_chunked_direct;
 
-        if (use_oneshot_direct) {
+        if (use_chunked_direct) {
+            const size_t required_input_size = total_count * dtype_size_;
+            if (!ensure_buffer_size(input_transit_buffer_, input_transit_buffer_ptr_,
+                                    input_transit_buffer_size_, input_transit_buffer_obj_,
+                                    required_input_size, "chunked direct input buffer")) {
+                return false;
+            }
+            copy_input_to_transit(input, total_count, stream);
+            const int cd_threads = threads;
+            int cd_blocks = std::min(max_blocks_,
+                                     (packedPerRank + cd_threads - 1) / cd_threads);
+            if (cd_blocks < 1) cd_blocks = 1;
+            if (cfg.cu_limit > 0 && cfg.cu_limit < cd_blocks) cd_blocks = cfg.cu_limit;
+            static thread_local bool s_cd_announced = false;
+            if (!s_cd_announced) {
+                printf("PE %d: MORI_CHUNKED_DIRECT=1 — chunked direct-output "
+                       "P2P-read allreduce; chunks=%d blocks=%d threads=%d\n",
+                       myPe_, numChunks_host, cd_blocks, cd_threads);
+                s_cd_announced = true;
+            }
+            for (int c = 0; c < numChunks_host; ++c) {
+                ChunkedDirectOutputKernel<T><<<cd_blocks, cd_threads, 0, stream>>>(
+                    myPe_, npes_, input_transit_buffer_obj_, flagsObj_, output,
+                    total_count, chunk_elems, c, pipeline_reduce_gen_, phase_ts_ptr);
+            }
+        } else if (use_oneshot_direct) {
             const size_t required_input_size = total_count * dtype_size_;
             if (!ensure_buffer_size(input_transit_buffer_, input_transit_buffer_ptr_,
                                     input_transit_buffer_size_, input_transit_buffer_obj_,
@@ -1297,6 +1327,8 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
 
         if (use_oneshot_direct) {
             pipeline_reduce_gen_ += 1;  // ready flag in flagsObj_
+        } else if (use_chunked_direct) {
+            pipeline_reduce_gen_ += static_cast<uint64_t>(numChunks_host);
         } else {
             pipeline_scatter_gen_ += numChunks_host;   // scatter SDMA (qId=0)
             // Plan A does NOT use SDMA AG signal (qId=1); AG is replaced by CU

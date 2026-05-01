@@ -186,6 +186,98 @@ __global__ void OneShotDirectOutputKernel(
   __syncthreads();
   ar_write_phase_ts(phase_ts, 2);
 }
+
+// Chunked variant of OneShotDirectOutputKernel. It keeps the direct-output
+// semantics but services only one chunk per launch, so the experiment can test
+// whether smaller AR service units reduce continuous backlog.
+template <typename T>
+__global__ void ChunkedDirectOutputKernel(
+    int myPe, int npes,
+    const application::SymmMemObjPtr inputObj,
+    const application::SymmMemObjPtr flagsMemObj,
+    T* __restrict__ user_output,
+    size_t elementCount,
+    size_t chunkElementCount,
+    int chunkIdx,
+    uint64_t readyBase,
+    uint64_t* phase_ts) {
+  ar_write_phase_ts(phase_ts, 0);
+  if (elementCount == 0 || chunkElementCount == 0 || npes <= 0) return;
+
+  using P = typename packed_t<T>::P;
+  using A = typename packed_t<T>::A;
+  constexpr int pack_size = P::size;
+  const size_t packedCount =
+      (elementCount + static_cast<size_t>(pack_size) - 1) /
+      static_cast<size_t>(pack_size);
+  const size_t packedChunk =
+      (chunkElementCount + static_cast<size_t>(pack_size) - 1) /
+      static_cast<size_t>(pack_size);
+  const size_t off = static_cast<size_t>(chunkIdx) * packedChunk;
+  if (off >= packedCount) return;
+  size_t cnt = packedChunk;
+  if (off + cnt > packedCount) cnt = packedCount - off;
+
+  if (blockIdx.x == 0) {
+    const int tid = static_cast<int>(threadIdx.x);
+    if (tid == 0) {
+      HSAuint64* myFlag = reinterpret_cast<HSAuint64*>(flagsMemObj->localPtr);
+      __hip_atomic_fetch_add(myFlag, 1ULL,
+                             __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+    __syncthreads();
+    if (tid < npes && tid != myPe) {
+      const uint64_t expected = readyBase + static_cast<uint64_t>(chunkIdx + 1);
+      HSAuint64* peerFlag = reinterpret_cast<HSAuint64*>(flagsMemObj->peerPtrs[tid]);
+      uint64_t stuck = 0;
+      while (core::AtomicLoadRelaxed(peerFlag) < expected) {
+        __builtin_amdgcn_s_sleep(1);
+        if (++stuck >= 100000000ULL) {
+          printf("[STUCK] PE %d CHUNKED_DIRECT c=%d wait peer=%d expected=%llu got=%llu\n",
+                 myPe, chunkIdx, tid, (unsigned long long)expected,
+                 (unsigned long long)core::AtomicLoadRelaxed(peerFlag));
+          stuck = 0;
+        }
+      }
+    }
+    __syncthreads();
+    ar_write_phase_ts(phase_ts, 1);
+  }
+  __syncthreads();
+
+  const size_t linear =
+      static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + threadIdx.x;
+  const size_t stride =
+      static_cast<size_t>(gridDim.x) * static_cast<size_t>(blockDim.x);
+  P* __restrict__ outP = reinterpret_cast<P*>(user_output);
+
+  if constexpr (std::is_same<typename P::type, uint32_t>::value ||
+                std::is_same<typename P::type, int32_t>::value) {
+    for (size_t k = linear; k < cnt; k += stride) {
+      const size_t idx = off + k;
+      const P* p0 = reinterpret_cast<const P*>(inputObj->peerPtrs[0]);
+      P acc = p0[idx];
+      for (int pe = 1; pe < npes; ++pe) {
+        const P* pp = reinterpret_cast<const P*>(inputObj->peerPtrs[pe]);
+        packed_assign_add(acc, pp[idx]);
+      }
+      outP[idx] = acc;
+    }
+  } else {
+    for (size_t k = linear; k < cnt; k += stride) {
+      const size_t idx = off + k;
+      const P* p0 = reinterpret_cast<const P*>(inputObj->peerPtrs[0]);
+      A acc = upcast_v<typename P::type, pack_size>(p0[idx]);
+      for (int pe = 1; pe < npes; ++pe) {
+        const P* pp = reinterpret_cast<const P*>(inputObj->peerPtrs[pe]);
+        packed_assign_add(acc, upcast_v<typename P::type, pack_size>(pp[idx]));
+      }
+      outP[idx] = downcast_v<typename P::type, pack_size>(acc);
+    }
+  }
+  __syncthreads();
+  ar_write_phase_ts(phase_ts, 2);
+}
 // ---------------------------------------------------------------------------
 
 // ============================================================================
