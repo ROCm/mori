@@ -121,6 +121,10 @@ add_executable(cu_xgmi_bench sdma/cu_xgmi_bench.cpp)
 set_source_files_properties(sdma/cu_xgmi_bench.cpp PROPERTIES LANGUAGE HIP)
 target_link_libraries(cu_xgmi_bench mori_shmem MPI::MPI_CXX hip::host hip::device)
 
+add_executable(multiring_xgmi_bench sdma/multiring_xgmi_bench.cpp)
+set_source_files_properties(sdma/multiring_xgmi_bench.cpp PROPERTIES LANGUAGE HIP)
+target_link_libraries(multiring_xgmi_bench mori_shmem MPI::MPI_CXX hip::host hip::device)
+
 add_executable(allreduce_example collective/intra_node/intra_node_example.cpp)
 target_link_libraries(allreduce_example mori_collective MPI::MPI_CXX hip::host
                       hip::device)

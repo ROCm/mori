@@ -3163,6 +3163,57 @@ inter-node executor abstractions.
 
 ---
 
+## Entry 78 — Add multi-ring bidirectional XGMI lane bandwidth bench
+- **Date**: 2026-05-01
+- **Commit**: _this commit_
+- **Why**: A viable direct-output ring cannot be a single ring or a small number
+  of same-direction rings. User pointed out the key constraint:
+  - 3 rings do not fill bandwidth,
+  - reverse rings are needed to occupy bidirectional XGMI bandwidth,
+  - even 6 lanes may leave bandwidth idle.
+
+Before writing the dedicated intranode ring/shard kernel, we need lane-count and
+direction data.
+
+### Implementation
+
+Add micro-benchmark:
+```text
+examples/sdma/multiring_xgmi_bench.cpp
+```
+
+Add CMake target:
+```text
+multiring_xgmi_bench
+```
+
+Add one-command script:
+```bash
+tools/bench_multiring_xgmi.sh
+```
+
+Default lane sweep:
+```text
+1F0R, 3F0R, 3F3R, 4F4R, 6F6R
+```
+
+Each lane reads a disjoint slice from a peer and writes locally. Forward lanes
+read `(myPe + hop) % npes`; reverse lanes read `(myPe - hop + npes) % npes`.
+This measures whether bidirectional multi-ring lane schedules can fill XGMI
+better than same-direction lanes.
+
+### Command
+
+```bash
+git pull origin sdma-test
+bash tools/bench_multiring_xgmi.sh
+```
+
+Use the result to choose the number of lanes and forward/reverse split for the
+dedicated intranode ring/shard direct-output kernel.
+
+---
+
 ## Entry 49 — Implement integer accumulator fast path for uint32/int32 pipeline reduce
 - **Date**: 2026-04-30
 - **Commit**: _this commit_
