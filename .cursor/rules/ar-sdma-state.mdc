@@ -841,6 +841,11 @@ Entry 98: full fused ring now uses the same current-signal+1 wait logic for RS
 and AG as the successful probe, and default script runs `RUN_RING_SHARD_SDMA=1`
 again.
 
+Entry 99: current-signal wait was still racy because it sampled signal after
+submitting local put; a fast previous peer could already satisfy the current
+round, causing expected to become one too high. Full ring now samples old signal
+at round start before submit, then waits for old+1.
+
 ### Why ring/shard can beat current fullmesh two-shot (Entry 88)
 
 Not because "ring has higher peak bandwidth" by default. Evidence:

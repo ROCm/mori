@@ -606,6 +606,14 @@ __global__ void RingShardDirectKernel(
     size_t sendCnt = packedPerShard;
     if (sendOff + sendCnt > packedTotal) sendCnt = packedTotal - sendOff;
     const size_t sendBytes = sendCnt * sizeof(P);
+    HSAuint64* rsSig = recvObj->signalPtrs + static_cast<size_t>(prev) * numQ;
+    uint64_t rsExpected = 0;
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+      // Capture the old value before peers can satisfy this round. Reading
+      // after submit races with a fast peer and can wait for a nonexistent
+      // future signal.
+      rsExpected = core::AtomicLoadRelaxed(rsSig) + 1ULL;
+    }
 
     if (blockIdx.x == 0 && threadIdx.x == 0 && sendBytes > 0) {
       anvil::SdmaQueueDeviceHandle** dh =
@@ -621,15 +629,13 @@ __global__ void RingShardDirectKernel(
     __syncthreads();
 
     if (blockIdx.x == 0 && threadIdx.x == 0) {
-      HSAuint64* sig = recvObj->signalPtrs + static_cast<size_t>(prev) * numQ;
-      const uint64_t expected = core::AtomicLoadRelaxed(sig) + 1ULL;
       uint64_t stuck = 0;
-      while (core::AtomicLoadRelaxed(sig) < expected) {
+      while (core::AtomicLoadRelaxed(rsSig) < rsExpected) {
         __builtin_amdgcn_s_sleep(1);
         if (++stuck >= 100000000ULL) {
           printf("[STUCK] PE %d RING_FUSED_RS round=%d prev=%d expected=%llu got=%llu\n",
-                 myPe, round, prev, (unsigned long long)expected,
-                 (unsigned long long)core::AtomicLoadRelaxed(sig));
+                 myPe, round, prev, (unsigned long long)rsExpected,
+                 (unsigned long long)core::AtomicLoadRelaxed(rsSig));
           stuck = 0;
         }
       }
@@ -665,6 +671,11 @@ __global__ void RingShardDirectKernel(
     size_t sendCnt = packedPerShard;
     if (sendOff + sendCnt > packedTotal) sendCnt = packedTotal - sendOff;
     const size_t sendBytes = sendCnt * sizeof(P);
+    HSAuint64* agSig = recvObj->signalPtrs + static_cast<size_t>(prev) * numQ + 1;
+    uint64_t agExpected = 0;
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+      agExpected = core::AtomicLoadRelaxed(agSig) + 1ULL;
+    }
 
     if (blockIdx.x == 0 && threadIdx.x == 0 && sendBytes > 0) {
       anvil::SdmaQueueDeviceHandle** dh =
@@ -680,15 +691,13 @@ __global__ void RingShardDirectKernel(
     __syncthreads();
 
     if (blockIdx.x == 0 && threadIdx.x == 0) {
-      HSAuint64* sig = recvObj->signalPtrs + static_cast<size_t>(prev) * numQ + 1;
-      const uint64_t expected = core::AtomicLoadRelaxed(sig) + 1ULL;
       uint64_t stuck = 0;
-      while (core::AtomicLoadRelaxed(sig) < expected) {
+      while (core::AtomicLoadRelaxed(agSig) < agExpected) {
         __builtin_amdgcn_s_sleep(1);
         if (++stuck >= 100000000ULL) {
           printf("[STUCK] PE %d RING_FUSED_AG round=%d prev=%d expected=%llu got=%llu\n",
-                 myPe, round, prev, (unsigned long long)expected,
-                 (unsigned long long)core::AtomicLoadRelaxed(sig));
+                 myPe, round, prev, (unsigned long long)agExpected,
+                 (unsigned long long)core::AtomicLoadRelaxed(agSig));
           stuck = 0;
         }
       }

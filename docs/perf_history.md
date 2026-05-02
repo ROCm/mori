@@ -3995,6 +3995,43 @@ bash tools/bench_sdma_ag_copy_pipe.sh
 
 ---
 
+## Entry 99 — Fix ring SDMA wait race by sampling signal before submit
+- **Date**: 2026-05-02
+- **Commit**: _this commit_
+- **Context**: `RING_SHARD_SDMA` still hung, while Entry 97 showed the one-round
+  probe can submit and receive a signal successfully.
+
+### Root cause
+
+The full fused ring kernel computed:
+```text
+expected = AtomicLoadRelaxed(signal) + 1
+```
+after submitting the local SDMA put. If the previous peer's signal arrived
+before this load, `signal` already included the current round, so `expected`
+became one too high and the kernel waited forever for a nonexistent future
+signal.
+
+### Fix
+
+For both reduce-scatter qId 0 and allgather qId 1:
+1. read the old signal value at the start of the round,
+2. set `expected = old + 1`,
+3. submit this rank's SDMA put,
+4. wait for `expected`.
+
+This preserves the probe's current-signal logic but removes the race with fast
+peers.
+
+### Next validation
+
+```bash
+git pull origin sdma-test
+bash tools/bench_sdma_ag_copy_pipe.sh
+```
+
+---
+
 ## Entry 88 — Why ring/shard cadence can beat current fullmesh two-shot in continuous overlap
 - **Date**: 2026-05-02
 - **Context**: User questioned why ring would be better than fullmesh.
