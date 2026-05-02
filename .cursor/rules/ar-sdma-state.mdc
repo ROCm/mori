@@ -820,6 +820,11 @@ shard sequence is valid; bug is in SDMA send/signal path. Added
 `RING_SHARD_SDMA_PROBE` to isolate whether hang is inside `SdmaPutThread` or in
 signal wait.
 
+Entry 95: probe still hung before device printf flush. Updated probe to
+submit-only by default (`MORI_RING_SHARD_SDMA_PROBE_WAIT=0`) so kernel can exit
+and flush `enter/before put/after put/skip wait`. Use
+`MORI_RING_SHARD_SDMA_PROBE_WAIT=1` only to test signal wait after submit works.
+
 ### Why ring/shard can beat current fullmesh two-shot (Entry 88)
 
 Not because "ring has higher peak bandwidth" by default. Evidence:

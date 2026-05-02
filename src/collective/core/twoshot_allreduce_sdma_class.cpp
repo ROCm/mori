@@ -1192,9 +1192,13 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                 return e != nullptr && std::atoi(e) == 1;
             }();
             if (ring_sdma_probe) {
+                int probe_wait = 0;
+                if (const char* e = std::getenv("MORI_RING_SHARD_SDMA_PROBE_WAIT")) {
+                    probe_wait = std::atoi(e) != 0 ? 1 : 0;
+                }
                 RingShardSdmaProbeKernel<T><<<1, 1, 0, stream>>>(
                     myPe_, npes_, input_transit_buffer_obj_, output_transit_buffer_obj_,
-                    total_count, pipeline_scatter_gen_);
+                    total_count, pipeline_scatter_gen_, probe_wait);
             } else if (ring_cu_debug) {
                 RingShardDirectCuDebugKernel<T><<<rs_blocks, rs_threads, 0, stream>>>(
                     myPe_, npes_, input_transit_buffer_obj_, output_transit_buffer_obj_,

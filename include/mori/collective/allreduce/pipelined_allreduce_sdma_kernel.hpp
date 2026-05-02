@@ -724,7 +724,8 @@ __global__ void RingShardSdmaProbeKernel(
     const application::SymmMemObjPtr accumObj,
     const application::SymmMemObjPtr recvObj,
     size_t elementCount,
-    uint64_t scatterBase) {
+    uint64_t scatterBase,
+    int waitForSignal) {
   if (elementCount == 0 || npes <= 1) return;
   using P = typename packed_t<T>::P;
   constexpr int pack_size = P::size;
@@ -761,6 +762,10 @@ __global__ void RingShardSdmaProbeKernel(
              myPe, src, dst, dh, rSig);
       core::SdmaPutThread(src, dst, sendBytes, dh, rSig, numQ, 0);
       printf("PE %d RING_SDMA_PROBE after put\n", myPe);
+    }
+    if (waitForSignal == 0) {
+      printf("PE %d RING_SDMA_PROBE skip wait\n", myPe);
+      return;
     }
     const uint64_t expected = scatterBase + 1ULL;
     HSAuint64* sig = recvObj->signalPtrs + static_cast<size_t>(prev) * numQ;

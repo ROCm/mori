@@ -3848,6 +3848,38 @@ Interpretation:
 
 ---
 
+## Entry 95 — Ring SDMA probe hung before printf flush; make probe submit-only by default
+- **Date**: 2026-05-02
+- **Commit**: _this commit_
+- **Context**: `RING_SHARD_SDMA_PROBE` hung and printed none of the device-side
+  probe messages. Device printf usually flushes when the kernel completes, so a
+  wait inside the same kernel hides whether the hang is in `SdmaPutThread` or in
+  the signal wait.
+
+### Change
+
+`RingShardSdmaProbeKernel` now defaults to submit-only:
+```text
+MORI_RING_SHARD_SDMA_PROBE_WAIT=0
+```
+
+It prints `enter`, `before put`, `after put`, then `skip wait` and exits. To
+test the signal wait explicitly:
+```bash
+MORI_RING_SHARD_SDMA_PROBE_WAIT=1
+```
+
+### Interpretation
+
+Next run:
+- if no `after put` appears, `SdmaPutThread` / SDMA queue submit is hanging;
+- if `after put` and `skip wait` appear, submit works and the prior hang was in
+  signal wait / generation;
+- if submit-only exits, correctness will fail by design because no reduction was
+  performed. That is acceptable for this diagnostic probe.
+
+---
+
 ## Entry 88 — Why ring/shard cadence can beat current fullmesh two-shot in continuous overlap
 - **Date**: 2026-05-02
 - **Context**: User questioned why ring would be better than fullmesh.
