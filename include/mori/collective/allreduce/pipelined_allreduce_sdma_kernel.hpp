@@ -671,7 +671,7 @@ __global__ void RingShardDirectKernel(
     size_t sendCnt = packedPerShard;
     if (sendOff + sendCnt > packedTotal) sendCnt = packedTotal - sendOff;
     const size_t sendBytes = sendCnt * sizeof(P);
-    HSAuint64* agSig = recvObj->signalPtrs + static_cast<size_t>(prev) * numQ + 1;
+    HSAuint64* agSig = recvObj->signalPtrs + static_cast<size_t>(prev) * numQ;
     uint64_t agExpected = 0;
     if (blockIdx.x == 0 && threadIdx.x == 0) {
       agExpected = core::AtomicLoadRelaxed(agSig) + 1ULL;
@@ -681,12 +681,12 @@ __global__ void RingShardDirectKernel(
       anvil::SdmaQueueDeviceHandle** dh =
           recvObj->deviceHandles_d + static_cast<size_t>(next) * numQ;
       HSAuint64* rSig = recvObj->peerSignalPtrs[next]
-          + static_cast<size_t>(myPe) * numQ + 1;
+          + static_cast<size_t>(myPe) * numQ;
       uint8_t* src = reinterpret_cast<uint8_t*>(accumObj->localPtr)
           + sendOff * sizeof(P);
       uint8_t* dst = reinterpret_cast<uint8_t*>(recvObj->peerPtrs[next])
           + sendOff * sizeof(P);
-      core::SdmaPutThread(src, dst, sendBytes, dh, rSig, numQ, 1);
+      core::SdmaPutThread(src, dst, sendBytes, dh, rSig, numQ, 0);
     }
     __syncthreads();
 
@@ -768,22 +768,21 @@ __global__ void RingShardSdmaProbeKernel(
       anvil::SdmaQueueDeviceHandle** dh =
           recvObj->deviceHandles_d + static_cast<size_t>(next) * numQ;
       HSAuint64* rSig = recvObj->peerSignalPtrs[next]
-          + static_cast<size_t>(myPe) * numQ + (agPhase ? 1 : 0);
+          + static_cast<size_t>(myPe) * numQ;
       uint8_t* src = reinterpret_cast<uint8_t*>(accumObj->localPtr)
           + sendOff * sizeof(P);
       uint8_t* dst = reinterpret_cast<uint8_t*>(recvObj->peerPtrs[next])
           + sendOff * sizeof(P);
       printf("PE %d RING_SDMA_PROBE before put src=%p dst=%p dh=%p sig=%p\n",
              myPe, src, dst, dh, rSig);
-      core::SdmaPutThread(src, dst, sendBytes, dh, rSig, numQ, agPhase ? 1 : 0);
+      core::SdmaPutThread(src, dst, sendBytes, dh, rSig, numQ, 0);
       printf("PE %d RING_SDMA_PROBE after put\n", myPe);
     }
     if (waitForSignal == 0) {
       printf("PE %d RING_SDMA_PROBE skip wait\n", myPe);
       return;
     }
-    HSAuint64* sig = recvObj->signalPtrs + static_cast<size_t>(prev) * numQ
-        + (agPhase ? 1 : 0);
+    HSAuint64* sig = recvObj->signalPtrs + static_cast<size_t>(prev) * numQ;
     const uint64_t expected = core::AtomicLoadRelaxed(sig) + 1ULL;
     uint64_t stuck = 0;
     while (core::AtomicLoadRelaxed(sig) < expected) {

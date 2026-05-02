@@ -4133,6 +4133,44 @@ specific `[STUCK] ... expected/got` line before the process exits.
 
 ---
 
+## Entry 103 — Use qId0 for both ring RS and AG after qId1 AG probe failure
+- **Date**: 2026-05-02
+- **Commit**: _this commit_
+- **Evidence**: `bench_ring_sdma_probe.sh` showed RS qId0 rounds can reach
+  `done`, while AG qId1 round 6 failed to receive a signal:
+  ```text
+  PE 3 RING_SDMA_PROBE enter phase=AG round=6 ...
+  PE 3 RING_SDMA_PROBE after put
+  [STUCK] PE 3 RING_SDMA_PROBE wait prev=2 expected=1 got=0
+  ```
+
+### Classification
+
+Implementation/signal-path issue, not ring mechanism data. The ring phases are
+sequential, so they do not require separate qIds. Reusing qId0 avoids the qId1
+signal path that failed in the probe.
+
+### Change
+
+For ring SDMA path and probe:
+- AG sends now use qId0
+- AG waits now read qId0 signal
+- RS remains qId0
+
+This makes RS and AG use the same queue/signal path that already reached
+`done` in the probe.
+
+### Next validation
+
+```bash
+git pull origin sdma-test
+bash tools/bench_ring_sdma_probe.sh
+```
+
+If RS/AG matrix passes, rerun full benchmark.
+
+---
+
 ## Entry 88 — Why ring/shard cadence can beat current fullmesh two-shot in continuous overlap
 - **Date**: 2026-05-02
 - **Context**: User questioned why ring would be better than fullmesh.

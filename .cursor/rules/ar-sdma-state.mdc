@@ -860,6 +860,10 @@ Entry 102: probe still hid diagnostics because infinite device wait prevented
 printf flush. Ring SDMA waits now print once and return on stuck threshold;
 `bench_ring_sdma_probe.sh` timeout is 60s.
 
+Entry 103: AG qId1 probe failed while RS qId0 passes. Since ring RS and AG are
+sequential, ring SDMA path now uses qId0 for both RS and AG to reuse the verified
+signal path. Re-run `tools/bench_ring_sdma_probe.sh`.
+
 ### Why ring/shard can beat current fullmesh two-shot (Entry 88)
 
 Not because "ring has higher peak bandwidth" by default. Evidence:
