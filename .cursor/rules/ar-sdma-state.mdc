@@ -814,6 +814,12 @@ Entry 93: CU debug ring path now passes correctness but is very slow
 performance path. Default script now runs `RING_SHARD_SDMA`
 (`MORI_RING_SHARD_CU_DEBUG=0`) and keeps CU debug opt-in.
 
+Entry 94: full SDMA ring path hung before stuck prints. Since CU debug passes,
+shard sequence is valid; bug is in SDMA send/signal path. Added
+`RingShardSdmaProbeKernel` and default script now runs
+`RING_SHARD_SDMA_PROBE` to isolate whether hang is inside `SdmaPutThread` or in
+signal wait.
+
 ### Why ring/shard can beat current fullmesh two-shot (Entry 88)
 
 Not because "ring has higher peak bandwidth" by default. Evidence:

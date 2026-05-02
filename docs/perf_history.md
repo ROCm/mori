@@ -3805,6 +3805,49 @@ baseline.
 
 ---
 
+## Entry 94 — Ring SDMA path hangs before wait diagnostics; add minimal SDMA probe
+- **Date**: 2026-05-02
+- **Commit**: _this commit_
+- **Context**: After switching default from CU debug to SDMA ring path, the
+  `RING_SHARD_SDMA` run hung before any `RING_FUSED_RS/AG` stuck print.
+
+### Classification
+
+Implementation bug in the SDMA send/signal path. Since CU debug correctness
+passes, shard sequencing is valid. The hang occurs before explicit wait-loop
+diagnostics, likely inside `SdmaPutThread` / queue submit / signal plumbing.
+
+### Change
+
+Add `RingShardSdmaProbeKernel`, a minimal one-round probe:
+- sends one shard from `myPe` to `next` using the same `recvObj` SDMA queue,
+- prints pointers / queue / signal before `SdmaPutThread`,
+- prints after `SdmaPutThread`,
+- waits for one signal from `prev`.
+
+Add env:
+```bash
+MORI_RING_SHARD_SDMA_PROBE=1
+```
+
+`tools/bench_sdma_ag_copy_pipe.sh` now defaults to `RING_SHARD_SDMA_PROBE`
+instead of full `RING_SHARD_SDMA`, so the next run isolates SDMA send/submit.
+
+### Next validation
+
+```bash
+git pull origin sdma-test
+bash tools/bench_sdma_ag_copy_pipe.sh
+```
+
+Interpretation:
+- if "before put" prints but "after put" does not, `SdmaPutThread` submit is
+  hanging;
+- if "after put" prints but wait hangs, signal/expected generation is wrong;
+- if probe passes, the full SDMA ring loop has an ordering bug.
+
+---
+
 ## Entry 88 — Why ring/shard cadence can beat current fullmesh two-shot in continuous overlap
 - **Date**: 2026-05-02
 - **Context**: User questioned why ring would be better than fullmesh.

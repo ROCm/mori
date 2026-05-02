@@ -719,6 +719,66 @@ __global__ void RingShardDirectKernel(
 }
 
 template <typename T>
+__global__ void RingShardSdmaProbeKernel(
+    int myPe, int npes,
+    const application::SymmMemObjPtr accumObj,
+    const application::SymmMemObjPtr recvObj,
+    size_t elementCount,
+    uint64_t scatterBase) {
+  if (elementCount == 0 || npes <= 1) return;
+  using P = typename packed_t<T>::P;
+  constexpr int pack_size = P::size;
+  const size_t elemsPerShard =
+      (elementCount + static_cast<size_t>(npes) - 1) / static_cast<size_t>(npes);
+  const size_t packedPerShard =
+      (elemsPerShard + static_cast<size_t>(pack_size) - 1) /
+      static_cast<size_t>(pack_size);
+  const size_t packedTotal =
+      (elementCount + static_cast<size_t>(pack_size) - 1) /
+      static_cast<size_t>(pack_size);
+  const int next = (myPe + 1) % npes;
+  const int prev = (myPe - 1 + npes) % npes;
+  const int sendShard = myPe;
+  const size_t sendOff = static_cast<size_t>(sendShard) * packedPerShard;
+  size_t sendCnt = packedPerShard;
+  if (sendOff + sendCnt > packedTotal) sendCnt = packedTotal - sendOff;
+  const size_t sendBytes = sendCnt * sizeof(P);
+  const uint32_t numQ = recvObj->sdmaNumQueue;
+  if (threadIdx.x == 0) {
+    printf("PE %d RING_SDMA_PROBE enter next=%d prev=%d numQ=%u bytes=%llu base=%llu\n",
+           myPe, next, prev, numQ, (unsigned long long)sendBytes,
+           (unsigned long long)scatterBase);
+    if (sendBytes > 0) {
+      anvil::SdmaQueueDeviceHandle** dh =
+          recvObj->deviceHandles_d + static_cast<size_t>(next) * numQ;
+      HSAuint64* rSig = recvObj->peerSignalPtrs[next]
+          + static_cast<size_t>(myPe) * numQ;
+      uint8_t* src = reinterpret_cast<uint8_t*>(accumObj->localPtr)
+          + sendOff * sizeof(P);
+      uint8_t* dst = reinterpret_cast<uint8_t*>(recvObj->peerPtrs[next])
+          + sendOff * sizeof(P);
+      printf("PE %d RING_SDMA_PROBE before put src=%p dst=%p dh=%p sig=%p\n",
+             myPe, src, dst, dh, rSig);
+      core::SdmaPutThread(src, dst, sendBytes, dh, rSig, numQ, 0);
+      printf("PE %d RING_SDMA_PROBE after put\n", myPe);
+    }
+    const uint64_t expected = scatterBase + 1ULL;
+    HSAuint64* sig = recvObj->signalPtrs + static_cast<size_t>(prev) * numQ;
+    uint64_t stuck = 0;
+    while (core::AtomicLoadRelaxed(sig) < expected) {
+      __builtin_amdgcn_s_sleep(1);
+      if (++stuck >= 100000000ULL) {
+        printf("[STUCK] PE %d RING_SDMA_PROBE wait prev=%d expected=%llu got=%llu\n",
+               myPe, prev, (unsigned long long)expected,
+               (unsigned long long)core::AtomicLoadRelaxed(sig));
+        stuck = 0;
+      }
+    }
+    printf("PE %d RING_SDMA_PROBE done\n", myPe);
+  }
+}
+
+template <typename T>
 __global__ void RingShardDirectCuDebugKernel(
     int myPe, int npes,
     const application::SymmMemObjPtr accumObj,
