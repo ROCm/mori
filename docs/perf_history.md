@@ -3673,6 +3673,47 @@ bash tools/bench_sdma_ag_copy_pipe.sh
 
 ---
 
+## Entry 91 — Ring CU debug path was missing allgather; add AG loop
+- **Date**: 2026-05-02
+- **Commit**: _this commit_
+- **Context**: Entry 90 added `RingShardDirectCuDebugKernel` to separate shard
+  sequence correctness from SDMA queue hangs. The first CU debug run still
+  failed correctness.
+
+### Classification
+
+Implementation bug in the debug kernel. The CU debug path only executed the
+reduce-scatter loop and then copied the full accumulation buffer to user output.
+After reduce-scatter, only one shard per rank is fully reduced; the remaining
+shards have not been allgathered. Copying the full buffer is therefore expected
+to fail.
+
+### Fix
+
+`RingShardDirectCuDebugKernel` now performs the allgather loop:
+- writes the locally owned shard to user output,
+- sends the current shard to `next`,
+- waits for `prev`,
+- copies the received shard into accumulation buffer and user output.
+
+It uses the same `flagsObj_` counter after the reduce-scatter rounds:
+```text
+expected = flagBase + (npes - 1) + round + 1
+```
+
+### Next validation
+
+Re-run:
+```bash
+git pull origin sdma-test
+bash tools/bench_sdma_ag_copy_pipe.sh
+```
+
+If this passes, shard sequence is valid and the next fix targets SDMA
+send/signal. If it fails, inspect round index formulas.
+
+---
+
 ## Entry 88 — Why ring/shard cadence can beat current fullmesh two-shot in continuous overlap
 - **Date**: 2026-05-02
 - **Context**: User questioned why ring would be better than fullmesh.

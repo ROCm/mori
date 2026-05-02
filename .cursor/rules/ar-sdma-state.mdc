@@ -799,6 +799,11 @@ stall inside SDMA submit/signal rather than explicit wait loops. Added
 `RingShardDirectCuDebugKernel`; default `MORI_RING_SHARD_CU_DEBUG=1` uses CU P2P
 stores + flags to validate shard sequence separately from SDMA queue path.
 
+Entry 91: CU debug kernel itself was incomplete: it only did reduce-scatter then
+copied full accum to output. Added allgather loop. If this passes, shard
+sequence is valid and SDMA send/signal path is next; if it fails, round index
+formulas are wrong.
+
 ### Why ring/shard can beat current fullmesh two-shot (Entry 88)
 
 Not because "ring has higher peak bandwidth" by default. Evidence:

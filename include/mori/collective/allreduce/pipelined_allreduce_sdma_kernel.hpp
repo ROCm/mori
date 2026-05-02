@@ -813,9 +813,53 @@ __global__ void RingShardDirectCuDebugKernel(
     __syncthreads();
   }
 
-  // Debug path: publish final accumulated buffer to user output.
-  for (size_t k = linear; k < packedTotal; k += stride) {
-    outP[k] = accumBase[k];
+  const int ownedShard = (myPe + 1) % npes;
+  const size_t ownedOff = static_cast<size_t>(ownedShard) * packedPerShard;
+  if (ownedOff < packedTotal) {
+    size_t ownedCnt = packedPerShard;
+    if (ownedOff + ownedCnt > packedTotal) ownedCnt = packedTotal - ownedOff;
+    for (size_t k = linear; k < ownedCnt; k += stride) {
+      outP[ownedOff + k] = accumBase[ownedOff + k];
+    }
+  }
+  __syncthreads();
+
+  for (int round = 0; round < npes - 1; ++round) {
+    const int sendShard = (myPe - round + 1 + npes) % npes;
+    const int recvShard = (myPe - round + npes) % npes;
+    const size_t sendOff = static_cast<size_t>(sendShard) * packedPerShard;
+    const size_t recvOff = static_cast<size_t>(recvShard) * packedPerShard;
+    size_t sendCnt = packedPerShard;
+    if (sendOff + sendCnt > packedTotal) sendCnt = packedTotal - sendOff;
+    size_t recvCnt = packedPerShard;
+    if (recvOff + recvCnt > packedTotal) recvCnt = packedTotal - recvOff;
+
+    P* __restrict__ remoteRecv =
+        reinterpret_cast<P*>(recvObj->peerPtrs[next]) + sendOff;
+    const P* __restrict__ sendPtr = accumBase + sendOff;
+    for (size_t k = linear; k < sendCnt; k += stride) {
+      remoteRecv[k] = sendPtr[k];
+    }
+    __syncthreads();
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+      __threadfence_system();
+      HSAuint64* myFlag = reinterpret_cast<HSAuint64*>(flagsMemObj->localPtr);
+      __hip_atomic_fetch_add(myFlag, 1ULL,
+                             __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+    __syncthreads();
+    wait_flag(prev, flagBase + static_cast<uint64_t>(npes - 1 + round + 1));
+    __syncthreads();
+
+    P* __restrict__ accum = accumBase + recvOff;
+    P* __restrict__ out = outP + recvOff;
+    const P* __restrict__ recv = recvBase + recvOff;
+    for (size_t k = linear; k < recvCnt; k += stride) {
+      const P v = recv[k];
+      accum[k] = v;
+      out[k] = v;
+    }
+    __syncthreads();
   }
   ar_write_phase_ts(phase_ts, 2);
 }
