@@ -809,6 +809,11 @@ Entry 92: host did not advance `pipeline_reduce_gen_` for
 later calls skipped waits on stale expected values. Fix advances
 `pipeline_reduce_gen_ += 2*(npes-1)`.
 
+Entry 93: CU debug ring path now passes correctness but is very slow
+(`seq_ar=272.893 ms`). Classification: shard sequence valid; CU debug is not
+performance path. Default script now runs `RING_SHARD_SDMA`
+(`MORI_RING_SHARD_CU_DEBUG=0`) and keeps CU debug opt-in.
+
 ### Why ring/shard can beat current fullmesh two-shot (Entry 88)
 
 Not because "ring has higher peak bandwidth" by default. Evidence:

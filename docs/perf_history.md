@@ -3752,6 +3752,59 @@ bash tools/bench_sdma_ag_copy_pipe.sh
 
 ---
 
+## Entry 93 — Ring CU debug correctness passes but is slow; switch default to SDMA ring path
+- **Date**: 2026-05-02
+- **Commit**: _this commit_
+- **Command**: `bash tools/bench_sdma_ag_copy_pipe.sh`
+- **Log**: `/tmp/perf_sdma_ag_copy_pipe_1777707703.log`
+
+### Result
+
+After Entry 92, the `MORI_RING_SHARD_DIRECT=1` default CU debug path reached
+summary and passed correctness. It is much slower, as expected for the debug
+path:
+```text
+BASELINE copy wall          = 6.860 ms
+RING_SHARD_DIRECT copy wall = 274.249 ms
+RING_SHARD_DIRECT seq_ar    = 272.893 ms
+```
+
+### Classification
+
+This is **scheme incomplete / debug path slow**, not a correctness bug:
+- the shard sequence is now valid in CU debug mode,
+- the path is single-block and uses CU P2P stores for debugging,
+- it is not intended to be the performance implementation.
+
+### Change
+
+`tools/bench_sdma_ag_copy_pipe.sh` now defaults to testing the real SDMA ring
+path:
+```bash
+RING_SHARD_SDMA
+MORI_RING_SHARD_DIRECT=1
+MORI_RING_SHARD_CU_DEBUG=0
+```
+
+The CU debug path remains opt-in:
+```bash
+RUN_RING_SHARD_DIRECT=1
+```
+
+### Next validation
+
+Re-run:
+```bash
+git pull origin sdma-test
+bash tools/bench_sdma_ag_copy_pipe.sh
+```
+
+If SDMA path hangs, use the existing `RING_FUSED_RS/AG` stuck prints. If it
+passes correctness, compare `seq_ar_ms` to the prior 272 ms CU debug value and
+baseline.
+
+---
+
 ## Entry 88 — Why ring/shard cadence can beat current fullmesh two-shot in continuous overlap
 - **Date**: 2026-05-02
 - **Context**: User questioned why ring would be better than fullmesh.
