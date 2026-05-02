@@ -832,6 +832,11 @@ bash tools/bench_ring_sdma_probe.sh
 Default `PROBE_WAIT=0` is submit-only and allreduce correctness failure is
 expected. `tools/bench_sdma_ag_copy_pipe.sh` defaults `RUN_RING_SHARD_PROBE=0`.
 
+Entry 97: submit-only probe printed `after put`, so `SdmaPutThread` submit works.
+Probe now defaults `PROBE_WAIT=1` and waits for `current signal + 1`, independent
+of pipeline generation counters. If it prints `done`, full ring hang is an
+ordering/generation bug in the fused loop.
+
 ### Why ring/shard can beat current fullmesh two-shot (Entry 88)
 
 Not because "ring has higher peak bandwidth" by default. Evidence:

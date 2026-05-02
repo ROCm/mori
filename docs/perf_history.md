@@ -3928,6 +3928,46 @@ RING_SDMA_PROBE skip wait
 
 ---
 
+## Entry 97 — Ring SDMA submit works; switch probe to current-signal wait
+- **Date**: 2026-05-02
+- **Observed output**: `RING_SDMA_PROBE after put` and `skip wait` printed.
+
+### Classification
+
+`SdmaPutThread` submit is not hanging. The previous full SDMA ring hang is now
+localized to signal wait / expected-generation / round ordering.
+
+### Fix
+
+`RingShardSdmaProbeKernel` now computes expected signal from the local signal:
+```text
+expected = AtomicLoadRelaxed(sig) + 1
+```
+
+instead of using `pipeline_scatter_gen_`, because the standalone probe is called
+inside warmup/measurement paths where the pipeline generation counter can jump
+or not advance as expected for a diagnostic.
+
+`tools/bench_ring_sdma_probe.sh` now defaults:
+```bash
+PROBE_WAIT=1
+```
+and always exits success because the probe does not compute allreduce
+correctness.
+
+### Next validation
+
+```bash
+git pull origin sdma-test
+bash tools/bench_ring_sdma_probe.sh
+```
+
+If this prints `done`, SDMA submit + signal delivery works and the full fused
+ring loop has an ordering/generation bug. If it times out after `after put`, the
+signal wait path is still wrong.
+
+---
+
 ## Entry 88 — Why ring/shard cadence can beat current fullmesh two-shot in continuous overlap
 - **Date**: 2026-05-02
 - **Context**: User questioned why ring would be better than fullmesh.

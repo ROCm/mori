@@ -767,8 +767,8 @@ __global__ void RingShardSdmaProbeKernel(
       printf("PE %d RING_SDMA_PROBE skip wait\n", myPe);
       return;
     }
-    const uint64_t expected = scatterBase + 1ULL;
     HSAuint64* sig = recvObj->signalPtrs + static_cast<size_t>(prev) * numQ;
+    const uint64_t expected = core::AtomicLoadRelaxed(sig) + 1ULL;
     uint64_t stuck = 0;
     while (core::AtomicLoadRelaxed(sig) < expected) {
       __builtin_amdgcn_s_sleep(1);
