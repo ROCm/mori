@@ -3714,6 +3714,44 @@ send/signal. If it fails, inspect round index formulas.
 
 ---
 
+## Entry 92 — Fix ring CU debug flag generation not advancing
+- **Date**: 2026-05-02
+- **Commit**: _this commit_
+- **Context**: `MORI_RING_SHARD_CU_DEBUG=1` still failed correctness after adding
+  the allgather loop.
+
+### Root cause
+
+The CU debug ring path uses `flagsObj_` and `pipeline_reduce_gen_` for its
+ready/round flags. Each AR call increments the flag `2 * (npes - 1)` times:
+- `npes-1` reduce-scatter rounds
+- `npes-1` allgather rounds
+
+But the host path did not advance `pipeline_reduce_gen_` for
+`use_ring_shard_direct`. On subsequent warmup/measurement calls, kernels waited
+for stale expected values that had already been satisfied by prior calls, so
+rounds could skip synchronization and read stale/incomplete data.
+
+### Fix
+
+For `MORI_RING_SHARD_CU_DEBUG=1`, advance:
+```text
+pipeline_reduce_gen_ += 2 * (npes - 1)
+```
+
+For the non-debug SDMA ring path, continue advancing `pipeline_scatter_gen_` and
+`pipeline_ag_gen_`.
+
+### Next validation
+
+Re-run:
+```bash
+git pull origin sdma-test
+bash tools/bench_sdma_ag_copy_pipe.sh
+```
+
+---
+
 ## Entry 88 — Why ring/shard cadence can beat current fullmesh two-shot in continuous overlap
 - **Date**: 2026-05-02
 - **Context**: User questioned why ring would be better than fullmesh.

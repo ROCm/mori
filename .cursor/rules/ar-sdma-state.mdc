@@ -804,6 +804,11 @@ copied full accum to output. Added allgather loop. If this passes, shard
 sequence is valid and SDMA send/signal path is next; if it fails, round index
 formulas are wrong.
 
+Entry 92: host did not advance `pipeline_reduce_gen_` for
+`MORI_RING_SHARD_CU_DEBUG=1`. Since each call uses `2*(npes-1)` flag increments,
+later calls skipped waits on stale expected values. Fix advances
+`pipeline_reduce_gen_ += 2*(npes-1)`.
+
 ### Why ring/shard can beat current fullmesh two-shot (Entry 88)
 
 Not because "ring has higher peak bandwidth" by default. Evidence:

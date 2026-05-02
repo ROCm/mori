@@ -1464,8 +1464,16 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
         if (use_oneshot_direct || use_multilane_direct) {
             pipeline_reduce_gen_ += 1;  // ready flag in flagsObj_
         } else if (use_ring_shard_direct) {
-            pipeline_scatter_gen_ += static_cast<uint64_t>(npes_ - 1);
-            pipeline_ag_gen_ += static_cast<uint64_t>(npes_ - 1);
+            const bool ring_cu_debug = []() -> bool {
+                const char* e = std::getenv("MORI_RING_SHARD_CU_DEBUG");
+                return e == nullptr || std::atoi(e) != 0;
+            }();
+            if (ring_cu_debug) {
+                pipeline_reduce_gen_ += static_cast<uint64_t>(2 * (npes_ - 1));
+            } else {
+                pipeline_scatter_gen_ += static_cast<uint64_t>(npes_ - 1);
+                pipeline_ag_gen_ += static_cast<uint64_t>(npes_ - 1);
+            }
         } else if (use_chunked_direct) {
             pipeline_reduce_gen_ += static_cast<uint64_t>(numChunks_host);
         } else {
