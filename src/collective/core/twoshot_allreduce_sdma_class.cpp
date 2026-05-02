@@ -1181,24 +1181,9 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                        myPe_, rs_blocks, rs_threads);
                 s_rs_announced = true;
             }
-            for (int r = 0; r < npes_ - 1; ++r) {
-                hipError_t bz = stream
-                    ? hipMemsetAsync(&barrierPtr_->flag, 0, sizeof(uint32_t), stream)
-                    : hipMemset(&barrierPtr_->flag, 0, sizeof(uint32_t));
-                if (bz != hipSuccess) return false;
-                RingShardReduceScatterRoundKernel<T><<<rs_blocks, rs_threads, 0, stream>>>(
-                    myPe_, npes_, input_transit_buffer_obj_, output_transit_buffer_obj_,
-                    barrierPtr_, total_count, r, pipeline_scatter_gen_);
-            }
-            for (int r = 0; r < npes_ - 1; ++r) {
-                hipError_t bz = stream
-                    ? hipMemsetAsync(&barrierPtr_->flag, 0, sizeof(uint32_t), stream)
-                    : hipMemset(&barrierPtr_->flag, 0, sizeof(uint32_t));
-                if (bz != hipSuccess) return false;
-                RingShardAllGatherRoundKernel<T><<<rs_blocks, rs_threads, 0, stream>>>(
-                    myPe_, npes_, input_transit_buffer_obj_, output_transit_buffer_obj_,
-                    barrierPtr_, output, total_count, r, pipeline_ag_gen_);
-            }
+            RingShardDirectKernel<T><<<rs_blocks, rs_threads, 0, stream>>>(
+                myPe_, npes_, input_transit_buffer_obj_, output_transit_buffer_obj_,
+                output, total_count, pipeline_scatter_gen_, pipeline_ag_gen_, phase_ts_ptr);
             hipError_t final_copy = stream
                 ? hipMemcpyAsync(output, input_transit_buffer_, total_count * dtype_size_,
                                  hipMemcpyDeviceToDevice, stream)

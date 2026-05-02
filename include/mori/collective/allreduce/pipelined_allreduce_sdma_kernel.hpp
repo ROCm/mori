@@ -562,6 +562,147 @@ __global__ void RingShardAllGatherRoundKernel(
     outSend[k] = accumSend[k];
   }
 }
+
+template <typename T>
+__global__ void RingShardDirectKernel(
+    int myPe, int npes,
+    const application::SymmMemObjPtr accumObj,
+    const application::SymmMemObjPtr recvObj,
+    T* __restrict__ user_output,
+    size_t elementCount,
+    uint64_t scatterBase,
+    uint64_t agBase,
+    uint64_t* phase_ts) {
+  ar_write_phase_ts(phase_ts, 0);
+  if (elementCount == 0 || npes <= 1) return;
+
+  using P = typename packed_t<T>::P;
+  using A = typename packed_t<T>::A;
+  constexpr int pack_size = P::size;
+  const size_t elemsPerShard =
+      (elementCount + static_cast<size_t>(npes) - 1) / static_cast<size_t>(npes);
+  const size_t packedPerShard =
+      (elemsPerShard + static_cast<size_t>(pack_size) - 1) /
+      static_cast<size_t>(pack_size);
+  const size_t packedTotal =
+      (elementCount + static_cast<size_t>(pack_size) - 1) /
+      static_cast<size_t>(pack_size);
+  const int next = (myPe + 1) % npes;
+  const int prev = (myPe - 1 + npes) % npes;
+  const uint32_t numQ = recvObj->sdmaNumQueue;
+
+  const size_t linear =
+      static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + threadIdx.x;
+  const size_t stride =
+      static_cast<size_t>(gridDim.x) * static_cast<size_t>(blockDim.x);
+
+  for (int round = 0; round < npes - 1; ++round) {
+    const int sendShard = (myPe - round + npes) % npes;
+    const int recvShard = (myPe - round - 1 + npes) % npes;
+    const size_t sendOff = static_cast<size_t>(sendShard) * packedPerShard;
+    const size_t recvOff = static_cast<size_t>(recvShard) * packedPerShard;
+    size_t recvCnt = packedPerShard;
+    if (recvOff + recvCnt > packedTotal) recvCnt = packedTotal - recvOff;
+    size_t sendCnt = packedPerShard;
+    if (sendOff + sendCnt > packedTotal) sendCnt = packedTotal - sendOff;
+    const size_t sendBytes = sendCnt * sizeof(P);
+
+    if (blockIdx.x == 0 && threadIdx.x == 0 && sendBytes > 0) {
+      anvil::SdmaQueueDeviceHandle** dh =
+          recvObj->deviceHandles_d + static_cast<size_t>(next) * numQ;
+      HSAuint64* rSig = recvObj->peerSignalPtrs[next]
+          + static_cast<size_t>(myPe) * numQ;
+      uint8_t* src = reinterpret_cast<uint8_t*>(accumObj->localPtr)
+          + sendOff * sizeof(P);
+      uint8_t* dst = reinterpret_cast<uint8_t*>(recvObj->peerPtrs[next])
+          + sendOff * sizeof(P);
+      core::SdmaPutThread(src, dst, sendBytes, dh, rSig, numQ, 0);
+    }
+    __syncthreads();
+
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+      const uint64_t expected = scatterBase + static_cast<uint64_t>(round + 1);
+      HSAuint64* sig = recvObj->signalPtrs + static_cast<size_t>(prev) * numQ;
+      while (core::AtomicLoadRelaxed(sig) < expected) {
+        __builtin_amdgcn_s_sleep(1);
+      }
+    }
+    __syncthreads();
+
+    P* __restrict__ accum = reinterpret_cast<P*>(accumObj->localPtr) + recvOff;
+    const P* __restrict__ recv = reinterpret_cast<const P*>(recvObj->localPtr) + recvOff;
+    if constexpr (std::is_same<typename P::type, uint32_t>::value ||
+                  std::is_same<typename P::type, int32_t>::value) {
+      for (size_t k = linear; k < recvCnt; k += stride) {
+        P v = accum[k];
+        packed_assign_add(v, recv[k]);
+        accum[k] = v;
+      }
+    } else {
+      for (size_t k = linear; k < recvCnt; k += stride) {
+        A v = upcast_v<typename P::type, pack_size>(accum[k]);
+        packed_assign_add(v, upcast_v<typename P::type, pack_size>(recv[k]));
+        accum[k] = downcast_v<typename P::type, pack_size>(v);
+      }
+    }
+    __syncthreads();
+  }
+
+  for (int round = 0; round < npes - 1; ++round) {
+    const int sendShard = (myPe - round + 1 + npes) % npes;
+    const int recvShard = (myPe - round + npes) % npes;
+    const size_t sendOff = static_cast<size_t>(sendShard) * packedPerShard;
+    const size_t recvOff = static_cast<size_t>(recvShard) * packedPerShard;
+    size_t recvCnt = packedPerShard;
+    if (recvOff + recvCnt > packedTotal) recvCnt = packedTotal - recvOff;
+    size_t sendCnt = packedPerShard;
+    if (sendOff + sendCnt > packedTotal) sendCnt = packedTotal - sendOff;
+    const size_t sendBytes = sendCnt * sizeof(P);
+
+    if (blockIdx.x == 0 && threadIdx.x == 0 && sendBytes > 0) {
+      anvil::SdmaQueueDeviceHandle** dh =
+          recvObj->deviceHandles_d + static_cast<size_t>(next) * numQ;
+      HSAuint64* rSig = recvObj->peerSignalPtrs[next]
+          + static_cast<size_t>(myPe) * numQ + 1;
+      uint8_t* src = reinterpret_cast<uint8_t*>(accumObj->localPtr)
+          + sendOff * sizeof(P);
+      uint8_t* dst = reinterpret_cast<uint8_t*>(recvObj->peerPtrs[next])
+          + sendOff * sizeof(P);
+      core::SdmaPutThread(src, dst, sendBytes, dh, rSig, numQ, 1);
+    }
+    __syncthreads();
+
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+      const uint64_t expected = agBase + static_cast<uint64_t>(round + 1);
+      HSAuint64* sig = recvObj->signalPtrs + static_cast<size_t>(prev) * numQ + 1;
+      while (core::AtomicLoadRelaxed(sig) < expected) {
+        __builtin_amdgcn_s_sleep(1);
+      }
+    }
+    __syncthreads();
+
+    P* __restrict__ accum = reinterpret_cast<P*>(accumObj->localPtr) + recvOff;
+    P* __restrict__ outP = reinterpret_cast<P*>(user_output) + recvOff;
+    const P* __restrict__ recv = reinterpret_cast<const P*>(recvObj->localPtr) + recvOff;
+    for (size_t k = linear; k < recvCnt; k += stride) {
+      const P v = recv[k];
+      accum[k] = v;
+      outP[k] = v;
+    }
+    const size_t selfShard = static_cast<size_t>(myPe) * packedPerShard;
+    if (selfShard < packedTotal) {
+      size_t selfCnt = packedPerShard;
+      if (selfShard + selfCnt > packedTotal) selfCnt = packedTotal - selfShard;
+      P* __restrict__ outSelf = reinterpret_cast<P*>(user_output) + selfShard;
+      const P* __restrict__ accumSelf = reinterpret_cast<const P*>(accumObj->localPtr) + selfShard;
+      for (size_t k = linear; k < selfCnt; k += stride) {
+        outSelf[k] = accumSelf[k];
+      }
+    }
+    __syncthreads();
+  }
+  ar_write_phase_ts(phase_ts, 2);
+}
 // ---------------------------------------------------------------------------
 
 // ============================================================================

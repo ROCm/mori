@@ -784,6 +784,11 @@ receive staging; each received shard is overwritten by SDMA, and memset may
 cause stale zero/cache visibility issues. If still failing, inspect shard index
 sequence next.
 
+Entry 87: fused ring reduce-scatter and allgather rounds into one kernel
+(`RingShardDirectKernel`) instead of 14 host-launched round kernels. Final-copy
+debug path remains. If correctness still fails, inspect shard index sequence;
+if it passes, compare against prior `seq_ar~41.5 ms`.
+
 ### 当前执行纪律更新
 
 用户明确要求：催促或状态问题不能只回复状态。每轮必须实际推进 repo 变更、

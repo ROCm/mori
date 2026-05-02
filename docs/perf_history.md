@@ -3563,6 +3563,39 @@ reduce-scatter/allgather shard index sequence.
 
 ---
 
+## Entry 87 — Ring/shard debug: fuse RS+AG rounds into one kernel
+- **Date**: 2026-05-02
+- **Commit**: _this commit_
+- **Why**: Entry 85/86 showed correctness still failing, and Entry 86 kept the
+  final-copy debug path. The previous host implementation launched 14 kernels
+  per AR (7 reduce-scatter + 7 allgather) and reset `barrier->flag` each round.
+  That is a scheme-incomplete source of high overhead and additional sync state.
+
+### Change
+
+Add `RingShardDirectKernel`:
+- one kernel contains all reduce-scatter rounds,
+- then all allgather rounds,
+- uses SDMA qId 0 for RS and qId 1 for AG,
+- writes gathered shards to user output,
+- keeps the host-side final-copy debug path for correctness discrimination.
+
+Host `MORI_RING_SHARD_DIRECT=1` now launches one ring kernel instead of 14 round
+kernels.
+
+### Next validation
+
+Re-run:
+```bash
+git pull origin sdma-test
+bash tools/bench_sdma_ag_copy_pipe.sh
+```
+
+If correctness still fails, focus on shard index sequence. If correctness
+passes, compare `seq_ar_ms` against the 41.5 ms pre-fusion value.
+
+---
+
 ## Entry 49 — Implement integer accumulator fast path for uint32/int32 pipeline reduce
 - **Date**: 2026-04-30
 - **Commit**: _this commit_
