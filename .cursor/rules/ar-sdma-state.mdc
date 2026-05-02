@@ -837,6 +837,10 @@ Probe now defaults `PROBE_WAIT=1` and waits for `current signal + 1`, independen
 of pipeline generation counters. If it prints `done`, full ring hang is an
 ordering/generation bug in the fused loop.
 
+Entry 98: full fused ring now uses the same current-signal+1 wait logic for RS
+and AG as the successful probe, and default script runs `RUN_RING_SHARD_SDMA=1`
+again.
+
 ### Why ring/shard can beat current fullmesh two-shot (Entry 88)
 
 Not because "ring has higher peak bandwidth" by default. Evidence:

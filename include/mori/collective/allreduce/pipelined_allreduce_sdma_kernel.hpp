@@ -621,8 +621,8 @@ __global__ void RingShardDirectKernel(
     __syncthreads();
 
     if (blockIdx.x == 0 && threadIdx.x == 0) {
-      const uint64_t expected = scatterBase + static_cast<uint64_t>(round + 1);
       HSAuint64* sig = recvObj->signalPtrs + static_cast<size_t>(prev) * numQ;
+      const uint64_t expected = core::AtomicLoadRelaxed(sig) + 1ULL;
       uint64_t stuck = 0;
       while (core::AtomicLoadRelaxed(sig) < expected) {
         __builtin_amdgcn_s_sleep(1);
@@ -680,8 +680,8 @@ __global__ void RingShardDirectKernel(
     __syncthreads();
 
     if (blockIdx.x == 0 && threadIdx.x == 0) {
-      const uint64_t expected = agBase + static_cast<uint64_t>(round + 1);
       HSAuint64* sig = recvObj->signalPtrs + static_cast<size_t>(prev) * numQ + 1;
+      const uint64_t expected = core::AtomicLoadRelaxed(sig) + 1ULL;
       uint64_t stuck = 0;
       while (core::AtomicLoadRelaxed(sig) < expected) {
         __builtin_amdgcn_s_sleep(1);

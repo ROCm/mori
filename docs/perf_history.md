@@ -3968,6 +3968,33 @@ signal wait path is still wrong.
 
 ---
 
+## Entry 98 — Apply current-signal wait logic to full fused ring
+- **Date**: 2026-05-02
+- **Commit**: _this commit_
+- **Evidence**: Entry 97 probe showed SDMA submit and signal delivery work when
+  waiting for `current signal + 1`.
+
+### Change
+
+`RingShardDirectKernel` now uses:
+```text
+expected = AtomicLoadRelaxed(sig) + 1
+```
+for both reduce-scatter qId 0 and allgather qId 1 waits, instead of using
+host-maintained `pipeline_scatter_gen_` / `pipeline_ag_gen_` base values.
+
+`tools/bench_sdma_ag_copy_pipe.sh` defaults `RUN_RING_SHARD_SDMA=1` again so the
+full fused ring path is validated with the same wait logic as the passing probe.
+
+### Next validation
+
+```bash
+git pull origin sdma-test
+bash tools/bench_sdma_ag_copy_pipe.sh
+```
+
+---
+
 ## Entry 88 — Why ring/shard cadence can beat current fullmesh two-shot in continuous overlap
 - **Date**: 2026-05-02
 - **Context**: User questioned why ring would be better than fullmesh.
