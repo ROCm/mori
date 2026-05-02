@@ -825,6 +825,13 @@ submit-only by default (`MORI_RING_SHARD_SDMA_PROBE_WAIT=0`) so kernel can exit
 and flush `enter/before put/after put/skip wait`. Use
 `MORI_RING_SHARD_SDMA_PROBE_WAIT=1` only to test signal wait after submit works.
 
+Entry 96: ring SDMA probe moved out of full Test6. New script:
+```bash
+bash tools/bench_ring_sdma_probe.sh
+```
+Default `PROBE_WAIT=0` is submit-only and allreduce correctness failure is
+expected. `tools/bench_sdma_ag_copy_pipe.sh` defaults `RUN_RING_SHARD_PROBE=0`.
+
 ### Why ring/shard can beat current fullmesh two-shot (Entry 88)
 
 Not because "ring has higher peak bandwidth" by default. Evidence:

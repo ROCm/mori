@@ -3880,6 +3880,54 @@ Next run:
 
 ---
 
+## Entry 96 — Move ring SDMA probe out of full Test6 script
+- **Date**: 2026-05-02
+- **Commit**: _this commit_
+- **Context**: `RING_SHARD_SDMA_PROBE` submit-only is a diagnostic. Running it
+  inside the full `tools/bench_sdma_ag_copy_pipe.sh` Test6 path necessarily
+  produces allreduce correctness failures because the probe does not compute an
+  allreduce.
+
+### Change
+
+Add dedicated probe script:
+```bash
+tools/bench_ring_sdma_probe.sh
+```
+
+It runs the shortest copy-to-user path with:
+```bash
+MORI_RING_SHARD_DIRECT=1
+MORI_RING_SHARD_SDMA_PROBE=1
+MORI_RING_SHARD_CU_DEBUG=0
+MORI_RING_SHARD_SDMA_PROBE_WAIT=<0|1>
+```
+
+Default:
+```bash
+PROBE_WAIT=0
+```
+This submit-only mode exits with success even if allreduce verification fails,
+because correctness failure is expected.
+
+`tools/bench_sdma_ag_copy_pipe.sh` now defaults `RUN_RING_SHARD_PROBE=0`.
+
+### Next validation
+
+```bash
+git pull origin sdma-test
+bash tools/bench_ring_sdma_probe.sh
+```
+
+Look for:
+```text
+RING_SDMA_PROBE before put
+RING_SDMA_PROBE after put
+RING_SDMA_PROBE skip wait
+```
+
+---
+
 ## Entry 88 — Why ring/shard cadence can beat current fullmesh two-shot in continuous overlap
 - **Date**: 2026-05-02
 - **Context**: User questioned why ring would be better than fullmesh.
