@@ -3596,6 +3596,80 @@ passes, compare `seq_ar_ms` against the 41.5 ms pre-fusion value.
 
 ---
 
+## Entry 88 — Why ring/shard cadence can beat current fullmesh two-shot in continuous overlap
+- **Date**: 2026-05-02
+- **Context**: User questioned why ring would be better than fullmesh.
+
+### Evidence
+
+The current fullmesh two-shot path is not losing because its standalone
+sequential AR work is worse. Entry 59 showed:
+```text
+continuous seq_ar:
+  SDMA no-copy = 4.810 ms
+  RCCL         = 5.135 ms
+```
+
+So in isolation, SDMA no-copy can be faster.
+
+The failure appears in continuous service cadence. Entry 68 showed:
+```text
+avg AR service duration under continuous overlap:
+  SDMA no-copy = 1.937 ms
+  RCCL         = 1.457 ms
+
+AR-GEMM backlog over 32 sampled stages:
+  SDMA no-copy = 0.011 ms -> 29.098 ms
+  SDMA copy    = 0.013 ms -> 37.142 ms
+  RCCL         <= 1.268 ms
+```
+
+### Mechanism
+
+Fullmesh has lower hop count on paper, but the current two-shot implementation
+services a stage as large, bursty phases:
+```text
+SDMA scatter all peers -> local reduce -> cross-PE barrier -> SDMA AG all peers -> wait
+```
+
+That creates a per-stage service unit around `~1.9 ms` in continuous mode. GEMM
+produces one stage around `~1.0 ms`, so backlog grows.
+
+Ring/shard exchange can be better for this workload not because one ring has
+more peak bandwidth than fullmesh, but because it breaks work into smaller
+service units:
+```text
+round k: send/recv/reduce one shard
+round k+1: next shard
+```
+
+That lets communication and reduction progress continuously instead of waiting
+for full scatter/reduce/barrier/AG bursts. RCCL's observed behavior matches
+this: its AR service time is closer to GEMM cadence and backlog stays bounded.
+
+### Important constraint
+
+This does not mean "single ring is enough". Entry 80 showed:
+```text
+1F0R  =  47.89 GB/s
+3F0R  = 142.37 GB/s
+3F3R  = 276.19 GB/s
+6F6R  = 312.18 GB/s
+```
+
+So the implementation must use multiple bidirectional lanes. The intended
+direction is **ring/shard cadence + multiple forward/reverse lanes**, not a
+single ring and not full-peer-read.
+
+### Conclusion
+
+Fullmesh is attractive for one-shot bandwidth, but the current fullmesh
+two-shot implementation has coarse phase barriers and long per-stage service
+time under overlap. Ring/shard can win by keeping service units smaller and
+preventing AR queue backlog, provided enough bidirectional lanes are used.
+
+---
+
 ## Entry 49 — Implement integer accumulator fast path for uint32/int32 pipeline reduce
 - **Date**: 2026-04-30
 - **Commit**: _this commit_

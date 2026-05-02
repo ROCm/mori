@@ -789,6 +789,22 @@ Entry 87: fused ring reduce-scatter and allgather rounds into one kernel
 debug path remains. If correctness still fails, inspect shard index sequence;
 if it passes, compare against prior `seq_ar~41.5 ms`.
 
+### Why ring/shard can beat current fullmesh two-shot (Entry 88)
+
+Not because "ring has higher peak bandwidth" by default. Evidence:
+- Entry 59: sequential AR no-copy is already faster than RCCL (`4.810 ms` vs
+  `5.135 ms`), so standalone work is not the issue.
+- Entry 68: continuous AR service is slower: SDMA no-copy avg `1.937 ms`, RCCL
+  avg `1.457 ms`; GEMM produces stages at ~`1 ms`.
+- Backlog: SDMA no-copy AR-GEMM gap grows `0.011 -> 29.098 ms`, while RCCL stays
+  `<=1.268 ms`.
+
+Current fullmesh two-shot has coarse burst phases:
+`scatter all peers -> reduce -> cross-PE barrier -> AG all peers -> wait`.
+Ring/shard is pursued because it can make smaller service units and keep the AR
+queue from accumulating backlog. It still needs multiple bidirectional lanes:
+Entry 80 showed `3F0R=142 GB/s`, `3F3R=276 GB/s`, `6F6R=312 GB/s`.
+
 ### 当前执行纪律更新
 
 用户明确要求：催促或状态问题不能只回复状态。每轮必须实际推进 repo 变更、
