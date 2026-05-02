@@ -85,7 +85,8 @@ run_one() {
     python3 tests/python/ccl/test_allreduce.py \
       --elems "$ELEMS" \
       --iterations 1 \
-      --warmup 1 2>&1
+    --warmup 1 \
+    --ring-sdma-probe-only 2>&1
   local rc=$?
   set -e
   echo "========== ${label}_EXIT rc=$rc =========="
@@ -110,7 +111,7 @@ echo
 echo "################################################################"
 echo "## RING SDMA PROBE SUMMARY (auto-extracted from $LOG)"
 echo "################################################################"
-grep -E "========== (RS|AG|PROBE)|RING_SDMA_PROBE|FAILED|PASSED|ProcessRaisedException|Timeout|STUCK|_EXIT" "$LOG" || true
+grep -E "========== (RS|AG|PROBE)|RING_SDMA_PROBE|Ring SDMA probe|FAILED|PASSED|ProcessRaisedException|Timeout|STUCK|_EXIT" "$LOG" || true
 echo "LOG: $LOG"
 
 echo "NOTE: ring_sdma_probe does not compute allreduce; correctness failure is expected."

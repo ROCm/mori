@@ -851,6 +851,11 @@ Entry 100: ring SDMA probe now accepts `MORI_RING_SHARD_SDMA_PROBE_ROUND` and
 RS/AG rounds 0..6. Use this to isolate which round/phase differs from the
 passing single-round probe.
 
+Entry 101: added `--ring-sdma-probe-only` to `test_allreduce.py`, and
+`tools/bench_ring_sdma_probe.sh` now uses it. The ring SDMA probe no longer runs
+the full correctness/perf suite, so expected allreduce failures no longer
+pollute probe output.
+
 ### Why ring/shard can beat current fullmesh two-shot (Entry 88)
 
 Not because "ring has higher peak bandwidth" by default. Evidence:

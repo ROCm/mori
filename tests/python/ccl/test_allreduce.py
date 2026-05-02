@@ -1800,6 +1800,7 @@ def _test_allreduce(
     continuous_timeline_samples=0,
     continuous_phase_iter=-1,
     continuous_phase_stage=0,
+    ring_sdma_probe_only=False,
 ):
     """Worker function for each process."""
 
@@ -1828,6 +1829,33 @@ def _test_allreduce(
         device = torch.device(f"cuda:{rank}")
         stream = torch.cuda.Stream(device=device)
         fill_value = (my_pe + 1) * 1000
+
+        if ring_sdma_probe_only:
+            if rank == 0:
+                print("\n>>> Ring SDMA probe only: launch once, no correctness suite")
+            ar = AllreduceSdma(
+                my_pe, npes,
+                input_buffer_size=data_bytes,
+                output_buffer_size=output_buf_size,
+                copy_output_to_user=True,
+                dtype=dtype,
+            )
+            inp = torch.full((elems,), fill_value, dtype=dtype, device=device)
+            out = torch.zeros(elems, dtype=dtype, device=device)
+            torch.cuda.synchronize()
+            dist.barrier()
+            with torch.cuda.stream(stream):
+                ok_probe = ar(inp, out, elems, stream)
+            stream.synchronize()
+            torch.cuda.synchronize()
+            ok_tensor = torch.tensor([1 if ok_probe else 0], dtype=torch.int32, device=device)
+            dist.all_reduce(ok_tensor, op=dist.ReduceOp.SUM)
+            if rank == 0:
+                print(f"Ring SDMA probe launch status: {ok_tensor.item()}/{npes} ranks returned ok")
+            del ar
+            dist.barrier()
+            shmem.shmem_finalize()
+            return
 
         ok1 = _test_outplace(
             rank,
@@ -2007,6 +2035,7 @@ def test_allreduce(
     continuous_timeline_samples=0,
     continuous_phase_iter=-1,
     continuous_phase_stage=0,
+    ring_sdma_probe_only=False,
 ):
     """Run AllReduce SDMA test."""
     os.environ.setdefault("MORI_ENABLE_SDMA", "1")
@@ -2034,6 +2063,7 @@ def test_allreduce(
             continuous_timeline_samples,
             continuous_phase_iter,
             continuous_phase_stage,
+            ring_sdma_probe_only,
         ),
         nprocs=world_size,
         join=True,
@@ -2158,6 +2188,12 @@ if __name__ == "__main__":
         default=0,
         help="Stage index for --continuous-phase-iter.",
     )
+    parser.add_argument(
+        "--ring-sdma-probe-only",
+        action="store_true",
+        help="Only initialize AllreduceSdma and launch the ring SDMA probe once; "
+             "skip correctness/perf suites because the probe is diagnostic.",
+    )
     args = parser.parse_args()
     os.environ["MORI_ENABLE_SDMA"] = str(args.enable_sdma)
 
@@ -2186,6 +2222,8 @@ if __name__ == "__main__":
                       f"stage {args.continuous_phase_stage}")
         if args.sweep:
             print(f"  Size sweep      : {', '.join(f'{s}MB' for s in _SWEEP_SIZES_MB)}")
+    if args.ring_sdma_probe_only:
+        print("  Ring SDMA probe : probe-only mode (no correctness suite)")
     if args.num_stages > 0 or args.test_gemm_overlap:
         print(f"  PIPELINE_CU     : {os.environ.get('MORI_PIPELINE_CU', 'not set (default=all)')}")
     print("-" * 60)
@@ -2210,4 +2248,5 @@ if __name__ == "__main__":
         continuous_timeline_samples=args.continuous_timeline_samples,
         continuous_phase_iter=args.continuous_phase_iter,
         continuous_phase_stage=args.continuous_phase_stage,
+        ring_sdma_probe_only=args.ring_sdma_probe_only,
     )

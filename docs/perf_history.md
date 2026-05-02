@@ -4065,6 +4065,43 @@ bash tools/bench_ring_sdma_probe.sh
 
 ---
 
+## Entry 101 — Add `--ring-sdma-probe-only` to avoid full correctness suite for diagnostic probe
+- **Date**: 2026-05-02
+- **Commit**: _this commit_
+- **Context**: `tools/bench_ring_sdma_probe.sh` still invoked the full
+  `test_allreduce.py` correctness/performance suite. Since
+  `RING_SHARD_SDMA_PROBE` only sends one shard and does not compute allreduce,
+  Test1b/Test2 failures are expected and noisy.
+
+### Change
+
+Add CLI:
+```bash
+python3 tests/python/ccl/test_allreduce.py --ring-sdma-probe-only
+```
+
+In probe-only mode each rank:
+1. initializes torch distributed + shmem,
+2. constructs `AllreduceSdma`,
+3. launches `ar(inp, out, elems, stream)` once under the probe env,
+4. synchronizes,
+5. reports launch status,
+6. finalizes shmem,
+7. exits without correctness/perf suites.
+
+`tools/bench_ring_sdma_probe.sh` now uses this mode.
+
+### Next validation
+
+```bash
+git pull origin sdma-test
+bash tools/bench_ring_sdma_probe.sh
+```
+
+The output should contain only probe logs, not Test1b/Test2 allreduce failures.
+
+---
+
 ## Entry 88 — Why ring/shard cadence can beat current fullmesh two-shot in continuous overlap
 - **Date**: 2026-05-02
 - **Context**: User questioned why ring would be better than fullmesh.
