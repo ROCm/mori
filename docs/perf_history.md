@@ -4032,6 +4032,39 @@ bash tools/bench_sdma_ag_copy_pipe.sh
 
 ---
 
+## Entry 100 — Extend ring SDMA probe to sweep RS/AG rounds
+- **Date**: 2026-05-02
+- **Commit**: _this commit_
+- **Context**: Entry 97 showed a single RS round probe can submit and signal.
+  The full fused SDMA ring still hangs, so the next diagnostic must identify
+  which phase/round differs from the passing probe.
+
+### Change
+
+`RingShardSdmaProbeKernel` now accepts:
+```text
+MORI_RING_SHARD_SDMA_PROBE_ROUND=<0..6>
+MORI_RING_SHARD_SDMA_PROBE_PHASE=0|1   # 0=RS qId0, 1=AG qId1
+```
+
+`tools/bench_ring_sdma_probe.sh` now defaults `PROBE_MATRIX=1` and runs:
+```text
+RS_0..RS_6
+AG_0..AG_6
+```
+
+Each mini-run prints `before put`, `after put`, `done`, and an exit code. This
+isolates a specific phase/round if the full ring still hangs.
+
+### Next validation
+
+```bash
+git pull origin sdma-test
+bash tools/bench_ring_sdma_probe.sh
+```
+
+---
+
 ## Entry 88 — Why ring/shard cadence can beat current fullmesh two-shot in continuous overlap
 - **Date**: 2026-05-02
 - **Context**: User questioned why ring would be better than fullmesh.

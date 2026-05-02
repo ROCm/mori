@@ -846,6 +846,11 @@ submitting local put; a fast previous peer could already satisfy the current
 round, causing expected to become one too high. Full ring now samples old signal
 at round start before submit, then waits for old+1.
 
+Entry 100: ring SDMA probe now accepts `MORI_RING_SHARD_SDMA_PROBE_ROUND` and
+`MORI_RING_SHARD_SDMA_PROBE_PHASE` and `tools/bench_ring_sdma_probe.sh` sweeps
+RS/AG rounds 0..6. Use this to isolate which round/phase differs from the
+passing single-round probe.
+
 ### Why ring/shard can beat current fullmesh two-shot (Entry 88)
 
 Not because "ring has higher peak bandwidth" by default. Evidence:

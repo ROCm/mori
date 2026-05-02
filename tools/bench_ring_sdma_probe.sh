@@ -4,7 +4,7 @@
 #
 # Env overrides:
 #   REPO=/home/fizhang/test/mori SIZE_MB=256 CASE_TIMEOUT_SEC=300 \
-#   PROBE_WAIT=1 SKIP_PULL=0 SKIP_BUILD=0 bash tools/bench_ring_sdma_probe.sh
+#   PROBE_WAIT=1 PROBE_MATRIX=1 SKIP_PULL=0 SKIP_BUILD=0 bash tools/bench_ring_sdma_probe.sh
 #
 # Runs only the copy-to-user correctness path with MORI_RING_SHARD_SDMA_PROBE=1
 # to isolate SDMA submit vs signal wait. The probe is not expected to pass
@@ -19,6 +19,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${SIZE_MB:=256}"
 : "${CASE_TIMEOUT_SEC:=300}"
 : "${PROBE_WAIT:=1}"
+: "${PROBE_MATRIX:=1}"
 : "${SKIP_PULL:=0}"
 : "${SKIP_BUILD:=0}"
 
@@ -51,7 +52,7 @@ print("devices:", torch.cuda.device_count())
 PY
 git rev-parse --abbrev-ref HEAD
 git log -1 --oneline
-echo "SIZE_MB=$SIZE_MB ELEMS=$ELEMS PROBE_WAIT=$PROBE_WAIT CASE_TIMEOUT_SEC=$CASE_TIMEOUT_SEC"
+echo "SIZE_MB=$SIZE_MB ELEMS=$ELEMS PROBE_WAIT=$PROBE_WAIT PROBE_MATRIX=$PROBE_MATRIX CASE_TIMEOUT_SEC=$CASE_TIMEOUT_SEC"
 
 if [ "$SKIP_PULL" != "1" ]; then
   echo
@@ -69,25 +70,47 @@ fi
 LOG="/tmp/perf_ring_sdma_probe_$(date +%s).log"
 echo
 echo "==================== [run] LOG=$LOG ===================="
-set +e
-timeout --signal=TERM "$CASE_TIMEOUT_SEC" env \
-  MORI_RING_SHARD_DIRECT=1 \
-  MORI_RING_SHARD_SDMA_PROBE=1 \
-  MORI_RING_SHARD_CU_DEBUG=0 \
-  MORI_RING_SHARD_SDMA_PROBE_WAIT="$PROBE_WAIT" \
-  python3 tests/python/ccl/test_allreduce.py \
-    --elems "$ELEMS" \
-    --iterations 1 \
-    --warmup 1 2>&1 | tee "$LOG"
-RC=${PIPESTATUS[0]}
-set -e
+run_one() {
+  local label="$1" phase="$2" round="$3"
+  echo
+  echo "========== $label =========="
+  set +e
+  timeout --signal=TERM "$CASE_TIMEOUT_SEC" env \
+    MORI_RING_SHARD_DIRECT=1 \
+    MORI_RING_SHARD_SDMA_PROBE=1 \
+    MORI_RING_SHARD_CU_DEBUG=0 \
+    MORI_RING_SHARD_SDMA_PROBE_WAIT="$PROBE_WAIT" \
+    MORI_RING_SHARD_SDMA_PROBE_PHASE="$phase" \
+    MORI_RING_SHARD_SDMA_PROBE_ROUND="$round" \
+    python3 tests/python/ccl/test_allreduce.py \
+      --elems "$ELEMS" \
+      --iterations 1 \
+      --warmup 1 2>&1
+  local rc=$?
+  set -e
+  echo "========== ${label}_EXIT rc=$rc =========="
+  return 0
+}
+
+{
+  if [ "$PROBE_MATRIX" = "1" ]; then
+    for phase in 0 1; do
+      for round in 0 1 2 3 4 5 6; do
+        label=$([ "$phase" = "0" ] && echo "RS_${round}" || echo "AG_${round}")
+        run_one "$label" "$phase" "$round"
+      done
+    done
+  else
+    run_one "PROBE" "${MORI_RING_SHARD_SDMA_PROBE_PHASE:-0}" \
+      "${MORI_RING_SHARD_SDMA_PROBE_ROUND:-0}"
+  fi
+} | tee "$LOG"
 
 echo
 echo "################################################################"
 echo "## RING SDMA PROBE SUMMARY (auto-extracted from $LOG)"
 echo "################################################################"
-grep -E "RING_SDMA_PROBE|FAILED|PASSED|ProcessRaisedException|Timeout|STUCK" "$LOG" || true
-echo "exit_code=$RC"
+grep -E "========== (RS|AG|PROBE)|RING_SDMA_PROBE|FAILED|PASSED|ProcessRaisedException|Timeout|STUCK|_EXIT" "$LOG" || true
 echo "LOG: $LOG"
 
 echo "NOTE: ring_sdma_probe does not compute allreduce; correctness failure is expected."
