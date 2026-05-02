@@ -3530,6 +3530,39 @@ bash tools/bench_sdma_ag_copy_pipe.sh
 
 ---
 
+## Entry 86 — Ring/shard correctness debug: remove recv staging memset before SDMA writes
+- **Date**: 2026-05-02
+- **Commit**: _this commit_
+- **Context**: Entry 85 added a final-copy debug path after
+  `MORI_RING_SHARD_DIRECT=1` failed correctness. The rerun still failed,
+  meaning the ring reduce-scatter/allgather dataflow or memory visibility is
+  wrong, not just direct output writeback.
+
+### Hypothesis
+
+The ring path zeroed `output_transit_buffer_` before using it as SDMA receive
+staging. Since every received shard is overwritten by SDMA before CU reads it,
+the memset is unnecessary. It may also make the subsequent CU read observe stale
+zeros/cache state rather than the SDMA-written data.
+
+### Change
+
+Remove the ring-path `hipMemset(output_transit_buffer_)`. The receive staging
+buffer is now only written by SDMA before it is consumed.
+
+### Next validation
+
+Re-run:
+```bash
+git pull origin sdma-test
+bash tools/bench_sdma_ag_copy_pipe.sh
+```
+
+If correctness still fails, the next implementation bug to inspect is the
+reduce-scatter/allgather shard index sequence.
+
+---
+
 ## Entry 49 — Implement integer accumulator fast path for uint32/int32 pipeline reduce
 - **Date**: 2026-04-30
 - **Commit**: _this commit_

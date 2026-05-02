@@ -1169,14 +1169,6 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                 return false;
             }
             copy_input_to_transit(input, total_count, stream);
-            hipError_t zrecv = stream
-                ? hipMemsetAsync(output_transit_buffer_, 0, transit_used, stream)
-                : hipMemset(output_transit_buffer_, 0, transit_used);
-            if (zrecv != hipSuccess) {
-                fprintf(stderr, "PE %d: ring shard recv zero failed: %s\n",
-                        myPe_, hipGetErrorString(zrecv));
-                return false;
-            }
             const int rs_threads = threads;
             int rs_blocks = std::min(max_blocks_,
                                      (packedPerRank + rs_threads - 1) / rs_threads);

@@ -778,6 +778,12 @@ Classification: implementation bug. Added temporary final copy from
 ring dataflow or direct per-round output writeback is wrong. This final copy is
 debug only, not target performance shape.
 
+Entry 86: final-copy debug still indicates ring dataflow/memory visibility
+problem. Removed ring-path `hipMemset(output_transit_buffer_)` before SDMA
+receive staging; each received shard is overwritten by SDMA, and memset may
+cause stale zero/cache visibility issues. If still failing, inspect shard index
+sequence next.
+
 ### 当前执行纪律更新
 
 用户明确要求：催促或状态问题不能只回复状态。每轮必须实际推进 repo 变更、
