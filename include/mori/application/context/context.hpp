@@ -65,6 +65,12 @@ class Context {
 
   const std::vector<RdmaEndpoint>& GetRdmaEndpoints() const { return rdmaEps; }
 
+  // Create a new independent set of QP endpoints for RDMA peers (does NOT connect).
+  std::vector<RdmaEndpoint> CreateAdditionalEndpoints(int numQpPerPe);
+
+  // Exchange new endpoint handles via AllToAll, then connect RDMA QPs. Collective.
+  void ConnectAdditionalEndpoints(std::vector<RdmaEndpoint>& endpoints, int numQpPerPe);
+
  private:
   void CollectHostNames();
   void InitializePossibleTransports();
@@ -91,6 +97,9 @@ class Context {
   std::vector<RdmaEndpoint> rdmaEps;
 
   std::unique_ptr<TopoSystem> topo{nullptr};
+
+  int savedPortId{-1};
+  RdmaEndpointConfig savedEpConfig;
 };
 
 }  // namespace application
