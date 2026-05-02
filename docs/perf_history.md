@@ -3490,6 +3490,46 @@ whether the ring/shard mechanism is incomplete or wrong.
 
 ---
 
+## Entry 85 — Ring/shard direct first run failed correctness; add final-copy debug path
+- **Date**: 2026-05-02
+- **Failing commit under test**: `24058a25`
+- **Command**: `bash tools/bench_sdma_ag_copy_pipe.sh`
+
+### Failure
+
+The `MORI_RING_SHARD_DIRECT=1` run failed correctness:
+```text
+AssertionError: PE 1: AllReduce verification failed (uint32)
+```
+
+### Classification
+
+This is an **implementation bug** in the new ring/shard prototype, not a ring
+mechanism conclusion. The likely fault class is shard placement / allgather
+writeback / round indexing.
+
+### Debug fix
+
+After ring reduce-scatter + allgather rounds, the host now copies the full
+`input_transit_buffer_` accumulation buffer back to user `output`. This is a
+temporary correctness discriminator:
+- if verification still fails, the reduce-scatter/allgather ring dataflow is
+  wrong;
+- if verification passes, the ring dataflow is correct and the bug is in direct
+  per-round user-output writes, which can then be removed/fixed.
+
+This final copy is not the target performance shape.
+
+### Next validation
+
+Re-run:
+```bash
+git pull origin sdma-test
+bash tools/bench_sdma_ag_copy_pipe.sh
+```
+
+---
+
 ## Entry 49 — Implement integer accumulator fast path for uint32/int32 pipeline reduce
 - **Date**: 2026-04-30
 - **Commit**: _this commit_

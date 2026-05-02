@@ -1207,6 +1207,16 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                     myPe_, npes_, input_transit_buffer_obj_, output_transit_buffer_obj_,
                     barrierPtr_, output, total_count, r, pipeline_ag_gen_);
             }
+            hipError_t final_copy = stream
+                ? hipMemcpyAsync(output, input_transit_buffer_, total_count * dtype_size_,
+                                 hipMemcpyDeviceToDevice, stream)
+                : hipMemcpy(output, input_transit_buffer_, total_count * dtype_size_,
+                            hipMemcpyDeviceToDevice);
+            if (final_copy != hipSuccess) {
+                fprintf(stderr, "PE %d: ring shard final output copy failed: %s\n",
+                        myPe_, hipGetErrorString(final_copy));
+                return false;
+            }
         } else if (use_multilane_direct) {
             const size_t required_input_size = total_count * dtype_size_;
             if (!ensure_buffer_size(input_transit_buffer_, input_transit_buffer_ptr_,
