@@ -17,7 +17,7 @@ ulimit -c 0 || true
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${REPO:=$(cd "$SCRIPT_DIR/.." && pwd)}"
 : "${SIZE_MB:=256}"
-: "${CASE_TIMEOUT_SEC:=300}"
+: "${CASE_TIMEOUT_SEC:=60}"
 : "${PROBE_WAIT:=1}"
 : "${PROBE_MATRIX:=1}"
 : "${SKIP_PULL:=0}"

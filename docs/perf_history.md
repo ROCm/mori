@@ -4102,6 +4102,37 @@ The output should contain only probe logs, not Test1b/Test2 allreduce failures.
 
 ---
 
+## Entry 102 — Make ring SDMA waits fail-fast so device printf flushes
+- **Date**: 2026-05-02
+- **Commit**: _this commit_
+- **Context**: `bench_ring_sdma_probe.sh` hung at `RS_0` and showed no
+  `RING_SDMA_PROBE` device prints. Device-side printf is flushed when the kernel
+  exits, so an infinite wait loop hides the diagnostic output.
+
+### Change
+
+For ring SDMA waits:
+- `RingShardDirectKernel` RS wait
+- `RingShardDirectKernel` AG wait
+- `RingShardSdmaProbeKernel` wait
+
+the first stuck threshold now prints the diagnostic and returns from the kernel,
+instead of printing forever and hanging.
+
+`tools/bench_ring_sdma_probe.sh` timeout reduced from 300s to 60s.
+
+### Next validation
+
+```bash
+git pull origin sdma-test
+bash tools/bench_ring_sdma_probe.sh
+```
+
+Expected outcome: each failing phase/round should now print either `done` or a
+specific `[STUCK] ... expected/got` line before the process exits.
+
+---
+
 ## Entry 88 — Why ring/shard cadence can beat current fullmesh two-shot in continuous overlap
 - **Date**: 2026-05-02
 - **Context**: User questioned why ring would be better than fullmesh.

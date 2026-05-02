@@ -636,7 +636,7 @@ __global__ void RingShardDirectKernel(
           printf("[STUCK] PE %d RING_FUSED_RS round=%d prev=%d expected=%llu got=%llu\n",
                  myPe, round, prev, (unsigned long long)rsExpected,
                  (unsigned long long)core::AtomicLoadRelaxed(rsSig));
-          stuck = 0;
+          return;
         }
       }
     }
@@ -698,7 +698,7 @@ __global__ void RingShardDirectKernel(
           printf("[STUCK] PE %d RING_FUSED_AG round=%d prev=%d expected=%llu got=%llu\n",
                  myPe, round, prev, (unsigned long long)agExpected,
                  (unsigned long long)core::AtomicLoadRelaxed(agSig));
-          stuck = 0;
+          return;
         }
       }
     }
@@ -792,7 +792,7 @@ __global__ void RingShardSdmaProbeKernel(
         printf("[STUCK] PE %d RING_SDMA_PROBE wait prev=%d expected=%llu got=%llu\n",
                myPe, prev, (unsigned long long)expected,
                (unsigned long long)core::AtomicLoadRelaxed(sig));
-        stuck = 0;
+        return;
       }
     }
     printf("PE %d RING_SDMA_PROBE done\n", myPe);

@@ -856,6 +856,10 @@ Entry 101: added `--ring-sdma-probe-only` to `test_allreduce.py`, and
 the full correctness/perf suite, so expected allreduce failures no longer
 pollute probe output.
 
+Entry 102: probe still hid diagnostics because infinite device wait prevented
+printf flush. Ring SDMA waits now print once and return on stuck threshold;
+`bench_ring_sdma_probe.sh` timeout is 60s.
+
 ### Why ring/shard can beat current fullmesh two-shot (Entry 88)
 
 Not because "ring has higher peak bandwidth" by default. Evidence:
