@@ -789,6 +789,11 @@ Entry 87: fused ring reduce-scatter and allgather rounds into one kernel
 debug path remains. If correctness still fails, inspect shard index sequence;
 if it passes, compare against prior `seq_ar~41.5 ms`.
 
+Entry 89: fused ring kernel hung. Classification: implementation bug due missing
+grid-level synchronization between internal rounds. Fix: default
+`MORI_RING_SHARD_DIRECT` to one block for correctness-first debug, add
+`MORI_RING_SHARD_BLOCKS` override, and add stuck diagnostics for RS/AG waits.
+
 ### Why ring/shard can beat current fullmesh two-shot (Entry 88)
 
 Not because "ring has higher peak bandwidth" by default. Evidence:

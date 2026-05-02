@@ -3596,6 +3596,43 @@ passes, compare `seq_ar_ms` against the 41.5 ms pre-fusion value.
 
 ---
 
+## Entry 89 — Ring/shard fused kernel hang: force single-block correctness mode and add stuck diagnostics
+- **Date**: 2026-05-02
+- **Commit**: _this commit_
+- **Context**: After Entry 87 fused 14 host-launched ring rounds into one kernel,
+  `MORI_RING_SHARD_DIRECT=1` hung during the RING_SHARD_DIRECT case.
+
+### Classification
+
+This is an **implementation bug** in the fused ring kernel, not ring mechanism
+data. The fused kernel used multiple blocks but had no grid-level synchronization
+between internal rounds. Block 0 controls SDMA send/wait, while other blocks
+reduce/copy; without a grid barrier, round-to-round ordering is unsafe.
+
+### Change
+
+For correctness-first debugging:
+- default `MORI_RING_SHARD_DIRECT` to one block,
+- add `MORI_RING_SHARD_BLOCKS=<N>` override for later experiments,
+- add stuck diagnostics to fused RS/AG signal waits:
+  ```text
+  [STUCK] PE ... RING_FUSED_RS ...
+  [STUCK] PE ... RING_FUSED_AG ...
+  ```
+
+### Next validation
+
+Re-run:
+```bash
+git pull origin sdma-test
+bash tools/bench_sdma_ag_copy_pipe.sh
+```
+
+If single-block correctness passes, reintroduce parallelism with explicit
+inter-block round barriers. If it still fails, inspect shard index sequence.
+
+---
+
 ## Entry 88 — Why ring/shard cadence can beat current fullmesh two-shot in continuous overlap
 - **Date**: 2026-05-02
 - **Context**: User questioned why ring would be better than fullmesh.

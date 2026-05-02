@@ -1170,10 +1170,12 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
             }
             copy_input_to_transit(input, total_count, stream);
             const int rs_threads = threads;
-            int rs_blocks = std::min(max_blocks_,
-                                     (packedPerRank + rs_threads - 1) / rs_threads);
-            if (rs_blocks < 1) rs_blocks = 1;
-            if (cfg.cu_limit > 0 && cfg.cu_limit < rs_blocks) rs_blocks = cfg.cu_limit;
+            int rs_blocks = 1;
+            if (const char* e = std::getenv("MORI_RING_SHARD_BLOCKS")) {
+                int v = std::atoi(e);
+                if (v > 0) rs_blocks = v;
+            }
+            if (rs_blocks > max_blocks_) rs_blocks = max_blocks_;
             static thread_local bool s_rs_announced = false;
             if (!s_rs_announced) {
                 printf("PE %d: MORI_RING_SHARD_DIRECT=1 — dedicated ring/shard "

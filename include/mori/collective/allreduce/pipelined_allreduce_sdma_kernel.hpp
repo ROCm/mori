@@ -623,8 +623,15 @@ __global__ void RingShardDirectKernel(
     if (blockIdx.x == 0 && threadIdx.x == 0) {
       const uint64_t expected = scatterBase + static_cast<uint64_t>(round + 1);
       HSAuint64* sig = recvObj->signalPtrs + static_cast<size_t>(prev) * numQ;
+      uint64_t stuck = 0;
       while (core::AtomicLoadRelaxed(sig) < expected) {
         __builtin_amdgcn_s_sleep(1);
+        if (++stuck >= 100000000ULL) {
+          printf("[STUCK] PE %d RING_FUSED_RS round=%d prev=%d expected=%llu got=%llu\n",
+                 myPe, round, prev, (unsigned long long)expected,
+                 (unsigned long long)core::AtomicLoadRelaxed(sig));
+          stuck = 0;
+        }
       }
     }
     __syncthreads();
@@ -675,8 +682,15 @@ __global__ void RingShardDirectKernel(
     if (blockIdx.x == 0 && threadIdx.x == 0) {
       const uint64_t expected = agBase + static_cast<uint64_t>(round + 1);
       HSAuint64* sig = recvObj->signalPtrs + static_cast<size_t>(prev) * numQ + 1;
+      uint64_t stuck = 0;
       while (core::AtomicLoadRelaxed(sig) < expected) {
         __builtin_amdgcn_s_sleep(1);
+        if (++stuck >= 100000000ULL) {
+          printf("[STUCK] PE %d RING_FUSED_AG round=%d prev=%d expected=%llu got=%llu\n",
+                 myPe, round, prev, (unsigned long long)expected,
+                 (unsigned long long)core::AtomicLoadRelaxed(sig));
+          stuck = 0;
+        }
       }
     }
     __syncthreads();
