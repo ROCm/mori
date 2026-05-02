@@ -794,6 +794,11 @@ grid-level synchronization between internal rounds. Fix: default
 `MORI_RING_SHARD_DIRECT` to one block for correctness-first debug, add
 `MORI_RING_SHARD_BLOCKS` override, and add stuck diagnostics for RS/AG waits.
 
+Entry 90: one-block fused ring still hung before stuck prints, indicating likely
+stall inside SDMA submit/signal rather than explicit wait loops. Added
+`RingShardDirectCuDebugKernel`; default `MORI_RING_SHARD_CU_DEBUG=1` uses CU P2P
+stores + flags to validate shard sequence separately from SDMA queue path.
+
 ### Why ring/shard can beat current fullmesh two-shot (Entry 88)
 
 Not because "ring has higher peak bandwidth" by default. Evidence:

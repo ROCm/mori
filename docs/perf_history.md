@@ -3633,6 +3633,46 @@ inter-block round barriers. If it still fails, inspect shard index sequence.
 
 ---
 
+## Entry 90 — Ring/shard hang debug: add CU P2P-store dataflow path
+- **Date**: 2026-05-02
+- **Commit**: _this commit_
+- **Context**: Entry 89 forced one-block correctness mode and added stuck
+  diagnostics. The run still hung before any `RING_FUSED_RS/AG` print, which
+  means it likely stalls inside/around `SdmaPutThread` submission rather than in
+  the explicit wait loops.
+
+### Classification
+
+Implementation bug. Need to separate:
+- ring shard index/dataflow correctness, from
+- SDMA queue submission/signal path correctness.
+
+### Change
+
+Add `RingShardDirectCuDebugKernel` and host env:
+```bash
+MORI_RING_SHARD_CU_DEBUG=1   # default for now
+```
+
+This debug kernel:
+- uses the same ring shard order,
+- sends shard data with CU P2P stores into peer receive staging,
+- signals peer readiness via `flagsObj_`,
+- performs local reduce,
+- writes final accumulated buffer to user output.
+
+If this passes correctness, the shard sequence is valid and the bug is in the
+SDMA send/signal path. If this still fails, the shard sequence is wrong.
+
+### Next validation
+
+```bash
+git pull origin sdma-test
+bash tools/bench_sdma_ag_copy_pipe.sh
+```
+
+---
+
 ## Entry 88 — Why ring/shard cadence can beat current fullmesh two-shot in continuous overlap
 - **Date**: 2026-05-02
 - **Context**: User questioned why ring would be better than fullmesh.

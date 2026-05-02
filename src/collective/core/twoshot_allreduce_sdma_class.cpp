@@ -1183,9 +1183,19 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                        myPe_, rs_blocks, rs_threads);
                 s_rs_announced = true;
             }
-            RingShardDirectKernel<T><<<rs_blocks, rs_threads, 0, stream>>>(
-                myPe_, npes_, input_transit_buffer_obj_, output_transit_buffer_obj_,
-                output, total_count, pipeline_scatter_gen_, pipeline_ag_gen_, phase_ts_ptr);
+            const bool ring_cu_debug = []() -> bool {
+                const char* e = std::getenv("MORI_RING_SHARD_CU_DEBUG");
+                return e == nullptr || std::atoi(e) != 0;
+            }();
+            if (ring_cu_debug) {
+                RingShardDirectCuDebugKernel<T><<<rs_blocks, rs_threads, 0, stream>>>(
+                    myPe_, npes_, input_transit_buffer_obj_, output_transit_buffer_obj_,
+                    flagsObj_, output, total_count, pipeline_reduce_gen_, phase_ts_ptr);
+            } else {
+                RingShardDirectKernel<T><<<rs_blocks, rs_threads, 0, stream>>>(
+                    myPe_, npes_, input_transit_buffer_obj_, output_transit_buffer_obj_,
+                    output, total_count, pipeline_scatter_gen_, pipeline_ag_gen_, phase_ts_ptr);
+            }
             hipError_t final_copy = stream
                 ? hipMemcpyAsync(output, input_transit_buffer_, total_count * dtype_size_,
                                  hipMemcpyDeviceToDevice, stream)
