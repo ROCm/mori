@@ -243,21 +243,21 @@ void Context::InitializePossibleTransports() {
     }
 
     if (rdmaDeviceContext.get() == nullptr) assert(false && "no rdma device found");
-    // Create multiple QPs for this peer
-    application::RdmaEndpointConfig config;
-    config.portId = portId;
-    config.gidIdx = -1;
-    const char* envGidIdx = std::getenv("MORI_IB_GID_INDEX");
-    if (envGidIdx != nullptr) {
-      config.gidIdx = std::atoi(envGidIdx);
+    // Build config once, save for CreateAdditionalEndpoints reuse
+    if (savedPortId < 0) {
+      savedPortId = portId;
+      savedEpConfig.portId = portId;
+      savedEpConfig.gidIdx = -1;
+      const char* envGidIdx = std::getenv("MORI_IB_GID_INDEX");
+      if (envGidIdx != nullptr) savedEpConfig.gidIdx = std::atoi(envGidIdx);
+      savedEpConfig.maxMsgsNum = 4096;
+      uint32_t vid = rdmaDeviceContext->GetRdmaDevice()->GetDeviceAttr()->orig_attr.vendor_id;
+      savedEpConfig.maxCqeNum = (vid == static_cast<uint32_t>(RdmaDeviceVendorId::Broadcom)) ? 1 : 4096;
+      savedEpConfig.alignment = 4096;
+      savedEpConfig.onGpu = true;
     }
-    config.maxMsgsNum = 4096;
-    uint32_t vid = rdmaDeviceContext->GetRdmaDevice()->GetDeviceAttr()->orig_attr.vendor_id;
-    config.maxCqeNum = (vid == static_cast<uint32_t>(RdmaDeviceVendorId::Broadcom)) ? 1 : 4096;
-    config.alignment = 4096;
-    config.onGpu = true;
     for (int qp = 0; qp < numQpPerPe; qp++) {
-      RdmaEndpoint ep = rdmaDeviceContext->CreateRdmaEndpoint(config);
+      RdmaEndpoint ep = rdmaDeviceContext->CreateRdmaEndpoint(savedEpConfig);
       rdmaEps.push_back(ep);
     }
     transportTypes.push_back(TransportType::RDMA);
@@ -286,6 +286,45 @@ void Context::InitializePossibleTransports() {
       int epIndex = peer * numQpPerPe + qp;
       rdmaDeviceContext->ConnectEndpoint(localToPeerEpHandles[epIndex],
                                          peerToLocalEpHandles[epIndex], qp);
+    }
+  }
+}
+
+std::vector<RdmaEndpoint> Context::CreateAdditionalEndpoints(int qpPerPe) {
+  std::vector<RdmaEndpoint> eps;
+  eps.reserve(WorldSize() * qpPerPe);
+
+  for (int i = 0; i < WorldSize(); i++) {
+    if (transportTypes[i] != TransportType::RDMA || !rdmaDeviceContext) {
+      for (int qp = 0; qp < qpPerPe; qp++) {
+        eps.push_back({});
+      }
+      continue;
+    }
+    for (int qp = 0; qp < qpPerPe; qp++) {
+      RdmaEndpoint ep = rdmaDeviceContext->CreateRdmaEndpoint(savedEpConfig);
+      eps.push_back(ep);
+    }
+  }
+  return eps;
+}
+
+void Context::ConnectAdditionalEndpoints(std::vector<RdmaEndpoint>& endpoints, int qpPerPe) {
+  int totalEps = WorldSize() * qpPerPe;
+  std::vector<RdmaEndpointHandle> localHandles(totalEps);
+  std::vector<RdmaEndpointHandle> peerHandles(totalEps);
+
+  for (int i = 0; i < totalEps; i++) {
+    localHandles[i] = endpoints[i].handle;
+  }
+
+  bootNet.AllToAll(localHandles.data(), peerHandles.data(), sizeof(RdmaEndpointHandle) * qpPerPe);
+
+  for (int peer = 0; peer < WorldSize(); peer++) {
+    if (transportTypes[peer] != TransportType::RDMA) continue;
+    for (int qp = 0; qp < qpPerPe; qp++) {
+      int idx = peer * qpPerPe + qp;
+      rdmaDeviceContext->ConnectEndpoint(localHandles[idx], peerHandles[idx], qp);
     }
   }
 }

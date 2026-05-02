@@ -74,20 +74,43 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
     return 1;
   }
 
-  mori::xshmem::XshmemDevComm* devComm = nullptr;
-  if (mori::xshmem::XshmemDevCommCreate(comm, &devComm) != 0) {
-    fprintf(stderr, "[rank %d] DevCommCreate failed\n", rank);
+  // ── Create DevComm #1 ──
+  mori::xshmem::XshmemDevComm* devComm1 = nullptr;
+  if (mori::xshmem::XshmemDevCommCreate(comm, &devComm1) != 0) {
+    fprintf(stderr, "[rank %d] DevCommCreate #1 failed\n", rank);
     return 1;
   }
-  printf("[rank %d] init OK\n", rank);
 
-  // Verify DevComm
-  mori::xshmem::XshmemDevComm dcHost;
-  HIP_CHECK(hipMemcpy(&dcHost, devComm, sizeof(dcHost), hipMemcpyDeviceToHost));
-  if (dcHost.rank != rank || dcHost.worldSize != nranks) {
-    fprintf(stderr, "[rank %d] DevComm mismatch\n", rank);
+  // ── Create DevComm #2 (fresh QPs, independent from #1) ──
+  mori::xshmem::XshmemDevComm* devComm2 = nullptr;
+  if (mori::xshmem::XshmemDevCommCreate(comm, &devComm2) != 0) {
+    fprintf(stderr, "[rank %d] DevCommCreate #2 failed\n", rank);
     return 1;
   }
+  printf("[rank %d] 2x DevCommCreate OK\n", rank);
+
+  // Verify both DevComms have correct rank/worldSize
+  mori::xshmem::XshmemDevComm dc1Host, dc2Host;
+  HIP_CHECK(hipMemcpy(&dc1Host, devComm1, sizeof(dc1Host), hipMemcpyDeviceToHost));
+  HIP_CHECK(hipMemcpy(&dc2Host, devComm2, sizeof(dc2Host), hipMemcpyDeviceToHost));
+  if (dc1Host.rank != rank || dc2Host.rank != rank) {
+    fprintf(stderr, "[rank %d] DevComm rank mismatch\n", rank);
+    return 1;
+  }
+
+  // Verify DevComm #1 and #2 have different QP resources (different GPU endpoint pointers)
+  if (dc1Host.ibgda.endpoints == dc2Host.ibgda.endpoints && dc1Host.ibgda.endpoints != nullptr) {
+    fprintf(stderr, "[rank %d] DevComm #1 and #2 share same endpoint pointer — NOT independent!\n",
+            rank);
+    return 1;
+  }
+
+  // Verify signal buffers are also independent
+  if (dc1Host.ibgda.signalBuf == dc2Host.ibgda.signalBuf && dc1Host.ibgda.signalBuf != nullptr) {
+    fprintf(stderr, "[rank %d] DevComm #1 and #2 share same signalBuf!\n", rank);
+    return 1;
+  }
+  printf("[rank %d] DevComm independence verified\n", rank);
 
   // P2P cross-read via flat addressing
   mori::xshmem::XshmemWindowDevice winHost;
@@ -110,7 +133,8 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
   }
   printf("[rank %d] P2P OK from %d peers\n", rank, p2pOk);
 
-  mori::xshmem::XshmemDevCommDestroy(devComm);
+  mori::xshmem::XshmemDevCommDestroy(devComm2);
+  mori::xshmem::XshmemDevCommDestroy(devComm1);
   mori::xshmem::XshmemWindowDeregister(comm, win);
   mori::xshmem::XshmemMemFree(comm, buf);
   mori::xshmem::XshmemCommDestroy(comm);

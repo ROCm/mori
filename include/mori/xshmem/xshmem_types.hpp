@@ -170,10 +170,6 @@ struct XshmemComm {
 
   std::vector<XshmemWindowHost*> windows;
 
-  // DevComm state: only one DevComm per Comm, created once.
-  // QP runtime state lives on GPU and cannot be safely re-snapshotted from host.
-  bool devCommCreated{false};
-
   // Window table: host shadow of GPU-side linked list (for DevCommCreate to build)
   struct WindowTableEntry {
     uintptr_t base;

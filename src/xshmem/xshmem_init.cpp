@@ -294,12 +294,6 @@ int XshmemMemFree(XshmemComm* comm, void* ptr) {
 /* ========================================================================== */
 
 int XshmemDevCommCreate(XshmemComm* comm, XshmemDevComm** outDevComm) {
-  if (comm->devCommCreated) {
-    MORI_SHMEM_ERROR("XshmemDevCommCreate: already created for this comm. "
-                     "QP runtime state lives on GPU and cannot be safely re-snapshotted. "
-                     "Destroy the old DevComm first, or use a separate Comm.");
-    return -1;
-  }
   MORI_SHMEM_TRACE("XshmemDevCommCreate: rank={}", comm->rank);
 
   XshmemDevComm hostShadow = {};
@@ -309,15 +303,30 @@ int XshmemDevCommCreate(XshmemComm* comm, XshmemDevComm** outDevComm) {
   hostShadow.perRankSize = comm->perRankSize;
   hostShadow.internalSyncPtr = comm->internalSyncGpuPtr;
 
-  // ── IBGDA Context: QP endpoints → GPU ──
+  // ── IBGDA Context: create fresh QP set (independent from previous DevComms) ──
   XshmemIbgdaContext& ibgda = hostShadow.ibgda;
   ibgda.numQpPerPe = comm->numQpPerPe;
 
   size_t numEps = static_cast<size_t>(comm->worldSize) * comm->numQpPerPe;
   shmem::ShmemRdmaEndpoint* epsGpu = nullptr;
-  if (!comm->rdmaEndpoints.empty()) {
+
+  if (comm->ctx->RdmaTransportEnabled()) {
+    // Create and connect fresh QPs (collective: all ranks must call together)
+    auto newEps = comm->ctx->CreateAdditionalEndpoints(comm->numQpPerPe);
+    comm->ctx->ConnectAdditionalEndpoints(newEps, comm->numQpPerPe);
+
+    // Convert to ShmemRdmaEndpoint format
+    std::vector<shmem::ShmemRdmaEndpoint> shmemEps(numEps);
+    for (size_t i = 0; i < numEps; i++) {
+      shmemEps[i].vendorId = newEps[i].vendorId;
+      shmemEps[i].qpn = newEps[i].handle.qpn;
+      shmemEps[i].wqHandle = newEps[i].wqHandle;
+      shmemEps[i].cqHandle = newEps[i].cqHandle;
+      shmemEps[i].atomicIbuf = newEps[i].atomicIbuf;
+    }
+
     HIP_RUNTIME_CHECK(hipMalloc(&epsGpu, numEps * sizeof(shmem::ShmemRdmaEndpoint)));
-    HIP_RUNTIME_CHECK(hipMemcpy(epsGpu, comm->rdmaEndpoints.data(),
+    HIP_RUNTIME_CHECK(hipMemcpy(epsGpu, shmemEps.data(),
                                 numEps * sizeof(shmem::ShmemRdmaEndpoint), hipMemcpyHostToDevice));
   }
   ibgda.endpoints = epsGpu;
@@ -414,7 +423,6 @@ int XshmemDevCommCreate(XshmemComm* comm, XshmemDevComm** outDevComm) {
   HIP_RUNTIME_CHECK(
       hipMemcpy(devCommGpu, &hostShadow, sizeof(XshmemDevComm), hipMemcpyHostToDevice));
 
-  comm->devCommCreated = true;
   *outDevComm = devCommGpu;
   MORI_SHMEM_INFO("XshmemDevCommCreate: rank={} devComm={} windows={} signals={} counters={} "
                   "signalBuf={} counterBuf={} signalLkey={}",
