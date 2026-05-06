@@ -4599,6 +4599,41 @@ a real SDMA atomic delivery failure for that link/round rather than the wait rac
 
 ---
 
+## Entry 111 — Gate validation to one `AG_6` case before full ring
+- **Date**: 2026-05-06
+- **Commit**: _this commit_
+
+### Context
+
+User requested not to run multiple cases blindly:
+```text
+先跑一个用例，过了再测试下1个
+```
+
+### Change
+
+`tools/bench_ring_sdma_probe.sh` now defaults to a single targeted case:
+```bash
+PROBE_MATRIX=0 PROBE_PHASE=1 PROBE_ROUND=6 REPEAT=1
+```
+
+The next validation should run only this one `AG_6` probe. If it passes, then
+run the next case: full fused ring benchmark.
+
+### Next validation
+
+First:
+```bash
+bash tools/bench_ring_sdma_probe.sh
+```
+
+Only if that passes:
+```bash
+RUN_RING_SHARD_SDMA=1 bash tools/bench_sdma_ag_copy_pipe.sh
+```
+
+---
+
 ## Entry 88 — Why ring/shard cadence can beat current fullmesh two-shot in continuous overlap
 - **Date**: 2026-05-02
 - **Context**: User questioned why ring would be better than fullmesh.

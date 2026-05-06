@@ -4,13 +4,13 @@
 #
 # Env overrides:
 #   REPO=/home/fizhang/test/mori SIZE_MB=256 CASE_TIMEOUT_SEC=300 \
-#   PROBE_WAIT=1 PROBE_MATRIX=0 PROBE_PHASE=1 PROBE_ROUND=6 REPEAT=3 \
+#   PROBE_WAIT=1 PROBE_MATRIX=0 PROBE_PHASE=1 PROBE_ROUND=6 REPEAT=1 \
 #   SKIP_PULL=0 SKIP_BUILD=0 bash tools/bench_ring_sdma_probe.sh
 #
 # Runs only the copy-to-user correctness path with MORI_RING_SHARD_SDMA_PROBE=1
 # to isolate SDMA submit vs signal wait. The probe is not expected to pass
 # allreduce correctness. PROBE_WAIT=0 checks submit only; PROBE_WAIT=1 also
-# checks signal delivery using current signal + 1.
+# checks signal delivery using generation-based expected values.
 
 set -euo pipefail
 ulimit -c 0 || true
@@ -23,7 +23,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${PROBE_MATRIX:=0}"
 : "${PROBE_PHASE:=1}"
 : "${PROBE_ROUND:=6}"
-: "${REPEAT:=3}"
+: "${REPEAT:=1}"
 : "${SKIP_PULL:=0}"
 : "${SKIP_BUILD:=0}"
 

@@ -934,6 +934,11 @@ expected `scatterBase+(npes-1)+r+1`; host advances `pipeline_scatter_gen_` by 1
 for probe and `2*(npes-1)` for full ring. Next run targeted AG6, then full ring
 if it passes.
 
+Entry 111: per user request, validation is gated one case at a time. The probe
+script default is now `PROBE_MATRIX=0 PROBE_PHASE=1 PROBE_ROUND=6 REPEAT=1`.
+Run only the single AG6 probe first; run `tools/bench_sdma_ag_copy_pipe.sh` full
+ring only if that one case passes.
+
 ### Why ring/shard can beat current fullmesh two-shot (Entry 88)
 
 Not because "ring has higher peak bandwidth" by default. Evidence:
