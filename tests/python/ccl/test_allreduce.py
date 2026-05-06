@@ -1801,6 +1801,7 @@ def _test_allreduce(
     continuous_phase_iter=-1,
     continuous_phase_stage=0,
     ring_sdma_probe_only=False,
+    copy_to_user_only=False,
 ):
     """Worker function for each process."""
 
@@ -1853,6 +1854,17 @@ def _test_allreduce(
             if rank == 0:
                 print(f"Ring SDMA probe launch status: {ok_tensor.item()}/{npes} ranks returned ok")
             del ar
+            dist.barrier()
+            shmem.shmem_finalize()
+            return
+
+        if copy_to_user_only:
+            ok_copy = _test_copy_to_user_verify(
+                rank, my_pe, npes, elems, data_bytes, output_buf_size, fill_value,
+                dtype, dtype_name, device, stream, iterations, warmup,
+            )
+            if rank == 0:
+                print(f"\n>>> Copy-to-user-only result: {'PASS' if ok_copy else 'FAIL'}")
             dist.barrier()
             shmem.shmem_finalize()
             return
@@ -2036,6 +2048,7 @@ def test_allreduce(
     continuous_phase_iter=-1,
     continuous_phase_stage=0,
     ring_sdma_probe_only=False,
+    copy_to_user_only=False,
 ):
     """Run AllReduce SDMA test."""
     os.environ.setdefault("MORI_ENABLE_SDMA", "1")
@@ -2064,6 +2077,7 @@ def test_allreduce(
             continuous_phase_iter,
             continuous_phase_stage,
             ring_sdma_probe_only,
+            copy_to_user_only,
         ),
         nprocs=world_size,
         join=True,
@@ -2194,6 +2208,11 @@ if __name__ == "__main__":
         help="Only initialize AllreduceSdma and launch the ring SDMA probe once; "
              "skip correctness/perf suites because the probe is diagnostic.",
     )
+    parser.add_argument(
+        "--copy-to-user-only",
+        action="store_true",
+        help="Run only the copy_output_to_user=True correctness test and exit.",
+    )
     args = parser.parse_args()
     os.environ["MORI_ENABLE_SDMA"] = str(args.enable_sdma)
 
@@ -2224,6 +2243,8 @@ if __name__ == "__main__":
             print(f"  Size sweep      : {', '.join(f'{s}MB' for s in _SWEEP_SIZES_MB)}")
     if args.ring_sdma_probe_only:
         print("  Ring SDMA probe : probe-only mode (no correctness suite)")
+    if args.copy_to_user_only:
+        print("  Copy-to-user only: enabled")
     if args.num_stages > 0 or args.test_gemm_overlap:
         print(f"  PIPELINE_CU     : {os.environ.get('MORI_PIPELINE_CU', 'not set (default=all)')}")
     print("-" * 60)
@@ -2249,4 +2270,5 @@ if __name__ == "__main__":
         continuous_phase_iter=args.continuous_phase_iter,
         continuous_phase_stage=args.continuous_phase_stage,
         ring_sdma_probe_only=args.ring_sdma_probe_only,
+        copy_to_user_only=args.copy_to_user_only,
     )

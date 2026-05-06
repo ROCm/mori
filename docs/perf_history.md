@@ -4690,6 +4690,66 @@ baseline/RCCL enabled.
 
 ---
 
+## Entry 113 — Full ring label fails correctness/perf; add true copy-to-user-only case
+- **Date**: 2026-05-06
+- **Commit**: _this commit_
+- **Log**: `/tmp/perf_sdma_ag_copy_pipe_1778055892.log`
+
+### Evidence
+
+The next gated case ran `RING_SHARD_SDMA`, but that label still executed the
+full `test_allreduce.py` suite internally. It failed correctness in transit
+tests and showed the fused one-block ring is not a viable performance point:
+```text
+PE 2 [inplace-transit/uint32]: FAILED! Expected 36000, got 8388608 mismatches
+First mismatch at idx 25165824: 33000
+
+RING_SHARD_SDMA wall_ms   256 MB | 213.306 | 6.244 | 5.804
+RING_SHARD_SDMA seq_ar_ms 256 MB | 210.856 | 4.839 | 5.123
+```
+
+The mismatch span is exactly one shard (`8,388,608` elements), and the first
+mismatch value `33000` is missing one rank's `3000` contribution from expected
+`36000`.
+
+### Classification
+
+Scheme-incomplete / implementation bug. The AG6 signal wait fix is valid, but
+the full fused ring path is not yet a correct or useful performance candidate:
+- the benchmark label mixed multiple subtests, so it was not a true single case;
+- the current fused ring uses one block for global ordering, making copy
+  `seq_ar` ~`210ms`;
+- correctness still shows at least one shard missing a contribution.
+
+### Change
+
+Add a true one-subtest mode to `test_allreduce.py`:
+```bash
+--copy-to-user-only
+```
+
+`tools/bench_sdma_ag_copy_pipe.sh` now supports:
+```bash
+RUN_COPY_TO_USER_ONLY=1
+```
+
+This isolates only `copy_output_to_user=True` correctness under
+`MORI_RING_SHARD_DIRECT=1`, without running no-copy/inplace/overlap tables.
+
+### Next validation
+
+Run exactly one subtest:
+```bash
+RUN_BASELINE=0 RUN_PHASE_TIMING=0 RUN_RING_SHARD_SDMA=1 RUN_COPY_TO_USER_ONLY=1 bash tools/bench_sdma_ag_copy_pipe.sh
+```
+
+If this fails, fix ring/shard dataflow before any performance benchmark. If it
+passes, the next case is a performance run with a dedicated multi-kernel or
+multi-block implementation, because the current one-block fused kernel is
+already measured at ~`210ms` seq_ar.
+
+---
+
 ## Entry 88 — Why ring/shard cadence can beat current fullmesh two-shot in continuous overlap
 - **Date**: 2026-05-02
 - **Context**: User questioned why ring would be better than fullmesh.
