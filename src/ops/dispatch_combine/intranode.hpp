@@ -225,11 +225,14 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
 /*                                    EpCombineIntraNodeKernel                                    */
 /* ---------------------------------------------------------------------------------------------- */
 template <typename T, bool UseP2PRead = true, bool EnableStdMoE = false,
-          bool UseFp8DirectCast = false>
+          bool UseFp8DirectCast = false, bool UseFp8BlockwiseQuant = false>
 __device__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
-  using TokT = std::conditional_t<UseFp8DirectCast, core::CombineInternalFp8, T>;
-  static_assert(!UseFp8DirectCast || std::is_same_v<T, hip_bfloat16>,
-                "Fp8 direct cast combine currently only supports bf16 input");
+  using TokT =
+      std::conditional_t<UseFp8DirectCast || UseFp8BlockwiseQuant, core::CombineInternalFp8, T>;
+  static_assert(!(UseFp8DirectCast && UseFp8BlockwiseQuant),
+                "Fp8 direct cast and blockwise quant are mutually exclusive");
+  static_assert((!UseFp8DirectCast && !UseFp8BlockwiseQuant) || std::is_same_v<T, hip_bfloat16>,
+                "Fp8 combine quant currently only supports bf16 input");
   const EpDispatchCombineConfig& config = args.config;
   int thdId = threadIdx.x;
   int thdNum = blockDim.x;
@@ -259,7 +262,9 @@ __device__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   const size_t hiddenBytes = hiddenDim * sizeof(TokT);
   const size_t weightBytes =
       (args.weightsBuf == nullptr) ? 0 : config.numExpertPerToken * sizeof(float);
-  const size_t combXferBytes = hiddenBytes + weightBytes;
+  const size_t scaleBytes =
+      UseFp8BlockwiseQuant ? static_cast<size_t>(config.scaleDim) * sizeof(float) : 0;
+  const size_t combXferBytes = hiddenBytes + scaleBytes + weightBytes;
 
   if constexpr (EnableStdMoE) {
 #ifdef ENABLE_STANDARD_MOE_ADAPT
@@ -268,7 +273,13 @@ __device__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   } else if constexpr (UseP2PRead) {
     if (args.config.useExternalInpBuffer) {
       for (int i = globalWarpId; i < totalRecvTokenNum; i += globalWarpNum) {
-        if constexpr (!std::is_same_v<T, TokT> && std::is_same_v<TokT, core::CombineInternalFp8>) {
+        if constexpr (UseFp8BlockwiseQuant) {
+          core::WarpQuantizeToFp8Blockwise<core::CombineInternalFp8>(
+              args.intraNodeTokBufs.combineInp->template GetAs<TokT*>() + i * hiddenDim,
+              args.shmemInpScalesMemObj->template GetAs<float*>() + i * config.scaleDim,
+              args.inpTokenBuf + i * hiddenDim, hiddenDim, config.scaleDim);
+        } else if constexpr (!std::is_same_v<T, TokT> &&
+                             std::is_same_v<TokT, core::CombineInternalFp8>) {
           core::WarpCastBf16ToCombineInternalFp8<T>(
               args.intraNodeTokBufs.combineInp->template GetAs<TokT*>() + i * hiddenDim,
               args.inpTokenBuf + i * hiddenDim, hiddenDim, laneId);
@@ -292,7 +303,13 @@ __device__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       index_t destLocalTokId = LocalTokIdFromFlatTokenIndex(config, destTokId);
       uint8_t* destStagingPtr = args.intraNodeTokBufs.combineInp->template GetAs<uint8_t*>(destPe) +
                                 SendBufSlotOffset(config, myPe, destLocalTokId) * combXferBytes;
-      if constexpr (!std::is_same_v<T, TokT> && std::is_same_v<TokT, core::CombineInternalFp8>) {
+      if constexpr (UseFp8BlockwiseQuant) {
+        core::WarpQuantizeToFp8Blockwise<core::CombineInternalFp8>(
+            reinterpret_cast<core::CombineInternalFp8*>(destStagingPtr),
+            reinterpret_cast<float*>(destStagingPtr + hiddenBytes),
+            args.inpTokenBuf + tokenIdx * hiddenDim, hiddenDim, config.scaleDim);
+      } else if constexpr (!std::is_same_v<T, TokT> &&
+                           std::is_same_v<TokT, core::CombineInternalFp8>) {
         core::WarpCastBf16ToCombineInternalFp8<T>(reinterpret_cast<TokT*>(destStagingPtr),
                                                   args.inpTokenBuf + tokenIdx * hiddenDim,
                                                   hiddenDim, laneId);
@@ -301,7 +318,7 @@ __device__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
                        args.inpTokenBuf + tokenIdx * hiddenDim, hiddenDim);
       }
       if (args.weightsBuf) {
-        core::WarpCopy(reinterpret_cast<float*>(destStagingPtr + hiddenBytes),
+        core::WarpCopy(reinterpret_cast<float*>(destStagingPtr + hiddenBytes + scaleBytes),
                        args.weightsBuf + tokenIdx * config.numExpertPerToken,
                        config.numExpertPerToken);
       }
@@ -319,6 +336,11 @@ __device__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   TokT** srcPtrs = reinterpret_cast<TokT**>(sharedMem) + warpId * config.numExpertPerToken;
   float** srcWeightsPtr = reinterpret_cast<float**>(sharedMem) +
                           warpNum * config.numExpertPerToken + warpId * config.numExpertPerToken;
+  float** srcScalePtrs = nullptr;
+  if constexpr (UseFp8BlockwiseQuant) {
+    srcScalePtrs = reinterpret_cast<float**>(sharedMem) + 2 * warpNum * config.numExpertPerToken +
+                   warpId * config.numExpertPerToken;
+  }
 
   MultiWarpIter mwIter(globalWarpNum, args.curRankNumToken, hiddenDim);
 
@@ -329,6 +351,7 @@ __device__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
     mwIter.Decode(i, tokenId, inTokenPartId, hiddenDimOffset, hiddenDimSize);
 
     // Prepare data pointers on different GPUs
+    const size_t weightOffset = hiddenBytes + scaleBytes;
     for (int j = laneId; j < config.numExpertPerToken; j += warpSize) {
       index_t destTokId = args.dispDestTokIdMap[tokenId * config.numExpertPerToken + j];
       index_t destPe = PeFromFlatTokenIndex(config, destTokId);
@@ -340,6 +363,10 @@ __device__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
                        destLocalTokId * hiddenDim + hiddenDimOffset;
           srcWeightsPtr[j] = args.shmemInpWeightsMemObj->template GetAs<float*>(destPe) +
                              destLocalTokId * config.numExpertPerToken;
+          if constexpr (UseFp8BlockwiseQuant) {
+            srcScalePtrs[j] = args.shmemInpScalesMemObj->template GetAs<float*>(destPe) +
+                              destLocalTokId * config.scaleDim;
+          }
         } else {
           srcPtrs[j] = reinterpret_cast<TokT*>(
                            args.intraNodeTokBufs.combineInp->template GetAs<uint8_t*>(myPe) +
@@ -347,11 +374,19 @@ __device__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
                        hiddenDimOffset;
           srcWeightsPtr[j] = reinterpret_cast<float*>(
               args.intraNodeTokBufs.combineInp->template GetAs<uint8_t*>(myPe) +
-              SendBufSlotOffset(config, destPe, tokenId) * combXferBytes + hiddenBytes);
+              SendBufSlotOffset(config, destPe, tokenId) * combXferBytes + weightOffset);
+          if constexpr (UseFp8BlockwiseQuant) {
+            srcScalePtrs[j] = reinterpret_cast<float*>(
+                args.intraNodeTokBufs.combineInp->template GetAs<uint8_t*>(myPe) +
+                SendBufSlotOffset(config, destPe, tokenId) * combXferBytes + hiddenBytes);
+          }
         }
       } else {
         srcPtrs[j] = nullptr;
         srcWeightsPtr[j] = nullptr;
+        if constexpr (UseFp8BlockwiseQuant) {
+          srcScalePtrs[j] = nullptr;
+        }
       }
     }
 
@@ -363,8 +398,12 @@ __device__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       {
         int isValid = 0;
         TokT* myTokPtr = nullptr;
+        float* myScalePtr = nullptr;
         if (laneId < config.numExpertPerToken) {
           myTokPtr = srcPtrs[laneId];
+          if constexpr (UseFp8BlockwiseQuant) {
+            myScalePtr = srcScalePtrs[laneId];
+          }
           isValid = (myTokPtr != nullptr) ? 1 : 0;
         }
         unsigned long long validMask = __ballot(isValid);
@@ -372,11 +411,27 @@ __device__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
         if (validAccumCount < config.numExpertPerToken && isValid) {
           int myPos = __popcll(validMask & ((1ULL << laneId) - 1));
           srcPtrs[myPos] = myTokPtr;
+          if constexpr (UseFp8BlockwiseQuant) {
+            srcScalePtrs[myPos] = myScalePtr;
+          }
         }
       }
     }
 
-    if constexpr (!std::is_same_v<T, TokT> && std::is_same_v<TokT, core::CombineInternalFp8>) {
+    if constexpr (UseFp8BlockwiseQuant) {
+      if (mwIter.warpsPerItem == 1) {
+        core::WarpAccumFp8DequantFull<T, core::CombineInternalFp8>(
+            outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
+            reinterpret_cast<const float* const*>(srcScalePtrs), validAccumCount, hiddenDim,
+            config.scaleDim);
+      } else {
+        core::WarpAccumFp8DequantSegment<T, core::CombineInternalFp8>(
+            outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
+            reinterpret_cast<const float* const*>(srcScalePtrs), validAccumCount, hiddenDimOffset,
+            hiddenDimSize, hiddenDim, config.scaleDim);
+      }
+    } else if constexpr (!std::is_same_v<T, TokT> &&
+                         std::is_same_v<TokT, core::CombineInternalFp8>) {
       core::WarpAccumCombineInternalFp8ToBf16(outPtr, reinterpret_cast<const TokT* const*>(srcPtrs),
                                               validAccumCount, laneId, hiddenDimSize);
     } else {
@@ -393,9 +448,10 @@ __device__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
 }
 
 template <typename T, bool UseP2PRead = true, bool EnableStdMoE = false,
-          bool UseFp8DirectCast = false>
+          bool UseFp8DirectCast = false, bool UseFp8BlockwiseQuant = false>
 __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
-  EpCombineIntraNodeKernel_body<T, UseP2PRead, EnableStdMoE, UseFp8DirectCast>(args);
+  EpCombineIntraNodeKernel_body<T, UseP2PRead, EnableStdMoE, UseFp8DirectCast,
+                                UseFp8BlockwiseQuant>(args);
 }
 
 }  // namespace moe

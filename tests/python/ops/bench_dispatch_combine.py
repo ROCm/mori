@@ -854,6 +854,14 @@ def _bench_dispatch_combine(
             "fp8_direct_cast quant requires combine dtype to be bfloat16, "
             f"got {combine_data_type}"
         )
+    if quant_type == "fp8_blockwise":
+        if data_type is not torch.bfloat16 or combine_data_type is not torch.bfloat16:
+            raise ValueError(
+                "fp8_blockwise quant requires dispatch and combine dtype to be bfloat16, "
+                f"got dispatch={data_type}, combine={combine_data_type}"
+            )
+        if zero_copy != 0:
+            raise ValueError("fp8_blockwise quant requires --zero-copy 0")
 
     config = mori.ops.EpDispatchCombineConfig(
         data_type=data_type,
@@ -1223,10 +1231,11 @@ if __name__ == "__main__":
         "--quant-type",
         type=str,
         default="none",
-        choices=["none", "fp8_direct_cast"],
+        choices=["none", "fp8_direct_cast", "fp8_blockwise"],
         help=(
             "Quantization method used inside Combine. "
-            "'fp8_direct_cast' is the BF16<->FP8 direct cast path."
+            "'fp8_direct_cast' is the BF16<->FP8 direct cast path; "
+            "'fp8_blockwise' is the BF16<->FP8 blockwise quant path."
         ),
     )
     parser.add_argument(
@@ -1318,6 +1327,14 @@ if __name__ == "__main__":
 
     dispatch_dtype = _DATA_TYPE_MAP[args.dtype]
     combine_dtype = _DATA_TYPE_MAP[combine_dtype_str]
+
+    if args.quant_type == "fp8_blockwise":
+        if args.dtype != "bf16" or combine_dtype_str != "bf16":
+            raise ValueError(
+                "fp8_blockwise quant requires --dtype bf16 and --combine-dtype bf16"
+            )
+        if args.zero_copy != 0:
+            raise ValueError("fp8_blockwise quant requires --zero-copy 0")
 
     base_hidden_dim = args.hidden_dim
     dispatch_hidden_dim = (

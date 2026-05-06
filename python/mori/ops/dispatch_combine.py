@@ -46,6 +46,7 @@ class EpDispatchCombineQuantType(mori_cpp.EpDispatchCombineQuantType):
 _QUANT_TYPE_MAP = {
     "none": EpDispatchCombineQuantType.None_,
     "fp8_direct_cast": EpDispatchCombineQuantType.Fp8DirectCast,
+    "fp8_blockwise": EpDispatchCombineQuantType.Fp8BlockwiseQuant,
 }
 
 
@@ -97,8 +98,8 @@ class EpDispatchCombineConfig:
         gpu_per_node: Number of GPUs per node. This affects all kernel types.
         rdma_block_num: Number of RDMA blocks for inter-node kernels.
         num_qp_per_pe: Number of queue pairs per processing element.
-        quant_type: Quantization mode. Supported string values are ``"none"``
-            and ``"fp8_direct_cast"``.
+        quant_type: Quantization mode. Supported string values are ``"none"``,
+            ``"fp8_direct_cast"``, and ``"fp8_blockwise"``.
     """
 
     data_type: (
@@ -394,9 +395,16 @@ class EpDispatchCombineOp:
         ) * 4  # sizeof(index_t)
 
     def _combine_shared_mem(self, warp_per_block):
-        """Shared memory for combine kernels: warpPerBlock * numExpertPerToken * (sizeof(T**) + sizeof(float**))."""
+        """Shared memory for combine kernels."""
+        quant_type = _normalize_quant_type(self.config.quant_type)
+        num_ptr_arrays = (
+            3 if quant_type == EpDispatchCombineQuantType.Fp8BlockwiseQuant else 2
+        )
         return (
-            warp_per_block * self.config.num_experts_per_token * (_PTR_SIZE + _PTR_SIZE)
+            warp_per_block
+            * self.config.num_experts_per_token
+            * num_ptr_arrays
+            * _PTR_SIZE
         )
 
     def _launch(self, func_name, grid, block, shared_mem, stream, args_ptr):
@@ -732,6 +740,22 @@ class EpDispatchCombineOp:
         block = (WARP_SIZE * actual_wpb,)
         shared_mem = self._combine_shared_mem(actual_wpb)
         kt = self.config.kernel_type.value
+        quant_type = _normalize_quant_type(self.config.quant_type)
+
+        if quant_type == EpDispatchCombineQuantType.Fp8BlockwiseQuant:
+            if kt != EpDispatchCombineKernelType.IntraNode.value:
+                raise ValueError(
+                    "Fp8BlockwiseQuant currently only supports IntraNode combine"
+                )
+            if sfx != "bf16":
+                raise ValueError(f"Fp8BlockwiseQuant only supports bf16, got {sfx}")
+            if not actual_use_ext:
+                raise ValueError(
+                    "Fp8BlockwiseQuant currently requires --zero-copy 0 "
+                    "(useExternalInpBuffer=True). P2P read path not yet implemented."
+                )
+            if self.config.scale_dim <= 0:
+                raise ValueError("Fp8BlockwiseQuant requires scale_dim > 0")
 
         if kt == EpDispatchCombineKernelType.InterNode.value:
             self._launch(
@@ -775,8 +799,16 @@ class EpDispatchCombineOp:
                 args_ptr,
             )
         elif kt == EpDispatchCombineKernelType.IntraNode.value:
-            if actual_use_ext:
-                quant_type = _normalize_quant_type(self.config.quant_type)
+            if quant_type == EpDispatchCombineQuantType.Fp8BlockwiseQuant:
+                self._launch(
+                    "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq",
+                    grid,
+                    block,
+                    shared_mem,
+                    stream,
+                    args_ptr,
+                )
+            elif actual_use_ext:
                 if (
                     sfx == "bf16"
                     and quant_type == EpDispatchCombineQuantType.Fp8DirectCast
@@ -810,7 +842,6 @@ class EpDispatchCombineOp:
         elif kt == EpDispatchCombineKernelType.AsyncLL.value:
             mp = self._handle_info["multi_processor_count"]
             mp_aligned = mp // self.config.world_size * self.config.world_size
-            quant_type = _normalize_quant_type(self.config.quant_type)
             if sfx == "bf16" and quant_type == EpDispatchCombineQuantType.Fp8DirectCast:
                 self._launch_multi(
                     [

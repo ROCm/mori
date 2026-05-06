@@ -304,6 +304,7 @@ void RegisterMoriOps(py::module_& m) {
   pybind11::enum_<mori::moe::QuantType>(m, "EpDispatchCombineQuantType")
       .value("None_", mori::moe::QuantType::None)
       .value("Fp8DirectCast", mori::moe::QuantType::Fp8DirectCast)
+      .value("Fp8BlockwiseQuant", mori::moe::QuantType::Fp8BlockwiseQuant)
       .export_values();
 
   mori::pybind::RegisterAllProfilerSlots(m);

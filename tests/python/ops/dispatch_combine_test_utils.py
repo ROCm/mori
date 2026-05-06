@@ -346,16 +346,26 @@ class EpDispatchCombineTestCase:
             atol, rtol = 1e-2, 1e-2
             if getattr(self.config, "quant_type", "none") == "fp8_direct_cast":
                 atol, rtol = 1e-1, 1e-1
+            elif getattr(self.config, "quant_type", "none") == "fp8_blockwise":
+                # FP8 E4M3 quantization can exceed 5% after combine accumulation.
+                atol, rtol = 7e-2, 7e-2
             result_match = torch.allclose(
                 got.float(), expected.float(), atol=atol, rtol=rtol
             )
             if not result_match:
+                diff = (got.float() - expected.float()).abs()
+                tol = atol + rtol * expected.float().abs()
+                max_idx = int(diff.argmax().item())
                 print(f"Rank[{self.config.rank}] result mismatch for token {i}:")
                 print(
                     f"Rank[{self.config.rank}]   indices[{i}]: {all_rank_indices[self.config.rank][i].cpu().tolist()}"
                 )
                 print(f"Rank[{self.config.rank}]   pes: {pes}")
                 print(f"Rank[{self.config.rank}]   unique_pes: {unique_pes}")
+                print(
+                    f"Rank[{self.config.rank}]   max diff: idx={max_idx}, "
+                    f"diff={float(diff[max_idx])}, tol={float(tol[max_idx])}"
+                )
                 print(f"Rank[{self.config.rank}]   got: {got}")
                 print(f"Rank[{self.config.rank}]   expected : {expected}")
                 print(

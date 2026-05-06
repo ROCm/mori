@@ -166,6 +166,14 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
                            config.HiddenDimSz() * config.maxTokenTypeSize;
   size_t maxStagingSize =
       static_cast<ssize_t>(config.MaxNumTokensToRecv()) * config.MaxXferBytesPerToken();
+  if (config.kernelType == KernelType::IntraNode &&
+      config.quantType == QuantType::Fp8BlockwiseQuant) {
+    size_t blockwiseScaleBytes =
+        (config.scaleDim > 0) ? static_cast<size_t>(config.scaleDim) * sizeof(float) : 0;
+    maxStagingSize = static_cast<size_t>(config.MaxNumTokensToRecv()) *
+                     (config.HiddenBytes(config.maxTokenTypeSize) + config.IndexBytes() +
+                      config.WeightBytes() + config.SrcTokenIdBytes() + blockwiseScaleBytes);
+  }
 
   if (config.kernelType == KernelType::IntraNode) {
     auto& bufs = shmemTokBufs.emplace<ShmemBufsIntraNode>();
@@ -206,8 +214,12 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
   shmemCombineOutWeightsMemObj =
       ShmemMallocAndReturnMemObjPtr(maxWeightSize, hipDeviceMallocUncached);
 
-  if ((config.scaleDim > 0) && (config.scaleTypeSize > 0)) {
-    size_t maxScaleSize = config.MaxNumTokensToRecv() * config.scaleDim * config.scaleTypeSize;
+  if ((config.scaleDim > 0) &&
+      ((config.scaleTypeSize > 0) || config.quantType == QuantType::Fp8BlockwiseQuant)) {
+    size_t scaleElemSizeForAlloc =
+        (config.quantType == QuantType::Fp8BlockwiseQuant) ? sizeof(float) : config.scaleTypeSize;
+    size_t maxScaleSize =
+        static_cast<size_t>(config.MaxNumTokensToRecv()) * config.scaleDim * scaleElemSizeForAlloc;
     shmemInpScalesMemObj = ShmemMallocAndReturnMemObjPtr(maxScaleSize, hipDeviceMallocUncached);
     shmemOutScalesMemObj = ShmemMallocAndReturnMemObjPtr(maxScaleSize, hipDeviceMallocUncached);
   }
