@@ -4634,6 +4634,62 @@ RUN_RING_SHARD_SDMA=1 bash tools/bench_sdma_ag_copy_pipe.sh
 
 ---
 
+## Entry 112 — Single `AG_6` probe passes after generation wait fix; gate next case to full ring only
+- **Date**: 2026-05-06
+- **Commit**: _this commit_
+- **Log**: `/tmp/perf_ring_sdma_probe_1778055618.log`
+
+### Evidence
+
+The single-case `AG_6` probe after Entry 110 passed:
+```text
+label       version target after done skip stuck rc status
+AG_6_REP_1       8      8     8    8    0     0  0 PASS
+NEXT_DECISION: all probe labels passed; run full fused ring with tools/bench_sdma_ag_copy_pipe.sh.
+```
+
+Representative raw lines show the generation-based wait avoided the previous
+false `expected=2` stall:
+```text
+PE 6 RING_SDMA_PROBE wait target qId=0 base=0 before=1 expected=1
+PE 6 RING_SDMA_PROBE after put
+PE 6 RING_SDMA_PROBE done
+
+PE 4 RING_SDMA_PROBE wait target qId=0 base=0 before=1 expected=1
+PE 4 RING_SDMA_PROBE after put
+PE 4 RING_SDMA_PROBE done
+```
+
+### Classification
+
+Entry 110 fix is validated for the targeted `AG_6` probe. The next case is the
+full fused ring path, but it should be run alone, not mixed with baseline/phase
+cases.
+
+### Change
+
+`tools/bench_sdma_ag_copy_pipe.sh` now supports:
+```bash
+RUN_BASELINE=0
+```
+
+It also uses the project-correct build command:
+```bash
+BUILD_EXAMPLES=ON BUILD_TESTS=ON pip3 install .
+```
+
+### Next validation
+
+Run only the next case:
+```bash
+RUN_BASELINE=0 RUN_PHASE_TIMING=0 RUN_RING_SHARD_SDMA=1 bash tools/bench_sdma_ag_copy_pipe.sh
+```
+
+If this full fused ring case passes, then run a copy-vs-RCCL comparison with
+baseline/RCCL enabled.
+
+---
+
 ## Entry 88 — Why ring/shard cadence can beat current fullmesh two-shot in continuous overlap
 - **Date**: 2026-05-02
 - **Context**: User questioned why ring would be better than fullmesh.

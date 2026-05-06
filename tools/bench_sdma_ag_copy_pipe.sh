@@ -4,7 +4,7 @@
 #
 # Env overrides:
 #   REPO=/home/fizhang/test/mori SIZE_MB=256 NUM_STAGES=4 CONTINUOUS_ITERS=100 \
-#   PIPELINE_CU=224 PIPELINE_CHUNKS=4 RUN_RING_SHARD_SDMA=0 RUN_RING_SHARD_PROBE=1 RUN_RING_SHARD_DIRECT=0 RUN_RING_EXECUTOR=0 \
+#   PIPELINE_CU=224 PIPELINE_CHUNKS=4 RUN_BASELINE=1 RUN_RING_SHARD_SDMA=0 RUN_RING_SHARD_PROBE=1 RUN_RING_SHARD_DIRECT=0 RUN_RING_EXECUTOR=0 \
 #   RUN_CHUNKED_DIRECT=0 RUN_ONESHOT_DIRECT=0 \
 #   RUN_PIPE=0 PIPE_NRS="112 144 176 200" \
 #   RUN_PHASE_TIMING=1 PHASE_ITERATIONS=20 PHASE_WARMUP=5 \
@@ -28,6 +28,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${CONTINUOUS_ITERS:=100}"
 : "${PIPELINE_CU:=224}"
 : "${PIPELINE_CHUNKS:=4}"
+: "${RUN_BASELINE:=1}"
 : "${RUN_RING_SHARD_SDMA:=1}"
 : "${RUN_RING_SHARD_PROBE:=0}"
 : "${RUN_RING_SHARD_DIRECT:=0}"
@@ -58,6 +59,7 @@ command -v python3 >/dev/null || { echo "MISSING: python3"; exit 1; }
 command -v git >/dev/null || { echo "MISSING: git"; exit 1; }
 command -v cmake >/dev/null || { echo "MISSING: cmake"; exit 1; }
 command -v hipcc >/dev/null || { echo "MISSING: hipcc"; exit 1; }
+command -v pip3 >/dev/null || { echo "MISSING: pip3"; exit 1; }
 command -v timeout >/dev/null || { echo "MISSING: timeout"; exit 1; }
 FREE_KB=$(df -Pk /tmp "$REPO" | awk 'NR>1 {if (min=="" || $4<min) min=$4} END {print min+0}')
 if [ "$FREE_KB" -lt $((20 * 1024 * 1024)) ]; then
@@ -76,7 +78,7 @@ rocm-smi --showproductname 2>&1 | head -8 || true
 git rev-parse --abbrev-ref HEAD
 git log -1 --oneline
 git status --short || true
-echo "SIZE_MB=$SIZE_MB NUM_STAGES=$NUM_STAGES ELEMS=$ELEMS CONTINUOUS_ITERS=$CONTINUOUS_ITERS PIPELINE_CU=$PIPELINE_CU PIPELINE_CHUNKS=$PIPELINE_CHUNKS RUN_RING_SHARD_SDMA=$RUN_RING_SHARD_SDMA RUN_RING_SHARD_PROBE=$RUN_RING_SHARD_PROBE RUN_RING_SHARD_DIRECT=$RUN_RING_SHARD_DIRECT RUN_RING_EXECUTOR=$RUN_RING_EXECUTOR RUN_CHUNKED_DIRECT=$RUN_CHUNKED_DIRECT RUN_ONESHOT_DIRECT=$RUN_ONESHOT_DIRECT RUN_PIPE=$RUN_PIPE PIPE_NRS=$PIPE_NRS RUN_PHASE_TIMING=$RUN_PHASE_TIMING PHASE_ITERATIONS=$PHASE_ITERATIONS PHASE_WARMUP=$PHASE_WARMUP CASE_TIMEOUT_SEC=$CASE_TIMEOUT_SEC"
+echo "SIZE_MB=$SIZE_MB NUM_STAGES=$NUM_STAGES ELEMS=$ELEMS CONTINUOUS_ITERS=$CONTINUOUS_ITERS PIPELINE_CU=$PIPELINE_CU PIPELINE_CHUNKS=$PIPELINE_CHUNKS RUN_BASELINE=$RUN_BASELINE RUN_RING_SHARD_SDMA=$RUN_RING_SHARD_SDMA RUN_RING_SHARD_PROBE=$RUN_RING_SHARD_PROBE RUN_RING_SHARD_DIRECT=$RUN_RING_SHARD_DIRECT RUN_RING_EXECUTOR=$RUN_RING_EXECUTOR RUN_CHUNKED_DIRECT=$RUN_CHUNKED_DIRECT RUN_ONESHOT_DIRECT=$RUN_ONESHOT_DIRECT RUN_PIPE=$RUN_PIPE PIPE_NRS=$PIPE_NRS RUN_PHASE_TIMING=$RUN_PHASE_TIMING PHASE_ITERATIONS=$PHASE_ITERATIONS PHASE_WARMUP=$PHASE_WARMUP CASE_TIMEOUT_SEC=$CASE_TIMEOUT_SEC"
 echo "Closed-by-default probes: RUN_PIPE=$RUN_PIPE (Entry 56), RUN_RING_EXECUTOR=$RUN_RING_EXECUTOR (Entry 77), RUN_CHUNKED_DIRECT=$RUN_CHUNKED_DIRECT (Entry 73), RUN_ONESHOT_DIRECT=$RUN_ONESHOT_DIRECT (Entry 70)"
 echo "Next active implementation target: dedicated AllreduceSdma intranode ring/shard direct-output kernel (not an existing executor wrapper)."
 
@@ -90,7 +92,7 @@ fi
 if [ "$SKIP_BUILD" != "1" ]; then
   echo
   echo "==================== [pip install] ===================="
-  pip install -e .
+  BUILD_EXAMPLES=ON BUILD_TESTS=ON pip3 install .
 fi
 
 LOG="/tmp/perf_sdma_ag_copy_pipe_$(date +%s).log"
@@ -129,10 +131,15 @@ run_phase_case() {
   echo "========== HEAD =========="
   git log -1 --oneline
   echo
-  run_case "BASELINE" \
-    MORI_CONTINUOUS_PREP=0 \
-    MORI_PIPELINE_CU="$PIPELINE_CU" \
-    MORI_PIPELINE_CHUNKS="$PIPELINE_CHUNKS"
+  if [ "$RUN_BASELINE" = "1" ]; then
+    run_case "BASELINE" \
+      MORI_CONTINUOUS_PREP=0 \
+      MORI_PIPELINE_CU="$PIPELINE_CU" \
+      MORI_PIPELINE_CHUNKS="$PIPELINE_CHUNKS"
+  else
+    echo "========== BASELINE_DISABLED =========="
+    echo "RUN_BASELINE=0: skipping baseline so this run exercises only the requested case."
+  fi
 
   if [ "$RUN_RING_SHARD_SDMA" = "1" ]; then
     run_case "RING_SHARD_SDMA" \
@@ -205,11 +212,13 @@ run_phase_case() {
   fi
 
   if [ "$RUN_PHASE_TIMING" = "1" ]; then
-    run_phase_case "BASELINE_PHASE_STAGE0" \
-      MORI_CONTINUOUS_PREP=0 \
-      MORI_PIPELINE_CU="$PIPELINE_CU" \
-      MORI_PIPELINE_CHUNKS="$PIPELINE_CHUNKS" \
-      MORI_PHASE_TARGET_STAGE=0
+    if [ "$RUN_BASELINE" = "1" ]; then
+      run_phase_case "BASELINE_PHASE_STAGE0" \
+        MORI_CONTINUOUS_PREP=0 \
+        MORI_PIPELINE_CU="$PIPELINE_CU" \
+        MORI_PIPELINE_CHUNKS="$PIPELINE_CHUNKS" \
+        MORI_PHASE_TARGET_STAGE=0
+    fi
     if [ "$RUN_RING_SHARD_SDMA" = "1" ]; then
       run_phase_case "RING_SHARD_SDMA_PHASE_STAGE0" \
         MORI_CONTINUOUS_PREP=0 \

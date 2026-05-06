@@ -939,6 +939,13 @@ script default is now `PROBE_MATRIX=0 PROBE_PHASE=1 PROBE_ROUND=6 REPEAT=1`.
 Run only the single AG6 probe first; run `tools/bench_sdma_ag_copy_pipe.sh` full
 ring only if that one case passes.
 
+Entry 112: single `AG_6` probe on `/tmp/perf_ring_sdma_probe_1778055618.log`
+passed after the generation-wait fix: `version=8 target=8 after=8 done=8
+stuck=0 rc=0`. `tools/bench_sdma_ag_copy_pipe.sh` now supports
+`RUN_BASELINE=0` and uses `BUILD_EXAMPLES=ON BUILD_TESTS=ON pip3 install .`.
+Next gated case is full fused ring only:
+`RUN_BASELINE=0 RUN_PHASE_TIMING=0 RUN_RING_SHARD_SDMA=1 bash tools/bench_sdma_ag_copy_pipe.sh`.
+
 ### Why ring/shard can beat current fullmesh two-shot (Entry 88)
 
 Not because "ring has higher peak bandwidth" by default. Evidence:
