@@ -4855,6 +4855,67 @@ candidate and move to a different direct-output implementation.
 
 ---
 
+## Entry 116 — Round-kernel direct output passes with 224 blocks and improves to 10.343ms
+- **Date**: 2026-05-06
+- **Commit**: _this commit_
+- **Log**: `/tmp/perf_sdma_ag_copy_pipe_1778057231.log`
+
+### Evidence
+
+The explicit round-kernel, 224-block, copy-to-user-only case passed:
+```text
+ENV: ... MORI_RING_SHARD_ROUND_KERNELS=1 MORI_RING_SHARD_BLOCKS=224 ...
+PE ... MORI_RING_SHARD_DIRECT=1 ... blocks=224 threads=512
+
+--- Copy-to-user (uint32) Performance ---
+  Min time : 10.306 ms
+  Max time : 10.380 ms
+  Avg time : 10.343 ms
+  Algo BW  : 24.17 GB/s
+  Bus BW   : 42.30 GB/s
+
+>>> Copy-to-user-only result: PASS
+```
+
+### Progress
+
+Compared with the one-block fused scaffold:
+```text
+54.056 ms -> 10.343 ms  (43.713 ms faster, 5.23x speedup)
+```
+
+Compared with the accidental one-block round-kernel point:
+```text
+58.346 ms -> 10.343 ms  (48.003 ms faster)
+```
+
+### Classification
+
+Correctness passes and multi-block round kernels are much better than one-block
+scaffolds, but still not close enough to the COPY-vs-RCCL target. Using recent
+RCCL references in this ledger (`~5.8ms` continuous wall and `~5.1ms` seq_ar),
+the 10.343ms single-call copy-to-user time leaves roughly `+4.5ms` gap to a
+competitive path.
+
+The likely dominant costs are still:
+- 14 serialized round kernel launches (7 RS + 7 AG),
+- one SDMA shard transfer per round,
+- per-round barrier reset/launch overhead.
+
+### Next validation
+
+Run one final block-count upper-bound case:
+```bash
+RUN_BASELINE=0 RUN_PHASE_TIMING=0 RUN_RING_SHARD_SDMA=1 RUN_COPY_TO_USER_ONLY=1 \
+RUN_RING_SHARD_ROUND_KERNELS=1 RING_SHARD_BLOCKS=256 bash tools/bench_sdma_ag_copy_pipe.sh
+```
+
+If 256 blocks does not materially beat 10.343ms, stop tuning block count and move
+to a higher-gain direct-output shape (fewer round launches and/or bidirectional
+multi-lane ring).
+
+---
+
 ## Entry 88 — Why ring/shard cadence can beat current fullmesh two-shot in continuous overlap
 - **Date**: 2026-05-02
 - **Context**: User questioned why ring would be better than fullmesh.
