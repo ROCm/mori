@@ -963,6 +963,16 @@ with multi-block shard processing and qId0 generation waits. Next single case:
 `RUN_BASELINE=0 RUN_PHASE_TIMING=0 RUN_RING_SHARD_SDMA=1 RUN_COPY_TO_USER_ONLY=1
 MORI_RING_SHARD_ROUND_KERNELS=1 bash tools/bench_sdma_ag_copy_pipe.sh`.
 
+Entry 115: round-kernel copy-only on `/tmp/perf_sdma_ag_copy_pipe_1778056943.log`
+passed but regressed to `Avg time=58.346ms` vs fused scaffold `54.056ms`.
+Raw log still showed `blocks=1`, and the script did not explicitly pass/print
+`MORI_RING_SHARD_ROUND_KERNELS`, so this was not a valid multi-block performance
+point. Script now exposes `RUN_RING_SHARD_ROUND_KERNELS` and
+`RING_SHARD_BLOCKS`, passes them to the test env, and prints them in preflight.
+Next single case:
+`RUN_BASELINE=0 RUN_PHASE_TIMING=0 RUN_RING_SHARD_SDMA=1 RUN_COPY_TO_USER_ONLY=1
+RUN_RING_SHARD_ROUND_KERNELS=1 RING_SHARD_BLOCKS=224 bash tools/bench_sdma_ag_copy_pipe.sh`.
+
 ### Why ring/shard can beat current fullmesh two-shot (Entry 88)
 
 Not because "ring has higher peak bandwidth" by default. Evidence:

@@ -4800,6 +4800,61 @@ If this passes, compare its copy-to-user runtime against the one-block fused
 
 ---
 
+## Entry 115 — Round-kernel copy-only passes with one block but regresses; next test must set blocks explicitly
+- **Date**: 2026-05-06
+- **Commit**: _this commit_
+- **Log**: `/tmp/perf_sdma_ag_copy_pipe_1778056943.log`
+
+### Evidence
+
+User ran the round-kernel copy-to-user-only case:
+```text
+--- Copy-to-user (uint32) Performance ---
+  Avg time : 58.346 ms
+  Algo BW  : 4.28 GB/s
+
+>>> Copy-to-user-only result: PASS
+```
+
+The raw lines still printed:
+```text
+PE ... MORI_RING_SHARD_DIRECT=1 ... blocks=1 threads=512
+```
+
+### Classification
+
+Correctness passes, but the measured point is not a useful performance point.
+It either used the round-kernel path with `MORI_RING_SHARD_BLOCKS` unset
+(`blocks=1`), or the log was ambiguous because the script did not explicitly
+pass/print `MORI_RING_SHARD_ROUND_KERNELS`. In either case, the result regresses
+from the one-block fused scaffold (`54.056ms`) to `58.346ms` by `+4.290ms`.
+
+### Change
+
+`tools/bench_sdma_ag_copy_pipe.sh` now exposes and passes:
+```bash
+RUN_RING_SHARD_ROUND_KERNELS=<0|1>
+RING_SHARD_BLOCKS=<N>
+```
+
+For the next single case, set `RUN_RING_SHARD_ROUND_KERNELS=1` and
+`RING_SHARD_BLOCKS=224` so the raw `ENV:` line proves the intended path and the
+round kernels can use enough blocks to test whether the multi-kernel shape has
+any chance to beat the `54.056ms` scaffold.
+
+### Next validation
+
+Run exactly one subtest:
+```bash
+RUN_BASELINE=0 RUN_PHASE_TIMING=0 RUN_RING_SHARD_SDMA=1 RUN_COPY_TO_USER_ONLY=1 \
+RUN_RING_SHARD_ROUND_KERNELS=1 RING_SHARD_BLOCKS=224 bash tools/bench_sdma_ag_copy_pipe.sh
+```
+
+If this is still slower than `54.056ms`, close the round-kernel shape as a perf
+candidate and move to a different direct-output implementation.
+
+---
+
 ## Entry 88 — Why ring/shard cadence can beat current fullmesh two-shot in continuous overlap
 - **Date**: 2026-05-02
 - **Context**: User questioned why ring would be better than fullmesh.
