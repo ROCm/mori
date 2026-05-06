@@ -4750,6 +4750,56 @@ already measured at ~`210ms` seq_ar.
 
 ---
 
+## Entry 114 — Copy-to-user-only correctness passes; add round-kernel ring candidate
+- **Date**: 2026-05-06
+- **Commit**: _this commit_
+- **Log**: `/tmp/perf_sdma_ag_copy_pipe_1778056461.log`
+
+### Evidence
+
+The isolated `copy_output_to_user=True` subtest passed:
+```text
+--- Copy-to-user (uint32) Performance ---
+  Avg time : 54.056 ms
+  Algo BW  : 4.62 GB/s
+
+>>> Copy-to-user-only result: PASS
+```
+
+### Classification
+
+Correctness passes for the one-block fused ring direct-output scaffold, but its
+performance is not viable. This is not a final perf candidate; it validates the
+ring/shard dataflow enough to move to the next implementation shape.
+
+### Change
+
+Add opt-in round-kernel ring path:
+```bash
+MORI_RING_SHARD_ROUND_KERNELS=1
+```
+
+Mechanism:
+- reduce-scatter and allgather use separate per-round kernel launches, so kernel
+  boundaries provide round ordering instead of one global in-kernel loop;
+- each round can use `MORI_RING_SHARD_BLOCKS` blocks instead of the one-block
+  fused scaffold;
+- AG round kernel now uses qId0 as the validated generation signal stream;
+- host resets the per-kernel block barrier before each round launch.
+
+### Next validation
+
+Run exactly one subtest:
+```bash
+RUN_BASELINE=0 RUN_PHASE_TIMING=0 RUN_RING_SHARD_SDMA=1 RUN_COPY_TO_USER_ONLY=1 \
+MORI_RING_SHARD_ROUND_KERNELS=1 bash tools/bench_sdma_ag_copy_pipe.sh
+```
+
+If this passes, compare its copy-to-user runtime against the one-block fused
+`54.056ms` before running broader overlap benchmarks.
+
+---
+
 ## Entry 88 — Why ring/shard cadence can beat current fullmesh two-shot in continuous overlap
 - **Date**: 2026-05-02
 - **Context**: User questioned why ring would be better than fullmesh.

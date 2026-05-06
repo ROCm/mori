@@ -506,7 +506,7 @@ __global__ void RingShardAllGatherRoundKernel(
   if (sendOff + sendCnt > packedTotal) sendCnt = packedTotal - sendOff;
   const size_t sendBytes = sendCnt * sizeof(P);
   const uint32_t numQ = recvObj->sdmaNumQueue;
-  constexpr uint32_t qId = 1;
+  constexpr uint32_t qId = 0;
 
   if (blockIdx.x == 0) {
     if (threadIdx.x == 0 && sendBytes > 0) {

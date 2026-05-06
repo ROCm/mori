@@ -1191,6 +1191,10 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                 const char* e = std::getenv("MORI_RING_SHARD_SDMA_PROBE");
                 return e != nullptr && std::atoi(e) == 1;
             }();
+            const bool ring_round_kernels = []() -> bool {
+                const char* e = std::getenv("MORI_RING_SHARD_ROUND_KERNELS");
+                return e != nullptr && std::atoi(e) == 1;
+            }();
             if (ring_sdma_probe) {
                 int probe_wait = 0;
                 if (const char* e = std::getenv("MORI_RING_SHARD_SDMA_PROBE_WAIT")) {
@@ -1213,6 +1217,34 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                 RingShardDirectCuDebugKernel<T><<<rs_blocks, rs_threads, 0, stream>>>(
                     myPe_, npes_, input_transit_buffer_obj_, output_transit_buffer_obj_,
                     flagsObj_, output, total_count, pipeline_reduce_gen_, phase_ts_ptr);
+            } else if (ring_round_kernels) {
+                for (int round = 0; round < npes_ - 1; ++round) {
+                    hipError_t br = stream
+                        ? hipMemsetAsync(barrierPtr_, 0, sizeof(CrossPeBarrier), stream)
+                        : hipMemset(barrierPtr_, 0, sizeof(CrossPeBarrier));
+                    if (br != hipSuccess) {
+                        fprintf(stderr, "PE %d: ring RS barrier reset failed: %s\n",
+                                myPe_, hipGetErrorString(br));
+                        return false;
+                    }
+                    RingShardReduceScatterRoundKernel<T><<<rs_blocks, rs_threads, 0, stream>>>(
+                        myPe_, npes_, input_transit_buffer_obj_, output_transit_buffer_obj_,
+                        barrierPtr_, total_count, round, pipeline_scatter_gen_);
+                }
+                const uint64_t ag_base = pipeline_scatter_gen_ + static_cast<uint64_t>(npes_ - 1);
+                for (int round = 0; round < npes_ - 1; ++round) {
+                    hipError_t br = stream
+                        ? hipMemsetAsync(barrierPtr_, 0, sizeof(CrossPeBarrier), stream)
+                        : hipMemset(barrierPtr_, 0, sizeof(CrossPeBarrier));
+                    if (br != hipSuccess) {
+                        fprintf(stderr, "PE %d: ring AG barrier reset failed: %s\n",
+                                myPe_, hipGetErrorString(br));
+                        return false;
+                    }
+                    RingShardAllGatherRoundKernel<T><<<rs_blocks, rs_threads, 0, stream>>>(
+                        myPe_, npes_, input_transit_buffer_obj_, output_transit_buffer_obj_,
+                        barrierPtr_, output, total_count, round, ag_base);
+                }
             } else {
                 RingShardDirectKernel<T><<<rs_blocks, rs_threads, 0, stream>>>(
                     myPe_, npes_, input_transit_buffer_obj_, output_transit_buffer_obj_,
