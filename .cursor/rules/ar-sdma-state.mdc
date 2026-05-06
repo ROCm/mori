@@ -989,6 +989,11 @@ Added `tools/bench_baseline_multistage_sweep.sh`. It runs baseline
 `test_allreduce.py --num-stages 4 --sweep` with `MORI_PIPELINE_CU=224` and
 `MORI_PIPELINE_CHUNKS=4`, then extracts 2..256MB wall/gap, seq_ar, and slowdown
 tables. Next command: `bash tools/bench_baseline_multistage_sweep.sh`.
+User clarified the comparison should be bandwidth, not time. Script now prints
+bandwidth tables first: wall effective algo/bus BW and sequential AR algo/bus BW.
+For `/tmp/perf_baseline_multistage_sweep_1778061903.log`, 256MB wall algo BW is
+SDMA copy `131.60GB/s`, SDMA no-copy `139.70GB/s`, RCCL `134.72GB/s`; copy is
+`-3.12GB/s` vs RCCL and no-copy is `+4.98GB/s` vs RCCL.
 
 ### Why ring/shard can beat current fullmesh two-shot (Entry 88)
 

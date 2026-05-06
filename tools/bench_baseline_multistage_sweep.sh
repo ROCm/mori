@@ -8,7 +8,7 @@
 #   bash tools/bench_baseline_multistage_sweep.sh
 #
 # Runs baseline multi-stage size sweep and prints 2..256MB comparison tables for:
-# SDMA copy, SDMA no-copy, RCCL, copy-vs-RCCL, no-copy-vs-RCCL, copy penalty.
+# SDMA copy, SDMA no-copy, RCCL bandwidth plus timing/gap diagnostics.
 
 set -euo pipefail
 ulimit -c 0 || true
@@ -99,7 +99,7 @@ echo "## BASELINE MULTI-STAGE SWEEP SUMMARY (2..256MB)"
 echo "## Extracted from $LOG"
 echo "################################################################"
 
-awk '
+awk -v stages="$NUM_STAGES" -v npes=8 '
   /Table 1: Overlap Wall Time/ { table="wall"; next }
   /Table 2: GEMM Slowdown/ { table="slowdown"; next }
   /Table 3: Sequential AllReduce Time/ { table="seq_ar"; next }
@@ -116,6 +116,55 @@ awk '
   }
   END {
     split("2 4 8 16 32 64 128 256", sizes, " ")
+    bus_factor = 2.0 * (npes - 1.0) / npes
+    print ""
+    print "### Wall Effective Algorithm BW (GB/s)"
+    print "### Formula: NUM_STAGES * size_MB / overlap_wall_ms"
+    printf "%8s %12s %14s %12s %14s %16s\n", "MB", "SDMA copy", "SDMA no-copy", "RCCL", "copy-RCCL", "no-copy-RCCL"
+    for (i=1; i<=8; ++i) {
+      s=sizes[i]+0
+      if (!seen[s]) continue
+      copy=stages*s/data["wall",s,"copy"]
+      nocopy=stages*s/data["wall",s,"nocopy"]
+      rccl=stages*s/data["wall",s,"rccl"]
+      printf "%8d %12.2f %14.2f %12.2f %+14.2f %+16.2f\n", s, copy, nocopy, rccl, copy-rccl, nocopy-rccl
+    }
+    print ""
+    print "### Wall Effective Bus BW (GB/s)"
+    print "### Formula: algo_bw * 2*(npes-1)/npes"
+    printf "%8s %12s %14s %12s %14s %16s\n", "MB", "SDMA copy", "SDMA no-copy", "RCCL", "copy-RCCL", "no-copy-RCCL"
+    for (i=1; i<=8; ++i) {
+      s=sizes[i]+0
+      if (!seen[s]) continue
+      copy=stages*s/data["wall",s,"copy"]*bus_factor
+      nocopy=stages*s/data["wall",s,"nocopy"]*bus_factor
+      rccl=stages*s/data["wall",s,"rccl"]*bus_factor
+      printf "%8d %12.2f %14.2f %12.2f %+14.2f %+16.2f\n", s, copy, nocopy, rccl, copy-rccl, nocopy-rccl
+    }
+    print ""
+    print "### Sequential AR Algorithm BW (GB/s)"
+    print "### Formula: NUM_STAGES * size_MB / seq_ar_ms"
+    printf "%8s %12s %14s %12s %14s %16s\n", "MB", "SDMA copy", "SDMA no-copy", "RCCL", "copy-RCCL", "no-copy-RCCL"
+    for (i=1; i<=8; ++i) {
+      s=sizes[i]+0
+      if (!seen[s]) continue
+      copy=stages*s/data["seq_ar",s,"copy"]
+      nocopy=stages*s/data["seq_ar",s,"nocopy"]
+      rccl=stages*s/data["seq_ar",s,"rccl"]
+      printf "%8d %12.2f %14.2f %12.2f %+14.2f %+16.2f\n", s, copy, nocopy, rccl, copy-rccl, nocopy-rccl
+    }
+    print ""
+    print "### Sequential AR Bus BW (GB/s)"
+    print "### Formula: seq_ar_algo_bw * 2*(npes-1)/npes"
+    printf "%8s %12s %14s %12s %14s %16s\n", "MB", "SDMA copy", "SDMA no-copy", "RCCL", "copy-RCCL", "no-copy-RCCL"
+    for (i=1; i<=8; ++i) {
+      s=sizes[i]+0
+      if (!seen[s]) continue
+      copy=stages*s/data["seq_ar",s,"copy"]*bus_factor
+      nocopy=stages*s/data["seq_ar",s,"nocopy"]*bus_factor
+      rccl=stages*s/data["seq_ar",s,"rccl"]*bus_factor
+      printf "%8d %12.2f %14.2f %12.2f %+14.2f %+16.2f\n", s, copy, nocopy, rccl, copy-rccl, nocopy-rccl
+    }
     print ""
     print "### Wall ms / Gap"
     printf "%8s %12s %14s %12s %14s %16s %14s\n", "MB", "SDMA copy", "SDMA no-copy", "RCCL", "copy-RCCL", "no-copy-RCCL", "copy-penalty"

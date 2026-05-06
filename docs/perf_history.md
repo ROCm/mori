@@ -4953,10 +4953,48 @@ MORI_PIPELINE_CU=224
 MORI_PIPELINE_CHUNKS=4
 ```
 
-It extracts only `2..256MB` and prints:
+It extracts only `2..256MB` and now prints bandwidth first:
+- wall effective algorithm BW and bus BW,
+- sequential AR algorithm BW and bus BW,
 - wall ms and gaps (`copy-RCCL`, `no-copy-RCCL`, `copy-penalty`),
 - sequential AR ms,
 - GEMM slowdown.
+
+Bandwidth formulas:
+```text
+wall_algo_bw = NUM_STAGES * size_MB / overlap_wall_ms
+seq_ar_algo_bw = NUM_STAGES * size_MB / seq_ar_ms
+bus_bw = algo_bw * 2*(npes-1)/npes
+```
+
+### Data from first pasted run
+
+For `/tmp/perf_baseline_multistage_sweep_1778061903.log`, the wall effective
+algorithm BW table is:
+```text
+      MB  SDMA copy  SDMA no-copy       RCCL    copy-RCCL  no-copy-RCCL
+       2       1.97          1.97       1.97        +0.01          +0.00
+       4       3.90          3.90       3.86        +0.03          +0.03
+       8       7.62          7.66       7.51        +0.11          +0.15
+      16      14.65         14.76      14.25        +0.40          +0.51
+      32      27.21         27.63      26.83        +0.37          +0.80
+      64      47.62         48.69      47.58        +0.04          +1.10
+     128      91.82         96.26      87.16        +4.66          +9.09
+     256     131.60        139.70     134.72        -3.12          +4.98
+```
+
+Sequential AR algorithm BW table:
+```text
+      MB  SDMA copy  SDMA no-copy       RCCL    copy-RCCL  no-copy-RCCL
+       2      38.46         38.10      40.40        -1.94          -2.31
+       4      64.78         64.78      60.15        +4.63          +4.63
+       8      93.84         99.69      83.99        +9.85         +15.70
+      16     126.23        135.31     103.90       +22.34         +31.41
+      32     155.53        167.32     148.32        +7.21         +19.00
+      64     177.04        189.91     175.58        +1.46         +14.33
+     128     190.26        205.05     191.69        -1.42         +13.36
+     256     195.87        212.76     199.80        -3.94         +12.95
+```
 
 ### Next data command
 
