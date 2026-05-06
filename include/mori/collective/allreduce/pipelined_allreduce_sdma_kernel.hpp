@@ -574,6 +574,7 @@ __global__ void RingShardDirectKernel(
     uint64_t agBase,
     uint64_t* phase_ts) {
   ar_write_phase_ts(phase_ts, 0);
+  (void)agBase;
   if (elementCount == 0 || npes <= 1) return;
 
   using P = typename packed_t<T>::P;
@@ -607,13 +608,7 @@ __global__ void RingShardDirectKernel(
     if (sendOff + sendCnt > packedTotal) sendCnt = packedTotal - sendOff;
     const size_t sendBytes = sendCnt * sizeof(P);
     HSAuint64* rsSig = recvObj->signalPtrs + static_cast<size_t>(prev) * numQ;
-    uint64_t rsExpected = 0;
-    if (blockIdx.x == 0 && threadIdx.x == 0) {
-      // Capture the old value before peers can satisfy this round. Reading
-      // after submit races with a fast peer and can wait for a nonexistent
-      // future signal.
-      rsExpected = core::AtomicLoadRelaxed(rsSig) + 1ULL;
-    }
+    const uint64_t rsExpected = scatterBase + static_cast<uint64_t>(round + 1);
 
     if (blockIdx.x == 0 && threadIdx.x == 0 && sendBytes > 0) {
       anvil::SdmaQueueDeviceHandle** dh =
@@ -672,10 +667,8 @@ __global__ void RingShardDirectKernel(
     if (sendOff + sendCnt > packedTotal) sendCnt = packedTotal - sendOff;
     const size_t sendBytes = sendCnt * sizeof(P);
     HSAuint64* agSig = recvObj->signalPtrs + static_cast<size_t>(prev) * numQ;
-    uint64_t agExpected = 0;
-    if (blockIdx.x == 0 && threadIdx.x == 0) {
-      agExpected = core::AtomicLoadRelaxed(agSig) + 1ULL;
-    }
+    const uint64_t agExpected =
+        scatterBase + static_cast<uint64_t>((npes - 1) + round + 1);
 
     if (blockIdx.x == 0 && threadIdx.x == 0 && sendBytes > 0) {
       anvil::SdmaQueueDeviceHandle** dh =
@@ -762,12 +755,14 @@ __global__ void RingShardSdmaProbeKernel(
   const uint32_t numQ = recvObj->sdmaNumQueue;
   if (threadIdx.x == 0) {
     HSAuint64* sig = recvObj->signalPtrs + static_cast<size_t>(prev) * numQ;
-    const uint64_t expected = core::AtomicLoadRelaxed(sig) + 1ULL;
+    const uint64_t before = core::AtomicLoadRelaxed(sig);
+    const uint64_t expected = scatterBase + 1ULL;
     printf("PE %d RING_SDMA_PROBE version=pre_submit_wait_v2 enter phase=%s round=%d shard=%d next=%d prev=%d numQ=%u bytes=%llu base=%llu\n",
            myPe, agPhase ? "AG" : "RS", round, sendShard, next, prev, numQ,
            (unsigned long long)sendBytes, (unsigned long long)scatterBase);
-    printf("PE %d RING_SDMA_PROBE wait target qId=0 expected=%llu\n",
-           myPe, (unsigned long long)expected);
+    printf("PE %d RING_SDMA_PROBE wait target qId=0 base=%llu before=%llu expected=%llu\n",
+           myPe, (unsigned long long)scatterBase, (unsigned long long)before,
+           (unsigned long long)expected);
     if (sendBytes > 0) {
       anvil::SdmaQueueDeviceHandle** dh =
           recvObj->deviceHandles_d + static_cast<size_t>(next) * numQ;

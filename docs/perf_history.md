@@ -4470,7 +4470,7 @@ Without those two lines, do not inspect SDMA stuck lines.
 
 ## Entry 109 — Valid probe-v2 output: `AG_6` q0 signal increments are missing on some links
 - **Date**: 2026-05-06
-- **Commit**: _pending_
+- **Commit**: `a6af36cc`
 
 ### Evidence
 
@@ -4527,6 +4527,75 @@ Interpretation:
 - if only later reps show `expected=2 got=1`, the issue is residual signal state
   after a previous stuck probe and the full ring needs generation-managed waits
   rather than current-signal waits.
+
+---
+
+## Entry 110 — Valid repeated `AG_6` proves current-signal wait race; switch ring waits to generation counters
+- **Date**: 2026-05-06
+- **Commit**: _this commit_
+- **Log**: `/tmp/perf_ring_sdma_probe_1778055193.log`
+
+### Evidence
+
+The targeted repeated `AG_6` script produced valid v2 rows:
+```text
+label        version target after done skip stuck rc   status
+AG_6_REP_1         8      8     8    5    0     3 ... FAIL
+AG_6_REP_2         8      8     8    6    0     2 ... FAIL
+AG_6_REP_3         8      8     8    7    0     1 ... FAIL
+```
+
+`AG_6_REP_1` already failed, so this is not full-matrix later-label pollution.
+The raw lines show why:
+```text
+PE 7 RING_SDMA_PROBE wait target qId=0 expected=2
+PE 7 RING_SDMA_PROBE after put
+[STUCK] PE 7 RING_SDMA_PROBE wait prev=6 expected=2 got=1
+
+PE 4 RING_SDMA_PROBE wait target qId=0 expected=2
+PE 4 RING_SDMA_PROBE after put
+[STUCK] PE 4 RING_SDMA_PROBE wait prev=3 expected=2 got=1
+```
+
+Other ranks in the same launch printed `expected=1` and completed. That means
+the probe's `expected = current_signal + 1` sampled after a fast peer's signal
+had already arrived on some ranks, so those ranks waited for a nonexistent
+second signal.
+
+### Classification
+
+Implementation/synchronization bug in the diagnostic and full fused SDMA ring
+wait logic. The current-signal wait is racy across PEs because there is no
+cross-PE barrier before every rank samples the signal. Fast sender atomic can
+arrive before slow receiver samples.
+
+### Change
+
+Use host-maintained generation counters instead of current-signal sampling:
+- `RingShardSdmaProbeKernel` waits for `scatterBase + 1` and prints `base`,
+  `before`, and `expected`.
+- Full `RingShardDirectKernel` treats q0 as a single signal stream:
+  - RS round r waits `scatterBase + r + 1`
+  - AG round r waits `scatterBase + (npes - 1) + r + 1`
+- Host advances `pipeline_scatter_gen_` by `1` for probe and by
+  `2 * (npes - 1)` for the full SDMA ring path.
+- `tools/bench_ring_sdma_probe.sh` summary no longer creates bogus `_EXIT`
+  labels and accepts the new `base/before/expected` marker.
+
+### Next validation
+
+Run:
+```bash
+bash tools/bench_ring_sdma_probe.sh
+```
+
+If targeted `AG_6` passes all reps, rerun full fused ring:
+```bash
+RUN_RING_SHARD_SDMA=1 bash tools/bench_sdma_ag_copy_pipe.sh
+```
+
+If targeted `AG_6` still fails with `expected=1 got=0`, then the remaining bug is
+a real SDMA atomic delivery failure for that link/round rather than the wait race.
 
 ---
 

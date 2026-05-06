@@ -1490,11 +1490,16 @@ bool AllreduceSdma<T>::pipelined(T* input, T* output, size_t total_count,
                 const char* e = std::getenv("MORI_RING_SHARD_CU_DEBUG");
                 return e == nullptr || std::atoi(e) != 0;
             }();
-            if (ring_cu_debug) {
+            const bool ring_sdma_probe = []() -> bool {
+                const char* e = std::getenv("MORI_RING_SHARD_SDMA_PROBE");
+                return e != nullptr && std::atoi(e) == 1;
+            }();
+            if (ring_sdma_probe) {
+                pipeline_scatter_gen_ += 1;
+            } else if (ring_cu_debug) {
                 pipeline_reduce_gen_ += static_cast<uint64_t>(2 * (npes_ - 1));
             } else {
-                pipeline_scatter_gen_ += static_cast<uint64_t>(npes_ - 1);
-                pipeline_ag_gen_ += static_cast<uint64_t>(npes_ - 1);
+                pipeline_scatter_gen_ += static_cast<uint64_t>(2 * (npes_ - 1));
             }
         } else if (use_chunked_direct) {
             pipeline_reduce_gen_ += static_cast<uint64_t>(numChunks_host);

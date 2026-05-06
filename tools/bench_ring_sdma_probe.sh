@@ -60,10 +60,10 @@ git log -1 --oneline
 echo "SIZE_MB=$SIZE_MB ELEMS=$ELEMS PROBE_WAIT=$PROBE_WAIT PROBE_MATRIX=$PROBE_MATRIX PROBE_PHASE=$PROBE_PHASE PROBE_ROUND=$PROBE_ROUND REPEAT=$REPEAT CASE_TIMEOUT_SEC=$CASE_TIMEOUT_SEC"
 echo "PROBE_SCRIPT_VERSION=pre_submit_wait_v2"
 if grep -q "version=pre_submit_wait_v2" include/mori/collective/allreduce/pipelined_allreduce_sdma_kernel.hpp &&
-   grep -q "wait target qId=0 expected" include/mori/collective/allreduce/pipelined_allreduce_sdma_kernel.hpp; then
-  echo "SOURCE_FEATURE: probe version=pre_submit_wait_v2 samples signal before submit and prints wait target"
+   grep -q "wait target qId=0 base=.*before=.*expected" include/mori/collective/allreduce/pipelined_allreduce_sdma_kernel.hpp; then
+  echo "SOURCE_FEATURE: probe version=pre_submit_wait_v2 uses generation expected and prints signal before/target"
 else
-  echo "ERROR: source is missing probe version=pre_submit_wait_v2 pre-submit wait-target instrumentation"
+  echo "ERROR: source is missing probe version=pre_submit_wait_v2 generation wait-target instrumentation"
   exit 1
 fi
 
@@ -128,6 +128,14 @@ echo "## RING SDMA PROBE SUMMARY (auto-extracted from $LOG)"
 echo "################################################################"
 
 awk -v wait="$PROBE_WAIT" '
+  /^========== .*_EXIT rc=/ {
+    label = $2
+    sub(/_EXIT$/, "", label)
+    rc = $3
+    sub(/^rc=/, "", rc)
+    exit_rc[label] = rc + 0
+    next
+  }
   /^========== (RS|AG|PROBE)/ {
     label = $2
     current = label
@@ -139,18 +147,10 @@ awk -v wait="$PROBE_WAIT" '
   }
   /RING_SDMA_PROBE after put/ { after_put[current]++; next }
   /RING_SDMA_PROBE version=pre_submit_wait_v2/ { version_seen[current]++; next }
-  /RING_SDMA_PROBE wait target qId=0 expected=/ { wait_target[current]++; next }
+  /RING_SDMA_PROBE wait target qId=0 .*expected=/ { wait_target[current]++; next }
   /RING_SDMA_PROBE skip wait/ { skipped[current]++; next }
   /RING_SDMA_PROBE done/ { done[current]++; next }
   /\[STUCK\] PE .* RING_SDMA_PROBE/ { stuck[current]++; next }
-  /^========== .*_EXIT rc=/ {
-    label = $2
-    sub(/_EXIT$/, "", label)
-    rc = $3
-    sub(/^rc=/, "", rc)
-    exit_rc[label] = rc + 0
-    next
-  }
   END {
     printf "%-8s %8s %8s %8s %8s %8s %8s %8s %s\n", "label", "version", "target", "after", "done", "skip", "stuck", "rc", "status"
     bad = 0
@@ -182,7 +182,7 @@ awk -v wait="$PROBE_WAIT" '
 ' "$LOG"
 
 if ! grep -q "RING_SDMA_PROBE version=pre_submit_wait_v2" "$LOG" ||
-   ! grep -q "RING_SDMA_PROBE wait target qId=0 expected=" "$LOG"; then
+   ! grep -q "RING_SDMA_PROBE wait target qId=0 .*expected=" "$LOG"; then
   echo
   echo "BUILD_MISMATCH: runtime log has no probe version=pre_submit_wait_v2 and pre-submit wait-target markers."
   echo "BUILD_MISMATCH: rerun without SKIP_BUILD=1, and make sure this script was pulled/applied before running."

@@ -923,6 +923,17 @@ defaults to targeted repeated `AG_6` (`PROBE_MATRIX=0 PROBE_PHASE=1
 PROBE_ROUND=6 REPEAT=3`) instead of the whole matrix. Use `PROBE_MATRIX=1` only
 when revalidating all rounds after the targeted bug is fixed.
 
+Entry 110: targeted repeated `AG_6` on `/tmp/perf_ring_sdma_probe_1778055193.log`
+showed `AG_6_REP_1 version=8 target=8 after=8 done=5 stuck=3`. Raw lines show
+some ranks had `expected=2 got=1` while others had `expected=1` and completed.
+This proves the current-signal wait is racy: a fast peer atomic can arrive before
+the slow receiver samples `current_signal + 1`, making it wait for a nonexistent
+second signal. Fix implemented: probe waits `scatterBase + 1`; full fused ring
+uses q0 as one generation stream with RS expected `scatterBase+r+1` and AG
+expected `scatterBase+(npes-1)+r+1`; host advances `pipeline_scatter_gen_` by 1
+for probe and `2*(npes-1)` for full ring. Next run targeted AG6, then full ring
+if it passes.
+
 ### Why ring/shard can beat current fullmesh two-shot (Entry 88)
 
 Not because "ring has higher peak bandwidth" by default. Evidence:
