@@ -7,7 +7,7 @@
 #   PIPELINE_CU=224 PIPELINE_CHUNKS=4 CONTINUOUS_ITERS=0 SKIP_PULL=0 SKIP_BUILD=0 \
 #   bash tools/bench_baseline_multistage_sweep.sh
 #
-# Runs baseline multi-stage size sweep and prints 2..256MB comparison tables for:
+# Runs baseline multi-stage size sweep and prints 2..512MB comparison tables for:
 # SDMA copy, SDMA no-copy, RCCL bandwidth plus timing/gap diagnostics.
 
 set -euo pipefail
@@ -95,7 +95,7 @@ timeout --signal=TERM "$CASE_TIMEOUT_SEC" env \
 
 echo
 echo "################################################################"
-echo "## BASELINE MULTI-STAGE SWEEP SUMMARY (2..256MB)"
+echo "## BASELINE MULTI-STAGE SWEEP SUMMARY (2..512MB)"
 echo "## Extracted from $LOG"
 echo "################################################################"
 
@@ -104,7 +104,7 @@ awk -v stages="$NUM_STAGES" -v npes=8 '
   /Table 2: GEMM Slowdown/ { table="slowdown"; next }
   /Table 3: Sequential AllReduce Time/ { table="seq_ar"; next }
   /Table 4: Sequential GEMM Time/ { table="seq_gemm"; next }
-  $1 ~ /^(2|4|8|16|32|64|128|256)$/ && $2 == "MB" && $3 == "|" {
+  $1 ~ /^(2|4|8|16|32|64|128|256|512)$/ && $2 == "MB" && $3 == "|" {
     size=$1 + 0
     copy=$4 + 0.0
     nocopy=$6 + 0.0
@@ -115,13 +115,13 @@ awk -v stages="$NUM_STAGES" -v npes=8 '
     seen[size] = 1
   }
   END {
-    split("2 4 8 16 32 64 128 256", sizes, " ")
+    split("2 4 8 16 32 64 128 256 512", sizes, " ")
     bus_factor = 2.0 * (npes - 1.0) / npes
     print ""
     print "### Wall Effective Algorithm BW (GB/s)"
     print "### Formula: NUM_STAGES * size_MB / overlap_wall_ms"
     printf "%8s %12s %14s %12s %14s %16s\n", "MB", "SDMA copy", "SDMA no-copy", "RCCL", "copy-RCCL", "no-copy-RCCL"
-    for (i=1; i<=8; ++i) {
+    for (i=1; i<=9; ++i) {
       s=sizes[i]+0
       if (!seen[s]) continue
       copy=stages*s/data["wall",s,"copy"]
@@ -133,7 +133,7 @@ awk -v stages="$NUM_STAGES" -v npes=8 '
     print "### Wall Effective Bus BW (GB/s)"
     print "### Formula: algo_bw * 2*(npes-1)/npes"
     printf "%8s %12s %14s %12s %14s %16s\n", "MB", "SDMA copy", "SDMA no-copy", "RCCL", "copy-RCCL", "no-copy-RCCL"
-    for (i=1; i<=8; ++i) {
+    for (i=1; i<=9; ++i) {
       s=sizes[i]+0
       if (!seen[s]) continue
       copy=stages*s/data["wall",s,"copy"]*bus_factor
@@ -145,7 +145,7 @@ awk -v stages="$NUM_STAGES" -v npes=8 '
     print "### Sequential AR Algorithm BW (GB/s)"
     print "### Formula: NUM_STAGES * size_MB / seq_ar_ms"
     printf "%8s %12s %14s %12s %14s %16s\n", "MB", "SDMA copy", "SDMA no-copy", "RCCL", "copy-RCCL", "no-copy-RCCL"
-    for (i=1; i<=8; ++i) {
+    for (i=1; i<=9; ++i) {
       s=sizes[i]+0
       if (!seen[s]) continue
       copy=stages*s/data["seq_ar",s,"copy"]
@@ -157,7 +157,7 @@ awk -v stages="$NUM_STAGES" -v npes=8 '
     print "### Sequential AR Bus BW (GB/s)"
     print "### Formula: seq_ar_algo_bw * 2*(npes-1)/npes"
     printf "%8s %12s %14s %12s %14s %16s\n", "MB", "SDMA copy", "SDMA no-copy", "RCCL", "copy-RCCL", "no-copy-RCCL"
-    for (i=1; i<=8; ++i) {
+    for (i=1; i<=9; ++i) {
       s=sizes[i]+0
       if (!seen[s]) continue
       copy=stages*s/data["seq_ar",s,"copy"]*bus_factor
@@ -168,7 +168,7 @@ awk -v stages="$NUM_STAGES" -v npes=8 '
     print ""
     print "### Wall ms / Gap"
     printf "%8s %12s %14s %12s %14s %16s %14s\n", "MB", "SDMA copy", "SDMA no-copy", "RCCL", "copy-RCCL", "no-copy-RCCL", "copy-penalty"
-    for (i=1; i<=8; ++i) {
+    for (i=1; i<=9; ++i) {
       s=sizes[i]+0
       if (!seen[s]) continue
       copy=data["wall",s,"copy"]; nocopy=data["wall",s,"nocopy"]; rccl=data["wall",s,"rccl"]
@@ -177,7 +177,7 @@ awk -v stages="$NUM_STAGES" -v npes=8 '
     print ""
     print "### Sequential AllReduce ms"
     printf "%8s %12s %14s %12s\n", "MB", "SDMA copy", "SDMA no-copy", "RCCL"
-    for (i=1; i<=8; ++i) {
+    for (i=1; i<=9; ++i) {
       s=sizes[i]+0
       if (!seen[s]) continue
       printf "%8d %12.3f %14.3f %12.3f\n", s, data["seq_ar",s,"copy"], data["seq_ar",s,"nocopy"], data["seq_ar",s,"rccl"]
@@ -185,7 +185,7 @@ awk -v stages="$NUM_STAGES" -v npes=8 '
     print ""
     print "### GEMM Slowdown"
     printf "%8s %12s %14s %12s\n", "MB", "SDMA copy", "SDMA no-copy", "RCCL"
-    for (i=1; i<=8; ++i) {
+    for (i=1; i<=9; ++i) {
       s=sizes[i]+0
       if (!seen[s]) continue
       printf "%8d %12.3f %14.3f %12.3f\n", s, data["slowdown",s,"copy"], data["slowdown",s,"nocopy"], data["slowdown",s,"rccl"]

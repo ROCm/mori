@@ -987,7 +987,7 @@ Entry 117: user stopped optimization and requested baseline multi-stage size
 sweep data for `2/4/.../256MB` comparing `SDMA copy`, `SDMA no-copy`, and `RCCL`.
 Added `tools/bench_baseline_multistage_sweep.sh`. It runs baseline
 `test_allreduce.py --num-stages 4 --sweep` with `MORI_PIPELINE_CU=224` and
-`MORI_PIPELINE_CHUNKS=4`, then extracts 2..256MB wall/gap, seq_ar, and slowdown
+`MORI_PIPELINE_CHUNKS=4`, then extracts 2..512MB wall/gap, seq_ar, and slowdown
 tables. Next command: `bash tools/bench_baseline_multistage_sweep.sh`.
 User clarified the comparison should be bandwidth, not time. Script now prints
 bandwidth tables first: wall effective algo/bus BW and sequential AR algo/bus BW.

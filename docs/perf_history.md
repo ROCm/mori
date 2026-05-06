@@ -4924,13 +4924,13 @@ multi-lane ring).
 
 User stopped the optimization loop and requested baseline data organization:
 ```text
-整理数据，输出BASELINE的在多STAGE时从2M/4M/.../256MB时的SDMA和RCCL COPY和非COPY数据对比
+整理数据，输出BASELINE的在多STAGE时从2M/4M/.../512MB时的SDMA和RCCL COPY和非COPY数据对比
 ```
 
 ### Existing data status
 
 The ledger contains many 256MB baseline / experiment points, but no complete
-single-run table covering `2,4,8,16,32,64,128,256MB` for baseline multi-stage
+single-run table covering `2,4,8,16,32,64,128,256,512MB` for baseline multi-stage
 `SDMA copy`, `SDMA no-copy`, and `RCCL` under the same run.
 
 ### Change
@@ -4953,7 +4953,7 @@ MORI_PIPELINE_CU=224
 MORI_PIPELINE_CHUNKS=4
 ```
 
-It extracts only `2..256MB` and now prints bandwidth first:
+It extracts only `2..512MB` and now prints bandwidth first:
 - wall effective algorithm BW and bus BW,
 - sequential AR algorithm BW and bus BW,
 - wall ms and gaps (`copy-RCCL`, `no-copy-RCCL`, `copy-penalty`),
