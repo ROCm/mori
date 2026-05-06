@@ -231,16 +231,25 @@ void RegisterMoriCcl(pybind11::module_& m) {
         "Return element size in bytes for a mori_cpp.DataType value");
 
   py::class_<mori::collective::AllGatherIntoTensor>(m, "AllGatherIntoTensor")
-      .def(py::init<int, int, size_t, size_t, bool>(), py::arg("my_pe"), py::arg("npes"),
+      .def(py::init<int, int, size_t, size_t, bool, bool>(), py::arg("my_pe"), py::arg("npes"),
            py::arg("input_buffer_size"), py::arg("output_buffer_size"),
-           py::arg("copy_output_to_user") = true,
+           py::arg("copy_output_to_user") = true, py::arg("auto_register") = false,
            "Construct with separate input/output transit buffer sizes (bytes)")
-      .def(py::init<int, int, size_t, bool>(), py::arg("my_pe"), py::arg("npes"),
+      .def(py::init<int, int, size_t, bool, bool>(), py::arg("my_pe"), py::arg("npes"),
            py::arg("transit_buffer_size") = 512 * 1024 * 1024,
-           py::arg("copy_output_to_user") = true,
+           py::arg("copy_output_to_user") = true, py::arg("auto_register") = false,
            "Construct with one combined transit buffer size (split 50/50 input/output)")
       .def_property_readonly("my_pe", &mori::collective::AllGatherIntoTensor::my_pe)
       .def_property_readonly("npes", &mori::collective::AllGatherIntoTensor::npes)
+      .def_property("auto_register",
+                    &mori::collective::AllGatherIntoTensor::auto_register,
+                    &mori::collective::AllGatherIntoTensor::set_auto_register,
+                    "Whether the class lazily registers recv buffers on first sight "
+                    "to enable the zero-copy direct-write path. Requires the recv "
+                    "buffer to be allocated as uncached device memory (e.g. via "
+                    "mori.shmem.shmem_malloc); cached PyTorch tensors will read back "
+                    "stale (all-zero) data due to GPU L2 cache vs SDMA copy-engine "
+                    "incoherence. Default is False.")
       .def(
           "__call__",
           [](mori::collective::AllGatherIntoTensor& self, uintptr_t input_ptr,

@@ -22,6 +22,7 @@
 
 #include "mori/collective/allgather/allgather_into_tensor.hpp"
 
+#include <cstdio>
 #include <stdexcept>
 
 namespace mori {
@@ -80,21 +81,66 @@ size_t bytes_to_u32_count(size_t sendcount, DataType dtype) {
 AllGatherIntoTensor::AllGatherIntoTensor(int my_pe, int npes,
                                          size_t input_buffer_size,
                                          size_t output_buffer_size,
-                                         bool copy_output_to_user)
+                                         bool copy_output_to_user,
+                                         bool auto_register)
     : my_pe_(my_pe),
       npes_(npes),
+      auto_register_(auto_register),
       impl_(std::make_unique<AllgatherSdma<uint32_t>>(
           my_pe, npes, input_buffer_size, output_buffer_size, copy_output_to_user)) {}
 
 AllGatherIntoTensor::AllGatherIntoTensor(int my_pe, int npes,
                                          size_t transit_buffer_size,
-                                         bool copy_output_to_user)
+                                         bool copy_output_to_user,
+                                         bool auto_register)
     : my_pe_(my_pe),
       npes_(npes),
+      auto_register_(auto_register),
       impl_(std::make_unique<AllgatherSdma<uint32_t>>(
           my_pe, npes, transit_buffer_size, copy_output_to_user)) {}
 
 AllGatherIntoTensor::~AllGatherIntoTensor() = default;
+
+// ---------------------------------------------------------------------------
+// maybe_auto_register
+// ---------------------------------------------------------------------------
+//
+// Idempotent best-effort registration of ``recvbuff`` with mori's symmetric
+// memory.  Registration is collective: every rank must call
+// ShmemSymmetricRegister with matching size at the same time.  This method
+// is invoked from inside ``operator()`` / ``start_async``, the natural
+// allgather barrier point — all ranks reach it together, so the collective
+// is well-formed.
+//
+// Discipline expected from the caller:
+//   * The *sequence* of recv buffers passed across allgather calls must
+//     match across ranks (their VAs differ, their order does not).  ZeRO-3
+//     parameter prefetching satisfies this naturally.
+//   * Recv buffers must remain live until shmem_finalize().  We never
+//     deregister, so freeing a buffer and reallocating into the same VA
+//     would silently use a stale IPC mapping.  ZeRO-3's prefetch pool
+//     reuses the same buffers across steps so this is fine in practice.
+//
+// On registration failure we log once and leave the buffer unregistered;
+// the underlying AllgatherSdma falls back to its transit-buffer path,
+// which is still correct, just one hipMemcpyAsync slower.
+void AllGatherIntoTensor::maybe_auto_register(void* recvbuff, size_t output_bytes) {
+  if (!auto_register_ || recvbuff == nullptr) return;
+  if (impl_->is_output_registered(recvbuff)) return;
+  try {
+    impl_->register_output_buffer(recvbuff, output_bytes);
+  } catch (const std::exception& e) {
+    static thread_local bool warned = false;
+    if (!warned) {
+      fprintf(stderr,
+              "[mori] AllGatherIntoTensor PE %d: auto-register failed (%s); "
+              "falling back to transit-buffer path for this and future calls\n",
+              my_pe_, e.what());
+      warned = true;
+    }
+    auto_register_ = false;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // ncclAllGather-style synchronous entry point
@@ -103,6 +149,8 @@ bool AllGatherIntoTensor::operator()(const void* sendbuff, void* recvbuff,
                                      size_t sendcount, DataType dtype,
                                      hipStream_t stream) {
   size_t u32_count = bytes_to_u32_count(sendcount, dtype);
+  size_t output_bytes = sendcount * SizeOf(dtype) * static_cast<size_t>(npes_);
+  maybe_auto_register(recvbuff, output_bytes);
   // The const_cast is safe: AllgatherSdma::operator() doesn't write through
   // the input pointer; we drop const only to reuse the existing entry point
   // (NCCL has the same situation: ncclAllGather declares sendbuff const but
@@ -119,6 +167,8 @@ bool AllGatherIntoTensor::start_async(const void* sendbuff, void* recvbuff,
                                       size_t sendcount, DataType dtype,
                                       hipStream_t stream) {
   size_t u32_count = bytes_to_u32_count(sendcount, dtype);
+  size_t output_bytes = sendcount * SizeOf(dtype) * static_cast<size_t>(npes_);
+  maybe_auto_register(recvbuff, output_bytes);
   auto* in = reinterpret_cast<uint32_t*>(const_cast<void*>(sendbuff));
   auto* out = reinterpret_cast<uint32_t*>(recvbuff);
   return impl_->start_async(in, out, u32_count, stream);

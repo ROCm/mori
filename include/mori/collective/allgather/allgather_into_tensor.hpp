@@ -84,13 +84,32 @@ class AllGatherIntoTensor {
   // Same constructor flavours as AllgatherSdma: either give one combined
   // transit buffer size (split internally 50/50 between input and output),
   // or give input/output sizes separately.
+  //
+  // ``auto_register`` (default false) controls the experimental zero-copy
+  // path: the first time a given ``recvbuff`` is seen, the class
+  // internally invokes the *collective* ``register_output_buffer`` step
+  // (every rank reaches it simultaneously inside the allgather entry
+  // point, so the collective is well-formed); subsequent calls with the
+  // same buffer hit the cache and the SDMA kernel writes directly into
+  // the user's recv tensor — no transit copy.
+  //
+  // IMPORTANT: this only produces correct results if ``recvbuff`` was
+  // allocated with ``hipExtMallocWithFlags(hipDeviceMallocUncached)``
+  // (i.e. via ``mori.shmem.shmem_malloc`` or equivalent).  PyTorch's
+  // caching allocator uses cached device memory, so the SDMA copy engine
+  // writes will sit in the GPU L2 cache stale and downstream kernels
+  // read zeros.  Hence the safe default is ``false`` — the class falls
+  // back to the transit-buffer + post-memcpy path, which is byte-exact
+  // and still strictly faster than RCCL on intra-node SDMA-capable links.
   AllGatherIntoTensor(int my_pe, int npes,
                       size_t input_buffer_size, size_t output_buffer_size,
-                      bool copy_output_to_user = true);
+                      bool copy_output_to_user = true,
+                      bool auto_register = false);
 
   AllGatherIntoTensor(int my_pe, int npes,
                       size_t transit_buffer_size = 512 * 1024 * 1024,
-                      bool copy_output_to_user = true);
+                      bool copy_output_to_user = true,
+                      bool auto_register = false);
 
   ~AllGatherIntoTensor();
 
@@ -126,12 +145,24 @@ class AllGatherIntoTensor {
   int my_pe() const { return my_pe_; }
   int npes() const { return npes_; }
 
+  // Toggle the lazy auto-registration of recv buffers.  See class header
+  // comment for the collective-correctness contract.
+  void set_auto_register(bool enable) { auto_register_ = enable; }
+  bool auto_register() const { return auto_register_; }
+
   // Exposed for diagnostics / advanced reuse.
   AllgatherSdma<uint32_t>* impl() { return impl_.get(); }
 
  private:
+  // Registers ``recvbuff`` with mori's symmetric memory the first time
+  // we see it, so the next allgather kernel can write directly to the
+  // caller's tensor (zero-copy).  Idempotent and silent on failure (the
+  // call falls back to the transit-buffer path in that case).
+  void maybe_auto_register(void* recvbuff, size_t output_bytes);
+
   int my_pe_;
   int npes_;
+  bool auto_register_;
   std::unique_ptr<AllgatherSdma<uint32_t>> impl_;
 };
 
