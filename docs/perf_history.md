@@ -4171,6 +4171,303 @@ If RS/AG matrix passes, rerun full benchmark.
 
 ---
 
+## Entry 104 — `AG_6` probe output lacks pre-submit wait-target marker; rerun required
+- **Date**: 2026-05-06
+- **Commit**: _this commit_
+- **Log**: `/tmp/perf_ring_sdma_probe_1778037575.log`
+
+### Evidence
+
+User pasted the `AG_6` section:
+```text
+>>> Ring SDMA probe only: launch once, no correctness suite
+Ring SDMA probe launch status: 8/8 ranks returned ok
+PE 0 RING_SDMA_PROBE enter phase=AG round=6 shard=3 next=1 prev=7 numQ=8 bytes=33554432 base=0
+PE 0 RING_SDMA_PROBE before put ...
+PE 0 RING_SDMA_PROBE after put
+[STUCK] PE 0 RING_SDMA_PROBE wait prev=7 expected=1 got=0
+...
+========== AG_6_EXIT rc=0 ==========
+```
+
+The output does **not** include the new marker:
+```text
+RING_SDMA_PROBE wait target qId=0 expected=...
+```
+
+### Classification
+
+Implementation/diagnostic mismatch, not ring mechanism data. The pasted run
+matches the older probe that sampled `expected = current_signal + 1` after
+`SdmaPutThread`. Entry 99 already showed that this ordering is racy: a peer can
+complete before the sample, making the probe wait for a future signal that will
+not arrive in this one-round diagnostic.
+
+### Change
+
+`RingShardSdmaProbeKernel` now samples `expected` before submit and prints the
+`wait target qId=0` marker. `tools/bench_ring_sdma_probe.sh` also fails fast if
+the source lacks that marker and prints a PASS/FAIL table for all probe labels.
+
+### Next validation
+
+Rebuild and rerun the probe matrix. A valid log must contain:
+```text
+SOURCE_FEATURE: probe samples signal before submit and prints wait target
+PE ... RING_SDMA_PROBE wait target qId=0 expected=...
+```
+
+Run:
+```bash
+bash tools/bench_ring_sdma_probe.sh
+```
+
+If the matrix passes, run the full fused ring benchmark. If `AG_6` still fails
+with the marker present, the next fix is the real AG round-6 signal path rather
+than the probe sampling race.
+
+---
+
+## Entry 105 — Probe output still misses wait-target marker; fix probe script rebuild path
+- **Date**: 2026-05-06
+- **Commit**: _this commit_
+- **Log**: `/tmp/perf_ring_sdma_probe_1778038564.log`
+
+### Evidence
+
+User pasted later probe output:
+```text
+[STUCK] PE 6 RING_SDMA_PROBE wait prev=5 expected=2 got=1
+...
+PE 0 RING_SDMA_PROBE enter phase=AG round=5 ...
+PE 0 RING_SDMA_PROBE after put
+[STUCK] PE 0 RING_SDMA_PROBE wait prev=7 expected=2 got=1
+...
+========== AG_6_EXIT rc=0 ==========
+LOG: /tmp/perf_ring_sdma_probe_1778038564.log
+```
+
+Again the output lacks:
+```text
+RING_SDMA_PROBE wait target qId=0 expected=...
+```
+
+### Classification
+
+Build/diagnostic mismatch. This is still not valid ring mechanism data because
+the binary did not print the marker compiled into the current source. The likely
+cause in the probe script is that it used:
+```bash
+pip install -e .
+```
+while the project state explicitly records the reliable build command as:
+```bash
+BUILD_EXAMPLES=ON BUILD_TESTS=ON pip3 install .
+```
+
+The `expected=2 got=1` values also show that later labels ran after earlier
+probe signals had already incremented q0 once. After a label gets `[STUCK]`,
+subsequent labels in the same matrix can be polluted by incomplete/late SDMA
+work, so the first valid failing label must be diagnosed with a rebuilt binary
+and marker-present output.
+
+### Change
+
+`tools/bench_ring_sdma_probe.sh` now:
+- checks `pip3` in preflight,
+- rebuilds with `BUILD_EXAMPLES=ON BUILD_TESTS=ON pip3 install .`,
+- counts `wait target qId=0 expected=...` lines in the auto summary, and
+- requires at least 8 marker lines for a label to PASS.
+
+### Next validation
+
+Run:
+```bash
+bash tools/bench_ring_sdma_probe.sh
+```
+
+The first valid failing label is the first label whose summary row has
+`target=8`, `rc=0`, and `stuck>0`. If all labels pass, proceed to full fused ring
+benchmark.
+
+---
+
+## Entry 106 — `RS_4` pasted output also lacks runtime marker; add explicit build-mismatch verdict
+- **Date**: 2026-05-06
+- **Commit**: _this commit_
+- **Context**: User pasted an `RS_4` probe section after Entry 105.
+
+### Evidence
+
+```text
+PE 0 RING_SDMA_PROBE enter phase=RS round=4 shard=4 ...
+PE 0 RING_SDMA_PROBE after put
+PE 0 RING_SDMA_PROBE done
+...
+PE 5 RING_SDMA_PROBE enter phase=RS round=4 shard=1 ...
+PE 5 RING_SDMA_PROBE after put
+[STUCK] PE 5 RING_SDMA_PROBE wait prev=4 expected=2 got=1
+...
+========== RS_4_EXIT rc=0 ==========
+```
+
+The runtime output still lacks:
+```text
+RING_SDMA_PROBE wait target qId=0 expected=...
+```
+
+### Classification
+
+Build/diagnostic mismatch remains unresolved. This `RS_4` output is not valid
+mechanism data for the current probe source because the runtime marker is absent.
+The `expected=2 got=1` values can be explained by matrix-local q0 history after
+prior probe labels, but cannot be used to classify the ring signal mechanism
+until the marker-present binary runs.
+
+### Change
+
+`tools/bench_ring_sdma_probe.sh` now prints an explicit:
+```text
+BUILD_MISMATCH: runtime log has no pre-submit wait-target marker.
+```
+verdict if the whole log lacks the runtime marker. This prevents interpreting
+old-binary probe output as a ring/shard signal result.
+
+### Next validation
+
+Run the updated script with build enabled:
+```bash
+bash tools/bench_ring_sdma_probe.sh
+```
+
+Only logs without `BUILD_MISMATCH` and with summary `target>=8` per label are
+valid for the next mechanism decision.
+
+---
+
+## Entry 107 — `AG_5/AG_6` pasted output still old runtime; add explicit probe version tag
+- **Date**: 2026-05-06
+- **Commit**: _this commit_
+- **Log**: `/tmp/perf_ring_sdma_probe_1778039730.log`
+
+### Evidence
+
+User pasted `AG_5` / `AG_6` probe output:
+```text
+PE 6 RING_SDMA_PROBE enter phase=AG round=5 ...
+PE 6 RING_SDMA_PROBE after put
+[STUCK] PE 6 RING_SDMA_PROBE wait prev=5 expected=2 got=1
+...
+PE 1 RING_SDMA_PROBE enter phase=AG round=6 ...
+PE 1 RING_SDMA_PROBE after put
+[STUCK] PE 1 RING_SDMA_PROBE wait prev=0 expected=2 got=1
+...
+LOG: /tmp/perf_ring_sdma_probe_1778039730.log
+```
+
+The output still lacks both new runtime markers:
+```text
+RING_SDMA_PROBE wait target qId=0 expected=...
+BUILD_MISMATCH: runtime log has no pre-submit wait-target marker.
+```
+
+It also lacks the new summary table with a `target` column, so the run came from
+an old script/runtime relative to Entries 104-106.
+
+### Classification
+
+Build/checkout mismatch, not ring/shard mechanism data. The repeated
+`expected=2 got=1` on q0 cannot be used until the runtime proves it contains the
+pre-submit wait probe. Current pasted output is useful only as evidence that the
+remote command is not yet exercising the modified probe.
+
+### Change
+
+`RingShardSdmaProbeKernel` now prints an explicit runtime version in the enter
+line:
+```text
+RING_SDMA_PROBE version=pre_submit_wait_v2 enter ...
+```
+
+`tools/bench_ring_sdma_probe.sh` now:
+- validates the source contains both the version tag and wait-target marker,
+- counts `version` and `target` lines per label in the summary, and
+- prints `BUILD_MISMATCH` unless both runtime markers appear in the log.
+
+### Next validation
+
+Run the updated script with build enabled:
+```bash
+bash tools/bench_ring_sdma_probe.sh
+```
+
+A valid mechanism result must satisfy all of:
+- no `BUILD_MISMATCH`,
+- each relevant summary row has `version>=8`,
+- each relevant summary row has `target>=8`.
+
+Only then should the first `stuck>0` label be used to choose the next code fix.
+
+---
+
+## Entry 108 — Repeated `AG_5/AG_6` output confirms delivery blocker, not new SDMA data
+- **Date**: 2026-05-06
+- **Commit**: _this commit_
+- **Log**: `/tmp/perf_ring_sdma_probe_1778040930.log`
+
+### Evidence
+
+User pasted another `AG_5/AG_6` probe tail:
+```text
+PE 7 RING_SDMA_PROBE enter phase=AG round=5 ...
+[STUCK] PE 7 RING_SDMA_PROBE wait prev=6 expected=2 got=1
+...
+PE 1 RING_SDMA_PROBE enter phase=AG round=6 ...
+[STUCK] PE 1 RING_SDMA_PROBE wait prev=0 expected=2 got=1
+...
+LOG: /tmp/perf_ring_sdma_probe_1778040930.log
+```
+
+It again lacks:
+```text
+RING_SDMA_PROBE version=pre_submit_wait_v2 enter ...
+RING_SDMA_PROBE wait target qId=0 expected=...
+BUILD_MISMATCH: ...
+```
+
+### Classification
+
+Delivery/build blocker. This is the same old-runtime signature as Entries
+104-107 and does not add new SDMA mechanism evidence. The active problem is that
+the probe v2 source/script changes are not present in the remote runtime being
+tested.
+
+### Change
+
+`tools/bench_ring_sdma_probe.sh` now prints:
+```text
+PROBE_SCRIPT_VERSION=pre_submit_wait_v2
+```
+near the top of preflight, before build and run. If this line is absent, the
+remote is not running the updated script at all.
+
+### Next validation
+
+The next useful output is the first 40 lines of:
+```bash
+bash tools/bench_ring_sdma_probe.sh
+```
+
+It must include:
+```text
+PROBE_SCRIPT_VERSION=pre_submit_wait_v2
+SOURCE_FEATURE: probe version=pre_submit_wait_v2 ...
+```
+
+Without those two lines, do not inspect SDMA stuck lines.
+
+---
+
 ## Entry 88 — Why ring/shard cadence can beat current fullmesh two-shot in continuous overlap
 - **Date**: 2026-05-02
 - **Context**: User questioned why ring would be better than fullmesh.

@@ -864,6 +864,55 @@ Entry 103: AG qId1 probe failed while RS qId0 passes. Since ring RS and AG are
 sequential, ring SDMA path now uses qId0 for both RS and AG to reuse the verified
 signal path. Re-run `tools/bench_ring_sdma_probe.sh`.
 
+Entry 104: pasted `AG_6` probe log `/tmp/perf_ring_sdma_probe_1778037575.log`
+still showed `expected=1 got=0`, but lacked the new
+`RING_SDMA_PROBE wait target qId=0 expected=...` marker. Treat it as an old
+probe / not-rebuilt diagnostic mismatch, not a ring mechanism result. The probe
+now samples signal before submit and `tools/bench_ring_sdma_probe.sh` fails fast
+unless the source contains that marker, then prints an auto PASS/FAIL matrix.
+Valid next log must include `SOURCE_FEATURE: probe samples signal before submit`.
+
+Entry 105: pasted `/tmp/perf_ring_sdma_probe_1778038564.log` again lacked the
+`wait target qId=0 expected=...` marker while showing AG labels with
+`expected=2 got=1`. Classification remains build/diagnostic mismatch, not ring
+mechanism data. Root cause likely script build command: it used `pip install -e .`
+instead of the project-valid `BUILD_EXAMPLES=ON BUILD_TESTS=ON pip3 install .`.
+`tools/bench_ring_sdma_probe.sh` now uses the non-editable rebuild, checks
+`pip3`, counts marker lines as `target`, and requires `target>=8` for PASS.
+Next valid result must come from `bash tools/bench_ring_sdma_probe.sh` and
+include `target` counts in the summary.
+
+Entry 106: pasted `RS_4` output also lacked the runtime marker while showing
+`expected=2 got=1`. Classification is still build/diagnostic mismatch.
+`tools/bench_ring_sdma_probe.sh` now emits explicit `BUILD_MISMATCH` if the
+runtime log lacks `RING_SDMA_PROBE wait target qId=0 expected=...`. Do not use
+RS/AG stuck lines for mechanism decisions until the log has no `BUILD_MISMATCH`
+and summary rows show `target>=8`.
+
+Entry 107: pasted `/tmp/perf_ring_sdma_probe_1778039730.log` for `AG_5/AG_6`
+also lacked the wait-target marker, the `BUILD_MISMATCH` verdict, and the new
+summary `target` column. Classification remains build/checkout mismatch.
+`RingShardSdmaProbeKernel` now prints
+`RING_SDMA_PROBE version=pre_submit_wait_v2 enter ...`; the probe script counts
+both `version` and `target` per label and requires each to be `>=8` for PASS.
+Valid mechanism data must have no `BUILD_MISMATCH`, `version>=8`, and
+`target>=8`; otherwise do not act on `expected=2 got=1` stuck lines.
+
+Current blocker resolved by the next pushed probe-v2 commit: before that push,
+remote tests were running commit `378deccd` (`fix(sdma): use qId0 for ring shard
+AG probes`) while the probe/version/script changes were only local. After
+pulling the probe-v2 commit on `/home/fizhang/test/mori`, valid probe logs must
+show `PROBE_SCRIPT_VERSION=pre_submit_wait_v2` and
+`version=pre_submit_wait_v2`; logs without those markers are old-binary tests
+and must not drive SDMA mechanism changes.
+
+Entry 108: pasted `/tmp/perf_ring_sdma_probe_1778040930.log` repeats the old
+`AG_5/AG_6 expected=2 got=1` signature and still lacks v2 runtime markers.
+This confirms the active blocker is delivery/build, not a new SDMA mechanism
+finding. `tools/bench_ring_sdma_probe.sh` now prints
+`PROBE_SCRIPT_VERSION=pre_submit_wait_v2` during preflight; if that line is
+absent, the remote script itself is stale and SDMA stuck lines must be ignored.
+
 ### Why ring/shard can beat current fullmesh two-shot (Entry 88)
 
 Not because "ring has higher peak bandwidth" by default. Evidence:
@@ -954,7 +1003,7 @@ Next run:
 
 ```bash
 cd /home/fizhang/test/mori && git pull origin sdma-test
-bash tools/bench_sdma_ag_copy_pipe.sh
+bash tools/bench_ring_sdma_probe.sh
 ```
 
 ---
