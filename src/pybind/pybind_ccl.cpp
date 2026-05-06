@@ -26,6 +26,7 @@
 #include <pybind11/stl.h>
 
 #include "mori/collective/all2all/oneshot_all2all_sdma_class.hpp"
+#include "mori/collective/allgather/allgather_into_tensor.hpp"
 #include "mori/collective/allgather/oneshot_allgather_sdma_class.hpp"
 #include "mori/collective/allreduce/twoshot_allreduce_sdma_class.hpp"
 #include "src/pybind/mori.hpp"
@@ -206,6 +207,92 @@ void RegisterMoriCcl(pybind11::module_& m) {
       .def(
           "is_output_registered",
           [](mori::collective::AllgatherSdma<uint32_t>& self, uintptr_t ptr) -> bool {
+            return self.is_output_registered(reinterpret_cast<void*>(ptr));
+          },
+          py::arg("ptr"), "Check whether an output buffer is registered for direct SDMA writes");
+
+  // =========================================================================
+  // AllGatherIntoTensor (NCCL/RCCL-style dispatcher over AllgatherSdma<uint32_t>)
+  // =========================================================================
+  py::enum_<mori::collective::DataType>(m, "DataType")
+      .value("Int8", mori::collective::DataType::kInt8)
+      .value("Uint8", mori::collective::DataType::kUint8)
+      .value("Int16", mori::collective::DataType::kInt16)
+      .value("Uint16", mori::collective::DataType::kUint16)
+      .value("Int32", mori::collective::DataType::kInt32)
+      .value("Uint32", mori::collective::DataType::kUint32)
+      .value("Int64", mori::collective::DataType::kInt64)
+      .value("Uint64", mori::collective::DataType::kUint64)
+      .value("Float16", mori::collective::DataType::kFloat16)
+      .value("BFloat16", mori::collective::DataType::kBFloat16)
+      .value("Float32", mori::collective::DataType::kFloat32)
+      .value("Float64", mori::collective::DataType::kFloat64);
+  m.def("size_of", &mori::collective::SizeOf, py::arg("dtype"),
+        "Return element size in bytes for a mori_cpp.DataType value");
+
+  py::class_<mori::collective::AllGatherIntoTensor>(m, "AllGatherIntoTensor")
+      .def(py::init<int, int, size_t, size_t, bool>(), py::arg("my_pe"), py::arg("npes"),
+           py::arg("input_buffer_size"), py::arg("output_buffer_size"),
+           py::arg("copy_output_to_user") = true,
+           "Construct with separate input/output transit buffer sizes (bytes)")
+      .def(py::init<int, int, size_t, bool>(), py::arg("my_pe"), py::arg("npes"),
+           py::arg("transit_buffer_size") = 512 * 1024 * 1024,
+           py::arg("copy_output_to_user") = true,
+           "Construct with one combined transit buffer size (split 50/50 input/output)")
+      .def_property_readonly("my_pe", &mori::collective::AllGatherIntoTensor::my_pe)
+      .def_property_readonly("npes", &mori::collective::AllGatherIntoTensor::npes)
+      .def(
+          "__call__",
+          [](mori::collective::AllGatherIntoTensor& self, uintptr_t input_ptr,
+             uintptr_t output_ptr, size_t count, mori::collective::DataType dtype,
+             int64_t stream) -> bool {
+            return self(reinterpret_cast<const void*>(input_ptr),
+                        reinterpret_cast<void*>(output_ptr), count, dtype,
+                        reinterpret_cast<hipStream_t>(stream));
+          },
+          py::arg("input_ptr"), py::arg("output_ptr"), py::arg("count"), py::arg("dtype"),
+          py::arg("stream") = 0,
+          "ncclAllGather-style synchronous launch: every rank contributes "
+          "`count` elements of `dtype` from `input_ptr`, output of size "
+          "`count * npes` lands at `output_ptr` on every rank.")
+      .def(
+          "start_async",
+          [](mori::collective::AllGatherIntoTensor& self, uintptr_t input_ptr,
+             uintptr_t output_ptr, size_t count, mori::collective::DataType dtype,
+             int64_t stream) -> bool {
+            return self.start_async(reinterpret_cast<const void*>(input_ptr),
+                                    reinterpret_cast<void*>(output_ptr), count, dtype,
+                                    reinterpret_cast<hipStream_t>(stream));
+          },
+          py::arg("input_ptr"), py::arg("output_ptr"), py::arg("count"), py::arg("dtype"),
+          py::arg("stream") = 0,
+          "Two-phase async PUT (pair with wait_async)")
+      .def(
+          "wait_async",
+          [](mori::collective::AllGatherIntoTensor& self, int64_t stream) -> double {
+            return self.wait_async(reinterpret_cast<hipStream_t>(stream));
+          },
+          py::arg("stream") = 0,
+          "Two-phase async WAIT; returns elapsed seconds for the operation")
+      .def("is_async_in_progress", &mori::collective::AllGatherIntoTensor::is_async_in_progress)
+      .def("cancel_async", &mori::collective::AllGatherIntoTensor::cancel_async)
+      .def("reset_flags", &mori::collective::AllGatherIntoTensor::resetFlags)
+      .def(
+          "register_output_buffer",
+          [](mori::collective::AllGatherIntoTensor& self, uintptr_t ptr, size_t size) {
+            self.register_output_buffer(reinterpret_cast<void*>(ptr), size);
+          },
+          py::arg("ptr"), py::arg("size"),
+          "Register a GPU buffer as direct SDMA output target (collective)")
+      .def(
+          "deregister_output_buffer",
+          [](mori::collective::AllGatherIntoTensor& self, uintptr_t ptr) {
+            self.deregister_output_buffer(reinterpret_cast<void*>(ptr));
+          },
+          py::arg("ptr"), "Deregister a previously registered output buffer (collective)")
+      .def(
+          "is_output_registered",
+          [](mori::collective::AllGatherIntoTensor& self, uintptr_t ptr) -> bool {
             return self.is_output_registered(reinterpret_cast<void*>(ptr));
           },
           py::arg("ptr"), "Check whether an output buffer is registered for direct SDMA writes");

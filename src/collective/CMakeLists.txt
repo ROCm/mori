@@ -1,6 +1,7 @@
 # Source files list
 set(COLLECTIVE_SOURCES
     core/oneshot_all2all_sdma_class.cpp core/oneshot_allgather_sdma_class.cpp
+    core/allgather_into_tensor.cpp
     core/twoshot_allreduce_sdma_class.cpp
     # Note: intra_node_executor is header-only template class
 )
