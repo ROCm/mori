@@ -114,6 +114,7 @@ def _hipcc_device_bc(
         "-D__HIP_PLATFORM_AMD__",
         "-DHIP_ENABLE_WARP_SYNC_BUILTINS",
         *_nic_defines(),
+        *_ccqe_defines(),
         *_profiler_defines(),
     ]
     for d in include_dirs:
@@ -161,6 +162,29 @@ def _verify_bitcode(cfg: BuildConfig, bc_path: Path) -> None:
             "This is a bug in the JIT compiler."
         )
 
+
+def _has_ionic_ccqe() -> bool:
+    """Check whether the ionic DV header exposes ionic_dv_create_cq_ex (CCQE support)."""
+    header = Path("/usr/include/infiniband/ionic_dv.h")
+    try:
+        return "ionic_dv_create_cq_ex" in header.read_text()
+    except OSError:
+        return False
+
+
+_ccqe_enabled: bool | None = None
+
+
+def is_ccqe_enabled() -> bool:
+    """Return True if CCQE should be enabled (cached after first call)."""
+    global _ccqe_enabled
+    if _ccqe_enabled is None:
+        _ccqe_enabled = detect_nic_type() == "ionic" and _has_ionic_ccqe()
+    return _ccqe_enabled
+
+
+def _ccqe_defines() -> list[str]:
+    return ["-DIONIC_CCQE"] if is_ccqe_enabled() else []
 
 def _nic_defines() -> list[str]:
     """Return compiler -D flags for the detected NIC type (device-side macros)."""
@@ -305,6 +329,7 @@ def _hipcc_genco(
         "-D__HIP_PLATFORM_AMD__",
         "-DHIP_ENABLE_WARP_SYNC_BUILTINS",
         *_nic_defines(),
+        *_ccqe_defines(),
         *_profiler_defines(),
     ]
     for d in include_dirs:
@@ -379,6 +404,7 @@ def compile_genco(
     cfg = detect_build_config()
     nic = detect_nic_type()
     profiler = is_profiler_enabled()
+    ccqe = is_ccqe_enabled()
     include_dirs = _collect_include_dirs(mori_root)
 
     sub_kernels = _PARALLEL_KERNEL_GROUPS.get(kernel_name)
@@ -387,7 +413,7 @@ def compile_genco(
             mori_root / "src" / "ops" / "kernels",
             mori_root / "include" / "mori",
         ]
-        cache_dir = get_cache_dir(cfg.arch, source_paths, nic, profiler=profiler)
+        cache_dir = get_cache_dir(cfg.arch, source_paths, nic, profiler=profiler, ccqe=ccqe)
 
         hsaco_paths = [cache_dir / f"{k}.hsaco" for k in sub_kernels]
         if all(p.is_file() for p in hsaco_paths):
@@ -432,7 +458,7 @@ def compile_genco(
         raise FileNotFoundError(f"Kernel source not found: {source}")
 
     source_paths = [source, mori_root / "include" / "mori"]
-    cache_dir = get_cache_dir(cfg.arch, source_paths, nic, profiler=profiler)
+    cache_dir = get_cache_dir(cfg.arch, source_paths, nic, profiler=profiler, ccqe=ccqe)
     hsaco_path = cache_dir / f"{kernel_name}.hsaco"
 
     if hsaco_path.is_file():
@@ -448,7 +474,7 @@ def compile_genco(
         nic = detect_nic_type()
         print(
             f"[mori-jit] Compiling {kernel_name} for {cfg.arch} "
-            f"(nic={nic}, profiler={profiler}) ..."
+            f"(nic={nic}, ccqe={ccqe}, profiler={profiler}) ..."
         )
         _hipcc_genco(cfg, source, include_dirs, hsaco_path)
         print(f"[mori-jit]   Cached: {hsaco_path}")
@@ -476,12 +502,13 @@ def ensure_bitcode(*, cov: int = 5) -> str:
 
     nic = detect_nic_type()
     profiler = is_profiler_enabled()
+    ccqe = is_ccqe_enabled()
     source_paths = [
         mori_root / "src" / "shmem" / "shmem_device_api_wrapper.cpp",
         mori_root / "include" / "mori" / "shmem",
         mori_root / "include" / "mori" / "core",
     ]
-    cache_dir = get_cache_dir(cfg.arch, source_paths, nic, profiler=profiler, cov=cov)
+    cache_dir = get_cache_dir(cfg.arch, source_paths, nic, profiler=profiler, cov=cov, ccqe=ccqe)
     bc_path = cache_dir / _BC_FILENAME
 
     if bc_path.is_file():
