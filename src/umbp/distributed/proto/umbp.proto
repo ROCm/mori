@@ -149,8 +149,15 @@ message RouteGetResponse {
 
   // page_size in bytes used by the source node's DRAM/HBM PageBitmapAllocator.
   // Client computes `rdma_offset = page_index * page_size` for every entry in
-  // `source.location_id`-derived page list.  Zero for SSD tier.
+  // the `pages` field below.  Zero for SSD tier.
   uint64 page_size = 7;
+
+  // Structured form of the page set encoded in `source.location_id`.
+  // Master parses location_id internally and populates this field so the
+  // Client can build scatter-gather RDMA descriptors directly without
+  // re-parsing the string.  Empty for SSD tier.
+  // Parallel to RoutePutResponse.pages.
+  repeated PageLocation pages = 8;
 }
 
 message RoutePutRequest {
@@ -263,6 +270,9 @@ message BatchRouteGetEntry {
   // Parallel to RouteGetResponse.
   repeated BufferMemoryDesc dram_memory_descs = 6;
   uint64 page_size = 7;
+
+  // Parallel to RouteGetResponse.pages / BatchRoutePutEntry.pages.
+  repeated PageLocation pages = 8;
 }
 message BatchRouteGetResponse {
   repeated BatchRouteGetEntry entries = 1;

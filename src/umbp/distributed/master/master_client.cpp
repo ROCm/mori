@@ -413,6 +413,10 @@ grpc::Status MasterClient::RouteGet(const std::string& key,
       result.dram_memory_descs.push_back(std::move(b));
     }
     result.page_size = resp.page_size();
+    result.pages.reserve(resp.pages_size());
+    for (const auto& p : resp.pages()) {
+      result.pages.push_back({p.buffer_index(), p.page_index()});
+    }
     *out_result = result;
   }
 
@@ -586,6 +590,10 @@ grpc::Status MasterClient::BatchRouteGet(const std::vector<std::string>& keys,
           result.dram_memory_descs.push_back(std::move(b));
         }
         result.page_size = entry.page_size();
+        result.pages.reserve(entry.pages_size());
+        for (const auto& p : entry.pages()) {
+          result.pages.push_back({p.buffer_index(), p.page_index()});
+        }
         (*out)[i] = std::move(result);
       }
     }

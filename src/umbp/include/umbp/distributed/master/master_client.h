@@ -50,6 +50,11 @@ struct RouteGetResult {
   // DRAM/HBM only; empty for SSD tier.
   std::vector<BufferMemoryDescBytes> dram_memory_descs;
   uint64_t page_size = 0;
+
+  // Structured page set populated by Master (parallel to RoutePutResult.pages).
+  // Master parses location.location_id and sends the result here so the Client
+  // can build scatter-gather RDMA descriptors without re-parsing the string.
+  std::vector<PageLocation> pages;
 };
 
 class MasterClient {
