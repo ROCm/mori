@@ -913,6 +913,16 @@ finding. `tools/bench_ring_sdma_probe.sh` now prints
 `PROBE_SCRIPT_VERSION=pre_submit_wait_v2` during preflight; if that line is
 absent, the remote script itself is stale and SDMA stuck lines must be ignored.
 
+Entry 109: first valid probe-v2 output arrived. `AG round=6` includes
+`version=pre_submit_wait_v2` and `wait target`; PE4 waits prev3
+`expected=2 got=1`, PE6 waits prev5 `expected=2 got=1`, while some other PEs
+finish. `test_allreduce.py --ring-sdma-probe-only` launches exactly once, so
+`expected=2` is pre-existing q0 signal state plus a missing current SDMA atomic,
+not Python warmup. Classification: implementation/signal-path bug. Script now
+defaults to targeted repeated `AG_6` (`PROBE_MATRIX=0 PROBE_PHASE=1
+PROBE_ROUND=6 REPEAT=3`) instead of the whole matrix. Use `PROBE_MATRIX=1` only
+when revalidating all rounds after the targeted bug is fixed.
+
 ### Why ring/shard can beat current fullmesh two-shot (Entry 88)
 
 Not because "ring has higher peak bandwidth" by default. Evidence:

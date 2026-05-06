@@ -4468,6 +4468,68 @@ Without those two lines, do not inspect SDMA stuck lines.
 
 ---
 
+## Entry 109 — Valid probe-v2 output: `AG_6` q0 signal increments are missing on some links
+- **Date**: 2026-05-06
+- **Commit**: _pending_
+
+### Evidence
+
+User pasted a valid probe-v2 `AG round=6` output with both runtime markers:
+```text
+PE 1 RING_SDMA_PROBE version=pre_submit_wait_v2 enter phase=AG round=6 shard=4 ...
+PE 1 RING_SDMA_PROBE wait target qId=0 expected=1
+PE 1 RING_SDMA_PROBE after put
+PE 1 RING_SDMA_PROBE done
+...
+PE 4 RING_SDMA_PROBE version=pre_submit_wait_v2 enter phase=AG round=6 shard=7 ...
+PE 4 RING_SDMA_PROBE wait target qId=0 expected=2
+PE 4 RING_SDMA_PROBE after put
+[STUCK] PE 4 RING_SDMA_PROBE wait prev=3 expected=2 got=1
+...
+PE 6 RING_SDMA_PROBE wait target qId=0 expected=2
+[STUCK] PE 6 RING_SDMA_PROBE wait prev=5 expected=2 got=1
+```
+
+### Classification
+
+Implementation/signal-path bug, now with valid runtime evidence. `test_allreduce.py`
+probe-only launches exactly once (`ring_sdma_probe_only` constructs one
+`AllreduceSdma` and calls `ar(...)` once), so `expected=2` is not caused by
+Python warmup/iterations. It means the local q0 signal already contained `1`
+before this probe launch, and the current sender's SDMA atomic did not advance
+it to `2` on at least PE4 waiting for prev3 and PE6 waiting for prev5.
+
+This still should not be treated as final full-ring mechanism data because the
+full matrix can leave residual q0 signal state between labels. The next
+diagnostic should isolate the known failing point (`AG round=6`) in repeated
+single-label processes.
+
+### Change
+
+`tools/bench_ring_sdma_probe.sh` now defaults to targeted repeated `AG_6`:
+```bash
+PROBE_MATRIX=0 PROBE_PHASE=1 PROBE_ROUND=6 REPEAT=3
+```
+
+Full matrix is still available with `PROBE_MATRIX=1`, but targeted `AG_6`
+prevents later labels from being interpreted after earlier stuck probes.
+
+### Next validation
+
+Run:
+```bash
+bash tools/bench_ring_sdma_probe.sh
+```
+
+Interpretation:
+- if `AG_6_REP_1` starts from `expected=1` and still gets stuck, the bug is a
+  direct one-shot AG6 q0 signal delivery failure;
+- if only later reps show `expected=2 got=1`, the issue is residual signal state
+  after a previous stuck probe and the full ring needs generation-managed waits
+  rather than current-signal waits.
+
+---
+
 ## Entry 88 — Why ring/shard cadence can beat current fullmesh two-shot in continuous overlap
 - **Date**: 2026-05-02
 - **Context**: User questioned why ring would be better than fullmesh.

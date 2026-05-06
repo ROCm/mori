@@ -4,7 +4,8 @@
 #
 # Env overrides:
 #   REPO=/home/fizhang/test/mori SIZE_MB=256 CASE_TIMEOUT_SEC=300 \
-#   PROBE_WAIT=1 PROBE_MATRIX=1 SKIP_PULL=0 SKIP_BUILD=0 bash tools/bench_ring_sdma_probe.sh
+#   PROBE_WAIT=1 PROBE_MATRIX=0 PROBE_PHASE=1 PROBE_ROUND=6 REPEAT=3 \
+#   SKIP_PULL=0 SKIP_BUILD=0 bash tools/bench_ring_sdma_probe.sh
 #
 # Runs only the copy-to-user correctness path with MORI_RING_SHARD_SDMA_PROBE=1
 # to isolate SDMA submit vs signal wait. The probe is not expected to pass
@@ -19,7 +20,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${SIZE_MB:=256}"
 : "${CASE_TIMEOUT_SEC:=60}"
 : "${PROBE_WAIT:=1}"
-: "${PROBE_MATRIX:=1}"
+: "${PROBE_MATRIX:=0}"
+: "${PROBE_PHASE:=1}"
+: "${PROBE_ROUND:=6}"
+: "${REPEAT:=3}"
 : "${SKIP_PULL:=0}"
 : "${SKIP_BUILD:=0}"
 
@@ -53,7 +57,7 @@ print("devices:", torch.cuda.device_count())
 PY
 git rev-parse --abbrev-ref HEAD
 git log -1 --oneline
-echo "SIZE_MB=$SIZE_MB ELEMS=$ELEMS PROBE_WAIT=$PROBE_WAIT PROBE_MATRIX=$PROBE_MATRIX CASE_TIMEOUT_SEC=$CASE_TIMEOUT_SEC"
+echo "SIZE_MB=$SIZE_MB ELEMS=$ELEMS PROBE_WAIT=$PROBE_WAIT PROBE_MATRIX=$PROBE_MATRIX PROBE_PHASE=$PROBE_PHASE PROBE_ROUND=$PROBE_ROUND REPEAT=$REPEAT CASE_TIMEOUT_SEC=$CASE_TIMEOUT_SEC"
 echo "PROBE_SCRIPT_VERSION=pre_submit_wait_v2"
 if grep -q "version=pre_submit_wait_v2" include/mori/collective/allreduce/pipelined_allreduce_sdma_kernel.hpp &&
    grep -q "wait target qId=0 expected" include/mori/collective/allreduce/pipelined_allreduce_sdma_kernel.hpp; then
@@ -111,8 +115,10 @@ run_one() {
       done
     done
   else
-    run_one "PROBE" "${MORI_RING_SHARD_SDMA_PROBE_PHASE:-0}" \
-      "${MORI_RING_SHARD_SDMA_PROBE_ROUND:-0}"
+    for rep in $(seq 1 "$REPEAT"); do
+      label=$([ "$PROBE_PHASE" = "0" ] && echo "RS_${PROBE_ROUND}_REP_${rep}" || echo "AG_${PROBE_ROUND}_REP_${rep}")
+      run_one "$label" "$PROBE_PHASE" "$PROBE_ROUND"
+    done
   fi
 } | tee "$LOG"
 
