@@ -76,14 +76,6 @@ std::optional<ParsedLocationId> ParseLocationIdWithLog(const std::string& locati
   return result;
 }
 
-std::optional<ParsedDramLocation> ParseDramLocationIdWithLog(const std::string& location_id) {
-  auto result = ParseDramLocationId(location_id);
-  if (!result) {
-    MORI_UMBP_ERROR("[PoolClient] Failed to parse DRAM/HBM location_id: {}", location_id);
-  }
-  return result;
-}
-
 bool IsValidMemoryDesc(const mori::io::MemoryDesc& desc) { return desc.size > 0; }
 
 // Bytes belonging to the i-th logical page in a Put/Get of `total_size`
@@ -504,18 +496,14 @@ bool PoolClient::Get(const std::string& key, void* dst, size_t size) {
 
   bool is_local = (loc.node_id == config_.master_config.node_id);
   if (loc.tier == TierType::DRAM || loc.tier == TierType::HBM) {
-    auto parsed = ParseDramLocationIdWithLog(loc.location_id);
-    if (!parsed) return false;
-    if (result->page_size == 0) {
-      MORI_UMBP_ERROR("[PoolClient] Get: master returned page_size=0 for DRAM/HBM target");
+    if (result->pages.empty() || result->page_size == 0) {
+      MORI_UMBP_ERROR("[PoolClient] Get: empty pages or zero page_size for DRAM/HBM, key='{}'",
+                      key);
       return false;
     }
+    const auto& pages = result->pages;
     const uint64_t page_size = result->page_size;
-    const size_t num_pages = parsed->pages.size();
-    if (num_pages == 0) {
-      MORI_UMBP_ERROR("[PoolClient] Get: empty pages list, key='{}'", key);
-      return false;
-    }
+    const size_t num_pages = pages.size();
     // Note: no `size in ((N-1)*ps, N*ps]` check here — it is implied by
     // `size == loc.size` (verified above) plus the master-side invariant
     // that Put stored num_pages = ceil(loc.size / page_size).  The
@@ -527,7 +515,7 @@ bool PoolClient::Get(const std::string& key, void* dst, size_t size) {
       // page may be partial — copy only its real bytes.
       char* dst_bytes = static_cast<char*>(dst);
       for (size_t i = 0; i < num_pages; ++i) {
-        const auto& p = parsed->pages[i];
+        const auto& p = pages[i];
         if (p.buffer_index >= config_.dram_buffers.size()) {
           MORI_UMBP_ERROR("[PoolClient] local Get: invalid buffer_index {}", p.buffer_index);
           return false;
@@ -550,11 +538,25 @@ bool PoolClient::Get(const std::string& key, void* dst, size_t size) {
       return true;
     }
 
+    // Master partial-fill check (mirror of BatchGet Phase 1a): without these
+    // the engine_desc_bytes/dram_memory_descs being empty would only surface
+    // as a less actionable RDMA-layer failure deep inside ScatterRead.
+    // peer_address is only consumed by PeerService/SSD path; an empty value
+    // is legitimate for clients without PeerService and MUST NOT trigger here.
+    if (result->engine_desc_bytes.empty() || result->dram_memory_descs.empty()) {
+      MORI_UMBP_ERROR(
+          "[PoolClient] Get: master partial-fill for key='{}' (engine_desc_bytes={}, "
+          "dram_memory_descs={})",
+          key, result->engine_desc_bytes.empty() ? "EMPTY" : "ok",
+          result->dram_memory_descs.empty() ? "EMPTY" : "ok");
+      return false;
+    }
+
     auto& peer = GetOrConnectPeer(loc.node_id, result->peer_address, result->engine_desc_bytes);
     EnsureBufferDescsCached(peer, result->dram_memory_descs);
     // zero_copy=true: try registered DRAM region first, fall back to staging
     // (with `staging_buffer_size` cap) only when caller did not pre-register.
-    bool ok = RemoteDramScatterRead(peer, parsed->pages, page_size, dst, size, true);
+    bool ok = RemoteDramScatterRead(peer, pages, page_size, dst, size, true);
     if (ok) {
       master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_GET_BYTES_TOTAL,
                                  MORI_UMBP_METRIC_CLIENT_GET_BYTES_TOTAL_HELP,
@@ -985,9 +987,8 @@ void PoolClient::PlanPeerForBatchGet(PeerConnection& peer,
                                      std::vector<BatchGetItemPlan>& plans,
                                      FusedBucket& out_bucket) {
   // Hydrate + snapshot under a single peers_mutex_ window (mirror of
-  // PlanPeerForBatchPut).  Pages were pre-parsed in Phase 1a into
-  // plans[orig_idx].parsed_pages, avoiding a second ParseDramLocationId
-  // here.
+  // PlanPeerForBatchPut).  Pages come from master via r.pages and are
+  // stored in plans[orig_idx].parsed_pages during Phase 1a.
   struct PerItemSnapshot {
     size_t orig_idx;
     std::vector<mori::io::MemoryDesc> remote_mems;  // one per parsed_page
@@ -1460,10 +1461,10 @@ std::vector<bool> PoolClient::BatchPut(const std::vector<std::string>& keys,
 //
 // Phase 0  : BatchRouteGet (one gRPC).
 // Phase 1a : Per-item classify into LOCAL / REMOTE_ZC / REMOTE_STG / SKIPPED;
-//            pre-parse loc.location_id into plans[i].parsed_pages so the
-//            per-peer loop in Phase 1b/c does not re-parse.  Validates
-//            master partial-fill cases (peer_address / engine_desc_bytes /
-//            dram_memory_descs / page_size) BEFORE tagging REMOTE_*.
+//            pages come from master via r.pages into plans[i].parsed_pages.
+//            Validates master partial-fill cases (peer_address /
+//            engine_desc_bytes / dram_memory_descs / page_size) BEFORE
+//            tagging REMOTE_*.
 //            FindRegisteredMemory acquired here BEFORE peers_mutex_ to
 //            keep the same global lock order as BatchPut.
 // Phase 1b : Per-peer plan + snapshot under peers_mutex_, build FusedBucket.
@@ -1531,15 +1532,19 @@ std::vector<bool> PoolClient::BatchGet(const std::vector<std::string>& keys,
     }
     if (loc.tier != TierType::DRAM && loc.tier != TierType::HBM) continue;
 
-    auto parsed = ParseDramLocationIdWithLog(loc.location_id);
-    if (!parsed) continue;
-    if (parsed->pages.empty() || r.page_size == 0) {
+    if (r.pages.empty() || r.page_size == 0) {
       MORI_UMBP_ERROR(
           "[PoolClient] BatchGet: empty pages or zero page_size, key='{}' location_id='{}'",
           keys[i], loc.location_id);
       continue;
     }
-    plans[i].parsed_pages = std::move(parsed->pages);
+    // IMPORTANT: r.pages MUST NOT be read after this move.  If a future phase
+    // needs the page list, read plans[i].parsed_pages instead.  Current
+    // contract holders (verified): PlanPeerForBatchGet (Phase 1b/c), LOCAL
+    // memcpy (Phase 2a), STG RemoteDramScatterRead (Phase 2b)—all consume
+    // plans[orig_idx].parsed_pages, never r.pages.  Other r.* fields stay
+    // valid (vector move leaves siblings untouched).
+    plans[i].parsed_pages = std::move(routes[i]->pages);
     plans[i].peer_node_id = loc.node_id;
     plans[i].page_size = r.page_size;
     plans[i].bytes_total = sizes[i];

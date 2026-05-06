@@ -357,8 +357,8 @@ class PoolClient {
     std::string peer_node_id;
     uint64_t page_size{0};
     size_t bytes_total{0};
-    // Pre-parsed in Phase 1a, reused by Phase 1b/c per-peer loop and by
-    // Phase 2 LOCAL/STG paths to avoid re-parsing loc.location_id.
+    // Populated from master's structured r.pages in Phase 1a; reused by
+    // Phase 1b/c per-peer loop and Phase 2 LOCAL/STG paths.
     std::vector<PageLocation> parsed_pages;
     // REMOTE_ZC only:
     mori::io::MemoryDesc local_mem{};

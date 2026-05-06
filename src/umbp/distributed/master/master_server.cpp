@@ -335,6 +335,11 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     if (result->tier == TierType::DRAM || result->tier == TierType::HBM) {
       auto parsed = ParseDramLocationId(result->location_id);
       if (parsed) {
+        for (const auto& p : parsed->pages) {
+          auto* proto_p = response->add_pages();
+          proto_p->set_buffer_index(p.buffer_index);
+          proto_p->set_page_index(p.page_index);
+        }
         auto descs = registry_.GetDramMemoryDescsForPages(result->node_id, parsed->pages);
         if (descs) {
           for (const auto& bd : *descs) {
@@ -492,6 +497,11 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
       if (loc.tier == TierType::DRAM || loc.tier == TierType::HBM) {
         auto parsed = ParseDramLocationId(loc.location_id);
         if (parsed) {
+          for (const auto& p : parsed->pages) {
+            auto* proto_p = entry->add_pages();
+            proto_p->set_buffer_index(p.buffer_index);
+            proto_p->set_page_index(p.page_index);
+          }
           auto descs = registry_.GetDramMemoryDescsForPages(loc.node_id, parsed->pages);
           if (descs) {
             for (const auto& bd : *descs) {
