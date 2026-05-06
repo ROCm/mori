@@ -4916,6 +4916,62 @@ multi-lane ring).
 
 ---
 
+## Entry 117 — Stop ring optimization; add baseline multi-stage size sweep extractor
+- **Date**: 2026-05-06
+- **Commit**: _this commit_
+
+### Context
+
+User stopped the optimization loop and requested baseline data organization:
+```text
+整理数据，输出BASELINE的在多STAGE时从2M/4M/.../256MB时的SDMA和RCCL COPY和非COPY数据对比
+```
+
+### Existing data status
+
+The ledger contains many 256MB baseline / experiment points, but no complete
+single-run table covering `2,4,8,16,32,64,128,256MB` for baseline multi-stage
+`SDMA copy`, `SDMA no-copy`, and `RCCL` under the same run.
+
+### Change
+
+Add:
+```bash
+tools/bench_baseline_multistage_sweep.sh
+```
+
+It runs the default baseline multi-stage sweep:
+```bash
+python3 tests/python/ccl/test_allreduce.py --num-stages 4 --elems 67108864 \
+  --iterations 100 --warmup 20 --sweep
+```
+
+with:
+```bash
+MORI_CONTINUOUS_PREP=0
+MORI_PIPELINE_CU=224
+MORI_PIPELINE_CHUNKS=4
+```
+
+It extracts only `2..256MB` and prints:
+- wall ms and gaps (`copy-RCCL`, `no-copy-RCCL`, `copy-penalty`),
+- sequential AR ms,
+- GEMM slowdown.
+
+### Next data command
+
+Run:
+```bash
+bash tools/bench_baseline_multistage_sweep.sh
+```
+
+Optional continuous workload variant:
+```bash
+CONTINUOUS_ITERS=100 ITERATIONS=1 WARMUP=1 bash tools/bench_baseline_multistage_sweep.sh
+```
+
+---
+
 ## Entry 88 — Why ring/shard cadence can beat current fullmesh two-shot in continuous overlap
 - **Date**: 2026-05-02
 - **Context**: User questioned why ring would be better than fullmesh.
