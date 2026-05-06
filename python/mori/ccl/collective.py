@@ -20,9 +20,28 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import os
+
 import torch
 from mori import cpp as mori_cpp
 from typing import Optional
+
+
+def _require_sdma_env(class_name: str) -> None:
+    """Fail fast if MORI_ENABLE_SDMA is not enabled.
+
+    Without it, SymmMemManager::Malloc falls back to cached hipMalloc instead
+    of hipExtMallocWithFlags(hipDeviceMallocUncached), and the SDMA kernel
+    NULL-faults on first use ("Memory access fault by GPU node-X on address
+    (nil)") with no actionable error.
+    """
+    raw = os.environ.get("MORI_ENABLE_SDMA", "").strip().lower()
+    if raw in ("", "0", "false", "no", "off"):
+        raise RuntimeError(
+            f"{class_name} requires MORI_ENABLE_SDMA=1 in the process "
+            f"environment (got MORI_ENABLE_SDMA={os.environ.get('MORI_ENABLE_SDMA')!r}). "
+            f"Export it before launch on every rank."
+        )
 
 
 _TORCH_DTYPE_TO_NUMPY = {
@@ -122,6 +141,7 @@ class All2allSdma:
         transit_buffer_size: Optional[int] = None,
         copy_output_to_user: bool = True,
     ):
+        _require_sdma_env("All2allSdma")
         self.my_pe = my_pe
         self.npes = npes
         handle_class = _cpp_all2all_factory("All2allSdmaHandle")
@@ -200,6 +220,7 @@ class AllgatherSdma:
         transit_buffer_size: Optional[int] = None,
         copy_output_to_user: bool = True,
     ):
+        _require_sdma_env("AllgatherSdma")
         self.my_pe = my_pe
         self.npes = npes
         handle_class = _cpp_allgather_factory("AllgatherSdmaHandle")
@@ -310,6 +331,7 @@ class AllreduceSdma:
         dtype: torch.dtype = torch.uint32,
         mode: str = "eager",
     ):
+        _require_sdma_env("AllreduceSdma")
         self.my_pe = my_pe
         self.npes = npes
         self.dtype = dtype
