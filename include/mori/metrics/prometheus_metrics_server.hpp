@@ -113,8 +113,19 @@ class MetricsServer {
   // `bounds` and reuse the stored layout.
   void observe(std::string_view name, std::string_view help, const std::vector<double>& bounds,
                double value);
-  void observe(std::string_view name, std::string_view help, const Labels& labels,
-               const std::vector<double>& bounds, double value);
+
+  // Merge a pre-aggregated histogram batch into a labeled series.
+  // `bucket_counts` is CUMULATIVE (bucket_counts[i] = #obs with value <=
+  // bounds[i]) and is added per-bucket into the stored series; `count` and
+  // `sum` are added to the running totals.  First-write-wins on `bounds`:
+  // a size mismatch on a subsequent call logs a one-shot WARN and returns,
+  // strengthening the silent first-write-wins of `observe()`.
+  // Used by master_server.cpp to ingest client-side aggregated histogram
+  // samples (umbp.proto's HistogramAggregate); the resulting series state is
+  // byte-equivalent to N back-to-back per-observation `observe()` calls.
+  void observeAggregated(std::string_view name, std::string_view help, const Labels& labels,
+                         const std::vector<double>& bounds,
+                         const std::vector<uint64_t>& bucket_counts, uint64_t count, double sum);
 
   // ------------------------------------------------------------------
   // Accessors

@@ -179,8 +179,10 @@ void MetricsServer::observe(std::string_view name, std::string_view help,
 static std::string FormatLabels(
     const mori::metrics::MetricsServer::Labels& labels);  // forward decl
 
-void MetricsServer::observe(std::string_view name, std::string_view help, const Labels& labels,
-                            const std::vector<double>& bounds, double value) {
+void MetricsServer::observeAggregated(std::string_view name, std::string_view help,
+                                      const Labels& labels, const std::vector<double>& bounds,
+                                      const std::vector<uint64_t>& bucket_counts, uint64_t count,
+                                      double sum) {
   auto label_str = FormatLabels(labels);
   std::lock_guard<std::mutex> lk(mutex_);
   auto& family = labeled_histograms_[std::string(name)];
@@ -189,12 +191,39 @@ void MetricsServer::observe(std::string_view name, std::string_view help, const 
   if (s.bounds.empty()) {
     s.bounds = bounds;
     s.bucket_counts.assign(bounds.size(), 0u);
+  } else if (s.bounds.size() != bounds.size()) {
+    // Strengthens the silent first-write-wins of observe() so a layout drift
+    // between caller and stored series surfaces as a log line instead of
+    // corrupting bucket counts.
+    static std::once_flag bounds_once;
+    std::call_once(bounds_once, [&]() {
+      MORI_METRICS_WARN(
+          "[Master] observeAggregated: bounds size mismatch for '{}' "
+          "(stored={}, incoming={}) — first write wins, sample dropped",
+          std::string(name), s.bounds.size(), bounds.size());
+    });
+    return;
   }
-  for (std::size_t i = 0; i < s.bounds.size(); ++i) {
-    if (value <= s.bounds[i]) s.bucket_counts[i]++;
+  if (bucket_counts.size() != s.bucket_counts.size()) {
+    // Defensive: caller bounds.size() matched but bucket_counts.size() did
+    // not.  Independent once_flag so this drift signal does not get shadowed
+    // by the bounds-mismatch WARN above (different root causes — proto
+    // arity drift vs. caller-side desync — deserve their own first-occurrence
+    // log line).
+    static std::once_flag bucket_counts_once;
+    std::call_once(bucket_counts_once, [&]() {
+      MORI_METRICS_WARN(
+          "[Master] observeAggregated: bucket_counts size mismatch for '{}' "
+          "(stored={}, incoming={}) — sample dropped",
+          std::string(name), s.bucket_counts.size(), bucket_counts.size());
+    });
+    return;
   }
-  s.count++;
-  s.sum += value;
+  for (std::size_t i = 0; i < bucket_counts.size(); ++i) {
+    s.bucket_counts[i] += bucket_counts[i];
+  }
+  s.count += count;
+  s.sum += sum;
 }
 
 static std::string FormatLabels(const mori::metrics::MetricsServer::Labels& labels) {

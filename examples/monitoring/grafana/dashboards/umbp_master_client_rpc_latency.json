@@ -202,8 +202,8 @@
     },
     {
       "id": 5,
-      "title": "Client-side metrics dropped (cap pressure)",
-      "description": "Histogram observations dropped client-side because pending_histograms_ hit the hard cap. Should be 0 in steady state; non-zero indicates QPS exceeds plan assumptions or master has been unreachable for many flush cycles.",
+      "title": "Client-side metrics dropped (series-cardinality cap)",
+      "description": "Distinct (name, labels) histogram series rejected client-side because pending_histogram_aggregates_ hit kMasterClientMaxPendingHistograms (15000). Always 0 in healthy operation — the map is bounded by label-set cardinality (~50 series). A non-zero rate signals a label-cardinality leak (e.g. an unbounded label value like a key or allocation_id was accidentally introduced); investigate the offending Observe call site, do not raise the cap.",
       "type": "timeseries",
       "gridPos": {
         "h": 8,

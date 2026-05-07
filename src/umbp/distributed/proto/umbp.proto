@@ -328,23 +328,31 @@ message MetricLabel {
   string value = 2;
 }
 
-message HistogramObservation {
-  repeated double bounds = 1;
-  double          value  = 2;
+// Aggregated histogram state. bucket_counts is CUMULATIVE
+// (bucket_counts[i] = #observations with value <= bounds[i]); the implicit
+// +Inf overflow is `count - bucket_counts.back()`. Mirrors the in-memory
+// representation already used by master MetricsServer::HistogramEntry, so
+// merge on the master side is a per-bucket add.
+message HistogramAggregate {
+  repeated double bounds        = 1;
+  repeated uint64 bucket_counts = 2;
+  uint64          count         = 3;
+  double          sum           = 4;
 }
 
 // One metric sample: a named series with optional labels and a typed value.
-// counter_delta: amount to add to the counter (monotonically increasing).
-// gauge_value:   absolute value to set the gauge to.
-// histogram:     a single observation to record in the histogram.
+// counter_delta:        amount to add to the counter (monotonically increasing).
+// gauge_value:          absolute value to set the gauge to.
+// histogram_aggregate:  pre-aggregated histogram state for one (name, labels)
+//                       series; carries the full bucket layout + counts + sum.
 message MetricSample {
   string               name    = 1;
   string               help    = 2;
   repeated MetricLabel labels  = 3;
   oneof value {
-    double               counter_delta = 4;
-    double               gauge_value   = 5;
-    HistogramObservation histogram     = 6;
+    double             counter_delta       = 4;
+    double             gauge_value         = 5;
+    HistogramAggregate histogram_aggregate = 6;
   }
 }
 
