@@ -226,7 +226,7 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
 /* ---------------------------------------------------------------------------------------------- */
 template <typename T, bool UseP2PRead = true, bool EnableStdMoE = false,
           bool UseFp8DirectCast = false, bool UseFp8BlockwiseQuant = false>
-__device__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
+__device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   using TokT =
       std::conditional_t<UseFp8DirectCast || UseFp8BlockwiseQuant, core::CombineInternalFp8, T>;
   static_assert(!(UseFp8DirectCast && UseFp8BlockwiseQuant),
@@ -252,7 +252,7 @@ __device__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   IF_ENABLE_PROFILER(
       INTRANODE_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
   MORI_TRACE_SEQ(seq, profiler);
-  MORI_TRACE_NEXT(seq, Slot::CombineCopyInput);
+  MORI_TRACE_NEXT(seq, Slot::CombineStageInput);
 
   const uint64_t crossDeviceBarrierFlag = args.crossDeviceBarrierFlag[0];
   // Copy input to shmem registered buffer so that other GPUs can access directly
@@ -289,6 +289,7 @@ __device__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
         }
       }
     }
+    MORI_TRACE_NEXT(seq, Slot::CombineCopyWeights);
     if (args.weightsBuf) {
       for (int i = globalWarpId; i < totalRecvTokenNum; i += globalWarpNum) {
         core::WarpCopy(
@@ -297,6 +298,44 @@ __device__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       }
     }
   } else {
+#ifdef ENABLE_PROFILER
+    for (int tokenIdx = globalWarpId; tokenIdx < totalRecvTokenNum; tokenIdx += globalWarpNum) {
+      index_t destTokId = args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(myPe)[tokenIdx];
+      index_t destPe = PeFromFlatTokenIndex(config, destTokId);
+      index_t destLocalTokId = LocalTokIdFromFlatTokenIndex(config, destTokId);
+      uint8_t* destStagingPtr = args.intraNodeTokBufs.combineInp->template GetAs<uint8_t*>(destPe) +
+                                SendBufSlotOffset(config, myPe, destLocalTokId) * combXferBytes;
+      if constexpr (UseFp8BlockwiseQuant) {
+        core::WarpQuantizeToFp8Blockwise<core::CombineInternalFp8>(
+            reinterpret_cast<core::CombineInternalFp8*>(destStagingPtr),
+            reinterpret_cast<float*>(destStagingPtr + hiddenBytes),
+            args.inpTokenBuf + tokenIdx * hiddenDim, hiddenDim, config.scaleDim);
+      } else if constexpr (!std::is_same_v<T, TokT> &&
+                           std::is_same_v<TokT, core::CombineInternalFp8>) {
+        core::WarpCastBf16ToCombineInternalFp8<T>(reinterpret_cast<TokT*>(destStagingPtr),
+                                                  args.inpTokenBuf + tokenIdx * hiddenDim,
+                                                  hiddenDim, laneId);
+      } else {
+        core::WarpCopy(reinterpret_cast<T*>(destStagingPtr),
+                       args.inpTokenBuf + tokenIdx * hiddenDim, hiddenDim);
+      }
+    }
+    MORI_TRACE_NEXT(seq, Slot::CombineCopyWeights);
+    if (args.weightsBuf) {
+      for (int tokenIdx = globalWarpId; tokenIdx < totalRecvTokenNum; tokenIdx += globalWarpNum) {
+        index_t destTokId =
+            args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(myPe)[tokenIdx];
+        index_t destPe = PeFromFlatTokenIndex(config, destTokId);
+        index_t destLocalTokId = LocalTokIdFromFlatTokenIndex(config, destTokId);
+        uint8_t* destStagingPtr =
+            args.intraNodeTokBufs.combineInp->template GetAs<uint8_t*>(destPe) +
+            SendBufSlotOffset(config, myPe, destLocalTokId) * combXferBytes;
+        core::WarpCopy(reinterpret_cast<float*>(destStagingPtr + hiddenBytes + scaleBytes),
+                       args.weightsBuf + tokenIdx * config.numExpertPerToken,
+                       config.numExpertPerToken);
+      }
+    }
+#else
     for (int tokenIdx = globalWarpId; tokenIdx < totalRecvTokenNum; tokenIdx += globalWarpNum) {
       index_t destTokId = args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(myPe)[tokenIdx];
       index_t destPe = PeFromFlatTokenIndex(config, destTokId);
@@ -323,6 +362,7 @@ __device__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
                        config.numExpertPerToken);
       }
     }
+#endif
   }
 
   // Make sure copy on all GPUs are finished
@@ -331,7 +371,7 @@ __device__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   *args.totalRecvTokenNum = 0;
   if (args.curRankNumToken == 0) return;
 
-  MORI_TRACE_NEXT(seq, Slot::CombineAccum);
+  MORI_TRACE_NEXT(seq, Slot::CombineAccumSetup);
   extern __shared__ char sharedMem[];
   TokT** srcPtrs = reinterpret_cast<TokT**>(sharedMem) + warpId * config.numExpertPerToken;
   float** srcWeightsPtr = reinterpret_cast<float**>(sharedMem) +
@@ -351,6 +391,7 @@ __device__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
     mwIter.Decode(i, tokenId, inTokenPartId, hiddenDimOffset, hiddenDimSize);
 
     // Prepare data pointers on different GPUs
+    MORI_TRACE_NEXT(seq, Slot::CombinePreparePtrs);
     const size_t weightOffset = hiddenBytes + scaleBytes;
     for (int j = laneId; j < config.numExpertPerToken; j += warpSize) {
       index_t destTokId = args.dispDestTokIdMap[tokenId * config.numExpertPerToken + j];
@@ -419,6 +460,7 @@ __device__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
     }
 
     if constexpr (UseFp8BlockwiseQuant) {
+      MORI_TRACE_NEXT(seq, Slot::CombineDequantAccum);
       if (mwIter.warpsPerItem == 1) {
         core::WarpAccumFp8DequantFull<T, core::CombineInternalFp8>(
             outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
@@ -432,12 +474,15 @@ __device__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       }
     } else if constexpr (!std::is_same_v<T, TokT> &&
                          std::is_same_v<TokT, core::CombineInternalFp8>) {
+      MORI_TRACE_NEXT(seq, Slot::CombineDequantAccum);
       core::WarpAccumCombineInternalFp8ToBf16(outPtr, reinterpret_cast<const TokT* const*>(srcPtrs),
                                               validAccumCount, laneId, hiddenDimSize);
     } else {
+      MORI_TRACE_NEXT(seq, Slot::CombineDequantAccum);
       core::WarpAccum<T, 4>(outPtr, srcPtrs, nullptr, validAccumCount, hiddenDimSize);
     }
 
+    MORI_TRACE_NEXT(seq, Slot::CombineAccumWeights);
     if (args.weightsBuf && inTokenPartId == mwIter.warpsPerItem - 1) {
       core::WarpAccum<float, 4>(args.shmemCombineOutWeightsMemObj->template GetAs<float*>() +
                                     tokenId * config.numExpertPerToken,
