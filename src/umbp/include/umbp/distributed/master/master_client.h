@@ -31,6 +31,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -41,6 +42,23 @@
 #include "umbp/distributed/types.h"
 
 namespace mori::umbp {
+
+// Buckets for mori_umbp_master_client_rpc_latency_seconds.  Spans 0.1 ms ~ 5 s
+// (14 finite bounds + implicit +Inf).  Bucket layout is locked on the first
+// observation client-side; never edit in place — bump the metric name suffix
+// instead.  See docs/MORI-UMBP-PD-MONITORING.md.
+inline constexpr double kMasterClientRpcLatencyBucketsArr[] = {
+    1e-4, 5e-4, 1e-3, 2.5e-3, 5e-3, 1e-2, 2.5e-2, 5e-2,
+    1e-1, 2.5e-1, 5e-1, 1.0, 2.5, 5.0,
+};
+
+// Hard cap on outstanding histogram samples in MasterClient::pending_histograms_.
+// Keeps a single ReportMetrics RPC well below gRPC's default 4 MB receive
+// limit (~250 B/sample × 15000 ≈ 3.75 MB worst case).  Hitting this cap is
+// always a sign of either Phase 2 needing to ship or master being unreachable
+// for many flush cycles; samples beyond the cap are dropped and accounted in
+// metrics_dropped_count_.
+inline constexpr std::size_t kMasterClientMaxPendingHistograms = 15000;
 
 struct RouteGetResult {
   Location location;
@@ -212,6 +230,7 @@ class MasterClient {
   std::unordered_map<std::string, PendingSample> pending_counters_;
   std::unordered_map<std::string, PendingSample> pending_gauges_;
   std::vector<PendingHistogram> pending_histograms_;
+  std::atomic<uint64_t> metrics_dropped_count_{0};
 
   uint64_t metrics_interval_ms_ = 1000;
 
@@ -223,6 +242,15 @@ class MasterClient {
   void StartMetricsReporting();
   void StopMetricsReporting();
   void MetricsLoop();
+
+  // --- ScopedRpcTimer integration ---
+  // Called by ScopedRpcTimer at the end of every monitored MasterClient RPC.
+  // Both methods short-circuit when metrics_running_ is false to avoid
+  // unbounded buffer growth on never-registered (Python read-only) clients
+  // and during destructor windows.
+  friend class ScopedRpcTimer;
+  void RecordRpcLatency(std::string_view method, bool ok, double seconds);
+  void RecordRpcError(std::string_view method, std::string_view code);
 };
 
 }  // namespace mori::umbp
