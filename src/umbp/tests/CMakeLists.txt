@@ -56,3 +56,16 @@ target_link_libraries(test_peer_dram_allocator PRIVATE umbp_common
 target_compile_features(test_peer_dram_allocator PRIVATE cxx_std_17)
 
 gtest_discover_tests(test_peer_dram_allocator)
+
+# ---------------------------------------------------------------------------
+# test_global_block_index_events
+# ---------------------------------------------------------------------------
+add_executable(test_global_block_index_events
+               test_global_block_index_events.cpp)
+
+target_link_libraries(test_global_block_index_events PRIVATE umbp_common
+                                                             GTest::gtest_main)
+
+target_compile_features(test_global_block_index_events PRIVATE cxx_std_17)
+
+gtest_discover_tests(test_global_block_index_events)
