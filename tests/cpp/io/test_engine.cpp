@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cstdio>
@@ -44,6 +45,7 @@
 
 #include "mori/application/utils/check.hpp"
 #include "mori/io/io.hpp"
+#include "src/io/rdma/backend_impl.hpp"
 #include "src/io/rdma/common.hpp"
 
 using namespace mori::io;
@@ -207,36 +209,206 @@ RegisteredGpuMem RegisterGpuMemory(IOEngine* engine, size_t sizeBytes, int devic
 void CaseSubmissionLedgerBasic() {
   constexpr uint32_t kNotifPerQp = 16;
   SubmissionLedger ledger(kNotifPerQp);
-  std::atomic<int> sqDepth{5};
   TransferStatus status;
   auto meta = std::make_shared<CqCallbackMeta>(&status, 101, 8);
   const uint64_t id = ledger.Insert(3, true, meta, 8);
   Require(id == kNotifPerQp, "first ledger record id should start at notifPerQp boundary");
-  int batchSize = 0;
-  auto releasedMeta = ledger.ReleaseByCqe(id, &sqDepth, &batchSize);
-  Require(releasedMeta != nullptr, "ledger release meta should not be null");
-  Require(releasedMeta->id == 101, "unexpected transfer id from ledger release");
-  Require(batchSize == 8, "unexpected batch size from ledger release");
-  Require(sqDepth.load(std::memory_order_relaxed) == 2, "unexpected sq depth after release");
+  SubmissionRecord released;
+  Require(ledger.ReleaseByCqe(id, &released), "ledger release should find posted record");
+  Require(released.meta != nullptr, "ledger release meta should not be null");
+  Require(released.meta->id == 101, "unexpected transfer id from ledger release");
+  Require(released.batchSize == 8, "unexpected batch size from ledger release");
+  Require(released.postedWr == 3, "unexpected posted WR count from ledger release");
 
   SubmissionLedger ledger2(kNotifPerQp);
-  std::atomic<int> sqDepth2{12};
   auto meta2 = std::make_shared<CqCallbackMeta>(&status, 202, 16);
   uint64_t postedId = ledger2.Insert(4, true, meta2, 10);
   Require(postedId == kNotifPerQp, "posted record id should respect notifPerQp offset");
-  ledger2.InsertOrphaned(3, meta2, 6);
+  uint64_t orphanedId = ledger2.InsertOrphaned(3, meta2, 6);
+  Require(orphanedId == kNotifPerQp + 1, "orphaned record id should follow posted id");
   Require(ledger2.HasOrphaned(), "expected orphaned record in ledger");
-  int recovered = ledger2.ReleaseOrphanedByRecovery(&sqDepth2);
-  // Only Orphaned record (3 WRs) should be released; Posted record (4 WRs) preserved.
-  Require(recovered == 3, "unexpected recovered wr count (should only release orphaned)");
-  Require(sqDepth2.load(std::memory_order_relaxed) == 9, "unexpected sq depth after recovery");
+  std::vector<SubmissionRecord> orphaned;
+  ledger2.ExtractOrphanedRecords(&orphaned);
+  Require(orphaned.size() == 1, "expected one orphaned record");
+  Require(orphaned[0].postedWr == 3, "unexpected orphaned WR count");
+  Require(orphaned[0].meta == meta2, "orphaned record should preserve callback meta");
   Require(!ledger2.HasOrphaned(), "orphaned records should be drained");
   // The Posted record should still be present and retrievable via ReleaseByCqe.
-  int postedBatch = 0;
-  auto postedMeta = ledger2.ReleaseByCqe(postedId, &sqDepth2, &postedBatch);
-  Require(postedMeta != nullptr, "posted record should survive recovery");
-  Require(postedBatch == 10, "posted record batch size mismatch");
-  Require(sqDepth2.load(std::memory_order_relaxed) == 5, "sq depth after posted CQE release");
+  SubmissionRecord posted;
+  Require(ledger2.ReleaseByCqe(postedId, &posted), "posted record should survive recovery");
+  Require(posted.meta != nullptr, "posted record meta should not be null");
+  Require(posted.batchSize == 10, "posted record batch size mismatch");
+  Require(posted.postedWr == 4, "posted record WR count mismatch");
+
+  SubmissionLedger ledger3(kNotifPerQp);
+  uint64_t tentativeId = ledger3.Insert(2, true, meta2, 2);
+  SubmissionRecord tentative;
+  Require(ledger3.CancelTentative(tentativeId, &tentative), "tentative cancel should find record");
+  Require(tentative.postedWr == 2, "tentative cancel should return record contents");
+  Require(!ledger3.ReleaseByCqe(tentativeId, nullptr), "canceled record should be erased");
+}
+
+void CaseSqControllerReserveReleaseWait() {
+  SqController sq(4, 0);
+  ReserveOptions opts;
+  opts.timeoutUs = 200000;
+  ReserveResult result;
+  Require(sq.Reserve(4, opts, &result), "initial reserve should fill SQ");
+  Require(sq.Depth() == 4, "unexpected depth after initial reserve");
+
+  std::atomic<bool> waiterDone{false};
+  std::atomic<bool> waiterOk{false};
+  std::thread waiter([&]() {
+    ReserveResult waitResult;
+    waiterOk.store(sq.Reserve(1, opts, &waitResult), std::memory_order_release);
+    waiterDone.store(true, std::memory_order_release);
+  });
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  Require(!waiterDone.load(std::memory_order_acquire), "waiter should block while SQ is full");
+  sq.Release(4);
+  waiter.join();
+  Require(waiterOk.load(std::memory_order_acquire), "waiter should reserve after release");
+  Require(sq.Depth() == 1, "waiter reserve should hold one credit");
+  sq.Release(1);
+  Require(sq.Depth() == 0, "release should drain controller depth");
+
+  SqController watermarked(4, 2);
+  Require(watermarked.Reserve(4, opts, &result), "watermark initial reserve should fill SQ");
+  waiterDone.store(false, std::memory_order_release);
+  waiterOk.store(false, std::memory_order_release);
+  std::thread watermarkWaiter([&]() {
+    ReserveResult waitResult;
+    waiterOk.store(watermarked.Reserve(1, opts, &waitResult), std::memory_order_release);
+    waiterDone.store(true, std::memory_order_release);
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  watermarked.Release(1);
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  Require(!waiterDone.load(std::memory_order_acquire),
+          "waiter should respect resume watermark after pressure");
+  watermarked.Release(1);
+  watermarkWaiter.join();
+  Require(waiterOk.load(std::memory_order_acquire),
+          "waiter should reserve after resume watermark is available");
+  Require(watermarked.Depth() == 3,
+          "watermark waiter should reserve one credit after two releases");
+  watermarked.Release(3);
+}
+
+void CaseSqControllerTerminalDegraded() {
+  SqController sq(4, 2);
+  ReserveOptions opts;
+  opts.timeoutUs = 200000;
+  ReserveResult result;
+  Require(sq.Reserve(4, opts, &result), "initial reserve should fill SQ");
+
+  std::atomic<bool> waiterDone{false};
+  std::atomic<bool> waiterOk{true};
+  std::atomic<SqReserveFailureKind> waiterKind{SqReserveFailureKind::None};
+  std::thread waiter([&]() {
+    ReserveResult waitResult;
+    waiterOk.store(sq.Reserve(1, opts, &waitResult), std::memory_order_release);
+    waiterKind.store(waitResult.kind, std::memory_order_release);
+    waiterDone.store(true, std::memory_order_release);
+  });
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  sq.MarkDegraded(SqDegradeReason::PartialPostOrphaned);
+  waiter.join();
+  Require(waiterDone.load(std::memory_order_acquire), "waiter should wake on degraded");
+  Require(!waiterOk.load(std::memory_order_acquire), "waiter should not reserve degraded SQ");
+  Require(waiterKind.load(std::memory_order_acquire) == SqReserveFailureKind::TerminalDegraded,
+          "waiter should fail with terminal degraded");
+  Require(sq.IsTerminalDegraded(), "partial-post orphaned should be terminal degraded");
+  Require(sq.Depth() == 4, "mark degraded should not release outstanding credits");
+  sq.ReleaseDrainedOrphaned(4);
+  Require(sq.Depth() == 0, "drained orphaned release should fix diagnostic depth");
+  Require(sq.IsTerminalDegraded(), "drained orphaned release must not restore admission");
+  Require(!sq.Reserve(1, opts, &result), "terminal degraded controller should reject reserve");
+}
+
+void CaseSqControllerRecheckRollsBack() {
+  SqController sq(8, 0);
+  ReserveOptions opts;
+  opts.timeoutUs = 10000;
+  ReserveResult result;
+  Require(sq.Reserve(3, opts, &result), "reserve before recheck should succeed");
+  sq.MarkDegraded(SqDegradeReason::FatalCqe);
+  Require(!sq.RecheckBeforePost(3, &result), "recheck should fail after terminal degraded");
+  Require(result.kind == SqReserveFailureKind::TerminalDegraded,
+          "recheck should report terminal degraded");
+  Require(sq.Depth() == 0, "failed recheck should roll back reserved credits");
+}
+
+void RunPendingUnsignaledOrphaningCase(const char* context, int epCount) {
+  constexpr uint32_t kNotifPerQp = 16;
+  TransferStatus status;
+  status.SetCode(StatusCode::IN_PROGRESS);
+  auto meta = std::make_shared<CqCallbackMeta>(&status, 303, epCount * 3);
+
+  EpPairVec eps;
+  eps.reserve(epCount);
+
+  ReserveOptions opts;
+  opts.timeoutUs = 10000;
+  ReserveResult result;
+  std::vector<int> epWrsSinceSignal;
+  std::vector<size_t> epMergedSinceSignal;
+  epWrsSinceSignal.reserve(epCount);
+  epMergedSinceSignal.reserve(epCount);
+
+  for (int i = 0; i < epCount; ++i) {
+    EpPair ep{};
+    ep.sq = std::make_shared<SqController>(8, 0);
+    ep.ledger = std::make_shared<SubmissionLedger>(kNotifPerQp);
+    Require(ep.sq->Reserve(2, opts, &result), "simulated unsignaled reserve should succeed");
+    eps.push_back(ep);
+    epWrsSinceSignal.push_back(2);
+    epMergedSinceSignal.push_back(3);
+  }
+
+  for (int i = 0; i < epCount; ++i) {
+    MovePendingUnsignaledToOrphanedForEndpoint(eps, static_cast<size_t>(i), epWrsSinceSignal,
+                                               epMergedSinceSignal, meta,
+                                               std::string("simulated ") + context, context);
+  }
+
+  for (int i = 0; i < epCount; ++i) {
+    Require(epWrsSinceSignal[i] == 0, "pending WR counter should be cleared after orphaning");
+    Require(epMergedSinceSignal[i] == 0,
+            "pending merged counter should be cleared after orphaning");
+    Require(eps[i].sq->IsTerminalDegraded(),
+            "pending unsignaled orphan should terminal degrade SQ");
+    Require(eps[i].sq->Depth() == 2, "orphaned WR credits should remain held until proven drained");
+    Require(eps[i].ledger->RecordCount() == 0, "orphaned records should be extracted for failure");
+    eps[i].sq->ReleaseDrainedOrphaned(2);
+    Require(eps[i].sq->Depth() == 0, "drained orphaned release should clear held credits");
+  }
+
+  Require(
+      meta->finishedBatchSize.load(std::memory_order_relaxed) == static_cast<uint32_t>(epCount * 3),
+      "orphaned meta should be counted as finished by failure path");
+  Require(status.Failed(), "orphaned meta should fail transfer status");
+}
+
+void CasePendingUnsignaledRecheckFailureOrphans() {
+  RunPendingUnsignaledOrphaningCase("RecheckBeforePost failed", 1);
+}
+
+void CasePendingUnsignaledReserveFailureOrphans() {
+  RunPendingUnsignaledOrphaningCase("TryReserveSqDepth failed", 2);
+}
+
+void CaseRdmaBackendSessionAliveChecksTerminalSq() {
+  RdmaBackendConfig cfg{};
+  mori::application::RdmaMemoryRegion mr{};
+  EpPair ep{};
+  ep.sq = std::make_shared<SqController>(8, 0);
+  RdmaBackendSession sess(cfg, mr, mr, EpPairVec{ep}, nullptr);
+  Require(sess.Alive(), "session should be alive before terminal degrade");
+  ep.sq->MarkDegraded(SqDegradeReason::PartialPostOrphaned);
+  Require(!sess.Alive(), "session should be dead after terminal degraded endpoint");
 }
 
 void CaseWrIdNamespaceHelpers() {
@@ -776,6 +948,12 @@ int main(int argc, char* argv[]) {
   SetLogLevel("info");
   std::vector<TestCase> cases = {
       {"submission_ledger_basic", CaseSubmissionLedgerBasic},
+      {"sq_controller_reserve_release_wait", CaseSqControllerReserveReleaseWait},
+      {"sq_controller_terminal_degraded", CaseSqControllerTerminalDegraded},
+      {"sq_controller_recheck_rolls_back", CaseSqControllerRecheckRollsBack},
+      {"pending_unsignaled_recheck_failure_orphans", CasePendingUnsignaledRecheckFailureOrphans},
+      {"pending_unsignaled_reserve_failure_orphans", CasePendingUnsignaledReserveFailureOrphans},
+      {"rdma_session_alive_checks_terminal_sq", CaseRdmaBackendSessionAliveChecksTerminalSq},
       {"wr_id_namespace_helpers", CaseWrIdNamespaceHelpers},
       {"rdma_notification_rejects_zero_notif_per_qp", CaseRdmaNotificationRejectsZeroNotifPerQp},
       {"rdma_transfer_basic", CaseRdmaTransferBasic},
