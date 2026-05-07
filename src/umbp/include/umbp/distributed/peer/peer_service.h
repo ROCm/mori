@@ -54,7 +54,10 @@ class PeerServiceServer {
                     const std::vector<uint8_t>& ssd_staging_mem_desc_bytes,
                     LocalStorageManager& storage, LocalBlockIndex& index,
                     PeerDramAllocator* dram_alloc = nullptr, int num_read_slots = 8,
-                    int num_write_slots = 8, int lease_timeout_s = 10);
+                    int num_write_slots = 8, int lease_timeout_s = 10,
+                    std::vector<uint8_t> engine_desc_bytes = {});
+  PeerServiceServer(PeerDramAllocator* dram_alloc, int num_read_slots = 8, int num_write_slots = 8,
+                    int lease_timeout_s = 10, std::vector<uint8_t> engine_desc_bytes = {});
   ~PeerServiceServer();
 
   bool Start(uint16_t port);
@@ -70,13 +73,14 @@ class PeerServiceServer {
  private:
   void* ssd_staging_base_;
   size_t ssd_staging_size_;
-  LocalStorageManager& storage_;
-  LocalBlockIndex& index_;
+  LocalStorageManager* storage_;
+  LocalBlockIndex* index_;
   PeerDramAllocator* dram_alloc_;
 
   StagingMetrics metrics_;
 
   std::vector<uint8_t> ssd_staging_mem_desc_bytes_;
+  std::vector<uint8_t> engine_desc_bytes_;
 
   std::unique_ptr<grpc::Server> server_;
 

@@ -41,6 +41,7 @@
 namespace mori::umbp {
 
 class PeerDramAllocator;
+class PeerServiceServer;
 
 // In the master-as-advisor design, PoolClient drives the Put/Get
 // pipeline: master gives a routing advisory, then the writer talks
@@ -109,6 +110,7 @@ class PoolClient {
   // the natural lifetime anchor for the per-process IO engine + DRAM
   // buffers; PeerServiceServer borrows it.
   std::unique_ptr<PeerDramAllocator> peer_alloc_;
+  std::unique_ptr<PeerServiceServer> peer_service_;
 
   std::unique_ptr<mori::io::IOEngine> io_engine_;
   mori::io::MemoryDesc staging_mem_{};

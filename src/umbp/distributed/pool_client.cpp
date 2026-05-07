@@ -34,6 +34,7 @@
 #include "umbp/common/env_time.h"
 #include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/peer/peer_dram_allocator.h"
+#include "umbp/distributed/peer/peer_service.h"
 #include "umbp_peer.grpc.pb.h"
 
 namespace mori::umbp {
@@ -227,10 +228,21 @@ bool PoolClient::Init() {
     }
   }
 
+  if (config_.peer_service_port > 0) {
+    peer_service_ =
+        std::make_unique<PeerServiceServer>(peer_alloc_.get(), 8, 8, 10, engine_desc_bytes);
+    if (!peer_service_->Start(config_.peer_service_port)) {
+      MORI_UMBP_ERROR("[PoolClient] PeerService failed to start on port {}",
+                      config_.peer_service_port);
+      peer_service_.reset();
+      initialized_ = false;
+      return false;
+    }
+  }
+
   std::string peer_address;
   if (config_.peer_service_port > 0) {
-    std::string host = config_.io_engine.host.empty() ? config_.master_config.node_address
-                                                      : config_.io_engine.host;
+    std::string host = config_.master_config.node_address;
     peer_address = host + ":" + std::to_string(config_.peer_service_port);
   }
 
@@ -269,6 +281,8 @@ void PoolClient::Shutdown() {
     std::lock_guard<std::mutex> lock(peers_mutex_);
     peers_.clear();
   }
+
+  peer_service_.reset();
 
   if (peer_alloc_) {
     peer_alloc_->StopReaper();
