@@ -26,7 +26,8 @@
 namespace mori::umbp {
 
 std::optional<RoutePutResult> TierAwareMostAvailableStrategy::Select(
-    const std::vector<ClientRecord>& alive_clients, uint64_t block_size) {
+    const std::vector<ClientRecord>& alive_clients, uint64_t block_size,
+    const std::unordered_set<std::string>& exclude_nodes) {
   static constexpr std::array<TierType, 3> kTierOrder = {TierType::HBM, TierType::DRAM,
                                                          TierType::SSD};
 
@@ -35,13 +36,10 @@ std::optional<RoutePutResult> TierAwareMostAvailableStrategy::Select(
     uint64_t best_available = 0;
 
     for (const auto& client : alive_clients) {
+      if (exclude_nodes.count(client.node_id)) continue;
       auto it = client.tier_capacities.find(tier);
-      if (it == client.tier_capacities.end()) {
-        continue;
-      }
-      if (it->second.available_bytes < block_size) {
-        continue;
-      }
+      if (it == client.tier_capacities.end()) continue;
+      if (it->second.available_bytes < block_size) continue;
       if (best == nullptr || it->second.available_bytes > best_available) {
         best = &client;
         best_available = it->second.available_bytes;
@@ -49,7 +47,7 @@ std::optional<RoutePutResult> TierAwareMostAvailableStrategy::Select(
     }
 
     if (best != nullptr) {
-      return RoutePutResult{best->node_id, best->node_address, tier};
+      return RoutePutResult{best->node_id, best->peer_address, tier};
     }
   }
 

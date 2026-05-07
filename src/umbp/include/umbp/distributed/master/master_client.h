@@ -34,6 +34,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -43,9 +44,12 @@
 
 namespace mori::umbp {
 
-// Result of RouteGet: a routing advisory only — the writer follows up
-// with peer.ResolveKey to fetch pages/descs/page_size.  `size` is carried
-// so the reader can preflight its destination buffer without round-trip.
+class PeerDramAllocator;
+
+// Result of RouteGet — pure routing advisory.  The reader follows up
+// with peer.ResolveKey to fetch pages/descs/page_size.  `size` is
+// carried so the reader can preflight its destination buffer without
+// a separate round trip.
 struct RouteGetResult {
   std::string node_id;
   TierType tier = TierType::UNKNOWN;
@@ -64,94 +68,53 @@ class MasterClient {
   MasterClient& operator=(const MasterClient&) = delete;
 
   // --- Client lifecycle ---
-  // Register with master. If auto_heartbeat, starts heartbeat thread.
-  // `dram_page_size` is the page size the Client wants Master's
-  // PageBitmapAllocator to use for this node's DRAM/HBM tier (per Q6, the
-  // same value applies to both tiers).  0 means "use Master's
-  // ClientRegistryConfig.default_dram_page_size".  Set from
-  // PoolClientConfig.dram_page_size at the call site.
-  grpc::Status RegisterSelf(
-      const std::map<TierType, TierCapacity>& tier_capacities, const std::string& peer_address = "",
-      const std::vector<uint8_t>& engine_desc_bytes = {},
-      const std::vector<std::vector<uint8_t>>& dram_memory_desc_bytes_list = {},
-      const std::vector<uint64_t>& dram_buffer_sizes = {},
-      const std::vector<uint64_t>& ssd_store_capacities = {}, uint64_t dram_page_size = 0);
+
+  // Register with master.  In the master-as-advisor design only
+  // membership + capacity-snapshot metadata is shipped — DRAM/HBM
+  // descriptors are peer-internal now.
+  grpc::Status RegisterSelf(const std::map<TierType, TierCapacity>& tier_capacities,
+                            const std::string& peer_address = "",
+                            const std::vector<uint8_t>& engine_desc_bytes = {},
+                            const std::vector<uint64_t>& ssd_store_capacities = {});
   grpc::Status UnregisterSelf();
 
-  // --- Block index ---
-  // Register a block key owned by this node in the master index.
-  grpc::Status Register(const std::string& key, const Location& location);
-  // Unregister a block key location owned by this node.
-  // If removed is non-null, returns 1 when removed, otherwise 0.
-  grpc::Status Unregister(const std::string& key, const Location& location,
-                          uint32_t* removed = nullptr);
-  // Read-only existence check (no access count side-effects).
-  grpc::Status Lookup(const std::string& key, bool* found);
-  grpc::Status FinalizeAllocation(const std::string& key, const Location& location,
-                                  const std::string& allocation_id, int32_t depth = -1);
-  grpc::Status PublishLocalBlock(const std::string& key, const Location& location);
-  grpc::Status AbortAllocation(const std::string& node_id, const std::string& allocation_id,
-                               uint64_t size);
-
   // --- Router ---
-  /// Pick an existing replica to read from.
-  /// Returns the Location via @p out_location (if found).
-  grpc::Status RouteGet(const std::string& key, std::optional<RouteGetResult>* out_result);
 
-  /// Pick a target node to write to.
-  /// After receiving the result, write via MORI-IO, then call FinalizeAllocation()
-  /// or AbortAllocation().
+  // Pick a target node for a Put.  `exclude_nodes` lets the writer
+  // steer master past nodes that already returned ENOSPC at peer
+  // level.
   grpc::Status RoutePut(const std::string& key, uint64_t block_size,
+                        const std::unordered_set<std::string>& exclude_nodes,
                         std::optional<RoutePutResult>* out_result);
+
+  // Pick a replica for a Get.  Same exclude semantics as RoutePut,
+  // used to retry past peers that report `found=false` on Resolve.
+  grpc::Status RouteGet(const std::string& key,
+                        const std::unordered_set<std::string>& exclude_nodes,
+                        std::optional<RouteGetResult>* out_result);
 
   // --- Batch RPCs ---
   grpc::Status BatchRoutePut(const std::vector<std::string>& keys,
                              const std::vector<uint64_t>& block_sizes,
+                             const std::unordered_set<std::string>& exclude_nodes,
                              std::vector<std::optional<RoutePutResult>>* out);
   grpc::Status BatchRouteGet(const std::vector<std::string>& keys,
+                             const std::unordered_set<std::string>& exclude_nodes,
                              std::vector<std::optional<RouteGetResult>>* out);
-  grpc::Status BatchFinalizeAllocation(const std::vector<std::string>& keys,
-                                       const std::vector<Location>& locations,
-                                       const std::vector<std::string>& allocation_ids,
-                                       std::vector<bool>* out,
-                                       const std::vector<int32_t>& depths = {});
-  // Read-only batch existence check (no access-count / lease side-effects).
-  // `out` is cleared on entry; on wire error it remains empty and the
-  // returned Status carries the failure.  On success, `*out` is resized to
-  // keys.size() and populated parallel to keys.
-  grpc::Status BatchLookup(const std::vector<std::string>& keys, std::vector<bool>* out);
 
-  // One entry of a BatchAbortAllocation request.  `node_id` is the target
-  // node owning the pending lease (not the caller); matches the single-item
-  // AbortAllocation semantics.
-  struct BatchAbortEntry {
-    std::string node_id;
-    std::string allocation_id;
-    uint64_t size;
-  };
-  // Batched rollback of pending allocations.  Semantics align with
-  // BatchFinalizeAllocation: wire success returns Status::OK and fills
-  // *out parallel to `entries`; per-entry false is not an error (racy
-  // reap / double-abort / EXPIRED node).  Callers use it as best-effort
-  // cleanup; TTL reaper covers the rest.
-  grpc::Status BatchAbortAllocation(const std::vector<BatchAbortEntry>& entries,
-                                    std::vector<bool>* out);
+  // --- Heartbeat (event-driven) ---
+  // Bind a PeerDramAllocator whose outbox the heartbeat thread will
+  // drain.  Pass nullptr for SSD-only peers.  Must be set before
+  // StartHeartbeat() — the heartbeat thread reads it once per tick.
+  void SetPeerDramAllocator(PeerDramAllocator* alloc);
 
-  // --- Heartbeat ---
   void StartHeartbeat();
   void StopHeartbeat();
 
   // --- Client-side metrics ---
-  // Buffer a counter delta. Flushed to master via ReportMetrics RPC periodically.
   void AddCounter(std::string name, std::string help, Labels labels, double delta);
-  // Buffer a gauge value (last write wins between flushes).
   void SetGauge(std::string name, std::string help, Labels labels, double value);
-  // Buffer a histogram observation. `bounds` is taken by const-ref so the
-  // 14-double rpc-latency layout (and the 3072-double bandwidth layout in
-  // pool_client.cpp) avoids a per-call heap allocation.  The observation is
-  // accumulated into a per-series HistogramAccumulator; only one MetricSample
-  // per (name, labels) series is sent on the wire per flush.
-  void Observe(std::string name, std::string help, Labels labels, const std::vector<double>& bounds,
+  void Observe(std::string name, std::string help, Labels labels, std::vector<double> bounds,
                double value);
 
   bool IsRegistered() const { return registered_; }
@@ -175,8 +138,6 @@ class MasterClient {
   UMBPMasterClientConfig config_;
 
   std::shared_ptr<grpc::Channel> channel_;
-  // Use void* to avoid exposing generated stub type in header.
-  // Cast to UMBPMaster::Stub* in the .cpp file.
   std::unique_ptr<void, void (*)(void*)> stub_;
 
   std::thread heartbeat_thread_;
@@ -187,9 +148,19 @@ class MasterClient {
   std::mutex hb_cv_mutex_;
   std::condition_variable hb_cv_;
 
-  // Cached tier capacities for heartbeat reporting
+  // Cached tier capacities — heartbeat reports the latest peer
+  // allocator snapshot when the bound PeerDramAllocator is non-null,
+  // else falls back to whatever was last set here.
   std::mutex caps_mutex_;
   std::map<TierType, TierCapacity> current_capacities_;
+
+  // Peer-event source for the heartbeat thread.  Non-owning; lifetime
+  // is managed by PoolClient.
+  PeerDramAllocator* peer_alloc_ = nullptr;
+
+  // Heartbeat seq state — the wire protocol's gap-recovery channel.
+  uint64_t hb_seq_ = 0;
+  uint64_t hb_last_acked_seq_ = 0;
 
   void HeartbeatLoop();
 

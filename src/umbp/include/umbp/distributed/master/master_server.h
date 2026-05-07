@@ -57,13 +57,6 @@ class MasterServer {
   // has called BuildAndStart().
   uint16_t GetBoundPort() const { return bound_port_.load(); }
 
-  // Test-only: read the depth recorded for `key` in the master's index.
-  // Returns nullopt if the key isn't present.  Used by BatchPut depth
-  // propagation tests; no production caller.
-  std::optional<int32_t> GetBlockDepthForTest(const std::string& key) const {
-    return index_.GetDepth(key);
-  }
-
  private:
   MasterServerConfig config_;
   GlobalBlockIndex index_;

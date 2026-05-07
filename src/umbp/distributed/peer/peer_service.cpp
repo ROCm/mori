@@ -30,7 +30,6 @@
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/env_time.h"
 #include "umbp/distributed/peer/peer_dram_allocator.h"
-#include "umbp/distributed/pool_client.h"
 #include "umbp/distributed/types.h"
 #include "umbp/local/block_index/local_block_index.h"
 #include "umbp/local/tiers/local_storage_manager.h"
@@ -158,7 +157,7 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
  public:
   UMBPPeerServiceImpl(void* ssd_staging_base, size_t ssd_staging_size,
                       const std::vector<uint8_t>& ssd_staging_mem_desc_bytes,
-                      LocalStorageManager& storage, LocalBlockIndex& index, PoolClient& coordinator,
+                      LocalStorageManager& storage, LocalBlockIndex& index,
                       PeerDramAllocator* dram_alloc, StagingMetrics& metrics, int num_read_slots,
                       int num_write_slots, int lease_timeout_s)
       : ssd_staging_base_(ssd_staging_base),
@@ -166,7 +165,6 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
         ssd_staging_mem_desc_bytes_(ssd_staging_mem_desc_bytes),
         storage_(storage),
         index_(index),
-        coordinator_(coordinator),
         dram_alloc_(dram_alloc),
         metrics_(metrics),
         lease_timeout_(std::max(lease_timeout_s, 1)),
@@ -289,8 +287,12 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
     const std::string& key = request->key();
     const size_t size = request->size();
 
+    // Local-only dedup: if this peer already has the key in its block
+    // index, treat the commit as a no-op success.  The cross-node
+    // FinalizeAllocation gate is gone in the master-as-advisor design;
+    // master will see the existing key via heartbeat events.
     auto existing = index_.Lookup(key);
-    if (existing.has_value() && coordinator_.IsRegistered(key)) {
+    if (existing.has_value()) {
       std::lock_guard<std::mutex> lock(write_slots_mutex_);
       ReleaseSlotByLeaseId(write_slots_, commit_lease_id);
       response->set_success(true);
@@ -298,17 +300,15 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
     }
 
     const void* src = static_cast<const uint8_t*>(ssd_staging_base_) + offset;
-    if (!existing.has_value()) {
-      bool ok = storage_.Write(key, src, size, StorageTier::LOCAL_SSD);
-      if (!ok) {
-        MORI_UMBP_ERROR("[PeerService] CommitSsdWrite: local SSD write failed for '{}'", key);
-        std::lock_guard<std::mutex> lock(write_slots_mutex_);
-        ReleaseSlotByLeaseId(write_slots_, commit_lease_id);
-        response->set_success(false);
-        return grpc::Status::OK;
-      }
-      index_.Insert(key, {StorageTier::LOCAL_SSD, 0, size});
+    bool ok = storage_.Write(key, src, size, StorageTier::LOCAL_SSD);
+    if (!ok) {
+      MORI_UMBP_ERROR("[PeerService] CommitSsdWrite: local SSD write failed for '{}'", key);
+      std::lock_guard<std::mutex> lock(write_slots_mutex_);
+      ReleaseSlotByLeaseId(write_slots_, commit_lease_id);
+      response->set_success(false);
+      return grpc::Status::OK;
     }
+    index_.Insert(key, {StorageTier::LOCAL_SSD, 0, size});
 
     auto* ssd = storage_.GetTier(StorageTier::LOCAL_SSD);
     auto loc_id = ssd ? ssd->GetLocationId(key) : std::nullopt;
@@ -323,16 +323,13 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
     }
     std::string location_id = "0:" + *loc_id;
 
-    bool finalized = coordinator_.FinalizeAllocation(key, size, location_id, TierType::SSD,
-                                                     request->allocation_id());
-    if (!finalized) {
-      storage_.Evict(key);
-      index_.Remove(key);
-      MORI_UMBP_ERROR("[PeerService] CommitSsdWrite: FinalizeAllocation failed for '{}'", key);
-      std::lock_guard<std::mutex> lock(write_slots_mutex_);
-      ReleaseSlotByLeaseId(write_slots_, commit_lease_id);
-      response->set_success(false);
-      return grpc::Status::OK;
+    // Master learns about this SSD-tier ADD via the heartbeat-shipped
+    // event log.  The peer's universal outbox lives on the DRAM
+    // allocator; SSD-only deployments still construct one (with empty
+    // tier configs) so this hand-off works.  When dram_alloc_ is null
+    // the SSD path is non-distributed: master simply never sees the key.
+    if (dram_alloc_ != nullptr) {
+      dram_alloc_->QueueExternalEvent(KvEvent{KvEvent::Kind::ADD, key, TierType::SSD, size});
     }
 
     {
@@ -554,7 +551,6 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
   const std::vector<uint8_t>& ssd_staging_mem_desc_bytes_;
   LocalStorageManager& storage_;
   LocalBlockIndex& index_;
-  PoolClient& coordinator_;
   PeerDramAllocator* dram_alloc_;
   StagingMetrics& metrics_;
 
@@ -575,18 +571,17 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
 PeerServiceServer::PeerServiceServer(void* ssd_staging_base, size_t ssd_staging_size,
                                      const std::vector<uint8_t>& ssd_staging_mem_desc_bytes,
                                      LocalStorageManager& storage, LocalBlockIndex& index,
-                                     PoolClient& coordinator, PeerDramAllocator* dram_alloc,
-                                     int num_read_slots, int num_write_slots, int lease_timeout_s)
+                                     PeerDramAllocator* dram_alloc, int num_read_slots,
+                                     int num_write_slots, int lease_timeout_s)
     : ssd_staging_base_(ssd_staging_base),
       ssd_staging_size_(ssd_staging_size),
       storage_(storage),
       index_(index),
-      coordinator_(coordinator),
       dram_alloc_(dram_alloc),
       ssd_staging_mem_desc_bytes_(ssd_staging_mem_desc_bytes) {
   service_ = std::make_unique<UMBPPeerServiceImpl>(
       ssd_staging_base_, ssd_staging_size_, ssd_staging_mem_desc_bytes_, storage_, index_,
-      coordinator_, dram_alloc_, metrics_, num_read_slots, num_write_slots, lease_timeout_s);
+      dram_alloc_, metrics_, num_read_slots, num_write_slots, lease_timeout_s);
 }
 
 PeerServiceServer::~PeerServiceServer() { Stop(); }

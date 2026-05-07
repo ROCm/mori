@@ -34,7 +34,6 @@ namespace mori::umbp {
 
 class LocalStorageManager;
 class LocalBlockIndex;
-class PoolClient;
 class PeerDramAllocator;
 
 struct StagingMetrics {
@@ -49,11 +48,11 @@ class PeerServiceServer {
   // no DRAM/HBM tier (SSD-only deployments).  When null, the new
   // AllocateSlot/CommitSlot/AbortSlot/ResolveKey/EvictKey handlers
   // respond with success=false / found=false; SSD staging RPCs continue
-  // to work unchanged.  PoolClient is the typical owner of the
-  // allocator and outlives this server.
+  // to work unchanged.  The allocator's outbox is also where the SSD
+  // commit path queues its ADD events for heartbeat shipment.
   PeerServiceServer(void* ssd_staging_base, size_t ssd_staging_size,
                     const std::vector<uint8_t>& ssd_staging_mem_desc_bytes,
-                    LocalStorageManager& storage, LocalBlockIndex& index, PoolClient& coordinator,
+                    LocalStorageManager& storage, LocalBlockIndex& index,
                     PeerDramAllocator* dram_alloc = nullptr, int num_read_slots = 8,
                     int num_write_slots = 8, int lease_timeout_s = 10);
   ~PeerServiceServer();
@@ -73,7 +72,6 @@ class PeerServiceServer {
   size_t ssd_staging_size_;
   LocalStorageManager& storage_;
   LocalBlockIndex& index_;
-  PoolClient& coordinator_;
   PeerDramAllocator* dram_alloc_;
 
   StagingMetrics metrics_;

@@ -183,6 +183,11 @@ std::vector<PeerDramAllocator::EvictResult> PeerDramAllocator::Evict(
   return out;
 }
 
+void PeerDramAllocator::QueueExternalEvent(KvEvent ev) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  pending_events_.push_back(std::move(ev));
+}
+
 std::vector<KvEvent> PeerDramAllocator::DrainPendingEvents() {
   std::lock_guard<std::mutex> lock(mutex_);
   std::vector<KvEvent> drained;

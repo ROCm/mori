@@ -139,6 +139,14 @@ class PeerDramAllocator {
   // For every key actually freed, a REMOVE event is queued.
   std::vector<EvictResult> Evict(const std::vector<std::string>& keys);
 
+  // -------- Event outbox (used by other peer-side code paths) --------
+
+  // Push a KvEvent onto the outbox without touching the bitmap or
+  // owned/pending maps.  Used by the SSD CommitSsdWrite path to ship
+  // ADD events for keys this allocator doesn't manage — one outbox per
+  // peer is the canonical event source for the heartbeat.
+  void QueueExternalEvent(KvEvent ev);
+
   // -------- Heartbeat helpers --------
 
   // Drain the outbox of events queued since the last call.  Called by
