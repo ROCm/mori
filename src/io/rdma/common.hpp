@@ -22,6 +22,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -137,6 +138,13 @@ struct CqCallbackMeta {
   internal::IoCallDiagnostics diagnostics{};
 };
 
+struct SqCqeDiagnostics {
+  std::atomic<int64_t> lastPollAttemptTimeUs{0};
+  std::atomic<int64_t> lastNonEmptyCqeTimeUs{0};
+  std::atomic<uint64_t> recentCqeCount{0};
+  std::atomic<uint64_t> recentBatchReleaseWr{0};
+};
+
 // SubmissionLedger: tracks per-EP WR submissions and enables precise sqDepth release.
 enum class SubmissionState : uint8_t {
   Posted,    // submitted, awaiting CQE
@@ -166,12 +174,13 @@ class SubmissionLedger {
   // CQE path: find record by recordId, release sqDepth, return CqCallbackMeta.
   // Returns nullptr if record not found.
   std::shared_ptr<CqCallbackMeta> ReleaseByCqe(uint64_t recordId, std::atomic<int>* sqDepth,
-                                               int* outBatchSize);
+                                               int* outBatchSize, int* outPostedWr = nullptr);
 
   // Recovery path: release only Orphaned records and keep Posted records.
   int ReleaseOrphanedByRecovery(std::atomic<int>* sqDepth);
 
   bool HasOrphaned() const;
+  size_t RecordCount() const;
 
  private:
   mutable std::mutex mu_;
@@ -192,7 +201,14 @@ struct EpPair {
   // Degraded flag — set on partial post without signaled tail.
   std::shared_ptr<std::atomic<bool>> degraded;
   std::shared_ptr<SubmissionLedger> ledger;
+  int qpPerTransfer{0};
+  int numWorkerThreads{0};
+  std::shared_ptr<SqCqeDiagnostics> sqCqeDiagnostics;
 };
+
+void RecordSqPollAttempt(const EpPair& ep);
+void RecordSqPollCqes(const EpPair& ep, int cqeCount);
+void RecordSqBatchReleaseWr(const EpPair& ep, int wrCount);
 
 using EndpointId = uint64_t;
 

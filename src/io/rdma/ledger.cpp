@@ -43,13 +43,17 @@ void SubmissionLedger::InsertOrphaned(int postedWr, std::shared_ptr<CqCallbackMe
 
 std::shared_ptr<CqCallbackMeta> SubmissionLedger::ReleaseByCqe(uint64_t recordId,
                                                                std::atomic<int>* sqDepth,
-                                                               int* outBatchSize) {
+                                                               int* outBatchSize,
+                                                               int* outPostedWr) {
   std::lock_guard<std::mutex> lock(mu_);
+  if (outBatchSize) *outBatchSize = 0;
+  if (outPostedWr) *outPostedWr = 0;
   auto it = records_.find(recordId);
   if (it == records_.end()) return nullptr;
   SubmissionRecord& rec = it->second;
   if (sqDepth && rec.postedWr > 0) sqDepth->fetch_sub(rec.postedWr, std::memory_order_relaxed);
   if (outBatchSize) *outBatchSize = rec.batchSize;
+  if (outPostedWr) *outPostedWr = rec.postedWr;
   auto meta = std::move(rec.meta);
   records_.erase(it);
   return meta;
@@ -80,6 +84,11 @@ bool SubmissionLedger::HasOrphaned() const {
     if (rec.state == SubmissionState::Orphaned) return true;
   }
   return false;
+}
+
+size_t SubmissionLedger::RecordCount() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  return records_.size();
 }
 
 }  // namespace io

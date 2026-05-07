@@ -21,6 +21,7 @@
 // SOFTWARE.
 #include "src/io/rdma/common.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
@@ -51,9 +52,58 @@ static int GetSqBackoffTimeoutUs() {
   static const int kBackoffTimeoutUs = []() {
     int v = 10000;
     env::Override("MORI_IO_SQ_BACKOFF_TIMEOUT_US", v, mori::env::detail::ParsePositiveInt);
+    const char* raw = std::getenv("MORI_IO_SQ_BACKOFF_TIMEOUT_US");
+    MORI_IO_INFO("MORI_IO_SQ_BACKOFF_TIMEOUT_US raw={} effective={} us",
+                 raw != nullptr ? raw : "<unset>", v);
     return v;
   }();
   return kBackoffTimeoutUs;
+}
+
+static int GetSqSignalIntervalWr() {
+  static const int kSignalIntervalWr = []() {
+    int v = 0;
+    const char* raw = std::getenv("MORI_IO_SQ_SIGNAL_INTERVAL_WR");
+    if (raw != nullptr && raw[0] != '\0') {
+      errno = 0;
+      char* end = nullptr;
+      long parsed = std::strtol(raw, &end, 10);
+      if (end != raw && *end == '\0' && errno == 0 && parsed >= 0 &&
+          parsed <= std::numeric_limits<int>::max()) {
+        v = static_cast<int>(parsed);
+      } else {
+        MORI_IO_WARN("Ignore invalid env MORI_IO_SQ_SIGNAL_INTERVAL_WR={}", raw);
+      }
+    }
+    MORI_IO_INFO("MORI_IO_SQ_SIGNAL_INTERVAL_WR raw={} configured={} WR",
+                 raw != nullptr ? raw : "<unset>", v);
+    return v;
+  }();
+  return kSignalIntervalWr;
+}
+
+static int64_t SteadyClockNowUs() {
+  return std::chrono::duration_cast<std::chrono::microseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+void RecordSqPollAttempt(const EpPair& ep) {
+  if (!ep.sqCqeDiagnostics) return;
+  ep.sqCqeDiagnostics->lastPollAttemptTimeUs.store(SteadyClockNowUs(), std::memory_order_relaxed);
+}
+
+void RecordSqPollCqes(const EpPair& ep, int cqeCount) {
+  if (!ep.sqCqeDiagnostics || cqeCount <= 0) return;
+  ep.sqCqeDiagnostics->lastNonEmptyCqeTimeUs.store(SteadyClockNowUs(), std::memory_order_relaxed);
+  ep.sqCqeDiagnostics->recentCqeCount.fetch_add(static_cast<uint64_t>(cqeCount),
+                                                std::memory_order_relaxed);
+}
+
+void RecordSqBatchReleaseWr(const EpPair& ep, int wrCount) {
+  if (!ep.sqCqeDiagnostics || wrCount <= 0) return;
+  ep.sqCqeDiagnostics->recentBatchReleaseWr.fetch_add(static_cast<uint64_t>(wrCount),
+                                                      std::memory_order_relaxed);
 }
 
 static void SetSqReserveFailureKind(SqReserveFailureKind* out, SqReserveFailureKind kind) {
@@ -71,7 +121,37 @@ static std::string BuildNotifyHint() {
          "MORI_IO_ENABLE_NOTIFICATION=0 if inbound notification is not required";
 }
 
-static std::string BuildSqDepthHint(const EpPair& ep, size_t qpCount, int effectivePostBatchSize,
+static std::string FormatDiagnosticTimeAge(int64_t nowUs, int64_t timestampUs) {
+  if (timestampUs <= 0) return "never";
+  return std::to_string(std::max<int64_t>(0, nowUs - timestampUs)) + "us_ago";
+}
+
+static std::string BuildSqCqeDiagnosticHint(const EpPair& ep) {
+  if (!ep.sqCqeDiagnostics) return "SQ/CQE diagnostics unavailable.";
+
+  const int64_t nowUs = SteadyClockNowUs();
+  const int64_t lastPollAttempt =
+      ep.sqCqeDiagnostics->lastPollAttemptTimeUs.load(std::memory_order_relaxed);
+  const int64_t lastNonEmptyCqe =
+      ep.sqCqeDiagnostics->lastNonEmptyCqeTimeUs.load(std::memory_order_relaxed);
+  const uint64_t recentCqeCount =
+      ep.sqCqeDiagnostics->recentCqeCount.exchange(0, std::memory_order_relaxed);
+  const uint64_t recentBatchReleaseWr =
+      ep.sqCqeDiagnostics->recentBatchReleaseWr.exchange(0, std::memory_order_relaxed);
+  const size_t recordCount = ep.ledger ? ep.ledger->RecordCount() : 0;
+  const int sqDepth = ep.sqDepth ? ep.sqDepth->load(std::memory_order_relaxed) : -1;
+
+  return "SQ/CQE diagnostics since previous SQ-full timeout: lastPollAttemptTime=" +
+         FormatDiagnosticTimeAge(nowUs, lastPollAttempt) +
+         ", lastNonEmptyCqeTime=" + FormatDiagnosticTimeAge(nowUs, lastNonEmptyCqe) +
+         ", recentCqeCount=" + std::to_string(recentCqeCount) +
+         ", recentBatchReleaseWr=" + std::to_string(recentBatchReleaseWr) +
+         ", ledgerRecordCount=" + std::to_string(recordCount) +
+         ", currentSqDepth=" + std::to_string(sqDepth) + ".";
+}
+
+static std::string BuildSqDepthHint(const EpPair& ep, size_t workerLocalQpCount,
+                                    int effectivePostBatchSize, int effectiveSignalIntervalWr,
                                     PostSendOpKind opKind, SqReserveFailureKind failureKind) {
   if (failureKind == SqReserveFailureKind::Degraded) return {};
 
@@ -87,6 +167,9 @@ static std::string BuildSqDepthHint(const EpPair& ep, size_t qpCount, int effect
       hint = "try increasing MORI_IO_QP_MAX_SEND_WR";
     }
     hint += ", and " + BuildNotifyHint() + ".";
+    if (failureKind == SqReserveFailureKind::Timeout) {
+      hint += " " + BuildSqCqeDiagnosticHint(ep);
+    }
     return hint;
   }
 
@@ -105,11 +188,23 @@ static std::string BuildSqDepthHint(const EpPair& ep, size_t qpCount, int effect
     hint += ", reducing RdmaBackendConfig::postBatchSize (current effective value " +
             std::to_string(effectivePostBatchSize) + ")";
   }
-  if (qpCount > 0) {
-    hint += ", or increasing RdmaBackendConfig::qpPerTransfer (current transfer uses " +
-            std::to_string(qpCount) + " QP(s)) if additional QPs are available";
+  if (workerLocalQpCount > 0) {
+    const int sessionQpPerTransfer =
+        ep.qpPerTransfer > 0 ? ep.qpPerTransfer : static_cast<int>(workerLocalQpCount);
+    const int numWorkerThreads = ep.numWorkerThreads > 0 ? ep.numWorkerThreads : 0;
+    hint +=
+        ", or increasing RdmaBackendConfig::qpPerTransfer only if additional QPs are "
+        "actually used by workers";
+    hint += " (worker-local QP count for this call=" + std::to_string(workerLocalQpCount) +
+            ", session qpPerTransfer=" + std::to_string(sessionQpPerTransfer) +
+            ", numWorkerThreads=" + std::to_string(numWorkerThreads) + ")";
   }
   hint += ". Current per-QP send WR limit is " + std::to_string(ep.maxSqDepth) + ".";
+  hint += " MORI_IO_SQ_SIGNAL_INTERVAL_WR configured=" + std::to_string(GetSqSignalIntervalWr()) +
+          ", effective=" + std::to_string(effectiveSignalIntervalWr) + " WR.";
+  if (failureKind == SqReserveFailureKind::Timeout) {
+    hint += " " + BuildSqCqeDiagnosticHint(ep);
+  }
   return hint;
 }
 
@@ -268,8 +363,8 @@ RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* status, Trans
   for (size_t i = 0; i < eps.size(); i++) {
     SqReserveFailureKind reserveFailure = SqReserveFailureKind::None;
     if (!TryReserveSqDepth(eps[i], 1, i, "notify", &reserveErr, &reserveFailure)) {
-      AppendHint(&reserveErr, BuildSqDepthHint(eps[i], eps.size(), -1, PostSendOpKind::Notification,
-                                               reserveFailure));
+      AppendHint(&reserveErr, BuildSqDepthHint(eps[i], eps.size(), -1, 0,
+                                               PostSendOpKind::Notification, reserveFailure));
       for (int j = 0; j < reserved; ++j) ReleaseSqDepth(eps[j], 1);
       return {StatusCode::ERR_RDMA_OP, reserveErr};
     }
@@ -422,21 +517,32 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
   size_t mergedWrCount = mergedWrs.size();
   size_t epNum = eps.size();
   size_t epBatchSize = (mergedWrCount + epNum - 1) / epNum;
+  int minMaxSqDepth = std::numeric_limits<int>::max();
+  for (size_t epId = 0; epId < epNum; ++epId) {
+    if (eps[epId].sqDepth && eps[epId].maxSqDepth > 0) {
+      minMaxSqDepth = std::min(minMaxSqDepth, eps[epId].maxSqDepth);
+    }
+  }
 
   if (postBatchSize == -1) {
     postBatchSize = (epBatchSize > static_cast<size_t>(std::numeric_limits<int>::max()))
                         ? std::numeric_limits<int>::max()
                         : static_cast<int>(epBatchSize);
   }
-  {
-    int minMaxSqDepth = std::numeric_limits<int>::max();
-    for (size_t epId = 0; epId < epNum; ++epId) {
-      if (eps[epId].sqDepth && eps[epId].maxSqDepth > 0) {
-        minMaxSqDepth = std::min(minMaxSqDepth, eps[epId].maxSqDepth);
-      }
+  if (minMaxSqDepth != std::numeric_limits<int>::max() && postBatchSize > minMaxSqDepth) {
+    postBatchSize = minMaxSqDepth;
+  }
+
+  int effectiveSignalIntervalWr = 0;
+  const int configuredSignalIntervalWr = GetSqSignalIntervalWr();
+  if (configuredSignalIntervalWr > 0) {
+    effectiveSignalIntervalWr = configuredSignalIntervalWr;
+    if (minMaxSqDepth != std::numeric_limits<int>::max()) {
+      effectiveSignalIntervalWr = std::min(effectiveSignalIntervalWr, minMaxSqDepth);
     }
-    if (minMaxSqDepth != std::numeric_limits<int>::max() && postBatchSize > minMaxSqDepth)
-      postBatchSize = minMaxSqDepth;
+    if (effectiveSignalIntervalWr > 0 && postBatchSize > effectiveSignalIntervalWr) {
+      postBatchSize = effectiveSignalIntervalWr;
+    }
   }
   if (postBatchSize <= 0) postBatchSize = 1;
   int numPostBatch = (mergedWrCount + postBatchSize - 1) / postBatchSize;
@@ -458,8 +564,9 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
     std::string reserveErr;
     SqReserveFailureKind reserveFailure = SqReserveFailureKind::None;
     if (!TryReserveSqDepth(eps[epId], batchWrNum, epId, "batch", &reserveErr, &reserveFailure)) {
-      AppendHint(&reserveErr, BuildSqDepthHint(eps[epId], epNum, postBatchSize,
-                                               PostSendOpKind::BatchData, reserveFailure));
+      AppendHint(&reserveErr,
+                 BuildSqDepthHint(eps[epId], epNum, postBatchSize, effectiveSignalIntervalWr,
+                                  PostSendOpKind::BatchData, reserveFailure));
       return {StatusCode::ERR_RDMA_OP, reserveErr};
     }
 
@@ -475,8 +582,10 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
     epMergedSinceSignal[epId] += mergedReqSize;
 
     bool isLastBatchForEp = ((i + epNum) >= numPostBatch);
+    bool signalIntervalReached =
+        effectiveSignalIntervalWr > 0 && epWrsSinceSignal[epId] >= effectiveSignalIntervalWr;
     bool sqNearFull = eps[epId].sqDepth && (epWrsSinceSignal[epId] >= eps[epId].maxSqDepth);
-    bool needSignal = isLastBatchForEp || sqNearFull;
+    bool needSignal = isLastBatchForEp || signalIntervalReached || sqNearFull;
 
     struct ibv_send_wr& last = mergedWrs[end - 1].wr;
     uint64_t recordId = 0;

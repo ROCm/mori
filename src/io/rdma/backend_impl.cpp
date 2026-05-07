@@ -363,7 +363,10 @@ EndpointId RdmaManager::ConnectEndpoint(EngineKey remoteKey, int devId,
             std::make_shared<std::atomic<int>>(0),
             static_cast<int>(epConfig.maxMsgsNum),
             std::make_shared<std::atomic<bool>>(false),
-            std::make_shared<SubmissionLedger>(config.notifPerQp)};
+            std::make_shared<SubmissionLedger>(config.notifPerQp),
+            config.qpPerTransfer,
+            config.numWorkerThreads,
+            std::make_shared<SqCqeDiagnostics>()};
   meta.rTable[topoKey].push_back(ep);
 
   EndpointId id = nextEndpointId_.fetch_add(1);
@@ -469,6 +472,7 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
   const EpPair& ep = rt->ep;
   ibv_cq* cq = ep.local.ibvHandle.cq;
   FlushDrainStats flushDrain;
+  RecordSqPollAttempt(ep);
 
   // Resolve notif context once before the CQ drain loop.
   QpNotifContext* notifCtxPtr = nullptr;
@@ -483,6 +487,7 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
   int n = 0;
 
   while ((n = ibv_poll_cq(cq, batchSize, wc)) > 0) {
+    RecordSqPollCqes(ep, n);
     for (int i = 0; i < n; ++i) {
       if (wc[i].status != IBV_WC_SUCCESS) {
         const bool isFlush = (wc[i].status == IBV_WC_WR_FLUSH_ERR);
@@ -514,9 +519,11 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
         }
 
         int mergedBatchSize = 0;
-        auto meta = ep.ledger
-                        ? ep.ledger->ReleaseByCqe(wc[i].wr_id, ep.sqDepth.get(), &mergedBatchSize)
-                        : nullptr;
+        int releasedWr = 0;
+        auto meta = ep.ledger ? ep.ledger->ReleaseByCqe(wc[i].wr_id, ep.sqDepth.get(),
+                                                        &mergedBatchSize, &releasedWr)
+                              : nullptr;
+        RecordSqBatchReleaseWr(ep, releasedWr);
         if (meta) {
           (void)meta->finishedBatchSize.fetch_add(mergedBatchSize);
           if (isFlush) {
@@ -611,9 +618,11 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
         // Batch path: wr_id carries a recordId from the SubmissionLedger.
         uint64_t recordId = wc[i].wr_id;
         int mergedBatchSize = 0;
-        auto meta = ep.ledger
-                        ? ep.ledger->ReleaseByCqe(recordId, ep.sqDepth.get(), &mergedBatchSize)
-                        : nullptr;
+        int releasedWr = 0;
+        auto meta = ep.ledger ? ep.ledger->ReleaseByCqe(recordId, ep.sqDepth.get(),
+                                                        &mergedBatchSize, &releasedWr)
+                              : nullptr;
+        RecordSqBatchReleaseWr(ep, releasedWr);
         if (meta) {
           uint32_t finishedBefore = meta->finishedBatchSize.fetch_add(mergedBatchSize);
           TransferStatus* statusPtr = meta->status;

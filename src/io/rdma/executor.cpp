@@ -135,7 +135,7 @@ MultithreadExecutor::MultithreadExecutor(int n) : numWorker(n) {
 
 MultithreadExecutor::~MultithreadExecutor() { Shutdown(); }
 
-std::vector<std::pair<int, int>> MultithreadExecutor::SplitWork(const ExecutorReq& req) {
+std::vector<MultithreadExecutor::WorkSplit> MultithreadExecutor::SplitWork(const ExecutorReq& req) {
   int numEps = req.eps.size();
   int totalBatchSize = req.sizes.size();
 
@@ -143,12 +143,16 @@ std::vector<std::pair<int, int>> MultithreadExecutor::SplitWork(const ExecutorRe
 
   int numActiveWorkers = std::min(numEps, numWorker);
   int perWorkerBatchSize = (totalBatchSize + numActiveWorkers - 1) / numActiveWorkers;
+  int startWorker = totalBatchSize < numActiveWorkers
+                        ? static_cast<int>(req.id % static_cast<TransferUniqueId>(numActiveWorkers))
+                        : 0;
 
-  std::vector<std::pair<int, int>> splits;
+  std::vector<WorkSplit> splits;
   for (int i = 0; i < numActiveWorkers; i++) {
     int begin = i * perWorkerBatchSize;
     int end = std::min(begin + perWorkerBatchSize, totalBatchSize);
-    splits.push_back({begin, end});
+    int workerId = totalBatchSize < numActiveWorkers ? (startWorker + i) % numActiveWorkers : i;
+    splits.push_back({workerId, workerId, begin, end});
     if (end >= totalBatchSize) break;
   }
 
@@ -163,9 +167,9 @@ RdmaOpRet MultithreadExecutor::RdmaBatchReadWrite(const ExecutorReq& req) {
   std::vector<std::future<RdmaOpRet>> futs;
 
   for (int i = 0; i < numSplits; i++) {
-    Task task{&req, i, splits[i].first, splits[i].second};
+    Task task{&req, splits[i].epId, splits[i].begin, splits[i].end};
     futs.push_back(std::move(task.ret.get_future()));
-    pool[i]->Submit(std::move(task));
+    pool[splits[i].workerId]->Submit(std::move(task));
   }
 
   bool hasFail = false;
