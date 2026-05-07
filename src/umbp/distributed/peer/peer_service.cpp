@@ -29,6 +29,7 @@
 
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/env_time.h"
+#include "umbp/distributed/peer/peer_dram_allocator.h"
 #include "umbp/distributed/pool_client.h"
 #include "umbp/distributed/types.h"
 #include "umbp/local/block_index/local_block_index.h"
@@ -52,8 +53,9 @@ struct StagingSlot {
   std::chrono::steady_clock::time_point allocated_at;
 };
 
-int AllocateSlot(std::vector<StagingSlot>& slots, std::atomic<uint64_t>& next_lease_id,
-                 std::chrono::seconds lease_timeout, size_t request_size, StagingMetrics& metrics) {
+int ClaimStagingSlot(std::vector<StagingSlot>& slots, std::atomic<uint64_t>& next_lease_id,
+                     std::chrono::seconds lease_timeout, size_t request_size,
+                     StagingMetrics& metrics) {
   auto now = std::chrono::steady_clock::now();
   for (auto& slot : slots) {
     if (slot.in_use && now - slot.allocated_at > lease_timeout) {
@@ -102,19 +104,70 @@ uint64_t RemainingTtlMs(std::chrono::steady_clock::time_point alloc_time,
 }
 }  // namespace
 
+namespace {
+
+// Translate proto TierType <-> umbp::TierType.  Defined inline because
+// only the peer service handlers need them.
+TierType FromProtoTier(::umbp::TierType t) {
+  switch (t) {
+    case ::umbp::TIER_HBM:
+      return TierType::HBM;
+    case ::umbp::TIER_DRAM:
+      return TierType::DRAM;
+    case ::umbp::TIER_SSD:
+      return TierType::SSD;
+    default:
+      return TierType::UNKNOWN;
+  }
+}
+::umbp::TierType ToProtoTier(TierType t) {
+  switch (t) {
+    case TierType::HBM:
+      return ::umbp::TIER_HBM;
+    case TierType::DRAM:
+      return ::umbp::TIER_DRAM;
+    case TierType::SSD:
+      return ::umbp::TIER_SSD;
+    default:
+      return ::umbp::TIER_UNKNOWN;
+  }
+}
+
+// Drop a (pages, page_size, descs) tuple into a slot-shaped response
+// that exposes those fields directly.  Templated so the same body
+// covers AllocateSlotResponse and ResolveKeyResponse.
+template <typename Response>
+void FillPagesAndDescs(Response* resp, const std::vector<PageLocation>& pages, uint64_t page_size,
+                       const std::vector<BufferMemoryDescBytes>& descs) {
+  for (const auto& p : pages) {
+    auto* pl = resp->add_pages();
+    pl->set_buffer_index(p.buffer_index);
+    pl->set_page_index(p.page_index);
+  }
+  resp->set_page_size(page_size);
+  for (const auto& d : descs) {
+    auto* desc = resp->add_descs();
+    desc->set_buffer_index(d.buffer_index);
+    desc->set_desc(std::string(d.desc_bytes.begin(), d.desc_bytes.end()));
+  }
+}
+
+}  // namespace
+
 class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Service {
  public:
   UMBPPeerServiceImpl(void* ssd_staging_base, size_t ssd_staging_size,
                       const std::vector<uint8_t>& ssd_staging_mem_desc_bytes,
                       LocalStorageManager& storage, LocalBlockIndex& index, PoolClient& coordinator,
-                      StagingMetrics& metrics, int num_read_slots, int num_write_slots,
-                      int lease_timeout_s)
+                      PeerDramAllocator* dram_alloc, StagingMetrics& metrics, int num_read_slots,
+                      int num_write_slots, int lease_timeout_s)
       : ssd_staging_base_(ssd_staging_base),
         ssd_staging_size_(ssd_staging_size),
         ssd_staging_mem_desc_bytes_(ssd_staging_mem_desc_bytes),
         storage_(storage),
         index_(index),
         coordinator_(coordinator),
+        dram_alloc_(dram_alloc),
         metrics_(metrics),
         lease_timeout_(std::max(lease_timeout_s, 1)),
         num_read_slots_(std::max(num_read_slots, 1)),
@@ -137,6 +190,25 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
     response->set_ssd_staging_mem_desc(
         std::string(ssd_staging_mem_desc_bytes_.begin(), ssd_staging_mem_desc_bytes_.end()));
     response->set_ssd_staging_size(ssd_staging_size_);
+    if (dram_alloc_ != nullptr) {
+      // Ship every configured DRAM/HBM buffer's desc so first-contact
+      // writers can hydrate without a follow-up Allocate / Resolve.
+      // DRAM and HBM share a single page_size in this design, so the
+      // single field on the response is sufficient.
+      auto dram_descs = dram_alloc_->AllBufferDescs(TierType::DRAM);
+      auto hbm_descs = dram_alloc_->AllBufferDescs(TierType::HBM);
+      for (const auto& d : dram_descs) {
+        auto* out = response->add_dram_memory_descs();
+        out->set_buffer_index(d.buffer_index);
+        out->set_desc(std::string(d.desc_bytes.begin(), d.desc_bytes.end()));
+      }
+      for (const auto& d : hbm_descs) {
+        auto* out = response->add_dram_memory_descs();
+        out->set_buffer_index(d.buffer_index);
+        out->set_desc(std::string(d.desc_bytes.begin(), d.desc_bytes.end()));
+      }
+      response->set_dram_page_size(dram_alloc_->PageSize());
+    }
     return grpc::Status::OK;
   }
 
@@ -156,7 +228,7 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
     {
       std::lock_guard<std::mutex> lock(write_slots_mutex_);
       slot_idx =
-          AllocateSlot(write_slots_, next_lease_id_, lease_timeout_, request->size(), metrics_);
+          ClaimStagingSlot(write_slots_, next_lease_id_, lease_timeout_, request->size(), metrics_);
       if (slot_idx < 0) {
         metrics_.slot_full_rejects.fetch_add(1, std::memory_order_relaxed);
         response->set_success(false);
@@ -292,7 +364,7 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
     {
       std::lock_guard<std::mutex> lock(read_slots_mutex_);
       slot_idx =
-          AllocateSlot(read_slots_, next_lease_id_, lease_timeout_, request->size(), metrics_);
+          ClaimStagingSlot(read_slots_, next_lease_id_, lease_timeout_, request->size(), metrics_);
       if (slot_idx < 0) {
         metrics_.slot_full_rejects.fetch_add(1, std::memory_order_relaxed);
         MORI_UMBP_WARN("[PeerService] PrepareSsdRead: no free staging slots");
@@ -337,6 +409,145 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
     return grpc::Status::OK;
   }
 
+  // ============================================================
+  //  DRAM/HBM allocator + key map (master-as-advisor design)
+  // ============================================================
+
+  grpc::Status AllocateSlot(grpc::ServerContext* /*ctx*/,
+                            const ::umbp::AllocateSlotRequest* request,
+                            ::umbp::AllocateSlotResponse* response) override {
+    if (dram_alloc_ == nullptr) {
+      response->set_success(false);
+      return grpc::Status::OK;
+    }
+    auto pending = dram_alloc_->Allocate(request->size(), FromProtoTier(request->tier()));
+    if (!pending) {
+      response->set_success(false);
+      return grpc::Status::OK;
+    }
+    auto descs = dram_alloc_->BufferDescsForPages(pending->tier, pending->pages);
+    response->set_success(true);
+    response->set_slot_id(pending->slot_id);
+    FillPagesAndDescs(response, pending->pages, dram_alloc_->PageSize(), descs);
+    response->set_pending_ttl_ms(dram_alloc_->PendingTtlMs());
+    return grpc::Status::OK;
+  }
+
+  grpc::Status CommitSlot(grpc::ServerContext* /*ctx*/, const ::umbp::CommitSlotRequest* request,
+                          ::umbp::CommitSlotResponse* response) override {
+    if (dram_alloc_ == nullptr) {
+      response->set_success(false);
+      return grpc::Status::OK;
+    }
+    response->set_success(dram_alloc_->Commit(request->slot_id(), request->key()));
+    return grpc::Status::OK;
+  }
+
+  grpc::Status AbortSlot(grpc::ServerContext* /*ctx*/, const ::umbp::AbortSlotRequest* request,
+                         ::umbp::AbortSlotResponse* response) override {
+    if (dram_alloc_ == nullptr) {
+      response->set_success(true);  // idempotent: nothing to drop
+      return grpc::Status::OK;
+    }
+    response->set_success(dram_alloc_->Abort(request->slot_id()));
+    return grpc::Status::OK;
+  }
+
+  grpc::Status ResolveKey(grpc::ServerContext* /*ctx*/, const ::umbp::ResolveKeyRequest* request,
+                          ::umbp::ResolveKeyResponse* response) override {
+    if (dram_alloc_ == nullptr) {
+      response->set_found(false);
+      return grpc::Status::OK;
+    }
+    auto r = dram_alloc_->Resolve(request->key());
+    response->set_found(r.found);
+    if (!r.found) return grpc::Status::OK;
+    auto descs = dram_alloc_->BufferDescsForPages(r.tier, r.pages);
+    FillPagesAndDescs(response, r.pages, dram_alloc_->PageSize(), descs);
+    response->set_size(r.size);
+    return grpc::Status::OK;
+  }
+
+  grpc::Status EvictKey(grpc::ServerContext* /*ctx*/, const ::umbp::EvictKeyRequest* request,
+                        ::umbp::EvictKeyResponse* response) override {
+    if (dram_alloc_ == nullptr) {
+      // No DRAM/HBM tier on this peer — nothing to evict, treat as success.
+      return grpc::Status::OK;
+    }
+    std::vector<std::string> keys(request->keys().begin(), request->keys().end());
+    auto results = dram_alloc_->Evict(keys);
+    for (const auto& r : results) {
+      auto* entry = response->add_evicted();
+      entry->set_key(r.key);
+      entry->set_bytes_freed(r.bytes_freed);
+    }
+    return grpc::Status::OK;
+  }
+
+  // -------- Batch variants --------
+
+  grpc::Status BatchAllocateSlots(grpc::ServerContext* /*ctx*/,
+                                  const ::umbp::BatchAllocateSlotsRequest* request,
+                                  ::umbp::BatchAllocateSlotsResponse* response) override {
+    for (const auto& entry : request->entries()) {
+      auto* out = response->add_entries();
+      if (dram_alloc_ == nullptr) {
+        out->set_success(false);
+        continue;
+      }
+      auto pending = dram_alloc_->Allocate(entry.size(), FromProtoTier(entry.tier()));
+      if (!pending) {
+        out->set_success(false);
+        continue;
+      }
+      auto descs = dram_alloc_->BufferDescsForPages(pending->tier, pending->pages);
+      out->set_success(true);
+      out->set_slot_id(pending->slot_id);
+      FillPagesAndDescs(out, pending->pages, dram_alloc_->PageSize(), descs);
+      out->set_pending_ttl_ms(dram_alloc_->PendingTtlMs());
+    }
+    return grpc::Status::OK;
+  }
+
+  grpc::Status BatchCommitSlots(grpc::ServerContext* /*ctx*/,
+                                const ::umbp::BatchCommitSlotsRequest* request,
+                                ::umbp::BatchCommitSlotsResponse* response) override {
+    for (const auto& entry : request->entries()) {
+      const bool ok = dram_alloc_ != nullptr && dram_alloc_->Commit(entry.slot_id(), entry.key());
+      response->add_success(ok);
+    }
+    return grpc::Status::OK;
+  }
+
+  grpc::Status BatchAbortSlots(grpc::ServerContext* /*ctx*/,
+                               const ::umbp::BatchAbortSlotsRequest* request,
+                               ::umbp::BatchAbortSlotsResponse* response) override {
+    for (uint64_t slot_id : request->slot_ids()) {
+      const bool ok = dram_alloc_ == nullptr ? true : dram_alloc_->Abort(slot_id);
+      response->add_success(ok);
+    }
+    return grpc::Status::OK;
+  }
+
+  grpc::Status BatchResolveKeys(grpc::ServerContext* /*ctx*/,
+                                const ::umbp::BatchResolveKeysRequest* request,
+                                ::umbp::BatchResolveKeysResponse* response) override {
+    for (const auto& key : request->keys()) {
+      auto* out = response->add_entries();
+      if (dram_alloc_ == nullptr) {
+        out->set_found(false);
+        continue;
+      }
+      auto r = dram_alloc_->Resolve(key);
+      out->set_found(r.found);
+      if (!r.found) continue;
+      auto descs = dram_alloc_->BufferDescsForPages(r.tier, r.pages);
+      FillPagesAndDescs(out, r.pages, dram_alloc_->PageSize(), descs);
+      out->set_size(r.size);
+    }
+    return grpc::Status::OK;
+  }
+
  private:
   void* ssd_staging_base_;
   size_t ssd_staging_size_;
@@ -344,6 +555,7 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
   LocalStorageManager& storage_;
   LocalBlockIndex& index_;
   PoolClient& coordinator_;
+  PeerDramAllocator* dram_alloc_;
   StagingMetrics& metrics_;
 
   const std::chrono::seconds lease_timeout_;
@@ -363,17 +575,18 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
 PeerServiceServer::PeerServiceServer(void* ssd_staging_base, size_t ssd_staging_size,
                                      const std::vector<uint8_t>& ssd_staging_mem_desc_bytes,
                                      LocalStorageManager& storage, LocalBlockIndex& index,
-                                     PoolClient& coordinator, int num_read_slots,
-                                     int num_write_slots, int lease_timeout_s)
+                                     PoolClient& coordinator, PeerDramAllocator* dram_alloc,
+                                     int num_read_slots, int num_write_slots, int lease_timeout_s)
     : ssd_staging_base_(ssd_staging_base),
       ssd_staging_size_(ssd_staging_size),
       storage_(storage),
       index_(index),
       coordinator_(coordinator),
+      dram_alloc_(dram_alloc),
       ssd_staging_mem_desc_bytes_(ssd_staging_mem_desc_bytes) {
   service_ = std::make_unique<UMBPPeerServiceImpl>(
       ssd_staging_base_, ssd_staging_size_, ssd_staging_mem_desc_bytes_, storage_, index_,
-      coordinator_, metrics_, num_read_slots, num_write_slots, lease_timeout_s);
+      coordinator_, dram_alloc_, metrics_, num_read_slots, num_write_slots, lease_timeout_s);
 }
 
 PeerServiceServer::~PeerServiceServer() { Stop(); }

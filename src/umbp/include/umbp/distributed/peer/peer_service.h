@@ -35,6 +35,7 @@ namespace mori::umbp {
 class LocalStorageManager;
 class LocalBlockIndex;
 class PoolClient;
+class PeerDramAllocator;
 
 struct StagingMetrics {
   std::atomic<uint64_t> expired_reclaims{0};
@@ -44,10 +45,17 @@ struct StagingMetrics {
 
 class PeerServiceServer {
  public:
+  // `dram_alloc` is non-owning and may be null when the host process has
+  // no DRAM/HBM tier (SSD-only deployments).  When null, the new
+  // AllocateSlot/CommitSlot/AbortSlot/ResolveKey/EvictKey handlers
+  // respond with success=false / found=false; SSD staging RPCs continue
+  // to work unchanged.  PoolClient is the typical owner of the
+  // allocator and outlives this server.
   PeerServiceServer(void* ssd_staging_base, size_t ssd_staging_size,
                     const std::vector<uint8_t>& ssd_staging_mem_desc_bytes,
                     LocalStorageManager& storage, LocalBlockIndex& index, PoolClient& coordinator,
-                    int num_read_slots = 8, int num_write_slots = 8, int lease_timeout_s = 10);
+                    PeerDramAllocator* dram_alloc = nullptr, int num_read_slots = 8,
+                    int num_write_slots = 8, int lease_timeout_s = 10);
   ~PeerServiceServer();
 
   bool Start(uint16_t port);
@@ -55,12 +63,18 @@ class PeerServiceServer {
 
   const StagingMetrics& Metrics() const { return metrics_; }
 
+  // Read-only access for the heartbeat shipper (lives in MasterClient
+  // / PoolClient).  Never null after construction with a non-null
+  // allocator argument.
+  PeerDramAllocator* DramAllocator() const { return dram_alloc_; }
+
  private:
   void* ssd_staging_base_;
   size_t ssd_staging_size_;
   LocalStorageManager& storage_;
   LocalBlockIndex& index_;
   PoolClient& coordinator_;
+  PeerDramAllocator* dram_alloc_;
 
   StagingMetrics metrics_;
 

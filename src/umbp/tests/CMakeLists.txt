@@ -44,3 +44,15 @@ target_link_libraries(test_client_registry_external_kv
 target_compile_features(test_client_registry_external_kv PRIVATE cxx_std_17)
 
 gtest_discover_tests(test_client_registry_external_kv)
+
+# ---------------------------------------------------------------------------
+# test_peer_dram_allocator
+# ---------------------------------------------------------------------------
+add_executable(test_peer_dram_allocator test_peer_dram_allocator.cpp)
+
+target_link_libraries(test_peer_dram_allocator PRIVATE umbp_common
+                                                       GTest::gtest_main)
+
+target_compile_features(test_peer_dram_allocator PRIVATE cxx_std_17)
+
+gtest_discover_tests(test_peer_dram_allocator)

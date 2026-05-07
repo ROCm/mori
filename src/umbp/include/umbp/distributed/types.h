@@ -99,12 +99,25 @@ struct PageLocation {
 };
 
 // One peer-side buffer's RDMA MemoryDesc bytes plus the buffer_index it
-// belongs to.  Returned by ClientRegistry helpers and threaded through
-// Master -> Client RoutePut/RouteGet responses so the Client can hydrate
-// its peer-side buffer_index -> MemoryDesc cache in a single batch.
+// belongs to.  Returned by PeerDramAllocator and the peer service in
+// AllocateSlot / ResolveKey / GetPeerInfo responses so the Client can
+// hydrate its peer-side buffer_index -> MemoryDesc cache in a single
+// batch.
 struct BufferMemoryDescBytes {
   uint32_t buffer_index = 0;
   std::vector<uint8_t> desc_bytes;
+};
+
+// One mutation in a peer's owned-key set, shipped via Heartbeat.  Mirrors
+// the wire-level umbp::KvEvent — kept as a plain C++ struct so the peer
+// allocator (and its unit tests) do not have to depend on the generated
+// proto headers.
+struct KvEvent {
+  enum class Kind : int { ADD = 0, REMOVE = 1 };
+  Kind kind = Kind::ADD;
+  std::string key;
+  TierType tier = TierType::UNKNOWN;
+  uint64_t size = 0;  // ADD only; REMOVE leaves this 0
 };
 
 struct ClientRecord {
