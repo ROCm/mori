@@ -36,6 +36,7 @@
 #include "umbp/distributed/master/external_kv_block_index.h"
 #include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/routing/router.h"
+#include "umbp_peer.grpc.pb.h"
 
 namespace mori::umbp {
 
@@ -60,6 +61,76 @@ KvEvent FromProtoEvent(const ::umbp::KvEvent& pe) {
   ev.size = pe.size();
   return ev;
 }
+
+int EvictKeyDeadlineMs() {
+  static const int v =
+      static_cast<int>(GetEnvMilliseconds("UMBP_EVICTKEY_DEADLINE_MS",
+                                          std::chrono::milliseconds(1000), /*min_allowed=*/1)
+                           .count());
+  return v;
+}
+
+// Master-owned outbound stub pool.  EvictionManager calls into this to
+// ship EvictKey to peers; the pool keeps one stub per node_id and
+// drops it when the peer's address changes or the RPC fails (so the
+// next dispatch rebuilds against a fresh channel).
+class MasterPeerStubPool : public EvictKeyDispatcher {
+ public:
+  void DispatchEvictKey(const std::string& node_id, const std::string& peer_address,
+                        std::vector<std::string> keys) override {
+    if (keys.empty() || peer_address.empty()) return;
+
+    auto stub = GetOrCreateStub(node_id, peer_address);
+    if (stub == nullptr) return;
+
+    ::umbp::EvictKeyRequest req;
+    for (auto& k : keys) req.add_keys(std::move(k));
+    ::umbp::EvictKeyResponse resp;
+    grpc::ClientContext ctx;
+    ctx.set_deadline(std::chrono::system_clock::now() +
+                     std::chrono::milliseconds(EvictKeyDeadlineMs()));
+
+    auto status = stub->EvictKey(&ctx, req, &resp);
+    if (!status.ok()) {
+      MORI_UMBP_WARN("[Master] EvictKey to {} failed: {} (will retry next round)", node_id,
+                     status.error_message());
+      // Drop the cached stub so the next dispatch picks up a fresh
+      // channel (covers transient gRPC channel teardown / restart).
+      DropStub(node_id);
+      return;
+    }
+    MORI_UMBP_DEBUG("[Master] EvictKey to {}: {} entries acked", node_id, resp.evicted_size());
+  }
+
+  // Called when ClientRegistry sees a node leave (Unregister or
+  // expiry) so we don't sit on a stale stub for a node that has gone.
+  void DropStub(const std::string& node_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    entries_.erase(node_id);
+  }
+
+ private:
+  struct Entry {
+    std::string peer_address;
+    std::shared_ptr<::umbp::UMBPPeer::Stub> stub;
+  };
+
+  std::shared_ptr<::umbp::UMBPPeer::Stub> GetOrCreateStub(const std::string& node_id,
+                                                          const std::string& peer_address) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = entries_.find(node_id);
+    if (it != entries_.end() && it->second.peer_address == peer_address) return it->second.stub;
+
+    auto channel = grpc::CreateChannel(peer_address, grpc::InsecureChannelCredentials());
+    if (channel == nullptr) return nullptr;
+    std::shared_ptr<::umbp::UMBPPeer::Stub> stub(::umbp::UMBPPeer::NewStub(channel).release());
+    entries_[node_id] = Entry{peer_address, stub};
+    return stub;
+  }
+
+  std::mutex mutex_;
+  std::unordered_map<std::string, Entry> entries_;
+};
 
 }  // namespace
 
@@ -440,8 +511,9 @@ MasterServer::MasterServer(MasterServerConfig config)
       router_(index_, registry_, std::move(config_.get_strategy), std::move(config_.put_strategy)),
       service_(std::make_unique<UMBPMasterServiceImpl>(registry_, index_, external_kv_index_,
                                                        router_, config_.registry_config, nullptr)),
-      eviction_manager_(
-          std::make_unique<EvictionManager>(index_, registry_, config_.eviction_config)) {
+      peer_stub_pool_(std::make_unique<MasterPeerStubPool>()),
+      eviction_manager_(std::make_unique<EvictionManager>(
+          index_, registry_, config_.eviction_config, peer_stub_pool_.get())) {
   router_.SetLeaseDuration(config_.eviction_config.lease_duration);
   registry_.SetExternalKvBlockIndex(&external_kv_index_);
 }

@@ -70,6 +70,12 @@ class MasterServer {
   class UMBPMasterServiceImpl;
   std::unique_ptr<UMBPMasterServiceImpl> service_;
 
+  // Outbound peer-stub pool used by EvictionManager to ship EvictKey
+  // RPCs.  Defined in master_server.cpp's anonymous namespace; the
+  // header sees only the EvictKeyDispatcher base.  Must outlive
+  // eviction_manager_, which holds a non-owning pointer to it.
+  std::unique_ptr<EvictKeyDispatcher> peer_stub_pool_;
+
   std::unique_ptr<EvictionManager> eviction_manager_;
 
   std::atomic<uint16_t> bound_port_{0};

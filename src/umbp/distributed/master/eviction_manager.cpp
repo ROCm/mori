@@ -36,8 +36,8 @@
 namespace mori::umbp {
 
 EvictionManager::EvictionManager(GlobalBlockIndex& index, ClientRegistry& registry,
-                                 const EvictionConfig& config)
-    : index_(index), registry_(registry), config_(config) {}
+                                 const EvictionConfig& config, EvictKeyDispatcher* dispatcher)
+    : index_(index), registry_(registry), config_(config), dispatcher_(dispatcher) {}
 
 EvictionManager::~EvictionManager() { Stop(); }
 
@@ -132,16 +132,31 @@ void EvictionManager::RunOnce() {
 
   if (selected == 0) return;
 
-  MORI_UMBP_INFO(
-      "[EvictionManager] Selected {} victims across {} nodes (RPC dispatch lands in phase D)",
-      selected, per_node_keys.size());
+  MORI_UMBP_INFO("[EvictionManager] Selected {} victims across {} nodes", selected,
+                 per_node_keys.size());
 
-  // Phase D plug-in point: for each (node, keys[]) pair, call
-  //   peer_stub.EvictKey(keys[]) via the master-server-owned stub pool,
-  // then leave the index alone — peer's REMOVE events on the next
-  // heartbeat are the source of truth.  For now we just log.
-  for (const auto& [node_id, keys] : per_node_keys) {
-    MORI_UMBP_DEBUG("[EvictionManager] would EvictKey on node={} ({} keys)", node_id, keys.size());
+  // Look up peer addresses once per dispatch round.  ClientRegistry
+  // owns the (node_id -> peer_address) mapping; we can't ship an
+  // EvictKey to a node that has dropped out.
+  std::unordered_map<std::string, std::string> node_to_peer;
+  for (const auto& client : clients) node_to_peer[client.node_id] = client.peer_address;
+
+  for (auto& [node_id, keys] : per_node_keys) {
+    auto it = node_to_peer.find(node_id);
+    if (it == node_to_peer.end() || it->second.empty()) {
+      MORI_UMBP_WARN("[EvictionManager] no peer_address for node={} — skipping {} keys", node_id,
+                     keys.size());
+      continue;
+    }
+    if (dispatcher_ == nullptr) {
+      MORI_UMBP_DEBUG("[EvictionManager] dispatcher unset; would EvictKey on node={} ({} keys)",
+                      node_id, keys.size());
+      continue;
+    }
+    // Master state is unchanged here — REMOVE events on the peer's
+    // next heartbeat are what shrink the index.  Re-eviction next
+    // round is safe because peer Evict is idempotent.
+    dispatcher_->DispatchEvictKey(node_id, it->second, std::move(keys));
   }
 }
 
