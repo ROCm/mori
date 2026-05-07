@@ -168,7 +168,7 @@ static bool EpDegraded(const EpPair& ep) {
   return ep.degraded && ep.degraded->load(std::memory_order_relaxed);
 }
 
-static void MarkEpDegraded(const EpPair& ep, SqDegradeReason reason) {
+static void MarkEpDegradedFromCqe(const EpPair& ep, SqDegradeReason reason) {
   if (ep.sq) {
     ep.sq->MarkDegraded(reason);
   } else if (ep.degraded) {
@@ -176,8 +176,8 @@ static void MarkEpDegraded(const EpPair& ep, SqDegradeReason reason) {
   }
 }
 
-static void FailUniqueSubmissionMetas(const std::vector<SubmissionRecord>& records,
-                                      const std::string& message) {
+static void FailUniqueSubmissionMetasFromCqe(const std::vector<SubmissionRecord>& records,
+                                             const std::string& message) {
   std::unordered_set<CqCallbackMeta*> seen;
   for (const auto& record : records) {
     if (!record.meta || !seen.insert(record.meta.get()).second) continue;
@@ -196,14 +196,14 @@ static void FailUniqueSubmissionMetas(const std::vector<SubmissionRecord>& recor
   }
 }
 
-static void ExtractAndFailOrphanedRecords(const EpPair& ep, const std::string& message) {
+static void ExtractAndFailOrphanedRecordsFromCqe(const EpPair& ep, const std::string& message) {
   if (!ep.ledger) return;
   std::vector<SubmissionRecord> orphaned;
   ep.ledger->ExtractOrphanedRecords(&orphaned);
   if (!orphaned.empty()) {
     MORI_IO_WARN("ProcessOneCqe: failing {} orphaned record(s) on endpoint qpn={}", orphaned.size(),
                  ep.local.handle.qpn);
-    FailUniqueSubmissionMetas(orphaned, message);
+    FailUniqueSubmissionMetasFromCqe(orphaned, message);
   }
 }
 
@@ -440,21 +440,20 @@ EndpointId RdmaManager::ConnectEndpoint(EngineKey remoteKey, int devId,
   auto epConfig = GetRdmaEndpointConfig(devId);
   EndpointId id = nextEndpointId_.fetch_add(1);
   const int maxSqDepth = static_cast<int>(epConfig.maxMsgsNum);
-  EpPair ep{id,
-            weight,
-            devId,
-            rdevId,
-            remoteKey,
-            local,
-            remote,
-            std::make_shared<SqController>(maxSqDepth, GetSqResumeWatermarkWrForDepth(maxSqDepth)),
-            nullptr,
-            maxSqDepth,
-            nullptr,
-            std::make_shared<SubmissionLedger>(config.notifPerQp),
-            config.qpPerTransfer,
-            config.numWorkerThreads,
-            std::make_shared<SqCqeDiagnostics>()};
+  EpPair ep{};
+  ep.endpointId = id;
+  ep.weight = weight;
+  ep.ldevId = devId;
+  ep.rdevId = rdevId;
+  ep.remoteEngineKey = remoteKey;
+  ep.local = local;
+  ep.remote = remote;
+  ep.sq = std::make_shared<SqController>(maxSqDepth, GetSqResumeWatermarkWrForDepth(maxSqDepth));
+  ep.maxSqDepth = maxSqDepth;
+  ep.ledger = std::make_shared<SubmissionLedger>(config.notifPerQp);
+  ep.qpPerTransfer = config.qpPerTransfer;
+  ep.numWorkerThreads = config.numWorkerThreads;
+  ep.sqCqeDiagnostics = std::make_shared<SqCqeDiagnostics>();
   meta.rTable[topoKey].push_back(ep);
 
   auto rt = std::make_shared<EndpointRuntime>(id, ep);
@@ -651,10 +650,10 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
         if (!isFlush && IsTerminalCqeStatus(wc[i].status)) {
           std::unique_lock<std::shared_mutex> recoveryGuard;
           if (ep.sq) recoveryGuard = ep.sq->AcquireRecoveryGuard();
-          MarkEpDegraded(ep, SqDegradeReason::FatalCqe);
-          ExtractAndFailOrphanedRecords(ep, failureAdvice.ComposeStatusMessage());
+          MarkEpDegradedFromCqe(ep, SqDegradeReason::FatalCqe);
+          ExtractAndFailOrphanedRecordsFromCqe(ep, failureAdvice.ComposeStatusMessage());
         } else if (EpDegraded(ep) && ep.ledger && ep.ledger->HasOrphaned()) {
-          ExtractAndFailOrphanedRecords(ep, failureAdvice.ComposeStatusMessage());
+          ExtractAndFailOrphanedRecordsFromCqe(ep, failureAdvice.ComposeStatusMessage());
         }
         continue;
       }
@@ -1228,7 +1227,17 @@ void RdmaBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remot
   }
   eps = rdma->GetAllEndpoint(ekey, kp);
   if (static_cast<int>(eps.size()) < config.qpPerTransfer) {
-    throw std::runtime_error("RDMA CreateSession could not allocate enough healthy endpoints");
+    std::string message =
+        "RDMA CreateSession could not allocate enough healthy endpoints: remoteEngine=" + ekey +
+        ", localTopo=(" + std::to_string(localKey.deviceId) + "," +
+        std::to_string(static_cast<uint32_t>(localKey.loc)) + "), remoteTopo=(" +
+        std::to_string(remoteKey.deviceId) + "," +
+        std::to_string(static_cast<uint32_t>(remoteKey.loc)) +
+        "), requestedQpPerTransfer=" + std::to_string(config.qpPerTransfer) +
+        ", healthyEndpointCount=" + std::to_string(eps.size()) +
+        ", attempts=" + std::to_string(maxAttempts);
+    MORI_IO_ERROR("{}", message);
+    throw std::runtime_error(std::move(message));
   }
 
   EpPairVec epSet = {eps.begin(), eps.begin() + config.qpPerTransfer};

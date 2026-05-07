@@ -36,6 +36,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <future>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -62,6 +63,16 @@ struct TestFailure : public std::runtime_error {
 
 void Require(bool cond, const std::string& msg) {
   if (!cond) throw TestFailure(msg);
+}
+
+template <typename Predicate>
+bool WaitUntil(Predicate pred, std::chrono::milliseconds timeout) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (pred()) return true;
+    std::this_thread::yield();
+  }
+  return pred();
 }
 
 class ScopedEnvVar {
@@ -273,14 +284,20 @@ void CaseSqControllerReserveReleaseWait() {
 
   std::atomic<bool> waiterDone{false};
   std::atomic<bool> waiterOk{false};
+  std::promise<void> waiterStartedPromise;
+  std::future<void> waiterStarted = waiterStartedPromise.get_future();
   std::thread waiter([&]() {
+    waiterStartedPromise.set_value();
     ReserveResult waitResult;
     waiterOk.store(sq.Reserve(1, opts, &waitResult), std::memory_order_release);
     waiterDone.store(true, std::memory_order_release);
   });
 
-  std::this_thread::sleep_for(std::chrono::milliseconds(20));
-  Require(!waiterDone.load(std::memory_order_acquire), "waiter should block while SQ is full");
+  Require(waiterStarted.wait_for(std::chrono::seconds(1)) == std::future_status::ready,
+          "waiter thread should start before release");
+  Require(!WaitUntil([&]() { return waiterDone.load(std::memory_order_acquire); },
+                     std::chrono::milliseconds(20)),
+          "waiter should block while SQ is full");
   sq.Release(4);
   waiter.join();
   Require(waiterOk.load(std::memory_order_acquire), "waiter should reserve after release");
@@ -292,15 +309,19 @@ void CaseSqControllerReserveReleaseWait() {
   Require(watermarked.Reserve(4, opts, &result), "watermark initial reserve should fill SQ");
   waiterDone.store(false, std::memory_order_release);
   waiterOk.store(false, std::memory_order_release);
+  std::promise<void> watermarkWaiterStartedPromise;
+  std::future<void> watermarkWaiterStarted = watermarkWaiterStartedPromise.get_future();
   std::thread watermarkWaiter([&]() {
+    watermarkWaiterStartedPromise.set_value();
     ReserveResult waitResult;
     waiterOk.store(watermarked.Reserve(1, opts, &waitResult), std::memory_order_release);
     waiterDone.store(true, std::memory_order_release);
   });
-  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  Require(watermarkWaiterStarted.wait_for(std::chrono::seconds(1)) == std::future_status::ready,
+          "watermark waiter thread should start before release");
   watermarked.Release(1);
-  std::this_thread::sleep_for(std::chrono::milliseconds(20));
-  Require(!waiterDone.load(std::memory_order_acquire),
+  Require(!WaitUntil([&]() { return waiterDone.load(std::memory_order_acquire); },
+                     std::chrono::milliseconds(20)),
           "waiter should respect resume watermark after pressure");
   watermarked.Release(1);
   watermarkWaiter.join();
@@ -321,17 +342,23 @@ void CaseSqControllerTerminalDegraded() {
   std::atomic<bool> waiterDone{false};
   std::atomic<bool> waiterOk{true};
   std::atomic<SqReserveFailureKind> waiterKind{SqReserveFailureKind::None};
+  std::promise<void> waiterStartedPromise;
+  std::future<void> waiterStarted = waiterStartedPromise.get_future();
   std::thread waiter([&]() {
+    waiterStartedPromise.set_value();
     ReserveResult waitResult;
     waiterOk.store(sq.Reserve(1, opts, &waitResult), std::memory_order_release);
     waiterKind.store(waitResult.kind, std::memory_order_release);
     waiterDone.store(true, std::memory_order_release);
   });
 
-  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  Require(waiterStarted.wait_for(std::chrono::seconds(1)) == std::future_status::ready,
+          "degraded waiter thread should start before mark degraded");
   sq.MarkDegraded(SqDegradeReason::PartialPostOrphaned);
+  Require(WaitUntil([&]() { return waiterDone.load(std::memory_order_acquire); },
+                    std::chrono::seconds(1)),
+          "waiter should wake on degraded");
   waiter.join();
-  Require(waiterDone.load(std::memory_order_acquire), "waiter should wake on degraded");
   Require(!waiterOk.load(std::memory_order_acquire), "waiter should not reserve degraded SQ");
   Require(waiterKind.load(std::memory_order_acquire) == SqReserveFailureKind::TerminalDegraded,
           "waiter should fail with terminal degraded");

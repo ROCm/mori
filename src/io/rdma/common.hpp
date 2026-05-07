@@ -285,6 +285,8 @@ using EpPairVec = std::vector<EpPair>;
 void RecordSqPollAttempt(const EpPair& ep);
 void RecordSqPollCqes(const EpPair& ep, int cqeCount);
 void RecordSqBatchReleaseWr(const EpPair& ep, int wrCount);
+// The vector membership is not modified, but endpoint controller/ledger/status
+// state is mutated through EpPair's shared ownership fields.
 void MovePendingUnsignaledToOrphanedForEndpoint(
     const EpPairVec& eps, size_t epId, std::vector<int>& epWrsSinceSignal,
     std::vector<size_t>& epMergedSinceSignal, const std::shared_ptr<CqCallbackMeta>& callbackMeta,

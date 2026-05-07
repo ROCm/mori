@@ -627,7 +627,7 @@ static bool RecheckSqBeforePost(const EpPair& ep, int reservedWrCount, int epId,
   return true;
 }
 
-static void MarkEpDegraded(const EpPair& ep, SqDegradeReason reason) {
+static void MarkEpDegradedFromSubmitFailure(const EpPair& ep, SqDegradeReason reason) {
   if (ep.sq) {
     ep.sq->MarkDegraded(reason);
   } else if (ep.degraded) {
@@ -635,8 +635,8 @@ static void MarkEpDegraded(const EpPair& ep, SqDegradeReason reason) {
   }
 }
 
-static void FailUniqueSubmissionMetas(const std::vector<SubmissionRecord>& records,
-                                      const std::string& message) {
+static void FailUniqueSubmissionMetasFromSubmitFailure(const std::vector<SubmissionRecord>& records,
+                                                       const std::string& message) {
   std::unordered_set<CqCallbackMeta*> seen;
   for (const auto& record : records) {
     if (!record.meta || !seen.insert(record.meta.get()).second) continue;
@@ -652,12 +652,13 @@ static void FailUniqueSubmissionMetas(const std::vector<SubmissionRecord>& recor
   }
 }
 
-static void ExtractAndFailOrphanedRecords(const EpPair& ep, const std::string& message) {
+static void ExtractAndFailOrphanedRecordsFromSubmitFailure(const EpPair& ep,
+                                                           const std::string& message) {
   if (!ep.ledger) return;
   std::vector<SubmissionRecord> orphaned;
   ep.ledger->ExtractOrphanedRecords(&orphaned);
   if (!orphaned.empty()) {
-    FailUniqueSubmissionMetas(orphaned, message);
+    FailUniqueSubmissionMetasFromSubmitFailure(orphaned, message);
   }
 }
 
@@ -679,7 +680,7 @@ void MovePendingUnsignaledToOrphanedForEndpoint(
 
   std::unique_lock<std::shared_mutex> recoveryGuard;
   if (eps[epId].sq) recoveryGuard = eps[epId].sq->AcquireRecoveryGuard();
-  MarkEpDegraded(eps[epId], SqDegradeReason::PartialPostOrphaned);
+  MarkEpDegradedFromSubmitFailure(eps[epId], SqDegradeReason::PartialPostOrphaned);
 
   MORI_IO_WARN(
       "{}: moving pending unsignaled WRs on ep {} (wrCount={}, mergedReq={}) to orphaned and "
@@ -687,7 +688,7 @@ void MovePendingUnsignaledToOrphanedForEndpoint(
       context != nullptr ? context : "RDMA submit failure", epId, wrCount, mergedReq);
   if (eps[epId].ledger) {
     eps[epId].ledger->InsertOrphaned(wrCount, callbackMeta, static_cast<int>(mergedReq));
-    ExtractAndFailOrphanedRecords(eps[epId], message);
+    ExtractAndFailOrphanedRecordsFromSubmitFailure(eps[epId], message);
   } else {
     MORI_IO_WARN(
         "EP {} has pending unsignaled WRs but no submission ledger; SQ credit may remain stale "
