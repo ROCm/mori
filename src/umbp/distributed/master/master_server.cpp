@@ -753,9 +753,10 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
           get_bytes += s.counter_delta();
       }
       MORI_UMBP_INFO(
-          "[Master] ReportMetrics: node={} samples={} put_bytes_delta={:.0f} "
+          "[Master] ReportMetrics: node={} samples={} bytes={} put_bytes_delta={:.0f} "
           "get_bytes_delta={:.0f}",
-          request->node_id(), request->metrics_size(), put_bytes, get_bytes);
+          request->node_id(), request->metrics_size(), request->ByteSizeLong(), put_bytes,
+          get_bytes);
     }
 
     mori::metrics::MetricsServer::Labels base = {{"node", request->node_id()}};
@@ -773,9 +774,12 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
         case ::umbp::MetricSample::kGaugeValue:
           metrics_->setGauge(s.name(), s.help(), labels, s.gauge_value());
           break;
-        case ::umbp::MetricSample::kHistogram: {
-          std::vector<double> bounds(s.histogram().bounds().begin(), s.histogram().bounds().end());
-          metrics_->observe(s.name(), s.help(), labels, bounds, s.histogram().value());
+        case ::umbp::MetricSample::kHistogramAggregate: {
+          const auto& a = s.histogram_aggregate();
+          std::vector<double> bounds(a.bounds().begin(), a.bounds().end());
+          std::vector<uint64_t> counts(a.bucket_counts().begin(), a.bucket_counts().end());
+          metrics_->observeAggregated(s.name(), s.help(), labels, bounds, counts, a.count(),
+                                      a.sum());
           break;
         }
         default:

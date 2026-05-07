@@ -253,7 +253,10 @@ TEST_F(MasterClientMetricsTest, SetGaugeLastWriteWins) {
   EXPECT_DOUBLE_EQ(last_val, 30.0);
 }
 
-// Observe flushes the histogram with correct bounds and value.
+// Observe flushes a histogram_aggregate with correct bounds, count, sum, and
+// cumulative bucket_counts.  For value=3.5 against bounds {1, 5, 10} the
+// cumulative encoding is {0, 1, 1} (3.5 falls into the bucket le=5 and
+// every bucket whose upper bound >= 3.5 gets +1).
 TEST_F(MasterClientMetricsTest, ObserveHistogramFlushed) {
   service_->Clear();
   client_->Observe("test_hist", "help", {}, {1.0, 5.0, 10.0}, 3.5);
@@ -263,16 +266,23 @@ TEST_F(MasterClientMetricsTest, ObserveHistogramFlushed) {
 
   bool found = false;
   for (const auto& s : samples) {
-    if (s.name() == "test_hist" && s.value_case() == ::umbp::MetricSample::kHistogram) {
-      EXPECT_DOUBLE_EQ(s.histogram().value(), 3.5);
-      ASSERT_EQ(s.histogram().bounds_size(), 3);
-      EXPECT_DOUBLE_EQ(s.histogram().bounds(0), 1.0);
-      EXPECT_DOUBLE_EQ(s.histogram().bounds(2), 10.0);
+    if (s.name() == "test_hist" && s.value_case() == ::umbp::MetricSample::kHistogramAggregate) {
+      const auto& a = s.histogram_aggregate();
+      ASSERT_EQ(a.bounds_size(), 3);
+      EXPECT_DOUBLE_EQ(a.bounds(0), 1.0);
+      EXPECT_DOUBLE_EQ(a.bounds(1), 5.0);
+      EXPECT_DOUBLE_EQ(a.bounds(2), 10.0);
+      ASSERT_EQ(a.bucket_counts_size(), 3);
+      EXPECT_EQ(a.bucket_counts(0), 0u);
+      EXPECT_EQ(a.bucket_counts(1), 1u);
+      EXPECT_EQ(a.bucket_counts(2), 1u);
+      EXPECT_EQ(a.count(), 1u);
+      EXPECT_DOUBLE_EQ(a.sum(), 3.5);
       found = true;
       break;
     }
   }
-  EXPECT_TRUE(found) << "Histogram sample not found in flushed request";
+  EXPECT_TRUE(found) << "histogram_aggregate sample not found in flushed request";
 }
 
 // Every ReportMetrics request must carry the client's own node_id so the

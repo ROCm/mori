@@ -45,18 +45,20 @@ namespace mori::umbp {
 
 // Buckets for mori_umbp_master_client_rpc_latency_seconds.  Spans 0.1 ms ~ 5 s
 // (14 finite bounds + implicit +Inf).  Bucket layout is locked on the first
-// observation client-side; never edit in place — bump the metric name suffix
-// instead.  See docs/MORI-UMBP-PD-MONITORING.md.
+// observation client-side and again on the master side; the layout is
+// silently first-write-wins, so editing in place corrupts existing series.
+// To change buckets bump the metric name suffix (e.g. _v2) instead.
 inline constexpr double kMasterClientRpcLatencyBucketsArr[] = {
     1e-4, 5e-4, 1e-3, 2.5e-3, 5e-3, 1e-2, 2.5e-2, 5e-2, 1e-1, 2.5e-1, 5e-1, 1.0, 2.5, 5.0,
 };
 
-// Hard cap on outstanding histogram samples in MasterClient::pending_histograms_.
-// Keeps a single ReportMetrics RPC well below gRPC's default 4 MB receive
-// limit (~250 B/sample × 15000 ≈ 3.75 MB worst case).  Hitting this cap is
-// always a sign of either Phase 2 needing to ship or master being unreachable
-// for many flush cycles; samples beyond the cap are dropped and accounted in
-// metrics_dropped_count_.
+// Series-cardinality cap for MasterClient::pending_histogram_aggregates_.
+// With client-side bucket aggregation the map is keyed by (name, labels) so
+// its size is bounded by the number of distinct series, not by QPS.  Healthy
+// operation with the current label set peaks at ~50 series; reaching this cap
+// indicates a label-cardinality leak (e.g. a per-key/per-allocation_id label
+// was accidentally introduced).  Excess series are dropped at insert time and
+// accounted in metrics_dropped_count_.
 inline constexpr std::size_t kMasterClientMaxPendingHistograms = 15000;
 
 struct RouteGetResult {
@@ -167,8 +169,12 @@ class MasterClient {
   void AddCounter(std::string name, std::string help, Labels labels, double delta);
   // Buffer a gauge value (last write wins between flushes).
   void SetGauge(std::string name, std::string help, Labels labels, double value);
-  // Buffer a histogram observation.
-  void Observe(std::string name, std::string help, Labels labels, std::vector<double> bounds,
+  // Buffer a histogram observation. `bounds` is taken by const-ref so the
+  // 14-double rpc-latency layout (and the 3072-double bandwidth layout in
+  // pool_client.cpp) avoids a per-call heap allocation.  The observation is
+  // accumulated into a per-series HistogramAccumulator; only one MetricSample
+  // per (name, labels) series is sent on the wire per flush.
+  void Observe(std::string name, std::string help, Labels labels, const std::vector<double>& bounds,
                double value);
 
   bool IsRegistered() const { return registered_; }
@@ -217,19 +223,32 @@ class MasterClient {
     Labels labels;
     double value = 0.0;
   };
-  struct PendingHistogram {
+  // Per-series histogram state.  bucket_counts is CUMULATIVE
+  // (bucket_counts[i] = #observations with value <= bounds[i]) so the master
+  // can merge by per-bucket addition without any encoding conversion.
+  // warned_mismatch dedups the "first-write-wins" WARN per series, so a
+  // single misconfigured caller does not silence every other series' WARN.
+  struct HistogramAccumulator {
     std::string name;
     std::string help;
     Labels labels;
     std::vector<double> bounds;
-    double value = 0.0;
+    std::vector<uint64_t> bucket_counts;
+    uint64_t count = 0;
+    double sum = 0.0;
+    bool warned_mismatch = false;
   };
 
   std::mutex metrics_mutex_;
   std::unordered_map<std::string, PendingSample> pending_counters_;
   std::unordered_map<std::string, PendingSample> pending_gauges_;
-  std::vector<PendingHistogram> pending_histograms_;
+  std::unordered_map<std::string, HistogramAccumulator> pending_histogram_aggregates_;
   std::atomic<uint64_t> metrics_dropped_count_{0};
+
+  // Non-const so a friend test can shrink the cap to exercise the cold drop
+  // path without env vars or config plumbing.  Production reads the constant
+  // default; tests that want to verify the cap install a small override.
+  std::size_t pending_histogram_series_cap_ = kMasterClientMaxPendingHistograms;
 
   uint64_t metrics_interval_ms_ = 1000;
 
@@ -250,6 +269,13 @@ class MasterClient {
   friend class ScopedRpcTimer;
   void RecordRpcLatency(std::string_view method, bool ok, double seconds);
   void RecordRpcError(std::string_view method, std::string_view code);
+
+  // Test-only access: lets the cap-exercise test in
+  // tests/cpp/umbp/distributed/test_master_client_rpc_latency.cpp shrink
+  // pending_histogram_series_cap_ and inspect pending_histogram_aggregates_
+  // / metrics_dropped_count_.  Production code never touches these fields
+  // through this friend.
+  friend class MasterClientRpcLatencyTest;
 };
 
 }  // namespace mori::umbp

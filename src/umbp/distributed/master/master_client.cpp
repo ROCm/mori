@@ -976,13 +976,23 @@ void MasterClient::HeartbeatLoop() {
 // ---------------------------------------------------------------------------
 
 namespace {
+// Build a stable per-series key as "name|k1=v1|k2=v2...".  Pre-reserve the
+// final length so the per-Observe hot path does at most one allocation —
+// repeated += without reserve costs ~2 reallocs + memcpy on a typical
+// 65-char rpc-latency key, which adds up at 100k RPC/s.
 std::string MetricKey(const std::string& name, const MasterClient::Labels& labels) {
-  std::string key = name;
+  std::size_t needed = name.size();
   for (const auto& [k, v] : labels) {
-    key += '|';
-    key += k;
-    key += '=';
-    key += v;
+    needed += 2 + k.size() + v.size();  // '|' + k + '=' + v
+  }
+  std::string key;
+  key.reserve(needed);
+  key.append(name);
+  for (const auto& [k, v] : labels) {
+    key.push_back('|');
+    key.append(k);
+    key.push_back('=');
+    key.append(v);
   }
   return key;
 }
@@ -1009,17 +1019,39 @@ void MasterClient::SetGauge(std::string name, std::string help, Labels labels, d
 }
 
 void MasterClient::Observe(std::string name, std::string help, Labels labels,
-                           std::vector<double> bounds, double value) {
+                           const std::vector<double>& bounds, double value) {
   std::lock_guard lock(metrics_mutex_);
-  // Hard cap to keep one ReportMetrics RPC well below gRPC's 4 MB receive
-  // limit.  Hitting this means QPS exceeds plan assumptions or master has
-  // been unresponsive for many flush cycles; surface the drop as a counter.
-  if (pending_histograms_.size() >= kMasterClientMaxPendingHistograms) {
-    metrics_dropped_count_.fetch_add(1, std::memory_order_relaxed);
-    return;
+  auto key = MetricKey(name, labels);
+  auto [it, inserted] = pending_histogram_aggregates_.try_emplace(std::move(key));
+  auto& h = it->second;
+  if (inserted) {
+    // Series-cardinality cap.  Bounds the map by # distinct (name, labels)
+    // series, not by QPS — hitting it indicates a label-cardinality leak.
+    if (pending_histogram_aggregates_.size() > pending_histogram_series_cap_) {
+      pending_histogram_aggregates_.erase(it);
+      metrics_dropped_count_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+    h.name = std::move(name);
+    h.help = std::move(help);
+    h.labels = std::move(labels);
+    h.bounds = bounds;
+    h.bucket_counts.assign(bounds.size(), 0);
+  } else if (h.bounds.size() != bounds.size() && !h.warned_mismatch) {
+    // Per-accumulator dedup: each series may warn once on its own bounds
+    // mismatch.  A process-wide once_flag would silence every other series
+    // after the first WARN, defeating the point of surfacing the bug.
+    h.warned_mismatch = true;
+    MORI_UMBP_WARN("[Client] Observe: bounds mismatch on '{}' — first write wins", h.name);
   }
-  pending_histograms_.push_back(
-      {std::move(name), std::move(help), std::move(labels), std::move(bounds), value});
+  // Cumulative bucket increments — every bucket whose upper bound is >= value
+  // gets +1.  Mirrors MetricsServer::observe() so master merge is a plain
+  // per-bucket add (no encoding conversion).
+  for (std::size_t i = 0; i < h.bounds.size(); ++i) {
+    if (value <= h.bounds[i]) ++h.bucket_counts[i];
+  }
+  ++h.count;
+  h.sum += value;
 }
 
 void MasterClient::RecordRpcLatency(std::string_view method, bool ok, double seconds) {
@@ -1027,12 +1059,13 @@ void MasterClient::RecordRpcLatency(std::string_view method, bool ok, double sec
   // teardown after StopMetricsReporting().  Avoids unbounded buffer growth
   // and any UAF window after the flush thread joins.
   if (!metrics_running_.load(std::memory_order_relaxed)) return;
+  // Built once per process: avoids constructing a 14-double vector on every
+  // monitored RPC.  Observe takes bounds by const-ref so this is alloc-free.
+  static const std::vector<double> kBounds(std::begin(kMasterClientRpcLatencyBucketsArr),
+                                           std::end(kMasterClientRpcLatencyBucketsArr));
   Labels labels = {{"rpc", std::string(method)}, {"status", ok ? "ok" : "error"}};
-  std::vector<double> bounds(std::begin(kMasterClientRpcLatencyBucketsArr),
-                             std::end(kMasterClientRpcLatencyBucketsArr));
   Observe(MORI_UMBP_METRIC_MASTER_CLIENT_RPC_LATENCY,
-          MORI_UMBP_METRIC_MASTER_CLIENT_RPC_LATENCY_HELP, std::move(labels), std::move(bounds),
-          seconds);
+          MORI_UMBP_METRIC_MASTER_CLIENT_RPC_LATENCY_HELP, std::move(labels), kBounds, seconds);
 }
 
 void MasterClient::RecordRpcError(std::string_view method, std::string_view code) {
@@ -1089,19 +1122,24 @@ void MasterClient::MetricsLoop() {
     // Swap out all pending samples under lock; send without holding lock.
     std::unordered_map<std::string, PendingSample> counters;
     std::unordered_map<std::string, PendingSample> gauges;
-    std::vector<PendingHistogram> histograms;
+    std::unordered_map<std::string, HistogramAccumulator> histogram_aggregates;
+    std::size_t cap_at_swap = 0;
     {
       std::lock_guard lock(metrics_mutex_);
       counters.swap(pending_counters_);
       gauges.swap(pending_gauges_);
-      histograms.swap(pending_histograms_);
+      histogram_aggregates.swap(pending_histogram_aggregates_);
+      cap_at_swap = pending_histogram_series_cap_;
     }
 
-    // Surface buffer-cap drops as a counter so master/Prometheus can alert.
+    // Surface series-cardinality drops as a counter so master/Prometheus can
+    // alert.  Reaching the cap is a label-leak signal, not a QPS problem.
     const uint64_t dropped = metrics_dropped_count_.exchange(0, std::memory_order_relaxed);
     if (dropped > 0) {
-      MORI_UMBP_WARN("[Client] MetricsLoop dropped {} histogram observation(s) this cycle (cap={})",
-                     dropped, kMasterClientMaxPendingHistograms);
+      MORI_UMBP_WARN(
+          "[Client] MetricsLoop dropped {} distinct histogram series this cycle "
+          "(label-cardinality cap={}; investigate for a label set leak)",
+          dropped, cap_at_swap);
       auto& s = counters[MORI_UMBP_METRIC_MASTER_CLIENT_METRICS_DROPPED_TOTAL];
       s.name = MORI_UMBP_METRIC_MASTER_CLIENT_METRICS_DROPPED_TOTAL;
       s.help = MORI_UMBP_METRIC_MASTER_CLIENT_METRICS_DROPPED_TOTAL_HELP;
@@ -1109,7 +1147,7 @@ void MasterClient::MetricsLoop() {
       s.value += static_cast<double>(dropped);
     }
 
-    if (counters.empty() && gauges.empty() && histograms.empty()) continue;
+    if (counters.empty() && gauges.empty() && histogram_aggregates.empty()) continue;
 
     // Log every flush so we know the thread is alive and what it's sending.
     {
@@ -1119,9 +1157,10 @@ void MasterClient::MetricsLoop() {
         if (s.name == MORI_UMBP_METRIC_CLIENT_GET_BYTES_TOTAL) get_bytes += s.value;
       }
       MORI_UMBP_INFO(
-          "[Client] MetricsLoop flush: node={} counters={} gauges={} histograms={} "
+          "[Client] MetricsLoop flush: node={} counters={} gauges={} histogram_series={} "
           "put_bytes_delta={:.0f} get_bytes_delta={:.0f}",
-          config_.node_id, counters.size(), gauges.size(), histograms.size(), put_bytes, get_bytes);
+          config_.node_id, counters.size(), gauges.size(), histogram_aggregates.size(), put_bytes,
+          get_bytes);
     }
 
     ::umbp::ReportMetricsRequest req;
@@ -1149,7 +1188,7 @@ void MasterClient::MetricsLoop() {
       }
       sample->set_gauge_value(s.value);
     }
-    for (const auto& h : histograms) {
+    for (const auto& [key, h] : histogram_aggregates) {
       auto* sample = req.add_metrics();
       sample->set_name(h.name);
       sample->set_help(h.help);
@@ -1158,9 +1197,11 @@ void MasterClient::MetricsLoop() {
         l->set_name(k);
         l->set_value(v);
       }
-      auto* hist = sample->mutable_histogram();
-      for (double b : h.bounds) hist->add_bounds(b);
-      hist->set_value(h.value);
+      auto* agg = sample->mutable_histogram_aggregate();
+      for (double b : h.bounds) agg->add_bounds(b);
+      for (uint64_t c : h.bucket_counts) agg->add_bucket_counts(c);
+      agg->set_count(h.count);
+      agg->set_sum(h.sum);
     }
 
     ::umbp::ReportMetricsResponse resp;
