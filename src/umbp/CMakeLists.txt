@@ -309,6 +309,7 @@ add_library(
   distributed/master/external_kv_block_index.cpp
   distributed/master/master_server.cpp
   distributed/master/master_client.cpp
+  distributed/master/rpc_latency_timer.cpp
   distributed/master/eviction_manager.cpp
   distributed/routing/router.cpp
   distributed/routing/route_get_strategy.cpp
