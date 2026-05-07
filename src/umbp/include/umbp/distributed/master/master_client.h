@@ -43,37 +43,14 @@
 
 namespace mori::umbp {
 
-// Buckets for mori_umbp_master_client_rpc_latency_seconds.  Spans 0.1 ms ~ 5 s
-// (14 finite bounds + implicit +Inf).  Bucket layout is locked on the first
-// observation client-side and again on the master side; the layout is
-// silently first-write-wins, so editing in place corrupts existing series.
-// To change buckets bump the metric name suffix (e.g. _v2) instead.
-inline constexpr double kMasterClientRpcLatencyBucketsArr[] = {
-    1e-4, 5e-4, 1e-3, 2.5e-3, 5e-3, 1e-2, 2.5e-2, 5e-2, 1e-1, 2.5e-1, 5e-1, 1.0, 2.5, 5.0,
-};
-
-// Series-cardinality cap for MasterClient::pending_histogram_aggregates_.
-// With client-side bucket aggregation the map is keyed by (name, labels) so
-// its size is bounded by the number of distinct series, not by QPS.  Healthy
-// operation with the current label set peaks at ~50 series; reaching this cap
-// indicates a label-cardinality leak (e.g. a per-key/per-allocation_id label
-// was accidentally introduced).  Excess series are dropped at insert time and
-// accounted in metrics_dropped_count_.
-inline constexpr std::size_t kMasterClientMaxPendingHistograms = 15000;
-
+// Result of RouteGet: a routing advisory only — the writer follows up
+// with peer.ResolveKey to fetch pages/descs/page_size.  `size` is carried
+// so the reader can preflight its destination buffer without round-trip.
 struct RouteGetResult {
-  Location location;
+  std::string node_id;
+  TierType tier = TierType::UNKNOWN;
+  uint64_t size = 0;
   std::string peer_address;
-  std::vector<uint8_t> engine_desc_bytes;
-
-  // DRAM/HBM only; empty for SSD tier.
-  std::vector<BufferMemoryDescBytes> dram_memory_descs;
-  uint64_t page_size = 0;
-
-  // Structured page set populated by Master (parallel to RoutePutResult.pages).
-  // Master parses location.location_id and sends the result here so the Client
-  // can build scatter-gather RDMA descriptors without re-parsing the string.
-  std::vector<PageLocation> pages;
 };
 
 class MasterClient {

@@ -1,31 +1,53 @@
 syntax = "proto3";
 package umbp;
 
+import "umbp.proto";
+
 service UMBPPeer {
   rpc GetPeerInfo(GetPeerInfoRequest) returns (GetPeerInfoResponse);
 
-  // SSD write: pre-allocate staging slot, RDMA write, then commit to SSD
+  // SSD staging (unchanged in this redesign).
   rpc AllocateWriteSlot(AllocateWriteSlotRequest) returns (AllocateWriteSlotResponse);
-  rpc CommitSsdWrite(CommitSsdWriteRequest) returns (CommitSsdWriteResponse);
+  rpc CommitSsdWrite   (CommitSsdWriteRequest)   returns (CommitSsdWriteResponse);
+  rpc PrepareSsdRead   (PrepareSsdReadRequest)   returns (PrepareSsdReadResponse);
+  rpc ReleaseSsdLease  (ReleaseSsdLeaseRequest)  returns (ReleaseSsdLeaseResponse);
 
-  // SSD read: load SSD into staging slot, caller RDMA reads, then release
-  rpc PrepareSsdRead(PrepareSsdReadRequest) returns (PrepareSsdReadResponse);
-  rpc ReleaseSsdLease(ReleaseSsdLeaseRequest) returns (ReleaseSsdLeaseResponse);
+  // DRAM/HBM allocator + key map (new — peer is now the canonical owner).
+  rpc AllocateSlot(AllocateSlotRequest) returns (AllocateSlotResponse);
+  rpc CommitSlot  (CommitSlotRequest)   returns (CommitSlotResponse);
+  rpc AbortSlot   (AbortSlotRequest)    returns (AbortSlotResponse);
+  rpc ResolveKey  (ResolveKeyRequest)   returns (ResolveKeyResponse);
+  rpc EvictKey    (EvictKeyRequest)     returns (EvictKeyResponse);
+
+  rpc BatchAllocateSlots(BatchAllocateSlotsRequest) returns (BatchAllocateSlotsResponse);
+  rpc BatchCommitSlots  (BatchCommitSlotsRequest)   returns (BatchCommitSlotsResponse);
+  rpc BatchAbortSlots   (BatchAbortSlotsRequest)    returns (BatchAbortSlotsResponse);
+  rpc BatchResolveKeys  (BatchResolveKeysRequest)   returns (BatchResolveKeysResponse);
 }
 
-// --- Handshake ---
+// ============================================================
+//  Handshake
+// ============================================================
+
 message GetPeerInfoRequest {}
 message GetPeerInfoResponse {
   bytes  engine_desc           = 1;
-  bytes  dram_memory_desc      = 2;
   uint64 ssd_capacity          = 3;
   uint64 ssd_available         = 4;
-  uint64 staging_base_offset   = 5;  // deprecated: kept for wire compat
   bytes  ssd_staging_mem_desc  = 6;  // packed MemoryDesc for dedicated SSD staging buffer
   uint64 ssd_staging_size      = 7;  // total staging buffer size
+
+  // DRAM/HBM buffer descriptors — peer-owned in the new design, exposed
+  // here so writers can hydrate first-contact peers without going through
+  // AllocateSlot or ResolveKey first.
+  repeated BufferMemoryDesc dram_memory_descs = 8;
+  uint64 dram_page_size                       = 9;
 }
 
-// --- Write slot pre-allocation ---
+// ============================================================
+//  SSD slot machinery (unchanged)
+// ============================================================
+
 message AllocateWriteSlotRequest {
   uint64 size = 1;
 }
@@ -33,24 +55,22 @@ message AllocateWriteSlotResponse {
   bool   success        = 1;
   uint64 staging_offset = 2;
   uint64 lease_id       = 3;
-  uint64 lease_ttl_ms   = 4;  // remaining lease milliseconds
+  uint64 lease_ttl_ms   = 4;
 }
 
-// --- SSD Write: RDMA into allocated slot → persist to SSD ---
 message CommitSsdWriteRequest {
   string key              = 1;
-  uint64 staging_offset   = 2;  // must match AllocateWriteSlot response
+  uint64 staging_offset   = 2;
   uint64 size             = 3;
   uint32 store_index      = 4;
-  string allocation_id    = 5;  // echoed from RoutePut
-  uint64 lease_id         = 6;  // from AllocateWriteSlot
+  string allocation_id    = 5;  // historical echo from RoutePut; ignored in the new design
+  uint64 lease_id         = 6;
 }
 message CommitSsdWriteResponse {
   bool   success          = 1;
   string ssd_location_id  = 2;
 }
 
-// --- SSD Read: load SSD → staging slot → caller RDMA reads ---
 message PrepareSsdReadRequest {
   string key              = 1;
   string ssd_location_id  = 2;
@@ -59,14 +79,117 @@ message PrepareSsdReadRequest {
 message PrepareSsdReadResponse {
   bool   success          = 1;
   uint64 staging_offset   = 2;
-  uint64 lease_id         = 3;  // client must release after RDMA completes
-  uint64 lease_ttl_ms     = 4;  // remaining lease milliseconds
+  uint64 lease_id         = 3;
+  uint64 lease_ttl_ms     = 4;
 }
 
-// --- Read slot release ---
 message ReleaseSsdLeaseRequest {
   uint64 lease_id = 1;
 }
 message ReleaseSsdLeaseResponse {
   bool success = 1;
+}
+
+// ============================================================
+//  DRAM/HBM allocator + key map (new)
+// ============================================================
+
+// Allocate a peer-local pending slot for `size` bytes on `tier`.  ENOSPC
+// is returned via `success=false` (not an RPC error) so the writer can
+// retry RoutePut with `exclude_nodes`.  `slot_id` is opaque to the
+// writer; it is echoed back by Commit/Abort.
+message AllocateSlotRequest {
+  uint64   size = 1;
+  TierType tier = 2;
+}
+message AllocateSlotResponse {
+  bool     success        = 1;
+  uint64   slot_id        = 2;
+  repeated PageLocation pages = 3;
+  uint64   page_size      = 4;
+  repeated BufferMemoryDesc descs = 5;  // dedup'd by buffer_index
+  uint64   pending_ttl_ms = 6;          // single TTL in the system
+}
+
+// Commit moves pending → owned.  After a successful commit the peer
+// queues a KvEvent{ADD, key, tier, size} for the next heartbeat.
+message CommitSlotRequest {
+  uint64 slot_id = 1;
+  string key     = 2;
+}
+message CommitSlotResponse {
+  bool success = 1;  // false if slot already reaped or unknown
+}
+
+// Abort drops a pending slot.  Idempotent: late or duplicate Abort for
+// an already-reaped slot returns success=true.
+message AbortSlotRequest {
+  uint64 slot_id = 1;
+}
+message AbortSlotResponse {
+  bool success = 1;
+}
+
+// Resolve a key the writer has been routed to.  Returns the page set
+// the reader needs to RDMA from.  Peer bumps its in-flight read counter
+// for `key` to defer concurrent eviction (Bug #7 resolution).
+message ResolveKeyRequest {
+  string key = 1;
+}
+message ResolveKeyResponse {
+  bool   found     = 1;
+  repeated PageLocation pages = 2;
+  uint64 page_size = 3;
+  repeated BufferMemoryDesc descs = 4;
+  uint64 size      = 5;
+}
+
+// Master-driven eviction.  Idempotent: already-evicted keys produce a
+// zero-bytes entry or are omitted; master tolerates either since the
+// REMOVE events shipped on the next heartbeat are the source of truth.
+message EvictKeyEntry {
+  string key         = 1;
+  uint64 bytes_freed = 2;  // 0 if the key was already gone or held a read lease
+}
+message EvictKeyRequest {
+  repeated string keys = 1;
+}
+message EvictKeyResponse {
+  repeated EvictKeyEntry evicted = 1;
+}
+
+// ============================================================
+//  Batch variants
+// ============================================================
+
+message BatchAllocateSlotsRequest {
+  repeated AllocateSlotRequest entries = 1;
+}
+message BatchAllocateSlotsResponse {
+  repeated AllocateSlotResponse entries = 1;
+}
+
+message BatchCommitSlotEntry {
+  uint64 slot_id = 1;
+  string key     = 2;
+}
+message BatchCommitSlotsRequest {
+  repeated BatchCommitSlotEntry entries = 1;
+}
+message BatchCommitSlotsResponse {
+  repeated bool success = 1;
+}
+
+message BatchAbortSlotsRequest {
+  repeated uint64 slot_ids = 1;
+}
+message BatchAbortSlotsResponse {
+  repeated bool success = 1;
+}
+
+message BatchResolveKeysRequest {
+  repeated string keys = 1;
+}
+message BatchResolveKeysResponse {
+  repeated ResolveKeyResponse entries = 1;
 }

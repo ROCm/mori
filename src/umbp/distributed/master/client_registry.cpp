@@ -28,7 +28,7 @@
 #include "mori/utils/mori_log.hpp"
 #include "umbp/distributed/master/external_kv_block_index.h"
 #include "umbp/distributed/master/global_block_index.h"
-#include "umbp/distributed/page_bitmap_allocator.h"
+#include "umbp/distributed/peer/peer_page_allocator.h"
 
 namespace mori::umbp {
 

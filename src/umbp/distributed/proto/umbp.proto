@@ -12,11 +12,29 @@ enum TierType {
   TIER_SSD     = 3;   // NVMe SSD
 }
 
-// Per-tier capacity reported by a client node.
+// Per-tier capacity reported by a peer node.  Master treats every value
+// as ground truth and applies it unconditionally — the peer's allocator
+// is the single source of physical capacity.
 message TierCapacity {
   TierType tier                     = 1;
   uint64   total_capacity_bytes     = 2;   // Total capacity on this tier
   uint64   available_capacity_bytes = 3;   // Current free capacity on this tier
+}
+
+// One page slot inside one of a node's DRAM/HBM buffers.  Carried by the
+// peer service in AllocateSlot / ResolveKey responses; master never sees
+// this type after the redesign (master holds no per-page state).
+message PageLocation {
+  uint32 buffer_index = 1;
+  uint32 page_index   = 2;
+}
+
+// One DRAM/HBM buffer's RDMA MemoryDesc plus the buffer_index it belongs
+// to.  Peer responses ship a deduplicated, ascending list so the writer
+// can hydrate its peer-side buffer_index → MemoryDesc cache in one batch.
+message BufferMemoryDesc {
+  uint32 buffer_index = 1;
+  bytes  desc         = 2;  // msgpack-packed mori::io::MemoryDesc
 }
 
 // ============================================================
@@ -29,227 +47,105 @@ enum ClientStatus {
   CLIENT_STATUS_EXPIRED = 2;
 }
 
+// Master no longer owns DRAM/HBM allocators, so descs / buffer sizes /
+// page sizes have moved to the peer.  ssd_store_capacities stays as
+// advisory capacity metadata for the routing strategy.  engine_desc is
+// retained so writers can resolve the target peer's IO engine without
+// an extra GetPeerInfo round trip on first contact.
 message RegisterClientRequest {
-  string node_id                    = 1;
+  string node_id                      = 1;
   string node_address                 = 2;   // Network address (e.g. "10.0.1.5:8080")
-  repeated TierCapacity tier_capacities = 3; // Capacity per tier (HBM, DRAM, SSD)
+  repeated TierCapacity tier_capacities = 3; // Capacity per tier
   string peer_address                 = 4;   // PeerService gRPC address
   bytes  engine_desc                  = 5;   // packed EngineDesc
-  reserved 6;                                // formerly: dram_memory_desc (single-buffer compat)
-  repeated bytes  dram_memory_descs   = 10;  // per-buffer packed MemoryDesc
-  repeated uint64 dram_buffer_sizes   = 11;  // size of each DRAM buffer in bytes
   repeated uint64 ssd_store_capacities = 12; // per-SSD-store capacity in bytes
-
-  // Page size used by Master's PageBitmapAllocator for this node's DRAM/HBM
-  // tier (single value applies to both DRAM and HBM).  0 = use the
-  // registry-wide default (ClientRegistryConfig.default_dram_page_size).
-  // Lets test fixtures override the 2MB default without resizing buffers.
-  uint64 dram_page_size               = 13;
 }
 message RegisterClientResponse {
   uint64 heartbeat_interval_ms = 1;  // Recommended heartbeat interval
+  uint64 ack_seq               = 2;  // Initial heartbeat seq peer should send (= 0)
 }
 
 message UnregisterClientRequest {
   string node_id = 1;
 }
-message UnregisterClientResponse {
-  uint32 keys_removed = 1;
+message UnregisterClientResponse {}
+
+// ============================================================
+//  Heartbeat / event-shipping (the new authoritative update channel)
+// ============================================================
+
+// One mutation in the peer's owned-key set.  ADD carries `size`; REMOVE
+// elides it because master already knows the size from the prior ADD.
+message KvEvent {
+  enum Kind {
+    ADD    = 0;
+    REMOVE = 1;
+  }
+  Kind     kind = 1;
+  string   key  = 2;
+  TierType tier = 3;
+  uint64   size = 4;   // ADD only
 }
 
 message HeartbeatRequest {
-  string node_id                    = 1;
-  repeated TierCapacity tier_capacities = 2; // Updated capacity per tier
+  string node_id            = 1;
+  uint64 seq                = 2;    // monotonic, peer-assigned (1 per heartbeat batch)
+  uint64 last_acked_seq     = 3;    // echo of master's last ack
+  repeated TierCapacity tier_capacities = 4; // ground truth from peer's allocator
+  repeated KvEvent      events          = 5; // adds + removes since last_acked_seq
+  bool   is_full_sync       = 6;    // when true, events[] is the complete owned-key set
 }
 message HeartbeatResponse {
-  ClientStatus status = 1;
+  ClientStatus status            = 1;
+  uint64       acked_seq         = 2;  // master applied up to this seq
+  bool         request_full_sync = 3;  // master detected gap; peer reships
 }
 
 // ============================================================
-//  Page-bitmap allocator (DRAM/HBM tier) common types
+//  Router (read-only on master state; pure routing advisor)
 // ============================================================
-
-// One page slot inside one of the target node's DRAM/HBM buffers.  The
-// actual RDMA byte offset is computed by the Client as
-// `page_index * page_size`, where page_size is carried alongside this list
-// (see RoutePutResponse / RouteGetResponse `page_size`).
-message PageLocation {
-  uint32 buffer_index = 1;
-  uint32 page_index   = 2;
-}
-
-// One buffer's RDMA MemoryDesc plus the buffer_index it belongs to.
-// RoutePutResponse / RouteGetResponse carry a deduplicated, ascending list
-// so the Client can hydrate its peer-side buffer_index -> MemoryDesc cache
-// in a single batch.
-message BufferMemoryDesc {
-  uint32 buffer_index = 1;
-  bytes  desc         = 2;  // msgpack-packed mori::io::MemoryDesc
-}
-
-// ============================================================
-//  Block index
-// ============================================================
-
-message Location {
-  string   node_id     = 1;
-  string   location_id = 2;
-  uint64   size        = 3;
-  TierType tier        = 4;
-}
-
-message RegisterRequest {
-  string   node_id   = 1;
-  string   key       = 2;
-  Location location  = 3;
-}
-message RegisterResponse {}
-
-message UnregisterRequest {
-  string   node_id   = 1;
-  string   key       = 2;
-  Location location  = 3;
-}
-message UnregisterResponse {
-  uint32 removed = 1;
-}
-
-// ============================================================
-//  Lookup (read-only existence check, no access count side-effects)
-// ============================================================
-
-message LookupRequest {
-  string key     = 1;
-  string node_id = 2;
-}
-message LookupResponse {
-  bool found = 1;
-}
-
-// ============================================================
-//  Router
-// ============================================================
-
-message RouteGetRequest {
-  string key     = 1;
-  string node_id = 2;   // Requesting node (for future locality hints)
-}
-message RouteGetResponse {
-  bool     found            = 1;
-  Location source           = 2;   // Selected replica to read from (if found)
-  string   peer_address     = 3;   // source node's PeerService address
-  bytes    engine_desc      = 4;   // source node's packed EngineDesc
-
-  reserved 5;                      // formerly: dram_memory_desc (single-buffer)
-
-  // For DRAM/HBM tier, list (deduplicated by buffer_index, ascending) of
-  // every buffer's MemoryDesc that the Client needs to perform the (possibly
-  // scatter-gather) RDMA Read.  Empty for SSD tier.
-  repeated BufferMemoryDesc dram_memory_descs = 6;
-
-  // page_size in bytes used by the source node's DRAM/HBM PageBitmapAllocator.
-  // Client computes `rdma_offset = page_index * page_size` for every entry in
-  // the `pages` field below.  Zero for SSD tier.
-  uint64 page_size = 7;
-
-  // Structured form of the page set encoded in `source.location_id`.
-  // Master parses location_id internally and populates this field so the
-  // Client can build scatter-gather RDMA descriptors directly without
-  // re-parsing the string.  Empty for SSD tier.
-  // Parallel to RoutePutResponse.pages.
-  repeated PageLocation pages = 8;
-}
 
 message RoutePutRequest {
-  string key        = 1;
-  string node_id    = 2;   // Requesting client
-  uint64 block_size = 3;   // Size of the block to write (bytes)
+  string key                   = 1;
+  string node_id               = 2;   // Requesting client (locality hints / metrics)
+  uint64 block_size            = 3;   // Size of the block to write (bytes)
+  repeated string exclude_nodes = 4;  // Nodes the caller has already failed against
 }
 message RoutePutResponse {
-  bool     found            = 1;
-  string   node_id          = 2;   // Target node ID
-  string   node_address     = 3;   // Target node network address (for MORI-IO connection)
-  TierType tier             = 4;   // Tier selected by the strategy
-  string   peer_address     = 5;   // target node's PeerService address
-  bytes    engine_desc      = 6;   // target node's packed EngineDesc
-
-  reserved 7, 8, 9;                // formerly: dram_memory_desc, allocated_offset, buffer_index
-
-  string   allocation_id    = 10;  // Unique lease id for Finalize/AbortAllocation
-
-  // Canonical location_id string ("0:p3,4;1:p0") covering every page slot
-  // reserved by Master for this Put.  Same information is also exposed
-  // structurally via `pages` so the Client can build scatter-gather RDMA
-  // descriptors directly.  Empty for SSD tier (SSD location_id is generated
-  // later by CommitSsdWrite).
-  string   location_id      = 11;
-  repeated PageLocation pages = 12;
-
-  // List (deduplicated by buffer_index, ascending) of every DRAM/HBM buffer's
-  // MemoryDesc referenced by `pages`.  Lets the Client hydrate its peer-side
-  // buffer_index → MemoryDesc cache in a single batch.  Empty for SSD tier.
-  repeated BufferMemoryDesc dram_memory_descs = 13;
-
-  // DRAM/HBM page_size in bytes used by the target node's PageBitmapAllocator.
-  // Client computes `rdma_offset = page_index * page_size`.  Zero for SSD tier.
-  uint64   page_size        = 14;
+  bool     found        = 1;
+  string   node_id      = 2;
+  TierType tier         = 3;
+  string   peer_address = 4;
 }
 
-message FinalizeRequest {
-  string   node_id       = 1;
-  string   key           = 2;
-  Location location      = 3;
-  string   allocation_id = 4;
-  int32    depth         = 5;  // -1 = not set; client must always set this field explicitly
+message RouteGetRequest {
+  string key                    = 1;
+  string node_id                = 2;
+  repeated string exclude_nodes = 3;
 }
-message FinalizeResponse {
-  bool finalized = 1;
-}
-
-message PublishRequest {
-  string   node_id   = 1;
-  string   key       = 2;
-  Location location  = 3;
-}
-message PublishResponse {
-  bool published = 1;
-}
-
-message AbortAllocationRequest {
-  string node_id       = 1;  // target node whose lease should be rolled back
-  string allocation_id = 2;
-  uint64 size          = 3;
-}
-message AbortAllocationResponse {
-  bool aborted = 1;
+message RouteGetResponse {
+  bool     found        = 1;
+  string   node_id      = 2;
+  TierType tier         = 3;
+  uint64   size         = 4;
+  string   peer_address = 5;
 }
 
 // ============================================================
-//  Batch RPCs
+//  Batch routing
 // ============================================================
 
 message BatchRoutePutRequest {
   string node_id = 1;
   repeated string keys = 2;
   repeated uint64 block_sizes = 3;
+  repeated string exclude_nodes = 4;  // global exclude — applies to every entry
 }
 message BatchRoutePutEntry {
-  bool     found            = 1;
-  string   node_id          = 2;
-  string   node_address     = 3;
-  TierType tier             = 4;
-  string   peer_address     = 5;
-  bytes    engine_desc      = 6;
-
-  reserved 7, 8, 9;                // formerly: dram_memory_desc, allocated_offset, buffer_index
-
-  string   allocation_id    = 10;
-
-  // Parallel to RoutePutResponse.
-  string   location_id      = 11;
-  repeated PageLocation pages = 12;
-  repeated BufferMemoryDesc dram_memory_descs = 13;
-  uint64   page_size        = 14;
+  bool     found        = 1;
+  string   node_id      = 2;
+  TierType tier         = 3;
+  string   peer_address = 4;
 }
 message BatchRoutePutResponse {
   repeated BatchRoutePutEntry entries = 1;
@@ -258,69 +154,21 @@ message BatchRoutePutResponse {
 message BatchRouteGetRequest {
   string node_id = 1;
   repeated string keys = 2;
+  repeated string exclude_nodes = 3;
 }
 message BatchRouteGetEntry {
-  bool     found            = 1;
-  Location source           = 2;
-  string   peer_address     = 3;
-  bytes    engine_desc      = 4;
-
-  reserved 5;                      // formerly: dram_memory_desc (single-buffer)
-
-  // Parallel to RouteGetResponse.
-  repeated BufferMemoryDesc dram_memory_descs = 6;
-  uint64 page_size = 7;
-
-  // Parallel to RouteGetResponse.pages / BatchRoutePutEntry.pages.
-  repeated PageLocation pages = 8;
+  bool     found        = 1;
+  string   node_id      = 2;
+  TierType tier         = 3;
+  uint64   size         = 4;
+  string   peer_address = 5;
 }
 message BatchRouteGetResponse {
   repeated BatchRouteGetEntry entries = 1;
 }
 
-message BatchFinalizeRequest {
-  string node_id = 1;
-  repeated string keys = 2;
-  repeated Location locations = 3;
-  repeated string allocation_ids = 4;
-  repeated int32 depths = 5;
-}
-message BatchFinalizeResponse {
-  repeated bool finalized = 1;
-}
-
-// Batch existence check — read-only, no access-count / lease side-effects.
-// Matches Lookup semantics, batched.
-message BatchLookupRequest {
-  string node_id = 1;
-  repeated string keys = 2;
-}
-message BatchLookupResponse {
-  // Parallel to BatchLookupRequest.keys; found[i] corresponds to keys[i].
-  repeated bool found = 1;
-}
-
-// Batch rollback of pending allocations.  Each entry carries its own
-// target `node_id` (the node owning the pending lease), mirroring the
-// single-item AbortAllocationRequest semantics so a single request can
-// roll back pendings across heterogeneous target nodes in one RPC.
-message BatchAbortAllocationEntry {
-  string node_id       = 1;  // target node whose lease should be rolled back
-  string allocation_id = 2;
-  uint64 size          = 3;
-}
-message BatchAbortAllocationRequest {
-  repeated BatchAbortAllocationEntry entries = 1;
-}
-message BatchAbortAllocationResponse {
-  // Parallel to request.entries; per-entry false is not an error
-  // (racy reap / double-abort / EXPIRED node), same as single-item
-  // AbortAllocationResponse.aborted semantics.
-  repeated bool aborted = 1;
-}
-
 // ============================================================
-//  Client-side metrics reporting
+//  Client-side metrics reporting (unchanged)
 // ============================================================
 
 message MetricLabel {
@@ -340,11 +188,6 @@ message HistogramAggregate {
   double          sum           = 4;
 }
 
-// One metric sample: a named series with optional labels and a typed value.
-// counter_delta:        amount to add to the counter (monotonically increasing).
-// gauge_value:          absolute value to set the gauge to.
-// histogram_aggregate:  pre-aggregated histogram state for one (name, labels)
-//                       series; carries the full bucket layout + counts + sum.
 message MetricSample {
   string               name    = 1;
   string               help    = 2;
@@ -361,10 +204,6 @@ message ReportMetricsRequest {
   repeated MetricSample metrics = 2;
 }
 message ReportMetricsResponse {}
-
-// ============================================================
-//  Single unified service
-// ============================================================
 
 // ============================================================
 //  External KV Block Events (unmanaged L1/L2 cache blocks)
@@ -396,35 +235,28 @@ message MatchExternalKvResponse {
   repeated ExternalKvNodeMatch matches = 1;
 }
 
+// ============================================================
+//  Service
+// ============================================================
+
 service UMBPMaster {
   // Client lifecycle
-  rpc RegisterClient(RegisterClientRequest) returns (RegisterClientResponse);
+  rpc RegisterClient  (RegisterClientRequest)   returns (RegisterClientResponse);
   rpc UnregisterClient(UnregisterClientRequest) returns (UnregisterClientResponse);
-  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc Heartbeat       (HeartbeatRequest)        returns (HeartbeatResponse);
 
-  // Block index
-  rpc Register(RegisterRequest) returns (RegisterResponse);
-  rpc Unregister(UnregisterRequest) returns (UnregisterResponse);
-  rpc Lookup(LookupRequest) returns (LookupResponse);
-  rpc FinalizeAllocation(FinalizeRequest) returns (FinalizeResponse);
-  rpc PublishLocalBlock(PublishRequest) returns (PublishResponse);
-  rpc AbortAllocation(AbortAllocationRequest) returns (AbortAllocationResponse);
-
-  // Router
-  rpc RouteGet(RouteGetRequest) returns (RouteGetResponse);
-  rpc RoutePut(RoutePutRequest) returns (RoutePutResponse);
+  // Router (read-only)
+  rpc RouteGet        (RouteGetRequest)         returns (RouteGetResponse);
+  rpc RoutePut        (RoutePutRequest)         returns (RoutePutResponse);
 
   // Batch
-  rpc BatchRoutePut(BatchRoutePutRequest) returns (BatchRoutePutResponse);
-  rpc BatchRouteGet(BatchRouteGetRequest) returns (BatchRouteGetResponse);
-  rpc BatchFinalizeAllocation(BatchFinalizeRequest) returns (BatchFinalizeResponse);
-  rpc BatchLookup(BatchLookupRequest) returns (BatchLookupResponse);
-  rpc BatchAbortAllocation(BatchAbortAllocationRequest) returns (BatchAbortAllocationResponse);
+  rpc BatchRoutePut   (BatchRoutePutRequest)    returns (BatchRoutePutResponse);
+  rpc BatchRouteGet   (BatchRouteGetRequest)    returns (BatchRouteGetResponse);
 
   // External KV block events
   rpc ReportExternalKvBlocks(ReportExternalKvBlocksRequest) returns (ReportExternalKvBlocksResponse);
   rpc RevokeExternalKvBlocks(RevokeExternalKvBlocksRequest) returns (RevokeExternalKvBlocksResponse);
-  rpc MatchExternalKv(MatchExternalKvRequest) returns (MatchExternalKvResponse);
+  rpc MatchExternalKv       (MatchExternalKvRequest)        returns (MatchExternalKvResponse);
 
   // Client-side metrics reporting
   rpc ReportMetrics(ReportMetricsRequest) returns (ReportMetricsResponse);

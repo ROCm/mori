@@ -51,15 +51,20 @@ struct TierCapacity {
   uint64_t available_bytes = 0;
 };
 
+// In the master-as-advisor design, Location is a (node_id, tier) handle.
+// The peer is the canonical owner of every per-key page set; master holds
+// no per-key page state, so location_id is gone.  `size` is carried so
+// the read path can size its RDMA buffer without a separate Resolve.
+//
+// Dedup key for the index is (node_id, tier): a single peer cannot host
+// two replicas of the same key on the same tier.
 struct Location {
   std::string node_id;
-  std::string location_id;  // Opaque handle from target node
   uint64_t size = 0;
   TierType tier = TierType::UNKNOWN;
 
   bool operator==(const Location& other) const {
-    return node_id == other.node_id && location_id == other.location_id && size == other.size &&
-           tier == other.tier;
+    return node_id == other.node_id && size == other.size && tier == other.tier;
   }
 };
 
