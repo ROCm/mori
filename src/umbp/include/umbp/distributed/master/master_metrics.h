@@ -206,18 +206,16 @@
 // added by the binary: rpc=<MethodName>, status=ok|error.  Master then
 // injects node=<node_id> as a third label.
 
-#define MORI_UMBP_METRIC_MASTER_CLIENT_RPC_LATENCY \
-  "mori_umbp_master_client_rpc_latency_seconds"
+#define MORI_UMBP_METRIC_MASTER_CLIENT_RPC_LATENCY "mori_umbp_master_client_rpc_latency_seconds"
 #define MORI_UMBP_METRIC_MASTER_CLIENT_RPC_LATENCY_HELP \
   "Latency of MasterClient RPC calls (client-perceived, includes network)"
 
-#define MORI_UMBP_METRIC_MASTER_CLIENT_RPC_ERRORS_TOTAL \
-  "mori_umbp_master_client_rpc_errors_total"
+#define MORI_UMBP_METRIC_MASTER_CLIENT_RPC_ERRORS_TOTAL "mori_umbp_master_client_rpc_errors_total"
 #define MORI_UMBP_METRIC_MASTER_CLIENT_RPC_ERRORS_TOTAL_HELP \
   "Number of MasterClient RPC calls returning a non-OK gRPC status"
 
 #define MORI_UMBP_METRIC_MASTER_CLIENT_METRICS_DROPPED_TOTAL \
   "mori_umbp_master_client_metrics_dropped_total"
-#define MORI_UMBP_METRIC_MASTER_CLIENT_METRICS_DROPPED_TOTAL_HELP                                 \
+#define MORI_UMBP_METRIC_MASTER_CLIENT_METRICS_DROPPED_TOTAL_HELP                                \
   "Number of histogram observations dropped client-side because the pending buffer hit its cap " \
   "(see kMasterClientMaxPendingHistograms in master_client.h)"
