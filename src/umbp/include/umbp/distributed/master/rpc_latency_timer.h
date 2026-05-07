@@ -49,9 +49,7 @@ class MasterClient;
 class ScopedRpcTimer {
  public:
   ScopedRpcTimer(MasterClient* owner, std::string_view method_name) noexcept
-      : owner_(owner),
-        method_(method_name),
-        t0_(std::chrono::steady_clock::now()) {}
+      : owner_(owner), method_(method_name), t0_(std::chrono::steady_clock::now()) {}
 
   ~ScopedRpcTimer();
 

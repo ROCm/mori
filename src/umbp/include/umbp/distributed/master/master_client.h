@@ -48,8 +48,7 @@ namespace mori::umbp {
 // observation client-side; never edit in place — bump the metric name suffix
 // instead.  See docs/MORI-UMBP-PD-MONITORING.md.
 inline constexpr double kMasterClientRpcLatencyBucketsArr[] = {
-    1e-4, 5e-4, 1e-3, 2.5e-3, 5e-3, 1e-2, 2.5e-2, 5e-2,
-    1e-1, 2.5e-1, 5e-1, 1.0, 2.5, 5.0,
+    1e-4, 5e-4, 1e-3, 2.5e-3, 5e-3, 1e-2, 2.5e-2, 5e-2, 1e-1, 2.5e-1, 5e-1, 1.0, 2.5, 5.0,
 };
 
 // Hard cap on outstanding histogram samples in MasterClient::pending_histograms_.

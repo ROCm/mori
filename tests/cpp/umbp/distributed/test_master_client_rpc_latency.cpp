@@ -264,8 +264,8 @@ TEST_F(MasterClientRpcLatencyTest, ErrorPathRecordsErrorCounter) {
       }
     }
     if (s.name() == MORI_UMBP_METRIC_MASTER_CLIENT_RPC_LATENCY &&
-        s.value_case() == ::umbp::MetricSample::kHistogram &&
-        LabelValue(s, "rpc") == "Lookup" && LabelValue(s, "status") == "error") {
+        s.value_case() == ::umbp::MetricSample::kHistogram && LabelValue(s, "rpc") == "Lookup" &&
+        LabelValue(s, "status") == "error") {
       ++lookup_error_hist;
     }
   }

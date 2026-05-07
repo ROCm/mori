@@ -1100,9 +1100,8 @@ void MasterClient::MetricsLoop() {
     // Surface buffer-cap drops as a counter so master/Prometheus can alert.
     const uint64_t dropped = metrics_dropped_count_.exchange(0, std::memory_order_relaxed);
     if (dropped > 0) {
-      MORI_UMBP_WARN(
-          "[Client] MetricsLoop dropped {} histogram observation(s) this cycle (cap={})", dropped,
-          kMasterClientMaxPendingHistograms);
+      MORI_UMBP_WARN("[Client] MetricsLoop dropped {} histogram observation(s) this cycle (cap={})",
+                     dropped, kMasterClientMaxPendingHistograms);
       auto& s = counters[MORI_UMBP_METRIC_MASTER_CLIENT_METRICS_DROPPED_TOTAL];
       s.name = MORI_UMBP_METRIC_MASTER_CLIENT_METRICS_DROPPED_TOTAL;
       s.help = MORI_UMBP_METRIC_MASTER_CLIENT_METRICS_DROPPED_TOTAL_HELP;
