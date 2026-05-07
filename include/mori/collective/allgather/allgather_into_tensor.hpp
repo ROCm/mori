@@ -101,15 +101,11 @@ class AllGatherIntoTensor {
   // read zeros.  Hence the safe default is ``false`` — the class falls
   // back to the transit-buffer + post-memcpy path, which is byte-exact
   // and still strictly faster than RCCL on intra-node SDMA-capable links.
-  AllGatherIntoTensor(int my_pe, int npes,
-                      size_t input_buffer_size, size_t output_buffer_size,
-                      bool copy_output_to_user = true,
-                      bool auto_register = false);
+  AllGatherIntoTensor(int my_pe, int npes, size_t input_buffer_size, size_t output_buffer_size,
+                      bool copy_output_to_user = true, bool auto_register = false);
 
-  AllGatherIntoTensor(int my_pe, int npes,
-                      size_t transit_buffer_size = 512 * 1024 * 1024,
-                      bool copy_output_to_user = true,
-                      bool auto_register = false);
+  AllGatherIntoTensor(int my_pe, int npes, size_t transit_buffer_size = 512 * 1024 * 1024,
+                      bool copy_output_to_user = true, bool auto_register = false);
 
   ~AllGatherIntoTensor();
 
@@ -121,12 +117,12 @@ class AllGatherIntoTensor {
   // Returns true on success, false on failure.  Synchronization is the
   // caller's responsibility (record an event on `stream` and wait on it
   // from the consumer stream), matching NCCL's own contract.
-  bool operator()(const void* sendbuff, void* recvbuff, size_t sendcount,
-                  DataType dtype, hipStream_t stream = nullptr);
+  bool operator()(const void* sendbuff, void* recvbuff, size_t sendcount, DataType dtype,
+                  hipStream_t stream = nullptr);
 
   // ----- Two-phase async path (mirrors AllgatherSdma) ---------------------
-  bool start_async(const void* sendbuff, void* recvbuff, size_t sendcount,
-                   DataType dtype, hipStream_t stream = nullptr);
+  bool start_async(const void* sendbuff, void* recvbuff, size_t sendcount, DataType dtype,
+                   hipStream_t stream = nullptr);
   double wait_async(hipStream_t stream = nullptr);
   bool is_async_in_progress() const;
   void cancel_async();

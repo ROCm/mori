@@ -78,26 +78,22 @@ size_t bytes_to_u32_count(size_t sendcount, DataType dtype) {
 // ---------------------------------------------------------------------------
 // Constructors / destructor
 // ---------------------------------------------------------------------------
-AllGatherIntoTensor::AllGatherIntoTensor(int my_pe, int npes,
-                                         size_t input_buffer_size,
-                                         size_t output_buffer_size,
-                                         bool copy_output_to_user,
+AllGatherIntoTensor::AllGatherIntoTensor(int my_pe, int npes, size_t input_buffer_size,
+                                         size_t output_buffer_size, bool copy_output_to_user,
                                          bool auto_register)
     : my_pe_(my_pe),
       npes_(npes),
       auto_register_(auto_register),
-      impl_(std::make_unique<AllgatherSdma<uint32_t>>(
-          my_pe, npes, input_buffer_size, output_buffer_size, copy_output_to_user)) {}
+      impl_(std::make_unique<AllgatherSdma<uint32_t>>(my_pe, npes, input_buffer_size,
+                                                      output_buffer_size, copy_output_to_user)) {}
 
-AllGatherIntoTensor::AllGatherIntoTensor(int my_pe, int npes,
-                                         size_t transit_buffer_size,
-                                         bool copy_output_to_user,
-                                         bool auto_register)
+AllGatherIntoTensor::AllGatherIntoTensor(int my_pe, int npes, size_t transit_buffer_size,
+                                         bool copy_output_to_user, bool auto_register)
     : my_pe_(my_pe),
       npes_(npes),
       auto_register_(auto_register),
-      impl_(std::make_unique<AllgatherSdma<uint32_t>>(
-          my_pe, npes, transit_buffer_size, copy_output_to_user)) {}
+      impl_(std::make_unique<AllgatherSdma<uint32_t>>(my_pe, npes, transit_buffer_size,
+                                                      copy_output_to_user)) {}
 
 AllGatherIntoTensor::~AllGatherIntoTensor() = default;
 
@@ -145,9 +141,8 @@ void AllGatherIntoTensor::maybe_auto_register(void* recvbuff, size_t output_byte
 // ---------------------------------------------------------------------------
 // ncclAllGather-style synchronous entry point
 // ---------------------------------------------------------------------------
-bool AllGatherIntoTensor::operator()(const void* sendbuff, void* recvbuff,
-                                     size_t sendcount, DataType dtype,
-                                     hipStream_t stream) {
+bool AllGatherIntoTensor::operator()(const void* sendbuff, void* recvbuff, size_t sendcount,
+                                     DataType dtype, hipStream_t stream) {
   size_t u32_count = bytes_to_u32_count(sendcount, dtype);
   size_t output_bytes = sendcount * SizeOf(dtype) * static_cast<size_t>(npes_);
   maybe_auto_register(recvbuff, output_bytes);
@@ -163,9 +158,8 @@ bool AllGatherIntoTensor::operator()(const void* sendbuff, void* recvbuff,
 // ---------------------------------------------------------------------------
 // Async two-phase API
 // ---------------------------------------------------------------------------
-bool AllGatherIntoTensor::start_async(const void* sendbuff, void* recvbuff,
-                                      size_t sendcount, DataType dtype,
-                                      hipStream_t stream) {
+bool AllGatherIntoTensor::start_async(const void* sendbuff, void* recvbuff, size_t sendcount,
+                                      DataType dtype, hipStream_t stream) {
   size_t u32_count = bytes_to_u32_count(sendcount, dtype);
   size_t output_bytes = sendcount * SizeOf(dtype) * static_cast<size_t>(npes_);
   maybe_auto_register(recvbuff, output_bytes);
@@ -174,13 +168,9 @@ bool AllGatherIntoTensor::start_async(const void* sendbuff, void* recvbuff,
   return impl_->start_async(in, out, u32_count, stream);
 }
 
-double AllGatherIntoTensor::wait_async(hipStream_t stream) {
-  return impl_->wait_async(stream);
-}
+double AllGatherIntoTensor::wait_async(hipStream_t stream) { return impl_->wait_async(stream); }
 
-bool AllGatherIntoTensor::is_async_in_progress() const {
-  return impl_->is_async_in_progress();
-}
+bool AllGatherIntoTensor::is_async_in_progress() const { return impl_->is_async_in_progress(); }
 
 void AllGatherIntoTensor::cancel_async() { impl_->cancel_async(); }
 

@@ -89,8 +89,15 @@ def _stats(times_ms, *, bytes_per_call):
     return mean, p50, p99, bw
 
 
-def _worker(rank: int, world_size: int, port: int, sizes_bytes, dtype: torch.dtype,
-            warmup: int, iters: int):
+def _worker(
+    rank: int,
+    world_size: int,
+    port: int,
+    sizes_bytes,
+    dtype: torch.dtype,
+    warmup: int,
+    iters: int,
+):
     with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
         shmem.shmem_torch_process_group_init("default")
         device = torch.device(f"cuda:{rank}")
@@ -101,7 +108,8 @@ def _worker(rank: int, world_size: int, port: int, sizes_bytes, dtype: torch.dty
         # round up to 4-byte alignment (SDMA kernel walks uint32 lanes)
         max_per_rank_bytes = (max_per_rank_bytes + 3) & ~0x3
         ag_mori = AllGatherIntoTensor(
-            my_pe=rank, npes=world_size,
+            my_pe=rank,
+            npes=world_size,
             input_buffer_size=max_per_rank_bytes + 4096,
             output_buffer_size=(max_per_rank_bytes + 4096) * world_size,
             copy_output_to_user=True,
@@ -110,18 +118,24 @@ def _worker(rank: int, world_size: int, port: int, sizes_bytes, dtype: torch.dty
         stream = torch.cuda.current_stream()
 
         if rank == 0:
-            print(f"=== bench_allgather_into_tensor "
-                  f"world_size={world_size}  dtype={dtype}  "
-                  f"iters={iters} (warmup={warmup}) ===")
-            print(f"{'output MB':>10}  {'variant':22}"
-                  f"{'mean ms':>10}{'p50 ms':>10}{'p99 ms':>10}{'GB/s':>10}")
+            print(
+                f"=== bench_allgather_into_tensor "
+                f"world_size={world_size}  dtype={dtype}  "
+                f"iters={iters} (warmup={warmup}) ==="
+            )
+            print(
+                f"{'output MB':>10}  {'variant':22}"
+                f"{'mean ms':>10}{'p50 ms':>10}{'p99 ms':>10}{'GB/s':>10}"
+            )
             print("-" * 72)
 
         for total_bytes in sizes_bytes:
             # Free any cached PyTorch tensors from the previous iteration
             # so big sizes don't compound the caching-allocator footprint.
             torch.cuda.empty_cache()
-            per_rank_bytes = (total_bytes // world_size) // dtype.itemsize * dtype.itemsize
+            per_rank_bytes = (
+                (total_bytes // world_size) // dtype.itemsize * dtype.itemsize
+            )
             if per_rank_bytes < 4 or (per_rank_bytes % 4) != 0:
                 continue
             per_rank_numel = per_rank_bytes // dtype.itemsize
@@ -130,13 +144,20 @@ def _worker(rank: int, world_size: int, port: int, sizes_bytes, dtype: torch.dty
             inp = torch.randn(per_rank_numel, device=device).to(dtype).contiguous()
             out_flat = torch.empty(total_numel, dtype=dtype, device=device)
             # list-form: N independent allocations (the case that costs N memcpys)
-            out_list = [torch.empty(per_rank_numel, dtype=dtype, device=device)
-                        for _ in range(world_size)]
+            out_list = [
+                torch.empty(per_rank_numel, dtype=dtype, device=device)
+                for _ in range(world_size)
+            ]
 
             def call_mori_into():
                 # AllGatherIntoTensor: 1 SDMA kernel + 1 D2D memcpy total.
-                ag_mori(inp.data_ptr(), out_flat.data_ptr(),
-                        per_rank_numel, mori_dtype, stream.cuda_stream)
+                ag_mori(
+                    inp.data_ptr(),
+                    out_flat.data_ptr(),
+                    per_rank_numel,
+                    mori_dtype,
+                    stream.cuda_stream,
+                )
 
             def call_mori_list():
                 # Same SDMA kernel, but emulate the all_gather (list) API:
@@ -145,11 +166,16 @@ def _worker(rank: int, world_size: int, port: int, sizes_bytes, dtype: torch.dty
                 # allocated user tensors with N hipMemcpyAsync copies — this
                 # is the cost a hypothetical mori ``AllGather`` (list form)
                 # wrapper would have to pay every call.
-                ag_mori(inp.data_ptr(), out_flat.data_ptr(),
-                        per_rank_numel, mori_dtype, stream.cuda_stream)
+                ag_mori(
+                    inp.data_ptr(),
+                    out_flat.data_ptr(),
+                    per_rank_numel,
+                    mori_dtype,
+                    stream.cuda_stream,
+                )
                 for i in range(world_size):
                     out_list[i].copy_(
-                        out_flat[i * per_rank_numel:(i + 1) * per_rank_numel],
+                        out_flat[i * per_rank_numel : (i + 1) * per_rank_numel],
                         non_blocking=True,
                     )
 
@@ -160,11 +186,16 @@ def _worker(rank: int, world_size: int, port: int, sizes_bytes, dtype: torch.dty
             cat_target = torch.empty(total_numel, dtype=dtype, device=device)
 
             def call_mori_list_then_cat():
-                ag_mori(inp.data_ptr(), out_flat.data_ptr(),
-                        per_rank_numel, mori_dtype, stream.cuda_stream)
+                ag_mori(
+                    inp.data_ptr(),
+                    out_flat.data_ptr(),
+                    per_rank_numel,
+                    mori_dtype,
+                    stream.cuda_stream,
+                )
                 for i in range(world_size):
                     out_list[i].copy_(
-                        out_flat[i * per_rank_numel:(i + 1) * per_rank_numel],
+                        out_flat[i * per_rank_numel : (i + 1) * per_rank_numel],
                         non_blocking=True,
                     )
                 torch.cat(out_list, dim=0, out=cat_target)
@@ -185,39 +216,49 @@ def _worker(rank: int, world_size: int, port: int, sizes_bytes, dtype: torch.dty
 
             # Correctness checks: every variant must reproduce the
             # full contiguous result byte-for-byte.
-            out_flat.zero_(); call_mori_into(); torch.cuda.synchronize()
+            out_flat.zero_()
+            call_mori_into()
+            torch.cuda.synchronize()
             if not torch.equal(out_flat, ref):
                 raise AssertionError(f"rank {rank} mori AG_into_tensor mismatch")
 
-            for t in out_list: t.zero_()
-            call_mori_list(); torch.cuda.synchronize()
+            for t in out_list:
+                t.zero_()
+            call_mori_list()
+            torch.cuda.synchronize()
             for i in range(world_size):
-                slice_ref = ref[i * per_rank_numel:(i + 1) * per_rank_numel]
+                slice_ref = ref[i * per_rank_numel : (i + 1) * per_rank_numel]
                 if not torch.equal(out_list[i], slice_ref):
                     raise AssertionError(f"rank {rank} mori AG_list slot {i} mismatch")
 
-            cat_target.zero_(); call_mori_list_then_cat(); torch.cuda.synchronize()
+            cat_target.zero_()
+            call_mori_list_then_cat()
+            torch.cuda.synchronize()
             if not torch.equal(cat_target, ref):
                 raise AssertionError(f"rank {rank} mori AG_list+cat final mismatch")
 
-            t_mori_into     = _bench_loop(call_mori_into,           warmup=warmup, iters=iters)
-            t_mori_list     = _bench_loop(call_mori_list,           warmup=warmup, iters=iters)
-            t_mori_list_cat = _bench_loop(call_mori_list_then_cat,  warmup=warmup, iters=iters)
+            t_mori_into = _bench_loop(call_mori_into, warmup=warmup, iters=iters)
+            t_mori_list = _bench_loop(call_mori_list, warmup=warmup, iters=iters)
+            t_mori_list_cat = _bench_loop(
+                call_mori_list_then_cat, warmup=warmup, iters=iters
+            )
 
             if rank == 0:
                 mb = total_numel * dtype.itemsize / 1e6
                 bytes_per = total_numel * dtype.itemsize
-                for label, ts in (("mori AG_into_tensor",      t_mori_into),
-                                  ("mori AG_list (1+N)",       t_mori_list),
-                                  ("mori AG_list+cat (1+N+1)", t_mori_list_cat)):
+                for label, ts in (
+                    ("mori AG_into_tensor", t_mori_into),
+                    ("mori AG_list (1+N)", t_mori_list),
+                    ("mori AG_list+cat (1+N+1)", t_mori_list_cat),
+                ):
                     m, p50, p99, bw = _stats(ts, bytes_per_call=bytes_per)
-                    print(f"{mb:>10.2f}  {label:26}"
-                          f"{m:>10.3f}{p50:>10.3f}{p99:>10.3f}{bw:>10.2f}")
+                    print(
+                        f"{mb:>10.2f}  {label:26}"
+                        f"{m:>10.3f}{p50:>10.3f}{p99:>10.3f}{bw:>10.2f}"
+                    )
                 print()
 
         torch.cuda.synchronize()
-        dist.barrier()
-        del ag_mori
         dist.barrier()
         shmem.shmem_finalize()
 
@@ -228,10 +269,13 @@ def main():
     p.add_argument("--dtype", type=str, default="bfloat16")
     p.add_argument("--iters", type=int, default=100)
     p.add_argument("--warmup", type=int, default=20)
-    p.add_argument("--sizes-mb", type=str,
-                   default="1,4,10,40,100",
-                   help="Comma-separated list of total output sizes in MB "
-                        "(matches DS prefetch_bucket_size range).")
+    p.add_argument(
+        "--sizes-mb",
+        type=str,
+        default="1,4,10,40,100",
+        help="Comma-separated list of total output sizes in MB "
+        "(matches DS prefetch_bucket_size range).",
+    )
     args = p.parse_args()
 
     if args.world_size is None:
@@ -246,7 +290,8 @@ def main():
     torch.multiprocessing.spawn(
         _worker,
         args=(args.world_size, port, sizes_bytes, dtype, args.warmup, args.iters),
-        nprocs=args.world_size, join=True,
+        nprocs=args.world_size,
+        join=True,
     )
 
 

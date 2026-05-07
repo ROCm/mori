@@ -39,12 +39,11 @@ walks the buffer in uint32 lanes).
 import os
 import traceback
 
-import numpy as np
 import torch
 import torch.distributed as dist
 
 import mori.shmem as shmem
-from mori.ccl import AllGatherIntoTensor, DataType, size_of
+from mori.ccl import AllGatherIntoTensor, DataType
 
 from tests.python.utils import TorchDistContext, get_free_port
 
@@ -75,7 +74,6 @@ def _make_input(dtype: torch.dtype, numel: int, rank: int, device) -> torch.Tens
         ramp = torch.arange(numel, dtype=torch.int32) % 64
         t = (ramp + base).to(dtype=dtype)
     else:
-        info = torch.iinfo(dtype) if dtype != torch.uint8 else None
         ramp = torch.arange(numel, dtype=torch.int64) % 64
         t = (ramp + base) % (256 if dtype in (torch.uint8, torch.int8) else 1024)
         t = t.to(dtype=dtype)
@@ -84,8 +82,15 @@ def _make_input(dtype: torch.dtype, numel: int, rank: int, device) -> torch.Tens
     return t.contiguous().to(device=device)
 
 
-def _run_one(handle: AllGatherIntoTensor, dtype: torch.dtype, numel: int,
-             rank: int, world_size: int, device, async_mode: bool):
+def _run_one(
+    handle: AllGatherIntoTensor,
+    dtype: torch.dtype,
+    numel: int,
+    rank: int,
+    world_size: int,
+    device,
+    async_mode: bool,
+):
     """Run a single (dtype, mode) round and assert against torch reference."""
     mori_dtype = _TORCH_TO_MORI[dtype]
 
@@ -100,14 +105,16 @@ def _run_one(handle: AllGatherIntoTensor, dtype: torch.dtype, numel: int,
     # code path wait on the same stream (mirrors what DeepSpeed does).
     stream = torch.cuda.current_stream()
     if async_mode:
-        ok = handle.start_async(inp.data_ptr(), out_mori.data_ptr(),
-                                numel, mori_dtype, stream.cuda_stream)
+        ok = handle.start_async(
+            inp.data_ptr(), out_mori.data_ptr(), numel, mori_dtype, stream.cuda_stream
+        )
         assert ok, f"start_async failed for dtype={dtype}, async={async_mode}"
         elapsed = handle.wait_async(stream.cuda_stream)
         assert elapsed >= 0, f"wait_async failed for dtype={dtype}, async={async_mode}"
     else:
-        ok = handle(inp.data_ptr(), out_mori.data_ptr(), numel, mori_dtype,
-                    stream.cuda_stream)
+        ok = handle(
+            inp.data_ptr(), out_mori.data_ptr(), numel, mori_dtype, stream.cuda_stream
+        )
         assert ok, f"sync call failed for dtype={dtype}, async={async_mode}"
     stream.synchronize()
 
@@ -123,7 +130,7 @@ def _run_one(handle: AllGatherIntoTensor, dtype: torch.dtype, numel: int,
 
 def _check_alignment_error(handle: AllGatherIntoTensor, device):
     """Per-rank byte length must be a multiple of 4; otherwise C++ raises."""
-    inp = torch.zeros(3, dtype=torch.int8, device=device)         # 3 bytes
+    inp = torch.zeros(3, dtype=torch.int8, device=device)  # 3 bytes
     out = torch.zeros(3 * 8, dtype=torch.int8, device=device)
     raised = False
     try:
@@ -133,8 +140,15 @@ def _check_alignment_error(handle: AllGatherIntoTensor, device):
     assert raised, "Expected RuntimeError for non-uint32-aligned input bytes"
 
 
-def _worker(rank: int, world_size: int, port: int, numel: int,
-            dtypes: list, async_modes: list, auto_register: bool):
+def _worker(
+    rank: int,
+    world_size: int,
+    port: int,
+    numel: int,
+    dtypes: list,
+    async_modes: list,
+    auto_register: bool,
+):
     """Body executed in each spawned process."""
     with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
         shmem.shmem_torch_process_group_init("default")
@@ -165,11 +179,11 @@ def _worker(rank: int, world_size: int, port: int, numel: int,
                 if (numel * dtype.itemsize) % 4 != 0:
                     continue
                 for async_mode in async_modes:
-                    _run_one(handle, dtype, numel, rank, world_size, device,
-                             async_mode)
+                    _run_one(handle, dtype, numel, rank, world_size, device, async_mode)
                     if rank == 0:
-                        print(f"  ok dtype={dtype}, async={async_mode}, "
-                              f"numel={numel}")
+                        print(
+                            f"  ok dtype={dtype}, async={async_mode}, " f"numel={numel}"
+                        )
 
             _check_alignment_error(handle, device)
             if rank == 0:
@@ -187,9 +201,13 @@ def _worker(rank: int, world_size: int, port: int, numel: int,
             shmem.shmem_finalize()
 
 
-def test_allgather_into_tensor(numel: int = 1024, world_size: int = None,
-                               dtypes=None, async_modes=None,
-                               auto_register: bool = False):
+def test_allgather_into_tensor(
+    numel: int = 1024,
+    world_size: int = None,
+    dtypes=None,
+    async_modes=None,
+    auto_register: bool = False,
+):
     """Pytest-friendly entry point.
 
     Defaults to a small problem (numel=1024) and the local visible GPU
@@ -205,16 +223,17 @@ def test_allgather_into_tensor(numel: int = 1024, world_size: int = None,
     """
     if world_size is None:
         world_size = torch.cuda.device_count()
-    assert world_size >= 2, (
-        f"AllGatherIntoTensor needs >=2 GPUs, got {world_size}"
-    )
+    assert world_size >= 2, f"AllGatherIntoTensor needs >=2 GPUs, got {world_size}"
     if dtypes is None:
         dtypes = [
-            torch.uint8, torch.int8,
+            torch.uint8,
+            torch.int8,
             torch.int16,
             torch.int32,
-            torch.float16, torch.bfloat16,
-            torch.float32, torch.float64,
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+            torch.float64,
             torch.int64,
         ]
     if async_modes is None:
@@ -237,28 +256,44 @@ if __name__ == "__main__":
         description="Unit test for mori::collective::AllGatherIntoTensor",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--numel", type=int, default=1024,
-                        help="Per-rank element count")
-    parser.add_argument("--world-size", type=int, default=None,
-                        help="Number of ranks (default: torch.cuda.device_count())")
-    parser.add_argument("--dtype", type=str, default=None,
-                        help="Restrict to a single torch dtype, e.g. bfloat16")
-    parser.add_argument("--auto-register", action="store_true",
-                        help="Enable experimental zero-copy direct-write path "
-                             "(requires uncached recv buffer; cached PyTorch "
-                             "tensors will read back zeros).")
+    parser.add_argument(
+        "--numel", type=int, default=1024, help="Per-rank element count"
+    )
+    parser.add_argument(
+        "--world-size",
+        type=int,
+        default=None,
+        help="Number of ranks (default: torch.cuda.device_count())",
+    )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default=None,
+        help="Restrict to a single torch dtype, e.g. bfloat16",
+    )
+    parser.add_argument(
+        "--auto-register",
+        action="store_true",
+        help="Enable experimental zero-copy direct-write path "
+        "(requires uncached recv buffer; cached PyTorch "
+        "tensors will read back zeros).",
+    )
     args = parser.parse_args()
 
     if args.dtype is not None:
         from tests.python.utils import string_to_dtype
+
         dtypes = [string_to_dtype(args.dtype)]
     else:
         dtypes = None
 
     try:
-        test_allgather_into_tensor(numel=args.numel, world_size=args.world_size,
-                                   dtypes=dtypes,
-                                   auto_register=args.auto_register)
+        test_allgather_into_tensor(
+            numel=args.numel,
+            world_size=args.world_size,
+            dtypes=dtypes,
+            auto_register=args.auto_register,
+        )
     except Exception:
         traceback.print_exc()
         raise SystemExit(1)

@@ -241,8 +241,7 @@ void RegisterMoriCcl(pybind11::module_& m) {
            "Construct with one combined transit buffer size (split 50/50 input/output)")
       .def_property_readonly("my_pe", &mori::collective::AllGatherIntoTensor::my_pe)
       .def_property_readonly("npes", &mori::collective::AllGatherIntoTensor::npes)
-      .def_property("auto_register",
-                    &mori::collective::AllGatherIntoTensor::auto_register,
+      .def_property("auto_register", &mori::collective::AllGatherIntoTensor::auto_register,
                     &mori::collective::AllGatherIntoTensor::set_auto_register,
                     "Whether the class lazily registers recv buffers on first sight "
                     "to enable the zero-copy direct-write path. Requires the recv "
@@ -252,9 +251,8 @@ void RegisterMoriCcl(pybind11::module_& m) {
                     "incoherence. Default is False.")
       .def(
           "__call__",
-          [](mori::collective::AllGatherIntoTensor& self, uintptr_t input_ptr,
-             uintptr_t output_ptr, size_t count, mori::collective::DataType dtype,
-             int64_t stream) -> bool {
+          [](mori::collective::AllGatherIntoTensor& self, uintptr_t input_ptr, uintptr_t output_ptr,
+             size_t count, mori::collective::DataType dtype, int64_t stream) -> bool {
             return self(reinterpret_cast<const void*>(input_ptr),
                         reinterpret_cast<void*>(output_ptr), count, dtype,
                         reinterpret_cast<hipStream_t>(stream));
@@ -266,23 +264,20 @@ void RegisterMoriCcl(pybind11::module_& m) {
           "`count * npes` lands at `output_ptr` on every rank.")
       .def(
           "start_async",
-          [](mori::collective::AllGatherIntoTensor& self, uintptr_t input_ptr,
-             uintptr_t output_ptr, size_t count, mori::collective::DataType dtype,
-             int64_t stream) -> bool {
+          [](mori::collective::AllGatherIntoTensor& self, uintptr_t input_ptr, uintptr_t output_ptr,
+             size_t count, mori::collective::DataType dtype, int64_t stream) -> bool {
             return self.start_async(reinterpret_cast<const void*>(input_ptr),
                                     reinterpret_cast<void*>(output_ptr), count, dtype,
                                     reinterpret_cast<hipStream_t>(stream));
           },
           py::arg("input_ptr"), py::arg("output_ptr"), py::arg("count"), py::arg("dtype"),
-          py::arg("stream") = 0,
-          "Two-phase async PUT (pair with wait_async)")
+          py::arg("stream") = 0, "Two-phase async PUT (pair with wait_async)")
       .def(
           "wait_async",
           [](mori::collective::AllGatherIntoTensor& self, int64_t stream) -> double {
             return self.wait_async(reinterpret_cast<hipStream_t>(stream));
           },
-          py::arg("stream") = 0,
-          "Two-phase async WAIT; returns elapsed seconds for the operation")
+          py::arg("stream") = 0, "Two-phase async WAIT; returns elapsed seconds for the operation")
       .def("is_async_in_progress", &mori::collective::AllGatherIntoTensor::is_async_in_progress)
       .def("cancel_async", &mori::collective::AllGatherIntoTensor::cancel_async)
       .def("reset_flags", &mori::collective::AllGatherIntoTensor::resetFlags)
