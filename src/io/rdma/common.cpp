@@ -674,13 +674,15 @@ void MovePendingUnsignaledToOrphanedForEndpoint(
 
   const int wrCount = epWrsSinceSignal[epId];
   const size_t mergedReq = epMergedSinceSignal[epId];
+  // Close admission before dropping the caller's shared submit guard. The
+  // unique recovery guard below then waits for already-admitted posters to drain.
+  MarkEpDegradedFromSubmitFailure(eps[epId], SqDegradeReason::PartialPostOrphaned);
   if (heldSubmitGuard != nullptr && heldSubmitGuard->owns_lock()) {
     heldSubmitGuard->unlock();
   }
 
   std::unique_lock<std::shared_mutex> recoveryGuard;
   if (eps[epId].sq) recoveryGuard = eps[epId].sq->AcquireRecoveryGuard();
-  MarkEpDegradedFromSubmitFailure(eps[epId], SqDegradeReason::PartialPostOrphaned);
 
   MORI_IO_WARN(
       "{}: moving pending unsignaled WRs on ep {} (wrCount={}, mergedReq={}) to orphaned and "

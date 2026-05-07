@@ -442,6 +442,54 @@ void CasePendingUnsignaledReserveFailureOrphans() {
   RunPendingUnsignaledOrphaningCase("TryReserveSqDepth failed", 2);
 }
 
+void CasePendingUnsignaledOrphaningClosesAdmissionBeforeRecoveryGuard() {
+  constexpr uint32_t kNotifPerQp = 16;
+  TransferStatus status;
+  status.SetCode(StatusCode::IN_PROGRESS);
+  auto meta = std::make_shared<CqCallbackMeta>(&status, 404, 3);
+
+  EpPair ep{};
+  ep.sq = std::make_shared<SqController>(8, 0);
+  ep.ledger = std::make_shared<SubmissionLedger>(kNotifPerQp);
+
+  ReserveOptions opts;
+  opts.timeoutUs = 10000;
+  ReserveResult result;
+  Require(ep.sq->Reserve(2, opts, &result), "simulated unsignaled reserve should succeed");
+
+  EpPairVec eps{ep};
+  std::vector<int> epWrsSinceSignal{2};
+  std::vector<size_t> epMergedSinceSignal{3};
+  std::shared_lock<std::shared_mutex> recoveryBlocker = ep.sq->AcquireSubmitGuard();
+  std::atomic<bool> helperStarted{false};
+  std::atomic<bool> helperDone{false};
+
+  std::thread helper([&]() {
+    std::shared_lock<std::shared_mutex> heldSubmitGuard = eps[0].sq->AcquireSubmitGuard();
+    helperStarted.store(true, std::memory_order_release);
+    MovePendingUnsignaledToOrphanedForEndpoint(eps, 0, epWrsSinceSignal, epMergedSinceSignal, meta,
+                                               "blocked recovery", "admission-close test",
+                                               &heldSubmitGuard);
+    helperDone.store(true, std::memory_order_release);
+  });
+
+  Require(WaitUntil([&]() { return helperStarted.load(std::memory_order_acquire); },
+                    std::chrono::seconds(1)),
+          "helper thread should acquire submit guard");
+  Require(WaitUntil([&]() { return ep.sq->IsTerminalDegraded(); }, std::chrono::seconds(1)),
+          "helper should close admission before recovery guard drains");
+  Require(!helperDone.load(std::memory_order_acquire),
+          "helper should wait for recovery guard while admission is closed");
+  Require(!ep.sq->Reserve(1, opts, &result), "reserve should fail after admission is closed");
+
+  recoveryBlocker.unlock();
+  helper.join();
+  Require(helperDone.load(std::memory_order_acquire), "helper should finish after recovery drains");
+  Require(status.Failed(), "orphaned meta should fail after recovery drains");
+  ep.sq->ReleaseDrainedOrphaned(2);
+  Require(ep.sq->Depth() == 0, "drained orphaned release should clear held credits");
+}
+
 void CaseRdmaBackendSessionAliveChecksTerminalSq() {
   RdmaBackendConfig cfg{};
   mori::application::RdmaMemoryRegion mr{};
@@ -995,6 +1043,8 @@ int main(int argc, char* argv[]) {
       {"sq_controller_recheck_rolls_back", CaseSqControllerRecheckRollsBack},
       {"pending_unsignaled_recheck_failure_orphans", CasePendingUnsignaledRecheckFailureOrphans},
       {"pending_unsignaled_reserve_failure_orphans", CasePendingUnsignaledReserveFailureOrphans},
+      {"pending_unsignaled_orphaning_closes_admission_before_recovery",
+       CasePendingUnsignaledOrphaningClosesAdmissionBeforeRecoveryGuard},
       {"rdma_session_alive_checks_terminal_sq", CaseRdmaBackendSessionAliveChecksTerminalSq},
       {"wr_id_namespace_helpers", CaseWrIdNamespaceHelpers},
       {"rdma_notification_rejects_zero_notif_per_qp", CaseRdmaNotificationRejectsZeroNotifPerQp},
