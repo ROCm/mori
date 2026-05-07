@@ -213,6 +213,7 @@ void CaseSubmissionLedgerBasic() {
   auto meta = std::make_shared<CqCallbackMeta>(&status, 101, 8);
   const uint64_t id = ledger.Insert(3, true, meta, 8);
   Require(id == kNotifPerQp, "first ledger record id should start at notifPerQp boundary");
+  Require(ledger.MarkPosted(id), "ledger mark posted should accept tentative signaled record");
   SubmissionRecord released;
   Require(ledger.ReleaseByCqe(id, &released), "ledger release should find posted record");
   Require(released.meta != nullptr, "ledger release meta should not be null");
@@ -224,8 +225,12 @@ void CaseSubmissionLedgerBasic() {
   auto meta2 = std::make_shared<CqCallbackMeta>(&status, 202, 16);
   uint64_t postedId = ledger2.Insert(4, true, meta2, 10);
   Require(postedId == kNotifPerQp, "posted record id should respect notifPerQp offset");
+  Require(ledger2.MarkPosted(postedId), "posted record should be markable after tail post");
   uint64_t orphanedId = ledger2.InsertOrphaned(3, meta2, 6);
   Require(orphanedId == kNotifPerQp + 1, "orphaned record id should follow posted id");
+  Require(!ledger2.MarkPosted(orphanedId), "orphaned record should not be markable as posted");
+  Require(!ledger2.CancelTentative(orphanedId, nullptr),
+          "orphaned record should not be cancelable as tentative");
   Require(ledger2.HasOrphaned(), "expected orphaned record in ledger");
   std::vector<SubmissionRecord> orphaned;
   ledger2.ExtractOrphanedRecords(&orphaned);
@@ -246,6 +251,16 @@ void CaseSubmissionLedgerBasic() {
   Require(ledger3.CancelTentative(tentativeId, &tentative), "tentative cancel should find record");
   Require(tentative.postedWr == 2, "tentative cancel should return record contents");
   Require(!ledger3.ReleaseByCqe(tentativeId, nullptr), "canceled record should be erased");
+
+  SubmissionLedger ledger4(kNotifPerQp);
+  uint64_t postedTentativeId = ledger4.Insert(5, true, meta2, 5);
+  Require(ledger4.MarkPosted(postedTentativeId), "posted tentative should transition to posted");
+  Require(!ledger4.CancelTentative(postedTentativeId, nullptr),
+          "posted record should not be cancelable as tentative");
+  SubmissionRecord stillPosted;
+  Require(ledger4.ReleaseByCqe(postedTentativeId, &stillPosted),
+          "posted record should remain after failed tentative cancel");
+  Require(stillPosted.postedWr == 5, "posted record contents should be preserved");
 }
 
 void CaseSqControllerReserveReleaseWait() {

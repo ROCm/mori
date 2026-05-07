@@ -1212,13 +1212,24 @@ void RdmaBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remot
 
   EngineKey ekey = remote.engineKey;
 
-  // Create a pair of endpoint if none
-  int epNum = rdma->CountEndpoint(ekey, kp);
-  for (int i = 0; i < (config.qpPerTransfer - epNum); i++) {
-    server->BuildRdmaConn(ekey, kp);
+  if (config.qpPerTransfer <= 0) {
+    throw std::runtime_error("RDMA CreateSession requires qpPerTransfer > 0");
   }
-  EpPairVec eps = rdma->GetAllEndpoint(ekey, kp);
-  assert(static_cast<int>(eps.size()) >= config.qpPerTransfer);
+
+  EpPairVec eps;
+  const int maxAttempts = std::max(2, config.qpPerTransfer * 2);
+  for (int attempt = 0; attempt < maxAttempts; ++attempt) {
+    eps = rdma->GetAllEndpoint(ekey, kp);
+    const int missing = config.qpPerTransfer - static_cast<int>(eps.size());
+    if (missing <= 0) break;
+    for (int i = 0; i < missing; ++i) {
+      server->BuildRdmaConn(ekey, kp);
+    }
+  }
+  eps = rdma->GetAllEndpoint(ekey, kp);
+  if (static_cast<int>(eps.size()) < config.qpPerTransfer) {
+    throw std::runtime_error("RDMA CreateSession could not allocate enough healthy endpoints");
+  }
 
   EpPairVec epSet = {eps.begin(), eps.begin() + config.qpPerTransfer};
 

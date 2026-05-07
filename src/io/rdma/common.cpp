@@ -1018,7 +1018,7 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
       const bool lastWasPosted = (postedCount == batchWrNum);
       if (needSignal && lastWasPosted) {
         // Signaled WR was posted; CQ path (ledger->ReleaseByCqe) owns the release.
-        // The record inserted above remains in Posted state — nothing to do here.
+        (void)eps[epId].ledger->MarkPosted(recordId);
       } else if (needSignal) {
         // Signaled WR itself was NOT posted; remove the tentative record.
         SubmissionRecord canceled;
@@ -1048,6 +1048,7 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
     }
 
     if (needSignal) {
+      (void)eps[epId].ledger->MarkPosted(recordId);
       epWrsSinceSignal[epId] = 0;
       epMergedSinceSignal[epId] = 0;
     }

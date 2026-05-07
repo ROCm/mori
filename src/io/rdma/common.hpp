@@ -214,8 +214,9 @@ using EndpointId = uint64_t;
 // SubmissionLedger tracks per-EP WR completions. SQ credit is released by
 // SqController after callers inspect the returned SubmissionRecord.
 enum class SubmissionState : uint8_t {
-  Posted,    // submitted, awaiting CQE
-  Orphaned,  // partial post without signaled tail; awaits recovery
+  Tentative,  // inserted before ibv_post_send confirms the signaled tail was posted
+  Posted,     // submitted, awaiting CQE
+  Orphaned,   // partial post without signaled tail; awaits recovery
 };
 
 struct SubmissionRecord {
@@ -240,6 +241,9 @@ class SubmissionLedger {
 
   // CQE path: find record by recordId, return it, and erase it.
   bool ReleaseByCqe(uint64_t recordId, SubmissionRecord* outRecord);
+
+  // Post path: a tentative signaled record has a posted tail and must await CQE.
+  bool MarkPosted(uint64_t recordId);
 
   // Post failure path: erase a tentative signaled record whose tail was not posted.
   bool CancelTentative(uint64_t recordId, SubmissionRecord* outRecord);
