@@ -31,10 +31,12 @@
 
 namespace mori::umbp {
 
-DRAMTier::DRAMTier(size_t capacity, bool use_shm, const std::string& shm_name)
+DRAMTier::DRAMTier(size_t capacity, bool use_shm, const std::string& shm_name, bool use_hugepages,
+                   size_t hugepage_size, int numa_node, bool prefault)
     : TierBackend(StorageTier::CPU_DRAM),
       base_ptr_(nullptr),
       capacity_(capacity),
+      mapped_size_(0),
       used_(0),
       shm_fd_(-1),
       use_shm_(use_shm),
@@ -50,17 +52,28 @@ DRAMTier::DRAMTier(size_t capacity, bool use_shm, const std::string& shm_name)
       throw std::runtime_error("ftruncate failed: " + std::string(strerror(errno)));
     }
     base_ptr_ = mmap(nullptr, capacity_, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd_, 0);
-  } else {
-    base_ptr_ =
-        mmap(nullptr, capacity_, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-  }
-
-  if (base_ptr_ == MAP_FAILED) {
-    if (use_shm_ && shm_fd_ >= 0) {
+    if (base_ptr_ == MAP_FAILED) {
       close(shm_fd_);
       shm_unlink(shm_name_.c_str());
+      throw std::runtime_error("mmap failed: " + std::string(strerror(errno)));
     }
-    throw std::runtime_error("mmap failed: " + std::string(strerror(errno)));
+    mapped_size_ = capacity_;
+  } else {
+    HostMemAllocator allocator;
+    HostBufferOptions opts;
+    opts.backing =
+        use_hugepages ? HostBufferBacking::kAnonymousHugetlb : HostBufferBacking::kAnonymous;
+    opts.hugepage_size = hugepage_size;
+    opts.numa_node = numa_node;
+    opts.prefault = prefault;
+
+    host_buf_handle_ = allocator.Alloc(capacity_, opts);
+    if (!host_buf_handle_.valid()) {
+      throw std::runtime_error("DRAMTier: memory allocation failed for " +
+                               std::to_string(capacity_) + " bytes");
+    }
+    base_ptr_ = host_buf_handle_.ptr;
+    mapped_size_ = host_buf_handle_.mapped_size;
   }
 
   // Initialize free list with entire capacity
@@ -68,12 +81,15 @@ DRAMTier::DRAMTier(size_t capacity, bool use_shm, const std::string& shm_name)
 }
 
 DRAMTier::~DRAMTier() {
-  if (base_ptr_ && base_ptr_ != MAP_FAILED) {
-    munmap(base_ptr_, capacity_);
-  }
   if (use_shm_) {
+    if (base_ptr_ && base_ptr_ != MAP_FAILED) {
+      munmap(base_ptr_, mapped_size_);
+    }
     if (shm_fd_ >= 0) close(shm_fd_);
     shm_unlink(shm_name_.c_str());
+  } else {
+    HostMemAllocator allocator;
+    allocator.Free(host_buf_handle_);
   }
 }
 

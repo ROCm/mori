@@ -31,6 +31,7 @@
 #include <utility>
 #include <vector>
 
+#include "umbp/local/host_mem_allocator.h"
 #include "umbp/local/tiers/tier_backend.h"
 
 namespace mori::umbp {
@@ -38,7 +39,15 @@ namespace mori::umbp {
 // DRAM Tier: mmap pre-allocated large memory block with offset allocator
 class DRAMTier : public TierBackend {
  public:
-  DRAMTier(size_t capacity, bool use_shm = false, const std::string& shm_name = "/umbp_dram");
+  DRAMTier(size_t capacity, bool use_shm, const std::string& shm_name, bool use_hugepages,
+           size_t hugepage_size, int numa_node, bool prefault);
+
+  // Backward-compatible overloads (no hugepages).
+  explicit DRAMTier(size_t capacity)
+      : DRAMTier(capacity, false, "/umbp_dram", false, 2ULL * 1024 * 1024, -1, true) {}
+  DRAMTier(size_t capacity, bool use_shm, const std::string& shm_name)
+      : DRAMTier(capacity, use_shm, shm_name, false, 2ULL * 1024 * 1024, -1, true) {}
+
   ~DRAMTier() override;
 
   // Non-copyable
@@ -75,12 +84,14 @@ class DRAMTier : public TierBackend {
   std::optional<size_t> GetSlotOffset(const std::string& key) const;
 
  private:
-  void* base_ptr_;  // mmap base address
-  size_t capacity_;
+  void* base_ptr_;      // mmap base address
+  size_t capacity_;     // usable capacity (= requested size)
+  size_t mapped_size_;  // actual mapped size (>= capacity_ with hugepages)
   size_t used_;
   int shm_fd_;  // shm_open fd (-1 for anonymous)
   bool use_shm_;
   std::string shm_name_;
+  HostBufferHandle host_buf_handle_;  // owned handle for non-shm path
 
   // Simple offset allocator: key -> (offset, size)
   struct SlotInfo {

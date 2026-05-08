@@ -58,6 +58,12 @@ struct UMBPDramConfig {
   std::string shm_name = "/umbp_dram";
   double high_watermark = 0.9;
   double low_watermark = 0.7;
+
+  // Host memory options (ignored when use_shared_memory=true).
+  bool use_hugepages = false;
+  size_t hugepage_size = 2ULL * 1024 * 1024;  // 2 MiB
+  int numa_node = -1;                         // -1 = no NUMA binding
+  bool prefault = true;
 };
 
 struct UMBPIoConfig {
@@ -198,6 +204,11 @@ struct UMBPConfig {
         return false;
       }
     }
+    if (dram.use_hugepages && dram.hugepage_size != 0 &&
+        (dram.hugepage_size & (dram.hugepage_size - 1)) != 0) {
+      if (error_message) *error_message = "dram.hugepage_size must be a power of two";
+      return false;
+    }
     if (copy_pipeline.queue_depth == 0) {
       if (error_message) *error_message = "copy_pipeline.queue_depth must be > 0";
       return false;
@@ -260,6 +271,11 @@ struct UMBPConfig {
     cfg.eviction.policy = getenv_str("UMBP_EVICTION_POLICY", cfg.eviction.policy);
     cfg.dram.high_watermark = getenv_double("UMBP_DRAM_HIGH_WM", cfg.dram.high_watermark);
     cfg.dram.low_watermark = getenv_double("UMBP_DRAM_LOW_WM", cfg.dram.low_watermark);
+    cfg.dram.use_hugepages =
+        getenv_int("UMBP_DRAM_USE_HUGEPAGES", cfg.dram.use_hugepages ? 1 : 0) != 0;
+    cfg.dram.hugepage_size = getenv_size("UMBP_DRAM_HUGEPAGE_SIZE", cfg.dram.hugepage_size);
+    cfg.dram.numa_node = getenv_int("UMBP_DRAM_NUMA_NODE", cfg.dram.numa_node);
+    cfg.dram.prefault = getenv_int("UMBP_DRAM_PREFAULT", cfg.dram.prefault ? 1 : 0) != 0;
 
     cfg.ssd_backend = getenv_str("UMBP_SSD_BACKEND", cfg.ssd_backend);
     if (cfg.ssd_backend == "posix" && !std::getenv("UMBP_SSD_BACKEND") &&

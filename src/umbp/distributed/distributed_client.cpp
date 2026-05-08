@@ -21,8 +21,6 @@
 // SOFTWARE.
 #include "umbp/distributed/distributed_client.h"
 
-#include <sys/mman.h>
-
 #include <map>
 #include <stdexcept>
 
@@ -53,12 +51,20 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
   }
 
   dram_pool_size_ = config.dram.capacity_bytes;
-  dram_pool_ =
-      mmap(nullptr, dram_pool_size_, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  if (dram_pool_ == MAP_FAILED) {
-    dram_pool_ = nullptr;
-    throw std::runtime_error("DistributedClient: mmap failed for DRAM pool");
+
+  HostMemAllocator allocator;
+  HostBufferOptions opts;
+  opts.backing = config.dram.use_hugepages ? HostBufferBacking::kAnonymousHugetlb
+                                           : HostBufferBacking::kAnonymous;
+  opts.hugepage_size = config.dram.hugepage_size;
+  opts.numa_node = config.dram.numa_node;
+  opts.prefault = config.dram.prefault;
+
+  dram_pool_handle_ = allocator.Alloc(dram_pool_size_, opts);
+  if (!dram_pool_handle_.valid()) {
+    throw std::runtime_error("DistributedClient: memory allocation failed for DRAM pool");
   }
+  dram_pool_ = dram_pool_handle_.ptr;
 
   auto pc_config = ToPoolClientConfig(
       dc,
@@ -68,8 +74,10 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
   pool_client_ = std::make_unique<PoolClient>(std::move(pc_config));
   if (!pool_client_->Init()) {
     pool_client_.reset();
-    munmap(dram_pool_, dram_pool_size_);
+    HostMemAllocator cleanup_allocator;
+    cleanup_allocator.Free(dram_pool_handle_);
     dram_pool_ = nullptr;
+    dram_pool_size_ = 0;
     throw std::runtime_error("DistributedClient: PoolClient::Init() failed");
   }
 
@@ -218,8 +226,10 @@ void DistributedClient::Close() {
   }
 
   if (dram_pool_) {
-    munmap(dram_pool_, dram_pool_size_);
+    HostMemAllocator allocator;
+    allocator.Free(dram_pool_handle_);
     dram_pool_ = nullptr;
+    dram_pool_size_ = 0;
   }
 
   MORI_UMBP_INFO("[DistributedClient] closed");
