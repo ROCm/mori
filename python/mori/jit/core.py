@@ -165,7 +165,9 @@ def _verify_bitcode(cfg: BuildConfig, bc_path: Path) -> None:
 
 def _has_ionic_ccqe() -> bool:
     """Check whether the ionic driver supports CCQE by probing the runtime library symbol."""
-    import ctypes, ctypes.util
+    import ctypes
+    import ctypes.util
+
     lib_name = ctypes.util.find_library("ionic")
     if lib_name is None:
         return False
@@ -190,6 +192,7 @@ def is_ccqe_enabled() -> bool:
 
 def _ccqe_defines() -> list[str]:
     return ["-DIONIC_CCQE"] if is_ccqe_enabled() else []
+
 
 def _nic_defines() -> list[str]:
     """Return compiler -D flags for the detected NIC type (device-side macros)."""
@@ -418,7 +421,9 @@ def compile_genco(
             mori_root / "src" / "ops" / "kernels",
             mori_root / "include" / "mori",
         ]
-        cache_dir = get_cache_dir(cfg.arch, source_paths, nic, profiler=profiler, ccqe=ccqe)
+        cache_dir = get_cache_dir(
+            cfg.arch, source_paths, nic, profiler=profiler, ccqe=ccqe
+        )
 
         hsaco_paths = [cache_dir / f"{k}.hsaco" for k in sub_kernels]
         if all(p.is_file() for p in hsaco_paths):
@@ -513,7 +518,9 @@ def ensure_bitcode(*, cov: int = 5) -> str:
         mori_root / "include" / "mori" / "shmem",
         mori_root / "include" / "mori" / "core",
     ]
-    cache_dir = get_cache_dir(cfg.arch, source_paths, nic, profiler=profiler, cov=cov, ccqe=ccqe)
+    cache_dir = get_cache_dir(
+        cfg.arch, source_paths, nic, profiler=profiler, cov=cov, ccqe=ccqe
+    )
     bc_path = cache_dir / _BC_FILENAME
 
     if bc_path.is_file():

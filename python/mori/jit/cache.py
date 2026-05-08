@@ -82,6 +82,10 @@ def get_cache_dir(
     ccqe_suffix = "_ccqe" if ccqe else ""
     profiler_suffix = "_profiler" if profiler else ""
     cov_suffix = f"_cov{cov}" if cov is not None else ""
-    d = get_cache_root() / f"{arch}_{nic}{ccqe_suffix}{profiler_suffix}{cov_suffix}" / content_hash
+    d = (
+        get_cache_root()
+        / f"{arch}_{nic}{ccqe_suffix}{profiler_suffix}{cov_suffix}"
+        / content_hash
+    )
     d.mkdir(parents=True, exist_ok=True)
     return d
