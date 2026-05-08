@@ -73,7 +73,7 @@ IonicCqContainer::IonicCqContainer(ibv_context* context, const RdmaEndpointConfi
   ionic_cq_attr.comp_mask = IONIC_CQ_INIT_ATTR_MASK_FLAGS;
   ionic_cq_attr.flags = IONIC_CQ_INIT_ATTR_CCQE;
   cq_attr.cqe = 1;
-  cq_ex = ionic_dv_create_cq_ex(context, &cq_attr, &ionic_cq_attr);
+  cq_ex = IonicDvApi::Instance().create_cq_ex(context, &cq_attr, &ionic_cq_attr);
 #else
   cq_attr.cqe = cqeNum * 2;  // from rocshmem, send&recv?
   cq_ex = ibv_create_cq_ex(context, &cq_attr);

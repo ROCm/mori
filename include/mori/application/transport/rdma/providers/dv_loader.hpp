@@ -181,6 +181,8 @@ struct IonicDvApi {
   using pd_set_sqcmb_t = int (*)(struct ibv_pd*, bool, bool, bool);
   using pd_set_rqcmb_t = int (*)(struct ibv_pd*, bool, bool, bool);
   using pd_set_udma_mask_t = int (*)(struct ibv_pd*, uint32_t);
+  using create_cq_ex_t = struct ibv_cq_ex* (*)(struct ibv_context*, struct ibv_cq_init_attr_ex*,
+                                               struct ionic_cq_init_attr_ex*);
 
   get_ctx_t get_ctx = nullptr;
   qp_get_udma_idx_t qp_get_udma_idx = nullptr;
@@ -189,6 +191,7 @@ struct IonicDvApi {
   pd_set_sqcmb_t pd_set_sqcmb = nullptr;
   pd_set_rqcmb_t pd_set_rqcmb = nullptr;
   pd_set_udma_mask_t pd_set_udma_mask = nullptr;
+  create_cq_ex_t create_cq_ex = nullptr;
 
   void* handle = nullptr;
 
@@ -203,9 +206,10 @@ struct IonicDvApi {
     pd_set_sqcmb = (pd_set_sqcmb_t)DvLoadSymbol(handle, "ionic_dv_pd_set_sqcmb");
     pd_set_rqcmb = (pd_set_rqcmb_t)DvLoadSymbol(handle, "ionic_dv_pd_set_rqcmb");
     pd_set_udma_mask = (pd_set_udma_mask_t)DvLoadSymbol(handle, "ionic_dv_pd_set_udma_mask");
+    create_cq_ex = (create_cq_ex_t)DvLoadSymbol(handle, "ionic_dv_create_cq_ex");
 
     return get_ctx && qp_get_udma_idx && get_cq && get_qp && pd_set_sqcmb && pd_set_rqcmb &&
-           pd_set_udma_mask;
+           pd_set_udma_mask && create_cq_ex;
   }
 
   static IonicDvApi& Instance() {
