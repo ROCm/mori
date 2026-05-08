@@ -190,10 +190,6 @@ void RegisterMoriShmem(py::module_& m) {
         "Convert local symmetric memory pointer to remote P2P address. "
         "Returns 0 if connection uses RDMA or if pointer is invalid. "
         "Returns P2P accessible address if connection uses P2P transport.");
-  m.def("shmem_torch_process_group_init", &ShmemTorchProcessGroupInit);
-  m.def("shmem_finalize", &ShmemFinalize);
-  m.def("shmem_mype", &ShmemMyPe);
-  m.def("shmem_npes", &ShmemNPes);
   m.def("shmem_num_qp_per_pe", &ShmemNumQpPerPe);
 }
 

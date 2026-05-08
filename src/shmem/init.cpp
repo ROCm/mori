@@ -745,11 +745,12 @@ int ShmemFinalize() {
 
   MORI_SHMEM_TRACE("Starting shmem finalization");
 
-  // Clean up in reverse order of initialization
-  FinalizeGpuStates(states);
-
-  // Clean up internal sync memory
+  // Clean up in reverse order of initialization.
+  // FinalizeInternalSync MUST run before FinalizeGpuStates: the latter clears
+  // states->gpuStates (incl. internalSyncPtr), which would make
+  // FinalizeInternalSync early-return and leak the sync memory.
   FinalizeInternalSync(states);
+  FinalizeGpuStates(states);
 
   FinalizeHeap(states);
   FinalizeAllStates(states);
