@@ -184,7 +184,7 @@ def is_ccqe_enabled() -> bool:
     global _ccqe_enabled
     if _ccqe_enabled is None:
         _ccqe_enabled = _has_ionic_ccqe()
-        print("xxxxxxxxxxxxxxxxxx CCQE enabled XXXXXXXXXXXXXXXXXXXXX")
+    print("xxxxxxxxxxxxxxxxxx CCQE enabled XXXXXXXXXXXXXXXXXXXXX", _ccqe_enabled)
     return _ccqe_enabled
 
 
