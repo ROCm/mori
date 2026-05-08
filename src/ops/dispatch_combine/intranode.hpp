@@ -405,8 +405,9 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
           srcWeightsPtr[j] = args.shmemInpWeightsMemObj->template GetAs<float*>(destPe) +
                              destLocalTokId * config.numExpertPerToken;
           if constexpr (UseFp8BlockwiseQuant) {
-            srcScalePtrs[j] = args.shmemInpScalesMemObj->template GetAs<float*>(destPe) +
+            float* scalePtr = args.shmemInpScalesMemObj->template GetAs<float*>(destPe) +
                               destLocalTokId * config.scaleDim;
+            srcScalePtrs[j] = (scalePtr[0] < 0.0f) ? scalePtr : nullptr;
           }
         } else {
           srcPtrs[j] = reinterpret_cast<TokT*>(
@@ -417,9 +418,10 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
               args.intraNodeTokBufs.combineInp->template GetAs<uint8_t*>(myPe) +
               SendBufSlotOffset(config, destPe, tokenId) * combXferBytes + weightOffset);
           if constexpr (UseFp8BlockwiseQuant) {
-            srcScalePtrs[j] = reinterpret_cast<float*>(
+            float* scalePtr = reinterpret_cast<float*>(
                 args.intraNodeTokBufs.combineInp->template GetAs<uint8_t*>(myPe) +
                 SendBufSlotOffset(config, destPe, tokenId) * combXferBytes + hiddenBytes);
+            srcScalePtrs[j] = (scalePtr[0] < 0.0f) ? scalePtr : nullptr;
           }
         }
       } else {

@@ -1655,13 +1655,14 @@ __device__ __forceinline__ void WarpAccumFp8DequantVecRangeBlockwiseScaleWave(
       const Fp8T* src = srcs[i];
       if (src == nullptr) continue;
       const auto* srcB = reinterpret_cast<const __hip_fp8_storage_t*>(src);
-      float s = 1.0f;
-      if (srcScales != nullptr && srcScales[i] != nullptr) {
-        s = srcScales[i][sb];
-        if (sb == 0 && s < 0.0f) s = -s;
-      }
+      const float* scalePtr = (srcScales != nullptr) ? srcScales[i] : nullptr;
 
       const LoadT packed = load<VecBytes>(srcB + idx);
+      float s = 1.0f;
+      if (scalePtr != nullptr) {
+        s = scalePtr[sb];
+        if (sb == 0 && s < 0.0f) s = -s;
+      }
 #pragma unroll
       for (int seg = 0; seg < kSegs; ++seg) {
         const uint32_t packed4 = [&]() -> uint32_t {
@@ -1676,7 +1677,11 @@ __device__ __forceinline__ void WarpAccumFp8DequantVecRangeBlockwiseScaleWave(
           }
           return 0;
         }();
-        AccumFp8Packed4<Fp8T, true>(acc01[seg], acc23[seg], packed4, s);
+        if (scalePtr != nullptr) {
+          AccumFp8Packed4<Fp8T, true>(acc01[seg], acc23[seg], packed4, s);
+        } else {
+          AccumFp8Packed4<Fp8T, false>(acc01[seg], acc23[seg], packed4, 1.0f);
+        }
       }
     }
 
@@ -1698,12 +1703,13 @@ __device__ __forceinline__ void WarpAccumFp8DequantVecRangeBlockwiseScaleWave(
       const auto* src = srcs[i];
       if (src == nullptr) continue;
       float v = static_cast<float>(src[j]);
-      float s = 1.0f;
-      if (srcScales != nullptr && srcScales[i] != nullptr) {
-        s = srcScales[i][sb];
+      const float* scalePtr = (srcScales != nullptr) ? srcScales[i] : nullptr;
+      if (scalePtr != nullptr) {
+        float s = scalePtr[sb];
         if (sb == 0 && s < 0.0f) s = -s;
+        v *= s;
       }
-      acc += v * s;
+      acc += v;
     }
     dstToken[j] = OutT(acc);
   }
@@ -1727,7 +1733,7 @@ __device__ __forceinline__ void WarpAccumFp8DequantFullImpl(
   if (srcScales != nullptr) {
 #pragma unroll AccumNum
     for (int i = 0; i < AccumNum; ++i) {
-      anyScale |= (srcScales[i] != nullptr);
+      anyScale |= (cachedSrcs[i] != nullptr && srcScales[i] != nullptr);
     }
   }
 
@@ -1931,7 +1937,7 @@ __device__ __forceinline__ void WarpAccumFp8DequantSegmentImpl(
   if (srcScales != nullptr) {
 #pragma unroll AccumNum
     for (int i = 0; i < AccumNum; ++i) {
-      anyScale |= (srcScales[i] != nullptr);
+      anyScale |= (cachedSrcs[i] != nullptr && srcScales[i] != nullptr);
     }
   }
 
