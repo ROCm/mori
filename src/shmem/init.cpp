@@ -58,20 +58,14 @@ ShmemStates* ShmemStatesSingleton::GetInstance() {
 #ifdef MORI_MULTITHREAD_SUPPORT
   // One instance per GPU, indexed by the calling thread's current HIP device.
   // hipGetDevice() reads thread-local HIP state, so it is very cheap.
-  // Clear any sticky HIP error before querying the device — a prior kernel error
-  // on this thread's stream must not prevent finalization from running.
   static ShmemStatesSingleton s_inst;
-  (void)hipGetLastError();  // clear sticky error
   int id = -1;
   HIP_RUNTIME_CHECK(hipGetDevice(&id));
-  if (__builtin_expect(id < 0 || id >= kMaxGpusPerNode, 0)) {
+  if (__builtin_expect(id < 0 || id >= mori::kMaxGpusPerNode, 0)) {
     MORI_SHMEM_ERROR("hipGetDevice() returned out-of-range id {}, max supported is {}", id,
-                     kMaxGpusPerNode - 1);
+                     mori::kMaxGpusPerNode - 1);
     assert(false);
   }
-  // Each array slot has a stable address — no lock needed for the read path
-  // once a thread's device is fixed.  We still take a brief lock the first
-  // time to guard concurrent ShmemInit calls on the same slot.
   return &s_inst.states_[id];
 #else
   static ShmemStates states;
@@ -670,11 +664,6 @@ int ShmemInit(application::BootstrapNetwork* bootNet) {
     MORI_SHMEM_INFO("Shmem already initialized, skipping");
     delete bootNet;
     return 0;
-  }
-  if (states->status == ShmemStatesStatus::Finalized) {
-    MORI_SHMEM_ERROR("Shmem has been finalized, cannot re-initialize");
-    delete bootNet;
-    return -1;
   }
 
   // Configure shmem mode

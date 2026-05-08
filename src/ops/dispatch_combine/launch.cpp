@@ -41,6 +41,7 @@
 #include <vector>
 
 #include "mori/application/utils/check.hpp"
+#include "mori/utils/limits.hpp"
 
 #ifdef __linux__
 #include <dlfcn.h>
@@ -76,12 +77,10 @@ KernelRegistry::Impl& KernelRegistry::GetImpl() {
   // current device; sharing modules across devices would launch the wrong
   // kernel image. In multi-process mode every process sees its single GPU as
   // device 0, so this collapses to slot[0] — equivalent to a singleton.
-  static constexpr int kMaxGpusPerNode = 8;
-  static std::array<Impl, kMaxGpusPerNode> impls;
-  (void)hipGetLastError();  // clear any sticky error on this thread
+  static std::array<Impl, mori::kMaxGpusPerNode> impls;
   int id = -1;
   HIP_RUNTIME_CHECK(hipGetDevice(&id));
-  if (id < 0 || id >= kMaxGpusPerNode) {
+  if (id < 0 || id >= mori::kMaxGpusPerNode) {
     throw std::runtime_error("KernelRegistry: hipGetDevice() out of range: " +
                              std::to_string(id));
   }

@@ -25,6 +25,7 @@
 #include "mori/application/application_device_types.hpp"
 #include "mori/core/utils.hpp"
 #include "mori/hip_compat.hpp"
+#include "mori/utils/limits.hpp"
 
 // Host-only includes: STL, ibverbs, application management classes.
 // Guarded so device compilation units (.hip files) do not pull them in.
@@ -170,10 +171,11 @@ struct RemoteAddrInfo {
 
 #if !defined(__HIPCC__) && !defined(__CUDACC__)
 
+// ShmemFinalize resets to New (not a separate Finalized state) so the slot
+// can be reused for re-init in the same process — see ShmemFinalize().
 enum ShmemStatesStatus {
   New = 0,
   Initialized = 1,
-  Finalized = 2,
 };
 
 // Per-GPU JIT module state (HIP module handle + device symbol pointers)
@@ -192,16 +194,12 @@ struct ShmemStates {
   ModuleStates moduleStates;  // JIT module state for this GPU
   GpuStates gpuStates;        // host-side copy of device GpuStates for this GPU
 
-  // This is a temporary API for debugging only
+  // Asserts that ShmemInit has been called. Used by APIs that touch GPU state
+  // (allocation, barrier, module init) which need a fully constructed slot.
   void CheckStatusValid() {
     if (status == ShmemStatesStatus::New) {
-      std::cout
-          << "Shmem state is not initialized, initialize it by calling ShmemMpiInitialize first."
-          << std::endl;
-      assert(false);
-    }
-    if (status == ShmemStatesStatus::Finalized) {
-      std::cout << "Shmem state has been finalized." << std::endl;
+      std::cout << "Shmem state is not initialized, call ShmemInit*/shmem_init_attr first."
+                << std::endl;
       assert(false);
     }
   }
@@ -210,9 +208,6 @@ struct ShmemStates {
 // Internal functions shared between init.cpp and runtime.cpp
 void CopyGpuStatesToDevice(ShmemStates* states);
 void FinalizeRuntime(ShmemStates* states);
-
-// Max GPUs per node (fixed array avoids deque resize/realloc issues)
-static constexpr int kMaxGpusPerNode = 8;
 
 class ShmemStatesSingleton {
  public:
@@ -238,8 +233,10 @@ class ShmemStatesSingleton {
 #ifdef MORI_MULTITHREAD_SUPPORT
   // One ShmemStates slot per GPU, indexed by hipGetDevice().
   // std::array gives stable addresses (no realloc unlike deque/vector).
-  std::array<ShmemStates, kMaxGpusPerNode> states_{};
-  std::mutex mutex_;
+  // No lock needed: SPMT contract is one thread per GPU, so each slot is
+  // accessed serially by its owning thread; the rank → device map below is
+  // the only structure that needs cross-thread synchronization.
+  std::array<ShmemStates, mori::kMaxGpusPerNode> states_{};
   ShmemStatesSingleton() = default;
 #endif
 };

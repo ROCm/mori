@@ -62,7 +62,7 @@ def _hip_set_device(dev: int) -> None:
         raise RuntimeError(f"hipSetDevice({dev}) failed: {err}")
 
 
-def _spmt_shmem_init_one_thread(rank, world_size, unique_id, kernel_dir):
+def _spmt_shmem_init_one_thread(rank, world_size, unique_id):
     """Init MORI shmem for one rank inside an SPMT thread.
 
     Bypasses mori.jax.shmem_init_attr (which requires jax.distributed client)
@@ -79,6 +79,10 @@ def _spmt_shmem_init_one_thread(rank, world_size, unique_id, kernel_dir):
 
 
 def _build_config(rank, world_size, gpu_per_node):
+    """Build an EP config. ``gpu_per_node`` is the per-node PE count (NOT the
+    physical GPU count of the box). For single-node SPMT testing pass
+    ``gpu_per_node = world_size``; the EP handle asserts
+    IsPowerOf2(gpuPerNode) && worldSize % gpuPerNode == 0."""
     import mori
     import jax.numpy as jnp
 
@@ -103,11 +107,11 @@ def _build_config(rank, world_size, gpu_per_node):
     )
 
 
-def _ep_thread_body(rank, world_size, unique_id, kernel_dir, results):
+def _ep_thread_body(rank, world_size, unique_id, results):
     """Per-thread body: init shmem + create EP op + run dispatch round-trip."""
     err = None
     try:
-        _spmt_shmem_init_one_thread(rank, world_size, unique_id, kernel_dir)
+        _spmt_shmem_init_one_thread(rank, world_size, unique_id)
 
         import jax
         import jax.numpy as jnp
@@ -115,6 +119,13 @@ def _ep_thread_body(rank, world_size, unique_id, kernel_dir, results):
         import mori
         from mori import cpp, shmem
 
+        # Set gpu_per_node = world_size so the EP handle treats this as a
+        # 1-node deployment (all PEs on this node). The EP handle asserts
+        # IsPowerOf2(gpuPerNode) && worldSize % gpuPerNode == 0; for our
+        # single-node SPMT test, this is the simplest valid configuration
+        # and matches what the multi-process JAX test does (gpu_per_node ==
+        # world_size). For real multi-node SPMT, callers must set
+        # gpu_per_node to the per-node PE count.
         config = _build_config(rank, world_size, gpu_per_node=world_size)
         op = mori.jax.EpDispatchCombineOp(config)
 
@@ -187,8 +198,9 @@ def _ep_thread_body(rank, world_size, unique_id, kernel_dir, results):
 
 
 def _run_spmt(world_size: int, kernel_dir: str):
-    if _get_num_gpus() < world_size:
-        pytest.skip(f"Need {world_size} GPUs")
+    num_gpus = _get_num_gpus()
+    if num_gpus < world_size:
+        pytest.skip(f"Need {world_size} GPUs, only {num_gpus} available")
 
     # Each thread binds to a different device → don't pre-set HIP_VISIBLE_DEVICES
     os.environ.setdefault("MORI_SOCKET_IFNAME", "lo")
@@ -203,7 +215,7 @@ def _run_spmt(world_size: int, kernel_dir: str):
     threads = [
         threading.Thread(
             target=_ep_thread_body,
-            args=(rank, world_size, unique_id, kernel_dir, results),
+            args=(rank, world_size, unique_id, results),
             daemon=True,
             name=f"ep-spmt-{rank}",
         )
