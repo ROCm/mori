@@ -432,7 +432,9 @@ LocalStorageManager::LocalStorageManager(const UMBPConfig& config,
   tiers_.push_back(
       {StorageTier::CPU_DRAM,
        std::make_unique<DRAMTier>(config_.dram.capacity_bytes, config_.dram.use_shared_memory,
-                                  config_.dram.shm_name)});
+                                  config_.dram.shm_name, config_.dram.use_hugepages,
+                                  config_.dram.hugepage_size, config_.dram.numa_node,
+                                  config_.dram.prefault)});
 
   // SSD tier is optional (slower)
   if (config_.ssd.enabled) {

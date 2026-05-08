@@ -126,7 +126,11 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("use_shared_memory", &UMBPDramConfig::use_shared_memory)
       .def_readwrite("shm_name", &UMBPDramConfig::shm_name)
       .def_readwrite("high_watermark", &UMBPDramConfig::high_watermark)
-      .def_readwrite("low_watermark", &UMBPDramConfig::low_watermark);
+      .def_readwrite("low_watermark", &UMBPDramConfig::low_watermark)
+      .def_readwrite("use_hugepages", &UMBPDramConfig::use_hugepages)
+      .def_readwrite("hugepage_size", &UMBPDramConfig::hugepage_size)
+      .def_readwrite("numa_node", &UMBPDramConfig::numa_node)
+      .def_readwrite("prefault", &UMBPDramConfig::prefault);
 
   py::class_<UMBPIoConfig>(m, "UMBPIoConfig")
       .def(py::init<>())

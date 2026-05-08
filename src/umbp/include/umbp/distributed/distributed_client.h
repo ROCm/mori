@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "umbp/distributed/pool_client.h"
+#include "umbp/local/host_mem_allocator.h"
 #include "umbp/umbp_client.h"
 
 namespace mori::umbp {
@@ -76,6 +77,7 @@ class DistributedClient : public IUMBPClient {
   UMBPConfig config_;
   void* dram_pool_ = nullptr;
   size_t dram_pool_size_ = 0;
+  HostBufferHandle dram_pool_handle_;
   std::unique_ptr<PoolClient> pool_client_;
   std::atomic<bool> closing_{false};
   mutable std::shared_mutex op_mutex_;
