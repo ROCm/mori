@@ -37,6 +37,7 @@
 #include "umbp/distributed/config.h"
 #include "umbp/distributed/master/master_client.h"
 #include "umbp/distributed/types.h"
+#include "umbp_peer.grpc.pb.h"
 
 namespace mori::umbp {
 
@@ -177,6 +178,92 @@ class PoolClient {
   std::vector<RegisteredRegion> registered_regions_;
   std::optional<std::pair<mori::io::MemoryDesc, size_t>> FindRegisteredMemory(const void* ptr,
                                                                               size_t size);
+
+  enum class PutAttemptOutcome { kSuccess, kRetry, kFatal };
+  enum class GetAttemptOutcome { kSuccess, kRetry, kFatal };
+
+  PutAttemptOutcome ExecuteLocalPut(const std::string& key, const void* src, size_t size,
+                                    TierType tier);
+  GetAttemptOutcome ExecuteLocalGet(const std::string& key, void* dst, size_t size);
+  std::unordered_map<std::string, std::vector<BatchPutItem>> PartitionBatchPutTargets(
+      const std::vector<std::string>& keys, const std::vector<const void*>& srcs,
+      const std::vector<size_t>& sizes, const std::vector<std::optional<RoutePutResult>>& routes,
+      std::vector<bool>* results);
+
+  struct BatchPutItem {
+    size_t index;
+    const std::string* key;
+    const void* src;
+    size_t size;
+    RoutePutResult route;
+  };
+  struct BatchGetItem {
+    size_t index;
+    const std::string* key;
+    void* dst;
+    size_t size;
+    RouteGetResult route;
+  };
+
+  struct TransferInstruction {
+    size_t entry_index;
+    mori::io::MemoryDesc local_desc;
+    uint64_t local_offset;
+    mori::io::MemoryDesc remote_desc;
+    uint64_t remote_offset;
+    uint64_t size;
+  };
+
+  struct RemotePutEntry {
+    size_t result_index;
+    const BatchPutItem* item;
+    SlotPlan plan;
+    uint64_t slot_id;
+    std::optional<std::pair<mori::io::MemoryDesc, size_t>> zero_copy;
+    bool use_staging = false;
+    uint64_t staging_offset = 0;
+    bool failed = false;
+  };
+
+  struct RemoteGetEntry {
+    size_t result_index;
+    const BatchGetItem* item;
+    SlotPlan plan;
+    std::optional<std::pair<mori::io::MemoryDesc, size_t>> zero_copy;
+    bool use_staging = false;
+    uint64_t staging_offset = 0;
+    bool failed = false;
+  };
+
+  void ProcessRemoteBatchPut(const std::vector<BatchPutItem>& items, std::vector<bool>* results);
+  void ProcessRemoteBatchGet(const std::vector<BatchGetItem>& items, std::vector<bool>* results);
+  void ExecuteRemoteBatchPut(const std::vector<BatchPutItem>& items, std::vector<bool>* results,
+                             PeerConnection& peer, ::umbp::UMBPPeer::Stub* stub);
+  void ExecuteRemoteBatchGet(const std::vector<BatchGetItem>& items, std::vector<bool>* results,
+                             PeerConnection& peer, ::umbp::UMBPPeer::Stub* stub);
+
+  bool AllocateRemotePutEntries(const std::vector<BatchPutItem>& items,
+                                ::umbp::UMBPPeer::Stub* stub, std::vector<RemotePutEntry>* entries,
+                                std::vector<uint64_t>* abort_slots, std::vector<bool>* results);
+  bool BuildRemotePutTransfers(std::vector<RemotePutEntry>& entries, PeerConnection& peer,
+                               std::vector<TransferInstruction>* transfers,
+                               uint64_t* staging_bytes);
+  void ExecuteRemotePutTransfers(std::vector<RemotePutEntry>& entries,
+                                 std::vector<TransferInstruction>& transfers,
+                                 uint64_t staging_bytes);
+  void FinalizeRemotePutEntries(std::vector<RemotePutEntry>& entries,
+                                std::vector<uint64_t>& abort_slots, std::vector<bool>* results,
+                                ::umbp::UMBPPeer::Stub* stub);
+
+  bool PrepareRemoteGetEntries(const std::vector<BatchGetItem>& items, ::umbp::UMBPPeer::Stub* stub,
+                               std::vector<RemoteGetEntry>* entries, std::vector<bool>* results);
+  bool BuildRemoteGetTransfers(std::vector<RemoteGetEntry>& entries, PeerConnection& peer,
+                               std::vector<TransferInstruction>* transfers,
+                               uint64_t* staging_bytes);
+  void ExecuteRemoteGetTransfers(std::vector<RemoteGetEntry>& entries,
+                                 std::vector<TransferInstruction>& transfers,
+                                 uint64_t staging_bytes);
+  void FinalizeRemoteGetEntries(std::vector<RemoteGetEntry>& entries, std::vector<bool>* results);
 };
 
 }  // namespace mori::umbp

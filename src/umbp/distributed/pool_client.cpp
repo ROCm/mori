@@ -27,7 +27,6 @@
 #include <chrono>
 #include <cstring>
 #include <msgpack.hpp>
-#include <sstream>
 #include <unordered_map>
 
 #include "mori/io/backend.hpp"
@@ -36,21 +35,11 @@
 #include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/peer/peer_dram_allocator.h"
 #include "umbp/distributed/peer/peer_service.h"
-#include "umbp/distributed/types.h"
 #include "umbp_peer.grpc.pb.h"
 
 namespace mori::umbp {
 
 namespace {
-
-// Cap on RoutePut/RouteGet retries when the chosen peer reports
-// ENOSPC (Put) or unknown-key (Get).  Each retry adds the failed
-// node_id to the exclude set; the loop terminates when master can no
-// longer find a candidate.
-uint32_t MaxRouteRetries() {
-  static const uint32_t v = GetEnvUint32("UMBP_MAX_ROUTE_RETRIES", 4, /*min_allowed=*/1);
-  return v;
-}
 
 bool IsValidMemoryDesc(const mori::io::MemoryDesc& desc) { return desc.size > 0; }
 
@@ -66,6 +55,12 @@ bool SizeMatchesAllocation(uint64_t size, size_t num_pages, uint64_t page_size) 
   if (size > num_pages * page_size) return false;
   if (size <= (num_pages - 1) * page_size) return false;
   return true;
+}
+
+uint64_t AlignUp(uint64_t value, uint64_t alignment) {
+  if (alignment == 0) return value;
+  uint64_t remainder = value % alignment;
+  return remainder == 0 ? value : (value + alignment - remainder);
 }
 
 // Group `pages` by buffer_index, preserving first-seen ordering so
@@ -153,21 +148,6 @@ SlotPlan FromResolveKeyResponse(const ::umbp::ResolveKeyResponse& resp) {
   return p;
 }
 
-std::string TierCapacitySummary(const std::map<TierType, TierCapacity>& caps) {
-  std::ostringstream oss;
-  bool first = true;
-  for (const auto& entry : caps) {
-    if (!first) oss << ", ";
-    first = false;
-    const char* tier_name = TierTypeName(entry.first);
-    const uint64_t avail_mb = entry.second.available_bytes / (1024 * 1024);
-    const uint64_t total_mb = entry.second.total_bytes / (1024 * 1024);
-    oss << tier_name << "=" << avail_mb << "MB/" << total_mb << "MB";
-  }
-  if (first) oss << "none";
-  return oss.str();
-}
-
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -249,15 +229,8 @@ bool PoolClient::Init() {
     peer_service_ =
         std::make_unique<PeerServiceServer>(peer_alloc_.get(), 8, 8, 10, engine_desc_bytes);
     if (!peer_service_->Start(config_.peer_service_port)) {
-      MORI_UMBP_ERROR(
-          "[PoolClient] Init stage=PeerServiceStart failed (node_id='{}', node_address='{}', "
-          "peer_service_port={}, io_engine_host='{}', io_engine_port={})",
-          config_.master_config.node_id.empty() ? "<unset>" : config_.master_config.node_id,
-          config_.master_config.node_address.empty() ? "<unset>"
-                                                     : config_.master_config.node_address,
-          config_.peer_service_port,
-          config_.io_engine.host.empty() ? "<unset>" : config_.io_engine.host,
-          config_.io_engine.port);
+      MORI_UMBP_ERROR("[PoolClient] PeerService failed to start on port {}",
+                      config_.peer_service_port);
       peer_service_.reset();
       initialized_ = false;
       return false;
@@ -278,13 +251,7 @@ bool PoolClient::Init() {
   auto status = master_client_->RegisterSelf(config_.tier_capacities, peer_address,
                                              engine_desc_bytes, ssd_store_capacities);
   if (!status.ok()) {
-    MORI_UMBP_ERROR(
-        "[PoolClient] Init stage=RegisterSelf failed (node_id='{}', peer_address='{}', "
-        "tier_caps=[{}], status_code={}, status_message='{}')",
-        config_.master_config.node_id.empty() ? "<unset>" : config_.master_config.node_id,
-        peer_address.empty() ? "<unset>" : peer_address,
-        TierCapacitySummary(config_.tier_capacities), static_cast<int>(status.error_code()),
-        status.error_message());
+    MORI_UMBP_ERROR("[PoolClient] RegisterSelf failed: {}", status.error_message());
     initialized_ = false;
     return false;
   }
@@ -435,221 +402,98 @@ bool PoolClient::LocalGetPages(const std::vector<PageLocation>& pages, uint64_t 
   return true;
 }
 
+PoolClient::PutAttemptOutcome PoolClient::ExecuteLocalPut(const std::string& key, const void* src,
+                                                          size_t size, TierType tier) {
+  if (!peer_alloc_) {
+    MORI_UMBP_ERROR("[PoolClient] Local Put requested but peer allocator unavailable");
+    return PutAttemptOutcome::kFatal;
+  }
+  auto pending = peer_alloc_->Allocate(size, tier);
+  if (!pending) {
+    return PutAttemptOutcome::kRetry;
+  }
+  if (!LocalPutPages(pending->pages, peer_alloc_->PageSize(), src, size)) {
+    peer_alloc_->Abort(pending->slot_id);
+    return PutAttemptOutcome::kFatal;
+  }
+  if (!peer_alloc_->Commit(pending->slot_id, key)) {
+    peer_alloc_->Abort(pending->slot_id);
+    return PutAttemptOutcome::kFatal;
+  }
+  master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_PUT_BYTES_TOTAL,
+                             MORI_UMBP_METRIC_CLIENT_PUT_BYTES_TOTAL_HELP, {{"traffic", "local"}},
+                             static_cast<double>(size));
+  return PutAttemptOutcome::kSuccess;
+}
+
+PoolClient::GetAttemptOutcome PoolClient::ExecuteLocalGet(const std::string& key, void* dst,
+                                                          size_t size) {
+  if (!peer_alloc_) {
+    MORI_UMBP_ERROR("[PoolClient] Local Get requested but peer allocator unavailable");
+    return GetAttemptOutcome::kFatal;
+  }
+  auto resolved = peer_alloc_->Resolve(key);
+  if (!resolved.found) {
+    return GetAttemptOutcome::kRetry;
+  }
+  if (!LocalGetPages(resolved.pages, peer_alloc_->PageSize(), dst, size)) {
+    return GetAttemptOutcome::kFatal;
+  }
+  master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_GET_BYTES_TOTAL,
+                             MORI_UMBP_METRIC_CLIENT_GET_BYTES_TOTAL_HELP, {{"traffic", "local"}},
+                             static_cast<double>(size));
+  return GetAttemptOutcome::kSuccess;
+}
+
+std::unordered_map<std::string, std::vector<PoolClient::BatchPutItem>>
+PoolClient::PartitionBatchPutTargets(const std::vector<std::string>& keys,
+                                     const std::vector<const void*>& srcs,
+                                     const std::vector<size_t>& sizes,
+                                     const std::vector<std::optional<RoutePutResult>>& routes,
+                                     std::vector<bool>* results) {
+  std::unordered_map<std::string, std::vector<BatchPutItem>> remote_groups;
+  const size_t count = keys.size();
+  for (size_t i = 0; i < count; ++i) {
+    if (i >= routes.size() || !routes[i].has_value()) {
+      continue;
+    }
+    const auto& route = routes[i].value();
+    if (route.node_id == config_.master_config.node_id) {
+      auto outcome = ExecuteLocalPut(keys[i], srcs[i], sizes[i], route.tier);
+      if (outcome == PutAttemptOutcome::kSuccess) {
+        (*results)[i] = true;
+      }
+      continue;
+    }
+    if (route.tier != TierType::DRAM && route.tier != TierType::HBM) {
+      (*results)[i] = false;
+      continue;
+    }
+    BatchPutItem item{
+        .index = i, .key = &keys[i], .src = srcs[i], .size = sizes[i], .route = route};
+    remote_groups[route.node_id].push_back(std::move(item));
+  }
+  return remote_groups;
+}
+
 // ---------------------------------------------------------------------------
 //  Put / Get hot paths
 // ---------------------------------------------------------------------------
 
 bool PoolClient::Put(const std::string& key, const void* src, size_t size) {
-  if (!initialized_) {
-    MORI_UMBP_ERROR("[PoolClient] Not initialized");
-    return false;
-  }
-
-  std::unordered_set<std::string> excludes;
-  for (uint32_t attempt = 0; attempt <= MaxRouteRetries(); ++attempt) {
-    std::optional<RoutePutResult> route;
-    auto status = master_client_->RoutePut(key, size, excludes, &route);
-    if (!status.ok()) {
-      MORI_UMBP_ERROR("[PoolClient] Put RoutePut failed: {}", status.error_message());
-      return false;
-    }
-    if (!route.has_value()) {
-      MORI_UMBP_ERROR("[PoolClient] Put: no suitable target after {} attempts", attempt);
-      return false;
-    }
-    if (route->tier == TierType::SSD) {
-      // SSD path: master only routes; peer handles AllocateWriteSlot +
-      // CommitSsdWrite.  Single-attempt for now (no SSD ENOSPC retry).
-      auto& peer = GetOrConnectPeer(route->node_id, route->peer_address);
-      bool ok = RemoteSsdWrite(peer, key, src, size, /*zero_copy=*/true, /*store_index=*/0);
-      if (ok) {
-        master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_PUT_BYTES_TOTAL,
-                                   MORI_UMBP_METRIC_CLIENT_PUT_BYTES_TOTAL_HELP,
-                                   {{"traffic", "remote"}}, static_cast<double>(size));
-      }
-      return ok;
-    }
-
-    const bool is_local = (route->node_id == config_.master_config.node_id);
-    if (is_local) {
-      // In-process fast path: reach directly into the local
-      // PeerDramAllocator.  No RDMA, no peer RPC.
-      auto pending = peer_alloc_->Allocate(size, route->tier);
-      if (!pending) {
-        excludes.insert(route->node_id);
-        continue;
-      }
-      if (!LocalPutPages(pending->pages, peer_alloc_->PageSize(), src, size)) {
-        peer_alloc_->Abort(pending->slot_id);
-        return false;
-      }
-      if (!peer_alloc_->Commit(pending->slot_id, key)) {
-        peer_alloc_->Abort(pending->slot_id);
-        return false;
-      }
-      master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_PUT_BYTES_TOTAL,
-                                 MORI_UMBP_METRIC_CLIENT_PUT_BYTES_TOTAL_HELP,
-                                 {{"traffic", "local"}}, static_cast<double>(size));
-      return true;
-    }
-
-    // Remote DRAM/HBM: peer.AllocateSlot → RDMA → peer.CommitSlot.
-    auto& peer = GetOrConnectPeer(route->node_id, route->peer_address);
-    if (!EnsurePeerServiceConnection(peer)) {
-      excludes.insert(route->node_id);
-      continue;
-    }
-    auto* stub = static_cast<::umbp::UMBPPeer::Stub*>(peer.peer_stub.get());
-
-    ::umbp::AllocateSlotRequest areq;
-    areq.set_size(size);
-    areq.set_tier(static_cast<::umbp::TierType>(route->tier));
-    ::umbp::AllocateSlotResponse aresp;
-    grpc::ClientContext actx;
-    auto astatus = stub->AllocateSlot(&actx, areq, &aresp);
-    if (!astatus.ok()) {
-      MORI_UMBP_WARN("[PoolClient] Put AllocateSlot failed on {}: {}", route->node_id,
-                     astatus.error_message());
-      excludes.insert(route->node_id);
-      continue;
-    }
-    if (!aresp.success()) {
-      // Peer-level ENOSPC.  Master routed us here but the peer's
-      // bitmap had no contiguous run.  Retry past this peer.
-      excludes.insert(route->node_id);
-      continue;
-    }
-    SlotPlan plan = FromAllocateSlotResponse(aresp);
-    if (!SizeMatchesAllocation(size, plan.pages.size(), plan.page_size)) {
-      MORI_UMBP_ERROR("[PoolClient] Put: peer returned malformed slot for key='{}'", key);
-      // Best-effort abort; peer reaper backs us up if this drops.
-      ::umbp::AbortSlotRequest abq;
-      abq.set_slot_id(plan.slot_id);
-      ::umbp::AbortSlotResponse abresp;
-      grpc::ClientContext abctx;
-      stub->AbortSlot(&abctx, abq, &abresp);
-      return false;
-    }
-
-    EnsureBufferDescsCached(peer, plan.descs);
-    if (!RemoteDramScatterWrite(peer, plan.pages, plan.page_size, src, size, /*zero_copy=*/true)) {
-      ::umbp::AbortSlotRequest abq;
-      abq.set_slot_id(plan.slot_id);
-      ::umbp::AbortSlotResponse abresp;
-      grpc::ClientContext abctx;
-      stub->AbortSlot(&abctx, abq, &abresp);
-      return false;
-    }
-
-    ::umbp::CommitSlotRequest creq;
-    creq.set_slot_id(plan.slot_id);
-    creq.set_key(key);
-    ::umbp::CommitSlotResponse cresp;
-    grpc::ClientContext cctx;
-    auto cstatus = stub->CommitSlot(&cctx, creq, &cresp);
-    if (!cstatus.ok() || !cresp.success()) {
-      MORI_UMBP_WARN("[PoolClient] Put CommitSlot failed on {}: {}", route->node_id,
-                     cstatus.error_message());
-      return false;
-    }
-    master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_PUT_BYTES_TOTAL,
-                               MORI_UMBP_METRIC_CLIENT_PUT_BYTES_TOTAL_HELP,
-                               {{"traffic", "remote"}}, static_cast<double>(size));
-    return true;
-  }
-
-  MORI_UMBP_ERROR("[PoolClient] Put: exhausted retries for key='{}'", key);
-  return false;
+  std::vector<std::string> keys{key};
+  std::vector<const void*> srcs{src};
+  std::vector<size_t> sizes{size};
+  auto results = BatchPut(keys, srcs, sizes);
+  return !results.empty() && results[0];
 }
 
 bool PoolClient::Get(const std::string& key, void* dst, size_t size) {
-  if (!initialized_) {
-    MORI_UMBP_ERROR("[PoolClient] Not initialized");
-    return false;
-  }
-
-  std::unordered_set<std::string> excludes;
-  for (uint32_t attempt = 0; attempt <= MaxRouteRetries(); ++attempt) {
-    std::optional<RouteGetResult> route;
-    auto status = master_client_->RouteGet(key, excludes, &route);
-    if (!status.ok()) {
-      MORI_UMBP_ERROR("[PoolClient] Get RouteGet failed: {}", status.error_message());
-      return false;
-    }
-    if (!route.has_value()) return false;  // miss
-    if (size != route->size) {
-      MORI_UMBP_ERROR("[PoolClient] Get: caller size {} != stored size {} for key='{}'", size,
-                      route->size, key);
-      return false;
-    }
-
-    const bool is_local = (route->node_id == config_.master_config.node_id);
-    if (route->tier == TierType::DRAM || route->tier == TierType::HBM) {
-      if (is_local) {
-        auto r = peer_alloc_->Resolve(key);
-        if (!r.found) {
-          excludes.insert(route->node_id);
-          continue;
-        }
-        if (!LocalGetPages(r.pages, peer_alloc_->PageSize(), dst, size)) return false;
-        master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_GET_BYTES_TOTAL,
-                                   MORI_UMBP_METRIC_CLIENT_GET_BYTES_TOTAL_HELP,
-                                   {{"traffic", "local"}}, static_cast<double>(size));
-        return true;
-      }
-
-      auto& peer = GetOrConnectPeer(route->node_id, route->peer_address);
-      if (!EnsurePeerServiceConnection(peer)) {
-        excludes.insert(route->node_id);
-        continue;
-      }
-      auto* stub = static_cast<::umbp::UMBPPeer::Stub*>(peer.peer_stub.get());
-      ::umbp::ResolveKeyRequest rreq;
-      rreq.set_key(key);
-      ::umbp::ResolveKeyResponse rresp;
-      grpc::ClientContext rctx;
-      auto rstatus = stub->ResolveKey(&rctx, rreq, &rresp);
-      if (!rstatus.ok()) {
-        MORI_UMBP_WARN("[PoolClient] Get ResolveKey failed on {}: {}", route->node_id,
-                       rstatus.error_message());
-        excludes.insert(route->node_id);
-        continue;
-      }
-      if (!rresp.found()) {
-        // Peer evicted between RouteGet and ResolveKey.  Retry past it.
-        excludes.insert(route->node_id);
-        continue;
-      }
-      SlotPlan plan = FromResolveKeyResponse(rresp);
-      EnsureBufferDescsCached(peer, plan.descs);
-      if (!RemoteDramScatterRead(peer, plan.pages, plan.page_size, dst, size,
-                                 /*zero_copy=*/true)) {
-        return false;
-      }
-      master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_GET_BYTES_TOTAL,
-                                 MORI_UMBP_METRIC_CLIENT_GET_BYTES_TOTAL_HELP,
-                                 {{"traffic", "remote"}}, static_cast<double>(size));
-      return true;
-    }
-
-    if (route->tier == TierType::SSD) {
-      auto& peer = GetOrConnectPeer(route->node_id, route->peer_address);
-      // SSD location_id is not carried back to the writer in the new
-      // wire shape; the peer handles it internally via PrepareSsdRead.
-      bool ok = RemoteSsdRead(peer, key, /*location_id=*/"", dst, size, /*zero_copy=*/true);
-      if (ok) {
-        master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_GET_BYTES_TOTAL,
-                                   MORI_UMBP_METRIC_CLIENT_GET_BYTES_TOTAL_HELP,
-                                   {{"traffic", "remote"}}, static_cast<double>(size));
-      }
-      return ok;
-    }
-
-    MORI_UMBP_WARN("[PoolClient] Get: unsupported tier {}", static_cast<int>(route->tier));
-    return false;
-  }
-  MORI_UMBP_ERROR("[PoolClient] Get: exhausted retries for key='{}'", key);
-  return false;
+  std::vector<std::string> keys{key};
+  std::vector<void*> dsts{dst};
+  std::vector<size_t> sizes{size};
+  auto results = BatchGet(keys, dsts, sizes);
+  return !results.empty() && results[0];
 }
 
 std::vector<bool> PoolClient::BatchPut(const std::vector<std::string>& keys,
@@ -660,8 +504,36 @@ std::vector<bool> PoolClient::BatchPut(const std::vector<std::string>& keys,
     MORI_UMBP_ERROR("[PoolClient] BatchPut: vector length mismatch");
     return results;
   }
+  if (!initialized_) {
+    MORI_UMBP_ERROR("[PoolClient] BatchPut: client not initialized");
+    return results;
+  }
+
+  std::vector<uint64_t> block_sizes(keys.size());
+  for (size_t i = 0; i < sizes.size(); ++i) {
+    block_sizes[i] = static_cast<uint64_t>(sizes[i]);
+  }
+  std::vector<std::optional<RoutePutResult>> routes;
+  std::unordered_set<std::string> excludes;
+  auto status = master_client_->BatchRoutePut(keys, block_sizes, excludes, &routes);
+  if (!status.ok()) {
+    MORI_UMBP_ERROR("[PoolClient] BatchPut: BatchRoutePut failed: {}", status.error_message());
+    return results;
+  }
+  if (routes.size() < keys.size()) {
+    routes.resize(keys.size());
+  }
+
+  auto remote_groups = PartitionBatchPutTargets(keys, srcs, sizes, routes, &results);
+
+  for (auto& [node_id, items] : remote_groups) {
+    ProcessRemoteBatchPut(items, &results);
+  }
+
+  // Entries without routing advice or still false fall back to individual attempts.
   for (size_t i = 0; i < keys.size(); ++i) {
-    results[i] = Put(keys[i], srcs[i], sizes[i]);
+    if (results[i]) continue;
+    results[i] = false;
   }
   return results;
 }
@@ -674,10 +546,609 @@ std::vector<bool> PoolClient::BatchGet(const std::vector<std::string>& keys,
     MORI_UMBP_ERROR("[PoolClient] BatchGet: vector length mismatch");
     return results;
   }
+  if (!initialized_) {
+    MORI_UMBP_ERROR("[PoolClient] BatchGet: client not initialized");
+    return results;
+  }
+
+  std::vector<std::optional<RouteGetResult>> routes;
+  std::unordered_set<std::string> excludes;
+  auto status = master_client_->BatchRouteGet(keys, excludes, &routes);
+  if (!status.ok()) {
+    MORI_UMBP_ERROR("[PoolClient] BatchGet: BatchRouteGet failed: {}", status.error_message());
+    return results;
+  }
+  if (routes.size() < keys.size()) {
+    routes.resize(keys.size());
+  }
+
+  std::unordered_map<std::string, std::vector<BatchGetItem>> remote_groups;
   for (size_t i = 0; i < keys.size(); ++i) {
-    results[i] = Get(keys[i], dsts[i], sizes[i]);
+    if (i >= routes.size() || !routes[i].has_value()) {
+      continue;
+    }
+    const auto& route = routes[i].value();
+    if (route.node_id == config_.master_config.node_id) {
+      auto outcome = ExecuteLocalGet(keys[i], const_cast<void*>(dsts[i]), sizes[i]);
+      if (outcome == GetAttemptOutcome::kSuccess) {
+        results[i] = true;
+      }
+      continue;
+    }
+    if (route.tier != TierType::DRAM && route.tier != TierType::HBM) {
+      results[i] = false;
+      continue;
+    }
+    BatchGetItem item{.index = i,
+                      .key = &keys[i],
+                      .dst = const_cast<void*>(dsts[i]),
+                      .size = sizes[i],
+                      .route = route};
+    remote_groups[route.node_id].push_back(std::move(item));
+  }
+
+  for (auto& [node_id, items] : remote_groups) {
+    ProcessRemoteBatchGet(items, &results);
+  }
+
+  for (size_t i = 0; i < keys.size(); ++i) {
+    if (results[i]) continue;
+    results[i] = false;
   }
   return results;
+}
+
+void PoolClient::ProcessRemoteBatchPut(const std::vector<BatchPutItem>& items,
+                                       std::vector<bool>* results) {
+  if (items.empty()) return;
+  if (!io_engine_) {
+    for (const auto& item : items) {
+      (*results)[item.index] = false;
+    }
+    return;
+  }
+
+  const auto& first = items.front();
+  auto& peer = GetOrConnectPeer(first.route.node_id, first.route.peer_address);
+  if (!EnsurePeerServiceConnection(peer)) {
+    for (const auto& item : items) {
+      (*results)[item.index] = false;
+    }
+    return;
+  }
+
+  auto* stub = static_cast<::umbp::UMBPPeer::Stub*>(peer.peer_stub.get());
+  ExecuteRemoteBatchPut(items, results, peer, stub);
+}
+
+void PoolClient::ExecuteRemoteBatchPut(const std::vector<BatchPutItem>& items,
+                                       std::vector<bool>* results, PeerConnection& peer,
+                                       ::umbp::UMBPPeer::Stub* stub) {
+  if (items.empty()) return;
+  if (!io_engine_) {
+    for (const auto& item : items) {
+      (*results)[item.index] = false;
+    }
+    return;
+  }
+
+  std::vector<RemotePutEntry> entries;
+  std::vector<uint64_t> abort_slots;
+  if (!AllocateRemotePutEntries(items, stub, &entries, &abort_slots, results)) {
+    return;
+  }
+
+  std::vector<TransferInstruction> transfers;
+  uint64_t staging_bytes = 0;
+  if (!BuildRemotePutTransfers(entries, peer, &transfers, &staging_bytes)) {
+    for (auto& entry : entries) {
+      abort_slots.push_back(entry.slot_id);
+      (*results)[entry.result_index] = false;
+    }
+    if (!abort_slots.empty()) {
+      ::umbp::BatchAbortSlotsRequest abort_req;
+      for (uint64_t slot_id : abort_slots) abort_req.add_slot_ids(slot_id);
+      ::umbp::BatchAbortSlotsResponse abort_resp;
+      grpc::ClientContext abort_ctx;
+      stub->BatchAbortSlots(&abort_ctx, abort_req, &abort_resp);
+    }
+    return;
+  }
+
+  ExecuteRemotePutTransfers(entries, transfers, staging_bytes);
+  FinalizeRemotePutEntries(entries, abort_slots, results, stub);
+}
+
+bool PoolClient::AllocateRemotePutEntries(const std::vector<BatchPutItem>& items,
+                                          ::umbp::UMBPPeer::Stub* stub,
+                                          std::vector<RemotePutEntry>* entries,
+                                          std::vector<uint64_t>* abort_slots,
+                                          std::vector<bool>* results) {
+  entries->clear();
+  ::umbp::BatchAllocateSlotsRequest alloc_req;
+  for (const auto& item : items) {
+    auto* entry = alloc_req.add_entries();
+    entry->set_size(item.size);
+    entry->set_tier(static_cast<::umbp::TierType>(item.route.tier));
+  }
+
+  ::umbp::BatchAllocateSlotsResponse alloc_resp;
+  grpc::ClientContext alloc_ctx;
+  auto alloc_status = stub->BatchAllocateSlots(&alloc_ctx, alloc_req, &alloc_resp);
+  if (!alloc_status.ok() || alloc_resp.entries_size() != static_cast<int>(items.size())) {
+    MORI_UMBP_WARN("[PoolClient] BatchAllocateSlots failed on {}: {}", items.front().route.node_id,
+                   alloc_status.error_message());
+    for (const auto& item : items) {
+      (*results)[item.index] = false;
+    }
+    return false;
+  }
+
+  entries->reserve(items.size());
+  for (size_t i = 0; i < items.size(); ++i) {
+    const auto& item = items[i];
+    const auto& resp_entry = alloc_resp.entries(static_cast<int>(i));
+    if (!resp_entry.success()) {
+      (*results)[item.index] = false;
+      continue;
+    }
+
+    SlotPlan plan = FromAllocateSlotResponse(resp_entry);
+    if (!SizeMatchesAllocation(item.size, plan.pages.size(), plan.page_size)) {
+      MORI_UMBP_ERROR("[PoolClient] BatchPut: malformed slot for key='{}'", *item.key);
+      abort_slots->push_back(plan.slot_id);
+      (*results)[item.index] = false;
+      continue;
+    }
+
+    RemotePutEntry entry;
+    entry.result_index = item.index;
+    entry.item = &item;
+    entry.slot_id = plan.slot_id;
+    entry.plan = std::move(plan);
+    entries->push_back(std::move(entry));
+  }
+
+  if (entries->empty()) {
+    if (!abort_slots->empty()) {
+      ::umbp::BatchAbortSlotsRequest abort_req;
+      for (uint64_t slot_id : *abort_slots) abort_req.add_slot_ids(slot_id);
+      ::umbp::BatchAbortSlotsResponse abort_resp;
+      grpc::ClientContext abort_ctx;
+      stub->BatchAbortSlots(&abort_ctx, abort_req, &abort_resp);
+      abort_slots->clear();
+    }
+    return false;
+  }
+  return true;
+}
+
+bool PoolClient::BuildRemotePutTransfers(std::vector<RemotePutEntry>& entries, PeerConnection& peer,
+                                         std::vector<TransferInstruction>* transfers,
+                                         uint64_t* staging_bytes) {
+  transfers->clear();
+  uint64_t cursor = 0;
+
+  for (size_t idx = 0; idx < entries.size(); ++idx) {
+    auto& entry = entries[idx];
+    EnsureBufferDescsCached(peer, entry.plan.descs);
+
+    auto zero_copy = FindRegisteredMemory(entry.item->src, entry.item->size);
+    if (zero_copy.has_value()) {
+      entry.zero_copy = zero_copy;
+      entry.use_staging = false;
+      entry.staging_offset = 0;
+    } else {
+      entry.zero_copy.reset();
+      entry.use_staging = true;
+      cursor = AlignUp(cursor, entry.plan.page_size);
+      const uint64_t aligned_size = AlignUp(entry.item->size, entry.plan.page_size);
+      if (cursor + aligned_size > config_.staging_buffer_size) return false;
+      entry.staging_offset = cursor;
+      cursor += aligned_size;
+    }
+
+    mori::io::MemoryDesc local_desc{};
+    uint64_t base_offset = 0;
+    if (entry.use_staging) {
+      local_desc = staging_mem_;
+      base_offset = entry.staging_offset;
+    } else {
+      local_desc = entry.zero_copy->first;
+      base_offset = entry.zero_copy->second;
+    }
+
+    std::vector<TransferInstruction> entry_transfers;
+    entry_transfers.reserve(entry.plan.pages.size());
+    for (size_t p = 0; p < entry.plan.pages.size(); ++p) {
+      const auto& page = entry.plan.pages[p];
+      if (page.buffer_index >= peer.dram_memories.size() ||
+          !IsValidMemoryDesc(peer.dram_memories[page.buffer_index])) {
+        entry.failed = true;
+        entry_transfers.clear();
+        break;
+      }
+      TransferInstruction instr;
+      instr.entry_index = idx;
+      instr.local_desc = local_desc;
+      instr.local_offset = base_offset + static_cast<uint64_t>(p) * entry.plan.page_size;
+      instr.remote_desc = peer.dram_memories[page.buffer_index];
+      instr.remote_offset = static_cast<uint64_t>(page.page_index) * entry.plan.page_size;
+      instr.size =
+          LogicalPageBytes(p, entry.plan.pages.size(), entry.plan.page_size, entry.item->size);
+      entry_transfers.push_back(std::move(instr));
+    }
+
+    if (!entry_transfers.empty()) {
+      transfers->insert(transfers->end(), entry_transfers.begin(), entry_transfers.end());
+    }
+  }
+
+  *staging_bytes = cursor;
+  return true;
+}
+
+void PoolClient::ExecuteRemotePutTransfers(std::vector<RemotePutEntry>& entries,
+                                           std::vector<TransferInstruction>& transfers,
+                                           uint64_t staging_bytes) {
+  std::unique_lock<std::mutex> staging_lock(staging_mutex_, std::defer_lock);
+  if (staging_bytes > 0) staging_lock.lock();
+
+  for (auto& entry : entries) {
+    if (entry.failed) continue;
+    if (entry.use_staging) {
+      if (entry.staging_offset + entry.item->size > config_.staging_buffer_size) {
+        entry.failed = true;
+        continue;
+      }
+      std::memcpy(staging_buffer_.get() + entry.staging_offset, entry.item->src, entry.item->size);
+    }
+  }
+
+  std::vector<TransferInstruction> active_transfers;
+  active_transfers.reserve(transfers.size());
+  for (const auto& transfer : transfers) {
+    if (!entries[transfer.entry_index].failed) {
+      active_transfers.push_back(transfer);
+    }
+  }
+  if (active_transfers.empty()) {
+    if (staging_lock.owns_lock()) staging_lock.unlock();
+    return;
+  }
+
+  const size_t N = active_transfers.size();
+  mori::io::MemDescVec local_descs(N), remote_descs(N);
+  mori::io::BatchSizeVec local_offsets(N), remote_offsets(N), sizes_v(N);
+  std::vector<mori::io::TransferStatus> statuses(N);
+  mori::io::TransferStatusPtrVec status_ptrs(N);
+  mori::io::TransferUniqueIdVec ids(N);
+  for (size_t i = 0; i < N; ++i) {
+    const auto& transfer = active_transfers[i];
+    local_descs[i] = transfer.local_desc;
+    remote_descs[i] = transfer.remote_desc;
+    local_offsets[i].push_back(transfer.local_offset);
+    remote_offsets[i].push_back(transfer.remote_offset);
+    sizes_v[i].push_back(transfer.size);
+    status_ptrs[i] = &statuses[i];
+    ids[i] = io_engine_->AllocateTransferUniqueId();
+  }
+
+  io_engine_->BatchWrite(local_descs, local_offsets, remote_descs, remote_offsets, sizes_v,
+                         status_ptrs, ids);
+  for (size_t i = 0; i < active_transfers.size(); ++i) {
+    statuses[i].Wait();
+    if (!statuses[i].Succeeded()) {
+      entries[active_transfers[i].entry_index].failed = true;
+    }
+  }
+
+  if (staging_lock.owns_lock()) staging_lock.unlock();
+}
+
+void PoolClient::FinalizeRemotePutEntries(std::vector<RemotePutEntry>& entries,
+                                          std::vector<uint64_t>& abort_slots,
+                                          std::vector<bool>* results,
+                                          ::umbp::UMBPPeer::Stub* stub) {
+  ::umbp::BatchCommitSlotsRequest commit_req;
+  std::vector<size_t> commit_indices;
+  commit_indices.reserve(entries.size());
+
+  for (size_t idx = 0; idx < entries.size(); ++idx) {
+    auto& entry = entries[idx];
+    if (entry.failed) {
+      abort_slots.push_back(entry.slot_id);
+      (*results)[entry.result_index] = false;
+      continue;
+    }
+    auto* commit = commit_req.add_entries();
+    commit->set_slot_id(entry.slot_id);
+    commit->set_key(*entry.item->key);
+    commit_indices.push_back(idx);
+  }
+
+  if (!commit_indices.empty()) {
+    ::umbp::BatchCommitSlotsResponse commit_resp;
+    grpc::ClientContext commit_ctx;
+    auto commit_status = stub->BatchCommitSlots(&commit_ctx, commit_req, &commit_resp);
+    if (!commit_status.ok() ||
+        commit_resp.success_size() != static_cast<int>(commit_indices.size())) {
+      const std::string& node_id = entries[commit_indices.front()].item->route.node_id;
+      MORI_UMBP_WARN("[PoolClient] BatchCommitSlots failed on {}: {}", node_id,
+                     commit_status.error_message());
+      for (size_t idx : commit_indices) {
+        abort_slots.push_back(entries[idx].slot_id);
+        (*results)[entries[idx].result_index] = false;
+        entries[idx].failed = true;
+      }
+    } else {
+      for (size_t i = 0; i < commit_indices.size(); ++i) {
+        auto idx = commit_indices[i];
+        auto& entry = entries[idx];
+        if (commit_resp.success(static_cast<int>(i))) {
+          master_client_->AddCounter(
+              MORI_UMBP_METRIC_CLIENT_PUT_BYTES_TOTAL, MORI_UMBP_METRIC_CLIENT_PUT_BYTES_TOTAL_HELP,
+              {{"traffic", "remote"}}, static_cast<double>(entry.item->size));
+          (*results)[entry.result_index] = true;
+        } else {
+          abort_slots.push_back(entry.slot_id);
+          (*results)[entry.result_index] = false;
+          entry.failed = true;
+        }
+      }
+    }
+  }
+
+  if (!abort_slots.empty()) {
+    ::umbp::BatchAbortSlotsRequest abort_req;
+    for (uint64_t slot_id : abort_slots) abort_req.add_slot_ids(slot_id);
+    ::umbp::BatchAbortSlotsResponse abort_resp;
+    grpc::ClientContext abort_ctx;
+    stub->BatchAbortSlots(&abort_ctx, abort_req, &abort_resp);
+    abort_slots.clear();
+  }
+}
+
+void PoolClient::ProcessRemoteBatchGet(const std::vector<BatchGetItem>& items,
+                                       std::vector<bool>* results) {
+  if (items.empty()) return;
+  if (!io_engine_) {
+    for (const auto& item : items) {
+      (*results)[item.index] = false;
+    }
+    return;
+  }
+
+  const auto& first = items.front();
+  auto& peer = GetOrConnectPeer(first.route.node_id, first.route.peer_address);
+  if (!EnsurePeerServiceConnection(peer)) {
+    for (const auto& item : items) {
+      (*results)[item.index] = false;
+    }
+    return;
+  }
+
+  auto* stub = static_cast<::umbp::UMBPPeer::Stub*>(peer.peer_stub.get());
+  ExecuteRemoteBatchGet(items, results, peer, stub);
+}
+
+void PoolClient::ExecuteRemoteBatchGet(const std::vector<BatchGetItem>& items,
+                                       std::vector<bool>* results, PeerConnection& peer,
+                                       ::umbp::UMBPPeer::Stub* stub) {
+  if (items.empty()) return;
+  if (!io_engine_) {
+    for (const auto& item : items) {
+      (*results)[item.index] = false;
+    }
+    return;
+  }
+
+  std::vector<RemoteGetEntry> entries;
+  if (!PrepareRemoteGetEntries(items, stub, &entries, results)) {
+    return;
+  }
+
+  std::vector<TransferInstruction> transfers;
+  uint64_t staging_bytes = 0;
+  if (!BuildRemoteGetTransfers(entries, peer, &transfers, &staging_bytes)) {
+    for (auto& entry : entries) {
+      (*results)[entry.result_index] = false;
+    }
+    return;
+  }
+
+  ExecuteRemoteGetTransfers(entries, transfers, staging_bytes);
+  FinalizeRemoteGetEntries(entries, results);
+}
+
+bool PoolClient::PrepareRemoteGetEntries(const std::vector<BatchGetItem>& items,
+                                         ::umbp::UMBPPeer::Stub* stub,
+                                         std::vector<RemoteGetEntry>* entries,
+                                         std::vector<bool>* results) {
+  entries->clear();
+  ::umbp::BatchResolveKeysRequest resolve_req;
+  for (const auto& item : items) resolve_req.add_keys(*item.key);
+
+  ::umbp::BatchResolveKeysResponse resolve_resp;
+  grpc::ClientContext resolve_ctx;
+  auto resolve_status = stub->BatchResolveKeys(&resolve_ctx, resolve_req, &resolve_resp);
+  if (!resolve_status.ok() || resolve_resp.entries_size() != static_cast<int>(items.size())) {
+    MORI_UMBP_WARN("[PoolClient] BatchResolveKeys failed on {}: {}", items.front().route.node_id,
+                   resolve_status.error_message());
+    for (const auto& item : items) {
+      (*results)[item.index] = false;
+    }
+    return false;
+  }
+
+  entries->reserve(items.size());
+  for (size_t i = 0; i < items.size(); ++i) {
+    const auto& item = items[i];
+    const auto& resp_entry = resolve_resp.entries(static_cast<int>(i));
+    if (!resp_entry.found()) {
+      (*results)[item.index] = false;
+      continue;
+    }
+    if (resp_entry.size() != item.size) {
+      MORI_UMBP_WARN("[PoolClient] BatchGet: size mismatch for key='{}' (wanted {}, got {})",
+                     *item.key, item.size, resp_entry.size());
+      (*results)[item.index] = false;
+      continue;
+    }
+    SlotPlan plan = FromResolveKeyResponse(resp_entry);
+    if (!SizeMatchesAllocation(item.size, plan.pages.size(), plan.page_size)) {
+      MORI_UMBP_ERROR("[PoolClient] BatchGet: malformed slot for key='{}'", *item.key);
+      (*results)[item.index] = false;
+      continue;
+    }
+
+    RemoteGetEntry entry;
+    entry.result_index = item.index;
+    entry.item = &item;
+    entry.plan = std::move(plan);
+    entries->push_back(std::move(entry));
+  }
+
+  return !entries->empty();
+}
+
+bool PoolClient::BuildRemoteGetTransfers(std::vector<RemoteGetEntry>& entries, PeerConnection& peer,
+                                         std::vector<TransferInstruction>* transfers,
+                                         uint64_t* staging_bytes) {
+  transfers->clear();
+  uint64_t cursor = 0;
+
+  for (size_t idx = 0; idx < entries.size(); ++idx) {
+    auto& entry = entries[idx];
+    EnsureBufferDescsCached(peer, entry.plan.descs);
+
+    auto zero_copy = FindRegisteredMemory(entry.item->dst, entry.item->size);
+    if (zero_copy.has_value()) {
+      entry.zero_copy = zero_copy;
+      entry.use_staging = false;
+      entry.staging_offset = 0;
+    } else {
+      entry.zero_copy.reset();
+      entry.use_staging = true;
+      cursor = AlignUp(cursor, entry.plan.page_size);
+      const uint64_t aligned_size = AlignUp(entry.item->size, entry.plan.page_size);
+      if (cursor + aligned_size > config_.staging_buffer_size) return false;
+      entry.staging_offset = cursor;
+      cursor += aligned_size;
+    }
+
+    mori::io::MemoryDesc local_desc{};
+    uint64_t base_offset = 0;
+    if (entry.use_staging) {
+      local_desc = staging_mem_;
+      base_offset = entry.staging_offset;
+    } else if (entry.zero_copy.has_value()) {
+      local_desc = entry.zero_copy->first;
+      base_offset = entry.zero_copy->second;
+    } else {
+      entry.failed = true;
+      continue;
+    }
+
+    std::vector<TransferInstruction> entry_transfers;
+    entry_transfers.reserve(entry.plan.pages.size());
+    for (size_t p = 0; p < entry.plan.pages.size(); ++p) {
+      const auto& page = entry.plan.pages[p];
+      if (page.buffer_index >= peer.dram_memories.size() ||
+          !IsValidMemoryDesc(peer.dram_memories[page.buffer_index])) {
+        entry.failed = true;
+        entry_transfers.clear();
+        break;
+      }
+      TransferInstruction instr;
+      instr.entry_index = idx;
+      instr.local_desc = local_desc;
+      instr.local_offset = base_offset + static_cast<uint64_t>(p) * entry.plan.page_size;
+      instr.remote_desc = peer.dram_memories[page.buffer_index];
+      instr.remote_offset = static_cast<uint64_t>(page.page_index) * entry.plan.page_size;
+      instr.size =
+          LogicalPageBytes(p, entry.plan.pages.size(), entry.plan.page_size, entry.item->size);
+      entry_transfers.push_back(std::move(instr));
+    }
+
+    if (!entry_transfers.empty()) {
+      transfers->insert(transfers->end(), entry_transfers.begin(), entry_transfers.end());
+    }
+  }
+
+  *staging_bytes = cursor;
+  return true;
+}
+
+void PoolClient::ExecuteRemoteGetTransfers(std::vector<RemoteGetEntry>& entries,
+                                           std::vector<TransferInstruction>& transfers,
+                                           uint64_t staging_bytes) {
+  std::unique_lock<std::mutex> staging_lock(staging_mutex_, std::defer_lock);
+  if (staging_bytes > 0) staging_lock.lock();
+
+  std::vector<TransferInstruction> active_transfers;
+  active_transfers.reserve(transfers.size());
+  for (const auto& transfer : transfers) {
+    if (!entries[transfer.entry_index].failed) {
+      active_transfers.push_back(transfer);
+    }
+  }
+  if (active_transfers.empty()) {
+    if (staging_lock.owns_lock()) staging_lock.unlock();
+    return;
+  }
+
+  const size_t N = active_transfers.size();
+  mori::io::MemDescVec local_descs(N), remote_descs(N);
+  mori::io::BatchSizeVec local_offsets(N), remote_offsets(N), sizes_v(N);
+  std::vector<mori::io::TransferStatus> statuses(N);
+  mori::io::TransferStatusPtrVec status_ptrs(N);
+  mori::io::TransferUniqueIdVec ids(N);
+  for (size_t i = 0; i < N; ++i) {
+    const auto& transfer = active_transfers[i];
+    remote_descs[i] = transfer.remote_desc;
+    local_descs[i] = transfer.local_desc;
+    remote_offsets[i].push_back(transfer.remote_offset);
+    local_offsets[i].push_back(transfer.local_offset);
+    sizes_v[i].push_back(transfer.size);
+    status_ptrs[i] = &statuses[i];
+    ids[i] = io_engine_->AllocateTransferUniqueId();
+  }
+
+  io_engine_->BatchRead(remote_descs, remote_offsets, local_descs, local_offsets, sizes_v,
+                        status_ptrs, ids);
+  for (size_t i = 0; i < active_transfers.size(); ++i) {
+    statuses[i].Wait();
+    if (!statuses[i].Succeeded()) {
+      entries[active_transfers[i].entry_index].failed = true;
+    }
+  }
+
+  if (staging_lock.owns_lock()) {
+    for (auto& entry : entries) {
+      if (entry.failed || !entry.use_staging) continue;
+      if (entry.staging_offset + entry.item->size > config_.staging_buffer_size) {
+        entry.failed = true;
+        continue;
+      }
+      std::memcpy(entry.item->dst, staging_buffer_.get() + entry.staging_offset, entry.item->size);
+    }
+    staging_lock.unlock();
+  }
+}
+
+void PoolClient::FinalizeRemoteGetEntries(std::vector<RemoteGetEntry>& entries,
+                                          std::vector<bool>* results) {
+  for (auto& entry : entries) {
+    if (entry.failed) {
+      (*results)[entry.result_index] = false;
+      continue;
+    }
+    master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_GET_BYTES_TOTAL,
+                               MORI_UMBP_METRIC_CLIENT_GET_BYTES_TOTAL_HELP,
+                               {{"traffic", "remote"}}, static_cast<double>(entry.item->size));
+    (*results)[entry.result_index] = true;
+  }
 }
 
 bool PoolClient::Exists(const std::string& key) {
