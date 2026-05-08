@@ -183,7 +183,7 @@ def is_ccqe_enabled() -> bool:
     """Return True if CCQE should be enabled (cached after first call)."""
     global _ccqe_enabled
     if _ccqe_enabled is None:
-        _ccqe_enabled = detect_nic_type() == "ionic" and _has_ionic_ccqe()
+        _ccqe_enabled = _has_ionic_ccqe()
         print("xxxxxxxxxxxxxxxxxx CCQE enabled XXXXXXXXXXXXXXXXXXXXX")
     return _ccqe_enabled
 
