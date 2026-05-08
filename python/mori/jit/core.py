@@ -164,10 +164,14 @@ def _verify_bitcode(cfg: BuildConfig, bc_path: Path) -> None:
 
 
 def _has_ionic_ccqe() -> bool:
-    """Check whether the ionic DV header exposes ionic_dv_create_cq_ex (CCQE support)."""
-    header = Path("/usr/include/infiniband/ionic_dv.h")
+    """Check whether the ionic driver supports CCQE by probing the runtime library symbol."""
+    import ctypes, ctypes.util
+    lib_name = ctypes.util.find_library("ionic")
+    if lib_name is None:
+        return False
     try:
-        return "ionic_dv_create_cq_ex" in header.read_text()
+        lib = ctypes.CDLL(lib_name)
+        return hasattr(lib, "ionic_dv_create_cq_ex")
     except OSError:
         return False
 
@@ -180,6 +184,7 @@ def is_ccqe_enabled() -> bool:
     global _ccqe_enabled
     if _ccqe_enabled is None:
         _ccqe_enabled = detect_nic_type() == "ionic" and _has_ionic_ccqe()
+        print("xxxxxxxxxxxxxxxxxx CCQE enabled XXXXXXXXXXXXXXXXXXXXX")
     return _ccqe_enabled
 
 
