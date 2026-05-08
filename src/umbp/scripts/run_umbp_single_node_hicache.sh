@@ -26,23 +26,9 @@ UMBP_IO_ENGINE_PORT="${UMBP_IO_ENGINE_PORT:-16000}"
 UMBP_PEER_SERVICE_PORT="${UMBP_PEER_SERVICE_PORT:-17000}"
 USE_DUMMY_WEIGHTS="${USE_DUMMY_WEIGHTS:-false}"
 
-SGLANG_BRANCH="${SGLANG_BRANCH:-main}"
-MORI_BRANCH="${MORI_BRANCH:-main}"
 SGLANG_REPO="${SGLANG_REPO:-${NFS_BASE}/sglang}"
 MORI_REPO="${MORI_REPO:-${NFS_BASE}/mori}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.7}"
-
-declare -a SGLANG_REMOTE_CANDIDATES=()
-if [[ -n "${SGLANG_REMOTE:-}" ]]; then
-  SGLANG_REMOTE_CANDIDATES+=("$SGLANG_REMOTE")
-fi
-SGLANG_REMOTE_CANDIDATES+=(umbp umb_ssh tiandi origin)
-
-declare -a MORI_REMOTE_CANDIDATES=()
-if [[ -n "${MORI_REMOTE:-}" ]]; then
-  MORI_REMOTE_CANDIDATES+=("$MORI_REMOTE")
-fi
-MORI_REMOTE_CANDIDATES+=(ssh origin)
 
 usage() {
   local exit_code="${1:-0}"
@@ -103,71 +89,6 @@ fail() {
   exit 1
 }
 
-resolve_git_remote() {
-  local repo_path="$1"
-  shift
-  for candidate in "$@"; do
-    [[ -z "$candidate" ]] && continue
-    if git -C "$repo_path" remote get-url "$candidate" >/dev/null 2>&1; then
-      echo "$candidate"
-      return 0
-    fi
-  done
-  return 1
-}
-
-update_repo_branch() {
-  local repo_path="$1"
-  local branch="$2"
-  local label="$3"
-  shift 3
-  if [[ ! -d "${repo_path}/.git" ]]; then
-    fail "${label} repo '${repo_path}' is not a git repository. Override ${label^^}_REPO if needed."
-  fi
-
-  local remote
-  if ! remote=$(resolve_git_remote "$repo_path" "$@"); then
-    fail "No valid git remote found for ${label} repo '${repo_path}'. Set ${label^^}_REMOTE to an existing remote."
-  fi
-
-  echo "  - Updating ${label} repo (${repo_path}) to ${remote}/${branch}"
-  pushd "$repo_path" >/dev/null
-
-  local fetch_ok=1
-  local has_remote_ref=0
-  if git fetch --no-write-fetch-head "$remote" "$branch"; then
-    if git show-ref --verify --quiet "refs/remotes/${remote}/${branch}" >/dev/null 2>&1; then
-      has_remote_ref=1
-    fi
-  else
-    fetch_ok=0
-    if ! git rev-parse --verify --quiet "$branch" >/dev/null 2>&1; then
-      popd >/dev/null
-      fail "${label} branch '$branch' not found locally and fetch from '$remote' failed."
-    fi
-    echo "    (warning) ${label}: skipping remote fetch from '$remote' for branch '$branch'; using local branch only."
-  fi
-
-  if git rev-parse --verify --quiet "$branch" >/dev/null 2>&1; then
-    git checkout "$branch" >/dev/null 2>&1 || git checkout "$branch"
-  elif (( has_remote_ref == 1 )); then
-    git checkout -B "$branch" "${remote}/${branch}"
-  else
-    popd >/dev/null
-    fail "${label} branch '$branch' not found locally and no remote ref available."
-  fi
-
-  if (( has_remote_ref == 1 )); then
-    if ! git rebase "${remote}/${branch}"; then
-      popd >/dev/null
-      fail "Failed to rebase ${label} branch '$branch' onto '${remote}/${branch}'. Resolve issues and retry."
-    fi
-  else
-    echo "    (info) ${label}: no remote tracking branch detected; leaving local commits as-is."
-  fi
-  popd >/dev/null
-}
-
 trap cleanup EXIT
 
 mkdir -p "$RESULTS_DIR"
@@ -189,11 +110,7 @@ else
   fi
 fi
 
-echo "[1/5] Updating git repositories (sglang: ${SGLANG_BRANCH}, mori: ${MORI_BRANCH})"
-update_repo_branch "$SGLANG_REPO" "$SGLANG_BRANCH" "sglang" "${SGLANG_REMOTE_CANDIDATES[@]}"
-update_repo_branch "$MORI_REPO" "$MORI_BRANCH" "mori" "${MORI_REMOTE_CANDIDATES[@]}"
-
-echo "[2/5] Preparing Docker container (${CONTAINER}) on node ${LOCAL_NODE}"
+echo "[1/4] Preparing Docker container (${CONTAINER}) on node ${LOCAL_NODE}"
 docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 docker run -d --name "$CONTAINER" \
   --ulimit memlock=-1:-1 --ulimit stack=67108864:67108864 \
@@ -213,15 +130,15 @@ if ! docker ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
 fi
 
 if [[ "$USE_DUMMY_WEIGHTS" == "true" ]]; then
-  echo "[3/5] Launching SGLang server (dummy weights) inside container"
+  echo "[2/4] Launching SGLang server (dummy weights) inside container"
 else
-  echo "[3/5] Launching SGLang server (real weights) inside container"
+  echo "[2/4] Launching SGLang server (real weights) inside container"
 fi
 
 docker exec "$CONTAINER" bash -c '
 set -euo pipefail
 
-echo "[3/5] Rebuilding Mori inside container from '"${MORI_REPO}"' via pip install"
+echo "[2/4] Rebuilding Mori inside container from '"${MORI_REPO}"' via pip install"
 cd '"${MORI_REPO}"'
 BUILD_UMBP="${BUILD_UMBP:-ON}" \
 BUILD_EXAMPLES="${BUILD_EXAMPLES:-OFF}" \
@@ -307,7 +224,7 @@ fi
 
 SGLANG_MORI_FP8_DISP=false \
 MORI_SHMEM_MODE=ISOLATION \
-SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16384 \
+SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK="${SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK:-16384}" \
 python -m sglang.launch_server \
   --enable-cache-report \
   --enable-metrics \
@@ -354,7 +271,7 @@ if [ $ELAPSED -ge $MAX_WAIT ]; then
   exit 1
 fi
 
-echo "[4/5] Running correctness probe"
+echo "[3/4] Running correctness probe"
 curl -sf --max-time "${PROBE_MAX_TIME:-300}" -X POST http://127.0.0.1:30000/v1/completions \
   -H "Content-Type: application/json" \
   -d "{\"model\":\"deepseek-v3\",\"prompt\":\"Say hello in one word.\",\"max_tokens\":8,\"stream\":false}" \
@@ -375,7 +292,7 @@ if [[ -n "${MASTER_PID:-}" ]]; then
 fi
 '
 
-echo "[5/5] Completed single-node smoke test; artifacts saved under ${RESULTS_DIR}"
+echo "[4/4] Completed single-node smoke test; artifacts saved under ${RESULTS_DIR}"
 
 
   # --hicache-storage-backend umbp \
