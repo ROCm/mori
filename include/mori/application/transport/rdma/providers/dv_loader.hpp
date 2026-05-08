@@ -208,8 +208,9 @@ struct IonicDvApi {
     pd_set_udma_mask = (pd_set_udma_mask_t)DvLoadSymbol(handle, "ionic_dv_pd_set_udma_mask");
     create_cq_ex = (create_cq_ex_t)DvLoadSymbol(handle, "ionic_dv_create_cq_ex");
 
+    // create_cq_ex is optional: nullptr means CCQE not supported by this driver version
     return get_ctx && qp_get_udma_idx && get_cq && get_qp && pd_set_sqcmb && pd_set_rqcmb &&
-           pd_set_udma_mask && create_cq_ex;
+           pd_set_udma_mask;
   }
 
   static IonicDvApi& Instance() {
