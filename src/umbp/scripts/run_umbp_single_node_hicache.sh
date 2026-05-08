@@ -16,8 +16,8 @@ CONTAINER="umbp-single-node"
 MODEL_PATH="${MODEL_PATH:-/nfs/data/Deepseek-R1}"
 RESULTS_DIR="${USER_HOME}/umbp_single_node_results"
 TP_SIZE="${TP_SIZE:-8}"
-DP_SIZE="${DP_SIZE:-1}"
-EP_SIZE="${EP_SIZE:-1}"
+DP_SIZE="${DP_SIZE:-8}"
+EP_SIZE="${EP_SIZE:-8}"
 ENABLE_DP="${ENABLE_DP:-false}"
 START_UMBP_MASTER="${START_UMBP_MASTER:-true}"
 UMBP_MASTER_ADDRESS="${UMBP_MASTER_ADDRESS:-127.0.0.1:15558}"
@@ -30,12 +30,13 @@ SGLANG_BRANCH="${SGLANG_BRANCH:-main}"
 MORI_BRANCH="${MORI_BRANCH:-main}"
 SGLANG_REPO="${SGLANG_REPO:-${NFS_BASE}/sglang}"
 MORI_REPO="${MORI_REPO:-${NFS_BASE}/mori}"
+MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.7}"
 
 declare -a SGLANG_REMOTE_CANDIDATES=()
 if [[ -n "${SGLANG_REMOTE:-}" ]]; then
   SGLANG_REMOTE_CANDIDATES+=("$SGLANG_REMOTE")
 fi
-SGLANG_REMOTE_CANDIDATES+=(hicache umb umb_ssh origin)
+SGLANG_REMOTE_CANDIDATES+=(umbp umb_ssh tiandi origin)
 
 declare -a MORI_REMOTE_CANDIDATES=()
 if [[ -n "${MORI_REMOTE:-}" ]]; then
@@ -132,18 +133,38 @@ update_repo_branch() {
   echo "  - Updating ${label} repo (${repo_path}) to ${remote}/${branch}"
   pushd "$repo_path" >/dev/null
 
-  git fetch "$remote" "$branch"
+  local fetch_ok=1
+  local has_remote_ref=0
+  if git fetch --no-write-fetch-head "$remote" "$branch"; then
+    if git show-ref --verify --quiet "refs/remotes/${remote}/${branch}" >/dev/null 2>&1; then
+      has_remote_ref=1
+    fi
+  else
+    fetch_ok=0
+    if ! git rev-parse --verify --quiet "$branch" >/dev/null 2>&1; then
+      popd >/dev/null
+      fail "${label} branch '$branch' not found locally and fetch from '$remote' failed."
+    fi
+    echo "    (warning) ${label}: skipping remote fetch from '$remote' for branch '$branch'; using local branch only."
+  fi
 
   if git rev-parse --verify --quiet "$branch" >/dev/null 2>&1; then
     git checkout "$branch" >/dev/null 2>&1 || git checkout "$branch"
-  elif git show-ref --verify --quiet "refs/remotes/${remote}/${branch}" >/dev/null 2>&1; then
+  elif (( has_remote_ref == 1 )); then
     git checkout -B "$branch" "${remote}/${branch}"
   else
     popd >/dev/null
-    fail "${label} branch '$branch' not found on remote '$remote'."
+    fail "${label} branch '$branch' not found locally and no remote ref available."
   fi
 
-  git pull --rebase "$remote" "$branch"
+  if (( has_remote_ref == 1 )); then
+    if ! git rebase "${remote}/${branch}"; then
+      popd >/dev/null
+      fail "Failed to rebase ${label} branch '$branch' onto '${remote}/${branch}'. Resolve issues and retry."
+    fi
+  else
+    echo "    (info) ${label}: no remote tracking branch detected; leaving local commits as-is."
+  fi
   popd >/dev/null
 }
 
@@ -199,6 +220,13 @@ fi
 
 docker exec "$CONTAINER" bash -c '
 set -euo pipefail
+
+echo "[3/5] Rebuilding Mori inside container from '"${MORI_REPO}"' via pip install"
+cd '"${MORI_REPO}"'
+BUILD_UMBP="${BUILD_UMBP:-ON}" \
+BUILD_EXAMPLES="${BUILD_EXAMPLES:-OFF}" \
+pip install . ${MORI_PIP_FLAGS:---no-build-isolation -v}
+cd - >/dev/null
 
 _IFNAME=$(ip -o addr show 2>/dev/null | awk -v ip="'"${LOCAL_IP}"'" '"'"'$4 ~ ip"/" {print $2; exit}'"'"')
 [[ -z "$_IFNAME" ]] && _IFNAME=$(ip route get 127.0.0.1 2>/dev/null | awk '"'"'NR==1{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1);exit}}'"'"')
@@ -288,22 +316,15 @@ python -m sglang.launch_server \
   --decode-log-interval 1 \
   --trust-remote-code \
   --watchdog-timeout 1000000 \
-  --chunked-prefill-size 131072 \
+  --chunked-prefill-size 65536 \
   --attention-backend aiter \
   --kv-cache-dtype fp8_e4m3 \
   --max-total-tokens 1024 \
-  --mem-fraction-static 0.5 \
+  --mem-fraction-static '"${MEM_FRACTION_STATIC}"' \
   --enable-hierarchical-cache \
   --hicache-write-policy write_through \
   --hicache-mem-layout page_first \
   --hicache-ratio 5.0 \
-  --hicache-storage-backend umbp \
-  --hicache-storage-backend-extra-config '"'"'{
-    "dram_capacity_bytes": 1073741824,
-    "ssd_enabled": false,
-    "auto_promote_on_read": true,
-    "prefetch_threshold": 0
-  }'"'"' \
   ${LOAD_FORMAT_FLAG:+$LOAD_FORMAT_FLAG} \
   '"$(if [[ "${ENABLE_DP}" == "true" ]]; then printf -- '--dp-size %s --ep-size %s --moe-a2a-backend mori --deepep-mode normal --enable-dp-attention --enable-dp-lm-head --moe-dense-tp-size 1' "${DP_SIZE}" "${EP_SIZE}"; fi)"' \
   > "$SERVER_LOG" 2>&1 &
@@ -334,9 +355,9 @@ if [ $ELAPSED -ge $MAX_WAIT ]; then
 fi
 
 echo "[4/5] Running correctness probe"
-curl -sf -X POST http://127.0.0.1:30000/v1/completions \
+curl -sf --max-time "${PROBE_MAX_TIME:-300}" -X POST http://127.0.0.1:30000/v1/completions \
   -H "Content-Type: application/json" \
-  -d "{\"model\":\"deepseek-v3\",\"prompt\":\"Say hello in one word.\",\"max_tokens\":8}" \
+  -d "{\"model\":\"deepseek-v3\",\"prompt\":\"Say hello in one word.\",\"max_tokens\":8,\"stream\":false}" \
   | tee ${RESULTS_DIR}/probe_response.json
 
 if ! grep -q "choices" ${RESULTS_DIR}/probe_response.json; then
@@ -355,3 +376,12 @@ fi
 '
 
 echo "[5/5] Completed single-node smoke test; artifacts saved under ${RESULTS_DIR}"
+
+
+  # --hicache-storage-backend umbp \
+  # --hicache-storage-backend-extra-config '"'"'{
+  #   "dram_capacity_bytes": 1073741824,
+  #   "ssd_enabled": false,
+  #   "auto_promote_on_read": true,
+  #   "prefetch_threshold": 0
+  # }'"'"' \
