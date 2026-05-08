@@ -110,15 +110,8 @@ PeerDramAllocator::TierConfig BuildDramTierConfig(const std::vector<ExportableDr
 
 // Translate a peer-side ::umbp::AllocateSlotResponse / ResolveKeyResponse
 // into the C++ shapes our code consumes.
-struct SlotPlan {
-  uint64_t slot_id = 0;
-  std::vector<PageLocation> pages;
-  uint64_t page_size = 0;
-  std::vector<BufferMemoryDescBytes> descs;
-};
-
-SlotPlan FromAllocateSlotResponse(const ::umbp::AllocateSlotResponse& resp) {
-  SlotPlan p;
+PoolClient::SlotPlan FromAllocateSlotResponse(const ::umbp::AllocateSlotResponse& resp) {
+  PoolClient::SlotPlan p;
   p.slot_id = resp.slot_id();
   p.page_size = resp.page_size();
   p.pages.reserve(resp.pages_size());
@@ -133,8 +126,8 @@ SlotPlan FromAllocateSlotResponse(const ::umbp::AllocateSlotResponse& resp) {
   return p;
 }
 
-SlotPlan FromResolveKeyResponse(const ::umbp::ResolveKeyResponse& resp) {
-  SlotPlan p;
+PoolClient::SlotPlan FromResolveKeyResponse(const ::umbp::ResolveKeyResponse& resp) {
+  PoolClient::SlotPlan p;
   p.page_size = resp.page_size();
   p.pages.reserve(resp.pages_size());
   for (const auto& pp : resp.pages()) p.pages.push_back({pp.buffer_index(), pp.page_index()});
@@ -693,7 +686,7 @@ bool PoolClient::AllocateRemotePutEntries(const std::vector<BatchPutItem>& items
       continue;
     }
 
-    SlotPlan plan = FromAllocateSlotResponse(resp_entry);
+    PoolClient::SlotPlan plan = FromAllocateSlotResponse(resp_entry);
     if (!SizeMatchesAllocation(item.size, plan.pages.size(), plan.page_size)) {
       MORI_UMBP_ERROR("[PoolClient] BatchPut: malformed slot for key='{}'", *item.key);
       abort_slots->push_back(plan.slot_id);
@@ -995,7 +988,7 @@ bool PoolClient::PrepareRemoteGetEntries(const std::vector<BatchGetItem>& items,
       (*results)[item.index] = false;
       continue;
     }
-    SlotPlan plan = FromResolveKeyResponse(resp_entry);
+    PoolClient::SlotPlan plan = FromResolveKeyResponse(resp_entry);
     if (!SizeMatchesAllocation(item.size, plan.pages.size(), plan.page_size)) {
       MORI_UMBP_ERROR("[PoolClient] BatchGet: malformed slot for key='{}'", *item.key);
       (*results)[item.index] = false;

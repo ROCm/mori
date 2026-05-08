@@ -101,6 +101,13 @@ class PoolClient {
   bool MatchExternalKv(const std::vector<std::string>& hashes,
                        std::vector<MasterClient::ExternalKvNodeMatch>* out_matches);
 
+  struct SlotPlan {
+    uint64_t slot_id = 0;
+    std::vector<PageLocation> pages;
+    uint64_t page_size = 0;
+    std::vector<BufferMemoryDescBytes> descs;
+  };
+
  private:
   PoolClientConfig config_;
   std::atomic<bool> initialized_{false};
@@ -185,11 +192,6 @@ class PoolClient {
   PutAttemptOutcome ExecuteLocalPut(const std::string& key, const void* src, size_t size,
                                     TierType tier);
   GetAttemptOutcome ExecuteLocalGet(const std::string& key, void* dst, size_t size);
-  std::unordered_map<std::string, std::vector<BatchPutItem>> PartitionBatchPutTargets(
-      const std::vector<std::string>& keys, const std::vector<const void*>& srcs,
-      const std::vector<size_t>& sizes, const std::vector<std::optional<RoutePutResult>>& routes,
-      std::vector<bool>* results);
-
   struct BatchPutItem {
     size_t index;
     const std::string* key;
@@ -204,6 +206,11 @@ class PoolClient {
     size_t size;
     RouteGetResult route;
   };
+
+  std::unordered_map<std::string, std::vector<BatchPutItem>> PartitionBatchPutTargets(
+      const std::vector<std::string>& keys, const std::vector<const void*>& srcs,
+      const std::vector<size_t>& sizes, const std::vector<std::optional<RoutePutResult>>& routes,
+      std::vector<bool>* results);
 
   struct TransferInstruction {
     size_t entry_index;
