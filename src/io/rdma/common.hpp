@@ -22,6 +22,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -29,6 +30,7 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -146,6 +148,11 @@ struct SqCqeDiagnostics {
   std::atomic<int64_t> lastNonEmptyCqeTimeUs{0};
   std::atomic<uint64_t> recentCqeCount{0};
   std::atomic<uint64_t> recentBatchReleaseWr{0};
+  std::atomic<uint64_t> executorAdmissionWaitCount{0};
+  std::atomic<uint64_t> executorAdmissionWaitUs{0};
+  std::atomic<uint64_t> executorAdmissionTimeoutCount{0};
+  std::atomic<uint64_t> leastLoadedSelectionCount{0};
+  std::atomic<int> queuedWrHighWatermark{0};
 };
 
 enum class SqReserveFailureKind : uint8_t {
@@ -175,6 +182,30 @@ struct ReserveResult {
   int backoffCount{0};
 };
 
+enum class AdmissionFailureKind : uint8_t {
+  None = 0,
+  NoCapacity,
+  Degraded,
+  TerminalDegraded,
+  ExceedsCapacity,
+};
+
+struct AdmissionSnapshot {
+  int depth{0};
+  int queuedDepth{0};
+  int effectiveLoad{0};
+  int maxDepth{0};
+  int requested{0};
+  int requiredFree{0};
+  int effectiveResumeWatermarkWr{0};
+  uint64_t epoch{0};
+};
+
+struct AdmissionResult {
+  AdmissionFailureKind kind{AdmissionFailureKind::None};
+  AdmissionSnapshot snapshot{};
+};
+
 class SqController {
  public:
   SqController(int maxDepth, int resumeWatermark);
@@ -182,12 +213,19 @@ class SqController {
   bool Reserve(int wrCount, ReserveOptions opts, ReserveResult* result);
   bool RecheckBeforePost(int reservedWrCount, ReserveResult* result);
   void Release(int wrCount);
+  bool TryAcquireAdmission(int admissionWr, int requiredFree, AdmissionResult* result);
+  void ReleaseAdmission(int admissionWr);
+  bool WaitForAdmissionChange(std::chrono::steady_clock::time_point deadline,
+                              uint64_t observedEpoch);
   bool MarkDegraded(SqDegradeReason reason);
   void ReleaseDrainedOrphaned(int wrCount);
   std::shared_lock<std::shared_mutex> AcquireSubmitGuard();
   std::unique_lock<std::shared_mutex> AcquireRecoveryGuard();
 
   int Depth() const;
+  int QueuedDepth() const;
+  int EffectiveDepth() const;
+  int FreeAdmissionSlots() const;
   int MaxDepth() const;
   bool IsDegraded() const;
   bool IsTerminalDegraded() const;
@@ -197,6 +235,7 @@ class SqController {
   void NotifyStateChangedLocked();
 
   std::atomic<int> depth_{0};
+  std::atomic<int> queuedDepth_{0};
   int maxDepth_{0};
   int resumeWatermark_{0};
   std::atomic<bool> degraded_{false};
@@ -204,10 +243,11 @@ class SqController {
   std::shared_mutex submitMu_;
   std::mutex mu_;
   std::condition_variable cv_;
-  uint64_t epoch_{0};
+  std::atomic<uint64_t> epoch_{0};
 };
 
 int GetSqResumeWatermarkWrForDepth(int maxDepth);
+int GetSqSignalIntervalWr();
 
 using EndpointId = uint64_t;
 
@@ -268,12 +308,9 @@ struct EpPair {
   EngineKey remoteEngineKey;
   application::RdmaEndpoint local;
   application::RdmaEndpointHandle remote;
-  // Shared across EpPair copies that refer to the same QP. sq is the Phase 2
-  // owner; sqDepth/degraded remain only for legacy/fallback EpPair instances.
+  // Shared across EpPair copies that refer to the same QP.
   std::shared_ptr<SqController> sq;
-  std::shared_ptr<std::atomic<int>> sqDepth;
   int maxSqDepth{0};
-  std::shared_ptr<std::atomic<bool>> degraded;
   std::shared_ptr<SubmissionLedger> ledger;
   int qpPerTransfer{0};
   int numWorkerThreads{0};
@@ -285,6 +322,7 @@ using EpPairVec = std::vector<EpPair>;
 void RecordSqPollAttempt(const EpPair& ep);
 void RecordSqPollCqes(const EpPair& ep, int cqeCount);
 void RecordSqBatchReleaseWr(const EpPair& ep, int wrCount);
+std::string BuildSqCqeDiagnosticHint(const EpPair& ep);
 // The vector membership is not modified, but endpoint controller/ledger/status
 // state is mutated through EpPair's shared ownership fields.
 void MovePendingUnsignaledToOrphanedForEndpoint(
@@ -321,6 +359,9 @@ struct RdmaOpRet {
 };
 
 RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* status, TransferUniqueId id);
+
+int EstimateMergedWrCount(const SizeVec& localOffsets, const SizeVec& remoteOffsets,
+                          const SizeVec& sizes, uint32_t maxSge);
 
 RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemoryRegion& local,
                              const SizeVec& localOffsets,

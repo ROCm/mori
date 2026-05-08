@@ -48,8 +48,15 @@
 #include "mori/io/io.hpp"
 #include "src/io/rdma/backend_impl.hpp"
 #include "src/io/rdma/common.hpp"
+#include "src/io/rdma/executor.hpp"
 
 using namespace mori::io;
+
+namespace mori {
+namespace io {
+void TestWorkerShutdownDrainsTokensAndPromisesForTest();
+}  // namespace io
+}  // namespace mori
 
 namespace {
 
@@ -381,6 +388,97 @@ void CaseSqControllerRecheckRollsBack() {
   Require(result.kind == SqReserveFailureKind::TerminalDegraded,
           "recheck should report terminal degraded");
   Require(sq.Depth() == 0, "failed recheck should roll back reserved credits");
+}
+
+void CaseSqControllerAdmissionCounters() {
+  SqController sq(4, 2);
+  AdmissionResult result;
+  Require(sq.TryAcquireAdmission(2, 2, &result), "initial admission should succeed");
+  Require(sq.QueuedDepth() == 2, "admission should increment queued depth");
+  Require(sq.EffectiveDepth() == 2, "effective depth should include queued depth");
+  Require(sq.FreeAdmissionSlots() == 2, "free admission slots should reflect queued depth");
+  Require(result.snapshot.queuedDepth == 2, "admission result should report queued depth");
+
+  Require(!sq.TryAcquireAdmission(3, 3, &result),
+          "admission should fail when effective SQ is full");
+  Require(result.kind == AdmissionFailureKind::NoCapacity,
+          "full admission should report no capacity");
+  const uint64_t observedEpoch = result.snapshot.epoch;
+
+  std::atomic<bool> waiterDone{false};
+  std::thread waiter([&]() {
+    waiterDone.store(sq.WaitForAdmissionChange(
+                         std::chrono::steady_clock::now() + std::chrono::seconds(1), observedEpoch),
+                     std::memory_order_release);
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  sq.ReleaseAdmission(2);
+  waiter.join();
+  Require(waiterDone.load(std::memory_order_acquire), "admission waiter should wake on release");
+  Require(sq.QueuedDepth() == 0, "admission release should decrement queued depth");
+
+  ReserveOptions opts;
+  opts.timeoutUs = 10000;
+  ReserveResult reserveResult;
+  Require(sq.Reserve(1, opts, &reserveResult), "hard reserve should still work");
+  Require(sq.TryAcquireAdmission(2, 2, &result), "admission should account with hard depth");
+  Require(sq.EffectiveDepth() == 3, "effective depth should be hard plus queued depth");
+  sq.ReleaseAdmission(2);
+  sq.Release(1);
+}
+
+void CaseSqControllerAdmissionDegraded() {
+  SqController sq(4, 0);
+  sq.MarkDegraded(SqDegradeReason::FatalCqe);
+  AdmissionResult result;
+  Require(!sq.TryAcquireAdmission(1, 1, &result), "degraded SQ should reject admission");
+  Require(result.kind == AdmissionFailureKind::TerminalDegraded,
+          "fatal degraded SQ should report terminal degraded admission failure");
+}
+
+void CaseSqControllerAdmissionMarkDegradedWakes() {
+  SqController sq(1, 0);
+  AdmissionResult result;
+  Require(sq.TryAcquireAdmission(1, 1, &result), "initial admission should fill soft slots");
+  Require(!sq.TryAcquireAdmission(1, 1, &result), "second admission should observe pressure");
+  const uint64_t observedEpoch = result.snapshot.epoch;
+
+  std::atomic<bool> waiterDone{false};
+  std::thread waiter([&]() {
+    waiterDone.store(sq.WaitForAdmissionChange(
+                         std::chrono::steady_clock::now() + std::chrono::seconds(1), observedEpoch),
+                     std::memory_order_release);
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  sq.MarkDegraded(SqDegradeReason::FatalCqe);
+  waiter.join();
+
+  Require(waiterDone.load(std::memory_order_acquire), "MarkDegraded should wake admission waiters");
+  sq.ReleaseAdmission(1);
+}
+
+void CaseAdmissionTokenMoveReleasesOnce() {
+  auto sq = std::make_shared<SqController>(8, 0);
+  AdmissionResult result;
+  Require(sq->TryAcquireAdmission(3, 3, &result), "token test admission should succeed");
+  {
+    AdmissionToken token(sq, 3);
+    AdmissionToken moved(std::move(token));
+    AdmissionToken assigned;
+    assigned = std::move(moved);
+    Require(sq->QueuedDepth() == 3, "moving token must not release admission early");
+  }
+  Require(sq->QueuedDepth() == 0, "moved token should release exactly once on destruction");
+
+  Require(sq->TryAcquireAdmission(2, 2, &result), "manual release admission should succeed");
+  AdmissionToken token(sq, 2);
+  token.Release();
+  token.Release();
+  Require(sq->QueuedDepth() == 0, "manual token release should be idempotent");
+}
+
+void CaseWorkerShutdownDrainsTokensAndPromises() {
+  mori::io::TestWorkerShutdownDrainsTokensAndPromisesForTest();
 }
 
 void RunPendingUnsignaledOrphaningCase(const char* context, int epCount) {
@@ -1029,6 +1127,48 @@ struct TestCase {
 
 }  // namespace
 
+namespace mori {
+namespace io {
+
+void TestWorkerShutdownDrainsTokensAndPromisesForTest() {
+  auto check = [](bool cond, const std::string& msg) {
+    if (!cond) throw std::runtime_error(msg);
+  };
+
+  MultithreadExecutor::Worker worker(0);
+  worker.running.store(true, std::memory_order_release);
+
+  auto sq = std::make_shared<SqController>(8, 0);
+  AdmissionResult result;
+  std::vector<std::future<RdmaOpRet>> futures;
+
+  {
+    std::lock_guard<std::mutex> lock(worker.mu);
+    for (int i = 0; i < 3; ++i) {
+      check(sq->TryAcquireAdmission(1, 1, &result),
+            "test setup should acquire worker shutdown admission token");
+      MultithreadExecutor::Task task{nullptr, 0, 0, 0, AdmissionToken(sq, 1)};
+      futures.push_back(task.ret.get_future());
+      worker.q.push(std::move(task));
+    }
+  }
+
+  check(sq->QueuedDepth() == 3, "queued test tasks should hold admission tokens");
+  worker.Shutdown();
+  check(sq->QueuedDepth() == 0, "shutdown should release queued task admission tokens");
+
+  for (auto& fut : futures) {
+    check(fut.wait_for(std::chrono::seconds(1)) == std::future_status::ready,
+          "shutdown should complete queued task promise");
+    RdmaOpRet ret = fut.get();
+    check(ret.code == StatusCode::ERR_BAD_STATE, "shutdown should return ERR_BAD_STATE");
+    check(ret.message == "executor shutdown", "shutdown should use executor shutdown message");
+  }
+}
+
+}  // namespace io
+}  // namespace mori
+
 int main(int argc, char* argv[]) {
   // Subprocess entry point for hidden-device importer
   if (argc >= 3 && std::string(argv[1]) == "--hidden-device-importer") {
@@ -1041,6 +1181,11 @@ int main(int argc, char* argv[]) {
       {"sq_controller_reserve_release_wait", CaseSqControllerReserveReleaseWait},
       {"sq_controller_terminal_degraded", CaseSqControllerTerminalDegraded},
       {"sq_controller_recheck_rolls_back", CaseSqControllerRecheckRollsBack},
+      {"sq_controller_admission_counters", CaseSqControllerAdmissionCounters},
+      {"sq_controller_admission_degraded", CaseSqControllerAdmissionDegraded},
+      {"sq_controller_admission_mark_degraded_wakes", CaseSqControllerAdmissionMarkDegradedWakes},
+      {"admission_token_move_releases_once", CaseAdmissionTokenMoveReleasesOnce},
+      {"worker_shutdown_drains_tokens_and_promises", CaseWorkerShutdownDrainsTokensAndPromises},
       {"pending_unsignaled_recheck_failure_orphans", CasePendingUnsignaledRecheckFailureOrphans},
       {"pending_unsignaled_reserve_failure_orphans", CasePendingUnsignaledReserveFailureOrphans},
       {"pending_unsignaled_orphaning_closes_admission_before_recovery",

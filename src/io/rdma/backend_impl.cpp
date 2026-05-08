@@ -156,24 +156,18 @@ static bool IsTerminalCqeStatus(ibv_wc_status status) {
 
 static void ReleaseSqCredit(const EpPair& ep, int wrCount) {
   if (wrCount <= 0) return;
-  if (ep.sq) {
-    ep.sq->Release(wrCount);
-  } else if (ep.sqDepth) {
-    ep.sqDepth->fetch_sub(wrCount, std::memory_order_relaxed);
-  }
+  assert(ep.sq != nullptr);
+  ep.sq->Release(wrCount);
 }
 
 static bool EpDegraded(const EpPair& ep) {
-  if (ep.sq) return ep.sq->IsDegraded();
-  return ep.degraded && ep.degraded->load(std::memory_order_relaxed);
+  assert(ep.sq != nullptr);
+  return ep.sq->IsDegraded();
 }
 
 static void MarkEpDegradedFromCqe(const EpPair& ep, SqDegradeReason reason) {
-  if (ep.sq) {
-    ep.sq->MarkDegraded(reason);
-  } else if (ep.degraded) {
-    ep.degraded->store(true, std::memory_order_relaxed);
-  }
+  assert(ep.sq != nullptr);
+  ep.sq->MarkDegraded(reason);
 }
 
 static void FailUniqueSubmissionMetasFromCqe(const std::vector<SubmissionRecord>& records,
@@ -330,7 +324,8 @@ int RdmaManager::CountEndpoint(EngineKey engine, TopoKeyPair key) {
   if (routeIt == remoteIt->second.rTable.end()) return 0;
   int count = 0;
   for (const auto& ep : routeIt->second) {
-    if (!ep.sq || !ep.sq->IsTerminalDegraded()) count++;
+    assert(ep.sq != nullptr);
+    if (!ep.sq->IsTerminalDegraded()) count++;
   }
   return count;
 }
@@ -343,7 +338,8 @@ EpPairVec RdmaManager::GetAllEndpoint(EngineKey engine, TopoKeyPair key) {
   auto routeIt = remoteIt->second.rTable.find(key);
   if (routeIt == remoteIt->second.rTable.end()) return healthy;
   for (const auto& ep : routeIt->second) {
-    if (!ep.sq || !ep.sq->IsTerminalDegraded()) healthy.push_back(ep);
+    assert(ep.sq != nullptr);
+    if (!ep.sq->IsTerminalDegraded()) healthy.push_back(ep);
   }
   return healthy;
 }

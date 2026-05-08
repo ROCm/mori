@@ -27,7 +27,6 @@
 #include <cstdlib>
 #include <limits>
 #include <numeric>
-#include <thread>
 #include <unordered_set>
 #include <utility>
 
@@ -54,7 +53,7 @@ static int GetSqBackoffTimeoutUs() {
   return kBackoffTimeoutUs;
 }
 
-static int GetSqSignalIntervalWr() {
+int GetSqSignalIntervalWr() {
   static const int kSignalIntervalWr = []() {
     int v = 0;
     const char* raw = std::getenv("MORI_IO_SQ_SIGNAL_INTERVAL_WR");
@@ -120,6 +119,21 @@ static void SetReserveResult(ReserveResult* result, SqReserveFailureKind kind, i
   result->backoffCount = backoffCount;
 }
 
+static void SetAdmissionResult(AdmissionResult* result, AdmissionFailureKind kind, int depth,
+                               int queuedDepth, int requested, int requiredFree,
+                               int effectiveResumeWatermarkWr, int maxDepth, uint64_t epoch) {
+  if (result == nullptr) return;
+  result->kind = kind;
+  result->snapshot.depth = depth;
+  result->snapshot.queuedDepth = queuedDepth;
+  result->snapshot.effectiveLoad = std::max(0, depth) + std::max(0, queuedDepth);
+  result->snapshot.maxDepth = maxDepth;
+  result->snapshot.requested = requested;
+  result->snapshot.requiredFree = requiredFree;
+  result->snapshot.effectiveResumeWatermarkWr = effectiveResumeWatermarkWr;
+  result->snapshot.epoch = epoch;
+}
+
 SqController::SqController(int maxDepth, int resumeWatermark)
     : maxDepth_(std::max(0, maxDepth)),
       resumeWatermark_(maxDepth_ > 0 ? std::max(0, std::min(resumeWatermark, maxDepth_))
@@ -172,7 +186,7 @@ bool SqController::Reserve(int wrCount, ReserveOptions opts, ReserveResult* resu
     }
 
     std::unique_lock<std::mutex> lock(mu_);
-    const uint64_t observedEpoch = epoch_;
+    const uint64_t observedEpoch = epoch_.load(std::memory_order_relaxed);
     auto waitPred = [&]() -> bool {
       if (degraded_.load(std::memory_order_relaxed)) return true;
       int depth = depth_.load(std::memory_order_relaxed);
@@ -183,7 +197,7 @@ bool SqController::Reserve(int wrCount, ReserveOptions opts, ReserveResult* resu
         requiredFree = std::max(requiredFree, resumeWatermark_);
       }
       if (freeSlots >= requiredFree) return true;
-      return epoch_ != observedEpoch;
+      return epoch_.load(std::memory_order_relaxed) != observedEpoch;
     };
     if (!cv_.wait_until(lock, deadline, waitPred)) {
       SetReserveResult(result, SqReserveFailureKind::Timeout, Depth(), wrCount, maxDepth_, backoff);
@@ -221,6 +235,82 @@ void SqController::Release(int wrCount) {
   NotifyStateChangedLocked();
 }
 
+bool SqController::TryAcquireAdmission(int admissionWr, int requiredFree, AdmissionResult* result) {
+  const int requested = admissionWr;
+  if (admissionWr <= 0 || maxDepth_ <= 0) {
+    SetAdmissionResult(result, AdmissionFailureKind::None, Depth(), QueuedDepth(), requested,
+                       requiredFree, std::min(resumeWatermark_, maxDepth_), maxDepth_,
+                       epoch_.load(std::memory_order_relaxed));
+    return true;
+  }
+  if (admissionWr > maxDepth_) {
+    SetAdmissionResult(result, AdmissionFailureKind::ExceedsCapacity, Depth(), QueuedDepth(),
+                       requested, requiredFree, std::min(resumeWatermark_, maxDepth_), maxDepth_,
+                       epoch_.load(std::memory_order_relaxed));
+    return false;
+  }
+
+  int effectiveRequiredFree = requiredFree > 0 ? requiredFree : admissionWr;
+  if (effectiveRequiredFree > maxDepth_) effectiveRequiredFree = maxDepth_;
+  const int effectiveResumeWatermark = std::min(resumeWatermark_, maxDepth_);
+
+  while (true) {
+    if (IsDegraded()) {
+      SetAdmissionResult(result,
+                         IsTerminalDegraded() ? AdmissionFailureKind::TerminalDegraded
+                                              : AdmissionFailureKind::Degraded,
+                         Depth(), QueuedDepth(), requested, effectiveRequiredFree,
+                         effectiveResumeWatermark, maxDepth_,
+                         epoch_.load(std::memory_order_relaxed));
+      return false;
+    }
+
+    int depth = depth_.load(std::memory_order_relaxed);
+    if (depth < 0) depth = 0;
+    int queued = queuedDepth_.load(std::memory_order_relaxed);
+    if (queued < 0) queued = 0;
+    const int effectiveLoad = depth + queued;
+    const int freeSlots = std::max(0, maxDepth_ - effectiveLoad);
+    if (freeSlots < effectiveRequiredFree) {
+      SetAdmissionResult(result, AdmissionFailureKind::NoCapacity, depth, queued, requested,
+                         effectiveRequiredFree, effectiveResumeWatermark, maxDepth_,
+                         epoch_.load(std::memory_order_relaxed));
+      return false;
+    }
+
+    int expected = queued;
+    if (queuedDepth_.compare_exchange_weak(expected, queued + admissionWr,
+                                           std::memory_order_relaxed)) {
+      SetAdmissionResult(result, AdmissionFailureKind::None, depth, queued + admissionWr, requested,
+                         effectiveRequiredFree, effectiveResumeWatermark, maxDepth_,
+                         epoch_.load(std::memory_order_relaxed));
+      return true;
+    }
+  }
+}
+
+void SqController::ReleaseAdmission(int admissionWr) {
+  if (admissionWr <= 0) return;
+  int cur = queuedDepth_.load(std::memory_order_relaxed);
+  while (true) {
+    const int next = std::max(0, cur - admissionWr);
+    if (queuedDepth_.compare_exchange_weak(cur, next, std::memory_order_relaxed)) break;
+  }
+  std::lock_guard<std::mutex> lock(mu_);
+  NotifyStateChangedLocked();
+}
+
+bool SqController::WaitForAdmissionChange(std::chrono::steady_clock::time_point deadline,
+                                          uint64_t observedEpoch) {
+  std::unique_lock<std::mutex> lock(mu_);
+  auto pred = [&]() {
+    return degraded_.load(std::memory_order_relaxed) ||
+           epoch_.load(std::memory_order_relaxed) != observedEpoch;
+  };
+  if (pred()) return true;
+  return cv_.wait_until(lock, deadline, pred);
+}
+
 bool SqController::MarkDegraded(SqDegradeReason reason) {
   bool changed = false;
   {
@@ -252,6 +342,14 @@ std::unique_lock<std::shared_mutex> SqController::AcquireRecoveryGuard() {
 
 int SqController::Depth() const { return depth_.load(std::memory_order_relaxed); }
 
+int SqController::QueuedDepth() const { return queuedDepth_.load(std::memory_order_relaxed); }
+
+int SqController::EffectiveDepth() const {
+  return std::max(0, Depth()) + std::max(0, QueuedDepth());
+}
+
+int SqController::FreeAdmissionSlots() const { return std::max(0, maxDepth_ - EffectiveDepth()); }
+
 int SqController::MaxDepth() const { return maxDepth_; }
 
 bool SqController::IsDegraded() const { return degraded_.load(std::memory_order_relaxed); }
@@ -261,7 +359,7 @@ bool SqController::IsTerminalDegraded() const {
 }
 
 void SqController::NotifyStateChangedLocked() {
-  epoch_++;
+  epoch_.fetch_add(1, std::memory_order_relaxed);
   cv_.notify_all();
 }
 
@@ -284,23 +382,23 @@ void RecordSqBatchReleaseWr(const EpPair& ep, int wrCount) {
 }
 
 static int EpSqDepth(const EpPair& ep) {
-  if (ep.sq) return ep.sq->Depth();
-  return ep.sqDepth ? ep.sqDepth->load(std::memory_order_relaxed) : -1;
+  assert(ep.sq != nullptr);
+  return ep.sq->Depth();
 }
 
 static int EpMaxSqDepth(const EpPair& ep) {
-  if (ep.sq) return ep.sq->MaxDepth();
-  return ep.maxSqDepth;
+  assert(ep.sq != nullptr);
+  return ep.sq->MaxDepth();
 }
 
 static bool EpIsDegraded(const EpPair& ep) {
-  if (ep.sq) return ep.sq->IsDegraded();
-  return ep.degraded && ep.degraded->load(std::memory_order_relaxed);
+  assert(ep.sq != nullptr);
+  return ep.sq->IsDegraded();
 }
 
 static bool EpIsTerminalDegraded(const EpPair& ep) {
-  if (ep.sq) return ep.sq->IsTerminalDegraded();
-  return false;
+  assert(ep.sq != nullptr);
+  return ep.sq->IsTerminalDegraded();
 }
 
 static void SetSqReserveFailureKind(SqReserveFailureKind* out, SqReserveFailureKind kind) {
@@ -323,7 +421,7 @@ static std::string FormatDiagnosticTimeAge(int64_t nowUs, int64_t timestampUs) {
   return std::to_string(std::max<int64_t>(0, nowUs - timestampUs)) + "us_ago";
 }
 
-static std::string BuildSqCqeDiagnosticHint(const EpPair& ep) {
+std::string BuildSqCqeDiagnosticHint(const EpPair& ep) {
   if (!ep.sqCqeDiagnostics) return "SQ/CQE diagnostics unavailable.";
 
   const int64_t nowUs = SteadyClockNowUs();
@@ -481,158 +579,72 @@ static bool TryReserveSqDepth(const EpPair& ep, int wrCount, int epId, const cha
                               std::string* errMsg, SqReserveFailureKind* failureKind = nullptr) {
   if (wrCount <= 0) return true;
   const int kBackoffTimeoutUs = GetSqBackoffTimeoutUs();
-  if (ep.sq) {
-    ReserveOptions opts;
-    opts.timeoutUs = kBackoffTimeoutUs;
-    ReserveResult result;
-    if (ep.sq->Reserve(wrCount, opts, &result)) return true;
+  assert(ep.sq != nullptr);
+  ReserveOptions opts;
+  opts.timeoutUs = kBackoffTimeoutUs;
+  ReserveResult result;
+  if (ep.sq->Reserve(wrCount, opts, &result)) return true;
 
-    SetSqReserveFailureKind(failureKind, result.kind);
-    if (result.kind == SqReserveFailureKind::TerminalDegraded ||
-        result.kind == SqReserveFailureKind::Degraded) {
-      if (errMsg) {
-        *errMsg = EpIsTerminalDegraded(ep) ? "EP is terminal degraded, rejecting new submissions"
-                                           : "EP is degraded, rejecting new submissions";
-      }
-      return false;
+  SetSqReserveFailureKind(failureKind, result.kind);
+  if (result.kind == SqReserveFailureKind::TerminalDegraded ||
+      result.kind == SqReserveFailureKind::Degraded) {
+    if (errMsg) {
+      *errMsg = EpIsTerminalDegraded(ep) ? "EP is terminal degraded, rejecting new submissions"
+                                         : "EP is degraded, rejecting new submissions";
     }
-    if (result.kind == SqReserveFailureKind::ExceedsCapacity) {
-      MORI_IO_WARN("SQ request exceeds capacity ({}): ep={} requested={} max={}", opTag, epId,
-                   wrCount, result.maxDepth);
-      if (errMsg) {
-        *errMsg = "SQ request exceeds capacity (" + std::string(opTag) +
-                  "): ep=" + std::to_string(epId) + " requested=" + std::to_string(wrCount) +
-                  " max=" + std::to_string(result.maxDepth);
-      }
-      return false;
-    }
-    if (result.kind == SqReserveFailureKind::Timeout) {
-      MORI_IO_WARN(
-          "SQ full timeout ({}): ep={} depth={} requested={} max={} after {} us (backoff={})",
-          opTag, epId, result.depth, wrCount, result.maxDepth, kBackoffTimeoutUs,
-          result.backoffCount);
-      if (errMsg) {
-        *errMsg = "SQ full (" + std::string(opTag) + "): ep=" + std::to_string(epId) +
-                  " depth=" + std::to_string(result.depth) +
-                  " requested=" + std::to_string(wrCount) +
-                  " max=" + std::to_string(result.maxDepth);
-      }
-      return false;
-    }
-    if (errMsg) *errMsg = "SQ reserve failed";
     return false;
   }
-
-  if (!ep.sqDepth) return true;
-  if (EpIsDegraded(ep)) {
-    SetSqReserveFailureKind(failureKind, SqReserveFailureKind::Degraded);
-    if (errMsg) *errMsg = "EP is degraded, rejecting new submissions";
-    return false;
-  }
-  const int maxSqDepth = EpMaxSqDepth(ep);
-  if (wrCount > maxSqDepth) {
-    SetSqReserveFailureKind(failureKind, SqReserveFailureKind::ExceedsCapacity);
+  if (result.kind == SqReserveFailureKind::ExceedsCapacity) {
     MORI_IO_WARN("SQ request exceeds capacity ({}): ep={} requested={} max={}", opTag, epId,
-                 wrCount, maxSqDepth);
+                 wrCount, result.maxDepth);
     if (errMsg) {
       *errMsg = "SQ request exceeds capacity (" + std::string(opTag) +
                 "): ep=" + std::to_string(epId) + " requested=" + std::to_string(wrCount) +
-                " max=" + std::to_string(maxSqDepth);
+                " max=" + std::to_string(result.maxDepth);
     }
     return false;
   }
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::microseconds(kBackoffTimeoutUs);
-  int backoff = 0;
-  int cur = ep.sqDepth->load(std::memory_order_relaxed);
-  if (cur < 0) cur = 0;  // defensive: clamp stale negative depth
-  while (true) {
-    // Re-check degraded state while waiting to avoid accepting new submissions
-    // after another thread has marked this EP as degraded.
-    if (EpIsDegraded(ep)) {
-      SetSqReserveFailureKind(failureKind, SqReserveFailureKind::Degraded);
-      if (errMsg) *errMsg = "EP is degraded, rejecting new submissions";
-      return false;
+  if (result.kind == SqReserveFailureKind::Timeout) {
+    MORI_IO_WARN(
+        "SQ full timeout ({}): ep={} depth={} requested={} max={} after {} us (backoff={})", opTag,
+        epId, result.depth, wrCount, result.maxDepth, kBackoffTimeoutUs, result.backoffCount);
+    if (errMsg) {
+      *errMsg = "SQ full (" + std::string(opTag) + "): ep=" + std::to_string(epId) +
+                " depth=" + std::to_string(result.depth) + " requested=" + std::to_string(wrCount) +
+                " max=" + std::to_string(result.maxDepth);
     }
-    if (cur + wrCount > maxSqDepth) {
-      if (std::chrono::steady_clock::now() >= deadline) {
-        SetSqReserveFailureKind(failureKind, SqReserveFailureKind::Timeout);
-        MORI_IO_WARN(
-            "SQ full timeout ({}): ep={} depth={} requested={} max={} after {} us (backoff={})",
-            opTag, epId, cur, wrCount, maxSqDepth, kBackoffTimeoutUs, backoff);
-        if (errMsg) {
-          *errMsg = "SQ full (" + std::string(opTag) + "): ep=" + std::to_string(epId) +
-                    " depth=" + std::to_string(cur) + " requested=" + std::to_string(wrCount) +
-                    " max=" + std::to_string(maxSqDepth);
-        }
-        return false;
-      }
-      // Phased backoff: short polite yields, then tiny sleeps to reduce CPU burn.
-      if (backoff < 16) {
-        std::this_thread::yield();
-      } else {
-        std::this_thread::sleep_for(std::chrono::microseconds(2));
-      }
-      backoff++;
-      cur = ep.sqDepth->load(std::memory_order_relaxed);
-      continue;
-    }
-    if (ep.sqDepth->compare_exchange_weak(cur, cur + wrCount, std::memory_order_relaxed))
-      return true;
-    if (backoff < 16) {
-      std::this_thread::yield();
-    } else {
-      std::this_thread::sleep_for(std::chrono::microseconds(2));
-    }
-    backoff++;
+    return false;
   }
+  if (errMsg) *errMsg = "SQ reserve failed";
+  return false;
 }
 
 static void ReleaseSqDepth(const EpPair& ep, int wrCount) {
   if (wrCount <= 0) return;
-  if (ep.sq) {
-    ep.sq->Release(wrCount);
-    return;
-  }
-  if (!ep.sqDepth) return;
-  ep.sqDepth->fetch_sub(wrCount, std::memory_order_relaxed);
+  assert(ep.sq != nullptr);
+  ep.sq->Release(wrCount);
 }
 
 static bool RecheckSqBeforePost(const EpPair& ep, int reservedWrCount, int epId, const char* opTag,
                                 std::string* errMsg, SqReserveFailureKind* failureKind = nullptr) {
   if (reservedWrCount <= 0) return true;
-  if (ep.sq) {
-    ReserveResult result;
-    if (ep.sq->RecheckBeforePost(reservedWrCount, &result)) return true;
-    SetSqReserveFailureKind(failureKind, result.kind);
-    if (errMsg) {
-      *errMsg =
-          "EP is " +
-          std::string(result.kind == SqReserveFailureKind::TerminalDegraded ? "terminal degraded"
-                                                                            : "degraded") +
-          ", rejecting reserved " + std::string(opTag) +
-          " submission on ep=" + std::to_string(epId);
-    }
-    return false;
+  assert(ep.sq != nullptr);
+  ReserveResult result;
+  if (ep.sq->RecheckBeforePost(reservedWrCount, &result)) return true;
+  SetSqReserveFailureKind(failureKind, result.kind);
+  if (errMsg) {
+    *errMsg =
+        "EP is " +
+        std::string(result.kind == SqReserveFailureKind::TerminalDegraded ? "terminal degraded"
+                                                                          : "degraded") +
+        ", rejecting reserved " + std::string(opTag) + " submission on ep=" + std::to_string(epId);
   }
-  if (EpIsDegraded(ep)) {
-    ReleaseSqDepth(ep, reservedWrCount);
-    SetSqReserveFailureKind(failureKind, SqReserveFailureKind::Degraded);
-    if (errMsg) {
-      *errMsg = "EP is degraded, rejecting reserved " + std::string(opTag) +
-                " submission on ep=" + std::to_string(epId);
-    }
-    return false;
-  }
-  return true;
+  return false;
 }
 
 static void MarkEpDegradedFromSubmitFailure(const EpPair& ep, SqDegradeReason reason) {
-  if (ep.sq) {
-    ep.sq->MarkDegraded(reason);
-  } else if (ep.degraded) {
-    ep.degraded->store(true, std::memory_order_relaxed);
-  }
+  assert(ep.sq != nullptr);
+  ep.sq->MarkDegraded(reason);
 }
 
 static void FailUniqueSubmissionMetasFromSubmitFailure(const std::vector<SubmissionRecord>& records,
@@ -770,6 +782,69 @@ RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* status, Trans
   return {StatusCode::IN_PROGRESS, ""};
 }
 
+int EstimateMergedWrCount(const SizeVec& localOffsets, const SizeVec& remoteOffsets,
+                          const SizeVec& sizes, uint32_t maxSge) {
+  if ((localOffsets.size() != remoteOffsets.size()) || (sizes.size() != remoteOffsets.size())) {
+    return static_cast<int>(sizes.size());
+  }
+
+  const size_t batchSize = sizes.size();
+  if (batchSize == 0) return 0;
+
+  std::vector<size_t> indices(batchSize);
+  std::iota(indices.begin(), indices.end(), 0);
+  if (!std::is_sorted(remoteOffsets.begin(), remoteOffsets.end())) {
+    std::sort(indices.begin(), indices.end(),
+              [&](size_t a, size_t b) { return remoteOffsets[a] < remoteOffsets[b]; });
+  }
+
+  const uint32_t effectiveMaxSge = std::max(maxSge, 1u);
+  bool hasCurrent = false;
+  uint64_t currentRemoteAddr = 0;
+  uint64_t currentRemoteLength = 0;
+  uint64_t lastSgeLocalAddr = 0;
+  uint64_t lastSgeLength = 0;
+  uint32_t currentSgeCount = 0;
+  int wrCount = 0;
+
+  auto startNewWr = [&](uint64_t remoteAddr, uint64_t localAddr, uint64_t len) {
+    hasCurrent = true;
+    wrCount++;
+    currentRemoteAddr = remoteAddr;
+    currentRemoteLength = len;
+    lastSgeLocalAddr = localAddr;
+    lastSgeLength = len;
+    currentSgeCount = 1;
+  };
+
+  for (size_t i = 0; i < batchSize; ++i) {
+    const size_t idx = indices[i];
+    const uint64_t currentLocalAddr = static_cast<uint64_t>(localOffsets[idx]);
+    const uint64_t remoteAddr = static_cast<uint64_t>(remoteOffsets[idx]);
+    const uint64_t len = static_cast<uint64_t>(sizes[idx]);
+
+    bool merged = false;
+    if (hasCurrent && currentRemoteAddr + currentRemoteLength == remoteAddr) {
+      if (lastSgeLocalAddr + lastSgeLength == currentLocalAddr &&
+          lastSgeLength + len <= std::numeric_limits<uint32_t>::max()) {
+        lastSgeLength += len;
+        currentRemoteLength += len;
+        merged = true;
+      } else if (currentSgeCount < effectiveMaxSge && len <= std::numeric_limits<uint32_t>::max()) {
+        currentSgeCount++;
+        lastSgeLocalAddr = currentLocalAddr;
+        lastSgeLength = len;
+        currentRemoteLength += len;
+        merged = true;
+      }
+    }
+    if (!merged) {
+      startNewWr(remoteAddr, currentLocalAddr, len);
+    }
+  }
+  return wrCount;
+}
+
 RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemoryRegion& local,
                              const SizeVec& localOffsets,
                              const application::RdmaMemoryRegion& remote,
@@ -885,7 +960,7 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
   int minMaxSqDepth = std::numeric_limits<int>::max();
   for (size_t epId = 0; epId < epNum; ++epId) {
     const int maxSqDepth = EpMaxSqDepth(eps[epId]);
-    if ((eps[epId].sq || eps[epId].sqDepth) && maxSqDepth > 0) {
+    if (eps[epId].sq && maxSqDepth > 0) {
       minMaxSqDepth = std::min(minMaxSqDepth, maxSqDepth);
     }
   }
@@ -972,8 +1047,7 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemory
     bool signalIntervalReached =
         effectiveSignalIntervalWr > 0 && epWrsSinceSignal[epId] >= effectiveSignalIntervalWr;
     const int epMaxSqDepth = EpMaxSqDepth(eps[epId]);
-    bool sqNearFull = (eps[epId].sq || eps[epId].sqDepth) && epMaxSqDepth > 0 &&
-                      (epWrsSinceSignal[epId] >= epMaxSqDepth);
+    bool sqNearFull = eps[epId].sq && epMaxSqDepth > 0 && (epWrsSinceSignal[epId] >= epMaxSqDepth);
     bool needSignal = isLastBatchForEp || signalIntervalReached || sqNearFull;
 
     struct ibv_send_wr& last = mergedWrs[end - 1].wr;
