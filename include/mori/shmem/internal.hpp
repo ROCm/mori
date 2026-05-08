@@ -220,6 +220,20 @@ class ShmemStatesSingleton {
 
   static ShmemStates* GetInstance();
 
+#ifdef MORI_MULTITHREAD_SUPPORT
+  // SPMT: rank → HIP device id mapping, populated at ShmemInit.
+  //
+  // Needed by FFI/custom-call handlers (e.g. XLA) that run on framework worker
+  // threads where hipGetDevice() does not return the rank's device. The handler
+  // can look up the device for a given rank and hipSetDevice() to it before
+  // touching MORI state.
+  //
+  // Returns -1 if no rank-to-device mapping has been recorded yet (caller
+  // should fall back to hipGetDevice()-based lookup or fail loudly).
+  static void RegisterRankDevice(int rank, int deviceId);
+  static int GetDeviceByRank(int rank);
+#endif
+
  private:
 #ifdef MORI_MULTITHREAD_SUPPORT
   // One ShmemStates slot per GPU, indexed by hipGetDevice().

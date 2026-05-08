@@ -46,6 +46,14 @@ namespace shmem {
 /*                                      ShmemStatesSingleton                                     */
 /* ---------------------------------------------------------------------------------------------- */
 
+#ifdef MORI_MULTITHREAD_SUPPORT
+// rank → device id, populated by RegisterRankDevice at ShmemInit.
+// Used by FFI handlers (XLA / custom calls) where the calling thread's
+// hipGetDevice() does NOT match the rank's device.
+static std::mutex g_rank_to_device_mu;
+static std::unordered_map<int, int> g_rank_to_device;
+#endif
+
 ShmemStates* ShmemStatesSingleton::GetInstance() {
 #ifdef MORI_MULTITHREAD_SUPPORT
   // One instance per GPU, indexed by the calling thread's current HIP device.
@@ -70,6 +78,19 @@ ShmemStates* ShmemStatesSingleton::GetInstance() {
   return &states;
 #endif
 }
+
+#ifdef MORI_MULTITHREAD_SUPPORT
+void ShmemStatesSingleton::RegisterRankDevice(int rank, int deviceId) {
+  std::lock_guard<std::mutex> lk(g_rank_to_device_mu);
+  g_rank_to_device[rank] = deviceId;
+}
+
+int ShmemStatesSingleton::GetDeviceByRank(int rank) {
+  std::lock_guard<std::mutex> lk(g_rank_to_device_mu);
+  auto it = g_rank_to_device.find(rank);
+  return it == g_rank_to_device.end() ? -1 : it->second;
+}
+#endif
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                          Helper Functions                                     */
@@ -624,6 +645,18 @@ static void InitializeBootStates(ShmemStates* states, application::BootstrapNetw
 
   MORI_SHMEM_TRACE("Bootstrap initialized: rank={}, worldSize={}", states->bootStates->rank,
                    states->bootStates->worldSize);
+
+#ifdef MORI_MULTITHREAD_SUPPORT
+  // Record rank → device mapping so FFI / custom-call handlers (XLA, etc.)
+  // running on framework worker threads can route to the right ShmemStates.
+  // We capture the current device of the calling user thread (which already
+  // did hipSetDevice() before ShmemInit per the SPMT contract).
+  int dev = -1;
+  if (hipGetDevice(&dev) == hipSuccess && dev >= 0) {
+    ShmemStatesSingleton::RegisterRankDevice(states->bootStates->rank, dev);
+    MORI_SHMEM_TRACE("Registered rank {} -> device {}", states->bootStates->rank, dev);
+  }
+#endif
 }
 
 /* ---------------------------------------------------------------------------------------------- */

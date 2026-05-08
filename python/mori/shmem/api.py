@@ -19,6 +19,7 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+import ctypes
 import threading
 
 from mori import cpp as mori_cpp
@@ -35,6 +36,22 @@ _shmem_module_loaded_gpus: set = set()
 _shmem_hsaco: str = ""
 
 
+def _current_hip_device() -> int:
+    """Return the calling thread's current HIP device id.
+
+    Uses ctypes against libamdhip64 directly so that the JAX path (which has
+    no torch dependency) works the same as the PyTorch path.
+    """
+    from mori.jit.hip_driver import _get_hip_lib
+
+    hip = _get_hip_lib()
+    dev = ctypes.c_int(-1)
+    err = hip.hipGetDevice(ctypes.byref(dev))
+    if err != 0:
+        raise RuntimeError(f"hipGetDevice failed with error {err}")
+    return int(dev.value)
+
+
 def _ensure_shmem_module():
     """JIT-compile and load the shmem device module before ShmemInit.
 
@@ -42,9 +59,7 @@ def _ensure_shmem_module():
     call, enabling single-process multi-thread (SPMT) use where each thread
     owns a different GPU.
     """
-    import torch
-
-    device_id = torch.cuda.current_device()
+    device_id = _current_hip_device()
     if device_id in _shmem_module_loaded_gpus:
         return
     with _shmem_module_lock:
@@ -143,12 +158,14 @@ def shmem_finalize():
     Returns:
         Status code (0 for success)
     """
-    import torch
-
     ret = mori_cpp.shmem_finalize()
     # Clear this GPU's module-loaded flag so a subsequent shmem_init_attr
     # call (e.g. in the next test round) will reload the JIT module.
-    device_id = torch.cuda.current_device()
+    try:
+        device_id = _current_hip_device()
+    except Exception:
+        # If HIP context is gone (e.g. process teardown), skip cache cleanup.
+        return ret
     with _shmem_module_lock:
         _shmem_module_loaded_gpus.discard(device_id)
     return ret

@@ -26,10 +26,13 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <array>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <unordered_map>
 
+#include "mori/application/utils/check.hpp"
 #include "mori/ops/dispatch_combine/launch.hpp"
 #include "mori/ops/ops.hpp"
 #include "mori/shmem/internal.hpp"
@@ -53,7 +56,7 @@ using mori::moe::KernelType;
 /* ---------------------------------------------------------------------------------------------- */
 namespace {
 
-// Global cache: maps packed ep_config → shared handle.
+// Cache: maps packed ep_config → shared handle.
 // All call sites with identical ep_config reuse the same EpDispatchCombineHandle.
 struct VecI32Hash {
   size_t operator()(const std::vector<int32_t>& v) const noexcept {
@@ -66,10 +69,37 @@ struct VecI32Hash {
   }
 };
 
-static std::mutex g_handle_cache_mu;
-static std::unordered_map<std::vector<int32_t>, std::unique_ptr<EpDispatchCombineHandle>,
-                          VecI32Hash>
-    g_handle_cache;
+using HandleCacheMap =
+    std::unordered_map<std::vector<int32_t>, std::unique_ptr<EpDispatchCombineHandle>, VecI32Hash>;
+
+struct HandleCacheSlot {
+  std::mutex mu;
+  HandleCacheMap map;
+};
+
+#ifdef MORI_MULTITHREAD_SUPPORT
+// SPMT: per-GPU cache slot. Each thread is bound to its own device, so each
+// gets its own (mu, map). This avoids a deadlock that would occur if a single
+// process-global mutex were held while calling the cross-PE Barrier() below —
+// thread A would hold the mutex during Barrier(), thread B would block on the
+// mutex and never reach its own Barrier(). In multi-process mode every process
+// sees its single GPU as device 0, so this collapses to slot[0].
+static constexpr int kMaxGpusPerNode = 8;
+static std::array<HandleCacheSlot, kMaxGpusPerNode> g_handle_cache_slots;
+
+static HandleCacheSlot& GetHandleCacheSlot() {
+  (void)hipGetLastError();  // clear sticky error on this thread
+  int id = -1;
+  HIP_RUNTIME_CHECK(hipGetDevice(&id));
+  if (id < 0 || id >= kMaxGpusPerNode) {
+    throw std::runtime_error("EpHandleCache: hipGetDevice() out of range: " + std::to_string(id));
+  }
+  return g_handle_cache_slots[static_cast<size_t>(id)];
+}
+#else
+static HandleCacheSlot g_handle_cache_singleton;
+static HandleCacheSlot& GetHandleCacheSlot() { return g_handle_cache_singleton; }
+#endif
 
 struct EpDispatchCombineState {
   static TypeId id;
@@ -280,8 +310,22 @@ ErrorOr<std::unique_ptr<EpDispatchCombineState>> EpDispatchCombineInstantiate(
   // ep_config share a single EpDispatchCombineHandle.
   std::vector<int32_t> key(ep_config->begin(), ep_config->end());
 
-  std::lock_guard<std::mutex> lock(g_handle_cache_mu);
-  auto& entry = g_handle_cache[key];
+#ifdef MORI_MULTITHREAD_SUPPORT
+  // SPMT: XLA FFI handlers run on framework worker threads where
+  // hipGetDevice() does NOT match the rank's device. Look up the device
+  // recorded at ShmemInit time and bind it on this thread before any HIP
+  // call — this ensures GetHandleCacheSlot() and ShmemStatesSingleton::
+  // GetInstance() (both keyed by hipGetDevice()) hit the right slot.
+  auto cfg_for_dev = EpDispatchCombineConfig::FromPackedI32Array(key.data(), key.size());
+  int rank_dev = mori::shmem::ShmemStatesSingleton::GetDeviceByRank(cfg_for_dev.rank);
+  if (rank_dev >= 0) {
+    HIP_RUNTIME_CHECK(hipSetDevice(rank_dev));
+  }
+#endif
+
+  auto& slot = GetHandleCacheSlot();
+  std::lock_guard<std::mutex> lock(slot.mu);
+  auto& entry = slot.map[key];
   if (!entry) {
     auto* states = mori::shmem::ShmemStatesSingleton::GetInstance();
     states->CheckStatusValid();
@@ -305,6 +349,14 @@ Error EpDispatchCombineImpl(hipStream_t stream, EpDispatchCombineState* state, D
   auto& h = *state->handle;
   // XPUT("EpDispatchCombineImpl stream=%p rank=%d  attrs: %zu",
   //     stream, h.config.rank, attrs.size());
+#ifdef MORI_MULTITHREAD_SUPPORT
+  // SPMT: bind this thread to the rank's device before any HIP call.
+  // See EpDispatchCombineInstantiate for rationale.
+  int rank_dev = mori::shmem::ShmemStatesSingleton::GetDeviceByRank(h.config.rank);
+  if (rank_dev >= 0) {
+    HIP_RUNTIME_CHECK(hipSetDevice(rank_dev));
+  }
+#endif
   if (attrs.contains("dispatch_op")) {
     return MoriDispatchImpl(stream, &h, attrs, args, rets);
   }
@@ -362,8 +414,17 @@ void RegisterXLAFFIOps(py::module_& m) {
   });
   m.def("preload_kernels", []() { mori::moe::KernelRegistry::Instance().AutoLoad(); });
   m.def("clear_ep_handle_cache", []() {
-    std::lock_guard<std::mutex> lock(g_handle_cache_mu);
-    g_handle_cache.clear();
+#ifdef MORI_MULTITHREAD_SUPPORT
+    // Clear all per-GPU slots. Each slot has its own mutex.
+    for (auto& slot : g_handle_cache_slots) {
+      std::lock_guard<std::mutex> lock(slot.mu);
+      slot.map.clear();
+    }
+#else
+    auto& slot = GetHandleCacheSlot();
+    std::lock_guard<std::mutex> lock(slot.mu);
+    slot.map.clear();
+#endif
   });
 }
 
