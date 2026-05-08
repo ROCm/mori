@@ -27,6 +27,7 @@
 #include <chrono>
 #include <cstring>
 #include <msgpack.hpp>
+#include <sstream>
 #include <unordered_map>
 
 #include "mori/io/backend.hpp"
@@ -35,6 +36,7 @@
 #include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/peer/peer_dram_allocator.h"
 #include "umbp/distributed/peer/peer_service.h"
+#include "umbp/distributed/types.h"
 #include "umbp_peer.grpc.pb.h"
 
 namespace mori::umbp {
@@ -151,6 +153,21 @@ SlotPlan FromResolveKeyResponse(const ::umbp::ResolveKeyResponse& resp) {
   return p;
 }
 
+std::string TierCapacitySummary(const std::map<TierType, TierCapacity>& caps) {
+  std::ostringstream oss;
+  bool first = true;
+  for (const auto& entry : caps) {
+    if (!first) oss << ", ";
+    first = false;
+    const char* tier_name = TierTypeName(entry.first);
+    const uint64_t avail_mb = entry.second.available_bytes / (1024 * 1024);
+    const uint64_t total_mb = entry.second.total_bytes / (1024 * 1024);
+    oss << tier_name << "=" << avail_mb << "MB/" << total_mb << "MB";
+  }
+  if (first) oss << "none";
+  return oss.str();
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -232,8 +249,15 @@ bool PoolClient::Init() {
     peer_service_ =
         std::make_unique<PeerServiceServer>(peer_alloc_.get(), 8, 8, 10, engine_desc_bytes);
     if (!peer_service_->Start(config_.peer_service_port)) {
-      MORI_UMBP_ERROR("[PoolClient] PeerService failed to start on port {}",
-                      config_.peer_service_port);
+      MORI_UMBP_ERROR(
+          "[PoolClient] Init stage=PeerServiceStart failed (node_id='{}', node_address='{}', "
+          "peer_service_port={}, io_engine_host='{}', io_engine_port={})",
+          config_.master_config.node_id.empty() ? "<unset>" : config_.master_config.node_id,
+          config_.master_config.node_address.empty() ? "<unset>"
+                                                     : config_.master_config.node_address,
+          config_.peer_service_port,
+          config_.io_engine.host.empty() ? "<unset>" : config_.io_engine.host,
+          config_.io_engine.port);
       peer_service_.reset();
       initialized_ = false;
       return false;
@@ -254,7 +278,13 @@ bool PoolClient::Init() {
   auto status = master_client_->RegisterSelf(config_.tier_capacities, peer_address,
                                              engine_desc_bytes, ssd_store_capacities);
   if (!status.ok()) {
-    MORI_UMBP_ERROR("[PoolClient] RegisterSelf failed: {}", status.error_message());
+    MORI_UMBP_ERROR(
+        "[PoolClient] Init stage=RegisterSelf failed (node_id='{}', peer_address='{}', "
+        "tier_caps=[{}], status_code={}, status_message='{}')",
+        config_.master_config.node_id.empty() ? "<unset>" : config_.master_config.node_id,
+        peer_address.empty() ? "<unset>" : peer_address,
+        TierCapacitySummary(config_.tier_capacities), static_cast<int>(status.error_code()),
+        status.error_message());
     initialized_ = false;
     return false;
   }

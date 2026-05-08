@@ -2,102 +2,103 @@
 
 This guide documents how to run the single-node UMBP + SGLang correctness smoke test that ships with Mori. The flow mirrors the `umbp-single-node-launcher` skill and launches the [`run_umbp_single_node_hicache.sh`](../src/umbp/scripts/run_umbp_single_node_hicache.sh) helper script inside a ROCm container.
 
+Use the placeholders in this document to map the workflow to any target node. Every environment-dependent value is surfaced as an argument or environment variable; update those inputs and the script can run unchanged.
+
 ## Overview
 
 The script spins up the Docker image, rebuilds Mori with UMBP enabled, launches a single-node SGLang server backed by UMBP hierarchical cache, issues a probe completion, and collects logs under `~/umbp_single_node_results`. It is intended as a fast health check for DP+EP configurations.
 
 ## Prerequisites
 
-- Access to the target node (for example `banff-ccs-aus-p20-38.cs-aus.dcgpu`) and an active Conductor reservation.
-- Mori checkout at `/nfs/users/<user>/mori` and SGLang checkout at `/nfs/users/<user>/sglang`.
-- Real checkpoints at `/nfs/data/Deepseek-R1` (or adjust `MODEL_PATH` accordingly).
+- Access to the target node (for example `<node-name>`), including an active reservation if required by the cluster scheduler.
+- Mori and SGLang checkouts on the node.
+- Access to a checkpoint directory when running with real weights.
 - Docker privileges on the node.
 
-## Required Inputs
+## Configuration Inputs
 
-Before launching the script, collect:
+### Script constants
 
-| Input | Value / Default | Notes |
-| ----- | --------------- | ----- |
-| Dummy weights | `--real-weights` (default) | Pass `--use-dummy-weights` to skip checkpoint validation. |
-| Parallelism mode | `ENABLE_DP=true`, `DP_SIZE`, `EP_SIZE`, `TP_SIZE` | For DP+EP runs, export all three sizes (defaults are 8/8/8). Set `ENABLE_DP=false` for TP-only. |
-| Repository paths | `SGLANG_REPO`, `MORI_REPO` | Default to `/nfs/users/<user>/sglang` and `/nfs/users/<user>/mori`. |
-| Model path | `MODEL_PATH=/nfs/data/Deepseek-R1` | Required when using real weights. |
-| Branch overrides | Optional | The script uses whatever branch is already checked out unless `SGLANG_BRANCH` or `MORI_BRANCH` are provided. |
+The script declares a few host-specific defaults near the top. Update them before running if your environment differs.
+
+| Variable | Purpose | Typical override |
+| --- | --- | --- |
+| `USER_HOME` | Home directory mounted into the container. | Set to your `${HOME}` path on the node. |
+| `NFS_BASE` | Base path containing the repositories. | Point to the shared filesystem path that holds Mori and SGLang. |
+| `EXTRA_MOUNTS` | Additional `docker run` bind mounts. | Remove entries that do not exist or add the host paths you require. |
+| `DOCKER_IMAGE` | ROCm container tag. | Change if you need a different toolchain. |
+
+### Runtime environment variables
+
+Export the variables below to adapt the run to your environment. The script reads these values at launch time.
+
+| Variable | Default in script | When to change | Example |
+| --- | --- | --- | --- |
+| `MODEL_PATH` | `/apps/data/models/DeepSeek-V3-0324` | Real checkpoint location. | `/apps/data/models/DeepSeek-V3-0324` |
+| `SGLANG_REPO` | `${NFS_BASE}/sglang` | Local SGLang checkout. | `/apps/ditian12/sglang` |
+| `MORI_REPO` | `${NFS_BASE}/mori` | Local Mori checkout. | `/apps/ditian12/mori` |
+| `RESULTS_DIR` | `${USER_HOME}/umbp_single_node_results` | Where to store logs. | `/tmp/umbp_results` |
+| `ENABLE_DP` | `false` | Enable DP+EP mode. | `true` |
+| `DP_SIZE` | `8` | Data parallel group size. | `4` |
+| `EP_SIZE` | `8` | Expert parallel group size. | `2` |
+| `TP_SIZE` | `8` | Tensor parallel group size. | `8` |
+| `START_UMBP_MASTER` | `true` | Disable if you already manage the master. | `false` |
+| `UMBP_MASTER_ADDRESS` | `127.0.0.1:15558` | Master listener address. | `<host-ip>:15558` |
+| `UMBP_NODE_ADDRESS` | `127.0.0.1` | IP advertised to clients. | `<node-ip>` |
+| `UMBP_IO_ENGINE_PORT` | `16000` | Hicache IO engine port. | `16010` |
+| `UMBP_PEER_SERVICE_PORT` | `17000` | Peer service port. | `17010` |
+| `USE_DUMMY_WEIGHTS` | `false` | Skip checkpoint validation. | `true` |
+| `MEM_FRACTION_STATIC` | `0.7` | Fraction reserved for static allocations. | `0.6` |
+| `PROBE_MAX_TIME` | `300` | Timeout for probe request in seconds. | `600` |
+
+The script also respects `MORI_BRANCH`, `SGLANG_BRANCH`, and `MORI_PIP_FLAGS` if they are supplied.
 
 ## Launch Steps
 
-1. **SSH to the node** (example):
+1. **SSH to the target node**:
    ```bash
-   ssh -o StrictHostKeyChecking=no banff-ccs-aus-p20-38.cs-aus.dcgpu
+   ssh -o StrictHostKeyChecking=no <node-name>
    ```
 
-2. **Change into the script directory**:
+2. **Review script constants**:
    ```bash
-   cd /nfs/users/<user>/mori/src/umbp/scripts
+   sed -n '1,120p' run_umbp_single_node_hicache.sh
    ```
+   Update `USER_HOME`, `NFS_BASE`, `EXTRA_MOUNTS`, and `DOCKER_IMAGE` if the defaults do not match your environment.
 
-3. **Export environment variables** (adjust values as needed):
+3. **Export runtime variables** (fill placeholders with your values):
    ```bash
-   export ENABLE_DP=true
-   export DP_SIZE=8
-   export EP_SIZE=8
-   export TP_SIZE=8
+   export MODEL_PATH=<path-to-model-checkpoints>
+   export SGLANG_REPO=<path-to-sglang>
+   export MORI_REPO=<path-to-mori>
+   export RESULTS_DIR=<path-for-results>
+   export ENABLE_DP=<true|false>
+   export DP_SIZE=<dp-size>
+   export EP_SIZE=<ep-size>
+   export TP_SIZE=<tp-size>
    export START_UMBP_MASTER=true
-   export MODEL_PATH=/nfs/data/Deepseek-R1
-   export SGLANG_REPO=/nfs/users/<user>/sglang
-   export MORI_REPO=/nfs/users/<user>/mori
+   export UMBP_NODE_ADDRESS=$(hostname -I | awk '{print $1}')
    export USE_DUMMY_WEIGHTS=false
    ```
+   Add any other overrides from the table above as needed.
 
-4. **Run the script**:
+4. **Run the script** with the desired weight mode:
    ```bash
    bash run_umbp_single_node_hicache.sh --real-weights
+   # or
+   bash run_umbp_single_node_hicache.sh --use-dummy-weights
    ```
 
    The script will:
-   - Start or recycle the `umbp-single-node` container (`rocm/sgl-dev:v0.5.9-rocm700-mi30x-20260316`).
-   - Rebuild Mori with `BUILD_UMBP=ON`.
+   - Start or recycle the `umbp-single-node` container.
+   - Rebuild Mori with `BUILD_UMBP=ON` via `pip install`.
    - Compute network interface settings for NCCL/Gloo.
-   - Launch the SGLang server with the following command (formatted for readability):
-     ```
-     python -m sglang.launch_server \
-       --enable-cache-report \
-       --enable-metrics \
-       --model-path "${MODEL_PATH}" \
-       --tp-size "${TP_SIZE}" \
-       --dp-size "${DP_SIZE}" \
-       --ep-size "${EP_SIZE}" \
-       --moe-a2a-backend mori \
-       --deepep-mode normal \
-       --enable-dp-attention \
-       --enable-dp-lm-head \
-       --moe-dense-tp-size 1 \
-       --decode-log-interval 1 \
-       --trust-remote-code \
-       --watchdog-timeout 1000000 \
-       --chunked-prefill-size 65536 \
-       --attention-backend aiter \
-       --kv-cache-dtype fp8_e4m3 \
-       --max-total-tokens 1024 \
-       --mem-fraction-static "${MEM_FRACTION_STATIC:-0.7}" \
-       --enable-hierarchical-cache \
-       --hicache-write-policy write_through \
-       --hicache-mem-layout page_first \
-       --hicache-ratio 5.0
-     ```
+   - Launch the SGLang server with the configured parallelism values and hicache settings.
 
-5. **Probe and cleanup**:
+5. **Monitor the probe and cleanup**:
    - The script waits up to one hour for `http://127.0.0.1:30000/health` to report ready.
-   - It then issues a probe request:
-     ```
-     curl -sf --max-time "${PROBE_MAX_TIME:-300}" \
-       -X POST http://127.0.0.1:30000/v1/completions \
-       -H "Content-Type: application/json" \
-       -d '{"model":"deepseek-v3","prompt":"Say hello in one word.","max_tokens":8,"stream":false}' \
-       | tee ${RESULTS_DIR}/probe_response.json
-     ```
-   - On success, the script terminates the SGLang server and UMBP master, leaving artifacts in `~/umbp_single_node_results`.
+   - It issues a probe request and stores the output in `${RESULTS_DIR}/probe_response.json`.
+   - On success, the script terminates the SGLang server and UMBP master, leaving artifacts in `${RESULTS_DIR}`.
 
 ## Core Dumps
 
@@ -111,7 +112,7 @@ Make sure the directory exists and has enough space.
 ## Troubleshooting
 
 - **Container launch**: `docker ps` should show `umbp-single-node`. If it exits immediately, check `docker logs`.
-- **Server logs**: Available under `~/umbp_single_node_results/server_*.log`.
+- **Server logs**: Available under `${RESULTS_DIR}/server_*.log`.
 - **UMBP master logs**: Saved alongside server logs when `START_UMBP_MASTER=true`.
 - **Model validation**: The script validates that `MODEL_PATH` contains `model-*.safetensors` when running with real weights.
 - **Probe failures**: Inspect the tail of the server log; the script prints it automatically on errors.

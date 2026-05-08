@@ -8,13 +8,13 @@ set -euo pipefail
 # ==============================
 # === Shared configuration  ====
 # ==============================
-USER_HOME="/home/ditian12"
-NFS_BASE="/nfs/users/ditian12"
-DOCKER_IMAGE="rocm/sgl-dev:v0.5.9-rocm700-mi30x-20260316"
-EXTRA_MOUNTS="-v /home/thshan@amd.com:/home/thshan@amd.com -v /apps/data/models/:/models -v /apps:/apps -v /it-share:/it-share -v /usr/sbin/nicctl:/usr/sbin/nicctl"
+USER_HOME="${USER_HOME:-${HOME:-/home/ditian12}}"
+NFS_BASE="${NFS_BASE:-/apps/ditian12}"
+DOCKER_IMAGE="${DOCKER_IMAGE:-rocm/pytorch-private:sglang-0.5.9-rocm720-mi35x-mori-0313-2}"
+EXTRA_MOUNTS="${EXTRA_MOUNTS:--v /apps/data/models/:/models -v /nfsdata/DeepSeek-R1:/nfsdata/DeepSeek-R1 -v /apps:/apps -v /home/ditian12:/home/ditian12 -v /it-share:/it-share -v /usr/sbin/nicctl:/usr/sbin/nicctl}"
 CONTAINER="umbp-single-node"
-MODEL_PATH="${MODEL_PATH:-/nfs/data/Deepseek-R1}"
-RESULTS_DIR="${USER_HOME}/umbp_single_node_results"
+MODEL_PATH="${MODEL_PATH:-/apps/data/models/DeepSeek-V3-0324}"
+RESULTS_DIR="${RESULTS_DIR:-${USER_HOME}/umbp_single_node_results}"
 TP_SIZE="${TP_SIZE:-8}"
 DP_SIZE="${DP_SIZE:-8}"
 EP_SIZE="${EP_SIZE:-8}"
@@ -25,10 +25,21 @@ UMBP_NODE_ADDRESS="${UMBP_NODE_ADDRESS:-127.0.0.1}"
 UMBP_IO_ENGINE_PORT="${UMBP_IO_ENGINE_PORT:-16000}"
 UMBP_PEER_SERVICE_PORT="${UMBP_PEER_SERVICE_PORT:-17000}"
 USE_DUMMY_WEIGHTS="${USE_DUMMY_WEIGHTS:-false}"
+RUN_GSM8K="${RUN_GSM8K:-true}"
+GSM8K_NUM_QUESTIONS="${GSM8K_NUM_QUESTIONS:-200}"
+GSM8K_PARALLEL="${GSM8K_PARALLEL:-64}"
+GSM8K_MAX_NEW_TOKENS="${GSM8K_MAX_NEW_TOKENS:-512}"
+GSM8K_USE_PLATINUM="${GSM8K_USE_PLATINUM:-false}"
+GSM8K_BACKEND="${GSM8K_BACKEND:-srt}"
+GSM8K_EXTRA_ARGS="${GSM8K_EXTRA_ARGS:-}"
 
 SGLANG_REPO="${SGLANG_REPO:-${NFS_BASE}/sglang}"
 MORI_REPO="${MORI_REPO:-${NFS_BASE}/mori}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.7}"
+
+if [[ "${GSM8K_USE_PLATINUM}" == "true" ]]; then
+  GSM8K_EXTRA_ARGS="--platinum ${GSM8K_EXTRA_ARGS}"
+fi
 
 usage() {
   local exit_code="${1:-0}"
@@ -70,6 +81,7 @@ LOCAL_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 if [[ -z "$LOCAL_IP" ]]; then
   LOCAL_IP="127.0.0.1"
 fi
+PYBUILD_DIR="${MORI_PYBUILD_DIR:-build}"
 
 # ==============================
 # === Helper functions      ====
@@ -117,7 +129,7 @@ docker run -d --name "$CONTAINER" \
   --device /dev/dri --device /dev/kfd \
   --network host --ipc host --group-add video \
   --cap-add SYS_PTRACE --security-opt seccomp=unconfined --privileged \
-  -w "$NFS_BASE" \
+  -w "$MORI_REPO" \
   --env HUGGINGFACE_HUB_CACHE=/models --env MODELSCOPE_CACHE=/models \
   -v /nfs:/nfs \
   -v "$USER_HOME:$USER_HOME" \
@@ -135,8 +147,22 @@ else
   echo "[2/4] Launching SGLang server (real weights) inside container"
 fi
 
-docker exec "$CONTAINER" bash -c '
+docker exec -e MORI_PYBUILD_DIR="'"${PYBUILD_DIR}"'" "$CONTAINER" bash -c '
 set -euo pipefail
+
+if [[ -z "${MORI_PYBUILD_DIR:-}" ]]; then
+  export MORI_PYBUILD_DIR="build"
+else
+  export MORI_PYBUILD_DIR
+fi
+echo "[2/4] Using MORI_PYBUILD_DIR=${MORI_PYBUILD_DIR}"
+
+RUN_GSM8K="'"${RUN_GSM8K}"'"
+GSM8K_NUM_QUESTIONS="'"${GSM8K_NUM_QUESTIONS}"'"
+GSM8K_PARALLEL="'"${GSM8K_PARALLEL}"'"
+GSM8K_MAX_NEW_TOKENS="'"${GSM8K_MAX_NEW_TOKENS}"'"
+GSM8K_BACKEND="'"${GSM8K_BACKEND}"'"
+GSM8K_EXTRA_ARGS="'"${GSM8K_EXTRA_ARGS}"'"
 
 echo "[2/4] Rebuilding Mori inside container from '"${MORI_REPO}"' via pip install"
 cd '"${MORI_REPO}"'
@@ -210,8 +236,8 @@ mkdir -p ${RESULTS_DIR}
 
 if [[ '"${START_UMBP_MASTER}"' == "true" ]]; then
   MASTER_LOG=${RESULTS_DIR}/umbp_master_$(date +%Y%m%d_%H%M%S).log
-  if [[ -x '"${NFS_BASE}"'/mori/build_$(hostname)/src/umbp/umbp_master ]]; then
-    '"${NFS_BASE}"'/mori/build_$(hostname)/src/umbp/umbp_master ${UMBP_MASTER_ADDRESS} > "${MASTER_LOG}" 2>&1 &
+  if [[ -x '"${NFS_BASE}"'/mori/'"${PYBUILD_DIR}"'/src/umbp/umbp_master ]]; then
+    '"${NFS_BASE}"'/mori/'"${PYBUILD_DIR}"'/src/umbp/umbp_master ${UMBP_MASTER_ADDRESS} > "${MASTER_LOG}" 2>&1 &
     MASTER_PID=$!
     echo "Started UMBP master (PID: ${MASTER_PID}, log: ${MASTER_LOG})"
   else
@@ -242,6 +268,13 @@ python -m sglang.launch_server \
   --hicache-write-policy write_through \
   --hicache-mem-layout page_first \
   --hicache-ratio 5.0 \
+  --hicache-storage-backend umbp \
+  --hicache-storage-backend-extra-config '"'"'{
+    "dram_capacity_bytes": 1073741824,
+    "ssd_enabled": false,
+    "auto_promote_on_read": true,
+    "prefetch_threshold": 0
+  }'"'"' \
   ${LOAD_FORMAT_FLAG:+$LOAD_FORMAT_FLAG} \
   '"$(if [[ "${ENABLE_DP}" == "true" ]]; then printf -- '--dp-size %s --ep-size %s --moe-a2a-backend mori --deepep-mode normal --enable-dp-attention --enable-dp-lm-head --moe-dense-tp-size 1' "${DP_SIZE}" "${EP_SIZE}"; fi)"' \
   > "$SERVER_LOG" 2>&1 &
@@ -284,6 +317,36 @@ fi
 
 echo "Probe succeeded"
 
+if [[ "${RUN_GSM8K}" != "false" ]]; then
+  GSM8K_EXTRA_ARGS_STR="'"${GSM8K_EXTRA_ARGS}"'"
+  rm -f "${RESULTS_DIR}/gsm8k_results.jsonl" "${RESULTS_DIR}/gsm8k_raw.jsonl" "${RESULTS_DIR}/gsm8k_stdout.log"
+  for run_idx in 1 2; do
+    echo "[4/4] Running GSM8K benchmark run ${run_idx}/2 (questions=${GSM8K_NUM_QUESTIONS}, parallel=${GSM8K_PARALLEL}, max_new_tokens=${GSM8K_MAX_NEW_TOKENS})"
+    result_file="${RESULTS_DIR}/gsm8k_results_run${run_idx}.jsonl"
+    raw_result_file="${RESULTS_DIR}/gsm8k_raw_run${run_idx}.jsonl"
+    BENCH_CMD=(python3 /sgl-workspace/sglang/benchmark/gsm8k/bench_sglang.py
+      --backend "${GSM8K_BACKEND}"
+      --host 127.0.0.1
+      --port 30000
+      --num-questions "${GSM8K_NUM_QUESTIONS}"
+      --parallel "${GSM8K_PARALLEL}"
+      --max-new-tokens "${GSM8K_MAX_NEW_TOKENS}"
+      --result-file "${result_file}"
+      --raw-result-file "${raw_result_file}"
+    )
+    if [[ "${GSM8K_EXTRA_ARGS_STR}" =~ [^[:space:]] ]]; then
+      # shellcheck disable=SC2206
+      EXTRA_ARGS=(${GSM8K_EXTRA_ARGS_STR})
+      BENCH_CMD+=("${EXTRA_ARGS[@]}")
+    fi
+    "${BENCH_CMD[@]}" | tee -a "${RESULTS_DIR}/gsm8k_stdout.log"
+    if [[ ${run_idx} -eq 2 ]]; then
+      cp "${result_file}" "${RESULTS_DIR}/gsm8k_results.jsonl"
+      cp "${raw_result_file}" "${RESULTS_DIR}/gsm8k_raw.jsonl"
+    fi
+  done
+fi
+
 kill $SERVER_PID
 wait $SERVER_PID 2>/dev/null || true
 if [[ -n "${MASTER_PID:-}" ]]; then
@@ -292,13 +355,4 @@ if [[ -n "${MASTER_PID:-}" ]]; then
 fi
 '
 
-echo "[4/4] Completed single-node smoke test; artifacts saved under ${RESULTS_DIR}"
-
-
-  # --hicache-storage-backend umbp \
-  # --hicache-storage-backend-extra-config '"'"'{
-  #   "dram_capacity_bytes": 1073741824,
-  #   "ssd_enabled": false,
-  #   "auto_promote_on_read": true,
-  #   "prefetch_threshold": 0
-  # }'"'"' \
+echo "[5/5] Completed single-node smoke test; artifacts saved under ${RESULTS_DIR}"
