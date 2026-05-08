@@ -171,8 +171,13 @@ def _ep_thread_body(rank, world_size, unique_id, kernel_dir, results):
         del op
 
         # Per-thread cleanup so the next test (different world_size) can
-        # re-init this slot without conflict.
+        # re-init this slot without conflict. Note: do NOT call
+        # jax.clear_caches() here — it is process-global and racy across
+        # SPMT threads. cpp.clear_ep_handle_cache() + gc.collect() is
+        # enough to drop our buffer references before shmem_finalize.
+        import gc
         cpp.clear_ep_handle_cache()
+        gc.collect()
         shmem.shmem_finalize()
 
     except Exception:

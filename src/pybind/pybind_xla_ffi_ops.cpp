@@ -414,17 +414,14 @@ void RegisterXLAFFIOps(py::module_& m) {
   });
   m.def("preload_kernels", []() { mori::moe::KernelRegistry::Instance().AutoLoad(); });
   m.def("clear_ep_handle_cache", []() {
-#ifdef MORI_MULTITHREAD_SUPPORT
-    // Clear all per-GPU slots. Each slot has its own mutex.
-    for (auto& slot : g_handle_cache_slots) {
-      std::lock_guard<std::mutex> lock(slot.mu);
-      slot.map.clear();
-    }
-#else
+    // Clear only the calling thread's slot. Under SPMT, each thread is
+    // bound to its own GPU and owns one slot; clearing all slots from one
+    // thread would invoke ~EpDispatchCombineHandle on OTHER GPUs' handles
+    // while the calling thread's hipDevice is still set to its own GPU,
+    // and ShmemFree would then look up addresses in the wrong VA manager.
     auto& slot = GetHandleCacheSlot();
     std::lock_guard<std::mutex> lock(slot.mu);
     slot.map.clear();
-#endif
   });
 }
 
