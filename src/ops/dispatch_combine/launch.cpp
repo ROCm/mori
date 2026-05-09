@@ -510,24 +510,9 @@ void LaunchCombine(EpDispatchCombineHandle& handle, void* input, void* weights, 
         if (args.config.scaleDim <= 0) {
           throw std::runtime_error("Fp8BlockwiseQuant requires scaleDim > 0");
         }
-        // Specialized noweight + AccumNum=8 + VecBytes=8 path. Each registered kernel symbol
-        // is a separate compile-time instantiation parameterised on `Vec8Top8BlockElems` —
-        // see EpCombineIntraNodeKernel_body in intranode.hpp.
-        //
-        // Selection prerequisites (must all hold):
-        //   - no weights (UseWeights=false eliminates srcWeightsPtr array, frees registers);
-        //   - block_elems = ceil(hiddenDim / scaleDim) is a power of two AND a registered
-        //     specialization value (currently 128 or 256);
-        //   - hiddenDim % 512 == 0 (warpSize * VecBytes = 64 * 8 = 512, ensures the vec8
-        //     no-scale path's outer iter divides hiddenDim cleanly without a scalar tail);
-        //   - num_experts_per_token == 8 (matches AccumNum=8 hardcoded in the helpers);
-        //   - world_size > 4 (avoids the EP4 validAccumCount compaction path; the helpers
-        //     unconditionally read srcs[0..7], which compaction would leave stale).
-        // Examples that match block_elems=128: (hidden=7168, sd=56), (4096, 32), (8192, 64).
-        // Examples that match block_elems=256: (hidden=7168, sd=28), (4096, 16), (8192, 32).
-        // The intranode.hpp dispatch site additionally guards the segment helper at runtime
-        // with an 8-byte alignment check, so non-aligned MultiWarpIter segments fall back to
-        // an inline scalar path automatically.
+        // Pick the AccumNum=8 + VecBytes=8 specialization when (no weights, hidden_dim % 512 == 0,
+        // top-k == 8, EP > 4) and block_elems matches a registered symbol. Keep in sync with the
+        // Python launch path in dispatch_combine.py.
         const int block_elems =
             (args.config.scaleDim > 0)
                 ? ((args.config.hiddenDim + args.config.scaleDim - 1) / args.config.scaleDim)

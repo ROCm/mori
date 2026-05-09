@@ -800,16 +800,8 @@ class EpDispatchCombineOp:
             )
         elif kt == EpDispatchCombineKernelType.IntraNode.value:
             if quant_type == EpDispatchCombineQuantType.Fp8BlockwiseQuant:
-                # Specialized noweight + AccumNum=8 + VecBytes=8 path. Each block_elems value
-                # (128, 256, ...) corresponds to a separately-instantiated kernel symbol; see
-                # LaunchCombine() in src/ops/dispatch_combine/launch.cpp for the C++ mirror
-                # and EpCombineIntraNodeKernel_body's `int Vec8Top8BlockElems` template
-                # parameter in src/ops/dispatch_combine/intranode.hpp. Keep the gating
-                # conditions in sync between this Python path and the C++ launch path.
-                # Production-equivalent shapes:
-                #   block_elems=128: (hidden_dim, scale_dim) in {(7168,56),(4096,32),(8192,64)}
-                #   block_elems=256: (hidden_dim, scale_dim) in {(7168,28),(4096,16),(8192,32)}
-                # Non-aligned MultiWarpIter segments fall back at the kernel dispatch site.
+                # Mirror of the AccumNum=8 + VecBytes=8 specialization gating in
+                # LaunchCombine() / launch.cpp. Keep in sync.
                 if self.config.scale_dim > 0:
                     block_elems = (
                         hidden_dim + self.config.scale_dim - 1

@@ -135,17 +135,11 @@ def test_dispatch_combine(
         pytest.skip("fp8_direct_cast is not supported in zero-copy mode")
     if quant_type == "fp8_direct_cast" and data_type is not torch.bfloat16:
         pytest.skip("fp8_direct_cast is only supported for bfloat16 data type")
-    # fp8_blockwise: bf16 input only, requires use_external_inp_buf=True (zero-copy=0),
-    # and requires scale_dim > 0. Test still runs through the legacy
-    # `_fp8bwq` kernel path because EpDispatchCombineTestCase always passes weights;
-    # the noweight_vec8 specialization is exercised by bench_dispatch_combine.py instead.
     if quant_type == "fp8_blockwise":
         if data_type is not torch.bfloat16:
             pytest.skip("fp8_blockwise only supports bfloat16 input")
         if not use_external_inp_buf:
-            pytest.skip(
-                "fp8_blockwise requires --zero-copy 0 (use_external_inp_buf=True)"
-            )
+            pytest.skip("fp8_blockwise requires use_external_inp_buf=True")
         if scale_dim <= 0:
             pytest.skip("fp8_blockwise requires scale_dim > 0")
 

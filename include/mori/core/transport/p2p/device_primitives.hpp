@@ -1774,10 +1774,6 @@ __device__ __forceinline__ void WarpAccumFp8DequantFullImpl(
   }
 }
 
-// Specialized FP8 blockwise dequant for the production path: AccumNum=8, VecBytes=8 (kSegs=2),
-// fixed BlockElems known at compile time. Caller (intranode.hpp) selects this based on the
-// (hidden_dim, scale_dim) pair giving block_elems == BlockElems. BlockElems must be a positive
-// power of two so the inner per-vector `globalIdx >> log2(BlockElems)` shift compiles cleanly.
 template <typename OutT, typename Fp8T, int BlockElems>
 __device__ __forceinline__ void WarpAccumFp8DequantFullBlockVec8Top8(
     OutT* __restrict__ dstToken, const Fp8T* const* __restrict__ srcs,
@@ -2019,10 +2015,7 @@ __device__ __forceinline__ void WarpAccumFp8DequantSegmentImpl(
   }
 }
 
-// Segment companion to WarpAccumFp8DequantFullBlockVec8Top8. Caller must ensure both
-// hiddenDimOffset and hiddenDimSize are 8-byte aligned (vec8 fp8 src loads + vec4 bf16 dst
-// stores); the intranode kernel dispatches misaligned segments to
-// WarpAccumFp8DequantSegmentScalarTop8 below.
+// Caller must ensure hiddenDimOffset and hiddenDimSize are 8-byte aligned.
 template <typename OutT, typename Fp8T, int BlockElems>
 __device__ __forceinline__ void WarpAccumFp8DequantSegmentBlockVec8Top8(
     OutT* __restrict__ dstToken, const Fp8T* const* __restrict__ srcs,
@@ -2059,15 +2052,9 @@ __device__ __forceinline__ void WarpAccumFp8DequantSegmentBlockVec8Top8(
       /*blockElems=*/BlockElems);
 }
 
-// Scalar segment fallback for AccumNum=8 blockwise dequant. Used by the intranode kernel
-// when MultiWarpIter produces a non-8-byte-aligned segment offset/size (e.g. warpsPerItem=3
-// with hidden_dim=7168 yields dimPerWarp=2390 which is not %8), which would violate the
-// vec8 specialized helper's alignment precondition.
-//
-// Kept deliberately tiny: pulling in the generic WarpAccumFp8DequantSegmentImpl<...,8> here
-// would re-instantiate its vec16/vec8/vec4 dispatch tree and inflate num_vgpr in the
-// caller's kernel from 79 back to 128. Scalar throughput is irrelevant — this branch is
-// dead code at runtime for production launch configs (warpsPerItem == 1).
+// Scalar fallback for the rare misaligned-segment case in the AccumNum=8 vec8 path. Kept tiny
+// on purpose: delegating to WarpAccumFp8DequantSegmentImpl<...,8> would drag the generic
+// vec16/vec8/vec4 dispatch tree into the caller and push num_vgpr from 79 back to 128.
 template <typename OutT, typename Fp8T, int BlockElems>
 __device__ __forceinline__ void WarpAccumFp8DequantSegmentScalarTop8(
     OutT* __restrict__ dstToken, const Fp8T* const* __restrict__ srcs,
