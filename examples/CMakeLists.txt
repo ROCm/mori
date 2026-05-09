@@ -125,13 +125,6 @@ target_link_libraries(intra_node_benchmark mori_collective MPI::MPI_CXX
 target_include_directories(intra_node_benchmark
                            PRIVATE ${CMAKE_SOURCE_DIR}/include)
 
-# Multi-thread multi-GPU exploration (requires MORI_MULTITHREAD_SUPPORT)
-if(MORI_MULTITHREAD_SUPPORT)
-  add_shmem_example(multithread_multi_gpu SOURCES shmem/multithread_multi_gpu.cpp)
-  target_compile_definitions(multithread_multi_gpu PRIVATE MORI_MULTITHREAD_SUPPORT)
-  target_link_libraries(multithread_multi_gpu stdc++fs)
-endif()
-
 # --- Application examples ---
 add_executable(context application/context.cpp)
 target_link_libraries(context mori_application hip::host hip::device)
