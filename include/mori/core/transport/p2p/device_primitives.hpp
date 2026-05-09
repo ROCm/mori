@@ -798,15 +798,6 @@ __device__ __forceinline__ float WarpReduceMaxF32(float val) {
   return val;
 }
 
-__device__ __forceinline__ uint32_t WarpReduceMaxU32(uint32_t val) {
-  for (int delta = (warpSize >> 1); delta > 0; delta >>= 1) {
-    const int other = __shfl_down(static_cast<int>(val), delta);
-    const int cur = static_cast<int>(val);
-    val = static_cast<uint32_t>((cur > other) ? cur : other);
-  }
-  return val;
-}
-
 template <int Width>
 __device__ __forceinline__ uint32_t SubwarpReduceMaxU32(uint32_t val) {
   for (int delta = (Width >> 1); delta > 0; delta >>= 1) {
@@ -1219,38 +1210,6 @@ __device__ __forceinline__ void WarpQuantizeBf16ToFp8BlockwiseVec(
   if (laneId == 0 && anyScaled) dstScales[0] = -dstScales[0];
 }
 
-template <int InVecBytes, typename Fp8T>
-__device__ __forceinline__ int WarpQuantizeBf16ToFp8NoScaleVec(
-    Fp8T* __restrict__ dstToken, float* __restrict__ dstScales,
-    const hip_bfloat16* __restrict__ srcToken, int hiddenDim) {
-  constexpr int kVecElems = Bf16Vec<InVecBytes>::kElems;
-  constexpr int kStrideElems = warpSize * kVecElems;
-  const int laneId = threadIdx.x & (warpSize - 1);
-
-  auto* dstBytes = reinterpret_cast<__hip_fp8_storage_t*>(dstToken);
-  const uint16_t fp8MaxBits = hip_bfloat16(kCombineInternalFp8MaxFinite).data;
-
-  bool needScale = false;
-
-  const int vecEnd = (hiddenDim / kStrideElems) * kStrideElems;
-  for (int idx = laneId * kVecElems; idx < vecEnd; idx += kStrideElems) {
-    const auto packed = load<InVecBytes>(srcToken + idx);
-    const uint32_t vecMaxBits = Bf16Vec<InVecBytes>::MaxAbsBits(packed);
-    needScale |= (static_cast<uint16_t>(vecMaxBits) > fp8MaxBits);
-    Bf16Vec<InVecBytes>::template QuantizeStore<Fp8T>(dstBytes, idx, packed, 1.0f);
-  }
-
-  for (int idx = vecEnd + laneId; idx < hiddenDim; idx += warpSize) {
-    const uint16_t bits = srcToken[idx].data;
-    needScale |= (Bf16AbsBits(bits) > fp8MaxBits);
-    dstToken[idx] = Fp8T(Bf16BitsToF32(bits));
-  }
-
-  const int anyNeedScale = __any(static_cast<int>(needScale));
-  if (laneId == 0 && !anyNeedScale) dstScales[0] = 1.0f;
-  return anyNeedScale;
-}
-
 }  // namespace detail
 
 template <typename Fp8T, typename InT>
@@ -1276,22 +1235,6 @@ __device__ __forceinline__ void WarpQuantizeToFp8Blockwise(Fp8T* __restrict__ ds
     const bool dstAligned8 = ((dstPtr & 0x7) == 0);
     const bool srcAligned4 = ((srcPtr & 0x3) == 0);
     const bool dstAligned4 = ((dstPtr & 0x3) == 0);
-
-    // if (scaleDim > 1) {
-    //   if (srcAligned8 && dstAligned8) {
-    //     const int needScale = detail::WarpQuantizeBf16ToFp8NoScaleVec<16, Fp8T>(
-    //         dstToken, dstScales, reinterpret_cast<const hip_bfloat16*>(srcToken), hiddenDim);
-    //     if (!needScale) return;
-    //   } else if (srcAligned8 && dstAligned4) {
-    //     const int needScale = detail::WarpQuantizeBf16ToFp8NoScaleVec<8, Fp8T>(
-    //         dstToken, dstScales, reinterpret_cast<const hip_bfloat16*>(srcToken), hiddenDim);
-    //     if (!needScale) return;
-    //   } else if (srcAligned4 && ((dstPtr & 0x1) == 0)) {
-    //     const int needScale = detail::WarpQuantizeBf16ToFp8NoScaleVec<4, Fp8T>(
-    //         dstToken, dstScales, reinterpret_cast<const hip_bfloat16*>(srcToken), hiddenDim);
-    //     if (!needScale) return;
-    //   }
-    // }
 
     if ((warpSize == 64) && (scaleDim > 1)) {
       if (blockAligned8 && srcAligned8 && dstAligned8) {
@@ -1530,45 +1473,6 @@ __device__ __forceinline__ void WarpAccumFp8DequantVecRange(OutT* __restrict__ d
       acc += v;
     }
     dstToken[j] = OutT(acc);
-  }
-}
-
-template <int SubwarpSize, int VecBytes, typename OutT, typename Fp8T, int AccumNum>
-__device__ __forceinline__ void WarpAccumFp8DequantBlockwiseVec(
-    OutT* __restrict__ dstToken, const Fp8T* const* __restrict__ srcs,
-    const float* const* __restrict__ srcScales, int sbStart, int sbCount, int blockElems,
-    int hiddenDim, int offset) {
-  static_assert((SubwarpSize & (SubwarpSize - 1)) == 0, "SubwarpSize must be a power of two");
-
-  const int laneId = threadIdx.x & (warpSize - 1);
-  const int subLaneId = laneId & (SubwarpSize - 1);
-  const int subWarpId = laneId / SubwarpSize;
-  constexpr int kSubwarpsPerWarp = warpSize / SubwarpSize;
-
-  for (int sbBase = 0; sbBase < sbCount; sbBase += kSubwarpsPerWarp) {
-    const int sb = sbStart + sbBase + subWarpId;
-    if (sb >= (sbStart + sbCount)) continue;
-
-    const int globalStart = sb * blockElems;
-    const int globalEnd = std::min(globalStart + blockElems, hiddenDim);
-    const int localStart = globalStart - offset;
-    const int localEnd = localStart + (globalEnd - globalStart);
-
-    float sbScales[AccumNum];
-#pragma unroll AccumNum
-    for (int i = 0; i < AccumNum; ++i) {
-      float s = 1.0f;
-      if (subLaneId == 0) {
-        if (srcs[i] != nullptr && srcScales != nullptr && srcScales[i] != nullptr) {
-          s = srcScales[i][sb];
-          if (sb == 0 && s < 0.0f) s = -s;
-        }
-      }
-      sbScales[i] = __shfl(s, 0, SubwarpSize);
-    }
-
-    WarpAccumFp8DequantVecRange<SubwarpSize, VecBytes, OutT, Fp8T, AccumNum, true>(
-        dstToken, srcs, sbScales, localStart, localEnd, subLaneId);
   }
 }
 
@@ -1870,10 +1774,16 @@ __device__ __forceinline__ void WarpAccumFp8DequantFullImpl(
   }
 }
 
-template <typename OutT, typename Fp8T>
-__device__ __forceinline__ void WarpAccumFp8DequantFullBlock128Vec8Top8(
+// Specialized FP8 blockwise dequant for the production path: AccumNum=8, VecBytes=8 (kSegs=2),
+// fixed BlockElems known at compile time. Caller (intranode.hpp) selects this based on the
+// (hidden_dim, scale_dim) pair giving block_elems == BlockElems. BlockElems must be a positive
+// power of two so the inner per-vector `globalIdx >> log2(BlockElems)` shift compiles cleanly.
+template <typename OutT, typename Fp8T, int BlockElems>
+__device__ __forceinline__ void WarpAccumFp8DequantFullBlockVec8Top8(
     OutT* __restrict__ dstToken, const Fp8T* const* __restrict__ srcs,
     const float* const* __restrict__ srcScales, int hiddenDim) {
+  static_assert(BlockElems > 0 && (BlockElems & (BlockElems - 1)) == 0,
+                "BlockElems must be a positive power of two");
   constexpr int AccumNum = 8;
 
   const int laneId = threadIdx.x & (warpSize - 1);
@@ -1899,7 +1809,7 @@ __device__ __forceinline__ void WarpAccumFp8DequantFullBlock128Vec8Top8(
 
   detail::WarpAccumFp8DequantVecRangeBlockwiseScaleWave<8, OutT, Fp8T, AccumNum>(
       dstToken, cachedSrcs, srcScales, /*hiddenDimOffset=*/0, /*start=*/0, /*end=*/hiddenDim,
-      /*blockElems=*/128);
+      /*blockElems=*/BlockElems);
 }
 
 template <typename OutT, typename Fp8T>
@@ -2109,10 +2019,16 @@ __device__ __forceinline__ void WarpAccumFp8DequantSegmentImpl(
   }
 }
 
-template <typename OutT, typename Fp8T>
-__device__ __forceinline__ void WarpAccumFp8DequantSegmentBlock128Vec8Top8(
+// Segment companion to WarpAccumFp8DequantFullBlockVec8Top8. Caller must ensure both
+// hiddenDimOffset and hiddenDimSize are 8-byte aligned (vec8 fp8 src loads + vec4 bf16 dst
+// stores); the intranode kernel dispatches misaligned segments to
+// WarpAccumFp8DequantSegmentScalarTop8 below.
+template <typename OutT, typename Fp8T, int BlockElems>
+__device__ __forceinline__ void WarpAccumFp8DequantSegmentBlockVec8Top8(
     OutT* __restrict__ dstToken, const Fp8T* const* __restrict__ srcs,
     const float* const* __restrict__ srcScales, int hiddenDimOffset, int hiddenDimSize) {
+  static_assert(BlockElems > 0 && (BlockElems & (BlockElems - 1)) == 0,
+                "BlockElems must be a positive power of two");
   constexpr int AccumNum = 8;
 
   const int laneId = threadIdx.x & (warpSize - 1);
@@ -2140,7 +2056,47 @@ __device__ __forceinline__ void WarpAccumFp8DequantSegmentBlock128Vec8Top8(
 
   detail::WarpAccumFp8DequantVecRangeBlockwiseScaleWave<8, OutT, Fp8T, AccumNum>(
       dstToken, cachedSrcs, srcScales, hiddenDimOffset, /*start=*/0, /*end=*/hiddenDimSize,
-      /*blockElems=*/128);
+      /*blockElems=*/BlockElems);
+}
+
+// Scalar segment fallback for AccumNum=8 blockwise dequant. Used by the intranode kernel
+// when MultiWarpIter produces a non-8-byte-aligned segment offset/size (e.g. warpsPerItem=3
+// with hidden_dim=7168 yields dimPerWarp=2390 which is not %8), which would violate the
+// vec8 specialized helper's alignment precondition.
+//
+// Kept deliberately tiny: pulling in the generic WarpAccumFp8DequantSegmentImpl<...,8> here
+// would re-instantiate its vec16/vec8/vec4 dispatch tree and inflate num_vgpr in the
+// caller's kernel from 79 back to 128. Scalar throughput is irrelevant — this branch is
+// dead code at runtime for production launch configs (warpsPerItem == 1).
+template <typename OutT, typename Fp8T, int BlockElems>
+__device__ __forceinline__ void WarpAccumFp8DequantSegmentScalarTop8(
+    OutT* __restrict__ dstToken, const Fp8T* const* __restrict__ srcs,
+    const float* const* __restrict__ srcScales, int hiddenDimOffset, int hiddenDimSize) {
+  static_assert(BlockElems > 0 && (BlockElems & (BlockElems - 1)) == 0,
+                "BlockElems must be a positive power of two");
+  constexpr int AccumNum = 8;
+  constexpr int kBlockShift = __builtin_ctz(BlockElems);
+
+  const int laneId = threadIdx.x & (warpSize - 1);
+  for (int j = laneId; j < hiddenDimSize; j += warpSize) {
+    const int globalIdx = hiddenDimOffset + j;
+    const int sb = globalIdx >> kBlockShift;
+    float acc = 0.0f;
+#pragma unroll
+    for (int i = 0; i < AccumNum; ++i) {
+      const Fp8T* src = srcs[i];
+      if (src == nullptr) continue;
+      float v = static_cast<float>(src[j]);
+      const float* scalePtr = srcScales[i];
+      if (scalePtr != nullptr) {
+        float s = scalePtr[sb];
+        if (sb == 0 && s < 0.0f) s = -s;
+        v *= s;
+      }
+      acc += v;
+    }
+    dstToken[j] = OutT(acc);
+  }
 }
 
 template <typename OutT, typename Fp8T>

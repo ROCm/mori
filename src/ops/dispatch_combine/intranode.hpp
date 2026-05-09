@@ -224,9 +224,15 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                    EpCombineIntraNodeKernel                                    */
 /* ---------------------------------------------------------------------------------------------- */
+// Vec8Top8BlockElems selects the AccumNum=8 + VecBytes=8 specialized dequant path.
+//   - 0   : disabled, use the generic WarpAccumFp8DequantFull/Segment switch dispatcher
+//   - 128 : production sd=56 path (hidden_dim=7168 / 4096 / 8192 with block_elems=128)
+//   - 256 : sd=28 path (hidden_dim=7168 / 4096 / 8192 with block_elems=256)
+// Other power-of-two values are accepted by the helper templates but require host-side
+// gating + a registered kernel symbol in ep_intranode.hip.
 template <typename T, bool UseP2PRead = true, bool EnableStdMoE = false,
           bool UseFp8DirectCast = false, bool UseFp8BlockwiseQuant = false, bool UseWeights = true,
-          bool UseBlock128Vec8Top8 = false>
+          int Vec8Top8BlockElems = 0>
 __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   using TokT =
       std::conditional_t<UseFp8DirectCast || UseFp8BlockwiseQuant, core::CombineInternalFp8, T>;
@@ -234,6 +240,11 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
                 "Fp8 direct cast and blockwise quant are mutually exclusive");
   static_assert((!UseFp8DirectCast && !UseFp8BlockwiseQuant) || std::is_same_v<T, hip_bfloat16>,
                 "Fp8 combine quant currently only supports bf16 input");
+  static_assert(Vec8Top8BlockElems == 0 || (Vec8Top8BlockElems > 0 &&
+                                            (Vec8Top8BlockElems & (Vec8Top8BlockElems - 1)) == 0),
+                "Vec8Top8BlockElems must be 0 (disabled) or a positive power of two");
+  static_assert(Vec8Top8BlockElems == 0 || UseFp8BlockwiseQuant,
+                "Vec8Top8BlockElems is only valid when UseFp8BlockwiseQuant=true");
   const EpDispatchCombineConfig& config = args.config;
   int thdId = threadIdx.x;
   int thdNum = blockDim.x;
@@ -380,6 +391,12 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
 
   MORI_TRACE_NEXT(seq, Slot::CombineAccumSetup);
   extern __shared__ char sharedMem[];
+  // Shared memory layout, in pointer-sized stride of (warpNum * numExpertPerToken):
+  //   [0]                            -> srcPtrs
+  //   [1] (only if UseWeights)       -> srcWeightsPtr
+  //   [1 or 2] (UseFp8BlockwiseQuant)-> srcScalePtrs (offset = UseWeights ? 2 : 1)
+  // The host-side combine_shared_mem(...) helper computes the total byte size from the same
+  // (UseWeights, UseFp8BlockwiseQuant) flags; both sides must stay in sync.
   TokT** srcPtrs = reinterpret_cast<TokT**>(sharedMem) + warpId * config.numExpertPerToken;
   float** srcWeightsPtr = nullptr;
   if constexpr (UseWeights) {
@@ -481,13 +498,28 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
 
     if constexpr (UseFp8BlockwiseQuant) {
       MORI_TRACE_NEXT(seq, Slot::CombineDequantAccum);
-      if constexpr (UseBlock128Vec8Top8) {
+      if constexpr (Vec8Top8BlockElems != 0) {
         if (mwIter.warpsPerItem == 1) {
-          core::WarpAccumFp8DequantFullBlock128Vec8Top8<T, core::CombineInternalFp8>(
+          core::WarpAccumFp8DequantFullBlockVec8Top8<T, core::CombineInternalFp8,
+                                                     Vec8Top8BlockElems>(
               outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
               reinterpret_cast<const float* const*>(srcScalePtrs), hiddenDim);
+        } else if ((hiddenDimOffset & 0x7) == 0 && (hiddenDimSize & 0x7) == 0) {
+          // The vec8 specialized segment helper requires both segment offset and size to be
+          // 8-byte aligned (vec8 fp8 source loads + vec4 bf16 dst stores). MultiWarpIter can
+          // produce non-8-aligned segment offsets when warpsPerItem and hiddenDim do not
+          // factor cleanly (e.g., warpsPerItem=3 with hidden_dim=7168 gives dimPerWarp=2390
+          // which is not %8). Fall back to the scalar helper below.
+          core::WarpAccumFp8DequantSegmentBlockVec8Top8<T, core::CombineInternalFp8,
+                                                        Vec8Top8BlockElems>(
+              outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
+              reinterpret_cast<const float* const*>(srcScalePtrs), hiddenDimOffset, hiddenDimSize);
         } else {
-          core::WarpAccumFp8DequantSegmentBlock128Vec8Top8<T, core::CombineInternalFp8>(
+          // Scalar fallback for misaligned segments. See WarpAccumFp8DequantSegmentScalarTop8
+          // in device_primitives.hpp for why we do not delegate to the generic
+          // WarpAccumFp8DequantSegmentImpl<...,8> here (it would re-inflate num_vgpr).
+          core::WarpAccumFp8DequantSegmentScalarTop8<T, core::CombineInternalFp8,
+                                                     Vec8Top8BlockElems>(
               outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
               reinterpret_cast<const float* const*>(srcScalePtrs), hiddenDimOffset, hiddenDimSize);
         }
@@ -528,10 +560,10 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
 
 template <typename T, bool UseP2PRead = true, bool EnableStdMoE = false,
           bool UseFp8DirectCast = false, bool UseFp8BlockwiseQuant = false, bool UseWeights = true,
-          bool UseBlock128Vec8Top8 = false>
+          int Vec8Top8BlockElems = 0>
 __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   EpCombineIntraNodeKernel_body<T, UseP2PRead, EnableStdMoE, UseFp8DirectCast, UseFp8BlockwiseQuant,
-                                UseWeights, UseBlock128Vec8Top8>(args);
+                                UseWeights, Vec8Top8BlockElems>(args);
 }
 
 }  // namespace moe

@@ -13,8 +13,13 @@ WRAP_ALL_TYPES_BOOL3(EpCombineIntraNodeKernel, _p2p_stdmoe, true, true, false)
 WRAP_BOOL3(EpCombineIntraNodeKernel, bf16_nop2p_fp8cast, hip_bfloat16, false, false, true)
 MORI_FP8_ANY(WRAP_BOOL4(EpCombineIntraNodeKernel, bf16_nop2p_fp8bwq, hip_bfloat16, false,
                         false, false, true))
-MORI_FP8_ANY(WRAP_BOOL6(EpCombineIntraNodeKernel, bf16_nop2p_fp8bwq_noweight_vec8,
-                        hip_bfloat16, false, false, false, true, false, true))
+// Vec8Top8 specializations of the bf16 nop2p fp8 blockwise combine kernel. The 6th template
+// arg of EpCombineIntraNodeKernel_body is `int Vec8Top8BlockElems` (not bool); WRAP_BOOL6 just
+// substitutes tokens into the template list, so passing a power-of-two integer here is fine.
+MORI_FP8_ANY(WRAP_BOOL6(EpCombineIntraNodeKernel, bf16_nop2p_fp8bwq_noweight_block128_vec8,
+                        hip_bfloat16, false, false, false, true, false, 128))
+MORI_FP8_ANY(WRAP_BOOL6(EpCombineIntraNodeKernel, bf16_nop2p_fp8bwq_noweight_block256_vec8,
+                        hip_bfloat16, false, false, false, true, false, 256))
 
 // Convert (used with ENABLE_STANDARD_MOE_ADAPT)
 extern "C" __global__ void mori_ConvertDispatchOutputKernel(ConvertDispatchOutputArgs args) {

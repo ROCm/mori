@@ -510,15 +510,45 @@ void LaunchCombine(EpDispatchCombineHandle& handle, void* input, void* weights, 
         if (args.config.scaleDim <= 0) {
           throw std::runtime_error("Fp8BlockwiseQuant requires scaleDim > 0");
         }
-        const bool useBlock128Vec8Top8 =
-            !hasWeights && args.config.hiddenDim == 7168 && args.config.scaleDim == 56 &&
-            args.config.numExpertPerToken == 8 && args.config.worldSize > 4;
-        const char* kernel_name = useBlock128Vec8Top8
-                                      ? "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq_noweight_vec8"
-                                      : "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq";
+        // Specialized noweight + AccumNum=8 + VecBytes=8 path. Each registered kernel symbol
+        // is a separate compile-time instantiation parameterised on `Vec8Top8BlockElems` —
+        // see EpCombineIntraNodeKernel_body in intranode.hpp.
+        //
+        // Selection prerequisites (must all hold):
+        //   - no weights (UseWeights=false eliminates srcWeightsPtr array, frees registers);
+        //   - block_elems = ceil(hiddenDim / scaleDim) is a power of two AND a registered
+        //     specialization value (currently 128 or 256);
+        //   - hiddenDim % 512 == 0 (warpSize * VecBytes = 64 * 8 = 512, ensures the vec8
+        //     no-scale path's outer iter divides hiddenDim cleanly without a scalar tail);
+        //   - num_experts_per_token == 8 (matches AccumNum=8 hardcoded in the helpers);
+        //   - world_size > 4 (avoids the EP4 validAccumCount compaction path; the helpers
+        //     unconditionally read srcs[0..7], which compaction would leave stale).
+        // Examples that match block_elems=128: (hidden=7168, sd=56), (4096, 32), (8192, 64).
+        // Examples that match block_elems=256: (hidden=7168, sd=28), (4096, 16), (8192, 32).
+        // The intranode.hpp dispatch site additionally guards the segment helper at runtime
+        // with an 8-byte alignment check, so non-aligned MultiWarpIter segments fall back to
+        // an inline scalar path automatically.
+        const int block_elems =
+            (args.config.scaleDim > 0)
+                ? ((args.config.hiddenDim + args.config.scaleDim - 1) / args.config.scaleDim)
+                : 0;
+        const bool baseVec8Top8Eligible = !hasWeights && (args.config.hiddenDim % 512 == 0) &&
+                                          args.config.numExpertPerToken == 8 &&
+                                          args.config.worldSize > 4;
+        const char* kernel_name = "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq";
+        bool useVec8Top8 = false;
+        if (baseVec8Top8Eligible) {
+          if (block_elems == 128) {
+            kernel_name = "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq_noweight_block128_vec8";
+            useVec8Top8 = true;
+          } else if (block_elems == 256) {
+            kernel_name = "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq_noweight_block256_vec8";
+            useVec8Top8 = true;
+          }
+        }
         int fp8bwq_smem = combine_shared_mem(wpb, handle.config.numExpertPerToken,
                                              /*use_scale_ptrs=*/true,
-                                             /*use_weight_ptrs=*/!useBlock128Vec8Top8);
+                                             /*use_weight_ptrs=*/!useVec8Top8);
         reg.Launch(kernel_name, bn, block_x, fp8bwq_smem, stream, &args, args_size);
       } else if (args.config.useExternalInpBuffer) {
         reg.Launch(std::string("EpCombineIntraNodeKernel_") + sfx + "_nop2p", bn, block_x, smem,
