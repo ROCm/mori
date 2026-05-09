@@ -331,6 +331,10 @@ ErrorOr<std::unique_ptr<EpDispatchCombineState>> EpDispatchCombineInstantiate(
   // ep_config share a single EpDispatchCombineHandle.
   std::vector<int32_t> key(ep_config->begin(), ep_config->end());
 
+  // Decode once; reused below for both rank-based device routing (SPMT) and
+  // (on cache miss) handle construction.
+  auto cfg = EpDispatchCombineConfig::FromPackedI32Array(key.data(), key.size());
+
 #ifdef MORI_MULTITHREAD_SUPPORT
   // SPMT: XLA FFI handlers run on framework worker threads where
   // hipGetDevice() does NOT match the rank's device. Look up the device
@@ -338,8 +342,7 @@ ErrorOr<std::unique_ptr<EpDispatchCombineState>> EpDispatchCombineInstantiate(
   // exit so XLA's other state isn't disturbed) before any HIP call. This
   // ensures GetHandleCacheSlot() and ShmemStatesSingleton::GetInstance()
   // (both keyed by hipGetDevice()) hit the right slot.
-  auto cfg_for_dev = EpDispatchCombineConfig::FromPackedI32Array(key.data(), key.size());
-  ScopedDevice _dev_guard(mori::shmem::ShmemStatesSingleton::GetDeviceByRank(cfg_for_dev.rank));
+  ScopedDevice _dev_guard(mori::shmem::ShmemStatesSingleton::GetDeviceByRank(cfg.rank));
 #endif
 
   auto& slot = GetHandleCacheSlot();
@@ -349,8 +352,6 @@ ErrorOr<std::unique_ptr<EpDispatchCombineState>> EpDispatchCombineInstantiate(
     auto* states = mori::shmem::ShmemStatesSingleton::GetInstance();
     states->CheckStatusValid();
     states->bootStates->bootNet->Barrier();
-
-    auto cfg = EpDispatchCombineConfig::FromPackedI32Array(key.data(), key.size());
     // XPUT("EpDispatchCombineInstantiate: creating new handle for rank %d "
     //      "(#attrs: %zu)", cfg.rank, attrs.size());
     entry = std::make_unique<EpDispatchCombineHandle>(cfg);

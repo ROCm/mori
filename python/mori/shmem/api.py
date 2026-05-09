@@ -45,6 +45,11 @@ def _current_hip_device() -> int:
     from mori.jit.hip_driver import _get_hip_lib
 
     hip = _get_hip_lib()
+    # Set explicit ctypes signatures — without these, ctypes assumes int args
+    # and int return, which happens to be right on x86_64 Linux but is not
+    # portable. Be explicit so future ABI changes don't silently break us.
+    hip.hipGetDevice.argtypes = [ctypes.POINTER(ctypes.c_int)]
+    hip.hipGetDevice.restype = ctypes.c_int
     dev = ctypes.c_int(-1)
     err = hip.hipGetDevice(ctypes.byref(dev))
     if err != 0:

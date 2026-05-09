@@ -74,6 +74,10 @@ class ModuleLogger {
       } catch (const spdlog::spdlog_ex&) {
         logger = spdlog::get(moduleName);
       }
+      // Defensive: spdlog::get may still return null if registration was
+      // dropped between throw and our second lookup. Bail out cleanly
+      // instead of dereferencing a null shared_ptr below.
+      if (!logger) return;
     }
 
     // Determine the log level priority: env var > global setting > provided level
