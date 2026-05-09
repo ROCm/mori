@@ -101,7 +101,9 @@ def _spmt_shmem_init_one_thread(rank, world_size, unique_id):
     from mori import cpp, shmem
 
     _hip_set_device(rank)
-    shmem.shmem_init_attr(shmem.MORI_SHMEM_INIT_WITH_UNIQUEID, rank, world_size, unique_id)
+    shmem.shmem_init_attr(
+        shmem.MORI_SHMEM_INIT_WITH_UNIQUEID, rank, world_size, unique_id
+    )
     # Preload AOT EP kernels into THIS thread's GPU's HIP context.
     cpp.preload_kernels()
 
@@ -158,9 +160,9 @@ def _gen_per_rank_inputs(rank, config, num_tokens):
     weights = jax.random.uniform(
         rng, (num_tokens, config.num_experts_per_token), dtype=jnp.float32
     )
-    inputs = jax.random.normal(rng, (num_tokens, config.hidden_dim), dtype=jnp.float32).astype(
-        jnp.bfloat16
-    )
+    inputs = jax.random.normal(
+        rng, (num_tokens, config.hidden_dim), dtype=jnp.float32
+    ).astype(jnp.bfloat16)
     return indices, weights, inputs
 
 
@@ -191,7 +193,9 @@ def _build_full_input_lists(world_size, config, num_tokens):
     )
 
 
-def _validate_dispatch(num, src_pos, tok_stride, inp_tok_per_rank, base_list, base_out, *args):
+def _validate_dispatch(
+    num, src_pos, tok_stride, inp_tok_per_rank, base_list, base_out, *args
+):
     """Mirror of validate_dispatch from test_dispatch_combine_jax.py.
 
     For each received token, decode (sender_pe, local_tok_id) from src_pos,
@@ -221,8 +225,16 @@ def _validate_dispatch(num, src_pos, tok_stride, inp_tok_per_rank, base_list, ba
     return x
 
 
-def _validate_combine(combine_output, combine_weights, inputs, weights, indices,
-                      num_experts_per_rank, num_tokens, dtype):
+def _validate_combine(
+    combine_output,
+    combine_weights,
+    inputs,
+    weights,
+    indices,
+    num_experts_per_rank,
+    num_tokens,
+    dtype,
+):
     """Mirror of validate_combine from test_dispatch_combine_jax.py.
 
     Each input token is dispatched to `unique_pes` distinct PEs; combine
@@ -253,7 +265,8 @@ def _validate_combine(combine_output, combine_weights, inputs, weights, indices,
         combine_output.astype(jnp.float32),
         inputs_buf.astype(jnp.float32),
         mask_1d,
-        atol=1e-2, rtol=1e-2,
+        atol=1e-2,
+        rtol=1e-2,
     )
 
     ok_weight = True
@@ -262,7 +275,11 @@ def _validate_combine(combine_output, combine_weights, inputs, weights, indices,
         weights_buf = jnp.zeros((max_tokens, x_weights.shape[1]), dtype=x_weights.dtype)
         weights_buf = jax.lax.dynamic_update_slice(weights_buf, x_weights, (0, 0))
         ok_weight = masked_allclose(
-            combine_weights, weights_buf, mask_1d, atol=1e-5, rtol=1e-5,
+            combine_weights,
+            weights_buf,
+            mask_1d,
+            atol=1e-5,
+            rtol=1e-5,
         )
     return ok_output & ok_weight
 
@@ -333,11 +350,14 @@ def _ep_thread_body(rank, world_size, unique_id, results):
                 src_token_pos,
                 tok_stride,
                 inp_tok_per_rank,
-                inputs_list, dispatch_output,
+                inputs_list,
+                dispatch_output,
                 (weights_list, dispatch_weights),
                 (indices_list, dispatch_indices),
             )
-            assert bool(np.asarray(ok_dispatch)), f"rank {rank} validate_dispatch FAILED"
+            assert bool(
+                np.asarray(ok_dispatch)
+            ), f"rank {rank} validate_dispatch FAILED"
             print(f"[thread {rank}] dispatch data verified", flush=True)
 
             # --- run combine ---
@@ -349,8 +369,14 @@ def _ep_thread_body(rank, world_size, unique_id, results):
 
             # --- validate combine: output == input * unique_pes ---
             ok_combine = _validate_combine(
-                combine_out, combine_w, inputs, weights, indices,
-                config.num_experts_per_rank, num_tokens, dtype,
+                combine_out,
+                combine_w,
+                inputs,
+                weights,
+                indices,
+                config.num_experts_per_rank,
+                num_tokens,
+                dtype,
             )
             assert bool(np.asarray(ok_combine)), f"rank {rank} validate_combine FAILED"
             print(f"[thread {rank}] combine data verified", flush=True)
