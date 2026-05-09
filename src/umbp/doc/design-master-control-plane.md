@@ -93,6 +93,54 @@ SGLang or vLLM worker). Each peer owns:
    `UMBP_ALLOCATION_TTL_SEC` is retained as a config knob for legacy
    compatibility but is unused by the live path.
 
+### Design space — advisor vs. strong-consistency master
+
+The two ends of the directory-service spectrum, on the axes that
+actually drive the protocol shape and the failure model. Each row
+lists the property under each model — strengths and costs both — so
+the trade-offs are visible without prescribing a choice.
+
+| Aspect | Master-as-Advisor (this design) | Strong-Consistency Master |
+|---|---|---|
+| **Master's role** | Routing advisor; peer owns the page state | Authoritative directory + allocator |
+| **Per-key state on master** | None — heartbeat-projected only | Full, written through a replicated log |
+| **Update channel** | Async `KvEvent` shipped on heartbeat | Synchronous master RPC per mutation |
+| **Put hot path** | `RoutePut` → peer `AllocateSlot` → RDMA → peer `CommitSlot` | `BeginPut` → RDMA → `CommitPut` (master in every op) |
+| **Read-after-write** | Lag of one heartbeat (~5 s) | Linearizable on commit |
+| **Capacity** | Stale; ENOSPC handled via `exclude_nodes` retry | Exact; master is the allocator, no surprise ENOSPC |
+| **Eviction** | Fire-and-forget; index shrinks on next heartbeat | Transactional; index drops in lockstep with peer ACK |
+| **Master outage** | Soft — hot path degrades but keeps serving | Hard — quorum loss halts the cluster |
+| **Master state size** | Small — O(unique keys) | Large — O(replicas × allocator metadata) |
+| **Throughput ceiling** | Peer aggregate bandwidth | Master Raft commit rate |
+| **Replica policy** | Not expressible in the protocol | Enforced by master placement |
+| **Trust model** | Peer self-reports ownership | Master mints every `location_id` |
+| **Recovery** | Per-peer heartbeat full-sync | Raft log replay on master |
+| **Master code complexity** | Small — a handful of classes | Database-engine sized |
+| **Suits** | Throughput-bound, miss-tolerant workloads | Strict-consistency workloads with bounded key counts and low write rate |
+| **Real-world analogue** | DNS-style routing directory | HDFS NameNode, Ceph monitor, Bigtable directory |
+
+#### Pros and cons — side by side
+
+**+** marks a strength under that model; **−** marks a cost. Some rows
+have both — that's the trade-off.
+
+| Aspect | Master-as-Advisor | Strong-Consistency Master |
+|---|---|---|
+| **Per-op latency** | **+** No master round trip on the hot path | **−** One Raft commit per mutation (~1–5 ms healthy) |
+| **Cluster throughput** | **+** Scales with peer aggregate bandwidth | **−** Bounded by master's Raft commit rate |
+| **Read-after-write** | **−** Lag of one heartbeat (~5 s) before new key is visible | **+** Linearizable — visible the moment `CommitPut` returns |
+| **Capacity accuracy** | **−** Stale snapshots; surprise ENOSPC retried via `exclude_nodes` | **+** Exact — master is the allocator, no surprise ENOSPC |
+| **Eviction** | **+** Idempotent, fire-and-forget; safe to retry<br>**−** Index shrinks on next heartbeat, not immediately | **+** Decisive — index drops in lockstep with peer ACK<br>**−** Slow / partitioned peer can block the eviction transaction |
+| **Master availability** | **+** Soft — peer-to-peer traffic rides out brief outages | **−** Hard — quorum loss halts the cluster |
+| **Master state size** | **+** Small, O(unique keys), unreplicated | **−** Large, O(keys × replicas × allocator metadata), persisted + replicated |
+| **Master code surface** | **+** Handful of classes; easy to reason about and modify | **−** Database-engine class — log, leader election, snapshots, membership change |
+| **Replica policy / synchronous publish / quotas** | **−** Not expressible in the protocol | **+** Enforceable centrally by master |
+| **Trust model** | **−** Peers self-report; index can be poisoned by a buggy/hostile peer | **+** Master mints every `location_id`; peers cannot unilaterally claim ownership |
+| **Recovery** | **−** Full-sync (`SnapshotOwnedKeys`) is the only primitive; thundering herd on master restart | **+** Raft log replay; well-understood path |
+| **Peer concurrency** | **−** Coarse mutex over `PeerDramAllocator` serializes peer hot path | **+** Peer is a dumb byte-host; no allocator state to lock |
+| **Operational failure modes** | **+** Few — no consensus layer to misbehave | **−** Split-brain on membership change, fsync lies, slow-follower starvation, log corruption |
+| **Cross-region / large-cluster** | **+** No consensus, no WAN commit penalty | **−** Raft commit latency degrades over WAN; leader CPU bounds cluster size |
+
 ---
 
 ## 2. Project layout
