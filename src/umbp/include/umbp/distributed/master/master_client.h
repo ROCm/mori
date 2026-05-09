@@ -44,6 +44,24 @@
 
 namespace mori::umbp {
 
+// Buckets for mori_umbp_master_client_rpc_latency_seconds.  Spans 0.1 ms ~ 5 s
+// (14 finite bounds + implicit +Inf).  Bucket layout is locked on the first
+// observation client-side and again on the master side; the layout is
+// silently first-write-wins, so editing in place corrupts existing series.
+// To change buckets bump the metric name suffix (e.g. _v2) instead.
+inline constexpr double kMasterClientRpcLatencyBucketsArr[] = {
+    1e-4, 5e-4, 1e-3, 2.5e-3, 5e-3, 1e-2, 2.5e-2, 5e-2, 1e-1, 2.5e-1, 5e-1, 1.0, 2.5, 5.0,
+};
+
+// Series-cardinality cap for MasterClient::pending_histogram_aggregates_.
+// With client-side bucket aggregation the map is keyed by (name, labels) so
+// its size is bounded by the number of distinct series, not by QPS.  Healthy
+// operation with the current label set peaks at ~50 series; reaching this cap
+// indicates a label-cardinality leak (e.g. a per-key/per-allocation_id label
+// was accidentally introduced).  Excess series are dropped at insert time and
+// accounted in metrics_dropped_count_.
+inline constexpr std::size_t kMasterClientMaxPendingHistograms = 15000;
+
 class PeerDramAllocator;
 
 // Result of RouteGet — pure routing advisory.  The reader follows up
@@ -114,7 +132,12 @@ class MasterClient {
   // --- Client-side metrics ---
   void AddCounter(std::string name, std::string help, Labels labels, double delta);
   void SetGauge(std::string name, std::string help, Labels labels, double value);
-  void Observe(std::string name, std::string help, Labels labels, std::vector<double> bounds,
+  // Buffer a histogram observation. `bounds` is taken by const-ref so the
+  // 14-double rpc-latency layout (and the 3072-double bandwidth layout in
+  // pool_client.cpp) avoids a per-call heap allocation.  The observation is
+  // accumulated into a per-series HistogramAccumulator; only one MetricSample
+  // per (name, labels) series is sent on the wire per flush.
+  void Observe(std::string name, std::string help, Labels labels, const std::vector<double>& bounds,
                double value);
 
   bool IsRegistered() const { return registered_; }
