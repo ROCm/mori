@@ -69,3 +69,23 @@ target_link_libraries(test_global_block_index_events PRIVATE umbp_common
 target_compile_features(test_global_block_index_events PRIVATE cxx_std_17)
 
 gtest_discover_tests(test_global_block_index_events)
+
+# ---------------------------------------------------------------------------
+# test_master_client_metrics_aggregation
+#
+# Targeted in-process tests for the abc-side metrics aggregation machinery that
+# was preserved through the rebase onto alloc-decoup.  Drives the MasterClient
+# via its public buffering API plus the friend-class test handle declared in
+# master_client.h.  Does NOT spin up a real master server — that surface lives
+# behind MORI_UMBP_LEGACY_DISTRIBUTED_TESTS.
+# ---------------------------------------------------------------------------
+add_executable(test_master_client_metrics_aggregation
+               test_master_client_metrics_aggregation.cpp)
+
+target_link_libraries(test_master_client_metrics_aggregation
+                      PRIVATE umbp_common GTest::gtest_main)
+
+target_compile_features(test_master_client_metrics_aggregation
+                        PRIVATE cxx_std_17)
+
+gtest_discover_tests(test_master_client_metrics_aggregation)
