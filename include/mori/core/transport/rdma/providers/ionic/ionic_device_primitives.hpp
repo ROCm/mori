@@ -622,8 +622,6 @@ inline __device__ int PollCqOnce2(WorkQueueHandle& wqHandle, CompletionQueueHand
   volatile struct ionic_v1_cqe* cqe = reinterpret_cast<ionic_v1_cqe*>(cqeAddr);
   uint32_t old, msn = HTOBE32(cqe->send.msg_msn);
 
-  printf("poll cccqe2\n");
-
   consIdx = wqHandle.dbTouchIdx;
 
   // MORI_PRINTF("ABH %s:%d here cons %#x msn %#x\n", __func__, __LINE__, consIdx, msn);
@@ -644,8 +642,6 @@ inline __device__ int PollCqOnce2(WorkQueueHandle& wqHandle, CompletionQueueHand
                                   uint32_t consIdx) {
   uint32_t my_logical_lane_id = get_active_lane_num(activemask);
   uint32_t my_cq_pos = cqHandle.cq_consumer + my_logical_lane_id;
-
-  printf("poll nonccqe 2\n");
 
   uint32_t cqeIdx = my_cq_pos & (cqeNum - 1);
   char* Addr = reinterpret_cast<char*>(cqeAddr) + (cqeIdx * sizeof(struct ionic_v1_cqe));
@@ -753,7 +749,6 @@ inline __device__ int PollCq<ProviderType::PSD>(WorkQueueHandle& wqHandle,
                                                 CompletionQueueHandle& cqHandle, void* cqAddr,
                                                 uint32_t cqeNum, uint32_t* consIdx,
                                                 uint16_t* wqeCounter) {
-  printf("poll cccqe\n");
   PollCqOnce2(wqHandle, cqHandle, 1, cqAddr, cqeNum, *consIdx);
   *wqeCounter = *consIdx;
   return 0;
@@ -764,8 +759,6 @@ inline __device__ int PollCq<ProviderType::PSD>(WorkQueueHandle& wqHandle,
                                                 CompletionQueueHandle& cqHandle, void* cqAddr,
                                                 uint32_t cqeNum, uint32_t* consIdx,
                                                 uint16_t* wqeCounter) {
-  printf("poll non cccqe\n");
-
   uint32_t greed = 10;
   const uint32_t curConsIdx = *consIdx;
   uint64_t activemask = GetActiveLaneMask();
