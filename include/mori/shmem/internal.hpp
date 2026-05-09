@@ -171,11 +171,14 @@ struct RemoteAddrInfo {
 
 #if !defined(__HIPCC__) && !defined(__CUDACC__)
 
-// ShmemFinalize resets to New (not a separate Finalized state) so the slot
-// can be reused for re-init in the same process — see ShmemFinalize().
 enum ShmemStatesStatus {
   New = 0,
   Initialized = 1,
+  // Finalized: reserved. ShmemFinalize() currently resets the slot to `New`
+  // so the same GPU can be re-initialized later (needed by SPMT test suites
+  // that run multiple init/finalize cycles). Keep this value for the case
+  // where future finalize semantics need to mark the slot as terminally done.
+  Finalized = 2,
 };
 
 // Per-GPU JIT module state (HIP module handle + device symbol pointers)
@@ -194,12 +197,17 @@ struct ShmemStates {
   ModuleStates moduleStates;  // JIT module state for this GPU
   GpuStates gpuStates;        // host-side copy of device GpuStates for this GPU
 
-  // Asserts that ShmemInit has been called. Used by APIs that touch GPU state
-  // (allocation, barrier, module init) which need a fully constructed slot.
+  // Asserts that ShmemInit has been called and the slot is currently usable.
+  // Used by APIs that touch GPU state (allocation, barrier, module init)
+  // which need a fully constructed slot.
   void CheckStatusValid() {
     if (status == ShmemStatesStatus::New) {
       std::cout << "Shmem state is not initialized, call ShmemInit*/shmem_init_attr first."
                 << std::endl;
+      assert(false);
+    }
+    if (status == ShmemStatesStatus::Finalized) {
+      std::cout << "Shmem state has been finalized." << std::endl;
       assert(false);
     }
   }
