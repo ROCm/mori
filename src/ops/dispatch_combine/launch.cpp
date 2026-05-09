@@ -81,8 +81,7 @@ KernelRegistry::Impl& KernelRegistry::GetImpl() {
   int id = -1;
   HIP_RUNTIME_CHECK(hipGetDevice(&id));
   if (id < 0 || id >= mori::kMaxGpusPerNode) {
-    throw std::runtime_error("KernelRegistry: hipGetDevice() out of range: " +
-                             std::to_string(id));
+    throw std::runtime_error("KernelRegistry: hipGetDevice() out of range: " + std::to_string(id));
   }
   return impls[static_cast<size_t>(id)];
 #else

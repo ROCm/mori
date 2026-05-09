@@ -145,8 +145,8 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
       // device, because hipIpcOpenMemHandle's lazy-enable path is skipped here.
       cpuMemObj->p2pPeerPtrs[i] = cpuMemObj->peerPtrs[i];
       hipPointerAttribute_t attr{};
-      hipError_t attrErr = hipPointerGetAttributes(
-          &attr, reinterpret_cast<const void*>(cpuMemObj->peerPtrs[i]));
+      hipError_t attrErr =
+          hipPointerGetAttributes(&attr, reinterpret_cast<const void*>(cpuMemObj->peerPtrs[i]));
       if (attrErr == hipSuccess && attr.device != hipInvalidDeviceId) {
         hipError_t peerErr = hipDeviceEnablePeerAccess(attr.device, 0);
         if (peerErr != hipSuccess && peerErr != hipErrorPeerAccessAlreadyEnabled) {
@@ -156,9 +156,8 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
       } else {
         // Clear sticky error so subsequent HIP calls aren't poisoned.
         (void)hipGetLastError();
-        MORI_APP_WARN("hipPointerGetAttributes failed for same-process peer {} ptr {:p}: {}",
-                      i, reinterpret_cast<void*>(cpuMemObj->peerPtrs[i]),
-                      hipGetErrorString(attrErr));
+        MORI_APP_WARN("hipPointerGetAttributes failed for same-process peer {} ptr {:p}: {}", i,
+                      reinterpret_cast<void*>(cpuMemObj->peerPtrs[i]), hipGetErrorString(attrErr));
       }
       continue;
     }

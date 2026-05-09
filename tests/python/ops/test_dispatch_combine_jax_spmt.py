@@ -138,9 +138,9 @@ def _ep_thread_body(rank, world_size, unique_id, results):
 
         total_experts = config.num_experts_per_rank * config.world_size
         keys = jax.random.split(rng, num_tokens)
-        indices = jax.vmap(
-            lambda k: jax.random.permutation(k, total_experts)
-        )(keys)[:, : config.num_experts_per_token].astype(jnp.int32)
+        indices = jax.vmap(lambda k: jax.random.permutation(k, total_experts))(keys)[
+            :, : config.num_experts_per_token
+        ].astype(jnp.int32)
         weights = jax.random.uniform(
             rng, (num_tokens, config.num_experts_per_token), dtype=jnp.float32
         )
@@ -187,6 +187,7 @@ def _ep_thread_body(rank, world_size, unique_id, results):
         # SPMT threads. cpp.clear_ep_handle_cache() + gc.collect() is
         # enough to drop our buffer references before shmem_finalize.
         import gc
+
         cpp.clear_ep_handle_cache()
         gc.collect()
         shmem.shmem_finalize()

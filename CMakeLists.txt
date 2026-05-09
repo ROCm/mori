@@ -160,7 +160,6 @@ add_library(mori_logging INTERFACE)
 target_include_directories(mori_logging INTERFACE include)
 target_link_libraries(mori_logging INTERFACE spdlog::spdlog_header_only)
 
-
 if(ENABLE_PROFILER)
   find_package(
     Python3

@@ -130,8 +130,7 @@ void RegisterMoriShmem(py::module_& m) {
   // Python threads (SPMT mode) can all progress through the socket bootstrap
   // handshake without deadlocking on the GIL.
   m.def("shmem_init_attr", &ShmemInitAttr, py::arg("flags"), py::arg("rank"), py::arg("nranks"),
-        py::arg("unique_id"),
-        py::call_guard<py::gil_scoped_release>(),
+        py::arg("unique_id"), py::call_guard<py::gil_scoped_release>(),
         "Initialize shmem with attributes (unique_id should be bytes from shmem_get_unique_id)");
 
   m.def("shmem_finalize", &ShmemFinalize, py::call_guard<py::gil_scoped_release>(),
@@ -150,8 +149,7 @@ void RegisterMoriShmem(py::module_& m) {
   m.def("shmem_npes", &ShmemNPes, "Get number of PEs");
 
   // Collective operations
-  m.def("shmem_barrier_all", &ShmemBarrierAll,
-        py::call_guard<py::gil_scoped_release>(),
+  m.def("shmem_barrier_all", &ShmemBarrierAll, py::call_guard<py::gil_scoped_release>(),
         "Global barrier synchronization");
 
   m.def(
@@ -160,8 +158,7 @@ void RegisterMoriShmem(py::module_& m) {
       py::arg("stream"), "Launch device barrier on a HIP stream");
 
   // Symmetric memory management
-  m.def("shmem_malloc", &ShmemMalloc, py::arg("size"),
-        py::call_guard<py::gil_scoped_release>(),
+  m.def("shmem_malloc", &ShmemMalloc, py::arg("size"), py::call_guard<py::gil_scoped_release>(),
         "Allocate symmetric memory (returns address as int)");
 
   m.def("shmem_malloc_align", &ShmemMallocAlign, py::arg("alignment"), py::arg("size"),
@@ -172,8 +169,7 @@ void RegisterMoriShmem(py::module_& m) {
         py::call_guard<py::gil_scoped_release>(),
         "Allocate symmetric memory with flags (returns address as int)");
 
-  m.def("shmem_free", &ShmemFree, py::arg("ptr"),
-        py::call_guard<py::gil_scoped_release>(),
+  m.def("shmem_free", &ShmemFree, py::arg("ptr"), py::call_guard<py::gil_scoped_release>(),
         "Free symmetric memory (ptr should be int address)");
 
   // Buffer registration

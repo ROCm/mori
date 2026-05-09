@@ -40,6 +40,7 @@ import mori.shmem as shmem
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _get_num_gpus() -> int:
     return torch.cuda.device_count()
 
@@ -128,6 +129,7 @@ def _run_spmt(world_size: int):
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.parametrize("world_size", [2, 4, 8])
 def test_spmt_shmem_init_finalize(world_size):
