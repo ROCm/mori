@@ -4,6 +4,11 @@ This guide documents how to run the single-node UMBP + SGLang correctness smoke 
 
 Use the placeholders in this document to map the workflow to any target node. Every environment-dependent value is surfaced as an argument or environment variable; update those inputs and the script can run unchanged.
 
+For the underlying architecture see
+[`src/umbp/doc/design-master-control-plane.md`](../src/umbp/doc/design-master-control-plane.md);
+for the full env-var inventory see
+[`src/umbp/doc/runtime-env-vars.md`](../src/umbp/doc/runtime-env-vars.md).
+
 ## Overview
 
 The script spins up the Docker image, rebuilds Mori with UMBP enabled, launches a single-node SGLang server backed by UMBP hierarchical cache, issues a probe completion, and collects logs under `~/umbp_single_node_results`. It is intended as a fast health check for DP+EP configurations.

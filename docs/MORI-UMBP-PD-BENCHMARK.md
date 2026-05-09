@@ -7,6 +7,12 @@ This guide is **xP1D-generic**: N prefill nodes (N >= 1) plus one decode node.
 The 1P1D case is just N=1; the 2P1D case is N=2. Set `PREFILL_NODES` /
 `PREFILL_IPS` to drive the topology — every step below loops over them.
 
+For the architecture this benchmark exercises (master-as-advisor,
+heartbeat-event index, peer-owned allocator), see
+[`src/umbp/doc/design-master-control-plane.md`](../src/umbp/doc/design-master-control-plane.md).
+Every `UMBP_*` env var referenced below is documented in
+[`src/umbp/doc/runtime-env-vars.md`](../src/umbp/doc/runtime-env-vars.md).
+
 ## Table of Contents
 
 - [Prerequisites](#prerequisites)
