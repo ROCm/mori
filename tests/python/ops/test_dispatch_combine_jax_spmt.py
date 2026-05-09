@@ -27,6 +27,14 @@ multiprocessing, no jax.distributed.initialize.  This is the JAX-on-SPMD model
 that the JAX team needs but that the existing test_dispatch_combine_jax.py
 (multi-process) does not exercise.
 
+Validation strategy: each thread generates per-rank inputs deterministically
+from PRNGKey(BASE_SEED + rank). Because every thread runs the same generator
+function, each one can locally re-seed for every other rank to reconstruct the
+full input_list — no cross-thread/cross-process all-gather needed. We then
+mirror the validate_dispatch / validate_combine logic from
+test_dispatch_combine_jax.py to verify dispatched data matches sources and
+combined output equals input * unique_pes.
+
 Requirements:
   - mori built with MORI_MULTITHREAD_SUPPORT=ON, BUILD_OPS_DEVICE=ON,
     BUILD_XLA_FFI_OPS=ON
@@ -39,6 +47,28 @@ import threading
 import traceback
 
 import pytest
+
+# Match the env-var bypass set by the multi-process JAX EP test:
+# - MORI_SHMEM_HEAP_SIZE=16G: default 4G is tight for world_size=8 EP buffers.
+# - XLA_FLAGS:
+#     --xla_gpu_autotune_level=0      → skip autotune (slow on first JIT)
+#     --xla_gpu_enable_command_buffer= → disable HIP command buffer (graph)
+#     --xla_gpu_enable_triton_gemm=false → avoid Triton-AMDGPU pass errors
+#                                          ("TritonAMDGPUMoveUpPrologueLoads")
+# Use setdefault so user-supplied values still win.
+os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "16G")
+os.environ.setdefault(
+    "XLA_FLAGS",
+    "--xla_gpu_autotune_level=0 "
+    "--xla_gpu_enable_command_buffer= "
+    "--xla_gpu_enable_triton_gemm=false",
+)
+
+
+# Shared PRNG seed base. All threads use PRNGKey(BASE_SEED + rank) so any
+# thread can reconstruct any other rank's inputs by re-seeding.
+BASE_SEED = 123
+NUM_TOKENS_PER_RANK = 32
 
 
 def _get_num_gpus() -> int:
@@ -71,9 +101,7 @@ def _spmt_shmem_init_one_thread(rank, world_size, unique_id):
     from mori import cpp, shmem
 
     _hip_set_device(rank)
-    shmem.shmem_init_attr(
-        shmem.MORI_SHMEM_INIT_WITH_UNIQUEID, rank, world_size, unique_id
-    )
+    shmem.shmem_init_attr(shmem.MORI_SHMEM_INIT_WITH_UNIQUEID, rank, world_size, unique_id)
     # Preload AOT EP kernels into THIS thread's GPU's HIP context.
     cpp.preload_kernels()
 
@@ -83,8 +111,8 @@ def _build_config(rank, world_size, gpu_per_node):
     physical GPU count of the box). For single-node SPMT testing pass
     ``gpu_per_node = world_size``; the EP handle asserts
     IsPowerOf2(gpuPerNode) && worldSize % gpuPerNode == 0."""
-    import mori
     import jax.numpy as jnp
+    import mori
 
     return mori.cpp.EpDispatchCombineConfig(
         rank=rank,
@@ -107,77 +135,225 @@ def _build_config(rank, world_size, gpu_per_node):
     )
 
 
+def _gen_per_rank_inputs(rank, config, num_tokens):
+    """Deterministic per-rank input generation. Every thread can reproduce any
+    rank's inputs by passing that rank's index here.
+
+    Returns (indices, weights, inputs) as JAX arrays on CPU (caller does
+    device_put as needed). Shapes:
+      indices: (num_tokens, num_experts_per_token)   int32
+      weights: (num_tokens, num_experts_per_token)   float32
+      inputs:  (num_tokens, hidden_dim)              bfloat16
+    """
+    import jax
+    import jax.numpy as jnp
+
+    rng = jax.random.PRNGKey(BASE_SEED + rank)
+    total_experts = config.num_experts_per_rank * config.world_size
+
+    keys = jax.random.split(rng, num_tokens)
+    indices = jax.vmap(lambda k: jax.random.permutation(k, total_experts))(keys)[
+        :, : config.num_experts_per_token
+    ].astype(jnp.int32)
+    weights = jax.random.uniform(
+        rng, (num_tokens, config.num_experts_per_token), dtype=jnp.float32
+    )
+    inputs = jax.random.normal(rng, (num_tokens, config.hidden_dim), dtype=jnp.float32).astype(
+        jnp.bfloat16
+    )
+    return indices, weights, inputs
+
+
+def _build_full_input_lists(world_size, config, num_tokens):
+    """Reconstruct every rank's inputs locally (no cross-thread comm needed)
+    and concatenate into world_size * max_num_inp_token_per_rank padded lists,
+    matching the layout that multi-process test produces via jax.lax.all_gather.
+    """
+    import jax.numpy as jnp
+
+    max_tokens = config.max_num_inp_token_per_rank
+    indices_list, weights_list, inputs_list = [], [], []
+    for r in range(world_size):
+        ind, wt, inp = _gen_per_rank_inputs(r, config, num_tokens)
+        # Pad each rank's contribution to max_tokens to match all_gather layout.
+        pad = max_tokens - num_tokens
+        if pad > 0:
+            ind = jnp.pad(ind, [(0, pad), (0, 0)])
+            wt = jnp.pad(wt, [(0, pad), (0, 0)])
+            inp = jnp.pad(inp, [(0, pad), (0, 0)])
+        indices_list.append(ind)
+        weights_list.append(wt)
+        inputs_list.append(inp)
+    return (
+        jnp.concatenate(indices_list, axis=0),
+        jnp.concatenate(weights_list, axis=0),
+        jnp.concatenate(inputs_list, axis=0),
+    )
+
+
+def _validate_dispatch(num, src_pos, tok_stride, inp_tok_per_rank, base_list, base_out, *args):
+    """Mirror of validate_dispatch from test_dispatch_combine_jax.py.
+
+    For each received token, decode (sender_pe, local_tok_id) from src_pos,
+    look up the original input via base_list[pe * inp_tok_per_rank + local_id],
+    and check it matches the dispatched output. Also check that no two received
+    tokens share the same src_pos (no double-delivery).
+    """
+    import jax.numpy as jnp
+
+    pe = src_pos // tok_stride
+    local_tok_id = src_pos - pe * tok_stride
+    list_idx = pe * inp_tok_per_rank + local_tok_id
+    Y = base_list[list_idx]
+    N = Y.shape[0]
+    mask = jnp.arange(N) < num
+    mask2D = mask[:, None]
+    x = jnp.all((Y == base_out) | (~mask2D))
+    for x_list, x_out in args:
+        if x_out is not None:
+            x = x & jnp.all((x_list[list_idx] == x_out) | (~mask2D))
+    maxv = jnp.iinfo(src_pos.dtype).max
+    s_masked = jnp.where(mask, src_pos, maxv)
+    s_sorted = jnp.sort(s_masked)
+    eq_adjacent = s_sorted[1:] == s_sorted[:-1]
+    valid = (s_sorted[1:] != maxv) & (s_sorted[:-1] != maxv)
+    x = x & ~jnp.any(eq_adjacent & valid)
+    return x
+
+
+def _validate_combine(combine_output, combine_weights, inputs, weights, indices,
+                      num_experts_per_rank, num_tokens, dtype):
+    """Mirror of validate_combine from test_dispatch_combine_jax.py.
+
+    Each input token is dispatched to `unique_pes` distinct PEs; combine
+    sums the `unique_pes` copies, so combined output should equal
+    `input * unique_pes` (and combined weights = `weights * unique_pes`).
+    Uses bf16-tolerant atol/rtol on the output and tight tolerance on weights.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    max_tokens = combine_output.shape[0]
+    mask_1d = jnp.arange(max_tokens) < num_tokens
+
+    def masked_allclose(a, b, mask, *, atol, rtol):
+        broad_mask = mask.reshape((mask.shape[0],) + (1,) * (a.ndim - 1))
+        diff = jnp.abs(a - b)
+        tol = atol + rtol * jnp.abs(b)
+        return jnp.all((diff <= tol) | (~broad_mask))
+
+    pes = indices // num_experts_per_rank
+    pes_sorted = jnp.sort(pes, axis=-1)
+    unique_pes = 1 + jnp.sum(pes_sorted[:, 1:] != pes_sorted[:, :-1], axis=-1)
+
+    x_inputs = inputs.astype(dtype) * unique_pes[:, None]
+    inputs_buf = jnp.zeros((max_tokens, x_inputs.shape[1]), dtype=x_inputs.dtype)
+    inputs_buf = jax.lax.dynamic_update_slice(inputs_buf, x_inputs, (0, 0))
+    ok_output = masked_allclose(
+        combine_output.astype(jnp.float32),
+        inputs_buf.astype(jnp.float32),
+        mask_1d,
+        atol=1e-2, rtol=1e-2,
+    )
+
+    ok_weight = True
+    if weights is not None:
+        x_weights = weights * unique_pes[:, None]
+        weights_buf = jnp.zeros((max_tokens, x_weights.shape[1]), dtype=x_weights.dtype)
+        weights_buf = jax.lax.dynamic_update_slice(weights_buf, x_weights, (0, 0))
+        ok_weight = masked_allclose(
+            combine_weights, weights_buf, mask_1d, atol=1e-5, rtol=1e-5,
+        )
+    return ok_output & ok_weight
+
+
 def _ep_thread_body(rank, world_size, unique_id, results):
-    """Per-thread body: init shmem + create EP op + run dispatch round-trip."""
+    """Per-thread body: init shmem + run EP dispatch+combine + verify data."""
     err = None
     try:
         _spmt_shmem_init_one_thread(rank, world_size, unique_id)
 
+        import gc
+
         import jax
         import jax.numpy as jnp
-        import numpy as np
         import mori
+        import numpy as np
         from mori import cpp, shmem
 
-        # Set gpu_per_node = world_size so the EP handle treats this as a
-        # 1-node deployment (all PEs on this node). The EP handle asserts
-        # IsPowerOf2(gpuPerNode) && worldSize % gpuPerNode == 0; for our
-        # single-node SPMT test, this is the simplest valid configuration
-        # and matches what the multi-process JAX test does (gpu_per_node ==
-        # world_size). For real multi-node SPMT, callers must set
-        # gpu_per_node to the per-node PE count.
+        # gpu_per_node = world_size for single-node SPMT (see _build_config).
         config = _build_config(rank, world_size, gpu_per_node=world_size)
         op = mori.jax.EpDispatchCombineOp(config)
 
-        # Build per-rank inputs on this thread's device.
-        # Use jax.device_put to ensure data is on rank's GPU.
         my_dev = jax.devices()[rank]
+        num_tokens = NUM_TOKENS_PER_RANK
+        dtype = jnp.bfloat16
 
-        rng = jax.random.PRNGKey(123 + rank)
-        num_tokens = 32
-
-        total_experts = config.num_experts_per_rank * config.world_size
-        keys = jax.random.split(rng, num_tokens)
-        indices = jax.vmap(lambda k: jax.random.permutation(k, total_experts))(keys)[
-            :, : config.num_experts_per_token
-        ].astype(jnp.int32)
-        weights = jax.random.uniform(
-            rng, (num_tokens, config.num_experts_per_token), dtype=jnp.float32
-        )
-        inputs = jax.random.normal(
-            rng, (num_tokens, config.hidden_dim), dtype=jnp.float32
-        ).astype(jnp.bfloat16)
-
-        # Place inputs on this thread's device.
+        # --- per-rank inputs (this thread's) ---
+        indices, weights, inputs = _gen_per_rank_inputs(rank, config, num_tokens)
         indices = jax.device_put(indices, my_dev)
         weights = jax.device_put(weights, my_dev)
         inputs = jax.device_put(inputs, my_dev)
 
-        # Run dispatch on this device.
+        # --- full inputs_list rebuilt locally on this device ---
+        # (every rank generates the same content from PRNGKey(BASE_SEED + r))
+        indices_list, weights_list, inputs_list = _build_full_input_lists(
+            world_size, config, num_tokens
+        )
+        indices_list = jax.device_put(indices_list, my_dev)
+        weights_list = jax.device_put(weights_list, my_dev)
+        inputs_list = jax.device_put(inputs_list, my_dev)
+
+        # --- run dispatch + get src token positions ---
         with jax.default_device(my_dev):
             (
                 dispatch_output,
                 dispatch_indices,
                 dispatch_recv_num_token,
                 dispatch_weights,
-                _,
+                _scales,
             ) = op.dispatch(inputs, weights, None, indices)
+            src_token_pos = op.get_dispatch_src_token_pos(dispatch_recv_num_token)
 
-            # Force materialization to make sure FFI completes
             num_recv = int(np.asarray(dispatch_recv_num_token))
-            print(
-                f"[thread {rank}] dispatch OK, recv {num_recv} tokens",
-                flush=True,
+            print(f"[thread {rank}] dispatched, recv {num_recv} tokens", flush=True)
+
+            # Sanity: src_token_pos length matches num_recv.
+            src_arr = np.asarray(src_token_pos)[:num_recv]
+            assert src_arr.size == num_recv, (
+                f"rank {rank}: src_token_pos size {src_arr.size} "
+                f"!= dispatch_recv_num_token {num_recv}"
             )
 
+            # --- validate dispatch: dispatched tokens match sources ---
+            tok_stride = config.max_num_tokens_to_send()
+            inp_tok_per_rank = config.max_num_inp_token_per_rank
+            ok_dispatch = _validate_dispatch(
+                dispatch_recv_num_token,
+                src_token_pos,
+                tok_stride,
+                inp_tok_per_rank,
+                inputs_list, dispatch_output,
+                (weights_list, dispatch_weights),
+                (indices_list, dispatch_indices),
+            )
+            assert bool(np.asarray(ok_dispatch)), f"rank {rank} validate_dispatch FAILED"
+            print(f"[thread {rank}] dispatch data verified", flush=True)
+
+            # --- run combine ---
             combine_out, combine_w = op.combine(
-                dispatch_output.astype(jnp.bfloat16),
+                dispatch_output.astype(dtype),
                 dispatch_weights,
                 dispatch_indices,
             )
-            # Materialize.
-            _ = np.asarray(combine_out[:1])
-            print(f"[thread {rank}] combine OK", flush=True)
+
+            # --- validate combine: output == input * unique_pes ---
+            ok_combine = _validate_combine(
+                combine_out, combine_w, inputs, weights, indices,
+                config.num_experts_per_rank, num_tokens, dtype,
+            )
+            assert bool(np.asarray(ok_combine)), f"rank {rank} validate_combine FAILED"
+            print(f"[thread {rank}] combine data verified", flush=True)
 
         del op
 
@@ -186,8 +362,6 @@ def _ep_thread_body(rank, world_size, unique_id, results):
         # jax.clear_caches() here — it is process-global and racy across
         # SPMT threads. cpp.clear_ep_handle_cache() + gc.collect() is
         # enough to drop our buffer references before shmem_finalize.
-        import gc
-
         cpp.clear_ep_handle_cache()
         gc.collect()
         shmem.shmem_finalize()
