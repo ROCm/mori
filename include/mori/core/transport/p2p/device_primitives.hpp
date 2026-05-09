@@ -1871,6 +1871,38 @@ __device__ __forceinline__ void WarpAccumFp8DequantFullImpl(
 }
 
 template <typename OutT, typename Fp8T>
+__device__ __forceinline__ void WarpAccumFp8DequantFullBlock128Vec8Top8(
+    OutT* __restrict__ dstToken, const Fp8T* const* __restrict__ srcs,
+    const float* const* __restrict__ srcScales, int hiddenDim) {
+  constexpr int AccumNum = 8;
+
+  const int laneId = threadIdx.x & (warpSize - 1);
+  const Fp8T* cachedSrcs[AccumNum];
+#pragma unroll AccumNum
+  for (int i = 0; i < AccumNum; ++i) {
+    cachedSrcs[i] = srcs[i];
+  }
+
+  bool anyScale = false;
+  if (srcScales != nullptr) {
+#pragma unroll AccumNum
+    for (int i = 0; i < AccumNum; ++i) {
+      anyScale |= (cachedSrcs[i] != nullptr && srcScales[i] != nullptr);
+    }
+  }
+
+  if (!anyScale) {
+    detail::WarpAccumFp8DequantVecRange<warpSize, 8, OutT, Fp8T, AccumNum, false>(
+        dstToken, cachedSrcs, nullptr, 0, hiddenDim, laneId);
+    return;
+  }
+
+  detail::WarpAccumFp8DequantVecRangeBlockwiseScaleWave<8, OutT, Fp8T, AccumNum>(
+      dstToken, cachedSrcs, srcScales, /*hiddenDimOffset=*/0, /*start=*/0, /*end=*/hiddenDim,
+      /*blockElems=*/128);
+}
+
+template <typename OutT, typename Fp8T>
 __device__ __forceinline__ void WarpAccumFp8DequantFull(OutT* __restrict__ dstToken,
                                                         const Fp8T* const* __restrict__ srcs,
                                                         const float* const* __restrict__ srcScales,
@@ -2075,6 +2107,40 @@ __device__ __forceinline__ void WarpAccumFp8DequantSegmentImpl(
     }
     dstToken[idx] = OutT(acc);
   }
+}
+
+template <typename OutT, typename Fp8T>
+__device__ __forceinline__ void WarpAccumFp8DequantSegmentBlock128Vec8Top8(
+    OutT* __restrict__ dstToken, const Fp8T* const* __restrict__ srcs,
+    const float* const* __restrict__ srcScales, int hiddenDimOffset, int hiddenDimSize) {
+  constexpr int AccumNum = 8;
+
+  const int laneId = threadIdx.x & (warpSize - 1);
+  if (hiddenDimSize <= 0) return;
+
+  const Fp8T* cachedSrcs[AccumNum];
+#pragma unroll AccumNum
+  for (int i = 0; i < AccumNum; ++i) {
+    cachedSrcs[i] = srcs[i];
+  }
+
+  bool anyScale = false;
+  if (srcScales != nullptr) {
+#pragma unroll AccumNum
+    for (int i = 0; i < AccumNum; ++i) {
+      anyScale |= (cachedSrcs[i] != nullptr && srcScales[i] != nullptr);
+    }
+  }
+
+  if (!anyScale) {
+    detail::WarpAccumFp8DequantVecRange<warpSize, 8, OutT, Fp8T, AccumNum, false>(
+        dstToken, cachedSrcs, nullptr, 0, hiddenDimSize, laneId);
+    return;
+  }
+
+  detail::WarpAccumFp8DequantVecRangeBlockwiseScaleWave<8, OutT, Fp8T, AccumNum>(
+      dstToken, cachedSrcs, srcScales, hiddenDimOffset, /*start=*/0, /*end=*/hiddenDimSize,
+      /*blockElems=*/128);
 }
 
 template <typename OutT, typename Fp8T>

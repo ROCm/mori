@@ -394,12 +394,12 @@ class EpDispatchCombineOp:
             + self.config.num_experts_per_rank
         ) * 4  # sizeof(index_t)
 
-    def _combine_shared_mem(self, warp_per_block):
+    def _combine_shared_mem(self, warp_per_block, use_weights=True):
         """Shared memory for combine kernels."""
         quant_type = _normalize_quant_type(self.config.quant_type)
-        num_ptr_arrays = (
-            3 if quant_type == EpDispatchCombineQuantType.Fp8BlockwiseQuant else 2
-        )
+        num_ptr_arrays = 1 + int(bool(use_weights))
+        if quant_type == EpDispatchCombineQuantType.Fp8BlockwiseQuant:
+            num_ptr_arrays += 1
         return (
             warp_per_block
             * self.config.num_experts_per_token
@@ -738,9 +738,9 @@ class EpDispatchCombineOp:
 
         grid = (actual_bn,)
         block = (WARP_SIZE * actual_wpb,)
-        shared_mem = self._combine_shared_mem(actual_wpb)
         kt = self.config.kernel_type.value
         quant_type = _normalize_quant_type(self.config.quant_type)
+        shared_mem = self._combine_shared_mem(actual_wpb)
 
         if quant_type == EpDispatchCombineQuantType.Fp8BlockwiseQuant:
             if kt != EpDispatchCombineKernelType.IntraNode.value:
@@ -800,8 +800,22 @@ class EpDispatchCombineOp:
             )
         elif kt == EpDispatchCombineKernelType.IntraNode.value:
             if quant_type == EpDispatchCombineQuantType.Fp8BlockwiseQuant:
+                use_block128_vec8_top8 = bool(weight_ptr == 0) and (
+                    hidden_dim == 7168
+                    and self.config.scale_dim == 56
+                    and self.config.num_experts_per_token == 8
+                    and self.config.world_size > 4
+                )
+                kernel_name = (
+                    "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq_noweight_vec8"
+                    if use_block128_vec8_top8
+                    else "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq"
+                )
+                shared_mem = self._combine_shared_mem(
+                    actual_wpb, use_weights=not use_block128_vec8_top8
+                )
                 self._launch(
-                    "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq",
+                    kernel_name,
                     grid,
                     block,
                     shared_mem,

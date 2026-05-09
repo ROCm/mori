@@ -378,8 +378,9 @@ static int dispatch_shared_mem(const EpDispatchCombineConfig& cfg, int wpb) {
          static_cast<int>(sizeof(index_t));
 }
 
-static int combine_shared_mem(int wpb, int num_experts_per_token, bool use_scale_ptrs = false) {
-  int num_ptr_arrays = use_scale_ptrs ? 3 : 2;
+static int combine_shared_mem(int wpb, int num_experts_per_token, bool use_scale_ptrs = false,
+                              bool use_weight_ptrs = true) {
+  int num_ptr_arrays = 1 + (use_weight_ptrs ? 1 : 0) + (use_scale_ptrs ? 1 : 0);
   return wpb * num_experts_per_token * num_ptr_arrays * 8;
 }
 
@@ -481,8 +482,10 @@ void LaunchCombine(EpDispatchCombineHandle& handle, void* input, void* weights, 
   }
 
   unsigned int block_x = WARP_SIZE * wpb;
+  const bool hasWeights = (weights != nullptr);
   int smem = combine_shared_mem(wpb, handle.config.numExpertPerToken,
-                                handle.config.quantType == QuantType::Fp8BlockwiseQuant);
+                                handle.config.quantType == QuantType::Fp8BlockwiseQuant,
+                                /*use_weight_ptrs=*/true);
   size_t args_size = sizeof(EpDispatchCombineArgsRaw);
   const char* sfx = dtype_suffix(dtype);
   auto& reg = KernelRegistry::Instance();
@@ -507,8 +510,16 @@ void LaunchCombine(EpDispatchCombineHandle& handle, void* input, void* weights, 
         if (args.config.scaleDim <= 0) {
           throw std::runtime_error("Fp8BlockwiseQuant requires scaleDim > 0");
         }
-        reg.Launch("EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq", bn, block_x, smem, stream, &args,
-                   args_size);
+        const bool useBlock128Vec8Top8 =
+            !hasWeights && args.config.hiddenDim == 7168 && args.config.scaleDim == 56 &&
+            args.config.numExpertPerToken == 8 && args.config.worldSize > 4;
+        const char* kernel_name = useBlock128Vec8Top8
+                                      ? "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq_noweight_vec8"
+                                      : "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq";
+        int fp8bwq_smem = combine_shared_mem(wpb, handle.config.numExpertPerToken,
+                                             /*use_scale_ptrs=*/true,
+                                             /*use_weight_ptrs=*/!useBlock128Vec8Top8);
+        reg.Launch(kernel_name, bn, block_x, fp8bwq_smem, stream, &args, args_size);
       } else if (args.config.useExternalInpBuffer) {
         reg.Launch(std::string("EpCombineIntraNodeKernel_") + sfx + "_nop2p", bn, block_x, smem,
                    stream, &args, args_size);

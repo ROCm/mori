@@ -225,7 +225,8 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
 /*                                    EpCombineIntraNodeKernel                                    */
 /* ---------------------------------------------------------------------------------------------- */
 template <typename T, bool UseP2PRead = true, bool EnableStdMoE = false,
-          bool UseFp8DirectCast = false, bool UseFp8BlockwiseQuant = false>
+          bool UseFp8DirectCast = false, bool UseFp8BlockwiseQuant = false, bool UseWeights = true,
+          bool UseBlock128Vec8Top8 = false>
 __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   using TokT =
       std::conditional_t<UseFp8DirectCast || UseFp8BlockwiseQuant, core::CombineInternalFp8, T>;
@@ -261,7 +262,7 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
   const size_t hiddenDim = config.HiddenDimSz();
   const size_t hiddenBytes = hiddenDim * sizeof(TokT);
   const size_t weightBytes =
-      (args.weightsBuf == nullptr) ? 0 : config.numExpertPerToken * sizeof(float);
+      (UseWeights && args.weightsBuf != nullptr) ? config.numExpertPerToken * sizeof(float) : 0;
   const size_t scaleBytes =
       UseFp8BlockwiseQuant ? static_cast<size_t>(config.scaleDim) * sizeof(float) : 0;
   const size_t combXferBytes = hiddenBytes + scaleBytes + weightBytes;
@@ -289,12 +290,14 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
         }
       }
     }
-    MORI_TRACE_NEXT(seq, Slot::CombineCopyWeights);
-    if (args.weightsBuf) {
-      for (int i = globalWarpId; i < totalRecvTokenNum; i += globalWarpNum) {
-        core::WarpCopy(
-            args.shmemInpWeightsMemObj->template GetAs<float*>() + i * config.numExpertPerToken,
-            args.weightsBuf + i * config.numExpertPerToken, config.numExpertPerToken);
+    if constexpr (UseWeights) {
+      MORI_TRACE_NEXT(seq, Slot::CombineCopyWeights);
+      if (args.weightsBuf) {
+        for (int i = globalWarpId; i < totalRecvTokenNum; i += globalWarpNum) {
+          core::WarpCopy(
+              args.shmemInpWeightsMemObj->template GetAs<float*>() + i * config.numExpertPerToken,
+              args.weightsBuf + i * config.numExpertPerToken, config.numExpertPerToken);
+        }
       }
     }
   } else {
@@ -320,19 +323,21 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
                        args.inpTokenBuf + tokenIdx * hiddenDim, hiddenDim);
       }
     }
-    MORI_TRACE_NEXT(seq, Slot::CombineCopyWeights);
-    if (args.weightsBuf) {
-      for (int tokenIdx = globalWarpId; tokenIdx < totalRecvTokenNum; tokenIdx += globalWarpNum) {
-        index_t destTokId =
-            args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(myPe)[tokenIdx];
-        index_t destPe = PeFromFlatTokenIndex(config, destTokId);
-        index_t destLocalTokId = LocalTokIdFromFlatTokenIndex(config, destTokId);
-        uint8_t* destStagingPtr =
-            args.intraNodeTokBufs.combineInp->template GetAs<uint8_t*>(destPe) +
-            SendBufSlotOffset(config, myPe, destLocalTokId) * combXferBytes;
-        core::WarpCopy(reinterpret_cast<float*>(destStagingPtr + hiddenBytes + scaleBytes),
-                       args.weightsBuf + tokenIdx * config.numExpertPerToken,
-                       config.numExpertPerToken);
+    if constexpr (UseWeights) {
+      MORI_TRACE_NEXT(seq, Slot::CombineCopyWeights);
+      if (args.weightsBuf) {
+        for (int tokenIdx = globalWarpId; tokenIdx < totalRecvTokenNum; tokenIdx += globalWarpNum) {
+          index_t destTokId =
+              args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(myPe)[tokenIdx];
+          index_t destPe = PeFromFlatTokenIndex(config, destTokId);
+          index_t destLocalTokId = LocalTokIdFromFlatTokenIndex(config, destTokId);
+          uint8_t* destStagingPtr =
+              args.intraNodeTokBufs.combineInp->template GetAs<uint8_t*>(destPe) +
+              SendBufSlotOffset(config, myPe, destLocalTokId) * combXferBytes;
+          core::WarpCopy(reinterpret_cast<float*>(destStagingPtr + hiddenBytes + scaleBytes),
+                         args.weightsBuf + tokenIdx * config.numExpertPerToken,
+                         config.numExpertPerToken);
+        }
       }
     }
 #else
@@ -356,10 +361,12 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
         core::WarpCopy(reinterpret_cast<T*>(destStagingPtr),
                        args.inpTokenBuf + tokenIdx * hiddenDim, hiddenDim);
       }
-      if (args.weightsBuf) {
-        core::WarpCopy(reinterpret_cast<float*>(destStagingPtr + hiddenBytes + scaleBytes),
-                       args.weightsBuf + tokenIdx * config.numExpertPerToken,
-                       config.numExpertPerToken);
+      if constexpr (UseWeights) {
+        if (args.weightsBuf) {
+          core::WarpCopy(reinterpret_cast<float*>(destStagingPtr + hiddenBytes + scaleBytes),
+                         args.weightsBuf + tokenIdx * config.numExpertPerToken,
+                         config.numExpertPerToken);
+        }
       }
     }
 #endif
@@ -374,11 +381,16 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
   MORI_TRACE_NEXT(seq, Slot::CombineAccumSetup);
   extern __shared__ char sharedMem[];
   TokT** srcPtrs = reinterpret_cast<TokT**>(sharedMem) + warpId * config.numExpertPerToken;
-  float** srcWeightsPtr = reinterpret_cast<float**>(sharedMem) +
-                          warpNum * config.numExpertPerToken + warpId * config.numExpertPerToken;
+  float** srcWeightsPtr = nullptr;
+  if constexpr (UseWeights) {
+    srcWeightsPtr = reinterpret_cast<float**>(sharedMem) + warpNum * config.numExpertPerToken +
+                    warpId * config.numExpertPerToken;
+  }
   float** srcScalePtrs = nullptr;
   if constexpr (UseFp8BlockwiseQuant) {
-    srcScalePtrs = reinterpret_cast<float**>(sharedMem) + 2 * warpNum * config.numExpertPerToken +
+    constexpr int scalePtrArrayOffset = UseWeights ? 2 : 1;
+    srcScalePtrs = reinterpret_cast<float**>(sharedMem) +
+                   scalePtrArrayOffset * warpNum * config.numExpertPerToken +
                    warpId * config.numExpertPerToken;
   }
 
@@ -392,7 +404,6 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
 
     // Prepare data pointers on different GPUs
     MORI_TRACE_NEXT(seq, Slot::CombinePreparePtrs);
-    const size_t weightOffset = hiddenBytes + scaleBytes;
     for (int j = laneId; j < config.numExpertPerToken; j += warpSize) {
       index_t destTokId = args.dispDestTokIdMap[tokenId * config.numExpertPerToken + j];
       index_t destPe = PeFromFlatTokenIndex(config, destTokId);
@@ -402,8 +413,10 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
           index_t destLocalTokId = LocalTokIdFromFlatTokenIndex(config, destTokId);
           srcPtrs[j] = args.intraNodeTokBufs.combineInp->template GetAs<TokT*>(destPe) +
                        destLocalTokId * hiddenDim + hiddenDimOffset;
-          srcWeightsPtr[j] = args.shmemInpWeightsMemObj->template GetAs<float*>(destPe) +
-                             destLocalTokId * config.numExpertPerToken;
+          if constexpr (UseWeights) {
+            srcWeightsPtr[j] = args.shmemInpWeightsMemObj->template GetAs<float*>(destPe) +
+                               destLocalTokId * config.numExpertPerToken;
+          }
           if constexpr (UseFp8BlockwiseQuant) {
             float* scalePtr = args.shmemInpScalesMemObj->template GetAs<float*>(destPe) +
                               destLocalTokId * config.scaleDim;
@@ -414,9 +427,12 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
                            args.intraNodeTokBufs.combineInp->template GetAs<uint8_t*>(myPe) +
                            SendBufSlotOffset(config, destPe, tokenId) * combXferBytes) +
                        hiddenDimOffset;
-          srcWeightsPtr[j] = reinterpret_cast<float*>(
-              args.intraNodeTokBufs.combineInp->template GetAs<uint8_t*>(myPe) +
-              SendBufSlotOffset(config, destPe, tokenId) * combXferBytes + weightOffset);
+          if constexpr (UseWeights) {
+            srcWeightsPtr[j] = reinterpret_cast<float*>(
+                args.intraNodeTokBufs.combineInp->template GetAs<uint8_t*>(myPe) +
+                SendBufSlotOffset(config, destPe, tokenId) * combXferBytes + hiddenBytes +
+                scaleBytes);
+          }
           if constexpr (UseFp8BlockwiseQuant) {
             float* scalePtr = reinterpret_cast<float*>(
                 args.intraNodeTokBufs.combineInp->template GetAs<uint8_t*>(myPe) +
@@ -426,7 +442,9 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
         }
       } else {
         srcPtrs[j] = nullptr;
-        srcWeightsPtr[j] = nullptr;
+        if constexpr (UseWeights) {
+          srcWeightsPtr[j] = nullptr;
+        }
         if constexpr (UseFp8BlockwiseQuant) {
           srcScalePtrs[j] = nullptr;
         }
@@ -463,16 +481,28 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
 
     if constexpr (UseFp8BlockwiseQuant) {
       MORI_TRACE_NEXT(seq, Slot::CombineDequantAccum);
-      if (mwIter.warpsPerItem == 1) {
-        core::WarpAccumFp8DequantFull<T, core::CombineInternalFp8>(
-            outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
-            reinterpret_cast<const float* const*>(srcScalePtrs), validAccumCount, hiddenDim,
-            config.scaleDim);
+      if constexpr (UseBlock128Vec8Top8) {
+        if (mwIter.warpsPerItem == 1) {
+          core::WarpAccumFp8DequantFullBlock128Vec8Top8<T, core::CombineInternalFp8>(
+              outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
+              reinterpret_cast<const float* const*>(srcScalePtrs), hiddenDim);
+        } else {
+          core::WarpAccumFp8DequantSegmentBlock128Vec8Top8<T, core::CombineInternalFp8>(
+              outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
+              reinterpret_cast<const float* const*>(srcScalePtrs), hiddenDimOffset, hiddenDimSize);
+        }
       } else {
-        core::WarpAccumFp8DequantSegment<T, core::CombineInternalFp8>(
-            outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
-            reinterpret_cast<const float* const*>(srcScalePtrs), validAccumCount, hiddenDimOffset,
-            hiddenDimSize, hiddenDim, config.scaleDim);
+        if (mwIter.warpsPerItem == 1) {
+          core::WarpAccumFp8DequantFull<T, core::CombineInternalFp8>(
+              outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
+              reinterpret_cast<const float* const*>(srcScalePtrs), validAccumCount, hiddenDim,
+              config.scaleDim);
+        } else {
+          core::WarpAccumFp8DequantSegment<T, core::CombineInternalFp8>(
+              outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
+              reinterpret_cast<const float* const*>(srcScalePtrs), validAccumCount, hiddenDimOffset,
+              hiddenDimSize, hiddenDim, config.scaleDim);
+        }
       }
     } else if constexpr (!std::is_same_v<T, TokT> &&
                          std::is_same_v<TokT, core::CombineInternalFp8>) {
@@ -484,21 +514,24 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
       core::WarpAccum<T, 4>(outPtr, srcPtrs, nullptr, validAccumCount, hiddenDimSize);
     }
 
-    MORI_TRACE_NEXT(seq, Slot::CombineAccumWeights);
-    if (args.weightsBuf && inTokenPartId == mwIter.warpsPerItem - 1) {
-      core::WarpAccum<float, 4>(args.shmemCombineOutWeightsMemObj->template GetAs<float*>() +
-                                    tokenId * config.numExpertPerToken,
-                                srcWeightsPtr, nullptr, config.numExpertPerToken,
-                                config.numExpertPerToken);
+    if constexpr (UseWeights) {
+      MORI_TRACE_NEXT(seq, Slot::CombineAccumWeights);
+      if (args.weightsBuf && inTokenPartId == mwIter.warpsPerItem - 1) {
+        core::WarpAccum<float, 4>(args.shmemCombineOutWeightsMemObj->template GetAs<float*>() +
+                                      tokenId * config.numExpertPerToken,
+                                  srcWeightsPtr, nullptr, config.numExpertPerToken,
+                                  config.numExpertPerToken);
+      }
     }
   }
 }
 
 template <typename T, bool UseP2PRead = true, bool EnableStdMoE = false,
-          bool UseFp8DirectCast = false, bool UseFp8BlockwiseQuant = false>
+          bool UseFp8DirectCast = false, bool UseFp8BlockwiseQuant = false, bool UseWeights = true,
+          bool UseBlock128Vec8Top8 = false>
 __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
-  EpCombineIntraNodeKernel_body<T, UseP2PRead, EnableStdMoE, UseFp8DirectCast,
-                                UseFp8BlockwiseQuant>(args);
+  EpCombineIntraNodeKernel_body<T, UseP2PRead, EnableStdMoE, UseFp8DirectCast, UseFp8BlockwiseQuant,
+                                UseWeights, UseBlock128Vec8Top8>(args);
 }
 
 }  // namespace moe
