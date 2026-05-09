@@ -1108,7 +1108,7 @@ void PoolClient::ExecuteRemoteGetTransfers(std::vector<RemoteGetEntry>& entries,
     ids[i] = io_engine_->AllocateTransferUniqueId();
   }
 
-  io_engine_->BatchRead(remote_descs, remote_offsets, local_descs, local_offsets, sizes_v,
+  io_engine_->BatchRead(local_descs, local_offsets, remote_descs, remote_offsets, sizes_v,
                         status_ptrs, ids);
   for (size_t i = 0; i < active_transfers.size(); ++i) {
     statuses[i].Wait();
@@ -1380,47 +1380,67 @@ bool PoolClient::RemoteDramScatterRead(PeerConnection& peer, const std::vector<P
 
 bool PoolClient::EnsurePeerServiceConnection(PeerConnection& peer) {
   std::lock_guard<std::mutex> lock(peer.ssd_op_mutex);
-  if (peer.peer_stub) return true;
-  if (peer.peer_address.empty()) return false;
-
-  auto channel = grpc::CreateChannel(peer.peer_address, grpc::InsecureChannelCredentials());
-  auto stub = ::umbp::UMBPPeer::NewStub(channel);
-
-  ::umbp::GetPeerInfoRequest req;
-  ::umbp::GetPeerInfoResponse resp;
-  grpc::ClientContext ctx;
-  auto status = stub->GetPeerInfo(&ctx, req, &resp);
-  if (!status.ok()) {
-    MORI_UMBP_ERROR("[PoolClient] GetPeerInfo failed for '{}': {}", peer.peer_address,
-                    status.error_message());
+  if (peer.peer_address.empty()) {
     return false;
   }
 
-  if (!resp.engine_desc().empty()) {
-    auto handle = msgpack::unpack(resp.engine_desc().data(), resp.engine_desc().size());
-    peer.engine_desc = handle.get().as<mori::io::EngineDesc>();
-    if (io_engine_ && !peer.engine_registered) {
-      io_engine_->RegisterRemoteEngine(peer.engine_desc);
-      peer.engine_registered = true;
+  auto hydrate_from_peer = [&](::umbp::UMBPPeer::Stub* stub) -> bool {
+    ::umbp::GetPeerInfoRequest req;
+    ::umbp::GetPeerInfoResponse resp;
+    grpc::ClientContext ctx;
+    auto status = stub->GetPeerInfo(&ctx, req, &resp);
+    if (!status.ok()) {
+      MORI_UMBP_ERROR("[PoolClient] GetPeerInfo failed for '{}': {}", peer.peer_address,
+                      status.error_message());
+      return false;
     }
-  }
-  if (!resp.ssd_staging_mem_desc().empty()) {
-    auto handle =
-        msgpack::unpack(resp.ssd_staging_mem_desc().data(), resp.ssd_staging_mem_desc().size());
-    peer.ssd_staging_mem = handle.get().as<mori::io::MemoryDesc>();
-    peer.ssd_staging_size = resp.ssd_staging_size();
+
+    if (!resp.engine_desc().empty()) {
+      auto handle = msgpack::unpack(resp.engine_desc().data(), resp.engine_desc().size());
+      peer.engine_desc = handle.get().as<mori::io::EngineDesc>();
+      if (io_engine_) {
+        io_engine_->RegisterRemoteEngine(peer.engine_desc);
+        peer.engine_registered = true;
+      }
+    } else if (io_engine_ && !peer.engine_registered) {
+      return false;
+    }
+
+    if (!resp.ssd_staging_mem_desc().empty()) {
+      auto handle =
+          msgpack::unpack(resp.ssd_staging_mem_desc().data(), resp.ssd_staging_mem_desc().size());
+      peer.ssd_staging_mem = handle.get().as<mori::io::MemoryDesc>();
+      peer.ssd_staging_size = resp.ssd_staging_size();
+    }
+
+    for (const auto& d : resp.dram_memory_descs()) {
+      if (peer.dram_memories.size() <= d.buffer_index()) {
+        peer.dram_memories.resize(d.buffer_index() + 1);
+      }
+      if (IsValidMemoryDesc(peer.dram_memories[d.buffer_index()])) continue;
+      if (d.desc().empty()) continue;
+      auto h = msgpack::unpack(d.desc().data(), d.desc().size());
+      peer.dram_memories[d.buffer_index()] = h.get().as<mori::io::MemoryDesc>();
+    }
+    return true;
+  };
+
+  if (peer.peer_stub) {
+    if (!peer.engine_registered && io_engine_) {
+      auto* stub = static_cast<::umbp::UMBPPeer::Stub*>(peer.peer_stub.get());
+      if (!hydrate_from_peer(stub)) {
+        peer.peer_stub.reset();
+        peer.engine_registered = false;
+        return false;
+      }
+    }
+    return true;
   }
 
-  // Hydrate any DRAM/HBM descs handed out in GetPeerInfo so first-
-  // contact AllocateSlot/ResolveKey responses don't have to.
-  for (const auto& d : resp.dram_memory_descs()) {
-    if (peer.dram_memories.size() <= d.buffer_index()) {
-      peer.dram_memories.resize(d.buffer_index() + 1);
-    }
-    if (IsValidMemoryDesc(peer.dram_memories[d.buffer_index()])) continue;
-    if (d.desc().empty()) continue;
-    auto h = msgpack::unpack(d.desc().data(), d.desc().size());
-    peer.dram_memories[d.buffer_index()] = h.get().as<mori::io::MemoryDesc>();
+  auto channel = grpc::CreateChannel(peer.peer_address, grpc::InsecureChannelCredentials());
+  auto stub = ::umbp::UMBPPeer::NewStub(channel);
+  if (!hydrate_from_peer(stub.get())) {
+    return false;
   }
 
   peer.peer_stub = std::unique_ptr<void, void (*)(void*)>(
