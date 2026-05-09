@@ -339,6 +339,7 @@ def _hipcc_genco(
         *_ccqe_defines(),
         *_profiler_defines(),
     ]
+    print("genco cmd", cmd)
     for d in include_dirs:
         cmd.extend(["-I", str(d)])
     cmd.extend([str(source), "-o", str(output)])
