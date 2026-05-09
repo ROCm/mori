@@ -641,7 +641,7 @@ inline __device__ int PollCqOnce2(WorkQueueHandle& wqHandle, CompletionQueueHand
 #else
 inline __device__ int PollCqOnce2(WorkQueueHandle& wqHandle, CompletionQueueHandle& cqHandle,
                                   uint64_t activemask, void* cqeAddr, uint32_t cqeNum,
-                                  cduint32_t consIdx) {
+                                  uint32_t consIdx) {
   uint32_t my_logical_lane_id = get_active_lane_num(activemask);
   uint32_t my_cq_pos = cqHandle.cq_consumer + my_logical_lane_id;
 
