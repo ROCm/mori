@@ -235,7 +235,7 @@ def _is_all_ionic_support_ccqe() -> bool:
     for ver in versions:
         if not _is_firmware_support_ccqe(ver):
             return False
-        
+
     return True
 
 
