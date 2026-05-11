@@ -248,6 +248,7 @@ def is_ccqe_enabled() -> bool:
     if _ccqe_enabled is None:
         _ccqe_enabled = _lib_has_ionic_ccqe() and _is_all_ionic_support_ccqe()
         print(f"Ionic _ccqe_enabled: {_ccqe_enabled}")
+
     return _ccqe_enabled
 
 
