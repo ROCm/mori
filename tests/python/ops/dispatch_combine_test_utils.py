@@ -27,9 +27,233 @@ import torch.distributed as dist
 
 TORCH_FLOAT4_E2M1FN_X2 = getattr(torch, "float4_e2m1fn_x2", None)
 
+# OCP/FNUZ FP8 e4m3 max finite. Matches kCombineInternalFp8MaxFinite on the
+# device side. Used as the threshold for blockwise scale-active detection.
+FP8_E4M3_MAX_FINITE = 448.0
+
+INPUT_DIST_CHOICES = ("normal", "uniform", "lognormal", "two_bucket")
+
 
 def _is_fp4x2_dtype(dtype):
     return TORCH_FLOAT4_E2M1FN_X2 is not None and dtype is TORCH_FLOAT4_E2M1FN_X2
+
+
+def _generate_input_tensor(
+    shape,
+    *,
+    dtype,
+    device,
+    generator,
+    input_dist="normal",
+    input_scale=1.0,
+    input_shift=0.0,
+    force_scale_active=False,
+    block_elems=None,
+    fp8_max=FP8_E4M3_MAX_FINITE,
+):
+    """Generate a [N, H] input tensor with the requested distribution.
+
+    `input_scale` / `input_shift` are applied uniformly after sampling.
+    When `force_scale_active=True`, each scale block (last dim partitioned
+    into chunks of `block_elems`) is guaranteed to contain at least one
+    element with abs > `fp8_max`, so the kernel always exercises the
+    scale-active path.
+    """
+    if input_dist not in INPUT_DIST_CHOICES:
+        raise ValueError(
+            f"Unsupported input_dist={input_dist!r}; "
+            f"choose from {INPUT_DIST_CHOICES}"
+        )
+
+    n, h = shape
+
+    if input_dist == "normal":
+        x = torch.randn(n, h, dtype=torch.float32, device=device, generator=generator)
+    elif input_dist == "uniform":
+        # Uniform on [-1, 1] before scale/shift.
+        u = torch.rand(n, h, dtype=torch.float32, device=device, generator=generator)
+        x = u * 2.0 - 1.0
+    elif input_dist == "lognormal":
+        # Centered lognormal: exp(N(0,1)) - 1 produces a long right tail.
+        z = torch.randn(n, h, dtype=torch.float32, device=device, generator=generator)
+        x = torch.exp(z) - 1.0
+    elif input_dist == "two_bucket":
+        # Mostly N(0,1), 1% drawn from N(0, 16) to model long-tail activations.
+        # The heavy bucket scale is 16x the base, multiplied by `input_scale`
+        # to allow further widening from the CLI.
+        base = torch.randn(
+            n, h, dtype=torch.float32, device=device, generator=generator
+        )
+        heavy = (
+            torch.randn(n, h, dtype=torch.float32, device=device, generator=generator)
+            * 16.0
+        )
+        mask = (
+            torch.rand(n, h, dtype=torch.float32, device=device, generator=generator)
+            < 0.01
+        )
+        x = torch.where(mask, heavy, base)
+    else:
+        # Defensive; INPUT_DIST_CHOICES should already cover this.
+        raise ValueError(f"Unsupported input_dist={input_dist!r}")
+
+    if input_scale != 1.0:
+        x.mul_(float(input_scale))
+    if input_shift != 0.0:
+        x.add_(float(input_shift))
+
+    if force_scale_active:
+        if block_elems is None or block_elems <= 0:
+            raise ValueError("force_scale_active=True requires a positive block_elems")
+        # Ensure every (token, scale-block) has |x| > fp8_max for at least
+        # one element. We overwrite the first lane of each block with a
+        # sign-alternating value of magnitude 2*fp8_max so that the kernel
+        # max-reduce always sees a value above the threshold.
+        if n > 0 and h > 0:
+            num_blocks = (h + block_elems - 1) // block_elems
+            sentinel = float(fp8_max) * 2.0
+            for b in range(num_blocks):
+                col = b * block_elems
+                if col >= h:
+                    break
+                # Alternate signs across tokens so we don't bias the
+                # accumulate output direction.
+                signs = torch.where(
+                    torch.arange(n, device=device) % 2 == 0,
+                    torch.tensor(sentinel, device=device),
+                    torch.tensor(-sentinel, device=device),
+                )
+                x[:, col] = signs
+
+    if _is_fp4x2_dtype(dtype):
+        # FP4 path is not driven by this helper; callers should not pass
+        # FP4 dtype through here.
+        raise ValueError("_generate_input_tensor does not support FP4x2 dtype")
+
+    return x.to(dtype)
+
+
+def compute_scale_active_stats(
+    all_rank_input,
+    *,
+    scale_dim,
+    fp8_max=FP8_E4M3_MAX_FINITE,
+):
+    """Compute scale-active statistics matching the device-side blockwise quant.
+
+    For a token with hidden dimension H and `scale_dim` scale blocks, the
+    block size in elements is `block_elems = ceil(H / scale_dim)` (the
+    same partition the device kernel uses). A block is considered
+    "scale-active" when its element-wise max absolute value exceeds
+    `fp8_max`. A token is considered "any-scaled" when at least one of
+    its blocks is scale-active.
+
+    Returns a list of per-rank stat dicts (None entries for empty ranks)
+    plus an aggregated dict over all non-empty ranks.
+    """
+    per_rank = []
+    block_scaled_counts = []
+    block_total_counts = []
+    token_any_scaled_counts = []
+    token_total_counts = []
+    all_token_max_abs = []
+
+    for r, x in enumerate(all_rank_input):
+        if x is None or x.numel() == 0:
+            per_rank.append(None)
+            continue
+
+        n, h = x.shape
+        x_f = x.to(torch.float32).abs()
+        block_elems = (h + scale_dim - 1) // scale_dim
+        padded_h = block_elems * scale_dim
+        if padded_h != h:
+            pad = torch.zeros(n, padded_h - h, device=x_f.device, dtype=x_f.dtype)
+            x_f = torch.cat([x_f, pad], dim=1)
+
+        blocks = x_f.view(n, scale_dim, block_elems)
+        block_max = blocks.amax(dim=2)
+        block_scaled = block_max > fp8_max
+        token_any_scaled = block_scaled.any(dim=1)
+        token_max_abs = block_max.amax(dim=1)
+
+        token_max_abs_cpu = token_max_abs.detach().to("cpu").float()
+        per_rank.append(
+            {
+                "rank": r,
+                "num_tokens": int(n),
+                "block_elems": int(block_elems),
+                "scale_dim": int(scale_dim),
+                "token_any_scaled_ratio": float(token_any_scaled.float().mean()),
+                "block_scaled_ratio": float(block_scaled.float().mean()),
+                "max_abs_p50": float(torch.quantile(token_max_abs_cpu, 0.50)),
+                "max_abs_p90": float(torch.quantile(token_max_abs_cpu, 0.90)),
+                "max_abs_p99": float(torch.quantile(token_max_abs_cpu, 0.99)),
+                "max_abs_max": float(token_max_abs_cpu.max()),
+            }
+        )
+
+        block_scaled_counts.append(int(block_scaled.sum().item()))
+        block_total_counts.append(int(block_scaled.numel()))
+        token_any_scaled_counts.append(int(token_any_scaled.sum().item()))
+        token_total_counts.append(int(token_any_scaled.numel()))
+        all_token_max_abs.append(token_max_abs_cpu)
+
+    if all_token_max_abs:
+        merged = torch.cat(all_token_max_abs)
+        block_total = sum(block_total_counts) or 1
+        token_total = sum(token_total_counts) or 1
+        aggregate = {
+            "num_ranks": len(all_token_max_abs),
+            "num_tokens_total": token_total,
+            "block_scaled_ratio": sum(block_scaled_counts) / block_total,
+            "token_any_scaled_ratio": sum(token_any_scaled_counts) / token_total,
+            "max_abs_p50": float(torch.quantile(merged, 0.50)),
+            "max_abs_p90": float(torch.quantile(merged, 0.90)),
+            "max_abs_p99": float(torch.quantile(merged, 0.99)),
+            "max_abs_max": float(merged.max()),
+        }
+    else:
+        aggregate = None
+
+    return per_rank, aggregate
+
+
+def format_scale_stats_report(
+    per_rank, aggregate, *, scale_dim, fp8_max=FP8_E4M3_MAX_FINITE
+):
+    """Format scale-active stats as a multi-line human-readable report."""
+    lines = []
+    lines.append(
+        f"[scale-stats] scale_dim={scale_dim}, fp8_max={fp8_max:g} "
+        f"(token_any_scaled_ratio = fraction of tokens with at least one block "
+        f"whose max|x| > fp8_max; block_scaled_ratio = fraction of all blocks "
+        f"with max|x| > fp8_max)"
+    )
+    for stat in per_rank:
+        if stat is None:
+            continue
+        lines.append(
+            f"  rank {stat['rank']:>2d}: ntok={stat['num_tokens']:>5d} "
+            f"block_elems={stat['block_elems']:>3d} "
+            f"any_scaled={stat['token_any_scaled_ratio']:.4f} "
+            f"block_scaled={stat['block_scaled_ratio']:.4f} "
+            f"max|x| p50={stat['max_abs_p50']:.3f} "
+            f"p90={stat['max_abs_p90']:.3f} "
+            f"p99={stat['max_abs_p99']:.3f} "
+            f"max={stat['max_abs_max']:.3f}"
+        )
+    if aggregate is not None:
+        lines.append(
+            f"  AGG  : ntok={aggregate['num_tokens_total']:>5d} "
+            f"any_scaled={aggregate['token_any_scaled_ratio']:.4f} "
+            f"block_scaled={aggregate['block_scaled_ratio']:.4f} "
+            f"max|x| p50={aggregate['max_abs_p50']:.3f} "
+            f"p90={aggregate['max_abs_p90']:.3f} "
+            f"p99={aggregate['max_abs_p99']:.3f} "
+            f"max={aggregate['max_abs_max']:.3f}"
+        )
+    return "\n".join(lines)
 
 
 _FP4_E2M1_LUT = [
@@ -139,7 +363,14 @@ class EpDispatchCombineTestCase:
         dist.barrier()
 
     def gen_test_data(
-        self, use_max_token_num=False, routing="random", num_token_override=None
+        self,
+        use_max_token_num=False,
+        routing="random",
+        num_token_override=None,
+        input_dist="normal",
+        input_scale=1.0,
+        input_shift=0.0,
+        force_scale_active=False,
     ):
         """Generate test data."""
         if num_token_override is not None:
@@ -233,27 +464,42 @@ class EpDispatchCombineTestCase:
         if self.config.scale_type_size == 1:
             all_rank_scales = [t.to(torch.float8_e4m3fnuz) for t in all_rank_scales]
 
+        # Pre-compute the device-side block partition so force_scale_active
+        # writes a sentinel into the same block layout the kernel uses.
+        block_elems = (
+            (self.config.hidden_dim + self.config.scale_dim - 1)
+            // self.config.scale_dim
+            if self.config.scale_dim > 0
+            else self.config.hidden_dim
+        )
+
         all_rank_input = []
         for r in range(self.config.world_size):
-            input_fp32 = torch.randn(
-                num_token[r],
-                self.config.hidden_dim,
-                dtype=torch.float32,
-                generator=self.rng,
-                device=self.device,
-            )
+            n_r = int(num_token[r])
             if _is_fp4x2_dtype(self.config.data_type):
                 fp4_bytes = torch.randint(
                     0,
                     256,
-                    (num_token[r], self.config.hidden_dim),
+                    (n_r, self.config.hidden_dim),
                     dtype=torch.uint8,
                     generator=self.rng,
                     device=self.device,
                 )
                 all_rank_input.append(fp4_bytes.view(torch.float4_e2m1fn_x2))
             else:
-                all_rank_input.append(input_fp32.to(self.config.data_type))
+                all_rank_input.append(
+                    _generate_input_tensor(
+                        (n_r, self.config.hidden_dim),
+                        dtype=self.config.data_type,
+                        device=self.device,
+                        generator=self.rng,
+                        input_dist=input_dist,
+                        input_scale=input_scale,
+                        input_shift=input_shift,
+                        force_scale_active=force_scale_active,
+                        block_elems=block_elems,
+                    )
+                )
 
         return (
             num_token,
@@ -346,16 +592,26 @@ class EpDispatchCombineTestCase:
             atol, rtol = 1e-2, 1e-2
             if getattr(self.config, "quant_type", "none") == "fp8_direct_cast":
                 atol, rtol = 1e-1, 1e-1
+            elif getattr(self.config, "quant_type", "none") == "fp8_blockwise":
+                # FP8 E4M3 quantization can exceed 5% after combine accumulation.
+                atol, rtol = 7e-2, 7e-2
             result_match = torch.allclose(
                 got.float(), expected.float(), atol=atol, rtol=rtol
             )
             if not result_match:
+                diff = (got.float() - expected.float()).abs()
+                tol = atol + rtol * expected.float().abs()
+                max_idx = int(diff.argmax().item())
                 print(f"Rank[{self.config.rank}] result mismatch for token {i}:")
                 print(
                     f"Rank[{self.config.rank}]   indices[{i}]: {all_rank_indices[self.config.rank][i].cpu().tolist()}"
                 )
                 print(f"Rank[{self.config.rank}]   pes: {pes}")
                 print(f"Rank[{self.config.rank}]   unique_pes: {unique_pes}")
+                print(
+                    f"Rank[{self.config.rank}]   max diff: idx={max_idx}, "
+                    f"diff={float(diff[max_idx])}, tol={float(tol[max_idx])}"
+                )
                 print(f"Rank[{self.config.rank}]   got: {got}")
                 print(f"Rank[{self.config.rank}]   expected : {expected}")
                 print(

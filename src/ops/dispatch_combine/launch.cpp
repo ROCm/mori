@@ -378,9 +378,10 @@ static int dispatch_shared_mem(const EpDispatchCombineConfig& cfg, int wpb) {
          static_cast<int>(sizeof(index_t));
 }
 
-static int combine_shared_mem(int wpb, int num_experts_per_token) {
-  // warpPerBlock * numExpertPerToken * (sizeof(ptr) + sizeof(ptr))
-  return wpb * num_experts_per_token * (8 + 8);
+static int combine_shared_mem(int wpb, int num_experts_per_token, bool use_scale_ptrs = false,
+                              bool use_weight_ptrs = true) {
+  int num_ptr_arrays = 1 + (use_weight_ptrs ? 1 : 0) + (use_scale_ptrs ? 1 : 0);
+  return wpb * num_experts_per_token * num_ptr_arrays * 8;
 }
 
 static void ensure_loaded() {
@@ -481,15 +482,60 @@ void LaunchCombine(EpDispatchCombineHandle& handle, void* input, void* weights, 
   }
 
   unsigned int block_x = WARP_SIZE * wpb;
-  int smem = combine_shared_mem(wpb, handle.config.numExpertPerToken);
+  const bool hasWeights = (weights != nullptr);
+  int smem = combine_shared_mem(wpb, handle.config.numExpertPerToken,
+                                handle.config.quantType == QuantType::Fp8BlockwiseQuant,
+                                /*use_weight_ptrs=*/true);
   size_t args_size = sizeof(EpDispatchCombineArgsRaw);
   const char* sfx = dtype_suffix(dtype);
   auto& reg = KernelRegistry::Instance();
   int mp = handle.multiProcessorCount;
 
+  if (args.config.quantType == QuantType::Fp8BlockwiseQuant &&
+      handle.config.kernelType != KernelType::IntraNode) {
+    throw std::runtime_error("Fp8BlockwiseQuant currently only supports IntraNode combine");
+  }
+
   switch (handle.config.kernelType) {
     case KernelType::IntraNode:
-      if (args.config.useExternalInpBuffer) {
+      if (args.config.quantType == QuantType::Fp8BlockwiseQuant) {
+        if (dtype != HIP_R_16BF) {
+          throw std::runtime_error("Fp8BlockwiseQuant currently only supports bf16 input");
+        }
+        if (!args.config.useExternalInpBuffer) {
+          throw std::runtime_error(
+              "Fp8BlockwiseQuant currently requires --zero-copy 0 "
+              "(useExternalInpBuffer=true)");
+        }
+        if (args.config.scaleDim <= 0) {
+          throw std::runtime_error("Fp8BlockwiseQuant requires scaleDim > 0");
+        }
+        // Pick the AccumNum=8 + VecBytes=8 specialization when (no weights, hidden_dim % 512 == 0,
+        // top-k == 8, EP > 4) and block_elems matches a registered symbol. Keep in sync with the
+        // Python launch path in dispatch_combine.py.
+        const int block_elems =
+            (args.config.scaleDim > 0)
+                ? ((args.config.hiddenDim + args.config.scaleDim - 1) / args.config.scaleDim)
+                : 0;
+        const bool baseVec8Top8Eligible = !hasWeights && (args.config.hiddenDim % 512 == 0) &&
+                                          args.config.numExpertPerToken == 8 &&
+                                          args.config.worldSize > 4;
+        const char* kernel_name = "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq";
+        bool useVec8Top8 = false;
+        if (baseVec8Top8Eligible) {
+          if (block_elems == 128) {
+            kernel_name = "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq_noweight_block128_vec8";
+            useVec8Top8 = true;
+          } else if (block_elems == 256) {
+            kernel_name = "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq_noweight_block256_vec8";
+            useVec8Top8 = true;
+          }
+        }
+        int fp8bwq_smem = combine_shared_mem(wpb, handle.config.numExpertPerToken,
+                                             /*use_scale_ptrs=*/true,
+                                             /*use_weight_ptrs=*/!useVec8Top8);
+        reg.Launch(kernel_name, bn, block_x, fp8bwq_smem, stream, &args, args_size);
+      } else if (args.config.useExternalInpBuffer) {
         reg.Launch(std::string("EpCombineIntraNodeKernel_") + sfx + "_nop2p", bn, block_x, smem,
                    stream, &args, args_size);
       } else {
@@ -566,7 +612,8 @@ void LaunchCombineRecv(EpDispatchCombineHandle& handle, int block_num, int warp_
   if (handle.curHiddenDim > 0) args.config.hiddenDim = handle.curHiddenDim;
 
   unsigned int block_x = WARP_SIZE * wpb;
-  int smem = combine_shared_mem(wpb, handle.config.numExpertPerToken);
+  int smem = combine_shared_mem(wpb, handle.config.numExpertPerToken,
+                                handle.config.quantType == QuantType::Fp8BlockwiseQuant);
   size_t args_size = sizeof(EpDispatchCombineArgsRaw);
   const char* sfx = dtype_suffix(handle.inputType);
 

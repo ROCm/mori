@@ -25,6 +25,9 @@ from tests.python.ops.dispatch_combine_test_utils import (
     _is_fp4x2_dtype,
     unpack_fp4x2,
     EpDispatchCombineTestCase,
+    INPUT_DIST_CHOICES,
+    compute_scale_active_stats,
+    format_scale_stats_report,
 )
 from tests.python.utils import TorchDistContext, get_free_port
 import torch
@@ -43,6 +46,11 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         combine_data_type=None,
         combine_hidden_dim=None,
         dispatch_hidden_dim=None,
+        input_dist="normal",
+        input_scale=1.0,
+        input_shift=0.0,
+        force_scale_active=False,
+        report_scale_stats=False,
     ):
         super().__init__(config)
         self.combine_data_type = (
@@ -56,13 +64,53 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             if dispatch_hidden_dim is not None
             else config.hidden_dim
         )
+        self.input_dist = input_dist
+        self.input_scale = float(input_scale)
+        self.input_shift = float(input_shift)
+        self.force_scale_active = bool(force_scale_active)
+        self.report_scale_stats = bool(report_scale_stats)
+        # Avoid printing the same scale-stats block more than once when
+        # gen_test_data is called multiple times in the same run.
+        self._scale_stats_reported = False
 
     def gen_test_data(self):
         saved = self.config.hidden_dim
         self.config.hidden_dim = self.dispatch_hidden_dim
-        result = super().gen_test_data(use_max_token_num=True)
+        result = super().gen_test_data(
+            use_max_token_num=True,
+            input_dist=self.input_dist,
+            input_scale=self.input_scale,
+            input_shift=self.input_shift,
+            force_scale_active=self.force_scale_active,
+        )
         self.config.hidden_dim = saved
+
+        if self.report_scale_stats and not self._scale_stats_reported:
+            self._scale_stats_reported = True
+            self._print_scale_stats(result)
         return result
+
+    def _print_scale_stats(self, test_data):
+        # Stats are computed on every rank (gen_test_data already produced
+        # this rank's tensors). Only rank 0 prints the report.
+        if _is_fp4x2_dtype(self.config.data_type):
+            return
+        (
+            _,
+            _,
+            all_rank_input,
+            _,
+            _,
+        ) = test_data
+        per_rank, aggregate = compute_scale_active_stats(
+            all_rank_input, scale_dim=self.config.scale_dim
+        )
+        if self.config.rank == 0:
+            print(
+                format_scale_stats_report(
+                    per_rank, aggregate, scale_dim=self.config.scale_dim
+                )
+            )
 
     def _get_combine_input(self, op, dispatch_output):
         """Return the tensor to pass as combine input.
@@ -838,6 +886,11 @@ def _bench_dispatch_combine(
     max_total_recv_tokens=0,
     save_tuning_config=None,
     call_local_expert_count=False,
+    input_dist="normal",
+    input_scale=1.0,
+    input_shift=0.0,
+    force_scale_active=False,
+    report_scale_stats=False,
 ):
     if combine_data_type is None:
         combine_data_type = data_type
@@ -854,6 +907,14 @@ def _bench_dispatch_combine(
             "fp8_direct_cast quant requires combine dtype to be bfloat16, "
             f"got {combine_data_type}"
         )
+    if quant_type == "fp8_blockwise":
+        if data_type is not torch.bfloat16 or combine_data_type is not torch.bfloat16:
+            raise ValueError(
+                "fp8_blockwise quant requires dispatch and combine dtype to be bfloat16, "
+                f"got dispatch={data_type}, combine={combine_data_type}"
+            )
+        if zero_copy != 0:
+            raise ValueError("fp8_blockwise quant requires --zero-copy 0")
 
     config = mori.ops.EpDispatchCombineConfig(
         data_type=data_type,
@@ -881,6 +942,11 @@ def _bench_dispatch_combine(
             combine_data_type=combine_data_type,
             combine_hidden_dim=combine_hidden_dim,
             dispatch_hidden_dim=hidden_dim,
+            input_dist=input_dist,
+            input_scale=input_scale,
+            input_shift=input_shift,
+            force_scale_active=force_scale_active,
+            report_scale_stats=report_scale_stats,
         )
 
         (
@@ -1147,6 +1213,13 @@ def bench_dispatch_combine(
     max_total_recv_tokens=0,
     save_tuning_config=None,
     call_local_expert_count=False,
+    scale_dim=32,
+    scale_type_size=4,
+    input_dist="normal",
+    input_scale=1.0,
+    input_shift=0.0,
+    force_scale_active=False,
+    report_scale_stats=False,
 ):
     if combine_data_type is None:
         combine_data_type = dtype
@@ -1159,8 +1232,8 @@ def bench_dispatch_combine(
             max_num_inp_token_per_rank,
             dtype,
             hidden_dim,
-            32,  # scale_dim
-            4,  # scale_type_size
+            scale_dim,
+            scale_type_size,
             num_experts_per_rank,
             num_experts_per_token,
             cmd,
@@ -1174,6 +1247,11 @@ def bench_dispatch_combine(
             max_total_recv_tokens,
             save_tuning_config,
             call_local_expert_count,
+            input_dist,
+            input_scale,
+            input_shift,
+            force_scale_active,
+            report_scale_stats,
         ),
         nprocs=world_size,
         join=True,
@@ -1223,10 +1301,11 @@ if __name__ == "__main__":
         "--quant-type",
         type=str,
         default="none",
-        choices=["none", "fp8_direct_cast"],
+        choices=["none", "fp8_direct_cast", "fp8_blockwise"],
         help=(
             "Quantization method used inside Combine. "
-            "'fp8_direct_cast' is the BF16<->FP8 direct cast path."
+            "'fp8_direct_cast' is the BF16<->FP8 direct cast path; "
+            "'fp8_blockwise' is the BF16<->FP8 blockwise quant path."
         ),
     )
     parser.add_argument(
@@ -1308,6 +1387,71 @@ if __name__ == "__main__":
         default=False,
         help="Call the local_expert_count kernel after each dispatch.",
     )
+    parser.add_argument(
+        "--scale-dim",
+        type=int,
+        default=32,
+        help=(
+            "Number of scale blocks per token for blockwise quant "
+            "(only used when --quant-type fp8_blockwise; default: 32). "
+            "Block size in elements is hidden_dim / scale_dim."
+        ),
+    )
+    parser.add_argument(
+        "--input-dist",
+        type=str,
+        default="normal",
+        choices=list(INPUT_DIST_CHOICES),
+        help=(
+            "Distribution used to generate the combine/dispatch input tensor. "
+            "'normal' is the legacy default (torch.randn). "
+            "'uniform' samples on [-1, 1]. "
+            "'lognormal' samples exp(N(0,1))-1 (heavy right tail). "
+            "'two_bucket' is 99% N(0,1) + 1% N(0, 16) for long-tail activations."
+        ),
+    )
+    parser.add_argument(
+        "--input-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Multiplier applied to the input distribution after sampling "
+            "(default: 1.0). Combine with --input-dist to control the dynamic "
+            "range; e.g. '--input-dist uniform --input-scale 1024' yields "
+            "uniform[-1024, 1024], reliably triggering scale-active blocks."
+        ),
+    )
+    parser.add_argument(
+        "--input-shift",
+        type=float,
+        default=0.0,
+        help=(
+            "Additive offset applied to the input after multiplying by "
+            "--input-scale (default: 0.0)."
+        ),
+    )
+    parser.add_argument(
+        "--force-scale-active",
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help=(
+            "When 1, write a sentinel value above the FP8 max into the first "
+            "lane of every scale block, so every block exercises the kernel's "
+            "scale-active path. Useful for stress-testing blockwise quant."
+        ),
+    )
+    parser.add_argument(
+        "--report-scale-stats",
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help=(
+            "When 1, compute and print scale-active stats from the host-side "
+            "reference (token any-scaled ratio, block scaled ratio, max|x| "
+            "p50/p90/p99/max) for the generated input."
+        ),
+    )
     args = parser.parse_args()
 
     if args.num_experts_per_rank is None:
@@ -1318,6 +1462,14 @@ if __name__ == "__main__":
 
     dispatch_dtype = _DATA_TYPE_MAP[args.dtype]
     combine_dtype = _DATA_TYPE_MAP[combine_dtype_str]
+
+    if args.quant_type == "fp8_blockwise":
+        if args.dtype != "bf16" or combine_dtype_str != "bf16":
+            raise ValueError(
+                "fp8_blockwise quant requires --dtype bf16 and --combine-dtype bf16"
+            )
+        if args.zero_copy != 0:
+            raise ValueError("fp8_blockwise quant requires --zero-copy 0")
 
     base_hidden_dim = args.hidden_dim
     dispatch_hidden_dim = (
@@ -1333,6 +1485,12 @@ if __name__ == "__main__":
         f"num_experts_per_token: {args.num_experts_per_token}, "
         f"zero_copy: {'true' if args.zero_copy else 'false'}, "
         f"quant_type: {args.quant_type}, "
+        f"scale_dim: {args.scale_dim}, "
+        f"input_dist: {args.input_dist}, "
+        f"input_scale: {args.input_scale}, "
+        f"input_shift: {args.input_shift}, "
+        f"force_scale_active: {bool(args.force_scale_active)}, "
+        f"report_scale_stats: {bool(args.report_scale_stats)}, "
         f"dispatch_block_num: {args.dispatch_block_num}, "
         f"dispatch_warp_per_block: {args.dispatch_warp_per_block}, "
         f"combine_block_num: {args.combine_block_num}, "
@@ -1357,4 +1515,10 @@ if __name__ == "__main__":
         max_total_recv_tokens=args.max_recv_total_tokens,
         save_tuning_config=args.save_tuning_config,
         call_local_expert_count=args.local_expert_count,
+        scale_dim=args.scale_dim,
+        input_dist=args.input_dist,
+        input_scale=args.input_scale,
+        input_shift=args.input_shift,
+        force_scale_active=bool(args.force_scale_active),
+        report_scale_stats=bool(args.report_scale_stats),
     )
