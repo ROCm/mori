@@ -231,10 +231,9 @@ def _is_all_ionic_support_ccqe() -> bool:
         return False
     if len(set(versions)) != 1:
         return False
-    
+
     for ver in versions:
         if not _is_firmware_support_ccqe(ver):
-            print(ver)
             return False
         
     return True
@@ -248,6 +247,7 @@ def is_ccqe_enabled() -> bool:
     global _ccqe_enabled
     if _ccqe_enabled is None:
         _ccqe_enabled = _lib_has_ionic_ccqe() and _is_all_ionic_support_ccqe()
+        print(f"ccqe_enabled {_ccqe_enabled}")
     return _ccqe_enabled
 
 
