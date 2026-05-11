@@ -50,8 +50,6 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
     config_.ssd.capacity_bytes = 0;
   }
 
-  dram_pool_size_ = config.dram.capacity_bytes;
-
   HostMemAllocator allocator;
   HostBufferOptions opts;
   opts.backing = config.dram.use_hugepages ? HostBufferBacking::kAnonymousHugetlb
@@ -60,11 +58,21 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
   opts.numa_node = config.dram.numa_node;
   opts.prefault = config.dram.prefault;
 
-  dram_pool_handle_ = allocator.Alloc(dram_pool_size_, opts);
+  dram_pool_handle_ = allocator.Alloc(config.dram.capacity_bytes, opts);
   if (!dram_pool_handle_.valid()) {
     throw std::runtime_error("DistributedClient: memory allocation failed for DRAM pool");
   }
   dram_pool_ = dram_pool_handle_.ptr;
+  // Use mapped_size (>= capacity_bytes, rounded up to page/hugepage boundary)
+  // so that RDMA registration, PeerDramAllocator capacity, and master-reported
+  // tier_capacities all agree on a single value.  This means the effective
+  // pool size may exceed config.dram.capacity_bytes by up to one hugepage.
+  // NOTE: if hugepage_size is not a multiple of dram_page_size, the tail
+  // bytes that don't form a complete dram_page are reported in
+  // tier_capacities but never allocated by PeerDramAllocator; heartbeat's
+  // TierCapacitiesSnapshot() will correct master's view.  Both default to
+  // 2 MiB, so this only matters with non-default page size combinations.
+  dram_pool_size_ = dram_pool_handle_.mapped_size;
 
   auto pc_config = ToPoolClientConfig(
       dc,
