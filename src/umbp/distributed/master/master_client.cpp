@@ -23,7 +23,9 @@
 
 #include <grpcpp/grpcpp.h>
 
+#include <array>
 #include <chrono>
+#include <iterator>
 #include <system_error>
 
 #include "mori/utils/mori_log.hpp"
@@ -35,6 +37,9 @@
 namespace mori::umbp {
 
 namespace {
+
+constexpr std::array<double, 14> kMasterClientRpcLatencyBucketsArr = {
+    0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 2.0, 5.0};
 
 int RpcShutdownTimeoutMs() {
   static const int v =
@@ -546,15 +551,15 @@ void MasterClient::MetricsLoop() {
     std::unordered_map<std::string, PendingSample> counters;
     std::unordered_map<std::string, PendingSample> gauges;
     std::unordered_map<std::string, HistogramAccumulator> histogram_aggregates;
-    std::size_t cap_at_swap = 0;
     {
       std::lock_guard lock(metrics_mutex_);
       counters.swap(pending_counters_);
       gauges.swap(pending_gauges_);
       histogram_aggregates.swap(pending_histogram_aggregates_);
-      cap_at_swap = pending_histogram_series_cap_;
     }
-    if (counters.empty() && gauges.empty() && histograms.empty()) continue;
+    auto dropped_delta = metrics_dropped_count_.exchange(0, std::memory_order_relaxed);
+    if (counters.empty() && gauges.empty() && histogram_aggregates.empty() && dropped_delta == 0)
+      continue;
 
     ::umbp::ReportMetricsRequest req;
     req.set_node_id(config_.node_id);
@@ -595,6 +600,12 @@ void MasterClient::MetricsLoop() {
       for (uint64_t c : h.bucket_counts) agg->add_bucket_counts(c);
       agg->set_count(h.count);
       agg->set_sum(h.sum);
+    }
+    if (dropped_delta > 0) {
+      auto* sample = req.add_metrics();
+      sample->set_name(MORI_UMBP_METRIC_MASTER_CLIENT_METRICS_DROPPED_TOTAL);
+      sample->set_help(MORI_UMBP_METRIC_MASTER_CLIENT_METRICS_DROPPED_TOTAL_HELP);
+      sample->set_counter_delta(static_cast<double>(dropped_delta));
     }
 
     ::umbp::ReportMetricsResponse resp;

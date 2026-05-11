@@ -46,6 +46,8 @@ namespace mori::umbp {
 
 class PeerDramAllocator;
 
+inline constexpr std::size_t kMasterClientMaxPendingHistograms = 15000;
+
 // Result of RouteGet — pure routing advisory.  The reader follows up
 // with peer.ResolveKey to fetch pages/descs/page_size.  `size` is
 // carried so the reader can preflight its destination buffer without
@@ -114,7 +116,7 @@ class MasterClient {
   // --- Client-side metrics ---
   void AddCounter(std::string name, std::string help, Labels labels, double delta);
   void SetGauge(std::string name, std::string help, Labels labels, double value);
-  void Observe(std::string name, std::string help, Labels labels, std::vector<double> bounds,
+  void Observe(std::string name, std::string help, Labels labels, const std::vector<double>& bounds,
                double value);
 
   bool IsRegistered() const { return registered_; }
