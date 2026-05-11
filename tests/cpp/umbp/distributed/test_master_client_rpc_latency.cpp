@@ -38,6 +38,7 @@
 #include <ctime>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -84,19 +85,21 @@ class RecordingMasterService final : public ::umbp::UMBPMaster::Service {
     return grpc::Status::OK;
   }
 
-  // Lookup is the workhorse RPC we exercise for instrumentation tests.
-  // When fail_lookup_=true it returns UNAVAILABLE deterministically so the
-  // ErrorPath test does not depend on TCP/channel reconnection timing.
-  grpc::Status Lookup(grpc::ServerContext*, const ::umbp::LookupRequest*,
-                      ::umbp::LookupResponse* resp) override {
-    if (fail_lookup_.load()) {
+  // RouteGet is the workhorse RPC we exercise for instrumentation tests:
+  // it has a single-key shape and a found=false-on-OK return that lets us
+  // hammer it without changing master state.  When fail_route_get_=true it
+  // returns UNAVAILABLE deterministically so the ErrorPath test does not
+  // depend on TCP/channel reconnection timing.
+  grpc::Status RouteGet(grpc::ServerContext*, const ::umbp::RouteGetRequest*,
+                        ::umbp::RouteGetResponse* resp) override {
+    if (fail_route_get_.load()) {
       return grpc::Status(grpc::StatusCode::UNAVAILABLE, "injected by test");
     }
     resp->set_found(false);
     return grpc::Status::OK;
   }
 
-  void SetFailLookup(bool fail) { fail_lookup_.store(fail); }
+  void SetFailRouteGet(bool fail) { fail_route_get_.store(fail); }
 
   // Used to test that read-only Python-style clients (no RegisterSelf) don't
   // leak entries into pending_histogram_aggregates_.
@@ -130,7 +133,7 @@ class RecordingMasterService final : public ::umbp::UMBPMaster::Service {
 
  private:
   int heartbeat_interval_ms_;
-  std::atomic<bool> fail_lookup_{false};
+  std::atomic<bool> fail_route_get_{false};
   std::mutex mu_;
   std::condition_variable cv_;
   std::vector<::umbp::ReportMetricsRequest> requests_;
@@ -187,7 +190,6 @@ class MasterClientRpcLatencyTest : public ::testing::Test {
     cfg.node_id = node_id;
     cfg.node_address = "127.0.0.1";
     cfg.master_address = address_;
-    cfg.auto_heartbeat = true;
     client_ = std::make_unique<MasterClient>(cfg);
     std::map<TierType, TierCapacity> caps;
     caps[TierType::DRAM] = {1 << 20, 1 << 20};
@@ -230,18 +232,18 @@ class MasterClientRpcLatencyTest : public ::testing::Test {
   std::unique_ptr<MasterClient> client_;
 };
 
-// N successful Lookups must produce a single histogram_aggregate sample
-// labelled rpc=Lookup,status=ok with count() >= N (client-side aggregation
+// N successful RouteGets must produce a single histogram_aggregate sample
+// labelled rpc=RouteGet,status=ok with count() >= N (client-side aggregation
 // collapses per-observation samples into one per series), and ReportMetrics
 // itself must never appear (self-feedback would re-bias the metric).
-TEST_F(MasterClientRpcLatencyTest, LookupHistogramObservedAndReportMetricsExcluded) {
+TEST_F(MasterClientRpcLatencyTest, RouteGetHistogramObservedAndReportMetricsExcluded) {
   StartClientAndRegister();
   service_->Clear();
 
   constexpr int N = 5;
   for (int i = 0; i < N; ++i) {
-    bool found = false;
-    auto status = client_->Lookup("test-key-" + std::to_string(i), &found);
+    std::optional<RouteGetResult> out;
+    auto status = client_->RouteGet("test-key-" + std::to_string(i), {}, &out);
     ASSERT_TRUE(status.ok()) << status.error_message();
   }
 
@@ -249,20 +251,20 @@ TEST_F(MasterClientRpcLatencyTest, LookupHistogramObservedAndReportMetricsExclud
   std::this_thread::sleep_for(std::chrono::milliseconds(2 * kFlushIntervalMs));
   auto samples = CollectSamples(service_->Requests());
 
-  uint64_t lookup_ok_count = 0;
+  uint64_t route_get_ok_count = 0;
   bool saw_report_metrics_self_metric = false;
   for (const auto& s : samples) {
     if (s.value_case() != ::umbp::MetricSample::kHistogramAggregate) continue;
     if (s.name() != MORI_UMBP_METRIC_MASTER_CLIENT_RPC_LATENCY) continue;
     const auto rpc = LabelValue(s, "rpc");
     const auto status = LabelValue(s, "status");
-    if (rpc == "Lookup" && status == "ok") {
-      lookup_ok_count += s.histogram_aggregate().count();
+    if (rpc == "RouteGet" && status == "ok") {
+      route_get_ok_count += s.histogram_aggregate().count();
     }
     if (rpc == "ReportMetrics") saw_report_metrics_self_metric = true;
   }
-  EXPECT_GE(lookup_ok_count, static_cast<uint64_t>(N))
-      << "Expected aggregated count >= " << N << " for Lookup latency";
+  EXPECT_GE(route_get_ok_count, static_cast<uint64_t>(N))
+      << "Expected aggregated count >= " << N << " for RouteGet latency";
   EXPECT_FALSE(saw_report_metrics_self_metric)
       << "ReportMetrics RPC must not be self-instrumented (would create a feedback loop)";
 }
@@ -270,18 +272,18 @@ TEST_F(MasterClientRpcLatencyTest, LookupHistogramObservedAndReportMetricsExclud
 // On a non-OK status the timer must emit both a status=error histogram
 // observation and a counter row tagged with the gRPC code name.  Failures
 // are injected deterministically by toggling RecordingMasterService into
-// fail_lookup mode (RegisterClient and ReportMetrics still succeed, so the
+// fail_route_get mode (RegisterClient and ReportMetrics still succeed, so the
 // flush thread can deliver the error sample to the test sink).
 TEST_F(MasterClientRpcLatencyTest, ErrorPathRecordsErrorCounter) {
   StartClientAndRegister();
   service_->Clear();
-  service_->SetFailLookup(true);
+  service_->SetFailRouteGet(true);
 
-  bool found = false;
   constexpr int N = 5;
   for (int i = 0; i < N; ++i) {
-    auto status = client_->Lookup("err-test-" + std::to_string(i), &found);
-    EXPECT_FALSE(status.ok()) << "Injected fail_lookup must surface as non-OK at " << i;
+    std::optional<RouteGetResult> out;
+    auto status = client_->RouteGet("err-test-" + std::to_string(i), {}, &out);
+    EXPECT_FALSE(status.ok()) << "Injected fail_route_get must surface as non-OK at " << i;
     EXPECT_EQ(status.error_code(), grpc::StatusCode::UNAVAILABLE);
   }
 
@@ -290,26 +292,26 @@ TEST_F(MasterClientRpcLatencyTest, ErrorPathRecordsErrorCounter) {
   auto samples = CollectSamples(service_->Requests());
 
   int error_counter_total = 0;
-  bool saw_lookup_unavailable = false;
-  uint64_t lookup_error_count = 0;
+  bool saw_route_get_unavailable = false;
+  uint64_t route_get_error_count = 0;
   for (const auto& s : samples) {
     if (s.name() == MORI_UMBP_METRIC_MASTER_CLIENT_RPC_ERRORS_TOTAL &&
         s.value_case() == ::umbp::MetricSample::kCounterDelta) {
       error_counter_total += static_cast<int>(s.counter_delta());
-      if (LabelValue(s, "rpc") == "Lookup" && LabelValue(s, "code") == "UNAVAILABLE") {
-        saw_lookup_unavailable = true;
+      if (LabelValue(s, "rpc") == "RouteGet" && LabelValue(s, "code") == "UNAVAILABLE") {
+        saw_route_get_unavailable = true;
       }
     }
     if (s.name() == MORI_UMBP_METRIC_MASTER_CLIENT_RPC_LATENCY &&
         s.value_case() == ::umbp::MetricSample::kHistogramAggregate &&
-        LabelValue(s, "rpc") == "Lookup" && LabelValue(s, "status") == "error") {
-      lookup_error_count += s.histogram_aggregate().count();
+        LabelValue(s, "rpc") == "RouteGet" && LabelValue(s, "status") == "error") {
+      route_get_error_count += s.histogram_aggregate().count();
     }
   }
   EXPECT_GE(error_counter_total, N) << "Each injected failure must bump the error counter";
-  EXPECT_TRUE(saw_lookup_unavailable)
-      << "Expected Lookup error counter sample with code=UNAVAILABLE";
-  EXPECT_GE(lookup_error_count, static_cast<uint64_t>(N))
+  EXPECT_TRUE(saw_route_get_unavailable)
+      << "Expected RouteGet error counter sample with code=UNAVAILABLE";
+  EXPECT_GE(route_get_error_count, static_cast<uint64_t>(N))
       << "Expected aggregated count >= " << N << " for status=error latency";
 }
 
@@ -322,7 +324,6 @@ TEST_F(MasterClientRpcLatencyTest, UnregisteredClientDoesNotBufferSamples) {
   cfg.node_id = "unregistered-test-node";
   cfg.node_address = "127.0.0.1";
   cfg.master_address = address_;
-  cfg.auto_heartbeat = false;
   auto unreg_client = std::make_unique<MasterClient>(cfg);
 
   // Fire an RPC that does not require registration (MatchExternalKv).
@@ -342,7 +343,7 @@ TEST_F(MasterClientRpcLatencyTest, UnregisteredClientDoesNotBufferSamples) {
   unreg_client.reset();
 }
 
-// N=200 successful Lookups produce a single histogram_aggregate sample per
+// N=200 successful RouteGets produce a single histogram_aggregate sample per
 // (rpc, status) series with count() == N, sum() > 0, and cumulative-monotone
 // bucket_counts.  Verifies the wire encoding and the master-side merge
 // invariants (cumulative + bucket_counts.back() <= count for the +Inf
@@ -353,8 +354,8 @@ TEST_F(MasterClientRpcLatencyTest, AggregatedFlushCountSumAndCumulativeBuckets) 
 
   constexpr int N = 200;
   for (int i = 0; i < N; ++i) {
-    bool found = false;
-    auto status = client_->Lookup("agg-key-" + std::to_string(i), &found);
+    std::optional<RouteGetResult> out;
+    auto status = client_->RouteGet("agg-key-" + std::to_string(i), {}, &out);
     ASSERT_TRUE(status.ok()) << status.error_message();
   }
 
@@ -362,8 +363,9 @@ TEST_F(MasterClientRpcLatencyTest, AggregatedFlushCountSumAndCumulativeBuckets) 
   std::this_thread::sleep_for(std::chrono::milliseconds(3 * kFlushIntervalMs));
   auto samples = CollectSamples(service_->Requests());
 
-  // Sum aggregated counts across flush cycles for the (rpc=Lookup, status=ok)
-  // series; we may have multiple flushes if the test ran across cycle boundaries.
+  // Sum aggregated counts across flush cycles for the (rpc=RouteGet,
+  // status=ok) series; we may have multiple flushes if the test ran across
+  // cycle boundaries.
   uint64_t total_count = 0;
   double total_sum = 0;
   bool saw_any_aggregate = false;
@@ -371,7 +373,7 @@ TEST_F(MasterClientRpcLatencyTest, AggregatedFlushCountSumAndCumulativeBuckets) 
   for (const auto& s : samples) {
     if (s.value_case() != ::umbp::MetricSample::kHistogramAggregate) continue;
     if (s.name() != MORI_UMBP_METRIC_MASTER_CLIENT_RPC_LATENCY) continue;
-    if (LabelValue(s, "rpc") != "Lookup" || LabelValue(s, "status") != "ok") continue;
+    if (LabelValue(s, "rpc") != "RouteGet" || LabelValue(s, "status") != "ok") continue;
     saw_any_aggregate = true;
     const auto& a = s.histogram_aggregate();
     total_count += a.count();
@@ -389,7 +391,7 @@ TEST_F(MasterClientRpcLatencyTest, AggregatedFlushCountSumAndCumulativeBuckets) 
       EXPECT_LE(a.bucket_counts(a.bucket_counts_size() - 1), a.count());
     }
   }
-  EXPECT_TRUE(saw_any_aggregate) << "No histogram_aggregate sample for (Lookup, ok) found";
+  EXPECT_TRUE(saw_any_aggregate) << "No histogram_aggregate sample for (RouteGet, ok) found";
   EXPECT_GE(total_count, static_cast<uint64_t>(N));
   EXPECT_GT(total_sum, 0.0);
 }

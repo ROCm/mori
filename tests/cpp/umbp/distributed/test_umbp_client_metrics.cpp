@@ -181,7 +181,6 @@ class MasterClientMetricsTest : public ::testing::Test {
     cfg.node_id = "metrics-test-node";
     cfg.node_address = "127.0.0.1";
     cfg.master_address = address_;
-    cfg.auto_heartbeat = true;
     client_ = std::make_unique<MasterClient>(cfg);
 
     std::map<TierType, TierCapacity> caps;

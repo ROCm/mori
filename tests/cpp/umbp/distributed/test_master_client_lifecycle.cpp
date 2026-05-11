@@ -154,13 +154,17 @@ TEST_F(MasterClientLifecycleTest, DestructorBoundedWhenMasterUnresponsive) {
   cfg.node_id = "lifecycle-test-node";
   cfg.node_address = "127.0.0.1";
   cfg.master_address = address_;
-  cfg.auto_heartbeat = true;
 
   auto client = std::make_unique<MasterClient>(cfg);
   std::map<TierType, TierCapacity> caps;
   caps[TierType::DRAM] = {1 << 20, 1 << 20};
   auto status = client->RegisterSelf(caps);
   ASSERT_TRUE(status.ok()) << "RegisterSelf failed: " << status.error_message();
+
+  // RegisterSelf does not start the heartbeat loop; callers (normally
+  // PoolClient) must call StartHeartbeat() explicitly.  Doing so here makes
+  // the destructor's Heartbeat-deadline path reachable from this test.
+  client->StartHeartbeat();
 
   // Wait until the heartbeat thread is actually blocked inside the RPC,
   // otherwise StopHeartbeat()'s notify_one() would unblock it cleanly

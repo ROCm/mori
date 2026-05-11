@@ -32,6 +32,7 @@
 #include "umbp.grpc.pb.h"
 #include "umbp/common/env_time.h"
 #include "umbp/distributed/master/master_metrics.h"
+#include "umbp/distributed/master/rpc_latency_timer.h"
 #include "umbp/distributed/peer/peer_dram_allocator.h"
 
 namespace mori::umbp {
@@ -100,6 +101,7 @@ grpc::Status MasterClient::RegisterSelf(const std::map<TierType, TierCapacity>& 
                                         const std::string& peer_address,
                                         const std::vector<uint8_t>& engine_desc_bytes,
                                         const std::vector<uint64_t>& ssd_store_capacities) {
+  ScopedRpcTimer _rpc_timer(this, "RegisterClient");
   if (registered_) {
     return grpc::Status(grpc::StatusCode::ALREADY_EXISTS, "node is already registered");
   }
@@ -115,6 +117,7 @@ grpc::Status MasterClient::RegisterSelf(const std::map<TierType, TierCapacity>& 
   ::umbp::RegisterClientResponse resp;
   grpc::ClientContext ctx;
   auto status = GetStub(stub_.get())->RegisterClient(&ctx, req, &resp);
+  _rpc_timer.SetStatus(status);
   if (!status.ok()) {
     MORI_UMBP_WARN("[Client] RegisterSelf failed: {}", status.error_message());
     return status;
@@ -135,6 +138,7 @@ grpc::Status MasterClient::RegisterSelf(const std::map<TierType, TierCapacity>& 
 
 grpc::Status MasterClient::UnregisterSelf() {
   if (!registered_) return grpc::Status::OK;
+  ScopedRpcTimer _rpc_timer(this, "UnregisterClient");
   ::umbp::UnregisterClientRequest req;
   req.set_node_id(config_.node_id);
   ::umbp::UnregisterClientResponse resp;
@@ -142,6 +146,7 @@ grpc::Status MasterClient::UnregisterSelf() {
   ctx.set_deadline(std::chrono::system_clock::now() +
                    std::chrono::milliseconds(RpcShutdownTimeoutMs()));
   auto status = GetStub(stub_.get())->UnregisterClient(&ctx, req, &resp);
+  _rpc_timer.SetStatus(status);
   registered_ = false;
   return status;
 }
@@ -149,6 +154,7 @@ grpc::Status MasterClient::UnregisterSelf() {
 grpc::Status MasterClient::RoutePut(const std::string& key, uint64_t block_size,
                                     const std::unordered_set<std::string>& exclude_nodes,
                                     std::optional<RoutePutResult>* out_result) {
+  ScopedRpcTimer _rpc_timer(this, "RoutePut");
   if (out_result == nullptr) {
     return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "out_result is null");
   }
@@ -163,6 +169,7 @@ grpc::Status MasterClient::RoutePut(const std::string& key, uint64_t block_size,
   ::umbp::RoutePutResponse resp;
   grpc::ClientContext ctx;
   auto status = GetStub(stub_.get())->RoutePut(&ctx, req, &resp);
+  _rpc_timer.SetStatus(status);
   if (!status.ok()) return status;
   if (!resp.found()) return grpc::Status::OK;
 
@@ -177,6 +184,7 @@ grpc::Status MasterClient::RoutePut(const std::string& key, uint64_t block_size,
 grpc::Status MasterClient::RouteGet(const std::string& key,
                                     const std::unordered_set<std::string>& exclude_nodes,
                                     std::optional<RouteGetResult>* out_result) {
+  ScopedRpcTimer _rpc_timer(this, "RouteGet");
   if (out_result == nullptr) {
     return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "out_result is null");
   }
@@ -190,6 +198,7 @@ grpc::Status MasterClient::RouteGet(const std::string& key,
   ::umbp::RouteGetResponse resp;
   grpc::ClientContext ctx;
   auto status = GetStub(stub_.get())->RouteGet(&ctx, req, &resp);
+  _rpc_timer.SetStatus(status);
   if (!status.ok()) return status;
   if (!resp.found()) return grpc::Status::OK;
 
@@ -206,6 +215,7 @@ grpc::Status MasterClient::BatchRoutePut(const std::vector<std::string>& keys,
                                          const std::vector<uint64_t>& block_sizes,
                                          const std::unordered_set<std::string>& exclude_nodes,
                                          std::vector<std::optional<RoutePutResult>>* out) {
+  ScopedRpcTimer _rpc_timer(this, "BatchRoutePut");
   if (out == nullptr) {
     return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "out is null");
   }
@@ -222,6 +232,7 @@ grpc::Status MasterClient::BatchRoutePut(const std::vector<std::string>& keys,
   ::umbp::BatchRoutePutResponse resp;
   grpc::ClientContext ctx;
   auto status = GetStub(stub_.get())->BatchRoutePut(&ctx, req, &resp);
+  _rpc_timer.SetStatus(status);
   if (!status.ok()) return status;
 
   out->resize(static_cast<size_t>(resp.entries_size()));
@@ -240,6 +251,7 @@ grpc::Status MasterClient::BatchRoutePut(const std::vector<std::string>& keys,
 grpc::Status MasterClient::BatchRouteGet(const std::vector<std::string>& keys,
                                          const std::unordered_set<std::string>& exclude_nodes,
                                          std::vector<std::optional<RouteGetResult>>* out) {
+  ScopedRpcTimer _rpc_timer(this, "BatchRouteGet");
   if (out == nullptr) {
     return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "out is null");
   }
@@ -252,6 +264,7 @@ grpc::Status MasterClient::BatchRouteGet(const std::vector<std::string>& keys,
   ::umbp::BatchRouteGetResponse resp;
   grpc::ClientContext ctx;
   auto status = GetStub(stub_.get())->BatchRouteGet(&ctx, req, &resp);
+  _rpc_timer.SetStatus(status);
   if (!status.ok()) return status;
 
   out->resize(static_cast<size_t>(resp.entries_size()));
@@ -343,7 +356,12 @@ void MasterClient::HeartbeatLoop() {
     grpc::ClientContext ctx;
     ctx.set_deadline(std::chrono::system_clock::now() +
                      std::chrono::milliseconds(RpcShutdownTimeoutMs()));
-    auto status = GetStub(stub_.get())->Heartbeat(&ctx, req, &resp);
+    grpc::Status status;
+    {
+      ScopedRpcTimer _rpc_timer(this, "Heartbeat");
+      status = GetStub(stub_.get())->Heartbeat(&ctx, req, &resp);
+      _rpc_timer.SetStatus(status);
+    }
     if (!status.ok()) {
       // Re-queue the drained events so we don't lose them on transient
       // failure.  Order of original drain is preserved by appending the
@@ -379,7 +397,12 @@ void MasterClient::HeartbeatLoop() {
       grpc::ClientContext fctx;
       fctx.set_deadline(std::chrono::system_clock::now() +
                         std::chrono::milliseconds(RpcShutdownTimeoutMs()));
-      auto fstatus = GetStub(stub_.get())->Heartbeat(&fctx, fr, &fresp);
+      grpc::Status fstatus;
+      {
+        ScopedRpcTimer _rpc_timer(this, "Heartbeat");
+        fstatus = GetStub(stub_.get())->Heartbeat(&fctx, fr, &fresp);
+        _rpc_timer.SetStatus(fstatus);
+      }
       if (fstatus.ok()) {
         hb_last_acked_seq_ = fresp.acked_seq();
       } else {
@@ -400,7 +423,12 @@ void MasterClient::HeartbeatLoop() {
       FillTierCapacities(re_req.mutable_tier_capacities(), caps);
       ::umbp::RegisterClientResponse re_resp;
       grpc::ClientContext re_ctx;
-      auto re_status = GetStub(stub_.get())->RegisterClient(&re_ctx, re_req, &re_resp);
+      grpc::Status re_status;
+      {
+        ScopedRpcTimer _rpc_timer(this, "RegisterClient");
+        re_status = GetStub(stub_.get())->RegisterClient(&re_ctx, re_req, &re_resp);
+        _rpc_timer.SetStatus(re_status);
+      }
       if (re_status.ok() || re_status.error_code() == grpc::StatusCode::ALREADY_EXISTS) {
         registered_ = true;
         hb_seq_ = 0;
@@ -627,32 +655,40 @@ void MasterClient::MetricsLoop() {
 grpc::Status MasterClient::ReportExternalKvBlocks(const std::string& node_id,
                                                   const std::vector<std::string>& hashes,
                                                   TierType tier) {
+  ScopedRpcTimer _rpc_timer(this, "ReportExternalKvBlocks");
   ::umbp::ReportExternalKvBlocksRequest req;
   req.set_node_id(node_id);
   for (const auto& h : hashes) req.add_hashes(h);
   req.set_tier(ToProtoTier(tier));
   ::umbp::ReportExternalKvBlocksResponse resp;
   grpc::ClientContext ctx;
-  return GetStub(stub_.get())->ReportExternalKvBlocks(&ctx, req, &resp);
+  auto status = GetStub(stub_.get())->ReportExternalKvBlocks(&ctx, req, &resp);
+  _rpc_timer.SetStatus(status);
+  return status;
 }
 
 grpc::Status MasterClient::RevokeExternalKvBlocks(const std::string& node_id,
                                                   const std::vector<std::string>& hashes) {
+  ScopedRpcTimer _rpc_timer(this, "RevokeExternalKvBlocks");
   ::umbp::RevokeExternalKvBlocksRequest req;
   req.set_node_id(node_id);
   for (const auto& h : hashes) req.add_hashes(h);
   ::umbp::RevokeExternalKvBlocksResponse resp;
   grpc::ClientContext ctx;
-  return GetStub(stub_.get())->RevokeExternalKvBlocks(&ctx, req, &resp);
+  auto status = GetStub(stub_.get())->RevokeExternalKvBlocks(&ctx, req, &resp);
+  _rpc_timer.SetStatus(status);
+  return status;
 }
 
 grpc::Status MasterClient::MatchExternalKv(const std::vector<std::string>& hashes,
                                            std::vector<ExternalKvNodeMatch>* out_matches) {
+  ScopedRpcTimer _rpc_timer(this, "MatchExternalKv");
   ::umbp::MatchExternalKvRequest req;
   for (const auto& h : hashes) req.add_hashes(h);
   ::umbp::MatchExternalKvResponse resp;
   grpc::ClientContext ctx;
   auto status = GetStub(stub_.get())->MatchExternalKv(&ctx, req, &resp);
+  _rpc_timer.SetStatus(status);
   if (!status.ok()) return status;
   if (out_matches != nullptr) {
     for (const auto& m : resp.matches()) {

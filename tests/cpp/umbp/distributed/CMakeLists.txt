@@ -1,9 +1,67 @@
-# The master-as-advisor redesign deleted the wire surface these tests exercised
-# (AllocateForPut / FinalizeAllocation / Register / Lookup, the fused-RDMA
-# pipeline, etc.).  They're kept on disk as references for the upcoming rewrite
-# but excluded from the default build.  Set
-# -DMORI_UMBP_LEGACY_DISTRIBUTED_TESTS=ON to opt into building them (most will
-# fail to compile until they're rewritten against the new RPC surface).
+# --------------------------------------------------------------------------
+# Tests below this header compile against the current MasterClient /
+# MasterServer / PoolClient surface (Route* / Batch* / *External RPCs). They are
+# built unconditionally because they cover the live API.
+#
+# The legacy distributed suite further down references symbols that no longer
+# exist (AllocateForPut / FinalizeAllocation / Register / Lookup / fused-RDMA
+# pipeline).  It remains gated behind MORI_UMBP_LEGACY_DISTRIBUTED_TESTS=OFF
+# until rewritten.
+# --------------------------------------------------------------------------
+
+find_library(_TEST_PROTOBUF_LIB NAMES protobuf libprotobuf REQUIRED)
+if(TARGET gRPC::grpc++)
+  set(_TEST_GRPCPP_LIB gRPC::grpc++)
+elseif(TARGET grpc++)
+  set(_TEST_GRPCPP_LIB grpc++)
+else()
+  find_library(_TEST_GRPCPP_LIB NAMES grpc++ REQUIRED)
+endif()
+
+# MasterClient lifecycle: destructor budget, heartbeat thread shutdown, etc.
+add_executable(test_umbp_master_client_lifecycle
+               test_master_client_lifecycle.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_umbp_master_client_lifecycle PRIVATE
+                      -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  test_umbp_master_client_lifecycle
+  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
+          gtest_main)
+add_test(NAME umbp_master_client_lifecycle
+         COMMAND test_umbp_master_client_lifecycle)
+
+# MasterClient AddCounter / SetGauge / Observe buffering + PoolClient byte
+# tracking integration.
+add_executable(test_umbp_client_metrics test_umbp_client_metrics.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_umbp_client_metrics PRIVATE -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  test_umbp_client_metrics PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB}
+                                   ${_TEST_GRPCPP_LIB} gtest)
+add_test(NAME umbp_client_metrics COMMAND test_umbp_client_metrics)
+
+# ScopedRpcTimer / MasterClient RPC latency instrumentation.
+add_executable(test_umbp_master_client_rpc_latency
+               test_master_client_rpc_latency.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_umbp_master_client_rpc_latency PRIVATE
+                      -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  test_umbp_master_client_rpc_latency
+  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
+          gtest_main)
+add_test(NAME umbp_master_client_rpc_latency
+         COMMAND test_umbp_master_client_rpc_latency)
+
+# --------------------------------------------------------------------------
+# Legacy gate.  Everything below here references deleted symbols (AllocateForPut
+# / FinalizeAllocation / Register / Lookup / fused-RDMA pipeline) and is opt-in
+# via -DMORI_UMBP_LEGACY_DISTRIBUTED_TESTS=ON.
+# --------------------------------------------------------------------------
 option(MORI_UMBP_LEGACY_DISTRIBUTED_TESTS
        "Build the pre-redesign tests/cpp/umbp/distributed/* suite" OFF)
 if(NOT MORI_UMBP_LEGACY_DISTRIBUTED_TESTS)
@@ -62,15 +120,6 @@ add_test(NAME umbp_finalize_idempotency COMMAND test_umbp_finalize_idempotency)
 add_executable(test_umbp_eviction test_eviction.cpp)
 target_link_libraries(test_umbp_eviction PRIVATE umbp_common gtest_main)
 add_test(NAME umbp_eviction COMMAND test_umbp_eviction)
-
-find_library(_TEST_PROTOBUF_LIB NAMES protobuf libprotobuf REQUIRED)
-if(TARGET gRPC::grpc++)
-  set(_TEST_GRPCPP_LIB gRPC::grpc++)
-elseif(TARGET grpc++)
-  set(_TEST_GRPCPP_LIB grpc++)
-else()
-  find_library(_TEST_GRPCPP_LIB NAMES grpc++ REQUIRED)
-endif()
 
 add_executable(test_umbp_peer_service test_peer_service.cpp)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -168,38 +217,3 @@ target_link_libraries(
   bench_umbp_pool_client_batch_get
   PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
           gtest_main)
-
-add_executable(test_umbp_master_client_lifecycle
-               test_master_client_lifecycle.cpp)
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  target_link_options(test_umbp_master_client_lifecycle PRIVATE
-                      -Wl,--no-as-needed)
-endif()
-target_link_libraries(
-  test_umbp_master_client_lifecycle
-  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
-          gtest_main)
-add_test(NAME umbp_master_client_lifecycle
-         COMMAND test_umbp_master_client_lifecycle)
-
-add_executable(test_umbp_client_metrics test_umbp_client_metrics.cpp)
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  target_link_options(test_umbp_client_metrics PRIVATE -Wl,--no-as-needed)
-endif()
-target_link_libraries(
-  test_umbp_client_metrics PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB}
-                                   ${_TEST_GRPCPP_LIB} gtest)
-add_test(NAME umbp_client_metrics COMMAND test_umbp_client_metrics)
-
-add_executable(test_umbp_master_client_rpc_latency
-               test_master_client_rpc_latency.cpp)
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  target_link_options(test_umbp_master_client_rpc_latency PRIVATE
-                      -Wl,--no-as-needed)
-endif()
-target_link_libraries(
-  test_umbp_master_client_rpc_latency
-  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
-          gtest_main)
-add_test(NAME umbp_master_client_rpc_latency
-         COMMAND test_umbp_master_client_rpc_latency)
