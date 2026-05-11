@@ -73,7 +73,7 @@ bool IsCcqeSupported(ibv_context* context) {
   if (IonicDvApi::Instance().create_cq_ex == nullptr) return false;
   int build = ReadIonicFwBuild(context->device->name);
 
-  MORI_APP_TRACE("dev: %s fw_build %d", context->device->name, build);
+  MORI_APP_TRACE("dev: {} fw_build {}", context->device->name, build);
   return build >= kCcqeMinFwBuild;
 }
 
