@@ -1,9 +1,17 @@
 UMBP Master Client
 ==================
 
-``UMBPMasterClient`` is the Python client for interacting with the UMBP master server.
-It lets nodes register themselves, report which KV-cache blocks they hold, and query which
-nodes hold a given set of blocks — enabling cross-node KV-cache reuse.
+``UMBPMasterClient`` is the **read-only** Python query client for the UMBP master.
+It lets nodes register themselves, report which KV-cache blocks they hold, and query
+which nodes hold a given set of blocks — enabling cross-node KV-cache reuse for
+externally-managed L1/L2 caches (e.g. SGLang's host-mem KV cache).
+
+It is *not* the full UMBP data-plane client. Hot-path Put/Get with RDMA / MORI-IO
+goes through the C++ ``IUMBPClient`` (``mori.cpp.UMBPClient`` in Python) backed by a
+``DistributedClient`` + ``PoolClient``. ``UMBPMasterClient`` only speaks to the master
+control plane and never registers a peer service or starts a heartbeat thread.
+
+For the full architecture see ``src/umbp/doc/design-master-control-plane.md``.
 
 ----
 
@@ -45,6 +53,11 @@ The master server is a standalone binary built alongside the mori wheel.
      - ``9091``
      - Prometheus metrics HTTP port
 
+All ``UMBP_*`` timing knobs (``UMBP_HEARTBEAT_TTL_SEC``, ``UMBP_REAPER_INTERVAL_SEC``,
+``UMBP_LEASE_DURATION_SEC``, ...) are honored at master startup and printed once as
+``[Master] Resolved timing: ...``. See
+`runtime-env-vars.md <../../src/umbp/doc/runtime-env-vars.md>`_ for the full list.
+
 **Examples:**
 
 .. code-block:: bash
@@ -52,14 +65,14 @@ The master server is a standalone binary built alongside the mori wheel.
    # Defaults: gRPC on 0.0.0.0:50051, metrics on 9091
    ./build/src/umbp/umbp_master
 
-   # Custom gRPC port, default metrics port
-   ./build/src/umbp/umbp_master localhost:5000
+   # Custom gRPC port (matches the SGLang/hicache default), default metrics port
+   ./build/src/umbp/umbp_master 127.0.0.1:15558
 
    # Both custom
-   ./build/src/umbp/umbp_master localhost:5000 9099
+   ./build/src/umbp/umbp_master 127.0.0.1:15558 9099
 
    # With debug logging
-   MORI_UMBP_LOG_LEVEL=DEBUG ./build/src/umbp/umbp_master localhost:5000
+   MORI_UMBP_LOG_LEVEL=DEBUG ./build/src/umbp/umbp_master 127.0.0.1:15558
 
 The server exits cleanly on ``SIGINT`` / ``SIGTERM`` (e.g. ``Ctrl-C`` or ``kill``).
 
@@ -71,8 +84,10 @@ The server exits cleanly on ``SIGINT`` / ``SIGTERM`` (e.g. ``Ctrl-C`` or ``kill`
    cmake .. -DUMBP=ON
    make -j$(nproc) umbp_master
 
-See the ``UMBP_MASTER_BIN`` environment variable to point the Python client at a
-non-default binary location.
+The Python ``mori.umbp`` package auto-detects ``umbp_master`` packaged inside the
+wheel and exports ``UMBP_MASTER_BIN`` to that path (see
+``mori/python/mori/umbp/__init__.py::_configure_packaged_umbp_master``). Set
+``UMBP_MASTER_BIN`` explicitly to point at a custom build.
 
 ----
 
@@ -147,14 +162,16 @@ UMBPMasterClient
    * - Parameter
      - Description
    * - ``master_address``
-     - Address of the UMBP master server, e.g. ``"localhost:5000"``
+     - Address of the UMBP master server, e.g. ``"127.0.0.1:15558"``
    * - ``node_id``
      - Identifier for this node (required for registration)
    * - ``node_address``
      - This node's own gRPC address, used by peers to connect back
 
 Construction is non-blocking — the gRPC channel is created lazily and will not
-raise even if the master is unreachable.
+raise even if the master is unreachable. ``auto_heartbeat`` is forced to ``False``
+on this client (no heartbeat thread is started); ``UMBPMasterClient`` is intended
+for one-shot or short-lived lookups, not for long-running peer membership.
 
 **Methods:**
 
@@ -191,7 +208,7 @@ Usage Examples
    _1GB = 1 * 1024 * 1024 * 1024
 
    client = UMBPMasterClient(
-       "localhost:5000",
+       "127.0.0.1:15558",
        node_id="worker-0",
        node_address="worker-0:8080",
    )
@@ -211,7 +228,7 @@ Usage Examples
    from mori.cpp import UMBPMasterClient, UMBPTierType
 
    _1GB = 1 * 1024 * 1024 * 1024
-   master = "localhost:5000"
+   master = "127.0.0.1:15558"
 
    # Node A reports that it holds some KV blocks in DRAM
    node_a = UMBPMasterClient(master, node_id="node-a", node_address="node-a:8080")
@@ -273,7 +290,7 @@ Usage Examples
                client.unregister_self()
 
    _1GB = 1 * 1024 * 1024 * 1024
-   with registered_client("localhost:5000", "worker-0", {UMBPTierType.DRAM: (_1GB, _1GB)}) as c:
+   with registered_client("127.0.0.1:15558", "worker-0", {UMBPTierType.DRAM: (_1GB, _1GB)}) as c:
        c.report_external_kv_blocks("worker-0", ["sha256-abc"], UMBPTierType.DRAM)
        matches = c.match_external_kv(["sha256-abc"])
 

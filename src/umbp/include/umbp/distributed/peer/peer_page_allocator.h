@@ -177,15 +177,6 @@ class PageBitmapAllocator {
     }
   }
 
-  // Convenience wrapper around ParseDramLocationId + Deallocate.  Malformed
-  // or empty location_id is silently no-op (consistent with Deallocate's
-  // idempotent semantics — callers may invoke this twice for the same id).
-  void DeallocateByLocationId(const std::string& location_id) {
-    auto parsed = ParseDramLocationId(location_id);
-    if (!parsed) return;
-    Deallocate(parsed->pages);
-  }
-
   uint64_t TotalBytes() const {
     uint64_t sum = 0;
     for (const auto& b : buffers_) {

@@ -24,45 +24,21 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "umbp/distributed/types.h"
 
 namespace mori::umbp {
 
-/// Result returned by RoutePutStrategy::Select and the Router::RoutePut path.
-///
-/// The strategy fills in only the placement-related fields (node_id,
-/// node_address, tier) — Router::RoutePut then drives ClientRegistry
-/// .AllocateForPut to populate everything below the divider.
-///
-/// DRAM/HBM layout under the new page-bitmap allocator:
-///   `location_id`         canonical "0:p3,4;1:p0" string for this Put
-///   `pages`               structured form of the same page set
-///   `dram_memory_descs`   deduplicated MemoryDesc bytes for every distinct
-///                         buffer_index referenced by `pages`
-///   `page_size`           page size of the source allocator (bytes)
-///
-/// SSD layout (legacy capacity-only allocator):
-///   The above DRAM/HBM fields are left empty / zero.  Allocation_id is
-///   still set, and ssd_store_index identifies which SSD store was reserved.
+/// Result of RoutePut: a routing advisory only.  Master owns no per-Put
+/// state — the writer follows up with peer.AllocateSlot to actually
+/// reserve capacity.  ENOSPC at peer triggers a retry with the failed
+/// node added to the exclude set.
 struct RoutePutResult {
   std::string node_id;
-  std::string node_address;
-  TierType tier;
-
   std::string peer_address;
-  std::vector<uint8_t> engine_desc_bytes;
-  std::string allocation_id;
-
-  // DRAM/HBM only.
-  std::string location_id;
-  std::vector<PageLocation> pages;
-  std::vector<BufferMemoryDescBytes> dram_memory_descs;
-  uint64_t page_size = 0;
-
-  // SSD only.
-  uint32_t ssd_store_index = 0;
+  TierType tier = TierType::UNKNOWN;
 };
 
 /// Abstract interface for RoutePut node placement.
@@ -72,18 +48,23 @@ class RoutePutStrategy {
   virtual ~RoutePutStrategy() = default;
 
   /// Select a target node from @p alive_clients that can accommodate
-  /// @p block_size bytes. Tier selection is the strategy's responsibility.
+  /// @p block_size bytes.  Tier selection is the strategy's responsibility.
+  /// Nodes whose `node_id` appears in @p exclude_nodes are skipped — the
+  /// caller has already failed against them (typically ENOSPC at the
+  /// peer's allocator) and would only fail again.
   /// @return nullopt if no suitable node exists.
-  virtual std::optional<RoutePutResult> Select(const std::vector<ClientRecord>& alive_clients,
-                                               uint64_t block_size) = 0;
+  virtual std::optional<RoutePutResult> Select(
+      const std::vector<ClientRecord>& alive_clients, uint64_t block_size,
+      const std::unordered_set<std::string>& exclude_nodes) = 0;
 };
 
 /// Default strategy: try tiers fastest-first (HBM -> DRAM -> SSD),
 /// pick the node with the most available space on the first tier that has capacity.
 class TierAwareMostAvailableStrategy : public RoutePutStrategy {
  public:
-  std::optional<RoutePutResult> Select(const std::vector<ClientRecord>& alive_clients,
-                                       uint64_t block_size) override;
+  std::optional<RoutePutResult> Select(
+      const std::vector<ClientRecord>& alive_clients, uint64_t block_size,
+      const std::unordered_set<std::string>& exclude_nodes) override;
 };
 
 }  // namespace mori::umbp

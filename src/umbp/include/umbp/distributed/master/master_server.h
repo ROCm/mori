@@ -57,13 +57,6 @@ class MasterServer {
   // has called BuildAndStart().
   uint16_t GetBoundPort() const { return bound_port_.load(); }
 
-  // Test-only: read the depth recorded for `key` in the master's index.
-  // Returns nullopt if the key isn't present.  Used by BatchPut depth
-  // propagation tests; no production caller.
-  std::optional<int32_t> GetBlockDepthForTest(const std::string& key) const {
-    return index_.GetDepth(key);
-  }
-
  private:
   MasterServerConfig config_;
   GlobalBlockIndex index_;
@@ -76,6 +69,12 @@ class MasterServer {
 
   class UMBPMasterServiceImpl;
   std::unique_ptr<UMBPMasterServiceImpl> service_;
+
+  // Outbound peer-stub pool used by EvictionManager to ship EvictKey
+  // RPCs.  Defined in master_server.cpp's anonymous namespace; the
+  // header sees only the EvictKeyDispatcher base.  Must outlive
+  // eviction_manager_, which holds a non-owning pointer to it.
+  std::unique_ptr<EvictKeyDispatcher> peer_stub_pool_;
 
   std::unique_ptr<EvictionManager> eviction_manager_;
 

@@ -21,6 +21,9 @@
 // SOFTWARE.
 #include "umbp/distributed/routing/router.h"
 
+#include <algorithm>
+#include <unordered_map>
+
 #include "mori/utils/mori_log.hpp"
 
 namespace mori::umbp {
@@ -35,89 +38,117 @@ Router::Router(GlobalBlockIndex& index, ClientRegistry& registry,
       put_strategy ? std::move(put_strategy) : std::make_unique<TierAwareMostAvailableStrategy>();
 }
 
-std::optional<Location> Router::RouteGet(const std::string& key, const std::string& node_id) {
+std::optional<RouteGetResolution> Router::RouteGet(
+    const std::string& key, const std::string& node_id,
+    const std::unordered_set<std::string>& exclude_nodes) {
   auto locations = index_.Lookup(key);
-
   if (locations.empty()) {
     MORI_UMBP_DEBUG("[Router] RouteGet key='{}': not found", key);
     return std::nullopt;
+  }
+
+  if (!exclude_nodes.empty()) {
+    locations.erase(
+        std::remove_if(locations.begin(), locations.end(),
+                       [&](const Location& l) { return exclude_nodes.count(l.node_id); }),
+        locations.end());
+    if (locations.empty()) {
+      MORI_UMBP_DEBUG("[Router] RouteGet key='{}': every replica excluded", key);
+      return std::nullopt;
+    }
   }
 
   Location selected = get_strategy_->Select(locations, node_id);
   index_.RecordAccess(key);
   index_.GrantLease(key, lease_duration_);
 
-  MORI_UMBP_DEBUG("[Router] RouteGet key='{}': selected node={}, location={}", key,
-                  selected.node_id, selected.location_id);
-  return selected;
+  // Resolve the peer address for the chosen replica from the registry.
+  // Routing-time read; the reader doesn't need to round-trip master to
+  // discover where to RDMA from.
+  std::string peer_address;
+  for (const auto& client : registry_.GetAliveClients()) {
+    if (client.node_id == selected.node_id) {
+      peer_address = client.peer_address;
+      break;
+    }
+  }
+
+  RouteGetResolution out;
+  out.location = selected;
+  out.peer_address = std::move(peer_address);
+  MORI_UMBP_DEBUG("[Router] RouteGet key='{}': selected node={}, tier={}, size={}", key,
+                  selected.node_id, TierTypeName(selected.tier), selected.size);
+  return out;
 }
 
-std::optional<RoutePutResult> Router::RoutePut(const std::string& key, const std::string& node_id,
-                                               uint64_t block_size) {
+std::optional<RoutePutResult> Router::RoutePut(
+    const std::string& key, const std::string& node_id, uint64_t block_size,
+    const std::unordered_set<std::string>& exclude_nodes) {
+  (void)key;
   auto candidates = registry_.GetAliveClients();
-  return RoutePutSingle(key, node_id, block_size, candidates);
-}
-
-std::optional<RoutePutResult> Router::RoutePutSingle(const std::string& key,
-                                                     const std::string& node_id,
-                                                     uint64_t block_size,
-                                                     std::vector<ClientRecord>& candidates) {
   if (candidates.empty()) {
-    MORI_UMBP_DEBUG("[Router] RoutePut key='{}' from={}: no alive clients", key, node_id);
+    MORI_UMBP_DEBUG("[Router] RoutePut from={}: no alive clients", node_id);
     return std::nullopt;
   }
-
-  for (;;) {
-    auto result = put_strategy_->Select(candidates, block_size);
-    if (!result) {
-      MORI_UMBP_DEBUG("[Router] RoutePut key='{}' from={}: no node with sufficient capacity", key,
-                      node_id);
-      return std::nullopt;
-    }
-
-    auto alloc = registry_.AllocateForPut(result->node_id, result->tier, block_size);
-    if (alloc) {
-      result->peer_address = std::move(alloc->peer_address);
-      result->engine_desc_bytes = std::move(alloc->engine_desc_bytes);
-      result->allocation_id = std::move(alloc->allocation_id);
-      result->location_id = std::move(alloc->location_id);
-      result->pages = std::move(alloc->pages);
-      result->dram_memory_descs = std::move(alloc->dram_memory_descs);
-      result->page_size = alloc->page_size;
-      result->ssd_store_index = alloc->ssd_store_index;
-      MORI_UMBP_DEBUG(
-          "[Router] RoutePut key='{}' from={}: selected node={}, tier={}, location='{}', pages={}",
-          key, node_id, result->node_id, TierTypeName(result->tier), result->location_id,
-          result->pages.size());
-      return result;
-    }
-
-    MORI_UMBP_DEBUG("[Router] RoutePut key='{}': allocation failed on node={} tier={}, retrying",
-                    key, result->node_id, TierTypeName(result->tier));
-    for (auto& c : candidates) {
-      if (c.node_id == result->node_id) {
-        c.tier_capacities.erase(result->tier);
-      }
-    }
+  auto selected = put_strategy_->Select(candidates, block_size, exclude_nodes);
+  if (!selected) {
+    MORI_UMBP_DEBUG("[Router] RoutePut from={}: no node with sufficient capacity", node_id);
+    return std::nullopt;
   }
+  return selected;
 }
 
 std::vector<std::optional<RoutePutResult>> Router::BatchRoutePut(
     const std::vector<std::string>& keys, const std::string& node_id,
-    const std::vector<uint64_t>& block_sizes) {
-  auto candidates = registry_.GetAliveClients();
+    const std::vector<uint64_t>& block_sizes,
+    const std::unordered_set<std::string>& exclude_nodes) {
+  (void)node_id;
   std::vector<std::optional<RoutePutResult>> results(keys.size());
+  // BatchRoutePut shares one alive-clients snapshot across all entries
+  // to keep results internally consistent.  Master holds no allocator
+  // state, so two entries selecting the same (node, tier) are not
+  // accounting-wrong here — the peer will sort out ENOSPC at
+  // AllocateSlot time.
+  auto candidates = registry_.GetAliveClients();
+  if (candidates.empty()) return results;
   for (size_t i = 0; i < keys.size(); ++i) {
-    results[i] = RoutePutSingle(keys[i], node_id, block_sizes[i], candidates);
+    results[i] = put_strategy_->Select(candidates, block_sizes[i], exclude_nodes);
   }
   return results;
 }
 
-std::vector<std::optional<Location>> Router::BatchRouteGet(const std::vector<std::string>& keys,
-                                                           const std::string& node_id) {
-  std::vector<std::optional<Location>> results(keys.size());
+std::vector<std::optional<RouteGetResolution>> Router::BatchRouteGet(
+    const std::vector<std::string>& keys, const std::string& node_id,
+    const std::unordered_set<std::string>& exclude_nodes) {
+  std::vector<std::optional<RouteGetResolution>> results(keys.size());
+
+  // Snapshot peer addresses once for the whole batch instead of pulling
+  // them per entry.  Master assumes the snapshot is stable for the
+  // duration of one BatchRouteGet.
+  std::unordered_map<std::string, std::string> node_to_peer;
+  for (const auto& client : registry_.GetAliveClients()) {
+    node_to_peer[client.node_id] = client.peer_address;
+  }
+
   for (size_t i = 0; i < keys.size(); ++i) {
-    results[i] = RouteGet(keys[i], node_id);
+    auto locations = index_.Lookup(keys[i]);
+    if (locations.empty()) continue;
+    if (!exclude_nodes.empty()) {
+      locations.erase(
+          std::remove_if(locations.begin(), locations.end(),
+                         [&](const Location& l) { return exclude_nodes.count(l.node_id); }),
+          locations.end());
+      if (locations.empty()) continue;
+    }
+    Location selected = get_strategy_->Select(locations, node_id);
+    index_.RecordAccess(keys[i]);
+    index_.GrantLease(keys[i], lease_duration_);
+
+    RouteGetResolution out;
+    out.location = selected;
+    auto it = node_to_peer.find(selected.node_id);
+    if (it != node_to_peer.end()) out.peer_address = it->second;
+    results[i] = std::move(out);
   }
   return results;
 }

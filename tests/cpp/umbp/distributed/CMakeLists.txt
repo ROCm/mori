@@ -1,3 +1,15 @@
+# The master-as-advisor redesign deleted the wire surface these tests exercised
+# (AllocateForPut / FinalizeAllocation / Register / Lookup, the fused-RDMA
+# pipeline, etc.).  They're kept on disk as references for the upcoming rewrite
+# but excluded from the default build.  Set
+# -DMORI_UMBP_LEGACY_DISTRIBUTED_TESTS=ON to opt into building them (most will
+# fail to compile until they're rewritten against the new RPC surface).
+option(MORI_UMBP_LEGACY_DISTRIBUTED_TESTS
+       "Build the pre-redesign tests/cpp/umbp/distributed/* suite" OFF)
+if(NOT MORI_UMBP_LEGACY_DISTRIBUTED_TESTS)
+  return()
+endif()
+
 add_executable(test_umbp_types test_types.cpp)
 target_link_libraries(test_umbp_types PRIVATE umbp_common gtest_main)
 add_test(NAME umbp_types COMMAND test_umbp_types)

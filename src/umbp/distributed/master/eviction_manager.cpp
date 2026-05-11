@@ -36,15 +36,13 @@
 namespace mori::umbp {
 
 EvictionManager::EvictionManager(GlobalBlockIndex& index, ClientRegistry& registry,
-                                 const EvictionConfig& config)
-    : index_(index), registry_(registry), config_(config) {}
+                                 const EvictionConfig& config, EvictKeyDispatcher* dispatcher)
+    : index_(index), registry_(registry), config_(config), dispatcher_(dispatcher) {}
 
 EvictionManager::~EvictionManager() { Stop(); }
 
 void EvictionManager::Start() {
-  if (running_.load(std::memory_order_relaxed)) {
-    return;
-  }
+  if (running_.load(std::memory_order_relaxed)) return;
   running_.store(true, std::memory_order_relaxed);
   thread_ = std::thread(&EvictionManager::EvictionLoop, this);
   MORI_UMBP_INFO("[EvictionManager] Started (interval={}s, high={}, low={})",
@@ -52,14 +50,10 @@ void EvictionManager::Start() {
 }
 
 void EvictionManager::Stop() {
-  if (!running_.load(std::memory_order_relaxed)) {
-    return;
-  }
+  if (!running_.load(std::memory_order_relaxed)) return;
   running_.store(false, std::memory_order_relaxed);
   cv_.notify_one();
-  if (thread_.joinable()) {
-    thread_.join();
-  }
+  if (thread_.joinable()) thread_.join();
   MORI_UMBP_INFO("[EvictionManager] Stopped");
 }
 
@@ -70,32 +64,27 @@ void EvictionManager::EvictionLoop() {
       cv_.wait_for(lock, config_.check_interval,
                    [this] { return !running_.load(std::memory_order_relaxed); });
     }
-    if (!running_.load(std::memory_order_relaxed)) {
-      break;
-    }
+    if (!running_.load(std::memory_order_relaxed)) break;
     RunOnce();
   }
 }
 
+// In the master-as-advisor design, master decides what to evict but the
+// peer executes — and master's view of the index only changes when the
+// peer ships REMOVE events on the next heartbeat.  This function picks
+// victims; phase D wires the actual EvictKey RPC dispatch via the
+// master-server-owned peer-stub pool.  Until then, this is a no-op
+// beyond logging the intent.
 void EvictionManager::RunOnce() {
-  // Step 1: determine overloaded nodes
   auto clients = registry_.GetAliveClients();
 
   using NodeTierKey = GlobalBlockIndex::NodeTierKey;
-  struct NodeTierHash {
-    size_t operator()(const NodeTierKey& k) const {
-      return std::hash<std::string>{}(k.node_id) ^
-             (std::hash<int>{}(static_cast<int>(k.tier)) << 16);
-    }
-  };
   std::set<NodeTierKey> overloaded_node_tiers;
-  std::unordered_map<NodeTierKey, int64_t, NodeTierHash> bytes_to_free;
+  std::unordered_map<std::string, std::map<TierType, int64_t>> bytes_to_free;
 
   for (const auto& client : clients) {
     for (const auto& [tier, cap] : client.tier_capacities) {
-      if (cap.total_bytes == 0) {
-        continue;
-      }
+      if (cap.total_bytes == 0) continue;
       uint64_t used = cap.total_bytes - cap.available_bytes;
       double usage = static_cast<double>(used) / static_cast<double>(cap.total_bytes);
       if (usage >= config_.high_watermark) {
@@ -104,90 +93,71 @@ void EvictionManager::RunOnce() {
         auto to_free = static_cast<int64_t>(used) - static_cast<int64_t>(target_used);
         if (to_free > 0) {
           overloaded_node_tiers.insert({client.node_id, tier});
-          bytes_to_free[{client.node_id, tier}] += to_free;
+          bytes_to_free[client.node_id][tier] += to_free;
         }
       }
     }
   }
 
-  if (overloaded_node_tiers.empty()) {
-    return;
-  }
-
+  if (overloaded_node_tiers.empty()) return;
   MORI_UMBP_INFO("[EvictionManager] {} overloaded node-tiers detected",
                  overloaded_node_tiers.size());
 
   auto candidates = index_.FindEvictionCandidates(overloaded_node_tiers);
-
   if (candidates.empty()) {
     MORI_UMBP_DEBUG("[EvictionManager] No eviction candidates found");
     return;
   }
 
-  // Step 2: sort and select victims (no lock)
+  // Sort by oldest-access first (LRU).  Depth-aware tiebreaking went away
+  // along with master's per-key depth field — peers don't ship depth in
+  // KvEvent — so a pure LRU sort is what we get.
   std::sort(candidates.begin(), candidates.end(),
             [](const EvictionCandidate& a, const EvictionCandidate& b) {
-              if (a.last_accessed_at != b.last_accessed_at) {
-                return a.last_accessed_at < b.last_accessed_at;
-              }
-              return a.depth > b.depth;
+              return a.last_accessed_at < b.last_accessed_at;
             });
 
-  std::vector<EvictionCandidate> victims;
+  // Group selected victims by node so the eventual EvictKey RPC takes a
+  // single keys[] per peer instead of N round trips.
+  std::unordered_map<std::string, std::vector<std::string>> per_node_keys;
+  size_t selected = 0;
   for (const auto& c : candidates) {
-    NodeTierKey key{c.location.node_id, c.location.tier};
-    auto it = bytes_to_free.find(key);
-    if (it == bytes_to_free.end() || it->second <= 0) {
+    auto& tier_budget = bytes_to_free[c.location.node_id];
+    auto it = tier_budget.find(c.location.tier);
+    if (it == tier_budget.end() || it->second <= 0) continue;
+    per_node_keys[c.location.node_id].push_back(c.key);
+    it->second -= static_cast<int64_t>(c.size);
+    ++selected;
+  }
+
+  if (selected == 0) return;
+
+  MORI_UMBP_INFO("[EvictionManager] Selected {} victims across {} nodes", selected,
+                 per_node_keys.size());
+
+  // Look up peer addresses once per dispatch round.  ClientRegistry
+  // owns the (node_id -> peer_address) mapping; we can't ship an
+  // EvictKey to a node that has dropped out.
+  std::unordered_map<std::string, std::string> node_to_peer;
+  for (const auto& client : clients) node_to_peer[client.node_id] = client.peer_address;
+
+  for (auto& [node_id, keys] : per_node_keys) {
+    auto it = node_to_peer.find(node_id);
+    if (it == node_to_peer.end() || it->second.empty()) {
+      MORI_UMBP_WARN("[EvictionManager] no peer_address for node={} — skipping {} keys", node_id,
+                     keys.size());
       continue;
     }
-    victims.push_back(c);
-    it->second -= static_cast<int64_t>(c.size);
-
-    bool all_satisfied = true;
-    for (const auto& [_, remaining] : bytes_to_free) {
-      if (remaining > 0) {
-        all_satisfied = false;
-        break;
-      }
+    if (dispatcher_ == nullptr) {
+      MORI_UMBP_DEBUG("[EvictionManager] dispatcher unset; would EvictKey on node={} ({} keys)",
+                      node_id, keys.size());
+      continue;
     }
-    if (all_satisfied) {
-      break;
-    }
+    // Master state is unchanged here — REMOVE events on the peer's
+    // next heartbeat are what shrink the index.  Re-eviction next
+    // round is safe because peer Evict is idempotent.
+    dispatcher_->DispatchEvictKey(node_id, it->second, std::move(keys));
   }
-
-  if (victims.empty()) {
-    return;
-  }
-
-  MORI_UMBP_INFO("[EvictionManager] Selected {} victims for eviction", victims.size());
-
-  // Step 3: evict in batches (write lock + yield between batches)
-  size_t total_evicted = 0;
-  for (size_t i = 0; i < victims.size(); i += config_.evict_batch_size) {
-    if (!running_.load(std::memory_order_relaxed)) {
-      break;
-    }
-
-    size_t end = std::min(i + config_.evict_batch_size, victims.size());
-    std::vector<EvictionCandidate> batch(victims.begin() + static_cast<ptrdiff_t>(i),
-                                         victims.begin() + static_cast<ptrdiff_t>(end));
-
-    auto evicted = index_.EvictEntries(batch);
-    total_evicted += evicted.size();
-
-    for (const auto& entry : evicted) {
-      // ClientRegistry::DeallocateForUnregister parses location_id internally:
-      // DRAM/HBM uses the page-bitmap "0:p3,4;1:p0" format via
-      // ParseDramLocationId; SSD uses the buffer-index-prefix format.
-      registry_.DeallocateForUnregister(entry.location.node_id, entry.location);
-    }
-
-    if (end < victims.size()) {
-      std::this_thread::yield();
-    }
-  }
-
-  MORI_UMBP_INFO("[EvictionManager] Evicted {} entries", total_evicted);
 }
 
 }  // namespace mori::umbp

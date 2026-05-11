@@ -134,59 +134,15 @@
 #define MORI_UMBP_METRIC_CLIENT_GET_BYTES_TOTAL_HELP \
   "Total bytes read per client split by local/remote traffic"
 
-// --- Core block management API call counters --------------------------------
+// --- Heartbeat / event-shipping counters (master-as-advisor) ----------------
 
-#define MORI_UMBP_METRIC_REGISTER_TOTAL "mori_umbp_register_total"
-#define MORI_UMBP_METRIC_REGISTER_TOTAL_HELP \
-  "Total number of Register API calls received by the master"
+#define MORI_UMBP_METRIC_HEARTBEAT_EVENTS_APPLIED_TOTAL "mori_umbp_heartbeat_events_applied_total"
+#define MORI_UMBP_METRIC_HEARTBEAT_EVENTS_APPLIED_TOTAL_HELP \
+  "KvEvents applied to GlobalBlockIndex via heartbeat"
 
-#define MORI_UMBP_METRIC_UNREGISTER_TOTAL "mori_umbp_unregister_total"
-#define MORI_UMBP_METRIC_UNREGISTER_TOTAL_HELP \
-  "Total number of Unregister API calls received by the master"
-
-#define MORI_UMBP_METRIC_FINALIZE_ALLOCATION_TOTAL "mori_umbp_finalize_allocation_total"
-#define MORI_UMBP_METRIC_FINALIZE_ALLOCATION_TOTAL_HELP \
-  "Total number of FinalizeAllocation API calls received by the master"
-
-#define MORI_UMBP_METRIC_PUBLISH_LOCAL_BLOCK_TOTAL "mori_umbp_publish_local_block_total"
-#define MORI_UMBP_METRIC_PUBLISH_LOCAL_BLOCK_TOTAL_HELP \
-  "Total number of PublishLocalBlock API calls received by the master"
-
-#define MORI_UMBP_METRIC_ABORT_ALLOCATION_TOTAL "mori_umbp_abort_allocation_total"
-#define MORI_UMBP_METRIC_ABORT_ALLOCATION_TOTAL_HELP \
-  "Total number of AbortAllocation API calls received by the master"
-
-// --- Batch API call counters ------------------------------------------------
-
-#define MORI_UMBP_METRIC_BATCH_LOOKUP_TOTAL "mori_umbp_batch_lookup_total"
-#define MORI_UMBP_METRIC_BATCH_LOOKUP_TOTAL_HELP \
-  "Total number of BatchLookup API calls received by the master"
-
-#define MORI_UMBP_METRIC_BATCH_LOOKUP_KEYS_TOTAL "mori_umbp_batch_lookup_keys_total"
-#define MORI_UMBP_METRIC_BATCH_LOOKUP_KEYS_TOTAL_HELP \
-  "Total keys queried across all BatchLookup calls"
-
-#define MORI_UMBP_METRIC_BATCH_LOOKUP_FOUND_TOTAL "mori_umbp_batch_lookup_found_total"
-#define MORI_UMBP_METRIC_BATCH_LOOKUP_FOUND_TOTAL_HELP \
-  "Total keys found across all BatchLookup calls"
-
-#define MORI_UMBP_METRIC_BATCH_FINALIZE_ALLOCATION_TOTAL "mori_umbp_batch_finalize_allocation_total"
-#define MORI_UMBP_METRIC_BATCH_FINALIZE_ALLOCATION_TOTAL_HELP \
-  "Total number of BatchFinalizeAllocation API calls received by the master"
-
-#define MORI_UMBP_METRIC_BATCH_FINALIZE_ALLOCATION_KEYS_TOTAL \
-  "mori_umbp_batch_finalize_allocation_keys_total"
-#define MORI_UMBP_METRIC_BATCH_FINALIZE_ALLOCATION_KEYS_TOTAL_HELP \
-  "Total keys processed across all BatchFinalizeAllocation calls"
-
-#define MORI_UMBP_METRIC_BATCH_ABORT_ALLOCATION_TOTAL "mori_umbp_batch_abort_allocation_total"
-#define MORI_UMBP_METRIC_BATCH_ABORT_ALLOCATION_TOTAL_HELP \
-  "Total number of BatchAbortAllocation API calls received by the master"
-
-#define MORI_UMBP_METRIC_BATCH_ABORT_ALLOCATION_ENTRIES_TOTAL \
-  "mori_umbp_batch_abort_allocation_entries_total"
-#define MORI_UMBP_METRIC_BATCH_ABORT_ALLOCATION_ENTRIES_TOTAL_HELP \
-  "Total entries processed across all BatchAbortAllocation calls"
+#define MORI_UMBP_METRIC_HEARTBEAT_SEQ_GAP_TOTAL "mori_umbp_heartbeat_seq_gap_total"
+#define MORI_UMBP_METRIC_HEARTBEAT_SEQ_GAP_TOTAL_HELP \
+  "Heartbeats rejected due to seq gap (full sync requested)"
 
 // --- Per-client batch bandwidth histograms (reported by clients) -----------
 

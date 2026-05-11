@@ -28,28 +28,19 @@
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
-#include <utility>
 #include <vector>
 
 #include "umbp/distributed/types.h"
 
 namespace mori::umbp {
 
-class ClientRegistry;
-
 struct BlockEntry {
   std::vector<Location> locations;
   BlockMetrics metrics;
 
-  // Atomic lease: steady_clock duration rep, lock-free
   std::atomic<int64_t> lease_expiry_rep{0};
-
-  // Atomic access tracking, lock-free
   std::atomic<int64_t> last_accessed_rep{0};
   std::atomic<uint64_t> atomic_access_count{0};
-
-  // Prefix-aware: depth from BatchPutWithDepth (-1 = unknown)
-  int32_t depth = -1;
 
   void GrantLease(std::chrono::steady_clock::duration duration) {
     auto expiry = std::chrono::steady_clock::now() + duration;
@@ -77,10 +68,13 @@ struct EvictionCandidate {
   std::string key;
   Location location;
   std::chrono::steady_clock::time_point last_accessed_at;
-  int32_t depth;
   uint64_t size;
 };
 
+// Master-side projection of every peer's owned-key set.  In the
+// master-as-advisor design this index is *only* mutated through the
+// event-shipping heartbeat — there are no per-Put or per-Eviction
+// master RPCs.  Routing and eviction read from here.
 class GlobalBlockIndex {
  public:
   GlobalBlockIndex() = default;
@@ -89,45 +83,39 @@ class GlobalBlockIndex {
   GlobalBlockIndex(const GlobalBlockIndex&) = delete;
   GlobalBlockIndex& operator=(const GlobalBlockIndex&) = delete;
 
-  void SetClientRegistry(ClientRegistry* registry);
+  // --- Mutators (event-driven only) ---
 
-  // --- Mutators ---
-  void Register(const std::string& node_id, const std::string& key, const Location& location);
+  // Apply one peer's heartbeat-shipped event batch.  Returns the count
+  // of events that mutated the index.  ADD with a (node_id, tier) that
+  // already exists for the key replaces the existing entry's size.
+  // REMOVE for an unknown (key, node_id, tier) is a silent no-op.
+  size_t ApplyEvents(const std::string& node_id, const std::vector<KvEvent>& events);
 
-  bool Unregister(const std::string& node_id, const std::string& key, const Location& location);
+  // Replace this node's full set of locations with the keys carried in
+  // `adds`.  Used on heartbeat full-sync (gap recovery, master restart,
+  // or expired-then-re-register).  Every prior location for `node_id`
+  // is dropped first.  REMOVE entries in `adds` are ignored.
+  void ReplaceNodeLocations(const std::string& node_id, const std::vector<KvEvent>& adds);
 
-  size_t UnregisterByNode(const std::string& key, const std::string& node_id);
-
-  // Batch variants — single lock acquisition for the entire batch.
-  size_t BatchRegister(const std::string& node_id,
-                       const std::vector<std::pair<std::string, Location>>& entries);
-  size_t BatchUnregister(const std::string& node_id,
-                         const std::vector<std::pair<std::string, Location>>& entries);
-
-  // Bump last_accessed_at and access_count. Called by Router on RouteGet.
+  // Bump last_accessed_at and access_count.  Called by Router on
+  // RouteGet.  Lock-free under the shared lock.
   void RecordAccess(const std::string& key);
 
-  // Grant a time-limited lease to protect a key from eviction.
+  // Grant a time-limited lease to protect a key from eviction.  Used by
+  // RouteGet to keep a key alive across the writer's RDMA round trip.
   void GrantLease(const std::string& key, std::chrono::steady_clock::duration duration);
 
-  void SetDepth(const std::string& key, int32_t depth);
-
   // --- Queries ---
+
   std::vector<Location> Lookup(const std::string& key) const;
 
-  // Batched existence check — single shared_lock acquisition for the whole
-  // batch.  Semantics match Lookup(): read-only, no access-count or lease
-  // side-effects.  Returns a vector parallel to `keys` where entry i is
-  // true iff the key has at least one registered Location.
+  // Batched existence check — single shared_lock acquisition for the
+  // whole batch.  Read-only, no access-count or lease side-effects.
+  // Returns a vector parallel to `keys` where entry i is true iff the
+  // key has at least one registered Location.
   std::vector<bool> BatchLookupExists(const std::vector<std::string>& keys) const;
 
-  // Returns metrics for a key, or nullopt if the key doesn't exist.
   std::optional<BlockMetrics> GetMetrics(const std::string& key) const;
-
-  // Returns the prefix-aware depth recorded for `key` (set by
-  // BatchFinalizeAllocation depths[]), or nullopt if the key doesn't
-  // exist.  Test-facing read-only accessor.
-  std::optional<int32_t> GetDepth(const std::string& key) const;
 
   // --- Eviction ---
 
@@ -144,13 +132,9 @@ class GlobalBlockIndex {
   std::vector<EvictionCandidate> FindEvictionCandidates(
       const std::set<NodeTierKey>& overloaded_node_tiers) const;
 
-  // Double-check and remove entries (write lock). Returns actually evicted candidates.
-  std::vector<EvictionCandidate> EvictEntries(const std::vector<EvictionCandidate>& victims);
-
  private:
   mutable std::shared_mutex mutex_;
   std::unordered_map<std::string, BlockEntry> entries_;
-  ClientRegistry* registry_ = nullptr;
 };
 
 }  // namespace mori::umbp

@@ -291,7 +291,11 @@ add_custom_command(
     ${_PROTOBUF_PROTOC} --proto_path=${UMBP_PROTO_DIR}
     --cpp_out=${UMBP_PROTO_GEN_DIR} --grpc_out=${UMBP_PROTO_GEN_DIR}
     --plugin=protoc-gen-grpc=${_GRPC_CPP_PLUGIN} ${UMBP_PEER_PROTO_FILE}
-  DEPENDS ${UMBP_PEER_PROTO_FILE}
+  # umbp_peer.proto imports umbp.proto for shared types (TierType, PageLocation,
+  # BufferMemoryDesc) — protoc reads it at generation time and the generated
+  # peer headers include "umbp.pb.h", so the peer generation depends on the
+  # master proto being present and current.
+  DEPENDS ${UMBP_PEER_PROTO_FILE} ${UMBP_PROTO_FILE} ${UMBP_PROTO_HDRS}
   COMMENT "Generating UMBP Peer protobuf/gRPC C++ sources"
   VERBATIM)
 
@@ -314,6 +318,7 @@ add_library(
   distributed/routing/router.cpp
   distributed/routing/route_get_strategy.cpp
   distributed/routing/route_put_strategy.cpp
+  distributed/peer/peer_dram_allocator.cpp
   distributed/peer/peer_service.cpp
   distributed/pool_client.cpp
   distributed/distributed_client.cpp)

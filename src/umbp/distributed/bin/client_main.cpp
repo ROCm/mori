@@ -21,8 +21,10 @@
 // SOFTWARE.
 #include <csignal>
 #include <cstdlib>
+#include <optional>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "mori/utils/mori_log.hpp"
@@ -113,82 +115,35 @@ int main(int argc, char** argv) {
     ++iteration;
     const std::string key = "demo-block-iter-" + std::to_string(iteration);
 
-    // ---- Step 1: RoutePut — ask master where to write ----
+    // RoutePut + RouteGet — pure routing advisory in the new design.
+    // The full Put/Get pipeline now goes through PoolClient (peer
+    // RPCs handle the actual data path); this demo just exercises
+    // the master surface.
+    std::unordered_set<std::string> excludes;
     std::optional<mori::umbp::RoutePutResult> put_target;
-    auto route_put_status = client.RoutePut(key, 4ULL * 1024 * 1024, &put_target);
+    auto route_put_status = client.RoutePut(key, 4ULL * 1024 * 1024, excludes, &put_target);
     if (!route_put_status.ok()) {
-      MORI_UMBP_WARN("[Client] Iteration {} RoutePut(key={}) RPC failed: {}", iteration, key,
+      MORI_UMBP_WARN("[Client] Iteration {} RoutePut RPC failed: {}", iteration,
                      route_put_status.error_message());
-      if (!SleepInterruptible(kOperationInterval)) break;
-      continue;
+    } else if (put_target.has_value()) {
+      MORI_UMBP_INFO("[Client] Iteration {} RoutePut(key={}): target_node={}, tier={}", iteration,
+                     key, put_target->node_id, mori::umbp::TierTypeName(put_target->tier));
+    } else {
+      MORI_UMBP_WARN("[Client] Iteration {} RoutePut(key={}): no candidate", iteration, key);
     }
 
-    if (!put_target.has_value()) {
-      MORI_UMBP_WARN("[Client] Iteration {} RoutePut(key={}): no suitable target node", iteration,
-                     key);
-      if (!SleepInterruptible(kOperationInterval)) break;
-      continue;
-    }
-
-    MORI_UMBP_INFO("[Client] Iteration {} RoutePut(key={}): target_node={}, addr={}, tier={}",
-                   iteration, key, put_target->node_id, put_target->node_address,
-                   mori::umbp::TierTypeName(put_target->tier));
-
-    // ---- Step 2: Simulate MORI-IO write (would be real RDMA in production) ----
-    std::string simulated_location_id = "sim-loc-" + std::to_string(iteration);
-    MORI_UMBP_INFO("[Client] Iteration {} Simulating MORI-IO write to {} -> location_id='{}'",
-                   iteration, put_target->node_id, simulated_location_id);
-
-    // ---- Step 3: Register — tell master where the block landed ----
-    mori::umbp::Location location;
-    location.node_id = put_target->node_id;
-    location.location_id = simulated_location_id;
-    location.size = 4ULL * 1024 * 1024;
-    location.tier = put_target->tier;
-
-    auto register_status = client.Register(key, location);
-    if (!register_status.ok()) {
-      MORI_UMBP_WARN("[Client] Iteration {} Register(key={}) failed: {}", iteration, key,
-                     register_status.error_message());
-      if (!SleepInterruptible(kOperationInterval)) break;
-      continue;
-    }
-    MORI_UMBP_INFO("[Client] Iteration {} Register(key={}) succeeded", iteration, key);
-
-    if (!SleepInterruptible(std::chrono::seconds(1))) break;
-
-    // ---- Step 4: RouteGet — ask master where to read the block back ----
     std::optional<mori::umbp::RouteGetResult> get_result;
-    auto route_get_status = client.RouteGet(key, &get_result);
+    auto route_get_status = client.RouteGet(key, excludes, &get_result);
     if (!route_get_status.ok()) {
-      MORI_UMBP_WARN("[Client] Iteration {} RouteGet(key={}) RPC failed: {}", iteration, key,
+      MORI_UMBP_WARN("[Client] Iteration {} RouteGet RPC failed: {}", iteration,
                      route_get_status.error_message());
-      if (!SleepInterruptible(kOperationInterval)) break;
-      continue;
+    } else if (get_result.has_value()) {
+      MORI_UMBP_INFO("[Client] Iteration {} RouteGet(key={}): node={}, tier={}, size={}", iteration,
+                     key, get_result->node_id, mori::umbp::TierTypeName(get_result->tier),
+                     get_result->size);
     }
 
-    if (get_result.has_value()) {
-      MORI_UMBP_INFO(
-          "[Client] Iteration {} RouteGet(key={}): read from node={}, location={}, tier={}",
-          iteration, key, get_result->location.node_id, get_result->location.location_id,
-          mori::umbp::TierTypeName(get_result->location.tier));
-    } else {
-      MORI_UMBP_WARN("[Client] Iteration {} RouteGet(key={}): not found (unexpected)", iteration,
-                     key);
-    }
-
-    // ---- Step 5: Cleanup — unregister the block ----
-    uint32_t removed = 0;
-    auto unregister_status = client.Unregister(key, location, &removed);
-    if (!unregister_status.ok()) {
-      MORI_UMBP_WARN("[Client] Iteration {} Unregister(key={}) failed: {}", iteration, key,
-                     unregister_status.error_message());
-    } else {
-      MORI_UMBP_INFO("[Client] Iteration {} Unregister(key={}) removed={}", iteration, key,
-                     removed);
-    }
-
-    // ---- Step 6: External KV simulation ----
+    // ---- External KV simulation ----
     // Revoke the previous batch (simulates KV cache eviction), then report a
     // fresh batch (simulates new KV cache tokens being prefilled).
     constexpr int kExtKvBatchSize = 10;
