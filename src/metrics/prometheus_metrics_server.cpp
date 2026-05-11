@@ -259,25 +259,31 @@ void MetricsServer::setGauge(std::string_view name, std::string_view help, const
 // Serialisation (Prometheus text format 0.0.4)
 // ---------------------------------------------------------------------------
 
-std::string MetricsServer::serializeLocked() const {
+std::string MetricsServer::SerializeMaps(
+    const std::map<std::string, GaugeEntry>& gauges,
+    const std::map<std::string, CounterEntry>& counters,
+    const std::map<std::string, HistogramEntry>& histograms,
+    const std::map<std::string, LabeledGaugeFamily>& labeled_gauges,
+    const std::map<std::string, LabeledCounterFamily>& labeled_counters,
+    const std::map<std::string, LabeledHistogramFamily>& labeled_histograms) {
   std::ostringstream out;
 
   // Gauges
-  for (const auto& [name, g] : gauges_) {
+  for (const auto& [name, g] : gauges) {
     out << "# HELP " << name << " " << g.help << "\n";
     out << "# TYPE " << name << " gauge\n";
     out << name << " " << g.value << "\n\n";
   }
 
   // Counters
-  for (const auto& [name, c] : counters_) {
+  for (const auto& [name, c] : counters) {
     out << "# HELP " << name << " " << c.help << "\n";
     out << "# TYPE " << name << " counter\n";
     out << name << " " << c.value << "\n\n";
   }
 
   // Labeled gauges
-  for (const auto& [name, family] : labeled_gauges_) {
+  for (const auto& [name, family] : labeled_gauges) {
     out << "# HELP " << name << " " << family.help << "\n";
     out << "# TYPE " << name << " gauge\n";
     for (const auto& [label_str, value] : family.series) {
@@ -287,7 +293,7 @@ std::string MetricsServer::serializeLocked() const {
   }
 
   // Labeled counters
-  for (const auto& [name, family] : labeled_counters_) {
+  for (const auto& [name, family] : labeled_counters) {
     out << "# HELP " << name << " " << family.help << "\n";
     out << "# TYPE " << name << " counter\n";
     for (const auto& [label_str, value] : family.series) {
@@ -297,7 +303,7 @@ std::string MetricsServer::serializeLocked() const {
   }
 
   // Histograms
-  for (const auto& [name, h] : histograms_) {
+  for (const auto& [name, h] : histograms) {
     out << "# HELP " << name << " " << h.help << "\n";
     out << "# TYPE " << name << " histogram\n";
 
@@ -312,7 +318,7 @@ std::string MetricsServer::serializeLocked() const {
   }
 
   // Labeled histograms
-  for (const auto& [name, family] : labeled_histograms_) {
+  for (const auto& [name, family] : labeled_histograms) {
     out << "# HELP " << name << " " << family.help << "\n";
     out << "# TYPE " << name << " histogram\n";
     for (const auto& [label_str, h] : family.series) {
@@ -359,8 +365,27 @@ void MetricsServer::handleClient(int client_fd) {
   std::string status;
 
   if (std::strncmp(buf, "GET /metrics", 12) == 0) {
-    std::lock_guard<std::mutex> lk(mutex_);
-    body = serializeLocked();
+    // Snapshot the metric maps under mutex_ then format the body without
+    // holding the lock. Lock hold time is bounded by series cardinality
+    // (the map copies), not by formatted body size, so addCounter /
+    // setGauge / observeAggregated callers are not blocked by the scrape.
+    std::map<std::string, GaugeEntry> gauges_copy;
+    std::map<std::string, CounterEntry> counters_copy;
+    std::map<std::string, HistogramEntry> histograms_copy;
+    std::map<std::string, LabeledGaugeFamily> labeled_gauges_copy;
+    std::map<std::string, LabeledCounterFamily> labeled_counters_copy;
+    std::map<std::string, LabeledHistogramFamily> labeled_histograms_copy;
+    {
+      std::lock_guard<std::mutex> lk(mutex_);
+      gauges_copy = gauges_;
+      counters_copy = counters_;
+      histograms_copy = histograms_;
+      labeled_gauges_copy = labeled_gauges_;
+      labeled_counters_copy = labeled_counters_;
+      labeled_histograms_copy = labeled_histograms_;
+    }
+    body = SerializeMaps(gauges_copy, counters_copy, histograms_copy, labeled_gauges_copy,
+                         labeled_counters_copy, labeled_histograms_copy);
     status = "200 OK";
   } else if (std::strncmp(buf, "GET /", 5) == 0) {
     body = "Try GET /metrics\n";

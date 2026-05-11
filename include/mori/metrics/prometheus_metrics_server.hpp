@@ -177,8 +177,17 @@ class MetricsServer {
 
   // ---- internal helpers ---------------------------------------------
 
-  // Serialise all metrics to Prometheus text format (caller must hold mutex_).
-  std::string serializeLocked() const;
+  // Format the supplied metric maps as Prometheus text. Pure function: the
+  // caller is responsible for snapshotting the maps under mutex_ and then
+  // invoking this without holding the lock, so that scrape-time formatting
+  // never blocks concurrent metric updates.
+  static std::string SerializeMaps(
+      const std::map<std::string, GaugeEntry>& gauges,
+      const std::map<std::string, CounterEntry>& counters,
+      const std::map<std::string, HistogramEntry>& histograms,
+      const std::map<std::string, LabeledGaugeFamily>& labeled_gauges,
+      const std::map<std::string, LabeledCounterFamily>& labeled_counters,
+      const std::map<std::string, LabeledHistogramFamily>& labeled_histograms);
 
   // Main loop running in accept_thread_.
   void acceptLoop();
