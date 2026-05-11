@@ -25,6 +25,8 @@
 #include <hip/hip_runtime_api.h>
 #include <infiniband/verbs.h>
 
+#include <cctype>
+#include <cstdio>
 #include <iostream>
 #include <optional>
 
@@ -40,6 +42,43 @@ namespace application {
 /*                                        Device Attributes                                       */
 /* ---------------------------------------------------------------------------------------------- */
 
+namespace {
+
+// Minimum firmware build number required for CCQE support (e.g. "1.117.5-a58" → 58).
+constexpr int kCcqeMinFwBuild = 58;
+
+// Read /sys/class/infiniband/<dev_name>/fw_ver and return the numeric build suffix
+// (the digits after the last '-[letters]' component).  Returns -1 on any failure.
+int ReadIonicFwBuild(const char* dev_name) {
+  char path[256];
+  snprintf(path, sizeof(path), "/sys/class/infiniband/%s/fw_ver", dev_name);
+
+  FILE* f = fopen(path, "r");
+  if (!f) return -1;
+
+  char buf[64] = {};
+  fgets(buf, sizeof(buf), f);
+  fclose(f);
+
+  // Find last '-' then skip letters to reach the build digits.
+  char* dash = strrchr(buf, '-');
+  if (!dash) return -1;
+  char* p = dash + 1;
+  while (*p && !isdigit(static_cast<unsigned char>(*p))) ++p;
+  if (!*p) return -1;
+  return atoi(p);
+}
+
+bool IsCcqeSupported(ibv_context* context) {
+  if (IonicDvApi::Instance().create_cq_ex == nullptr) return false;
+  int build = ReadIonicFwBuild(context->device->name);
+
+  MORI_APP_TRACE("dev: %s fw_build %d", context->device->name, build);
+  return build >= kCcqeMinFwBuild;
+}
+
+}  // namespace
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                          IonicCqContainer                            */
 /* ---------------------------------------------------------------------------------------------- */
@@ -52,7 +91,7 @@ IonicCqContainer::IonicCqContainer(ibv_context* context, const RdmaEndpointConfi
 
   cqeNum = config.maxCqeNum;
 
-  const bool ccqe_enabled = IonicDvApi::Instance().create_cq_ex != nullptr;
+  const bool ccqe_enabled = IsCcqeSupported(context);
 
   memset(&cq_attr, 0, sizeof(struct ibv_cq_init_attr_ex));
   cq_attr.cq_context = nullptr;
