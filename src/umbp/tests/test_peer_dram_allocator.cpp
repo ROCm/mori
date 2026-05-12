@@ -64,7 +64,9 @@ TEST(PeerDramAllocator, CommitMakesKeyResolvable) {
   EXPECT_EQ(pending->size, kPageSize);
   EXPECT_EQ(pending->pages.size(), 1u);
 
-  ASSERT_TRUE(a->Commit(pending->slot_id, "key-1"));
+  uint64_t committed_bytes = 0;
+  ASSERT_TRUE(a->Commit(pending->slot_id, "key-1", committed_bytes));
+  EXPECT_EQ(committed_bytes, pending->size);
   auto r = a->Resolve("key-1");
   EXPECT_TRUE(r.found);
   EXPECT_EQ(r.size, kPageSize);
@@ -111,7 +113,9 @@ TEST(PeerDramAllocator, PendingSlotExpiresAfterTtl) {
   std::this_thread::sleep_for(std::chrono::milliseconds{20});
   a->RunReaperOnceForTest();
 
-  EXPECT_FALSE(a->Commit(pending->slot_id, "key-late"));
+  uint64_t committed_bytes = 0;
+  EXPECT_FALSE(a->Commit(pending->slot_id, "key-late", committed_bytes));
+  EXPECT_EQ(committed_bytes, 0u);
   EXPECT_TRUE(a->DrainPendingEvents().empty());
 
   auto cap = a->TierCapacitiesSnapshot();
@@ -135,7 +139,9 @@ TEST(PeerDramAllocator, AbortIsIdempotent) {
 TEST(PeerDramAllocator, EvictRemovesKeyAndQueuesEvent) {
   auto a = MakeAllocator();
   auto p = a->Allocate(kPageSize, TierType::DRAM);
-  ASSERT_TRUE(a->Commit(p->slot_id, "k"));
+  uint64_t committed_bytes = 0;
+  ASSERT_TRUE(a->Commit(p->slot_id, "k", committed_bytes));
+  EXPECT_EQ(committed_bytes, p->size);
   a->DrainPendingEvents();
 
   auto results = a->Evict({"k", "ghost"});
@@ -164,7 +170,9 @@ TEST(PeerDramAllocator, EvictDefersWhenReadLeaseActive) {
                                                /*pending_ttl=*/std::chrono::milliseconds{5000},
                                                /*read_lease_ttl=*/std::chrono::milliseconds{200});
   auto p = a->Allocate(kPageSize, TierType::DRAM);
-  ASSERT_TRUE(a->Commit(p->slot_id, "k"));
+  uint64_t committed_bytes = 0;
+  ASSERT_TRUE(a->Commit(p->slot_id, "k", committed_bytes));
+  EXPECT_EQ(committed_bytes, p->size);
   a->DrainPendingEvents();
 
   auto r = a->Resolve("k");
@@ -191,7 +199,9 @@ TEST(PeerDramAllocator, SnapshotOwnedKeysReturnsEveryAdd) {
   for (int i = 0; i < 5; ++i) {
     auto p = a->Allocate(kPageSize, TierType::DRAM);
     ASSERT_TRUE(p.has_value());
-    ASSERT_TRUE(a->Commit(p->slot_id, "k-" + std::to_string(i)));
+    uint64_t committed_bytes = 0;
+    ASSERT_TRUE(a->Commit(p->slot_id, "k-" + std::to_string(i), committed_bytes));
+    EXPECT_EQ(committed_bytes, p->size);
   }
   a->DrainPendingEvents();
 
@@ -235,7 +245,9 @@ TEST(PeerDramAllocator, TierCapacitiesReflectAllocations) {
   auto cap1 = a->TierCapacitiesSnapshot();
   EXPECT_EQ(cap1[TierType::DRAM].available_bytes, total - 3 * kPageSize);
 
-  ASSERT_TRUE(a->Commit(p->slot_id, "k"));
+  uint64_t committed_bytes = 0;
+  ASSERT_TRUE(a->Commit(p->slot_id, "k", committed_bytes));
+  EXPECT_EQ(committed_bytes, p->size);
   auto cap2 = a->TierCapacitiesSnapshot();
   EXPECT_EQ(cap2[TierType::DRAM].available_bytes, total - 3 * kPageSize);
 
@@ -253,7 +265,9 @@ TEST(PeerDramAllocator, CommitAfterReapReturnsFalse) {
   ASSERT_TRUE(p.has_value());
   std::this_thread::sleep_for(std::chrono::milliseconds{20});
   a->RunReaperOnceForTest();
-  EXPECT_FALSE(a->Commit(p->slot_id, "doomed"));
+  uint64_t committed_bytes = 0;
+  EXPECT_FALSE(a->Commit(p->slot_id, "doomed", committed_bytes));
+  EXPECT_EQ(committed_bytes, 0u);
   EXPECT_TRUE(a->DrainPendingEvents().empty());
 }
 

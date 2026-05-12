@@ -26,9 +26,12 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <string>
 
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/env_time.h"
+#include "umbp/distributed/master/master_client.h"
+#include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/peer/peer_dram_allocator.h"
 #include "umbp/distributed/types.h"
 #include "umbp/local/block_index/local_block_index.h"
@@ -158,9 +161,9 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
   UMBPPeerServiceImpl(void* ssd_staging_base, size_t ssd_staging_size,
                       const std::vector<uint8_t>& ssd_staging_mem_desc_bytes,
                       LocalStorageManager* storage, LocalBlockIndex* index,
-                      PeerDramAllocator* dram_alloc, StagingMetrics& metrics, int num_read_slots,
-                      int num_write_slots, int lease_timeout_s,
-                      const std::vector<uint8_t>& engine_desc_bytes)
+                      PeerDramAllocator* dram_alloc, MasterClient* master_client,
+                      StagingMetrics& metrics, int num_read_slots, int num_write_slots,
+                      int lease_timeout_s, const std::vector<uint8_t>& engine_desc_bytes)
       : ssd_staging_base_(ssd_staging_base),
         ssd_staging_size_(ssd_staging_size),
         ssd_staging_mem_desc_bytes_(ssd_staging_mem_desc_bytes),
@@ -177,7 +180,8 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
         write_slot_size_((ssd_staging_size / 2) /
                          static_cast<size_t>(std::max(num_write_slots, 1))),
         read_slots_(std::max(num_read_slots, 1)),
-        write_slots_(std::max(num_write_slots, 1)) {
+        write_slots_(std::max(num_write_slots, 1)),
+        master_client_(master_client) {
     if (num_read_slots <= 0 || num_write_slots <= 0) {
       MORI_UMBP_ERROR("[PeerService] num_read_slots={} num_write_slots={} invalid, clamped to 1",
                       num_read_slots, num_write_slots);
@@ -353,6 +357,7 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
     response->set_ssd_location_id(location_id);
     MORI_UMBP_INFO("[PeerService] CommitSsdWrite: key={}, size={}, location={}", key, size,
                    location_id);
+    RecordInboundPut(static_cast<uint64_t>(size), "remote");
     return grpc::Status::OK;
   }
 
@@ -453,7 +458,10 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
       response->set_success(false);
       return grpc::Status::OK;
     }
-    response->set_success(dram_alloc_->Commit(request->slot_id(), request->key()));
+    uint64_t committed_bytes = 0;
+    const bool ok = dram_alloc_->Commit(request->slot_id(), request->key(), committed_bytes);
+    response->set_success(ok);
+    if (ok) RecordInboundPut(committed_bytes, "remote");
     return grpc::Status::OK;
   }
 
@@ -479,6 +487,7 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
     auto descs = dram_alloc_->BufferDescsForPages(r.tier, r.pages);
     FillPagesAndDescs(response, r.pages, dram_alloc_->PageSize(), descs);
     response->set_size(r.size);
+    RecordInboundGet(r.size, "remote");
     return grpc::Status::OK;
   }
 
@@ -526,10 +535,15 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
   grpc::Status BatchCommitSlots(grpc::ServerContext* /*ctx*/,
                                 const ::umbp::BatchCommitSlotsRequest* request,
                                 ::umbp::BatchCommitSlotsResponse* response) override {
+    uint64_t total_committed = 0;
     for (const auto& entry : request->entries()) {
-      const bool ok = dram_alloc_ != nullptr && dram_alloc_->Commit(entry.slot_id(), entry.key());
+      uint64_t committed_bytes = 0;
+      const bool ok = dram_alloc_ != nullptr &&
+                      dram_alloc_->Commit(entry.slot_id(), entry.key(), committed_bytes);
       response->add_success(ok);
+      if (ok) total_committed += committed_bytes;
     }
+    if (total_committed > 0) RecordInboundPut(total_committed, "remote");
     return grpc::Status::OK;
   }
 
@@ -546,6 +560,7 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
   grpc::Status BatchResolveKeys(grpc::ServerContext* /*ctx*/,
                                 const ::umbp::BatchResolveKeysRequest* request,
                                 ::umbp::BatchResolveKeysResponse* response) override {
+    uint64_t total_bytes = 0;
     for (const auto& key : request->keys()) {
       auto* out = response->add_entries();
       if (dram_alloc_ == nullptr) {
@@ -558,7 +573,9 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
       auto descs = dram_alloc_->BufferDescsForPages(r.tier, r.pages);
       FillPagesAndDescs(out, r.pages, dram_alloc_->PageSize(), descs);
       out->set_size(r.size);
+      total_bytes += r.size;
     }
+    RecordInboundGet(total_bytes, "remote");
     return grpc::Status::OK;
   }
 
@@ -568,12 +585,29 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
            ssd_staging_size_ > 0;
   }
 
+  void RecordInboundPut(uint64_t bytes, const char* traffic) {
+    if (master_client_ == nullptr || bytes == 0) return;
+    MasterClient::Labels labels = {{"traffic", std::string(traffic)}};
+    master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_INBOUND_PUT_BYTES_TOTAL,
+                               MORI_UMBP_METRIC_CLIENT_INBOUND_PUT_BYTES_TOTAL_HELP, labels,
+                               static_cast<double>(bytes));
+  }
+
+  void RecordInboundGet(uint64_t bytes, const char* traffic) {
+    if (master_client_ == nullptr || bytes == 0) return;
+    MasterClient::Labels labels = {{"traffic", std::string(traffic)}};
+    master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL,
+                               MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL_HELP, labels,
+                               static_cast<double>(bytes));
+  }
+
   void* ssd_staging_base_;
   size_t ssd_staging_size_;
   const std::vector<uint8_t>& ssd_staging_mem_desc_bytes_;
   LocalStorageManager* storage_;
   LocalBlockIndex* index_;
   PeerDramAllocator* dram_alloc_;
+  MasterClient* master_client_;
   const std::vector<uint8_t>& engine_desc_bytes_;
   StagingMetrics& metrics_;
 
@@ -596,31 +630,37 @@ PeerServiceServer::PeerServiceServer(void* ssd_staging_base, size_t ssd_staging_
                                      LocalStorageManager& storage, LocalBlockIndex& index,
                                      PeerDramAllocator* dram_alloc, int num_read_slots,
                                      int num_write_slots, int lease_timeout_s,
-                                     std::vector<uint8_t> engine_desc_bytes)
+                                     std::vector<uint8_t> engine_desc_bytes,
+                                     MasterClient* master_client)
     : ssd_staging_base_(ssd_staging_base),
       ssd_staging_size_(ssd_staging_size),
       storage_(&storage),
       index_(&index),
       dram_alloc_(dram_alloc),
       ssd_staging_mem_desc_bytes_(ssd_staging_mem_desc_bytes),
+      master_client_(master_client),
       engine_desc_bytes_(std::move(engine_desc_bytes)) {
   service_ = std::make_unique<UMBPPeerServiceImpl>(
       ssd_staging_base_, ssd_staging_size_, ssd_staging_mem_desc_bytes_, storage_, index_,
-      dram_alloc_, metrics_, num_read_slots, num_write_slots, lease_timeout_s, engine_desc_bytes_);
+      dram_alloc_, master_client_, metrics_, num_read_slots, num_write_slots, lease_timeout_s,
+      engine_desc_bytes_);
 }
 
 PeerServiceServer::PeerServiceServer(PeerDramAllocator* dram_alloc, int num_read_slots,
                                      int num_write_slots, int lease_timeout_s,
-                                     std::vector<uint8_t> engine_desc_bytes)
+                                     std::vector<uint8_t> engine_desc_bytes,
+                                     MasterClient* master_client)
     : ssd_staging_base_(nullptr),
       ssd_staging_size_(0),
       storage_(nullptr),
       index_(nullptr),
       dram_alloc_(dram_alloc),
+      master_client_(master_client),
       engine_desc_bytes_(std::move(engine_desc_bytes)) {
   service_ = std::make_unique<UMBPPeerServiceImpl>(
       ssd_staging_base_, ssd_staging_size_, ssd_staging_mem_desc_bytes_, storage_, index_,
-      dram_alloc_, metrics_, num_read_slots, num_write_slots, lease_timeout_s, engine_desc_bytes_);
+      dram_alloc_, master_client_, metrics_, num_read_slots, num_write_slots, lease_timeout_s,
+      engine_desc_bytes_);
 }
 
 PeerServiceServer::~PeerServiceServer() { Stop(); }

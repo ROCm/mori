@@ -101,7 +101,9 @@ std::optional<PeerDramAllocator::PendingSlot> PeerDramAllocator::Allocate(uint64
   return slot;
 }
 
-bool PeerDramAllocator::Commit(uint64_t slot_id, const std::string& key) {
+bool PeerDramAllocator::Commit(uint64_t slot_id, const std::string& key,
+                               uint64_t& bytes_committed) {
+  bytes_committed = 0;
   std::lock_guard<std::mutex> lock(mutex_);
   auto it = pending_.find(slot_id);
   if (it == pending_.end()) return false;  // reaped, aborted, or never existed
@@ -126,6 +128,7 @@ bool PeerDramAllocator::Commit(uint64_t slot_id, const std::string& key) {
   pending_events_.push_back(KvEvent{KvEvent::Kind::ADD, key, owned.tier, owned.size});
   owned_[key] = std::move(owned);
   pending_.erase(it);
+  bytes_committed = owned_[key].size;
   return true;
 }
 

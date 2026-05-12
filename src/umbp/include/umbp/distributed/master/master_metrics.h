@@ -126,13 +126,21 @@
 
 // --- Per-client traffic byte counters (reported by clients) ----------------
 
-#define MORI_UMBP_METRIC_CLIENT_PUT_BYTES_TOTAL "mori_umbp_client_put_bytes_total"
-#define MORI_UMBP_METRIC_CLIENT_PUT_BYTES_TOTAL_HELP \
-  "Total bytes written per client split by local/remote traffic"
+#define MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL "mori_umbp_client_outbound_put_bytes_total"
+#define MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL_HELP \
+  "Total bytes written by this client (outbound) split by local/remote traffic"
 
-#define MORI_UMBP_METRIC_CLIENT_GET_BYTES_TOTAL "mori_umbp_client_get_bytes_total"
-#define MORI_UMBP_METRIC_CLIENT_GET_BYTES_TOTAL_HELP \
-  "Total bytes read per client split by local/remote traffic"
+#define MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL "mori_umbp_client_outbound_get_bytes_total"
+#define MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL_HELP \
+  "Total bytes fetched by this client (outbound reads) split by local/remote traffic"
+
+#define MORI_UMBP_METRIC_CLIENT_INBOUND_PUT_BYTES_TOTAL "mori_umbp_client_inbound_put_bytes_total"
+#define MORI_UMBP_METRIC_CLIENT_INBOUND_PUT_BYTES_TOTAL_HELP \
+  "Total bytes received by this client (inbound writes) split by local/remote traffic"
+
+#define MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL "mori_umbp_client_inbound_get_bytes_total"
+#define MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL_HELP \
+  "Total bytes delivered to this client (inbound reads) split by local/remote traffic"
 
 // --- Heartbeat / event-shipping counters (master-as-advisor) ----------------
 

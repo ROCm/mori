@@ -219,8 +219,8 @@ bool PoolClient::Init() {
   }
 
   if (config_.peer_service_port > 0) {
-    peer_service_ =
-        std::make_unique<PeerServiceServer>(peer_alloc_.get(), 8, 8, 10, engine_desc_bytes);
+    peer_service_ = std::make_unique<PeerServiceServer>(peer_alloc_.get(), 8, 8, 10,
+                                                        engine_desc_bytes, master_client_.get());
     if (!peer_service_->Start(config_.peer_service_port)) {
       MORI_UMBP_ERROR("[PoolClient] PeerService failed to start on port {}",
                       config_.peer_service_port);
@@ -409,13 +409,17 @@ PoolClient::PutAttemptOutcome PoolClient::ExecuteLocalPut(const std::string& key
     peer_alloc_->Abort(pending->slot_id);
     return PutAttemptOutcome::kFatal;
   }
-  if (!peer_alloc_->Commit(pending->slot_id, key)) {
+  uint64_t committed_bytes = 0;
+  if (!peer_alloc_->Commit(pending->slot_id, key, committed_bytes)) {
     peer_alloc_->Abort(pending->slot_id);
     return PutAttemptOutcome::kFatal;
   }
-  master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_PUT_BYTES_TOTAL,
-                             MORI_UMBP_METRIC_CLIENT_PUT_BYTES_TOTAL_HELP, {{"traffic", "local"}},
-                             static_cast<double>(size));
+  master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL,
+                             MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL_HELP,
+                             {{"traffic", "local"}}, static_cast<double>(size));
+  master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_INBOUND_PUT_BYTES_TOTAL,
+                             MORI_UMBP_METRIC_CLIENT_INBOUND_PUT_BYTES_TOTAL_HELP,
+                             {{"traffic", "local"}}, static_cast<double>(size));
   return PutAttemptOutcome::kSuccess;
 }
 
@@ -432,9 +436,12 @@ PoolClient::GetAttemptOutcome PoolClient::ExecuteLocalGet(const std::string& key
   if (!LocalGetPages(resolved.pages, peer_alloc_->PageSize(), dst, size)) {
     return GetAttemptOutcome::kFatal;
   }
-  master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_GET_BYTES_TOTAL,
-                             MORI_UMBP_METRIC_CLIENT_GET_BYTES_TOTAL_HELP, {{"traffic", "local"}},
-                             static_cast<double>(size));
+  master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL,
+                             MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL_HELP,
+                             {{"traffic", "local"}}, static_cast<double>(size));
+  master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL,
+                             MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL_HELP,
+                             {{"traffic", "local"}}, static_cast<double>(size));
   return GetAttemptOutcome::kSuccess;
 }
 
@@ -558,6 +565,12 @@ std::vector<bool> PoolClient::BatchGet(const std::vector<std::string>& keys,
   std::unordered_map<std::string, std::vector<BatchGetItem>> remote_groups;
   for (size_t i = 0; i < keys.size(); ++i) {
     if (i >= routes.size() || !routes[i].has_value()) {
+      if (peer_alloc_) {
+        auto outcome = ExecuteLocalGet(keys[i], const_cast<void*>(dsts[i]), sizes[i]);
+        if (outcome == GetAttemptOutcome::kSuccess) {
+          results[i] = true;
+        }
+      }
       continue;
     }
     const auto& route = routes[i].value();
@@ -879,9 +892,10 @@ void PoolClient::FinalizeRemotePutEntries(std::vector<RemotePutEntry>& entries,
         auto idx = commit_indices[i];
         auto& entry = entries[idx];
         if (commit_resp.success(static_cast<int>(i))) {
-          master_client_->AddCounter(
-              MORI_UMBP_METRIC_CLIENT_PUT_BYTES_TOTAL, MORI_UMBP_METRIC_CLIENT_PUT_BYTES_TOTAL_HELP,
-              {{"traffic", "remote"}}, static_cast<double>(entry.item->size));
+          master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL,
+                                     MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL_HELP,
+                                     {{"traffic", "remote"}},
+                                     static_cast<double>(entry.item->size));
           (*results)[entry.result_index] = true;
         } else {
           abort_slots.push_back(entry.slot_id);
@@ -1137,8 +1151,11 @@ void PoolClient::FinalizeRemoteGetEntries(std::vector<RemoteGetEntry>& entries,
       (*results)[entry.result_index] = false;
       continue;
     }
-    master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_GET_BYTES_TOTAL,
-                               MORI_UMBP_METRIC_CLIENT_GET_BYTES_TOTAL_HELP,
+    master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL,
+                               MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL_HELP,
+                               {{"traffic", "remote"}}, static_cast<double>(entry.item->size));
+    master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL,
+                               MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL_HELP,
                                {{"traffic", "remote"}}, static_cast<double>(entry.item->size));
     (*results)[entry.result_index] = true;
   }

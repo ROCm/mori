@@ -120,7 +120,7 @@ class PeerDramAllocator {
   // Move pending -> owned and queue an ADD event.  Returns false if
   // slot_id is unknown (already reaped, already aborted, or never
   // existed) — the writer treats false as a Put failure.
-  bool Commit(uint64_t slot_id, const std::string& key);
+  bool Commit(uint64_t slot_id, const std::string& key, uint64_t& bytes_committed);
 
   // Drop a pending slot.  Idempotent: returns true if the slot was
   // dropped here OR was already gone (reaped or never existed).  False

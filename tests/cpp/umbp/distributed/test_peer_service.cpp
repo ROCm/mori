@@ -79,8 +79,9 @@ class PeerServiceSlotTest : public ::testing::Test {
     port_ = AllocPort();
 
     server_ = std::make_unique<PeerServiceServer>(
-        staging_buffer_, kStagingSize, ssd_staging_mem_desc_, *storage_, index_, *coordinator_,
-        kNumReadSlots, kNumWriteSlots, kLeaseTimeoutS);
+        staging_buffer_, kStagingSize, ssd_staging_mem_desc_, *storage_, index_,
+        coordinator_->DramAllocator(), kNumReadSlots, kNumWriteSlots, kLeaseTimeoutS,
+        std::vector<uint8_t>{}, &coordinator_->Master());
     server_->Start(port_);
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 

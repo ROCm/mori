@@ -35,6 +35,7 @@ namespace mori::umbp {
 class LocalStorageManager;
 class LocalBlockIndex;
 class PeerDramAllocator;
+class MasterClient;
 
 struct StagingMetrics {
   std::atomic<uint64_t> expired_reclaims{0};
@@ -55,9 +56,11 @@ class PeerServiceServer {
                     LocalStorageManager& storage, LocalBlockIndex& index,
                     PeerDramAllocator* dram_alloc = nullptr, int num_read_slots = 8,
                     int num_write_slots = 8, int lease_timeout_s = 10,
-                    std::vector<uint8_t> engine_desc_bytes = {});
+                    std::vector<uint8_t> engine_desc_bytes = {},
+                    MasterClient* master_client = nullptr);
   PeerServiceServer(PeerDramAllocator* dram_alloc, int num_read_slots = 8, int num_write_slots = 8,
-                    int lease_timeout_s = 10, std::vector<uint8_t> engine_desc_bytes = {});
+                    int lease_timeout_s = 10, std::vector<uint8_t> engine_desc_bytes = {},
+                    MasterClient* master_client = nullptr);
   ~PeerServiceServer();
 
   bool Start(uint16_t port);
@@ -76,6 +79,7 @@ class PeerServiceServer {
   LocalStorageManager* storage_;
   LocalBlockIndex* index_;
   PeerDramAllocator* dram_alloc_;
+  MasterClient* master_client_;
 
   StagingMetrics metrics_;
 

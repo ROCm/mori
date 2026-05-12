@@ -425,19 +425,38 @@ TEST_F(PoolClientLocalByteTrackingTest, LocalPutGetBytesCounted) {
   std::string body = FetchPrometheusMetrics(metrics_port_);
   ASSERT_FALSE(body.empty()) << "Could not fetch Prometheus metrics from port " << metrics_port_;
 
-  double put_local = ParseMetricValue(body, "mori_umbp_client_put_bytes_total", "local");
-  double get_local = ParseMetricValue(body, "mori_umbp_client_get_bytes_total", "local");
+  double put_outbound_local =
+      ParseMetricValue(body, "mori_umbp_client_outbound_put_bytes_total", "local");
+  double get_outbound_local =
+      ParseMetricValue(body, "mori_umbp_client_outbound_get_bytes_total", "local");
+  double put_inbound_local =
+      ParseMetricValue(body, "mori_umbp_client_inbound_put_bytes_total", "local");
+  double get_inbound_local =
+      ParseMetricValue(body, "mori_umbp_client_inbound_get_bytes_total", "local");
 
-  EXPECT_GE(put_local, static_cast<double>(kLocalPageSize))
-      << "Expected >= " << kLocalPageSize << " local put bytes; Prometheus shows " << put_local;
-  EXPECT_GE(get_local, static_cast<double>(kLocalPageSize))
-      << "Expected >= " << kLocalPageSize << " local get bytes; Prometheus shows " << get_local;
+  EXPECT_GE(put_outbound_local, static_cast<double>(kLocalPageSize))
+      << "Expected >= " << kLocalPageSize << " local outbound put bytes; Prometheus shows "
+      << put_outbound_local;
+  EXPECT_GE(put_inbound_local, static_cast<double>(kLocalPageSize))
+      << "Expected >= " << kLocalPageSize << " local inbound put bytes; Prometheus shows "
+      << put_inbound_local;
+
+  EXPECT_GE(get_outbound_local, static_cast<double>(kLocalPageSize))
+      << "Expected >= " << kLocalPageSize << " local outbound get bytes; Prometheus shows "
+      << get_outbound_local;
+  EXPECT_GE(get_inbound_local, static_cast<double>(kLocalPageSize))
+      << "Expected >= " << kLocalPageSize << " local inbound get bytes; Prometheus shows "
+      << get_inbound_local;
 
   // Single-node setup must not produce any remote traffic counters.
-  EXPECT_EQ(ParseMetricValue(body, "mori_umbp_client_put_bytes_total", "remote"), -1.0)
-      << "Unexpected remote put bytes in single-node setup";
-  EXPECT_EQ(ParseMetricValue(body, "mori_umbp_client_get_bytes_total", "remote"), -1.0)
-      << "Unexpected remote get bytes in single-node setup";
+  EXPECT_EQ(ParseMetricValue(body, "mori_umbp_client_outbound_put_bytes_total", "remote"), -1.0)
+      << "Unexpected remote outbound put bytes in single-node setup";
+  EXPECT_EQ(ParseMetricValue(body, "mori_umbp_client_outbound_get_bytes_total", "remote"), -1.0)
+      << "Unexpected remote outbound get bytes in single-node setup";
+  EXPECT_EQ(ParseMetricValue(body, "mori_umbp_client_inbound_put_bytes_total", "remote"), -1.0)
+      << "Unexpected remote inbound put bytes in single-node setup";
+  EXPECT_EQ(ParseMetricValue(body, "mori_umbp_client_inbound_get_bytes_total", "remote"), -1.0)
+      << "Unexpected remote inbound get bytes in single-node setup";
 }
 
 }  // namespace
