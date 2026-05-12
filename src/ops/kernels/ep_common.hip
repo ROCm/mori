@@ -89,6 +89,11 @@ using namespace mori::moe;
   MORI_FP4(WRAP_BOOL(kernel, fp4##bool_suffix, mori::mori_fp4x2_e2m1, B))         \
   WRAP_BOOL(kernel, f32##bool_suffix, float, B)
 
+#define WRAP_BOOL2(kernel, suffix, T, B1, B2)                                   \
+  extern "C" __global__ void kernel##_##suffix(EpDispatchCombineArgs<T> args) { \
+    kernel##_body<T, B1, B2>(args);                                             \
+  }
+
 #define WRAP_BOOL3(kernel, suffix, T, B1, B2, B3)                               \
   extern "C" __global__ void kernel##_##suffix(EpDispatchCombineArgs<T> args) { \
     kernel##_body<T, B1, B2, B3>(args);                                         \

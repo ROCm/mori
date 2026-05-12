@@ -200,6 +200,21 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
     // pre-assertion to prevent silent memory access fault
     size_t maxStagingSize =
         static_cast<ssize_t>(config.MaxNumTokensToSend()) * config.MaxXferBytesPerToken();
+    // AsyncLL combine fp8_blockwise re-uses the dispatch staging slot at a different
+    // per-slot stride: each combine slot is [hidden_fp8 | scaleDim*float]. Make sure the
+    // dispatch-side allocation already covers that combine layout, so the cross-purpose
+    // reuse stays in-bounds. With maxTokenTypeSize=2 (bf16) and any reasonable scaleDim,
+    // dispatch's per-slot stride (~hidden*2 + scales + index + weight + src_id) is
+    // always larger than combine's (hidden*1 + scaleDim*4), but assert it for safety.
+    if (config.kernelType == KernelType::AsyncLL &&
+        config.quantType == QuantType::Fp8BlockwiseQuant) {
+      const size_t blockwiseScaleBytes =
+          (config.scaleDim > 0) ? static_cast<size_t>(config.scaleDim) * sizeof(float) : 0;
+      const size_t combineSlotBytes =
+          static_cast<size_t>(config.hiddenDim) * sizeof(uint8_t) + blockwiseScaleBytes;
+      assert(combineSlotBytes <= config.MaxXferBytesPerToken() &&
+             "AsyncLL combine fp8_blockwise slot exceeds dispatch staging stride");
+    }
     bufs.dispatchInp = ShmemMallocAndReturnMemObjPtr(maxStagingSize, hipDeviceMallocUncached);
     bufs.combineInp = ShmemMallocAndReturnMemObjPtr(maxStagingSize, hipDeviceMallocUncached);
     bufs.staging = ShmemMallocAndReturnMemObjPtr(maxStagingSize, hipDeviceMallocUncached);

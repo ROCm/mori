@@ -743,15 +743,18 @@ class EpDispatchCombineOp:
         shared_mem = self._combine_shared_mem(actual_wpb)
 
         if quant_type == EpDispatchCombineQuantType.Fp8BlockwiseQuant:
-            if kt != EpDispatchCombineKernelType.IntraNode.value:
+            if kt not in (
+                EpDispatchCombineKernelType.IntraNode.value,
+                EpDispatchCombineKernelType.AsyncLL.value,
+            ):
                 raise ValueError(
-                    "Fp8BlockwiseQuant currently only supports IntraNode combine"
+                    "Fp8BlockwiseQuant currently supports IntraNode and AsyncLL combine"
                 )
             if sfx != "bf16":
                 raise ValueError(f"Fp8BlockwiseQuant only supports bf16, got {sfx}")
-            if not actual_use_ext:
+            if kt == EpDispatchCombineKernelType.IntraNode.value and not actual_use_ext:
                 raise ValueError(
-                    "Fp8BlockwiseQuant currently requires --zero-copy 0 "
+                    "Fp8BlockwiseQuant on IntraNode currently requires --zero-copy 0 "
                     "(useExternalInpBuffer=True). P2P read path not yet implemented."
                 )
             if self.config.scale_dim <= 0:
@@ -868,7 +871,24 @@ class EpDispatchCombineOp:
         elif kt == EpDispatchCombineKernelType.AsyncLL.value:
             mp = self._handle_info["multi_processor_count"]
             mp_aligned = mp // self.config.world_size * self.config.world_size
-            if sfx == "bf16" and quant_type == EpDispatchCombineQuantType.Fp8DirectCast:
+            if (
+                sfx == "bf16"
+                and quant_type == EpDispatchCombineQuantType.Fp8BlockwiseQuant
+            ):
+                self._launch_multi(
+                    [
+                        "EpCombineLowLatencyAsyncSendCopy_bf16_fp8bwq",
+                        "EpCombineLowLatencyAsyncSendTransfer_bf16_fp8bwq",
+                    ],
+                    [mp_aligned, self.config.world_size],
+                    [WARP_SIZE * actual_wpb, WARP_SIZE * actual_wpb],
+                    [0, 0],
+                    stream,
+                    args_ptr,
+                )
+            elif (
+                sfx == "bf16" and quant_type == EpDispatchCombineQuantType.Fp8DirectCast
+            ):
                 self._launch_multi(
                     [
                         "EpCombineLowLatencyAsyncSendCopy_bf16_fp8cast",
@@ -956,7 +976,28 @@ class EpDispatchCombineOp:
             mp = self._handle_info["multi_processor_count"]
             mp_aligned = mp // self.config.world_size * self.config.world_size
             quant_type = _normalize_quant_type(self.config.quant_type)
-            if sfx == "bf16" and quant_type == EpDispatchCombineQuantType.Fp8DirectCast:
+            if (
+                sfx == "bf16"
+                and quant_type == EpDispatchCombineQuantType.Fp8BlockwiseQuant
+            ):
+                # AsyncLL combine never carries weights through staging (combine_send is
+                # invoked with weights=None in production callers). Compute shared mem
+                # for the no-weight layout: srcPtrs[] + srcScalePtrs[].
+                fp8bwq_smem = self._combine_shared_mem(actual_wpb, use_weights=False)
+                self._launch_multi(
+                    [
+                        "EpCombineLowLatencyAsyncRecvTransfer_bf16_fp8bwq",
+                        "EpCombineLowLatencyAsyncRecvCopy_bf16_fp8bwq",
+                    ],
+                    [self.config.world_size, mp_aligned],
+                    [WARP_SIZE * actual_wpb, WARP_SIZE * actual_wpb],
+                    [0, fp8bwq_smem],
+                    stream,
+                    args_ptr,
+                )
+            elif (
+                sfx == "bf16" and quant_type == EpDispatchCombineQuantType.Fp8DirectCast
+            ):
                 self._launch_multi(
                     [
                         "EpCombineLowLatencyAsyncRecvTransfer_bf16_fp8cast",
