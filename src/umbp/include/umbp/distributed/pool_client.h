@@ -52,6 +52,10 @@ class PoolClient {
 
   const std::string& NodeId() const { return config_.master_config.node_id; }
 
+  // Returns the effective chunk size used for DRAM MR registration.
+  // SIZE_MAX means no chunking was applied.
+  size_t DramChunkSize() const { return dram_chunk_size_; }
+
   bool RegisterMemory(void* ptr, size_t size);
   void DeregisterMemory(void* ptr);
 
@@ -150,9 +154,10 @@ class PoolClient {
 
   // Zero-copy registered memory regions
   struct RegisteredRegion {
-    void* base;
-    size_t size;
+    void* base;   // this chunk's actual start address
+    size_t size;  // this chunk's size
     mori::io::MemoryDesc mem_desc;
+    void* group_base;  // original RegisterMemory() caller's base pointer
   };
   std::mutex registered_mem_mutex_;
   std::vector<RegisteredRegion> registered_regions_;
@@ -162,6 +167,9 @@ class PoolClient {
 
   mutable std::mutex cache_mutex_;
   std::unordered_map<std::string, Location> cluster_locations_;
+
+  // Effective MR chunk size for DRAM registration. SIZE_MAX = no chunking.
+  size_t dram_chunk_size_ = SIZE_MAX;
 };
 
 }  // namespace mori::umbp

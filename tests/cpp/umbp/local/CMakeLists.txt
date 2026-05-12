@@ -1,4 +1,8 @@
 # C++ unit tests
+add_executable(test_dram_tier test_dram_tier.cpp)
+target_link_libraries(test_dram_tier PRIVATE umbp_core)
+add_test(NAME test_dram_tier COMMAND test_dram_tier)
+
 add_executable(test_umbp_local_block_index test_local_block_index.cpp)
 target_link_libraries(test_umbp_local_block_index PRIVATE umbp_core)
 add_test(NAME umbp_local_block_index COMMAND test_umbp_local_block_index)

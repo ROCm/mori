@@ -566,14 +566,26 @@ std::optional<LocalStorageManager::TierLocationInfo> LocalStorageManager::BuildT
     return std::nullopt;
   }
 
+  TierLocationInfo info;
+  info.size = size;
+
+  // DRAM: read structured chunk location directly from DRAMTier.
+  if (tier->tier_id() == StorageTier::CPU_DRAM) {
+    auto* dram = dynamic_cast<DRAMTier*>(tier);
+    if (dram) {
+      auto loc = dram->GetSlotChunkLocation(key);
+      if (!loc) return std::nullopt;
+      info.location_id = std::to_string(loc->chunk_index) + ":" + std::to_string(loc->offset);
+      return info;
+    }
+  }
+
+  // Non-DRAM tiers: single-buffer "0:<raw_id>" format.
   auto raw_id = tier->GetLocationId(key);
   if (!raw_id.has_value()) {
     return std::nullopt;
   }
-
-  TierLocationInfo info;
   info.location_id = "0:" + *raw_id;
-  info.size = size;
   return info;
 }
 

@@ -115,6 +115,12 @@ struct UMBPDistributedConfig {
   uint16_t peer_service_port = 0;  // gRPC peer service port
 
   bool cache_remote_fetches = true;  // cache remotely-fetched blocks locally
+
+  // Maximum single MR size for RDMA memory registration (bytes).
+  // 0 (default) = auto-detect from ibv_device_attr.max_mr_size.
+  // Set explicitly when auto-detection is unavailable or for testing.
+  // Env: UMBP_MAX_MR_CHUNK_SIZE
+  size_t max_mr_chunk_size = 0;
 };
 
 struct UMBPConfig {
@@ -365,6 +371,9 @@ struct PoolClientConfig {
   std::map<TierType, TierCapacity> tier_capacities;
 
   uint16_t peer_service_port = 0;
+
+  // Passed from UMBPDistributedConfig::max_mr_chunk_size.
+  size_t max_mr_chunk_size = 0;
 };
 
 }  // namespace mori::umbp

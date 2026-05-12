@@ -1171,5 +1171,27 @@ void RdmaBackend::InvalidateSessionsForMemory(MemoryUniqueId id) {
   }
 }
 
+size_t RdmaBackend::GetMaxMemoryRegionSize() const {
+  // IONIC (Pensando/AINIC) NICs report an incorrect max_mr_size via
+  // ibv_query_device.  Cap to 2 GB for these devices.
+  static constexpr size_t kIonicMaxMrSize = 2ULL * 1024 * 1024 * 1024;
+
+  size_t min_size = SIZE_MAX;
+  for (const auto& [dev, port] : rdma->GetAvailDevices()) {
+    const auto* attr = dev->GetDeviceAttr();
+    if (!attr) continue;
+
+    size_t dev_max = static_cast<size_t>(attr->orig_attr.max_mr_size);
+    if (attr->orig_attr.vendor_id ==
+        static_cast<uint32_t>(application::RdmaDeviceVendorId::Pensando)) {
+      dev_max = kIonicMaxMrSize;
+    }
+    if (dev_max > 0) {
+      min_size = std::min(min_size, dev_max);
+    }
+  }
+  return min_size;
+}
+
 }  // namespace io
 }  // namespace mori

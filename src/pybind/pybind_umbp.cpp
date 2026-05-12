@@ -102,7 +102,8 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("io_engine_port", &UMBPDistributedConfig::io_engine_port)
       .def_readwrite("staging_buffer_size", &UMBPDistributedConfig::staging_buffer_size)
       .def_readwrite("peer_service_port", &UMBPDistributedConfig::peer_service_port)
-      .def_readwrite("cache_remote_fetches", &UMBPDistributedConfig::cache_remote_fetches);
+      .def_readwrite("cache_remote_fetches", &UMBPDistributedConfig::cache_remote_fetches)
+      .def_readwrite("max_mr_chunk_size", &UMBPDistributedConfig::max_mr_chunk_size);
 
   py::class_<UMBPConfig>(m, "UMBPConfig")
       .def(py::init<>())

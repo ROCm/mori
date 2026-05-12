@@ -78,6 +78,7 @@ class RdmaManager {
   std::vector<std::shared_ptr<EndpointRuntime>> SnapshotEndpointRuntimes();
 
   application::RdmaDeviceContext* GetRdmaDeviceContext(int devId);
+  const application::ActiveDevicePortList& GetAvailDevices() const { return availDevices; }
 
  private:
   application::RdmaDeviceContext* GetOrCreateDeviceContext(int devId);
@@ -286,6 +287,7 @@ class RdmaBackend : public Backend {
                       bool isRead);
   BackendSession* CreateSession(const MemoryDesc& local, const MemoryDesc& remote);
   bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id, TransferStatus* status);
+  size_t GetMaxMemoryRegionSize() const override;
 
  private:
   void CreateSession(const MemoryDesc& local, const MemoryDesc& remote, RdmaBackendSession& sess);

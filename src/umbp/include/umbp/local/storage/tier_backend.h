@@ -114,8 +114,10 @@ class TierBackend {
   // SSDTier: O_DIRECT; SpdkProxyTier: skip ring buffer cache.
   virtual void SetColdRead(bool /*enable*/) {}
 
-  // Return an opaque location identifier for a previously written key.
-  // Callers prepend the store index before publishing to the Master.
+  // Return a tier-internal location identifier for a previously written key.
+  // This is NOT directly publishable to the Master — use
+  // LocalStorageManager::BuildTierLocationInfo() for that, which handles
+  // tier-specific formatting (e.g. DRAM chunk_index:offset).
   virtual std::optional<std::string> GetLocationId(const std::string& key) const;
 
   // Which StorageTier does this backend represent?
