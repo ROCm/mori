@@ -596,9 +596,4 @@ setup(
     },
     ext_modules=extensions,
     include_package_data=True,
-    entry_points={
-        "console_scripts": [
-            "mori = mori.cli:main",
-        ],
-    },
 )
