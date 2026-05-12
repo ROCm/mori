@@ -10,8 +10,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  IMAGE: rocm/mori:ci_rocm723
-  BASE_IMAGE: rocm/pytorch:rocm7.2.3_ubuntu24.04_py3.12_pytorch_release_2.10.0
+  IMAGE: rocm/mori:ci_rocm722
+  BASE_IMAGE: rocm/pytorch:rocm7.2.2_ubuntu24.04_py3.12_pytorch_release_2.10.0
   CONTAINER: mori_ci_${{ github.run_id }}
   CT: docker
 
