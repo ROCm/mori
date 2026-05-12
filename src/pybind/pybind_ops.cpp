@@ -209,10 +209,13 @@ void PyLaunchLocalExpertCount(const mori::moe::EpDispatchCombineConfig& config, 
 }
 
 py::tuple GetDispatchSrcTokenId(mori::moe::EpDispatchCombineHandle& handle) {
+  mori::moe::index_t recvNum = 0;
+  HIP_RUNTIME_CHECK(
+      hipMemcpy(&recvNum, handle.totalRecvTokenNum, sizeof(recvNum), hipMemcpyDeviceToHost));
   return py::make_tuple(
       reinterpret_cast<int64_t>(
           handle.dispTokIdToSrcTokIdMemObj->template GetAs<mori::moe::index_t*>()),
-      static_cast<int64_t>(*handle.totalRecvTokenNum));
+      static_cast<int64_t>(recvNum));
 }
 
 py::tuple GetDispatchSenderTokenIdxMap(mori::moe::EpDispatchCombineHandle& handle) {
@@ -222,8 +225,11 @@ py::tuple GetDispatchSenderTokenIdxMap(mori::moe::EpDispatchCombineHandle& handl
 }
 
 py::tuple GetDispatchReceiverTokenIdxMap(mori::moe::EpDispatchCombineHandle& handle) {
+  mori::moe::index_t counter = 0;
+  HIP_RUNTIME_CHECK(
+      hipMemcpy(&counter, handle.localPeTokenCounter, sizeof(counter), hipMemcpyDeviceToHost));
   return py::make_tuple(reinterpret_cast<int64_t>(handle.dispReceiverIdxMap),
-                        static_cast<int64_t>(*handle.localPeTokenCounter));
+                        static_cast<int64_t>(counter));
 }
 
 py::tuple GetRegisteredCombineInputBuffer(mori::moe::EpDispatchCombineHandle& handle,
