@@ -131,7 +131,7 @@ def _test_dispatch_combine(
     num_token_override=None,
     check_results=True,
 ):
-    os.environ["MORI_DISABLE_P2P"] = "1"
+    os.environ["MORI_ENABLE_SDMA"] = "1"
     try:
         config = _make_asyncll_config(
             rank=rank,
@@ -155,7 +155,7 @@ def _test_dispatch_combine(
             check_results=check_results,
         )
     finally:
-        os.environ.pop("MORI_DISABLE_P2P", None)
+        os.environ.pop("MORI_ENABLE_SDMA", None)
 
 
 def _test_dispatch_combine_multi_iteration(
@@ -172,7 +172,7 @@ def _test_dispatch_combine_multi_iteration(
     quant_type="none",
     routing="round_robin",
 ):
-    os.environ["MORI_DISABLE_P2P"] = "1"
+    os.environ["MORI_ENABLE_SDMA"] = "1"
     try:
         config = _make_asyncll_config(
             rank=rank,
@@ -195,7 +195,7 @@ def _test_dispatch_combine_multi_iteration(
             )
             test_case.run_test_once(op, test_data)
     finally:
-        os.environ.pop("MORI_DISABLE_P2P", None)
+        os.environ.pop("MORI_ENABLE_SDMA", None)
 
 
 @pytest.mark.parametrize("world_size", (8,))
