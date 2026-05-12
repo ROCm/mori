@@ -510,8 +510,38 @@ def _try_precompile(root_dir: Path) -> None:
         print(f"[mori] Precompilation skipped: {e}")
 
 
+_BUNDLED_SCRIPTS = ("env_check.sh", "env_setup.sh", "diagnose_env.sh")
+
+
+def _sync_bundled_scripts() -> None:
+    """Copy ``tools/*.sh`` into ``python/mori/scripts/`` so they ship in the wheel.
+
+    Keeps a single source of truth (``tools/``) while still letting the
+    installed package expose them via the ``mori`` console script.
+    """
+    here = Path(__file__).resolve().parent
+    src_dir = here / "tools"
+    dst_dir = here / "python" / "mori" / "tools"
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    for name in _BUNDLED_SCRIPTS:
+        src = src_dir / name
+        if not src.is_file():
+            continue
+        dst = dst_dir / name
+        try:
+            if not dst.is_file() or dst.read_bytes() != src.read_bytes():
+                shutil.copy2(src, dst)
+            os.chmod(dst, os.stat(dst).st_mode | 0o111)
+        except OSError as exc:
+            print(f"[mori] WARN: failed to bundle {name}: {exc}")
+
+
+_sync_bundled_scripts()
+
+
 class CustomBuild(_build):
     def run(self) -> None:
+        _sync_bundled_scripts()
         self.run_command("build_ext")
         super().run()
 
@@ -544,6 +574,7 @@ mori_package_data = [
     "_jit-sources/3rdparty/**/*.hpp",
     "_jit-sources/tools/**/*.py",
     "ops/tuning_configs/*.json",
+    "tools/*.sh",
 ]
 if _env_flag("BUILD_UMBP", "OFF"):
     mori_package_data.append("spdk_proxy")
@@ -554,6 +585,7 @@ setup(
     package_data={
         "mori": mori_package_data,
         "mori.ir": ["*.bc"],
+        "mori.tools": ["*.sh"],
     },
     exclude_package_data={
         "mori": ["*.a"],
@@ -564,4 +596,9 @@ setup(
     },
     ext_modules=extensions,
     include_package_data=True,
+    entry_points={
+        "console_scripts": [
+            "mori = mori.cli:main",
+        ],
+    },
 )
