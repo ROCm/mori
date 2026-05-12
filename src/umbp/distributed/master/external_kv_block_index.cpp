@@ -22,28 +22,47 @@
 #include "umbp/distributed/master/external_kv_block_index.h"
 
 #include <mutex>
+#include <set>
 #include <shared_mutex>
 #include <unordered_map>
 
 namespace mori::umbp {
 
+namespace {
+
+TierType BestTier(const std::set<TierType>& tiers) {
+  if (tiers.count(TierType::HBM)) return TierType::HBM;
+  if (tiers.count(TierType::DRAM)) return TierType::DRAM;
+  if (tiers.count(TierType::SSD)) return TierType::SSD;
+  return TierType::UNKNOWN;
+}
+
+}  // namespace
+
 void ExternalKvBlockIndex::Register(const std::string& node_id,
                                     const std::vector<std::string>& hashes, TierType tier) {
   std::unique_lock lock(mutex_);
   for (const auto& hash : hashes) {
-    entries_[hash][node_id] = tier;
+    entries_[hash][node_id].insert(tier);
   }
 }
 
 void ExternalKvBlockIndex::Unregister(const std::string& node_id,
-                                      const std::vector<std::string>& hashes) {
+                                      const std::vector<std::string>& hashes, TierType tier) {
   std::unique_lock lock(mutex_);
   for (const auto& hash : hashes) {
     auto it = entries_.find(hash);
     if (it == entries_.end()) {
       continue;
     }
-    it->second.erase(node_id);
+    auto node_it = it->second.find(node_id);
+    if (node_it == it->second.end()) {
+      continue;
+    }
+    node_it->second.erase(tier);
+    if (node_it->second.empty()) {
+      it->second.erase(node_it);
+    }
     if (it->second.empty()) {
       entries_.erase(it);
     }
@@ -67,30 +86,26 @@ std::vector<ExternalKvBlockIndex::NodeMatch> ExternalKvBlockIndex::Match(
     const std::vector<std::string>& hashes) const {
   std::shared_lock lock(mutex_);
 
-  // Accumulate per-(node_id, tier) matched hashes.
-  // Key: node_id; value: (tier, matched_hashes).
-  std::unordered_map<std::string, std::pair<TierType, std::vector<std::string>>> acc;
+  std::unordered_map<std::string, NodeMatch> acc;
 
   for (const auto& hash : hashes) {
     auto it = entries_.find(hash);
     if (it == entries_.end()) {
       continue;
     }
-    for (const auto& [node_id, tier] : it->second) {
+    for (const auto& [node_id, tiers] : it->second) {
       auto& entry = acc[node_id];
-      entry.first = tier;
-      entry.second.push_back(hash);
+      entry.node_id = node_id;
+      entry.matched_hashes.push_back(hash);
+      entry.tiers.insert(tiers.begin(), tiers.end());
     }
   }
 
   std::vector<NodeMatch> result;
   result.reserve(acc.size());
-  for (auto& [node_id, tier_hashes] : acc) {
-    NodeMatch m;
-    m.node_id = node_id;
-    m.tier = tier_hashes.first;
-    m.matched_hashes = std::move(tier_hashes.second);
-    result.push_back(std::move(m));
+  for (auto& [_, match] : acc) {
+    match.tier = BestTier(match.tiers);
+    result.push_back(std::move(match));
   }
   return result;
 }

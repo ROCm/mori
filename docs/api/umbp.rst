@@ -189,8 +189,8 @@ for one-shot or short-lived lookups, not for long-running peer membership.
      - Return ``True`` if this node is currently registered.
    * - ``report_external_kv_blocks(node_id, hashes, tier)``
      - Announce that ``node_id`` holds the KV blocks identified by ``hashes`` at ``tier``. Raises ``RuntimeError`` if ``hashes`` is empty or the call fails.
-   * - ``revoke_external_kv_blocks(node_id, hashes)``
-     - Remove previously reported blocks from the master index. No-op if the hashes were never reported. Raises ``RuntimeError`` if ``hashes`` is empty.
+   * - ``revoke_external_kv_blocks(node_id, hashes, tier)``
+     - Remove previously reported blocks from the master index at ``tier``. No-op if the hashes were never reported on that tier. Raises ``RuntimeError`` if ``hashes`` is empty.
    * - ``match_external_kv(hashes) -> list[UMBPExternalKvNodeMatch]``
      - Query the master for nodes that hold any of the requested ``hashes``. Returns an empty list when no matches exist or ``hashes`` is empty. Raises ``RuntimeError`` on connection failure.
 
@@ -251,7 +251,7 @@ Usage Examples
 
    # After evicting some blocks from cache, revoke them so other nodes stop routing to us
    evicted = ["sha256-abc", "sha256-def"]
-   node_a.revoke_external_kv_blocks("node-a", evicted)
+   node_a.revoke_external_kv_blocks("node-a", evicted, UMBPTierType.DRAM)
 
 **Multiple nodes holding the same blocks (different tiers):**
 

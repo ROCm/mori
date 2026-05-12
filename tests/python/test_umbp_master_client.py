@@ -177,7 +177,7 @@ def test_report_empty_hashes_raises(master_address):
 def test_revoke_empty_hashes_raises(master_address):
     client = UMBPMasterClient(master_address)
     with pytest.raises(RuntimeError, match="empty"):
-        client.revoke_external_kv_blocks("any-node", [])
+        client.revoke_external_kv_blocks("any-node", [], UMBPTierType.DRAM)
 
 
 def test_report_and_match_external_kv_dram(master_address):
@@ -236,7 +236,7 @@ def test_revoke_removes_hashes_from_index(master_address):
         client.report_external_kv_blocks(node_id, hashes, UMBPTierType.DRAM)
         assert any(m.node_id == node_id for m in client.match_external_kv(hashes))
 
-        client.revoke_external_kv_blocks(node_id, hashes)
+        client.revoke_external_kv_blocks(node_id, hashes, UMBPTierType.DRAM)
 
         node_ids_after = {m.node_id for m in client.match_external_kv(hashes)}
         assert node_id not in node_ids_after
@@ -250,7 +250,7 @@ def test_revoke_partial_hashes(master_address):
 
     with _registered_client(master_address, node_id) as client:
         client.report_external_kv_blocks(node_id, hashes, UMBPTierType.DRAM)
-        client.revoke_external_kv_blocks(node_id, to_revoke)
+        client.revoke_external_kv_blocks(node_id, to_revoke, UMBPTierType.DRAM)
 
         kept_matched = {
             h
@@ -287,8 +287,8 @@ def test_multiple_nodes_report_same_hashes(master_address):
         assert node_b in matched_nodes
 
 
-def test_report_overwrites_tier_for_same_node(master_address):
-    node_id = "int-test-node-overwrite"
+def test_report_tracks_multiple_tiers_for_same_node(master_address):
+    node_id = "int-test-node-multi-tier"
     hashes = _make_hashes("overwrite", 3)
 
     with _registered_client(master_address, node_id) as client:
@@ -299,13 +299,18 @@ def test_report_overwrites_tier_for_same_node(master_address):
             m for m in client.match_external_kv(hashes) if m.node_id == node_id
         ]
         assert len(node_matches) >= 1
+        tiers = set()
+        for match in node_matches:
+            tiers.update(match.tiers)
+        assert UMBPTierType.DRAM in tiers
+        assert UMBPTierType.HBM in tiers
 
 
 def test_revoke_nonexistent_hashes_does_not_raise(master_address):
     # Revoking hashes that were never reported is a no-op.
     hashes = _make_hashes("nonexistent", 3)
     client = UMBPMasterClient(master_address)
-    client.revoke_external_kv_blocks("any-node", hashes)
+    client.revoke_external_kv_blocks("any-node", hashes, UMBPTierType.DRAM)
 
 
 def test_external_kv_node_match_repr():
@@ -332,7 +337,7 @@ def test_report_external_kv_connection_refused_raises():
 def test_revoke_external_kv_connection_refused_raises():
     client = UMBPMasterClient("localhost:19996")
     with pytest.raises(RuntimeError):
-        client.revoke_external_kv_blocks("node", ["hash"])
+        client.revoke_external_kv_blocks("node", ["hash"], UMBPTierType.DRAM)
 
 
 def test_large_batch_report_and_match(master_address):

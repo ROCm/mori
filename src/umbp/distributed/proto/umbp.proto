@@ -219,6 +219,7 @@ message ReportExternalKvBlocksResponse {}
 message RevokeExternalKvBlocksRequest {
   string node_id         = 1;
   repeated string hashes = 2;
+  TierType tier          = 3;
 }
 message RevokeExternalKvBlocksResponse {}
 
@@ -230,6 +231,7 @@ message ExternalKvNodeMatch {
   string peer_address            = 2;
   repeated string matched_hashes = 3;
   TierType tier                  = 4;
+  repeated TierType tiers        = 5;
 }
 message MatchExternalKvResponse {
   repeated ExternalKvNodeMatch matches = 1;

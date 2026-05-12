@@ -62,7 +62,7 @@ class ClientRegistry {
   void RegisterExternalKvBlocks(const std::string& node_id, const std::vector<std::string>& hashes,
                                 TierType tier);
   void UnregisterExternalKvBlocks(const std::string& node_id,
-                                  const std::vector<std::string>& hashes);
+                                  const std::vector<std::string>& hashes, TierType tier);
 
   // --- Client lifecycle ---
 

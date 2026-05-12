@@ -95,6 +95,7 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("peer_address", &IUMBPClient::ExternalKvMatch::peer_address)
       .def_readwrite("matched_hashes", &IUMBPClient::ExternalKvMatch::matched_hashes)
       .def_readwrite("tier", &IUMBPClient::ExternalKvMatch::tier)
+      .def_readwrite("tiers", &IUMBPClient::ExternalKvMatch::tiers)
       .def("__repr__", [](const IUMBPClient::ExternalKvMatch& m) {
         return "<UMBPExternalKvMatch node_id='" + m.node_id +
                "' matched=" + std::to_string(m.matched_hashes.size()) + ">";
@@ -243,7 +244,7 @@ void RegisterMoriUmbp(py::module_& m) {
       .def("report_external_kv_blocks", &IUMBPClient::ReportExternalKvBlocks, py::arg("hashes"),
            py::arg("tier"), py::call_guard<py::gil_scoped_release>())
       .def("revoke_external_kv_blocks", &IUMBPClient::RevokeExternalKvBlocks, py::arg("hashes"),
-           py::call_guard<py::gil_scoped_release>())
+           py::arg("tier"), py::call_guard<py::gil_scoped_release>())
       .def("match_external_kv", &IUMBPClient::MatchExternalKv, py::arg("hashes"),
            py::call_guard<py::gil_scoped_release>());
 
@@ -257,6 +258,7 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("peer_address", &MasterClient::ExternalKvNodeMatch::peer_address)
       .def_readwrite("matched_hashes", &MasterClient::ExternalKvNodeMatch::matched_hashes)
       .def_readwrite("tier", &MasterClient::ExternalKvNodeMatch::tier)
+      .def_readwrite("tiers", &MasterClient::ExternalKvNodeMatch::tiers)
       .def("__repr__", [](const MasterClient::ExternalKvNodeMatch& m) {
         return "<UMBPExternalKvNodeMatch node_id='" + m.node_id +
                "' matched=" + std::to_string(m.matched_hashes.size()) + ">";
@@ -309,13 +311,14 @@ void RegisterMoriUmbp(py::module_& m) {
           py::call_guard<py::gil_scoped_release>())
       .def(
           "revoke_external_kv_blocks",
-          [](MasterClient& self, const std::string& node_id,
-             const std::vector<std::string>& hashes) {
-            auto status = self.RevokeExternalKvBlocks(node_id, hashes);
+          [](MasterClient& self, const std::string& node_id, const std::vector<std::string>& hashes,
+             TierType tier) {
+            auto status = self.RevokeExternalKvBlocks(node_id, hashes, tier);
             if (!status.ok())
               throw std::runtime_error("RevokeExternalKvBlocks failed: " + status.error_message());
           },
-          py::arg("node_id"), py::arg("hashes"), py::call_guard<py::gil_scoped_release>())
+          py::arg("node_id"), py::arg("hashes"), py::arg("tier"),
+          py::call_guard<py::gil_scoped_release>())
       .def(
           "match_external_kv",
           [](MasterClient& self, const std::vector<std::string>& hashes) {

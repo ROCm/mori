@@ -206,7 +206,7 @@ def run_demo(master_address: str) -> None:
 
     with registered_client(master_address, "node-d", DRAM_CAPS) as cd:
         cd.report_external_kv_blocks("node-d", hashes_d, UMBPTierType.DRAM)
-        cd.revoke_external_kv_blocks("node-d", to_revoke)
+        cd.revoke_external_kv_blocks("node-d", to_revoke, UMBPTierType.DRAM)
         print(f"[node-d] revoked {len(to_revoke)} blocks, kept {len(to_keep)}")
 
         kept_matches = {

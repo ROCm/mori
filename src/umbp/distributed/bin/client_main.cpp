@@ -149,7 +149,8 @@ int main(int argc, char** argv) {
     constexpr int kExtKvBatchSize = 10;
 
     if (!live_ext_kv_hashes.empty()) {
-      auto revoke_status = client.RevokeExternalKvBlocks(node_id, live_ext_kv_hashes);
+      auto revoke_status =
+          client.RevokeExternalKvBlocks(node_id, live_ext_kv_hashes, mori::umbp::TierType::HBM);
       if (revoke_status.ok()) {
         MORI_UMBP_INFO("[Client] Iteration {} RevokeExternalKvBlocks: revoked {} hashes", iteration,
                        live_ext_kv_hashes.size());

@@ -24,6 +24,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -116,14 +117,15 @@ class IUMBPClient {
   /// Report that this node holds the given hashes at the specified tier.
   virtual bool ReportExternalKvBlocks(const std::vector<std::string>& hashes, TierType tier) = 0;
 
-  /// Revoke previously reported hashes from this node's entry.
-  virtual bool RevokeExternalKvBlocks(const std::vector<std::string>& hashes) = 0;
+  /// Revoke previously reported hashes from this node's entry at one tier.
+  virtual bool RevokeExternalKvBlocks(const std::vector<std::string>& hashes, TierType tier) = 0;
 
   struct ExternalKvMatch {
     std::string node_id;
     std::string peer_address;
     std::vector<std::string> matched_hashes;
     TierType tier = TierType::UNKNOWN;
+    std::set<TierType> tiers;
   };
 
   /// Query which nodes hold any of the given hashes.

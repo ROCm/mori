@@ -114,7 +114,7 @@ TEST(ClientRegistryExternalKv, UnregisterExternalKvBlocksRemovesSpecificHashes) 
 
   ASSERT_TRUE(RegisterNode(reg, "node-A"));
   reg.RegisterExternalKvBlocks("node-A", {"h1", "h2", "h3"}, TierType::DRAM);
-  reg.UnregisterExternalKvBlocks("node-A", {"h2"});
+  reg.UnregisterExternalKvBlocks("node-A", {"h2"}, TierType::DRAM);
 
   auto matches = ekv.Match({"h1", "h2", "h3"});
   ASSERT_EQ(matches.size(), 1u);
@@ -133,7 +133,7 @@ TEST(ClientRegistryExternalKv, NullIndexDoesNotCrash) {
   ASSERT_TRUE(RegisterNode(reg, "node-A"));
 
   EXPECT_NO_THROW(reg.RegisterExternalKvBlocks("node-A", {"h1"}, TierType::DRAM));
-  EXPECT_NO_THROW(reg.UnregisterExternalKvBlocks("node-A", {"h1"}));
+  EXPECT_NO_THROW(reg.UnregisterExternalKvBlocks("node-A", {"h1"}, TierType::DRAM));
   EXPECT_NO_THROW(reg.UnregisterClient("node-A"));
 }
 

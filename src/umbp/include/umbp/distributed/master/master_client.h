@@ -30,6 +30,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -125,13 +126,14 @@ class MasterClient {
   grpc::Status ReportExternalKvBlocks(const std::string& node_id,
                                       const std::vector<std::string>& hashes, TierType tier);
   grpc::Status RevokeExternalKvBlocks(const std::string& node_id,
-                                      const std::vector<std::string>& hashes);
+                                      const std::vector<std::string>& hashes, TierType tier);
 
   struct ExternalKvNodeMatch {
     std::string node_id;
     std::string peer_address;
     std::vector<std::string> matched_hashes;
     TierType tier = TierType::UNKNOWN;
+    std::set<TierType> tiers;
   };
   grpc::Status MatchExternalKv(const std::vector<std::string>& hashes,
                                std::vector<ExternalKvNodeMatch>* out_matches);

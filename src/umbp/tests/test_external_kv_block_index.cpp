@@ -58,23 +58,26 @@ TEST(ExternalKvBlockIndex, RegisterAndMatchBasic) {
   ASSERT_EQ(matches.size(), 1u);
   EXPECT_EQ(matches[0].node_id, "node-A");
   EXPECT_EQ(matches[0].tier, TierType::DRAM);
+  EXPECT_TRUE(matches[0].tiers.count(TierType::DRAM));
   EXPECT_EQ(matches[0].matched_hashes.size(), 2u);
 }
 
-TEST(ExternalKvBlockIndex, RegisterOverwritesTier) {
+TEST(ExternalKvBlockIndex, RegisterTracksMultipleTiers) {
   ExternalKvBlockIndex idx;
   idx.Register("node-A", {"h1"}, TierType::DRAM);
-  idx.Register("node-A", {"h1"}, TierType::SSD);
+  idx.Register("node-A", {"h1"}, TierType::HBM);
 
   auto matches = idx.Match({"h1"});
   ASSERT_EQ(matches.size(), 1u);
-  EXPECT_EQ(matches[0].tier, TierType::SSD);
+  EXPECT_EQ(matches[0].tier, TierType::HBM);
+  EXPECT_TRUE(matches[0].tiers.count(TierType::DRAM));
+  EXPECT_TRUE(matches[0].tiers.count(TierType::HBM));
 }
 
 TEST(ExternalKvBlockIndex, UnregisterRemovesSpecificHashes) {
   ExternalKvBlockIndex idx;
   idx.Register("node-A", {"h1", "h2", "h3"}, TierType::DRAM);
-  idx.Unregister("node-A", {"h2"});
+  idx.Unregister("node-A", {"h2"}, TierType::DRAM);
 
   auto matches = idx.Match({"h1", "h2", "h3"});
   ASSERT_EQ(matches.size(), 1u);
@@ -88,6 +91,20 @@ TEST(ExternalKvBlockIndex, UnregisterRemovesSpecificHashes) {
   // h2 specifically is gone
   auto h2_matches = idx.Match({"h2"});
   EXPECT_TRUE(h2_matches.empty());
+}
+
+TEST(ExternalKvBlockIndex, UnregisterRemovesOnlyRequestedTier) {
+  ExternalKvBlockIndex idx;
+  idx.Register("node-A", {"h1"}, TierType::DRAM);
+  idx.Register("node-A", {"h1"}, TierType::HBM);
+
+  idx.Unregister("node-A", {"h1"}, TierType::HBM);
+
+  auto matches = idx.Match({"h1"});
+  ASSERT_EQ(matches.size(), 1u);
+  EXPECT_EQ(matches[0].tier, TierType::DRAM);
+  EXPECT_TRUE(matches[0].tiers.count(TierType::DRAM));
+  EXPECT_FALSE(matches[0].tiers.count(TierType::HBM));
 }
 
 TEST(ExternalKvBlockIndex, UnregisterByNodeRemovesAllHashes) {
@@ -151,7 +168,7 @@ TEST(ExternalKvBlockIndex, MatchAcrossMultipleNodesCorrectGrouping) {
 TEST(ExternalKvBlockIndex, UnregisterNonExistentHashIsNoOp) {
   ExternalKvBlockIndex idx;
   idx.Register("node-A", {"h1"}, TierType::DRAM);
-  EXPECT_NO_THROW(idx.Unregister("node-A", {"h99"}));
+  EXPECT_NO_THROW(idx.Unregister("node-A", {"h99"}, TierType::DRAM));
   auto matches = idx.Match({"h1"});
   EXPECT_EQ(matches.size(), 1u);
 }

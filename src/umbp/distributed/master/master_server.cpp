@@ -62,6 +62,12 @@ KvEvent FromProtoEvent(const ::umbp::KvEvent& pe) {
   return ev;
 }
 
+TierType FromProtoTier(::umbp::TierType tier) { return static_cast<TierType>(tier); }
+
+bool IsKnownTier(::umbp::TierType tier) {
+  return tier == ::umbp::TIER_HBM || tier == ::umbp::TIER_DRAM || tier == ::umbp::TIER_SSD;
+}
+
 int EvictKeyDeadlineMs() {
   static const int v =
       static_cast<int>(GetEnvMilliseconds("UMBP_EVICTKEY_DEADLINE_MS",
@@ -360,7 +366,10 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
       return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "node_id/hashes cannot be empty");
     }
     std::vector<std::string> hashes(request->hashes().begin(), request->hashes().end());
-    TierType tier = static_cast<TierType>(request->tier());
+    if (!IsKnownTier(request->tier())) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "tier is required");
+    }
+    TierType tier = FromProtoTier(request->tier());
     registry_.RegisterExternalKvBlocks(request->node_id(), hashes, tier);
 
     if (metrics_) {
@@ -385,7 +394,11 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
       return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "node_id/hashes cannot be empty");
     }
     std::vector<std::string> hashes(request->hashes().begin(), request->hashes().end());
-    registry_.UnregisterExternalKvBlocks(request->node_id(), hashes);
+    if (!IsKnownTier(request->tier())) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "tier is required");
+    }
+    TierType tier = FromProtoTier(request->tier());
+    registry_.UnregisterExternalKvBlocks(request->node_id(), hashes, tier);
 
     if (metrics_) {
       metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_REVOKE_TOTAL,
@@ -419,6 +432,9 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
       if (peer_it != peer_map.end()) proto_match->set_peer_address(peer_it->second);
       for (const auto& hash : m.matched_hashes) proto_match->add_matched_hashes(hash);
       proto_match->set_tier(static_cast<::umbp::TierType>(m.tier));
+      for (const auto& tier : m.tiers) {
+        proto_match->add_tiers(static_cast<::umbp::TierType>(tier));
+      }
     }
 
     size_t total_matched = 0;

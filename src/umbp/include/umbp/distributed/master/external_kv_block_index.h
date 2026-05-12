@@ -21,6 +21,7 @@
 // SOFTWARE.
 #pragma once
 
+#include <set>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
@@ -42,11 +43,12 @@ class ExternalKvBlockIndex {
   ExternalKvBlockIndex(const ExternalKvBlockIndex&) = delete;
   ExternalKvBlockIndex& operator=(const ExternalKvBlockIndex&) = delete;
 
-  // Register (or overwrite) a batch of hashes for node_id at the given tier.
+  // Register a batch of hashes for node_id at the given tier.
   void Register(const std::string& node_id, const std::vector<std::string>& hashes, TierType tier);
 
-  // Remove specific hashes for a node.
-  void Unregister(const std::string& node_id, const std::vector<std::string>& hashes);
+  // Remove specific hashes for a node at one tier.
+  void Unregister(const std::string& node_id, const std::vector<std::string>& hashes,
+                  TierType tier);
 
   // Remove all hashes for a node (bulk, called on node expiry/unregister).
   void UnregisterByNode(const std::string& node_id);
@@ -55,6 +57,7 @@ class ExternalKvBlockIndex {
     std::string node_id;
     std::vector<std::string> matched_hashes;
     TierType tier = TierType::UNKNOWN;
+    std::set<TierType> tiers;
   };
 
   // Return per-node matches across all queried hashes.
@@ -64,9 +67,9 @@ class ExternalKvBlockIndex {
   size_t GetKvCount(const std::string& node_id) const;
 
  private:
-  // hash -> (node_id -> tier)
+  // hash -> (node_id -> tiers)
   mutable std::shared_mutex mutex_;
-  std::unordered_map<std::string, std::unordered_map<std::string, TierType>> entries_;
+  std::unordered_map<std::string, std::unordered_map<std::string, std::set<TierType>>> entries_;
 };
 
 }  // namespace mori::umbp

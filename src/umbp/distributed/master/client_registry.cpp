@@ -59,9 +59,10 @@ void ClientRegistry::RegisterExternalKvBlocks(const std::string& node_id,
 }
 
 void ClientRegistry::UnregisterExternalKvBlocks(const std::string& node_id,
-                                                const std::vector<std::string>& hashes) {
+                                                const std::vector<std::string>& hashes,
+                                                TierType tier) {
   if (external_kv_index_ != nullptr) {
-    external_kv_index_->Unregister(node_id, hashes);
+    external_kv_index_->Unregister(node_id, hashes, tier);
   }
 }
 
