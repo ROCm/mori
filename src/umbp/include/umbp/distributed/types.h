@@ -129,6 +129,11 @@ struct ClientRecord {
   std::vector<uint8_t> engine_desc_bytes;
 
   uint64_t last_applied_seq = 0;
+
+  // Opaque key=value labels supplied at registration (e.g. "sgl_role=prefill").
+  // Attached to all metrics reported by this node so Prometheus queries can
+  // filter/group by role or other client attributes.
+  std::vector<std::string> tags;
 };
 
 // Helpers for logging

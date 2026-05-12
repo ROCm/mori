@@ -113,6 +113,7 @@ grpc::Status MasterClient::RegisterSelf(const std::map<TierType, TierCapacity>& 
   req.set_engine_desc(engine_desc_bytes.data(), engine_desc_bytes.size());
   FillTierCapacities(req.mutable_tier_capacities(), tier_capacities);
   for (uint64_t cap : ssd_store_capacities) req.add_ssd_store_capacities(cap);
+  for (const auto& tag : config_.tags) req.add_tags(tag);
 
   ::umbp::RegisterClientResponse resp;
   grpc::ClientContext ctx;
@@ -421,6 +422,7 @@ void MasterClient::HeartbeatLoop() {
       re_req.set_node_id(config_.node_id);
       re_req.set_node_address(config_.node_address);
       FillTierCapacities(re_req.mutable_tier_capacities(), caps);
+      for (const auto& tag : config_.tags) re_req.add_tags(tag);
       ::umbp::RegisterClientResponse re_resp;
       grpc::ClientContext re_ctx;
       grpc::Status re_status;

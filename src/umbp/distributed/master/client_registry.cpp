@@ -68,7 +68,8 @@ void ClientRegistry::UnregisterExternalKvBlocks(const std::string& node_id,
 bool ClientRegistry::RegisterClient(const std::string& node_id, const std::string& node_address,
                                     const std::map<TierType, TierCapacity>& tier_capacities,
                                     const std::string& peer_address,
-                                    const std::vector<uint8_t>& engine_desc_bytes) {
+                                    const std::vector<uint8_t>& engine_desc_bytes,
+                                    const std::vector<std::string>& tags) {
   std::unique_lock lock(mutex_);
   const auto now = std::chrono::steady_clock::now();
 
@@ -93,11 +94,17 @@ bool ClientRegistry::RegisterClient(const std::string& node_id, const std::strin
   record.peer_address = peer_address;
   record.engine_desc_bytes = engine_desc_bytes;
   record.last_applied_seq = 0;
+  record.tags = tags;
 
   clients_[node_id] = std::move(record);
 
-  MORI_UMBP_INFO("[Registry] Registered node: {} at {} (peer={})", node_id, node_address,
-                 peer_address);
+  std::string tags_str;
+  for (const auto& t : tags) {
+    if (!tags_str.empty()) tags_str += ',';
+    tags_str += t;
+  }
+  MORI_UMBP_INFO("[Registry] Registered node: {} at {} (peer={}) tags=[{}]", node_id, node_address,
+                 peer_address, tags_str);
   return true;
 }
 
@@ -193,6 +200,13 @@ std::vector<ClientRecord> ClientRegistry::GetAliveClients() const {
     if (record.status == ClientStatus::ALIVE) result.push_back(record);
   }
   return result;
+}
+
+std::vector<std::string> ClientRegistry::GetClientTags(const std::string& node_id) const {
+  std::shared_lock lock(mutex_);
+  auto it = clients_.find(node_id);
+  if (it == clients_.end()) return {};
+  return it->second.tags;
 }
 
 void ClientRegistry::StartReaper() {

@@ -59,6 +59,7 @@ message RegisterClientRequest {
   string peer_address                 = 4;   // PeerService gRPC address
   bytes  engine_desc                  = 5;   // packed EngineDesc
   repeated uint64 ssd_store_capacities = 12; // per-SSD-store capacity in bytes
+  repeated string tags                = 13;  // opaque key=value labels (e.g. "sgl_role=prefill")
 }
 message RegisterClientResponse {
   uint64 heartbeat_interval_ms = 1;  // Recommended heartbeat interval

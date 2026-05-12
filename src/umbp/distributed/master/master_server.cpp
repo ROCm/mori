@@ -172,9 +172,11 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     const auto& engine_desc_str = request->engine_desc();
     std::vector<uint8_t> engine_desc_bytes(engine_desc_str.begin(), engine_desc_str.end());
 
+    std::vector<std::string> tags(request->tags().begin(), request->tags().end());
+
     const bool registered =
         registry_.RegisterClient(request->node_id(), request->node_address(), caps,
-                                 request->peer_address(), engine_desc_bytes);
+                                 request->peer_address(), engine_desc_bytes, tags);
     if (!registered) {
       return grpc::Status(grpc::StatusCode::ALREADY_EXISTS,
                           "node is already alive and cannot be re-registered");
@@ -442,6 +444,12 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     if (!metrics_) return grpc::Status::OK;
 
     mori::metrics::MetricsServer::Labels base = {{"node", request->node_id()}};
+    for (const auto& tag : registry_.GetClientTags(request->node_id())) {
+      const auto sep = tag.find('=');
+      if (sep != std::string::npos) {
+        base.push_back({tag.substr(0, sep), tag.substr(sep + 1)});
+      }
+    }
     for (const auto& s : request->metrics()) {
       mori::metrics::MetricsServer::Labels labels = base;
       for (const auto& l : s.labels()) labels.push_back({l.name(), l.value()});

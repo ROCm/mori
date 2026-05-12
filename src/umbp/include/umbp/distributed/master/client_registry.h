@@ -74,7 +74,8 @@ class ClientRegistry {
   bool RegisterClient(const std::string& node_id, const std::string& node_address,
                       const std::map<TierType, TierCapacity>& tier_capacities,
                       const std::string& peer_address = "",
-                      const std::vector<uint8_t>& engine_desc_bytes = {});
+                      const std::vector<uint8_t>& engine_desc_bytes = {},
+                      const std::vector<std::string>& tags = {});
 
   // Drops the node from the registry and clears every index entry that
   // belonged to it.
@@ -98,6 +99,8 @@ class ClientRegistry {
   bool IsClientAlive(const std::string& node_id) const;
   size_t ClientCount() const;
   std::vector<ClientRecord> GetAliveClients() const;
+  // Returns the tags registered for node_id, or empty if not found.
+  std::vector<std::string> GetClientTags(const std::string& node_id) const;
 
   // --- Reaper control ---
   // The reaper only expires nodes whose last_heartbeat has aged past

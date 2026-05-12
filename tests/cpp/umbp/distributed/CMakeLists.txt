@@ -57,6 +57,16 @@ target_link_libraries(
 add_test(NAME umbp_master_client_rpc_latency
          COMMAND test_umbp_master_client_rpc_latency)
 
+# Client-tag registration + metrics label injection.
+add_executable(test_umbp_tags test_umbp_tags.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_umbp_tags PRIVATE -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  test_umbp_tags PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB}
+                         ${_TEST_GRPCPP_LIB} gtest_main)
+add_test(NAME umbp_tags COMMAND test_umbp_tags)
+
 # --------------------------------------------------------------------------
 # Legacy gate.  Everything below here references deleted symbols (AllocateForPut
 # / FinalizeAllocation / Register / Lookup / fused-RDMA pipeline) and is opt-in

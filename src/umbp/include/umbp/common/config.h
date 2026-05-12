@@ -106,6 +106,9 @@ struct UMBPMasterClientConfig {
   std::string node_id;         // unique node identifier
   std::string node_address;    // this node's reachable address for peers
   bool auto_heartbeat = true;  // start heartbeat thread on Init
+  // Opaque key=value strings forwarded to master on RegisterClient and
+  // attached to all metrics emitted for this node.  e.g. "sgl_role=prefill".
+  std::vector<std::string> tags;
 };
 
 // RDMA IO-engine endpoint parameters.

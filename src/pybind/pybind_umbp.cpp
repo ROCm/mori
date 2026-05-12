@@ -170,7 +170,8 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("master_address", &UMBPMasterClientConfig::master_address)
       .def_readwrite("node_id", &UMBPMasterClientConfig::node_id)
       .def_readwrite("node_address", &UMBPMasterClientConfig::node_address)
-      .def_readwrite("auto_heartbeat", &UMBPMasterClientConfig::auto_heartbeat);
+      .def_readwrite("auto_heartbeat", &UMBPMasterClientConfig::auto_heartbeat)
+      .def_readwrite("tags", &UMBPMasterClientConfig::tags);
 
   py::class_<UMBPIoEngineConfig>(m, "UMBPIoEngineConfig")
       .def(py::init<>())
