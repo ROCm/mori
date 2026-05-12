@@ -41,6 +41,10 @@ using namespace mori::shmem;
 
 static constexpr int32_t EP_CONFIG_I32_VERSION = 1;
 
+// 56 → block_elems = 7168/56 = 128, matching the AccumNum=8 + VecBytes=8 dequant specialization.
+static constexpr int kDefaultFp8BlockwiseScaleDim = 56;
+static constexpr const char* kFp8BlockwiseScaleDimEnv = "MORI_FP8_COMBINE_SCALE_DIM";
+
 std::vector<int32_t> EpDispatchCombineConfig::ToPackedI32Array() const {
   return {
       EP_CONFIG_I32_VERSION,
@@ -111,6 +115,17 @@ EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config_
     MORI_OPS_INFO("numQpPerPe {} larger than shmem numQpPerPe {}, set to {}", config.numQpPerPe,
                   shmemNumQpPerPe, shmemNumQpPerPe);
   }
+
+  if (config.quantType == QuantType::Fp8BlockwiseQuant) {
+    fp8BlockwiseCombineScaleDim =
+        env::GetPositiveIntOr(kFp8BlockwiseScaleDimEnv, kDefaultFp8BlockwiseScaleDim);
+    fp8BlockwiseCombineScaleTypeSize = static_cast<int>(sizeof(float));
+    if (config.rank == 0) {
+      MORI_OPS_INFO("Fp8BlockwiseQuant combine scale_dim={} (override via {})",
+                    fp8BlockwiseCombineScaleDim, kFp8BlockwiseScaleDimEnv);
+    }
+  }
+
   config.enableSdma = env::IsEnvVarEnabled("MORI_ENABLE_SDMA");
   MORI_OPS_INFO("EpDispatchCombine SDMA {} (currently only effective for AsyncLL kernel type)",
                 config.enableSdma ? "enabled" : "disabled");
@@ -169,7 +184,9 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
   if (config.kernelType == KernelType::IntraNode &&
       config.quantType == QuantType::Fp8BlockwiseQuant) {
     size_t blockwiseScaleBytes =
-        (config.scaleDim > 0) ? static_cast<size_t>(config.scaleDim) * sizeof(float) : 0;
+        (fp8BlockwiseCombineScaleDim > 0)
+            ? static_cast<size_t>(fp8BlockwiseCombineScaleDim) * fp8BlockwiseCombineScaleTypeSize
+            : 0;
     maxStagingSize = static_cast<size_t>(config.MaxNumTokensToRecv()) *
                      (config.HiddenBytes(config.maxTokenTypeSize) + config.IndexBytes() +
                       config.WeightBytes() + config.SrcTokenIdBytes() + blockwiseScaleBytes);
@@ -214,14 +231,22 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
   shmemCombineOutWeightsMemObj =
       ShmemMallocAndReturnMemObjPtr(maxWeightSize, hipDeviceMallocUncached);
 
-  if ((config.scaleDim > 0) &&
-      ((config.scaleTypeSize > 0) || config.quantType == QuantType::Fp8BlockwiseQuant)) {
-    size_t scaleElemSizeForAlloc =
-        (config.quantType == QuantType::Fp8BlockwiseQuant) ? sizeof(float) : config.scaleTypeSize;
-    size_t maxScaleSize =
-        static_cast<size_t>(config.MaxNumTokensToRecv()) * config.scaleDim * scaleElemSizeForAlloc;
-    shmemInpScalesMemObj = ShmemMallocAndReturnMemObjPtr(maxScaleSize, hipDeviceMallocUncached);
-    shmemOutScalesMemObj = ShmemMallocAndReturnMemObjPtr(maxScaleSize, hipDeviceMallocUncached);
+  size_t userScaleSize = 0;
+  if (config.scaleDim > 0 && config.scaleTypeSize > 0) {
+    userScaleSize =
+        static_cast<size_t>(config.MaxNumTokensToRecv()) * config.scaleDim * config.scaleTypeSize;
+  }
+  size_t fp8BlockwiseScaleSize = 0;
+  if (config.quantType == QuantType::Fp8BlockwiseQuant && fp8BlockwiseCombineScaleDim > 0) {
+    fp8BlockwiseScaleSize = static_cast<size_t>(config.MaxNumTokensToRecv()) *
+                            fp8BlockwiseCombineScaleDim * fp8BlockwiseCombineScaleTypeSize;
+  }
+  size_t inpScaleSize = std::max(userScaleSize, fp8BlockwiseScaleSize);
+  if (inpScaleSize > 0) {
+    shmemInpScalesMemObj = ShmemMallocAndReturnMemObjPtr(inpScaleSize, hipDeviceMallocUncached);
+  }
+  if (userScaleSize > 0) {
+    shmemOutScalesMemObj = ShmemMallocAndReturnMemObjPtr(userScaleSize, hipDeviceMallocUncached);
   }
 
   size_t maxIndicesSize = config.MaxNumTokensToRecv() * config.numExpertPerToken * sizeof(index_t);
@@ -422,6 +447,7 @@ EpDispatchCombineArgsRaw GetEpDispatchCombineArgsRaw(const EpDispatchCombineHand
                                                      int rdmaBlockNum) {
   EpDispatchCombineArgsRaw args;
   args.config = handle.config;
+  args.fp8BlockwiseCombineScaleDim = handle.fp8BlockwiseCombineScaleDim;
   args.rdmaBlockNum = rdmaBlockNum;
   args.curRankNumToken = handle.curRankNumToken;
   args.tokenIndices = handle.tokenIndices;

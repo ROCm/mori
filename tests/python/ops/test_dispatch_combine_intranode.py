@@ -140,8 +140,8 @@ def test_dispatch_combine(
             pytest.skip("fp8_blockwise only supports bfloat16 input")
         if not use_external_inp_buf:
             pytest.skip("fp8_blockwise requires use_external_inp_buf=True")
-        if scale_dim <= 0:
-            pytest.skip("fp8_blockwise requires scale_dim > 0")
+        # fp8_blockwise combine ignores scale_dim/scale_type_size (driven by
+        # MORI_FP8_COMBINE_SCALE_DIM internally).
 
     for i in range(world_size):
         torch_dist_process_manager.task_queue.put(

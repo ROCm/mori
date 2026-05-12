@@ -266,7 +266,8 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
   const size_t weightBytes =
       (UseWeights && args.weightsBuf != nullptr) ? config.numExpertPerToken * sizeof(float) : 0;
   const size_t scaleBytes =
-      UseFp8BlockwiseQuant ? static_cast<size_t>(config.scaleDim) * sizeof(float) : 0;
+      UseFp8BlockwiseQuant ? static_cast<size_t>(args.fp8BlockwiseCombineScaleDim) * sizeof(float)
+                           : 0;
   const size_t combXferBytes = hiddenBytes + scaleBytes + weightBytes;
 
   if constexpr (EnableStdMoE) {
@@ -279,8 +280,9 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
         if constexpr (UseFp8BlockwiseQuant) {
           core::WarpQuantizeToFp8Blockwise<core::CombineInternalFp8>(
               args.intraNodeTokBufs.combineInp->template GetAs<TokT*>() + i * hiddenDim,
-              args.shmemInpScalesMemObj->template GetAs<float*>() + i * config.scaleDim,
-              args.inpTokenBuf + i * hiddenDim, hiddenDim, config.scaleDim);
+              args.shmemInpScalesMemObj->template GetAs<float*>() +
+                  i * args.fp8BlockwiseCombineScaleDim,
+              args.inpTokenBuf + i * hiddenDim, hiddenDim, args.fp8BlockwiseCombineScaleDim);
         } else if constexpr (!std::is_same_v<T, TokT> &&
                              std::is_same_v<TokT, core::CombineInternalFp8>) {
           core::WarpCastBf16ToCombineInternalFp8<T>(
@@ -314,7 +316,7 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
         core::WarpQuantizeToFp8Blockwise<core::CombineInternalFp8>(
             reinterpret_cast<core::CombineInternalFp8*>(destStagingPtr),
             reinterpret_cast<float*>(destStagingPtr + hiddenBytes),
-            args.inpTokenBuf + tokenIdx * hiddenDim, hiddenDim, config.scaleDim);
+            args.inpTokenBuf + tokenIdx * hiddenDim, hiddenDim, args.fp8BlockwiseCombineScaleDim);
       } else if constexpr (!std::is_same_v<T, TokT> &&
                            std::is_same_v<TokT, core::CombineInternalFp8>) {
         core::WarpCastBf16ToCombineInternalFp8<T>(reinterpret_cast<TokT*>(destStagingPtr),
@@ -353,7 +355,7 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
         core::WarpQuantizeToFp8Blockwise<core::CombineInternalFp8>(
             reinterpret_cast<core::CombineInternalFp8*>(destStagingPtr),
             reinterpret_cast<float*>(destStagingPtr + hiddenBytes),
-            args.inpTokenBuf + tokenIdx * hiddenDim, hiddenDim, config.scaleDim);
+            args.inpTokenBuf + tokenIdx * hiddenDim, hiddenDim, args.fp8BlockwiseCombineScaleDim);
       } else if constexpr (!std::is_same_v<T, TokT> &&
                            std::is_same_v<TokT, core::CombineInternalFp8>) {
         core::WarpCastBf16ToCombineInternalFp8<T>(reinterpret_cast<TokT*>(destStagingPtr),
@@ -423,7 +425,7 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
           }
           if constexpr (UseFp8BlockwiseQuant) {
             float* scalePtr = args.shmemInpScalesMemObj->template GetAs<float*>(destPe) +
-                              destLocalTokId * config.scaleDim;
+                              destLocalTokId * args.fp8BlockwiseCombineScaleDim;
             srcScalePtrs[j] = (scalePtr[0] < 0.0f) ? scalePtr : nullptr;
           }
         } else {
@@ -508,12 +510,12 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
           core::WarpAccumFp8DequantFull<T, core::CombineInternalFp8>(
               outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
               reinterpret_cast<const float* const*>(srcScalePtrs), validAccumCount, hiddenDim,
-              config.scaleDim);
+              args.fp8BlockwiseCombineScaleDim);
         } else {
           core::WarpAccumFp8DequantSegment<T, core::CombineInternalFp8>(
               outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
               reinterpret_cast<const float* const*>(srcScalePtrs), validAccumCount, hiddenDimOffset,
-              hiddenDimSize, hiddenDim, config.scaleDim);
+              hiddenDimSize, hiddenDim, args.fp8BlockwiseCombineScaleDim);
         }
       }
     } else if constexpr (!std::is_same_v<T, TokT> &&

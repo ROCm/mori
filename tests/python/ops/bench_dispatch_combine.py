@@ -1392,9 +1392,9 @@ if __name__ == "__main__":
         type=int,
         default=32,
         help=(
-            "Number of scale blocks per token for blockwise quant "
-            "(only used when --quant-type fp8_blockwise; default: 32). "
-            "Block size in elements is hidden_dim / scale_dim."
+            "Number of caller-provided dispatch scale values per token "
+            "(default: 32). fp8_blockwise combine ignores this and uses "
+            "MORI_FP8_COMBINE_SCALE_DIM for its internal scale layout."
         ),
     )
     parser.add_argument(

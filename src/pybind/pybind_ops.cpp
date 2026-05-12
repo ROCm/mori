@@ -97,9 +97,10 @@ int64_t PrepareAndBuildArgs(mori::moe::EpDispatchCombineHandle& handle, int64_t 
 py::tuple GetDispatchOutputPtrs(mori::moe::EpDispatchCombineHandle& handle, bool has_scales) {
   int64_t out_ptr = reinterpret_cast<int64_t>(handle.GetShmemDispatchOutTokMemObj()->Get());
   int64_t outW_ptr = reinterpret_cast<int64_t>(handle.shmemDispatchOutWeightsMemObj->Get());
-  int64_t outS_ptr = (has_scales && handle.config.scaleDim > 0)
-                         ? reinterpret_cast<int64_t>(handle.shmemOutScalesMemObj->Get())
-                         : 0;
+  int64_t outS_ptr =
+      (has_scales && handle.config.scaleDim > 0 && handle.shmemOutScalesMemObj.IsValid())
+          ? reinterpret_cast<int64_t>(handle.shmemOutScalesMemObj->Get())
+          : 0;
   int64_t outI_ptr = reinterpret_cast<int64_t>(handle.shmemOutIndicesMemObj->Get());
   int64_t total_ptr = reinterpret_cast<int64_t>(handle.totalRecvTokenNum);
   return py::make_tuple(out_ptr, outW_ptr, outS_ptr, outI_ptr, total_ptr);
@@ -120,6 +121,8 @@ py::dict GetHandleInfo(mori::moe::EpDispatchCombineHandle& handle) {
   info["hidden_dim"] = handle.config.hiddenDim;
   info["scale_dim"] = handle.config.scaleDim;
   info["scale_type_size"] = handle.config.scaleTypeSize;
+  info["fp8_blockwise_combine_scale_dim"] = handle.Fp8BlockwiseCombineScaleDim();
+  info["fp8_blockwise_combine_scale_type_size"] = handle.Fp8BlockwiseCombineScaleTypeSize();
   info["max_token_type_size"] = handle.config.maxTokenTypeSize;
   info["max_num_inp_token_per_rank"] = handle.config.maxNumInpTokenPerRank;
   info["num_expert_per_rank"] = handle.config.numExpertPerRank;
