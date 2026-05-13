@@ -264,6 +264,12 @@ def is_profiler_enabled() -> bool:
     return val.lower() in ("1", "true", "yes", "on")
 
 
+def is_debuginfo_enabled() -> bool:
+    """Return True if MORI_DEBUG_INFO is set to a truthy value."""
+    val = os.environ.get("MORI_DEBUG_INFO", "")
+    return val.lower() in ("1", "true", "yes", "on")
+
+
 def detect_build_config() -> BuildConfig:
     """Auto-detect the full build config (cached after first call)."""
     global _cached_config
