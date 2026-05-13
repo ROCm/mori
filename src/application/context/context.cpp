@@ -42,6 +42,14 @@ namespace mori {
 namespace application {
 
 Context::Context(BootstrapNetwork& bootNet) : bootNet(bootNet) {
+  // Snapshot env vars once at construction. Every subsequent decision (transport
+  // selection, hipMalloc vs hipExtMallocWithFlags(uncached), etc.) must read
+  // from this cached state, not getenv. Otherwise late env mutations -- e.g.
+  // a test setting MORI_ENABLE_SDMA after worker init -- can produce a state
+  // where the transport layer chose P2P but per-allocation paths flip to
+  // uncached SDMA buffers, leading to cache/IPC inconsistency hangs.
+  sdmaEnabled = env::IsEnvVarEnabled("MORI_ENABLE_SDMA");
+  p2pDisabled = env::IsEnvVarEnabled("MORI_DISABLE_P2P");
   CollectHostNames();
   InitializePossibleTransports();
 }
@@ -121,9 +129,10 @@ void Context::CollectHostNames() {
   }
 }
 
-bool IsP2PDisabled() { return env::IsEnvVarEnabled("MORI_DISABLE_P2P"); }
-
-bool IsSDMAEnabled() { return env::IsEnvVarEnabled("MORI_ENABLE_SDMA"); }
+// MORI_ENABLE_SDMA / MORI_DISABLE_P2P are now read exactly once in the
+// Context constructor and cached as members; consult Context::IsSdmaEnabled()
+// / Context::IsP2PDisabled() instead of getenv anywhere outside the
+// constructor.
 
 void Context::InitializePossibleTransports() {
   // Find my rank in node
@@ -197,7 +206,7 @@ void Context::InitializePossibleTransports() {
   this->numQpPerPe = numQpPerPe;
   // Initialize transport
   int peerRankInNode = -1;
-  if (!IsP2PDisabled() && IsSDMAEnabled()) anvil::anvil.init();
+  if (!IsP2PDisabled() && IsSdmaEnabled()) anvil::anvil.init();
 
   int sdmaNumChannels = anvil::GetSdmaNumChannels();
   MORI_APP_INFO("SDMA num channels per GPU pair: {}", sdmaNumChannels);
@@ -213,7 +222,7 @@ void Context::InitializePossibleTransports() {
         bool canAccessPeer = true;
 
         if ((i == LocalRank()) || canAccessPeer) {
-          if (IsSDMAEnabled()) {
+          if (IsSdmaEnabled()) {
             if (i != LocalRank()) {
               transportTypes.push_back(TransportType::SDMA);
               anvil::EnablePeerAccess(LocalRank() % 8, i % 8);

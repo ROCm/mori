@@ -126,7 +126,13 @@ EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config_
     }
   }
 
-  config.enableSdma = env::IsEnvVarEnabled("MORI_ENABLE_SDMA");
+  // Read the SDMA flag from the Context-cached snapshot (set once at Context
+  // construction). Reading getenv directly here would race with the
+  // SymmMemManager / Context decisions made at shmem init time -- the symptom
+  // was tests that set MORI_ENABLE_SDMA inside the test function deadlocking
+  // because Malloc started returning uncached buffers while Context still
+  // believed the transport was P2P.
+  config.enableSdma = ShmemSdmaEnabled();
   MORI_OPS_INFO("EpDispatchCombine SDMA {} (currently only effective for AsyncLL kernel type)",
                 config.enableSdma ? "enabled" : "disabled");
   if (config.kernelType == KernelType::AsyncLL && !config.enableSdma && config.rank == 0) {
