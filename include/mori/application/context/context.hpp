@@ -52,6 +52,15 @@ class Context {
   // Check if P2P connection is possible with a peer (same node)
   bool CanUseP2P(int destRank) const;
 
+  // Cached env-var snapshot taken at construction time. All later code MUST
+  // consult these (not getenv) so that env-var changes after Context init
+  // cannot create an inconsistent state -- e.g. transport selected one way
+  // at init but SymmMemManager::Malloc later switching to uncached
+  // hipExtMallocWithFlags allocations because someone set MORI_ENABLE_SDMA
+  // in a test function after the workers had already been spawned.
+  bool IsSdmaEnabled() const { return sdmaEnabled; }
+  bool IsP2PDisabled() const { return p2pDisabled; }
+
   const std::vector<RdmaEndpoint>& GetRdmaEndpoints() const { return rdmaEps; }
 
  private:
@@ -62,6 +71,9 @@ class Context {
   BootstrapNetwork& bootNet;
   int rankInNode{-1};
   int numQpPerPe{4};
+  // Snapshotted at construction; see IsSdmaEnabled() / IsP2PDisabled() above.
+  bool sdmaEnabled{false};
+  bool p2pDisabled{false};
   std::vector<std::string> hostnames;
   std::vector<TransportType> transportTypes;
 

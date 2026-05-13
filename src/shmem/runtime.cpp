@@ -177,6 +177,11 @@ int ShmemNumQpPerPe() {
   return states->rdmaStates->commContext->GetNumQpPerPe();
 }
 
+bool ShmemSdmaEnabled() {
+  ShmemStates* states = ShmemStatesSingleton::GetInstance();
+  return states->rdmaStates->commContext->IsSdmaEnabled();
+}
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                      Barrier APIs                                             */
 /* ---------------------------------------------------------------------------------------------- */

@@ -93,6 +93,11 @@ enum ShmemTeamType {
 
 int ShmemNumQpPerPe();
 
+// Returns the MORI_ENABLE_SDMA snapshot taken at Context construction time.
+// Use this instead of getenv("MORI_ENABLE_SDMA") so callers stay consistent
+// with the transport selection that was made at shmem init.
+bool ShmemSdmaEnabled();
+
 // TODO: finish team pe api
 // int ShmemTeamMyPe(ShmemTeamType);
 // int ShmemTeamNPes(ShmemTeamType);
