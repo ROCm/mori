@@ -20,8 +20,16 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 import mori
+import os
 import pytest
 import torch
+
+# Default to SDMA transport for local runs.  CI overrides this per step:
+#   SDMA step:  MORI_ENABLE_SDMA=1  (same as default, redundant but harmless)
+#   IBGDA step: MORI_DISABLE_P2P=1  (overrides transport to RDMA; SDMA flag ignored)
+# Must be set at module level (before worker processes are spawned by the
+# session fixture) so the child processes inherit the correct env.
+os.environ.setdefault("MORI_ENABLE_SDMA", "1")
 from tests.python.ops.dispatch_combine_test_utils import (
     _all_data_types,
     _is_fp4x2_dtype,
