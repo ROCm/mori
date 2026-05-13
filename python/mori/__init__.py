@@ -44,6 +44,11 @@ def __dir__():
     return list(globals().keys()) + sorted(_LAZY_SUBMODULES)
 
 
+if os.environ.get("MORI_FORCE_RECOMPILE", "").lower() in ("1", "true", "on"):
+    from .jit import clear_kernel_cache
+
+    clear_kernel_cache()
+
 if os.environ.get("MORI_PRECOMPILE", "").lower() in ("1", "true", "on"):
     from .jit import precompile
 

@@ -29,13 +29,24 @@ Results are cached to ~/.mori/jit/ for subsequent runs.
 To precompile all kernels (avoid first-run latency)::
 
     MORI_PRECOMPILE=1 python -c "import mori"
+
+To force recompile all kernels (clear cache and rebuild)::
+
+    MORI_FORCE_RECOMPILE=1 MORI_PRECOMPILE=1 python -c "import mori"
 """
 
 import os
 
 from mori.jit.core import compile_genco, ensure_bitcode
 
-__all__ = ["compile_genco", "ensure_bitcode", "precompile"]
+__all__ = ["clear_kernel_cache", "compile_genco", "ensure_bitcode", "precompile"]
+
+
+def clear_kernel_cache() -> None:
+    """Clear the in-memory kernel lookup tables and force recompilation."""
+    from mori.ops._jit_loader import clear_kernel_cache as _clear
+
+    _clear()
 
 
 def precompile():

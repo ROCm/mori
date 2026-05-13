@@ -42,6 +42,17 @@ _compiled_hsaco: dict[str, str] = {}
 _loaded_modules: dict = {}
 
 
+def clear_kernel_cache() -> None:
+    """Clear the in-memory kernel lookup tables.
+
+    This clears both the compiled hsaco path cache and the loaded module cache,
+    forcing kernels to be recompiled and reloaded on next use.
+    """
+    _compiled_hsaco.clear()
+    _loaded_modules.clear()
+    print("[mori-jit] Kernel cache cleared")
+
+
 def ensure_compiled(hip_name: str) -> None:
     """Compile *hip_name* to ``.hsaco`` and cache the path in ``_compiled_hsaco``.
 
