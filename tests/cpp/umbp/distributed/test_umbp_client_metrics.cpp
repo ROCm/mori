@@ -434,6 +434,13 @@ TEST_F(PoolClientLocalByteTrackingTest, LocalPutGetBytesCounted) {
   double get_inbound_local =
       ParseMetricValue(body, "mori_umbp_client_inbound_get_bytes_total", "local");
 
+  auto parse_hist_sum = [&](const std::string& name, const std::string& traffic) {
+    return ParseMetricValue(body, name + "_sum", "traffic=\"" + traffic + "\"");
+  };
+  auto parse_hist_count = [&](const std::string& name, const std::string& traffic) {
+    return ParseMetricValue(body, name + "_count", "traffic=\"" + traffic + "\"");
+  };
+
   EXPECT_GE(put_outbound_local, static_cast<double>(kLocalPageSize))
       << "Expected >= " << kLocalPageSize << " local outbound put bytes; Prometheus shows "
       << put_outbound_local;
@@ -448,6 +455,24 @@ TEST_F(PoolClientLocalByteTrackingTest, LocalPutGetBytesCounted) {
       << "Expected >= " << kLocalPageSize << " local inbound get bytes; Prometheus shows "
       << get_inbound_local;
 
+  const double batch_put_local_sum =
+      parse_hist_sum("mori_umbp_client_batch_put_bandwidth_gibps", "local");
+  const double batch_put_local_count =
+      parse_hist_count("mori_umbp_client_batch_put_bandwidth_gibps", "local");
+  const double batch_get_local_sum =
+      parse_hist_sum("mori_umbp_client_batch_get_bandwidth_gibps", "local");
+  const double batch_get_local_count =
+      parse_hist_count("mori_umbp_client_batch_get_bandwidth_gibps", "local");
+
+  EXPECT_GT(batch_put_local_sum, 0.0)
+      << "Expected local batch-put bandwidth sum > 0; Prometheus shows " << batch_put_local_sum;
+  EXPECT_GT(batch_put_local_count, 0.0)
+      << "Expected local batch-put bandwidth count > 0; Prometheus shows " << batch_put_local_count;
+  EXPECT_GT(batch_get_local_sum, 0.0)
+      << "Expected local batch-get bandwidth sum > 0; Prometheus shows " << batch_get_local_sum;
+  EXPECT_GT(batch_get_local_count, 0.0)
+      << "Expected local batch-get bandwidth count > 0; Prometheus shows " << batch_get_local_count;
+
   // Single-node setup must not produce any remote traffic counters.
   EXPECT_EQ(ParseMetricValue(body, "mori_umbp_client_outbound_put_bytes_total", "remote"), -1.0)
       << "Unexpected remote outbound put bytes in single-node setup";
@@ -457,6 +482,11 @@ TEST_F(PoolClientLocalByteTrackingTest, LocalPutGetBytesCounted) {
       << "Unexpected remote inbound put bytes in single-node setup";
   EXPECT_EQ(ParseMetricValue(body, "mori_umbp_client_inbound_get_bytes_total", "remote"), -1.0)
       << "Unexpected remote inbound get bytes in single-node setup";
+
+  EXPECT_EQ(parse_hist_sum("mori_umbp_client_batch_put_bandwidth_gibps", "remote"), -1.0)
+      << "Unexpected remote batch-put bandwidth series in single-node setup";
+  EXPECT_EQ(parse_hist_sum("mori_umbp_client_batch_get_bandwidth_gibps", "remote"), -1.0)
+      << "Unexpected remote batch-get bandwidth series in single-node setup";
 }
 
 }  // namespace

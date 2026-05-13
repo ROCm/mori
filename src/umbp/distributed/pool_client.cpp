@@ -27,6 +27,9 @@
 #include <chrono>
 #include <cstring>
 #include <msgpack.hpp>
+#include <numeric>
+#include <string>
+#include <string_view>
 #include <unordered_map>
 
 #include "mori/io/backend.hpp"
@@ -42,6 +45,60 @@ namespace mori::umbp {
 namespace {
 
 bool IsValidMemoryDesc(const mori::io::MemoryDesc& desc) { return desc.size > 0; }
+
+constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
+
+const std::vector<double>& BatchBandwidthBucketsGiBps() {
+  static const std::vector<double> buckets = {
+      0.1,  0.2,  0.5,  1.0,   2.0,   3.0,   4.0,   6.0,   8.0,   12.0,  16.0,  24.0, 32.0,
+      48.0, 64.0, 96.0, 128.0, 192.0, 256.0, 320.0, 384.0, 448.0, 512.0, 640.0, 800.0};
+  return buckets;
+}
+
+struct BatchBandwidthSplit {
+  double local = 0.0;
+  double remote = 0.0;
+};
+
+template <typename Route>
+BatchBandwidthSplit ComputeBatchBandwidthBytes(const std::vector<bool>& results,
+                                               const std::vector<size_t>& sizes,
+                                               const std::vector<std::optional<Route>>& routes,
+                                               std::string_view local_node_id) {
+  const size_t limit =
+      std::min({results.size(), sizes.size(), routes.size()});  // guard against mismatched sizes
+  size_t idx = 0;
+  auto reducer = [&](BatchBandwidthSplit acc, bool success) {
+    if (idx >= limit) {
+      ++idx;
+      return acc;
+    }
+    if (success) {
+      const double bytes = static_cast<double>(sizes[idx]);
+      // No route means the key was served from local storage (fallback path).
+      const bool is_local = !routes[idx].has_value() || routes[idx]->node_id == local_node_id;
+      if (is_local) {
+        acc.local += bytes;
+      } else {
+        acc.remote += bytes;
+      }
+    }
+    ++idx;
+    return acc;
+  };
+  return std::accumulate(results.begin(), results.begin() + limit, BatchBandwidthSplit{}, reducer);
+}
+
+void ObserveBatchBandwidth(MasterClient& master_client, double bytes, double seconds,
+                           const char* metric_name, const char* metric_help,
+                           std::string_view traffic) {
+  if (bytes <= 0.0 || seconds <= 0.0) return;
+  const double gibps = (bytes / seconds) / kGiB;
+  if (gibps <= 0.0) return;
+  MasterClient::Labels labels = {{"traffic", std::string(traffic)}};
+  master_client.Observe(metric_name, metric_help, std::move(labels), BatchBandwidthBucketsGiBps(),
+                        gibps);
+}
 
 // Bytes belonging to the i-th logical page of a Put/Get spread across
 // `num_pages` pages of `page_size` bytes.  Last page may be partial.
@@ -499,6 +556,7 @@ bool PoolClient::Get(const std::string& key, void* dst, size_t size) {
 std::vector<bool> PoolClient::BatchPut(const std::vector<std::string>& keys,
                                        const std::vector<const void*>& srcs,
                                        const std::vector<size_t>& sizes) {
+  const auto call_start = std::chrono::steady_clock::now();
   std::vector<bool> results(keys.size(), false);
   if (keys.size() != srcs.size() || keys.size() != sizes.size()) {
     MORI_UMBP_ERROR("[PoolClient] BatchPut: vector length mismatch");
@@ -535,12 +593,26 @@ std::vector<bool> PoolClient::BatchPut(const std::vector<std::string>& keys,
     if (results[i]) continue;
     results[i] = false;
   }
+
+  const auto call_end = std::chrono::steady_clock::now();
+  const double seconds =
+      std::chrono::duration_cast<std::chrono::duration<double>>(call_end - call_start).count();
+  if (seconds > 0.0) {
+    auto split = ComputeBatchBandwidthBytes(results, sizes, routes, config_.master_config.node_id);
+    ObserveBatchBandwidth(*master_client_, split.local, seconds,
+                          MORI_UMBP_METRIC_CLIENT_BATCH_PUT_BANDWIDTH,
+                          MORI_UMBP_METRIC_CLIENT_BATCH_PUT_BANDWIDTH_HELP, "local");
+    ObserveBatchBandwidth(*master_client_, split.remote, seconds,
+                          MORI_UMBP_METRIC_CLIENT_BATCH_PUT_BANDWIDTH,
+                          MORI_UMBP_METRIC_CLIENT_BATCH_PUT_BANDWIDTH_HELP, "remote");
+  }
   return results;
 }
 
 std::vector<bool> PoolClient::BatchGet(const std::vector<std::string>& keys,
                                        const std::vector<void*>& dsts,
                                        const std::vector<size_t>& sizes) {
+  const auto call_start = std::chrono::steady_clock::now();
   std::vector<bool> results(keys.size(), false);
   if (keys.size() != dsts.size() || keys.size() != sizes.size()) {
     MORI_UMBP_ERROR("[PoolClient] BatchGet: vector length mismatch");
@@ -600,6 +672,19 @@ std::vector<bool> PoolClient::BatchGet(const std::vector<std::string>& keys,
   for (size_t i = 0; i < keys.size(); ++i) {
     if (results[i]) continue;
     results[i] = false;
+  }
+
+  const auto call_end = std::chrono::steady_clock::now();
+  const double seconds =
+      std::chrono::duration_cast<std::chrono::duration<double>>(call_end - call_start).count();
+  if (seconds > 0.0) {
+    auto split = ComputeBatchBandwidthBytes(results, sizes, routes, config_.master_config.node_id);
+    ObserveBatchBandwidth(*master_client_, split.local, seconds,
+                          MORI_UMBP_METRIC_CLIENT_BATCH_GET_BANDWIDTH,
+                          MORI_UMBP_METRIC_CLIENT_BATCH_GET_BANDWIDTH_HELP, "local");
+    ObserveBatchBandwidth(*master_client_, split.remote, seconds,
+                          MORI_UMBP_METRIC_CLIENT_BATCH_GET_BANDWIDTH,
+                          MORI_UMBP_METRIC_CLIENT_BATCH_GET_BANDWIDTH_HELP, "remote");
   }
   return results;
 }
