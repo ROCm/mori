@@ -234,6 +234,8 @@ class EpDispatchCombineHandle {
   void LaunchReset(hipStream_t = 0);
 
   index_t GetCurRankNumToken() const { return curRankNumToken; }
+  int Fp8BlockwiseCombineScaleDim() const { return fp8BlockwiseCombineScaleDim; }
+  int Fp8BlockwiseCombineScaleTypeSize() const { return fp8BlockwiseCombineScaleTypeSize; }
 
   mori::application::SymmMemObjPtr GetShmemDispatchOutTokMemObj() const {
     if (config.kernelType == KernelType::IntraNode)
@@ -284,6 +286,8 @@ class EpDispatchCombineHandle {
  public:
   // Config
   EpDispatchCombineConfig config;
+  int fp8BlockwiseCombineScaleDim{0};
+  int fp8BlockwiseCombineScaleTypeSize{0};
   // Routed expert indices for tokens
   index_t* tokenIndices{nullptr};
 
@@ -385,6 +389,7 @@ template <typename T>
 struct EpDispatchCombineArgs {
   using data_type = T;
   EpDispatchCombineConfig config;
+  int fp8BlockwiseCombineScaleDim{0};
   int rdmaBlockNum{-1};
   index_t curRankNumToken{0};
   index_t* tokenIndices{nullptr};
@@ -447,6 +452,7 @@ struct EpDispatchCombineArgs {
 // Used by Python-side kernel launch where the type is erased.
 struct EpDispatchCombineArgsRaw {
   EpDispatchCombineConfig config;
+  int fp8BlockwiseCombineScaleDim{0};
   int rdmaBlockNum{-1};
   index_t curRankNumToken{0};
   index_t* tokenIndices{nullptr};

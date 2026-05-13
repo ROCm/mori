@@ -51,6 +51,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         input_shift=0.0,
         force_scale_active=False,
         report_scale_stats=False,
+        combine_scale_dim=None,
     ):
         super().__init__(config)
         self.combine_data_type = (
@@ -69,6 +70,10 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
         self.input_shift = float(input_shift)
         self.force_scale_active = bool(force_scale_active)
         self.report_scale_stats = bool(report_scale_stats)
+        # For fp8_blockwise the kernel quantizes by its own internal
+        # scale_dim; sentinel placement and scale-stat reporting must use
+        # the same value or they describe a different block partition.
+        self.combine_scale_dim = combine_scale_dim
         # Avoid printing the same scale-stats block more than once when
         # gen_test_data is called multiple times in the same run.
         self._scale_stats_reported = False
@@ -82,6 +87,7 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             input_scale=self.input_scale,
             input_shift=self.input_shift,
             force_scale_active=self.force_scale_active,
+            combine_scale_dim=self.combine_scale_dim,
         )
         self.config.hidden_dim = saved
 
@@ -102,13 +108,14 @@ class EpDispatchCombineBenchmark(EpDispatchCombineTestCase):
             _,
             _,
         ) = test_data
+        stats_scale_dim = self.combine_scale_dim or self.config.scale_dim
         per_rank, aggregate = compute_scale_active_stats(
-            all_rank_input, scale_dim=self.config.scale_dim
+            all_rank_input, scale_dim=stats_scale_dim
         )
         if self.config.rank == 0:
             print(
                 format_scale_stats_report(
-                    per_rank, aggregate, scale_dim=self.config.scale_dim
+                    per_rank, aggregate, scale_dim=stats_scale_dim
                 )
             )
 
@@ -937,6 +944,14 @@ def _bench_dispatch_combine(
     with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
         mori.shmem.shmem_torch_process_group_init("default")
         op = mori.ops.EpDispatchCombineOp(config)
+        # For fp8_blockwise, plumb the kernel-internal scale_dim into the
+        # benchmark so force_scale_active sentinels and report_scale_stats
+        # match the partition the kernel actually quantizes.
+        bench_combine_scale_dim = (
+            op._fp8_blockwise_combine_scale_dim
+            if quant_type == "fp8_blockwise"
+            else None
+        )
         benchmark = EpDispatchCombineBenchmark(
             config,
             combine_data_type=combine_data_type,
@@ -947,6 +962,7 @@ def _bench_dispatch_combine(
             input_shift=input_shift,
             force_scale_active=force_scale_active,
             report_scale_stats=report_scale_stats,
+            combine_scale_dim=bench_combine_scale_dim,
         )
 
         (
@@ -1392,9 +1408,9 @@ if __name__ == "__main__":
         type=int,
         default=32,
         help=(
-            "Number of scale blocks per token for blockwise quant "
-            "(only used when --quant-type fp8_blockwise; default: 32). "
-            "Block size in elements is hidden_dim / scale_dim."
+            "Number of caller-provided dispatch scale values per token "
+            "(default: 32). fp8_blockwise combine ignores this and uses "
+            "MORI_FP8_COMBINE_SCALE_DIM for its internal scale layout."
         ),
     )
     parser.add_argument(

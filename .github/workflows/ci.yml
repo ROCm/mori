@@ -139,6 +139,10 @@ jobs:
           $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
             cd $GITHUB_WORKSPACE
             timeout 120 python3 tests/python/ops/bench_dispatch_combine.py
+            timeout 120 python3 tests/python/ops/bench_dispatch_combine.py \
+              --cmd bench --dtype bf16 --quant-type fp8_blockwise \
+              --zero-copy 0 --max-tokens 128 \
+              --force-scale-active 1 --report-scale-stats 1
           "
 
       - name: MORI-IO

@@ -507,16 +507,14 @@ void LaunchCombine(EpDispatchCombineHandle& handle, void* input, void* weights, 
               "Fp8BlockwiseQuant currently requires --zero-copy 0 "
               "(useExternalInpBuffer=true)");
         }
-        if (args.config.scaleDim <= 0) {
-          throw std::runtime_error("Fp8BlockwiseQuant requires scaleDim > 0");
+        const int fp8ScaleDim = args.fp8BlockwiseCombineScaleDim;
+        if (fp8ScaleDim <= 0) {
+          throw std::runtime_error("Fp8BlockwiseQuant requires internal combine scaleDim > 0");
         }
         // Pick the AccumNum=8 + VecBytes=8 specialization when (no weights, hidden_dim % 512 == 0,
         // top-k == 8, EP > 4) and block_elems matches a registered symbol. Keep in sync with the
         // Python launch path in dispatch_combine.py.
-        const int block_elems =
-            (args.config.scaleDim > 0)
-                ? ((args.config.hiddenDim + args.config.scaleDim - 1) / args.config.scaleDim)
-                : 0;
+        const int block_elems = (args.config.hiddenDim + fp8ScaleDim - 1) / fp8ScaleDim;
         const bool baseVec8Top8Eligible = !hasWeights && (args.config.hiddenDim % 512 == 0) &&
                                           args.config.numExpertPerToken == 8 &&
                                           args.config.worldSize > 4;

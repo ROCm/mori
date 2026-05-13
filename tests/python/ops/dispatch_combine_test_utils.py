@@ -371,6 +371,7 @@ class EpDispatchCombineTestCase:
         input_scale=1.0,
         input_shift=0.0,
         force_scale_active=False,
+        combine_scale_dim=None,
     ):
         """Generate test data."""
         if num_token_override is not None:
@@ -466,10 +467,15 @@ class EpDispatchCombineTestCase:
 
         # Pre-compute the device-side block partition so force_scale_active
         # writes a sentinel into the same block layout the kernel uses.
+        # For fp8_blockwise the caller should pass `combine_scale_dim` from
+        # op._fp8_blockwise_combine_scale_dim; otherwise we fall back to the
+        # user-config scale_dim (FP4 / non-blockwise paths).
+        partition_scale_dim = (
+            combine_scale_dim if combine_scale_dim else self.config.scale_dim
+        )
         block_elems = (
-            (self.config.hidden_dim + self.config.scale_dim - 1)
-            // self.config.scale_dim
-            if self.config.scale_dim > 0
+            (self.config.hidden_dim + partition_scale_dim - 1) // partition_scale_dim
+            if partition_scale_dim > 0
             else self.config.hidden_dim
         )
 
