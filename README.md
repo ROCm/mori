@@ -235,6 +235,7 @@ python -c "import mori; print('OK')"
 ```bash
 cd /path/to/mori
 export PYTHONPATH=/path/to/mori:$PYTHONPATH
+python -c "import mori; print(mori.__file__)"
 
 # Test correctness (8 GPUs)
 pytest tests/python/ops/test_dispatch_combine_intranode.py -q
