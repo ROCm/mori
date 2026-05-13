@@ -94,27 +94,31 @@ def _test_all2all(rank, world_size, port, elems, iterations, warmup):
             elems_per_pe * npes, dtype=torch.uint32, device=device
         )
 
-        # Prepare data: PE i sends value (i+1)*1000 + j to PE j
+        # Input is refreshed each iteration with an iter-dependent value so that
+        # stale flags (the flag-reset bug) produce detectably wrong output on call 2+.
+        # Pattern: PE i sends (i+1)*1000 + dest_pe + iter*100000 to PE dest_pe.
         input_data_cpu = np.zeros(elems_per_pe * npes, dtype=np.uint32)
-        for dest_pe in range(npes):
-            value = (my_pe + 1) * 1000 + dest_pe
-            input_data_cpu[dest_pe * elems_per_pe : (dest_pe + 1) * elems_per_pe] = (
-                value
-            )
 
-        # Copy to GPU
-        input_tensor.copy_(torch.from_numpy(input_data_cpu))
+        def refresh_input(iter_idx):
+            for dest_pe in range(npes):
+                value = (my_pe + 1) * 1000 + dest_pe + iter_idx * 100000
+                input_data_cpu[dest_pe * elems_per_pe : (dest_pe + 1) * elems_per_pe] = value
+            input_tensor.copy_(torch.from_numpy(input_data_cpu))
+
+        def verify_output(iter_idx):
+            output_data_cpu = output_tensor.cpu().numpy()
+            ok = True
+            for src_pe in range(npes):
+                chunk = output_data_cpu[src_pe * elems_per_pe : (src_pe + 1) * elems_per_pe]
+                expected = (src_pe + 1) * 1000 + my_pe + iter_idx * 100000
+                if not np.all(chunk == expected):
+                    print(f"PE {rank}: iter {iter_idx} chunk from PE {src_pe} FAILED! "
+                          f"expected={expected} got unique={np.unique(chunk)[:5]}")
+                    ok = False
+            return ok
 
         if rank == 0:
-            print(
-                f"PE {rank}: Prepared input data with pattern: (src_pe+1)*1000 + dest_pe"
-            )
-            print(
-                f"  Sending to PE 0: {input_tensor[0].item()} (expected: {(my_pe+1)*1000 + 0})"
-            )
-            print(
-                f"  Sending to PE 1: {input_tensor[elems_per_pe].item()} (expected: {(my_pe+1)*1000 + 1})"
-            )
+            print(f"PE {rank}: Input refreshed each iteration — pattern: (src+1)*1000 + dest + iter*100000")
 
         # Create CUDA stream for all2all operations (similar to test_allgather.py)
         stream = torch.cuda.Stream(device=device)
@@ -134,6 +138,10 @@ def _test_all2all(rank, world_size, port, elems, iterations, warmup):
             all2all_end = torch.cuda.Event(enable_timing=True)
 
             for iter_idx in range(total_iters):
+                # Refresh input with iter-dependent values to catch stale-flag bug
+                refresh_input(iter_idx)
+                dist.barrier()
+
                 # Record start time
                 all2all_start.record(stream)
 
@@ -150,6 +158,12 @@ def _test_all2all(rank, world_size, port, elems, iterations, warmup):
                     print(
                         f"PE {rank}: All2All operation failed at iteration {iter_idx}"
                     )
+                    break
+
+                # Per-iteration correctness check
+                if not verify_output(iter_idx):
+                    success = False
+                    print(f"PE {rank}: Correctness check failed at iteration {iter_idx}")
                     break
 
                 # Calculate execution time
@@ -252,7 +266,7 @@ def _test_all2all(rank, world_size, port, elems, iterations, warmup):
                 chunk = output_data_cpu[
                     src_pe * elems_per_pe : (src_pe + 1) * elems_per_pe
                 ]
-                expected_value = (src_pe + 1) * 1000 + my_pe
+                expected_value = (src_pe + 1) * 1000 + my_pe + (total_iters - 1) * 100000
 
                 if not np.all(chunk == expected_value):
                     print(f"PE {rank}: Chunk from PE {src_pe} verification FAILED!")
@@ -293,7 +307,7 @@ def _test_all2all(rank, world_size, port, elems, iterations, warmup):
                     transit_buffer_chunk = transit_chunk[
                         src_pe * elems_per_pe : (src_pe + 1) * elems_per_pe
                     ]
-                    expected_value = (src_pe + 1) * 1000 + my_pe
+                    expected_value = (src_pe + 1) * 1000 + my_pe + (total_iters - 1) * 100000
                     if np.all(transit_buffer_chunk == expected_value):
                         if rank == 0:
                             print(
