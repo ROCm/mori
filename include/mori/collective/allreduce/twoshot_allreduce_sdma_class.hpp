@@ -181,7 +181,8 @@ class AllreduceSdma {
   int64_t prepare_reduce_scatter(const T* input, T* output, size_t total_count, hipStream_t stream);
   std::tuple<int, int> get_reduce_scatter_grid(size_t total_count) const;
   int64_t prepare_allgather(size_t total_count, hipStream_t stream);
-  double finish_sync(T* output, size_t total_count, hipStream_t stream);
+  double finish_sync(T* output, size_t total_count, hipStream_t stream,
+                     bool force_copy_output_to_user = false);
 
   int64_t prepare_async_reduce_scatter(const T* input, T* output, size_t total_count,
                                        hipStream_t stream);

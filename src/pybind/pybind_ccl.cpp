@@ -70,11 +70,14 @@ void BindAllreduceHandle(py::module_& m, const char* python_name) {
           py::arg("count"), py::arg("stream"))
       .def(
           "finish_sync",
-          [](Handle& self, uintptr_t output, size_t count, int64_t stream) -> double {
+          [](Handle& self, uintptr_t output, size_t count, int64_t stream,
+             bool force_copy_output_to_user) -> double {
             return self.finish_sync(reinterpret_cast<T*>(output), count,
-                                    reinterpret_cast<hipStream_t>(stream));
+                                    reinterpret_cast<hipStream_t>(stream),
+                                    force_copy_output_to_user);
           },
-          py::arg("output_ptr"), py::arg("count"), py::arg("stream"))
+          py::arg("output_ptr"), py::arg("count"), py::arg("stream"),
+          py::arg("force_copy_output_to_user") = false)
       // JIT async path
       .def(
           "prepare_async_reduce_scatter",

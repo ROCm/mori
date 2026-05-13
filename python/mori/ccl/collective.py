@@ -373,7 +373,14 @@ class AllreduceSdma:
                 my_pe, npes, 512 * 1024 * 1024, copy_output_to_user
             )
 
-    def __call__(self, input_data, output_data, count: int, stream=None) -> bool:
+    def _run_sync(
+        self,
+        input_data,
+        output_data,
+        count: int,
+        stream=None,
+        force_copy_output: bool = False,
+    ) -> bool:
         s = _stream_to_int(stream)
         sfx = self._type_suffix
         # Step 1: ReduceScatter
@@ -390,11 +397,14 @@ class AllreduceSdma:
             (1,), (512,), 0, s, args
         )
         # Sync + copy output
-        self._handle.finish_sync(output_data.data_ptr(), count, s)
+        self._handle.finish_sync(output_data.data_ptr(), count, s, force_copy_output)
         return True
 
+    def __call__(self, input_data, output_data, count: int, stream=None) -> bool:
+        return self._run_sync(input_data, output_data, count, stream)
+
     def allreduce_inplace(self, data, count: int, stream=None) -> bool:
-        return self(data, data, count, stream)
+        return self._run_sync(data, data, count, stream, force_copy_output=True)
 
     def start_async(self, input_data, output_data, count: int, stream=None) -> bool:
         s = _stream_to_int(stream)
