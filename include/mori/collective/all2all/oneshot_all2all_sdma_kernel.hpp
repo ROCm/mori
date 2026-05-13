@@ -31,7 +31,7 @@
 namespace mori {
 namespace collective {
 template <typename T>
-__global__ void OneShotAll2allSdmaKernel(
+__device__ void OneShotAll2allSdmaKernel_body(
     int myPe, int npes, T* input,
     const application::SymmMemObjPtr inputTransitMemObj,   // Changed to input transit buffer
     const application::SymmMemObjPtr outputTransitMemObj,  // Output transit buffer
@@ -136,6 +136,16 @@ __global__ void OneShotAll2allSdmaKernel(
         }
     }
 #endif
+}
+
+template <typename T>
+__global__ void OneShotAll2allSdmaKernel(int myPe, int npes, T* input,
+                                         const application::SymmMemObjPtr inputTransitMemObj,
+                                         const application::SymmMemObjPtr outputTransitMemObj,
+                                         const application::SymmMemObjPtr flagsMemObj,
+                                         size_t elementCount) {
+  OneShotAll2allSdmaKernel_body<T>(myPe, npes, input, inputTransitMemObj, outputTransitMemObj,
+                                   flagsMemObj, elementCount);
 }
 
 }  // namespace collective

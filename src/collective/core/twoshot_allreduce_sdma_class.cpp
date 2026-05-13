@@ -30,8 +30,6 @@
 #include <cstring>
 #include <stdexcept>
 
-#include "mori/collective/allreduce/twoshot_sdma_async_kernel.hpp"
-#include "mori/collective/allreduce/twoshot_sdma_kernel.hpp"
 #include "mori/shmem/shmem.hpp"
 
 namespace mori {
@@ -215,156 +213,28 @@ void AllreduceSdma<T>::copy_output_to_user(T* output, size_t total_count, hipStr
 // ---------------------------------------------------------------------------
 template <typename T>
 bool AllreduceSdma<T>::operator()(T* input, T* output, size_t total_count, hipStream_t stream) {
-  try {
-    // Step 1: SdmaReduceScatter — SDMA scatter + local reduce
-    constexpr int pack_size = packed_t<T>::P::size;
-    int threads = 512;
-    int packedPerRank = static_cast<int>(((total_count / npes_ + pack_size - 1) / pack_size));
-    int blocks = std::min(max_blocks_, (packedPerRank + threads - 1) / threads);
-    if (blocks < 1) blocks = 1;
-
-    SdmaReduceScatterKernel<T><<<blocks, threads, 0, stream>>>(
-        myPe_, npes_, input, output_transit_buffer_obj_, flagsObj_, barrierPtr_, total_count);
-
-    hipError_t err = hipGetLastError();
-    if (err != hipSuccess) {
-      fprintf(stderr, "PE %d: SdmaReduceScatter launch failed: %s\n", myPe_,
-              hipGetErrorString(err));
-      return false;
-    }
-
-    // Step 2: AllGather via SDMA
-    AllGatherSdmaKernel<T><<<1, 512, 0, stream>>>(myPe_, npes_, output_transit_buffer_obj_,
-                                                  flagsObj_, barrierPtr_, total_count);
-
-    err = hipGetLastError();
-    if (err != hipSuccess) {
-      fprintf(stderr, "PE %d: AllGather launch failed: %s\n", myPe_, hipGetErrorString(err));
-      return false;
-    }
-
-    // Step 3: Copy result to user buffer
-    if (copy_output_to_user_) {
-      copy_output_to_user(output, total_count, stream);
-    }
-
-  } catch (const std::exception& e) {
-    fprintf(stderr, "PE %d: AllReduce failed: %s\n", myPe_, e.what());
-    return false;
-  }
-  return true;
+  (void)input;
+  (void)output;
+  (void)total_count;
+  (void)stream;
+  throw std::runtime_error("AllreduceSdma::operator() removed — use Python JIT launch path");
 }
 
 // ================ Async API Implementations ================
 
 template <typename T>
 bool AllreduceSdma<T>::start_async(T* input, T* output, size_t total_count, hipStream_t stream) {
-  bool expected = false;
-  if (!async_in_progress_.compare_exchange_strong(expected, true)) {
-    printf("PE %d: Another async operation is already in progress\n", myPe_);
-    return false;
-  }
-
-  async_input_ = input;
-  async_output_ = output;
-  async_total_count_ = total_count;
-  async_stream_ = stream;
-  async_start_time_ = CollectiveWallTime();
-
-  try {
-    size_t elementCountPerRank = total_count / npes_;
-    size_t required_output_size = elementCountPerRank * npes_ * dtype_size_;
-    if (!ensure_buffer_size(output_transit_buffer_, output_transit_buffer_ptr_,
-                            output_transit_buffer_size_, output_transit_buffer_obj_,
-                            required_output_size, "output transit buffer")) {
-      async_in_progress_ = false;
-      return false;
-    }
-
-    // Step 1: SdmaReduceScatter — same as operator()
-    constexpr int pack_size = packed_t<T>::P::size;
-    int threads = 512;
-    int packedPerRank = static_cast<int>(((total_count / npes_ + pack_size - 1) / pack_size));
-    int blocks = std::min(max_blocks_, (packedPerRank + threads - 1) / threads);
-    if (blocks < 1) blocks = 1;
-
-    SdmaReduceScatterKernel<T><<<blocks, threads, 0, stream>>>(
-        myPe_, npes_, input, output_transit_buffer_obj_, flagsObj_, barrierPtr_, total_count);
-
-    // Step 2: AllGather PUT only — sends data, returns immediately
-    // The wait is deferred to wait_async so the user can run GEMM on CU
-    AllGatherAsyncPutKernel<T><<<1, 512, 0, stream>>>(myPe_, npes_, output_transit_buffer_obj_,
-                                                      flagsObj_, barrierPtr_, total_count);
-
-    hipError_t kernel_err = hipGetLastError();
-    if (kernel_err != hipSuccess) {
-      fprintf(stderr, "PE %d: Async kernel launch failed: %s\n", myPe_,
-              hipGetErrorString(kernel_err));
-      throw std::runtime_error("Kernel launch failed");
-    }
-
-    return true;
-
-  } catch (const std::exception& e) {
-    fprintf(stderr, "PE %d: Failed to start async operation: %s\n", myPe_, e.what());
-    async_in_progress_ = false;
-    return false;
-  }
+  (void)input;
+  (void)output;
+  (void)total_count;
+  (void)stream;
+  throw std::runtime_error("AllreduceSdma::start_async removed — use Python JIT launch path");
 }
 
 template <typename T>
 double AllreduceSdma<T>::wait_async(hipStream_t stream) {
-  if (!async_in_progress_) {
-    printf("PE %d: No async operation in progress\n", myPe_);
-    return -1.0;
-  }
-
-  try {
-    hipStream_t wait_stream = (stream != nullptr) ? stream : async_stream_;
-
-    // Wait for AllGather SDMA transfers to complete + invalidate L2
-    AllGatherAsyncWaitKernel<<<1, 64, 0, wait_stream>>>(myPe_, npes_, flagsObj_, barrierPtr_,
-                                                        async_total_count_);
-
-    // Copy result to user buffer (if enabled)
-    if (copy_output_to_user_) {
-      copy_output_to_user(async_output_, async_total_count_, wait_stream);
-    }
-
-    // Single synchronization at the end
-    if (wait_stream != nullptr) {
-      hipError_t err = hipStreamSynchronize(wait_stream);
-      if (err != hipSuccess) {
-        fprintf(stderr, "PE %d: Stream synchronization failed: %s\n", myPe_,
-                hipGetErrorString(err));
-        throw std::runtime_error("Stream synchronization failed");
-      }
-    } else {
-      hipError_t err = hipDeviceSynchronize();
-      if (err != hipSuccess) {
-        fprintf(stderr, "PE %d: Device synchronization failed: %s\n", myPe_,
-                hipGetErrorString(err));
-        throw std::runtime_error("Device synchronization failed");
-      }
-    }
-
-    double end_time = CollectiveWallTime();
-    double duration = end_time - async_start_time_;
-
-    async_in_progress_ = false;
-    async_input_ = nullptr;
-    async_output_ = nullptr;
-    async_total_count_ = 0;
-    async_stream_ = nullptr;
-    async_start_time_ = 0.0;
-
-    return duration;
-
-  } catch (const std::exception& e) {
-    fprintf(stderr, "PE %d: Async wait failed: %s\n", myPe_, e.what());
-    cancel_async();
-    return -1.0;
-  }
+  (void)stream;
+  throw std::runtime_error("AllreduceSdma::wait_async removed — use Python JIT launch path");
 }
 
 template <typename T>
@@ -382,15 +252,12 @@ void AllreduceSdma<T>::cancel_async() {
 
 // ================ END: Async API Implementations ================
 
-// allreduce_inplace implementation
+// allreduce_inplace — removed; use prepare/finish JIT path
 // ---------------------------------------------------------------------------
 template <typename T>
-bool AllreduceSdma<T>::allreduce_inplace(T* data, size_t total_count, hipStream_t stream) {
-  bool saved = copy_output_to_user_;
-  copy_output_to_user_ = true;
-  bool ok = (*this)(data, data, total_count, stream);
-  copy_output_to_user_ = saved;
-  return ok;
+bool AllreduceSdma<T>::allreduce_inplace(T* /*data*/, size_t /*total_count*/,
+                                         hipStream_t /*stream*/) {
+  throw std::runtime_error("AllreduceSdma::allreduce_inplace removed — use Python JIT launch path");
 }
 
 // ---------------------------------------------------------------------------
@@ -399,6 +266,125 @@ void AllreduceSdma<T>::resetFlags() {
   if (flags_) {
     memset(flags_.get(), 0, npes_ * sizeof(uint64_t));
   }
+}
+
+// ---------------------------------------------------------------------------
+// JIT launch helpers
+// ---------------------------------------------------------------------------
+template <typename T>
+void AllreduceSdma<T>::fill_jit_args_(const T* input, size_t total_count) {
+  jit_args_.myPe = myPe_;
+  jit_args_.npes = npes_;
+  jit_args_.input = input;
+  jit_args_.dstMemObj = output_transit_buffer_obj_;
+  jit_args_.flagsMemObj = flagsObj_;
+  jit_args_.barrier = barrierPtr_;
+  jit_args_.elementCount = total_count;
+}
+
+template <typename T>
+int64_t AllreduceSdma<T>::prepare_reduce_scatter(const T* input, T* output, size_t total_count,
+                                                 hipStream_t stream) {
+  if (async_in_progress_) throw std::runtime_error("Async operation in progress");
+  (void)output;
+  (void)stream;
+  fill_jit_args_(input, total_count);
+  return reinterpret_cast<int64_t>(&jit_args_);
+}
+
+template <typename T>
+std::tuple<int, int> AllreduceSdma<T>::get_reduce_scatter_grid(size_t total_count) const {
+  constexpr size_t pack_size = 16 / sizeof(T);
+  size_t packedPerRank = (total_count / npes_ + pack_size - 1) / pack_size;
+  int threads = 512;
+  int blocks = std::min(max_blocks_, static_cast<int>((packedPerRank + threads - 1) / threads));
+  if (blocks < 1) blocks = 1;
+  return {blocks, threads};
+}
+
+template <typename T>
+int64_t AllreduceSdma<T>::prepare_allgather(size_t total_count, hipStream_t /*stream*/) {
+  jit_args_.input = nullptr;
+  jit_args_.elementCount = total_count;
+  return reinterpret_cast<int64_t>(&jit_args_);
+}
+
+template <typename T>
+double AllreduceSdma<T>::finish_sync(T* output, size_t total_count, hipStream_t stream) {
+  if (copy_output_to_user_) {
+    copy_output_to_user(output, total_count, stream);
+  }
+  return 0.0;
+}
+
+template <typename T>
+int64_t AllreduceSdma<T>::prepare_async_reduce_scatter(const T* input, T* output,
+                                                       size_t total_count, hipStream_t stream) {
+  bool expected = false;
+  if (!async_in_progress_.compare_exchange_strong(expected, true))
+    throw std::runtime_error("Another async operation is already in progress");
+
+  async_input_ = const_cast<T*>(input);
+  async_output_ = output;
+  async_total_count_ = total_count;
+  async_stream_ = stream;
+  async_start_time_ = CollectiveWallTime();
+
+  size_t required = (total_count / npes_) * npes_ * dtype_size_;
+  if (!ensure_buffer_size(output_transit_buffer_, output_transit_buffer_ptr_,
+                          output_transit_buffer_size_, output_transit_buffer_obj_, required,
+                          "output transit buffer")) {
+    async_in_progress_ = false;
+    throw std::runtime_error("Buffer allocation failed");
+  }
+
+  fill_jit_args_(input, total_count);
+  return reinterpret_cast<int64_t>(&jit_args_);
+}
+
+template <typename T>
+int64_t AllreduceSdma<T>::prepare_async_allgather_put(size_t total_count, hipStream_t /*stream*/) {
+  jit_args_.input = nullptr;
+  jit_args_.elementCount = total_count;
+  return reinterpret_cast<int64_t>(&jit_args_);
+}
+
+template <typename T>
+void AllreduceSdma<T>::after_async_start() {
+  hipError_t err = hipGetLastError();
+  if (err != hipSuccess) {
+    async_in_progress_ = false;
+    throw std::runtime_error("Async kernel launch failed");
+  }
+}
+
+template <typename T>
+int64_t AllreduceSdma<T>::prepare_async_wait(hipStream_t stream) {
+  if (!async_in_progress_) throw std::runtime_error("No async operation in progress");
+  (void)stream;
+  jit_args_.input = nullptr;
+  jit_args_.elementCount = async_total_count_;
+  return reinterpret_cast<int64_t>(&jit_args_);
+}
+
+template <typename T>
+double AllreduceSdma<T>::finish_async_wait(hipStream_t stream) {
+  hipStream_t ws = (stream != nullptr) ? stream : async_stream_;
+  hipError_t err = ws ? hipStreamSynchronize(ws) : hipDeviceSynchronize();
+  if (err != hipSuccess) throw std::runtime_error("Synchronization failed");
+
+  if (copy_output_to_user_) {
+    copy_output_to_user(async_output_, async_total_count_, ws);
+  }
+
+  double duration = CollectiveWallTime() - async_start_time_;
+  async_in_progress_ = false;
+  async_input_ = nullptr;
+  async_output_ = nullptr;
+  async_total_count_ = 0;
+  async_stream_ = nullptr;
+  async_start_time_ = 0.0;
+  return duration;
 }
 
 // ---------------------------------------------------------------------------

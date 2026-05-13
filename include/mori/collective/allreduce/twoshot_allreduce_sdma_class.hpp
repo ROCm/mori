@@ -27,8 +27,10 @@
 
 #include <cstdint>
 #include <memory>
+#include <tuple>
 
 #include "mori/application/application.hpp"
+#include "mori/collective/ccl_kernel_args.hpp"
 #include "mori/collective/collective_pub.hpp"
 #include "mori/collective/core/wall_time.hpp"
 #include "mori/shmem/shmem.hpp"
@@ -36,7 +38,17 @@
 namespace mori {
 namespace collective {
 
-struct CrossPeBarrier;
+struct alignas(128) CrossPeBarrier {
+  alignas(128) uint32_t flag;
+};
+
+inline int getDeviceMaxBlocks() {
+  int dev = 0;
+  (void)hipGetDevice(&dev);
+  hipDeviceProp_t prop;
+  (void)hipGetDeviceProperties(&prop, dev);
+  return (prop.multiProcessorCount > 0) ? prop.multiProcessorCount : 80;
+}
 
 template <typename T>
 class AllreduceSdma {
@@ -92,6 +104,7 @@ class AllreduceSdma {
 
   void copy_input_to_transit(T* input, size_t total_count, hipStream_t stream);
   void copy_output_to_user(T* output, size_t total_count, hipStream_t stream);
+  void fill_jit_args_(const T* input, size_t total_count);
 
  public:
   /**
@@ -160,6 +173,26 @@ class AllreduceSdma {
   }
 
   void resetFlags();
+
+  // JIT launch support: Python calls prepare_* to get args pointer,
+  // launches the kernel via HipModule, then calls finish_*.
+  CclAllreduceArgs<T> jit_args_;
+
+  int64_t prepare_reduce_scatter(const T* input, T* output, size_t total_count, hipStream_t stream);
+  std::tuple<int, int> get_reduce_scatter_grid(size_t total_count) const;
+  int64_t prepare_allgather(size_t total_count, hipStream_t stream);
+  double finish_sync(T* output, size_t total_count, hipStream_t stream);
+
+  int64_t prepare_async_reduce_scatter(const T* input, T* output, size_t total_count,
+                                       hipStream_t stream);
+  int64_t prepare_async_allgather_put(size_t total_count, hipStream_t stream);
+  void after_async_start();
+
+  int64_t prepare_async_wait(hipStream_t stream);
+  double finish_async_wait(hipStream_t stream);
+
+  int max_blocks() const { return max_blocks_; }
+  int npes() const { return npes_; }
 };
 
 }  // namespace collective

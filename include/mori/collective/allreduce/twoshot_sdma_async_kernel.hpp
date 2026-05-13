@@ -46,9 +46,9 @@ namespace collective {
 //   slot npes-1: PE (npes-1)'s shard_j
 // ============================================================
 template <typename T>
-__global__ void ReduceScatterSdmaPutKernel(int myPe, int npes, T* input,
-                                           const application::SymmMemObjPtr dstMemObj,
-                                           size_t elementCountPerRank) {
+__device__ void ReduceScatterSdmaPutKernel_body(int myPe, int npes, T* input,
+                                                const application::SymmMemObjPtr dstMemObj,
+                                                size_t elementCountPerRank) {
   const size_t bytesPerElement = sizeof(T);
   const size_t bytesPerPeer = elementCountPerRank * bytesPerElement;
   const int numQueues = dstMemObj->sdmaNumQueue;
@@ -82,6 +82,13 @@ __global__ void ReduceScatterSdmaPutKernel(int myPe, int npes, T* input,
   }
 }
 
+template <typename T>
+__global__ void ReduceScatterSdmaPutKernel(int myPe, int npes, T* input,
+                                           const application::SymmMemObjPtr dstMemObj,
+                                           size_t elementCountPerRank) {
+  ReduceScatterSdmaPutKernel_body<T>(myPe, npes, input, dstMemObj, elementCountPerRank);
+}
+
 // ============================================================
 // AllGather async PUT kernel
 //
@@ -90,10 +97,11 @@ __global__ void ReduceScatterSdmaPutKernel(int myPe, int npes, T* input,
 // Paired with AllGatherAsyncWaitKernel below.
 // ============================================================
 template <typename T>
-__global__ void AllGatherAsyncPutKernel(int myPe, int npes,
-                                        const application::SymmMemObjPtr dstMemObj,
-                                        const application::SymmMemObjPtr flagsMemObj,
-                                        CrossPeBarrier* __restrict__ barrier, size_t elementCount) {
+__device__ void AllGatherAsyncPutKernel_body(int myPe, int npes,
+                                             const application::SymmMemObjPtr dstMemObj,
+                                             const application::SymmMemObjPtr flagsMemObj,
+                                             CrossPeBarrier* __restrict__ barrier,
+                                             size_t elementCount) {
   if (elementCount == 0 || npes <= 0) return;
 
   using P = typename packed_t<T>::P;
@@ -144,6 +152,14 @@ __global__ void AllGatherAsyncPutKernel(int myPe, int npes,
   }
 }
 
+template <typename T>
+__global__ void AllGatherAsyncPutKernel(int myPe, int npes,
+                                        const application::SymmMemObjPtr dstMemObj,
+                                        const application::SymmMemObjPtr flagsMemObj,
+                                        CrossPeBarrier* __restrict__ barrier, size_t elementCount) {
+  AllGatherAsyncPutKernel_body<T>(myPe, npes, dstMemObj, flagsMemObj, barrier, elementCount);
+}
+
 // ============================================================
 // AllGather async WAIT kernel
 //
@@ -151,10 +167,10 @@ __global__ void AllGatherAsyncPutKernel(int myPe, int npes,
 // Uses AMO_SET + generation counter (< flag_val comparison).
 // Paired with AllGatherAsyncPutKernel above.
 // ============================================================
-__global__ void AllGatherAsyncWaitKernel(int myPe, int npes,
-                                         const application::SymmMemObjPtr flagsMemObj,
-                                         CrossPeBarrier* __restrict__ barrier,
-                                         size_t elementCount) {
+__device__ void AllGatherAsyncWaitKernel_body(int myPe, int npes,
+                                              const application::SymmMemObjPtr flagsMemObj,
+                                              CrossPeBarrier* __restrict__ barrier,
+                                              size_t elementCount) {
   uint64_t* __restrict__ flags = reinterpret_cast<uint64_t*>(flagsMemObj->localPtr);
 
   // Read the generation token set by AllGatherAsyncPutKernel
@@ -184,6 +200,13 @@ __global__ void AllGatherAsyncWaitKernel(int myPe, int npes,
   __syncthreads();
 }
 
+__global__ void AllGatherAsyncWaitKernel(int myPe, int npes,
+                                         const application::SymmMemObjPtr flagsMemObj,
+                                         CrossPeBarrier* __restrict__ barrier,
+                                         size_t elementCount) {
+  AllGatherAsyncWaitKernel_body(myPe, npes, flagsMemObj, barrier, elementCount);
+}
+
 // ============================================================
 // Phase 2: Local reduce kernel for reduce-scatter
 //
@@ -204,8 +227,9 @@ __device__ __forceinline__ __half reduce_add(__half a, __half b) {
 #endif
 
 template <typename T>
-__global__ void ReduceScatterLocalReduceKernel(T* gathered, const T* input,
-                                               size_t elementCountPerRank, int myPe, int npes) {
+__device__ void ReduceScatterLocalReduceKernel_body(T* gathered, const T* input,
+                                                    size_t elementCountPerRank, int myPe,
+                                                    int npes) {
   const size_t threadLinearId =
       static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + threadIdx.x;
   const size_t threadsPerGrid = static_cast<size_t>(blockDim.x) * static_cast<size_t>(gridDim.x);
@@ -239,6 +263,12 @@ __global__ void ReduceScatterLocalReduceKernel(T* gathered, const T* input,
 #endif
 }
 
+template <typename T>
+__global__ void ReduceScatterLocalReduceKernel(T* gathered, const T* input,
+                                               size_t elementCountPerRank, int myPe, int npes) {
+  ReduceScatterLocalReduceKernel_body<T>(gathered, input, elementCountPerRank, myPe, npes);
+}
+
 // ============================================================
 // Phase 1+2 (P2P variant): ReduceScatter via P2P memory reads
 //
@@ -250,10 +280,10 @@ __global__ void ReduceScatterLocalReduceKernel(T* gathered, const T* input,
 // Result: reduced shard written to dstMemObj->localPtr at slot myPe
 // ============================================================
 template <typename T>
-__global__ void ReduceScatterP2pKernel(int myPe, int npes,
-                                       const application::SymmMemObjPtr srcMemObj,
-                                       const application::SymmMemObjPtr dstMemObj,
-                                       size_t elementCount) {
+__device__ void ReduceScatterP2pKernel_body(int myPe, int npes,
+                                            const application::SymmMemObjPtr srcMemObj,
+                                            const application::SymmMemObjPtr dstMemObj,
+                                            size_t elementCount) {
   if (elementCount == 0 || npes <= 0) {
     return;
   }
@@ -299,6 +329,14 @@ __global__ void ReduceScatterP2pKernel(int myPe, int npes,
 #endif
 }
 
+template <typename T>
+__global__ void ReduceScatterP2pKernel(int myPe, int npes,
+                                       const application::SymmMemObjPtr srcMemObj,
+                                       const application::SymmMemObjPtr dstMemObj,
+                                       size_t elementCount) {
+  ReduceScatterP2pKernel_body<T>(myPe, npes, srcMemObj, dstMemObj, elementCount);
+}
+
 // ============================================================
 // Phase 3: AllGather SDMA PUT kernel for reduced shards
 //
@@ -307,9 +345,9 @@ __global__ void ReduceScatterP2pKernel(int myPe, int npes,
 // Uses multi-queue SDMA for bandwidth.
 // ============================================================
 template <typename T>
-__global__ void AllGatherReducedSdmaPutKernel(int myPe, int npes,
-                                              const application::SymmMemObjPtr dstMemObj,
-                                              size_t elementCountPerRank) {
+__device__ void AllGatherReducedSdmaPutKernel_body(int myPe, int npes,
+                                                   const application::SymmMemObjPtr dstMemObj,
+                                                   size_t elementCountPerRank) {
   const size_t bytesPerElement = sizeof(T);
   const size_t bytesPerPeer = elementCountPerRank * bytesPerElement;
   const int numQueues = dstMemObj->sdmaNumQueue;
@@ -342,6 +380,13 @@ __global__ void AllGatherReducedSdmaPutKernel(int myPe, int npes,
   }
 }
 
+template <typename T>
+__global__ void AllGatherReducedSdmaPutKernel(int myPe, int npes,
+                                              const application::SymmMemObjPtr dstMemObj,
+                                              size_t elementCountPerRank) {
+  AllGatherReducedSdmaPutKernel_body<T>(myPe, npes, dstMemObj, elementCountPerRank);
+}
+
 // ============================================================
 // Fused kernel: ReduceScatter + AllGather PUT in one launch.
 //
@@ -353,11 +398,12 @@ __global__ void AllGatherReducedSdmaPutKernel(int myPe, int npes,
 // Requirement: gridDim.x <= multiProcessorCount (co-resident blocks).
 // ============================================================
 template <typename T>
-__global__ void ReduceScatterAllGatherFusedKernel(int myPe, int npes, const T* __restrict__ input,
-                                                  const application::SymmMemObjPtr dstMemObj,
-                                                  const application::SymmMemObjPtr flagsMemObj,
-                                                  CrossPeBarrier* __restrict__ barrier,
-                                                  size_t elementCount) {
+__device__ void ReduceScatterAllGatherFusedKernel_body(int myPe, int npes,
+                                                       const T* __restrict__ input,
+                                                       const application::SymmMemObjPtr dstMemObj,
+                                                       const application::SymmMemObjPtr flagsMemObj,
+                                                       CrossPeBarrier* __restrict__ barrier,
+                                                       size_t elementCount) {
   if (elementCount == 0 || npes <= 0) return;
 
   using P = typename packed_t<T>::P;
@@ -482,6 +528,16 @@ __global__ void ReduceScatterAllGatherFusedKernel(int myPe, int npes, const T* _
     asm volatile("buffer_wbl2" ::: "memory");
   }
 #endif
+}
+
+template <typename T>
+__global__ void ReduceScatterAllGatherFusedKernel(int myPe, int npes, const T* __restrict__ input,
+                                                  const application::SymmMemObjPtr dstMemObj,
+                                                  const application::SymmMemObjPtr flagsMemObj,
+                                                  CrossPeBarrier* __restrict__ barrier,
+                                                  size_t elementCount) {
+  ReduceScatterAllGatherFusedKernel_body<T>(myPe, npes, input, dstMemObj, flagsMemObj, barrier,
+                                            elementCount);
 }
 
 }  // namespace collective
