@@ -21,6 +21,16 @@
 // SOFTWARE.
 #include "src/ops/dispatch_combine/low_latency_async.hpp"
 
+// Set to 1 to enable async-ll kernel debug prints, 0 to disable
+#define ASYNC_LL_DEBUG 0
+#if ASYNC_LL_DEBUG
+#define LL_PRINTF(...) printf(__VA_ARGS__)
+#else
+#define LL_PRINTF(...) \
+  do {                 \
+  } while (0)
+#endif
+
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_fp8.h>
 #include <hip/hip_runtime.h>
@@ -78,6 +88,7 @@ __device__ void EpDispatchLowLatencyAsyncSendCopy_body(EpDispatchCombineArgs<T> 
 
     if (laneId == 0) {
       // decide token id in dest pe
+      // 抢到目的PE的第几个位置
       destTokId = atomicAdd(args.destPeTokenCounter + destPe, 1);
       args.dispDestTokIdMap[i] = SendBufSlotOffset(config, destPe, destTokId);
     }
@@ -118,15 +129,22 @@ __device__ void EpDispatchLowLatencyAsyncSendCopy_body(EpDispatchCombineArgs<T> 
 // experts' destPe for dedup — no extra memory loads needed.
 template <typename T>
 __device__ void EpDispatchLowLatencyAsyncSendCopySlotAssign_body(EpDispatchCombineArgs<T> args) {
-  DEF_COMMON_VARS;
+  DEF_COMMON_VARS;  // calculate常用的变量
   IF_ENABLE_PROFILER(
       LOW_LATENCY_ASYNC_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
   MORI_TRACE_SPAN(profiler, Slot::DispatchAsyncSlotAssign);
-  int numEpt = config.numExpertPerToken;
-  int tokensPerWarp = warpSize / numEpt;
-  int expertIdx = laneId % numEpt;
-  int inWarpTokIdx = laneId / numEpt;
-  int baseLane = inWarpTokIdx * numEpt;
+  int numEpt = config.numExpertPerToken;  // 2，每个token发往多少expert处理
+  int tokensPerWarp = warpSize / numEpt;  // 每个warp能同时处理多少个token
+  int expertIdx = laneId % numEpt;        // 负责token的哪个expert
+  int inWarpTokIdx = laneId / numEpt;     // 负责warp里的第几个token
+  int baseLane = inWarpTokIdx * numEpt;   // 同一个token组的第一个lane标号
+
+  //  args.curRankNumToken 每个GPU管多少token
+  // globalWarpId = blockIdx.x * warpNum + warpId
+
+  // global warp 0 处理token 0-31, numExpert = 2
+  // global warp 1 处理token 32-63
+  // global warp 2 处理token 64-95
 
   for (int warpTokBase = globalWarpId * tokensPerWarp; warpTokBase < args.curRankNumToken;
        warpTokBase += globalWarpNum * tokensPerWarp) {
@@ -134,7 +152,7 @@ __device__ void EpDispatchLowLatencyAsyncSendCopySlotAssign_body(EpDispatchCombi
     if (tokenId >= args.curRankNumToken) continue;
 
     int i = tokenId * numEpt + expertIdx;
-    index_t destExpert = args.tokenIndices[i];
+    index_t destExpert = args.tokenIndices[i];  // flattened layout
     index_t destPe = destExpert / config.numExpertPerRank;
 
     // Deduplicate via shuffle: read previous experts' destPe from registers.
@@ -149,12 +167,28 @@ __device__ void EpDispatchLowLatencyAsyncSendCopySlotAssign_body(EpDispatchCombi
 
     if (isDuplicate) {
       args.dispDestTokIdMap[i] = NullSendBufSlotOffset(config);
+      LL_PRINTF(
+          "[SlotAssign] rank=%d warp=%-4d lane=%-2d entry=%-2d tok=%-2d expertIdx=%d "
+          "destExpert=%d destPe=%d → DUPLICATE slot=%d(null)\n",
+          config.rank, globalWarpId, laneId, i, tokenId, expertIdx, destExpert, destPe,
+          NullSendBufSlotOffset(config));
     } else {
       index_t destTokId = atomicAdd(args.destPeTokenCounter + destPe, 1);
       args.dispDestTokIdMap[i] = SendBufSlotOffset(config, destPe, destTokId);
+      LL_PRINTF(
+          "[SlotAssign] rank=%d warp=%-4d lane=%-2d entry=%-2d tok=%-2d expertIdx=%d "
+          "destExpert=%d destPe=%d → slot=%d (destTokId=%d)\n",
+          config.rank, globalWarpId, laneId, i, tokenId, expertIdx, destExpert, destPe,
+          SendBufSlotOffset(config, destPe, destTokId), destTokId);
     }
   }
-  if (globalThdId == 0) args.totalRecvTokenNum[0] = 0;
+  if (globalThdId == 0) {
+    args.totalRecvTokenNum[0] = 0;
+    int totalEntries = args.curRankNumToken * config.numExpertPerToken;
+    LL_PRINTF("[dispDestTokIdMap] rank=%d len=%d: ", config.rank, totalEntries);
+    for (int i = 0; i < totalEntries; ++i) LL_PRINTF("entry%d=%d ", i, args.dispDestTokIdMap[i]);
+    LL_PRINTF("\n");
+  }
 }
 
 // Phase 2: Data copy using pre-computed slot assignments from dispDestTokIdMap.
@@ -165,14 +199,15 @@ __device__ void EpDispatchLowLatencyAsyncSendCopyMultiBlock_body(EpDispatchCombi
   IF_ENABLE_PROFILER(
       LOW_LATENCY_ASYNC_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
   MORI_TRACE_SPAN(profiler, Slot::DispatchAsyncSendCopyMultiBlock);
-  index_t totalEntries = args.curRankNumToken * config.numExpertPerToken;
-  index_t warpsPerToken = (globalWarpNum + totalEntries - 1) / totalEntries;
-  index_t hiddenBytesPerWarp =
-      ((hiddenBytes + warpsPerToken - 1) / warpsPerToken + 15) & ~(size_t)15;
+  index_t totalEntries = args.curRankNumToken * config.numExpertPerToken;  // 需要处理的entry数
+  index_t warpsPerToken =
+      (globalWarpNum + totalEntries - 1) / totalEntries;  // 多少warp搬运一个entry
+  index_t hiddenBytesPerWarp = ((hiddenBytes + warpsPerToken - 1) / warpsPerToken + 15) &
+                               ~(size_t)15;  // 每个warp搬运多少byte?
 
   for (int i = globalWarpId; i < totalEntries * warpsPerToken; i += globalWarpNum) {
     index_t entryId = i / warpsPerToken;
-    index_t inTokenPartId = i % warpsPerToken;
+    index_t inTokenPartId = i % warpsPerToken;  // 该Warp负责该token的第几段
 
     index_t destTokOffset = args.dispDestTokIdMap[entryId];
 
@@ -188,6 +223,12 @@ __device__ void EpDispatchLowLatencyAsyncSendCopyMultiBlock_body(EpDispatchCombi
     size_t hiddenOffset = inTokenPartId * hiddenBytesPerWarp;
     if (hiddenOffset < hiddenBytes) {
       size_t len = min(hiddenBytesPerWarp, hiddenBytes - hiddenOffset);
+      if (laneId == 0)
+        LL_PRINTF(
+            "[CopyMB] rank=%d warp=%-4d lane=0  tok=%-2d entry=%-2d partId=%-2d "
+            "hidden: src_off=%zu dst_off=%zu len=%zu\n",
+            config.rank, globalWarpId, srcTokId, entryId, (int)inTokenPartId,
+            srcTokId * hiddenBytes + hiddenOffset, (size_t)(dst + hiddenOffset - stagingPtr), len);
       core::WarpCopy<uint8_t, 1>(
           dst + hiddenOffset,
           reinterpret_cast<uint8_t*>(args.inpTokenBuf) + srcTokId * hiddenBytes + hiddenOffset,
@@ -195,7 +236,7 @@ __device__ void EpDispatchLowLatencyAsyncSendCopyMultiBlock_body(EpDispatchCombi
     }
 
     // First sub-warp handles metadata copies
-    if (inTokenPartId == 0) {
+    if (inTokenPartId == 0) {  // 拷贝自己的weight bytes和index bytes
       core::WarpCopy<uint8_t, 1>(
           dst + hiddenBytes, reinterpret_cast<uint8_t*>(args.tokenIndices) + srcTokId * indexBytes,
           indexBytes);
@@ -206,10 +247,9 @@ __device__ void EpDispatchLowLatencyAsyncSendCopyMultiBlock_body(EpDispatchCombi
         core::WarpCopy<uint8_t, 1>(
             dst + hiddenBytes + indexBytes + weightBytes,
             reinterpret_cast<uint8_t*>(args.scalesBuf) + srcTokId * scaleBytes, scaleBytes);
-      if (laneId == 0) {
+      if (laneId == 0) {  // global encodeed token index
         reinterpret_cast<index_t*>(dst + hiddenBytes + indexBytes + weightBytes + scaleBytes)[0] =
             FlatTokenIndex(config, myPe, srcTokId);
-        // srcTokId + config.rank * config.maxNumInpTokenPerRank;
       }
     }
   }
@@ -232,6 +272,14 @@ __device__ void EpDispatchLowLatencyAsyncSendTransfer_body(EpDispatchCombineArgs
       int thisChunkTokenNum = std::min(tokenChunkNum, tokenNum - qpId * tokenChunkNum);
       size_t remoteOffset = SendBufSlotOffset(config, myPe, tokenChunkNum * qpId) * xferBytes;
       size_t localOffset = SendBufSlotOffset(config, destPe, tokenChunkNum * qpId) * xferBytes;
+      if (laneId == 0)
+        LL_PRINTF(
+            "[SendTransfer] rank=%d block=%d warp=%d destPe=%d qpId=%d "
+            "tokenNum=%d tokenChunkNum=%d thisChunk=%d "
+            "local_off=%zu remote_off=%zu bytes=%zu %s\n",
+            config.rank, blockId, warpId, destPe, qpId, tokenNum, tokenChunkNum, thisChunkTokenNum,
+            localOffset, remoteOffset, thisChunkTokenNum * xferBytes,
+            destPe == myPe ? "SKIP(self)" : (thisChunkTokenNum > 0 ? "RDMA→" : "SKIP(0tok)"));
       if ((destPe != myPe) && (laneId == 0) && (thisChunkTokenNum > 0)) {
         shmem::ShmemPutMemNbiThread(args.interNodeTokBufs.dispatchInp, remoteOffset,
                                     args.interNodeTokBufs.staging, localOffset,
@@ -297,8 +345,8 @@ __device__ void EpDispatchLowLatencyAsyncRecvCopyMultiBlock_body(EpDispatchCombi
       LOW_LATENCY_ASYNC_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
   MORI_TRACE_SPAN(profiler, Slot::DispatchAsyncRecvCopy);
 
-  int blocksPerPe = blockNum / npes;
-  int destPe = blockId / blocksPerPe;
+  int blocksPerPe = blockNum / npes;   // 每个PE有多少Block，拆分block来处理来自不同的PE的数据
+  int destPe = blockId / blocksPerPe;  // 当前thread处与哪个Block，处理哪个DestPE的数据
 
   uint64_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<uint64_t*>();
 
@@ -312,7 +360,7 @@ __device__ void EpDispatchLowLatencyAsyncRecvCopyMultiBlock_body(EpDispatchCombi
     uint64_t n = __shfl_up(inclusive, offset);
     if (laneId >= offset) inclusive += n;
   }
-  uint64_t peExclusive = __shfl_up(inclusive, 1);
+  uint64_t peExclusive = __shfl_up(inclusive, 1);  // 每个warp都在算这些prefixsum
   if (laneId == 0) peExclusive = 0;
 
   uint64_t peOffset = __shfl(peExclusive, destPe);
@@ -330,14 +378,14 @@ __device__ void EpDispatchLowLatencyAsyncRecvCopyMultiBlock_body(EpDispatchCombi
                             : args.interNodeTokBufs.staging->template GetAs<uint8_t*>();
   stagingPtr += SendBufSlotOffset(config, destPe, 0) * xferBytes;
 
-  int peWarps = blocksPerPe * warpNum;
-  int localWarpId = (blockId % blocksPerPe) * warpNum + warpId;
+  int peWarps = blocksPerPe * warpNum;                           // 一个PE有多少warp
+  int localWarpId = (blockId % blocksPerPe) * warpNum + warpId;  // 整个PE的WarpId
   index_t warpsPerToken = (recvTokenNum > 0) ? (peWarps + recvTokenNum - 1) / recvTokenNum : 1;
   size_t hiddenBytesPerWarp =
       ((hiddenBytes + warpsPerToken - 1) / warpsPerToken + 15) & ~(size_t)15;
 
   for (int i = localWarpId; i < recvTokenNum * warpsPerToken; i += peWarps) {
-    index_t tokenId = i / warpsPerToken;
+    index_t tokenId = i / warpsPerToken;  // i means local warp id, local is the single GPU level
     index_t inTokenPartId = i % warpsPerToken;
     index_t destTokId = peOffset + tokenId;
 
@@ -348,6 +396,15 @@ __device__ void EpDispatchLowLatencyAsyncRecvCopyMultiBlock_body(EpDispatchCombi
       core::WarpCopy<uint8_t, 1>(args.interNodeTokBufs.dispatchOut->template GetAs<uint8_t*>() +
                                      destTokId * hiddenBytes + hiddenOffset,
                                  stagingPtr + tokenId * xferBytes + hiddenOffset, len);
+      if (config.rank == 1 && laneId < 4 && localWarpId == tokenId * warpsPerToken)
+        LL_PRINTF(
+            "[RecvCopy:hidden] rank=1 warp=%-4d lane=%-2d destPe=%d tok=%d destTokId=%llu "
+            "src_off=%zu dst_off=%zu len=%zu\n",
+            localWarpId, laneId, destPe, (int)tokenId, (unsigned long long)destTokId,
+            (size_t)(stagingPtr + tokenId * xferBytes + hiddenOffset -
+                     (destPe != myPe ? args.interNodeTokBufs.dispatchInp->template GetAs<uint8_t*>()
+                                     : args.interNodeTokBufs.staging->template GetAs<uint8_t*>())),
+            destTokId * hiddenBytes + hiddenOffset, len);
     }
 
     // First sub-warp handles metadata and validation
@@ -374,10 +431,22 @@ __device__ void EpDispatchLowLatencyAsyncRecvCopyMultiBlock_body(EpDispatchCombi
       if (laneId == 0) {
         // A map used to recover token ordering at combine send phase
         args.dispReceiverIdxMap[destTokId] = SendBufSlotOffset(config, destPe, tokenId);
-        // A map used for unit test correctness check
-        args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>()[destTokId] =
+        index_t srcTokId =
             reinterpret_cast<index_t*>(stagingPtr + tokenId * xferBytes + hiddenBytes + indexBytes +
                                        weightBytes + scaleBytes)[0];
+        // A map used for unit test correctness check
+        args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>()[destTokId] = srcTokId;
+        if (config.rank == 1 && localWarpId == tokenId * warpsPerToken) {
+          index_t* indices =
+              reinterpret_cast<index_t*>(stagingPtr + tokenId * xferBytes + hiddenBytes);
+          float* weights =
+              reinterpret_cast<float*>(stagingPtr + tokenId * xferBytes + hiddenBytes + indexBytes);
+          LL_PRINTF(
+              "[RecvCopy:meta] rank=1 destPe=%d tok=%d destTokId=%llu "
+              "indices=[%d,%d] weights=[%.2f,%.2f] srcTokId=%d dispReceiverIdxMap=%d\n",
+              destPe, (int)tokenId, (unsigned long long)destTokId, indices[0], indices[1],
+              weights[0], weights[1], srcTokId, SendBufSlotOffset(config, destPe, tokenId));
+        }
       }
     }
   }
@@ -385,6 +454,8 @@ __device__ void EpDispatchLowLatencyAsyncRecvCopyMultiBlock_body(EpDispatchCombi
   if (globalWarpId == 0) {
     if (laneId == 0) {
       args.totalRecvTokenNum[0] = totalTokens;
+      LL_PRINTF("[RecvCopy] rank=%d DONE totalRecvTokenNum=%llu\n", config.rank,
+                (unsigned long long)totalTokens);
     }
     if (laneId < npes) {
       args.destPeTokenCounter[laneId] = 0;
@@ -414,10 +485,20 @@ __device__ void EpCombineLowLatencyAsyncSendCopy_body(EpDispatchCombineArgs<T> a
   // Copy token onto staging buffer for later IBGDA transfer
   index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
   uint8_t* stagingPtr = args.interNodeTokBufs.staging->template GetAs<uint8_t*>();
+  if (globalWarpId == 0 && laneId == 0)
+    LL_PRINTF("[C1:SendCopy] rank=%d totalRecvTokenNum=%d inpTokenBuf=%p stagingPtr=%p\n",
+              config.rank, (int)totalRecvTokenNum, (void*)args.inpTokenBuf, (void*)stagingPtr);
   for (int tokenId = globalWarpId; tokenId < totalRecvTokenNum; tokenId += globalWarpNum) {
     index_t stagingTokId = 0;
     if (laneId == 0) stagingTokId = args.dispReceiverIdxMap[tokenId];
     stagingTokId = __shfl(stagingTokId, 0);
+    if (globalWarpId == tokenId && laneId == 0) {
+      float val = __bfloat162float(
+          reinterpret_cast<__hip_bfloat16*>(args.inpTokenBuf)[tokenId * hiddenDim]);
+      LL_PRINTF("[C1:SendCopy] rank=%d tok=%d stagingSlot=%d inp[0]=%.1f dst_off=%zu\n",
+                config.rank, tokenId, (int)stagingTokId, val,
+                (size_t)stagingTokId * tokHiddenBytes);
+    }
     if constexpr (UseFp8DirectCast) {
       core::WarpCastBf16ToCombineInternalFp8<T>(
           reinterpret_cast<TokT*>(stagingPtr + stagingTokId * tokHiddenBytes),
@@ -531,6 +612,12 @@ __device__ void EpCombineLowLatencyAsyncRecvCopy_body(EpDispatchCombineArgs<T> a
   extern __shared__ char sharedMem[];
   TokT** srcPtrs = reinterpret_cast<TokT**>(sharedMem) + warpId * config.numExpertPerToken;
 
+  if (globalWarpId == 0 && laneId == 0)
+    LL_PRINTF("[C4:RecvCopy] rank=%d curRankNumToken=%d combineOut=%p combineInp=%p staging=%p\n",
+              config.rank, (int)args.curRankNumToken,
+              (void*)args.interNodeTokBufs.combineOut->template GetAs<void*>(),
+              (void*)args.interNodeTokBufs.combineInp->template GetAs<void*>(),
+              (void*)args.interNodeTokBufs.staging->template GetAs<void*>());
   if (args.curRankNumToken != 0) {
     MultiWarpIter mwIter(globalWarpNum, args.curRankNumToken, hiddenDim);
 
@@ -556,6 +643,9 @@ __device__ void EpCombineLowLatencyAsyncRecvCopy_body(EpDispatchCombineArgs<T> a
 
       T* outPtr = args.interNodeTokBufs.combineOut->template GetAs<T*>() + tokenId * hiddenDim +
                   hiddenDimOffset;
+      if (globalWarpId == 0 && laneId == 0 && inTokenPartId == 0)
+        LL_PRINTF("[C4:RecvCopy] rank=%d tok=%d srcPtrs[0]=%p srcPtrs[1]=%p outPtr=%p\n",
+                  config.rank, tokenId, (void*)srcPtrs[0], (void*)srcPtrs[1], (void*)outPtr);
       if constexpr (UseFp8DirectCast) {
         core::WarpAccumCombineInternalFp8ToBf16(outPtr,
                                                 reinterpret_cast<const TokT* const*>(srcPtrs),

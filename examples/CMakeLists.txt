@@ -140,3 +140,8 @@ add_shmem_example(ibverbs_test SOURCES application/ibverbs_test.cpp)
 
 add_executable(test_vmm_mpi_write utils/test_vmm_mpi_write.cpp)
 target_link_libraries(test_vmm_mpi_write mori_application hip::host hip::device)
+
+# --- AsyncLL dispatch example ---
+add_executable(async_ll_dispatch_example async_ll_dispatch_example.cpp)
+target_link_libraries(async_ll_dispatch_example mori_ops mori_application MPI::MPI_CXX hip::host hip::device)
+target_include_directories(async_ll_dispatch_example PRIVATE ${CMAKE_SOURCE_DIR}/include)

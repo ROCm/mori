@@ -192,6 +192,9 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
     // pre-assertion to prevent silent memory access fault
     size_t maxStagingSize =
         static_cast<ssize_t>(config.MaxNumTokensToSend()) * config.MaxXferBytesPerToken();
+
+    printf("Aysnc_ll Buf Init MaxNumTokensToSend %d MaxXferBytesPerToken %zu\n",
+           config.MaxNumTokensToSend(), config.MaxXferBytesPerToken());
     bufs.dispatchInp = ShmemMallocAndReturnMemObjPtr(maxStagingSize, hipDeviceMallocUncached);
     bufs.combineInp = ShmemMallocAndReturnMemObjPtr(maxStagingSize, hipDeviceMallocUncached);
     bufs.staging = ShmemMallocAndReturnMemObjPtr(maxStagingSize, hipDeviceMallocUncached);
