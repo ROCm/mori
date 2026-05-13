@@ -137,7 +137,7 @@ jobs:
       - name: MORI-EP (async_ll IBGDA)
         run: |
           $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
-            cd $GITHUB_WORKSPACE && MORI_DISABLE_P2P=1 timeout 300 pytest tests/python/ops/test_dispatch_combine_async_ll.py -v
+            cd $GITHUB_WORKSPACE && MORI_DISABLE_P2P=1 MORI_ENABLE_SDMA=0 timeout 300 pytest tests/python/ops/test_dispatch_combine_async_ll.py -v
           "
 
       - name: MORI-EP bench
