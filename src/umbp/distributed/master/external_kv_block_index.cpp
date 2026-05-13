@@ -67,9 +67,11 @@ std::vector<ExternalKvBlockIndex::NodeMatch> ExternalKvBlockIndex::Match(
     const std::vector<std::string>& hashes) const {
   std::shared_lock lock(mutex_);
 
-  // Accumulate per-(node_id, tier) matched hashes.
-  // Key: node_id; value: (tier, matched_hashes).
-  std::unordered_map<std::string, std::pair<TierType, std::vector<std::string>>> acc;
+  struct Accumulator {
+    TierType best_tier = TierType::UNKNOWN;
+    std::vector<std::string> matched_hashes;
+  };
+  std::unordered_map<std::string, Accumulator> acc;
 
   for (const auto& hash : hashes) {
     auto it = entries_.find(hash);
@@ -78,18 +80,22 @@ std::vector<ExternalKvBlockIndex::NodeMatch> ExternalKvBlockIndex::Match(
     }
     for (const auto& [node_id, tier] : it->second) {
       auto& entry = acc[node_id];
-      entry.first = tier;
-      entry.second.push_back(hash);
+      if (entry.best_tier == TierType::UNKNOWN ||
+          (tier != TierType::UNKNOWN &&
+           static_cast<int>(tier) < static_cast<int>(entry.best_tier))) {
+        entry.best_tier = tier;
+      }
+      entry.matched_hashes.push_back(hash);
     }
   }
 
   std::vector<NodeMatch> result;
   result.reserve(acc.size());
-  for (auto& [node_id, tier_hashes] : acc) {
+  for (auto& [node_id, match] : acc) {
     NodeMatch m;
     m.node_id = node_id;
-    m.tier = tier_hashes.first;
-    m.matched_hashes = std::move(tier_hashes.second);
+    m.tier = match.best_tier;
+    m.matched_hashes = std::move(match.matched_hashes);
     result.push_back(std::move(m));
   }
   return result;
