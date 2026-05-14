@@ -984,10 +984,32 @@ class EpDispatchCombineOp:
                 # invoked with weights=None in production callers). Compute shared mem
                 # for the no-weight layout: srcPtrs[] + srcScalePtrs[].
                 fp8bwq_smem = self._combine_shared_mem(actual_wpb, use_weights=False)
+                # Mirror of the AccumNum=8 + VecBytes=8 specialization gating used by the
+                # IntraNode combine. Only the recv-side dequant changes; send-side reuses
+                # the generic `_bf16_fp8bwq` symbols. Keep the eligibility check in sync
+                # with the IntraNode branch in combine().
+                hidden_dim = self.config.hidden_dim
+                if self.config.scale_dim > 0:
+                    block_elems = (
+                        hidden_dim + self.config.scale_dim - 1
+                    ) // self.config.scale_dim
+                else:
+                    block_elems = 0
+                base_vec8_top8_eligible = (
+                    (hidden_dim % 512) == 0
+                    and self.config.num_experts_per_token == 8
+                    and self.config.world_size > 4
+                )
+                recv_copy_kernel = "EpCombineLowLatencyAsyncRecvCopy_bf16_fp8bwq"
+                if base_vec8_top8_eligible:
+                    if block_elems == 128:
+                        recv_copy_kernel = "EpCombineLowLatencyAsyncRecvCopy_bf16_fp8bwq_noweight_block128_vec8"
+                    elif block_elems == 256:
+                        recv_copy_kernel = "EpCombineLowLatencyAsyncRecvCopy_bf16_fp8bwq_noweight_block256_vec8"
                 self._launch_multi(
                     [
                         "EpCombineLowLatencyAsyncRecvTransfer_bf16_fp8bwq",
-                        "EpCombineLowLatencyAsyncRecvCopy_bf16_fp8bwq",
+                        recv_copy_kernel,
                     ],
                     [self.config.world_size, mp_aligned],
                     [WARP_SIZE * actual_wpb, WARP_SIZE * actual_wpb],

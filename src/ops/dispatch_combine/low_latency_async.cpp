@@ -400,7 +400,7 @@ __device__ void EpDispatchLowLatencyAsyncRecvCopyMultiBlock_body(EpDispatchCombi
 /*                                EpCombineLowLatencyAsyncSendCopy                                */
 /* ---------------------------------------------------------------------------------------------- */
 
-template <typename T, bool UseFp8DirectCast, bool UseFp8BlockwiseQuant>
+template <typename T, bool UseFp8DirectCast, bool UseFp8BlockwiseQuant, int Vec8Top8BlockElems = 0>
 __device__ void EpCombineLowLatencyAsyncSendCopy_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
   IF_ENABLE_PROFILER(
@@ -412,6 +412,10 @@ __device__ void EpCombineLowLatencyAsyncSendCopy_body(EpDispatchCombineArgs<T> a
                 "Fp8 direct cast and blockwise quant are mutually exclusive");
   static_assert((!UseFp8DirectCast && !UseFp8BlockwiseQuant) || std::is_same_v<T, hip_bfloat16>,
                 "Fp8 combine quant currently only supports bf16 input");
+  static_assert((Vec8Top8BlockElems & (Vec8Top8BlockElems - 1)) == 0,
+                "Vec8Top8BlockElems must be 0 or a power of two");
+  static_assert(Vec8Top8BlockElems == 0 || UseFp8BlockwiseQuant,
+                "Vec8Top8BlockElems specialization requires UseFp8BlockwiseQuant");
   const size_t tokHiddenBytes = hiddenDim * sizeof(TokT);
   // Per-slot extra bytes appended after the FP8 hidden region. Blockwise quant writes one
   // float per scale block (scaleDim floats) right after the FP8 hidden bytes.
@@ -447,7 +451,7 @@ __device__ void EpCombineLowLatencyAsyncSendCopy_body(EpDispatchCombineArgs<T> a
 /*                              EpCombineLowLatencyAsyncSendTransfer                              */
 /* ---------------------------------------------------------------------------------------------- */
 
-template <typename T, bool UseFp8DirectCast, bool UseFp8BlockwiseQuant>
+template <typename T, bool UseFp8DirectCast, bool UseFp8BlockwiseQuant, int Vec8Top8BlockElems = 0>
 __device__ void EpCombineLowLatencyAsyncSendTransfer_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
   IF_ENABLE_PROFILER(
@@ -459,6 +463,10 @@ __device__ void EpCombineLowLatencyAsyncSendTransfer_body(EpDispatchCombineArgs<
                 "Fp8 direct cast and blockwise quant are mutually exclusive");
   static_assert((!UseFp8DirectCast && !UseFp8BlockwiseQuant) || std::is_same_v<T, hip_bfloat16>,
                 "Fp8 combine quant currently only supports bf16 input");
+  static_assert((Vec8Top8BlockElems & (Vec8Top8BlockElems - 1)) == 0,
+                "Vec8Top8BlockElems must be 0 or a power of two");
+  static_assert(Vec8Top8BlockElems == 0 || UseFp8BlockwiseQuant,
+                "Vec8Top8BlockElems specialization requires UseFp8BlockwiseQuant");
   const size_t tokHiddenBytes = hiddenDim * sizeof(TokT);
   const size_t combScaleBytes =
       UseFp8BlockwiseQuant ? static_cast<size_t>(config.scaleDim) * sizeof(float) : 0;
@@ -495,7 +503,7 @@ __device__ void EpCombineLowLatencyAsyncSendTransfer_body(EpDispatchCombineArgs<
 /*                              EpCombineLowLatencyAsyncRecvTransfer                              */
 /* ---------------------------------------------------------------------------------------------- */
 
-template <typename T, bool UseFp8DirectCast, bool UseFp8BlockwiseQuant>
+template <typename T, bool UseFp8DirectCast, bool UseFp8BlockwiseQuant, int Vec8Top8BlockElems = 0>
 __device__ void EpCombineLowLatencyAsyncRecvTransfer_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
   IF_ENABLE_PROFILER(
@@ -507,6 +515,10 @@ __device__ void EpCombineLowLatencyAsyncRecvTransfer_body(EpDispatchCombineArgs<
                 "Fp8 direct cast and blockwise quant are mutually exclusive");
   static_assert((!UseFp8DirectCast && !UseFp8BlockwiseQuant) || std::is_same_v<T, hip_bfloat16>,
                 "Fp8 combine quant currently only supports bf16 input");
+  static_assert((Vec8Top8BlockElems & (Vec8Top8BlockElems - 1)) == 0,
+                "Vec8Top8BlockElems must be 0 or a power of two");
+  static_assert(Vec8Top8BlockElems == 0 || UseFp8BlockwiseQuant,
+                "Vec8Top8BlockElems specialization requires UseFp8BlockwiseQuant");
   (void)sizeof(TokT);
 
   for (int destPe = blockId; destPe < npes; destPe += blockNum) {
@@ -540,7 +552,7 @@ __device__ void EpCombineLowLatencyAsyncRecvTransfer_body(EpDispatchCombineArgs<
 /*                                EpCombineLowLatencyAsyncRecvCopy                                */
 /* ---------------------------------------------------------------------------------------------- */
 
-template <typename T, bool UseFp8DirectCast, bool UseFp8BlockwiseQuant>
+template <typename T, bool UseFp8DirectCast, bool UseFp8BlockwiseQuant, int Vec8Top8BlockElems = 0>
 __device__ void EpCombineLowLatencyAsyncRecvCopy_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
   IF_ENABLE_PROFILER(
@@ -552,6 +564,10 @@ __device__ void EpCombineLowLatencyAsyncRecvCopy_body(EpDispatchCombineArgs<T> a
                 "Fp8 direct cast and blockwise quant are mutually exclusive");
   static_assert((!UseFp8DirectCast && !UseFp8BlockwiseQuant) || std::is_same_v<T, hip_bfloat16>,
                 "Fp8 combine quant currently only supports bf16 input");
+  static_assert((Vec8Top8BlockElems & (Vec8Top8BlockElems - 1)) == 0,
+                "Vec8Top8BlockElems must be 0 or a power of two");
+  static_assert(Vec8Top8BlockElems == 0 || UseFp8BlockwiseQuant,
+                "Vec8Top8BlockElems specialization requires UseFp8BlockwiseQuant");
 
   const size_t tokHiddenBytes = hiddenDim * sizeof(TokT);
   const size_t combScaleBytes =
@@ -605,7 +621,31 @@ __device__ void EpCombineLowLatencyAsyncRecvCopy_body(EpDispatchCombineArgs<T> a
       T* outPtr = args.interNodeTokBufs.combineOut->template GetAs<T*>() + tokenId * hiddenDim +
                   hiddenDimOffset;
       if constexpr (UseFp8BlockwiseQuant) {
-        if (mwIter.warpsPerItem == 1) {
+        if constexpr (Vec8Top8BlockElems != 0) {
+          // Compile-time specialization for AccumNum=8 / VecBytes=8 /
+          // block_elems ∈ {128, 256} / weights=None on the recv-side dequant.
+          // Matches the IntraNode "noweight_blockN_vec8" kernel; mirrors the
+          // same VGPR-pressure win on the AsyncLL recv kernel.
+          if (mwIter.warpsPerItem == 1) {
+            core::WarpAccumFp8DequantFullBlockVec8Top8<T, core::CombineInternalFp8,
+                                                       Vec8Top8BlockElems>(
+                outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
+                reinterpret_cast<const float* const*>(srcScalePtrs), hiddenDim);
+          } else if ((hiddenDimOffset & 0x7) == 0 && (hiddenDimSize & 0x7) == 0) {
+            core::WarpAccumFp8DequantSegmentBlockVec8Top8<T, core::CombineInternalFp8,
+                                                          Vec8Top8BlockElems>(
+                outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
+                reinterpret_cast<const float* const*>(srcScalePtrs), hiddenDimOffset,
+                hiddenDimSize);
+          } else {
+            // Misaligned segment: vec8 helper would fault on the load. Tiny scalar fallback.
+            core::WarpAccumFp8DequantSegmentScalarTop8<T, core::CombineInternalFp8,
+                                                       Vec8Top8BlockElems>(
+                outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
+                reinterpret_cast<const float* const*>(srcScalePtrs), hiddenDimOffset,
+                hiddenDimSize);
+          }
+        } else if (mwIter.warpsPerItem == 1) {
           core::WarpAccumFp8DequantFull<T, core::CombineInternalFp8>(
               outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
               reinterpret_cast<const float* const*>(srcScalePtrs), config.numExpertPerToken,

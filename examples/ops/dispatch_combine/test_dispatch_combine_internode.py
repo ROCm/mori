@@ -280,6 +280,7 @@ class EpDispatchCombineTestCase:
         hidden_dim=7168,
         combine_dtype=None,
         max_total_recv_tokens=0,
+        scale_dim=32,
     ):
         self.rank = rank
         self.gpu_per_node = gpu_per_node
@@ -305,7 +306,7 @@ class EpDispatchCombineTestCase:
             rank=self.rank,
             world_size=self.world_size,
             hidden_dim=max(self.dispatch_hidden_dim, self.combine_hidden_dim),
-            scale_dim=32,
+            scale_dim=scale_dim,
             scale_type_size=4,
             max_num_inp_token_per_rank=max_tokens,
             num_experts_per_rank=256 // self.world_size,
@@ -714,6 +715,8 @@ class EpDispatchCombineTestCase:
             atol, rtol = 1e-2, 1e-2
             if getattr(self.config, "quant_type", "none") == "fp8_direct_cast":
                 atol, rtol = 1e-1, 1e-1
+            elif getattr(self.config, "quant_type", "none") == "fp8_blockwise":
+                atol, rtol = 5e-2, 5e-2
             if combine_data_type in (
                 torch.float8_e4m3fn,
                 torch.float8_e4m3fnuz,
@@ -1549,6 +1552,7 @@ def test_dispatch_combine(
     hidden_dim=7168,
     save_tuning_config=None,
     skip_verify=False,
+    scale_dim=32,
 ):
     world_size = num_node * gpu_per_node
     node_rank = int(os.environ["RANK"])
@@ -1567,6 +1571,7 @@ def test_dispatch_combine(
             hidden_dim=hidden_dim,
             combine_dtype=combine_dtype,
             max_total_recv_tokens=max_total_recv_tokens,
+            scale_dim=scale_dim,
         )
         test_case.setup()
         if cmd == "test":
@@ -1666,10 +1671,21 @@ parser.add_argument(
     "--quant-type",
     type=str,
     default="none",
-    choices=["none", "fp8_direct_cast"],
+    choices=["none", "fp8_direct_cast", "fp8_blockwise"],
     help=(
         "Quantization method used inside Combine. "
-        "'fp8_direct_cast' is the current BF16<->FP8 direct cast path."
+        "'fp8_direct_cast' is BF16<->FP8 direct cast. "
+        "'fp8_blockwise' is BF16<->FP8 per-block scaled quant."
+    ),
+)
+parser.add_argument(
+    "--scale-dim",
+    type=int,
+    default=32,
+    help=(
+        "Per-token scale block count. For fp8_blockwise the production shape on "
+        "hidden_dim=7168 uses 56 (block_elems=128 matches DeepSeek-style activation "
+        "block size). Default 32 keeps backward-compat with the legacy bench config."
     ),
 )
 parser.add_argument(
@@ -1751,6 +1767,7 @@ if __name__ == "__main__":
             args_cli.hidden_dim,
             args_cli.save_tuning_config,
             args_cli.skip_verify,
+            args_cli.scale_dim,
         ),
         nprocs=gpu_per_node,
         join=True,

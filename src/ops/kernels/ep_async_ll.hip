@@ -35,3 +35,12 @@ MORI_FP8_ANY(
 MORI_FP8_ANY(WRAP_BOOL2(EpCombineLowLatencyAsyncRecvCopy, bf16_fp8bwq, hip_bfloat16, false, true))
 MORI_FP8_ANY(
     WRAP_BOOL2(EpCombineLowLatencyAsyncRecvTransfer, bf16_fp8bwq, hip_bfloat16, false, true))
+
+// Block128Vec8Top8 specialization: AccumNum=8 + VecBytes=8 + block_elems ∈ {128, 256} dequant path.
+// Send-side kernels are shape-agnostic and reuse the existing `_bf16_fp8bwq` symbols;
+// only RecvCopy is specialized. The naming mirrors IntraNode's
+// `EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq_noweight_block{128,256}_vec8`.
+MORI_FP8_ANY(WRAP_BOOL3(EpCombineLowLatencyAsyncRecvCopy,
+                        bf16_fp8bwq_noweight_block128_vec8, hip_bfloat16, false, true, 128))
+MORI_FP8_ANY(WRAP_BOOL3(EpCombineLowLatencyAsyncRecvCopy,
+                        bf16_fp8bwq_noweight_block256_vec8, hip_bfloat16, false, true, 256))
