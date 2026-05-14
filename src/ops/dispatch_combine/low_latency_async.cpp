@@ -173,7 +173,7 @@ __device__ void EpDispatchLowLatencyAsyncSendCopySlotAssign_body(EpDispatchCombi
           config.rank, globalWarpId, laneId, i, tokenId, expertIdx, destExpert, destPe,
           NullSendBufSlotOffset(config));
     } else {
-      index_t destTokId = atomicAdd(args.destPeTokenCounter + destPe, 1);
+      index_t destTokId = atomicAdd(args.destPeTokenCounter + destPe, 1);  // return old, then add
       args.dispDestTokIdMap[i] = SendBufSlotOffset(config, destPe, destTokId);
       LL_PRINTF(
           "[SlotAssign] rank=%d warp=%-4d lane=%-2d entry=%-2d tok=%-2d expertIdx=%d "
@@ -371,6 +371,7 @@ __device__ void EpDispatchLowLatencyAsyncRecvCopyMultiBlock_body(EpDispatchCombi
     assert(totalTokens <= config.MaxNumTokensToRecv() &&
            "Total recv token overflow: increase maxTotalRecvTokens");
   }
+  /* 根据srcPe在dispatchOut抢位置 / PE0, tk0 / PE0, tk1 / PE1, tk0 / PE0, tk1/  */
 
   // Copy data — multiple warps cooperate per token
   uint8_t* stagingPtr = (destPe != myPe)
@@ -436,13 +437,13 @@ __device__ void EpDispatchLowLatencyAsyncRecvCopyMultiBlock_body(EpDispatchCombi
                                        weightBytes + scaleBytes)[0];
         // A map used for unit test correctness check
         args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>()[destTokId] = srcTokId;
-        if (config.rank == 1 && localWarpId == tokenId * warpsPerToken) {
+        if (config.rank == 0 && localWarpId == tokenId * warpsPerToken) {
           index_t* indices =
               reinterpret_cast<index_t*>(stagingPtr + tokenId * xferBytes + hiddenBytes);
           float* weights =
               reinterpret_cast<float*>(stagingPtr + tokenId * xferBytes + hiddenBytes + indexBytes);
           LL_PRINTF(
-              "[RecvCopy:meta] rank=1 destPe=%d tok=%d destTokId=%llu "
+              "[RecvCopy:meta] rank=0 destPe=%d tok=%d destTokId=%llu "
               "indices=[%d,%d] weights=[%.2f,%.2f] srcTokId=%d dispReceiverIdxMap=%d\n",
               destPe, (int)tokenId, (unsigned long long)destTokId, indices[0], indices[1],
               weights[0], weights[1], srcTokId, SendBufSlotOffset(config, destPe, tokenId));
@@ -488,9 +489,9 @@ __device__ void EpCombineLowLatencyAsyncSendCopy_body(EpDispatchCombineArgs<T> a
   if (globalWarpId == 0 && laneId == 0) {
     LL_PRINTF("[C1:SendCopy] rank=%d totalRecvTokenNum=%d inpTokenBuf=%p stagingPtr=%p\n",
               config.rank, (int)totalRecvTokenNum, (void*)args.inpTokenBuf, (void*)stagingPtr);
-    LL_PRINTF("[C1:SendCopy] rank=%d dispReceiverIdxMap[0..%d]:", config.rank, (int)totalRecvTokenNum - 1);
-    for (int i = 0; i < totalRecvTokenNum; ++i)
-      LL_PRINTF(" %d", (int)args.dispReceiverIdxMap[i]);
+    LL_PRINTF("[C1:SendCopy] rank=%d dispReceiverIdxMap[0..%d]:", config.rank,
+              (int)totalRecvTokenNum - 1);
+    for (int i = 0; i < totalRecvTokenNum; ++i) LL_PRINTF(" %d", (int)args.dispReceiverIdxMap[i]);
     LL_PRINTF("\n");
   }
   for (int tokenId = globalWarpId; tokenId < totalRecvTokenNum; tokenId += globalWarpNum) {
@@ -540,7 +541,7 @@ __device__ void EpCombineLowLatencyAsyncSendTransfer_body(EpDispatchCombineArgs<
         core::AtomicStoreRelaxedSystem(&recvTokenNums[destPe * config.numQpPerPe + qpId],
                                        uint64_t{0});
       }
-      tokenNum = __shfl(tokenNum, 0); // 从lane0把读到的token广播给warp里的其他lane
+      tokenNum = __shfl(tokenNum, 0);  // 从lane0把读到的token广播给warp里的其他lane
       int tokenChunkNum = core::CeilDiv(tokenNum, config.numQpPerPe);
       int thisChunkTokenNum = std::min(tokenChunkNum, tokenNum - qpId * tokenChunkNum);
       size_t remoteOffset = SendBufSlotOffset(config, myPe, tokenChunkNum * qpId) * tokHiddenBytes;
@@ -617,12 +618,6 @@ __device__ void EpCombineLowLatencyAsyncRecvCopy_body(EpDispatchCombineArgs<T> a
   extern __shared__ char sharedMem[];
   TokT** srcPtrs = reinterpret_cast<TokT**>(sharedMem) + warpId * config.numExpertPerToken;
 
-  if (globalWarpId == 0 && laneId == 0)
-    LL_PRINTF("[C4:RecvCopy] rank=%d curRankNumToken=%d combineOut=%p combineInp=%p staging=%p\n",
-              config.rank, (int)args.curRankNumToken,
-              (void*)args.interNodeTokBufs.combineOut->template GetAs<void*>(),
-              (void*)args.interNodeTokBufs.combineInp->template GetAs<void*>(),
-              (void*)args.interNodeTokBufs.staging->template GetAs<void*>());
   if (args.curRankNumToken != 0) {
     MultiWarpIter mwIter(globalWarpNum, args.curRankNumToken, hiddenDim);
 
@@ -648,9 +643,7 @@ __device__ void EpCombineLowLatencyAsyncRecvCopy_body(EpDispatchCombineArgs<T> a
 
       T* outPtr = args.interNodeTokBufs.combineOut->template GetAs<T*>() + tokenId * hiddenDim +
                   hiddenDimOffset;
-      if (globalWarpId == 0 && laneId == 0 && inTokenPartId == 0)
-        LL_PRINTF("[C4:RecvCopy] rank=%d tok=%d srcPtrs[0]=%p srcPtrs[1]=%p outPtr=%p\n",
-                  config.rank, tokenId, (void*)srcPtrs[0], (void*)srcPtrs[1], (void*)outPtr);
+
       if constexpr (UseFp8DirectCast) {
         core::WarpAccumCombineInternalFp8ToBf16(outPtr,
                                                 reinterpret_cast<const TokT* const*>(srcPtrs),
