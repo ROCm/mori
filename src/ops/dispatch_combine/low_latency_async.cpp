@@ -22,7 +22,7 @@
 #include "src/ops/dispatch_combine/low_latency_async.hpp"
 
 // Set to 1 to enable async-ll kernel debug prints, 0 to disable
-#define ASYNC_LL_DEBUG 0
+#define ASYNC_LL_DEBUG 1
 #if ASYNC_LL_DEBUG
 #define LL_PRINTF(...) printf(__VA_ARGS__)
 #else
@@ -485,9 +485,14 @@ __device__ void EpCombineLowLatencyAsyncSendCopy_body(EpDispatchCombineArgs<T> a
   // Copy token onto staging buffer for later IBGDA transfer
   index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
   uint8_t* stagingPtr = args.interNodeTokBufs.staging->template GetAs<uint8_t*>();
-  if (globalWarpId == 0 && laneId == 0)
+  if (globalWarpId == 0 && laneId == 0) {
     LL_PRINTF("[C1:SendCopy] rank=%d totalRecvTokenNum=%d inpTokenBuf=%p stagingPtr=%p\n",
               config.rank, (int)totalRecvTokenNum, (void*)args.inpTokenBuf, (void*)stagingPtr);
+    LL_PRINTF("[C1:SendCopy] rank=%d dispReceiverIdxMap[0..%d]:", config.rank, (int)totalRecvTokenNum - 1);
+    for (int i = 0; i < totalRecvTokenNum; ++i)
+      LL_PRINTF(" %d", (int)args.dispReceiverIdxMap[i]);
+    LL_PRINTF("\n");
+  }
   for (int tokenId = globalWarpId; tokenId < totalRecvTokenNum; tokenId += globalWarpNum) {
     index_t stagingTokId = 0;
     if (laneId == 0) stagingTokId = args.dispReceiverIdxMap[tokenId];
@@ -535,7 +540,7 @@ __device__ void EpCombineLowLatencyAsyncSendTransfer_body(EpDispatchCombineArgs<
         core::AtomicStoreRelaxedSystem(&recvTokenNums[destPe * config.numQpPerPe + qpId],
                                        uint64_t{0});
       }
-      tokenNum = __shfl(tokenNum, 0);
+      tokenNum = __shfl(tokenNum, 0); // 从lane0把读到的token广播给warp里的其他lane
       int tokenChunkNum = core::CeilDiv(tokenNum, config.numQpPerPe);
       int thisChunkTokenNum = std::min(tokenChunkNum, tokenNum - qpId * tokenChunkNum);
       size_t remoteOffset = SendBufSlotOffset(config, myPe, tokenChunkNum * qpId) * tokHiddenBytes;
