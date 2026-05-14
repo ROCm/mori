@@ -147,6 +147,14 @@ int main(int argc, char** argv) {
       float val = rank * 10.0f + t;
       for (int d = 0; d < hiddenDim; ++d) h_input[t * hiddenDim + d] = __float2bfloat16(val);
     }
+    printf("[PE%d] input (%d tokens):\n", rank, numTokens);
+    for (int t = 0; t < numTokens; ++t) {
+      printf("[PE%d]   tok%d: [", rank, t);
+      for (int d = 0; d < hiddenDim; ++d)
+        printf("%s%.0f", d ? "," : "", __bfloat162float(h_input[t * hiddenDim + d]));
+      printf("]\n");
+    }
+
     void* d_input = nullptr;
     HIP_CHECK(hipMalloc(&d_input, numTokens * hBytes));
     HIP_CHECK(hipMemcpy(d_input, h_input.data(), numTokens * hBytes, hipMemcpyHostToDevice));
