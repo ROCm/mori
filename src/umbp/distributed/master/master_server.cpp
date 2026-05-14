@@ -497,6 +497,16 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
       metrics_->setGauge(MORI_UMBP_METRIC_CLIENT_CAPACITY_AVAIL,
                          MORI_UMBP_METRIC_CLIENT_CAPACITY_AVAIL_HELP, labels,
                          static_cast<double>(cap.available_bytes));
+      const uint64_t used_bytes =
+          cap.total_bytes >= cap.available_bytes ? cap.total_bytes - cap.available_bytes : 0;
+      metrics_->setGauge(MORI_UMBP_METRIC_CLIENT_CAPACITY_USED,
+                         MORI_UMBP_METRIC_CLIENT_CAPACITY_USED_HELP, labels,
+                         static_cast<double>(used_bytes));
+      const double utilization = cap.total_bytes > 0 ? static_cast<double>(used_bytes) /
+                                                           static_cast<double>(cap.total_bytes)
+                                                     : 0.0;
+      metrics_->setGauge(MORI_UMBP_METRIC_CLIENT_CAPACITY_UTILIZATION,
+                         MORI_UMBP_METRIC_CLIENT_CAPACITY_UTILIZATION_HELP, labels, utilization);
     }
   }
 

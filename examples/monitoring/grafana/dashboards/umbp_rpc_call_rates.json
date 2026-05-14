@@ -130,6 +130,65 @@
       ]
     },
     {
+      "id": 14,
+      "title": "Per-Client Used Capacity by Tier (bytes)",
+      "description": "Used capacity per client per tier, derived from total - available.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 20
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "mori_umbp_client_capacity_used_bytes",
+          "legendFormat": "{{node}} {{tier}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "title": "Per-Client Capacity Utilization by Tier",
+      "description": "Fraction of capacity in use per client per tier (0-1).",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 20
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "mori_umbp_client_capacity_utilization_ratio",
+          "legendFormat": "{{node}} {{tier}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
       "id": 7,
       "title": "Per-Client BatchRoutePut Rate (entries/s)",
       "description": "Rate of successfully routed BatchRoutePut entries per target client.",
@@ -138,7 +197,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 20
+        "y": 28
       },
       "fieldConfig": {
         "defaults": {
@@ -167,7 +226,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 20
+        "y": 28
       },
       "fieldConfig": {
         "defaults": {
@@ -196,7 +255,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 28
+        "y": 36
       },
       "fieldConfig": {
         "defaults": {
@@ -252,7 +311,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 28
+        "y": 36
       },
       "fieldConfig": {
         "defaults": {
@@ -308,7 +367,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 36
+        "y": 44
       },
       "fieldConfig": {
         "defaults": {
@@ -355,7 +414,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 44
+        "y": 52
       },
       "fieldConfig": {
         "defaults": {
@@ -384,7 +443,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 44
+        "y": 52
       },
       "fieldConfig": {
         "defaults": {
@@ -413,7 +472,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 44
+        "y": 52
       },
       "fieldConfig": {
         "defaults": {

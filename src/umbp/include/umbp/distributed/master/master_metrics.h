@@ -91,6 +91,19 @@
 #define MORI_UMBP_METRIC_CLIENT_CAPACITY_AVAIL "mori_umbp_client_capacity_available_bytes"
 #define MORI_UMBP_METRIC_CLIENT_CAPACITY_AVAIL_HELP "Available capacity bytes"
 
+#define MORI_UMBP_METRIC_CLIENT_CAPACITY_USED_PREFIX "mori_umbp_client_capacity_used_bytes_"
+#define MORI_UMBP_METRIC_CLIENT_CAPACITY_USED_HELP_PREFIX "Used capacity bytes for client "
+#define MORI_UMBP_METRIC_CLIENT_CAPACITY_USED "mori_umbp_client_capacity_used_bytes"
+#define MORI_UMBP_METRIC_CLIENT_CAPACITY_USED_HELP "Used capacity bytes (total - available)"
+
+#define MORI_UMBP_METRIC_CLIENT_CAPACITY_UTILIZATION_PREFIX \
+  "mori_umbp_client_capacity_utilization_ratio_"
+#define MORI_UMBP_METRIC_CLIENT_CAPACITY_UTILIZATION_HELP_PREFIX \
+  "Capacity utilization ratio for client "
+#define MORI_UMBP_METRIC_CLIENT_CAPACITY_UTILIZATION "mori_umbp_client_capacity_utilization_ratio"
+#define MORI_UMBP_METRIC_CLIENT_CAPACITY_UTILIZATION_HELP \
+  "Capacity utilization ratio (used / total) in [0,1]"
+
 // --- Per-client RPC call counters ------------------------------------------
 // Full name: prefix + sanitized_node_id
 

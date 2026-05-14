@@ -489,6 +489,65 @@ TEST_F(PoolClientLocalByteTrackingTest, LocalPutGetBytesCounted) {
       << "Unexpected remote batch-get bandwidth series in single-node setup";
 }
 
+// Verifies that the four per-(node,tier) capacity gauges (total / available /
+// used / utilization_ratio) reach Prometheus via the heartbeat path, and that
+// available/used/utilization react to an allocation.
+TEST_F(PoolClientLocalByteTrackingTest, TierCapacityGaugesPublished) {
+  // First heartbeat must reach the master so the allocator snapshot lands in
+  // ClientRecord.tier_capacities and the gauges fire.
+  std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+
+  std::string body = FetchPrometheusMetrics(metrics_port_);
+  ASSERT_FALSE(body.empty()) << "Could not fetch Prometheus metrics from port " << metrics_port_;
+
+  // Prometheus text exposition rounds doubles to ~6 significant digits, so an
+  // 8 MiB byte count round-trips with up to ~10-byte error.  Tolerances below
+  // are sized accordingly.
+  const std::string dram_label = "tier=\"DRAM\"";
+  const double total0 = ParseMetricValue(body, "mori_umbp_client_capacity_total_bytes", dram_label);
+  const double avail0 =
+      ParseMetricValue(body, "mori_umbp_client_capacity_available_bytes", dram_label);
+  const double used0 = ParseMetricValue(body, "mori_umbp_client_capacity_used_bytes", dram_label);
+  const double util0 =
+      ParseMetricValue(body, "mori_umbp_client_capacity_utilization_ratio", dram_label);
+
+  // All four gauges must be present (-1.0 sentinel = not found in scrape).
+  ASSERT_GE(total0, 0.0) << "capacity_total_bytes missing from /metrics";
+  ASSERT_GE(avail0, 0.0) << "capacity_available_bytes missing from /metrics";
+  ASSERT_GE(used0, 0.0) << "capacity_used_bytes missing from /metrics";
+  ASSERT_GE(util0, 0.0) << "capacity_utilization_ratio missing from /metrics";
+
+  // Pristine state: nothing allocated yet.  Exact zero round-trips losslessly;
+  // total/available are at buf-size scale, so allow %g rounding slack.
+  EXPECT_NEAR(total0, static_cast<double>(kLocalBufSize), 16.0);
+  EXPECT_NEAR(avail0, static_cast<double>(kLocalBufSize), 16.0);
+  EXPECT_EQ(used0, 0.0);
+  EXPECT_EQ(util0, 0.0);
+
+  // Allocate one page via Put; the next heartbeat must reflect the drop.
+  ASSERT_TRUE(client_->Put("capacity-metric-key", src_, kLocalPageSize));
+  std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+
+  body = FetchPrometheusMetrics(metrics_port_);
+  ASSERT_FALSE(body.empty());
+
+  const double total1 = ParseMetricValue(body, "mori_umbp_client_capacity_total_bytes", dram_label);
+  const double avail1 =
+      ParseMetricValue(body, "mori_umbp_client_capacity_available_bytes", dram_label);
+  const double used1 = ParseMetricValue(body, "mori_umbp_client_capacity_used_bytes", dram_label);
+  const double util1 =
+      ParseMetricValue(body, "mori_umbp_client_capacity_utilization_ratio", dram_label);
+
+  EXPECT_NEAR(total1, total0, 16.0) << "total must not change after Put";
+  EXPECT_LT(avail1, avail0) << "available must drop after allocating a page";
+  EXPECT_GT(used1, 0.0) << "used must be positive after allocating a page";
+  EXPECT_GT(util1, 0.0);
+  EXPECT_LT(util1, 1.0);
+  // Invariants the gauge formulas guarantee.  Tolerances absorb %g rounding.
+  EXPECT_NEAR(used1 + avail1, total1, 16.0) << "used + available must equal total";
+  EXPECT_NEAR(util1, used1 / total1, 1e-3) << "utilization must equal used / total";
+}
+
 }  // namespace
 }  // namespace mori::umbp
 
