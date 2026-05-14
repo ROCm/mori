@@ -74,7 +74,7 @@ class All2allSdma {
   // if false, user should directly use output_transit_buffer
   bool copy_output_to_user_;
 
-  // Reusable args struct for JIT kernel launch from Python
+  // Not reentrant: previous launch must complete before next prepare_*.
   CclAll2allArgs<T> jit_args_;
 
   // Disable copy constructor and assignment operator

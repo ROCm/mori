@@ -46,10 +46,11 @@ try:
         "size_of",
     ]
 except (ImportError, AttributeError):
-    __all__ = []
+    __all__ = [
+        "All2allSdma",
+        "AllgatherSdma",
+        "AllreduceSdma",
+    ]
 
     def __getattr__(name: str):
-        raise ImportError(
-            f"mori.ccl.{name} is not available. "
-            "Rebuild mori with -DBUILD_COLLECTIVE=ON to enable collective ops."
-        )
+        raise ImportError(f"mori.ccl.{name} is not available — not yet ported to JIT.")

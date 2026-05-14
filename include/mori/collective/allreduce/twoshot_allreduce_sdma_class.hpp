@@ -176,6 +176,7 @@ class AllreduceSdma {
 
   // JIT launch support: Python calls prepare_* to get args pointer,
   // launches the kernel via HipModule, then calls finish_*.
+  // Not reentrant: previous launch must complete before next prepare_*.
   CclAllreduceArgs<T> jit_args_;
 
   int64_t prepare_reduce_scatter(const T* input, T* output, size_t total_count, hipStream_t stream);

@@ -163,9 +163,6 @@ CCL_ALLREDUCE_ALL_TYPES(CCL_WRAP_ALLREDUCE_RS, SdmaReduceScatterKernel)
 // --- AllGatherSdmaKernel ---
 CCL_ALLREDUCE_ALL_TYPES(CCL_WRAP_ALLREDUCE_AG, AllGatherSdmaKernel)
 
-// --- ReduceScatterAllGatherFusedKernel ---
-CCL_ALLREDUCE_ALL_TYPES(CCL_WRAP_ALLREDUCE_RS, ReduceScatterAllGatherFusedKernel)
-
 // --- ReduceScatterSdmaPutKernel (async scatter, no wait/reduce) ---
 CCL_ALLREDUCE_ALL_TYPES(CCL_WRAP_ALLREDUCE_RS_PUT, ReduceScatterSdmaPutKernel)
 

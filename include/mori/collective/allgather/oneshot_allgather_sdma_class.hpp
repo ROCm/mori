@@ -90,7 +90,7 @@ class AllgatherSdma {
   // Range lookup helper: returns {SymmMemObjPtr, offset_from_base} or {invalid, 0}.
   std::pair<application::SymmMemObjPtr, size_t> find_registered(void* ptr) const;
 
-  // Reusable args struct for JIT kernel launch from Python
+  // Not reentrant: previous launch must complete before next prepare_*.
   CclAllgatherArgs<T> jit_args_;
 
   // Disable copy constructor and assignment operator

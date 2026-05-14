@@ -450,7 +450,7 @@ int64_t AllgatherSdma<T>::prepare_async_start(T* input, T* output, size_t total_
   jit_args_.flagsMemObj = flagsObj_;
   jit_args_.elementCount = total_count;
   jit_args_.dstBaseOffset = direct ? byteOffset : 0;
-  jit_args_.flagVal = 0;
+  jit_args_.flagVal = async_flag_token_;
 
   return (int64_t)&jit_args_;
 }
