@@ -493,19 +493,21 @@ class EpDispatchCombineTestCase:
                 )
                 all_rank_input.append(fp4_bytes.view(torch.float4_e2m1fn_x2))
             else:
-                all_rank_input.append(
-                    _generate_input_tensor(
-                        (n_r, self.config.hidden_dim),
-                        dtype=self.config.data_type,
-                        device=self.device,
-                        generator=self.rng,
-                        input_dist=input_dist,
-                        input_scale=input_scale,
-                        input_shift=input_shift,
-                        force_scale_active=force_scale_active,
-                        block_elems=block_elems,
-                    )
+                # DEBUG: Fill with PE ID pattern for easier debugging
+                # Each element = rank + 0.01 * token_id + 0.0001 * elem_id
+                # This makes it easy to identify: which rank, which token, which element
+                input_tensor = torch.zeros(
+                    (n_r, self.config.hidden_dim),
+                    dtype=torch.float32,
+                    device=self.device,
                 )
+                for tok in range(n_r):
+                    # Pattern: rank.token_elem (e.g., rank=3, tok=5, elem=7 -> 3.050007)
+                    base_val = float(r) + 0.01 * tok
+                    input_tensor[tok, :] = base_val + 0.0001 * torch.arange(
+                        self.config.hidden_dim, dtype=torch.float32, device=self.device
+                    )
+                all_rank_input.append(input_tensor.to(self.config.data_type))
 
         return (
             num_token,
@@ -760,6 +762,13 @@ def run_ep_dispatch_local_expert_count_test(config):
     check_local_expert_count(op, dispatch_indices, dispatch_recv_num_token)
 
 
+def _zero_shmem_buffer(ptr: int, size: int):
+    """Zero out a shmem buffer using hipMemset."""
+    import ctypes
+    hip = ctypes.CDLL("libamdhip64.so")
+    hip.hipMemset(ctypes.c_void_p(ptr), 0, ctypes.c_size_t(size))
+
+
 def run_ep_dispatch_combine_test(
     config,
     test_case_cls,
@@ -769,6 +778,52 @@ def run_ep_dispatch_combine_test(
     check_results=True,
 ):
     op = mori.ops.EpDispatchCombineOp(config)
+
+    # Zero out ALL output buffers before test to detect stale data vs wrong data issues
+    out_ptr, outW_ptr, outS_ptr, outI_ptr, total_ptr = op._dispatch_out_ptrs
+    max_recv = op._cpp_config.max_num_tokens_to_recv()
+    hidden_dim = config.hidden_dim
+    num_experts_per_token = config.num_experts_per_token
+
+    # Zero dispatch output buffer (tokens)
+    if out_ptr != 0:
+        dtype_size = 2 if config.data_type in (torch.bfloat16, torch.float16) else 1
+        dispatch_out_size = max_recv * hidden_dim * dtype_size
+        _zero_shmem_buffer(out_ptr, dispatch_out_size)
+        print(f"[DIAG] Zeroed dispatch output buffer: ptr={hex(out_ptr)}, size={dispatch_out_size}")
+
+    # Zero dispatch weight buffer
+    if outW_ptr != 0:
+        max_weight_size = max_recv * num_experts_per_token * 4  # float32
+        _zero_shmem_buffer(outW_ptr, max_weight_size)
+        print(f"[DIAG] Zeroed dispatch weight buffer: ptr={hex(outW_ptr)}, size={max_weight_size}")
+
+    # Zero dispatch indices buffer
+    if outI_ptr != 0:
+        indices_size = max_recv * num_experts_per_token * 4  # int32
+        _zero_shmem_buffer(outI_ptr, indices_size)
+        print(f"[DIAG] Zeroed dispatch indices buffer: ptr={hex(outI_ptr)}, size={indices_size}")
+
+    # Zero combine output buffers
+    combine_out_ptr, combine_outW_ptr = op._combine_out_ptrs
+    max_inp = config.max_num_inp_token_per_rank
+
+    if combine_out_ptr != 0:
+        dtype_size = 2 if config.data_type in (torch.bfloat16, torch.float16) else 1
+        combine_out_size = max_inp * hidden_dim * dtype_size
+        _zero_shmem_buffer(combine_out_ptr, combine_out_size)
+        print(f"[DIAG] Zeroed combine output buffer: ptr={hex(combine_out_ptr)}, size={combine_out_size}")
+
+    if combine_outW_ptr != 0:
+        combine_weight_size = max_inp * num_experts_per_token * 4  # float32
+        _zero_shmem_buffer(combine_outW_ptr, combine_weight_size)
+        print(f"[DIAG] Zeroed combine weight buffer: ptr={hex(combine_outW_ptr)}, size={combine_weight_size}")
+
+    # Sync after zeroing
+    import torch
+    torch.cuda.synchronize()
+    print(f"[DIAG] All output buffers zeroed for rank {config.rank}")
+
     test_case = test_case_cls(config)
     gen_kwargs = {}
     if use_max_token_num:
