@@ -168,8 +168,10 @@ PeerDramAllocator::ResolveResult PeerDramAllocator::Resolve(const std::string& k
   r.tier = it->second.tier;
   r.pages = it->second.pages;
   r.size = it->second.size;
-  // Bump read lease so concurrent Evict reports bytes_freed=0 for this key.
-  read_leases_[key].push_back(std::chrono::steady_clock::now() + read_lease_ttl_);
+  // Extend the read lease so concurrent Evict reports bytes_freed=0 for
+  // this key.  steady_clock is monotonic and read_lease_ttl_ is fixed,
+  // so this assignment is always >= any previous deadline for the key.
+  read_lease_until_[key] = std::chrono::steady_clock::now() + read_lease_ttl_;
   return r;
 }
 
@@ -222,7 +224,7 @@ void PeerDramAllocator::ClearLocal() {
     kv.second.cancelled_by_clear = true;
   }
 
-  read_leases_.clear();
+  read_lease_until_.clear();
   // Drop any queued ADD/REMOVE that the heartbeat hasn't shipped yet:
   // the snapshot we're about to send is the authoritative state.
   pending_events_.clear();
@@ -308,12 +310,10 @@ std::vector<BufferMemoryDescBytes> PeerDramAllocator::BuildBufferDescsLocked(
 }
 
 bool PeerDramAllocator::HasActiveReadLeaseLocked(const std::string& key) {
-  auto it = read_leases_.find(key);
-  if (it == read_leases_.end()) return false;
-  const auto now = std::chrono::steady_clock::now();
-  while (!it->second.empty() && it->second.front() <= now) it->second.pop_front();
-  if (it->second.empty()) {
-    read_leases_.erase(it);
+  auto it = read_lease_until_.find(key);
+  if (it == read_lease_until_.end()) return false;
+  if (it->second <= std::chrono::steady_clock::now()) {
+    read_lease_until_.erase(it);
     return false;
   }
   return true;
@@ -361,12 +361,11 @@ void PeerDramAllocator::ReaperSweep() {
     }
   }
 
-  // Trim expired read leases so they stop blocking eviction.  Empty
-  // entries are dropped from the map to keep its size bounded.
-  for (auto it = read_leases_.begin(); it != read_leases_.end();) {
-    while (!it->second.empty() && it->second.front() <= now) it->second.pop_front();
-    if (it->second.empty()) {
-      it = read_leases_.erase(it);
+  // Drop expired read leases so they stop blocking eviction and the
+  // map size stays bounded.
+  for (auto it = read_lease_until_.begin(); it != read_lease_until_.end();) {
+    if (it->second <= now) {
+      it = read_lease_until_.erase(it);
     } else {
       ++it;
     }

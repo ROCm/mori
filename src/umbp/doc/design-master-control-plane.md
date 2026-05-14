@@ -589,7 +589,7 @@ State:
 ```cpp
 unordered_map<uint64_t, PendingSlot>           pending_;
 unordered_map<string,    OwnedSlot>            owned_;
-unordered_map<string,    deque<time_point>>    read_leases_;
+unordered_map<string,    time_point>           read_lease_until_;
 vector<KvEvent>                                pending_events_;  // outbox
 ```
 
@@ -600,7 +600,7 @@ Lifecycle:
 | `Allocate(size, tier)` | Reserve pages, assign `slot_id`, push `PendingSlot` into `pending_`. |
 | `Commit(slot_id, key)` | Pop from `pending_`, insert into `owned_`, enqueue `KvEvent{ADD}` in `pending_events_`. |
 | `Abort(slot_id)` | Pop from `pending_`, free pages. Idempotent. |
-| `Resolve(key)` | Look up in `owned_`, append `now()+read_lease_ttl_` to `read_leases_[key]`, return pages. |
+| `Resolve(key)` | Look up in `owned_`, set `read_lease_until_[key] = now()+read_lease_ttl_` (covers any earlier deadline since `steady_clock` is monotonic), return pages. |
 | `Evict(keys[])` | For each key: skip if `HasActiveReadLeaseLocked`, else free pages and enqueue `KvEvent{REMOVE}`. |
 | `DrainPendingEvents()` | Returns and clears `pending_events_`; called by the heartbeat thread. |
 | `SnapshotOwnedKeys()` | Build the full ADD list for full-sync. |
@@ -608,7 +608,7 @@ Lifecycle:
 | `QueueExternalEvent(ev)` | Lets the SSD `CommitSsdWrite` path enqueue ADD/REMOVE for keys it manages — one outbox per peer. |
 
 A reaper thread sweeps `pending_` for expired slots (`pending_ttl`) and
-`read_leases_` for expired entries (`read_lease_ttl_`).
+`read_lease_until_` for expired entries (`read_lease_ttl_`).
 
 ### 7.2 PeerServiceServer  (`peer/peer_service.h`)
 
@@ -724,7 +724,7 @@ the defaults; see `runtime-env-vars.md` for the full list.
 | `GlobalBlockIndex::entries_` | `shared_mutex` | `ApplyEvents` / `ReplaceNodeLocations` exclusive; `Lookup` / `BatchLookupExists` / `GetMetrics` shared. `RecordAccess` and `GrantLease` use `std::atomic` reps under shared lock. |
 | `ExternalKvBlockIndex::entries_` | `shared_mutex` | `Register`/`Unregister`/`UnregisterByNode` exclusive; `Match` / `GetKvCount` shared. |
 | `ClientRegistry::clients_` | `shared_mutex` | `RegisterClient`/`Heartbeat`/`UnregisterClient`/reaper exclusive; `IsClientAlive`/`ClientCount`/`GetAliveClients` shared. |
-| `PeerDramAllocator` | `std::mutex` | One coarse mutex over `pending_` / `owned_` / `read_leases_` / `pending_events_`. Page bitmaps live under it too — fine-grained pages are not split out. |
+| `PeerDramAllocator` | `std::mutex` | One coarse mutex over `pending_` / `owned_` / `read_lease_until_` / `pending_events_`. Page bitmaps live under it too — fine-grained pages are not split out. |
 | `MasterClient` | per-field | `caps_mutex_` for the cached capacities, `hb_cv_mutex_` + `hb_cv_` for the heartbeat thread, `metrics_mutex_` for the buffered samples. |
 
 Lock ordering: master code never holds two of these mutexes at once.

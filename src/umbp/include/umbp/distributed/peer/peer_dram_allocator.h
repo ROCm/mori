@@ -25,7 +25,6 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
-#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -133,9 +132,10 @@ class PeerDramAllocator {
   // contract changes).
   bool Abort(uint64_t slot_id);
 
-  // Look up a key the writer was just routed to.  Bumps the read-lease
-  // counter for `key` for `read_lease_ttl_`; concurrent Evict requests
-  // for that key during the lease window report bytes_freed=0.
+  // Look up a key the writer was just routed to.  Extends the
+  // read-lease deadline for `key` to now + `read_lease_ttl_`;
+  // concurrent Evict requests for that key during the lease window
+  // report bytes_freed=0.
   ResolveResult Resolve(const std::string& key);
 
   // Master-driven eviction.  Idempotent: keys that are unknown or
@@ -217,8 +217,8 @@ class PeerDramAllocator {
   PageBitmapAllocator* AllocatorForLocked(TierType tier);
   const PageBitmapAllocator* AllocatorForLocked(TierType tier) const;
 
-  // Caller MUST hold `mutex_`.  True iff `key` has at least one
-  // unexpired read-lease entry.  Trims expired entries while at it.
+  // Caller MUST hold `mutex_`.  True iff `key`'s read-lease deadline
+  // is still in the future.  Drops the entry if it has expired.
   bool HasActiveReadLeaseLocked(const std::string& key);
 
   // Caller MUST hold `mutex_`.
@@ -239,7 +239,7 @@ class PeerDramAllocator {
 
   std::unordered_map<uint64_t, PendingSlot> pending_;
   std::unordered_map<std::string, OwnedSlot> owned_;
-  std::unordered_map<std::string, std::deque<std::chrono::steady_clock::time_point>> read_leases_;
+  std::unordered_map<std::string, std::chrono::steady_clock::time_point> read_lease_until_;
   std::vector<KvEvent> pending_events_;
 
   std::atomic<uint64_t> next_slot_id_{1};
