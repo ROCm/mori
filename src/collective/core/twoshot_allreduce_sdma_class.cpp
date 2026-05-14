@@ -312,8 +312,6 @@ int64_t AllreduceSdma<T>::prepare_allgather(size_t total_count, hipStream_t /*st
 template <typename T>
 double AllreduceSdma<T>::finish_sync(T* output, size_t total_count, hipStream_t stream,
                                      bool force_copy_output_to_user) {
-  hipError_t err = stream ? hipStreamSynchronize(stream) : hipDeviceSynchronize();
-  if (err != hipSuccess) throw std::runtime_error("Synchronization failed in finish_sync");
   if (copy_output_to_user_ || force_copy_output_to_user) {
     copy_output_to_user(output, total_count, stream);
   }
