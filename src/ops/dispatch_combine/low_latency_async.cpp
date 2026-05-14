@@ -642,6 +642,7 @@ __device__ void EpCombineLowLatencyAsyncRecvCopy_body(EpDispatchCombineArgs<T> a
       size_t hiddenDimOffset, hiddenDimSize;
       mwIter.Decode(i, tokenId, inTokenPartId, hiddenDimOffset, hiddenDimSize);
 
+      // inner loop是在为每个token找到各个expert执行完成的结果
       for (int j = laneId; j < config.numExpertPerToken; j += warpSize) {
         index_t destTokId = args.dispDestTokIdMap[tokenId * config.numExpertPerToken + j];
         index_t destPe = PeFromSendBufSlotOffset(config, destTokId);
@@ -658,6 +659,10 @@ __device__ void EpCombineLowLatencyAsyncRecvCopy_body(EpDispatchCombineArgs<T> a
 
       T* outPtr = args.interNodeTokBufs.combineOut->template GetAs<T*>() + tokenId * hiddenDim +
                   hiddenDimOffset;
+      if (config.rank == 0 && tokenId == 0 && laneId == 0 && hiddenDimSize > 0)
+        LL_PRINTF(
+            "[C4:warp] rank=0 tok=0 globalWarpId=%d inTokenPartId=%d hiddenOffset=%zu size=%zu\n",
+            globalWarpId, inTokenPartId, hiddenDimOffset, hiddenDimSize);
 
       if constexpr (UseFp8DirectCast) {
         core::WarpAccumCombineInternalFp8ToBf16(outPtr,
