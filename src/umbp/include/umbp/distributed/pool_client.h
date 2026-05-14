@@ -60,6 +60,14 @@ class PoolClient {
   bool Init();
   void Shutdown();
 
+  // Drop every locally-owned key, cancel in-flight pending writes, and
+  // ask master to collapse this node's index via a full-sync empty
+  // snapshot.  Returns immediately — convergence happens on the next
+  // heartbeat tick (which is woken eagerly).  See ClearLocal() /
+  // RequestFullSync() for the semantics of the write gate and the
+  // best-effort caveat around in-flight remote reads.
+  void Clear();
+
   const std::string& NodeId() const { return config_.master_config.node_id; }
 
   // Pin a caller-owned region for zero-copy RDMA.  Calls into the IO

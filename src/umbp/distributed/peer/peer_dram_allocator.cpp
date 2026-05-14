@@ -84,6 +84,11 @@ std::optional<PeerDramAllocator::PendingSlot> PeerDramAllocator::Allocate(uint64
   const uint32_t num_pages = SizeToPages(size, page_size_);
   if (num_pages == 0) return std::nullopt;
 
+  // Refuse new allocations between ClearLocal() and the first acked
+  // full-sync empty heartbeat — any owned key created in that window
+  // would not appear in the snapshot we are about to ship to master.
+  if (clear_full_sync_pending_.load(std::memory_order_acquire)) return std::nullopt;
+
   std::lock_guard<std::mutex> lock(mutex_);
   PageBitmapAllocator* alloc = AllocatorForLocked(tier);
   if (alloc == nullptr) return std::nullopt;
@@ -107,6 +112,17 @@ bool PeerDramAllocator::Commit(uint64_t slot_id, const std::string& key,
   std::lock_guard<std::mutex> lock(mutex_);
   auto it = pending_.find(slot_id);
   if (it == pending_.end()) return false;  // reaped, aborted, or never existed
+
+  // Slot was alive when ClearLocal() ran: release its pages now and
+  // tell the writer the Put failed.  No ADD is queued, so the
+  // post-clear empty snapshot stays authoritative.
+  if (it->second.cancelled_by_clear) {
+    if (auto* alloc = AllocatorForLocked(it->second.tier)) {
+      alloc->Deallocate(it->second.pages);
+    }
+    pending_.erase(it);
+    return false;
+  }
 
   // If the key was already owned (legitimate idempotent retry from the
   // writer), free the prior slot's pages first so we don't leak — then
@@ -184,6 +200,39 @@ std::vector<PeerDramAllocator::EvictResult> PeerDramAllocator::Evict(
     out.push_back(std::move(r));
   }
   return out;
+}
+
+void PeerDramAllocator::ClearLocal() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  // Owned pages: release back to the bitmap.  No REMOVE events — the
+  // upcoming full-sync empty snapshot will collapse master's index
+  // for this node in one shot.
+  for (auto& kv : owned_) {
+    if (auto* alloc = AllocatorForLocked(kv.second.tier)) {
+      alloc->Deallocate(kv.second.pages);
+    }
+  }
+  owned_.clear();
+
+  // Pending pages: do NOT free them — an in-flight RDMA write from a
+  // peer could still land on them.  Mark them so the eventual Commit
+  // fails (and frees the pages) without enqueueing an ADD.  The
+  // reaper's existing TTL path also handles dead writers.
+  for (auto& kv : pending_) {
+    kv.second.cancelled_by_clear = true;
+  }
+
+  read_leases_.clear();
+  // Drop any queued ADD/REMOVE that the heartbeat hasn't shipped yet:
+  // the snapshot we're about to send is the authoritative state.
+  pending_events_.clear();
+
+  clear_full_sync_pending_.store(true, std::memory_order_release);
+  MORI_UMBP_INFO("[PeerDramAllocator] ClearLocal — pending writes will be rejected until ack");
+}
+
+void PeerDramAllocator::ClearFullSyncAcked() {
+  clear_full_sync_pending_.store(false, std::memory_order_release);
 }
 
 void PeerDramAllocator::QueueExternalEvent(KvEvent ev) {

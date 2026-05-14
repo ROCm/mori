@@ -284,6 +284,21 @@ grpc::Status MasterClient::BatchRouteGet(const std::vector<std::string>& keys,
 
 void MasterClient::SetPeerDramAllocator(PeerDramAllocator* alloc) { peer_alloc_ = alloc; }
 
+void MasterClient::RequestFullSync() {
+  // Mark in-flight first so a heartbeat that races with us still
+  // sees we owe an ack-callback.
+  clear_full_sync_in_flight_.store(true);
+  clear_full_sync_requested_.store(true);
+  if (!heartbeat_running_.load()) {
+    MORI_UMBP_WARN(
+        "[Client] RequestFullSync without a running heartbeat thread; "
+        "master will not converge until StartHeartbeat()");
+    return;
+  }
+  std::lock_guard lock(hb_cv_mutex_);
+  hb_cv_.notify_all();
+}
+
 void MasterClient::StartHeartbeat() {
   if (!registered_) {
     MORI_UMBP_WARN("[Client] StartHeartbeat ignored: not registered");
@@ -313,8 +328,9 @@ void MasterClient::HeartbeatLoop() {
   while (heartbeat_running_) {
     {
       std::unique_lock lock(hb_cv_mutex_);
-      hb_cv_.wait_for(lock, std::chrono::milliseconds(heartbeat_interval_ms_),
-                      [this] { return !heartbeat_running_.load(); });
+      hb_cv_.wait_for(lock, std::chrono::milliseconds(heartbeat_interval_ms_), [this] {
+        return !heartbeat_running_.load() || clear_full_sync_requested_.load();
+      });
     }
     if (!heartbeat_running_) break;
 
@@ -336,14 +352,21 @@ void MasterClient::HeartbeatLoop() {
       caps = current_capacities_;
     }
 
+    // Clear-driven branch ships an empty full-sync; normal branch
+    // ships a delta from pending_events_.  Master-driven gap recovery
+    // further down is independent and never touches the ack flag.
+    const bool is_clear_sync = clear_full_sync_requested_.exchange(false);
+
     std::vector<KvEvent> events;
-    if (peer_alloc_ != nullptr) events = peer_alloc_->DrainPendingEvents();
+    if (peer_alloc_ != nullptr) {
+      events = is_clear_sync ? peer_alloc_->SnapshotOwnedKeys() : peer_alloc_->DrainPendingEvents();
+    }
 
     ::umbp::HeartbeatRequest req;
     req.set_node_id(config_.node_id);
     req.set_seq(++hb_seq_);
     req.set_last_acked_seq(hb_last_acked_seq_);
-    req.set_is_full_sync(false);
+    req.set_is_full_sync(is_clear_sync);
     FillTierCapacities(req.mutable_tier_capacities(), caps);
     for (const auto& ev : events) {
       auto* pe = req.add_events();
@@ -374,9 +397,16 @@ void MasterClient::HeartbeatLoop() {
                      status.error_message());
       // Roll the seq back so master doesn't see a gap on the next try.
       --hb_seq_;
+      // Clear-driven full-sync is not optional — re-arm for the next
+      // tick.  Normal heartbeat just retries from the unchanged outbox.
+      if (is_clear_sync) clear_full_sync_requested_.store(true);
       continue;
     }
     hb_last_acked_seq_ = resp.acked_seq();
+    if (is_clear_sync && clear_full_sync_in_flight_.exchange(false) && peer_alloc_ != nullptr) {
+      peer_alloc_->ClearFullSyncAcked();
+      MORI_UMBP_INFO("[Client] Clear full-sync acked by master; allocator writes re-enabled");
+    }
 
     if (resp.request_full_sync() && peer_alloc_ != nullptr) {
       MORI_UMBP_WARN("[Client] Master requested full sync — reshipping owned-key snapshot");

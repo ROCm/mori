@@ -113,6 +113,14 @@ class MasterClient {
   void StartHeartbeat();
   void StopHeartbeat();
 
+  // Force the next heartbeat to send `is_full_sync=true` with the
+  // peer allocator's current owned-key snapshot.  Used by Clear():
+  // after PeerDramAllocator::ClearLocal() the snapshot is empty, so
+  // master will collapse this node's index in one shot.  The heartbeat
+  // thread is woken so master converges within an RPC round-trip
+  // instead of the next heartbeat tick.
+  void RequestFullSync();
+
   // --- Client-side metrics ---
   void AddCounter(std::string name, std::string help, Labels labels, double delta);
   void SetGauge(std::string name, std::string help, Labels labels, double value);
@@ -163,6 +171,15 @@ class MasterClient {
   // Heartbeat seq state — the wire protocol's gap-recovery channel.
   uint64_t hb_seq_ = 0;
   uint64_t hb_last_acked_seq_ = 0;
+
+  // Set by Clear() via RequestFullSync().  `_requested_` wakes the
+  // heartbeat thread and picks the empty-snapshot branch.
+  // `_in_flight_` survives that branch and triggers
+  // PeerDramAllocator::ClearFullSyncAcked() once master acks — kept
+  // separate so master-driven gap recovery (which also sends a
+  // full-sync) does not lift the allocator write gate.
+  std::atomic<bool> clear_full_sync_requested_{false};
+  std::atomic<bool> clear_full_sync_in_flight_{false};
 
   void HeartbeatLoop();
 

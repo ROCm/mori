@@ -271,4 +271,82 @@ TEST(PeerDramAllocator, CommitAfterReapReturnsFalse) {
   EXPECT_TRUE(a->DrainPendingEvents().empty());
 }
 
+// ---- Distributed Clear ------------------------------------------------------
+
+TEST(PeerDramAllocator, ClearLocalReleasesOwnedAndCancelsPending) {
+  auto a = MakeAllocator();
+
+  auto pA = a->Allocate(kPageSize, TierType::DRAM);
+  ASSERT_TRUE(pA.has_value());
+  uint64_t committed_bytes = 0;
+  ASSERT_TRUE(a->Commit(pA->slot_id, "A", committed_bytes));
+
+  auto pB = a->Allocate(kPageSize * 2, TierType::DRAM);
+  ASSERT_TRUE(pB.has_value());
+  a->DrainPendingEvents();  // discard the A ADD
+
+  const auto cap_before = a->TierCapacitiesSnapshot()[TierType::DRAM];
+  ASSERT_LT(cap_before.available_bytes, cap_before.total_bytes);
+
+  a->ClearLocal();
+
+  EXPECT_TRUE(a->IsClearFullSyncPending());
+  EXPECT_FALSE(a->Resolve("A").found);
+  EXPECT_TRUE(a->SnapshotOwnedKeys().empty());
+  EXPECT_TRUE(a->DrainPendingEvents().empty());
+
+  // Owned pages (A) returned immediately; pending pages (B) still held.
+  auto cap_after_clear = a->TierCapacitiesSnapshot()[TierType::DRAM];
+  EXPECT_EQ(cap_after_clear.available_bytes, cap_before.total_bytes - 2 * kPageSize);
+
+  // Committing the cancelled pending fails AND releases its pages
+  // without emitting an ADD.
+  EXPECT_FALSE(a->Commit(pB->slot_id, "B", committed_bytes));
+  EXPECT_EQ(committed_bytes, 0u);
+  EXPECT_TRUE(a->DrainPendingEvents().empty());
+  EXPECT_FALSE(a->Resolve("B").found);
+
+  auto cap_final = a->TierCapacitiesSnapshot()[TierType::DRAM];
+  EXPECT_EQ(cap_final.available_bytes, cap_final.total_bytes);
+}
+
+TEST(PeerDramAllocator, ClearLocalGatesAllocateUntilAcked) {
+  auto a = MakeAllocator();
+
+  a->ClearLocal();
+  EXPECT_FALSE(a->Allocate(kPageSize, TierType::DRAM).has_value());
+
+  a->ClearFullSyncAcked();
+  EXPECT_FALSE(a->IsClearFullSyncPending());
+  EXPECT_TRUE(a->Allocate(kPageSize, TierType::DRAM).has_value());
+}
+
+TEST(PeerDramAllocator, ClearLocalDropsQueuedAdds) {
+  auto a = MakeAllocator();
+  auto p = a->Allocate(kPageSize, TierType::DRAM);
+  ASSERT_TRUE(p.has_value());
+  uint64_t committed_bytes = 0;
+  ASSERT_TRUE(a->Commit(p->slot_id, "k", committed_bytes));
+  // ADD is sitting in the outbox, not yet drained.
+
+  a->ClearLocal();
+
+  EXPECT_TRUE(a->DrainPendingEvents().empty());
+  EXPECT_TRUE(a->SnapshotOwnedKeys().empty());
+}
+
+TEST(PeerDramAllocator, AbortReleasesCancelledPending) {
+  auto a = MakeAllocator();
+  auto p = a->Allocate(kPageSize, TierType::DRAM);
+  ASSERT_TRUE(p.has_value());
+
+  a->ClearLocal();
+  // Abort on a cancelled pending is idempotent and frees the pages.
+  EXPECT_TRUE(a->Abort(p->slot_id));
+  a->ClearFullSyncAcked();
+
+  auto cap = a->TierCapacitiesSnapshot()[TierType::DRAM];
+  EXPECT_EQ(cap.available_bytes, cap.total_bytes);
+}
+
 }  // namespace mori::umbp

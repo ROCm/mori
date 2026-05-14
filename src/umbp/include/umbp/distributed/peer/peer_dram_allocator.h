@@ -92,6 +92,11 @@ class PeerDramAllocator {
     std::vector<PageLocation> pages;
     uint64_t size = 0;
     std::chrono::steady_clock::time_point deadline;
+    // True iff the slot was alive when ClearLocal() ran.  Commit() on
+    // such a slot deallocates pages and returns false WITHOUT queuing
+    // an ADD — the writer sees Put failure and master never indexes a
+    // post-clear ghost key.
+    bool cancelled_by_clear = false;
   };
 
   struct OwnedSlot {
@@ -146,6 +151,24 @@ class PeerDramAllocator {
   // ADD events for keys this allocator doesn't manage — one outbox per
   // peer is the canonical event source for the heartbeat.
   void QueueExternalEvent(KvEvent ev);
+
+  // -------- Distributed Clear --------
+
+  // Drop every owned key + read lease, mark every pending slot
+  // cancelled, and clear the event outbox.  Owned pages are released
+  // back to the bitmap immediately; pending pages stay reserved until
+  // the writer's Commit/Abort or the reaper expires the TTL (so an
+  // in-flight RDMA write does not land on a recycled page).  After
+  // this call Allocate() returns nullopt until ClearFullSyncAcked().
+  void ClearLocal();
+
+  // Called by the heartbeat thread after the first full-sync empty
+  // snapshot is acked by master.  Re-enables Allocate().
+  void ClearFullSyncAcked();
+
+  bool IsClearFullSyncPending() const {
+    return clear_full_sync_pending_.load(std::memory_order_acquire);
+  }
 
   // -------- Heartbeat helpers --------
 
@@ -220,6 +243,11 @@ class PeerDramAllocator {
   std::vector<KvEvent> pending_events_;
 
   std::atomic<uint64_t> next_slot_id_{1};
+
+  // Set by ClearLocal(), cleared by ClearFullSyncAcked().  Gates
+  // Allocate() so no new owned key appears between local clear and the
+  // first acked full-sync empty heartbeat.
+  std::atomic<bool> clear_full_sync_pending_{false};
 
   std::thread reaper_thread_;
   std::atomic<bool> reaper_running_{false};

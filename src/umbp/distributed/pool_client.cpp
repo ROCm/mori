@@ -356,6 +356,12 @@ void PoolClient::Shutdown() {
   master_client_.reset();
 }
 
+void PoolClient::Clear() {
+  if (!initialized_.load()) return;
+  if (peer_alloc_) peer_alloc_->ClearLocal();
+  if (master_client_) master_client_->RequestFullSync();
+}
+
 bool PoolClient::IsInitialized() const { return initialized_; }
 MasterClient& PoolClient::Master() { return *master_client_; }
 PeerDramAllocator* PoolClient::DramAllocator() { return peer_alloc_.get(); }
