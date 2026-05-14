@@ -33,7 +33,7 @@ from mori.ccl import All2allSdma
 from tests.python.utils import TorchDistContext, get_free_port
 
 
-def _test_all2all(rank, world_size, port, elems, iterations, warmup):
+def _test_all2all(rank, world_size, port, elems, iterations, warmup, use_async=False):
     """Worker function for each process"""
 
     with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
@@ -96,12 +96,12 @@ def _test_all2all(rank, world_size, port, elems, iterations, warmup):
 
         # Input is refreshed each iteration with an iter-dependent value so that
         # stale flags (the flag-reset bug) produce detectably wrong output on call 2+.
-        # Pattern: PE i sends (i+1)*1000 + dest_pe + iter*100000 to PE dest_pe.
+        # Pattern: PE i sends iter*100000 + (i+1)*1000 + dest_pe to PE dest_pe.
         input_data_cpu = np.zeros(elems_per_pe * npes, dtype=np.uint32)
 
         def refresh_input(iter_idx):
             for dest_pe in range(npes):
-                value = (my_pe + 1) * 1000 + dest_pe + iter_idx * 100000
+                value = iter_idx * 100000 + (my_pe + 1) * 1000 + dest_pe
                 input_data_cpu[dest_pe * elems_per_pe : (dest_pe + 1) * elems_per_pe] = value
             input_tensor.copy_(torch.from_numpy(input_data_cpu))
 
@@ -110,7 +110,7 @@ def _test_all2all(rank, world_size, port, elems, iterations, warmup):
             ok = True
             for src_pe in range(npes):
                 chunk = output_data_cpu[src_pe * elems_per_pe : (src_pe + 1) * elems_per_pe]
-                expected = (src_pe + 1) * 1000 + my_pe + iter_idx * 100000
+                expected = iter_idx * 100000 + (src_pe + 1) * 1000 + my_pe
                 if not np.all(chunk == expected):
                     print(f"PE {rank}: iter {iter_idx} chunk from PE {src_pe} FAILED! "
                           f"expected={expected} got unique={np.unique(chunk)[:5]}")
@@ -118,7 +118,7 @@ def _test_all2all(rank, world_size, port, elems, iterations, warmup):
             return ok
 
         if rank == 0:
-            print(f"PE {rank}: Input refreshed each iteration — pattern: (src+1)*1000 + dest + iter*100000")
+            print(f"PE {rank}: Input refreshed each iteration — pattern: iter*100000 + (src+1)*1000 + dest")
 
         # Create CUDA stream for all2all operations (similar to test_allgather.py)
         stream = torch.cuda.Stream(device=device)
@@ -129,7 +129,6 @@ def _test_all2all(rank, world_size, port, elems, iterations, warmup):
         # Execute All2All multiple times
         exec_times = []
         total_iters = warmup + iterations
-        use_async = False  # Use async mode to match C++ test
 
         if not use_async:
             # Synchronous mode (single SDMA queue) - add timing and stream
@@ -195,6 +194,8 @@ def _test_all2all(rank, world_size, port, elems, iterations, warmup):
                     stage = "Warmup" if iter_idx < warmup else "Measurement"
                     print(f"\n--- {stage} Iteration {iter_idx + 1} ---")
 
+                # Refresh input with iter-dependent values to catch stale-flag bug
+                refresh_input(iter_idx)
                 dist.barrier()
 
                 # Start async operation using context manager style (like test_allgather.py)
@@ -216,6 +217,12 @@ def _test_all2all(rank, world_size, port, elems, iterations, warmup):
 
                 # Synchronize stream to ensure completion (like test_allgather.py)
                 stream.synchronize()
+
+                # Per-iteration correctness check
+                if not verify_output(iter_idx):
+                    success = False
+                    print(f"PE {rank}: Correctness check failed at iteration {iter_idx}")
+                    break
 
                 # Collect times after warmup
                 if iter_idx >= warmup:
@@ -266,7 +273,7 @@ def _test_all2all(rank, world_size, port, elems, iterations, warmup):
                 chunk = output_data_cpu[
                     src_pe * elems_per_pe : (src_pe + 1) * elems_per_pe
                 ]
-                expected_value = (src_pe + 1) * 1000 + my_pe + (total_iters - 1) * 100000
+                expected_value = (total_iters - 1) * 100000 + (src_pe + 1) * 1000 + my_pe
 
                 if not np.all(chunk == expected_value):
                     print(f"PE {rank}: Chunk from PE {src_pe} verification FAILED!")
@@ -307,7 +314,7 @@ def _test_all2all(rank, world_size, port, elems, iterations, warmup):
                     transit_buffer_chunk = transit_chunk[
                         src_pe * elems_per_pe : (src_pe + 1) * elems_per_pe
                     ]
-                    expected_value = (src_pe + 1) * 1000 + my_pe + (total_iters - 1) * 100000
+                    expected_value = (total_iters - 1) * 100000 + (src_pe + 1) * 1000 + my_pe
                     if np.all(transit_buffer_chunk == expected_value):
                         if rank == 0:
                             print(
@@ -374,13 +381,13 @@ def _test_all2all(rank, world_size, port, elems, iterations, warmup):
             raise AssertionError(f"PE {rank}: All2All verification failed")
 
 
-def test_all2all(elems=67108864, world_size=8, iterations=10, warmup=10):
+def test_all2all(elems=67108864, world_size=8, iterations=10, warmup=10, use_async=False):
     """Run All2All SDMA test"""
     os.environ.setdefault("MORI_ENABLE_SDMA", "1")
     port = get_free_port()
     torch.multiprocessing.spawn(
         _test_all2all,
-        args=(world_size, port, elems, iterations, warmup),
+        args=(world_size, port, elems, iterations, warmup, use_async),
         nprocs=world_size,
         join=True,
     )
@@ -402,6 +409,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--enable-sdma", type=int, default=1, choices=[0, 1], help="Enable SDMA"
     )
+    parser.add_argument(
+        "--async", dest="use_async", action="store_true", help="Use async mode (start_async + wait_async)"
+    )
     args = parser.parse_args()
     os.environ["MORI_ENABLE_SDMA"] = str(args.enable_sdma)
 
@@ -410,6 +420,7 @@ if __name__ == "__main__":
     print(f"  World size: {args.world_size}")
     print(f"  Iterations: {args.iterations}")
     print(f"  Warmup: {args.warmup}")
+    print(f"  Mode: {'async' if args.use_async else 'sync'}")
     print("-" * 60)
 
-    test_all2all(args.elems, args.world_size, args.iterations, args.warmup)
+    test_all2all(args.elems, args.world_size, args.iterations, args.warmup, args.use_async)
