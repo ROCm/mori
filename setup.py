@@ -253,6 +253,10 @@ def _copy_jit_sources(root_dir: Path) -> None:
     if io_kernels_src.is_dir():
         _copytree(io_kernels_src, jit_dir / "src" / "io" / "kernels")
 
+    ccl_kernels_src = root_dir / "src" / "collective" / "kernels"
+    if ccl_kernels_src.is_dir():
+        _copytree(ccl_kernels_src, jit_dir / "src" / "collective" / "kernels")
+
     shmem_dst = jit_dir / "src" / "shmem"
     shmem_dst.mkdir(parents=True, exist_ok=True)
     for name in ["shmem_device_api_wrapper.cpp"]:
@@ -435,11 +439,12 @@ class CMakeBuild(build_ext):
                 build_dir / "src/io/libmori_io.so",
                 root_dir / "python/mori/libmori_io.so",
             ),
-            (
-                build_dir / "src/collective/libmori_collective.so",
-                root_dir / "python/mori/libmori_collective.so",
-            ),
         ]
+        collective_so = build_dir / "src/collective/libmori_collective.so"
+        if collective_so.exists():
+            files_to_copy.append(
+                (collective_so, root_dir / "python/mori/libmori_collective.so")
+            )
         for src_path, dst_path in files_to_copy:
             shutil.copyfile(src_path, dst_path)
 
@@ -561,11 +566,12 @@ mori_package_data = [
     "libmori_ops.so",
     "libmori_io.so",
     "libmori_application.so",
-    "libmori_collective.so",
+    "libmori_collective.so",  # optional: only present when BUILD_COLLECTIVE=ON
     "spdk_proxy",
     "umbp_master",
     "_jit-sources/include/**/*.hpp",
     "_jit-sources/include/**/*.h",
+    "_jit-sources/include/**/*.cuh",
     "_jit-sources/src/**/*.hip",
     "_jit-sources/src/**/*.hpp",
     "_jit-sources/src/**/*.cpp",

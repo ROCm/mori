@@ -31,12 +31,12 @@
 namespace mori {
 namespace collective {
 template <typename T>
-__global__ void OneShotAllGatherSdmaKernel(int myPe, int npes, T* input,
-                                           const application::SymmMemObjPtr srcMemObj,
-                                           const application::SymmMemObjPtr dstMemObj,
-                                           const application::SymmMemObjPtr flagsMemObj,
-                                           size_t elementCount, size_t dstBaseOffset = 0,
-                                           uint64_t flagVal = 1) {
+__device__ void OneShotAllGatherSdmaKernel_body(int myPe, int npes, T* input,
+                                                const application::SymmMemObjPtr srcMemObj,
+                                                const application::SymmMemObjPtr dstMemObj,
+                                                const application::SymmMemObjPtr flagsMemObj,
+                                                size_t elementCount, size_t dstBaseOffset = 0,
+                                                uint64_t flagVal = 1) {
   if (elementCount == 0 || npes <= 0) {
     return;
   }
@@ -109,6 +109,17 @@ __global__ void OneShotAllGatherSdmaKernel(int myPe, int npes, T* input,
   }
 
   // Monotonic generation flags; no reset needed.
+}
+
+template <typename T>
+__global__ void OneShotAllGatherSdmaKernel(int myPe, int npes, T* input,
+                                           const application::SymmMemObjPtr srcMemObj,
+                                           const application::SymmMemObjPtr dstMemObj,
+                                           const application::SymmMemObjPtr flagsMemObj,
+                                           size_t elementCount, size_t dstBaseOffset = 0,
+                                           uint64_t flagVal = 1) {
+  OneShotAllGatherSdmaKernel_body<T>(myPe, npes, input, srcMemObj, dstMemObj, flagsMemObj,
+                                     elementCount, dstBaseOffset, flagVal);
 }
 }  // namespace collective
 }  // namespace mori

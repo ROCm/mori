@@ -20,27 +20,37 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from .collective import All2allSdma
-from .collective import AllgatherSdma
-from .collective import AllreduceSdma
+try:
+    from .collective import All2allSdma
+    from .collective import AllgatherSdma
+    from .collective import AllreduceSdma
 
-# NCCL/RCCL-style C++ AllGather-into-tensor dispatcher.  The class and its
-# DataType enum are implemented entirely in C++ (see
-# ``include/mori/collective/allgather/allgather_into_tensor.hpp`` and
-# ``src/collective/core/allgather_into_tensor.cpp``); we only re-export the
-# pybind11 symbols here so callers can do
-# ``from mori.ccl import AllGatherIntoTensor, DataType``.
-from mori import cpp as _mori_cpp
+    # NCCL/RCCL-style C++ AllGather-into-tensor dispatcher.  The class and its
+    # DataType enum are implemented entirely in C++ (see
+    # ``include/mori/collective/allgather/allgather_into_tensor.hpp`` and
+    # ``src/collective/core/allgather_into_tensor.cpp``); we only re-export the
+    # pybind11 symbols here so callers can do
+    # ``from mori.ccl import AllGatherIntoTensor, DataType``.
+    from mori import cpp as _mori_cpp
 
-AllGatherIntoTensor = _mori_cpp.AllGatherIntoTensor
-DataType = _mori_cpp.DataType
-size_of = _mori_cpp.size_of
+    AllGatherIntoTensor = _mori_cpp.AllGatherIntoTensor
+    DataType = _mori_cpp.DataType
+    size_of = _mori_cpp.size_of
 
-__all__ = [
-    "All2allSdma",
-    "AllgatherSdma",
-    "AllreduceSdma",
-    "AllGatherIntoTensor",
-    "DataType",
-    "size_of",
-]
+    __all__ = [
+        "All2allSdma",
+        "AllgatherSdma",
+        "AllreduceSdma",
+        "AllGatherIntoTensor",
+        "DataType",
+        "size_of",
+    ]
+except (ImportError, AttributeError):
+    __all__ = [
+        "All2allSdma",
+        "AllgatherSdma",
+        "AllreduceSdma",
+    ]
+
+    def __getattr__(name: str):
+        raise ImportError(f"mori.ccl.{name} is not available — not yet ported to JIT.")
