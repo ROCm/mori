@@ -417,12 +417,15 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
       proto_match->set_node_id(m.node_id);
       auto peer_it = peer_map.find(m.node_id);
       if (peer_it != peer_map.end()) proto_match->set_peer_address(peer_it->second);
-      for (const auto& hash : m.matched_hashes) proto_match->add_matched_hashes(hash);
-      proto_match->set_tier(static_cast<::umbp::TierType>(m.tier));
+      for (const auto& [tier, hashes] : m.hashes_by_tier) {
+        auto* proto_bucket = proto_match->add_hashes_by_tier();
+        proto_bucket->set_tier(static_cast<::umbp::TierType>(tier));
+        for (const auto& hash : hashes) proto_bucket->add_hashes(hash);
+      }
     }
 
     size_t total_matched = 0;
-    for (const auto& m : matches) total_matched += m.matched_hashes.size();
+    for (const auto& m : matches) total_matched += m.MatchedHashCount();
     if (metrics_) {
       metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_MATCH_TOTAL,
                            MORI_UMBP_METRIC_EXT_KV_MATCH_TOTAL_HELP);

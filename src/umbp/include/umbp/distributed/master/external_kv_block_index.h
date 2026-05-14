@@ -21,6 +21,7 @@
 // SOFTWARE.
 #pragma once
 
+#include <map>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
@@ -53,8 +54,18 @@ class ExternalKvBlockIndex {
 
   struct NodeMatch {
     std::string node_id;
-    std::vector<std::string> matched_hashes;
-    TierType tier = TierType::UNKNOWN;
+    // Matched hashes grouped by the tier they live on for this node.
+    // The same hash never appears in two tiers (Register overwrites).
+    // std::map keys iterate in sorted order, so the smallest TierType
+    // value with a non-empty bucket is the fastest available tier.
+    std::map<TierType, std::vector<std::string>> hashes_by_tier;
+
+    // Convenience: total matched hash count across all tiers.
+    size_t MatchedHashCount() const {
+      size_t total = 0;
+      for (const auto& [tier, hashes] : hashes_by_tier) total += hashes.size();
+      return total;
+    }
   };
 
   // Return per-node matches across all queried hashes.

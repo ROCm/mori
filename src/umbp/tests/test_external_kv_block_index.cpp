@@ -48,6 +48,17 @@ static const ExternalKvBlockIndex::NodeMatch* FindMatch(
   return nullptr;
 }
 
+// All matched hashes for a node, regardless of tier.
+static std::vector<std::string> AllHashesSorted(
+    const ExternalKvBlockIndex::NodeMatch& m) {
+  std::vector<std::string> all;
+  for (const auto& [tier, hashes] : m.hashes_by_tier) {
+    all.insert(all.end(), hashes.begin(), hashes.end());
+  }
+  std::sort(all.begin(), all.end());
+  return all;
+}
+
 // ---- Tests ------------------------------------------------------------------
 
 TEST(ExternalKvBlockIndex, RegisterAndMatchBasic) {
@@ -57,8 +68,10 @@ TEST(ExternalKvBlockIndex, RegisterAndMatchBasic) {
   auto matches = idx.Match({"h1", "h2"});
   ASSERT_EQ(matches.size(), 1u);
   EXPECT_EQ(matches[0].node_id, "node-A");
-  EXPECT_EQ(matches[0].tier, TierType::DRAM);
-  EXPECT_EQ(matches[0].matched_hashes.size(), 2u);
+  EXPECT_EQ(matches[0].MatchedHashCount(), 2u);
+  ASSERT_EQ(matches[0].hashes_by_tier.size(), 1u);
+  ASSERT_TRUE(matches[0].hashes_by_tier.count(TierType::DRAM));
+  EXPECT_EQ(matches[0].hashes_by_tier.at(TierType::DRAM).size(), 2u);
 }
 
 TEST(ExternalKvBlockIndex, RegisterOverwritesTier) {
@@ -68,7 +81,11 @@ TEST(ExternalKvBlockIndex, RegisterOverwritesTier) {
 
   auto matches = idx.Match({"h1"});
   ASSERT_EQ(matches.size(), 1u);
-  EXPECT_EQ(matches[0].tier, TierType::SSD);
+  // After overwrite, h1 should only appear under SSD.
+  ASSERT_EQ(matches[0].hashes_by_tier.size(), 1u);
+  ASSERT_TRUE(matches[0].hashes_by_tier.count(TierType::SSD));
+  EXPECT_EQ(matches[0].hashes_by_tier.at(TierType::SSD), (std::vector<std::string>{"h1"}));
+  EXPECT_FALSE(matches[0].hashes_by_tier.count(TierType::DRAM));
 }
 
 TEST(ExternalKvBlockIndex, UnregisterRemovesSpecificHashes) {
@@ -80,10 +97,7 @@ TEST(ExternalKvBlockIndex, UnregisterRemovesSpecificHashes) {
   ASSERT_EQ(matches.size(), 1u);
   const auto& m = matches[0];
   EXPECT_EQ(m.node_id, "node-A");
-
-  std::vector<std::string> sorted_hashes = m.matched_hashes;
-  std::sort(sorted_hashes.begin(), sorted_hashes.end());
-  EXPECT_EQ(sorted_hashes, (std::vector<std::string>{"h1", "h3"}));
+  EXPECT_EQ(AllHashesSorted(m), (std::vector<std::string>{"h1", "h3"}));
 
   // h2 specifically is gone
   auto h2_matches = idx.Match({"h2"});
@@ -102,9 +116,9 @@ TEST(ExternalKvBlockIndex, UnregisterByNodeRemovesAllHashes) {
 
   const auto* mb = FindMatch(matches, "node-B");
   ASSERT_NE(mb, nullptr);
-  std::vector<std::string> sorted_hashes = mb->matched_hashes;
-  std::sort(sorted_hashes.begin(), sorted_hashes.end());
-  EXPECT_EQ(sorted_hashes, (std::vector<std::string>{"h1", "h3"}));
+  EXPECT_EQ(AllHashesSorted(*mb), (std::vector<std::string>{"h1", "h3"}));
+  ASSERT_EQ(mb->hashes_by_tier.size(), 1u);
+  ASSERT_TRUE(mb->hashes_by_tier.count(TierType::HBM));
 }
 
 TEST(ExternalKvBlockIndex, MatchWithNoHitsReturnsEmpty) {
@@ -135,35 +149,47 @@ TEST(ExternalKvBlockIndex, MatchAcrossMultipleNodesCorrectGrouping) {
 
   const auto* ma = FindMatch(matches, "node-A");
   ASSERT_NE(ma, nullptr);
-  EXPECT_EQ(ma->tier, TierType::DRAM);
-  std::vector<std::string> a_hashes = ma->matched_hashes;
+  ASSERT_TRUE(ma->hashes_by_tier.count(TierType::DRAM));
+  std::vector<std::string> a_hashes = ma->hashes_by_tier.at(TierType::DRAM);
   std::sort(a_hashes.begin(), a_hashes.end());
   EXPECT_EQ(a_hashes, (std::vector<std::string>{"h1", "h2"}));
 
   const auto* mb = FindMatch(matches, "node-B");
   ASSERT_NE(mb, nullptr);
-  EXPECT_EQ(mb->tier, TierType::SSD);
-  std::vector<std::string> b_hashes = mb->matched_hashes;
+  ASSERT_TRUE(mb->hashes_by_tier.count(TierType::SSD));
+  std::vector<std::string> b_hashes = mb->hashes_by_tier.at(TierType::SSD);
   std::sort(b_hashes.begin(), b_hashes.end());
   EXPECT_EQ(b_hashes, (std::vector<std::string>{"h2", "h3"}));
 }
 
-TEST(ExternalKvBlockIndex, MatchReturnsFastestTierForMixedNodeHits) {
+TEST(ExternalKvBlockIndex, MatchSplitsHashesAcrossTiersOnSameNode) {
+  // A single node holding the same prefix on multiple tiers must report each
+  // hash under its actual tier (the cost model needs per-tier counts).
   ExternalKvBlockIndex idx;
-  idx.Register("node-A", {"h1"}, TierType::SSD);
-  idx.Register("node-A", {"h2"}, TierType::HBM);
-  idx.Register("node-A", {"h3"}, TierType::DRAM);
+  idx.Register("node-A", {"h1"}, TierType::HBM);
+  idx.Register("node-A", {"h2", "h3"}, TierType::DRAM);
+  idx.Register("node-A", {"h4"}, TierType::SSD);
 
-  auto matches = idx.Match({"h1", "h2", "h3"});
+  auto matches = idx.Match({"h1", "h2", "h3", "h4"});
   ASSERT_EQ(matches.size(), 1u);
-  EXPECT_EQ(matches[0].tier, TierType::HBM);
+  const auto& m = matches[0];
+  EXPECT_EQ(m.MatchedHashCount(), 4u);
+  ASSERT_EQ(m.hashes_by_tier.size(), 3u);
+  EXPECT_EQ(m.hashes_by_tier.at(TierType::HBM), (std::vector<std::string>{"h1"}));
 
-  std::vector<std::string> hashes = matches[0].matched_hashes;
-  std::sort(hashes.begin(), hashes.end());
-  EXPECT_EQ(hashes, (std::vector<std::string>{"h1", "h2", "h3"}));
+  std::vector<std::string> dram_hashes = m.hashes_by_tier.at(TierType::DRAM);
+  std::sort(dram_hashes.begin(), dram_hashes.end());
+  EXPECT_EQ(dram_hashes, (std::vector<std::string>{"h2", "h3"}));
+
+  EXPECT_EQ(m.hashes_by_tier.at(TierType::SSD), (std::vector<std::string>{"h4"}));
+
+  // std::map iterates in tier order, so begin() is the fastest tier.
+  EXPECT_EQ(m.hashes_by_tier.begin()->first, TierType::HBM);
 }
 
-TEST(ExternalKvBlockIndex, MatchDoesNotLetUnknownOverrideKnownTier) {
+TEST(ExternalKvBlockIndex, MatchPreservesUnknownTierBucket) {
+  // UNKNOWN-tier registrations are kept under their own bucket so callers
+  // can decide whether to treat them as cache hits or ignore them.
   ExternalKvBlockIndex idx;
   idx.Register("node-A", {"h1"}, TierType::DRAM);
   idx.Register("node-A", {"h2"}, TierType::UNKNOWN);
@@ -175,11 +201,13 @@ TEST(ExternalKvBlockIndex, MatchDoesNotLetUnknownOverrideKnownTier) {
 
   const auto* ma = FindMatch(matches, "node-A");
   ASSERT_NE(ma, nullptr);
-  EXPECT_EQ(ma->tier, TierType::DRAM);
+  EXPECT_EQ(ma->hashes_by_tier.at(TierType::DRAM), (std::vector<std::string>{"h1"}));
+  EXPECT_EQ(ma->hashes_by_tier.at(TierType::UNKNOWN), (std::vector<std::string>{"h2"}));
 
   const auto* mb = FindMatch(matches, "node-B");
   ASSERT_NE(mb, nullptr);
-  EXPECT_EQ(mb->tier, TierType::SSD);
+  EXPECT_EQ(mb->hashes_by_tier.at(TierType::UNKNOWN), (std::vector<std::string>{"h1"}));
+  EXPECT_EQ(mb->hashes_by_tier.at(TierType::SSD), (std::vector<std::string>{"h2"}));
 }
 
 TEST(ExternalKvBlockIndex, UnregisterNonExistentHashIsNoOp) {

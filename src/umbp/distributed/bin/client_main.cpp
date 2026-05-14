@@ -176,7 +176,7 @@ int main(int argc, char** argv) {
     auto match_status = client.MatchExternalKv(live_ext_kv_hashes, &matches);
     if (match_status.ok()) {
       size_t total_matched = 0;
-      for (const auto& m : matches) total_matched += m.matched_hashes.size();
+      for (const auto& m : matches) total_matched += m.MatchedHashCount();
       MORI_UMBP_INFO(
           "[Client] Iteration {} MatchExternalKv: queried={}, matched_nodes={}, "
           "total_matched_hashes={}",

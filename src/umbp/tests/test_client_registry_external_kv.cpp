@@ -79,8 +79,10 @@ TEST(ClientRegistryExternalKv, RegisterAcceptedForAliveNode) {
   auto matches = ekv.Match({"h1", "h2"});
   ASSERT_EQ(matches.size(), 1u);
   EXPECT_EQ(matches[0].node_id, "node-A");
-  EXPECT_EQ(matches[0].tier, TierType::DRAM);
-  EXPECT_EQ(matches[0].matched_hashes.size(), 2u);
+  EXPECT_EQ(matches[0].MatchedHashCount(), 2u);
+  ASSERT_EQ(matches[0].hashes_by_tier.size(), 1u);
+  ASSERT_TRUE(matches[0].hashes_by_tier.count(TierType::DRAM));
+  EXPECT_EQ(matches[0].hashes_by_tier.at(TierType::DRAM).size(), 2u);
 }
 
 TEST(ClientRegistryExternalKv, UnregisterClientClearsExternalKv) {
@@ -118,7 +120,7 @@ TEST(ClientRegistryExternalKv, UnregisterExternalKvBlocksRemovesSpecificHashes) 
 
   auto matches = ekv.Match({"h1", "h2", "h3"});
   ASSERT_EQ(matches.size(), 1u);
-  EXPECT_EQ(matches[0].matched_hashes.size(), 2u);
+  EXPECT_EQ(matches[0].MatchedHashCount(), 2u);
 
   auto h2_match = ekv.Match({"h2"});
   EXPECT_TRUE(h2_match.empty());

@@ -225,11 +225,20 @@ message RevokeExternalKvBlocksResponse {}
 message MatchExternalKvRequest {
   repeated string hashes = 1;
 }
+// Per-tier bucket of matched hashes for a single node.
+// proto3 disallows map<int, repeated_string>, so we use a wrapper.
+message TierHashes {
+  TierType tier          = 1;
+  repeated string hashes = 2;
+}
 message ExternalKvNodeMatch {
-  string node_id                 = 1;
-  string peer_address            = 2;
-  repeated string matched_hashes = 3;
-  TierType tier                  = 4;
+  string node_id                     = 1;
+  string peer_address                = 2;
+  // Matched hashes grouped by the tier they live on for this node.
+  // The same hash never appears in two tiers (Register overwrites).
+  // Total matched count = sum of hashes.size() across all entries.
+  // Best (fastest) tier  = min key with non-empty hashes.
+  repeated TierHashes hashes_by_tier = 3;
 }
 message MatchExternalKvResponse {
   repeated ExternalKvNodeMatch matches = 1;

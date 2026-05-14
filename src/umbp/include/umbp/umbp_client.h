@@ -23,6 +23,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -122,8 +123,18 @@ class IUMBPClient {
   struct ExternalKvMatch {
     std::string node_id;
     std::string peer_address;
-    std::vector<std::string> matched_hashes;
-    TierType tier = TierType::UNKNOWN;
+    // Matched hashes grouped by the tier they live on for this node.
+    // The same hash never appears in two tiers (Register overwrites).
+    // std::map keys iterate in sorted order, so the smallest TierType
+    // value with a non-empty bucket is the fastest available tier.
+    std::map<TierType, std::vector<std::string>> hashes_by_tier;
+
+    // Convenience: total matched hash count across all tiers.
+    size_t MatchedHashCount() const {
+      size_t total = 0;
+      for (const auto& [tier, hashes] : hashes_by_tier) total += hashes.size();
+      return total;
+    }
   };
 
   /// Query which nodes hold any of the given hashes.

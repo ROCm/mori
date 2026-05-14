@@ -695,8 +695,10 @@ grpc::Status MasterClient::MatchExternalKv(const std::vector<std::string>& hashe
       ExternalKvNodeMatch out;
       out.node_id = m.node_id();
       out.peer_address = m.peer_address();
-      out.matched_hashes.assign(m.matched_hashes().begin(), m.matched_hashes().end());
-      out.tier = FromProtoTier(m.tier());
+      for (const auto& bucket : m.hashes_by_tier()) {
+        auto& vec = out.hashes_by_tier[FromProtoTier(bucket.tier())];
+        vec.assign(bucket.hashes().begin(), bucket.hashes().end());
+      }
       out_matches->push_back(std::move(out));
     }
   }

@@ -191,8 +191,9 @@ def test_report_and_match_external_kv_dram(master_address):
         assert len(matches) == 1
         match = matches[0]
         assert match.node_id == node_id
-        assert match.tier == UMBPTierType.DRAM
-        assert set(match.matched_hashes) == set(hashes)
+        assert match.matched_hash_count() == len(hashes)
+        assert UMBPTierType.DRAM in match.hashes_by_tier
+        assert set(match.hashes_by_tier[UMBPTierType.DRAM]) == set(hashes)
 
 
 def test_report_and_match_external_kv_hbm(master_address):
@@ -208,8 +209,8 @@ def test_report_and_match_external_kv_hbm(master_address):
         assert node_id in node_ids
         for m in matches:
             if m.node_id == node_id:
-                assert m.tier == UMBPTierType.HBM
-                assert set(m.matched_hashes).issubset(set(hashes))
+                assert UMBPTierType.HBM in m.hashes_by_tier
+                assert set(m.hashes_by_tier[UMBPTierType.HBM]).issubset(set(hashes))
 
 
 def test_match_returns_only_subset_of_queried_hashes(master_address):
@@ -223,7 +224,7 @@ def test_match_returns_only_subset_of_queried_hashes(master_address):
         query = reported[:3] + extra
         matches = client.match_external_kv(query)
 
-        all_matched = {h for m in matches for h in m.matched_hashes}
+        all_matched = {h for m in matches for hs in m.hashes_by_tier.values() for h in hs}
         assert all_matched.issubset(set(reported))
         assert not all_matched.intersection(set(extra))
 
@@ -256,7 +257,8 @@ def test_revoke_partial_hashes(master_address):
             h
             for m in client.match_external_kv(to_keep)
             if m.node_id == node_id
-            for h in m.matched_hashes
+            for hs in m.hashes_by_tier.values()
+            for h in hs
         }
         assert kept_matched == set(to_keep)
 
@@ -264,7 +266,8 @@ def test_revoke_partial_hashes(master_address):
             h
             for m in client.match_external_kv(to_revoke)
             if m.node_id == node_id
-            for h in m.matched_hashes
+            for hs in m.hashes_by_tier.values()
+            for h in hs
         }
         assert revoked_matched == set()
 
@@ -311,10 +314,10 @@ def test_revoke_nonexistent_hashes_does_not_raise(master_address):
 def test_external_kv_node_match_repr():
     match = UMBPExternalKvNodeMatch()
     match.node_id = "my-node"
-    match.matched_hashes = ["h1", "h2"]
-    match.tier = UMBPTierType.HBM
+    match.hashes_by_tier = {UMBPTierType.HBM: ["h1", "h2"]}
     r = repr(match)
     assert "my-node" in r
+    assert match.matched_hash_count() == 2
 
 
 def test_match_external_kv_connection_refused_raises():
@@ -343,5 +346,5 @@ def test_large_batch_report_and_match(master_address):
         client.report_external_kv_blocks(node_id, hashes, UMBPTierType.DRAM)
 
         matches = client.match_external_kv(hashes)
-        all_matched = {h for m in matches for h in m.matched_hashes}
+        all_matched = {h for m in matches for hs in m.hashes_by_tier.values() for h in hs}
         assert set(hashes).issubset(all_matched)

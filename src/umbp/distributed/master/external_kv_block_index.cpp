@@ -67,35 +67,24 @@ std::vector<ExternalKvBlockIndex::NodeMatch> ExternalKvBlockIndex::Match(
     const std::vector<std::string>& hashes) const {
   std::shared_lock lock(mutex_);
 
-  struct Accumulator {
-    TierType best_tier = TierType::UNKNOWN;
-    std::vector<std::string> matched_hashes;
-  };
-  std::unordered_map<std::string, Accumulator> acc;
+  // node_id -> (tier -> hashes).  Each (node, hash) is registered at exactly
+  // one tier (Register overwrites), so no de-dup is needed.
+  std::unordered_map<std::string, std::map<TierType, std::vector<std::string>>> acc;
 
   for (const auto& hash : hashes) {
     auto it = entries_.find(hash);
-    if (it == entries_.end()) {
-      continue;
-    }
+    if (it == entries_.end()) continue;
     for (const auto& [node_id, tier] : it->second) {
-      auto& entry = acc[node_id];
-      if (entry.best_tier == TierType::UNKNOWN ||
-          (tier != TierType::UNKNOWN &&
-           static_cast<int>(tier) < static_cast<int>(entry.best_tier))) {
-        entry.best_tier = tier;
-      }
-      entry.matched_hashes.push_back(hash);
+      acc[node_id][tier].push_back(hash);
     }
   }
 
   std::vector<NodeMatch> result;
   result.reserve(acc.size());
-  for (auto& [node_id, match] : acc) {
+  for (auto& [node_id, by_tier] : acc) {
     NodeMatch m;
     m.node_id = node_id;
-    m.tier = match.best_tier;
-    m.matched_hashes = std::move(match.matched_hashes);
+    m.hashes_by_tier = std::move(by_tier);
     result.push_back(std::move(m));
   }
   return result;

@@ -93,11 +93,11 @@ void RegisterMoriUmbp(py::module_& m) {
       .def(py::init<>())
       .def_readwrite("node_id", &IUMBPClient::ExternalKvMatch::node_id)
       .def_readwrite("peer_address", &IUMBPClient::ExternalKvMatch::peer_address)
-      .def_readwrite("matched_hashes", &IUMBPClient::ExternalKvMatch::matched_hashes)
-      .def_readwrite("tier", &IUMBPClient::ExternalKvMatch::tier)
+      .def_readwrite("hashes_by_tier", &IUMBPClient::ExternalKvMatch::hashes_by_tier)
+      .def("matched_hash_count", &IUMBPClient::ExternalKvMatch::MatchedHashCount)
       .def("__repr__", [](const IUMBPClient::ExternalKvMatch& m) {
         return "<UMBPExternalKvMatch node_id='" + m.node_id +
-               "' matched=" + std::to_string(m.matched_hashes.size()) + ">";
+               "' matched=" + std::to_string(m.MatchedHashCount()) + ">";
       });
 
   py::enum_<UMBPRole>(m, "UMBPRole")
@@ -255,11 +255,11 @@ void RegisterMoriUmbp(py::module_& m) {
       .def(py::init<>())
       .def_readwrite("node_id", &MasterClient::ExternalKvNodeMatch::node_id)
       .def_readwrite("peer_address", &MasterClient::ExternalKvNodeMatch::peer_address)
-      .def_readwrite("matched_hashes", &MasterClient::ExternalKvNodeMatch::matched_hashes)
-      .def_readwrite("tier", &MasterClient::ExternalKvNodeMatch::tier)
+      .def_readwrite("hashes_by_tier", &MasterClient::ExternalKvNodeMatch::hashes_by_tier)
+      .def("matched_hash_count", &MasterClient::ExternalKvNodeMatch::MatchedHashCount)
       .def("__repr__", [](const MasterClient::ExternalKvNodeMatch& m) {
         return "<UMBPExternalKvNodeMatch node_id='" + m.node_id +
-               "' matched=" + std::to_string(m.matched_hashes.size()) + ">";
+               "' matched=" + std::to_string(m.MatchedHashCount()) + ">";
       });
 
   py::class_<MasterClient>(m, "UMBPMasterClient")

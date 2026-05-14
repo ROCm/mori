@@ -272,8 +272,7 @@ std::vector<IUMBPClient::ExternalKvMatch> DistributedClient::MatchExternalKv(
     IUMBPClient::ExternalKvMatch m;
     m.node_id = std::move(r.node_id);
     m.peer_address = std::move(r.peer_address);
-    m.matched_hashes = std::move(r.matched_hashes);
-    m.tier = r.tier;
+    m.hashes_by_tier = std::move(r.hashes_by_tier);
     result.push_back(std::move(m));
   }
   return result;
