@@ -26,8 +26,8 @@
 #include <vector>
 
 #include "umbp/local/block_index/local_block_index.h"
-#include "umbp/local/storage/local_storage_manager.h"
-#include "umbp/local/umbp_client.h"
+#include "umbp/local/standalone_client.h"
+#include "umbp/local/tiers/local_storage_manager.h"
 
 using namespace mori::umbp;
 
@@ -331,7 +331,7 @@ void test_concurrent_depth_map_access() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 8: UMBPClient depth-aware batch put — BatchPutFromPtrWithDepth.
+// Test 8: StandaloneClient depth-aware batch put — BatchPutWithDepth.
 // ---------------------------------------------------------------------------
 void test_umbp_client_batch_put_with_depth() {
   std::cout << "test_umbp_client_batch_put_with_depth... ";
@@ -342,7 +342,7 @@ void test_umbp_client_batch_put_with_depth() {
   cfg.eviction.policy = "prefix_aware_lru";
   cfg.eviction.candidate_window = 16;
 
-  UMBPClient client(cfg);
+  StandaloneClient client(cfg);
 
   std::vector<char> data(512, 'Z');
   uintptr_t src = reinterpret_cast<uintptr_t>(data.data());
@@ -352,7 +352,7 @@ void test_umbp_client_batch_put_with_depth() {
   std::vector<size_t> sizes = {512, 512, 512};
   std::vector<int> depths = {0, 3, 7};
 
-  auto results = client.BatchPutFromPtrWithDepth(keys, ptrs, sizes, depths);
+  auto results = client.BatchPutWithDepth(keys, ptrs, sizes, depths);
   assert(results.size() == 3);
   assert(results[0] && results[1] && results[2]);
 
@@ -361,7 +361,7 @@ void test_umbp_client_batch_put_with_depth() {
   assert(client.Exists("key_c_0_k"));
 
   // Dedup: re-putting same keys should succeed (already exist).
-  auto results2 = client.BatchPutFromPtrWithDepth(keys, ptrs, sizes, depths);
+  auto results2 = client.BatchPutWithDepth(keys, ptrs, sizes, depths);
   assert(results2[0] && results2[1] && results2[2]);
 
   std::cout << "PASSED" << std::endl;

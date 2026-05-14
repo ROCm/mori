@@ -77,12 +77,17 @@ from mori.cpp import (
     UMBPDistributedConfig,
     UMBPDramConfig,
     UMBPDurabilityMode,
+    UMBPHostBufferBacking,
+    UMBPHostBufferHandle,
+    UMBPHostMemAllocator,
     UMBPIoBackend,
     UMBPIoConfig,
     UMBPRole,
     UMBPSsdConfig,
     UMBPEvictionConfig,
     UMBPDurabilityConfig,
+    UMBPTierType,
+    UMBPExternalKvMatch,
 )
 
 __all__ = [
@@ -93,9 +98,14 @@ __all__ = [
     "UMBPDramConfig",
     "UMBPDurabilityConfig",
     "UMBPDurabilityMode",
+    "UMBPHostBufferBacking",
+    "UMBPHostBufferHandle",
+    "UMBPHostMemAllocator",
     "UMBPIoBackend",
     "UMBPIoConfig",
     "UMBPRole",
     "UMBPSsdConfig",
     "UMBPEvictionConfig",
+    "UMBPTierType",
+    "UMBPExternalKvMatch",
 ]

@@ -21,17 +21,12 @@
 // SOFTWARE.
 #pragma once
 
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
-#include <map>
-#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
-
-#include "umbp/common/types.h"
 
 namespace mori::umbp {
 
@@ -63,6 +58,12 @@ struct UMBPDramConfig {
   std::string shm_name = "/umbp_dram";
   double high_watermark = 0.9;
   double low_watermark = 0.7;
+
+  // Host memory options (ignored when use_shared_memory=true).
+  bool use_hugepages = false;
+  size_t hugepage_size = 2ULL * 1024 * 1024;  // 2 MiB
+  int numa_node = -1;                         // -1 = no NUMA binding
+  bool prefault = true;
 };
 
 struct UMBPIoConfig {
@@ -98,23 +99,43 @@ struct UMBPCopyPipelineConfig {
   size_t batch_max_ops = 128;
 };
 
-// User-facing distributed configuration. Set UMBPConfig::distributed to enable
-// distributed mode. Internally translated to PoolClientConfig by UMBPClient.
-struct UMBPDistributedConfig {
+// Master-control-plane client parameters.  Shared between user-facing
+// UMBPDistributedConfig and the internal PoolClientConfig/MasterClient.
+struct UMBPMasterClientConfig {
   std::string master_address;  // e.g. "master-host:50051"
   std::string node_id;         // unique node identifier
   std::string node_address;    // this node's reachable address for peers
-
   bool auto_heartbeat = true;  // start heartbeat thread on Init
+  // Opaque key=value strings forwarded to master on RegisterClient and
+  // attached to all metrics emitted for this node.  e.g. "sgl_role=prefill".
+  std::vector<std::string> tags;
+};
 
-  std::string io_engine_host;   // RDMA engine hostname
-  uint16_t io_engine_port = 0;  // RDMA engine port (0 = no RDMA)
+// RDMA IO-engine endpoint parameters.
+struct UMBPIoEngineConfig {
+  std::string host;   // RDMA engine hostname (formerly UMBPDistributedConfig::io_engine_host)
+  uint16_t port = 0;  // RDMA engine port; 0 = OS-assigned ephemeral port (formerly io_engine_port)
+};
+
+// User-facing distributed configuration. Set UMBPConfig::distributed to enable
+// distributed mode. Internally translated to PoolClientConfig by DistributedClient.
+struct UMBPDistributedConfig {
+  UMBPMasterClientConfig master_config;
+  UMBPIoEngineConfig io_engine;
 
   size_t staging_buffer_size = 64ULL * 1024 * 1024;  // 64 MB
 
   uint16_t peer_service_port = 0;  // gRPC peer service port
 
   bool cache_remote_fetches = true;  // cache remotely-fetched blocks locally
+
+  // Page size used by Master's PageBitmapAllocator for this node's DRAM/HBM
+  // tier.  Reported via RegisterClient.  Same value applies to both DRAM
+  // and HBM.  Forwarded to PoolClientConfig::dram_page_size by
+  // DistributedClient unmodified.
+  // 0 = delegate to Master's ClientRegistryConfig::default_dram_page_size
+  // (2 MiB by default).  Set to an explicit byte count to override.
+  uint64_t dram_page_size = 0;
 };
 
 struct UMBPConfig {
@@ -153,8 +174,8 @@ struct UMBPConfig {
   bool follower_mode = false;
   bool force_ssd_copy_on_write = false;
 
-  // Optional distributed mode. When set, UMBPClient creates an internal
-  // PoolClient that connects to the Master and sends periodic heartbeats.
+  // Optional distributed mode. When set, DistributedClient wraps PoolClient
+  // that connects to the Master and sends periodic heartbeats.
   // nullopt (default) = local-only mode with no network dependencies.
   std::optional<UMBPDistributedConfig> distributed;
 
@@ -186,6 +207,11 @@ struct UMBPConfig {
         return false;
       }
     }
+    if (dram.use_hugepages && dram.hugepage_size != 0 &&
+        (dram.hugepage_size & (dram.hugepage_size - 1)) != 0) {
+      if (error_message) *error_message = "dram.hugepage_size must be a power of two";
+      return false;
+    }
     if (copy_pipeline.queue_depth == 0) {
       if (error_message) *error_message = "copy_pipeline.queue_depth must be > 0";
       return false;
@@ -204,16 +230,18 @@ struct UMBPConfig {
     }
     if (distributed.has_value()) {
       const auto& d = distributed.value();
-      if (d.master_address.empty()) {
-        if (error_message) *error_message = "distributed.master_address must not be empty";
+      if (d.master_config.master_address.empty()) {
+        if (error_message)
+          *error_message = "distributed.master_config.master_address must not be empty";
         return false;
       }
-      if (d.node_id.empty()) {
-        if (error_message) *error_message = "distributed.node_id must not be empty";
+      if (d.master_config.node_id.empty()) {
+        if (error_message) *error_message = "distributed.master_config.node_id must not be empty";
         return false;
       }
-      if (d.node_address.empty()) {
-        if (error_message) *error_message = "distributed.node_address must not be empty";
+      if (d.master_config.node_address.empty()) {
+        if (error_message)
+          *error_message = "distributed.master_config.node_address must not be empty";
         return false;
       }
     }
@@ -246,6 +274,11 @@ struct UMBPConfig {
     cfg.eviction.policy = getenv_str("UMBP_EVICTION_POLICY", cfg.eviction.policy);
     cfg.dram.high_watermark = getenv_double("UMBP_DRAM_HIGH_WM", cfg.dram.high_watermark);
     cfg.dram.low_watermark = getenv_double("UMBP_DRAM_LOW_WM", cfg.dram.low_watermark);
+    cfg.dram.use_hugepages =
+        getenv_int("UMBP_DRAM_USE_HUGEPAGES", cfg.dram.use_hugepages ? 1 : 0) != 0;
+    cfg.dram.hugepage_size = getenv_size("UMBP_DRAM_HUGEPAGE_SIZE", cfg.dram.hugepage_size);
+    cfg.dram.numa_node = getenv_int("UMBP_DRAM_NUMA_NODE", cfg.dram.numa_node);
+    cfg.dram.prefault = getenv_int("UMBP_DRAM_PREFAULT", cfg.dram.prefault ? 1 : 0) != 0;
 
     cfg.ssd_backend = getenv_str("UMBP_SSD_BACKEND", cfg.ssd_backend);
     if (cfg.ssd_backend == "posix" && !std::getenv("UMBP_SSD_BACKEND") &&
@@ -311,60 +344,6 @@ struct UMBPConfig {
 
     return cfg;
   }
-};
-
-// Forward declarations for strategy interfaces used by MasterServerConfig.
-class RouteGetStrategy;
-class RoutePutStrategy;
-
-// --- Distributed config structs ---
-
-struct ClientRegistryConfig {
-  std::chrono::seconds heartbeat_ttl{10};
-  std::chrono::seconds reaper_interval{5};
-  std::chrono::seconds allocation_ttl{30};
-  uint32_t max_missed_heartbeats = 3;
-};
-
-struct MasterClientConfig {
-  std::string master_address;
-  std::string node_id;
-  std::string node_address;
-  bool auto_heartbeat = true;
-};
-
-struct MasterServerConfig {
-  std::string listen_address = "0.0.0.0:50051";
-  ClientRegistryConfig registry_config;
-
-  std::unique_ptr<RouteGetStrategy> get_strategy;
-  std::unique_ptr<RoutePutStrategy> put_strategy;
-};
-
-struct ExportableDram {
-  void* buffer = nullptr;
-  size_t size = 0;
-};
-
-struct ExportableSsd {
-  std::string dir;
-  size_t capacity = 0;
-};
-
-struct PoolClientConfig {
-  MasterClientConfig master_config;
-
-  std::string io_engine_host;
-  uint16_t io_engine_port = 0;
-
-  size_t staging_buffer_size = 64ULL * 1024 * 1024;
-
-  std::vector<ExportableDram> dram_buffers;
-  std::vector<ExportableSsd> ssd_stores;
-
-  std::map<TierType, TierCapacity> tier_capacities;
-
-  uint16_t peer_service_port = 0;
 };
 
 }  // namespace mori::umbp

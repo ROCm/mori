@@ -24,24 +24,21 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
-#include "umbp/common/types.h"
+#include "umbp/distributed/types.h"
 
 namespace mori::umbp {
 
-/// Result returned by RoutePutStrategy::Select.
+/// Result of RoutePut: a routing advisory only.  Master owns no per-Put
+/// state — the writer follows up with peer.AllocateSlot to actually
+/// reserve capacity.  ENOSPC at peer triggers a retry with the failed
+/// node added to the exclude set.
 struct RoutePutResult {
   std::string node_id;
-  std::string node_address;
-  TierType tier;
-
   std::string peer_address;
-  std::vector<uint8_t> engine_desc_bytes;
-  std::vector<uint8_t> dram_memory_desc_bytes;
-  uint64_t allocated_offset = 0;
-  uint32_t buffer_index = 0;
-  std::string allocation_id;
+  TierType tier = TierType::UNKNOWN;
 };
 
 /// Abstract interface for RoutePut node placement.
@@ -51,18 +48,23 @@ class RoutePutStrategy {
   virtual ~RoutePutStrategy() = default;
 
   /// Select a target node from @p alive_clients that can accommodate
-  /// @p block_size bytes. Tier selection is the strategy's responsibility.
+  /// @p block_size bytes.  Tier selection is the strategy's responsibility.
+  /// Nodes whose `node_id` appears in @p exclude_nodes are skipped — the
+  /// caller has already failed against them (typically ENOSPC at the
+  /// peer's allocator) and would only fail again.
   /// @return nullopt if no suitable node exists.
-  virtual std::optional<RoutePutResult> Select(const std::vector<ClientRecord>& alive_clients,
-                                               uint64_t block_size) = 0;
+  virtual std::optional<RoutePutResult> Select(
+      const std::vector<ClientRecord>& alive_clients, uint64_t block_size,
+      const std::unordered_set<std::string>& exclude_nodes) = 0;
 };
 
 /// Default strategy: try tiers fastest-first (HBM -> DRAM -> SSD),
 /// pick the node with the most available space on the first tier that has capacity.
 class TierAwareMostAvailableStrategy : public RoutePutStrategy {
  public:
-  std::optional<RoutePutResult> Select(const std::vector<ClientRecord>& alive_clients,
-                                       uint64_t block_size) override;
+  std::optional<RoutePutResult> Select(
+      const std::vector<ClientRecord>& alive_clients, uint64_t block_size,
+      const std::unordered_set<std::string>& exclude_nodes) override;
 };
 
 }  // namespace mori::umbp

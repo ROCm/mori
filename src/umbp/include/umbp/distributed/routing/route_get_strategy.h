@@ -24,7 +24,7 @@
 #include <string>
 #include <vector>
 
-#include "umbp/common/types.h"
+#include "umbp/distributed/types.h"
 
 namespace mori::umbp {
 

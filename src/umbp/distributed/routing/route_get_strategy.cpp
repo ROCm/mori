@@ -22,18 +22,51 @@
 #include "umbp/distributed/routing/route_get_strategy.h"
 
 #include <random>
+#include <sstream>
+
+#include "mori/utils/mori_log.hpp"
 
 namespace mori::umbp {
 
+namespace {
+
+std::string SummarizeLocations(const std::vector<Location>& locations) {
+  if (locations.empty()) return "<empty>";
+  std::ostringstream oss;
+  bool first = true;
+  for (const auto& loc : locations) {
+    if (!first) oss << ", ";
+    first = false;
+    oss << loc.node_id << ':' << TierTypeName(loc.tier) << '/' << loc.size;
+  }
+  return oss.str();
+}
+
+}  // namespace
+
 Location RandomRouteGetStrategy::Select(const std::vector<Location>& locations,
                                         const std::string& /*node_id*/) {
+  if (locations.empty()) {
+    MORI_UMBP_WARN("[RouteGetStrategy] received empty location set; returning default Location");
+    return {};
+  }
+
   if (locations.size() == 1) {
-    return locations[0];
+    const auto& single = locations[0];
+    MORI_UMBP_INFO("[RouteGetStrategy] single candidate selected node={} tier={} size={}",
+                   single.node_id, TierTypeName(single.tier), single.size);
+    return single;
   }
 
   thread_local std::mt19937 rng{std::random_device{}()};
   std::uniform_int_distribution<size_t> dist(0, locations.size() - 1);
-  return locations[dist(rng)];
+  size_t choice = dist(rng);
+  const auto& selected = locations[choice];
+  MORI_UMBP_INFO(
+      "[RouteGetStrategy] {} candidates -> choice={} node={} tier={} size={}, candidates=[{}]",
+      locations.size(), choice, selected.node_id, TierTypeName(selected.tier), selected.size,
+      SummarizeLocations(locations));
+  return selected;
 }
 
 }  // namespace mori::umbp

@@ -9,6 +9,15 @@ set(SPDK_PKG_CONFIG_PATH
     CACHE STRING "Custom pkg-config path for SPDK")
 option(USE_SPDK "Enable SPDK support (auto-detected by default)" ON)
 
+# Test/bench-only build switch.  Covers (1) observability counter increments
+# inside distributed PoolClient and (2) virtual test seams (e.g.
+# IssueBatchWrite) used by failure-injection unit tests.  OFF in release —
+# counters compile away to (void)0; seams stay non-virtual for inlining.
+# Toggling this option changes class layout (vtable presence): test/release
+# object files MUST NOT be mixed-linked.
+option(MORI_UMBP_TESTING
+       "Enable PoolClient counters + virtual test seams for tests/bench" OFF)
+
 set(HAVE_SPDK FALSE)
 if(USE_SPDK)
   find_package(PkgConfig QUIET)
@@ -83,31 +92,32 @@ endif()
 # Core static library
 set(UMBP_CORE_SRCS
     local/block_index/local_block_index.cpp
-    local/storage/io/storage_io_driver.cpp
-    local/storage/io/posix_storage_io_driver.cpp
-    local/storage/io/io_uring_storage_io_driver.cpp
-    local/storage/copy_pipeline.cpp
-    local/storage/segment/segment_format.cpp
-    local/storage/segment/segment_index.cpp
-    local/storage/segment/segment_scanner.cpp
-    local/storage/segment/segment_writer.cpp
-    local/storage/tier_backend.cpp
-    local/storage/dram_tier.cpp
-    local/storage/ssd_tier.cpp
-    local/storage/dummy_ssd_tier.cpp
-    local/storage/local_storage_manager.cpp
-    local/umbp_client.cpp
-    allocator/offset_allocator.cpp)
+    storage/io/storage_io_driver.cpp
+    storage/io/posix_storage_io_driver.cpp
+    storage/io/io_uring_storage_io_driver.cpp
+    local/tiers/copy_pipeline.cpp
+    local/tiers/segment/segment_format.cpp
+    local/tiers/segment/segment_index.cpp
+    local/tiers/segment/segment_scanner.cpp
+    local/tiers/segment/segment_writer.cpp
+    local/tiers/tier_backend.cpp
+    local/tiers/dram_tier.cpp
+    local/host_mem_allocator.cpp
+    local/tiers/ssd_tier.cpp
+    local/tiers/dummy_ssd_tier.cpp
+    local/tiers/local_storage_manager.cpp
+    local/standalone_client.cpp
+    storage/spdk/offset_allocator.cpp)
 
 # SPDK Proxy client (shared memory IPC, no SPDK dependency — Linux only)
 if(UNIX)
-  list(APPEND UMBP_CORE_SRCS proxy/spdk_proxy_shm.cpp
-       local/storage/spdk_proxy_tier.cpp)
+  list(APPEND UMBP_CORE_SRCS storage/spdk/proxy/spdk_proxy_shm.cpp
+       local/tiers/spdk_proxy_tier.cpp)
 endif()
 
 if(HAVE_SPDK)
-  list(APPEND UMBP_CORE_SRCS local/storage/spdk/spdk_env.cpp
-       local/storage/spdk_ssd_tier.cpp)
+  list(APPEND UMBP_CORE_SRCS storage/spdk/spdk_env.cpp
+       local/tiers/spdk_ssd_tier.cpp)
 endif()
 
 add_library(umbp_core STATIC ${UMBP_CORE_SRCS})
@@ -143,7 +153,7 @@ if(HAVE_SPDK)
            -lelf)
 
   # SPDK Proxy daemon (owns SPDK, serves ranks via SHM IPC)
-  add_executable(spdk_proxy proxy/spdk_proxy_daemon.cpp)
+  add_executable(spdk_proxy storage/spdk/proxy/spdk_proxy_daemon.cpp)
   target_link_libraries(spdk_proxy PRIVATE umbp_core)
 endif()
 
@@ -157,7 +167,7 @@ endif()
 find_package(Protobuf QUIET)
 find_package(gRPC CONFIG QUIET)
 
-# This branch wires distributed PoolClient support directly into umbp_core, so
+# This branch wires distributed PoolClient support directly into umbp_common, so
 # gRPC + Protobuf are a required build dependency here.
 if(TARGET gRPC::grpc++)
   set(_GRPCPP_LIB gRPC::grpc++)
@@ -281,7 +291,11 @@ add_custom_command(
     ${_PROTOBUF_PROTOC} --proto_path=${UMBP_PROTO_DIR}
     --cpp_out=${UMBP_PROTO_GEN_DIR} --grpc_out=${UMBP_PROTO_GEN_DIR}
     --plugin=protoc-gen-grpc=${_GRPC_CPP_PLUGIN} ${UMBP_PEER_PROTO_FILE}
-  DEPENDS ${UMBP_PEER_PROTO_FILE}
+  # umbp_peer.proto imports umbp.proto for shared types (TierType, PageLocation,
+  # BufferMemoryDesc) — protoc reads it at generation time and the generated
+  # peer headers include "umbp.pb.h", so the peer generation depends on the
+  # master proto being present and current.
+  DEPENDS ${UMBP_PEER_PROTO_FILE} ${UMBP_PROTO_FILE} ${UMBP_PROTO_HDRS}
   COMMENT "Generating UMBP Peer protobuf/gRPC C++ sources"
   VERBATIM)
 
@@ -296,13 +310,18 @@ add_library(
   ${UMBP_PEER_GRPC_SRCS}
   distributed/master/global_block_index.cpp
   distributed/master/client_registry.cpp
+  distributed/master/external_kv_block_index.cpp
   distributed/master/master_server.cpp
   distributed/master/master_client.cpp
+  distributed/master/rpc_latency_timer.cpp
+  distributed/master/eviction_manager.cpp
   distributed/routing/router.cpp
   distributed/routing/route_get_strategy.cpp
   distributed/routing/route_put_strategy.cpp
+  distributed/peer/peer_dram_allocator.cpp
   distributed/peer/peer_service.cpp
-  distributed/pool_client.cpp)
+  distributed/pool_client.cpp
+  distributed/distributed_client.cpp)
 
 target_include_directories(
   umbp_common PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${UMBP_PROTO_GEN_DIR}
@@ -318,14 +337,25 @@ if(NOT EXISTS "${_PROTOBUF_COMPAT_DIR}/google")
 endif()
 target_include_directories(umbp_common BEFORE PUBLIC "${_PROTOBUF_COMPAT_DIR}")
 
-target_link_libraries(umbp_common PUBLIC mori_logging mori_io ${_PROTOBUF_LIBS}
-                                         ${_GRPCPP_LIB})
+target_link_libraries(umbp_common PUBLIC mori_logging mori_io mori_metrics
+                                         ${_PROTOBUF_LIBS} ${_GRPCPP_LIB})
 
 target_compile_features(umbp_common PUBLIC cxx_std_17)
 
-# Link umbp_core → umbp_common so UMBPClient can construct PoolClient and see
-# the generated protobuf/gRPC headers during compilation.
-target_link_libraries(umbp_core PUBLIC umbp_common)
+if(MORI_UMBP_TESTING)
+  target_compile_definitions(umbp_common PUBLIC MORI_UMBP_TESTING)
+endif()
+
+# NOTE: umbp_core no longer depends on umbp_common.  StandaloneClient has no
+# gRPC/Protobuf dependency.  Targets that need distributed features should link
+# umbp_common directly.
+target_link_libraries(umbp_core PUBLIC mori_logging)
+
+# Factory: references both StandaloneClient and DistributedClient, so it belongs
+# in umbp_common (which has the distributed symbols).  Runtime switching is via
+# config.distributed.has_value().
+target_sources(umbp_common
+               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/umbp_client_factory.cpp)
 
 # ---------- Master executable -------------------------------------------------
 
@@ -344,3 +374,5 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 target_link_libraries(umbp_client PRIVATE umbp_common ${_PROTOBUF_LIBS}
                                           ${_GRPCPP_LIB})
+
+add_subdirectory(tests)

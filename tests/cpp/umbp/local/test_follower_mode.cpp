@@ -27,8 +27,8 @@
 #include <thread>
 #include <vector>
 
-#include "umbp/local/storage/ssd_tier.h"
-#include "umbp/local/umbp_client.h"
+#include "umbp/local/standalone_client.h"
+#include "umbp/local/tiers/ssd_tier.h"
 
 using namespace mori::umbp;
 
@@ -172,7 +172,7 @@ void test_follower_stale_index_after_evict() {
   leader_cfg.ssd.segment_size_bytes = 4 * 1024 * 1024;
   leader_cfg.copy_pipeline.async_enabled = false;
   leader_cfg.role = UMBPRole::SharedSSDLeader;
-  UMBPClient leader(leader_cfg);
+  StandaloneClient leader(leader_cfg);
 
   std::vector<char> data(4096, 'Q');
   assert(leader.Put("stale_k", data.data(), data.size()));
@@ -188,10 +188,10 @@ void test_follower_stale_index_after_evict() {
   follower_cfg.ssd.segment_size_bytes = 4 * 1024 * 1024;
   follower_cfg.role = UMBPRole::SharedSSDFollower;
   follower_cfg.eviction.auto_promote_on_read = false;
-  UMBPClient follower(follower_cfg);
+  StandaloneClient follower(follower_cfg);
 
   std::vector<char> buf(4096, 0);
-  assert(follower.GetIntoPtr("stale_k", reinterpret_cast<uintptr_t>(buf.data()), buf.size()));
+  assert(follower.Get("stale_k", reinterpret_cast<uintptr_t>(buf.data()), buf.size()));
   assert(follower.Index().MayExist("stale_k"));
 
   // Leader evicts the key, clearing it from the segment metadata
@@ -205,8 +205,7 @@ void test_follower_stale_index_after_evict() {
   // This is acceptable behavior — the key hasn't been physically deleted.
   // Verify that the follower can still read the data.
   std::vector<char> buf2(4096, 0);
-  bool read_ok =
-      follower.GetIntoPtr("stale_k", reinterpret_cast<uintptr_t>(buf2.data()), buf2.size());
+  bool read_ok = follower.Get("stale_k", reinterpret_cast<uintptr_t>(buf2.data()), buf2.size());
   // The follower has the key in its local metadata from the previous read,
   // so this should succeed.
   assert(read_ok);
@@ -231,7 +230,7 @@ void test_leader_copy_to_ssd() {
   cfg.copy_pipeline.async_enabled = false;
   cfg.role = UMBPRole::SharedSSDLeader;
 
-  UMBPClient leader(cfg);
+  StandaloneClient leader(cfg);
 
   std::vector<char> data(4096, 'Z');
   assert(leader.Put("copy_k", data.data(), data.size()));
@@ -279,7 +278,7 @@ void test_e2e_leader_follower() {
   leader_cfg.copy_pipeline.async_enabled = false;
   leader_cfg.role = UMBPRole::SharedSSDLeader;
 
-  UMBPClient leader(leader_cfg);
+  StandaloneClient leader(leader_cfg);
 
   // Follower config — separate DRAM, shared SSD dir
   UMBPConfig follower_cfg;
@@ -293,7 +292,7 @@ void test_e2e_leader_follower() {
   follower_cfg.role = UMBPRole::SharedSSDFollower;
   follower_cfg.eviction.auto_promote_on_read = true;
 
-  UMBPClient follower(follower_cfg);
+  StandaloneClient follower(follower_cfg);
 
   // Leader writes 3 keys
   for (int i = 0; i < 3; ++i) {
@@ -312,7 +311,7 @@ void test_e2e_leader_follower() {
   for (int i = 0; i < 3; ++i) {
     std::string key = "e2e_k" + std::to_string(i);
     std::vector<char> buf(4096, 0);
-    assert(follower.GetIntoPtr(key, reinterpret_cast<uintptr_t>(buf.data()), buf.size()));
+    assert(follower.Get(key, reinterpret_cast<uintptr_t>(buf.data()), buf.size()));
     std::vector<char> expected(4096, 'A' + i);
     assert(buf == expected);
   }
@@ -342,7 +341,7 @@ void test_follower_batch_exists() {
   leader_cfg.ssd.segment_size_bytes = 4 * 1024 * 1024;
   leader_cfg.copy_pipeline.async_enabled = false;
   leader_cfg.role = UMBPRole::SharedSSDLeader;
-  UMBPClient leader(leader_cfg);
+  StandaloneClient leader(leader_cfg);
 
   // Follower
   UMBPConfig follower_cfg;
@@ -354,7 +353,7 @@ void test_follower_batch_exists() {
   follower_cfg.ssd.durability.mode = UMBPDurabilityMode::Relaxed;
   follower_cfg.ssd.segment_size_bytes = 4 * 1024 * 1024;
   follower_cfg.role = UMBPRole::SharedSSDFollower;
-  UMBPClient follower(follower_cfg);
+  StandaloneClient follower(follower_cfg);
 
   // Leader writes 10 keys
   std::vector<std::string> keys;
@@ -397,7 +396,7 @@ void test_follower_autopromote_no_writeback() {
   leader_cfg.ssd.segment_size_bytes = 4 * 1024 * 1024;
   leader_cfg.copy_pipeline.async_enabled = false;
   leader_cfg.role = UMBPRole::SharedSSDLeader;
-  UMBPClient leader(leader_cfg);
+  StandaloneClient leader(leader_cfg);
 
   std::vector<char> d0(4096, 'M');
   std::vector<char> d1(4096, 'N');
@@ -428,13 +427,13 @@ void test_follower_autopromote_no_writeback() {
   follower_cfg.role = UMBPRole::SharedSSDFollower;
   follower_cfg.eviction.auto_promote_on_read = true;
   follower_cfg.dram.high_watermark = 2.0;  // force promote path on every read
-  UMBPClient follower(follower_cfg);
+  StandaloneClient follower(follower_cfg);
 
   std::vector<char> buf(4096, 0);
-  assert(follower.GetIntoPtr("auto_k0", reinterpret_cast<uintptr_t>(buf.data()), buf.size()));
+  assert(follower.Get("auto_k0", reinterpret_cast<uintptr_t>(buf.data()), buf.size()));
   // Ensure filesystem mtime granularity won't mask accidental rewrites.
   std::this_thread::sleep_for(std::chrono::milliseconds(1200));
-  assert(follower.GetIntoPtr("auto_k1", reinterpret_cast<uintptr_t>(buf.data()), buf.size()));
+  assert(follower.Get("auto_k1", reinterpret_cast<uintptr_t>(buf.data()), buf.size()));
 
   // Segment file size should not have grown — follower never writes back
   uintmax_t after_size = fs::file_size(segment_path);
