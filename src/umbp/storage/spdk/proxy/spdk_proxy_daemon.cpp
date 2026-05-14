@@ -48,9 +48,9 @@
 #include <immintrin.h>
 #endif
 
+#include "mori/utils/mori_log.hpp"
 #include "umbp/common/config.h"
 #include "umbp/common/env_time.h"
-#include "umbp/common/log.h"
 #include "umbp/local/tiers/spdk_ssd_tier.h"
 #include "umbp/storage/spdk/offset_allocator.hpp"
 #include "umbp/storage/spdk/proxy/spdk_proxy_protocol.h"
@@ -386,8 +386,8 @@ class TenantRegistry {
 
     TenantRuntime& tenant = *it->second;
     if (quota_hint > tenant.quota_bytes) {
-      UMBP_LOG_WARN(
-          "spdk_proxy: tenant %u quota_hint %zu exceeds allocated %zu; "
+      MORI_UMBP_WARN(
+          "spdk_proxy: tenant {} quota_hint {} exceeds allocated {}; "
           "continuing with daemon quota",
           tenant.tenant_id, static_cast<size_t>(quota_hint), tenant.quota_bytes);
     }
@@ -981,8 +981,8 @@ void AllocChannelDmaPools(ChannelDmaPool* pools, int max_channels) {
       for (int i = got; i < per_channel; ++i) pools[c].bufs[i] = nullptr;
     }
   }
-  UMBP_LOG_INFO("spdk_proxy: allocated %d DMA bufs/channel × %d channels (%zuMB each)", per_channel,
-                max_channels, kDmaBufSize / (1024 * 1024));
+  MORI_UMBP_INFO("spdk_proxy: allocated {} DMA bufs/channel × {} channels ({}MB each)", per_channel,
+                 max_channels, kDmaBufSize / (1024 * 1024));
 }
 
 void FreeChannelDmaPools(ChannelDmaPool* pools, int max_channels) {
@@ -1008,8 +1008,8 @@ void PollLoop(ProxyShmRegion& shm, TenantRegistry& tenants, ChannelDmaPool* chan
     batch_inflight[c].store(false, std::memory_order_relaxed);
   }
 
-  UMBP_LOG_INFO("spdk_proxy: entering poll loop (channels=%u tenants=%u)", hdr->max_channels,
-                hdr->max_tenants);
+  MORI_UMBP_INFO("spdk_proxy: entering poll loop (channels={} tenants={})", hdr->max_channels,
+                 hdr->max_tenants);
 
   auto last_heartbeat = std::chrono::steady_clock::now();
   auto last_reap = last_heartbeat;
@@ -1122,7 +1122,7 @@ void PollLoop(ProxyShmRegion& shm, TenantRegistry& tenants, ChannelDmaPool* chan
         auto* ch = shm.Channel(c);
         uint32_t owner_pid = ch->owner_pid.load(std::memory_order_relaxed);
         if (owner_pid > 0 && kill(static_cast<pid_t>(owner_pid), 0) != 0) {
-          UMBP_LOG_WARN("spdk_proxy: client channel %u pid %u dead, reclaiming", c, owner_pid);
+          MORI_UMBP_WARN("spdk_proxy: client channel {} pid {} dead, reclaiming", c, owner_pid);
           tenants.ForceDetachChannel(*ch);
         }
       }
@@ -1165,7 +1165,7 @@ void PollLoop(ProxyShmRegion& shm, TenantRegistry& tenants, ChannelDmaPool* chan
     if (worker.joinable()) worker.join();
   }
 
-  UMBP_LOG_INFO("spdk_proxy: exiting poll loop");
+  MORI_UMBP_INFO("spdk_proxy: exiting poll loop");
 }
 
 std::string getenv_str(const char* name, const char* def) {
@@ -1181,7 +1181,7 @@ bool try_getenv_size(const char* name, size_t* value_out) {
   char* end = nullptr;
   unsigned long long parsed = std::strtoull(v, &end, 10);
   if (errno != 0 || end == v || (end && *end != '\0')) {
-    UMBP_LOG_WARN("spdk_proxy: ignoring invalid numeric env %s='%s'", name, v);
+    MORI_UMBP_WARN("spdk_proxy: ignoring invalid numeric env {}='{}'", name, v);
     return false;
   }
   *value_out = static_cast<size_t>(parsed);
@@ -1206,6 +1206,8 @@ int main(int argc, char** argv) {
 
   signal(SIGINT, signal_handler);
   signal(SIGTERM, signal_handler);
+
+  mori::InitializeLoggingFromEnv();
 
   std::string nvme_pci = getenv_str("UMBP_SPDK_NVME_PCI", "");
   std::string nvme_ctrl = getenv_str("UMBP_SPDK_NVME_CTRL", "NVMe0");
@@ -1328,10 +1330,10 @@ int main(int argc, char** argv) {
   tenants.SyncTelemetry();
   hdr->state.store(static_cast<uint32_t>(ProxyState::READY), std::memory_order_release);
 
-  UMBP_LOG_INFO(
-      "spdk_proxy: READY — capacity=%zuMB usable=%zuMB ring=%zuMB "
-      "channels=%d tenants=%d data_region=%zuMB/channel idle_exit=%dms "
-      "borrow=%s write_back=%s",
+  MORI_UMBP_INFO(
+      "spdk_proxy: READY — capacity={}MB usable={}MB ring={}MB "
+      "channels={} tenants={} data_region={}MB/channel idle_exit={}ms "
+      "borrow={} write_back={}",
       service_capacity / (1024 * 1024), tenants.usable_capacity_bytes() / (1024 * 1024), ring_mb,
       max_channels, max_tenants, data_per_channel_mb, idle_exit_timeout_ms,
       allow_borrow ? "ON" : "OFF", write_back ? "ON" : "OFF");
@@ -1345,7 +1347,7 @@ int main(int argc, char** argv) {
 
   hdr->state.store(static_cast<uint32_t>(ProxyState::SHUTDOWN), std::memory_order_release);
 
-  UMBP_LOG_INFO("spdk_proxy: shutting down");
+  MORI_UMBP_INFO("spdk_proxy: shutting down");
   shm.Detach();
   return 0;
 }

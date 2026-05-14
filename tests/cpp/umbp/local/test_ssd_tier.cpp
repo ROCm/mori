@@ -122,7 +122,14 @@ void test_segmented_io_uring_backend() {
   cfg.ssd.durability.mode = UMBPDurabilityMode::Strict;
   cfg.ssd.io.queue_depth = 128;
 
-  LocalStorageManager mgr(cfg);
+  std::unique_ptr<LocalStorageManager> mgr_ptr;
+  try {
+    mgr_ptr = std::make_unique<LocalStorageManager>(cfg);
+  } catch (const std::runtime_error& e) {
+    std::cout << "SKIPPED (io_uring unavailable: " << e.what() << ")" << std::endl;
+    return;
+  }
+  auto& mgr = *mgr_ptr;
   std::vector<char> payload(4096, 'U');
   assert(mgr.Write("uring_key", payload.data(), payload.size(), StorageTier::LOCAL_SSD));
 
@@ -239,7 +246,14 @@ void test_ssd_batch_read_io_uring() {
   cfg.ssd.io.backend = UMBPIoBackend::IoUring;
   cfg.ssd.io.queue_depth = 128;
 
-  LocalStorageManager mgr(cfg);
+  std::unique_ptr<LocalStorageManager> mgr_ptr;
+  try {
+    mgr_ptr = std::make_unique<LocalStorageManager>(cfg);
+  } catch (const std::runtime_error& e) {
+    std::cout << "SKIPPED (io_uring unavailable: " << e.what() << ")" << std::endl;
+    return;
+  }
+  auto& mgr = *mgr_ptr;
 
   constexpr size_t kNumKeys = 8;
   constexpr size_t kValueSize = 8192;

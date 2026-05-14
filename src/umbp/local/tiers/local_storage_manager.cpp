@@ -28,7 +28,7 @@
 #include <stdexcept>
 #include <thread>
 
-#include "umbp/common/log.h"
+#include "mori/utils/mori_log.hpp"
 #include "umbp/local/tiers/dram_tier.h"
 #include "umbp/local/tiers/dummy_ssd_tier.h"
 #include "umbp/local/tiers/ssd_tier.h"
@@ -236,7 +236,7 @@ static std::string FindProxyBinary(const std::string& explicit_path) {
 
   if (!explicit_path.empty()) {
     if (auto hit = try_candidate(explicit_path); !hit.empty()) return hit;
-    UMBP_LOG_WARN("LSM: UMBP_SPDK_PROXY_BIN='%s' not executable", explicit_path.c_str());
+    MORI_UMBP_WARN("LSM: UMBP_SPDK_PROXY_BIN='{}' not executable", explicit_path);
   }
 
   char exe_buf[4096];
@@ -276,11 +276,11 @@ class ScopedBootstrapLock {
     path_ = ::umbp::proxy::ProxyShmRegion::BootstrapLockPath(shm_name);
     fd_ = open(path_.c_str(), O_CREAT | O_RDWR, 0666);
     if (fd_ < 0) {
-      UMBP_LOG_ERROR("LSM: open bootstrap lock '%s' failed: %s", path_.c_str(), strerror(errno));
+      MORI_UMBP_ERROR("LSM: open bootstrap lock '{}' failed: {}", path_, strerror(errno));
       return;
     }
     if (flock(fd_, LOCK_EX) != 0) {
-      UMBP_LOG_ERROR("LSM: flock bootstrap lock '%s' failed: %s", path_.c_str(), strerror(errno));
+      MORI_UMBP_ERROR("LSM: flock bootstrap lock '{}' failed: {}", path_, strerror(errno));
       close(fd_);
       fd_ = -1;
     }
@@ -318,11 +318,10 @@ static void SetEnvVarFromConfig(const char* name, bool value) {
 
 int LocalStorageManager::SpawnProxyDaemon(const std::string& shm_name) {
   std::string bin = FindProxyBinary(config_.spdk_proxy_bin);
-  UMBP_LOG_INFO("LSM: launching spdk_proxy binary '%s' for shm '%s'", bin.c_str(),
-                shm_name.c_str());
+  MORI_UMBP_INFO("LSM: launching spdk_proxy binary '{}' for shm '{}'", bin, shm_name);
   pid_t pid = fork();
   if (pid < 0) {
-    UMBP_LOG_ERROR("LSM: fork() failed: %s", strerror(errno));
+    MORI_UMBP_ERROR("LSM: fork() failed: {}", strerror(errno));
     return -1;
   }
 
@@ -347,12 +346,21 @@ int LocalStorageManager::SpawnProxyDaemon(const std::string& shm_name) {
     SetEnvVarFromConfig("UMBP_SPDK_MEM_MB", config_.spdk_mem_size_mb);
     SetEnvVarFromConfig("UMBP_SPDK_IO_WORKERS", config_.spdk_io_workers);
 
-    if (UmbpLogLevel() >= 1) {
-      int devnull = open("/dev/null", O_WRONLY);
-      if (devnull >= 0) {
-        dup2(devnull, STDOUT_FILENO);
-        dup2(devnull, STDERR_FILENO);
-        close(devnull);
+    // Suppress child output unless verbose logging is requested.
+    // Uses direct getenv (fork-safe, no spdlog) to check the Mori log level.
+    {
+      const char* lv = getenv("MORI_UMBP_LOG_LEVEL");
+      if (!lv) lv = getenv("MORI_GLOBAL_LOG_LEVEL");
+      bool verbose =
+          lv && (strcmp(lv, "info") == 0 || strcmp(lv, "INFO") == 0 || strcmp(lv, "debug") == 0 ||
+                 strcmp(lv, "DEBUG") == 0 || strcmp(lv, "trace") == 0 || strcmp(lv, "TRACE") == 0);
+      if (!verbose) {
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+          dup2(devnull, STDOUT_FILENO);
+          dup2(devnull, STDERR_FILENO);
+          close(devnull);
+        }
       }
     }
     execlp(bin.c_str(), "spdk_proxy", static_cast<char*>(nullptr));
@@ -360,7 +368,7 @@ int LocalStorageManager::SpawnProxyDaemon(const std::string& shm_name) {
     _exit(127);
   }
 
-  UMBP_LOG_INFO("LSM: spawned spdk_proxy service pid=%d shm='%s'", pid, shm_name.c_str());
+  MORI_UMBP_INFO("LSM: spawned spdk_proxy service pid={} shm='{}'", pid, shm_name);
   return 0;
 }
 
@@ -368,14 +376,14 @@ int LocalStorageManager::EnsureProxyDaemon(const std::string& shm_name) {
   int probe = ::umbp::proxy::ProxyShmRegion::ProbeExisting(shm_name);
   if (probe == 1) return 0;
   if (probe == -2) {
-    UMBP_LOG_ERROR("LSM: proxy protocol version mismatch on SHM '%s'", shm_name.c_str());
+    MORI_UMBP_ERROR("LSM: proxy protocol version mismatch on SHM '{}'", shm_name);
     return -1;
   }
   if (!config_.spdk_proxy_auto_start) {
     if (probe == -1) {
       return SpdkProxyTier::WaitForProxy(shm_name, config_.spdk_proxy_startup_timeout_ms) ? 0 : -1;
     }
-    UMBP_LOG_ERROR("LSM: SPDK proxy absent on SHM '%s' and auto-start disabled", shm_name.c_str());
+    MORI_UMBP_ERROR("LSM: SPDK proxy absent on SHM '{}' and auto-start disabled", shm_name);
     return -1;
   }
 
@@ -385,7 +393,7 @@ int LocalStorageManager::EnsureProxyDaemon(const std::string& shm_name) {
   probe = ::umbp::proxy::ProxyShmRegion::ProbeExisting(shm_name);
   if (probe == 1) return 0;
   if (probe == -2) {
-    UMBP_LOG_ERROR("LSM: proxy protocol version mismatch on SHM '%s'", shm_name.c_str());
+    MORI_UMBP_ERROR("LSM: proxy protocol version mismatch on SHM '{}'", shm_name);
     return -1;
   }
   if (probe == -1) {
@@ -403,12 +411,12 @@ int LocalStorageManager::EnsureProxyDaemon(const std::string& shm_name) {
       alive = (pid > 0 && kill(static_cast<pid_t>(pid), 0) == 0);
 #endif
       if (alive && st == static_cast<uint32_t>(::umbp::proxy::ProxyState::ERROR)) {
-        UMBP_LOG_ERROR("LSM: proxy on SHM '%s' is alive but in ERROR state", shm_name.c_str());
+        MORI_UMBP_ERROR("LSM: proxy on SHM '{}' is alive but in ERROR state", shm_name);
         return -1;
       }
       if (alive && st != static_cast<uint32_t>(::umbp::proxy::ProxyState::SHUTDOWN)) {
-        UMBP_LOG_ERROR("LSM: proxy on SHM '%s' did not become READY in time (state=%u)",
-                       shm_name.c_str(), st);
+        MORI_UMBP_ERROR("LSM: proxy on SHM '{}' did not become READY in time (state={})", shm_name,
+                        st);
         return -1;
       }
     }

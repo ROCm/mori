@@ -30,6 +30,7 @@
 #include <stdexcept>
 #include <vector>
 
+#include "mori/utils/mori_log.hpp"
 #include "umbp/local/tiers/segment/segment_format.h"
 
 namespace fs = std::filesystem;
@@ -52,7 +53,9 @@ SSDTier::SSDTier(const std::string& dir, size_t capacity, const UMBPConfig& conf
   }
   if (config_.ssd.io.backend == UMBPIoBackend::IoUring &&
       !io_driver_->Capabilities().native_async) {
-    throw std::runtime_error("UMBP io_uring backend requested but initialization failed");
+    MORI_UMBP_WARN(
+        "SSDTier: io_uring backend requested but unavailable (kernel missing io_uring "
+        "support or restricted by seccomp/capabilities); falling back to POSIX backend");
   }
   writer_ = std::make_unique<segment::Writer>(*io_driver_);
   fs::create_directories(dir_);

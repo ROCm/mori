@@ -48,8 +48,8 @@
 #include <thread>
 #include <vector>
 
+#include "mori/utils/mori_log.hpp"
 #include "umbp/common/config.h"
-#include "umbp/common/log.h"
 #include "umbp/local/tiers/spdk_ssd_tier.h"
 #include "umbp/local/tiers/ssd_tier.h"
 #include "umbp/storage/spdk/spdk_env.h"
@@ -131,7 +131,7 @@ static void SeqDirectWorker(umbp::SpdkEnv& env, size_t io_size, size_t aligned_i
   auto dma_bufs = std::make_unique<void*[]>(qd);
   int got = env.DmaPoolAllocBatch(dma_bufs.get(), aligned_io, qd, env.GetBlockSize());
   if (got == 0) {
-    UMBP_LOG_ERROR("DMA alloc failed");
+    MORI_UMBP_ERROR("DMA alloc failed");
     return;
   }
   qd = got;

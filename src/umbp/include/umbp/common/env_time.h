@@ -50,7 +50,7 @@
 #include <string>
 #include <unordered_set>
 
-#include "umbp/common/log.h"
+#include "mori/utils/mori_log.hpp"
 
 namespace mori::umbp {
 
@@ -69,7 +69,7 @@ inline std::unordered_set<std::string>& WarnedNames() {
 inline void WarnOnce(const char* name, const char* reason, const char* raw) {
   std::lock_guard<std::mutex> lock(WarnMutex());
   if (!WarnedNames().insert(name).second) return;
-  UMBP_LOG_WARN("env %s: %s (value='%s'); using default", name, reason, raw ? raw : "");
+  MORI_UMBP_WARN("env {}: {} (value='{}'); using default", name, reason, raw ? raw : "");
 }
 
 // Parse an env value as signed integer. On any failure / out-of-range,

@@ -41,9 +41,31 @@ UMBPConfig StandaloneClient::NormalizeConfig(const UMBPConfig& config) {
   return normalized;
 }
 
+static const char* RoleStr(UMBPRole r) {
+  switch (r) {
+    case UMBPRole::SharedSSDLeader:
+      return "leader";
+    case UMBPRole::SharedSSDFollower:
+      return "follower";
+    default:
+      return "standalone";
+  }
+}
+
 StandaloneClient::StandaloneClient(const UMBPConfig& config)
     : config_(NormalizeConfig(config)), role_(config_.ResolveRole()), storage_(config_, &index_) {
   copy_pipeline_ = std::make_unique<CopyPipeline>(storage_, config_.copy_pipeline, role_);
+
+  MORI_UMBP_INFO(
+      "[StandaloneClient] initialized — role={} "
+      "dram={}MB hugepages={} hugepage_size={}MB numa_node={} "
+      "ssd={} ssd_backend={} ssd_capacity={}MB ssd_dir={} "
+      "eviction={} copy_pipeline_threads={} copy_pipeline_qdepth={}",
+      RoleStr(role_), config_.dram.capacity_bytes / (1024 * 1024), config_.dram.use_hugepages,
+      config_.dram.hugepage_size / (1024 * 1024), config_.dram.numa_node, config_.ssd.enabled,
+      config_.ssd_backend, config_.ssd.capacity_bytes / (1024 * 1024), config_.ssd.storage_dir,
+      config_.eviction.policy, config_.copy_pipeline.worker_threads,
+      config_.copy_pipeline.queue_depth);
 }
 
 StandaloneClient::~StandaloneClient() { Close(); }

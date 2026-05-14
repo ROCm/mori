@@ -33,8 +33,8 @@
 #include <cstring>
 #include <thread>
 
+#include "mori/utils/mori_log.hpp"
 #include "umbp/common/env_time.h"
-#include "umbp/common/log.h"
 
 #ifdef __linux__
 #include <unistd.h>
@@ -81,28 +81,27 @@ SpdkProxyTier::SpdkProxyTier(const UMBPConfig& config) : TierBackend(StorageTier
 
   int rc = shm_.Attach(shm_name);
   if (rc != 0) {
-    UMBP_LOG_ERROR("SpdkProxyTier: cannot attach to SHM '%s' rc=%d", shm_name.c_str(), rc);
+    MORI_UMBP_ERROR("SpdkProxyTier: cannot attach to SHM '{}' rc={}", shm_name, rc);
     return;
   }
 
   auto* hdr = shm_.Header();
   if (hdr->version != kProxyVersion) {
-    UMBP_LOG_ERROR("SpdkProxyTier: protocol mismatch on SHM '%s' (have=%u want=%u)",
-                   shm_name.c_str(), hdr->version, kProxyVersion);
+    MORI_UMBP_ERROR("SpdkProxyTier: protocol mismatch on SHM '{}' (have={} want={})", shm_name,
+                    hdr->version, kProxyVersion);
     shm_.Detach();
     return;
   }
   std::string layout_error;
   if (!ProxyShmRegion::ValidateHeaderLayout(hdr, shm_.Size(), &layout_error)) {
-    UMBP_LOG_ERROR("SpdkProxyTier: invalid proxy SHM layout on '%s': %s", shm_name.c_str(),
-                   layout_error.c_str());
+    MORI_UMBP_ERROR("SpdkProxyTier: invalid proxy SHM layout on '{}': {}", shm_name, layout_error);
     shm_.Detach();
     return;
   }
 
   uint32_t state = hdr->state.load(std::memory_order_acquire);
   if (state != static_cast<uint32_t>(ProxyState::READY)) {
-    UMBP_LOG_ERROR("SpdkProxyTier: proxy not READY (state=%u)", state);
+    MORI_UMBP_ERROR("SpdkProxyTier: proxy not READY (state={})", state);
     shm_.Detach();
     return;
   }
@@ -128,7 +127,7 @@ SpdkProxyTier::SpdkProxyTier(const UMBPConfig& config) : TierBackend(StorageTier
         ch->tail.store(0, std::memory_order_relaxed);
         ch->session_id.store(0, std::memory_order_relaxed);
         channel_id_ = c;
-        UMBP_LOG_WARN("SpdkProxyTier: reclaimed dead channel %u (pid %u)", c, expected);
+        MORI_UMBP_WARN("SpdkProxyTier: reclaimed dead channel {} (pid {})", c, expected);
         break;
       }
     }
@@ -136,7 +135,7 @@ SpdkProxyTier::SpdkProxyTier(const UMBPConfig& config) : TierBackend(StorageTier
   }
 
   if (channel_id_ >= hdr->max_channels) {
-    UMBP_LOG_ERROR("SpdkProxyTier: all %u proxy channels are occupied", hdr->max_channels);
+    MORI_UMBP_ERROR("SpdkProxyTier: all {} proxy channels are occupied", hdr->max_channels);
     shm_.Detach();
     return;
   }
@@ -161,8 +160,8 @@ SpdkProxyTier::SpdkProxyTier(const UMBPConfig& config) : TierBackend(StorageTier
   auto attach_rc = SubmitAndWait(RequestType::ATTACH_SESSION, "", nullptr, 0, nullptr, 0,
                                  config.spdk_proxy_tenant_quota_bytes, nullptr, &attach_session_id);
   if (attach_rc != ResultCode::OK) {
-    UMBP_LOG_ERROR("SpdkProxyTier: ATTACH_SESSION failed tenant=%u rc=%d", tenant_id_,
-                   static_cast<int>(attach_rc));
+    MORI_UMBP_ERROR("SpdkProxyTier: ATTACH_SESSION failed tenant={} rc={}", tenant_id_,
+                    static_cast<int>(attach_rc));
     connected_ = false;
     ReleaseChannel();
     shm_.Detach();
@@ -173,8 +172,8 @@ SpdkProxyTier::SpdkProxyTier(const UMBPConfig& config) : TierBackend(StorageTier
   tenant_slot_ = ch->tenant_slot;
   if (session_id_ == 0) session_id_ = ch->session_id.load(std::memory_order_acquire);
 
-  UMBP_LOG_INFO("SpdkProxyTier: attached channel=%u tenant=%u session=%lu shm='%s'", channel_id_,
-                tenant_id_, static_cast<unsigned long>(session_id_), shm_name.c_str());
+  MORI_UMBP_INFO("SpdkProxyTier: attached channel={} tenant={} session={} shm='{}'", channel_id_,
+                 tenant_id_, session_id_, shm_name);
 }
 
 SpdkProxyTier::~SpdkProxyTier() {
@@ -201,14 +200,14 @@ bool SpdkProxyTier::WaitForProxy(const std::string& shm_name, int timeout_ms) {
     if (rc == 0) {
       auto* hdr = probe.Header();
       if (hdr->version != kProxyVersion) {
-        UMBP_LOG_ERROR("SpdkProxyTier: protocol mismatch on SHM '%s' (have=%u want=%u)",
-                       shm_name.c_str(), hdr->version, kProxyVersion);
+        MORI_UMBP_ERROR("SpdkProxyTier: protocol mismatch on SHM '{}' (have={} want={})", shm_name,
+                        hdr->version, kProxyVersion);
         return false;
       }
       std::string layout_error;
       if (!ProxyShmRegion::ValidateHeaderLayout(hdr, probe.Size(), &layout_error)) {
-        UMBP_LOG_ERROR("SpdkProxyTier: invalid proxy SHM layout on '%s': %s", shm_name.c_str(),
-                       layout_error.c_str());
+        MORI_UMBP_ERROR("SpdkProxyTier: invalid proxy SHM layout on '{}': {}", shm_name,
+                        layout_error);
         return false;
       }
 
@@ -227,14 +226,14 @@ bool SpdkProxyTier::WaitForProxy(const std::string& shm_name, int timeout_ms) {
           }
         }
       } else if (st == static_cast<uint32_t>(ProxyState::ERROR)) {
-        UMBP_LOG_ERROR("SpdkProxyTier: proxy reported ERROR state");
+        MORI_UMBP_ERROR("SpdkProxyTier: proxy reported ERROR state");
         return false;
       }
     }
 
     auto elapsed = std::chrono::steady_clock::now() - start;
     if (std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count() >= timeout_ms) {
-      UMBP_LOG_ERROR("SpdkProxyTier: timed out waiting for proxy READY (%d ms)", timeout_ms);
+      MORI_UMBP_ERROR("SpdkProxyTier: timed out waiting for proxy READY ({} ms)", timeout_ms);
       return false;
     }
 
@@ -298,7 +297,7 @@ ResultCode SpdkProxyTier::SubmitAndWait(RequestType type, const std::string& key
   uint32_t t = ch->tail.load(std::memory_order_acquire);
 
   if (((h + 1) % kRingSize) == t) {
-    UMBP_LOG_ERROR("SpdkProxyTier: ring full");
+    MORI_UMBP_ERROR("SpdkProxyTier: ring full");
     return ResultCode::ERROR;
   }
 
@@ -321,7 +320,7 @@ ResultCode SpdkProxyTier::SubmitAndWait(RequestType type, const std::string& key
     if (ring_base_for_slot == 0) {
       size_t max_size = shm_.Header()->data_region_per_channel;
       if (write_size > max_size) {
-        UMBP_LOG_ERROR("SpdkProxyTier: data too large %zu > %zu", write_size, max_size);
+        MORI_UMBP_ERROR("SpdkProxyTier: data too large {} > {}", write_size, max_size);
         return ResultCode::ERROR;
       }
       std::memcpy(data_region, write_data, write_size);
@@ -355,7 +354,7 @@ ResultCode SpdkProxyTier::SubmitAndWait(RequestType type, const std::string& key
     if (st == static_cast<uint32_t>(SlotState::COMPLETED)) break;
     CPU_PAUSE();
     if (++spin % 8192 == 0 && !IsProxyAlive()) {
-      UMBP_LOG_ERROR("SpdkProxyTier: proxy heartbeat stale, aborting");
+      MORI_UMBP_ERROR("SpdkProxyTier: proxy heartbeat stale, aborting");
       slot.state.store(static_cast<uint32_t>(SlotState::EMPTY), std::memory_order_release);
       return ResultCode::ERROR;
     }
@@ -479,7 +478,7 @@ std::vector<bool> SpdkProxyTier::SubmitBatch(RequestType type, const std::vector
     while (((h + 1) % kRingSize) == ch->tail.load(std::memory_order_acquire)) {
       CPU_PAUSE();
       if (++ring_spin % 8192 == 0 && !IsProxyAlive()) {
-        UMBP_LOG_ERROR("SpdkProxyTier: proxy dead while waiting for ring slot");
+        MORI_UMBP_ERROR("SpdkProxyTier: proxy dead while waiting for ring slot");
         return results;
       }
     }
@@ -529,7 +528,7 @@ std::vector<bool> SpdkProxyTier::SubmitBatch(RequestType type, const std::vector
         if (st == static_cast<uint32_t>(SlotState::COMPLETED)) break;
         CPU_PAUSE();
         if (++spin % 8192 == 0 && !IsProxyAlive()) {
-          UMBP_LOG_ERROR("SpdkProxyTier: proxy dead during batch write");
+          MORI_UMBP_ERROR("SpdkProxyTier: proxy dead during batch write");
           slot.state.store(static_cast<uint32_t>(SlotState::EMPTY), std::memory_order_release);
           return results;
         }
@@ -579,7 +578,7 @@ std::vector<bool> SpdkProxyTier::SubmitBatch(RequestType type, const std::vector
             } else {
               CPU_PAUSE();
               if (++spin % 8192 == 0 && !IsProxyAlive()) {
-                UMBP_LOG_ERROR("SpdkProxyTier: proxy dead during batch read");
+                MORI_UMBP_ERROR("SpdkProxyTier: proxy dead during batch read");
                 slot.state.store(static_cast<uint32_t>(SlotState::EMPTY),
                                  std::memory_order_release);
                 return results;
@@ -598,7 +597,7 @@ std::vector<bool> SpdkProxyTier::SubmitBatch(RequestType type, const std::vector
         if (st == static_cast<uint32_t>(SlotState::COMPLETED)) break;
         CPU_PAUSE();
         if (++spin % 8192 == 0 && !IsProxyAlive()) {
-          UMBP_LOG_ERROR("SpdkProxyTier: proxy dead waiting for read completion");
+          MORI_UMBP_ERROR("SpdkProxyTier: proxy dead waiting for read completion");
           slot.state.store(static_cast<uint32_t>(SlotState::EMPTY), std::memory_order_release);
           return results;
         }

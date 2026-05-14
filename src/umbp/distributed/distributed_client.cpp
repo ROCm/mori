@@ -89,8 +89,23 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
     throw std::runtime_error("DistributedClient: PoolClient::Init() failed");
   }
 
-  MORI_UMBP_INFO("[DistributedClient] initialized — node_id={} dram_pool={}MB",
-                 dc.master_config.node_id, dram_pool_size_ / (1024 * 1024));
+  std::string tags_str;
+  for (const auto& t : dc.master_config.tags) {
+    if (!tags_str.empty()) tags_str += ',';
+    tags_str += t;
+  }
+
+  MORI_UMBP_INFO(
+      "[DistributedClient] initialized — "
+      "node_id={} node_address={} master={} "
+      "dram_pool={}MB hugepages={} hugepage_size={}MB numa_node={} "
+      "dram_page_size={}KB staging_buffer={}MB peer_port={} cache_remote={} "
+      "io_engine={}:{} tags=[{}]",
+      dc.master_config.node_id, dc.master_config.node_address, dc.master_config.master_address,
+      dram_pool_size_ / (1024 * 1024), config_.dram.use_hugepages,
+      config_.dram.hugepage_size / (1024 * 1024), config_.dram.numa_node, dc.dram_page_size / 1024,
+      dc.staging_buffer_size / (1024 * 1024), dc.peer_service_port, dc.cache_remote_fetches,
+      dc.io_engine.host, dc.io_engine.port, tags_str);
 }
 
 DistributedClient::~DistributedClient() { Close(); }

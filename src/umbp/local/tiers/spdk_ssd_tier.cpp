@@ -33,7 +33,7 @@
 #include <cstring>
 #include <thread>
 
-#include "umbp/common/log.h"
+#include "mori/utils/mori_log.hpp"
 #include "umbp/storage/spdk/spdk_env.h"
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -109,7 +109,7 @@ SpdkSsdTier::SpdkSsdTier(const UMBPConfig& config, uint64_t base_offset, size_t 
 
     int rc = env.Init(ecfg);
     if (rc != 0) {
-      UMBP_LOG_ERROR("SpdkSsdTier: SpdkEnv init failed rc=%d, falling back", rc);
+      MORI_UMBP_ERROR("SpdkSsdTier: SpdkEnv init failed rc={}, falling back", rc);
       return;
     }
   }
@@ -119,9 +119,7 @@ SpdkSsdTier::SpdkSsdTier(const UMBPConfig& config, uint64_t base_offset, size_t 
 
   uint64_t device_size = env.GetBdevSize();
   if (base_offset >= device_size) {
-    UMBP_LOG_ERROR("SpdkSsdTier: base offset %lu beyond device size %lu",
-                   static_cast<unsigned long>(base_offset),
-                   static_cast<unsigned long>(device_size));
+    MORI_UMBP_ERROR("SpdkSsdTier: base offset {} beyond device size {}", base_offset, device_size);
     return;
   }
 
@@ -129,14 +127,14 @@ SpdkSsdTier::SpdkSsdTier(const UMBPConfig& config, uint64_t base_offset, size_t 
   size_t max_capacity = static_cast<size_t>(device_size - base_offset_);
   capacity_ = std::min(capacity_bytes, max_capacity);
   if (capacity_ == 0) {
-    UMBP_LOG_ERROR("SpdkSsdTier: capacity is zero after range clamp");
+    MORI_UMBP_ERROR("SpdkSsdTier: capacity is zero after range clamp");
     return;
   }
 
   allocator_ = ::umbp::offset_allocator::OffsetAllocator::createAligned(base_offset_, capacity_,
                                                                         block_size_);
   if (!allocator_) {
-    UMBP_LOG_ERROR("SpdkSsdTier: OffsetAllocator creation failed");
+    MORI_UMBP_ERROR("SpdkSsdTier: OffsetAllocator creation failed");
     return;
   }
 
@@ -145,10 +143,10 @@ SpdkSsdTier::SpdkSsdTier(const UMBPConfig& config, uint64_t base_offset, size_t 
   EnsureDmaPool();
 
   initialized_ = true;
-  UMBP_LOG_INFO(
-      "SpdkSsdTier: ready — base=%zuMB capacity=%zuMB block_size=%u "
-      "dma_pool=%d×%zuKB io_workers=%d shards=%zu",
-      static_cast<size_t>(base_offset_ / (1024 * 1024)), capacity_ / (1024 * 1024), block_size_,
+  MORI_UMBP_INFO(
+      "SpdkSsdTier: ready — base={}MB capacity={}MB block_size={} "
+      "dma_pool={}×{}KB io_workers={} shards={}",
+      base_offset_ / (1024 * 1024), capacity_ / (1024 * 1024), block_size_,
       dma_pool_ ? dma_pool_->count : 0, dma_pool_ ? dma_pool_->buf_size / 1024 : 0, num_io_workers_,
       kNumShards);
 }
@@ -267,18 +265,18 @@ size_t SpdkSsdTier::EvictLRU(size_t needed) {
       evicted_bytes_.fetch_add(entry_size, std::memory_order_relaxed);
       shard.map.erase(it);
       if (!immediate) {
-        UMBP_LOG_WARN(
-            "EvictLRU: key '%s' (%zuKB) has in-flight readers, "
+        MORI_UMBP_WARN(
+            "EvictLRU: key '{}' ({}KB) has in-flight readers, "
             "space reclaim deferred",
-            key.c_str(), entry_size / 1024);
+            key, entry_size / 1024);
       }
     }
     lru_list_.pop_back();
     ++evicted;
   }
   if (evicted > 0) {
-    UMBP_LOG_INFO("EvictLRU: evicted %d entries, freed %zuMB (requested %zuMB)", evicted,
-                  freed / (1024 * 1024), needed / (1024 * 1024));
+    MORI_UMBP_INFO("EvictLRU: evicted {} entries, freed {}MB (requested {}MB)", evicted,
+                   freed / (1024 * 1024), needed / (1024 * 1024));
   }
   return freed;
 }
@@ -356,9 +354,9 @@ std::vector<SpdkSsdTier::PendingWrite> SpdkSsdTier::PrepareWriteAlloc(
   if (success_count < new_indices.size()) {
     size_t failed = new_indices.size() - success_count;
     auto metrics = allocator_->get_metrics();
-    UMBP_LOG_WARN(
-        "PrepareWriteAlloc: %zu/%zu keys failed to allocate "
-        "(free=%zuMB, largest_free=%zuMB)",
+    MORI_UMBP_WARN(
+        "PrepareWriteAlloc: {}/{} keys failed to allocate "
+        "(free={}MB, largest_free={}MB)",
         failed, new_indices.size(), metrics.total_free_space_ / (1024 * 1024),
         metrics.largest_free_region_ / (1024 * 1024));
     for (size_t k = success_count; k < new_indices.size(); ++k) results[new_indices[k]] = false;

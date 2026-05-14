@@ -33,7 +33,7 @@
 #include <sstream>
 #include <vector>
 
-#include "umbp/common/log.h"
+#include "mori/utils/mori_log.hpp"
 
 extern "C" {
 #include "spdk/bdev.h"
@@ -54,7 +54,7 @@ extern "C" {
 void umbp_bdev_init_complete_cb(void*, int) {}
 
 static void bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev*, void*) {
-  UMBP_LOG_INFO("SpdkEnv: bdev event type=%d", static_cast<int>(type));
+  MORI_UMBP_INFO("SpdkEnv: bdev event type={}", static_cast<int>(type));
 }
 
 static void submit_single_io(umbp::SpdkIoRequest* req, void* bdev_desc) {
@@ -97,7 +97,7 @@ static void submit_single_io(umbp::SpdkIoRequest* req, void* bdev_desc) {
     rc = spdk_bdev_read(SPDK_DESC(bdev_desc), ch, req->buf, req->offset, req->nbytes, done, req);
   }
   if (rc != 0) {
-    UMBP_LOG_ERROR("SpdkEnv: bdev I/O submit failed rc=%d", rc);
+    MORI_UMBP_ERROR("SpdkEnv: bdev I/O submit failed rc={}", rc);
     req->success = false;
     req->completed.store(true, std::memory_order_release);
   }
@@ -146,7 +146,7 @@ void umbp_init_reactor_cb(void* arg1, void* arg2) {
   std::snprintf(name, sizeof(name), "umbp_io_%d", idx);
   struct spdk_thread* th = spdk_thread_create(name, &cpumask);
   if (!th) {
-    UMBP_LOG_ERROR("SpdkEnv: spdk_thread_create failed for reactor %d", idx);
+    MORI_UMBP_ERROR("SpdkEnv: spdk_thread_create failed for reactor {}", idx);
     umbp_signal_init_done(env, -1);
     return;
   }
@@ -154,7 +154,7 @@ void umbp_init_reactor_cb(void* arg1, void* arg2) {
 
   auto* ch = spdk_bdev_get_io_channel(SPDK_DESC(env->bdev_desc_));
   if (!ch) {
-    UMBP_LOG_ERROR("SpdkEnv: io_channel failed for reactor %d", idx);
+    MORI_UMBP_ERROR("SpdkEnv: io_channel failed for reactor {}", idx);
     umbp_signal_init_done(env, -1);
     return;
   }
@@ -163,7 +163,7 @@ void umbp_init_reactor_cb(void* arg1, void* arg2) {
   env->reactors_[idx].io_channel = ch;
   env->reactors_[idx].core_id = spdk_env_get_current_core();
 
-  UMBP_LOG_INFO("SpdkEnv: reactor %d ready on core %u", idx, spdk_env_get_current_core());
+  MORI_UMBP_INFO("SpdkEnv: reactor {} ready on core {}", idx, spdk_env_get_current_core());
 
   int ready = env->reactors_ready_.fetch_add(1, std::memory_order_acq_rel) + 1;
   if (ready == env->num_reactors_) {
@@ -214,7 +214,7 @@ void umbp_app_start_cb(void* ctx) {
   struct spdk_bdev_desc* desc = nullptr;
   int rc = spdk_bdev_open_ext(cfg.bdev_name.c_str(), true, bdev_event_cb, nullptr, &desc);
   if (rc != 0) {
-    UMBP_LOG_ERROR("SpdkEnv: spdk_bdev_open_ext('%s') failed rc=%d", cfg.bdev_name.c_str(), rc);
+    MORI_UMBP_ERROR("SpdkEnv: spdk_bdev_open_ext('{}') failed rc={}", cfg.bdev_name, rc);
     umbp_signal_init_done(env, rc);
     return;
   }
@@ -225,8 +225,8 @@ void umbp_app_start_cb(void* ctx) {
   env->block_size_ = spdk_bdev_get_block_size(bd);
   env->bdev_size_ = static_cast<uint64_t>(spdk_bdev_get_num_blocks(bd)) * env->block_size_;
 
-  UMBP_LOG_INFO("SpdkEnv: bdev '%s' opened — block_size=%u total_size=%lu", cfg.bdev_name.c_str(),
-                env->block_size_, static_cast<unsigned long>(env->bdev_size_));
+  MORI_UMBP_INFO("SpdkEnv: bdev '{}' opened — block_size={} total_size={}", cfg.bdev_name,
+                 env->block_size_, env->bdev_size_);
 
   std::vector<uint32_t> cores;
   uint32_t core;
@@ -235,7 +235,7 @@ void umbp_app_start_cb(void* ctx) {
   env->reactors_.resize(env->num_reactors_);
   env->reactors_ready_.store(0, std::memory_order_relaxed);
 
-  UMBP_LOG_INFO("SpdkEnv: %d reactor core(s) available", env->num_reactors_);
+  MORI_UMBP_INFO("SpdkEnv: {} reactor core(s) available", env->num_reactors_);
 
   if (env->num_reactors_ == 0) {
     umbp_signal_init_done(env, -1);
@@ -245,7 +245,7 @@ void umbp_app_start_cb(void* ctx) {
   {
     struct spdk_io_channel* ch = spdk_bdev_get_io_channel(desc);
     if (!ch) {
-      UMBP_LOG_ERROR("SpdkEnv: io_channel failed for master reactor");
+      MORI_UMBP_ERROR("SpdkEnv: io_channel failed for master reactor");
       umbp_signal_init_done(env, -1);
       return;
     }
@@ -253,7 +253,7 @@ void umbp_app_start_cb(void* ctx) {
     env->reactors_[0].io_channel = ch;
     env->reactors_[0].core_id = cores[0];
 
-    UMBP_LOG_INFO("SpdkEnv: reactor 0 ready on core %u", cores[0]);
+    MORI_UMBP_INFO("SpdkEnv: reactor 0 ready on core {}", cores[0]);
 
     int ready = env->reactors_ready_.fetch_add(1, std::memory_order_acq_rel) + 1;
     if (ready == env->num_reactors_) {
@@ -287,7 +287,7 @@ SpdkEnv::~SpdkEnv() {
 
 int SpdkEnv::Init(const SpdkEnvConfig& config) {
   if (initialized_.load(std::memory_order_acquire)) {
-    UMBP_LOG_WARN("SpdkEnv: already initialized");
+    MORI_UMBP_WARN("SpdkEnv: already initialized");
     return 0;
   }
 
@@ -357,8 +357,7 @@ int SpdkEnv::Init(const SpdkEnvConfig& config) {
                 "      }",
                 ctrl.c_str(), pci_addrs[i].c_str());
         fprintf(f, ",\n");
-        UMBP_LOG_INFO("SpdkEnv: NVMe bdev JSON — ctrl=%s traddr=%s", ctrl.c_str(),
-                      pci_addrs[i].c_str());
+        MORI_UMBP_INFO("SpdkEnv: NVMe bdev JSON — ctrl={} traddr={}", ctrl, pci_addrs[i]);
       }
 
       if (use_raid) {
@@ -386,8 +385,8 @@ int SpdkEnv::Init(const SpdkEnvConfig& config) {
                 "]\n"
                 "        }\n"
                 "      }\n");
-        UMBP_LOG_INFO("SpdkEnv: RAID0 bdev — %zu disks, strip_size=%dKB", pci_addrs.size(),
-                      strip_kb);
+        MORI_UMBP_INFO("SpdkEnv: RAID0 bdev — {} disks, strip_size={}KB", pci_addrs.size(),
+                       strip_kb);
       } else {
         // Remove trailing comma for single-disk case: rewind past ",\n"
         fseek(f, -2, SEEK_CUR);
@@ -414,7 +413,7 @@ int SpdkEnv::Init(const SpdkEnvConfig& config) {
 
     int rc = spdk_app_start(&opts, umbp_app_start_cb, this);
     if (rc != 0) {
-      UMBP_LOG_ERROR("SpdkEnv: spdk_app_start returned rc=%d", rc);
+      MORI_UMBP_ERROR("SpdkEnv: spdk_app_start returned rc={}", rc);
     }
     spdk_app_fini();
 
@@ -432,13 +431,13 @@ int SpdkEnv::Init(const SpdkEnvConfig& config) {
   }
 
   if (init_result_ != 0) {
-    UMBP_LOG_ERROR("SpdkEnv: init failed rc=%d", init_result_);
+    MORI_UMBP_ERROR("SpdkEnv: init failed rc={}", init_result_);
     if (reactor_thread_.joinable()) reactor_thread_.join();
     return init_result_;
   }
 
   initialized_.store(true, std::memory_order_release);
-  UMBP_LOG_INFO("SpdkEnv: initialization complete — %d reactor(s)", num_reactors_);
+  MORI_UMBP_INFO("SpdkEnv: initialization complete — {} reactor(s)", num_reactors_);
   return 0;
 }
 
@@ -474,7 +473,7 @@ void SpdkEnv::Shutdown() {
     dma_pool_.clear();
   }
 
-  UMBP_LOG_INFO("SpdkEnv: shutdown complete");
+  MORI_UMBP_INFO("SpdkEnv: shutdown complete");
 }
 
 void SpdkEnv::CleanupThreadLocalCtx() { /* no per-thread state */ }
@@ -616,8 +615,8 @@ int SpdkEnv::DmaPoolAllocBatch(void** out_bufs, size_t needed, int count, size_t
   for (int i = got; i < count; ++i) {
     out_bufs[i] = spdk_dma_malloc(needed, align, nullptr);
     if (!out_bufs[i]) {
-      UMBP_LOG_ERROR("DmaPoolAllocBatch FAIL: malloc_fail_at=%d needed=%zu count=%d", i, needed,
-                     count);
+      MORI_UMBP_ERROR("DmaPoolAllocBatch FAIL: malloc_fail_at={} needed={} count={}", i, needed,
+                      count);
       return i;
     }
     ++got;
@@ -641,9 +640,9 @@ void SpdkEnv::DmaPoolPrewarm(size_t buf_size, int count, size_t align) {
   }
   if (ok > 0) DmaPoolFreeBatch(bufs.get(), buf_size, ok);
   if (ok < count) {
-    UMBP_LOG_ERROR("SpdkEnv: DMA pool pre-warm PARTIAL %d/%d × %zu bytes", ok, count, buf_size);
+    MORI_UMBP_ERROR("SpdkEnv: DMA pool pre-warm PARTIAL {}/{} × {} bytes", ok, count, buf_size);
   } else {
-    UMBP_LOG_INFO("SpdkEnv: DMA pool pre-warmed %d × %zu bytes", ok, buf_size);
+    MORI_UMBP_INFO("SpdkEnv: DMA pool pre-warmed {} × {} bytes", ok, buf_size);
   }
 }
 

@@ -38,7 +38,7 @@
 #include <string>
 #include <vector>
 
-#include "umbp/common/log.h"
+#include "mori/utils/mori_log.hpp"
 
 namespace mori::umbp {
 namespace {
@@ -84,17 +84,17 @@ void LogHugepageFallbackOnce(size_t size, size_t hugepage_size, int err) {
   static std::once_flag once;
   std::call_once(once, [size, hugepage_size, err] {
     const std::string meminfo = ReadHugepageMeminfoSummary();
-    UMBP_LOG_WARN(
-        "HostMemAllocator: MAP_HUGETLB allocation failed for size=%zu "
-        "hugepage_size=%zu (%d: %s); falling back to anonymous pages. %s",
-        size, hugepage_size, err, std::strerror(err), meminfo.c_str());
+    MORI_UMBP_WARN(
+        "HostMemAllocator: MAP_HUGETLB allocation failed for size={} "
+        "hugepage_size={} ({}: {}); falling back to anonymous pages. {}",
+        size, hugepage_size, err, std::strerror(err), meminfo);
   });
 }
 
 void LogNumaUnavailableOnce() {
   static std::once_flag once;
   std::call_once(once, [] {
-    UMBP_LOG_WARN("HostMemAllocator: NUMA binding unavailable on this build; ignoring numa_node");
+    MORI_UMBP_WARN("HostMemAllocator: NUMA binding unavailable on this build; ignoring numa_node");
   });
 }
 
@@ -111,8 +111,8 @@ void PrefaultPages(void* ptr, size_t mapped_size, size_t stride) {
 #ifdef MADV_POPULATE_WRITE
   if (madvise(ptr, mapped_size, MADV_POPULATE_WRITE) == 0) return;
   const int err = errno;
-  UMBP_LOG_WARN(
-      "HostMemAllocator: madvise(MADV_POPULATE_WRITE) failed (%d: %s); falling back "
+  MORI_UMBP_WARN(
+      "HostMemAllocator: madvise(MADV_POPULATE_WRITE) failed ({}: {}); falling back "
       "to manual page touching",
       err, std::strerror(err));
 #endif
@@ -159,8 +159,8 @@ void ApplyPostMappingPolicies(HostBufferHandle& handle, const HostBufferOptions&
     if (rc == -ENOSYS) {
       LogNumaUnavailableOnce();
     } else if (rc != 0) {
-      UMBP_LOG_WARN("HostMemAllocator: mbind(node=%d) failed (%d: %s)", opts.numa_node, -rc,
-                    std::strerror(-rc));
+      MORI_UMBP_WARN("HostMemAllocator: mbind(node={}) failed ({}: {})", opts.numa_node, -rc,
+                     std::strerror(-rc));
     }
   }
 
@@ -207,8 +207,8 @@ HostBufferHandle AllocAnonymousHugetlb(size_t size, const HostBufferOptions& opt
   HostBufferHandle handle;
   if (size == 0) return handle;
   if (!IsPowerOfTwo(opts.hugepage_size)) {
-    UMBP_LOG_WARN("HostMemAllocator: invalid hugepage_size=%zu; falling back to anonymous pages",
-                  opts.hugepage_size);
+    MORI_UMBP_WARN("HostMemAllocator: invalid hugepage_size={}; falling back to anonymous pages",
+                   opts.hugepage_size);
     HostBufferOptions fallback = opts;
     fallback.backing = HostBufferBacking::kAnonymous;
     return AllocAnonymous(size, fallback);
@@ -225,8 +225,8 @@ HostBufferHandle AllocAnonymousHugetlb(size_t size, const HostBufferOptions& opt
 #else
   int hugepage_flags = 0;
   if (!TryBuildHugepageFlags(opts.hugepage_size, &hugepage_flags)) {
-    UMBP_LOG_WARN(
-        "HostMemAllocator: cannot encode hugepage_size=%zu with this libc/kernel header set; "
+    MORI_UMBP_WARN(
+        "HostMemAllocator: cannot encode hugepage_size={} with this libc/kernel header set; "
         "falling back to anonymous pages",
         opts.hugepage_size);
     HostBufferOptions fallback = opts;
@@ -271,8 +271,8 @@ void HostMemAllocator::Free(HostBufferHandle& handle) {
 
   if (munmap(handle.ptr, handle.mapped_size) != 0) {
     const int err = errno;
-    UMBP_LOG_WARN(
-        "HostMemAllocator: munmap failed (%d: %s); invalidating handle anyway "
+    MORI_UMBP_WARN(
+        "HostMemAllocator: munmap failed ({}: {}); invalidating handle anyway "
         "to prevent a possible double-free of a reused VA range",
         err, std::strerror(err));
     // Fall through to invalidation below: keeping a stale-but-valid handle
