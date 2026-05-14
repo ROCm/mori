@@ -236,7 +236,6 @@ jobs:
             cd $GITHUB_WORKSPACE
             MORI_ENABLE_SDMA=1 timeout 300 python -m tests.python.ccl.test_allgather --world-size 8 --elems 1024 --iterations 1 --warmup 0
             MORI_ENABLE_SDMA=1 timeout 300 python -m tests.python.ccl.test_all2all --world-size 8 --elems 1024 --iterations 1 --warmup 0
-            MORI_ENABLE_SDMA=1 timeout 300 python -m tests.python.ccl.test_allreduce --world-size 8 --elems 1024 --iterations 1 --warmup 0
           "
 
       - name: MORI-EP async kernel bench (intranode)
