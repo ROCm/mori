@@ -1,15 +1,19 @@
 UMBP Master Client
 ==================
 
-``UMBPMasterClient`` is the **read-only** Python query client for the UMBP master.
-It lets nodes register themselves, report which KV-cache blocks they hold, and query
-which nodes hold a given set of blocks — enabling cross-node KV-cache reuse for
-externally-managed L1/L2 caches (e.g. SGLang's host-mem KV cache).
+``UMBPMasterClient`` is a lightweight Python **control-plane** client for the
+UMBP master.  It can register a node, report/revoke externally-managed KV-cache
+blocks, and query which nodes hold a given set of blocks — enabling cross-node
+KV-cache-aware scheduling for externally-managed L1/L2/L3 caches such as
+SGLang HiCache (GPU HBM, pinned host DRAM, and storage-backed L3).
 
 It is *not* the full UMBP data-plane client. Hot-path Put/Get with RDMA / MORI-IO
 goes through the C++ ``IUMBPClient`` (``mori.cpp.UMBPClient`` in Python) backed by a
 ``DistributedClient`` + ``PoolClient``. ``UMBPMasterClient`` only speaks to the master
 control plane and never registers a peer service or starts a heartbeat thread.
+Schedulers should usually use it only for ``match_external_kv()`` queries; SGLang
+HiCache event forwarding normally uses the distributed UMBP client owned by
+``UMBPStore``.
 
 For the full architecture see ``src/umbp/doc/design-master-control-plane.md``.
 
@@ -135,7 +139,10 @@ for that node.
    * - ``node_id: str``
      - Identifier of the node holding the blocks
    * - ``peer_address: str``
-     - gRPC address of the node (for direct transfer)
+     - PeerService gRPC address of the node, when the node registered one.
+       This is used by UMBP data-plane clients for direct transfer.  It may be
+       empty for lightweight ``UMBPMasterClient.register_self()`` examples or
+       for schedulers that only need ``node_id`` for routing decisions.
    * - ``hashes_by_tier: dict[UMBPTierType, list[str]]``
      - Matched hashes grouped by every tier they currently live on for this
        node.  A single block held on multiple tiers (e.g. write_through has
@@ -202,7 +209,9 @@ for one-shot or short-lived lookups, not for long-running peer membership.
        ``tier``.  Existing tier buckets for the same hashes are untouched
        (a re-report at the same tier is a no-op; reporting at a new tier
        adds a bucket without removing previously reported ones).  Raises
-       ``RuntimeError`` if ``hashes`` is empty or the call fails.
+       ``RuntimeError`` if ``hashes`` is empty or the call fails.  ``node_id``
+       must already be registered and alive; reports for unknown or expired
+       nodes are ignored by the master.
    * - ``revoke_external_kv_blocks(node_id, hashes, tier)``
      - Remove ``hashes`` from a single tier on this node.  Other tier
        buckets for the same hashes are untouched.  No-op for hashes that
@@ -214,6 +223,14 @@ for one-shot or short-lived lookups, not for long-running peer membership.
        or detach, host-pool reset).  Other tier buckets are untouched.
    * - ``match_external_kv(hashes) -> list[UMBPExternalKvNodeMatch]``
      - Query the master for nodes that hold any of the requested ``hashes``. Returns an empty list when no matches exist or ``hashes`` is empty. Raises ``RuntimeError`` on connection failure.
+
+**Protocol notes for non-Python clients:**
+
+``MatchExternalKv`` returns one ``ExternalKvNodeMatch`` per node.  Each match
+contains ``repeated TierHashes hashes_by_tier`` rather than the legacy
+``matched_hashes + tier`` shape.  A single hash may appear in multiple tier
+buckets for the same node, so consumers must de-duplicate by hash before using a
+match count for routing.
 
 ----
 
@@ -264,8 +281,9 @@ Usage Examples
 
    for m in matches:
        per_tier = {t.name: len(hs) for t, hs in m.hashes_by_tier.items()}
-       print(f"node {m.node_id} @ {m.peer_address} has {m.matched_hash_count()} blocks: {per_tier}")
-       # → "node node-a @ node-a:8080 has 3 blocks: {'DRAM': 3}"
+       peer = m.peer_address or "<no PeerService>"
+       print(f"node {m.node_id} @ {peer} has {m.matched_hash_count()} blocks: {per_tier}")
+       # → "node node-a @ <no PeerService> has 3 blocks: {'DRAM': 3}"
 
 **Revoking blocks when one tier is evicted:**
 
@@ -319,6 +337,115 @@ Usage Examples
    matches = node_a.match_external_kv(hashes)
    matched_nodes = {m.node_id: list(m.hashes_by_tier.keys()) for m in matches}
    # → {"node-a": [UMBPTierType.DRAM], "node-b": [UMBPTierType.HBM]}
+
+**Using ``match_external_kv`` for KV-cache-aware scheduling:**
+
+``match_external_kv`` is intentionally grouped by node, then by tier.  A
+scheduler such as mori-scheduler can derive both a per-worker cache-hit score
+and per-hash source locations from this response.
+
+.. code-block:: python
+
+   from collections import defaultdict
+   from mori.cpp import UMBPMasterClient, UMBPTierType
+
+   master = "127.0.0.1:15558"
+   query_client = UMBPMasterClient(master)
+
+   query_hashes = [
+       "sha256-prefix-0",
+       "sha256-prefix-1",
+       "sha256-prefix-2",
+       "sha256-prefix-3",
+   ]
+   matches = query_client.match_external_kv(query_hashes)
+
+   # hash -> list of candidate locations.  Useful for building a future
+   # prefetch hint or for explaining why a request was routed to a worker.
+   locations_by_hash = defaultdict(list)
+   for m in matches:
+       for tier, hashes in m.hashes_by_tier.items():
+           for h in hashes:
+               locations_by_hash[h].append(
+                   {
+                       "node_id": m.node_id,
+                       "peer_address": m.peer_address,
+                       "tier": tier,
+                   }
+               )
+
+   # Per-node summaries for routing.  Do NOT sum bucket sizes to get a hit
+   # count: the same hash can appear in HBM+DRAM+SSD on the same node.
+   summaries = []
+   for m in matches:
+       best_tier_by_hash = {}
+       for tier in sorted(m.hashes_by_tier):
+           for h in m.hashes_by_tier[tier]:
+               best_tier_by_hash.setdefault(h, tier)
+
+       summaries.append(
+           {
+               "node_id": m.node_id,
+               "matched_blocks": len(best_tier_by_hash),  # distinct hashes
+               "per_tier_blocks": {
+                   tier.name: len(set(hashes))
+                   for tier, hashes in m.hashes_by_tier.items()
+               },
+               # Fastest tier for each matched hash on this node.
+               "best_tier_by_hash": best_tier_by_hash,
+           }
+       )
+
+   not_found = set(query_hashes) - set(locations_by_hash)
+   best_node = max(summaries, key=lambda s: s["matched_blocks"], default=None)
+
+   # Example policy sketch:
+   # - HBM hits are best routed to the same worker/rank.
+   # - DRAM hits are cheaper than recompute but require H2D load-back.
+   # - SSD hits are L3/storage hits and should carry a higher fetch cost.
+   tier_cost = {
+       UMBPTierType.HBM: 0,
+       UMBPTierType.DRAM: 1,
+       UMBPTierType.SSD: 3,
+   }
+
+   def estimated_fetch_cost(summary):
+       return sum(
+           tier_cost[tier]
+           for tier in summary["best_tier_by_hash"].values()
+       )
+
+   cost_aware_node = min(summaries, key=estimated_fetch_cost, default=None)
+   # Production policies should combine this tier cost with recompute cost for
+   # `not_found`, queue depth, and worker health/load signals.
+
+For Rust/tonic consumers, mirror the current proto shape:
+
+.. code-block:: rust
+
+   use std::collections::{HashMap, HashSet};
+
+   pub struct NodeMatch {
+       pub node_id: String,
+       pub peer_address: String,
+       pub hashes_by_tier: HashMap<i32, Vec<String>>,
+   }
+
+   impl NodeMatch {
+       pub fn matched_hash_count(&self) -> usize {
+           let mut seen = HashSet::new();
+           for hashes in self.hashes_by_tier.values() {
+               for h in hashes {
+                   seen.insert(h);
+               }
+           }
+           seen.len()
+       }
+   }
+
+Do not keep using a legacy ``matched_hashes: Vec<String>, tier: i32`` wrapper:
+it cannot represent one block living on multiple HiCache tiers and will either
+lose tier information or double-count hits.
 
 **Context-manager pattern for automatic cleanup:**
 
