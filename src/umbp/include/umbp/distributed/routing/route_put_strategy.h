@@ -35,7 +35,15 @@ namespace mori::umbp {
 /// state — the writer follows up with peer.AllocateSlot to actually
 /// reserve capacity.  ENOSPC at peer triggers a retry with the failed
 /// node added to the exclude set.
+/// BatchRoutePut per-key outcome.  "Unavailable" is the outer
+/// `std::optional<RoutePutResult>::nullopt`.
+enum class RoutePutOutcome {
+  kRouted,         ///< node_id / tier / peer_address populated
+  kAlreadyExists,  ///< master-side dedup hit
+};
+
 struct RoutePutResult {
+  RoutePutOutcome outcome = RoutePutOutcome::kRouted;
   std::string node_id;
   std::string peer_address;
   TierType tier = TierType::UNKNOWN;

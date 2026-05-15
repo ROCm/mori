@@ -104,7 +104,12 @@ std::optional<RoutePutResult> TierAwareMostAvailableStrategy::Select(
           "candidates={} excludes=[{}]",
           block_size, TierTypeName(tier), best->node_id, best_available, candidates_considered,
           exclude_snapshot);
-      return RoutePutResult{best->node_id, best->peer_address, tier};
+      return RoutePutResult{
+          .outcome = RoutePutOutcome::kRouted,
+          .node_id = best->node_id,
+          .peer_address = best->peer_address,
+          .tier = tier,
+      };
     }
 
     MORI_UMBP_DEBUG(

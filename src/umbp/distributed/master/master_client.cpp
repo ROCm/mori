@@ -239,12 +239,23 @@ grpc::Status MasterClient::BatchRoutePut(const std::vector<std::string>& keys,
   out->resize(static_cast<size_t>(resp.entries_size()));
   for (int i = 0; i < resp.entries_size(); ++i) {
     const auto& e = resp.entries(i);
-    if (!e.found()) continue;
-    RoutePutResult r;
-    r.node_id = e.node_id();
-    r.peer_address = e.peer_address();
-    r.tier = FromProtoTier(e.tier());
-    (*out)[i] = std::move(r);
+    switch (e.outcome()) {
+      case ::umbp::ROUTE_PUT_OUTCOME_ROUTED:
+        (*out)[i] = RoutePutResult{
+            .outcome = RoutePutOutcome::kRouted,
+            .node_id = e.node_id(),
+            .peer_address = e.peer_address(),
+            .tier = FromProtoTier(e.tier()),
+        };
+        break;
+      case ::umbp::ROUTE_PUT_OUTCOME_ALREADY_EXISTS:
+        // Non-nullopt so caller distinguishes dedup from unavailable (= nullopt).
+        (*out)[i] = RoutePutResult{.outcome = RoutePutOutcome::kAlreadyExists};
+        break;
+      case ::umbp::ROUTE_PUT_OUTCOME_UNAVAILABLE:
+      default:
+        break;  // leave as nullopt
+    }
   }
   return grpc::Status::OK;
 }
@@ -284,14 +295,14 @@ grpc::Status MasterClient::BatchRouteGet(const std::vector<std::string>& keys,
 
 void MasterClient::SetPeerDramAllocator(PeerDramAllocator* alloc) { peer_alloc_ = alloc; }
 
-void MasterClient::RequestFullSync() {
+void MasterClient::RequestClearFullSync() {
   // Mark in-flight first so a heartbeat that races with us still
   // sees we owe an ack-callback.
   clear_full_sync_in_flight_.store(true);
   clear_full_sync_requested_.store(true);
   if (!heartbeat_running_.load()) {
     MORI_UMBP_WARN(
-        "[Client] RequestFullSync without a running heartbeat thread; "
+        "[Client] RequestClearFullSync without a running heartbeat thread; "
         "master will not converge until StartHeartbeat()");
     return;
   }

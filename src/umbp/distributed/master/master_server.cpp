@@ -331,11 +331,12 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     auto results = router_.BatchRoutePut(keys, request->node_id(), block_sizes, excludes);
     for (auto& opt : results) {
       auto* entry = response->add_entries();
-      if (!opt.has_value()) {
-        entry->set_found(false);
+      if (!opt.has_value()) continue;  // default UNAVAILABLE
+      if (opt->outcome == RoutePutOutcome::kAlreadyExists) {
+        entry->set_outcome(::umbp::ROUTE_PUT_OUTCOME_ALREADY_EXISTS);
         continue;
       }
-      entry->set_found(true);
+      entry->set_outcome(::umbp::ROUTE_PUT_OUTCOME_ROUTED);
       entry->set_node_id(opt->node_id);
       entry->set_tier(static_cast<::umbp::TierType>(opt->tier));
       entry->set_peer_address(opt->peer_address);

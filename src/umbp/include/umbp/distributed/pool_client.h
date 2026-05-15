@@ -64,7 +64,7 @@ class PoolClient {
   // ask master to collapse this node's index via a full-sync empty
   // snapshot.  Returns immediately — convergence happens on the next
   // heartbeat tick (which is woken eagerly).  See ClearLocal() /
-  // RequestFullSync() for the semantics of the write gate and the
+  // RequestClearFullSync() for the semantics of the write gate and the
   // best-effort caveat around in-flight remote reads.
   void Clear();
 
@@ -116,6 +116,13 @@ class PoolClient {
     uint64_t page_size = 0;
     std::vector<BufferMemoryDescBytes> descs;
   };
+
+  // Per-entry outcome inside the Put pipeline; projected to `bool` at
+  // BatchPut's return boundary (anything but kFailed is success).
+  // `kAlreadyExists` (master- or peer-side dedup) is success-to-caller
+  // but excluded from bandwidth metrics — no bytes on the wire.
+  // Mirrors PeerDramAllocator::Outcome / proto *_ALREADY_EXISTS.
+  enum class PutEntryOutcome { kFailed, kSucceeded, kAlreadyExists };
 
  private:
   PoolClientConfig config_;
@@ -195,7 +202,9 @@ class PoolClient {
   std::optional<std::pair<mori::io::MemoryDesc, size_t>> FindRegisteredMemory(const void* ptr,
                                                                               size_t size);
 
-  enum class PutAttemptOutcome { kSuccess, kRetry, kFatal };
+  // Single-attempt outcome from a peer call; mapped to PutEntryOutcome
+  // by the caller (Partition / Allocate).
+  enum class PutAttemptOutcome { kSuccess, kSuccessAlreadyExists, kRetry, kFatal };
   enum class GetAttemptOutcome { kSuccess, kRetry, kFatal };
 
   PutAttemptOutcome ExecuteLocalPut(const std::string& key, const void* src, size_t size,
@@ -219,7 +228,7 @@ class PoolClient {
   std::unordered_map<std::string, std::vector<BatchPutItem>> PartitionBatchPutTargets(
       const std::vector<std::string>& keys, const std::vector<const void*>& srcs,
       const std::vector<size_t>& sizes, const std::vector<std::optional<RoutePutResult>>& routes,
-      std::vector<bool>* results);
+      std::vector<PutEntryOutcome>* results);
 
   struct TransferInstruction {
     size_t entry_index;
@@ -251,16 +260,19 @@ class PoolClient {
     bool failed = false;
   };
 
-  void ProcessRemoteBatchPut(const std::vector<BatchPutItem>& items, std::vector<bool>* results);
+  void ProcessRemoteBatchPut(const std::vector<BatchPutItem>& items,
+                             std::vector<PutEntryOutcome>* results);
   void ProcessRemoteBatchGet(const std::vector<BatchGetItem>& items, std::vector<bool>* results);
-  void ExecuteRemoteBatchPut(const std::vector<BatchPutItem>& items, std::vector<bool>* results,
-                             PeerConnection& peer, ::umbp::UMBPPeer::Stub* stub);
+  void ExecuteRemoteBatchPut(const std::vector<BatchPutItem>& items,
+                             std::vector<PutEntryOutcome>* results, PeerConnection& peer,
+                             ::umbp::UMBPPeer::Stub* stub);
   void ExecuteRemoteBatchGet(const std::vector<BatchGetItem>& items, std::vector<bool>* results,
                              PeerConnection& peer, ::umbp::UMBPPeer::Stub* stub);
 
   bool AllocateRemotePutEntries(const std::vector<BatchPutItem>& items,
                                 ::umbp::UMBPPeer::Stub* stub, std::vector<RemotePutEntry>* entries,
-                                std::vector<uint64_t>* abort_slots, std::vector<bool>* results);
+                                std::vector<uint64_t>* abort_slots,
+                                std::vector<PutEntryOutcome>* results);
   bool BuildRemotePutTransfers(std::vector<RemotePutEntry>& entries, PeerConnection& peer,
                                std::vector<TransferInstruction>* transfers,
                                uint64_t* staging_bytes);
@@ -268,7 +280,8 @@ class PoolClient {
                                  std::vector<TransferInstruction>& transfers,
                                  uint64_t staging_bytes);
   void FinalizeRemotePutEntries(std::vector<RemotePutEntry>& entries,
-                                std::vector<uint64_t>& abort_slots, std::vector<bool>* results,
+                                std::vector<uint64_t>& abort_slots,
+                                std::vector<PutEntryOutcome>* results,
                                 ::umbp::UMBPPeer::Stub* stub);
 
   bool PrepareRemoteGetEntries(const std::vector<BatchGetItem>& items, ::umbp::UMBPPeer::Stub* stub,

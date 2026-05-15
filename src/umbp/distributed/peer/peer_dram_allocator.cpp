@@ -79,22 +79,30 @@ const PageBitmapAllocator* PeerDramAllocator::AllocatorForLocked(TierType tier) 
   return it == allocators_.end() ? nullptr : it->second.get();
 }
 
-std::optional<PeerDramAllocator::PendingSlot> PeerDramAllocator::Allocate(uint64_t size,
-                                                                          TierType tier) {
+PeerDramAllocator::AllocateResult PeerDramAllocator::Allocate(const std::string& key, uint64_t size,
+                                                              TierType tier) {
+  AllocateResult out;  // defaults to kFailed
   const uint32_t num_pages = SizeToPages(size, page_size_);
-  if (num_pages == 0) return std::nullopt;
+  if (num_pages == 0) return out;
 
-  // Refuse new allocations between ClearLocal() and the first acked
-  // full-sync empty heartbeat — any owned key created in that window
-  // would not appear in the snapshot we are about to ship to master.
-  if (clear_full_sync_pending_.load(std::memory_order_acquire)) return std::nullopt;
+  // Block new allocations between ClearLocal() and full-sync ack — any
+  // owned key created here would miss the empty snapshot to master.
+  if (clear_full_sync_pending_.load(std::memory_order_acquire)) return out;
 
   std::lock_guard<std::mutex> lock(mutex_);
+
+  // owned_ dedup (master-index-lag fallback).  pending_ deliberately
+  // not checked — same-key pending race is absorbed by Commit().
+  if (owned_.find(key) != owned_.end()) {
+    out.outcome = Outcome::kAlreadyExists;
+    return out;
+  }
+
   PageBitmapAllocator* alloc = AllocatorForLocked(tier);
-  if (alloc == nullptr) return std::nullopt;
+  if (alloc == nullptr) return out;
 
   auto result = alloc->Allocate(num_pages);
-  if (!result) return std::nullopt;
+  if (!result) return out;
 
   PendingSlot slot;
   slot.slot_id = next_slot_id_.fetch_add(1, std::memory_order_relaxed);
@@ -104,7 +112,9 @@ std::optional<PeerDramAllocator::PendingSlot> PeerDramAllocator::Allocate(uint64
   slot.deadline = std::chrono::steady_clock::now() + pending_ttl_;
   slot.generation = allocator_generation_;
   pending_[slot.slot_id] = slot;
-  return slot;
+  out.outcome = Outcome::kAllocated;
+  out.slot = std::move(slot);
+  return out;
 }
 
 bool PeerDramAllocator::Commit(uint64_t slot_id, const std::string& key,
@@ -123,17 +133,20 @@ bool PeerDramAllocator::Commit(uint64_t slot_id, const std::string& key,
     return false;
   }
 
-  // If the key was already owned (legitimate idempotent retry from the
-  // writer), free the prior slot's pages first so we don't leak — then
-  // overwrite with the new slot.  This matches the doc's "commit raced
-  // reaper" recovery path: writer retries and we converge.
+  // Race-window safety net: two writers passed Allocate() before either
+  // committed.  Keep first, drop new pages, idempotent success.
   auto existing = owned_.find(key);
   if (existing != owned_.end()) {
-    if (auto* prev_alloc = AllocatorForLocked(existing->second.tier)) {
-      prev_alloc->Deallocate(existing->second.pages);
+    MORI_UMBP_WARN(
+        "[PeerDramAllocator] duplicate Commit for key='{}' "
+        "(existing tier={} size={}, new size={}) — keeping prior slot",
+        key, static_cast<int>(existing->second.tier), existing->second.size, it->second.size);
+    if (auto* alloc = AllocatorForLocked(it->second.tier)) {
+      alloc->Deallocate(it->second.pages);
     }
-    pending_events_.push_back(KvEvent{KvEvent::Kind::REMOVE, key, existing->second.tier, 0});
-    owned_.erase(existing);
+    bytes_committed = existing->second.size;
+    pending_.erase(it);
+    return true;
   }
 
   OwnedSlot owned;

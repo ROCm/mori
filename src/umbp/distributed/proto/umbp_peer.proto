@@ -94,21 +94,30 @@ message ReleaseSsdLeaseResponse {
 //  DRAM/HBM allocator + key map (new)
 // ============================================================
 
-// Allocate a peer-local pending slot for `size` bytes on `tier`.  ENOSPC
-// is returned via `success=false` (not an RPC error) so the writer can
-// retry RoutePut with `exclude_nodes`.  `slot_id` is opaque to the
-// writer; it is echoed back by Commit/Abort.
+// Reserve a peer-local pending slot for `size` bytes on `tier`.  Failure
+// modes (ENOSPC etc.) are signaled via `outcome`, not an RPC error, so
+// the writer can retry RoutePut with `exclude_nodes`.  `slot_id` is
+// opaque; echoed back by Commit / Abort.
 message AllocateSlotRequest {
   uint64   size = 1;
   TierType tier = 2;
+  string   key  = 3;  // owned_ dedup (master-index-lag fallback)
 }
+// AllocateSlot / BatchAllocateSlots per-entry outcome.  Only ALLOCATED
+// populates slot_id / pages / descs / pending_ttl_ms.
+enum AllocateSlotOutcome {
+  ALLOCATE_SLOT_OUTCOME_FAILED         = 0;  // ENOSPC / bad tier / clear-pending
+  ALLOCATE_SLOT_OUTCOME_ALLOCATED      = 1;
+  ALLOCATE_SLOT_OUTCOME_ALREADY_EXISTS = 2;  // owned_[key] dedup hit
+}
+
 message AllocateSlotResponse {
-  bool     success        = 1;
-  uint64   slot_id        = 2;
-  repeated PageLocation pages = 3;
-  uint64   page_size      = 4;
-  repeated BufferMemoryDesc descs = 5;  // dedup'd by buffer_index
-  uint64   pending_ttl_ms = 6;          // single TTL in the system
+  AllocateSlotOutcome outcome        = 1;
+  uint64              slot_id        = 2;
+  repeated PageLocation       pages  = 3;
+  uint64              page_size      = 4;
+  repeated BufferMemoryDesc   descs  = 5;  // dedup'd by buffer_index
+  uint64              pending_ttl_ms = 6;  // single TTL in the system
 }
 
 // Commit moves pending → owned.  After a successful commit the peer

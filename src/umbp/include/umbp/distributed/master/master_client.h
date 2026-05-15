@@ -120,7 +120,7 @@ class MasterClient {
   // master will collapse this node's index in one shot.  The heartbeat
   // thread is woken so master converges within an RPC round-trip
   // instead of the next heartbeat tick.
-  void RequestFullSync();
+  void RequestClearFullSync();
 
   // --- Client-side metrics ---
   void AddCounter(std::string name, std::string help, Labels labels, double delta);
@@ -191,7 +191,7 @@ class MasterClient {
   uint64_t hb_seq_ = 0;
   uint64_t hb_last_acked_seq_ = 0;
 
-  // Set by Clear() via RequestFullSync().  `_requested_` wakes the
+  // Set by Clear() via RequestClearFullSync().  `_requested_` wakes the
   // heartbeat thread and picks the empty-snapshot branch.
   // `_in_flight_` survives that branch and triggers
   // PeerDramAllocator::ClearFullSyncAcked() once master acks — kept

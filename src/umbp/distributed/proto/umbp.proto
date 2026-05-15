@@ -150,11 +150,19 @@ message BatchRoutePutRequest {
   repeated uint64 block_sizes = 3;
   repeated string exclude_nodes = 4;  // global exclude — applies to every entry
 }
+// BatchRoutePut per-key result.  Only ROUTED populates node_id / tier /
+// peer_address; the other states leave them empty.
+enum RoutePutOutcome {
+  ROUTE_PUT_OUTCOME_UNAVAILABLE    = 0;  // no alive client / no capacity
+  ROUTE_PUT_OUTCOME_ROUTED         = 1;
+  ROUTE_PUT_OUTCOME_ALREADY_EXISTS = 2;  // master-side dedup hit
+}
+
 message BatchRoutePutEntry {
-  bool     found        = 1;
-  string   node_id      = 2;
-  TierType tier         = 3;
-  string   peer_address = 4;
+  RoutePutOutcome outcome      = 1;
+  string          node_id      = 2;
+  TierType        tier         = 3;
+  string          peer_address = 4;
 }
 message BatchRoutePutResponse {
   repeated BatchRoutePutEntry entries = 1;

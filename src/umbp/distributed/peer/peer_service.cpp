@@ -435,19 +435,24 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
   grpc::Status AllocateSlot(grpc::ServerContext* /*ctx*/,
                             const ::umbp::AllocateSlotRequest* request,
                             ::umbp::AllocateSlotResponse* response) override {
-    if (dram_alloc_ == nullptr) {
-      response->set_success(false);
-      return grpc::Status::OK;
+    if (dram_alloc_ == nullptr) return grpc::Status::OK;  // default FAILED
+    auto result =
+        dram_alloc_->Allocate(request->key(), request->size(), FromProtoTier(request->tier()));
+    switch (result.outcome) {
+      case PeerDramAllocator::Outcome::kAlreadyExists:
+        response->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_ALREADY_EXISTS);
+        return grpc::Status::OK;
+      case PeerDramAllocator::Outcome::kFailed:
+        response->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_FAILED);
+        return grpc::Status::OK;
+      case PeerDramAllocator::Outcome::kAllocated:
+        break;
     }
-    auto pending = dram_alloc_->Allocate(request->size(), FromProtoTier(request->tier()));
-    if (!pending) {
-      response->set_success(false);
-      return grpc::Status::OK;
-    }
-    auto descs = dram_alloc_->BufferDescsForPages(pending->tier, pending->pages);
-    response->set_success(true);
-    response->set_slot_id(pending->slot_id);
-    FillPagesAndDescs(response, pending->pages, dram_alloc_->PageSize(), descs);
+    const auto& pending = *result.slot;
+    auto descs = dram_alloc_->BufferDescsForPages(pending.tier, pending.pages);
+    response->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_ALLOCATED);
+    response->set_slot_id(pending.slot_id);
+    FillPagesAndDescs(response, pending.pages, dram_alloc_->PageSize(), descs);
     response->set_pending_ttl_ms(dram_alloc_->PendingTtlMs());
     return grpc::Status::OK;
   }
@@ -514,19 +519,23 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
                                   ::umbp::BatchAllocateSlotsResponse* response) override {
     for (const auto& entry : request->entries()) {
       auto* out = response->add_entries();
-      if (dram_alloc_ == nullptr) {
-        out->set_success(false);
-        continue;
+      if (dram_alloc_ == nullptr) continue;  // default FAILED
+      auto result = dram_alloc_->Allocate(entry.key(), entry.size(), FromProtoTier(entry.tier()));
+      switch (result.outcome) {
+        case PeerDramAllocator::Outcome::kAlreadyExists:
+          out->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_ALREADY_EXISTS);
+          continue;
+        case PeerDramAllocator::Outcome::kFailed:
+          out->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_FAILED);
+          continue;
+        case PeerDramAllocator::Outcome::kAllocated:
+          break;
       }
-      auto pending = dram_alloc_->Allocate(entry.size(), FromProtoTier(entry.tier()));
-      if (!pending) {
-        out->set_success(false);
-        continue;
-      }
-      auto descs = dram_alloc_->BufferDescsForPages(pending->tier, pending->pages);
-      out->set_success(true);
-      out->set_slot_id(pending->slot_id);
-      FillPagesAndDescs(out, pending->pages, dram_alloc_->PageSize(), descs);
+      const auto& pending = *result.slot;
+      auto descs = dram_alloc_->BufferDescsForPages(pending.tier, pending.pages);
+      out->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_ALLOCATED);
+      out->set_slot_id(pending.slot_id);
+      FillPagesAndDescs(out, pending.pages, dram_alloc_->PageSize(), descs);
       out->set_pending_ttl_ms(dram_alloc_->PendingTtlMs());
     }
     return grpc::Status::OK;

@@ -428,7 +428,7 @@ Master-facing service. Sources of truth are the proto file and the
 | `Heartbeat(HeartbeatRequest)` | The authoritative update channel. `seq` is monotonic and peer-assigned; `last_acked_seq` echoes master's most recent ack; `events[]` is the queue since the last ack; `is_full_sync` flips the request into a complete owned-key set replay. Response has `acked_seq` and `request_full_sync` for gap recovery. |
 | `RouteGet(RouteGetRequest)` | Pick a replica. Read-only against `GlobalBlockIndex`. |
 | `RoutePut(RoutePutRequest)` | Pick a target node + tier. Read-only against `ClientRegistry`. |
-| `BatchRouteGet`/`BatchRoutePut` | Parallel-key variants. |
+| `BatchRouteGet`/`BatchRoutePut` | Parallel-key variants. `BatchRoutePut` also performs **master-side Put dedup**: any key already present in `GlobalBlockIndex` is returned with `already_exists=true` (and no node selection) so the caller can skip the Put entirely — primary defense against re-uploading the same kv-cache from multiple ranks (sglang DP-attention). Peer's `AllocateSlot` carries a key field and applies the same dedup as a defensive layer against master-index lag. |
 | `ReportExternalKvBlocks`/`RevokeExternalKvBlocks`/`MatchExternalKv` | External (unmanaged) cache index. |
 | `ReportMetrics(ReportMetricsRequest)` | Client-side counters/gauges/histograms forwarded to master's Prometheus exposition. |
 
@@ -444,7 +444,7 @@ has a DRAM/HBM tier or an SSD tier.
 | RPC | Purpose |
 |---|---|
 | `GetPeerInfo` | First-contact hydration: packed `engine_desc`, SSD staging buffer descriptor, all DRAM/HBM `BufferMemoryDesc`s, and the tier `dram_page_size`. |
-| `AllocateSlot(size, tier)` | Reserve a pending DRAM/HBM slot. Response carries `slot_id`, the `pages` it covers, `page_size`, the dedup'd `descs` for those pages, and a `pending_ttl_ms`. ENOSPC is `success=false`, not an RPC error. |
+| `AllocateSlot(key, size, tier)` | Reserve a pending DRAM/HBM slot. Response carries `slot_id`, the `pages` it covers, `page_size`, the dedup'd `descs` for those pages, and a `pending_ttl_ms`. ENOSPC is `success=false` + `already_exists=false`. **Duplicate-key dedup**: if `owned_[key]` is already present (master-index-lag fallback), response is `success=false` + `already_exists=true` — caller treats this as a no-op success and skips RDMA. |
 | `CommitSlot(slot_id, key)` | Move pending → owned. Queues `KvEvent{ADD, key, tier, size}`. |
 | `AbortSlot(slot_id)` | Drop a pending slot. Idempotent. |
 | `ResolveKey(key)` | Read-side lookup. Bumps the per-key read-lease counter (Bug #7 mitigation). Returns `pages`, `page_size`, `descs`, `size`. |

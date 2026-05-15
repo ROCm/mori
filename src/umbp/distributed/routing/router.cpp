@@ -84,6 +84,8 @@ std::optional<RouteGetResolution> Router::RouteGet(
 std::optional<RoutePutResult> Router::RoutePut(
     const std::string& key, const std::string& node_id, uint64_t block_size,
     const std::unordered_set<std::string>& exclude_nodes) {
+  // Master-side dedup lives only in BatchRoutePut (single RoutePut
+  // proto carries no already_exists; PoolClient::Put wraps BatchPut).
   (void)key;
   auto candidates = registry_.GetAliveClients();
   if (candidates.empty()) {
@@ -104,14 +106,17 @@ std::vector<std::optional<RoutePutResult>> Router::BatchRoutePut(
     const std::unordered_set<std::string>& exclude_nodes) {
   (void)node_id;
   std::vector<std::optional<RoutePutResult>> results(keys.size());
-  // BatchRoutePut shares one alive-clients snapshot across all entries
-  // to keep results internally consistent.  Master holds no allocator
-  // state, so two entries selecting the same (node, tier) are not
-  // accounting-wrong here — the peer will sort out ENOSPC at
-  // AllocateSlot time.
+  // Single shared_lock for the whole batch: dedup mask + alive snapshot.
+  // Two entries picking the same (node, tier) is fine — peer will sort
+  // out ENOSPC at AllocateSlot.
+  auto exists_mask = index_.BatchLookupExists(keys);
   auto candidates = registry_.GetAliveClients();
-  if (candidates.empty()) return results;
   for (size_t i = 0; i < keys.size(); ++i) {
+    if (i < exists_mask.size() && exists_mask[i]) {
+      results[i] = RoutePutResult{.outcome = RoutePutOutcome::kAlreadyExists};
+      continue;
+    }
+    if (candidates.empty()) continue;
     results[i] = put_strategy_->Select(candidates, block_sizes[i], exclude_nodes);
   }
   return results;

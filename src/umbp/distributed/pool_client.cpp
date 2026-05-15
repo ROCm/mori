@@ -60,33 +60,30 @@ struct BatchBandwidthSplit {
   double remote = 0.0;
 };
 
-template <typename Route>
-BatchBandwidthSplit ComputeBatchBandwidthBytes(const std::vector<bool>& results,
+// Bandwidth predicate.  BatchGet uses `bool` (no dedup); BatchPut uses
+// PutEntryOutcome (kAlreadyExists is success-to-caller but moves no
+// bytes — excluded from bandwidth).
+inline bool IsCountedForBandwidth(bool r) { return r; }
+inline bool IsCountedForBandwidth(PoolClient::PutEntryOutcome r) {
+  return r == PoolClient::PutEntryOutcome::kSucceeded;
+}
+
+template <typename Route, typename Result>
+BatchBandwidthSplit ComputeBatchBandwidthBytes(const std::vector<Result>& results,
                                                const std::vector<size_t>& sizes,
                                                const std::vector<std::optional<Route>>& routes,
                                                std::string_view local_node_id) {
-  const size_t limit =
-      std::min({results.size(), sizes.size(), routes.size()});  // guard against mismatched sizes
-  size_t idx = 0;
-  auto reducer = [&](BatchBandwidthSplit acc, bool success) {
-    if (idx >= limit) {
-      ++idx;
-      return acc;
-    }
-    if (success) {
-      const double bytes = static_cast<double>(sizes[idx]);
-      // No route means the key was served from local storage (fallback path).
-      const bool is_local = !routes[idx].has_value() || routes[idx]->node_id == local_node_id;
-      if (is_local) {
-        acc.local += bytes;
-      } else {
-        acc.remote += bytes;
-      }
-    }
-    ++idx;
-    return acc;
-  };
-  return std::accumulate(results.begin(), results.begin() + limit, BatchBandwidthSplit{}, reducer);
+  // guard against mismatched sizes
+  const size_t limit = std::min({results.size(), sizes.size(), routes.size()});
+  BatchBandwidthSplit acc;
+  for (size_t i = 0; i < limit; ++i) {
+    if (!IsCountedForBandwidth(results[i])) continue;
+    const double bytes = static_cast<double>(sizes[i]);
+    // No route means the key was served from local storage (fallback path).
+    const bool is_local = !routes[i].has_value() || routes[i]->node_id == local_node_id;
+    (is_local ? acc.local : acc.remote) += bytes;
+  }
+  return acc;
 }
 
 void ObserveBatchBandwidth(MasterClient& master_client, double bytes, double seconds,
@@ -359,7 +356,7 @@ void PoolClient::Shutdown() {
 void PoolClient::Clear() {
   if (!initialized_.load()) return;
   if (peer_alloc_) peer_alloc_->ClearLocal();
-  if (master_client_) master_client_->RequestFullSync();
+  if (master_client_) master_client_->RequestClearFullSync();
 }
 
 bool PoolClient::IsInitialized() const { return initialized_; }
@@ -464,17 +461,24 @@ PoolClient::PutAttemptOutcome PoolClient::ExecuteLocalPut(const std::string& key
     MORI_UMBP_ERROR("[PoolClient] Local Put requested but peer allocator unavailable");
     return PutAttemptOutcome::kFatal;
   }
-  auto pending = peer_alloc_->Allocate(size, tier);
-  if (!pending) {
-    return PutAttemptOutcome::kRetry;
+  auto alloc_res = peer_alloc_->Allocate(key, size, tier);
+  switch (alloc_res.outcome) {
+    case PeerDramAllocator::Outcome::kAlreadyExists:
+      // Dedup: skip RDMA + Commit + bytes metric.
+      return PutAttemptOutcome::kSuccessAlreadyExists;
+    case PeerDramAllocator::Outcome::kFailed:
+      return PutAttemptOutcome::kRetry;
+    case PeerDramAllocator::Outcome::kAllocated:
+      break;
   }
-  if (!LocalPutPages(pending->pages, peer_alloc_->PageSize(), src, size)) {
-    peer_alloc_->Abort(pending->slot_id);
+  const auto& pending = *alloc_res.slot;
+  if (!LocalPutPages(pending.pages, peer_alloc_->PageSize(), src, size)) {
+    peer_alloc_->Abort(pending.slot_id);
     return PutAttemptOutcome::kFatal;
   }
   uint64_t committed_bytes = 0;
-  if (!peer_alloc_->Commit(pending->slot_id, key, committed_bytes)) {
-    peer_alloc_->Abort(pending->slot_id);
+  if (!peer_alloc_->Commit(pending.slot_id, key, committed_bytes)) {
+    peer_alloc_->Abort(pending.slot_id);
     return PutAttemptOutcome::kFatal;
   }
   master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL,
@@ -513,28 +517,34 @@ PoolClient::PartitionBatchPutTargets(const std::vector<std::string>& keys,
                                      const std::vector<const void*>& srcs,
                                      const std::vector<size_t>& sizes,
                                      const std::vector<std::optional<RoutePutResult>>& routes,
-                                     std::vector<bool>* results) {
+                                     std::vector<PutEntryOutcome>* results) {
   std::unordered_map<std::string, std::vector<BatchPutItem>> remote_groups;
   const size_t count = keys.size();
   for (size_t i = 0; i < count; ++i) {
-    if (i >= routes.size() || !routes[i].has_value()) {
+    if (i >= routes.size() || !routes[i].has_value()) continue;
+    const auto& route = routes[i].value();
+    // Master-side dedup hit.
+    if (route.outcome == RoutePutOutcome::kAlreadyExists) {
+      (*results)[i] = PutEntryOutcome::kAlreadyExists;
       continue;
     }
-    const auto& route = routes[i].value();
     if (route.node_id == config_.master_config.node_id) {
-      auto outcome = ExecuteLocalPut(keys[i], srcs[i], sizes[i], route.tier);
-      if (outcome == PutAttemptOutcome::kSuccess) {
-        (*results)[i] = true;
+      switch (ExecuteLocalPut(keys[i], srcs[i], sizes[i], route.tier)) {
+        case PutAttemptOutcome::kSuccess:
+          (*results)[i] = PutEntryOutcome::kSucceeded;
+          break;
+        case PutAttemptOutcome::kSuccessAlreadyExists:
+          (*results)[i] = PutEntryOutcome::kAlreadyExists;
+          break;
+        case PutAttemptOutcome::kRetry:
+        case PutAttemptOutcome::kFatal:
+          break;  // default kFailed
       }
       continue;
     }
-    if (route.tier != TierType::DRAM && route.tier != TierType::HBM) {
-      (*results)[i] = false;
-      continue;
-    }
-    BatchPutItem item{
-        .index = i, .key = &keys[i], .src = srcs[i], .size = sizes[i], .route = route};
-    remote_groups[route.node_id].push_back(std::move(item));
+    if (route.tier != TierType::DRAM && route.tier != TierType::HBM) continue;
+    remote_groups[route.node_id].push_back(BatchPutItem{
+        .index = i, .key = &keys[i], .src = srcs[i], .size = sizes[i], .route = route});
   }
   return remote_groups;
 }
@@ -563,54 +573,50 @@ std::vector<bool> PoolClient::BatchPut(const std::vector<std::string>& keys,
                                        const std::vector<const void*>& srcs,
                                        const std::vector<size_t>& sizes) {
   const auto call_start = std::chrono::steady_clock::now();
-  std::vector<bool> results(keys.size(), false);
   if (keys.size() != srcs.size() || keys.size() != sizes.size()) {
     MORI_UMBP_ERROR("[PoolClient] BatchPut: vector length mismatch");
-    return results;
+    return std::vector<bool>(keys.size(), false);
   }
   if (!initialized_) {
     MORI_UMBP_ERROR("[PoolClient] BatchPut: client not initialized");
-    return results;
+    return std::vector<bool>(keys.size(), false);
   }
 
+  // Tri-state pipeline; projected to vector<bool> at return.
+  std::vector<PutEntryOutcome> outcomes(keys.size(), PutEntryOutcome::kFailed);
+
   std::vector<uint64_t> block_sizes(keys.size());
-  for (size_t i = 0; i < sizes.size(); ++i) {
-    block_sizes[i] = static_cast<uint64_t>(sizes[i]);
-  }
+  for (size_t i = 0; i < sizes.size(); ++i) block_sizes[i] = static_cast<uint64_t>(sizes[i]);
   std::vector<std::optional<RoutePutResult>> routes;
   std::unordered_set<std::string> excludes;
   auto status = master_client_->BatchRoutePut(keys, block_sizes, excludes, &routes);
   if (!status.ok()) {
     MORI_UMBP_ERROR("[PoolClient] BatchPut: BatchRoutePut failed: {}", status.error_message());
-    return results;
+    return std::vector<bool>(keys.size(), false);
   }
-  if (routes.size() < keys.size()) {
-    routes.resize(keys.size());
-  }
+  if (routes.size() < keys.size()) routes.resize(keys.size());
 
-  auto remote_groups = PartitionBatchPutTargets(keys, srcs, sizes, routes, &results);
-
+  auto remote_groups = PartitionBatchPutTargets(keys, srcs, sizes, routes, &outcomes);
   for (auto& [node_id, items] : remote_groups) {
-    ProcessRemoteBatchPut(items, &results);
-  }
-
-  // Entries without routing advice or still false fall back to individual attempts.
-  for (size_t i = 0; i < keys.size(); ++i) {
-    if (results[i]) continue;
-    results[i] = false;
+    ProcessRemoteBatchPut(items, &outcomes);
   }
 
   const auto call_end = std::chrono::steady_clock::now();
   const double seconds =
       std::chrono::duration_cast<std::chrono::duration<double>>(call_end - call_start).count();
   if (seconds > 0.0) {
-    auto split = ComputeBatchBandwidthBytes(results, sizes, routes, config_.master_config.node_id);
+    auto split = ComputeBatchBandwidthBytes(outcomes, sizes, routes, config_.master_config.node_id);
     ObserveBatchBandwidth(*master_client_, split.local, seconds,
                           MORI_UMBP_METRIC_CLIENT_BATCH_PUT_BANDWIDTH,
                           MORI_UMBP_METRIC_CLIENT_BATCH_PUT_BANDWIDTH_HELP, "local");
     ObserveBatchBandwidth(*master_client_, split.remote, seconds,
                           MORI_UMBP_METRIC_CLIENT_BATCH_PUT_BANDWIDTH,
                           MORI_UMBP_METRIC_CLIENT_BATCH_PUT_BANDWIDTH_HELP, "remote");
+  }
+
+  std::vector<bool> results(outcomes.size());
+  for (size_t i = 0; i < outcomes.size(); ++i) {
+    results[i] = (outcomes[i] != PutEntryOutcome::kFailed);
   }
   return results;
 }
@@ -696,51 +702,44 @@ std::vector<bool> PoolClient::BatchGet(const std::vector<std::string>& keys,
 }
 
 void PoolClient::ProcessRemoteBatchPut(const std::vector<BatchPutItem>& items,
-                                       std::vector<bool>* results) {
+                                       std::vector<PutEntryOutcome>* results) {
   if (items.empty()) return;
+  auto fail_all = [&] {
+    for (const auto& item : items) (*results)[item.index] = PutEntryOutcome::kFailed;
+  };
   if (!io_engine_) {
-    for (const auto& item : items) {
-      (*results)[item.index] = false;
-    }
+    fail_all();
     return;
   }
-
   const auto& first = items.front();
   auto& peer = GetOrConnectPeer(first.route.node_id, first.route.peer_address);
   if (!EnsurePeerServiceConnection(peer)) {
-    for (const auto& item : items) {
-      (*results)[item.index] = false;
-    }
+    fail_all();
     return;
   }
-
   auto* stub = static_cast<::umbp::UMBPPeer::Stub*>(peer.peer_stub.get());
   ExecuteRemoteBatchPut(items, results, peer, stub);
 }
 
 void PoolClient::ExecuteRemoteBatchPut(const std::vector<BatchPutItem>& items,
-                                       std::vector<bool>* results, PeerConnection& peer,
+                                       std::vector<PutEntryOutcome>* results, PeerConnection& peer,
                                        ::umbp::UMBPPeer::Stub* stub) {
   if (items.empty()) return;
   if (!io_engine_) {
-    for (const auto& item : items) {
-      (*results)[item.index] = false;
-    }
+    for (const auto& item : items) (*results)[item.index] = PutEntryOutcome::kFailed;
     return;
   }
 
   std::vector<RemotePutEntry> entries;
   std::vector<uint64_t> abort_slots;
-  if (!AllocateRemotePutEntries(items, stub, &entries, &abort_slots, results)) {
-    return;
-  }
+  if (!AllocateRemotePutEntries(items, stub, &entries, &abort_slots, results)) return;
 
   std::vector<TransferInstruction> transfers;
   uint64_t staging_bytes = 0;
   if (!BuildRemotePutTransfers(entries, peer, &transfers, &staging_bytes)) {
     for (auto& entry : entries) {
       abort_slots.push_back(entry.slot_id);
-      (*results)[entry.result_index] = false;
+      (*results)[entry.result_index] = PutEntryOutcome::kFailed;
     }
     if (!abort_slots.empty()) {
       ::umbp::BatchAbortSlotsRequest abort_req;
@@ -760,13 +759,14 @@ bool PoolClient::AllocateRemotePutEntries(const std::vector<BatchPutItem>& items
                                           ::umbp::UMBPPeer::Stub* stub,
                                           std::vector<RemotePutEntry>* entries,
                                           std::vector<uint64_t>* abort_slots,
-                                          std::vector<bool>* results) {
+                                          std::vector<PutEntryOutcome>* results) {
   entries->clear();
   ::umbp::BatchAllocateSlotsRequest alloc_req;
   for (const auto& item : items) {
     auto* entry = alloc_req.add_entries();
     entry->set_size(item.size);
     entry->set_tier(static_cast<::umbp::TierType>(item.route.tier));
+    entry->set_key(*item.key);
   }
 
   ::umbp::BatchAllocateSlotsResponse alloc_resp;
@@ -775,9 +775,7 @@ bool PoolClient::AllocateRemotePutEntries(const std::vector<BatchPutItem>& items
   if (!alloc_status.ok() || alloc_resp.entries_size() != static_cast<int>(items.size())) {
     MORI_UMBP_WARN("[PoolClient] BatchAllocateSlots failed on {}: {}", items.front().route.node_id,
                    alloc_status.error_message());
-    for (const auto& item : items) {
-      (*results)[item.index] = false;
-    }
+    for (const auto& item : items) (*results)[item.index] = PutEntryOutcome::kFailed;
     return false;
   }
 
@@ -785,16 +783,24 @@ bool PoolClient::AllocateRemotePutEntries(const std::vector<BatchPutItem>& items
   for (size_t i = 0; i < items.size(); ++i) {
     const auto& item = items[i];
     const auto& resp_entry = alloc_resp.entries(static_cast<int>(i));
-    if (!resp_entry.success()) {
-      (*results)[item.index] = false;
-      continue;
+    switch (resp_entry.outcome()) {
+      case ::umbp::ALLOCATE_SLOT_OUTCOME_ALREADY_EXISTS:
+        // Peer-side dedup: skip RDMA + Commit + Abort.
+        (*results)[item.index] = PutEntryOutcome::kAlreadyExists;
+        continue;
+      case ::umbp::ALLOCATE_SLOT_OUTCOME_FAILED:
+      default:
+        (*results)[item.index] = PutEntryOutcome::kFailed;
+        continue;
+      case ::umbp::ALLOCATE_SLOT_OUTCOME_ALLOCATED:
+        break;
     }
 
     PoolClient::SlotPlan plan = FromAllocateSlotResponse(resp_entry);
     if (!SizeMatchesAllocation(item.size, plan.pages.size(), plan.page_size)) {
       MORI_UMBP_ERROR("[PoolClient] BatchPut: malformed slot for key='{}'", *item.key);
       abort_slots->push_back(plan.slot_id);
-      (*results)[item.index] = false;
+      (*results)[item.index] = PutEntryOutcome::kFailed;
       continue;
     }
 
@@ -945,7 +951,7 @@ void PoolClient::ExecuteRemotePutTransfers(std::vector<RemotePutEntry>& entries,
 
 void PoolClient::FinalizeRemotePutEntries(std::vector<RemotePutEntry>& entries,
                                           std::vector<uint64_t>& abort_slots,
-                                          std::vector<bool>* results,
+                                          std::vector<PutEntryOutcome>* results,
                                           ::umbp::UMBPPeer::Stub* stub) {
   ::umbp::BatchCommitSlotsRequest commit_req;
   std::vector<size_t> commit_indices;
@@ -955,7 +961,7 @@ void PoolClient::FinalizeRemotePutEntries(std::vector<RemotePutEntry>& entries,
     auto& entry = entries[idx];
     if (entry.failed) {
       abort_slots.push_back(entry.slot_id);
-      (*results)[entry.result_index] = false;
+      (*results)[entry.result_index] = PutEntryOutcome::kFailed;
       continue;
     }
     auto* commit = commit_req.add_entries();
@@ -975,7 +981,7 @@ void PoolClient::FinalizeRemotePutEntries(std::vector<RemotePutEntry>& entries,
                      commit_status.error_message());
       for (size_t idx : commit_indices) {
         abort_slots.push_back(entries[idx].slot_id);
-        (*results)[entries[idx].result_index] = false;
+        (*results)[entries[idx].result_index] = PutEntryOutcome::kFailed;
         entries[idx].failed = true;
       }
     } else {
@@ -987,10 +993,10 @@ void PoolClient::FinalizeRemotePutEntries(std::vector<RemotePutEntry>& entries,
                                      MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL_HELP,
                                      {{"traffic", "remote"}},
                                      static_cast<double>(entry.item->size));
-          (*results)[entry.result_index] = true;
+          (*results)[entry.result_index] = PutEntryOutcome::kSucceeded;
         } else {
           abort_slots.push_back(entry.slot_id);
-          (*results)[entry.result_index] = false;
+          (*results)[entry.result_index] = PutEntryOutcome::kFailed;
           entry.failed = true;
         }
       }

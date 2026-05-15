@@ -69,3 +69,14 @@ target_link_libraries(test_global_block_index_events PRIVATE umbp_common
 target_compile_features(test_global_block_index_events PRIVATE cxx_std_17)
 
 gtest_discover_tests(test_global_block_index_events)
+
+# ---------------------------------------------------------------------------
+# test_router_dedup — master-side BatchRoutePut dedup via GlobalBlockIndex
+# ---------------------------------------------------------------------------
+add_executable(test_router_dedup test_router_dedup.cpp)
+
+target_link_libraries(test_router_dedup PRIVATE umbp_common GTest::gtest_main)
+
+target_compile_features(test_router_dedup PRIVATE cxx_std_17)
+
+gtest_discover_tests(test_router_dedup)

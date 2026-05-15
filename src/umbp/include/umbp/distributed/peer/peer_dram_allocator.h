@@ -114,10 +114,21 @@ class PeerDramAllocator {
     uint64_t bytes_freed = 0;  // 0 if key was unknown / already freed / read-leased
   };
 
-  // Reserve `size` bytes on `tier`.  Returns nullopt on ENOSPC or if
-  // the tier is not configured.  The slot is in the pending state
-  // until Commit (or Abort, or the reaper expires it).
-  std::optional<PendingSlot> Allocate(uint64_t size, TierType tier);
+  // Allocate() outcome.  Only kAllocated populates slot.
+  enum class Outcome {
+    kFailed,  // ENOSPC / bad tier / size==0 / clear-pending
+    kAllocated,
+    kAlreadyExists,  // owned_[key] dedup hit; caller treats as no-op success
+  };
+
+  struct AllocateResult {
+    Outcome outcome = Outcome::kFailed;
+    std::optional<PendingSlot> slot;  // populated iff outcome == kAllocated
+  };
+
+  // Reserve `size` bytes on `tier` for `key`.  `key` enables owned_
+  // dedup (master-index-lag fallback; primary dedup is at BatchRoutePut).
+  AllocateResult Allocate(const std::string& key, uint64_t size, TierType tier);
 
   // Move pending -> owned and queue an ADD event.  Returns false if
   // slot_id is unknown (already reaped, already aborted, or never
