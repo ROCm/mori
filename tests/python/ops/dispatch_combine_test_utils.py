@@ -578,6 +578,9 @@ class EpDispatchCombineTestCase:
         if _is_fp4x2_dtype(combine_data_type):
             return
 
+        failed_tokens = []
+        failed_weight_tokens = []
+
         for i in range(all_rank_num_token[self.config.rank]):
             pes = [
                 (idx // self.config.num_experts_per_rank)
@@ -607,6 +610,7 @@ class EpDispatchCombineTestCase:
                 got.float(), expected.float(), atol=atol, rtol=rtol
             )
             if not result_match:
+                failed_tokens.append(i)
                 diff = (got.float() - expected.float()).abs()
                 tol = atol + rtol * expected.float().abs()
                 error_mask = diff > tol
@@ -638,7 +642,6 @@ class EpDispatchCombineTestCase:
                 print(
                     f"Rank[{self.config.rank}]   input : {all_rank_input[self.config.rank][i].to(torch.float32)}"
                 )
-            assert result_match
 
             if combine_output_weight is not None:
                 got_weight, expected_weight = (
@@ -649,6 +652,7 @@ class EpDispatchCombineTestCase:
                     got_weight, expected_weight, atol=1e-5, rtol=1e-5
                 )
                 if not weight_match:
+                    failed_weight_tokens.append(i)
                     print(f"Rank[{self.config.rank}] Weight mismatch for token {i}:")
                     print(
                         f"Rank[{self.config.rank}]   indices[{i}]: {all_rank_indices[self.config.rank][i].cpu().tolist()}"
@@ -659,7 +663,20 @@ class EpDispatchCombineTestCase:
                     print(
                         f"Rank[{self.config.rank}]   expected_weight (weights[{i}] * {unique_pes}): {expected_weight}"
                     )
-                assert weight_match
+
+        # Summary and final assertion
+        total_tokens = int(all_rank_num_token[self.config.rank])
+        if failed_tokens or failed_weight_tokens:
+            print(
+                f"Rank[{self.config.rank}] SUMMARY: {len(failed_tokens)}/{total_tokens} tokens failed, "
+                f"{len(failed_weight_tokens)}/{total_tokens} weight checks failed"
+            )
+            if failed_tokens:
+                print(f"Rank[{self.config.rank}]   failed token ids: {failed_tokens}")
+            if failed_weight_tokens:
+                print(f"Rank[{self.config.rank}]   failed weight token ids: {failed_weight_tokens}")
+        assert len(failed_tokens) == 0, f"Rank[{self.config.rank}] {len(failed_tokens)}/{total_tokens} tokens failed"
+        assert len(failed_weight_tokens) == 0, f"Rank[{self.config.rank}] {len(failed_weight_tokens)}/{total_tokens} weight checks failed"
 
     def run_test_once(self, op, test_data, check_results=True):
         (
