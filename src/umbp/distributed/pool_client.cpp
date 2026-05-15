@@ -1282,9 +1282,14 @@ bool PoolClient::ReportExternalKvBlocks(const std::vector<std::string>& hashes, 
   return master_client_->ReportExternalKvBlocks(config_.master_config.node_id, hashes, tier).ok();
 }
 
-bool PoolClient::RevokeExternalKvBlocks(const std::vector<std::string>& hashes) {
+bool PoolClient::RevokeExternalKvBlocks(const std::vector<std::string>& hashes, TierType tier) {
   if (!initialized_) return false;
-  return master_client_->RevokeExternalKvBlocks(config_.master_config.node_id, hashes).ok();
+  return master_client_->RevokeExternalKvBlocks(config_.master_config.node_id, hashes, tier).ok();
+}
+
+bool PoolClient::RevokeAllExternalKvBlocksAtTier(TierType tier) {
+  if (!initialized_) return false;
+  return master_client_->RevokeAllExternalKvBlocksAtTier(config_.master_config.node_id, tier).ok();
 }
 
 bool PoolClient::MatchExternalKv(const std::vector<std::string>& hashes,

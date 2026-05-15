@@ -167,12 +167,15 @@ def run_demo(master_address: str) -> None:
         matches = ca.match_external_kv(hashes_a)
         assert len(matches) == 1, f"expected 1 match, got {len(matches)}"
         m = matches[0]
+        all_hashes = {h for hs in m.hashes_by_tier.values() for h in hs}
         print(
-            f"[match]  node_id={m.node_id}  tier={m.tier}  matched={len(m.matched_hashes)} blocks"
+            f"[match]  node_id={m.node_id}  hashes_by_tier="
+            f"{ {t.name: len(hs) for t, hs in m.hashes_by_tier.items()} }"
         )
         assert m.node_id == "node-a"
-        assert m.tier == UMBPTierType.DRAM
-        assert set(m.matched_hashes) == set(hashes_a)
+        assert UMBPTierType.DRAM in m.hashes_by_tier
+        assert set(m.hashes_by_tier[UMBPTierType.DRAM]) == set(hashes_a)
+        assert all_hashes == set(hashes_a)
 
     # ------------------------------------------------------------------
     # Scenario 2 – two nodes, same hashes, different tiers
@@ -191,10 +194,12 @@ def run_demo(master_address: str) -> None:
         print(f"[node-c] reported {len(shared_hashes)} blocks on HBM")
 
         matches = cb.match_external_kv(shared_hashes)
-        found = {m.node_id: m.tier for m in matches}
+        # The same hash can be reported by multiple nodes at different tiers;
+        # each node's hashes_by_tier reflects its own tier registration.
+        found = {m.node_id: list(m.hashes_by_tier.keys()) for m in matches}
         print(f"[match]  {found}")
-        assert "node-b" in found and found["node-b"] == UMBPTierType.DRAM
-        assert "node-c" in found and found["node-c"] == UMBPTierType.HBM
+        assert "node-b" in found and UMBPTierType.DRAM in found["node-b"]
+        assert "node-c" in found and UMBPTierType.HBM in found["node-c"]
 
     # ------------------------------------------------------------------
     # Scenario 3 – revoke removes blocks from the index
@@ -206,20 +211,22 @@ def run_demo(master_address: str) -> None:
 
     with registered_client(master_address, "node-d", DRAM_CAPS) as cd:
         cd.report_external_kv_blocks("node-d", hashes_d, UMBPTierType.DRAM)
-        cd.revoke_external_kv_blocks("node-d", to_revoke)
+        cd.revoke_external_kv_blocks("node-d", to_revoke, UMBPTierType.DRAM)
         print(f"[node-d] revoked {len(to_revoke)} blocks, kept {len(to_keep)}")
 
         kept_matches = {
             h
             for m in cd.match_external_kv(to_keep)
             if m.node_id == "node-d"
-            for h in m.matched_hashes
+            for hs in m.hashes_by_tier.values()
+            for h in hs
         }
         revoked_matches = {
             h
             for m in cd.match_external_kv(to_revoke)
             if m.node_id == "node-d"
-            for h in m.matched_hashes
+            for hs in m.hashes_by_tier.values()
+            for h in hs
         }
         assert kept_matches == set(to_keep), f"kept mismatch: {kept_matches}"
         assert revoked_matches == set(), f"revoked still present: {revoked_matches}"

@@ -123,22 +123,32 @@ UMBPExternalKvNodeMatch
 -----------------------
 
 Returned by ``match_external_kv()``. Each instance describes one node that holds
-a subset of the queried KV blocks.
+a subset of the queried KV blocks, grouped by every tier each block lives on
+for that node.
 
 .. list-table::
    :header-rows: 1
    :widths: 30 70
 
-   * - Attribute
+   * - Attribute / method
      - Description
    * - ``node_id: str``
      - Identifier of the node holding the blocks
    * - ``peer_address: str``
      - gRPC address of the node (for direct transfer)
-   * - ``matched_hashes: list[str]``
-     - Subset of queried hashes found on this node
-   * - ``tier: UMBPTierType``
-     - Storage tier where the blocks reside
+   * - ``hashes_by_tier: dict[UMBPTierType, list[str]]``
+     - Matched hashes grouped by every tier they currently live on for this
+       node.  A single block held on multiple tiers (e.g. write_through has
+       created a CPU mirror while the GPU copy is still alive) appears in
+       **every** tier bucket it physically resides on — bucket sizes do not
+       sum to the distinct count.  Iterating the dict yields tiers in
+       sorted ``UMBPTierType`` order, so the first non-empty bucket is the
+       fastest tier currently available on this node.
+   * - ``matched_hash_count() -> int``
+     - Number of *distinct* matched hashes (size of the union across tiers).
+       A hash on HBM+DRAM still counts once.  This is the right value to
+       feed into "how much of the prompt does this worker have cached?"
+       routing decisions; use ``hashes_by_tier`` for per-tier cost models.
 
 ----
 
@@ -188,9 +198,20 @@ for one-shot or short-lived lookups, not for long-running peer membership.
    * - ``is_registered() -> bool``
      - Return ``True`` if this node is currently registered.
    * - ``report_external_kv_blocks(node_id, hashes, tier)``
-     - Announce that ``node_id`` holds the KV blocks identified by ``hashes`` at ``tier``. Raises ``RuntimeError`` if ``hashes`` is empty or the call fails.
-   * - ``revoke_external_kv_blocks(node_id, hashes)``
-     - Remove previously reported blocks from the master index. No-op if the hashes were never reported. Raises ``RuntimeError`` if ``hashes`` is empty.
+     - **Additive**: announce that ``node_id`` now holds ``hashes`` at
+       ``tier``.  Existing tier buckets for the same hashes are untouched
+       (a re-report at the same tier is a no-op; reporting at a new tier
+       adds a bucket without removing previously reported ones).  Raises
+       ``RuntimeError`` if ``hashes`` is empty or the call fails.
+   * - ``revoke_external_kv_blocks(node_id, hashes, tier)``
+     - Remove ``hashes`` from a single tier on this node.  Other tier
+       buckets for the same hashes are untouched.  No-op for hashes that
+       were never reported at ``tier``.  Raises ``RuntimeError`` if
+       ``hashes`` is empty.
+   * - ``revoke_all_external_kv_blocks_at_tier(node_id, tier)``
+     - **Bulk**: revoke every hash currently registered by ``node_id`` at
+       ``tier``.  Used when an entire tier is wiped (storage backend clear
+       or detach, host-pool reset).  Other tier buckets are untouched.
    * - ``match_external_kv(hashes) -> list[UMBPExternalKvNodeMatch]``
      - Query the master for nodes that hold any of the requested ``hashes``. Returns an empty list when no matches exist or ``hashes`` is empty. Raises ``RuntimeError`` on connection failure.
 
@@ -242,16 +263,41 @@ Usage Examples
    matches = node_b.match_external_kv(hashes)
 
    for m in matches:
-       print(f"node {m.node_id} @ {m.peer_address} has {len(m.matched_hashes)} blocks on {m.tier}")
-       # → "node node-a @ node-a:8080 has 3 blocks on UMBPTierType.DRAM"
+       per_tier = {t.name: len(hs) for t, hs in m.hashes_by_tier.items()}
+       print(f"node {m.node_id} @ {m.peer_address} has {m.matched_hash_count()} blocks: {per_tier}")
+       # → "node node-a @ node-a:8080 has 3 blocks: {'DRAM': 3}"
 
-**Revoking blocks when they are evicted:**
+**Revoking blocks when one tier is evicted:**
 
 .. code-block:: python
 
-   # After evicting some blocks from cache, revoke them so other nodes stop routing to us
+   # GPU was evicted but the host (DRAM) mirror is still alive — drop only
+   # the HBM bucket; node-a stays in the index with its DRAM bucket intact.
    evicted = ["sha256-abc", "sha256-def"]
-   node_a.revoke_external_kv_blocks("node-a", evicted)
+   node_a.revoke_external_kv_blocks("node-a", evicted, UMBPTierType.HBM)
+
+**Bulk revoke when an entire tier is wiped:**
+
+.. code-block:: python
+
+   # Storage backend was cleared — drop every SSD bucket this node has in
+   # one RPC.  HBM and DRAM buckets are untouched.
+   node_a.revoke_all_external_kv_blocks_at_tier("node-a", UMBPTierType.SSD)
+
+**Same node holding the same blocks on multiple tiers:**
+
+.. code-block:: python
+
+   # write_through created a CPU mirror while the GPU copy is still alive
+   # — report both tiers; the master keeps both buckets.
+   hashes = ["sha256-prefix-0", "sha256-prefix-1"]
+   node_a.report_external_kv_blocks("node-a", hashes, UMBPTierType.HBM)
+   node_a.report_external_kv_blocks("node-a", hashes, UMBPTierType.DRAM)
+
+   matches = node_a.match_external_kv(hashes)
+   m = matches[0]
+   # m.hashes_by_tier == {UMBPTierType.HBM: [...], UMBPTierType.DRAM: [...]}
+   # m.matched_hash_count() == 2  (distinct, NOT 4 — same hash on two tiers)
 
 **Multiple nodes holding the same blocks (different tiers):**
 
@@ -268,10 +314,11 @@ Usage Examples
    node_b.register_self({UMBPTierType.HBM: (_1GB, _1GB)})
    node_b.report_external_kv_blocks("node-b", hashes, UMBPTierType.HBM)
 
-   # match_external_kv returns one entry per node
+   # match_external_kv returns one entry per node; each entry breaks the
+   # matched hashes down by every tier they live on for that node.
    matches = node_a.match_external_kv(hashes)
-   matched_nodes = {m.node_id: m.tier for m in matches}
-   # → {"node-a": UMBPTierType.DRAM, "node-b": UMBPTierType.HBM}
+   matched_nodes = {m.node_id: list(m.hashes_by_tier.keys()) for m in matches}
+   # → {"node-a": [UMBPTierType.DRAM], "node-b": [UMBPTierType.HBM]}
 
 **Context-manager pattern for automatic cleanup:**
 
@@ -300,8 +347,8 @@ End-to-End Example
 ------------------
 
 ``examples/umbp/umbp_master_client_demo.py`` is a self-contained script that
-starts the master binary as a subprocess, runs a two-node report/match/revoke
-scenario, then shuts everything down cleanly.
+starts the master binary as a subprocess, runs a multi-tier
+report/match/revoke scenario, then shuts everything down cleanly.
 
 .. code-block:: bash
 

@@ -57,12 +57,17 @@ class ClientRegistry {
 
   void SetBlockIndex(GlobalBlockIndex* index);
 
-  // ---- External KV block index (for unmanaged L1/L2 cache blocks) ----
+  // ---- External KV block index (for unmanaged L1/L2/L3 cache blocks) ----
   void SetExternalKvBlockIndex(ExternalKvBlockIndex* index);
   void RegisterExternalKvBlocks(const std::string& node_id, const std::vector<std::string>& hashes,
                                 TierType tier);
+  // Revoke `hashes` from `tier` only; other tiers for the same hashes are
+  // untouched.
   void UnregisterExternalKvBlocks(const std::string& node_id,
-                                  const std::vector<std::string>& hashes);
+                                  const std::vector<std::string>& hashes, TierType tier);
+  // Bulk: revoke every hash registered by this node at the given tier
+  // (e.g. issued when the node clears or detaches its storage backend).
+  void UnregisterExternalKvBlocksByTier(const std::string& node_id, TierType tier);
 
   // --- Client lifecycle ---
 

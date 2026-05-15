@@ -27,6 +27,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -132,14 +133,32 @@ class MasterClient {
   // --- External KV block events ---
   grpc::Status ReportExternalKvBlocks(const std::string& node_id,
                                       const std::vector<std::string>& hashes, TierType tier);
+  // Revoke specific hashes from a single tier on this node.
   grpc::Status RevokeExternalKvBlocks(const std::string& node_id,
-                                      const std::vector<std::string>& hashes);
+                                      const std::vector<std::string>& hashes, TierType tier);
+  // Bulk: revoke every hash registered by this node at the given tier.
+  grpc::Status RevokeAllExternalKvBlocksAtTier(const std::string& node_id, TierType tier);
 
   struct ExternalKvNodeMatch {
     std::string node_id;
     std::string peer_address;
-    std::vector<std::string> matched_hashes;
-    TierType tier = TierType::UNKNOWN;
+    // Matched hashes grouped by every tier they currently live on for this
+    // node.  A single hash MAY appear in multiple tier buckets when the
+    // node holds physical copies on more than one tier (e.g. write_through
+    // created a CPU mirror while the GPU copy is still alive).  std::map
+    // keys iterate in sorted TierType order, so the first non-empty bucket
+    // is the fastest tier currently available on this node.
+    std::map<TierType, std::vector<std::string>> hashes_by_tier;
+
+    // Number of *distinct* matched hashes (size of the union across tiers).
+    // A hash present on HBM+DRAM still counts once.
+    size_t MatchedHashCount() const {
+      std::unordered_set<std::string_view> seen;
+      for (const auto& [tier, hashes] : hashes_by_tier) {
+        for (const auto& h : hashes) seen.insert(h);
+      }
+      return seen.size();
+    }
   };
   grpc::Status MatchExternalKv(const std::vector<std::string>& hashes,
                                std::vector<ExternalKvNodeMatch>* out_matches);

@@ -409,7 +409,8 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
       return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "node_id/hashes cannot be empty");
     }
     std::vector<std::string> hashes(request->hashes().begin(), request->hashes().end());
-    registry_.UnregisterExternalKvBlocks(request->node_id(), hashes);
+    TierType tier = static_cast<TierType>(request->tier());
+    registry_.UnregisterExternalKvBlocks(request->node_id(), hashes, tier);
 
     if (metrics_) {
       metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_REVOKE_TOTAL,
@@ -418,6 +419,27 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
       metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_REVOKE_BLOCKS_TOTAL,
                            MORI_UMBP_METRIC_EXT_KV_REVOKE_BLOCKS_TOTAL_HELP,
                            {{"node", request->node_id()}}, static_cast<uint64_t>(hashes.size()));
+      const size_t kv_count = external_kv_index_.GetKvCount(request->node_id());
+      metrics_->setGauge(MORI_UMBP_METRIC_EXT_KV_LIVE_COUNT,
+                         MORI_UMBP_METRIC_EXT_KV_LIVE_COUNT_HELP, {{"node", request->node_id()}},
+                         static_cast<double>(kv_count));
+    }
+    return grpc::Status::OK;
+  }
+
+  grpc::Status RevokeAllExternalKvBlocksAtTier(
+      grpc::ServerContext* /*ctx*/, const ::umbp::RevokeAllExternalKvBlocksAtTierRequest* request,
+      ::umbp::RevokeAllExternalKvBlocksAtTierResponse* /*response*/) override {
+    if (request->node_id().empty()) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "node_id cannot be empty");
+    }
+    TierType tier = static_cast<TierType>(request->tier());
+    registry_.UnregisterExternalKvBlocksByTier(request->node_id(), tier);
+
+    if (metrics_) {
+      metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_REVOKE_TOTAL,
+                           MORI_UMBP_METRIC_EXT_KV_REVOKE_TOTAL_HELP,
+                           {{"node", request->node_id()}});
       const size_t kv_count = external_kv_index_.GetKvCount(request->node_id());
       metrics_->setGauge(MORI_UMBP_METRIC_EXT_KV_LIVE_COUNT,
                          MORI_UMBP_METRIC_EXT_KV_LIVE_COUNT_HELP, {{"node", request->node_id()}},
@@ -441,12 +463,15 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
       proto_match->set_node_id(m.node_id);
       auto peer_it = peer_map.find(m.node_id);
       if (peer_it != peer_map.end()) proto_match->set_peer_address(peer_it->second);
-      for (const auto& hash : m.matched_hashes) proto_match->add_matched_hashes(hash);
-      proto_match->set_tier(static_cast<::umbp::TierType>(m.tier));
+      for (const auto& [tier, hashes] : m.hashes_by_tier) {
+        auto* proto_bucket = proto_match->add_hashes_by_tier();
+        proto_bucket->set_tier(static_cast<::umbp::TierType>(tier));
+        for (const auto& hash : hashes) proto_bucket->add_hashes(hash);
+      }
     }
 
     size_t total_matched = 0;
-    for (const auto& m : matches) total_matched += m.matched_hashes.size();
+    for (const auto& m : matches) total_matched += m.MatchedHashCount();
     if (metrics_) {
       metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_MATCH_TOTAL,
                            MORI_UMBP_METRIC_EXT_KV_MATCH_TOTAL_HELP);

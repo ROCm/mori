@@ -713,14 +713,29 @@ grpc::Status MasterClient::ReportExternalKvBlocks(const std::string& node_id,
 }
 
 grpc::Status MasterClient::RevokeExternalKvBlocks(const std::string& node_id,
-                                                  const std::vector<std::string>& hashes) {
+                                                  const std::vector<std::string>& hashes,
+                                                  TierType tier) {
   ScopedRpcTimer _rpc_timer(this, "RevokeExternalKvBlocks");
   ::umbp::RevokeExternalKvBlocksRequest req;
   req.set_node_id(node_id);
   for (const auto& h : hashes) req.add_hashes(h);
+  req.set_tier(ToProtoTier(tier));
   ::umbp::RevokeExternalKvBlocksResponse resp;
   grpc::ClientContext ctx;
   auto status = GetStub(stub_.get())->RevokeExternalKvBlocks(&ctx, req, &resp);
+  _rpc_timer.SetStatus(status);
+  return status;
+}
+
+grpc::Status MasterClient::RevokeAllExternalKvBlocksAtTier(const std::string& node_id,
+                                                           TierType tier) {
+  ScopedRpcTimer _rpc_timer(this, "RevokeAllExternalKvBlocksAtTier");
+  ::umbp::RevokeAllExternalKvBlocksAtTierRequest req;
+  req.set_node_id(node_id);
+  req.set_tier(ToProtoTier(tier));
+  ::umbp::RevokeAllExternalKvBlocksAtTierResponse resp;
+  grpc::ClientContext ctx;
+  auto status = GetStub(stub_.get())->RevokeAllExternalKvBlocksAtTier(&ctx, req, &resp);
   _rpc_timer.SetStatus(status);
   return status;
 }
@@ -740,8 +755,10 @@ grpc::Status MasterClient::MatchExternalKv(const std::vector<std::string>& hashe
       ExternalKvNodeMatch out;
       out.node_id = m.node_id();
       out.peer_address = m.peer_address();
-      out.matched_hashes.assign(m.matched_hashes().begin(), m.matched_hashes().end());
-      out.tier = FromProtoTier(m.tier());
+      for (const auto& bucket : m.hashes_by_tier()) {
+        auto& vec = out.hashes_by_tier[FromProtoTier(bucket.tier())];
+        vec.assign(bucket.hashes().begin(), bucket.hashes().end());
+      }
       out_matches->push_back(std::move(out));
     }
   }

@@ -280,9 +280,15 @@ bool DistributedClient::ReportExternalKvBlocks(const std::vector<std::string>& h
   return pool_client_->ReportExternalKvBlocks(hashes, tier);
 }
 
-bool DistributedClient::RevokeExternalKvBlocks(const std::vector<std::string>& hashes) {
+bool DistributedClient::RevokeExternalKvBlocks(const std::vector<std::string>& hashes,
+                                               TierType tier) {
   if (!pool_client_) return false;
-  return pool_client_->RevokeExternalKvBlocks(hashes);
+  return pool_client_->RevokeExternalKvBlocks(hashes, tier);
+}
+
+bool DistributedClient::RevokeAllExternalKvBlocksAtTier(TierType tier) {
+  if (!pool_client_) return false;
+  return pool_client_->RevokeAllExternalKvBlocksAtTier(tier);
 }
 
 std::vector<IUMBPClient::ExternalKvMatch> DistributedClient::MatchExternalKv(
@@ -298,8 +304,7 @@ std::vector<IUMBPClient::ExternalKvMatch> DistributedClient::MatchExternalKv(
     IUMBPClient::ExternalKvMatch m;
     m.node_id = std::move(r.node_id);
     m.peer_address = std::move(r.peer_address);
-    m.matched_hashes = std::move(r.matched_hashes);
-    m.tier = r.tier;
+    m.hashes_by_tier = std::move(r.hashes_by_tier);
     result.push_back(std::move(m));
   }
   return result;
