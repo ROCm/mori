@@ -216,11 +216,24 @@ message ReportExternalKvBlocksRequest {
 }
 message ReportExternalKvBlocksResponse {}
 
+// Revoke specific hashes from a single tier on this node.  The same (node,
+// hash) pair may live on multiple tiers simultaneously — only the named tier
+// is removed; other tier buckets are untouched.
 message RevokeExternalKvBlocksRequest {
   string node_id         = 1;
   repeated string hashes = 2;
+  TierType tier          = 3;
 }
 message RevokeExternalKvBlocksResponse {}
+
+// Bulk-revoke every hash currently registered by this node at the given tier
+// (e.g. issued when the node clears or detaches its storage backend).  Other
+// tiers for those same hashes are untouched.
+message RevokeAllExternalKvBlocksAtTierRequest {
+  string node_id = 1;
+  TierType tier  = 2;
+}
+message RevokeAllExternalKvBlocksAtTierResponse {}
 
 message MatchExternalKvRequest {
   repeated string hashes = 1;
@@ -235,9 +248,10 @@ message ExternalKvNodeMatch {
   string node_id                     = 1;
   string peer_address                = 2;
   // Matched hashes grouped by the tier they live on for this node.
-  // The same hash never appears in two tiers (Register overwrites).
-  // Total matched count = sum of hashes.size() across all entries.
-  // Best (fastest) tier  = min key with non-empty hashes.
+  // A single (node, hash) pair MAY appear in more than one tier bucket when
+  // the node holds multiple physical copies (e.g. write_through created a
+  // CPU mirror while the GPU copy is still alive).  Total matched-block
+  // count for the node = size of the union across buckets, NOT the sum.
   repeated TierHashes hashes_by_tier = 3;
 }
 message MatchExternalKvResponse {
@@ -263,9 +277,14 @@ service UMBPMaster {
   rpc BatchRouteGet   (BatchRouteGetRequest)    returns (BatchRouteGetResponse);
 
   // External KV block events
-  rpc ReportExternalKvBlocks(ReportExternalKvBlocksRequest) returns (ReportExternalKvBlocksResponse);
-  rpc RevokeExternalKvBlocks(RevokeExternalKvBlocksRequest) returns (RevokeExternalKvBlocksResponse);
-  rpc MatchExternalKv       (MatchExternalKvRequest)        returns (MatchExternalKvResponse);
+  rpc ReportExternalKvBlocks         (ReportExternalKvBlocksRequest)
+      returns (ReportExternalKvBlocksResponse);
+  rpc RevokeExternalKvBlocks         (RevokeExternalKvBlocksRequest)
+      returns (RevokeExternalKvBlocksResponse);
+  rpc RevokeAllExternalKvBlocksAtTier(RevokeAllExternalKvBlocksAtTierRequest)
+      returns (RevokeAllExternalKvBlocksAtTierResponse);
+  rpc MatchExternalKv                (MatchExternalKvRequest)
+      returns (MatchExternalKvResponse);
 
   // Client-side metrics reporting
   rpc ReportMetrics(ReportMetricsRequest) returns (ReportMetricsResponse);

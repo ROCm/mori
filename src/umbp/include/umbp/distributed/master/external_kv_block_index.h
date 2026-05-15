@@ -22,19 +22,23 @@
 #pragma once
 
 #include <map>
+#include <set>
 #include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "umbp/distributed/types.h"
 
 namespace mori::umbp {
 
-/// Lightweight index for externally-managed KV blocks (e.g. sglang L1/L2
-/// cache).  Unlike GlobalBlockIndex, this index has no Location, no
-/// BlockMetrics, and no ClientRegistry back-pointer.  It maps each hash to the
-/// set of nodes that hold the block and the storage tier they reported.
+/// Lightweight index for externally-managed KV blocks (e.g. sglang L1/L2/L3
+/// cache).  Each (node, hash) pair tracks the *set* of tiers the node has
+/// reported the block on — the same block can simultaneously live on HBM
+/// (GPU), DRAM (CPU mirror) and SSD (storage backup), and the index keeps
+/// every tier so the cost-aware scheduler can see the full physical layout.
 class ExternalKvBlockIndex {
  public:
   ExternalKvBlockIndex() = default;
@@ -43,41 +47,56 @@ class ExternalKvBlockIndex {
   ExternalKvBlockIndex(const ExternalKvBlockIndex&) = delete;
   ExternalKvBlockIndex& operator=(const ExternalKvBlockIndex&) = delete;
 
-  // Register (or overwrite) a batch of hashes for node_id at the given tier.
+  // Add `tier` to the tier set of every (node_id, hash) pair.  Idempotent:
+  // re-registering at the same tier is a no-op; registering at a *new* tier
+  // adds a bucket without touching existing tiers.
   void Register(const std::string& node_id, const std::vector<std::string>& hashes, TierType tier);
 
-  // Remove specific hashes for a node.
-  void Unregister(const std::string& node_id, const std::vector<std::string>& hashes);
+  // Remove `tier` from the tier set of every (node_id, hash) pair.  Other
+  // tiers for the same hash are untouched.  When a hash's tier set becomes
+  // empty, the (node, hash) entry is dropped.
+  void Unregister(const std::string& node_id, const std::vector<std::string>& hashes,
+                  TierType tier);
 
-  // Remove all hashes for a node (bulk, called on node expiry/unregister).
+  // Remove `tier` from every hash currently registered by `node_id`.  Used
+  // when a node clears or detaches a whole tier (e.g. storage backend wipe).
+  void UnregisterByNodeAtTier(const std::string& node_id, TierType tier);
+
+  // Remove all tiers for all hashes registered by `node_id` (bulk, called
+  // on node expiry / unregister).
   void UnregisterByNode(const std::string& node_id);
 
   struct NodeMatch {
     std::string node_id;
-    // Matched hashes grouped by the tier they live on for this node.
-    // The same hash never appears in two tiers (Register overwrites).
-    // std::map keys iterate in sorted order, so the smallest TierType
-    // value with a non-empty bucket is the fastest available tier.
+    // Matched hashes grouped by tier.  A single hash may appear in MORE
+    // THAN ONE tier bucket when the node holds multiple physical copies
+    // (e.g. GPU + CPU mirror).  std::map iterates in sorted TierType
+    // order, so the first non-empty bucket is the fastest available tier.
     std::map<TierType, std::vector<std::string>> hashes_by_tier;
 
-    // Convenience: total matched hash count across all tiers.
+    // Number of *distinct* matched hashes (size of the union across tiers).
+    // NOT the sum of bucket sizes — a hash on HBM+DRAM still counts once.
     size_t MatchedHashCount() const {
-      size_t total = 0;
-      for (const auto& [tier, hashes] : hashes_by_tier) total += hashes.size();
-      return total;
+      std::unordered_set<std::string_view> seen;
+      for (const auto& [tier, hashes] : hashes_by_tier) {
+        for (const auto& h : hashes) seen.insert(h);
+      }
+      return seen.size();
     }
   };
 
   // Return per-node matches across all queried hashes.
   std::vector<NodeMatch> Match(const std::vector<std::string>& hashes) const;
 
-  // Return the number of live KV blocks registered for a node.
+  // Return the number of distinct hashes (across all tiers) registered for
+  // a node.  Used by master metrics.
   size_t GetKvCount(const std::string& node_id) const;
 
  private:
-  // hash -> (node_id -> tier)
+  // hash -> (node_id -> set<TierType>).  std::set chosen for deterministic
+  // iteration in tier order; the cardinality is small (≤ 4 tiers).
   mutable std::shared_mutex mutex_;
-  std::unordered_map<std::string, std::unordered_map<std::string, TierType>> entries_;
+  std::unordered_map<std::string, std::unordered_map<std::string, std::set<TierType>>> entries_;
 };
 
 }  // namespace mori::umbp

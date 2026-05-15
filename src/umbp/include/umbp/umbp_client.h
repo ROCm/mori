@@ -26,6 +26,8 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <string_view>
+#include <unordered_set>
 #include <vector>
 
 #include "umbp/common/config.h"
@@ -115,25 +117,37 @@ class IUMBPClient {
   // ---- External KV Events (for unmanaged L1/L2 cache blocks) ----
 
   /// Report that this node holds the given hashes at the specified tier.
+  /// Additive: re-reporting at the same tier is a no-op; reporting at a new
+  /// tier adds a tier bucket without removing existing buckets.
   virtual bool ReportExternalKvBlocks(const std::vector<std::string>& hashes, TierType tier) = 0;
 
-  /// Revoke previously reported hashes from this node's entry.
-  virtual bool RevokeExternalKvBlocks(const std::vector<std::string>& hashes) = 0;
+  /// Revoke `hashes` from a single tier on this node.  Other tier buckets
+  /// for the same hashes are untouched.
+  virtual bool RevokeExternalKvBlocks(const std::vector<std::string>& hashes, TierType tier) = 0;
+
+  /// Bulk-revoke every hash currently registered by this node at `tier`.
+  /// Use when a whole tier is wiped (e.g. storage backend cleared).
+  virtual bool RevokeAllExternalKvBlocksAtTier(TierType tier) = 0;
 
   struct ExternalKvMatch {
     std::string node_id;
     std::string peer_address;
-    // Matched hashes grouped by the tier they live on for this node.
-    // The same hash never appears in two tiers (Register overwrites).
-    // std::map keys iterate in sorted order, so the smallest TierType
-    // value with a non-empty bucket is the fastest available tier.
+    // Matched hashes grouped by every tier they currently live on for this
+    // node.  A single hash MAY appear in multiple tier buckets when the
+    // node holds physical copies on more than one tier (e.g. write_through
+    // created a CPU mirror while the GPU copy is still alive).  std::map
+    // keys iterate in sorted TierType order, so the first non-empty bucket
+    // is the fastest tier currently available on this node.
     std::map<TierType, std::vector<std::string>> hashes_by_tier;
 
-    // Convenience: total matched hash count across all tiers.
+    // Number of *distinct* matched hashes (size of the union across tiers).
+    // A hash present on HBM+DRAM still counts once.
     size_t MatchedHashCount() const {
-      size_t total = 0;
-      for (const auto& [tier, hashes] : hashes_by_tier) total += hashes.size();
-      return total;
+      std::unordered_set<std::string_view> seen;
+      for (const auto& [tier, hashes] : hashes_by_tier) {
+        for (const auto& h : hashes) seen.insert(h);
+      }
+      return seen.size();
     }
   };
 

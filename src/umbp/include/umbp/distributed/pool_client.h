@@ -95,9 +95,10 @@ class PoolClient {
 
   bool IsInitialized() const;
 
-  // External KV block events (unchanged).
+  // External KV block events.
   bool ReportExternalKvBlocks(const std::vector<std::string>& hashes, TierType tier);
-  bool RevokeExternalKvBlocks(const std::vector<std::string>& hashes);
+  bool RevokeExternalKvBlocks(const std::vector<std::string>& hashes, TierType tier);
+  bool RevokeAllExternalKvBlocksAtTier(TierType tier);
   bool MatchExternalKv(const std::vector<std::string>& hashes,
                        std::vector<MasterClient::ExternalKvNodeMatch>* out_matches);
 
