@@ -91,11 +91,9 @@ class PeerDramAllocator {
     std::vector<PageLocation> pages;
     uint64_t size = 0;
     std::chrono::steady_clock::time_point deadline;
-    // True iff the slot was alive when ClearLocal() ran.  Commit() on
-    // such a slot deallocates pages and returns false WITHOUT queuing
-    // an ADD — the writer sees Put failure and master never indexes a
-    // post-clear ghost key.
-    bool cancelled_by_clear = false;
+    // Snapshot of allocator_generation_ at Allocate().  Commit()
+    // rejects slots whose generation no longer matches the current.
+    uint64_t generation = 0;
   };
 
   struct OwnedSlot {
@@ -154,12 +152,11 @@ class PeerDramAllocator {
 
   // -------- Distributed Clear --------
 
-  // Drop every owned key + read lease, mark every pending slot
-  // cancelled, and clear the event outbox.  Owned pages are released
-  // back to the bitmap immediately; pending pages stay reserved until
-  // the writer's Commit/Abort or the reaper expires the TTL (so an
-  // in-flight RDMA write does not land on a recycled page).  After
-  // this call Allocate() returns nullopt until ClearFullSyncAcked().
+  // Drop owned/lease state, bump allocator_generation_ so pre-clear
+  // pending slots fail at Commit(), and clear the event outbox.  Owned
+  // pages with an active read lease are deferred to the reaper; others
+  // are freed immediately.  Allocate() returns nullopt until
+  // ClearFullSyncAcked().
   void ClearLocal();
 
   // Called by the heartbeat thread after the first full-sync empty
@@ -232,6 +229,15 @@ class PeerDramAllocator {
   void ReaperLoop();
   void ReaperSweep();
 
+  // Owned pages held back at ClearLocal() because of an active read
+  // lease.  Released by ReaperSweep() when release_at <= now.
+  struct DeferredFree {
+    std::string key;  // for debug log only.
+    TierType tier = TierType::UNKNOWN;
+    std::vector<PageLocation> pages;
+    std::chrono::steady_clock::time_point release_at;
+  };
+
   mutable std::mutex mutex_;
   uint64_t page_size_;
   std::chrono::milliseconds pending_ttl_;
@@ -245,6 +251,12 @@ class PeerDramAllocator {
   std::unordered_map<std::string, OwnedSlot> owned_;
   std::unordered_map<std::string, std::chrono::steady_clock::time_point> read_lease_until_;
   std::vector<KvEvent> pending_events_;
+
+  std::vector<DeferredFree> deferred_frees_;
+
+  // Bumped by ClearLocal(); snapshotted into each PendingSlot.
+  // Commit() rejects pre-clear slots via mismatch.  Local-only.
+  uint64_t allocator_generation_ = 0;
 
   std::atomic<uint64_t> next_slot_id_{1};
 

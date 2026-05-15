@@ -349,6 +349,152 @@ TEST(PeerDramAllocator, AbortReleasesCancelledPending) {
   EXPECT_EQ(cap.available_bytes, cap.total_bytes);
 }
 
+// Pre-clear pending Commit fails; post-ack new Allocate+Commit succeeds.
+TEST(PeerDramAllocator, PendingGenerationRejectsPreClearCommit) {
+  auto a = MakeAllocator();
+
+  auto pB = a->Allocate(kPageSize * 2, TierType::DRAM);
+  ASSERT_TRUE(pB.has_value());
+  const auto cap_before = a->TierCapacitiesSnapshot()[TierType::DRAM];
+  EXPECT_EQ(cap_before.available_bytes, cap_before.total_bytes - 2 * kPageSize);
+
+  a->ClearLocal();
+
+  uint64_t committed_bytes = 0;
+  EXPECT_FALSE(a->Commit(pB->slot_id, "B", committed_bytes));
+  EXPECT_EQ(committed_bytes, 0u);
+  EXPECT_TRUE(a->DrainPendingEvents().empty());
+  auto cap_after_reject = a->TierCapacitiesSnapshot()[TierType::DRAM];
+  EXPECT_EQ(cap_after_reject.available_bytes, cap_after_reject.total_bytes);
+
+  a->ClearFullSyncAcked();
+
+  auto pC = a->Allocate(kPageSize, TierType::DRAM);
+  ASSERT_TRUE(pC.has_value());
+  ASSERT_TRUE(a->Commit(pC->slot_id, "C", committed_bytes));
+  EXPECT_EQ(committed_bytes, kPageSize);
+  EXPECT_TRUE(a->Resolve("C").found);
+}
+
+// Repeated Clears still reject the original pre-clear pending Commit.
+TEST(PeerDramAllocator, PendingGenerationSurvivesDoubleClear) {
+  auto a = MakeAllocator();
+
+  auto pB = a->Allocate(kPageSize, TierType::DRAM);
+  ASSERT_TRUE(pB.has_value());
+
+  a->ClearLocal();
+  a->ClearLocal();
+
+  uint64_t committed_bytes = 0;
+  EXPECT_FALSE(a->Commit(pB->slot_id, "B", committed_bytes));
+  auto cap_after_reject = a->TierCapacitiesSnapshot()[TierType::DRAM];
+  EXPECT_EQ(cap_after_reject.available_bytes, cap_after_reject.total_bytes);
+
+  a->ClearFullSyncAcked();
+  auto pC = a->Allocate(kPageSize, TierType::DRAM);
+  ASSERT_TRUE(pC.has_value());
+  EXPECT_TRUE(a->Commit(pC->slot_id, "C", committed_bytes));
+}
+
+// Leased owned key: logically gone at Clear, pages freed by reaper after
+// the lease expires.
+TEST(PeerDramAllocator, ClearLocalDefersLeasedOwnedPages) {
+  auto a = MakeAllocator(/*pending_ttl=*/std::chrono::milliseconds{5000},
+                         /*read_lease_ttl=*/std::chrono::milliseconds{200});
+
+  auto p = a->Allocate(kPageSize, TierType::DRAM);
+  ASSERT_TRUE(p.has_value());
+  uint64_t committed_bytes = 0;
+  ASSERT_TRUE(a->Commit(p->slot_id, "A", committed_bytes));
+  a->DrainPendingEvents();
+
+  const auto cap_committed = a->TierCapacitiesSnapshot()[TierType::DRAM];
+  EXPECT_EQ(cap_committed.available_bytes, cap_committed.total_bytes - kPageSize);
+
+  ASSERT_TRUE(a->Resolve("A").found);  // lease.
+
+  a->ClearLocal();
+
+  EXPECT_FALSE(a->Resolve("A").found);
+  EXPECT_TRUE(a->SnapshotOwnedKeys().empty());
+
+  auto cap_after_clear = a->TierCapacitiesSnapshot()[TierType::DRAM];
+  EXPECT_EQ(cap_after_clear.available_bytes, cap_committed.total_bytes - kPageSize);
+
+  // Pre-TTL sweep: no-op.
+  a->RunReaperOnceForTest();
+  auto cap_no_op_sweep = a->TierCapacitiesSnapshot()[TierType::DRAM];
+  EXPECT_EQ(cap_no_op_sweep.available_bytes, cap_committed.total_bytes - kPageSize);
+
+  // Past TTL: pages return to bitmap.
+  std::this_thread::sleep_for(std::chrono::milliseconds{300});
+  a->RunReaperOnceForTest();
+  auto cap_swept = a->TierCapacitiesSnapshot()[TierType::DRAM];
+  EXPECT_EQ(cap_swept.available_bytes, cap_swept.total_bytes);
+}
+
+// Leased owned A defers; pending B rejects via generation.
+TEST(PeerDramAllocator, ClearLocalMixedPendingAndLeased) {
+  auto a = MakeAllocator(/*pending_ttl=*/std::chrono::milliseconds{5000},
+                         /*read_lease_ttl=*/std::chrono::milliseconds{200});
+
+  auto pA = a->Allocate(kPageSize, TierType::DRAM);
+  ASSERT_TRUE(pA.has_value());
+  uint64_t committed_bytes = 0;
+  ASSERT_TRUE(a->Commit(pA->slot_id, "A", committed_bytes));
+  ASSERT_TRUE(a->Resolve("A").found);  // lease.
+
+  auto pB = a->Allocate(kPageSize * 2, TierType::DRAM);
+  ASSERT_TRUE(pB.has_value());
+  a->DrainPendingEvents();
+
+  const auto total = a->TierCapacitiesSnapshot()[TierType::DRAM].total_bytes;
+
+  a->ClearLocal();
+
+  EXPECT_FALSE(a->Resolve("A").found);
+  EXPECT_TRUE(a->SnapshotOwnedKeys().empty());
+
+  // A deferred + B pending: 3 pages occupied.
+  auto cap_after_clear = a->TierCapacitiesSnapshot()[TierType::DRAM];
+  EXPECT_EQ(cap_after_clear.available_bytes, total - 3 * kPageSize);
+
+  // Commit(B) fails on generation mismatch, releases B.
+  EXPECT_FALSE(a->Commit(pB->slot_id, "B", committed_bytes));
+  auto cap_after_reject = a->TierCapacitiesSnapshot()[TierType::DRAM];
+  EXPECT_EQ(cap_after_reject.available_bytes, total - kPageSize);  // only A.
+
+  // Past lease + sweep: A released.
+  std::this_thread::sleep_for(std::chrono::milliseconds{300});
+  a->RunReaperOnceForTest();
+  auto cap_final = a->TierCapacitiesSnapshot()[TierType::DRAM];
+  EXPECT_EQ(cap_final.available_bytes, total);
+}
+
+// Sweeps are no-ops while the deferred lease is still active.
+TEST(PeerDramAllocator, ClearLocalSweepRespectsTtl) {
+  auto a = MakeAllocator(/*pending_ttl=*/std::chrono::milliseconds{5000},
+                         /*read_lease_ttl=*/std::chrono::milliseconds{10000});
+
+  auto p = a->Allocate(kPageSize, TierType::DRAM);
+  ASSERT_TRUE(p.has_value());
+  uint64_t committed_bytes = 0;
+  ASSERT_TRUE(a->Commit(p->slot_id, "A", committed_bytes));
+  ASSERT_TRUE(a->Resolve("A").found);
+
+  const auto cap_committed = a->TierCapacitiesSnapshot()[TierType::DRAM];
+
+  a->ClearLocal();
+
+  // Lease still live: every sweep is a no-op.
+  for (int i = 0; i < 3; ++i) {
+    a->RunReaperOnceForTest();
+    auto cap = a->TierCapacitiesSnapshot()[TierType::DRAM];
+    EXPECT_EQ(cap.available_bytes, cap_committed.available_bytes) << "sweep i=" << i;
+  }
+}
+
 // ---- OwnedKeyCountByTier ----------------------------------------------------
 
 TEST(PeerDramAllocator, OwnedKeyCountByTierTracksCommitsAndEvicts) {

@@ -102,6 +102,7 @@ std::optional<PeerDramAllocator::PendingSlot> PeerDramAllocator::Allocate(uint64
   slot.pages = std::move(result->pages);
   slot.size = size;
   slot.deadline = std::chrono::steady_clock::now() + pending_ttl_;
+  slot.generation = allocator_generation_;
   pending_[slot.slot_id] = slot;
   return slot;
 }
@@ -113,10 +114,8 @@ bool PeerDramAllocator::Commit(uint64_t slot_id, const std::string& key,
   auto it = pending_.find(slot_id);
   if (it == pending_.end()) return false;  // reaped, aborted, or never existed
 
-  // Slot was alive when ClearLocal() ran: release its pages now and
-  // tell the writer the Put failed.  No ADD is queued, so the
-  // post-clear empty snapshot stays authoritative.
-  if (it->second.cancelled_by_clear) {
+  // Pre-clear pending slot: free pages, report Put failure, no ADD.
+  if (it->second.generation != allocator_generation_) {
     if (auto* alloc = AllocatorForLocked(it->second.tier)) {
       alloc->Deallocate(it->second.pages);
     }
@@ -206,25 +205,36 @@ std::vector<PeerDramAllocator::EvictResult> PeerDramAllocator::Evict(
 
 void PeerDramAllocator::ClearLocal() {
   std::lock_guard<std::mutex> lock(mutex_);
-  // Owned pages: release back to the bitmap.  No REMOVE events — the
-  // upcoming full-sync empty snapshot will collapse master's index
-  // for this node in one shot.
-  for (auto& kv : owned_) {
-    if (auto* alloc = AllocatorForLocked(kv.second.tier)) {
-      alloc->Deallocate(kv.second.pages);
+  const auto now = std::chrono::steady_clock::now();
+
+  // Pending slots become pre-clear via generation mismatch; their
+  // pages stay reserved (RDMA write may still be in flight) and are
+  // freed by the writer's Commit or by the reaper's TTL path.
+  ++allocator_generation_;
+
+  // Owned: defer pages with an active read lease (RDMA read may still
+  // be in flight); free others immediately.  No REMOVE events — the
+  // upcoming full-sync empty snapshot collapses master's index.
+  for (auto& [key, slot] : owned_) {
+    auto lease_it = read_lease_until_.find(key);
+    if (lease_it != read_lease_until_.end() && lease_it->second > now) {
+      DeferredFree df;
+      df.key = key;
+      df.tier = slot.tier;
+      df.pages = std::move(slot.pages);
+      df.release_at = lease_it->second;
+      deferred_frees_.push_back(std::move(df));
+      continue;
+    }
+    if (auto* alloc = AllocatorForLocked(slot.tier)) {
+      alloc->Deallocate(slot.pages);
     }
   }
   owned_.clear();
 
-  // Pending pages: do NOT free them — an in-flight RDMA write from a
-  // peer could still land on them.  Mark them so the eventual Commit
-  // fails (and frees the pages) without enqueueing an ADD.  The
-  // reaper's existing TTL path also handles dead writers.
-  for (auto& kv : pending_) {
-    kv.second.cancelled_by_clear = true;
-  }
-
+  // Active deadlines that mattered are already in deferred_frees_.
   read_lease_until_.clear();
+
   // Drop any queued ADD/REMOVE that the heartbeat hasn't shipped yet:
   // the snapshot we're about to send is the authoritative state.
   pending_events_.clear();
@@ -374,6 +384,20 @@ void PeerDramAllocator::ReaperSweep() {
   for (auto it = read_lease_until_.begin(); it != read_lease_until_.end();) {
     if (it->second <= now) {
       it = read_lease_until_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+
+  // Release ClearLocal()-deferred pages whose lease deadline has passed.
+  for (auto it = deferred_frees_.begin(); it != deferred_frees_.end();) {
+    if (it->release_at <= now) {
+      if (auto* alloc = AllocatorForLocked(it->tier)) {
+        alloc->Deallocate(it->pages);
+      }
+      MORI_UMBP_DEBUG("[PeerDramAllocator] released deferred key='{}' pages={}", it->key,
+                      it->pages.size());
+      it = deferred_frees_.erase(it);
     } else {
       ++it;
     }
