@@ -88,6 +88,13 @@ message KvEvent {
   uint64   size = 4;   // ADD only
 }
 
+// Per-tier live owned-key count snapshot reported by the client.
+// Authoritative — taken directly from the client's local block index.
+message TierKvCount {
+  TierType tier  = 1;
+  uint64   count = 2;
+}
+
 message HeartbeatRequest {
   string node_id            = 1;
   uint64 seq                = 2;    // monotonic, peer-assigned (1 per heartbeat batch)
@@ -95,6 +102,7 @@ message HeartbeatRequest {
   repeated TierCapacity tier_capacities = 4; // ground truth from peer's allocator
   repeated KvEvent      events          = 5; // adds + removes since last_acked_seq
   bool   is_full_sync       = 6;    // when true, events[] is the complete owned-key set
+  repeated TierKvCount  tier_kv_counts  = 7; // live owned-key count per tier (client-reported)
 }
 message HeartbeatResponse {
   ClientStatus status            = 1;
@@ -226,15 +234,15 @@ message RevokeExternalKvBlocksResponse {}
 message MatchExternalKvRequest {
   repeated string hashes = 1;
 }
-message ExternalKvNodeMatch {
+message MatchExternalKvResponse {
+  repeated ExternalKvNodeMatch matches = 1;
+}message ExternalKvNodeMatch {
   string node_id                 = 1;
   string peer_address            = 2;
   repeated string matched_hashes = 3;
   TierType tier                  = 4;
 }
-message MatchExternalKvResponse {
-  repeated ExternalKvNodeMatch matches = 1;
-}
+
 
 // ============================================================
 //  Service

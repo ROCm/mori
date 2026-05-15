@@ -259,6 +259,14 @@ std::vector<KvEvent> PeerDramAllocator::SnapshotOwnedKeys() const {
   return out;
 }
 
+std::map<TierType, uint64_t> PeerDramAllocator::OwnedKeyCountByTier() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  std::map<TierType, uint64_t> result;
+  for (TierType t : {TierType::HBM, TierType::DRAM, TierType::SSD}) result[t] = 0;
+  for (const auto& [key, slot] : owned_) result[slot.tier]++;
+  return result;
+}
+
 std::map<TierType, TierCapacity> PeerDramAllocator::TierCapacitiesSnapshot() const {
   std::lock_guard<std::mutex> lock(mutex_);
   std::map<TierType, TierCapacity> out;

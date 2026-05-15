@@ -349,4 +349,57 @@ TEST(PeerDramAllocator, AbortReleasesCancelledPending) {
   EXPECT_EQ(cap.available_bytes, cap.total_bytes);
 }
 
+// ---- OwnedKeyCountByTier ----------------------------------------------------
+
+TEST(PeerDramAllocator, OwnedKeyCountByTierTracksCommitsAndEvicts) {
+  auto a = MakeAllocator();
+
+  auto counts0 = a->OwnedKeyCountByTier();
+  EXPECT_EQ(counts0[TierType::DRAM], 0u);
+  EXPECT_EQ(counts0[TierType::HBM], 0u);
+  EXPECT_EQ(counts0[TierType::SSD], 0u);
+
+  for (int i = 0; i < 3; ++i) {
+    auto p = a->Allocate(kPageSize, TierType::DRAM);
+    ASSERT_TRUE(p.has_value()) << "i=" << i;
+    uint64_t committed_bytes = 0;
+    ASSERT_TRUE(a->Commit(p->slot_id, "key-dram-" + std::to_string(i), committed_bytes));
+  }
+  auto counts1 = a->OwnedKeyCountByTier();
+  EXPECT_EQ(counts1[TierType::DRAM], 3u);
+  EXPECT_EQ(counts1[TierType::HBM], 0u);
+  EXPECT_EQ(counts1[TierType::SSD], 0u);
+
+  a->Evict({"key-dram-0"});
+  auto counts2 = a->OwnedKeyCountByTier();
+  EXPECT_EQ(counts2[TierType::DRAM], 2u);
+  EXPECT_EQ(counts2[TierType::HBM], 0u);
+}
+
+TEST(PeerDramAllocator, OwnedKeyCountByTierMultiTier) {
+  PeerDramAllocator::TierConfig hbm_cfg;
+  hbm_cfg.buffer_sizes = {kPageSize * 4};
+  hbm_cfg.buffer_descs = {{0xD0, 0xD1}};
+  auto a = std::make_unique<PeerDramAllocator>(kPageSize, MakeDramCfg(), hbm_cfg,
+                                               std::chrono::milliseconds{5000});
+
+  for (int i = 0; i < 2; ++i) {
+    auto p = a->Allocate(kPageSize, TierType::DRAM);
+    ASSERT_TRUE(p.has_value());
+    uint64_t committed_bytes = 0;
+    ASSERT_TRUE(a->Commit(p->slot_id, "d-" + std::to_string(i), committed_bytes));
+  }
+  {
+    auto p = a->Allocate(kPageSize, TierType::HBM);
+    ASSERT_TRUE(p.has_value());
+    uint64_t committed_bytes = 0;
+    ASSERT_TRUE(a->Commit(p->slot_id, "h-0", committed_bytes));
+  }
+
+  auto counts = a->OwnedKeyCountByTier();
+  EXPECT_EQ(counts[TierType::DRAM], 2u);
+  EXPECT_EQ(counts[TierType::HBM], 1u);
+  EXPECT_EQ(counts[TierType::SSD], 0u);
+}
+
 }  // namespace mori::umbp

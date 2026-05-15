@@ -180,6 +180,10 @@ class PeerDramAllocator {
   // requests a full sync (seq gap or master restart).
   std::vector<KvEvent> SnapshotOwnedKeys() const;
 
+  // Live owned-key count per tier.  O(tiers) — cheap to call every
+  // heartbeat.  Used by the heartbeat shipper for per-client metrics.
+  std::map<TierType, uint64_t> OwnedKeyCountByTier() const;
+
   // Live capacity per tier — derived directly from the underlying
   // bitmap allocators, so always reflects pending+owned correctly.
   std::map<TierType, TierCapacity> TierCapacitiesSnapshot() const;

@@ -362,12 +362,20 @@ void MasterClient::HeartbeatLoop() {
       events = is_clear_sync ? peer_alloc_->SnapshotOwnedKeys() : peer_alloc_->DrainPendingEvents();
     }
 
+    std::map<TierType, uint64_t> kv_counts;
+    if (peer_alloc_ != nullptr) kv_counts = peer_alloc_->OwnedKeyCountByTier();
+
     ::umbp::HeartbeatRequest req;
     req.set_node_id(config_.node_id);
     req.set_seq(++hb_seq_);
     req.set_last_acked_seq(hb_last_acked_seq_);
     req.set_is_full_sync(is_clear_sync);
     FillTierCapacities(req.mutable_tier_capacities(), caps);
+    for (const auto& [tier, count] : kv_counts) {
+      auto* tkc = req.add_tier_kv_counts();
+      tkc->set_tier(ToProtoTier(tier));
+      tkc->set_count(count);
+    }
     for (const auto& ev : events) {
       auto* pe = req.add_events();
       pe->set_kind(ev.kind == KvEvent::Kind::ADD ? ::umbp::KvEvent::ADD : ::umbp::KvEvent::REMOVE);
@@ -417,6 +425,11 @@ void MasterClient::HeartbeatLoop() {
       fr.set_last_acked_seq(hb_last_acked_seq_);
       fr.set_is_full_sync(true);
       FillTierCapacities(fr.mutable_tier_capacities(), caps);
+      for (const auto& [tier, count] : kv_counts) {
+        auto* tkc = fr.add_tier_kv_counts();
+        tkc->set_tier(ToProtoTier(tier));
+        tkc->set_count(count);
+      }
       for (const auto& ev : snapshot) {
         auto* pe = fr.add_events();
         pe->set_kind(::umbp::KvEvent::ADD);

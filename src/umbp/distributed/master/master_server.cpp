@@ -228,6 +228,28 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
 
     UpdateClientCapacityMetrics(request->node_id(), caps);
 
+    if (metrics_ != nullptr && request->tier_kv_counts_size() > 0) {
+      mori::metrics::MetricsServer::Labels base = {{"node", request->node_id()}};
+      for (const auto& tag : registry_.GetClientTags(request->node_id())) {
+        const auto sep = tag.find('=');
+        if (sep != std::string::npos) {
+          base.push_back({tag.substr(0, sep), tag.substr(sep + 1)});
+        }
+      }
+      uint64_t total = 0;
+      for (const auto& tkc : request->tier_kv_counts()) {
+        total += tkc.count();
+        auto labels = base;
+        labels.push_back({"tier", TierTypeName(static_cast<TierType>(tkc.tier()))});
+        metrics_->setGauge(MORI_UMBP_METRIC_CLIENT_KV_LIVE_COUNT,
+                           MORI_UMBP_METRIC_CLIENT_KV_LIVE_COUNT_HELP, labels,
+                           static_cast<double>(tkc.count()));
+      }
+      metrics_->setGauge(MORI_UMBP_METRIC_CLIENT_KV_LIVE_COUNT_TOTAL,
+                         MORI_UMBP_METRIC_CLIENT_KV_LIVE_COUNT_TOTAL_HELP, base,
+                         static_cast<double>(total));
+    }
+
     if (request_full_sync && metrics_ != nullptr) {
       metrics_->addCounter("mori_umbp_heartbeat_seq_gap_total",
                            "Heartbeats rejected due to seq gap (full sync requested)",

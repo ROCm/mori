@@ -30,6 +30,14 @@
   },
   "panels": [
     {
+      "id": 100,
+      "title": "Per-Client Capacity",
+      "type": "row",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "panels": []
+    },
+    {
       "id": 1,
       "title": "Alive Client Count",
       "description": "Number of alive UMBP clients (SGLang workers) registered with the master.",
@@ -38,7 +46,7 @@
         "h": 4,
         "w": 6,
         "x": 0,
-        "y": 0
+        "y": 1
       },
       "fieldConfig": {
         "defaults": {
@@ -80,7 +88,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 4
+        "y": 5
       },
       "fieldConfig": {
         "defaults": {
@@ -109,7 +117,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 12
+        "y": 13
       },
       "fieldConfig": {
         "defaults": {
@@ -138,7 +146,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 20
+        "y": 21
       },
       "fieldConfig": {
         "defaults": {
@@ -167,7 +175,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 20
+        "y": 21
       },
       "fieldConfig": {
         "defaults": {
@@ -189,6 +197,14 @@
       ]
     },
     {
+      "id": 101,
+      "title": "Routing & Call Rates",
+      "type": "row",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 29 },
+      "panels": []
+    },
+    {
       "id": 7,
       "title": "Per-Client BatchRoutePut Rate (entries/s)",
       "description": "Rate of successfully routed BatchRoutePut entries per target client.",
@@ -197,7 +213,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 28
+        "y": 30
       },
       "fieldConfig": {
         "defaults": {
@@ -226,7 +242,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 28
+        "y": 30
       },
       "fieldConfig": {
         "defaults": {
@@ -255,7 +271,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 36
+        "y": 38
       },
       "fieldConfig": {
         "defaults": {
@@ -311,7 +327,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 36
+        "y": 38
       },
       "fieldConfig": {
         "defaults": {
@@ -367,7 +383,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 44
+        "y": 46
       },
       "fieldConfig": {
         "defaults": {
@@ -414,7 +430,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 52
+        "y": 54
       },
       "fieldConfig": {
         "defaults": {
@@ -443,7 +459,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 52
+        "y": 54
       },
       "fieldConfig": {
         "defaults": {
@@ -472,7 +488,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 52
+        "y": 54
       },
       "fieldConfig": {
         "defaults": {

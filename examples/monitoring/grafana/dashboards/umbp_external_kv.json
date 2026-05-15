@@ -1,5 +1,5 @@
 {
-  "title": "UMBP Master - External KV Metrics",
+  "title": "UMBP Master - KV Metrics",
   "uid": "5f4e34f0-d80a-49a7-8af4-28a0dc82991e",
   "tags": [
     "umbp",
@@ -164,6 +164,62 @@
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "expr": "rate(mori_umbp_external_kv_match_matched_blocks_total[30s]) / rate(mori_umbp_external_kv_match_queried_blocks_total[30s])",
           "legendFormat": "hit rate",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 200,
+      "title": "Per-Client Live KV Key Count",
+      "type": "row",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 40 },
+      "panels": []
+    },
+    {
+      "id": 201,
+      "title": "Live KV Key Count per Node - Decode",
+      "description": "Live owned KV key count per node and tier for decode nodes, as reported by the client in heartbeat.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 41 },
+      "fieldConfig": { "defaults": { "min": 0, "unit": "short" } },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "mori_umbp_client_kv_live_count{sgl_role=\"decode\"}",
+          "legendFormat": "{{node}} {{tier}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 202,
+      "title": "Live KV Key Count per Node - Prefill",
+      "description": "Live owned KV key count per node and tier for prefill nodes, as reported by the client in heartbeat.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 41 },
+      "fieldConfig": { "defaults": { "min": 0, "unit": "short" } },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "mori_umbp_client_kv_live_count{sgl_role=\"prefill\"}",
+          "legendFormat": "{{node}} {{tier}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 203,
+      "title": "Live KV Key Count per Node - Colocated",
+      "description": "Live owned KV key count per node and tier for colocated nodes (no sgl_role label), as reported by the client in heartbeat.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 41 },
+      "fieldConfig": { "defaults": { "min": 0, "unit": "short" } },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "mori_umbp_client_kv_live_count{sgl_role=\"\"}",
+          "legendFormat": "{{node}} {{tier}}",
           "refId": "A"
         }
       ]

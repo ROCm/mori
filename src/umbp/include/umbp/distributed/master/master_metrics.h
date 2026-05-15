@@ -73,6 +73,17 @@
 #define MORI_UMBP_METRIC_EXT_KV_LIVE_COUNT "mori_umbp_external_kv_live_count"
 #define MORI_UMBP_METRIC_EXT_KV_LIVE_COUNT_HELP "Live external KV block count"
 
+// --- Per-client live KV key count (reported by clients in heartbeat) -------
+// Labels: node=<node_id>, tier=<hbm|dram|ssd>
+
+#define MORI_UMBP_METRIC_CLIENT_KV_LIVE_COUNT "mori_umbp_client_kv_live_count"
+#define MORI_UMBP_METRIC_CLIENT_KV_LIVE_COUNT_HELP \
+  "Live KV key count owned by this client, reported by the client (per tier)"
+
+#define MORI_UMBP_METRIC_CLIENT_KV_LIVE_COUNT_TOTAL "mori_umbp_client_kv_live_count_total"
+#define MORI_UMBP_METRIC_CLIENT_KV_LIVE_COUNT_TOTAL_HELP \
+  "Total live KV key count owned by this client (sum across tiers)"
+
 // --- Alive client count (gauge) --------------------------------------------
 
 #define MORI_UMBP_METRIC_CLIENT_COUNT "mori_umbp_client_count"

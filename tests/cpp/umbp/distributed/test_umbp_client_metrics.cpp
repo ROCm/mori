@@ -66,7 +66,7 @@ namespace {
 static uint16_t AllocPort() {
   static std::atomic<uint16_t> next{0};
   if (next.load() == 0) {
-    std::srand(static_cast<unsigned>(std::time(nullptr)));
+    std::srand(static_cast<unsigned>(std::time(nullptr)) ^ static_cast<unsigned>(::getpid()));
     next.store(static_cast<uint16_t>(60000 + (std::rand() % 2000)));
   }
   return next.fetch_add(10);
@@ -167,15 +167,17 @@ class MasterClientMetricsTest : public ::testing::Test {
   static constexpr int kFlushIntervalMs = 100;
 
   void SetUp() override {
-    port_ = AllocPort();
-    address_ = "127.0.0.1:" + std::to_string(port_);
     service_ = std::make_unique<RecordingMasterService>(kFlushIntervalMs);
 
     grpc::ServerBuilder builder;
-    builder.AddListeningPort(address_, grpc::InsecureServerCredentials());
+    int selected_port = 0;
+    builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &selected_port);
     builder.RegisterService(service_.get());
     server_ = builder.BuildAndStart();
     ASSERT_NE(server_, nullptr);
+    ASSERT_GT(selected_port, 0);
+    port_ = static_cast<uint16_t>(selected_port);
+    address_ = "127.0.0.1:" + std::to_string(port_);
 
     UMBPMasterClientConfig cfg;
     cfg.node_id = "metrics-test-node";
