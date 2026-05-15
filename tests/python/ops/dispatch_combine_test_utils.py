@@ -428,6 +428,24 @@ class EpDispatchCombineTestCase:
                 indices = torch.zeros(
                     n, self.config.num_experts_per_token, dtype=torch.int64
                 )
+            elif routing == "two_pe":
+                # Route tokens only between PE 0 and PE 1 for debugging
+                # All experts map to PE 0 or PE 1
+                indices = torch.empty(
+                    n, self.config.num_experts_per_token, dtype=torch.int64
+                )
+                for i in range(n):
+                    for j in range(self.config.num_experts_per_token):
+                        # Alternate between PE 0 and PE 1
+                        target_pe = (i + j) % 2
+                        indices[i, j] = target_pe * self.config.num_experts_per_rank
+            elif routing == "self_only":
+                # Route all tokens to self (same PE) for debugging
+                indices = torch.full(
+                    (n, self.config.num_experts_per_token),
+                    r * self.config.num_experts_per_rank,
+                    dtype=torch.int64
+                )
             else:
                 indices = torch.empty(
                     n, self.config.num_experts_per_token, dtype=torch.int64

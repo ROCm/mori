@@ -382,3 +382,56 @@ def test_dispatch_combine_large_token_num(
         )
 
     assert_worker_results(torch_dist_process_manager, world_size)
+
+
+# Debug test with controlled routing for VMM mode debugging
+def test_intranode_vmm_debug(torch_dist_process_manager):
+    """Debug test with two_pe routing for VMM mode."""
+    world_size = 8
+
+    torch_dist_process_manager.run_on_workers(
+        _run_dispatch_combine_worker,
+        [
+            torch.bfloat16,  # data_type
+            7168,  # hidden_dim
+            4,  # max_num_inp_token_per_rank - small value for debugging
+            32,  # num_experts_per_rank
+            8,  # num_experts_per_token
+            True,  # use_external_inp_buf
+            0,  # scale_dim
+            1,  # scale_type_size
+            "none",  # quant_type
+            0,  # max_total_recv_tokens
+            "two_pe",  # routing - only PE 0 and PE 1
+            True,  # use_max_token_num
+            True,  # check_results
+        ],
+    )
+
+    assert_worker_results(torch_dist_process_manager, world_size)
+
+
+def test_intranode_self_only_debug(torch_dist_process_manager):
+    """Debug test with self_only routing - no cross-GPU communication."""
+    world_size = 8
+
+    torch_dist_process_manager.run_on_workers(
+        _run_dispatch_combine_worker,
+        [
+            torch.bfloat16,  # data_type
+            7168,  # hidden_dim
+            4,  # max_num_inp_token_per_rank
+            32,  # num_experts_per_rank
+            8,  # num_experts_per_token
+            True,  # use_external_inp_buf
+            0,  # scale_dim
+            1,  # scale_type_size
+            "none",  # quant_type
+            0,  # max_total_recv_tokens
+            "self_only",  # routing - only to self
+            True,  # use_max_token_num
+            True,  # check_results
+        ],
+    )
+
+    assert_worker_results(torch_dist_process_manager, world_size)
