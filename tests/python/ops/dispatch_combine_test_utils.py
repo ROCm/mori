@@ -609,7 +609,15 @@ class EpDispatchCombineTestCase:
             if not result_match:
                 diff = (got.float() - expected.float()).abs()
                 tol = atol + rtol * expected.float().abs()
+                error_mask = diff > tol
+                num_errors = int(error_mask.sum().item())
+                total_elems = got.numel()
+                error_pct = 100.0 * num_errors / total_elems
                 max_idx = int(diff.argmax().item())
+                # Find first and last error indices
+                error_indices = torch.where(error_mask)[0]
+                first_err_idx = int(error_indices[0].item()) if len(error_indices) > 0 else -1
+                last_err_idx = int(error_indices[-1].item()) if len(error_indices) > 0 else -1
                 print(f"Rank[{self.config.rank}] result mismatch for token {i}:")
                 print(
                     f"Rank[{self.config.rank}]   indices[{i}]: {all_rank_indices[self.config.rank][i].cpu().tolist()}"
@@ -617,8 +625,13 @@ class EpDispatchCombineTestCase:
                 print(f"Rank[{self.config.rank}]   pes: {pes}")
                 print(f"Rank[{self.config.rank}]   unique_pes: {unique_pes}")
                 print(
+                    f"Rank[{self.config.rank}]   errors: {num_errors}/{total_elems} ({error_pct:.2f}%), "
+                    f"range=[{first_err_idx}, {last_err_idx}]"
+                )
+                print(
                     f"Rank[{self.config.rank}]   max diff: idx={max_idx}, "
-                    f"diff={float(diff[max_idx])}, tol={float(tol[max_idx])}"
+                    f"diff={float(diff[max_idx])}, tol={float(tol[max_idx])}, "
+                    f"got={float(got[max_idx])}, expected={float(expected[max_idx])}"
                 )
                 print(f"Rank[{self.config.rank}]   got: {got}")
                 print(f"Rank[{self.config.rank}]   expected : {expected}")
