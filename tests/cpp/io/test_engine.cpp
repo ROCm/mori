@@ -44,11 +44,14 @@
 
 #include "mori/application/utils/check.hpp"
 #include "mori/io/io.hpp"
+#include "src/io/rdma/backend_impl.hpp"
 #include "src/io/rdma/common.hpp"
 
 using namespace mori::io;
 
 namespace {
+
+constexpr const char* kNoRdmaDeviceFilter = "__mori_no_such_device_for_test__";
 
 struct TestSkip : public std::runtime_error {
   using std::runtime_error::runtime_error;
@@ -168,6 +171,10 @@ int GetFreePort() {
 }
 
 ConnectedEnginePair CreateConnectedRdmaPair(const std::string& prefix, bool enableNotification) {
+  if (!RdmaBackend::HasActiveDevices()) {
+    throw TestSkip("requires at least one active RDMA device");
+  }
+
   IOEngineConfig cfg;
   cfg.host = "127.0.0.1";
   cfg.port = GetFreePort();
@@ -261,6 +268,10 @@ void CaseWrIdNamespaceHelpers() {
 }
 
 void CaseRdmaNotificationRejectsZeroNotifPerQp() {
+  if (!RdmaBackend::HasActiveDevices()) {
+    throw TestSkip("requires at least one active RDMA device");
+  }
+
   IOEngineConfig cfg;
   cfg.host = "127.0.0.1";
   cfg.port = 0;
@@ -279,6 +290,286 @@ void CaseRdmaNotificationRejectsZeroNotifPerQp() {
             "zero notifPerQp failure should mention notifPerQp");
   }
   Require(threw, "notification-enabled RDMA backend should reject notifPerQp == 0");
+}
+
+void CaseRdmaBackendHasActiveDevicesReturnsFalseWhenNoDevice() {
+  ScopedEnvVar noRdma("MORI_RDMA_DEVICES", kNoRdmaDeviceFilter);
+  Require(!RdmaBackend::HasActiveDevices(),
+          "RdmaBackend::HasActiveDevices() should return false when MORI_RDMA_DEVICES filters "
+          "out all devices");
+}
+
+void CaseRdmaManagerThrowsWhenNoActiveDevices() {
+  ScopedEnvVar noRdma("MORI_RDMA_DEVICES", kNoRdmaDeviceFilter);
+  auto ctx =
+      std::make_unique<mori::application::RdmaContext>(mori::application::RdmaBackendType::IBVerbs);
+  RdmaBackendConfig cfg{};
+
+  bool threw = false;
+  try {
+    RdmaManager mgr(cfg, ctx.get());
+    (void)ctx.release();
+    (void)mgr;
+  } catch (const std::runtime_error&) {
+    threw = true;
+  }
+
+  Require(threw, "RdmaManager ctor must throw when no active RDMA device is available");
+}
+
+void CaseCreateBackendRdmaThrowsByDefaultWhenNoRdmaDevice() {
+  ScopedEnvVar noRdma("MORI_RDMA_DEVICES", kNoRdmaDeviceFilter);
+  ScopedEnvVar gate("MORI_DISABLE_AUTO_XGMI", "1");
+
+  IOEngineConfig cfg{};
+  cfg.host = "127.0.0.1";
+  cfg.port = 0;
+  IOEngine engine("test_default_no_rdma_fallback", cfg);
+
+  RdmaBackendConfig rdmaCfg{};
+  bool threw = false;
+  std::string what;
+  try {
+    engine.CreateBackend(BackendType::RDMA, rdmaCfg);
+  } catch (const std::runtime_error& e) {
+    threw = true;
+    what = e.what();
+  }
+
+  Require(threw,
+          "CreateBackend(RDMA) must throw when no RDMA device is available and fallback is not "
+          "explicitly enabled");
+  Require(what.find("MORI_DISABLE_AUTO_XGMI=0") != std::string::npos,
+          "no-RDMA error should mention MORI_DISABLE_AUTO_XGMI=0; got: " + what);
+}
+
+void CaseCreateBackendRdmaFallsBackToXgmiWhenOptedIn() {
+  if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
+
+  ScopedEnvVar noRdma("MORI_RDMA_DEVICES", kNoRdmaDeviceFilter);
+  ScopedEnvVar gate("MORI_DISABLE_AUTO_XGMI", "0");
+
+  IOEngineConfig cfg{};
+  cfg.host = "127.0.0.1";
+  cfg.port = 0;
+  IOEngine engine("test_rdma_fallback_to_xgmi", cfg);
+
+  RdmaBackendConfig rdmaCfg{};
+  engine.CreateBackend(BackendType::RDMA, rdmaCfg);
+
+  EngineDesc desc = engine.GetEngineDesc();
+  Require(desc.port == internal::kXgmiOnlyFallbackPlaceholderPort,
+          "XGMI-only fallback should set engine_desc.port to sentinel; got " +
+              std::to_string(desc.port));
+
+  engine.CreateBackend(BackendType::RDMA, rdmaCfg);
+  desc = engine.GetEngineDesc();
+  Require(desc.port == internal::kXgmiOnlyFallbackPlaceholderPort,
+          "repeated fallback should keep engine_desc.port at sentinel; got " +
+              std::to_string(desc.port));
+}
+
+void CaseCreateBackendRdmaThrowsWhenOptedInButNoXgmi() {
+  if (GetGpuCount() != 0) {
+    throw TestSkip("requires a no-GPU host to deterministically exercise no-XGMI fallback failure");
+  }
+
+  ScopedEnvVar noRdma("MORI_RDMA_DEVICES", kNoRdmaDeviceFilter);
+  ScopedEnvVar gate("MORI_DISABLE_AUTO_XGMI", "0");
+
+  IOEngineConfig cfg{};
+  cfg.host = "127.0.0.1";
+  cfg.port = 0;
+  IOEngine engine("test_no_rdma_no_xgmi", cfg);
+
+  RdmaBackendConfig rdmaCfg{};
+  bool threw = false;
+  std::string what;
+  try {
+    engine.CreateBackend(BackendType::RDMA, rdmaCfg);
+  } catch (const std::runtime_error& e) {
+    threw = true;
+    what = e.what();
+  }
+
+  Require(threw, "CreateBackend(RDMA) must throw when neither RDMA nor XGMI is usable");
+  Require(what.find("XGMI") != std::string::npos || what.find("GPU P2P") != std::string::npos,
+          "no-XGMI error should mention XGMI/GPU P2P; got: " + what);
+}
+
+void CaseExplicitXgmiThenRdmaWithoutOptInStillThrows() {
+  if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
+
+  ScopedEnvVar noRdma("MORI_RDMA_DEVICES", kNoRdmaDeviceFilter);
+  ScopedEnvVar gate("MORI_DISABLE_AUTO_XGMI", "1");
+
+  IOEngineConfig cfg{};
+  cfg.host = "127.0.0.1";
+  cfg.port = 0;
+  IOEngine engine("test_explicit_xgmi_then_rdma_no_optin", cfg);
+
+  XgmiBackendConfig xgmiCfg{};
+  engine.CreateBackend(BackendType::XGMI, xgmiCfg);
+
+  RdmaBackendConfig rdmaCfg{};
+  bool threw = false;
+  std::string what;
+  try {
+    engine.CreateBackend(BackendType::RDMA, rdmaCfg);
+  } catch (const std::runtime_error& e) {
+    threw = true;
+    what = e.what();
+  }
+
+  Require(threw, "explicit XGMI must not bypass the RDMA fallback env gate");
+  Require(what.find("MORI_DISABLE_AUTO_XGMI=0") != std::string::npos,
+          "env-gate error should remain actionable; got: " + what);
+}
+
+void CaseExplicitXgmiThenRdmaWithOptInRefreshesPort() {
+  if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
+
+  ScopedEnvVar noRdma("MORI_RDMA_DEVICES", kNoRdmaDeviceFilter);
+  ScopedEnvVar gate("MORI_DISABLE_AUTO_XGMI", "0");
+
+  IOEngineConfig cfg{};
+  cfg.host = "127.0.0.1";
+  cfg.port = 0;
+  IOEngine engine("test_explicit_xgmi_then_rdma_optin", cfg);
+
+  XgmiBackendConfig xgmiCfg{};
+  engine.CreateBackend(BackendType::XGMI, xgmiCfg);
+
+  RdmaBackendConfig rdmaCfg{};
+  engine.CreateBackend(BackendType::RDMA, rdmaCfg);
+
+  EngineDesc desc = engine.GetEngineDesc();
+  Require(desc.port == internal::kXgmiOnlyFallbackPlaceholderPort,
+          "opted-in RDMA fallback should refresh desc.port to sentinel after explicit XGMI; got " +
+              std::to_string(desc.port));
+}
+
+void CaseRdmaBackendRefusesSentinelPortConfig() {
+  if (!RdmaBackend::HasActiveDevices()) {
+    throw TestSkip("requires at least one active RDMA device");
+  }
+
+  ScopedEnvVar gate("MORI_DISABLE_AUTO_XGMI", "1");
+  IOEngineConfig cfg{};
+  cfg.host = "127.0.0.1";
+  cfg.port = internal::kXgmiOnlyFallbackPlaceholderPort;
+  IOEngine engine("test_rdma_sentinel_port_refused", cfg);
+
+  RdmaBackendConfig rdmaCfg{};
+  bool threw = false;
+  std::string what;
+  try {
+    engine.CreateBackend(BackendType::RDMA, rdmaCfg);
+  } catch (const std::runtime_error& e) {
+    threw = true;
+    what = e.what();
+  }
+
+  Require(threw, "real RDMA backend must refuse the XGMI-only sentinel port");
+  Require(what.find("sentinel") != std::string::npos || what.find("reserved") != std::string::npos,
+          "sentinel port error should explain that the port is reserved; got: " + what);
+}
+
+void CaseSelectBackendReturnsNullForCrossNodeUnderXgmiOnly() {
+  if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
+
+  ScopedEnvVar noRdma("MORI_RDMA_DEVICES", kNoRdmaDeviceFilter);
+  ScopedEnvVar gate("MORI_DISABLE_AUTO_XGMI", "0");
+
+  IOEngineConfig cfg{};
+  cfg.host = "127.0.0.1";
+  cfg.port = 0;
+  IOEngine engine("test_xgmi_only_cross_node", cfg);
+
+  RdmaBackendConfig rdmaCfg{};
+  engine.CreateBackend(BackendType::RDMA, rdmaCfg);
+
+  EngineDesc fakeRemote{};
+  fakeRemote.key = "fake_cross_node_remote";
+  fakeRemote.nodeId = "different-node";
+  fakeRemote.hostname = "different-host";
+  fakeRemote.host = "127.0.0.1";
+  fakeRemote.port = internal::kXgmiOnlyFallbackPlaceholderPort;
+  fakeRemote.pid = 0;
+  engine.RegisterRemoteEngine(fakeRemote);
+
+  auto local = RegisterGpuMemory(&engine, 4096, 0);
+  MemoryDesc remote{};
+  remote.engineKey = fakeRemote.key;
+  remote.id = 999;
+  remote.deviceId = 0;
+  remote.deviceBusId = local.desc.deviceBusId;
+  remote.data = local.desc.data;
+  remote.size = local.desc.size;
+  remote.loc = MemoryLocationType::GPU;
+
+  TransferStatus status;
+  TransferUniqueId uid = engine.AllocateTransferUniqueId();
+  engine.Write(local.desc, 0, remote, 0, 16, &status, uid);
+
+  Require(status.Code() == StatusCode::ERR_BAD_STATE,
+          "cross-node transfer under XGMI-only fallback should return ERR_BAD_STATE; got " +
+              std::to_string(status.CodeUint32()) + ", msg='" + status.Message() + "'");
+  Require(status.Message().find("No available backend") != std::string::npos,
+          "cross-node transfer under XGMI-only fallback should be rejected by route layer; got: " +
+              status.Message());
+}
+
+void CaseRdmaBackendCanHandleRejectsSentinelPortRemote() {
+  if (!RdmaBackend::HasActiveDevices()) {
+    throw TestSkip("requires at least one active RDMA device");
+  }
+
+  ScopedEnvVar gate("MORI_DISABLE_AUTO_XGMI", "1");
+  IOEngineConfig cfg{};
+  cfg.host = "127.0.0.1";
+  cfg.port = 0;
+  IOEngine engine("test_rdma_rejects_sentinel_remote", cfg);
+
+  RdmaBackendConfig rdmaCfg{};
+  engine.CreateBackend(BackendType::RDMA, rdmaCfg);
+
+  EngineDesc fakeRemote{};
+  fakeRemote.key = "remote_xgmi_only";
+  fakeRemote.nodeId = "remote-node";
+  fakeRemote.hostname = "remote-host";
+  fakeRemote.host = "10.255.255.255";
+  fakeRemote.port = internal::kXgmiOnlyFallbackPlaceholderPort;
+  fakeRemote.pid = 0;
+  engine.RegisterRemoteEngine(fakeRemote);
+
+  int localValue = 0;
+  int remoteValue = 0;
+  MemoryDesc local{};
+  local.engineKey = engine.GetEngineDesc().key;
+  local.id = 1;
+  local.deviceId = -1;
+  local.data = reinterpret_cast<uintptr_t>(&localValue);
+  local.size = sizeof(localValue);
+  local.loc = MemoryLocationType::CPU;
+
+  MemoryDesc remote{};
+  remote.engineKey = fakeRemote.key;
+  remote.id = 2;
+  remote.deviceId = -1;
+  remote.data = reinterpret_cast<uintptr_t>(&remoteValue);
+  remote.size = sizeof(remoteValue);
+  remote.loc = MemoryLocationType::CPU;
+
+  TransferStatus status;
+  TransferUniqueId uid = engine.AllocateTransferUniqueId();
+  engine.Write(local, 0, remote, 0, sizeof(localValue), &status, uid);
+
+  Require(status.Code() == StatusCode::ERR_BAD_STATE,
+          "RDMA backend must reject sentinel-port remote before Connect; got " +
+              std::to_string(status.CodeUint32()) + ", msg='" + status.Message() + "'");
+  Require(status.Message().find("No available backend") != std::string::npos,
+          "sentinel-port remote should be rejected by route layer; got: " + status.Message());
 }
 
 void CaseRdmaTransferBasic() {
@@ -778,6 +1069,24 @@ int main(int argc, char* argv[]) {
       {"submission_ledger_basic", CaseSubmissionLedgerBasic},
       {"wr_id_namespace_helpers", CaseWrIdNamespaceHelpers},
       {"rdma_notification_rejects_zero_notif_per_qp", CaseRdmaNotificationRejectsZeroNotifPerQp},
+      {"rdma_backend_has_active_devices_returns_false_when_no_device",
+       CaseRdmaBackendHasActiveDevicesReturnsFalseWhenNoDevice},
+      {"rdma_manager_throws_when_no_active_devices", CaseRdmaManagerThrowsWhenNoActiveDevices},
+      {"create_backend_rdma_throws_by_default_when_no_rdma_device",
+       CaseCreateBackendRdmaThrowsByDefaultWhenNoRdmaDevice},
+      {"create_backend_rdma_falls_back_to_xgmi_when_opted_in",
+       CaseCreateBackendRdmaFallsBackToXgmiWhenOptedIn},
+      {"create_backend_rdma_throws_when_opted_in_but_no_xgmi",
+       CaseCreateBackendRdmaThrowsWhenOptedInButNoXgmi},
+      {"explicit_xgmi_then_rdma_without_opt_in_still_throws",
+       CaseExplicitXgmiThenRdmaWithoutOptInStillThrows},
+      {"explicit_xgmi_then_rdma_with_opt_in_refreshes_port",
+       CaseExplicitXgmiThenRdmaWithOptInRefreshesPort},
+      {"rdma_backend_refuses_sentinel_port_config", CaseRdmaBackendRefusesSentinelPortConfig},
+      {"select_backend_returns_null_for_cross_node_under_xgmi_only",
+       CaseSelectBackendReturnsNullForCrossNodeUnderXgmiOnly},
+      {"rdma_backend_can_handle_rejects_sentinel_port_remote",
+       CaseRdmaBackendCanHandleRejectsSentinelPortRemote},
       {"rdma_transfer_basic", CaseRdmaTransferBasic},
       {"rdma_notification_disabled_behavior", CaseRdmaNotificationDisabledBehavior},
       {"rdma_notification_env_override_disables", CaseRdmaNotificationEnvOverrideDisables},
