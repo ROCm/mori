@@ -125,6 +125,14 @@ jobs:
           mkdir -p gh-pages/nightly/$DATE
           cp ./wheels/*.whl gh-pages/nightly/$DATE/
 
+          cd gh-pages/nightly/$DATE
+          echo '<!DOCTYPE html><html><body>' > index.html
+          for f in *.whl; do
+            [ -f "$f" ] && echo "<a href=\"$f\">$f</a><br>" >> index.html
+          done
+          echo '</body></html>' >> index.html
+          cd -
+
           CUTOFF=$(date -d '30 days ago' +%Y-%m-%d 2>/dev/null || date -v-30d +%Y-%m-%d)
           cd gh-pages/nightly
           for d in 20??-??-??; do
@@ -160,7 +168,7 @@ jobs:
           <h1>MoRI Nightly Wheels</h1>
           <div class="install">
           <strong>Install latest nightly:</strong><br>
-          <code>pip install --pre --find-links https://rocm.github.io/mori/nightly/latest/ amd_mori</code>
+          <code>pip install --no-index --find-links https://rocm.github.io/mori/nightly/latest/ amd_mori</code>
           </div>
           HEADER
 
@@ -264,7 +272,7 @@ jobs:
         run: |
           $CT exec $CONTAINER bash -c "
             for i in 1 2 3 4 5; do
-              pip install --pre --find-links $WHEEL_URL amd_mori && break
+              pip install --no-index --find-links $WHEEL_URL amd_mori && break
               echo \"Retry \$i: waiting for gh-pages to propagate...\"
               sleep 15
             done
@@ -487,7 +495,7 @@ jobs:
         run: |
           $CT exec $CONTAINER bash -c "
             for i in 1 2 3 4 5; do
-              pip install --pre --find-links $WHEEL_URL amd_mori && break
+              pip install --no-index --find-links $WHEEL_URL amd_mori && break
               echo \"Retry \$i: waiting for gh-pages to propagate...\"
               sleep 15
             done
@@ -499,8 +507,8 @@ jobs:
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST \
             "$CT exec $CONTAINER bash -c '
               for i in 1 2 3 4 5; do
-                pip install --pre --find-links $WHEEL_URL amd_mori && break
-                echo \"Retry \$i: waiting for gh-pages...\"
+              pip install --no-index --find-links $WHEEL_URL amd_mori && break
+              echo \"Retry \$i: waiting for gh-pages...\"
                 sleep 15
               done
               pip install prettytable
@@ -677,6 +685,15 @@ jobs:
           rm -rf gh-pages/nightly/latest
           mkdir -p gh-pages/nightly/latest
           cp ./wheels/*.whl gh-pages/nightly/latest/
+
+          cd gh-pages/nightly/latest
+          echo '<!DOCTYPE html><html><body>' > index.html
+          for f in *.whl; do
+            [ -f "$f" ] && echo "<a href=\"$f\">$f</a><br>" >> index.html
+          done
+          echo '</body></html>' >> index.html
+          cd -
+
           echo "=== latest/ updated ==="
           ls -lh gh-pages/nightly/latest/
 
