@@ -7,7 +7,6 @@ on:
   pull_request:            # TODO: remove after first successful run
     paths:
       - '.github/workflows/nightly.yml'
-      - '.github/actions/**'
 
 concurrency:
   group: nightly-${{ github.ref }}
@@ -97,6 +96,7 @@ jobs:
       MORI_RDMA_DEVICES: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
       MORI_RDMA_SL: 3
       MORI_RDMA_TC: 104
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -139,12 +139,91 @@ jobs:
             python3 -c 'import mori; print(\"mori imported OK\")'
           "
 
-      - name: Run Python intranode tests
-        uses: ./.github/actions/run-intranode-tests
-        with:
-          container: ${{ env.CONTAINER }}
-          ct: ${{ env.CT }}
-          workspace: ${{ github.workspace }}
+      - name: MORI-EP (intranode)
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE && timeout 300 pytest tests/python/ops/test_dispatch_combine_intranode.py -v
+          "
+
+      - name: MORI-EP (internode_v1)
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE && timeout 300 pytest tests/python/ops/test_dispatch_combine_internode_v1.py -v
+          "
+
+      - name: MORI-EP (async_ll SDMA)
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE && MORI_ENABLE_SDMA=1 timeout 300 pytest tests/python/ops/test_dispatch_combine_async_ll.py -v
+          "
+
+      - name: MORI-EP (async_ll IBGDA)
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE && MORI_DISABLE_P2P=1 MORI_ENABLE_SDMA=0 timeout 300 pytest tests/python/ops/test_dispatch_combine_async_ll.py -v
+          "
+
+      - name: MORI-EP bench
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE
+            timeout 120 python3 tests/python/ops/bench_dispatch_combine.py
+            timeout 120 python3 tests/python/ops/bench_dispatch_combine.py \
+              --cmd bench --dtype bf16 --quant-type fp8_blockwise \
+              --zero-copy 0 --max-tokens 128 \
+              --force-scale-active 1 --report-scale-stats 1
+          "
+
+      - name: MORI-IO
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE
+            timeout 60 pytest tests/python/io/ -v
+            MORI_IO_XGMI_SCATTER_GATHER_THRESHOLD=4 \
+              timeout 120 pytest tests/python/io/test_discrete_buffer.py -v -k 'not performance'
+          "
+
+      - name: MORI-IR
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE -e HOME=/tmp $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE
+            timeout 60 torchrun --nproc_per_node=2 examples/shmem/ir/test_triton_shmem.py
+            timeout 60 torchrun --nproc_per_node=8 examples/shmem/ir/test_triton_allreduce.py
+            MORI_DISABLE_P2P=ON timeout 60 torchrun --nproc_per_node=8 examples/shmem/ir/test_triton_allreduce.py
+          "
+
+      - name: MORI-CCL/shmem
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE
+            timeout 600 pytest tests/python/shmem/test_api.py -v
+          "
+
+      - name: MORI-CCL collectives
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE
+            MORI_ENABLE_SDMA=1 timeout 300 python -m tests.python.ccl.test_allgather --world-size 8 --elems 1024 --iterations 1 --warmup 0
+            MORI_ENABLE_SDMA=1 timeout 300 python -m tests.python.ccl.test_all2all --world-size 8 --elems 1024 --iterations 1 --warmup 0
+          "
+
+      - name: MORI-EP async kernel bench (intranode)
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE
+            PORT=12390
+            for TOKENS in 64 128; do
+              echo \"=== async_ll bench max-tokens=\$TOKENS port=\$PORT ===\"
+              MORI_ENABLE_SDMA=1 GPU_PER_NODE=8 \
+              timeout 120 torchrun \
+                --nnodes=1 --node_rank=0 --nproc_per_node=1 \
+                --master_addr=127.0.0.1 --master_port=\$PORT \
+                examples/ops/dispatch_combine/test_dispatch_combine_internode.py \
+                --kernel-type async_ll --num-qp 2 --cmd bench \
+                --dtype bf16 --max-tokens \$TOKENS
+              PORT=\$((PORT + 1))
+            done
+          "
 
       - name: Cleanup
         if: always()
@@ -248,6 +327,7 @@ jobs:
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "
             $CT rm -f $CONTAINER 2>/dev/null || true
             mkdir -p $GITHUB_WORKSPACE
+            mkdir -p /tmp/nightly-wheel
           "
           rsync -az --exclude='.git' \
             -e "ssh $SSH_OPTS -p $NODE2_PORT" \
@@ -256,7 +336,7 @@ jobs:
           rsync -az \
             -e "ssh $SSH_OPTS -p $NODE2_PORT" \
             ${{ runner.temp }}/wheel/ \
-            $(whoami)@$NODE2_HOST:${{ runner.temp }}/wheel/
+            $(whoami)@$NODE2_HOST:/tmp/nightly-wheel/
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "
             cd $GITHUB_WORKSPACE &&
             $CT build --network=host --build-arg BASE_IMAGE=${{ matrix.base_image }} -t $IMAGE -f docker/Dockerfile.dev . &&
@@ -268,7 +348,7 @@ jobs:
               -e GLOO_SOCKET_IFNAME=$NODE2_IFNAME \
               -e NCCL_SOCKET_IFNAME=$NODE2_IFNAME \
               -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
-              -v ${{ runner.temp }}/wheel:/tmp/wheel:ro \
+              -v /tmp/nightly-wheel:/tmp/wheel:ro \
               -w $GITHUB_WORKSPACE \
               $IMAGE sleep infinity &&
             $CT exec $CONTAINER \
@@ -286,18 +366,133 @@ jobs:
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST \
             "$CT exec $CONTAINER bash -c 'pip install /tmp/wheel/*.whl && pip install prettytable'"
 
-      - name: Run internode tests
-        uses: ./.github/actions/run-internode-tests
-        with:
-          container: ${{ env.CONTAINER }}
-          ct: ${{ env.CT }}
-          workspace: ${{ github.workspace }}
-          node1_host: ${{ env.NODE1_HOST }}
-          node2_host: ${{ env.NODE2_HOST }}
-          node2_port: ${{ env.NODE2_PORT }}
-          node1_ifname: ${{ env.NODE1_IFNAME }}
-          node2_ifname: ${{ env.NODE2_IFNAME }}
-          ssh_opts: ${{ env.SSH_OPTS }}
+      - name: MORI-IO internode write sweep
+        run: |
+          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_io_benchmark.sh"
+          PORT=29120
+          echo "=== MORI-IO internode benchmark: wide-write-sweep port=$PORT ==="
+          NODE2_CMD=(
+            $CT exec $CONTAINER bash $SCRIPT
+            --rank 1 --master-addr $NODE1_HOST --master-port $PORT
+            --ifname $NODE2_IFNAME
+            -- --op-type write --transfer-batch-size 128 --all
+            --sweep-start-size 1024 --sweep-max-size 16777216 --iters 4
+            --enable-sess --enable-batch-transfer
+            --num-qp-per-transfer 2 --num-worker-threads 2
+            --num-initiator-dev 8 --num-target-dev 8
+          )
+          ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
+          $CT exec $CONTAINER bash $SCRIPT \
+            --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+            --ifname $NODE1_IFNAME \
+            -- --op-type write --transfer-batch-size 128 --all \
+            --sweep-start-size 1024 --sweep-max-size 16777216 --iters 4 \
+            --enable-sess --enable-batch-transfer \
+            --num-qp-per-transfer 2 --num-worker-threads 2 \
+            --num-initiator-dev 8 --num-target-dev 8
+          wait
+
+      - name: MORI-IO internode read
+        run: |
+          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_io_benchmark.sh"
+          PORT=29121
+          echo "=== MORI-IO internode benchmark: batch-session-read port=$PORT ==="
+          NODE2_CMD=(
+            $CT exec $CONTAINER bash $SCRIPT
+            --rank 1 --master-addr $NODE1_HOST --master-port $PORT
+            --ifname $NODE2_IFNAME
+            -- --op-type read --buffer-size 4096 --transfer-batch-size 128 --iters 8
+            --enable-batch-transfer --enable-sess --poll_cq_mode event
+            --num-qp-per-transfer 2 --num-worker-threads 2
+            --num-initiator-dev 8 --num-target-dev 8
+          )
+          ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
+          $CT exec $CONTAINER bash $SCRIPT \
+            --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+            --ifname $NODE1_IFNAME \
+            -- --op-type read --buffer-size 4096 --transfer-batch-size 128 --iters 8 \
+            --enable-batch-transfer --enable-sess --poll_cq_mode event \
+            --num-qp-per-transfer 2 --num-worker-threads 2 \
+            --num-initiator-dev 8 --num-target-dev 8
+          wait
+
+      - name: MORI-EP internode normal kernel bench
+        run: |
+          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
+          PORT=29140
+          for KERNEL in v1 v1_ll; do
+            for TOKENS in 64 128 1024 2048 4096; do
+              echo "=== bench kernel=$KERNEL max-tokens=$TOKENS port=$PORT ==="
+              NODE2_CMD=(
+                $CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT
+                --rank 1 --master-addr $NODE1_HOST --master-port $PORT
+                --ifname $NODE2_IFNAME
+                --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS
+              )
+              ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
+              $CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT \
+                --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+                --ifname $NODE1_IFNAME \
+                --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS
+              wait
+              sleep 1
+              PORT=$((PORT + 1))
+            done
+          done
+
+      - name: MORI-EP internode normal kernel stress
+        run: |
+          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
+          PORT=29160
+          for KERNEL in v1 v1_ll; do
+            for TOKENS in 64 128 1024 2048 4096; do
+              echo "=== stress kernel=$KERNEL max-tokens=$TOKENS port=$PORT ==="
+              NODE2_CMD=(
+                $CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT
+                --rank 1 --master-addr $NODE1_HOST --master-port $PORT
+                --ifname $NODE2_IFNAME
+                --cmd stress --kernel-type $KERNEL --max-tokens $TOKENS
+              )
+              ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
+              $CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT \
+                --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+                --ifname $NODE1_IFNAME \
+                --cmd stress --kernel-type $KERNEL --max-tokens $TOKENS
+              wait
+              sleep 1
+              PORT=$((PORT + 1))
+            done
+          done
+
+      - name: MORI-EP internode async kernel test
+        run: |
+          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
+          PORT=29180
+          for TOKENS in 64 128; do
+            echo "=== async_ll test max-tokens=$TOKENS port=$PORT ==="
+            NODE2_CMD=(
+              $CT exec
+              -e GPU_PER_NODE=8 -e MORI_ENABLE_SDMA=1 -e MORI_INTERNODE_TIMEOUT=600
+              $CONTAINER bash $SCRIPT
+              --rank 1 --master-addr $NODE1_HOST --master-port $PORT
+              --ifname $NODE2_IFNAME
+              --cmd test --kernel-type async_ll
+              --quant-type none --dtype bf16 --max-tokens $TOKENS
+            )
+            ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
+            $CT exec \
+              -e GPU_PER_NODE=8 \
+              -e MORI_ENABLE_SDMA=1 \
+              -e MORI_INTERNODE_TIMEOUT=600 \
+              $CONTAINER bash $SCRIPT \
+              --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+              --ifname $NODE1_IFNAME \
+              --cmd test --kernel-type async_ll \
+              --quant-type none --dtype bf16 --max-tokens $TOKENS
+            wait
+            sleep 1
+            PORT=$((PORT + 1))
+          done
 
       - name: Cleanup node1
         if: always()
@@ -317,8 +512,10 @@ jobs:
         if: always()
         run: |
           ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            -p $NODE2_PORT $(whoami)@$NODE2_HOST \
-            "$CT rm -f $CONTAINER || true"
+            -p $NODE2_PORT $(whoami)@$NODE2_HOST "
+              $CT rm -f $CONTAINER || true
+              rm -rf /tmp/nightly-wheel
+            "
 
   deploy-nightly:
     name: deploy to gh-pages
