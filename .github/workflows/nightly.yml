@@ -238,7 +238,7 @@ jobs:
           $CT rm -f $CONTAINER || true
 
   test-wheel-internode:
-    name: internode test (${{ matrix.platform }})
+    name: internode test (${{ matrix.platform }}, py${{ matrix.python }})
     needs: build-wheel
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -246,6 +246,21 @@ jobs:
       matrix:
         include:
           - platform: MI355X_AINIC
+            python: "3.10"
+            runner: [self-hosted, MI355X-AINIC]
+            base_image: rocm/pytorch:rocm7.2.1_ubuntu22.04_py3.10_pytorch_release_2.8.0
+            artifact: wheel-cp3.10
+            node1_host: 10.2.80.22
+            node2_host: 10.2.80.20
+            node2_port: 22
+            node1_ifname: enp193s0f1np1
+            node2_ifname: enp193s0f1np1
+            rdma_devices: rocep105s0,rocep121s0,rocep137s0,rocep153s0,rocep233s0,rocep249s0,rocep25s0,rocep9s0
+            rdma_sl: 3
+            rdma_tc: 104
+            ct: podman
+          - platform: MI355X_AINIC
+            python: "3.12"
             runner: [self-hosted, MI355X-AINIC]
             base_image: rocm/pytorch:rocm7.2.1_ubuntu24.04_py3.12_pytorch_release_2.8.0
             artifact: wheel-cp3.12
@@ -259,6 +274,21 @@ jobs:
             rdma_tc: 104
             ct: podman
           - platform: MI300X_BNXT
+            python: "3.10"
+            runner: [self-hosted, MI300X-BNXT]
+            base_image: rocm/pytorch:rocm7.2.1_ubuntu22.04_py3.10_pytorch_release_2.8.0
+            artifact: wheel-cp3.10
+            node1_host: 10.245.128.61
+            node2_host: 10.245.128.59
+            node2_port: 22
+            node1_ifname: enp159s0np0
+            node2_ifname: enp159s0np0
+            rdma_devices: bnxt_re0,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re7,bnxt_re8,bnxt_re9
+            rdma_sl: 3
+            rdma_tc: 104
+            ct: docker
+          - platform: MI300X_BNXT
+            python: "3.12"
             runner: [self-hosted, MI300X-BNXT]
             base_image: rocm/pytorch:rocm7.2.1_ubuntu24.04_py3.12_pytorch_release_2.8.0
             artifact: wheel-cp3.12
