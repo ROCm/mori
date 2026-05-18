@@ -22,11 +22,17 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
+#include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "mori/io/common.hpp"
 #include "mori/io/enum.hpp"
@@ -137,10 +143,120 @@ struct CqCallbackMeta {
   internal::IoCallDiagnostics diagnostics{};
 };
 
-// SubmissionLedger: tracks per-EP WR submissions and enables precise sqDepth release.
+struct SqCqeDiagnostics {
+  std::atomic<int64_t> lastPollAttemptTimeUs{0};
+  std::atomic<int64_t> lastNonEmptyCqeTimeUs{0};
+  std::atomic<uint64_t> recentCqeCount{0};
+  std::atomic<uint64_t> recentBatchReleaseWr{0};
+  std::atomic<uint64_t> executorAdmissionWaitCount{0};
+  std::atomic<uint64_t> executorAdmissionWaitUs{0};
+  std::atomic<uint64_t> executorAdmissionTimeoutCount{0};
+  std::atomic<uint64_t> leastLoadedSelectionCount{0};
+  std::atomic<int> queuedWrHighWatermark{0};
+};
+
+enum class SqReserveFailureKind : uint8_t {
+  None = 0,
+  Degraded,
+  TerminalDegraded,
+  ExceedsCapacity,
+  Timeout,
+};
+
+enum class SqDegradeReason : uint8_t {
+  None = 0,
+  PartialPostOrphaned,
+  FatalCqe,
+  EndpointTeardown,
+};
+
+struct ReserveOptions {
+  int timeoutUs{0};
+};
+
+struct ReserveResult {
+  SqReserveFailureKind kind{SqReserveFailureKind::None};
+  int depth{0};
+  int requested{0};
+  int maxDepth{0};
+  int backoffCount{0};
+};
+
+enum class AdmissionFailureKind : uint8_t {
+  None = 0,
+  NoCapacity,
+  Degraded,
+  TerminalDegraded,
+  ExceedsCapacity,
+};
+
+struct AdmissionSnapshot {
+  int depth{0};
+  int queuedDepth{0};
+  int effectiveLoad{0};
+  int maxDepth{0};
+  int requested{0};
+  int requiredFree{0};
+  int effectiveResumeWatermarkWr{0};
+  uint64_t epoch{0};
+};
+
+struct AdmissionResult {
+  AdmissionFailureKind kind{AdmissionFailureKind::None};
+  AdmissionSnapshot snapshot{};
+};
+
+class SqController {
+ public:
+  SqController(int maxDepth, int resumeWatermark);
+
+  bool Reserve(int wrCount, ReserveOptions opts, ReserveResult* result);
+  bool RecheckBeforePost(int reservedWrCount, ReserveResult* result);
+  void Release(int wrCount);
+  bool TryAcquireAdmission(int admissionWr, int requiredFree, AdmissionResult* result);
+  void ReleaseAdmission(int admissionWr);
+  bool WaitForAdmissionChange(std::chrono::steady_clock::time_point deadline,
+                              uint64_t observedEpoch);
+  bool MarkDegraded(SqDegradeReason reason);
+  void ReleaseDrainedOrphaned(int wrCount);
+  std::shared_lock<std::shared_mutex> AcquireSubmitGuard();
+  std::unique_lock<std::shared_mutex> AcquireRecoveryGuard();
+
+  int Depth() const;
+  int QueuedDepth() const;
+  int EffectiveDepth() const;
+  int FreeAdmissionSlots() const;
+  int MaxDepth() const;
+  bool IsDegraded() const;
+  bool IsTerminalDegraded() const;
+
+ private:
+  void ReleaseInternal(int wrCount);
+  void NotifyStateChangedLocked();
+
+  std::atomic<int> depth_{0};
+  std::atomic<int> queuedDepth_{0};
+  int maxDepth_{0};
+  int resumeWatermark_{0};
+  std::atomic<bool> degraded_{false};
+  std::atomic<bool> terminalDegraded_{false};
+  std::shared_mutex submitMu_;
+  std::mutex mu_;
+  std::condition_variable cv_;
+  std::atomic<uint64_t> epoch_{0};
+};
+
+int GetSqResumeWatermarkWrForDepth(int maxDepth);
+int GetSqSignalIntervalWr();
+
+using EndpointId = uint64_t;
+
+// SubmissionLedger tracks per-EP WR completions. SQ credit is released by
+// SqController after callers inspect the returned SubmissionRecord.
 enum class SubmissionState : uint8_t {
-  Posted,    // submitted, awaiting CQE
-  Orphaned,  // partial post without signaled tail; awaits recovery
+  Tentative,  // inserted before ibv_post_send confirms the signaled tail was posted
+  Posted,     // submitted, awaiting CQE
+  Orphaned,   // partial post without signaled tail; awaits recovery
 };
 
 struct SubmissionRecord {
@@ -161,17 +277,22 @@ class SubmissionLedger {
                   int batchSize);
 
   // Insert an Orphaned record (partial post, no signaled tail).
-  void InsertOrphaned(int postedWr, std::shared_ptr<CqCallbackMeta> meta, int batchSize);
+  uint64_t InsertOrphaned(int postedWr, std::shared_ptr<CqCallbackMeta> meta, int batchSize);
 
-  // CQE path: find record by recordId, release sqDepth, return CqCallbackMeta.
-  // Returns nullptr if record not found.
-  std::shared_ptr<CqCallbackMeta> ReleaseByCqe(uint64_t recordId, std::atomic<int>* sqDepth,
-                                               int* outBatchSize);
+  // CQE path: find record by recordId, return it, and erase it.
+  bool ReleaseByCqe(uint64_t recordId, SubmissionRecord* outRecord);
 
-  // Recovery path: release only Orphaned records and keep Posted records.
-  int ReleaseOrphanedByRecovery(std::atomic<int>* sqDepth);
+  // Post path: a tentative signaled record has a posted tail and must await CQE.
+  bool MarkPosted(uint64_t recordId);
+
+  // Post failure path: erase a tentative signaled record whose tail was not posted.
+  bool CancelTentative(uint64_t recordId, SubmissionRecord* outRecord);
+
+  // Terminal degraded path: extract Orphaned records and keep Posted records.
+  void ExtractOrphanedRecords(std::vector<SubmissionRecord>* outRecords);
 
   bool HasOrphaned() const;
+  size_t RecordCount() const;
 
  private:
   mutable std::mutex mu_;
@@ -180,21 +301,35 @@ class SubmissionLedger {
 };
 
 struct EpPair {
-  int weight;
-  int ldevId;
-  int rdevId;
+  EndpointId endpointId{0};
+  int weight{0};
+  int ldevId{0};
+  int rdevId{0};
   EngineKey remoteEngineKey;
   application::RdmaEndpoint local;
   application::RdmaEndpointHandle remote;
   // Shared across EpPair copies that refer to the same QP.
-  std::shared_ptr<std::atomic<int>> sqDepth;
+  std::shared_ptr<SqController> sq;
   int maxSqDepth{0};
-  // Degraded flag — set on partial post without signaled tail.
-  std::shared_ptr<std::atomic<bool>> degraded;
   std::shared_ptr<SubmissionLedger> ledger;
+  int qpPerTransfer{0};
+  int numWorkerThreads{0};
+  std::shared_ptr<SqCqeDiagnostics> sqCqeDiagnostics;
 };
 
-using EndpointId = uint64_t;
+using EpPairVec = std::vector<EpPair>;
+
+void RecordSqPollAttempt(const EpPair& ep);
+void RecordSqPollCqes(const EpPair& ep, int cqeCount);
+void RecordSqBatchReleaseWr(const EpPair& ep, int wrCount);
+std::string BuildSqCqeDiagnosticHint(const EpPair& ep);
+// The vector membership is not modified, but endpoint controller/ledger/status
+// state is mutated through EpPair's shared ownership fields.
+void MovePendingUnsignaledToOrphanedForEndpoint(
+    const EpPairVec& eps, size_t epId, std::vector<int>& epWrsSinceSignal,
+    std::vector<size_t>& epMergedSinceSignal, const std::shared_ptr<CqCallbackMeta>& callbackMeta,
+    const std::string& message, const char* context,
+    std::shared_lock<std::shared_mutex>* heldSubmitGuard = nullptr);
 
 struct EndpointRuntime {
   EndpointRuntime() = default;
@@ -204,7 +339,6 @@ struct EndpointRuntime {
   EpPair ep;
 };
 
-using EpPairVec = std::vector<EpPair>;
 using RouteTable = std::unordered_map<TopoKeyPair, EpPairVec>;
 using MemoryTable = std::unordered_map<MemoryKey, application::RdmaMemoryRegion>;
 
@@ -225,6 +359,9 @@ struct RdmaOpRet {
 };
 
 RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* status, TransferUniqueId id);
+
+int EstimateMergedWrCount(const SizeVec& localOffsets, const SizeVec& remoteOffsets,
+                          const SizeVec& sizes, uint32_t maxSge);
 
 RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemoryRegion& local,
                              const SizeVec& localOffsets,
