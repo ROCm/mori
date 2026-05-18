@@ -32,6 +32,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: Clean stale dist
         run: |
@@ -103,15 +106,6 @@ jobs:
             rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
             rdma_sl: 3
             rdma_tc: 104
-          - platform: MI300X_BNXT
-            python: "3.10"
-            runner: [self-hosted, MI300X-BNXT]
-            base_image: rocm/pytorch:rocm7.2.1_ubuntu22.04_py3.10_pytorch_release_2.8.0
-            artifact: wheel-cp3.10
-            rdma_devices: bnxt_re0,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re7,bnxt_re8,bnxt_re9
-            rdma_sl: 3
-            rdma_tc: 104
-            socket_ifname: enp159s0np0
           - platform: MI300X_BNXT
             python: "3.12"
             runner: [self-hosted, MI300X-BNXT]
@@ -304,20 +298,6 @@ jobs:
             rdma_sl: 3
             rdma_tc: 104
             ct: podman
-          - platform: MI300X_BNXT
-            python: "3.10"
-            runner: [self-hosted, MI300X-BNXT]
-            base_image: rocm/pytorch:rocm7.2.1_ubuntu22.04_py3.10_pytorch_release_2.8.0
-            artifact: wheel-cp3.10
-            node1_host: 10.245.128.61
-            node2_host: 10.245.128.59
-            node2_port: 22
-            node1_ifname: enp159s0np0
-            node2_ifname: enp159s0np0
-            rdma_devices: bnxt_re0,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re7,bnxt_re8,bnxt_re9
-            rdma_sl: 3
-            rdma_tc: 104
-            ct: docker
           - platform: MI300X_BNXT
             python: "3.12"
             runner: [self-hosted, MI300X-BNXT]
