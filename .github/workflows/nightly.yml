@@ -174,7 +174,7 @@ jobs:
 
           for d in $(ls -rd 20??-??-?? 2>/dev/null); do
             [ -d "$d" ] || continue
-            echo "<h2 class=\"date\">$d</h2>" >> index.html
+            echo "<h2 class=\"date\"><a href=\"$d/\">$d</a></h2>" >> index.html
             echo "<table>" >> index.html
             echo "<tr><th>Commit</th><th>Version</th><th>Python</th><th>Wheel</th><th>Size</th></tr>" >> index.html
             for f in $(ls -r "$d"/amd_mori-*.whl 2>/dev/null); do
