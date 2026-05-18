@@ -54,7 +54,7 @@ jobs:
         run: $CT exec $CONTAINER bash -c "BUILD_EXAMPLES=ON pip install ."
 
       - name: Verify installation
-        run: $CT exec $CONTAINER python -c "import mori; print('OK')"
+        run: $CT exec $CONTAINER python -c "import mori; print('mori ' + mori.__version__ + ' OK')"
 
       - name: Cleanup
         if: always()
