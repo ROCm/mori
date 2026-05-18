@@ -642,7 +642,7 @@ jobs:
           <h1>MoRI Nightly Wheels</h1>
           <div class="install">
           <strong>Install latest nightly:</strong><br>
-          <code>pip install --find-links https://rocm.github.io/mori/nightly/ amd_mori</code>
+          <code>pip install --pre --find-links https://rocm.github.io/mori/nightly/ amd_mori</code>
           </div>
           <table>
           <tr><th>Date</th><th>Commit</th><th>Version</th><th>Python</th><th>Wheel</th><th>Size</th></tr>
