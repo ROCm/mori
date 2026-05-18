@@ -2,8 +2,8 @@ name: MoRI CI test
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
+  # pull_request:            # temporarily disabled while validating nightly.yml
+  #   branches: [main]
   workflow_dispatch:
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
