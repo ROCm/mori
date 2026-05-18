@@ -160,8 +160,12 @@ class MasterClient {
       return seen.size();
     }
   };
+  using ExternalKvHitCountEntry = mori::umbp::ExternalKvHitCountEntry;
   grpc::Status MatchExternalKv(const std::vector<std::string>& hashes,
-                               std::vector<ExternalKvNodeMatch>* out_matches);
+                               std::vector<ExternalKvNodeMatch>* out_matches,
+                               bool count_as_hit = false);
+  grpc::Status GetExternalKvHitCounts(const std::vector<std::string>& hashes,
+                                      std::vector<ExternalKvHitCountEntry>* out_entries);
 
  private:
   UMBPMasterClientConfig config_;

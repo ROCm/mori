@@ -24,16 +24,20 @@
 #include <grpcpp/server.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 
 #include "mori/metrics/prometheus_metrics_server.hpp"
 #include "umbp/distributed/config.h"
 #include "umbp/distributed/master/client_registry.h"
 #include "umbp/distributed/master/eviction_manager.h"
 #include "umbp/distributed/master/external_kv_block_index.h"
+#include "umbp/distributed/master/external_kv_hit_index.h"
 #include "umbp/distributed/master/global_block_index.h"
 #include "umbp/distributed/routing/route_get_strategy.h"
 #include "umbp/distributed/routing/route_put_strategy.h"
@@ -61,6 +65,7 @@ class MasterServer {
   MasterServerConfig config_;
   GlobalBlockIndex index_;
   ExternalKvBlockIndex external_kv_index_;
+  ExternalKvHitIndex external_kv_hit_index_;
   ClientRegistry registry_;
   Router router_;
 
@@ -79,6 +84,15 @@ class MasterServer {
   std::unique_ptr<EvictionManager> eviction_manager_;
 
   std::atomic<uint16_t> bound_port_{0};
+
+  void StartHitIndexGc();
+  void StopHitIndexGc();
+  void HitIndexGcLoop();
+
+  std::thread hit_index_gc_thread_;
+  std::atomic<bool> hit_index_gc_running_{false};
+  std::mutex hit_index_gc_cv_mutex_;
+  std::condition_variable hit_index_gc_cv_;
 };
 
 }  // namespace mori::umbp

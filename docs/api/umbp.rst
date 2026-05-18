@@ -99,7 +99,12 @@ wheel and exports ``UMBP_MASTER_BIN`` to that path (see
 
 .. code-block:: python
 
-   from mori.cpp import UMBPMasterClient, UMBPTierType, UMBPExternalKvNodeMatch
+   from mori.cpp import (
+       UMBPMasterClient,
+       UMBPTierType,
+       UMBPExternalKvNodeMatch,
+       UMBPExternalKvHitCountEntry,
+   )
 
 ----
 
@@ -221,8 +226,10 @@ for one-shot or short-lived lookups, not for long-running peer membership.
      - **Bulk**: revoke every hash currently registered by ``node_id`` at
        ``tier``.  Used when an entire tier is wiped (storage backend clear
        or detach, host-pool reset).  Other tier buckets are untouched.
-   * - ``match_external_kv(hashes) -> list[UMBPExternalKvNodeMatch]``
-     - Query the master for nodes that hold any of the requested ``hashes``. Returns an empty list when no matches exist or ``hashes`` is empty. Raises ``RuntimeError`` on connection failure.
+   * - ``match_external_kv(hashes, count_as_hit=False) -> list[UMBPExternalKvNodeMatch]``
+     - Query the master for nodes that hold any of the requested ``hashes``. Returns an empty list when no matches exist or ``hashes`` is empty. Set ``count_as_hit=True`` only for real user-request routing queries; diagnostic or health-check callers should keep the default. Raises ``RuntimeError`` on connection failure.
+   * - ``get_external_kv_hit_counts(hashes) -> list[UMBPExternalKvHitCountEntry]``
+     - Sparse lookup of cumulative per-hash routing-hit counters. Hashes that have never been counted, or that expired from the hit index, are omitted. Duplicate request hashes are de-duplicated by the server. Oversized requests fail with ``RuntimeError``.
 
 **Protocol notes for non-Python clients:**
 
@@ -231,6 +238,38 @@ contains ``repeated TierHashes hashes_by_tier`` rather than the legacy
 ``matched_hashes + tier`` shape.  A single hash may appear in multiple tier
 buckets for the same node, so consumers must de-duplicate by hash before using a
 match count for routing.
+
+``MatchExternalKvRequest.count_as_hit`` is optional and defaults to ``false``.
+When set to ``true``, the master increments ``hit_count_total`` once for every
+unique queried hash that is actually matched in the external KV placement
+index. Missing hashes are not counted, and the number of nodes or tiers holding
+the same hash does not multiply the increment.
+
+``GetExternalKvHitCounts`` returns ``HitCountEntry`` values sparsely: absent
+hashes are omitted rather than returned with zero. Response ordering is not
+guaranteed to match request ordering, so callers should build a ``hash -> entry``
+map when alignment matters.
+
+----
+
+UMBPExternalKvHitCountEntry
+---------------------------
+
+Returned by ``get_external_kv_hit_counts()``.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 70
+
+   * - Attribute
+     - Description
+   * - ``hash: str``
+     - KV block hash.
+   * - ``hit_count_total: int``
+     - Lifetime cumulative count of ``match_external_kv(..., count_as_hit=True)``
+       calls in which this hash was actually matched. The count is dropped if
+       the entry is garbage-collected after ``UMBP_HIT_INDEX_TTL_SEC`` of
+       inactivity or if the master restarts.
 
 ----
 
@@ -418,6 +457,26 @@ and per-hash source locations from this response.
    cost_aware_node = min(summaries, key=estimated_fetch_cost, default=None)
    # Production policies should combine this tier cost with recompute cost for
    # `not_found`, queue depth, and worker health/load signals.
+
+**Tracking cumulative per-hash routing hits:**
+
+.. code-block:: python
+
+   from mori.cpp import UMBPMasterClient
+
+   query_client = UMBPMasterClient(master)
+   query_hashes = ["sha256-prefix-0", "sha256-prefix-1"]
+
+   # Set count_as_hit=True only on the real user-request routing path.
+   matches = query_client.match_external_kv(query_hashes, count_as_hit=True)
+
+   counts = {
+       entry.hash: entry.hit_count_total
+       for entry in query_client.get_external_kv_hit_counts(query_hashes)
+   }
+
+   # Missing hashes are absent from counts; duplicate request hashes never
+   # produce duplicate entries.
 
 For Rust/tonic consumers, mirror the current proto shape:
 

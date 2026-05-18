@@ -72,7 +72,10 @@ class DistributedClient : public IUMBPClient {
   bool ReportExternalKvBlocks(const std::vector<std::string>& hashes, TierType tier) override;
   bool RevokeExternalKvBlocks(const std::vector<std::string>& hashes, TierType tier) override;
   bool RevokeAllExternalKvBlocksAtTier(TierType tier) override;
-  std::vector<ExternalKvMatch> MatchExternalKv(const std::vector<std::string>& hashes) override;
+  std::vector<ExternalKvMatch> MatchExternalKv(const std::vector<std::string>& hashes,
+                                               bool count_as_hit = false) override;
+  std::vector<ExternalKvHitCountEntry> GetExternalKvHitCounts(
+      const std::vector<std::string>& hashes) override;
 
  private:
   UMBPConfig config_;

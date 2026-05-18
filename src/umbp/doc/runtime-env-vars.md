@@ -62,6 +62,9 @@ Read by the **master process** (`bin/master_main.cpp` via
 | `UMBP_LEASE_DURATION_SEC` | `10` | sec | Master-side read-lease length granted by `Router::RouteGet` to keep a key alive across the writer's RDMA round trip. Distinct from the peer's `read_lease_ttl_` (~500 ms by default), which protects against concurrent eviction during a single `ResolveKey`. |
 | `UMBP_HEARTBEAT_INTERVAL_DIVISOR` | `2` | count | Recommended client heartbeat interval = `heartbeat_ttl / divisor`. `min_allowed=1` guards against div-by-zero. Read by the master and echoed in `RegisterClientResponse.heartbeat_interval_ms`. |
 | `UMBP_EVICTKEY_DEADLINE_MS` | `1000` | ms | Per-call gRPC deadline applied to outbound `EvictKey` RPCs from `MasterPeerStubPool`. |
+| `UMBP_HIT_INDEX_TTL_SEC` | `7200` | sec | External KV hit-count entry TTL. A hash with no counted match for longer than this is removed from the hit index. |
+| `UMBP_HIT_INDEX_GC_INTERVAL_SEC` | `60` | sec | External KV hit-count GC sweep interval. |
+| `UMBP_HIT_QUERY_MAX_BATCH` | `4096` | count | Maximum hashes accepted by one `GetExternalKvHitCounts` request. Oversized requests return gRPC `INVALID_ARGUMENT`; the server does not truncate. |
 
 ## Peer / pool client
 

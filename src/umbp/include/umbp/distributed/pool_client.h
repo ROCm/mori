@@ -108,7 +108,10 @@ class PoolClient {
   bool RevokeExternalKvBlocks(const std::vector<std::string>& hashes, TierType tier);
   bool RevokeAllExternalKvBlocksAtTier(TierType tier);
   bool MatchExternalKv(const std::vector<std::string>& hashes,
-                       std::vector<MasterClient::ExternalKvNodeMatch>* out_matches);
+                       std::vector<MasterClient::ExternalKvNodeMatch>* out_matches,
+                       bool count_as_hit = false);
+  bool GetExternalKvHitCounts(const std::vector<std::string>& hashes,
+                              std::vector<MasterClient::ExternalKvHitCountEntry>* out_entries);
 
   struct SlotPlan {
     uint64_t slot_id = 0;

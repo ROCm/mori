@@ -254,6 +254,11 @@ message RevokeAllExternalKvBlocksAtTierResponse {}
 
 message MatchExternalKvRequest {
   repeated string hashes = 1;
+  // When true, master increments hit_count_total for every unique hash in
+  // `hashes` that is actually matched in the external KV placement index.
+  // Unmatched hashes are not counted; admin/diagnostic callers should keep
+  // the default false value.
+  bool count_as_hit = 2;
 }
 // Per-tier bucket of matched hashes for a single node.
 // proto3 disallows map<int, repeated_string>, so we use a wrapper.
@@ -273,6 +278,18 @@ message ExternalKvNodeMatch {
 }
 message MatchExternalKvResponse {
   repeated ExternalKvNodeMatch matches = 1;
+}
+
+message HitCountEntry {
+  string hash = 1;
+  uint64 hit_count_total = 2;
+}
+
+message GetExternalKvHitCountsRequest {
+  repeated string hashes = 1;
+}
+message GetExternalKvHitCountsResponse {
+  repeated HitCountEntry entries = 1;
 }
 
 
@@ -303,6 +320,8 @@ service UMBPMaster {
       returns (RevokeAllExternalKvBlocksAtTierResponse);
   rpc MatchExternalKv                (MatchExternalKvRequest)
       returns (MatchExternalKvResponse);
+  rpc GetExternalKvHitCounts         (GetExternalKvHitCountsRequest)
+      returns (GetExternalKvHitCountsResponse);
 
   // Client-side metrics reporting
   rpc ReportMetrics(ReportMetricsRequest) returns (ReportMetricsResponse);

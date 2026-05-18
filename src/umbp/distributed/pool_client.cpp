@@ -1280,7 +1280,7 @@ std::vector<bool> PoolClient::BatchExists(const std::vector<std::string>& keys) 
 }
 
 // ---------------------------------------------------------------------------
-//  External KV (unchanged)
+//  External KV
 // ---------------------------------------------------------------------------
 
 bool PoolClient::ReportExternalKvBlocks(const std::vector<std::string>& hashes, TierType tier) {
@@ -1299,9 +1299,17 @@ bool PoolClient::RevokeAllExternalKvBlocksAtTier(TierType tier) {
 }
 
 bool PoolClient::MatchExternalKv(const std::vector<std::string>& hashes,
-                                 std::vector<MasterClient::ExternalKvNodeMatch>* out_matches) {
+                                 std::vector<MasterClient::ExternalKvNodeMatch>* out_matches,
+                                 bool count_as_hit) {
   if (!initialized_) return false;
-  return master_client_->MatchExternalKv(hashes, out_matches).ok();
+  return master_client_->MatchExternalKv(hashes, out_matches, count_as_hit).ok();
+}
+
+bool PoolClient::GetExternalKvHitCounts(
+    const std::vector<std::string>& hashes,
+    std::vector<MasterClient::ExternalKvHitCountEntry>* out_entries) {
+  if (!initialized_) return false;
+  return master_client_->GetExternalKvHitCounts(hashes, out_entries).ok();
 }
 
 // ---------------------------------------------------------------------------
