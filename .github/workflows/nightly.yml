@@ -13,7 +13,6 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  IMAGE: rocm/mori:ci
   CT: docker
   CONTAINER: mori_nightly_${{ github.run_id }}
 
@@ -22,6 +21,8 @@ jobs:
   build-wheel:
     name: wheel (py${{ matrix.python }})
     runs-on: [self-hosted, MI355X-AINIC-TW]
+    env:
+      IMAGE: rocm/mori:ci-py${{ matrix.python }}
     strategy:
       fail-fast: false
       matrix:
@@ -230,6 +231,7 @@ jobs:
             rdma_tc: 104
             socket_ifname: enp159s0np0
     env:
+      IMAGE: rocm/mori:ci-py${{ matrix.python }}
       MORI_RDMA_DEVICES: ${{ matrix.rdma_devices }}
       MORI_RDMA_SL: ${{ matrix.rdma_sl }}
       MORI_RDMA_TC: ${{ matrix.rdma_tc }}
@@ -417,7 +419,7 @@ jobs:
             ct: docker
     env:
       CT: ${{ matrix.ct }}
-      IMAGE: rocm/mori:ci
+      IMAGE: rocm/mori:ci-py${{ matrix.python }}
       SSH_OPTS: -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
       NODE1_HOST: ${{ matrix.node1_host }}
       NODE2_HOST: ${{ matrix.node2_host }}
