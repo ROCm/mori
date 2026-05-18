@@ -4,9 +4,6 @@ on:
   schedule:
     - cron: '0 17 * * *'  # daily 01:00 Beijing (UTC+8)
   workflow_dispatch:       # manual trigger
-  pull_request:            # TODO: remove after first successful run
-    paths:
-      - '.github/workflows/nightly.yml'
 
 concurrency:
   group: nightly-${{ github.ref }}
