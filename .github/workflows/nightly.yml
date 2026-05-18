@@ -2,7 +2,7 @@ name: Nightly Wheel Build
 
 on:
   schedule:
-    - cron: '0 16 * * *'  # daily 00:00 Beijing (UTC+8)
+    - cron: '0 17 * * *'  # daily 01:00 Beijing (UTC+8)
   workflow_dispatch:       # manual trigger
   pull_request:            # TODO: remove after first successful run
     paths:
@@ -172,7 +172,7 @@ jobs:
           <h1>MoRI Nightly Wheels</h1>
           <div class="install">
           <strong>Install latest nightly:</strong><br>
-          <code>pip install --no-index --find-links https://rocm.github.io/mori/nightly/latest/ amd_mori</code>
+          <code>pip install --no-index --force-reinstall --find-links https://rocm.github.io/mori/nightly/latest/ amd_mori</code>
           </div>
           HEADER
 
@@ -180,7 +180,18 @@ jobs:
             LATEST_WHL=$(ls latest/amd_mori-*.whl | head -1 | xargs basename)
             LATEST_VER=$(echo "$LATEST_WHL" | sed 's/amd_mori-\(.*\)-cp[0-9]*-cp.*/\1/')
             LATEST_COMMIT=$(echo "$LATEST_VER" | sed -n 's/.*+\(.*\)/\1/p')
-            echo "<p><strong>Latest tested version:</strong> <code>$LATEST_VER</code> (commit <code>$LATEST_COMMIT</code>) — <a href=\"latest/\">browse</a></p>" >> index.html
+            echo "<h2><a href=\"latest/\">Latest</a> (tested)</h2>" >> index.html
+            echo "<table>" >> index.html
+            echo "<tr><th>Commit</th><th>Version</th><th>Python</th><th>Wheel</th><th>Size</th></tr>" >> index.html
+            for f in $(ls -r latest/amd_mori-*.whl 2>/dev/null); do
+              BASENAME=$(basename "$f")
+              SIZE=$(du -h "$f" | cut -f1)
+              VER=$(echo "$BASENAME" | sed 's/amd_mori-\(.*\)-cp[0-9]*-cp.*/\1/')
+              COMMIT=$(echo "$VER" | sed -n 's/.*+\(.*\)/\1/p')
+              PYTAG=$(echo "$BASENAME" | sed 's/.*-\(cp[0-9]*\)-cp[0-9]*-.*/\1/')
+              echo "<tr><td><code>${COMMIT}</code></td><td>${VER}</td><td>${PYTAG}</td><td><a href=\"latest/${BASENAME}\">${BASENAME}</a></td><td>${SIZE}</td></tr>" >> index.html
+            done
+            echo "</table>" >> index.html
           fi
 
           echo "<hr>" >> index.html
@@ -286,9 +297,9 @@ jobs:
       - name: Install from gh-pages
         run: |
           $CT exec $CONTAINER bash -c "
-            for i in 1 2 3 4 5; do
+            for i in \$(seq 1 15); do
               pip install --no-index --find-links $WHEEL_URL amd_mori==$WHEEL_VERSION && break
-              echo \"Retry \$i: waiting for gh-pages to propagate...\"
+              echo \"Retry \$i/15: waiting for gh-pages to propagate...\"
               sleep 15
             done
             pip install prettytable pytest
@@ -510,9 +521,9 @@ jobs:
       - name: Install wheel (node1)
         run: |
           $CT exec $CONTAINER bash -c "
-            for i in 1 2 3 4 5; do
+            for i in \$(seq 1 15); do
               pip install --no-index --find-links $WHEEL_URL amd_mori==$WHEEL_VERSION && break
-              echo \"Retry \$i: waiting for gh-pages to propagate...\"
+              echo \"Retry \$i/15: waiting for gh-pages to propagate...\"
               sleep 15
             done
             pip install prettytable
@@ -522,9 +533,9 @@ jobs:
         run: |
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST \
             "$CT exec $CONTAINER bash -c '
-              for i in 1 2 3 4 5; do
+              for i in \$(seq 1 15); do
               pip install --no-index --find-links $WHEEL_URL amd_mori==$WHEEL_VERSION && break
-              echo \"Retry \$i: waiting for gh-pages...\"
+              echo \"Retry \$i/15: waiting for gh-pages...\"
                 sleep 15
               done
               pip install prettytable
@@ -713,12 +724,82 @@ jobs:
           echo "=== latest/ updated ==="
           ls -lh gh-pages/nightly/latest/
 
+      - name: Regenerate index.html
+        run: |
+          cd gh-pages/nightly
+          cat > index.html << 'HEADER'
+          <!DOCTYPE html>
+          <html><head>
+          <meta charset="utf-8">
+          <title>MoRI Nightly Wheels</title>
+          <style>
+            body { font-family: -apple-system, sans-serif; max-width: 960px; margin: 2em auto; padding: 0 1em; }
+            h1 { border-bottom: 1px solid #ddd; padding-bottom: 0.3em; }
+            table { border-collapse: collapse; width: 100%; }
+            th, td { text-align: left; padding: 6px 12px; border-bottom: 1px solid #eee; }
+            th { background: #f6f8fa; }
+            a { color: #0366d6; text-decoration: none; }
+            a:hover { text-decoration: underline; }
+            code { background: #f0f0f0; padding: 2px 6px; border-radius: 3px; font-size: 0.9em; }
+            .install { background: #f6f8fa; padding: 1em; border-radius: 6px; margin: 1em 0; }
+            h2.date { margin-top: 1.5em; color: #24292e; font-size: 1.1em; }
+          </style>
+          </head><body>
+          <h1>MoRI Nightly Wheels</h1>
+          <div class="install">
+          <strong>Install latest nightly:</strong><br>
+          <code>pip install --no-index --force-reinstall --find-links https://rocm.github.io/mori/nightly/latest/ amd_mori</code>
+          </div>
+          HEADER
+
+          if [ -d "latest" ] && ls latest/amd_mori-*.whl &>/dev/null; then
+            echo "<h2><a href=\"latest/\">Latest</a> (tested)</h2>" >> index.html
+            echo "<table>" >> index.html
+            echo "<tr><th>Commit</th><th>Version</th><th>Python</th><th>Wheel</th><th>Size</th></tr>" >> index.html
+            for f in $(ls -r latest/amd_mori-*.whl 2>/dev/null); do
+              BASENAME=$(basename "$f")
+              SIZE=$(du -h "$f" | cut -f1)
+              VER=$(echo "$BASENAME" | sed 's/amd_mori-\(.*\)-cp[0-9]*-cp.*/\1/')
+              COMMIT=$(echo "$VER" | sed -n 's/.*+\(.*\)/\1/p')
+              PYTAG=$(echo "$BASENAME" | sed 's/.*-\(cp[0-9]*\)-cp[0-9]*-.*/\1/')
+              echo "<tr><td><code>${COMMIT}</code></td><td>${VER}</td><td>${PYTAG}</td><td><a href=\"latest/${BASENAME}\">${BASENAME}</a></td><td>${SIZE}</td></tr>" >> index.html
+            done
+            echo "</table>" >> index.html
+          fi
+
+          echo "<hr>" >> index.html
+          echo "<h2>All builds</h2>" >> index.html
+
+          for d in $(ls -rd 20??-??-?? 2>/dev/null); do
+            [ -d "$d" ] || continue
+            echo "<h2 class=\"date\"><a href=\"$d/\">$d</a></h2>" >> index.html
+            echo "<table>" >> index.html
+            echo "<tr><th>Commit</th><th>Version</th><th>Python</th><th>Wheel</th><th>Size</th></tr>" >> index.html
+            for f in $(ls -r "$d"/amd_mori-*.whl 2>/dev/null); do
+              BASENAME=$(basename "$f")
+              SIZE=$(du -h "$f" | cut -f1)
+              VER=$(echo "$BASENAME" | sed 's/amd_mori-\(.*\)-cp[0-9]*-cp.*/\1/')
+              COMMIT=$(echo "$VER" | sed -n 's/.*+\(.*\)/\1/p')
+              PYTAG=$(echo "$BASENAME" | sed 's/.*-\(cp[0-9]*\)-cp[0-9]*-.*/\1/')
+              echo "<tr><td><code>${COMMIT}</code></td><td>${VER}</td><td>${PYTAG}</td><td><a href=\"${d}/${BASENAME}\">${BASENAME}</a></td><td>${SIZE}</td></tr>" >> index.html
+            done
+            echo "</table>" >> index.html
+          done
+
+          cat >> index.html << 'FOOTER'
+          <p style="color:#888; margin-top:2em; font-size:0.85em">
+          Auto-generated by <a href="https://github.com/ROCm/mori/actions/workflows/nightly.yml">nightly.yml</a>.
+          Wheels older than 30 days are automatically pruned. Only wheels that pass full test suite are published.
+          </p>
+          </body></html>
+          FOOTER
+
       - name: Push to gh-pages
         run: |
           cd gh-pages
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add nightly/latest/
+          git add nightly/
           git diff --cached --quiet && echo "No changes" && exit 0
           git commit -m "nightly: promote tested wheels to latest $(date +%Y-%m-%d)"
           git push
