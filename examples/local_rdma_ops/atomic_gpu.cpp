@@ -72,18 +72,24 @@ __device__ void SendThreadKernel(RdmaEndpoint& epSend, RdmaMemoryRegion sendMr,
 }
 
 __device__ void RecvThreadKernel(RdmaEndpoint& epRecv, RdmaMemoryRegion mr) {
-  uint32_t postIdx = 0;
   uint32_t* addr = reinterpret_cast<uint32_t*>(mr.addr);
   uint32_t val = core::AtomicLoadSeqCst(addr);
   printf("val = %u\n", val);
-  while (val != 2) {
+
+  // Cross-block, lock-free observation: there is no sync between the send block
+  // (which issues CAS then FETCH_ADD) and this recv block, so by the time we
+  // start polling either both atomics or only CAS may have landed.  Just wait
+  // until the value leaves its initial 0, and then until it reaches the final
+  // expected sum (CAS_swap + FETCH_ADD_value == 2 + 2 == 4).
+  while (val == 0) {
     val = core::AtomicLoadSeqCst(addr);
-    printf("after compare and swap val = %u\n", val);
   }
+  printf("after compare and swap val = %u\n", val);
+
   while (val != 4) {
     val = core::AtomicLoadSeqCst(addr);
-    printf("after fetch add val = %u\n", val);
   }
+  printf("after fetch add val = %u\n", val);
 }
 
 __global__ void SendRecvOnGpu(RdmaEndpoint& epSend, RdmaEndpoint& epRecv, RdmaMemoryRegion mrSend,
