@@ -1,0 +1,112 @@
+name: Run intranode tests
+description: Shared Python intranode test steps for CI and nightly workflows
+
+inputs:
+  container:
+    description: Container name to exec into
+    required: true
+  ct:
+    description: Container runtime (docker or podman)
+    required: true
+  workspace:
+    description: GITHUB_WORKSPACE path
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: MORI-EP (intranode)
+      shell: bash
+      run: |
+        ${{ inputs.ct }} exec -e PYTHONPATH=${{ inputs.workspace }} ${{ inputs.container }} bash -c "
+          cd ${{ inputs.workspace }} && timeout 300 pytest tests/python/ops/test_dispatch_combine_intranode.py -v
+        "
+
+    - name: MORI-EP (internode_v1)
+      shell: bash
+      run: |
+        ${{ inputs.ct }} exec -e PYTHONPATH=${{ inputs.workspace }} ${{ inputs.container }} bash -c "
+          cd ${{ inputs.workspace }} && timeout 300 pytest tests/python/ops/test_dispatch_combine_internode_v1.py -v
+        "
+
+    - name: MORI-EP (async_ll SDMA)
+      shell: bash
+      run: |
+        ${{ inputs.ct }} exec -e PYTHONPATH=${{ inputs.workspace }} ${{ inputs.container }} bash -c "
+          cd ${{ inputs.workspace }} && MORI_ENABLE_SDMA=1 timeout 300 pytest tests/python/ops/test_dispatch_combine_async_ll.py -v
+        "
+
+    - name: MORI-EP (async_ll IBGDA)
+      shell: bash
+      run: |
+        ${{ inputs.ct }} exec -e PYTHONPATH=${{ inputs.workspace }} ${{ inputs.container }} bash -c "
+          cd ${{ inputs.workspace }} && MORI_DISABLE_P2P=1 MORI_ENABLE_SDMA=0 timeout 300 pytest tests/python/ops/test_dispatch_combine_async_ll.py -v
+        "
+
+    - name: MORI-EP bench
+      shell: bash
+      run: |
+        ${{ inputs.ct }} exec -e PYTHONPATH=${{ inputs.workspace }} ${{ inputs.container }} bash -c "
+          cd ${{ inputs.workspace }}
+          timeout 120 python3 tests/python/ops/bench_dispatch_combine.py
+          timeout 120 python3 tests/python/ops/bench_dispatch_combine.py \
+            --cmd bench --dtype bf16 --quant-type fp8_blockwise \
+            --zero-copy 0 --max-tokens 128 \
+            --force-scale-active 1 --report-scale-stats 1
+        "
+
+    - name: MORI-IO
+      shell: bash
+      run: |
+        ${{ inputs.ct }} exec -e PYTHONPATH=${{ inputs.workspace }} ${{ inputs.container }} bash -c "
+          cd ${{ inputs.workspace }}
+          timeout 60 pytest tests/python/io/ -v
+          MORI_IO_XGMI_SCATTER_GATHER_THRESHOLD=4 \
+            timeout 120 pytest tests/python/io/test_discrete_buffer.py -v -k 'not performance'
+        "
+
+    - name: MORI-IR
+      shell: bash
+      run: |
+        ${{ inputs.ct }} exec -e PYTHONPATH=${{ inputs.workspace }} -e HOME=/tmp ${{ inputs.container }} bash -c "
+          cd ${{ inputs.workspace }}
+          timeout 60 torchrun --nproc_per_node=2 examples/shmem/ir/test_triton_shmem.py
+          timeout 60 torchrun --nproc_per_node=8 examples/shmem/ir/test_triton_allreduce.py
+          MORI_DISABLE_P2P=ON timeout 60 torchrun --nproc_per_node=8 examples/shmem/ir/test_triton_allreduce.py
+        "
+
+    - name: MORI-CCL/shmem
+      shell: bash
+      run: |
+        ${{ inputs.ct }} exec -e PYTHONPATH=${{ inputs.workspace }} ${{ inputs.container }} bash -c "
+          cd ${{ inputs.workspace }}
+          timeout 600 pytest tests/python/shmem/test_api.py -v
+        "
+
+    - name: MORI-CCL collectives
+      shell: bash
+      run: |
+        ${{ inputs.ct }} exec -e PYTHONPATH=${{ inputs.workspace }} ${{ inputs.container }} bash -c "
+          cd ${{ inputs.workspace }}
+          MORI_ENABLE_SDMA=1 timeout 300 python -m tests.python.ccl.test_allgather --world-size 8 --elems 1024 --iterations 1 --warmup 0
+          MORI_ENABLE_SDMA=1 timeout 300 python -m tests.python.ccl.test_all2all --world-size 8 --elems 1024 --iterations 1 --warmup 0
+        "
+
+    - name: MORI-EP async kernel bench (intranode)
+      shell: bash
+      run: |
+        ${{ inputs.ct }} exec -e PYTHONPATH=${{ inputs.workspace }} ${{ inputs.container }} bash -c "
+          cd ${{ inputs.workspace }}
+          PORT=12390
+          for TOKENS in 64 128; do
+            echo \"=== async_ll bench max-tokens=\$TOKENS port=\$PORT ===\"
+            MORI_ENABLE_SDMA=1 GPU_PER_NODE=8 \
+            timeout 120 torchrun \
+              --nnodes=1 --node_rank=0 --nproc_per_node=1 \
+              --master_addr=127.0.0.1 --master_port=\$PORT \
+              examples/ops/dispatch_combine/test_dispatch_combine_internode.py \
+              --kernel-type async_ll --num-qp 2 --cmd bench \
+              --dtype bf16 --max-tokens \$TOKENS
+            PORT=\$((PORT + 1))
+          done
+        "

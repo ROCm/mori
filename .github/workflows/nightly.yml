@@ -7,6 +7,7 @@ on:
   pull_request:            # TODO: remove after first successful run
     paths:
       - '.github/workflows/nightly.yml'
+      - '.github/actions/**'
 
 concurrency:
   group: nightly-${{ github.ref }}
@@ -14,7 +15,6 @@ concurrency:
 
 env:
   IMAGE: rocm/mori:ci
-  BASE_IMAGE: rocm/pytorch:rocm7.2.1_ubuntu24.04_py3.12_pytorch_release_2.8.0
   CT: docker
   CONTAINER: mori_nightly_${{ github.run_id }}
 
@@ -25,45 +25,37 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.10", "3.12"]
+        include:
+          - python: "3.10"
+            base_image: rocm/pytorch:rocm7.2.1_ubuntu22.04_py3.10_pytorch_release_2.8.0
+          - python: "3.12"
+            base_image: rocm/pytorch:rocm7.2.1_ubuntu24.04_py3.12_pytorch_release_2.8.0
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Clean stale dist
         run: |
-          $CT run --rm -v ${{ runner.temp }}:/runner_temp $BASE_IMAGE \
+          $CT run --rm -v ${{ runner.temp }}:/runner_temp ${{ matrix.base_image }} \
             rm -rf /runner_temp/dist || true
 
       - name: Build CI image
-        run: $CT build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE -t $IMAGE -f docker/Dockerfile.dev .
+        run: $CT build --network=host --build-arg BASE_IMAGE=${{ matrix.base_image }} -t $IMAGE -f docker/Dockerfile.dev .
 
       - name: Build wheel
         run: |
           DATE=$(date +%Y%m%d)
           SHA=$(git rev-parse --short HEAD)
           VERSION="${DATE}+${SHA}"
-          PY=${{ matrix.python }}
 
           $CT run --rm --network=host \
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE -w $GITHUB_WORKSPACE \
             -v ${{ runner.temp }}/dist:/tmp/dist \
             $IMAGE bash -c "
               git config --global --add safe.directory '*'
-
-              if [ '$PY' != '3.12' ]; then
-                apt-get update -qq
-                apt-get install -y -qq software-properties-common > /dev/null 2>&1
-                add-apt-repository -y ppa:deadsnakes/ppa > /dev/null 2>&1
-                apt-get update -qq
-                apt-get install -y -qq python${PY} python${PY}-dev python${PY}-venv > /dev/null 2>&1
-                python${PY} -m ensurepip --upgrade > /dev/null 2>&1
-                python${PY} -m pip install --upgrade pip wheel setuptools pybind11 cmake ninja > /dev/null 2>&1
-              fi
-
-              echo 'Building wheel for Python ${PY}, version=${VERSION}'
+              echo 'Building wheel for Python ${{ matrix.python }}, version=${VERSION}'
               SETUPTOOLS_SCM_PRETEND_VERSION=${VERSION} \
-                python${PY} -m pip wheel --no-deps -w /tmp/dist .
+                python3 -m pip wheel --no-deps -w /tmp/dist .
             "
 
           echo "=== produced ==="
@@ -94,11 +86,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.10", "3.12"]
         include:
           - python: "3.10"
+            base_image: rocm/pytorch:rocm7.2.1_ubuntu22.04_py3.10_pytorch_release_2.8.0
             artifact: wheel-cp3.10
           - python: "3.12"
+            base_image: rocm/pytorch:rocm7.2.1_ubuntu24.04_py3.12_pytorch_release_2.8.0
             artifact: wheel-cp3.12
     env:
       MORI_RDMA_DEVICES: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
@@ -112,7 +105,7 @@ jobs:
 
       - name: Clean stale wheels
         run: |
-          $CT run --rm -v ${{ runner.temp }}:/runner_temp $BASE_IMAGE \
+          $CT run --rm -v ${{ runner.temp }}:/runner_temp ${{ matrix.base_image }} \
             rm -rf /runner_temp/wheel || true
 
       - name: Download wheel
@@ -122,7 +115,7 @@ jobs:
           path: ${{ runner.temp }}/wheel
 
       - name: Build CI image
-        run: $CT build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE -t $IMAGE -f docker/Dockerfile.dev .
+        run: $CT build --network=host --build-arg BASE_IMAGE=${{ matrix.base_image }} -t $IMAGE -f docker/Dockerfile.dev .
 
       - name: Start container
         run: |
@@ -140,89 +133,18 @@ jobs:
 
       - name: Install from wheel
         run: |
-          PY=${{ matrix.python }}
           $CT exec $CONTAINER bash -c "
-            if [ '$PY' != '3.12' ]; then
-              apt-get update -qq
-              apt-get install -y -qq software-properties-common > /dev/null 2>&1
-              add-apt-repository -y ppa:deadsnakes/ppa > /dev/null 2>&1
-              apt-get update -qq
-              apt-get install -y -qq python${PY} python${PY}-dev python${PY}-venv > /dev/null 2>&1
-              python${PY} -m ensurepip --upgrade > /dev/null 2>&1
-              python${PY} -m pip install --upgrade pip > /dev/null 2>&1
-            fi
-            python${PY} -m pip install /tmp/wheel/*.whl
-            python${PY} -m pip install prettytable pytest
-            python${PY} -c 'import mori; print(\"mori imported OK\")'
+            pip install /tmp/wheel/*.whl
+            pip install prettytable pytest
+            python3 -c 'import mori; print(\"mori imported OK\")'
           "
 
-      - name: MORI-EP (intranode)
-        run: |
-          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
-            cd $GITHUB_WORKSPACE && timeout 300 pytest tests/python/ops/test_dispatch_combine_intranode.py -v
-          "
-
-      - name: MORI-EP (internode_v1)
-        run: |
-          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
-            cd $GITHUB_WORKSPACE && timeout 300 pytest tests/python/ops/test_dispatch_combine_internode_v1.py -v
-          "
-
-      - name: MORI-EP (async_ll)
-        run: |
-          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
-            cd $GITHUB_WORKSPACE && timeout 300 pytest tests/python/ops/test_dispatch_combine_async_ll.py -v
-          "
-
-      - name: MORI-EP bench
-        run: |
-          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
-            cd $GITHUB_WORKSPACE
-            timeout 120 python3 tests/python/ops/bench_dispatch_combine.py
-          "
-
-      - name: MORI-IO
-        run: |
-          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
-            cd $GITHUB_WORKSPACE
-            timeout 60 pytest tests/python/io/ -v
-            MORI_IO_XGMI_SCATTER_GATHER_THRESHOLD=4 \
-              timeout 120 pytest tests/python/io/test_discrete_buffer.py -v -k 'not performance'
-          "
-
-      - name: MORI-IR
-        run: |
-          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE -e HOME=/tmp $CONTAINER bash -c "
-            cd $GITHUB_WORKSPACE
-            timeout 60 torchrun --nproc_per_node=2 examples/shmem/ir/test_triton_shmem.py
-            timeout 60 torchrun --nproc_per_node=8 examples/shmem/ir/test_triton_allreduce.py
-            MORI_DISABLE_P2P=ON timeout 60 torchrun --nproc_per_node=8 examples/shmem/ir/test_triton_allreduce.py
-          "
-
-      - name: MORI-CCL/shmem
-        run: |
-          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
-            cd $GITHUB_WORKSPACE
-            timeout 600 pytest tests/python/shmem/test_api.py -v
-          "
-
-      - name: MORI-EP async kernel bench (intranode)
-        run: |
-          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
-            cd $GITHUB_WORKSPACE
-            PORT=12390
-            for TOKENS in 64 128; do
-              echo \"=== async_ll bench max-tokens=\$TOKENS port=\$PORT ===\"
-              MORI_ENABLE_SDMA=1 GPU_PER_NODE=8 \
-              timeout 120 torchrun \
-                --nnodes=1 --node_rank=0 --nproc_per_node=1 \
-                --master_addr=127.0.0.1 --master_port=\$PORT \
-                examples/ops/dispatch_combine/test_dispatch_combine_internode.py \
-                --kernel-type async_ll --num-qp 2 --cmd bench \
-                --dtype bf16 --max-tokens \$TOKENS
-              PORT=\$((PORT + 1))
-            done
-          "
+      - name: Run Python intranode tests
+        uses: ./.github/actions/run-intranode-tests
+        with:
+          container: ${{ env.CONTAINER }}
+          ct: ${{ env.CT }}
+          workspace: ${{ github.workspace }}
 
       - name: Cleanup
         if: always()
@@ -236,9 +158,171 @@ jobs:
               " || true
           $CT rm -f $CONTAINER || true
 
+  test-wheel-internode:
+    name: internode test (${{ matrix.platform }})
+    needs: build-wheel
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: MI355X_AINIC
+            runner: [self-hosted, MI355X-AINIC]
+            base_image: rocm/pytorch:rocm7.2.1_ubuntu24.04_py3.12_pytorch_release_2.8.0
+            artifact: wheel-cp3.12
+            node1_host: 10.2.80.22
+            node2_host: 10.2.80.20
+            node2_port: 22
+            node1_ifname: enp193s0f1np1
+            node2_ifname: enp193s0f1np1
+            rdma_devices: rocep105s0,rocep121s0,rocep137s0,rocep153s0,rocep233s0,rocep249s0,rocep25s0,rocep9s0
+            rdma_sl: 3
+            rdma_tc: 104
+            ct: podman
+          - platform: MI300X_BNXT
+            runner: [self-hosted, MI300X-BNXT]
+            base_image: rocm/pytorch:rocm7.2.1_ubuntu24.04_py3.12_pytorch_release_2.8.0
+            artifact: wheel-cp3.12
+            node1_host: 10.245.128.61
+            node2_host: 10.245.128.59
+            node2_port: 22
+            node1_ifname: enp159s0np0
+            node2_ifname: enp159s0np0
+            rdma_devices: bnxt_re0,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re7,bnxt_re8,bnxt_re9
+            rdma_sl: 3
+            rdma_tc: 104
+            ct: docker
+    env:
+      CT: ${{ matrix.ct }}
+      IMAGE: rocm/mori:ci
+      SSH_OPTS: -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+      NODE1_HOST: ${{ matrix.node1_host }}
+      NODE2_HOST: ${{ matrix.node2_host }}
+      NODE2_PORT: ${{ matrix.node2_port }}
+      NODE1_IFNAME: ${{ matrix.node1_ifname }}
+      NODE2_IFNAME: ${{ matrix.node2_ifname }}
+      MORI_RDMA_DEVICES: ${{ matrix.rdma_devices }}
+      MORI_RDMA_SL: ${{ matrix.rdma_sl }}
+      MORI_RDMA_TC: ${{ matrix.rdma_tc }}
+      MORI_SOCKET_IFNAME: ${{ matrix.node1_ifname }}
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Clean stale wheels
+        run: |
+          $CT run --rm -v ${{ runner.temp }}:/runner_temp ${{ matrix.base_image }} \
+            rm -rf /runner_temp/wheel || true
+
+      - name: Download wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ runner.temp }}/wheel
+
+      - name: Build CI image
+        run: $CT build --network=host --build-arg BASE_IMAGE=${{ matrix.base_image }} -t $IMAGE -f docker/Dockerfile.dev .
+
+      - name: Start container on node1
+        run: |
+          $CT rm -f $CONTAINER 2>/dev/null || true
+          CONTAINER_RUNTIME=$CT ./docker/ci_run.sh --name $CONTAINER \
+            -e MORI_RDMA_DEVICES=$MORI_RDMA_DEVICES \
+            -e MORI_RDMA_SL=$MORI_RDMA_SL \
+            -e MORI_RDMA_TC=$MORI_RDMA_TC \
+            -e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME \
+            -e GLOO_SOCKET_IFNAME=$NODE1_IFNAME \
+            -e NCCL_SOCKET_IFNAME=$NODE1_IFNAME \
+            -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
+            -v ${{ runner.temp }}/wheel:/tmp/wheel:ro \
+            -w $GITHUB_WORKSPACE \
+            $IMAGE sleep infinity
+          $CT exec $CONTAINER \
+            git config --global --add safe.directory $GITHUB_WORKSPACE
+
+      - name: Start container on node2
+        run: |
+          ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "
+            $CT rm -f $CONTAINER 2>/dev/null || true
+            mkdir -p $GITHUB_WORKSPACE
+          "
+          rsync -az --exclude='.git' \
+            -e "ssh $SSH_OPTS -p $NODE2_PORT" \
+            $GITHUB_WORKSPACE/ \
+            $(whoami)@$NODE2_HOST:$GITHUB_WORKSPACE/
+          rsync -az \
+            -e "ssh $SSH_OPTS -p $NODE2_PORT" \
+            ${{ runner.temp }}/wheel/ \
+            $(whoami)@$NODE2_HOST:${{ runner.temp }}/wheel/
+          ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "
+            cd $GITHUB_WORKSPACE &&
+            $CT build --network=host --build-arg BASE_IMAGE=${{ matrix.base_image }} -t $IMAGE -f docker/Dockerfile.dev . &&
+            CONTAINER_RUNTIME=$CT ./docker/ci_run.sh --name $CONTAINER \
+              -e MORI_RDMA_DEVICES=$MORI_RDMA_DEVICES \
+              -e MORI_RDMA_SL=$MORI_RDMA_SL \
+              -e MORI_RDMA_TC=$MORI_RDMA_TC \
+              -e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME \
+              -e GLOO_SOCKET_IFNAME=$NODE2_IFNAME \
+              -e NCCL_SOCKET_IFNAME=$NODE2_IFNAME \
+              -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
+              -v ${{ runner.temp }}/wheel:/tmp/wheel:ro \
+              -w $GITHUB_WORKSPACE \
+              $IMAGE sleep infinity &&
+            $CT exec $CONTAINER \
+              git config --global --add safe.directory $GITHUB_WORKSPACE
+          "
+
+      - name: Install wheel (node1)
+        run: |
+          $CT exec $CONTAINER bash -c "
+            pip install /tmp/wheel/*.whl && pip install prettytable
+          "
+
+      - name: Install wheel (node2)
+        run: |
+          ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST \
+            "$CT exec $CONTAINER bash -c 'pip install /tmp/wheel/*.whl && pip install prettytable'"
+
+      - name: Run internode tests
+        uses: ./.github/actions/run-internode-tests
+        with:
+          container: ${{ env.CONTAINER }}
+          ct: ${{ env.CT }}
+          workspace: ${{ github.workspace }}
+          node1_host: ${{ env.NODE1_HOST }}
+          node2_host: ${{ env.NODE2_HOST }}
+          node2_port: ${{ env.NODE2_PORT }}
+          node1_ifname: ${{ env.NODE1_IFNAME }}
+          node2_ifname: ${{ env.NODE2_IFNAME }}
+          ssh_opts: ${{ env.SSH_OPTS }}
+
+      - name: Cleanup node1
+        if: always()
+        run: |
+          $CT rm -f $CONTAINER || true
+          if $CT image inspect $IMAGE &>/dev/null; then
+            $CT run --rm \
+                -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
+                -v ${{ runner.temp }}:/runner_temp \
+                $IMAGE bash -c "
+                  chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null
+                  rm -rf /runner_temp/wheel
+                " || true
+          fi
+
+      - name: Cleanup node2
+        if: always()
+        run: |
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -p $NODE2_PORT $(whoami)@$NODE2_HOST \
+            "$CT rm -f $CONTAINER || true"
+
   deploy-nightly:
     name: deploy to gh-pages
-    needs: test-wheel
+    needs: [test-wheel, test-wheel-internode]
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:

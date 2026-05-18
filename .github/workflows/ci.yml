@@ -116,58 +116,12 @@ jobs:
           $CT exec $CONTAINER bash -c \
             "cd $GITHUB_WORKSPACE && BUILD_BENCHMARK=ON BUILD_EXAMPLES=ON pip install . && pip install prettytable"
 
-      - name: MORI-EP (intranode)
-        run: |
-          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
-            cd $GITHUB_WORKSPACE && timeout 300 pytest tests/python/ops/test_dispatch_combine_intranode.py -v
-          "
-
-      - name: MORI-EP (internode_v1)
-        run: |
-          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
-            cd $GITHUB_WORKSPACE && timeout 300 pytest tests/python/ops/test_dispatch_combine_internode_v1.py -v
-          "
-
-      - name: MORI-EP (async_ll SDMA)
-        run: |
-          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
-            cd $GITHUB_WORKSPACE && MORI_ENABLE_SDMA=1 timeout 300 pytest tests/python/ops/test_dispatch_combine_async_ll.py -v
-          "
-
-      - name: MORI-EP (async_ll IBGDA)
-        run: |
-          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
-            cd $GITHUB_WORKSPACE && MORI_DISABLE_P2P=1 MORI_ENABLE_SDMA=0 timeout 300 pytest tests/python/ops/test_dispatch_combine_async_ll.py -v
-          "
-
-      - name: MORI-EP bench
-        run: |
-          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
-            cd $GITHUB_WORKSPACE
-            timeout 120 python3 tests/python/ops/bench_dispatch_combine.py
-            timeout 120 python3 tests/python/ops/bench_dispatch_combine.py \
-              --cmd bench --dtype bf16 --quant-type fp8_blockwise \
-              --zero-copy 0 --max-tokens 128 \
-              --force-scale-active 1 --report-scale-stats 1
-          "
-
-      - name: MORI-IO
-        run: |
-          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
-            cd $GITHUB_WORKSPACE
-            timeout 60 pytest tests/python/io/ -v
-            MORI_IO_XGMI_SCATTER_GATHER_THRESHOLD=4 \
-              timeout 120 pytest tests/python/io/test_discrete_buffer.py -v -k 'not performance'
-          "
-
-      - name: MORI-IR
-        run: |
-          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE -e HOME=/tmp $CONTAINER bash -c "
-            cd $GITHUB_WORKSPACE
-            timeout 60 torchrun --nproc_per_node=2 examples/shmem/ir/test_triton_shmem.py
-            timeout 60 torchrun --nproc_per_node=8 examples/shmem/ir/test_triton_allreduce.py
-            MORI_DISABLE_P2P=ON timeout 60 torchrun --nproc_per_node=8 examples/shmem/ir/test_triton_allreduce.py
-          "
+      - name: Run Python intranode tests
+        uses: ./.github/actions/run-intranode-tests
+        with:
+          container: ${{ env.CONTAINER }}
+          ct: ${{ env.CT }}
+          workspace: ${{ github.workspace }}
 
       - name: MORI-CPP shmem_benchmark (P2P)
         run: |
@@ -442,133 +396,18 @@ jobs:
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST \
             "$CT exec $CONTAINER bash -c 'cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install . && pip install prettytable'"
 
-      - name: MORI-IO internode write sweep
-        run: |
-          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_io_benchmark.sh"
-          PORT=29120
-          echo "=== MORI-IO internode benchmark: wide-write-sweep port=$PORT ==="
-          NODE2_CMD=(
-            $CT exec $CONTAINER bash $SCRIPT
-            --rank 1 --master-addr $NODE1_HOST --master-port $PORT
-            --ifname $NODE2_IFNAME
-            -- --op-type write --transfer-batch-size 128 --all
-            --sweep-start-size 1024 --sweep-max-size 16777216 --iters 4
-            --enable-sess --enable-batch-transfer
-            --num-qp-per-transfer 2 --num-worker-threads 2
-            --num-initiator-dev 8 --num-target-dev 8
-          )
-          ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
-          $CT exec $CONTAINER bash $SCRIPT \
-            --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
-            --ifname $NODE1_IFNAME \
-            -- --op-type write --transfer-batch-size 128 --all \
-            --sweep-start-size 1024 --sweep-max-size 16777216 --iters 4 \
-            --enable-sess --enable-batch-transfer \
-            --num-qp-per-transfer 2 --num-worker-threads 2 \
-            --num-initiator-dev 8 --num-target-dev 8
-          wait
-
-      - name: MORI-IO internode read
-        run: |
-          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_io_benchmark.sh"
-          PORT=29121
-          echo "=== MORI-IO internode benchmark: batch-session-read port=$PORT ==="
-          NODE2_CMD=(
-            $CT exec $CONTAINER bash $SCRIPT
-            --rank 1 --master-addr $NODE1_HOST --master-port $PORT
-            --ifname $NODE2_IFNAME
-            -- --op-type read --buffer-size 4096 --transfer-batch-size 128 --iters 8
-            --enable-batch-transfer --enable-sess --poll_cq_mode event
-            --num-qp-per-transfer 2 --num-worker-threads 2
-            --num-initiator-dev 8 --num-target-dev 8
-          )
-          ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
-          $CT exec $CONTAINER bash $SCRIPT \
-            --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
-            --ifname $NODE1_IFNAME \
-            -- --op-type read --buffer-size 4096 --transfer-batch-size 128 --iters 8 \
-            --enable-batch-transfer --enable-sess --poll_cq_mode event \
-            --num-qp-per-transfer 2 --num-worker-threads 2 \
-            --num-initiator-dev 8 --num-target-dev 8
-          wait
-
-      - name: MORI-EP internode normal kernel bench
-        run: |
-          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
-          PORT=29140
-          for KERNEL in v1 v1_ll; do
-            for TOKENS in 64 128 1024 2048 4096; do
-              echo "=== bench kernel=$KERNEL max-tokens=$TOKENS port=$PORT ==="
-              NODE2_CMD=(
-                $CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT
-                --rank 1 --master-addr $NODE1_HOST --master-port $PORT
-                --ifname $NODE2_IFNAME
-                --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS
-              )
-              ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
-              $CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT \
-                --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
-                --ifname $NODE1_IFNAME \
-                --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS
-              wait
-              sleep 1
-              PORT=$((PORT + 1))
-            done
-          done
-
-      - name: MORI-EP internode normal kernel stress
-        run: |
-          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
-          PORT=29160
-          for KERNEL in v1 v1_ll; do
-            for TOKENS in 64 128 1024 2048 4096; do
-              echo "=== stress kernel=$KERNEL max-tokens=$TOKENS port=$PORT ==="
-              NODE2_CMD=(
-                $CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT
-                --rank 1 --master-addr $NODE1_HOST --master-port $PORT
-                --ifname $NODE2_IFNAME
-                --cmd stress --kernel-type $KERNEL --max-tokens $TOKENS
-              )
-              ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
-              $CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT \
-                --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
-                --ifname $NODE1_IFNAME \
-                --cmd stress --kernel-type $KERNEL --max-tokens $TOKENS
-              wait
-              sleep 1
-              PORT=$((PORT + 1))
-            done
-          done
-
-      - name: MORI-EP internode async kernel test
-        run: |
-          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
-          PORT=29180
-          for TOKENS in 64 128; do
-            echo "=== async_ll test max-tokens=$TOKENS port=$PORT ==="
-            NODE2_CMD=(
-              $CT exec
-              -e GPU_PER_NODE=8 -e MORI_ENABLE_SDMA=1 -e MORI_INTERNODE_TIMEOUT=600
-              $CONTAINER bash $SCRIPT
-              --rank 1 --master-addr $NODE1_HOST --master-port $PORT
-              --ifname $NODE2_IFNAME
-              --cmd test --kernel-type async_ll
-              --quant-type none --dtype bf16 --max-tokens $TOKENS
-            )
-            ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
-            $CT exec \
-              -e GPU_PER_NODE=8 \
-              -e MORI_ENABLE_SDMA=1 \
-              -e MORI_INTERNODE_TIMEOUT=600 \
-              $CONTAINER bash $SCRIPT \
-              --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
-              --ifname $NODE1_IFNAME \
-              --cmd test --kernel-type async_ll \
-              --quant-type none --dtype bf16 --max-tokens $TOKENS
-            wait
-            sleep 1
-            PORT=$((PORT + 1))
-          done
+      - name: Run internode tests
+        uses: ./.github/actions/run-internode-tests
+        with:
+          container: ${{ env.CONTAINER }}
+          ct: ${{ env.CT }}
+          workspace: ${{ github.workspace }}
+          node1_host: ${{ env.NODE1_HOST }}
+          node2_host: ${{ env.NODE2_HOST }}
+          node2_port: ${{ env.NODE2_PORT }}
+          node1_ifname: ${{ env.NODE1_IFNAME }}
+          node2_ifname: ${{ env.NODE2_IFNAME }}
+          ssh_opts: ${{ env.SSH_OPTS }}
 
       - name: Cleanup node1
         if: always()
