@@ -172,11 +172,10 @@ jobs:
             for f in $(ls -r "$d"/amd_mori-*.whl 2>/dev/null); do
               BASENAME=$(basename "$f")
               SIZE=$(du -h "$f" | cut -f1)
-              VER=$(echo "$BASENAME" | sed 's/amd_mori-\(.*\)-cp.*/\1/')
+              VER=$(echo "$BASENAME" | sed 's/amd_mori-\(.*\)-cp[0-9]*-cp.*/\1/')
               COMMIT=$(echo "$VER" | sed -n 's/.*+\(.*\)/\1/p')
-              BASE_VER=$(echo "$VER" | sed 's/\.dev.*//')
-              PYTAG=$(echo "$BASENAME" | sed 's/.*-\(cp[0-9]*\)-cp.*/\1/')
-              echo "<tr><td><code>${COMMIT}</code></td><td>${BASE_VER}</td><td>${PYTAG}</td><td><a href=\"${d}/${BASENAME}\">${BASENAME}</a></td><td>${SIZE}</td></tr>" >> index.html
+              PYTAG=$(echo "$BASENAME" | sed 's/.*-\(cp[0-9]*\)-cp[0-9]*-.*/\1/')
+              echo "<tr><td><code>${COMMIT}</code></td><td>${VER}</td><td>${PYTAG}</td><td><a href=\"${d}/${BASENAME}\">${BASENAME}</a></td><td>${SIZE}</td></tr>" >> index.html
             done
             echo "</table>" >> index.html
           done
