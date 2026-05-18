@@ -43,9 +43,10 @@ jobs:
 
       - name: Build wheel
         run: |
+          BASE_VER=$(git describe --tags --abbrev=0 | sed 's/^v//')
           DATE=$(date +%Y%m%d)
           SHA=$(git rev-parse --short HEAD)
-          VERSION="${DATE}+${SHA}"
+          VERSION="${BASE_VER}.dev${DATE}+${SHA}"
 
           $CT run --rm --network=host \
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE -w $GITHUB_WORKSPACE \
@@ -79,7 +80,7 @@ jobs:
               " || true
 
   test-wheel:
-    name: test (${{ matrix.platform }}, py${{ matrix.python }})
+    name: intranode test (${{ matrix.platform }}, py${{ matrix.python }})
     needs: build-wheel
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -610,7 +611,7 @@ jobs:
           cd gh-pages/nightly
           for f in amd_mori-*.whl; do
             [ -f "$f" ] || continue
-            FILE_DATE=$(echo "$f" | sed -n 's/amd_mori-\([0-9]\{8\}\).*/\1/p')
+            FILE_DATE=$(echo "$f" | sed -n 's/.*\.dev\([0-9]\{8\}\).*/\1/p')
             if [ -n "$FILE_DATE" ] && [ "$FILE_DATE" -lt "$CUTOFF" ] 2>/dev/null; then
               echo "Pruning old wheel: $f"
               rm "$f"
@@ -644,17 +645,18 @@ jobs:
           <code>pip install --find-links https://rocm.github.io/mori/nightly/ amd_mori</code>
           </div>
           <table>
-          <tr><th>Date</th><th>Commit</th><th>Python</th><th>Wheel</th><th>Size</th></tr>
+          <tr><th>Date</th><th>Commit</th><th>Version</th><th>Python</th><th>Wheel</th><th>Size</th></tr>
           HEADER
 
           for f in $(ls -r amd_mori-*.whl 2>/dev/null); do
             SIZE=$(du -h "$f" | cut -f1)
             VER=$(echo "$f" | sed 's/amd_mori-\(.*\)-cp.*/\1/')
-            FILE_DATE=$(echo "$VER" | cut -d'+' -f1)
-            COMMIT=$(echo "$VER" | cut -d'+' -f2)
+            FILE_DATE=$(echo "$VER" | sed -n 's/.*\.dev\([0-9]\{8\}\).*/\1/p')
+            COMMIT=$(echo "$VER" | sed -n 's/.*+\(.*\)/\1/p')
+            BASE_VER=$(echo "$VER" | sed 's/\.dev.*//')
             PRETTY_DATE="${FILE_DATE:0:4}-${FILE_DATE:4:2}-${FILE_DATE:6:2}"
             PYTAG=$(echo "$f" | sed 's/.*-\(cp[0-9]*\)-cp.*/\1/')
-            echo "<tr><td>${PRETTY_DATE}</td><td><code>${COMMIT}</code></td><td>${PYTAG}</td><td><a href=\"${f}\">${f}</a></td><td>${SIZE}</td></tr>" >> index.html
+            echo "<tr><td>${PRETTY_DATE}</td><td><code>${COMMIT}</code></td><td>${BASE_VER}</td><td>${PYTAG}</td><td><a href=\"${f}\">${f}</a></td><td>${SIZE}</td></tr>" >> index.html
           done
 
           cat >> index.html << 'FOOTER'
