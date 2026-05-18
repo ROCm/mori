@@ -95,20 +95,24 @@ jobs:
     outputs:
       date: ${{ steps.set-date.outputs.date }}
       wheel_url: ${{ steps.set-date.outputs.wheel_url }}
+      version: ${{ steps.set-date.outputs.version }}
     steps:
-      - name: Set date
-        id: set-date
-        run: |
-          DATE=$(date +%Y-%m-%d)
-          echo "date=$DATE" >> $GITHUB_OUTPUT
-          echo "wheel_url=https://rocm.github.io/mori/nightly/$DATE/" >> $GITHUB_OUTPUT
-
       - name: Download all wheels
         uses: actions/download-artifact@v4
         with:
           pattern: wheel-*
           merge-multiple: true
           path: ./wheels
+
+      - name: Set date and version
+        id: set-date
+        run: |
+          DATE=$(date +%Y-%m-%d)
+          VERSION=$(ls ./wheels/*.whl | head -1 | sed 's/.*amd_mori-\(.*\)-cp[0-9]*-cp.*/\1/')
+          echo "date=$DATE" >> $GITHUB_OUTPUT
+          echo "wheel_url=https://rocm.github.io/mori/nightly/$DATE/" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Detected version: $VERSION"
 
       - name: List wheels
         run: ls -lh ./wheels/
@@ -171,6 +175,16 @@ jobs:
           <code>pip install --no-index --find-links https://rocm.github.io/mori/nightly/latest/ amd_mori</code>
           </div>
           HEADER
+
+          if [ -d "latest" ] && ls latest/amd_mori-*.whl &>/dev/null; then
+            LATEST_WHL=$(ls latest/amd_mori-*.whl | head -1 | xargs basename)
+            LATEST_VER=$(echo "$LATEST_WHL" | sed 's/amd_mori-\(.*\)-cp[0-9]*-cp.*/\1/')
+            LATEST_COMMIT=$(echo "$LATEST_VER" | sed -n 's/.*+\(.*\)/\1/p')
+            echo "<p><strong>Latest tested version:</strong> <code>$LATEST_VER</code> (commit <code>$LATEST_COMMIT</code>) — <a href=\"latest/\">browse</a></p>" >> index.html
+          fi
+
+          echo "<hr>" >> index.html
+          echo "<h2>All builds</h2>" >> index.html
 
           for d in $(ls -rd 20??-??-?? 2>/dev/null); do
             [ -d "$d" ] || continue
@@ -244,6 +258,7 @@ jobs:
       MORI_RDMA_TC: ${{ matrix.rdma_tc }}
       MORI_SOCKET_IFNAME: ${{ matrix.socket_ifname }}
       WHEEL_URL: ${{ needs.deploy-staging.outputs.wheel_url }}
+      WHEEL_VERSION: ${{ needs.deploy-staging.outputs.version }}
     timeout-minutes: 45
     steps:
       - name: Checkout
@@ -272,12 +287,12 @@ jobs:
         run: |
           $CT exec $CONTAINER bash -c "
             for i in 1 2 3 4 5; do
-              pip install --no-index --find-links $WHEEL_URL amd_mori && break
+              pip install --no-index --find-links $WHEEL_URL amd_mori==$WHEEL_VERSION && break
               echo \"Retry \$i: waiting for gh-pages to propagate...\"
               sleep 15
             done
             pip install prettytable pytest
-            python3 -c 'import mori; print(\"mori imported OK\")'
+            python3 -c 'import mori; print(\"mori imported OK, version=\" + mori.__version__)'
           "
 
       - name: MORI-EP (intranode)
@@ -438,6 +453,7 @@ jobs:
       MORI_RDMA_TC: ${{ matrix.rdma_tc }}
       MORI_SOCKET_IFNAME: ${{ matrix.node1_ifname }}
       WHEEL_URL: ${{ needs.deploy-staging.outputs.wheel_url }}
+      WHEEL_VERSION: ${{ needs.deploy-staging.outputs.version }}
     timeout-minutes: 45
     steps:
       - name: Checkout
@@ -495,7 +511,7 @@ jobs:
         run: |
           $CT exec $CONTAINER bash -c "
             for i in 1 2 3 4 5; do
-              pip install --no-index --find-links $WHEEL_URL amd_mori && break
+              pip install --no-index --find-links $WHEEL_URL amd_mori==$WHEEL_VERSION && break
               echo \"Retry \$i: waiting for gh-pages to propagate...\"
               sleep 15
             done
@@ -507,7 +523,7 @@ jobs:
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST \
             "$CT exec $CONTAINER bash -c '
               for i in 1 2 3 4 5; do
-              pip install --no-index --find-links $WHEEL_URL amd_mori && break
+              pip install --no-index --find-links $WHEEL_URL amd_mori==$WHEEL_VERSION && break
               echo \"Retry \$i: waiting for gh-pages...\"
                 sleep 15
               done
