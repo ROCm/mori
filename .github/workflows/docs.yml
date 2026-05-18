@@ -69,4 +69,5 @@ jobs:
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./html
+          keep_files: true
           commit_message: 'docs: deploy documentation'
