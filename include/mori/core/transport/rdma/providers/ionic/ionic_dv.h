@@ -178,6 +178,16 @@ int ionic_dv_pd_set_sqcmb(struct ibv_pd* ibpd, bool enable, bool expdb, bool req
 int ionic_dv_pd_set_rqcmb(struct ibv_pd* ibpd, bool enable, bool expdb, bool require);
 
 /**
+ * ionic_dv_pd_set_expdb_mask - Specify expdb mask.
+ *
+ * Queues associated with this pd will attempt to have expdb on for WQE sizes
+ * other than default (and supported by the NIC).
+ *
+ * @mask - IONIC_EPXDB_* bitmap
+ */
+int ionic_dv_pd_set_expdb_mask(struct ibv_pd* ibpd, uint8_t mask);
+
+/**
  * ionic_dv_qp_set_gda - Enable or disable GPU-Direct Async (GDA) mode.
  *
  * In GDA mode, when the application calls ibv_post_send() or ibv_post_recv(), the
@@ -240,6 +250,31 @@ int ionic_dv_qp_get_send_dbell_data(struct ibv_qp* ibqp, uint64_t* dbdata);
  * @dbdata - Output parameter for doorbell data.
  */
 int ionic_dv_qp_get_recv_dbell_data(struct ibv_qp* ibqp, uint64_t* dbdata);
+
+enum ionic_cq_init_attr_mask {
+  IONIC_CQ_INIT_ATTR_MASK_FLAGS = 1 << 0,
+};
+
+enum ionic_cq_init_attr_flags {
+  IONIC_CQ_INIT_ATTR_CCQE = 1 << 0,
+};
+
+struct ionic_cq_init_attr_ex {
+  /* One or more flags of enum ionic_cq_init_attr_mask */
+  uint32_t comp_mask;
+  /* One or more flags of enum ionic_cq_init_attr_flags */
+  uint32_t flags;
+};
+
+/**
+ * ionic_dv_create_cq_ex - Create an IBV CQ with vendor-specific attributes.
+ *
+ * @ibctx - Context CQ will be attached to.
+ * @ex - IBV attributes to create the CQ with.
+ * @ionic_ex - Vendor-specific attributes to create the CQ with.
+ */
+struct ibv_cq_ex* ionic_dv_create_cq_ex(struct ibv_context* ibctx, struct ibv_cq_init_attr_ex* ex,
+                                        struct ionic_cq_init_attr_ex* ionic_ex);
 
 /**
  * ionic_dv_get_ctx - Extract context information for gpu-initiated rdma.
