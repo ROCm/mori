@@ -31,7 +31,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Clean stale dist
-        run: rm -rf ${{ runner.temp }}/dist
+        run: |
+          $CT run --rm -v ${{ runner.temp }}:/runner_temp $BASE_IMAGE \
+            rm -rf /runner_temp/dist || true
 
       - name: Build CI image
         run: $CT build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE -t $IMAGE -f docker/Dockerfile.dev .
@@ -77,8 +79,13 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE $IMAGE \
-              chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
+          $CT run --rm \
+              -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
+              -v ${{ runner.temp }}:/runner_temp \
+              $IMAGE bash -c "
+                chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null
+                rm -rf /runner_temp/dist
+              " || true
 
   test-wheel:
     name: test (py${{ matrix.python }})
@@ -104,7 +111,9 @@ jobs:
           submodules: true
 
       - name: Clean stale wheels
-        run: rm -rf ${{ runner.temp }}/wheel
+        run: |
+          $CT run --rm -v ${{ runner.temp }}:/runner_temp $BASE_IMAGE \
+            rm -rf /runner_temp/wheel || true
 
       - name: Download wheel
         uses: actions/download-artifact@v4
@@ -218,8 +227,13 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE $IMAGE \
-              chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
+          $CT run --rm \
+              -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
+              -v ${{ runner.temp }}:/runner_temp \
+              $IMAGE bash -c "
+                chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null
+                rm -rf /runner_temp/wheel
+              " || true
           $CT rm -f $CONTAINER || true
 
   deploy-nightly:
