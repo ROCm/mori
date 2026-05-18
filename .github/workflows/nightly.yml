@@ -79,23 +79,52 @@ jobs:
               " || true
 
   test-wheel:
-    name: test (py${{ matrix.python }})
+    name: test (${{ matrix.platform }}, py${{ matrix.python }})
     needs: build-wheel
-    runs-on: [self-hosted, MI355X-AINIC-TW]
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - python: "3.10"
+          - platform: MI355X_AINIC
+            python: "3.10"
+            runner: [self-hosted, MI355X-AINIC-TW]
             base_image: rocm/pytorch:rocm7.2.1_ubuntu22.04_py3.10_pytorch_release_2.8.0
             artifact: wheel-cp3.10
-          - python: "3.12"
+            rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
+            rdma_sl: 3
+            rdma_tc: 104
+          - platform: MI355X_AINIC
+            python: "3.12"
+            runner: [self-hosted, MI355X-AINIC-TW]
             base_image: rocm/pytorch:rocm7.2.1_ubuntu24.04_py3.12_pytorch_release_2.8.0
             artifact: wheel-cp3.12
+            rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
+            rdma_sl: 3
+            rdma_tc: 104
+          - platform: MI300X_BNXT
+            python: "3.10"
+            runner: [self-hosted, MI300X-BNXT]
+            base_image: rocm/pytorch:rocm7.2.1_ubuntu22.04_py3.10_pytorch_release_2.8.0
+            artifact: wheel-cp3.10
+            rdma_devices: bnxt_re0,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re7,bnxt_re8,bnxt_re9
+            rdma_sl: 3
+            rdma_tc: 104
+            socket_ifname: enp159s0np0
+          - platform: MI300X_BNXT
+            python: "3.12"
+            runner: [self-hosted, MI300X-BNXT]
+            base_image: rocm/pytorch:rocm7.2.1_ubuntu24.04_py3.12_pytorch_release_2.8.0
+            artifact: wheel-cp3.12
+            rdma_devices: bnxt_re0,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re7,bnxt_re8,bnxt_re9
+            rdma_sl: 3
+            rdma_tc: 104
+            socket_ifname: enp159s0np0
     env:
-      MORI_RDMA_DEVICES: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
-      MORI_RDMA_SL: 3
-      MORI_RDMA_TC: 104
+      MORI_RDMA_DEVICES: ${{ matrix.rdma_devices }}
+      MORI_RDMA_SL: ${{ matrix.rdma_sl }}
+      MORI_RDMA_TC: ${{ matrix.rdma_tc }}
+      MORI_SOCKET_IFNAME: ${{ matrix.socket_ifname }}
     timeout-minutes: 45
     steps:
       - name: Checkout
@@ -124,6 +153,7 @@ jobs:
             -e MORI_RDMA_DEVICES=$MORI_RDMA_DEVICES \
             -e MORI_RDMA_SL=$MORI_RDMA_SL \
             -e MORI_RDMA_TC=$MORI_RDMA_TC \
+            ${MORI_SOCKET_IFNAME:+-e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME} \
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
             -v ${{ runner.temp }}/wheel:/tmp/wheel:ro \
             -w $GITHUB_WORKSPACE \
