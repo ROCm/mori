@@ -292,7 +292,7 @@ jobs:
               sleep 15
             done
             pip install prettytable pytest
-            python3 -c 'import mori; print(\"mori imported OK, version=\" + mori.__version__)'
+            python3 -c 'import mori; print(\"mori imported OK\")'
           "
 
       - name: MORI-EP (intranode)
