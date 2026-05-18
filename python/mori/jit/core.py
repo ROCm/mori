@@ -184,11 +184,10 @@ def _parse_ionic_fw_minor(fw_ver: str) -> int | None:
     Extracts the numeric part from the suffix after '-', e.g. 'a58' → 58, 'a119' → 119.
     Returns None if the string cannot be parsed.
     """
-    m = re.search(r"-[a-zA-Z]+(\d+)$", fw_ver.strip())
-    if m:
-        return int(m.group(1))
+    if fw_ver:
+        return int(fw_ver.split('a')[-1].lstrip('-'))
+    
     return None
-
 
 _CCQE_MIN_FW_MINOR = 58
 
@@ -231,7 +230,7 @@ def _is_all_ionic_support_ccqe() -> bool:
         return False
     if len(set(versions)) != 1:
         return False
-
+    
     for ver in versions:
         if not _is_firmware_support_ccqe(ver):
             return False
@@ -246,8 +245,10 @@ def is_ccqe_enabled() -> bool:
     """Return True if CCQE should be enabled (cached after first call)."""
     global _ccqe_enabled
     if _ccqe_enabled is None:
-        _ccqe_enabled = _lib_has_ionic_ccqe() and _is_all_ionic_support_ccqe()
-        print(f"Ionic _ccqe_enabled: {_ccqe_enabled}")
+        lib_support = _lib_has_ionic_ccqe()
+        nic_support = _is_all_ionic_support_ccqe()
+        _ccqe_enabled = lib_support and nic_support
+        print(f"Ionic _ccqe_enabled: {_ccqe_enabled} lib_support {lib_support} nic_support: {nic_support}")
 
     return _ccqe_enabled
 
