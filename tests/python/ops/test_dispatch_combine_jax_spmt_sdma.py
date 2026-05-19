@@ -395,7 +395,9 @@ def test_jax_ep_spmt_sdma(world_size):
     if result.returncode != 0:
         out = (result.stdout or "")[-2000:]
         err = "\n".join(
-            l for l in (result.stderr or "").splitlines() if "libibverbs" not in l
+            line
+            for line in (result.stderr or "").splitlines()
+            if "libibverbs" not in line
         )[-2000:]
         print(out)
         print(err)
