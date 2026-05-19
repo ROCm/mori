@@ -114,16 +114,20 @@ class PeerDramAllocator {
     uint64_t bytes_freed = 0;  // 0 if key was unknown / already freed / read-leased
   };
 
-  // Allocate() outcome.  Only kAllocated populates slot.
+  // Allocate() outcome. Only kSuccessAllocated populates slot.
+  // kFailedNoSpace is split out so the writer can keep retrying on
+  // other peers; every other failure collapses into kFailed and is
+  // diagnosed via the WARN log emitted inside Allocate().
   enum class Outcome {
-    kFailed,  // ENOSPC / bad tier / size==0 / clear-pending
-    kAllocated,
-    kAlreadyExists,  // owned_[key] dedup hit; caller treats as no-op success
+    kSuccessAllocated,
+    kSuccessAlreadyExists,  // owned_[key] dedup hit
+    kFailed,                // generic — see allocator log for reason
+    kFailedNoSpace,         // tier exhausted; retry on another peer
   };
 
   struct AllocateResult {
     Outcome outcome = Outcome::kFailed;
-    std::optional<PendingSlot> slot;  // populated iff outcome == kAllocated
+    std::optional<PendingSlot> slot;  // populated iff outcome == kSuccessAllocated
   };
 
   // Reserve `size` bytes on `tier` for `key`.  `key` enables owned_

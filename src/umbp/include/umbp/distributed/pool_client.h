@@ -44,6 +44,25 @@ namespace mori::umbp {
 class PeerDramAllocator;
 class PeerServiceServer;
 
+// Short name for log output. Generic FAILED maps to "FAILED" — the
+// detailed reason for that case lives in the peer's allocator log.
+inline const char* OutcomeName(::umbp::AllocateSlotOutcome o) {
+  switch (o) {
+    case ::umbp::ALLOCATE_SLOT_OUTCOME_UNSPECIFIED:
+      return "UNSPECIFIED";
+    case ::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALLOCATED:
+      return "SUCCESS_ALLOCATED";
+    case ::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALREADY_EXISTS:
+      return "SUCCESS_ALREADY_EXISTS";
+    case ::umbp::ALLOCATE_SLOT_OUTCOME_FAILED:
+      return "FAILED";
+    case ::umbp::ALLOCATE_SLOT_OUTCOME_FAILED_NO_SPACE:
+      return "NO_SPACE";
+    default:
+      return "UNKNOWN";
+  }
+}
+
 // In the master-as-advisor design, PoolClient drives the Put/Get
 // pipeline: master gives a routing advisory, then the writer talks
 // directly to the peer (AllocateSlot → RDMA → CommitSlot or
@@ -121,7 +140,9 @@ class PoolClient {
   // BatchPut's return boundary (anything but kFailed is success).
   // `kAlreadyExists` (master- or peer-side dedup) is success-to-caller
   // but excluded from bandwidth metrics — no bytes on the wire.
-  // Mirrors PeerDramAllocator::Outcome / proto *_ALREADY_EXISTS.
+  // Aggregates all SUCCESS_* / FAILED_* variants of
+  // PeerDramAllocator::Outcome / proto AllocateSlotOutcome into 3 buckets;
+  // the specific failure reason is logged at the call site, not propagated.
   enum class PutEntryOutcome { kFailed, kSucceeded, kAlreadyExists };
 
  private:

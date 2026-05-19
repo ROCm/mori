@@ -463,12 +463,13 @@ PoolClient::PutAttemptOutcome PoolClient::ExecuteLocalPut(const std::string& key
   }
   auto alloc_res = peer_alloc_->Allocate(key, size, tier);
   switch (alloc_res.outcome) {
-    case PeerDramAllocator::Outcome::kAlreadyExists:
-      // Dedup: skip RDMA + Commit + bytes metric.
+    case PeerDramAllocator::Outcome::kSuccessAlreadyExists:
       return PutAttemptOutcome::kSuccessAlreadyExists;
     case PeerDramAllocator::Outcome::kFailed:
+    case PeerDramAllocator::Outcome::kFailedNoSpace:
+      // Peer allocator already logged the specific reason.
       return PutAttemptOutcome::kRetry;
-    case PeerDramAllocator::Outcome::kAllocated:
+    case PeerDramAllocator::Outcome::kSuccessAllocated:
       break;
   }
   const auto& pending = *alloc_res.slot;
@@ -708,12 +709,18 @@ void PoolClient::ProcessRemoteBatchPut(const std::vector<BatchPutItem>& items,
     for (const auto& item : items) (*results)[item.index] = PutEntryOutcome::kFailed;
   };
   if (!io_engine_) {
+    MORI_UMBP_ERROR("[PoolClient] ProcessRemoteBatchPut: io_engine_ not initialized (items={})",
+                    items.size());
     fail_all();
     return;
   }
   const auto& first = items.front();
   auto& peer = GetOrConnectPeer(first.route.node_id, first.route.peer_address);
   if (!EnsurePeerServiceConnection(peer)) {
+    MORI_UMBP_WARN(
+        "[PoolClient] ProcessRemoteBatchPut: peer service connection unavailable, node='{}' "
+        "addr='{}' items={}",
+        first.route.node_id, first.route.peer_address, items.size());
     fail_all();
     return;
   }
@@ -737,6 +744,10 @@ void PoolClient::ExecuteRemoteBatchPut(const std::vector<BatchPutItem>& items,
   std::vector<TransferInstruction> transfers;
   uint64_t staging_bytes = 0;
   if (!BuildRemotePutTransfers(entries, peer, &transfers, &staging_bytes)) {
+    MORI_UMBP_WARN(
+        "[PoolClient] ExecuteRemoteBatchPut: BuildRemotePutTransfers failed, node='{}' "
+        "entries={} staging_bytes={} -> aborting all slots",
+        items.front().route.node_id, entries.size(), staging_bytes);
     for (auto& entry : entries) {
       abort_slots.push_back(entry.slot_id);
       (*results)[entry.result_index] = PutEntryOutcome::kFailed;
@@ -783,16 +794,28 @@ bool PoolClient::AllocateRemotePutEntries(const std::vector<BatchPutItem>& items
   for (size_t i = 0; i < items.size(); ++i) {
     const auto& item = items[i];
     const auto& resp_entry = alloc_resp.entries(static_cast<int>(i));
-    switch (resp_entry.outcome()) {
-      case ::umbp::ALLOCATE_SLOT_OUTCOME_ALREADY_EXISTS:
-        // Peer-side dedup: skip RDMA + Commit + Abort.
+    const auto outcome = resp_entry.outcome();
+
+    switch (outcome) {
+      case ::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALREADY_EXISTS:
         (*results)[item.index] = PutEntryOutcome::kAlreadyExists;
         continue;
       case ::umbp::ALLOCATE_SLOT_OUTCOME_FAILED:
-      default:
+      case ::umbp::ALLOCATE_SLOT_OUTCOME_FAILED_NO_SPACE:
+        // Peer allocator already logged the specific reason.
         (*results)[item.index] = PutEntryOutcome::kFailed;
         continue;
-      case ::umbp::ALLOCATE_SLOT_OUTCOME_ALLOCATED:
+      case ::umbp::ALLOCATE_SLOT_OUTCOME_UNSPECIFIED:
+      default:
+        // Unset / unknown — proto version skew or wire corruption.
+        // Must NOT fall through into slot processing below.
+        MORI_UMBP_ERROR(
+            "[PoolClient] BatchAllocateSlots: bad outcome={} ({}) for key='{}' on node='{}'",
+            static_cast<int>(outcome), OutcomeName(outcome),
+            item.key ? *item.key : std::string{"<null>"}, items.front().route.node_id);
+        (*results)[item.index] = PutEntryOutcome::kFailed;
+        continue;
+      case ::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALLOCATED:
         break;
     }
 
@@ -846,7 +869,15 @@ bool PoolClient::BuildRemotePutTransfers(std::vector<RemotePutEntry>& entries, P
       entry.use_staging = true;
       cursor = AlignUp(cursor, entry.plan.page_size);
       const uint64_t aligned_size = AlignUp(entry.item->size, entry.plan.page_size);
-      if (cursor + aligned_size > config_.staging_buffer_size) return false;
+      if (cursor + aligned_size > config_.staging_buffer_size) {
+        MORI_UMBP_WARN(
+            "[PoolClient] BuildRemotePutTransfers: staging buffer overflow at entry {}/{}, "
+            "key='{}' size={} aligned={} cursor={} cap={}",
+            idx, entries.size(),
+            (entry.item && entry.item->key) ? *entry.item->key : std::string{"<null>"},
+            entry.item ? entry.item->size : 0, aligned_size, cursor, config_.staging_buffer_size);
+        return false;
+      }
       entry.staging_offset = cursor;
       cursor += aligned_size;
     }
@@ -867,6 +898,11 @@ bool PoolClient::BuildRemotePutTransfers(std::vector<RemotePutEntry>& entries, P
       const auto& page = entry.plan.pages[p];
       if (page.buffer_index >= peer.dram_memories.size() ||
           !IsValidMemoryDesc(peer.dram_memories[page.buffer_index])) {
+        MORI_UMBP_ERROR(
+            "[PoolClient] BuildRemotePutTransfers: invalid peer dram_memories slot, "
+            "key='{}' buffer_index={} peer_dram_size={} page_index={}",
+            (entry.item && entry.item->key) ? *entry.item->key : std::string{"<null>"},
+            page.buffer_index, peer.dram_memories.size(), page.page_index);
         entry.failed = true;
         entry_transfers.clear();
         break;
@@ -901,6 +937,11 @@ void PoolClient::ExecuteRemotePutTransfers(std::vector<RemotePutEntry>& entries,
     if (entry.failed) continue;
     if (entry.use_staging) {
       if (entry.staging_offset + entry.item->size > config_.staging_buffer_size) {
+        MORI_UMBP_ERROR(
+            "[PoolClient] ExecuteRemotePutTransfers: staging offset overflow (should not happen), "
+            "key='{}' staging_offset={} size={} cap={}",
+            (entry.item && entry.item->key) ? *entry.item->key : std::string{"<null>"},
+            entry.staging_offset, entry.item ? entry.item->size : 0, config_.staging_buffer_size);
         entry.failed = true;
         continue;
       }
@@ -942,7 +983,15 @@ void PoolClient::ExecuteRemotePutTransfers(std::vector<RemotePutEntry>& entries,
   for (size_t i = 0; i < active_transfers.size(); ++i) {
     statuses[i].Wait();
     if (!statuses[i].Succeeded()) {
-      entries[active_transfers[i].entry_index].failed = true;
+      const auto& tr = active_transfers[i];
+      auto& entry = entries[tr.entry_index];
+      MORI_UMBP_ERROR(
+          "RemotePut BatchWrite failed: code={} msg='{}' peer_engine='{}' key='{}' "
+          "slot_id={} size={} local_off={} remote_off={} use_staging={}",
+          statuses[i].CodeUint32(), statuses[i].Message(), tr.remote_desc.engineKey,
+          (entry.item && entry.item->key) ? *entry.item->key : std::string{"<null>"}, entry.slot_id,
+          tr.size, tr.local_offset, tr.remote_offset, entry.use_staging);
+      entry.failed = true;
     }
   }
 
@@ -995,6 +1044,7 @@ void PoolClient::FinalizeRemotePutEntries(std::vector<RemotePutEntry>& entries,
                                      static_cast<double>(entry.item->size));
           (*results)[entry.result_index] = PutEntryOutcome::kSucceeded;
         } else {
+          // Peer allocator already logged the reason (SLOT_GONE / PRE_CLEAR).
           abort_slots.push_back(entry.slot_id);
           (*results)[entry.result_index] = PutEntryOutcome::kFailed;
           entry.failed = true;
@@ -1017,6 +1067,8 @@ void PoolClient::ProcessRemoteBatchGet(const std::vector<BatchGetItem>& items,
                                        std::vector<bool>* results) {
   if (items.empty()) return;
   if (!io_engine_) {
+    MORI_UMBP_ERROR("[PoolClient] ProcessRemoteBatchGet: io_engine_ not initialized (items={})",
+                    items.size());
     for (const auto& item : items) {
       (*results)[item.index] = false;
     }
@@ -1026,6 +1078,10 @@ void PoolClient::ProcessRemoteBatchGet(const std::vector<BatchGetItem>& items,
   const auto& first = items.front();
   auto& peer = GetOrConnectPeer(first.route.node_id, first.route.peer_address);
   if (!EnsurePeerServiceConnection(peer)) {
+    MORI_UMBP_WARN(
+        "[PoolClient] ProcessRemoteBatchGet: peer service connection unavailable, node='{}' "
+        "addr='{}' items={}",
+        first.route.node_id, first.route.peer_address, items.size());
     for (const auto& item : items) {
       (*results)[item.index] = false;
     }
@@ -1055,6 +1111,10 @@ void PoolClient::ExecuteRemoteBatchGet(const std::vector<BatchGetItem>& items,
   std::vector<TransferInstruction> transfers;
   uint64_t staging_bytes = 0;
   if (!BuildRemoteGetTransfers(entries, peer, &transfers, &staging_bytes)) {
+    MORI_UMBP_WARN(
+        "[PoolClient] ExecuteRemoteBatchGet: BuildRemoteGetTransfers failed, node='{}' "
+        "entries={} staging_bytes={}",
+        items.front().route.node_id, entries.size(), staging_bytes);
     for (auto& entry : entries) {
       (*results)[entry.result_index] = false;
     }
@@ -1136,7 +1196,15 @@ bool PoolClient::BuildRemoteGetTransfers(std::vector<RemoteGetEntry>& entries, P
       entry.use_staging = true;
       cursor = AlignUp(cursor, entry.plan.page_size);
       const uint64_t aligned_size = AlignUp(entry.item->size, entry.plan.page_size);
-      if (cursor + aligned_size > config_.staging_buffer_size) return false;
+      if (cursor + aligned_size > config_.staging_buffer_size) {
+        MORI_UMBP_WARN(
+            "[PoolClient] BuildRemoteGetTransfers: staging buffer overflow at entry {}/{}, "
+            "key='{}' size={} aligned={} cursor={} cap={}",
+            idx, entries.size(),
+            (entry.item && entry.item->key) ? *entry.item->key : std::string{"<null>"},
+            entry.item ? entry.item->size : 0, aligned_size, cursor, config_.staging_buffer_size);
+        return false;
+      }
       entry.staging_offset = cursor;
       cursor += aligned_size;
     }
@@ -1160,6 +1228,11 @@ bool PoolClient::BuildRemoteGetTransfers(std::vector<RemoteGetEntry>& entries, P
       const auto& page = entry.plan.pages[p];
       if (page.buffer_index >= peer.dram_memories.size() ||
           !IsValidMemoryDesc(peer.dram_memories[page.buffer_index])) {
+        MORI_UMBP_ERROR(
+            "[PoolClient] BuildRemoteGetTransfers: invalid peer dram_memories slot, "
+            "key='{}' buffer_index={} peer_dram_size={} page_index={}",
+            (entry.item && entry.item->key) ? *entry.item->key : std::string{"<null>"},
+            page.buffer_index, peer.dram_memories.size(), page.page_index);
         entry.failed = true;
         entry_transfers.clear();
         break;
@@ -1224,7 +1297,15 @@ void PoolClient::ExecuteRemoteGetTransfers(std::vector<RemoteGetEntry>& entries,
   for (size_t i = 0; i < active_transfers.size(); ++i) {
     statuses[i].Wait();
     if (!statuses[i].Succeeded()) {
-      entries[active_transfers[i].entry_index].failed = true;
+      const auto& tr = active_transfers[i];
+      auto& entry = entries[tr.entry_index];
+      MORI_UMBP_ERROR(
+          "RemoteGet BatchRead failed: code={} msg='{}' peer_engine='{}' key='{}' "
+          "size={} local_off={} remote_off={} use_staging={}",
+          statuses[i].CodeUint32(), statuses[i].Message(), tr.remote_desc.engineKey,
+          (entry.item && entry.item->key) ? *entry.item->key : std::string{"<null>"}, tr.size,
+          tr.local_offset, tr.remote_offset, entry.use_staging);
+      entry.failed = true;
     }
   }
 
@@ -1232,6 +1313,11 @@ void PoolClient::ExecuteRemoteGetTransfers(std::vector<RemoteGetEntry>& entries,
     for (auto& entry : entries) {
       if (entry.failed || !entry.use_staging) continue;
       if (entry.staging_offset + entry.item->size > config_.staging_buffer_size) {
+        MORI_UMBP_ERROR(
+            "[PoolClient] ExecuteRemoteGetTransfers: staging offset overflow (should not happen), "
+            "key='{}' staging_offset={} size={} cap={}",
+            (entry.item && entry.item->key) ? *entry.item->key : std::string{"<null>"},
+            entry.staging_offset, entry.item ? entry.item->size : 0, config_.staging_buffer_size);
         entry.failed = true;
         continue;
       }

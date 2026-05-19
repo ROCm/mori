@@ -104,7 +104,7 @@ TEST(PeerDramAllocator, AllocateRejectsAlreadyOwnedKey) {
   const auto cap_after_commit = a->TierCapacitiesSnapshot()[TierType::DRAM];
 
   auto second = a->Allocate("A", kPageSize, TierType::DRAM);
-  EXPECT_EQ(second.outcome, PeerDramAllocator::Outcome::kAlreadyExists);
+  EXPECT_EQ(second.outcome, PeerDramAllocator::Outcome::kSuccessAlreadyExists);
   EXPECT_FALSE(second.slot.has_value());
 
   // No pages reserved -> capacity unchanged.
@@ -121,7 +121,7 @@ TEST(PeerDramAllocator, AllocateAllowsDifferentKey) {
   ASSERT_TRUE(a->Commit(first->slot_id, "A", committed_bytes));
 
   auto second = a->Allocate("B", kPageSize, TierType::DRAM);
-  EXPECT_EQ(second.outcome, PeerDramAllocator::Outcome::kAllocated);
+  EXPECT_EQ(second.outcome, PeerDramAllocator::Outcome::kSuccessAllocated);
   ASSERT_TRUE(second.slot.has_value());
   EXPECT_TRUE(a->Commit(second.slot->slot_id, "B", committed_bytes));
 }
@@ -133,11 +133,11 @@ TEST(PeerDramAllocator, AllocateDoesNotRejectOnPendingDuplicate) {
   auto a = MakeAllocator();
 
   auto first = a->Allocate("A", kPageSize, TierType::DRAM);
-  EXPECT_EQ(first.outcome, PeerDramAllocator::Outcome::kAllocated);
+  EXPECT_EQ(first.outcome, PeerDramAllocator::Outcome::kSuccessAllocated);
   ASSERT_TRUE(first.slot.has_value());
 
   auto second = a->Allocate("A", kPageSize, TierType::DRAM);
-  EXPECT_EQ(second.outcome, PeerDramAllocator::Outcome::kAllocated);
+  EXPECT_EQ(second.outcome, PeerDramAllocator::Outcome::kSuccessAllocated);
   ASSERT_TRUE(second.slot.has_value());
   ASSERT_NE(second.slot->slot_id, first.slot->slot_id);
 }

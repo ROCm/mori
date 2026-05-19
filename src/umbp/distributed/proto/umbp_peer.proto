@@ -103,12 +103,17 @@ message AllocateSlotRequest {
   TierType tier = 2;
   string   key  = 3;  // owned_ dedup (master-index-lag fallback)
 }
-// AllocateSlot / BatchAllocateSlots per-entry outcome.  Only ALLOCATED
-// populates slot_id / pages / descs / pending_ttl_ms.
+// AllocateSlot / BatchAllocateSlots per-entry outcome.
+// FAILED_NO_SPACE is split out so the writer can keep retrying with
+// `exclude_nodes` — every other failure either is a transient/config
+// issue (where retrying makes no sense) or is fully diagnosed in the
+// peer's own log; client just sees the bucketed FAILED.
 enum AllocateSlotOutcome {
-  ALLOCATE_SLOT_OUTCOME_FAILED         = 0;  // ENOSPC / bad tier / clear-pending
-  ALLOCATE_SLOT_OUTCOME_ALLOCATED      = 1;
-  ALLOCATE_SLOT_OUTCOME_ALREADY_EXISTS = 2;  // owned_[key] dedup hit
+  ALLOCATE_SLOT_OUTCOME_UNSPECIFIED            = 0;  // wire default; should not appear in healthy traffic
+  ALLOCATE_SLOT_OUTCOME_SUCCESS_ALLOCATED      = 1;
+  ALLOCATE_SLOT_OUTCOME_SUCCESS_ALREADY_EXISTS = 2;  // owned_[key] dedup hit
+  ALLOCATE_SLOT_OUTCOME_FAILED                 = 3;  // generic — see peer log for reason
+  ALLOCATE_SLOT_OUTCOME_FAILED_NO_SPACE        = 4;  // tier exhausted; retry on another peer
 }
 
 message AllocateSlotResponse {

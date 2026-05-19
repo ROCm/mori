@@ -81,28 +81,40 @@ const PageBitmapAllocator* PeerDramAllocator::AllocatorForLocked(TierType tier) 
 
 PeerDramAllocator::AllocateResult PeerDramAllocator::Allocate(const std::string& key, uint64_t size,
                                                               TierType tier) {
-  AllocateResult out;  // defaults to kFailed
+  auto fail = [&](Outcome outcome, const char* reason) {
+    MORI_UMBP_WARN("[PeerDramAllocator] Allocate reason={} key='{}' size={} tier={}", reason, key,
+                   size, static_cast<int>(tier));
+    AllocateResult r;
+    r.outcome = outcome;
+    return r;
+  };
+
   const uint32_t num_pages = SizeToPages(size, page_size_);
-  if (num_pages == 0) return out;
+  if (num_pages == 0) return fail(Outcome::kFailed, "ZERO_SIZE");
 
   // Block new allocations between ClearLocal() and full-sync ack — any
   // owned key created here would miss the empty snapshot to master.
-  if (clear_full_sync_pending_.load(std::memory_order_acquire)) return out;
+  if (clear_full_sync_pending_.load(std::memory_order_acquire)) {
+    return fail(Outcome::kFailed, "CLEAR_PENDING");
+  }
 
   std::lock_guard<std::mutex> lock(mutex_);
 
   // owned_ dedup (master-index-lag fallback).  pending_ deliberately
   // not checked — same-key pending race is absorbed by Commit().
   if (owned_.find(key) != owned_.end()) {
-    out.outcome = Outcome::kAlreadyExists;
+    AllocateResult out;
+    out.outcome = Outcome::kSuccessAlreadyExists;
     return out;
   }
 
   PageBitmapAllocator* alloc = AllocatorForLocked(tier);
-  if (alloc == nullptr) return out;
+  if (alloc == nullptr) return fail(Outcome::kFailed, "BAD_TIER");
 
   auto result = alloc->Allocate(num_pages);
-  if (!result) return out;
+  if (!result) return fail(Outcome::kFailedNoSpace, "NO_SPACE");
+
+  AllocateResult out;
 
   PendingSlot slot;
   slot.slot_id = next_slot_id_.fetch_add(1, std::memory_order_relaxed);
@@ -112,7 +124,7 @@ PeerDramAllocator::AllocateResult PeerDramAllocator::Allocate(const std::string&
   slot.deadline = std::chrono::steady_clock::now() + pending_ttl_;
   slot.generation = allocator_generation_;
   pending_[slot.slot_id] = slot;
-  out.outcome = Outcome::kAllocated;
+  out.outcome = Outcome::kSuccessAllocated;
   out.slot = std::move(slot);
   return out;
 }
@@ -122,10 +134,14 @@ bool PeerDramAllocator::Commit(uint64_t slot_id, const std::string& key,
   bytes_committed = 0;
   std::lock_guard<std::mutex> lock(mutex_);
   auto it = pending_.find(slot_id);
-  if (it == pending_.end()) return false;  // reaped, aborted, or never existed
+  if (it == pending_.end()) {
+    MORI_UMBP_WARN("[PeerDramAllocator] Commit reason=SLOT_GONE key='{}' slot_id={}", key, slot_id);
+    return false;
+  }
 
   // Pre-clear pending slot: free pages, report Put failure, no ADD.
   if (it->second.generation != allocator_generation_) {
+    MORI_UMBP_WARN("[PeerDramAllocator] Commit reason=PRE_CLEAR key='{}' slot_id={}", key, slot_id);
     if (auto* alloc = AllocatorForLocked(it->second.tier)) {
       alloc->Deallocate(it->second.pages);
     }
