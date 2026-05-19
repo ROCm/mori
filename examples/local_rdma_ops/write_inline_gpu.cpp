@@ -59,8 +59,8 @@ __device__ void SendThreadKernel(RdmaEndpoint& epSend, RdmaMemoryRegion mr) {
     uint32_t wqeIdx = 0;
     int opcode;
     do {
-      opcode = PollCq<P>(epSend.cqHandle.cqAddr, epSend.cqHandle.cqeNum,
-                         &epSend.cqHandle.consIdx, &wqeIdx);
+      opcode = PollCq<P>(epSend.cqHandle.cqAddr, epSend.cqHandle.cqeNum, &epSend.cqHandle.consIdx,
+                         &wqeIdx);
     } while (opcode < 0);
     epSend.cqHandle.consIdx += 1;
     __threadfence_system();
