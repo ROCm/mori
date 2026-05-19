@@ -27,6 +27,7 @@
 #include <stdexcept>
 
 #include "mori/core/core.hpp"
+#include "mori/shmem/internal.hpp"
 #include "mori/shmem/shmem_api.hpp"
 #include "mori/utils/env_utils.hpp"
 #include "mori/utils/hip_helper.hpp"
@@ -166,6 +167,12 @@ EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config_
 }
 
 EpDispatchCombineHandle::~EpDispatchCombineHandle() {
+  auto* states = mori::shmem::ShmemStatesSingleton::GetInstance();
+  if (states->status != mori::shmem::ShmemStatesStatus::Initialized) {
+    return;
+  }
+  hipDeviceSynchronize();
+  (void)hipGetLastError();
   FinalizeShmemBuf();
   FinalizeTokenNumSignalBuf();
   FinalizeOrderMapBuf();
