@@ -63,6 +63,9 @@ class StandaloneClient : public IUMBPClient {
   bool Flush() override;
   void Close() override;
   bool IsDistributed() const override;
+  bool ReportHiCacheTransferBytes(HiCacheTransfer /*direction*/, uint64_t /*bytes*/) override {
+    return true;
+  }
 
   bool ReportExternalKvBlocks(const std::vector<std::string>& /*hashes*/,
                               TierType /*tier*/) override {

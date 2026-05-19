@@ -71,6 +71,43 @@ target_compile_features(test_global_block_index_events PRIVATE cxx_std_17)
 gtest_discover_tests(test_global_block_index_events)
 
 # ---------------------------------------------------------------------------
+# test_client_metric_dispatcher
+# ---------------------------------------------------------------------------
+add_executable(test_client_metric_dispatcher test_client_metric_dispatcher.cpp)
+
+target_link_libraries(test_client_metric_dispatcher PRIVATE umbp_common
+                                                            GTest::gtest_main)
+
+target_compile_features(test_client_metric_dispatcher PRIVATE cxx_std_17)
+
+gtest_discover_tests(test_client_metric_dispatcher)
+
+# ---------------------------------------------------------------------------
+# test_client_counter_rate_view
+# ---------------------------------------------------------------------------
+add_executable(test_client_counter_rate_view test_client_counter_rate_view.cpp)
+
+target_link_libraries(test_client_counter_rate_view PRIVATE umbp_common
+                                                            GTest::gtest_main)
+
+target_compile_features(test_client_counter_rate_view PRIVATE cxx_std_17)
+
+gtest_discover_tests(test_client_counter_rate_view)
+
+# ---------------------------------------------------------------------------
+# test_master_server_transfer_rates
+# ---------------------------------------------------------------------------
+add_executable(test_master_server_transfer_rates
+               test_master_server_transfer_rates.cpp)
+
+target_link_libraries(test_master_server_transfer_rates
+                      PRIVATE umbp_common GTest::gtest_main)
+
+target_compile_features(test_master_server_transfer_rates PRIVATE cxx_std_17)
+
+gtest_discover_tests(test_master_server_transfer_rates)
+
+# ---------------------------------------------------------------------------
 # test_router_dedup — master-side BatchRoutePut dedup via GlobalBlockIndex
 # ---------------------------------------------------------------------------
 add_executable(test_router_dedup test_router_dedup.cpp)

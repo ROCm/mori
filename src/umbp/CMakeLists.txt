@@ -310,6 +310,8 @@ add_library(
   ${UMBP_PEER_GRPC_SRCS}
   distributed/master/global_block_index.cpp
   distributed/master/client_registry.cpp
+  distributed/master/client_metric_dispatcher.cpp
+  distributed/master/client_counter_rate_view.cpp
   distributed/master/external_kv_block_index.cpp
   distributed/master/master_server.cpp
   distributed/master/master_client.cpp

@@ -48,6 +48,21 @@ bool IsValidMemoryDesc(const mori::io::MemoryDesc& desc) { return desc.size > 0;
 
 constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
 
+const char* HiCacheTransferLabel(HiCacheTransfer direction) {
+  switch (direction) {
+    case HiCacheTransfer::L1_TO_L2:
+      return "l1_to_l2";
+    case HiCacheTransfer::L2_TO_L1:
+      return "l2_to_l1";
+    case HiCacheTransfer::L2_TO_L3:
+      return "l2_to_l3";
+    case HiCacheTransfer::L3_TO_L2:
+      return "l3_to_l2";
+    default:
+      return nullptr;
+  }
+}
+
 const std::vector<double>& BatchBandwidthBucketsGiBps() {
   static const std::vector<double> buckets = {
       0.1,  0.2,  0.5,  1.0,   2.0,   3.0,   4.0,   6.0,   8.0,   12.0,  16.0,  24.0, 32.0,
@@ -1302,6 +1317,16 @@ bool PoolClient::MatchExternalKv(const std::vector<std::string>& hashes,
                                  std::vector<MasterClient::ExternalKvNodeMatch>* out_matches) {
   if (!initialized_) return false;
   return master_client_->MatchExternalKv(hashes, out_matches).ok();
+}
+
+bool PoolClient::ReportHiCacheTransferBytes(HiCacheTransfer direction, uint64_t bytes) {
+  if (!initialized_ || !master_client_ || bytes == 0) return true;
+  const char* label = HiCacheTransferLabel(direction);
+  if (label == nullptr) return false;
+  master_client_->AddCounter(MORI_UMBP_METRIC_HICACHE_TRANSFER_BYTES_TOTAL,
+                             MORI_UMBP_METRIC_HICACHE_TRANSFER_BYTES_TOTAL_HELP,
+                             {{"direction", label}}, static_cast<double>(bytes));
+  return true;
 }
 
 // ---------------------------------------------------------------------------

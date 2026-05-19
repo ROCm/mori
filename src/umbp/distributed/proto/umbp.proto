@@ -223,6 +223,43 @@ message ReportMetricsRequest {
 message ReportMetricsResponse {}
 
 // ============================================================
+//  HiCache transfer-rate query API
+// ============================================================
+
+// HiCache cross-tier transfer direction. L1=HBM(GPU), L2=DRAM(host),
+// L3=STORAGE(UMBPStore). This is directional transfer, not a tier type.
+enum HiCacheTransfer {
+  HICACHE_TRANSFER_UNKNOWN  = 0;
+  HICACHE_TRANSFER_L1_TO_L2 = 1;  // HBM -> DRAM, write-through / write-back
+  HICACHE_TRANSFER_L2_TO_L1 = 2;  // DRAM -> HBM, load-back
+  HICACHE_TRANSFER_L2_TO_L3 = 3;  // DRAM -> STORAGE, backup
+  HICACHE_TRANSFER_L3_TO_L2 = 4;  // STORAGE -> DRAM, prefetch
+}
+
+message HiCacheTransferRate {
+  HiCacheTransfer direction     = 1;
+  double          bytes_per_sec = 2;
+  uint64          rate_age_ms   = 3;
+  uint64          window_ms     = 4;
+}
+
+message ClientTransferRates {
+  string node_id      = 1;
+  string peer_address = 2;
+  repeated string tags = 3;
+  repeated HiCacheTransferRate rates = 4;
+}
+
+message GetClientTransferRatesRequest {
+  // Empty means all currently alive clients. Non-empty is silently deduped.
+  repeated string node_ids = 1;
+}
+
+message GetClientTransferRatesResponse {
+  repeated ClientTransferRates clients = 1;
+}
+
+// ============================================================
 //  External KV Block Events (unmanaged L1/L2 cache blocks)
 // ============================================================
 
@@ -306,4 +343,8 @@ service UMBPMaster {
 
   // Client-side metrics reporting
   rpc ReportMetrics(ReportMetricsRequest) returns (ReportMetricsResponse);
+
+  // Scheduler-private HiCache transfer pressure signal.
+  rpc GetClientTransferRates(GetClientTransferRatesRequest)
+      returns (GetClientTransferRatesResponse);
 }

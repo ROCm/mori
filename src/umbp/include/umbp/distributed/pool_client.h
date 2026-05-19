@@ -109,6 +109,7 @@ class PoolClient {
   bool RevokeAllExternalKvBlocksAtTier(TierType tier);
   bool MatchExternalKv(const std::vector<std::string>& hashes,
                        std::vector<MasterClient::ExternalKvNodeMatch>* out_matches);
+  bool ReportHiCacheTransferBytes(HiCacheTransfer direction, uint64_t bytes);
 
   struct SlotPlan {
     uint64_t slot_id = 0;

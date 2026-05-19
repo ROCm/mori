@@ -62,6 +62,9 @@ uint64_t MetricsReportIntervalMs() {
 
 ::umbp::TierType ToProtoTier(TierType t) { return static_cast<::umbp::TierType>(t); }
 TierType FromProtoTier(::umbp::TierType t) { return static_cast<TierType>(t); }
+HiCacheTransfer FromProtoHiCacheTransfer(::umbp::HiCacheTransfer d) {
+  return static_cast<HiCacheTransfer>(d);
+}
 
 void FillTierCapacities(::google::protobuf::RepeatedPtrField<::umbp::TierCapacity>* dst,
                         const std::map<TierType, TierCapacity>& src) {
@@ -772,6 +775,43 @@ grpc::Status MasterClient::MatchExternalKv(const std::vector<std::string>& hashe
       }
       out_matches->push_back(std::move(out));
     }
+  }
+  return grpc::Status::OK;
+}
+
+grpc::Status MasterClient::GetClientTransferRates(const std::vector<std::string>& node_ids,
+                                                  std::vector<ClientTransferRates>* out) {
+  ScopedRpcTimer _rpc_timer(this, "GetClientTransferRates");
+  if (out == nullptr) {
+    return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "out is null");
+  }
+  out->clear();
+
+  ::umbp::GetClientTransferRatesRequest req;
+  for (const auto& node_id : node_ids) req.add_node_ids(node_id);
+
+  ::umbp::GetClientTransferRatesResponse resp;
+  grpc::ClientContext ctx;
+  auto status = GetStub(stub_.get())->GetClientTransferRates(&ctx, req, &resp);
+  _rpc_timer.SetStatus(status);
+  if (!status.ok()) return status;
+
+  out->reserve(static_cast<std::size_t>(resp.clients_size()));
+  for (const auto& client : resp.clients()) {
+    ClientTransferRates item;
+    item.node_id = client.node_id();
+    item.peer_address = client.peer_address();
+    item.tags.assign(client.tags().begin(), client.tags().end());
+    item.rates.reserve(static_cast<std::size_t>(client.rates_size()));
+    for (const auto& rate : client.rates()) {
+      HiCacheTransferRate r;
+      r.direction = FromProtoHiCacheTransfer(rate.direction());
+      r.bytes_per_sec = rate.bytes_per_sec();
+      r.rate_age_ms = rate.rate_age_ms();
+      r.window_ms = rate.window_ms();
+      item.rates.push_back(r);
+    }
+    out->push_back(std::move(item));
   }
   return grpc::Status::OK;
 }

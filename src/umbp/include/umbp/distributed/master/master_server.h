@@ -31,6 +31,7 @@
 
 #include "mori/metrics/prometheus_metrics_server.hpp"
 #include "umbp/distributed/config.h"
+#include "umbp/distributed/master/client_counter_rate_view.h"
 #include "umbp/distributed/master/client_registry.h"
 #include "umbp/distributed/master/eviction_manager.h"
 #include "umbp/distributed/master/external_kv_block_index.h"
@@ -61,6 +62,9 @@ class MasterServer {
   MasterServerConfig config_;
   GlobalBlockIndex index_;
   ExternalKvBlockIndex external_kv_index_;
+  // Must be declared before registry_: registry reaper/unregister paths may call
+  // Forget(), so registry_ must destruct first if Shutdown ordering regresses.
+  ClientCounterRateView rate_view_;
   ClientRegistry registry_;
   Router router_;
 

@@ -63,6 +63,7 @@ struct RouteGetResult {
 class MasterClient {
  public:
   using Labels = std::vector<std::pair<std::string, std::string>>;
+  using ClientTransferRates = mori::umbp::ClientTransferRates;
 
   explicit MasterClient(const UMBPMasterClientConfig& config);
   ~MasterClient();
@@ -162,6 +163,8 @@ class MasterClient {
   };
   grpc::Status MatchExternalKv(const std::vector<std::string>& hashes,
                                std::vector<ExternalKvNodeMatch>* out_matches);
+  grpc::Status GetClientTransferRates(const std::vector<std::string>& node_ids,
+                                      std::vector<ClientTransferRates>* out);
 
  private:
   UMBPMasterClientConfig config_;

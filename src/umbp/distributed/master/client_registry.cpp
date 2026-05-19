@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "mori/utils/mori_log.hpp"
+#include "umbp/distributed/master/client_counter_rate_view.h"
 #include "umbp/distributed/master/external_kv_block_index.h"
 #include "umbp/distributed/master/global_block_index.h"
 
@@ -44,6 +45,11 @@ void ClientRegistry::SetBlockIndex(GlobalBlockIndex* index) {
 void ClientRegistry::SetExternalKvBlockIndex(ExternalKvBlockIndex* index) {
   std::unique_lock lock(mutex_);
   external_kv_index_ = index;
+}
+
+void ClientRegistry::SetCounterRateView(ClientCounterRateView* view) {
+  std::unique_lock lock(mutex_);
+  rate_view_ = view;
 }
 
 void ClientRegistry::RegisterExternalKvBlocks(const std::string& node_id,
@@ -89,6 +95,7 @@ bool ClientRegistry::RegisterClient(const std::string& node_id, const std::strin
       return false;
     }
     MORI_UMBP_INFO("[Registry] Re-registering expired node: {}", node_id);
+    if (rate_view_ != nullptr) rate_view_->Forget(node_id);
   }
 
   ClientRecord record;
@@ -130,6 +137,9 @@ void ClientRegistry::UnregisterClient(const std::string& node_id) {
   }
   if (external_kv_index_ != nullptr) {
     external_kv_index_->UnregisterByNode(node_id);
+  }
+  if (rate_view_ != nullptr) {
+    rate_view_->Forget(node_id);
   }
   MORI_UMBP_INFO("[Registry] Unregistered node: {}", node_id);
 }
@@ -273,6 +283,11 @@ void ClientRegistry::ReapExpiredClients() {
   if (external_kv_index_ != nullptr) {
     for (const auto& dead_id : dead_nodes) {
       external_kv_index_->UnregisterByNode(dead_id);
+    }
+  }
+  if (rate_view_ != nullptr) {
+    for (const auto& dead_id : dead_nodes) {
+      rate_view_->Forget(dead_id);
     }
   }
 }

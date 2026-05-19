@@ -65,6 +65,7 @@ class DistributedClient : public IUMBPClient {
   bool Flush() override;
   void Close() override;
   bool IsDistributed() const override;
+  bool ReportHiCacheTransferBytes(HiCacheTransfer direction, uint64_t bytes) override;
 
   bool RegisterMemory(uintptr_t ptr, size_t size) override;
   void DeregisterMemory(uintptr_t ptr) override;

@@ -40,6 +40,7 @@ namespace mori::umbp {
 
 class GlobalBlockIndex;
 class ExternalKvBlockIndex;
+class ClientCounterRateView;
 
 // Master-side membership ledger + heartbeat ingestion.  In the
 // master-as-advisor design this class no longer owns any allocator
@@ -59,6 +60,7 @@ class ClientRegistry {
 
   // ---- External KV block index (for unmanaged L1/L2/L3 cache blocks) ----
   void SetExternalKvBlockIndex(ExternalKvBlockIndex* index);
+  void SetCounterRateView(ClientCounterRateView* view);
   void RegisterExternalKvBlocks(const std::string& node_id, const std::vector<std::string>& hashes,
                                 TierType tier);
   // Revoke `hashes` from `tier` only; other tiers for the same hashes are
@@ -118,6 +120,7 @@ class ClientRegistry {
   ClientRegistryConfig config_;
   GlobalBlockIndex* index_ = nullptr;
   ExternalKvBlockIndex* external_kv_index_ = nullptr;
+  ClientCounterRateView* rate_view_ = nullptr;
 
   mutable std::shared_mutex mutex_;
   std::unordered_map<std::string, ClientRecord> clients_;

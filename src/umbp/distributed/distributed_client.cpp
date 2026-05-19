@@ -274,6 +274,13 @@ void DistributedClient::Close() {
 
 bool DistributedClient::IsDistributed() const { return true; }
 
+bool DistributedClient::ReportHiCacheTransferBytes(HiCacheTransfer direction, uint64_t bytes) {
+  if (closing_) return false;
+  std::shared_lock lk(op_mutex_);
+  if (closed_ || !pool_client_) return false;
+  return pool_client_->ReportHiCacheTransferBytes(direction, bytes);
+}
+
 bool DistributedClient::ReportExternalKvBlocks(const std::vector<std::string>& hashes,
                                                TierType tier) {
   if (!pool_client_) return false;

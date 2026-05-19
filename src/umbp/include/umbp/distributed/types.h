@@ -38,6 +38,28 @@ enum class TierType : int {
   SSD = 3,
 };
 
+enum class HiCacheTransfer : int {
+  UNKNOWN = 0,
+  L1_TO_L2 = 1,
+  L2_TO_L1 = 2,
+  L2_TO_L3 = 3,
+  L3_TO_L2 = 4,
+};
+
+struct HiCacheTransferRate {
+  HiCacheTransfer direction = HiCacheTransfer::UNKNOWN;
+  double bytes_per_sec = 0.0;
+  uint64_t rate_age_ms = 0;
+  uint64_t window_ms = 0;
+};
+
+struct ClientTransferRates {
+  std::string node_id;
+  std::string peer_address;
+  std::vector<std::string> tags;
+  std::vector<HiCacheTransferRate> rates;
+};
+
 struct TierCapacity {
   uint64_t total_bytes = 0;
   uint64_t available_bytes = 0;
@@ -145,6 +167,21 @@ inline const char* TierTypeName(TierType t) {
       return "DRAM";
     case TierType::SSD:
       return "SSD";
+    default:
+      return "UNKNOWN";
+  }
+}
+
+inline const char* HiCacheTransferName(HiCacheTransfer d) {
+  switch (d) {
+    case HiCacheTransfer::L1_TO_L2:
+      return "L1_TO_L2";
+    case HiCacheTransfer::L2_TO_L1:
+      return "L2_TO_L1";
+    case HiCacheTransfer::L2_TO_L3:
+      return "L2_TO_L3";
+    case HiCacheTransfer::L3_TO_L2:
+      return "L3_TO_L2";
     default:
       return "UNKNOWN";
   }

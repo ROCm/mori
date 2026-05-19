@@ -102,6 +102,12 @@ class IUMBPClient {
   /// Returns true when the client operates in distributed (master-led) mode.
   virtual bool IsDistributed() const = 0;
 
+  /// Report logical HiCache transfer bytes to the distributed master.
+  /// Standalone and non-reporting implementations may safely no-op.
+  virtual bool ReportHiCacheTransferBytes(HiCacheTransfer /*direction*/, uint64_t /*bytes*/) {
+    return true;
+  }
+
   // ---- Optional zero-copy hooks ----
   //
   // Register a host buffer for zero-copy RDMA transfers.  Standalone

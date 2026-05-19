@@ -166,6 +166,14 @@
 #define MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL_HELP \
   "Total bytes delivered to this client (inbound reads) split by local/remote traffic"
 
+#define MORI_UMBP_METRIC_HICACHE_TRANSFER_BYTES_TOTAL "mori_umbp_hicache_transfer_bytes_total"
+#define MORI_UMBP_METRIC_HICACHE_TRANSFER_BYTES_TOTAL_HELP \
+  "Logical KV bytes transferred by SGLang HiCache, split by direction"
+
+#define MORI_UMBP_METRIC_RATE_VIEW_DROPPED_SAMPLES_TOTAL "mori_umbp_rate_view_dropped_samples_total"
+#define MORI_UMBP_METRIC_RATE_VIEW_DROPPED_SAMPLES_TOTAL_HELP \
+  "Metric samples dropped by the HiCache transfer-rate view, split by reason"
+
 // --- Heartbeat / event-shipping counters (master-as-advisor) ----------------
 
 #define MORI_UMBP_METRIC_HEARTBEAT_EVENTS_APPLIED_TOTAL "mori_umbp_heartbeat_events_applied_total"

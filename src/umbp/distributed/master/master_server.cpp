@@ -23,8 +23,12 @@
 
 #include <grpcpp/grpcpp.h>
 
+#include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
+#include <limits>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -33,6 +37,7 @@
 #include "mori/utils/mori_log.hpp"
 #include "umbp.grpc.pb.h"
 #include "umbp/common/env_time.h"
+#include "umbp/distributed/master/client_metric_dispatcher.h"
 #include "umbp/distributed/master/external_kv_block_index.h"
 #include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/routing/router.h"
@@ -50,6 +55,19 @@ uint32_t HeartbeatIntervalDivisor() {
 std::chrono::seconds GrpcShutdownDeadline() {
   static const auto v =
       GetEnvSeconds("UMBP_GRPC_SHUTDOWN_DEADLINE_SEC", std::chrono::seconds(3), /*min_allowed=*/1);
+  return v;
+}
+
+uint64_t NowNs() {
+  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count());
+}
+
+std::size_t TransferRateQueryMaxBatch() {
+  static const std::size_t v =
+      static_cast<std::size_t>(GetEnvUint32("UMBP_TRANSFER_RATE_QUERY_MAX_BATCH", 4096,
+                                            /*min_allowed=*/1));
   return v;
 }
 
@@ -148,13 +166,20 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
  public:
   UMBPMasterServiceImpl(ClientRegistry& registry, GlobalBlockIndex& index,
                         ExternalKvBlockIndex& external_kv_index, Router& router,
-                        const ClientRegistryConfig& config, mori::metrics::MetricsServer* metrics)
+                        ClientCounterRateView& rate_view, const ClientRegistryConfig& config,
+                        mori::metrics::MetricsServer* metrics)
       : registry_(registry),
         index_(index),
         external_kv_index_(external_kv_index),
         router_(router),
+        rate_view_(rate_view),
         config_(config),
-        metrics_(metrics) {}
+        metrics_(metrics),
+        prometheus_consumer_(registry_) {
+    metric_dispatcher_.Register(&rate_view_);
+    metric_dispatcher_.Register(&prometheus_consumer_);
+    prometheus_consumer_.SetMetrics(metrics_);
+  }
 
   // -------- Client lifecycle --------
 
@@ -259,6 +284,9 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
       metrics_->addCounter("mori_umbp_heartbeat_events_applied_total",
                            "KvEvents applied to GlobalBlockIndex via heartbeat",
                            {{"node", request->node_id()}}, static_cast<uint64_t>(events.size()));
+    }
+    if (status == ClientStatus::ALIVE) {
+      rate_view_.Tick(request->node_id(), NowNs());
     }
     return grpc::Status::OK;
   }
@@ -489,44 +517,139 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
   grpc::Status ReportMetrics(grpc::ServerContext* /*ctx*/,
                              const ::umbp::ReportMetricsRequest* request,
                              ::umbp::ReportMetricsResponse* /*response*/) override {
-    if (!metrics_) return grpc::Status::OK;
+    const uint64_t now_ns = NowNs();
+    for (const auto& s : request->metrics()) {
+      metric_dispatcher_.Dispatch(request->node_id(), s, now_ns);
+    }
+    PublishRateViewDroppedCounters();
+    return grpc::Status::OK;
+  }
 
-    mori::metrics::MetricsServer::Labels base = {{"node", request->node_id()}};
-    for (const auto& tag : registry_.GetClientTags(request->node_id())) {
-      const auto sep = tag.find('=');
-      if (sep != std::string::npos) {
-        base.push_back({tag.substr(0, sep), tag.substr(sep + 1)});
+  grpc::Status GetClientTransferRates(grpc::ServerContext* /*ctx*/,
+                                      const ::umbp::GetClientTransferRatesRequest* request,
+                                      ::umbp::GetClientTransferRatesResponse* response) override {
+    const int requested = request->node_ids_size();
+    if (static_cast<std::size_t>(requested) > TransferRateQueryMaxBatch()) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                          "node_ids exceeds UMBP_TRANSFER_RATE_QUERY_MAX_BATCH");
+    }
+
+    std::vector<ClientRecord> targets;
+    if (requested == 0) {
+      targets = registry_.GetAliveClients();
+    } else {
+      std::unordered_set<std::string> wanted(request->node_ids().begin(),
+                                             request->node_ids().end());
+      for (auto& rec : registry_.GetAliveClients()) {
+        if (wanted.find(rec.node_id) != wanted.end()) targets.push_back(std::move(rec));
       }
     }
-    for (const auto& s : request->metrics()) {
-      mori::metrics::MetricsServer::Labels labels = base;
-      for (const auto& l : s.labels()) labels.push_back({l.name(), l.value()});
-      switch (s.value_case()) {
-        case ::umbp::MetricSample::kCounterDelta:
-          metrics_->addCounter(s.name(), s.help(), labels,
-                               static_cast<uint64_t>(s.counter_delta()));
+
+    const uint64_t now_ns = NowNs();
+    for (const auto& rec : targets) {
+      auto* out = response->add_clients();
+      out->set_node_id(rec.node_id);
+      out->set_peer_address(rec.peer_address);
+      for (const auto& tag : rec.tags) out->add_tags(tag);
+      for (const auto& rate : rate_view_.Snapshot(rec.node_id, now_ns)) {
+        auto* proto_rate = out->add_rates();
+        proto_rate->set_direction(static_cast<::umbp::HiCacheTransfer>(rate.direction));
+        proto_rate->set_bytes_per_sec(rate.bytes_per_sec);
+        proto_rate->set_rate_age_ms(rate.rate_age_ms);
+        proto_rate->set_window_ms(rate.window_ms);
+      }
+    }
+    return grpc::Status::OK;
+  }
+
+  void SetMetrics(mori::metrics::MetricsServer* metrics) {
+    metrics_ = metrics;
+    prometheus_consumer_.SetMetrics(metrics);
+  }
+
+ private:
+  class PrometheusMirrorConsumer final : public ClientMetricConsumer {
+   public:
+    explicit PrometheusMirrorConsumer(ClientRegistry& registry) : registry_(registry) {}
+
+    void SetMetrics(mori::metrics::MetricsServer* metrics) { metrics_ = metrics; }
+
+    bool Accept(std::string_view /*metric_name*/) const override { return metrics_ != nullptr; }
+
+    void OnSample(std::string_view node_id, const ::umbp::MetricSample& sample,
+                  uint64_t /*now_ns*/) override {
+      auto* metrics = metrics_;
+      if (metrics == nullptr) return;
+
+      const std::string node(node_id.data(), node_id.size());
+      mori::metrics::MetricsServer::Labels labels = {{"node", node}};
+      for (const auto& tag : registry_.GetClientTags(node)) {
+        const auto sep = tag.find('=');
+        if (sep != std::string::npos) {
+          labels.push_back({tag.substr(0, sep), tag.substr(sep + 1)});
+        }
+      }
+      for (const auto& label : sample.labels()) labels.push_back({label.name(), label.value()});
+
+      switch (sample.value_case()) {
+        case ::umbp::MetricSample::kCounterDelta: {
+          const double delta = sample.counter_delta();
+          if (std::isfinite(delta) && delta >= 0.0 &&
+              delta <= static_cast<double>(std::numeric_limits<uint64_t>::max())) {
+            metrics->addCounter(sample.name(), sample.help(), labels, static_cast<uint64_t>(delta));
+          }
           break;
+        }
         case ::umbp::MetricSample::kGaugeValue:
-          metrics_->setGauge(s.name(), s.help(), labels, s.gauge_value());
+          if (std::isfinite(sample.gauge_value())) {
+            metrics->setGauge(sample.name(), sample.help(), labels, sample.gauge_value());
+          }
           break;
         case ::umbp::MetricSample::kHistogramAggregate: {
-          const auto& a = s.histogram_aggregate();
-          std::vector<double> bounds(a.bounds().begin(), a.bounds().end());
-          std::vector<uint64_t> counts(a.bucket_counts().begin(), a.bucket_counts().end());
-          metrics_->observeAggregated(s.name(), s.help(), labels, bounds, counts, a.count(),
-                                      a.sum());
+          const auto& aggregate = sample.histogram_aggregate();
+          std::vector<double> bounds(aggregate.bounds().begin(), aggregate.bounds().end());
+          std::vector<uint64_t> counts(aggregate.bucket_counts().begin(),
+                                       aggregate.bucket_counts().end());
+          metrics->observeAggregated(sample.name(), sample.help(), labels, bounds, counts,
+                                     aggregate.count(), aggregate.sum());
           break;
         }
         default:
           break;
       }
     }
-    return grpc::Status::OK;
+
+   private:
+    ClientRegistry& registry_;
+    mori::metrics::MetricsServer* metrics_ = nullptr;
+  };
+
+  void PublishRateViewDroppedCounters() {
+    if (metrics_ == nullptr) return;
+    std::lock_guard<std::mutex> lock(rate_view_drop_publish_mu_);
+    constexpr std::array<ClientCounterRateView::DropReason, 4> kReasons = {
+        ClientCounterRateView::DropReason::kNonCounter,
+        ClientCounterRateView::DropReason::kInvalidValue,
+        ClientCounterRateView::DropReason::kMissingOrDuplicateDirection,
+        ClientCounterRateView::DropReason::kUnknownDirection,
+    };
+    constexpr std::array<const char*, 4> kReasonLabels = {
+        "non_counter",
+        "invalid_value",
+        "missing_or_duplicate_direction",
+        "unknown_direction",
+    };
+    for (std::size_t i = 0; i < kReasons.size(); ++i) {
+      const uint64_t current = rate_view_.DroppedCount(kReasons[i]);
+      const uint64_t last = last_published_rate_view_drops_[i];
+      if (current <= last) continue;
+      metrics_->addCounter(MORI_UMBP_METRIC_RATE_VIEW_DROPPED_SAMPLES_TOTAL,
+                           MORI_UMBP_METRIC_RATE_VIEW_DROPPED_SAMPLES_TOTAL_HELP,
+                           {{"reason", kReasonLabels[i]}}, current - last);
+      last_published_rate_view_drops_[i] = current;
+    }
   }
 
-  void SetMetrics(mori::metrics::MetricsServer* metrics) { metrics_ = metrics; }
-
- private:
   void UpdateClientCountMetric() {
     if (!metrics_) return;
     metrics_->setGauge(MORI_UMBP_METRIC_CLIENT_COUNT, MORI_UMBP_METRIC_CLIENT_COUNT_HELP,
@@ -562,8 +685,13 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
   GlobalBlockIndex& index_;
   ExternalKvBlockIndex& external_kv_index_;
   Router& router_;
+  ClientCounterRateView& rate_view_;
   ClientRegistryConfig config_;
   mori::metrics::MetricsServer* metrics_ = nullptr;
+  ClientMetricDispatcher metric_dispatcher_;
+  PrometheusMirrorConsumer prometheus_consumer_;
+  std::mutex rate_view_drop_publish_mu_;
+  std::array<uint64_t, 4> last_published_rate_view_drops_{};
 };
 
 // ---------------------------------------------------------------------------
@@ -573,15 +701,18 @@ MasterServer::MasterServer(MasterServerConfig config)
     : config_(std::move(config)),
       index_(),
       external_kv_index_(),
+      rate_view_(),
       registry_(config_.registry_config, index_),
       router_(index_, registry_, std::move(config_.get_strategy), std::move(config_.put_strategy)),
       service_(std::make_unique<UMBPMasterServiceImpl>(registry_, index_, external_kv_index_,
-                                                       router_, config_.registry_config, nullptr)),
+                                                       router_, rate_view_, config_.registry_config,
+                                                       nullptr)),
       peer_stub_pool_(std::make_unique<MasterPeerStubPool>()),
       eviction_manager_(std::make_unique<EvictionManager>(
           index_, registry_, config_.eviction_config, peer_stub_pool_.get())) {
   router_.SetLeaseDuration(config_.eviction_config.lease_duration);
   registry_.SetExternalKvBlockIndex(&external_kv_index_);
+  registry_.SetCounterRateView(&rate_view_);
 }
 
 MasterServer::~MasterServer() {
@@ -621,6 +752,7 @@ void MasterServer::Shutdown() {
     server_->Shutdown(deadline);
   }
   registry_.StopReaper();
+  registry_.SetCounterRateView(nullptr);
 }
 
 }  // namespace mori::umbp

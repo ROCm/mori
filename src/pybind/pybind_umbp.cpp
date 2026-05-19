@@ -89,6 +89,14 @@ void RegisterMoriUmbp(py::module_& m) {
       .value("SSD", TierType::SSD)
       .export_values();
 
+  py::enum_<HiCacheTransfer>(m, "UMBPHiCacheTransfer")
+      .value("Unknown", HiCacheTransfer::UNKNOWN)
+      .value("L1ToL2", HiCacheTransfer::L1_TO_L2)
+      .value("L2ToL1", HiCacheTransfer::L2_TO_L1)
+      .value("L2ToL3", HiCacheTransfer::L2_TO_L3)
+      .value("L3ToL2", HiCacheTransfer::L3_TO_L2)
+      .export_values();
+
   py::class_<IUMBPClient::ExternalKvMatch>(m, "UMBPExternalKvMatch")
       .def(py::init<>())
       .def_readwrite("node_id", &IUMBPClient::ExternalKvMatch::node_id)
@@ -237,6 +245,8 @@ void RegisterMoriUmbp(py::module_& m) {
       .def("clear", &IUMBPClient::Clear, py::call_guard<py::gil_scoped_release>())
       .def("flush", &IUMBPClient::Flush, py::call_guard<py::gil_scoped_release>())
       .def("is_distributed", &IUMBPClient::IsDistributed)  // pure getter, no I/O
+      .def("report_hicache_transfer_bytes", &IUMBPClient::ReportHiCacheTransferBytes,
+           py::arg("direction"), py::arg("bytes"), py::call_guard<py::gil_scoped_release>())
       .def("register_memory", &IUMBPClient::RegisterMemory, py::arg("ptr"), py::arg("size"),
            py::call_guard<py::gil_scoped_release>())
       .def("deregister_memory", &IUMBPClient::DeregisterMemory, py::arg("ptr"),
@@ -263,6 +273,29 @@ void RegisterMoriUmbp(py::module_& m) {
       .def("__repr__", [](const MasterClient::ExternalKvNodeMatch& m) {
         return "<UMBPExternalKvNodeMatch node_id='" + m.node_id +
                "' matched=" + std::to_string(m.MatchedHashCount()) + ">";
+      });
+
+  py::class_<HiCacheTransferRate>(m, "UMBPHiCacheTransferRate")
+      .def(py::init<>())
+      .def_readonly("direction", &HiCacheTransferRate::direction)
+      .def_readonly("bytes_per_sec", &HiCacheTransferRate::bytes_per_sec)
+      .def_readonly("rate_age_ms", &HiCacheTransferRate::rate_age_ms)
+      .def_readonly("window_ms", &HiCacheTransferRate::window_ms)
+      .def("__repr__", [](const HiCacheTransferRate& r) {
+        return "<UMBPHiCacheTransferRate direction='" +
+               std::string(HiCacheTransferName(r.direction)) +
+               "' bytes_per_sec=" + std::to_string(r.bytes_per_sec) + ">";
+      });
+
+  py::class_<MasterClient::ClientTransferRates>(m, "UMBPClientTransferRates")
+      .def(py::init<>())
+      .def_readonly("node_id", &MasterClient::ClientTransferRates::node_id)
+      .def_readonly("peer_address", &MasterClient::ClientTransferRates::peer_address)
+      .def_readonly("tags", &MasterClient::ClientTransferRates::tags)
+      .def_readonly("rates", &MasterClient::ClientTransferRates::rates)
+      .def("__repr__", [](const MasterClient::ClientTransferRates& c) {
+        return "<UMBPClientTransferRates node_id='" + c.node_id +
+               "' rates=" + std::to_string(c.rates.size()) + ">";
       });
 
   py::class_<MasterClient>(m, "UMBPMasterClient")
@@ -338,7 +371,18 @@ void RegisterMoriUmbp(py::module_& m) {
               throw std::runtime_error("MatchExternalKv failed: " + status.error_message());
             return matches;
           },
-          py::arg("hashes"), py::call_guard<py::gil_scoped_release>());
+          py::arg("hashes"), py::call_guard<py::gil_scoped_release>())
+      .def(
+          "get_client_transfer_rates",
+          [](MasterClient& self, const std::vector<std::string>& node_ids) {
+            std::vector<MasterClient::ClientTransferRates> rates;
+            auto status = self.GetClientTransferRates(node_ids, &rates);
+            if (!status.ok())
+              throw std::runtime_error("GetClientTransferRates failed: " + status.error_message());
+            return rates;
+          },
+          py::arg("node_ids") = std::vector<std::string>{},
+          py::call_guard<py::gil_scoped_release>());
 }
 
 }  // namespace mori
