@@ -1,0 +1,9 @@
+# Runner label → GPU hardware mapping
+# Used by frameworks-devops-dashboard to display GPU architecture
+runners:
+  MI355X-AINIC-TW:
+    gpu_arch: MI355
+    gpu_count: 1
+  MI300X-BNXT:
+    gpu_arch: MI300X
+    gpu_count: 1
