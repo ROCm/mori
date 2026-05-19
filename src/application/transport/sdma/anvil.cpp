@@ -200,8 +200,8 @@ SdmaQueue::SdmaQueue(int localDeviceId, int remoteDeviceId, hsa_agent_t& localAg
   CHECK_HIP_ERROR(
       hipExtMallocWithFlags((void**)&committedWptr_, sizeof(uint64_t), hipDeviceMallocUncached));
 
-  uint64_t cachedWptr = (uint64_t) * (queue_.Queue_write_ptr_aql);
-  uint64_t committedWptr = (uint64_t) * (queue_.Queue_write_ptr_aql);
+  uint64_t cachedWptr = (uint64_t)*(queue_.Queue_write_ptr_aql);
+  uint64_t committedWptr = (uint64_t)*(queue_.Queue_write_ptr_aql);
   SdmaQueueDeviceHandle handle = {
       .queueBuf = static_cast<uint32_t*>(queueBuffer_),
       .rptr = queue_.Queue_read_ptr_aql,
@@ -209,7 +209,7 @@ SdmaQueue::SdmaQueue(int localDeviceId, int remoteDeviceId, hsa_agent_t& localAg
       .doorbell = queue_.Queue_DoorBell_aql,
       .cachedWptr = cachedWptr_,
       .committedWptr = committedWptr_,
-      .cachedHwReadIndex = (uint64_t) * (queue_.Queue_read_ptr_aql),
+      .cachedHwReadIndex = (uint64_t)*(queue_.Queue_read_ptr_aql),
   };
 
   CHECK_HIP_ERROR(

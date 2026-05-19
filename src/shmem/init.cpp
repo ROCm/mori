@@ -843,7 +843,7 @@ int ShmemGetUniqueId(mori_shmem_uniqueid_t* uid) {
       int opt = 1;
       setsockopt(probe_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-      struct sockaddr_in probe_addr {};
+      struct sockaddr_in probe_addr{};
       probe_addr.sin_family = AF_INET;
       probe_addr.sin_port = htons(random_port);
       probe_addr.sin_addr.s_addr = htonl(INADDR_ANY);
