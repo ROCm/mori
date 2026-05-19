@@ -429,12 +429,15 @@ Master-facing service. Sources of truth are the proto file and the
 | `RouteGet(RouteGetRequest)` | Pick a replica. Read-only against `GlobalBlockIndex`. |
 | `RoutePut(RoutePutRequest)` | Pick a target node + tier. Read-only against `ClientRegistry`. |
 | `BatchRouteGet`/`BatchRoutePut` | Parallel-key variants. `BatchRoutePut` also performs **master-side Put dedup**: any key already present in `GlobalBlockIndex` is returned with `already_exists=true` (and no node selection) so the caller can skip the Put entirely — primary defense against re-uploading the same kv-cache from multiple ranks (sglang DP-attention). Peer's `AllocateSlot` carries a key field and applies the same dedup as a defensive layer against master-index lag. |
+| `BatchLookup(BatchLookupRequest)` | Read-only batched existence probe. Goes straight to `GlobalBlockIndex::BatchLookupExists` — no `RecordAccess`, no `GrantLease`, no per-node RouteGet counters. Used by `PoolClient::Exists` / `BatchExists` for the sglang probe path where the caller only wants to know "is the key resident?" and is not about to RDMA-read it. |
 | `ReportExternalKvBlocks`/`RevokeExternalKvBlocks`/`MatchExternalKv` | External (unmanaged) cache index. |
 | `ReportMetrics(ReportMetricsRequest)` | Client-side counters/gauges/histograms forwarded to master's Prometheus exposition. |
 
-There are **no** per-key `Register`/`Unregister`/`Lookup` RPCs; those
-have been removed. Existence checks go through `RouteGet` (or
-`MatchExternalKv` for L1/L2 lookups).
+Existence checks go through `BatchLookup` (or `MatchExternalKv` for L1/L2
+lookups); the legacy per-key `Register`/`Unregister`/`Lookup` RPCs are
+gone, and `RouteGet`/`BatchRouteGet` are reserved for the real read path
+(they bump `RecordAccess` and `GrantLease` on hit, which is the wrong
+side-effect for a pure probe).
 
 ### 5.2 `UMBPPeer`  (`distributed/proto/umbp_peer.proto`)
 

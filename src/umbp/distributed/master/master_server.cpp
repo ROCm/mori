@@ -376,6 +376,14 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     return grpc::Status::OK;
   }
 
+  grpc::Status BatchLookup(grpc::ServerContext* /*ctx*/, const ::umbp::BatchLookupRequest* request,
+                           ::umbp::BatchLookupResponse* response) override {
+    std::vector<std::string> keys(request->keys().begin(), request->keys().end());
+    auto found = index_.BatchLookupExists(keys);
+    for (bool b : found) response->add_found(b);
+    return grpc::Status::OK;
+  }
+
   // -------- External KV (unchanged from prior design) --------
 
   grpc::Status ReportExternalKvBlocks(

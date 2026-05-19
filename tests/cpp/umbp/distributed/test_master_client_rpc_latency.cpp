@@ -92,6 +92,44 @@ class RecordingMasterService final : public ::umbp::UMBPMaster::Service {
 
   void SetFailRouteGet(bool fail) { fail_route_get_.store(fail); }
 
+  // BatchLookup / BatchRouteGet recorders.  The BatchLookupRoutedSeparately
+  // test asserts MasterClient::BatchLookup dispatches to BatchLookup on the
+  // wire — and not to BatchRouteGet, which would re-introduce the
+  // RecordAccess / GrantLease / RouteGet-counter side effects on master.
+  grpc::Status BatchLookup(grpc::ServerContext*, const ::umbp::BatchLookupRequest* req,
+                           ::umbp::BatchLookupResponse* resp) override {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      ++batch_lookup_calls_;
+      batch_lookup_keys_total_ += req->keys_size();
+    }
+    // Canned response: alternate true/false by index so callers can verify
+    // we are parsing per-key bits in order.
+    for (int i = 0; i < req->keys_size(); ++i) resp->add_found((i % 2) == 0);
+    return grpc::Status::OK;
+  }
+  grpc::Status BatchRouteGet(grpc::ServerContext*, const ::umbp::BatchRouteGetRequest* req,
+                             ::umbp::BatchRouteGetResponse* resp) override {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      ++batch_route_get_calls_;
+    }
+    for (int i = 0; i < req->keys_size(); ++i) resp->add_entries()->set_found(false);
+    return grpc::Status::OK;
+  }
+  int BatchLookupCalls() {
+    std::lock_guard<std::mutex> lock(mu_);
+    return batch_lookup_calls_;
+  }
+  int BatchLookupKeysTotal() {
+    std::lock_guard<std::mutex> lock(mu_);
+    return batch_lookup_keys_total_;
+  }
+  int BatchRouteGetCalls() {
+    std::lock_guard<std::mutex> lock(mu_);
+    return batch_route_get_calls_;
+  }
+
   // Used to test that read-only Python-style clients (no RegisterSelf) don't
   // leak entries into pending_histogram_aggregates_.
   grpc::Status MatchExternalKv(grpc::ServerContext*, const ::umbp::MatchExternalKvRequest*,
@@ -128,6 +166,9 @@ class RecordingMasterService final : public ::umbp::UMBPMaster::Service {
   std::mutex mu_;
   std::condition_variable cv_;
   std::vector<::umbp::ReportMetricsRequest> requests_;
+  int batch_lookup_calls_ = 0;
+  int batch_lookup_keys_total_ = 0;
+  int batch_route_get_calls_ = 0;
 };
 
 static std::vector<::umbp::MetricSample> CollectSamples(
@@ -482,6 +523,34 @@ TEST_F(MasterClientRpcLatencyTest, CapEnforcedAndDropCounterIncrements) {
       << "Cap=4 must let exactly 4 distinct series through, got " << test_cap_metric_series;
   EXPECT_GE(dropped_total_delta, 1u)
       << "5th distinct series must bump metrics_dropped_total counter";
+}
+
+// BatchLookup is the side-effect-free probe path that PoolClient::Exists /
+// BatchExists routes through.  Two things must hold on the wire:
+//   1) BatchLookup is the RPC actually issued (NOT BatchRouteGet — that
+//      was the bug the new RPC was added to fix; BatchRouteGet has
+//      RecordAccess / GrantLease side-effects on master).
+//   2) The per-key found bits round-trip in order so the caller's
+//      parallel-to-keys output is correct.
+// The side-effect-free contract of the underlying GlobalBlockIndex::
+// BatchLookupExists is already covered by
+// test_global_block_index.cpp::BatchLookupExistsHasNoMetricsSideEffects.
+TEST_F(MasterClientRpcLatencyTest, BatchLookupRoutedSeparatelyAndParsesResponse) {
+  StartClientAndRegister();
+
+  const std::vector<std::string> keys = {"k0", "k1", "k2", "k3", "k4"};
+  std::vector<bool> out;
+  auto status = client_->BatchLookup(keys, &out);
+  ASSERT_TRUE(status.ok()) << status.error_message();
+
+  ASSERT_EQ(out.size(), keys.size());
+  for (size_t i = 0; i < keys.size(); ++i) {
+    EXPECT_EQ(out[i], (i % 2) == 0) << "found[" << i << "] mismatch";
+  }
+  EXPECT_EQ(service_->BatchLookupCalls(), 1);
+  EXPECT_EQ(service_->BatchLookupKeysTotal(), static_cast<int>(keys.size()));
+  EXPECT_EQ(service_->BatchRouteGetCalls(), 0)
+      << "MasterClient::BatchLookup must dispatch to BatchLookup, never BatchRouteGet";
 }
 
 }  // namespace mori::umbp

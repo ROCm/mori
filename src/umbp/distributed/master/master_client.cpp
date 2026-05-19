@@ -293,6 +293,29 @@ grpc::Status MasterClient::BatchRouteGet(const std::vector<std::string>& keys,
   return grpc::Status::OK;
 }
 
+grpc::Status MasterClient::BatchLookup(const std::vector<std::string>& keys,
+                                       std::vector<bool>* out) {
+  ScopedRpcTimer _rpc_timer(this, "BatchLookup");
+  if (out == nullptr) {
+    return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "out is null");
+  }
+  out->clear();
+
+  ::umbp::BatchLookupRequest req;
+  req.set_node_id(config_.node_id);
+  for (const auto& k : keys) req.add_keys(k);
+
+  ::umbp::BatchLookupResponse resp;
+  grpc::ClientContext ctx;
+  auto status = GetStub(stub_.get())->BatchLookup(&ctx, req, &resp);
+  _rpc_timer.SetStatus(status);
+  if (!status.ok()) return status;
+
+  out->reserve(static_cast<size_t>(resp.found_size()));
+  for (int i = 0; i < resp.found_size(); ++i) out->push_back(resp.found(i));
+  return grpc::Status::OK;
+}
+
 void MasterClient::SetPeerDramAllocator(PeerDramAllocator* alloc) { peer_alloc_ = alloc; }
 
 void MasterClient::RequestClearFullSync() {

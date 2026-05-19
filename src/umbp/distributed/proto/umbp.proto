@@ -184,6 +184,22 @@ message BatchRouteGetResponse {
   repeated BatchRouteGetEntry entries = 1;
 }
 
+// Read-only batched existence probe.  Unlike BatchRouteGet, this does
+// not bump RecordAccess / GrantLease on the index and emits no per-node
+// RouteGet counters — used by PoolClient::Exists / BatchExists for the
+// sglang probe path where the caller only wants to know "is the key
+// resident?" and is not about to RDMA-read it.
+message BatchLookupRequest {
+  // Caller node_id; carried for parity with other RPCs (audit / future
+  // tagging).  Server currently ignores it.
+  string node_id = 1;
+  repeated string keys = 2;
+}
+message BatchLookupResponse {
+  // Parallel to BatchLookupRequest.keys; found[i] corresponds to keys[i].
+  repeated bool found = 1;
+}
+
 // ============================================================
 //  Client-side metrics reporting (unchanged)
 // ============================================================
@@ -293,6 +309,7 @@ service UMBPMaster {
   // Batch
   rpc BatchRoutePut   (BatchRoutePutRequest)    returns (BatchRoutePutResponse);
   rpc BatchRouteGet   (BatchRouteGetRequest)    returns (BatchRouteGetResponse);
+  rpc BatchLookup     (BatchLookupRequest)      returns (BatchLookupResponse);
 
   // External KV block events
   rpc ReportExternalKvBlocks         (ReportExternalKvBlocksRequest)

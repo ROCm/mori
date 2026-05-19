@@ -1345,23 +1345,16 @@ void PoolClient::FinalizeRemoteGetEntries(std::vector<RemoteGetEntry>& entries,
 }
 
 bool PoolClient::Exists(const std::string& key) {
-  if (!initialized_) return false;
-  std::optional<RouteGetResult> route;
-  std::unordered_set<std::string> excludes;
-  auto status = master_client_->RouteGet(key, excludes, &route);
-  return status.ok() && route.has_value();
+  auto v = BatchExists({key});
+  return !v.empty() && v.front();
 }
 
 std::vector<bool> PoolClient::BatchExists(const std::vector<std::string>& keys) {
-  std::vector<bool> out(keys.size(), false);
-  if (!initialized_) return out;
-  std::vector<std::optional<RouteGetResult>> routes;
-  std::unordered_set<std::string> excludes;
-  auto status = master_client_->BatchRouteGet(keys, excludes, &routes);
-  if (!status.ok()) return out;
-  for (size_t i = 0; i < keys.size() && i < routes.size(); ++i) {
-    out[i] = routes[i].has_value();
-  }
+  if (!initialized_ || keys.empty()) return std::vector<bool>(keys.size(), false);
+
+  std::vector<bool> out;
+  auto status = master_client_->BatchLookup(keys, &out);
+  if (!status.ok() || out.size() != keys.size()) return std::vector<bool>(keys.size(), false);
   return out;
 }
 

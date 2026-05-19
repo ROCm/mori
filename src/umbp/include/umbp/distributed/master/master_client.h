@@ -105,6 +105,12 @@ class MasterClient {
                              const std::unordered_set<std::string>& exclude_nodes,
                              std::vector<std::optional<RouteGetResult>>* out);
 
+  // Read-only batched existence probe.  out[i] mirrors keys[i].  No
+  // access-count / lease side effects on master, no per-node RouteGet
+  // counters — use this instead of BatchRouteGet when the caller only
+  // wants to know "is the key resident?" and is not about to RDMA-read.
+  grpc::Status BatchLookup(const std::vector<std::string>& keys, std::vector<bool>* out);
+
   // --- Heartbeat (event-driven) ---
   // Bind a PeerDramAllocator whose outbox the heartbeat thread will
   // drain.  Pass nullptr for SSD-only peers.  Must be set before
