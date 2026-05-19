@@ -200,8 +200,8 @@ SdmaQueue::SdmaQueue(int localDeviceId, int remoteDeviceId, hsa_agent_t& localAg
   CHECK_HIP_ERROR(
       hipExtMallocWithFlags((void**)&committedWptr_, sizeof(uint64_t), hipDeviceMallocUncached));
 
-  uint64_t cachedWptr = (uint64_t)*(queue_.Queue_write_ptr_aql);
-  uint64_t committedWptr = (uint64_t)*(queue_.Queue_write_ptr_aql);
+  uint64_t cachedWptr = (uint64_t) * (queue_.Queue_write_ptr_aql);
+  uint64_t committedWptr = (uint64_t) * (queue_.Queue_write_ptr_aql);
   SdmaQueueDeviceHandle handle = {
       .queueBuf = static_cast<uint32_t*>(queueBuffer_),
       .rptr = queue_.Queue_read_ptr_aql,
@@ -209,7 +209,7 @@ SdmaQueue::SdmaQueue(int localDeviceId, int remoteDeviceId, hsa_agent_t& localAg
       .doorbell = queue_.Queue_DoorBell_aql,
       .cachedWptr = cachedWptr_,
       .committedWptr = committedWptr_,
-      .cachedHwReadIndex = (uint64_t)*(queue_.Queue_read_ptr_aql),
+      .cachedHwReadIndex = (uint64_t) * (queue_.Queue_read_ptr_aql),
   };
 
   CHECK_HIP_ERROR(
@@ -265,26 +265,27 @@ void AnvilLib::init() {
 }
 
 bool AnvilLib::connect(int srcDeviceId, int dstDeviceId, int numChannels) {
-  uint32_t engineId = getSdmaEngineId(srcDeviceId, dstDeviceId);  // + 1) * 2;
-  // std::cout << "Connect from " << srcDeviceId << " to " << dstDeviceId << " with " << numChannels
-  //           << " channels using engine " << engineId << std::endl;
+  uint32_t engineId = getSdmaEngineId(srcDeviceId, dstDeviceId);
+  std::lock_guard<std::mutex> lock(channels_mutex_);
+  auto key = std::make_pair(srcDeviceId, dstDeviceId);
   for (int c = 0; c < numChannels; ++c) {
-    sdma_channels_[dstDeviceId].emplace_back(
+    sdma_channels_[key].emplace_back(
         std::make_unique<SdmaQueue>(srcDeviceId, dstDeviceId, gpuAgents_[srcDeviceId], engineId));
   }
   return true;
 }
 
 SdmaQueue* AnvilLib::getSdmaQueue(int srcDeviceId, int dstDeviceId, int channel_idx) {
-  if (sdma_channels_.find(dstDeviceId) == sdma_channels_.end()) {
+  std::lock_guard<std::mutex> lock(channels_mutex_);
+  auto key = std::make_pair(srcDeviceId, dstDeviceId);
+  auto it = sdma_channels_.find(key);
+  if (it == sdma_channels_.end()) {
     return nullptr;
   }
-
-  if (!(channel_idx < sdma_channels_[dstDeviceId].size())) {
+  if (!(channel_idx < static_cast<int>(it->second.size()))) {
     return nullptr;
   }
-
-  return sdma_channels_[dstDeviceId][channel_idx].get();  // TODO
+  return it->second[channel_idx].get();
 }
 
 AnvilLib& AnvilLib::getInstance() {
