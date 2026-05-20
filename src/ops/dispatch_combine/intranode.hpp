@@ -96,6 +96,7 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   int myPe = config.rank;
   int npes = config.worldSize;
   size_t hiddenDim = config.HiddenDimSz();
+  const bool hasScales = args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0);
 
   IF_ENABLE_PROFILER(
       INTRANODE_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
@@ -141,6 +142,13 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       }
       destTokId = __shfl(destTokId, 0);
 
+      size_t srcTokOffset = srcTokId * hiddenDim;
+      size_t destTokOffset = destTokId * hiddenDim;
+
+      core::WarpCopy<T, 2>(
+          args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) + destTokOffset,
+          args.inpTokenBuf + srcTokOffset, hiddenDim);
+
       // Write weights and indices
       if (laneId < config.numExpertPerToken) {
         if (args.weightsBuf) {
@@ -154,19 +162,13 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       }
 
       // Write scales
-      if (args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0)) {
+      if (hasScales) {
         size_t destScaleOffset = (size_t)destTokId * config.scaleDim * config.scaleTypeSize;
         size_t srcScaleOffset = (size_t)srcTokId * config.scaleDim * config.scaleTypeSize;
         core::WarpCopy(
             args.shmemOutScalesMemObj->template GetAs<uint8_t*>(destPe) + destScaleOffset,
             args.scalesBuf + srcScaleOffset, config.scaleDim * config.scaleTypeSize);
       }
-
-      size_t srcTokOffset = srcTokId * hiddenDim;
-      size_t destTokOffset = destTokId * hiddenDim;
-
-      core::WarpCopy<T, 2>(args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) + destTokOffset,
-                           args.inpTokenBuf + srcTokOffset, hiddenDim);
     }
   }
   __syncthreads();
