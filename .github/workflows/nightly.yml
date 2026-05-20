@@ -861,6 +861,7 @@ jobs:
       - name: Test PyPI wheel
         run: |
           $CT run --rm --network=host \
+            --device=/dev/kfd --device=/dev/dri \
             -v ${{ runner.temp }}/pypi-wheel:/tmp/wheel:ro \
             $IMAGE bash -c "
               pip install /tmp/wheel/*.whl
