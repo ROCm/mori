@@ -81,6 +81,12 @@ const PageBitmapAllocator* PeerDramAllocator::AllocatorForLocked(TierType tier) 
 
 PeerDramAllocator::AllocateResult PeerDramAllocator::Allocate(const std::string& key, uint64_t size,
                                                               TierType tier) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return AllocateLocked(key, size, tier);
+}
+
+PeerDramAllocator::AllocateResult PeerDramAllocator::AllocateLocked(const std::string& key,
+                                                                    uint64_t size, TierType tier) {
   auto fail = [&](Outcome outcome, const char* reason) {
     MORI_UMBP_WARN("[PeerDramAllocator] Allocate reason={} key='{}' size={} tier={}", reason, key,
                    size, static_cast<int>(tier));
@@ -97,8 +103,6 @@ PeerDramAllocator::AllocateResult PeerDramAllocator::Allocate(const std::string&
   if (clear_full_sync_pending_.load(std::memory_order_acquire)) {
     return fail(Outcome::kFailed, "CLEAR_PENDING");
   }
-
-  std::lock_guard<std::mutex> lock(mutex_);
 
   // owned_ dedup (master-index-lag fallback).  pending_ deliberately
   // not checked — same-key pending race is absorbed by Commit().
@@ -129,10 +133,32 @@ PeerDramAllocator::AllocateResult PeerDramAllocator::Allocate(const std::string&
   return out;
 }
 
+std::vector<PeerDramAllocator::BatchAllocateResult> PeerDramAllocator::BatchAllocate(
+    const std::vector<AllocateRequest>& entries) {
+  std::vector<BatchAllocateResult> out(entries.size());
+  if (entries.empty()) return out;
+  std::lock_guard<std::mutex> lock(mutex_);
+  for (size_t i = 0; i < entries.size(); ++i) {
+    const auto& entry = entries[i];
+    auto result = AllocateLocked(entry.key, entry.size, entry.tier);
+    out[i].outcome = result.outcome;
+    out[i].slot = std::move(result.slot);
+    if (out[i].outcome == Outcome::kSuccessAllocated && out[i].slot.has_value()) {
+      out[i].descs = BuildBufferDescsLocked(out[i].slot->tier, out[i].slot->pages);
+    }
+  }
+  return out;
+}
+
 bool PeerDramAllocator::Commit(uint64_t slot_id, const std::string& key,
                                uint64_t& bytes_committed) {
-  bytes_committed = 0;
   std::lock_guard<std::mutex> lock(mutex_);
+  return CommitLocked(slot_id, key, bytes_committed);
+}
+
+bool PeerDramAllocator::CommitLocked(uint64_t slot_id, const std::string& key,
+                                     uint64_t& bytes_committed) {
+  bytes_committed = 0;
   auto it = pending_.find(slot_id);
   if (it == pending_.end()) {
     MORI_UMBP_WARN("[PeerDramAllocator] Commit reason=SLOT_GONE key='{}' slot_id={}", key, slot_id);
@@ -176,8 +202,24 @@ bool PeerDramAllocator::Commit(uint64_t slot_id, const std::string& key,
   return true;
 }
 
+std::vector<PeerDramAllocator::CommitResult> PeerDramAllocator::BatchCommit(
+    const std::vector<CommitRequest>& entries) {
+  std::vector<CommitResult> out(entries.size());
+  if (entries.empty()) return out;
+  std::lock_guard<std::mutex> lock(mutex_);
+  for (size_t i = 0; i < entries.size(); ++i) {
+    const auto& entry = entries[i];
+    out[i].success = CommitLocked(entry.slot_id, entry.key, out[i].bytes_committed);
+  }
+  return out;
+}
+
 bool PeerDramAllocator::Abort(uint64_t slot_id) {
   std::lock_guard<std::mutex> lock(mutex_);
+  return AbortLocked(slot_id);
+}
+
+bool PeerDramAllocator::AbortLocked(uint64_t slot_id) {
   auto it = pending_.find(slot_id);
   if (it == pending_.end()) return true;  // already reaped / aborted — idempotent
   if (auto* alloc = AllocatorForLocked(it->second.tier)) {
@@ -185,6 +227,16 @@ bool PeerDramAllocator::Abort(uint64_t slot_id) {
   }
   pending_.erase(it);
   return true;
+}
+
+std::vector<bool> PeerDramAllocator::BatchAbort(const std::vector<uint64_t>& slot_ids) {
+  std::vector<bool> out(slot_ids.size(), false);
+  if (slot_ids.empty()) return out;
+  std::lock_guard<std::mutex> lock(mutex_);
+  for (size_t i = 0; i < slot_ids.size(); ++i) {
+    out[i] = AbortLocked(slot_ids[i]);
+  }
+  return out;
 }
 
 PeerDramAllocator::ResolveResult PeerDramAllocator::Resolve(const std::string& key) {

@@ -139,20 +139,48 @@ class PeerDramAllocator {
     std::optional<PendingSlot> slot;  // populated iff outcome == kSuccessAllocated
   };
 
+  struct AllocateRequest {
+    std::string key;
+    uint64_t size = 0;
+    TierType tier = TierType::UNKNOWN;
+  };
+
+  struct BatchAllocateResult {
+    Outcome outcome = Outcome::kFailed;
+    std::optional<PendingSlot> slot;
+    std::vector<BufferMemoryDescBytes> descs;
+  };
+
+  struct CommitRequest {
+    uint64_t slot_id = 0;
+    std::string key;
+  };
+
+  struct CommitResult {
+    bool success = false;
+    uint64_t bytes_committed = 0;
+  };
+
   // Reserve `size` bytes on `tier` for `key`.  `key` enables owned_
   // dedup (master-index-lag fallback; primary dedup is at BatchRoutePut).
   AllocateResult Allocate(const std::string& key, uint64_t size, TierType tier);
+
+  std::vector<BatchAllocateResult> BatchAllocate(const std::vector<AllocateRequest>& entries);
 
   // Move pending -> owned and queue an ADD event.  Returns false if
   // slot_id is unknown (already reaped, already aborted, or never
   // existed) — the writer treats false as a Put failure.
   bool Commit(uint64_t slot_id, const std::string& key, uint64_t& bytes_committed);
 
+  std::vector<CommitResult> BatchCommit(const std::vector<CommitRequest>& entries);
+
   // Drop a pending slot.  Idempotent: returns true if the slot was
   // dropped here OR was already gone (reaped or never existed).  False
   // is reserved for a state we don't currently produce (kept for future
   // contract changes).
   bool Abort(uint64_t slot_id);
+
+  std::vector<bool> BatchAbort(const std::vector<uint64_t>& slot_ids);
 
   // Look up a key the writer was just routed to.  Extends the
   // read-lease deadline for `key` to now + `read_lease_ttl_`;
@@ -245,6 +273,10 @@ class PeerDramAllocator {
   // Caller MUST hold `mutex_`.
   PageBitmapAllocator* AllocatorForLocked(TierType tier);
   const PageBitmapAllocator* AllocatorForLocked(TierType tier) const;
+
+  AllocateResult AllocateLocked(const std::string& key, uint64_t size, TierType tier);
+  bool CommitLocked(uint64_t slot_id, const std::string& key, uint64_t& bytes_committed);
+  bool AbortLocked(uint64_t slot_id);
 
   // Caller MUST hold `mutex_`.  True iff `key`'s read-lease deadline
   // is still in the future.  Drops the entry if it has expired.
