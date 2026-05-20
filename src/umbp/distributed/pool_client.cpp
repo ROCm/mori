@@ -1367,14 +1367,32 @@ bool PoolClient::BindExternalHashes(const std::vector<std::string>& hashes, Tier
   return master_client_->BindExternalHashes(hashes, tier);
 }
 
+bool PoolClient::ReportExternalKvBlocks(const std::vector<std::string>& hashes, TierType tier) {
+  if (!initialized_) return false;
+  if (!master_client_->BindExternalHashes(hashes, tier)) return false;
+  return master_client_->FlushExternalQueue();
+}
+
 bool PoolClient::UnbindExternalHashes(const std::vector<std::string>& hashes, TierType tier) {
   if (!initialized_) return false;
   return master_client_->UnbindExternalHashes(hashes, tier);
 }
 
+bool PoolClient::RevokeExternalKvBlocks(const std::vector<std::string>& hashes, TierType tier) {
+  if (!initialized_) return false;
+  if (!master_client_->UnbindExternalHashes(hashes, tier)) return false;
+  return master_client_->FlushExternalQueue();
+}
+
 bool PoolClient::UnbindAllExternalHashesAtTier(TierType tier) {
   if (!initialized_) return false;
   return master_client_->UnbindAllExternalHashesAtTier(tier);
+}
+
+bool PoolClient::RevokeAllExternalKvBlocksAtTier(TierType tier) {
+  if (!initialized_) return false;
+  if (!master_client_->UnbindAllExternalHashesAtTier(tier)) return false;
+  return master_client_->FlushExternalQueue();
 }
 
 bool PoolClient::FlushExternalQueue() {

@@ -48,11 +48,13 @@ Location* FindOrInsertLocation(BlockEntry& entry, const std::string& node_id, Ti
 
 bool IsServable(const Location& loc) { return loc.owner == LocationOwner::UMBP_OWNED; }
 
-void RemoveLocationsLocked(std::unordered_map<std::string, BlockEntry>& entries,
-                           const std::string& node_id, std::optional<TierType> tier,
-                           std::optional<LocationOwner> owner) {
+size_t RemoveLocationsLocked(std::unordered_map<std::string, BlockEntry>& entries,
+                             const std::string& node_id, std::optional<TierType> tier,
+                             std::optional<LocationOwner> owner) {
+  size_t removed = 0;
   for (auto it = entries.begin(); it != entries.end();) {
     auto& locs = it->second.locations;
+    const size_t before = locs.size();
     locs.erase(std::remove_if(locs.begin(), locs.end(),
                               [&](const Location& l) {
                                 if (l.node_id != node_id) return false;
@@ -61,12 +63,14 @@ void RemoveLocationsLocked(std::unordered_map<std::string, BlockEntry>& entries,
                                 return true;
                               }),
                locs.end());
+    removed += before - locs.size();
     if (locs.empty()) {
       it = entries.erase(it);
     } else {
       ++it;
     }
   }
+  return removed;
 }
 
 }  // namespace
@@ -80,8 +84,7 @@ size_t GlobalBlockIndex::ApplyEvents(const std::string& node_id,
 
   for (const auto& ev : events) {
     if (ev.kind == KvEvent::Kind::CLEAR_AT_TIER) {
-      RemoveLocationsLocked(entries_, node_id, ev.tier, ev.owner);
-      ++mutated;
+      mutated += RemoveLocationsLocked(entries_, node_id, ev.tier, ev.owner);
     } else if (ev.kind == KvEvent::Kind::ADD) {
       auto& entry = entries_[ev.key];
       if (entry.locations.empty()) {

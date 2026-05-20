@@ -279,15 +279,32 @@ bool DistributedClient::BindExternalHashes(const std::vector<std::string>& hashe
   return pool_client_->BindExternalHashes(hashes, tier);
 }
 
+bool DistributedClient::ReportExternalKvBlocks(const std::vector<std::string>& hashes,
+                                               TierType tier) {
+  if (!pool_client_) return false;
+  return pool_client_->ReportExternalKvBlocks(hashes, tier);
+}
+
 bool DistributedClient::UnbindExternalHashes(const std::vector<std::string>& hashes,
                                              TierType tier) {
   if (!pool_client_) return false;
   return pool_client_->UnbindExternalHashes(hashes, tier);
 }
 
+bool DistributedClient::RevokeExternalKvBlocks(const std::vector<std::string>& hashes,
+                                               TierType tier) {
+  if (!pool_client_) return false;
+  return pool_client_->RevokeExternalKvBlocks(hashes, tier);
+}
+
 bool DistributedClient::UnbindAllExternalHashesAtTier(TierType tier) {
   if (!pool_client_) return false;
   return pool_client_->UnbindAllExternalHashesAtTier(tier);
+}
+
+bool DistributedClient::RevokeAllExternalKvBlocksAtTier(TierType tier) {
+  if (!pool_client_) return false;
+  return pool_client_->RevokeAllExternalKvBlocksAtTier(tier);
 }
 
 bool DistributedClient::FlushExternalQueue() {

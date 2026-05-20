@@ -149,7 +149,7 @@ TEST(GlobalBlockIndexEvents, ClearAtTierClearsOnlyTargetOwnerTier) {
   idx.ApplyEvents("node-A", {Add("k1", TierType::DRAM, 1), AddExternal("k1", TierType::DRAM),
                              AddExternal("k2", TierType::SSD), AddExternal("k3", TierType::DRAM)});
 
-  idx.ApplyEvents("node-A", {ClearExternal(TierType::DRAM)});
+  EXPECT_EQ(idx.ApplyEvents("node-A", {ClearExternal(TierType::DRAM)}), 2u);
 
   EXPECT_TRUE(
       HasLocation(idx.Lookup("k1"), "node-A", TierType::DRAM, 1, LocationOwner::UMBP_OWNED));

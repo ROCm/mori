@@ -437,7 +437,108 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     return grpc::Status::OK;
   }
 
-  // -------- External KV query --------
+  // -------- External KV mutation/query --------
+
+  grpc::Status ReportExternalKvBlocks(
+      grpc::ServerContext* /*ctx*/, const ::umbp::ReportExternalKvBlocksRequest* request,
+      ::umbp::ReportExternalKvBlocksResponse* /*response*/) override {
+    if (request->node_id().empty()) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "node_id must not be empty");
+    }
+    if (request->hashes_size() == 0) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "hashes must not be empty");
+    }
+
+    const TierType tier = static_cast<TierType>(request->tier());
+    if (!registry_.IsClientAlive(request->node_id())) {
+      MORI_UMBP_WARN("[Server] ReportExternalKvBlocks rejected: node not alive: {}",
+                     request->node_id());
+      if (metrics_) {
+        metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_REPORT_TOTAL,
+                             MORI_UMBP_METRIC_EXT_KV_REPORT_TOTAL_HELP,
+                             {{"node", request->node_id()},
+                              {"tier", TierTypeName(tier)},
+                              {"result", "rejected_not_alive"}});
+      }
+      return grpc::Status::OK;
+    }
+
+    std::vector<KvEvent> events;
+    events.reserve(static_cast<size_t>(request->hashes_size()));
+    for (const auto& hash : request->hashes()) {
+      events.push_back(
+          KvEvent{KvEvent::Kind::ADD, hash, tier, /*size=*/0, LocationOwner::EXTERNAL_HICACHE});
+    }
+
+    const size_t mutated = index_.ApplyEvents(request->node_id(), events);
+    if (metrics_) {
+      const mori::metrics::MetricsServer::Labels labels = {{"node", request->node_id()},
+                                                           {"tier", TierTypeName(tier)}};
+      metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_REPORT_BLOCKS_TOTAL,
+                           MORI_UMBP_METRIC_EXT_KV_REPORT_BLOCKS_TOTAL_HELP, labels,
+                           static_cast<uint64_t>(mutated));
+      metrics_->addCounter(
+          MORI_UMBP_METRIC_EXT_KV_REPORT_TOTAL, MORI_UMBP_METRIC_EXT_KV_REPORT_TOTAL_HELP,
+          {{"node", request->node_id()}, {"tier", TierTypeName(tier)}, {"result", "ok"}});
+    }
+    return grpc::Status::OK;
+  }
+
+  grpc::Status RevokeExternalKvBlocks(
+      grpc::ServerContext* /*ctx*/, const ::umbp::RevokeExternalKvBlocksRequest* request,
+      ::umbp::RevokeExternalKvBlocksResponse* /*response*/) override {
+    if (request->node_id().empty()) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "node_id must not be empty");
+    }
+    if (request->hashes_size() == 0) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "hashes must not be empty");
+    }
+
+    const TierType tier = static_cast<TierType>(request->tier());
+    std::vector<KvEvent> events;
+    events.reserve(static_cast<size_t>(request->hashes_size()));
+    for (const auto& hash : request->hashes()) {
+      events.push_back(
+          KvEvent{KvEvent::Kind::REMOVE, hash, tier, /*size=*/0, LocationOwner::EXTERNAL_HICACHE});
+    }
+
+    const size_t mutated = index_.ApplyEvents(request->node_id(), events);
+    if (metrics_) {
+      const mori::metrics::MetricsServer::Labels labels = {{"node", request->node_id()},
+                                                           {"tier", TierTypeName(tier)}};
+      metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_REVOKE_BLOCKS_TOTAL,
+                           MORI_UMBP_METRIC_EXT_KV_REVOKE_BLOCKS_TOTAL_HELP, labels,
+                           static_cast<uint64_t>(mutated));
+      metrics_->addCounter(
+          MORI_UMBP_METRIC_EXT_KV_REVOKE_TOTAL, MORI_UMBP_METRIC_EXT_KV_REVOKE_TOTAL_HELP,
+          {{"node", request->node_id()}, {"tier", TierTypeName(tier)}, {"result", "ok"}});
+    }
+    return grpc::Status::OK;
+  }
+
+  grpc::Status RevokeAllExternalKvBlocksAtTier(
+      grpc::ServerContext* /*ctx*/, const ::umbp::RevokeAllExternalKvBlocksAtTierRequest* request,
+      ::umbp::RevokeAllExternalKvBlocksAtTierResponse* /*response*/) override {
+    if (request->node_id().empty()) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "node_id must not be empty");
+    }
+
+    const TierType tier = static_cast<TierType>(request->tier());
+    const std::vector<KvEvent> events = {KvEvent{KvEvent::Kind::CLEAR_AT_TIER, "", tier, /*size=*/0,
+                                                 LocationOwner::EXTERNAL_HICACHE}};
+    const size_t mutated = index_.ApplyEvents(request->node_id(), events);
+    if (metrics_) {
+      const mori::metrics::MetricsServer::Labels labels = {{"node", request->node_id()},
+                                                           {"tier", TierTypeName(tier)}};
+      metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_REVOKE_BLOCKS_TOTAL,
+                           MORI_UMBP_METRIC_EXT_KV_REVOKE_BLOCKS_TOTAL_HELP, labels,
+                           static_cast<uint64_t>(mutated));
+      metrics_->addCounter(
+          MORI_UMBP_METRIC_EXT_KV_REVOKE_TOTAL, MORI_UMBP_METRIC_EXT_KV_REVOKE_TOTAL_HELP,
+          {{"node", request->node_id()}, {"tier", TierTypeName(tier)}, {"result", "ok"}});
+    }
+    return grpc::Status::OK;
+  }
 
   grpc::Status MatchExternalKv(grpc::ServerContext* /*ctx*/,
                                const ::umbp::MatchExternalKvRequest* request,

@@ -88,10 +88,11 @@ class GlobalBlockIndex {
   // --- Mutators (event-driven only) ---
 
   // Apply one peer's heartbeat-shipped event batch.  Returns the count
-  // of events that mutated the index.  ADD with a (node_id, tier, owner) that
+  // of location mutations.  ADD with a (node_id, tier, owner) that
   // already exists for the key replaces the existing entry's size.
   // REMOVE for an unknown (key, node_id, tier, owner) is a silent no-op.
-  // CLEAR_AT_TIER drops every key for (node_id, tier, owner).
+  // CLEAR_AT_TIER drops every key for (node_id, tier, owner) and returns
+  // the number of locations removed.
   size_t ApplyEvents(const std::string& node_id, const std::vector<KvEvent>& events);
 
   // Replace this node's full set of locations for `owner` with the ADDs

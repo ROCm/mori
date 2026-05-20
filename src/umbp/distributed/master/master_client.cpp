@@ -835,6 +835,58 @@ void MasterClient::MetricsLoop() {
 //  External KV block events
 // ---------------------------------------------------------------------------
 
+grpc::Status MasterClient::ReportExternalKvBlocks(const std::string& node_id,
+                                                  const std::vector<std::string>& hashes,
+                                                  TierType tier) {
+  ScopedRpcTimer _rpc_timer(this, "ReportExternalKvBlocks");
+  ::umbp::ReportExternalKvBlocksRequest req;
+  req.set_node_id(node_id);
+  req.set_tier(ToProtoTier(tier));
+  for (const auto& hash : hashes) req.add_hashes(hash);
+
+  ::umbp::ReportExternalKvBlocksResponse resp;
+  grpc::ClientContext ctx;
+  ctx.set_deadline(std::chrono::system_clock::now() +
+                   std::chrono::milliseconds(RpcShutdownTimeoutMs()));
+  auto status = GetStub(stub_.get())->ReportExternalKvBlocks(&ctx, req, &resp);
+  _rpc_timer.SetStatus(status);
+  return status;
+}
+
+grpc::Status MasterClient::RevokeExternalKvBlocks(const std::string& node_id,
+                                                  const std::vector<std::string>& hashes,
+                                                  TierType tier) {
+  ScopedRpcTimer _rpc_timer(this, "RevokeExternalKvBlocks");
+  ::umbp::RevokeExternalKvBlocksRequest req;
+  req.set_node_id(node_id);
+  req.set_tier(ToProtoTier(tier));
+  for (const auto& hash : hashes) req.add_hashes(hash);
+
+  ::umbp::RevokeExternalKvBlocksResponse resp;
+  grpc::ClientContext ctx;
+  ctx.set_deadline(std::chrono::system_clock::now() +
+                   std::chrono::milliseconds(RpcShutdownTimeoutMs()));
+  auto status = GetStub(stub_.get())->RevokeExternalKvBlocks(&ctx, req, &resp);
+  _rpc_timer.SetStatus(status);
+  return status;
+}
+
+grpc::Status MasterClient::RevokeAllExternalKvBlocksAtTier(const std::string& node_id,
+                                                           TierType tier) {
+  ScopedRpcTimer _rpc_timer(this, "RevokeAllExternalKvBlocksAtTier");
+  ::umbp::RevokeAllExternalKvBlocksAtTierRequest req;
+  req.set_node_id(node_id);
+  req.set_tier(ToProtoTier(tier));
+
+  ::umbp::RevokeAllExternalKvBlocksAtTierResponse resp;
+  grpc::ClientContext ctx;
+  ctx.set_deadline(std::chrono::system_clock::now() +
+                   std::chrono::milliseconds(RpcShutdownTimeoutMs()));
+  auto status = GetStub(stub_.get())->RevokeAllExternalKvBlocksAtTier(&ctx, req, &resp);
+  _rpc_timer.SetStatus(status);
+  return status;
+}
+
 bool MasterClient::BindExternalHashes(const std::vector<std::string>& hashes, TierType tier) {
   if (hashes.empty()) return true;
   std::lock_guard state_lock(hb_state_mutex_);

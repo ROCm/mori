@@ -258,6 +258,31 @@ message ReportMetricsRequest {
 }
 message ReportMetricsResponse {}
 
+// ---- External KV mutation RPCs --------------------------------------------
+// v2.5 added a heartbeat-bundled outbox path for data-plane clients. These
+// direct RPCs remain available for lightweight control-plane callers that need
+// per-call synchronous visibility while writing the same GlobalBlockIndex
+// entries under LOCATION_OWNER_EXTERNAL_HICACHE.
+message ReportExternalKvBlocksRequest {
+  string         node_id = 1;
+  repeated string hashes = 2;
+  TierType       tier    = 3;
+}
+message ReportExternalKvBlocksResponse {}
+
+message RevokeExternalKvBlocksRequest {
+  string         node_id = 1;
+  repeated string hashes = 2;
+  TierType       tier    = 3;
+}
+message RevokeExternalKvBlocksResponse {}
+
+message RevokeAllExternalKvBlocksAtTierRequest {
+  string   node_id = 1;
+  TierType tier    = 2;
+}
+message RevokeAllExternalKvBlocksAtTierResponse {}
+
 message MatchExternalKvRequest {
   repeated string hashes = 1;
   // When true, master increments hit_count_total for every unique hash in
@@ -318,7 +343,13 @@ service UMBPMaster {
   rpc BatchRouteGet   (BatchRouteGetRequest)    returns (BatchRouteGetResponse);
   rpc BatchLookup     (BatchLookupRequest)      returns (BatchLookupResponse);
 
-  // External KV block query
+  // External KV block mutation/query
+  rpc ReportExternalKvBlocks         (ReportExternalKvBlocksRequest)
+      returns (ReportExternalKvBlocksResponse);
+  rpc RevokeExternalKvBlocks         (RevokeExternalKvBlocksRequest)
+      returns (RevokeExternalKvBlocksResponse);
+  rpc RevokeAllExternalKvBlocksAtTier(RevokeAllExternalKvBlocksAtTierRequest)
+      returns (RevokeAllExternalKvBlocksAtTierResponse);
   rpc MatchExternalKv                (MatchExternalKvRequest)
       returns (MatchExternalKvResponse);
   rpc GetExternalKvHitCounts         (GetExternalKvHitCountsRequest)

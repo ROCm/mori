@@ -120,12 +120,24 @@ class IUMBPClient {
   /// These are advisory for MatchExternalKv and are not servable by UMBP ResolveKey.
   virtual bool BindExternalHashes(const std::vector<std::string>& hashes, TierType tier) = 0;
 
+  /// Backward-compatible alias for BindExternalHashes that flushes the external
+  /// event queue before returning.
+  virtual bool ReportExternalKvBlocks(const std::vector<std::string>& hashes, TierType tier) = 0;
+
   /// Revoke `hashes` from a single external tier on this node. Other tiers
   /// for the same hashes are untouched.
   virtual bool UnbindExternalHashes(const std::vector<std::string>& hashes, TierType tier) = 0;
 
+  /// Backward-compatible alias for UnbindExternalHashes that flushes the
+  /// external event queue before returning.
+  virtual bool RevokeExternalKvBlocks(const std::vector<std::string>& hashes, TierType tier) = 0;
+
   /// Bulk-revoke every externally-owned hash currently bound at `tier`.
   virtual bool UnbindAllExternalHashesAtTier(TierType tier) = 0;
+
+  /// Backward-compatible alias for UnbindAllExternalHashesAtTier that flushes
+  /// the external event queue before returning.
+  virtual bool RevokeAllExternalKvBlocksAtTier(TierType tier) = 0;
 
   /// Force an immediate heartbeat carrying any queued external bind/unbind events.
   virtual bool FlushExternalQueue() = 0;
