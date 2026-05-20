@@ -88,6 +88,7 @@ from mori.cpp import (
     UMBPDurabilityConfig,
     UMBPTierType,
     UMBPExternalKvMatch,
+    UMBPExternalKvHitCountEntry,
 )
 
 __all__ = [
@@ -108,4 +109,5 @@ __all__ = [
     "UMBPEvictionConfig",
     "UMBPTierType",
     "UMBPExternalKvMatch",
+    "UMBPExternalKvHitCountEntry",
 ]

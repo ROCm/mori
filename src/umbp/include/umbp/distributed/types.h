@@ -43,6 +43,11 @@ struct TierCapacity {
   uint64_t available_bytes = 0;
 };
 
+struct ExternalKvHitCountEntry {
+  std::string hash;
+  uint64_t hit_count_total = 0;
+};
+
 // In the master-as-advisor design, Location is a (node_id, tier) handle.
 // The peer is the canonical owner of every per-key page set; master holds
 // no per-key page state, so location_id is gone.  `size` is carried so

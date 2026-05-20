@@ -28,7 +28,12 @@ from pathlib import Path
 
 import pytest
 
-from mori.cpp import UMBPMasterClient, UMBPTierType, UMBPExternalKvNodeMatch
+from mori.cpp import (
+    UMBPMasterClient,
+    UMBPTierType,
+    UMBPExternalKvNodeMatch,
+    UMBPExternalKvHitCountEntry,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -58,6 +63,13 @@ def _wait_for_port(host: str, port: int, timeout: float = 10.0) -> bool:
 
 def _make_hashes(prefix: str, count: int) -> list[str]:
     return [f"{prefix}-hash-{i:04d}" for i in range(count)]
+
+
+def _hit_counts(client: UMBPMasterClient, hashes: list[str]) -> dict[str, int]:
+    return {
+        entry.hash: entry.hit_count_total
+        for entry in client.get_external_kv_hit_counts(hashes)
+    }
 
 
 @contextlib.contextmanager
@@ -168,6 +180,11 @@ def test_match_external_kv_unknown_hashes_returns_empty(master_address):
     assert matches == []
 
 
+def test_external_kv_hit_counts_are_sparse_for_unknown_hashes(master_address):
+    client = UMBPMasterClient(master_address)
+    assert client.get_external_kv_hit_counts(_make_hashes("unknown-hit-count", 3)) == []
+
+
 def test_report_empty_hashes_raises(master_address):
     client = UMBPMasterClient(master_address)
     with pytest.raises(RuntimeError, match="empty"):
@@ -194,6 +211,69 @@ def test_report_and_match_external_kv_dram(master_address):
         assert match.matched_hash_count() == len(hashes)
         assert UMBPTierType.DRAM in match.hashes_by_tier
         assert set(match.hashes_by_tier[UMBPTierType.DRAM]) == set(hashes)
+
+
+def test_match_external_kv_count_as_hit_false_does_not_record(master_address):
+    node_id = "hit-count-disabled-node"
+    hashes = _make_hashes("hit-count-disabled", 2)
+
+    with _registered_client(master_address, node_id) as client:
+        client.report_external_kv_blocks(node_id, hashes, UMBPTierType.DRAM)
+
+        for _ in range(3):
+            assert client.match_external_kv(hashes)
+
+        assert client.get_external_kv_hit_counts(hashes) == []
+
+
+def test_match_external_kv_count_as_hit_records_only_matched_unique_hashes(
+    master_address,
+):
+    node_a = "hit-count-node-a"
+    node_b = "hit-count-node-b"
+    hot_hash = "hit-count-unique-hot"
+    missing_hash = "hit-count-unique-missing"
+
+    with (
+        _registered_client(master_address, node_a) as ca,
+        _registered_client(master_address, node_b) as cb,
+    ):
+        ca.report_external_kv_blocks(node_a, [hot_hash], UMBPTierType.DRAM)
+        ca.report_external_kv_blocks(node_a, [hot_hash], UMBPTierType.HBM)
+        cb.report_external_kv_blocks(node_b, [hot_hash], UMBPTierType.DRAM)
+
+        matches = ca.match_external_kv(
+            [hot_hash, hot_hash, hot_hash, missing_hash], count_as_hit=True
+        )
+        assert {m.node_id for m in matches} == {node_a, node_b}
+
+        counts = _hit_counts(ca, [hot_hash, hot_hash, missing_hash])
+        assert counts == {hot_hash: 1}
+
+
+def test_external_kv_hit_counts_accumulate_and_survive_revoke(master_address):
+    node_id = "hit-count-revoke-node"
+    hot_hash = "hit-count-revoke-hot"
+
+    with _registered_client(master_address, node_id) as client:
+        client.report_external_kv_blocks(node_id, [hot_hash], UMBPTierType.DRAM)
+        for _ in range(4):
+            client.match_external_kv([hot_hash], count_as_hit=True)
+
+        assert _hit_counts(client, [hot_hash]) == {hot_hash: 4}
+
+        client.revoke_external_kv_blocks(node_id, [hot_hash], UMBPTierType.DRAM)
+        assert client.match_external_kv([hot_hash], count_as_hit=True) == []
+        assert _hit_counts(client, [hot_hash]) == {hot_hash: 4}
+
+
+def test_get_external_kv_hit_counts_rejects_oversized_batch(master_address):
+    client = UMBPMasterClient(master_address)
+    max_batch = int(os.environ.get("UMBP_HIT_QUERY_MAX_BATCH", "4096"))
+    with pytest.raises(RuntimeError, match="UMBP_HIT_QUERY_MAX_BATCH"):
+        client.get_external_kv_hit_counts(
+            _make_hashes("too-many-hit-counts", max_batch + 1)
+        )
 
 
 def test_report_and_match_external_kv_hbm(master_address):
@@ -320,6 +400,15 @@ def test_external_kv_node_match_repr():
     r = repr(match)
     assert "my-node" in r
     assert match.matched_hash_count() == 2
+
+
+def test_external_kv_hit_count_entry_repr():
+    entry = UMBPExternalKvHitCountEntry()
+    entry.hash = "my-hash"
+    entry.hit_count_total = 7
+    r = repr(entry)
+    assert "my-hash" in r
+    assert "7" in r
 
 
 def test_match_external_kv_connection_refused_raises():

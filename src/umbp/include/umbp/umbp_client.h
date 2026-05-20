@@ -151,8 +151,19 @@ class IUMBPClient {
     }
   };
 
-  /// Query which nodes hold any of the given hashes.
-  virtual std::vector<ExternalKvMatch> MatchExternalKv(const std::vector<std::string>& hashes) = 0;
+  using ExternalKvHitCountEntry = mori::umbp::ExternalKvHitCountEntry;
+
+  /// Query which nodes hold any of the given hashes. Set count_as_hit=true
+  /// only for real user-request routing queries; diagnostic callers should
+  /// keep the default false value.
+  virtual std::vector<ExternalKvMatch> MatchExternalKv(const std::vector<std::string>& hashes,
+                                                       bool count_as_hit = false) = 0;
+
+  /// Sparse lookup of cumulative per-hash routing-hit counters.
+  virtual std::vector<ExternalKvHitCountEntry> GetExternalKvHitCounts(
+      const std::vector<std::string>& /*hashes*/) {
+    return {};
+  }
 };
 
 /// Factory: creates the appropriate IUMBPClient implementation.

@@ -34,6 +34,7 @@
 #include "umbp.grpc.pb.h"
 #include "umbp/common/env_time.h"
 #include "umbp/distributed/master/external_kv_block_index.h"
+#include "umbp/distributed/master/external_kv_hit_index.h"
 #include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/routing/router.h"
 #include "umbp_peer.grpc.pb.h"
@@ -51,6 +52,33 @@ std::chrono::seconds GrpcShutdownDeadline() {
   static const auto v =
       GetEnvSeconds("UMBP_GRPC_SHUTDOWN_DEADLINE_SEC", std::chrono::seconds(3), /*min_allowed=*/1);
   return v;
+}
+
+std::chrono::seconds HitIndexTtl() {
+  static const auto v =
+      GetEnvSeconds("UMBP_HIT_INDEX_TTL_SEC", std::chrono::seconds(7200), /*min_allowed=*/1);
+  return v;
+}
+
+std::chrono::seconds HitIndexGcInterval() {
+  static const auto v =
+      GetEnvSeconds("UMBP_HIT_INDEX_GC_INTERVAL_SEC", std::chrono::seconds(60), /*min_allowed=*/1);
+  return v;
+}
+
+uint32_t HitQueryMaxBatch() {
+  static const uint32_t v = GetEnvUint32("UMBP_HIT_QUERY_MAX_BATCH", 4096, /*min_allowed=*/1);
+  return v;
+}
+
+uint64_t NowNs() {
+  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count());
+}
+
+uint64_t ToNs(std::chrono::seconds value) {
+  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(value).count());
 }
 
 KvEvent FromProtoEvent(const ::umbp::KvEvent& pe) {
@@ -147,11 +175,13 @@ MasterServerConfig MasterServerConfig::FromEnvironment() {
 class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Service {
  public:
   UMBPMasterServiceImpl(ClientRegistry& registry, GlobalBlockIndex& index,
-                        ExternalKvBlockIndex& external_kv_index, Router& router,
+                        ExternalKvBlockIndex& external_kv_index,
+                        ExternalKvHitIndex& external_kv_hit_index, Router& router,
                         const ClientRegistryConfig& config, mori::metrics::MetricsServer* metrics)
       : registry_(registry),
         index_(index),
         external_kv_index_(external_kv_index),
+        external_kv_hit_index_(external_kv_hit_index),
         router_(router),
         config_(config),
         metrics_(metrics) {}
@@ -479,6 +509,21 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
       }
     }
 
+    if (request->count_as_hit() && !matches.empty()) {
+      std::unordered_set<std::string> matched_hashes;
+      for (const auto& m : matches) {
+        for (const auto& [tier, hashes_in_tier] : m.hashes_by_tier) {
+          for (const auto& hash : hashes_in_tier) matched_hashes.insert(hash);
+        }
+      }
+      if (!matched_hashes.empty()) {
+        std::vector<std::string> unique_matched;
+        unique_matched.reserve(matched_hashes.size());
+        for (const auto& hash : matched_hashes) unique_matched.push_back(hash);
+        external_kv_hit_index_.IncrementHits(unique_matched, NowNs());
+      }
+    }
+
     size_t total_matched = 0;
     for (const auto& m : matches) total_matched += m.MatchedHashCount();
     if (metrics_) {
@@ -490,6 +535,28 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
       metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_MATCH_MATCHED_BLOCKS_TOTAL,
                            MORI_UMBP_METRIC_EXT_KV_MATCH_MATCHED_BLOCKS_TOTAL_HELP,
                            static_cast<uint64_t>(total_matched));
+    }
+    return grpc::Status::OK;
+  }
+
+  grpc::Status GetExternalKvHitCounts(grpc::ServerContext* /*ctx*/,
+                                      const ::umbp::GetExternalKvHitCountsRequest* request,
+                                      ::umbp::GetExternalKvHitCountsResponse* response) override {
+    const size_t max_batch = static_cast<size_t>(HitQueryMaxBatch());
+    if (static_cast<size_t>(request->hashes_size()) > max_batch) {
+      return grpc::Status(
+          grpc::StatusCode::INVALID_ARGUMENT,
+          "hashes size exceeds UMBP_HIT_QUERY_MAX_BATCH=" + std::to_string(max_batch));
+    }
+
+    std::vector<std::string> hashes(request->hashes().begin(), request->hashes().end());
+    std::vector<std::pair<std::string, uint64_t>> entries;
+    entries.reserve(hashes.size());
+    external_kv_hit_index_.Lookup(hashes, &entries);
+    for (const auto& [hash, total] : entries) {
+      auto* entry = response->add_entries();
+      entry->set_hash(hash);
+      entry->set_hit_count_total(total);
     }
     return grpc::Status::OK;
   }
@@ -569,6 +636,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
   ClientRegistry& registry_;
   GlobalBlockIndex& index_;
   ExternalKvBlockIndex& external_kv_index_;
+  ExternalKvHitIndex& external_kv_hit_index_;
   Router& router_;
   ClientRegistryConfig config_;
   mori::metrics::MetricsServer* metrics_ = nullptr;
@@ -581,10 +649,12 @@ MasterServer::MasterServer(MasterServerConfig config)
     : config_(std::move(config)),
       index_(),
       external_kv_index_(),
+      external_kv_hit_index_(),
       registry_(config_.registry_config, index_),
       router_(index_, registry_, std::move(config_.get_strategy), std::move(config_.put_strategy)),
       service_(std::make_unique<UMBPMasterServiceImpl>(registry_, index_, external_kv_index_,
-                                                       router_, config_.registry_config, nullptr)),
+                                                       external_kv_hit_index_, router_,
+                                                       config_.registry_config, nullptr)),
       peer_stub_pool_(std::make_unique<MasterPeerStubPool>()),
       eviction_manager_(std::make_unique<EvictionManager>(
           index_, registry_, config_.eviction_config, peer_stub_pool_.get())) {
@@ -608,6 +678,7 @@ void MasterServer::Run() {
 
   registry_.StartReaper();
   eviction_manager_->Start();
+  StartHitIndexGc();
 
   grpc::ServerBuilder builder;
   int selected_port = 0;
@@ -629,6 +700,43 @@ void MasterServer::Shutdown() {
     server_->Shutdown(deadline);
   }
   registry_.StopReaper();
+  StopHitIndexGc();
+}
+
+void MasterServer::StartHitIndexGc() {
+  bool expected = false;
+  if (!hit_index_gc_running_.compare_exchange_strong(expected, true)) return;
+  hit_index_gc_thread_ = std::thread(&MasterServer::HitIndexGcLoop, this);
+  MORI_UMBP_INFO("[Master] External KV hit index GC started (ttl={}s, interval={}s)",
+                 HitIndexTtl().count(), HitIndexGcInterval().count());
+}
+
+void MasterServer::StopHitIndexGc() {
+  bool expected = true;
+  if (!hit_index_gc_running_.compare_exchange_strong(expected, false)) return;
+  hit_index_gc_cv_.notify_one();
+  if (hit_index_gc_thread_.joinable()) hit_index_gc_thread_.join();
+  MORI_UMBP_INFO("[Master] External KV hit index GC stopped");
+}
+
+void MasterServer::HitIndexGcLoop() {
+  const uint64_t ttl_ns = ToNs(HitIndexTtl());
+  while (hit_index_gc_running_) {
+    {
+      std::unique_lock lock(hit_index_gc_cv_mutex_);
+      hit_index_gc_cv_.wait_for(lock, HitIndexGcInterval(),
+                                [this] { return !hit_index_gc_running_.load(); });
+    }
+    if (!hit_index_gc_running_) break;
+
+    const uint64_t now_ns = NowNs();
+    const uint64_t cutoff_ns = now_ns > ttl_ns ? now_ns - ttl_ns : 0;
+    if (cutoff_ns == 0) continue;
+    const size_t dropped = external_kv_hit_index_.GarbageCollect(cutoff_ns);
+    if (dropped > 0) {
+      MORI_UMBP_DEBUG("[Master] External KV hit index GC dropped {} entries", dropped);
+    }
+  }
 }
 
 }  // namespace mori::umbp

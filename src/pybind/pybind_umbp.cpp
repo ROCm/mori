@@ -100,6 +100,15 @@ void RegisterMoriUmbp(py::module_& m) {
                "' matched=" + std::to_string(m.MatchedHashCount()) + ">";
       });
 
+  py::class_<ExternalKvHitCountEntry>(m, "UMBPExternalKvHitCountEntry")
+      .def(py::init<>())
+      .def_readwrite("hash", &ExternalKvHitCountEntry::hash)
+      .def_readwrite("hit_count_total", &ExternalKvHitCountEntry::hit_count_total)
+      .def("__repr__", [](const ExternalKvHitCountEntry& e) {
+        return "<UMBPExternalKvHitCountEntry hash='" + e.hash +
+               "' hit_count_total=" + std::to_string(e.hit_count_total) + ">";
+      });
+
   py::enum_<UMBPRole>(m, "UMBPRole")
       .value("Standalone", UMBPRole::Standalone)
       .value("SharedSSDLeader", UMBPRole::SharedSSDLeader)
@@ -248,6 +257,8 @@ void RegisterMoriUmbp(py::module_& m) {
       .def("revoke_all_external_kv_blocks_at_tier", &IUMBPClient::RevokeAllExternalKvBlocksAtTier,
            py::arg("tier"), py::call_guard<py::gil_scoped_release>())
       .def("match_external_kv", &IUMBPClient::MatchExternalKv, py::arg("hashes"),
+           py::arg("count_as_hit") = false, py::call_guard<py::gil_scoped_release>())
+      .def("get_external_kv_hit_counts", &IUMBPClient::GetExternalKvHitCounts, py::arg("hashes"),
            py::call_guard<py::gil_scoped_release>());
 
   // UMBPMasterClient is a read-only query client for the UMBP master.
@@ -331,12 +342,23 @@ void RegisterMoriUmbp(py::module_& m) {
           py::arg("node_id"), py::arg("tier"), py::call_guard<py::gil_scoped_release>())
       .def(
           "match_external_kv",
-          [](MasterClient& self, const std::vector<std::string>& hashes) {
+          [](MasterClient& self, const std::vector<std::string>& hashes, bool count_as_hit) {
             std::vector<MasterClient::ExternalKvNodeMatch> matches;
-            auto status = self.MatchExternalKv(hashes, &matches);
+            auto status = self.MatchExternalKv(hashes, &matches, count_as_hit);
             if (!status.ok())
               throw std::runtime_error("MatchExternalKv failed: " + status.error_message());
             return matches;
+          },
+          py::arg("hashes"), py::arg("count_as_hit") = false,
+          py::call_guard<py::gil_scoped_release>())
+      .def(
+          "get_external_kv_hit_counts",
+          [](MasterClient& self, const std::vector<std::string>& hashes) {
+            std::vector<MasterClient::ExternalKvHitCountEntry> entries;
+            auto status = self.GetExternalKvHitCounts(hashes, &entries);
+            if (!status.ok())
+              throw std::runtime_error("GetExternalKvHitCounts failed: " + status.error_message());
+            return entries;
           },
           py::arg("hashes"), py::call_guard<py::gil_scoped_release>());
 }

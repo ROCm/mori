@@ -73,7 +73,11 @@ class StandaloneClient : public IUMBPClient {
     return true;
   }
   bool RevokeAllExternalKvBlocksAtTier(TierType /*tier*/) override { return true; }
-  std::vector<ExternalKvMatch> MatchExternalKv(
+  std::vector<ExternalKvMatch> MatchExternalKv(const std::vector<std::string>& /*hashes*/,
+                                               bool /*count_as_hit*/ = false) override {
+    return {};
+  }
+  std::vector<ExternalKvHitCountEntry> GetExternalKvHitCounts(
       const std::vector<std::string>& /*hashes*/) override {
     return {};
   }

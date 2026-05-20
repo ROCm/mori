@@ -775,10 +775,12 @@ grpc::Status MasterClient::RevokeAllExternalKvBlocksAtTier(const std::string& no
 }
 
 grpc::Status MasterClient::MatchExternalKv(const std::vector<std::string>& hashes,
-                                           std::vector<ExternalKvNodeMatch>* out_matches) {
+                                           std::vector<ExternalKvNodeMatch>* out_matches,
+                                           bool count_as_hit) {
   ScopedRpcTimer _rpc_timer(this, "MatchExternalKv");
   ::umbp::MatchExternalKvRequest req;
   for (const auto& h : hashes) req.add_hashes(h);
+  req.set_count_as_hit(count_as_hit);
   ::umbp::MatchExternalKvResponse resp;
   grpc::ClientContext ctx;
   auto status = GetStub(stub_.get())->MatchExternalKv(&ctx, req, &resp);
@@ -794,6 +796,29 @@ grpc::Status MasterClient::MatchExternalKv(const std::vector<std::string>& hashe
         vec.assign(bucket.hashes().begin(), bucket.hashes().end());
       }
       out_matches->push_back(std::move(out));
+    }
+  }
+  return grpc::Status::OK;
+}
+
+grpc::Status MasterClient::GetExternalKvHitCounts(
+    const std::vector<std::string>& hashes, std::vector<ExternalKvHitCountEntry>* out_entries) {
+  ScopedRpcTimer _rpc_timer(this, "GetExternalKvHitCounts");
+  ::umbp::GetExternalKvHitCountsRequest req;
+  for (const auto& h : hashes) req.add_hashes(h);
+  ::umbp::GetExternalKvHitCountsResponse resp;
+  grpc::ClientContext ctx;
+  auto status = GetStub(stub_.get())->GetExternalKvHitCounts(&ctx, req, &resp);
+  _rpc_timer.SetStatus(status);
+  if (!status.ok()) return status;
+  if (out_entries != nullptr) {
+    out_entries->clear();
+    out_entries->reserve(static_cast<size_t>(resp.entries_size()));
+    for (const auto& entry : resp.entries()) {
+      ExternalKvHitCountEntry out;
+      out.hash = entry.hash();
+      out.hit_count_total = entry.hit_count_total();
+      out_entries->push_back(std::move(out));
     }
   }
   return grpc::Status::OK;

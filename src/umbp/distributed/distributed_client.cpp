@@ -292,11 +292,11 @@ bool DistributedClient::RevokeAllExternalKvBlocksAtTier(TierType tier) {
 }
 
 std::vector<IUMBPClient::ExternalKvMatch> DistributedClient::MatchExternalKv(
-    const std::vector<std::string>& hashes) {
+    const std::vector<std::string>& hashes, bool count_as_hit) {
   if (!pool_client_) return {};
 
   std::vector<MasterClient::ExternalKvNodeMatch> raw;
-  if (!pool_client_->MatchExternalKv(hashes, &raw)) return {};
+  if (!pool_client_->MatchExternalKv(hashes, &raw, count_as_hit)) return {};
 
   std::vector<IUMBPClient::ExternalKvMatch> result;
   result.reserve(raw.size());
@@ -306,6 +306,24 @@ std::vector<IUMBPClient::ExternalKvMatch> DistributedClient::MatchExternalKv(
     m.peer_address = std::move(r.peer_address);
     m.hashes_by_tier = std::move(r.hashes_by_tier);
     result.push_back(std::move(m));
+  }
+  return result;
+}
+
+std::vector<IUMBPClient::ExternalKvHitCountEntry> DistributedClient::GetExternalKvHitCounts(
+    const std::vector<std::string>& hashes) {
+  if (!pool_client_) return {};
+
+  std::vector<MasterClient::ExternalKvHitCountEntry> raw;
+  if (!pool_client_->GetExternalKvHitCounts(hashes, &raw)) return {};
+
+  std::vector<IUMBPClient::ExternalKvHitCountEntry> result;
+  result.reserve(raw.size());
+  for (auto& r : raw) {
+    IUMBPClient::ExternalKvHitCountEntry entry;
+    entry.hash = std::move(r.hash);
+    entry.hit_count_total = r.hit_count_total;
+    result.push_back(std::move(entry));
   }
   return result;
 }

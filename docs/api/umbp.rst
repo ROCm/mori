@@ -99,7 +99,12 @@ wheel and exports ``UMBP_MASTER_BIN`` to that path (see
 
 .. code-block:: python
 
-   from mori.cpp import UMBPMasterClient, UMBPTierType, UMBPExternalKvNodeMatch
+   from mori.cpp import (
+       UMBPMasterClient,
+       UMBPTierType,
+       UMBPExternalKvNodeMatch,
+       UMBPExternalKvHitCountEntry,
+   )
 
 ----
 
@@ -221,8 +226,25 @@ for one-shot or short-lived lookups, not for long-running peer membership.
      - **Bulk**: revoke every hash currently registered by ``node_id`` at
        ``tier``.  Used when an entire tier is wiped (storage backend clear
        or detach, host-pool reset).  Other tier buckets are untouched.
-   * - ``match_external_kv(hashes) -> list[UMBPExternalKvNodeMatch]``
-     - Query the master for nodes that hold any of the requested ``hashes``. Returns an empty list when no matches exist or ``hashes`` is empty. Raises ``RuntimeError`` on connection failure.
+   * - ``match_external_kv(hashes, count_as_hit=False) -> list[UMBPExternalKvNodeMatch]``
+     - Query the master for nodes that hold any of the requested ``hashes``.
+       Returns an empty list when no matches exist or ``hashes`` is empty. Set
+       ``count_as_hit=True`` **only** on the real user-request routing path —
+       this is what feeds the hit-tracking index (see
+       `Cache Hit Tracking`_).  Diagnostic, health-check, dashboard, or
+       speculative-probe callers must leave the default ``False`` to avoid
+       polluting the counters.  Raises ``RuntimeError`` on connection failure.
+   * - ``get_external_kv_hit_counts(hashes) -> list[UMBPExternalKvHitCountEntry]``
+     - Sparse lookup of cumulative per-hash routing-hit counters maintained by
+       the master.  Hashes that have never been counted, or whose entry was
+       garbage-collected after ``UMBP_HIT_INDEX_TTL_SEC`` of inactivity, are
+       omitted from the response (not returned with ``hit_count_total=0``).
+       Duplicate request hashes are de-duplicated by the server and yield at
+       most one entry each. Response order is not guaranteed to match request
+       order — build a ``{hash: entry}`` map if you need alignment.  Requests
+       larger than ``UMBP_HIT_QUERY_MAX_BATCH`` (default ``4096``) fail with
+       ``RuntimeError`` carrying ``UMBP_HIT_QUERY_MAX_BATCH`` in the message;
+       the server does **not** silently truncate.
 
 **Protocol notes for non-Python clients:**
 
@@ -231,6 +253,235 @@ contains ``repeated TierHashes hashes_by_tier`` rather than the legacy
 ``matched_hashes + tier`` shape.  A single hash may appear in multiple tier
 buckets for the same node, so consumers must de-duplicate by hash before using a
 match count for routing.
+
+``MatchExternalKvRequest.count_as_hit`` is optional and defaults to ``false``.
+When set to ``true``, the master increments ``hit_count_total`` once for every
+unique queried hash that is actually matched in the external KV placement
+index. Missing hashes are not counted, and the number of nodes or tiers holding
+the same hash does not multiply the increment.
+
+``GetExternalKvHitCounts`` returns ``HitCountEntry`` values sparsely: absent
+hashes are omitted rather than returned with zero. Response ordering is not
+guaranteed to match request ordering, so callers should build a ``hash -> entry``
+map when alignment matters.
+
+----
+
+Cache Hit Tracking
+------------------
+
+**Purpose — hot KV block awareness.** This API tells you, for any KV block
+hash you care about, **how many real-request routing lookups have matched
+it** in the external KV placement index.  That is the basic hotness signal
+you need to identify hot blocks; what you do with that signal — pin them
+to a faster tier, replicate them to more workers, bias the scheduler away
+from evicting them, expose a "hottest prompts" operator dashboard, … — is
+intentionally left to the caller.
+
+The counter records *lookup matches*, not *cache reads*: the master
+increments it the moment a ``count_as_hit=True`` query hits a hash in the
+placement index, with no further visibility into whether the caller went
+on to dispatch the request, whether the routed worker actually served
+from cache, or whether the request was later canceled.  In practice this
+is close enough to traffic hotness as long as ``count_as_hit=True`` is
+restricted to the real routing path (see below); it is **not** a "this
+block was definitely served" log.
+
+UMBP itself does **not** change where blocks live, what gets evicted, or how
+routing decisions are made based on hotness.  It exposes the counter as a
+primitive; downstream policies are user-built on top.
+
+The mechanism is a single in-memory per-hash counter on the master:
+
+* **Increment** on the real user-request routing path by calling
+  ``match_external_kv(hashes, count_as_hit=True)``.
+* **Read** the counter from any process by calling
+  ``get_external_kv_hit_counts(hashes)``.
+
+Keeping ``count_as_hit=True`` out of diagnostic / probe / dashboard / health-
+check callers is what gives the counter its meaning as a *real-routing-path*
+signal; otherwise it degenerates into "how many times did anyone ask about
+this hash".
+
+Finding hot KV blocks (the typical workflow)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+This is the main flow this API is designed for. Four steps:
+
+1. **Wire ``count_as_hit=True`` into the routing path, and only there.**
+   The component that does the placement lookup for an incoming user
+   request should call ``match_external_kv(hashes, count_as_hit=True)``.
+   No other caller should set this flag.  This is what keeps the counter
+   meaningful as a routing-path signal instead of degenerating into
+   "anyone who asked".  (The master only sees the lookup itself, not
+   whether the routing decision was followed through — keeping the flag
+   off auxiliary callers is what makes the signal close to real traffic in
+   practice.)
+
+2. **Maintain the hash universe you want to observe in the caller.**
+   There is no scan, no iteration, no "give me the top-K hottest hashes" RPC
+   — ``get_external_kv_hit_counts`` is a sparse point lookup keyed by the
+   hashes you pass in.  Track the set of hashes you care about yourself
+   (e.g. the union of hashes your workers have reported via
+   ``report_external_kv_blocks``, or the prefix hashes your scheduler has
+   seen).  Split large universes into ``UMBP_HIT_QUERY_MAX_BATCH`` (default
+   ``4096``) chunks per RPC.
+
+3. **Periodically read the counters and rank them.** Any process with
+   network access to the master can do this — your scheduler, a sidecar
+   analyzer, an operator script, a Prometheus exporter.  ``hit_count_total``
+   is comparable across hashes, so a simple ``sorted(..., reverse=True)``
+   on the returned list gives you a hotness ranking.
+
+4. **Plug the ranking into your own policy.**  Examples of what users
+   typically do once they know which blocks are hot — *none of these are
+   implemented by UMBP*; they are the kinds of things this API is meant to
+   enable:
+
+   * Pin the top-K blocks to a faster tier (HBM) and stop evicting them.
+   * Replicate hot blocks to additional workers for more read concurrency.
+   * Skip the recompute fallback for hot prefixes even on a partial cache
+     miss.
+   * Bias the scheduler toward workers that already hold hot blocks, to
+     compound locality.
+   * Expose a "hottest prompts" dashboard to operators.
+
+Lifetime cumulative — not a rate
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``hit_count_total`` is a **lifetime cumulative** counter, not a rate, not
+a sliding window, not exponentially decayed.  It only goes up while the
+entry exists, and is reset only when the entry disappears (master restart,
+or ``UMBP_HIT_INDEX_TTL_SEC`` of inactivity).
+
+For "recent" hotness — i.e. a current-QPS-style ranking instead of an all-
+time ranking — snapshot the counter at two points and diff:
+
+.. code-block:: python
+
+   import time
+
+   def snapshot_counts(client, hashes, batch=4096):
+       counts = {}
+       for i in range(0, len(hashes), batch):
+           for entry in client.get_external_kv_hit_counts(hashes[i : i + batch]):
+               counts[entry.hash] = entry.hit_count_total
+       return counts
+
+   before = snapshot_counts(monitor, hash_universe)
+   time.sleep(300)  # 5 minutes
+   after = snapshot_counts(monitor, hash_universe)
+
+   delta = {
+       h: after[h] - before.get(h, 0)
+       for h in after
+       if after[h] - before.get(h, 0) > 0
+   }
+   recent_hottest = sorted(delta.items(), key=lambda kv: kv[1], reverse=True)[:32]
+   # delta[h] is "hits during the 5-minute window".  Hashes absent from
+   # `after` either had zero traffic in the window or were GC'd from the
+   # hit index after UMBP_HIT_INDEX_TTL_SEC of inactivity.
+
+The raw ``hit_count_total`` itself is most useful as an "ever was hot"
+signal (e.g. when deciding whether to re-warm a block that has just been
+evicted from every tier).
+
+**Counting rules at a glance:**
+
+* Increments happen on the master, not on the client. There is no client-side
+  buffering or batching.
+* Per call, each unique input hash is incremented **at most once**, regardless
+  of how many ``ExternalKvNodeMatch`` entries reference it (same hash on
+  HBM+DRAM+SSD on the same node still counts once; the same hash held by
+  N nodes still counts once).
+* A query that does **not** match anything in the placement index increments
+  nothing — even with ``count_as_hit=True``.
+* ``revoke_external_kv_blocks`` and ``revoke_all_external_kv_blocks_at_tier``
+  do **not** clear the corresponding counters; a block can carry a non-zero
+  lifetime count after its last replica has been dropped.  This is the basis
+  for "this block was hot and just got evicted — should I re-warm it?"
+  policies.
+* The hit index is in-memory only. Counters are lost when the master
+  restarts.
+* Each entry has its own TTL (``UMBP_HIT_INDEX_TTL_SEC``).  An entry is
+  dropped if no ``count_as_hit=True`` call has touched it for that long; the
+  master sweeps for expired entries every ``UMBP_HIT_INDEX_GC_INTERVAL_SEC``.
+  Absent ≠ ``hit_count_total == 0`` — treat absent as "no recent real
+  traffic / no signal".
+
+**Tuning knobs (master process):**
+
+.. list-table::
+   :header-rows: 1
+   :widths: 35 15 50
+
+   * - Env var
+     - Default
+     - Description
+   * - ``UMBP_HIT_INDEX_TTL_SEC``
+     - ``7200``
+     - Per-entry inactivity TTL. A hash with no counted match for longer
+       than this is removed from the hit index.
+   * - ``UMBP_HIT_INDEX_GC_INTERVAL_SEC``
+     - ``60``
+     - Background GC sweep period.
+   * - ``UMBP_HIT_QUERY_MAX_BATCH``
+     - ``4096``
+     - Maximum hashes accepted by one ``get_external_kv_hit_counts``
+       call. Oversized requests fail with ``RuntimeError`` (gRPC
+       ``INVALID_ARGUMENT``).  The server does not truncate; split your
+       request batch on the client side.
+
+See the
+`master env-var reference <../../src/umbp/doc/runtime-env-vars.md>`_ for the
+full master env-var list.
+
+**Where to call from.**  The two RPCs are reachable through two Python
+clients.  Both ultimately go to the same master and read/write the same
+hit index, but their **error semantics differ** — pick the one whose
+behaviour matches what you want:
+
+* ``UMBPMasterClient`` — the lightweight control-plane client documented on
+  this page.  Use it from schedulers, controllers, dashboards, or any
+  process that does not need the RDMA / MORI-IO data plane.  Failures
+  (connection refused, oversized batch, master returning ``INVALID_ARGUMENT``,
+  …) surface as Python ``RuntimeError``.
+* ``mori.cpp.UMBPClient`` — the distributed data-plane client backed by
+  ``DistributedClient`` + ``PoolClient``.  HiCache / data-plane integrations
+  can call ``match_external_kv(hashes, count_as_hit=...)`` and
+  ``get_external_kv_hit_counts(hashes)`` on the same client they already
+  use for Put/Get, avoiding a second connection.  **Caveat:** the
+  data-plane wrapper currently swallows RPC failures and returns an
+  **empty list** rather than raising — an empty response from this client
+  means "no matches **or** the underlying RPC failed".  If you need to
+  distinguish the two (e.g. surface oversized-batch errors), call through
+  ``UMBPMasterClient`` instead.
+
+Both methods are also defined on ``StandaloneClient``, but the standalone
+implementation is a stub that always returns an empty list and never
+contacts a master — it exists only so the ``IUMBPClient`` interface stays
+uniform for non-distributed deployments.
+
+----
+
+UMBPExternalKvHitCountEntry
+---------------------------
+
+Returned by ``get_external_kv_hit_counts()``.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 70
+
+   * - Attribute
+     - Description
+   * - ``hash: str``
+     - KV block hash.
+   * - ``hit_count_total: int``
+     - Lifetime cumulative count of ``match_external_kv(..., count_as_hit=True)``
+       calls in which this hash was actually matched. The count is dropped if
+       the entry is garbage-collected after ``UMBP_HIT_INDEX_TTL_SEC`` of
+       inactivity or if the master restarts.
 
 ----
 
@@ -419,7 +670,97 @@ and per-hash source locations from this response.
    # Production policies should combine this tier cost with recompute cost for
    # `not_found`, queue depth, and worker health/load signals.
 
-For Rust/tonic consumers, mirror the current proto shape:
+**Identifying hot KV blocks (end-to-end):**
+
+The hot-block use case has two pieces, usually but not necessarily in
+different processes:
+
+*Piece 1 — On the request-routing path,* call ``match_external_kv``
+with ``count_as_hit=True`` so each unique hash matched on this lookup
+gets one increment on the master:
+
+.. code-block:: python
+
+   from mori.cpp import UMBPMasterClient
+
+   router = UMBPMasterClient("127.0.0.1:15558")
+
+   def route_request(prefix_hashes):
+       # count_as_hit=True is the ONLY thing that feeds the hit index.
+       # Each unique hash in `prefix_hashes` that actually matches in the
+       # placement index is incremented exactly once on the master.
+       matches = router.match_external_kv(prefix_hashes, count_as_hit=True)
+       if not matches:
+           return None  # cache miss — fall back to a recompute worker
+       return pick_worker_from_matches(matches)  # caller-defined policy
+
+   # Anywhere else (dashboards, probes, health checks, debug tools) that
+   # also wants the placement of these hashes must use count_as_hit=False
+   # so it does not pollute the counter.
+
+*Piece 2 — From anywhere with access to the master,* read the
+counters back to rank your hashes by hotness.  Maintain the hash
+universe in your caller; the master has no scan / top-N RPC.
+
+.. code-block:: python
+
+   import time
+   from mori.cpp import UMBPMasterClient
+
+   monitor = UMBPMasterClient("127.0.0.1:15558")
+
+   # The set of hashes you want to observe — typically the union of
+   # hashes your workers have reported, or the prefix hashes your
+   # scheduler has seen.  You own this set; the master does not enumerate
+   # it for you.
+   tracked_hashes: list[str] = load_tracked_prefix_hashes()
+
+   # Split into UMBP_HIT_QUERY_MAX_BATCH (default 4096) chunks to avoid
+   # RuntimeError on oversized requests.
+   def fetch_counts(client, hashes, batch=4096):
+       counts: dict[str, int] = {}
+       for i in range(0, len(hashes), batch):
+           for entry in client.get_external_kv_hit_counts(hashes[i : i + batch]):
+               counts[entry.hash] = entry.hit_count_total
+       return counts
+
+   while True:
+       counts = fetch_counts(monitor, tracked_hashes)
+       # Hashes with no recorded routing hit are absent — that is NOT the
+       # same as hit_count_total == 0.  Treat absent as "no counted
+       # routing lookup yet" / "GC'd after UMBP_HIT_INDEX_TTL_SEC of
+       # inactivity".
+       hottest = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[:32]
+
+       # What you do with `hottest` is entirely up to you — UMBP does not
+       # change placement or eviction based on this signal.  Examples:
+       #
+       #   pin_to_hbm([h for h, _ in hottest])
+       #   replicate_to_more_workers([h for h, _ in hottest])
+       #   export_to_prometheus(hottest)
+       #
+       time.sleep(30)
+
+If you need *recent* hotness rather than lifetime hotness, replace the
+single ``fetch_counts`` call with the snapshot-and-diff pattern shown in
+the `Cache Hit Tracking`_ section above.
+
+**A few subtle properties worth remembering:**
+
+* A counter survives ``revoke_external_kv_blocks`` /
+  ``revoke_all_external_kv_blocks_at_tier`` — the placement index and the
+  hit index are decoupled.  This is what lets the caller say "this block
+  is no longer cached anywhere but it was hot, let's re-warm it".
+* A counter does **not** survive a master restart or
+  ``UMBP_HIT_INDEX_TTL_SEC`` of inactivity.  Long-tail hashes will
+  eventually fall out of the index; only persistently hot blocks stay.
+* The two pieces above can live in the same process or in different
+  processes on different hosts — both work.  They can use either
+  ``UMBPMasterClient`` or the data-plane ``mori.cpp.UMBPClient``; both
+  share the same hit index on the master.
+
+**For Rust / tonic consumers**, mirror the current proto shape.
+``MatchExternalKv``:
 
 .. code-block:: rust
 
@@ -446,6 +787,25 @@ For Rust/tonic consumers, mirror the current proto shape:
 Do not keep using a legacy ``matched_hashes: Vec<String>, tier: i32`` wrapper:
 it cannot represent one block living on multiple HiCache tiers and will either
 lose tier information or double-count hits.
+
+``GetExternalKvHitCounts``:
+
+.. code-block:: rust
+
+   pub struct HitCountEntry {
+       pub hash: String,
+       pub hit_count_total: u64,
+   }
+
+   // Request: GetExternalKvHitCountsRequest { hashes: Vec<String> }
+   // Response: GetExternalKvHitCountsResponse { entries: Vec<HitCountEntry> }
+   //
+   // - Entries are sparse: hashes that have never been counted, or that
+   //   expired after UMBP_HIT_INDEX_TTL_SEC, are simply omitted.
+   // - Response order is not guaranteed to follow request order; build a
+   //   HashMap<String, u64> keyed by hash.
+   // - Batches larger than UMBP_HIT_QUERY_MAX_BATCH (default 4096) return
+   //   gRPC INVALID_ARGUMENT — split client-side.
 
 **Context-manager pattern for automatic cleanup:**
 

@@ -33,6 +33,18 @@ include(GoogleTest)
 gtest_discover_tests(test_external_kv_block_index)
 
 # ---------------------------------------------------------------------------
+# test_external_kv_hit_index
+# ---------------------------------------------------------------------------
+add_executable(test_external_kv_hit_index test_external_kv_hit_index.cpp)
+
+target_link_libraries(test_external_kv_hit_index PRIVATE umbp_common
+                                                         GTest::gtest_main)
+
+target_compile_features(test_external_kv_hit_index PRIVATE cxx_std_17)
+
+gtest_discover_tests(test_external_kv_hit_index)
+
+# ---------------------------------------------------------------------------
 # test_client_registry_external_kv
 # ---------------------------------------------------------------------------
 add_executable(test_client_registry_external_kv
