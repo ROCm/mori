@@ -83,12 +83,28 @@ jobs:
                 PLAT=\$(auditwheel show \"\$whl\" 2>&1 | grep -o 'manylinux_[0-9_]*_x86_64' | head -1)
                 if [ -z \"\$PLAT\" ]; then PLAT=linux_x86_64; fi
                 NEWNAME=\$(basename \"\$whl\" | sed \"s/linux_x86_64/\$PLAT/\")
-                pip install wheel -q
-                cd /tmp && python3 -m wheel unpack \"\$whl\"
-                UNPACKED=\$(ls -d /tmp/amd_mori_nightly-*/ | head -1)
-                sed -i \"s/linux_x86_64/\$PLAT/\" \"\$UNPACKED\"/*.dist-info/WHEEL
-                python3 -m wheel pack \"\$UNPACKED\" -d /tmp/dist-pypi/
-                rm -rf \"\$UNPACKED\"
+                python3 -c \"
+import zipfile, shutil, os, sys
+src = '\$whl'
+dst = '/tmp/dist-pypi/\$NEWNAME'
+shutil.copy2(src, dst)
+with zipfile.ZipFile(dst, 'r') as zin:
+    names = zin.namelist()
+    wheel_file = [n for n in names if n.endswith('/WHEEL')][0]
+    content = zin.read(wheel_file).decode()
+fixed = content.replace('linux_x86_64', '\$PLAT')
+import tempfile
+tmpfd, tmppath = tempfile.mkstemp(suffix='.whl')
+os.close(tmpfd)
+with zipfile.ZipFile(dst, 'r') as zin, zipfile.ZipFile(tmppath, 'w') as zout:
+    for item in zin.infolist():
+        data = zin.read(item.filename)
+        if item.filename == wheel_file:
+            data = fixed.encode()
+        zout.writestr(item, data)
+shutil.move(tmppath, dst)
+print(f'Retagged: {os.path.basename(dst)}')
+\"
               done
             "
           echo "=== PyPI wheels ==="
