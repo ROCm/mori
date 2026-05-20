@@ -895,8 +895,8 @@ jobs:
 
       - name: Upload to PyPI
         run: |
-          pip install twine
-          python3 -m twine upload ./dist/*.whl || echo "Upload failed (version may already exist)"
+          pip install "twine<6"
+          python3 -m twine upload --skip-existing ./dist/*.whl
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
