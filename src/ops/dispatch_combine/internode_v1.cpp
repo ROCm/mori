@@ -99,6 +99,32 @@ inline __device__ void DispatchIntraNode(EpDispatchCombineArgs<T>& args) {
   int startTokenIdx = (blockId - blockOffset) * tokenPerBlock;
   int endTokenIdx = std::min(startTokenIdx + tokenPerBlock, args.curRankNumToken);
 
+  // Mode-2 replay: stream new payload along the routing layout pinned by the prior mode-1
+  // dispatch. No CAS, no dedup, no map writes — just WarpCopy the new token data to the
+  // destination slot recorded in dispDestTokIdMap. Inter-node destinations were Null'd in
+  // mode-1 (they are handled by the RDMA receive path below), so they're skipped here too.
+  if (args.replayMode) {
+    for (int i = warpId; i < (endTokenIdx - startTokenIdx) * config.numExpertPerToken;
+         i += warpNum) {
+      index_t tokenId = i / config.numExpertPerToken + startTokenIdx;
+      index_t expertOffset = startTokenIdx * config.numExpertPerToken + i;
+
+      const index_t flatIdx = args.dispDestTokIdMap[expertOffset];
+      const index_t destPe = PeFromFlatTokenIndex(config, flatIdx);
+      // destPe == worldSize is the Null sentinel (sentinel/dedup'd or routed inter-node).
+      if (destPe >= config.worldSize) continue;
+      const index_t destLocalTokId = LocalTokIdFromFlatTokenIndex(config, flatIdx);
+
+      const size_t srcTokOffset = (size_t)tokenId * hiddenDim;
+      const size_t destTokOffset = (size_t)destLocalTokId * hiddenDim;
+      core::WarpCopy(args.interNodeV1TokBufs.dispatchOut->template GetAs<T*>(destPe) + destTokOffset,
+                     args.inpTokenBuf + srcTokOffset, hiddenDim);
+    }
+    // destPeTokenCounter intentionally untouched; DispatchSync's recv-num signaling becomes
+    // a `+= 0` no-op in mode-2 so totalRecvTokenNum stays at the pinned mode-1 value.
+    return;
+  }
+
   int localPeTokenCounter = 0;
 
   for (int i = warpId; i < (endTokenIdx - startTokenIdx) * config.numExpertPerToken; i += warpNum) {
@@ -158,6 +184,72 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
     if (i == myNode) continue;
     int proxyPe = i * config.gpuPerNode + (config.rank % config.gpuPerNode);
     if (DEDUP) {
+      // Mode-2 replay: same per-warp iteration as mode-1 (driven by tokenIndices to
+      // determine which lanes are senders) but use the cached destTokId from
+      // interNodeDispSendMap instead of re-running atomicAdd on blockFlagCounter for
+      // slot assignment. The atomicAdd on blockFlagCounter is still issued so that the
+      // counter ends up at the same final value as mode-1 — DispatchSync uses it to
+      // signal the per-node total to the RDMA receiver.
+      if (args.replayMode) {
+        for (int tokenId = startTokenIdx + laneId; tokenId < endTokenIdx; tokenId += warpSize) {
+          bool shouldSend = false;
+          for (int e = 0; e < config.numExpertPerToken; e++) {
+            index_t laneExpert = args.tokenIndices[tokenId * numExpertPerToken + e];
+            if (laneExpert < 0) continue;
+            int destNode = laneExpert / config.numExpertPerRank / config.gpuPerNode;
+            if (destNode == i) shouldSend = true;
+            // Skip rewriting dispDestTokIdMap — already pinned by mode-1.
+          }
+          uint64_t mask = __ballot(shouldSend) & __activemask();
+          uint64_t num = __popcll(mask);
+          if (num == 0) continue;
+
+          // Recover flagSlotId from the cached map: the first sender lane in the warp
+          // had warpOffset == 0, so its destTokId == flagSlotId * warpSize.
+          index_t cachedDestTokId =
+              shouldSend ? args.interNodeDispSendMap[nNodes * tokenId + i] : index_t{0};
+          int firstSenderLane =
+              __ffsll(static_cast<unsigned long long>(mask)) - 1;
+          index_t flagSlotId = __shfl(cachedDestTokId, firstSenderLane) / warpSize;
+          index_t flag = num + 1;
+
+          // Keep blockFlagCounter consistent with mode-1's final value so DispatchSync's
+          // numTokenSignal computation produces the same per-node total. The return value
+          // is intentionally ignored — slot assignment uses the cached value above.
+          if (laneId == 0) {
+            (void)atomicAdd(args.blockFlagCounter + i, 1);
+          }
+
+          if (shouldSend) {
+            bool prev = (laneId > 0) ? ((mask >> (laneId - 1)) & 1ULL) : 0;
+            int count = 0;
+            if (!prev) {
+              count = 1;
+              for (int j = laneId + 1; j < warpSize; j++) {
+                if ((mask >> j) & 1ULL) {
+                  count++;
+                } else {
+                  break;
+                }
+              }
+            }
+            size_t remoteIdx = SendBufSlotOffset(config, myNode, cachedDestTokId);
+            if (count > 0) {
+              size_t stagingTokOffset = tokenId * xferBytes;
+              int qpId = (tokenId / warpSize) % config.numQpPerPe;
+              shmem::ShmemPutMemNbiSignalThread(
+                  args.interNodeV1TokBufs.dispatchInp, remoteIdx * xferBytes,
+                  args.interNodeV1TokBufs.staging, stagingTokOffset, count * xferBytes,
+                  args.interNodeChunkFlagMemObj,
+                  (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t), flag,
+                  core::atomicType::AMO_ADD, proxyPe, qpId);
+            }
+            // interNodeDispSendMap is already pinned — do not rewrite.
+          }
+        }
+        continue;
+      }
+
       for (int tokenId = startTokenIdx + laneId; tokenId < endTokenIdx; tokenId += warpSize) {
         bool shouldSend = false;
         for (int e = 0; e < config.numExpertPerToken; e++) {
@@ -355,6 +447,56 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
   uint64_t* chunkFlag = args.interNodeChunkFlagMemObj->template GetAs<uint64_t*>();
   uint64_t* nodeRecvTokenNum = args.nodeRecvTokenNumMemObj->template GetAs<uint64_t*>();
   uint8_t* stagingPtr = args.interNodeV1TokBufs.dispatchInp->template GetAs<uint8_t*>();
+
+  // Mode-2 replay receive path. Same chunk-flag polling as mode-1 (the chunks still arrive
+  // via fresh RDMA-puts), but use the cached interNodeDispDestTokIdMap to find each
+  // (stagingSlot, expert) pair's destination instead of re-running CAS on
+  // dispTokOffsetMemObj. We only stream the hidden-byte payload; indices/weights/scales
+  // were pinned at the destination by mode-1.
+  if (args.replayMode) {
+    for (int bid = blockId; bid < numRecvBlock * maxChunkNum * (nNodes - 1);
+         bid += args.rdmaBlockNum) {
+      int k = bid / (numRecvBlock * (nNodes - 1));
+      int i = (bid / numRecvBlock) % (nNodes - 1);
+      int node = (myNode + 1 + i) % nNodes;
+      int startTokenIdx = k * warpSize;
+
+      uint64_t thisChunkTokenNum = 0;
+      index_t nodeFlag = 0;
+      if (laneId == 0) {
+        while (1) {
+          thisChunkTokenNum = core::AtomicLoadRelaxedSystem(&chunkFlag[node * maxChunkNum + k]);
+          if (thisChunkTokenNum > 0) break;
+
+          nodeFlag = core::AtomicLoadRelaxedSystem(&nodeRecvTokenNum[node]);
+          if ((nodeFlag > 0) && (startTokenIdx >= (nodeFlag - 1))) {
+            thisChunkTokenNum = 1;
+            break;
+          }
+        }
+      }
+      thisChunkTokenNum = __shfl(thisChunkTokenNum, 0) - 1;
+      int endTokenIdx = startTokenIdx + thisChunkTokenNum;
+
+      for (int j = startTokenIdx + (blockId % numRecvBlock) * warpNum + warpId; j < endTokenIdx;
+           j += numRecvBlock * warpNum) {
+        int tokIdx = SendBufSlotOffset(config, node, j);
+        for (int e = 0; e < config.numExpertPerToken; e++) {
+          index_t destTokId_flat =
+              args.interNodeDispDestTokIdMap[tokIdx * config.numExpertPerToken + e];
+          index_t destPe = PeFromFlatTokenIndex(config, destTokId_flat);
+          if (destPe >= config.worldSize) continue;
+          index_t destLocalTokId = LocalTokIdFromFlatTokenIndex(config, destTokId_flat);
+          core::WarpCopy<uint8_t, 4>(
+              args.interNodeV1TokBufs.dispatchOut->template GetAs<uint8_t*>(destPe) +
+                  destLocalTokId * hiddenBytes,
+              stagingPtr + tokIdx * xferBytes, hiddenBytes);
+        }
+      }
+    }
+    // destPeTokenCounter intentionally untouched in mode-2.
+    return;
+  }
 
   int localPeTokenCounter = 0;
   int totalChunkNum = 0;
@@ -1358,8 +1500,12 @@ __device__ void EpCombineAll_body(EpDispatchCombineArgs<T> args) {
       INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
   MORI_TRACE_SPAN(profiler, Slot::EpCombineAll);
 
+  // releaseHandle == false pins totalRecvTokenNum across this combine so a subsequent
+  // mode-2 replay dispatch (e.g. autograd backward) can reuse the cached layout. The
+  // next "release" combine zeroes it. blockFlagCounter is per-dispatch internal state
+  // and is always reset here so the next dispatch (mode-1 or mode-2) starts at 0.
   if (globalWarpId == 0) {
-    if (laneId == 0) args.totalRecvTokenNum[0] = 0;
+    if (args.releaseHandle && laneId == 0) args.totalRecvTokenNum[0] = 0;
     if (laneId < nNodes) args.blockFlagCounter[laneId] = 0;
   }
   if (args.curRankNumToken == 0) return;

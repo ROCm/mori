@@ -484,7 +484,10 @@ class EpDispatchCombineOp:
         through the precomputed routes. Use this for the autograd backward dispatch so the
         backward routing is bit-identical to the forward.
 
-        Currently only the IntraNode kernel honors replay=True. Other kernel types raise.
+        Currently honored by the IntraNode and InterNodeV1 kernels. The InterNodeV1 replay
+        path still requires ``indices`` to be passed (it drives the per-warp send loop),
+        but only the cached chunk slots / dest slots are used for the actual data motion.
+        Other kernel types raise.
         """
         hidden_dim = input.size(1)
         weight_ptr = weights.data_ptr() if weights is not None else 0
@@ -504,11 +507,26 @@ class EpDispatchCombineOp:
         self._dispatch_dtype = input.dtype
         sfx = _DTYPE_SUFFIX[input.dtype]
 
-        if replay and self.config.kernel_type.value != EpDispatchCombineKernelType.IntraNode.value:
+        _replay_supported = (
+            EpDispatchCombineKernelType.IntraNode.value,
+            EpDispatchCombineKernelType.InterNodeV1.value,
+        )
+        if replay and self.config.kernel_type.value not in _replay_supported:
             raise NotImplementedError(
                 "DeepEP-style replay (replay=True) is currently only supported for "
-                "EpDispatchCombineKernelType.IntraNode. Got "
+                "EpDispatchCombineKernelType.IntraNode and InterNodeV1. Got "
                 f"{self.config.kernel_type}."
+            )
+        if (
+            replay
+            and self.config.kernel_type.value
+            == EpDispatchCombineKernelType.InterNodeV1.value
+            and indices is None
+        ):
+            raise ValueError(
+                "InterNodeV1 replay (replay=True) requires the same `indices` tensor "
+                "that was used for the prior mode-1 dispatch — it drives the per-warp "
+                "send loop. Pass the indices tensor explicitly."
             )
 
         mori_cpp.prepare_inference_args(
@@ -731,8 +749,9 @@ class EpDispatchCombineOp:
         with release=True (typically the backward combine) so the count is zeroed for the
         next iteration.
 
-        Currently honored by the IntraNode kernel; other kernel types ignore it (they
-        always release).
+        Currently honored by the IntraNode and InterNodeV1 kernels (InterNodeV1's
+        ``EpCombineAll`` skips zeroing ``totalRecvTokenNum`` when ``release=False``).
+        Other kernel types ignore it (they always release).
         """
         hidden_dim = input.size(1)
         weight_ptr = (
