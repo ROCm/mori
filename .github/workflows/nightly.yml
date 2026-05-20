@@ -73,17 +73,21 @@ jobs:
 
       - name: Repair PyPI wheels (manylinux tag)
         run: |
-          pip install --user auditwheel patchelf 2>/dev/null || true
-          export PATH="$HOME/.local/bin:$PATH"
           mkdir -p ${{ runner.temp }}/dist-pypi
-          for whl in ${{ runner.temp }}/dist/amd_mori_nightly-*.whl; do
-            PLAT=$(python3 -m auditwheel show "$whl" 2>&1 | grep -o 'manylinux_[0-9_]*_x86_64' | head -1)
-            if [ -n "$PLAT" ]; then
-              python3 -m auditwheel repair "$whl" --plat "$PLAT" -w ${{ runner.temp }}/dist-pypi/
-            else
-              cp "$whl" ${{ runner.temp }}/dist-pypi/
-            fi
-          done
+          $CT run --rm \
+            -v ${{ runner.temp }}/dist:/tmp/dist:ro \
+            -v ${{ runner.temp }}/dist-pypi:/tmp/dist-pypi \
+            $IMAGE bash -c "
+              pip install auditwheel patchelf -q
+              for whl in /tmp/dist/amd_mori_nightly-*.whl; do
+                PLAT=\$(auditwheel show \"\$whl\" 2>&1 | grep -o 'manylinux_[0-9_]*_x86_64' | head -1)
+                if [ -n \"\$PLAT\" ]; then
+                  auditwheel repair \"\$whl\" --plat \"\$PLAT\" -w /tmp/dist-pypi/
+                else
+                  cp \"\$whl\" /tmp/dist-pypi/
+                fi
+              done
+            "
           echo "=== PyPI wheels ==="
           ls -lh ${{ runner.temp }}/dist-pypi/
 
