@@ -914,7 +914,7 @@ jobs:
 
       - name: Upload to PyPI
         run: |
-          pip install "twine<6"
+          pip install twine
           python3 -m twine upload --skip-existing ./dist/*.whl
         env:
           TWINE_USERNAME: __token__
