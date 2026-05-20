@@ -165,8 +165,8 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       size_t srcTokOffset = srcTokId * hiddenDim;
       size_t destTokOffset = destTokId * hiddenDim;
 
-      core::WarpCopy(args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) + destTokOffset,
-                     args.inpTokenBuf + srcTokOffset, hiddenDim);
+      core::WarpCopy<T, 2>(args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) + destTokOffset,
+                           args.inpTokenBuf + srcTokOffset, hiddenDim);
     }
   }
   __syncthreads();
@@ -216,8 +216,9 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
 #endif
 }
 
-template <typename T, bool EnableStdMoE = false>
-__global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
+template <typename T, bool EnableStdMoE = false, int threads = 512, int blocks = 1>
+__global__ void __launch_bounds__(threads, blocks)
+    EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   EpDispatchIntraNodeKernel_body<T, EnableStdMoE>(args);
 }
 
