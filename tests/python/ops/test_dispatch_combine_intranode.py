@@ -82,6 +82,7 @@ def _test_dispatch_combine(
     routing=None,
     use_max_token_num=False,
     check_results=True,
+    sentinel_pattern=None,
 ):
     config = _make_intranode_config(
         rank=rank,
@@ -103,6 +104,7 @@ def _test_dispatch_combine(
         use_max_token_num=use_max_token_num,
         routing=routing,
         check_results=check_results,
+        sentinel_pattern=sentinel_pattern,
     )
 
 
@@ -348,6 +350,122 @@ def test_dispatch_combine_max_total_recv_tokens_under_budget(
 # and hidden_dim=7168.  Only checks that dispatch+combine complete without
 # error; correctness checks are skipped because they are too slow at this scale.
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# DeepEP-style -1 sentinel tests (IntraNode only)
+#
+# Inject ``-1`` into selected top-k slots and verify that dispatch + combine
+# treat them as "drop this slot": no dispatch, no combine contribution.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("world_size", (8,))
+@pytest.mark.parametrize("data_type", (torch.bfloat16,))
+@pytest.mark.parametrize("hidden_dim", (4096,))
+@pytest.mark.parametrize("max_num_inp_token_per_rank", (1, 32))
+@pytest.mark.parametrize("num_experts_per_rank", (1,))
+@pytest.mark.parametrize("num_experts_per_token", (16,))
+@pytest.mark.parametrize(
+    "sentinel_pattern",
+    (None, "first_only", 8),
+)
+def test_dispatch_combine_tp_replicated_with_sentinels(
+    torch_dist_process_manager,
+    world_size,
+    data_type,
+    hidden_dim,
+    max_num_inp_token_per_rank,
+    num_experts_per_rank,
+    num_experts_per_token,
+    sentinel_pattern,
+):
+    """Megatron-style TP-replicated routing combined with -1 sentinels.
+
+    ``num_experts_per_token = world_size * router_topk = 16`` and
+    ``num_experts_per_rank = 1`` mimic ``tp=8, ep=1, router_topk=2``. Each
+    token's slots are grouped: slots ``[0..7]`` route to PEs ``0..7`` and
+    slots ``[8..15]`` route to PEs ``0..7`` again, so dedup must drop all
+    of slots ``[8..15]``. Adding sentinels (``-1``) on top exercises the
+    interaction between dedup-null and sentinel-null on the same token.
+    """
+    for _ in range(world_size):
+        torch_dist_process_manager.task_queue.put(
+            (
+                _test_dispatch_combine,
+                [
+                    world_size,
+                    data_type,
+                    hidden_dim,
+                    max_num_inp_token_per_rank,
+                    num_experts_per_rank,
+                    num_experts_per_token,
+                    True,  # use_external_inp_buf
+                    0,  # scale_dim
+                    1,  # scale_type_size
+                    "none",  # quant_type
+                    0,  # max_total_recv_tokens
+                    "tp_replicated",  # routing
+                    False,  # use_max_token_num
+                    True,  # check_results
+                    sentinel_pattern,
+                ],
+            )
+        )
+
+    assert_worker_results(torch_dist_process_manager, world_size)
+
+
+@pytest.mark.parametrize("world_size", (8,))
+@pytest.mark.parametrize("data_type", (torch.bfloat16,))
+@pytest.mark.parametrize("hidden_dim", (4096,))
+@pytest.mark.parametrize("max_num_inp_token_per_rank", (1, 32))
+@pytest.mark.parametrize("num_experts_per_rank", (32,))
+@pytest.mark.parametrize("num_experts_per_token", (8,))
+@pytest.mark.parametrize(
+    "sentinel_pattern",
+    ("every_other", "first_only", 1, 7),
+)
+def test_dispatch_combine_minus_one_sentinel(
+    torch_dist_process_manager,
+    world_size,
+    data_type,
+    hidden_dim,
+    max_num_inp_token_per_rank,
+    num_experts_per_rank,
+    num_experts_per_token,
+    sentinel_pattern,
+):
+    """Dispatch + combine must treat -1 routing entries as DeepEP-style sentinels.
+
+    For each pattern we check that the kernels skip the -1 slots: combine
+    output equals input * (number of unique non-sentinel PEs).
+    """
+    for _ in range(world_size):
+        torch_dist_process_manager.task_queue.put(
+            (
+                _test_dispatch_combine,
+                [
+                    world_size,
+                    data_type,
+                    hidden_dim,
+                    max_num_inp_token_per_rank,
+                    num_experts_per_rank,
+                    num_experts_per_token,
+                    True,  # use_external_inp_buf
+                    0,  # scale_dim
+                    1,  # scale_type_size
+                    "none",  # quant_type
+                    0,  # max_total_recv_tokens
+                    None,  # routing (default random)
+                    False,  # use_max_token_num
+                    True,  # check_results
+                    sentinel_pattern,
+                ],
+            )
+        )
+
+    assert_worker_results(torch_dist_process_manager, world_size)
 
 
 def test_dispatch_combine_large_token_num(
