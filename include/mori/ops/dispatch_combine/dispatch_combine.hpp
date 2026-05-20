@@ -281,6 +281,21 @@ class EpDispatchCombineHandle {
   index_t multiProcessorCount{0};
   index_t maxThreads{0};
 
+  // DeepEP-style two-mode dispatch toggles.
+  //
+  // replayMode: when true, the next dispatch launch reuses the routing layout
+  // already stored in dispDestTokIdMap / dispTokIdToSrcTokIdMemObj / shmem*
+  // (built by an earlier mode-1 dispatch). The kernel skips the atomic slot
+  // assignment and the recv-num signaling phase — it only moves token data
+  // along the precomputed routes. Defaults to false (mode-1 / CAS race).
+  //
+  // releaseHandle: when true (default), combine zeros totalRecvTokenNum on the
+  // way out so the next mode-1 dispatch starts clean. Set to false on the
+  // forward combine of a pinned forward/backward pair so the cached
+  // totalRecvTokenNum survives until the backward (replay) dispatch reads it.
+  bool replayMode{false};
+  bool releaseHandle{true};
+
  public:
   // Config
   EpDispatchCombineConfig config;
@@ -386,6 +401,9 @@ struct EpDispatchCombineArgs {
   using data_type = T;
   EpDispatchCombineConfig config;
   int rdmaBlockNum{-1};
+  // DeepEP-style two-mode dispatch flags (see EpDispatchCombineHandle for docs).
+  bool replayMode{false};
+  bool releaseHandle{true};
   index_t curRankNumToken{0};
   index_t* tokenIndices{nullptr};
   T* inpTokenBuf{nullptr};
@@ -448,6 +466,10 @@ struct EpDispatchCombineArgs {
 struct EpDispatchCombineArgsRaw {
   EpDispatchCombineConfig config;
   int rdmaBlockNum{-1};
+  // DeepEP-style two-mode dispatch flags. Must mirror EpDispatchCombineArgs<T>
+  // exactly so the static_assert on layout equality continues to hold.
+  bool replayMode{false};
+  bool releaseHandle{true};
   index_t curRankNumToken{0};
   index_t* tokenIndices{nullptr};
   void* inpTokenBuf{nullptr};

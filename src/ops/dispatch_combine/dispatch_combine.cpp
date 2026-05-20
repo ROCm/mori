@@ -411,6 +411,8 @@ EpDispatchCombineArgsRaw GetEpDispatchCombineArgsRaw(const EpDispatchCombineHand
   EpDispatchCombineArgsRaw args;
   args.config = handle.config;
   args.rdmaBlockNum = rdmaBlockNum;
+  args.replayMode = handle.replayMode;
+  args.releaseHandle = handle.releaseHandle;
   args.curRankNumToken = handle.curRankNumToken;
   args.tokenIndices = handle.tokenIndices;
   args.inpTokenBuf = handle.inpTokenBuf;
