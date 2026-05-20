@@ -25,6 +25,10 @@
 #include <hip/hip_runtime_api.h>
 #include <infiniband/verbs.h>
 
+#include <cctype>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <optional>
 
@@ -40,6 +44,45 @@ namespace application {
 /*                                        Device Attributes                                       */
 /* ---------------------------------------------------------------------------------------------- */
 
+namespace {
+
+// Minimum firmware build number required for CCQE support (e.g. "1.117.5-a58" → 58).
+constexpr int kCcqeMinFwBuild = 58;
+
+// Read /sys/class/infiniband/<dev_name>/fw_ver and return the numeric build suffix
+// (the digits after the last '-[letters]' component).  Returns -1 on any failure.
+int ReadIonicFwBuild(const char* dev_name) {
+  char path[256];
+  snprintf(path, sizeof(path), "/sys/class/infiniband/%s/fw_ver", dev_name);
+
+  FILE* f = fopen(path, "r");
+  if (!f) return -1;
+
+  char buf[64] = {};
+  fgets(buf, sizeof(buf), f);
+  fclose(f);
+
+  // Find last '-' then skip letters to reach the build digits.
+  char* dash = strrchr(buf, '-');
+  if (!dash) return -1;
+  char* p = dash + 1;
+  while (*p && !isdigit(static_cast<unsigned char>(*p))) ++p;
+  if (!*p) return -1;
+  return atoi(p);
+}
+
+bool IsCcqeSupported(ibv_context* context) {
+  const char* disable_ccqe = std::getenv("MORI_DISABLE_IONIC_CCQE");
+  if (disable_ccqe && std::strcmp(disable_ccqe, "1") == 0) return false;
+  if (IonicDvApi::Instance().create_cq_ex == nullptr) return false;
+  int build = ReadIonicFwBuild(context->device->name);
+
+  MORI_APP_TRACE("dev: {} fw_build {}", context->device->name, build);
+  return build >= kCcqeMinFwBuild;
+}
+
+}  // namespace
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                          IonicCqContainer                            */
 /* ---------------------------------------------------------------------------------------------- */
@@ -52,14 +95,9 @@ IonicCqContainer::IonicCqContainer(ibv_context* context, const RdmaEndpointConfi
 
   cqeNum = config.maxCqeNum;
 
+  const bool ccqe_enabled = IsCcqeSupported(context);
+
   memset(&cq_attr, 0, sizeof(struct ibv_cq_init_attr_ex));
-#ifdef IONIC_CCQE
-  cq_attr.cqe = 0;
-  MORI_APP_TRACE("cqe mode: ccqe mode");
-#else
-  cq_attr.cqe = cqeNum * 2;  // from rocshmem, send&recv?
-  MORI_APP_TRACE("cqe mode: normal mode");
-#endif
   cq_attr.cq_context = nullptr;
   cq_attr.channel = nullptr;
   cq_attr.comp_vector = 0;
@@ -67,7 +105,20 @@ IonicCqContainer::IonicCqContainer(ibv_context* context, const RdmaEndpointConfi
   cq_attr.comp_mask = IBV_CQ_INIT_ATTR_MASK_PD;
   cq_attr.parent_domain = pd;
 
-  cq_ex = ibv_create_cq_ex(context, &cq_attr);
+  if (ccqe_enabled) {
+    MORI_APP_TRACE("cqe mode: ccqe mode");
+    struct ionic_cq_init_attr_ex ionic_cq_attr;
+    memset(&ionic_cq_attr, 0, sizeof(struct ionic_cq_init_attr_ex));
+    ionic_cq_attr.comp_mask = IONIC_CQ_INIT_ATTR_MASK_FLAGS;
+    ionic_cq_attr.flags = IONIC_CQ_INIT_ATTR_CCQE;
+    cq_attr.cqe = 1;
+    cq_ex = IonicDvApi::Instance().create_cq_ex(context, &cq_attr, &ionic_cq_attr);
+  } else {
+    MORI_APP_TRACE("cqe mode: normal mode");
+    cq_attr.cqe = cqeNum * 2;  // from rocshmem, send&recv?
+    cq_ex = ibv_create_cq_ex(context, &cq_attr);
+  }
+
   assert(cq_ex);
   cq = ibv_cq_ex_to_cq(cq_ex);
   assert(cq);

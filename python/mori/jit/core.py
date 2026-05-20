@@ -114,6 +114,7 @@ def _hipcc_device_bc(
         "-D__HIP_PLATFORM_AMD__",
         "-DHIP_ENABLE_WARP_SYNC_BUILTINS",
         *_nic_defines(),
+        *_ccqe_defines(),
         *_profiler_defines(),
     ]
     for d in include_dirs:
@@ -160,6 +161,107 @@ def _verify_bitcode(cfg: BuildConfig, bc_path: Path) -> None:
             "JIT compilation succeeded but globalGpuStates symbol not found in bitcode. "
             "This is a bug in the JIT compiler."
         )
+
+
+def _lib_has_ionic_ccqe() -> bool:
+    """Check whether the ionic driver supports CCQE by probing the runtime library symbol."""
+    import ctypes
+    import ctypes.util
+
+    lib_name = ctypes.util.find_library("ionic")
+    if lib_name is None:
+        return False
+    try:
+        lib = ctypes.CDLL(lib_name)
+        return hasattr(lib, "ionic_dv_create_cq_ex")
+    except OSError:
+        return False
+
+
+def _parse_ionic_fw_minor(fw_ver: str) -> int | None:
+    """Parse the build number from an ionic firmware string like '1.117.5-a58'.
+
+    Extracts the numeric part from the suffix after '-', e.g. 'a58' → 58, 'a119' → 119.
+    Returns None if the string cannot be parsed.
+    """
+    if fw_ver:
+        return int(fw_ver.split("a")[-1].lstrip("-"))
+
+    return None
+
+
+_CCQE_MIN_FW_MINOR = 58
+
+
+def _is_firmware_support_ccqe(fw_ver: str) -> bool:
+    """Return True if the firmware version string reports build number >= 58."""
+    minor = _parse_ionic_fw_minor(fw_ver)
+    return minor is not None and minor >= _CCQE_MIN_FW_MINOR
+
+
+def _get_ionic_fw_versions() -> list[str]:
+    """Return fw_ver strings for every ionic IB device found in sysfs."""
+    ib_dir = "/sys/class/infiniband"
+    versions: list[str] = []
+    try:
+        for dev in os.listdir(ib_dir):
+            dev_path = os.path.join(ib_dir, dev)
+            driver_link = os.path.join(dev_path, "device", "driver")
+            try:
+                driver_name = os.path.basename(os.readlink(driver_link))
+            except OSError:
+                continue
+            if driver_name not in ("ionic_rdma", "ionic"):
+                continue
+            fw_path = os.path.join(dev_path, "fw_ver")
+            try:
+                fw_ver = Path(fw_path).read_text().strip()
+                versions.append(fw_ver)
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return versions
+
+
+def _is_all_ionic_support_ccqe() -> bool:
+    """Return True only when every ionic device has the same fw version and that version >= 58."""
+    versions = _get_ionic_fw_versions()
+    if not versions:
+        return False
+    if len(set(versions)) != 1:
+        return False
+
+    for ver in versions:
+        if not _is_firmware_support_ccqe(ver):
+            return False
+
+    return True
+
+
+_ccqe_enabled: bool | None = None
+
+
+def is_ccqe_enabled() -> bool:
+    """Return True if CCQE should be enabled (cached after first call)."""
+    global _ccqe_enabled
+    if _ccqe_enabled is None:
+        if os.environ.get("MORI_DISABLE_IONIC_CCQE") == "1":
+            _ccqe_enabled = False
+            print("Ionic _ccqe_enabled: False (disabled by MORI_DISABLE_IONIC_CCQE)")
+        else:
+            lib_support = _lib_has_ionic_ccqe()
+            nic_support = _is_all_ionic_support_ccqe()
+            _ccqe_enabled = lib_support and nic_support
+            print(
+                f"Ionic _ccqe_enabled: {_ccqe_enabled} lib_support {lib_support} nic_support: {nic_support}"
+            )
+
+    return _ccqe_enabled
+
+
+def _ccqe_defines() -> list[str]:
+    return ["-DIONIC_CCQE"] if is_ccqe_enabled() else []
 
 
 def _nic_defines() -> list[str]:
@@ -305,8 +407,10 @@ def _hipcc_genco(
         "-D__HIP_PLATFORM_AMD__",
         "-DHIP_ENABLE_WARP_SYNC_BUILTINS",
         *_nic_defines(),
+        *_ccqe_defines(),
         *_profiler_defines(),
     ]
+    print("genco cmd", cmd)
     for d in include_dirs:
         cmd.extend(["-I", str(d)])
     cmd.extend([str(source), "-o", str(output)])
@@ -379,6 +483,7 @@ def compile_genco(
     cfg = detect_build_config()
     nic = detect_nic_type()
     profiler = is_profiler_enabled()
+    ccqe = is_ccqe_enabled()
     include_dirs = _collect_include_dirs(mori_root)
 
     sub_kernels = _PARALLEL_KERNEL_GROUPS.get(kernel_name)
@@ -387,7 +492,9 @@ def compile_genco(
             mori_root / "src" / "ops" / "kernels",
             mori_root / "include" / "mori",
         ]
-        cache_dir = get_cache_dir(cfg.arch, source_paths, nic, profiler=profiler)
+        cache_dir = get_cache_dir(
+            cfg.arch, source_paths, nic, profiler=profiler, ccqe=ccqe
+        )
 
         hsaco_paths = [cache_dir / f"{k}.hsaco" for k in sub_kernels]
         if all(p.is_file() for p in hsaco_paths):
@@ -432,7 +539,7 @@ def compile_genco(
         raise FileNotFoundError(f"Kernel source not found: {source}")
 
     source_paths = [source, mori_root / "include" / "mori"]
-    cache_dir = get_cache_dir(cfg.arch, source_paths, nic, profiler=profiler)
+    cache_dir = get_cache_dir(cfg.arch, source_paths, nic, profiler=profiler, ccqe=ccqe)
     hsaco_path = cache_dir / f"{kernel_name}.hsaco"
 
     if hsaco_path.is_file():
@@ -448,7 +555,7 @@ def compile_genco(
         nic = detect_nic_type()
         print(
             f"[mori-jit] Compiling {kernel_name} for {cfg.arch} "
-            f"(nic={nic}, profiler={profiler}) ..."
+            f"(nic={nic}, ccqe={ccqe}, profiler={profiler}) ..."
         )
         _hipcc_genco(cfg, source, include_dirs, hsaco_path)
         print(f"[mori-jit]   Cached: {hsaco_path}")
@@ -476,12 +583,15 @@ def ensure_bitcode(*, cov: int = 5) -> str:
 
     nic = detect_nic_type()
     profiler = is_profiler_enabled()
+    ccqe = is_ccqe_enabled()
     source_paths = [
         mori_root / "src" / "shmem" / "shmem_device_api_wrapper.cpp",
         mori_root / "include" / "mori" / "shmem",
         mori_root / "include" / "mori" / "core",
     ]
-    cache_dir = get_cache_dir(cfg.arch, source_paths, nic, profiler=profiler, cov=cov)
+    cache_dir = get_cache_dir(
+        cfg.arch, source_paths, nic, profiler=profiler, cov=cov, ccqe=ccqe
+    )
     bc_path = cache_dir / _BC_FILENAME
 
     if bc_path.is_file():
