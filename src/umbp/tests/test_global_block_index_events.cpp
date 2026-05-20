@@ -260,4 +260,98 @@ TEST(GlobalBlockIndexEvents, FindEvictionCandidatesFiltersByOverloadedNodeTier) 
   EXPECT_EQ(candidates[0].location.tier, TierType::DRAM);
 }
 
+// ---- BatchLookupForRouteGet ------------------------------------------------
+
+TEST(GlobalBlockIndexEvents, BatchLookupForRouteGetEmptyInputReturnsEmpty) {
+  GlobalBlockIndex idx;
+  EXPECT_TRUE(idx.BatchLookupForRouteGet({}, {}, std::chrono::seconds{1}).empty());
+}
+
+TEST(GlobalBlockIndexEvents, BatchLookupForRouteGetMixedHitsAndMisses) {
+  GlobalBlockIndex idx;
+  idx.ApplyEvents("node-A", {Add("k1", TierType::DRAM, 100)});
+  idx.ApplyEvents("node-B", {Add("k1", TierType::DRAM, 200), Add("k2", TierType::HBM, 300)});
+
+  auto ref_k1 = idx.Lookup("k1");
+  auto ref_k2 = idx.Lookup("k2");
+  auto before_k1 = idx.GetMetrics("k1");
+  auto before_k2 = idx.GetMetrics("k2");
+  ASSERT_TRUE(before_k1.has_value());
+  ASSERT_TRUE(before_k2.has_value());
+
+  auto results = idx.BatchLookupForRouteGet({"k1", "ghost", "k2"}, {}, std::chrono::seconds{10});
+  ASSERT_EQ(results.size(), 3u);
+  EXPECT_EQ(results[0], ref_k1);
+  EXPECT_TRUE(results[1].empty());
+  EXPECT_EQ(results[2], ref_k2);
+
+  auto after_k1 = idx.GetMetrics("k1");
+  auto after_k2 = idx.GetMetrics("k2");
+  ASSERT_TRUE(after_k1.has_value());
+  ASSERT_TRUE(after_k2.has_value());
+  EXPECT_EQ(after_k1->access_count, before_k1->access_count + 1);
+  EXPECT_EQ(after_k2->access_count, before_k2->access_count + 1);
+  EXPECT_FALSE(idx.GetMetrics("ghost").has_value());
+}
+
+TEST(GlobalBlockIndexEvents, BatchLookupForRouteGetGrantsLeaseForHitsOnly) {
+  GlobalBlockIndex idx;
+  idx.ApplyEvents("node-A", {Add("hit", TierType::DRAM, 100), Add("other", TierType::DRAM, 200)});
+
+  std::set<GlobalBlockIndex::NodeTierKey> overloaded{{"node-A", TierType::DRAM}};
+  ASSERT_EQ(idx.FindEvictionCandidates(overloaded).size(), 2u);
+
+  idx.BatchLookupForRouteGet({"hit", "ghost"}, {}, std::chrono::seconds{10});
+
+  auto candidates = idx.FindEvictionCandidates(overloaded);
+  ASSERT_EQ(candidates.size(), 1u);
+  EXPECT_EQ(candidates[0].key, "other");
+}
+
+// All replicas excluded -> slot empty, access_count NOT bumped,
+// lease NOT granted.  A key whose every replica is unreachable must
+// not pollute LRU or block eviction.
+TEST(GlobalBlockIndexEvents, BatchLookupForRouteGetSkipsSideEffectsWhenAllReplicasExcluded) {
+  GlobalBlockIndex idx;
+  idx.ApplyEvents("node-A", {Add("k", TierType::DRAM, 100)});
+  idx.ApplyEvents("node-B", {Add("k", TierType::DRAM, 200)});
+
+  auto before = idx.GetMetrics("k");
+  ASSERT_TRUE(before.has_value());
+  std::set<GlobalBlockIndex::NodeTierKey> overloaded{{"node-A", TierType::DRAM},
+                                                     {"node-B", TierType::DRAM}};
+  ASSERT_EQ(idx.FindEvictionCandidates(overloaded).size(), 2u);
+
+  std::unordered_set<std::string> excludes{"node-A", "node-B"};
+  auto results = idx.BatchLookupForRouteGet({"k"}, excludes, std::chrono::seconds{10});
+  ASSERT_EQ(results.size(), 1u);
+  EXPECT_TRUE(results[0].empty());
+
+  auto after = idx.GetMetrics("k");
+  ASSERT_TRUE(after.has_value());
+  EXPECT_EQ(after->access_count, before->access_count);
+  EXPECT_EQ(idx.FindEvictionCandidates(overloaded).size(), 2u);
+}
+
+// Some replicas excluded but not all -> returned slot has only the
+// survivors, access_count IS bumped, lease IS granted.
+TEST(GlobalBlockIndexEvents, BatchLookupForRouteGetFiltersAndLeasesWhenSomeReplicasSurvive) {
+  GlobalBlockIndex idx;
+  idx.ApplyEvents("node-A", {Add("k", TierType::DRAM, 100)});
+  idx.ApplyEvents("node-B", {Add("k", TierType::DRAM, 200)});
+
+  auto before = idx.GetMetrics("k");
+  ASSERT_TRUE(before.has_value());
+
+  std::unordered_set<std::string> excludes{"node-A"};
+  auto results = idx.BatchLookupForRouteGet({"k"}, excludes, std::chrono::seconds{10});
+  ASSERT_EQ(results.size(), 1u);
+  ASSERT_EQ(results[0].size(), 1u);
+  EXPECT_EQ(results[0][0].node_id, "node-B");
+
+  auto after = idx.GetMetrics("k");
+  ASSERT_TRUE(after.has_value());
+  EXPECT_EQ(after->access_count, before->access_count + 1);
+}
+
 }  // namespace mori::umbp

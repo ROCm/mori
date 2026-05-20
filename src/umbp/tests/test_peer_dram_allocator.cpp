@@ -348,6 +348,123 @@ TEST(PeerDramAllocator, BufferDescsForPagesDedupAndOrder) {
   EXPECT_EQ(descs[1].desc_bytes, std::vector<uint8_t>({0xB0, 0xB1}));
 }
 
+// ---- BatchResolve ----------------------------------------------------------
+
+TEST(PeerDramAllocator, BatchResolveEmptyInputReturnsEmpty) {
+  auto a = MakeAllocator();
+  EXPECT_TRUE(a->BatchResolve({}).empty());
+}
+
+TEST(PeerDramAllocator, BatchResolveMixedHitsAndMisses) {
+  auto a = MakeAllocator();
+  // 5 pages over 4-pages-per-buffer config -> exercises dedup'd descs.
+  auto p_hit = AllocateOk(*a, "hit", kPageSize * 5, TierType::DRAM);
+  ASSERT_TRUE(p_hit.has_value());
+  uint64_t committed_bytes = 0;
+  ASSERT_TRUE(a->Commit(p_hit->slot_id, "hit", committed_bytes));
+  auto p_small = AllocateOk(*a, "small", kPageSize, TierType::DRAM);
+  ASSERT_TRUE(p_small.has_value());
+  ASSERT_TRUE(a->Commit(p_small->slot_id, "small", committed_bytes));
+  a->DrainPendingEvents();
+
+  auto ref_hit = a->Resolve("hit");
+  auto ref_descs_hit = a->BufferDescsForPages(ref_hit.tier, ref_hit.pages);
+  auto ref_small = a->Resolve("small");
+  auto ref_descs_small = a->BufferDescsForPages(ref_small.tier, ref_small.pages);
+  ASSERT_TRUE(ref_hit.found);
+  ASSERT_TRUE(ref_small.found);
+
+  auto results = a->BatchResolve({"hit", "ghost-a", "small", "ghost-b"});
+  ASSERT_EQ(results.size(), 4u);
+
+  EXPECT_TRUE(results[0].found);
+  EXPECT_EQ(results[0].tier, ref_hit.tier);
+  EXPECT_EQ(results[0].pages, ref_hit.pages);
+  EXPECT_EQ(results[0].size, ref_hit.size);
+  ASSERT_EQ(results[0].descs.size(), ref_descs_hit.size());
+  for (size_t i = 0; i < ref_descs_hit.size(); ++i) {
+    EXPECT_EQ(results[0].descs[i].buffer_index, ref_descs_hit[i].buffer_index);
+    EXPECT_EQ(results[0].descs[i].desc_bytes, ref_descs_hit[i].desc_bytes);
+  }
+
+  EXPECT_FALSE(results[1].found);
+  EXPECT_TRUE(results[1].pages.empty());
+  EXPECT_EQ(results[1].size, 0u);
+  EXPECT_TRUE(results[1].descs.empty());
+
+  EXPECT_TRUE(results[2].found);
+  EXPECT_EQ(results[2].tier, ref_small.tier);
+  EXPECT_EQ(results[2].pages, ref_small.pages);
+  EXPECT_EQ(results[2].size, ref_small.size);
+  ASSERT_EQ(results[2].descs.size(), ref_descs_small.size());
+  for (size_t i = 0; i < ref_descs_small.size(); ++i) {
+    EXPECT_EQ(results[2].descs[i].buffer_index, ref_descs_small[i].buffer_index);
+    EXPECT_EQ(results[2].descs[i].desc_bytes, ref_descs_small[i].desc_bytes);
+  }
+
+  EXPECT_FALSE(results[3].found);
+}
+
+TEST(PeerDramAllocator, BatchResolveExtendsLeaseForHitsOnly) {
+  auto a = std::make_unique<PeerDramAllocator>(kPageSize, MakeDramCfg(), EmptyCfg(),
+                                               /*pending_ttl=*/std::chrono::milliseconds{5000},
+                                               /*read_lease_ttl=*/std::chrono::milliseconds{500});
+  auto p_x = AllocateOk(*a, "x", kPageSize, TierType::DRAM);
+  ASSERT_TRUE(p_x.has_value());
+  uint64_t committed_bytes = 0;
+  ASSERT_TRUE(a->Commit(p_x->slot_id, "x", committed_bytes));
+  auto p_y = AllocateOk(*a, "y", kPageSize, TierType::DRAM);
+  ASSERT_TRUE(p_y.has_value());
+  ASSERT_TRUE(a->Commit(p_y->slot_id, "y", committed_bytes));
+  a->DrainPendingEvents();
+
+  auto results = a->BatchResolve({"x", "missing", "y"});
+  ASSERT_EQ(results.size(), 3u);
+  ASSERT_TRUE(results[0].found);
+  ASSERT_FALSE(results[1].found);
+  ASSERT_TRUE(results[2].found);
+
+  auto evict = a->Evict({"x", "y"});
+  ASSERT_EQ(evict.size(), 2u);
+  EXPECT_EQ(evict[0].bytes_freed, 0u);
+  EXPECT_EQ(evict[1].bytes_freed, 0u);
+  EXPECT_TRUE(a->Resolve("x").found);
+  EXPECT_TRUE(a->Resolve("y").found);
+  EXPECT_TRUE(a->DrainPendingEvents().empty());
+
+  // Miss must not poison read_lease_until_: a subsequent
+  // Allocate+Commit+Evict on the same key must free as if never touched.
+  auto p_miss = AllocateOk(*a, "missing", kPageSize, TierType::DRAM);
+  ASSERT_TRUE(p_miss.has_value());
+  ASSERT_TRUE(a->Commit(p_miss->slot_id, "missing", committed_bytes));
+  a->DrainPendingEvents();
+  auto evict_missing = a->Evict({"missing"});
+  ASSERT_EQ(evict_missing.size(), 1u);
+  EXPECT_EQ(evict_missing[0].bytes_freed, kPageSize);
+}
+
+TEST(PeerDramAllocator, BatchResolveLeaseExpiresLikeSingleKeyResolve) {
+  auto a = std::make_unique<PeerDramAllocator>(kPageSize, MakeDramCfg(), EmptyCfg(),
+                                               /*pending_ttl=*/std::chrono::milliseconds{5000},
+                                               /*read_lease_ttl=*/std::chrono::milliseconds{50});
+  auto p = AllocateOk(*a, "k", kPageSize, TierType::DRAM);
+  ASSERT_TRUE(p.has_value());
+  uint64_t committed_bytes = 0;
+  ASSERT_TRUE(a->Commit(p->slot_id, "k", committed_bytes));
+  a->DrainPendingEvents();
+
+  auto results = a->BatchResolve({"k"});
+  ASSERT_EQ(results.size(), 1u);
+  ASSERT_TRUE(results[0].found);
+
+  EXPECT_EQ(a->Evict({"k"})[0].bytes_freed, 0u);
+
+  std::this_thread::sleep_for(std::chrono::milliseconds{100});
+  auto evicted = a->Evict({"k"});
+  ASSERT_EQ(evicted.size(), 1u);
+  EXPECT_EQ(evicted[0].bytes_freed, kPageSize);
+}
+
 // ---- Capacities snapshot ----------------------------------------------------
 
 TEST(PeerDramAllocator, TierCapacitiesReflectAllocations) {

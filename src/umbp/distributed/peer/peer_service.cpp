@@ -581,18 +581,20 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
   grpc::Status BatchResolveKeys(grpc::ServerContext* /*ctx*/,
                                 const ::umbp::BatchResolveKeysRequest* request,
                                 ::umbp::BatchResolveKeysResponse* response) override {
-    uint64_t total_bytes = 0;
-    for (const auto& key : request->keys()) {
-      auto* out = response->add_entries();
-      if (dram_alloc_ == nullptr) {
-        out->set_found(false);
-        continue;
+    if (dram_alloc_ == nullptr) {
+      for (int i = 0; i < request->keys_size(); ++i) {
+        response->add_entries()->set_found(false);
       }
-      auto r = dram_alloc_->Resolve(key);
+      return grpc::Status::OK;
+    }
+    std::vector<std::string> keys(request->keys().begin(), request->keys().end());
+    auto resolved = dram_alloc_->BatchResolve(keys);
+    uint64_t total_bytes = 0;
+    for (const auto& r : resolved) {
+      auto* out = response->add_entries();
       out->set_found(r.found);
       if (!r.found) continue;
-      auto descs = dram_alloc_->BufferDescsForPages(r.tier, r.pages);
-      FillPagesAndDescs(out, r.pages, dram_alloc_->PageSize(), descs);
+      FillPagesAndDescs(out, r.pages, dram_alloc_->PageSize(), r.descs);
       out->set_size(r.size);
       total_bytes += r.size;
     }

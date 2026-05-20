@@ -28,6 +28,7 @@
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "umbp/distributed/types.h"
@@ -97,13 +98,12 @@ class GlobalBlockIndex {
   // is dropped first.  REMOVE entries in `adds` are ignored.
   void ReplaceNodeLocations(const std::string& node_id, const std::vector<KvEvent>& adds);
 
-  // Bump last_accessed_at and access_count.  Called by Router on
-  // RouteGet.  Lock-free under the shared lock.
-  void RecordAccess(const std::string& key);
-
-  // Grant a time-limited lease to protect a key from eviction.  Used by
-  // RouteGet to keep a key alive across the writer's RDMA round trip.
-  void GrantLease(const std::string& key, std::chrono::steady_clock::duration duration);
+  // Batched Lookup + filter + (on non-empty result) RecordAccess + GrantLease,
+  // under a single shared_lock.  Fully-excluded or missing keys leave
+  // access/lease state untouched.
+  std::vector<std::vector<Location>> BatchLookupForRouteGet(
+      const std::vector<std::string>& keys, const std::unordered_set<std::string>& exclude_nodes,
+      std::chrono::steady_clock::duration lease_duration);
 
   // --- Queries ---
 

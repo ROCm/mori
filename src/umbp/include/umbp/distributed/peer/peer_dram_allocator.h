@@ -109,6 +109,15 @@ class PeerDramAllocator {
     uint64_t size = 0;
   };
 
+  // ResolveResult + descs built under the same lock.
+  struct ResolvedEntry {
+    bool found = false;
+    TierType tier = TierType::UNKNOWN;
+    std::vector<PageLocation> pages;
+    uint64_t size = 0;
+    std::vector<BufferMemoryDescBytes> descs;
+  };
+
   struct EvictResult {
     std::string key;
     uint64_t bytes_freed = 0;  // 0 if key was unknown / already freed / read-leased
@@ -150,6 +159,10 @@ class PeerDramAllocator {
   // concurrent Evict requests for that key during the lease window
   // report bytes_freed=0.
   ResolveResult Resolve(const std::string& key);
+
+  // Batched Resolve + BufferDescsForPages under a single mutex_ hold.
+  // Per-key behavior byte-identical to Resolve() + BufferDescsForPages().
+  std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys);
 
   // Master-driven eviction.  Idempotent: keys that are unknown or
   // already gone produce zero-bytes entries; keys with active read

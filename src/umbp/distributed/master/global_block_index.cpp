@@ -118,13 +118,6 @@ void GlobalBlockIndex::ReplaceNodeLocations(const std::string& node_id,
   }
 }
 
-void GlobalBlockIndex::RecordAccess(const std::string& key) {
-  std::shared_lock lock(mutex_);
-  auto it = entries_.find(key);
-  if (it == entries_.end()) return;
-  it->second.RecordAccessAtomic();
-}
-
 std::vector<Location> GlobalBlockIndex::Lookup(const std::string& key) const {
   std::shared_lock lock(mutex_);
   auto it = entries_.find(key);
@@ -153,11 +146,27 @@ std::optional<BlockMetrics> GlobalBlockIndex::GetMetrics(const std::string& key)
   return result;
 }
 
-void GlobalBlockIndex::GrantLease(const std::string& key,
-                                  std::chrono::steady_clock::duration duration) {
+std::vector<std::vector<Location>> GlobalBlockIndex::BatchLookupForRouteGet(
+    const std::vector<std::string>& keys, const std::unordered_set<std::string>& exclude_nodes,
+    std::chrono::steady_clock::duration lease_duration) {
+  std::vector<std::vector<Location>> out(keys.size());
+  if (keys.empty()) return out;
   std::shared_lock lock(mutex_);
-  auto it = entries_.find(key);
-  if (it != entries_.end()) it->second.GrantLease(duration);
+  for (size_t i = 0; i < keys.size(); ++i) {
+    auto it = entries_.find(keys[i]);
+    if (it == entries_.end()) continue;
+    auto& locs = out[i];
+    locs = it->second.locations;
+    if (!exclude_nodes.empty()) {
+      locs.erase(std::remove_if(locs.begin(), locs.end(),
+                                [&](const Location& l) { return exclude_nodes.count(l.node_id); }),
+                 locs.end());
+      if (locs.empty()) continue;
+    }
+    it->second.RecordAccessAtomic();
+    it->second.GrantLease(lease_duration);
+  }
+  return out;
 }
 
 std::vector<EvictionCandidate> GlobalBlockIndex::FindEvictionCandidates(

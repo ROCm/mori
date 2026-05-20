@@ -41,44 +41,8 @@ Router::Router(GlobalBlockIndex& index, ClientRegistry& registry,
 std::optional<RouteGetResolution> Router::RouteGet(
     const std::string& key, const std::string& node_id,
     const std::unordered_set<std::string>& exclude_nodes) {
-  auto locations = index_.Lookup(key);
-  if (locations.empty()) {
-    MORI_UMBP_DEBUG("[Router] RouteGet key='{}': not found", key);
-    return std::nullopt;
-  }
-
-  if (!exclude_nodes.empty()) {
-    locations.erase(
-        std::remove_if(locations.begin(), locations.end(),
-                       [&](const Location& l) { return exclude_nodes.count(l.node_id); }),
-        locations.end());
-    if (locations.empty()) {
-      MORI_UMBP_DEBUG("[Router] RouteGet key='{}': every replica excluded", key);
-      return std::nullopt;
-    }
-  }
-
-  Location selected = get_strategy_->Select(locations, node_id);
-  index_.RecordAccess(key);
-  index_.GrantLease(key, lease_duration_);
-
-  // Resolve the peer address for the chosen replica from the registry.
-  // Routing-time read; the reader doesn't need to round-trip master to
-  // discover where to RDMA from.
-  std::string peer_address;
-  for (const auto& client : registry_.GetAliveClients()) {
-    if (client.node_id == selected.node_id) {
-      peer_address = client.peer_address;
-      break;
-    }
-  }
-
-  RouteGetResolution out;
-  out.location = selected;
-  out.peer_address = std::move(peer_address);
-  MORI_UMBP_DEBUG("[Router] RouteGet key='{}': selected node={}, tier={}, size={}", key,
-                  selected.node_id, TierTypeName(selected.tier), selected.size);
-  return out;
+  auto results = BatchRouteGet({key}, node_id, exclude_nodes);
+  return std::move(results.front());
 }
 
 std::optional<RoutePutResult> Router::RoutePut(
@@ -127,32 +91,30 @@ std::vector<std::optional<RouteGetResolution>> Router::BatchRouteGet(
     const std::unordered_set<std::string>& exclude_nodes) {
   std::vector<std::optional<RouteGetResolution>> results(keys.size());
 
-  // Snapshot peer addresses once for the whole batch instead of pulling
-  // them per entry.  Master assumes the snapshot is stable for the
-  // duration of one BatchRouteGet.
+  // Snapshot peer addresses once for the whole batch.  Master assumes
+  // the snapshot is stable for the duration of one BatchRouteGet.
   std::unordered_map<std::string, std::string> node_to_peer;
   for (const auto& client : registry_.GetAliveClients()) {
     node_to_peer[client.node_id] = client.peer_address;
   }
 
+  auto all_locs = index_.BatchLookupForRouteGet(keys, exclude_nodes, lease_duration_);
   for (size_t i = 0; i < keys.size(); ++i) {
-    auto locations = index_.Lookup(keys[i]);
-    if (locations.empty()) continue;
-    if (!exclude_nodes.empty()) {
-      locations.erase(
-          std::remove_if(locations.begin(), locations.end(),
-                         [&](const Location& l) { return exclude_nodes.count(l.node_id); }),
-          locations.end());
-      if (locations.empty()) continue;
+    auto& locations = all_locs[i];
+    if (locations.empty()) {
+      MORI_UMBP_DEBUG(
+          "[Router] BatchRouteGet key='{}': not routed (missing or every replica excluded)",
+          keys[i]);
+      continue;
     }
     Location selected = get_strategy_->Select(locations, node_id);
-    index_.RecordAccess(keys[i]);
-    index_.GrantLease(keys[i], lease_duration_);
 
     RouteGetResolution out;
     out.location = selected;
     auto it = node_to_peer.find(selected.node_id);
     if (it != node_to_peer.end()) out.peer_address = it->second;
+    MORI_UMBP_DEBUG("[Router] BatchRouteGet key='{}': selected node={}, tier={}, size={}", keys[i],
+                    selected.node_id, TierTypeName(selected.tier), selected.size);
     results[i] = std::move(out);
   }
   return results;
