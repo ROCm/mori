@@ -27,6 +27,7 @@
 
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include <optional>
 
@@ -70,6 +71,7 @@ int ReadIonicFwBuild(const char* dev_name) {
 }
 
 bool IsCcqeSupported(ibv_context* context) {
+  if (std::getenv("MORI_DISABLE_IONIC_CCQE")) return false;
   if (IonicDvApi::Instance().create_cq_ex == nullptr) return false;
   int build = ReadIonicFwBuild(context->device->name);
 

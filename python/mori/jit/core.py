@@ -246,12 +246,16 @@ def is_ccqe_enabled() -> bool:
     """Return True if CCQE should be enabled (cached after first call)."""
     global _ccqe_enabled
     if _ccqe_enabled is None:
-        lib_support = _lib_has_ionic_ccqe()
-        nic_support = _is_all_ionic_support_ccqe()
-        _ccqe_enabled = lib_support and nic_support
-        print(
-            f"Ionic _ccqe_enabled: {_ccqe_enabled} lib_support {lib_support} nic_support: {nic_support}"
-        )
+        if os.environ.get("MORI_DISABLE_IONIC_CCQE"):
+            _ccqe_enabled = False
+            print("Ionic _ccqe_enabled: False (disabled by MORI_DISABLE_IONIC_CCQE)")
+        else:
+            lib_support = _lib_has_ionic_ccqe()
+            nic_support = _is_all_ionic_support_ccqe()
+            _ccqe_enabled = lib_support and nic_support
+            print(
+                f"Ionic _ccqe_enabled: {_ccqe_enabled} lib_support {lib_support} nic_support: {nic_support}"
+            )
 
     return _ccqe_enabled
 
