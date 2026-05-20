@@ -139,9 +139,27 @@ class EpDispatchCombineTestCase:
         dist.barrier()
 
     def gen_test_data(
-        self, use_max_token_num=False, routing="random", num_token_override=None
+        self,
+        use_max_token_num=False,
+        routing="random",
+        num_token_override=None,
+        sentinel_pattern=None,
     ):
-        """Generate test data."""
+        """Generate test data.
+
+        ``sentinel_pattern`` controls injection of DeepEP-style ``-1`` sentinels
+        into the per-token routing indices. When set, kernels are expected to
+        skip those slots (no dispatch, no combine contribution). Supported
+        values:
+
+        * ``None``: no sentinels (default).
+        * ``"every_other"``: every other top-k slot of every token is set to
+          ``-1`` (slots ``1, 3, 5, ...``).
+        * ``"first_only"``: only the first slot of every token survives;
+          slots ``[1:]`` are all ``-1``.
+        * ``int k``: deterministically punch ``k`` ``-1`` holes per token at
+          slot indices ``[num_experts_per_token-1, ..., num_experts_per_token-k]``.
+        """
         if num_token_override is not None:
             assert len(num_token_override) == self.config.world_size
             assert min(num_token_override) >= 0
@@ -196,6 +214,30 @@ class EpDispatchCombineTestCase:
                 indices = torch.zeros(
                     n, self.config.num_experts_per_token, dtype=torch.int64
                 )
+            elif routing == "tp_replicated":
+                # Mimics Megatron-style TP-replicated routing: each token's
+                # ``num_experts_per_token`` slots are organised into groups of
+                # ``world_size`` (the TP fanout). Within a group, slot ``g`` of
+                # group ``G`` routes to expert ``g * num_experts_per_rank``
+                # (i.e. the first expert on PE ``g``). Different groups thus
+                # map to the *same* set of PEs, so dedup must drop all but
+                # the first group. Requires
+                # ``num_experts_per_token % world_size == 0``.
+                assert (
+                    self.config.num_experts_per_token
+                    % self.config.world_size
+                    == 0
+                ), (
+                    "tp_replicated routing requires num_experts_per_token % "
+                    "world_size == 0"
+                )
+                indices = torch.empty(
+                    n, self.config.num_experts_per_token, dtype=torch.int64
+                )
+                for i in range(n):
+                    for j in range(self.config.num_experts_per_token):
+                        pe = j % self.config.world_size
+                        indices[i, j] = pe * self.config.num_experts_per_rank
             else:
                 indices = torch.empty(
                     n, self.config.num_experts_per_token, dtype=torch.int64
@@ -207,6 +249,25 @@ class EpDispatchCombineTestCase:
                         device=self.device,
                     )
                     indices[i] = perm[: self.config.num_experts_per_token]
+
+            if sentinel_pattern is not None and n > 0:
+                k = self.config.num_experts_per_token
+                if sentinel_pattern == "every_other":
+                    sentinel_slots = list(range(1, k, 2))
+                elif sentinel_pattern == "first_only":
+                    sentinel_slots = list(range(1, k))
+                elif isinstance(sentinel_pattern, int):
+                    assert 0 <= sentinel_pattern < k, (
+                        f"sentinel_pattern={sentinel_pattern} must be in [0, "
+                        f"num_experts_per_token={k})"
+                    )
+                    sentinel_slots = list(range(k - sentinel_pattern, k))
+                else:
+                    raise ValueError(
+                        f"Unknown sentinel_pattern: {sentinel_pattern!r}"
+                    )
+                for j in sentinel_slots:
+                    indices[:, j] = -1
             all_rank_indices.append(indices.to(torch.int32).to(self.device))
 
         all_rank_weights = [
@@ -325,9 +386,13 @@ class EpDispatchCombineTestCase:
             return
 
         for i in range(all_rank_num_token[self.config.rank]):
+            # Ignore DeepEP-style -1 sentinels: they should be skipped by
+            # both dispatch and combine, so they contribute no PE to the
+            # expected unique-PE multiplier.
             pes = [
                 (idx // self.config.num_experts_per_rank)
                 for idx in all_rank_indices[self.config.rank][i].cpu().tolist()
+                if idx >= 0
             ]
             unique_pes = len(set(pes))
 
@@ -505,6 +570,7 @@ def run_ep_dispatch_combine_test(
     routing=None,
     num_token_override=None,
     check_results=True,
+    sentinel_pattern=None,
 ):
     op = mori.ops.EpDispatchCombineOp(config)
     test_case = test_case_cls(config)
@@ -515,5 +581,7 @@ def run_ep_dispatch_combine_test(
         gen_kwargs["routing"] = routing
     if num_token_override is not None:
         gen_kwargs["num_token_override"] = num_token_override
+    if sentinel_pattern is not None:
+        gen_kwargs["sentinel_pattern"] = sentinel_pattern
     test_data = test_case.gen_test_data(**gen_kwargs)
     test_case.run_test_once(op, test_data, check_results=check_results)

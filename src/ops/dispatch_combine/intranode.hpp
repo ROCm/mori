@@ -109,6 +109,13 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
          i += globalWarpNum) {
       index_t srcTokId = i / config.numExpertPerToken;
       index_t destExpert = args.tokenIndices[i];
+      // DeepEP-style sentinel: a negative expert id means "drop this top-k slot".
+      // Skip the dispatch entirely and write the existing combine-side null sentinel
+      // (PE == worldSize) into dispDestTokIdMap so combine treats this slot as nullptr.
+      if (destExpert < 0) {
+        if (laneId == 0) args.dispDestTokIdMap[i] = FlatTokenIndex(config, config.worldSize, 0);
+        continue;
+      }
       index_t destPe = destExpert / config.numExpertPerRank;
       index_t destTokId = 0;
 
@@ -116,8 +123,8 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       assert(config.numExpertPerToken < warpSize);
       int condition = 0;
       if (laneId < (i % config.numExpertPerToken)) {
-        condition = destPe == (args.tokenIndices[srcTokId * config.numExpertPerToken + laneId] /
-                               config.numExpertPerRank);
+        index_t otherExpert = args.tokenIndices[srcTokId * config.numExpertPerToken + laneId];
+        condition = (otherExpert >= 0) && (destPe == (otherExpert / config.numExpertPerRank));
       }
       if (__any(condition)) {
         // Indicate that this token is already sent to the destination PE by setting an overflow

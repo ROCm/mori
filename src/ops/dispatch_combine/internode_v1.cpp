@@ -103,13 +103,22 @@ inline __device__ void DispatchIntraNode(EpDispatchCombineArgs<T>& args) {
 
   for (int i = warpId; i < (endTokenIdx - startTokenIdx) * config.numExpertPerToken; i += warpNum) {
     index_t tokenId = i / config.numExpertPerToken + startTokenIdx;
-    index_t destPe =
-        args.tokenIndices[startTokenIdx * config.numExpertPerToken + i] / config.numExpertPerRank;
+    index_t expertOffset = startTokenIdx * config.numExpertPerToken + i;
+    index_t destExpert = args.tokenIndices[expertOffset];
+    // DeepEP-style sentinel: drop slots with a negative expert id.
+    if (destExpert < 0) {
+      if (laneId == 0) args.dispDestTokIdMap[expertOffset] = NullFlatTokenIndex(config);
+      continue;
+    }
+    index_t destPe = destExpert / config.numExpertPerRank;
     int destNode = destPe / config.gpuPerNode;
 
     int lanePe = -1, laneNode = -1;
     if (laneId < numExpertPerToken) {
-      lanePe = (args.tokenIndices[tokenId * numExpertPerToken + laneId] / config.numExpertPerRank);
+      index_t laneExpert = args.tokenIndices[tokenId * numExpertPerToken + laneId];
+      // Sentinel lanes get a unique impossible destPe so dedup cannot false-match a real PE.
+      lanePe = (laneExpert < 0) ? (-1 - static_cast<int>(laneId))
+                                : (laneExpert / config.numExpertPerRank);
       laneNode = lanePe / config.gpuPerNode;
     };
 
@@ -117,9 +126,7 @@ inline __device__ void DispatchIntraNode(EpDispatchCombineArgs<T>& args) {
     index_t inTokenExpertId = i % numExpertPerToken;
     if (destNode == myNode) {
       if (__any((laneId < inTokenExpertId) && (destPe == lanePe))) {
-        if (laneId == 0)
-          args.dispDestTokIdMap[startTokenIdx * config.numExpertPerToken + i] =
-              NullFlatTokenIndex(config);
+        if (laneId == 0) args.dispDestTokIdMap[expertOffset] = NullFlatTokenIndex(config);
         continue;
       }
       DispatchIntraNodeBlock(args, tokenId, inTokenExpertId, destPe, localPeTokenCounter);
@@ -154,8 +161,9 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
       for (int tokenId = startTokenIdx + laneId; tokenId < endTokenIdx; tokenId += warpSize) {
         bool shouldSend = false;
         for (int e = 0; e < config.numExpertPerToken; e++) {
-          int destNode = args.tokenIndices[tokenId * numExpertPerToken + e] /
-                         config.numExpertPerRank / config.gpuPerNode;
+          index_t laneExpert = args.tokenIndices[tokenId * numExpertPerToken + e];
+          if (laneExpert < 0) continue;  // DeepEP-style -1 sentinel: drop this slot.
+          int destNode = laneExpert / config.numExpertPerRank / config.gpuPerNode;
           if (destNode == i) {
             shouldSend |= true;
             args.dispDestTokIdMap[tokenId * numExpertPerToken + e] = NullFlatTokenIndex(config);
@@ -212,8 +220,9 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
       for (int tokenId = startTokenIdx + laneId; tokenId < endTokenIdx; tokenId += warpSize) {
         bool shouldSend = false;
         for (int e = 0; e < config.numExpertPerToken; e++) {
-          int destNode = args.tokenIndices[tokenId * numExpertPerToken + e] /
-                         config.numExpertPerRank / config.gpuPerNode;
+          index_t laneExpert = args.tokenIndices[tokenId * numExpertPerToken + e];
+          if (laneExpert < 0) continue;  // DeepEP-style -1 sentinel: drop this slot.
+          int destNode = laneExpert / config.numExpertPerRank / config.gpuPerNode;
           if (destNode == i) {
             shouldSend |= true;
             args.dispDestTokIdMap[tokenId * numExpertPerToken + e] = NullFlatTokenIndex(config);
@@ -283,8 +292,9 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs<T>& args) {
          tokenId += warpSize) {
       bool shouldSend = false;
       for (int e = 0; e < config.numExpertPerToken; e++) {
-        int destNode = args.tokenIndices[tokenId * numExpertPerToken + e] /
-                       config.numExpertPerRank / config.gpuPerNode;
+        index_t laneExpert = args.tokenIndices[tokenId * numExpertPerToken + e];
+        if (laneExpert < 0) continue;  // DeepEP-style -1 sentinel: drop this slot.
+        int destNode = laneExpert / config.numExpertPerRank / config.gpuPerNode;
         if (destNode == i) {
           shouldSend |= true;
           args.dispDestTokIdMap[tokenId * numExpertPerToken + e] = NullFlatTokenIndex(config);
@@ -381,19 +391,27 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
          j += numRecvBlock * warpNum) {
       int tokIdx = SendBufSlotOffset(config, node, j);
       index_t* indices = reinterpret_cast<index_t*>(stagingPtr + tokIdx * xferBytes + hiddenBytes);
+      // DeepEP-style: a lane whose expert id is < 0 (sentinel) gets a unique impossible
+      // destPe so the per-expert dedup compare cannot false-match a real PE-0 slot.
       int lanePe = -1;
       if (laneId < config.numExpertPerToken) {
-        lanePe = indices[laneId] / config.numExpertPerRank;
-        assert((lanePe < config.worldSize) && (lanePe >= 0));
+        index_t laneExpert = indices[laneId];
+        lanePe = (laneExpert < 0) ? (-1 - static_cast<int>(laneId))
+                                  : (laneExpert / config.numExpertPerRank);
+        assert((laneExpert < 0) ||
+               ((lanePe < config.worldSize) && (lanePe >= 0)));
       }
       index_t srcTokId = reinterpret_cast<index_t*>(stagingPtr + tokIdx * xferBytes + hiddenBytes +
                                                     indexBytes + weightBytes + scaleBytes)[0];
 
       for (int e = 0; e < config.numExpertPerToken; e++) {
         int destPe = __shfl(lanePe, e);
-        int destNode = destPe / config.gpuPerNode;
+        // Sentinel slot -> destPe is negative; treat it like "skip".
+        bool isSentinelSlot = (destPe < 0);
+        int destNode = isSentinelSlot ? -1 : destPe / config.gpuPerNode;
 
-        bool shouldSkip = (destNode != myNode) || __any((laneId < e) && (destPe == lanePe));
+        bool shouldSkip = isSentinelSlot || (destNode != myNode) ||
+                          __any((laneId < e) && (destPe == lanePe));
         if (shouldSkip) {
           if (laneId == 0)
             args.interNodeDispDestTokIdMap[tokIdx * config.numExpertPerToken + e] =
@@ -487,18 +505,24 @@ inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs<T>& args) {
     int globalTokenId = SendBufSlotOffset(config, node, tokenId);
     index_t* indices =
         reinterpret_cast<index_t*>(stagingPtr + globalTokenId * xferBytes + hiddenBytes);
+    // DeepEP-style: -1 expert ids get a unique impossible destPe.
     int lanePe = -1;
     if (laneId < config.numExpertPerToken) {
-      lanePe = indices[laneId] / config.numExpertPerRank;
-      assert((lanePe < config.worldSize) && (lanePe >= 0));
+      index_t laneExpert = indices[laneId];
+      lanePe = (laneExpert < 0) ? (-1 - static_cast<int>(laneId))
+                                : (laneExpert / config.numExpertPerRank);
+      assert((laneExpert < 0) ||
+             ((lanePe < config.worldSize) && (lanePe >= 0)));
     }
     index_t srcTokId =
         reinterpret_cast<index_t*>(stagingPtr + globalTokenId * xferBytes + hiddenBytes +
                                    indexBytes + weightBytes + scaleBytes)[0];
 
     int destPe = __shfl(lanePe, expertId);
-    int destNode = destPe / config.gpuPerNode;
-    bool shouldSkip = (destNode != myNode) || __any((laneId < expertId) && (destPe == lanePe));
+    bool isSentinelSlot = (destPe < 0);
+    int destNode = isSentinelSlot ? -1 : destPe / config.gpuPerNode;
+    bool shouldSkip = isSentinelSlot || (destNode != myNode) ||
+                      __any((laneId < expertId) && (destPe == lanePe));
     if (shouldSkip) {
       if (laneId == 0)
         args.interNodeDispDestTokIdMap[globalTokenId * config.numExpertPerToken + expertId] =
@@ -1238,8 +1262,12 @@ __forceinline__ __device__ void EpCombineAllInternalFp8(EpDispatchCombineArgs<T>
 
     int lanePe = -1, laneNode = -1;
     if (laneId < config.numExpertPerToken) {
-      lanePe = (args.tokenIndices[tokenId * numExpertPerToken + laneId] / config.numExpertPerRank);
-      laneNode = lanePe / config.gpuPerNode;
+      index_t laneExpert = args.tokenIndices[tokenId * numExpertPerToken + laneId];
+      // DeepEP-style sentinel: -1 lanes contribute no node so they cannot be claimed.
+      if (laneExpert >= 0) {
+        lanePe = laneExpert / config.numExpertPerRank;
+        laneNode = lanePe / config.gpuPerNode;
+      }
     }
 
     if (laneId < nNodes) {
@@ -1289,8 +1317,12 @@ __forceinline__ __device__ void EpCombineAllGeneric(EpDispatchCombineArgs<T>& ar
 
     int lanePe = -1, laneNode = -1;
     if (laneId < config.numExpertPerToken) {
-      lanePe = (args.tokenIndices[tokenId * numExpertPerToken + laneId] / config.numExpertPerRank);
-      laneNode = lanePe / config.gpuPerNode;
+      index_t laneExpert = args.tokenIndices[tokenId * numExpertPerToken + laneId];
+      // DeepEP-style sentinel: -1 lanes contribute no node so they cannot be claimed.
+      if (laneExpert >= 0) {
+        lanePe = laneExpert / config.numExpertPerRank;
+        laneNode = lanePe / config.gpuPerNode;
+      }
     }
 
     if (laneId < nNodes) {
