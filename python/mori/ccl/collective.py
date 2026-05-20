@@ -20,24 +20,65 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import os
+import time
+
 import torch
 from mori import cpp as mori_cpp
 from typing import Optional
+
+
+# ---------------------------------------------------------------------------
+# JIT compilation for CCL kernels
+# ---------------------------------------------------------------------------
+_ccl_hip_module = None
+
+
+def _ensure_ccl_jit():
+    """JIT compile ccl_kernels.hip and load the HipModule (once)."""
+    global _ccl_hip_module
+    if _ccl_hip_module is not None:
+        return
+    from mori.jit.core import compile_genco
+    from mori.ops._jit_loader import _compiled_hsaco, load_hip_module
+
+    if "ccl_kernels" not in _compiled_hsaco:
+        _compiled_hsaco["ccl_kernels"] = compile_genco(
+            "ccl_kernels", source_dir="src/collective/kernels"
+        )
+    _ccl_hip_module = load_hip_module("ccl_kernels", init_shmem=True)
+
+
+def _get_ccl_func(name: str):
+    """Get a kernel function from the JIT-compiled CCL module."""
+    return _ccl_hip_module.get_function(name)
+
+
+# ---------------------------------------------------------------------------
+# Helpers (unchanged from original)
+# ---------------------------------------------------------------------------
+
+
+def _require_sdma_env(class_name: str) -> None:
+    raw = os.environ.get("MORI_ENABLE_SDMA", "").strip().lower()
+    if raw in ("", "0", "false", "no", "off"):
+        raise RuntimeError(
+            f"{class_name} requires MORI_ENABLE_SDMA=1 in the process "
+            f"environment (got MORI_ENABLE_SDMA={os.environ.get('MORI_ENABLE_SDMA')!r}). "
+            f"Export it before launch on every rank."
+        )
 
 
 _TORCH_DTYPE_TO_NUMPY = {
     torch.uint32: "<u4",
     torch.int32: "<i4",
     torch.float16: "<f2",
-    # torch.as_tensor() cannot materialize bf16 from a raw "void" CUDA array
-    # interface view, so expose it as uint16 and reinterpret via .view().
     torch.bfloat16: "<u2",
     torch.float32: "<f4",
 }
 
 
 def _stream_to_int(stream) -> int:
-    """Convert a torch.cuda.Stream (or None / int) to an integer handle."""
     if stream is None:
         return 0
     if isinstance(stream, int):
@@ -46,9 +87,6 @@ def _stream_to_int(stream) -> int:
 
 
 class _GpuBufferView:
-    """Lightweight wrapper that exposes __cuda_array_interface__ so
-    ``torch.as_tensor`` can wrap a raw GPU pointer without a copy."""
-
     def __init__(self, ptr: int, shape: tuple, typestr: str):
         self.__cuda_array_interface__ = {
             "shape": shape,
@@ -59,7 +97,6 @@ class _GpuBufferView:
 
 
 def _ptr_to_tensor(ptr: int, size_bytes: int, dtype=torch.uint32, device=None):
-    """Wrap a raw GPU pointer as a 1-D torch CUDA tensor (zero-copy view)."""
     elem_size = torch.tensor([], dtype=dtype).element_size()
     num_elements = size_bytes // elem_size
     typestr = _TORCH_DTYPE_TO_NUMPY.get(dtype, "<u4")
@@ -73,7 +110,6 @@ def _ptr_to_tensor(ptr: int, size_bytes: int, dtype=torch.uint32, device=None):
 
 
 def _normalize_cuda_device(device):
-    """Resolve a CUDA tensor/device spec into a torch.device."""
     if device is None:
         return None
     if isinstance(device, torch.Tensor):
@@ -84,35 +120,28 @@ def _normalize_cuda_device(device):
         device = torch.device(device)
     elif not isinstance(device, torch.device):
         raise TypeError("device must be a CUDA tensor, torch.device, int, str, or None")
-
     if device.type != "cuda":
         raise ValueError("device must refer to a CUDA device")
     return device
 
 
 def _resolve_transit_view_args(dtype, device, fallback_dtype):
-    """Support both the new dtype= API and legacy device= calls."""
     if device is None and dtype is not None and not isinstance(dtype, torch.dtype):
         device = dtype
         dtype = None
-
     if isinstance(device, torch.Tensor) and dtype is None:
         dtype = device.dtype
-
     if dtype is None:
         dtype = fallback_dtype
-
     return dtype, _normalize_cuda_device(device)
 
 
-def _cpp_all2all_factory(entity_name: str):
-    """Factory function to get C++ entities from mori_cpp module"""
-    return getattr(mori_cpp, entity_name)
+# ---------------------------------------------------------------------------
+# All2allSdma
+# ---------------------------------------------------------------------------
 
 
 class All2allSdma:
-    """Python wrapper for All2allSdma C++ class"""
-
     def __init__(
         self,
         my_pe: int,
@@ -122,9 +151,11 @@ class All2allSdma:
         transit_buffer_size: Optional[int] = None,
         copy_output_to_user: bool = True,
     ):
+        _require_sdma_env("All2allSdma")
+        _ensure_ccl_jit()
         self.my_pe = my_pe
         self.npes = npes
-        handle_class = _cpp_all2all_factory("All2allSdmaHandle")
+        handle_class = getattr(mori_cpp, "All2allSdmaHandle")
 
         if input_buffer_size is not None and output_buffer_size is not None:
             self._handle = handle_class(
@@ -140,28 +171,35 @@ class All2allSdma:
             )
 
     def __call__(self, input_data, output_data, count: int, stream=None) -> float:
-        """Execute All2All SDMA operation.
-
-        Args:
-            input_data: Input CUDA tensor (1D, GPU memory)
-            output_data: Output CUDA tensor (1D, GPU memory)
-            count: Number of elements per PE
-            stream: Optional torch.cuda.Stream / int / None
-
-        Returns:
-            Execution time in seconds
-        """
-        return self._handle(
-            input_data.data_ptr(), output_data.data_ptr(), count, _stream_to_int(stream)
+        s = _stream_to_int(stream)
+        t0 = time.perf_counter()
+        args = self._handle.prepare_sync(
+            input_data.data_ptr(), output_data.data_ptr(), count, s
         )
+        _get_ccl_func("OneShotAll2allSdmaKernel_u32").launch_struct(
+            (1,), (64,), 0, s, args
+        )
+        self._handle.finish_sync(output_data.data_ptr(), count, s)
+        return time.perf_counter() - t0
 
     def start_async(self, input_data, output_data, count: int, stream=None) -> bool:
-        return self._handle.start_async(
-            input_data.data_ptr(), output_data.data_ptr(), count, _stream_to_int(stream)
+        s = _stream_to_int(stream)
+        args = self._handle.prepare_async_start(
+            input_data.data_ptr(), output_data.data_ptr(), count, s
         )
+        _get_ccl_func("OneShotAll2allSdmaAsyncPutKernel_u32").launch_struct(
+            (1,), (64,), 0, s, args
+        )
+        self._handle.after_async_start()
+        return True
 
     def wait_async(self, stream=None) -> float:
-        return self._handle.wait_async(_stream_to_int(stream))
+        s = _stream_to_int(stream)
+        args = self._handle.prepare_async_wait(s)
+        _get_ccl_func("OneShotAll2allSdmaAsyncWaitKernel_u32").launch_struct(
+            (1,), (512,), 0, s, args
+        )
+        return self._handle.finish_async_wait(s)
 
     def is_async_in_progress(self) -> bool:
         return self._handle.is_async_in_progress()
@@ -173,24 +211,17 @@ class All2allSdma:
         self._handle.reset_flags()
 
     def get_output_transit_buffer(self, dtype=None, device=None):
-        """Get output transit buffer as a PyTorch CUDA tensor (zero-copy view).
-
-        Args:
-            dtype: torch.dtype for the returned tensor view.
-            device: Optional CUDA tensor/device for legacy compatibility.
-        """
         dtype, device = _resolve_transit_view_args(dtype, device, torch.uint32)
         ptr, size_bytes = self._handle.get_output_transit_buffer()
         return _ptr_to_tensor(ptr, size_bytes, dtype, device)
 
 
-def _cpp_allgather_factory(entity_name: str):
-    return getattr(mori_cpp, entity_name)
+# ---------------------------------------------------------------------------
+# AllgatherSdma
+# ---------------------------------------------------------------------------
 
 
 class AllgatherSdma:
-    """Python wrapper for AllgatherSdma C++ class"""
-
     def __init__(
         self,
         my_pe: int,
@@ -200,9 +231,11 @@ class AllgatherSdma:
         transit_buffer_size: Optional[int] = None,
         copy_output_to_user: bool = True,
     ):
+        _require_sdma_env("AllgatherSdma")
+        _ensure_ccl_jit()
         self.my_pe = my_pe
         self.npes = npes
-        handle_class = _cpp_allgather_factory("AllgatherSdmaHandle")
+        handle_class = getattr(mori_cpp, "AllgatherSdmaHandle")
 
         if input_buffer_size is not None and output_buffer_size is not None:
             self._handle = handle_class(
@@ -218,33 +251,38 @@ class AllgatherSdma:
             )
 
     def __call__(self, input_data, output_data, count: int, stream=None) -> bool:
-        """Execute Allgather SDMA operation.
-
-        ``count`` is in *elements* of the tensor dtype; the wrapper converts
-        to a uint32-equivalent count so the SDMA kernel copies the right
-        number of bytes.
-        """
         byte_count = count * input_data.element_size()
         u32_count = (byte_count + 3) // 4
-        return self._handle(
-            input_data.data_ptr(),
-            output_data.data_ptr(),
-            u32_count,
-            _stream_to_int(stream),
+        s = _stream_to_int(stream)
+        args = self._handle.prepare_sync(
+            input_data.data_ptr(), output_data.data_ptr(), u32_count, s
         )
+        _get_ccl_func("OneShotAllGatherSdmaKernel_u32").launch_struct(
+            (1,), (512,), 0, s, args
+        )
+        self._handle.finish_sync(output_data.data_ptr(), u32_count, s)
+        return True
 
     def start_async(self, input_data, output_data, count: int, stream=None) -> bool:
         byte_count = count * input_data.element_size()
         u32_count = (byte_count + 3) // 4
-        return self._handle.start_async(
-            input_data.data_ptr(),
-            output_data.data_ptr(),
-            u32_count,
-            _stream_to_int(stream),
+        s = _stream_to_int(stream)
+        args = self._handle.prepare_async_start(
+            input_data.data_ptr(), output_data.data_ptr(), u32_count, s
         )
+        _get_ccl_func("OneShotAllGatherSdmaAsyncPutKernel_u32").launch_struct(
+            (1,), (512,), 0, s, args
+        )
+        self._handle.after_async_start()
+        return True
 
     def wait_async(self, stream=None) -> float:
-        return self._handle.wait_async(_stream_to_int(stream))
+        s = _stream_to_int(stream)
+        args = self._handle.prepare_async_wait(s)
+        _get_ccl_func("OneShotAllGatherSdmaAsyncWaitKernel_u32").launch_struct(
+            (1,), (64,), 0, s, args
+        )
+        return self._handle.finish_async_wait(s)
 
     def is_async_in_progress(self) -> bool:
         return self._handle.is_async_in_progress()
@@ -256,49 +294,44 @@ class AllgatherSdma:
         self._handle.reset_flags()
 
     def get_output_transit_buffer(self, dtype=None, device=None):
-        """Get output transit buffer as a PyTorch CUDA tensor (zero-copy view)."""
         dtype, device = _resolve_transit_view_args(dtype, device, torch.uint32)
         ptr, size_bytes = self._handle.get_output_transit_buffer()
         return _ptr_to_tensor(ptr, size_bytes, dtype, device)
 
     def register_output_buffer(self, tensor):
-        """Register a CUDA tensor as direct SDMA output target (collective)."""
         self._handle.register_output_buffer(
             tensor.data_ptr(), tensor.numel() * tensor.element_size()
         )
 
     def deregister_output_buffer(self, tensor):
-        """Deregister a previously registered output buffer (collective)."""
         self._handle.deregister_output_buffer(tensor.data_ptr())
 
     def is_output_registered(self, tensor) -> bool:
-        """Check whether an output tensor is registered."""
         return self._handle.is_output_registered(tensor.data_ptr())
 
 
-def _cpp_allreduce_factory(entity_name: str):
-    return getattr(mori_cpp, entity_name)
+# ---------------------------------------------------------------------------
+# AllreduceSdma
+# ---------------------------------------------------------------------------
+
+_DTYPE_TO_SUFFIX = {
+    torch.uint32: "u32",
+    torch.int32: "i32",
+    torch.float32: "f32",
+    torch.float16: "f16",
+    torch.bfloat16: "bf16",
+}
+
+_HANDLE_MAP = {
+    torch.uint32: "AllreduceSdmaHandle",
+    torch.int32: "AllreduceSdmaHandleInt32",
+    torch.float32: "AllreduceSdmaHandleFp32",
+    torch.float16: "AllreduceSdmaHandleFp16",
+    torch.bfloat16: "AllreduceSdmaHandleBf16",
+}
 
 
 class AllreduceSdma:
-    """Python wrapper for AllreduceSdma C++ class.
-
-    Performs AllReduce in two stages:
-      Stage 1: ReduceScatter -- each rank reduces its shard across all peers
-      Stage 2: AllGather -- broadcast reduced shards to all peers via SDMA
-
-    Supported dtypes: torch.uint32, torch.int32, torch.float32, torch.float16,
-    torch.bfloat16
-    """
-
-    _HANDLE_MAP = {
-        torch.uint32: "AllreduceSdmaHandle",
-        torch.int32: "AllreduceSdmaHandleInt32",
-        torch.float32: "AllreduceSdmaHandleFp32",
-        torch.float16: "AllreduceSdmaHandleFp16",
-        torch.bfloat16: "AllreduceSdmaHandleBf16",
-    }
-
     def __init__(
         self,
         my_pe: int,
@@ -310,17 +343,22 @@ class AllreduceSdma:
         dtype: torch.dtype = torch.uint32,
         mode: str = "eager",
     ):
+        _require_sdma_env("AllreduceSdma")
+        _ensure_ccl_jit()
         self.my_pe = my_pe
         self.npes = npes
         self.dtype = dtype
         self.mode = mode
-
-        handle_name = self._HANDLE_MAP.get(dtype)
-        if handle_name is None:
+        self._type_suffix = _DTYPE_TO_SUFFIX.get(dtype)
+        if self._type_suffix is None:
             raise ValueError(
-                f"Unsupported dtype {dtype}. Supported: {list(self._HANDLE_MAP.keys())}"
+                f"Unsupported dtype {dtype}. Supported: {list(_DTYPE_TO_SUFFIX.keys())}"
             )
-        handle_class = _cpp_allreduce_factory(handle_name)
+
+        handle_name = _HANDLE_MAP.get(dtype)
+        if handle_name is None:
+            raise ValueError(f"Unsupported dtype {dtype}")
+        handle_class = getattr(mori_cpp, handle_name)
 
         if input_buffer_size is not None and output_buffer_size is not None:
             self._handle = handle_class(
@@ -335,25 +373,66 @@ class AllreduceSdma:
                 my_pe, npes, 512 * 1024 * 1024, copy_output_to_user
             )
 
-    def __call__(self, input_data, output_data, count: int, stream=None) -> bool:
-        """Execute out-of-place AllReduce SDMA operation."""
-        return self._handle(
-            input_data.data_ptr(), output_data.data_ptr(), count, _stream_to_int(stream)
+    def _run_sync(
+        self,
+        input_data,
+        output_data,
+        count: int,
+        stream=None,
+        force_copy_output: bool = False,
+    ) -> bool:
+        s = _stream_to_int(stream)
+        sfx = self._type_suffix
+        # Step 1: ReduceScatter
+        args = self._handle.prepare_reduce_scatter(
+            input_data.data_ptr(), output_data.data_ptr(), count, s
         )
+        blocks, threads = self._handle.get_reduce_scatter_grid(count)
+        _get_ccl_func(f"SdmaReduceScatterKernel_{sfx}").launch_struct(
+            (blocks,), (threads,), 0, s, args
+        )
+        # Step 2: AllGather
+        args = self._handle.prepare_allgather(count, s)
+        _get_ccl_func(f"AllGatherSdmaKernel_{sfx}").launch_struct(
+            (1,), (512,), 0, s, args
+        )
+        # Sync + copy output
+        self._handle.finish_sync(output_data.data_ptr(), count, s, force_copy_output)
+        return True
+
+    def __call__(self, input_data, output_data, count: int, stream=None) -> bool:
+        return self._run_sync(input_data, output_data, count, stream)
 
     def allreduce_inplace(self, data, count: int, stream=None) -> bool:
-        """Execute in-place AllReduce SDMA operation (result overwrites input)."""
-        return self._handle.allreduce_inplace(
-            data.data_ptr(), count, _stream_to_int(stream)
-        )
+        return self._run_sync(data, data, count, stream, force_copy_output=True)
 
     def start_async(self, input_data, output_data, count: int, stream=None) -> bool:
-        return self._handle.start_async(
-            input_data.data_ptr(), output_data.data_ptr(), count, _stream_to_int(stream)
+        s = _stream_to_int(stream)
+        sfx = self._type_suffix
+        # ReduceScatter
+        args = self._handle.prepare_async_reduce_scatter(
+            input_data.data_ptr(), output_data.data_ptr(), count, s
         )
+        blocks, threads = self._handle.get_reduce_scatter_grid(count)
+        _get_ccl_func(f"SdmaReduceScatterKernel_{sfx}").launch_struct(
+            (blocks,), (threads,), 0, s, args
+        )
+        # AllGather PUT
+        args = self._handle.prepare_async_allgather_put(count, s)
+        _get_ccl_func(f"AllGatherAsyncPutKernel_{sfx}").launch_struct(
+            (1,), (512,), 0, s, args
+        )
+        self._handle.after_async_start()
+        return True
 
     def wait_async(self, stream=None) -> float:
-        return self._handle.wait_async(_stream_to_int(stream))
+        s = _stream_to_int(stream)
+        sfx = self._type_suffix
+        args = self._handle.prepare_async_wait(s)
+        _get_ccl_func(f"AllGatherAsyncWaitKernel_{sfx}").launch_struct(
+            (1,), (64,), 0, s, args
+        )
+        return self._handle.finish_async_wait(s)
 
     def is_async_in_progress(self) -> bool:
         return self._handle.is_async_in_progress()
@@ -365,12 +444,6 @@ class AllreduceSdma:
         self._handle.reset_flags()
 
     def get_output_transit_buffer(self, dtype=None, device=None):
-        """Get output transit buffer as a PyTorch CUDA tensor (zero-copy view).
-
-        Args:
-            dtype: torch.dtype for the view. Defaults to self.dtype.
-            device: Optional CUDA tensor/device for legacy compatibility.
-        """
         dtype, device = _resolve_transit_view_args(dtype, device, self.dtype)
         ptr, size_bytes = self._handle.get_output_transit_buffer()
         return _ptr_to_tensor(ptr, size_bytes, dtype, device)

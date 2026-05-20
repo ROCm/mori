@@ -68,18 +68,25 @@ def precompile():
         ("scatter_gather", "src/io/kernels"),
     ]
 
+    # CCL kernels
+    ccl_kernels = [
+        ("ccl_kernels", "src/collective/kernels"),
+    ]
+
     def _compile_bc():
         return "shmem bitcode", ensure_bitcode()
 
     def _compile_genco(name, source_dir="src/ops/kernels"):
         return name, compile_genco(name, source_dir=source_dir)
 
-    total_tasks = len(all_kernels) + len(io_kernels) + 1
+    total_tasks = len(all_kernels) + len(io_kernels) + len(ccl_kernels) + 1
     with ThreadPoolExecutor(max_workers=total_tasks) as pool:
         futures = [pool.submit(_compile_bc)]
         for name in all_kernels:
             futures.append(pool.submit(_compile_genco, name))
         for name, src_dir in io_kernels:
+            futures.append(pool.submit(_compile_genco, name, src_dir))
+        for name, src_dir in ccl_kernels:
             futures.append(pool.submit(_compile_genco, name, src_dir))
 
         for future in as_completed(futures):

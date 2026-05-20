@@ -75,8 +75,13 @@ void SymmMemManager::HostFree(void* localPtr) {
 
 SymmMemObjPtr SymmMemManager::Malloc(size_t size) {
   void* ptr = nullptr;
-  const bool enableSdma = (std::getenv("MORI_ENABLE_SDMA") != nullptr);
-  if (enableSdma) {
+  // Use the Context-cached snapshot rather than getenv() so this stays
+  // consistent with the transport selection that was made when the Context
+  // was constructed. Without this, late env mutations (e.g. a test setting
+  // MORI_ENABLE_SDMA after worker init) flip allocations to uncached
+  // hipExtMallocWithFlags while transport selection still believes P2P,
+  // producing cache/IPC inconsistency hangs.
+  if (context.IsSdmaEnabled()) {
     HIP_RUNTIME_CHECK(hipExtMallocWithFlags(&ptr, size, hipDeviceMallocUncached));
   } else {
     HIP_RUNTIME_CHECK(hipMalloc(&ptr, size));

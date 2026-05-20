@@ -118,7 +118,7 @@ if(USE_ROCM)
     elseif(GPU_ARCH MATCHES "^gfx9")
       add_definitions(-D__GFX9__=1)
     endif()
-    set(HIP_HIPCC_FLAGS "--amdgpu-target=${GPU_TARGETS}")
+    set(CMAKE_HIP_ARCHITECTURES "${GPU_TARGETS}")
   endif()
 else()
   set(CUDA_HOME /usr/local/cuda)
@@ -150,10 +150,13 @@ set(SPDLOG_BUILD_BENCH
     CACHE BOOL "" FORCE)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 add_subdirectory(3rdparty/spdlog)
+# Hide spdlog symbols from other libraries to avoid symbol conflicts
+target_compile_options(spdlog PRIVATE -fvisibility=hidden
+                                      -fvisibility-inlines-hidden)
 
 add_library(mori_logging INTERFACE)
 target_include_directories(mori_logging INTERFACE include)
-target_link_libraries(mori_logging INTERFACE spdlog::spdlog)
+target_link_libraries(mori_logging INTERFACE spdlog::spdlog_header_only)
 
 if(ENABLE_PROFILER)
   find_package(

@@ -65,10 +65,11 @@ inline int getDeviceMaxBlocks() {
 // This replaces the previous hipStreamSynchronize — no host blocking needed.
 // ============================================================================
 template <typename T>
-__global__ void ReduceScatterKernel(int myPe, int npes, const application::SymmMemObjPtr srcMemObj,
-                                    const application::SymmMemObjPtr dstMemObj,
-                                    const application::SymmMemObjPtr barrierObj,
-                                    size_t elementCount) {
+__device__ void ReduceScatterKernel_body(int myPe, int npes,
+                                         const application::SymmMemObjPtr srcMemObj,
+                                         const application::SymmMemObjPtr dstMemObj,
+                                         const application::SymmMemObjPtr barrierObj,
+                                         size_t elementCount) {
   if (elementCount == 0 || npes <= 0) {
     return;
   }
@@ -130,6 +131,14 @@ __global__ void ReduceScatterKernel(int myPe, int npes, const application::SymmM
   }
 }
 
+template <typename T>
+__global__ void ReduceScatterKernel(int myPe, int npes, const application::SymmMemObjPtr srcMemObj,
+                                    const application::SymmMemObjPtr dstMemObj,
+                                    const application::SymmMemObjPtr barrierObj,
+                                    size_t elementCount) {
+  ReduceScatterKernel_body<T>(myPe, npes, srcMemObj, dstMemObj, barrierObj, elementCount);
+}
+
 // ============================================================================
 // SdmaReduceScatterKernel — SDMA scatter + local reduce in ONE kernel
 //
@@ -148,10 +157,11 @@ __global__ void ReduceScatterKernel(int myPe, int npes, const application::SymmM
 // Requirement: gridDim.x <= multiProcessorCount (co-resident blocks).
 // ============================================================================
 template <typename T>
-__global__ void SdmaReduceScatterKernel(int myPe, int npes, const T* __restrict__ input,
-                                        const application::SymmMemObjPtr dstMemObj,
-                                        const application::SymmMemObjPtr flagsMemObj,
-                                        CrossPeBarrier* __restrict__ barrier, size_t elementCount) {
+__device__ void SdmaReduceScatterKernel_body(int myPe, int npes, const T* __restrict__ input,
+                                             const application::SymmMemObjPtr dstMemObj,
+                                             const application::SymmMemObjPtr flagsMemObj,
+                                             CrossPeBarrier* __restrict__ barrier,
+                                             size_t elementCount) {
   if (elementCount == 0 || npes <= 0) return;
 
   using P = typename packed_t<T>::P;
@@ -283,6 +293,14 @@ __global__ void SdmaReduceScatterKernel(int myPe, int npes, const T* __restrict_
 #endif
 }
 
+template <typename T>
+__global__ void SdmaReduceScatterKernel(int myPe, int npes, const T* __restrict__ input,
+                                        const application::SymmMemObjPtr dstMemObj,
+                                        const application::SymmMemObjPtr flagsMemObj,
+                                        CrossPeBarrier* __restrict__ barrier, size_t elementCount) {
+  SdmaReduceScatterKernel_body<T>(myPe, npes, input, dstMemObj, flagsMemObj, barrier, elementCount);
+}
+
 // ============================================================================
 // AllGatherSdmaKernel — AllGather via SDMA
 //
@@ -290,9 +308,11 @@ __global__ void SdmaReduceScatterKernel(int myPe, int npes, const T* __restrict_
 // to every rank via SDMA put, then waits for all peers to finish.
 // ============================================================================
 template <typename T>
-__global__ void AllGatherSdmaKernel(int myPe, int npes, const application::SymmMemObjPtr dstMemObj,
-                                    const application::SymmMemObjPtr flagsMemObj,
-                                    CrossPeBarrier* __restrict__ barrier, size_t elementCount) {
+__device__ void AllGatherSdmaKernel_body(int myPe, int npes,
+                                         const application::SymmMemObjPtr dstMemObj,
+                                         const application::SymmMemObjPtr flagsMemObj,
+                                         CrossPeBarrier* __restrict__ barrier,
+                                         size_t elementCount) {
   if (elementCount == 0 || npes <= 0) {
     return;
   }
@@ -372,6 +392,13 @@ __global__ void AllGatherSdmaKernel(int myPe, int npes, const application::SymmM
   }
 
   // Flags are monotonic generation tokens (AMO_SET), so no reset is needed.
+}
+
+template <typename T>
+__global__ void AllGatherSdmaKernel(int myPe, int npes, const application::SymmMemObjPtr dstMemObj,
+                                    const application::SymmMemObjPtr flagsMemObj,
+                                    CrossPeBarrier* __restrict__ barrier, size_t elementCount) {
+  AllGatherSdmaKernel_body<T>(myPe, npes, dstMemObj, flagsMemObj, barrier, elementCount);
 }
 
 }  // namespace collective

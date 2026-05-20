@@ -57,7 +57,7 @@ def _make_intranode_config(
         num_experts_per_rank=num_experts_per_rank,
         num_experts_per_token=num_experts_per_token,
         max_token_type_size=4,
-        block_num=256,
+        block_num=64,
         warp_num_per_block=4,
         use_external_inp_buf=use_external_inp_buf,
         kernel_type=mori.ops.EpDispatchCombineKernelType.IntraNode,
@@ -118,7 +118,7 @@ def _test_dispatch_combine(
 @pytest.mark.parametrize("num_experts_per_rank", (32,))
 @pytest.mark.parametrize("num_experts_per_token", (8,))
 @pytest.mark.parametrize("use_external_inp_buf", (True, False))
-@pytest.mark.parametrize("quant_type", ("none", "fp8_direct_cast"))
+@pytest.mark.parametrize("quant_type", ("none", "fp8_direct_cast", "fp8_blockwise"))
 def test_dispatch_combine(
     torch_dist_process_manager,
     world_size,
@@ -137,6 +137,13 @@ def test_dispatch_combine(
         pytest.skip("fp8_direct_cast is not supported in zero-copy mode")
     if quant_type == "fp8_direct_cast" and data_type is not torch.bfloat16:
         pytest.skip("fp8_direct_cast is only supported for bfloat16 data type")
+    if quant_type == "fp8_blockwise":
+        if data_type is not torch.bfloat16:
+            pytest.skip("fp8_blockwise only supports bfloat16 input")
+        if not use_external_inp_buf:
+            pytest.skip("fp8_blockwise requires use_external_inp_buf=True")
+        # fp8_blockwise combine ignores scale_dim/scale_type_size (driven by
+        # MORI_FP8_COMBINE_SCALE_DIM internally).
 
     for i in range(world_size):
         torch_dist_process_manager.task_queue.put(

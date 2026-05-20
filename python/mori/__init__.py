@@ -22,6 +22,11 @@
 import importlib
 import os
 
+try:
+    from ._version import __version__
+except ImportError:
+    __version__ = "unknown"
+
 _LAZY_SUBMODULES = {
     "cpp",
     "ops",

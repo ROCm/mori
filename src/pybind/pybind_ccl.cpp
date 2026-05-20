@@ -26,6 +26,7 @@
 #include <pybind11/stl.h>
 
 #include "mori/collective/all2all/oneshot_all2all_sdma_class.hpp"
+#include "mori/collective/allgather/allgather_into_tensor.hpp"
 #include "mori/collective/allgather/oneshot_allgather_sdma_class.hpp"
 #include "mori/collective/allreduce/twoshot_allreduce_sdma_class.hpp"
 #include "src/pybind/mori.hpp"
@@ -44,37 +45,68 @@ void BindAllreduceHandle(py::module_& m, const char* python_name) {
       .def(py::init<int, int, size_t, bool, bool>(), py::arg("my_pe"), py::arg("npes"),
            py::arg("transit_buffer_size") = 512 * 1024 * 1024,
            py::arg("copy_output_to_user") = true, py::arg("use_graph_mode") = false)
+      // JIT sync path (two-shot: reduce-scatter kernel, then allgather kernel)
       .def(
-          "__call__",
-          [](Handle& self, uintptr_t input_ptr, uintptr_t output_ptr, size_t count,
-             int64_t stream) -> bool {
-            return self(reinterpret_cast<T*>(input_ptr), reinterpret_cast<T*>(output_ptr), count,
-                        reinterpret_cast<hipStream_t>(stream));
+          "prepare_reduce_scatter",
+          [](Handle& self, uintptr_t input, uintptr_t output, size_t count,
+             int64_t stream) -> int64_t {
+            return self.prepare_reduce_scatter(reinterpret_cast<const T*>(input),
+                                               reinterpret_cast<T*>(output), count,
+                                               reinterpret_cast<hipStream_t>(stream));
           },
-          py::arg("input_ptr"), py::arg("output_ptr"), py::arg("count"), py::arg("stream") = 0)
+          py::arg("input_ptr"), py::arg("output_ptr"), py::arg("count"), py::arg("stream"))
       .def(
-          "allreduce_inplace",
-          [](Handle& self, uintptr_t data_ptr, size_t count, int64_t stream) -> bool {
-            return self.allreduce_inplace(reinterpret_cast<T*>(data_ptr), count,
-                                          reinterpret_cast<hipStream_t>(stream));
+          "get_reduce_scatter_grid",
+          [](Handle& self, size_t count) -> py::tuple {
+            auto [blocks, threads] = self.get_reduce_scatter_grid(count);
+            return py::make_tuple(blocks, threads);
           },
-          py::arg("data_ptr"), py::arg("count"), py::arg("stream") = 0,
-          "Execute in-place AllReduce SDMA operation")
+          py::arg("count"))
       .def(
-          "start_async",
-          [](Handle& self, uintptr_t input_ptr, uintptr_t output_ptr, size_t count,
-             int64_t stream) -> bool {
-            return self.start_async(reinterpret_cast<T*>(input_ptr),
-                                    reinterpret_cast<T*>(output_ptr), count,
-                                    reinterpret_cast<hipStream_t>(stream));
+          "prepare_allgather",
+          [](Handle& self, size_t count, int64_t stream) -> int64_t {
+            return self.prepare_allgather(count, reinterpret_cast<hipStream_t>(stream));
           },
-          py::arg("input_ptr"), py::arg("output_ptr"), py::arg("count"), py::arg("stream") = 0)
+          py::arg("count"), py::arg("stream"))
       .def(
-          "wait_async",
+          "finish_sync",
+          [](Handle& self, uintptr_t output, size_t count, int64_t stream,
+             bool force_copy_output_to_user) -> double {
+            return self.finish_sync(reinterpret_cast<T*>(output), count,
+                                    reinterpret_cast<hipStream_t>(stream),
+                                    force_copy_output_to_user);
+          },
+          py::arg("output_ptr"), py::arg("count"), py::arg("stream"),
+          py::arg("force_copy_output_to_user") = false)
+      // JIT async path
+      .def(
+          "prepare_async_reduce_scatter",
+          [](Handle& self, uintptr_t input, uintptr_t output, size_t count,
+             int64_t stream) -> int64_t {
+            return self.prepare_async_reduce_scatter(reinterpret_cast<const T*>(input),
+                                                     reinterpret_cast<T*>(output), count,
+                                                     reinterpret_cast<hipStream_t>(stream));
+          },
+          py::arg("input_ptr"), py::arg("output_ptr"), py::arg("count"), py::arg("stream"))
+      .def(
+          "prepare_async_allgather_put",
+          [](Handle& self, size_t count, int64_t stream) -> int64_t {
+            return self.prepare_async_allgather_put(count, reinterpret_cast<hipStream_t>(stream));
+          },
+          py::arg("count"), py::arg("stream"))
+      .def("after_async_start", &Handle::after_async_start)
+      .def(
+          "prepare_async_wait",
+          [](Handle& self, int64_t stream) -> int64_t {
+            return self.prepare_async_wait(reinterpret_cast<hipStream_t>(stream));
+          },
+          py::arg("stream"))
+      .def(
+          "finish_async_wait",
           [](Handle& self, int64_t stream) -> double {
-            return self.wait_async(reinterpret_cast<hipStream_t>(stream));
+            return self.finish_async_wait(reinterpret_cast<hipStream_t>(stream));
           },
-          py::arg("stream") = 0)
+          py::arg("stream"))
       .def("is_async_in_progress", &Handle::is_async_in_progress)
       .def("cancel_async", &Handle::cancel_async)
       .def("reset_flags", &Handle::resetFlags)
@@ -86,16 +118,19 @@ void BindAllreduceHandle(py::module_& m, const char* python_name) {
             if (ptr == nullptr) throw std::runtime_error("Output transit buffer is null");
             return py::make_tuple(reinterpret_cast<uintptr_t>(ptr), size);
           },
-          "Return (ptr, size_bytes) of the output transit buffer");
+          "Return (ptr, size_bytes) of the output transit buffer")
+      .def("max_blocks", &Handle::max_blocks)
+      .def("npes", &Handle::npes);
 }
 }  // namespace
 
 namespace mori {
 void RegisterMoriCcl(pybind11::module_& m) {
   // =========================================================================
-  // All2allSdma (uint32_t)
+  // All2allSdma (uint32_t) — JIT launch path
   // =========================================================================
-  py::class_<mori::collective::All2allSdma<uint32_t>>(m, "All2allSdmaHandle")
+  using All2allU32 = mori::collective::All2allSdma<uint32_t>;
+  py::class_<All2allU32>(m, "All2allSdmaHandle")
       .def(py::init<int, int, size_t, size_t, bool>(), py::arg("my_pe"), py::arg("npes"),
            py::arg("input_buffer_size"), py::arg("output_buffer_size"),
            py::arg("copy_output_to_user") = true)
@@ -103,38 +138,49 @@ void RegisterMoriCcl(pybind11::module_& m) {
            py::arg("transit_buffer_size") = 512 * 1024 * 1024,
            py::arg("copy_output_to_user") = true)
       .def(
-          "__call__",
-          [](mori::collective::All2allSdma<uint32_t>& self, uintptr_t input_ptr,
-             uintptr_t output_ptr, size_t count, int64_t stream) -> double {
-            return self(reinterpret_cast<uint32_t*>(input_ptr),
-                        reinterpret_cast<uint32_t*>(output_ptr), count,
-                        reinterpret_cast<hipStream_t>(stream));
+          "prepare_sync",
+          [](All2allU32& self, uintptr_t input, uintptr_t output, size_t count,
+             int64_t stream) -> int64_t {
+            return self.prepare_sync(reinterpret_cast<uint32_t*>(input),
+                                     reinterpret_cast<uint32_t*>(output), count,
+                                     reinterpret_cast<hipStream_t>(stream));
           },
-          py::arg("input_ptr"), py::arg("output_ptr"), py::arg("count"), py::arg("stream") = 0,
-          "Execute All2all SDMA operation (raw GPU pointers)")
+          py::arg("input_ptr"), py::arg("output_ptr"), py::arg("count"), py::arg("stream"))
       .def(
-          "start_async",
-          [](mori::collective::All2allSdma<uint32_t>& self, uintptr_t input_ptr,
-             uintptr_t output_ptr, size_t count, int64_t stream) -> bool {
-            return self.start_async(reinterpret_cast<uint32_t*>(input_ptr),
-                                    reinterpret_cast<uint32_t*>(output_ptr), count,
+          "finish_sync",
+          [](All2allU32& self, uintptr_t output, size_t count, int64_t stream) -> double {
+            return self.finish_sync(reinterpret_cast<uint32_t*>(output), count,
                                     reinterpret_cast<hipStream_t>(stream));
           },
-          py::arg("input_ptr"), py::arg("output_ptr"), py::arg("count"), py::arg("stream") = 0,
-          "Start asynchronous All2all SDMA operation (PUT phase)")
+          py::arg("output_ptr"), py::arg("count"), py::arg("stream"))
       .def(
-          "wait_async",
-          [](mori::collective::All2allSdma<uint32_t>& self, int64_t stream) -> double {
-            return self.wait_async(reinterpret_cast<hipStream_t>(stream));
+          "prepare_async_start",
+          [](All2allU32& self, uintptr_t input, uintptr_t output, size_t count,
+             int64_t stream) -> int64_t {
+            return self.prepare_async_start(reinterpret_cast<uint32_t*>(input),
+                                            reinterpret_cast<uint32_t*>(output), count,
+                                            reinterpret_cast<hipStream_t>(stream));
           },
-          py::arg("stream") = 0,
-          "Wait for asynchronous All2all SDMA operation to complete (WAIT phase)")
-      .def("is_async_in_progress", &mori::collective::All2allSdma<uint32_t>::is_async_in_progress)
-      .def("cancel_async", &mori::collective::All2allSdma<uint32_t>::cancel_async)
-      .def("reset_flags", &mori::collective::All2allSdma<uint32_t>::resetFlags)
+          py::arg("input_ptr"), py::arg("output_ptr"), py::arg("count"), py::arg("stream"))
+      .def("after_async_start", &All2allU32::after_async_start)
+      .def(
+          "prepare_async_wait",
+          [](All2allU32& self, int64_t stream) -> int64_t {
+            return self.prepare_async_wait(reinterpret_cast<hipStream_t>(stream));
+          },
+          py::arg("stream"))
+      .def(
+          "finish_async_wait",
+          [](All2allU32& self, int64_t stream) -> double {
+            return self.finish_async_wait(reinterpret_cast<hipStream_t>(stream));
+          },
+          py::arg("stream"))
+      .def("is_async_in_progress", &All2allU32::is_async_in_progress)
+      .def("cancel_async", &All2allU32::cancel_async)
+      .def("reset_flags", &All2allU32::resetFlags)
       .def(
           "get_output_transit_buffer",
-          [](mori::collective::All2allSdma<uint32_t>& self) -> py::tuple {
+          [](All2allU32& self) -> py::tuple {
             void* ptr = self.getOutputTransitBuffer();
             size_t size = self.getOutputTransitBufferSize();
             if (ptr == nullptr) throw std::runtime_error("Output transit buffer is null");
@@ -143,9 +189,10 @@ void RegisterMoriCcl(pybind11::module_& m) {
           "Return (ptr, size_bytes) of the output transit buffer");
 
   // =========================================================================
-  // AllgatherSdma (uint32_t)
+  // AllgatherSdma (uint32_t) — JIT launch path
   // =========================================================================
-  py::class_<mori::collective::AllgatherSdma<uint32_t>>(m, "AllgatherSdmaHandle")
+  using AllgatherU32 = mori::collective::AllgatherSdma<uint32_t>;
+  py::class_<AllgatherU32>(m, "AllgatherSdmaHandle")
       .def(py::init<int, int, size_t, size_t, bool>(), py::arg("my_pe"), py::arg("npes"),
            py::arg("input_buffer_size"), py::arg("output_buffer_size"),
            py::arg("copy_output_to_user") = true)
@@ -153,37 +200,49 @@ void RegisterMoriCcl(pybind11::module_& m) {
            py::arg("transit_buffer_size") = 512 * 1024 * 1024,
            py::arg("copy_output_to_user") = true)
       .def(
-          "__call__",
-          [](mori::collective::AllgatherSdma<uint32_t>& self, uintptr_t input_ptr,
-             uintptr_t output_ptr, size_t count, int64_t stream) -> bool {
-            return self(reinterpret_cast<uint32_t*>(input_ptr),
-                        reinterpret_cast<uint32_t*>(output_ptr), count,
-                        reinterpret_cast<hipStream_t>(stream));
+          "prepare_sync",
+          [](AllgatherU32& self, uintptr_t input, uintptr_t output, size_t count,
+             int64_t stream) -> int64_t {
+            return self.prepare_sync(reinterpret_cast<uint32_t*>(input),
+                                     reinterpret_cast<uint32_t*>(output), count,
+                                     reinterpret_cast<hipStream_t>(stream));
           },
-          py::arg("input_ptr"), py::arg("output_ptr"), py::arg("count"), py::arg("stream") = 0,
-          "Execute Allgather SDMA operation (raw GPU pointers)")
+          py::arg("input_ptr"), py::arg("output_ptr"), py::arg("count"), py::arg("stream"))
       .def(
-          "start_async",
-          [](mori::collective::AllgatherSdma<uint32_t>& self, uintptr_t input_ptr,
-             uintptr_t output_ptr, size_t count, int64_t stream) -> bool {
-            return self.start_async(reinterpret_cast<uint32_t*>(input_ptr),
-                                    reinterpret_cast<uint32_t*>(output_ptr), count,
+          "finish_sync",
+          [](AllgatherU32& self, uintptr_t output, size_t count, int64_t stream) -> double {
+            return self.finish_sync(reinterpret_cast<uint32_t*>(output), count,
                                     reinterpret_cast<hipStream_t>(stream));
           },
-          py::arg("input_ptr"), py::arg("output_ptr"), py::arg("count"), py::arg("stream") = 0,
-          "Start asynchronous Allgather SDMA operation (PUT phase)")
+          py::arg("output_ptr"), py::arg("count"), py::arg("stream"))
       .def(
-          "wait_async",
-          [](mori::collective::AllgatherSdma<uint32_t>& self, int64_t stream) -> double {
-            return self.wait_async(reinterpret_cast<hipStream_t>(stream));
+          "prepare_async_start",
+          [](AllgatherU32& self, uintptr_t input, uintptr_t output, size_t count,
+             int64_t stream) -> int64_t {
+            return self.prepare_async_start(reinterpret_cast<uint32_t*>(input),
+                                            reinterpret_cast<uint32_t*>(output), count,
+                                            reinterpret_cast<hipStream_t>(stream));
           },
-          py::arg("stream") = 0, "Wait for asynchronous Allgather SDMA operation to complete")
-      .def("is_async_in_progress", &mori::collective::AllgatherSdma<uint32_t>::is_async_in_progress)
-      .def("cancel_async", &mori::collective::AllgatherSdma<uint32_t>::cancel_async)
-      .def("reset_flags", &mori::collective::AllgatherSdma<uint32_t>::resetFlags)
+          py::arg("input_ptr"), py::arg("output_ptr"), py::arg("count"), py::arg("stream"))
+      .def("after_async_start", &AllgatherU32::after_async_start)
+      .def(
+          "prepare_async_wait",
+          [](AllgatherU32& self, int64_t stream) -> int64_t {
+            return self.prepare_async_wait(reinterpret_cast<hipStream_t>(stream));
+          },
+          py::arg("stream"))
+      .def(
+          "finish_async_wait",
+          [](AllgatherU32& self, int64_t stream) -> double {
+            return self.finish_async_wait(reinterpret_cast<hipStream_t>(stream));
+          },
+          py::arg("stream"))
+      .def("is_async_in_progress", &AllgatherU32::is_async_in_progress)
+      .def("cancel_async", &AllgatherU32::cancel_async)
+      .def("reset_flags", &AllgatherU32::resetFlags)
       .def(
           "get_output_transit_buffer",
-          [](mori::collective::AllgatherSdma<uint32_t>& self) -> py::tuple {
+          [](AllgatherU32& self) -> py::tuple {
             void* ptr = self.getOutputTransitBuffer();
             size_t size = self.getOutputTransitBufferSize();
             if (ptr == nullptr) throw std::runtime_error("Output transit buffer is null");
@@ -192,24 +251,53 @@ void RegisterMoriCcl(pybind11::module_& m) {
           "Return (ptr, size_bytes) of the output transit buffer")
       .def(
           "register_output_buffer",
-          [](mori::collective::AllgatherSdma<uint32_t>& self, uintptr_t ptr, size_t size) {
+          [](AllgatherU32& self, uintptr_t ptr, size_t size) {
             self.register_output_buffer(reinterpret_cast<void*>(ptr), size);
           },
           py::arg("ptr"), py::arg("size"),
           "Register a GPU buffer as direct SDMA output target (collective)")
       .def(
           "deregister_output_buffer",
-          [](mori::collective::AllgatherSdma<uint32_t>& self, uintptr_t ptr) {
+          [](AllgatherU32& self, uintptr_t ptr) {
             self.deregister_output_buffer(reinterpret_cast<void*>(ptr));
           },
           py::arg("ptr"), "Deregister a previously registered output buffer (collective)")
       .def(
           "is_output_registered",
-          [](mori::collective::AllgatherSdma<uint32_t>& self, uintptr_t ptr) -> bool {
+          [](AllgatherU32& self, uintptr_t ptr) -> bool {
             return self.is_output_registered(reinterpret_cast<void*>(ptr));
           },
           py::arg("ptr"), "Check whether an output buffer is registered for direct SDMA writes");
 
+  // =========================================================================
+  // DataType enum and size_of
+  // =========================================================================
+  py::enum_<mori::collective::DataType>(m, "DataType")
+      .value("Int8", mori::collective::DataType::kInt8)
+      .value("Uint8", mori::collective::DataType::kUint8)
+      .value("Int16", mori::collective::DataType::kInt16)
+      .value("Uint16", mori::collective::DataType::kUint16)
+      .value("Int32", mori::collective::DataType::kInt32)
+      .value("Uint32", mori::collective::DataType::kUint32)
+      .value("Int64", mori::collective::DataType::kInt64)
+      .value("Uint64", mori::collective::DataType::kUint64)
+      .value("Float16", mori::collective::DataType::kFloat16)
+      .value("BFloat16", mori::collective::DataType::kBFloat16)
+      .value("Float32", mori::collective::DataType::kFloat32)
+      .value("Float64", mori::collective::DataType::kFloat64);
+  m.def("size_of", &mori::collective::SizeOf, py::arg("dtype"),
+        "Return element size in bytes for a mori_cpp.DataType value");
+
+  // =========================================================================
+  // AllGatherIntoTensor — REMOVED
+  // The underlying AllgatherSdma<uint32_t>::operator() now throws; this
+  // wrapper needs the Python JIT launch path to be ported before it can be
+  // re-enabled.
+  // =========================================================================
+
+  // =========================================================================
+  // AllreduceSdma — JIT launch path (typed instantiations)
+  // =========================================================================
   BindAllreduceHandle<uint32_t>(m, "AllreduceSdmaHandle");
   BindAllreduceHandle<int32_t>(m, "AllreduceSdmaHandleInt32");
   BindAllreduceHandle<float>(m, "AllreduceSdmaHandleFp32");

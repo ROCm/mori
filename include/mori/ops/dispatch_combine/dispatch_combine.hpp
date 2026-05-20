@@ -46,7 +46,7 @@ namespace mori {
 namespace moe {
 
 enum KernelType { IntraNode = 0, InterNode = 1, InterNodeV1 = 2, InterNodeV1LL = 3, AsyncLL = 4 };
-enum class QuantType { None = 0, Fp8DirectCast = 1 };
+enum class QuantType { None = 0, Fp8DirectCast = 1, Fp8BlockwiseQuant = 2 };
 
 inline const char* HipDataTypeToString(hipDataType dtype) {
   switch (dtype) {
@@ -234,6 +234,8 @@ class EpDispatchCombineHandle {
   void LaunchReset(hipStream_t = 0);
 
   index_t GetCurRankNumToken() const { return curRankNumToken; }
+  int Fp8BlockwiseCombineScaleDim() const { return fp8BlockwiseCombineScaleDim; }
+  int Fp8BlockwiseCombineScaleTypeSize() const { return fp8BlockwiseCombineScaleTypeSize; }
 
   mori::application::SymmMemObjPtr GetShmemDispatchOutTokMemObj() const {
     if (config.kernelType == KernelType::IntraNode)
@@ -299,6 +301,8 @@ class EpDispatchCombineHandle {
  public:
   // Config
   EpDispatchCombineConfig config;
+  int fp8BlockwiseCombineScaleDim{0};
+  int fp8BlockwiseCombineScaleTypeSize{0};
   // Routed expert indices for tokens
   index_t* tokenIndices{nullptr};
 
@@ -400,6 +404,7 @@ template <typename T>
 struct EpDispatchCombineArgs {
   using data_type = T;
   EpDispatchCombineConfig config;
+  int fp8BlockwiseCombineScaleDim{0};
   int rdmaBlockNum{-1};
   // DeepEP-style two-mode dispatch flags (see EpDispatchCombineHandle for docs).
   bool replayMode{false};
@@ -465,6 +470,7 @@ struct EpDispatchCombineArgs {
 // Used by Python-side kernel launch where the type is erased.
 struct EpDispatchCombineArgsRaw {
   EpDispatchCombineConfig config;
+  int fp8BlockwiseCombineScaleDim{0};
   int rdmaBlockNum{-1};
   // DeepEP-style two-mode dispatch flags. Must mirror EpDispatchCombineArgs<T>
   // exactly so the static_assert on layout equality continues to hold.

@@ -40,6 +40,7 @@ from mori.jit.config import (
     detect_nic_type,
     find_mpi_include,
     get_mori_source_root,
+    is_debuginfo_enabled,
     is_profiler_enabled,
 )
 
@@ -176,6 +177,11 @@ def _profiler_defines() -> list[str]:
     return ["-DENABLE_PROFILER"] if is_profiler_enabled() else []
 
 
+def _debuginfo_flags() -> list[str]:
+    """Return hipcc debug flags if MORI_DEBUG_INFO is enabled."""
+    return ["-g", "-ggdb"] if is_debuginfo_enabled() else []
+
+
 def _ensure_generated_include(mori_root: Path) -> Path:
     """Run generate_profiler_bindings.py into the JIT cache and return the include root.
 
@@ -295,6 +301,7 @@ def _hipcc_genco(
         f"--offload-arch={cfg.arch}",
         "-std=c++17",
         "-O2",
+        *_debuginfo_flags(),
         "-D__HIP_PLATFORM_AMD__",
         "-DHIP_ENABLE_WARP_SYNC_BUILTINS",
         *_nic_defines(),

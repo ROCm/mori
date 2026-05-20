@@ -32,6 +32,7 @@
 
 // Include necessary headers
 #include "mori/application/application.hpp"
+#include "mori/collective/ccl_kernel_args.hpp"
 #include "mori/collective/collective_pub.hpp"
 #include "mori/collective/core/wall_time.hpp"
 #include "mori/shmem/shmem.hpp"
@@ -88,6 +89,9 @@ class AllgatherSdma {
 
   // Range lookup helper: returns {SymmMemObjPtr, offset_from_base} or {invalid, 0}.
   std::pair<application::SymmMemObjPtr, size_t> find_registered(void* ptr) const;
+
+  // Not reentrant: previous launch must complete before next prepare_*.
+  CclAllgatherArgs<T> jit_args_;
 
   // Disable copy constructor and assignment operator
   AllgatherSdma(const AllgatherSdma&) = delete;
@@ -231,6 +235,13 @@ class AllgatherSdma {
    * @brief Resets flags (sets to 0)
    */
   void resetFlags();
+
+  int64_t prepare_sync(T* input, T* output, size_t total_count, hipStream_t stream);
+  double finish_sync(T* output, size_t total_count, hipStream_t stream);
+  int64_t prepare_async_start(T* input, T* output, size_t total_count, hipStream_t stream);
+  void after_async_start();
+  int64_t prepare_async_wait(hipStream_t stream);
+  double finish_async_wait(hipStream_t stream);
 };
 
 }  // namespace collective

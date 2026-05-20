@@ -26,8 +26,6 @@
 #include <cstring>
 #include <stdexcept>
 
-#include "mori/collective/allgather/oneshot_sdma_async_kernel.hpp"
-#include "mori/collective/allgather/oneshot_sdma_kernel.hpp"
 #include "mori/shmem/shmem.hpp"
 
 namespace mori {
@@ -198,40 +196,12 @@ bool AllgatherSdma<T>::start_async(T* input, T* output, size_t total_count, hipS
     return false;
   }
 
-  // Save parameters for async operation
-  async_input_ = input;
-  async_output_ = output;
-  async_total_count_ = total_count;
-  async_stream_ = stream;
-  async_start_time_ = CollectiveWallTime();
-  async_flag_token_ = call_seq_.fetch_add(1, std::memory_order_relaxed) + 1;
-
-  try {
-    auto [regObj, byteOffset] = find_registered(output);
-    bool direct = regObj.IsValid();
-    auto& dst_obj = direct ? regObj : output_transit_buffer_obj_;
-    async_dst_obj_ = dst_obj;
-
-    OneShotAllGatherSdmaAsyncPutKernel<T>
-        <<<1, 512, 0, stream>>>(myPe_, npes_, input, input_transit_buffer_obj_, dst_obj, flagsObj_,
-                                total_count, direct ? byteOffset : 0);
-
-    hipError_t kernel_err = hipGetLastError();
-    if (kernel_err != hipSuccess) {
-      fprintf(stderr, "PE %d: Async kernel launch failed: %s\n", myPe_,
-              hipGetErrorString(kernel_err));
-      throw std::runtime_error("Kernel launch failed");
-    }
-
-    return true;
-
-  } catch (const std::exception& e) {
-    printf("PE %d: Failed to start async operation: %s\n", myPe_, e.what());
-    async_in_progress_ = false;
-    async_dst_obj_ = {};
-    async_flag_token_ = 0;
-    return false;
-  }
+  (void)input;
+  (void)output;
+  (void)total_count;
+  (void)stream;
+  async_in_progress_ = false;
+  throw std::runtime_error("Use Python JIT launch path");
 }
 
 template <typename T>
@@ -241,59 +211,8 @@ double AllgatherSdma<T>::wait_async(hipStream_t stream) {
     return -1.0;
   }
 
-  try {
-    hipStream_t wait_stream = (stream != nullptr) ? stream : async_stream_;
-
-    OneShotAllGatherSdmaAsyncWaitKernel<<<1, 64, 0, wait_stream>>>(
-        myPe_, npes_, async_dst_obj_.IsValid() ? async_dst_obj_ : output_transit_buffer_obj_,
-        flagsObj_, async_flag_token_);
-
-    if (wait_stream != nullptr) {
-      hipError_t err = hipStreamSynchronize(wait_stream);
-      if (err != hipSuccess) {
-        fprintf(stderr, "PE %d: Stream synchronization failed: %s\n", myPe_,
-                hipGetErrorString(err));
-        throw std::runtime_error("Stream synchronization failed");
-      }
-    } else {
-      hipError_t err = hipDeviceSynchronize();
-      if (err != hipSuccess) {
-        fprintf(stderr, "PE %d: Device synchronization failed: %s\n", myPe_,
-                hipGetErrorString(err));
-        throw std::runtime_error("Device synchronization failed");
-      }
-    }
-
-    bool direct = find_registered(async_output_).first.IsValid();
-    if (!direct && copy_output_to_user_) {
-      copy_output_to_user(async_output_, async_total_count_, wait_stream);
-    }
-
-    if (wait_stream != nullptr) {
-      (void)hipStreamSynchronize(wait_stream);
-    } else {
-      (void)hipDeviceSynchronize();
-    }
-
-    double end_time = CollectiveWallTime();
-    double duration = end_time - async_start_time_;
-
-    async_in_progress_ = false;
-    async_input_ = nullptr;
-    async_output_ = nullptr;
-    async_total_count_ = 0;
-    async_stream_ = nullptr;
-    async_dst_obj_ = {};
-    async_start_time_ = 0.0;
-    async_flag_token_ = 0;
-
-    return duration;
-
-  } catch (const std::exception& e) {
-    printf("PE %d: Async wait failed: %s\n", myPe_, e.what());
-    cancel_async();
-    return -1.0;
-  }
+  (void)stream;
+  throw std::runtime_error("Use Python JIT launch path");
 }
 
 template <typename T>
@@ -444,33 +363,171 @@ bool AllgatherSdma<T>::operator()(T* input, T* output, size_t total_count, hipSt
     return false;
   }
 
-  try {
-    uint64_t flag_token = call_seq_.fetch_add(1, std::memory_order_relaxed) + 1;
-    auto [regObj, byteOffset] = find_registered(output);
-    bool direct = regObj.IsValid();
-    auto& dst_obj = direct ? regObj : output_transit_buffer_obj_;
+  (void)input;
+  (void)output;
+  (void)total_count;
+  (void)stream;
+  throw std::runtime_error("Use Python JIT launch path");
+}
 
-    OneShotAllGatherSdmaKernel<T>
-        <<<1, 512, 0, stream>>>(myPe_, npes_, input, input_transit_buffer_obj_, dst_obj, flagsObj_,
-                                total_count, direct ? byteOffset : 0, flag_token);
+// ================ JIT prepare/finish methods ================
 
-    hipError_t err = hipGetLastError();
+template <typename T>
+int64_t AllgatherSdma<T>::prepare_sync(T* input, T* output, size_t total_count,
+                                       hipStream_t stream) {
+  (void)stream;
+  uint64_t flag_token = call_seq_.fetch_add(1, std::memory_order_relaxed) + 1;
+  auto [regObj, byteOffset] = find_registered(output);
+  bool direct = regObj.IsValid();
+
+  jit_args_.myPe = myPe_;
+  jit_args_.npes = npes_;
+  jit_args_.input = input;
+  jit_args_.srcMemObj = input_transit_buffer_obj_;
+  jit_args_.dstMemObj = direct ? regObj : output_transit_buffer_obj_;
+  jit_args_.flagsMemObj = flagsObj_;
+  jit_args_.elementCount = total_count;
+  jit_args_.dstBaseOffset = direct ? byteOffset : 0;
+  jit_args_.flagVal = flag_token;
+
+  return (int64_t)&jit_args_;
+}
+
+template <typename T>
+double AllgatherSdma<T>::finish_sync(T* output, size_t total_count, hipStream_t stream) {
+  if (stream != nullptr) {
+    hipError_t err = hipStreamSynchronize(stream);
     if (err != hipSuccess) {
-      fprintf(stderr, "PE %d: Kernel launch failed: %s\n", myPe_, hipGetErrorString(err));
-      return false;
+      fprintf(stderr, "PE %d: Stream synchronization failed: %s\n", myPe_, hipGetErrorString(err));
+      throw std::runtime_error("Stream synchronization failed");
     }
-
-    if (!direct && copy_output_to_user_) {
-      copy_output_to_user(output, total_count, stream);
+  } else {
+    hipError_t err = hipDeviceSynchronize();
+    if (err != hipSuccess) {
+      fprintf(stderr, "PE %d: Device synchronization failed: %s\n", myPe_, hipGetErrorString(err));
+      throw std::runtime_error("Device synchronization failed");
     }
-
-  } catch (const std::exception& e) {
-    fprintf(stderr, "PE %d: Allgather operation failed: %s\n", myPe_, e.what());
-    return false;
   }
 
-  return true;
+  bool direct = find_registered(output).first.IsValid();
+  if (!direct && copy_output_to_user_) {
+    copy_output_to_user(output, total_count, stream);
+    if (stream != nullptr) {
+      (void)hipStreamSynchronize(stream);
+    } else {
+      (void)hipDeviceSynchronize();
+    }
+  }
+
+  return 0.0;
 }
+
+template <typename T>
+int64_t AllgatherSdma<T>::prepare_async_start(T* input, T* output, size_t total_count,
+                                              hipStream_t stream) {
+  bool expected = false;
+  if (!async_in_progress_.compare_exchange_strong(expected, true)) {
+    throw std::runtime_error("Another async operation is already in progress");
+  }
+
+  async_input_ = input;
+  async_output_ = output;
+  async_total_count_ = total_count;
+  async_stream_ = stream;
+  async_start_time_ = CollectiveWallTime();
+  async_flag_token_ = call_seq_.fetch_add(1, std::memory_order_relaxed) + 1;
+
+  auto [regObj, byteOffset] = find_registered(output);
+  bool direct = regObj.IsValid();
+  auto& dst_obj = direct ? regObj : output_transit_buffer_obj_;
+  async_dst_obj_ = dst_obj;
+
+  jit_args_.myPe = myPe_;
+  jit_args_.npes = npes_;
+  jit_args_.input = input;
+  jit_args_.srcMemObj = input_transit_buffer_obj_;
+  jit_args_.dstMemObj = dst_obj;
+  jit_args_.flagsMemObj = flagsObj_;
+  jit_args_.elementCount = total_count;
+  jit_args_.dstBaseOffset = direct ? byteOffset : 0;
+  jit_args_.flagVal = async_flag_token_;
+
+  return (int64_t)&jit_args_;
+}
+
+template <typename T>
+void AllgatherSdma<T>::after_async_start() {}
+
+template <typename T>
+int64_t AllgatherSdma<T>::prepare_async_wait(hipStream_t stream) {
+  if (!async_in_progress_) {
+    throw std::runtime_error("No async operation in progress");
+  }
+  (void)stream;
+
+  jit_args_.myPe = myPe_;
+  jit_args_.npes = npes_;
+  jit_args_.input = nullptr;
+  jit_args_.srcMemObj = {};
+  jit_args_.dstMemObj = async_dst_obj_.IsValid() ? async_dst_obj_ : output_transit_buffer_obj_;
+  jit_args_.flagsMemObj = flagsObj_;
+  jit_args_.elementCount = 0;
+  jit_args_.dstBaseOffset = 0;
+  jit_args_.flagVal = async_flag_token_;
+
+  return (int64_t)&jit_args_;
+}
+
+template <typename T>
+double AllgatherSdma<T>::finish_async_wait(hipStream_t stream) {
+  if (!async_in_progress_) {
+    throw std::runtime_error("No async operation in progress");
+  }
+
+  hipStream_t wait_stream = (stream != nullptr) ? stream : async_stream_;
+
+  if (wait_stream != nullptr) {
+    hipError_t err = hipStreamSynchronize(wait_stream);
+    if (err != hipSuccess) {
+      fprintf(stderr, "PE %d: Stream synchronization failed: %s\n", myPe_, hipGetErrorString(err));
+      cancel_async();
+      throw std::runtime_error("Stream synchronization failed");
+    }
+  } else {
+    hipError_t err = hipDeviceSynchronize();
+    if (err != hipSuccess) {
+      fprintf(stderr, "PE %d: Device synchronization failed: %s\n", myPe_, hipGetErrorString(err));
+      cancel_async();
+      throw std::runtime_error("Device synchronization failed");
+    }
+  }
+
+  bool direct = find_registered(async_output_).first.IsValid();
+  if (!direct && copy_output_to_user_) {
+    copy_output_to_user(async_output_, async_total_count_, wait_stream);
+    if (wait_stream != nullptr) {
+      (void)hipStreamSynchronize(wait_stream);
+    } else {
+      (void)hipDeviceSynchronize();
+    }
+  }
+
+  double end_time = CollectiveWallTime();
+  double duration = end_time - async_start_time_;
+
+  async_in_progress_ = false;
+  async_input_ = nullptr;
+  async_output_ = nullptr;
+  async_total_count_ = 0;
+  async_stream_ = nullptr;
+  async_dst_obj_ = {};
+  async_start_time_ = 0.0;
+  async_flag_token_ = 0;
+
+  return duration;
+}
+
+// ================ END: JIT prepare/finish methods ================
 
 // resetFlags implementation (unchanged)
 template <typename T>

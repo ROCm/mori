@@ -207,12 +207,37 @@ cd mori && docker build -t rocm/mori:dev -f docker/Dockerfile.dev .
 
 ### Install
 
+MoRI can be installed in three ways: from PyPI (stable), nightly pre-built wheels (latest dev), or from source.
+
+#### From PyPI (stable release)
+
+```bash
+pip install amd_mori
+```
+
+#### Nightly (pre-built, tested daily)
+
+```bash
+# From PyPI
+pip install --pre amd-mori-nightly
+
+# Or from GitHub Pages
+pip install --no-index --force-reinstall --find-links https://rocm.github.io/mori/nightly/latest/ amd_mori
+```
+
+Browse all nightly builds: https://rocm.github.io/mori/nightly/
+
+> **Note**: `amd-mori` and `amd-mori-nightly` both provide the `mori` Python module.
+> Do not install both at the same time — uninstall one before installing the other.
+
+#### From source
+
 ```bash
 # NOTE: for venv build, add --no-build-isolation at the end
 cd mori && pip install .
 ```
 
-That's it. No hipcc needed at install time — host code compiles with a standard
+No hipcc needed at install time — host code compiles with a standard
 C++ compiler. GPU kernels are JIT-compiled on first use and cached to
 `~/.mori/jit/`. If a GPU is detected during install, kernel precompilation
 starts automatically in the background.
@@ -225,7 +250,7 @@ MORI_PRECOMPILE=1 python -c "import mori"
 ### Verify installation
 
 ```bash
-python -c "import mori; print('OK')"
+python -c "import mori; print(mori.__version__)"
 ```
 
 ## Testing
@@ -235,6 +260,7 @@ python -c "import mori; print('OK')"
 ```bash
 cd /path/to/mori
 export PYTHONPATH=/path/to/mori:$PYTHONPATH
+python -c "import mori; print(mori.__file__)"
 
 # Test correctness (8 GPUs)
 pytest tests/python/ops/test_dispatch_combine_intranode.py -q

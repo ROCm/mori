@@ -26,8 +26,6 @@
 #include <cstring>
 #include <stdexcept>
 
-#include "mori/collective/all2all/oneshot_all2all_sdma_async_kernel.hpp"
-#include "mori/collective/all2all/oneshot_all2all_sdma_kernel.hpp"
 #include "mori/shmem/shmem.hpp"
 
 namespace mori {
@@ -138,129 +136,20 @@ All2allSdma<T>::~All2allSdma() {
 
 template <typename T>
 bool All2allSdma<T>::start_async(T* input, T* output, size_t total_count, hipStream_t stream) {
-  // Check if another async operation is in progress
-  bool expected = false;
-  if (!async_in_progress_.compare_exchange_strong(expected, true)) {
-    printf("PE %d: Another async operation is already in progress\n", myPe_);
-    return false;
-  }
-
-  // Save parameters for async operation
-  async_input_ = input;
-  async_output_ = output;
-  async_total_count_ = total_count;
-  async_stream_ = stream;
-  async_start_time_ = CollectiveWallTime();
-
-  try {
-    // Step 1: Copy input data to input transit buffer
-    printf("PE %d: Starting async All2All (PUT phase)\n", myPe_);
-    // copy_input_to_transit(input, total_count * npes_, stream);
-
-    // Step 2: Reset flags
-    // resetFlags();
-
-    // Step 3: Execute All2All kernel (PUT operation)
-    printf("PE %d: Launching async PUT kernel...\n", myPe_);
-
-    int block_size = 256;
-    int grid_size = (total_count * npes_ + block_size - 1) / block_size;
-    if (grid_size < 1) grid_size = 1;
-    if (grid_size > 65535) grid_size = 65535;
-
-    printf("  Grid size: %d, Block size: %d\n", grid_size, block_size);
-
-    // Launch the kernel - this runs asynchronously
-    OneShotAll2allSdmaAsyncPutKernel<T>
-        <<<1, 64, 0, stream>>>(myPe_, npes_, input, input_transit_buffer_obj_,
-                               output_transit_buffer_obj_, flagsObj_, total_count);
-
-    hipError_t kernel_err = hipGetLastError();
-    if (kernel_err != hipSuccess) {
-      printf("PE %d: Async kernel launch failed: %s\n", myPe_, hipGetErrorString(kernel_err));
-      throw std::runtime_error("Kernel launch failed");
-    }
-
-    printf("PE %d: Async PUT operation started successfully\n", myPe_);
-    return true;
-
-  } catch (const std::exception& e) {
-    printf("PE %d: Failed to start async operation: %s\n", myPe_, e.what());
-    async_in_progress_ = false;
-    return false;
-  }
+  // Kernel launch moved to Python JIT path.
+  // Use prepare_async_start / after_async_start instead.
+  throw std::runtime_error(
+      "All2allSdma::start_async() is deprecated; use Python JIT launch path "
+      "(prepare_async_start + after_async_start)");
 }
 
 template <typename T>
 double All2allSdma<T>::wait_async(hipStream_t stream) {
-  if (!async_in_progress_) {
-    printf("PE %d: No async operation in progress\n", myPe_);
-    return -1.0;
-  }
-
-  try {
-    printf("PE %d: Waiting for async All2All completion (WAIT phase)\n", myPe_);
-
-    // Use provided stream or the one from start_async
-    hipStream_t wait_stream = (stream != nullptr) ? stream : async_stream_;
-
-    OneShotAll2allSdmaAsyncWaitKernel<<<1, 512, 0, wait_stream>>>(
-        myPe_, npes_, output_transit_buffer_obj_, flagsObj_);
-
-    // Step 1: Synchronize to ensure PUT kernel is completed
-    printf("PE %d: Synchronizing to ensure PUT kernel completion\n", myPe_);
-
-    if (wait_stream != nullptr) {
-      hipError_t err = hipStreamSynchronize(wait_stream);
-      if (err != hipSuccess) {
-        printf("PE %d: Stream synchronization failed: %s\n", myPe_, hipGetErrorString(err));
-        throw std::runtime_error("Stream synchronization failed");
-      }
-    } else {
-      hipError_t err = hipDeviceSynchronize();
-      if (err != hipSuccess) {
-        printf("PE %d: Device synchronization failed: %s\n", myPe_, hipGetErrorString(err));
-        throw std::runtime_error("Device synchronization failed");
-      }
-    }
-
-    // Step 2: Copy from output transit buffer to user output buffer (if enabled)
-    if (copy_output_to_user_) {
-      printf("PE %d: Copying results to user output buffer\n", myPe_);
-      copy_output_to_user(async_output_, async_total_count_, wait_stream);
-    } else {
-      printf("PE %d: Skipping copy to user output buffer (using output_transit_buffer directly)\n",
-             myPe_);
-    }
-
-    // Final synchronization
-    if (wait_stream != nullptr) {
-      (void)hipStreamSynchronize(wait_stream);
-    } else {
-      (void)hipDeviceSynchronize();
-    }
-
-    // Calculate total execution time
-    double end_time = CollectiveWallTime();
-    double duration = end_time - async_start_time_;
-
-    printf("PE %d: Async All2All completed in %.6f seconds\n", myPe_, duration);
-
-    // Reset async state
-    async_in_progress_ = false;
-    async_input_ = nullptr;
-    async_output_ = nullptr;
-    async_total_count_ = 0;
-    async_stream_ = nullptr;
-    async_start_time_ = 0.0;
-
-    return duration;
-
-  } catch (const std::exception& e) {
-    printf("PE %d: Async wait failed: %s\n", myPe_, e.what());
-    cancel_async();
-    return -1.0;
-  }
+  // Kernel launch moved to Python JIT path.
+  // Use prepare_async_wait / finish_async_wait instead.
+  throw std::runtime_error(
+      "All2allSdma::wait_async() is deprecated; use Python JIT launch path "
+      "(prepare_async_wait + finish_async_wait)");
 }
 
 template <typename T>
@@ -400,83 +289,135 @@ void All2allSdma<T>::copy_output_to_user(T* output, size_t total_count, hipStrea
   }
 }
 
-// operator() implementation (modified to check async status)
+// operator() — kernel launch moved to Python JIT path
 template <typename T>
 double All2allSdma<T>::operator()(T* input, T* output, size_t total_count, hipStream_t stream) {
-  // Check if async operation is in progress
+  // Kernel launch moved to Python JIT path.
+  // Use prepare_sync / finish_sync instead.
+  throw std::runtime_error(
+      "All2allSdma::operator() is deprecated; use Python JIT launch path "
+      "(prepare_sync + finish_sync)");
+}
+
+// ================ JIT launch support ================
+
+template <typename T>
+int64_t All2allSdma<T>::prepare_sync(T* input, T* output, size_t total_count, hipStream_t stream) {
   if (async_in_progress_) {
-    printf("PE %d: Cannot execute sync operation while async is in progress\n", myPe_);
-    printf("  Call cancel_async() first or wait for async to complete\n");
-    return -1.0;
+    throw std::runtime_error("Cannot execute sync operation while async is in progress");
+  }
+  jit_args_.myPe = myPe_;
+  jit_args_.npes = npes_;
+  jit_args_.input = input;
+  jit_args_.inputTransitMemObj = input_transit_buffer_obj_;
+  jit_args_.outputTransitMemObj = output_transit_buffer_obj_;
+  jit_args_.flagsMemObj = flagsObj_;
+  jit_args_.elementCount = total_count;
+  return reinterpret_cast<int64_t>(&jit_args_);
+}
+
+template <typename T>
+double All2allSdma<T>::finish_sync(T* output, size_t total_count, hipStream_t stream) {
+  hipError_t err;
+  if (stream != nullptr) {
+    err = hipStreamSynchronize(stream);
+  } else {
+    err = hipDeviceSynchronize();
+  }
+  if (err != hipSuccess) {
+    throw std::runtime_error("Synchronization failed");
+  }
+  if (copy_output_to_user_) {
+    copy_output_to_user(output, total_count, stream);
+  }
+  if (stream != nullptr) {
+    (void)hipStreamSynchronize(stream);
+  } else {
+    (void)hipDeviceSynchronize();
+  }
+  return 0.0;
+}
+
+template <typename T>
+int64_t All2allSdma<T>::prepare_async_start(T* input, T* output, size_t total_count,
+                                            hipStream_t stream) {
+  bool expected = false;
+  if (!async_in_progress_.compare_exchange_strong(expected, true)) {
+    throw std::runtime_error("Another async operation is already in progress");
+  }
+  async_input_ = input;
+  async_output_ = output;
+  async_total_count_ = total_count;
+  async_stream_ = stream;
+  async_start_time_ = CollectiveWallTime();
+
+  jit_args_.myPe = myPe_;
+  jit_args_.npes = npes_;
+  jit_args_.input = input;
+  jit_args_.inputTransitMemObj = input_transit_buffer_obj_;
+  jit_args_.outputTransitMemObj = output_transit_buffer_obj_;
+  jit_args_.flagsMemObj = flagsObj_;
+  jit_args_.elementCount = total_count;
+  return reinterpret_cast<int64_t>(&jit_args_);
+}
+
+template <typename T>
+void All2allSdma<T>::after_async_start() {
+  hipError_t err = hipGetLastError();
+  if (err != hipSuccess) {
+    async_in_progress_ = false;
+    throw std::runtime_error("Async kernel launch failed");
+  }
+}
+
+template <typename T>
+int64_t All2allSdma<T>::prepare_async_wait(hipStream_t stream) {
+  if (!async_in_progress_) {
+    throw std::runtime_error("No async operation in progress");
+  }
+  jit_args_.myPe = myPe_;
+  jit_args_.npes = npes_;
+  jit_args_.input = nullptr;
+  jit_args_.inputTransitMemObj = {};
+  jit_args_.outputTransitMemObj = output_transit_buffer_obj_;
+  jit_args_.flagsMemObj = flagsObj_;
+  jit_args_.elementCount = 0;
+  return reinterpret_cast<int64_t>(&jit_args_);
+}
+
+template <typename T>
+double All2allSdma<T>::finish_async_wait(hipStream_t stream) {
+  hipStream_t wait_stream = (stream != nullptr) ? stream : async_stream_;
+  hipError_t err;
+  if (wait_stream != nullptr) {
+    err = hipStreamSynchronize(wait_stream);
+  } else {
+    err = hipDeviceSynchronize();
+  }
+  if (err != hipSuccess) {
+    throw std::runtime_error("Synchronization failed");
   }
 
-  // Execute All2All operation
-  double start = CollectiveWallTime();
-
-  hipError_t sync_err = hipSuccess;
-  try {
-    // Step 1: Copy input data to input transit buffer
-    // copy_input_to_transit(input, total_count * npes_, stream);
-
-    // Step 2: Reset flags
-    // resetFlags();
-
-    // Step 3: Execute All2All kernel
-    int block_size = 256;
-    int grid_size = (total_count * npes_ + block_size - 1) / block_size;
-    if (grid_size < 1) grid_size = 1;
-    if (grid_size > 65535) grid_size = 65535;
-
-    OneShotAll2allSdmaKernel<T>
-        <<<1, 64, 0, stream>>>(myPe_, npes_, input, input_transit_buffer_obj_,
-                               output_transit_buffer_obj_, flagsObj_, total_count);
-
-    sync_err = hipGetLastError();
-    if (sync_err != hipSuccess) {
-      fprintf(stderr, "PE %d: Kernel launch failed: %s\n", myPe_, hipGetErrorString(sync_err));
-      throw std::runtime_error("Kernel launch failed");
-    }
-
-    // Synchronize GPU to ensure kernel completion
-    if (stream != nullptr) {
-      sync_err = hipStreamSynchronize(stream);
-    } else {
-      sync_err = hipDeviceSynchronize();
-    }
-
-    if (sync_err != hipSuccess) {
-      fprintf(stderr, "PE %d: Failed to synchronize: %s\n", myPe_, hipGetErrorString(sync_err));
-      throw std::runtime_error("Synchronization failed");
-    }
-
-    // Step 4: Copy from output transit buffer to user output buffer (if enabled)
-    if (copy_output_to_user_) {
-      copy_output_to_user(output, total_count, stream);
-    }
-
-    // Final synchronization
-    if (stream != nullptr) {
-      sync_err = hipStreamSynchronize(stream);
-    } else {
-      sync_err = hipDeviceSynchronize();
-    }
-
-    if (sync_err != hipSuccess) {
-      fprintf(stderr, "PE %d: Final synchronization failed: %s\n", myPe_,
-              hipGetErrorString(sync_err));
-      throw std::runtime_error("Final synchronization failed");
-    }
-
-  } catch (const std::exception& e) {
-    fprintf(stderr, "PE %d: All2All operation failed: %s\n", myPe_, e.what());
-    return -1.0;
+  if (copy_output_to_user_) {
+    copy_output_to_user(async_output_, async_total_count_, wait_stream);
+  }
+  if (wait_stream != nullptr) {
+    (void)hipStreamSynchronize(wait_stream);
+  } else {
+    (void)hipDeviceSynchronize();
   }
 
-  double end = CollectiveWallTime();
-  double duration = end - start;
-
+  double duration = CollectiveWallTime() - async_start_time_;
+  async_in_progress_ = false;
+  async_input_ = nullptr;
+  async_output_ = nullptr;
+  async_total_count_ = 0;
+  async_stream_ = nullptr;
+  async_start_time_ = 0.0;
   return duration;
 }
+
+// ================ END: JIT launch support ================
 
 // resetFlags implementation (unchanged)
 template <typename T>

@@ -32,11 +32,10 @@ namespace mori {
 namespace collective {
 
 template <typename T>
-__global__ void OneShotAllGatherSdmaAsyncPutKernel(int myPe, int npes, T* input,
-                                                   const application::SymmMemObjPtr srcMemObj,
-                                                   const application::SymmMemObjPtr dstMemObj,
-                                                   const application::SymmMemObjPtr flagsMemObj,
-                                                   size_t elementCount, size_t dstBaseOffset = 0) {
+__device__ void OneShotAllGatherSdmaAsyncPutKernel_body(
+    int myPe, int npes, T* input, const application::SymmMemObjPtr srcMemObj,
+    const application::SymmMemObjPtr dstMemObj, const application::SymmMemObjPtr flagsMemObj,
+    size_t elementCount, size_t dstBaseOffset = 0) {
   if (elementCount == 0 || npes <= 0) {
     return;
   }
@@ -83,10 +82,19 @@ __global__ void OneShotAllGatherSdmaAsyncPutKernel(int myPe, int npes, T* input,
   }
 }
 
-__global__ void OneShotAllGatherSdmaAsyncWaitKernel(int myPe, int npes,
-                                                    const application::SymmMemObjPtr dstMemObj,
-                                                    const application::SymmMemObjPtr flagsMemObj,
-                                                    uint64_t flagVal = 1) {
+template <typename T>
+__global__ void OneShotAllGatherSdmaAsyncPutKernel(int myPe, int npes, T* input,
+                                                   const application::SymmMemObjPtr srcMemObj,
+                                                   const application::SymmMemObjPtr dstMemObj,
+                                                   const application::SymmMemObjPtr flagsMemObj,
+                                                   size_t elementCount, size_t dstBaseOffset = 0) {
+  OneShotAllGatherSdmaAsyncPutKernel_body<T>(myPe, npes, input, srcMemObj, dstMemObj, flagsMemObj,
+                                             elementCount, dstBaseOffset);
+}
+
+__device__ void OneShotAllGatherSdmaAsyncWaitKernel_body(
+    int myPe, int npes, const application::SymmMemObjPtr dstMemObj,
+    const application::SymmMemObjPtr flagsMemObj, uint64_t flagVal = 1) {
   uint64_t* __restrict__ flags = reinterpret_cast<uint64_t*>(flagsMemObj->localPtr);
 
   const size_t threadLinearId =
@@ -121,6 +129,13 @@ __global__ void OneShotAllGatherSdmaAsyncWaitKernel(int myPe, int npes,
   }
 
   // Monotonic generation flags; no reset needed.
+}
+
+__global__ void OneShotAllGatherSdmaAsyncWaitKernel(int myPe, int npes,
+                                                    const application::SymmMemObjPtr dstMemObj,
+                                                    const application::SymmMemObjPtr flagsMemObj,
+                                                    uint64_t flagVal = 1) {
+  OneShotAllGatherSdmaAsyncWaitKernel_body(myPe, npes, dstMemObj, flagsMemObj, flagVal);
 }
 }  // namespace collective
 }  // namespace mori

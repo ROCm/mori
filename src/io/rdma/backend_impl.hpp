@@ -42,6 +42,15 @@
 
 namespace mori {
 namespace io {
+
+namespace internal {
+
+// Placeholder written into engine_desc.port when an RDMA backend request is
+// rerouted to XGMI-only mode because this host has no active RDMA device.
+inline constexpr uint16_t kXgmiOnlyFallbackPlaceholderPort = 1;
+
+}  // namespace internal
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                           RdmaManager                                          */
 /* ---------------------------------------------------------------------------------------------- */
@@ -196,6 +205,7 @@ class ControlPlaneServer {
   // Remote engine meta management
   void RegisterRemoteEngine(const EngineDesc&);
   void DeregisterRemoteEngine(const EngineDesc&);
+  std::optional<int> TryGetRemoteEnginePort(const EngineKey&) const;
 
   // Endpoint management
   void BuildRdmaConn(EngineKey, TopoKeyPair);
@@ -268,24 +278,28 @@ class RdmaBackend : public Backend {
   RdmaBackend(EngineKey, const IOEngineConfig&, const RdmaBackendConfig&);
   ~RdmaBackend();
 
+  static bool HasActiveDevices();
+
   std::optional<uint16_t> GetListenPort() const {
     if (!server) return std::nullopt;
     return server->GetListenPort();
   }
 
-  void RegisterRemoteEngine(const EngineDesc&);
-  void DeregisterRemoteEngine(const EngineDesc&);
-  void RegisterMemory(MemoryDesc& desc);
-  void DeregisterMemory(const MemoryDesc& desc);
+  void RegisterRemoteEngine(const EngineDesc&) override;
+  void DeregisterRemoteEngine(const EngineDesc&) override;
+  void RegisterMemory(MemoryDesc& desc) override;
+  void DeregisterMemory(const MemoryDesc& desc) override;
   void ReadWrite(const MemoryDesc& localDest, size_t localOffset, const MemoryDesc& remoteSrc,
                  size_t remoteOffset, size_t size, TransferStatus* status, TransferUniqueId id,
-                 bool isRead);
+                 bool isRead) override;
   void BatchReadWrite(const MemoryDesc& localDest, const SizeVec& localOffsets,
                       const MemoryDesc& remoteSrc, const SizeVec& remoteOffsets,
                       const SizeVec& sizes, TransferStatus* status, TransferUniqueId id,
-                      bool isRead);
-  BackendSession* CreateSession(const MemoryDesc& local, const MemoryDesc& remote);
-  bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id, TransferStatus* status);
+                      bool isRead) override;
+  BackendSession* CreateSession(const MemoryDesc& local, const MemoryDesc& remote) override;
+  bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
+                                TransferStatus* status) override;
+  bool CanHandle(const MemoryDesc& local, const MemoryDesc& remote) const override;
 
  private:
   void CreateSession(const MemoryDesc& local, const MemoryDesc& remote, RdmaBackendSession& sess);

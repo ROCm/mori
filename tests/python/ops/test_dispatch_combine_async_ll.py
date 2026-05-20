@@ -23,6 +23,13 @@ import mori
 import os
 import pytest
 import torch
+
+# Default to SDMA transport for local runs.  CI overrides this per step:
+#   SDMA step:  MORI_ENABLE_SDMA=1  (same as default, redundant but harmless)
+#   IBGDA step: MORI_DISABLE_P2P=1  (overrides transport to RDMA; SDMA flag ignored)
+# Must be set at module level (before worker processes are spawned by the
+# session fixture) so the child processes inherit the correct env.
+os.environ.setdefault("MORI_ENABLE_SDMA", "1")
 from tests.python.ops.dispatch_combine_test_utils import (
     _all_data_types,
     _is_fp4x2_dtype,
@@ -131,31 +138,27 @@ def _test_dispatch_combine(
     num_token_override=None,
     check_results=True,
 ):
-    os.environ["MORI_DISABLE_P2P"] = "1"
-    try:
-        config = _make_asyncll_config(
-            rank=rank,
-            world_size=world_size,
-            data_type=data_type,
-            hidden_dim=hidden_dim,
-            max_num_inp_token_per_rank=max_num_inp_token_per_rank,
-            num_experts_per_rank=num_experts_per_rank,
-            num_experts_per_token=num_experts_per_token,
-            scale_dim=scale_dim,
-            scale_type_size=scale_type_size,
-            quant_type=quant_type,
-            max_total_recv_tokens=max_total_recv_tokens,
-        )
-        run_ep_dispatch_combine_test(
-            config,
-            AsyncLLDispatchCombineTestCase,
-            use_max_token_num=use_max_token_num,
-            routing=routing,
-            num_token_override=num_token_override,
-            check_results=check_results,
-        )
-    finally:
-        os.environ.pop("MORI_DISABLE_P2P", None)
+    config = _make_asyncll_config(
+        rank=rank,
+        world_size=world_size,
+        data_type=data_type,
+        hidden_dim=hidden_dim,
+        max_num_inp_token_per_rank=max_num_inp_token_per_rank,
+        num_experts_per_rank=num_experts_per_rank,
+        num_experts_per_token=num_experts_per_token,
+        scale_dim=scale_dim,
+        scale_type_size=scale_type_size,
+        quant_type=quant_type,
+        max_total_recv_tokens=max_total_recv_tokens,
+    )
+    run_ep_dispatch_combine_test(
+        config,
+        AsyncLLDispatchCombineTestCase,
+        use_max_token_num=use_max_token_num,
+        routing=routing,
+        num_token_override=num_token_override,
+        check_results=check_results,
+    )
 
 
 def _test_dispatch_combine_multi_iteration(
@@ -172,30 +175,26 @@ def _test_dispatch_combine_multi_iteration(
     quant_type="none",
     routing="round_robin",
 ):
-    os.environ["MORI_DISABLE_P2P"] = "1"
-    try:
-        config = _make_asyncll_config(
-            rank=rank,
-            world_size=world_size,
-            data_type=data_type,
-            hidden_dim=hidden_dim,
-            max_num_inp_token_per_rank=max_num_inp_token_per_rank,
-            num_experts_per_rank=num_experts_per_rank,
-            num_experts_per_token=num_experts_per_token,
-            scale_dim=scale_dim,
-            scale_type_size=scale_type_size,
-            quant_type=quant_type,
-        )
-        op = mori.ops.EpDispatchCombineOp(config)
-        test_case = AsyncLLDispatchCombineTestCase(config)
+    config = _make_asyncll_config(
+        rank=rank,
+        world_size=world_size,
+        data_type=data_type,
+        hidden_dim=hidden_dim,
+        max_num_inp_token_per_rank=max_num_inp_token_per_rank,
+        num_experts_per_rank=num_experts_per_rank,
+        num_experts_per_token=num_experts_per_token,
+        scale_dim=scale_dim,
+        scale_type_size=scale_type_size,
+        quant_type=quant_type,
+    )
+    op = mori.ops.EpDispatchCombineOp(config)
+    test_case = AsyncLLDispatchCombineTestCase(config)
 
-        for num_token_override in num_token_patterns:
-            test_data = test_case.gen_test_data(
-                routing=routing, num_token_override=num_token_override
-            )
-            test_case.run_test_once(op, test_data)
-    finally:
-        os.environ.pop("MORI_DISABLE_P2P", None)
+    for num_token_override in num_token_patterns:
+        test_data = test_case.gen_test_data(
+            routing=routing, num_token_override=num_token_override
+        )
+        test_case.run_test_once(op, test_data)
 
 
 @pytest.mark.parametrize("world_size", (8,))

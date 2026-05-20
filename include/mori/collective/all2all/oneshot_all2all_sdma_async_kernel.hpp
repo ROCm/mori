@@ -33,11 +33,11 @@ namespace collective {
 // One-shot all-reduce: single phase.
 // Every GPU reads the full buffer from all peers, accumulates locally, and writes the result.
 template <typename T>
-__global__ void OneShotAll2allSdmaAsyncPutKernel(int myPe, int npes, T* input,
-                                                 const application::SymmMemObjPtr srcMemObj,
-                                                 const application::SymmMemObjPtr dstMemObj,
-                                                 const application::SymmMemObjPtr flagsMemObj,
-                                                 size_t elementCount) {
+__device__ void OneShotAll2allSdmaAsyncPutKernel_body(int myPe, int npes, T* input,
+                                                      const application::SymmMemObjPtr srcMemObj,
+                                                      const application::SymmMemObjPtr dstMemObj,
+                                                      const application::SymmMemObjPtr flagsMemObj,
+                                                      size_t elementCount) {
   if (elementCount == 0 || npes <= 0) {
     return;
   }
@@ -83,9 +83,19 @@ __global__ void OneShotAll2allSdmaAsyncPutKernel(int myPe, int npes, T* input,
   }
 }
 
-__global__ void OneShotAll2allSdmaAsyncWaitKernel(int myPe, int npes,
-                                                  const application::SymmMemObjPtr dstMemObj,
-                                                  const application::SymmMemObjPtr flagsMemObj) {
+template <typename T>
+__global__ void OneShotAll2allSdmaAsyncPutKernel(int myPe, int npes, T* input,
+                                                 const application::SymmMemObjPtr srcMemObj,
+                                                 const application::SymmMemObjPtr dstMemObj,
+                                                 const application::SymmMemObjPtr flagsMemObj,
+                                                 size_t elementCount) {
+  OneShotAll2allSdmaAsyncPutKernel_body<T>(myPe, npes, input, srcMemObj, dstMemObj, flagsMemObj,
+                                           elementCount);
+}
+
+__device__ void OneShotAll2allSdmaAsyncWaitKernel_body(
+    int myPe, int npes, const application::SymmMemObjPtr dstMemObj,
+    const application::SymmMemObjPtr flagsMemObj) {
   int flag_val = 1;
   uint64_t* __restrict__ flags = reinterpret_cast<uint64_t*>(flagsMemObj->localPtr);
 
@@ -122,6 +132,12 @@ __global__ void OneShotAll2allSdmaAsyncWaitKernel(int myPe, int npes,
   if (threadLinearId < npes) {
     flags[threadLinearId] = 0;
   }
+}
+
+__global__ void OneShotAll2allSdmaAsyncWaitKernel(int myPe, int npes,
+                                                  const application::SymmMemObjPtr dstMemObj,
+                                                  const application::SymmMemObjPtr flagsMemObj) {
+  OneShotAll2allSdmaAsyncWaitKernel_body(myPe, npes, dstMemObj, flagsMemObj);
 }
 }  // namespace collective
 }  // namespace mori

@@ -23,11 +23,43 @@
 FlyDSL-specific runtime helpers for mori shmem integration.
 
   - ``get_bitcode_path()``  — returns the path to libmori_shmem_device.bc
-  - ``install_hook()``      — installs the FlyDSL post-compile hook that calls
-                              ``shmem_module_init`` to inject ``globalGpuStates``
+  - ``shmem_module_init()`` — initializes ``globalGpuStates`` for a loaded
+                              FlyDSL HIP module
 """
 
 from mori.ir.bitcode import find_bitcode
+
+_FLYDSL_COV = 6
+_FLYDSL_ROCDL_ABI = 600
+
+
+def _check_flydsl_rocdl_abi() -> None:
+    """Verify FlyDSL still lowers ROCm code objects with ABI 600.
+
+    Mori's FlyDSL device bitcode is compiled with code object version 6.  The
+    matching FlyDSL `rocdl-attach-target` option is `abi=600`; if either side
+    changes, linked kernels can compile but fail later at HIP module load time.
+    """
+    try:
+        from flydsl.compiler.backends import get_backend
+
+        backend = get_backend()
+        fragments = backend.pipeline_fragments(compile_hints={})
+    except Exception as exc:
+        raise RuntimeError(
+            "Unable to inspect FlyDSL ROCm backend ABI settings"
+        ) from exc
+
+    attach_fragments = [frag for frag in fragments if "rocdl-attach-target" in frag]
+    if not attach_fragments:
+        raise RuntimeError("FlyDSL ROCm pipeline has no rocdl-attach-target pass")
+
+    expected = f"abi={_FLYDSL_ROCDL_ABI}"
+    if not any(expected in frag for frag in attach_fragments):
+        raise RuntimeError(
+            "MORI FlyDSL bitcode is built with cov=6 and requires FlyDSL "
+            f"rocdl-attach-target {expected}; got: {attach_fragments}"
+        )
 
 
 def get_bitcode_path() -> str:
@@ -38,53 +70,27 @@ def get_bitcode_path() -> str:
         from mori.ir.flydsl import get_bitcode_path
         bc = get_bitcode_path()
     """
-    return find_bitcode(cov=6)
+    _check_flydsl_rocdl_abi()
+    return find_bitcode(cov=_FLYDSL_COV)
+
+
+def shmem_module_init(hip_module: int):
+    """Initialize globalGpuStates in a FlyDSL-loaded HIP module."""
+    import mori.shmem as ms
+
+    return ms.shmem_module_init(hip_module)
 
 
 def install_hook() -> None:
-    """Install FlyDSL post-compile hook for mori shmem.
+    """Compatibility no-op.
 
-    The hook calls ``mori.shmem.shmem_module_init(hip_module)`` after each
-    shmem kernel compilation so that the ``globalGpuStates`` device symbol is
-    properly initialized inside the compiled GPU module.
-
-    Call once before any shmem kernel launch::
-
-        from mori.ir.flydsl import install_hook
-        install_hook()
+    Modern FlyDSL integration attaches ``shmem_module_init`` directly through
+    ``link_extern(..., module_init_fn=...)`` when constructing the extern
+    wrappers, so no global hook installation is required.
     """
-    try:
-        from flydsl.compiler import shmem_compile as sc
-    except ImportError:
-        raise ImportError(
-            "flydsl.compiler.shmem_compile not found. "
-            "Make sure FlyDSL is installed with shmem support."
-        )
-
-    def _hook(hip_module: int) -> None:
-        import mori.shmem as ms
-
-        ms.shmem_module_init(hip_module)
-
-    sc._shmem_post_compile_hook = _hook
+    return None
 
 
 def install_jit_hook() -> None:
-    """Install FlyDSL JIT module-load hook for mori shmem.
-
-    When called, registers a callback in libfly_jit_runtime.so so that
-    every GPU module loaded by flyc.jit automatically gets its
-    ``globalGpuStates`` initialized via ``shmem_module_init``.
-
-    Call once before any shmem kernel launch via ``flyc.jit``::
-
-        from mori.ir.flydsl.runtime import install_jit_hook
-        install_jit_hook()
-
-    Note: If using ``@flyc.jit`` with ``ExternFunction`` that declares
-    ``mori_shmem_*`` symbols, the hook is installed automatically.
-    This function provides an explicit entry point for manual control.
-    """
-    from flydsl.compiler.jit_executor import _ensure_shmem_hook
-
-    _ensure_shmem_hook()
+    """Compatibility alias for :func:`install_hook`."""
+    return install_hook()
