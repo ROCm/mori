@@ -106,6 +106,8 @@ jobs:
                 python3 /tmp/retag.py \"\$whl\" \"/tmp/dist-pypi/\$NEWNAME\" \"\$PLAT\"
               done
             "
+          $CT run --rm -v ${{ runner.temp }}/dist-pypi:/tmp/dist-pypi $IMAGE \
+            chown -R $(id -u):$(id -g) /tmp/dist-pypi
           echo "=== PyPI wheels ==="
           ls -lh ${{ runner.temp }}/dist-pypi/
 
