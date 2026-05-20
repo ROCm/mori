@@ -113,13 +113,7 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   //   earlier mode-1 dispatch on this handle. No atomics, no dedup, no map writes — just
   //   stream new token data through the precomputed routes. This is what's used for the
   //   backward dispatch in autograd, where the routing must match forward exactly.
-  //
-  // We need an input tensor in both modes; tokenIndices is required only in mode-1
-  // (mode-2 reads the route from dispDestTokIdMap instead, so the caller may pass
-  // indices=None in replay).
-  const bool kHaveInputs = (args.inpTokenBuf != nullptr);
-  const bool kHaveRouting = args.replayMode || (args.tokenIndices != nullptr);
-  if (kHaveInputs && kHaveRouting) {
+  if (args.tokenIndices && args.inpTokenBuf) {
     for (int i = globalWarpId; i < args.curRankNumToken * config.numExpertPerToken;
          i += globalWarpNum) {
       index_t srcTokId = i / config.numExpertPerToken;
@@ -195,8 +189,8 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
         }
       }
 
-      const size_t srcTokOffset = (size_t)srcTokId * hiddenDim;
-      const size_t destTokOffset = (size_t)destTokId * hiddenDim;
+      size_t srcTokOffset = (size_t)srcTokId * hiddenDim;
+      size_t destTokOffset = (size_t)destTokId * hiddenDim;
       core::WarpCopy(args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) + destTokOffset,
                      args.inpTokenBuf + srcTokOffset, hiddenDim);
     }
@@ -204,23 +198,22 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   __syncthreads();
   if (thdId == 0) atomicAdd(args.dispatchGridBarrier, 1);
 
-  // Cross-rank signal/wait. In mode-2 replay this also runs, but the per-PE counter
-  // (destPeTokenCounter) is 0 (cleaned up at the end of the prior mode-1 phase 2), so the
-  // signal carries `0 + 1` and the receiver atomicAdds 0 to totalRecvTokenNum — a no-op
-  // that leaves the cached count intact while still acting as a cross-rank barrier.
+  // Send token num & token to expert mapping to other ranks
   MORI_TRACE_NEXT(seq, Slot::DispatchNotifyPeer);
   if (globalWarpId == 0) {
     for (int destPe = laneId; destPe < npes; destPe += warpSize) {
+      // Wait until all tokens are sent
       shmem::ShmemUint32WaitUntilEquals(args.dispatchGridBarrier, gridDim.x);
       __hip_atomic_store(args.dispatchGridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-
+      // Add 1 so that when token number == 0, receiver side still know the signal is sent
       index_t numTokenSignal = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe) + 1;
       index_t* signal = args.recvTokenNumMemObj->template GetAs<index_t*>(destPe) + myPe;
       shmem::ShmemInt32WaitUntilEquals(signal, 0);
       core::AtomicStoreRelaxedSystem(signal, numTokenSignal);
     }
   }
-
+  // Phase 2: recv token
+  // Each warp wait until sender finished by waiting token number signal
   MORI_TRACE_NEXT(seq, Slot::DispatchWaitPeerToken);
   index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
   if (globalWarpId == 0) {
@@ -233,7 +226,7 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       // reset local counter
       args.destPeTokenCounter[destPe] = 0;
     }
-
+    // reset counter
     if (laneId == 0) {
       args.dispTokOffsetMemObj->template GetAs<index_t*>()[0] = 0;
     }
@@ -241,9 +234,6 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
 
 #ifdef ENABLE_STANDARD_MOE_ADAPT
   if constexpr (EnableStdMoE) {
-    // NOTE: Standard-MoE replay is not yet wired. The convert step has its own atomic on
-    // packedRecvCount which would re-randomize layout under replay. Use replayMode=false
-    // when EnableStdMoE is true.
     InvokeConvertDispatchOutput<T>(args, myPe);
   }
 #endif

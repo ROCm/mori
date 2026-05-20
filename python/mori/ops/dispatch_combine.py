@@ -492,21 +492,6 @@ class EpDispatchCombineOp:
         call_local_expert_count: bool = False,
         replay: bool = False,
     ):
-        """DeepEP-style two-mode dispatch.
-
-        Mode-1 (replay=False, default): full CAS-based slot assignment. Builds the routing
-        layout in the handle's internal buffers and streams data along it.
-
-        Mode-2 (replay=True): replay along the layout pinned by an earlier mode-1 dispatch
-        on this handle. No atomics, no dedup, no recv-num signaling — just streams new data
-        through the precomputed routes. Use this for the autograd backward dispatch so the
-        backward routing is bit-identical to the forward.
-
-        Currently honored by the IntraNode and InterNodeV1 kernels. The InterNodeV1 replay
-        path still requires ``indices`` to be passed (it drives the per-warp send loop),
-        but only the cached chunk slots / dest slots are used for the actual data motion.
-        Other kernel types raise.
-        """
         hidden_dim = input.size(1)
         weight_ptr = weights.data_ptr() if weights is not None else 0
         has_scales = scales is not None and self.config.scale_dim > 0
@@ -531,20 +516,9 @@ class EpDispatchCombineOp:
         )
         if replay and self.config.kernel_type.value not in _replay_supported:
             raise NotImplementedError(
-                "DeepEP-style replay (replay=True) is currently only supported for "
+                "replay=True is currently only supported for "
                 "EpDispatchCombineKernelType.IntraNode and InterNodeV1. Got "
                 f"{self.config.kernel_type}."
-            )
-        if (
-            replay
-            and self.config.kernel_type.value
-            == EpDispatchCombineKernelType.InterNodeV1.value
-            and indices is None
-        ):
-            raise ValueError(
-                "InterNodeV1 replay (replay=True) requires the same `indices` tensor "
-                "that was used for the prior mode-1 dispatch — it drives the per-warp "
-                "send loop. Pass the indices tensor explicitly."
             )
 
         mori_cpp.prepare_inference_args(
@@ -554,19 +528,15 @@ class EpDispatchCombineOp:
             num_tokens=input.size(0),
             weight_ptr=weight_ptr,
             scale_ptr=scale_ptr,
-            indices_ptr=indices.data_ptr() if indices is not None else 0,
+            indices_ptr=indices.data_ptr(),
         )
         # Toggle the handle's replay flag so build_args() picks it up.
         mori_cpp.set_replay_mode(self._handle, bool(replay))
-        try:
-            args_ptr = mori_cpp.build_args(
-                self._handle,
-                rdma_block_num=actual_rbn,
-                hidden_dim=hidden_dim,
-            )
-        except Exception:
-            mori_cpp.set_replay_mode(self._handle, False)
-            raise
+        args_ptr = mori_cpp.build_args(
+            self._handle,
+            rdma_block_num=actual_rbn,
+            hidden_dim=hidden_dim,
+        )
 
         grid = (actual_bn,)
         block = (WARP_SIZE * actual_wpb,)
@@ -755,22 +725,6 @@ class EpDispatchCombineOp:
         call_reset: bool = False,
         release: bool = True,
     ):
-        """Combine.
-
-        release=True (default): zeros the cached totalRecvTokenNum on the way out so the
-        next mode-1 dispatch starts clean. This is the standard inference / training-step
-        boundary behavior.
-
-        release=False: keeps the cached totalRecvTokenNum alive across this combine. Pass
-        this on the forward combine of a pinned forward/backward pair when you intend to
-        run a backward dispatch in replay mode (mode-2). The next combine should be called
-        with release=True (typically the backward combine) so the count is zeroed for the
-        next iteration.
-
-        Currently honored by the IntraNode and InterNodeV1 kernels (InterNodeV1's
-        ``EpCombineAll`` skips zeroing ``totalRecvTokenNum`` when ``release=False``).
-        Other kernel types ignore it (they always release).
-        """
         hidden_dim = input.size(1)
         weight_ptr = (
             weights.data_ptr() if weights is not None and weights.size(0) != 0 else 0
@@ -808,16 +762,12 @@ class EpDispatchCombineOp:
         )
         # Toggle the handle's release flag so build_args() picks it up.
         mori_cpp.set_release_handle(self._handle, bool(release))
-        try:
-            args_ptr = mori_cpp.build_args(
-                self._handle,
-                rdma_block_num=actual_rbn,
-                hidden_dim=hidden_dim,
-                use_external_inp_buf=use_external_inp_buf,
-            )
-        except Exception:
-            mori_cpp.set_release_handle(self._handle, True)
-            raise
+        args_ptr = mori_cpp.build_args(
+            self._handle,
+            rdma_block_num=actual_rbn,
+            hidden_dim=hidden_dim,
+            use_external_inp_buf=use_external_inp_buf,
+        )
 
         grid = (actual_bn,)
         block = (WARP_SIZE * actual_wpb,)

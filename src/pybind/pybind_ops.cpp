@@ -216,13 +216,6 @@ bool GetReleaseHandle(const mori::moe::EpDispatchCombineHandle& handle) {
   return handle.releaseHandle;
 }
 
-// Helper to host-side zero the cached totalRecvTokenNum (e.g. when abandoning a pinned
-// layout without going through a "release" combine). Single int32 memset on the stream.
-void ResetTotalRecvTokenNum(mori::moe::EpDispatchCombineHandle& handle, int64_t stream) {
-  HIP_RUNTIME_CHECK(hipMemsetAsync(handle.totalRecvTokenNum, 0, sizeof(mori::moe::index_t),
-                                   reinterpret_cast<hipStream_t>(stream)));
-}
-
 void PyLaunchLocalExpertCount(const mori::moe::EpDispatchCombineConfig& config, int64_t indices_ptr,
                               int64_t total_recv_token_num_ptr, int64_t local_expert_count_ptr,
                               int block_num, int warp_per_block, int64_t stream) {
@@ -313,8 +306,6 @@ void DeclareEpDispatchCombineHandle(pybind11::module& m) {
   m.def("set_release_handle", &SetReleaseHandle, py::arg("handle"), py::arg("enabled"));
   m.def("get_replay_mode", &GetReplayMode, py::arg("handle"));
   m.def("get_release_handle", &GetReleaseHandle, py::arg("handle"));
-  m.def("reset_total_recv_token_num", &ResetTotalRecvTokenNum, py::arg("handle"),
-        py::arg("stream") = 0);
 
   m.def("get_cur_rank_num_token", &mori::moe::EpDispatchCombineHandle::GetCurRankNumToken);
   m.def("get_dispatch_src_token_pos", &GetDispatchSrcTokenId);

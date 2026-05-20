@@ -472,8 +472,7 @@ struct EpDispatchCombineArgsRaw {
   EpDispatchCombineConfig config;
   int fp8BlockwiseCombineScaleDim{0};
   int rdmaBlockNum{-1};
-  // DeepEP-style two-mode dispatch flags. Must mirror EpDispatchCombineArgs<T>
-  // exactly so the static_assert on layout equality continues to hold.
+  // DeepEP-style two-mode dispatch flags (see EpDispatchCombineHandle for docs).
   bool replayMode{false};
   bool releaseHandle{true};
   index_t curRankNumToken{0};
