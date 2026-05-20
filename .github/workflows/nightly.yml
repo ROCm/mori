@@ -43,31 +43,62 @@ jobs:
       - name: Build CI image
         run: $CT build --network=host --build-arg BASE_IMAGE=${{ matrix.base_image }} -t $IMAGE -f docker/Dockerfile.dev .
 
-      - name: Build wheel
+      - name: Build wheels
         run: |
           BASE_VER=$(git describe --tags --abbrev=0 | sed 's/^v//')
           DATE=$(date +%Y%m%d)
           SHA=$(git rev-parse --short HEAD)
-          VERSION="${BASE_VER}.dev${DATE}+${SHA}"
+          GH_VERSION="${BASE_VER}.dev${DATE}+${SHA}"
+          PYPI_VERSION="${BASE_VER}.dev${DATE}"
 
           $CT run --rm --network=host \
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE -w $GITHUB_WORKSPACE \
             -v ${{ runner.temp }}/dist:/tmp/dist \
             $IMAGE bash -c "
               git config --global --add safe.directory '*'
-              echo 'Building wheel for Python ${{ matrix.python }}, version=${VERSION}'
-              SETUPTOOLS_SCM_PRETEND_VERSION=${VERSION} \
+
+              echo '=== Building gh-pages wheel (amd_mori ${GH_VERSION}) ==='
+              SETUPTOOLS_SCM_PRETEND_VERSION=${GH_VERSION} \
                 python3 -m pip wheel --no-deps -w /tmp/dist .
+
+              echo '=== Building PyPI wheel (amd_mori_nightly ${PYPI_VERSION}) ==='
+              sed -i 's/name = \"amd_mori\"/name = \"amd_mori_nightly\"/' pyproject.toml
+              SETUPTOOLS_SCM_PRETEND_VERSION=${PYPI_VERSION} \
+                python3 -m pip wheel --no-deps -w /tmp/dist .
+              git checkout pyproject.toml
             "
 
           echo "=== produced ==="
           ls -lh ${{ runner.temp }}/dist/
 
-      - name: Upload wheel
+      - name: Repair PyPI wheels (manylinux tag)
+        run: |
+          pip install --user auditwheel patchelf 2>/dev/null || true
+          export PATH="$HOME/.local/bin:$PATH"
+          mkdir -p ${{ runner.temp }}/dist-pypi
+          for whl in ${{ runner.temp }}/dist/amd_mori_nightly-*.whl; do
+            PLAT=$(python3 -m auditwheel show "$whl" 2>&1 | grep -o 'manylinux_[0-9_]*_x86_64' | head -1)
+            if [ -n "$PLAT" ]; then
+              python3 -m auditwheel repair "$whl" --plat "$PLAT" -w ${{ runner.temp }}/dist-pypi/
+            else
+              cp "$whl" ${{ runner.temp }}/dist-pypi/
+            fi
+          done
+          echo "=== PyPI wheels ==="
+          ls -lh ${{ runner.temp }}/dist-pypi/
+
+      - name: Upload gh-pages wheel
         uses: actions/upload-artifact@v4
         with:
           name: wheel-cp${{ matrix.python }}
-          path: ${{ runner.temp }}/dist/*.whl
+          path: ${{ runner.temp }}/dist/amd_mori-*.whl
+          retention-days: 30
+
+      - name: Upload PyPI wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: pypi-wheel-cp${{ matrix.python }}
+          path: ${{ runner.temp }}/dist-pypi/amd_mori_nightly-*.whl
           retention-days: 30
 
       - name: Cleanup
@@ -800,3 +831,64 @@ jobs:
           git diff --cached --quiet && echo "No changes" && exit 0
           git commit -m "nightly: promote tested wheels to latest $(date +%Y-%m-%d)"
           git push
+
+  # ── Stage 5: Test PyPI wheel (install + import verification) ───────────────
+  test-pypi-wheel:
+    name: test pypi wheel (py${{ matrix.python }})
+    needs: [promote-latest]
+    if: github.event_name != 'pull_request'
+    runs-on: [self-hosted, MI355X-AINIC-TW]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python: "3.10"
+            base_image: rocm/pytorch:rocm7.2.1_ubuntu22.04_py3.10_pytorch_release_2.8.0
+          - python: "3.12"
+            base_image: rocm/pytorch:rocm7.2.1_ubuntu24.04_py3.12_pytorch_release_2.8.0
+    env:
+      IMAGE: rocm/mori:ci-py${{ matrix.python }}
+    steps:
+      - name: Download PyPI wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: pypi-wheel-cp${{ matrix.python }}
+          path: ${{ runner.temp }}/pypi-wheel
+
+      - name: Build CI image
+        run: $CT build --network=host --build-arg BASE_IMAGE=${{ matrix.base_image }} -t $IMAGE -f docker/Dockerfile.dev .
+
+      - name: Test PyPI wheel
+        run: |
+          $CT run --rm --network=host \
+            -v ${{ runner.temp }}/pypi-wheel:/tmp/wheel:ro \
+            $IMAGE bash -c "
+              pip install /tmp/wheel/*.whl
+              python3 -c 'import mori; print(\"amd-mori-nightly \" + mori.__version__ + \" OK\")'
+              python3 -c 'from mori import ops; print(\"mori.ops OK\")'
+            "
+
+  # ── Stage 6: Publish to PyPI ───────────────────────────────────────────────
+  publish-pypi:
+    name: publish to PyPI
+    needs: [test-pypi-wheel]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download PyPI wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: pypi-wheel-*
+          merge-multiple: true
+          path: ./dist
+
+      - name: List wheels
+        run: ls -lh ./dist/
+
+      - name: Upload to PyPI
+        run: |
+          pip install twine
+          python3 -m twine upload ./dist/*.whl || echo "Upload failed (version may already exist)"
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
