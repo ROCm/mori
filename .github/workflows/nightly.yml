@@ -71,21 +71,24 @@ jobs:
           echo "=== produced ==="
           ls -lh ${{ runner.temp }}/dist/
 
-      - name: Repair PyPI wheels (manylinux tag)
+      - name: Retag PyPI wheels (manylinux platform tag)
         run: |
           mkdir -p ${{ runner.temp }}/dist-pypi
           $CT run --rm \
             -v ${{ runner.temp }}/dist:/tmp/dist:ro \
             -v ${{ runner.temp }}/dist-pypi:/tmp/dist-pypi \
             $IMAGE bash -c "
-              pip install auditwheel patchelf -q
+              pip install auditwheel -q
               for whl in /tmp/dist/amd_mori_nightly-*.whl; do
                 PLAT=\$(auditwheel show \"\$whl\" 2>&1 | grep -o 'manylinux_[0-9_]*_x86_64' | head -1)
-                if [ -n \"\$PLAT\" ]; then
-                  auditwheel repair \"\$whl\" --plat \"\$PLAT\" -w /tmp/dist-pypi/
-                else
-                  cp \"\$whl\" /tmp/dist-pypi/
-                fi
+                if [ -z \"\$PLAT\" ]; then PLAT=linux_x86_64; fi
+                NEWNAME=\$(basename \"\$whl\" | sed \"s/linux_x86_64/\$PLAT/\")
+                pip install wheel -q
+                cd /tmp && python3 -m wheel unpack \"\$whl\"
+                UNPACKED=\$(ls -d /tmp/amd_mori_nightly-*/ | head -1)
+                sed -i \"s/linux_x86_64/\$PLAT/\" \"\$UNPACKED\"/*.dist-info/WHEEL
+                python3 -m wheel pack \"\$UNPACKED\" -d /tmp/dist-pypi/
+                rm -rf \"\$UNPACKED\"
               done
             "
           echo "=== PyPI wheels ==="
