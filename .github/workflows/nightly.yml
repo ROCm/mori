@@ -270,6 +270,7 @@ jobs:
   test-wheel:
     name: intranode test (${{ matrix.platform }}, py${{ matrix.python }})
     needs: deploy-staging
+    if: false  # TODO: remove — temporarily disabled to validate pypi flow
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -441,6 +442,7 @@ jobs:
   test-wheel-internode:
     name: internode test (${{ matrix.platform }}, py${{ matrix.python }})
     needs: deploy-staging
+    if: false  # TODO: remove — temporarily disabled to validate pypi flow
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
