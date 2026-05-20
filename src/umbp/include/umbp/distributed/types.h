@@ -38,6 +38,25 @@ enum class TierType : int {
   SSD = 3,
 };
 
+enum class LocationOwner : uint8_t {
+  UMBP_OWNED = 0,
+  EXTERNAL_HICACHE = 1,
+};
+
+inline constexpr uint32_t kLocationOwnerUmbpOwnedBit = 1u << 0;
+inline constexpr uint32_t kLocationOwnerExternalHiCacheBit = 1u << 1;
+
+enum class FullSyncScope : int {
+  NONE = 0,
+  UMBP_OWNED = 1,
+  EXTERNAL_HICACHE = 2,
+};
+
+inline LocationOwner OwnerFromFullSyncScope(FullSyncScope scope) {
+  return scope == FullSyncScope::EXTERNAL_HICACHE ? LocationOwner::EXTERNAL_HICACHE
+                                                  : LocationOwner::UMBP_OWNED;
+}
+
 struct TierCapacity {
   uint64_t total_bytes = 0;
   uint64_t available_bytes = 0;
@@ -48,20 +67,27 @@ struct ExternalKvHitCountEntry {
   uint64_t hit_count_total = 0;
 };
 
-// In the master-as-advisor design, Location is a (node_id, tier) handle.
+// In the master-as-advisor design, Location is a (node_id, tier, owner) handle.
 // The peer is the canonical owner of every per-key page set; master holds
 // no per-key page state, so location_id is gone.  `size` is carried so
 // the read path can size its RDMA buffer without a separate Resolve.
 //
-// Dedup key for the index is (node_id, tier): a single peer cannot host
-// two replicas of the same key on the same tier.
+// Dedup key for the index is (node_id, tier, owner): UMBP-owned locations
+// are servable by ResolveKey, while EXTERNAL_HICACHE locations are advisory
+// matches for sglang-owned cache state.
 struct Location {
   std::string node_id;
   uint64_t size = 0;
   TierType tier = TierType::UNKNOWN;
+  LocationOwner owner = LocationOwner::UMBP_OWNED;
 
   bool operator==(const Location& other) const {
-    return node_id == other.node_id && size == other.size && tier == other.tier;
+    return node_id == other.node_id && size == other.size && tier == other.tier &&
+           owner == other.owner;
+  }
+
+  bool SameIdentity(const Location& other) const {
+    return node_id == other.node_id && tier == other.tier && owner == other.owner;
   }
 };
 
@@ -110,11 +136,17 @@ struct BufferMemoryDescBytes {
 // allocator (and its unit tests) do not have to depend on the generated
 // proto headers.
 struct KvEvent {
-  enum class Kind : int { ADD = 0, REMOVE = 1 };
+  enum class Kind : int { ADD = 0, REMOVE = 1, CLEAR_AT_TIER = 2 };
   Kind kind = Kind::ADD;
   std::string key;
   TierType tier = TierType::UNKNOWN;
   uint64_t size = 0;  // ADD only; REMOVE leaves this 0
+  LocationOwner owner = LocationOwner::UMBP_OWNED;
+};
+
+struct EventBundle {
+  uint64_t seq = 0;
+  std::vector<KvEvent> events;
 };
 
 // Master-side snapshot of one peer node.  In the master-as-advisor design
@@ -161,6 +193,17 @@ inline const char* ClientStatusName(ClientStatus s) {
       return "ALIVE";
     case ClientStatus::EXPIRED:
       return "EXPIRED";
+    default:
+      return "UNKNOWN";
+  }
+}
+
+inline const char* LocationOwnerName(LocationOwner owner) {
+  switch (owner) {
+    case LocationOwner::UMBP_OWNED:
+      return "UMBP_OWNED";
+    case LocationOwner::EXTERNAL_HICACHE:
+      return "EXTERNAL_HICACHE";
     default:
       return "UNKNOWN";
   }

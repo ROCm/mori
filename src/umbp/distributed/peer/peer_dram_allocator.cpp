@@ -267,6 +267,7 @@ void PeerDramAllocator::ClearLocal() {
   // Drop any queued ADD/REMOVE that the heartbeat hasn't shipped yet:
   // the snapshot we're about to send is the authoritative state.
   pending_events_.clear();
+  owned_external_ssd_.clear();
 
   clear_full_sync_pending_.store(true, std::memory_order_release);
   MORI_UMBP_INFO("[PeerDramAllocator] ClearLocal — pending writes will be rejected until ack");
@@ -278,6 +279,19 @@ void PeerDramAllocator::ClearFullSyncAcked() {
 
 void PeerDramAllocator::QueueExternalEvent(KvEvent ev) {
   std::lock_guard<std::mutex> lock(mutex_);
+  if (ev.tier == TierType::SSD) {
+    switch (ev.kind) {
+      case KvEvent::Kind::ADD:
+        owned_external_ssd_[ev.key] = SsdEntry{ev.size};
+        break;
+      case KvEvent::Kind::REMOVE:
+        owned_external_ssd_.erase(ev.key);
+        break;
+      case KvEvent::Kind::CLEAR_AT_TIER:
+        owned_external_ssd_.clear();
+        break;
+    }
+  }
   pending_events_.push_back(std::move(ev));
 }
 
@@ -291,9 +305,12 @@ std::vector<KvEvent> PeerDramAllocator::DrainPendingEvents() {
 std::vector<KvEvent> PeerDramAllocator::SnapshotOwnedKeys() const {
   std::lock_guard<std::mutex> lock(mutex_);
   std::vector<KvEvent> out;
-  out.reserve(owned_.size());
+  out.reserve(owned_.size() + owned_external_ssd_.size());
   for (const auto& kv : owned_) {
     out.push_back(KvEvent{KvEvent::Kind::ADD, kv.first, kv.second.tier, kv.second.size});
+  }
+  for (const auto& kv : owned_external_ssd_) {
+    out.push_back(KvEvent{KvEvent::Kind::ADD, kv.first, TierType::SSD, kv.second.size});
   }
   return out;
 }
@@ -303,6 +320,7 @@ std::map<TierType, uint64_t> PeerDramAllocator::OwnedKeyCountByTier() const {
   std::map<TierType, uint64_t> result;
   for (TierType t : {TierType::HBM, TierType::DRAM, TierType::SSD}) result[t] = 0;
   for (const auto& [key, slot] : owned_) result[slot.tier]++;
+  result[TierType::SSD] += owned_external_ssd_.size();
   return result;
 }
 

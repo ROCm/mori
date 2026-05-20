@@ -27,10 +27,12 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -137,13 +139,10 @@ class MasterClient {
   bool IsRegistered() const { return registered_; }
 
   // --- External KV block events ---
-  grpc::Status ReportExternalKvBlocks(const std::string& node_id,
-                                      const std::vector<std::string>& hashes, TierType tier);
-  // Revoke specific hashes from a single tier on this node.
-  grpc::Status RevokeExternalKvBlocks(const std::string& node_id,
-                                      const std::vector<std::string>& hashes, TierType tier);
-  // Bulk: revoke every hash registered by this node at the given tier.
-  grpc::Status RevokeAllExternalKvBlocksAtTier(const std::string& node_id, TierType tier);
+  bool BindExternalHashes(const std::vector<std::string>& hashes, TierType tier);
+  bool UnbindExternalHashes(const std::vector<std::string>& hashes, TierType tier);
+  bool UnbindAllExternalHashesAtTier(TierType tier);
+  bool FlushExternalQueue();
 
   struct ExternalKvNodeMatch {
     std::string node_id;
@@ -197,9 +196,15 @@ class MasterClient {
   // is managed by PoolClient.
   PeerDramAllocator* peer_alloc_ = nullptr;
 
-  // Heartbeat seq state — the wire protocol's gap-recovery channel.
-  uint64_t hb_seq_ = 0;
+  std::mutex hb_send_mutex_;
+  std::mutex hb_state_mutex_;
+  std::deque<EventBundle> outbox_;
+  uint64_t next_bundle_seq_ = 1;
   uint64_t hb_last_acked_seq_ = 0;
+  uint32_t full_sync_owners_to_resend_ = 0;
+
+  std::vector<KvEvent> external_pending_events_;
+  std::set<std::pair<TierType, std::string>> external_current_set_;
 
   // Set by Clear() via RequestClearFullSync().  `_requested_` wakes the
   // heartbeat thread and picks the empty-snapshot branch.
@@ -211,6 +216,9 @@ class MasterClient {
   std::atomic<bool> clear_full_sync_in_flight_{false};
 
   void HeartbeatLoop();
+  bool SendHeartbeatOnce();
+  bool SendFullSyncLocked(FullSyncScope scope, const std::map<TierType, TierCapacity>& caps,
+                          const std::map<TierType, uint64_t>& kv_counts);
 
   // --- Metrics buffering ---
   struct PendingSample {

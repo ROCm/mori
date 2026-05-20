@@ -41,7 +41,7 @@ Router::Router(GlobalBlockIndex& index, ClientRegistry& registry,
 std::optional<RouteGetResolution> Router::RouteGet(
     const std::string& key, const std::string& node_id,
     const std::unordered_set<std::string>& exclude_nodes) {
-  auto locations = index_.Lookup(key);
+  auto locations = index_.LookupServable(key);
   if (locations.empty()) {
     MORI_UMBP_DEBUG("[Router] RouteGet key='{}': not found", key);
     return std::nullopt;
@@ -109,7 +109,7 @@ std::vector<std::optional<RoutePutResult>> Router::BatchRoutePut(
   // Single shared_lock for the whole batch: dedup mask + alive snapshot.
   // Two entries picking the same (node, tier) is fine — peer will sort
   // out ENOSPC at AllocateSlot.
-  auto exists_mask = index_.BatchLookupExists(keys);
+  auto exists_mask = index_.BatchLookupExistsServable(keys);
   auto candidates = registry_.GetAliveClients();
   for (size_t i = 0; i < keys.size(); ++i) {
     if (i < exists_mask.size() && exists_mask[i]) {
@@ -136,7 +136,7 @@ std::vector<std::optional<RouteGetResolution>> Router::BatchRouteGet(
   }
 
   for (size_t i = 0; i < keys.size(); ++i) {
-    auto locations = index_.Lookup(keys[i]);
+    auto locations = index_.LookupServable(keys[i]);
     if (locations.empty()) continue;
     if (!exclude_nodes.empty()) {
       locations.erase(

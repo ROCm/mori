@@ -69,9 +69,10 @@ class DistributedClient : public IUMBPClient {
   bool RegisterMemory(uintptr_t ptr, size_t size) override;
   void DeregisterMemory(uintptr_t ptr) override;
 
-  bool ReportExternalKvBlocks(const std::vector<std::string>& hashes, TierType tier) override;
-  bool RevokeExternalKvBlocks(const std::vector<std::string>& hashes, TierType tier) override;
-  bool RevokeAllExternalKvBlocksAtTier(TierType tier) override;
+  bool BindExternalHashes(const std::vector<std::string>& hashes, TierType tier) override;
+  bool UnbindExternalHashes(const std::vector<std::string>& hashes, TierType tier) override;
+  bool UnbindAllExternalHashesAtTier(TierType tier) override;
+  bool FlushExternalQueue() override;
   std::vector<ExternalKvMatch> MatchExternalKv(const std::vector<std::string>& hashes,
                                                bool count_as_hit = false) override;
   std::vector<ExternalKvHitCountEntry> GetExternalKvHitCounts(

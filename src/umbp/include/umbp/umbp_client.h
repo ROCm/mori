@@ -116,18 +116,19 @@ class IUMBPClient {
 
   // ---- External KV Events (for unmanaged L1/L2 cache blocks) ----
 
-  /// Report that this node holds the given hashes at the specified tier.
-  /// Additive: re-reporting at the same tier is a no-op; reporting at a new
-  /// tier adds a tier bucket without removing existing buckets.
-  virtual bool ReportExternalKvBlocks(const std::vector<std::string>& hashes, TierType tier) = 0;
+  /// Bind externally-owned HiCache hashes to this node at the specified tier.
+  /// These are advisory for MatchExternalKv and are not servable by UMBP ResolveKey.
+  virtual bool BindExternalHashes(const std::vector<std::string>& hashes, TierType tier) = 0;
 
-  /// Revoke `hashes` from a single tier on this node.  Other tier buckets
+  /// Revoke `hashes` from a single external tier on this node. Other tiers
   /// for the same hashes are untouched.
-  virtual bool RevokeExternalKvBlocks(const std::vector<std::string>& hashes, TierType tier) = 0;
+  virtual bool UnbindExternalHashes(const std::vector<std::string>& hashes, TierType tier) = 0;
 
-  /// Bulk-revoke every hash currently registered by this node at `tier`.
-  /// Use when a whole tier is wiped (e.g. storage backend cleared).
-  virtual bool RevokeAllExternalKvBlocksAtTier(TierType tier) = 0;
+  /// Bulk-revoke every externally-owned hash currently bound at `tier`.
+  virtual bool UnbindAllExternalHashesAtTier(TierType tier) = 0;
+
+  /// Force an immediate heartbeat carrying any queued external bind/unbind events.
+  virtual bool FlushExternalQueue() = 0;
 
   struct ExternalKvMatch {
     std::string node_id;

@@ -39,7 +39,6 @@
 namespace mori::umbp {
 
 class GlobalBlockIndex;
-class ExternalKvBlockIndex;
 
 // Master-side membership ledger + heartbeat ingestion.  In the
 // master-as-advisor design this class no longer owns any allocator
@@ -56,18 +55,6 @@ class ClientRegistry {
   ClientRegistry& operator=(const ClientRegistry&) = delete;
 
   void SetBlockIndex(GlobalBlockIndex* index);
-
-  // ---- External KV block index (for unmanaged L1/L2/L3 cache blocks) ----
-  void SetExternalKvBlockIndex(ExternalKvBlockIndex* index);
-  void RegisterExternalKvBlocks(const std::string& node_id, const std::vector<std::string>& hashes,
-                                TierType tier);
-  // Revoke `hashes` from `tier` only; other tiers for the same hashes are
-  // untouched.
-  void UnregisterExternalKvBlocks(const std::string& node_id,
-                                  const std::vector<std::string>& hashes, TierType tier);
-  // Bulk: revoke every hash registered by this node at the given tier
-  // (e.g. issued when the node clears or detaches its storage backend).
-  void UnregisterExternalKvBlocksByTier(const std::string& node_id, TierType tier);
 
   // --- Client lifecycle ---
 
@@ -86,19 +73,16 @@ class ClientRegistry {
   // belonged to it.
   void UnregisterClient(const std::string& node_id);
 
-  // Apply one heartbeat batch.  Returns the resulting status
+  // Apply one heartbeat request.  Returns the resulting status
   // (UNKNOWN if the node isn't registered).  On the success path:
   //   - tier_capacities replace the stored values unconditionally,
-  //   - events are applied to the index (or the node's locations are
-  //     replaced in full when is_full_sync=true),
-  //   - last_applied_seq advances to req.seq.
-  // If req.seq != last_applied_seq + 1 (and !is_full_sync), the heartbeat
-  // is rejected: out_request_full_sync is set to true and out_acked_seq
-  // echoes the previously applied seq so the peer reships.
-  ClientStatus Heartbeat(const std::string& node_id, uint64_t seq, uint64_t last_acked_seq,
+  //   - delta bundles are applied in seq order, with retransmissions skipped,
+  //   - owner-scoped full-sync replaces only the requested owner.
+  ClientStatus Heartbeat(const std::string& node_id,
                          const std::map<TierType, TierCapacity>& tier_capacities,
-                         const std::vector<KvEvent>& events, bool is_full_sync,
-                         uint64_t* out_acked_seq, bool* out_request_full_sync);
+                         const std::vector<EventBundle>& bundles, FullSyncScope full_sync_scope,
+                         uint64_t delta_seq_baseline, uint64_t* out_acked_seq,
+                         uint32_t* out_full_sync_owners_to_resend);
 
   // --- Queries ---
   bool IsClientAlive(const std::string& node_id) const;
@@ -117,7 +101,6 @@ class ClientRegistry {
  private:
   ClientRegistryConfig config_;
   GlobalBlockIndex* index_ = nullptr;
-  ExternalKvBlockIndex* external_kv_index_ = nullptr;
 
   mutable std::shared_mutex mutex_;
   std::unordered_map<std::string, ClientRecord> clients_;

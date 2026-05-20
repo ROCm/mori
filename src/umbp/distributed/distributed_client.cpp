@@ -274,21 +274,25 @@ void DistributedClient::Close() {
 
 bool DistributedClient::IsDistributed() const { return true; }
 
-bool DistributedClient::ReportExternalKvBlocks(const std::vector<std::string>& hashes,
-                                               TierType tier) {
+bool DistributedClient::BindExternalHashes(const std::vector<std::string>& hashes, TierType tier) {
   if (!pool_client_) return false;
-  return pool_client_->ReportExternalKvBlocks(hashes, tier);
+  return pool_client_->BindExternalHashes(hashes, tier);
 }
 
-bool DistributedClient::RevokeExternalKvBlocks(const std::vector<std::string>& hashes,
-                                               TierType tier) {
+bool DistributedClient::UnbindExternalHashes(const std::vector<std::string>& hashes,
+                                             TierType tier) {
   if (!pool_client_) return false;
-  return pool_client_->RevokeExternalKvBlocks(hashes, tier);
+  return pool_client_->UnbindExternalHashes(hashes, tier);
 }
 
-bool DistributedClient::RevokeAllExternalKvBlocksAtTier(TierType tier) {
+bool DistributedClient::UnbindAllExternalHashesAtTier(TierType tier) {
   if (!pool_client_) return false;
-  return pool_client_->RevokeAllExternalKvBlocksAtTier(tier);
+  return pool_client_->UnbindAllExternalHashesAtTier(tier);
+}
+
+bool DistributedClient::FlushExternalQueue() {
+  if (!pool_client_) return false;
+  return pool_client_->FlushExternalQueue();
 }
 
 std::vector<IUMBPClient::ExternalKvMatch> DistributedClient::MatchExternalKv(

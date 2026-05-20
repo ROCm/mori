@@ -102,6 +102,10 @@ class PeerDramAllocator {
     uint64_t size = 0;
   };
 
+  struct SsdEntry {
+    uint64_t size = 0;
+  };
+
   struct ResolveResult {
     bool found = false;
     TierType tier = TierType::UNKNOWN;
@@ -264,6 +268,7 @@ class PeerDramAllocator {
 
   std::unordered_map<uint64_t, PendingSlot> pending_;
   std::unordered_map<std::string, OwnedSlot> owned_;
+  std::unordered_map<std::string, SsdEntry> owned_external_ssd_;
   std::unordered_map<std::string, std::chrono::steady_clock::time_point> read_lease_until_;
   std::vector<KvEvent> pending_events_;
 
