@@ -348,6 +348,117 @@ TEST(PeerDramAllocator, BufferDescsForPagesDedupAndOrder) {
   EXPECT_EQ(descs[1].desc_bytes, std::vector<uint8_t>({0xB0, 0xB1}));
 }
 
+// ---- BatchAllocate / BatchCommit / BatchAbort -------------------------------
+
+TEST(PeerDramAllocator, BatchAllocateEmptyInputReturnsEmpty) {
+  auto a = MakeAllocator();
+  EXPECT_TRUE(a->BatchAllocate({}).empty());
+}
+
+TEST(PeerDramAllocator, BatchAllocateMixedOutcomesAndDescs) {
+  auto a = MakeAllocator();
+  auto owned = AllocateOk(*a, "owned", kPageSize, TierType::DRAM);
+  ASSERT_TRUE(owned.has_value());
+  uint64_t committed_bytes = 0;
+  ASSERT_TRUE(a->Commit(owned->slot_id, "owned", committed_bytes));
+  a->DrainPendingEvents();
+
+  std::vector<PeerDramAllocator::AllocateRequest> requests;
+  requests.push_back({"owned", kPageSize, TierType::DRAM});
+  requests.push_back({"ok", kPageSize * 5, TierType::DRAM});
+  requests.push_back({"bad-tier", kPageSize, TierType::HBM});
+  requests.push_back({"zero", 0, TierType::DRAM});
+  requests.push_back({"too-big", kPageSize * 20, TierType::DRAM});
+
+  auto results = a->BatchAllocate(requests);
+  ASSERT_EQ(results.size(), requests.size());
+
+  EXPECT_EQ(results[0].outcome, PeerDramAllocator::Outcome::kSuccessAlreadyExists);
+  EXPECT_FALSE(results[0].slot.has_value());
+  EXPECT_TRUE(results[0].descs.empty());
+
+  EXPECT_EQ(results[1].outcome, PeerDramAllocator::Outcome::kSuccessAllocated);
+  ASSERT_TRUE(results[1].slot.has_value());
+  EXPECT_EQ(results[1].slot->size, kPageSize * 5);
+  EXPECT_EQ(results[1].slot->pages.size(), 5u);
+  ASSERT_EQ(results[1].descs.size(), 2u);
+  EXPECT_EQ(results[1].descs[0].buffer_index, 0u);
+  EXPECT_EQ(results[1].descs[1].buffer_index, 1u);
+
+  EXPECT_EQ(results[2].outcome, PeerDramAllocator::Outcome::kFailed);
+  EXPECT_FALSE(results[2].slot.has_value());
+  EXPECT_EQ(results[3].outcome, PeerDramAllocator::Outcome::kFailed);
+  EXPECT_FALSE(results[3].slot.has_value());
+  EXPECT_EQ(results[4].outcome, PeerDramAllocator::Outcome::kFailedNoSpace);
+  EXPECT_FALSE(results[4].slot.has_value());
+}
+
+TEST(PeerDramAllocator, BatchCommitMixedSuccessAndFailure) {
+  auto a = MakeAllocator();
+  auto allocated = a->BatchAllocate({
+      {"dup", kPageSize, TierType::DRAM},
+      {"dup", kPageSize * 2, TierType::DRAM},
+      {"unique", kPageSize, TierType::DRAM},
+  });
+  ASSERT_EQ(allocated.size(), 3u);
+  ASSERT_TRUE(allocated[0].slot.has_value());
+  ASSERT_TRUE(allocated[1].slot.has_value());
+  ASSERT_TRUE(allocated[2].slot.has_value());
+
+  auto committed = a->BatchCommit({
+      {allocated[0].slot->slot_id, "dup"},
+      {999999, "missing"},
+      {allocated[1].slot->slot_id, "dup"},
+      {allocated[2].slot->slot_id, "unique"},
+  });
+  ASSERT_EQ(committed.size(), 4u);
+  EXPECT_TRUE(committed[0].success);
+  EXPECT_EQ(committed[0].bytes_committed, kPageSize);
+  EXPECT_FALSE(committed[1].success);
+  EXPECT_EQ(committed[1].bytes_committed, 0u);
+  EXPECT_TRUE(committed[2].success);
+  EXPECT_EQ(committed[2].bytes_committed, kPageSize);
+  EXPECT_TRUE(committed[3].success);
+  EXPECT_EQ(committed[3].bytes_committed, kPageSize);
+
+  auto dup = a->Resolve("dup");
+  ASSERT_TRUE(dup.found);
+  EXPECT_EQ(dup.pages, allocated[0].slot->pages);
+  EXPECT_EQ(dup.size, kPageSize);
+  auto unique = a->Resolve("unique");
+  ASSERT_TRUE(unique.found);
+  EXPECT_EQ(unique.size, kPageSize);
+
+  auto events = a->DrainPendingEvents();
+  ASSERT_EQ(events.size(), 2u);
+  EXPECT_EQ(events[0].kind, KvEvent::Kind::ADD);
+  EXPECT_EQ(events[0].key, "dup");
+  EXPECT_EQ(events[1].kind, KvEvent::Kind::ADD);
+  EXPECT_EQ(events[1].key, "unique");
+}
+
+TEST(PeerDramAllocator, BatchAbortMixedSlotsIsIdempotent) {
+  auto a = MakeAllocator();
+  auto allocated = a->BatchAllocate({
+      {"drop", kPageSize, TierType::DRAM},
+      {"keep", kPageSize, TierType::DRAM},
+  });
+  ASSERT_EQ(allocated.size(), 2u);
+  ASSERT_TRUE(allocated[0].slot.has_value());
+  ASSERT_TRUE(allocated[1].slot.has_value());
+
+  auto aborted = a->BatchAbort({allocated[0].slot->slot_id, 999999});
+  ASSERT_EQ(aborted.size(), 2u);
+  EXPECT_TRUE(aborted[0]);
+  EXPECT_TRUE(aborted[1]);
+
+  uint64_t committed_bytes = 0;
+  EXPECT_FALSE(a->Commit(allocated[0].slot->slot_id, "drop", committed_bytes));
+  EXPECT_TRUE(a->Commit(allocated[1].slot->slot_id, "keep", committed_bytes));
+  EXPECT_EQ(committed_bytes, kPageSize);
+  EXPECT_TRUE(a->Resolve("keep").found);
+}
+
 // ---- BatchResolve ----------------------------------------------------------
 
 TEST(PeerDramAllocator, BatchResolveEmptyInputReturnsEmpty) {

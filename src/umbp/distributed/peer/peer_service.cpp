@@ -523,13 +523,27 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
   grpc::Status BatchAllocateSlots(grpc::ServerContext* /*ctx*/,
                                   const ::umbp::BatchAllocateSlotsRequest* request,
                                   ::umbp::BatchAllocateSlotsResponse* response) override {
-    for (const auto& entry : request->entries()) {
-      auto* out = response->add_entries();
-      if (dram_alloc_ == nullptr) {
+    if (dram_alloc_ == nullptr) {
+      for (int i = 0; i < request->entries_size(); ++i) {
+        auto* out = response->add_entries();
         out->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_FAILED);
-        continue;
       }
-      auto result = dram_alloc_->Allocate(entry.key(), entry.size(), FromProtoTier(entry.tier()));
+      return grpc::Status::OK;
+    }
+
+    std::vector<PeerDramAllocator::AllocateRequest> entries;
+    entries.reserve(request->entries_size());
+    for (const auto& entry : request->entries()) {
+      PeerDramAllocator::AllocateRequest alloc_entry;
+      alloc_entry.key = entry.key();
+      alloc_entry.size = entry.size();
+      alloc_entry.tier = FromProtoTier(entry.tier());
+      entries.push_back(std::move(alloc_entry));
+    }
+
+    auto results = dram_alloc_->BatchAllocate(entries);
+    for (const auto& result : results) {
+      auto* out = response->add_entries();
       switch (result.outcome) {
         case PeerDramAllocator::Outcome::kSuccessAlreadyExists:
           out->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALREADY_EXISTS);
@@ -544,10 +558,9 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
           break;
       }
       const auto& pending = *result.slot;
-      auto descs = dram_alloc_->BufferDescsForPages(pending.tier, pending.pages);
       out->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALLOCATED);
       out->set_slot_id(pending.slot_id);
-      FillPagesAndDescs(out, pending.pages, dram_alloc_->PageSize(), descs);
+      FillPagesAndDescs(out, pending.pages, dram_alloc_->PageSize(), result.descs);
       out->set_pending_ttl_ms(dram_alloc_->PendingTtlMs());
     }
     return grpc::Status::OK;
@@ -556,13 +569,25 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
   grpc::Status BatchCommitSlots(grpc::ServerContext* /*ctx*/,
                                 const ::umbp::BatchCommitSlotsRequest* request,
                                 ::umbp::BatchCommitSlotsResponse* response) override {
-    uint64_t total_committed = 0;
+    if (dram_alloc_ == nullptr) {
+      for (int i = 0; i < request->entries_size(); ++i) response->add_success(false);
+      return grpc::Status::OK;
+    }
+
+    std::vector<PeerDramAllocator::CommitRequest> entries;
+    entries.reserve(request->entries_size());
     for (const auto& entry : request->entries()) {
-      uint64_t committed_bytes = 0;
-      const bool ok = dram_alloc_ != nullptr &&
-                      dram_alloc_->Commit(entry.slot_id(), entry.key(), committed_bytes);
-      response->add_success(ok);
-      if (ok) total_committed += committed_bytes;
+      PeerDramAllocator::CommitRequest commit_entry;
+      commit_entry.slot_id = entry.slot_id();
+      commit_entry.key = entry.key();
+      entries.push_back(std::move(commit_entry));
+    }
+
+    auto results = dram_alloc_->BatchCommit(entries);
+    uint64_t total_committed = 0;
+    for (const auto& result : results) {
+      response->add_success(result.success);
+      if (result.success) total_committed += result.bytes_committed;
     }
     if (total_committed > 0) RecordInboundPut(total_committed, "remote");
     return grpc::Status::OK;
@@ -571,8 +596,14 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
   grpc::Status BatchAbortSlots(grpc::ServerContext* /*ctx*/,
                                const ::umbp::BatchAbortSlotsRequest* request,
                                ::umbp::BatchAbortSlotsResponse* response) override {
-    for (uint64_t slot_id : request->slot_ids()) {
-      const bool ok = dram_alloc_ == nullptr ? true : dram_alloc_->Abort(slot_id);
+    if (dram_alloc_ == nullptr) {
+      for (int i = 0; i < request->slot_ids_size(); ++i) response->add_success(true);
+      return grpc::Status::OK;
+    }
+
+    std::vector<uint64_t> slot_ids(request->slot_ids().begin(), request->slot_ids().end());
+    auto results = dram_alloc_->BatchAbort(slot_ids);
+    for (bool ok : results) {
       response->add_success(ok);
     }
     return grpc::Status::OK;
