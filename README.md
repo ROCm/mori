@@ -2,8 +2,8 @@
 
 ## News
 
-- **[2026/05]** 🔥 MORI becomes the primary EP communication library for AMD platforms in Alibaba RTP-LLM ([MORI-EP](https://github.com/alibaba/rtp-llm/pull/977)).
-- **[2026/05]** MORI's SDMA-based AllGather collective is integrated into DeepSpeed for ZeRO-3 optimization on AMD GPUs, delivering up to 10% end-to-end training speedup by offloading AllGather traffic to dedicated SDMA copy engines ([example](https://github.com/deepspeedai/DeepSpeed/blob/master/examples/sdma_allgather/README.md)).
+- **[2026/05]** 🔥 MORI becomes the primary EP communication library for AMD platforms in Alibaba RTP-LLM ([MORI-EP PR](https://github.com/alibaba/rtp-llm/pull/977)).
+- **[2026/05]** MORI's SDMA-based AllGather collective is integrated into DeepSpeed for ZeRO-3 optimization on AMD GPUs, delivering up to 10% end-to-end training speedup by offloading AllGather traffic to dedicated SDMA copy engines ([example](https://github.com/deepspeedai/DeepSpeed/blob/master/examples/sdma_allgather/README.md), [post](https://x.com/DeepSpeedAI/status/2056401598839140384)).
 - **[2026/04]** 🔥 Tencent OpenUCL adopts the Mori ecosystem, using Mori's EP-style dispatch/combine pattern in AMD GPU deployments and leveraging MORI-SHMEM for GPU-initiated communication.
 - **[2026/03]** 🔥 MORI-SHMEM powers ByteDance Triton-distributed EP dispatch/combine kernels as the backend, delivering seamless integration and high performance on AMD GPUs ([EP Kernels](https://github.com/ByteDance-Seed/Triton-distributed/pull/164), [MORI-SHMEM Integration](https://github.com/ByteDance-Seed/Triton-distributed/pull/145)).
 - **[2026/02]** 🔥 MORI powers AMD's WideEP and PD disaggregation in SemiAnalysis InferenceX v2 benchmark ([PR](https://github.com/SemiAnalysisAI/InferenceX/pull/348), [InferenceX](https://inferencex.semianalysis.com/), [blog](https://newsletter.semianalysis.com/p/inferencex-v2-nvidia-blackwell-vs)).
