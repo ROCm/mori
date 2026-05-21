@@ -14,18 +14,14 @@ def is_mori_fsdp_sdma_enabled() -> bool:
 
 
 class _MoriSdmaAllGatherWork:
-    def __init__(self, collective: Any, output_tensor: torch.Tensor, stream: torch.cuda.Stream):
+    def __init__(self, collective: Any, stream: torch.cuda.Stream):
         self._collective = collective
-        self._output_tensor = output_tensor
         self._stream = stream
         self._waited = False
 
     def wait(self) -> bool:
         if not self._waited:
-            try:
-                self._collective.wait_async(stream=self._stream)
-            finally:
-                self._collective.deregister_output_buffer(self._output_tensor)
+            self._collective.wait_async(stream=self._stream)
             self._waited = True
         return True
 
@@ -37,6 +33,7 @@ class MoriSdmaAllGather(AllGather):
         self._world_size: Optional[int] = None
         self._input_buffer_size = 0
         self._output_buffer_size = 0
+        self._registered_outputs: dict[int, int] = {}
 
     def allocate(
         self,
@@ -58,14 +55,11 @@ class MoriSdmaAllGather(AllGather):
         collective = self._get_collective(group)
         stream = torch.cuda.current_stream(input_tensor.device)
         count = input_tensor.numel()
-        collective.register_output_buffer(output_tensor)
+        self._ensure_output_registered(collective, output_tensor)
         if async_op:
             collective.start_async(input_tensor, output_tensor, count, stream=stream)
-            return _MoriSdmaAllGatherWork(collective, output_tensor, stream)
-        try:
-            collective(input_tensor, output_tensor, count, stream=stream)
-        finally:
-            collective.deregister_output_buffer(output_tensor)
+            return _MoriSdmaAllGatherWork(collective, stream)
+        collective(input_tensor, output_tensor, count, stream=stream)
         return None
 
     def _validate_tensors(
@@ -131,7 +125,19 @@ class MoriSdmaAllGather(AllGather):
         self._world_size = world_size
         self._input_buffer_size = 4
         self._output_buffer_size = 4
+        self._registered_outputs.clear()
         return self._collective
+
+    def _ensure_output_registered(self, collective: Any, output_tensor: torch.Tensor) -> None:
+        ptr = output_tensor.data_ptr()
+        nbytes = _tensor_nbytes(output_tensor)
+        if self._registered_outputs.get(ptr, 0) >= nbytes:
+            return
+        if collective.is_output_registered(output_tensor):
+            self._registered_outputs[ptr] = nbytes
+            return
+        collective.register_output_buffer(output_tensor)
+        self._registered_outputs[ptr] = nbytes
 
 
 def _tensor_nbytes(tensor: torch.Tensor) -> int:
