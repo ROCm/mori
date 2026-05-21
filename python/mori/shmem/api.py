@@ -19,25 +19,64 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+import ctypes
+import threading
+
 from mori import cpp as mori_cpp
 
 # Initialization flags
 MORI_SHMEM_INIT_WITH_MPI_COMM = mori_cpp.MORI_SHMEM_INIT_WITH_MPI_COMM
 MORI_SHMEM_INIT_WITH_UNIQUEID = mori_cpp.MORI_SHMEM_INIT_WITH_UNIQUEID
 
-_shmem_module_loaded = False
+# Per-GPU module loading: keyed by device ID so that each GPU context gets its
+# own hipModuleLoad call even when multiple threads share one process (SPMT).
+_shmem_module_lock = threading.Lock()
+_shmem_module_loaded_gpus: set = set()
+# Cached hsaco path (compilation is arch-specific, not instance-specific).
+_shmem_hsaco: str = ""
+
+
+def _current_hip_device() -> int:
+    """Return the calling thread's current HIP device id.
+
+    Uses ctypes against libamdhip64 directly so that the JAX path (which has
+    no torch dependency) works the same as the PyTorch path.
+    """
+    from mori.jit.hip_driver import _get_hip_lib
+
+    hip = _get_hip_lib()
+    # Set explicit ctypes signatures — without these, ctypes assumes int args
+    # and int return, which happens to be right on x86_64 Linux but is not
+    # portable. Be explicit so future ABI changes don't silently break us.
+    hip.hipGetDevice.argtypes = [ctypes.POINTER(ctypes.c_int)]
+    hip.hipGetDevice.restype = ctypes.c_int
+    dev = ctypes.c_int(-1)
+    err = hip.hipGetDevice(ctypes.byref(dev))
+    if err != 0:
+        raise RuntimeError(f"hipGetDevice failed with error {err}")
+    return int(dev.value)
 
 
 def _ensure_shmem_module():
-    """JIT-compile and load the shmem device module before ShmemInit."""
-    global _shmem_module_loaded
-    if _shmem_module_loaded:
-        return
-    from mori.jit.core import compile_genco
+    """JIT-compile and load the shmem device module before ShmemInit.
 
-    hsaco = compile_genco("shmem_kernels")
-    mori_cpp.load_shmem_module(hsaco)
-    _shmem_module_loaded = True
+    Thread-safe: each GPU device context gets exactly one load_shmem_module
+    call, enabling single-process multi-thread (SPMT) use where each thread
+    owns a different GPU.
+    """
+    device_id = _current_hip_device()
+    if device_id in _shmem_module_loaded_gpus:
+        return
+    with _shmem_module_lock:
+        if device_id in _shmem_module_loaded_gpus:
+            return
+        global _shmem_hsaco
+        if not _shmem_hsaco:
+            from mori.jit.core import compile_genco
+
+            _shmem_hsaco = compile_genco("shmem_kernels")
+        mori_cpp.load_shmem_module(_shmem_hsaco)
+        _shmem_module_loaded_gpus.add(device_id)
 
 
 def shmem_torch_process_group_init(group_name: str):
@@ -124,7 +163,17 @@ def shmem_finalize():
     Returns:
         Status code (0 for success)
     """
-    return mori_cpp.shmem_finalize()
+    ret = mori_cpp.shmem_finalize()
+    # Clear this GPU's module-loaded flag so a subsequent shmem_init_attr
+    # call (e.g. in the next test round) will reload the JIT module.
+    try:
+        device_id = _current_hip_device()
+    except Exception:
+        # If HIP context is gone (e.g. process teardown), skip cache cleanup.
+        return ret
+    with _shmem_module_lock:
+        _shmem_module_loaded_gpus.discard(device_id)
+    return ret
 
 
 def shmem_module_init(hip_module: int):
