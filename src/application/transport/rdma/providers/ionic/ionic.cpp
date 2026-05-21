@@ -31,6 +31,7 @@
 #include <cstring>
 #include <iostream>
 #include <optional>
+#include <tuple>
 
 #include "mori/application/utils/check.hpp"
 #include "mori/application/utils/math.hpp"
@@ -46,39 +47,47 @@ namespace application {
 
 namespace {
 
-// Minimum firmware build number required for CCQE support (e.g. "1.117.5-a58" → 58).
-constexpr int kCcqeMinFwBuild = 58;
+using FwVersion = std::tuple<int, int, int, int>;
+constexpr FwVersion kCcqeMinFwVersion{1, 117, 5, 58};
 
-// Read /sys/class/infiniband/<dev_name>/fw_ver and return the numeric build suffix
-// (the digits after the last '-[letters]' component).  Returns -1 on any failure.
-int ReadIonicFwBuild(const char* dev_name) {
+// Parse "1.117.5-a-58" or "1.117.5-a58" into (1,117,5,58).
+std::optional<FwVersion> ParseIonicFwVersion(const char* fw_ver) {
+  int major, minor, patch, build;
+  char tag;
+  if (sscanf(fw_ver, "%d.%d.%d-%c-%d", &major, &minor, &patch, &tag, &build) == 5 ||
+      sscanf(fw_ver, "%d.%d.%d-%c%d", &major, &minor, &patch, &tag, &build) == 5) {
+    return FwVersion{major, minor, patch, build};
+  }
+  return std::nullopt;
+}
+
+std::optional<FwVersion> ReadIonicFwVersion(const char* dev_name) {
   char path[256];
   snprintf(path, sizeof(path), "/sys/class/infiniband/%s/fw_ver", dev_name);
 
   FILE* f = fopen(path, "r");
-  if (!f) return -1;
+  if (!f) return std::nullopt;
 
   char buf[64] = {};
   fgets(buf, sizeof(buf), f);
   fclose(f);
 
-  // Find last '-' then skip letters to reach the build digits.
-  char* dash = strrchr(buf, '-');
-  if (!dash) return -1;
-  char* p = dash + 1;
-  while (*p && !isdigit(static_cast<unsigned char>(*p))) ++p;
-  if (!*p) return -1;
-  return atoi(p);
+  // Strip trailing newline.
+  buf[strcspn(buf, "\n")] = '\0';
+  return ParseIonicFwVersion(buf);
 }
 
 bool IsCcqeSupported(ibv_context* context) {
   const char* disable_ccqe = std::getenv("MORI_DISABLE_IONIC_CCQE");
   if (disable_ccqe && std::strcmp(disable_ccqe, "1") == 0) return false;
   if (IonicDvApi::Instance().create_cq_ex == nullptr) return false;
-  int build = ReadIonicFwBuild(context->device->name);
 
-  MORI_APP_TRACE("dev: {} fw_build {}", context->device->name, build);
-  return build >= kCcqeMinFwBuild;
+  /* Minimum firmware version verified by MORI to support CCQE is 1.117.5-a-58. */
+  auto ver = ReadIonicFwVersion(context->device->name);
+  MORI_APP_TRACE("dev: {} fw_ver {}.{}.{}-a-{}", context->device->name,
+                 ver ? std::get<0>(*ver) : -1, ver ? std::get<1>(*ver) : -1,
+                 ver ? std::get<2>(*ver) : -1, ver ? std::get<3>(*ver) : -1);
+  return ver.has_value() && *ver >= kCcqeMinFwVersion;
 }
 
 }  // namespace

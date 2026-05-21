@@ -243,7 +243,7 @@ enum ionic_v1_cqe_qtf_bits {
   IONIC_V1_CQE_TYPE_RECV = 1,
   IONIC_V1_CQE_TYPE_SEND_MSN = 2,
   IONIC_V1_CQE_TYPE_SEND_NPG = 3,
-  c = 4,
+  IONIC_V1_CQE_TYPE_RECV_RCQE = 4,
 };
 
 #if !defined(__HIP_PLATFORM_AMD__) && !defined(__HIP_PLATFORM_HCC__)

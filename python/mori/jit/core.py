@@ -178,25 +178,23 @@ def _lib_has_ionic_ccqe() -> bool:
         return False
 
 
-def _parse_ionic_fw_minor(fw_ver: str) -> int | None:
-    """Parse the build number from an ionic firmware string like '1.117.5-a58'.
-
-    Extracts the numeric part from the suffix after '-', e.g. 'a58' → 58, 'a119' → 119.
-    Returns None if the string cannot be parsed.
-    """
-    if fw_ver:
-        return int(fw_ver.split("a")[-1].lstrip("-"))
-
-    return None
+_CCQE_MIN_FW_VERSION = (1, 117, 5, 58)
 
 
-_CCQE_MIN_FW_MINOR = 58
+def _parse_ionic_fw_version(fw_ver: str) -> tuple[int, ...] | None:
+    """Parse '1.117.5-a-58' → (1, 117, 5, 58). Returns None if unparseable."""
+    if not fw_ver:
+        return None
+    m = re.match(r"^(\d+)\.(\d+)\.(\d+)-a-?(\d+)$", fw_ver)
+    if not m:
+        return None
+    return tuple(int(x) for x in m.groups())
 
 
 def _is_firmware_support_ccqe(fw_ver: str) -> bool:
-    """Return True if the firmware version string reports build number >= 58."""
-    minor = _parse_ionic_fw_minor(fw_ver)
-    return minor is not None and minor >= _CCQE_MIN_FW_MINOR
+    """Return True if the firmware version >= 1.117.5-a-58."""
+    ver = _parse_ionic_fw_version(fw_ver)
+    return ver is not None and ver >= _CCQE_MIN_FW_VERSION
 
 
 def _get_ionic_fw_versions() -> list[str]:
@@ -231,6 +229,8 @@ def _is_all_ionic_support_ccqe() -> bool:
         return False
     if len(set(versions)) != 1:
         return False
+
+    print(f"ionic ver: {versions[-1]}")
 
     for ver in versions:
         if not _is_firmware_support_ccqe(ver):
@@ -410,7 +410,7 @@ def _hipcc_genco(
         *_ccqe_defines(),
         *_profiler_defines(),
     ]
-    print("genco cmd", cmd)
+
     for d in include_dirs:
         cmd.extend(["-I", str(d)])
     cmd.extend([str(source), "-o", str(output)])

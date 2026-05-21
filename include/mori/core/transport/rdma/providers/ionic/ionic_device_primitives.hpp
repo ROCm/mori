@@ -465,8 +465,9 @@ inline __device__ void UpdateDbrAndRingDbRecv<ProviderType::PSD>(void* dbrRecAdd
 /*                                        Completion Queue                                        */
 /* ---------------------------------------------------------------------------------------------- */
 #ifdef IONIC_CCQE
-inline __device__ int PollCqCcqe(void* cqAddr, uint32_t cqeNum, uint32_t* consIdx,
-                                 uint32_t* wqeCounter) {
+template <>
+inline __device__ int PollCq<ProviderType::PSD>(void* cqAddr, uint32_t cqeNum, uint32_t* consIdx,
+                                                uint32_t* wqeCounter) {
   const uint32_t curConsIdx = *consIdx;
 
   volatile struct ionic_v1_cqe* cqe = reinterpret_cast<volatile ionic_v1_cqe*>(cqAddr);
@@ -474,18 +475,16 @@ inline __device__ int PollCqCcqe(void* cqAddr, uint32_t cqeNum, uint32_t* consId
   if ((msn - (curConsIdx + 1)) & 0x800000) {
     return -1;  // firmware hasn't produced enough completions yet
   }
+
   *wqeCounter = msn;
   return 0;
 }
-#endif
+
+#else
 
 template <>
 inline __device__ int PollCq<ProviderType::PSD>(void* cqAddr, uint32_t cqeNum, uint32_t* consIdx,
                                                 uint32_t* wqeCounter) {
-#ifdef IONIC_CCQE
-  return PollCqCcqe(cqAddr, cqeNum, consIdx, wqeCounter);
-#endif
-
   const uint32_t curConsIdx = *consIdx;
   const uint32_t cqeIdx = curConsIdx & (cqeNum - 1);
 
@@ -518,6 +517,7 @@ inline __device__ int PollCq<ProviderType::PSD>(void* cqAddr, uint32_t cqeNum, u
   *wqeCounter = BE32TOH(cqe->send.msg_msn);
   return 0;
 }
+#endif  // end of IONIC_CCQE
 
 template <>
 inline __device__ void UpdateCqDbrRecord<ProviderType::PSD>(CompletionQueueHandle& cq,
