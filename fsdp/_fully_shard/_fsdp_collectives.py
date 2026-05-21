@@ -7,10 +7,9 @@ import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import _get_device_handle
 from torch.distributed.distributed_c10d import ReduceOp
-from torch.distributed.fsdp._fully_shard._fsdp_api import AllGather, ReduceScatter
 from torch.distributed.tensor import DTensor
 
-from ._fsdp_api import _ReduceOp
+from ._fsdp_api import AllGather, ReduceScatter, _ReduceOp
 from ._fsdp_common import (
     _get_dim0_padded_size,
     _raise_assert_with_print,
@@ -23,7 +22,7 @@ from ._fsdp_param import FSDPParam, ShardedState
 class AllGatherResult(NamedTuple):
     all_gather_output: torch.Tensor
     all_gather_event: Optional[torch.Event]
-    all_gather_work: Optional[dist.distributed_c10d.Work]
+    all_gather_work: Optional[Any]
     # For each parameter, the all-gather input dtype for each input
     param_all_gather_input_dtypes: list[list[torch.dtype]]
     # For each parameter, the all-gather input numel for each input
@@ -360,6 +359,8 @@ def foreach_all_gather_copy_out(
     if all_gather_event is not None:  # sync op
         device_handle.current_stream().wait_event(all_gather_event)
     if isinstance(all_gather_work, dist.distributed_c10d.Work):  # async op
+        all_gather_work.wait()
+    elif all_gather_work is not None:
         all_gather_work.wait()
     world_size, device = group.size(), all_gather_output.device
 

@@ -32,6 +32,7 @@ from ._fsdp_common import (
     HSDPMeshInfo,
     TrainingState,
 )
+from ._mori_sdma_allgather import is_mori_fsdp_sdma_enabled, MoriSdmaAllGather
 from ._fsdp_param import FSDPParam, ParamModuleInfo, ShardedState
 
 
@@ -165,7 +166,9 @@ class FSDPParamGroup:
         self._module_to_pre_save_state_dict_hook_handle: _ModuleToHandleDict = {}
         self._module_to_pre_load_state_dict_hook_handle: _ModuleToHandleDict = {}
         self._all_reduce_hook: Optional[Callable[[torch.Tensor], None]] = None
-        self._all_gather_comm: AllGather = DefaultAllGather()
+        self._all_gather_comm: AllGather = (
+            MoriSdmaAllGather() if is_mori_fsdp_sdma_enabled() else DefaultAllGather()
+        )
         self._reduce_scatter_comm: ReduceScatter = DefaultReduceScatter()
         # Optional stream to run the user-defined all-reduce hook in
         # Saved here and not in the comm. context because we allow the user to
