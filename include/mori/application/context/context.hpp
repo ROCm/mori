@@ -39,7 +39,7 @@ class Context {
   int LocalRank() const { return bootNet.GetLocalRank(); }
   int WorldSize() const { return bootNet.GetWorldSize(); }
   int LocalRankInNode() const { return rankInNode; }
-  std::string HostName() const { return myHostname; }
+  const std::string& HostName() const { return myHostname; }
 
   TransportType GetTransportType(int destRank) const { return transportTypes[destRank]; }
   const std::vector<TransportType>& GetTransportTypes() const { return transportTypes; }
