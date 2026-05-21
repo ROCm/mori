@@ -88,7 +88,8 @@ class GlobalBlockIndex {
 
   // Apply one peer's heartbeat-shipped event batch.  Returns the count
   // of events that mutated the index.  ADD with a (node_id, tier) that
-  // already exists for the key replaces the existing entry's size.
+  // already exists for the key is a silent no-op on the location's size
+  // (a WARN is logged); the existing location is preserved.
   // REMOVE for an unknown (key, node_id, tier) is a silent no-op.
   size_t ApplyEvents(const std::string& node_id, const std::vector<KvEvent>& events);
 
@@ -135,6 +136,8 @@ class GlobalBlockIndex {
  private:
   mutable std::shared_mutex mutex_;
   std::unordered_map<std::string, BlockEntry> entries_;
+  // Reverse index: lets ReplaceNodeLocations skip a full entries_ scan.
+  std::unordered_map<std::string, std::unordered_set<std::string>> node_to_keys_;
 };
 
 }  // namespace mori::umbp

@@ -64,16 +64,14 @@ TEST(GlobalBlockIndexEvents, ApplyAddInsertsLocation) {
   EXPECT_EQ(locs[0].size, 1024u);
 }
 
-TEST(GlobalBlockIndexEvents, ApplyAddSameNodeTierUpdatesSize) {
+// Duplicate ADD keeps the first observed size; only REMOVE retires it.
+TEST(GlobalBlockIndexEvents, ApplyAddSameNodeTierKeepsExistingSize) {
   GlobalBlockIndex idx;
   idx.ApplyEvents("node-A", {Add("k", TierType::DRAM, 1024)});
-  // ADD again with a different size on the same (node, tier) — the
-  // dedup key is (node, tier), so the existing location's size is
-  // overwritten rather than duplicated.
   idx.ApplyEvents("node-A", {Add("k", TierType::DRAM, 2048)});
   auto locs = idx.Lookup("k");
   ASSERT_EQ(locs.size(), 1u);
-  EXPECT_EQ(locs[0].size, 2048u);
+  EXPECT_EQ(locs[0].size, 1024u);
 }
 
 TEST(GlobalBlockIndexEvents, MultipleNodesCoexistForSameKey) {
@@ -155,6 +153,114 @@ TEST(GlobalBlockIndexEvents, ReplaceNodeLocationsIgnoresRemoveEntries) {
   EXPECT_TRUE(idx.Lookup("k1").empty());
   EXPECT_FALSE(idx.Lookup("k2").empty());
   EXPECT_TRUE(idx.Lookup("k3").empty());
+}
+
+// ---- Reverse-index (node_to_keys_) invariants ------------------------------
+
+TEST(GlobalBlockIndexEvents, ReplaceNodeLocationsAfterMultiTierRemoveKeepsKeyClean) {
+  GlobalBlockIndex idx;
+  idx.ApplyEvents("node-A", {Add("k", TierType::DRAM, 100), Add("k", TierType::HBM, 200)});
+  idx.ApplyEvents("node-B", {Add("k", TierType::DRAM, 300)});
+
+  // A still owns (k, HBM): reverse index must keep k.
+  idx.ApplyEvents("node-A", {Remove("k", TierType::DRAM)});
+  auto mid = idx.Lookup("k");
+  ASSERT_EQ(mid.size(), 2u);
+  EXPECT_TRUE(HasLocation(mid, "node-A", TierType::HBM, 200));
+  EXPECT_TRUE(HasLocation(mid, "node-B", TierType::DRAM, 300));
+
+  idx.ReplaceNodeLocations("node-A", {});
+  auto after = idx.Lookup("k");
+  ASSERT_EQ(after.size(), 1u);
+  EXPECT_EQ(after[0].node_id, "node-B");
+  EXPECT_EQ(after[0].tier, TierType::DRAM);
+  EXPECT_EQ(after[0].size, 300u);
+}
+
+TEST(GlobalBlockIndexEvents, ReplaceNodeLocationsLeavesOtherNodesIntact) {
+  GlobalBlockIndex idx;
+  idx.ApplyEvents("node-A", {Add("k1", TierType::DRAM, 1), Add("k2", TierType::DRAM, 2)});
+  idx.ApplyEvents("node-B", {Add("k1", TierType::DRAM, 10), Add("k3", TierType::HBM, 30)});
+  idx.ApplyEvents("node-C", {Add("k2", TierType::HBM, 200), Add("k4", TierType::DRAM, 400)});
+
+  idx.ReplaceNodeLocations("node-A", {Add("k_new", TierType::DRAM, 999)});
+
+  auto k1 = idx.Lookup("k1");
+  ASSERT_EQ(k1.size(), 1u);
+  EXPECT_EQ(k1[0].node_id, "node-B");
+  EXPECT_EQ(k1[0].size, 10u);
+
+  auto k2 = idx.Lookup("k2");
+  ASSERT_EQ(k2.size(), 1u);
+  EXPECT_EQ(k2[0].node_id, "node-C");
+  EXPECT_EQ(k2[0].tier, TierType::HBM);
+
+  EXPECT_TRUE(HasLocation(idx.Lookup("k_new"), "node-A", TierType::DRAM, 999));
+
+  auto k3 = idx.Lookup("k3");
+  ASSERT_EQ(k3.size(), 1u);
+  EXPECT_EQ(k3[0].node_id, "node-B");
+  EXPECT_EQ(k3[0].size, 30u);
+
+  auto k4 = idx.Lookup("k4");
+  ASSERT_EQ(k4.size(), 1u);
+  EXPECT_EQ(k4[0].node_id, "node-C");
+  EXPECT_EQ(k4[0].size, 400u);
+}
+
+// 2nd sync must see reverse index repopulated by 1st sync's replay.
+TEST(GlobalBlockIndexEvents, ReplaceNodeLocationsTwiceRotatesKeys) {
+  GlobalBlockIndex idx;
+  idx.ApplyEvents("node-A", {Add("k_old", TierType::DRAM, 1)});
+
+  idx.ReplaceNodeLocations("node-A",
+                           {Add("k_mid_a", TierType::DRAM, 2), Add("k_mid_b", TierType::HBM, 3)});
+  EXPECT_TRUE(idx.Lookup("k_old").empty());
+  EXPECT_FALSE(idx.Lookup("k_mid_a").empty());
+  EXPECT_FALSE(idx.Lookup("k_mid_b").empty());
+
+  idx.ReplaceNodeLocations("node-A", {Add("k_final", TierType::DRAM, 4)});
+  EXPECT_TRUE(idx.Lookup("k_mid_a").empty());
+  EXPECT_TRUE(idx.Lookup("k_mid_b").empty());
+  auto final_locs = idx.Lookup("k_final");
+  ASSERT_EQ(final_locs.size(), 1u);
+  EXPECT_EQ(final_locs[0].node_id, "node-A");
+  EXPECT_EQ(final_locs[0].size, 4u);
+}
+
+// Reverse-index insert must run even when inserted==false.
+TEST(GlobalBlockIndexEvents, DuplicateAddKeepsReverseConsistent) {
+  GlobalBlockIndex idx;
+  idx.ApplyEvents("node-A", {Add("dup", TierType::DRAM, 1024)});
+  idx.ApplyEvents("node-A", {Add("dup", TierType::DRAM, 2048)});
+  idx.ApplyEvents("node-A", {Add("dup", TierType::DRAM, 4096)});
+
+  auto locs = idx.Lookup("dup");
+  ASSERT_EQ(locs.size(), 1u);
+
+  idx.ReplaceNodeLocations("node-A", {});
+  EXPECT_TRUE(idx.Lookup("dup").empty());
+}
+
+// No-op REMOVE must leave node_to_keys_ untouched on both sides.
+TEST(GlobalBlockIndexEvents, RemoveNonMatchingTierLeavesReverseUntouched) {
+  GlobalBlockIndex idx;
+  idx.ApplyEvents("node-A", {Add("k", TierType::DRAM, 100)});
+
+  idx.ApplyEvents("node-A", {Remove("k", TierType::HBM)});
+  auto mid = idx.Lookup("k");
+  ASSERT_EQ(mid.size(), 1u);
+  EXPECT_EQ(mid[0].tier, TierType::DRAM);
+
+  idx.ReplaceNodeLocations("node-A", {});
+  EXPECT_TRUE(idx.Lookup("k").empty());
+
+  idx.ApplyEvents("node-A", {Add("k", TierType::DRAM, 100)});
+  idx.ApplyEvents("node-B", {Remove("k", TierType::DRAM)});
+  idx.ReplaceNodeLocations("node-B", {});
+  auto after = idx.Lookup("k");
+  ASSERT_EQ(after.size(), 1u);
+  EXPECT_EQ(after[0].node_id, "node-A");
 }
 
 // ---- ClientRegistry::Heartbeat applies events end-to-end --------------------

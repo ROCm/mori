@@ -26,20 +26,30 @@
 #include <mutex>
 #include <shared_mutex>
 #include <unordered_set>
+#include <utility>
+
+#include "mori/utils/mori_log.hpp"
 
 namespace mori::umbp {
 
 namespace {
 
-// Locate (or insert) the location for (node_id, tier) within an entry's
-// location list.  Caller MUST hold the unique lock.  Returns a pointer
-// into entry.locations that's stable until the next mutation.
-Location* FindOrInsertLocation(BlockEntry& entry, const std::string& node_id, TierType tier) {
+// Caller must hold the unique lock. Returns {location, inserted}.
+std::pair<Location*, bool> FindOrInsertLocation(BlockEntry& entry, const std::string& node_id,
+                                                TierType tier) {
   for (auto& loc : entry.locations) {
-    if (loc.node_id == node_id && loc.tier == tier) return &loc;
+    if (loc.node_id == node_id && loc.tier == tier) return {&loc, false};
   }
   entry.locations.push_back(Location{node_id, /*size=*/0, tier});
-  return &entry.locations.back();
+  return {&entry.locations.back(), true};
+}
+
+// Caller must hold the unique lock.
+bool HasLocationForNode(const BlockEntry& entry, const std::string& node_id) {
+  for (const auto& loc : entry.locations) {
+    if (loc.node_id == node_id) return true;
+  }
+  return false;
 }
 
 }  // namespace
@@ -61,9 +71,18 @@ size_t GlobalBlockIndex::ApplyEvents(const std::string& node_id,
         entry.last_accessed_rep.store(now.time_since_epoch().count(), std::memory_order_release);
         entry.atomic_access_count.store(0, std::memory_order_relaxed);
       }
-      Location* loc = FindOrInsertLocation(entry, node_id, ev.tier);
-      loc->size = ev.size;
-      ++mutated;
+      auto [loc, inserted] = FindOrInsertLocation(entry, node_id, ev.tier);
+      // Idempotent; must run on duplicate ADDs too.
+      node_to_keys_[node_id].insert(ev.key);
+      if (!inserted) {
+        MORI_UMBP_WARN(
+            "[GlobalBlockIndex] duplicate ADD for key='{}' node={} tier={} old_size={} "
+            "new_size={}; keeping existing location",
+            ev.key, node_id, TierTypeName(ev.tier), loc->size, ev.size);
+      } else {
+        loc->size = ev.size;
+        ++mutated;
+      }
     } else {  // REMOVE
       auto it = entries_.find(ev.key);
       if (it == entries_.end()) continue;
@@ -75,6 +94,11 @@ size_t GlobalBlockIndex::ApplyEvents(const std::string& node_id,
                  locs.end());
       if (locs.size() != before) {
         ++mutated;
+        // find(), not operator[]: don't grow an empty bucket for strangers.
+        if (!HasLocationForNode(it->second, node_id)) {
+          auto rev_it = node_to_keys_.find(node_id);
+          if (rev_it != node_to_keys_.end()) rev_it->second.erase(ev.key);
+        }
         if (locs.empty()) entries_.erase(it);
       }
     }
@@ -87,22 +111,22 @@ void GlobalBlockIndex::ReplaceNodeLocations(const std::string& node_id,
   std::unique_lock lock(mutex_);
   const auto now = std::chrono::steady_clock::now();
 
-  // First pass: drop every existing location belonging to node_id.
-  // Erase entries that become empty so Lookup doesn't surface ghost keys.
-  for (auto it = entries_.begin(); it != entries_.end();) {
-    auto& locs = it->second.locations;
-    locs.erase(std::remove_if(locs.begin(), locs.end(),
-                              [&](const Location& l) { return l.node_id == node_id; }),
-               locs.end());
-    if (locs.empty()) {
-      it = entries_.erase(it);
-    } else {
-      ++it;
+  // O(N_node + |adds|) via the reverse index; erase empties to avoid ghosts.
+  auto rev_it = node_to_keys_.find(node_id);
+  if (rev_it != node_to_keys_.end()) {
+    auto old_keys = std::move(rev_it->second);
+    node_to_keys_.erase(rev_it);
+    for (const auto& key : old_keys) {
+      auto eit = entries_.find(key);
+      if (eit == entries_.end()) continue;
+      auto& locs = eit->second.locations;
+      locs.erase(std::remove_if(locs.begin(), locs.end(),
+                                [&](const Location& l) { return l.node_id == node_id; }),
+                 locs.end());
+      if (locs.empty()) entries_.erase(eit);
     }
   }
 
-  // Second pass: replay each ADD.  REMOVE entries in a full-sync batch
-  // are nonsensical (the snapshot is the truth) and are silently ignored.
   for (const auto& ev : adds) {
     if (ev.kind != KvEvent::Kind::ADD) continue;
     auto& entry = entries_[ev.key];
@@ -113,8 +137,10 @@ void GlobalBlockIndex::ReplaceNodeLocations(const std::string& node_id,
       entry.last_accessed_rep.store(now.time_since_epoch().count(), std::memory_order_release);
       entry.atomic_access_count.store(0, std::memory_order_relaxed);
     }
-    Location* loc = FindOrInsertLocation(entry, node_id, ev.tier);
+    auto [loc, inserted] = FindOrInsertLocation(entry, node_id, ev.tier);
+    (void)inserted;
     loc->size = ev.size;
+    node_to_keys_[node_id].insert(ev.key);
   }
 }
 
