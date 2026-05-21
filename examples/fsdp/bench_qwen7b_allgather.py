@@ -141,7 +141,10 @@ def _load_qwen_model(model_name_or_path: str | None, dtype: torch.dtype):
             use_cache=False,
         )
     config.use_cache = False
-    model = AutoModelForCausalLM.from_config(config, torch_dtype=dtype)
+    try:
+        model = AutoModelForCausalLM.from_config(config, dtype=dtype)
+    except TypeError:
+        model = AutoModelForCausalLM.from_config(config, torch_dtype=dtype)
     return model, config
 
 
@@ -222,10 +225,15 @@ def main() -> None:
         else nullcontext()
     )
 
+    if rank == 0:
+        print("Loading Qwen model config and initializing weights...", flush=True)
     model, config = _load_qwen_model(args.model_name_or_path, dtype)
-    model.to(device)
+    if rank == 0:
+        print("Applying FSDP2 layer-by-layer sharding...", flush=True)
     _apply_fsdp2(model, dtype=dtype, reshard_root=args.reshard_root)
     model.train()
+    if rank == 0:
+        print("FSDP2 model is ready; starting optimizer setup and benchmark.", flush=True)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     dist.barrier()

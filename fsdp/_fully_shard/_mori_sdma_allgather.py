@@ -14,14 +14,18 @@ def is_mori_fsdp_sdma_enabled() -> bool:
 
 
 class _MoriSdmaAllGatherWork:
-    def __init__(self, collective: Any, stream: torch.cuda.Stream):
+    def __init__(self, collective: Any, output_tensor: torch.Tensor, stream: torch.cuda.Stream):
         self._collective = collective
+        self._output_tensor = output_tensor
         self._stream = stream
         self._waited = False
 
     def wait(self) -> bool:
         if not self._waited:
-            self._collective.wait_async(stream=self._stream)
+            try:
+                self._collective.wait_async(stream=self._stream)
+            finally:
+                self._collective.deregister_output_buffer(self._output_tensor)
             self._waited = True
         return True
 
@@ -51,13 +55,17 @@ class MoriSdmaAllGather(AllGather):
         async_op: bool = False,
     ) -> Optional[Any]:
         self._validate_tensors(output_tensor, input_tensor, group)
-        collective = self._get_collective(output_tensor, input_tensor, group)
+        collective = self._get_collective(group)
         stream = torch.cuda.current_stream(input_tensor.device)
         count = input_tensor.numel()
+        collective.register_output_buffer(output_tensor)
         if async_op:
             collective.start_async(input_tensor, output_tensor, count, stream=stream)
-            return _MoriSdmaAllGatherWork(collective, stream)
-        collective(input_tensor, output_tensor, count, stream=stream)
+            return _MoriSdmaAllGatherWork(collective, output_tensor, stream)
+        try:
+            collective(input_tensor, output_tensor, count, stream=stream)
+        finally:
+            collective.deregister_output_buffer(output_tensor)
         return None
 
     def _validate_tensors(
@@ -91,21 +99,12 @@ class MoriSdmaAllGather(AllGather):
                 "to be 4-byte aligned"
             )
 
-    def _get_collective(
-        self,
-        output_tensor: torch.Tensor,
-        input_tensor: torch.Tensor,
-        group: dist.ProcessGroup,
-    ) -> Any:
+    def _get_collective(self, group: dist.ProcessGroup) -> Any:
         rank, world_size = group.rank(), group.size()
-        input_nbytes = _tensor_nbytes(input_tensor)
-        output_nbytes = _tensor_nbytes(output_tensor)
         if (
             self._collective is not None
             and self._rank == rank
             and self._world_size == world_size
-            and self._input_buffer_size >= input_nbytes
-            and self._output_buffer_size >= output_nbytes
         ):
             return self._collective
 
@@ -124,14 +123,14 @@ class MoriSdmaAllGather(AllGather):
         self._collective = AllgatherSdma(
             my_pe,
             npes,
-            input_buffer_size=max(input_nbytes, 4),
-            output_buffer_size=max(output_nbytes, 4),
+            input_buffer_size=4,
+            output_buffer_size=4,
             copy_output_to_user=True,
         )
         self._rank = rank
         self._world_size = world_size
-        self._input_buffer_size = input_nbytes
-        self._output_buffer_size = output_nbytes
+        self._input_buffer_size = 4
+        self._output_buffer_size = 4
         return self._collective
 
 
