@@ -517,7 +517,7 @@ inline __device__ int PollCq<ProviderType::PSD>(void* cqAddr, uint32_t cqeNum, u
   *wqeCounter = BE32TOH(cqe->send.msg_msn);
   return 0;
 }
-#endif  // end of IONIC_CCQE
+#endif  // end of PollCq<ProviderType::PSD>
 
 template <>
 inline __device__ void UpdateCqDbrRecord<ProviderType::PSD>(CompletionQueueHandle& cq,
