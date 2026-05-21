@@ -33,7 +33,9 @@ class MoriSdmaAllGather(AllGather):
         self._world_size: Optional[int] = None
         self._input_buffer_size = 0
         self._output_buffer_size = 0
-        self._registered_outputs: dict[int, int] = {}
+        self._output_buffer: Optional[torch.Tensor] = None
+        self._output_buffer_nbytes = 0
+        self._registered_output_ptr: Optional[int] = None
 
     def allocate(
         self,
@@ -42,7 +44,19 @@ class MoriSdmaAllGather(AllGather):
         dtype: torch.dtype,
         device: torch.device,
     ) -> torch.Tensor:
-        return torch.empty(*size, dtype=dtype, device=device)
+        nbytes = _numel(size) * torch.empty((), dtype=dtype).element_size()
+        if (
+            self._output_buffer is not None
+            and self._output_buffer.dtype == dtype
+            and self._output_buffer.device == device
+            and self._output_buffer.numel() >= _numel(size)
+        ):
+            return self._output_buffer.narrow(0, 0, _numel(size))
+        self._deregister_output_buffer_if_needed()
+        self._output_buffer = torch.empty(*size, dtype=dtype, device=device)
+        self._output_buffer_nbytes = nbytes
+        self._registered_output_ptr = None
+        return self._output_buffer
 
     def __call__(
         self,
@@ -59,7 +73,7 @@ class MoriSdmaAllGather(AllGather):
         if async_op:
             collective.start_async(input_tensor, output_tensor, count, stream=stream)
             return _MoriSdmaAllGatherWork(collective, stream)
-        collective(input_tensor, output_tensor, count, stream=stream)
+        collective.enqueue(input_tensor, output_tensor, count, stream=stream)
         return None
 
     def _validate_tensors(
@@ -125,20 +139,35 @@ class MoriSdmaAllGather(AllGather):
         self._world_size = world_size
         self._input_buffer_size = 4
         self._output_buffer_size = 4
-        self._registered_outputs.clear()
+        self._registered_output_ptr = None
         return self._collective
 
     def _ensure_output_registered(self, collective: Any, output_tensor: torch.Tensor) -> None:
         ptr = output_tensor.data_ptr()
         nbytes = _tensor_nbytes(output_tensor)
-        if self._registered_outputs.get(ptr, 0) >= nbytes:
+        if self._registered_output_ptr == ptr and self._output_buffer_nbytes >= nbytes:
             return
         if collective.is_output_registered(output_tensor):
-            self._registered_outputs[ptr] = nbytes
+            self._registered_output_ptr = ptr
             return
         collective.register_output_buffer(output_tensor)
-        self._registered_outputs[ptr] = nbytes
+        self._registered_output_ptr = ptr
+
+    def _deregister_output_buffer_if_needed(self) -> None:
+        if self._collective is None or self._output_buffer is None:
+            return
+        if self._registered_output_ptr != self._output_buffer.data_ptr():
+            return
+        self._collective.deregister_output_buffer(self._output_buffer)
+        self._registered_output_ptr = None
 
 
 def _tensor_nbytes(tensor: torch.Tensor) -> int:
     return tensor.numel() * tensor.element_size()
+
+
+def _numel(size: Sequence[Union[int, torch.SymInt]]) -> int:
+    numel = 1
+    for dim in size:
+        numel *= int(dim)
+    return numel

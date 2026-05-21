@@ -263,6 +263,18 @@ class AllgatherSdma:
         self._handle.finish_sync(output_data.data_ptr(), u32_count, s)
         return True
 
+    def enqueue(self, input_data, output_data, count: int, stream=None) -> bool:
+        byte_count = count * input_data.element_size()
+        u32_count = (byte_count + 3) // 4
+        s = _stream_to_int(stream)
+        args = self._handle.prepare_sync(
+            input_data.data_ptr(), output_data.data_ptr(), u32_count, s
+        )
+        _get_ccl_func("OneShotAllGatherSdmaKernel_u32").launch_struct(
+            (1,), (512,), 0, s, args
+        )
+        return True
+
     def start_async(self, input_data, output_data, count: int, stream=None) -> bool:
         byte_count = count * input_data.element_size()
         u32_count = (byte_count + 3) // 4
