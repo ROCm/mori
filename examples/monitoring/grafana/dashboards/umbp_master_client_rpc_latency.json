@@ -68,12 +68,12 @@
   "panels": [
     {
       "id": 1,
-      "title": "P99 Latency by RPC (excludes Heartbeat)",
-      "description": "P99 client-perceived latency for each MasterClient RPC method, grouped by client (node). Heartbeat is filtered out by default to avoid masking real business RPC tail latency.",
+      "title": "Latency - Routing (single-key): RoutePut / RouteGet",
+      "description": "Mean and p50/p90/p95/p99 client-perceived latency aggregated across all clients for the single-key router RPCs. Hot business path; read and write share the same router code so they're plotted together.",
       "type": "timeseries",
       "gridPos": {
         "h": 8,
-        "w": 24,
+        "w": 12,
         "x": 0,
         "y": 0
       },
@@ -89,20 +89,121 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.99, sum by (le, rpc, node) (rate(mori_umbp_master_client_rpc_latency_seconds_bucket{status=\"ok\",rpc!=\"Heartbeat\",node=~\"$node\",rpc=~\"$rpc\"}[$__rate_interval])))",
-          "legendFormat": "{{rpc}} @ {{node}}",
+          "expr": "sum by (rpc) (rate(mori_umbp_master_client_rpc_latency_seconds_sum{status=\"ok\",rpc=~\"RoutePut|RouteGet\",rpc=~\"$rpc\"}[$__rate_interval])) / sum by (rpc) (rate(mori_umbp_master_client_rpc_latency_seconds_count{status=\"ok\",rpc=~\"RoutePut|RouteGet\",rpc=~\"$rpc\"}[$__rate_interval]))",
+          "legendFormat": "mean {{rpc}}",
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.50, sum by (le, rpc) (rate(mori_umbp_master_client_rpc_latency_seconds_bucket{status=\"ok\",rpc=~\"RoutePut|RouteGet\",rpc=~\"$rpc\"}[$__rate_interval])))",
+          "legendFormat": "p50 {{rpc}}",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.90, sum by (le, rpc) (rate(mori_umbp_master_client_rpc_latency_seconds_bucket{status=\"ok\",rpc=~\"RoutePut|RouteGet\",rpc=~\"$rpc\"}[$__rate_interval])))",
+          "legendFormat": "p90 {{rpc}}",
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le, rpc) (rate(mori_umbp_master_client_rpc_latency_seconds_bucket{status=\"ok\",rpc=~\"RoutePut|RouteGet\",rpc=~\"$rpc\"}[$__rate_interval])))",
+          "legendFormat": "p95 {{rpc}}",
+          "refId": "D"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le, rpc) (rate(mori_umbp_master_client_rpc_latency_seconds_bucket{status=\"ok\",rpc=~\"RoutePut|RouteGet\",rpc=~\"$rpc\"}[$__rate_interval])))",
+          "legendFormat": "p99 {{rpc}}",
+          "refId": "E"
         }
       ]
     },
     {
       "id": 2,
-      "title": "Selected RPC: P50 / P95 / P99 (per node)",
-      "description": "Latency distribution for the selected RPC ($rpc) per client. Use the rpc template variable to focus on a single method including Heartbeat.",
+      "title": "Latency - Routing (batch): BatchRoutePut / BatchRouteGet",
+      "description": "Mean and p50/p90/p95/p99 client-perceived latency aggregated across all clients for the batched router RPCs. Same router logic as single-key but operating over key vectors; absolute latency profile differs so a dedicated panel keeps the y-axis readable. Note: SGLang's batch_exists path also goes over BatchRouteGet on the wire, so this panel's BatchRouteGet line includes those calls.",
       "type": "timeseries",
       "gridPos": {
         "h": 8,
-        "w": 24,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (rpc) (rate(mori_umbp_master_client_rpc_latency_seconds_sum{status=\"ok\",rpc=~\"BatchRoutePut|BatchRouteGet\",rpc=~\"$rpc\"}[$__rate_interval])) / sum by (rpc) (rate(mori_umbp_master_client_rpc_latency_seconds_count{status=\"ok\",rpc=~\"BatchRoutePut|BatchRouteGet\",rpc=~\"$rpc\"}[$__rate_interval]))",
+          "legendFormat": "mean {{rpc}}",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.50, sum by (le, rpc) (rate(mori_umbp_master_client_rpc_latency_seconds_bucket{status=\"ok\",rpc=~\"BatchRoutePut|BatchRouteGet\",rpc=~\"$rpc\"}[$__rate_interval])))",
+          "legendFormat": "p50 {{rpc}}",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.90, sum by (le, rpc) (rate(mori_umbp_master_client_rpc_latency_seconds_bucket{status=\"ok\",rpc=~\"BatchRoutePut|BatchRouteGet\",rpc=~\"$rpc\"}[$__rate_interval])))",
+          "legendFormat": "p90 {{rpc}}",
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le, rpc) (rate(mori_umbp_master_client_rpc_latency_seconds_bucket{status=\"ok\",rpc=~\"BatchRoutePut|BatchRouteGet\",rpc=~\"$rpc\"}[$__rate_interval])))",
+          "legendFormat": "p95 {{rpc}}",
+          "refId": "D"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le, rpc) (rate(mori_umbp_master_client_rpc_latency_seconds_bucket{status=\"ok\",rpc=~\"BatchRoutePut|BatchRouteGet\",rpc=~\"$rpc\"}[$__rate_interval])))",
+          "legendFormat": "p99 {{rpc}}",
+          "refId": "E"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Latency - External KV index: Report / Revoke / RevokeAll / Match",
+      "description": "Mean and p50/p90/p95/p99 client-perceived latency aggregated across all clients for the external KV block-index RPCs (three writers + one reader). They share the GlobalBlockIndex data structure on the master, so contention shows up here first.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
         "x": 0,
         "y": 8
       },
@@ -118,8 +219,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.50, sum by (le, rpc, node) (rate(mori_umbp_master_client_rpc_latency_seconds_bucket{status=\"ok\",node=~\"$node\",rpc=~\"$rpc\"}[$__rate_interval])))",
-          "legendFormat": "p50 {{rpc}} @ {{node}}",
+          "expr": "sum by (rpc) (rate(mori_umbp_master_client_rpc_latency_seconds_sum{status=\"ok\",rpc=~\"ReportExternalKvBlocks|RevokeExternalKvBlocks|RevokeAllExternalKvBlocksAtTier|MatchExternalKv\",rpc=~\"$rpc\"}[$__rate_interval])) / sum by (rpc) (rate(mori_umbp_master_client_rpc_latency_seconds_count{status=\"ok\",rpc=~\"ReportExternalKvBlocks|RevokeExternalKvBlocks|RevokeAllExternalKvBlocksAtTier|MatchExternalKv\",rpc=~\"$rpc\"}[$__rate_interval]))",
+          "legendFormat": "mean {{rpc}}",
           "refId": "A"
         },
         {
@@ -127,8 +228,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, rpc, node) (rate(mori_umbp_master_client_rpc_latency_seconds_bucket{status=\"ok\",node=~\"$node\",rpc=~\"$rpc\"}[$__rate_interval])))",
-          "legendFormat": "p95 {{rpc}} @ {{node}}",
+          "expr": "histogram_quantile(0.50, sum by (le, rpc) (rate(mori_umbp_master_client_rpc_latency_seconds_bucket{status=\"ok\",rpc=~\"ReportExternalKvBlocks|RevokeExternalKvBlocks|RevokeAllExternalKvBlocksAtTier|MatchExternalKv\",rpc=~\"$rpc\"}[$__rate_interval])))",
+          "legendFormat": "p50 {{rpc}}",
           "refId": "B"
         },
         {
@@ -136,14 +237,97 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.99, sum by (le, rpc, node) (rate(mori_umbp_master_client_rpc_latency_seconds_bucket{status=\"ok\",node=~\"$node\",rpc=~\"$rpc\"}[$__rate_interval])))",
-          "legendFormat": "p99 {{rpc}} @ {{node}}",
+          "expr": "histogram_quantile(0.90, sum by (le, rpc) (rate(mori_umbp_master_client_rpc_latency_seconds_bucket{status=\"ok\",rpc=~\"ReportExternalKvBlocks|RevokeExternalKvBlocks|RevokeAllExternalKvBlocksAtTier|MatchExternalKv\",rpc=~\"$rpc\"}[$__rate_interval])))",
+          "legendFormat": "p90 {{rpc}}",
           "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le, rpc) (rate(mori_umbp_master_client_rpc_latency_seconds_bucket{status=\"ok\",rpc=~\"ReportExternalKvBlocks|RevokeExternalKvBlocks|RevokeAllExternalKvBlocksAtTier|MatchExternalKv\",rpc=~\"$rpc\"}[$__rate_interval])))",
+          "legendFormat": "p95 {{rpc}}",
+          "refId": "D"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le, rpc) (rate(mori_umbp_master_client_rpc_latency_seconds_bucket{status=\"ok\",rpc=~\"ReportExternalKvBlocks|RevokeExternalKvBlocks|RevokeAllExternalKvBlocksAtTier|MatchExternalKv\",rpc=~\"$rpc\"}[$__rate_interval])))",
+          "legendFormat": "p99 {{rpc}}",
+          "refId": "E"
         }
       ]
     },
     {
-      "id": 3,
+      "id": 4,
+      "title": "Latency - Lifecycle & heartbeat: RegisterClient / UnregisterClient / Heartbeat",
+      "description": "Mean and p50/p90/p95/p99 client-perceived latency aggregated across all clients for control-plane RPCs. Register/Unregister fire rarely; Heartbeat fires every ~5s. Watching Heartbeat tail latency catches master-side stalls before business RPCs notice.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (rpc) (rate(mori_umbp_master_client_rpc_latency_seconds_sum{status=\"ok\",rpc=~\"RegisterClient|UnregisterClient|Heartbeat\",rpc=~\"$rpc\"}[$__rate_interval])) / sum by (rpc) (rate(mori_umbp_master_client_rpc_latency_seconds_count{status=\"ok\",rpc=~\"RegisterClient|UnregisterClient|Heartbeat\",rpc=~\"$rpc\"}[$__rate_interval]))",
+          "legendFormat": "mean {{rpc}}",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.50, sum by (le, rpc) (rate(mori_umbp_master_client_rpc_latency_seconds_bucket{status=\"ok\",rpc=~\"RegisterClient|UnregisterClient|Heartbeat\",rpc=~\"$rpc\"}[$__rate_interval])))",
+          "legendFormat": "p50 {{rpc}}",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.90, sum by (le, rpc) (rate(mori_umbp_master_client_rpc_latency_seconds_bucket{status=\"ok\",rpc=~\"RegisterClient|UnregisterClient|Heartbeat\",rpc=~\"$rpc\"}[$__rate_interval])))",
+          "legendFormat": "p90 {{rpc}}",
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le, rpc) (rate(mori_umbp_master_client_rpc_latency_seconds_bucket{status=\"ok\",rpc=~\"RegisterClient|UnregisterClient|Heartbeat\",rpc=~\"$rpc\"}[$__rate_interval])))",
+          "legendFormat": "p95 {{rpc}}",
+          "refId": "D"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le, rpc) (rate(mori_umbp_master_client_rpc_latency_seconds_bucket{status=\"ok\",rpc=~\"RegisterClient|UnregisterClient|Heartbeat\",rpc=~\"$rpc\"}[$__rate_interval])))",
+          "legendFormat": "p99 {{rpc}}",
+          "refId": "E"
+        }
+      ]
+    },
+    {
+      "id": 5,
       "title": "QPS by RPC (excludes Heartbeat)",
       "description": "Successful RPC rate per method per client. Heartbeat (~0.2 Hz) excluded so business RPCs are visible.",
       "type": "timeseries",
@@ -172,7 +356,7 @@
       ]
     },
     {
-      "id": 4,
+      "id": 6,
       "title": "Error rate by RPC + code",
       "description": "Non-OK RPC rate, broken down by gRPC status code (UNAVAILABLE, DEADLINE_EXCEEDED, ...).",
       "type": "timeseries",
@@ -201,9 +385,9 @@
       ]
     },
     {
-      "id": 5,
+      "id": 7,
       "title": "Client-side metrics dropped (series-cardinality cap)",
-      "description": "Distinct (name, labels) histogram series rejected client-side because pending_histogram_aggregates_ hit kMasterClientMaxPendingHistograms (15000). Always 0 in healthy operation — the map is bounded by label-set cardinality (~50 series). A non-zero rate signals a label-cardinality leak (e.g. an unbounded label value like a key or allocation_id was accidentally introduced); investigate the offending Observe call site, do not raise the cap.",
+      "description": "Distinct (name, labels) histogram series rejected client-side because pending_histogram_aggregates_ hit kMasterClientMaxPendingHistograms (15000). Always 0 in healthy operation - the map is bounded by label-set cardinality (~50 series). A non-zero rate signals a label-cardinality leak (e.g. an unbounded label value like a key or allocation_id was accidentally introduced); investigate the offending Observe call site, do not raise the cap.",
       "type": "timeseries",
       "gridPos": {
         "h": 8,
