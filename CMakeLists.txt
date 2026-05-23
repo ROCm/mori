@@ -40,6 +40,8 @@ option(ENABLE_PROFILER "Enable kernel profiling" OFF)
 option(ENABLE_DEBUG_PRINTF "Enable debug printf in device kernels" OFF)
 option(ENABLE_STANDARD_MOE_ADAPT "Enable standard moe adapt" OFF)
 option(BUILD_OPS_DEVICE "AOT compile EP kernels to .hsaco(requires hipcc)" OFF)
+option(MORI_MULTITHREAD_SUPPORT
+       "Enable single-process multi-thread multi-GPU support in mori_shmem" OFF)
 
 # ---------------------------------------------------------------------------
 # Host NIC: all vendor-specific dv libraries (mlx5, bnxt_re, ionic) are loaded
@@ -150,13 +152,18 @@ set(SPDLOG_BUILD_BENCH
     CACHE BOOL "" FORCE)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 add_subdirectory(3rdparty/spdlog)
-# Hide spdlog symbols from other libraries to avoid symbol conflicts
-target_compile_options(spdlog PRIVATE -fvisibility=hidden
-                                      -fvisibility-inlines-hidden)
+# Hide spdlog symbols to avoid cross-library symbol collisions. Both rocroller
+# (via hipblaslt/TE) and MORI statically link spdlog; if both export spdlog
+# symbols, MORI's spdlog calls can be interposed by rocroller's copy, causing
+# heap corruption (free(): invalid size). Using the compiled spdlog library (not
+# header-only) with hidden visibility ensures spdlog symbols stay internal to
+# MORI's .so files.
+set_target_properties(spdlog PROPERTIES CXX_VISIBILITY_PRESET hidden
+                                        VISIBILITY_INLINES_HIDDEN ON)
 
 add_library(mori_logging INTERFACE)
 target_include_directories(mori_logging INTERFACE include)
-target_link_libraries(mori_logging INTERFACE spdlog::spdlog_header_only)
+target_link_libraries(mori_logging INTERFACE spdlog::spdlog)
 
 if(ENABLE_PROFILER)
   find_package(

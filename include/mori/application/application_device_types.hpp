@@ -109,6 +109,10 @@ struct SymmMemObj {
   // SdmaPutThread writes ATOMIC to peerSignalPtrs[remotePe] + myPe*sdmaNumQueue + qId,
   // so the remote PE can directly read its own signalPtrs to detect completion.
   HSAuint64** peerSignalPtrs = nullptr;  // should only placed on GPU
+  // Host-side copy of peer signal pointers for IPC cleanup during deregistration.
+  // Only entries opened via hipIpcOpenMemHandle need closing; same-process (SPMT)
+  // entries are raw VA and must NOT be closed.
+  HSAuint64** peerSignalPtrsHost = nullptr;  // should only placed on CPU
 
   __device__ __host__ RdmaMemoryRegion GetRdmaMemoryRegion(int pe) const {
     RdmaMemoryRegion mr;

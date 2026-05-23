@@ -126,16 +126,21 @@ void RegisterMoriShmem(py::module_& m) {
   m.def("shmem_get_unique_id", &ShmemGetUniqueId,
         "Get a unique ID for shmem initialization (returns bytes)");
 
+  // Release the GIL for blocking shmem init/finalize so that concurrent
+  // Python threads (SPMT mode) can all progress through the socket bootstrap
+  // handshake without deadlocking on the GIL.
   m.def("shmem_init_attr", &ShmemInitAttr, py::arg("flags"), py::arg("rank"), py::arg("nranks"),
-        py::arg("unique_id"),
+        py::arg("unique_id"), py::call_guard<py::gil_scoped_release>(),
         "Initialize shmem with attributes (unique_id should be bytes from shmem_get_unique_id)");
 
-  m.def("shmem_finalize", &ShmemFinalize, "Finalize shmem");
+  m.def("shmem_finalize", &ShmemFinalize, py::call_guard<py::gil_scoped_release>(),
+        "Finalize shmem");
 
   //  Module-specific initialization (for Triton kernels)
   m.def("shmem_module_init", &ShmemModuleInit, py::arg("hip_module"),
         "Initialize globalGpuStates in a specific HIP module (for Triton kernels)");
   m.def("load_shmem_module", &LoadShmemModule, py::arg("hsaco_path"),
+        py::call_guard<py::gil_scoped_release>(),
         "Load JIT-compiled shmem module (.hsaco) with globalGpuStates and barrier kernel");
 
   // Query APIs
@@ -144,7 +149,8 @@ void RegisterMoriShmem(py::module_& m) {
   m.def("shmem_npes", &ShmemNPes, "Get number of PEs");
 
   // Collective operations
-  m.def("shmem_barrier_all", &ShmemBarrierAll, "Global barrier synchronization");
+  m.def("shmem_barrier_all", &ShmemBarrierAll, py::call_guard<py::gil_scoped_release>(),
+        "Global barrier synchronization");
 
   m.def(
       "shmem_barrier_on_stream",
@@ -152,23 +158,27 @@ void RegisterMoriShmem(py::module_& m) {
       py::arg("stream"), "Launch device barrier on a HIP stream");
 
   // Symmetric memory management
-  m.def("shmem_malloc", &ShmemMalloc, py::arg("size"),
+  m.def("shmem_malloc", &ShmemMalloc, py::arg("size"), py::call_guard<py::gil_scoped_release>(),
         "Allocate symmetric memory (returns address as int)");
 
   m.def("shmem_malloc_align", &ShmemMallocAlign, py::arg("alignment"), py::arg("size"),
+        py::call_guard<py::gil_scoped_release>(),
         "Allocate aligned symmetric memory (returns address as int)");
 
   m.def("shmem_ext_malloc_with_flags", &ShmemExtMallocWithFlags, py::arg("size"), py::arg("flags"),
+        py::call_guard<py::gil_scoped_release>(),
         "Allocate symmetric memory with flags (returns address as int)");
 
-  m.def("shmem_free", &ShmemFree, py::arg("ptr"),
+  m.def("shmem_free", &ShmemFree, py::arg("ptr"), py::call_guard<py::gil_scoped_release>(),
         "Free symmetric memory (ptr should be int address)");
 
   // Buffer registration
   m.def("shmem_buffer_register", &ShmemBufferRegister, py::arg("ptr"), py::arg("size"),
+        py::call_guard<py::gil_scoped_release>(),
         "Register an existing buffer for RDMA (ptr should be int address)");
 
   m.def("shmem_buffer_deregister", &ShmemBufferDeregister, py::arg("ptr"), py::arg("size"),
+        py::call_guard<py::gil_scoped_release>(),
         "Deregister a buffer from RDMA (ptr should be int address)");
 
   // P2P address translation
@@ -176,10 +186,6 @@ void RegisterMoriShmem(py::module_& m) {
         "Convert local symmetric memory pointer to remote P2P address. "
         "Returns 0 if connection uses RDMA or if pointer is invalid. "
         "Returns P2P accessible address if connection uses P2P transport.");
-  m.def("shmem_torch_process_group_init", &ShmemTorchProcessGroupInit);
-  m.def("shmem_finalize", &ShmemFinalize);
-  m.def("shmem_mype", &ShmemMyPe);
-  m.def("shmem_npes", &ShmemNPes);
   m.def("shmem_num_qp_per_pe", &ShmemNumQpPerPe);
 }
 

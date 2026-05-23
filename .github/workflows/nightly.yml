@@ -46,10 +46,11 @@ jobs:
       - name: Build wheels
         run: |
           BASE_VER=$(git describe --tags --abbrev=0 | sed 's/^v//')
+          NEXT_VER=$(echo "$BASE_VER" | awk -F. '{$NF=$NF+1; print}' OFS=.)
           DATE=$(date +%Y%m%d)
           SHA=$(git rev-parse --short HEAD)
-          GH_VERSION="${BASE_VER}.dev${DATE}+${SHA}"
-          PYPI_VERSION="${BASE_VER}.dev${DATE}"
+          GH_VERSION="${NEXT_VER}.dev${DATE}+${SHA}"
+          PYPI_VERSION="${NEXT_VER}.dev${DATE}"
 
           $CT run --rm --network=host \
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE -w $GITHUB_WORKSPACE \
