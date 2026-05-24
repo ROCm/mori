@@ -108,45 +108,64 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
     for (int i = globalWarpId; i < args.curRankNumToken * config.numExpertPerToken;
          i += globalWarpNum) {
       index_t srcTokId = i / config.numExpertPerToken;
-      index_t destExpert = args.tokenIndices[i];
-      // DeepEP-style sentinel: a negative expert id means "drop this top-k slot".
-      // Skip the dispatch entirely and write the existing combine-side null sentinel
-      // (PE == worldSize) into dispDestTokIdMap so combine treats this slot as nullptr.
-      if (destExpert < 0) {
-        if (laneId == 0) args.dispDestTokIdMap[i] = FlatTokenIndex(config, config.worldSize, 0);
-        continue;
-      }
-      index_t destPe = destExpert / config.numExpertPerRank;
+      index_t destPe;
       index_t destTokId = 0;
 
-      // Deduplicate
-      assert(config.numExpertPerToken < warpSize);
-      int condition = 0;
-      if (laneId < (i % config.numExpertPerToken)) {
-        index_t otherExpert = args.tokenIndices[srcTokId * config.numExpertPerToken + laneId];
-        condition = (otherExpert >= 0) && (destPe == (otherExpert / config.numExpertPerRank));
-      }
-      if (__any(condition)) {
-        // Indicate that this token is already sent to the destination PE by setting an overflow
-        // token index
-        if (laneId == 0) args.dispDestTokIdMap[i] = FlatTokenIndex(config, config.worldSize, 0);
-        continue;
-      }
+      if (!args.replayMode) {
+        // Mode-1 (DeepEP-style cached-mode "first call"): decide where this
+        // (token, top-k) pair goes via atomicAdd-based slot assignment. Records
+        // the routing into dispDestTokIdMap (and the symmetric local view via
+        // dispTokIdToSrcTokIdMemObj on the destination PE) so a later mode-2
+        // dispatch / combine can replay the same layout deterministically.
+        index_t destExpert = args.tokenIndices[i];
+        // DeepEP-style sentinel: a negative expert id means "drop this top-k slot".
+        // Skip the dispatch entirely and write the existing combine-side null sentinel
+        // (PE == worldSize) into dispDestTokIdMap so combine treats this slot as nullptr.
+        if (destExpert < 0) {
+          if (laneId == 0) args.dispDestTokIdMap[i] = FlatTokenIndex(config, config.worldSize, 0);
+          continue;
+        }
+        destPe = destExpert / config.numExpertPerRank;
 
-      if (laneId == 0) {
-        // decide token id in dest pe
-        destTokId = atomicAdd(args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe), 1);
-        assert(destTokId < config.MaxNumTokensToRecv() &&
-               "Total recv token overflow: increase maxTotalRecvTokens");
-        atomicAdd(args.destPeTokenCounter + destPe, 1);
-        // In dispDestTokIdMap, record the destination slot for this token-expert pair (flat index
-        // into the dest PE's recv buffer) In dispTokIdToSrcTokIdMemObj on the dest PE, record which
-        // global source token occupies this slot (for combine-phase routing)
-        args.dispDestTokIdMap[i] = FlatTokenIndex(config, destPe, destTokId);
-        args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destTokId] =
-            FlatTokenIndex(config, myPe, srcTokId);
+        // Deduplicate
+        assert(config.numExpertPerToken < warpSize);
+        int condition = 0;
+        if (laneId < (i % config.numExpertPerToken)) {
+          index_t otherExpert = args.tokenIndices[srcTokId * config.numExpertPerToken + laneId];
+          condition = (otherExpert >= 0) && (destPe == (otherExpert / config.numExpertPerRank));
+        }
+        if (__any(condition)) {
+          // Indicate that this token is already sent to the destination PE by setting an overflow
+          // token index
+          if (laneId == 0) args.dispDestTokIdMap[i] = FlatTokenIndex(config, config.worldSize, 0);
+          continue;
+        }
+
+        if (laneId == 0) {
+          // decide token id in dest pe
+          destTokId = atomicAdd(args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe), 1);
+          assert(destTokId < config.MaxNumTokensToRecv() &&
+                 "Total recv token overflow: increase maxTotalRecvTokens");
+          atomicAdd(args.destPeTokenCounter + destPe, 1);
+          // In dispDestTokIdMap, record the destination slot for this token-expert pair (flat index
+          // into the dest PE's recv buffer) In dispTokIdToSrcTokIdMemObj on the dest PE, record which
+          // global source token occupies this slot (for combine-phase routing)
+          args.dispDestTokIdMap[i] = FlatTokenIndex(config, destPe, destTokId);
+          args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destTokId] =
+              FlatTokenIndex(config, myPe, srcTokId);
+        }
+        destTokId = __shfl(destTokId, 0);
+      } else {
+        // Mode-2 (replay): caller already supplied a populated dispDestTokIdMap
+        // from a matching mode-1 dispatch. Recover (destPe, destTokId) directly
+        // and skip CAS / dedup / cross-rank src-id writes. The sentinel slot
+        // (destPe == worldSize) means the original mode-1 dropped or deduped
+        // this top-k slot, so we skip transmitting payload as well.
+        index_t flat = args.dispDestTokIdMap[i];
+        destPe = PeFromFlatTokenIndex(config, flat);
+        if (destPe >= config.worldSize) continue;
+        destTokId = LocalTokIdFromFlatTokenIndex(config, flat);
       }
-      destTokId = __shfl(destTokId, 0);
 
       // Write weights and indices
       if (laneId < config.numExpertPerToken) {
@@ -312,9 +331,16 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
       }
     }
   } else {
+    // When the caller passes a routing handle, args.dispTokIdToSrcTokIdLocal
+    // holds a per-call snapshot of the symmetric local view. Otherwise fall
+    // back to the shared symmetric buffer (legacy single-routing path).
+    const index_t* localSrcMap =
+        args.dispTokIdToSrcTokIdLocal != nullptr
+            ? args.dispTokIdToSrcTokIdLocal
+            : args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(myPe);
 #ifdef ENABLE_PROFILER
     for (int tokenIdx = globalWarpId; tokenIdx < totalRecvTokenNum; tokenIdx += globalWarpNum) {
-      index_t destTokId = args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(myPe)[tokenIdx];
+      index_t destTokId = localSrcMap[tokenIdx];
       index_t destPe = PeFromFlatTokenIndex(config, destTokId);
       index_t destLocalTokId = LocalTokIdFromFlatTokenIndex(config, destTokId);
       uint8_t* destStagingPtr = args.intraNodeTokBufs.combineInp->template GetAs<uint8_t*>(destPe) +
@@ -338,8 +364,7 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
       MORI_TRACE_NEXT(seq, Slot::CombineCopyWeights);
       if (args.weightsBuf) {
         for (int tokenIdx = globalWarpId; tokenIdx < totalRecvTokenNum; tokenIdx += globalWarpNum) {
-          index_t destTokId =
-              args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(myPe)[tokenIdx];
+          index_t destTokId = localSrcMap[tokenIdx];
           index_t destPe = PeFromFlatTokenIndex(config, destTokId);
           index_t destLocalTokId = LocalTokIdFromFlatTokenIndex(config, destTokId);
           uint8_t* destStagingPtr =
@@ -353,7 +378,7 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
     }
 #else
     for (int tokenIdx = globalWarpId; tokenIdx < totalRecvTokenNum; tokenIdx += globalWarpNum) {
-      index_t destTokId = args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(myPe)[tokenIdx];
+      index_t destTokId = localSrcMap[tokenIdx];
       index_t destPe = PeFromFlatTokenIndex(config, destTokId);
       index_t destLocalTokId = LocalTokIdFromFlatTokenIndex(config, destTokId);
       uint8_t* destStagingPtr = args.intraNodeTokBufs.combineInp->template GetAs<uint8_t*>(destPe) +
@@ -386,7 +411,13 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
   // Make sure copy on all GPUs are finished
   MORI_TRACE_NEXT(seq, Slot::CombineBarrier);
   CrossDeviceBarrierIntraNodeKernel(args, crossDeviceBarrierFlag);
-  *args.totalRecvTokenNum = 0;
+  // Legacy path zeroes the shared totalRecvTokenNum so the next mode-1 dispatch
+  // through the same handle starts clean. With a routing handle, the caller
+  // owns this tensor (it may still be alive in autograd ctx), so we skip the
+  // reset — the next dispatch will allocate or replay its own.
+  if (args.dispTokIdToSrcTokIdLocal == nullptr) {
+    *args.totalRecvTokenNum = 0;
+  }
   if (args.curRankNumToken == 0) return;
 
   MORI_TRACE_NEXT(seq, Slot::CombineAccumSetup);

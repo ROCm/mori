@@ -49,19 +49,30 @@ inline __device__ void DispatchIntraNodeBlock(EpDispatchCombineArgs<T>& args, in
 
   index_t tokenExpertId = tokenId * args.config.numExpertPerToken + expId;
   index_t destTokId = 0;
-  if (laneId == 0) {
-    // decide token id in dest pe
-    destTokId = atomicAdd(args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe), 1);
-    assert(destTokId < config.MaxNumTokensToRecv() &&
-           "Total recv token overflow: increase maxTotalRecvTokens");
-    args.dispDestTokIdMap[tokenExpertId] = FlatTokenIndex(config, destPe, destTokId);
+  if (!args.replayMode) {
+    if (laneId == 0) {
+      // Mode-1: decide token id in dest pe via atomicAdd, record routing.
+      destTokId = atomicAdd(args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe), 1);
+      assert(destTokId < config.MaxNumTokensToRecv() &&
+             "Total recv token overflow: increase maxTotalRecvTokens");
+      args.dispDestTokIdMap[tokenExpertId] = FlatTokenIndex(config, destPe, destTokId);
 
-    core::AtomicStoreRelaxedSystem(
-        args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe) + destTokId,
-        static_cast<index_t>(FlatTokenIndex(config, config.rank, tokenId)));
+      core::AtomicStoreRelaxedSystem(
+          args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe) + destTokId,
+          static_cast<index_t>(FlatTokenIndex(config, config.rank, tokenId)));
+    }
+    destTokId = __shfl(destTokId, 0);
+  } else {
+    // Mode-2 (replay): caller's dispDestTokIdMap already has the slot from a
+    // matching mode-1. Skip the CAS and the cross-rank src-id write — the
+    // caller's dispTokIdToSrcTokIdLocal snapshot also has the latter cached.
+    index_t flat = args.dispDestTokIdMap[tokenExpertId];
+    destTokId = LocalTokIdFromFlatTokenIndex(config, flat);
   }
-  if (laneId == (destPe % config.gpuPerNode)) localPeTokenCounter++;
-  destTokId = __shfl(destTokId, 0);
+  // Skip the per-PE counter increment in replay mode: caller's totalRecvTokenNum
+  // is already populated from mode-1; if we let DispatchSync atomicAdd a fresh
+  // recvTokenNum it would double-count. Mode-1 still increments and signals.
+  if (!args.replayMode && laneId == (destPe % config.gpuPerNode)) localPeTokenCounter++;
   size_t srcTokOffset = tokenId * hiddenDim;
   size_t destTokOffset = destTokId * hiddenDim;
 
@@ -107,7 +118,10 @@ inline __device__ void DispatchIntraNode(EpDispatchCombineArgs<T>& args) {
     index_t destExpert = args.tokenIndices[expertOffset];
     // DeepEP-style sentinel: drop slots with a negative expert id.
     if (destExpert < 0) {
-      if (laneId == 0) args.dispDestTokIdMap[expertOffset] = NullFlatTokenIndex(config);
+      // Replay path: dispDestTokIdMap already holds the cached sentinel — caller
+      // owns the tensor, so skip the redundant write.
+      if (!args.replayMode && laneId == 0)
+        args.dispDestTokIdMap[expertOffset] = NullFlatTokenIndex(config);
       continue;
     }
     index_t destPe = destExpert / config.numExpertPerRank;
@@ -126,7 +140,8 @@ inline __device__ void DispatchIntraNode(EpDispatchCombineArgs<T>& args) {
     index_t inTokenExpertId = i % numExpertPerToken;
     if (destNode == myNode) {
       if (__any((laneId < inTokenExpertId) && (destPe == lanePe))) {
-        if (laneId == 0) args.dispDestTokIdMap[expertOffset] = NullFlatTokenIndex(config);
+        if (!args.replayMode && laneId == 0)
+          args.dispDestTokIdMap[expertOffset] = NullFlatTokenIndex(config);
         continue;
       }
       DispatchIntraNodeBlock(args, tokenId, inTokenExpertId, destPe, localPeTokenCounter);
@@ -166,7 +181,10 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
           int destNode = laneExpert / config.numExpertPerRank / config.gpuPerNode;
           if (destNode == i) {
             shouldSend |= true;
-            args.dispDestTokIdMap[tokenId * numExpertPerToken + e] = NullFlatTokenIndex(config);
+            // Replay: dispDestTokIdMap is caller-owned and already has cached
+            // sentinels — skip the redundant write.
+            if (!args.replayMode)
+              args.dispDestTokIdMap[tokenId * numExpertPerToken + e] = NullFlatTokenIndex(config);
           }
         }
         uint64_t mask = __ballot(shouldSend) & __activemask();
@@ -174,6 +192,11 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
 
         if (num == 0) continue;
 
+        // Both modes do the atomicAdd: in mode-1 it allocates the flag slot,
+        // in mode-2 the result is ignored (we use the cached flagSlotId from
+        // interNodeDispSendMap) but the increment is still required so the
+        // end-of-kernel `numTokenSignal = blockFlagCounter[i] * warpSize + 1`
+        // matches mode-1 (the receiver uses it as a chunk-count fallback).
         index_t flag = 0;
         index_t flagSlotId = 0;
         if (laneId == 0) {
@@ -182,6 +205,17 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
         }
         flag = __shfl(flag, 0);
         flagSlotId = __shfl(flagSlotId, 0);
+
+        if (args.replayMode) {
+          // Recover the deterministic flag slot from the cached send map.
+          // Every sender lane in this warp shares the same flagSlotId, so we
+          // pull from the first sender's cache entry: cached destTokId =
+          // flagSlotId * warpSize + warpOffset, hence /warpSize recovers it.
+          int firstSender = __ffsll(static_cast<unsigned long long>(mask)) - 1;
+          index_t myCached =
+              shouldSend ? args.interNodeDispSendMap[nNodes * tokenId + i] : 0;
+          flagSlotId = __shfl(myCached, firstSender) / warpSize;
+        }
 
         index_t destTokIdOffset = flagSlotId * warpSize;
 
@@ -213,7 +247,8 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
                 (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t), flag,
                 core::atomicType::AMO_ADD, proxyPe, qpId);
           }
-          args.interNodeDispSendMap[nNodes * tokenId + i] = destTokId;
+          // Replay: caller's interNodeDispSendMap is the source of truth.
+          if (!args.replayMode) args.interNodeDispSendMap[nNodes * tokenId + i] = destTokId;
         }
       }
     } else {
@@ -413,22 +448,34 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
         bool shouldSkip = isSentinelSlot || (destNode != myNode) ||
                           __any((laneId < e) && (destPe == lanePe));
         if (shouldSkip) {
-          if (laneId == 0)
+          // Replay: interNodeDispDestTokIdMap is caller-owned and pre-populated.
+          if (!args.replayMode && laneId == 0)
             args.interNodeDispDestTokIdMap[tokIdx * config.numExpertPerToken + e] =
                 NullFlatTokenIndex(config);
           continue;
         }
         int destTokId = 0;
-        if (laneId == 0) {
-          destTokId = atomicAdd(args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe), 1);
-          assert(destTokId < config.MaxNumTokensToRecv() &&
-                 "Total recv token overflow: increase maxTotalRecvTokens");
-          args.interNodeDispDestTokIdMap[tokIdx * config.numExpertPerToken + e] =
-              FlatTokenIndex(config, destPe, destTokId);
-          args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destTokId] = srcTokId;
+        if (!args.replayMode) {
+          if (laneId == 0) {
+            destTokId = atomicAdd(args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe), 1);
+            assert(destTokId < config.MaxNumTokensToRecv() &&
+                   "Total recv token overflow: increase maxTotalRecvTokens");
+            args.interNodeDispDestTokIdMap[tokIdx * config.numExpertPerToken + e] =
+                FlatTokenIndex(config, destPe, destTokId);
+            args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destTokId] = srcTokId;
+          }
+          destTokId = __shfl(destTokId, 0);
+        } else {
+          // Mode-2: pull the cached recv-side slot. The mode-1 dispatch already
+          // resolved this via CAS and its result is preserved in the routing
+          // handle's interNodeDispDestTokIdMap.
+          index_t flat = args.interNodeDispDestTokIdMap[tokIdx * config.numExpertPerToken + e];
+          destTokId = LocalTokIdFromFlatTokenIndex(config, flat);
         }
-        if ((destPe % config.gpuPerNode) == laneId) localPeTokenCounter++;
-        destTokId = __shfl(destTokId, 0);
+        // Mode-2: caller's totalRecvTokenNum is already correct. Skip per-PE
+        // counter increment so DispatchSync's atomicAdd to totalRecvTokenNum
+        // adds 0 (not a fresh round of recvTokenNum).
+        if (!args.replayMode && (destPe % config.gpuPerNode) == laneId) localPeTokenCounter++;
         core::WarpCopy<uint8_t, 4>(
             args.interNodeV1TokBufs.dispatchOut->template GetAs<uint8_t*>(destPe) +
                 destTokId * hiddenBytes,
@@ -922,7 +969,13 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs<T>& 
                       args.shmemInpWeightsMemObj->template GetAs<float*>(destPe) +
                       destLocalTokId * config.numExpertPerToken;
                 }
-                args.interNodeDispDestTokIdMap[tokIdx * config.numExpertPerToken + laneId] = 0;
+                // Legacy path zeroes the recv map so the next mode-1 dispatch
+                // through the shared handle finds clean state. Routing-handle
+                // callers own this tensor (it may still be live in autograd
+                // ctx), so leave it alone.
+                if (args.dispTokIdToSrcTokIdLocal == nullptr) {
+                  args.interNodeDispDestTokIdMap[tokIdx * config.numExpertPerToken + laneId] = 0;
+                }
               }
 
               core::WarpAccum<TokT, 4>(
@@ -1359,7 +1412,12 @@ __device__ void EpCombineAll_body(EpDispatchCombineArgs<T> args) {
   MORI_TRACE_SPAN(profiler, Slot::EpCombineAll);
 
   if (globalWarpId == 0) {
-    if (laneId == 0) args.totalRecvTokenNum[0] = 0;
+    // Legacy path: reset totalRecvTokenNum so the next mode-1 dispatch finds
+    // clean state. Routing-handle callers own this tensor — leave it alone.
+    if (laneId == 0 && args.dispTokIdToSrcTokIdLocal == nullptr)
+      args.totalRecvTokenNum[0] = 0;
+    // blockFlagCounter is part of the shared op handle (not per-call), so it
+    // is always reset here regardless of routing-handle path.
     if (laneId < nNodes) args.blockFlagCounter[laneId] = 0;
   }
   if (args.curRankNumToken == 0) return;

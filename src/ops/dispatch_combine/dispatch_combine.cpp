@@ -522,5 +522,20 @@ EpDispatchCombineArgsRaw GetEpDispatchCombineArgsRaw(const EpDispatchCombineHand
   return args;
 }
 
+EpDispatchCombineArgsRaw GetEpDispatchCombineArgsRaw(
+    const EpDispatchCombineHandle& handle, int rdmaBlockNum,
+    const EpDispatchCombineRoutingPtrs* routing, bool replayMode) {
+  EpDispatchCombineArgsRaw args = GetEpDispatchCombineArgsRaw(handle, rdmaBlockNum);
+  args.replayMode = replayMode;
+  if (routing != nullptr && routing->IsValid()) {
+    args.dispDestTokIdMap = routing->dispDestTokIdMap;
+    args.interNodeDispDestTokIdMap = routing->interNodeDispDestTokIdMap;
+    args.interNodeDispSendMap = routing->interNodeDispSendMap;
+    args.totalRecvTokenNum = routing->totalRecvTokenNum;
+    args.dispTokIdToSrcTokIdLocal = routing->dispTokIdToSrcTokIdLocal;
+  }
+  return args;
+}
+
 }  // namespace moe
 }  // namespace mori
