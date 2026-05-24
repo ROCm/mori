@@ -68,12 +68,7 @@ def _current_stream():
 
 @dataclass
 class EpDispatchRoutingHandle:
-    """Per-call routing snapshot returned by mode-1 dispatch and consumed by
-    combine / mode-2 dispatch.
-    Mode selection inside the kernel is implicit: passing ``routing=`` to
-    ``dispatch`` means "replay mode-2 along this layout"; passing it to
-    ``combine`` means "read routing from here instead of the shared handle".
-    """
+    """Per-call routing snapshot from mode-1 dispatch, replayed by combine / mode-2 dispatch."""
 
     disp_dest_tok_id_map: torch.Tensor
     inter_node_disp_dest_tok_id_map: torch.Tensor
@@ -83,7 +78,6 @@ class EpDispatchRoutingHandle:
     cur_rank_num_token: int = 0
 
     def tensors(self):
-        """Tuple form for ``torch.autograd.Function.save_for_backward``."""
         return (
             self.disp_dest_tok_id_map,
             self.inter_node_disp_dest_tok_id_map,
@@ -511,12 +505,7 @@ class EpDispatchCombineOp:
         )
         return from_gpu_ptr(ptr, (shape0, shape1), dtype)
 
-    # ------------------------------------------------------------------
-    # Routing-handle (DeepEP-style cached-mode dispatch) helpers
-    # ------------------------------------------------------------------
     def _alloc_routing_handle(self) -> EpDispatchRoutingHandle:
-        """Allocate a fresh, zero-initialized routing handle.
-        """
         cfg = self.config
         world_size = cfg.world_size
         m_send = cfg.max_num_inp_token_per_rank
@@ -578,22 +567,6 @@ class EpDispatchCombineOp:
         routing: "EpDispatchRoutingHandle | None" = None,
         return_routing: bool = False,
     ):
-        """Dispatch tokens to expert-parallel ranks.
-
-        Args:
-            routing: When non-None, run mode-2 (replay) using the cached layout
-                from this handle. CAS-based slot assignment is skipped; outputs
-                are routed to the same slots as the matching mode-1 dispatch.
-                Mutually exclusive with ``return_routing=True``.
-            return_routing: When True, run mode-1 with caller-owned routing
-                tensors and return the new routing handle as an extra
-                element of the output tuple. Subsequent ``combine(routing=R)``
-                / ``dispatch(..., routing=R)`` calls replay against ``R``.
-
-        When neither kwarg is set the legacy single-shared-routing behavior is
-        used (output tuple unchanged, no per-call alloc) — this is the path
-        for inference / forward-only callers.
-        """
         if routing is not None and return_routing:
             raise ValueError(
                 "pass either `routing=` (replay) or `return_routing=True` "
@@ -745,11 +718,6 @@ class EpDispatchCombineOp:
         out_indices = from_gpu_ptr(
             outI_ptr, (max_recv, self.config.num_experts_per_token), TOPK_IDX_DTYPE
         )
-        # When the caller owns totalRecvTokenNum (routing-handle path) we surface
-        # *their* tensor instead of the shared handle scratch. Both alias the
-        # exact same int32 the kernel wrote, but downstream consumers who keep
-        # the routing handle alive are insulated from a later layer's mode-1
-        # dispatch racing through the shared scalar.
         total_recv = (
             routing.total_recv_token_num
             if use_routing_handle
@@ -757,10 +725,6 @@ class EpDispatchCombineOp:
         )
 
         if return_routing:
-            # Snapshot the symmetric local view (which combine reads in the
-            # IntraNode no-P2P path) into the routing handle's owned tensor.
-            # The symmetric buffer cannot be made per-call because senders
-            # write into it cross-rank via GetAs<destPe>().
             mori_cpp.snapshot_disp_tok_id_to_src_tok_id_local(
                 self._handle,
                 routing.disp_tok_id_to_src_tok_id_local.data_ptr(),
@@ -857,21 +821,6 @@ class EpDispatchCombineOp:
         *,
         routing: "EpDispatchRoutingHandle | None" = None,
     ):
-        """Combine partial-expert outputs back into per-token outputs.
-
-        Args:
-            routing: When non-None, route the combine reduction along this
-                cached layout (paired with the matching ``return_routing``
-                dispatch). Reads from the caller-owned routing tensors instead
-                of the shared op handle, so multiple in-flight routings from
-                different layers do not stomp each other. The kernel skips its
-                end-of-call zeroing of routing fields under this path —
-                caller's ``torch.zeros`` allocation gives the next mode-1
-                dispatch fresh accumulators.
-
-        When ``routing`` is None the legacy path is taken (shared handle, in-
-        place zeroing) — identical to today's behavior.
-        """
         if routing is not None and not self._supports_routing_handle():
             raise NotImplementedError(
                 f"routing handle path not supported for kernel_type="
@@ -889,10 +838,6 @@ class EpDispatchCombineOp:
             else int(self.config.use_external_inp_buf)
         )
         is_zero_copy = not actual_use_ext
-        # Use the routing handle's pinned cur_rank_num_token (recorded at the
-        # matching mode-1 dispatch) so that intervening layer dispatches sharing
-        # the same op handle don't bleed their N into our tuning lookup or
-        # kernel args.
         cur_n = (
             routing.cur_rank_num_token
             if routing is not None
@@ -924,8 +869,6 @@ class EpDispatchCombineOp:
             indices_ptr=indices.data_ptr(),
         )
         if routing is not None:
-            # Combine never replays — replay_mode=False even on the
-            # routing-handle path. The replayMode flag is for *dispatch* only.
             args_ptr = self._build_args_routing(
                 routing,
                 rdma_block_num=actual_rbn,

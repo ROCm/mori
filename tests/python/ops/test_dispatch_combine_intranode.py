@@ -352,12 +352,7 @@ def test_dispatch_combine_max_total_recv_tokens_under_budget(
 # ---------------------------------------------------------------------------
 
 
-# ---------------------------------------------------------------------------
 # DeepEP-style -1 sentinel tests (IntraNode only)
-#
-# Inject ``-1`` into selected top-k slots and verify that dispatch + combine
-# treat them as "drop this slot": no dispatch, no combine contribution.
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("world_size", (8,))
@@ -380,15 +375,7 @@ def test_dispatch_combine_tp_replicated_with_sentinels(
     num_experts_per_token,
     sentinel_pattern,
 ):
-    """Megatron-style TP-replicated routing combined with -1 sentinels.
-
-    ``num_experts_per_token = world_size * router_topk = 16`` and
-    ``num_experts_per_rank = 1`` mimic ``tp=8, ep=1, router_topk=2``. Each
-    token's slots are grouped: slots ``[0..7]`` route to PEs ``0..7`` and
-    slots ``[8..15]`` route to PEs ``0..7`` again, so dedup must drop all
-    of slots ``[8..15]``. Adding sentinels (``-1``) on top exercises the
-    interaction between dedup-null and sentinel-null on the same token.
-    """
+    """Megatron TP-replicated routing combined with -1 sentinels (mimics tp=8, ep=1, topk=2)."""
     for _ in range(world_size):
         torch_dist_process_manager.task_queue.put(
             (
@@ -436,11 +423,7 @@ def test_dispatch_combine_minus_one_sentinel(
     num_experts_per_token,
     sentinel_pattern,
 ):
-    """Dispatch + combine must treat -1 routing entries as DeepEP-style sentinels.
-
-    For each pattern we check that the kernels skip the -1 slots: combine
-    output equals input * (number of unique non-sentinel PEs).
-    """
+    """Dispatch + combine must treat -1 routing entries as DeepEP-style sentinels."""
     for _ in range(world_size):
         torch_dist_process_manager.task_queue.put(
             (

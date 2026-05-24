@@ -84,11 +84,7 @@ int64_t BuildArgs(mori::moe::EpDispatchCombineHandle& handle, int rdmaBlockNum, 
   return reinterpret_cast<int64_t>(&args);
 }
 
-// Routing-handle build: same as BuildArgs, but the routing-related buffers are
-// taken from caller-owned tensors instead of the shared op handle. `replayMode`
-// selects mode-1 vs mode-2 dispatch behavior; combine should always pass false.
-// All five routing pointers must be valid device pointers (Python is expected
-// to construct them via _alloc_routing_handle()).
+// BuildArgs variant that reads routing from caller-owned tensors; replayMode toggles mode-1/2.
 int64_t BuildArgsWithRouting(mori::moe::EpDispatchCombineHandle& handle, int rdmaBlockNum,
                              int hiddenDim, int useExternalInpBuf, bool replayMode,
                              int64_t disp_dest_tok_id_map_ptr,
@@ -120,16 +116,11 @@ int64_t BuildArgsWithRouting(mori::moe::EpDispatchCombineHandle& handle, int rdm
   return reinterpret_cast<int64_t>(&args);
 }
 
-// Stream-ordered snapshot of dispTokIdToSrcTokIdMemObj's local view into the
-// caller-provided tensor (sized [worldSize * MaxNumTokensToSend * numExpertPerRank]).
-// Combine in mode-1 reads the shared symmetric view via cross-rank writes; the
-// snapshot decouples this from the next mode-1 dispatch, which would otherwise
-// stomp the routing of in-flight layers (e.g. autograd-saved routings).
+// Stream-ordered snapshot of the local view of dispTokIdToSrcTokIdMemObj into a caller tensor.
 void SnapshotDispTokIdToSrcTokIdLocal(mori::moe::EpDispatchCombineHandle& handle, int64_t dst_ptr,
                                       int64_t stream) {
   if (!handle.dispTokIdToSrcTokIdMemObj.IsValid()) return;
   auto* src = handle.dispTokIdToSrcTokIdMemObj->template GetAs<mori::moe::index_t*>();
-  // Matches the allocation in InitializeOrderMapBuf (maxNumOutToken).
   const auto& cfg = handle.config;
   size_t nelem =
       static_cast<size_t>(cfg.MaxNumTokensToSend()) * static_cast<size_t>(cfg.numExpertPerRank);

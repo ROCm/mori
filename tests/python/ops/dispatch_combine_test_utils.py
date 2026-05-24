@@ -376,18 +376,8 @@ class EpDispatchCombineTestCase:
     ):
         """Generate test data.
 
-        ``sentinel_pattern`` controls injection of DeepEP-style ``-1`` sentinels
-        into the per-token routing indices. When set, kernels are expected to
-        skip those slots (no dispatch, no combine contribution). Supported
-        values:
-
-        * ``None``: no sentinels (default).
-        * ``"every_other"``: every other top-k slot of every token is set to
-          ``-1`` (slots ``1, 3, 5, ...``).
-        * ``"first_only"``: only the first slot of every token survives;
-          slots ``[1:]`` are all ``-1``.
-        * ``int k``: deterministically punch ``k`` ``-1`` holes per token at
-          slot indices ``[num_experts_per_token-1, ..., num_experts_per_token-k]``.
+        ``sentinel_pattern`` injects ``-1`` sentinels into routing indices. Accepts
+        ``None``, ``"every_other"``, ``"first_only"``, or an ``int`` count of trailing slots.
         """
         if num_token_override is not None:
             assert len(num_token_override) == self.config.world_size
@@ -444,14 +434,8 @@ class EpDispatchCombineTestCase:
                     n, self.config.num_experts_per_token, dtype=torch.int64
                 )
             elif routing == "tp_replicated":
-                # Mimics Megatron-style TP-replicated routing: each token's
-                # ``num_experts_per_token`` slots are organised into groups of
-                # ``world_size`` (the TP fanout). Within a group, slot ``g`` of
-                # group ``G`` routes to expert ``g * num_experts_per_rank``
-                # (i.e. the first expert on PE ``g``). Different groups thus
-                # map to the *same* set of PEs, so dedup must drop all but
-                # the first group. Requires
-                # ``num_experts_per_token % world_size == 0``.
+                # Megatron-style TP-replicated routing: every group of `world_size` slots maps
+                # to the same set of PEs, so dedup must drop all but the first group.
                 assert (
                     self.config.num_experts_per_token
                     % self.config.world_size

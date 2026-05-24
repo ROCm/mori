@@ -84,22 +84,12 @@ inline size_t GetHipDataTypeSize(hipDataType dtype) {
 
 using index_t = int32_t;
 
-// Per-call routing layout pointers — DeepEP-style cached-mode handle.
-//
-// When dispatch is invoked with `return_routing=True` the Python wrapper
-// allocates a fresh set of routing tensors and pipes their device pointers
-// in here. The kernel then reads/writes routing through these pointers
-// instead of from the shared `EpDispatchCombineHandle.dispDestTokIdMap` etc.,
-//
-// All five pointers must be set together (or all left null). When `IsValid()`
-// returns true, `GetEpDispatchCombineArgsRaw` overrides the corresponding args fields
+// Caller-owned routing pointers for DeepEP-style cached-mode dispatch/combine.
 struct EpDispatchCombineRoutingPtrs {
   index_t* dispDestTokIdMap{nullptr};
   index_t* interNodeDispDestTokIdMap{nullptr};
   index_t* interNodeDispSendMap{nullptr};
   index_t* totalRecvTokenNum{nullptr};
-  // Local-view clone of dispTokIdToSrcTokIdMemObj, taken right after a mode-1
-  // dispatch finishes. Combine reads from here when non-null.
   index_t* dispTokIdToSrcTokIdLocal{nullptr};
 
   bool IsValid() const { return dispDestTokIdMap != nullptr; }
@@ -412,7 +402,6 @@ struct EpDispatchCombineArgs {
   EpDispatchCombineConfig config;
   int fp8BlockwiseCombineScaleDim{0};
   int rdmaBlockNum{-1};
-  // DeepEP-style two-mode dispatch toggle.
   bool replayMode{false};
   index_t curRankNumToken{0};
   index_t* tokenIndices{nullptr};
@@ -445,8 +434,6 @@ struct EpDispatchCombineArgs {
   mori::application::SymmMemObjPtr dispTokIdToSrcTokIdMemObj;
   index_t* dispDestTokIdMap{nullptr};
   index_t* totalRecvTokenNum{nullptr};
-  // Per-call clone of dispTokIdToSrcTokIdMemObj's local view. When non-null,
-  // combine reads from this pointer instead of dispTokIdToSrcTokIdMemObj's Local view.
   index_t* dispTokIdToSrcTokIdLocal{nullptr};
   mori::application::SymmMemObjPtr crossDeviceBarrierMemObj;
   uint64_t* crossDeviceBarrierFlag{nullptr};
@@ -545,11 +532,8 @@ static_assert(sizeof(EpDispatchCombineArgsRaw) == sizeof(EpDispatchCombineArgs<h
 EpDispatchCombineArgsRaw GetEpDispatchCombineArgsRaw(const EpDispatchCombineHandle& handle,
                                                      int rdmaBlockNum);
 
-// Routing-handle overload: the routing-related pointers
-// (dispDestTokIdMap, interNodeDispDestTokIdMap, interNodeDispSendMap,
-// totalRecvTokenNum, dispTokIdToSrcTokIdLocal) are taken from caller-owned
-// tensors instead of the shared handle. `replayMode` selects mode-1 vs mode-2
-// dispatch behavior; combine should always pass false.
+// Routing-handle overload: routing pointers come from caller-owned tensors;
+// `replayMode` selects mode-1 vs mode-2 dispatch (combine always passes false).
 EpDispatchCombineArgsRaw GetEpDispatchCombineArgsRaw(
     const EpDispatchCombineHandle& handle, int rdmaBlockNum,
     const EpDispatchCombineRoutingPtrs* routing, bool replayMode);

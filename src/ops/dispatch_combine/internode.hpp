@@ -92,12 +92,7 @@ __device__ void EpDispatchInterNodeKernel_body(EpDispatchCombineArgs<T> args) {
          tokenId += globalSubWarpNum) {
       const int expertOffset = tokenId * numExpertPerToken + laneInSubWarp;
       index_t destExpert = args.tokenIndices[expertOffset];
-      // DeepEP-style sentinel: drop slots with a negative expert id. Assign each sentinel
-      // lane a unique impossible destPe so __match_any_sync below cannot false-match
-      // valid PE-0 lanes (because (-1)/numExpertPerRank == 0 in C++).
-      bool isSentinel = (destExpert < 0);
-      index_t destPe = isSentinel ? (-1 - static_cast<index_t>(laneInSubWarp))
-                                  : destExpert / config.numExpertPerRank;
+      index_t destPe = destExpert / config.numExpertPerRank;
 
       unsigned long long subWarpMask = ((1ULL << numExpertPerToken) - 1ULL)
                                        << (subWarpId * numExpertPerToken);
@@ -108,7 +103,7 @@ __device__ void EpDispatchInterNodeKernel_body(EpDispatchCombineArgs<T> args) {
             dupMask & (((1ULL << laneInSubWarp) - 1ULL) << (subWarpId * numExpertPerToken));
         dup = (lowerMask != 0ULL);
       }
-      if (isSentinel || dup) {
+      if (dup) {
         args.dispSenderIdxMap[expertOffset] = MaxNumTokensToRecv;
         continue;
       } else {
