@@ -63,7 +63,19 @@ class Context {
   bool IsSdmaEnabled() const { return sdmaEnabled; }
   bool IsP2PDisabled() const { return p2pDisabled; }
 
+  // Returns the initial RDMA endpoint set. Empty until BuildInitialEndpoints()
+  // has been called. SHMEM consumes this set; CCO does not (it creates its own
+  // per-DevComm sets via CreateAdditionalEndpoints).
   const std::vector<RdmaEndpoint>& GetRdmaEndpoints() const { return rdmaEps; }
+
+  // Build and connect the initial RDMA endpoint set sized worldSize×numQpPerPe.
+  // Idempotent: safe to call multiple times, second+ calls are no-ops.
+  //
+  // This is a collective operation: all ranks must call it together. It runs
+  // one AllToAll to exchange QP handles plus per-peer RTR/RTS transitions, so
+  // it's heavy. Modules that don't need the initial set (e.g. CCO) can skip
+  // this entirely and only use CreateAdditionalEndpoints later.
+  void BuildInitialEndpoints();
 
   // Create a new independent set of QP endpoints for RDMA peers (does NOT connect).
   std::vector<RdmaEndpoint> CreateAdditionalEndpoints(int numQpPerPe);
@@ -73,7 +85,8 @@ class Context {
 
  private:
   void CollectHostNames();
-  void InitializePossibleTransports();
+  void InitializeTopologyAndTransports();   // lightweight: topology + NIC + transport type decision + SDMA queues
+  void BuildAndConnectInitialEndpoints();   // heavyweight: build initial QP set + AllToAll + connect
 
   struct PeerInfo {
     bool sameHost{false};     // on the same node (same hostname+IP)
@@ -95,6 +108,7 @@ class Context {
   std::unique_ptr<RdmaDeviceContext> rdmaDeviceContext{nullptr};
 
   std::vector<RdmaEndpoint> rdmaEps;
+  bool initialEndpointsBuilt{false};
 
   std::unique_ptr<TopoSystem> topo{nullptr};
 

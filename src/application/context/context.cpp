@@ -51,7 +51,16 @@ Context::Context(BootstrapNetwork& bootNet) : bootNet(bootNet) {
   sdmaEnabled = env::IsEnvVarEnabled("MORI_ENABLE_SDMA");
   p2pDisabled = env::IsEnvVarEnabled("MORI_DISABLE_P2P");
   CollectHostNames();
-  InitializePossibleTransports();
+  // Lightweight: topology, NIC selection, transport type decision, SDMA queues.
+  // No QP creation, no AllToAll. Modules that need the initial RDMA endpoint
+  // set must explicitly call BuildInitialEndpoints() afterwards.
+  InitializeTopologyAndTransports();
+}
+
+void Context::BuildInitialEndpoints() {
+  if (initialEndpointsBuilt) return;
+  BuildAndConnectInitialEndpoints();
+  initialEndpointsBuilt = true;
 }
 
 Context::~Context() {}
@@ -145,7 +154,7 @@ void Context::CollectHostNames() {
 // / Context::IsP2PDisabled() instead of getenv anywhere outside the
 // constructor.
 
-void Context::InitializePossibleTransports() {
+void Context::InitializeTopologyAndTransports() {
   // Find my rank in node
   for (int i = 0; i <= LocalRank(); i++) {
     if (peerInfos[i].sameHost) rankInNode++;
@@ -222,6 +231,9 @@ void Context::InitializePossibleTransports() {
   int sdmaNumChannels = anvil::GetSdmaNumChannels();
   MORI_APP_INFO("SDMA num channels per GPU pair: {}", sdmaNumChannels);
 
+  // Decide transport type per peer. Lazily populate savedEpConfig the first
+  // time we see an RDMA peer (needed by both BuildInitialEndpoints and
+  // CreateAdditionalEndpoints). No QP creation / no AllToAll here.
   for (int i = 0; i < WorldSize(); i++) {
     // Check P2P availability
     if (!IsP2PDisabled()) {
@@ -246,24 +258,20 @@ void Context::InitializePossibleTransports() {
           } else {
             transportTypes.push_back(TransportType::P2P);
           }
-          for (int qp = 0; qp < numQpPerPe; qp++) {
-            rdmaEps.push_back({});
-          }
           continue;
         }
       }
     } else {
       if (i == LocalRank()) {
         transportTypes.push_back(TransportType::P2P);
-        for (int qp = 0; qp < numQpPerPe; qp++) {
-          rdmaEps.push_back({});
-        }
         continue;
       }
     }
 
+    // Falls through to here only for RDMA peers.
     if (rdmaDeviceContext.get() == nullptr) assert(false && "no rdma device found");
-    // Build config once, save for CreateAdditionalEndpoints reuse
+    // Build endpoint config once (lazy on first RDMA peer). Reused by both
+    // BuildInitialEndpoints and CreateAdditionalEndpoints.
     if (savedPortId < 0) {
       savedPortId = portId;
       savedEpConfig.portId = portId;
@@ -276,28 +284,42 @@ void Context::InitializePossibleTransports() {
       savedEpConfig.alignment = 4096;
       savedEpConfig.onGpu = true;
     }
-    for (int qp = 0; qp < numQpPerPe; qp++) {
-      RdmaEndpoint ep = rdmaDeviceContext->CreateRdmaEndpoint(savedEpConfig);
-      rdmaEps.push_back(ep);
-    }
     transportTypes.push_back(TransportType::RDMA);
   }
+}
 
-  // All2All rdma eps
-  // Exchange endpoint handles (now with multiple QPs per peer)
+/* ------------------------------------------------------------------------ */
+/*               Phase B: build + connect initial RDMA endpoint set         */
+/* ------------------------------------------------------------------------ */
+
+void Context::BuildAndConnectInitialEndpoints() {
+  // Build the worldSize × numQpPerPe rdmaEps vector. Non-RDMA peer slots are
+  // populated with empty stubs to keep the indexing uniform.
+  rdmaEps.reserve(static_cast<size_t>(WorldSize()) * numQpPerPe);
+  for (int i = 0; i < WorldSize(); i++) {
+    if (transportTypes[i] == TransportType::RDMA) {
+      for (int qp = 0; qp < numQpPerPe; qp++) {
+        RdmaEndpoint ep = rdmaDeviceContext->CreateRdmaEndpoint(savedEpConfig);
+        rdmaEps.push_back(ep);
+      }
+    } else {
+      for (int qp = 0; qp < numQpPerPe; qp++) {
+        rdmaEps.push_back({});
+      }
+    }
+  }
+
+  // Exchange endpoint handles via AllToAll (worldSize × numQpPerPe handles).
   int totalEps = WorldSize() * numQpPerPe;
   std::vector<RdmaEndpointHandle> localToPeerEpHandles(totalEps);
   std::vector<RdmaEndpointHandle> peerToLocalEpHandles(totalEps);
-
-  // Fill local endpoint handles
   for (int i = 0; i < rdmaEps.size(); i++) {
     localToPeerEpHandles[i] = rdmaEps[i].handle;
   }
-
   bootNet.AllToAll(localToPeerEpHandles.data(), peerToLocalEpHandles.data(),
                    sizeof(RdmaEndpointHandle) * numQpPerPe);
 
-  // Connect RDMA endpoints
+  // Connect each RDMA peer's QPs (INIT -> RTR -> RTS).
   for (int peer = 0; peer < WorldSize(); peer++) {
     if (transportTypes[peer] != TransportType::RDMA) {
       continue;
