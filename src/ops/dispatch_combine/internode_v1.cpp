@@ -196,8 +196,7 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
         if (args.replayMode) {
           // Recover the deterministic flag slot from the cached send map.
           int firstSender = __ffsll(static_cast<unsigned long long>(mask)) - 1;
-          index_t myCached =
-              shouldSend ? args.interNodeDispSendMap[nNodes * tokenId + i] : 0;
+          index_t myCached = shouldSend ? args.interNodeDispSendMap[nNodes * tokenId + i] : 0;
           flagSlotId = __shfl(myCached, firstSender) / warpSize;
         }
 
@@ -414,8 +413,7 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
         index_t laneExpert = indices[laneId];
         lanePe = (laneExpert < 0) ? (-1 - static_cast<int>(laneId))
                                   : (laneExpert / config.numExpertPerRank);
-        assert((laneExpert < 0) ||
-               ((lanePe < config.worldSize) && (lanePe >= 0)));
+        assert((laneExpert < 0) || ((lanePe < config.worldSize) && (lanePe >= 0)));
       }
       index_t srcTokId = reinterpret_cast<index_t*>(stagingPtr + tokIdx * xferBytes + hiddenBytes +
                                                     indexBytes + weightBytes + scaleBytes)[0];
@@ -425,8 +423,8 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
         bool isSentinelSlot = (destPe < 0);
         int destNode = isSentinelSlot ? -1 : destPe / config.gpuPerNode;
 
-        bool shouldSkip = isSentinelSlot || (destNode != myNode) ||
-                          __any((laneId < e) && (destPe == lanePe));
+        bool shouldSkip =
+            isSentinelSlot || (destNode != myNode) || __any((laneId < e) && (destPe == lanePe));
         if (shouldSkip) {
           if (!args.replayMode && laneId == 0)
             args.interNodeDispDestTokIdMap[tokIdx * config.numExpertPerToken + e] =
@@ -1376,8 +1374,7 @@ __device__ void EpCombineAll_body(EpDispatchCombineArgs<T> args) {
 
   if (globalWarpId == 0) {
     // routing-handle callers own this tensor hence no need to reset.
-    if (laneId == 0 && args.dispTokIdToSrcTokIdLocal == nullptr)
-      args.totalRecvTokenNum[0] = 0;
+    if (laneId == 0 && args.dispTokIdToSrcTokIdLocal == nullptr) args.totalRecvTokenNum[0] = 0;
     if (laneId < nNodes) args.blockFlagCounter[laneId] = 0;
   }
   if (args.curRankNumToken == 0) return;

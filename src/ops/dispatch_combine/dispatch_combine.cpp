@@ -522,9 +522,10 @@ EpDispatchCombineArgsRaw GetEpDispatchCombineArgsRaw(const EpDispatchCombineHand
   return args;
 }
 
-EpDispatchCombineArgsRaw GetEpDispatchCombineArgsRaw(
-    const EpDispatchCombineHandle& handle, int rdmaBlockNum,
-    const EpDispatchCombineRoutingPtrs* routing, bool replayMode) {
+EpDispatchCombineArgsRaw GetEpDispatchCombineArgsRaw(const EpDispatchCombineHandle& handle,
+                                                     int rdmaBlockNum,
+                                                     const EpDispatchCombineRoutingPtrs* routing,
+                                                     bool replayMode) {
   EpDispatchCombineArgsRaw args = GetEpDispatchCombineArgsRaw(handle, rdmaBlockNum);
   args.replayMode = replayMode;
   if (routing != nullptr && routing->IsValid()) {

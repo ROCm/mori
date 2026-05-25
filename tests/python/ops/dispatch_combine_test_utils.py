@@ -454,9 +454,7 @@ class EpDispatchCombineTestCase:
                     )
                     sentinel_slots = list(range(k - sentinel_pattern, k))
                 else:
-                    raise ValueError(
-                        f"Unknown sentinel_pattern: {sentinel_pattern!r}"
-                    )
+                    raise ValueError(f"Unknown sentinel_pattern: {sentinel_pattern!r}")
                 for j in sentinel_slots:
                     indices[:, j] = -1
             all_rank_indices.append(indices.to(torch.int32).to(self.device))

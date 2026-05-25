@@ -115,8 +115,11 @@ def _do_combine(op, dispatch_out, indices_local, *, routing=None):
 
 def _default_vs_routing_handle_parity(rank, world_size, kernel):
     """Mode-1 default path (op-owned buffers) vs routing-handle path must match."""
-    config = _make_intranode_config(rank, world_size) if kernel == "intra" \
+    config = (
+        _make_intranode_config(rank, world_size)
+        if kernel == "intra"
         else _make_internode_v1_config(rank, world_size)
+    )
 
     op_default = mori.ops.EpDispatchCombineOp(config)
     op_routing = mori.ops.EpDispatchCombineOp(config)
@@ -126,16 +129,12 @@ def _default_vs_routing_handle_parity(rank, world_size, kernel):
 
     default_disp, _ = _do_dispatch(op_default, test_data, return_routing=False)
     tc.sync()
-    default_combine_out, _ = _do_combine(
-        op_default, default_disp, test_data[1][rank]
-    )
+    default_combine_out, _ = _do_combine(op_default, default_disp, test_data[1][rank])
     tc.sync()
 
     rh_disp, R = _do_dispatch(op_routing, test_data, return_routing=True)
     tc.sync()
-    rh_combine_out, _ = _do_combine(
-        op_routing, rh_disp, test_data[1][rank], routing=R
-    )
+    rh_combine_out, _ = _do_combine(op_routing, rh_disp, test_data[1][rank], routing=R)
     tc.sync()
 
     assert torch.allclose(
@@ -147,8 +146,11 @@ def _default_vs_routing_handle_parity(rank, world_size, kernel):
 
 
 def _replay_correctness(rank, world_size, kernel):
-    config = _make_intranode_config(rank, world_size) if kernel == "intra" \
+    config = (
+        _make_intranode_config(rank, world_size)
+        if kernel == "intra"
         else _make_internode_v1_config(rank, world_size)
+    )
 
     op = mori.ops.EpDispatchCombineOp(config)
     tc = EpDispatchCombineTestCase(config)
@@ -177,8 +179,7 @@ def _replay_correctness(rank, world_size, kernel):
         test_data[0],  # num_token per rank (unchanged)
         test_data[1],  # all_rank_indices / expert routing (unchanged for replay)
         [
-            grad_input if r == rank else test_data[2][r]
-            for r in range(world_size)
+            grad_input if r == rank else test_data[2][r] for r in range(world_size)
         ],  # all_rank_input: new payload on this rank only
         test_data[3],  # all_rank_weights (unchanged)
         test_data[4],  # all_rank_scales (unchanged)
@@ -187,12 +188,12 @@ def _replay_correctness(rank, world_size, kernel):
     rep_disp, _ = _do_dispatch(op, grad_test_data, routing=R)
     tc.sync()
 
-    assert torch.equal(R.disp_dest_tok_id_map, pre_disp_dest), (
-        f"rank {rank}: dispDestTokIdMap changed after replay dispatch"
-    )
-    assert torch.equal(R.total_recv_token_num, pre_total_recv), (
-        f"rank {rank}: totalRecvTokenNum changed after replay dispatch"
-    )
+    assert torch.equal(
+        R.disp_dest_tok_id_map, pre_disp_dest
+    ), f"rank {rank}: dispDestTokIdMap changed after replay dispatch"
+    assert torch.equal(
+        R.total_recv_token_num, pre_total_recv
+    ), f"rank {rank}: totalRecvTokenNum changed after replay dispatch"
 
     assert rep_disp["total_recv"] == fwd_disp["total_recv"], (
         f"rank {rank}: replay total_recv {rep_disp['total_recv']} differs from "
@@ -203,8 +204,11 @@ def _replay_correctness(rank, world_size, kernel):
 
 def _multi_layer_correctness(rank, world_size, kernel, num_layers):
     """Shared op + per-layer routing handles vs fresh op default path per layer."""
-    config = _make_intranode_config(rank, world_size) if kernel == "intra" \
+    config = (
+        _make_intranode_config(rank, world_size)
+        if kernel == "intra"
         else _make_internode_v1_config(rank, world_size)
+    )
 
     op_shared = mori.ops.EpDispatchCombineOp(config)
     tc = EpDispatchCombineTestCase(config)
@@ -222,8 +226,9 @@ def _multi_layer_correctness(rank, world_size, kernel, num_layers):
 
     layer_combine_out = []
     for L in range(num_layers):
-        out, _ = _do_combine(op_shared, layer_disp[L], layer_data[L][1][rank],
-                             routing=layer_R[L])
+        out, _ = _do_combine(
+            op_shared, layer_disp[L], layer_data[L][1][rank], routing=layer_R[L]
+        )
         tc.sync()
         layer_combine_out.append(out)
 
@@ -270,9 +275,7 @@ def _stale_symmetric_buffer_guard(rank, world_size):
     out_base, _ = _do_combine(op_baseline, d_base, td0[1][rank])
     tc.sync()
 
-    assert torch.allclose(
-        out_shared.float(), out_base.float(), atol=1e-2, rtol=1e-2
-    ), (
+    assert torch.allclose(out_shared.float(), out_base.float(), atol=1e-2, rtol=1e-2), (
         f"rank {rank}: stale-symmetric-buffer guard failed; combine on shared op "
         f"diverged from baseline (max diff = "
         f"{(out_shared.float() - out_base.float()).abs().max().item()})."

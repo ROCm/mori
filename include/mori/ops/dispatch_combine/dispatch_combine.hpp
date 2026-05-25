@@ -534,9 +534,10 @@ EpDispatchCombineArgsRaw GetEpDispatchCombineArgsRaw(const EpDispatchCombineHand
 
 // Routing-handle overload: routing pointers come from caller-owned tensors;
 // `replayMode` selects mode-1 vs mode-2 dispatch (combine always passes false).
-EpDispatchCombineArgsRaw GetEpDispatchCombineArgsRaw(
-    const EpDispatchCombineHandle& handle, int rdmaBlockNum,
-    const EpDispatchCombineRoutingPtrs* routing, bool replayMode);
+EpDispatchCombineArgsRaw GetEpDispatchCombineArgsRaw(const EpDispatchCombineHandle& handle,
+                                                     int rdmaBlockNum,
+                                                     const EpDispatchCombineRoutingPtrs* routing,
+                                                     bool replayMode);
 
 struct LocalExpertCountArgs {
   const index_t* indices;

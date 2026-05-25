@@ -89,8 +89,7 @@ int64_t BuildArgsWithRouting(mori::moe::EpDispatchCombineHandle& handle, int rdm
                              int hiddenDim, int useExternalInpBuf, bool replayMode,
                              int64_t disp_dest_tok_id_map_ptr,
                              int64_t inter_node_disp_dest_tok_id_map_ptr,
-                             int64_t inter_node_disp_send_map_ptr,
-                             int64_t total_recv_token_num_ptr,
+                             int64_t inter_node_disp_send_map_ptr, int64_t total_recv_token_num_ptr,
                              int64_t disp_tok_id_to_src_tok_id_local_ptr) {
   mori::moe::EpDispatchCombineRoutingPtrs routing;
   routing.dispDestTokIdMap = reinterpret_cast<mori::moe::index_t*>(disp_dest_tok_id_map_ptr);
@@ -126,8 +125,7 @@ void SnapshotDispTokIdToSrcTokIdLocal(mori::moe::EpDispatchCombineHandle& handle
       static_cast<size_t>(cfg.MaxNumTokensToSend()) * static_cast<size_t>(cfg.numExpertPerRank);
   size_t nbytes = nelem * sizeof(mori::moe::index_t);
   HIP_RUNTIME_CHECK(hipMemcpyAsync(reinterpret_cast<void*>(dst_ptr), src, nbytes,
-                                   hipMemcpyDeviceToDevice,
-                                   reinterpret_cast<hipStream_t>(stream)));
+                                   hipMemcpyDeviceToDevice, reinterpret_cast<hipStream_t>(stream)));
 }
 
 // Backward-compatible helper for call sites that still want a merged API.

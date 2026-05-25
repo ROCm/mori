@@ -538,7 +538,13 @@ class EpDispatchCombineOp:
         )
 
     def _build_args_routing(
-        self, routing, *, rdma_block_num, hidden_dim, replay_mode, use_external_inp_buf=-1
+        self,
+        routing,
+        *,
+        rdma_block_num,
+        hidden_dim,
+        replay_mode,
+        use_external_inp_buf=-1,
     ):
         return mori_cpp.build_args_with_routing(
             self._handle,

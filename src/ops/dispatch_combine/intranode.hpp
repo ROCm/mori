@@ -148,8 +148,8 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
                  "Total recv token overflow: increase maxTotalRecvTokens");
           atomicAdd(args.destPeTokenCounter + destPe, 1);
           // In dispDestTokIdMap, record the destination slot for this token-expert pair (flat index
-          // into the dest PE's recv buffer) In dispTokIdToSrcTokIdMemObj on the dest PE, record which
-          // global source token occupies this slot (for combine-phase routing)
+          // into the dest PE's recv buffer) In dispTokIdToSrcTokIdMemObj on the dest PE, record
+          // which global source token occupies this slot (for combine-phase routing)
           args.dispDestTokIdMap[i] = FlatTokenIndex(config, destPe, destTokId);
           args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destTokId] =
               FlatTokenIndex(config, myPe, srcTokId);
