@@ -140,6 +140,160 @@ hipMalloc 内存只能通过 `hipIpcOpenMemHandle` 在 peer 端打开，返回**
 - `CcoWindowRegister(comm, ptr, size, win)`：接受 MemAlloc 的 ptr，做 RDMA MR 注册 + SDMA signal setup + 构建 GPU device 结构
 - `CcoWindowRegister(comm, size, win, &ptr)`：便捷重载，内部 = MemAlloc + WindowRegister(ptr)
 
+### DevComm requirements + Connection + Team（参考 ncclDevCommRequirements）
+
+CCO 学 NCCL 把 device 端的资源描述集中到一个 `CcoDevCommRequirements` 结构，由用户在 `CcoDevCommCreate` 时显式传入。三个核心维度：
+
+**1. Connection type（GDA QP 分配策略）**
+
+| 类型 | QP 数 (per rank) | 涵盖哪些 peer | 何时使用 |
+|------|------------------|--------------|---------|
+| `CCO_GDA_CONNECTION_NONE` | 0 | 不建 NIC QP | 纯 intra-node 应用，省 NIC 资源 |
+| `CCO_GDA_CONNECTION_FULL` | `worldSize - 1` | 所有 peer（含同节点） | uniform addressing，便利但浪费 intra-node QP |
+| `CCO_GDA_CONNECTION_CROSSNODE` ⭐ | `worldSize - lsaSize` | 所有跨节点 peer（跳过同节点） | **CCO 新增**：搭配 explicit `lsa.put`/`gda.put` 模型，省同节点 QP |
+| `CCO_GDA_CONNECTION_RAIL` | `nNodes - 1` | 仅同 rail（同 NIC slot index）跨节点 peer | 分层算法（节点内 LSA + 节点间 rail-aware GDA） |
+
+`CROSSNODE` 是 CCO 相对 NCCL 的延伸：NCCL 的 explicit team model 偏 uniform，缺少这个档；CCO 的 explicit backend selection 让 "GDA 永不发同节点" 成为合理设计点，刚好填上 FULL 和 RAIL 之间的空白。
+
+**2. Team（kernel 端的 peer 寻址空间）**
+
+`CcoTeam` 是 3-int 的逻辑 rank 子集描述符（与 ncclTeam 同构）：
+
+```cpp
+struct CcoTeam {
+  int nRanks;   // 子集大小
+  int rank;     // 我在子集中的 index
+  int stride;   // 在 world rank 空间的步长
+};
+```
+
+内置 team（device-side inline 函数）：
+
+| Team | 用途 | 公式 |
+|------|------|------|
+| `CcoTeamWorld(devComm)` | 全部 ranks | `{worldSize, rank, 1}` |
+| `CcoTeamLsa(devComm)` | 同节点 | `{lsaSize, lsaRank, 1}` |
+| `CcoTeamCrossNode(devComm)` ⭐ | 跨节点（跳过自己节点）| `{worldSize - lsaSize, ?, 1}` |
+| `CcoTeamRail(devComm)` | 跨节点同 rail | `{worldSize/lsaSize, rank/lsaSize, lsaSize}` |
+
+转换公式：`worldRank = comm.rank + (teamRank - team.rank) * team.stride`
+
+**3. Connection × Team 的兼容契约**
+
+`gda.put(team, peer, ...)` 内部把 team rank 转成 QP 数组下标。两者必须匹配：
+
+| Connection 设置 | 可用的 team（gda.put 接受） |
+|-----------------|------------------------------|
+| `NONE` | （无） |
+| `FULL` | World / CrossNode / Rail / LSA 任意 |
+| `CROSSNODE` | CrossNode / Rail（前提是 rail ⊆ crossnode；通常成立） |
+| `RAIL` | Rail（或 Rail 的子集） |
+
+注：LSA backend 不接受 team 参数（peer 永远是 intra-node local rank），同理 SDMA。Team 只用于 GDA。
+
+**4. Requirements struct（用户显式填）**
+
+```cpp
+struct CcoDevCommRequirements {
+  // forward-compat 三件套（必须由 INITIALIZER 宏填充）
+  size_t   size;
+  uint32_t magic;
+  uint32_t version;
+
+  // 资源链表（per-backend session 通过 CreateRequirement 往里加 buffer slot）
+  CcoDevResourceRequirements* resourceRequirementsList;
+
+  // ── GDA (RDMA) ──
+  CcoGdaConnectionType gdaConnectionType;   // 默认 NONE
+  int                  gdaContextCount;     // 独立 QP set 数量（hint，对应 numQpPerPe），默认 4
+  int                  gdaSignalCount;      // signal slot 数（从 id=0 起），默认 16
+  int                  gdaCounterCount;     // counter slot 数（从 id=0 起），默认 16
+  int                  gdaQueueDepth;       // 0 = use provider default
+  int                  gdaTrafficClass;     // -1 = use MORI_RDMA_TC env
+
+  // ── LSA (P2P) ──
+  int lsaBarrierCount;                      // CcoLsaBarrierSession 数量
+
+  // ── SDMA ──
+  int sdmaQueueCount;                       // 每 peer SDMA 队列数
+
+  // ── Hybrid barrier ──
+  int barrierCount;                         // LSA + GDA-Rail 二段式 barrier
+};
+
+#define CCO_DEV_COMM_REQUIREMENTS_INITIALIZER { \
+  sizeof(CcoDevCommRequirements), CCO_API_MAGIC, CCO_API_VERSION, \
+  /* resourceRequirementsList */ nullptr, \
+  /* gda */ CCO_GDA_CONNECTION_NONE, 4, 16, 16, 0, -1, \
+  /* lsa */ 0, \
+  /* sdma */ 0, \
+  /* hybrid barrier */ 0, \
+}
+
+struct CcoDevResourceRequirements {
+  CcoDevResourceRequirements* next;
+  size_t   bufferSize;
+  size_t   bufferAlign;
+  uint32_t* outBufferHandle;     // 创建后回填，是 comm 内部 buffer 的 offset (>>7)
+  int      gdaSignalCount;
+  int      gdaCounterCount;
+  uint32_t* outGdaSignalStart;   // 回填：分配到的 signal id 起点
+  uint32_t* outGdaCounterStart;
+};
+```
+
+**5. 使用范式（kernel 端）**
+
+```cpp
+// host
+CcoDevCommRequirements reqs = CCO_DEV_COMM_REQUIREMENTS_INITIALIZER;
+reqs.gdaConnectionType = CCO_GDA_CONNECTION_CROSSNODE;
+reqs.gdaSignalCount = CTA_COUNT;
+reqs.lsaBarrierCount = CTA_COUNT;
+CcoDevCommCreate(comm, &reqs, &devComm);
+
+// kernel
+__global__ void hybrid_alltoall(CcoDevComm* comm, CcoWindow_t win) {
+  CcoLsa lsa;
+  CcoGda gda(*comm, /*contextIdx=*/0);
+
+  // intra-node 走 LSA（peer 是 lsa local rank）
+  for (int p = 0; p < comm->lsaSize; p++) {
+    if (p == comm->lsaRank) continue;
+    lsa.put(p, win, dstOff, win, srcOff, bytes);
+  }
+
+  // 跨节点走 GDA + CrossNode team
+  CcoTeam xnode = CcoTeamCrossNode(*comm);
+  for (int p = 0; p < xnode.nRanks; p++) {
+    gda.put(xnode, p, win, dstOff, win, srcOff, bytes,
+            CcoGda_SignalInc{sigId});
+  }
+  gda.flush();
+}
+```
+
+**6. 实现要点**
+
+- **lsa topology 探测**：`CcoCommCreate` 时通过 `hipDeviceCanAccessPeer` + `LocalBootstrapNetwork` 确定哪些 rank 在同节点；存 `lsaSize`、`lsaRank` 到 `CcoComm` 和 `CcoDevComm`
+- **CROSSNODE QP 分配**：host 端构造 peer endpoint 列表时，跳过 `[myNodeStart, myNodeStart + lsaSize)` 的 rank
+- **device 端 rank→QP index 映射**：
+  ```cpp
+  __device__ int teamRankToGdaRank(CcoDevComm const& c, CcoTeam tm, int teamRank) {
+    int wr = c.rank + (teamRank - tm.rank) * tm.stride;
+    switch (c.gdaConnType) {
+      case CCO_GDA_CONNECTION_FULL:      return wr;
+      case CCO_GDA_CONNECTION_CROSSNODE: {
+        int myNodeStart = (c.rank / c.lsaSize) * c.lsaSize;
+        return wr < myNodeStart ? wr : wr - c.lsaSize;
+      }
+      case CCO_GDA_CONNECTION_RAIL:      return wr / c.lsaSize;
+    }
+  }
+  ```
+- **forward compat**：`CcoDevCommCreate` 入口检查 `reqs->size == sizeof(*reqs) && magic == CCO_API_MAGIC`，否则报错
+- **degenerate case**：单节点跑 `CROSSNODE` 时 `nGdaRanks = 0`，host 自动降级为 NONE 并 warn
+
 ---
 
 ## 数据结构定义
@@ -152,21 +306,21 @@ struct CcoComm {
     application::BootstrapNetwork* bootNet;
     application::Context*          ctx;       // RDMA 端点、传输类型协商
 
+    // ── Topology (intra-node detection) ──
+    int lsaSize;           // # of ranks on my node
+    int lsaRank;           // my index within node [0..lsaSize)
+    int myNodeStart;       // (rank / lsaSize) * lsaSize, world-rank of node[0]
+    // 假设所有节点 lsaSize 相同（典型部署：8 GPU/节点）。
+    // CcoCommCreate 时通过 hipDeviceCanAccessPeer + Allgather 探测。
+
     // VMM flat address space
     void*  flatBase;       // hipMemAddressReserve 返回的连续 VA 基址
     size_t perRankSize;    // 每 rank 的 VA slot 大小（用户指定，>= 所有 window 总大小）
     size_t nextOffset;     // slot 内下一个可用偏移
 
-    // RDMA
-    std::vector<ShmemRdmaEndpoint> rdmaEndpoints; // DevCommCreate 时 H2D copy
-    int    numQpPerPe;
-
-    // SDMA（per-comm，所有 window 共享）
+    // SDMA (per-comm，所有 window 共享，CcoCommCreate 时初始化)
     anvil::SdmaQueueDeviceHandle** sdmaDevHandles;
-    int    sdmaNumQueue;
-
-    // Barrier
-    uint64_t* internalSyncGpuPtr; // GPU 显存，128×uint64_t
+    int    sdmaNumQueue;   // 默认值，可被 DevCommRequirements.sdmaQueueCount 覆盖
 
     // 内存分配元数据（MemAlloc 时存入，WindowRegister(ptr) 时查询）
     struct AllocMeta {
@@ -178,6 +332,10 @@ struct CcoComm {
     std::unordered_map<void*, AllocMeta> allocTable; // key = localPtr
 
     std::vector<CcoWindowHost*> windows; // 供 Destroy 时清理
+
+    // ── DevComm 端点池 ──
+    // RDMA endpoints 不再写死在 CcoComm 里，改为 CcoDevCommCreate 时按 reqs
+    // 创建 ctx->CreateAdditionalEndpoints；CcoComm 只持有 Context 和默认参数。
 };
 ```
 
@@ -185,11 +343,25 @@ struct CcoComm {
 
 ```cpp
 struct CcoDevComm {
-    int rank, worldSize, numQpPerPe;
-    ShmemRdmaEndpoint* rdmaEndpoints;  // GPU buf，长度 worldSize*numQpPerPe
-    uint64_t*          internalSyncPtr; // GPU buf，128×uint64_t
+    // ── World / topology ──
+    int rank, worldSize;
+    int lsaSize, lsaRank;          // 从 CcoComm copy
+
+    // ── GDA backend ──
+    CcoGdaConnectionType gdaConnType;
+    int                  gdaNumQpPerPe;        // = reqs.gdaContextCount
+    int                  gdaNGdaRanks;         // 视 connType 而定
+    ShmemRdmaEndpoint*   gdaEndpoints;         // GPU buf，长度 gdaNGdaRanks * gdaNumQpPerPe
+    CcoIbgdaContext      ibgda;                // signal/counter resources
+
+    // ── LSA / SDMA ──
+    uint64_t* internalSyncPtr;     // GPU buf, 128×uint64_t (host barrier shadow)
+    int       sdmaNumQueue;
+
+    // ── Window lookup table ──
     void*  flatBase;
     size_t perRankSize;
+    CcoWindowTableNode* windowTable;
 };
 typedef CcoDevComm* CcoDevComm_t;
 ```
@@ -268,15 +440,17 @@ ncclResult_t CcoWindowRegister(CcoComm* comm, void* ptr, size_t size,
                                   CcoWindow_t* win);
 ncclResult_t CcoWindowDeregister(CcoComm* comm, CcoWindow_t win);
 
-// ── 阶段三：固化 GPU 端 comm 结构 ──
-ncclResult_t CcoDevCommCreate(CcoComm* comm, CcoDevComm** devComm);
-ncclResult_t CcoDevCommDestroy(CcoDevComm* devComm);
+// ── 阶段三：固化 GPU 端 comm 结构（带 requirements） ──
+int CcoDevCommCreate(CcoComm* comm,
+                     const CcoDevCommRequirements* reqs,
+                     CcoDevComm** devComm);
+int CcoDevCommDestroy(CcoDevComm* devComm);
 
 // Host barrier
-ncclResult_t CcoBarrierAll(CcoComm* comm);  // bootNet->Barrier()
+int CcoBarrierAll(CcoComm* comm);  // bootNet->Barrier()
 ```
 
-**典型调用顺序 A（全自动）：**
+**典型调用顺序（带 reqs）：**
 
 ```cpp
 CcoCommCreate(bootNet, perRankVmmSize, &comm);
@@ -285,7 +459,14 @@ void *buf_a, *buf_b;
 CcoWindowRegister(comm, size_a, &win_a, &buf_a);
 CcoWindowRegister(comm, size_b, &win_b, &buf_b);
 
-CcoDevCommCreate(comm, &devComm);
+// ── 配置 DevComm 资源 ──
+CcoDevCommRequirements reqs = CCO_DEV_COMM_REQUIREMENTS_INITIALIZER;
+reqs.gdaConnectionType = CCO_GDA_CONNECTION_CROSSNODE;
+reqs.gdaSignalCount    = CTA_COUNT;
+reqs.gdaCounterCount   = CTA_COUNT;
+reqs.lsaBarrierCount   = CTA_COUNT;
+
+CcoDevCommCreate(comm, &reqs, &devComm);
 my_kernel<<<grid, block>>>(devComm, win_a, win_b, ...);
 
 CcoDevCommDestroy(devComm);
@@ -294,29 +475,7 @@ CcoWindowDeregister(comm, win_b);
 CcoCommDestroy(comm);
 ```
 
-**典型调用顺序 B（分离，类比 ncclMemAlloc + ncclCommWindowRegister）：**
-
-```cpp
-CcoCommCreate(bootNet, perRankVmmSize, &comm);
-
-void *buf_a, *buf_b;
-CcoMemAlloc(comm, size_a, &buf_a);
-CcoMemAlloc(comm, size_b, &buf_b);
-// 此时 buf 已可 P2P 访问，可做其他事
-
-CcoWindowRegister(comm, buf_a, size_a, &win_a);  // 仅 RDMA MR + SDMA 注册
-CcoWindowRegister(comm, buf_b, size_b, &win_b);
-
-CcoDevCommCreate(comm, &devComm);
-my_kernel<<<grid, block>>>(devComm, win_a, win_b, ...);
-
-CcoDevCommDestroy(devComm);
-CcoWindowDeregister(comm, win_a);
-CcoWindowDeregister(comm, win_b);
-CcoMemFree(comm, buf_a);
-CcoMemFree(comm, buf_b);
-CcoCommDestroy(comm);
-```
+**MemAlloc + WindowRegister 分离形式同样兼容**，仅 `CcoDevCommCreate` 签名变化。
 
 ---
 
