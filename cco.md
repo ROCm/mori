@@ -18,6 +18,73 @@ mori 是一个 GPU 通信库，有 `mori-SHMEM` 模块提供 GPU-initiated P2P /
 
 ---
 
+## 命名约定（Naming Convention）
+
+CCO 包含两层 API，**风格刻意分开**：
+
+### Host 端（CCO comm/window 生命周期 + 资源管理）
+
+沿用 mori 通用风格（Google C++ Style 变体），与 `mori_application` / `mori_shmem` / `Rdma*` / `Sdma*` 兄弟模块对齐：
+
+| 元素 | 规则 | 例子 |
+|------|------|------|
+| 函数（free function） | `CcoPascalCase`（带前缀） | `CcoCommCreate`, `CcoMemAlloc`, `CcoWindowRegister`, `CcoDevCommCreate`, `CcoBarrierAll` |
+| Struct / Class | `CcoPascalCase`（带前缀） | `CcoComm`, `CcoWindowHost`, `CcoDevComm` |
+| Handle typedef | `CcoPascalCase_t`（带前缀 + `_t` 后缀） | `CcoWindow_t`, `CcoDevComm_t` |
+| 字段（struct member） | `camelCase` | `worldSize`, `flatBase`, `nextOffset`, `numQpPerPe` |
+| 常量 / 宏 | `CCO_UPPER_SNAKE_CASE`（带前缀） | `CCO_WINDOW_TABLE_SIZE` |
+| 文件 | `cco_xxx.hpp` / `cco_xxx.cpp` | `cco_api.hpp`, `cco_init.cpp`, `cco_memory.cpp` |
+| 命名空间 | `mori::cco` | — |
+
+### Device 端（CcoLsa / CcoGda / CcoSdma session + 内部辅助）
+
+借鉴 **NCCL device API 风格**（`nccl_device/gin.h`, `nccl_device/lsa_barrier.h`），让从 NCCL/NVSHMEM 迁移过来的用户有熟悉感：
+
+| 元素 | 规则 | 例子 |
+|------|------|------|
+| Session class | `CcoPascalCase`（带前缀） | `CcoGda`, `CcoLsa`, `CcoSdma`, `CcoLsaBarrierSession` |
+| Session 成员函数 | `camelCase`（首字母小写） | `put`, `get`, `signal`, `flush`, `flushAsync`, `wait`, `readSignal`, `waitSignal`, `resetSignal` |
+| Tag 类型（模板 dispatch） | `CcoModule_TagName`（**下划线**分隔模块名和 Tag 名） | `CcoGda_None`, `CcoGda_NoSignal`, `CcoGda_SignalInc`, `CcoGda_SignalAdd`, `CcoGda_CounterInc`, `CcoGda_SegmentDevice` |
+| Handle typedef | `CcoPascalCase_t`（带前缀 + `_t` 后缀） | `CcoGdaSignal_t`, `CcoGdaCounter_t`, `CcoGdaRequest_t`, `CcoLsaBarrierHandle_t` |
+| Enum 值 | `CcoModuleAction`（PascalCase，比 NCCL `SCREAMING_SNAKE_CASE` 短） | `CcoGdaSignalInc`, `CcoGdaSignalAdd` |
+| 内部 / private 成员 | `_camelCase`（下划线前缀） | `_gdaHandle`, `_signalShadows` |
+| Namespace 内 free function | `camelCase`（**不带** `Cco` 前缀，namespace 已经 disambiguate） | `mori::cco::findWindow`, `mori::cco::getPeerPtr`, `mori::cco::gda::put`, `mori::cco::gda::flush` |
+| 字段（struct member） | `camelCase` | `signalId`, `counterId`, `contextId`, `winBase`, `stride4G` |
+| 文件 | `xxx_device_common.hpp` + `xxx_device_api.hpp` | `gda_device_common.hpp`, `gda_device_api.hpp` |
+| 命名空间 | `mori::cco::<backend>` | `mori::cco::gda`, `mori::cco::lsa`, `mori::cco::sdma` |
+
+### 共同约定
+
+- **缩写当作普通单词**（与 mori 现有代码一致）：`Cco` / `Rdma` / `Sdma` / `Gda` / `Lsa` / `Shmem` / `Nic` —— **不**写成 `CCO` / `RDMA` / `LSA`
+- **类型 vs 函数的判别准则**：能用 `using` 在调用点免去 `mori::cco::` 前缀的（类型/handle）保留 `Cco` 前缀；不会单独被 `using` 出去的（namespace 内 free function）不加前缀
+- **公共 API 入口（含 `__device__`）一律加 `Cco` 前缀**，方便用户 grep；内部 helper 不加
+
+### 现有代码的对照
+
+```cpp
+// Host (mori style)
+int CcoCommCreate(application::BootstrapNetwork* bootNet, ...);   // PascalCase
+struct CcoComm { int rank; int worldSize; void* flatBase; };       // camelCase fields
+static constexpr int CCO_WINDOW_TABLE_SIZE = 32;                   // SCREAMING_SNAKE
+
+// Device GDA backend (NCCL style)
+namespace mori::cco::gda {
+  struct CcoGda_NoSignal {};                                       // Tag with `_`
+  struct CcoGda_SignalInc { CcoGdaSignal_t signalId; };
+  typedef uint32_t CcoGdaSignal_t;                                 // _t suffix
+
+  struct CcoGda {
+    void* _gdaHandle;                                              // internal `_` prefix
+    __device__ void put(int peer, ...);                            // camelCase method
+    __device__ void flushAsync(int peer, ...);
+  };
+
+  __device__ inline static void put(CcoGdaCtx ctx, ...);           // namespace-internal, no prefix
+}
+```
+
+---
+
 ## 关键参考文件
 
 | 角色 | 路径 |
@@ -385,65 +452,133 @@ CcoDevCommCreate(comm, &devComm):
 
 ---
 
-## Device API（`include/mori/cco/cco_device_api.hpp`）
+## Device API（NCCL 风格 session class，参见"命名约定"）
+
+CCO device API 分两层：
+
+1. **通用辅助**（`include/mori/cco/cco_device_api.hpp`）
+   - `findWindow(comm, ptr)` — 在 windowTable 里查 window
+   - `getPeerPtr(win, pe, off)` / `getLocalPtr(win, off)` — 计算 flat VA 地址（P2P / SDMA 用）
+   - 在 `mori::cco` namespace 内，**不带** `Cco` 前缀，camelCase
+
+2. **per-backend session class**（每个 backend 一个子目录）
 
 ```cpp
-// ── P2P：直接 GPU store，同机 xGMI ──
-__device__ inline void CcoP2pPutThread(
-    CcoWindow_t dst, size_t dstOff,
-    CcoWindow_t src, size_t srcOff,
-    size_t bytes, int pe) {
-    void* remote = (void*)(dst->p2pPeerPtrs[pe] + dstOff);
-    void* local  = (void*)((uintptr_t)src->localPtr + srcOff);
-    // 复用 mori p2p provider 的 put 函数（参考 shmem_device_api.hpp P2P 路径）
-    p2pPutThread(local, remote, bytes);
+// ── GDA backend (RDMA via NIC GPU-direct, ncclGin 同款) ──
+// include/mori/cco/gda/gda_device_api.hpp
+namespace mori::cco::gda {
+
+// Tag types (template dispatch)
+struct CcoGda_NoSignal {};
+struct CcoGda_NoCounter {};
+struct CcoGda_SignalInc { CcoGdaSignal_t signalId; };
+struct CcoGda_SignalAdd { CcoGdaSignal_t signalId; uint64_t value; };
+struct CcoGda_CounterInc { CcoGdaCounter_t counterId; };
+
+// Handles
+typedef uint32_t CcoGdaSignal_t;
+typedef uint32_t CcoGdaCounter_t;
+typedef void*    CcoGdaRequest_t;
+
+// Session
+struct CcoGda {
+  CcoDevComm const& comm;
+  uint32_t contextId;
+  CcoGdaCtx ctx;
+  void* _gdaHandle;
+
+  __device__ CcoGda(CcoDevComm const&, int contextIndex);
+
+  template <typename RemoteAction = CcoGda_NoSignal,
+            typename LocalAction  = CcoGda_NoCounter>
+  __device__ void put(int peer, CcoWindow_t dstWin, size_t dstOff,
+                      CcoWindow_t srcWin, size_t srcOff, size_t bytes,
+                      RemoteAction = CcoGda_NoSignal{},
+                      LocalAction  = CcoGda_NoCounter{});
+
+  template <typename T, typename RemoteAction = CcoGda_NoSignal>
+  __device__ void putValue(int peer, CcoWindow_t dstWin, size_t dstOff,
+                           T value, RemoteAction = CcoGda_NoSignal{});
+
+  __device__ void get(int peer, CcoWindow_t remoteWin, size_t remoteOff,
+                      CcoWindow_t localWin, size_t localOff, size_t bytes);
+  template <typename RemoteAction>
+  __device__ void signal(int peer, RemoteAction);
+
+  __device__ uint64_t readSignal (CcoGdaSignal_t,  int bits = 64);
+  __device__ void     waitSignal (CcoGdaSignal_t,  uint64_t least, int bits = 64);
+  __device__ void     resetSignal(CcoGdaSignal_t);
+  __device__ uint64_t readCounter (CcoGdaCounter_t, int bits = 56);
+  __device__ void     waitCounter (CcoGdaCounter_t, uint64_t least, int bits = 56);
+  __device__ void     resetCounter(CcoGdaCounter_t);
+
+  __device__ void flush();
+  __device__ void flushAsync(int peer, CcoGdaRequest_t* outRequest);
+  __device__ void wait(CcoGdaRequest_t& request);
+};
+
+}  // namespace mori::cco::gda
+
+// ── LSA backend (intra-node P2P direct store)：Phase 2 ──
+// include/mori/cco/lsa/lsa_device_api.hpp
+namespace mori::cco::lsa {
+struct CcoLsa {
+  __device__ void put(int peer, CcoWindow_t dst, size_t dstOff,
+                      CcoWindow_t src, size_t srcOff, size_t bytes);
+  template <typename T>
+  __device__ void putValue(int peer, CcoWindow_t dst, size_t dstOff, T value);
+};
+
+struct CcoLsaBarrierSession {
+  template <typename Coop>
+  __device__ void arrive(Coop, cuda::memory_order);
+  template <typename Coop>
+  __device__ void wait  (Coop, cuda::memory_order);
+  template <typename Coop>
+  __device__ void sync  (Coop, cuda::memory_order);
+};
+}  // namespace mori::cco::lsa
+
+// ── SDMA backend (intra-node SDMA copy engine)：Phase 2 ──
+// include/mori/cco/sdma/sdma_device_api.hpp
+namespace mori::cco::sdma {
+struct CcoSdma {
+  __device__ void put(int peer, CcoWindow_t dst, size_t dstOff,
+                      CcoWindow_t src, size_t srcOff, size_t bytes, int queueId = 0);
+  __device__ void quiet(int peer, int queueId = 0);
+};
+}  // namespace mori::cco::sdma
+```
+
+**用户使用范式**（per-CTA 实例化 session 后调方法）：
+
+```cpp
+__global__ void my_kernel(CcoDevComm* comm,
+                          CcoWindow_t dst, CcoWindow_t src) {
+  // RDMA put with remote signal
+  mori::cco::gda::CcoGda gda(*comm, /*contextIndex=*/0);
+  gda.put(peer, dst, dstOff, src, srcOff, bytes,
+          mori::cco::gda::CcoGda_SignalInc{sigId});
+  gda.flush();
+
+  // P2P put (intra-node)
+  mori::cco::lsa::CcoLsa lsa;
+  lsa.put(peer, dst, dstOff, src, srcOff, bytes);
+
+  // SDMA put (intra-node)
+  mori::cco::sdma::CcoSdma sdma;
+  sdma.put(peer, dst, dstOff, src, srcOff, bytes);
+  sdma.quiet(peer);
 }
-
-// ── RDMA：ibgda RDMA Write，跨机 ──
-__device__ void CcoRdmaPutThread(
-    CcoDevComm* comm,
-    CcoWindow_t dst, size_t dstOff,
-    CcoWindow_t src, size_t srcOff,
-    size_t bytes, int pe, int qpId = 0);
-// raddr = dst->peerPtrs[pe] + dstOff, rkey = dst->peerRkeys[pe]
-// laddr = src->peerPtrs[rank] + srcOff, lkey = src->lkey
-// iova=0 时 peerPtrs[pe]=0 → raddr=dstOff；iova=VA 时 peerPtrs[pe]=远端VA → raddr=VA+dstOff
-// 两种模式同一份 kernel 代码
-// 复用 ibgda provider（参考 shmem_device_api.hpp RDMA 路径）
-
-__device__ void CcoRdmaPutSignalThread(
-    CcoDevComm* comm,
-    CcoWindow_t dst, size_t dstOff,
-    CcoWindow_t src, size_t srcOff, size_t bytes,
-    CcoWindow_t sig, size_t sigOff, uint64_t sigVal, atomicType sigOp,
-    int pe, int qpId = 0);
-
-__device__ void CcoRdmaQuietThread(CcoDevComm* comm, int pe, int qpId = 0);
-
-// ── SDMA：DMA 引擎 packet queue，同机 ──
-__device__ void CcoSdmaPutThread(
-    CcoWindow_t dst, size_t dstOff,
-    CcoWindow_t src, size_t srcOff,
-    size_t bytes, int pe, int qpId = 0);
-// dstPtr = dst->p2pPeerPtrs[pe] + dstOff（本地 flat VA，与 P2P 共用）
-// srcPtr = src->localPtr + srcOff
-// 复用 core::SdmaPutThread（参考 shmem_sdma_kernels.hpp）
-
-__device__ void CcoSdmaQuietThread(CcoWindow_t win, int pe, int qpId = 0);
-
-// ── Barrier ──
-__device__ void CcoBarrierAllBlock(CcoDevComm* comm);
-// 复用 ShmemInternalBarrierBlock 逻辑，传入 comm->internalSyncPtr
-// 参考 shmem_device_api.hpp 中 barrier 实现
 ```
 
 **字段依赖一览**：
 
-| 路径 | 来自 CcoDevComm | 来自 CcoWindowDevice |
-|------|-------------------|------------------------|
-| P2P  | — | `p2pPeerPtrs`, `localPtr` |
-| RDMA | `rdmaEndpoints` (QP handles) | `peerPtrs`, `peerRkeys`, `lkey`, `localPtr` |
-| SDMA | — | `p2pPeerPtrs`, `localPtr`, `deviceHandles_d`, `signalPtrs`, `expectSignalsPtr`, `peerSignalPtrs` |
+| backend | session class | 来自 `CcoDevComm` | 来自 `CcoWindowDevice` |
+|---------|---------------|------------------|------------------------|
+| GDA (RDMA) | `CcoGda` | `ibgda` (QP endpoints + signal/counter) | `ibgdaWin` (rkeys + lkey) |
+| LSA (P2P)  | `CcoLsa`  | — | `winBase`, `stride4G`, `rank` (flat VA addressing) |
+| SDMA       | `CcoSdma` | — | `deviceHandles_d`, `signalPtrs`, `expectSignalsPtr`, `peerSignalPtrs` |
 
 ---
 
@@ -451,9 +586,22 @@ __device__ void CcoBarrierAllBlock(CcoDevComm* comm);
 
 ```
 include/mori/cco/
-├── cco_types.hpp       ← CcoComm, CcoDevComm, CcoWindowDevice, CcoWindowHost
-├── cco_api.hpp         ← Host API 声明
-└── cco_device_api.hpp  ← Device inline 函数实现
+├── cco_types.hpp           ← Host/device 共享类型：CcoComm, CcoDevComm,
+│                              CcoWindowDevice, CcoWindowHost, CcoIbgdaContext
+├── cco_api.hpp             ← Host API 声明（mori 风格）
+├── cco_device.hpp          ← Device API umbrella，include 下面所有
+├── cco_device_api.hpp      ← 通用 device 辅助：findWindow, getPeerPtr, getLocalPtr
+└── gda/                    ← GDA (RDMA) backend (NCCL 风格 session)
+    ├── gda_device_common.hpp  ← CcoGda struct 声明 + tag 类型 + handle typedef
+    └── gda_device_api.hpp     ← CcoGda 成员函数实现 + namespace 内 free function
+
+(后续阶段)
+└── lsa/                    ← LSA (P2P direct store) backend，TODO
+    ├── lsa_device_common.hpp
+    └── lsa_device_api.hpp
+└── sdma/                   ← SDMA backend，TODO
+    ├── sdma_device_common.hpp
+    └── sdma_device_api.hpp
 
 src/cco/
 ├── cco_init.cpp        ← CommCreate/Destroy, DevCommCreate/Destroy, MemAlloc/Free, BarrierAll
