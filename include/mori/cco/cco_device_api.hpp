@@ -1,21 +1,21 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
 // MIT License — see LICENSE for details.
 //
-// XSHMEM Device API — skeleton declarations for Phase 1.
+// CCO Device API — skeleton declarations for Phase 1.
 // Implementations will be filled in Phase 2.
 #pragma once
 
-#include "mori/xshmem/xshmem_types.hpp"
+#include "mori/cco/cco_types.hpp"
 
 namespace mori {
-namespace xshmem {
+namespace cco {
 
 // ── Window lookup: find window by pointer (like ncclFindWindow) ──
-__device__ inline XshmemWindow_t XshmemFindWindow(XshmemDevComm* comm, const void* ptr) {
+__device__ inline CcoWindow_t CcoFindWindow(CcoDevComm* comm, const void* ptr) {
   uintptr_t uptr = reinterpret_cast<uintptr_t>(ptr);
-  XshmemWindowTableNode* node = comm->windowTable;
+  CcoWindowTableNode* node = comm->windowTable;
   while (node) {
-    for (int i = 0; i < XSHMEM_WINDOW_TABLE_SIZE; i++) {
+    for (int i = 0; i < CCO_WINDOW_TABLE_SIZE; i++) {
       auto& e = node->entries[i];
       if (e.base != 0 && e.size != 0 && e.window != nullptr) {
         if (uptr >= e.base && uptr < e.base + e.size) {
@@ -29,17 +29,17 @@ __device__ inline XshmemWindow_t XshmemFindWindow(XshmemDevComm* comm, const voi
 }
 
 // ── Address helpers ──
-__device__ inline void* XshmemGetPeerPtr(XshmemWindow_t win, int pe, size_t offset = 0) {
+__device__ inline void* CcoGetPeerPtr(CcoWindow_t win, int pe, size_t offset = 0) {
   return win->winBase + ((static_cast<uint64_t>(pe) * win->stride4G) << 32) + offset;
 }
 
-__device__ inline void* XshmemGetLocalPtr(XshmemWindow_t win, size_t offset = 0) {
+__device__ inline void* CcoGetLocalPtr(CcoWindow_t win, size_t offset = 0) {
   return win->winBase + ((static_cast<uint64_t>(win->rank) * win->stride4G) << 32) + offset;
 }
 
 // ── P2P: direct GPU store, intra-node xGMI ──
-__device__ inline void XshmemP2pPutThread(XshmemWindow_t dst, size_t dstOff,
-                                          XshmemWindow_t src, size_t srcOff, size_t bytes,
+__device__ inline void CcoP2pPutThread(CcoWindow_t dst, size_t dstOff,
+                                          CcoWindow_t src, size_t srcOff, size_t bytes,
                                           int pe) {
   (void)dst;
   (void)dstOff;
@@ -47,14 +47,14 @@ __device__ inline void XshmemP2pPutThread(XshmemWindow_t dst, size_t dstOff,
   (void)srcOff;
   (void)bytes;
   (void)pe;
-  // Phase 2: void* remote = XshmemGetPeerPtr(dst, pe, dstOff);
-  //          void* local  = XshmemGetLocalPtr(src, srcOff);
+  // Phase 2: void* remote = CcoGetPeerPtr(dst, pe, dstOff);
+  //          void* local  = CcoGetLocalPtr(src, srcOff);
   //          p2pPutThread(local, remote, bytes);
 }
 
 // ── RDMA: ibgda RDMA Write, inter-node ──
-__device__ inline void XshmemRdmaPutThread(XshmemDevComm* comm, XshmemWindow_t dst, size_t dstOff,
-                                           XshmemWindow_t src, size_t srcOff, size_t bytes, int pe,
+__device__ inline void CcoRdmaPutThread(CcoDevComm* comm, CcoWindow_t dst, size_t dstOff,
+                                           CcoWindow_t src, size_t srcOff, size_t bytes, int pe,
                                            int qpId = 0) {
   (void)comm;
   (void)dst;
@@ -69,7 +69,7 @@ __device__ inline void XshmemRdmaPutThread(XshmemDevComm* comm, XshmemWindow_t d
   //          QP endpoint = comm->ibgda.endpoints[pe * comm->ibgda.numQpPerPe + qpId]
 }
 
-__device__ inline void XshmemRdmaQuietThread(XshmemDevComm* comm, int pe, int qpId = 0) {
+__device__ inline void CcoRdmaQuietThread(CcoDevComm* comm, int pe, int qpId = 0) {
   (void)comm;
   (void)pe;
   (void)qpId;
@@ -77,7 +77,7 @@ __device__ inline void XshmemRdmaQuietThread(XshmemDevComm* comm, int pe, int qp
 }
 
 // ── SDMA: DMA engine packet queue, intra-node ──
-__device__ inline void XshmemSdmaPutThread(XshmemWindow_t dst, size_t dstOff, XshmemWindow_t src,
+__device__ inline void CcoSdmaPutThread(CcoWindow_t dst, size_t dstOff, CcoWindow_t src,
                                            size_t srcOff, size_t bytes, int pe, int qpId = 0) {
   (void)dst;
   (void)dstOff;
@@ -86,12 +86,12 @@ __device__ inline void XshmemSdmaPutThread(XshmemWindow_t dst, size_t dstOff, Xs
   (void)bytes;
   (void)pe;
   (void)qpId;
-  // Phase 2: dstPtr = XshmemGetPeerPtr(dst, pe, dstOff)
-  //          srcPtr = XshmemGetLocalPtr(src, srcOff)
+  // Phase 2: dstPtr = CcoGetPeerPtr(dst, pe, dstOff)
+  //          srcPtr = CcoGetLocalPtr(src, srcOff)
   //          core::SdmaPutThread(...)
 }
 
-__device__ inline void XshmemSdmaQuietThread(XshmemWindow_t win, int pe, int qpId = 0) {
+__device__ inline void CcoSdmaQuietThread(CcoWindow_t win, int pe, int qpId = 0) {
   (void)win;
   (void)pe;
   (void)qpId;
@@ -103,14 +103,14 @@ __device__ inline void XshmemSdmaQuietThread(XshmemWindow_t win, int pe, int qpI
 // Signal raddr for peer pe: signalIndex * sizeof(uint64_t)
 // Signal rkey for peer pe: comm->ibgda.peerSignalRkeys[pe]
 
-__device__ inline uint64_t XshmemReadSignal(XshmemDevComm* comm, int signalIndex) {
+__device__ inline uint64_t CcoReadSignal(CcoDevComm* comm, int signalIndex) {
   // Phase 2: return atomicLoad(&comm->ibgda.signalBuf[signalIndex])
   (void)comm;
   (void)signalIndex;
   return 0;
 }
 
-__device__ inline void XshmemWaitSignal(XshmemDevComm* comm, int signalIndex, uint64_t threshold) {
+__device__ inline void CcoWaitSignal(CcoDevComm* comm, int signalIndex, uint64_t threshold) {
   // Phase 2: spin until comm->ibgda.signalBuf[signalIndex] >= threshold
   (void)comm;
   (void)signalIndex;
@@ -120,13 +120,13 @@ __device__ inline void XshmemWaitSignal(XshmemDevComm* comm, int signalIndex, ui
 // ── Counter: local completion (analogous to NCCL ncclGin_CounterInc) ──
 // NIC loopback writes to comm->ibgda.counterBuf after source data fully transmitted.
 
-__device__ inline uint64_t XshmemReadCounter(XshmemDevComm* comm, int counterIndex) {
+__device__ inline uint64_t CcoReadCounter(CcoDevComm* comm, int counterIndex) {
   (void)comm;
   (void)counterIndex;
   return 0;
 }
 
-__device__ inline void XshmemWaitCounter(XshmemDevComm* comm, int counterIndex,
+__device__ inline void CcoWaitCounter(CcoDevComm* comm, int counterIndex,
                                          uint64_t threshold) {
   (void)comm;
   (void)counterIndex;
@@ -134,10 +134,10 @@ __device__ inline void XshmemWaitCounter(XshmemDevComm* comm, int counterIndex,
 }
 
 // ── Barrier ──
-__device__ inline void XshmemBarrierAllBlock(XshmemDevComm* comm) {
+__device__ inline void CcoBarrierAllBlock(CcoDevComm* comm) {
   (void)comm;
   // Phase 2: reuse ShmemInternalBarrierBlock logic with comm->internalSyncPtr
 }
 
-}  // namespace xshmem
+}  // namespace cco
 }  // namespace mori

@@ -22,5 +22,5 @@
 
 #pragma once
 
-#include "mori/xshmem/gda/gda_device_api.hpp"
-#include "mori/xshmem/gda/gda_device_common.hpp"
+#include "mori/cco/gda/gda_device_api.hpp"
+#include "mori/cco/gda/gda_device_common.hpp"

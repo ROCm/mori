@@ -1,8 +1,8 @@
-// Test: XSHMEM host API — multi-process, one GPU per rank.
+// Test: CCO host API — multi-process, one GPU per rank.
 //
 // Two modes, auto-detected:
-//   mpirun -np 8 ./test_xshmem_multiprocess          (MPI bootstrap)
-//   ./test_xshmem_multiprocess [nranks]               (fork, socket bootstrap)
+//   mpirun -np 8 ./test_cco_multiprocess          (MPI bootstrap)
+//   ./test_cco_multiprocess [nranks]               (fork, socket bootstrap)
 
 #ifdef MORI_WITH_MPI
 #include <mpi.h>
@@ -18,7 +18,7 @@
 
 #include "hip/hip_runtime.h"
 #include "mori/application/bootstrap/socket_bootstrap.hpp"
-#include "mori/xshmem/xshmem_api.hpp"
+#include "mori/cco/cco_api.hpp"
 
 static int g_rank = 0;
 
@@ -52,15 +52,15 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
 
   printf("[rank %d/%d] pid=%d GPU=%d\n", rank, nranks, getpid(), dev);
 
-  mori::xshmem::XshmemComm* comm = nullptr;
-  if (mori::xshmem::XshmemCommCreate(bootNet, PER_RANK_VMM_SIZE, &comm) != 0) {
+  mori::cco::CcoComm* comm = nullptr;
+  if (mori::cco::CcoCommCreate(bootNet, PER_RANK_VMM_SIZE, &comm) != 0) {
     fprintf(stderr, "[rank %d] CommCreate failed\n", rank);
     return 1;
   }
   printf("[rank %d] CommCreate OK\n", rank);
 
   void* buf = nullptr;
-  if (mori::xshmem::XshmemMemAlloc(comm, WINDOW_SIZE, &buf) != 0) {
+  if (mori::cco::CcoMemAlloc(comm, WINDOW_SIZE, &buf) != 0) {
     fprintf(stderr, "[rank %d] MemAlloc failed\n", rank);
     return 1;
   }
@@ -68,29 +68,29 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
   uint8_t pattern = static_cast<uint8_t>((rank + 1) * 10);
   HIP_CHECK(hipMemset(buf, pattern, WINDOW_SIZE));
 
-  mori::xshmem::XshmemWindow_t win = nullptr;
-  if (mori::xshmem::XshmemWindowRegister(comm, buf, WINDOW_SIZE, &win) != 0) {
+  mori::cco::CcoWindow_t win = nullptr;
+  if (mori::cco::CcoWindowRegister(comm, buf, WINDOW_SIZE, &win) != 0) {
     fprintf(stderr, "[rank %d] WindowRegister failed\n", rank);
     return 1;
   }
 
   // ── Create DevComm #1 ──
-  mori::xshmem::XshmemDevComm* devComm1 = nullptr;
-  if (mori::xshmem::XshmemDevCommCreate(comm, &devComm1) != 0) {
+  mori::cco::CcoDevComm* devComm1 = nullptr;
+  if (mori::cco::CcoDevCommCreate(comm, &devComm1) != 0) {
     fprintf(stderr, "[rank %d] DevCommCreate #1 failed\n", rank);
     return 1;
   }
 
   // ── Create DevComm #2 (fresh QPs, independent from #1) ──
-  mori::xshmem::XshmemDevComm* devComm2 = nullptr;
-  if (mori::xshmem::XshmemDevCommCreate(comm, &devComm2) != 0) {
+  mori::cco::CcoDevComm* devComm2 = nullptr;
+  if (mori::cco::CcoDevCommCreate(comm, &devComm2) != 0) {
     fprintf(stderr, "[rank %d] DevCommCreate #2 failed\n", rank);
     return 1;
   }
   printf("[rank %d] 2x DevCommCreate OK\n", rank);
 
   // Verify both DevComms have correct rank/worldSize
-  mori::xshmem::XshmemDevComm dc1Host, dc2Host;
+  mori::cco::CcoDevComm dc1Host, dc2Host;
   HIP_CHECK(hipMemcpy(&dc1Host, devComm1, sizeof(dc1Host), hipMemcpyDeviceToHost));
   HIP_CHECK(hipMemcpy(&dc2Host, devComm2, sizeof(dc2Host), hipMemcpyDeviceToHost));
   if (dc1Host.rank != rank || dc2Host.rank != rank) {
@@ -113,10 +113,10 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
   printf("[rank %d] DevComm independence verified\n", rank);
 
   // P2P cross-read via flat addressing
-  mori::xshmem::XshmemWindowDevice winHost;
+  mori::cco::CcoWindowDevice winHost;
   HIP_CHECK(hipMemcpy(&winHost, win, sizeof(winHost), hipMemcpyDeviceToHost));
 
-  mori::xshmem::XshmemBarrierAll(comm);
+  mori::cco::CcoBarrierAll(comm);
 
   int p2pOk = 0;
   for (int pe = 0; pe < nranks; pe++) {
@@ -133,11 +133,11 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
   }
   printf("[rank %d] P2P OK from %d peers\n", rank, p2pOk);
 
-  mori::xshmem::XshmemDevCommDestroy(devComm2);
-  mori::xshmem::XshmemDevCommDestroy(devComm1);
-  mori::xshmem::XshmemWindowDeregister(comm, win);
-  mori::xshmem::XshmemMemFree(comm, buf);
-  mori::xshmem::XshmemCommDestroy(comm);
+  mori::cco::CcoDevCommDestroy(devComm2);
+  mori::cco::CcoDevCommDestroy(devComm1);
+  mori::cco::CcoWindowDeregister(comm, win);
+  mori::cco::CcoMemFree(comm, buf);
+  mori::cco::CcoCommDestroy(comm);
 
   printf("[rank %d] PASSED\n", rank);
   return 0;
@@ -161,9 +161,9 @@ static bool read_file(const char* path, void* data, size_t len) {
 
 static int run_fork_mode(int nranks) {
   char uidPath[256];
-  snprintf(uidPath, sizeof(uidPath), "/tmp/xshmem_test_uid_%d", getpid());
+  snprintf(uidPath, sizeof(uidPath), "/tmp/cco_test_uid_%d", getpid());
 
-  printf("=== XSHMEM Multi-Process Test (fork, %d ranks) ===\n", nranks);
+  printf("=== CCO Multi-Process Test (fork, %d ranks) ===\n", nranks);
   fflush(stdout);
 
   auto uid = mori::application::SocketBootstrapNetwork::GenerateUniqueIdWithInterface("lo", 19876);
@@ -215,7 +215,7 @@ int main(int argc, char** argv) {
     int rank, nranks;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &nranks);
-    if (rank == 0) printf("=== XSHMEM Multi-Process Test (MPI, %d ranks) ===\n", nranks);
+    if (rank == 0) printf("=== CCO Multi-Process Test (MPI, %d ranks) ===\n", nranks);
 
     auto* boot = new mori::application::MpiBootstrapNetwork(MPI_COMM_WORLD);
     int ret = run_test(rank, nranks, boot);

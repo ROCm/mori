@@ -18,29 +18,29 @@
 #endif
 
 namespace mori {
-namespace xshmem {
+namespace cco {
 
 /* ────────────────────────────────────────────────────────────────────────────
  *  GPU-side structures (device-safe, no STL)
  * ──────────────────────────────────────────────────────────────────────────── */
 
-struct XshmemWindowDevice;
+struct CcoWindowDevice;
 
-static constexpr int XSHMEM_WINDOW_TABLE_SIZE = 32;
+static constexpr int CCO_WINDOW_TABLE_SIZE = 32;
 
-struct XshmemWindowTableNode {
+struct CcoWindowTableNode {
   struct Entry {
     uintptr_t base;       // localPtr as uintptr_t
     uintptr_t size;
-    XshmemWindowDevice* window;
-  } entries[XSHMEM_WINDOW_TABLE_SIZE];
-  XshmemWindowTableNode* next;
+    CcoWindowDevice* window;
+  } entries[CCO_WINDOW_TABLE_SIZE];
+  CcoWindowTableNode* next;
 };
 
 // IBGDA context: QP endpoints + signal/counter resources bundled together.
 // Analogous to NCCL's ncclGinGdakiGPUContext.
 // One context per comm (single NIC). Future multi-NIC: array of contexts.
-struct XshmemIbgdaContext {
+struct CcoIbgdaContext {
   // QP endpoints: indexed by [pe * numQpPerPe + qpId]
   shmem::ShmemRdmaEndpoint* endpoints;  // GPU buf, length = worldSize * numQpPerPe
   int numQpPerPe;
@@ -57,27 +57,27 @@ struct XshmemIbgdaContext {
   uint64_t* counterBuf;        // GPU buf [counterCount]
 };
 
-struct XshmemDevComm {
+struct CcoDevComm {
   int rank;
   int worldSize;
   uint64_t* internalSyncPtr;                // GPU buf, 128 × uint64_t
   void* flatBase;
   size_t perRankSize;
-  XshmemWindowTableNode* windowTable;       // GPU, linked list of registered windows
+  CcoWindowTableNode* windowTable;       // GPU, linked list of registered windows
 
   // IBGDA context (QP + signal + counter)
-  XshmemIbgdaContext ibgda;
+  CcoIbgdaContext ibgda;
 };
-typedef XshmemDevComm* XshmemDevComm_t;
+typedef CcoDevComm* CcoDevComm_t;
 
 // Per-window RDMA context (analogous to NCCL's ncclGinWindow_t ginWins[])
 // One MR per window, shared by all QPs. peerRkeys indexed by [pe].
-struct XshmemIbgdaWin {
+struct CcoIbgdaWin {
   uint32_t* peerRkeys;     // [worldSize], Allgather-exchanged
   uint32_t lkey;            // local MR key for this window
 };
 
-struct XshmemWindowDevice {
+struct CcoWindowDevice {
   // ── flat VA addressing (P2P / SDMA / general) ──
   // Intentionally duplicated from DevComm so window is self-contained.
   // winBase = flatBase + slotOffset (pre-computed, like NCCL's lsaFlatBase + bigOffset)
@@ -92,7 +92,7 @@ struct XshmemWindowDevice {
   // ── RDMA / IBGDA (iova=0, offset-based) ──
   // QP endpoints: DevComm->ibgda.endpoints[pe * ibgda.numQpPerPe + qpId]
   // MR keys are per-window (same MR for all QPs):
-  XshmemIbgdaWin ibgdaWin;
+  CcoIbgdaWin ibgdaWin;
   // raddr = dstOff (iova=0)
   // laddr = srcOff (iova=0)
   // rkey  = ibgdaWin.peerRkeys[pe]
@@ -105,7 +105,7 @@ struct XshmemWindowDevice {
   HSAuint64** peerSignalPtrs;                       // [worldSize]
   uint32_t sdmaNumQueue;
 };
-typedef XshmemWindowDevice* XshmemWindow_t;
+typedef CcoWindowDevice* CcoWindow_t;
 
 /* ────────────────────────────────────────────────────────────────────────────
  *  Host-only structures
@@ -113,7 +113,7 @@ typedef XshmemWindowDevice* XshmemWindow_t;
 
 #if !defined(__HIPCC__) && !defined(__CUDACC__)
 
-struct XshmemWindowHost {
+struct CcoWindowHost {
   void* localPtr;
   size_t size;
   // SDMA signals (for Deregister cleanup)
@@ -121,13 +121,13 @@ struct XshmemWindowHost {
   HSAuint64* expectSignalsPtr;
   HSAuint64** peerSignalPtrs;
   // GPU device struct (for Deregister cleanup)
-  XshmemWindowDevice* devPtr;
+  CcoWindowDevice* devPtr;
   // GPU arrays (for Deregister cleanup)
   uint32_t* peerRkeys_gpu;
   HSAuint64** peerSignalPtrs_gpu;
 };
 
-struct XshmemComm {
+struct CcoComm {
   int rank{0};
   int worldSize{0};
   application::BootstrapNetwork* bootNet{nullptr};
@@ -168,18 +168,18 @@ struct XshmemComm {
   };
   std::unordered_map<void*, AllocMeta> allocTable;
 
-  std::vector<XshmemWindowHost*> windows;
+  std::vector<CcoWindowHost*> windows;
 
   // Window table: host shadow of GPU-side linked list (for DevCommCreate to build)
   struct WindowTableEntry {
     uintptr_t base;
     uintptr_t size;
-    XshmemWindowDevice* devPtr;
+    CcoWindowDevice* devPtr;
   };
   std::vector<WindowTableEntry> windowTableEntries;
 };
 
 #endif  // !defined(__HIPCC__) && !defined(__CUDACC__)
 
-}  // namespace xshmem
+}  // namespace cco
 }  // namespace mori

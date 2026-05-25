@@ -1,6 +1,6 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
 // MIT License — see LICENSE for details.
-#include "mori/xshmem/xshmem_api.hpp"
+#include "mori/cco/cco_api.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -15,16 +15,16 @@
 #include "mori/utils/mori_log.hpp"
 
 namespace mori {
-namespace xshmem {
+namespace cco {
 
 /* ========================================================================== */
-/*                         XshmemWindowRegister (ptr)                         */
+/*                         CcoWindowRegister (ptr)                         */
 /* ========================================================================== */
 
-int XshmemWindowRegister(XshmemComm* comm, void* ptr, size_t size, XshmemWindow_t* outWin) {
+int CcoWindowRegister(CcoComm* comm, void* ptr, size_t size, CcoWindow_t* outWin) {
   auto it = comm->allocTable.find(ptr);
   if (it == comm->allocTable.end()) {
-    MORI_SHMEM_ERROR("XshmemWindowRegister: ptr {} not in allocTable", ptr);
+    MORI_SHMEM_ERROR("CcoWindowRegister: ptr {} not in allocTable", ptr);
     return -1;
   }
 
@@ -37,7 +37,7 @@ int XshmemWindowRegister(XshmemComm* comm, void* ptr, size_t size, XshmemWindow_
 
   size_t alignedSize = meta.size;
 
-  MORI_SHMEM_TRACE("XshmemWindowRegister: rank={} ptr={} size={} slotOffset={}", rank, ptr, size,
+  MORI_SHMEM_TRACE("CcoWindowRegister: rank={} ptr={} size={} slotOffset={}", rank, ptr, size,
                    slotOffset);
 
   int currentDev = 0;
@@ -65,7 +65,7 @@ int XshmemWindowRegister(XshmemComm* comm, void* ptr, size_t size, XshmemWindow_
     // Socket path must be SAME across all ranks in this comm group,
     // but UNIQUE per window and per group to avoid collision.
     // groupId (rank 0's pid) identifies the group; slotOffset identifies the window.
-    std::string socketPath = "/tmp/mori_xshmem_" + std::to_string(comm->groupId) + "_" +
+    std::string socketPath = "/tmp/mori_cco_" + std::to_string(comm->groupId) + "_" +
                              std::to_string(slotOffset) + "_";
 
     // Clean up stale socket files from previous crashed runs (rank 0 only to avoid race)
@@ -86,7 +86,7 @@ int XshmemWindowRegister(XshmemComm* comm, void* ptr, size_t size, XshmemWindow_
     std::vector<int> myFds = {shareFd};
     std::vector<std::vector<int>> allFds;
     if (!localBoot.ExchangeFileDescriptors(myFds, allFds)) {
-      MORI_SHMEM_ERROR("XshmemWindowRegister: P2P FD exchange failed");
+      MORI_SHMEM_ERROR("CcoWindowRegister: P2P FD exchange failed");
       localBoot.Finalize();
       return -1;
     }
@@ -111,7 +111,7 @@ int XshmemWindowRegister(XshmemComm* comm, void* ptr, size_t size, XshmemWindow_
       hipError_t err = hipMemImportFromShareableHandleCompat(
           &importedHandle, peerFd, hipMemHandleTypePosixFileDescriptor);
       if (err != hipSuccess) {
-        MORI_SHMEM_WARN("XshmemWindowRegister: import from PE {} failed: {}", pe, err);
+        MORI_SHMEM_WARN("CcoWindowRegister: import from PE {} failed: {}", pe, err);
         continue;
       }
 
@@ -207,8 +207,8 @@ int XshmemWindowRegister(XshmemComm* comm, void* ptr, size_t size, XshmemWindow_
   HIP_RUNTIME_CHECK(hipMemcpy(peerRkeys_gpu, peerRkeys_host, sizeof(uint32_t) * worldSize,
                               hipMemcpyHostToDevice));
 
-  // ── Build GPU-side XshmemWindowDevice ──
-  XshmemWindowDevice hostShadow = {};
+  // ── Build GPU-side CcoWindowDevice ──
+  CcoWindowDevice hostShadow = {};
   hostShadow.winBase = static_cast<char*>(comm->flatBase) + slotOffset;
   hostShadow.stride4G = static_cast<uint32_t>(comm->perRankSize >> 32);
   hostShadow.rank = rank;
@@ -221,20 +221,20 @@ int XshmemWindowRegister(XshmemComm* comm, void* ptr, size_t size, XshmemWindow_
   hostShadow.peerSignalPtrs = peerSignalPtrs_gpu;
   hostShadow.sdmaNumQueue = static_cast<uint32_t>(sdmaNumQueue);
 
-  XshmemWindowDevice* devPtr = nullptr;
-  HIP_RUNTIME_CHECK(hipMalloc(&devPtr, sizeof(XshmemWindowDevice)));
+  CcoWindowDevice* devPtr = nullptr;
+  HIP_RUNTIME_CHECK(hipMalloc(&devPtr, sizeof(CcoWindowDevice)));
   HIP_RUNTIME_CHECK(
-      hipMemcpy(devPtr, &hostShadow, sizeof(XshmemWindowDevice), hipMemcpyHostToDevice));
+      hipMemcpy(devPtr, &hostShadow, sizeof(CcoWindowDevice), hipMemcpyHostToDevice));
 
   // ── Register in window table (for ncclFindWindow-style lookup) ──
-  XshmemComm::WindowTableEntry tableEntry;
+  CcoComm::WindowTableEntry tableEntry;
   tableEntry.base = reinterpret_cast<uintptr_t>(localPtr);
   tableEntry.size = static_cast<uintptr_t>(size);
   tableEntry.devPtr = devPtr;
   comm->windowTableEntries.push_back(tableEntry);
 
   // ── Record host-side metadata ──
-  auto* wh = new XshmemWindowHost();
+  auto* wh = new CcoWindowHost();
   wh->localPtr = localPtr;
   wh->size = size;
   wh->signalPtrs = signalPtrs;
@@ -249,7 +249,7 @@ int XshmemWindowRegister(XshmemComm* comm, void* ptr, size_t size, XshmemWindow_
 
   // Print window info
   char* winBase = static_cast<char*>(comm->flatBase) + slotOffset;
-  MORI_SHMEM_INFO("XshmemWindowRegister: rank={} win={} winBase={} size={} slotOffset={} lkey={}",
+  MORI_SHMEM_INFO("CcoWindowRegister: rank={} win={} winBase={} size={} slotOffset={} lkey={}",
                   rank, (void*)devPtr, (void*)winBase, size, slotOffset, lkey);
   for (int pe = 0; pe < worldSize; pe++) {
     void* peerVa = winBase + static_cast<size_t>(pe) * comm->perRankSize;
@@ -267,17 +267,17 @@ int XshmemWindowRegister(XshmemComm* comm, void* ptr, size_t size, XshmemWindow_
 }
 
 /* ========================================================================== */
-/*                      XshmemWindowRegister (convenience)                    */
+/*                      CcoWindowRegister (convenience)                    */
 /* ========================================================================== */
 
-int XshmemWindowRegister(XshmemComm* comm, size_t size, XshmemWindow_t* outWin, void** localPtr) {
+int CcoWindowRegister(CcoComm* comm, size_t size, CcoWindow_t* outWin, void** localPtr) {
   void* ptr = nullptr;
-  int ret = XshmemMemAlloc(comm, size, &ptr);
+  int ret = CcoMemAlloc(comm, size, &ptr);
   if (ret != 0) return ret;
 
-  ret = XshmemWindowRegister(comm, ptr, size, outWin);
+  ret = CcoWindowRegister(comm, ptr, size, outWin);
   if (ret != 0) {
-    XshmemMemFree(comm, ptr);
+    CcoMemFree(comm, ptr);
     return ret;
   }
 
@@ -286,12 +286,12 @@ int XshmemWindowRegister(XshmemComm* comm, size_t size, XshmemWindow_t* outWin, 
 }
 
 /* ========================================================================== */
-/*                          XshmemWindowDeregister                            */
+/*                          CcoWindowDeregister                            */
 /* ========================================================================== */
 
-int XshmemWindowDeregister(XshmemComm* comm, XshmemWindow_t win) {
-  // Find matching XshmemWindowHost
-  XshmemWindowHost* wh = nullptr;
+int CcoWindowDeregister(CcoComm* comm, CcoWindow_t win) {
+  // Find matching CcoWindowHost
+  CcoWindowHost* wh = nullptr;
   size_t idx = 0;
   for (size_t i = 0; i < comm->windows.size(); i++) {
     if (comm->windows[i]->devPtr == win) {
@@ -301,11 +301,11 @@ int XshmemWindowDeregister(XshmemComm* comm, XshmemWindow_t win) {
     }
   }
   if (!wh) {
-    MORI_SHMEM_WARN("XshmemWindowDeregister: win {} not found", (void*)win);
+    MORI_SHMEM_WARN("CcoWindowDeregister: win {} not found", (void*)win);
     return -1;
   }
 
-  MORI_SHMEM_TRACE("XshmemWindowDeregister: rank={} ptr={}", comm->rank, wh->localPtr);
+  MORI_SHMEM_TRACE("CcoWindowDeregister: rank={} ptr={}", comm->rank, wh->localPtr);
 
   // Unmap P2P peer slots (mapped during WindowRegister)
   auto allocIt = comm->allocTable.find(wh->localPtr);
@@ -324,7 +324,7 @@ int XshmemWindowDeregister(XshmemComm* comm, XshmemWindow_t win) {
   // Remove from window table
   auto& entries = comm->windowTableEntries;
   entries.erase(std::remove_if(entries.begin(), entries.end(),
-                               [win](const XshmemComm::WindowTableEntry& e) {
+                               [win](const CcoComm::WindowTableEntry& e) {
                                  return e.devPtr == win;
                                }),
                 entries.end());
@@ -351,5 +351,5 @@ int XshmemWindowDeregister(XshmemComm* comm, XshmemWindow_t win) {
   return 0;
 }
 
-}  // namespace xshmem
+}  // namespace cco
 }  // namespace mori

@@ -1,6 +1,6 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
 // MIT License — see LICENSE for details.
-#include "mori/xshmem/xshmem_api.hpp"
+#include "mori/cco/cco_api.hpp"
 
 #include <cstring>
 #include <vector>
@@ -13,7 +13,7 @@
 #include "mori/utils/mori_log.hpp"
 
 namespace mori {
-namespace xshmem {
+namespace cco {
 
 static constexpr size_t INTERNAL_SYNC_COUNT = 128;
 static constexpr size_t INTERNAL_SYNC_BYTES = INTERNAL_SYNC_COUNT * sizeof(uint64_t);
@@ -23,12 +23,12 @@ static size_t AlignUp(size_t x, size_t align) {
 }
 
 /* ========================================================================== */
-/*                              XshmemCommCreate                              */
+/*                              CcoCommCreate                              */
 /* ========================================================================== */
 
-int XshmemCommCreate(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
-                     XshmemComm** outComm) {
-  auto* comm = new XshmemComm();
+int CcoCommCreate(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
+                     CcoComm** outComm) {
+  auto* comm = new CcoComm();
   *outComm = comm;
 
   // Step 1: bootstrap
@@ -43,7 +43,7 @@ int XshmemCommCreate(application::BootstrapNetwork* bootNet, size_t perRankVmmSi
   comm->bootNet->Allgather(&myPid, allPids.data(), sizeof(int64_t));
   comm->groupId = allPids[0];
 
-  MORI_SHMEM_TRACE("XshmemCommCreate: rank={} worldSize={} groupId={}", comm->rank,
+  MORI_SHMEM_TRACE("CcoCommCreate: rank={} worldSize={} groupId={}", comm->rank,
                    comm->worldSize, comm->groupId);
 
   // Step 2: context (RDMA endpoints, transport type negotiation)
@@ -79,7 +79,7 @@ int XshmemCommCreate(application::BootstrapNetwork* bootNet, size_t perRankVmmSi
 
   size_t totalVaSize = static_cast<size_t>(comm->worldSize) * perRankVmmSize;
   HIP_RUNTIME_CHECK(hipMemAddressReserve(&comm->flatBase, totalVaSize, granularity, nullptr, 0));
-  MORI_SHMEM_TRACE("XshmemCommCreate: flatBase={} totalVA={} granularity={}", comm->flatBase,
+  MORI_SHMEM_TRACE("CcoCommCreate: flatBase={} totalVA={} granularity={}", comm->flatBase,
                    totalVaSize, granularity);
 
   // Step 4: SDMA device handles (per-comm, shared across windows)
@@ -122,7 +122,7 @@ int XshmemCommCreate(application::BootstrapNetwork* bootNet, size_t perRankVmmSi
     }
   }
 
-  MORI_SHMEM_INFO("XshmemCommCreate: rank={}/{} groupId={} flatBase={} perRankSize={} "
+  MORI_SHMEM_INFO("CcoCommCreate: rank={}/{} groupId={} flatBase={} perRankSize={} "
                   "granularity={} numQpPerPe={} sdmaNumQueue={} rdma={}",
                   comm->rank, comm->worldSize, comm->groupId, comm->flatBase, comm->perRankSize,
                   comm->vmmGranularity, comm->numQpPerPe, comm->sdmaNumQueue,
@@ -140,13 +140,13 @@ int XshmemCommCreate(application::BootstrapNetwork* bootNet, size_t perRankVmmSi
 }
 
 /* ========================================================================== */
-/*                             XshmemCommDestroy                              */
+/*                             CcoCommDestroy                              */
 /* ========================================================================== */
 
-int XshmemCommDestroy(XshmemComm* comm) {
+int CcoCommDestroy(CcoComm* comm) {
   if (!comm) return 0;
 
-  MORI_SHMEM_TRACE("XshmemCommDestroy: rank={}", comm->rank);
+  MORI_SHMEM_TRACE("CcoCommDestroy: rank={}", comm->rank);
 
   // Free remaining windows
   for (auto* wh : comm->windows) {
@@ -189,17 +189,17 @@ int XshmemCommDestroy(XshmemComm* comm) {
 }
 
 /* ========================================================================== */
-/*                              XshmemMemAlloc                                */
+/*                              CcoMemAlloc                                */
 /* ========================================================================== */
 
-int XshmemMemAlloc(XshmemComm* comm, size_t size, void** outPtr) {
+int CcoMemAlloc(CcoComm* comm, size_t size, void** outPtr) {
   int currentDev = 0;
   HIP_RUNTIME_CHECK(hipGetDevice(&currentDev));
 
   size_t alignedSize = AlignUp(size, comm->vmmGranularity);
   size_t slotOffset = comm->nextOffset;
 
-  MORI_SHMEM_TRACE("XshmemMemAlloc: rank={} size={} alignedSize={} slotOffset={}", comm->rank,
+  MORI_SHMEM_TRACE("CcoMemAlloc: rank={} size={} alignedSize={} slotOffset={}", comm->rank,
                    size, alignedSize, slotOffset);
 
   // Step 1: create physical memory
@@ -231,7 +231,7 @@ int XshmemMemAlloc(XshmemComm* comm, size_t size, void** outPtr) {
   // Step 4: advance offset and record metadata
   comm->nextOffset += alignedSize;
 
-  XshmemComm::AllocMeta meta;
+  CcoComm::AllocMeta meta;
   meta.physHandle = physHandle;
   meta.shareFd = shareFd;
   meta.slotOffset = slotOffset;
@@ -239,19 +239,19 @@ int XshmemMemAlloc(XshmemComm* comm, size_t size, void** outPtr) {
   comm->allocTable[localVa] = meta;
 
   *outPtr = localVa;
-  MORI_SHMEM_TRACE("XshmemMemAlloc: done, localPtr={} (local only, P2P mapping deferred to WindowRegister)",
+  MORI_SHMEM_TRACE("CcoMemAlloc: done, localPtr={} (local only, P2P mapping deferred to WindowRegister)",
                    localVa);
   return 0;
 }
 
 /* ========================================================================== */
-/*                              XshmemMemFree                                 */
+/*                              CcoMemFree                                 */
 /* ========================================================================== */
 
-int XshmemMemFree(XshmemComm* comm, void* ptr) {
+int CcoMemFree(CcoComm* comm, void* ptr) {
   auto it = comm->allocTable.find(ptr);
   if (it == comm->allocTable.end()) {
-    MORI_SHMEM_WARN("XshmemMemFree: ptr {} not found", ptr);
+    MORI_SHMEM_WARN("CcoMemFree: ptr {} not found", ptr);
     return -1;
   }
 
@@ -259,7 +259,7 @@ int XshmemMemFree(XshmemComm* comm, void* ptr) {
   size_t alignedSize = meta.size;
   size_t slotOffset = meta.slotOffset;
 
-  MORI_SHMEM_TRACE("XshmemMemFree: rank={} ptr={} size={}", comm->rank, ptr, alignedSize);
+  MORI_SHMEM_TRACE("CcoMemFree: rank={} ptr={} size={}", comm->rank, ptr, alignedSize);
 
   int currentDev = 0;
   HIP_RUNTIME_CHECK(hipGetDevice(&currentDev));
@@ -273,7 +273,7 @@ int XshmemMemFree(XshmemComm* comm, void* ptr) {
                    static_cast<size_t>(pe) * comm->perRankSize + slotOffset;
     hipError_t err = hipMemUnmap(peerVa, alignedSize);
     if (err != hipSuccess) {
-      MORI_SHMEM_WARN("XshmemMemFree: unmap PE {} failed: {}", pe, err);
+      MORI_SHMEM_WARN("CcoMemFree: unmap PE {} failed: {}", pe, err);
     }
   }
 
@@ -290,13 +290,13 @@ int XshmemMemFree(XshmemComm* comm, void* ptr) {
 }
 
 /* ========================================================================== */
-/*                            XshmemDevCommCreate                             */
+/*                            CcoDevCommCreate                             */
 /* ========================================================================== */
 
-int XshmemDevCommCreate(XshmemComm* comm, XshmemDevComm** outDevComm) {
-  MORI_SHMEM_TRACE("XshmemDevCommCreate: rank={}", comm->rank);
+int CcoDevCommCreate(CcoComm* comm, CcoDevComm** outDevComm) {
+  MORI_SHMEM_TRACE("CcoDevCommCreate: rank={}", comm->rank);
 
-  XshmemDevComm hostShadow = {};
+  CcoDevComm hostShadow = {};
   hostShadow.rank = comm->rank;
   hostShadow.worldSize = comm->worldSize;
   hostShadow.flatBase = comm->flatBase;
@@ -304,7 +304,7 @@ int XshmemDevCommCreate(XshmemComm* comm, XshmemDevComm** outDevComm) {
   hostShadow.internalSyncPtr = comm->internalSyncGpuPtr;
 
   // ── IBGDA Context: create fresh QP set (independent from previous DevComms) ──
-  XshmemIbgdaContext& ibgda = hostShadow.ibgda;
+  CcoIbgdaContext& ibgda = hostShadow.ibgda;
   ibgda.numQpPerPe = comm->numQpPerPe;
 
   size_t numEps = static_cast<size_t>(comm->worldSize) * comm->numQpPerPe;
@@ -335,20 +335,20 @@ int XshmemDevCommCreate(XshmemComm* comm, XshmemDevComm** outDevComm) {
   const auto& tableEntries = comm->windowTableEntries;
   size_t numWindows = tableEntries.size();
   size_t numNodes =
-      (numWindows + XSHMEM_WINDOW_TABLE_SIZE - 1) / XSHMEM_WINDOW_TABLE_SIZE;
+      (numWindows + CCO_WINDOW_TABLE_SIZE - 1) / CCO_WINDOW_TABLE_SIZE;
   if (numNodes == 0) numNodes = 1;
 
   // Allocate all nodes on GPU, build from host
-  std::vector<XshmemWindowTableNode*> gpuNodes(numNodes, nullptr);
+  std::vector<CcoWindowTableNode*> gpuNodes(numNodes, nullptr);
   for (size_t n = 0; n < numNodes; n++) {
-    HIP_RUNTIME_CHECK(hipMalloc(&gpuNodes[n], sizeof(XshmemWindowTableNode)));
-    HIP_RUNTIME_CHECK(hipMemset(gpuNodes[n], 0, sizeof(XshmemWindowTableNode)));
+    HIP_RUNTIME_CHECK(hipMalloc(&gpuNodes[n], sizeof(CcoWindowTableNode)));
+    HIP_RUNTIME_CHECK(hipMemset(gpuNodes[n], 0, sizeof(CcoWindowTableNode)));
   }
 
   for (size_t n = 0; n < numNodes; n++) {
-    XshmemWindowTableNode nodeHost = {};
-    size_t base = n * XSHMEM_WINDOW_TABLE_SIZE;
-    for (int i = 0; i < XSHMEM_WINDOW_TABLE_SIZE; i++) {
+    CcoWindowTableNode nodeHost = {};
+    size_t base = n * CCO_WINDOW_TABLE_SIZE;
+    for (int i = 0; i < CCO_WINDOW_TABLE_SIZE; i++) {
       size_t idx = base + i;
       if (idx < numWindows) {
         nodeHost.entries[i].base = tableEntries[idx].base;
@@ -358,11 +358,11 @@ int XshmemDevCommCreate(XshmemComm* comm, XshmemDevComm** outDevComm) {
     }
     nodeHost.next = (n + 1 < numNodes) ? gpuNodes[n + 1] : nullptr;
     HIP_RUNTIME_CHECK(
-        hipMemcpy(gpuNodes[n], &nodeHost, sizeof(XshmemWindowTableNode), hipMemcpyHostToDevice));
+        hipMemcpy(gpuNodes[n], &nodeHost, sizeof(CcoWindowTableNode), hipMemcpyHostToDevice));
   }
   hostShadow.windowTable = gpuNodes[0];
 
-  MORI_SHMEM_TRACE("XshmemDevCommCreate: windowTable with {} windows in {} nodes", numWindows,
+  MORI_SHMEM_TRACE("CcoDevCommCreate: windowTable with {} windows in {} nodes", numWindows,
                    numNodes);
 
   // ── IBGDA Context: Signal / Counter buffers ──
@@ -414,17 +414,17 @@ int XshmemDevCommCreate(XshmemComm* comm, XshmemDevComm** outDevComm) {
   ibgda.peerSignalRkeys = peerSignalRkeysGpu;
   free(peerSignalRkeys_host);
 
-  MORI_SHMEM_TRACE("XshmemDevCommCreate: signals={} counters={} signalLkey={}", signalCount,
+  MORI_SHMEM_TRACE("CcoDevCommCreate: signals={} counters={} signalLkey={}", signalCount,
                    counterCount, signalLkey);
 
   // Copy struct to GPU
-  XshmemDevComm* devCommGpu = nullptr;
-  HIP_RUNTIME_CHECK(hipMalloc(&devCommGpu, sizeof(XshmemDevComm)));
+  CcoDevComm* devCommGpu = nullptr;
+  HIP_RUNTIME_CHECK(hipMalloc(&devCommGpu, sizeof(CcoDevComm)));
   HIP_RUNTIME_CHECK(
-      hipMemcpy(devCommGpu, &hostShadow, sizeof(XshmemDevComm), hipMemcpyHostToDevice));
+      hipMemcpy(devCommGpu, &hostShadow, sizeof(CcoDevComm), hipMemcpyHostToDevice));
 
   *outDevComm = devCommGpu;
-  MORI_SHMEM_INFO("XshmemDevCommCreate: rank={} devComm={} windows={} signals={} counters={} "
+  MORI_SHMEM_INFO("CcoDevCommCreate: rank={} devComm={} windows={} signals={} counters={} "
                   "signalBuf={} counterBuf={} signalLkey={}",
                   comm->rank, (void*)devCommGpu, numWindows, signalCount, counterCount,
                   (void*)signalBufGpu, (void*)counterBufGpu, signalLkey);
@@ -432,15 +432,15 @@ int XshmemDevCommCreate(XshmemComm* comm, XshmemDevComm** outDevComm) {
 }
 
 /* ========================================================================== */
-/*                           XshmemDevCommDestroy                             */
+/*                           CcoDevCommDestroy                             */
 /* ========================================================================== */
 
-int XshmemDevCommDestroy(XshmemDevComm* devComm) {
+int CcoDevCommDestroy(CcoDevComm* devComm) {
   if (!devComm) return 0;
 
-  XshmemDevComm hostShadow;
+  CcoDevComm hostShadow;
   HIP_RUNTIME_CHECK(
-      hipMemcpy(&hostShadow, devComm, sizeof(XshmemDevComm), hipMemcpyDeviceToHost));
+      hipMemcpy(&hostShadow, devComm, sizeof(CcoDevComm), hipMemcpyDeviceToHost));
 
   // Free IBGDA context resources
   auto& ibgda = hostShadow.ibgda;
@@ -451,11 +451,11 @@ int XshmemDevCommDestroy(XshmemDevComm* devComm) {
   if (ibgda.peerSignalRkeys) HIP_RUNTIME_CHECK(hipFree(ibgda.peerSignalRkeys));
 
   // Free window table linked list
-  XshmemWindowTableNode* node = hostShadow.windowTable;
+  CcoWindowTableNode* node = hostShadow.windowTable;
   while (node) {
-    XshmemWindowTableNode nodeHost;
+    CcoWindowTableNode nodeHost;
     HIP_RUNTIME_CHECK(
-        hipMemcpy(&nodeHost, node, sizeof(XshmemWindowTableNode), hipMemcpyDeviceToHost));
+        hipMemcpy(&nodeHost, node, sizeof(CcoWindowTableNode), hipMemcpyDeviceToHost));
     HIP_RUNTIME_CHECK(hipFree(node));
     node = nodeHost.next;
   }
@@ -465,13 +465,13 @@ int XshmemDevCommDestroy(XshmemDevComm* devComm) {
 }
 
 /* ========================================================================== */
-/*                             XshmemBarrierAll                               */
+/*                             CcoBarrierAll                               */
 /* ========================================================================== */
 
-int XshmemBarrierAll(XshmemComm* comm) {
+int CcoBarrierAll(CcoComm* comm) {
   comm->bootNet->Barrier();
   return 0;
 }
 
-}  // namespace xshmem
+}  // namespace cco
 }  // namespace mori

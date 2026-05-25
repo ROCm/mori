@@ -1,4 +1,4 @@
-// Test: XSHMEM host-side API lifecycle
+// Test: CCO host-side API lifecycle
 // Single process, N threads (one per GPU) via SocketBootstrapNetwork.
 // Validates: CommCreate → MemAlloc → WindowRegister → DevCommCreate → P2P read → teardown.
 
@@ -10,7 +10,7 @@
 #include "hip/hip_runtime.h"
 #include "mori/application/bootstrap/socket_bootstrap.hpp"
 #include "mori/utils/mori_log.hpp"
-#include "mori/xshmem/xshmem_api.hpp"
+#include "mori/cco/cco_api.hpp"
 
 #define HIP_CHECK(cmd)                                                         \
   do {                                                                         \
@@ -56,8 +56,8 @@ static void run_rank(int rank, int nranks, const mori::application::UniqueId& ui
   auto* bootNet = new mori::application::SocketBootstrapNetwork(uid, rank, nranks);
 
   // Phase 1: CommCreate
-  mori::xshmem::XshmemComm* comm = nullptr;
-  int ret = mori::xshmem::XshmemCommCreate(bootNet, PER_RANK_VMM_SIZE, &comm);
+  mori::cco::CcoComm* comm = nullptr;
+  int ret = mori::cco::CcoCommCreate(bootNet, PER_RANK_VMM_SIZE, &comm);
   if (ret != 0) {
     snprintf(result->detail, sizeof(result->detail), "CommCreate failed: %d", ret);
     return;
@@ -66,10 +66,10 @@ static void run_rank(int rank, int nranks, const mori::application::UniqueId& ui
 
   // Phase 1.5: MemAlloc
   void* buf = nullptr;
-  ret = mori::xshmem::XshmemMemAlloc(comm, WINDOW_SIZE, &buf);
+  ret = mori::cco::CcoMemAlloc(comm, WINDOW_SIZE, &buf);
   if (ret != 0) {
     snprintf(result->detail, sizeof(result->detail), "MemAlloc failed: %d", ret);
-    mori::xshmem::XshmemCommDestroy(comm);
+    mori::cco::CcoCommDestroy(comm);
     return;
   }
   printf("[rank %d] MemAlloc OK: buf=%p\n", rank, buf);
@@ -82,42 +82,42 @@ static void run_rank(int rank, int nranks, const mori::application::UniqueId& ui
   HIP_CHECK(hipMemcpy(buf, pattern.data(), WINDOW_SIZE, hipMemcpyHostToDevice));
 
   // Phase 2: WindowRegister (ptr overload)
-  mori::xshmem::XshmemWindow_t win = nullptr;
-  ret = mori::xshmem::XshmemWindowRegister(comm, buf, WINDOW_SIZE, &win);
+  mori::cco::CcoWindow_t win = nullptr;
+  ret = mori::cco::CcoWindowRegister(comm, buf, WINDOW_SIZE, &win);
   if (ret != 0) {
     snprintf(result->detail, sizeof(result->detail), "WindowRegister failed: %d", ret);
-    mori::xshmem::XshmemMemFree(comm, buf);
-    mori::xshmem::XshmemCommDestroy(comm);
+    mori::cco::CcoMemFree(comm, buf);
+    mori::cco::CcoCommDestroy(comm);
     return;
   }
 
   // Phase 2: WindowRegister (convenience overload)
-  mori::xshmem::XshmemWindow_t win2 = nullptr;
+  mori::cco::CcoWindow_t win2 = nullptr;
   void* buf2 = nullptr;
-  ret = mori::xshmem::XshmemWindowRegister(comm, WINDOW_SIZE, &win2, &buf2);
+  ret = mori::cco::CcoWindowRegister(comm, WINDOW_SIZE, &win2, &buf2);
   if (ret != 0) {
     snprintf(result->detail, sizeof(result->detail), "WindowRegister(convenience) failed: %d", ret);
-    mori::xshmem::XshmemWindowDeregister(comm, win);
-    mori::xshmem::XshmemMemFree(comm, buf);
-    mori::xshmem::XshmemCommDestroy(comm);
+    mori::cco::CcoWindowDeregister(comm, win);
+    mori::cco::CcoMemFree(comm, buf);
+    mori::cco::CcoCommDestroy(comm);
     return;
   }
   printf("[rank %d] WindowRegister x2 OK\n", rank);
 
   // Phase 3: DevCommCreate
-  mori::xshmem::XshmemDevComm* devComm = nullptr;
-  ret = mori::xshmem::XshmemDevCommCreate(comm, &devComm);
+  mori::cco::CcoDevComm* devComm = nullptr;
+  ret = mori::cco::CcoDevCommCreate(comm, &devComm);
   if (ret != 0) {
     snprintf(result->detail, sizeof(result->detail), "DevCommCreate failed: %d", ret);
-    mori::xshmem::XshmemWindowDeregister(comm, win2);
-    mori::xshmem::XshmemWindowDeregister(comm, win);
-    mori::xshmem::XshmemMemFree(comm, buf);
-    mori::xshmem::XshmemCommDestroy(comm);
+    mori::cco::CcoWindowDeregister(comm, win2);
+    mori::cco::CcoWindowDeregister(comm, win);
+    mori::cco::CcoMemFree(comm, buf);
+    mori::cco::CcoCommDestroy(comm);
     return;
   }
 
   // Verify DevComm on GPU
-  mori::xshmem::XshmemDevComm devCommHost;
+  mori::cco::CcoDevComm devCommHost;
   HIP_CHECK(
       hipMemcpy(&devCommHost, devComm, sizeof(devCommHost), hipMemcpyDeviceToHost));
   if (devCommHost.rank != rank || devCommHost.worldSize != nranks) {
@@ -129,7 +129,7 @@ static void run_rank(int rank, int nranks, const mori::application::UniqueId& ui
 
   {
     // Verify WindowDevice on GPU — use flat addressing
-    mori::xshmem::XshmemWindowDevice winHost;
+    mori::cco::CcoWindowDevice winHost;
     HIP_CHECK(hipMemcpy(&winHost, win, sizeof(winHost), hipMemcpyDeviceToHost));
 
     // Verify local ptr via flat addressing
@@ -141,7 +141,7 @@ static void run_rank(int rank, int nranks, const mori::application::UniqueId& ui
     }
 
     // Barrier before P2P cross-read
-    mori::xshmem::XshmemBarrierAll(comm);
+    mori::cco::CcoBarrierAll(comm);
 
     // P2P read from every peer via flat addressing
     int p2pChecked = 0;
@@ -165,12 +165,12 @@ static void run_rank(int rank, int nranks, const mori::application::UniqueId& ui
   snprintf(result->detail, sizeof(result->detail), "all OK (%d ranks)", nranks);
 
 cleanup:
-  mori::xshmem::XshmemDevCommDestroy(devComm);
-  mori::xshmem::XshmemWindowDeregister(comm, win2);
-  mori::xshmem::XshmemWindowDeregister(comm, win);
-  mori::xshmem::XshmemMemFree(comm, buf2);
-  mori::xshmem::XshmemMemFree(comm, buf);
-  mori::xshmem::XshmemCommDestroy(comm);
+  mori::cco::CcoDevCommDestroy(devComm);
+  mori::cco::CcoWindowDeregister(comm, win2);
+  mori::cco::CcoWindowDeregister(comm, win);
+  mori::cco::CcoMemFree(comm, buf2);
+  mori::cco::CcoMemFree(comm, buf);
+  mori::cco::CcoCommDestroy(comm);
 
   if (result->passed) printf("[rank %d] PASSED\n", rank);
 }
@@ -190,7 +190,7 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  printf("=== XSHMEM Host API Test (%d ranks on %d GPUs) ===\n\n", nranks, numDevices);
+  printf("=== CCO Host API Test (%d ranks on %d GPUs) ===\n\n", nranks, numDevices);
 
   auto uid = mori::application::SocketBootstrapNetwork::GenerateUniqueIdWithInterface("lo", 18456);
 

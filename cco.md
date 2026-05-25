@@ -1,6 +1,6 @@
-# XSHMEM 工作交接（完整版）
+# CCO 工作交接（完整版）
 
-你是接受这个任务的 agent。mori 代码库在 `/home/jiahzhou/workspace/mori`。你的任务是实现 XSHMEM 模块（host 端初始化，device API 骨架）。下面包含你需要的所有信息。
+你是接受这个任务的 agent。mori 代码库在 `/home/jiahzhou/workspace/mori`。你的任务是实现 CCO 模块（host 端初始化，device API 骨架）。下面包含你需要的所有信息。
 
 ---
 
@@ -8,10 +8,10 @@
 
 mori 是一个 GPU 通信库，有 `mori-SHMEM` 模块提供 GPU-initiated P2P / RDMA / SDMA 传输。当前 SHMEM 用 Meyer's singleton（`ShmemStatesSingleton`）管理全局状态，一个进程只能有一套通信上下文。
 
-**XSHMEM 目标**：实现类似 NCCL LSA（P2P）+ GIN（RDMA）+ SDMA 的功能，用显式 comm 句柄替代 singleton，支持单进程内多个独立 comm 实例。
+**CCO 目标**：实现类似 NCCL LSA（P2P）+ GIN（RDMA）+ SDMA 的功能，用显式 comm 句柄替代 singleton，支持单进程内多个独立 comm 实例。
 
 核心特性：
-1. **无 singleton**：每个 `XshmemComm` 独立堆分配，多线程可并发使用
+1. **无 singleton**：每个 `CcoComm` 独立堆分配，多线程可并发使用
 2. **三段式初始化**：`CommCreate` → `WindowRegister` → `DevCommCreate`
 3. **三条显式传输路径**：P2P（直接 GPU store）、RDMA（ibgda）、SDMA（DMA 引擎），用户在 kernel 里显式选择，不做自动 dispatch
 4. **统一 VMM 内存**：window 底层用 `hipMemCreate`，一次注册同时具备三条路径能力
@@ -41,7 +41,7 @@ hipMalloc 内存只能通过 `hipIpcOpenMemHandle` 在 peer 端打开，返回**
 
 ### 双地址表设计（peerPtrs + p2pPeerPtrs）
 
-与现有 `SymmMemObj` 一致，`XshmemWindowDevice` 维护两套地址表：
+与现有 `SymmMemObj` 一致，`CcoWindowDevice` 维护两套地址表：
 
 - **`p2pPeerPtrs[pe]`**（P2P / SDMA 用）：本地 flat VA，`= flatBase + pe*perRankSize + slotOffset`。仅同节点 P2P 可达 peer 有值，远程 peer 为 0
 - **`peerPtrs[pe]`**（RDMA 用）：iova=0 时全部为 0；iova=VA fallback 时存远端 PE 的 localPtr
@@ -52,7 +52,7 @@ hipMalloc 内存只能通过 `hipIpcOpenMemHandle` 在 peer 端打开，返回**
 - **RDMA**：`raddr = peerPtrs[pe] + dstOff`（iova=0 时 = dstOff；iova=VA 时 = 远端VA + dstOff。两种模式同一份 kernel 代码）
 - **SDMA**：`dstPtr = p2pPeerPtrs[pe] + dstOff`（与 P2P 共用，仅同节点可达）
 
-一次 `XshmemWindowRegister` 同时拥有三条路径的能力。
+一次 `CcoWindowRegister` 同时拥有三条路径的能力。
 
 ### iova=0 RDMA 机制
 
@@ -69,18 +69,18 @@ hipMalloc 内存只能通过 `hipIpcOpenMemHandle` 在 peer 端打开，返回**
 
 ### MemAlloc 和 WindowRegister 分离（参考 ncclMemAlloc + ncclCommWindowRegister）
 
-- `XshmemMemAlloc`：VMM 分配 + P2P flat space 映射，**不做** RDMA MR 注册
-- `XshmemWindowRegister(comm, ptr, size, win)`：接受 MemAlloc 的 ptr，做 RDMA MR 注册 + SDMA signal setup + 构建 GPU device 结构
-- `XshmemWindowRegister(comm, size, win, &ptr)`：便捷重载，内部 = MemAlloc + WindowRegister(ptr)
+- `CcoMemAlloc`：VMM 分配 + P2P flat space 映射，**不做** RDMA MR 注册
+- `CcoWindowRegister(comm, ptr, size, win)`：接受 MemAlloc 的 ptr，做 RDMA MR 注册 + SDMA signal setup + 构建 GPU device 结构
+- `CcoWindowRegister(comm, size, win, &ptr)`：便捷重载，内部 = MemAlloc + WindowRegister(ptr)
 
 ---
 
 ## 数据结构定义
 
-### XshmemComm（host 端，堆分配）
+### CcoComm（host 端，堆分配）
 
 ```cpp
-struct XshmemComm {
+struct CcoComm {
     int rank, worldSize;
     application::BootstrapNetwork* bootNet;
     application::Context*          ctx;       // RDMA 端点、传输类型协商
@@ -110,27 +110,27 @@ struct XshmemComm {
     };
     std::unordered_map<void*, AllocMeta> allocTable; // key = localPtr
 
-    std::vector<XshmemWindowHost*> windows; // 供 Destroy 时清理
+    std::vector<CcoWindowHost*> windows; // 供 Destroy 时清理
 };
 ```
 
-### XshmemDevComm（GPU 显存，kernel 接收此指针）
+### CcoDevComm（GPU 显存，kernel 接收此指针）
 
 ```cpp
-struct XshmemDevComm {
+struct CcoDevComm {
     int rank, worldSize, numQpPerPe;
     ShmemRdmaEndpoint* rdmaEndpoints;  // GPU buf，长度 worldSize*numQpPerPe
     uint64_t*          internalSyncPtr; // GPU buf，128×uint64_t
     void*  flatBase;
     size_t perRankSize;
 };
-typedef XshmemDevComm* XshmemDevComm_t;
+typedef CcoDevComm* CcoDevComm_t;
 ```
 
-### XshmemWindowDevice（GPU 显存，kernel 接收此指针）
+### CcoWindowDevice（GPU 显存，kernel 接收此指针）
 
 ```cpp
-struct XshmemWindowDevice {
+struct CcoWindowDevice {
     // ── P2P / SDMA（同节点，本地 flat VA）──
     uintptr_t* p2pPeerPtrs; // [worldSize]，p2pPeerPtrs[pe] = flatBase + pe*perRankSize + slotOffset
                              // 仅同节点 P2P 可达 peer 有值，远程 peer 为 0
@@ -151,13 +151,13 @@ struct XshmemWindowDevice {
     HSAuint64** peerSignalPtrs;  // [worldSize]，各 pe 的 signal 地址
     uint32_t   sdmaNumQueue;
 };
-typedef XshmemWindowDevice* XshmemWindow_t;
+typedef CcoWindowDevice* CcoWindow_t;
 ```
 
-### XshmemWindowHost（host 端记录，供 Deregister 清理）
+### CcoWindowHost（host 端记录，供 Deregister 清理）
 
 ```cpp
-struct XshmemWindowHost {
+struct CcoWindowHost {
     void*     localPtr;
     size_t    size;
     // RDMA MR 句柄（供 Deregister 时 deregister）
@@ -167,7 +167,7 @@ struct XshmemWindowHost {
     HSAuint64* expectSignalsPtr;
     HSAuint64** peerSignalPtrs;
     // GPU device 结构（供 Deregister 时 hipFree）
-    XshmemWindowDevice* devPtr;
+    CcoWindowDevice* devPtr;
     // GPU buf（供 Deregister 时 hipFree）
     uintptr_t* p2pPeerPtrs_gpu;
     uintptr_t* peerPtrs_gpu;
@@ -182,83 +182,83 @@ struct XshmemWindowHost {
 
 ```cpp
 // ── 阶段一：comm 初始化 ──
-ncclResult_t XshmemCommCreate(application::BootstrapNetwork* bootNet,
+ncclResult_t CcoCommCreate(application::BootstrapNetwork* bootNet,
                                size_t perRankVmmSize,
-                               XshmemComm** comm);
-ncclResult_t XshmemCommDestroy(XshmemComm* comm);
+                               CcoComm** comm);
+ncclResult_t CcoCommDestroy(CcoComm* comm);
 
 // ── 阶段 1.5（可选）：VMM 内存分配 + P2P flat space 映射 ──
 // 不做 RDMA MR 注册；可在 WindowRegister 之前独立调用
-ncclResult_t XshmemMemAlloc(XshmemComm* comm, size_t size, void** ptr);
-ncclResult_t XshmemMemFree(XshmemComm* comm, void* ptr);
+ncclResult_t CcoMemAlloc(CcoComm* comm, size_t size, void** ptr);
+ncclResult_t CcoMemFree(CcoComm* comm, void* ptr);
 
 // ── 阶段二：window 注册（两个重载，三路传输同时就绪）──
-// 重载 A：内部分配（= XshmemMemAlloc + XshmemWindowRegister(ptr)）
-ncclResult_t XshmemWindowRegister(XshmemComm* comm, size_t size,
-                                  XshmemWindow_t* win, void** localPtr);
-// 重载 B：接受 XshmemMemAlloc 返回的 ptr
-ncclResult_t XshmemWindowRegister(XshmemComm* comm, void* ptr, size_t size,
-                                  XshmemWindow_t* win);
-ncclResult_t XshmemWindowDeregister(XshmemComm* comm, XshmemWindow_t win);
+// 重载 A：内部分配（= CcoMemAlloc + CcoWindowRegister(ptr)）
+ncclResult_t CcoWindowRegister(CcoComm* comm, size_t size,
+                                  CcoWindow_t* win, void** localPtr);
+// 重载 B：接受 CcoMemAlloc 返回的 ptr
+ncclResult_t CcoWindowRegister(CcoComm* comm, void* ptr, size_t size,
+                                  CcoWindow_t* win);
+ncclResult_t CcoWindowDeregister(CcoComm* comm, CcoWindow_t win);
 
 // ── 阶段三：固化 GPU 端 comm 结构 ──
-ncclResult_t XshmemDevCommCreate(XshmemComm* comm, XshmemDevComm** devComm);
-ncclResult_t XshmemDevCommDestroy(XshmemDevComm* devComm);
+ncclResult_t CcoDevCommCreate(CcoComm* comm, CcoDevComm** devComm);
+ncclResult_t CcoDevCommDestroy(CcoDevComm* devComm);
 
 // Host barrier
-ncclResult_t XshmemBarrierAll(XshmemComm* comm);  // bootNet->Barrier()
+ncclResult_t CcoBarrierAll(CcoComm* comm);  // bootNet->Barrier()
 ```
 
 **典型调用顺序 A（全自动）：**
 
 ```cpp
-XshmemCommCreate(bootNet, perRankVmmSize, &comm);
+CcoCommCreate(bootNet, perRankVmmSize, &comm);
 
 void *buf_a, *buf_b;
-XshmemWindowRegister(comm, size_a, &win_a, &buf_a);
-XshmemWindowRegister(comm, size_b, &win_b, &buf_b);
+CcoWindowRegister(comm, size_a, &win_a, &buf_a);
+CcoWindowRegister(comm, size_b, &win_b, &buf_b);
 
-XshmemDevCommCreate(comm, &devComm);
+CcoDevCommCreate(comm, &devComm);
 my_kernel<<<grid, block>>>(devComm, win_a, win_b, ...);
 
-XshmemDevCommDestroy(devComm);
-XshmemWindowDeregister(comm, win_a);
-XshmemWindowDeregister(comm, win_b);
-XshmemCommDestroy(comm);
+CcoDevCommDestroy(devComm);
+CcoWindowDeregister(comm, win_a);
+CcoWindowDeregister(comm, win_b);
+CcoCommDestroy(comm);
 ```
 
 **典型调用顺序 B（分离，类比 ncclMemAlloc + ncclCommWindowRegister）：**
 
 ```cpp
-XshmemCommCreate(bootNet, perRankVmmSize, &comm);
+CcoCommCreate(bootNet, perRankVmmSize, &comm);
 
 void *buf_a, *buf_b;
-XshmemMemAlloc(comm, size_a, &buf_a);
-XshmemMemAlloc(comm, size_b, &buf_b);
+CcoMemAlloc(comm, size_a, &buf_a);
+CcoMemAlloc(comm, size_b, &buf_b);
 // 此时 buf 已可 P2P 访问，可做其他事
 
-XshmemWindowRegister(comm, buf_a, size_a, &win_a);  // 仅 RDMA MR + SDMA 注册
-XshmemWindowRegister(comm, buf_b, size_b, &win_b);
+CcoWindowRegister(comm, buf_a, size_a, &win_a);  // 仅 RDMA MR + SDMA 注册
+CcoWindowRegister(comm, buf_b, size_b, &win_b);
 
-XshmemDevCommCreate(comm, &devComm);
+CcoDevCommCreate(comm, &devComm);
 my_kernel<<<grid, block>>>(devComm, win_a, win_b, ...);
 
-XshmemDevCommDestroy(devComm);
-XshmemWindowDeregister(comm, win_a);
-XshmemWindowDeregister(comm, win_b);
-XshmemMemFree(comm, buf_a);
-XshmemMemFree(comm, buf_b);
-XshmemCommDestroy(comm);
+CcoDevCommDestroy(devComm);
+CcoWindowDeregister(comm, win_a);
+CcoWindowDeregister(comm, win_b);
+CcoMemFree(comm, buf_a);
+CcoMemFree(comm, buf_b);
+CcoCommDestroy(comm);
 ```
 
 ---
 
 ## 初始化流程（详细步骤）
 
-### XshmemCommCreate
+### CcoCommCreate
 
 ```
-1. new XshmemComm
+1. new CcoComm
 2. bootNet->Initialize()          → rank/worldSize 发现
 3. new Context(*bootNet)          → RDMA 端点建立、传输类型协商、numQpPerPe
 4. hipMemAddressReserve(&flatBase, worldSize * perRankVmmSize)
@@ -274,10 +274,10 @@ XshmemCommDestroy(comm);
    从 ctx->GetNumQpPerPe() 取 numQpPerPe
 ```
 
-### XshmemMemAlloc（VMM 分配 + P2P flat space 映射）
+### CcoMemAlloc（VMM 分配 + P2P flat space 映射）
 
 ```
-XshmemMemAlloc(comm, size, &ptr):
+CcoMemAlloc(comm, size, &ptr):
 1. slotOffset = comm->nextOffset
 2. 构建 hipMemAllocationProp allocProp：
      .type = hipMemAllocationTypePinned (或 Uncached)
@@ -303,10 +303,10 @@ XshmemMemAlloc(comm, size, &ptr):
 10. *ptr = localPtr
 ```
 
-### XshmemWindowRegister（重载 B：接受 ptr）
+### CcoWindowRegister（重载 B：接受 ptr）
 
 ```
-XshmemWindowRegister(comm, ptr, size, &win):
+CcoWindowRegister(comm, ptr, size, &win):
 0. meta = comm->allocTable[ptr]
    slotOffset = meta.slotOffset
    fd         = meta.shareFd
@@ -341,8 +341,8 @@ XshmemWindowRegister(comm, ptr, size, &win):
    hipMalloc peerPtrs_gpu + hipMemcpy H2D
    hipMalloc peerRkeys_gpu + hipMemcpy H2D
 
-── 构建 GPU 端 XshmemWindowDevice ──
-8. 填 XshmemWindowDevice shadow：
+── 构建 GPU 端 CcoWindowDevice ──
+8. 填 CcoWindowDevice shadow：
    .localPtr         = localPtr
    .p2pPeerPtrs      = p2pPeerPtrs_gpu
    .peerPtrs         = peerPtrs_gpu
@@ -353,25 +353,25 @@ XshmemWindowRegister(comm, ptr, size, &win):
    .expectSignalsPtr = expectSignalsPtr
    .peerSignalPtrs   = peerSignalPtrs_gpu
    .sdmaNumQueue     = comm->sdmaNumQueue
-9. hipMalloc XshmemWindowDevice（GPU 显存）+ hipMemcpy H2D → devPtr
-10. new XshmemWindowHost{...}，push_back 到 comm->windows
+9. hipMalloc CcoWindowDevice（GPU 显存）+ hipMemcpy H2D → devPtr
+10. new CcoWindowHost{...}，push_back 到 comm->windows
 11. *win = devPtr
 ```
 
-### XshmemWindowRegister（重载 A：内部分配）
+### CcoWindowRegister（重载 A：内部分配）
 
 ```
-XshmemWindowRegister(comm, size, &win, &localPtr):
-→ XshmemMemAlloc(comm, size, &ptr)
-→ XshmemWindowRegister(comm, ptr, size, win)
+CcoWindowRegister(comm, size, &win, &localPtr):
+→ CcoMemAlloc(comm, size, &ptr)
+→ CcoWindowRegister(comm, ptr, size, win)
 → *localPtr = ptr
 ```
 
-### XshmemDevCommCreate
+### CcoDevCommCreate
 
 ```
-XshmemDevCommCreate(comm, &devComm):
-1. 填 XshmemDevComm host shadow：
+CcoDevCommCreate(comm, &devComm):
+1. 填 CcoDevComm host shadow：
    .rank            = comm->rank
    .worldSize       = comm->worldSize
    .numQpPerPe      = comm->numQpPerPe
@@ -379,19 +379,19 @@ XshmemDevCommCreate(comm, &devComm):
    .internalSyncPtr = comm->internalSyncGpuPtr（已在 GPU，直接填）
    .flatBase        = comm->flatBase
    .perRankSize     = comm->perRankSize
-2. hipMalloc XshmemDevComm（GPU 显存）+ hipMemcpy H2D
+2. hipMalloc CcoDevComm（GPU 显存）+ hipMemcpy H2D
 3. *devComm = GPU 指针（直接作为 kernel 参数传入）
 ```
 
 ---
 
-## Device API（`include/mori/xshmem/xshmem_device_api.hpp`）
+## Device API（`include/mori/cco/cco_device_api.hpp`）
 
 ```cpp
 // ── P2P：直接 GPU store，同机 xGMI ──
-__device__ inline void XshmemP2pPutThread(
-    XshmemWindow_t dst, size_t dstOff,
-    XshmemWindow_t src, size_t srcOff,
+__device__ inline void CcoP2pPutThread(
+    CcoWindow_t dst, size_t dstOff,
+    CcoWindow_t src, size_t srcOff,
     size_t bytes, int pe) {
     void* remote = (void*)(dst->p2pPeerPtrs[pe] + dstOff);
     void* local  = (void*)((uintptr_t)src->localPtr + srcOff);
@@ -400,10 +400,10 @@ __device__ inline void XshmemP2pPutThread(
 }
 
 // ── RDMA：ibgda RDMA Write，跨机 ──
-__device__ void XshmemRdmaPutThread(
-    XshmemDevComm* comm,
-    XshmemWindow_t dst, size_t dstOff,
-    XshmemWindow_t src, size_t srcOff,
+__device__ void CcoRdmaPutThread(
+    CcoDevComm* comm,
+    CcoWindow_t dst, size_t dstOff,
+    CcoWindow_t src, size_t srcOff,
     size_t bytes, int pe, int qpId = 0);
 // raddr = dst->peerPtrs[pe] + dstOff, rkey = dst->peerRkeys[pe]
 // laddr = src->peerPtrs[rank] + srcOff, lkey = src->lkey
@@ -411,35 +411,35 @@ __device__ void XshmemRdmaPutThread(
 // 两种模式同一份 kernel 代码
 // 复用 ibgda provider（参考 shmem_device_api.hpp RDMA 路径）
 
-__device__ void XshmemRdmaPutSignalThread(
-    XshmemDevComm* comm,
-    XshmemWindow_t dst, size_t dstOff,
-    XshmemWindow_t src, size_t srcOff, size_t bytes,
-    XshmemWindow_t sig, size_t sigOff, uint64_t sigVal, atomicType sigOp,
+__device__ void CcoRdmaPutSignalThread(
+    CcoDevComm* comm,
+    CcoWindow_t dst, size_t dstOff,
+    CcoWindow_t src, size_t srcOff, size_t bytes,
+    CcoWindow_t sig, size_t sigOff, uint64_t sigVal, atomicType sigOp,
     int pe, int qpId = 0);
 
-__device__ void XshmemRdmaQuietThread(XshmemDevComm* comm, int pe, int qpId = 0);
+__device__ void CcoRdmaQuietThread(CcoDevComm* comm, int pe, int qpId = 0);
 
 // ── SDMA：DMA 引擎 packet queue，同机 ──
-__device__ void XshmemSdmaPutThread(
-    XshmemWindow_t dst, size_t dstOff,
-    XshmemWindow_t src, size_t srcOff,
+__device__ void CcoSdmaPutThread(
+    CcoWindow_t dst, size_t dstOff,
+    CcoWindow_t src, size_t srcOff,
     size_t bytes, int pe, int qpId = 0);
 // dstPtr = dst->p2pPeerPtrs[pe] + dstOff（本地 flat VA，与 P2P 共用）
 // srcPtr = src->localPtr + srcOff
 // 复用 core::SdmaPutThread（参考 shmem_sdma_kernels.hpp）
 
-__device__ void XshmemSdmaQuietThread(XshmemWindow_t win, int pe, int qpId = 0);
+__device__ void CcoSdmaQuietThread(CcoWindow_t win, int pe, int qpId = 0);
 
 // ── Barrier ──
-__device__ void XshmemBarrierAllBlock(XshmemDevComm* comm);
+__device__ void CcoBarrierAllBlock(CcoDevComm* comm);
 // 复用 ShmemInternalBarrierBlock 逻辑，传入 comm->internalSyncPtr
 // 参考 shmem_device_api.hpp 中 barrier 实现
 ```
 
 **字段依赖一览**：
 
-| 路径 | 来自 XshmemDevComm | 来自 XshmemWindowDevice |
+| 路径 | 来自 CcoDevComm | 来自 CcoWindowDevice |
 |------|-------------------|------------------------|
 | P2P  | — | `p2pPeerPtrs`, `localPtr` |
 | RDMA | `rdmaEndpoints` (QP handles) | `peerPtrs`, `peerRkeys`, `lkey`, `localPtr` |
@@ -450,17 +450,17 @@ __device__ void XshmemBarrierAllBlock(XshmemDevComm* comm);
 ## 文件结构
 
 ```
-include/mori/xshmem/
-├── xshmem_types.hpp       ← XshmemComm, XshmemDevComm, XshmemWindowDevice, XshmemWindowHost
-├── xshmem_api.hpp         ← Host API 声明
-└── xshmem_device_api.hpp  ← Device inline 函数实现
+include/mori/cco/
+├── cco_types.hpp       ← CcoComm, CcoDevComm, CcoWindowDevice, CcoWindowHost
+├── cco_api.hpp         ← Host API 声明
+└── cco_device_api.hpp  ← Device inline 函数实现
 
-src/xshmem/
-├── xshmem_init.cpp        ← CommCreate/Destroy, DevCommCreate/Destroy, MemAlloc/Free, BarrierAll
-└── xshmem_memory.cpp      ← WindowRegister/Deregister
+src/cco/
+├── cco_init.cpp        ← CommCreate/Destroy, DevCommCreate/Destroy, MemAlloc/Free, BarrierAll
+└── cco_memory.cpp      ← WindowRegister/Deregister
 ```
 
-CMakeLists.txt 新增 `mori_xshmem` target，链接 `mori_application`（Context 等）。
+CMakeLists.txt 新增 `mori_cco` target，链接 `mori_application`（Context 等）。
 
 ---
 
@@ -490,17 +490,17 @@ CMakeLists.txt 新增 `mori_xshmem` target，链接 `mori_application`（Context
 
 Device API 骨架（声明 + 注释）也要写，实现留后续迭代：
 
-1. `XshmemCommCreate` / `XshmemCommDestroy`
-2. `XshmemMemAlloc` / `XshmemMemFree`
-3. `XshmemWindowRegister`（两个重载）/ `XshmemWindowDeregister`
-4. `XshmemDevCommCreate` / `XshmemDevCommDestroy`
-5. `XshmemBarrierAll`
+1. `CcoCommCreate` / `CcoCommDestroy`
+2. `CcoMemAlloc` / `CcoMemFree`
+3. `CcoWindowRegister`（两个重载）/ `CcoWindowDeregister`
+4. `CcoDevCommCreate` / `CcoDevCommDestroy`
+5. `CcoBarrierAll`
 6. 头文件骨架（types, api, device_api 声明）
 
 ---
 
 ## 验证
 
-1. 两线程各自 `XshmemCommCreate` + `XshmemWindowRegister`，互不干扰（验证无 singleton）
-2. 改写 `examples/shmem/put_thread_allgather.cpp` 使用 XSHMEM API
+1. 两线程各自 `CcoCommCreate` + `CcoWindowRegister`，互不干扰（验证无 singleton）
+2. 改写 `examples/shmem/put_thread_allgather.cpp` 使用 CCO API
 3. 同进程两个 comm 并发 put + barrier，验证 `internalSyncPtr` 互不污染
