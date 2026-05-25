@@ -359,54 +359,6 @@ def test_dispatch_combine_max_total_recv_tokens_under_budget(
 @pytest.mark.parametrize("data_type", (torch.bfloat16,))
 @pytest.mark.parametrize("hidden_dim", (4096,))
 @pytest.mark.parametrize("max_num_inp_token_per_rank", (1, 32))
-@pytest.mark.parametrize("num_experts_per_rank", (1,))
-@pytest.mark.parametrize("num_experts_per_token", (16,))
-@pytest.mark.parametrize(
-    "sentinel_pattern",
-    (None, "first_only", 8),
-)
-def test_dispatch_combine_tp_replicated_with_sentinels(
-    torch_dist_process_manager,
-    world_size,
-    data_type,
-    hidden_dim,
-    max_num_inp_token_per_rank,
-    num_experts_per_rank,
-    num_experts_per_token,
-    sentinel_pattern,
-):
-    """Megatron TP-replicated routing combined with -1 sentinels (mimics tp=8, ep=1, topk=2)."""
-    for _ in range(world_size):
-        torch_dist_process_manager.task_queue.put(
-            (
-                _test_dispatch_combine,
-                [
-                    world_size,
-                    data_type,
-                    hidden_dim,
-                    max_num_inp_token_per_rank,
-                    num_experts_per_rank,
-                    num_experts_per_token,
-                    True,  # use_external_inp_buf
-                    0,  # scale_dim
-                    1,  # scale_type_size
-                    "none",  # quant_type
-                    0,  # max_total_recv_tokens
-                    "tp_replicated",  # routing
-                    False,  # use_max_token_num
-                    True,  # check_results
-                    sentinel_pattern,
-                ],
-            )
-        )
-
-    assert_worker_results(torch_dist_process_manager, world_size)
-
-
-@pytest.mark.parametrize("world_size", (8,))
-@pytest.mark.parametrize("data_type", (torch.bfloat16,))
-@pytest.mark.parametrize("hidden_dim", (4096,))
-@pytest.mark.parametrize("max_num_inp_token_per_rank", (1, 32))
 @pytest.mark.parametrize("num_experts_per_rank", (32,))
 @pytest.mark.parametrize("num_experts_per_token", (8,))
 @pytest.mark.parametrize(

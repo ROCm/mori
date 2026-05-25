@@ -113,36 +113,36 @@ def _do_combine(op, dispatch_out, indices_local, *, routing=None):
     return out[:n].clone(), (out_w[:n].clone() if out_w is not None else None)
 
 
-def _legacy_vs_routing_handle_parity(rank, world_size, kernel):
+def _default_vs_routing_handle_parity(rank, world_size, kernel):
+    """Mode-1 default path (op-owned buffers) vs routing-handle path must match."""
     config = _make_intranode_config(rank, world_size) if kernel == "intra" \
         else _make_internode_v1_config(rank, world_size)
 
-    op_legacy = mori.ops.EpDispatchCombineOp(config)
-    op_route = mori.ops.EpDispatchCombineOp(config)
+    op_default = mori.ops.EpDispatchCombineOp(config)
+    op_routing = mori.ops.EpDispatchCombineOp(config)
 
     tc = EpDispatchCombineTestCase(config)
     test_data = _gen_layer_data(tc, seed=4242)
 
-    leg_disp, _ = _do_dispatch(op_legacy, test_data, return_routing=False)
+    default_disp, _ = _do_dispatch(op_default, test_data, return_routing=False)
     tc.sync()
-    leg_combine_out, _ = _do_combine(
-        op_legacy, leg_disp, test_data[1][rank]
+    default_combine_out, _ = _do_combine(
+        op_default, default_disp, test_data[1][rank]
     )
     tc.sync()
 
-    rh_disp, R = _do_dispatch(op_route, test_data, return_routing=True)
+    rh_disp, R = _do_dispatch(op_routing, test_data, return_routing=True)
     tc.sync()
     rh_combine_out, _ = _do_combine(
-        op_route, rh_disp, test_data[1][rank], routing=R
+        op_routing, rh_disp, test_data[1][rank], routing=R
     )
     tc.sync()
 
-    # Combine outputs are order-invariant; compare those.
     assert torch.allclose(
-        leg_combine_out.float(), rh_combine_out.float(), atol=1e-3, rtol=1e-3
+        default_combine_out.float(), rh_combine_out.float(), atol=1e-3, rtol=1e-3
     ), (
-        f"rank {rank}: legacy/routing-handle combine outputs differ; max diff = "
-        f"{(leg_combine_out.float() - rh_combine_out.float()).abs().max().item()}"
+        f"rank {rank}: default-path/routing-handle combine outputs differ; max diff = "
+        f"{(default_combine_out.float() - rh_combine_out.float()).abs().max().item()}"
     )
 
 
@@ -172,12 +172,16 @@ def _replay_correctness(rank, world_size, kernel):
         device=test_data[2][rank].device,
         generator=rng,
     )
+    # Same 5-tuple layout as gen_test_data(); only activations change on this rank.
     grad_test_data = (
-        test_data[0],
-        test_data[1],
-        [grad_input if r == rank else test_data[2][r] for r in range(world_size)],
-        test_data[3],
-        test_data[4],
+        test_data[0],  # num_token per rank (unchanged)
+        test_data[1],  # all_rank_indices / expert routing (unchanged for replay)
+        [
+            grad_input if r == rank else test_data[2][r]
+            for r in range(world_size)
+        ],  # all_rank_input: new payload on this rank only
+        test_data[3],  # all_rank_weights (unchanged)
+        test_data[4],  # all_rank_scales (unchanged)
     )
 
     rep_disp, _ = _do_dispatch(op, grad_test_data, routing=R)
@@ -198,6 +202,7 @@ def _replay_correctness(rank, world_size, kernel):
 
 
 def _multi_layer_correctness(rank, world_size, kernel, num_layers):
+    """Shared op + per-layer routing handles vs fresh op default path per layer."""
     config = _make_intranode_config(rank, world_size) if kernel == "intra" \
         else _make_internode_v1_config(rank, world_size)
 
@@ -222,21 +227,19 @@ def _multi_layer_correctness(rank, world_size, kernel, num_layers):
         tc.sync()
         layer_combine_out.append(out)
 
-    # Baseline: each layer through a fresh op.
+    # Baseline: fresh op per layer on the default (op-owned buffer) path.
     for L in range(num_layers):
         op_baseline = mori.ops.EpDispatchCombineOp(config)
         td = layer_data[L]
-        d, R = _do_dispatch(op_baseline, td, return_routing=True)
+        d, _ = _do_dispatch(op_baseline, td, return_routing=False)
         tc.sync()
-        out, _ = _do_combine(op_baseline, d, td[1][rank], routing=R)
+        out, _ = _do_combine(op_baseline, d, td[1][rank])
         tc.sync()
-        # Allow small numerical wobble across runs (different op instance,
-        # different CAS race), but layer outputs must be close.
         assert torch.allclose(
             out.float(), layer_combine_out[L].float(), atol=1e-2, rtol=1e-2
         ), (
-            f"rank {rank} layer {L}: shared-op combine differs from baseline; "
-            f"max diff = "
+            f"rank {rank} layer {L}: shared-op routing-handle combine differs from "
+            f"fresh-op default-path baseline; max diff = "
             f"{(out.float() - layer_combine_out[L].float()).abs().max().item()}"
         )
 
@@ -244,29 +247,27 @@ def _multi_layer_correctness(rank, world_size, kernel, num_layers):
 def _stale_symmetric_buffer_guard(rank, world_size):
     """Verify the disp_tok_id_to_src_tok_id_local snapshot is layer-private (IntraNode only)."""
     config = _make_intranode_config(rank, world_size)
-    op_shared = mori.ops.EpDispatchCombineOp(config)
+    # No-P2P combine reads disp_tok_id_to_src_tok_id_local; external inp buf forces that path.
+    config.use_external_inp_buf = False
     tc = EpDispatchCombineTestCase(config)
+    op_shared = mori.ops.EpDispatchCombineOp(config)
 
     td0 = _gen_layer_data(tc, seed=51)
     td1 = _gen_layer_data(tc, seed=151)
 
-    # No-P2P combine reads dispTokIdToSrcTokIdLocal; use_external_inp_buf=False forces it.
-    config_nop2p = _make_intranode_config(rank, world_size)
-    config_nop2p.use_external_inp_buf = False
-    op_shared_nop2p = mori.ops.EpDispatchCombineOp(config_nop2p)
-
-    d0, R0 = _do_dispatch(op_shared_nop2p, td0, return_routing=True)
+    d0, R0 = _do_dispatch(op_shared, td0, return_routing=True)
     tc.sync()
-    _ = _do_dispatch(op_shared_nop2p, td1, return_routing=True)
+    _ = _do_dispatch(op_shared, td1, return_routing=True)
     tc.sync()
 
-    out_shared, _ = _do_combine(op_shared_nop2p, d0, td0[1][rank], routing=R0)
+    out_shared, _ = _do_combine(op_shared, d0, td0[1][rank], routing=R0)
     tc.sync()
 
-    op_baseline = mori.ops.EpDispatchCombineOp(config_nop2p)
-    d_base, R_base = _do_dispatch(op_baseline, td0, return_routing=True)
+    # Fresh op, layer 0 only: combine reads op-owned symmetric inverse map (no snapshot).
+    op_baseline = mori.ops.EpDispatchCombineOp(config)
+    d_base, _ = _do_dispatch(op_baseline, td0, return_routing=False)
     tc.sync()
-    out_base, _ = _do_combine(op_baseline, d_base, td0[1][rank], routing=R_base)
+    out_base, _ = _do_combine(op_baseline, d_base, td0[1][rank])
     tc.sync()
 
     assert torch.allclose(
@@ -279,11 +280,11 @@ def _stale_symmetric_buffer_guard(rank, world_size):
 
 
 @pytest.mark.parametrize("kernel", ("intra", "v1"))
-def test_legacy_vs_routing_handle_parity(torch_dist_process_manager, kernel):
+def test_default_vs_routing_handle_parity(torch_dist_process_manager, kernel):
     world_size = 8
     for _ in range(world_size):
         torch_dist_process_manager.task_queue.put(
-            (_legacy_vs_routing_handle_parity, [world_size, kernel])
+            (_default_vs_routing_handle_parity, [world_size, kernel])
         )
     assert_worker_results(torch_dist_process_manager, world_size)
 

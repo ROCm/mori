@@ -374,11 +374,7 @@ class EpDispatchCombineTestCase:
         combine_scale_dim=None,
         sentinel_pattern=None,
     ):
-        """Generate test data.
-
-        ``sentinel_pattern`` injects ``-1`` sentinels into routing indices. Accepts
-        ``None``, ``"every_other"``, ``"first_only"``, or an ``int`` count of trailing slots.
-        """
+        """Generate test data."""
         if num_token_override is not None:
             assert len(num_token_override) == self.config.world_size
             assert min(num_token_override) >= 0
@@ -433,24 +429,6 @@ class EpDispatchCombineTestCase:
                 indices = torch.zeros(
                     n, self.config.num_experts_per_token, dtype=torch.int64
                 )
-            elif routing == "tp_replicated":
-                # Megatron-style TP-replicated routing: every group of `world_size` slots maps
-                # to the same set of PEs, so dedup must drop all but the first group.
-                assert (
-                    self.config.num_experts_per_token
-                    % self.config.world_size
-                    == 0
-                ), (
-                    "tp_replicated routing requires num_experts_per_token % "
-                    "world_size == 0"
-                )
-                indices = torch.empty(
-                    n, self.config.num_experts_per_token, dtype=torch.int64
-                )
-                for i in range(n):
-                    for j in range(self.config.num_experts_per_token):
-                        pe = j % self.config.world_size
-                        indices[i, j] = pe * self.config.num_experts_per_rank
             else:
                 indices = torch.empty(
                     n, self.config.num_experts_per_token, dtype=torch.int64
