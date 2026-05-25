@@ -100,6 +100,7 @@ int64_t BuildArgsWithRouting(mori::moe::EpDispatchCombineHandle& handle, int rdm
   routing.totalRecvTokenNum = reinterpret_cast<mori::moe::index_t*>(total_recv_token_num_ptr);
   routing.dispTokIdToSrcTokIdLocal =
       reinterpret_cast<mori::moe::index_t*>(disp_tok_id_to_src_tok_id_local_ptr);
+  routing.Validate();
 
   thread_local mori::moe::EpDispatchCombineArgsRaw args;
   args = mori::moe::GetEpDispatchCombineArgsRaw(handle, rdmaBlockNum, &routing, replayMode);

@@ -380,7 +380,9 @@ class EpDispatchCombineTestCase:
         dist.all_gather(output, padded_input)
         return output
 
-    def gen_test_data(self, max_num_token, use_max_token_num=False, only_my_rank=False):
+    def gen_test_data(
+        self, max_num_token, use_max_token_num=False, only_my_rank=False, sentinel_pattern=None
+    ):
         hidden_dim = self.dispatch_hidden_dim
         keep_ranks = {self.rank} if only_my_rank else set(range(self.world_size))
 
@@ -412,6 +414,21 @@ class EpDispatchCombineTestCase:
             indices = torch.argsort(random_vals, dim=1)[
                 :, : self.config.num_experts_per_token
             ]
+            if sentinel_pattern is not None and num_tok > 0:
+                k = self.config.num_experts_per_token
+                if sentinel_pattern == "every_other":
+                    sentinel_slots = list(range(1, k, 2))
+                elif sentinel_pattern == "first_only":
+                    sentinel_slots = list(range(1, k))
+                elif isinstance(sentinel_pattern, int):
+                    assert 0 <= sentinel_pattern < k, (
+                        f"sentinel_pattern={sentinel_pattern} must be in [0, k={k})"
+                    )
+                    sentinel_slots = list(range(k - sentinel_pattern, k))
+                else:
+                    raise ValueError(f"Unknown sentinel_pattern: {sentinel_pattern!r}")
+                for j in sentinel_slots:
+                    indices[:, j] = -1
             if r in keep_ranks:
                 all_rank_indices[r] = indices.to(torch.int32)
             del random_vals, indices
@@ -683,6 +700,7 @@ class EpDispatchCombineTestCase:
             pes = [
                 (idx // self.config.num_experts_per_rank)
                 for idx in all_rank_indices[self.rank][i].cpu().tolist()
+                if idx >= 0
             ]
             unique_pes = len(set(pes))
             unique_innode_pes = len(
@@ -786,6 +804,35 @@ class EpDispatchCombineTestCase:
             error_round,
         )
 
+        del op
+
+    def test_sentinel_dispatch_combine(self, sentinel_pattern="every_other", num_rounds=50):
+        """Default-path dispatch/combine with DeepEP-style -1 expert sentinels."""
+        if self.config.kernel_type not in (
+            mori.ops.EpDispatchCombineKernelType.InterNodeV1,
+            mori.ops.EpDispatchCombineKernelType.InterNodeV1LL,
+        ):
+            if self.rank == 0:
+                print(
+                    "test_sentinel_dispatch_combine: skipping non-V1 kernel "
+                    f"{self.config.kernel_type}"
+                )
+            return
+        error_round = set()
+        op = mori.ops.EpDispatchCombineOp(self.config)
+        for i in range(num_rounds):
+            if self.rank == 0:
+                print(f"Sentinel round {i} begin (pattern={sentinel_pattern!r})")
+            test_data = self.gen_test_data(
+                max_num_token=self.config.max_num_inp_token_per_rank,
+                use_max_token_num=False,
+                sentinel_pattern=sentinel_pattern,
+            )
+            self.run_test_once(op, test_data, error_round, i)
+        if self.rank == 0:
+            print(
+                f"Sentinel test done: {len(error_round)} failing rounds out of {num_rounds}"
+            )
         del op
 
     def stress_dispatch_combine(self):
@@ -1549,12 +1596,13 @@ def test_dispatch_combine(
     hidden_dim=7168,
     save_tuning_config=None,
     skip_verify=False,
+    sentinel_pattern="every_other",
 ):
     world_size = num_node * gpu_per_node
     node_rank = int(os.environ["RANK"])
     global_rank = node_rank * gpu_per_node + local_rank
 
-    if cmd in ("test", "bench", "stress", "profile", "tuning"):
+    if cmd in ("test", "bench", "stress", "profile", "tuning", "test_sentinel"):
         test_case = EpDispatchCombineTestCase(
             global_rank,
             gpu_per_node,
@@ -1571,6 +1619,10 @@ def test_dispatch_combine(
         test_case.setup()
         if cmd == "test":
             test_case.test_dispatch_combine()
+        elif cmd == "test_sentinel":
+            test_case.test_sentinel_dispatch_combine(
+                sentinel_pattern=sentinel_pattern,
+            )
         elif cmd == "bench":
             test_case.bench_dispatch_combine(
                 max_tokens,
@@ -1620,8 +1672,8 @@ parser.add_argument(
     "--cmd",
     type=str,
     default="test",
-    choices=["test", "bench", "stress", "sweep_bench", "profile", "tuning"],
-    help="Available subcommands: test, bench, stress, sweep_bench, profile, tuning",
+    choices=["test", "test_sentinel", "bench", "stress", "sweep_bench", "profile", "tuning"],
+    help="Available subcommands: test, test_sentinel, bench, stress, sweep_bench, profile, tuning",
 )
 parser.add_argument(
     "--dtype",
@@ -1717,6 +1769,15 @@ parser.add_argument(
     default=False,
     help="Skip correctness verification in bench mode to reduce GPU memory usage.",
 )
+parser.add_argument(
+    "--sentinel-pattern",
+    type=str,
+    default="every_other",
+    help=(
+        "DeepEP-style -1 sentinel injection for test_sentinel: every_other, "
+        "first_only, or an integer suffix count (e.g. 1)."
+    ),
+)
 args_cli = parser.parse_args()
 
 if __name__ == "__main__":
@@ -1729,6 +1790,10 @@ if __name__ == "__main__":
     )
     dispatch_dtype = _DATA_TYPE_MAP[args_cli.dtype]
     combine_dtype = _DATA_TYPE_MAP[combine_dtype_str]
+
+    sentinel_pattern = args_cli.sentinel_pattern
+    if sentinel_pattern.isdigit():
+        sentinel_pattern = int(sentinel_pattern)
 
     world_size = num_node * gpu_per_node
     torch.multiprocessing.spawn(
@@ -1751,6 +1816,7 @@ if __name__ == "__main__":
             args_cli.hidden_dim,
             args_cli.save_tuning_config,
             args_cli.skip_verify,
+            args_cli.sentinel_pattern,
         ),
         nprocs=gpu_per_node,
         join=True,

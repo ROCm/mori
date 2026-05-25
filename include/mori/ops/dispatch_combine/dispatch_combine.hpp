@@ -85,6 +85,7 @@ inline size_t GetHipDataTypeSize(hipDataType dtype) {
 using index_t = int32_t;
 
 // Caller-owned routing pointers for DeepEP-style cached-mode dispatch/combine.
+// All fields must be non-null when passed to GetEpDispatchCombineArgsRaw(..., routing, ...).
 struct EpDispatchCombineRoutingPtrs {
   index_t* dispDestTokIdMap{nullptr};
   index_t* interNodeDispDestTokIdMap{nullptr};
@@ -92,7 +93,14 @@ struct EpDispatchCombineRoutingPtrs {
   index_t* totalRecvTokenNum{nullptr};
   index_t* dispTokIdToSrcTokIdLocal{nullptr};
 
-  bool IsValid() const { return dispDestTokIdMap != nullptr; }
+  bool IsValid() const {
+    return dispDestTokIdMap != nullptr && interNodeDispDestTokIdMap != nullptr &&
+           interNodeDispSendMap != nullptr && totalRecvTokenNum != nullptr &&
+           dispTokIdToSrcTokIdLocal != nullptr;
+  }
+
+  // Throws std::invalid_argument listing any null required pointer.
+  void Validate() const;
 };
 
 #define MAX_EXPERTS_PER_TOKEN (9)

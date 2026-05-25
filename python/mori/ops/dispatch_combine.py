@@ -537,6 +537,18 @@ class EpDispatchCombineOp:
             EpDispatchCombineKernelType.InterNodeV1.value,
         )
 
+    @staticmethod
+    def _routing_source_token_count(routing: EpDispatchRoutingHandle) -> int:
+        """Return the mode-1 source token count stored in a routing handle."""
+        n = int(routing.cur_rank_num_token)
+        if n <= 0:
+            raise ValueError(
+                "routing handle has cur_rank_num_token <= 0; use a handle from "
+                "dispatch(..., return_routing=True) or pass a positive "
+                "cur_rank_num_token to EpDispatchRoutingHandle.from_tensors(...)"
+            )
+        return n
+
     def _build_args_routing(
         self,
         routing,
@@ -588,6 +600,15 @@ class EpDispatchCombineOp:
             )
         if return_routing:
             routing = self._alloc_routing_handle()
+
+        num_tokens = int(input.size(0))
+        if is_replay:
+            replay_n = self._routing_source_token_count(routing)
+            if num_tokens != replay_n:
+                raise ValueError(
+                    f"replay dispatch input has {num_tokens} tokens but "
+                    f"routing.cur_rank_num_token={replay_n}"
+                )
 
         hidden_dim = input.size(1)
         weight_ptr = weights.data_ptr() if weights is not None else 0
@@ -845,7 +866,7 @@ class EpDispatchCombineOp:
         )
         is_zero_copy = not actual_use_ext
         cur_n = (
-            routing.cur_rank_num_token
+            self._routing_source_token_count(routing)
             if routing is not None
             else self._get_cur_rank_num_token(self._handle)
         )

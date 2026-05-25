@@ -48,7 +48,11 @@ def _make_intranode_config(rank, world_size):
     )
 
 
-def _make_internode_v1_config(rank, world_size):
+def _make_internode_v1_config(rank, world_size, gpu_per_node=None):
+    # Default: single-node layout (n_nodes==1). Pass gpu_per_node < world_size
+    # to emulate multi-node RDMA paths on a single multi-GPU host.
+    if gpu_per_node is None:
+        gpu_per_node = world_size
     return mori.ops.EpDispatchCombineConfig(
         data_type=torch.bfloat16,
         rank=rank,
@@ -64,7 +68,7 @@ def _make_internode_v1_config(rank, world_size):
         rdma_block_num=64,
         warp_num_per_block=8,
         kernel_type=mori.ops.EpDispatchCombineKernelType.InterNodeV1,
-        gpu_per_node=world_size,
+        gpu_per_node=gpu_per_node,
     )
 
 
@@ -113,12 +117,12 @@ def _do_combine(op, dispatch_out, indices_local, *, routing=None):
     return out[:n].clone(), (out_w[:n].clone() if out_w is not None else None)
 
 
-def _default_vs_routing_handle_parity(rank, world_size, kernel):
+def _default_vs_routing_handle_parity(rank, world_size, kernel, gpu_per_node=None):
     """Mode-1 default path (op-owned buffers) vs routing-handle path must match."""
     config = (
         _make_intranode_config(rank, world_size)
         if kernel == "intra"
-        else _make_internode_v1_config(rank, world_size)
+        else _make_internode_v1_config(rank, world_size, gpu_per_node=gpu_per_node)
     )
 
     op_default = mori.ops.EpDispatchCombineOp(config)
@@ -145,12 +149,13 @@ def _default_vs_routing_handle_parity(rank, world_size, kernel):
     )
 
 
-def _replay_correctness(rank, world_size, kernel):
+def _replay_correctness(rank, world_size, kernel, gpu_per_node=None):
     config = (
         _make_intranode_config(rank, world_size)
         if kernel == "intra"
-        else _make_internode_v1_config(rank, world_size)
+        else _make_internode_v1_config(rank, world_size, gpu_per_node=gpu_per_node)
     )
+    n_nodes = max(1, world_size // config.gpu_per_node)
 
     op = mori.ops.EpDispatchCombineOp(config)
     tc = EpDispatchCombineTestCase(config)
@@ -161,6 +166,8 @@ def _replay_correctness(rank, world_size, kernel):
     tc.sync()
     pre_disp_dest = R.disp_dest_tok_id_map.clone()
     pre_total_recv = R.total_recv_token_num.clone()
+    pre_inter_send = R.inter_node_disp_send_map.clone()
+    pre_inter_dest = R.inter_node_disp_dest_tok_id_map.clone()
 
     combine_out, _ = _do_combine(op, fwd_disp, rank_idx, routing=R)
     tc.sync()
@@ -194,6 +201,18 @@ def _replay_correctness(rank, world_size, kernel):
     assert torch.equal(
         R.total_recv_token_num, pre_total_recv
     ), f"rank {rank}: totalRecvTokenNum changed after replay dispatch"
+    assert torch.equal(
+        R.inter_node_disp_send_map, pre_inter_send
+    ), f"rank {rank}: interNodeDispSendMap changed after replay dispatch"
+    assert torch.equal(
+        R.inter_node_disp_dest_tok_id_map, pre_inter_dest
+    ), f"rank {rank}: interNodeDispDestTokIdMap changed after replay dispatch"
+
+    if kernel == "v1" and n_nodes > 1:
+        assert pre_inter_send.abs().sum() > 0 or pre_inter_dest.abs().sum() > 0, (
+            f"rank {rank}: expected non-zero inter-node routing maps after "
+            f"mode-1 dispatch (n_nodes={n_nodes})"
+        )
 
     assert rep_disp["total_recv"] == fwd_disp["total_recv"], (
         f"rank {rank}: replay total_recv {rep_disp['total_recv']} differs from "
@@ -202,12 +221,12 @@ def _replay_correctness(rank, world_size, kernel):
     assert combine_out is not None
 
 
-def _multi_layer_correctness(rank, world_size, kernel, num_layers):
+def _multi_layer_correctness(rank, world_size, kernel, num_layers, gpu_per_node=None):
     """Shared op + per-layer routing handles vs fresh op default path per layer."""
     config = (
         _make_intranode_config(rank, world_size)
         if kernel == "intra"
-        else _make_internode_v1_config(rank, world_size)
+        else _make_internode_v1_config(rank, world_size, gpu_per_node=gpu_per_node)
     )
 
     op_shared = mori.ops.EpDispatchCombineOp(config)
@@ -284,6 +303,7 @@ def _stale_symmetric_buffer_guard(rank, world_size):
 
 @pytest.mark.parametrize("kernel", ("intra", "v1"))
 def test_default_vs_routing_handle_parity(torch_dist_process_manager, kernel):
+    """InterNodeV1 (``kernel=v1``) uses ``gpu_per_node=world_size`` → single-node paths only."""
     world_size = 8
     for _ in range(world_size):
         torch_dist_process_manager.task_queue.put(
@@ -294,6 +314,7 @@ def test_default_vs_routing_handle_parity(torch_dist_process_manager, kernel):
 
 @pytest.mark.parametrize("kernel", ("intra", "v1"))
 def test_replay_correctness(torch_dist_process_manager, kernel):
+    """InterNodeV1 (``kernel=v1``) uses ``gpu_per_node=world_size`` → single-node paths only."""
     world_size = 8
     for _ in range(world_size):
         torch_dist_process_manager.task_queue.put(
@@ -302,13 +323,53 @@ def test_replay_correctness(torch_dist_process_manager, kernel):
     assert_worker_results(torch_dist_process_manager, world_size)
 
 
+def test_default_vs_routing_handle_parity_v1_two_nodes(torch_dist_process_manager):
+    """InterNodeV1 with ``gpu_per_node=4``: 2-node RDMA paths + routing-handle parity."""
+    world_size = 8
+    gpu_per_node = 4
+    for _ in range(world_size):
+        torch_dist_process_manager.task_queue.put(
+            (
+                _default_vs_routing_handle_parity,
+                [world_size, "v1", gpu_per_node],
+            )
+        )
+    assert_worker_results(torch_dist_process_manager, world_size)
+
+
+def test_replay_correctness_v1_two_nodes(torch_dist_process_manager):
+    """InterNodeV1 replay with ``gpu_per_node=4``: exercises inter-node map caching."""
+    world_size = 8
+    gpu_per_node = 4
+    for _ in range(world_size):
+        torch_dist_process_manager.task_queue.put(
+            (_replay_correctness, [world_size, "v1", gpu_per_node])
+        )
+    assert_worker_results(torch_dist_process_manager, world_size)
+
+
 @pytest.mark.parametrize("kernel", ("intra", "v1"))
 @pytest.mark.parametrize("num_layers", (2, 4))
 def test_multi_layer_correctness(torch_dist_process_manager, kernel, num_layers):
+    """InterNodeV1 (``kernel=v1``) uses ``gpu_per_node=world_size`` → single-node paths only."""
     world_size = 8
     for _ in range(world_size):
         torch_dist_process_manager.task_queue.put(
             (_multi_layer_correctness, [world_size, kernel, num_layers])
+        )
+    assert_worker_results(torch_dist_process_manager, world_size)
+
+
+def test_multi_layer_correctness_v1_two_nodes(torch_dist_process_manager):
+    """InterNodeV1 multi-layer routing with ``gpu_per_node=4`` (2 emulated nodes)."""
+    world_size = 8
+    gpu_per_node = 4
+    for _ in range(world_size):
+        torch_dist_process_manager.task_queue.put(
+            (
+                _multi_layer_correctness,
+                [world_size, "v1", 2, gpu_per_node],
+            )
         )
     assert_worker_results(torch_dist_process_manager, world_size)
 

@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <stdexcept>
+#include <string>
 
 #include "mori/core/core.hpp"
 #include "mori/shmem/internal.hpp"
@@ -522,13 +523,32 @@ EpDispatchCombineArgsRaw GetEpDispatchCombineArgsRaw(const EpDispatchCombineHand
   return args;
 }
 
+void EpDispatchCombineRoutingPtrs::Validate() const {
+  if (IsValid()) return;
+  std::string missing;
+  auto append = [&](const char* name, const index_t* ptr) {
+    if (ptr == nullptr) {
+      if (!missing.empty()) missing += ", ";
+      missing += name;
+    }
+  };
+  append("dispDestTokIdMap", dispDestTokIdMap);
+  append("interNodeDispDestTokIdMap", interNodeDispDestTokIdMap);
+  append("interNodeDispSendMap", interNodeDispSendMap);
+  append("totalRecvTokenNum", totalRecvTokenNum);
+  append("dispTokIdToSrcTokIdLocal", dispTokIdToSrcTokIdLocal);
+  throw std::invalid_argument(
+      "EpDispatchCombineRoutingPtrs: missing required routing pointer(s): " + missing);
+}
+
 EpDispatchCombineArgsRaw GetEpDispatchCombineArgsRaw(const EpDispatchCombineHandle& handle,
                                                      int rdmaBlockNum,
                                                      const EpDispatchCombineRoutingPtrs* routing,
                                                      bool replayMode) {
   EpDispatchCombineArgsRaw args = GetEpDispatchCombineArgsRaw(handle, rdmaBlockNum);
   args.replayMode = replayMode;
-  if (routing != nullptr && routing->IsValid()) {
+  if (routing != nullptr) {
+    routing->Validate();
     args.dispDestTokIdMap = routing->dispDestTokIdMap;
     args.interNodeDispDestTokIdMap = routing->interNodeDispDestTokIdMap;
     args.interNodeDispSendMap = routing->interNodeDispSendMap;
