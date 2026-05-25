@@ -104,9 +104,10 @@ static void run_rank(int rank, int nranks, const mori::application::UniqueId& ui
   }
   printf("[rank %d] WindowRegister x2 OK\n", rank);
 
-  // Phase 3: DevCommCreate
+  // Phase 3: DevCommCreate with default requirements
+  mori::cco::CcoDevCommRequirements reqs = CCO_DEV_COMM_REQUIREMENTS_INITIALIZER;
   mori::cco::CcoDevComm* devComm = nullptr;
-  ret = mori::cco::CcoDevCommCreate(comm, &devComm);
+  ret = mori::cco::CcoDevCommCreate(comm, &reqs, &devComm);
   if (ret != 0) {
     snprintf(result->detail, sizeof(result->detail), "DevCommCreate failed: %d", ret);
     mori::cco::CcoWindowDeregister(comm, win2);

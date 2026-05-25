@@ -74,16 +74,17 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
     return 1;
   }
 
-  // ── Create DevComm #1 ──
+  // ── Create DevComm #1 (default requirements) ──
+  mori::cco::CcoDevCommRequirements reqs = CCO_DEV_COMM_REQUIREMENTS_INITIALIZER;
   mori::cco::CcoDevComm* devComm1 = nullptr;
-  if (mori::cco::CcoDevCommCreate(comm, &devComm1) != 0) {
+  if (mori::cco::CcoDevCommCreate(comm, &reqs, &devComm1) != 0) {
     fprintf(stderr, "[rank %d] DevCommCreate #1 failed\n", rank);
     return 1;
   }
 
   // ── Create DevComm #2 (fresh QPs, independent from #1) ──
   mori::cco::CcoDevComm* devComm2 = nullptr;
-  if (mori::cco::CcoDevCommCreate(comm, &devComm2) != 0) {
+  if (mori::cco::CcoDevCommCreate(comm, &reqs, &devComm2) != 0) {
     fprintf(stderr, "[rank %d] DevCommCreate #2 failed\n", rank);
     return 1;
   }

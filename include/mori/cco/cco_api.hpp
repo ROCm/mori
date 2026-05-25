@@ -33,7 +33,14 @@ int CcoWindowRegister(CcoComm* comm, void* ptr, size_t size, CcoWindow_t* win);
 int CcoWindowDeregister(CcoComm* comm, CcoWindow_t win);
 
 // ── Phase 3: Device communicator ──
-int CcoDevCommCreate(CcoComm* comm, CcoDevComm** devComm);
+//
+// Initialize `reqs` via CCO_DEV_COMM_REQUIREMENTS_INITIALIZER and override
+// per-DevComm settings (gdaSignalCount, gdaConnectionType, ...) as needed.
+// `reqs` must not be NULL; passing NULL or a struct without the magic/version
+// triplet results in an error return (binary forward-compat check).
+int CcoDevCommCreate(CcoComm* comm,
+                     const CcoDevCommRequirements* reqs,
+                     CcoDevComm** devComm);
 int CcoDevCommDestroy(CcoDevComm* devComm);
 
 // ── Host barrier ──

@@ -48,7 +48,54 @@ int CcoCommCreate(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
 
   // Step 2: context (RDMA endpoints, transport type negotiation)
   comm->ctx = new application::Context(*comm->bootNet);
-  comm->numQpPerPe = comm->ctx->GetNumQpPerPe();
+  comm->defaultNumQpPerPe = comm->ctx->GetNumQpPerPe();
+
+  // Step 2.5: detect intra-node topology (lsa = "local symmetric access").
+  // Use hipDeviceCanAccessPeer between rank 0's device and each other rank
+  // is not feasible cross-process — instead use the bootstrap to Allgather a
+  // "node identifier" (e.g. hostname hash or rank 0's pid) and group ranks
+  // that share the same identifier. We already gathered allPids above for
+  // groupId derivation; the same pid means same process tree but NOT same
+  // node when MPI launches one process per GPU.
+  //
+  // Use Context::GetTransportType: any peer whose transport is P2P is on the
+  // same physical node (since P2P implies xGMI/NVLink access). Collect such
+  // peers and compute lsaSize/lsaRank/myNodeStart from the contiguous run.
+  //
+  // ASSUMPTION (matches mori shmem conventions): rank layout is contiguous
+  // within each node — i.e. ranks 0..lsaSize-1 are on node 0,
+  // lsaSize..2*lsaSize-1 are on node 1, etc. Validated below.
+  {
+    int lsaCount = 0;
+    int firstSameNode = comm->rank;
+    int lastSameNode = comm->rank;
+    for (int pe = 0; pe < comm->worldSize; pe++) {
+      bool sameNode = (pe == comm->rank) ||
+                      (comm->ctx->GetTransportType(pe) ==
+                       application::TransportType::P2P) ||
+                      (comm->ctx->GetTransportType(pe) ==
+                       application::TransportType::SDMA);
+      if (sameNode) {
+        if (pe < firstSameNode) firstSameNode = pe;
+        if (pe > lastSameNode) lastSameNode = pe;
+        lsaCount++;
+      }
+    }
+    comm->lsaSize = lsaCount;
+    comm->myNodeStart = firstSameNode;
+    comm->lsaRank = comm->rank - firstSameNode;
+
+    // Sanity: contiguous block of [firstSameNode, lastSameNode]
+    if (lastSameNode - firstSameNode + 1 != lsaCount) {
+      MORI_SHMEM_WARN("CcoCommCreate: non-contiguous lsa membership detected "
+                      "(first={} last={} count={}); team math assumes contiguous "
+                      "node-major rank layout",
+                      firstSameNode, lastSameNode, lsaCount);
+    }
+    MORI_SHMEM_INFO("CcoCommCreate: lsa topology rank={} lsaSize={} lsaRank={} "
+                    "myNodeStart={}",
+                    comm->rank, comm->lsaSize, comm->lsaRank, comm->myNodeStart);
+  }
 
   // Step 3: reserve contiguous VA for flat address space
   // If user passes 0, default to GPU total memory.
@@ -108,34 +155,16 @@ int CcoCommCreate(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
   HIP_RUNTIME_CHECK(hipMalloc(&comm->internalSyncGpuPtr, INTERNAL_SYNC_BYTES));
   HIP_RUNTIME_CHECK(hipMemset(comm->internalSyncGpuPtr, 0, INTERNAL_SYNC_BYTES));
 
-  // Step 6: RDMA endpoints
-  if (comm->ctx->RdmaTransportEnabled()) {
-    const auto& hostEps = comm->ctx->GetRdmaEndpoints();
-    size_t numEps = static_cast<size_t>(comm->worldSize) * comm->numQpPerPe;
-    comm->rdmaEndpoints.resize(numEps);
-    for (size_t i = 0; i < numEps; i++) {
-      comm->rdmaEndpoints[i].vendorId = hostEps[i].vendorId;
-      comm->rdmaEndpoints[i].qpn = hostEps[i].handle.qpn;
-      comm->rdmaEndpoints[i].wqHandle = hostEps[i].wqHandle;
-      comm->rdmaEndpoints[i].cqHandle = hostEps[i].cqHandle;
-      comm->rdmaEndpoints[i].atomicIbuf = hostEps[i].atomicIbuf;
-    }
-  }
+  // Note: per-DevComm RDMA QP endpoints are no longer pre-allocated here.
+  // They are created lazily in CcoDevCommCreate via ctx->CreateAdditionalEndpoints,
+  // sized by CcoDevCommRequirements::gdaContextCount. This lets multiple
+  // independent DevComms coexist on the same Comm with different QP counts.
 
   MORI_SHMEM_INFO("CcoCommCreate: rank={}/{} groupId={} flatBase={} perRankSize={} "
-                  "granularity={} numQpPerPe={} sdmaNumQueue={} rdma={}",
+                  "granularity={} defaultNumQpPerPe={} sdmaNumQueue={} rdma={}",
                   comm->rank, comm->worldSize, comm->groupId, comm->flatBase, comm->perRankSize,
-                  comm->vmmGranularity, comm->numQpPerPe, comm->sdmaNumQueue,
+                  comm->vmmGranularity, comm->defaultNumQpPerPe, comm->sdmaNumQueue,
                   comm->ctx->RdmaTransportEnabled());
-  if (!comm->rdmaEndpoints.empty()) {
-    for (int pe = 0; pe < comm->worldSize; pe++) {
-      for (int qp = 0; qp < comm->numQpPerPe; qp++) {
-        auto& ep = comm->rdmaEndpoints[pe * comm->numQpPerPe + qp];
-        MORI_SHMEM_INFO("  QP[pe={},qp={}]: vendor={:#x} qpn={}", pe, qp,
-                        static_cast<uint32_t>(ep.vendorId), ep.qpn);
-      }
-    }
-  }
   return 0;
 }
 
@@ -293,27 +322,72 @@ int CcoMemFree(CcoComm* comm, void* ptr) {
 /*                            CcoDevCommCreate                             */
 /* ========================================================================== */
 
-int CcoDevCommCreate(CcoComm* comm, CcoDevComm** outDevComm) {
+int CcoDevCommCreate(CcoComm* comm,
+                     const CcoDevCommRequirements* reqs,
+                     CcoDevComm** outDevComm) {
   MORI_SHMEM_TRACE("CcoDevCommCreate: rank={}", comm->rank);
+
+  // ── forward-compat: validate reqs ──
+  if (reqs == nullptr) {
+    MORI_SHMEM_ERROR("CcoDevCommCreate: reqs is NULL — must initialize via "
+                     "CCO_DEV_COMM_REQUIREMENTS_INITIALIZER");
+    return -1;
+  }
+  if (reqs->magic != CCO_API_MAGIC) {
+    MORI_SHMEM_ERROR("CcoDevCommCreate: reqs->magic mismatch (got {:#x}, expect {:#x}) — "
+                     "must initialize via CCO_DEV_COMM_REQUIREMENTS_INITIALIZER",
+                     reqs->magic, CCO_API_MAGIC);
+    return -1;
+  }
+  if (reqs->version > CCO_API_VERSION) {
+    MORI_SHMEM_WARN("CcoDevCommCreate: reqs->version={} > runtime CCO_API_VERSION={}",
+                    reqs->version, CCO_API_VERSION);
+  }
+
+  // Sanitize / log connection type
+  CcoGdaConnectionType connType = reqs->gdaConnectionType;
+  if (connType == CCO_GDA_CONNECTION_FULL ||
+      connType == CCO_GDA_CONNECTION_RAIL) {
+    MORI_SHMEM_WARN("CcoDevCommCreate: gdaConnectionType={} (FULL/RAIL) not yet "
+                    "implemented; falling back to CROSSNODE semantics. "
+                    "QP allocation is driven by Context::CreateAdditionalEndpoints "
+                    "which already skips P2P-reachable peers.",
+                    static_cast<int>(connType));
+    connType = CCO_GDA_CONNECTION_CROSSNODE;
+  }
+  // Auto-downgrade CROSSNODE to NONE on single-node deployments
+  if (connType == CCO_GDA_CONNECTION_CROSSNODE && comm->lsaSize == comm->worldSize) {
+    MORI_SHMEM_TRACE("CcoDevCommCreate: single-node deployment, downgrading "
+                     "CROSSNODE -> NONE (no cross-node peers)");
+    connType = CCO_GDA_CONNECTION_NONE;
+  }
 
   CcoDevComm hostShadow = {};
   hostShadow.rank = comm->rank;
   hostShadow.worldSize = comm->worldSize;
+  hostShadow.lsaSize = comm->lsaSize;
+  hostShadow.lsaRank = comm->lsaRank;
+  hostShadow.myNodeStart = comm->myNodeStart;
+  hostShadow.gdaConnType = connType;
   hostShadow.flatBase = comm->flatBase;
   hostShadow.perRankSize = comm->perRankSize;
   hostShadow.internalSyncPtr = comm->internalSyncGpuPtr;
 
-  // ── IBGDA Context: create fresh QP set (independent from previous DevComms) ──
+  // ── IBGDA Context: create fresh QP set per DevComm ──
   CcoIbgdaContext& ibgda = hostShadow.ibgda;
-  ibgda.numQpPerPe = comm->numQpPerPe;
+  int numQpPerPe = reqs->gdaContextCount > 0 ? reqs->gdaContextCount
+                                              : comm->defaultNumQpPerPe;
+  ibgda.numQpPerPe = numQpPerPe;
 
-  size_t numEps = static_cast<size_t>(comm->worldSize) * comm->numQpPerPe;
+  size_t numEps = static_cast<size_t>(comm->worldSize) * numQpPerPe;
   shmem::ShmemRdmaEndpoint* epsGpu = nullptr;
 
-  if (comm->ctx->RdmaTransportEnabled()) {
-    // Create and connect fresh QPs (collective: all ranks must call together)
-    auto newEps = comm->ctx->CreateAdditionalEndpoints(comm->numQpPerPe);
-    comm->ctx->ConnectAdditionalEndpoints(newEps, comm->numQpPerPe);
+  if (connType != CCO_GDA_CONNECTION_NONE && comm->ctx->RdmaTransportEnabled()) {
+    // Create and connect fresh QPs (collective: all ranks must call together).
+    // Context internally only allocates QPs for transportType==RDMA peers,
+    // which corresponds to cross-node — this is the CROSSNODE behavior.
+    auto newEps = comm->ctx->CreateAdditionalEndpoints(numQpPerPe);
+    comm->ctx->ConnectAdditionalEndpoints(newEps, numQpPerPe);
 
     // Convert to ShmemRdmaEndpoint format
     std::vector<shmem::ShmemRdmaEndpoint> shmemEps(numEps);
@@ -366,8 +440,9 @@ int CcoDevCommCreate(CcoComm* comm, CcoDevComm** outDevComm) {
                    numNodes);
 
   // ── IBGDA Context: Signal / Counter buffers ──
-  int signalCount = comm->signalCount;
-  int counterCount = comm->counterCount;
+  // Only allocate when GDA is enabled (NONE => skip).
+  int signalCount = (connType == CCO_GDA_CONNECTION_NONE) ? 0 : reqs->gdaSignalCount;
+  int counterCount = (connType == CCO_GDA_CONNECTION_NONE) ? 0 : reqs->gdaCounterCount;
   ibgda.signalCount = signalCount;
   ibgda.counterCount = counterCount;
 
