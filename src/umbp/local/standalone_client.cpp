@@ -267,9 +267,10 @@ size_t StandaloneClient::BatchExistsConsecutive(const std::vector<std::string>& 
 // Lifecycle
 // ---------------------------------------------------------------------------
 
-void StandaloneClient::Clear() {
+bool StandaloneClient::Clear() {
   index_.Clear();
   storage_.Clear();
+  return true;
 }
 
 bool StandaloneClient::Flush() { return storage_.Flush(); }

@@ -86,8 +86,13 @@ class IUMBPClient {
 
   // ---- Lifecycle ----
 
-  /// Remove all stored entries.
-  virtual void Clear() = 0;
+  /// Remove all stored entries.  Returns true when the empty state is
+  /// reached: vacuously so when the client is uninitialised or already
+  /// closed, otherwise only after the underlying convergence (e.g. a
+  /// distributed full-sync) has been acknowledged.  Returns false only
+  /// when a synchronous convergence attempt actually failed; callers
+  /// should treat that as incomplete.
+  virtual bool Clear() = 0;
 
   /// Persist all pending write-back data.
   virtual bool Flush() = 0;

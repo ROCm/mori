@@ -416,6 +416,38 @@ def test_umbpclient_revoke_all_external_kv_blocks_at_tier_alias(master_address):
         assert set(matches[0].hashes_by_tier[UMBPTierType.DRAM]) == set(hashes)
 
 
+def test_umbpclient_clear_removes_external_kv_immediately(master_address):
+    node_id = "clear-external-node"
+    hashes = _make_hashes("clear-external", 3)
+
+    with _registered_client(master_address, node_id) as client:
+        assert client.report_external_kv_blocks(hashes, UMBPTierType.DRAM)
+
+        query = UMBPMasterClient(master_address)
+        assert any(m.node_id == node_id for m in query.match_external_kv(hashes))
+
+        assert client.clear()
+        assert all(m.node_id != node_id for m in query.match_external_kv(hashes))
+
+
+def test_umbpclient_clear_allows_rebind_and_second_clear(master_address):
+    node_id = "clear-rebind-node"
+    hashes = _make_hashes("clear-rebind", 2)
+
+    with _registered_client(master_address, node_id) as client:
+        assert client.report_external_kv_blocks(hashes, UMBPTierType.DRAM)
+        assert client.clear()
+
+        query = UMBPMasterClient(master_address)
+        assert all(m.node_id != node_id for m in query.match_external_kv(hashes))
+
+        assert client.report_external_kv_blocks(hashes, UMBPTierType.DRAM)
+        assert any(m.node_id == node_id for m in query.match_external_kv(hashes))
+
+        assert client.clear()
+        assert all(m.node_id != node_id for m in query.match_external_kv(hashes))
+
+
 def test_bind_empty_hashes_is_noop(master_address):
     with _registered_client(master_address, "empty-bind-node") as client:
         _bind(client, [], UMBPTierType.DRAM)

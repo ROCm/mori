@@ -79,13 +79,17 @@ class PoolClient {
   bool Init();
   void Shutdown();
 
-  // Drop every locally-owned key, cancel in-flight pending writes, and
-  // ask master to collapse this node's index via a full-sync empty
-  // snapshot.  Returns immediately — convergence happens on the next
-  // heartbeat tick (which is woken eagerly).  See ClearLocal() /
-  // RequestClearFullSync() for the semantics of the write gate and the
+  // Drop every locally-owned key, cancel in-flight pending writes, clear
+  // external HiCache placement, and ask master to collapse this node's
+  // index via full-sync empty snapshots.  Returns true when the target
+  // empty state is reached: vacuously so if the client is uninitialised
+  // or no master is configured, otherwise only after master acknowledges
+  // both clear full-sync snapshots before this call returns.  Returns
+  // false only on an actual synchronous full-sync RPC failure; the
+  // heartbeat loop will then retry until convergence.  See ClearLocal()
+  // / ClearFullSync() for the semantics of the write gate and the
   // best-effort caveat around in-flight remote reads.
-  void Clear();
+  bool Clear();
 
   const std::string& NodeId() const { return config_.master_config.node_id; }
 

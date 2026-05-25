@@ -370,6 +370,11 @@ grpc::Status MasterClient::BatchLookup(const std::vector<std::string>& keys,
 void MasterClient::SetPeerDramAllocator(PeerDramAllocator* alloc) { peer_alloc_ = alloc; }
 
 void MasterClient::RequestClearFullSync() {
+  {
+    std::lock_guard state_lock(hb_state_mutex_);
+    external_pending_events_.clear();
+    external_current_set_.clear();
+  }
   // Mark in-flight first so a heartbeat that races with us still
   // sees we owe an ack-callback.
   clear_full_sync_in_flight_.store(true);
@@ -382,6 +387,55 @@ void MasterClient::RequestClearFullSync() {
   }
   std::lock_guard lock(hb_cv_mutex_);
   hb_cv_.notify_all();
+}
+
+bool MasterClient::ClearFullSync() {
+  std::lock_guard send_lock(hb_send_mutex_);
+  if (!registered_) return false;
+
+  {
+    std::lock_guard state_lock(hb_state_mutex_);
+    external_pending_events_.clear();
+    external_current_set_.clear();
+  }
+
+  // Mark in-flight before sending so failed attempts leave the write gate
+  // closed until a later heartbeat retry succeeds.
+  clear_full_sync_in_flight_.store(true);
+  clear_full_sync_requested_.store(false);
+
+  std::map<TierType, TierCapacity> caps;
+  if (peer_alloc_ != nullptr) {
+    caps = peer_alloc_->TierCapacitiesSnapshot();
+    std::lock_guard lock(caps_mutex_);
+    for (auto& [t, c] : current_capacities_) {
+      if (caps.find(t) == caps.end()) caps[t] = c;
+    }
+    current_capacities_ = caps;
+  } else {
+    std::lock_guard lock(caps_mutex_);
+    caps = current_capacities_;
+  }
+
+  std::map<TierType, uint64_t> kv_counts;
+  if (peer_alloc_ != nullptr) kv_counts = peer_alloc_->OwnedKeyCountByTier();
+
+  if (!SendFullSyncLocked(FullSyncScope::UMBP_OWNED, caps, kv_counts)) {
+    clear_full_sync_requested_.store(true);
+    return false;
+  }
+  // EXTERNAL_HICACHE retry is idempotent because this method has already
+  // emptied external_current_set_ under hb_state_mutex_.
+  if (!SendFullSyncLocked(FullSyncScope::EXTERNAL_HICACHE, caps, kv_counts)) {
+    clear_full_sync_requested_.store(true);
+    return false;
+  }
+
+  if (clear_full_sync_in_flight_.exchange(false) && peer_alloc_ != nullptr) {
+    peer_alloc_->ClearFullSyncAcked();
+    MORI_UMBP_INFO("[Client] Clear full-sync acked by master; allocator writes re-enabled");
+  }
+  return true;
 }
 
 void MasterClient::StartHeartbeat() {

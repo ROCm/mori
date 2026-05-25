@@ -61,7 +61,7 @@ class DistributedClient : public IUMBPClient {
   std::vector<bool> BatchExists(const std::vector<std::string>& keys) const override;
   size_t BatchExistsConsecutive(const std::vector<std::string>& keys) const override;
 
-  void Clear() override;
+  bool Clear() override;
   bool Flush() override;
   void Close() override;
   bool IsDistributed() const override;

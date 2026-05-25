@@ -233,17 +233,25 @@ void DistributedClient::DeregisterMemory(uintptr_t ptr) {
 // Lifecycle
 // ---------------------------------------------------------------------------
 
-void DistributedClient::Clear() {
-  if (closing_) return;
+bool DistributedClient::Clear() {
+  // Vacuously done during shutdown / teardown: there is no live client to
+  // converge with master, so callers in close paths should not see a
+  // spurious failure.
+  if (closing_) return true;
   // Exclusive lock: Clear races with every Put/Get/Batch* (which take
   // shared_lock) and with Close (which takes unique_lock).  Holding it
   // here keeps local in-flight public API calls out of the clear
   // window — remote in-flight RDMA reads are not in scope (best
   // effort; see distributed-clear-full-sync-plan-zh.md).
   std::unique_lock lk(op_mutex_);
-  if (closed_ || !pool_client_) return;
-  pool_client_->Clear();
-  MORI_UMBP_INFO("[DistributedClient] Clear() requested full-sync empty snapshot");
+  if (closed_ || !pool_client_) return true;
+  const bool ok = pool_client_->Clear();
+  if (ok) {
+    MORI_UMBP_INFO("[DistributedClient] Clear() completed full-sync empty snapshot");
+  } else {
+    MORI_UMBP_WARN("[DistributedClient] Clear() full-sync empty snapshot failed");
+  }
+  return ok;
 }
 
 bool DistributedClient::Flush() {

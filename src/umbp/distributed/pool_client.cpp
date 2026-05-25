@@ -353,10 +353,19 @@ void PoolClient::Shutdown() {
   master_client_.reset();
 }
 
-void PoolClient::Clear() {
-  if (!initialized_.load()) return;
+bool PoolClient::Clear() {
+  // Vacuously done: nothing has been initialized so there is no state to
+  // clear and no master to notify.  Treat as success so callers in
+  // shutdown / teardown paths do not surface a spurious error.
+  if (!initialized_.load()) return true;
   if (peer_alloc_) peer_alloc_->ClearLocal();
-  if (master_client_) master_client_->RequestClearFullSync();
+  if (master_client_) {
+    if (!master_client_->ClearFullSync()) {
+      MORI_UMBP_WARN("[PoolClient] Clear full-sync heartbeat failed");
+      return false;
+    }
+  }
+  return true;
 }
 
 bool PoolClient::IsInitialized() const { return initialized_; }

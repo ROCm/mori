@@ -122,13 +122,18 @@ class MasterClient {
   void StartHeartbeat();
   void StopHeartbeat();
 
-  // Force the next heartbeat to send `is_full_sync=true` with the
-  // peer allocator's current owned-key snapshot.  Used by Clear():
-  // after PeerDramAllocator::ClearLocal() the snapshot is empty, so
-  // master will collapse this node's index in one shot.  The heartbeat
-  // thread is woken so master converges within an RPC round-trip
-  // instead of the next heartbeat tick.
+  // Force the next heartbeat to send full-sync snapshots for both
+  // UMBP-owned and external HiCache placement.  Used by Clear():
+  // after PeerDramAllocator::ClearLocal() and local external placement
+  // state are emptied, master collapses this node's index in one shot.
+  // The heartbeat thread is woken so master converges within an RPC
+  // round-trip instead of the next heartbeat tick.
   void RequestClearFullSync();
+
+  // Synchronously clear this node's UMBP-owned and external HiCache
+  // placement from master.  Returns true only after both full-sync
+  // snapshots are acknowledged by master.
+  bool ClearFullSync();
 
   // --- Client-side metrics ---
   void AddCounter(std::string name, std::string help, Labels labels, double delta);
@@ -212,9 +217,10 @@ class MasterClient {
   std::vector<KvEvent> external_pending_events_;
   std::set<std::pair<TierType, std::string>> external_current_set_;
 
-  // Set by Clear() via RequestClearFullSync().  `_requested_` wakes the
-  // heartbeat thread and picks the empty-snapshot branch.
-  // `_in_flight_` survives that branch and triggers
+  // Set by async RequestClearFullSync() or sync ClearFullSync().
+  // `_requested_` wakes the heartbeat thread and picks the
+  // empty-snapshot branch for async clears. `_in_flight_` survives
+  // that branch and triggers
   // PeerDramAllocator::ClearFullSyncAcked() once master acks — kept
   // separate so master-driven gap recovery (which also sends a
   // full-sync) does not lift the allocator write gate.
