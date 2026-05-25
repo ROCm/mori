@@ -31,6 +31,30 @@
 namespace mori {
 namespace application {
 
+/* ---------------------------------------------------------------------------
+ *  PeerCapabilities — per-peer transport capability discovery
+ *
+ *  Describes WHICH transports are physically available to reach a given peer,
+ *  taking into account hardware topology + env-var snapshots. Decoupled from
+ *  the policy "which one do we actually use" (`transportTypes` below applies
+ *  a default policy to derive a single TransportType from these caps).
+ *
+ *  - `transportTypes[i]` (legacy single-value field) is the historical
+ *    "Context picked one for you" interface, kept for SHMEM compatibility.
+ *  - `peerCaps[i]` is the new capability set, intended for CCO and other
+ *    consumers that want to make their own policy decisions (e.g. CCO's
+ *    gdaConnectionType chooses whether intra-node peers also get NIC QPs).
+ * --------------------------------------------------------------------------- */
+struct PeerCapabilities {
+  bool sameHost{false};     // peer is on the same physical node
+  bool sameProcess{false};  // peer is in the same OS process (loopback IPC ok)
+  bool canP2P{false};       // intra-node GPU peer access (xGMI / NVLink) reachable
+  bool canSDMA{false};      // intra-node SDMA (anvil) queue reachable
+  bool canRDMA{false};      // NIC reachable (always false for self / same-host
+                            //                when canP2P is preferred; true for
+                            //                cross-node when an NIC is present)
+};
+
 class Context {
  public:
   Context(BootstrapNetwork& bootNet);
@@ -41,9 +65,23 @@ class Context {
   int LocalRankInNode() const { return rankInNode; }
   const std::string& HostName() const { return myHostname; }
 
+  // Single-value transport selection driven by Context's default policy
+  // (intra-node P2P > SDMA > cross-node RDMA). Kept stable so SHMEM's
+  // device-side DISPATCH_TRANSPORT_TYPE macro continues to work unchanged.
   TransportType GetTransportType(int destRank) const { return transportTypes[destRank]; }
   const std::vector<TransportType>& GetTransportTypes() const { return transportTypes; }
   int GetNumQpPerPe() const { return numQpPerPe; }
+
+  // Capability-level query: reveals all transports physically available to
+  // reach the peer, without baking any policy choice. Use this when you need
+  // to apply a custom policy (e.g. CCO's gdaConnectionType FULL forces NIC
+  // QPs to intra-node peers even though canP2P is also true).
+  const PeerCapabilities& GetPeerCapabilities(int destRank) const {
+    return peerCaps[destRank];
+  }
+  const std::vector<PeerCapabilities>& GetAllPeerCapabilities() const {
+    return peerCaps;
+  }
 
   RdmaContext* GetRdmaContext() const { return rdmaContext.get(); }
   RdmaDeviceContext* GetRdmaDeviceContext() const { return rdmaDeviceContext.get(); }
@@ -88,6 +126,13 @@ class Context {
   void InitializeTopologyAndTransports();   // lightweight: topology + NIC + transport type decision + SDMA queues
   void BuildAndConnectInitialEndpoints();   // heavyweight: build initial QP set + AllToAll + connect
 
+  // Apply Context's built-in policy to derive a single TransportType from a
+  // PeerCapabilities entry. Preference: P2P > SDMA > RDMA. Self always P2P.
+  // Aborts (assert) if no transport is available, matching legacy behavior
+  // expected by SHMEM init.
+  TransportType DefaultPolicyResolve(const PeerCapabilities& cap,
+                                     bool isSelf) const;
+
   struct PeerInfo {
     bool sameHost{false};     // on the same node (same hostname+IP)
     bool sameProcess{false};  // in the same OS process (same pid + same host)
@@ -102,7 +147,8 @@ class Context {
   bool p2pDisabled{false};
   std::string myHostname;
   std::vector<PeerInfo> peerInfos;
-  std::vector<TransportType> transportTypes;
+  std::vector<PeerCapabilities> peerCaps;        // raw capability discovery
+  std::vector<TransportType> transportTypes;     // derived via DefaultPolicyResolve
 
   std::unique_ptr<RdmaContext> rdmaContext{nullptr};
   std::unique_ptr<RdmaDeviceContext> rdmaDeviceContext{nullptr};

@@ -231,61 +231,107 @@ void Context::InitializeTopologyAndTransports() {
   int sdmaNumChannels = anvil::GetSdmaNumChannels();
   MORI_APP_INFO("SDMA num channels per GPU pair: {}", sdmaNumChannels);
 
-  // Decide transport type per peer. Lazily populate savedEpConfig the first
-  // time we see an RDMA peer (needed by both BuildInitialEndpoints and
-  // CreateAdditionalEndpoints). No QP creation / no AllToAll here.
+  // Per-peer loop, split into two phases:
+  //
+  //   (A) Capability discovery: fill peerCaps[i] purely from environment +
+  //       NIC presence. No "we picked X" decision. This is what CCO consults
+  //       to apply its own policy (gdaConnectionType FULL/CROSSNODE/RAIL).
+  //
+  //   (B) Default-policy resolve: call DefaultPolicyResolve(cap) to derive a
+  //       single transportTypes[i]. This is what SHMEM's GpuStates copy step
+  //       reads, so its DISPATCH_TRANSPORT_TYPE macro keeps working.
+  //
+  // Side effects (anvil queue setup, savedEpConfig lazy init) happen in (A)
+  // because they depend on the discovered capability, not on the policy.
+  peerCaps.resize(WorldSize());
   for (int i = 0; i < WorldSize(); i++) {
-    // Check P2P availability
-    if (!IsP2PDisabled()) {
-      if (peerInfos[i].sameHost) {
-        peerRankInNode++;
+    PeerCapabilities& cap = peerCaps[i];
+    cap.sameHost = peerInfos[i].sameHost;
+    cap.sameProcess = peerInfos[i].sameProcess;
 
-        // TODO: should use TopoSystemGpu to determine if peer access is enabled, but that requires
-        // exchanging gpu bdf id, hence for simplicity we assume peer access is enabled
-        bool canAccessPeer = true;
+    // ── (A.1) intra-node capabilities ──
+    if (!IsP2PDisabled() && cap.sameHost) {
+      peerRankInNode++;
+      // TODO: should use TopoSystemGpu to determine if peer access is enabled,
+      // but that requires exchanging gpu bdf id, hence for simplicity we
+      // assume peer access is enabled.
+      const bool canAccessPeer = true;
 
-        if ((i == LocalRank()) || canAccessPeer) {
-          if (IsSdmaEnabled()) {
-            if (i != LocalRank()) {
-              transportTypes.push_back(TransportType::SDMA);
-              anvil::EnablePeerAccess(LocalRank() % 8, i % 8);
-              // Better performance if allocating all 8 queues
-              anvil::anvil.connect(LocalRank() % 8, i % 8, sdmaNumChannels);
-            } else {
-              transportTypes.push_back(TransportType::SDMA);
-              anvil::anvil.connect(LocalRank() % 8, i % 8, sdmaNumChannels);
-            }
-          } else {
-            transportTypes.push_back(TransportType::P2P);
+      if (i == LocalRank() || canAccessPeer) {
+        if (IsSdmaEnabled()) {
+          // Same-host with SDMA enabled: also wire up the anvil queues now,
+          // because SHMEM's default policy resolver picks SDMA over P2P and
+          // expects the queues already exist.
+          cap.canSDMA = true;
+          if (i != LocalRank()) {
+            anvil::EnablePeerAccess(LocalRank() % 8, i % 8);
           }
-          continue;
+          anvil::anvil.connect(LocalRank() % 8, i % 8, sdmaNumChannels);
+        } else {
+          cap.canP2P = true;
         }
       }
-    } else {
-      if (i == LocalRank()) {
-        transportTypes.push_back(TransportType::P2P);
-        continue;
+    } else if (IsP2PDisabled() && i == LocalRank()) {
+      // Self-loop always reachable via "P2P" semantics even with P2P disabled.
+      cap.canP2P = true;
+    }
+
+    // ── (A.2) cross-node capability ──
+    //
+    // Cross-node peers require an RDMA NIC. If we have no NIC and we have a
+    // cross-node peer, we still mark canRDMA=false and let the policy layer
+    // (DefaultPolicyResolve or CCO's resolver) decide whether to assert or
+    // gracefully report "no transport".
+    const bool isCrossNode = !cap.sameHost;
+    const bool needsRdma = isCrossNode || (IsP2PDisabled() && i != LocalRank());
+    if (needsRdma && rdmaDeviceContext.get() != nullptr) {
+      cap.canRDMA = true;
+      // Lazy-initialize the EP config the first time we encounter a peer
+      // that would need an RDMA endpoint.
+      if (savedPortId < 0) {
+        savedPortId = portId;
+        savedEpConfig.portId = portId;
+        savedEpConfig.gidIdx = -1;
+        const char* envGidIdx = std::getenv("MORI_IB_GID_INDEX");
+        if (envGidIdx != nullptr) savedEpConfig.gidIdx = std::atoi(envGidIdx);
+        savedEpConfig.maxMsgsNum = 4096;
+        uint32_t vid = rdmaDeviceContext->GetRdmaDevice()->GetDeviceAttr()->orig_attr.vendor_id;
+        savedEpConfig.maxCqeNum =
+            (vid == static_cast<uint32_t>(RdmaDeviceVendorId::Broadcom)) ? 1 : 4096;
+        savedEpConfig.alignment = 4096;
+        savedEpConfig.onGpu = true;
       }
     }
 
-    // Falls through to here only for RDMA peers.
-    if (rdmaDeviceContext.get() == nullptr) assert(false && "no rdma device found");
-    // Build endpoint config once (lazy on first RDMA peer). Reused by both
-    // BuildInitialEndpoints and CreateAdditionalEndpoints.
-    if (savedPortId < 0) {
-      savedPortId = portId;
-      savedEpConfig.portId = portId;
-      savedEpConfig.gidIdx = -1;
-      const char* envGidIdx = std::getenv("MORI_IB_GID_INDEX");
-      if (envGidIdx != nullptr) savedEpConfig.gidIdx = std::atoi(envGidIdx);
-      savedEpConfig.maxMsgsNum = 4096;
-      uint32_t vid = rdmaDeviceContext->GetRdmaDevice()->GetDeviceAttr()->orig_attr.vendor_id;
-      savedEpConfig.maxCqeNum = (vid == static_cast<uint32_t>(RdmaDeviceVendorId::Broadcom)) ? 1 : 4096;
-      savedEpConfig.alignment = 4096;
-      savedEpConfig.onGpu = true;
-    }
-    transportTypes.push_back(TransportType::RDMA);
+    // ── (B) default policy resolve ──
+    //
+    // Equivalent to the old per-peer if/else cascade. SHMEM and any caller
+    // of GetTransportType() / GetTransportTypes() sees the same behavior as
+    // before this refactor.
+    transportTypes.push_back(DefaultPolicyResolve(cap, /*isSelf=*/i == LocalRank()));
   }
+}
+
+/* ------------------------------------------------------------------------ */
+/*                          Default policy resolver                         */
+/* ------------------------------------------------------------------------ */
+
+TransportType Context::DefaultPolicyResolve(const PeerCapabilities& cap,
+                                            bool isSelf) const {
+  // Self always uses the cheapest path (P2P semantics for local read/write).
+  // Among real peers: P2P first if available, then SDMA, then RDMA.
+  if (isSelf) {
+    // If SDMA is enabled, we have set canSDMA=true for self too (matches the
+    // pre-refactor behavior). Otherwise default to P2P.
+    return cap.canSDMA ? TransportType::SDMA : TransportType::P2P;
+  }
+  if (cap.canSDMA) return TransportType::SDMA;
+  if (cap.canP2P) return TransportType::P2P;
+  if (cap.canRDMA) return TransportType::RDMA;
+  // No transport available — historical behavior was to assert here. Keep it
+  // so SHMEM's init still fails fast on misconfigured deployments.
+  assert(false && "no transport available for peer");
+  return TransportType::RDMA;  // unreachable
 }
 
 /* ------------------------------------------------------------------------ */
