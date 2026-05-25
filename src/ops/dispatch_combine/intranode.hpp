@@ -333,7 +333,7 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
   } else {
     // When the caller passes a routing handle, args.dispTokIdToSrcTokIdLocal
     // holds a per-call snapshot of the symmetric local view. Otherwise fall
-    // back to the shared symmetric buffer (legacy single-routing path).
+    // back to the shared symmetric buffer.
     const index_t* localSrcMap =
         args.dispTokIdToSrcTokIdLocal != nullptr
             ? args.dispTokIdToSrcTokIdLocal
@@ -411,10 +411,8 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
   // Make sure copy on all GPUs are finished
   MORI_TRACE_NEXT(seq, Slot::CombineBarrier);
   CrossDeviceBarrierIntraNodeKernel(args, crossDeviceBarrierFlag);
-  // Legacy path zeroes the shared totalRecvTokenNum so the next mode-1 dispatch
-  // through the same handle starts clean. With a routing handle, the caller
-  // owns this tensor (it may still be alive in autograd ctx), so we skip the
-  // reset — the next dispatch will allocate or replay its own.
+  // With a routing handle, the caller owns this tensor (it may still be alive in autograd ctx),
+  // so we skip the reset. The next dispatch will allocate or replay its own.
   if (args.dispTokIdToSrcTokIdLocal == nullptr) {
     *args.totalRecvTokenNum = 0;
   }

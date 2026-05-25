@@ -51,6 +51,7 @@ inline __device__ void DispatchIntraNodeBlock(EpDispatchCombineArgs<T>& args, in
   index_t destTokId = 0;
   if (!args.replayMode) {
     if (laneId == 0) {
+      // decide token id in dest pe
       destTokId = atomicAdd(args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe), 1);
       assert(destTokId < config.MaxNumTokensToRecv() &&
              "Total recv token overflow: increase maxTotalRecvTokens");
@@ -309,9 +310,8 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs<T>& args) {
          tokenId += warpSize) {
       bool shouldSend = false;
       for (int e = 0; e < config.numExpertPerToken; e++) {
-        index_t laneExpert = args.tokenIndices[tokenId * numExpertPerToken + e];
-        if (laneExpert < 0) continue;
-        int destNode = laneExpert / config.numExpertPerRank / config.gpuPerNode;
+        int destNode = args.tokenIndices[tokenId * numExpertPerToken + e] /
+                       config.numExpertPerRank / config.gpuPerNode;
         if (destNode == i) {
           shouldSend |= true;
           args.dispDestTokIdMap[tokenId * numExpertPerToken + e] = NullFlatTokenIndex(config);
@@ -528,21 +528,16 @@ inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs<T>& args) {
         reinterpret_cast<index_t*>(stagingPtr + globalTokenId * xferBytes + hiddenBytes);
     int lanePe = -1;
     if (laneId < config.numExpertPerToken) {
-      index_t laneExpert = indices[laneId];
-      lanePe = (laneExpert < 0) ? (-1 - static_cast<int>(laneId))
-                                : (laneExpert / config.numExpertPerRank);
-      assert((laneExpert < 0) ||
-             ((lanePe < config.worldSize) && (lanePe >= 0)));
+      lanePe = indices[laneId] / config.numExpertPerRank;
+      assert((lanePe < config.worldSize) && (lanePe >= 0));
     }
     index_t srcTokId =
         reinterpret_cast<index_t*>(stagingPtr + globalTokenId * xferBytes + hiddenBytes +
                                    indexBytes + weightBytes + scaleBytes)[0];
 
     int destPe = __shfl(lanePe, expertId);
-    bool isSentinelSlot = (destPe < 0);
-    int destNode = isSentinelSlot ? -1 : destPe / config.gpuPerNode;
-    bool shouldSkip = isSentinelSlot || (destNode != myNode) ||
-                      __any((laneId < expertId) && (destPe == lanePe));
+    int destNode = destPe / config.gpuPerNode;
+    bool shouldSkip = (destNode != myNode) || __any((laneId < expertId) && (destPe == lanePe));
     if (shouldSkip) {
       if (laneId == 0)
         args.interNodeDispDestTokIdMap[globalTokenId * config.numExpertPerToken + expertId] =
@@ -942,7 +937,7 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs<T>& 
                       args.shmemInpWeightsMemObj->template GetAs<float*>(destPe) +
                       destLocalTokId * config.numExpertPerToken;
                 }
-                // Reset is only safe on the legacy path; routing-handle callers own this tensor.
+                // routing-handle callers own this tensor, hence no need to reset.
                 if (args.dispTokIdToSrcTokIdLocal == nullptr) {
                   args.interNodeDispDestTokIdMap[tokIdx * config.numExpertPerToken + laneId] = 0;
                 }
@@ -1380,7 +1375,7 @@ __device__ void EpCombineAll_body(EpDispatchCombineArgs<T> args) {
   MORI_TRACE_SPAN(profiler, Slot::EpCombineAll);
 
   if (globalWarpId == 0) {
-    // Reset is only safe on the legacy path; routing-handle callers own this tensor.
+    // routing-handle callers own this tensor hence no need to reset.
     if (laneId == 0 && args.dispTokIdToSrcTokIdLocal == nullptr)
       args.totalRecvTokenNum[0] = 0;
     if (laneId < nNodes) args.blockFlagCounter[laneId] = 0;
