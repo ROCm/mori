@@ -381,7 +381,11 @@ class EpDispatchCombineTestCase:
         return output
 
     def gen_test_data(
-        self, max_num_token, use_max_token_num=False, only_my_rank=False, sentinel_pattern=None
+        self,
+        max_num_token,
+        use_max_token_num=False,
+        only_my_rank=False,
+        sentinel_pattern=None,
     ):
         hidden_dim = self.dispatch_hidden_dim
         keep_ranks = {self.rank} if only_my_rank else set(range(self.world_size))
@@ -421,9 +425,9 @@ class EpDispatchCombineTestCase:
                 elif sentinel_pattern == "first_only":
                     sentinel_slots = list(range(1, k))
                 elif isinstance(sentinel_pattern, int):
-                    assert 0 <= sentinel_pattern < k, (
-                        f"sentinel_pattern={sentinel_pattern} must be in [0, k={k})"
-                    )
+                    assert (
+                        0 <= sentinel_pattern < k
+                    ), f"sentinel_pattern={sentinel_pattern} must be in [0, k={k})"
                     sentinel_slots = list(range(k - sentinel_pattern, k))
                 else:
                     raise ValueError(f"Unknown sentinel_pattern: {sentinel_pattern!r}")
@@ -806,7 +810,9 @@ class EpDispatchCombineTestCase:
 
         del op
 
-    def test_sentinel_dispatch_combine(self, sentinel_pattern="every_other", num_rounds=50):
+    def test_sentinel_dispatch_combine(
+        self, sentinel_pattern="every_other", num_rounds=50
+    ):
         """Default-path dispatch/combine with DeepEP-style -1 expert sentinels."""
         if self.config.kernel_type not in (
             mori.ops.EpDispatchCombineKernelType.InterNodeV1,
@@ -1672,7 +1678,15 @@ parser.add_argument(
     "--cmd",
     type=str,
     default="test",
-    choices=["test", "test_sentinel", "bench", "stress", "sweep_bench", "profile", "tuning"],
+    choices=[
+        "test",
+        "test_sentinel",
+        "bench",
+        "stress",
+        "sweep_bench",
+        "profile",
+        "tuning",
+    ],
     help="Available subcommands: test, test_sentinel, bench, stress, sweep_bench, profile, tuning",
 )
 parser.add_argument(
