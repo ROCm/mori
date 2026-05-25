@@ -149,26 +149,21 @@ int main(int argc, char** argv) {
     constexpr int kExtKvBatchSize = 10;
 
     if (!live_ext_kv_hashes.empty()) {
-      auto revoke_status =
-          client.RevokeExternalKvBlocks(node_id, live_ext_kv_hashes, mori::umbp::TierType::HBM);
-      if (revoke_status.ok()) {
-        MORI_UMBP_INFO("[Client] Iteration {} RevokeExternalKvBlocks: revoked {} hashes", iteration,
+      if (client.UnbindExternalHashes(live_ext_kv_hashes, mori::umbp::TierType::HBM)) {
+        MORI_UMBP_INFO("[Client] Iteration {} UnbindExternalHashes: revoked {} hashes", iteration,
                        live_ext_kv_hashes.size());
       } else {
-        MORI_UMBP_WARN("[Client] Iteration {} RevokeExternalKvBlocks failed: {}", iteration,
-                       revoke_status.error_message());
+        MORI_UMBP_WARN("[Client] Iteration {} UnbindExternalHashes failed", iteration);
       }
     }
 
     live_ext_kv_hashes = MakeHashes(node_id, iteration, kExtKvBatchSize);
-    auto report_status =
-        client.ReportExternalKvBlocks(node_id, live_ext_kv_hashes, mori::umbp::TierType::HBM);
-    if (report_status.ok()) {
-      MORI_UMBP_INFO("[Client] Iteration {} ReportExternalKvBlocks: reported {} hashes", iteration,
+    if (client.BindExternalHashes(live_ext_kv_hashes, mori::umbp::TierType::HBM) &&
+        client.FlushExternalQueue()) {
+      MORI_UMBP_INFO("[Client] Iteration {} BindExternalHashes: reported {} hashes", iteration,
                      live_ext_kv_hashes.size());
     } else {
-      MORI_UMBP_WARN("[Client] Iteration {} ReportExternalKvBlocks failed: {}", iteration,
-                     report_status.error_message());
+      MORI_UMBP_WARN("[Client] Iteration {} BindExternalHashes failed", iteration);
       live_ext_kv_hashes.clear();
     }
 

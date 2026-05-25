@@ -21,6 +21,7 @@
 // SOFTWARE.
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <memory>
 #include <optional>
@@ -330,6 +331,29 @@ TEST(PeerDramAllocator, SnapshotOwnedKeysReturnsEveryAdd) {
     EXPECT_EQ(ev.tier, TierType::DRAM);
   }
   EXPECT_TRUE(a->DrainPendingEvents().empty());
+}
+
+TEST(PeerDramAllocator, SnapshotOwnedKeysTracksExternalSsdEvents) {
+  auto a = MakeAllocator();
+  a->QueueExternalEvent(KvEvent{KvEvent::Kind::ADD, "ssd-a", TierType::SSD, 123});
+  a->QueueExternalEvent(KvEvent{KvEvent::Kind::ADD, "ssd-b", TierType::SSD, 456});
+
+  auto snap = a->SnapshotOwnedKeys();
+  ASSERT_EQ(snap.size(), 2u);
+  EXPECT_TRUE(std::any_of(snap.begin(), snap.end(), [](const KvEvent& ev) {
+    return ev.key == "ssd-a" && ev.tier == TierType::SSD && ev.size == 123;
+  }));
+  EXPECT_TRUE(std::any_of(snap.begin(), snap.end(), [](const KvEvent& ev) {
+    return ev.key == "ssd-b" && ev.tier == TierType::SSD && ev.size == 456;
+  }));
+
+  a->QueueExternalEvent(KvEvent{KvEvent::Kind::REMOVE, "ssd-a", TierType::SSD, 0});
+  snap = a->SnapshotOwnedKeys();
+  ASSERT_EQ(snap.size(), 1u);
+  EXPECT_EQ(snap[0].key, "ssd-b");
+
+  a->QueueExternalEvent(KvEvent{KvEvent::Kind::CLEAR_AT_TIER, "", TierType::SSD, 0});
+  EXPECT_TRUE(a->SnapshotOwnedKeys().empty());
 }
 
 // ---- Buffer descs filtered to the page set ---------------------------------

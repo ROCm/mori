@@ -1362,19 +1362,42 @@ std::vector<bool> PoolClient::BatchExists(const std::vector<std::string>& keys) 
 //  External KV
 // ---------------------------------------------------------------------------
 
+bool PoolClient::BindExternalHashes(const std::vector<std::string>& hashes, TierType tier) {
+  if (!initialized_) return false;
+  return master_client_->BindExternalHashes(hashes, tier);
+}
+
 bool PoolClient::ReportExternalKvBlocks(const std::vector<std::string>& hashes, TierType tier) {
   if (!initialized_) return false;
-  return master_client_->ReportExternalKvBlocks(config_.master_config.node_id, hashes, tier).ok();
+  if (!master_client_->BindExternalHashes(hashes, tier)) return false;
+  return master_client_->FlushExternalQueue();
+}
+
+bool PoolClient::UnbindExternalHashes(const std::vector<std::string>& hashes, TierType tier) {
+  if (!initialized_) return false;
+  return master_client_->UnbindExternalHashes(hashes, tier);
 }
 
 bool PoolClient::RevokeExternalKvBlocks(const std::vector<std::string>& hashes, TierType tier) {
   if (!initialized_) return false;
-  return master_client_->RevokeExternalKvBlocks(config_.master_config.node_id, hashes, tier).ok();
+  if (!master_client_->UnbindExternalHashes(hashes, tier)) return false;
+  return master_client_->FlushExternalQueue();
+}
+
+bool PoolClient::UnbindAllExternalHashesAtTier(TierType tier) {
+  if (!initialized_) return false;
+  return master_client_->UnbindAllExternalHashesAtTier(tier);
 }
 
 bool PoolClient::RevokeAllExternalKvBlocksAtTier(TierType tier) {
   if (!initialized_) return false;
-  return master_client_->RevokeAllExternalKvBlocksAtTier(config_.master_config.node_id, tier).ok();
+  if (!master_client_->UnbindAllExternalHashesAtTier(tier)) return false;
+  return master_client_->FlushExternalQueue();
+}
+
+bool PoolClient::FlushExternalQueue() {
+  if (!initialized_) return false;
+  return master_client_->FlushExternalQueue();
 }
 
 bool PoolClient::MatchExternalKv(const std::vector<std::string>& hashes,

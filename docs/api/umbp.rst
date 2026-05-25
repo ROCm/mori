@@ -11,9 +11,10 @@ It is *not* the full UMBP data-plane client. Hot-path Put/Get with RDMA / MORI-I
 goes through the C++ ``IUMBPClient`` (``mori.cpp.UMBPClient`` in Python) backed by a
 ``DistributedClient`` + ``PoolClient``. ``UMBPMasterClient`` only speaks to the master
 control plane and never registers a peer service or starts a heartbeat thread.
-Schedulers should usually use it only for ``match_external_kv()`` queries; SGLang
-HiCache event forwarding normally uses the distributed UMBP client owned by
-``UMBPStore``.
+Schedulers and sidecars can use it for synchronous external-KV
+``report``/``revoke`` calls on behalf of a registered worker; SGLang HiCache
+event forwarding normally uses the distributed UMBP client owned by
+``UMBPStore`` so high-rate writes are batched through heartbeats.
 
 For the full architecture see ``src/umbp/doc/design-master-control-plane.md``.
 
@@ -214,18 +215,20 @@ for one-shot or short-lived lookups, not for long-running peer membership.
        ``tier``.  Existing tier buckets for the same hashes are untouched
        (a re-report at the same tier is a no-op; reporting at a new tier
        adds a bucket without removing previously reported ones).  Raises
-       ``RuntimeError`` if ``hashes`` is empty or the call fails.  ``node_id``
-       must already be registered and alive; reports for unknown or expired
-       nodes are ignored by the master.
+       ``RuntimeError`` if ``node_id`` or ``hashes`` is empty, or the call
+       fails.  ``node_id`` must already be registered and alive; reports for
+       unknown or expired nodes are ignored by the master.
    * - ``revoke_external_kv_blocks(node_id, hashes, tier)``
      - Remove ``hashes`` from a single tier on this node.  Other tier
        buckets for the same hashes are untouched.  No-op for hashes that
-       were never reported at ``tier``.  Raises ``RuntimeError`` if
-       ``hashes`` is empty.
+       were never reported at ``tier``.  Unlike report, revoke does not
+       require ``node_id`` to be alive.  Raises ``RuntimeError`` if
+       ``node_id`` or ``hashes`` is empty.
    * - ``revoke_all_external_kv_blocks_at_tier(node_id, tier)``
      - **Bulk**: revoke every hash currently registered by ``node_id`` at
        ``tier``.  Used when an entire tier is wiped (storage backend clear
        or detach, host-pool reset).  Other tier buckets are untouched.
+       Unlike report, revoke does not require ``node_id`` to be alive.
    * - ``match_external_kv(hashes, count_as_hit=False) -> list[UMBPExternalKvNodeMatch]``
      - Query the master for nodes that hold any of the requested ``hashes``.
        Returns an empty list when no matches exist or ``hashes`` is empty. Set
@@ -436,10 +439,10 @@ See the
 `master env-var reference <../../src/umbp/doc/runtime-env-vars.md>`_ for the
 full master env-var list.
 
-**Where to call from.**  The two RPCs are reachable through two Python
-clients.  Both ultimately go to the same master and read/write the same
-hit index, but their **error semantics differ** — pick the one whose
-behaviour matches what you want:
+**Where to call from.**  External-KV query methods are reachable through two
+Python clients.  Both ultimately go to the same master and read the same
+placement and hit-count indexes, but their **error semantics differ** — pick
+the one whose behaviour matches what you want:
 
 * ``UMBPMasterClient`` — the lightweight control-plane client documented on
   this page.  Use it from schedulers, controllers, dashboards, or any
@@ -461,6 +464,16 @@ Both methods are also defined on ``StandaloneClient``, but the standalone
 implementation is a stub that always returns an empty list and never
 contacts a master — it exists only so the ``IUMBPClient`` interface stays
 uniform for non-distributed deployments.
+
+For placement writes, use ``UMBPMasterClient.report_external_kv_blocks(node_id,
+hashes, tier)`` when a scheduler or sidecar reports on behalf of a registered
+worker and needs synchronous visibility.  Use the data-plane
+``mori.cpp.UMBPClient.bind_external_hashes(hashes, tier)`` /
+``unbind_external_hashes(hashes, tier)`` path for high-rate in-process cache
+events; the old data-plane names
+``report_external_kv_blocks(hashes, tier)`` /
+``revoke_external_kv_blocks(hashes, tier)`` remain available as
+backward-compatible aliases and flush the heartbeat outbox before returning.
 
 ----
 

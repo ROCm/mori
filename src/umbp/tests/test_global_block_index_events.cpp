@@ -38,14 +38,30 @@ KvEvent Add(std::string key, TierType tier, uint64_t size) {
   return KvEvent{KvEvent::Kind::ADD, std::move(key), tier, size};
 }
 
+KvEvent AddExternal(std::string key, TierType tier) {
+  return KvEvent{KvEvent::Kind::ADD, std::move(key), tier, 0, LocationOwner::EXTERNAL_HICACHE};
+}
+
 KvEvent Remove(std::string key, TierType tier) {
   return KvEvent{KvEvent::Kind::REMOVE, std::move(key), tier, 0};
 }
 
+KvEvent RemoveExternal(std::string key, TierType tier) {
+  return KvEvent{KvEvent::Kind::REMOVE, std::move(key), tier, 0, LocationOwner::EXTERNAL_HICACHE};
+}
+
+KvEvent ClearExternal(TierType tier) {
+  return KvEvent{KvEvent::Kind::CLEAR_AT_TIER, "", tier, 0, LocationOwner::EXTERNAL_HICACHE};
+}
+
+EventBundle Bundle(uint64_t seq, std::vector<KvEvent> events) {
+  return EventBundle{seq, std::move(events)};
+}
+
 bool HasLocation(const std::vector<Location>& locs, const std::string& node, TierType tier,
-                 uint64_t size) {
+                 uint64_t size, LocationOwner owner = LocationOwner::UMBP_OWNED) {
   for (const auto& l : locs) {
-    if (l.node_id == node && l.tier == tier && l.size == size) return true;
+    if (l.node_id == node && l.tier == tier && l.size == size && l.owner == owner) return true;
   }
   return false;
 }
@@ -108,6 +124,56 @@ TEST(GlobalBlockIndexEvents, RemoveLastLocationErasesEntry) {
 TEST(GlobalBlockIndexEvents, RemoveUnknownIsNoop) {
   GlobalBlockIndex idx;
   EXPECT_EQ(idx.ApplyEvents("ghost", {Remove("ghost-key", TierType::DRAM)}), 0u);
+}
+
+TEST(GlobalBlockIndexEvents, MixedOwnersCoexistAndRemoveByOwner) {
+  GlobalBlockIndex idx;
+  idx.ApplyEvents("node-A", {Add("k", TierType::DRAM, 4096)});
+  idx.ApplyEvents("node-A", {AddExternal("k", TierType::DRAM)});
+
+  auto locs = idx.Lookup("k");
+  ASSERT_EQ(locs.size(), 2u);
+  EXPECT_TRUE(HasLocation(locs, "node-A", TierType::DRAM, 4096, LocationOwner::UMBP_OWNED));
+  EXPECT_TRUE(HasLocation(locs, "node-A", TierType::DRAM, 0, LocationOwner::EXTERNAL_HICACHE));
+
+  idx.ApplyEvents("node-A", {RemoveExternal("k", TierType::DRAM)});
+  locs = idx.Lookup("k");
+  ASSERT_EQ(locs.size(), 1u);
+  EXPECT_TRUE(HasLocation(locs, "node-A", TierType::DRAM, 4096, LocationOwner::UMBP_OWNED));
+}
+
+TEST(GlobalBlockIndexEvents, ClearAtTierClearsOnlyTargetOwnerTier) {
+  GlobalBlockIndex idx;
+  idx.ApplyEvents("node-A", {Add("k1", TierType::DRAM, 1), AddExternal("k1", TierType::DRAM),
+                             AddExternal("k2", TierType::SSD), AddExternal("k3", TierType::DRAM)});
+
+  EXPECT_EQ(idx.ApplyEvents("node-A", {ClearExternal(TierType::DRAM)}), 2u);
+
+  EXPECT_TRUE(
+      HasLocation(idx.Lookup("k1"), "node-A", TierType::DRAM, 1, LocationOwner::UMBP_OWNED));
+  EXPECT_FALSE(
+      HasLocation(idx.Lookup("k1"), "node-A", TierType::DRAM, 0, LocationOwner::EXTERNAL_HICACHE));
+  EXPECT_TRUE(
+      HasLocation(idx.Lookup("k2"), "node-A", TierType::SSD, 0, LocationOwner::EXTERNAL_HICACHE));
+  EXPECT_TRUE(idx.Lookup("k3").empty());
+}
+
+TEST(GlobalBlockIndexEvents, ServableLookupAndExternalMatchFilterOwners) {
+  GlobalBlockIndex idx;
+  idx.ApplyEvents("node-A", {AddExternal("h1", TierType::HBM), AddExternal("h1", TierType::DRAM)});
+  idx.ApplyEvents("node-B", {Add("h1", TierType::DRAM, 4096)});
+
+  auto servable = idx.LookupServable("h1");
+  ASSERT_EQ(servable.size(), 1u);
+  EXPECT_EQ(servable[0].node_id, "node-B");
+  EXPECT_EQ(idx.BatchLookupExistsServable({"h1", "missing"}), std::vector<bool>({true, false}));
+
+  auto matches = idx.MatchExternal({"h1"});
+  ASSERT_EQ(matches.size(), 1u);
+  EXPECT_EQ(matches[0].node_id, "node-A");
+  EXPECT_EQ(matches[0].MatchedHashCount(), 1u);
+  EXPECT_EQ(matches[0].hashes_by_tier[TierType::HBM], std::vector<std::string>({"h1"}));
+  EXPECT_EQ(matches[0].hashes_by_tier[TierType::DRAM], std::vector<std::string>({"h1"}));
 }
 
 // ---- ReplaceNodeLocations: full-sync recovery ------------------------------
@@ -273,13 +339,12 @@ TEST(ClientRegistryHeartbeat, AppliesEventsAndAdvancesSeq) {
   ASSERT_TRUE(reg.RegisterClient("node-A", "10.0.0.1:1", /*caps=*/{}, "10.0.0.1:2", {}));
 
   uint64_t acked = 0;
-  bool need_full = false;
-  auto status =
-      reg.Heartbeat("node-A", /*seq=*/1, /*last_acked=*/0, /*caps=*/{},
-                    {Add("k", TierType::DRAM, 42)}, /*is_full_sync=*/false, &acked, &need_full);
+  uint32_t need_full = 0;
+  auto status = reg.Heartbeat("node-A", /*caps=*/{}, {Bundle(1, {Add("k", TierType::DRAM, 42)})},
+                              FullSyncScope::NONE, /*delta_seq_baseline=*/0, &acked, &need_full);
   EXPECT_EQ(status, ClientStatus::ALIVE);
   EXPECT_EQ(acked, 1u);
-  EXPECT_FALSE(need_full);
+  EXPECT_EQ(need_full, 0u);
   EXPECT_FALSE(idx.Lookup("k").empty());
 }
 
@@ -290,15 +355,17 @@ TEST(ClientRegistryHeartbeat, SeqGapTriggersFullSyncRequest) {
   reg.RegisterClient("node-A", "10.0.0.1:1", {}, "10.0.0.1:2", {});
 
   uint64_t acked = 0;
-  bool need_full = false;
+  uint32_t need_full = 0;
   // First heartbeat seq=1 — applied normally.
-  reg.Heartbeat("node-A", 1, 0, {}, {Add("k1", TierType::DRAM, 1)}, false, &acked, &need_full);
-  ASSERT_FALSE(need_full);
+  reg.Heartbeat("node-A", {}, {Bundle(1, {Add("k1", TierType::DRAM, 1)})}, FullSyncScope::NONE, 0,
+                &acked, &need_full);
+  ASSERT_EQ(need_full, 0u);
   ASSERT_EQ(acked, 1u);
 
   // Second heartbeat skips seq=2: master detects the gap.
-  reg.Heartbeat("node-A", 3, 1, {}, {Add("k2", TierType::DRAM, 2)}, false, &acked, &need_full);
-  EXPECT_TRUE(need_full);
+  reg.Heartbeat("node-A", {}, {Bundle(3, {Add("k2", TierType::DRAM, 2)})}, FullSyncScope::NONE, 0,
+                &acked, &need_full);
+  EXPECT_EQ(need_full, kLocationOwnerUmbpOwnedBit | kLocationOwnerExternalHiCacheBit);
   EXPECT_EQ(acked, 1u);  // unchanged — no events applied from this batch
 
   // k2 is NOT in the index because the gap-batch was rejected.
@@ -313,17 +380,19 @@ TEST(ClientRegistryHeartbeat, FullSyncReplacesNodeLocations) {
   reg.RegisterClient("node-A", "10.0.0.1:1", {}, "10.0.0.1:2", {});
 
   uint64_t acked = 0;
-  bool need_full = false;
-  reg.Heartbeat("node-A", 1, 0, {}, {Add("k1", TierType::DRAM, 1), Add("k2", TierType::DRAM, 2)},
-                false, &acked, &need_full);
+  uint32_t need_full = 0;
+  reg.Heartbeat("node-A", {},
+                {Bundle(1, {Add("k1", TierType::DRAM, 1), Add("k2", TierType::DRAM, 2)})},
+                FullSyncScope::NONE, 0, &acked, &need_full);
   ASSERT_FALSE(idx.Lookup("k1").empty());
   ASSERT_FALSE(idx.Lookup("k2").empty());
 
   // Full-sync: only k1 + k3 should remain for node-A.
-  reg.Heartbeat("node-A", 2, 1, {}, {Add("k1", TierType::DRAM, 10), Add("k3", TierType::DRAM, 30)},
-                /*is_full_sync=*/true, &acked, &need_full);
+  reg.Heartbeat("node-A", {},
+                {Bundle(2, {Add("k1", TierType::DRAM, 10), Add("k3", TierType::DRAM, 30)})},
+                FullSyncScope::UMBP_OWNED, /*delta_seq_baseline=*/2, &acked, &need_full);
   EXPECT_EQ(acked, 2u);
-  EXPECT_FALSE(need_full);
+  EXPECT_EQ(need_full, 0u);
 
   auto k1 = idx.Lookup("k1");
   ASSERT_EQ(k1.size(), 1u);
@@ -339,8 +408,9 @@ TEST(ClientRegistryHeartbeat, UnregisterClearsNodeFromIndex) {
   reg.RegisterClient("node-A", "10.0.0.1:1", {}, "10.0.0.1:2", {});
 
   uint64_t acked = 0;
-  bool need_full = false;
-  reg.Heartbeat("node-A", 1, 0, {}, {Add("k1", TierType::DRAM, 1)}, false, &acked, &need_full);
+  uint32_t need_full = 0;
+  reg.Heartbeat("node-A", {}, {Bundle(1, {Add("k1", TierType::DRAM, 1)})}, FullSyncScope::NONE, 0,
+                &acked, &need_full);
   ASSERT_FALSE(idx.Lookup("k1").empty());
 
   reg.UnregisterClient("node-A");
@@ -398,6 +468,23 @@ TEST(GlobalBlockIndexEvents, BatchLookupForRouteGetMixedHitsAndMisses) {
   EXPECT_EQ(after_k1->access_count, before_k1->access_count + 1);
   EXPECT_EQ(after_k2->access_count, before_k2->access_count + 1);
   EXPECT_FALSE(idx.GetMetrics("ghost").has_value());
+}
+
+TEST(GlobalBlockIndexEvents, BatchLookupForRouteGetFiltersExternalOnlyLocations) {
+  GlobalBlockIndex idx;
+  idx.ApplyEvents("node-A", {AddExternal("external-only", TierType::DRAM)});
+
+  auto before = idx.GetMetrics("external-only");
+  ASSERT_TRUE(before.has_value());
+
+  auto results =
+      idx.BatchLookupForRouteGet({"external-only"}, {}, std::chrono::seconds{10});
+  ASSERT_EQ(results.size(), 1u);
+  EXPECT_TRUE(results[0].empty());
+
+  auto after = idx.GetMetrics("external-only");
+  ASSERT_TRUE(after.has_value());
+  EXPECT_EQ(after->access_count, before->access_count);
 }
 
 TEST(GlobalBlockIndexEvents, BatchLookupForRouteGetGrantsLeaseForHitsOnly) {

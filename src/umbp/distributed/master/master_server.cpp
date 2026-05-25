@@ -33,7 +33,6 @@
 #include "mori/utils/mori_log.hpp"
 #include "umbp.grpc.pb.h"
 #include "umbp/common/env_time.h"
-#include "umbp/distributed/master/external_kv_block_index.h"
 #include "umbp/distributed/master/external_kv_hit_index.h"
 #include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/routing/router.h"
@@ -83,11 +82,29 @@ uint64_t ToNs(std::chrono::seconds value) {
 
 KvEvent FromProtoEvent(const ::umbp::KvEvent& pe) {
   KvEvent ev;
-  ev.kind = (pe.kind() == ::umbp::KvEvent::ADD) ? KvEvent::Kind::ADD : KvEvent::Kind::REMOVE;
+  switch (pe.kind()) {
+    case ::umbp::KvEvent::ADD:
+      ev.kind = KvEvent::Kind::ADD;
+      break;
+    case ::umbp::KvEvent::REMOVE:
+      ev.kind = KvEvent::Kind::REMOVE;
+      break;
+    case ::umbp::KvEvent::CLEAR_AT_TIER:
+      ev.kind = KvEvent::Kind::CLEAR_AT_TIER;
+      break;
+    default:
+      ev.kind = KvEvent::Kind::ADD;
+      break;
+  }
   ev.key = pe.key();
   ev.tier = static_cast<TierType>(pe.tier());
   ev.size = pe.size();
+  ev.owner = static_cast<LocationOwner>(pe.owner());
   return ev;
+}
+
+FullSyncScope FromProtoFullSyncScope(::umbp::FullSyncScope scope) {
+  return static_cast<FullSyncScope>(scope);
 }
 
 int EvictKeyDeadlineMs() {
@@ -175,12 +192,10 @@ MasterServerConfig MasterServerConfig::FromEnvironment() {
 class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Service {
  public:
   UMBPMasterServiceImpl(ClientRegistry& registry, GlobalBlockIndex& index,
-                        ExternalKvBlockIndex& external_kv_index,
                         ExternalKvHitIndex& external_kv_hit_index, Router& router,
                         const ClientRegistryConfig& config, mori::metrics::MetricsServer* metrics)
       : registry_(registry),
         index_(index),
-        external_kv_index_(external_kv_index),
         external_kv_hit_index_(external_kv_hit_index),
         router_(router),
         config_(config),
@@ -242,19 +257,25 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
       caps[static_cast<TierType>(tc.tier())] = c;
     }
 
-    std::vector<KvEvent> events;
-    events.reserve(static_cast<size_t>(request->events_size()));
-    for (const auto& pe : request->events()) events.push_back(FromProtoEvent(pe));
+    std::vector<EventBundle> bundles;
+    bundles.reserve(static_cast<size_t>(request->bundles_size()));
+    for (const auto& pb : request->bundles()) {
+      EventBundle bundle;
+      bundle.seq = pb.seq();
+      bundle.events.reserve(static_cast<size_t>(pb.events_size()));
+      for (const auto& pe : pb.events()) bundle.events.push_back(FromProtoEvent(pe));
+      bundles.push_back(std::move(bundle));
+    }
 
     uint64_t acked_seq = 0;
-    bool request_full_sync = false;
-    auto status =
-        registry_.Heartbeat(request->node_id(), request->seq(), request->last_acked_seq(), caps,
-                            events, request->is_full_sync(), &acked_seq, &request_full_sync);
+    uint32_t full_sync_owners_to_resend = 0;
+    auto status = registry_.Heartbeat(
+        request->node_id(), caps, bundles, FromProtoFullSyncScope(request->full_sync_scope()),
+        request->delta_seq_baseline(), &acked_seq, &full_sync_owners_to_resend);
 
     response->set_status(static_cast<::umbp::ClientStatus>(status));
     response->set_acked_seq(acked_seq);
-    response->set_request_full_sync(request_full_sync);
+    response->set_full_sync_owners_to_resend(full_sync_owners_to_resend);
 
     UpdateClientCapacityMetrics(request->node_id(), caps);
 
@@ -280,15 +301,17 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
                          static_cast<double>(total));
     }
 
-    if (request_full_sync && metrics_ != nullptr) {
+    if (full_sync_owners_to_resend != 0 && metrics_ != nullptr) {
       metrics_->addCounter("mori_umbp_heartbeat_seq_gap_total",
                            "Heartbeats rejected due to seq gap (full sync requested)",
                            {{"node", request->node_id()}});
     }
-    if (metrics_ != nullptr && !events.empty()) {
+    size_t event_count = 0;
+    for (const auto& bundle : bundles) event_count += bundle.events.size();
+    if (metrics_ != nullptr && event_count > 0) {
       metrics_->addCounter("mori_umbp_heartbeat_events_applied_total",
                            "KvEvents applied to GlobalBlockIndex via heartbeat",
-                           {{"node", request->node_id()}}, static_cast<uint64_t>(events.size()));
+                           {{"node", request->node_id()}}, static_cast<uint64_t>(event_count));
     }
     return grpc::Status::OK;
   }
@@ -409,34 +432,54 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
   grpc::Status BatchLookup(grpc::ServerContext* /*ctx*/, const ::umbp::BatchLookupRequest* request,
                            ::umbp::BatchLookupResponse* response) override {
     std::vector<std::string> keys(request->keys().begin(), request->keys().end());
-    auto found = index_.BatchLookupExists(keys);
+    auto found = index_.BatchLookupExistsServable(keys);
     for (bool b : found) response->add_found(b);
     return grpc::Status::OK;
   }
 
-  // -------- External KV (unchanged from prior design) --------
+  // -------- External KV mutation/query --------
 
   grpc::Status ReportExternalKvBlocks(
       grpc::ServerContext* /*ctx*/, const ::umbp::ReportExternalKvBlocksRequest* request,
       ::umbp::ReportExternalKvBlocksResponse* /*response*/) override {
-    if (request->node_id().empty() || request->hashes_size() == 0) {
-      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "node_id/hashes cannot be empty");
+    if (request->node_id().empty()) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "node_id must not be empty");
     }
-    std::vector<std::string> hashes(request->hashes().begin(), request->hashes().end());
-    TierType tier = static_cast<TierType>(request->tier());
-    registry_.RegisterExternalKvBlocks(request->node_id(), hashes, tier);
+    if (request->hashes_size() == 0) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "hashes must not be empty");
+    }
 
+    const TierType tier = static_cast<TierType>(request->tier());
+    if (!registry_.IsClientAlive(request->node_id())) {
+      MORI_UMBP_WARN("[Server] ReportExternalKvBlocks rejected: node not alive: {}",
+                     request->node_id());
+      if (metrics_) {
+        metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_REPORT_TOTAL,
+                             MORI_UMBP_METRIC_EXT_KV_REPORT_TOTAL_HELP,
+                             {{"node", request->node_id()},
+                              {"tier", TierTypeName(tier)},
+                              {"result", "rejected_not_alive"}});
+      }
+      return grpc::Status::OK;
+    }
+
+    std::vector<KvEvent> events;
+    events.reserve(static_cast<size_t>(request->hashes_size()));
+    for (const auto& hash : request->hashes()) {
+      events.push_back(
+          KvEvent{KvEvent::Kind::ADD, hash, tier, /*size=*/0, LocationOwner::EXTERNAL_HICACHE});
+    }
+
+    const size_t mutated = index_.ApplyEvents(request->node_id(), events);
     if (metrics_) {
-      metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_REPORT_TOTAL,
-                           MORI_UMBP_METRIC_EXT_KV_REPORT_TOTAL_HELP,
-                           {{"node", request->node_id()}});
+      const mori::metrics::MetricsServer::Labels labels = {{"node", request->node_id()},
+                                                           {"tier", TierTypeName(tier)}};
       metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_REPORT_BLOCKS_TOTAL,
-                           MORI_UMBP_METRIC_EXT_KV_REPORT_BLOCKS_TOTAL_HELP,
-                           {{"node", request->node_id()}}, static_cast<uint64_t>(hashes.size()));
-      const size_t kv_count = external_kv_index_.GetKvCount(request->node_id());
-      metrics_->setGauge(MORI_UMBP_METRIC_EXT_KV_LIVE_COUNT,
-                         MORI_UMBP_METRIC_EXT_KV_LIVE_COUNT_HELP, {{"node", request->node_id()}},
-                         static_cast<double>(kv_count));
+                           MORI_UMBP_METRIC_EXT_KV_REPORT_BLOCKS_TOTAL_HELP, labels,
+                           static_cast<uint64_t>(mutated));
+      metrics_->addCounter(
+          MORI_UMBP_METRIC_EXT_KV_REPORT_TOTAL, MORI_UMBP_METRIC_EXT_KV_REPORT_TOTAL_HELP,
+          {{"node", request->node_id()}, {"tier", TierTypeName(tier)}, {"result", "ok"}});
     }
     return grpc::Status::OK;
   }
@@ -444,24 +487,31 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
   grpc::Status RevokeExternalKvBlocks(
       grpc::ServerContext* /*ctx*/, const ::umbp::RevokeExternalKvBlocksRequest* request,
       ::umbp::RevokeExternalKvBlocksResponse* /*response*/) override {
-    if (request->node_id().empty() || request->hashes_size() == 0) {
-      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "node_id/hashes cannot be empty");
+    if (request->node_id().empty()) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "node_id must not be empty");
     }
-    std::vector<std::string> hashes(request->hashes().begin(), request->hashes().end());
-    TierType tier = static_cast<TierType>(request->tier());
-    registry_.UnregisterExternalKvBlocks(request->node_id(), hashes, tier);
+    if (request->hashes_size() == 0) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "hashes must not be empty");
+    }
 
+    const TierType tier = static_cast<TierType>(request->tier());
+    std::vector<KvEvent> events;
+    events.reserve(static_cast<size_t>(request->hashes_size()));
+    for (const auto& hash : request->hashes()) {
+      events.push_back(
+          KvEvent{KvEvent::Kind::REMOVE, hash, tier, /*size=*/0, LocationOwner::EXTERNAL_HICACHE});
+    }
+
+    const size_t mutated = index_.ApplyEvents(request->node_id(), events);
     if (metrics_) {
-      metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_REVOKE_TOTAL,
-                           MORI_UMBP_METRIC_EXT_KV_REVOKE_TOTAL_HELP,
-                           {{"node", request->node_id()}});
+      const mori::metrics::MetricsServer::Labels labels = {{"node", request->node_id()},
+                                                           {"tier", TierTypeName(tier)}};
       metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_REVOKE_BLOCKS_TOTAL,
-                           MORI_UMBP_METRIC_EXT_KV_REVOKE_BLOCKS_TOTAL_HELP,
-                           {{"node", request->node_id()}}, static_cast<uint64_t>(hashes.size()));
-      const size_t kv_count = external_kv_index_.GetKvCount(request->node_id());
-      metrics_->setGauge(MORI_UMBP_METRIC_EXT_KV_LIVE_COUNT,
-                         MORI_UMBP_METRIC_EXT_KV_LIVE_COUNT_HELP, {{"node", request->node_id()}},
-                         static_cast<double>(kv_count));
+                           MORI_UMBP_METRIC_EXT_KV_REVOKE_BLOCKS_TOTAL_HELP, labels,
+                           static_cast<uint64_t>(mutated));
+      metrics_->addCounter(
+          MORI_UMBP_METRIC_EXT_KV_REVOKE_TOTAL, MORI_UMBP_METRIC_EXT_KV_REVOKE_TOTAL_HELP,
+          {{"node", request->node_id()}, {"tier", TierTypeName(tier)}, {"result", "ok"}});
     }
     return grpc::Status::OK;
   }
@@ -470,19 +520,22 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
       grpc::ServerContext* /*ctx*/, const ::umbp::RevokeAllExternalKvBlocksAtTierRequest* request,
       ::umbp::RevokeAllExternalKvBlocksAtTierResponse* /*response*/) override {
     if (request->node_id().empty()) {
-      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "node_id cannot be empty");
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "node_id must not be empty");
     }
-    TierType tier = static_cast<TierType>(request->tier());
-    registry_.UnregisterExternalKvBlocksByTier(request->node_id(), tier);
 
+    const TierType tier = static_cast<TierType>(request->tier());
+    const std::vector<KvEvent> events = {KvEvent{KvEvent::Kind::CLEAR_AT_TIER, "", tier, /*size=*/0,
+                                                 LocationOwner::EXTERNAL_HICACHE}};
+    const size_t mutated = index_.ApplyEvents(request->node_id(), events);
     if (metrics_) {
-      metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_REVOKE_TOTAL,
-                           MORI_UMBP_METRIC_EXT_KV_REVOKE_TOTAL_HELP,
-                           {{"node", request->node_id()}});
-      const size_t kv_count = external_kv_index_.GetKvCount(request->node_id());
-      metrics_->setGauge(MORI_UMBP_METRIC_EXT_KV_LIVE_COUNT,
-                         MORI_UMBP_METRIC_EXT_KV_LIVE_COUNT_HELP, {{"node", request->node_id()}},
-                         static_cast<double>(kv_count));
+      const mori::metrics::MetricsServer::Labels labels = {{"node", request->node_id()},
+                                                           {"tier", TierTypeName(tier)}};
+      metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_REVOKE_BLOCKS_TOTAL,
+                           MORI_UMBP_METRIC_EXT_KV_REVOKE_BLOCKS_TOTAL_HELP, labels,
+                           static_cast<uint64_t>(mutated));
+      metrics_->addCounter(
+          MORI_UMBP_METRIC_EXT_KV_REVOKE_TOTAL, MORI_UMBP_METRIC_EXT_KV_REVOKE_TOTAL_HELP,
+          {{"node", request->node_id()}, {"tier", TierTypeName(tier)}, {"result", "ok"}});
     }
     return grpc::Status::OK;
   }
@@ -491,7 +544,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
                                const ::umbp::MatchExternalKvRequest* request,
                                ::umbp::MatchExternalKvResponse* response) override {
     std::vector<std::string> hashes(request->hashes().begin(), request->hashes().end());
-    auto matches = external_kv_index_.Match(hashes);
+    auto matches = index_.MatchExternal(hashes);
 
     std::unordered_map<std::string, std::string> peer_map;
     for (const auto& record : registry_.GetAliveClients()) {
@@ -635,7 +688,6 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
 
   ClientRegistry& registry_;
   GlobalBlockIndex& index_;
-  ExternalKvBlockIndex& external_kv_index_;
   ExternalKvHitIndex& external_kv_hit_index_;
   Router& router_;
   ClientRegistryConfig config_;
@@ -648,18 +700,15 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
 MasterServer::MasterServer(MasterServerConfig config)
     : config_(std::move(config)),
       index_(),
-      external_kv_index_(),
       external_kv_hit_index_(),
       registry_(config_.registry_config, index_),
       router_(index_, registry_, std::move(config_.get_strategy), std::move(config_.put_strategy)),
-      service_(std::make_unique<UMBPMasterServiceImpl>(registry_, index_, external_kv_index_,
-                                                       external_kv_hit_index_, router_,
-                                                       config_.registry_config, nullptr)),
+      service_(std::make_unique<UMBPMasterServiceImpl>(registry_, index_, external_kv_hit_index_,
+                                                       router_, config_.registry_config, nullptr)),
       peer_stub_pool_(std::make_unique<MasterPeerStubPool>()),
       eviction_manager_(std::make_unique<EvictionManager>(
           index_, registry_, config_.eviction_config, peer_stub_pool_.get())) {
   router_.SetLeaseDuration(config_.eviction_config.lease_duration);
-  registry_.SetExternalKvBlockIndex(&external_kv_index_);
 }
 
 MasterServer::~MasterServer() {
@@ -681,6 +730,8 @@ void MasterServer::Run() {
   StartHitIndexGc();
 
   grpc::ServerBuilder builder;
+  builder.SetMaxReceiveMessageSize(64 * 1024 * 1024);
+  builder.SetMaxSendMessageSize(64 * 1024 * 1024);
   int selected_port = 0;
   builder.AddListeningPort(config_.listen_address, grpc::InsecureServerCredentials(),
                            &selected_port);

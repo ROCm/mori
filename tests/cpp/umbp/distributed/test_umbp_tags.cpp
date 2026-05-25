@@ -122,8 +122,8 @@ TEST(ClientRegistryTagsTest, TagsUnchangedByHeartbeat) {
   ASSERT_TRUE(reg.RegisterClient("n1", "127.0.0.1:9003", {}, "", {}, tags));
 
   uint64_t acked = 0;
-  bool full_sync = false;
-  reg.Heartbeat("n1", 1, 0, {}, {}, false, &acked, &full_sync);
+  uint32_t full_sync = 0;
+  reg.Heartbeat("n1", {}, {}, FullSyncScope::NONE, 0, &acked, &full_sync);
 
   EXPECT_EQ(reg.GetClientTags("n1"), tags);
 }
@@ -194,16 +194,6 @@ class CapturingMasterService final : public ::umbp::UMBPMaster::Service {
   }
   grpc::Status BatchRoutePut(grpc::ServerContext*, const ::umbp::BatchRoutePutRequest*,
                              ::umbp::BatchRoutePutResponse*) override {
-    return grpc::Status::OK;
-  }
-  grpc::Status ReportExternalKvBlocks(grpc::ServerContext*,
-                                      const ::umbp::ReportExternalKvBlocksRequest*,
-                                      ::umbp::ReportExternalKvBlocksResponse*) override {
-    return grpc::Status::OK;
-  }
-  grpc::Status RevokeExternalKvBlocks(grpc::ServerContext*,
-                                      const ::umbp::RevokeExternalKvBlocksRequest*,
-                                      ::umbp::RevokeExternalKvBlocksResponse*) override {
     return grpc::Status::OK;
   }
   grpc::Status MatchExternalKv(grpc::ServerContext*, const ::umbp::MatchExternalKvRequest*,

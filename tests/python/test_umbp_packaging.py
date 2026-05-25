@@ -57,6 +57,7 @@ def _write_fake_mori_package(tmp_path: Path, proxy_mode: int) -> Path:
                 "class UMBPDurabilityConfig: pass",
                 "class UMBPTierType: pass",
                 "class UMBPExternalKvMatch: pass",
+                "class UMBPExternalKvHitCountEntry: pass",
             ]
         ),
         encoding="utf-8",

@@ -128,17 +128,24 @@ def master_server():
 
 @contextlib.contextmanager
 def registered_client(master_address: str, node_id: str, tier_caps: dict):
-    """Yield a UMBPMasterClient that is registered and auto-unregisters on exit."""
-    from mori.cpp import UMBPMasterClient
+    """Yield a distributed UMBPClient that is registered and auto-unregisters on exit."""
+    from mori.cpp import UMBPClient, UMBPConfig, UMBPDistributedConfig
 
-    client = UMBPMasterClient(master_address, node_id=node_id, node_address=node_id)
-    client.register_self(tier_caps)
-    print(f"[client] {node_id!r} registered  (is_registered={client.is_registered()})")
+    cfg = UMBPConfig()
+    cfg.dram.capacity_bytes = 8 * 1024 * 1024
+    cfg.ssd.enabled = False
+    dist = UMBPDistributedConfig()
+    dist.master_config.master_address = master_address
+    dist.master_config.node_id = node_id
+    dist.master_config.node_address = node_id
+    cfg.distributed = dist
+    client = UMBPClient(cfg)
+    print(f"[client] {node_id!r} registered")
     try:
         yield client
     finally:
         with contextlib.suppress(Exception):
-            client.unregister_self()
+            client.close()
         print(f"[client] {node_id!r} unregistered")
 
 
@@ -147,8 +154,18 @@ def registered_client(master_address: str, node_id: str, tier_caps: dict):
 # ---------------------------------------------------------------------------
 
 
+def bind_external(client, hashes, tier) -> None:
+    assert client.bind_external_hashes(hashes, tier)
+    assert client.flush_external_queue()
+
+
+def unbind_external(client, hashes, tier) -> None:
+    assert client.unbind_external_hashes(hashes, tier)
+    assert client.flush_external_queue()
+
+
 def run_demo(master_address: str) -> None:
-    from mori.cpp import UMBPMasterClient, UMBPTierType
+    from mori.cpp import UMBPTierType
 
     _1GB = 1 * 1024 * 1024 * 1024
     DRAM_CAPS = {UMBPTierType.DRAM: (_1GB, _1GB)}
@@ -161,7 +178,7 @@ def run_demo(master_address: str) -> None:
     hashes_a = [f"block-{i:04d}" for i in range(5)]
 
     with registered_client(master_address, "node-a", DRAM_CAPS) as ca:
-        ca.report_external_kv_blocks("node-a", hashes_a, UMBPTierType.DRAM)
+        bind_external(ca, hashes_a, UMBPTierType.DRAM)
         print(f"[node-a] reported {len(hashes_a)} blocks on DRAM")
 
         matches = ca.match_external_kv(hashes_a)
@@ -188,8 +205,8 @@ def run_demo(master_address: str) -> None:
         registered_client(master_address, "node-c", HBM_CAPS) as cc,
     ):
 
-        cb.report_external_kv_blocks("node-b", shared_hashes, UMBPTierType.DRAM)
-        cc.report_external_kv_blocks("node-c", shared_hashes, UMBPTierType.HBM)
+        bind_external(cb, shared_hashes, UMBPTierType.DRAM)
+        bind_external(cc, shared_hashes, UMBPTierType.HBM)
         print(f"[node-b] reported {len(shared_hashes)} blocks on DRAM")
         print(f"[node-c] reported {len(shared_hashes)} blocks on HBM")
 
@@ -210,8 +227,8 @@ def run_demo(master_address: str) -> None:
     to_keep = hashes_d[3:]
 
     with registered_client(master_address, "node-d", DRAM_CAPS) as cd:
-        cd.report_external_kv_blocks("node-d", hashes_d, UMBPTierType.DRAM)
-        cd.revoke_external_kv_blocks("node-d", to_revoke, UMBPTierType.DRAM)
+        bind_external(cd, hashes_d, UMBPTierType.DRAM)
+        unbind_external(cd, to_revoke, UMBPTierType.DRAM)
         print(f"[node-d] revoked {len(to_revoke)} blocks, kept {len(to_keep)}")
 
         kept_matches = {

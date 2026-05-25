@@ -29,6 +29,9 @@ from pathlib import Path
 import pytest
 
 from mori.cpp import (
+    UMBPClient,
+    UMBPConfig,
+    UMBPDistributedConfig,
     UMBPMasterClient,
     UMBPTierType,
     UMBPExternalKvNodeMatch,
@@ -65,6 +68,40 @@ def _make_hashes(prefix: str, count: int) -> list[str]:
     return [f"{prefix}-hash-{i:04d}" for i in range(count)]
 
 
+def _start_master_process(address: str, metrics_port: int = 0) -> subprocess.Popen:
+    if not MASTER_BIN.is_file():
+        pytest.skip(f"UMBP master binary not found: {MASTER_BIN}")
+
+    proc = subprocess.Popen(
+        [str(MASTER_BIN), address, str(metrics_port)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    host, port_text = address.rsplit(":", 1)
+    if not _wait_for_port(host, int(port_text), timeout=10.0):
+        _stop_master_process(proc)
+        pytest.fail(f"UMBP master server did not start within 10s on {address}")
+    return proc
+
+
+def _stop_master_process(proc: subprocess.Popen) -> None:
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
+@contextlib.contextmanager
+def _running_master(address: str, metrics_port: int = 0):
+    proc = _start_master_process(address, metrics_port)
+    try:
+        yield proc
+    finally:
+        _stop_master_process(proc)
+
+
 def _hit_counts(client: UMBPMasterClient, hashes: list[str]) -> dict[str, int]:
     return {
         entry.hash: entry.hit_count_total
@@ -74,7 +111,26 @@ def _hit_counts(client: UMBPMasterClient, hashes: list[str]) -> dict[str, int]:
 
 @contextlib.contextmanager
 def _registered_client(master_address: str, node_id: str, caps=None):
-    """Context manager that yields a UMBPMasterClient registered with the master."""
+    """Context manager that yields a distributed UMBPClient registered with the master."""
+    cfg = UMBPConfig()
+    cfg.dram.capacity_bytes = 8 * 1024 * 1024
+    cfg.ssd.enabled = False
+    dist = UMBPDistributedConfig()
+    dist.master_config.master_address = master_address
+    dist.master_config.node_id = node_id
+    dist.master_config.node_address = node_id
+    dist.master_config.auto_heartbeat = True
+    cfg.distributed = dist
+    client = UMBPClient(cfg)
+    try:
+        yield client
+    finally:
+        with contextlib.suppress(Exception):
+            client.close()
+
+
+@contextlib.contextmanager
+def _registered_master_client(master_address: str, node_id: str, caps=None):
     client = UMBPMasterClient(master_address, node_id=node_id, node_address=node_id)
     client.register_self(caps or _DEFAULT_CAPS)
     try:
@@ -84,34 +140,38 @@ def _registered_client(master_address: str, node_id: str, caps=None):
             client.unregister_self()
 
 
+def _bind(client, hashes: list[str], tier) -> None:
+    assert client.bind_external_hashes(hashes, tier)
+    assert client.flush_external_queue()
+
+
+def _unbind(client, hashes: list[str], tier) -> None:
+    assert client.unbind_external_hashes(hashes, tier)
+    assert client.flush_external_queue()
+
+
+def _clear_tier(client, tier) -> None:
+    assert client.unbind_all_external_hashes_at_tier(tier)
+    assert client.flush_external_queue()
+
+
+def _flush_external_queue_until_ok(client, timeout: float = 10.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if client.flush_external_queue():
+            return True
+        time.sleep(0.2)
+    return False
+
+
 @pytest.fixture(scope="module")
 def master_address():
-    if not MASTER_BIN.is_file():
-        pytest.skip(f"UMBP master binary not found: {MASTER_BIN}")
-
     port = _get_free_port()
     metrics_port = _get_free_port()
     address = f"localhost:{port}"
 
-    proc = subprocess.Popen(
-        [str(MASTER_BIN), address, str(metrics_port)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
-    if not _wait_for_port("localhost", port, timeout=10.0):
-        proc.terminate()
-        proc.wait()
-        pytest.fail(f"UMBP master server did not start within 10s on port {port}")
-
-    yield address
-
-    proc.terminate()
-    try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
+    with _running_master(address, metrics_port):
+        yield address
 
 
 # ---------------------------------------------------------------------------
@@ -158,8 +218,8 @@ def test_unregister_not_registered_raises(master_address):
     client = UMBPMasterClient(
         master_address, node_id="unreg-test-node", node_address="unreg-test-node:8080"
     )
-    with pytest.raises(RuntimeError):
-        client.unregister_self()
+    client.unregister_self()
+    assert not client.is_registered()
 
 
 # ---------------------------------------------------------------------------
@@ -185,16 +245,185 @@ def test_external_kv_hit_counts_are_sparse_for_unknown_hashes(master_address):
     assert client.get_external_kv_hit_counts(_make_hashes("unknown-hit-count", 3)) == []
 
 
-def test_report_empty_hashes_raises(master_address):
-    client = UMBPMasterClient(master_address)
-    with pytest.raises(RuntimeError, match="empty"):
-        client.report_external_kv_blocks("any-node", [], UMBPTierType.DRAM)
+def test_master_client_report_external_kv_blocks_round_trip(master_address):
+    node_id = "rpc-report-node"
+    hashes = _make_hashes("rpc-report", 3)
+
+    with _registered_master_client(master_address, node_id):
+        client = UMBPMasterClient(master_address)
+        client.report_external_kv_blocks(node_id, hashes, UMBPTierType.DRAM)
+
+        matches = [m for m in client.match_external_kv(hashes) if m.node_id == node_id]
+        assert len(matches) == 1
+        assert set(matches[0].hashes_by_tier[UMBPTierType.DRAM]) == set(hashes)
 
 
-def test_revoke_empty_hashes_raises(master_address):
+def test_master_client_revoke_external_kv_blocks_single_tier(master_address):
+    node_id = "rpc-revoke-tier-node"
+    hashes = _make_hashes("rpc-revoke-tier", 4)
+    caps = {UMBPTierType.HBM: (_1GB, _1GB), UMBPTierType.DRAM: (_1GB, _1GB)}
+
+    with _registered_master_client(master_address, node_id, caps):
+        client = UMBPMasterClient(master_address)
+        client.report_external_kv_blocks(node_id, hashes, UMBPTierType.HBM)
+        client.report_external_kv_blocks(node_id, hashes, UMBPTierType.DRAM)
+        client.revoke_external_kv_blocks(node_id, hashes, UMBPTierType.HBM)
+
+        matches = [m for m in client.match_external_kv(hashes) if m.node_id == node_id]
+        assert len(matches) == 1
+        assert UMBPTierType.HBM not in matches[0].hashes_by_tier
+        assert set(matches[0].hashes_by_tier[UMBPTierType.DRAM]) == set(hashes)
+
+
+def test_master_client_revoke_all_external_kv_blocks_at_tier(master_address):
+    node_id = "rpc-revoke-all-node"
+    hashes = _make_hashes("rpc-revoke-all", 8)
+
+    with _registered_master_client(master_address, node_id):
+        client = UMBPMasterClient(master_address)
+        client.report_external_kv_blocks(node_id, hashes, UMBPTierType.DRAM)
+        client.report_external_kv_blocks(node_id, hashes, UMBPTierType.SSD)
+        client.revoke_all_external_kv_blocks_at_tier(node_id, UMBPTierType.SSD)
+
+        matches = [m for m in client.match_external_kv(hashes) if m.node_id == node_id]
+        assert len(matches) == 1
+        assert UMBPTierType.SSD not in matches[0].hashes_by_tier
+        assert set(matches[0].hashes_by_tier[UMBPTierType.DRAM]) == set(hashes)
+
+
+def test_master_client_report_for_unregistered_node_is_ignored(master_address):
     client = UMBPMasterClient(master_address)
-    with pytest.raises(RuntimeError, match="empty"):
-        client.revoke_external_kv_blocks("any-node", [], UMBPTierType.DRAM)
+    hashes = _make_hashes("rpc-ghost", 1)
+
+    client.report_external_kv_blocks("rpc-ghost-node", hashes, UMBPTierType.DRAM)
+
+    assert all(m.node_id != "rpc-ghost-node" for m in client.match_external_kv(hashes))
+
+
+def test_master_client_report_after_unregister_is_ignored(master_address):
+    node_id = "rpc-dead-node"
+    hashes = _make_hashes("rpc-dead", 1)
+
+    client = UMBPMasterClient(master_address, node_id=node_id, node_address=node_id)
+    client.register_self(_DEFAULT_CAPS)
+    client.unregister_self()
+
+    client.report_external_kv_blocks(node_id, hashes, UMBPTierType.DRAM)
+
+    assert all(m.node_id != node_id for m in client.match_external_kv(hashes))
+
+
+def test_master_client_revoke_for_unknown_node_is_noop(master_address):
+    client = UMBPMasterClient(master_address)
+    client.revoke_external_kv_blocks(
+        "rpc-unknown-revoke-node",
+        _make_hashes("rpc-unknown-revoke", 2),
+        UMBPTierType.DRAM,
+    )
+    client.revoke_all_external_kv_blocks_at_tier(
+        "rpc-unknown-revoke-node", UMBPTierType.DRAM
+    )
+
+
+def test_master_client_report_empty_node_id_raises(master_address):
+    client = UMBPMasterClient(master_address)
+    with pytest.raises(RuntimeError, match="node_id"):
+        client.report_external_kv_blocks("", ["rpc-empty-node-hash"], UMBPTierType.DRAM)
+
+
+def test_master_client_report_empty_hashes_raises(master_address):
+    node_id = "rpc-empty-hashes-node"
+    with _registered_master_client(master_address, node_id):
+        client = UMBPMasterClient(master_address)
+        with pytest.raises(RuntimeError, match="hashes"):
+            client.report_external_kv_blocks(node_id, [], UMBPTierType.DRAM)
+
+
+def test_umbpclient_report_external_kv_blocks_alias_is_visible(master_address):
+    node_id = "alias-report-node"
+    hashes = _make_hashes("alias-report", 2)
+
+    with _registered_client(master_address, node_id) as client:
+        assert client.report_external_kv_blocks(hashes, UMBPTierType.DRAM)
+
+        query = UMBPMasterClient(master_address)
+        matches = [m for m in query.match_external_kv(hashes) if m.node_id == node_id]
+        assert len(matches) == 1
+        assert set(matches[0].hashes_by_tier[UMBPTierType.DRAM]) == set(hashes)
+
+
+def test_umbpclient_two_arg_alias_survives_external_full_sync():
+    port = _get_free_port()
+    address = f"localhost:{port}"
+    node_id = "alias-full-sync-node"
+    hashes = _make_hashes("alias-full-sync", 2)
+
+    proc = _start_master_process(address)
+    try:
+        with _registered_client(address, node_id) as client:
+            assert client.report_external_kv_blocks(hashes, UMBPTierType.DRAM)
+
+            query = UMBPMasterClient(address)
+            matches = [
+                m for m in query.match_external_kv(hashes) if m.node_id == node_id
+            ]
+            assert len(matches) == 1
+            assert set(matches[0].hashes_by_tier[UMBPTierType.DRAM]) == set(hashes)
+
+            _stop_master_process(proc)
+            proc = None
+
+            proc = _start_master_process(address)
+            assert _flush_external_queue_until_ok(client)
+            assert _flush_external_queue_until_ok(client)
+
+            query = UMBPMasterClient(address)
+            matches = [
+                m for m in query.match_external_kv(hashes) if m.node_id == node_id
+            ]
+            assert len(matches) == 1
+            assert set(matches[0].hashes_by_tier[UMBPTierType.DRAM]) == set(hashes)
+    finally:
+        if proc is not None:
+            _stop_master_process(proc)
+
+
+def test_umbpclient_revoke_external_kv_blocks_alias(master_address):
+    node_id = "alias-revoke-node"
+    hashes = _make_hashes("alias-revoke", 2)
+
+    with _registered_client(master_address, node_id) as client:
+        assert client.report_external_kv_blocks(hashes, UMBPTierType.DRAM)
+        assert client.revoke_external_kv_blocks(hashes, UMBPTierType.DRAM)
+
+        query = UMBPMasterClient(master_address)
+        assert all(m.node_id != node_id for m in query.match_external_kv(hashes))
+
+
+def test_umbpclient_revoke_all_external_kv_blocks_at_tier_alias(master_address):
+    node_id = "alias-revoke-all-node"
+    hashes = _make_hashes("alias-revoke-all", 3)
+
+    with _registered_client(master_address, node_id) as client:
+        assert client.report_external_kv_blocks(hashes, UMBPTierType.DRAM)
+        assert client.report_external_kv_blocks(hashes, UMBPTierType.SSD)
+        assert client.revoke_all_external_kv_blocks_at_tier(UMBPTierType.SSD)
+
+        query = UMBPMasterClient(master_address)
+        matches = [m for m in query.match_external_kv(hashes) if m.node_id == node_id]
+        assert len(matches) == 1
+        assert UMBPTierType.SSD not in matches[0].hashes_by_tier
+        assert set(matches[0].hashes_by_tier[UMBPTierType.DRAM]) == set(hashes)
+
+
+def test_bind_empty_hashes_is_noop(master_address):
+    with _registered_client(master_address, "empty-bind-node") as client:
+        _bind(client, [], UMBPTierType.DRAM)
+
+
+def test_unbind_empty_hashes_is_noop(master_address):
+    with _registered_client(master_address, "empty-unbind-node") as client:
+        _unbind(client, [], UMBPTierType.DRAM)
 
 
 def test_report_and_match_external_kv_dram(master_address):
@@ -202,7 +431,7 @@ def test_report_and_match_external_kv_dram(master_address):
     hashes = _make_hashes("dram", 8)
 
     with _registered_client(master_address, node_id) as client:
-        client.report_external_kv_blocks(node_id, hashes, UMBPTierType.DRAM)
+        _bind(client, hashes, UMBPTierType.DRAM)
 
         matches = client.match_external_kv(hashes)
         assert len(matches) == 1
@@ -218,7 +447,7 @@ def test_match_external_kv_count_as_hit_false_does_not_record(master_address):
     hashes = _make_hashes("hit-count-disabled", 2)
 
     with _registered_client(master_address, node_id) as client:
-        client.report_external_kv_blocks(node_id, hashes, UMBPTierType.DRAM)
+        _bind(client, hashes, UMBPTierType.DRAM)
 
         for _ in range(3):
             assert client.match_external_kv(hashes)
@@ -238,9 +467,9 @@ def test_match_external_kv_count_as_hit_records_only_matched_unique_hashes(
         _registered_client(master_address, node_a) as ca,
         _registered_client(master_address, node_b) as cb,
     ):
-        ca.report_external_kv_blocks(node_a, [hot_hash], UMBPTierType.DRAM)
-        ca.report_external_kv_blocks(node_a, [hot_hash], UMBPTierType.HBM)
-        cb.report_external_kv_blocks(node_b, [hot_hash], UMBPTierType.DRAM)
+        _bind(ca, [hot_hash], UMBPTierType.DRAM)
+        _bind(ca, [hot_hash], UMBPTierType.HBM)
+        _bind(cb, [hot_hash], UMBPTierType.DRAM)
 
         matches = ca.match_external_kv(
             [hot_hash, hot_hash, hot_hash, missing_hash], count_as_hit=True
@@ -256,13 +485,13 @@ def test_external_kv_hit_counts_accumulate_and_survive_revoke(master_address):
     hot_hash = "hit-count-revoke-hot"
 
     with _registered_client(master_address, node_id) as client:
-        client.report_external_kv_blocks(node_id, [hot_hash], UMBPTierType.DRAM)
+        _bind(client, [hot_hash], UMBPTierType.DRAM)
         for _ in range(4):
             client.match_external_kv([hot_hash], count_as_hit=True)
 
         assert _hit_counts(client, [hot_hash]) == {hot_hash: 4}
 
-        client.revoke_external_kv_blocks(node_id, [hot_hash], UMBPTierType.DRAM)
+        _unbind(client, [hot_hash], UMBPTierType.DRAM)
         assert client.match_external_kv([hot_hash], count_as_hit=True) == []
         assert _hit_counts(client, [hot_hash]) == {hot_hash: 4}
 
@@ -282,7 +511,7 @@ def test_report_and_match_external_kv_hbm(master_address):
     caps = {UMBPTierType.HBM: (_1GB, _1GB)}
 
     with _registered_client(master_address, node_id, caps) as client:
-        client.report_external_kv_blocks(node_id, hashes, UMBPTierType.HBM)
+        _bind(client, hashes, UMBPTierType.HBM)
 
         matches = client.match_external_kv(hashes)
         node_ids = {m.node_id for m in matches}
@@ -299,7 +528,7 @@ def test_match_returns_only_subset_of_queried_hashes(master_address):
     extra = _make_hashes("subset-extra", 4)
 
     with _registered_client(master_address, node_id) as client:
-        client.report_external_kv_blocks(node_id, reported, UMBPTierType.DRAM)
+        _bind(client, reported, UMBPTierType.DRAM)
 
         query = reported[:3] + extra
         matches = client.match_external_kv(query)
@@ -316,10 +545,10 @@ def test_revoke_removes_hashes_from_index(master_address):
     hashes = _make_hashes("revoke", 6)
 
     with _registered_client(master_address, node_id) as client:
-        client.report_external_kv_blocks(node_id, hashes, UMBPTierType.DRAM)
+        _bind(client, hashes, UMBPTierType.DRAM)
         assert any(m.node_id == node_id for m in client.match_external_kv(hashes))
 
-        client.revoke_external_kv_blocks(node_id, hashes, UMBPTierType.DRAM)
+        _unbind(client, hashes, UMBPTierType.DRAM)
 
         node_ids_after = {m.node_id for m in client.match_external_kv(hashes)}
         assert node_id not in node_ids_after
@@ -332,8 +561,8 @@ def test_revoke_partial_hashes(master_address):
     to_keep = hashes[4:]
 
     with _registered_client(master_address, node_id) as client:
-        client.report_external_kv_blocks(node_id, hashes, UMBPTierType.DRAM)
-        client.revoke_external_kv_blocks(node_id, to_revoke, UMBPTierType.DRAM)
+        _bind(client, hashes, UMBPTierType.DRAM)
+        _unbind(client, to_revoke, UMBPTierType.DRAM)
 
         kept_matched = {
             h
@@ -363,8 +592,8 @@ def test_multiple_nodes_report_same_hashes(master_address):
         _registered_client(master_address, node_a) as ca,
         _registered_client(master_address, node_b) as cb,
     ):
-        ca.report_external_kv_blocks(node_a, hashes, UMBPTierType.DRAM)
-        cb.report_external_kv_blocks(node_b, hashes, UMBPTierType.HBM)
+        _bind(ca, hashes, UMBPTierType.DRAM)
+        _bind(cb, hashes, UMBPTierType.HBM)
 
         matches = ca.match_external_kv(hashes)
         matched_nodes = {m.node_id for m in matches}
@@ -377,8 +606,8 @@ def test_report_overwrites_tier_for_same_node(master_address):
     hashes = _make_hashes("overwrite", 3)
 
     with _registered_client(master_address, node_id) as client:
-        client.report_external_kv_blocks(node_id, hashes, UMBPTierType.DRAM)
-        client.report_external_kv_blocks(node_id, hashes, UMBPTierType.HBM)
+        _bind(client, hashes, UMBPTierType.DRAM)
+        _bind(client, hashes, UMBPTierType.HBM)
 
         node_matches = [
             m for m in client.match_external_kv(hashes) if m.node_id == node_id
@@ -389,8 +618,8 @@ def test_report_overwrites_tier_for_same_node(master_address):
 def test_revoke_nonexistent_hashes_does_not_raise(master_address):
     # Revoking hashes that were never reported is a no-op.
     hashes = _make_hashes("nonexistent", 3)
-    client = UMBPMasterClient(master_address)
-    client.revoke_external_kv_blocks("any-node", hashes, UMBPTierType.DRAM)
+    with _registered_client(master_address, "nonexistent-revoke-node") as client:
+        _unbind(client, hashes, UMBPTierType.DRAM)
 
 
 def test_external_kv_node_match_repr():
@@ -417,16 +646,17 @@ def test_match_external_kv_connection_refused_raises():
         client.match_external_kv(["some-hash"])
 
 
-def test_report_external_kv_connection_refused_raises():
-    client = UMBPMasterClient("localhost:19997")
+def test_bind_external_kv_connection_refused_raises():
+    cfg = UMBPConfig()
+    cfg.dram.capacity_bytes = 8 * 1024 * 1024
+    cfg.ssd.enabled = False
+    dist = UMBPDistributedConfig()
+    dist.master_config.master_address = "localhost:19997"
+    dist.master_config.node_id = "bind-refused"
+    dist.master_config.node_address = "bind-refused"
+    cfg.distributed = dist
     with pytest.raises(RuntimeError):
-        client.report_external_kv_blocks("node", ["hash"], UMBPTierType.DRAM)
-
-
-def test_revoke_external_kv_connection_refused_raises():
-    client = UMBPMasterClient("localhost:19996")
-    with pytest.raises(RuntimeError):
-        client.revoke_external_kv_blocks("node", ["hash"], UMBPTierType.DRAM)
+        UMBPClient(cfg)
 
 
 def test_large_batch_report_and_match(master_address):
@@ -434,7 +664,7 @@ def test_large_batch_report_and_match(master_address):
     hashes = _make_hashes("large", 500)
 
     with _registered_client(master_address, node_id) as client:
-        client.report_external_kv_blocks(node_id, hashes, UMBPTierType.DRAM)
+        _bind(client, hashes, UMBPTierType.DRAM)
 
         matches = client.match_external_kv(hashes)
         all_matched = {
@@ -450,8 +680,8 @@ def test_register_is_additive_across_tiers(master_address):
     hashes = _make_hashes("additive", 4)
 
     with _registered_client(master_address, node_id, caps) as client:
-        client.report_external_kv_blocks(node_id, hashes, UMBPTierType.HBM)
-        client.report_external_kv_blocks(node_id, hashes, UMBPTierType.DRAM)
+        _bind(client, hashes, UMBPTierType.HBM)
+        _bind(client, hashes, UMBPTierType.DRAM)
 
         matches = [m for m in client.match_external_kv(hashes) if m.node_id == node_id]
         assert len(matches) == 1
@@ -469,10 +699,10 @@ def test_revoke_drops_only_one_tier(master_address):
     hashes = _make_hashes("tier-revoke", 3)
 
     with _registered_client(master_address, node_id, caps) as client:
-        client.report_external_kv_blocks(node_id, hashes, UMBPTierType.HBM)
-        client.report_external_kv_blocks(node_id, hashes, UMBPTierType.DRAM)
+        _bind(client, hashes, UMBPTierType.HBM)
+        _bind(client, hashes, UMBPTierType.DRAM)
 
-        client.revoke_external_kv_blocks(node_id, hashes, UMBPTierType.HBM)
+        _unbind(client, hashes, UMBPTierType.HBM)
 
         matches = [m for m in client.match_external_kv(hashes) if m.node_id == node_id]
         assert len(matches) == 1
@@ -489,11 +719,11 @@ def test_revoke_all_at_tier_bulk(master_address):
     hashes = _make_hashes("bulk-revoke", 50)
 
     with _registered_client(master_address, node_id, caps) as client:
-        client.report_external_kv_blocks(node_id, hashes, UMBPTierType.DRAM)
-        client.report_external_kv_blocks(node_id, hashes, UMBPTierType.SSD)
+        _bind(client, hashes, UMBPTierType.DRAM)
+        _bind(client, hashes, UMBPTierType.SSD)
         assert any(m.node_id == node_id for m in client.match_external_kv(hashes))
 
-        client.revoke_all_external_kv_blocks_at_tier(node_id, UMBPTierType.SSD)
+        _clear_tier(client, UMBPTierType.SSD)
 
         matches = [m for m in client.match_external_kv(hashes) if m.node_id == node_id]
         assert len(matches) == 1
