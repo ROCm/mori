@@ -1,3 +1,7 @@
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+// MIT License — see LICENSE for details.
+#pragma once
+
 #include "mori/cco/cco_types.hpp"
 
 namespace mori {

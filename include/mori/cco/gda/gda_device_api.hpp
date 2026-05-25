@@ -21,7 +21,7 @@
 // SOFTWARE.
 #pragma once
 
-#include "mori/Cco/gda/gda_device_common.hpp"
+#include "mori/cco/gda/gda_device_common.hpp"
 
 namespace mori {
 namespace cco {
