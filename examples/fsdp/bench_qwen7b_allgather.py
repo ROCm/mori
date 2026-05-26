@@ -41,6 +41,9 @@ _use_local_fsdp()
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 
 
+_BENCHMARK_SEED = 1234
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Qwen7B FSDP2 training benchmark for native vs MORI SDMA allgather"
@@ -175,32 +178,36 @@ def _apply_fsdp2(model: torch.nn.Module, dtype: torch.dtype, reshard_root: bool)
     fully_shard(model, mp_policy=mp_policy, reshard_after_forward=reshard_root)
 
 
-def _make_batch(
+def _make_batches(
     vocab_size: int,
     batch_size: int,
     seq_len: int,
+    total_steps: int,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    input_ids = torch.randint(
-        low=0,
-        high=vocab_size,
-        size=(batch_size, seq_len),
-        device=device,
-        dtype=torch.long,
-    )
-    labels = input_ids.clone()
-    return input_ids, labels
+    seed: int,
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
+    batches = []
+    for _ in range(total_steps):
+        input_ids = torch.randint(
+            low=0,
+            high=vocab_size,
+            size=(batch_size, seq_len),
+            device=device,
+            dtype=torch.long,
+            generator=generator,
+        )
+        batches.append((input_ids, input_ids.clone()))
+    return batches
 
 
 def _run_step(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
-    vocab_size: int,
-    batch_size: int,
-    seq_len: int,
-    device: torch.device,
+    batch: tuple[torch.Tensor, torch.Tensor],
 ) -> float:
-    input_ids, labels = _make_batch(vocab_size, batch_size, seq_len, device)
+    input_ids, labels = batch
     optimizer.zero_grad(set_to_none=True)
     outputs = model(input_ids=input_ids, labels=labels)
     loss = outputs.loss
@@ -216,8 +223,8 @@ def main() -> None:
     _init_mori_shmem_if_needed(args.mode)
 
     dtype = _get_torch_dtype(args.dtype)
-    torch.manual_seed(1234 + rank)
-    torch.cuda.manual_seed_all(1234 + rank)
+    torch.manual_seed(_BENCHMARK_SEED + rank)
+    torch.cuda.manual_seed_all(_BENCHMARK_SEED + rank)
 
     autocast_ctx = (
         torch.autocast(device_type="cuda", dtype=dtype)
@@ -242,6 +249,16 @@ def main() -> None:
     measured_times: list[float] = []
     measured_losses: list[float] = []
     total_steps = args.warmup + args.steps
+    batches = _make_batches(
+        config.vocab_size,
+        args.micro_batch_size,
+        args.seq_len,
+        total_steps,
+        device,
+        seed=_BENCHMARK_SEED + 100_000 + rank,
+    )
+    dist.barrier()
+    torch.cuda.synchronize(device)
     for step in range(total_steps):
         torch.cuda.synchronize(device)
         start = time.perf_counter()
@@ -249,10 +266,7 @@ def main() -> None:
             loss = _run_step(
                 model,
                 optimizer,
-                config.vocab_size,
-                args.micro_batch_size,
-                args.seq_len,
-                device,
+                batches[step],
             )
         torch.cuda.synchronize(device)
         elapsed = time.perf_counter() - start
@@ -295,6 +309,7 @@ def main() -> None:
             "steps": args.steps,
             "warmup": args.warmup,
             "dtype": args.dtype,
+            "seed": _BENCHMARK_SEED,
             "avg_step_time_s": avg_step_time,
             "avg_tokens_per_s": avg_tokens_per_s,
             "last_loss": measured_losses[-1] if measured_losses else None,
