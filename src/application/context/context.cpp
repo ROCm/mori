@@ -400,25 +400,26 @@ void Context::BuildAndConnectInitialEndpoints() {
   }
 }
 
-// Decides whether peer `i` should get a QP allocated in CreateAdditional /
-// connected in ConnectAdditional. Centralizes the FULL vs default-policy split.
+// Whether peer `i` should be a target for QP create/connect. Filters self
+// and capability-less peers regardless of what the mask says, so callers
+// don't need to repeat those checks.
 static bool ShouldCreateQpForPeer(int i, int selfRank,
-                                  const std::vector<TransportType>& transportTypes,
                                   const std::vector<PeerCapabilities>& peerCaps,
-                                  bool forceAllPeers) {
-  if (i == selfRank) return false;  // never QP to self
-  if (forceAllPeers) return peerCaps[i].canRDMA;
-  return transportTypes[i] == TransportType::RDMA;
+                                  const std::vector<bool>& peerMask) {
+  if (i == selfRank) return false;
+  if (i >= static_cast<int>(peerMask.size())) return false;
+  if (!peerMask[i]) return false;
+  return peerCaps[i].canRDMA;
 }
 
-std::vector<RdmaEndpoint> Context::CreateAdditionalEndpoints(int qpPerPe, bool forceAllPeers) {
+std::vector<RdmaEndpoint> Context::CreateAdditionalEndpoints(
+    int qpPerPe, const std::vector<bool>& peerMask) {
   std::vector<RdmaEndpoint> eps;
   eps.reserve(WorldSize() * qpPerPe);
 
   for (int i = 0; i < WorldSize(); i++) {
     const bool need = rdmaDeviceContext != nullptr &&
-                      ShouldCreateQpForPeer(i, LocalRank(), transportTypes, peerCaps,
-                                            forceAllPeers);
+                      ShouldCreateQpForPeer(i, LocalRank(), peerCaps, peerMask);
     if (!need) {
       for (int qp = 0; qp < qpPerPe; qp++) eps.push_back({});
       continue;
@@ -432,7 +433,7 @@ std::vector<RdmaEndpoint> Context::CreateAdditionalEndpoints(int qpPerPe, bool f
 }
 
 void Context::ConnectAdditionalEndpoints(std::vector<RdmaEndpoint>& endpoints, int qpPerPe,
-                                          bool forceAllPeers) {
+                                          const std::vector<bool>& peerMask) {
   int totalEps = WorldSize() * qpPerPe;
   std::vector<RdmaEndpointHandle> localHandles(totalEps);
   std::vector<RdmaEndpointHandle> peerHandles(totalEps);
@@ -444,8 +445,7 @@ void Context::ConnectAdditionalEndpoints(std::vector<RdmaEndpoint>& endpoints, i
   bootNet.AllToAll(localHandles.data(), peerHandles.data(), sizeof(RdmaEndpointHandle) * qpPerPe);
 
   for (int peer = 0; peer < WorldSize(); peer++) {
-    if (!ShouldCreateQpForPeer(peer, LocalRank(), transportTypes, peerCaps, forceAllPeers))
-      continue;
+    if (!ShouldCreateQpForPeer(peer, LocalRank(), peerCaps, peerMask)) continue;
     for (int qp = 0; qp < qpPerPe; qp++) {
       int idx = peer * qpPerPe + qp;
       rdmaDeviceContext->ConnectEndpoint(localHandles[idx], peerHandles[idx], qp);

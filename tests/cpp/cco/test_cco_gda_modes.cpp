@@ -76,8 +76,10 @@ static void run_rank(int rank, int nranks, const mori::application::UniqueId& ui
 
   mori::cco::CcoDevComm* dcNone = nullptr;
   mori::cco::CcoDevComm* dcFull = nullptr;
+  mori::cco::CcoDevComm* dcRail = nullptr;
   auto reqsNone = makeReqs(mori::cco::CCO_GDA_CONNECTION_NONE);
   auto reqsFull = makeReqs(mori::cco::CCO_GDA_CONNECTION_FULL);
+  auto reqsRail = makeReqs(mori::cco::CCO_GDA_CONNECTION_RAIL);
   const int numQpPerPe = reqsFull.gdaContextCount;
 
   if (mori::cco::CcoDevCommCreate(comm, &reqsNone, &dcNone) != 0) {
@@ -91,28 +93,48 @@ static void run_rank(int rank, int nranks, const mori::application::UniqueId& ui
     mori::cco::CcoCommDestroy(comm);
     return;
   }
+  if (mori::cco::CcoDevCommCreate(comm, &reqsRail, &dcRail) != 0) {
+    snprintf(r->detail, sizeof(r->detail), "DevCommCreate RAIL failed");
+    mori::cco::CcoDevCommDestroy(comm, dcFull);
+    mori::cco::CcoDevCommDestroy(comm, dcNone);
+    mori::cco::CcoCommDestroy(comm);
+    return;
+  }
 
-  int qpsNone = CountQpsFor(dcNone, comm->worldSize);
-  int qpsFull = CountQpsFor(dcFull, comm->worldSize);
-  int expectedFull = (comm->worldSize - 1) * numQpPerPe;  // every non-self peer
+  // Expectations on a uniform N-nodes × lsaSize layout:
+  //   NONE : 0
+  //   FULL : (worldSize - 1) * qpsPerPe
+  //   RAIL : (nNodes - 1) * qpsPerPe  (one peer per other node at same lsaRank)
+  // On single-node (nNodes == 1), RAIL collapses to NONE: expected 0.
+  const int nNodes = comm->worldSize / comm->lsaSize;
+  const int qpsNone = CountQpsFor(dcNone, comm->worldSize);
+  const int qpsFull = CountQpsFor(dcFull, comm->worldSize);
+  const int qpsRail = CountQpsFor(dcRail, comm->worldSize);
+  const int expectedFull = (comm->worldSize - 1) * numQpPerPe;
+  const int expectedRail = (nNodes - 1) * numQpPerPe;
 
   bool ok = true;
   if (qpsNone != 0) {
-    snprintf(r->detail, sizeof(r->detail), "NONE: expected 0 QPs, got %d", qpsNone);
+    snprintf(r->detail, sizeof(r->detail), "NONE: expected 0, got %d", qpsNone);
     ok = false;
   } else if (qpsFull != expectedFull) {
-    snprintf(r->detail, sizeof(r->detail),
-             "FULL: expected %d QPs ((worldSize-1)*numQpPerPe=%d*%d), got %d",
-             expectedFull, comm->worldSize - 1, numQpPerPe, qpsFull);
+    snprintf(r->detail, sizeof(r->detail), "FULL: expected %d, got %d",
+             expectedFull, qpsFull);
+    ok = false;
+  } else if (qpsRail != expectedRail) {
+    snprintf(r->detail, sizeof(r->detail), "RAIL: expected %d ((nNodes-1)*qpsPerPe=%d*%d), got %d",
+             expectedRail, nNodes - 1, numQpPerPe, qpsRail);
     ok = false;
   } else {
-    snprintf(r->detail, sizeof(r->detail), "NONE=0 FULL=%d (worldSize=%d, qpsPerPe=%d)",
-             qpsFull, comm->worldSize, numQpPerPe);
+    snprintf(r->detail, sizeof(r->detail),
+             "NONE=0 FULL=%d RAIL=%d (worldSize=%d lsaSize=%d nNodes=%d qpsPerPe=%d)",
+             qpsFull, qpsRail, comm->worldSize, comm->lsaSize, nNodes, numQpPerPe);
   }
 
-  printf("[rank %d] NONE qps=%d FULL qps=%d (expected: 0 / %d)\n", rank, qpsNone,
-         qpsFull, expectedFull);
+  printf("[rank %d] NONE=%d FULL=%d RAIL=%d (expected: 0 / %d / %d)\n", rank, qpsNone,
+         qpsFull, qpsRail, expectedFull, expectedRail);
 
+  mori::cco::CcoDevCommDestroy(comm, dcRail);
   mori::cco::CcoDevCommDestroy(comm, dcFull);
   mori::cco::CcoDevCommDestroy(comm, dcNone);
   mori::cco::CcoCommDestroy(comm);

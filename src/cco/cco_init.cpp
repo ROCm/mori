@@ -782,15 +782,10 @@ int CcoDevCommCreate(CcoComm* comm,
                     reqs->version, CCO_API_VERSION);
   }
 
-  // Resolve connection type. RAIL still falls back to CROSSNODE (packed
-  // same-rail layout not implemented yet). CROSSNODE collapses to NONE on
-  // single-node deployments. FULL is honored directly.
+  // Resolve connection type. CROSSNODE collapses to NONE on single-node
+  // deployments (no cross-node peers exist). RAIL collapses to NONE if it
+  // ends up with zero peers (single-node, or self-rail only).
   CcoGdaConnectionType connType = reqs->gdaConnectionType;
-  if (connType == CCO_GDA_CONNECTION_RAIL) {
-    MORI_SHMEM_WARN("CcoDevCommCreate: gdaConnectionType=RAIL not yet "
-                    "implemented; falling back to CROSSNODE.");
-    connType = CCO_GDA_CONNECTION_CROSSNODE;
-  }
   if (connType == CCO_GDA_CONNECTION_CROSSNODE && comm->lsaSize == comm->worldSize) {
     MORI_SHMEM_TRACE("CcoDevCommCreate: single-node, CROSSNODE -> NONE");
     connType = CCO_GDA_CONNECTION_NONE;
@@ -816,13 +811,52 @@ int CcoDevCommCreate(CcoComm* comm,
   size_t numEps = static_cast<size_t>(comm->worldSize) * numQpPerPe;
   shmem::ShmemRdmaEndpoint* epsGpu = nullptr;
 
+  // Build the peer mask once based on connType. Context::CreateAdditional /
+  // ConnectAdditional take the same mask. Empty mask if NONE.
+  //
+  // Layout assumption (HARD CONTRACT enforced at CommCreate): ranks are
+  // node-major contiguous and lsaSize is uniform across nodes, so each
+  // peer's lsaRank is `peer % comm->lsaSize`.
+  std::vector<bool> peerMask;
+  if (connType != CCO_GDA_CONNECTION_NONE) {
+    peerMask.assign(comm->worldSize, false);
+    for (int peer = 0; peer < comm->worldSize; peer++) {
+      if (peer == comm->rank) continue;
+      const auto& cap = comm->ctx->GetPeerCapabilities(peer);
+      switch (connType) {
+        case CCO_GDA_CONNECTION_FULL:
+          peerMask[peer] = cap.canRDMA;
+          break;
+        case CCO_GDA_CONNECTION_CROSSNODE:
+          peerMask[peer] = cap.canRDMA && !cap.sameHost;
+          break;
+        case CCO_GDA_CONNECTION_RAIL: {
+          const int myLsaRank = comm->lsaRank;
+          const int peerLsaRank = peer % comm->lsaSize;
+          peerMask[peer] =
+              cap.canRDMA && !cap.sameHost && (peerLsaRank == myLsaRank);
+          break;
+        }
+        default:
+          break;
+      }
+    }
+    // Collapse to NONE if the resolved mask is empty (e.g. RAIL on single
+    // node, or CROSSNODE that lost all peers).
+    if (std::none_of(peerMask.begin(), peerMask.end(), [](bool b) { return b; })) {
+      MORI_SHMEM_TRACE("CcoDevCommCreate: resolved peer mask is empty, "
+                       "downgrading connType {} -> NONE",
+                       static_cast<int>(connType));
+      connType = CCO_GDA_CONNECTION_NONE;
+      peerMask.clear();
+    }
+    hostShadow.gdaConnType = connType;  // may have been collapsed above
+  }
+
   if (connType != CCO_GDA_CONNECTION_NONE && comm->ctx->RdmaTransportEnabled()) {
     // Collective: every rank must call CreateAdditionalEndpoints together.
-    // FULL: force RDMA QPs for every canRDMA peer (incl. intra-node).
-    // CROSSNODE: default — only cross-node peers (where transportType==RDMA).
-    const bool forceAllPeers = (connType == CCO_GDA_CONNECTION_FULL);
-    auto newEps = comm->ctx->CreateAdditionalEndpoints(numQpPerPe, forceAllPeers);
-    comm->ctx->ConnectAdditionalEndpoints(newEps, numQpPerPe, forceAllPeers);
+    auto newEps = comm->ctx->CreateAdditionalEndpoints(numQpPerPe, peerMask);
+    comm->ctx->ConnectAdditionalEndpoints(newEps, numQpPerPe, peerMask);
 
     // Note: post-Connect RTS verification via ibv_query_qp doesn't work for
     // direct-verbs providers (bnxt, mlx5), which keep QPs in their own
@@ -1036,7 +1070,6 @@ int CcoDevCommCreate(CcoComm* comm,
       }
       const bool sdmaPoolActive = (hostShadow.sdma.sdmaNumQueue > 0 &&
                                    hostShadow.sdma.signalBuf != nullptr);
-      const bool forceAll = (connType == CCO_GDA_CONNECTION_FULL);
 
       // Build the entire table into one string and emit atomically — avoids
       // interleaving when ranks fork-write to the same stderr concurrently.
@@ -1066,12 +1099,11 @@ int CcoDevCommCreate(CcoComm* comm,
         //   RDMA — this DevComm allocated a QP for peer (depends on connType).
         const bool actP2P = cap.canP2P && cap.sameHost;
         const bool actSDMA = sdmaPoolActive && cap.canSDMA;
-        const bool actRDMA =
-            (connType != CCO_GDA_CONNECTION_NONE) && rdmaEnabled &&
-            (forceAll
-                 ? cap.canRDMA
-                 : (comm->ctx->GetTransportType(peer) ==
-                    application::TransportType::RDMA));
+        bool actRDMA = false;
+        if (connType != CCO_GDA_CONNECTION_NONE && rdmaEnabled &&
+            peer < static_cast<int>(peerMask.size())) {
+          actRDMA = peerMask[peer];
+        }
 
         auto fmt = [](bool p2p, bool sdma, bool rdma, char* out, size_t n) {
           out[0] = '\0';

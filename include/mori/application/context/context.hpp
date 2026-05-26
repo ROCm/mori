@@ -140,20 +140,24 @@ class Context {
   // No-op if already set up, or if no peer has canSDMA capability.
   void EnsureSdmaTransport();
 
-  // Create a new independent set of QP endpoints for RDMA peers (does NOT connect).
-  // Default: only allocates QPs where transportTypes[peer] == RDMA (matches
-  // legacy policy — typically cross-node only).
-  // forceAllPeers=true: allocate QPs for every peer with capability cap.canRDMA
-  // (excluding self), ignoring the policy choice. Used by CCO's
-  // CCO_GDA_CONNECTION_FULL mode to RDMA-talk to intra-node peers too.
+  // Create a new independent set of QP endpoints. `peerMask[i] == true` means
+  // peer i gets `numQpPerPe` real QPs; `false` peers get empty stub slots so
+  // the returned vector is always worldSize×numQpPerPe long. peerMask is the
+  // single source of truth for "which peers do I want to talk to over RDMA":
+  // callers (CCO) compute it based on their connection policy
+  // (CROSSNODE / FULL / RAIL / …).
+  //
+  // Defaults to "no peers" if peerMask is empty — but this rarely makes sense;
+  // pass it explicitly. Self-peer (i == LocalRank()) and peers with
+  // peerCaps[i].canRDMA == false are silently skipped even when mask[i] is true,
+  // so callers don't have to repeat those checks.
   std::vector<RdmaEndpoint> CreateAdditionalEndpoints(int numQpPerPe,
-                                                      bool forceAllPeers = false);
+                                                      const std::vector<bool>& peerMask);
 
-  // Exchange new endpoint handles via AllToAll, then connect RDMA QPs. Collective.
-  // Must match the forceAllPeers flag used in CreateAdditionalEndpoints — passing
-  // a mismatched flag will silently skip the corresponding connection step.
+  // Exchange endpoint handles via AllToAll then move each masked QP through
+  // INIT → RTR → RTS. Must use the same peerMask as CreateAdditionalEndpoints.
   void ConnectAdditionalEndpoints(std::vector<RdmaEndpoint>& endpoints, int numQpPerPe,
-                                  bool forceAllPeers = false);
+                                  const std::vector<bool>& peerMask);
 
  private:
   void CollectHostNames();

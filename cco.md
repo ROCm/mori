@@ -806,6 +806,33 @@ Device API 骨架（声明 + 注释）也要写，实现留后续迭代：
 
 ---
 
+## reqs 字段进度
+
+`CcoDevCommRequirements` 各字段当前生效情况（截至 `6fc6a74b`）：
+
+| 字段 | 状态 | 说明 |
+|------|------|------|
+| `size` / `magic` / `version` | ✅ 已生效 | `CcoDevCommCreate` 入口校验 |
+| `gdaConnectionType = NONE` | ✅ 已生效 | 完全跳过 QP 创建 |
+| `gdaConnectionType = CROSSNODE` | ✅ 已生效 | 走 Context 默认 policy（transportTypes==RDMA） |
+| `gdaConnectionType = FULL` | ✅ 已生效 | 强制全 peer 建 QP（`forceAllPeers`） |
+| `gdaConnectionType = RAIL` | ⏳ 进行中 | 同 rail 跨节点 peer |
+| `gdaContextCount` | ✅ 已生效 | numQpPerPe |
+| `gdaSignalCount` | ✅ 已生效 | IBGDA signalBuf 大小 |
+| `gdaCounterCount` | ✅ 已生效 | IBGDA counterBuf 大小 |
+| `gdaQueueDepth` | ❌ TODO | 透传给 `RdmaEndpointConfig` |
+| `gdaTrafficClass` | ❌ TODO | 透传给 RDMA endpoint（目前用 `MORI_RDMA_TC` env） |
+| `sdmaQueueCount` | ❌ TODO | 等 device 端 SDMA session 落地后再做（现在用 anvil 默认） |
+| `lsaBarrierCount` | ❌ TODO | 等 `CcoLsaBarrierSession` 落地 |
+| `barrierCount` | ❌ TODO | 等 hybrid LSA+GDA-Rail barrier 落地 |
+| `resourceRequirementsList` | ❌ TODO | 等 device 端 `CcoLsa` / `CcoSdma` session 落地 |
+
+`MORI_CCO_LOG_TRANSPORT=1` 可在 `CcoDevCommCreate` 之后打印 per-rank
+transport 矩阵（CAP=硬件能力 / ACT=本 DevComm 实例化的），用于验证
+connType 的实际行为。
+
+---
+
 ## 验证
 
 1. 两线程各自 `CcoCommCreate` + `CcoWindowRegister`，互不干扰（验证无 singleton）
