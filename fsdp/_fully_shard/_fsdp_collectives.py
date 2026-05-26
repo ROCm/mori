@@ -32,6 +32,8 @@ class AllGatherResult(NamedTuple):
     all_gather_input_split_sizes: list[int]
     # Whether the output tensor can be directly used as the parameter buffer.
     all_gather_no_copy: bool = False
+    # Keeps a skipped copy-in source tensor alive until the all-gather result is freed.
+    all_gather_input: Optional[torch.Tensor] = None
 
 
 lib = torch.library.Library("fsdp", "FRAGMENT")  # noqa: TOR901
@@ -263,13 +265,22 @@ def foreach_all_gather(
         all_gather_output = all_gather_comm.allocate(
             (all_gather_input_numel * world_size,), dtype=dtype, device=device
         )
-        all_gather_input, all_gather_output = torch.ops.fsdp.all_gather_copy_in(
-            all_gather_inputs,
-            all_gather_output,
-            inp_split_sizes,
-            all_gather_input_numel,
-            rank,
-        )
+        if (
+            getattr(all_gather_comm, "supports_input_no_copy", False)
+            and len(all_gather_inputs) == 1
+            and all_gather_inputs[0].is_contiguous()
+            and all_gather_inputs[0].numel() == all_gather_input_numel
+            and all_gather_inputs[0].dtype == dtype
+        ):
+            all_gather_input = all_gather_inputs[0]
+        else:
+            all_gather_input, all_gather_output = torch.ops.fsdp.all_gather_copy_in(
+                all_gather_inputs,
+                all_gather_output,
+                inp_split_sizes,
+                all_gather_input_numel,
+                rank,
+            )
         del param_all_gather_inputs
     all_gather_stream.wait_stream(all_gather_copy_in_stream)
     with device_handle.stream(all_gather_stream):
@@ -288,6 +299,7 @@ def foreach_all_gather(
             param_all_gather_input_numels,
             inp_split_sizes,
             getattr(all_gather_comm, "supports_no_copy", False),
+            all_gather_input,
         )
 
 
