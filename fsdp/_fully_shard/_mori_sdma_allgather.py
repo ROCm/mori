@@ -135,7 +135,7 @@ class MoriSdmaAllGather(AllGather):
             npes,
             input_buffer_size=4,
             output_buffer_size=4,
-            copy_output_to_user=True,
+            copy_output_to_user=False,
         )
         self._rank = rank
         self._world_size = world_size
@@ -153,6 +153,11 @@ class MoriSdmaAllGather(AllGather):
             self._registered_output_ptr = ptr
             return
         collective.register_output_buffer(output_tensor)
+        if not collective.is_output_registered(output_tensor):
+            raise RuntimeError(
+                "MORI FSDP SDMA allgather requires registered output buffers "
+                "when copy_output_to_user=False"
+            )
         self._registered_output_ptr = ptr
 
     def _deregister_output_buffer_if_needed(self) -> None:
