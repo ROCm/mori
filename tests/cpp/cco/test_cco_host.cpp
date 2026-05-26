@@ -74,6 +74,35 @@ static void run_rank(int rank, int nranks, const mori::application::UniqueId& ui
   }
   printf("[rank %d] MemAlloc OK: buf=%p\n", rank, buf);
 
+  // Phase 1.6: Allocator path coverage (size==0 + freelist reuse).
+  {
+    void* z = reinterpret_cast<void*>(0x1);
+    if (mori::cco::CcoMemAlloc(comm, 0, &z) != 0 || z != nullptr) {
+      snprintf(result->detail, sizeof(result->detail), "size==0 alloc didn't return nullptr");
+      mori::cco::CcoMemFree(comm, buf);
+      mori::cco::CcoCommDestroy(comm);
+      return;
+    }
+    void* a = nullptr;
+    void* b = nullptr;
+    if (mori::cco::CcoMemAlloc(comm, WINDOW_SIZE, &a) != 0 ||
+        mori::cco::CcoMemFree(comm, a) != 0 ||
+        mori::cco::CcoMemAlloc(comm, WINDOW_SIZE, &b) != 0) {
+      snprintf(result->detail, sizeof(result->detail), "alloc/free churn failed");
+      mori::cco::CcoMemFree(comm, buf);
+      mori::cco::CcoCommDestroy(comm);
+      return;
+    }
+    if (a != b) {
+      snprintf(result->detail, sizeof(result->detail), "slot reuse: a=%p b=%p", a, b);
+      mori::cco::CcoMemFree(comm, b);
+      mori::cco::CcoMemFree(comm, buf);
+      mori::cco::CcoCommDestroy(comm);
+      return;
+    }
+    mori::cco::CcoMemFree(comm, b);
+  }
+
   // Write unique pattern: byte[0] = (rank+1)*10
   std::vector<uint8_t> pattern(WINDOW_SIZE);
   for (size_t i = 0; i < WINDOW_SIZE; i++) {

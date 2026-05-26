@@ -234,8 +234,15 @@ struct CcoComm {
   // VMM flat address space (sized lsaSize * perRankSize).
   void* flatBase{nullptr};
   size_t perRankSize{0};
-  size_t nextOffset{0};
   size_t vmmGranularity{0};
+
+  // Per-rank slot allocator within [0, perRankSize). Tracks allocated
+  // intervals in a sorted "cuts" array; segments alternate empty<->full.
+  // Lazy first-fit on alloc; coalescing free.
+  struct AllocSpace {
+    std::vector<int64_t> cuts;
+  };
+  AllocSpace allocSpace;
 
   // Default # of QPs per peer (from Context). Per-DevComm may override via reqs.
   int defaultNumQpPerPe{4};
@@ -255,7 +262,7 @@ struct CcoComm {
   };
   std::unordered_map<void*, AllocMeta> allocTable;
 
-  // Protects nextOffset, allocTable, windows, windowTableEntries against
+  // Protects allocSpace, allocTable, windows, windowTableEntries against
   // concurrent MemAlloc / MemFree / WindowRegister / WindowDeregister from
   // multiple threads sharing the same CcoComm.
   mutable std::mutex allocMutex;
