@@ -41,7 +41,7 @@ int CcoWindowDeregister(CcoComm* comm, CcoWindow_t win);
 int CcoDevCommCreate(CcoComm* comm,
                      const CcoDevCommRequirements* reqs,
                      CcoDevComm** devComm);
-int CcoDevCommDestroy(CcoDevComm* devComm);
+int CcoDevCommDestroy(CcoComm* comm, CcoDevComm* devComm);
 
 // ── Host barrier ──
 int CcoBarrierAll(CcoComm* comm);

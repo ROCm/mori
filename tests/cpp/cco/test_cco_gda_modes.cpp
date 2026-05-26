@@ -87,7 +87,7 @@ static void run_rank(int rank, int nranks, const mori::application::UniqueId& ui
   }
   if (mori::cco::CcoDevCommCreate(comm, &reqsFull, &dcFull) != 0) {
     snprintf(r->detail, sizeof(r->detail), "DevCommCreate FULL failed");
-    mori::cco::CcoDevCommDestroy(dcNone);
+    mori::cco::CcoDevCommDestroy(comm, dcNone);
     mori::cco::CcoCommDestroy(comm);
     return;
   }
@@ -113,8 +113,8 @@ static void run_rank(int rank, int nranks, const mori::application::UniqueId& ui
   printf("[rank %d] NONE qps=%d FULL qps=%d (expected: 0 / %d)\n", rank, qpsNone,
          qpsFull, expectedFull);
 
-  mori::cco::CcoDevCommDestroy(dcFull);
-  mori::cco::CcoDevCommDestroy(dcNone);
+  mori::cco::CcoDevCommDestroy(comm, dcFull);
+  mori::cco::CcoDevCommDestroy(comm, dcNone);
   mori::cco::CcoCommDestroy(comm);
 
   r->passed = ok;

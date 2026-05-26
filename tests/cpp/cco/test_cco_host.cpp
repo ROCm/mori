@@ -203,7 +203,7 @@ static void run_rank(int rank, int nranks, const mori::application::UniqueId& ui
   snprintf(result->detail, sizeof(result->detail), "all OK (%d ranks)", nranks);
 
 cleanup:
-  mori::cco::CcoDevCommDestroy(devComm);
+  mori::cco::CcoDevCommDestroy(comm, devComm);
   mori::cco::CcoWindowDeregister(comm, win2);
   mori::cco::CcoWindowDeregister(comm, win);
   mori::cco::CcoMemFree(comm, buf2);

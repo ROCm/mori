@@ -881,6 +881,11 @@ int CcoDevCommCreate(CcoComm* comm,
   // SDMA signal pool (per-DevComm). Materialized only if comm-level SDMA
   // queues are up. Pool: [lsaSize × sdmaNumQueue × uint64], shared by all
   // windows. Kernels index via devComm->sdma.signalBuf[lsaPeer * sdmaNumQueue + qId].
+  //
+  // SPMT-safe peer-pointer exchange: hipIpcOpenMemHandle fails when the
+  // handle was exported by the same process, so for SPMT we Allgather raw
+  // VAs alongside IPC handles and pick per-peer based on SameProcessP2P.
+  // (See shmem's SymmMemManager::Register for the same pattern.)
   CcoSdmaContext& sdma = hostShadow.sdma;
   sdma.sdmaNumQueue = static_cast<uint32_t>(comm->sdmaNumQueue);
   if (comm->sdmaNumQueue > 0) {
@@ -891,12 +896,17 @@ int CcoDevCommCreate(CcoComm* comm,
     HIP_RUNTIME_CHECK(hipMalloc(&sdma.expectSignals, poolBytes));
     HIP_RUNTIME_CHECK(hipMemset(sdma.expectSignals, 0, poolBytes));
 
-    // Single Allgather of IPC handle for the whole pool (not per-window).
     hipIpcMemHandle_t myHandle;
     HIP_RUNTIME_CHECK(hipIpcGetMemHandle(&myHandle, sdma.signalBuf));
     auto* handles = static_cast<hipIpcMemHandle_t*>(
         calloc(comm->worldSize, sizeof(hipIpcMemHandle_t)));
     comm->bootNet->Allgather(&myHandle, handles, sizeof(hipIpcMemHandle_t));
+
+    // Also Allgather raw VAs — used for same-process peers where IPC fails.
+    HSAuint64* myRawVa = sdma.signalBuf;
+    auto* rawVas =
+        static_cast<HSAuint64**>(calloc(comm->worldSize, sizeof(HSAuint64*)));
+    comm->bootNet->Allgather(&myRawVa, rawVas, sizeof(HSAuint64*));
 
     auto* peerPtrs_host =
         static_cast<HSAuint64**>(calloc(comm->lsaSize, sizeof(HSAuint64*)));
@@ -905,10 +915,32 @@ int CcoDevCommCreate(CcoComm* comm,
       if (lsa == comm->lsaRank) continue;
       int pe = comm->myNodeStart + lsa;
       if (!comm->ctx->GetPeerCapabilities(pe).canSDMA) continue;
-      void* mapped = nullptr;
-      HIP_RUNTIME_CHECK(
-          hipIpcOpenMemHandle(&mapped, handles[pe], hipIpcMemLazyEnablePeerAccess));
-      peerPtrs_host[lsa] = reinterpret_cast<HSAuint64*>(mapped);
+
+      if (comm->ctx->SameProcessP2P(pe)) {
+        // Same process (SPMT): use peer's raw VA, defensively enable peer
+        // access for its device. hipIpcMemLazyEnablePeerAccess doesn't run
+        // here because we're not opening an IPC handle.
+        peerPtrs_host[lsa] = rawVas[pe];
+        hipPointerAttribute_t attr{};
+        if (hipPointerGetAttributes(&attr, rawVas[pe]) == hipSuccess &&
+            attr.device != hipInvalidDeviceId) {
+          hipError_t peerErr = hipDeviceEnablePeerAccess(attr.device, 0);
+          (void)hipGetLastError();
+          if (peerErr != hipSuccess && peerErr != hipErrorPeerAccessAlreadyEnabled) {
+            MORI_SHMEM_WARN("CcoDevCommCreate: hipDeviceEnablePeerAccess(peer={}, "
+                            "device={}) failed: {}",
+                            pe, attr.device, hipGetErrorString(peerErr));
+          }
+        } else {
+          (void)hipGetLastError();
+        }
+      } else {
+        // Cross-process: standard IPC open.
+        void* mapped = nullptr;
+        HIP_RUNTIME_CHECK(
+            hipIpcOpenMemHandle(&mapped, handles[pe], hipIpcMemLazyEnablePeerAccess));
+        peerPtrs_host[lsa] = reinterpret_cast<HSAuint64*>(mapped);
+      }
     }
     HIP_RUNTIME_CHECK(
         hipMalloc(&sdma.peerSignalPtrs, sizeof(HSAuint64*) * comm->lsaSize));
@@ -916,6 +948,7 @@ int CcoDevCommCreate(CcoComm* comm,
                                 sizeof(HSAuint64*) * comm->lsaSize,
                                 hipMemcpyHostToDevice));
     free(peerPtrs_host);
+    free(rawVas);
     free(handles);
 
     sdma.deviceHandles = comm->sdmaDevHandles;
@@ -1066,7 +1099,7 @@ int CcoDevCommCreate(CcoComm* comm,
 /*                           CcoDevCommDestroy                             */
 /* ========================================================================== */
 
-int CcoDevCommDestroy(CcoDevComm* devComm) {
+int CcoDevCommDestroy(CcoComm* comm, CcoDevComm* devComm) {
   if (!devComm) return 0;
 
   CcoDevComm hostShadow;
@@ -1080,8 +1113,10 @@ int CcoDevCommDestroy(CcoDevComm* devComm) {
   if (ibgda.counterBuf) HIP_RUNTIME_CHECK(hipFree(ibgda.counterBuf));
   if (ibgda.peerSignalRkeys) HIP_RUNTIME_CHECK(hipFree(ibgda.peerSignalRkeys));
 
-  // SDMA pool cleanup. peerSignalPtrs is GPU array of host-mapped peer ptrs;
-  // we need to close the IPC mappings before freeing the array.
+  // SDMA pool cleanup. peerSignalPtrs is a GPU array of host-mapped peer
+  // pointers — only the cross-process entries came from hipIpcOpenMemHandle
+  // and need a matching close; same-process entries are raw VAs into a peer
+  // thread's signalBuf and must NOT be passed to hipIpcCloseMemHandle.
   auto& sdma = hostShadow.sdma;
   if (sdma.peerSignalPtrs) {
     std::vector<HSAuint64*> peerPtrs_host(hostShadow.lsaSize, nullptr);
@@ -1090,9 +1125,10 @@ int CcoDevCommDestroy(CcoDevComm* devComm) {
                                 hipMemcpyDeviceToHost));
     for (int lsa = 0; lsa < hostShadow.lsaSize; lsa++) {
       if (lsa == hostShadow.lsaRank) continue;
-      if (peerPtrs_host[lsa]) {
-        (void)hipIpcCloseMemHandle(peerPtrs_host[lsa]);
-      }
+      if (!peerPtrs_host[lsa]) continue;
+      int pe = hostShadow.myNodeStart + lsa;
+      if (comm && comm->ctx && comm->ctx->SameProcessP2P(pe)) continue;
+      (void)hipIpcCloseMemHandle(peerPtrs_host[lsa]);
     }
     HIP_RUNTIME_CHECK(hipFree(sdma.peerSignalPtrs));
   }

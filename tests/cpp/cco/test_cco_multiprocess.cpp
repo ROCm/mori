@@ -139,8 +139,8 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
   }
   printf("[rank %d] P2P OK from %d LSA peers\n", rank, p2pOk);
 
-  mori::cco::CcoDevCommDestroy(devComm2);
-  mori::cco::CcoDevCommDestroy(devComm1);
+  mori::cco::CcoDevCommDestroy(comm, devComm2);
+  mori::cco::CcoDevCommDestroy(comm, devComm1);
   mori::cco::CcoWindowDeregister(comm, win);
   mori::cco::CcoMemFree(comm, buf);
   mori::cco::CcoCommDestroy(comm);
