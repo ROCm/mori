@@ -6,6 +6,7 @@ import torch
 import torch.distributed as dist
 
 from ._fsdp_api import AllGather
+from ._mori_sdma_stats import record_register
 
 
 def is_mori_fsdp_sdma_enabled() -> bool:
@@ -149,10 +150,13 @@ class MoriSdmaAllGather(AllGather):
         ptr = output_tensor.data_ptr()
         nbytes = _tensor_nbytes(output_tensor)
         if self._registered_output_ptr == ptr and self._output_buffer_nbytes >= nbytes:
+            record_register("cache_hit")
             return
         if collective.is_output_registered(output_tensor):
             self._registered_output_ptr = ptr
+            record_register("existing_hit")
             return
+        record_register("call")
         collective.register_output_buffer(output_tensor)
         if not collective.is_output_registered(output_tensor):
             raise RuntimeError(

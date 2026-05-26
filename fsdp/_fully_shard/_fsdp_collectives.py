@@ -17,6 +17,11 @@ from ._fsdp_common import (
     compiled_autograd_enabled,
 )
 from ._fsdp_param import FSDPParam, ShardedState
+from ._mori_sdma_stats import (
+    record_all_gather,
+    record_copy_in,
+    record_copy_out,
+)
 
 
 class AllGatherResult(NamedTuple):
@@ -265,13 +270,16 @@ def foreach_all_gather(
         all_gather_output = all_gather_comm.allocate(
             (all_gather_input_numel * world_size,), dtype=dtype, device=device
         )
-        if (
+        input_no_copy = (
             getattr(all_gather_comm, "supports_input_no_copy", False)
             and len(all_gather_inputs) == 1
             and all_gather_inputs[0].is_contiguous()
             and all_gather_inputs[0].numel() == all_gather_input_numel
             and all_gather_inputs[0].dtype == dtype
-        ):
+        )
+        record_all_gather(all_gather_input_numel)
+        record_copy_in(all_gather_input_numel, skipped=input_no_copy)
+        if input_no_copy:
             all_gather_input = all_gather_inputs[0]
         else:
             all_gather_input, all_gather_output = torch.ops.fsdp.all_gather_copy_in(
@@ -465,36 +473,44 @@ def _try_no_copy_all_gather_output(
     fsdp_params: list[FSDPParam],
     world_size: int,
 ) -> bool:
-    if not all_gather_result.all_gather_no_copy or compiled_autograd_enabled():
+    output_numel = all_gather_result.all_gather_output.numel()
+
+    def miss(reason: str) -> bool:
+        record_copy_out(output_numel, skipped=False, reason=reason)
         return False
+
+    if not all_gather_result.all_gather_no_copy:
+        return miss("unsupported_comm")
+    if compiled_autograd_enabled():
+        return miss("compiled_autograd")
     if len(fsdp_params) != 1:
-        return False
+        return miss("multi_param_group")
 
     fsdp_param = fsdp_params[0]
     if fsdp_param.fsdp_placement.dim != 0:
-        return False
+        return miss("nonzero_shard_dim")
     if fsdp_param.is_dtensor:
-        return False
+        return miss("dtensor")
     if hasattr(fsdp_param._sharded_local_tensor, "fsdp_post_all_gather"):
-        return False
+        return miss("post_all_gather_hook")
     if len(all_gather_result.param_all_gather_input_numels) != 1:
-        return False
+        return miss("input_numel_metadata")
     if len(all_gather_result.param_all_gather_input_dtypes) != 1:
-        return False
+        return miss("input_dtype_metadata")
     if len(all_gather_result.all_gather_input_split_sizes) != 1:
-        return False
+        return miss("split_metadata")
 
     input_numels = all_gather_result.param_all_gather_input_numels[0]
     input_dtypes = all_gather_result.param_all_gather_input_dtypes[0]
     if len(input_numels) != 1 or len(input_dtypes) != 1:
-        return False
+        return miss("multi_input_param")
 
     all_gather_output = all_gather_result.all_gather_output
     expected_numel = input_numels[0] * world_size
     if all_gather_output.numel() != expected_numel:
-        return False
+        return miss("output_numel_mismatch")
     if all_gather_output.dtype != input_dtypes[0]:
-        return False
+        return miss("output_dtype_mismatch")
 
     existing_outputs = fsdp_param.all_gather_outputs
     if hasattr(fsdp_param, "_unsharded_param"):
@@ -517,6 +533,7 @@ def _try_no_copy_all_gather_output(
 
     fsdp_param._keep_all_gather_output_storage = True
     fsdp_param.all_gather_outputs = [all_gather_output]
+    record_copy_out(output_numel, skipped=True)
     return True
 
 
