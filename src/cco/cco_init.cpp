@@ -782,14 +782,13 @@ int CcoDevCommCreate(CcoComm* comm,
                     reqs->version, CCO_API_VERSION);
   }
 
-  // Resolve connection type. FULL/RAIL fall back to CROSSNODE (Context already
-  // skips P2P-reachable peers). CROSSNODE collapses to NONE on single-node.
+  // Resolve connection type. RAIL still falls back to CROSSNODE (packed
+  // same-rail layout not implemented yet). CROSSNODE collapses to NONE on
+  // single-node deployments. FULL is honored directly.
   CcoGdaConnectionType connType = reqs->gdaConnectionType;
-  if (connType == CCO_GDA_CONNECTION_FULL ||
-      connType == CCO_GDA_CONNECTION_RAIL) {
-    MORI_SHMEM_WARN("CcoDevCommCreate: gdaConnectionType={} (FULL/RAIL) not "
-                    "yet implemented; falling back to CROSSNODE.",
-                    static_cast<int>(connType));
+  if (connType == CCO_GDA_CONNECTION_RAIL) {
+    MORI_SHMEM_WARN("CcoDevCommCreate: gdaConnectionType=RAIL not yet "
+                    "implemented; falling back to CROSSNODE.");
     connType = CCO_GDA_CONNECTION_CROSSNODE;
   }
   if (connType == CCO_GDA_CONNECTION_CROSSNODE && comm->lsaSize == comm->worldSize) {
@@ -819,9 +818,11 @@ int CcoDevCommCreate(CcoComm* comm,
 
   if (connType != CCO_GDA_CONNECTION_NONE && comm->ctx->RdmaTransportEnabled()) {
     // Collective: every rank must call CreateAdditionalEndpoints together.
-    // Context skips QPs for non-RDMA peers, so intra-node slots stay empty.
-    auto newEps = comm->ctx->CreateAdditionalEndpoints(numQpPerPe);
-    comm->ctx->ConnectAdditionalEndpoints(newEps, numQpPerPe);
+    // FULL: force RDMA QPs for every canRDMA peer (incl. intra-node).
+    // CROSSNODE: default — only cross-node peers (where transportType==RDMA).
+    const bool forceAllPeers = (connType == CCO_GDA_CONNECTION_FULL);
+    auto newEps = comm->ctx->CreateAdditionalEndpoints(numQpPerPe, forceAllPeers);
+    comm->ctx->ConnectAdditionalEndpoints(newEps, numQpPerPe, forceAllPeers);
 
     std::vector<shmem::ShmemRdmaEndpoint> shmemEps(numEps);
     for (size_t i = 0; i < numEps; i++) {

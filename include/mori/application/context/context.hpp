@@ -141,10 +141,19 @@ class Context {
   void EnsureSdmaTransport();
 
   // Create a new independent set of QP endpoints for RDMA peers (does NOT connect).
-  std::vector<RdmaEndpoint> CreateAdditionalEndpoints(int numQpPerPe);
+  // Default: only allocates QPs where transportTypes[peer] == RDMA (matches
+  // legacy policy — typically cross-node only).
+  // forceAllPeers=true: allocate QPs for every peer with capability cap.canRDMA
+  // (excluding self), ignoring the policy choice. Used by CCO's
+  // CCO_GDA_CONNECTION_FULL mode to RDMA-talk to intra-node peers too.
+  std::vector<RdmaEndpoint> CreateAdditionalEndpoints(int numQpPerPe,
+                                                      bool forceAllPeers = false);
 
   // Exchange new endpoint handles via AllToAll, then connect RDMA QPs. Collective.
-  void ConnectAdditionalEndpoints(std::vector<RdmaEndpoint>& endpoints, int numQpPerPe);
+  // Must match the forceAllPeers flag used in CreateAdditionalEndpoints — passing
+  // a mismatched flag will silently skip the corresponding connection step.
+  void ConnectAdditionalEndpoints(std::vector<RdmaEndpoint>& endpoints, int numQpPerPe,
+                                  bool forceAllPeers = false);
 
  private:
   void CollectHostNames();
