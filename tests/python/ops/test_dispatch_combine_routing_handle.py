@@ -28,6 +28,7 @@ from tests.python.ops.dispatch_combine_test_utils import (
     assert_worker_results,
 )
 
+
 def _make_intranode_config(rank, world_size):
     return mori.ops.EpDispatchCombineConfig(
         data_type=torch.bfloat16,
