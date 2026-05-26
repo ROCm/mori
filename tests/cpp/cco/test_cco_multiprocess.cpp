@@ -113,13 +113,14 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
   }
   printf("[rank %d] DevComm independence verified\n", rank);
 
-  // ── GDA connection mode verification (NONE / FULL / RAIL) ──
-  // Re-issues DevCommCreate with each non-default connType and counts the
-  // QPs that ended up non-zero in ibgda.endpoints. Expected on a uniform
-  // N-nodes × lsaSize layout:
-  //   NONE : 0
-  //   FULL : (worldSize - 1) * qpsPerPe
-  //   RAIL : (nNodes - 1) * qpsPerPe   (collapses to 0 on single-node)
+  // ── GDA connection mode verification (NONE / FULL / CROSSNODE / RAIL) ──
+  // Re-issues DevCommCreate with each connType and counts the QPs that ended
+  // up non-zero in ibgda.endpoints. Expected on a uniform N-nodes × lsaSize
+  // layout:
+  //   NONE      : 0
+  //   FULL      : (worldSize - 1) * qpsPerPe
+  //   CROSSNODE : (worldSize - lsaSize) * qpsPerPe   (collapses to 0 on single-node)
+  //   RAIL      : (nNodes - 1) * qpsPerPe            (collapses to 0 on single-node)
   {
     auto countQps = [&](mori::cco::CcoDevComm* dc) -> int {
       mori::cco::CcoDevComm h;
@@ -138,33 +139,39 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
       r.gdaConnectionType = ct;
       return r;
     };
-    mori::cco::CcoDevComm *dcNone = nullptr, *dcFull = nullptr, *dcRail = nullptr;
-    auto rNone = mkReqs(mori::cco::CCO_GDA_CONNECTION_NONE);
-    auto rFull = mkReqs(mori::cco::CCO_GDA_CONNECTION_FULL);
-    auto rRail = mkReqs(mori::cco::CCO_GDA_CONNECTION_RAIL);
+    mori::cco::CcoDevComm *dcNone = nullptr, *dcFull = nullptr;
+    mori::cco::CcoDevComm *dcXnode = nullptr, *dcRail = nullptr;
+    auto rNone  = mkReqs(mori::cco::CCO_GDA_CONNECTION_NONE);
+    auto rFull  = mkReqs(mori::cco::CCO_GDA_CONNECTION_FULL);
+    auto rXnode = mkReqs(mori::cco::CCO_GDA_CONNECTION_CROSSNODE);
+    auto rRail  = mkReqs(mori::cco::CCO_GDA_CONNECTION_RAIL);
     const int qpsPerPe = rFull.gdaContextCount;
-    if (mori::cco::CcoDevCommCreate(comm, &rNone, &dcNone) != 0 ||
-        mori::cco::CcoDevCommCreate(comm, &rFull, &dcFull) != 0 ||
-        mori::cco::CcoDevCommCreate(comm, &rRail, &dcRail) != 0) {
+    if (mori::cco::CcoDevCommCreate(comm, &rNone,  &dcNone)  != 0 ||
+        mori::cco::CcoDevCommCreate(comm, &rFull,  &dcFull)  != 0 ||
+        mori::cco::CcoDevCommCreate(comm, &rXnode, &dcXnode) != 0 ||
+        mori::cco::CcoDevCommCreate(comm, &rRail,  &dcRail)  != 0) {
       fprintf(stderr, "[rank %d] connType DevCommCreate failed\n", rank);
       return 1;
     }
     const int nNodes = dc1Host.worldSize / dc1Host.lsaSize;
-    const int qNone = countQps(dcNone);
-    const int qFull = countQps(dcFull);
-    const int qRail = countQps(dcRail);
-    const int eFull = (dc1Host.worldSize - 1) * qpsPerPe;
-    const int eRail = (nNodes - 1) * qpsPerPe;
-    if (qNone != 0 || qFull != eFull || qRail != eRail) {
+    const int qNone  = countQps(dcNone);
+    const int qFull  = countQps(dcFull);
+    const int qXnode = countQps(dcXnode);
+    const int qRail  = countQps(dcRail);
+    const int eFull  = (dc1Host.worldSize - 1)              * qpsPerPe;
+    const int eXnode = (dc1Host.worldSize - dc1Host.lsaSize) * qpsPerPe;
+    const int eRail  = (nNodes - 1)                          * qpsPerPe;
+    if (qNone != 0 || qFull != eFull || qXnode != eXnode || qRail != eRail) {
       fprintf(stderr,
               "[rank %d] connType MISMATCH: NONE got=%d exp=0, FULL got=%d exp=%d, "
-              "RAIL got=%d exp=%d (nNodes=%d qpsPerPe=%d)\n",
-              rank, qNone, qFull, eFull, qRail, eRail, nNodes, qpsPerPe);
+              "XNODE got=%d exp=%d, RAIL got=%d exp=%d (nNodes=%d qpsPerPe=%d)\n",
+              rank, qNone, qFull, eFull, qXnode, eXnode, qRail, eRail, nNodes, qpsPerPe);
       return 1;
     }
-    printf("[rank %d] connType OK: NONE=0 FULL=%d RAIL=%d (nNodes=%d qpsPerPe=%d)\n",
-           rank, qFull, qRail, nNodes, qpsPerPe);
+    printf("[rank %d] connType OK: NONE=0 FULL=%d XNODE=%d RAIL=%d (nNodes=%d qpsPerPe=%d)\n",
+           rank, qFull, qXnode, qRail, nNodes, qpsPerPe);
     mori::cco::CcoDevCommDestroy(comm, dcRail);
+    mori::cco::CcoDevCommDestroy(comm, dcXnode);
     mori::cco::CcoDevCommDestroy(comm, dcFull);
     mori::cco::CcoDevCommDestroy(comm, dcNone);
   }
