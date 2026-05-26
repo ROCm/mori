@@ -824,6 +824,12 @@ int CcoDevCommCreate(CcoComm* comm,
     auto newEps = comm->ctx->CreateAdditionalEndpoints(numQpPerPe, forceAllPeers);
     comm->ctx->ConnectAdditionalEndpoints(newEps, numQpPerPe, forceAllPeers);
 
+    // Note: post-Connect RTS verification via ibv_query_qp doesn't work for
+    // direct-verbs providers (bnxt, mlx5), which keep QPs in their own
+    // containers and leave ibvHandle.qp null. Provider-side QueryQpState is
+    // a TODO; for now, rely on modify_qp's internal check + the transport
+    // map dump (MORI_CCO_LOG_TRANSPORT) for visibility.
+
     std::vector<shmem::ShmemRdmaEndpoint> shmemEps(numEps);
     for (size_t i = 0; i < numEps; i++) {
       shmemEps[i].vendorId = newEps[i].vendorId;
@@ -981,6 +987,78 @@ int CcoDevCommCreate(CcoComm* comm,
                   "signalBuf={} counterBuf={} signalLkey={}",
                   comm->rank, (void*)devCommGpu, numWindows, signalCount, counterCount,
                   (void*)signalBufGpu, (void*)counterBufGpu, signalLkey);
+
+  // Optional transport map dump, gated on MORI_CCO_LOG_TRANSPORT. Shows each
+  // peer's hardware capability (canP2P/canSDMA/canRDMA) alongside whether
+  // this DevComm has materialized resources for that transport — useful for
+  // verifying gdaConnectionType behavior end-to-end.
+  if (const char* env = std::getenv("MORI_CCO_LOG_TRANSPORT")) {
+    if (env[0] != '0') {
+      const char* connTypeStr = "?";
+      switch (connType) {
+        case CCO_GDA_CONNECTION_NONE: connTypeStr = "NONE"; break;
+        case CCO_GDA_CONNECTION_FULL: connTypeStr = "FULL"; break;
+        case CCO_GDA_CONNECTION_CROSSNODE: connTypeStr = "CROSSNODE"; break;
+        case CCO_GDA_CONNECTION_RAIL: connTypeStr = "RAIL"; break;
+      }
+      const bool sdmaPoolActive = (hostShadow.sdma.sdmaNumQueue > 0 &&
+                                   hostShadow.sdma.signalBuf != nullptr);
+      const bool forceAll = (connType == CCO_GDA_CONNECTION_FULL);
+
+      // Build the entire table into one string and emit atomically — avoids
+      // interleaving when ranks fork-write to the same stderr concurrently.
+      std::string buf;
+      buf.reserve(256 + 64 * comm->worldSize);
+      char line[160];
+      snprintf(line, sizeof(line),
+               "[cco] DevComm rank=%d/%d connType=%s — transport map "
+               "(CAP=hardware capability, ACT=materialized by this DevComm):\n",
+               comm->rank, comm->worldSize, connTypeStr);
+      buf += line;
+      buf += "  peer  | cap                | active\n";
+      buf += "  ------+--------------------+--------------------\n";
+      const bool rdmaEnabled = comm->ctx->RdmaTransportEnabled();
+      for (int peer = 0; peer < comm->worldSize; peer++) {
+        if (peer == comm->rank) {
+          snprintf(line, sizeof(line), "  %4d* | SELF               | SELF\n", peer);
+          buf += line;
+          continue;
+        }
+        const auto& cap = comm->ctx->GetPeerCapabilities(peer);
+
+        // Active = "has resources / connectivity right now":
+        //   P2P  — sameHost peer with capability (LSA flat-VA covers
+        //          intra-node; window-level FD exchange happens in WindowRegister).
+        //   SDMA — this DevComm allocated an SDMA signal pool AND peer canSDMA.
+        //   RDMA — this DevComm allocated a QP for peer (depends on connType).
+        const bool actP2P = cap.canP2P && cap.sameHost;
+        const bool actSDMA = sdmaPoolActive && cap.canSDMA;
+        const bool actRDMA =
+            (connType != CCO_GDA_CONNECTION_NONE) && rdmaEnabled &&
+            (forceAll
+                 ? cap.canRDMA
+                 : (comm->ctx->GetTransportType(peer) ==
+                    application::TransportType::RDMA));
+
+        auto fmt = [](bool p2p, bool sdma, bool rdma, char* out, size_t n) {
+          out[0] = '\0';
+          if (p2p) snprintf(out + strlen(out), n - strlen(out), "P2P ");
+          if (sdma) snprintf(out + strlen(out), n - strlen(out), "SDMA ");
+          if (rdma) snprintf(out + strlen(out), n - strlen(out), "RDMA ");
+          if (out[0] == '\0') snprintf(out, n, "(none)");
+        };
+        char capStr[32], actStr[32];
+        fmt(cap.canP2P, cap.canSDMA, cap.canRDMA, capStr, sizeof(capStr));
+        fmt(actP2P, actSDMA, actRDMA, actStr, sizeof(actStr));
+        snprintf(line, sizeof(line), "  %4d  | %-18s | %-18s%s\n", peer, capStr, actStr,
+                 cap.sameHost ? " (intra-node)" : "");
+        buf += line;
+      }
+      fwrite(buf.data(), 1, buf.size(), stderr);
+      fflush(stderr);
+    }
+  }
+
   return 0;
 }
 
