@@ -10,6 +10,7 @@
 #include "mori/shmem/internal.hpp"
 
 #if !defined(__HIPCC__) && !defined(__CUDACC__)
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -303,6 +304,14 @@ struct CcoComm {
     size_t size{0};
   };
   std::unordered_map<void*, AllocMeta> allocTable;
+
+  // Protects nextOffset (slot bump pointer) + allocTable + windows + windowTableEntries
+  // against concurrent MemAlloc/MemFree/WindowRegister/WindowDeregister from
+  // multiple threads sharing the same CcoComm. (Per-thread CcoComm in
+  // test_cco_host doesn't need this — each thread has its own comm — but we
+  // make CcoComm itself thread-safe so a future multi-thread-per-comm
+  // workload doesn't silently corrupt internal data structures.)
+  mutable std::mutex allocMutex;
 
   std::vector<CcoWindowHost*> windows;
 

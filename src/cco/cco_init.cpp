@@ -235,46 +235,101 @@ int CcoMemAlloc(CcoComm* comm, size_t size, void** outPtr) {
   HIP_RUNTIME_CHECK(hipGetDevice(&currentDev));
 
   size_t alignedSize = AlignUp(size, comm->vmmGranularity);
-  size_t slotOffset = comm->nextOffset;
+
+  // ── reserve a slot under the mutex (bump pointer in flat VA) ──
+  size_t slotOffset;
+  {
+    std::lock_guard<std::mutex> lock(comm->allocMutex);
+    slotOffset = comm->nextOffset;
+    if (slotOffset + alignedSize > comm->perRankSize) {
+      MORI_SHMEM_ERROR(
+          "CcoMemAlloc: slot exhausted (offset {} + size {} > perRankSize {}). "
+          "Increase perRankVmmSize at CcoCommCreate or reduce window count.",
+          slotOffset, alignedSize, comm->perRankSize);
+      return -1;
+    }
+    comm->nextOffset += alignedSize;  // optimistic reserve; rolled back on failure
+  }
 
   MORI_SHMEM_TRACE("CcoMemAlloc: rank={} size={} alignedSize={} slotOffset={}", comm->rank,
                    size, alignedSize, slotOffset);
 
-  // Step 1: create physical memory
+  // Helper: roll back the reserved slot if we fail before publishing.
+  // Note: holes left in the bump pointer are still leaked until comm
+  // destruction (no freelist yet). This rollback only covers the *most
+  // recent* alloc when no other thread has bumped past it.
+  auto rollbackSlot = [&]() {
+    std::lock_guard<std::mutex> lock(comm->allocMutex);
+    if (comm->nextOffset == slotOffset + alignedSize) {
+      comm->nextOffset = slotOffset;
+    }
+  };
+
+  // ── Step 1: create physical memory ──
   hipMemAllocationProp allocProp = {};
   allocProp.type = hipMemAllocationTypePinned;
   allocProp.requestedHandleType = hipMemHandleTypePosixFileDescriptor;
   allocProp.location.type = hipMemLocationTypeDevice;
   allocProp.location.id = currentDev;
 
-  hipMemGenericAllocationHandle_t physHandle;
-  HIP_RUNTIME_CHECK(hipMemCreate(&physHandle, alignedSize, &allocProp, 0));
+  hipMemGenericAllocationHandle_t physHandle = 0;
+  hipError_t err = hipMemCreate(&physHandle, alignedSize, &allocProp, 0);
+  if (err != hipSuccess) {
+    MORI_SHMEM_ERROR("CcoMemAlloc: hipMemCreate failed: {} ({})", static_cast<int>(err),
+                     hipGetErrorString(err));
+    rollbackSlot();
+    return -1;
+  }
 
-  // Step 2: map to local slot only (no cross-rank communication)
+  // ── Step 2: map to local slot only (no cross-rank communication) ──
   void* localVa =
       static_cast<char*>(comm->flatBase) + static_cast<size_t>(comm->rank) * comm->perRankSize + slotOffset;
-  HIP_RUNTIME_CHECK(hipMemMap(localVa, alignedSize, 0, physHandle, 0));
+  err = hipMemMap(localVa, alignedSize, 0, physHandle, 0);
+  if (err != hipSuccess) {
+    MORI_SHMEM_ERROR("CcoMemAlloc: hipMemMap failed: {} ({})", static_cast<int>(err),
+                     hipGetErrorString(err));
+    (void)hipMemRelease(physHandle);  // best-effort cleanup
+    rollbackSlot();
+    return -1;
+  }
 
   hipMemAccessDesc accessDesc = {};
   accessDesc.location.type = hipMemLocationTypeDevice;
   accessDesc.location.id = currentDev;
   accessDesc.flags = hipMemAccessFlagsProtReadWrite;
-  HIP_RUNTIME_CHECK(hipMemSetAccess(localVa, alignedSize, &accessDesc, 1));
+  err = hipMemSetAccess(localVa, alignedSize, &accessDesc, 1);
+  if (err != hipSuccess) {
+    MORI_SHMEM_ERROR("CcoMemAlloc: hipMemSetAccess failed: {} ({})", static_cast<int>(err),
+                     hipGetErrorString(err));
+    (void)hipMemUnmap(localVa, alignedSize);  // best-effort cleanup
+    (void)hipMemRelease(physHandle);
+    rollbackSlot();
+    return -1;
+  }
 
-  // Step 3: export dma-buf FD (for later use by WindowRegister: P2P + RDMA MR)
+  // ── Step 3: export dma-buf FD (for later use by WindowRegister: P2P + RDMA MR) ──
   int shareFd = -1;
-  HIP_RUNTIME_CHECK(hipMemExportToShareableHandle(
-      reinterpret_cast<void*>(&shareFd), physHandle, hipMemHandleTypePosixFileDescriptor, 0));
+  err = hipMemExportToShareableHandle(
+      reinterpret_cast<void*>(&shareFd), physHandle, hipMemHandleTypePosixFileDescriptor, 0);
+  if (err != hipSuccess) {
+    MORI_SHMEM_ERROR("CcoMemAlloc: hipMemExportToShareableHandle failed: {} ({})",
+                     static_cast<int>(err), hipGetErrorString(err));
+    (void)hipMemUnmap(localVa, alignedSize);  // best-effort cleanup
+    (void)hipMemRelease(physHandle);
+    rollbackSlot();
+    return -1;
+  }
 
-  // Step 4: advance offset and record metadata
-  comm->nextOffset += alignedSize;
-
-  CcoComm::AllocMeta meta;
-  meta.physHandle = physHandle;
-  meta.shareFd = shareFd;
-  meta.slotOffset = slotOffset;
-  meta.size = alignedSize;
-  comm->allocTable[localVa] = meta;
+  // ── Step 4: publish metadata under the mutex ──
+  {
+    std::lock_guard<std::mutex> lock(comm->allocMutex);
+    CcoComm::AllocMeta meta;
+    meta.physHandle = physHandle;
+    meta.shareFd = shareFd;
+    meta.slotOffset = slotOffset;
+    meta.size = alignedSize;
+    comm->allocTable[localVa] = meta;
+  }
 
   *outPtr = localVa;
   MORI_SHMEM_TRACE("CcoMemAlloc: done, localPtr={} (local only, P2P mapping deferred to WindowRegister)",
@@ -287,22 +342,28 @@ int CcoMemAlloc(CcoComm* comm, size_t size, void** outPtr) {
 /* ========================================================================== */
 
 int CcoMemFree(CcoComm* comm, void* ptr) {
-  auto it = comm->allocTable.find(ptr);
-  if (it == comm->allocTable.end()) {
-    MORI_SHMEM_WARN("CcoMemFree: ptr {} not found", ptr);
-    return -1;
+  // Take a snapshot of the meta under the mutex, then drop the lock for the
+  // (possibly slow) hipMem* calls. This lets concurrent MemAlloc on another
+  // thread proceed in parallel with the unmap/release here.
+  CcoComm::AllocMeta meta;
+  {
+    std::lock_guard<std::mutex> lock(comm->allocMutex);
+    auto it = comm->allocTable.find(ptr);
+    if (it == comm->allocTable.end()) {
+      MORI_SHMEM_WARN("CcoMemFree: ptr {} not found", ptr);
+      return -1;
+    }
+    meta = it->second;
+    comm->allocTable.erase(it);  // remove eagerly; no one should look it up after this
   }
 
-  auto& meta = it->second;
   size_t alignedSize = meta.size;
   size_t slotOffset = meta.slotOffset;
 
   MORI_SHMEM_TRACE("CcoMemFree: rank={} ptr={} size={}", comm->rank, ptr, alignedSize);
 
-  int currentDev = 0;
-  HIP_RUNTIME_CHECK(hipGetDevice(&currentDev));
-
-  // Unmap peer slots
+  // Unmap peer slots (P2P-mapped during WindowRegister; unmap may fail with
+  // ENOMAP if WindowRegister was never called — that's expected and silent).
   for (int pe = 0; pe < comm->worldSize; pe++) {
     if (pe == comm->rank) continue;
     if (!comm->ctx->CanUseP2P(pe)) continue;
@@ -311,19 +372,29 @@ int CcoMemFree(CcoComm* comm, void* ptr) {
                    static_cast<size_t>(pe) * comm->perRankSize + slotOffset;
     hipError_t err = hipMemUnmap(peerVa, alignedSize);
     if (err != hipSuccess) {
-      MORI_SHMEM_WARN("CcoMemFree: unmap PE {} failed: {}", pe, err);
+      MORI_SHMEM_WARN("CcoMemFree: unmap PE {} failed: {}", pe, static_cast<int>(err));
     }
   }
 
-  // Unmap local slot
-  HIP_RUNTIME_CHECK(hipMemUnmap(ptr, alignedSize));
-  HIP_RUNTIME_CHECK(hipMemRelease(meta.physHandle));
+  // Unmap local slot + release the physical handle.
+  hipError_t err = hipMemUnmap(ptr, alignedSize);
+  if (err != hipSuccess) {
+    MORI_SHMEM_WARN("CcoMemFree: local hipMemUnmap failed: {} ({})", static_cast<int>(err),
+                    hipGetErrorString(err));
+  }
+  err = hipMemRelease(meta.physHandle);
+  if (err != hipSuccess) {
+    MORI_SHMEM_WARN("CcoMemFree: hipMemRelease failed: {} ({})", static_cast<int>(err),
+                    hipGetErrorString(err));
+  }
 
   if (meta.shareFd >= 0) {
     close(meta.shareFd);
   }
 
-  comm->allocTable.erase(it);
+  // Note: slotOffset is NOT returned to a freelist; nextOffset stays put.
+  // Long-running alloc/free churn will eventually exhaust perRankSize. A
+  // proper segmented allocator is future work (see CcoMemAlloc issues list).
   return 0;
 }
 
