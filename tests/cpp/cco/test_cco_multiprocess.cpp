@@ -261,9 +261,71 @@ static int run_fork_mode(int nranks) {
   return fail > 0 ? 1 : 0;
 }
 
-// ── Main: auto-detect MPI or fork ──
+// ── Single-rank mode: --rank R --world N --uid-file F [--gpu-offset G] ──
+// Used for cross-host launches where mpirun/MPI bootstrap isn't available;
+// an outside coordinator writes the UID file and spawns one process per rank.
+static int run_single_rank_mode(int argc, char** argv) {
+  int rank = -1, worldSize = -1, gpuOffset = -1;
+  const char* uidPath = nullptr;
+  for (int i = 1; i < argc; i++) {
+    if (!strcmp(argv[i], "--rank") && i + 1 < argc) rank = atoi(argv[++i]);
+    else if (!strcmp(argv[i], "--world") && i + 1 < argc) worldSize = atoi(argv[++i]);
+    else if (!strcmp(argv[i], "--uid-file") && i + 1 < argc) uidPath = argv[++i];
+    else if (!strcmp(argv[i], "--gpu-offset") && i + 1 < argc) gpuOffset = atoi(argv[++i]);
+  }
+  if (rank < 0 || worldSize <= 0 || !uidPath) return -1;
+
+  mori::application::UniqueId uid;
+  for (int tries = 0; tries < 600; tries++) {
+    FILE* f = fopen(uidPath, "rb");
+    if (f) {
+      size_t n = fread(&uid, 1, sizeof(uid), f);
+      fclose(f);
+      if (n == sizeof(uid)) break;
+    }
+    usleep(100000);  // wait up to 60s for the launcher to write the UID
+  }
+
+  // Pin this process to a GPU. If --gpu-offset is given, use rank - offset
+  // (so two-host launches can map rank 0..7 -> GPU 0..7 on node A and rank
+  // 8..15 -> GPU 0..7 on node B). Otherwise fall back to rank % numDevices.
+  if (gpuOffset >= 0) HIP_CHECK(hipSetDevice(rank - gpuOffset));
+
+  auto* boot = new mori::application::SocketBootstrapNetwork(uid, rank, worldSize);
+  return run_test(rank, worldSize, boot);
+}
+
+// ── --gen-uid IFACE PORT OUTFILE ──
+// Generate a SocketBootstrap UniqueId bound to the given interface/port and
+// write it to OUTFILE. The cross-host launcher uses this on one node, then
+// distributes the file to the other node.
+static int run_gen_uid_mode(int argc, char** argv) {
+  if (argc < 5) {
+    fprintf(stderr, "usage: --gen-uid IFACE PORT OUTFILE\n");
+    return 1;
+  }
+  const char* iface = argv[2];
+  int port = atoi(argv[3]);
+  const char* outPath = argv[4];
+  auto uid = mori::application::SocketBootstrapNetwork::GenerateUniqueIdWithInterface(iface, port);
+  FILE* f = fopen(outPath, "wb");
+  if (!f) { fprintf(stderr, "fopen(%s) failed\n", outPath); return 1; }
+  fwrite(&uid, 1, sizeof(uid), f);
+  fclose(f);
+  printf("Wrote UID (%zu bytes) for iface=%s port=%d to %s\n",
+         sizeof(uid), iface, port, outPath);
+  return 0;
+}
+
+// ── Main: auto-detect MPI / single-rank / gen-uid / fork ──
 
 int main(int argc, char** argv) {
+  // Special CLI modes (cross-host launcher uses these)
+  if (argc >= 2 && !strcmp(argv[1], "--gen-uid")) return run_gen_uid_mode(argc, argv);
+  for (int i = 1; i < argc; i++) {
+    if (!strcmp(argv[i], "--rank")) return run_single_rank_mode(argc, argv);
+  }
+
 #ifdef MORI_WITH_MPI
   int mpiInitialized = 0;
   MPI_Initialized(&mpiInitialized);
