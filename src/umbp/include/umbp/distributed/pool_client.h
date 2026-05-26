@@ -127,13 +127,9 @@ class PoolClient {
   bool IsInitialized() const;
 
   // External KV block events.
-  bool BindExternalHashes(const std::vector<std::string>& hashes, TierType tier);
   bool ReportExternalKvBlocks(const std::vector<std::string>& hashes, TierType tier);
-  bool UnbindExternalHashes(const std::vector<std::string>& hashes, TierType tier);
   bool RevokeExternalKvBlocks(const std::vector<std::string>& hashes, TierType tier);
-  bool UnbindAllExternalHashesAtTier(TierType tier);
   bool RevokeAllExternalKvBlocksAtTier(TierType tier);
-  bool FlushExternalQueue();
   bool MatchExternalKv(const std::vector<std::string>& hashes,
                        std::vector<MasterClient::ExternalKvNodeMatch>* out_matches,
                        bool count_as_hit = false);

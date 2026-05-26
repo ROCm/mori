@@ -64,24 +64,15 @@ class StandaloneClient : public IUMBPClient {
   void Close() override;
   bool IsDistributed() const override;
 
-  bool BindExternalHashes(const std::vector<std::string>& /*hashes*/, TierType /*tier*/) override {
-    return true;
-  }
   bool ReportExternalKvBlocks(const std::vector<std::string>& /*hashes*/,
                               TierType /*tier*/) override {
-    return true;
-  }
-  bool UnbindExternalHashes(const std::vector<std::string>& /*hashes*/,
-                            TierType /*tier*/) override {
     return true;
   }
   bool RevokeExternalKvBlocks(const std::vector<std::string>& /*hashes*/,
                               TierType /*tier*/) override {
     return true;
   }
-  bool UnbindAllExternalHashesAtTier(TierType /*tier*/) override { return true; }
   bool RevokeAllExternalKvBlocksAtTier(TierType /*tier*/) override { return true; }
-  bool FlushExternalQueue() override { return true; }
   std::vector<ExternalKvMatch> MatchExternalKv(const std::vector<std::string>& /*hashes*/,
                                                bool /*count_as_hit*/ = false) override {
     return {};

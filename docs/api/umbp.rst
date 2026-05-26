@@ -467,13 +467,10 @@ uniform for non-distributed deployments.
 
 For placement writes, use ``UMBPMasterClient.report_external_kv_blocks(node_id,
 hashes, tier)`` when a scheduler or sidecar reports on behalf of a registered
-worker and needs synchronous visibility.  Use the data-plane
-``mori.cpp.UMBPClient.bind_external_hashes(hashes, tier)`` /
-``unbind_external_hashes(hashes, tier)`` path for high-rate in-process cache
-events; the old data-plane names
-``report_external_kv_blocks(hashes, tier)`` /
-``revoke_external_kv_blocks(hashes, tier)`` remain available as
-backward-compatible aliases and flush the heartbeat outbox before returning.
+worker.  In-process distributed clients use the two-argument synchronous
+methods ``mori.cpp.UMBPClient.report_external_kv_blocks(hashes, tier)``,
+``revoke_external_kv_blocks(hashes, tier)``, and
+``revoke_all_external_kv_blocks_at_tier(tier)`` for their own node.
 
 ----
 

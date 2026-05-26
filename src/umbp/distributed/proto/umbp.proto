@@ -12,11 +12,6 @@ enum TierType {
   TIER_SSD     = 3;   // NVMe SSD
 }
 
-enum LocationOwner {
-  LOCATION_OWNER_UMBP_OWNED       = 0;
-  LOCATION_OWNER_EXTERNAL_HICACHE = 1;
-}
-
 // Per-tier capacity reported by a peer node.  Master treats every value
 // as ground truth and applies it unconditionally — the peer's allocator
 // is the single source of physical capacity.
@@ -83,6 +78,9 @@ message UnregisterClientResponse {}
 // One mutation in the peer's owned-key set.  ADD carries `size`; REMOVE
 // elides it because master already knows the size from the prior ADD.
 message KvEvent {
+  reserved 5;
+  reserved "owner";
+
   enum Kind {
     ADD           = 0;
     REMOVE        = 1;
@@ -92,18 +90,11 @@ message KvEvent {
   string        key   = 2;
   TierType      tier  = 3;
   uint64        size  = 4;   // ADD only
-  LocationOwner owner = 5;
 }
 
 message EventBundle {
   uint64 seq = 1;
   repeated KvEvent events = 2;
-}
-
-enum FullSyncScope {
-  FULL_SYNC_NONE              = 0;
-  FULL_SYNC_UMBP_OWNED        = 1;
-  FULL_SYNC_EXTERNAL_HICACHE  = 2;
 }
 
 // Per-tier live owned-key count snapshot reported by the client.
@@ -115,11 +106,11 @@ message TierKvCount {
 
 message HeartbeatRequest {
   reserved 5;
-  reserved "seq", "last_acked_seq", "events", "is_full_sync";
+  reserved "seq", "last_acked_seq", "events";
 
   string node_id            = 1;
   repeated EventBundle bundles = 2; // unacked delta bundles in seq order, or full-sync snapshot
-  FullSyncScope full_sync_scope = 3;
+  bool is_full_sync = 3;
   repeated TierCapacity tier_capacities = 4; // ground truth from peer's allocator
   uint64 delta_seq_baseline = 6;    // valid for full-sync; master adopts this cursor
   repeated TierKvCount  tier_kv_counts  = 7; // live owned-key count per tier (client-reported)
@@ -127,7 +118,7 @@ message HeartbeatRequest {
 message HeartbeatResponse {
   ClientStatus status            = 1;
   uint64       acked_seq         = 2;  // master applied up to this seq
-  uint32       full_sync_owners_to_resend = 3; // bitmask of LocationOwner values
+  bool         request_full_sync = 3;  // master detected gap; peer reships
 }
 
 // ============================================================
@@ -259,10 +250,7 @@ message ReportMetricsRequest {
 message ReportMetricsResponse {}
 
 // ---- External KV mutation RPCs --------------------------------------------
-// v2.5 added a heartbeat-bundled outbox path for data-plane clients. These
-// direct RPCs remain available for lightweight control-plane callers that need
-// per-call synchronous visibility while writing the same GlobalBlockIndex
-// entries under LOCATION_OWNER_EXTERNAL_HICACHE.
+// Direct synchronous mutation surface for externally managed HiCache placement.
 message ReportExternalKvBlocksRequest {
   string         node_id = 1;
   repeated string hashes = 2;
@@ -282,6 +270,11 @@ message RevokeAllExternalKvBlocksAtTierRequest {
   TierType tier    = 2;
 }
 message RevokeAllExternalKvBlocksAtTierResponse {}
+
+message RevokeAllExternalKvBlocksForNodeRequest {
+  string node_id = 1;
+}
+message RevokeAllExternalKvBlocksForNodeResponse {}
 
 message MatchExternalKvRequest {
   repeated string hashes = 1;
@@ -350,6 +343,8 @@ service UMBPMaster {
       returns (RevokeExternalKvBlocksResponse);
   rpc RevokeAllExternalKvBlocksAtTier(RevokeAllExternalKvBlocksAtTierRequest)
       returns (RevokeAllExternalKvBlocksAtTierResponse);
+  rpc RevokeAllExternalKvBlocksForNode(RevokeAllExternalKvBlocksForNodeRequest)
+      returns (RevokeAllExternalKvBlocksForNodeResponse);
   rpc MatchExternalKv                (MatchExternalKvRequest)
       returns (MatchExternalKvResponse);
   rpc GetExternalKvHitCounts         (GetExternalKvHitCountsRequest)

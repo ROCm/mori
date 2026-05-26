@@ -33,6 +33,7 @@
 #include "mori/utils/mori_log.hpp"
 #include "umbp.grpc.pb.h"
 #include "umbp/common/env_time.h"
+#include "umbp/distributed/master/external_kv_block_index.h"
 #include "umbp/distributed/master/external_kv_hit_index.h"
 #include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/routing/router.h"
@@ -99,12 +100,7 @@ KvEvent FromProtoEvent(const ::umbp::KvEvent& pe) {
   ev.key = pe.key();
   ev.tier = static_cast<TierType>(pe.tier());
   ev.size = pe.size();
-  ev.owner = static_cast<LocationOwner>(pe.owner());
   return ev;
-}
-
-FullSyncScope FromProtoFullSyncScope(::umbp::FullSyncScope scope) {
-  return static_cast<FullSyncScope>(scope);
 }
 
 int EvictKeyDeadlineMs() {
@@ -192,10 +188,12 @@ MasterServerConfig MasterServerConfig::FromEnvironment() {
 class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Service {
  public:
   UMBPMasterServiceImpl(ClientRegistry& registry, GlobalBlockIndex& index,
+                        ExternalKvBlockIndex& external_kv_index,
                         ExternalKvHitIndex& external_kv_hit_index, Router& router,
                         const ClientRegistryConfig& config, mori::metrics::MetricsServer* metrics)
       : registry_(registry),
         index_(index),
+        external_kv_index_(external_kv_index),
         external_kv_hit_index_(external_kv_hit_index),
         router_(router),
         config_(config),
@@ -268,14 +266,14 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     }
 
     uint64_t acked_seq = 0;
-    uint32_t full_sync_owners_to_resend = 0;
-    auto status = registry_.Heartbeat(
-        request->node_id(), caps, bundles, FromProtoFullSyncScope(request->full_sync_scope()),
-        request->delta_seq_baseline(), &acked_seq, &full_sync_owners_to_resend);
+    bool request_full_sync = false;
+    auto status =
+        registry_.Heartbeat(request->node_id(), caps, bundles, request->is_full_sync(),
+                            request->delta_seq_baseline(), &acked_seq, &request_full_sync);
 
     response->set_status(static_cast<::umbp::ClientStatus>(status));
     response->set_acked_seq(acked_seq);
-    response->set_full_sync_owners_to_resend(full_sync_owners_to_resend);
+    response->set_request_full_sync(request_full_sync);
 
     UpdateClientCapacityMetrics(request->node_id(), caps);
 
@@ -301,7 +299,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
                          static_cast<double>(total));
     }
 
-    if (full_sync_owners_to_resend != 0 && metrics_ != nullptr) {
+    if (request_full_sync && metrics_ != nullptr) {
       metrics_->addCounter("mori_umbp_heartbeat_seq_gap_total",
                            "Heartbeats rejected due to seq gap (full sync requested)",
                            {{"node", request->node_id()}});
@@ -432,7 +430,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
   grpc::Status BatchLookup(grpc::ServerContext* /*ctx*/, const ::umbp::BatchLookupRequest* request,
                            ::umbp::BatchLookupResponse* response) override {
     std::vector<std::string> keys(request->keys().begin(), request->keys().end());
-    auto found = index_.BatchLookupExistsServable(keys);
+    auto found = index_.BatchLookupExists(keys);
     for (bool b : found) response->add_found(b);
     return grpc::Status::OK;
   }
@@ -463,14 +461,8 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
       return grpc::Status::OK;
     }
 
-    std::vector<KvEvent> events;
-    events.reserve(static_cast<size_t>(request->hashes_size()));
-    for (const auto& hash : request->hashes()) {
-      events.push_back(
-          KvEvent{KvEvent::Kind::ADD, hash, tier, /*size=*/0, LocationOwner::EXTERNAL_HICACHE});
-    }
-
-    const size_t mutated = index_.ApplyEvents(request->node_id(), events);
+    std::vector<std::string> hashes(request->hashes().begin(), request->hashes().end());
+    const size_t mutated = external_kv_index_.Register(request->node_id(), hashes, tier);
     if (metrics_) {
       const mori::metrics::MetricsServer::Labels labels = {{"node", request->node_id()},
                                                            {"tier", TierTypeName(tier)}};
@@ -495,14 +487,8 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     }
 
     const TierType tier = static_cast<TierType>(request->tier());
-    std::vector<KvEvent> events;
-    events.reserve(static_cast<size_t>(request->hashes_size()));
-    for (const auto& hash : request->hashes()) {
-      events.push_back(
-          KvEvent{KvEvent::Kind::REMOVE, hash, tier, /*size=*/0, LocationOwner::EXTERNAL_HICACHE});
-    }
-
-    const size_t mutated = index_.ApplyEvents(request->node_id(), events);
+    std::vector<std::string> hashes(request->hashes().begin(), request->hashes().end());
+    const size_t mutated = external_kv_index_.Unregister(request->node_id(), hashes, tier);
     if (metrics_) {
       const mori::metrics::MetricsServer::Labels labels = {{"node", request->node_id()},
                                                            {"tier", TierTypeName(tier)}};
@@ -524,9 +510,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     }
 
     const TierType tier = static_cast<TierType>(request->tier());
-    const std::vector<KvEvent> events = {KvEvent{KvEvent::Kind::CLEAR_AT_TIER, "", tier, /*size=*/0,
-                                                 LocationOwner::EXTERNAL_HICACHE}};
-    const size_t mutated = index_.ApplyEvents(request->node_id(), events);
+    const size_t mutated = external_kv_index_.UnregisterByNodeAtTier(request->node_id(), tier);
     if (metrics_) {
       const mori::metrics::MetricsServer::Labels labels = {{"node", request->node_id()},
                                                            {"tier", TierTypeName(tier)}};
@@ -540,11 +524,32 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     return grpc::Status::OK;
   }
 
+  grpc::Status RevokeAllExternalKvBlocksForNode(
+      grpc::ServerContext* /*ctx*/, const ::umbp::RevokeAllExternalKvBlocksForNodeRequest* request,
+      ::umbp::RevokeAllExternalKvBlocksForNodeResponse* /*response*/) override {
+    if (request->node_id().empty()) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "node_id must not be empty");
+    }
+
+    const size_t mutated = external_kv_index_.UnregisterByNode(request->node_id());
+    if (metrics_) {
+      const mori::metrics::MetricsServer::Labels labels = {{"node", request->node_id()},
+                                                           {"tier", "ALL"}};
+      metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_REVOKE_BLOCKS_TOTAL,
+                           MORI_UMBP_METRIC_EXT_KV_REVOKE_BLOCKS_TOTAL_HELP, labels,
+                           static_cast<uint64_t>(mutated));
+      metrics_->addCounter(MORI_UMBP_METRIC_EXT_KV_REVOKE_TOTAL,
+                           MORI_UMBP_METRIC_EXT_KV_REVOKE_TOTAL_HELP,
+                           {{"node", request->node_id()}, {"tier", "ALL"}, {"result", "ok"}});
+    }
+    return grpc::Status::OK;
+  }
+
   grpc::Status MatchExternalKv(grpc::ServerContext* /*ctx*/,
                                const ::umbp::MatchExternalKvRequest* request,
                                ::umbp::MatchExternalKvResponse* response) override {
     std::vector<std::string> hashes(request->hashes().begin(), request->hashes().end());
-    auto matches = index_.MatchExternal(hashes);
+    auto matches = external_kv_index_.Match(hashes);
 
     std::unordered_map<std::string, std::string> peer_map;
     for (const auto& record : registry_.GetAliveClients()) {
@@ -688,6 +693,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
 
   ClientRegistry& registry_;
   GlobalBlockIndex& index_;
+  ExternalKvBlockIndex& external_kv_index_;
   ExternalKvHitIndex& external_kv_hit_index_;
   Router& router_;
   ClientRegistryConfig config_;
@@ -700,11 +706,13 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
 MasterServer::MasterServer(MasterServerConfig config)
     : config_(std::move(config)),
       index_(),
+      external_kv_index_(),
       external_kv_hit_index_(),
-      registry_(config_.registry_config, index_),
+      registry_(config_.registry_config, index_, &external_kv_index_),
       router_(index_, registry_, std::move(config_.get_strategy), std::move(config_.put_strategy)),
-      service_(std::make_unique<UMBPMasterServiceImpl>(registry_, index_, external_kv_hit_index_,
-                                                       router_, config_.registry_config, nullptr)),
+      service_(std::make_unique<UMBPMasterServiceImpl>(registry_, index_, external_kv_index_,
+                                                       external_kv_hit_index_, router_,
+                                                       config_.registry_config, nullptr)),
       peer_stub_pool_(std::make_unique<MasterPeerStubPool>()),
       eviction_manager_(std::make_unique<EvictionManager>(
           index_, registry_, config_.eviction_config, peer_stub_pool_.get())) {

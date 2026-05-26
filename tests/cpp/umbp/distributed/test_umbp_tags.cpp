@@ -122,8 +122,8 @@ TEST(ClientRegistryTagsTest, TagsUnchangedByHeartbeat) {
   ASSERT_TRUE(reg.RegisterClient("n1", "127.0.0.1:9003", {}, "", {}, tags));
 
   uint64_t acked = 0;
-  uint32_t full_sync = 0;
-  reg.Heartbeat("n1", {}, {}, FullSyncScope::NONE, 0, &acked, &full_sync);
+  bool request_full_sync = false;
+  reg.Heartbeat("n1", {}, {}, /*is_full_sync=*/false, 0, &acked, &request_full_sync);
 
   EXPECT_EQ(reg.GetClientTags("n1"), tags);
 }

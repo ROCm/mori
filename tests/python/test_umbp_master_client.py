@@ -64,6 +64,17 @@ def _wait_for_port(host: str, port: int, timeout: float = 10.0) -> bool:
     return False
 
 
+def _wait_for_predicate(
+    predicate, timeout: float = 10.0, interval: float = 0.2
+) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return predicate()
+
+
 def _make_hashes(prefix: str, count: int) -> list[str]:
     return [f"{prefix}-hash-{i:04d}" for i in range(count)]
 
@@ -72,10 +83,16 @@ def _start_master_process(address: str, metrics_port: int = 0) -> subprocess.Pop
     if not MASTER_BIN.is_file():
         pytest.skip(f"UMBP master binary not found: {MASTER_BIN}")
 
+    env = os.environ.copy()
+    lib_dir = str(MASTER_BIN.parent)
+    existing_ld = env.get("LD_LIBRARY_PATH")
+    env["LD_LIBRARY_PATH"] = f"{lib_dir}:{existing_ld}" if existing_ld else lib_dir
+
     proc = subprocess.Popen(
         [str(MASTER_BIN), address, str(metrics_port)],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        env=env,
     )
     host, port_text = address.rsplit(":", 1)
     if not _wait_for_port(host, int(port_text), timeout=10.0):
@@ -141,27 +158,19 @@ def _registered_master_client(master_address: str, node_id: str, caps=None):
 
 
 def _bind(client, hashes: list[str], tier) -> None:
-    assert client.bind_external_hashes(hashes, tier)
-    assert client.flush_external_queue()
+    if not hashes:
+        return
+    assert client.report_external_kv_blocks(hashes, tier)
 
 
 def _unbind(client, hashes: list[str], tier) -> None:
-    assert client.unbind_external_hashes(hashes, tier)
-    assert client.flush_external_queue()
+    if not hashes:
+        return
+    assert client.revoke_external_kv_blocks(hashes, tier)
 
 
 def _clear_tier(client, tier) -> None:
-    assert client.unbind_all_external_hashes_at_tier(tier)
-    assert client.flush_external_queue()
-
-
-def _flush_external_queue_until_ok(client, timeout: float = 10.0) -> bool:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if client.flush_external_queue():
-            return True
-        time.sleep(0.2)
-    return False
+    assert client.revoke_all_external_kv_blocks_at_tier(tier)
 
 
 @pytest.fixture(scope="module")
@@ -352,11 +361,11 @@ def test_umbpclient_report_external_kv_blocks_alias_is_visible(master_address):
         assert set(matches[0].hashes_by_tier[UMBPTierType.DRAM]) == set(hashes)
 
 
-def test_umbpclient_two_arg_alias_survives_external_full_sync():
+def test_umbpclient_master_restart_loses_external_state():
     port = _get_free_port()
     address = f"localhost:{port}"
-    node_id = "alias-full-sync-node"
-    hashes = _make_hashes("alias-full-sync", 2)
+    node_id = "restart-rebind-node"
+    hashes = _make_hashes("restart-external", 2)
 
     proc = _start_master_process(address)
     try:
@@ -374,15 +383,19 @@ def test_umbpclient_two_arg_alias_survives_external_full_sync():
             proc = None
 
             proc = _start_master_process(address)
-            assert _flush_external_queue_until_ok(client)
-            assert _flush_external_queue_until_ok(client)
+            assert _wait_for_predicate(lambda: _wait_for_port("localhost", port, 0.1))
 
             query = UMBPMasterClient(address)
-            matches = [
-                m for m in query.match_external_kv(hashes) if m.node_id == node_id
-            ]
-            assert len(matches) == 1
-            assert set(matches[0].hashes_by_tier[UMBPTierType.DRAM]) == set(hashes)
+
+            def external_state_is_gone() -> bool:
+                try:
+                    return all(
+                        m.node_id != node_id for m in query.match_external_kv(hashes)
+                    )
+                except RuntimeError:
+                    return False
+
+            assert _wait_for_predicate(external_state_is_gone)
     finally:
         if proc is not None:
             _stop_master_process(proc)
@@ -678,14 +691,14 @@ def test_match_external_kv_connection_refused_raises():
         client.match_external_kv(["some-hash"])
 
 
-def test_bind_external_kv_connection_refused_raises():
+def test_report_external_kv_connection_refused_raises():
     cfg = UMBPConfig()
     cfg.dram.capacity_bytes = 8 * 1024 * 1024
     cfg.ssd.enabled = False
     dist = UMBPDistributedConfig()
     dist.master_config.master_address = "localhost:19997"
-    dist.master_config.node_id = "bind-refused"
-    dist.master_config.node_address = "bind-refused"
+    dist.master_config.node_id = "report-refused"
+    dist.master_config.node_address = "report-refused"
     cfg.distributed = dist
     with pytest.raises(RuntimeError):
         UMBPClient(cfg)

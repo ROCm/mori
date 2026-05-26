@@ -63,12 +63,6 @@ uint64_t MetricsReportIntervalMs() {
 
 ::umbp::TierType ToProtoTier(TierType t) { return static_cast<::umbp::TierType>(t); }
 TierType FromProtoTier(::umbp::TierType t) { return static_cast<TierType>(t); }
-::umbp::LocationOwner ToProtoOwner(LocationOwner owner) {
-  return static_cast<::umbp::LocationOwner>(owner);
-}
-::umbp::FullSyncScope ToProtoFullSyncScope(FullSyncScope scope) {
-  return static_cast<::umbp::FullSyncScope>(scope);
-}
 
 ::umbp::KvEvent::Kind ToProtoEventKind(KvEvent::Kind kind) {
   switch (kind) {
@@ -114,7 +108,6 @@ void FillBundle(::umbp::EventBundle* dst, const EventBundle& src) {
     pe->set_key(ev.key);
     pe->set_tier(ToProtoTier(ev.tier));
     pe->set_size(ev.size);
-    pe->set_owner(ToProtoOwner(ev.owner));
   }
 }
 
@@ -174,9 +167,7 @@ grpc::Status MasterClient::RegisterSelf(const std::map<TierType, TierCapacity>& 
   {
     std::lock_guard lock(hb_state_mutex_);
     outbox_.clear();
-    external_pending_events_.clear();
-    external_current_set_.clear();
-    full_sync_owners_to_resend_ = 0;
+    request_full_sync_ = false;
   }
   {
     std::lock_guard lock(caps_mutex_);
@@ -370,11 +361,6 @@ grpc::Status MasterClient::BatchLookup(const std::vector<std::string>& keys,
 void MasterClient::SetPeerDramAllocator(PeerDramAllocator* alloc) { peer_alloc_ = alloc; }
 
 void MasterClient::RequestClearFullSync() {
-  {
-    std::lock_guard state_lock(hb_state_mutex_);
-    external_pending_events_.clear();
-    external_current_set_.clear();
-  }
   // Mark in-flight first so a heartbeat that races with us still
   // sees we owe an ack-callback.
   clear_full_sync_in_flight_.store(true);
@@ -392,12 +378,6 @@ void MasterClient::RequestClearFullSync() {
 bool MasterClient::ClearFullSync() {
   std::lock_guard send_lock(hb_send_mutex_);
   if (!registered_) return false;
-
-  {
-    std::lock_guard state_lock(hb_state_mutex_);
-    external_pending_events_.clear();
-    external_current_set_.clear();
-  }
 
   // Mark in-flight before sending so failed attempts leave the write gate
   // closed until a later heartbeat retry succeeds.
@@ -420,13 +400,12 @@ bool MasterClient::ClearFullSync() {
   std::map<TierType, uint64_t> kv_counts;
   if (peer_alloc_ != nullptr) kv_counts = peer_alloc_->OwnedKeyCountByTier();
 
-  if (!SendFullSyncLocked(FullSyncScope::UMBP_OWNED, caps, kv_counts)) {
+  if (!SendFullSyncLocked(caps, kv_counts)) {
     clear_full_sync_requested_.store(true);
     return false;
   }
-  // EXTERNAL_HICACHE retry is idempotent because this method has already
-  // emptied external_current_set_ under hb_state_mutex_.
-  if (!SendFullSyncLocked(FullSyncScope::EXTERNAL_HICACHE, caps, kv_counts)) {
+  auto external_status = RevokeAllExternalKvBlocksForNode(config_.node_id);
+  if (!external_status.ok()) {
     clear_full_sync_requested_.store(true);
     return false;
   }
@@ -500,12 +479,13 @@ bool MasterClient::SendHeartbeatOnce() {
 
   const bool is_clear_sync = clear_full_sync_requested_.exchange(false);
   if (is_clear_sync) {
-    const bool ok = SendFullSyncLocked(FullSyncScope::UMBP_OWNED, caps, kv_counts);
+    const bool ok = SendFullSyncLocked(caps, kv_counts);
     if (!ok) {
       clear_full_sync_requested_.store(true);
       return false;
     }
-    if (!SendFullSyncLocked(FullSyncScope::EXTERNAL_HICACHE, caps, kv_counts)) {
+    auto external_status = RevokeAllExternalKvBlocksForNode(config_.node_id);
+    if (!external_status.ok()) {
       clear_full_sync_requested_.store(true);
       return false;
     }
@@ -515,23 +495,16 @@ bool MasterClient::SendHeartbeatOnce() {
     }
   }
 
-  uint32_t resend_bits = 0;
+  bool request_full_sync = false;
   {
     std::lock_guard state_lock(hb_state_mutex_);
-    resend_bits = full_sync_owners_to_resend_;
-    full_sync_owners_to_resend_ = 0;
+    request_full_sync = request_full_sync_;
+    request_full_sync_ = false;
   }
-  if (resend_bits & kLocationOwnerUmbpOwnedBit) {
-    if (!SendFullSyncLocked(FullSyncScope::UMBP_OWNED, caps, kv_counts)) {
+  if (request_full_sync) {
+    if (!SendFullSyncLocked(caps, kv_counts)) {
       std::lock_guard state_lock(hb_state_mutex_);
-      full_sync_owners_to_resend_ |= kLocationOwnerUmbpOwnedBit;
-      return false;
-    }
-  }
-  if (resend_bits & kLocationOwnerExternalHiCacheBit) {
-    if (!SendFullSyncLocked(FullSyncScope::EXTERNAL_HICACHE, caps, kv_counts)) {
-      std::lock_guard state_lock(hb_state_mutex_);
-      full_sync_owners_to_resend_ |= kLocationOwnerExternalHiCacheBit;
+      request_full_sync_ = true;
       return false;
     }
   }
@@ -541,17 +514,11 @@ bool MasterClient::SendHeartbeatOnce() {
     auto owned_events = peer_alloc_->DrainPendingEvents();
     new_events.reserve(owned_events.size());
     for (auto& ev : owned_events) {
-      ev.owner = LocationOwner::UMBP_OWNED;
       new_events.push_back(std::move(ev));
     }
   }
   {
     std::lock_guard state_lock(hb_state_mutex_);
-    for (auto& ev : external_pending_events_) {
-      ev.owner = LocationOwner::EXTERNAL_HICACHE;
-      new_events.push_back(std::move(ev));
-    }
-    external_pending_events_.clear();
     if (!new_events.empty()) {
       outbox_.push_back(EventBundle{next_bundle_seq_++, std::move(new_events)});
     }
@@ -559,7 +526,7 @@ bool MasterClient::SendHeartbeatOnce() {
 
   ::umbp::HeartbeatRequest req;
   req.set_node_id(config_.node_id);
-  req.set_full_sync_scope(::umbp::FULL_SYNC_NONE);
+  req.set_is_full_sync(false);
   FillTierCapacities(req.mutable_tier_capacities(), caps);
   FillTierKvCounts(req.mutable_tier_kv_counts(), kv_counts);
   {
@@ -591,7 +558,7 @@ bool MasterClient::SendHeartbeatOnce() {
     while (!outbox_.empty() && outbox_.front().seq <= hb_last_acked_seq_) {
       outbox_.pop_front();
     }
-    full_sync_owners_to_resend_ |= resp.full_sync_owners_to_resend();
+    request_full_sync_ = request_full_sync_ || resp.request_full_sync();
   }
 
   if (resp.status() == ::umbp::CLIENT_STATUS_UNKNOWN) {
@@ -614,7 +581,7 @@ bool MasterClient::SendHeartbeatOnce() {
       registered_ = true;
       std::lock_guard state_lock(hb_state_mutex_);
       hb_last_acked_seq_ = 0;
-      full_sync_owners_to_resend_ |= kLocationOwnerUmbpOwnedBit | kLocationOwnerExternalHiCacheBit;
+      request_full_sync_ = true;
       MORI_UMBP_INFO("[Client] Re-registered with master after UNKNOWN status");
     } else {
       MORI_UMBP_WARN("[Client] Re-registration failed: {}", re_status.error_message());
@@ -624,12 +591,11 @@ bool MasterClient::SendHeartbeatOnce() {
   return true;
 }
 
-bool MasterClient::SendFullSyncLocked(FullSyncScope scope,
-                                      const std::map<TierType, TierCapacity>& caps,
+bool MasterClient::SendFullSyncLocked(const std::map<TierType, TierCapacity>& caps,
                                       const std::map<TierType, uint64_t>& kv_counts) {
   ::umbp::HeartbeatRequest req;
   req.set_node_id(config_.node_id);
-  req.set_full_sync_scope(ToProtoFullSyncScope(scope));
+  req.set_is_full_sync(true);
   FillTierCapacities(req.mutable_tier_capacities(), caps);
   FillTierKvCounts(req.mutable_tier_kv_counts(), kv_counts);
 
@@ -638,17 +604,9 @@ bool MasterClient::SendFullSyncLocked(FullSyncScope scope,
     std::lock_guard state_lock(hb_state_mutex_);
     snapshot.seq = next_bundle_seq_ - 1;
     req.set_delta_seq_baseline(snapshot.seq);
-    if (scope == FullSyncScope::EXTERNAL_HICACHE) {
-      snapshot.events.reserve(external_current_set_.size());
-      for (const auto& [tier, hash] : external_current_set_) {
-        snapshot.events.push_back(
-            KvEvent{KvEvent::Kind::ADD, hash, tier, /*size=*/0, LocationOwner::EXTERNAL_HICACHE});
-      }
-    }
   }
-  if (scope == FullSyncScope::UMBP_OWNED && peer_alloc_ != nullptr) {
+  if (peer_alloc_ != nullptr) {
     snapshot.events = peer_alloc_->SnapshotOwnedKeys();
-    for (auto& ev : snapshot.events) ev.owner = LocationOwner::UMBP_OWNED;
   }
   FillBundle(req.add_bundles(), snapshot);
 
@@ -663,8 +621,7 @@ bool MasterClient::SendFullSyncLocked(FullSyncScope scope,
     _rpc_timer.SetStatus(status);
   }
   if (!status.ok()) {
-    MORI_UMBP_WARN("[Client] Full-sync heartbeat failed: scope={}, error={}",
-                   static_cast<int>(scope), status.error_message());
+    MORI_UMBP_WARN("[Client] Full-sync heartbeat failed: error={}", status.error_message());
     return false;
   }
   {
@@ -673,7 +630,7 @@ bool MasterClient::SendFullSyncLocked(FullSyncScope scope,
     while (!outbox_.empty() && outbox_.front().seq <= hb_last_acked_seq_) {
       outbox_.pop_front();
     }
-    full_sync_owners_to_resend_ |= resp.full_sync_owners_to_resend();
+    request_full_sync_ = request_full_sync_ || resp.request_full_sync();
   }
   return true;
 }
@@ -941,52 +898,19 @@ grpc::Status MasterClient::RevokeAllExternalKvBlocksAtTier(const std::string& no
   return status;
 }
 
-bool MasterClient::BindExternalHashes(const std::vector<std::string>& hashes, TierType tier) {
-  if (hashes.empty()) return true;
-  std::lock_guard state_lock(hb_state_mutex_);
-  for (const auto& hash : hashes) {
-    external_current_set_.insert({tier, hash});
-    external_pending_events_.push_back(
-        KvEvent{KvEvent::Kind::ADD, hash, tier, /*size=*/0, LocationOwner::EXTERNAL_HICACHE});
-  }
-  hb_cv_.notify_all();
-  return true;
-}
+grpc::Status MasterClient::RevokeAllExternalKvBlocksForNode(const std::string& node_id) {
+  ScopedRpcTimer _rpc_timer(this, "RevokeAllExternalKvBlocksForNode");
+  ::umbp::RevokeAllExternalKvBlocksForNodeRequest req;
+  req.set_node_id(node_id);
 
-bool MasterClient::UnbindExternalHashes(const std::vector<std::string>& hashes, TierType tier) {
-  if (hashes.empty()) return true;
-  std::lock_guard state_lock(hb_state_mutex_);
-  for (const auto& hash : hashes) {
-    auto it = external_current_set_.find({tier, hash});
-    if (it == external_current_set_.end()) {
-      MORI_UMBP_DEBUG("[Client] UnbindExternalHashes skipped unknown hash='{}' tier={}", hash,
-                      TierTypeName(tier));
-      continue;
-    }
-    external_current_set_.erase(it);
-    external_pending_events_.push_back(
-        KvEvent{KvEvent::Kind::REMOVE, hash, tier, /*size=*/0, LocationOwner::EXTERNAL_HICACHE});
-  }
-  hb_cv_.notify_all();
-  return true;
+  ::umbp::RevokeAllExternalKvBlocksForNodeResponse resp;
+  grpc::ClientContext ctx;
+  ctx.set_deadline(std::chrono::system_clock::now() +
+                   std::chrono::milliseconds(RpcShutdownTimeoutMs()));
+  auto status = GetStub(stub_.get())->RevokeAllExternalKvBlocksForNode(&ctx, req, &resp);
+  _rpc_timer.SetStatus(status);
+  return status;
 }
-
-bool MasterClient::UnbindAllExternalHashesAtTier(TierType tier) {
-  std::lock_guard state_lock(hb_state_mutex_);
-  for (auto it = external_current_set_.begin(); it != external_current_set_.end();) {
-    if (it->first == tier) {
-      it = external_current_set_.erase(it);
-    } else {
-      ++it;
-    }
-  }
-  external_pending_events_.push_back(
-      KvEvent{KvEvent::Kind::CLEAR_AT_TIER, "", tier, /*size=*/0, LocationOwner::EXTERNAL_HICACHE});
-  hb_cv_.notify_all();
-  return true;
-}
-
-bool MasterClient::FlushExternalQueue() { return SendHeartbeatOnce(); }
 
 grpc::Status MasterClient::MatchExternalKv(const std::vector<std::string>& hashes,
                                            std::vector<ExternalKvNodeMatch>* out_matches,

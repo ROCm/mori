@@ -39,6 +39,7 @@
 namespace mori::umbp {
 
 class GlobalBlockIndex;
+class ExternalKvBlockIndex;
 
 // Master-side membership ledger + heartbeat ingestion.  In the
 // master-as-advisor design this class no longer owns any allocator
@@ -48,13 +49,15 @@ class GlobalBlockIndex;
 class ClientRegistry {
  public:
   explicit ClientRegistry(const ClientRegistryConfig& config);
-  ClientRegistry(const ClientRegistryConfig& config, GlobalBlockIndex& index);
+  ClientRegistry(const ClientRegistryConfig& config, GlobalBlockIndex& index,
+                 ExternalKvBlockIndex* external_kv_index = nullptr);
   ~ClientRegistry();
 
   ClientRegistry(const ClientRegistry&) = delete;
   ClientRegistry& operator=(const ClientRegistry&) = delete;
 
   void SetBlockIndex(GlobalBlockIndex* index);
+  void SetExternalKvBlockIndex(ExternalKvBlockIndex* index);
 
   // --- Client lifecycle ---
 
@@ -77,12 +80,12 @@ class ClientRegistry {
   // (UNKNOWN if the node isn't registered).  On the success path:
   //   - tier_capacities replace the stored values unconditionally,
   //   - delta bundles are applied in seq order, with retransmissions skipped,
-  //   - owner-scoped full-sync replaces only the requested owner.
+  //   - full-sync replaces this node's UMBP-owned locations.
   ClientStatus Heartbeat(const std::string& node_id,
                          const std::map<TierType, TierCapacity>& tier_capacities,
-                         const std::vector<EventBundle>& bundles, FullSyncScope full_sync_scope,
+                         const std::vector<EventBundle>& bundles, bool is_full_sync,
                          uint64_t delta_seq_baseline, uint64_t* out_acked_seq,
-                         uint32_t* out_full_sync_owners_to_resend);
+                         bool* out_request_full_sync);
 
   // --- Queries ---
   bool IsClientAlive(const std::string& node_id) const;
@@ -101,6 +104,7 @@ class ClientRegistry {
  private:
   ClientRegistryConfig config_;
   GlobalBlockIndex* index_ = nullptr;
+  ExternalKvBlockIndex* external_kv_index_ = nullptr;
 
   mutable std::shared_mutex mutex_;
   std::unordered_map<std::string, ClientRecord> clients_;

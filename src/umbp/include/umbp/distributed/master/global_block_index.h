@@ -88,20 +88,17 @@ class GlobalBlockIndex {
   // --- Mutators (event-driven only) ---
 
   // Apply one peer's heartbeat-shipped event batch.  Returns the count
-  // of location mutations.  ADD with a (node_id, tier, owner) that
-  // already exists for the key is an idempotent no-op on the location's size.
-  // REMOVE for an unknown (key, node_id, tier, owner) is a silent no-op.
-  // CLEAR_AT_TIER drops every key for (node_id, tier, owner) and returns
+  // of location mutations.  ADD with a (node_id, tier) that already exists
+  // for the key is an idempotent no-op on the location's size.
+  // REMOVE for an unknown (key, node_id, tier) is a silent no-op.
+  // CLEAR_AT_TIER drops every key for (node_id, tier) and returns
   // the number of locations removed.
   size_t ApplyEvents(const std::string& node_id, const std::vector<KvEvent>& events);
 
-  // Replace this node's full set of locations for `owner` with the ADDs
-  // carried in `adds`. Other owners for the same node are untouched.
-  void ReplaceNodeLocations(const std::string& node_id, const std::vector<KvEvent>& adds,
-                            LocationOwner owner = LocationOwner::UMBP_OWNED);
+  // Replace this node's full set of locations with the ADDs carried in `adds`.
+  void ReplaceNodeLocations(const std::string& node_id, const std::vector<KvEvent>& adds);
 
   void RemoveByNode(const std::string& node_id);
-  void RemoveByNodeAndOwner(const std::string& node_id, LocationOwner owner);
 
   // Bump last_accessed_at and access_count.  Lock-free under the shared lock.
   void RecordAccess(const std::string& key);
@@ -110,8 +107,7 @@ class GlobalBlockIndex {
   void GrantLease(const std::string& key, std::chrono::steady_clock::duration duration);
 
   // Batched Lookup + filter + (on non-empty result) RecordAccess + GrantLease,
-  // under a single shared_lock.  Only UMBP-owned locations are returned;
-  // fully-excluded, external-only, or missing keys leave access/lease state untouched.
+  // under a single shared_lock.
   std::vector<std::vector<Location>> BatchLookupForRouteGet(
       const std::vector<std::string>& keys, const std::unordered_set<std::string>& exclude_nodes,
       std::chrono::steady_clock::duration lease_duration);
@@ -119,30 +115,12 @@ class GlobalBlockIndex {
   // --- Queries ---
 
   std::vector<Location> Lookup(const std::string& key) const;
-  std::vector<Location> LookupServable(const std::string& key) const;
 
   // Batched existence check — single shared_lock acquisition for the
   // whole batch.  Read-only, no access-count or lease side-effects.
   // Returns a vector parallel to `keys` where entry i is true iff the
   // key has at least one registered Location.
   std::vector<bool> BatchLookupExists(const std::vector<std::string>& keys) const;
-  std::vector<bool> BatchLookupExistsServable(const std::vector<std::string>& keys) const;
-
-  struct NodeMatch {
-    std::string node_id;
-    std::map<TierType, std::vector<std::string>> hashes_by_tier;
-
-    size_t MatchedHashCount() const {
-      std::unordered_set<std::string_view> seen;
-      for (const auto& [tier, hashes] : hashes_by_tier) {
-        for (const auto& h : hashes) seen.insert(h);
-      }
-      return seen.size();
-    }
-  };
-
-  std::vector<NodeMatch> MatchExternal(const std::vector<std::string>& hashes) const;
-  size_t GetExternalKvCount(const std::string& node_id) const;
 
   std::optional<BlockMetrics> GetMetrics(const std::string& key) const;
 

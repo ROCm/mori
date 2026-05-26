@@ -32,7 +32,6 @@
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <set>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -122,17 +121,14 @@ class MasterClient {
   void StartHeartbeat();
   void StopHeartbeat();
 
-  // Force the next heartbeat to send full-sync snapshots for both
-  // UMBP-owned and external HiCache placement.  Used by Clear():
-  // after PeerDramAllocator::ClearLocal() and local external placement
-  // state are emptied, master collapses this node's index in one shot.
-  // The heartbeat thread is woken so master converges within an RPC
-  // round-trip instead of the next heartbeat tick.
+  // Force the next heartbeat to send a UMBP-owned full-sync snapshot.
+  // Used by Clear(): after PeerDramAllocator::ClearLocal(), master collapses
+  // this node's UMBP-owned index in one shot.
   void RequestClearFullSync();
 
-  // Synchronously clear this node's UMBP-owned and external HiCache
-  // placement from master.  Returns true only after both full-sync
-  // snapshots are acknowledged by master.
+  // Synchronously clear this node's UMBP-owned and external HiCache placement
+  // from master. Returns true only after the heartbeat full-sync and external
+  // clear RPC are acknowledged by master.
   bool ClearFullSync();
 
   // --- Client-side metrics ---
@@ -149,11 +145,7 @@ class MasterClient {
   grpc::Status RevokeExternalKvBlocks(const std::string& node_id,
                                       const std::vector<std::string>& hashes, TierType tier);
   grpc::Status RevokeAllExternalKvBlocksAtTier(const std::string& node_id, TierType tier);
-
-  bool BindExternalHashes(const std::vector<std::string>& hashes, TierType tier);
-  bool UnbindExternalHashes(const std::vector<std::string>& hashes, TierType tier);
-  bool UnbindAllExternalHashesAtTier(TierType tier);
-  bool FlushExternalQueue();
+  grpc::Status RevokeAllExternalKvBlocksForNode(const std::string& node_id);
 
   struct ExternalKvNodeMatch {
     std::string node_id;
@@ -212,10 +204,7 @@ class MasterClient {
   std::deque<EventBundle> outbox_;
   uint64_t next_bundle_seq_ = 1;
   uint64_t hb_last_acked_seq_ = 0;
-  uint32_t full_sync_owners_to_resend_ = 0;
-
-  std::vector<KvEvent> external_pending_events_;
-  std::set<std::pair<TierType, std::string>> external_current_set_;
+  bool request_full_sync_ = false;
 
   // Set by async RequestClearFullSync() or sync ClearFullSync().
   // `_requested_` wakes the heartbeat thread and picks the
@@ -229,7 +218,7 @@ class MasterClient {
 
   void HeartbeatLoop();
   bool SendHeartbeatOnce();
-  bool SendFullSyncLocked(FullSyncScope scope, const std::map<TierType, TierCapacity>& caps,
+  bool SendFullSyncLocked(const std::map<TierType, TierCapacity>& caps,
                           const std::map<TierType, uint64_t>& kv_counts);
 
   // --- Metrics buffering ---

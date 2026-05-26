@@ -250,20 +250,12 @@ void RegisterMoriUmbp(py::module_& m) {
            py::call_guard<py::gil_scoped_release>())
       .def("deregister_memory", &IUMBPClient::DeregisterMemory, py::arg("ptr"),
            py::call_guard<py::gil_scoped_release>())
-      .def("bind_external_hashes", &IUMBPClient::BindExternalHashes, py::arg("hashes"),
-           py::arg("tier"), py::call_guard<py::gil_scoped_release>())
       .def("report_external_kv_blocks", &IUMBPClient::ReportExternalKvBlocks, py::arg("hashes"),
-           py::arg("tier"), py::call_guard<py::gil_scoped_release>())
-      .def("unbind_external_hashes", &IUMBPClient::UnbindExternalHashes, py::arg("hashes"),
            py::arg("tier"), py::call_guard<py::gil_scoped_release>())
       .def("revoke_external_kv_blocks", &IUMBPClient::RevokeExternalKvBlocks, py::arg("hashes"),
            py::arg("tier"), py::call_guard<py::gil_scoped_release>())
-      .def("unbind_all_external_hashes_at_tier", &IUMBPClient::UnbindAllExternalHashesAtTier,
-           py::arg("tier"), py::call_guard<py::gil_scoped_release>())
       .def("revoke_all_external_kv_blocks_at_tier", &IUMBPClient::RevokeAllExternalKvBlocksAtTier,
            py::arg("tier"), py::call_guard<py::gil_scoped_release>())
-      .def("flush_external_queue", &IUMBPClient::FlushExternalQueue,
-           py::call_guard<py::gil_scoped_release>())
       .def("match_external_kv", &IUMBPClient::MatchExternalKv, py::arg("hashes"),
            py::arg("count_as_hit") = false, py::call_guard<py::gil_scoped_release>())
       .def("get_external_kv_hit_counts", &IUMBPClient::GetExternalKvHitCounts, py::arg("hashes"),

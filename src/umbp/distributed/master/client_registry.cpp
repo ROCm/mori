@@ -24,20 +24,27 @@
 #include <vector>
 
 #include "mori/utils/mori_log.hpp"
+#include "umbp/distributed/master/external_kv_block_index.h"
 #include "umbp/distributed/master/global_block_index.h"
 
 namespace mori::umbp {
 
 ClientRegistry::ClientRegistry(const ClientRegistryConfig& config) : config_(config) {}
 
-ClientRegistry::ClientRegistry(const ClientRegistryConfig& config, GlobalBlockIndex& index)
-    : config_(config), index_(&index) {}
+ClientRegistry::ClientRegistry(const ClientRegistryConfig& config, GlobalBlockIndex& index,
+                               ExternalKvBlockIndex* external_kv_index)
+    : config_(config), index_(&index), external_kv_index_(external_kv_index) {}
 
 ClientRegistry::~ClientRegistry() { StopReaper(); }
 
 void ClientRegistry::SetBlockIndex(GlobalBlockIndex* index) {
   std::unique_lock lock(mutex_);
   index_ = index;
+}
+
+void ClientRegistry::SetExternalKvBlockIndex(ExternalKvBlockIndex* index) {
+  std::unique_lock lock(mutex_);
+  external_kv_index_ = index;
 }
 
 bool ClientRegistry::RegisterClient(const std::string& node_id, const std::string& node_address,
@@ -85,32 +92,35 @@ bool ClientRegistry::RegisterClient(const std::string& node_id, const std::strin
 
 void ClientRegistry::UnregisterClient(const std::string& node_id) {
   GlobalBlockIndex* idx = nullptr;
+  ExternalKvBlockIndex* external_idx = nullptr;
   {
     std::unique_lock lock(mutex_);
     auto it = clients_.find(node_id);
     if (it == clients_.end()) return;
     idx = index_;
+    external_idx = external_kv_index_;
     clients_.erase(it);
   }
   if (idx != nullptr) {
     idx->RemoveByNode(node_id);
+  }
+  if (external_idx != nullptr) {
+    external_idx->UnregisterByNode(node_id);
   }
   MORI_UMBP_INFO("[Registry] Unregistered node: {}", node_id);
 }
 
 ClientStatus ClientRegistry::Heartbeat(const std::string& node_id,
                                        const std::map<TierType, TierCapacity>& tier_capacities,
-                                       const std::vector<EventBundle>& bundles,
-                                       FullSyncScope full_sync_scope, uint64_t delta_seq_baseline,
-                                       uint64_t* out_acked_seq,
-                                       uint32_t* out_full_sync_owners_to_resend) {
+                                       const std::vector<EventBundle>& bundles, bool is_full_sync,
+                                       uint64_t delta_seq_baseline, uint64_t* out_acked_seq,
+                                       bool* out_request_full_sync) {
   if (out_acked_seq != nullptr) *out_acked_seq = 0;
-  if (out_full_sync_owners_to_resend != nullptr) *out_full_sync_owners_to_resend = 0;
+  if (out_request_full_sync != nullptr) *out_request_full_sync = false;
 
   GlobalBlockIndex* idx = nullptr;
   std::vector<EventBundle> bundles_to_apply;
   std::vector<KvEvent> full_sync_adds;
-  LocationOwner full_sync_owner = LocationOwner::UMBP_OWNED;
   bool do_full_sync = false;
 
   {
@@ -128,12 +138,10 @@ ClientStatus ClientRegistry::Heartbeat(const std::string& node_id,
 
     idx = index_;
 
-    if (full_sync_scope != FullSyncScope::NONE) {
-      full_sync_owner = OwnerFromFullSyncScope(full_sync_scope);
+    if (is_full_sync) {
       for (const auto& bundle : bundles) {
         for (auto ev : bundle.events) {
           if (ev.kind != KvEvent::Kind::ADD) continue;
-          ev.owner = full_sync_owner;
           full_sync_adds.push_back(std::move(ev));
         }
       }
@@ -146,13 +154,10 @@ ClientStatus ClientRegistry::Heartbeat(const std::string& node_id,
         if (bundle.seq != record.last_applied_seq + 1) {
           MORI_UMBP_WARN(
               "[Registry] Heartbeat bundle seq gap from {}: got {}, expected {} — requesting "
-              "owner-scoped full sync",
+              "full sync",
               node_id, bundle.seq, record.last_applied_seq + 1);
           if (out_acked_seq != nullptr) *out_acked_seq = record.last_applied_seq;
-          if (out_full_sync_owners_to_resend != nullptr) {
-            *out_full_sync_owners_to_resend =
-                kLocationOwnerUmbpOwnedBit | kLocationOwnerExternalHiCacheBit;
-          }
+          if (out_request_full_sync != nullptr) *out_request_full_sync = true;
           return ClientStatus::ALIVE;
         }
         bundles_to_apply.push_back(bundle);
@@ -164,7 +169,7 @@ ClientStatus ClientRegistry::Heartbeat(const std::string& node_id,
 
   if (idx != nullptr) {
     if (do_full_sync) {
-      idx->ReplaceNodeLocations(node_id, full_sync_adds, full_sync_owner);
+      idx->ReplaceNodeLocations(node_id, full_sync_adds);
     } else {
       for (const auto& bundle : bundles_to_apply) {
         if (!bundle.events.empty()) idx->ApplyEvents(node_id, bundle.events);
@@ -248,11 +253,24 @@ void ClientRegistry::ReapExpiredClients() {
     }
   }
 
-  if (index_ != nullptr) {
+  GlobalBlockIndex* idx = nullptr;
+  ExternalKvBlockIndex* external_idx = nullptr;
+  {
+    std::shared_lock lock(mutex_);
+    idx = index_;
+    external_idx = external_kv_index_;
+  }
+
+  if (idx != nullptr) {
     for (const auto& dead_id : dead_nodes) {
       // Clear every index entry belonging to the dead node.  Capacity
       // numbers vanish with the ClientRecord above.
-      index_->RemoveByNode(dead_id);
+      idx->RemoveByNode(dead_id);
+    }
+  }
+  if (external_idx != nullptr) {
+    for (const auto& dead_id : dead_nodes) {
+      external_idx->UnregisterByNode(dead_id);
     }
   }
 }

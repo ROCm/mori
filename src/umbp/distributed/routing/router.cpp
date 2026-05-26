@@ -73,7 +73,7 @@ std::vector<std::optional<RoutePutResult>> Router::BatchRoutePut(
   // Single shared_lock for the whole batch: dedup mask + alive snapshot.
   // Two entries picking the same (node, tier) is fine — peer will sort
   // out ENOSPC at AllocateSlot.
-  auto exists_mask = index_.BatchLookupExistsServable(keys);
+  auto exists_mask = index_.BatchLookupExists(keys);
   auto candidates = registry_.GetAliveClients();
   for (size_t i = 0; i < keys.size(); ++i) {
     if (i < exists_mask.size() && exists_mask[i]) {

@@ -100,42 +100,4 @@ TEST(RouterDedup, BatchRoutePutAlreadyExistsBypassesNoAliveClient) {
   EXPECT_FALSE(results[1].has_value());  // distinct from kAlreadyExists
 }
 
-TEST(RouterDedup, ExternalOnlyLocationDoesNotDedupPut) {
-  GlobalBlockIndex index;
-  ClientRegistry registry(ClientRegistryConfig{}, index);
-  Router router(index, registry);
-
-  ASSERT_TRUE(registry.RegisterClient("node-a", "node-a:1", MakeDramCaps(),
-                                      /*peer_address=*/"node-a:peer"));
-  ASSERT_EQ(index.ApplyEvents("node-a", {KvEvent{KvEvent::Kind::ADD, "key-X", TierType::DRAM, 0,
-                                                 LocationOwner::EXTERNAL_HICACHE}}),
-            1u);
-
-  std::vector<std::string> keys{"key-X"};
-  std::vector<uint64_t> sizes{4096};
-  std::unordered_set<std::string> excludes;
-
-  auto results = router.BatchRoutePut(keys, "requester", sizes, excludes);
-  ASSERT_EQ(results.size(), 1u);
-  ASSERT_TRUE(results[0].has_value());
-  EXPECT_EQ(results[0]->outcome, RoutePutOutcome::kRouted);
-  EXPECT_EQ(results[0]->node_id, "node-a");
-}
-
-TEST(RouterDedup, ExternalOnlyLocationDoesNotRouteGet) {
-  GlobalBlockIndex index;
-  ClientRegistry registry(ClientRegistryConfig{}, index);
-  Router router(index, registry);
-
-  ASSERT_TRUE(registry.RegisterClient("node-a", "node-a:1", MakeDramCaps(),
-                                      /*peer_address=*/"node-a:peer"));
-  ASSERT_EQ(index.ApplyEvents("node-a", {KvEvent{KvEvent::Kind::ADD, "key-X", TierType::DRAM, 0,
-                                                 LocationOwner::EXTERNAL_HICACHE}}),
-            1u);
-
-  auto results = router.BatchRouteGet({"key-X"}, "requester", {});
-  ASSERT_EQ(results.size(), 1u);
-  EXPECT_FALSE(results[0].has_value());
-}
-
 }  // namespace mori::umbp

@@ -155,17 +155,15 @@ def registered_client(master_address: str, node_id: str, tier_caps: dict):
 
 
 def bind_external(client, hashes, tier) -> None:
-    assert client.bind_external_hashes(hashes, tier)
-    assert client.flush_external_queue()
+    assert client.report_external_kv_blocks(hashes, tier)
 
 
 def unbind_external(client, hashes, tier) -> None:
-    assert client.unbind_external_hashes(hashes, tier)
-    assert client.flush_external_queue()
+    assert client.revoke_external_kv_blocks(hashes, tier)
 
 
 def run_demo(master_address: str) -> None:
-    from mori.cpp import UMBPTierType
+    from mori.cpp import UMBPMasterClient, UMBPTierType
 
     _1GB = 1 * 1024 * 1024 * 1024
     DRAM_CAPS = {UMBPTierType.DRAM: (_1GB, _1GB)}

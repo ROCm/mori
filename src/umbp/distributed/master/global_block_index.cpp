@@ -36,16 +36,15 @@ namespace mori::umbp {
 
 namespace {
 
-// Locate (or insert) the location for (node_id, tier, owner) within an entry's
+// Locate (or insert) the location for (node_id, tier) within an entry's
 // location list.  Caller MUST hold the unique lock.  Returns a pointer
 // into entry.locations that's stable until the next mutation.
 std::pair<Location*, bool> FindOrInsertLocation(BlockEntry& entry, const std::string& node_id,
-                                                TierType tier, LocationOwner owner) {
-  Location needle{node_id, /*size=*/0, tier, owner};
+                                                TierType tier) {
   for (auto& loc : entry.locations) {
-    if (loc.SameIdentity(needle)) return {&loc, false};
+    if (loc.node_id == node_id && loc.tier == tier) return {&loc, false};
   }
-  entry.locations.push_back(Location{node_id, /*size=*/0, tier, owner});
+  entry.locations.push_back(Location{node_id, /*size=*/0, tier});
   return {&entry.locations.back(), true};
 }
 
@@ -54,13 +53,10 @@ bool HasLocationForNode(const BlockEntry& entry, const std::string& node_id) {
                      [&](const Location& loc) { return loc.node_id == node_id; });
 }
 
-bool IsServable(const Location& loc) { return loc.owner == LocationOwner::UMBP_OWNED; }
-
-size_t RemoveLocationsLocked(std::unordered_map<std::string, BlockEntry>& entries,
-                             std::unordered_map<std::string, std::unordered_set<std::string>>&
-                                 node_to_keys,
-                             const std::string& node_id, std::optional<TierType> tier,
-                             std::optional<LocationOwner> owner) {
+size_t RemoveLocationsLocked(
+    std::unordered_map<std::string, BlockEntry>& entries,
+    std::unordered_map<std::string, std::unordered_set<std::string>>& node_to_keys,
+    const std::string& node_id, std::optional<TierType> tier) {
   size_t removed = 0;
   for (auto it = entries.begin(); it != entries.end();) {
     auto& locs = it->second.locations;
@@ -69,7 +65,6 @@ size_t RemoveLocationsLocked(std::unordered_map<std::string, BlockEntry>& entrie
                               [&](const Location& l) {
                                 if (l.node_id != node_id) return false;
                                 if (tier.has_value() && l.tier != *tier) return false;
-                                if (owner.has_value() && l.owner != *owner) return false;
                                 return true;
                               }),
                locs.end());
@@ -102,7 +97,7 @@ size_t GlobalBlockIndex::ApplyEvents(const std::string& node_id,
 
   for (const auto& ev : events) {
     if (ev.kind == KvEvent::Kind::CLEAR_AT_TIER) {
-      mutated += RemoveLocationsLocked(entries_, node_to_keys_, node_id, ev.tier, ev.owner);
+      mutated += RemoveLocationsLocked(entries_, node_to_keys_, node_id, ev.tier);
     } else if (ev.kind == KvEvent::Kind::ADD) {
       auto& entry = entries_[ev.key];
       if (entry.locations.empty()) {
@@ -112,15 +107,14 @@ size_t GlobalBlockIndex::ApplyEvents(const std::string& node_id,
         entry.last_accessed_rep.store(now.time_since_epoch().count(), std::memory_order_release);
         entry.atomic_access_count.store(0, std::memory_order_relaxed);
       }
-      auto [loc, inserted] = FindOrInsertLocation(entry, node_id, ev.tier, ev.owner);
+      auto [loc, inserted] = FindOrInsertLocation(entry, node_id, ev.tier);
       // Idempotent; must run on duplicate ADDs too.
       node_to_keys_[node_id].insert(ev.key);
       if (!inserted) {
         MORI_UMBP_WARN(
-            "[GlobalBlockIndex] duplicate ADD for key='{}' node={} tier={} owner={} old_size={} "
+            "[GlobalBlockIndex] duplicate ADD for key='{}' node={} tier={} old_size={} "
             "new_size={}; keeping existing location",
-            ev.key, node_id, TierTypeName(ev.tier), LocationOwnerName(ev.owner), loc->size,
-            ev.size);
+            ev.key, node_id, TierTypeName(ev.tier), loc->size, ev.size);
       } else {
         loc->size = ev.size;
         ++mutated;
@@ -130,9 +124,9 @@ size_t GlobalBlockIndex::ApplyEvents(const std::string& node_id,
       if (it == entries_.end()) continue;
       auto& locs = it->second.locations;
       const size_t before = locs.size();
-      Location needle{node_id, /*size=*/0, ev.tier, ev.owner};
-      locs.erase(std::remove_if(locs.begin(), locs.end(),
-                                [&](const Location& l) { return l.SameIdentity(needle); }),
+      locs.erase(std::remove_if(
+                     locs.begin(), locs.end(),
+                     [&](const Location& l) { return l.node_id == node_id && l.tier == ev.tier; }),
                  locs.end());
       if (locs.size() != before) {
         ++mutated;
@@ -152,18 +146,11 @@ size_t GlobalBlockIndex::ApplyEvents(const std::string& node_id,
 }
 
 void GlobalBlockIndex::ReplaceNodeLocations(const std::string& node_id,
-                                            const std::vector<KvEvent>& adds, LocationOwner owner) {
+                                            const std::vector<KvEvent>& adds) {
   std::unique_lock lock(mutex_);
   const auto now = std::chrono::steady_clock::now();
-  std::unordered_set<std::string>* rebuilt_keys = nullptr;
-  auto remember_key_for_node = [&]() -> std::unordered_set<std::string>& {
-    if (rebuilt_keys == nullptr) {
-      rebuilt_keys = &node_to_keys_[node_id];
-    }
-    return *rebuilt_keys;
-  };
 
-  // O(N_node + |adds|) via the reverse index; replace only the requested owner.
+  // O(N_node + |adds|) via the reverse index.
   auto rev_it = node_to_keys_.find(node_id);
   if (rev_it != node_to_keys_.end()) {
     auto old_keys = std::move(rev_it->second);
@@ -173,14 +160,10 @@ void GlobalBlockIndex::ReplaceNodeLocations(const std::string& node_id,
       if (eit == entries_.end()) continue;
       auto& locs = eit->second.locations;
       locs.erase(std::remove_if(locs.begin(), locs.end(),
-                                [&](const Location& l) {
-                                  return l.node_id == node_id && l.owner == owner;
-                                }),
+                                [&](const Location& l) { return l.node_id == node_id; }),
                  locs.end());
       if (locs.empty()) {
         entries_.erase(eit);
-      } else if (HasLocationForNode(eit->second, node_id)) {
-        remember_key_for_node().insert(key);
       }
     }
   }
@@ -195,21 +178,16 @@ void GlobalBlockIndex::ReplaceNodeLocations(const std::string& node_id,
       entry.last_accessed_rep.store(now.time_since_epoch().count(), std::memory_order_release);
       entry.atomic_access_count.store(0, std::memory_order_relaxed);
     }
-    auto [loc, inserted] = FindOrInsertLocation(entry, node_id, ev.tier, owner);
+    auto [loc, inserted] = FindOrInsertLocation(entry, node_id, ev.tier);
     (void)inserted;
     loc->size = ev.size;
-    remember_key_for_node().insert(ev.key);
+    node_to_keys_[node_id].insert(ev.key);
   }
 }
 
 void GlobalBlockIndex::RemoveByNode(const std::string& node_id) {
   std::unique_lock lock(mutex_);
-  RemoveLocationsLocked(entries_, node_to_keys_, node_id, std::nullopt, std::nullopt);
-}
-
-void GlobalBlockIndex::RemoveByNodeAndOwner(const std::string& node_id, LocationOwner owner) {
-  std::unique_lock lock(mutex_);
-  RemoveLocationsLocked(entries_, node_to_keys_, node_id, std::nullopt, owner);
+  RemoveLocationsLocked(entries_, node_to_keys_, node_id, std::nullopt);
 }
 
 void GlobalBlockIndex::RecordAccess(const std::string& key) {
@@ -233,17 +211,6 @@ std::vector<Location> GlobalBlockIndex::Lookup(const std::string& key) const {
   return it->second.locations;
 }
 
-std::vector<Location> GlobalBlockIndex::LookupServable(const std::string& key) const {
-  std::shared_lock lock(mutex_);
-  auto it = entries_.find(key);
-  if (it == entries_.end()) return {};
-  std::vector<Location> out;
-  for (const auto& loc : it->second.locations) {
-    if (IsServable(loc)) out.push_back(loc);
-  }
-  return out;
-}
-
 std::vector<bool> GlobalBlockIndex::BatchLookupExists(const std::vector<std::string>& keys) const {
   std::vector<bool> results(keys.size(), false);
   if (keys.empty()) return results;
@@ -253,56 +220,6 @@ std::vector<bool> GlobalBlockIndex::BatchLookupExists(const std::vector<std::str
     results[i] = (it != entries_.end()) && !it->second.locations.empty();
   }
   return results;
-}
-
-std::vector<bool> GlobalBlockIndex::BatchLookupExistsServable(
-    const std::vector<std::string>& keys) const {
-  std::vector<bool> results(keys.size(), false);
-  if (keys.empty()) return results;
-  std::shared_lock lock(mutex_);
-  for (size_t i = 0; i < keys.size(); ++i) {
-    auto it = entries_.find(keys[i]);
-    if (it == entries_.end()) continue;
-    results[i] = std::any_of(it->second.locations.begin(), it->second.locations.end(), IsServable);
-  }
-  return results;
-}
-
-std::vector<GlobalBlockIndex::NodeMatch> GlobalBlockIndex::MatchExternal(
-    const std::vector<std::string>& hashes) const {
-  std::shared_lock lock(mutex_);
-  std::unordered_map<std::string, std::map<TierType, std::vector<std::string>>> acc;
-  for (const auto& hash : hashes) {
-    auto it = entries_.find(hash);
-    if (it == entries_.end()) continue;
-    for (const auto& loc : it->second.locations) {
-      if (loc.owner != LocationOwner::EXTERNAL_HICACHE) continue;
-      acc[loc.node_id][loc.tier].push_back(hash);
-    }
-  }
-
-  std::vector<NodeMatch> result;
-  result.reserve(acc.size());
-  for (auto& [node_id, by_tier] : acc) {
-    NodeMatch m;
-    m.node_id = std::move(node_id);
-    m.hashes_by_tier = std::move(by_tier);
-    result.push_back(std::move(m));
-  }
-  return result;
-}
-
-size_t GlobalBlockIndex::GetExternalKvCount(const std::string& node_id) const {
-  std::shared_lock lock(mutex_);
-  size_t count = 0;
-  for (const auto& [hash, entry] : entries_) {
-    const bool present =
-        std::any_of(entry.locations.begin(), entry.locations.end(), [&](const Location& loc) {
-          return loc.node_id == node_id && loc.owner == LocationOwner::EXTERNAL_HICACHE;
-        });
-    if (present) ++count;
-  }
-  return count;
 }
 
 std::optional<BlockMetrics> GlobalBlockIndex::GetMetrics(const std::string& key) const {
@@ -326,7 +243,6 @@ std::vector<std::vector<Location>> GlobalBlockIndex::BatchLookupForRouteGet(
     if (it == entries_.end()) continue;
     auto& locs = out[i];
     for (const auto& loc : it->second.locations) {
-      if (!IsServable(loc)) continue;
       if (!exclude_nodes.empty() && exclude_nodes.count(loc.node_id)) continue;
       locs.push_back(loc);
     }
@@ -344,7 +260,6 @@ std::vector<EvictionCandidate> GlobalBlockIndex::FindEvictionCandidates(
   for (const auto& [key, entry] : entries_) {
     if (entry.IsLeased()) continue;
     for (const auto& loc : entry.locations) {
-      if (loc.owner != LocationOwner::UMBP_OWNED) continue;
       if (overloaded_node_tiers.count({loc.node_id, loc.tier})) {
         EvictionCandidate c;
         c.key = key;
