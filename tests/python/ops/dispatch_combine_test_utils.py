@@ -709,7 +709,10 @@ class EpDispatchCombineTestCase:
                 dispatch_output[:total_recv_num_token, :]
             )
         combine_output, combine_output_weight = op.combine(
-            dispatch_output, dispatch_weights, dispatch_indices, call_reset=False
+            dispatch_output,
+            dispatch_weights,
+            all_rank_indices[self.config.rank],
+            call_reset=False,
         )
         self.sync()
         if check_results:
