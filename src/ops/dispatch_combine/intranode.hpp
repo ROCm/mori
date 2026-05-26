@@ -241,7 +241,7 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   const bool hasScales = args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0);
 
   // Warp-group coordination: 4 warps per group
-  constexpr int kWarpsPerGroup = 4;
+  constexpr int kWarpsPerGroup = 2;
   constexpr int kMaxWarpGroups = 8;
 
   __shared__ uint64_t groupData[kMaxWarpGroups];  // (iteration+1, destTokId)
@@ -252,17 +252,19 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   int warpGroupId = globalWarpId / kWarpsPerGroup;
   int warpGroupNum = globalWarpNum / kWarpsPerGroup;
 
-  // Clear shared memory
+  // clear shared memory
   if (inGroupWarpId == 0 && laneId == 0) {
     groupData[warpGroupIdInBlock] = 0;
-    groupCounters[warpGroupIdInBlock] = 0;
+    groupCounters[warpGroupIdInBlock] = kWarpsPerGroup - 1;
   }
-  __threadfence_block();
+  __syncthreads();
 
   // Hidden dim split for each warp in group
   size_t dimPerWarp = (hiddenDim + kWarpsPerGroup - 1) / kWarpsPerGroup;
-  size_t myDimOffset = (size_t)inGroupWarpId * dimPerWarp;
-  size_t myDimChunk = (myDimOffset < hiddenDim) ? min(hiddenDim - myDimOffset, dimPerWarp) : 0;
+  size_t warpDimOffset = (size_t)inGroupWarpId * dimPerWarp;
+  size_t warpDimChunk =
+      (warpDimOffset < hiddenDim) ? min(hiddenDim - warpDimOffset, dimPerWarp) : 0;
+  assert(warpDimChunk > 0 && "warpDimChunk must be > 0 for warpgroups to be useful");
 
   IF_ENABLE_PROFILER(
       INTRANODE_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
@@ -279,7 +281,7 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       index_t destPe = destExpert / config.numExpertPerRank;
       index_t destTokId = 0;
 
-      // ALL 4 warps do dedup independently (same input = same result)
+      // ALL warps in warp-group do dedup independently (same input = same result)
       assert(config.numExpertPerToken < warpSize);
       int condition = 0;
       if (laneId < (i % config.numExpertPerToken)) {
@@ -294,7 +296,7 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
         continue;
       }
 
-      // Warp 0: atomic allocation + notify via shared memory
+      // Header Warp: atomic allocation + notify via shared memory
       if (inGroupWarpId == 0) {
         if (laneId == 0) {
           // Atomic allocation
@@ -306,15 +308,14 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
           args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destTokId] =
               FlatTokenIndex(config, myPe, srcTokId);
 
-          // Wait for previous round to be consumed (use atomicAdd for shared memory)
-          while (atomicAdd(&groupCounters[warpGroupIdInBlock], 0) != 0) {
+          // Wait for all consumers done (counter == N-1), then set to 0
+          while (atomicCAS(&groupCounters[warpGroupIdInBlock], kWarpsPerGroup - 1, 0) !=
+                 kWarpsPerGroup - 1) {
           }
 
           // Write to shared mem: use (i+1) to avoid confusion with initial value 0
-          // Use atomicExch for shared memory (workgroup scope)
           atomicExch((unsigned long long*)&groupData[warpGroupIdInBlock],
                      ((uint64_t)(i + 1) << 32) | (uint32_t)destTokId);
-          atomicExch(&groupCounters[warpGroupIdInBlock], 3);
         }
         destTokId = __shfl(destTokId, 0);
 
@@ -330,28 +331,30 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
               args.tokenIndices[srcTokId * config.numExpertPerToken + laneId];
         }
       } else {
-        // Warps 1-3: spin wait for iteration match, then consume
-        // Use atomicAdd for shared memory atomic load (workgroup scope)
-        uint64_t val;
-        do {
-          val = atomicAdd((unsigned long long*)&groupData[warpGroupIdInBlock], 0ULL);
-        } while ((val >> 32) != (uint32_t)(i + 1));
-        destTokId = (index_t)(val & 0xFFFFFFFF);
-
+        // Normal Warps: spin wait for iteration match, then consume
+        // Only lane 0 spins, then broadcast to other lanes
         if (laneId == 0) {
-          atomicSub(&groupCounters[warpGroupIdInBlock], 1);
+          uint64_t val;
+          do {
+            __builtin_amdgcn_s_sleep(4);
+            val = __hip_atomic_load(
+                reinterpret_cast<unsigned long long*>(&groupData[warpGroupIdInBlock]),
+                __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_WORKGROUP);
+          } while ((val >> 32) != (uint32_t)(i + 1));
+          atomicAdd(&groupCounters[warpGroupIdInBlock], 1);
+          destTokId = (index_t)(val & 0xFFFFFFFF);
         }
+
+        destTokId = __shfl(destTokId, 0);
       }
 
-      // All 4 warps: copy their portion of token data
+      // All warps in warpgroup: copy their portion of token data
       size_t srcTokOffset = srcTokId * hiddenDim;
       size_t destTokOffset = destTokId * hiddenDim;
 
-      if (myDimChunk > 0) {
-        core::WarpCopy<T, 2>(args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) +
-                                 destTokOffset + myDimOffset,
-                             args.inpTokenBuf + srcTokOffset + myDimOffset, myDimChunk);
-      }
+      core::WarpCopy<T, 2>(args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) +
+                               destTokOffset + warpDimOffset,
+                           args.inpTokenBuf + srcTokOffset + warpDimOffset, warpDimChunk);
 
       // Write scales: split across 4 warps
       if (hasScales) {
@@ -361,16 +364,15 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
         size_t myScaleChunk =
             (myScaleOffset < scaleSize) ? min(scaleSize - myScaleOffset, scalePerWarp) : 0;
 
-        if (myScaleChunk > 0) {
-          size_t destScaleOffset = (size_t)destTokId * scaleSize;
-          size_t srcScaleOffset = (size_t)srcTokId * scaleSize;
-          core::WarpCopy(args.shmemOutScalesMemObj->template GetAs<uint8_t*>(destPe) +
-                             destScaleOffset + myScaleOffset,
-                         args.scalesBuf + srcScaleOffset + myScaleOffset, myScaleChunk);
-        }
+        size_t destScaleOffset = (size_t)destTokId * scaleSize;
+        size_t srcScaleOffset = (size_t)srcTokId * scaleSize;
+        core::WarpCopy(args.shmemOutScalesMemObj->template GetAs<uint8_t*>(destPe) +
+                           destScaleOffset + myScaleOffset,
+                       args.scalesBuf + srcScaleOffset + myScaleOffset, myScaleChunk);
       }
     }
   }
+
   __syncthreads();
   if (thdId == 0) atomicAdd(args.dispatchGridBarrier, 1);
 
