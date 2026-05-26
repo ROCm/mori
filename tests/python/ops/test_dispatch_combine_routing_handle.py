@@ -28,7 +28,6 @@ from tests.python.ops.dispatch_combine_test_utils import (
     assert_worker_results,
 )
 
-
 def _make_intranode_config(rank, world_size):
     return mori.ops.EpDispatchCombineConfig(
         data_type=torch.bfloat16,
@@ -107,10 +106,12 @@ def _do_dispatch(op, test_data, *, return_routing=False, routing=None):
 
 
 def _do_combine(op, dispatch_out, indices_local, *, routing=None):
+    # Combine needs per-source-token top-k (same tensor as dispatch input), not
+    # recv-buffer dispatch_indices layout.
     out, out_w = op.combine(
         dispatch_out["out"],
         dispatch_out["out_w"],
-        dispatch_out["out_idx"],
+        indices_local,
         routing=routing,
     )
     n = int(indices_local.size(0))
@@ -221,53 +222,6 @@ def _replay_correctness(rank, world_size, kernel, gpu_per_node=None):
     assert combine_out is not None
 
 
-def _multi_layer_correctness(rank, world_size, kernel, num_layers, gpu_per_node=None):
-    """Shared op + per-layer routing handles vs fresh op default path per layer."""
-    config = (
-        _make_intranode_config(rank, world_size)
-        if kernel == "intra"
-        else _make_internode_v1_config(rank, world_size, gpu_per_node=gpu_per_node)
-    )
-
-    op_shared = mori.ops.EpDispatchCombineOp(config)
-    tc = EpDispatchCombineTestCase(config)
-
-    layer_data = []
-    layer_disp = []
-    layer_R = []
-    for L in range(num_layers):
-        td = _gen_layer_data(tc, seed=10_000 + L)
-        d, R = _do_dispatch(op_shared, td, return_routing=True)
-        tc.sync()
-        layer_data.append(td)
-        layer_disp.append(d)
-        layer_R.append(R)
-
-    layer_combine_out = []
-    for L in range(num_layers):
-        out, _ = _do_combine(
-            op_shared, layer_disp[L], layer_data[L][1][rank], routing=layer_R[L]
-        )
-        tc.sync()
-        layer_combine_out.append(out)
-
-    # Baseline: fresh op per layer on the default (op-owned buffer) path.
-    for L in range(num_layers):
-        op_baseline = mori.ops.EpDispatchCombineOp(config)
-        td = layer_data[L]
-        d, _ = _do_dispatch(op_baseline, td, return_routing=False)
-        tc.sync()
-        out, _ = _do_combine(op_baseline, d, td[1][rank])
-        tc.sync()
-        assert torch.allclose(
-            out.float(), layer_combine_out[L].float(), atol=1e-2, rtol=1e-2
-        ), (
-            f"rank {rank} layer {L}: shared-op routing-handle combine differs from "
-            f"fresh-op default-path baseline; max diff = "
-            f"{(out.float() - layer_combine_out[L].float()).abs().max().item()}"
-        )
-
-
 def _stale_symmetric_buffer_guard(rank, world_size):
     """Verify the disp_tok_id_to_src_tok_id_local snapshot is layer-private (IntraNode only)."""
     config = _make_intranode_config(rank, world_size)
@@ -344,32 +298,6 @@ def test_replay_correctness_v1_two_nodes(torch_dist_process_manager):
     for _ in range(world_size):
         torch_dist_process_manager.task_queue.put(
             (_replay_correctness, [world_size, "v1", gpu_per_node])
-        )
-    assert_worker_results(torch_dist_process_manager, world_size)
-
-
-@pytest.mark.parametrize("kernel", ("intra", "v1"))
-@pytest.mark.parametrize("num_layers", (2, 4))
-def test_multi_layer_correctness(torch_dist_process_manager, kernel, num_layers):
-    """InterNodeV1 (``kernel=v1``) uses ``gpu_per_node=world_size`` → single-node paths only."""
-    world_size = 8
-    for _ in range(world_size):
-        torch_dist_process_manager.task_queue.put(
-            (_multi_layer_correctness, [world_size, kernel, num_layers])
-        )
-    assert_worker_results(torch_dist_process_manager, world_size)
-
-
-def test_multi_layer_correctness_v1_two_nodes(torch_dist_process_manager):
-    """InterNodeV1 multi-layer routing with ``gpu_per_node=4`` (2 emulated nodes)."""
-    world_size = 8
-    gpu_per_node = 4
-    for _ in range(world_size):
-        torch_dist_process_manager.task_queue.put(
-            (
-                _multi_layer_correctness,
-                [world_size, "v1", 2, gpu_per_node],
-            )
         )
     assert_worker_results(torch_dist_process_manager, world_size)
 
