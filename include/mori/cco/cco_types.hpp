@@ -21,48 +21,24 @@
 namespace mori {
 namespace cco {
 
-/* ────────────────────────────────────────────────────────────────────────────
- *  API forward-compat constants
- * ──────────────────────────────────────────────────────────────────────────── */
-
-// Magic + version are baked into CcoDevCommRequirements via the
-// CCO_DEV_COMM_REQUIREMENTS_INITIALIZER macro. CcoDevCommCreate validates them
-// on entry so we can safely add new fields to the struct in the future without
-// breaking existing user binaries (older binaries pass a smaller struct; the
-// runtime sees the smaller `size` and uses defaults for the missing tail).
+// CcoDevCommRequirements carries {size, magic, version} so we can grow the
+// struct ABI-compatibly. CcoDevCommCreate validates these on entry; older
+// binaries pass a smaller `size` and the runtime fills the missing tail
+// with INITIALIZER defaults.
 static constexpr uint32_t CCO_API_MAGIC   = 0x0CC0AAAA;
 static constexpr uint32_t CCO_API_VERSION = 1;
 
-/* ────────────────────────────────────────────────────────────────────────────
- *  GDA backend connection topology
- * ──────────────────────────────────────────────────────────────────────────── */
-
+// GDA backend QP allocation strategy.
 enum CcoGdaConnectionType {
-  CCO_GDA_CONNECTION_NONE      = 0,   // No GDA QPs at all.
-  CCO_GDA_CONNECTION_FULL      = 1,   // QPs to every peer (incl. intra-node).
-                                       // TODO: not yet enforced — currently
-                                       // falls back to CROSSNODE because
-                                       // Context skips P2P-reachable peers.
-  CCO_GDA_CONNECTION_CROSSNODE = 2,   // QPs only to cross-node peers (default).
-                                       // CCO addition not present in NCCL.
-  CCO_GDA_CONNECTION_RAIL      = 3,   // QPs only to same-rail cross-node peers.
-                                       // TODO: not yet enforced — falls back
-                                       // to CROSSNODE.
+  CCO_GDA_CONNECTION_NONE      = 0,   // no GDA QPs
+  CCO_GDA_CONNECTION_FULL      = 1,   // QPs to every peer (incl. intra-node) — TODO: not yet enforced
+  CCO_GDA_CONNECTION_CROSSNODE = 2,   // QPs only to cross-node peers (default)
+  CCO_GDA_CONNECTION_RAIL      = 3,   // QPs only to same-rail cross-node peers — TODO: not yet enforced
 };
 
-/* ────────────────────────────────────────────────────────────────────────────
- *  Team — 3-int rank subset descriptor, mirrors ncclTeam
- *
- *  Conversion to world rank:
- *    worldRank = commRank + (teamRank - team.rank) * team.stride
- *
- *  Built-in teams (declared in cco_team.hpp as __device__ inline funcs):
- *    CcoTeamWorld    : all ranks
- *    CcoTeamLsa      : ranks on the same node
- *    CcoTeamCrossNode: cross-node ranks (skipping my node)
- *    CcoTeamRail     : same NIC-rail-index cross-node ranks
- * ──────────────────────────────────────────────────────────────────────────── */
-
+// 3-int rank subset descriptor.
+//   worldRank = commRank + (teamRank - team.rank) * team.stride
+// Built-in teams live in cco_team.hpp: ccoTeamWorld / Lsa / CrossNode / Rail.
 struct CcoTeam {
   int nRanks;
   int rank;
@@ -80,110 +56,95 @@ static constexpr int CCO_WINDOW_TABLE_SIZE = 32;
 
 struct CcoWindowTableNode {
   struct Entry {
-    uintptr_t base;       // localPtr as uintptr_t
+    uintptr_t base;
     uintptr_t size;
     CcoWindowDevice* window;
   } entries[CCO_WINDOW_TABLE_SIZE];
   CcoWindowTableNode* next;
 };
 
-// IBGDA context: QP endpoints + signal/counter resources bundled together.
-// Analogous to NCCL's ncclGinGdakiGPUContext.
-// One context per comm (single NIC). Future multi-NIC: array of contexts.
+// IBGDA context: QP endpoints + signal/counter resources for one DevComm.
+// One context per comm today (single NIC). Future multi-NIC may use an array.
 struct CcoIbgdaContext {
-  // QP endpoints: indexed by [pe * numQpPerPe + qpId]
-  shmem::ShmemRdmaEndpoint* endpoints;  // GPU buf, length = worldSize * numQpPerPe
+  shmem::ShmemRdmaEndpoint* endpoints;  // [worldSize * numQpPerPe]
   int numQpPerPe;
 
-  // Signal: remote peers RDMA-atomic to our signalBuf after put completes
+  // Signal: remote peers atomic +1 here after put completes.
   int signalCount;
-  uint64_t* signalBuf;         // GPU buf [signalCount], remote write target
-  uint64_t* signalShadows;     // GPU buf [signalCount], local sent-signal tracking
-  uint32_t* peerSignalRkeys;   // GPU buf [worldSize], each peer's signalBuf rkey
-  uint32_t signalLkey;         // local signalBuf MR lkey
+  uint64_t* signalBuf;         // [signalCount]
+  uint64_t* signalShadows;     // [signalCount], local sent-signal tracking
+  uint32_t* peerSignalRkeys;   // [worldSize], each peer's signalBuf rkey
+  uint32_t signalLkey;         // signalBuf MR lkey
 
-  // Counter: NIC loopback writes here after source data fully transmitted
+  // Counter: NIC loopback writes here after source data fully transmitted.
   int counterCount;
-  uint64_t* counterBuf;        // GPU buf [counterCount]
+  uint64_t* counterBuf;        // [counterCount]
 };
 
 struct CcoDevComm {
-  // ── World / topology ──
+  // World / topology
   int rank;
   int worldSize;
-  int lsaSize;        // # of ranks on my node (intra-node group size)
+  int lsaSize;        // # of ranks on my node
   int lsaRank;        // my index in lsa team [0..lsaSize)
-  int myNodeStart;    // = (rank / lsaSize) * lsaSize, world rank of node[0]
+  int myNodeStart;    // world rank of node[0]
 
-  // ── GDA backend ──
+  // GDA backend
   CcoGdaConnectionType gdaConnType;
 
-  // ── Common ──
-  uint64_t* internalSyncPtr;                // GPU buf, 128 × uint64_t
+  // Common
+  uint64_t* internalSyncPtr;             // [128] for device barriers
   void* flatBase;
   size_t perRankSize;
-  CcoWindowTableNode* windowTable;       // GPU, linked list of registered windows
+  CcoWindowTableNode* windowTable;       // GPU linked list of registered windows
 
-  // IBGDA context (QP + signal + counter); empty when gdaConnType==NONE
+  // IBGDA context (QP + signal + counter); empty when gdaConnType==NONE.
   CcoIbgdaContext ibgda;
 };
 typedef CcoDevComm* CcoDevComm_t;
 
-// Per-window RDMA context (analogous to NCCL's ncclGinWindow_t ginWins[])
-// One MR per window, shared by all QPs. peerRkeys indexed by [pe].
+// Per-window RDMA context: one MR shared by all QPs of one window.
+// peerRkeys is worldSize-sized — GDA targets any peer including FULL-mode
+// intra-node loopback.
 struct CcoIbgdaWin {
-  uint32_t* peerRkeys;     // [worldSize], Allgather-exchanged
-  uint32_t lkey;            // local MR key for this window
+  uint32_t* peerRkeys;     // [worldSize]
+  uint32_t lkey;
 };
 
 struct CcoWindowDevice {
-  // ── flat VA addressing (P2P / SDMA / general) ──
-  // Intentionally duplicated from DevComm so window is self-contained.
-  // winBase = flatBase + slotOffset (pre-computed, like NCCL's lsaFlatBase + bigOffset)
-  char* winBase;           // = flatBase + slotOffset (rank 0's window start in flat VA)
-  uint32_t stride4G;       // = perRankSize >> 32 (4GB-aligned stride, like NCCL)
-  int rank;                // = comm->rank
-  int worldSize;           // = comm->worldSize
+  // LSA flat-VA addressing (intra-node only). winBase is the window's slot in
+  // the LSA-sized flat VA reservation. Peer addressing uses LSA rank, not
+  // world rank. Cross-node access goes through ibgdaWin (iova=0 + offset).
+  //   winBase = flatBase + slotOffset
+  //   peer_va = winBase + ((uint64_t)peerLsaRank * stride4G << 32) + offset
+  //   local   = winBase + ((uint64_t)lsaRank     * stride4G << 32) + offset
+  char* winBase;
+  uint32_t stride4G;       // perRankSize >> 32 (perRankSize is 4GB-aligned)
+  int lsaRank;             // caller's index in the LSA team
 
-  // P2P/SDMA: winBase + ((uint64_t)pe * stride4G << 32) + offset
-  // local:    winBase + ((uint64_t)rank * stride4G << 32) + offset
-
-  // ── RDMA / IBGDA (iova=0, offset-based) ──
-  // QP endpoints: DevComm->ibgda.endpoints[pe * ibgda.numQpPerPe + qpId]
-  // MR keys are per-window (same MR for all QPs):
+  // GDA / IBGDA (iova=0). raddr=dstOff, laddr=srcOff, rkey=peerRkeys[worldRank].
   CcoIbgdaWin ibgdaWin;
-  // raddr = dstOff (iova=0)
-  // laddr = srcOff (iova=0)
-  // rkey  = ibgdaWin.peerRkeys[pe]
-  // lkey  = ibgdaWin.lkey
 
-  // ── SDMA signals ──
-  anvil::SdmaQueueDeviceHandle** deviceHandles_d;  // per-comm shared
-  HSAuint64* signalPtrs;                            // [worldSize * sdmaNumQueue]
-  HSAuint64* expectSignalsPtr;                      // [worldSize * sdmaNumQueue]
-  HSAuint64** peerSignalPtrs;                       // [worldSize]
+  // SDMA signals (intra-node only, indexed by LSA rank).
+  anvil::SdmaQueueDeviceHandle** deviceHandles_d;   // per-comm shared
+  HSAuint64* signalPtrs;                             // [lsaSize * sdmaNumQueue]
+  HSAuint64* expectSignalsPtr;                       // [lsaSize * sdmaNumQueue]
+  HSAuint64** peerSignalPtrs;                        // [lsaSize]
   uint32_t sdmaNumQueue;
 };
 typedef CcoWindowDevice* CcoWindow_t;
 
 /* ────────────────────────────────────────────────────────────────────────────
- *  DevComm requirements (host-input, drives DevCommCreate resource allocation)
- *
- *  Always initialize via CCO_DEV_COMM_REQUIREMENTS_INITIALIZER:
+ *  DevComm requirements
  *
  *    CcoDevCommRequirements reqs = CCO_DEV_COMM_REQUIREMENTS_INITIALIZER;
  *    reqs.gdaConnectionType = CCO_GDA_CONNECTION_CROSSNODE;
  *    reqs.gdaSignalCount = numCTAs;
  *    CcoDevCommCreate(comm, &reqs, &devComm);
- *
- *  Forward-compat: CcoDevCommCreate checks {size, magic, version}. Adding
- *  new tail fields is ABI-safe — old binaries pass a smaller `size` and the
- *  runtime fills the missing tail with INITIALIZER defaults.
  * ──────────────────────────────────────────────────────────────────────────── */
 
-// Linked-list node for per-backend resource buffer reservations
-// (mirrors ncclDevResourceRequirements). Phase 1 scope: declared but unused;
-// will be wired up when CcoLsa / CcoSdma / CcoLsaBarrierSession land.
+// Per-backend resource buffer reservation node. Currently declared as a Phase 2
+// scaffold; will be consumed when CcoLsa / CcoSdma / CcoLsaBarrierSession land.
 struct CcoDevResourceRequirements {
   CcoDevResourceRequirements* next;
   size_t   bufferSize;
@@ -191,40 +152,37 @@ struct CcoDevResourceRequirements {
   uint32_t* outBufferHandle;     // populated on success: offset in comm buf
   int      gdaSignalCount;
   int      gdaCounterCount;
-  uint32_t* outGdaSignalStart;   // populated: signal id range start
-  uint32_t* outGdaCounterStart;  // populated: counter id range start
+  uint32_t* outGdaSignalStart;
+  uint32_t* outGdaCounterStart;
 };
 
 struct CcoDevCommRequirements {
-  // ── forward-compat triplet (do not touch — set by INITIALIZER) ──
+  // Forward-compat triplet (set by INITIALIZER, do not touch).
   size_t   size;
   uint32_t magic;
   uint32_t version;
 
-  // ── resource buffer linked list (Phase 2 — currently informational only) ──
+  // Resource buffer linked list (Phase 2 scaffold).
   CcoDevResourceRequirements* resourceRequirementsList;
 
-  // ── GDA (RDMA) ──
-  CcoGdaConnectionType gdaConnectionType;   // default CROSSNODE
-  int                  gdaContextCount;     // # of independent QP sets (numQpPerPe)
-  int                  gdaSignalCount;      // remote-write signal slots
-  int                  gdaCounterCount;     // local NIC-loopback counter slots
+  // GDA (RDMA).
+  CcoGdaConnectionType gdaConnectionType;
+  int                  gdaContextCount;     // # of independent QP sets per peer
+  int                  gdaSignalCount;
+  int                  gdaCounterCount;
   int                  gdaQueueDepth;       // 0 = provider default
   int                  gdaTrafficClass;     // -1 = MORI_RDMA_TC env
 
-  // ── LSA (intra-node P2P) ──
+  // LSA (intra-node P2P).
   int lsaBarrierCount;
 
-  // ── SDMA ──
-  int sdmaQueueCount;                       // 0 = use anvil default
+  // SDMA.
+  int sdmaQueueCount;                       // 0 = anvil default
 
-  // ── Hybrid barrier (LSA + GDA-Rail two-stage) ──
+  // Hybrid barrier (LSA + GDA-Rail two-stage).
   int barrierCount;
 };
 
-// Default values mirror the previously hardcoded constants in cco_init.cpp.
-// gdaConnectionType defaults to CROSSNODE because that matches what mori's
-// Context naturally produces (P2P/SDMA-reachable peers get no NIC QP).
 #define CCO_DEV_COMM_REQUIREMENTS_INITIALIZER {                                \
     sizeof(::mori::cco::CcoDevCommRequirements),                               \
     ::mori::cco::CCO_API_MAGIC,                                                \
@@ -250,13 +208,10 @@ struct CcoDevCommRequirements {
 struct CcoWindowHost {
   void* localPtr;
   size_t size;
-  // SDMA signals (for Deregister cleanup)
   HSAuint64* signalPtrs;
   HSAuint64* expectSignalsPtr;
   HSAuint64** peerSignalPtrs;
-  // GPU device struct (for Deregister cleanup)
   CcoWindowDevice* devPtr;
-  // GPU arrays (for Deregister cleanup)
   uint32_t* peerRkeys_gpu;
   HSAuint64** peerSignalPtrs_gpu;
 };
@@ -267,36 +222,31 @@ struct CcoComm {
   application::BootstrapNetwork* bootNet{nullptr};
   application::Context* ctx{nullptr};
 
-  // Group ID: rank 0's pid, shared via Allgather. Used to derive unique
-  // LocalBootstrapNetwork socket paths across independent comm groups.
+  // rank 0's pid, gathered via Allgather. Disambiguates LocalBootstrap socket
+  // paths across independent comm groups in the same process tree.
   int64_t groupId{0};
 
-  // ── Topology (intra-node detection, populated at CommCreate) ──
-  // Assumes all nodes have the same lsaSize (typical: 8 GPUs/node).
-  // Probed via hipDeviceCanAccessPeer + Allgather.
+  // Intra-node topology (populated at CommCreate).
   int lsaSize{1};
   int lsaRank{0};
   int myNodeStart{0};
 
-  // VMM flat address space
+  // VMM flat address space (sized lsaSize * perRankSize).
   void* flatBase{nullptr};
   size_t perRankSize{0};
   size_t nextOffset{0};
   size_t vmmGranularity{0};
 
-  // Default # of QPs per peer, read from Context. Per-DevComm may override
-  // via CcoDevCommRequirements::gdaContextCount.
+  // Default # of QPs per peer (from Context). Per-DevComm may override via reqs.
   int defaultNumQpPerPe{4};
   bool iovaZeroMode{true};
 
-  // SDMA (per-comm, shared across all windows)
+  // SDMA queue handles (per-comm, sized lsaSize * sdmaNumQueue, indexed by lsaRank).
   anvil::SdmaQueueDeviceHandle** sdmaDevHandles{nullptr};
   int sdmaNumQueue{0};
 
-  // Barrier
   uint64_t* internalSyncGpuPtr{nullptr};
 
-  // Allocation metadata (populated by MemAlloc, queried by WindowRegister)
   struct AllocMeta {
     hipMemGenericAllocationHandle_t physHandle;
     int shareFd{-1};
@@ -305,17 +255,13 @@ struct CcoComm {
   };
   std::unordered_map<void*, AllocMeta> allocTable;
 
-  // Protects nextOffset (slot bump pointer) + allocTable + windows + windowTableEntries
-  // against concurrent MemAlloc/MemFree/WindowRegister/WindowDeregister from
-  // multiple threads sharing the same CcoComm. (Per-thread CcoComm in
-  // test_cco_host doesn't need this — each thread has its own comm — but we
-  // make CcoComm itself thread-safe so a future multi-thread-per-comm
-  // workload doesn't silently corrupt internal data structures.)
+  // Protects nextOffset, allocTable, windows, windowTableEntries against
+  // concurrent MemAlloc / MemFree / WindowRegister / WindowDeregister from
+  // multiple threads sharing the same CcoComm.
   mutable std::mutex allocMutex;
 
   std::vector<CcoWindowHost*> windows;
 
-  // Window table: host shadow of GPU-side linked list (for DevCommCreate to build)
   struct WindowTableEntry {
     uintptr_t base;
     uintptr_t size;

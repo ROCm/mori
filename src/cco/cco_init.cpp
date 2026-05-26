@@ -46,21 +46,19 @@ int CcoCommCreate(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
   MORI_SHMEM_TRACE("CcoCommCreate: rank={} worldSize={} groupId={}", comm->rank,
                    comm->worldSize, comm->groupId);
 
-  // Step 2: context (RDMA endpoints, transport type negotiation)
+  // Step 2: context (RDMA endpoints + transport-type negotiation).
   comm->ctx = new application::Context(*comm->bootNet);
   comm->defaultNumQpPerPe = comm->ctx->GetNumQpPerPe();
 
-  // Step 2.5: detect intra-node topology (lsa = "local symmetric access").
+  // Step 2.5: detect intra-node topology (LSA = Local Symmetric Access).
+  // Use Context's capability discovery (PeerCapabilities.sameHost) rather
+  // than the chosen transport — LSA membership is a hardware fact and must
+  // not flip even if policy routes intra-node traffic via RDMA.
   //
-  // Consult Context's capability discovery directly (`PeerCapabilities.sameHost`)
-  // rather than inferring sameHost from Context's chosen transport. This way
-  // CCO stays correct even if env vars / policy decide that an intra-node peer
-  // should use RDMA (e.g. CCO_GDA_CONNECTION_FULL): the peer is still on the
-  // same node, lsa membership doesn't change.
-  //
-  // ASSUMPTION (matches mori shmem conventions): rank layout is contiguous
-  // within each node — i.e. ranks 0..lsaSize-1 are on node 0,
-  // lsaSize..2*lsaSize-1 are on node 1, etc. Validated below.
+  // HARD CONTRACT — violations are fatal:
+  //   (a) node-major contiguous ranks (same-host peers form a single block)
+  //   (b) every rank observes the same lsaSize
+  // Both are required by the flat-VA formula `lsaFlatBase + lsaRank * stride`.
   {
     int lsaCount = 0;
     int firstSameNode = comm->rank;
@@ -74,38 +72,62 @@ int CcoCommCreate(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
         lsaCount++;
       }
     }
+
+    if (lastSameNode - firstSameNode + 1 != lsaCount) {
+      MORI_SHMEM_ERROR(
+          "CcoCommCreate: non-contiguous lsa membership "
+          "(rank {}: first={} last={} count={}). CCO requires "
+          "node-major contiguous rank layout. Reorder ranks in your "
+          "launch (mpirun -host A:N,B:N or equivalent).",
+          comm->rank, firstSameNode, lastSameNode, lsaCount);
+      delete comm->ctx;
+      comm->bootNet->Finalize();
+      delete comm;
+      *outComm = nullptr;
+      return -1;
+    }
+
+    std::vector<int> allLsaSizes(comm->worldSize);
+    comm->bootNet->Allgather(&lsaCount, allLsaSizes.data(), sizeof(int));
+    for (int r = 0; r < comm->worldSize; r++) {
+      if (allLsaSizes[r] != lsaCount) {
+        MORI_SHMEM_ERROR(
+            "CcoCommCreate: heterogeneous lsa sizes detected "
+            "(my rank {} sees lsaSize={}, rank {} sees lsaSize={}). "
+            "CCO requires uniform GPUs-per-node across all nodes.",
+            comm->rank, lsaCount, r, allLsaSizes[r]);
+        delete comm->ctx;
+        comm->bootNet->Finalize();
+        delete comm;
+        *outComm = nullptr;
+        return -1;
+      }
+    }
+
     comm->lsaSize = lsaCount;
     comm->myNodeStart = firstSameNode;
     comm->lsaRank = comm->rank - firstSameNode;
 
-    // Sanity: contiguous block of [firstSameNode, lastSameNode]
-    if (lastSameNode - firstSameNode + 1 != lsaCount) {
-      MORI_SHMEM_WARN("CcoCommCreate: non-contiguous lsa membership detected "
-                      "(first={} last={} count={}); team math assumes contiguous "
-                      "node-major rank layout",
-                      firstSameNode, lastSameNode, lsaCount);
-    }
-    MORI_SHMEM_INFO("CcoCommCreate: lsa topology rank={} lsaSize={} lsaRank={} "
-                    "myNodeStart={}",
-                    comm->rank, comm->lsaSize, comm->lsaRank, comm->myNodeStart);
+    MORI_SHMEM_INFO(
+        "CcoCommCreate: lsa topology rank={} lsaSize={} lsaRank={} myNodeStart={}",
+        comm->rank, comm->lsaSize, comm->lsaRank, comm->myNodeStart);
   }
 
-  // Step 3: reserve contiguous VA for flat address space
-  // If user passes 0, default to GPU total memory.
-  // Always align to 4GB so stride4G = perRankSize >> 32 is lossless (like NCCL).
+  // Step 3: reserve flat VA. Always 4GB-aligned so stride4G = perRankSize >> 32
+  // is lossless. perRankVmmSize == 0 defaults to GPU total memory.
   if (perRankVmmSize == 0) {
     size_t freeMem = 0, totalMem = 0;
     HIP_RUNTIME_CHECK(hipMemGetInfo(&freeMem, &totalMem));
     perRankVmmSize = totalMem;
   }
-  perRankVmmSize = AlignUp(perRankVmmSize, 1ULL << 32);  // force 4GB alignment
+  perRankVmmSize = AlignUp(perRankVmmSize, 1ULL << 32);
   comm->perRankSize = perRankVmmSize;
 
   int currentDev = 0;
   HIP_RUNTIME_CHECK(hipGetDevice(&currentDev));
 
-  // Query granularity with the SAME allocProp that MemAlloc will use,
-  // including requestedHandleType — granularity may differ with FD export enabled
+  // Query granularity with the SAME allocProp MemAlloc will use — granularity
+  // can shift when requestedHandleType (FD export) is enabled.
   hipMemAllocationProp allocProp = {};
   allocProp.type = hipMemAllocationTypePinned;
   allocProp.requestedHandleType = hipMemHandleTypePosixFileDescriptor;
@@ -117,17 +139,15 @@ int CcoCommCreate(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
       hipMemGetAllocationGranularity(&granularity, &allocProp, hipMemAllocationGranularityMinimum));
   comm->vmmGranularity = granularity;
 
-  size_t totalVaSize = static_cast<size_t>(comm->worldSize) * perRankVmmSize;
+  // Flat VA covers the LSA team only. Cross-node peers don't use VA — RDMA
+  // goes through iova=0 + offset.
+  size_t totalVaSize = static_cast<size_t>(comm->lsaSize) * perRankVmmSize;
   HIP_RUNTIME_CHECK(hipMemAddressReserve(&comm->flatBase, totalVaSize, granularity, nullptr, 0));
-  MORI_SHMEM_TRACE("CcoCommCreate: flatBase={} totalVA={} granularity={}", comm->flatBase,
-                   totalVaSize, granularity);
+  MORI_SHMEM_TRACE("CcoCommCreate: flatBase={} totalVA={} (lsaSize={} x perRankSize={}) granularity={}",
+                   comm->flatBase, totalVaSize, comm->lsaSize, perRankVmmSize, granularity);
 
-  // Step 4: SDMA device handles (per-comm, shared across windows).
-  //
-  // capability AND policy: only materialize SDMA queues if the user opted in
-  // via MORI_ENABLE_SDMA (policy) and at least one peer has the SDMA hardware
-  // available (capability). Pure P2P deployments (the default) skip this
-  // entirely, leaving comm->sdmaNumQueue == 0.
+  // Step 4: SDMA queue setup. Materialize only if the user opted in
+  // (MORI_ENABLE_SDMA) AND at least one peer has SDMA-capable hardware.
   bool anySdmaCapable = false;
   for (int pe = 0; pe < comm->worldSize; pe++) {
     if (comm->ctx->GetPeerCapabilities(pe).canSDMA) {
@@ -137,37 +157,40 @@ int CcoCommCreate(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
   }
   if (comm->ctx->IsSdmaEnabled() && anySdmaCapable) {
     comm->sdmaNumQueue = anvil::GetSdmaNumChannels();
-    comm->ctx->EnsureSdmaTransport();  // lazy anvil.init + connect + EnablePeerAccess
+    comm->ctx->EnsureSdmaTransport();
 
+    // sdmaDevHandles is lsaSize × sdmaNumQueue, indexed by lsaRank. Assumes
+    // ranks bind 1:1 to GPUs within a node (rank lsa ⇒ GPU lsa).
     int srcDeviceId = currentDev;
-    size_t numSlots = static_cast<size_t>(comm->worldSize) * comm->sdmaNumQueue;
+    size_t numSlots = static_cast<size_t>(comm->lsaSize) * comm->sdmaNumQueue;
     HIP_RUNTIME_CHECK(
         hipMalloc(&comm->sdmaDevHandles, numSlots * sizeof(anvil::SdmaQueueDeviceHandle*)));
     HIP_RUNTIME_CHECK(
         hipMemset(comm->sdmaDevHandles, 0, numSlots * sizeof(anvil::SdmaQueueDeviceHandle*)));
 
-    for (int pe = 0; pe < comm->worldSize; pe++) {
+    for (int lsa = 0; lsa < comm->lsaSize; lsa++) {
+      int pe = comm->myNodeStart + lsa;
       if (!comm->ctx->GetPeerCapabilities(pe).canSDMA) continue;
-      int dstDeviceId = pe % 8;
+      int dstDeviceId = lsa;
       for (int q = 0; q < comm->sdmaNumQueue; q++) {
         auto* handle = anvil::anvil.getSdmaQueue(srcDeviceId, dstDeviceId, q)->deviceHandle();
         HIP_RUNTIME_CHECK(hipMemcpy(
-            &comm->sdmaDevHandles[dstDeviceId * comm->sdmaNumQueue + q],
+            &comm->sdmaDevHandles[lsa * comm->sdmaNumQueue + q],
             &handle, sizeof(handle), hipMemcpyHostToDevice));
       }
     }
   } else {
-    comm->sdmaNumQueue = 0;  // canonicalize: SDMA not enabled ⇒ no queues
+    comm->sdmaNumQueue = 0;
   }
 
-  // Step 5: internal sync for device barriers
+  // Step 5: device-barrier scratch.
   HIP_RUNTIME_CHECK(hipMalloc(&comm->internalSyncGpuPtr, INTERNAL_SYNC_BYTES));
   HIP_RUNTIME_CHECK(hipMemset(comm->internalSyncGpuPtr, 0, INTERNAL_SYNC_BYTES));
 
-  // Note: per-DevComm RDMA QP endpoints are no longer pre-allocated here.
-  // They are created lazily in CcoDevCommCreate via ctx->CreateAdditionalEndpoints,
-  // sized by CcoDevCommRequirements::gdaContextCount. This lets multiple
-  // independent DevComms coexist on the same Comm with different QP counts.
+  // RDMA QP endpoints are NOT pre-allocated here. CcoDevCommCreate builds
+  // a fresh QP set per DevComm via ctx->CreateAdditionalEndpoints, sized by
+  // reqs.gdaContextCount, so multiple DevComms can coexist with independent
+  // QP state.
 
   MORI_SHMEM_INFO("CcoCommCreate: rank={}/{} groupId={} flatBase={} perRankSize={} "
                   "granularity={} defaultNumQpPerPe={} sdmaNumQueue={} rdma={}",
@@ -186,38 +209,23 @@ int CcoCommDestroy(CcoComm* comm) {
 
   MORI_SHMEM_TRACE("CcoCommDestroy: rank={}", comm->rank);
 
-  // Free remaining windows
-  for (auto* wh : comm->windows) {
-    // Caller should have called WindowDeregister; clean up stragglers
-    delete wh;
-  }
+  for (auto* wh : comm->windows) delete wh;
   comm->windows.clear();
 
-  // Free remaining allocations
   for (auto& [ptr, meta] : comm->allocTable) {
-    if (meta.shareFd >= 0) {
-      close(meta.shareFd);
-    }
+    if (meta.shareFd >= 0) close(meta.shareFd);
   }
   comm->allocTable.clear();
 
-  // SDMA device handles
-  if (comm->sdmaDevHandles) {
-    HIP_RUNTIME_CHECK(hipFree(comm->sdmaDevHandles));
-  }
+  if (comm->sdmaDevHandles) HIP_RUNTIME_CHECK(hipFree(comm->sdmaDevHandles));
+  if (comm->internalSyncGpuPtr) HIP_RUNTIME_CHECK(hipFree(comm->internalSyncGpuPtr));
 
-  // Internal sync
-  if (comm->internalSyncGpuPtr) {
-    HIP_RUNTIME_CHECK(hipFree(comm->internalSyncGpuPtr));
-  }
-
-  // Release VA space
+  // Release flat VA — sized to match the reservation in CcoCommCreate.
   if (comm->flatBase) {
-    size_t totalVaSize = static_cast<size_t>(comm->worldSize) * comm->perRankSize;
+    size_t totalVaSize = static_cast<size_t>(comm->lsaSize) * comm->perRankSize;
     HIP_RUNTIME_CHECK(hipMemAddressFree(comm->flatBase, totalVaSize));
   }
 
-  // Context + bootstrap
   delete comm->ctx;
   comm->bootNet->Finalize();
   delete comm->bootNet;
@@ -236,7 +244,7 @@ int CcoMemAlloc(CcoComm* comm, size_t size, void** outPtr) {
 
   size_t alignedSize = AlignUp(size, comm->vmmGranularity);
 
-  // ── reserve a slot under the mutex (bump pointer in flat VA) ──
+  // Reserve a slot via bump pointer; rolled back below if any later step fails.
   size_t slotOffset;
   {
     std::lock_guard<std::mutex> lock(comm->allocMutex);
@@ -248,16 +256,14 @@ int CcoMemAlloc(CcoComm* comm, size_t size, void** outPtr) {
           slotOffset, alignedSize, comm->perRankSize);
       return -1;
     }
-    comm->nextOffset += alignedSize;  // optimistic reserve; rolled back on failure
+    comm->nextOffset += alignedSize;
   }
 
   MORI_SHMEM_TRACE("CcoMemAlloc: rank={} size={} alignedSize={} slotOffset={}", comm->rank,
                    size, alignedSize, slotOffset);
 
-  // Helper: roll back the reserved slot if we fail before publishing.
-  // Note: holes left in the bump pointer are still leaked until comm
-  // destruction (no freelist yet). This rollback only covers the *most
-  // recent* alloc when no other thread has bumped past it.
+  // Best-effort slot rollback: only undoes the bump if no other thread has
+  // moved past us. Holes are leaked until comm destruction (no freelist yet).
   auto rollbackSlot = [&]() {
     std::lock_guard<std::mutex> lock(comm->allocMutex);
     if (comm->nextOffset == slotOffset + alignedSize) {
@@ -265,7 +271,6 @@ int CcoMemAlloc(CcoComm* comm, size_t size, void** outPtr) {
     }
   };
 
-  // ── Step 1: create physical memory ──
   hipMemAllocationProp allocProp = {};
   allocProp.type = hipMemAllocationTypePinned;
   allocProp.requestedHandleType = hipMemHandleTypePosixFileDescriptor;
@@ -281,14 +286,14 @@ int CcoMemAlloc(CcoComm* comm, size_t size, void** outPtr) {
     return -1;
   }
 
-  // ── Step 2: map to local slot only (no cross-rank communication) ──
+  // Map only the local slot. Peer slots are mapped lazily in WindowRegister.
   void* localVa =
-      static_cast<char*>(comm->flatBase) + static_cast<size_t>(comm->rank) * comm->perRankSize + slotOffset;
+      static_cast<char*>(comm->flatBase) + static_cast<size_t>(comm->lsaRank) * comm->perRankSize + slotOffset;
   err = hipMemMap(localVa, alignedSize, 0, physHandle, 0);
   if (err != hipSuccess) {
     MORI_SHMEM_ERROR("CcoMemAlloc: hipMemMap failed: {} ({})", static_cast<int>(err),
                      hipGetErrorString(err));
-    (void)hipMemRelease(physHandle);  // best-effort cleanup
+    (void)hipMemRelease(physHandle);
     rollbackSlot();
     return -1;
   }
@@ -301,26 +306,25 @@ int CcoMemAlloc(CcoComm* comm, size_t size, void** outPtr) {
   if (err != hipSuccess) {
     MORI_SHMEM_ERROR("CcoMemAlloc: hipMemSetAccess failed: {} ({})", static_cast<int>(err),
                      hipGetErrorString(err));
-    (void)hipMemUnmap(localVa, alignedSize);  // best-effort cleanup
+    (void)hipMemUnmap(localVa, alignedSize);
     (void)hipMemRelease(physHandle);
     rollbackSlot();
     return -1;
   }
 
-  // ── Step 3: export dma-buf FD (for later use by WindowRegister: P2P + RDMA MR) ──
+  // dma-buf FD is stashed for WindowRegister to share (P2P FD exchange + RDMA MR).
   int shareFd = -1;
   err = hipMemExportToShareableHandle(
       reinterpret_cast<void*>(&shareFd), physHandle, hipMemHandleTypePosixFileDescriptor, 0);
   if (err != hipSuccess) {
     MORI_SHMEM_ERROR("CcoMemAlloc: hipMemExportToShareableHandle failed: {} ({})",
                      static_cast<int>(err), hipGetErrorString(err));
-    (void)hipMemUnmap(localVa, alignedSize);  // best-effort cleanup
+    (void)hipMemUnmap(localVa, alignedSize);
     (void)hipMemRelease(physHandle);
     rollbackSlot();
     return -1;
   }
 
-  // ── Step 4: publish metadata under the mutex ──
   {
     std::lock_guard<std::mutex> lock(comm->allocMutex);
     CcoComm::AllocMeta meta;
@@ -332,8 +336,7 @@ int CcoMemAlloc(CcoComm* comm, size_t size, void** outPtr) {
   }
 
   *outPtr = localVa;
-  MORI_SHMEM_TRACE("CcoMemAlloc: done, localPtr={} (local only, P2P mapping deferred to WindowRegister)",
-                   localVa);
+  MORI_SHMEM_TRACE("CcoMemAlloc: done, localPtr={}", localVa);
   return 0;
 }
 
@@ -342,9 +345,8 @@ int CcoMemAlloc(CcoComm* comm, size_t size, void** outPtr) {
 /* ========================================================================== */
 
 int CcoMemFree(CcoComm* comm, void* ptr) {
-  // Take a snapshot of the meta under the mutex, then drop the lock for the
-  // (possibly slow) hipMem* calls. This lets concurrent MemAlloc on another
-  // thread proceed in parallel with the unmap/release here.
+  // Snapshot meta under the lock, then drop it before the (potentially slow)
+  // hipMem* calls so concurrent MemAlloc isn't blocked.
   CcoComm::AllocMeta meta;
   {
     std::lock_guard<std::mutex> lock(comm->allocMutex);
@@ -354,7 +356,7 @@ int CcoMemFree(CcoComm* comm, void* ptr) {
       return -1;
     }
     meta = it->second;
-    comm->allocTable.erase(it);  // remove eagerly; no one should look it up after this
+    comm->allocTable.erase(it);
   }
 
   size_t alignedSize = meta.size;
@@ -362,21 +364,22 @@ int CcoMemFree(CcoComm* comm, void* ptr) {
 
   MORI_SHMEM_TRACE("CcoMemFree: rank={} ptr={} size={}", comm->rank, ptr, alignedSize);
 
-  // Unmap peer slots (P2P-mapped during WindowRegister; unmap may fail with
-  // ENOMAP if WindowRegister was never called — that's expected and silent).
-  for (int pe = 0; pe < comm->worldSize; pe++) {
-    if (pe == comm->rank) continue;
+  // Unmap peer slots that WindowRegister mapped. ENOMAP for never-registered
+  // windows is expected and ignored.
+  for (int lsa = 0; lsa < comm->lsaSize; lsa++) {
+    if (lsa == comm->lsaRank) continue;
+    int pe = comm->myNodeStart + lsa;
     if (!comm->ctx->CanUseP2P(pe)) continue;
 
     void* peerVa = static_cast<char*>(comm->flatBase) +
-                   static_cast<size_t>(pe) * comm->perRankSize + slotOffset;
+                   static_cast<size_t>(lsa) * comm->perRankSize + slotOffset;
     hipError_t err = hipMemUnmap(peerVa, alignedSize);
     if (err != hipSuccess) {
-      MORI_SHMEM_WARN("CcoMemFree: unmap PE {} failed: {}", pe, static_cast<int>(err));
+      MORI_SHMEM_WARN("CcoMemFree: unmap PE {} (lsa={}) failed: {}",
+                      pe, lsa, static_cast<int>(err));
     }
   }
 
-  // Unmap local slot + release the physical handle.
   hipError_t err = hipMemUnmap(ptr, alignedSize);
   if (err != hipSuccess) {
     MORI_SHMEM_WARN("CcoMemFree: local hipMemUnmap failed: {} ({})", static_cast<int>(err),
@@ -388,13 +391,11 @@ int CcoMemFree(CcoComm* comm, void* ptr) {
                     hipGetErrorString(err));
   }
 
-  if (meta.shareFd >= 0) {
-    close(meta.shareFd);
-  }
+  if (meta.shareFd >= 0) close(meta.shareFd);
 
-  // Note: slotOffset is NOT returned to a freelist; nextOffset stays put.
-  // Long-running alloc/free churn will eventually exhaust perRankSize. A
-  // proper segmented allocator is future work (see CcoMemAlloc issues list).
+  // slotOffset is not returned to nextOffset — bump pointer only. Long-running
+  // alloc/free churn will eventually exhaust perRankSize; a segmented
+  // allocator is future work.
   return 0;
 }
 
@@ -407,7 +408,7 @@ int CcoDevCommCreate(CcoComm* comm,
                      CcoDevComm** outDevComm) {
   MORI_SHMEM_TRACE("CcoDevCommCreate: rank={}", comm->rank);
 
-  // ── forward-compat: validate reqs ──
+  // Forward-compat: validate {magic, version}.
   if (reqs == nullptr) {
     MORI_SHMEM_ERROR("CcoDevCommCreate: reqs is NULL — must initialize via "
                      "CCO_DEV_COMM_REQUIREMENTS_INITIALIZER");
@@ -424,21 +425,18 @@ int CcoDevCommCreate(CcoComm* comm,
                     reqs->version, CCO_API_VERSION);
   }
 
-  // Sanitize / log connection type
+  // Resolve connection type. FULL/RAIL fall back to CROSSNODE (Context already
+  // skips P2P-reachable peers). CROSSNODE collapses to NONE on single-node.
   CcoGdaConnectionType connType = reqs->gdaConnectionType;
   if (connType == CCO_GDA_CONNECTION_FULL ||
       connType == CCO_GDA_CONNECTION_RAIL) {
-    MORI_SHMEM_WARN("CcoDevCommCreate: gdaConnectionType={} (FULL/RAIL) not yet "
-                    "implemented; falling back to CROSSNODE semantics. "
-                    "QP allocation is driven by Context::CreateAdditionalEndpoints "
-                    "which already skips P2P-reachable peers.",
+    MORI_SHMEM_WARN("CcoDevCommCreate: gdaConnectionType={} (FULL/RAIL) not "
+                    "yet implemented; falling back to CROSSNODE.",
                     static_cast<int>(connType));
     connType = CCO_GDA_CONNECTION_CROSSNODE;
   }
-  // Auto-downgrade CROSSNODE to NONE on single-node deployments
   if (connType == CCO_GDA_CONNECTION_CROSSNODE && comm->lsaSize == comm->worldSize) {
-    MORI_SHMEM_TRACE("CcoDevCommCreate: single-node deployment, downgrading "
-                     "CROSSNODE -> NONE (no cross-node peers)");
+    MORI_SHMEM_TRACE("CcoDevCommCreate: single-node, CROSSNODE -> NONE");
     connType = CCO_GDA_CONNECTION_NONE;
   }
 
@@ -453,7 +451,7 @@ int CcoDevCommCreate(CcoComm* comm,
   hostShadow.perRankSize = comm->perRankSize;
   hostShadow.internalSyncPtr = comm->internalSyncGpuPtr;
 
-  // ── IBGDA Context: create fresh QP set per DevComm ──
+  // Fresh QP set per DevComm.
   CcoIbgdaContext& ibgda = hostShadow.ibgda;
   int numQpPerPe = reqs->gdaContextCount > 0 ? reqs->gdaContextCount
                                               : comm->defaultNumQpPerPe;
@@ -463,13 +461,11 @@ int CcoDevCommCreate(CcoComm* comm,
   shmem::ShmemRdmaEndpoint* epsGpu = nullptr;
 
   if (connType != CCO_GDA_CONNECTION_NONE && comm->ctx->RdmaTransportEnabled()) {
-    // Create and connect fresh QPs (collective: all ranks must call together).
-    // Context internally only allocates QPs for transportType==RDMA peers,
-    // which corresponds to cross-node — this is the CROSSNODE behavior.
+    // Collective: every rank must call CreateAdditionalEndpoints together.
+    // Context skips QPs for non-RDMA peers, so intra-node slots stay empty.
     auto newEps = comm->ctx->CreateAdditionalEndpoints(numQpPerPe);
     comm->ctx->ConnectAdditionalEndpoints(newEps, numQpPerPe);
 
-    // Convert to ShmemRdmaEndpoint format
     std::vector<shmem::ShmemRdmaEndpoint> shmemEps(numEps);
     for (size_t i = 0; i < numEps; i++) {
       shmemEps[i].vendorId = newEps[i].vendorId;
@@ -485,14 +481,13 @@ int CcoDevCommCreate(CcoComm* comm,
   }
   ibgda.endpoints = epsGpu;
 
-  // Build window table linked list on GPU
+  // Build window-table linked list on GPU.
   const auto& tableEntries = comm->windowTableEntries;
   size_t numWindows = tableEntries.size();
   size_t numNodes =
       (numWindows + CCO_WINDOW_TABLE_SIZE - 1) / CCO_WINDOW_TABLE_SIZE;
   if (numNodes == 0) numNodes = 1;
 
-  // Allocate all nodes on GPU, build from host
   std::vector<CcoWindowTableNode*> gpuNodes(numNodes, nullptr);
   for (size_t n = 0; n < numNodes; n++) {
     HIP_RUNTIME_CHECK(hipMalloc(&gpuNodes[n], sizeof(CcoWindowTableNode)));
@@ -519,8 +514,7 @@ int CcoDevCommCreate(CcoComm* comm,
   MORI_SHMEM_TRACE("CcoDevCommCreate: windowTable with {} windows in {} nodes", numWindows,
                    numNodes);
 
-  // ── IBGDA Context: Signal / Counter buffers ──
-  // Only allocate when GDA is enabled (NONE => skip).
+  // Signal + counter buffers (skipped when GDA is disabled).
   int signalCount = (connType == CCO_GDA_CONNECTION_NONE) ? 0 : reqs->gdaSignalCount;
   int counterCount = (connType == CCO_GDA_CONNECTION_NONE) ? 0 : reqs->gdaCounterCount;
   ibgda.signalCount = signalCount;
@@ -546,7 +540,7 @@ int CcoDevCommCreate(CcoComm* comm,
   }
   ibgda.counterBuf = counterBufGpu;
 
-  // Register signalBuf as RDMA MR and exchange rkeys
+  // Register signalBuf as an RDMA MR and Allgather rkeys.
   uint32_t signalLkey = 0;
   uint32_t localSignalRkey = 0;
   application::RdmaDeviceContext* rdmaDevCtx = comm->ctx->GetRdmaDeviceContext();
@@ -572,7 +566,6 @@ int CcoDevCommCreate(CcoComm* comm,
   MORI_SHMEM_TRACE("CcoDevCommCreate: signals={} counters={} signalLkey={}", signalCount,
                    counterCount, signalLkey);
 
-  // Copy struct to GPU
   CcoDevComm* devCommGpu = nullptr;
   HIP_RUNTIME_CHECK(hipMalloc(&devCommGpu, sizeof(CcoDevComm)));
   HIP_RUNTIME_CHECK(
@@ -597,7 +590,6 @@ int CcoDevCommDestroy(CcoDevComm* devComm) {
   HIP_RUNTIME_CHECK(
       hipMemcpy(&hostShadow, devComm, sizeof(CcoDevComm), hipMemcpyDeviceToHost));
 
-  // Free IBGDA context resources
   auto& ibgda = hostShadow.ibgda;
   if (ibgda.endpoints) HIP_RUNTIME_CHECK(hipFree(ibgda.endpoints));
   if (ibgda.signalBuf) HIP_RUNTIME_CHECK(hipFree(ibgda.signalBuf));
@@ -605,7 +597,6 @@ int CcoDevCommDestroy(CcoDevComm* devComm) {
   if (ibgda.counterBuf) HIP_RUNTIME_CHECK(hipFree(ibgda.counterBuf));
   if (ibgda.peerSignalRkeys) HIP_RUNTIME_CHECK(hipFree(ibgda.peerSignalRkeys));
 
-  // Free window table linked list
   CcoWindowTableNode* node = hostShadow.windowTable;
   while (node) {
     CcoWindowTableNode nodeHost;

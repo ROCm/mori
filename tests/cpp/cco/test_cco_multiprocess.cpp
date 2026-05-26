@@ -113,26 +113,31 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
   }
   printf("[rank %d] DevComm independence verified\n", rank);
 
-  // P2P cross-read via flat addressing
+  // P2P cross-read via flat addressing — LSA peers only (intra-node).
   mori::cco::CcoWindowDevice winHost;
   HIP_CHECK(hipMemcpy(&winHost, win, sizeof(winHost), hipMemcpyDeviceToHost));
+  mori::cco::CcoDevComm devCommSnap;
+  HIP_CHECK(hipMemcpy(&devCommSnap, devComm1, sizeof(devCommSnap), hipMemcpyDeviceToHost));
 
   mori::cco::CcoBarrierAll(comm);
 
   int p2pOk = 0;
-  for (int pe = 0; pe < nranks; pe++) {
-    if (pe == rank) continue;
-    void* peerVa = winHost.winBase + (static_cast<uint64_t>(pe) * winHost.stride4G << 32);
+  int lsaSize = devCommSnap.lsaSize;
+  int myNodeStart = devCommSnap.myNodeStart;
+  for (int lsa = 0; lsa < lsaSize; lsa++) {
+    if (lsa == winHost.lsaRank) continue;
+    int pe = myNodeStart + lsa;
+    void* peerVa = winHost.winBase + (static_cast<uint64_t>(lsa) * winHost.stride4G << 32);
     uint8_t got = 0;
     HIP_CHECK(hipMemcpy(&got, peerVa, 1, hipMemcpyDeviceToHost));
     uint8_t want = static_cast<uint8_t>((pe + 1) * 10);
     if (got != want) {
-      fprintf(stderr, "[rank %d] P2P read PE %d: got %u want %u\n", rank, pe, got, want);
+      fprintf(stderr, "[rank %d] P2P read PE %d (lsa=%d): got %u want %u\n", rank, pe, lsa, got, want);
       return 1;
     }
     p2pOk++;
   }
-  printf("[rank %d] P2P OK from %d peers\n", rank, p2pOk);
+  printf("[rank %d] P2P OK from %d LSA peers\n", rank, p2pOk);
 
   mori::cco::CcoDevCommDestroy(devComm2);
   mori::cco::CcoDevCommDestroy(devComm1);

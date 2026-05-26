@@ -129,12 +129,15 @@ static void run_rank(int rank, int nranks, const mori::application::UniqueId& ui
   }
 
   {
-    // Verify WindowDevice on GPU — use flat addressing
+    // Verify WindowDevice on GPU — uses LSA-sized flat VA, addressed by lsaRank.
     mori::cco::CcoWindowDevice winHost;
     HIP_CHECK(hipMemcpy(&winHost, win, sizeof(winHost), hipMemcpyDeviceToHost));
+    mori::cco::CcoDevComm devCommSnap;
+    HIP_CHECK(hipMemcpy(&devCommSnap, devComm, sizeof(devCommSnap), hipMemcpyDeviceToHost));
 
-    // Verify local ptr via flat addressing
-    void* localVa = winHost.winBase + (static_cast<uint64_t>(winHost.rank) * winHost.stride4G << 32);
+    // Verify local ptr via flat addressing (uses lsaRank now).
+    void* localVa =
+        winHost.winBase + (static_cast<uint64_t>(winHost.lsaRank) * winHost.stride4G << 32);
     if (localVa != buf) {
       snprintf(result->detail, sizeof(result->detail), "flat localVa mismatch: %p != %p", localVa,
                buf);
@@ -144,22 +147,27 @@ static void run_rank(int rank, int nranks, const mori::application::UniqueId& ui
     // Barrier before P2P cross-read
     mori::cco::CcoBarrierAll(comm);
 
-    // P2P read from every peer via flat addressing
+    // P2P read from every LSA peer via flat addressing (intra-node only;
+    // cross-node peers would need RDMA path, not exercised by this test).
     int p2pChecked = 0;
-    for (int pe = 0; pe < nranks; pe++) {
-      if (pe == rank) continue;
-      void* peerVa = winHost.winBase + (static_cast<uint64_t>(pe) * winHost.stride4G << 32);
+    int lsaSize = devCommSnap.lsaSize;
+    int myNodeStart = devCommSnap.myNodeStart;
+    for (int lsa = 0; lsa < lsaSize; lsa++) {
+      if (lsa == winHost.lsaRank) continue;
+      int pe = myNodeStart + lsa;
+      void* peerVa =
+          winHost.winBase + (static_cast<uint64_t>(lsa) * winHost.stride4G << 32);
       uint8_t got = 0;
       HIP_CHECK(hipMemcpy(&got, peerVa, 1, hipMemcpyDeviceToHost));
       uint8_t want = static_cast<uint8_t>((pe + 1) * 10);
       if (got != want) {
-        snprintf(result->detail, sizeof(result->detail), "P2P read PE %d: got %u want %u", pe, got,
-                 want);
+        snprintf(result->detail, sizeof(result->detail), "P2P read PE %d (lsa=%d): got %u want %u",
+                 pe, lsa, got, want);
         goto cleanup;
       }
       p2pChecked++;
     }
-    printf("[rank %d] P2P read OK from %d peers\n", rank, p2pChecked);
+    printf("[rank %d] P2P read OK from %d LSA peers\n", rank, p2pChecked);
   }
 
   result->passed = true;

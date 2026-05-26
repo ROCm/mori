@@ -43,7 +43,8 @@ int CcoWindowRegister(CcoComm* comm, void* ptr, size_t size, CcoWindow_t* outWin
   int currentDev = 0;
   HIP_RUNTIME_CHECK(hipGetDevice(&currentDev));
 
-  // ── P2P: exchange FDs with same-node peers and map their memory into flat VA ──
+  // P2P: exchange dma-buf FDs with same-node peers and map their slots into
+  // the LSA flat VA.
   std::vector<int> p2pPeers;
   for (int pe = 0; pe < worldSize; pe++) {
     if (comm->ctx->CanUseP2P(pe)) {
@@ -62,13 +63,12 @@ int CcoWindowRegister(CcoComm* comm, void* ptr, size_t size, CcoWindow_t* outWin
     }
     int p2pWorldSize = static_cast<int>(sortedGroup.size());
 
-    // Socket path must be SAME across all ranks in this comm group,
-    // but UNIQUE per window and per group to avoid collision.
-    // groupId (rank 0's pid) identifies the group; slotOffset identifies the window.
+    // Socket path must agree across the group but be unique per (group, window).
+    // groupId = rank 0's pid; slotOffset identifies the window.
     std::string socketPath = "/tmp/mori_cco_" + std::to_string(comm->groupId) + "_" +
                              std::to_string(slotOffset) + "_";
 
-    // Clean up stale socket files from previous crashed runs (rank 0 only to avoid race)
+    // Best-effort cleanup of stale sockets from crashed runs.
     if (myPeerRank == 0) {
       for (int i = 0; i < p2pWorldSize; i++) {
         for (int j = 0; j < p2pWorldSize; j++) {
@@ -115,11 +115,12 @@ int CcoWindowRegister(CcoComm* comm, void* ptr, size_t size, CcoWindow_t* outWin
         continue;
       }
 
+      int peerLsaRank = pe - comm->myNodeStart;
       void* peerVa = static_cast<char*>(comm->flatBase) +
-                     static_cast<size_t>(pe) * comm->perRankSize + slotOffset;
+                     static_cast<size_t>(peerLsaRank) * comm->perRankSize + slotOffset;
       HIP_RUNTIME_CHECK(hipMemMap(peerVa, alignedSize, 0, importedHandle, 0));
 
-      // hipMemSetAccess can transiently fail under concurrent VMM operations (multi-thread)
+      // hipMemSetAccess can transiently fail under concurrent VMM operations.
       for (int retry = 0;; retry++) {
         hipError_t setErr = hipMemSetAccess(peerVa, alignedSize, &accessDesc, 1);
         if (setErr == hipSuccess) break;
@@ -131,7 +132,7 @@ int CcoWindowRegister(CcoComm* comm, void* ptr, size_t size, CcoWindow_t* outWin
     localBoot.Finalize();
   }
 
-  // ── RDMA MR registration ──
+  // RDMA MR registration + rkey Allgather.
   uint32_t lkey = 0;
   uint32_t localRkey = 0;
 
@@ -147,27 +148,23 @@ int CcoWindowRegister(CcoComm* comm, void* ptr, size_t size, CcoWindow_t* outWin
     localRkey = mr.rkey;
   }
 
-  // Exchange rkeys (Allgather is implicitly synchronizing)
   auto* peerRkeys_host = static_cast<uint32_t*>(calloc(worldSize, sizeof(uint32_t)));
   peerRkeys_host[rank] = localRkey;
   comm->bootNet->Allgather(&localRkey, peerRkeys_host, sizeof(uint32_t));
 
-  // ── SDMA signals ──
+  // SDMA signals — intra-node only, sized lsaSize × sdmaNumQueue. The IPC
+  // handle Allgather still spans worldSize (avoids a second bootstrap); we
+  // only open the LSA peers' handles into the lsa-sized peerSignalPtrs.
   int sdmaNumQueue = comm->sdmaNumQueue;
-  size_t signalArraySize = static_cast<size_t>(worldSize) * sdmaNumQueue * sizeof(HSAuint64);
+  size_t signalArraySize = static_cast<size_t>(comm->lsaSize) * sdmaNumQueue * sizeof(HSAuint64);
 
   HSAuint64* signalPtrs = nullptr;
   HSAuint64* expectSignalsPtr = nullptr;
   HSAuint64** peerSignalPtrs_host_arr = nullptr;
   HSAuint64** peerSignalPtrs_gpu = nullptr;
 
-  // Allocate SDMA signals when both:
-  //   1. The user actually wants SDMA (MORI_ENABLE_SDMA env or future
-  //      per-DevComm reqs.sdmaQueueCount > 0 — Phase 2 will move this onto
-  //      the DevComm side); and
-  //   2. The hardware can do SDMA for at least one peer.
-  // capability AND policy — capability alone is not enough (single-node
-  // hardware always reports canSDMA, but the user may be running pure P2P).
+  // Materialize SDMA signals only if the user opted in (policy) AND at least
+  // one peer is SDMA-capable (hardware).
   bool hasSdmaPeers = false;
   if (comm->ctx->IsSdmaEnabled()) {
     for (int pe = 0; pe < worldSize; pe++) {
@@ -184,7 +181,6 @@ int CcoWindowRegister(CcoComm* comm, void* ptr, size_t size, CcoWindow_t* outWin
     HIP_RUNTIME_CHECK(hipMalloc(&expectSignalsPtr, signalArraySize));
     HIP_RUNTIME_CHECK(hipMemset(expectSignalsPtr, 0, signalArraySize));
 
-    // Exchange signal pointers via IPC
     hipIpcMemHandle_t signalHandle;
     HIP_RUNTIME_CHECK(hipIpcGetMemHandle(&signalHandle, signalPtrs));
 
@@ -192,35 +188,34 @@ int CcoWindowRegister(CcoComm* comm, void* ptr, size_t size, CcoWindow_t* outWin
         static_cast<hipIpcMemHandle_t*>(calloc(worldSize, sizeof(hipIpcMemHandle_t)));
     comm->bootNet->Allgather(&signalHandle, signalHandles, sizeof(hipIpcMemHandle_t));
 
-    peerSignalPtrs_host_arr = static_cast<HSAuint64**>(calloc(worldSize, sizeof(HSAuint64*)));
-    peerSignalPtrs_host_arr[rank] = signalPtrs;
-    for (int pe = 0; pe < worldSize; pe++) {
+    peerSignalPtrs_host_arr =
+        static_cast<HSAuint64**>(calloc(comm->lsaSize, sizeof(HSAuint64*)));
+    peerSignalPtrs_host_arr[comm->lsaRank] = signalPtrs;
+    for (int lsa = 0; lsa < comm->lsaSize; lsa++) {
+      if (lsa == comm->lsaRank) continue;
+      int pe = comm->myNodeStart + lsa;
       if (!comm->ctx->GetPeerCapabilities(pe).canSDMA) continue;
-      if (pe == rank) continue;
       void* mapped = nullptr;
       HIP_RUNTIME_CHECK(
           hipIpcOpenMemHandle(&mapped, signalHandles[pe], hipIpcMemLazyEnablePeerAccess));
-      peerSignalPtrs_host_arr[pe] = reinterpret_cast<HSAuint64*>(mapped);
+      peerSignalPtrs_host_arr[lsa] = reinterpret_cast<HSAuint64*>(mapped);
     }
 
-    HIP_RUNTIME_CHECK(hipMalloc(&peerSignalPtrs_gpu, sizeof(HSAuint64*) * worldSize));
+    HIP_RUNTIME_CHECK(hipMalloc(&peerSignalPtrs_gpu, sizeof(HSAuint64*) * comm->lsaSize));
     HIP_RUNTIME_CHECK(hipMemcpy(peerSignalPtrs_gpu, peerSignalPtrs_host_arr,
-                                sizeof(HSAuint64*) * worldSize, hipMemcpyHostToDevice));
+                                sizeof(HSAuint64*) * comm->lsaSize, hipMemcpyHostToDevice));
     free(signalHandles);
   }
 
-  // ── Copy arrays to GPU ──
   uint32_t* peerRkeys_gpu = nullptr;
   HIP_RUNTIME_CHECK(hipMalloc(&peerRkeys_gpu, sizeof(uint32_t) * worldSize));
   HIP_RUNTIME_CHECK(hipMemcpy(peerRkeys_gpu, peerRkeys_host, sizeof(uint32_t) * worldSize,
                               hipMemcpyHostToDevice));
 
-  // ── Build GPU-side CcoWindowDevice ──
   CcoWindowDevice hostShadow = {};
   hostShadow.winBase = static_cast<char*>(comm->flatBase) + slotOffset;
   hostShadow.stride4G = static_cast<uint32_t>(comm->perRankSize >> 32);
-  hostShadow.rank = rank;
-  hostShadow.worldSize = worldSize;
+  hostShadow.lsaRank = comm->lsaRank;
   hostShadow.ibgdaWin.peerRkeys = peerRkeys_gpu;
   hostShadow.ibgdaWin.lkey = lkey;
   hostShadow.deviceHandles_d = comm->sdmaDevHandles;
@@ -234,14 +229,13 @@ int CcoWindowRegister(CcoComm* comm, void* ptr, size_t size, CcoWindow_t* outWin
   HIP_RUNTIME_CHECK(
       hipMemcpy(devPtr, &hostShadow, sizeof(CcoWindowDevice), hipMemcpyHostToDevice));
 
-  // ── Register in window table (for ncclFindWindow-style lookup) ──
+  // Publish into the per-comm window table (drives findWindow lookups).
   CcoComm::WindowTableEntry tableEntry;
   tableEntry.base = reinterpret_cast<uintptr_t>(localPtr);
   tableEntry.size = static_cast<uintptr_t>(size);
   tableEntry.devPtr = devPtr;
   comm->windowTableEntries.push_back(tableEntry);
 
-  // ── Record host-side metadata ──
   auto* wh = new CcoWindowHost();
   wh->localPtr = localPtr;
   wh->size = size;
@@ -255,13 +249,17 @@ int CcoWindowRegister(CcoComm* comm, void* ptr, size_t size, CcoWindow_t* outWin
 
   *outWin = devPtr;
 
-  // Print window info
   char* winBase = static_cast<char*>(comm->flatBase) + slotOffset;
   MORI_SHMEM_INFO("CcoWindowRegister: rank={} win={} winBase={} size={} slotOffset={} lkey={}",
                   rank, (void*)devPtr, (void*)winBase, size, slotOffset, lkey);
+  for (int lsa = 0; lsa < comm->lsaSize; lsa++) {
+    int pe = comm->myNodeStart + lsa;
+    void* peerVa = winBase + static_cast<size_t>(lsa) * comm->perRankSize;
+    MORI_SHMEM_INFO("  LSA[{}] (PE {}): flatVA={} rkey={}", lsa, pe, peerVa, peerRkeys_host[pe]);
+  }
   for (int pe = 0; pe < worldSize; pe++) {
-    void* peerVa = winBase + static_cast<size_t>(pe) * comm->perRankSize;
-    MORI_SHMEM_INFO("  PE {}: flatVA={} rkey={}", pe, peerVa, peerRkeys_host[pe]);
+    if (pe >= comm->myNodeStart && pe < comm->myNodeStart + comm->lsaSize) continue;
+    MORI_SHMEM_INFO("  XNODE PE {}: rkey={} (RDMA via iova=0)", pe, peerRkeys_host[pe]);
   }
   if (signalPtrs) {
     MORI_SHMEM_INFO("  SDMA: signalPtrs={} expectSignals={} numQueue={}",
@@ -298,7 +296,6 @@ int CcoWindowRegister(CcoComm* comm, size_t size, CcoWindow_t* outWin, void** lo
 /* ========================================================================== */
 
 int CcoWindowDeregister(CcoComm* comm, CcoWindow_t win) {
-  // Find matching CcoWindowHost
   CcoWindowHost* wh = nullptr;
   size_t idx = 0;
   for (size_t i = 0; i < comm->windows.size(); i++) {
@@ -315,21 +312,21 @@ int CcoWindowDeregister(CcoComm* comm, CcoWindow_t win) {
 
   MORI_SHMEM_TRACE("CcoWindowDeregister: rank={} ptr={}", comm->rank, wh->localPtr);
 
-  // Unmap P2P peer slots (mapped during WindowRegister)
+  // Unmap the P2P peer slots that WindowRegister mapped (ENOMAP is fine).
   auto allocIt = comm->allocTable.find(wh->localPtr);
   if (allocIt != comm->allocTable.end()) {
     size_t slotOff = allocIt->second.slotOffset;
     size_t allocSize = allocIt->second.size;
-    for (int pe = 0; pe < comm->worldSize; pe++) {
-      if (pe == comm->rank) continue;
+    for (int lsa = 0; lsa < comm->lsaSize; lsa++) {
+      if (lsa == comm->lsaRank) continue;
+      int pe = comm->myNodeStart + lsa;
       if (!comm->ctx->CanUseP2P(pe)) continue;
       void* peerVa = static_cast<char*>(comm->flatBase) +
-                     static_cast<size_t>(pe) * comm->perRankSize + slotOff;
-      hipMemUnmap(peerVa, allocSize);
+                     static_cast<size_t>(lsa) * comm->perRankSize + slotOff;
+      (void)hipMemUnmap(peerVa, allocSize);
     }
   }
 
-  // Remove from window table
   auto& entries = comm->windowTableEntries;
   entries.erase(std::remove_if(entries.begin(), entries.end(),
                                [win](const CcoComm::WindowTableEntry& e) {
@@ -337,23 +334,17 @@ int CcoWindowDeregister(CcoComm* comm, CcoWindow_t win) {
                                }),
                 entries.end());
 
-  // Deregister RDMA MR
   application::RdmaDeviceContext* rdmaDevCtx = comm->ctx->GetRdmaDeviceContext();
-  if (rdmaDevCtx) {
-    rdmaDevCtx->DeregisterRdmaMemoryRegion(wh->localPtr);
-  }
+  if (rdmaDevCtx) rdmaDevCtx->DeregisterRdmaMemoryRegion(wh->localPtr);
 
-  // Free GPU arrays
   if (wh->peerRkeys_gpu) HIP_RUNTIME_CHECK(hipFree(wh->peerRkeys_gpu));
   if (wh->signalPtrs) HIP_RUNTIME_CHECK(hipFree(wh->signalPtrs));
   if (wh->expectSignalsPtr) HIP_RUNTIME_CHECK(hipFree(wh->expectSignalsPtr));
   if (wh->peerSignalPtrs_gpu) HIP_RUNTIME_CHECK(hipFree(wh->peerSignalPtrs_gpu));
   if (wh->devPtr) HIP_RUNTIME_CHECK(hipFree(wh->devPtr));
 
-  // Free host-side signal pointer array
   free(wh->peerSignalPtrs);
 
-  // Remove from list
   comm->windows.erase(comm->windows.begin() + idx);
   delete wh;
   return 0;
