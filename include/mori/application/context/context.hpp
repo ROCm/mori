@@ -51,14 +51,23 @@ struct PeerCapabilities {
   // transport gets picked); they do not change capability — the hardware can
   // still do P2P even if env var disables it. Use the policy layer
   // (DefaultPolicyResolve or CCO's resolver) to combine cap + env intent.
+  //
+  // CURRENT LIMITATIONS:
+  //  * canP2P/canSDMA are conservative — both default to `sameHost`. mori
+  //    has no real hardware probe for either (we assume HIP peer access is
+  //    always enabled, and anvil has no IsSupported() API). True capability
+  //    is determined when anvil queues / hipDeviceEnablePeerAccess actually
+  //    get invoked, which happens later in EnsureSdmaTransport() / window
+  //    registration. A future probe-based check would refine these bits
+  //    without changing the public API.
+  //  * canRDMA is true whenever a NIC was selected for this Context, even
+  //    for same-host peers. This lets future FULL-style policies allocate
+  //    NIC QPs to intra-node peers (NIC loopback for uniform addressing).
   bool sameHost{false};     // peer is on the same physical node
   bool sameProcess{false};  // peer is in the same OS process (loopback IPC ok)
-  bool canP2P{false};       // intra-node GPU peer access (xGMI / NVLink) reachable
-  bool canSDMA{false};      // intra-node SDMA (anvil) hardware available
-  bool canRDMA{false};      // NIC reachable (true for any peer if an NIC is
-                            // present; the loopback case lets policies like
-                            // FULL connection allocate NIC QPs to intra-node
-                            // peers)
+  bool canP2P{false};       // intra-node GPU peer access *likely* reachable
+  bool canSDMA{false};      // intra-node SDMA *likely* reachable
+  bool canRDMA{false};      // NIC reachable for this Context (host or cross)
 };
 
 class Context {

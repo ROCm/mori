@@ -241,15 +241,21 @@ void Context::InitializeTopologyAndTransports() {
   }
   this->numQpPerPe = numQpPerPe;
 
-  int sdmaNumChannels = anvil::GetSdmaNumChannels();
-  MORI_APP_INFO("SDMA num channels per GPU pair: {}", sdmaNumChannels);
-
   // ──────────────────────────────────────────────────────────────────────
   // Pure capability discovery. No policy (env vars), no side-effecting
   // setup (anvil.init / connect / EnablePeerAccess). All env-driven
   // decisions and the SDMA queue wiring happen later, when something
   // actually needs them: BuildInitialEndpoints() for SHMEM, or
   // EnsureSdmaTransport() on demand for CCO.
+  //
+  // Note on canSDMA: mori currently has no true hardware probe for SDMA
+  // engine presence (anvil::GetSdmaNumChannels reads MORI_SDMA_NUM_CHANNELS
+  // env or returns default 2, regardless of hardware). The honest
+  // capability statement is therefore just "intra-node peer reachable —
+  // SDMA *might* work". The actual hardware check happens implicitly in
+  // EnsureSdmaTransport() when anvil.init() / anvil.connect() is invoked.
+  // A future probe-based check would refine canSDMA without changing
+  // the API surface.
   // ──────────────────────────────────────────────────────────────────────
   peerCaps.resize(WorldSize());
   for (int i = 0; i < WorldSize(); i++) {
@@ -257,15 +263,15 @@ void Context::InitializeTopologyAndTransports() {
     cap.sameHost = peerInfos[i].sameHost;
     cap.sameProcess = peerInfos[i].sameProcess;
 
-    // Hardware capabilities (objective):
+    // Hardware capabilities (objective, env-var-free):
     //  - canP2P : sameHost (we assume HIP peer-access is enabled; TODO:
     //             cross-check with TopoSystemGpu BDF info)
-    //  - canSDMA: sameHost AND the SDMA hardware reports ≥1 channel
+    //  - canSDMA: sameHost (anvil hardware probe is TODO; see comment above)
     //  - canRDMA: NIC is present (works for both same-host loopback and
     //             cross-node; lets FULL-style policies allocate NIC QPs
     //             even to intra-node peers)
     cap.canP2P  = cap.sameHost;
-    cap.canSDMA = cap.sameHost && (sdmaNumChannels > 0);
+    cap.canSDMA = cap.sameHost;
     cap.canRDMA = (rdmaDeviceContext.get() != nullptr);
 
     // Lazy-initialize savedEpConfig the first time we see a peer that *could*
@@ -331,14 +337,16 @@ void Context::EnsureSdmaTransport() {
   if (sdmaSetupDone) return;
 
   // anvil global init: do it lazily here rather than at Context construction
-  // so processes that never touch SDMA don't pay for it.
+  // so processes that never touch SDMA don't pay for it. This is also where
+  // a true hardware probe will fail loudly if the GPU doesn't actually have
+  // SDMA engines — see PeerCapabilities doc for context.
   anvil::anvil.init();
 
+  // GetSdmaNumChannels is a configuration knob (env or default 2), not a
+  // hardware probe. The real check is whether the loop body below succeeds
+  // for every canSDMA peer.
   int sdmaNumChannels = anvil::GetSdmaNumChannels();
-  if (sdmaNumChannels <= 0) {
-    sdmaSetupDone = true;  // nothing to do; remember so we don't retry
-    return;
-  }
+  MORI_APP_INFO("SDMA num channels per GPU pair: {}", sdmaNumChannels);
 
   for (int i = 0; i < WorldSize(); i++) {
     if (!peerCaps[i].canSDMA) continue;
