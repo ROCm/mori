@@ -30,6 +30,8 @@ class AllGatherResult(NamedTuple):
     # 1D flattened version of `param_all_gather_input_numels` saved to avoid
     # CPU overhead from recomputing
     all_gather_input_split_sizes: list[int]
+    # Whether the output tensor can be directly used as the parameter buffer.
+    all_gather_no_copy: bool = False
 
 
 lib = torch.library.Library("fsdp", "FRAGMENT")  # noqa: TOR901
@@ -285,6 +287,7 @@ def foreach_all_gather(
             param_all_gather_input_dtypes,
             param_all_gather_input_numels,
             inp_split_sizes,
+            getattr(all_gather_comm, "supports_no_copy", False),
         )
 
 
@@ -346,14 +349,12 @@ def foreach_all_gather_copy_out(
     fsdp_params: list[FSDPParam],
     group: dist.ProcessGroup,
 ) -> None:
-    (
-        all_gather_output,
-        all_gather_event,
-        all_gather_work,
-        param_all_gather_input_dtypes,
-        param_all_gather_input_numels,
-        all_gather_input_split_sizes,
-    ) = all_gather_result
+    all_gather_output = all_gather_result.all_gather_output
+    all_gather_event = all_gather_result.all_gather_event
+    all_gather_work = all_gather_result.all_gather_work
+    param_all_gather_input_dtypes = all_gather_result.param_all_gather_input_dtypes
+    param_all_gather_input_numels = all_gather_result.param_all_gather_input_numels
+    all_gather_input_split_sizes = all_gather_result.all_gather_input_split_sizes
     _dtype, device = all_gather_output.dtype, all_gather_output.device
     device_handle = _get_device_handle(device.type)
     if all_gather_event is not None:  # sync op
@@ -363,6 +364,9 @@ def foreach_all_gather_copy_out(
     elif all_gather_work is not None:
         all_gather_work.wait()
     world_size, device = group.size(), all_gather_output.device
+
+    if _try_no_copy_all_gather_output(all_gather_result, fsdp_params, world_size):
+        return
 
     split_with_sizes_out: list[torch.Tensor] = []
     shard_i_copy_infos: list[tuple[FSDPParam, list[torch.Tensor]]] = []
@@ -442,6 +446,66 @@ def foreach_all_gather_copy_out(
                 post_param_size[shard_dim] *= world_size
                 cat_out = target_all_gather_output.view(post_param_size)
                 torch.cat(chunks, dim=shard_dim, out=cat_out)
+
+
+def _try_no_copy_all_gather_output(
+    all_gather_result: AllGatherResult,
+    fsdp_params: list[FSDPParam],
+    world_size: int,
+) -> bool:
+    if not all_gather_result.all_gather_no_copy or compiled_autograd_enabled():
+        return False
+    if len(fsdp_params) != 1:
+        return False
+
+    fsdp_param = fsdp_params[0]
+    if fsdp_param.fsdp_placement.dim != 0:
+        return False
+    if fsdp_param.is_dtensor:
+        return False
+    if hasattr(fsdp_param._sharded_local_tensor, "fsdp_post_all_gather"):
+        return False
+    if len(all_gather_result.param_all_gather_input_numels) != 1:
+        return False
+    if len(all_gather_result.param_all_gather_input_dtypes) != 1:
+        return False
+    if len(all_gather_result.all_gather_input_split_sizes) != 1:
+        return False
+
+    input_numels = all_gather_result.param_all_gather_input_numels[0]
+    input_dtypes = all_gather_result.param_all_gather_input_dtypes[0]
+    if len(input_numels) != 1 or len(input_dtypes) != 1:
+        return False
+
+    all_gather_output = all_gather_result.all_gather_output
+    expected_numel = input_numels[0] * world_size
+    if all_gather_output.numel() != expected_numel:
+        return False
+    if all_gather_output.dtype != input_dtypes[0]:
+        return False
+
+    existing_outputs = fsdp_param.all_gather_outputs
+    if hasattr(fsdp_param, "_unsharded_param"):
+        if not existing_outputs:
+            raise RuntimeError(
+                "MORI FSDP no-copy allgather expected a stable output buffer "
+                "after the unsharded parameter was initialized"
+            )
+        existing = existing_outputs[0]
+        if (
+            existing.data_ptr() != all_gather_output.data_ptr()
+            or existing.numel() != all_gather_output.numel()
+            or existing.dtype != all_gather_output.dtype
+        ):
+            raise RuntimeError(
+                "MORI FSDP no-copy allgather output buffer changed after the "
+                "unsharded parameter was initialized. Use a fixed per-layer "
+                "output size or disable no-copy for this parameter group."
+            )
+
+    fsdp_param._keep_all_gather_output_storage = True
+    fsdp_param.all_gather_outputs = [all_gather_output]
+    return True
 
 
 @torch.no_grad()

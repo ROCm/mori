@@ -27,6 +27,8 @@ class _MoriSdmaAllGatherWork:
 
 
 class MoriSdmaAllGather(AllGather):
+    supports_no_copy = True
+
     def __init__(self) -> None:
         self._collective: Optional[Any] = None
         self._rank: Optional[int] = None

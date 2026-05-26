@@ -244,6 +244,7 @@ class FSDPParam:
             self._init_sharded_post_forward_param_metadata(param)
         self._init_extensions()
         self.all_gather_outputs: list[torch.Tensor] = []
+        self._keep_all_gather_output_storage = False
         self.unsharded_accumulated_grad = None
         self._param_fqn: Optional[str] = None  # prefixed from root module
         # TODO: Remove this padding logic once DTensor pads the local tensor:
@@ -442,6 +443,7 @@ class FSDPParam:
     ):
         if not force_recreate and len(self.all_gather_outputs) > 0:
             return  # already initialized
+        self._keep_all_gather_output_storage = False
         self.all_gather_outputs = [
             torch.empty(torch.Size([numel * world_size]), dtype=dtype, device=device)
             for numel, dtype in zip(all_gather_input_numels, all_gather_input_dtypes)
@@ -666,9 +668,8 @@ class FSDPParam:
             self.all_gather_outputs = []
             self._unsharded_inner_tensors = []
         else:
-            for tensor in itertools.chain(
-                self.all_gather_outputs, self._unsharded_inner_tensors
-            ):
+            outputs = () if self._keep_all_gather_output_storage else self.all_gather_outputs
+            for tensor in itertools.chain(outputs, self._unsharded_inner_tensors):
                 free_storage(tensor)
 
     @property
