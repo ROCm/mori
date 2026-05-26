@@ -113,6 +113,62 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
   }
   printf("[rank %d] DevComm independence verified\n", rank);
 
+  // ── GDA connection mode verification (NONE / FULL / RAIL) ──
+  // Re-issues DevCommCreate with each non-default connType and counts the
+  // QPs that ended up non-zero in ibgda.endpoints. Expected on a uniform
+  // N-nodes × lsaSize layout:
+  //   NONE : 0
+  //   FULL : (worldSize - 1) * qpsPerPe
+  //   RAIL : (nNodes - 1) * qpsPerPe   (collapses to 0 on single-node)
+  {
+    auto countQps = [&](mori::cco::CcoDevComm* dc) -> int {
+      mori::cco::CcoDevComm h;
+      HIP_CHECK(hipMemcpy(&h, dc, sizeof(h), hipMemcpyDeviceToHost));
+      if (!h.ibgda.endpoints || h.ibgda.numQpPerPe == 0) return 0;
+      size_t n = static_cast<size_t>(h.worldSize) * h.ibgda.numQpPerPe;
+      std::vector<mori::shmem::ShmemRdmaEndpoint> eps(n);
+      HIP_CHECK(hipMemcpy(eps.data(), h.ibgda.endpoints, n * sizeof(eps[0]),
+                          hipMemcpyDeviceToHost));
+      int c = 0;
+      for (auto& ep : eps) if (ep.qpn != 0) c++;
+      return c;
+    };
+    auto mkReqs = [](mori::cco::CcoGdaConnectionType ct) {
+      mori::cco::CcoDevCommRequirements r = CCO_DEV_COMM_REQUIREMENTS_INITIALIZER;
+      r.gdaConnectionType = ct;
+      return r;
+    };
+    mori::cco::CcoDevComm *dcNone = nullptr, *dcFull = nullptr, *dcRail = nullptr;
+    auto rNone = mkReqs(mori::cco::CCO_GDA_CONNECTION_NONE);
+    auto rFull = mkReqs(mori::cco::CCO_GDA_CONNECTION_FULL);
+    auto rRail = mkReqs(mori::cco::CCO_GDA_CONNECTION_RAIL);
+    const int qpsPerPe = rFull.gdaContextCount;
+    if (mori::cco::CcoDevCommCreate(comm, &rNone, &dcNone) != 0 ||
+        mori::cco::CcoDevCommCreate(comm, &rFull, &dcFull) != 0 ||
+        mori::cco::CcoDevCommCreate(comm, &rRail, &dcRail) != 0) {
+      fprintf(stderr, "[rank %d] connType DevCommCreate failed\n", rank);
+      return 1;
+    }
+    const int nNodes = dc1Host.worldSize / dc1Host.lsaSize;
+    const int qNone = countQps(dcNone);
+    const int qFull = countQps(dcFull);
+    const int qRail = countQps(dcRail);
+    const int eFull = (dc1Host.worldSize - 1) * qpsPerPe;
+    const int eRail = (nNodes - 1) * qpsPerPe;
+    if (qNone != 0 || qFull != eFull || qRail != eRail) {
+      fprintf(stderr,
+              "[rank %d] connType MISMATCH: NONE got=%d exp=0, FULL got=%d exp=%d, "
+              "RAIL got=%d exp=%d (nNodes=%d qpsPerPe=%d)\n",
+              rank, qNone, qFull, eFull, qRail, eRail, nNodes, qpsPerPe);
+      return 1;
+    }
+    printf("[rank %d] connType OK: NONE=0 FULL=%d RAIL=%d (nNodes=%d qpsPerPe=%d)\n",
+           rank, qFull, qRail, nNodes, qpsPerPe);
+    mori::cco::CcoDevCommDestroy(comm, dcRail);
+    mori::cco::CcoDevCommDestroy(comm, dcFull);
+    mori::cco::CcoDevCommDestroy(comm, dcNone);
+  }
+
   // P2P cross-read via flat addressing — LSA peers only (intra-node).
   mori::cco::CcoWindowDevice winHost;
   HIP_CHECK(hipMemcpy(&winHost, win, sizeof(winHost), hipMemcpyDeviceToHost));
