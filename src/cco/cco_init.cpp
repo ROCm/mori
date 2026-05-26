@@ -629,60 +629,9 @@ int CcoWindowRegister(CcoComm* comm, void* ptr, size_t size, CcoWindow_t* outWin
   peerRkeys_host[rank] = localRkey;
   comm->bootNet->Allgather(&localRkey, peerRkeys_host, sizeof(uint32_t));
 
-  // SDMA signals — intra-node only, sized lsaSize × sdmaNumQueue. The IPC
-  // handle Allgather still spans worldSize (avoids a second bootstrap); we
-  // only open the LSA peers' handles into the lsa-sized peerSignalPtrs.
-  int sdmaNumQueue = comm->sdmaNumQueue;
-  size_t signalArraySize = static_cast<size_t>(comm->lsaSize) * sdmaNumQueue * sizeof(HSAuint64);
-
-  HSAuint64* signalPtrs = nullptr;
-  HSAuint64* expectSignalsPtr = nullptr;
-  HSAuint64** peerSignalPtrs_host_arr = nullptr;
-  HSAuint64** peerSignalPtrs_gpu = nullptr;
-
-  // Materialize SDMA signals only if the user opted in (policy) AND at least
-  // one peer is SDMA-capable (hardware).
-  bool hasSdmaPeers = false;
-  if (comm->ctx->IsSdmaEnabled()) {
-    for (int pe = 0; pe < worldSize; pe++) {
-      if (comm->ctx->GetPeerCapabilities(pe).canSDMA) {
-        hasSdmaPeers = true;
-        break;
-      }
-    }
-  }
-
-  if (hasSdmaPeers && sdmaNumQueue > 0) {
-    HIP_RUNTIME_CHECK(hipMalloc(&signalPtrs, signalArraySize));
-    HIP_RUNTIME_CHECK(hipMemset(signalPtrs, 0, signalArraySize));
-    HIP_RUNTIME_CHECK(hipMalloc(&expectSignalsPtr, signalArraySize));
-    HIP_RUNTIME_CHECK(hipMemset(expectSignalsPtr, 0, signalArraySize));
-
-    hipIpcMemHandle_t signalHandle;
-    HIP_RUNTIME_CHECK(hipIpcGetMemHandle(&signalHandle, signalPtrs));
-
-    auto* signalHandles =
-        static_cast<hipIpcMemHandle_t*>(calloc(worldSize, sizeof(hipIpcMemHandle_t)));
-    comm->bootNet->Allgather(&signalHandle, signalHandles, sizeof(hipIpcMemHandle_t));
-
-    peerSignalPtrs_host_arr =
-        static_cast<HSAuint64**>(calloc(comm->lsaSize, sizeof(HSAuint64*)));
-    peerSignalPtrs_host_arr[comm->lsaRank] = signalPtrs;
-    for (int lsa = 0; lsa < comm->lsaSize; lsa++) {
-      if (lsa == comm->lsaRank) continue;
-      int pe = comm->myNodeStart + lsa;
-      if (!comm->ctx->GetPeerCapabilities(pe).canSDMA) continue;
-      void* mapped = nullptr;
-      HIP_RUNTIME_CHECK(
-          hipIpcOpenMemHandle(&mapped, signalHandles[pe], hipIpcMemLazyEnablePeerAccess));
-      peerSignalPtrs_host_arr[lsa] = reinterpret_cast<HSAuint64*>(mapped);
-    }
-
-    HIP_RUNTIME_CHECK(hipMalloc(&peerSignalPtrs_gpu, sizeof(HSAuint64*) * comm->lsaSize));
-    HIP_RUNTIME_CHECK(hipMemcpy(peerSignalPtrs_gpu, peerSignalPtrs_host_arr,
-                                sizeof(HSAuint64*) * comm->lsaSize, hipMemcpyHostToDevice));
-    free(signalHandles);
-  }
+  // SDMA signal pool is per-DevComm, materialized by CcoDevCommCreate.
+  // WindowRegister no longer allocates SDMA state — kernels look up signals
+  // via devComm->sdma.
 
   uint32_t* peerRkeys_gpu = nullptr;
   HIP_RUNTIME_CHECK(hipMalloc(&peerRkeys_gpu, sizeof(uint32_t) * worldSize));
@@ -695,11 +644,6 @@ int CcoWindowRegister(CcoComm* comm, void* ptr, size_t size, CcoWindow_t* outWin
   hostShadow.lsaRank = comm->lsaRank;
   hostShadow.ibgdaWin.peerRkeys = peerRkeys_gpu;
   hostShadow.ibgdaWin.lkey = lkey;
-  hostShadow.deviceHandles_d = comm->sdmaDevHandles;
-  hostShadow.signalPtrs = signalPtrs;
-  hostShadow.expectSignalsPtr = expectSignalsPtr;
-  hostShadow.peerSignalPtrs = peerSignalPtrs_gpu;
-  hostShadow.sdmaNumQueue = static_cast<uint32_t>(sdmaNumQueue);
 
   CcoWindowDevice* devPtr = nullptr;
   HIP_RUNTIME_CHECK(hipMalloc(&devPtr, sizeof(CcoWindowDevice)));
@@ -716,12 +660,8 @@ int CcoWindowRegister(CcoComm* comm, void* ptr, size_t size, CcoWindow_t* outWin
   auto* wh = new CcoWindowHost();
   wh->localPtr = localPtr;
   wh->size = size;
-  wh->signalPtrs = signalPtrs;
-  wh->expectSignalsPtr = expectSignalsPtr;
-  wh->peerSignalPtrs = peerSignalPtrs_host_arr;
   wh->devPtr = devPtr;
   wh->peerRkeys_gpu = peerRkeys_gpu;
-  wh->peerSignalPtrs_gpu = peerSignalPtrs_gpu;
   comm->windows.push_back(wh);
 
   *outWin = devPtr;
@@ -738,12 +678,6 @@ int CcoWindowRegister(CcoComm* comm, void* ptr, size_t size, CcoWindow_t* outWin
     if (pe >= comm->myNodeStart && pe < comm->myNodeStart + comm->lsaSize) continue;
     MORI_SHMEM_INFO("  XNODE PE {}: rkey={} (RDMA via iova=0)", pe, peerRkeys_host[pe]);
   }
-  if (signalPtrs) {
-    MORI_SHMEM_INFO("  SDMA: signalPtrs={} expectSignals={} numQueue={}",
-                    (void*)signalPtrs, (void*)expectSignalsPtr, sdmaNumQueue);
-  }
-  MORI_SHMEM_INFO("  deviceHandles_d={}", (void*)comm->sdmaDevHandles);
-
   free(peerRkeys_host);
 
   return 0;
@@ -815,12 +749,7 @@ int CcoWindowDeregister(CcoComm* comm, CcoWindow_t win) {
   if (rdmaDevCtx) rdmaDevCtx->DeregisterRdmaMemoryRegion(wh->localPtr);
 
   if (wh->peerRkeys_gpu) HIP_RUNTIME_CHECK(hipFree(wh->peerRkeys_gpu));
-  if (wh->signalPtrs) HIP_RUNTIME_CHECK(hipFree(wh->signalPtrs));
-  if (wh->expectSignalsPtr) HIP_RUNTIME_CHECK(hipFree(wh->expectSignalsPtr));
-  if (wh->peerSignalPtrs_gpu) HIP_RUNTIME_CHECK(hipFree(wh->peerSignalPtrs_gpu));
   if (wh->devPtr) HIP_RUNTIME_CHECK(hipFree(wh->devPtr));
-
-  free(wh->peerSignalPtrs);
 
   comm->windows.erase(comm->windows.begin() + idx);
   delete wh;
@@ -942,6 +871,53 @@ int CcoDevCommCreate(CcoComm* comm,
   MORI_SHMEM_TRACE("CcoDevCommCreate: windowTable with {} windows in {} nodes", numWindows,
                    numNodes);
 
+  // SDMA signal pool (per-DevComm). Materialized only if comm-level SDMA
+  // queues are up. Pool: [lsaSize × sdmaNumQueue × uint64], shared by all
+  // windows. Kernels index via devComm->sdma.signalBuf[lsaPeer * sdmaNumQueue + qId].
+  CcoSdmaContext& sdma = hostShadow.sdma;
+  sdma.sdmaNumQueue = static_cast<uint32_t>(comm->sdmaNumQueue);
+  if (comm->sdmaNumQueue > 0) {
+    size_t poolBytes =
+        static_cast<size_t>(comm->lsaSize) * comm->sdmaNumQueue * sizeof(HSAuint64);
+    HIP_RUNTIME_CHECK(hipMalloc(&sdma.signalBuf, poolBytes));
+    HIP_RUNTIME_CHECK(hipMemset(sdma.signalBuf, 0, poolBytes));
+    HIP_RUNTIME_CHECK(hipMalloc(&sdma.expectSignals, poolBytes));
+    HIP_RUNTIME_CHECK(hipMemset(sdma.expectSignals, 0, poolBytes));
+
+    // Single Allgather of IPC handle for the whole pool (not per-window).
+    hipIpcMemHandle_t myHandle;
+    HIP_RUNTIME_CHECK(hipIpcGetMemHandle(&myHandle, sdma.signalBuf));
+    auto* handles = static_cast<hipIpcMemHandle_t*>(
+        calloc(comm->worldSize, sizeof(hipIpcMemHandle_t)));
+    comm->bootNet->Allgather(&myHandle, handles, sizeof(hipIpcMemHandle_t));
+
+    auto* peerPtrs_host =
+        static_cast<HSAuint64**>(calloc(comm->lsaSize, sizeof(HSAuint64*)));
+    peerPtrs_host[comm->lsaRank] = sdma.signalBuf;
+    for (int lsa = 0; lsa < comm->lsaSize; lsa++) {
+      if (lsa == comm->lsaRank) continue;
+      int pe = comm->myNodeStart + lsa;
+      if (!comm->ctx->GetPeerCapabilities(pe).canSDMA) continue;
+      void* mapped = nullptr;
+      HIP_RUNTIME_CHECK(
+          hipIpcOpenMemHandle(&mapped, handles[pe], hipIpcMemLazyEnablePeerAccess));
+      peerPtrs_host[lsa] = reinterpret_cast<HSAuint64*>(mapped);
+    }
+    HIP_RUNTIME_CHECK(
+        hipMalloc(&sdma.peerSignalPtrs, sizeof(HSAuint64*) * comm->lsaSize));
+    HIP_RUNTIME_CHECK(hipMemcpy(sdma.peerSignalPtrs, peerPtrs_host,
+                                sizeof(HSAuint64*) * comm->lsaSize,
+                                hipMemcpyHostToDevice));
+    free(peerPtrs_host);
+    free(handles);
+
+    sdma.deviceHandles = comm->sdmaDevHandles;
+    MORI_SHMEM_TRACE("CcoDevCommCreate: SDMA pool signalBuf={} expectSignals={} "
+                     "peerSignalPtrs={} numQueue={}",
+                     (void*)sdma.signalBuf, (void*)sdma.expectSignals,
+                     (void*)sdma.peerSignalPtrs, sdma.sdmaNumQueue);
+  }
+
   // Signal + counter buffers (skipped when GDA is disabled).
   int signalCount = (connType == CCO_GDA_CONNECTION_NONE) ? 0 : reqs->gdaSignalCount;
   int counterCount = (connType == CCO_GDA_CONNECTION_NONE) ? 0 : reqs->gdaCounterCount;
@@ -1024,6 +1000,25 @@ int CcoDevCommDestroy(CcoDevComm* devComm) {
   if (ibgda.signalShadows) HIP_RUNTIME_CHECK(hipFree(ibgda.signalShadows));
   if (ibgda.counterBuf) HIP_RUNTIME_CHECK(hipFree(ibgda.counterBuf));
   if (ibgda.peerSignalRkeys) HIP_RUNTIME_CHECK(hipFree(ibgda.peerSignalRkeys));
+
+  // SDMA pool cleanup. peerSignalPtrs is GPU array of host-mapped peer ptrs;
+  // we need to close the IPC mappings before freeing the array.
+  auto& sdma = hostShadow.sdma;
+  if (sdma.peerSignalPtrs) {
+    std::vector<HSAuint64*> peerPtrs_host(hostShadow.lsaSize, nullptr);
+    HIP_RUNTIME_CHECK(hipMemcpy(peerPtrs_host.data(), sdma.peerSignalPtrs,
+                                sizeof(HSAuint64*) * hostShadow.lsaSize,
+                                hipMemcpyDeviceToHost));
+    for (int lsa = 0; lsa < hostShadow.lsaSize; lsa++) {
+      if (lsa == hostShadow.lsaRank) continue;
+      if (peerPtrs_host[lsa]) {
+        (void)hipIpcCloseMemHandle(peerPtrs_host[lsa]);
+      }
+    }
+    HIP_RUNTIME_CHECK(hipFree(sdma.peerSignalPtrs));
+  }
+  if (sdma.signalBuf) HIP_RUNTIME_CHECK(hipFree(sdma.signalBuf));
+  if (sdma.expectSignals) HIP_RUNTIME_CHECK(hipFree(sdma.expectSignals));
 
   CcoWindowTableNode* node = hostShadow.windowTable;
   while (node) {

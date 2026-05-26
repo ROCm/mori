@@ -81,6 +81,16 @@ struct CcoIbgdaContext {
   uint64_t* counterBuf;        // [counterCount]
 };
 
+// SDMA context: per-DevComm signal pool + IPC-mapped peer pointers.
+// Empty when SDMA is not used by this DevComm.
+struct CcoSdmaContext {
+  uint32_t sdmaNumQueue;                            // 0 when SDMA disabled
+  anvil::SdmaQueueDeviceHandle** deviceHandles;     // [lsaSize * sdmaNumQueue], shared from comm
+  HSAuint64* signalBuf;                             // [lsaSize * sdmaNumQueue], local pool
+  HSAuint64* expectSignals;                         // [lsaSize * sdmaNumQueue], local
+  HSAuint64** peerSignalPtrs;                       // [lsaSize], peer signalBuf via IPC
+};
+
 struct CcoDevComm {
   // World / topology
   int rank;
@@ -100,6 +110,8 @@ struct CcoDevComm {
 
   // IBGDA context (QP + signal + counter); empty when gdaConnType==NONE.
   CcoIbgdaContext ibgda;
+  // SDMA context (signal pool); empty when SDMA not materialized.
+  CcoSdmaContext sdma;
 };
 typedef CcoDevComm* CcoDevComm_t;
 
@@ -125,12 +137,8 @@ struct CcoWindowDevice {
   // GDA / IBGDA (iova=0). raddr=dstOff, laddr=srcOff, rkey=peerRkeys[worldRank].
   CcoIbgdaWin ibgdaWin;
 
-  // SDMA signals (intra-node only, indexed by LSA rank).
-  anvil::SdmaQueueDeviceHandle** deviceHandles_d;   // per-comm shared
-  HSAuint64* signalPtrs;                             // [lsaSize * sdmaNumQueue]
-  HSAuint64* expectSignalsPtr;                       // [lsaSize * sdmaNumQueue]
-  HSAuint64** peerSignalPtrs;                        // [lsaSize]
-  uint32_t sdmaNumQueue;
+  // SDMA signal pool lives on CcoDevComm::sdma (per-DevComm, not per-window).
+  // Kernels consume signals via devComm->sdma.signalBuf indexed by (lsaPeer, queueId).
 };
 typedef CcoWindowDevice* CcoWindow_t;
 
@@ -208,12 +216,8 @@ struct CcoDevCommRequirements {
 struct CcoWindowHost {
   void* localPtr;
   size_t size;
-  HSAuint64* signalPtrs;
-  HSAuint64* expectSignalsPtr;
-  HSAuint64** peerSignalPtrs;
   CcoWindowDevice* devPtr;
   uint32_t* peerRkeys_gpu;
-  HSAuint64** peerSignalPtrs_gpu;
 };
 
 struct CcoComm {
