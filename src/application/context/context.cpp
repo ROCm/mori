@@ -59,6 +59,22 @@ Context::Context(BootstrapNetwork& bootNet) : bootNet(bootNet) {
 
 void Context::BuildInitialEndpoints() {
   if (initialEndpointsBuilt) return;
+
+  // (A) Apply default policy: cap + env vars → one TransportType per peer.
+  //     Populates transportTypes[] which SHMEM consumes via GetTransportType[s].
+  transportTypes.clear();
+  transportTypes.reserve(WorldSize());
+  bool anyNeedsSdma = false;
+  for (int i = 0; i < WorldSize(); i++) {
+    TransportType t = DefaultPolicyResolve(peerCaps[i], /*isSelf=*/i == LocalRank());
+    transportTypes.push_back(t);
+    if (t == TransportType::SDMA) anyNeedsSdma = true;
+  }
+
+  // (B) Materialize SDMA queues if any peer resolved to SDMA.
+  if (anyNeedsSdma) EnsureSdmaTransport();
+
+  // (C) Build & connect the initial QP set (worldSize × numQpPerPe).
   BuildAndConnectInitialEndpoints();
   initialEndpointsBuilt = true;
 }
@@ -224,114 +240,112 @@ void Context::InitializeTopologyAndTransports() {
     numQpPerPe = std::max(1, std::atoi(envNumQp));  // ensure at least 1 QP
   }
   this->numQpPerPe = numQpPerPe;
-  // Initialize transport
-  int peerRankInNode = -1;
-  if (!IsP2PDisabled() && IsSdmaEnabled()) anvil::anvil.init();
 
   int sdmaNumChannels = anvil::GetSdmaNumChannels();
   MORI_APP_INFO("SDMA num channels per GPU pair: {}", sdmaNumChannels);
 
-  // Per-peer loop, split into two phases:
-  //
-  //   (A) Capability discovery: fill peerCaps[i] purely from environment +
-  //       NIC presence. No "we picked X" decision. This is what CCO consults
-  //       to apply its own policy (gdaConnectionType FULL/CROSSNODE/RAIL).
-  //
-  //   (B) Default-policy resolve: call DefaultPolicyResolve(cap) to derive a
-  //       single transportTypes[i]. This is what SHMEM's GpuStates copy step
-  //       reads, so its DISPATCH_TRANSPORT_TYPE macro keeps working.
-  //
-  // Side effects (anvil queue setup, savedEpConfig lazy init) happen in (A)
-  // because they depend on the discovered capability, not on the policy.
+  // ──────────────────────────────────────────────────────────────────────
+  // Pure capability discovery. No policy (env vars), no side-effecting
+  // setup (anvil.init / connect / EnablePeerAccess). All env-driven
+  // decisions and the SDMA queue wiring happen later, when something
+  // actually needs them: BuildInitialEndpoints() for SHMEM, or
+  // EnsureSdmaTransport() on demand for CCO.
+  // ──────────────────────────────────────────────────────────────────────
   peerCaps.resize(WorldSize());
   for (int i = 0; i < WorldSize(); i++) {
     PeerCapabilities& cap = peerCaps[i];
     cap.sameHost = peerInfos[i].sameHost;
     cap.sameProcess = peerInfos[i].sameProcess;
 
-    // ── (A.1) intra-node capabilities ──
-    if (!IsP2PDisabled() && cap.sameHost) {
-      peerRankInNode++;
-      // TODO: should use TopoSystemGpu to determine if peer access is enabled,
-      // but that requires exchanging gpu bdf id, hence for simplicity we
-      // assume peer access is enabled.
-      const bool canAccessPeer = true;
+    // Hardware capabilities (objective):
+    //  - canP2P : sameHost (we assume HIP peer-access is enabled; TODO:
+    //             cross-check with TopoSystemGpu BDF info)
+    //  - canSDMA: sameHost AND the SDMA hardware reports ≥1 channel
+    //  - canRDMA: NIC is present (works for both same-host loopback and
+    //             cross-node; lets FULL-style policies allocate NIC QPs
+    //             even to intra-node peers)
+    cap.canP2P  = cap.sameHost;
+    cap.canSDMA = cap.sameHost && (sdmaNumChannels > 0);
+    cap.canRDMA = (rdmaDeviceContext.get() != nullptr);
 
-      if (i == LocalRank() || canAccessPeer) {
-        if (IsSdmaEnabled()) {
-          // Same-host with SDMA enabled: also wire up the anvil queues now,
-          // because SHMEM's default policy resolver picks SDMA over P2P and
-          // expects the queues already exist.
-          cap.canSDMA = true;
-          if (i != LocalRank()) {
-            anvil::EnablePeerAccess(LocalRank() % 8, i % 8);
-          }
-          anvil::anvil.connect(LocalRank() % 8, i % 8, sdmaNumChannels);
-        } else {
-          cap.canP2P = true;
-        }
-      }
-    } else if (IsP2PDisabled() && i == LocalRank()) {
-      // Self-loop always reachable via "P2P" semantics even with P2P disabled.
-      cap.canP2P = true;
+    // Lazy-initialize savedEpConfig the first time we see a peer that *could*
+    // need an RDMA endpoint. It's just a config snapshot, no QP created.
+    if (cap.canRDMA && savedPortId < 0) {
+      savedPortId = portId;
+      savedEpConfig.portId = portId;
+      savedEpConfig.gidIdx = -1;
+      const char* envGidIdx = std::getenv("MORI_IB_GID_INDEX");
+      if (envGidIdx != nullptr) savedEpConfig.gidIdx = std::atoi(envGidIdx);
+      savedEpConfig.maxMsgsNum = 4096;
+      uint32_t vid = rdmaDeviceContext->GetRdmaDevice()->GetDeviceAttr()->orig_attr.vendor_id;
+      savedEpConfig.maxCqeNum =
+          (vid == static_cast<uint32_t>(RdmaDeviceVendorId::Broadcom)) ? 1 : 4096;
+      savedEpConfig.alignment = 4096;
+      savedEpConfig.onGpu = true;
     }
-
-    // ── (A.2) cross-node capability ──
-    //
-    // Cross-node peers require an RDMA NIC. If we have no NIC and we have a
-    // cross-node peer, we still mark canRDMA=false and let the policy layer
-    // (DefaultPolicyResolve or CCO's resolver) decide whether to assert or
-    // gracefully report "no transport".
-    const bool isCrossNode = !cap.sameHost;
-    const bool needsRdma = isCrossNode || (IsP2PDisabled() && i != LocalRank());
-    if (needsRdma && rdmaDeviceContext.get() != nullptr) {
-      cap.canRDMA = true;
-      // Lazy-initialize the EP config the first time we encounter a peer
-      // that would need an RDMA endpoint.
-      if (savedPortId < 0) {
-        savedPortId = portId;
-        savedEpConfig.portId = portId;
-        savedEpConfig.gidIdx = -1;
-        const char* envGidIdx = std::getenv("MORI_IB_GID_INDEX");
-        if (envGidIdx != nullptr) savedEpConfig.gidIdx = std::atoi(envGidIdx);
-        savedEpConfig.maxMsgsNum = 4096;
-        uint32_t vid = rdmaDeviceContext->GetRdmaDevice()->GetDeviceAttr()->orig_attr.vendor_id;
-        savedEpConfig.maxCqeNum =
-            (vid == static_cast<uint32_t>(RdmaDeviceVendorId::Broadcom)) ? 1 : 4096;
-        savedEpConfig.alignment = 4096;
-        savedEpConfig.onGpu = true;
-      }
-    }
-
-    // ── (B) default policy resolve ──
-    //
-    // Equivalent to the old per-peer if/else cascade. SHMEM and any caller
-    // of GetTransportType() / GetTransportTypes() sees the same behavior as
-    // before this refactor.
-    transportTypes.push_back(DefaultPolicyResolve(cap, /*isSelf=*/i == LocalRank()));
   }
+
+  // rankInNode bookkeeping (used by NIC selection above and as
+  // LocalRankInNode() accessor). Kept here so capability discovery still
+  // computes it as a derived fact.
+  // (already computed at the top of this function)
 }
 
 /* ------------------------------------------------------------------------ */
 /*                          Default policy resolver                         */
+/*                                                                          */
+/*  Combines objective capability with the env-var-driven user intent       */
+/*  cached on Context (sdmaEnabled, p2pDisabled) to pick one TransportType  */
+/*  per peer. This is the legacy "Context decided for you" behavior         */
+/*  consumed by SHMEM's DISPATCH_TRANSPORT_TYPE macro.                      */
 /* ------------------------------------------------------------------------ */
 
 TransportType Context::DefaultPolicyResolve(const PeerCapabilities& cap,
                                             bool isSelf) const {
-  // Self always uses the cheapest path (P2P semantics for local read/write).
-  // Among real peers: P2P first if available, then SDMA, then RDMA.
-  if (isSelf) {
-    // If SDMA is enabled, we have set canSDMA=true for self too (matches the
-    // pre-refactor behavior). Otherwise default to P2P.
-    return cap.canSDMA ? TransportType::SDMA : TransportType::P2P;
+  // Same-host preference order (matching legacy behavior):
+  //   1. SDMA if enabled by env AND hardware supports it
+  //   2. P2P if not disabled by env AND hardware supports it
+  //   3. fall through to RDMA (NIC loopback) — needed when both intra-node
+  //      transports are forbidden by env
+  if (isSelf || cap.sameHost) {
+    if (IsSdmaEnabled() && cap.canSDMA) return TransportType::SDMA;
+    if (!IsP2PDisabled() && cap.canP2P) return TransportType::P2P;
   }
-  if (cap.canSDMA) return TransportType::SDMA;
-  if (cap.canP2P) return TransportType::P2P;
+  // Cross-node, or same-host with both intra-node transports forbidden:
   if (cap.canRDMA) return TransportType::RDMA;
   // No transport available — historical behavior was to assert here. Keep it
   // so SHMEM's init still fails fast on misconfigured deployments.
   assert(false && "no transport available for peer");
   return TransportType::RDMA;  // unreachable
+}
+
+/* ------------------------------------------------------------------------ */
+/*                  Lazy SDMA queue setup (anvil)                           */
+/*                                                                          */
+/*  Walks peerCaps[] and wires up anvil queues + peer-access for every      */
+/*  peer with canSDMA. Idempotent; safe to call from any module that wants  */
+/*  SDMA queues materialized but did not go through BuildInitialEndpoints.  */
+/* ------------------------------------------------------------------------ */
+
+void Context::EnsureSdmaTransport() {
+  if (sdmaSetupDone) return;
+
+  // anvil global init: do it lazily here rather than at Context construction
+  // so processes that never touch SDMA don't pay for it.
+  anvil::anvil.init();
+
+  int sdmaNumChannels = anvil::GetSdmaNumChannels();
+  if (sdmaNumChannels <= 0) {
+    sdmaSetupDone = true;  // nothing to do; remember so we don't retry
+    return;
+  }
+
+  for (int i = 0; i < WorldSize(); i++) {
+    if (!peerCaps[i].canSDMA) continue;
+    if (i != LocalRank()) anvil::EnablePeerAccess(LocalRank() % 8, i % 8);
+    anvil::anvil.connect(LocalRank() % 8, i % 8, sdmaNumChannels);
+  }
+  sdmaSetupDone = true;
 }
 
 /* ------------------------------------------------------------------------ */

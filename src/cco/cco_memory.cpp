@@ -161,12 +161,20 @@ int CcoWindowRegister(CcoComm* comm, void* ptr, size_t size, CcoWindow_t* outWin
   HSAuint64** peerSignalPtrs_host_arr = nullptr;
   HSAuint64** peerSignalPtrs_gpu = nullptr;
 
-  // Only allocate SDMA signals if there are SDMA peers
+  // Allocate SDMA signals when both:
+  //   1. The user actually wants SDMA (MORI_ENABLE_SDMA env or future
+  //      per-DevComm reqs.sdmaQueueCount > 0 — Phase 2 will move this onto
+  //      the DevComm side); and
+  //   2. The hardware can do SDMA for at least one peer.
+  // capability AND policy — capability alone is not enough (single-node
+  // hardware always reports canSDMA, but the user may be running pure P2P).
   bool hasSdmaPeers = false;
-  for (int pe = 0; pe < worldSize; pe++) {
-    if (comm->ctx->GetTransportType(pe) == application::TransportType::SDMA) {
-      hasSdmaPeers = true;
-      break;
+  if (comm->ctx->IsSdmaEnabled()) {
+    for (int pe = 0; pe < worldSize; pe++) {
+      if (comm->ctx->GetPeerCapabilities(pe).canSDMA) {
+        hasSdmaPeers = true;
+        break;
+      }
     }
   }
 
@@ -187,7 +195,7 @@ int CcoWindowRegister(CcoComm* comm, void* ptr, size_t size, CcoWindow_t* outWin
     peerSignalPtrs_host_arr = static_cast<HSAuint64**>(calloc(worldSize, sizeof(HSAuint64*)));
     peerSignalPtrs_host_arr[rank] = signalPtrs;
     for (int pe = 0; pe < worldSize; pe++) {
-      if (comm->ctx->GetTransportType(pe) != application::TransportType::SDMA) continue;
+      if (!comm->ctx->GetPeerCapabilities(pe).canSDMA) continue;
       if (pe == rank) continue;
       void* mapped = nullptr;
       HIP_RUNTIME_CHECK(

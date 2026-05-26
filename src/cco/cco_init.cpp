@@ -51,16 +51,12 @@ int CcoCommCreate(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
   comm->defaultNumQpPerPe = comm->ctx->GetNumQpPerPe();
 
   // Step 2.5: detect intra-node topology (lsa = "local symmetric access").
-  // Use hipDeviceCanAccessPeer between rank 0's device and each other rank
-  // is not feasible cross-process — instead use the bootstrap to Allgather a
-  // "node identifier" (e.g. hostname hash or rank 0's pid) and group ranks
-  // that share the same identifier. We already gathered allPids above for
-  // groupId derivation; the same pid means same process tree but NOT same
-  // node when MPI launches one process per GPU.
   //
-  // Use Context::GetTransportType: any peer whose transport is P2P is on the
-  // same physical node (since P2P implies xGMI/NVLink access). Collect such
-  // peers and compute lsaSize/lsaRank/myNodeStart from the contiguous run.
+  // Consult Context's capability discovery directly (`PeerCapabilities.sameHost`)
+  // rather than inferring sameHost from Context's chosen transport. This way
+  // CCO stays correct even if env vars / policy decide that an intra-node peer
+  // should use RDMA (e.g. CCO_GDA_CONNECTION_FULL): the peer is still on the
+  // same node, lsa membership doesn't change.
   //
   // ASSUMPTION (matches mori shmem conventions): rank layout is contiguous
   // within each node — i.e. ranks 0..lsaSize-1 are on node 0,
@@ -70,11 +66,8 @@ int CcoCommCreate(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
     int firstSameNode = comm->rank;
     int lastSameNode = comm->rank;
     for (int pe = 0; pe < comm->worldSize; pe++) {
-      bool sameNode = (pe == comm->rank) ||
-                      (comm->ctx->GetTransportType(pe) ==
-                       application::TransportType::P2P) ||
-                      (comm->ctx->GetTransportType(pe) ==
-                       application::TransportType::SDMA);
+      const auto& cap = comm->ctx->GetPeerCapabilities(pe);
+      const bool sameNode = (pe == comm->rank) || cap.sameHost;
       if (sameNode) {
         if (pe < firstSameNode) firstSameNode = pe;
         if (pe > lastSameNode) lastSameNode = pe;
@@ -129,9 +122,23 @@ int CcoCommCreate(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
   MORI_SHMEM_TRACE("CcoCommCreate: flatBase={} totalVA={} granularity={}", comm->flatBase,
                    totalVaSize, granularity);
 
-  // Step 4: SDMA device handles (per-comm, shared across windows)
-  comm->sdmaNumQueue = anvil::GetSdmaNumChannels();
-  if (comm->sdmaNumQueue > 0) {
+  // Step 4: SDMA device handles (per-comm, shared across windows).
+  //
+  // capability AND policy: only materialize SDMA queues if the user opted in
+  // via MORI_ENABLE_SDMA (policy) and at least one peer has the SDMA hardware
+  // available (capability). Pure P2P deployments (the default) skip this
+  // entirely, leaving comm->sdmaNumQueue == 0.
+  bool anySdmaCapable = false;
+  for (int pe = 0; pe < comm->worldSize; pe++) {
+    if (comm->ctx->GetPeerCapabilities(pe).canSDMA) {
+      anySdmaCapable = true;
+      break;
+    }
+  }
+  if (comm->ctx->IsSdmaEnabled() && anySdmaCapable) {
+    comm->sdmaNumQueue = anvil::GetSdmaNumChannels();
+    comm->ctx->EnsureSdmaTransport();  // lazy anvil.init + connect + EnablePeerAccess
+
     int srcDeviceId = currentDev;
     size_t numSlots = static_cast<size_t>(comm->worldSize) * comm->sdmaNumQueue;
     HIP_RUNTIME_CHECK(
@@ -140,7 +147,7 @@ int CcoCommCreate(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
         hipMemset(comm->sdmaDevHandles, 0, numSlots * sizeof(anvil::SdmaQueueDeviceHandle*)));
 
     for (int pe = 0; pe < comm->worldSize; pe++) {
-      if (comm->ctx->GetTransportType(pe) != application::TransportType::SDMA) continue;
+      if (!comm->ctx->GetPeerCapabilities(pe).canSDMA) continue;
       int dstDeviceId = pe % 8;
       for (int q = 0; q < comm->sdmaNumQueue; q++) {
         auto* handle = anvil::anvil.getSdmaQueue(srcDeviceId, dstDeviceId, q)->deviceHandle();
@@ -149,6 +156,8 @@ int CcoCommCreate(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
             &handle, sizeof(handle), hipMemcpyHostToDevice));
       }
     }
+  } else {
+    comm->sdmaNumQueue = 0;  // canonicalize: SDMA not enabled ⇒ no queues
   }
 
   // Step 5: internal sync for device barriers

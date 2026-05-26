@@ -46,13 +46,19 @@ namespace application {
  *    gdaConnectionType chooses whether intra-node peers also get NIC QPs).
  * --------------------------------------------------------------------------- */
 struct PeerCapabilities {
+  // Objective hardware/topology facts only. NO policy / env-var influence.
+  // Env vars MORI_DISABLE_P2P / MORI_ENABLE_SDMA flip *policy* (which
+  // transport gets picked); they do not change capability — the hardware can
+  // still do P2P even if env var disables it. Use the policy layer
+  // (DefaultPolicyResolve or CCO's resolver) to combine cap + env intent.
   bool sameHost{false};     // peer is on the same physical node
   bool sameProcess{false};  // peer is in the same OS process (loopback IPC ok)
   bool canP2P{false};       // intra-node GPU peer access (xGMI / NVLink) reachable
-  bool canSDMA{false};      // intra-node SDMA (anvil) queue reachable
-  bool canRDMA{false};      // NIC reachable (always false for self / same-host
-                            //                when canP2P is preferred; true for
-                            //                cross-node when an NIC is present)
+  bool canSDMA{false};      // intra-node SDMA (anvil) hardware available
+  bool canRDMA{false};      // NIC reachable (true for any peer if an NIC is
+                            // present; the loopback case lets policies like
+                            // FULL connection allocate NIC QPs to intra-node
+                            // peers)
 };
 
 class Context {
@@ -113,7 +119,17 @@ class Context {
   // one AllToAll to exchange QP handles plus per-peer RTR/RTS transitions, so
   // it's heavy. Modules that don't need the initial set (e.g. CCO) can skip
   // this entirely and only use CreateAdditionalEndpoints later.
+  //
+  // Side effects: also applies Context's default policy to populate the
+  // transportTypes[] vector (consumed by GetTransportType[s]) and lazily
+  // initializes the SDMA queues if any peer was resolved to SDMA.
   void BuildInitialEndpoints();
+
+  // Idempotent setup of anvil SDMA queues for all canSDMA peers. Useful when
+  // SHMEM-style "BuildInitialEndpoints does it for me" is not in play — e.g.
+  // CCO chooses SDMA per-DevComm and needs the queues materialized on demand.
+  // No-op if already set up, or if no peer has canSDMA capability.
+  void EnsureSdmaTransport();
 
   // Create a new independent set of QP endpoints for RDMA peers (does NOT connect).
   std::vector<RdmaEndpoint> CreateAdditionalEndpoints(int numQpPerPe);
@@ -155,6 +171,7 @@ class Context {
 
   std::vector<RdmaEndpoint> rdmaEps;
   bool initialEndpointsBuilt{false};
+  bool sdmaSetupDone{false};
 
   std::unique_ptr<TopoSystem> topo{nullptr};
 
