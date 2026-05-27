@@ -451,6 +451,10 @@ int CcoWindowRegister(CcoComm* comm, void* ptr, size_t size, CcoWindow_t* outWin
   MORI_SHMEM_TRACE("CcoWindowRegister: rank={} ptr={} size={} slotOffset={}", rank, ptr, size,
                    slotOffset);
 
+  // P2P imported handles — collected during the FD-exchange loop below,
+  // ownership later transferred to CcoWindowHost so Deregister can release.
+  std::vector<hipMemGenericAllocationHandle_t> p2pImportedHandles;
+
   // P2P: exchange dma-buf FDs with same-node peers and map their slots into
   // the LSA flat VA.
   std::vector<int> p2pPeers;
@@ -509,6 +513,11 @@ int CcoWindowRegister(CcoComm* comm, void* ptr, size_t size, CcoWindow_t* outWin
     accessDesc.location.id = comm->cudaDev;
     accessDesc.flags = hipMemAccessFlagsProtReadWrite;
 
+    // Imported handles parked here; transferred to CcoWindowHost only after
+    // the whole loop succeeds so any error path can release them locally.
+    std::vector<hipMemGenericAllocationHandle_t> importedHandles;
+    importedHandles.reserve(p2pPeers.size());
+
     for (int pe : p2pPeers) {
       int pr = globalToPeer[pe];
       if (pr < 0 || pr >= static_cast<int>(allFds.size())) continue;
@@ -518,6 +527,9 @@ int CcoWindowRegister(CcoComm* comm, void* ptr, size_t size, CcoWindow_t* outWin
       hipMemGenericAllocationHandle_t importedHandle;
       hipError_t err = hipMemImportFromShareableHandleCompat(
           &importedHandle, peerFd, hipMemHandleTypePosixFileDescriptor);
+      // Either way, drop the local fd copy: hipMemImportFromShareableHandle
+      // already dup'd the underlying dma-buf reference internally.
+      close(peerFd);
       if (err != hipSuccess) {
         MORI_SHMEM_WARN("CcoWindowRegister: import from PE {} failed: {}", pe, err);
         continue;
@@ -535,7 +547,12 @@ int CcoWindowRegister(CcoComm* comm, void* ptr, size_t size, CcoWindow_t* outWin
         if (retry >= 5) { HIP_RUNTIME_CHECK(setErr); }
         usleep(1000 * (1 << retry));
       }
+
+      importedHandles.push_back(importedHandle);
     }
+
+    // Stash handles on the WindowHost so Deregister can release them.
+    p2pImportedHandles = std::move(importedHandles);
 
     localBoot.Finalize();
   }
@@ -593,6 +610,7 @@ int CcoWindowRegister(CcoComm* comm, void* ptr, size_t size, CcoWindow_t* outWin
   wh->size = size;
   wh->devPtr = devPtr;
   wh->peerRkeys_gpu = peerRkeys_gpu;
+  wh->peerImportedHandles = std::move(p2pImportedHandles);
   comm->windows.push_back(wh);
 
   *outWin = devPtr;
@@ -668,6 +686,13 @@ int CcoWindowDeregister(CcoComm* comm, CcoWindow_t win) {
       (void)hipMemUnmap(peerVa, allocSize);
     }
   }
+
+  // Drop refcount on each peer's imported handle. hipMemUnmap above
+  // detaches VA mappings but doesn't release the handle itself.
+  for (auto handle : wh->peerImportedHandles) {
+    (void)hipMemRelease(handle);
+  }
+  wh->peerImportedHandles.clear();
 
   auto& entries = comm->windowTableEntries;
   entries.erase(std::remove_if(entries.begin(), entries.end(),

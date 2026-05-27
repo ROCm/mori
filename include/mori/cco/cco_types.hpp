@@ -220,6 +220,10 @@ struct CcoWindowHost {
   size_t size;
   CcoWindowDevice* devPtr;
   uint32_t* peerRkeys_gpu;
+  // Peer's dma-buf imported handles. WindowRegister inserts one per P2P-
+  // mapped peer; WindowDeregister hipMemUnmap's the peer VA then
+  // hipMemRelease's the handle to drop the cross-process refcount.
+  std::vector<hipMemGenericAllocationHandle_t> peerImportedHandles;
 };
 
 struct CcoComm {
