@@ -29,8 +29,8 @@ namespace cco {
 
 template <typename Group>
 __device__ inline CcoLsaBarrierSession<Group>::CcoLsaBarrierSession(Group grp, CcoDevComm_t comm,
-                                                                     CcoLsaBarrierHandle h,
-                                                                     uint32_t idx) {
+                                                                    CcoLsaBarrierHandle h,
+                                                                    uint32_t idx) {
   this->group = grp;
   this->comm = comm;
   this->handle = h;
@@ -104,12 +104,12 @@ done:
 
 template <typename Group>
 __device__ inline void CcoLsaBarrierSession<Group>::wait(Group g) {
-  this->template waitInternal<false>(g, 0ULL);
+  this->template waitInternal</* DisableTimeout */ false>(g, 0ULL);
 }
 
 template <typename Group>
 __device__ inline int CcoLsaBarrierSession<Group>::wait(Group g, uint64_t timeoutCycles) {
-  return this->template waitInternal<true>(g, timeoutCycles);
+  return this->template waitInternal</* EnableTimeout */ true>(g, timeoutCycles);
 }
 
 template <typename Group>

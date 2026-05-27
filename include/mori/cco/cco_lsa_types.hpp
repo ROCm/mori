@@ -27,13 +27,13 @@
 namespace mori {
 namespace cco {
 
-// Returns pointer to rank `rank`'s resource buffer at bufHandle offset.
-// flatBase layout: rank 0 | rank 1 | ... each slot is perRankSize bytes.
+#define CCO_BUF_HANDLE_GRANULARITY (128)
+
 // bufHandle is a 128-byte unit index within the rank's slot.
 __device__ inline uint32_t* CcoGetResourceBuffer(CcoDevComm_t comm, uint32_t bufHandle, int rank) {
   char* base = reinterpret_cast<char*>(comm->flatBase);
   char* rankBase = base + (uint64_t)rank * comm->perRankSize;
-  return reinterpret_cast<uint32_t*>(rankBase + (uint64_t)bufHandle * 128);
+  return reinterpret_cast<uint32_t*>(rankBase + (uint64_t)bufHandle * CCO_BUF_HANDLE_GRANULARITY);
 }
 
 __device__ inline uint32_t* CcoGetLocalResourceBuffer(CcoDevComm_t comm, uint32_t bufHandle) {
@@ -43,11 +43,6 @@ __device__ inline uint32_t* CcoGetLocalResourceBuffer(CcoDevComm_t comm, uint32_
 // State buffer layout (unicast only, no multicast):
 //   [0,          nBarriers)                    epoch[index]       (persisted across sessions)
 //   [nBarriers,  nBarriers + nBarriers*nRanks) ucInbox[index][peer]
-
-struct CcoLsaBarrierHandle {
-  uint32_t bufHandle;  // 128-byte unit index into flatBase
-  uint32_t nBarriers;
-};
 
 template <typename Group>
 struct CcoLsaBarrierSession {

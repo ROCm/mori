@@ -83,6 +83,11 @@ struct CcoLsaContext {
   int lsaSize;
 };
 
+struct CcoLsaBarrierHandle {
+  uint32_t bufHandle;  // 128-byte unit index into flatBase
+  uint32_t nBarriers;
+};
+
 struct CcoDevComm {
   int rank;
   int worldSize;
