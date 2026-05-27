@@ -846,10 +846,18 @@ CCO host API 当前已经对齐 NCCL 的 resource-window 模型：
 
 **1. IBGDA 资源池 → 单一 symmetric window**（`cdf00b13`）
 
-`CcoDevCommCreate` 不再单独 hipMalloc signalBuf / signalShadows /
-counterBuf 三块，而是一次 `CcoMemAlloc + CcoWindowRegister` 出一个
-"resource window"，三个 buffer 作 sub-pointer 落进去。这个 window 是
-完整的 CCO symmetric window：
+`CcoDevCommCreate` 不再为 signalBuf / signalShadows / counterBuf 各
+分配一块，而是一次 `CcoMemAlloc + CcoWindowRegister` 出一个 "resource
+window"，三个 buffer 作 sub-pointer 落进去。
+
+> **底层不走 `hipMalloc`**：`CcoMemAlloc` 用的是 VMM API
+> （`hipMemCreate` 分配物理 handle + `hipMemMap` 映射到 LSA flat VA
+> 里的预留槽），这样才能既被映射到 symmetric 的固定 VA、又能 export
+> 成 dma-buf FD 注册 RDMA MR + P2P import 给 peer。`hipMalloc` 在 CCO
+> 里只用于不需要 peer 访问的小 staging buffer（如 epsGpu / windowTable
+> nodes / sdmaDevHandles）。
+
+这个 window 是完整的 CCO symmetric window：
 
 - 位于 LSA flat VA，**peer 可 P2P-load/store 访问**（`CcoLsaBarrier`
   直接走这条）
@@ -929,17 +937,21 @@ Kernel 读 `winBase` / `stride4G` / `ibgdaWin.{lkey,peerRkeys}` 直接走
 cmem，不必通过 `resourceWindow` 指针访问 GPU global。`CcoDevComm`
 从 152B → 184B，仍远在 4KB kernel param 上限内。
 
-**3. DevCommCreate hipMalloc 调用数下降**
+**3. DevCommCreate 分配次数下降**
+
+分清"symmetric 内存"和"staging 内存"两类：
 
 |  | 旧 (Phase 1) | 现在 |
 |---|---|---|
-| IBGDA signal/shadows/counter/peerRkeys | 4 个 hipMalloc | 1 个（resource window 内部） |
-| MR 注册 | 仅 signalBuf 一段 | 整个 resource window，**P2P + RDMA 双通道** |
-| 总 hipMalloc | ~10 | ~7 |
+| Symmetric IBGDA pool（VMM + dma-buf + RDMA MR + P2P import） | 3 块独立分配，分别注册 | **1 块**（resource window）一次 alloc + 一次 register，覆盖 P2P + RDMA 双通道 |
+| `signalBuf` MR 注册 | 仅 signalBuf 一段 | 整个 resource window 全段都可 P2P/RDMA |
+| Host staging hipMalloc（`epsGpu` / windowTable nodes / sdmaDevHandles / devCommGpu） | ~6 | ~6（未变；这些不需要 peer 访问） |
 
-剩下的 epsGpu / windowTable nodes / sdma.* / devCommGpu 都可以在 Phase 2.3
-（session class + `resourceRequirementsList` 接通）时一并吃进 resource
-window 或独立的 session pool。
+剩下的 staging buffer（epsGpu / windowTable nodes / sdma.* / devCommGpu）
+都用 `hipMalloc` 即可，不需要并入 resource window。Phase 2.3 接通
+`resourceRequirementsList` 后，所有需要 peer 访问的 session buffer
+（LSA barrier、LLA2A staging、用户自定义 session）都会自动沉淀进
+resource window 这一块 VMM 分配里。
 
 ---
 
