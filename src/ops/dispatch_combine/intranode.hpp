@@ -80,7 +80,9 @@ inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T
 /*                                    EpDispatchIntraNodeKernel                                   */
 /* ---------------------------------------------------------------------------------------------- */
 
-/*
+#define ENABLE_DISPATCH_WARPGROUP
+
+#if !defined(ENABLE_DISPATCH_WARPGROUP)
 template <typename T, bool EnableStdMoE = false>
 __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   const EpDispatchCombineConfig& config = args.config;
@@ -98,7 +100,6 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   int myPe = config.rank;
   int npes = config.worldSize;
   size_t hiddenDim = config.HiddenDimSz();
-  const bool hasScales = args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0);
 
   IF_ENABLE_PROFILER(
       INTRANODE_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
@@ -144,13 +145,6 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       }
       destTokId = __shfl(destTokId, 0);
 
-      size_t srcTokOffset = srcTokId * hiddenDim;
-      size_t destTokOffset = destTokId * hiddenDim;
-
-      core::WarpCopy<T, 2>(
-          args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) + destTokOffset,
-          args.inpTokenBuf + srcTokOffset, hiddenDim);
-
       // Write weights and indices
       if (laneId < config.numExpertPerToken) {
         if (args.weightsBuf) {
@@ -164,13 +158,19 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       }
 
       // Write scales
-      if (hasScales) {
+      if (args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0)) {
         size_t destScaleOffset = (size_t)destTokId * config.scaleDim * config.scaleTypeSize;
         size_t srcScaleOffset = (size_t)srcTokId * config.scaleDim * config.scaleTypeSize;
         core::WarpCopy(
             args.shmemOutScalesMemObj->template GetAs<uint8_t*>(destPe) + destScaleOffset,
             args.scalesBuf + srcScaleOffset, config.scaleDim * config.scaleTypeSize);
       }
+
+      size_t srcTokOffset = srcTokId * hiddenDim;
+      size_t destTokOffset = destTokId * hiddenDim;
+
+      core::WarpCopy(args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) + destTokOffset,
+                     args.inpTokenBuf + srcTokOffset, hiddenDim);
     }
   }
   __syncthreads();
@@ -219,8 +219,7 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   }
 #endif
 }
-*/
-
+#else
 template <typename T, bool EnableStdMoE = false>
 __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   const EpDispatchCombineConfig& config = args.config;
@@ -240,7 +239,7 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   size_t hiddenDim = config.HiddenDimSz();
   const bool hasScales = args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0);
 
-  // Warp-group coordination: 4 warps per group
+  // Warp-group coordination: 2 warps per group
   constexpr int kWarpsPerGroup = 2;
   constexpr int kMaxWarpGroups = 8;
 
@@ -248,7 +247,7 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   __shared__ int groupCounters[kMaxWarpGroups];   // consume counter
 
   int warpGroupIdInBlock = warpId / kWarpsPerGroup;
-  int inGroupWarpId = warpId % kWarpsPerGroup;  // 0-3
+  int inGroupWarpId = warpId % kWarpsPerGroup;
   int warpGroupId = globalWarpId / kWarpsPerGroup;
   int warpGroupNum = globalWarpNum / kWarpsPerGroup;
 
@@ -281,6 +280,9 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       index_t destPe = destExpert / config.numExpertPerRank;
       index_t destTokId = 0;
 
+      // prefetch remote addr
+      auto dispTokOffset = args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe);
+
       // ALL warps in warp-group do dedup independently (same input = same result)
       assert(config.numExpertPerToken < warpSize);
       int condition = 0;
@@ -296,26 +298,30 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
         continue;
       }
 
+      // prefetch remote addr
+      auto dispatchOut = args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe);
+
       // Header Warp: atomic allocation + notify via shared memory
       if (inGroupWarpId == 0) {
         if (laneId == 0) {
           // Atomic allocation
-          destTokId = atomicAdd(args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe), 1);
+          destTokId = atomicAdd(dispTokOffset, 1);
           assert(destTokId < config.MaxNumTokensToRecv() &&
                  "Total recv token overflow: increase maxTotalRecvTokens");
-          atomicAdd(args.destPeTokenCounter + destPe, 1);
-          args.dispDestTokIdMap[i] = FlatTokenIndex(config, destPe, destTokId);
-          args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destTokId] =
-              FlatTokenIndex(config, myPe, srcTokId);
 
           // Wait for all consumers done (counter == N-1), then set to 0
           while (atomicCAS(&groupCounters[warpGroupIdInBlock], kWarpsPerGroup - 1, 0) !=
                  kWarpsPerGroup - 1) {
           }
-
           // Write to shared mem: use (i+1) to avoid confusion with initial value 0
-          atomicExch((unsigned long long*)&groupData[warpGroupIdInBlock],
-                     ((uint64_t)(i + 1) << 32) | (uint32_t)destTokId);
+          __hip_atomic_store((unsigned long long*)&groupData[warpGroupIdInBlock],
+                             ((uint64_t)(i + 1) << 32) | (uint32_t)destTokId, __ATOMIC_RELAXED,
+                             __HIP_MEMORY_SCOPE_WORKGROUP);
+
+          atomicAdd(args.destPeTokenCounter + destPe, 1);
+          args.dispDestTokIdMap[i] = FlatTokenIndex(config, destPe, destTokId);
+          args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destTokId] =
+              FlatTokenIndex(config, myPe, srcTokId);
         }
         destTokId = __shfl(destTokId, 0);
 
@@ -336,10 +342,9 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
         if (laneId == 0) {
           uint64_t val;
           do {
-            __builtin_amdgcn_s_sleep(4);
             val = __hip_atomic_load(
                 reinterpret_cast<unsigned long long*>(&groupData[warpGroupIdInBlock]),
-                __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_WORKGROUP);
+                __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
           } while ((val >> 32) != (uint32_t)(i + 1));
           atomicAdd(&groupCounters[warpGroupIdInBlock], 1);
           destTokId = (index_t)(val & 0xFFFFFFFF);
@@ -352,8 +357,7 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       size_t srcTokOffset = srcTokId * hiddenDim;
       size_t destTokOffset = destTokId * hiddenDim;
 
-      core::WarpCopy<T, 2>(args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) +
-                               destTokOffset + warpDimOffset,
+      core::WarpCopy<T, 2>(dispatchOut + destTokOffset + warpDimOffset,
                            args.inpTokenBuf + srcTokOffset + warpDimOffset, warpDimChunk);
 
       // Write scales: split across 4 warps
@@ -419,6 +423,7 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   }
 #endif
 }
+#endif
 
 template <typename T, bool EnableStdMoE = false, int block_threads = 512, int grid_blocks = 1>
 __global__ void __launch_bounds__(block_threads, grid_blocks)
