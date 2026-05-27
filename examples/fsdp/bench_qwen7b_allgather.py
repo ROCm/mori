@@ -178,6 +178,12 @@ def _apply_fsdp2(model: torch.nn.Module, dtype: torch.dtype, reshard_root: bool)
     fully_shard(model, mp_policy=mp_policy, reshard_after_forward=reshard_root)
 
 
+def _estimate_training_tflops(num_params: int, tokens: int, step_time_s: float) -> float:
+    # Dense transformer training is commonly approximated as 6 FLOPs per
+    # parameter per token. This is a model-level estimate, not a profiler count.
+    return 6.0 * num_params * tokens / step_time_s / 1e12
+
+
 def _make_batches(
     vocab_size: int,
     batch_size: int,
@@ -235,8 +241,13 @@ def main() -> None:
     if rank == 0:
         print("Loading Qwen model config and initializing weights...", flush=True)
     model, config = _load_qwen_model(args.model_name_or_path, dtype)
+    num_params = sum(p.numel() for p in model.parameters())
     if rank == 0:
-        print("Applying FSDP2 layer-by-layer sharding...", flush=True)
+        print(
+            f"Applying FSDP2 layer-by-layer sharding "
+            f"(num_params={num_params:,})...",
+            flush=True,
+        )
     _apply_fsdp2(model, dtype=dtype, reshard_root=args.reshard_root)
     model.train()
     if rank == 0:
@@ -287,12 +298,15 @@ def main() -> None:
                 recent_times = measured_times[-args.print_every :]
                 tokens = args.micro_batch_size * args.seq_len * world_size
                 avg_time = sum(recent_times) / len(recent_times)
+                tflops = _estimate_training_tflops(num_params, tokens, avg_time)
                 print(
                     f"steps={measured_step - len(recent_times) + 1}-{measured_step} "
                     f"mode={args.mode} avg_time_s={avg_time:.6f} "
                     f"min_time_s={min(recent_times):.6f} "
                     f"max_time_s={max(recent_times):.6f} "
                     f"tokens_per_s={tokens / avg_time:.2f} "
+                    f"tflops={tflops:.2f} "
+                    f"tflops_per_gpu={tflops / world_size:.2f} "
                     f"loss={loss:.6f}",
                     flush=True,
                 )
@@ -312,6 +326,11 @@ def main() -> None:
     avg_tokens_per_s = (
         args.micro_batch_size * args.seq_len * world_size / avg_step_time
     )
+    avg_tflops = _estimate_training_tflops(
+        num_params,
+        args.micro_batch_size * args.seq_len * world_size,
+        avg_step_time,
+    )
 
     if rank == 0:
         summary = {
@@ -323,8 +342,11 @@ def main() -> None:
             "warmup": args.warmup,
             "dtype": args.dtype,
             "seed": _BENCHMARK_SEED,
+            "num_params": num_params,
             "avg_step_time_s": avg_step_time,
             "avg_tokens_per_s": avg_tokens_per_s,
+            "avg_tflops": avg_tflops,
+            "avg_tflops_per_gpu": avg_tflops / world_size,
             "last_loss": measured_losses[-1] if measured_losses else None,
             "mori_fsdp_enable_sdma": os.environ.get("MORI_FSDP_ENABLE_SDMA"),
             "mori_enable_sdma": os.environ.get("MORI_ENABLE_SDMA"),
