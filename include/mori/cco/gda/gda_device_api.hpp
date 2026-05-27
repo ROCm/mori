@@ -39,8 +39,8 @@ __device__ inline CcoGda::CcoGda(CcoDevComm const& comm_, int contextIndex)
 // Put: RDMA write with optional signal/counter
 template <typename RemoteAction = CcoGda_NoSignal, typename LocalAction = CcoGda_NoCounter>
 __device__ inline void CcoGda::put(int peer, CcoWindow_t dstWin, size_t dstOffset,
-                                      CcoWindow_t srcWin, size_t srcOffset, size_t bytes,
-                                      RemoteAction remoteAction, LocalAction localAction) {
+                                   CcoWindow_t srcWin, size_t srcOffset, size_t bytes,
+                                   RemoteAction remoteAction, LocalAction localAction) {
   bool isSignal = false;
   CcoGdaSignal_t signalId = 0;
   CcoGdaSignalOp_t signalOp = CcoGdaSignalInc;
@@ -74,8 +74,8 @@ __device__ inline void CcoGda::put(int peer, CcoWindow_t dstWin, size_t dstOffse
 
 // PutValue: write immediate value (≤8 bytes)
 template <typename T, typename RemoteAction = CcoGda_NoSignal>
-__device__ inline void CcoGda::putValue(int peer, CcoWindow_t dstWin, size_t dstOffset,
-                                           T value, RemoteAction remoteAction) {
+__device__ inline void CcoGda::putValue(int peer, CcoWindow_t dstWin, size_t dstOffset, T value,
+                                        RemoteAction remoteAction) {
   static_assert(sizeof(T) <= 8, "putValue only supports types <= 8 bytes");
 
   bool isSignal = false;
@@ -101,7 +101,7 @@ __device__ inline void CcoGda::putValue(int peer, CcoWindow_t dstWin, size_t dst
 
 // Get: RDMA read
 __device__ inline void CcoGda::get(int peer, CcoWindow_t remoteWin, size_t remoteOffset,
-                                      CcoWindow_t localWin, size_t localOffset, size_t bytes) {
+                                   CcoWindow_t localWin, size_t localOffset, size_t bytes) {
   gda::get(this->ctx, peer, remoteWin, remoteOffset, localWin, localOffset, bytes);
 }
 
@@ -160,8 +160,7 @@ __device__ inline uint64_t CcoGda::readCounter(CcoGdaCounter_t counterId, int bi
 }
 
 // WaitCounter: wait until local counter reaches specified value
-__device__ inline void CcoGda::waitCounter(CcoGdaCounter_t counterId, uint64_t least,
-                                              int bits) {
+__device__ inline void CcoGda::waitCounter(CcoGdaCounter_t counterId, uint64_t least, int bits) {
   gda::waitCounter(this->ctx, counterId, least, bits);
 }
 
@@ -171,11 +170,11 @@ __device__ inline void CcoGda::resetCounter(CcoGdaCounter_t counterId) {
 }
 
 // Low-level GDA API (to be implemented with actual GDA hardware API)
-__device__ inline static void put(CcoGdaCtx ctx, int peer, CcoWindow_t dstWin,
-                                  size_t dstOffset, CcoWindow_t srcWin, size_t srcOffset,
-                                  size_t bytes, bool isSignal, CcoGdaSignal_t signalId,
-                                  CcoGdaSignalOp_t signalOp, uint64_t signalOpArg,
-                                  bool isCounter, CcoGdaCounter_t counterId) {}
+__device__ inline static void put(CcoGdaCtx ctx, int peer, CcoWindow_t dstWin, size_t dstOffset,
+                                  CcoWindow_t srcWin, size_t srcOffset, size_t bytes, bool isSignal,
+                                  CcoGdaSignal_t signalId, CcoGdaSignalOp_t signalOp,
+                                  uint64_t signalOpArg, bool isCounter, CcoGdaCounter_t counterId) {
+}
 
 template <typename T>
 __device__ inline static void putValue(CcoGdaCtx ctx, int peer, CcoWindow_t dstWin,
@@ -190,27 +189,24 @@ __device__ inline static void get(CcoGdaCtx ctx, int peer, CcoWindow_t remoteWin
                                   size_t bytes) {}
 
 __device__ inline static void flush(CcoGdaCtx ctx, int peer) {}
-__device__ inline static void flushAsync(CcoGdaCtx ctx, int peer,
-                                         CcoGdaRequest_t* outRequest) {}
+__device__ inline static void flushAsync(CcoGdaCtx ctx, int peer, CcoGdaRequest_t* outRequest) {}
 __device__ inline static void signal(CcoGdaCtx ctx, int peer, CcoGdaSignal_t signalId,
                                      CcoGdaSignalOp_t signalOp, uint64_t signalOpArg) {}
 
 __device__ inline static void resetSignal(CcoGdaCtx ctx, CcoGdaSignal_t signalId) {}
-__device__ inline static uint64_t readSignal(CcoGdaCtx ctx, CcoGdaSignal_t signalId,
-                                             int bits) {
+__device__ inline static uint64_t readSignal(CcoGdaCtx ctx, CcoGdaSignal_t signalId, int bits) {
   return 0;
 }
 
-__device__ inline static void waitSignal(CcoGdaCtx ctx, CcoGdaSignal_t signalId,
-                                         uint64_t least, int bits) {}
-__device__ inline static uint64_t readCounter(CcoGdaCtx ctx, CcoGdaCounter_t counterId,
-                                              int bits) {
+__device__ inline static void waitSignal(CcoGdaCtx ctx, CcoGdaSignal_t signalId, uint64_t least,
+                                         int bits) {}
+__device__ inline static uint64_t readCounter(CcoGdaCtx ctx, CcoGdaCounter_t counterId, int bits) {
   return 0;
 }
 
 __device__ inline static void resetCounter(CcoGdaCtx ctx, CcoGdaCounter_t counterId) {}
-__device__ inline static void waitCounter(CcoGdaCtx ctx, CcoGdaCounter_t counterId,
-                                          uint64_t least, int bits) {}
+__device__ inline static void waitCounter(CcoGdaCtx ctx, CcoGdaCounter_t counterId, uint64_t least,
+                                          int bits) {}
 
 }  // namespace gda
 }  // namespace cco

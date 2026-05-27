@@ -272,7 +272,8 @@ void Context::InitializePossibleTransports() {
       if (envGidIdx != nullptr) savedEpConfig.gidIdx = std::atoi(envGidIdx);
       savedEpConfig.maxMsgsNum = 4096;
       uint32_t vid = rdmaDeviceContext->GetRdmaDevice()->GetDeviceAttr()->orig_attr.vendor_id;
-      savedEpConfig.maxCqeNum = (vid == static_cast<uint32_t>(RdmaDeviceVendorId::Broadcom)) ? 1 : 4096;
+      savedEpConfig.maxCqeNum =
+          (vid == static_cast<uint32_t>(RdmaDeviceVendorId::Broadcom)) ? 1 : 4096;
       savedEpConfig.alignment = 4096;
       savedEpConfig.onGpu = true;
     }

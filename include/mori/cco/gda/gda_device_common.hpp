@@ -1,4 +1,25 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
 // MIT License — see LICENSE for details.
 #pragma once
 
@@ -19,8 +40,7 @@ struct CcoGda_SignalInc {
 struct CcoGda_SignalAdd {
   CcoGdaSignal_t signalId;
   uint64_t value;
-  __device__ inline CcoGda_SignalAdd(CcoGdaSignal_t id, uint64_t val)
-      : signalId(id), value(val) {}
+  __device__ inline CcoGda_SignalAdd(CcoGdaSignal_t id, uint64_t val) : signalId(id), value(val) {}
 };
 
 struct CcoGda_CounterInc {
@@ -57,8 +77,8 @@ struct CcoGda {
 
   // Data transfer operations
   template <typename RemoteAction = CcoGda_NoSignal, typename LocalAction = CcoGda_NoCounter>
-  __device__ inline void put(int peer, CcoWindow_t dstWin, size_t dstOffset,
-                             CcoWindow_t srcWin, size_t srcOffset, size_t bytes,
+  __device__ inline void put(int peer, CcoWindow_t dstWin, size_t dstOffset, CcoWindow_t srcWin,
+                             size_t srcOffset, size_t bytes,
                              RemoteAction remoteAction = CcoGda_NoSignal{},
                              LocalAction localAction = CcoGda_NoCounter{});
 

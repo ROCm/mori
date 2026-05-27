@@ -1,7 +1,26 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
 // MIT License — see LICENSE for details.
-#include "mori/cco/cco_api.hpp"
-
 #include <cstring>
 #include <vector>
 
@@ -9,6 +28,7 @@
 #include "mori/application/bootstrap/local_bootstrap.hpp"
 #include "mori/application/transport/sdma/anvil.hpp"
 #include "mori/application/utils/check.hpp"
+#include "mori/cco/cco_api.hpp"
 #include "mori/utils/hip_compat.hpp"
 #include "mori/utils/mori_log.hpp"
 
@@ -18,16 +38,14 @@ namespace cco {
 static constexpr size_t INTERNAL_SYNC_COUNT = 128;
 static constexpr size_t INTERNAL_SYNC_BYTES = INTERNAL_SYNC_COUNT * sizeof(uint64_t);
 
-static size_t AlignUp(size_t x, size_t align) {
-  return (x + align - 1) & ~(align - 1);
-}
+static size_t AlignUp(size_t x, size_t align) { return (x + align - 1) & ~(align - 1); }
 
 /* ========================================================================== */
 /*                              CcoCommCreate                              */
 /* ========================================================================== */
 
 int CcoCommCreate(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
-                     CcoComm** outComm) {
+                  CcoComm** outComm) {
   auto* comm = new CcoComm();
   *outComm = comm;
 
@@ -43,8 +61,8 @@ int CcoCommCreate(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
   comm->bootNet->Allgather(&myPid, allPids.data(), sizeof(int64_t));
   comm->groupId = allPids[0];
 
-  MORI_SHMEM_TRACE("CcoCommCreate: rank={} worldSize={} groupId={}", comm->rank,
-                   comm->worldSize, comm->groupId);
+  MORI_SHMEM_TRACE("CcoCommCreate: rank={} worldSize={} groupId={}", comm->rank, comm->worldSize,
+                   comm->groupId);
 
   // Step 2: context (RDMA endpoints, transport type negotiation)
   comm->ctx = new application::Context(*comm->bootNet);
@@ -97,9 +115,8 @@ int CcoCommCreate(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
       int dstDeviceId = pe % 8;
       for (int q = 0; q < comm->sdmaNumQueue; q++) {
         auto* handle = anvil::anvil.getSdmaQueue(srcDeviceId, dstDeviceId, q)->deviceHandle();
-        HIP_RUNTIME_CHECK(hipMemcpy(
-            &comm->sdmaDevHandles[dstDeviceId * comm->sdmaNumQueue + q],
-            &handle, sizeof(handle), hipMemcpyHostToDevice));
+        HIP_RUNTIME_CHECK(hipMemcpy(&comm->sdmaDevHandles[dstDeviceId * comm->sdmaNumQueue + q],
+                                    &handle, sizeof(handle), hipMemcpyHostToDevice));
       }
     }
   }
@@ -122,11 +139,12 @@ int CcoCommCreate(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
     }
   }
 
-  MORI_SHMEM_INFO("CcoCommCreate: rank={}/{} groupId={} flatBase={} perRankSize={} "
-                  "granularity={} numQpPerPe={} sdmaNumQueue={} rdma={}",
-                  comm->rank, comm->worldSize, comm->groupId, comm->flatBase, comm->perRankSize,
-                  comm->vmmGranularity, comm->numQpPerPe, comm->sdmaNumQueue,
-                  comm->ctx->RdmaTransportEnabled());
+  MORI_SHMEM_INFO(
+      "CcoCommCreate: rank={}/{} groupId={} flatBase={} perRankSize={} "
+      "granularity={} numQpPerPe={} sdmaNumQueue={} rdma={}",
+      comm->rank, comm->worldSize, comm->groupId, comm->flatBase, comm->perRankSize,
+      comm->vmmGranularity, comm->numQpPerPe, comm->sdmaNumQueue,
+      comm->ctx->RdmaTransportEnabled());
   if (!comm->rdmaEndpoints.empty()) {
     for (int pe = 0; pe < comm->worldSize; pe++) {
       for (int qp = 0; qp < comm->numQpPerPe; qp++) {
@@ -199,8 +217,8 @@ int CcoMemAlloc(CcoComm* comm, size_t size, void** outPtr) {
   size_t alignedSize = AlignUp(size, comm->vmmGranularity);
   size_t slotOffset = comm->nextOffset;
 
-  MORI_SHMEM_TRACE("CcoMemAlloc: rank={} size={} alignedSize={} slotOffset={}", comm->rank,
-                   size, alignedSize, slotOffset);
+  MORI_SHMEM_TRACE("CcoMemAlloc: rank={} size={} alignedSize={} slotOffset={}", comm->rank, size,
+                   alignedSize, slotOffset);
 
   // Step 1: create physical memory
   hipMemAllocationProp allocProp = {};
@@ -213,8 +231,8 @@ int CcoMemAlloc(CcoComm* comm, size_t size, void** outPtr) {
   HIP_RUNTIME_CHECK(hipMemCreate(&physHandle, alignedSize, &allocProp, 0));
 
   // Step 2: map to local slot only (no cross-rank communication)
-  void* localVa =
-      static_cast<char*>(comm->flatBase) + static_cast<size_t>(comm->rank) * comm->perRankSize + slotOffset;
+  void* localVa = static_cast<char*>(comm->flatBase) +
+                  static_cast<size_t>(comm->rank) * comm->perRankSize + slotOffset;
   HIP_RUNTIME_CHECK(hipMemMap(localVa, alignedSize, 0, physHandle, 0));
 
   hipMemAccessDesc accessDesc = {};
@@ -225,8 +243,8 @@ int CcoMemAlloc(CcoComm* comm, size_t size, void** outPtr) {
 
   // Step 3: export dma-buf FD (for later use by WindowRegister: P2P + RDMA MR)
   int shareFd = -1;
-  HIP_RUNTIME_CHECK(hipMemExportToShareableHandle(
-      reinterpret_cast<void*>(&shareFd), physHandle, hipMemHandleTypePosixFileDescriptor, 0));
+  HIP_RUNTIME_CHECK(hipMemExportToShareableHandle(reinterpret_cast<void*>(&shareFd), physHandle,
+                                                  hipMemHandleTypePosixFileDescriptor, 0));
 
   // Step 4: advance offset and record metadata
   comm->nextOffset += alignedSize;
@@ -239,8 +257,9 @@ int CcoMemAlloc(CcoComm* comm, size_t size, void** outPtr) {
   comm->allocTable[localVa] = meta;
 
   *outPtr = localVa;
-  MORI_SHMEM_TRACE("CcoMemAlloc: done, localPtr={} (local only, P2P mapping deferred to WindowRegister)",
-                   localVa);
+  MORI_SHMEM_TRACE(
+      "CcoMemAlloc: done, localPtr={} (local only, P2P mapping deferred to WindowRegister)",
+      localVa);
   return 0;
 }
 
@@ -326,16 +345,15 @@ int CcoDevCommCreate(CcoComm* comm, CcoDevComm** outDevComm) {
     }
 
     HIP_RUNTIME_CHECK(hipMalloc(&epsGpu, numEps * sizeof(shmem::ShmemRdmaEndpoint)));
-    HIP_RUNTIME_CHECK(hipMemcpy(epsGpu, shmemEps.data(),
-                                numEps * sizeof(shmem::ShmemRdmaEndpoint), hipMemcpyHostToDevice));
+    HIP_RUNTIME_CHECK(hipMemcpy(epsGpu, shmemEps.data(), numEps * sizeof(shmem::ShmemRdmaEndpoint),
+                                hipMemcpyHostToDevice));
   }
   ibgda.endpoints = epsGpu;
 
   // Build window table linked list on GPU
   const auto& tableEntries = comm->windowTableEntries;
   size_t numWindows = tableEntries.size();
-  size_t numNodes =
-      (numWindows + CCO_WINDOW_TABLE_SIZE - 1) / CCO_WINDOW_TABLE_SIZE;
+  size_t numNodes = (numWindows + CCO_WINDOW_TABLE_SIZE - 1) / CCO_WINDOW_TABLE_SIZE;
   if (numNodes == 0) numNodes = 1;
 
   // Allocate all nodes on GPU, build from host
@@ -420,14 +438,14 @@ int CcoDevCommCreate(CcoComm* comm, CcoDevComm** outDevComm) {
   // Copy struct to GPU
   CcoDevComm* devCommGpu = nullptr;
   HIP_RUNTIME_CHECK(hipMalloc(&devCommGpu, sizeof(CcoDevComm)));
-  HIP_RUNTIME_CHECK(
-      hipMemcpy(devCommGpu, &hostShadow, sizeof(CcoDevComm), hipMemcpyHostToDevice));
+  HIP_RUNTIME_CHECK(hipMemcpy(devCommGpu, &hostShadow, sizeof(CcoDevComm), hipMemcpyHostToDevice));
 
   *outDevComm = devCommGpu;
-  MORI_SHMEM_INFO("CcoDevCommCreate: rank={} devComm={} windows={} signals={} counters={} "
-                  "signalBuf={} counterBuf={} signalLkey={}",
-                  comm->rank, (void*)devCommGpu, numWindows, signalCount, counterCount,
-                  (void*)signalBufGpu, (void*)counterBufGpu, signalLkey);
+  MORI_SHMEM_INFO(
+      "CcoDevCommCreate: rank={} devComm={} windows={} signals={} counters={} "
+      "signalBuf={} counterBuf={} signalLkey={}",
+      comm->rank, (void*)devCommGpu, numWindows, signalCount, counterCount, (void*)signalBufGpu,
+      (void*)counterBufGpu, signalLkey);
   return 0;
 }
 
@@ -439,8 +457,7 @@ int CcoDevCommDestroy(CcoDevComm* devComm) {
   if (!devComm) return 0;
 
   CcoDevComm hostShadow;
-  HIP_RUNTIME_CHECK(
-      hipMemcpy(&hostShadow, devComm, sizeof(CcoDevComm), hipMemcpyDeviceToHost));
+  HIP_RUNTIME_CHECK(hipMemcpy(&hostShadow, devComm, sizeof(CcoDevComm), hipMemcpyDeviceToHost));
 
   // Free IBGDA context resources
   auto& ibgda = hostShadow.ibgda;

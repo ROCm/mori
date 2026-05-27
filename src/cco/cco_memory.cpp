@@ -1,7 +1,26 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
 // MIT License — see LICENSE for details.
-#include "mori/cco/cco_api.hpp"
-
 #include <algorithm>
 #include <cstring>
 #include <vector>
@@ -11,6 +30,7 @@
 #include "mori/application/transport/rdma/rdma.hpp"
 #include "mori/application/transport/sdma/anvil.hpp"
 #include "mori/application/utils/check.hpp"
+#include "mori/cco/cco_api.hpp"
 #include "mori/utils/hip_compat.hpp"
 #include "mori/utils/mori_log.hpp"
 
@@ -58,15 +78,18 @@ int CcoWindowRegister(CcoComm* comm, void* ptr, size_t size, CcoWindow_t* outWin
 
     int myPeerRank = 0;
     for (int i = 0; i < static_cast<int>(sortedGroup.size()); i++) {
-      if (sortedGroup[i] == rank) { myPeerRank = i; break; }
+      if (sortedGroup[i] == rank) {
+        myPeerRank = i;
+        break;
+      }
     }
     int p2pWorldSize = static_cast<int>(sortedGroup.size());
 
     // Socket path must be SAME across all ranks in this comm group,
     // but UNIQUE per window and per group to avoid collision.
     // groupId (rank 0's pid) identifies the group; slotOffset identifies the window.
-    std::string socketPath = "/tmp/mori_cco_" + std::to_string(comm->groupId) + "_" +
-                             std::to_string(slotOffset) + "_";
+    std::string socketPath =
+        "/tmp/mori_cco_" + std::to_string(comm->groupId) + "_" + std::to_string(slotOffset) + "_";
 
     // Clean up stale socket files from previous crashed runs (rank 0 only to avoid race)
     if (myPeerRank == 0) {
@@ -108,8 +131,8 @@ int CcoWindowRegister(CcoComm* comm, void* ptr, size_t size, CcoWindow_t* outWin
       if (peerFd < 0) continue;
 
       hipMemGenericAllocationHandle_t importedHandle;
-      hipError_t err = hipMemImportFromShareableHandleCompat(
-          &importedHandle, peerFd, hipMemHandleTypePosixFileDescriptor);
+      hipError_t err = hipMemImportFromShareableHandleCompat(&importedHandle, peerFd,
+                                                             hipMemHandleTypePosixFileDescriptor);
       if (err != hipSuccess) {
         MORI_SHMEM_WARN("CcoWindowRegister: import from PE {} failed: {}", pe, err);
         continue;
@@ -123,7 +146,9 @@ int CcoWindowRegister(CcoComm* comm, void* ptr, size_t size, CcoWindow_t* outWin
       for (int retry = 0;; retry++) {
         hipError_t setErr = hipMemSetAccess(peerVa, alignedSize, &accessDesc, 1);
         if (setErr == hipSuccess) break;
-        if (retry >= 5) { HIP_RUNTIME_CHECK(setErr); }
+        if (retry >= 5) {
+          HIP_RUNTIME_CHECK(setErr);
+        }
         usleep(1000 * (1 << retry));
       }
     }
@@ -223,8 +248,7 @@ int CcoWindowRegister(CcoComm* comm, void* ptr, size_t size, CcoWindow_t* outWin
 
   CcoWindowDevice* devPtr = nullptr;
   HIP_RUNTIME_CHECK(hipMalloc(&devPtr, sizeof(CcoWindowDevice)));
-  HIP_RUNTIME_CHECK(
-      hipMemcpy(devPtr, &hostShadow, sizeof(CcoWindowDevice), hipMemcpyHostToDevice));
+  HIP_RUNTIME_CHECK(hipMemcpy(devPtr, &hostShadow, sizeof(CcoWindowDevice), hipMemcpyHostToDevice));
 
   // ── Register in window table (for ncclFindWindow-style lookup) ──
   CcoComm::WindowTableEntry tableEntry;
@@ -256,8 +280,8 @@ int CcoWindowRegister(CcoComm* comm, void* ptr, size_t size, CcoWindow_t* outWin
     MORI_SHMEM_INFO("  PE {}: flatVA={} rkey={}", pe, peerVa, peerRkeys_host[pe]);
   }
   if (signalPtrs) {
-    MORI_SHMEM_INFO("  SDMA: signalPtrs={} expectSignals={} numQueue={}",
-                    (void*)signalPtrs, (void*)expectSignalsPtr, sdmaNumQueue);
+    MORI_SHMEM_INFO("  SDMA: signalPtrs={} expectSignals={} numQueue={}", (void*)signalPtrs,
+                    (void*)expectSignalsPtr, sdmaNumQueue);
   }
   MORI_SHMEM_INFO("  deviceHandles_d={}", (void*)comm->sdmaDevHandles);
 
@@ -323,11 +347,10 @@ int CcoWindowDeregister(CcoComm* comm, CcoWindow_t win) {
 
   // Remove from window table
   auto& entries = comm->windowTableEntries;
-  entries.erase(std::remove_if(entries.begin(), entries.end(),
-                               [win](const CcoComm::WindowTableEntry& e) {
-                                 return e.devPtr == win;
-                               }),
-                entries.end());
+  entries.erase(
+      std::remove_if(entries.begin(), entries.end(),
+                     [win](const CcoComm::WindowTableEntry& e) { return e.devPtr == win; }),
+      entries.end());
 
   // Deregister RDMA MR
   application::RdmaDeviceContext* rdmaDevCtx = comm->ctx->GetRdmaDeviceContext();

@@ -1,3 +1,24 @@
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 // Test: CCO host-side API lifecycle
 // Single process, N threads (one per GPU) via SocketBootstrapNetwork.
 // Validates: CommCreate → MemAlloc → WindowRegister → DevCommCreate → P2P read → teardown.
@@ -9,17 +30,17 @@
 
 #include "hip/hip_runtime.h"
 #include "mori/application/bootstrap/socket_bootstrap.hpp"
-#include "mori/utils/mori_log.hpp"
 #include "mori/cco/cco_api.hpp"
+#include "mori/utils/mori_log.hpp"
 
-#define HIP_CHECK(cmd)                                                         \
-  do {                                                                         \
-    hipError_t e = (cmd);                                                      \
-    if (e != hipSuccess) {                                                     \
-      fprintf(stderr, "[rank ?] HIP error %d (%s) at %s:%d\n", e,             \
-              hipGetErrorString(e), __FILE__, __LINE__);                       \
-      exit(1);                                                                 \
-    }                                                                          \
+#define HIP_CHECK(cmd)                                                                            \
+  do {                                                                                            \
+    hipError_t e = (cmd);                                                                         \
+    if (e != hipSuccess) {                                                                        \
+      fprintf(stderr, "[rank ?] HIP error %d (%s) at %s:%d\n", e, hipGetErrorString(e), __FILE__, \
+              __LINE__);                                                                          \
+      exit(1);                                                                                    \
+    }                                                                                             \
   } while (0)
 
 static const size_t PER_RANK_VMM_SIZE = 256ULL * 1024 * 1024;
@@ -118,8 +139,7 @@ static void run_rank(int rank, int nranks, const mori::application::UniqueId& ui
 
   // Verify DevComm on GPU
   mori::cco::CcoDevComm devCommHost;
-  HIP_CHECK(
-      hipMemcpy(&devCommHost, devComm, sizeof(devCommHost), hipMemcpyDeviceToHost));
+  HIP_CHECK(hipMemcpy(&devCommHost, devComm, sizeof(devCommHost), hipMemcpyDeviceToHost));
   if (devCommHost.rank != rank || devCommHost.worldSize != nranks) {
     snprintf(result->detail, sizeof(result->detail),
              "DevComm mismatch: rank=%d(want %d) world=%d(want %d)", devCommHost.rank, rank,
@@ -133,7 +153,8 @@ static void run_rank(int rank, int nranks, const mori::application::UniqueId& ui
     HIP_CHECK(hipMemcpy(&winHost, win, sizeof(winHost), hipMemcpyDeviceToHost));
 
     // Verify local ptr via flat addressing
-    void* localVa = winHost.winBase + (static_cast<uint64_t>(winHost.rank) * winHost.stride4G << 32);
+    void* localVa =
+        winHost.winBase + (static_cast<uint64_t>(winHost.rank) * winHost.stride4G << 32);
     if (localVa != buf) {
       snprintf(result->detail, sizeof(result->detail), "flat localVa mismatch: %p != %p", localVa,
                buf);
