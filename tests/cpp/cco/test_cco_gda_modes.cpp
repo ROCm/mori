@@ -70,7 +70,10 @@ static void run_rank(int rank, int nranks, const mori::application::UniqueId& ui
   // Build three DevComms with different connection types.
   auto makeReqs = [](mori::cco::CcoGdaConnectionType ct) {
     mori::cco::CcoDevCommRequirements reqs = CCO_DEV_COMM_REQUIREMENTS_INITIALIZER;
-    reqs.gdaConnectionType = ct;
+    reqs.gdaConnectionType   = ct;
+    reqs.lsaBarrierCount     = 4;  // LSA barrier slab in resource window
+    reqs.railGdaBarrierCount = 2;  // rail GDA barrier → IBGDA signal pool
+    reqs.barrierCount        = 3;  // hybrid LSA + rail GDA
     return reqs;
   };
 

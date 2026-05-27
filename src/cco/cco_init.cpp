@@ -18,9 +18,6 @@
 namespace mori {
 namespace cco {
 
-static constexpr size_t INTERNAL_SYNC_COUNT = 128;
-static constexpr size_t INTERNAL_SYNC_BYTES = INTERNAL_SYNC_COUNT * sizeof(uint64_t);
-
 static size_t AlignUp(size_t x, size_t align) {
   return (x + align - 1) & ~(align - 1);
 }
@@ -208,10 +205,6 @@ int CcoCommCreate(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
     comm->sdmaNumQueue = 0;
   }
 
-  // Step 5: device-barrier scratch.
-  HIP_RUNTIME_CHECK(hipMalloc(&comm->internalSyncGpuPtr, INTERNAL_SYNC_BYTES));
-  HIP_RUNTIME_CHECK(hipMemset(comm->internalSyncGpuPtr, 0, INTERNAL_SYNC_BYTES));
-
   // RDMA QP endpoints are NOT pre-allocated here. CcoDevCommCreate builds
   // a fresh QP set per DevComm via ctx->CreateAdditionalEndpoints, sized by
   // reqs.gdaContextCount, so multiple DevComms can coexist with independent
@@ -257,7 +250,6 @@ int CcoCommDestroy(CcoComm* comm) {
   comm->allocTable.clear();
 
   if (comm->sdmaDevHandles) HIP_RUNTIME_CHECK(hipFree(comm->sdmaDevHandles));
-  if (comm->internalSyncGpuPtr) HIP_RUNTIME_CHECK(hipFree(comm->internalSyncGpuPtr));
 
   // Release flat VA — sized to match the reservation in CcoCommCreate.
   if (comm->flatBase) {
@@ -831,7 +823,6 @@ int CcoDevCommCreate(CcoComm* comm,
   hostShadow.gdaConnType = connType;
   hostShadow.flatBase = comm->flatBase;
   hostShadow.perRankSize = comm->perRankSize;
-  hostShadow.internalSyncPtr = comm->internalSyncGpuPtr;
 
   // Fresh QP set per DevComm.
   CcoIbgdaContext& ibgda = hostShadow.ibgda;
@@ -911,11 +902,14 @@ int CcoDevCommCreate(CcoComm* comm,
   ibgda.endpoints = epsGpu;
 
   // Resource window: a CCO symmetric window backing this DevComm's session
-  // state (today: IBGDA signal/shadows/counter). Lives in the LSA flat VA
-  // + has an RDMA MR — peers can either P2P-load/store into it (intra-node)
-  // or RDMA-write to it (cross-node) using the standard window addressing
-  // formula. This is the NCCL resource-window pattern, just delegated to
-  // CCO's own MemAlloc + WindowRegister mechanism.
+  // state. Lives in the LSA flat VA + has an RDMA MR, so each block inside
+  // is simultaneously P2P-load/store-addressable by intra-node peers AND
+  // RDMA-write-target-addressable by cross-node peers — every per-session
+  // sub-allocation gets the full transport matrix "for free", same as NCCL.
+  //
+  // Current residents:
+  //   * IBGDA signal / shadows / counter pool (gdaConnType != NONE)
+  //   * LSA barrier inbox+state buffer        (lsaBarrierCount > 0)
   //
   // Layout pins signalBufOffset == 0 so a peer's RDMA atomic add still uses
   // raddr = signal_slot_id * 8 (no per-rank offset shift needed).
@@ -924,20 +918,55 @@ int CcoDevCommCreate(CcoComm* comm,
   //
   // Allocated BEFORE the windowTable build below so the GPU windowTable
   // includes it (a kernel can findWindow(devComm.resourceWindow) too).
-  int signalCount = (connType == CCO_GDA_CONNECTION_NONE) ? 0 : reqs->gdaSignalCount;
-  int counterCount = (connType == CCO_GDA_CONNECTION_NONE) ? 0 : reqs->gdaCounterCount;
-  ibgda.signalCount = signalCount;
+  // Rail team size = # of nodes (one peer per node at this lsaRank slot).
+  // GDA-Rail barriers only make sense when there are cross-node peers AND
+  // we actually have RDMA QPs to talk to them; otherwise collapse to 0.
+  int nNodes = comm->worldSize / comm->lsaSize;
+  bool gdaRailUsable = (connType != CCO_GDA_CONNECTION_NONE) && (nNodes > 1);
+
+  int signalCountUser = (connType == CCO_GDA_CONNECTION_NONE) ? 0 : reqs->gdaSignalCount;
+  int counterCount    = (connType == CCO_GDA_CONNECTION_NONE) ? 0 : reqs->gdaCounterCount;
+  int lsaBarrierCount       = reqs->lsaBarrierCount;
+  int railGdaBarrierCount   = gdaRailUsable ? reqs->railGdaBarrierCount : 0;
+  int hybridBarrierCount    = reqs->barrierCount;
+  // hybrid Rail half is only active when we have cross-rail peers + RDMA.
+  int hybridRailBarrierCount = gdaRailUsable ? hybridBarrierCount : 0;
+
+  // Signal slot assignment (NCCL-style):
+  //   [0 .. signalCountUser)                 — user-visible signal slots
+  //   [signalCountUser .. +A)                — railGdaBarrier (A = N*nNodes)
+  //   [.. +B)                                — hybridRailGdaBarrier (B = N*nNodes)
+  uint32_t railGdaBarrierSignal0 = static_cast<uint32_t>(signalCountUser);
+  int railGdaBarrierSignals = railGdaBarrierCount * nNodes;
+  uint32_t hybridRailBarrierSignal0 =
+      railGdaBarrierSignal0 + static_cast<uint32_t>(railGdaBarrierSignals);
+  int hybridRailBarrierSignals = hybridRailBarrierCount * nNodes;
+  int signalCount = signalCountUser + railGdaBarrierSignals + hybridRailBarrierSignals;
+  ibgda.signalCount  = signalCount;
   ibgda.counterCount = counterCount;
 
   auto alignTo = [](size_t v, size_t a) { return (v + a - 1) & ~(a - 1); };
+  auto lsaBarBytes = [&](int n) -> size_t {
+    // NCCL convention: state[3*N] + inbox[N*team.nRanks]
+    return static_cast<size_t>(3 * n + n * comm->lsaSize) * sizeof(uint32_t);
+  };
 
   struct ResourceWindowLayout {
     size_t signalBufOffset = 0;
     size_t signalShadowsOffset = 0;
     size_t counterBufOffset = 0;
+    size_t lsaBarrierOffset = 0;
+    size_t lsaBarrierBytes = 0;
+    size_t hybridLsaBarrierOffset = 0;
+    size_t hybridLsaBarrierBytes = 0;
     size_t totalSize = 0;
   } layout;
-  if (signalCount > 0 || counterCount > 0) {
+  if (lsaBarrierCount > 0)    layout.lsaBarrierBytes       = lsaBarBytes(lsaBarrierCount);
+  if (hybridBarrierCount > 0) layout.hybridLsaBarrierBytes = lsaBarBytes(hybridBarrierCount);
+
+  bool needWindow = signalCount > 0 || counterCount > 0 || lsaBarrierCount > 0 ||
+                    hybridBarrierCount > 0;
+  if (needWindow) {
     size_t off = 0;
     layout.signalBufOffset = off;        // pinned at 0
     off += static_cast<size_t>(signalCount) * sizeof(uint64_t);
@@ -947,6 +976,18 @@ int CcoDevCommCreate(CcoComm* comm,
     off = alignTo(off, 8);
     layout.counterBufOffset = off;
     off += static_cast<size_t>(counterCount) * sizeof(uint64_t);
+    // LSA barrier slabs: 128B align so peers' P2P stores hit a cache-line-
+    // isolated region.
+    if (lsaBarrierCount > 0) {
+      off = alignTo(off, 128);
+      layout.lsaBarrierOffset = off;
+      off += layout.lsaBarrierBytes;
+    }
+    if (hybridBarrierCount > 0) {
+      off = alignTo(off, 128);
+      layout.hybridLsaBarrierOffset = off;
+      off += layout.hybridLsaBarrierBytes;
+    }
     layout.totalSize = off;
   }
 
@@ -966,12 +1007,26 @@ int CcoDevCommCreate(CcoComm* comm,
       return -1;
     }
     auto* base = static_cast<uint8_t*>(resourceWindowPtr);
-    ibgda.signalBuf =
-        reinterpret_cast<uint64_t*>(base + layout.signalBufOffset);
-    ibgda.signalShadows =
-        reinterpret_cast<uint64_t*>(base + layout.signalShadowsOffset);
-    ibgda.counterBuf =
-        reinterpret_cast<uint64_t*>(base + layout.counterBufOffset);
+    if (signalCount > 0) {
+      ibgda.signalBuf =
+          reinterpret_cast<uint64_t*>(base + layout.signalBufOffset);
+      ibgda.signalShadows =
+          reinterpret_cast<uint64_t*>(base + layout.signalShadowsOffset);
+    }
+    if (counterCount > 0) {
+      ibgda.counterBuf =
+          reinterpret_cast<uint64_t*>(base + layout.counterBufOffset);
+    }
+    if (lsaBarrierCount > 0) {
+      hostShadow.lsaBarrier.bufOffset =
+          static_cast<uint32_t>(layout.lsaBarrierOffset);
+      hostShadow.lsaBarrier.nBarriers = lsaBarrierCount;
+    }
+    if (hybridBarrierCount > 0) {
+      hostShadow.hybridLsaBarrier.bufOffset =
+          static_cast<uint32_t>(layout.hybridLsaBarrierOffset);
+      hostShadow.hybridLsaBarrier.nBarriers = hybridBarrierCount;
+    }
 
     // Snapshot the GPU resource-window struct into the DevComm so kernels
     // can read winBase/stride4G/ibgdaWin.{lkey,peerRkeys} straight out of
@@ -981,10 +1036,27 @@ int CcoDevCommCreate(CcoComm* comm,
   }
   hostShadow.resourceWindow = resourceWindow;
 
-  MORI_SHMEM_TRACE("CcoDevCommCreate: resourceWindow={} ptr={} totalSize={} "
-                   "signals={} counters={}",
-                   (void*)resourceWindow, resourceWindowPtr, layout.totalSize,
-                   signalCount, counterCount);
+  // GDA barrier handles point into ibgda.signalBuf; no resource-window bytes
+  // consumed. Disabled handles stay {0,0}.
+  if (railGdaBarrierCount > 0) {
+    hostShadow.railGdaBarrier.signal0   = railGdaBarrierSignal0;
+    hostShadow.railGdaBarrier.nBarriers = railGdaBarrierCount;
+  }
+  if (hybridRailBarrierCount > 0) {
+    hostShadow.hybridRailGdaBarrier.signal0   = hybridRailBarrierSignal0;
+    hostShadow.hybridRailGdaBarrier.nBarriers = hybridRailBarrierCount;
+  }
+
+  MORI_SHMEM_TRACE(
+      "CcoDevCommCreate: resourceWindow={} ptr={} totalSize={} signals={} "
+      "counters={} lsaBar={} lsaBarOff={:#x} hybLsaBar={} hybLsaBarOff={:#x} "
+      "railGdaBar={} railGdaSig0={} hybRailGdaBar={} hybRailGdaSig0={}",
+      (void*)resourceWindow, resourceWindowPtr, layout.totalSize,
+      signalCount, counterCount,
+      lsaBarrierCount, layout.lsaBarrierOffset,
+      hybridBarrierCount, layout.hybridLsaBarrierOffset,
+      railGdaBarrierCount, railGdaBarrierSignal0,
+      hybridRailBarrierCount, hybridRailBarrierSignal0);
 
   // Build window-table linked list on GPU.
   const auto& tableEntries = comm->windowTableEntries;

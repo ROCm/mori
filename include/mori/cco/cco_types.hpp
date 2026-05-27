@@ -116,6 +116,43 @@ struct CcoIbgdaContext {
   uint64_t* counterBuf;        // [counterCount] — sub-ptr into resourceWindow
 };
 
+// LSA barrier handle: a {byte-offset, count} pair pointing into the DevComm's
+// resourceWindow. The barrier inbox/state buffer lives inside the resource
+// window so it inherits LSA peer P2P addressing for free (no separate
+// hipMalloc / Allgather).
+//
+// Layout in window (NCCL-style, lsa team):
+//   uint32_t state[3*nBarriers]                          ← local epoch / arrive counters
+//   uint32_t inbox[nBarriers * lsaSize]                  ← per-rank slots, peers store-add here
+//
+// Sizing convention:
+//   bufferBytes = (3*N + N*lsaSize) * sizeof(uint32_t)
+//
+// Device side: barrier session computes the peer slot address as
+//   winBase + peerLsa*stride4G<<32 + bufOffset + barrierIdx*lsaSize*4 + myLsa*4
+struct CcoLsaBarrierHandle {
+  uint32_t bufOffset;   // byte offset within resourceWindow; 0 == disabled
+  int      nBarriers;   // 0 == disabled
+};
+
+// GDA barrier handle: barriers via IBGDA signal pool. NCCL-style — each
+// barrier consumes `team.nRanks` signal slots; peers do RDMA atomic-add to
+// `signalBuf[signal0 + barrierIdx * team.nRanks + mySrcIdx]` and poll/reset.
+// Team is determined by which DevComm field this handle lives in:
+//   * railGdaBarrier         → same-lsaRank cross-node (rail) team, size = nNodes
+//   * hybridRailGdaBarrier   → same rail team (paired with hybridLsaBarrier
+//                              for two-stage world-spanning barrier)
+//
+// Sizing convention:
+//   ginSignalCount = nBarriers * teamSize    (no buffer bytes consumed)
+//
+// Device side: barrier session uses signal0 + barrierIdx*teamSize + srcRailIdx
+// to compute the slot id, then RDMA atomic-add via IBGDA window.
+struct CcoGdaBarrierHandle {
+  uint32_t signal0;     // starting slot id in ibgda.signalBuf; 0 + nBarriers==0 == disabled
+  int      nBarriers;   // 0 == disabled
+};
+
 // SDMA context: per-DevComm signal pool + IPC-mapped peer pointers.
 // Empty when SDMA is not used by this DevComm.
 struct CcoSdmaContext {
@@ -138,7 +175,6 @@ struct CcoDevComm {
   CcoGdaConnectionType gdaConnType;
 
   // Common
-  uint64_t* internalSyncPtr;             // [128] for device barriers
   void* flatBase;
   size_t perRankSize;
   CcoWindowTableNode* windowTable;       // GPU linked list of registered windows
@@ -168,6 +204,18 @@ struct CcoDevComm {
 
   // IBGDA context (QP + signal + counter); empty when gdaConnType==NONE.
   CcoIbgdaContext ibgda;
+  // Standalone barriers (mirroring NCCL `ncclDevComm`):
+  //   * lsaBarrier            — intra-node, driven by reqs.lsaBarrierCount
+  //   * railGdaBarrier        — same-rail cross-node, driven by reqs.railGdaBarrierCount
+  // Hybrid barrier pair (two-stage LSA+Rail world barrier):
+  //   * hybridLsaBarrier      — intra-node half
+  //   * hybridRailGdaBarrier  — inter-node half (same rail team)
+  // All four are driven from CcoDevCommRequirements counts; any field with
+  // nBarriers==0 is disabled.
+  CcoLsaBarrierHandle lsaBarrier;
+  CcoGdaBarrierHandle railGdaBarrier;
+  CcoLsaBarrierHandle hybridLsaBarrier;
+  CcoGdaBarrierHandle hybridRailGdaBarrier;
   // SDMA context (signal pool); empty when SDMA not materialized.
   CcoSdmaContext sdma;
 };
@@ -215,10 +263,14 @@ struct CcoDevCommRequirements {
   // LSA (intra-node P2P).
   int lsaBarrierCount;
 
+  // GDA-Rail (same-lsaRank cross-node) standalone barrier.
+  int railGdaBarrierCount;
+
   // SDMA.
   int sdmaQueueCount;                       // 0 = anvil default
 
-  // Hybrid barrier (LSA + GDA-Rail two-stage).
+  // Hybrid barrier (LSA + GDA-Rail two-stage). Drives BOTH
+  // hybridLsaBarrier and hybridRailGdaBarrier with the same N.
   int barrierCount;
 };
 
@@ -234,6 +286,7 @@ struct CcoDevCommRequirements {
     0,                                        /* gdaQueueDepth      */         \
     -1,                                       /* gdaTrafficClass    */         \
     0,                                        /* lsaBarrierCount    */         \
+    0,                                        /* railGdaBarrierCount*/         \
     0,                                        /* sdmaQueueCount     */         \
     0,                                        /* barrierCount       */         \
 }
@@ -293,8 +346,6 @@ struct CcoComm {
   // SDMA queue handles (per-comm, sized lsaSize * sdmaNumQueue, indexed by lsaRank).
   anvil::SdmaQueueDeviceHandle** sdmaDevHandles{nullptr};
   int sdmaNumQueue{0};
-
-  uint64_t* internalSyncGpuPtr{nullptr};
 
   struct AllocMeta {
     hipMemGenericAllocationHandle_t physHandle;

@@ -133,8 +133,11 @@ static void run_rank(int rank, int nranks, const mori::application::UniqueId& ui
   }
   printf("[rank %d] WindowRegister x2 OK\n", rank);
 
-  // Phase 3: DevCommCreate with default requirements
+  // Phase 3: DevCommCreate with default requirements + all barrier handles.
   mori::cco::CcoDevCommRequirements reqs = CCO_DEV_COMM_REQUIREMENTS_INITIALIZER;
+  reqs.lsaBarrierCount     = 4;  // standalone LSA barrier (resource-window slab)
+  reqs.railGdaBarrierCount = 2;  // standalone GDA-Rail barrier (signal pool)
+  reqs.barrierCount        = 3;  // hybrid LSA + GDA-Rail two-stage barrier
   mori::cco::CcoDevComm* devComm = nullptr;
   ret = mori::cco::CcoDevCommCreate(comm, &reqs, &devComm);
   if (ret != 0) {
@@ -154,6 +157,31 @@ static void run_rank(int rank, int nranks, const mori::application::UniqueId& ui
     snprintf(result->detail, sizeof(result->detail),
              "DevComm mismatch: rank=%d(want %d) world=%d(want %d)", devCommHost.rank, rank,
              devCommHost.worldSize, nranks);
+    goto cleanup;
+  }
+  // lsaBarrier handle populated and resource window allocated.
+  if (devCommHost.lsaBarrier.nBarriers != reqs.lsaBarrierCount ||
+      devCommHost.resourceWindow == nullptr) {
+    snprintf(result->detail, sizeof(result->detail),
+             "lsaBarrier handle bad: nBarriers=%d (want %d) resourceWindow=%p",
+             devCommHost.lsaBarrier.nBarriers, reqs.lsaBarrierCount,
+             devCommHost.resourceWindow);
+    goto cleanup;
+  }
+  // hybridLsaBarrier handle populated.
+  if (devCommHost.hybridLsaBarrier.nBarriers != reqs.barrierCount) {
+    snprintf(result->detail, sizeof(result->detail),
+             "hybridLsaBarrier handle bad: nBarriers=%d (want %d)",
+             devCommHost.hybridLsaBarrier.nBarriers, reqs.barrierCount);
+    goto cleanup;
+  }
+  // Single-node test: nNodes==1 → rail GDA handles must collapse to disabled.
+  if (devCommHost.railGdaBarrier.nBarriers != 0 ||
+      devCommHost.hybridRailGdaBarrier.nBarriers != 0) {
+    snprintf(result->detail, sizeof(result->detail),
+             "rail GDA handles must collapse on single-node: rail=%d hyb=%d",
+             devCommHost.railGdaBarrier.nBarriers,
+             devCommHost.hybridRailGdaBarrier.nBarriers);
     goto cleanup;
   }
 
