@@ -59,7 +59,10 @@ struct CcoLsaBarrierSession {
                                          uint32_t index);
   __device__ inline ~CcoLsaBarrierSession();
 
+  // Write epoch+1 into peer's inbox slot reserved for us, cross-gpu write
   __device__ inline void arrive(Group);
+
+  // Read each peer's arrival signal from my own buffer at slot[peer]
   __device__ inline void wait(Group);
   __device__ inline int wait(Group, uint64_t timeoutCycles);
 
@@ -67,7 +70,6 @@ struct CcoLsaBarrierSession {
   __device__ inline int sync(Group, uint64_t timeoutCycles);
 
  private:
-  // inbox where `owner` expects to receive a signal from `peer`
   __device__ inline uint32_t* ucInbox(int owner, int peer) {
     uint32_t* state = CcoGetResourceBuffer(comm, handle.bufHandle, owner);
     return state + handle.nBarriers + index * comm->worldSize + peer;

@@ -62,8 +62,9 @@ __device__ inline void CcoLsaBarrierSession<Group>::arrive(Group) {
 
   for (int i = this->group.thread_rank(); i < nranks - 1; i += this->group.size()) {
     int peer = i + ((i >= myRank) ? 1 : 0);
-    // Write epoch+1 into peer's inbox slot reserved for us.
-    __atomic_store_n(this->ucInbox(peer, myRank), this->epoch + 1, __ATOMIC_RELAXED);
+    // Write epoch+1 into peer's inbox slot reserved for us， cross-gpu write
+    __hip_atomic_store(this->ucInbox(peer, myRank), this->epoch + 1, __ATOMIC_RELAXED,
+                       __HIP_MEMORY_SCOPE_SYSTEM);
   }
 }
 
@@ -84,7 +85,7 @@ __device__ inline int CcoLsaBarrierSession<Group>::waitInternal(Group, uint64_t 
     uint32_t* slot = this->ucInbox(myRank, peer);
 
     while (true) {
-      uint32_t got = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
+      uint32_t got = __hip_atomic_load(slot, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
       if ((got - (uint32_t)(this->epoch + 1)) == 0) break;
 
       if constexpr (EnableTimeout) {
