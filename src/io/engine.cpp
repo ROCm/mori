@@ -25,7 +25,9 @@
 #include <unistd.h>
 
 #include <cctype>
+#include <chrono>
 #include <cstdlib>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -554,6 +556,61 @@ bool IOEngine::PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
     if (popped) return true;
   }
   return false;
+}
+
+StatusCode IOEngine::WaitAll(const std::vector<TransferStatus*>& statuses, int timeoutMs) {
+  if (statuses.empty()) return StatusCode::SUCCESS;
+
+  if (timeoutMs == 0) {
+    bool anyInProgress = false;
+    for (TransferStatus* status : statuses) {
+      if (status == nullptr) continue;
+      StatusCode rc = status->WaitFor(0);
+      if (rc == StatusCode::IN_PROGRESS) {
+        anyInProgress = true;
+        continue;
+      }
+      if (rc != StatusCode::SUCCESS) return rc;
+    }
+    return anyInProgress ? StatusCode::IN_PROGRESS : StatusCode::SUCCESS;
+  }
+
+  if (timeoutMs < 0) {
+    StatusCode firstError = StatusCode::SUCCESS;
+    for (TransferStatus* status : statuses) {
+      if (status == nullptr) continue;
+      StatusCode rc = status->WaitFor(-1);
+      if (rc != StatusCode::SUCCESS && firstError == StatusCode::SUCCESS) {
+        firstError = rc;
+      }
+    }
+    return firstError;
+  }
+
+  using Clock = std::chrono::steady_clock;
+  const auto deadline = Clock::now() + std::chrono::milliseconds(timeoutMs);
+  StatusCode firstError = StatusCode::SUCCESS;
+  for (TransferStatus* status : statuses) {
+    if (status == nullptr) continue;
+
+    const auto now = Clock::now();
+    if (now >= deadline) {
+      return firstError != StatusCode::SUCCESS ? firstError : StatusCode::IN_PROGRESS;
+    }
+
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+    const int remainingMs = remaining.count() > std::numeric_limits<int>::max()
+                                ? std::numeric_limits<int>::max()
+                                : static_cast<int>(remaining.count());
+    StatusCode rc = status->WaitFor(remainingMs);
+    if (rc == StatusCode::IN_PROGRESS) {
+      return firstError != StatusCode::SUCCESS ? firstError : StatusCode::IN_PROGRESS;
+    }
+    if (rc != StatusCode::SUCCESS && firstError == StatusCode::SUCCESS) {
+      firstError = rc;
+    }
+  }
+  return firstError;
 }
 
 }  // namespace io
