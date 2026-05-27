@@ -96,8 +96,9 @@ __device__ inline int CcoLsaBarrierSession<Group>::waitInternal(Group, uint64_t 
     }
   }
 
-done:
   this->epoch += 1;
+
+done:
   this->group.sync();
   return ret;
 }
