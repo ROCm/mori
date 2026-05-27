@@ -961,20 +961,19 @@ int CcoDevCommCreate(CcoComm* comm,
     HIP_RUNTIME_CHECK(hipMalloc(&sdma.expectSignals, poolBytes));
     HIP_RUNTIME_CHECK(hipMemset(sdma.expectSignals, 0, poolBytes));
 
+    // Use std::vector for host scratch so any exception thrown by
+    // bootNet->Allgather (cross-rank comm) doesn't leak heap.
     hipIpcMemHandle_t myHandle;
     HIP_RUNTIME_CHECK(hipIpcGetMemHandle(&myHandle, sdma.signalBuf));
-    auto* handles = static_cast<hipIpcMemHandle_t*>(
-        calloc(comm->worldSize, sizeof(hipIpcMemHandle_t)));
-    comm->bootNet->Allgather(&myHandle, handles, sizeof(hipIpcMemHandle_t));
+    std::vector<hipIpcMemHandle_t> handles(comm->worldSize);
+    comm->bootNet->Allgather(&myHandle, handles.data(), sizeof(hipIpcMemHandle_t));
 
     // Also Allgather raw VAs — used for same-process peers where IPC fails.
     HSAuint64* myRawVa = sdma.signalBuf;
-    auto* rawVas =
-        static_cast<HSAuint64**>(calloc(comm->worldSize, sizeof(HSAuint64*)));
-    comm->bootNet->Allgather(&myRawVa, rawVas, sizeof(HSAuint64*));
+    std::vector<HSAuint64*> rawVas(comm->worldSize, nullptr);
+    comm->bootNet->Allgather(&myRawVa, rawVas.data(), sizeof(HSAuint64*));
 
-    auto* peerPtrs_host =
-        static_cast<HSAuint64**>(calloc(comm->lsaSize, sizeof(HSAuint64*)));
+    std::vector<HSAuint64*> peerPtrs_host(comm->lsaSize, nullptr);
     peerPtrs_host[comm->lsaRank] = sdma.signalBuf;
     for (int lsa = 0; lsa < comm->lsaSize; lsa++) {
       if (lsa == comm->lsaRank) continue;
@@ -1009,12 +1008,10 @@ int CcoDevCommCreate(CcoComm* comm,
     }
     HIP_RUNTIME_CHECK(
         hipMalloc(&sdma.peerSignalPtrs, sizeof(HSAuint64*) * comm->lsaSize));
-    HIP_RUNTIME_CHECK(hipMemcpy(sdma.peerSignalPtrs, peerPtrs_host,
+    HIP_RUNTIME_CHECK(hipMemcpy(sdma.peerSignalPtrs, peerPtrs_host.data(),
                                 sizeof(HSAuint64*) * comm->lsaSize,
                                 hipMemcpyHostToDevice));
-    free(peerPtrs_host);
-    free(rawVas);
-    free(handles);
+    // handles / rawVas / peerPtrs_host destructed by std::vector RAII.
 
     sdma.deviceHandles = comm->sdmaDevHandles;
     MORI_SHMEM_TRACE("CcoDevCommCreate: SDMA pool signalBuf={} expectSignals={} "
@@ -1061,16 +1058,15 @@ int CcoDevCommCreate(CcoComm* comm,
   }
   ibgda.signalLkey = signalLkey;
 
-  auto* peerSignalRkeys_host = static_cast<uint32_t*>(calloc(comm->worldSize, sizeof(uint32_t)));
+  std::vector<uint32_t> peerSignalRkeys_host(comm->worldSize, 0);
   peerSignalRkeys_host[comm->rank] = localSignalRkey;
-  comm->bootNet->Allgather(&localSignalRkey, peerSignalRkeys_host, sizeof(uint32_t));
+  comm->bootNet->Allgather(&localSignalRkey, peerSignalRkeys_host.data(), sizeof(uint32_t));
 
   uint32_t* peerSignalRkeysGpu = nullptr;
   HIP_RUNTIME_CHECK(hipMalloc(&peerSignalRkeysGpu, sizeof(uint32_t) * comm->worldSize));
-  HIP_RUNTIME_CHECK(hipMemcpy(peerSignalRkeysGpu, peerSignalRkeys_host,
+  HIP_RUNTIME_CHECK(hipMemcpy(peerSignalRkeysGpu, peerSignalRkeys_host.data(),
                               sizeof(uint32_t) * comm->worldSize, hipMemcpyHostToDevice));
   ibgda.peerSignalRkeys = peerSignalRkeysGpu;
-  free(peerSignalRkeys_host);
 
   MORI_SHMEM_TRACE("CcoDevCommCreate: signals={} counters={} signalLkey={}", signalCount,
                    counterCount, signalLkey);
@@ -1170,6 +1166,16 @@ int CcoDevCommDestroy(CcoComm* comm, CcoDevComm* devComm) {
       hipMemcpy(&hostShadow, devComm, sizeof(CcoDevComm), hipMemcpyDeviceToHost));
 
   auto& ibgda = hostShadow.ibgda;
+
+  // CcoDevCommCreate registered signalBuf as an RDMA MR so peers can
+  // atomic-add into it from their NICs — deregister before hipFree so the
+  // NIC isn't left with a dangling reference to freed GPU memory.
+  application::RdmaDeviceContext* rdmaDevCtx =
+      (comm && comm->ctx) ? comm->ctx->GetRdmaDeviceContext() : nullptr;
+  if (rdmaDevCtx && ibgda.signalBuf) {
+    rdmaDevCtx->DeregisterRdmaMemoryRegion(ibgda.signalBuf);
+  }
+
   if (ibgda.endpoints) HIP_RUNTIME_CHECK(hipFree(ibgda.endpoints));
   if (ibgda.signalBuf) HIP_RUNTIME_CHECK(hipFree(ibgda.signalBuf));
   if (ibgda.signalShadows) HIP_RUNTIME_CHECK(hipFree(ibgda.signalShadows));
