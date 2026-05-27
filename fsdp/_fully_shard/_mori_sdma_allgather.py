@@ -30,6 +30,7 @@ class _MoriSdmaAllGatherWork:
 class MoriSdmaAllGather(AllGather):
     supports_no_copy = True
     supports_input_no_copy = True
+    supports_param_contiguous_output = True
 
     def __init__(self) -> None:
         self._collective: Optional[Any] = None
@@ -40,6 +41,8 @@ class MoriSdmaAllGather(AllGather):
         self._output_buffer: Optional[torch.Tensor] = None
         self._output_buffer_nbytes = 0
         self._registered_output_ptr: Optional[int] = None
+        self._param_contiguous_split_sizes: Optional[torch.Tensor] = None
+        self._param_contiguous_split_offsets: Optional[torch.Tensor] = None
 
     def allocate(
         self,
@@ -74,11 +77,76 @@ class MoriSdmaAllGather(AllGather):
         stream = torch.cuda.current_stream(input_tensor.device)
         count = input_tensor.numel()
         self._ensure_output_registered(collective, output_tensor)
+        if self._param_contiguous_split_sizes is not None:
+            split_sizes = self._param_contiguous_split_sizes
+            split_offsets = self._param_contiguous_split_offsets
+            if split_offsets is None:
+                raise RuntimeError("MORI param-contiguous allgather offsets are not initialized")
+            if async_op:
+                collective.start_async_param_contiguous(
+                    input_tensor,
+                    output_tensor,
+                    count,
+                    split_sizes,
+                    split_offsets,
+                    stream=stream,
+                )
+                return _MoriSdmaAllGatherWork(collective, stream)
+            collective.enqueue_param_contiguous(
+                input_tensor,
+                output_tensor,
+                count,
+                split_sizes,
+                split_offsets,
+                stream=stream,
+            )
+            return None
         if async_op:
             collective.start_async(input_tensor, output_tensor, count, stream=stream)
             return _MoriSdmaAllGatherWork(collective, stream)
         collective.enqueue(input_tensor, output_tensor, count, stream=stream)
         return None
+
+    def prepare_param_contiguous_output(
+        self,
+        split_sizes: list[int],
+        *,
+        element_size: int,
+        device: torch.device,
+    ) -> bool:
+        self.clear_param_contiguous_output()
+        if not split_sizes:
+            return False
+        split_sizes_u32: list[int] = []
+        split_offsets_u32: list[int] = []
+        offset = 0
+        for split_size in split_sizes:
+            split_nbytes = int(split_size) * element_size
+            if split_nbytes % 4 != 0:
+                return False
+            split_u32 = split_nbytes // 4
+            split_offsets_u32.append(offset)
+            split_sizes_u32.append(split_u32)
+            offset += split_u32
+        self._param_contiguous_split_sizes = torch.tensor(
+            split_sizes_u32, dtype=torch.int64, device=device
+        )
+        self._param_contiguous_split_offsets = torch.tensor(
+            split_offsets_u32, dtype=torch.int64, device=device
+        )
+        return True
+
+    def clear_param_contiguous_output(self) -> None:
+        self._param_contiguous_split_sizes = None
+        self._param_contiguous_split_offsets = None
+
+    def param_contiguous_metadata(self) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if (
+            self._param_contiguous_split_sizes is None
+            or self._param_contiguous_split_offsets is None
+        ):
+            return None
+        return self._param_contiguous_split_sizes, self._param_contiguous_split_offsets
 
     def _validate_tensors(
         self,

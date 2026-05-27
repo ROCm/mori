@@ -39,6 +39,10 @@ class AllGatherResult(NamedTuple):
     all_gather_no_copy: bool = False
     # Keeps a skipped copy-in source tensor alive until the all-gather result is freed.
     all_gather_input: Optional[torch.Tensor] = None
+    # Whether MORI wrote multi-param output as [param][rank] contiguous blocks.
+    param_contiguous_output: bool = False
+    # Keeps device split metadata alive for async param-contiguous MORI launches.
+    param_contiguous_metadata: Optional[tuple[torch.Tensor, torch.Tensor]] = None
 
 
 lib = torch.library.Library("fsdp", "FRAGMENT")  # noqa: TOR901
@@ -267,11 +271,26 @@ def foreach_all_gather(
             all_gather_inputs = [*chain.from_iterable(param_all_gather_inputs)]
         inp_split_sizes = [t.numel() for t in all_gather_inputs]
         all_gather_input_numel = sum(inp_split_sizes)
+        param_contiguous_output = _can_use_param_contiguous_all_gather_output(
+            all_gather_comm,
+            fsdp_params,
+            param_all_gather_input_numels,
+            param_all_gather_input_dtypes,
+        )
+        if param_contiguous_output:
+            param_contiguous_output = all_gather_comm.prepare_param_contiguous_output(
+                inp_split_sizes,
+                element_size=torch.empty((), dtype=dtype).element_size(),
+                device=device,
+            )
+        elif hasattr(all_gather_comm, "clear_param_contiguous_output"):
+            all_gather_comm.clear_param_contiguous_output()
         all_gather_output = all_gather_comm.allocate(
             (all_gather_input_numel * world_size,), dtype=dtype, device=device
         )
         input_no_copy = (
-            getattr(all_gather_comm, "supports_input_no_copy", False)
+            not param_contiguous_output
+            and getattr(all_gather_comm, "supports_input_no_copy", False)
             and len(all_gather_inputs) == 1
             and all_gather_inputs[0].is_contiguous()
             and all_gather_inputs[0].numel() == all_gather_input_numel
@@ -279,7 +298,12 @@ def foreach_all_gather(
         )
         record_all_gather(all_gather_input_numel)
         record_copy_in(all_gather_input_numel, skipped=input_no_copy)
-        if input_no_copy:
+        if param_contiguous_output:
+            all_gather_input = torch.empty(
+                (all_gather_input_numel,), dtype=dtype, device=device
+            )
+            torch._foreach_copy_(torch.split(all_gather_input, inp_split_sizes), all_gather_inputs)
+        elif input_no_copy:
             all_gather_input = all_gather_inputs[0]
         else:
             all_gather_input, all_gather_output = torch.ops.fsdp.all_gather_copy_in(
@@ -298,6 +322,12 @@ def foreach_all_gather(
             group=group,
             async_op=async_op,
         )
+        param_contiguous_metadata = (
+            all_gather_comm.param_contiguous_metadata()
+            if param_contiguous_output
+            and hasattr(all_gather_comm, "param_contiguous_metadata")
+            else None
+        )
         all_gather_event = all_gather_stream.record_event()
         return AllGatherResult(
             all_gather_output,
@@ -308,7 +338,41 @@ def foreach_all_gather(
             inp_split_sizes,
             getattr(all_gather_comm, "supports_no_copy", False),
             all_gather_input,
+            param_contiguous_output,
+            param_contiguous_metadata,
         )
+
+
+def _can_use_param_contiguous_all_gather_output(
+    all_gather_comm: AllGather,
+    fsdp_params: list[FSDPParam],
+    param_all_gather_input_numels: list[list[int]],
+    param_all_gather_input_dtypes: list[list[torch.dtype]],
+) -> bool:
+    if not getattr(all_gather_comm, "supports_param_contiguous_output", False):
+        return False
+    if not getattr(all_gather_comm, "supports_no_copy", False):
+        return False
+    if compiled_autograd_enabled():
+        return False
+    if len(fsdp_params) <= 1:
+        return False
+    if len(param_all_gather_input_numels) != len(fsdp_params):
+        return False
+    if len(param_all_gather_input_dtypes) != len(fsdp_params):
+        return False
+    for fsdp_param, input_numels, input_dtypes in zip(
+        fsdp_params, param_all_gather_input_numels, param_all_gather_input_dtypes
+    ):
+        if fsdp_param.fsdp_placement.dim != 0:
+            return False
+        if fsdp_param.is_dtensor:
+            return False
+        if hasattr(fsdp_param._sharded_local_tensor, "fsdp_post_all_gather"):
+            return False
+        if len(input_numels) != 1 or len(input_dtypes) != 1:
+            return False
+    return True
 
 
 @torch.no_grad()
@@ -483,56 +547,72 @@ def _try_no_copy_all_gather_output(
         return miss("unsupported_comm")
     if compiled_autograd_enabled():
         return miss("compiled_autograd")
-    if len(fsdp_params) != 1:
+    if len(fsdp_params) != 1 and not all_gather_result.param_contiguous_output:
         return miss("multi_param_group")
-
-    fsdp_param = fsdp_params[0]
-    if fsdp_param.fsdp_placement.dim != 0:
-        return miss("nonzero_shard_dim")
-    if fsdp_param.is_dtensor:
-        return miss("dtensor")
-    if hasattr(fsdp_param._sharded_local_tensor, "fsdp_post_all_gather"):
-        return miss("post_all_gather_hook")
-    if len(all_gather_result.param_all_gather_input_numels) != 1:
+    if len(all_gather_result.param_all_gather_input_numels) != len(fsdp_params):
         return miss("input_numel_metadata")
-    if len(all_gather_result.param_all_gather_input_dtypes) != 1:
+    if len(all_gather_result.param_all_gather_input_dtypes) != len(fsdp_params):
         return miss("input_dtype_metadata")
-    if len(all_gather_result.all_gather_input_split_sizes) != 1:
+    if len(all_gather_result.all_gather_input_split_sizes) != len(fsdp_params):
         return miss("split_metadata")
 
-    input_numels = all_gather_result.param_all_gather_input_numels[0]
-    input_dtypes = all_gather_result.param_all_gather_input_dtypes[0]
-    if len(input_numels) != 1 or len(input_dtypes) != 1:
-        return miss("multi_input_param")
-
     all_gather_output = all_gather_result.all_gather_output
-    expected_numel = input_numels[0] * world_size
+    expected_numel = sum(all_gather_result.all_gather_input_split_sizes) * world_size
     if all_gather_output.numel() != expected_numel:
         return miss("output_numel_mismatch")
-    if all_gather_output.dtype != input_dtypes[0]:
-        return miss("output_dtype_mismatch")
+    if len(fsdp_params) == 1:
+        output_views = [all_gather_output]
+    elif all_gather_result.param_contiguous_output:
+        output_views = []
+        offset = 0
+        for split_size in all_gather_result.all_gather_input_split_sizes:
+            output_numels = split_size * world_size
+            output_views.append(all_gather_output.narrow(0, offset, output_numels))
+            offset += output_numels
+    else:
+        return miss("multi_param_group")
 
-    existing_outputs = fsdp_param.all_gather_outputs
-    if hasattr(fsdp_param, "_unsharded_param"):
-        if not existing_outputs:
-            raise RuntimeError(
-                "MORI FSDP no-copy allgather expected a stable output buffer "
-                "after the unsharded parameter was initialized"
-            )
-        existing = existing_outputs[0]
-        if (
-            existing.data_ptr() != all_gather_output.data_ptr()
-            or existing.numel() != all_gather_output.numel()
-            or existing.dtype != all_gather_output.dtype
-        ):
-            raise RuntimeError(
-                "MORI FSDP no-copy allgather output buffer changed after the "
-                "unsharded parameter was initialized. Use a fixed per-layer "
-                "output size or disable no-copy for this parameter group."
-            )
+    for fsdp_param, input_numels, input_dtypes, output_view in zip(
+        fsdp_params,
+        all_gather_result.param_all_gather_input_numels,
+        all_gather_result.param_all_gather_input_dtypes,
+        output_views,
+    ):
+        if fsdp_param.fsdp_placement.dim != 0:
+            return miss("nonzero_shard_dim")
+        if fsdp_param.is_dtensor:
+            return miss("dtensor")
+        if hasattr(fsdp_param._sharded_local_tensor, "fsdp_post_all_gather"):
+            return miss("post_all_gather_hook")
+        if len(input_numels) != 1 or len(input_dtypes) != 1:
+            return miss("multi_input_param")
+        if output_view.dtype != input_dtypes[0]:
+            return miss("output_dtype_mismatch")
+        if output_view.numel() != input_numels[0] * world_size:
+            return miss("param_output_numel_mismatch")
 
-    fsdp_param._keep_all_gather_output_storage = True
-    fsdp_param.all_gather_outputs = [all_gather_output]
+        existing_outputs = fsdp_param.all_gather_outputs
+        if hasattr(fsdp_param, "_unsharded_param"):
+            if not existing_outputs:
+                raise RuntimeError(
+                    "MORI FSDP no-copy allgather expected a stable output buffer "
+                    "after the unsharded parameter was initialized"
+                )
+            existing = existing_outputs[0]
+            if (
+                existing.data_ptr() != output_view.data_ptr()
+                or existing.numel() != output_view.numel()
+                or existing.dtype != output_view.dtype
+            ):
+                raise RuntimeError(
+                    "MORI FSDP no-copy allgather output buffer changed after the "
+                    "unsharded parameter was initialized. Use a fixed per-layer "
+                    "output size or disable no-copy for this parameter group."
+                )
+
+    for fsdp_param, output_view in zip(fsdp_params, output_views):
+        fsdp_param._keep_all_gather_output_storage = True
+        fsdp_param.all_gather_outputs = [output_view]
     record_copy_out(output_numel, skipped=True)
     return True
 
