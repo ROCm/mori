@@ -67,20 +67,26 @@ struct CcoWindowTableNode {
 
 // IBGDA context: QP endpoints + signal/counter resources for one DevComm.
 // One context per comm today (single NIC). Future multi-NIC may use an array.
+//
+// signalBuf / signalShadows / counterBuf are sub-pointers into the DevComm's
+// resourceWindow (a regular CCO symmetric window). For RDMA atomic add to a
+// peer's signalBuf, kernels use:
+//   lkey  = devComm->resourceWindow->ibgdaWin.lkey
+//   rkey  = devComm->resourceWindow->ibgdaWin.peerRkeys[peerWorldRank]
+//   raddr = signal_slot_id * sizeof(uint64)   (signalBuf is at offset 0
+//                                               within the resource window)
 struct CcoIbgdaContext {
   shmem::ShmemRdmaEndpoint* endpoints;  // [worldSize * numQpPerPe]
   int numQpPerPe;
 
   // Signal: remote peers atomic +1 here after put completes.
   int signalCount;
-  uint64_t* signalBuf;         // [signalCount]
-  uint64_t* signalShadows;     // [signalCount], local sent-signal tracking
-  uint32_t* peerSignalRkeys;   // [worldSize], each peer's signalBuf rkey
-  uint32_t signalLkey;         // signalBuf MR lkey
+  uint64_t* signalBuf;         // [signalCount]  — sub-ptr into resourceWindow
+  uint64_t* signalShadows;     // [signalCount]  — sub-ptr into resourceWindow
 
   // Counter: NIC loopback writes here after source data fully transmitted.
   int counterCount;
-  uint64_t* counterBuf;        // [counterCount]
+  uint64_t* counterBuf;        // [counterCount] — sub-ptr into resourceWindow
 };
 
 // SDMA context: per-DevComm signal pool + IPC-mapped peer pointers.
@@ -109,6 +115,16 @@ struct CcoDevComm {
   void* flatBase;
   size_t perRankSize;
   CcoWindowTableNode* windowTable;       // GPU linked list of registered windows
+
+  // Resource window: a CCO-internal symmetric window backing all per-
+  // DevComm session state (today: IBGDA signal/shadows/counter pool).
+  // Lives in the LSA flat VA so peers can either P2P-load/store into it
+  // (intra-node) or RDMA-write to it (cross-node) using the standard
+  // window addressing formula:
+  //   peer_va = resourceWindow->winBase + peerLsa * stride4G<<32 + offset
+  //   raddr   = offset, rkey = resourceWindow->ibgdaWin.peerRkeys[peer]
+  // Equivalent to NCCL's `resourceWindow_inlined`.
+  CcoWindowDevice* resourceWindow;       // points into windowTable
 
   // IBGDA context (QP + signal + counter); empty when gdaConnType==NONE.
   CcoIbgdaContext ibgda;
