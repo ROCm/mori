@@ -972,6 +972,12 @@ int CcoDevCommCreate(CcoComm* comm,
         reinterpret_cast<uint64_t*>(base + layout.signalShadowsOffset);
     ibgda.counterBuf =
         reinterpret_cast<uint64_t*>(base + layout.counterBufOffset);
+
+    // Snapshot the GPU resource-window struct into the DevComm so kernels
+    // can read winBase/stride4G/ibgdaWin.{lkey,peerRkeys} straight out of
+    // kernel cmem (no extra GPU memory load through the pointer).
+    HIP_RUNTIME_CHECK(hipMemcpy(&hostShadow.resourceWindow_inlined, resourceWindow,
+                                sizeof(CcoWindowDevice), hipMemcpyDeviceToHost));
   }
   hostShadow.resourceWindow = resourceWindow;
 

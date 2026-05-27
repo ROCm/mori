@@ -65,14 +65,41 @@ struct CcoWindowTableNode {
   CcoWindowTableNode* next;
 };
 
+// Per-window RDMA context: one MR shared by all QPs of one window.
+// peerRkeys is worldSize-sized — GDA targets any peer including FULL-mode
+// intra-node loopback.
+struct CcoIbgdaWin {
+  uint32_t* peerRkeys;     // [worldSize]
+  uint32_t lkey;
+};
+
+struct CcoWindowDevice {
+  // LSA flat-VA addressing (intra-node only). winBase is the window's slot in
+  // the LSA-sized flat VA reservation. Peer addressing uses LSA rank, not
+  // world rank. Cross-node access goes through ibgdaWin (iova=0 + offset).
+  //   winBase = flatBase + slotOffset
+  //   peer_va = winBase + ((uint64_t)peerLsaRank * stride4G << 32) + offset
+  //   local   = winBase + ((uint64_t)lsaRank     * stride4G << 32) + offset
+  char* winBase;
+  uint32_t stride4G;       // perRankSize >> 32 (perRankSize is 4GB-aligned)
+  int lsaRank;             // caller's index in the LSA team
+
+  // GDA / IBGDA (iova=0). raddr=dstOff, laddr=srcOff, rkey=peerRkeys[worldRank].
+  CcoIbgdaWin ibgdaWin;
+
+  // SDMA signal pool lives on CcoDevComm::sdma (per-DevComm, not per-window).
+  // Kernels consume signals via devComm->sdma.signalBuf indexed by (lsaPeer, queueId).
+};
+typedef CcoWindowDevice* CcoWindow_t;
+
 // IBGDA context: QP endpoints + signal/counter resources for one DevComm.
 // One context per comm today (single NIC). Future multi-NIC may use an array.
 //
 // signalBuf / signalShadows / counterBuf are sub-pointers into the DevComm's
 // resourceWindow (a regular CCO symmetric window). For RDMA atomic add to a
 // peer's signalBuf, kernels use:
-//   lkey  = devComm->resourceWindow->ibgdaWin.lkey
-//   rkey  = devComm->resourceWindow->ibgdaWin.peerRkeys[peerWorldRank]
+//   lkey  = devComm->resourceWindow_inlined.ibgdaWin.lkey
+//   rkey  = devComm->resourceWindow_inlined.ibgdaWin.peerRkeys[peerWorldRank]
 //   raddr = signal_slot_id * sizeof(uint64)   (signalBuf is at offset 0
 //                                               within the resource window)
 struct CcoIbgdaContext {
@@ -121,10 +148,23 @@ struct CcoDevComm {
   // Lives in the LSA flat VA so peers can either P2P-load/store into it
   // (intra-node) or RDMA-write to it (cross-node) using the standard
   // window addressing formula:
-  //   peer_va = resourceWindow->winBase + peerLsa * stride4G<<32 + offset
-  //   raddr   = offset, rkey = resourceWindow->ibgdaWin.peerRkeys[peer]
-  // Equivalent to NCCL's `resourceWindow_inlined`.
-  CcoWindowDevice* resourceWindow;       // points into windowTable
+  //   peer_va = winBase + peerLsa * stride4G<<32 + offset
+  //   raddr   = offset, rkey = peerRkeys[peer]
+  //
+  // Two fields, matching NCCL's `resourceWindow` + `resourceWindow_inlined`:
+  //   * resourceWindow         : GPU pointer to the window struct. Used
+  //                              by host-side bookkeeping (DevCommDestroy
+  //                              looks up the matching CcoWindowHost via
+  //                              this pointer); also lets `findWindow`
+  //                              from device kernels return a stable
+  //                              handle.
+  //   * resourceWindow_inlined : 32-byte CcoWindowDevice copy embedded
+  //                              right here in the kernel parameter
+  //                              space. Kernels read winBase / stride4G /
+  //                              ibgdaWin.{lkey,peerRkeys} directly out
+  //                              of cmem with no GPU-memory dereference.
+  CcoWindowDevice* resourceWindow;       // pointer into windowTable
+  CcoWindowDevice  resourceWindow_inlined;  // host-side snapshot
 
   // IBGDA context (QP + signal + counter); empty when gdaConnType==NONE.
   CcoIbgdaContext ibgda;
@@ -132,33 +172,6 @@ struct CcoDevComm {
   CcoSdmaContext sdma;
 };
 typedef CcoDevComm* CcoDevComm_t;
-
-// Per-window RDMA context: one MR shared by all QPs of one window.
-// peerRkeys is worldSize-sized — GDA targets any peer including FULL-mode
-// intra-node loopback.
-struct CcoIbgdaWin {
-  uint32_t* peerRkeys;     // [worldSize]
-  uint32_t lkey;
-};
-
-struct CcoWindowDevice {
-  // LSA flat-VA addressing (intra-node only). winBase is the window's slot in
-  // the LSA-sized flat VA reservation. Peer addressing uses LSA rank, not
-  // world rank. Cross-node access goes through ibgdaWin (iova=0 + offset).
-  //   winBase = flatBase + slotOffset
-  //   peer_va = winBase + ((uint64_t)peerLsaRank * stride4G << 32) + offset
-  //   local   = winBase + ((uint64_t)lsaRank     * stride4G << 32) + offset
-  char* winBase;
-  uint32_t stride4G;       // perRankSize >> 32 (perRankSize is 4GB-aligned)
-  int lsaRank;             // caller's index in the LSA team
-
-  // GDA / IBGDA (iova=0). raddr=dstOff, laddr=srcOff, rkey=peerRkeys[worldRank].
-  CcoIbgdaWin ibgdaWin;
-
-  // SDMA signal pool lives on CcoDevComm::sdma (per-DevComm, not per-window).
-  // Kernels consume signals via devComm->sdma.signalBuf indexed by (lsaPeer, queueId).
-};
-typedef CcoWindowDevice* CcoWindow_t;
 
 /* ────────────────────────────────────────────────────────────────────────────
  *  DevComm requirements
