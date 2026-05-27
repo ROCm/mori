@@ -65,8 +65,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--print-every",
         type=int,
-        default=1,
-        help="Rank 0 prints every N measured steps.",
+        default=10,
+        help="Rank 0 prints an aggregate every N measured steps.",
     )
     return parser.parse_args()
 
@@ -275,11 +275,24 @@ def main() -> None:
             measured_step = step - args.warmup
             measured_times.append(elapsed)
             measured_losses.append(loss)
-            if rank == 0 and measured_step % args.print_every == 0:
+            should_print = (
+                rank == 0
+                and args.print_every > 0
+                and (
+                    (measured_step + 1) % args.print_every == 0
+                    or measured_step + 1 == args.steps
+                )
+            )
+            if should_print:
+                recent_times = measured_times[-args.print_every :]
                 tokens = args.micro_batch_size * args.seq_len * world_size
+                avg_time = sum(recent_times) / len(recent_times)
                 print(
-                    f"step={measured_step} mode={args.mode} "
-                    f"time_s={elapsed:.6f} tokens_per_s={tokens / elapsed:.2f} "
+                    f"steps={measured_step - len(recent_times) + 1}-{measured_step} "
+                    f"mode={args.mode} avg_time_s={avg_time:.6f} "
+                    f"min_time_s={min(recent_times):.6f} "
+                    f"max_time_s={max(recent_times):.6f} "
+                    f"tokens_per_s={tokens / avg_time:.2f} "
                     f"loss={loss:.6f}",
                     flush=True,
                 )
