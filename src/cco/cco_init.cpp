@@ -135,8 +135,10 @@ int CcoCommCreate(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
   perRankVmmSize = AlignUp(perRankVmmSize, 1ULL << 32);
   comm->perRankSize = perRankVmmSize;
 
-  int currentDev = 0;
-  HIP_RUNTIME_CHECK(hipGetDevice(&currentDev));
+  // Cache the device once — subsequent API calls (CcoMemAlloc, CcoWindow-
+  // Register) reuse this without re-querying hipGetDevice. Callers MUST keep
+  // the calling thread bound to this device for any later CCO API on this comm.
+  HIP_RUNTIME_CHECK(hipGetDevice(&comm->cudaDev));
 
   // Query granularity with the SAME allocProp MemAlloc will use — granularity
   // can shift when requestedHandleType (FD export) is enabled.
@@ -144,7 +146,7 @@ int CcoCommCreate(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
   allocProp.type = hipMemAllocationTypePinned;
   allocProp.requestedHandleType = hipMemHandleTypePosixFileDescriptor;
   allocProp.location.type = hipMemLocationTypeDevice;
-  allocProp.location.id = currentDev;
+  allocProp.location.id = comm->cudaDev;
 
   // RECOMMENDED granularity (typically 2 MiB on modern GPUs) trades a small
   // amount of internal fragmentation for fewer page-table entries, matching
@@ -184,7 +186,7 @@ int CcoCommCreate(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
 
     // sdmaDevHandles is lsaSize × sdmaNumQueue, indexed by lsaRank. Assumes
     // ranks bind 1:1 to GPUs within a node (rank lsa ⇒ GPU lsa).
-    int srcDeviceId = currentDev;
+    int srcDeviceId = comm->cudaDev;
     size_t numSlots = static_cast<size_t>(comm->lsaSize) * comm->sdmaNumQueue;
     HIP_RUNTIME_CHECK(
         hipMalloc(&comm->sdmaDevHandles, numSlots * sizeof(anvil::SdmaQueueDeviceHandle*)));
@@ -271,9 +273,6 @@ int CcoMemAlloc(CcoComm* comm, size_t size, void** outPtr) {
     return 0;
   }
 
-  int currentDev = 0;
-  HIP_RUNTIME_CHECK(hipGetDevice(&currentDev));
-
   size_t alignedSize = AlignUp(size, comm->vmmGranularity);
 
   // Reserve a slot via first-fit in the per-rank HeapVAManager. The returned
@@ -302,7 +301,7 @@ int CcoMemAlloc(CcoComm* comm, size_t size, void** outPtr) {
   allocProp.type = hipMemAllocationTypePinned;
   allocProp.requestedHandleType = hipMemHandleTypePosixFileDescriptor;
   allocProp.location.type = hipMemLocationTypeDevice;
-  allocProp.location.id = currentDev;
+  allocProp.location.id = comm->cudaDev;
 
   hipMemGenericAllocationHandle_t physHandle = 0;
   hipError_t err = hipMemCreate(&physHandle, alignedSize, &allocProp, 0);
@@ -328,7 +327,7 @@ int CcoMemAlloc(CcoComm* comm, size_t size, void** outPtr) {
 
   hipMemAccessDesc accessDesc = {};
   accessDesc.location.type = hipMemLocationTypeDevice;
-  accessDesc.location.id = currentDev;
+  accessDesc.location.id = comm->cudaDev;
   accessDesc.flags = hipMemAccessFlagsProtReadWrite;
   err = hipMemSetAccess(localVa, alignedSize, &accessDesc, 1);
   if (err != hipSuccess) {
@@ -452,9 +451,6 @@ int CcoWindowRegister(CcoComm* comm, void* ptr, size_t size, CcoWindow_t* outWin
   MORI_SHMEM_TRACE("CcoWindowRegister: rank={} ptr={} size={} slotOffset={}", rank, ptr, size,
                    slotOffset);
 
-  int currentDev = 0;
-  HIP_RUNTIME_CHECK(hipGetDevice(&currentDev));
-
   // P2P: exchange dma-buf FDs with same-node peers and map their slots into
   // the LSA flat VA.
   std::vector<int> p2pPeers;
@@ -510,7 +506,7 @@ int CcoWindowRegister(CcoComm* comm, void* ptr, size_t size, CcoWindow_t* outWin
 
     hipMemAccessDesc accessDesc = {};
     accessDesc.location.type = hipMemLocationTypeDevice;
-    accessDesc.location.id = currentDev;
+    accessDesc.location.id = comm->cudaDev;
     accessDesc.flags = hipMemAccessFlagsProtReadWrite;
 
     for (int pe : p2pPeers) {

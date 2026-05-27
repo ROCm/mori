@@ -232,6 +232,12 @@ struct CcoComm {
   // paths across independent comm groups in the same process tree.
   int64_t groupId{0};
 
+  // Local HIP device this comm is bound to. Cached at CommCreate so we
+  // don't call hipGetDevice() on the hot path (per-MemAlloc / per-Window).
+  // Callers MUST keep the calling thread bound to this device for the
+  // lifetime of any CCO API call on this comm.
+  int cudaDev{-1};
+
   // Intra-node topology (populated at CommCreate).
   int lsaSize{1};
   int lsaRank{0};
