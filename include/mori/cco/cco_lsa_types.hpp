@@ -25,35 +25,43 @@
 #include "mori/cco/cco_types.hpp"
 
 namespace mori {
-
 namespace cco {
 
-__device__ inline void* CcoGetResourceBufferLocalPointer(CcoDevComm_t comm, uint32_t resHandle) {
-  void* lsaFlatBase = comm.lsaFlatBase;
-  uint32_t stride4G = 1;
-  void* local = lsaFlatBase + (stride4G * comm.lsaRank) << 32;
-  return (void*)(reinterpret_cast<char (*)[128]>(local) + resHandle);
+// Returns pointer to rank `rank`'s resource buffer at bufHandle offset.
+// flatBase layout: rank 0 | rank 1 | ... each slot is perRankSize bytes.
+// bufHandle is a 128-byte unit index within the rank's slot.
+__device__ inline uint32_t* CcoGetResourceBuffer(CcoDevComm_t comm, uint32_t bufHandle, int rank) {
+  char* base = reinterpret_cast<char*>(comm->flatBase);
+  char* rankBase = base + (uint64_t)rank * comm->perRankSize;
+  return reinterpret_cast<uint32_t*>(rankBase + (uint64_t)bufHandle * 128);
 }
 
+__device__ inline uint32_t* CcoGetLocalResourceBuffer(CcoDevComm_t comm, uint32_t bufHandle) {
+  return CcoGetResourceBuffer(comm, bufHandle, comm->lsa.lsaRank);
+}
+
+// State buffer layout (unicast only, no multicast):
+//   [0,          nBarriers)                    epoch[index]       (persisted across sessions)
+//   [nBarriers,  nBarriers + nBarriers*nRanks) ucInbox[index][peer]
+
 struct CcoLsaBarrierHandle {
+  uint32_t bufHandle;  // 128-byte unit index into flatBase
   uint32_t nBarriers;
-  uint32_t bufHandle;
 };
 
 template <typename Group>
 struct CcoLsaBarrierSession {
-  Group group; /* thread / warp / block */
+  Group group;
   CcoDevComm_t comm;
   CcoLsaBarrierHandle handle;
   uint32_t epoch;
   uint32_t index;
-  // (1 * nbarries + nRanks * nBarries) * uint32_t
 
-  // TODO: alloc barrier inbox memory
   // TODO: support multicast on new generation hardware
   // TODO: add flexible memory order parameters in APIs
 
-  __device__ inline CcoLsaBarrierSession(CcoDevComm_t comm, CcoLsaBarrierHandle h, uint32_t index);
+  __device__ inline CcoLsaBarrierSession(Group group, CcoDevComm_t comm, CcoLsaBarrierHandle h,
+                                         uint32_t index);
   __device__ inline ~CcoLsaBarrierSession();
 
   __device__ inline void arrive(Group);
@@ -64,15 +72,15 @@ struct CcoLsaBarrierSession {
   __device__ inline int sync(Group, uint64_t timeoutCycles);
 
  private:
+  // inbox where `owner` expects to receive a signal from `peer`
   __device__ inline uint32_t* ucInbox(int owner, int peer) {
-    uint32_t* state = comm->flatBase + owner * comm->stride4G + h.bufHandle * 128;
-    return state + nBarriers + index * ranks + peer;
+    uint32_t* state = CcoGetResourceBuffer(comm, handle.bufHandle, owner);
+    return state + handle.nBarriers + index * comm->worldSize + peer;
   }
 
   template <bool EnableTimeout>
-  __device__ inline int waitInternal(Group);
+  __device__ inline int waitInternal(Group, uint64_t timeoutCycles);
 };
 
 }  // namespace cco
-
 }  // namespace mori

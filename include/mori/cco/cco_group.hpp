@@ -20,7 +20,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#pragma
+#pragma once
 
 #include "mori/cco/cco_types.hpp"
 
@@ -36,8 +36,8 @@ struct CcoAnyGroup {
 
 struct CcoBlockGroup : CcoAnyGroup {
   __device__ inline int thread_rank() const override { return threadIdx.x; }
-  __device__ inline int size() const override{return blockDim.x} __device__
-      inline void sync() override {
+  __device__ inline int size() const override { return blockDim.x; }
+  __device__ inline void sync() override {
     __syncthreads();
   }
 };

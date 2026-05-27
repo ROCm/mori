@@ -22,90 +22,107 @@
 
 #pragma once
 
-#include "mori/cco/cco_types.hpp"
+#include "mori/cco/cco_lsa_types.hpp"
 
 namespace mori {
 namespace cco {
 
 template <typename Group>
-__device__ inline CcoLsaBarrierSession<Group>::CcoLsaBarrierSession(CcoDevComm_t comm,
-                                                                    CcoLsaBarrierHandle h,
-                                                                    uint32_t index) {
-  // TOOD
+__device__ inline CcoLsaBarrierSession<Group>::CcoLsaBarrierSession(Group grp, CcoDevComm_t comm,
+                                                                     CcoLsaBarrierHandle h,
+                                                                     uint32_t idx) {
+  this->group = grp;
+  this->comm = comm;
+  this->handle = h;
+  this->index = idx;
+
+  // Restore epoch persisted by the previous session's destructor.
+  // Inbox slots are never zeroed, so epoch must be monotonically increasing
+  // to avoid false-positive matches against stale inbox values.
+  uint32_t* state = CcoGetLocalResourceBuffer(comm, h.bufHandle);
+  this->epoch = state[idx];
 }
 
 template <typename Group>
-__device__ inline CcoLsaBarrierSession<Group>::~CcoLsaBarrierSession();
+__device__ inline CcoLsaBarrierSession<Group>::~CcoLsaBarrierSession() {
+  // Persist epoch so the next session on this barrier slot resumes correctly.
+  uint32_t* state = CcoGetLocalResourceBuffer(this->comm, this->handle.bufHandle);
+  if (this->group.thread_rank() == 0) {
+    state[this->index] = this->epoch;
+  }
+  this->group.sync();
+}
 
 template <typename Group>
 __device__ inline void CcoLsaBarrierSession<Group>::arrive(Group) {
   this->group.sync();
 
-  // Ensure that the previous write is visible to other peers
-  __threadfence_system();
+  const int nranks = this->comm->worldSize;
+  const int myRank = this->comm->lsa.lsaRank;
 
-  int nranks = 8;
-  for (int i = group.thread_rank(); i < nranks - 1; i += this->group.size()) {
-    int peer = i + ((i >= this->rank) ? 1 : 0);
-    hip::atomic_ref<uint32_t> inbox(*this->ucInbox(peer, this->rank));
-    inbox.store(this->epoch + 1, hip::memory_order_relaxed);
+  for (int i = this->group.thread_rank(); i < nranks - 1; i += this->group.size()) {
+    int peer = i + ((i >= myRank) ? 1 : 0);
+    // Write epoch+1 into peer's inbox slot reserved for us.
+    __atomic_store_n(this->ucInbox(peer, myRank), this->epoch + 1, __ATOMIC_RELAXED);
   }
-};
+}
 
 template <typename Group>
 template <bool EnableTimeout>
 __device__ inline int CcoLsaBarrierSession<Group>::waitInternal(Group, uint64_t timeoutCycles) {
-  int nranks = 8;
-  uint64_t startCycle;
+  const int nranks = this->comm->worldSize;
+  const int myRank = this->comm->lsa.lsaRank;
   int ret = 0;
 
+  uint64_t startCycle;
   if constexpr (EnableTimeout) {
-    startCycle = clock64();
+    startCycle = (uint64_t)clock64();
   }
 
   for (int i = this->group.thread_rank(); i < nranks - 1; i += this->group.size()) {
-    int peer = i + (i >= this->rank ? 1 : 0);
-    hip::atomic_ref<uint32_t> inbox(*this->ucInbox(this->rank, rank));
-    uint32_t got = inbox.load(hip::memory_order_relaxed);
+    int peer = i + ((i >= myRank) ? 1 : 0);
+    uint32_t* slot = this->ucInbox(myRank, peer);
 
     while (true) {
+      uint32_t got = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
       if ((got - (uint32_t)(this->epoch + 1)) == 0) break;
 
       if constexpr (EnableTimeout) {
-        if (clock64() - startCycle > timeoutCycle) {
-          break;
+        if ((uint64_t)clock64() - startCycle >= timeoutCycles) {
+          ret = 1;  // timeout
+          goto done;
         }
       }
     }
   }
 
+done:
+  this->epoch += 1;
   this->group.sync();
-
   return ret;
 }
 
 template <typename Group>
-__device__ inline void CcoLsaBarrierSession<Group>::wait() {
-  this->template waitInternal<false>(coop, 0ULL);
-};
+__device__ inline void CcoLsaBarrierSession<Group>::wait(Group g) {
+  this->template waitInternal<false>(g, 0ULL);
+}
 
 template <typename Group>
-__device__ inline void CcoLsaBarrierSession<Group>::wait(Group group, uint64_t timeoutCycles) {
-  this->group.sync();
-  this->template waitInternal<true>(group, timeoutCycles);
-};
+__device__ inline int CcoLsaBarrierSession<Group>::wait(Group g, uint64_t timeoutCycles) {
+  return this->template waitInternal<true>(g, timeoutCycles);
+}
 
 template <typename Group>
-__device__ inline void CcoLsaBarrierSession<Group>::sync(Group group) {
-  this->arrive();
-  this->wait(group);
-};
+__device__ inline void CcoLsaBarrierSession<Group>::sync(Group g) {
+  this->arrive(g);
+  this->wait(g);
+}
 
 template <typename Group>
-__device__ inline int CcoLsaBarrierSession<Group>::sync(Group group, uint64_t timeoutCycles) {
-  this->arrive();
-  return this->wait(group, timeoutCycles);
-};
+__device__ inline int CcoLsaBarrierSession<Group>::sync(Group g, uint64_t timeoutCycles) {
+  this->arrive(g);
+  return this->wait(g, timeoutCycles);
+}
 
 }  // namespace cco
 }  // namespace mori
