@@ -483,6 +483,7 @@ class FSDPParam:
             self._extensions_data.clear()
             return
         inner_tensor = self._sharded_local_tensor
+        direct_unsharded_tensor = False
         if not compiled_autograd_enabled() and hasattr(
             inner_tensor, "fsdp_post_all_gather"
         ):
@@ -501,12 +502,17 @@ class FSDPParam:
             # gives the unsharded parameter data directly
             assert len(self.all_gather_outputs) == 1, f"{len(self.all_gather_outputs)}"
             unsharded_tensor = self.all_gather_outputs[0]
+            direct_unsharded_tensor = True
         unsharded_param = torch.as_strided(
             unsharded_tensor,
             self._orig_size,
             self._contiguous_orig_stride,
-            storage_offset=0,
+            storage_offset=unsharded_tensor.storage_offset(),
         )
+        if direct_unsharded_tensor and unsharded_param.data_ptr() != unsharded_tensor.data_ptr():
+            _raise_assert_with_print(
+                "FSDP unsharded parameter lost its all-gather output storage offset"
+            )
         if self.is_dtensor:
             unsharded_param = _from_local_no_grad(unsharded_param, self._tp_spec)
         if hasattr(self, "_unsharded_param"):
