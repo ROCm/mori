@@ -234,8 +234,22 @@ int CcoCommDestroy(CcoComm* comm) {
 
   MORI_SHMEM_TRACE("CcoCommDestroy: rank={}", comm->rank);
 
-  for (auto* wh : comm->windows) delete wh;
-  comm->windows.clear();
+  // Safety net for callers that didn't pair every WindowRegister with a
+  // matching Deregister: walk and properly deregister each straggler so
+  // peer-imported handles, peer VA mappings, RDMA MRs, and GPU shadow
+  // structs all get released. Each Deregister removes from comm->windows,
+  // so iterate via .back() until empty.
+  while (!comm->windows.empty()) {
+    CcoWindowHost* wh = comm->windows.back();
+    if (!wh || !wh->devPtr) {
+      delete wh;
+      comm->windows.pop_back();
+      continue;
+    }
+    MORI_SHMEM_WARN("CcoCommDestroy: window {} not deregistered by caller; "
+                    "auto-deregistering", wh->localPtr);
+    (void)CcoWindowDeregister(comm, wh->devPtr);
+  }
 
   for (auto& [ptr, meta] : comm->allocTable) {
     if (meta.shareFd >= 0) close(meta.shareFd);
@@ -503,6 +517,21 @@ int CcoWindowRegister(CcoComm* comm, void* ptr, size_t size, CcoWindow_t* outWin
       return -1;
     }
 
+    // All peer-supplied fds (everything in allFds except our own slot) must
+    // be close()'d exactly once — closing them at the very end on every
+    // exit path (success and bail) is the easiest invariant to enforce.
+    // hipMemImportFromShareableHandle already dup's the underlying dma-buf
+    // reference internally, so it's safe to delay the close to here.
+    auto closePeerFds = [&]() {
+      for (int i = 0; i < static_cast<int>(allFds.size()); i++) {
+        if (i == myPeerRank) continue;  // our own shareFd is owned by meta
+        for (int fd : allFds[i]) {
+          if (fd >= 0) close(fd);
+        }
+      }
+      allFds.clear();
+    };
+
     std::vector<int> globalToPeer(worldSize, -1);
     for (int i = 0; i < p2pWorldSize; i++) {
       globalToPeer[sortedGroup[i]] = i;
@@ -513,47 +542,90 @@ int CcoWindowRegister(CcoComm* comm, void* ptr, size_t size, CcoWindow_t* outWin
     accessDesc.location.id = comm->cudaDev;
     accessDesc.flags = hipMemAccessFlagsProtReadWrite;
 
-    // Imported handles parked here; transferred to CcoWindowHost only after
-    // the whole loop succeeds so any error path can release them locally.
-    std::vector<hipMemGenericAllocationHandle_t> importedHandles;
-    importedHandles.reserve(p2pPeers.size());
+    // Track already-mapped peers so we can roll back if any later peer
+    // fails — partial success would leave the window with missing P2P
+    // links and silently segfault when a kernel touches a missing peer.
+    struct MappedPeer {
+      hipMemGenericAllocationHandle_t handle;
+      void* peerVa;
+    };
+    std::vector<MappedPeer> mappedPeers;
+    mappedPeers.reserve(p2pPeers.size());
+
+    auto rollbackMappedPeers = [&]() {
+      for (auto& mp : mappedPeers) {
+        (void)hipMemUnmap(mp.peerVa, alignedSize);
+        (void)hipMemRelease(mp.handle);
+      }
+      mappedPeers.clear();
+    };
+
+    auto bail = [&]() {
+      rollbackMappedPeers();
+      closePeerFds();
+      localBoot.Finalize();
+    };
 
     for (int pe : p2pPeers) {
       int pr = globalToPeer[pe];
-      if (pr < 0 || pr >= static_cast<int>(allFds.size())) continue;
+      if (pr < 0 || pr >= static_cast<int>(allFds.size())) {
+        MORI_SHMEM_ERROR("CcoWindowRegister: PE {} missing in FD exchange result", pe);
+        bail();
+        return -1;
+      }
       int peerFd = allFds[pr][0];
-      if (peerFd < 0) continue;
+      if (peerFd < 0) {
+        MORI_SHMEM_ERROR("CcoWindowRegister: PE {} delivered invalid FD ({})", pe, peerFd);
+        bail();
+        return -1;
+      }
 
       hipMemGenericAllocationHandle_t importedHandle;
       hipError_t err = hipMemImportFromShareableHandleCompat(
           &importedHandle, peerFd, hipMemHandleTypePosixFileDescriptor);
-      // Either way, drop the local fd copy: hipMemImportFromShareableHandle
-      // already dup'd the underlying dma-buf reference internally.
-      close(peerFd);
       if (err != hipSuccess) {
-        MORI_SHMEM_WARN("CcoWindowRegister: import from PE {} failed: {}", pe, err);
-        continue;
+        MORI_SHMEM_ERROR("CcoWindowRegister: import from PE {} failed: {}", pe,
+                         static_cast<int>(err));
+        bail();
+        return -1;
       }
 
       int peerLsaRank = pe - comm->myNodeStart;
       void* peerVa = static_cast<char*>(comm->flatBase) +
                      static_cast<size_t>(peerLsaRank) * comm->perRankSize + slotOffset;
-      HIP_RUNTIME_CHECK(hipMemMap(peerVa, alignedSize, 0, importedHandle, 0));
-
-      // hipMemSetAccess can transiently fail under concurrent VMM operations.
-      for (int retry = 0;; retry++) {
-        hipError_t setErr = hipMemSetAccess(peerVa, alignedSize, &accessDesc, 1);
-        if (setErr == hipSuccess) break;
-        if (retry >= 5) { HIP_RUNTIME_CHECK(setErr); }
-        usleep(1000 * (1 << retry));
+      hipError_t mapErr = hipMemMap(peerVa, alignedSize, 0, importedHandle, 0);
+      if (mapErr != hipSuccess) {
+        MORI_SHMEM_ERROR("CcoWindowRegister: hipMemMap PE {} failed: {}", pe,
+                         static_cast<int>(mapErr));
+        (void)hipMemRelease(importedHandle);
+        bail();
+        return -1;
       }
 
-      importedHandles.push_back(importedHandle);
+      // hipMemSetAccess can transiently fail under concurrent VMM operations.
+      hipError_t setErr = hipSuccess;
+      for (int retry = 0; retry < 5; retry++) {
+        setErr = hipMemSetAccess(peerVa, alignedSize, &accessDesc, 1);
+        if (setErr == hipSuccess) break;
+        usleep(1000 * (1 << retry));
+      }
+      if (setErr != hipSuccess) {
+        MORI_SHMEM_ERROR("CcoWindowRegister: hipMemSetAccess PE {} failed after retries: {}",
+                         pe, static_cast<int>(setErr));
+        (void)hipMemUnmap(peerVa, alignedSize);
+        (void)hipMemRelease(importedHandle);
+        bail();
+        return -1;
+      }
+
+      mappedPeers.push_back({importedHandle, peerVa});
     }
 
     // Stash handles on the WindowHost so Deregister can release them.
-    p2pImportedHandles = std::move(importedHandles);
+    p2pImportedHandles.reserve(mappedPeers.size());
+    for (auto& mp : mappedPeers) p2pImportedHandles.push_back(mp.handle);
 
+    closePeerFds();
     localBoot.Finalize();
   }
 
@@ -573,9 +645,12 @@ int CcoWindowRegister(CcoComm* comm, void* ptr, size_t size, CcoWindow_t* outWin
     localRkey = mr.rkey;
   }
 
-  auto* peerRkeys_host = static_cast<uint32_t*>(calloc(worldSize, sizeof(uint32_t)));
+  // Allgather rkeys into a std::vector so an exception in Allgather doesn't
+  // leak the host buffer (HIP_RUNTIME_CHECKs below abort the process anyway,
+  // but bootNet->Allgather is throwing).
+  std::vector<uint32_t> peerRkeys_host(worldSize, 0);
   peerRkeys_host[rank] = localRkey;
-  comm->bootNet->Allgather(&localRkey, peerRkeys_host, sizeof(uint32_t));
+  comm->bootNet->Allgather(&localRkey, peerRkeys_host.data(), sizeof(uint32_t));
 
   // SDMA signal pool is per-DevComm, materialized by CcoDevCommCreate.
   // WindowRegister no longer allocates SDMA state — kernels look up signals
@@ -583,8 +658,8 @@ int CcoWindowRegister(CcoComm* comm, void* ptr, size_t size, CcoWindow_t* outWin
 
   uint32_t* peerRkeys_gpu = nullptr;
   HIP_RUNTIME_CHECK(hipMalloc(&peerRkeys_gpu, sizeof(uint32_t) * worldSize));
-  HIP_RUNTIME_CHECK(hipMemcpy(peerRkeys_gpu, peerRkeys_host, sizeof(uint32_t) * worldSize,
-                              hipMemcpyHostToDevice));
+  HIP_RUNTIME_CHECK(hipMemcpy(peerRkeys_gpu, peerRkeys_host.data(),
+                              sizeof(uint32_t) * worldSize, hipMemcpyHostToDevice));
 
   CcoWindowDevice hostShadow = {};
   hostShadow.winBase = static_cast<char*>(comm->flatBase) + slotOffset;
@@ -627,7 +702,7 @@ int CcoWindowRegister(CcoComm* comm, void* ptr, size_t size, CcoWindow_t* outWin
     if (pe >= comm->myNodeStart && pe < comm->myNodeStart + comm->lsaSize) continue;
     MORI_SHMEM_INFO("  XNODE PE {}: rkey={} (RDMA via iova=0)", pe, peerRkeys_host[pe]);
   }
-  free(peerRkeys_host);
+  // peerRkeys_host is std::vector — destructs cleanly at scope exit.
 
   return 0;
 }
