@@ -21,13 +21,17 @@ namespace cco {
 static constexpr size_t INTERNAL_SYNC_COUNT = 128;
 static constexpr size_t INTERNAL_SYNC_BYTES = INTERNAL_SYNC_COUNT * sizeof(uint64_t);
 
-// HeapVAManager uses 0 as its failure sentinel, so we pick a non-zero base
-// for the per-rank slot allocator and convert addr <-> slotOffset at the API
-// boundary. 1 TiB is 4 GiB-aligned and well outside any real GPU heap.
-static constexpr uintptr_t kHeapVABase = 1ULL << 40;
-
 static size_t AlignUp(size_t x, size_t align) {
   return (x + align - 1) & ~(align - 1);
+}
+
+// Local slot base = the VA where this rank's slice of the flat VA starts.
+// Used as HeapVAManager's baseAddr so Allocate() returns dereferenceable
+// localVa directly. Guaranteed non-zero because flatBase comes from
+// hipMemAddressReserve.
+static uintptr_t LocalSlotBase(const CcoComm* comm) {
+  return reinterpret_cast<uintptr_t>(comm->flatBase) +
+         static_cast<uintptr_t>(comm->lsaRank) * comm->perRankSize;
 }
 
 /* ========================================================================== */
@@ -150,17 +154,20 @@ int CcoCommCreate(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
       hipMemGetAllocationGranularity(&granularity, &allocProp, hipMemAllocationGranularityRecommended));
   comm->vmmGranularity = granularity;
 
-  // Per-rank slot allocator. baseAddr is a sentinel-distinguishing non-zero
-  // value; we subtract it back to a slotOffset at the API boundary.
-  comm->vaManager.reset(
-      new application::HeapVAManager(kHeapVABase, perRankVmmSize, granularity));
-
   // Flat VA covers the LSA team only. Cross-node peers don't use VA — RDMA
   // goes through iova=0 + offset.
   size_t totalVaSize = static_cast<size_t>(comm->lsaSize) * perRankVmmSize;
   HIP_RUNTIME_CHECK(hipMemAddressReserve(&comm->flatBase, totalVaSize, granularity, nullptr, 0));
   MORI_SHMEM_TRACE("CcoCommCreate: flatBase={} totalVA={} (lsaSize={} x perRankSize={}) granularity={}",
                    comm->flatBase, totalVaSize, comm->lsaSize, perRankVmmSize, granularity);
+
+  // Per-rank slot allocator. baseAddr is THIS rank's slot in the flat VA,
+  // so vaManager->Allocate() returns a dereferenceable localVa directly.
+  // flatBase + lsaRank*perRankSize is granularity-aligned (perRankSize is
+  // 4 GiB-aligned) and non-zero (kernel-allocated VA), satisfying
+  // HeapVAManager's invariants.
+  comm->vaManager.reset(
+      new application::HeapVAManager(LocalSlotBase(comm), perRankVmmSize, granularity));
 
   // Step 4: SDMA queue setup. Materialize only if the user opted in
   // (MORI_ENABLE_SDMA) AND at least one peer has SDMA-capable hardware.
@@ -269,9 +276,10 @@ int CcoMemAlloc(CcoComm* comm, size_t size, void** outPtr) {
 
   size_t alignedSize = AlignUp(size, comm->vmmGranularity);
 
-  // Reserve a slot via first-fit in the per-rank HeapVAManager. The manager
-  // uses 0 as a failure sentinel, so the constructor was given a non-zero
-  // base; convert back to a slot offset within [0, perRankSize).
+  // Reserve a slot via first-fit in the per-rank HeapVAManager. The returned
+  // address IS the local VA for this rank's slot — directly dereferenceable.
+  // 0 is the failure sentinel; baseAddr was set to flatBase + lsaRank*perRankSize
+  // which is non-zero, so 0 unambiguously means failure.
   uintptr_t slotAddr = comm->vaManager->Allocate(alignedSize, comm->vmmGranularity);
   if (slotAddr == 0) {
     MORI_SHMEM_ERROR(
@@ -280,7 +288,9 @@ int CcoMemAlloc(CcoComm* comm, size_t size, void** outPtr) {
         alignedSize, comm->perRankSize);
     return -1;
   }
-  size_t slotOffset = static_cast<size_t>(slotAddr - kHeapVABase);
+  // slotOffset is the offset within the rank's perRankSize slot; needed for
+  // peer-VA computation (peer's localVa = flatBase + peerLsaRank*stride + slotOffset).
+  size_t slotOffset = static_cast<size_t>(slotAddr - LocalSlotBase(comm));
 
   MORI_SHMEM_TRACE("CcoMemAlloc: rank={} size={} alignedSize={} slotOffset={}", comm->rank,
                    size, alignedSize, slotOffset);
@@ -304,8 +314,9 @@ int CcoMemAlloc(CcoComm* comm, size_t size, void** outPtr) {
   }
 
   // Map only the local slot. Peer slots are mapped lazily in WindowRegister.
-  void* localVa =
-      static_cast<char*>(comm->flatBase) + static_cast<size_t>(comm->lsaRank) * comm->perRankSize + slotOffset;
+  // slotAddr already equals flatBase + lsaRank*perRankSize + slotOffset because
+  // vaManager's baseAddr was set to LocalSlotBase(comm).
+  void* localVa = reinterpret_cast<void*>(slotAddr);
   err = hipMemMap(localVa, alignedSize, 0, physHandle, 0);
   if (err != hipSuccess) {
     MORI_SHMEM_ERROR("CcoMemAlloc: hipMemMap failed: {} ({})", static_cast<int>(err),
@@ -378,7 +389,8 @@ int CcoMemFree(CcoComm* comm, void* ptr) {
     meta = it->second;
     comm->allocTable.erase(it);
   }
-  (void)comm->vaManager->Free(kHeapVABase + static_cast<uintptr_t>(meta.slotOffset));
+  // ptr == LocalSlotBase(comm) + meta.slotOffset == the address vaManager handed out.
+  (void)comm->vaManager->Free(reinterpret_cast<uintptr_t>(ptr));
 
   size_t alignedSize = meta.size;
   size_t slotOffset = meta.slotOffset;
