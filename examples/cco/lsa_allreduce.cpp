@@ -25,14 +25,42 @@
 #include "args_parser.hpp"
 #include "mori/cco/cco_api.hpp"
 #include "mori/cco/cco_lsa_types.hpp"
+#include "mori/cco/cco_types.hpp"
 
-int main() {
+#define BUFSIZE (64)
+
+using namespace mori::cco;
+
+__global__ void allreduce_kernel() {}
+
+int main(int argc, char* argv[]) {
 #ifndef MORI_WITH_MPI
   std::fprintf(stderr, "lsa_allreduce requires MORI_WITH_MPI (enable WITH_MPI).\n");
   return 1;
 #endif
 
-  printf("cco lsa examples\n");
+  int rank, nranks;
+  MPI_Init(&argc, &argv);
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &nranks);
 
+  void* buf;
+  CcoComm* comm;
+  CcoDevComm* devComm;
+  CcoWindow_t win;
+  auto* boot = new mori::application::MpiBootstrapNetwork(MPI_COMM_WORLD);
+
+  CcoCommCreate(boot, 0, &comm);
+  assert(comm);
+
+  CcoMemAlloc(comm, BUFSIZE, &buf);
+
+  printf("Cco free resources...");
+
+  // free resources
+  CcoMemFree(comm, buf);
+  CcoCommDestroy(comm);
+
+  delete boot;
   return 0;
 }
