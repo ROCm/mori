@@ -10,12 +10,14 @@
 #include "mori/shmem/internal.hpp"
 
 #if !defined(__HIPCC__) && !defined(__CUDACC__)
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
 
 #include "mori/application/application.hpp"
 #include "mori/application/bootstrap/bootstrap.hpp"
+#include "mori/application/memory/va_manager.hpp"
 #endif
 
 namespace mori {
@@ -240,13 +242,10 @@ struct CcoComm {
   size_t perRankSize{0};
   size_t vmmGranularity{0};
 
-  // Per-rank slot allocator within [0, perRankSize). Tracks allocated
-  // intervals in a sorted "cuts" array; segments alternate empty<->full.
-  // Lazy first-fit on alloc; coalescing free.
-  struct AllocSpace {
-    std::vector<int64_t> cuts;
-  };
-  AllocSpace allocSpace;
+  // Per-rank slot allocator within [0, perRankSize). Reuses the application
+  // HeapVAManager (first-fit + O(log n) coalescing, already used by shmem).
+  // baseAddr=0 so Allocate() returns the offset directly.
+  std::unique_ptr<application::HeapVAManager> vaManager;
 
   // Default # of QPs per peer (from Context). Per-DevComm may override via reqs.
   int defaultNumQpPerPe{4};
@@ -266,9 +265,9 @@ struct CcoComm {
   };
   std::unordered_map<void*, AllocMeta> allocTable;
 
-  // Protects allocSpace, allocTable, windows, windowTableEntries against
-  // concurrent MemAlloc / MemFree / WindowRegister / WindowDeregister from
-  // multiple threads sharing the same CcoComm.
+  // Protects allocTable, windows, windowTableEntries against concurrent
+  // MemAlloc / MemFree / WindowRegister / WindowDeregister from multiple
+  // threads sharing the same CcoComm. The vaManager has its own mutex.
   mutable std::mutex allocMutex;
 
   std::vector<CcoWindowHost*> windows;

@@ -21,87 +21,13 @@ namespace cco {
 static constexpr size_t INTERNAL_SYNC_COUNT = 128;
 static constexpr size_t INTERNAL_SYNC_BYTES = INTERNAL_SYNC_COUNT * sizeof(uint64_t);
 
+// HeapVAManager uses 0 as its failure sentinel, so we pick a non-zero base
+// for the per-rank slot allocator and convert addr <-> slotOffset at the API
+// boundary. 1 TiB is 4 GiB-aligned and well outside any real GPU heap.
+static constexpr uintptr_t kHeapVABase = 1ULL << 40;
+
 static size_t AlignUp(size_t x, size_t align) {
   return (x + align - 1) & ~(align - 1);
-}
-
-/* ========================================================================== */
-/*  AllocSpace — segmented interval allocator (ported from NCCL ncclSpace).   */
-/*                                                                            */
-/*  Tracks allocated [lo, hi) intervals in a sorted `cuts` array. Segments    */
-/*  between consecutive cuts alternate empty<->full. The trailing segment is  */
-/*  always empty (the unallocated frontier). Knowing parity:                  */
-/*    isFull(i) = (i % 2 != cuts.size() % 2)                                  */
-/*                                                                            */
-/*  Alloc is first-fit; Free shrinks/splits/merges. Caller holds the mutex.   */
-/* ========================================================================== */
-
-// Insert two cuts [lo, hi) before `index`, then dedup adjacent equal entries.
-// Adjacent equal cuts collapse zero-length segments and fuse the neighbours.
-static void SpaceInsertSegment(CcoComm::AllocSpace& s, int index, int64_t lo, int64_t hi) {
-  s.cuts.insert(s.cuts.begin() + index, {lo, hi});
-
-  int count = static_cast<int>(s.cuts.size());
-  int r = index, w = index;
-  int64_t prev = (r == 0) ? 0 : s.cuts[r - 1];
-  while (r < count) {
-    int64_t cur = s.cuts[r++];
-    s.cuts[w++] = cur;
-    if (prev == cur) {
-      w -= (w == 1) ? 1 : 2;
-      cur = 0;
-    }
-    prev = cur;
-  }
-  s.cuts.resize(w);
-}
-
-// First-fit search over empty segments. On success writes the chosen aligned
-// offset into *outOffset and returns 0; returns -1 if nothing fits.
-static int SpaceAlloc(CcoComm::AllocSpace& s, int64_t limit, int64_t size,
-                      int64_t align, int64_t* outOffset) {
-  int count = static_cast<int>(s.cuts.size());
-  int i = count % 2;  // First empty segment ends at cuts[i].
-  while (i <= count) {
-    int64_t lo = (i == 0)     ? 0     : s.cuts[i - 1];
-    int64_t hi = (i == count) ? limit : s.cuts[i];
-    int64_t off = (lo + align - 1) & ~(align - 1);
-    if (off + size <= hi) {
-      *outOffset = off;
-      if (i == 0 || off + size == hi) {
-        SpaceInsertSegment(s, i, off, off + size);
-      } else {
-        s.cuts[i - 1] = off + size;  // Extend left-adjacent full segment.
-      }
-      return 0;
-    }
-    i += 2;
-  }
-  return -1;
-}
-
-// Free [offset, offset+size). Returns 0 on success, -1 if not a valid full
-// segment slice.
-static int SpaceFree(CcoComm::AllocSpace& s, int64_t offset, int64_t size) {
-  int count = static_cast<int>(s.cuts.size());
-  if (count == 0 || s.cuts[count - 1] <= offset) return -1;
-
-  int i = 1 - (count % 2);  // First full segment ends at cuts[i].
-  while (i < count && s.cuts[i] <= offset) i += 2;
-  if (i >= count) return -1;
-
-  int64_t lo = (i == 0) ? 0 : s.cuts[i - 1];
-  int64_t hi = s.cuts[i];
-  if (offset < lo || hi < offset + size) return -1;
-
-  if (i != 0 && lo == offset && offset + size != hi) {
-    s.cuts[i - 1] = offset + size;
-  } else if (lo != offset && offset + size == hi) {
-    s.cuts[i] = offset;
-  } else {
-    SpaceInsertSegment(s, i, offset, offset + size);
-  }
-  return 0;
 }
 
 /* ========================================================================== */
@@ -224,6 +150,11 @@ int CcoCommCreate(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
       hipMemGetAllocationGranularity(&granularity, &allocProp, hipMemAllocationGranularityRecommended));
   comm->vmmGranularity = granularity;
 
+  // Per-rank slot allocator. baseAddr is a sentinel-distinguishing non-zero
+  // value; we subtract it back to a slotOffset at the API boundary.
+  comm->vaManager.reset(
+      new application::HeapVAManager(kHeapVABase, perRankVmmSize, granularity));
+
   // Flat VA covers the LSA team only. Cross-node peers don't use VA — RDMA
   // goes through iova=0 + offset.
   size_t totalVaSize = static_cast<size_t>(comm->lsaSize) * perRankVmmSize;
@@ -338,31 +269,24 @@ int CcoMemAlloc(CcoComm* comm, size_t size, void** outPtr) {
 
   size_t alignedSize = AlignUp(size, comm->vmmGranularity);
 
-  // Reserve a slot via first-fit in the per-rank AllocSpace.
-  int64_t slotOffset64 = 0;
-  {
-    std::lock_guard<std::mutex> lock(comm->allocMutex);
-    if (SpaceAlloc(comm->allocSpace, static_cast<int64_t>(comm->perRankSize),
-                   static_cast<int64_t>(alignedSize),
-                   static_cast<int64_t>(comm->vmmGranularity),
-                   &slotOffset64) != 0) {
-      MORI_SHMEM_ERROR(
-          "CcoMemAlloc: slot exhausted (no contiguous {} bytes free in perRankSize={}). "
-          "Increase perRankVmmSize at CcoCommCreate or free unused allocations.",
-          alignedSize, comm->perRankSize);
-      return -1;
-    }
+  // Reserve a slot via first-fit in the per-rank HeapVAManager. The manager
+  // uses 0 as a failure sentinel, so the constructor was given a non-zero
+  // base; convert back to a slot offset within [0, perRankSize).
+  uintptr_t slotAddr = comm->vaManager->Allocate(alignedSize, comm->vmmGranularity);
+  if (slotAddr == 0) {
+    MORI_SHMEM_ERROR(
+        "CcoMemAlloc: slot exhausted (no contiguous {} bytes free in perRankSize={}). "
+        "Increase perRankVmmSize at CcoCommCreate or free unused allocations.",
+        alignedSize, comm->perRankSize);
+    return -1;
   }
-  size_t slotOffset = static_cast<size_t>(slotOffset64);
+  size_t slotOffset = static_cast<size_t>(slotAddr - kHeapVABase);
 
   MORI_SHMEM_TRACE("CcoMemAlloc: rank={} size={} alignedSize={} slotOffset={}", comm->rank,
                    size, alignedSize, slotOffset);
 
-  // Return the reserved slot to the AllocSpace on any failure after this point.
-  auto rollbackSlot = [&]() {
-    std::lock_guard<std::mutex> lock(comm->allocMutex);
-    (void)SpaceFree(comm->allocSpace, slotOffset64, static_cast<int64_t>(alignedSize));
-  };
+  // Return the reserved slot to the vaManager on any failure after this point.
+  auto rollbackSlot = [&]() { (void)comm->vaManager->Free(slotAddr); };
 
   hipMemAllocationProp allocProp = {};
   allocProp.type = hipMemAllocationTypePinned;
@@ -440,9 +364,9 @@ int CcoMemAlloc(CcoComm* comm, size_t size, void** outPtr) {
 int CcoMemFree(CcoComm* comm, void* ptr) {
   if (ptr == nullptr) return 0;
 
-  // Snapshot meta + return the slot to AllocSpace under the lock, then drop
-  // it before the (potentially slow) hipMem* calls so concurrent MemAlloc
-  // isn't blocked.
+  // Snapshot meta + return the slot to vaManager, then drop the cco mutex
+  // before the (potentially slow) hipMem* calls so concurrent MemAlloc
+  // isn't blocked. vaManager->Free takes its own mutex internally.
   CcoComm::AllocMeta meta;
   {
     std::lock_guard<std::mutex> lock(comm->allocMutex);
@@ -453,9 +377,8 @@ int CcoMemFree(CcoComm* comm, void* ptr) {
     }
     meta = it->second;
     comm->allocTable.erase(it);
-    (void)SpaceFree(comm->allocSpace, static_cast<int64_t>(meta.slotOffset),
-                    static_cast<int64_t>(meta.size));
   }
+  (void)comm->vaManager->Free(kHeapVABase + static_cast<uintptr_t>(meta.slotOffset));
 
   size_t alignedSize = meta.size;
   size_t slotOffset = meta.slotOffset;
