@@ -1020,56 +1020,93 @@ int CcoDevCommCreate(CcoComm* comm,
                      (void*)sdma.peerSignalPtrs, sdma.sdmaNumQueue);
   }
 
-  // Signal + counter buffers (skipped when GDA is disabled).
+  // IBGDA resource pool: a single hipMalloc holds signalBuf + signalShadows
+  // + counterBuf + peerSignalRkeys at fixed offsets. This is the first step
+  // toward NCCL's "resource window" model — collapses 4 hipMallocs into 1
+  // and registers a single RDMA MR covering all of it.
+  //
+  // Invariant: signalBuf lives at offset 0 within the pool, so device-side
+  // RDMA raddr math (raddr = slot_id * 8) is unchanged. Other sub-buffers
+  // are accessed by local kernel only, so their offsets don't need to be
+  // exposed to peers.
+  //
+  // The pool is non-empty whenever signal slots or counter slots are
+  // requested (typically signalCount > 0). connType==NONE => 0 slots =>
+  // no pool, no MR.
   int signalCount = (connType == CCO_GDA_CONNECTION_NONE) ? 0 : reqs->gdaSignalCount;
   int counterCount = (connType == CCO_GDA_CONNECTION_NONE) ? 0 : reqs->gdaCounterCount;
   ibgda.signalCount = signalCount;
   ibgda.counterCount = counterCount;
 
-  uint64_t* signalBufGpu = nullptr;
-  uint64_t* signalShadowsGpu = nullptr;
-  if (signalCount > 0) {
-    size_t sigBytes = signalCount * sizeof(uint64_t);
-    HIP_RUNTIME_CHECK(hipMalloc(&signalBufGpu, sigBytes));
-    HIP_RUNTIME_CHECK(hipMemset(signalBufGpu, 0, sigBytes));
-    HIP_RUNTIME_CHECK(hipMalloc(&signalShadowsGpu, sigBytes));
-    HIP_RUNTIME_CHECK(hipMemset(signalShadowsGpu, 0, sigBytes));
-  }
-  ibgda.signalBuf = signalBufGpu;
-  ibgda.signalShadows = signalShadowsGpu;
+  auto alignTo = [](size_t v, size_t a) { return (v + a - 1) & ~(a - 1); };
 
-  uint64_t* counterBufGpu = nullptr;
-  if (counterCount > 0) {
-    size_t ctrBytes = counterCount * sizeof(uint64_t);
-    HIP_RUNTIME_CHECK(hipMalloc(&counterBufGpu, ctrBytes));
-    HIP_RUNTIME_CHECK(hipMemset(counterBufGpu, 0, ctrBytes));
+  struct IbgdaPoolLayout {
+    size_t signalBufOffset = 0;
+    size_t signalShadowsOffset = 0;
+    size_t counterBufOffset = 0;
+    size_t peerRkeysOffset = 0;
+    size_t totalSize = 0;
+  } layout;
+  if (signalCount > 0 || counterCount > 0) {
+    size_t off = 0;
+    layout.signalBufOffset = off;        // pinned at 0 — kernel-side invariant
+    off += static_cast<size_t>(signalCount) * sizeof(uint64_t);
+    off = alignTo(off, 8);
+    layout.signalShadowsOffset = off;
+    off += static_cast<size_t>(signalCount) * sizeof(uint64_t);
+    off = alignTo(off, 8);
+    layout.counterBufOffset = off;
+    off += static_cast<size_t>(counterCount) * sizeof(uint64_t);
+    off = alignTo(off, 4);
+    layout.peerRkeysOffset = off;
+    off += static_cast<size_t>(comm->worldSize) * sizeof(uint32_t);
+    layout.totalSize = off;
   }
-  ibgda.counterBuf = counterBufGpu;
 
-  // Register signalBuf as an RDMA MR and Allgather rkeys.
+  uint8_t* ibgdaPool = nullptr;
+  if (layout.totalSize > 0) {
+    HIP_RUNTIME_CHECK(hipMalloc(&ibgdaPool, layout.totalSize));
+    HIP_RUNTIME_CHECK(hipMemset(ibgdaPool, 0, layout.totalSize));
+    ibgda.signalBuf =
+        reinterpret_cast<uint64_t*>(ibgdaPool + layout.signalBufOffset);
+    ibgda.signalShadows =
+        reinterpret_cast<uint64_t*>(ibgdaPool + layout.signalShadowsOffset);
+    ibgda.counterBuf =
+        reinterpret_cast<uint64_t*>(ibgdaPool + layout.counterBufOffset);
+    ibgda.peerSignalRkeys =
+        reinterpret_cast<uint32_t*>(ibgdaPool + layout.peerRkeysOffset);
+  }
+
+  // Single MR covers the whole pool. signalLkey/peerSignalRkeys[*] become
+  // "pool MR" keys; the device side combines them with the per-resource
+  // offset to compute raddr. With signalBufOffset == 0, the simplest case
+  // (signal atomic add) keeps the existing raddr = slot_id * 8 form.
   uint32_t signalLkey = 0;
-  uint32_t localSignalRkey = 0;
+  uint32_t localPoolRkey = 0;
   application::RdmaDeviceContext* rdmaDevCtx = comm->ctx->GetRdmaDeviceContext();
-  if (rdmaDevCtx && signalBufGpu && signalCount > 0) {
+  if (rdmaDevCtx && ibgdaPool) {
     application::RdmaMemoryRegion mr =
-        rdmaDevCtx->RegisterRdmaMemoryRegion(signalBufGpu, signalCount * sizeof(uint64_t));
+        rdmaDevCtx->RegisterRdmaMemoryRegion(ibgdaPool, layout.totalSize);
     signalLkey = mr.lkey;
-    localSignalRkey = mr.rkey;
+    localPoolRkey = mr.rkey;
   }
   ibgda.signalLkey = signalLkey;
 
-  std::vector<uint32_t> peerSignalRkeys_host(comm->worldSize, 0);
-  peerSignalRkeys_host[comm->rank] = localSignalRkey;
-  comm->bootNet->Allgather(&localSignalRkey, peerSignalRkeys_host.data(), sizeof(uint32_t));
+  if (ibgdaPool) {
+    std::vector<uint32_t> peerPoolRkeys_host(comm->worldSize, 0);
+    peerPoolRkeys_host[comm->rank] = localPoolRkey;
+    comm->bootNet->Allgather(&localPoolRkey, peerPoolRkeys_host.data(), sizeof(uint32_t));
+    // peerSignalRkeys lives INSIDE the pool, so this hipMemcpy writes into
+    // it directly — no separate hipMalloc for the rkey table.
+    HIP_RUNTIME_CHECK(hipMemcpy(ibgda.peerSignalRkeys, peerPoolRkeys_host.data(),
+                                sizeof(uint32_t) * comm->worldSize,
+                                hipMemcpyHostToDevice));
+  }
 
-  uint32_t* peerSignalRkeysGpu = nullptr;
-  HIP_RUNTIME_CHECK(hipMalloc(&peerSignalRkeysGpu, sizeof(uint32_t) * comm->worldSize));
-  HIP_RUNTIME_CHECK(hipMemcpy(peerSignalRkeysGpu, peerSignalRkeys_host.data(),
-                              sizeof(uint32_t) * comm->worldSize, hipMemcpyHostToDevice));
-  ibgda.peerSignalRkeys = peerSignalRkeysGpu;
-
-  MORI_SHMEM_TRACE("CcoDevCommCreate: signals={} counters={} signalLkey={}", signalCount,
-                   counterCount, signalLkey);
+  MORI_SHMEM_TRACE("CcoDevCommCreate: ibgda pool={} totalSize={} signals={} counters={} "
+                   "signalLkey={} poolRkey={}",
+                   (void*)ibgdaPool, layout.totalSize, signalCount, counterCount,
+                   signalLkey, localPoolRkey);
 
   CcoDevComm* devCommGpu = nullptr;
   HIP_RUNTIME_CHECK(hipMalloc(&devCommGpu, sizeof(CcoDevComm)));
@@ -1078,9 +1115,9 @@ int CcoDevCommCreate(CcoComm* comm,
 
   *outDevComm = devCommGpu;
   MORI_SHMEM_INFO("CcoDevCommCreate: rank={} devComm={} windows={} signals={} counters={} "
-                  "signalBuf={} counterBuf={} signalLkey={}",
+                  "pool={} signalLkey={}",
                   comm->rank, (void*)devCommGpu, numWindows, signalCount, counterCount,
-                  (void*)signalBufGpu, (void*)counterBufGpu, signalLkey);
+                  (void*)ibgdaPool, signalLkey);
 
   // Optional transport map dump, gated on MORI_CCO_LOG_TRANSPORT. Shows each
   // peer's hardware capability (canP2P/canSDMA/canRDMA) alongside whether
@@ -1167,9 +1204,11 @@ int CcoDevCommDestroy(CcoComm* comm, CcoDevComm* devComm) {
 
   auto& ibgda = hostShadow.ibgda;
 
-  // CcoDevCommCreate registered signalBuf as an RDMA MR so peers can
-  // atomic-add into it from their NICs — deregister before hipFree so the
-  // NIC isn't left with a dangling reference to freed GPU memory.
+  // IBGDA pool: signalBuf lives at offset 0 of the single hipMalloc'd pool
+  // — it serves as the pool base. signalShadows / counterBuf /
+  // peerSignalRkeys are sub-pointers within the same allocation; freeing
+  // signalBuf releases everything. The MR covers the whole pool so the
+  // matching deregister also uses signalBuf as the registered address.
   application::RdmaDeviceContext* rdmaDevCtx =
       (comm && comm->ctx) ? comm->ctx->GetRdmaDeviceContext() : nullptr;
   if (rdmaDevCtx && ibgda.signalBuf) {
@@ -1178,9 +1217,9 @@ int CcoDevCommDestroy(CcoComm* comm, CcoDevComm* devComm) {
 
   if (ibgda.endpoints) HIP_RUNTIME_CHECK(hipFree(ibgda.endpoints));
   if (ibgda.signalBuf) HIP_RUNTIME_CHECK(hipFree(ibgda.signalBuf));
-  if (ibgda.signalShadows) HIP_RUNTIME_CHECK(hipFree(ibgda.signalShadows));
-  if (ibgda.counterBuf) HIP_RUNTIME_CHECK(hipFree(ibgda.counterBuf));
-  if (ibgda.peerSignalRkeys) HIP_RUNTIME_CHECK(hipFree(ibgda.peerSignalRkeys));
+  // Don't hipFree signalShadows / counterBuf / peerSignalRkeys — they are
+  // sub-pointers of signalBuf (the pool base) and freed by the single
+  // hipFree above.
 
   // SDMA pool cleanup. peerSignalPtrs is a GPU array of host-mapped peer
   // pointers — only the cross-process entries came from hipIpcOpenMemHandle
