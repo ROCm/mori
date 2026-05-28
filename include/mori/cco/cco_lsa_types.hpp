@@ -34,19 +34,19 @@ namespace cco {
 //   [3*nBarriers, 3*nBarriers + nBarriers*lsaSize)   ucInbox[index][peer]
 
 template <typename Group>
-struct CcoLsaBarrierSession {
+struct ccoLsaBarrierSession {
   Group group;
-  CcoDevComm_t comm;
-  CcoLsaBarrierHandle handle;
+  ccoDevComm_t comm;
+  ccoLsaBarrierHandle handle;
   uint32_t epoch;
   uint32_t index;
 
   // TODO: support multicast on new generation hardware
   // TODO: add flexible memory order parameters in APIs
 
-  __device__ inline CcoLsaBarrierSession(Group group, CcoDevComm_t comm, CcoLsaBarrierHandle h,
+  __device__ inline ccoLsaBarrierSession(Group group, ccoDevComm_t comm, ccoLsaBarrierHandle h,
                                          uint32_t index);
-  __device__ inline ~CcoLsaBarrierSession();
+  __device__ inline ~ccoLsaBarrierSession();
 
   // Write epoch+1 into peer's inbox slot reserved for us, cross-gpu write
   __device__ inline void arrive(Group);
@@ -63,7 +63,7 @@ struct CcoLsaBarrierSession {
     // State buffer lives inside the DevComm's resource window at offset
     // `bufOffset`. Resource window's winBase already = flatBase + the
     // resource window's slotOffset, so applying the canonical LSA peer
-    // formula here matches getLsaPeerPtr / cco_types.hpp::CcoLsaBarrierHandle
+    // formula here matches getLsaPeerPtr / cco_types.hpp::ccoLsaBarrierHandle
     // comment (winBase + peer*stride4G<<32 + bufOffset).
     const auto& rw = comm->resourceWindow_inlined;
     char* base = rw.winBase + ((uint64_t)owner * rw.stride4G << 32);

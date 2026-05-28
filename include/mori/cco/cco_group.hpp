@@ -28,23 +28,23 @@ namespace mori {
 namespace cco {
 
 // Concrete group types used as the `Group` template arg of
-// CcoLsaBarrierSession<Group>. Each must provide:
+// ccoLsaBarrierSession<Group>. Each must provide:
 //   __device__ int  thread_rank() const   // rank within the group
 //   __device__ int  size()        const   // number of threads in the group
 //   __device__ void sync()                // group-internal sync barrier
 //
 // They are intentionally NOT derived from a virtual base: device-side
 // virtual dispatch is problematic on AMD GPU (vtable placement, devirt
-// reliability), and CcoLsaBarrierSession is a template — polymorphism is
+// reliability), and ccoLsaBarrierSession is a template — polymorphism is
 // not required.
 
-struct CcoBlockGroup {
+struct ccoBlockGroup {
   __device__ inline int  thread_rank() const { return threadIdx.x; }
   __device__ inline int  size()        const { return blockDim.x;  }
   __device__ inline void sync()              { __syncthreads();    }
 };
 
-struct CcoWarpGroup {
+struct ccoWarpGroup {
   __device__ inline int  thread_rank() const { return __lane_id(); }
   // `warpSize` is a HIP/CUDA built-in __device__ const int (64 on AMD gfx9+).
   __device__ inline int  size()        const { return warpSize; }
@@ -53,7 +53,7 @@ struct CcoWarpGroup {
   __device__ inline void sync()              { __builtin_amdgcn_wave_barrier(); }
 };
 
-struct CcoThreadGroup {
+struct ccoThreadGroup {
   __device__ inline int  thread_rank() const { return 0; }
   __device__ inline int  size()        const { return 1; }
   __device__ inline void sync()              { /* empty: a 1-thread group is trivially synced */ }

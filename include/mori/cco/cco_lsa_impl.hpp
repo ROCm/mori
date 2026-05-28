@@ -28,8 +28,8 @@ namespace mori {
 namespace cco {
 
 template <typename Group>
-__device__ inline CcoLsaBarrierSession<Group>::CcoLsaBarrierSession(Group grp, CcoDevComm_t comm,
-                                                                    CcoLsaBarrierHandle h,
+__device__ inline ccoLsaBarrierSession<Group>::ccoLsaBarrierSession(Group grp, ccoDevComm_t comm,
+                                                                    ccoLsaBarrierHandle h,
                                                                     uint32_t idx)
     : group(grp), comm(comm), handle(h), index(idx) {
 
@@ -47,7 +47,7 @@ __device__ inline CcoLsaBarrierSession<Group>::CcoLsaBarrierSession(Group grp, C
 }
 
 template <typename Group>
-__device__ inline CcoLsaBarrierSession<Group>::~CcoLsaBarrierSession() {
+__device__ inline ccoLsaBarrierSession<Group>::~ccoLsaBarrierSession() {
   // Persist epoch so the next session on this barrier slot resumes correctly.
   const auto& rw = this->comm->resourceWindow_inlined;
   char* base = rw.winBase + ((uint64_t)this->comm->lsaRank * rw.stride4G << 32);
@@ -59,7 +59,7 @@ __device__ inline CcoLsaBarrierSession<Group>::~CcoLsaBarrierSession() {
 }
 
 template <typename Group>
-__device__ inline void CcoLsaBarrierSession<Group>::arrive(Group) {
+__device__ inline void ccoLsaBarrierSession<Group>::arrive(Group) {
   this->group.sync();
 
   const int nranks = this->comm->lsaSize;
@@ -75,7 +75,7 @@ __device__ inline void CcoLsaBarrierSession<Group>::arrive(Group) {
 
 template <typename Group>
 template <bool EnableTimeout>
-__device__ inline int CcoLsaBarrierSession<Group>::waitInternal(Group, uint64_t timeoutCycles) {
+__device__ inline int ccoLsaBarrierSession<Group>::waitInternal(Group, uint64_t timeoutCycles) {
   const int nranks = this->comm->lsaSize;
   const int myRank = this->comm->lsaRank;
   int ret = 0;
@@ -110,23 +110,23 @@ done:
 }
 
 template <typename Group>
-__device__ inline void CcoLsaBarrierSession<Group>::wait(Group g) {
+__device__ inline void ccoLsaBarrierSession<Group>::wait(Group g) {
   this->template waitInternal</* DisableTimeout */ false>(g, 0ULL);
 }
 
 template <typename Group>
-__device__ inline int CcoLsaBarrierSession<Group>::wait(Group g, uint64_t timeoutCycles) {
+__device__ inline int ccoLsaBarrierSession<Group>::wait(Group g, uint64_t timeoutCycles) {
   return this->template waitInternal</* EnableTimeout */ true>(g, timeoutCycles);
 }
 
 template <typename Group>
-__device__ inline void CcoLsaBarrierSession<Group>::sync(Group g) {
+__device__ inline void ccoLsaBarrierSession<Group>::sync(Group g) {
   this->arrive(g);
   this->wait(g);
 }
 
 template <typename Group>
-__device__ inline int CcoLsaBarrierSession<Group>::sync(Group g, uint64_t timeoutCycles) {
+__device__ inline int ccoLsaBarrierSession<Group>::sync(Group g, uint64_t timeoutCycles) {
   this->arrive(g);
   return this->wait(g, timeoutCycles);
 }

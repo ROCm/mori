@@ -26,9 +26,9 @@
  * Demonstrates three variants of the same allreduce-sum, one per CCo group
  * abstraction (mori/include/mori/cco/cco_group.hpp):
  *
- *   BLOCK  : CcoBlockGroup   ── CTA-wide cooperation, __syncthreads()
- *   WARP   : CcoWarpGroup    ── wavefront-wide cooperation, wave_barrier()
- *   THREAD : CcoThreadGroup  ── single-thread, no-op sync
+ *   BLOCK  : ccoBlockGroup   ── CTA-wide cooperation, __syncthreads()
+ *   WARP   : ccoWarpGroup    ── wavefront-wide cooperation, wave_barrier()
+ *   THREAD : ccoThreadGroup  ── single-thread, no-op sync
  *
  * Per-rank input vector: (rank, rank, rank, rank).
  * Expected per-rank output: (N(N-1)/2, ...) on every rank.
@@ -59,7 +59,7 @@ using namespace mori::cco;
 // ===========================================================================
 //
 // All three follow the same protocol:
-//   1. open a CcoLsaBarrierSession on barrier slot 0
+//   1. open a ccoLsaBarrierSession on barrier slot 0
 //   2. sync (acquire — wait for peers' sendBuf to be ready)
 //   3. for each owned element i:
 //        v = sum over peers of sendBuf[i]
@@ -75,12 +75,12 @@ using namespace mori::cco;
 // ─── BLOCK variant ─────────────────────────────────────────────────────────
 //   Launch: <<<1, blockDim>>>
 //   All threads of the CTA cooperate. Stride loop over threadIdx.x.
-__global__ void lsa_allreduce_block_kernel(CcoDevComm* devComm,
-                                           CcoWindow_t sendWin, size_t sendOff,
-                                           CcoWindow_t recvWin, size_t recvOff,
+__global__ void lsa_allreduce_block_kernel(ccoDevComm* devComm,
+                                           ccoWindow_t sendWin, size_t sendOff,
+                                           ccoWindow_t recvWin, size_t recvOff,
                                            size_t count) {
-  CcoBlockGroup g;
-  CcoLsaBarrierSession<CcoBlockGroup> bar(g, devComm, devComm->lsaBarrier, 0);
+  ccoBlockGroup g;
+  ccoLsaBarrierSession<ccoBlockGroup> bar(g, devComm, devComm->lsaBarrier, 0);
   bar.sync(g);
 
   const int lsaSize = devComm->lsaSize;
@@ -101,12 +101,12 @@ __global__ void lsa_allreduce_block_kernel(CcoDevComm* devComm,
 // ─── WARP variant ──────────────────────────────────────────────────────────
 //   Launch: <<<1, 64>>>  (exactly one wavefront on AMD)
 //   The 64 lanes of one warp cooperate. Stride loop over lane id.
-__global__ void lsa_allreduce_warp_kernel(CcoDevComm* devComm,
-                                          CcoWindow_t sendWin, size_t sendOff,
-                                          CcoWindow_t recvWin, size_t recvOff,
+__global__ void lsa_allreduce_warp_kernel(ccoDevComm* devComm,
+                                          ccoWindow_t sendWin, size_t sendOff,
+                                          ccoWindow_t recvWin, size_t recvOff,
                                           size_t count) {
-  CcoWarpGroup g;
-  CcoLsaBarrierSession<CcoWarpGroup> bar(g, devComm, devComm->lsaBarrier, 0);
+  ccoWarpGroup g;
+  ccoLsaBarrierSession<ccoWarpGroup> bar(g, devComm, devComm->lsaBarrier, 0);
   bar.sync(g);
 
   const int lsaSize = devComm->lsaSize;
@@ -129,12 +129,12 @@ __global__ void lsa_allreduce_warp_kernel(CcoDevComm* devComm,
 // ─── THREAD variant ────────────────────────────────────────────────────────
 //   Launch: <<<1, 1>>>  (one single thread per rank)
 //   That thread does the whole allreduce serially.
-__global__ void lsa_allreduce_thread_kernel(CcoDevComm* devComm,
-                                            CcoWindow_t sendWin, size_t sendOff,
-                                            CcoWindow_t recvWin, size_t recvOff,
+__global__ void lsa_allreduce_thread_kernel(ccoDevComm* devComm,
+                                            ccoWindow_t sendWin, size_t sendOff,
+                                            ccoWindow_t recvWin, size_t recvOff,
                                             size_t count) {
-  CcoThreadGroup g;
-  CcoLsaBarrierSession<CcoThreadGroup> bar(g, devComm, devComm->lsaBarrier, 0);
+  ccoThreadGroup g;
+  ccoLsaBarrierSession<ccoThreadGroup> bar(g, devComm, devComm->lsaBarrier, 0);
   bar.sync(g);
 
   const int lsaSize = devComm->lsaSize;
@@ -167,18 +167,18 @@ int main(int argc, char* argv[]) {
 
   // ── Phase 1: communicator ──
   auto* boot = new mori::application::MpiBootstrapNetwork(MPI_COMM_WORLD);
-  CcoComm* comm = nullptr;
-  assert(CcoCommCreate(boot, 0, &comm) == 0);
+  ccoComm* comm = nullptr;
+  assert(ccoCommCreate(boot, 0, &comm) == 0);
 
   const size_t sizeBytes = NELEMS * sizeof(float);
 
   // ── Phase 2: register send/recv windows + init send buffer ──
   void* sendBuf = nullptr;
   void* recvBuf = nullptr;
-  CcoWindow_t sendWin = nullptr;
-  CcoWindow_t recvWin = nullptr;
-  assert(CcoWindowRegister(comm, sizeBytes, &sendWin, &sendBuf) == 0);
-  assert(CcoWindowRegister(comm, sizeBytes, &recvWin, &recvBuf) == 0);
+  ccoWindow_t sendWin = nullptr;
+  ccoWindow_t recvWin = nullptr;
+  assert(ccoWindowRegister(comm, sizeBytes, &sendWin, &sendBuf) == 0);
+  assert(ccoWindowRegister(comm, sizeBytes, &recvWin, &recvBuf) == 0);
 
   // Each rank's send vector is (rank, rank, rank, rank).
   std::vector<float> sendHost(NELEMS, static_cast<float>(rank));
@@ -203,12 +203,12 @@ int main(int argc, char* argv[]) {
   }
 
   // ── Phase 3: device communicator (1 barrier slot is enough for all 3) ──
-  CcoDevCommRequirements reqs = CCO_DEV_COMM_REQUIREMENTS_INITIALIZER;
+  ccoDevCommRequirements reqs = CCO_DEV_COMM_REQUIREMENTS_INITIALIZER;
   reqs.gdaConnectionType = CCO_GDA_CONNECTION_NONE;
   reqs.lsaBarrierCount   = 1;
 
-  CcoDevComm* devComm = nullptr;
-  assert(CcoDevCommCreate(comm, &reqs, &devComm) == 0);
+  ccoDevComm* devComm = nullptr;
+  assert(ccoDevCommCreate(comm, &reqs, &devComm) == 0);
 
   if (rank == 0) {
     printf("DevComm ready, lsaSize=%d  (running 3 group variants back-to-back)\n",
@@ -257,15 +257,15 @@ int main(int argc, char* argv[]) {
   });
 
   // ── Teardown ──
-  CcoDevCommDestroy(comm, devComm);
-  CcoWindowDeregister(comm, sendWin);
-  CcoWindowDeregister(comm, recvWin);
-  CcoMemFree(comm, sendBuf);
-  CcoMemFree(comm, recvBuf);
+  ccoDevCommDestroy(comm, devComm);
+  ccoWindowDeregister(comm, sendWin);
+  ccoWindowDeregister(comm, recvWin);
+  ccoMemFree(comm, sendBuf);
+  ccoMemFree(comm, recvBuf);
 
-  // bootstrap ownership transfers to CcoComm at CcoCommCreate; CcoCommDestroy
+  // bootstrap ownership transfers to ccoComm at ccoCommCreate; ccoCommDestroy
   // does `bootNet->Finalize()` + `delete bootNet`, which calls MPI_Finalize().
   // Don't double-free `boot` or call MPI_Finalize() a second time here.
-  CcoCommDestroy(comm);
+  ccoCommDestroy(comm);
   return totalErrors != 0 ? 1 : 0;
 }
