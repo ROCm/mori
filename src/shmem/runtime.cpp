@@ -43,13 +43,20 @@ namespace shmem {
 
 using GpuStatesAddrProvider = void* (*)();
 
-// static std::vector<GpuStatesAddrProvider> s_gpuStatesAddrProviders;
+// Use Meyer's singleton for the GpuStatesAddrProvider registry
+#define USE_SINGLETON 1
 
+#if !USE_SINGLETON
+static std::vector<GpuStatesAddrProvider> s_gpuStatesAddrProviders;
+#endif
 namespace {
   std::vector<GpuStatesAddrProvider>& GpuStatesProviders() {
+#if USE_SINGLETON
     static std::vector<GpuStatesAddrProvider> instance;   // initialized on first use
     return instance;
-    // return s_gpuStatesAddrProviders;
+#else
+    return s_gpuStatesAddrProviders;
+#endif
   }
 }  // namespace
 
