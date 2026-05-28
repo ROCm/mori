@@ -37,7 +37,7 @@ __device__ inline uint32_t* CcoGetResourceBuffer(CcoDevComm_t comm, uint32_t buf
 }
 
 __device__ inline uint32_t* CcoGetLocalResourceBuffer(CcoDevComm_t comm, uint32_t bufHandle) {
-  return CcoGetResourceBuffer(comm, bufHandle, comm->lsa.lsaRank);
+  return CcoGetResourceBuffer(comm, bufHandle, comm->rank);
 }
 
 // State buffer layout (unicast only, no multicast):
@@ -71,7 +71,7 @@ struct CcoLsaBarrierSession {
 
  private:
   __device__ inline uint32_t* ucInbox(int owner, int peer) {
-    uint32_t* state = CcoGetResourceBuffer(comm, handle.bufHandle, owner);
+    uint32_t* state = CcoGetResourceBuffer(comm, handle.bufOffset, owner);
     return state + handle.nBarriers + index * comm->worldSize + peer;
   }
 
