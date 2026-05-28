@@ -69,7 +69,7 @@ typedef enum CcoGdaSignalOp_t {
 struct CcoGda {
   CcoDevComm const& comm;
   uint32_t contextId;
-  CcoGdaCtx ctx;  // diff from nccl gin
+  CcoGdaCtx ctx;
   void* _gdaHandle;
 
   // Constructor
