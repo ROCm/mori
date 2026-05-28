@@ -30,25 +30,24 @@ namespace cco {
 template <typename Group>
 __device__ inline CcoLsaBarrierSession<Group>::CcoLsaBarrierSession(Group grp, CcoDevComm_t comm,
                                                                     CcoLsaBarrierHandle h,
-                                                                    uint32_t idx) {
-  this->group = grp;
-  this->comm = comm;
-  this->handle = h;
-  this->index = idx;
+                                                                    uint32_t idx)
+    : group(grp), comm(comm), handle(h), index(idx) {
 
   // Restore epoch persisted by the previous session's destructor.
   // Inbox slots are never zeroed, so epoch must be monotonically increasing
   // to avoid false-positive matches against stale inbox values.
-  uint32_t* state = CcoGetLocalResourceBuffer(comm, h.bufHandle);
-  this->epoch = state[idx];
+  char* base = reinterpret_cast<char*>(comm->flatBase) + (uint64_t)comm->lsaRank * comm->perRankSize;
+  uint32_t* state = reinterpret_cast<uint32_t*>(base + h.bufOffset);
+  this->epoch = state[h.nBarriers + idx];  // unicast epoch slot
 }
 
 template <typename Group>
 __device__ inline CcoLsaBarrierSession<Group>::~CcoLsaBarrierSession() {
   // Persist epoch so the next session on this barrier slot resumes correctly.
-  uint32_t* state = CcoGetLocalResourceBuffer(this->comm, this->handle.bufHandle);
+  char* base = reinterpret_cast<char*>(this->comm->flatBase) + (uint64_t)this->comm->lsaRank * this->comm->perRankSize;
+  uint32_t* state = reinterpret_cast<uint32_t*>(base + this->handle.bufOffset);
   if (this->group.thread_rank() == 0) {
-    state[this->index] = this->epoch;
+    state[this->handle.nBarriers + this->index] = this->epoch;  // unicast epoch slot
   }
   this->group.sync();
 }
@@ -57,8 +56,8 @@ template <typename Group>
 __device__ inline void CcoLsaBarrierSession<Group>::arrive(Group) {
   this->group.sync();
 
-  const int nranks = this->comm->worldSize;
-  const int myRank = this->comm->lsa.lsaRank;
+  const int nranks = this->comm->lsaSize;
+  const int myRank = this->comm->lsaRank;
 
   for (int i = this->group.thread_rank(); i < nranks - 1; i += this->group.size()) {
     int peer = i + ((i >= myRank) ? 1 : 0);
@@ -71,8 +70,8 @@ __device__ inline void CcoLsaBarrierSession<Group>::arrive(Group) {
 template <typename Group>
 template <bool EnableTimeout>
 __device__ inline int CcoLsaBarrierSession<Group>::waitInternal(Group, uint64_t timeoutCycles) {
-  const int nranks = this->comm->worldSize;
-  const int myRank = this->comm->lsa.lsaRank;
+  const int nranks = this->comm->lsaSize;
+  const int myRank = this->comm->lsaRank;
   int ret = 0;
 
   uint64_t startCycle;

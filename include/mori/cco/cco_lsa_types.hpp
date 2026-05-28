@@ -27,22 +27,11 @@
 namespace mori {
 namespace cco {
 
-#define CCO_BUF_HANDLE_GRANULARITY (128)
-
-// bufHandle is a 128-byte unit index within the rank's slot.
-__device__ inline uint32_t* CcoGetResourceBuffer(CcoDevComm_t comm, uint32_t bufHandle, int rank) {
-  char* base = reinterpret_cast<char*>(comm->flatBase);
-  char* rankBase = base + (uint64_t)rank * comm->perRankSize;
-  return reinterpret_cast<uint32_t*>(rankBase + (uint64_t)bufHandle * CCO_BUF_HANDLE_GRANULARITY);
-}
-
-__device__ inline uint32_t* CcoGetLocalResourceBuffer(CcoDevComm_t comm, uint32_t bufHandle) {
-  return CcoGetResourceBuffer(comm, bufHandle, comm->rank);
-}
-
 // State buffer layout (unicast only, no multicast):
-//   [0,          nBarriers)                    epoch[index]       (persisted across sessions)
-//   [nBarriers,  nBarriers + nBarriers*nRanks) ucInbox[index][peer]
+//   [ 0, nBarries)                                   multimem epoch
+//   [ nBarries,    2 * nBarries)                     unicast epoch
+//   [2 * nBarries, 3 * nBarries)                     multimem inbox
+//   [3*nBarriers, 3*nBarriers + nBarriers*lsaSize)   ucInbox[index][peer]
 
 template <typename Group>
 struct CcoLsaBarrierSession {
@@ -71,8 +60,9 @@ struct CcoLsaBarrierSession {
 
  private:
   __device__ inline uint32_t* ucInbox(int owner, int peer) {
-    uint32_t* state = CcoGetResourceBuffer(comm, handle.bufOffset, owner);
-    return state + handle.nBarriers + index * comm->worldSize + peer;
+    char* base = reinterpret_cast<char*>(comm->flatBase) + (uint64_t)owner * comm->perRankSize;
+    uint32_t* state = reinterpret_cast<uint32_t*>(base + handle.bufOffset);
+    return state + 3 * handle.nBarriers + index * comm->lsaSize + peer;
   }
 
   template <bool EnableTimeout>
