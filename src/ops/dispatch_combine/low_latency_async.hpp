@@ -49,16 +49,16 @@ __global__ void EpDispatchLowLatencyAsyncRecvCopy(EpDispatchCombineArgs<T> args)
 template <typename T>
 __global__ void EpDispatchLowLatencyAsyncRecvCopyMultiBlock(EpDispatchCombineArgs<T> args);
 
-template <typename T, bool UseFp8DirectCast = false>
+template <typename T, bool UseFp8DirectCast = false, bool UseFp8BlockwiseQuant = false>
 __global__ void EpCombineLowLatencyAsyncSendCopy(EpDispatchCombineArgs<T> args);
 
-template <typename T, bool UseFp8DirectCast = false>
+template <typename T, bool UseFp8DirectCast = false, bool UseFp8BlockwiseQuant = false>
 __global__ void EpCombineLowLatencyAsyncSendTransfer(EpDispatchCombineArgs<T> args);
 
-template <typename T, bool UseFp8DirectCast = false>
+template <typename T, bool UseFp8DirectCast = false, bool UseFp8BlockwiseQuant = false>
 __global__ void EpCombineLowLatencyAsyncRecvTransfer(EpDispatchCombineArgs<T> args);
 
-template <typename T, bool UseFp8DirectCast = false>
+template <typename T, bool UseFp8DirectCast = false, bool UseFp8BlockwiseQuant = false>
 __global__ void EpCombineLowLatencyAsyncRecvCopy(EpDispatchCombineArgs<T> args);
 
 }  // namespace moe

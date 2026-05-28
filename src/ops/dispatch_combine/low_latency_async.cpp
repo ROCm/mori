@@ -400,16 +400,24 @@ __device__ void EpDispatchLowLatencyAsyncRecvCopyMultiBlock_body(EpDispatchCombi
 /*                                EpCombineLowLatencyAsyncSendCopy                                */
 /* ---------------------------------------------------------------------------------------------- */
 
-template <typename T, bool UseFp8DirectCast>
+template <typename T, bool UseFp8DirectCast, bool UseFp8BlockwiseQuant>
 __device__ void EpCombineLowLatencyAsyncSendCopy_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
   IF_ENABLE_PROFILER(
       LOW_LATENCY_ASYNC_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
   MORI_TRACE_SPAN(profiler, Slot::CombineAsyncSendCopy);
-  using TokT = std::conditional_t<UseFp8DirectCast, core::CombineInternalFp8, T>;
-  static_assert(!UseFp8DirectCast || std::is_same_v<T, hip_bfloat16>,
-                "Fp8 direct cast combine currently only supports bf16 input");
-  const size_t tokHiddenBytes = hiddenDim * sizeof(TokT);
+  using TokT = std::conditional_t<UseFp8DirectCast || UseFp8BlockwiseQuant,
+                                  core::CombineInternalFp8, T>;
+  static_assert(!(UseFp8DirectCast && UseFp8BlockwiseQuant),
+                "Fp8 direct cast and blockwise quant are mutually exclusive");
+  static_assert((!UseFp8DirectCast && !UseFp8BlockwiseQuant) ||
+                    std::is_same_v<T, hip_bfloat16>,
+                "Fp8 combine quant currently only supports bf16 input");
+  const size_t hiddenBytes = hiddenDim * sizeof(TokT);
+  const size_t scaleBytes = UseFp8BlockwiseQuant
+                                ? size_t(args.fp8BlockwiseCombineScaleDim) * sizeof(float)
+                                : size_t{0};
+  const size_t tokPayloadBytes = hiddenBytes + scaleBytes;
 
   // Copy token onto staging buffer for later IBGDA transfer
   index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
@@ -420,12 +428,13 @@ __device__ void EpCombineLowLatencyAsyncSendCopy_body(EpDispatchCombineArgs<T> a
     stagingTokId = __shfl(stagingTokId, 0);
     if constexpr (UseFp8DirectCast) {
       core::WarpCastBf16ToCombineInternalFp8<T>(
-          reinterpret_cast<TokT*>(stagingPtr + stagingTokId * tokHiddenBytes),
+          reinterpret_cast<TokT*>(stagingPtr + stagingTokId * tokPayloadBytes),
           args.inpTokenBuf + tokenId * hiddenDim, hiddenDim, laneId);
     } else {
+      // Non-quant path: TokT == T, scaleBytes == 0, so tokPayloadBytes == hiddenBytes.
       core::WarpCopy<uint8_t, 4>(
-          stagingPtr + stagingTokId * tokHiddenBytes,
-          reinterpret_cast<uint8_t*>(args.inpTokenBuf) + tokenId * tokHiddenBytes, tokHiddenBytes);
+          stagingPtr + stagingTokId * tokPayloadBytes,
+          reinterpret_cast<uint8_t*>(args.inpTokenBuf) + tokenId * hiddenBytes, hiddenBytes);
     }
   }
 }
@@ -434,16 +443,24 @@ __device__ void EpCombineLowLatencyAsyncSendCopy_body(EpDispatchCombineArgs<T> a
 /*                              EpCombineLowLatencyAsyncSendTransfer                              */
 /* ---------------------------------------------------------------------------------------------- */
 
-template <typename T, bool UseFp8DirectCast>
+template <typename T, bool UseFp8DirectCast, bool UseFp8BlockwiseQuant>
 __device__ void EpCombineLowLatencyAsyncSendTransfer_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
   IF_ENABLE_PROFILER(
       LOW_LATENCY_ASYNC_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
   MORI_TRACE_SPAN(profiler, Slot::CombineAsyncSendTransfer);
-  using TokT = std::conditional_t<UseFp8DirectCast, core::CombineInternalFp8, T>;
-  static_assert(!UseFp8DirectCast || std::is_same_v<T, hip_bfloat16>,
-                "Fp8 direct cast combine currently only supports bf16 input");
-  const size_t tokHiddenBytes = hiddenDim * sizeof(TokT);
+  using TokT = std::conditional_t<UseFp8DirectCast || UseFp8BlockwiseQuant,
+                                  core::CombineInternalFp8, T>;
+  static_assert(!(UseFp8DirectCast && UseFp8BlockwiseQuant),
+                "Fp8 direct cast and blockwise quant are mutually exclusive");
+  static_assert((!UseFp8DirectCast && !UseFp8BlockwiseQuant) ||
+                    std::is_same_v<T, hip_bfloat16>,
+                "Fp8 combine quant currently only supports bf16 input");
+  const size_t hiddenBytes = hiddenDim * sizeof(TokT);
+  const size_t scaleBytes = UseFp8BlockwiseQuant
+                                ? size_t(args.fp8BlockwiseCombineScaleDim) * sizeof(float)
+                                : size_t{0};
+  const size_t tokPayloadBytes = hiddenBytes + scaleBytes;
 
   uint64_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<uint64_t*>();
   for (int destPe = blockId; destPe < npes; destPe += blockNum) {
@@ -457,12 +474,13 @@ __device__ void EpCombineLowLatencyAsyncSendTransfer_body(EpDispatchCombineArgs<
       tokenNum = __shfl(tokenNum, 0);
       int tokenChunkNum = core::CeilDiv(tokenNum, config.numQpPerPe);
       int thisChunkTokenNum = std::min(tokenChunkNum, tokenNum - qpId * tokenChunkNum);
-      size_t remoteOffset = SendBufSlotOffset(config, myPe, tokenChunkNum * qpId) * tokHiddenBytes;
-      size_t localOffset = SendBufSlotOffset(config, destPe, tokenChunkNum * qpId) * tokHiddenBytes;
+      size_t remoteOffset = SendBufSlotOffset(config, myPe, tokenChunkNum * qpId) * tokPayloadBytes;
+      size_t localOffset =
+          SendBufSlotOffset(config, destPe, tokenChunkNum * qpId) * tokPayloadBytes;
       if ((destPe != myPe) && (laneId == 0) && (thisChunkTokenNum > 0))
         shmem::ShmemPutMemNbiThread(args.interNodeTokBufs.combineInp, remoteOffset,
                                     args.interNodeTokBufs.staging, localOffset,
-                                    thisChunkTokenNum * tokHiddenBytes, destPe, qpId);
+                                    thisChunkTokenNum * tokPayloadBytes, destPe, qpId);
       // if (laneId == 0)
       // shmem::ShmemQuietThread(destPe, qpId);
       // shmem::ShmemAtomicTypeNonFetchWarp<uint64_t>(
@@ -476,15 +494,19 @@ __device__ void EpCombineLowLatencyAsyncSendTransfer_body(EpDispatchCombineArgs<
 /*                              EpCombineLowLatencyAsyncRecvTransfer                              */
 /* ---------------------------------------------------------------------------------------------- */
 
-template <typename T, bool UseFp8DirectCast>
+template <typename T, bool UseFp8DirectCast, bool UseFp8BlockwiseQuant>
 __device__ void EpCombineLowLatencyAsyncRecvTransfer_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
   IF_ENABLE_PROFILER(
       LOW_LATENCY_ASYNC_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
   MORI_TRACE_SPAN(profiler, Slot::CombineAsyncRecvTransfer);
-  using TokT = std::conditional_t<UseFp8DirectCast, core::CombineInternalFp8, T>;
-  static_assert(!UseFp8DirectCast || std::is_same_v<T, hip_bfloat16>,
-                "Fp8 direct cast combine currently only supports bf16 input");
+  using TokT = std::conditional_t<UseFp8DirectCast || UseFp8BlockwiseQuant,
+                                  core::CombineInternalFp8, T>;
+  static_assert(!(UseFp8DirectCast && UseFp8BlockwiseQuant),
+                "Fp8 direct cast and blockwise quant are mutually exclusive");
+  static_assert((!UseFp8DirectCast && !UseFp8BlockwiseQuant) ||
+                    std::is_same_v<T, hip_bfloat16>,
+                "Fp8 combine quant currently only supports bf16 input");
   (void)sizeof(TokT);
 
   for (int destPe = blockId; destPe < npes; destPe += blockNum) {
@@ -518,15 +540,19 @@ __device__ void EpCombineLowLatencyAsyncRecvTransfer_body(EpDispatchCombineArgs<
 /*                                EpCombineLowLatencyAsyncRecvCopy                                */
 /* ---------------------------------------------------------------------------------------------- */
 
-template <typename T, bool UseFp8DirectCast>
+template <typename T, bool UseFp8DirectCast, bool UseFp8BlockwiseQuant>
 __device__ void EpCombineLowLatencyAsyncRecvCopy_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
   IF_ENABLE_PROFILER(
       LOW_LATENCY_ASYNC_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
   MORI_TRACE_SPAN(profiler, Slot::CombineAsyncRecvCopy);
-  using TokT = std::conditional_t<UseFp8DirectCast, core::CombineInternalFp8, T>;
-  static_assert(!UseFp8DirectCast || std::is_same_v<T, hip_bfloat16>,
-                "Fp8 direct cast combine currently only supports bf16 input");
+  using TokT = std::conditional_t<UseFp8DirectCast || UseFp8BlockwiseQuant,
+                                  core::CombineInternalFp8, T>;
+  static_assert(!(UseFp8DirectCast && UseFp8BlockwiseQuant),
+                "Fp8 direct cast and blockwise quant are mutually exclusive");
+  static_assert((!UseFp8DirectCast && !UseFp8BlockwiseQuant) ||
+                    std::is_same_v<T, hip_bfloat16>,
+                "Fp8 combine quant currently only supports bf16 input");
 
   extern __shared__ char sharedMem[];
   TokT** srcPtrs = reinterpret_cast<TokT**>(sharedMem) + warpId * config.numExpertPerToken;
