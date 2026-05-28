@@ -42,18 +42,27 @@ namespace shmem {
 /* ---------------------------------------------------------------------------------------------- */
 
 using GpuStatesAddrProvider = void* (*)();
-// One entry per RegisterGpuStatesAddrProvider (e.g. multiple HIP TUs + modules).
-// Single-pointer storage would drop earlier registrations. See shmem.hpp policy.
-static std::vector<GpuStatesAddrProvider> s_gpuStatesAddrProviders;
+
+// static std::vector<GpuStatesAddrProvider> s_gpuStatesAddrProviders;
+
+namespace {
+  std::vector<GpuStatesAddrProvider>& GpuStatesProviders() {
+    static std::vector<GpuStatesAddrProvider> instance;   // initialized on first use
+    return instance;
+    // return s_gpuStatesAddrProviders;
+  }
+}  // namespace
 
 using BarrierLauncher = void (*)(hipStream_t);
 static BarrierLauncher s_staticBarrierLauncher = nullptr;
 
 void RegisterGpuStatesAddrProvider(GpuStatesAddrProvider provider) {
-  s_gpuStatesAddrProviders.push_back(provider);
+  GpuStatesProviders().push_back(provider);
 }
 
 void RegisterBarrierLauncher(BarrierLauncher launcher) { s_staticBarrierLauncher = launcher; }
+
+size_t GetGpuStatesAddrProviderCount() { return GpuStatesProviders().size(); }
 
 int LoadShmemModule(const char* hsaco_path) {
   ShmemStates* states = ShmemStatesSingleton::GetInstance();
@@ -94,7 +103,7 @@ void CopyGpuStatesToDevice(ShmemStates* states) {
         hipMemcpy(ms.gpuStatesPtr, gpuStates, sizeof(GpuStates), hipMemcpyHostToDevice));
   }
 
-  for (auto& provider : s_gpuStatesAddrProviders) {
+  for (auto& provider : GpuStatesProviders()) {
     void* staticAddr = provider();
     if (staticAddr != nullptr) {
       MORI_SHMEM_TRACE("Copying GpuStates to static globalGpuStates ({:p})", staticAddr);
@@ -115,6 +124,7 @@ void FinalizeRuntime(ShmemStates* states) {
     ms.barrierFunc = nullptr;
   }
   states->gpuStates = {};
+  GpuStatesProviders().clear();
 }
 
 /* ---------------------------------------------------------------------------------------------- */
