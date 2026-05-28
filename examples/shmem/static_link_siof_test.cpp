@@ -41,7 +41,7 @@
 // `src/shmem/runtime.cpp`. Always safe to call; returns 0 if no consumer has
 // registered yet.
 namespace mori::shmem {
-  size_t GetGpuStatesAddrProviderCount();
+size_t GetGpuStatesAddrProviderCount();
 }
 
 int main(int /*argc*/, char* /*argv*/[]) {
@@ -49,8 +49,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
 
   // Address of the registrar emitted in *this* TU. Printing it confirms the
   // static-init block was compiled (i.e. the file was processed as HIP).
-  fprintf(stderr,
-          "[SIOF-TEST] this TU's _s_gpuStatesRegistrar = %p (ctor should have run)\n",
+  fprintf(stderr, "[SIOF-TEST] this TU's _s_gpuStatesRegistrar = %p (ctor should have run)\n",
           static_cast<const void*>(&mori::shmem::_static_init::_s_gpuStatesRegistrar));
 
   const size_t count = mori::shmem::GetGpuStatesAddrProviderCount();
@@ -75,8 +74,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
     return 1;
   }
 
-  fprintf(stderr,
-          "\n[SIOF-TEST] PASS: registry contains %zu provider(s); SIOF not present.\n",
+  fprintf(stderr, "\n[SIOF-TEST] PASS: registry contains %zu provider(s); SIOF not present.\n",
           count);
   return 0;
 }
