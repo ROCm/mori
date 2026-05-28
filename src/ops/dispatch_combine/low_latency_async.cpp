@@ -400,7 +400,7 @@ __device__ void EpDispatchLowLatencyAsyncRecvCopyMultiBlock_body(EpDispatchCombi
 /*                                EpCombineLowLatencyAsyncSendCopy                                */
 /* ---------------------------------------------------------------------------------------------- */
 
-template <typename T, bool UseFp8DirectCast, bool UseFp8BlockwiseQuant>
+template <typename T, bool UseFp8DirectCast = false, bool UseFp8BlockwiseQuant = false>
 __device__ void EpCombineLowLatencyAsyncSendCopy_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
   IF_ENABLE_PROFILER(
@@ -413,11 +413,16 @@ __device__ void EpCombineLowLatencyAsyncSendCopy_body(EpDispatchCombineArgs<T> a
   static_assert((!UseFp8DirectCast && !UseFp8BlockwiseQuant) ||
                     std::is_same_v<T, hip_bfloat16>,
                 "Fp8 combine quant currently only supports bf16 input");
-  const size_t hiddenBytes = hiddenDim * sizeof(TokT);
-  const size_t scaleBytes = UseFp8BlockwiseQuant
-                                ? size_t(args.fp8BlockwiseCombineScaleDim) * sizeof(float)
-                                : size_t{0};
-  const size_t tokPayloadBytes = hiddenBytes + scaleBytes;
+  // Note: tokHiddenBytes / fp8ScaleBytes / tokPayloadBytes shadow nothing
+  // from DEF_COMMON_VARS — that macro defines `hiddenBytes` from sizeof(T)
+  // (bf16=2B) and `scaleBytes` from user dispatch scaleDim, both unrelated
+  // to the fp8bw staging slot which is sized for sizeof(TokT) (fp8=1B) +
+  // per-block fp32 scales.
+  const size_t tokHiddenBytes = hiddenDim * sizeof(TokT);
+  const size_t fp8ScaleBytes = UseFp8BlockwiseQuant
+                                   ? size_t(args.fp8BlockwiseCombineScaleDim) * sizeof(float)
+                                   : size_t{0};
+  const size_t tokPayloadBytes = tokHiddenBytes + fp8ScaleBytes;
 
   // Copy token onto staging buffer for later IBGDA transfer
   index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
@@ -432,7 +437,7 @@ __device__ void EpCombineLowLatencyAsyncSendCopy_body(EpDispatchCombineArgs<T> a
       uint8_t* slotPtr = stagingPtr + stagingTokId * tokPayloadBytes;
       core::WarpQuantizeToFp8Blockwise<core::CombineInternalFp8>(
           reinterpret_cast<core::CombineInternalFp8*>(slotPtr),
-          reinterpret_cast<float*>(slotPtr + hiddenBytes),
+          reinterpret_cast<float*>(slotPtr + tokHiddenBytes),
           args.inpTokenBuf + tokenId * hiddenDim, hiddenDim,
           args.fp8BlockwiseCombineScaleDim);
     } else if constexpr (UseFp8DirectCast) {
@@ -440,10 +445,11 @@ __device__ void EpCombineLowLatencyAsyncSendCopy_body(EpDispatchCombineArgs<T> a
           reinterpret_cast<TokT*>(stagingPtr + stagingTokId * tokPayloadBytes),
           args.inpTokenBuf + tokenId * hiddenDim, hiddenDim, laneId);
     } else {
-      // Non-quant path: TokT == T, scaleBytes == 0, so tokPayloadBytes == hiddenBytes.
+      // Non-quant path: TokT == T, fp8ScaleBytes == 0, so tokPayloadBytes == tokHiddenBytes.
       core::WarpCopy<uint8_t, 4>(
           stagingPtr + stagingTokId * tokPayloadBytes,
-          reinterpret_cast<uint8_t*>(args.inpTokenBuf) + tokenId * hiddenBytes, hiddenBytes);
+          reinterpret_cast<uint8_t*>(args.inpTokenBuf) + tokenId * tokHiddenBytes,
+          tokHiddenBytes);
     }
   }
 }
@@ -452,7 +458,7 @@ __device__ void EpCombineLowLatencyAsyncSendCopy_body(EpDispatchCombineArgs<T> a
 /*                              EpCombineLowLatencyAsyncSendTransfer                              */
 /* ---------------------------------------------------------------------------------------------- */
 
-template <typename T, bool UseFp8DirectCast, bool UseFp8BlockwiseQuant>
+template <typename T, bool UseFp8DirectCast = false, bool UseFp8BlockwiseQuant = false>
 __device__ void EpCombineLowLatencyAsyncSendTransfer_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
   IF_ENABLE_PROFILER(
@@ -465,11 +471,11 @@ __device__ void EpCombineLowLatencyAsyncSendTransfer_body(EpDispatchCombineArgs<
   static_assert((!UseFp8DirectCast && !UseFp8BlockwiseQuant) ||
                     std::is_same_v<T, hip_bfloat16>,
                 "Fp8 combine quant currently only supports bf16 input");
-  const size_t hiddenBytes = hiddenDim * sizeof(TokT);
-  const size_t scaleBytes = UseFp8BlockwiseQuant
-                                ? size_t(args.fp8BlockwiseCombineScaleDim) * sizeof(float)
-                                : size_t{0};
-  const size_t tokPayloadBytes = hiddenBytes + scaleBytes;
+  const size_t tokHiddenBytes = hiddenDim * sizeof(TokT);
+  const size_t fp8ScaleBytes = UseFp8BlockwiseQuant
+                                   ? size_t(args.fp8BlockwiseCombineScaleDim) * sizeof(float)
+                                   : size_t{0};
+  const size_t tokPayloadBytes = tokHiddenBytes + fp8ScaleBytes;
 
   uint64_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<uint64_t*>();
   for (int destPe = blockId; destPe < npes; destPe += blockNum) {
@@ -503,7 +509,7 @@ __device__ void EpCombineLowLatencyAsyncSendTransfer_body(EpDispatchCombineArgs<
 /*                              EpCombineLowLatencyAsyncRecvTransfer                              */
 /* ---------------------------------------------------------------------------------------------- */
 
-template <typename T, bool UseFp8DirectCast, bool UseFp8BlockwiseQuant>
+template <typename T, bool UseFp8DirectCast = false, bool UseFp8BlockwiseQuant = false>
 __device__ void EpCombineLowLatencyAsyncRecvTransfer_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
   IF_ENABLE_PROFILER(
@@ -549,7 +555,7 @@ __device__ void EpCombineLowLatencyAsyncRecvTransfer_body(EpDispatchCombineArgs<
 /*                                EpCombineLowLatencyAsyncRecvCopy                                */
 /* ---------------------------------------------------------------------------------------------- */
 
-template <typename T, bool UseFp8DirectCast, bool UseFp8BlockwiseQuant>
+template <typename T, bool UseFp8DirectCast = false, bool UseFp8BlockwiseQuant = false>
 __device__ void EpCombineLowLatencyAsyncRecvCopy_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
   IF_ENABLE_PROFILER(
@@ -562,11 +568,11 @@ __device__ void EpCombineLowLatencyAsyncRecvCopy_body(EpDispatchCombineArgs<T> a
   static_assert((!UseFp8DirectCast && !UseFp8BlockwiseQuant) ||
                     std::is_same_v<T, hip_bfloat16>,
                 "Fp8 combine quant currently only supports bf16 input");
-  const size_t hiddenBytes = hiddenDim * sizeof(TokT);
-  const size_t scaleBytes = UseFp8BlockwiseQuant
-                                ? size_t(args.fp8BlockwiseCombineScaleDim) * sizeof(float)
-                                : size_t{0};
-  const size_t tokPayloadBytes = hiddenBytes + scaleBytes;
+  const size_t tokHiddenBytes = hiddenDim * sizeof(TokT);
+  const size_t fp8ScaleBytes = UseFp8BlockwiseQuant
+                                   ? size_t(args.fp8BlockwiseCombineScaleDim) * sizeof(float)
+                                   : size_t{0};
+  const size_t tokPayloadBytes = tokHiddenBytes + fp8ScaleBytes;
 
   extern __shared__ char sharedMem[];
   // Layout: [srcPtrs] [srcScalePtrs if UseFp8BlockwiseQuant];
@@ -603,7 +609,7 @@ __device__ void EpCombineLowLatencyAsyncRecvCopy_body(EpDispatchCombineArgs<T> a
           uint8_t* slotBase = reinterpret_cast<uint8_t*>(stagingPtr) + destTokId * tokPayloadBytes;
           srcPtrs[j] = reinterpret_cast<TokT*>(slotBase) + hiddenDimOffset;
           if constexpr (UseFp8BlockwiseQuant) {
-            float* scaleBase = reinterpret_cast<float*>(slotBase + hiddenBytes);
+            float* scaleBase = reinterpret_cast<float*>(slotBase + tokHiddenBytes);
             // Sign-bit validity sentinel (mirrors IntraNode): the quantizer
             // flips the sign of scales[0] when any block was actually
             // scaled. An un-scaled token (e.g. all zeros) keeps positive

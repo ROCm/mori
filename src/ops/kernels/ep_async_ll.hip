@@ -18,3 +18,16 @@ WRAP_ALL_TYPES_BOOL(EpCombineLowLatencyAsyncRecvCopy, , false)
 WRAP_ALL_TYPES_BOOL(EpCombineLowLatencyAsyncRecvTransfer, , false)
 MORI_FP8_ANY(WRAP_BOOL(EpCombineLowLatencyAsyncRecvCopy, bf16_fp8cast, hip_bfloat16, true))
 MORI_FP8_ANY(WRAP_BOOL(EpCombineLowLatencyAsyncRecvTransfer, bf16_fp8cast, hip_bfloat16, true))
+
+// Fp8BlockwiseQuant family (mirrors IntraNode `_bf16_nop2p_fp8bwq` template flag pattern).
+// Template args are <T, UseFp8DirectCast=false, UseFp8BlockwiseQuant=true>. Gated on FP8
+// support because the producer/consumer rely on core::CombineInternalFp8.
+#define WRAP_ASYNC_FP8BWQ(kernel)                                                                  \
+  extern "C" __global__ void kernel##_bf16_fp8bw_quant(EpDispatchCombineArgs<hip_bfloat16> args) { \
+    kernel##_body<hip_bfloat16, /*UseFp8DirectCast=*/false, /*UseFp8BlockwiseQuant=*/true>(args);  \
+  }
+MORI_FP8_ANY(WRAP_ASYNC_FP8BWQ(EpCombineLowLatencyAsyncSendCopy))
+MORI_FP8_ANY(WRAP_ASYNC_FP8BWQ(EpCombineLowLatencyAsyncSendTransfer))
+MORI_FP8_ANY(WRAP_ASYNC_FP8BWQ(EpCombineLowLatencyAsyncRecvTransfer))
+MORI_FP8_ANY(WRAP_ASYNC_FP8BWQ(EpCombineLowLatencyAsyncRecvCopy))
+#undef WRAP_ASYNC_FP8BWQ
