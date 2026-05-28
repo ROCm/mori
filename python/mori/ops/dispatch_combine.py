@@ -880,7 +880,19 @@ class EpDispatchCombineOp:
         elif kt == EpDispatchCombineKernelType.AsyncLL.value:
             mp = self._handle_info["multi_processor_count"]
             mp_aligned = mp // self.config.world_size * self.config.world_size
-            if sfx == "bf16" and quant_type == EpDispatchCombineQuantType.Fp8DirectCast:
+            if sfx == "bf16" and quant_type == EpDispatchCombineQuantType.Fp8BlockwiseQuant:
+                self._launch_multi(
+                    [
+                        "EpCombineLowLatencyAsyncSendCopy_bf16_fp8bw_quant",
+                        "EpCombineLowLatencyAsyncSendTransfer_bf16_fp8bw_quant",
+                    ],
+                    [mp_aligned, self.config.world_size],
+                    [WARP_SIZE * actual_wpb, WARP_SIZE * actual_wpb],
+                    [0, 0],
+                    stream,
+                    args_ptr,
+                )
+            elif sfx == "bf16" and quant_type == EpDispatchCombineQuantType.Fp8DirectCast:
                 self._launch_multi(
                     [
                         "EpCombineLowLatencyAsyncSendCopy_bf16_fp8cast",
@@ -968,7 +980,19 @@ class EpDispatchCombineOp:
             mp = self._handle_info["multi_processor_count"]
             mp_aligned = mp // self.config.world_size * self.config.world_size
             quant_type = _normalize_quant_type(self.config.quant_type)
-            if sfx == "bf16" and quant_type == EpDispatchCombineQuantType.Fp8DirectCast:
+            if sfx == "bf16" and quant_type == EpDispatchCombineQuantType.Fp8BlockwiseQuant:
+                self._launch_multi(
+                    [
+                        "EpCombineLowLatencyAsyncRecvTransfer_bf16_fp8bw_quant",
+                        "EpCombineLowLatencyAsyncRecvCopy_bf16_fp8bw_quant",
+                    ],
+                    [self.config.world_size, mp_aligned],
+                    [WARP_SIZE * actual_wpb, WARP_SIZE * actual_wpb],
+                    [0, shared_mem],
+                    stream,
+                    args_ptr,
+                )
+            elif sfx == "bf16" and quant_type == EpDispatchCombineQuantType.Fp8DirectCast:
                 self._launch_multi(
                     [
                         "EpCombineLowLatencyAsyncRecvTransfer_bf16_fp8cast",

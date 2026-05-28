@@ -522,8 +522,10 @@ void LaunchCombine(EpDispatchCombineHandle& handle, void* input, void* weights, 
   int mp = handle.multiProcessorCount;
 
   if (args.config.quantType == QuantType::Fp8BlockwiseQuant &&
-      handle.config.kernelType != KernelType::IntraNode) {
-    throw std::runtime_error("Fp8BlockwiseQuant currently only supports IntraNode combine");
+      handle.config.kernelType != KernelType::IntraNode &&
+      handle.config.kernelType != KernelType::AsyncLL) {
+    throw std::runtime_error(
+        "Fp8BlockwiseQuant currently only supports IntraNode and AsyncLL combine");
   }
 
   switch (handle.config.kernelType) {
@@ -594,14 +596,31 @@ void LaunchCombine(EpDispatchCombineHandle& handle, void* input, void* weights, 
     case KernelType::AsyncLL: {
       int mp = handle.multiProcessorCount;
       int mp_aligned = mp - (mp % handle.config.worldSize);
-      reg.Launch(std::string("EpCombineLowLatencyAsyncSendCopy_") + sfx, mp_aligned, block_x, 0,
-                 stream, &args, args_size);
-      reg.Launch(std::string("EpCombineLowLatencyAsyncSendTransfer_") + sfx,
-                 handle.config.worldSize, block_x, 0, stream, &args, args_size);
-      reg.Launch(std::string("EpCombineLowLatencyAsyncRecvTransfer_") + sfx,
-                 handle.config.worldSize, block_x, 0, stream, &args, args_size);
-      reg.Launch(std::string("EpCombineLowLatencyAsyncRecvCopy_") + sfx, mp_aligned, block_x, smem,
-                 stream, &args, args_size);
+      // Pick the kernel symbol suffix based on quantType. fp8bw uses the dedicated
+      // `_bf16_fp8bw_quant` family instantiated in ep_async_ll.hip; bf16-only
+      // (asserted by static_assert inside the kernel body).
+      std::string send_copy_name = std::string("EpCombineLowLatencyAsyncSendCopy_") + sfx;
+      std::string send_xfer_name = std::string("EpCombineLowLatencyAsyncSendTransfer_") + sfx;
+      std::string recv_xfer_name = std::string("EpCombineLowLatencyAsyncRecvTransfer_") + sfx;
+      std::string recv_copy_name = std::string("EpCombineLowLatencyAsyncRecvCopy_") + sfx;
+      if (args.config.quantType == QuantType::Fp8BlockwiseQuant) {
+        if (dtype != HIP_R_16BF) {
+          throw std::runtime_error(
+              "Fp8BlockwiseQuant AsyncLL combine currently only supports bf16 input");
+        }
+        if (args.fp8BlockwiseCombineScaleDim <= 0) {
+          throw std::runtime_error(
+              "Fp8BlockwiseQuant AsyncLL combine requires internal scaleDim > 0");
+        }
+        send_copy_name = "EpCombineLowLatencyAsyncSendCopy_bf16_fp8bw_quant";
+        send_xfer_name = "EpCombineLowLatencyAsyncSendTransfer_bf16_fp8bw_quant";
+        recv_xfer_name = "EpCombineLowLatencyAsyncRecvTransfer_bf16_fp8bw_quant";
+        recv_copy_name = "EpCombineLowLatencyAsyncRecvCopy_bf16_fp8bw_quant";
+      }
+      reg.Launch(send_copy_name, mp_aligned, block_x, 0, stream, &args, args_size);
+      reg.Launch(send_xfer_name, handle.config.worldSize, block_x, 0, stream, &args, args_size);
+      reg.Launch(recv_xfer_name, handle.config.worldSize, block_x, 0, stream, &args, args_size);
+      reg.Launch(recv_copy_name, mp_aligned, block_x, smem, stream, &args, args_size);
       break;
     }
     default:
@@ -661,10 +680,14 @@ void LaunchCombineRecv(EpDispatchCombineHandle& handle, int block_num, int warp_
     auto& reg = KernelRegistry::Instance();
     int mp = handle.multiProcessorCount;
     int mp_aligned = mp - (mp % handle.config.worldSize);
-    reg.Launch(std::string("EpCombineLowLatencyAsyncRecvTransfer_") + sfx, handle.config.worldSize,
-               block_x, 0, stream, &args, args_size);
-    reg.Launch(std::string("EpCombineLowLatencyAsyncRecvCopy_") + sfx, mp_aligned, block_x, smem,
-               stream, &args, args_size);
+    std::string recv_xfer_name = std::string("EpCombineLowLatencyAsyncRecvTransfer_") + sfx;
+    std::string recv_copy_name = std::string("EpCombineLowLatencyAsyncRecvCopy_") + sfx;
+    if (handle.config.quantType == QuantType::Fp8BlockwiseQuant) {
+      recv_xfer_name = "EpCombineLowLatencyAsyncRecvTransfer_bf16_fp8bw_quant";
+      recv_copy_name = "EpCombineLowLatencyAsyncRecvCopy_bf16_fp8bw_quant";
+    }
+    reg.Launch(recv_xfer_name, handle.config.worldSize, block_x, 0, stream, &args, args_size);
+    reg.Launch(recv_copy_name, mp_aligned, block_x, smem, stream, &args, args_size);
   } else {
     throw std::runtime_error("LaunchCombineRecv only supported for AsyncLL");
   }

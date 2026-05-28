@@ -228,8 +228,19 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
     // NOTE(ditian12): no overflow protection for dispatchInp/combinInp/staging in async kernel,
     // hence have to allocate to max size we need to either implement compact layout or add
     // pre-assertion to prevent silent memory access fault
+    size_t perTokenBytes = config.MaxXferBytesPerToken();
+    // AsyncLL fp8 blockwise combine packs per-block fp32 scales right after the
+    // fp8 token in the staging slot (see REFERENCE_INTRANODE.md §"Staging slot
+    // layout"). Bump per-token bytes by the fp8bw scale region so that
+    // ShmemPutMemNbi in SendTransfer never overruns the remote staging slot.
+    // Mirrors the IntraNode allocator pattern in this same function.
+    if (config.kernelType == KernelType::AsyncLL &&
+        config.quantType == QuantType::Fp8BlockwiseQuant && fp8BlockwiseCombineScaleDim > 0) {
+      perTokenBytes += static_cast<size_t>(fp8BlockwiseCombineScaleDim) *
+                       fp8BlockwiseCombineScaleTypeSize;
+    }
     size_t maxStagingSize =
-        static_cast<ssize_t>(config.MaxNumTokensToSend()) * config.MaxXferBytesPerToken();
+        static_cast<ssize_t>(config.MaxNumTokensToSend()) * perTokenBytes;
     bufs.dispatchInp = ShmemMallocAndReturnMemObjPtr(maxStagingSize, hipDeviceMallocUncached);
     bufs.combineInp = ShmemMallocAndReturnMemObjPtr(maxStagingSize, hipDeviceMallocUncached);
     bufs.staging = ShmemMallocAndReturnMemObjPtr(maxStagingSize, hipDeviceMallocUncached);
