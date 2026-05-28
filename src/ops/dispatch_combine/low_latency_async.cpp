@@ -562,9 +562,22 @@ __device__ void EpCombineLowLatencyAsyncRecvCopy_body(EpDispatchCombineArgs<T> a
   static_assert((!UseFp8DirectCast && !UseFp8BlockwiseQuant) ||
                     std::is_same_v<T, hip_bfloat16>,
                 "Fp8 combine quant currently only supports bf16 input");
+  const size_t hiddenBytes = hiddenDim * sizeof(TokT);
+  const size_t scaleBytes = UseFp8BlockwiseQuant
+                                ? size_t(args.fp8BlockwiseCombineScaleDim) * sizeof(float)
+                                : size_t{0};
+  const size_t tokPayloadBytes = hiddenBytes + scaleBytes;
 
   extern __shared__ char sharedMem[];
+  // Layout: [srcPtrs] [srcScalePtrs if UseFp8BlockwiseQuant];
+  // AsyncLL combine path does not carry weights (cf. SendCopy), so no
+  // srcWeightsPtr region — scalePtrArrayOffset is always 1.
   TokT** srcPtrs = reinterpret_cast<TokT**>(sharedMem) + warpId * config.numExpertPerToken;
+  float** srcScalePtrs = nullptr;
+  if constexpr (UseFp8BlockwiseQuant) {
+    srcScalePtrs = reinterpret_cast<float**>(sharedMem) + warpNum * config.numExpertPerToken +
+                   warpId * config.numExpertPerToken;
+  }
 
   if (args.curRankNumToken != 0) {
     MultiWarpIter mwIter(globalWarpNum, args.curRankNumToken, hiddenDim);
@@ -583,15 +596,43 @@ __device__ void EpCombineLowLatencyAsyncRecvCopy_body(EpDispatchCombineArgs<T> a
                                ? args.interNodeTokBufs.combineInp->template GetAs<TokT*>()
                                : args.interNodeTokBufs.staging->template GetAs<TokT*>();
         if (destPe < npes) {
-          srcPtrs[j] = stagingPtr + destTokId * hiddenDim + hiddenDimOffset;
+          // Byte math: slot is wider than hiddenBytes when UseFp8BlockwiseQuant
+          // (FP8 token + per-block FP32 scales). For non-fp8bw paths,
+          // tokPayloadBytes == hiddenBytes, so this collapses to the prior
+          // element math.
+          uint8_t* slotBase = reinterpret_cast<uint8_t*>(stagingPtr) + destTokId * tokPayloadBytes;
+          srcPtrs[j] = reinterpret_cast<TokT*>(slotBase) + hiddenDimOffset;
+          if constexpr (UseFp8BlockwiseQuant) {
+            float* scaleBase = reinterpret_cast<float*>(slotBase + hiddenBytes);
+            // Sign-bit validity sentinel (mirrors IntraNode): the quantizer
+            // flips the sign of scales[0] when any block was actually
+            // scaled. An un-scaled token (e.g. all zeros) keeps positive
+            // scales[0]; treat as nullptr so the dequant helper skips it.
+            srcScalePtrs[j] = (scaleBase[0] < 0.0f) ? scaleBase : nullptr;
+          }
         } else {
           srcPtrs[j] = nullptr;
+          if constexpr (UseFp8BlockwiseQuant) {
+            srcScalePtrs[j] = nullptr;
+          }
         }
       }
 
       T* outPtr = args.interNodeTokBufs.combineOut->template GetAs<T*>() + tokenId * hiddenDim +
                   hiddenDimOffset;
-      if constexpr (UseFp8DirectCast) {
+      if constexpr (UseFp8BlockwiseQuant) {
+        if (mwIter.warpsPerItem == 1) {
+          core::WarpAccumFp8DequantFull<T, core::CombineInternalFp8>(
+              outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
+              reinterpret_cast<const float* const*>(srcScalePtrs), config.numExpertPerToken,
+              hiddenDim, args.fp8BlockwiseCombineScaleDim);
+        } else {
+          core::WarpAccumFp8DequantSegment<T, core::CombineInternalFp8>(
+              outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
+              reinterpret_cast<const float* const*>(srcScalePtrs), config.numExpertPerToken,
+              hiddenDimOffset, hiddenDimSize, hiddenDim, args.fp8BlockwiseCombineScaleDim);
+        }
+      } else if constexpr (UseFp8DirectCast) {
         core::WarpAccumCombineInternalFp8ToBf16(outPtr,
                                                 reinterpret_cast<const TokT* const*>(srcPtrs),
                                                 config.numExpertPerToken, laneId, hiddenDimSize);
