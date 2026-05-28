@@ -8,6 +8,32 @@ namespace mori {
 namespace cco {
 namespace gda {
 
+// ============================================================================
+// Cooperative Group Types (AMD wavefront = 64 threads)
+// ============================================================================
+
+struct ccoCoopThread {
+  __device__ int thread_rank() const { return 0; }
+  __device__ int size() const { return 1; }
+  __device__ void sync() {}
+};
+
+struct ccoCoopWarp {
+  __device__ int thread_rank() const { return threadIdx.x % 64; }
+  __device__ int size() const { return 64; }
+  __device__ void sync() { __syncwarp(); }
+};
+
+struct ccoCoopBlock {
+  __device__ int thread_rank() const { return threadIdx.x; }
+  __device__ int size() const { return blockDim.x; }
+  __device__ void sync() { __syncthreads(); }
+};
+
+// ============================================================================
+// Action Types
+// ============================================================================
+
 struct ccoGda_NoSignal {};
 struct ccoGda_NoCounter {};
 
