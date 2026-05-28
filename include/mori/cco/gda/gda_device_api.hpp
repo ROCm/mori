@@ -27,7 +27,7 @@ namespace mori {
 namespace cco {
 namespace gda {
 
-__device__ inline CcoGda::CcoGda(CcoDevComm const& comm_, int contextIndex)
+__device__ inline ccoGda::ccoGda(ccoDevComm const& comm_, int contextIndex)
     : comm(comm_), contextId(contextIndex) {
   this->ctx.rank = comm.rank;
   this->ctx.worldSize = comm.worldSize;
@@ -37,34 +37,34 @@ __device__ inline CcoGda::CcoGda(CcoDevComm const& comm_, int contextIndex)
 }
 
 // Put: RDMA write with optional signal/counter
-template <typename RemoteAction = CcoGda_NoSignal, typename LocalAction = CcoGda_NoCounter>
-__device__ inline void CcoGda::put(int peer, CcoWindow_t dstWin, size_t dstOffset,
-                                   CcoWindow_t srcWin, size_t srcOffset, size_t bytes,
+template <typename RemoteAction = ccoGda_NoSignal, typename LocalAction = ccoGda_NoCounter>
+__device__ inline void ccoGda::put(int peer, ccoWindow_t dstWin, size_t dstOffset,
+                                   ccoWindow_t srcWin, size_t srcOffset, size_t bytes,
                                    RemoteAction remoteAction, LocalAction localAction) {
   bool isSignal = false;
-  CcoGdaSignal_t signalId = 0;
-  CcoGdaSignalOp_t signalOp = CcoGdaSignalInc;
+  ccoGdaSignal_t signalId = 0;
+  ccoGdaSignalOp_t signalOp = ccoGdaSignalInc;
   uint64_t signalOpArg = 0;
 
-  if constexpr (!std::is_same<RemoteAction, CcoGda_NoSignal>::value) {
+  if constexpr (!std::is_same<RemoteAction, ccoGda_NoSignal>::value) {
     isSignal = true;
-    if constexpr (std::is_same<RemoteAction, CcoGda_SignalInc>::value) {
+    if constexpr (std::is_same<RemoteAction, ccoGda_SignalInc>::value) {
       signalId = remoteAction.signalId;
-      signalOp = CcoGdaSignalInc;
+      signalOp = ccoGdaSignalInc;
       signalOpArg = 1;
-    } else if constexpr (std::is_same<RemoteAction, CcoGda_SignalAdd>::value) {
+    } else if constexpr (std::is_same<RemoteAction, ccoGda_SignalAdd>::value) {
       signalId = remoteAction.signalId;
-      signalOp = CcoGdaSignalAdd;
+      signalOp = ccoGdaSignalAdd;
       signalOpArg = remoteAction.value;
     }
   }
 
   bool isCounter = false;
-  CcoGdaCounter_t counterId = 0;
+  ccoGdaCounter_t counterId = 0;
 
-  if constexpr (!std::is_same<LocalAction, CcoGda_NoCounter>::value) {
+  if constexpr (!std::is_same<LocalAction, ccoGda_NoCounter>::value) {
     isCounter = true;
-    if constexpr (std::is_same<LocalAction, CcoGda_CounterInc>::value) {
+    if constexpr (std::is_same<LocalAction, ccoGda_CounterInc>::value) {
       counterId = localAction.counterId;
     }
   }
@@ -73,25 +73,25 @@ __device__ inline void CcoGda::put(int peer, CcoWindow_t dstWin, size_t dstOffse
 }
 
 // PutValue: write immediate value (≤8 bytes)
-template <typename T, typename RemoteAction = CcoGda_NoSignal>
-__device__ inline void CcoGda::putValue(int peer, CcoWindow_t dstWin, size_t dstOffset, T value,
+template <typename T, typename RemoteAction = ccoGda_NoSignal>
+__device__ inline void ccoGda::putValue(int peer, ccoWindow_t dstWin, size_t dstOffset, T value,
                                         RemoteAction remoteAction) {
   static_assert(sizeof(T) <= 8, "putValue only supports types <= 8 bytes");
 
   bool isSignal = false;
-  CcoGdaSignal_t signalId = 0;
-  CcoGdaSignalOp_t signalOp = CcoGdaSignalInc;
+  ccoGdaSignal_t signalId = 0;
+  ccoGdaSignalOp_t signalOp = ccoGdaSignalInc;
   uint64_t signalOpArg = 0;
 
-  if constexpr (!std::is_same<RemoteAction, CcoGda_NoSignal>::value) {
+  if constexpr (!std::is_same<RemoteAction, ccoGda_NoSignal>::value) {
     isSignal = true;
-    if constexpr (std::is_same<RemoteAction, CcoGda_SignalInc>::value) {
+    if constexpr (std::is_same<RemoteAction, ccoGda_SignalInc>::value) {
       signalId = remoteAction.signalId;
-      signalOp = CcoGdaSignalInc;
+      signalOp = ccoGdaSignalInc;
       signalOpArg = 1;
-    } else if constexpr (std::is_same<RemoteAction, CcoGda_SignalAdd>::value) {
+    } else if constexpr (std::is_same<RemoteAction, ccoGda_SignalAdd>::value) {
       signalId = remoteAction.signalId;
-      signalOp = CcoGdaSignalAdd;
+      signalOp = ccoGdaSignalAdd;
       signalOpArg = remoteAction.value;
     }
   }
@@ -100,25 +100,25 @@ __device__ inline void CcoGda::putValue(int peer, CcoWindow_t dstWin, size_t dst
 }
 
 // Get: RDMA read
-__device__ inline void CcoGda::get(int peer, CcoWindow_t remoteWin, size_t remoteOffset,
-                                   CcoWindow_t localWin, size_t localOffset, size_t bytes) {
+__device__ inline void ccoGda::get(int peer, ccoWindow_t remoteWin, size_t remoteOffset,
+                                   ccoWindow_t localWin, size_t localOffset, size_t bytes) {
   gda::get(this->ctx, peer, remoteWin, remoteOffset, localWin, localOffset, bytes);
 }
 
 // Signal: send to remote peer
 template <typename RemoteAction>
-__device__ inline void CcoGda::signal(int peer, RemoteAction remoteAction) {
-  CcoGdaSignal_t signalId = 0;
-  CcoGdaSignalOp_t signalOp = CcoGdaSignalInc;
+__device__ inline void ccoGda::signal(int peer, RemoteAction remoteAction) {
+  ccoGdaSignal_t signalId = 0;
+  ccoGdaSignalOp_t signalOp = ccoGdaSignalInc;
   uint64_t signalOpArg = 0;
 
-  if constexpr (std::is_same<RemoteAction, CcoGda_SignalInc>::value) {
+  if constexpr (std::is_same<RemoteAction, ccoGda_SignalInc>::value) {
     signalId = remoteAction.signalId;
-    signalOp = CcoGdaSignalInc;
+    signalOp = ccoGdaSignalInc;
     signalOpArg = 1;
-  } else if constexpr (std::is_same<RemoteAction, CcoGda_SignalAdd>::value) {
+  } else if constexpr (std::is_same<RemoteAction, ccoGda_SignalAdd>::value) {
     signalId = remoteAction.signalId;
-    signalOp = CcoGdaSignalAdd;
+    signalOp = ccoGdaSignalAdd;
     signalOpArg = remoteAction.value;
   }
 
@@ -126,7 +126,7 @@ __device__ inline void CcoGda::signal(int peer, RemoteAction remoteAction) {
 }
 
 // Flush: ensure all operations complete
-__device__ inline void CcoGda::flush() {
+__device__ inline void ccoGda::flush() {
   for (int peer = 0; peer < this->ctx.worldSize; peer++) {
     if (peer != this->ctx.rank) {
       gda::flush(this->ctx, peer);
@@ -135,77 +135,77 @@ __device__ inline void CcoGda::flush() {
 }
 
 // FlushAsync: async flush for peer
-__device__ inline void CcoGda::flushAsync(int peer, CcoGdaRequest_t* outRequest) {
+__device__ inline void ccoGda::flushAsync(int peer, ccoGdaRequest_t* outRequest) {
   gda::flushAsync(this->ctx, peer, outRequest);
 }
 
 // Wait: wait for async request
-__device__ inline void CcoGda::wait(CcoGdaRequest_t& request) {
+__device__ inline void ccoGda::wait(ccoGdaRequest_t& request) {
   // TODO: poll completion queue
 }
-__device__ inline uint64_t CcoGda::readSignal(CcoGdaSignal_t signalId, int bits) {
+__device__ inline uint64_t ccoGda::readSignal(ccoGdaSignal_t signalId, int bits) {
   return gda::readSignal(this->ctx, signalId, bits);
 }
 
 // WaitSignal: wait until local signal reaches specified value
-__device__ inline void CcoGda::waitSignal(CcoGdaSignal_t signalId, uint64_t least, int bits) {
+__device__ inline void ccoGda::waitSignal(ccoGdaSignal_t signalId, uint64_t least, int bits) {
   gda::waitSignal(this->ctx, signalId, least, bits);
 }
 
-__device__ inline void CcoGda::resetSignal(CcoGdaSignal_t signalId) {
+__device__ inline void ccoGda::resetSignal(ccoGdaSignal_t signalId) {
   gda::resetSignal(this->ctx, signalId);
 }
-__device__ inline uint64_t CcoGda::readCounter(CcoGdaCounter_t counterId, int bits) {
+__device__ inline uint64_t ccoGda::readCounter(ccoGdaCounter_t counterId, int bits) {
   return gda::readCounter(this->ctx, counterId, bits);
 }
 
 // WaitCounter: wait until local counter reaches specified value
-__device__ inline void CcoGda::waitCounter(CcoGdaCounter_t counterId, uint64_t least, int bits) {
+__device__ inline void ccoGda::waitCounter(ccoGdaCounter_t counterId, uint64_t least, int bits) {
   gda::waitCounter(this->ctx, counterId, least, bits);
 }
 
 // ResetCounter: reset local counter to zero
-__device__ inline void CcoGda::resetCounter(CcoGdaCounter_t counterId) {
+__device__ inline void ccoGda::resetCounter(ccoGdaCounter_t counterId) {
   gda::resetCounter(this->ctx, counterId);
 }
 
 // Low-level GDA API (to be implemented with actual GDA hardware API)
-__device__ inline static void put(CcoGdaCtx ctx, int peer, CcoWindow_t dstWin, size_t dstOffset,
-                                  CcoWindow_t srcWin, size_t srcOffset, size_t bytes, bool isSignal,
-                                  CcoGdaSignal_t signalId, CcoGdaSignalOp_t signalOp,
-                                  uint64_t signalOpArg, bool isCounter, CcoGdaCounter_t counterId) {
+__device__ inline static void put(ccoGdaCtx ctx, int peer, ccoWindow_t dstWin, size_t dstOffset,
+                                  ccoWindow_t srcWin, size_t srcOffset, size_t bytes, bool isSignal,
+                                  ccoGdaSignal_t signalId, ccoGdaSignalOp_t signalOp,
+                                  uint64_t signalOpArg, bool isCounter, ccoGdaCounter_t counterId) {
 }
 
 template <typename T>
-__device__ inline static void putValue(CcoGdaCtx ctx, int peer, CcoWindow_t dstWin,
+__device__ inline static void putValue(ccoGdaCtx ctx, int peer, ccoWindow_t dstWin,
                                        size_t dstOffset, T value, bool isSignal,
-                                       CcoGdaSignal_t signalId, CcoGdaSignalOp_t signalOp,
+                                       ccoGdaSignal_t signalId, ccoGdaSignalOp_t signalOp,
                                        uint64_t signalOpArg) {
   static_assert(sizeof(T) <= 8, "putValue only supports types <= 8 bytes");
   // TODO: Implement with actual GDA hardware API
 }
-__device__ inline static void get(CcoGdaCtx ctx, int peer, CcoWindow_t remoteWin,
-                                  size_t remoteOffset, CcoWindow_t localWin, size_t localOffset,
+__device__ inline static void get(ccoGdaCtx ctx, int peer, ccoWindow_t remoteWin,
+                                  size_t remoteOffset, ccoWindow_t localWin, size_t localOffset,
                                   size_t bytes) {}
 
-__device__ inline static void flush(CcoGdaCtx ctx, int peer) {}
-__device__ inline static void flushAsync(CcoGdaCtx ctx, int peer, CcoGdaRequest_t* outRequest) {}
-__device__ inline static void signal(CcoGdaCtx ctx, int peer, CcoGdaSignal_t signalId,
-                                     CcoGdaSignalOp_t signalOp, uint64_t signalOpArg) {}
+__device__ inline static void flush(ccoGdaCtx ctx, int peer) {}
+__device__ inline static void flushAsync(ccoGdaCtx ctx, int peer, ccoGdaRequest_t* outRequest) {}
+__device__ inline static void signal(ccoGdaCtx ctx, int peer, ccoGdaSignal_t signalId,
+                                     ccoGdaSignalOp_t signalOp, uint64_t signalOpArg) {}
 
-__device__ inline static void resetSignal(CcoGdaCtx ctx, CcoGdaSignal_t signalId) {}
-__device__ inline static uint64_t readSignal(CcoGdaCtx ctx, CcoGdaSignal_t signalId, int bits) {
+__device__ inline static void resetSignal(ccoGdaCtx ctx, ccoGdaSignal_t signalId) {}
+__device__ inline static uint64_t readSignal(ccoGdaCtx ctx, ccoGdaSignal_t signalId, int bits) {
   return 0;
 }
 
-__device__ inline static void waitSignal(CcoGdaCtx ctx, CcoGdaSignal_t signalId, uint64_t least,
+__device__ inline static void waitSignal(ccoGdaCtx ctx, ccoGdaSignal_t signalId, uint64_t least,
                                          int bits) {}
-__device__ inline static uint64_t readCounter(CcoGdaCtx ctx, CcoGdaCounter_t counterId, int bits) {
+__device__ inline static uint64_t readCounter(ccoGdaCtx ctx, ccoGdaCounter_t counterId, int bits) {
   return 0;
 }
 
-__device__ inline static void resetCounter(CcoGdaCtx ctx, CcoGdaCounter_t counterId) {}
-__device__ inline static void waitCounter(CcoGdaCtx ctx, CcoGdaCounter_t counterId, uint64_t least,
+__device__ inline static void resetCounter(ccoGdaCtx ctx, ccoGdaCounter_t counterId) {}
+__device__ inline static void waitCounter(ccoGdaCtx ctx, ccoGdaCounter_t counterId, uint64_t least,
                                           int bits) {}
 
 }  // namespace gda

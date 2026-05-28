@@ -29,89 +29,125 @@ namespace mori {
 namespace cco {
 namespace gda {
 
-struct CcoGda_NoSignal {};
-struct CcoGda_NoCounter {};
+// ============================================================================
+// Cooperative Group Types (AMD wavefront = 64 threads)
+// ============================================================================
 
-struct CcoGda_SignalInc {
-  CcoGdaSignal_t signalId;
-  __device__ inline CcoGda_SignalInc(CcoGdaSignal_t id) : signalId(id) {}
+struct ccoCoopThread {
+  __device__ int thread_rank() const { return 0; }
+  __device__ int size() const { return 1; }
+  __device__ void sync() {}
 };
 
-struct CcoGda_SignalAdd {
-  CcoGdaSignal_t signalId;
+struct ccoCoopWarp {
+  __device__ int thread_rank() const { return threadIdx.x % 64; }
+  __device__ int size() const { return 64; }
+  __device__ void sync() { __syncwarp(); }
+};
+
+struct ccoCoopBlock {
+  __device__ int thread_rank() const { return threadIdx.x; }
+  __device__ int size() const { return blockDim.x; }
+  __device__ void sync() { __syncthreads(); }
+};
+
+// ============================================================================
+// Action Types
+// ============================================================================
+
+struct ccoGda_NoSignal {};
+struct ccoGda_NoCounter {};
+
+struct ccoGda_SignalInc {
+  ccoGdaSignal_t signalId;
+  __device__ inline ccoGda_SignalInc(ccoGdaSignal_t id) : signalId(id) {}
+};
+
+struct ccoGda_SignalAdd {
+  ccoGdaSignal_t signalId;
   uint64_t value;
-  __device__ inline CcoGda_SignalAdd(CcoGdaSignal_t id, uint64_t val) : signalId(id), value(val) {}
+  __device__ inline ccoGda_SignalAdd(ccoGdaSignal_t id, uint64_t val) : signalId(id), value(val) {}
 };
 
-struct CcoGda_CounterInc {
-  CcoGdaCounter_t counterId;
-  __device__ inline CcoGda_CounterInc(CcoGdaCounter_t id) : counterId(id) {}
+struct ccoGda_CounterInc {
+  ccoGdaCounter_t counterId;
+  __device__ inline ccoGda_CounterInc(ccoGdaCounter_t id) : counterId(id) {}
 };
 
-struct CcoGdaCtx {
+struct ccoGdaCtx {
   int rank;
   int worldSize;
   void* handle;
   int contextId;
 };
 
-typedef void* CcoWindow_t;
-typedef void* CcoGdaRequest_t;
+typedef void* ccoWindow_t;
+typedef void* ccoGdaRequest_t;
 
-typedef uint32_t CcoGdaSignal_t;
-typedef uint32_t CcoGdaCounter_t;
+typedef uint32_t ccoGdaSignal_t;
+typedef uint32_t ccoGdaCounter_t;
 
-typedef enum CcoGdaSignalOp_t {
-  CcoGdaSignalInc = 0,
-  CcoGdaSignalAdd,
-} CcoGdaSignalOp_t;
+enum ccoGdaOptFlags {
+  ccoGdaOptFlagsDefault = 0,
+  ccoGdaOptFlagsMaySkipCreditCheck = (1 << 0),
+  ccoGdaOptFlagsAggregateRequests = (1 << 1),
+};
 
-struct CcoGda {
-  CcoDevComm const& comm;
+typedef enum ccoGdaSignalOp_t {
+  ccoGdaSignalInc = 0,
+  ccoGdaSignalAdd,
+} ccoGdaSignalOp_t;
+
+struct ccoGda {
+  ccoDevComm const& comm;
   uint32_t contextId;
-  CcoGdaCtx ctx;
+  ccoGdaCtx ctx;
   void* _gdaHandle;
 
   // Constructor
-  __device__ inline CcoGda(CcoDevComm const&, int contextIndex);
+  __device__ inline ccoGda(ccoDevComm const&, int contextIndex);
 
   // Data transfer operations
-  template <typename RemoteAction = CcoGda_NoSignal, typename LocalAction = CcoGda_NoCounter>
-  __device__ inline void put(int peer, CcoWindow_t dstWin, size_t dstOffset, CcoWindow_t srcWin,
+  template <typename RemoteAction = ccoGda_NoSignal, typename LocalAction = ccoGda_NoCounter>
+  __device__ inline void put(int peer, ccoWindow_t dstWin, size_t dstOffset, ccoWindow_t srcWin,
                              size_t srcOffset, size_t bytes,
-                             RemoteAction remoteAction = CcoGda_NoSignal{},
-                             LocalAction localAction = CcoGda_NoCounter{});
+                             RemoteAction remoteAction = ccoGda_NoSignal{},
+                             LocalAction localAction = ccoGda_NoCounter{},
+                             uint32_t optFlags = ccoGdaOptFlagsDefault);
 
-  template <typename T, typename RemoteAction = CcoGda_NoSignal>
-  __device__ inline void putValue(int peer, CcoWindow_t dstWin, size_t dstOffset, T value,
-                                  RemoteAction remoteAction = CcoGda_NoSignal{});
+  template <typename T, typename RemoteAction = ccoGda_NoSignal>
+  __device__ inline void putValue(int peer, ccoWindow_t dstWin, size_t dstOffset, T value,
+                                  RemoteAction remoteAction = ccoGda_NoSignal{},
+                                  uint32_t optFlags = ccoGdaOptFlagsDefault);
 
-  __device__ inline void get(int peer, CcoWindow_t remoteWin, size_t remoteOffset,
-                             CcoWindow_t localWin, size_t localOffset, size_t bytes);
+  __device__ inline void get(int peer, ccoWindow_t remoteWin, size_t remoteOffset,
+                             ccoWindow_t localWin, size_t localOffset, size_t bytes,
+                             uint32_t optFlags = ccoGdaOptFlagsDefault);
 
   // Signal operations
   template <typename RemoteAction>
   __device__ inline void signal(int peer, RemoteAction remoteAction);
 
-  __device__ inline uint64_t readSignal(CcoGdaSignal_t signalId, int bits = 64);
+  __device__ inline uint64_t readSignal(ccoGdaSignal_t signalId, int bits = 64);
 
-  __device__ inline void waitSignal(CcoGdaSignal_t signalId, uint64_t least, int bits = 64);
+  __device__ inline void waitSignal(ccoGdaSignal_t signalId, uint64_t least, int bits = 64);
 
-  __device__ inline void resetSignal(CcoGdaSignal_t signalId);
+  __device__ inline void resetSignal(ccoGdaSignal_t signalId);
 
   // Counter operations
-  __device__ inline uint64_t readCounter(CcoGdaCounter_t counterId, int bits = 56);
+  __device__ inline uint64_t readCounter(ccoGdaCounter_t counterId, int bits = 56);
 
-  __device__ inline void waitCounter(CcoGdaCounter_t counterId, uint64_t least, int bits = 56);
+  __device__ inline void waitCounter(ccoGdaCounter_t counterId, uint64_t least, int bits = 56);
 
-  __device__ inline void resetCounter(CcoGdaCounter_t counterId);
+  __device__ inline void resetCounter(ccoGdaCounter_t counterId);
 
   // Completion operations
-  __device__ inline void flush();
+  __device__ inline void flush();          // Ring doorbell for all peers
+  __device__ inline void flush(int peer);  // Ring doorbell for specific peer
 
-  __device__ inline void flushAsync(int peer, CcoGdaRequest_t* outRequest);
+  __device__ inline void flushAsync(int peer, ccoGdaRequest_t* outRequest);
 
-  __device__ inline void wait(CcoGdaRequest_t& request);
+  __device__ inline void wait(ccoGdaRequest_t& request);
 };
 
 }  // namespace gda

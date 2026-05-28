@@ -1,5 +1,5 @@
 // Test: CCO GDA connection modes (NONE / CROSSNODE / FULL).
-// Validates that CcoDevCommCreate honors reqs.gdaConnectionType:
+// Validates that ccoDevCommCreate honors reqs.gdaConnectionType:
 //   - NONE      : 0 QPs allocated
 //   - CROSSNODE : 0 QPs allocated on a single-node deployment (auto-collapsed
 //                 to NONE because lsaSize == worldSize), otherwise per-cross-node-peer
@@ -16,13 +16,13 @@
 #include "mori/cco/cco_api.hpp"
 #include "mori/utils/mori_log.hpp"
 
-#define HIP_CHECK(cmd)                                                         \
-  do {                                                                         \
-    hipError_t e = (cmd);                                                      \
-    if (e != hipSuccess) {                                                     \
+#define HIP_CHECK(cmd)                                                            \
+  do {                                                                            \
+    hipError_t e = (cmd);                                                         \
+    if (e != hipSuccess) {                                                        \
       fprintf(stderr, "[rank ?] HIP error %d at %s:%d\n", e, __FILE__, __LINE__); \
-      exit(1);                                                                 \
-    }                                                                          \
+      exit(1);                                                                    \
+    }                                                                             \
   } while (0)
 
 static const size_t PER_RANK_VMM_SIZE = 64ULL * 1024 * 1024;
@@ -34,14 +34,14 @@ struct Result {
 };
 
 // Read DevComm back to host, count non-zero QPs in the IBGDA endpoint array.
-static int CountQpsFor(mori::cco::CcoDevComm* devComm, int worldSize) {
-  mori::cco::CcoDevComm host;
+static int CountQpsFor(mori::cco::ccoDevComm* devComm, int worldSize) {
+  mori::cco::ccoDevComm host;
   HIP_CHECK(hipMemcpy(&host, devComm, sizeof(host), hipMemcpyDeviceToHost));
   if (host.ibgda.endpoints == nullptr || host.ibgda.numQpPerPe == 0) return 0;
   size_t total = static_cast<size_t>(worldSize) * host.ibgda.numQpPerPe;
   std::vector<mori::shmem::ShmemRdmaEndpoint> eps(total);
-  HIP_CHECK(hipMemcpy(eps.data(), host.ibgda.endpoints, total * sizeof(eps[0]),
-                      hipMemcpyDeviceToHost));
+  HIP_CHECK(
+      hipMemcpy(eps.data(), host.ibgda.endpoints, total * sizeof(eps[0]), hipMemcpyDeviceToHost));
   int count = 0;
   for (const auto& ep : eps) {
     if (ep.qpn != 0) count++;
@@ -49,8 +49,7 @@ static int CountQpsFor(mori::cco::CcoDevComm* devComm, int worldSize) {
   return count;
 }
 
-static void run_rank(int rank, int nranks, const mori::application::UniqueId& uid,
-                     Result* r) {
+static void run_rank(int rank, int nranks, const mori::application::UniqueId& uid, Result* r) {
   r->rank = rank;
   r->passed = false;
 
@@ -61,46 +60,46 @@ static void run_rank(int rank, int nranks, const mori::application::UniqueId& ui
 
   auto* bootNet = new mori::application::SocketBootstrapNetwork(uid, rank, nranks);
 
-  mori::cco::CcoComm* comm = nullptr;
-  if (mori::cco::CcoCommCreate(bootNet, PER_RANK_VMM_SIZE, &comm) != 0) {
+  mori::cco::ccoComm* comm = nullptr;
+  if (mori::cco::ccoCommCreate(bootNet, PER_RANK_VMM_SIZE, &comm) != 0) {
     snprintf(r->detail, sizeof(r->detail), "CommCreate failed");
     return;
   }
 
   // Build three DevComms with different connection types.
-  auto makeReqs = [](mori::cco::CcoGdaConnectionType ct) {
-    mori::cco::CcoDevCommRequirements reqs = CCO_DEV_COMM_REQUIREMENTS_INITIALIZER;
-    reqs.gdaConnectionType   = ct;
-    reqs.lsaBarrierCount     = 4;  // LSA barrier slab in resource window
+  auto makeReqs = [](mori::cco::ccoGdaConnectionType ct) {
+    mori::cco::ccoDevCommRequirements reqs = CCO_DEV_COMM_REQUIREMENTS_INITIALIZER;
+    reqs.gdaConnectionType = ct;
+    reqs.lsaBarrierCount = 4;      // LSA barrier slab in resource window
     reqs.railGdaBarrierCount = 2;  // rail GDA barrier → IBGDA signal pool
-    reqs.barrierCount        = 3;  // hybrid LSA + rail GDA
+    reqs.barrierCount = 3;         // hybrid LSA + rail GDA
     return reqs;
   };
 
-  mori::cco::CcoDevComm* dcNone = nullptr;
-  mori::cco::CcoDevComm* dcFull = nullptr;
-  mori::cco::CcoDevComm* dcRail = nullptr;
+  mori::cco::ccoDevComm* dcNone = nullptr;
+  mori::cco::ccoDevComm* dcFull = nullptr;
+  mori::cco::ccoDevComm* dcRail = nullptr;
   auto reqsNone = makeReqs(mori::cco::CCO_GDA_CONNECTION_NONE);
   auto reqsFull = makeReqs(mori::cco::CCO_GDA_CONNECTION_FULL);
   auto reqsRail = makeReqs(mori::cco::CCO_GDA_CONNECTION_RAIL);
   const int numQpPerPe = reqsFull.gdaContextCount;
 
-  if (mori::cco::CcoDevCommCreate(comm, &reqsNone, &dcNone) != 0) {
+  if (mori::cco::ccoDevCommCreate(comm, &reqsNone, &dcNone) != 0) {
     snprintf(r->detail, sizeof(r->detail), "DevCommCreate NONE failed");
-    mori::cco::CcoCommDestroy(comm);
+    mori::cco::ccoCommDestroy(comm);
     return;
   }
-  if (mori::cco::CcoDevCommCreate(comm, &reqsFull, &dcFull) != 0) {
+  if (mori::cco::ccoDevCommCreate(comm, &reqsFull, &dcFull) != 0) {
     snprintf(r->detail, sizeof(r->detail), "DevCommCreate FULL failed");
-    mori::cco::CcoDevCommDestroy(comm, dcNone);
-    mori::cco::CcoCommDestroy(comm);
+    mori::cco::ccoDevCommDestroy(comm, dcNone);
+    mori::cco::ccoCommDestroy(comm);
     return;
   }
-  if (mori::cco::CcoDevCommCreate(comm, &reqsRail, &dcRail) != 0) {
+  if (mori::cco::ccoDevCommCreate(comm, &reqsRail, &dcRail) != 0) {
     snprintf(r->detail, sizeof(r->detail), "DevCommCreate RAIL failed");
-    mori::cco::CcoDevCommDestroy(comm, dcFull);
-    mori::cco::CcoDevCommDestroy(comm, dcNone);
-    mori::cco::CcoCommDestroy(comm);
+    mori::cco::ccoDevCommDestroy(comm, dcFull);
+    mori::cco::ccoDevCommDestroy(comm, dcNone);
+    mori::cco::ccoCommDestroy(comm);
     return;
   }
 
@@ -121,8 +120,7 @@ static void run_rank(int rank, int nranks, const mori::application::UniqueId& ui
     snprintf(r->detail, sizeof(r->detail), "NONE: expected 0, got %d", qpsNone);
     ok = false;
   } else if (qpsFull != expectedFull) {
-    snprintf(r->detail, sizeof(r->detail), "FULL: expected %d, got %d",
-             expectedFull, qpsFull);
+    snprintf(r->detail, sizeof(r->detail), "FULL: expected %d, got %d", expectedFull, qpsFull);
     ok = false;
   } else if (qpsRail != expectedRail) {
     snprintf(r->detail, sizeof(r->detail), "RAIL: expected %d ((nNodes-1)*qpsPerPe=%d*%d), got %d",
@@ -130,17 +128,17 @@ static void run_rank(int rank, int nranks, const mori::application::UniqueId& ui
     ok = false;
   } else {
     snprintf(r->detail, sizeof(r->detail),
-             "NONE=0 FULL=%d RAIL=%d (worldSize=%d lsaSize=%d nNodes=%d qpsPerPe=%d)",
-             qpsFull, qpsRail, comm->worldSize, comm->lsaSize, nNodes, numQpPerPe);
+             "NONE=0 FULL=%d RAIL=%d (worldSize=%d lsaSize=%d nNodes=%d qpsPerPe=%d)", qpsFull,
+             qpsRail, comm->worldSize, comm->lsaSize, nNodes, numQpPerPe);
   }
 
-  printf("[rank %d] NONE=%d FULL=%d RAIL=%d (expected: 0 / %d / %d)\n", rank, qpsNone,
-         qpsFull, qpsRail, expectedFull, expectedRail);
+  printf("[rank %d] NONE=%d FULL=%d RAIL=%d (expected: 0 / %d / %d)\n", rank, qpsNone, qpsFull,
+         qpsRail, expectedFull, expectedRail);
 
-  mori::cco::CcoDevCommDestroy(comm, dcRail);
-  mori::cco::CcoDevCommDestroy(comm, dcFull);
-  mori::cco::CcoDevCommDestroy(comm, dcNone);
-  mori::cco::CcoCommDestroy(comm);
+  mori::cco::ccoDevCommDestroy(comm, dcRail);
+  mori::cco::ccoDevCommDestroy(comm, dcFull);
+  mori::cco::ccoDevCommDestroy(comm, dcNone);
+  mori::cco::ccoCommDestroy(comm);
 
   r->passed = ok;
   if (ok) printf("[rank %d] PASSED\n", rank);
@@ -161,8 +159,7 @@ int main(int argc, char** argv) {
 
   printf("=== CCO GDA Connection Modes Test (%d ranks) ===\n\n", nranks);
 
-  auto uid =
-      mori::application::SocketBootstrapNetwork::GenerateUniqueIdWithInterface("lo", 18458);
+  auto uid = mori::application::SocketBootstrapNetwork::GenerateUniqueIdWithInterface("lo", 18458);
 
   std::vector<Result> results(nranks);
   std::vector<std::thread> threads;

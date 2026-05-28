@@ -23,18 +23,18 @@ static size_t AlignUp(size_t x, size_t align) { return (x + align - 1) & ~(align
 // Used as HeapVAManager's baseAddr so Allocate() returns dereferenceable
 // localVa directly. Guaranteed non-zero because flatBase comes from
 // hipMemAddressReserve.
-static uintptr_t LocalSlotBase(const CcoComm* comm) {
+static uintptr_t LocalSlotBase(const ccoComm* comm) {
   return reinterpret_cast<uintptr_t>(comm->flatBase) +
          static_cast<uintptr_t>(comm->lsaRank) * comm->perRankSize;
 }
 
 /* ========================================================================== */
-/*                              CcoCommCreate                              */
+/*                              ccoCommCreate                              */
 /* ========================================================================== */
 
-int CcoCommCreate(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
-                  CcoComm** outComm) {
-  auto* comm = new CcoComm();
+int ccoCommCreate(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
+                  ccoComm** outComm) {
+  auto* comm = new ccoComm();
   *outComm = comm;
 
   // Step 1: bootstrap
@@ -49,7 +49,7 @@ int CcoCommCreate(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
   comm->bootNet->Allgather(&myPid, allPids.data(), sizeof(int64_t));
   comm->groupId = allPids[0];
 
-  MORI_SHMEM_TRACE("CcoCommCreate: rank={} worldSize={} groupId={}", comm->rank, comm->worldSize,
+  MORI_SHMEM_TRACE("ccoCommCreate: rank={} worldSize={} groupId={}", comm->rank, comm->worldSize,
                    comm->groupId);
 
   // Step 2: context (RDMA endpoints + transport-type negotiation).
@@ -81,7 +81,7 @@ int CcoCommCreate(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
 
     if (lastSameNode - firstSameNode + 1 != lsaCount) {
       MORI_SHMEM_ERROR(
-          "CcoCommCreate: non-contiguous lsa membership "
+          "ccoCommCreate: non-contiguous lsa membership "
           "(rank {}: first={} last={} count={}). CCO requires "
           "node-major contiguous rank layout. Reorder ranks in your "
           "launch (mpirun -host A:N,B:N or equivalent).",
@@ -98,7 +98,7 @@ int CcoCommCreate(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
     for (int r = 0; r < comm->worldSize; r++) {
       if (allLsaSizes[r] != lsaCount) {
         MORI_SHMEM_ERROR(
-            "CcoCommCreate: heterogeneous lsa sizes detected "
+            "ccoCommCreate: heterogeneous lsa sizes detected "
             "(my rank {} sees lsaSize={}, rank {} sees lsaSize={}). "
             "CCO requires uniform GPUs-per-node across all nodes.",
             comm->rank, lsaCount, r, allLsaSizes[r]);
@@ -114,7 +114,7 @@ int CcoCommCreate(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
     comm->myNodeStart = firstSameNode;
     comm->lsaRank = comm->rank - firstSameNode;
 
-    MORI_SHMEM_INFO("CcoCommCreate: lsa topology rank={} lsaSize={} lsaRank={} myNodeStart={}",
+    MORI_SHMEM_INFO("ccoCommCreate: lsa topology rank={} lsaSize={} lsaRank={} myNodeStart={}",
                     comm->rank, comm->lsaSize, comm->lsaRank, comm->myNodeStart);
   }
 
@@ -128,7 +128,7 @@ int CcoCommCreate(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
   perRankVmmSize = AlignUp(perRankVmmSize, 1ULL << 32);
   comm->perRankSize = perRankVmmSize;
 
-  // Cache the device once — subsequent API calls (CcoMemAlloc, CcoWindow-
+  // Cache the device once — subsequent API calls (ccoMemAlloc, ccoWindow-
   // Register) reuse this without re-querying hipGetDevice. Callers MUST keep
   // the calling thread bound to this device for any later CCO API on this comm.
   HIP_RUNTIME_CHECK(hipGetDevice(&comm->cudaDev));
@@ -154,7 +154,7 @@ int CcoCommCreate(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
   size_t totalVaSize = static_cast<size_t>(comm->lsaSize) * perRankVmmSize;
   HIP_RUNTIME_CHECK(hipMemAddressReserve(&comm->flatBase, totalVaSize, granularity, nullptr, 0));
   MORI_SHMEM_TRACE(
-      "CcoCommCreate: flatBase={} totalVA={} (lsaSize={} x perRankSize={}) granularity={}",
+      "ccoCommCreate: flatBase={} totalVA={} (lsaSize={} x perRankSize={}) granularity={}",
       comm->flatBase, totalVaSize, comm->lsaSize, perRankVmmSize, granularity);
 
   // Per-rank slot allocator. baseAddr is THIS rank's slot in the flat VA,
@@ -201,13 +201,13 @@ int CcoCommCreate(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
     comm->sdmaNumQueue = 0;
   }
 
-  // RDMA QP endpoints are NOT pre-allocated here. CcoDevCommCreate builds
+  // RDMA QP endpoints are NOT pre-allocated here. ccoDevCommCreate builds
   // a fresh QP set per DevComm via ctx->CreateAdditionalEndpoints, sized by
   // reqs.gdaContextCount, so multiple DevComms can coexist with independent
   // QP state.
 
   MORI_SHMEM_INFO(
-      "CcoCommCreate: rank={}/{} groupId={} flatBase={} perRankSize={} "
+      "ccoCommCreate: rank={}/{} groupId={} flatBase={} perRankSize={} "
       "granularity={} defaultNumQpPerPe={} sdmaNumQueue={} rdma={}",
       comm->rank, comm->worldSize, comm->groupId, comm->flatBase, comm->perRankSize,
       comm->vmmGranularity, comm->defaultNumQpPerPe, comm->sdmaNumQueue,
@@ -216,13 +216,13 @@ int CcoCommCreate(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
 }
 
 /* ========================================================================== */
-/*                             CcoCommDestroy                              */
+/*                             ccoCommDestroy                              */
 /* ========================================================================== */
 
-int CcoCommDestroy(CcoComm* comm) {
+int ccoCommDestroy(ccoComm* comm) {
   if (!comm) return 0;
 
-  MORI_SHMEM_TRACE("CcoCommDestroy: rank={}", comm->rank);
+  MORI_SHMEM_TRACE("ccoCommDestroy: rank={}", comm->rank);
 
   // Safety net for callers that didn't pair every WindowRegister with a
   // matching Deregister: walk and properly deregister each straggler so
@@ -230,17 +230,17 @@ int CcoCommDestroy(CcoComm* comm) {
   // structs all get released. Each Deregister removes from comm->windows,
   // so iterate via .back() until empty.
   while (!comm->windows.empty()) {
-    CcoWindowHost* wh = comm->windows.back();
+    ccoWindowHost* wh = comm->windows.back();
     if (!wh || !wh->devPtr) {
       delete wh;
       comm->windows.pop_back();
       continue;
     }
     MORI_SHMEM_WARN(
-        "CcoCommDestroy: window {} not deregistered by caller; "
+        "ccoCommDestroy: window {} not deregistered by caller; "
         "auto-deregistering",
         wh->localPtr);
-    (void)CcoWindowDeregister(comm, wh->devPtr);
+    (void)ccoWindowDeregister(comm, wh->devPtr);
   }
 
   for (auto& [ptr, meta] : comm->allocTable) {
@@ -250,7 +250,7 @@ int CcoCommDestroy(CcoComm* comm) {
 
   if (comm->sdmaDevHandles) HIP_RUNTIME_CHECK(hipFree(comm->sdmaDevHandles));
 
-  // Release flat VA — sized to match the reservation in CcoCommCreate.
+  // Release flat VA — sized to match the reservation in ccoCommCreate.
   if (comm->flatBase) {
     size_t totalVaSize = static_cast<size_t>(comm->lsaSize) * comm->perRankSize;
     HIP_RUNTIME_CHECK(hipMemAddressFree(comm->flatBase, totalVaSize));
@@ -265,12 +265,12 @@ int CcoCommDestroy(CcoComm* comm) {
 }
 
 /* ========================================================================== */
-/*                              CcoMemAlloc                                */
+/*                              ccoMemAlloc                                */
 /* ========================================================================== */
 
-int CcoMemAlloc(CcoComm* comm, size_t size, void** outPtr) {
+int ccoMemAlloc(ccoComm* comm, size_t size, void** outPtr) {
   if (outPtr == nullptr) {
-    MORI_SHMEM_ERROR("CcoMemAlloc: outPtr is NULL");
+    MORI_SHMEM_ERROR("ccoMemAlloc: outPtr is NULL");
     return -1;
   }
   if (size == 0) {
@@ -287,8 +287,8 @@ int CcoMemAlloc(CcoComm* comm, size_t size, void** outPtr) {
   uintptr_t slotAddr = comm->vaManager->Allocate(alignedSize, comm->vmmGranularity);
   if (slotAddr == 0) {
     MORI_SHMEM_ERROR(
-        "CcoMemAlloc: slot exhausted (no contiguous {} bytes free in perRankSize={}). "
-        "Increase perRankVmmSize at CcoCommCreate or free unused allocations.",
+        "ccoMemAlloc: slot exhausted (no contiguous {} bytes free in perRankSize={}). "
+        "Increase perRankVmmSize at ccoCommCreate or free unused allocations.",
         alignedSize, comm->perRankSize);
     return -1;
   }
@@ -296,7 +296,7 @@ int CcoMemAlloc(CcoComm* comm, size_t size, void** outPtr) {
   // peer-VA computation (peer's localVa = flatBase + peerLsaRank*stride + slotOffset).
   size_t slotOffset = static_cast<size_t>(slotAddr - LocalSlotBase(comm));
 
-  MORI_SHMEM_TRACE("CcoMemAlloc: rank={} size={} alignedSize={} slotOffset={}", comm->rank, size,
+  MORI_SHMEM_TRACE("ccoMemAlloc: rank={} size={} alignedSize={} slotOffset={}", comm->rank, size,
                    alignedSize, slotOffset);
 
   // Return the reserved slot to the vaManager on any failure after this point.
@@ -311,7 +311,7 @@ int CcoMemAlloc(CcoComm* comm, size_t size, void** outPtr) {
   hipMemGenericAllocationHandle_t physHandle = 0;
   hipError_t err = hipMemCreate(&physHandle, alignedSize, &allocProp, 0);
   if (err != hipSuccess) {
-    MORI_SHMEM_ERROR("CcoMemAlloc: hipMemCreate failed: {} ({})", static_cast<int>(err),
+    MORI_SHMEM_ERROR("ccoMemAlloc: hipMemCreate failed: {} ({})", static_cast<int>(err),
                      hipGetErrorString(err));
     rollbackSlot();
     return -1;
@@ -323,7 +323,7 @@ int CcoMemAlloc(CcoComm* comm, size_t size, void** outPtr) {
   void* localVa = reinterpret_cast<void*>(slotAddr);
   err = hipMemMap(localVa, alignedSize, 0, physHandle, 0);
   if (err != hipSuccess) {
-    MORI_SHMEM_ERROR("CcoMemAlloc: hipMemMap failed: {} ({})", static_cast<int>(err),
+    MORI_SHMEM_ERROR("ccoMemAlloc: hipMemMap failed: {} ({})", static_cast<int>(err),
                      hipGetErrorString(err));
     (void)hipMemRelease(physHandle);
     rollbackSlot();
@@ -336,7 +336,7 @@ int CcoMemAlloc(CcoComm* comm, size_t size, void** outPtr) {
   accessDesc.flags = hipMemAccessFlagsProtReadWrite;
   err = hipMemSetAccess(localVa, alignedSize, &accessDesc, 1);
   if (err != hipSuccess) {
-    MORI_SHMEM_ERROR("CcoMemAlloc: hipMemSetAccess failed: {} ({})", static_cast<int>(err),
+    MORI_SHMEM_ERROR("ccoMemAlloc: hipMemSetAccess failed: {} ({})", static_cast<int>(err),
                      hipGetErrorString(err));
     (void)hipMemUnmap(localVa, alignedSize);
     (void)hipMemRelease(physHandle);
@@ -349,7 +349,7 @@ int CcoMemAlloc(CcoComm* comm, size_t size, void** outPtr) {
   err = hipMemExportToShareableHandle(reinterpret_cast<void*>(&shareFd), physHandle,
                                       hipMemHandleTypePosixFileDescriptor, 0);
   if (err != hipSuccess) {
-    MORI_SHMEM_ERROR("CcoMemAlloc: hipMemExportToShareableHandle failed: {} ({})",
+    MORI_SHMEM_ERROR("ccoMemAlloc: hipMemExportToShareableHandle failed: {} ({})",
                      static_cast<int>(err), hipGetErrorString(err));
     (void)hipMemUnmap(localVa, alignedSize);
     (void)hipMemRelease(physHandle);
@@ -359,7 +359,7 @@ int CcoMemAlloc(CcoComm* comm, size_t size, void** outPtr) {
 
   {
     std::lock_guard<std::mutex> lock(comm->allocMutex);
-    CcoComm::AllocMeta meta;
+    ccoComm::AllocMeta meta;
     meta.physHandle = physHandle;
     meta.shareFd = shareFd;
     meta.slotOffset = slotOffset;
@@ -368,26 +368,26 @@ int CcoMemAlloc(CcoComm* comm, size_t size, void** outPtr) {
   }
 
   *outPtr = localVa;
-  MORI_SHMEM_TRACE("CcoMemAlloc: done, localPtr={}", localVa);
+  MORI_SHMEM_TRACE("ccoMemAlloc: done, localPtr={}", localVa);
   return 0;
 }
 
 /* ========================================================================== */
-/*                              CcoMemFree                                 */
+/*                              ccoMemFree                                 */
 /* ========================================================================== */
 
-int CcoMemFree(CcoComm* comm, void* ptr) {
+int ccoMemFree(ccoComm* comm, void* ptr) {
   if (ptr == nullptr) return 0;
 
   // Snapshot meta + return the slot to vaManager, then drop the cco mutex
   // before the (potentially slow) hipMem* calls so concurrent MemAlloc
   // isn't blocked. vaManager->Free takes its own mutex internally.
-  CcoComm::AllocMeta meta;
+  ccoComm::AllocMeta meta;
   {
     std::lock_guard<std::mutex> lock(comm->allocMutex);
     auto it = comm->allocTable.find(ptr);
     if (it == comm->allocTable.end()) {
-      MORI_SHMEM_WARN("CcoMemFree: ptr {} not found", ptr);
+      MORI_SHMEM_WARN("ccoMemFree: ptr {} not found", ptr);
       return -1;
     }
     meta = it->second;
@@ -399,7 +399,7 @@ int CcoMemFree(CcoComm* comm, void* ptr) {
   size_t alignedSize = meta.size;
   size_t slotOffset = meta.slotOffset;
 
-  MORI_SHMEM_TRACE("CcoMemFree: rank={} ptr={} size={}", comm->rank, ptr, alignedSize);
+  MORI_SHMEM_TRACE("ccoMemFree: rank={} ptr={} size={}", comm->rank, ptr, alignedSize);
 
   // Unmap peer slots that WindowRegister mapped. ENOMAP for never-registered
   // windows is expected and ignored.
@@ -412,19 +412,19 @@ int CcoMemFree(CcoComm* comm, void* ptr) {
                    static_cast<size_t>(lsa) * comm->perRankSize + slotOffset;
     hipError_t err = hipMemUnmap(peerVa, alignedSize);
     if (err != hipSuccess) {
-      MORI_SHMEM_WARN("CcoMemFree: unmap PE {} (lsa={}) failed: {}", pe, lsa,
+      MORI_SHMEM_WARN("ccoMemFree: unmap PE {} (lsa={}) failed: {}", pe, lsa,
                       static_cast<int>(err));
     }
   }
 
   hipError_t err = hipMemUnmap(ptr, alignedSize);
   if (err != hipSuccess) {
-    MORI_SHMEM_WARN("CcoMemFree: local hipMemUnmap failed: {} ({})", static_cast<int>(err),
+    MORI_SHMEM_WARN("ccoMemFree: local hipMemUnmap failed: {} ({})", static_cast<int>(err),
                     hipGetErrorString(err));
   }
   err = hipMemRelease(meta.physHandle);
   if (err != hipSuccess) {
-    MORI_SHMEM_WARN("CcoMemFree: hipMemRelease failed: {} ({})", static_cast<int>(err),
+    MORI_SHMEM_WARN("ccoMemFree: hipMemRelease failed: {} ({})", static_cast<int>(err),
                     hipGetErrorString(err));
   }
 
@@ -434,13 +434,13 @@ int CcoMemFree(CcoComm* comm, void* ptr) {
 }
 
 /* ========================================================================== */
-/*                         CcoWindowRegister (ptr)                         */
+/*                         ccoWindowRegister (ptr)                         */
 /* ========================================================================== */
 
-int CcoWindowRegister(CcoComm* comm, void* ptr, size_t size, CcoWindow_t* outWin) {
+int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin) {
   auto it = comm->allocTable.find(ptr);
   if (it == comm->allocTable.end()) {
-    MORI_SHMEM_ERROR("CcoWindowRegister: ptr {} not in allocTable", ptr);
+    MORI_SHMEM_ERROR("ccoWindowRegister: ptr {} not in allocTable", ptr);
     return -1;
   }
 
@@ -453,11 +453,11 @@ int CcoWindowRegister(CcoComm* comm, void* ptr, size_t size, CcoWindow_t* outWin
 
   size_t alignedSize = meta.size;
 
-  MORI_SHMEM_TRACE("CcoWindowRegister: rank={} ptr={} size={} slotOffset={}", rank, ptr, size,
+  MORI_SHMEM_TRACE("ccoWindowRegister: rank={} ptr={} size={} slotOffset={}", rank, ptr, size,
                    slotOffset);
 
   // P2P imported handles — collected during the FD-exchange loop below,
-  // ownership later transferred to CcoWindowHost so Deregister can release.
+  // ownership later transferred to ccoWindowHost so Deregister can release.
   std::vector<hipMemGenericAllocationHandle_t> p2pImportedHandles;
 
   // P2P: exchange dma-buf FDs with same-node peers and map their slots into
@@ -506,7 +506,7 @@ int CcoWindowRegister(CcoComm* comm, void* ptr, size_t size, CcoWindow_t* outWin
     std::vector<int> myFds = {shareFd};
     std::vector<std::vector<int>> allFds;
     if (!localBoot.ExchangeFileDescriptors(myFds, allFds)) {
-      MORI_SHMEM_ERROR("CcoWindowRegister: P2P FD exchange failed");
+      MORI_SHMEM_ERROR("ccoWindowRegister: P2P FD exchange failed");
       localBoot.Finalize();
       return -1;
     }
@@ -563,13 +563,13 @@ int CcoWindowRegister(CcoComm* comm, void* ptr, size_t size, CcoWindow_t* outWin
     for (int pe : p2pPeers) {
       int pr = globalToPeer[pe];
       if (pr < 0 || pr >= static_cast<int>(allFds.size())) {
-        MORI_SHMEM_ERROR("CcoWindowRegister: PE {} missing in FD exchange result", pe);
+        MORI_SHMEM_ERROR("ccoWindowRegister: PE {} missing in FD exchange result", pe);
         bail();
         return -1;
       }
       int peerFd = allFds[pr][0];
       if (peerFd < 0) {
-        MORI_SHMEM_ERROR("CcoWindowRegister: PE {} delivered invalid FD ({})", pe, peerFd);
+        MORI_SHMEM_ERROR("ccoWindowRegister: PE {} delivered invalid FD ({})", pe, peerFd);
         bail();
         return -1;
       }
@@ -578,7 +578,7 @@ int CcoWindowRegister(CcoComm* comm, void* ptr, size_t size, CcoWindow_t* outWin
       hipError_t err = hipMemImportFromShareableHandleCompat(&importedHandle, peerFd,
                                                              hipMemHandleTypePosixFileDescriptor);
       if (err != hipSuccess) {
-        MORI_SHMEM_ERROR("CcoWindowRegister: import from PE {} failed: {}", pe,
+        MORI_SHMEM_ERROR("ccoWindowRegister: import from PE {} failed: {}", pe,
                          static_cast<int>(err));
         bail();
         return -1;
@@ -589,7 +589,7 @@ int CcoWindowRegister(CcoComm* comm, void* ptr, size_t size, CcoWindow_t* outWin
                      static_cast<size_t>(peerLsaRank) * comm->perRankSize + slotOffset;
       hipError_t mapErr = hipMemMap(peerVa, alignedSize, 0, importedHandle, 0);
       if (mapErr != hipSuccess) {
-        MORI_SHMEM_ERROR("CcoWindowRegister: hipMemMap PE {} failed: {}", pe,
+        MORI_SHMEM_ERROR("ccoWindowRegister: hipMemMap PE {} failed: {}", pe,
                          static_cast<int>(mapErr));
         (void)hipMemRelease(importedHandle);
         bail();
@@ -604,7 +604,7 @@ int CcoWindowRegister(CcoComm* comm, void* ptr, size_t size, CcoWindow_t* outWin
         usleep(1000 * (1 << retry));
       }
       if (setErr != hipSuccess) {
-        MORI_SHMEM_ERROR("CcoWindowRegister: hipMemSetAccess PE {} failed after retries: {}", pe,
+        MORI_SHMEM_ERROR("ccoWindowRegister: hipMemSetAccess PE {} failed after retries: {}", pe,
                          static_cast<int>(setErr));
         (void)hipMemUnmap(peerVa, alignedSize);
         (void)hipMemRelease(importedHandle);
@@ -646,7 +646,7 @@ int CcoWindowRegister(CcoComm* comm, void* ptr, size_t size, CcoWindow_t* outWin
   peerRkeys_host[rank] = localRkey;
   comm->bootNet->Allgather(&localRkey, peerRkeys_host.data(), sizeof(uint32_t));
 
-  // SDMA signal pool is per-DevComm, materialized by CcoDevCommCreate.
+  // SDMA signal pool is per-DevComm, materialized by ccoDevCommCreate.
   // WindowRegister no longer allocates SDMA state — kernels look up signals
   // via devComm->sdma.
 
@@ -655,25 +655,25 @@ int CcoWindowRegister(CcoComm* comm, void* ptr, size_t size, CcoWindow_t* outWin
   HIP_RUNTIME_CHECK(hipMemcpy(peerRkeys_gpu, peerRkeys_host.data(), sizeof(uint32_t) * worldSize,
                               hipMemcpyHostToDevice));
 
-  CcoWindowDevice hostShadow = {};
+  ccoWindowDevice hostShadow = {};
   hostShadow.winBase = static_cast<char*>(comm->flatBase) + slotOffset;
   hostShadow.stride4G = static_cast<uint32_t>(comm->perRankSize >> 32);
   hostShadow.lsaRank = comm->lsaRank;
   hostShadow.ibgdaWin.peerRkeys = peerRkeys_gpu;
   hostShadow.ibgdaWin.lkey = lkey;
 
-  CcoWindowDevice* devPtr = nullptr;
-  HIP_RUNTIME_CHECK(hipMalloc(&devPtr, sizeof(CcoWindowDevice)));
-  HIP_RUNTIME_CHECK(hipMemcpy(devPtr, &hostShadow, sizeof(CcoWindowDevice), hipMemcpyHostToDevice));
+  ccoWindowDevice* devPtr = nullptr;
+  HIP_RUNTIME_CHECK(hipMalloc(&devPtr, sizeof(ccoWindowDevice)));
+  HIP_RUNTIME_CHECK(hipMemcpy(devPtr, &hostShadow, sizeof(ccoWindowDevice), hipMemcpyHostToDevice));
 
   // Publish into the per-comm window table (drives findWindow lookups).
-  CcoComm::WindowTableEntry tableEntry;
+  ccoComm::WindowTableEntry tableEntry;
   tableEntry.base = reinterpret_cast<uintptr_t>(localPtr);
   tableEntry.size = static_cast<uintptr_t>(size);
   tableEntry.devPtr = devPtr;
   comm->windowTableEntries.push_back(tableEntry);
 
-  auto* wh = new CcoWindowHost();
+  auto* wh = new ccoWindowHost();
   wh->localPtr = localPtr;
   wh->size = size;
   wh->devPtr = devPtr;
@@ -684,7 +684,7 @@ int CcoWindowRegister(CcoComm* comm, void* ptr, size_t size, CcoWindow_t* outWin
   *outWin = devPtr;
 
   char* winBase = static_cast<char*>(comm->flatBase) + slotOffset;
-  MORI_SHMEM_INFO("CcoWindowRegister: rank={} win={} winBase={} size={} slotOffset={} lkey={}",
+  MORI_SHMEM_INFO("ccoWindowRegister: rank={} win={} winBase={} size={} slotOffset={} lkey={}",
                   rank, (void*)devPtr, (void*)winBase, size, slotOffset, lkey);
   for (int lsa = 0; lsa < comm->lsaSize; lsa++) {
     int pe = comm->myNodeStart + lsa;
@@ -701,17 +701,17 @@ int CcoWindowRegister(CcoComm* comm, void* ptr, size_t size, CcoWindow_t* outWin
 }
 
 /* ========================================================================== */
-/*                      CcoWindowRegister (convenience)                    */
+/*                      ccoWindowRegister (convenience)                    */
 /* ========================================================================== */
 
-int CcoWindowRegister(CcoComm* comm, size_t size, CcoWindow_t* outWin, void** localPtr) {
+int ccoWindowRegister(ccoComm* comm, size_t size, ccoWindow_t* outWin, void** localPtr) {
   void* ptr = nullptr;
-  int ret = CcoMemAlloc(comm, size, &ptr);
+  int ret = ccoMemAlloc(comm, size, &ptr);
   if (ret != 0) return ret;
 
-  ret = CcoWindowRegister(comm, ptr, size, outWin);
+  ret = ccoWindowRegister(comm, ptr, size, outWin);
   if (ret != 0) {
-    CcoMemFree(comm, ptr);
+    ccoMemFree(comm, ptr);
     return ret;
   }
 
@@ -720,11 +720,11 @@ int CcoWindowRegister(CcoComm* comm, size_t size, CcoWindow_t* outWin, void** lo
 }
 
 /* ========================================================================== */
-/*                          CcoWindowDeregister                            */
+/*                          ccoWindowDeregister                            */
 /* ========================================================================== */
 
-int CcoWindowDeregister(CcoComm* comm, CcoWindow_t win) {
-  CcoWindowHost* wh = nullptr;
+int ccoWindowDeregister(ccoComm* comm, ccoWindow_t win) {
+  ccoWindowHost* wh = nullptr;
   size_t idx = 0;
   for (size_t i = 0; i < comm->windows.size(); i++) {
     if (comm->windows[i]->devPtr == win) {
@@ -734,11 +734,11 @@ int CcoWindowDeregister(CcoComm* comm, CcoWindow_t win) {
     }
   }
   if (!wh) {
-    MORI_SHMEM_WARN("CcoWindowDeregister: win {} not found", (void*)win);
+    MORI_SHMEM_WARN("ccoWindowDeregister: win {} not found", (void*)win);
     return -1;
   }
 
-  MORI_SHMEM_TRACE("CcoWindowDeregister: rank={} ptr={}", comm->rank, wh->localPtr);
+  MORI_SHMEM_TRACE("ccoWindowDeregister: rank={} ptr={}", comm->rank, wh->localPtr);
 
   // Unmap the P2P peer slots that WindowRegister mapped (ENOMAP is fine).
   auto allocIt = comm->allocTable.find(wh->localPtr);
@@ -765,7 +765,7 @@ int CcoWindowDeregister(CcoComm* comm, CcoWindow_t win) {
   auto& entries = comm->windowTableEntries;
   entries.erase(
       std::remove_if(entries.begin(), entries.end(),
-                     [win](const CcoComm::WindowTableEntry& e) { return e.devPtr == win; }),
+                     [win](const ccoComm::WindowTableEntry& e) { return e.devPtr == win; }),
       entries.end());
 
   application::RdmaDeviceContext* rdmaDevCtx = comm->ctx->GetRdmaDeviceContext();
@@ -780,41 +780,41 @@ int CcoWindowDeregister(CcoComm* comm, CcoWindow_t win) {
 }
 
 /* ========================================================================== */
-/*                            CcoDevCommCreate                             */
+/*                            ccoDevCommCreate                             */
 /* ========================================================================== */
 
-int CcoDevCommCreate(CcoComm* comm, const CcoDevCommRequirements* reqs, CcoDevComm** outDevComm) {
-  MORI_SHMEM_TRACE("CcoDevCommCreate: rank={}", comm->rank);
+int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevComm** outDevComm) {
+  MORI_SHMEM_TRACE("ccoDevCommCreate: rank={}", comm->rank);
 
   // Forward-compat: validate {magic, version}.
   if (reqs == nullptr) {
     MORI_SHMEM_ERROR(
-        "CcoDevCommCreate: reqs is NULL — must initialize via "
+        "ccoDevCommCreate: reqs is NULL — must initialize via "
         "CCO_DEV_COMM_REQUIREMENTS_INITIALIZER");
     return -1;
   }
   if (reqs->magic != CCO_API_MAGIC) {
     MORI_SHMEM_ERROR(
-        "CcoDevCommCreate: reqs->magic mismatch (got {:#x}, expect {:#x}) — "
+        "ccoDevCommCreate: reqs->magic mismatch (got {:#x}, expect {:#x}) — "
         "must initialize via CCO_DEV_COMM_REQUIREMENTS_INITIALIZER",
         reqs->magic, CCO_API_MAGIC);
     return -1;
   }
   if (reqs->version > CCO_API_VERSION) {
-    MORI_SHMEM_WARN("CcoDevCommCreate: reqs->version={} > runtime CCO_API_VERSION={}",
+    MORI_SHMEM_WARN("ccoDevCommCreate: reqs->version={} > runtime CCO_API_VERSION={}",
                     reqs->version, CCO_API_VERSION);
   }
 
   // Resolve connection type. CROSSNODE collapses to NONE on single-node
   // deployments (no cross-node peers exist). RAIL collapses to NONE if it
   // ends up with zero peers (single-node, or self-rail only).
-  CcoGdaConnectionType connType = reqs->gdaConnectionType;
+  ccoGdaConnectionType connType = reqs->gdaConnectionType;
   if (connType == CCO_GDA_CONNECTION_CROSSNODE && comm->lsaSize == comm->worldSize) {
-    MORI_SHMEM_TRACE("CcoDevCommCreate: single-node, CROSSNODE -> NONE");
+    MORI_SHMEM_TRACE("ccoDevCommCreate: single-node, CROSSNODE -> NONE");
     connType = CCO_GDA_CONNECTION_NONE;
   }
 
-  CcoDevComm hostShadow = {};
+  ccoDevComm hostShadow = {};
   hostShadow.rank = comm->rank;
   hostShadow.worldSize = comm->worldSize;
   hostShadow.lsaSize = comm->lsaSize;
@@ -825,7 +825,7 @@ int CcoDevCommCreate(CcoComm* comm, const CcoDevCommRequirements* reqs, CcoDevCo
   hostShadow.perRankSize = comm->perRankSize;
 
   // Fresh QP set per DevComm.
-  CcoIbgdaContext& ibgda = hostShadow.ibgda;
+  ccoIbgdaContext& ibgda = hostShadow.ibgda;
   int numQpPerPe = reqs->gdaContextCount > 0 ? reqs->gdaContextCount : comm->defaultNumQpPerPe;
   ibgda.numQpPerPe = numQpPerPe;
 
@@ -865,7 +865,7 @@ int CcoDevCommCreate(CcoComm* comm, const CcoDevCommRequirements* reqs, CcoDevCo
     // node, or CROSSNODE that lost all peers).
     if (std::none_of(peerMask.begin(), peerMask.end(), [](bool b) { return b; })) {
       MORI_SHMEM_TRACE(
-          "CcoDevCommCreate: resolved peer mask is empty, "
+          "ccoDevCommCreate: resolved peer mask is empty, "
           "downgrading connType {} -> NONE",
           static_cast<int>(connType));
       connType = CCO_GDA_CONNECTION_NONE;
@@ -991,17 +991,17 @@ int CcoDevCommCreate(CcoComm* comm, const CcoDevCommRequirements* reqs, CcoDevCo
   }
 
   void* resourceWindowPtr = nullptr;
-  CcoWindow_t resourceWindow = nullptr;
+  ccoWindow_t resourceWindow = nullptr;
   if (layout.totalSize > 0) {
-    if (CcoMemAlloc(comm, layout.totalSize, &resourceWindowPtr) != 0) {
-      MORI_SHMEM_ERROR("CcoDevCommCreate: resource window MemAlloc failed");
+    if (ccoMemAlloc(comm, layout.totalSize, &resourceWindowPtr) != 0) {
+      MORI_SHMEM_ERROR("ccoDevCommCreate: resource window MemAlloc failed");
       if (epsGpu) HIP_RUNTIME_CHECK(hipFree(epsGpu));
       return -1;
     }
     HIP_RUNTIME_CHECK(hipMemset(resourceWindowPtr, 0, layout.totalSize));
-    if (CcoWindowRegister(comm, resourceWindowPtr, layout.totalSize, &resourceWindow) != 0) {
-      MORI_SHMEM_ERROR("CcoDevCommCreate: resource window Register failed");
-      (void)CcoMemFree(comm, resourceWindowPtr);
+    if (ccoWindowRegister(comm, resourceWindowPtr, layout.totalSize, &resourceWindow) != 0) {
+      MORI_SHMEM_ERROR("ccoDevCommCreate: resource window Register failed");
+      (void)ccoMemFree(comm, resourceWindowPtr);
       if (epsGpu) HIP_RUNTIME_CHECK(hipFree(epsGpu));
       return -1;
     }
@@ -1026,7 +1026,7 @@ int CcoDevCommCreate(CcoComm* comm, const CcoDevCommRequirements* reqs, CcoDevCo
     // can read winBase/stride4G/ibgdaWin.{lkey,peerRkeys} straight out of
     // kernel cmem (no extra GPU memory load through the pointer).
     HIP_RUNTIME_CHECK(hipMemcpy(&hostShadow.resourceWindow_inlined, resourceWindow,
-                                sizeof(CcoWindowDevice), hipMemcpyDeviceToHost));
+                                sizeof(ccoWindowDevice), hipMemcpyDeviceToHost));
   }
   hostShadow.resourceWindow = resourceWindow;
 
@@ -1042,7 +1042,7 @@ int CcoDevCommCreate(CcoComm* comm, const CcoDevCommRequirements* reqs, CcoDevCo
   }
 
   MORI_SHMEM_TRACE(
-      "CcoDevCommCreate: resourceWindow={} ptr={} totalSize={} signals={} "
+      "ccoDevCommCreate: resourceWindow={} ptr={} totalSize={} signals={} "
       "counters={} lsaBar={} lsaBarOff={:#x} hybLsaBar={} hybLsaBarOff={:#x} "
       "railGdaBar={} railGdaSig0={} hybRailGdaBar={} hybRailGdaSig0={}",
       (void*)resourceWindow, resourceWindowPtr, layout.totalSize, signalCount, counterCount,
@@ -1055,14 +1055,14 @@ int CcoDevCommCreate(CcoComm* comm, const CcoDevCommRequirements* reqs, CcoDevCo
   size_t numNodes = (numWindows + CCO_WINDOW_TABLE_SIZE - 1) / CCO_WINDOW_TABLE_SIZE;
   if (numNodes == 0) numNodes = 1;
 
-  std::vector<CcoWindowTableNode*> gpuNodes(numNodes, nullptr);
+  std::vector<ccoWindowTableNode*> gpuNodes(numNodes, nullptr);
   for (size_t n = 0; n < numNodes; n++) {
-    HIP_RUNTIME_CHECK(hipMalloc(&gpuNodes[n], sizeof(CcoWindowTableNode)));
-    HIP_RUNTIME_CHECK(hipMemset(gpuNodes[n], 0, sizeof(CcoWindowTableNode)));
+    HIP_RUNTIME_CHECK(hipMalloc(&gpuNodes[n], sizeof(ccoWindowTableNode)));
+    HIP_RUNTIME_CHECK(hipMemset(gpuNodes[n], 0, sizeof(ccoWindowTableNode)));
   }
 
   for (size_t n = 0; n < numNodes; n++) {
-    CcoWindowTableNode nodeHost = {};
+    ccoWindowTableNode nodeHost = {};
     size_t base = n * CCO_WINDOW_TABLE_SIZE;
     for (int i = 0; i < CCO_WINDOW_TABLE_SIZE; i++) {
       size_t idx = base + i;
@@ -1074,11 +1074,11 @@ int CcoDevCommCreate(CcoComm* comm, const CcoDevCommRequirements* reqs, CcoDevCo
     }
     nodeHost.next = (n + 1 < numNodes) ? gpuNodes[n + 1] : nullptr;
     HIP_RUNTIME_CHECK(
-        hipMemcpy(gpuNodes[n], &nodeHost, sizeof(CcoWindowTableNode), hipMemcpyHostToDevice));
+        hipMemcpy(gpuNodes[n], &nodeHost, sizeof(ccoWindowTableNode), hipMemcpyHostToDevice));
   }
   hostShadow.windowTable = gpuNodes[0];
 
-  MORI_SHMEM_TRACE("CcoDevCommCreate: windowTable with {} windows in {} nodes", numWindows,
+  MORI_SHMEM_TRACE("ccoDevCommCreate: windowTable with {} windows in {} nodes", numWindows,
                    numNodes);
 
   // SDMA signal pool (per-DevComm). Materialized only if comm-level SDMA
@@ -1089,7 +1089,7 @@ int CcoDevCommCreate(CcoComm* comm, const CcoDevCommRequirements* reqs, CcoDevCo
   // handle was exported by the same process, so for SPMT we Allgather raw
   // VAs alongside IPC handles and pick per-peer based on SameProcessP2P.
   // (See shmem's SymmMemManager::Register for the same pattern.)
-  CcoSdmaContext& sdma = hostShadow.sdma;
+  ccoSdmaContext& sdma = hostShadow.sdma;
   sdma.sdmaNumQueue = static_cast<uint32_t>(comm->sdmaNumQueue);
   if (comm->sdmaNumQueue > 0) {
     size_t poolBytes = static_cast<size_t>(comm->lsaSize) * comm->sdmaNumQueue * sizeof(HSAuint64);
@@ -1129,7 +1129,7 @@ int CcoDevCommCreate(CcoComm* comm, const CcoDevCommRequirements* reqs, CcoDevCo
           (void)hipGetLastError();
           if (peerErr != hipSuccess && peerErr != hipErrorPeerAccessAlreadyEnabled) {
             MORI_SHMEM_WARN(
-                "CcoDevCommCreate: hipDeviceEnablePeerAccess(peer={}, "
+                "ccoDevCommCreate: hipDeviceEnablePeerAccess(peer={}, "
                 "device={}) failed: {}",
                 pe, attr.device, hipGetErrorString(peerErr));
           }
@@ -1150,19 +1150,19 @@ int CcoDevCommCreate(CcoComm* comm, const CcoDevCommRequirements* reqs, CcoDevCo
 
     sdma.deviceHandles = comm->sdmaDevHandles;
     MORI_SHMEM_TRACE(
-        "CcoDevCommCreate: SDMA pool signalBuf={} expectSignals={} "
+        "ccoDevCommCreate: SDMA pool signalBuf={} expectSignals={} "
         "peerSignalPtrs={} numQueue={}",
         (void*)sdma.signalBuf, (void*)sdma.expectSignals, (void*)sdma.peerSignalPtrs,
         sdma.sdmaNumQueue);
   }
 
-  CcoDevComm* devCommGpu = nullptr;
-  HIP_RUNTIME_CHECK(hipMalloc(&devCommGpu, sizeof(CcoDevComm)));
-  HIP_RUNTIME_CHECK(hipMemcpy(devCommGpu, &hostShadow, sizeof(CcoDevComm), hipMemcpyHostToDevice));
+  ccoDevComm* devCommGpu = nullptr;
+  HIP_RUNTIME_CHECK(hipMalloc(&devCommGpu, sizeof(ccoDevComm)));
+  HIP_RUNTIME_CHECK(hipMemcpy(devCommGpu, &hostShadow, sizeof(ccoDevComm), hipMemcpyHostToDevice));
 
   *outDevComm = devCommGpu;
   MORI_SHMEM_INFO(
-      "CcoDevCommCreate: rank={} devComm={} windows={} signals={} counters={} "
+      "ccoDevCommCreate: rank={} devComm={} windows={} signals={} counters={} "
       "resourceWindow={}",
       comm->rank, (void*)devCommGpu, numWindows, signalCount, counterCount, (void*)resourceWindow);
 
@@ -1247,20 +1247,20 @@ int CcoDevCommCreate(CcoComm* comm, const CcoDevCommRequirements* reqs, CcoDevCo
 }
 
 /* ========================================================================== */
-/*                           CcoDevCommDestroy                             */
+/*                           ccoDevCommDestroy                             */
 /* ========================================================================== */
 
-int CcoDevCommDestroy(CcoComm* comm, CcoDevComm* devComm) {
+int ccoDevCommDestroy(ccoComm* comm, ccoDevComm* devComm) {
   if (!devComm) return 0;
 
-  CcoDevComm hostShadow;
-  HIP_RUNTIME_CHECK(hipMemcpy(&hostShadow, devComm, sizeof(CcoDevComm), hipMemcpyDeviceToHost));
+  ccoDevComm hostShadow;
+  HIP_RUNTIME_CHECK(hipMemcpy(&hostShadow, devComm, sizeof(ccoDevComm), hipMemcpyDeviceToHost));
 
   auto& ibgda = hostShadow.ibgda;
 
-  // Resource window: undoes CcoMemAlloc + CcoWindowRegister done in
+  // Resource window: undoes ccoMemAlloc + ccoWindowRegister done in
   // DevCommCreate. WindowDeregister handles MR deregister, peer-VA unmap,
-  // imported handle release, and frees the GPU CcoWindowDevice. MemFree
+  // imported handle release, and frees the GPU ccoWindowDevice. MemFree
   // then releases the physical pages and returns the slot to vaManager.
   // Look up the wh->localPtr before Deregister erases the entry.
   if (hostShadow.resourceWindow && comm) {
@@ -1271,13 +1271,13 @@ int CcoDevCommDestroy(CcoComm* comm, CcoDevComm* devComm) {
         break;
       }
     }
-    (void)CcoWindowDeregister(comm, hostShadow.resourceWindow);
-    if (resourceWindowLocalPtr) (void)CcoMemFree(comm, resourceWindowLocalPtr);
+    (void)ccoWindowDeregister(comm, hostShadow.resourceWindow);
+    if (resourceWindowLocalPtr) (void)ccoMemFree(comm, resourceWindowLocalPtr);
   }
 
   // QP endpoints array. signalBuf/Shadows/counterBuf are sub-pointers into
-  // the resource window — they were freed above by CcoWindowDeregister +
-  // CcoMemFree, so no separate hipFree needed.
+  // the resource window — they were freed above by ccoWindowDeregister +
+  // ccoMemFree, so no separate hipFree needed.
   if (ibgda.endpoints) HIP_RUNTIME_CHECK(hipFree(ibgda.endpoints));
 
   // SDMA pool cleanup. peerSignalPtrs is a GPU array of host-mapped peer
@@ -1301,11 +1301,11 @@ int CcoDevCommDestroy(CcoComm* comm, CcoDevComm* devComm) {
   if (sdma.signalBuf) HIP_RUNTIME_CHECK(hipFree(sdma.signalBuf));
   if (sdma.expectSignals) HIP_RUNTIME_CHECK(hipFree(sdma.expectSignals));
 
-  CcoWindowTableNode* node = hostShadow.windowTable;
+  ccoWindowTableNode* node = hostShadow.windowTable;
   while (node) {
-    CcoWindowTableNode nodeHost;
+    ccoWindowTableNode nodeHost;
     HIP_RUNTIME_CHECK(
-        hipMemcpy(&nodeHost, node, sizeof(CcoWindowTableNode), hipMemcpyDeviceToHost));
+        hipMemcpy(&nodeHost, node, sizeof(ccoWindowTableNode), hipMemcpyDeviceToHost));
     HIP_RUNTIME_CHECK(hipFree(node));
     node = nodeHost.next;
   }
@@ -1315,10 +1315,10 @@ int CcoDevCommDestroy(CcoComm* comm, CcoDevComm* devComm) {
 }
 
 /* ========================================================================== */
-/*                             CcoBarrierAll                               */
+/*                             ccoBarrierAll                               */
 /* ========================================================================== */
 
-int CcoBarrierAll(CcoComm* comm) {
+int ccoBarrierAll(ccoComm* comm) {
   comm->bootNet->Barrier();
   return 0;
 }

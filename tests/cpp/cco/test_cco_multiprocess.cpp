@@ -74,15 +74,15 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
 
   printf("[rank %d/%d] pid=%d GPU=%d\n", rank, nranks, getpid(), dev);
 
-  mori::cco::CcoComm* comm = nullptr;
-  if (mori::cco::CcoCommCreate(bootNet, PER_RANK_VMM_SIZE, &comm) != 0) {
+  mori::cco::ccoComm* comm = nullptr;
+  if (mori::cco::ccoCommCreate(bootNet, PER_RANK_VMM_SIZE, &comm) != 0) {
     fprintf(stderr, "[rank %d] CommCreate failed\n", rank);
     return 1;
   }
   printf("[rank %d] CommCreate OK\n", rank);
 
   void* buf = nullptr;
-  if (mori::cco::CcoMemAlloc(comm, WINDOW_SIZE, &buf) != 0) {
+  if (mori::cco::ccoMemAlloc(comm, WINDOW_SIZE, &buf) != 0) {
     fprintf(stderr, "[rank %d] MemAlloc failed\n", rank);
     return 1;
   }
@@ -90,30 +90,30 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
   uint8_t pattern = static_cast<uint8_t>((rank + 1) * 10);
   HIP_CHECK(hipMemset(buf, pattern, WINDOW_SIZE));
 
-  mori::cco::CcoWindow_t win = nullptr;
-  if (mori::cco::CcoWindowRegister(comm, buf, WINDOW_SIZE, &win) != 0) {
+  mori::cco::ccoWindow_t win = nullptr;
+  if (mori::cco::ccoWindowRegister(comm, buf, WINDOW_SIZE, &win) != 0) {
     fprintf(stderr, "[rank %d] WindowRegister failed\n", rank);
     return 1;
   }
 
   // ── Create DevComm #1 (default requirements) ──
-  mori::cco::CcoDevCommRequirements reqs = CCO_DEV_COMM_REQUIREMENTS_INITIALIZER;
-  mori::cco::CcoDevComm* devComm1 = nullptr;
-  if (mori::cco::CcoDevCommCreate(comm, &reqs, &devComm1) != 0) {
+  mori::cco::ccoDevCommRequirements reqs = CCO_DEV_COMM_REQUIREMENTS_INITIALIZER;
+  mori::cco::ccoDevComm* devComm1 = nullptr;
+  if (mori::cco::ccoDevCommCreate(comm, &reqs, &devComm1) != 0) {
     fprintf(stderr, "[rank %d] DevCommCreate #1 failed\n", rank);
     return 1;
   }
 
   // ── Create DevComm #2 (fresh QPs, independent from #1) ──
-  mori::cco::CcoDevComm* devComm2 = nullptr;
-  if (mori::cco::CcoDevCommCreate(comm, &reqs, &devComm2) != 0) {
+  mori::cco::ccoDevComm* devComm2 = nullptr;
+  if (mori::cco::ccoDevCommCreate(comm, &reqs, &devComm2) != 0) {
     fprintf(stderr, "[rank %d] DevCommCreate #2 failed\n", rank);
     return 1;
   }
   printf("[rank %d] 2x DevCommCreate OK\n", rank);
 
   // Verify both DevComms have correct rank/worldSize
-  mori::cco::CcoDevComm dc1Host, dc2Host;
+  mori::cco::ccoDevComm dc1Host, dc2Host;
   HIP_CHECK(hipMemcpy(&dc1Host, devComm1, sizeof(dc1Host), hipMemcpyDeviceToHost));
   HIP_CHECK(hipMemcpy(&dc2Host, devComm2, sizeof(dc2Host), hipMemcpyDeviceToHost));
   if (dc1Host.rank != rank || dc2Host.rank != rank) {
@@ -144,45 +144,46 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
   //   CROSSNODE : (worldSize - lsaSize) * qpsPerPe   (collapses to 0 on single-node)
   //   RAIL      : (nNodes - 1) * qpsPerPe            (collapses to 0 on single-node)
   {
-    auto countQps = [&](mori::cco::CcoDevComm* dc) -> int {
-      mori::cco::CcoDevComm h;
+    auto countQps = [&](mori::cco::ccoDevComm* dc) -> int {
+      mori::cco::ccoDevComm h;
       HIP_CHECK(hipMemcpy(&h, dc, sizeof(h), hipMemcpyDeviceToHost));
       if (!h.ibgda.endpoints || h.ibgda.numQpPerPe == 0) return 0;
       size_t n = static_cast<size_t>(h.worldSize) * h.ibgda.numQpPerPe;
       std::vector<mori::shmem::ShmemRdmaEndpoint> eps(n);
-      HIP_CHECK(hipMemcpy(eps.data(), h.ibgda.endpoints, n * sizeof(eps[0]),
-                          hipMemcpyDeviceToHost));
+      HIP_CHECK(
+          hipMemcpy(eps.data(), h.ibgda.endpoints, n * sizeof(eps[0]), hipMemcpyDeviceToHost));
       int c = 0;
-      for (auto& ep : eps) if (ep.qpn != 0) c++;
+      for (auto& ep : eps)
+        if (ep.qpn != 0) c++;
       return c;
     };
-    auto mkReqs = [](mori::cco::CcoGdaConnectionType ct) {
-      mori::cco::CcoDevCommRequirements r = CCO_DEV_COMM_REQUIREMENTS_INITIALIZER;
+    auto mkReqs = [](mori::cco::ccoGdaConnectionType ct) {
+      mori::cco::ccoDevCommRequirements r = CCO_DEV_COMM_REQUIREMENTS_INITIALIZER;
       r.gdaConnectionType = ct;
       return r;
     };
-    mori::cco::CcoDevComm *dcNone = nullptr, *dcFull = nullptr;
-    mori::cco::CcoDevComm *dcXnode = nullptr, *dcRail = nullptr;
-    auto rNone  = mkReqs(mori::cco::CCO_GDA_CONNECTION_NONE);
-    auto rFull  = mkReqs(mori::cco::CCO_GDA_CONNECTION_FULL);
+    mori::cco::ccoDevComm *dcNone = nullptr, *dcFull = nullptr;
+    mori::cco::ccoDevComm *dcXnode = nullptr, *dcRail = nullptr;
+    auto rNone = mkReqs(mori::cco::CCO_GDA_CONNECTION_NONE);
+    auto rFull = mkReqs(mori::cco::CCO_GDA_CONNECTION_FULL);
     auto rXnode = mkReqs(mori::cco::CCO_GDA_CONNECTION_CROSSNODE);
-    auto rRail  = mkReqs(mori::cco::CCO_GDA_CONNECTION_RAIL);
+    auto rRail = mkReqs(mori::cco::CCO_GDA_CONNECTION_RAIL);
     const int qpsPerPe = rFull.gdaContextCount;
-    if (mori::cco::CcoDevCommCreate(comm, &rNone,  &dcNone)  != 0 ||
-        mori::cco::CcoDevCommCreate(comm, &rFull,  &dcFull)  != 0 ||
-        mori::cco::CcoDevCommCreate(comm, &rXnode, &dcXnode) != 0 ||
-        mori::cco::CcoDevCommCreate(comm, &rRail,  &dcRail)  != 0) {
+    if (mori::cco::ccoDevCommCreate(comm, &rNone, &dcNone) != 0 ||
+        mori::cco::ccoDevCommCreate(comm, &rFull, &dcFull) != 0 ||
+        mori::cco::ccoDevCommCreate(comm, &rXnode, &dcXnode) != 0 ||
+        mori::cco::ccoDevCommCreate(comm, &rRail, &dcRail) != 0) {
       fprintf(stderr, "[rank %d] connType DevCommCreate failed\n", rank);
       return 1;
     }
     const int nNodes = dc1Host.worldSize / dc1Host.lsaSize;
-    const int qNone  = countQps(dcNone);
-    const int qFull  = countQps(dcFull);
+    const int qNone = countQps(dcNone);
+    const int qFull = countQps(dcFull);
     const int qXnode = countQps(dcXnode);
-    const int qRail  = countQps(dcRail);
-    const int eFull  = (dc1Host.worldSize - 1)              * qpsPerPe;
+    const int qRail = countQps(dcRail);
+    const int eFull = (dc1Host.worldSize - 1) * qpsPerPe;
     const int eXnode = (dc1Host.worldSize - dc1Host.lsaSize) * qpsPerPe;
-    const int eRail  = (nNodes - 1)                          * qpsPerPe;
+    const int eRail = (nNodes - 1) * qpsPerPe;
     if (qNone != 0 || qFull != eFull || qXnode != eXnode || qRail != eRail) {
       fprintf(stderr,
               "[rank %d] connType MISMATCH: NONE got=%d exp=0, FULL got=%d exp=%d, "
@@ -190,21 +191,21 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
               rank, qNone, qFull, eFull, qXnode, eXnode, qRail, eRail, nNodes, qpsPerPe);
       return 1;
     }
-    printf("[rank %d] connType OK: NONE=0 FULL=%d XNODE=%d RAIL=%d (nNodes=%d qpsPerPe=%d)\n",
-           rank, qFull, qXnode, qRail, nNodes, qpsPerPe);
-    mori::cco::CcoDevCommDestroy(comm, dcRail);
-    mori::cco::CcoDevCommDestroy(comm, dcXnode);
-    mori::cco::CcoDevCommDestroy(comm, dcFull);
-    mori::cco::CcoDevCommDestroy(comm, dcNone);
+    printf("[rank %d] connType OK: NONE=0 FULL=%d XNODE=%d RAIL=%d (nNodes=%d qpsPerPe=%d)\n", rank,
+           qFull, qXnode, qRail, nNodes, qpsPerPe);
+    mori::cco::ccoDevCommDestroy(comm, dcRail);
+    mori::cco::ccoDevCommDestroy(comm, dcXnode);
+    mori::cco::ccoDevCommDestroy(comm, dcFull);
+    mori::cco::ccoDevCommDestroy(comm, dcNone);
   }
 
   // P2P cross-read via flat addressing — LSA peers only (intra-node).
-  mori::cco::CcoWindowDevice winHost;
+  mori::cco::ccoWindowDevice winHost;
   HIP_CHECK(hipMemcpy(&winHost, win, sizeof(winHost), hipMemcpyDeviceToHost));
-  mori::cco::CcoDevComm devCommSnap;
+  mori::cco::ccoDevComm devCommSnap;
   HIP_CHECK(hipMemcpy(&devCommSnap, devComm1, sizeof(devCommSnap), hipMemcpyDeviceToHost));
 
-  mori::cco::CcoBarrierAll(comm);
+  mori::cco::ccoBarrierAll(comm);
 
   int p2pOk = 0;
   int lsaSize = devCommSnap.lsaSize;
@@ -217,18 +218,19 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
     HIP_CHECK(hipMemcpy(&got, peerVa, 1, hipMemcpyDeviceToHost));
     uint8_t want = static_cast<uint8_t>((pe + 1) * 10);
     if (got != want) {
-      fprintf(stderr, "[rank %d] P2P read PE %d (lsa=%d): got %u want %u\n", rank, pe, lsa, got, want);
+      fprintf(stderr, "[rank %d] P2P read PE %d (lsa=%d): got %u want %u\n", rank, pe, lsa, got,
+              want);
       return 1;
     }
     p2pOk++;
   }
   printf("[rank %d] P2P OK from %d LSA peers\n", rank, p2pOk);
 
-  mori::cco::CcoDevCommDestroy(comm, devComm2);
-  mori::cco::CcoDevCommDestroy(comm, devComm1);
-  mori::cco::CcoWindowDeregister(comm, win);
-  mori::cco::CcoMemFree(comm, buf);
-  mori::cco::CcoCommDestroy(comm);
+  mori::cco::ccoDevCommDestroy(comm, devComm2);
+  mori::cco::ccoDevCommDestroy(comm, devComm1);
+  mori::cco::ccoWindowDeregister(comm, win);
+  mori::cco::ccoMemFree(comm, buf);
+  mori::cco::ccoCommDestroy(comm);
 
   printf("[rank %d] PASSED\n", rank);
   return 0;
@@ -297,10 +299,14 @@ static int run_single_rank_mode(int argc, char** argv) {
   int rank = -1, worldSize = -1, gpuOffset = -1;
   const char* uidPath = nullptr;
   for (int i = 1; i < argc; i++) {
-    if (!strcmp(argv[i], "--rank") && i + 1 < argc) rank = atoi(argv[++i]);
-    else if (!strcmp(argv[i], "--world") && i + 1 < argc) worldSize = atoi(argv[++i]);
-    else if (!strcmp(argv[i], "--uid-file") && i + 1 < argc) uidPath = argv[++i];
-    else if (!strcmp(argv[i], "--gpu-offset") && i + 1 < argc) gpuOffset = atoi(argv[++i]);
+    if (!strcmp(argv[i], "--rank") && i + 1 < argc)
+      rank = atoi(argv[++i]);
+    else if (!strcmp(argv[i], "--world") && i + 1 < argc)
+      worldSize = atoi(argv[++i]);
+    else if (!strcmp(argv[i], "--uid-file") && i + 1 < argc)
+      uidPath = argv[++i];
+    else if (!strcmp(argv[i], "--gpu-offset") && i + 1 < argc)
+      gpuOffset = atoi(argv[++i]);
   }
   if (rank < 0 || worldSize <= 0 || !uidPath) return -1;
 
@@ -338,11 +344,13 @@ static int run_gen_uid_mode(int argc, char** argv) {
   const char* outPath = argv[4];
   auto uid = mori::application::SocketBootstrapNetwork::GenerateUniqueIdWithInterface(iface, port);
   FILE* f = fopen(outPath, "wb");
-  if (!f) { fprintf(stderr, "fopen(%s) failed\n", outPath); return 1; }
+  if (!f) {
+    fprintf(stderr, "fopen(%s) failed\n", outPath);
+    return 1;
+  }
   fwrite(&uid, 1, sizeof(uid), f);
   fclose(f);
-  printf("Wrote UID (%zu bytes) for iface=%s port=%d to %s\n",
-         sizeof(uid), iface, port, outPath);
+  printf("Wrote UID (%zu bytes) for iface=%s port=%d to %s\n", sizeof(uid), iface, port, outPath);
   return 0;
 }
 

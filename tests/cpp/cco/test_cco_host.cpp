@@ -77,8 +77,8 @@ static void run_rank(int rank, int nranks, const mori::application::UniqueId& ui
   auto* bootNet = new mori::application::SocketBootstrapNetwork(uid, rank, nranks);
 
   // Phase 1: CommCreate
-  mori::cco::CcoComm* comm = nullptr;
-  int ret = mori::cco::CcoCommCreate(bootNet, PER_RANK_VMM_SIZE, &comm);
+  mori::cco::ccoComm* comm = nullptr;
+  int ret = mori::cco::ccoCommCreate(bootNet, PER_RANK_VMM_SIZE, &comm);
   if (ret != 0) {
     snprintf(result->detail, sizeof(result->detail), "CommCreate failed: %d", ret);
     return;
@@ -87,10 +87,10 @@ static void run_rank(int rank, int nranks, const mori::application::UniqueId& ui
 
   // Phase 1.5: MemAlloc
   void* buf = nullptr;
-  ret = mori::cco::CcoMemAlloc(comm, WINDOW_SIZE, &buf);
+  ret = mori::cco::ccoMemAlloc(comm, WINDOW_SIZE, &buf);
   if (ret != 0) {
     snprintf(result->detail, sizeof(result->detail), "MemAlloc failed: %d", ret);
-    mori::cco::CcoCommDestroy(comm);
+    mori::cco::ccoCommDestroy(comm);
     return;
   }
   printf("[rank %d] MemAlloc OK: buf=%p\n", rank, buf);
@@ -98,29 +98,29 @@ static void run_rank(int rank, int nranks, const mori::application::UniqueId& ui
   // Phase 1.6: Allocator path coverage (size==0 + freelist reuse).
   {
     void* z = reinterpret_cast<void*>(0x1);
-    if (mori::cco::CcoMemAlloc(comm, 0, &z) != 0 || z != nullptr) {
+    if (mori::cco::ccoMemAlloc(comm, 0, &z) != 0 || z != nullptr) {
       snprintf(result->detail, sizeof(result->detail), "size==0 alloc didn't return nullptr");
-      mori::cco::CcoMemFree(comm, buf);
-      mori::cco::CcoCommDestroy(comm);
+      mori::cco::ccoMemFree(comm, buf);
+      mori::cco::ccoCommDestroy(comm);
       return;
     }
     void* a = nullptr;
     void* b = nullptr;
-    if (mori::cco::CcoMemAlloc(comm, WINDOW_SIZE, &a) != 0 || mori::cco::CcoMemFree(comm, a) != 0 ||
-        mori::cco::CcoMemAlloc(comm, WINDOW_SIZE, &b) != 0) {
+    if (mori::cco::ccoMemAlloc(comm, WINDOW_SIZE, &a) != 0 || mori::cco::ccoMemFree(comm, a) != 0 ||
+        mori::cco::ccoMemAlloc(comm, WINDOW_SIZE, &b) != 0) {
       snprintf(result->detail, sizeof(result->detail), "alloc/free churn failed");
-      mori::cco::CcoMemFree(comm, buf);
-      mori::cco::CcoCommDestroy(comm);
+      mori::cco::ccoMemFree(comm, buf);
+      mori::cco::ccoCommDestroy(comm);
       return;
     }
     if (a != b) {
       snprintf(result->detail, sizeof(result->detail), "slot reuse: a=%p b=%p", a, b);
-      mori::cco::CcoMemFree(comm, b);
-      mori::cco::CcoMemFree(comm, buf);
-      mori::cco::CcoCommDestroy(comm);
+      mori::cco::ccoMemFree(comm, b);
+      mori::cco::ccoMemFree(comm, buf);
+      mori::cco::ccoCommDestroy(comm);
       return;
     }
-    mori::cco::CcoMemFree(comm, b);
+    mori::cco::ccoMemFree(comm, b);
   }
 
   // Write unique pattern: byte[0] = (rank+1)*10
@@ -131,46 +131,46 @@ static void run_rank(int rank, int nranks, const mori::application::UniqueId& ui
   HIP_CHECK(hipMemcpy(buf, pattern.data(), WINDOW_SIZE, hipMemcpyHostToDevice));
 
   // Phase 2: WindowRegister (ptr overload)
-  mori::cco::CcoWindow_t win = nullptr;
-  ret = mori::cco::CcoWindowRegister(comm, buf, WINDOW_SIZE, &win);
+  mori::cco::ccoWindow_t win = nullptr;
+  ret = mori::cco::ccoWindowRegister(comm, buf, WINDOW_SIZE, &win);
   if (ret != 0) {
     snprintf(result->detail, sizeof(result->detail), "WindowRegister failed: %d", ret);
-    mori::cco::CcoMemFree(comm, buf);
-    mori::cco::CcoCommDestroy(comm);
+    mori::cco::ccoMemFree(comm, buf);
+    mori::cco::ccoCommDestroy(comm);
     return;
   }
 
   // Phase 2: WindowRegister (convenience overload)
-  mori::cco::CcoWindow_t win2 = nullptr;
+  mori::cco::ccoWindow_t win2 = nullptr;
   void* buf2 = nullptr;
-  ret = mori::cco::CcoWindowRegister(comm, WINDOW_SIZE, &win2, &buf2);
+  ret = mori::cco::ccoWindowRegister(comm, WINDOW_SIZE, &win2, &buf2);
   if (ret != 0) {
     snprintf(result->detail, sizeof(result->detail), "WindowRegister(convenience) failed: %d", ret);
-    mori::cco::CcoWindowDeregister(comm, win);
-    mori::cco::CcoMemFree(comm, buf);
-    mori::cco::CcoCommDestroy(comm);
+    mori::cco::ccoWindowDeregister(comm, win);
+    mori::cco::ccoMemFree(comm, buf);
+    mori::cco::ccoCommDestroy(comm);
     return;
   }
   printf("[rank %d] WindowRegister x2 OK\n", rank);
 
   // Phase 3: DevCommCreate with default requirements + all barrier handles.
-  mori::cco::CcoDevCommRequirements reqs = CCO_DEV_COMM_REQUIREMENTS_INITIALIZER;
+  mori::cco::ccoDevCommRequirements reqs = CCO_DEV_COMM_REQUIREMENTS_INITIALIZER;
   reqs.lsaBarrierCount = 4;      // standalone LSA barrier (resource-window slab)
   reqs.railGdaBarrierCount = 2;  // standalone GDA-Rail barrier (signal pool)
   reqs.barrierCount = 3;         // hybrid LSA + GDA-Rail two-stage barrier
-  mori::cco::CcoDevComm* devComm = nullptr;
-  ret = mori::cco::CcoDevCommCreate(comm, &reqs, &devComm);
+  mori::cco::ccoDevComm* devComm = nullptr;
+  ret = mori::cco::ccoDevCommCreate(comm, &reqs, &devComm);
   if (ret != 0) {
     snprintf(result->detail, sizeof(result->detail), "DevCommCreate failed: %d", ret);
-    mori::cco::CcoWindowDeregister(comm, win2);
-    mori::cco::CcoWindowDeregister(comm, win);
-    mori::cco::CcoMemFree(comm, buf);
-    mori::cco::CcoCommDestroy(comm);
+    mori::cco::ccoWindowDeregister(comm, win2);
+    mori::cco::ccoWindowDeregister(comm, win);
+    mori::cco::ccoMemFree(comm, buf);
+    mori::cco::ccoCommDestroy(comm);
     return;
   }
 
   // Verify DevComm on GPU
-  mori::cco::CcoDevComm devCommHost;
+  mori::cco::ccoDevComm devCommHost;
   HIP_CHECK(hipMemcpy(&devCommHost, devComm, sizeof(devCommHost), hipMemcpyDeviceToHost));
   if (devCommHost.rank != rank || devCommHost.worldSize != nranks) {
     snprintf(result->detail, sizeof(result->detail),
@@ -204,9 +204,9 @@ static void run_rank(int rank, int nranks, const mori::application::UniqueId& ui
 
   {
     // Verify WindowDevice on GPU — uses LSA-sized flat VA, addressed by lsaRank.
-    mori::cco::CcoWindowDevice winHost;
+    mori::cco::ccoWindowDevice winHost;
     HIP_CHECK(hipMemcpy(&winHost, win, sizeof(winHost), hipMemcpyDeviceToHost));
-    mori::cco::CcoDevComm devCommSnap;
+    mori::cco::ccoDevComm devCommSnap;
     HIP_CHECK(hipMemcpy(&devCommSnap, devComm, sizeof(devCommSnap), hipMemcpyDeviceToHost));
 
     // Verify local ptr via flat addressing (uses lsaRank now).
@@ -219,7 +219,7 @@ static void run_rank(int rank, int nranks, const mori::application::UniqueId& ui
     }
 
     // Barrier before P2P cross-read
-    mori::cco::CcoBarrierAll(comm);
+    mori::cco::ccoBarrierAll(comm);
 
     // P2P read from every LSA peer via flat addressing (intra-node only;
     // cross-node peers would need RDMA path, not exercised by this test).
@@ -247,12 +247,12 @@ static void run_rank(int rank, int nranks, const mori::application::UniqueId& ui
   snprintf(result->detail, sizeof(result->detail), "all OK (%d ranks)", nranks);
 
 cleanup:
-  mori::cco::CcoDevCommDestroy(comm, devComm);
-  mori::cco::CcoWindowDeregister(comm, win2);
-  mori::cco::CcoWindowDeregister(comm, win);
-  mori::cco::CcoMemFree(comm, buf2);
-  mori::cco::CcoMemFree(comm, buf);
-  mori::cco::CcoCommDestroy(comm);
+  mori::cco::ccoDevCommDestroy(comm, devComm);
+  mori::cco::ccoWindowDeregister(comm, win2);
+  mori::cco::ccoWindowDeregister(comm, win);
+  mori::cco::ccoMemFree(comm, buf2);
+  mori::cco::ccoMemFree(comm, buf);
+  mori::cco::ccoCommDestroy(comm);
 
   if (result->passed) printf("[rank %d] PASSED\n", rank);
 }
