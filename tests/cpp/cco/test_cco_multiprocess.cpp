@@ -34,7 +34,13 @@ static int g_rank = 0;
   } while (0)
 
 static const size_t PER_RANK_VMM_SIZE = 256ULL * 1024 * 1024;
-static const size_t WINDOW_SIZE = 4096;
+// 4 MiB user buffer — exercises the multi-sub-buffer code path under
+// hipMemAddressReserve. ROCm 7.0 → 7.2.3 has a bug (SWDEV-568260,
+// rocm-systems#2516) where the 2nd hipMemSetAccess on a smaller sub-buffer
+// fails after a larger one; docker/Dockerfile.dev patches libamdhip64.so
+// to pick up the fix from clr/develop (PR rocm-systems#2451). Keeping
+// WINDOW_SIZE large here makes this test a regression for that patch.
+static const size_t WINDOW_SIZE = 4096 * 1024;
 
 static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* bootNet) {
   g_rank = rank;

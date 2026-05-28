@@ -4,7 +4,7 @@
 #   rocm/pytorch:rocm7.1.1_ubuntu24.04_py3.12_pytorch_release_2.8.0
 #   rocm/pytorch:rocm7.2.1_ubuntu22.04_py3.10_pytorch_release_2.8.0
 #   rocm/pytorch:rocm7.2.1_ubuntu24.04_py3.12_pytorch_release_2.8.0
-ARG BASE_IMAGE=rocm/pytorch:rocm7.2.1_ubuntu22.04_py3.10_pytorch_release_2.8.0
+ARG BASE_IMAGE=rocm/pytorch:rocm7.2.1_ubuntu24.04_py3.12_pytorch_release_2.8.0
 FROM ${BASE_IMAGE}
 
 RUN apt-get update && \
@@ -13,3 +13,60 @@ RUN apt-get update && \
     openmpi-bin libopenmpi-dev \
     libpci-dev libdw1 locales && \
     rm -rf /var/lib/apt/lists/*
+
+# ── Patch ROCm CLR for SWDEV-568260 (hipMemSetAccess sub-buffer validation bug) ──
+#
+# Bug: `hipMemSetAccess` validates sub-buffer coverage by iterating from
+# parent's sub-buffer 0, ignoring the ptr argument. Returns InvalidValue
+# whenever size != prefix sum starting at sub-buffer 0. Affects any caller
+# that uses one hipMemAddressReserve + multiple hipMemMap allocations
+# (which is exactly CCO's symmetric flat-VA pattern).
+#
+# Status:
+#   - Introduced in ROCm 7.0 (regression from 6.4.x).
+#   - All ROCm 7.0 → 7.2.3 releases affected.
+#   - Fix merged to clr develop on 2026-01-26 (PR ROCm/rocm-systems#2451,
+#     commit be8bcd059); not yet cherry-picked to any release branch.
+#   - External report: https://github.com/ROCm/rocm-systems/issues/2516
+#
+# This RUN block cherry-picks the fix on top of the base image's matching
+# rocm-X.Y.Z release branch, builds libamdhip64.so, and atomically replaces
+# the system library. ROCm 6.x base images skip the patch (no bug).
+#
+# Verified compatible (cherry-pick + build + CCO test):
+#   - rocm-7.2.0 / 7.2.1 / 7.2.2 / 7.2.3
+#   - Ubuntu 22.04 (Py3.10, glibc 2.35) and Ubuntu 24.04 (Py3.12, glibc 2.39)
+#
+# Auto-detects:
+#   - ROCm version (from /opt/rocm/.info/version)
+#   - libamdhip64.so target stamp (from symlink readlink)
+#
+# Remove this entire RUN block once ROCm release branches pick up the fix
+# (expected ROCm 7.3 / 8.0 — track issue #2516 for confirmation).
+RUN set -ex && \
+    ROCM_VER=$(cat /opt/rocm/.info/version 2>/dev/null | head -c 5) && \
+    test -n "${ROCM_VER}" || { echo "ERROR: cannot read /opt/rocm/.info/version"; exit 1; } && \
+    ROCM_MAJOR=$(echo "${ROCM_VER}" | cut -d. -f1) && \
+    if [ "${ROCM_MAJOR}" -lt 7 ]; then \
+        echo "Skipping libamdhip64 patch: ROCm ${ROCM_VER} (< 7.0) does not have the bug"; \
+    else \
+        LIBHIP_TARGET=$(basename $(readlink -f /opt/rocm/lib/libamdhip64.so.7)) && \
+        echo "Patching libamdhip64.so on ROCm ${ROCM_VER}, target=${LIBHIP_TARGET}" && \
+        pip install --quiet cmake CppHeaderParser && \
+        git clone --depth 1 --branch rocm-${ROCM_VER} --quiet \
+            https://github.com/ROCm/clr.git /tmp/clr && \
+        git clone --depth 1 --branch rocm-${ROCM_VER} --quiet \
+            https://github.com/ROCm/HIP.git /tmp/hip && \
+        cd /tmp/clr && \
+        git fetch --quiet origin develop && \
+        git -c user.email=ci@local -c user.name=ci cherry-pick be8bcd059 && \
+        mkdir build && cd build && \
+        cmake -DHIP_COMMON_DIR=/tmp/hip -DCMAKE_PREFIX_PATH=/opt/rocm \
+              -DCLR_BUILD_HIP=ON -DCLR_BUILD_OCL=OFF -DHIP_PLATFORM=amd \
+              -D__HIP_ENABLE_RTC=OFF -D__HIP_ENABLE_PCH=OFF .. && \
+        make -j$(nproc) amdhip64 && \
+        BUILT_LIB=$(ls hipamd/lib/libamdhip64.so.7.2.* | grep -E '\.so\.7\.2\.[0-9]+-[a-f0-9]+$' | head -1) && \
+        test -f "${BUILT_LIB}" || { echo "ERROR: built lib not found"; exit 1; } && \
+        cp "${BUILT_LIB}" /opt/rocm/lib/${LIBHIP_TARGET} && \
+        cd / && rm -rf /tmp/clr /tmp/hip; \
+    fi
