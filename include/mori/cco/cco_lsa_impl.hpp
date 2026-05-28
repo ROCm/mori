@@ -36,7 +36,12 @@ __device__ inline CcoLsaBarrierSession<Group>::CcoLsaBarrierSession(Group grp, C
   // Restore epoch persisted by the previous session's destructor.
   // Inbox slots are never zeroed, so epoch must be monotonically increasing
   // to avoid false-positive matches against stale inbox values.
-  char* base = reinterpret_cast<char*>(comm->flatBase) + (uint64_t)comm->lsaRank * comm->perRankSize;
+  //
+  // State buffer lives at offset `bufOffset` inside the DevComm's resource
+  // window. Use the standard LSA peer-addressing formula off the resource
+  // window's own slot (winBase already = flatBase + resource window slotOffset).
+  const auto& rw = comm->resourceWindow_inlined;
+  char* base = rw.winBase + ((uint64_t)comm->lsaRank * rw.stride4G << 32);
   uint32_t* state = reinterpret_cast<uint32_t*>(base + h.bufOffset);
   this->epoch = state[h.nBarriers + idx];  // unicast epoch slot
 }
@@ -44,7 +49,8 @@ __device__ inline CcoLsaBarrierSession<Group>::CcoLsaBarrierSession(Group grp, C
 template <typename Group>
 __device__ inline CcoLsaBarrierSession<Group>::~CcoLsaBarrierSession() {
   // Persist epoch so the next session on this barrier slot resumes correctly.
-  char* base = reinterpret_cast<char*>(this->comm->flatBase) + (uint64_t)this->comm->lsaRank * this->comm->perRankSize;
+  const auto& rw = this->comm->resourceWindow_inlined;
+  char* base = rw.winBase + ((uint64_t)this->comm->lsaRank * rw.stride4G << 32);
   uint32_t* state = reinterpret_cast<uint32_t*>(base + this->handle.bufOffset);
   if (this->group.thread_rank() == 0) {
     state[this->handle.nBarriers + this->index] = this->epoch;  // unicast epoch slot

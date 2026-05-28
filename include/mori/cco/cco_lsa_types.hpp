@@ -60,7 +60,13 @@ struct CcoLsaBarrierSession {
 
  private:
   __device__ inline uint32_t* ucInbox(int owner, int peer) {
-    char* base = reinterpret_cast<char*>(comm->flatBase) + (uint64_t)owner * comm->perRankSize;
+    // State buffer lives inside the DevComm's resource window at offset
+    // `bufOffset`. Resource window's winBase already = flatBase + the
+    // resource window's slotOffset, so applying the canonical LSA peer
+    // formula here matches getLsaPeerPtr / cco_types.hpp::CcoLsaBarrierHandle
+    // comment (winBase + peer*stride4G<<32 + bufOffset).
+    const auto& rw = comm->resourceWindow_inlined;
+    char* base = rw.winBase + ((uint64_t)owner * rw.stride4G << 32);
     uint32_t* state = reinterpret_cast<uint32_t*>(base + handle.bufOffset);
     return state + 3 * handle.nBarriers + index * comm->lsaSize + peer;
   }

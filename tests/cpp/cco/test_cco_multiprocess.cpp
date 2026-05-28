@@ -55,7 +55,7 @@ static int g_rank = 0;
   } while (0)
 
 static const size_t PER_RANK_VMM_SIZE = 256ULL * 1024 * 1024;
-static const size_t WINDOW_SIZE = 4096;
+static const size_t WINDOW_SIZE = 4096 * 1024;
 
 static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* bootNet) {
   g_rank = rank;

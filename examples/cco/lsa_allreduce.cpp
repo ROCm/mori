@@ -23,21 +23,21 @@
 /*
  * CCo Device API AllReduce Example (intra-node LSA)
  *
- * Mirrors the NCCL docs/examples/06_device_api/01_allreduce_lsa pattern:
- *  - One barrier slot per CTA (blockIdx.x selects the slot).
- *  - Separate send / recv windows.
- *  - Two barrier syncs (acquire at start, release at end).
- *  - getLsaPeerPtr() for direct peer memory access.
+ * Demonstrates three variants of the same allreduce-sum, one per CCo group
+ * abstraction (mori/include/mori/cco/cco_group.hpp):
  *
- * Host flow:
- *   CcoCommCreate → CcoWindowRegister (x2) → CcoDevCommCreate
- *   → kernel → CcoDevCommDestroy → CcoWindowDeregister → CcoCommDestroy
+ *   BLOCK  : CcoBlockGroup   ── CTA-wide cooperation, __syncthreads()
+ *   WARP   : CcoWarpGroup    ── wavefront-wide cooperation, wave_barrier()
+ *   THREAD : CcoThreadGroup  ── single-thread, no-op sync
+ *
+ * Per-rank input vector: (rank, rank, rank, rank).
+ * Expected per-rank output: (N(N-1)/2, ...) on every rank.
  */
 
 #include <hip/hip_runtime.h>
-#include <hip/hip_cooperative_groups.h>
 #include <mpi.h>
 
+#include <algorithm>
 #include <cassert>
 #include <cstdio>
 #include <vector>
@@ -45,61 +45,115 @@
 #include "args_parser.hpp"
 #include "mori/cco/cco_api.hpp"
 #include "mori/cco/cco_device_api.hpp"
+#include "mori/cco/cco_group.hpp"
 #include "mori/cco/cco_lsa_impl.hpp"
 #include "mori/cco/cco_lsa_types.hpp"
 #include "mori/cco/cco_types.hpp"
 
-#define CTA_COUNT        (16)
-#define THREADS_PER_CTA  (512)
-#define NELEMS           (1024 * 1024)  // 1M floats = 4 MB
+#define NELEMS  (4)  // tiny vector: rank r contributes (r,r,r,r)
 
 using namespace mori::cco;
-namespace cg = cooperative_groups;
 
-// ---------------------------------------------------------------------------
-// Kernel — direct CCo Device API AllReduce over LSA
+// ===========================================================================
+// Three allreduce kernels — one per CCo group type.
+// ===========================================================================
 //
-// Each CTA owns barrier slot blockIdx.x.
-// Threads spread work via a global-thread-ID stride loop across all lsaSize
-// ranks, matching the NCCL example's globalTid / globalNthreads pattern.
+// All three follow the same protocol:
+//   1. open a CcoLsaBarrierSession on barrier slot 0
+//   2. sync (acquire — wait for peers' sendBuf to be ready)
+//   3. for each owned element i:
+//        v = sum over peers of sendBuf[i]
+//        write v to every peer's recvBuf[i]
+//   4. sync (release — signal recvBuf is fully written)
+//
+// They differ only in:
+//   * the launch shape they expect
+//   * the Group type used for the barrier session
+//   * how work is distributed inside the group
 // ---------------------------------------------------------------------------
-__global__ void lsa_allreduce_kernel(CcoDevComm* devComm,
-                                     CcoWindow_t sendWin, size_t sendOff,
-                                     CcoWindow_t recvWin,  size_t recvOff,
-                                     size_t count) {
-  cg::thread_block blk = cg::this_thread_block();
 
-  // Each CTA gets its own dedicated barrier slot.
-  CcoLsaBarrierSession<cg::thread_block> bar(blk, devComm, devComm->lsaBarrier, blockIdx.x);
-
-  // Acquire barrier — wait until all peers have written their send buffers.
-  bar.sync(blk);
+// ─── BLOCK variant ─────────────────────────────────────────────────────────
+//   Launch: <<<1, blockDim>>>
+//   All threads of the CTA cooperate. Stride loop over threadIdx.x.
+__global__ void lsa_allreduce_block_kernel(CcoDevComm* devComm,
+                                           CcoWindow_t sendWin, size_t sendOff,
+                                           CcoWindow_t recvWin, size_t recvOff,
+                                           size_t count) {
+  CcoBlockGroup g;
+  CcoLsaBarrierSession<CcoBlockGroup> bar(g, devComm, devComm->lsaBarrier, 0);
+  bar.sync(g);
 
   const int lsaSize = devComm->lsaSize;
-  const int lsaRank = devComm->lsaRank;
 
-  // Global thread ID spread across all ranks, matching NCCL example.
-  const size_t globalTid      = threadIdx.x + blockDim.x * (lsaRank + blockIdx.x * lsaSize);
-  const size_t globalNthreads = blockDim.x * gridDim.x * lsaSize;
-
-  for (size_t i = globalTid; i < count; i += globalNthreads) {
+  for (size_t i = threadIdx.x; i < count; i += blockDim.x) {
     float v = 0.f;
-    // Reduce: read element i from every peer's send buffer.
     for (int peer = 0; peer < lsaSize; peer++) {
-      float* src = reinterpret_cast<float*>(getLsaPeerPtr(sendWin, peer, sendOff));
-      v += src[i];
+      v += reinterpret_cast<float*>(getLsaPeerPtr(sendWin, peer, sendOff))[i];
     }
-    // Scatter result into every peer's recv buffer.
     for (int peer = 0; peer < lsaSize; peer++) {
-      float* dst = reinterpret_cast<float*>(getLsaPeerPtr(recvWin, peer, recvOff));
-      dst[i] = v;
+      reinterpret_cast<float*>(getLsaPeerPtr(recvWin, peer, recvOff))[i] = v;
     }
   }
 
-  // Release barrier — signal peers that recv buffers are fully written.
-  bar.sync(blk);
+  bar.sync(g);
 }
 
+// ─── WARP variant ──────────────────────────────────────────────────────────
+//   Launch: <<<1, 64>>>  (exactly one wavefront on AMD)
+//   The 64 lanes of one warp cooperate. Stride loop over lane id.
+__global__ void lsa_allreduce_warp_kernel(CcoDevComm* devComm,
+                                          CcoWindow_t sendWin, size_t sendOff,
+                                          CcoWindow_t recvWin, size_t recvOff,
+                                          size_t count) {
+  CcoWarpGroup g;
+  CcoLsaBarrierSession<CcoWarpGroup> bar(g, devComm, devComm->lsaBarrier, 0);
+  bar.sync(g);
+
+  const int lsaSize = devComm->lsaSize;
+  const int lane    = __lane_id();
+  // `warpSize` is a HIP built-in __device__ const int (64 on AMD gfx9+).
+
+  for (size_t i = lane; i < count; i += warpSize) {
+    float v = 0.f;
+    for (int peer = 0; peer < lsaSize; peer++) {
+      v += reinterpret_cast<float*>(getLsaPeerPtr(sendWin, peer, sendOff))[i];
+    }
+    for (int peer = 0; peer < lsaSize; peer++) {
+      reinterpret_cast<float*>(getLsaPeerPtr(recvWin, peer, recvOff))[i] = v;
+    }
+  }
+
+  bar.sync(g);
+}
+
+// ─── THREAD variant ────────────────────────────────────────────────────────
+//   Launch: <<<1, 1>>>  (one single thread per rank)
+//   That thread does the whole allreduce serially.
+__global__ void lsa_allreduce_thread_kernel(CcoDevComm* devComm,
+                                            CcoWindow_t sendWin, size_t sendOff,
+                                            CcoWindow_t recvWin, size_t recvOff,
+                                            size_t count) {
+  CcoThreadGroup g;
+  CcoLsaBarrierSession<CcoThreadGroup> bar(g, devComm, devComm->lsaBarrier, 0);
+  bar.sync(g);
+
+  const int lsaSize = devComm->lsaSize;
+  for (size_t i = 0; i < count; i++) {
+    float v = 0.f;
+    for (int peer = 0; peer < lsaSize; peer++) {
+      v += reinterpret_cast<float*>(getLsaPeerPtr(sendWin, peer, sendOff))[i];
+    }
+    for (int peer = 0; peer < lsaSize; peer++) {
+      reinterpret_cast<float*>(getLsaPeerPtr(recvWin, peer, recvOff))[i] = v;
+    }
+  }
+
+  bar.sync(g);
+}
+
+// ===========================================================================
+// Host driver
+// ===========================================================================
 int main(int argc, char* argv[]) {
 #ifndef MORI_WITH_MPI
   std::fprintf(stderr, "lsa_allreduce requires MORI_WITH_MPI (enable WITH_MPI).\n");
@@ -118,7 +172,7 @@ int main(int argc, char* argv[]) {
 
   const size_t sizeBytes = NELEMS * sizeof(float);
 
-  // ── Phase 2: register send and recv windows ──
+  // ── Phase 2: register send/recv windows + init send buffer ──
   void* sendBuf = nullptr;
   void* recvBuf = nullptr;
   CcoWindow_t sendWin = nullptr;
@@ -126,48 +180,81 @@ int main(int argc, char* argv[]) {
   assert(CcoWindowRegister(comm, sizeBytes, &sendWin, &sendBuf) == 0);
   assert(CcoWindowRegister(comm, sizeBytes, &recvWin, &recvBuf) == 0);
 
-  // Initialize send buffer: each rank fills with its rank value.
-  // sendBuf is GPU VMM memory — use a host staging buffer + hipMemcpy.
+  // Each rank's send vector is (rank, rank, rank, rank).
+  std::vector<float> sendHost(NELEMS, static_cast<float>(rank));
+  assert(hipMemcpy(sendBuf, sendHost.data(), sizeBytes, hipMemcpyHostToDevice) == hipSuccess);
+
+  // Print input.
   {
-    std::vector<float> host(NELEMS, static_cast<float>(rank));
-    assert(hipMemcpy(sendBuf, host.data(), sizeBytes, hipMemcpyHostToDevice) == hipSuccess);
+    char buf[256]; int n = 0;
+    n += snprintf(buf + n, sizeof(buf) - n, "  Rank %d INPUT  (", rank);
+    for (size_t i = 0; i < NELEMS; i++)
+      n += snprintf(buf + n, sizeof(buf) - n, "%s%.0f", i ? "," : "", sendHost[i]);
+    n += snprintf(buf + n, sizeof(buf) - n, ")\n");
+    fputs(buf, stdout); fflush(stdout);
   }
 
+  const float expected = static_cast<float>(nranks * (nranks - 1)) / 2.f;
   if (rank == 0) {
-    printf("Starting LSA AllReduce: %zu elements (%.0f MB), %d ranks\n",
-           (size_t)NELEMS, sizeBytes / 1e6, nranks);
-    printf("Expected result per element: %.0f\n",
-           (float)(nranks * (nranks - 1)) / 2.f);
+    printf("AllReduce-SUM over %d ranks of %zu-elem vectors  ⇒  expected = (%.0f",
+           nranks, (size_t)NELEMS, expected);
+    for (size_t i = 1; i < NELEMS; i++) printf(",%.0f", expected);
+    printf(")\n");
   }
 
-  // ── Phase 3: device communicator — one barrier slot per CTA ──
+  // ── Phase 3: device communicator (1 barrier slot is enough for all 3) ──
   CcoDevCommRequirements reqs = CCO_DEV_COMM_REQUIREMENTS_INITIALIZER;
   reqs.gdaConnectionType = CCO_GDA_CONNECTION_NONE;
-  reqs.lsaBarrierCount   = CTA_COUNT;
+  reqs.lsaBarrierCount   = 1;
 
   CcoDevComm* devComm = nullptr;
   assert(CcoDevCommCreate(comm, &reqs, &devComm) == 0);
 
-  printf("  Rank %d: DevComm ready, lsaSize=%d lsaRank=%d\n",
-         rank, devComm->lsaSize, devComm->lsaRank);
-
-  // ── Launch ──
-  lsa_allreduce_kernel<<<CTA_COUNT, THREADS_PER_CTA>>>(
-      devComm, sendWin, 0, recvWin, 0, NELEMS);
-  assert(hipDeviceSynchronize() == hipSuccess);
-
-  // ── Verify ──
-  float expected = static_cast<float>(nranks * (nranks - 1)) / 2.f;
-  int errors = 0;
-  {
-    std::vector<float> host(NELEMS);
-    assert(hipMemcpy(host.data(), recvBuf, sizeBytes, hipMemcpyDeviceToHost) == hipSuccess);
-    for (size_t i = 0; i < NELEMS; i++) {
-      if (host[i] != expected) errors++;
-    }
+  if (rank == 0) {
+    printf("DevComm ready, lsaSize=%d  (running 3 group variants back-to-back)\n",
+           devComm->lsaSize);
   }
-  printf("  Rank %d: %s (expected=%.0f errors=%d)\n",
-         rank, errors == 0 ? "PASS" : "FAIL", expected, errors);
+
+  // ── Helper: launch one variant, verify, print ──
+  int totalErrors = 0;
+  auto run_variant = [&](const char* name, auto launch_fn) {
+    // Zero recvBuf so each variant is independently verified.
+    assert(hipMemset(recvBuf, 0, sizeBytes) == hipSuccess);
+
+    launch_fn();
+    assert(hipDeviceSynchronize() == hipSuccess);
+
+    std::vector<float> recvHost(NELEMS);
+    assert(hipMemcpy(recvHost.data(), recvBuf, sizeBytes,
+                     hipMemcpyDeviceToHost) == hipSuccess);
+    int errors = 0;
+    for (size_t i = 0; i < NELEMS; i++)
+      if (recvHost[i] != expected) errors++;
+    totalErrors += errors;
+
+    char buf[256]; int n = 0;
+    n += snprintf(buf + n, sizeof(buf) - n, "  Rank %d [%-6s] RESULT (", rank, name);
+    for (size_t i = 0; i < NELEMS; i++)
+      n += snprintf(buf + n, sizeof(buf) - n, "%s%.0f", i ? "," : "", recvHost[i]);
+    n += snprintf(buf + n, sizeof(buf) - n, ")  %s  (expected=%.0f errors=%d)\n",
+                  errors == 0 ? "PASS" : "FAIL", expected, errors);
+    fputs(buf, stdout); fflush(stdout);
+  };
+
+  // ── BLOCK variant ──
+  run_variant("block",  [&] {
+    lsa_allreduce_block_kernel<<<1, 64>>>(devComm, sendWin, 0, recvWin, 0, NELEMS);
+  });
+
+  // ── WARP variant ──
+  run_variant("warp",   [&] {
+    lsa_allreduce_warp_kernel<<<1, 64>>>(devComm, sendWin, 0, recvWin, 0, NELEMS);
+  });
+
+  // ── THREAD variant ──
+  run_variant("thread", [&] {
+    lsa_allreduce_thread_kernel<<<1, 1>>>(devComm, sendWin, 0, recvWin, 0, NELEMS);
+  });
 
   // ── Teardown ──
   CcoDevCommDestroy(comm, devComm);
@@ -175,8 +262,10 @@ int main(int argc, char* argv[]) {
   CcoWindowDeregister(comm, recvWin);
   CcoMemFree(comm, sendBuf);
   CcoMemFree(comm, recvBuf);
+
+  // bootstrap ownership transfers to CcoComm at CcoCommCreate; CcoCommDestroy
+  // does `bootNet->Finalize()` + `delete bootNet`, which calls MPI_Finalize().
+  // Don't double-free `boot` or call MPI_Finalize() a second time here.
   CcoCommDestroy(comm);
-  delete boot;
-  MPI_Finalize();
-  return errors != 0 ? 1 : 0;
+  return totalErrors != 0 ? 1 : 0;
 }
