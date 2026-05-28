@@ -753,9 +753,13 @@ class EpDispatchCombineOp:
         shared_mem = self._combine_shared_mem(actual_wpb)
 
         if quant_type == EpDispatchCombineQuantType.Fp8BlockwiseQuant:
-            if kt != EpDispatchCombineKernelType.IntraNode.value:
+            if kt not in (
+                EpDispatchCombineKernelType.IntraNode.value,
+                EpDispatchCombineKernelType.AsyncLL.value,
+            ):
                 raise ValueError(
-                    "Fp8BlockwiseQuant currently only supports IntraNode combine"
+                    "Fp8BlockwiseQuant currently only supports IntraNode "
+                    "and AsyncLL combine"
                 )
             if sfx != "bf16":
                 raise ValueError(f"Fp8BlockwiseQuant only supports bf16, got {sfx}")
