@@ -55,11 +55,11 @@ int main(int argc, char* argv[]) {
 
   CcoMemAlloc(comm, BUFSIZE, &buf);
 
-  printf("Cco free resources...");
+  printf("PE %d Cco free resources...\n", rank);
 
-  // free resources
-  CcoMemFree(comm, buf);
-  CcoCommDestroy(comm);
+  // // free resources
+  // CcoMemFree(comm, buf);
+  // CcoCommDestroy(comm);
 
   delete boot;
   return 0;
