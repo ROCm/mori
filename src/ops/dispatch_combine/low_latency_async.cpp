@@ -426,7 +426,16 @@ __device__ void EpCombineLowLatencyAsyncSendCopy_body(EpDispatchCombineArgs<T> a
     index_t stagingTokId = 0;
     if (laneId == 0) stagingTokId = args.dispReceiverIdxMap[tokenId];
     stagingTokId = __shfl(stagingTokId, 0);
-    if constexpr (UseFp8DirectCast) {
+    if constexpr (UseFp8BlockwiseQuant) {
+      // Fp8 blockwise: quantize bf16 -> fp8 token + per-block fp32 scales into
+      // the staging slot. Scales land directly after the fp8 token region.
+      uint8_t* slotPtr = stagingPtr + stagingTokId * tokPayloadBytes;
+      core::WarpQuantizeToFp8Blockwise<core::CombineInternalFp8>(
+          reinterpret_cast<core::CombineInternalFp8*>(slotPtr),
+          reinterpret_cast<float*>(slotPtr + hiddenBytes),
+          args.inpTokenBuf + tokenId * hiddenDim, hiddenDim,
+          args.fp8BlockwiseCombineScaleDim);
+    } else if constexpr (UseFp8DirectCast) {
       core::WarpCastBf16ToCombineInternalFp8<T>(
           reinterpret_cast<TokT*>(stagingPtr + stagingTokId * tokPayloadBytes),
           args.inpTokenBuf + tokenId * hiddenDim, hiddenDim, laneId);
