@@ -1,4 +1,4 @@
-set(MORI_CCO_SOURCES cco_init.cpp cco_memory.cpp)
+set(MORI_CCO_SOURCES cco_init.cpp)
 
 add_library(mori_cco SHARED ${MORI_CCO_SOURCES})
 

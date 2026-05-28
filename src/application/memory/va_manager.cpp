@@ -23,6 +23,7 @@
 #include "mori/application/memory/va_manager.hpp"
 
 #include <algorithm>
+#include <cassert>
 
 #include "mori/utils/mori_log.hpp"
 
@@ -31,6 +32,11 @@ namespace application {
 
 HeapVAManager::HeapVAManager(uintptr_t baseAddr, size_t totalSize, size_t granularity)
     : baseAddr_(baseAddr), totalSize_(totalSize), granularity_(granularity) {
+  // baseAddr=0 would collide with Allocate()'s failure sentinel (returns 0
+  // both for "out of memory" and for "first valid offset" if base is 0).
+  assert(baseAddr != 0 && "HeapVAManager baseAddr must be non-zero "
+                          "(0 collides with Allocate()'s failure sentinel)");
+
   // Initialize with one large free block
   VABlock initialBlock(baseAddr, totalSize, true);
   blocks_[baseAddr] = initialBlock;

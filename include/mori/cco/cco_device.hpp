@@ -29,4 +29,5 @@
 // Future backends will live under cco/lsa/ and cco/sdma/.
 
 #include "mori/cco/cco_device_api.hpp"
+#include "mori/cco/cco_team.hpp"
 #include "mori/cco/gda/gda_device_api.hpp"
