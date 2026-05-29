@@ -167,15 +167,14 @@ __device__ inline void ccoGda<PrvdType>::put(int peer, ccoWindow_t dstWin, size_
   uint64_t signalOpArg = 0;
 
   if constexpr (std::is_same_v<RemoteAction, ccoGda_SignalInc>) {
-    // Signal buffer is at offset 0 within resource window
-    uintptr_t signalBaseAddr = reinterpret_cast<uintptr_t>(ibgda->signalBuf);
-    signalRaddr = signalBaseAddr + remoteAction.signalId * sizeof(uint64_t);
+    // iova=0: raddr is the offset within the resource window MR. signalBuf is
+    // pinned at window offset 0, so the slot offset is signalId * 8.
+    signalRaddr = remoteAction.signalId * sizeof(uint64_t);
     signalRkey = comm.resourceWindow_inlined.ibgdaWin.peerRkeys[peer];
     signalOp = ccoGdaSignalInc;
     signalOpArg = 1;
   } else if constexpr (std::is_same_v<RemoteAction, ccoGda_SignalAdd>) {
-    uintptr_t signalBaseAddr = reinterpret_cast<uintptr_t>(ibgda->signalBuf);
-    signalRaddr = signalBaseAddr + remoteAction.signalId * sizeof(uint64_t);
+    signalRaddr = remoteAction.signalId * sizeof(uint64_t);
     signalRkey = comm.resourceWindow_inlined.ibgdaWin.peerRkeys[peer];
     signalOp = ccoGdaSignalAdd;
     signalOpArg = remoteAction.value;
@@ -229,13 +228,14 @@ __device__ inline void ccoGda<PrvdType>::putValue(int peer, ccoWindow_t dstWin, 
   uint64_t signalOpArg = 0;
 
   if constexpr (std::is_same_v<RemoteAction, ccoGda_SignalInc>) {
+    // iova=0: raddr is the window offset; signalBuf pinned at offset 0.
     signalRaddr = remoteAction.signalId * sizeof(uint64_t);
-    signalRkey = dstRkey;
+    signalRkey = comm.resourceWindow_inlined.ibgdaWin.peerRkeys[peer];
     signalOp = ccoGdaSignalInc;
     signalOpArg = 1;
   } else if constexpr (std::is_same_v<RemoteAction, ccoGda_SignalAdd>) {
     signalRaddr = remoteAction.signalId * sizeof(uint64_t);
-    signalRkey = dstRkey;
+    signalRkey = comm.resourceWindow_inlined.ibgdaWin.peerRkeys[peer];
     signalOp = ccoGdaSignalAdd;
     signalOpArg = remoteAction.value;
   }
@@ -287,14 +287,13 @@ __device__ inline void ccoGda<PrvdType>::signal(int peer, RemoteAction remoteAct
   uint32_t signalRkey = 0;
 
   if constexpr (std::is_same_v<RemoteAction, ccoGda_SignalInc>) {
-    uintptr_t signalBaseAddr = reinterpret_cast<uintptr_t>(ibgda->signalBuf);
-    signalRaddr = signalBaseAddr + remoteAction.signalId * sizeof(uint64_t);
+    // iova=0: raddr is the window offset; signalBuf pinned at offset 0.
+    signalRaddr = remoteAction.signalId * sizeof(uint64_t);
     signalRkey = comm.resourceWindow_inlined.ibgdaWin.peerRkeys[peer];
     signalOp = ccoGdaSignalInc;
     signalOpArg = 1;
   } else if constexpr (std::is_same_v<RemoteAction, ccoGda_SignalAdd>) {
-    uintptr_t signalBaseAddr = reinterpret_cast<uintptr_t>(ibgda->signalBuf);
-    signalRaddr = signalBaseAddr + remoteAction.signalId * sizeof(uint64_t);
+    signalRaddr = remoteAction.signalId * sizeof(uint64_t);
     signalRkey = comm.resourceWindow_inlined.ibgdaWin.peerRkeys[peer];
     signalOp = ccoGdaSignalAdd;
     signalOpArg = remoteAction.value;
@@ -312,7 +311,7 @@ __device__ inline void ccoGda<PrvdType>::flush() {
 
   for (int peer = 0; peer < worldSize; peer++) {
     if (peer != myRank) {
-      flush(peer);
+      this->flush(peer);
     }
   }
 }
@@ -339,19 +338,30 @@ __device__ inline void ccoGda<PrvdType>::flushAsync(int peer, ccoGdaRequest_t* o
   shmem::ShmemRdmaEndpoint* ep = &ibgda->endpoints[qpIdx];
   uint32_t qpn = ep->qpn;
 
-  // Call primitive flushAsync
-  flushAsyncImpl<PrvdType>(ep, qpn, outRequest);
+  // Call primitive flushAsync (writes the WQE index into the request)
+  ccoGdaRequest_t wqeReq;
+  flushAsyncImpl<PrvdType>(ep, qpn, &wqeReq);
+
+  // Pack qpIdx (high 32 bits) with the WQE index (low 32 bits) so wait()
+  // can recover the endpoint this request belongs to.
+  uint32_t wqeIdx = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(wqeReq));
+  uintptr_t packed = (static_cast<uintptr_t>(static_cast<uint32_t>(qpIdx)) << 32) | wqeIdx;
+  *outRequest = reinterpret_cast<ccoGdaRequest_t>(packed);
 }
 
 // Wait: wait for async request
 template <core::ProviderType PrvdType>
 __device__ inline void ccoGda<PrvdType>::wait(ccoGdaRequest_t& request) {
-  // Need to know which endpoint - use first endpoint as default
-  // TODO: request should encode which endpoint it belongs to
-  ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
-  shmem::ShmemRdmaEndpoint* ep = &ibgda->endpoints[0];
+  // Unpack qpIdx (high 32 bits) and WQE index (low 32 bits) packed by flushAsync.
+  uintptr_t packed = reinterpret_cast<uintptr_t>(request);
+  uint32_t qpIdx = static_cast<uint32_t>(packed >> 32);
+  uint32_t wqeIdx = static_cast<uint32_t>(packed & 0xFFFFFFFFu);
 
-  waitImpl<PrvdType>(ep, request);
+  ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
+  shmem::ShmemRdmaEndpoint* ep = &ibgda->endpoints[qpIdx];
+
+  ccoGdaRequest_t wqeReq = reinterpret_cast<ccoGdaRequest_t>(static_cast<uintptr_t>(wqeIdx));
+  waitImpl<PrvdType>(ep, wqeReq);
 }
 
 // ReadSignal: read local signal value
