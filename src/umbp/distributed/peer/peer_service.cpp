@@ -162,8 +162,8 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
                       const std::vector<uint8_t>& ssd_staging_mem_desc_bytes,
                       LocalStorageManager* storage, LocalBlockIndex* index,
                       PeerDramAllocator* dram_alloc, MasterClient* master_client,
-                      StagingMetrics& metrics, int num_read_slots, int num_write_slots,
-                      int lease_timeout_s, const std::vector<uint8_t>& engine_desc_bytes)
+                      StagingMetrics& metrics, int num_read_slots, int lease_timeout_s,
+                      const std::vector<uint8_t>& engine_desc_bytes)
       : ssd_staging_base_(ssd_staging_base),
         ssd_staging_size_(ssd_staging_size),
         ssd_staging_mem_desc_bytes_(ssd_staging_mem_desc_bytes),
@@ -174,17 +174,15 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
         metrics_(metrics),
         lease_timeout_(std::max(lease_timeout_s, 1)),
         num_read_slots_(std::max(num_read_slots, 1)),
-        num_write_slots_(std::max(num_write_slots, 1)),
+        // Read staging currently lives in the upper half of the buffer; the
+        // lower half was the removed direct-put write staging and is reclaimed
+        // when read staging is rebuilt in Phase 3.
         read_region_base_(ssd_staging_size / 2),
         read_slot_size_((ssd_staging_size / 2) / static_cast<size_t>(std::max(num_read_slots, 1))),
-        write_slot_size_((ssd_staging_size / 2) /
-                         static_cast<size_t>(std::max(num_write_slots, 1))),
         read_slots_(std::max(num_read_slots, 1)),
-        write_slots_(std::max(num_write_slots, 1)),
         master_client_(master_client) {
-    if (num_read_slots <= 0 || num_write_slots <= 0) {
-      MORI_UMBP_ERROR("[PeerService] num_read_slots={} num_write_slots={} invalid, clamped to 1",
-                      num_read_slots, num_write_slots);
+    if (num_read_slots <= 0) {
+      MORI_UMBP_ERROR("[PeerService] num_read_slots={} invalid, clamped to 1", num_read_slots);
     }
   }
 
@@ -219,149 +217,12 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
     return grpc::Status::OK;
   }
 
-  // ---- Write path: AllocateWriteSlot + CommitSsdWrite ----
-
-  grpc::Status AllocateWriteSlot(grpc::ServerContext* /*context*/,
-                                 const ::umbp::AllocateWriteSlotRequest* request,
-                                 ::umbp::AllocateWriteSlotResponse* response) override {
-    if (!SsdRpcAvailable()) {
-      response->set_success(false);
-      return grpc::Status::OK;
-    }
-    if (request->size() > write_slot_size_ || request->size() == 0) {
-      response->set_success(false);
-      return grpc::Status::OK;
-    }
-
-    int slot_idx;
-    uint64_t offset, lease_id;
-    std::chrono::steady_clock::time_point alloc_time;
-    {
-      std::lock_guard<std::mutex> lock(write_slots_mutex_);
-      slot_idx =
-          ClaimStagingSlot(write_slots_, next_lease_id_, lease_timeout_, request->size(), metrics_);
-      if (slot_idx < 0) {
-        metrics_.slot_full_rejects.fetch_add(1, std::memory_order_relaxed);
-        response->set_success(false);
-        return grpc::Status::OK;
-      }
-      offset = static_cast<uint64_t>(slot_idx) * write_slot_size_;
-      lease_id = write_slots_[slot_idx].lease_id;
-      alloc_time = write_slots_[slot_idx].allocated_at;
-    }
-
-    response->set_success(true);
-    response->set_staging_offset(offset);
-    response->set_lease_id(lease_id);
-    response->set_lease_ttl_ms(RemainingTtlMs(alloc_time, lease_timeout_));
-    return grpc::Status::OK;
-  }
-
-  grpc::Status CommitSsdWrite(grpc::ServerContext* /*context*/,
-                              const ::umbp::CommitSsdWriteRequest* request,
-                              ::umbp::CommitSsdWriteResponse* response) override {
-    const uint64_t commit_lease_id = request->lease_id();
-    uint64_t offset;
-    {
-      std::lock_guard<std::mutex> lock(write_slots_mutex_);
-      int slot_idx = FindSlotByLeaseId(write_slots_, commit_lease_id);
-      if (slot_idx < 0) {
-        metrics_.invalid_lease_rejects.fetch_add(1, std::memory_order_relaxed);
-        MORI_UMBP_ERROR("[PeerService] CommitSsdWrite: invalid/expired lease_id={}",
-                        commit_lease_id);
-        response->set_success(false);
-        return grpc::Status::OK;
-      }
-      offset = static_cast<uint64_t>(slot_idx) * write_slot_size_;
-
-      if (request->store_index() != 0) {
-        MORI_UMBP_ERROR("[PeerService] CommitSsdWrite: store_index {} != 0, rejected",
-                        request->store_index());
-        ReleaseSlotByLeaseId(write_slots_, commit_lease_id);
-        response->set_success(false);
-        return grpc::Status::OK;
-      }
-      if (request->size() > write_slots_[slot_idx].allocated_size) {
-        MORI_UMBP_ERROR("[PeerService] CommitSsdWrite: size {} > allocated {}", request->size(),
-                        write_slots_[slot_idx].allocated_size);
-        ReleaseSlotByLeaseId(write_slots_, commit_lease_id);
-        response->set_success(false);
-        return grpc::Status::OK;
-      }
-      if (request->staging_offset() != offset) {
-        MORI_UMBP_ERROR("[PeerService] CommitSsdWrite: staging_offset {} != slot offset {}",
-                        request->staging_offset(), offset);
-        ReleaseSlotByLeaseId(write_slots_, commit_lease_id);
-        response->set_success(false);
-        return grpc::Status::OK;
-      }
-    }
-
-    const std::string& key = request->key();
-    const size_t size = request->size();
-
-    // Local-only dedup: if this peer already has the key in its block
-    // index, treat the commit as a no-op success.  The cross-node
-    // FinalizeAllocation gate is gone in the master-as-advisor design;
-    // master will see the existing key via heartbeat events.
-    if (!SsdRpcAvailable()) {
-      response->set_success(false);
-      return grpc::Status::OK;
-    }
-    auto existing = index_->Lookup(key);
-    if (existing.has_value()) {
-      std::lock_guard<std::mutex> lock(write_slots_mutex_);
-      ReleaseSlotByLeaseId(write_slots_, commit_lease_id);
-      response->set_success(true);
-      return grpc::Status::OK;
-    }
-
-    const void* src = static_cast<const uint8_t*>(ssd_staging_base_) + offset;
-    bool ok = storage_->Write(key, src, size, StorageTier::LOCAL_SSD);
-    if (!ok) {
-      MORI_UMBP_ERROR("[PeerService] CommitSsdWrite: local SSD write failed for '{}'", key);
-      std::lock_guard<std::mutex> lock(write_slots_mutex_);
-      ReleaseSlotByLeaseId(write_slots_, commit_lease_id);
-      response->set_success(false);
-      return grpc::Status::OK;
-    }
-    index_->Insert(key, {StorageTier::LOCAL_SSD, 0, size});
-
-    auto* ssd = storage_->GetTier(StorageTier::LOCAL_SSD);
-    auto loc_id = ssd ? ssd->GetLocationId(key) : std::nullopt;
-    if (!loc_id.has_value()) {
-      storage_->Evict(key);
-      index_->Remove(key);
-      MORI_UMBP_ERROR("[PeerService] CommitSsdWrite: GetLocationId failed for '{}'", key);
-      std::lock_guard<std::mutex> lock(write_slots_mutex_);
-      ReleaseSlotByLeaseId(write_slots_, commit_lease_id);
-      response->set_success(false);
-      return grpc::Status::OK;
-    }
-    std::string location_id = "0:" + *loc_id;
-
-    // Master learns about this SSD-tier ADD via the heartbeat-shipped
-    // event log.  The peer's universal outbox lives on the DRAM
-    // allocator; SSD-only deployments still construct one (with empty
-    // tier configs) so this hand-off works.  When dram_alloc_ is null
-    // the SSD path is non-distributed: master simply never sees the key.
-    if (dram_alloc_ != nullptr) {
-      dram_alloc_->QueueExternalEvent(KvEvent{KvEvent::Kind::ADD, key, TierType::SSD, size});
-    }
-
-    {
-      std::lock_guard<std::mutex> lock(write_slots_mutex_);
-      ReleaseSlotByLeaseId(write_slots_, commit_lease_id);
-    }
-    response->set_success(true);
-    response->set_ssd_location_id(location_id);
-    MORI_UMBP_INFO("[PeerService] CommitSsdWrite: key={}, size={}, location={}", key, size,
-                   location_id);
-    RecordInboundPut(static_cast<uint64_t>(size), "remote");
-    return grpc::Status::OK;
-  }
-
-  // ---- Read path: PrepareSsdRead + ReleaseSsdLease ----
+  // ---- SSD read staging: PrepareSsdRead + ReleaseSsdLease ----
+  // Direct-SSD-put (AllocateWriteSlot / CommitSsdWrite) was removed in the
+  // SSD-tier redesign — SSD is now an async copy-on-commit cold tier, not a
+  // writer-driven put target.  TODO(Phase 3): refactor the two read RPCs to
+  // key-based + status enum + size (docs/umbp-ssd-tier-interface-contract-zh.md
+  // §5), and reclaim the now-vestigial lower half of the staging buffer.
 
   grpc::Status PrepareSsdRead(grpc::ServerContext* /*context*/,
                               const ::umbp::PrepareSsdReadRequest* request,
@@ -667,15 +528,11 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
 
   const std::chrono::seconds lease_timeout_;
   const int num_read_slots_;
-  const int num_write_slots_;
   const uint64_t read_region_base_;
   const size_t read_slot_size_;
-  const size_t write_slot_size_;
 
   std::mutex read_slots_mutex_;
-  std::mutex write_slots_mutex_;
   std::vector<StagingSlot> read_slots_;
-  std::vector<StagingSlot> write_slots_;
   std::atomic<uint64_t> next_lease_id_{1};
 };
 
@@ -683,8 +540,7 @@ PeerServiceServer::PeerServiceServer(void* ssd_staging_base, size_t ssd_staging_
                                      const std::vector<uint8_t>& ssd_staging_mem_desc_bytes,
                                      LocalStorageManager& storage, LocalBlockIndex& index,
                                      PeerDramAllocator* dram_alloc, int num_read_slots,
-                                     int num_write_slots, int lease_timeout_s,
-                                     std::vector<uint8_t> engine_desc_bytes,
+                                     int lease_timeout_s, std::vector<uint8_t> engine_desc_bytes,
                                      MasterClient* master_client)
     : ssd_staging_base_(ssd_staging_base),
       ssd_staging_size_(ssd_staging_size),
@@ -696,13 +552,11 @@ PeerServiceServer::PeerServiceServer(void* ssd_staging_base, size_t ssd_staging_
       engine_desc_bytes_(std::move(engine_desc_bytes)) {
   service_ = std::make_unique<UMBPPeerServiceImpl>(
       ssd_staging_base_, ssd_staging_size_, ssd_staging_mem_desc_bytes_, storage_, index_,
-      dram_alloc_, master_client_, metrics_, num_read_slots, num_write_slots, lease_timeout_s,
-      engine_desc_bytes_);
+      dram_alloc_, master_client_, metrics_, num_read_slots, lease_timeout_s, engine_desc_bytes_);
 }
 
 PeerServiceServer::PeerServiceServer(PeerDramAllocator* dram_alloc, int num_read_slots,
-                                     int num_write_slots, int lease_timeout_s,
-                                     std::vector<uint8_t> engine_desc_bytes,
+                                     int lease_timeout_s, std::vector<uint8_t> engine_desc_bytes,
                                      MasterClient* master_client)
     : ssd_staging_base_(nullptr),
       ssd_staging_size_(0),
@@ -713,8 +567,7 @@ PeerServiceServer::PeerServiceServer(PeerDramAllocator* dram_alloc, int num_read
       engine_desc_bytes_(std::move(engine_desc_bytes)) {
   service_ = std::make_unique<UMBPPeerServiceImpl>(
       ssd_staging_base_, ssd_staging_size_, ssd_staging_mem_desc_bytes_, storage_, index_,
-      dram_alloc_, master_client_, metrics_, num_read_slots, num_write_slots, lease_timeout_s,
-      engine_desc_bytes_);
+      dram_alloc_, master_client_, metrics_, num_read_slots, lease_timeout_s, engine_desc_bytes_);
 }
 
 PeerServiceServer::~PeerServiceServer() { Stop(); }

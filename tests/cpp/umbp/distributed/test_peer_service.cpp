@@ -43,7 +43,6 @@ namespace {
 constexpr size_t kStagingSize = 4096;
 constexpr uint16_t kBasePort = 50200;
 constexpr int kNumReadSlots = 4;
-constexpr int kNumWriteSlots = 4;
 constexpr int kLeaseTimeoutS = 2;
 
 static uint16_t AllocPort() {
@@ -80,8 +79,8 @@ class PeerServiceSlotTest : public ::testing::Test {
 
     server_ = std::make_unique<PeerServiceServer>(
         staging_buffer_, kStagingSize, ssd_staging_mem_desc_, *storage_, index_,
-        coordinator_->DramAllocator(), kNumReadSlots, kNumWriteSlots, kLeaseTimeoutS,
-        std::vector<uint8_t>{}, &coordinator_->Master());
+        coordinator_->DramAllocator(), kNumReadSlots, kLeaseTimeoutS, std::vector<uint8_t>{},
+        &coordinator_->Master());
     server_->Start(port_);
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
@@ -127,85 +126,6 @@ TEST_F(PeerServiceSlotTest, GetPeerInfoReturnsStagingInfo) {
   EXPECT_EQ(response.ssd_staging_mem_desc(),
             std::string(ssd_staging_mem_desc_.begin(), ssd_staging_mem_desc_.end()));
   EXPECT_EQ(response.ssd_staging_size(), kStagingSize);
-}
-
-// --- AllocateWriteSlot ---
-
-TEST_F(PeerServiceSlotTest, AllocateWriteSlotSuccess) {
-  ::umbp::AllocateWriteSlotRequest req;
-  req.set_size(64);
-  ::umbp::AllocateWriteSlotResponse resp;
-  grpc::ClientContext ctx;
-
-  auto status = stub_->AllocateWriteSlot(&ctx, req, &resp);
-  ASSERT_TRUE(status.ok());
-  ASSERT_TRUE(resp.success());
-  EXPECT_GT(resp.lease_id(), 0u);
-  EXPECT_GT(resp.lease_ttl_ms(), 0u);
-  EXPECT_LT(resp.staging_offset(), kStagingSize / 2);
-}
-
-TEST_F(PeerServiceSlotTest, AllocateWriteSlotTooLarge) {
-  ::umbp::AllocateWriteSlotRequest req;
-  req.set_size(kStagingSize);  // exceeds slot size
-  ::umbp::AllocateWriteSlotResponse resp;
-  grpc::ClientContext ctx;
-
-  auto status = stub_->AllocateWriteSlot(&ctx, req, &resp);
-  ASSERT_TRUE(status.ok());
-  EXPECT_FALSE(resp.success());
-}
-
-TEST_F(PeerServiceSlotTest, AllocateWriteSlotZeroSize) {
-  ::umbp::AllocateWriteSlotRequest req;
-  req.set_size(0);
-  ::umbp::AllocateWriteSlotResponse resp;
-  grpc::ClientContext ctx;
-
-  auto status = stub_->AllocateWriteSlot(&ctx, req, &resp);
-  ASSERT_TRUE(status.ok());
-  EXPECT_FALSE(resp.success());
-}
-
-TEST_F(PeerServiceSlotTest, AllocateWriteSlotExhaustAll) {
-  for (int i = 0; i < kNumWriteSlots; ++i) {
-    ::umbp::AllocateWriteSlotRequest req;
-    req.set_size(32);
-    ::umbp::AllocateWriteSlotResponse resp;
-    grpc::ClientContext ctx;
-    auto status = stub_->AllocateWriteSlot(&ctx, req, &resp);
-    ASSERT_TRUE(status.ok());
-    ASSERT_TRUE(resp.success()) << "Slot " << i << " should succeed";
-  }
-
-  ::umbp::AllocateWriteSlotRequest req;
-  req.set_size(32);
-  ::umbp::AllocateWriteSlotResponse resp;
-  grpc::ClientContext ctx;
-  auto status = stub_->AllocateWriteSlot(&ctx, req, &resp);
-  ASSERT_TRUE(status.ok());
-  EXPECT_FALSE(resp.success()) << "Should fail when all slots exhausted";
-}
-
-TEST_F(PeerServiceSlotTest, AllocateWriteSlotTtlReclaim) {
-  for (int i = 0; i < kNumWriteSlots; ++i) {
-    ::umbp::AllocateWriteSlotRequest req;
-    req.set_size(32);
-    ::umbp::AllocateWriteSlotResponse resp;
-    grpc::ClientContext ctx;
-    stub_->AllocateWriteSlot(&ctx, req, &resp);
-  }
-
-  std::this_thread::sleep_for(std::chrono::seconds(kLeaseTimeoutS + 1));
-
-  ::umbp::AllocateWriteSlotRequest req;
-  req.set_size(32);
-  ::umbp::AllocateWriteSlotResponse resp;
-  grpc::ClientContext ctx;
-  auto status = stub_->AllocateWriteSlot(&ctx, req, &resp);
-  ASSERT_TRUE(status.ok());
-  EXPECT_TRUE(resp.success()) << "Should succeed after TTL reclaim";
-  EXPECT_GT(server_->Metrics().expired_reclaims.load(), 0u);
 }
 
 // --- PrepareSsdRead ---
@@ -341,90 +261,6 @@ TEST_F(PeerServiceSlotTest, ReleaseSsdLeaseInvalid) {
   EXPECT_FALSE(resp.success());
 }
 
-// --- CommitSsdWrite with lease_id ---
-
-TEST_F(PeerServiceSlotTest, CommitSsdWriteInvalidLeaseId) {
-  ::umbp::CommitSsdWriteRequest req;
-  req.set_key("block_bad_lease");
-  req.set_staging_offset(0);
-  req.set_size(10);
-  req.set_store_index(0);
-  req.set_lease_id(9999);
-  ::umbp::CommitSsdWriteResponse resp;
-  grpc::ClientContext ctx;
-
-  auto status = stub_->CommitSsdWrite(&ctx, req, &resp);
-  ASSERT_TRUE(status.ok());
-  EXPECT_FALSE(resp.success());
-  EXPECT_GT(server_->Metrics().invalid_lease_rejects.load(), 0u);
-}
-
-TEST_F(PeerServiceSlotTest, CommitSsdWriteBadStoreIndex) {
-  ::umbp::AllocateWriteSlotRequest alloc_req;
-  alloc_req.set_size(32);
-  ::umbp::AllocateWriteSlotResponse alloc_resp;
-  grpc::ClientContext alloc_ctx;
-  stub_->AllocateWriteSlot(&alloc_ctx, alloc_req, &alloc_resp);
-  ASSERT_TRUE(alloc_resp.success());
-
-  ::umbp::CommitSsdWriteRequest req;
-  req.set_key("block_bad_store");
-  req.set_staging_offset(alloc_resp.staging_offset());
-  req.set_size(32);
-  req.set_store_index(99);
-  req.set_lease_id(alloc_resp.lease_id());
-  ::umbp::CommitSsdWriteResponse resp;
-  grpc::ClientContext ctx;
-
-  auto status = stub_->CommitSsdWrite(&ctx, req, &resp);
-  ASSERT_TRUE(status.ok());
-  EXPECT_FALSE(resp.success());
-}
-
-TEST_F(PeerServiceSlotTest, CommitSsdWriteSizeTooLarge) {
-  ::umbp::AllocateWriteSlotRequest alloc_req;
-  alloc_req.set_size(32);
-  ::umbp::AllocateWriteSlotResponse alloc_resp;
-  grpc::ClientContext alloc_ctx;
-  stub_->AllocateWriteSlot(&alloc_ctx, alloc_req, &alloc_resp);
-  ASSERT_TRUE(alloc_resp.success());
-
-  ::umbp::CommitSsdWriteRequest req;
-  req.set_key("block_size_check");
-  req.set_staging_offset(alloc_resp.staging_offset());
-  req.set_size(64);  // larger than allocated 32
-  req.set_store_index(0);
-  req.set_lease_id(alloc_resp.lease_id());
-  ::umbp::CommitSsdWriteResponse resp;
-  grpc::ClientContext ctx;
-
-  auto status = stub_->CommitSsdWrite(&ctx, req, &resp);
-  ASSERT_TRUE(status.ok());
-  EXPECT_FALSE(resp.success());
-}
-
-TEST_F(PeerServiceSlotTest, CommitSsdWriteOffsetMismatch) {
-  ::umbp::AllocateWriteSlotRequest alloc_req;
-  alloc_req.set_size(32);
-  ::umbp::AllocateWriteSlotResponse alloc_resp;
-  grpc::ClientContext alloc_ctx;
-  stub_->AllocateWriteSlot(&alloc_ctx, alloc_req, &alloc_resp);
-  ASSERT_TRUE(alloc_resp.success());
-
-  ::umbp::CommitSsdWriteRequest req;
-  req.set_key("block_offset_check");
-  req.set_staging_offset(alloc_resp.staging_offset() + 1);  // wrong offset
-  req.set_size(32);
-  req.set_store_index(0);
-  req.set_lease_id(alloc_resp.lease_id());
-  ::umbp::CommitSsdWriteResponse resp;
-  grpc::ClientContext ctx;
-
-  auto status = stub_->CommitSsdWrite(&ctx, req, &resp);
-  ASSERT_TRUE(status.ok());
-  EXPECT_FALSE(resp.success());
-}
-
 // --- Slot isolation: different slots get different offsets ---
 
 TEST_F(PeerServiceSlotTest, MultipleReadSlotsDifferentOffsets) {
@@ -451,25 +287,6 @@ TEST_F(PeerServiceSlotTest, MultipleReadSlotsDifferentOffsets) {
   for (size_t i = 0; i < offsets.size(); ++i) {
     for (size_t j = i + 1; j < offsets.size(); ++j) {
       EXPECT_NE(offsets[i], offsets[j]) << "Slots " << i << " and " << j << " overlap";
-    }
-  }
-}
-
-TEST_F(PeerServiceSlotTest, MultipleWriteSlotsDifferentOffsets) {
-  std::vector<uint64_t> offsets;
-  for (int i = 0; i < kNumWriteSlots; ++i) {
-    ::umbp::AllocateWriteSlotRequest req;
-    req.set_size(32);
-    ::umbp::AllocateWriteSlotResponse resp;
-    grpc::ClientContext ctx;
-    stub_->AllocateWriteSlot(&ctx, req, &resp);
-    ASSERT_TRUE(resp.success());
-    offsets.push_back(resp.staging_offset());
-  }
-
-  for (size_t i = 0; i < offsets.size(); ++i) {
-    for (size_t j = i + 1; j < offsets.size(); ++j) {
-      EXPECT_NE(offsets[i], offsets[j]) << "Write slots " << i << " and " << j << " overlap";
     }
   }
 }

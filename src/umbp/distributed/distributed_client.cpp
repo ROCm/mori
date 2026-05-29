@@ -38,8 +38,10 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
 
   const auto& dc = config.distributed.value();
 
-  // TODO(distributed-ssd): remove or narrow this guard once DistributedClient
-  // actually wires in ssd_stores + PeerService for the distributed data path.
+  // TODO(Phase 1): remove this guard together with wiring in PeerSsdManager +
+  // ssd_stores/SSD TierCapacity lowering at the ToPoolClientConfig call below.
+  // See docs/umbp-ssd-tier-interface-contract-zh.md (§0.5, §7). Until then the
+  // distributed data path stays DRAM-only.
   if (config_.ssd.enabled) {
     MORI_UMBP_WARN(
         "[DistributedClient] SSD tier is currently not wired in distributed "
@@ -74,6 +76,10 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
   // 2 MiB, so this only matters with non-default page size combinations.
   dram_pool_size_ = dram_pool_handle_.mapped_size;
 
+  // TODO(Phase 1): when SSD is enabled, also pass ssd_stores and a
+  // TierType::SSD entry in tier_capacities here so the peer constructs a
+  // PeerSsdManager and reports SSD capacity (contract §0.5/§7). Kept DRAM-only
+  // for now by the guard above.
   auto pc_config = ToPoolClientConfig(
       dc,
       /*dram_buffers=*/{{dram_pool_, dram_pool_size_}},

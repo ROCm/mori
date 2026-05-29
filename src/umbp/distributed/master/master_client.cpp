@@ -149,6 +149,8 @@ grpc::Status MasterClient::RegisterSelf(const std::map<TierType, TierCapacity>& 
   req.set_peer_address(peer_address);
   req.set_engine_desc(engine_desc_bytes.data(), engine_desc_bytes.size());
   FillTierCapacities(req.mutable_tier_capacities(), tier_capacities);
+  // DEPRECATED: master does not consume ssd_store_capacities. SSD capacity now
+  // travels in tier_capacities as TierType::SSD (Phase 1). Kept for wire compat.
   for (uint64_t cap : ssd_store_capacities) req.add_ssd_store_capacities(cap);
   for (const auto& tag : config_.tags) req.add_tags(tag);
 

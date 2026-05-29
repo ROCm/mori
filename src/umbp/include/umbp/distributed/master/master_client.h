@@ -82,6 +82,10 @@ class MasterClient {
   // Register with master.  In the master-as-advisor design only
   // membership + capacity-snapshot metadata is shipped — DRAM/HBM
   // descriptors are peer-internal now.
+  // `tier_capacities` is the single source of per-tier capacity, including SSD
+  // (TierType::SSD) in the SSD-tier redesign.  `ssd_store_capacities` is a
+  // deprecated/legacy param master does not consume; left for compat and slated
+  // for removal once SSD capacity is wired via tier_capacities (Phase 1).
   grpc::Status RegisterSelf(const std::map<TierType, TierCapacity>& tier_capacities,
                             const std::string& peer_address = "",
                             const std::vector<uint8_t>& engine_desc_bytes = {},

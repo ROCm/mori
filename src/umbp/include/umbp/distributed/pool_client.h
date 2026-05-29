@@ -210,12 +210,10 @@ class PoolClient {
   bool LocalGetPages(const std::vector<PageLocation>& pages, uint64_t page_size, void* dst,
                      size_t size);
 
-  // SSD path helpers — preserved so the SSD CommitSsdWrite slot
-  // pre-allocation flow keeps working.  The peer side re-shaping of
-  // those RPCs is not in scope for this commit.
   bool EnsurePeerServiceConnection(PeerConnection& peer);
-  bool RemoteSsdWrite(PeerConnection& peer, const std::string& key, const void* src, size_t size,
-                      bool zero_copy, uint32_t store_index = 0);
+  // SSD read glue. TODO(Phase 3): rewrite for the new SSD get path (local vs
+  // remote, key-based PrepareSsdRead) per the interface contract §5. Direct
+  // SSD put (RemoteSsdWrite) was removed in the SSD-tier redesign.
   bool RemoteSsdRead(PeerConnection& peer, const std::string& key, const std::string& location_id,
                      void* dst, size_t size, bool zero_copy);
 

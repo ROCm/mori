@@ -46,20 +46,21 @@ struct StagingMetrics {
 class PeerServiceServer {
  public:
   // `dram_alloc` is non-owning and may be null when the host process has
-  // no DRAM/HBM tier (SSD-only deployments).  When null, the new
+  // no DRAM/HBM tier (SSD-only deployments).  When null, the
   // AllocateSlot/CommitSlot/AbortSlot/ResolveKey/EvictKey handlers
-  // respond with success=false / found=false; SSD staging RPCs continue
-  // to work unchanged.  The allocator's outbox is also where the SSD
-  // commit path queues its ADD events for heartbeat shipment.
+  // respond with success=false / found=false; the SSD read-staging RPCs
+  // continue to work unchanged.  The allocator's outbox is where owned-tier
+  // ADD/REMOVE events are queued for heartbeat shipment.
+  // (Direct-SSD-put RPCs were removed in the SSD-tier redesign; only the SSD
+  // read-staging RPCs remain, pending Phase 3 refactor.)
   PeerServiceServer(void* ssd_staging_base, size_t ssd_staging_size,
                     const std::vector<uint8_t>& ssd_staging_mem_desc_bytes,
                     LocalStorageManager& storage, LocalBlockIndex& index,
                     PeerDramAllocator* dram_alloc = nullptr, int num_read_slots = 8,
-                    int num_write_slots = 8, int lease_timeout_s = 10,
-                    std::vector<uint8_t> engine_desc_bytes = {},
-                    MasterClient* master_client = nullptr);
-  PeerServiceServer(PeerDramAllocator* dram_alloc, int num_read_slots = 8, int num_write_slots = 8,
                     int lease_timeout_s = 10, std::vector<uint8_t> engine_desc_bytes = {},
+                    MasterClient* master_client = nullptr);
+  PeerServiceServer(PeerDramAllocator* dram_alloc, int num_read_slots = 8, int lease_timeout_s = 10,
+                    std::vector<uint8_t> engine_desc_bytes = {},
                     MasterClient* master_client = nullptr);
   ~PeerServiceServer();
 

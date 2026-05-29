@@ -48,17 +48,20 @@ enum ClientStatus {
 }
 
 // Master no longer owns DRAM/HBM allocators, so descs / buffer sizes /
-// page sizes have moved to the peer.  ssd_store_capacities stays as
-// advisory capacity metadata for the routing strategy.  engine_desc is
-// retained so writers can resolve the target peer's IO engine without
-// an extra GetPeerInfo round trip on first contact.
+// page sizes have moved to the peer.  engine_desc is retained so writers can
+// resolve the target peer's IO engine without an extra GetPeerInfo round trip
+// on first contact.
 message RegisterClientRequest {
   string node_id                      = 1;
   string node_address                 = 2;   // Network address (e.g. "10.0.1.5:8080")
-  repeated TierCapacity tier_capacities = 3; // Capacity per tier
+  repeated TierCapacity tier_capacities = 3; // Capacity per tier (incl. SSD — see field 12)
   string peer_address                 = 4;   // PeerService gRPC address
   bytes  engine_desc                  = 5;   // packed EngineDesc
-  repeated uint64 ssd_store_capacities = 12; // per-SSD-store capacity in bytes
+  // DEPRECATED/legacy: master does not consume this field.  The SSD-tier
+  // redesign reports SSD capacity via TierCapacity{tier=TIER_SSD} in
+  // tier_capacities (field 3), same as DRAM/HBM.  Kept for wire compat; do not
+  // build new behavior on it.  See docs/umbp-ssd-tier-interface-contract-zh.md §0.5.
+  repeated uint64 ssd_store_capacities = 12; // [deprecated] per-SSD-store capacity in bytes
   repeated string tags                = 13;  // opaque key=value labels (e.g. "sgl_role=prefill")
 }
 message RegisterClientResponse {

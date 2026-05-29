@@ -273,8 +273,8 @@ bool PoolClient::Init() {
   }
 
   if (config_.peer_service_port > 0) {
-    peer_service_ = std::make_unique<PeerServiceServer>(peer_alloc_.get(), 8, 8, 10,
-                                                        engine_desc_bytes, master_client_.get());
+    peer_service_ = std::make_unique<PeerServiceServer>(peer_alloc_.get(), 8, 10, engine_desc_bytes,
+                                                        master_client_.get());
     if (!peer_service_->Start(config_.peer_service_port)) {
       MORI_UMBP_ERROR("[PoolClient] PeerService failed to start on port {}",
                       config_.peer_service_port);
@@ -290,6 +290,9 @@ bool PoolClient::Init() {
     peer_address = host + ":" + std::to_string(config_.peer_service_port);
   }
 
+  // DEPRECATED: ssd_store_capacities is legacy and unconsumed by master. The
+  // SSD-tier redesign reports SSD capacity via config_.tier_capacities
+  // (TierType::SSD), wired in Phase 1. Left empty here for wire compat.
   std::vector<uint64_t> ssd_store_capacities;
   for (const auto& store : config_.ssd_stores) ssd_store_capacities.push_back(store.capacity);
 
@@ -1665,57 +1668,11 @@ bool PoolClient::EnsurePeerServiceConnection(PeerConnection& peer) {
   return true;
 }
 
-bool PoolClient::RemoteSsdWrite(PeerConnection& peer, const std::string& key, const void* src,
-                                size_t size, bool zero_copy, uint32_t store_index) {
-  if (!io_engine_) return false;
-  if (!EnsurePeerServiceConnection(peer)) return false;
-  if (!IsValidMemoryDesc(peer.ssd_staging_mem)) return false;
-  auto* stub = static_cast<::umbp::UMBPPeer::Stub*>(peer.peer_stub.get());
-
-  ::umbp::AllocateWriteSlotRequest alloc_req;
-  alloc_req.set_size(size);
-  ::umbp::AllocateWriteSlotResponse alloc_resp;
-  grpc::ClientContext alloc_ctx;
-  auto alloc_status = stub->AllocateWriteSlot(&alloc_ctx, alloc_req, &alloc_resp);
-  if (!alloc_status.ok() || !alloc_resp.success()) return false;
-  uint64_t write_offset = alloc_resp.staging_offset();
-
-  bool used_zero_copy = false;
-  if (zero_copy) {
-    auto reg = FindRegisteredMemory(src, size);
-    if (reg) {
-      auto uid = io_engine_->AllocateTransferUniqueId();
-      mori::io::TransferStatus status;
-      io_engine_->Write(reg->first, reg->second, peer.ssd_staging_mem, write_offset, size, &status,
-                        uid);
-      status.Wait();
-      if (!status.Succeeded()) return false;
-      used_zero_copy = true;
-    }
-  }
-  if (!used_zero_copy) {
-    if (size > config_.staging_buffer_size) return false;
-    std::lock_guard<std::mutex> lock(staging_mutex_);
-    std::memcpy(staging_buffer_.get(), src, size);
-    auto uid = io_engine_->AllocateTransferUniqueId();
-    mori::io::TransferStatus status;
-    io_engine_->Write(staging_mem_, 0, peer.ssd_staging_mem, write_offset, size, &status, uid);
-    status.Wait();
-    if (!status.Succeeded()) return false;
-  }
-
-  ::umbp::CommitSsdWriteRequest req;
-  req.set_key(key);
-  req.set_staging_offset(write_offset);
-  req.set_size(size);
-  req.set_store_index(store_index);
-  req.set_lease_id(alloc_resp.lease_id());
-  ::umbp::CommitSsdWriteResponse resp;
-  grpc::ClientContext ctx;
-  auto grpc_status = stub->CommitSsdWrite(&ctx, req, &resp);
-  return grpc_status.ok() && resp.success();
-}
-
+// TODO(Phase 3): RemoteSsdRead is the legacy client-side SSD read glue.  It is
+// currently dead (no callers) and will be rewritten for the new SSD get path
+// (local vs remote, key-based PrepareSsdRead) per the interface contract §5.
+// Direct-SSD-put (RemoteSsdWrite) was removed in the SSD-tier redesign — SSD is
+// an async copy-on-commit cold tier, not a writer-driven put target.
 bool PoolClient::RemoteSsdRead(PeerConnection& peer, const std::string& key,
                                const std::string& location_id, void* dst, size_t size,
                                bool zero_copy) {

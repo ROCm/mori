@@ -6,9 +6,11 @@ import "umbp.proto";
 service UMBPPeer {
   rpc GetPeerInfo(GetPeerInfoRequest) returns (GetPeerInfoResponse);
 
-  // SSD staging (unchanged in this redesign).
-  rpc AllocateWriteSlot(AllocateWriteSlotRequest) returns (AllocateWriteSlotResponse);
-  rpc CommitSsdWrite   (CommitSsdWriteRequest)   returns (CommitSsdWriteResponse);
+  // SSD read staging.  The direct-SSD-put RPCs (AllocateWriteSlot /
+  // CommitSsdWrite) were removed in the SSD-tier redesign: SSD is now an
+  // async copy-on-commit cold tier, not a writer-driven put target.
+  // TODO(Phase 3): refactor these two to key-based + status enum + size per
+  // docs/umbp-ssd-tier-interface-contract-zh.md §5.
   rpc PrepareSsdRead   (PrepareSsdReadRequest)   returns (PrepareSsdReadResponse);
   rpc ReleaseSsdLease  (ReleaseSsdLeaseRequest)  returns (ReleaseSsdLeaseResponse);
 
@@ -45,31 +47,8 @@ message GetPeerInfoResponse {
 }
 
 // ============================================================
-//  SSD slot machinery (unchanged)
+//  SSD read staging (Phase 3 will refactor — see service comment)
 // ============================================================
-
-message AllocateWriteSlotRequest {
-  uint64 size = 1;
-}
-message AllocateWriteSlotResponse {
-  bool   success        = 1;
-  uint64 staging_offset = 2;
-  uint64 lease_id       = 3;
-  uint64 lease_ttl_ms   = 4;
-}
-
-message CommitSsdWriteRequest {
-  string key              = 1;
-  uint64 staging_offset   = 2;
-  uint64 size             = 3;
-  uint32 store_index      = 4;
-  string allocation_id    = 5;  // historical echo from RoutePut; ignored in the new design
-  uint64 lease_id         = 6;
-}
-message CommitSsdWriteResponse {
-  bool   success          = 1;
-  string ssd_location_id  = 2;
-}
 
 message PrepareSsdReadRequest {
   string key              = 1;
