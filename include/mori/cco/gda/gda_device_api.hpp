@@ -188,6 +188,26 @@ __device__ inline static void get(ccoGdaCtx ctx, int peer, ccoWindow_t remoteWin
                                   size_t remoteOffset, ccoWindow_t localWin, size_t localOffset,
                                   size_t bytes) {}
 
+<<<<<<< HEAD
+__device__ inline static void flush(CcoGdaCtx ctx, int peer) {}
+__device__ inline static void flushAsync(CcoGdaCtx ctx, int peer, CcoGdaRequest_t* outRequest) {}
+__device__ inline static void signal(CcoGdaCtx ctx, int peer, CcoGdaSignal_t signalId,
+                                     CcoGdaSignalOp_t signalOp, uint64_t signalOpArg) {}
+
+__device__ inline static void resetSignal(CcoGdaCtx ctx, CcoGdaSignal_t signalId) {}
+__device__ inline static uint64_t readSignal(CcoGdaCtx ctx, CcoGdaSignal_t signalId, int bits) {
+  return 0;
+}
+
+__device__ inline static void waitSignal(CcoGdaCtx ctx, CcoGdaSignal_t signalId, uint64_t least,
+                                         int bits) {}
+__device__ inline static uint64_t readCounter(CcoGdaCtx ctx, CcoGdaCounter_t counterId, int bits) {
+  return 0;
+}
+
+__device__ inline static void resetCounter(CcoGdaCtx ctx, CcoGdaCounter_t counterId) {}
+__device__ inline static void waitCounter(CcoGdaCtx ctx, CcoGdaCounter_t counterId, uint64_t least,
+=======
 __device__ inline static void flush(ccoGdaCtx ctx, int peer) {}
 __device__ inline static void flushAsync(ccoGdaCtx ctx, int peer, ccoGdaRequest_t* outRequest) {}
 __device__ inline static void signal(ccoGdaCtx ctx, int peer, ccoGdaSignal_t signalId,
@@ -206,6 +226,7 @@ __device__ inline static uint64_t readCounter(ccoGdaCtx ctx, ccoGdaCounter_t cou
 
 __device__ inline static void resetCounter(ccoGdaCtx ctx, ccoGdaCounter_t counterId) {}
 __device__ inline static void waitCounter(ccoGdaCtx ctx, ccoGdaCounter_t counterId, uint64_t least,
+>>>>>>> dev/cco
                                           int bits) {}
 
 }  // namespace gda

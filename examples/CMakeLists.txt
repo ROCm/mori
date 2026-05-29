@@ -131,6 +131,10 @@ target_link_libraries(lsa_allreduce mori_cco MPI::MPI_CXX hip::host hip::device)
 target_include_directories(lsa_allreduce PRIVATE ${CMAKE_SOURCE_DIR}/include
                                                   ${CMAKE_SOURCE_DIR}/examples/utils)
 
+add_executable(lsa_barrier cco/lsa_barrier.cpp)
+target_link_libraries(lsa_barrier mori_cco MPI::MPI_CXX hip::host hip::device)
+target_include_directories(lsa_barrier PRIVATE ${CMAKE_SOURCE_DIR}/include)
+
 # --- Application examples ---
 add_executable(context application/context.cpp)
 target_link_libraries(context mori_application hip::host hip::device)
