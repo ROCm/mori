@@ -9,8 +9,9 @@ service UMBPPeer {
   // SSD read staging.  The direct-SSD-put RPCs (AllocateWriteSlot /
   // CommitSsdWrite) were removed in the SSD-tier redesign: SSD is now an
   // async copy-on-commit cold tier, not a writer-driven put target.
-  // TODO(Phase 3): refactor these two to key-based + status enum + size per
-  // docs/umbp-ssd-tier-interface-contract-zh.md §5.
+  // PrepareSsdRead is key-based (the peer looks up the SSD location by key via
+  // PeerSsdManager) and returns a typed status + the actual size; ReleaseSsdLease
+  // is a best-effort fast release (slots are also reclaimed by lease TTL).
   rpc PrepareSsdRead   (PrepareSsdReadRequest)   returns (PrepareSsdReadResponse);
   rpc ReleaseSsdLease  (ReleaseSsdLeaseRequest)  returns (ReleaseSsdLeaseResponse);
 
@@ -34,8 +35,7 @@ service UMBPPeer {
 message GetPeerInfoRequest {}
 message GetPeerInfoResponse {
   bytes  engine_desc           = 1;
-  uint64 ssd_capacity          = 3;
-  uint64 ssd_available         = 4;
+  // SSD capacity is reported via heartbeat tier_capacities, not here.
   bytes  ssd_staging_mem_desc  = 6;  // packed MemoryDesc for dedicated SSD staging buffer
   uint64 ssd_staging_size      = 7;  // total staging buffer size
 
@@ -47,19 +47,33 @@ message GetPeerInfoResponse {
 }
 
 // ============================================================
-//  SSD read staging (Phase 3 will refactor — see service comment)
+//  SSD read staging (key-based; see UMBPPeer service comment + contract §5)
 // ============================================================
 
+// Per-key SSD read outcome.  Callers MUST distinguish retryable transient
+// failures (NO_SLOT / LEASE_EXPIRED) from a definitive miss (NOT_FOUND): a
+// transient failure must never be surfaced to hicache as a cache miss.
+enum SsdReadStatus {
+  SSD_READ_OK             = 0;
+  SSD_READ_NOT_FOUND      = 1;   // key not on this peer's SSD tier → caller treats as miss
+  SSD_READ_NO_SLOT        = 2;   // staging slots exhausted → retryable
+  SSD_READ_SIZE_TOO_LARGE = 3;   // actual size > reader cap / staging slot size
+  SSD_READ_LEASE_EXPIRED  = 4;   // lease elapsed before use → retryable
+  SSD_READ_ERROR          = 5;   // backend read error (e.g. concurrent evict / corruption)
+}
+
 message PrepareSsdReadRequest {
-  string key              = 1;
-  string ssd_location_id  = 2;
-  uint64 size             = 3;
+  string key      = 1;
+  // Reader's destination buffer size (capacity upper bound).  The peer rejects
+  // with SSD_READ_SIZE_TOO_LARGE when the key's actual size exceeds it.
+  uint64 max_size = 2;
 }
 message PrepareSsdReadResponse {
-  bool   success          = 1;
-  uint64 staging_offset   = 2;
-  uint64 lease_id         = 3;
-  uint64 lease_ttl_ms     = 4;
+  SsdReadStatus status        = 1;
+  uint64        staging_offset = 2;   // offset into the published ssd_staging_mem_desc
+  uint64        size           = 3;   // actual readable bytes
+  uint64        lease_id       = 4;
+  uint64        lease_ttl_ms   = 5;
 }
 
 message ReleaseSsdLeaseRequest {

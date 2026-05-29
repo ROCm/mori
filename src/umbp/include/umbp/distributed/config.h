@@ -136,6 +136,14 @@ struct PoolClientConfig {
 
   size_t staging_buffer_size = 64ULL * 1024 * 1024;
 
+  // SSD read-staging tuning (peer side).  More slots reduce NO_SLOT under large
+  // concurrent prefetch batches, but shrink per-slot size (= staging_buffer_size
+  // / slots), which must stay >= the largest single SSD block.  The lease TTL
+  // is the primary slot-reclaim mechanism (ReleaseSsdLease is best-effort), so
+  // it should comfortably exceed one SSD read's latency.
+  int ssd_read_slots = 16;
+  int ssd_lease_timeout_s = 10;
+
   std::vector<ExportableDram> dram_buffers;
   PeerSsdConfig ssd;
 

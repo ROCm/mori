@@ -145,11 +145,38 @@ TEST_F(PeerSsdManagerTest, EvictRemovesOwnershipAndQueuesRemoveEvent) {
   EXPECT_TRUE(mgr.DrainPendingEvents().empty());
 }
 
-TEST_F(PeerSsdManagerTest, PrepareReadIsStubInPhase1) {
+TEST_F(PeerSsdManagerTest, PrepareReadReturnsBytesForOwnedKey) {
+  PeerSsdManager mgr(MakeConfig());
+  const std::string key = "key-read";
+  const std::string value = "hello-ssd-read-path";
+  ASSERT_TRUE(mgr.Write(key, OneSegment(value), value.size()));
+
+  std::vector<char> staging(value.size());
+  auto out = mgr.PrepareRead(key, staging.data(), staging.size());
+  EXPECT_EQ(out.status, SsdReadStatus::kOk);
+  EXPECT_EQ(out.size, value.size());
+  EXPECT_EQ(std::string(staging.data(), out.size), value);
+}
+
+TEST_F(PeerSsdManagerTest, PrepareReadUnknownKeyIsNotFound) {
   PeerSsdManager mgr(MakeConfig());
   std::vector<char> staging(64);
-  auto out = mgr.PrepareRead("any", staging.data(), staging.size());
+  auto out = mgr.PrepareRead("never-written", staging.data(), staging.size());
   EXPECT_EQ(out.status, SsdReadStatus::kNotFound);
+}
+
+TEST_F(PeerSsdManagerTest, PrepareReadRejectsOverCapBeforeIo) {
+  PeerSsdManager mgr(MakeConfig());
+  const std::string key = "key-big";
+  const std::string value(4096, 'z');
+  ASSERT_TRUE(mgr.Write(key, OneSegment(value), value.size()));
+
+  // Capacity smaller than the actual size must be rejected as kSizeTooLarge
+  // (and the reported size is the real size) without reading into the buffer.
+  std::vector<char> staging(value.size() / 2);
+  auto out = mgr.PrepareRead(key, staging.data(), staging.size());
+  EXPECT_EQ(out.status, SsdReadStatus::kSizeTooLarge);
+  EXPECT_EQ(out.size, value.size());
 }
 
 // ---- Unified owned-location source aggregation ------------------------------

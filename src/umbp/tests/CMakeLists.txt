@@ -117,3 +117,33 @@ target_link_libraries(test_ssd_copy_pipeline PRIVATE umbp_common
 target_compile_features(test_ssd_copy_pipeline PRIVATE cxx_std_17)
 
 gtest_discover_tests(test_ssd_copy_pipeline)
+
+# ---------------------------------------------------------------------------
+# test_tier_priority_route_get — Phase 3 RouteGet tier-priority strategy
+# ---------------------------------------------------------------------------
+add_executable(test_tier_priority_route_get test_tier_priority_route_get.cpp)
+
+target_link_libraries(test_tier_priority_route_get PRIVATE umbp_common
+                                                           GTest::gtest_main)
+
+target_compile_features(test_tier_priority_route_get PRIVATE cxx_std_17)
+
+gtest_discover_tests(test_tier_priority_route_get)
+
+# ---------------------------------------------------------------------------
+# test_peer_ssd_read_rpc — Phase 3 SSD read RPC over a gRPC loopback (status
+# distinctions: OK / NOT_FOUND / NO_SLOT / SIZE_TOO_LARGE + slot lifecycle).
+# Needs the gRPC peer service + generated stubs (umbp_core) and protobuf/gRPC.
+# ---------------------------------------------------------------------------
+add_executable(test_peer_ssd_read_rpc test_peer_ssd_read_rpc.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_peer_ssd_read_rpc PRIVATE -Wl,--no-as-needed)
+endif()
+
+target_link_libraries(
+  test_peer_ssd_read_rpc PRIVATE umbp_core umbp_common ${_PROTOBUF_LIB}
+                                 ${_GRPCPP_LIB} GTest::gtest_main)
+
+target_compile_features(test_peer_ssd_read_rpc PRIVATE cxx_std_17)
+
+gtest_discover_tests(test_peer_ssd_read_rpc)

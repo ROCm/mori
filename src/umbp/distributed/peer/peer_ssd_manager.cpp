@@ -151,10 +151,36 @@ void PeerSsdManager::ClearLocal() {
   pending_events_.clear();
 }
 
-SsdReadOutcome PeerSsdManager::PrepareRead(const std::string& /*key*/, void* /*staging_ptr*/,
-                                           size_t /*staging_cap*/) {
-  // TODO(Phase 3): key-based read into staging (local vs remote SSD get).
-  return SsdReadOutcome{SsdReadStatus::kNotFound, 0};
+SsdReadOutcome PeerSsdManager::PrepareRead(const std::string& key, void* staging_ptr,
+                                           size_t staging_cap) {
+  if (!backend_) return SsdReadOutcome{SsdReadStatus::kNotFound, 0};
+
+  // Look up the authoritative size under the lock, then release it before the
+  // blocking SSD IO so a concurrent copy Write() is not serialized behind this
+  // read (the lock only guards the owned_ map, not the backend IO).
+  size_t size = 0;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = owned_.find(key);
+    if (it == owned_.end()) return SsdReadOutcome{SsdReadStatus::kNotFound, 0};
+    size = it->second;
+  }
+
+  // Reject before touching the device: a key larger than the caller's capacity
+  // (reader buffer / staging slot) must not trigger a wasted SSD read.
+  if (size > staging_cap) {
+    MORI_UMBP_WARN("[PeerSsdManager] PrepareRead key={} size={} exceeds cap={}", key, size,
+                   staging_cap);
+    return SsdReadOutcome{SsdReadStatus::kSizeTooLarge, size};
+  }
+
+  if (!backend_->ReadIntoPtr(key, reinterpret_cast<uintptr_t>(staging_ptr), size)) {
+    // owned_ had the key but the backend couldn't serve it (e.g. a Phase 4
+    // local evict raced us, or a corrupt record): kError, not a definitive miss.
+    MORI_UMBP_WARN("[PeerSsdManager] PrepareRead backend read failed key={} size={}", key, size);
+    return SsdReadOutcome{SsdReadStatus::kError, size};
+  }
+  return SsdReadOutcome{SsdReadStatus::kOk, size};
 }
 
 std::vector<KvEvent> PeerSsdManager::DrainPendingEvents() {

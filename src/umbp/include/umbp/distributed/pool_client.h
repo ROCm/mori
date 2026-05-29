@@ -222,11 +222,18 @@ class PoolClient {
                      size_t size);
 
   bool EnsurePeerServiceConnection(PeerConnection& peer);
-  // SSD read glue. TODO(Phase 3): rewrite for the new SSD get path (local vs
-  // remote, key-based PrepareSsdRead) per the interface contract §5. Direct
-  // SSD put (RemoteSsdWrite) was removed in the SSD-tier redesign.
-  bool RemoteSsdRead(PeerConnection& peer, const std::string& key, const std::string& location_id,
-                     void* dst, size_t size, bool zero_copy);
+
+  // Outcome of one remote SSD get attempt.  kRetry (NO_SLOT / LEASE_EXPIRED) is
+  // a transient peer-side condition the caller retries; kMiss (NOT_FOUND) is a
+  // definitive miss; kError is a hard failure.  Keeping these distinct is what
+  // lets BatchGet avoid surfacing transient slot contention as a cache miss.
+  enum class SsdGetOutcome { kSuccess, kMiss, kRetry, kError };
+
+  // Remote SSD get path (reader != owner): key-based PrepareSsdRead -> RDMA out
+  // of the peer's published SSD staging buffer -> best-effort ReleaseSsdLease.
+  SsdGetOutcome RemoteSsdReadOnce(PeerConnection& peer, const std::string& key, void* dst,
+                                  size_t size);
+  void ReleaseSsdLeaseBestEffort(::umbp::UMBPPeer::Stub* stub, uint64_t lease_id);
 
   // Zero-copy registered memory regions.
   struct RegisteredRegion {
@@ -247,6 +254,9 @@ class PoolClient {
   PutAttemptOutcome ExecuteLocalPut(const std::string& key, const void* src, size_t size,
                                     TierType tier);
   GetAttemptOutcome ExecuteLocalGet(const std::string& key, void* dst, size_t size);
+  // Self-target SSD get: read straight from the local SSD tier into the user
+  // buffer (no staging / RDMA / lease).
+  GetAttemptOutcome ExecuteLocalSsdGet(const std::string& key, void* dst, size_t size);
   struct BatchPutItem {
     size_t index;
     const std::string* key;
@@ -300,6 +310,9 @@ class PoolClient {
   void ProcessRemoteBatchPut(const std::vector<BatchPutItem>& items,
                              std::vector<PutEntryOutcome>* results);
   void ProcessRemoteBatchGet(const std::vector<BatchGetItem>& items, std::vector<bool>* results);
+  // Remote SSD reads (one staging slot + lease per key) with bounded retry on
+  // transient NO_SLOT / LEASE_EXPIRED; a NOT_FOUND short-circuits as a miss.
+  void ProcessRemoteSsdBatchGet(const std::vector<BatchGetItem>& items, std::vector<bool>* results);
   void ExecuteRemoteBatchPut(const std::vector<BatchPutItem>& items,
                              std::vector<PutEntryOutcome>* results, PeerConnection& peer,
                              ::umbp::UMBPPeer::Stub* stub);
