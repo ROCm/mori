@@ -35,6 +35,7 @@
 #include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/master/rpc_latency_timer.h"
 #include "umbp/distributed/peer/peer_dram_allocator.h"
+#include "umbp/distributed/peer/peer_ssd_manager.h"
 
 namespace mori::umbp {
 
@@ -136,8 +137,7 @@ MasterClient::~MasterClient() {
 
 grpc::Status MasterClient::RegisterSelf(const std::map<TierType, TierCapacity>& tier_capacities,
                                         const std::string& peer_address,
-                                        const std::vector<uint8_t>& engine_desc_bytes,
-                                        const std::vector<uint64_t>& ssd_store_capacities) {
+                                        const std::vector<uint8_t>& engine_desc_bytes) {
   ScopedRpcTimer _rpc_timer(this, "RegisterClient");
   if (registered_) {
     return grpc::Status(grpc::StatusCode::ALREADY_EXISTS, "node is already registered");
@@ -149,9 +149,6 @@ grpc::Status MasterClient::RegisterSelf(const std::map<TierType, TierCapacity>& 
   req.set_peer_address(peer_address);
   req.set_engine_desc(engine_desc_bytes.data(), engine_desc_bytes.size());
   FillTierCapacities(req.mutable_tier_capacities(), tier_capacities);
-  // DEPRECATED: master does not consume ssd_store_capacities. SSD capacity now
-  // travels in tier_capacities as TierType::SSD (Phase 1). Kept for wire compat.
-  for (uint64_t cap : ssd_store_capacities) req.add_ssd_store_capacities(cap);
   for (const auto& tag : config_.tags) req.add_tags(tag);
 
   ::umbp::RegisterClientResponse resp;
@@ -360,7 +357,20 @@ grpc::Status MasterClient::BatchLookup(const std::vector<std::string>& keys,
   return grpc::Status::OK;
 }
 
-void MasterClient::SetPeerDramAllocator(PeerDramAllocator* alloc) { peer_alloc_ = alloc; }
+void MasterClient::SetPeerDramAllocator(PeerDramAllocator* dram_alloc) {
+  peer_alloc_ = dram_alloc;
+  AddOwnedLocationSource(dram_alloc);
+}
+
+void MasterClient::SetPeerSsdManager(PeerSsdManager* ssd_manager) {
+  ssd_manager_ = ssd_manager;
+  AddOwnedLocationSource(ssd_manager);
+}
+
+void MasterClient::AddOwnedLocationSource(OwnedLocationSource* source) {
+  if (source == nullptr) return;
+  owned_sources_.push_back(source);
+}
 
 bool MasterClient::ClearFullSync() {
   std::lock_guard send_lock(hb_send_mutex_);
@@ -439,17 +449,28 @@ void MasterClient::HeartbeatLoop() {
 }
 
 std::map<TierType, TierCapacity> MasterClient::SnapshotAndCacheTierCapacities() {
+  std::map<TierType, TierCapacity> caps;
+  bool have_live = false;
   if (peer_alloc_ != nullptr) {
-    auto caps = peer_alloc_->TierCapacitiesSnapshot();
-    std::lock_guard lock(caps_mutex_);
-    for (auto& [t, c] : current_capacities_) {
-      if (caps.find(t) == caps.end()) caps[t] = c;
+    caps = peer_alloc_->TierCapacitiesSnapshot();  // DRAM/HBM, bitmap-derived
+    have_live = true;
+  }
+  if (ssd_manager_ != nullptr) {
+    auto [used, total] = ssd_manager_->Capacity();
+    if (total > 0) {
+      const uint64_t avail = used < total ? total - used : 0;
+      caps[TierType::SSD] = TierCapacity{total, avail};
+      have_live = true;
     }
-    current_capacities_ = caps;
-    return caps;
   }
   std::lock_guard lock(caps_mutex_);
-  return current_capacities_;
+  if (!have_live) return current_capacities_;
+  // Fill tiers we have no live source for from the cached snapshot.
+  for (auto& [t, c] : current_capacities_) {
+    if (caps.find(t) == caps.end()) caps[t] = c;
+  }
+  current_capacities_ = caps;
+  return caps;
 }
 
 bool MasterClient::SendHeartbeatOnce() {
@@ -489,7 +510,7 @@ bool MasterClient::SendFullSyncHeartbeatLocked(const std::map<TierType, TierCapa
     snapshot.seq = next_bundle_seq_ - 1;
     req.set_delta_seq_baseline(snapshot.seq);
   }
-  if (peer_alloc_ != nullptr) snapshot.events = peer_alloc_->SnapshotOwnedKeys();
+  snapshot.events = SnapshotAllSources(owned_sources_);
   FillBundle(req.add_bundles(), snapshot);
 
   ::umbp::HeartbeatResponse resp;
@@ -503,12 +524,13 @@ bool MasterClient::SendFullSyncHeartbeatLocked(const std::map<TierType, TierCapa
 
 bool MasterClient::SendDeltaHeartbeatLocked(const std::map<TierType, TierCapacity>& caps,
                                             const std::map<TierType, uint64_t>& kv_counts) {
-  if (peer_alloc_ != nullptr) {
-    auto new_events = peer_alloc_->DrainPendingEvents();
-    if (!new_events.empty()) {
-      std::lock_guard state_lock(hb_state_mutex_);
-      outbox_.push_back(EventBundle{next_bundle_seq_++, std::move(new_events)});
-    }
+  // Drain every owned-location source (DRAM allocator + SSD manager) and
+  // concat into ONE bundle under ONE monotonic seq — never one seq per source,
+  // which would break ack / seq-gap full-sync recovery.
+  auto new_events = DrainAllSources(owned_sources_);
+  if (!new_events.empty()) {
+    std::lock_guard state_lock(hb_state_mutex_);
+    outbox_.push_back(EventBundle{next_bundle_seq_++, std::move(new_events)});
   }
 
   ::umbp::HeartbeatRequest req;

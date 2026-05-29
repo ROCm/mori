@@ -38,6 +38,7 @@
 #include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/peer/peer_dram_allocator.h"
 #include "umbp/distributed/peer/peer_service.h"
+#include "umbp/distributed/peer/peer_ssd_manager.h"
 #include "umbp_peer.grpc.pb.h"
 
 namespace mori::umbp {
@@ -250,6 +251,16 @@ bool PoolClient::Init() {
   peer_alloc_->StartReaper();
   master_client_->SetPeerDramAllocator(peer_alloc_.get());
 
+  // Peer-side SSD tier owner.  Built only when SSD is enabled; registered as an
+  // owned-location event source + SSD capacity provider.  Phase 1: present and
+  // reporting capacity, but nothing writes (copy = Phase 2) or reads (Phase 3)
+  // it yet.  TODO(Phase 2): PoolClient::Clear() must also clear peer_ssd_'s
+  // owned keys once copy-on-commit can populate them.
+  if (config_.ssd.enabled) {
+    peer_ssd_ = std::make_unique<PeerSsdManager>(config_.ssd);
+    master_client_->SetPeerSsdManager(peer_ssd_.get());
+  }
+
   // Pack engine_desc for master registration.
   std::vector<uint8_t> engine_desc_bytes;
   if (io_engine_) {
@@ -258,8 +269,9 @@ bool PoolClient::Init() {
     engine_desc_bytes.assign(sbuf.data(), sbuf.data() + sbuf.size());
   }
 
-  // SSD staging buffer (one per process; not part of DRAM exports).
-  if (!config_.ssd_stores.empty()) {
+  // SSD staging buffer (one per process; not part of DRAM exports).  Phase 3
+  // serves remote SSD reads out of it; allocated up front when SSD is enabled.
+  if (config_.ssd.enabled) {
     ssd_staging_buffer_ = std::make_unique<char[]>(config_.staging_buffer_size);
     std::memset(ssd_staging_buffer_.get(), 0, config_.staging_buffer_size);
     if (io_engine_) {
@@ -290,16 +302,11 @@ bool PoolClient::Init() {
     peer_address = host + ":" + std::to_string(config_.peer_service_port);
   }
 
-  // DEPRECATED: ssd_store_capacities is legacy and unconsumed by master. The
-  // SSD-tier redesign reports SSD capacity via config_.tier_capacities
-  // (TierType::SSD), wired in Phase 1. Left empty here for wire compat.
-  std::vector<uint64_t> ssd_store_capacities;
-  for (const auto& store : config_.ssd_stores) ssd_store_capacities.push_back(store.capacity);
-
   // Master register.  In the new design master holds no DRAM-side
-  // metadata; only membership + capacity-snapshot.
-  auto status = master_client_->RegisterSelf(config_.tier_capacities, peer_address,
-                                             engine_desc_bytes, ssd_store_capacities);
+  // metadata; only membership + capacity-snapshot (SSD capacity rides in
+  // tier_capacities as TierType::SSD).
+  auto status =
+      master_client_->RegisterSelf(config_.tier_capacities, peer_address, engine_desc_bytes);
   if (!status.ok()) {
     MORI_UMBP_ERROR("[PoolClient] RegisterSelf failed: {}", status.error_message());
     initialized_ = false;
@@ -335,6 +342,10 @@ void PoolClient::Shutdown() {
     peer_alloc_->StopReaper();
     peer_alloc_.reset();
   }
+
+  // Heartbeat thread is already stopped above, so MasterClient no longer reads
+  // ssd_manager_; safe to drop the SSD tier owner here.
+  peer_ssd_.reset();
 
   if (io_engine_) {
     {

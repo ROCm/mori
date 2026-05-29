@@ -84,6 +84,25 @@ struct UMBPSsdConfig {
   size_t segment_size_bytes = 256ULL * 1024 * 1024;
   UMBPIoConfig io;
   UMBPDurabilityConfig durability;
+
+  // Focused validation for the SSD tier alone (used by SSDTier, which depends
+  // on UMBPSsdConfig rather than the whole UMBPConfig).  UMBPConfig::Validate()
+  // remains the global validator.
+  bool Validate(std::string* error_message = nullptr) const {
+    // capacity_bytes == 0 is legal when SSD is not in use; only enforce sizing
+    // when the tier is actually enabled (mirrors UMBPConfig::Validate's
+    // `if (ssd.enabled)` gate).
+    if (!enabled) return true;
+    if (capacity_bytes == 0) {
+      if (error_message) *error_message = "ssd.capacity_bytes must be > 0";
+      return false;
+    }
+    if (segment_size_bytes == 0) {
+      if (error_message) *error_message = "ssd.segment_size_bytes must be > 0";
+      return false;
+    }
+    return true;
+  }
 };
 
 struct UMBPEvictionConfig {

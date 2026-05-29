@@ -34,6 +34,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "umbp/distributed/peer/owned_location_source.h"
 #include "umbp/distributed/peer/peer_page_allocator.h"
 #include "umbp/distributed/types.h"
 
@@ -57,7 +58,7 @@ namespace mori::umbp {
 //   2. Peer service calls Evict(keys) here.
 //   3. For each key actually freed, a REMOVE event is queued.
 //   4. Heartbeat ships the REMOVE events and master drops the index entry.
-class PeerDramAllocator {
+class PeerDramAllocator : public OwnedLocationSource {
  public:
   // Per-tier inputs: each i'th buffer's size in bytes, and the matching
   // packed mori::io::MemoryDesc that the writer will use to RDMA into
@@ -99,10 +100,6 @@ class PeerDramAllocator {
   struct OwnedSlot {
     TierType tier = TierType::UNKNOWN;
     std::vector<PageLocation> pages;
-    uint64_t size = 0;
-  };
-
-  struct SsdEntry {
     uint64_t size = 0;
   };
 
@@ -202,14 +199,6 @@ class PeerDramAllocator {
   // For every key actually freed, a REMOVE event is queued.
   std::vector<EvictResult> Evict(const std::vector<std::string>& keys);
 
-  // -------- Event outbox (used by other peer-side code paths) --------
-
-  // Push a KvEvent onto the outbox without touching the bitmap or
-  // owned/pending maps.  Used by the SSD CommitSsdWrite path to ship
-  // ADD events for keys this allocator doesn't manage — one outbox per
-  // peer is the canonical event source for the heartbeat.
-  void QueueExternalEvent(KvEvent ev);
-
   // -------- Distributed Clear --------
 
   // Drop owned/lease state, bump allocator_generation_ so pre-clear
@@ -230,12 +219,12 @@ class PeerDramAllocator {
   // -------- Heartbeat helpers --------
 
   // Drain the outbox of events queued since the last call.  Called by
-  // the heartbeat shipper; clears the buffer.
-  std::vector<KvEvent> DrainPendingEvents();
+  // the heartbeat shipper; clears the buffer.  OwnedLocationSource.
+  std::vector<KvEvent> DrainPendingEvents() override;
 
   // Full snapshot of every owned key as ADD events.  Used when master
-  // requests a full sync (seq gap or master restart).
-  std::vector<KvEvent> SnapshotOwnedKeys() const;
+  // requests a full sync (seq gap or master restart).  OwnedLocationSource.
+  std::vector<KvEvent> SnapshotOwnedKeys() const override;
 
   // Live owned-key count per tier.  O(tiers) — cheap to call every
   // heartbeat.  Used by the heartbeat shipper for per-client metrics.
@@ -313,7 +302,6 @@ class PeerDramAllocator {
 
   std::unordered_map<uint64_t, PendingSlot> pending_;
   std::unordered_map<std::string, OwnedSlot> owned_;
-  std::unordered_map<std::string, SsdEntry> owned_external_ssd_;
   std::unordered_map<std::string, std::chrono::steady_clock::time_point> read_lease_until_;
   std::vector<KvEvent> pending_events_;
 

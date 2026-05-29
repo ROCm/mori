@@ -486,7 +486,7 @@ int main(int argc, char** argv) {
       std::vector<double> wbw, rbw;
       for (int iter = 0; iter < bench.iterations; ++iter) {
         UMBPConfig posix_cfg;
-        SSDTier posix_tier(posix_dir, 8ULL * 1024 * 1024 * 1024, posix_cfg);
+        SSDTier posix_tier(posix_dir, 8ULL * 1024 * 1024 * 1024, posix_cfg.ssd);
 
         std::vector<std::string> keys(count);
         std::vector<std::vector<char>> bufs(count);

@@ -518,7 +518,7 @@ LocalStorageManager::LocalStorageManager(const UMBPConfig& config,
         segmented_access_mode = SSDAccessMode::ReadOnlyShared;
       }
       ssd_backend = std::make_unique<SSDTier>(config_.ssd.storage_dir, config_.ssd.capacity_bytes,
-                                              config_, segmented_access_mode);
+                                              config_.ssd, segmented_access_mode);
     }
     tiers_.push_back({StorageTier::LOCAL_SSD, std::move(ssd_backend)});
   }

@@ -57,11 +57,12 @@ message RegisterClientRequest {
   repeated TierCapacity tier_capacities = 3; // Capacity per tier (incl. SSD — see field 12)
   string peer_address                 = 4;   // PeerService gRPC address
   bytes  engine_desc                  = 5;   // packed EngineDesc
-  // DEPRECATED/legacy: master does not consume this field.  The SSD-tier
-  // redesign reports SSD capacity via TierCapacity{tier=TIER_SSD} in
-  // tier_capacities (field 3), same as DRAM/HBM.  Kept for wire compat; do not
-  // build new behavior on it.  See docs/umbp-ssd-tier-interface-contract-zh.md §0.5.
-  repeated uint64 ssd_store_capacities = 12; // [deprecated] per-SSD-store capacity in bytes
+  // Field 12 was `repeated uint64 ssd_store_capacities` — removed in the
+  // SSD-tier redesign.  SSD capacity now flows via TierCapacity{tier=TIER_SSD}
+  // in tier_capacities (field 3), same as DRAM/HBM.  Reserved so the tag is
+  // never silently reused with a different type.
+  reserved 12;
+  reserved "ssd_store_capacities";
   repeated string tags                = 13;  // opaque key=value labels (e.g. "sgl_role=prefill")
 }
 message RegisterClientResponse {

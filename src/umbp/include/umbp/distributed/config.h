@@ -118,9 +118,16 @@ struct ExportableDram {
   size_t size = 0;
 };
 
-struct ExportableSsd {
-  std::string dir;
-  size_t capacity = 0;
+// SSD-tier construction parameters lowered from the user-facing UMBPConfig.
+// SSDTier depends on UMBPSsdConfig (io backend/queue_depth, segment_size,
+// durability, storage_dir, capacity), so the peer only needs that subset — not
+// the whole global config.  (SPDK/proxy backend selection lives at UMBPConfig
+// top level and is not yet wired into the distributed peer path; v1 builds the
+// POSIX SSDTier.  TODO(follow-up): fold ssd_backend/spdk* into UMBPSsdConfig so
+// the distributed path can select SpdkSsdTier too.)
+struct PeerSsdConfig {
+  bool enabled = false;
+  UMBPSsdConfig ssd;
 };
 
 struct PoolClientConfig {
@@ -130,7 +137,7 @@ struct PoolClientConfig {
   size_t staging_buffer_size = 64ULL * 1024 * 1024;
 
   std::vector<ExportableDram> dram_buffers;
-  std::vector<ExportableSsd> ssd_stores;
+  PeerSsdConfig ssd;
 
   std::map<TierType, TierCapacity> tier_capacities;
 
@@ -153,7 +160,8 @@ struct PoolClientConfig {
 // DistributedClient (pool mmap'd memory), not in the user-facing config.
 inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
                                            std::vector<ExportableDram> dram_buffers,
-                                           std::map<TierType, TierCapacity> tier_capacities) {
+                                           std::map<TierType, TierCapacity> tier_capacities,
+                                           PeerSsdConfig ssd = {}) {
   PoolClientConfig pc;
   pc.master_config = dc.master_config;
   pc.io_engine = dc.io_engine;
@@ -165,6 +173,7 @@ inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
   pc.dram_page_size = dc.dram_page_size;
   pc.dram_buffers = std::move(dram_buffers);
   pc.tier_capacities = std::move(tier_capacities);
+  pc.ssd = std::move(ssd);
   return pc;
 }
 

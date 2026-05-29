@@ -93,3 +93,15 @@ target_link_libraries(test_router_dedup PRIVATE umbp_common GTest::gtest_main)
 target_compile_features(test_router_dedup PRIVATE cxx_std_17)
 
 gtest_discover_tests(test_router_dedup)
+
+# ---------------------------------------------------------------------------
+# test_peer_ssd_manager — Phase 1 SSD tier ownership + owned-location source
+# ---------------------------------------------------------------------------
+add_executable(test_peer_ssd_manager test_peer_ssd_manager.cpp)
+
+target_link_libraries(test_peer_ssd_manager PRIVATE umbp_common
+                                                    GTest::gtest_main)
+
+target_compile_features(test_peer_ssd_manager PRIVATE cxx_std_17)
+
+gtest_discover_tests(test_peer_ssd_manager)

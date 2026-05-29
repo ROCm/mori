@@ -43,6 +43,7 @@ namespace mori::umbp {
 
 class PeerDramAllocator;
 class PeerServiceServer;
+class PeerSsdManager;
 
 // Short name for log output. Generic FAILED maps to "FAILED" — the
 // detailed reason for that case lives in the peer's allocator log.
@@ -162,6 +163,10 @@ class PoolClient {
   // the natural lifetime anchor for the per-process IO engine + DRAM
   // buffers; PeerServiceServer borrows it.
   std::unique_ptr<PeerDramAllocator> peer_alloc_;
+  // Peer-side SSD tier owner.  Built only when config_.ssd.enabled; registered
+  // with MasterClient as an owned-location source + SSD capacity provider.
+  // Phase 1: present and reporting, but nothing writes/reads it yet.
+  std::unique_ptr<PeerSsdManager> peer_ssd_;
   std::unique_ptr<PeerServiceServer> peer_service_;
 
   std::unique_ptr<mori::io::IOEngine> io_engine_;

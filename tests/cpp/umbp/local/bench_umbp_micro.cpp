@@ -870,7 +870,7 @@ struct TierScope {
   // POSIX: create local SSDTier
   TierScope(const std::string& dir, size_t capacity, const UMBPConfig& ucfg)
       : tmp(std::make_unique<ScopedTempDir>(dir)),
-        local_tier(std::make_unique<SSDTier>(tmp->path, capacity, ucfg)),
+        local_tier(std::make_unique<SSDTier>(tmp->path, capacity, ucfg.ssd)),
         tier(local_tier.get()) {}
 
   // SPDK: borrow external tier
@@ -2011,7 +2011,7 @@ static void BenchIOBackend(const BenchConfig& cfg, const std::vector<std::string
       ScopedTempDir tmp(cfg.base_dir + "/io_" + std::string(spec.path_suffix) + "_w");
       std::unique_ptr<SSDTier> tier;
       try {
-        tier = std::make_unique<SSDTier>(tmp.path, cfg.ssd_capacity, ucfg);
+        tier = std::make_unique<SSDTier>(tmp.path, cfg.ssd_capacity, ucfg.ssd);
       } catch (const std::exception& e) {
         std::printf("[SKIP] %s not available: %s\n", variant.c_str(), e.what());
         return;
@@ -2050,7 +2050,7 @@ static void BenchIOBackend(const BenchConfig& cfg, const std::vector<std::string
       ScopedTempDir tmp(cfg.base_dir + "/io_" + std::string(spec.path_suffix) + "_r");
       std::unique_ptr<SSDTier> tier;
       try {
-        tier = std::make_unique<SSDTier>(tmp.path, cfg.ssd_capacity, ucfg);
+        tier = std::make_unique<SSDTier>(tmp.path, cfg.ssd_capacity, ucfg.ssd);
       } catch (const std::exception& e) {
         std::printf("[SKIP] %s not available: %s\n", variant.c_str(), e.what());
         return;
@@ -2122,7 +2122,7 @@ static void BenchDurability(const BenchConfig& cfg, const std::vector<std::strin
     UMBPConfig ucfg = MakeBaseSsdConfig(cfg, cfg.ssd_io_backend, mode, cfg.ssd_io_queue_depth);
 
     ScopedTempDir tmp(cfg.base_dir + "/dur_" + label);
-    SSDTier tier(tmp.path, cfg.ssd_capacity, ucfg);
+    SSDTier tier(tmp.path, cfg.ssd_capacity, ucfg.ssd);
 
     // Warmup
     for (size_t w = 0; w < cfg.warmup_iters; ++w) {

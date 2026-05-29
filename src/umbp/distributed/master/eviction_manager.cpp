@@ -84,6 +84,11 @@ void EvictionManager::RunOnce() {
 
   for (const auto& client : clients) {
     for (const auto& [tier, cap] : client.tier_capacities) {
+      // v1 SSD eviction is purely peer-local (Phase 4).  Master must NOT turn
+      // an SSD overload into an EvictKey: EvictKey only acts on the peer's
+      // PeerDramAllocator, so it would wrongly evict the DRAM copy of the same
+      // key while leaving SSD untouched.
+      if (tier == TierType::SSD) continue;
       if (cap.total_bytes == 0) continue;
       uint64_t used = cap.total_bytes - cap.available_bytes;
       double usage = static_cast<double>(used) / static_cast<double>(cap.total_bytes);

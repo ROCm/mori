@@ -76,8 +76,11 @@ std::string SummarizeClientTiers(const std::vector<ClientRecord>& alive_clients)
 std::optional<RoutePutResult> TierAwareMostAvailableStrategy::Select(
     const std::vector<ClientRecord>& alive_clients, uint64_t block_size,
     const std::unordered_set<std::string>& exclude_nodes) {
-  static constexpr std::array<TierType, 3> kTierOrder = {TierType::HBM, TierType::DRAM,
-                                                         TierType::SSD};
+  // SSD is intentionally excluded: in the SSD-tier redesign there is no direct
+  // SSD put — the SSD copy is filled asynchronously by copy-on-commit (Phase
+  // 2).  Even after SSD capacity is reported via heartbeat, RoutePut must never
+  // steer a put at a tier with no direct-put semantics.
+  static constexpr std::array<TierType, 2> kTierOrder = {TierType::HBM, TierType::DRAM};
 
   const std::string exclude_snapshot = FormatExcludeSet(exclude_nodes);
 
