@@ -1,3 +1,24 @@
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 // Test: CCO host API — multi-process, one GPU per rank.
 //
 // Two modes, auto-detected:
@@ -34,12 +55,6 @@ static int g_rank = 0;
   } while (0)
 
 static const size_t PER_RANK_VMM_SIZE = 256ULL * 1024 * 1024;
-// 4 MiB user buffer — exercises the multi-sub-buffer code path under
-// hipMemAddressReserve. ROCm 7.0 → 7.2.3 has a bug (SWDEV-568260,
-// rocm-systems#2516) where the 2nd hipMemSetAccess on a smaller sub-buffer
-// fails after a larger one; docker/Dockerfile.dev patches libamdhip64.so
-// to pick up the fix from clr/develop (PR rocm-systems#2451). Keeping
-// WINDOW_SIZE large here makes this test a regression for that patch.
 static const size_t WINDOW_SIZE = 4096 * 1024;
 
 static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* bootNet) {

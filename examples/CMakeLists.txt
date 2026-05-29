@@ -125,6 +125,12 @@ target_link_libraries(intra_node_benchmark mori_collective MPI::MPI_CXX
 target_include_directories(intra_node_benchmark
                            PRIVATE ${CMAKE_SOURCE_DIR}/include)
 
+# --- CCO examples ---
+add_executable(lsa_allreduce cco/lsa_allreduce.cpp utils/args_parser.cpp)
+target_link_libraries(lsa_allreduce mori_cco MPI::MPI_CXX hip::host hip::device)
+target_include_directories(lsa_allreduce PRIVATE ${CMAKE_SOURCE_DIR}/include
+                                                  ${CMAKE_SOURCE_DIR}/examples/utils)
+
 # --- Application examples ---
 add_executable(context application/context.cpp)
 target_link_libraries(context mori_application hip::host hip::device)
