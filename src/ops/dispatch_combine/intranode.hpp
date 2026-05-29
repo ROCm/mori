@@ -80,9 +80,6 @@ inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T
 /*                                    EpDispatchIntraNodeKernel                                   */
 /* ---------------------------------------------------------------------------------------------- */
 
-#define ENABLE_DISPATCH_WARPGROUP
-
-#if !defined(ENABLE_DISPATCH_WARPGROUP)
 template <typename T, bool EnableStdMoE = false>
 __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   const EpDispatchCombineConfig& config = args.config;
@@ -219,9 +216,9 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   }
 #endif
 }
-#else
+
 template <typename T, bool EnableStdMoE = false>
-__device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
+__device__ void EpDispatchIntraNodeLLKernel_body(EpDispatchCombineArgs<T> args) {
   const EpDispatchCombineConfig& config = args.config;
 
   int thdId = threadIdx.x;
@@ -423,11 +420,9 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   }
 #endif
 }
-#endif
 
-template <typename T, bool EnableStdMoE = false, int block_threads = 512, int grid_blocks = 1>
-__global__ void __launch_bounds__(block_threads, grid_blocks)
-    EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
+template <typename T, bool EnableStdMoE = false>
+__global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   EpDispatchIntraNodeKernel_body<T, EnableStdMoE>(args);
 }
 
