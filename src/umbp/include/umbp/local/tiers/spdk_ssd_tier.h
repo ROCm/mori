@@ -66,8 +66,8 @@ class SpdkSsdTier : public TierBackend {
   };
   using SharedDmaPool = std::shared_ptr<DmaPool>;
 
-  explicit SpdkSsdTier(const UMBPConfig& config);
-  SpdkSsdTier(const UMBPConfig& config, uint64_t base_offset, size_t capacity_bytes,
+  explicit SpdkSsdTier(const UMBPSsdConfig& config);
+  SpdkSsdTier(const UMBPSsdConfig& config, uint64_t base_offset, size_t capacity_bytes,
               SharedDmaPool shared_dma_pool = nullptr);
   ~SpdkSsdTier() override;
 

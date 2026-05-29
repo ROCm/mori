@@ -42,7 +42,7 @@ namespace umbp {
 
 class SpdkProxyTier : public TierBackend {
  public:
-  explicit SpdkProxyTier(const UMBPConfig& config);
+  explicit SpdkProxyTier(const UMBPSsdConfig& config);
   ~SpdkProxyTier() override;
 
   bool IsValid() const { return connected_; }

@@ -36,10 +36,10 @@
 
 using namespace mori::umbp;
 
-static UMBPConfig MakeTestConfig() {
-  UMBPConfig cfg;
+static UMBPSsdConfig MakeTestConfig() {
+  UMBPSsdConfig cfg;
   cfg.ssd_backend = "spdk";
-  cfg.ssd.capacity_bytes = 512ULL * 1024 * 1024;  // 512 MB
+  cfg.capacity_bytes = 512ULL * 1024 * 1024;  // 512 MB
 
   const char* bdev = std::getenv("UMBP_SPDK_BDEV");
   const char* pci = std::getenv("UMBP_SPDK_NVME_PCI");

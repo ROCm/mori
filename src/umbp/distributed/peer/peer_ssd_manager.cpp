@@ -22,8 +22,10 @@
 #include "umbp/distributed/peer/peer_ssd_manager.h"
 
 #include <cstring>
+#include <stdexcept>
 
 #include "mori/utils/mori_log.hpp"
+#include "umbp/local/tiers/spdk_proxy_tier.h"
 #include "umbp/local/tiers/ssd_tier.h"
 #include "umbp/local/tiers/tier_backend.h"
 
@@ -34,13 +36,40 @@ PeerSsdManager::PeerSsdManager(const PeerSsdConfig& cfg) {
     MORI_UMBP_INFO("[PeerSsdManager] constructed disabled (no SSD backend)");
     return;
   }
-  // v1 builds the POSIX/io_uring SSDTier directly from UMBPSsdConfig.  SPDK
-  // backend selection is not wired into the distributed peer path yet (see
-  // PeerSsdConfig TODO); when it is, branch on the backend here.
   const auto& ssd = cfg.ssd;
-  backend_ = std::make_unique<SSDTier>(ssd.storage_dir, ssd.capacity_bytes, ssd);
-  MORI_UMBP_INFO("[PeerSsdManager] SSDTier ready dir={} capacity={}B", ssd.storage_dir,
-                 ssd.capacity_bytes);
+
+  // Explicit backend selection — an unknown value is a configuration error, not
+  // a reason to silently fall back to POSIX.
+  if (ssd.ssd_backend == "posix") {
+    backend_ = std::make_unique<SSDTier>(ssd.storage_dir, ssd.capacity_bytes, ssd);
+    MORI_UMBP_INFO("[PeerSsdManager] SSDTier ready dir={} capacity={}B", ssd.storage_dir,
+                   ssd.capacity_bytes);
+    return;
+  }
+
+  // The distributed peer shares one physical device across processes, so SPDK
+  // is reached through the spdk_proxy daemon, never the single-process direct
+  // SpdkSsdTier.  Both "spdk" and "spdk_proxy" therefore map to SpdkProxyTier:
+  // "spdk" here means "use SPDK via the proxy".
+  if (ssd.ssd_backend == "spdk" || ssd.ssd_backend == "spdk_proxy") {
+    MORI_UMBP_INFO("[PeerSsdManager] distributed ssd_backend={} uses SpdkProxyTier",
+                   ssd.ssd_backend);
+    auto proxy = std::make_unique<SpdkProxyTier>(ssd);
+    // PeerSsdManager only connects to an already-ready proxy; it does not spawn
+    // the daemon.  A connect failure with an explicit SPDK config is fatal — we
+    // must not silently disable SSD or fall back to POSIX.
+    if (!proxy->IsValid()) {
+      throw std::runtime_error("[PeerSsdManager] ssd_backend=" + ssd.ssd_backend +
+                               ": SPDK proxy connect failed (shm=" + ssd.spdk_proxy_shm_name +
+                               "). Ensure the spdk_proxy daemon is running and READY.");
+    }
+    backend_ = std::move(proxy);
+    MORI_UMBP_INFO("[PeerSsdManager] SpdkProxyTier ready (shm={})", ssd.spdk_proxy_shm_name);
+    return;
+  }
+
+  throw std::runtime_error("[PeerSsdManager] unknown ssd_backend='" + ssd.ssd_backend +
+                           "' (expected one of: posix, spdk, spdk_proxy)");
 }
 
 PeerSsdManager::~PeerSsdManager() = default;

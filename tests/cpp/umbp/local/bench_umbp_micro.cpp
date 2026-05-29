@@ -409,7 +409,7 @@ static bool IsSpdk(const BenchConfig& cfg) { return cfg.ssd_backend == "spdk"; }
 static UMBPConfig MakeBaseSsdConfig(const BenchConfig& cfg) {
   UMBPConfig ucfg = IsSpdk(cfg) ? UMBPConfig::FromEnvironment() : UMBPConfig();
   ucfg.ssd.enabled = true;
-  ucfg.ssd_backend = cfg.ssd_backend;
+  ucfg.ssd.ssd_backend = cfg.ssd_backend;
   ucfg.ssd.capacity_bytes = cfg.ssd_capacity;
   ucfg.ssd.io.backend = cfg.ssd_io_backend;
   ucfg.ssd.io.queue_depth = cfg.ssd_io_queue_depth;
@@ -424,7 +424,7 @@ static UMBPConfig MakeBaseSsdConfig(const BenchConfig& cfg, UMBPIoBackend backen
   ucfg.ssd.io.backend = backend;
   ucfg.ssd.io.queue_depth = queue_depth;
   ucfg.ssd.durability.mode = durability;
-  ucfg.ssd_backend = cfg.ssd_backend;
+  ucfg.ssd.ssd_backend = cfg.ssd_backend;
   return ucfg;
 }
 

@@ -373,7 +373,7 @@ static UMBPConfig MakeDummyConfig(size_t dram_bytes, size_t ssd_bytes) {
   UMBPConfig cfg;
   cfg.dram.capacity_bytes = dram_bytes;
   cfg.ssd.enabled = true;
-  cfg.ssd_backend = "dummy_storage";
+  cfg.ssd.ssd_backend = "dummy_storage";
   cfg.ssd.capacity_bytes = ssd_bytes;
   return cfg;
 }

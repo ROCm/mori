@@ -74,7 +74,7 @@ std::chrono::milliseconds ProxyPollInterval() {
 // ---------------------------------------------------------------------------
 // Construction / Destruction
 // ---------------------------------------------------------------------------
-SpdkProxyTier::SpdkProxyTier(const UMBPConfig& config) : TierBackend(StorageTier::LOCAL_SSD) {
+SpdkProxyTier::SpdkProxyTier(const UMBPSsdConfig& config) : TierBackend(StorageTier::LOCAL_SSD) {
   std::string shm_name = config.spdk_proxy_shm_name;
   if (shm_name.empty()) shm_name = kDefaultShmName;
   tenant_id_ = config.spdk_proxy_tenant_id;

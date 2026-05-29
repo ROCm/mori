@@ -317,7 +317,7 @@ static void SetEnvVarFromConfig(const char* name, bool value) {
 }
 
 int LocalStorageManager::SpawnProxyDaemon(const std::string& shm_name) {
-  std::string bin = FindProxyBinary(config_.spdk_proxy_bin);
+  std::string bin = FindProxyBinary(config_.ssd.spdk_proxy_bin);
   MORI_UMBP_INFO("LSM: launching spdk_proxy binary '{}' for shm '{}'", bin, shm_name);
   pid_t pid = fork();
   if (pid < 0) {
@@ -330,21 +330,21 @@ int LocalStorageManager::SpawnProxyDaemon(const std::string& shm_name) {
 
     SetEnvVarFromConfig("UMBP_SPDK_PROXY_SHM", shm_name);
     SetEnvVarFromConfig("UMBP_SPDK_PROXY_MAX_CHANNELS",
-                        static_cast<int>(config_.spdk_proxy_max_channels));
+                        static_cast<int>(config_.ssd.spdk_proxy_max_channels));
     SetEnvVarFromConfig("UMBP_SPDK_PROXY_DATA_PER_CHANNEL_MB",
-                        config_.spdk_proxy_data_per_channel_mb);
+                        config_.ssd.spdk_proxy_data_per_channel_mb);
     SetEnvVarFromConfig("UMBP_SPDK_PROXY_IDLE_EXIT_TIMEOUT_MS",
-                        config_.spdk_proxy_idle_exit_timeout_ms);
-    SetEnvVarFromConfig("UMBP_SPDK_PROXY_ALLOW_BORROW", config_.spdk_proxy_allow_borrow);
+                        config_.ssd.spdk_proxy_idle_exit_timeout_ms);
+    SetEnvVarFromConfig("UMBP_SPDK_PROXY_ALLOW_BORROW", config_.ssd.spdk_proxy_allow_borrow);
     SetEnvVarFromConfig("UMBP_SPDK_PROXY_RESERVED_SHARED_BYTES",
-                        config_.spdk_proxy_reserved_shared_bytes);
+                        config_.ssd.spdk_proxy_reserved_shared_bytes);
     SetEnvVarFromConfig("UMBP_SSD_CAPACITY", config_.ssd.capacity_bytes);
-    SetEnvVarFromConfig("UMBP_SPDK_NVME_PCI", config_.spdk_nvme_pci_addr);
-    SetEnvVarFromConfig("UMBP_SPDK_NVME_CTRL", config_.spdk_nvme_ctrl_name);
-    SetEnvVarFromConfig("UMBP_SPDK_BDEV", config_.spdk_bdev_name);
-    SetEnvVarFromConfig("UMBP_SPDK_REACTOR_MASK", config_.spdk_reactor_mask);
-    SetEnvVarFromConfig("UMBP_SPDK_MEM_MB", config_.spdk_mem_size_mb);
-    SetEnvVarFromConfig("UMBP_SPDK_IO_WORKERS", config_.spdk_io_workers);
+    SetEnvVarFromConfig("UMBP_SPDK_NVME_PCI", config_.ssd.spdk_nvme_pci_addr);
+    SetEnvVarFromConfig("UMBP_SPDK_NVME_CTRL", config_.ssd.spdk_nvme_ctrl_name);
+    SetEnvVarFromConfig("UMBP_SPDK_BDEV", config_.ssd.spdk_bdev_name);
+    SetEnvVarFromConfig("UMBP_SPDK_REACTOR_MASK", config_.ssd.spdk_reactor_mask);
+    SetEnvVarFromConfig("UMBP_SPDK_MEM_MB", config_.ssd.spdk_mem_size_mb);
+    SetEnvVarFromConfig("UMBP_SPDK_IO_WORKERS", config_.ssd.spdk_io_workers);
 
     // Suppress child output unless verbose logging is requested.
     // Uses direct getenv (fork-safe, no spdlog) to check the Mori log level.
@@ -379,9 +379,10 @@ int LocalStorageManager::EnsureProxyDaemon(const std::string& shm_name) {
     MORI_UMBP_ERROR("LSM: proxy protocol version mismatch on SHM '{}'", shm_name);
     return -1;
   }
-  if (!config_.spdk_proxy_auto_start) {
+  if (!config_.ssd.spdk_proxy_auto_start) {
     if (probe == -1) {
-      return SpdkProxyTier::WaitForProxy(shm_name, config_.spdk_proxy_startup_timeout_ms) ? 0 : -1;
+      return SpdkProxyTier::WaitForProxy(shm_name, config_.ssd.spdk_proxy_startup_timeout_ms) ? 0
+                                                                                              : -1;
     }
     MORI_UMBP_ERROR("LSM: SPDK proxy absent on SHM '{}' and auto-start disabled", shm_name);
     return -1;
@@ -397,7 +398,7 @@ int LocalStorageManager::EnsureProxyDaemon(const std::string& shm_name) {
     return -1;
   }
   if (probe == -1) {
-    if (SpdkProxyTier::WaitForProxy(shm_name, config_.spdk_proxy_startup_timeout_ms)) {
+    if (SpdkProxyTier::WaitForProxy(shm_name, config_.ssd.spdk_proxy_startup_timeout_ms)) {
       return 0;
     }
 
@@ -425,7 +426,7 @@ int LocalStorageManager::EnsureProxyDaemon(const std::string& shm_name) {
   ::umbp::proxy::ProxyShmRegion::CleanupStale(shm_name);
   if (SpawnProxyDaemon(shm_name) != 0) return -1;
 
-  return SpdkProxyTier::WaitForProxy(shm_name, config_.spdk_proxy_startup_timeout_ms) ? 0 : -1;
+  return SpdkProxyTier::WaitForProxy(shm_name, config_.ssd.spdk_proxy_startup_timeout_ms) ? 0 : -1;
 }
 #endif
 
@@ -449,12 +450,12 @@ LocalStorageManager::LocalStorageManager(const UMBPConfig& config,
     std::unique_ptr<TierBackend> ssd_backend;
     bool use_proxy = false;
 
-    if (config_.ssd_backend == "spdk") {
+    if (config_.ssd.ssd_backend == "spdk") {
 #ifdef USE_SPDK
       if (role_ == UMBPRole::Standalone) {
         // Standalone with USE_SPDK compiled: try direct SPDK access first
         // (best perf, single process, no proxy overhead).
-        auto spdk_tier = std::make_unique<SpdkSsdTier>(config_);
+        auto spdk_tier = std::make_unique<SpdkSsdTier>(config_.ssd);
         if (spdk_tier->IsValid()) {
           ssd_backend = std::unique_ptr<TierBackend>(spdk_tier.release());
         } else {
@@ -473,42 +474,43 @@ LocalStorageManager::LocalStorageManager(const UMBPConfig& config,
       // (pure POSIX SHM), and the separate spdk_proxy daemon handles NVMe.
       use_proxy = true;
 #endif
-    } else if (config_.ssd_backend == "spdk_proxy") {
+    } else if (config_.ssd.ssd_backend == "spdk_proxy") {
       use_proxy = true;
     }
 
 #ifdef __linux__
     if (use_proxy && !ssd_backend) {
-      std::string proxy_shm_name = config_.spdk_proxy_shm_name;
+      std::string proxy_shm_name = config_.ssd.spdk_proxy_shm_name;
       if (proxy_shm_name.empty()) proxy_shm_name = ::umbp::proxy::kDefaultShmName;
 
       bool proxy_ready = false;
-      if (config_.spdk_proxy_auto_start) {
+      if (config_.ssd.spdk_proxy_auto_start) {
         proxy_ready = (EnsureProxyDaemon(proxy_shm_name) == 0);
       } else {
         proxy_ready =
-            SpdkProxyTier::WaitForProxy(proxy_shm_name, config_.spdk_proxy_startup_timeout_ms);
+            SpdkProxyTier::WaitForProxy(proxy_shm_name, config_.ssd.spdk_proxy_startup_timeout_ms);
       }
 
       if (proxy_ready) {
-        auto proxy_tier = std::make_unique<SpdkProxyTier>(config_);
+        auto proxy_tier = std::make_unique<SpdkProxyTier>(config_.ssd);
         if (proxy_tier->IsValid()) {
           ssd_backend = std::unique_ptr<TierBackend>(proxy_tier.release());
         }
       }
 
       if (!ssd_backend) {
-        bool explicit_spdk = (config_.ssd_backend == "spdk" || config_.ssd_backend == "spdk_proxy");
+        bool explicit_spdk =
+            (config_.ssd.ssd_backend == "spdk" || config_.ssd.ssd_backend == "spdk_proxy");
         if (explicit_spdk) {
           throw std::runtime_error(
-              "UMBP_SSD_BACKEND=" + config_.ssd_backend + ": SPDK proxy connect failed (shm=" +
+              "UMBP_SSD_BACKEND=" + config_.ssd.ssd_backend + ": SPDK proxy connect failed (shm=" +
               proxy_shm_name + "). Run 'tools/umbp_spdk_preflight.sh --pci <addr>' to diagnose.");
         }
         fprintf(stderr, "[UMBP WARN] SPDK proxy connect failed. Falling back to POSIX SSD.\n");
       }
     }
 #endif
-    if (!ssd_backend && config_.ssd_backend == "dummy_storage") {
+    if (!ssd_backend && config_.ssd.ssd_backend == "dummy_storage") {
       ssd_backend = std::make_unique<DummySsdTier>(config_.ssd.capacity_bytes);
     }
 

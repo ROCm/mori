@@ -85,6 +85,32 @@ struct UMBPSsdConfig {
   UMBPIoConfig io;
   UMBPDurabilityConfig durability;
 
+  // SSD backend selection. "posix" uses the segmented-log SSDTier; "spdk" /
+  // "spdk_proxy" use the SPDK NVMe path (direct SpdkSsdTier in standalone, or
+  // SpdkProxyTier when sharing the device across processes).  Kept here (rather
+  // than at UMBPConfig top level) so both the standalone LocalStorageManager and
+  // the distributed PeerSsdManager select the backend from the same config.
+  std::string ssd_backend = "posix";      // "posix" or "spdk"
+  std::string spdk_bdev_name;             // e.g. "Malloc0" or "NVMe0n1"
+  std::string spdk_reactor_mask = "0x1";  // CPU core mask for SPDK reactors
+  int spdk_mem_size_mb = 256;             // DPDK hugepage limit (MB)
+  std::string spdk_nvme_pci_addr;         // PCI BDF, e.g. "0000:47:00.0"
+  std::string spdk_nvme_ctrl_name = "NVMe0";
+  int spdk_io_workers = 4;  // Internal I/O worker threads for SpdkSsdTier batch ops
+
+  // SPDK Proxy configuration
+  std::string spdk_proxy_shm_name = "/umbp_spdk_proxy";
+  uint32_t spdk_proxy_tenant_id = 0;
+  size_t spdk_proxy_tenant_quota_bytes = 0;
+  uint32_t spdk_proxy_max_channels = 8;
+  size_t spdk_proxy_data_per_channel_mb = 32;  // MB of SHM data region per channel
+  std::string spdk_proxy_bin;                  // Path to spdk_proxy binary (empty = search PATH)
+  int spdk_proxy_startup_timeout_ms = 30000;   // Max ms to wait for proxy READY
+  bool spdk_proxy_auto_start = true;
+  int spdk_proxy_idle_exit_timeout_ms = 30000;
+  bool spdk_proxy_allow_borrow = false;
+  size_t spdk_proxy_reserved_shared_bytes = 0;
+
   // Focused validation for the SSD tier alone (used by SSDTier, which depends
   // on UMBPSsdConfig rather than the whole UMBPConfig).  UMBPConfig::Validate()
   // remains the global validator.
@@ -93,6 +119,12 @@ struct UMBPSsdConfig {
     // when the tier is actually enabled (mirrors UMBPConfig::Validate's
     // `if (ssd.enabled)` gate).
     if (!enabled) return true;
+    if (ssd_backend != "posix" && ssd_backend != "spdk" && ssd_backend != "spdk_proxy" &&
+        ssd_backend != "dummy_storage") {
+      if (error_message)
+        *error_message = "ssd.ssd_backend must be one of: posix, spdk, spdk_proxy, dummy_storage";
+      return false;
+    }
     if (capacity_bytes == 0) {
       if (error_message) *error_message = "ssd.capacity_bytes must be > 0";
       return false;
@@ -163,28 +195,6 @@ struct UMBPConfig {
   UMBPEvictionConfig eviction;
   UMBPCopyPipelineConfig copy_pipeline;
 
-  // SPDK SSD tier configuration (only used when ssd_backend == "spdk")
-  std::string ssd_backend = "posix";      // "posix" or "spdk"
-  std::string spdk_bdev_name;             // e.g. "Malloc0" or "NVMe0n1"
-  std::string spdk_reactor_mask = "0x1";  // CPU core mask for SPDK reactors
-  int spdk_mem_size_mb = 256;             // DPDK hugepage limit (MB)
-  std::string spdk_nvme_pci_addr;         // PCI BDF, e.g. "0000:47:00.0"
-  std::string spdk_nvme_ctrl_name = "NVMe0";
-  int spdk_io_workers = 4;  // Internal I/O worker threads for SpdkSsdTier batch ops
-
-  // SPDK Proxy configuration
-  std::string spdk_proxy_shm_name = "/umbp_spdk_proxy";
-  uint32_t spdk_proxy_tenant_id = 0;
-  size_t spdk_proxy_tenant_quota_bytes = 0;
-  uint32_t spdk_proxy_max_channels = 8;
-  size_t spdk_proxy_data_per_channel_mb = 32;  // MB of SHM data region per channel
-  std::string spdk_proxy_bin;                  // Path to spdk_proxy binary (empty = search PATH)
-  int spdk_proxy_startup_timeout_ms = 30000;   // Max ms to wait for proxy READY
-  bool spdk_proxy_auto_start = true;
-  int spdk_proxy_idle_exit_timeout_ms = 30000;
-  bool spdk_proxy_allow_borrow = false;
-  size_t spdk_proxy_reserved_shared_bytes = 0;
-
   // Role is the source of truth for runtime behavior.
   UMBPRole role = UMBPRole::Standalone;
 
@@ -243,8 +253,8 @@ struct UMBPConfig {
       if (error_message) *error_message = "copy_pipeline.batch_max_ops must be > 0";
       return false;
     }
-    if (spdk_proxy_max_channels == 0) {
-      if (error_message) *error_message = "spdk_proxy_max_channels must be > 0";
+    if (ssd.spdk_proxy_max_channels == 0) {
+      if (error_message) *error_message = "ssd.spdk_proxy_max_channels must be > 0";
       return false;
     }
     if (distributed.has_value()) {
@@ -299,47 +309,47 @@ struct UMBPConfig {
     cfg.dram.numa_node = getenv_int("UMBP_DRAM_NUMA_NODE", cfg.dram.numa_node);
     cfg.dram.prefault = getenv_int("UMBP_DRAM_PREFAULT", cfg.dram.prefault ? 1 : 0) != 0;
 
-    cfg.ssd_backend = getenv_str("UMBP_SSD_BACKEND", cfg.ssd_backend);
-    if (cfg.ssd_backend == "posix" && !std::getenv("UMBP_SSD_BACKEND") &&
+    cfg.ssd.ssd_backend = getenv_str("UMBP_SSD_BACKEND", cfg.ssd.ssd_backend);
+    if (cfg.ssd.ssd_backend == "posix" && !std::getenv("UMBP_SSD_BACKEND") &&
         std::getenv("UMBP_SPDK_NVME_PCI")) {
-      cfg.ssd_backend = "spdk";
+      cfg.ssd.ssd_backend = "spdk";
     }
-    cfg.spdk_bdev_name = getenv_str("UMBP_SPDK_BDEV", cfg.spdk_bdev_name);
-    cfg.spdk_reactor_mask = getenv_str("UMBP_SPDK_REACTOR_MASK", cfg.spdk_reactor_mask);
-    cfg.spdk_mem_size_mb = getenv_int("UMBP_SPDK_MEM_MB", cfg.spdk_mem_size_mb);
-    cfg.spdk_nvme_pci_addr = getenv_str("UMBP_SPDK_NVME_PCI", cfg.spdk_nvme_pci_addr);
-    cfg.spdk_nvme_ctrl_name = getenv_str("UMBP_SPDK_NVME_CTRL", cfg.spdk_nvme_ctrl_name);
-    cfg.spdk_io_workers = getenv_int("UMBP_SPDK_IO_WORKERS", cfg.spdk_io_workers);
+    cfg.ssd.spdk_bdev_name = getenv_str("UMBP_SPDK_BDEV", cfg.ssd.spdk_bdev_name);
+    cfg.ssd.spdk_reactor_mask = getenv_str("UMBP_SPDK_REACTOR_MASK", cfg.ssd.spdk_reactor_mask);
+    cfg.ssd.spdk_mem_size_mb = getenv_int("UMBP_SPDK_MEM_MB", cfg.ssd.spdk_mem_size_mb);
+    cfg.ssd.spdk_nvme_pci_addr = getenv_str("UMBP_SPDK_NVME_PCI", cfg.ssd.spdk_nvme_pci_addr);
+    cfg.ssd.spdk_nvme_ctrl_name = getenv_str("UMBP_SPDK_NVME_CTRL", cfg.ssd.spdk_nvme_ctrl_name);
+    cfg.ssd.spdk_io_workers = getenv_int("UMBP_SPDK_IO_WORKERS", cfg.ssd.spdk_io_workers);
 
-    cfg.spdk_proxy_shm_name = getenv_str("UMBP_SPDK_PROXY_SHM", cfg.spdk_proxy_shm_name);
-    cfg.spdk_proxy_tenant_id = static_cast<uint32_t>(
-        getenv_int("UMBP_SPDK_PROXY_TENANT_ID", static_cast<int>(cfg.spdk_proxy_tenant_id)));
-    cfg.spdk_proxy_tenant_quota_bytes =
-        getenv_size("UMBP_SPDK_PROXY_TENANT_QUOTA_BYTES", cfg.spdk_proxy_tenant_quota_bytes);
+    cfg.ssd.spdk_proxy_shm_name = getenv_str("UMBP_SPDK_PROXY_SHM", cfg.ssd.spdk_proxy_shm_name);
+    cfg.ssd.spdk_proxy_tenant_id = static_cast<uint32_t>(
+        getenv_int("UMBP_SPDK_PROXY_TENANT_ID", static_cast<int>(cfg.ssd.spdk_proxy_tenant_id)));
+    cfg.ssd.spdk_proxy_tenant_quota_bytes =
+        getenv_size("UMBP_SPDK_PROXY_TENANT_QUOTA_BYTES", cfg.ssd.spdk_proxy_tenant_quota_bytes);
 
     const char* max_channels_env = std::getenv("UMBP_SPDK_PROXY_MAX_CHANNELS");
     if (!max_channels_env) max_channels_env = std::getenv("UMBP_SPDK_PROXY_MAX_RANKS");
     if (max_channels_env) {
-      cfg.spdk_proxy_max_channels = static_cast<uint32_t>(std::atoi(max_channels_env));
+      cfg.ssd.spdk_proxy_max_channels = static_cast<uint32_t>(std::atoi(max_channels_env));
     }
 
     const char* data_mb_env = std::getenv("UMBP_SPDK_PROXY_DATA_PER_CHANNEL_MB");
     if (!data_mb_env) data_mb_env = std::getenv("UMBP_SPDK_PROXY_DATA_MB");
     if (data_mb_env) {
-      cfg.spdk_proxy_data_per_channel_mb = static_cast<size_t>(std::stoull(data_mb_env));
+      cfg.ssd.spdk_proxy_data_per_channel_mb = static_cast<size_t>(std::stoull(data_mb_env));
     }
 
-    cfg.spdk_proxy_bin = getenv_str("UMBP_SPDK_PROXY_BIN", cfg.spdk_proxy_bin);
-    cfg.spdk_proxy_startup_timeout_ms =
-        getenv_int("UMBP_SPDK_PROXY_TIMEOUT_MS", cfg.spdk_proxy_startup_timeout_ms);
-    cfg.spdk_proxy_auto_start =
-        getenv_int("UMBP_SPDK_PROXY_AUTO_START", cfg.spdk_proxy_auto_start ? 1 : 0) != 0;
-    cfg.spdk_proxy_idle_exit_timeout_ms =
-        getenv_int("UMBP_SPDK_PROXY_IDLE_EXIT_TIMEOUT_MS", cfg.spdk_proxy_idle_exit_timeout_ms);
-    cfg.spdk_proxy_allow_borrow =
-        getenv_int("UMBP_SPDK_PROXY_ALLOW_BORROW", cfg.spdk_proxy_allow_borrow ? 1 : 0) != 0;
-    cfg.spdk_proxy_reserved_shared_bytes =
-        getenv_size("UMBP_SPDK_PROXY_RESERVED_SHARED_BYTES", cfg.spdk_proxy_reserved_shared_bytes);
+    cfg.ssd.spdk_proxy_bin = getenv_str("UMBP_SPDK_PROXY_BIN", cfg.ssd.spdk_proxy_bin);
+    cfg.ssd.spdk_proxy_startup_timeout_ms =
+        getenv_int("UMBP_SPDK_PROXY_TIMEOUT_MS", cfg.ssd.spdk_proxy_startup_timeout_ms);
+    cfg.ssd.spdk_proxy_auto_start =
+        getenv_int("UMBP_SPDK_PROXY_AUTO_START", cfg.ssd.spdk_proxy_auto_start ? 1 : 0) != 0;
+    cfg.ssd.spdk_proxy_idle_exit_timeout_ms =
+        getenv_int("UMBP_SPDK_PROXY_IDLE_EXIT_TIMEOUT_MS", cfg.ssd.spdk_proxy_idle_exit_timeout_ms);
+    cfg.ssd.spdk_proxy_allow_borrow =
+        getenv_int("UMBP_SPDK_PROXY_ALLOW_BORROW", cfg.ssd.spdk_proxy_allow_borrow ? 1 : 0) != 0;
+    cfg.ssd.spdk_proxy_reserved_shared_bytes = getenv_size(
+        "UMBP_SPDK_PROXY_RESERVED_SHARED_BYTES", cfg.ssd.spdk_proxy_reserved_shared_bytes);
 
     std::string role_str = getenv_str("UMBP_ROLE", "");
     if (role_str == "leader")
