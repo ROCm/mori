@@ -6,6 +6,7 @@
 
 #include "mori/application/transport/rdma/rdma.hpp"
 #include "mori/cco/cco_types.hpp"
+#include "mori/cco/gda/gda_device_types.hpp"
 #include "mori/core/transport/rdma/device_primitives.hpp"
 #include "mori/core/transport/rdma/providers/bnxt/bnxt_device_primitives.hpp"
 #include "mori/core/transport/rdma/providers/ionic/ionic_device_primitives.hpp"
@@ -176,8 +177,9 @@ __device__ inline static uint64_t buildFlushDbrVal(core::WorkQueueHandle* wq, ui
     // BNXT: reconstruct db header
     uint8_t flags = (postIdx >> (__ffs(wq->sqWqeNum) - 1)) & 0x1;
     uint32_t epoch = (flags & BNXT_RE_FLAG_EPOCH_TAIL_MASK) << BNXT_RE_DB_EPOCH_TAIL_SHIFT;
-    return bnxt_re_init_db_hdr(((postIdx & (wq->sqWqeNum - 1)) * BNXT_RE_NUM_SLOT_PER_WQE) | epoch,
-                               0, qpn, BNXT_RE_QUE_TYPE_SQ);
+    return core::bnxt_re_init_db_hdr(
+        ((postIdx & (wq->sqWqeNum - 1)) * BNXT_RE_NUM_SLOT_PER_WQE) | epoch, 0, qpn,
+        BNXT_RE_QUE_TYPE_SQ);
   }
 }
 
