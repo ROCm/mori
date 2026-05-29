@@ -84,7 +84,8 @@ int64_t BuildArgs(mori::moe::EpDispatchCombineHandle& handle, int rdmaBlockNum, 
   return reinterpret_cast<int64_t>(&args);
 }
 
-// BuildArgs variant that reads routing from caller-owned tensors; replayMode toggles cache vs replay routing.
+// BuildArgs variant that reads routing from caller-owned tensors; replayMode toggles cache vs
+// replay routing.
 int64_t BuildArgsWithRouting(mori::moe::EpDispatchCombineHandle& handle, int rdmaBlockNum,
                              int hiddenDim, int useExternalInpBuf, bool replayMode,
                              int64_t disp_dest_tok_id_map_ptr,

@@ -535,7 +535,8 @@ class EpDispatchCombineTestCase:
                 rank_counts[ur] += 1  # All ranks that receive this token
 
                 dst_nodes = {
-                    int(dst_rank // self.config.gpu_per_node) for dst_rank in ur.tolist()
+                    int(dst_rank // self.config.gpu_per_node)
+                    for dst_rank in ur.tolist()
                 }
 
                 for dst_rank in ur.tolist():
