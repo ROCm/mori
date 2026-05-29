@@ -84,7 +84,7 @@ inline size_t GetHipDataTypeSize(hipDataType dtype) {
 
 using index_t = int32_t;
 
-// Caller-owned routing pointers for DeepEP-style cached-mode dispatch/combine.
+// Caller-owned routing pointers for cached/replay routing dispatch/combine.
 // All fields must be non-null when passed to GetEpDispatchCombineArgsRaw(..., routing, ...).
 struct EpDispatchCombineRoutingPtrs {
   index_t* dispDestTokIdMap{nullptr};
@@ -541,7 +541,7 @@ EpDispatchCombineArgsRaw GetEpDispatchCombineArgsRaw(const EpDispatchCombineHand
                                                      int rdmaBlockNum);
 
 // Routing-handle overload: routing pointers come from caller-owned tensors;
-// `replayMode` selects mode-1 vs mode-2 dispatch (combine always passes false).
+// `replayMode` selects cache vs replay routing dispatch (combine always passes false).
 EpDispatchCombineArgsRaw GetEpDispatchCombineArgsRaw(const EpDispatchCombineHandle& handle,
                                                      int rdmaBlockNum,
                                                      const EpDispatchCombineRoutingPtrs* routing,

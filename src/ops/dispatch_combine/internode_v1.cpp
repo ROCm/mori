@@ -63,11 +63,11 @@ inline __device__ void DispatchIntraNodeBlock(EpDispatchCombineArgs<T>& args, in
     }
     destTokId = __shfl(destTokId, 0);
   } else {
-    // Replay: reuse the slot recorded by a prior mode-1.
+    // Replay routing: reuse the slot recorded by a prior cache-routing dispatch.
     index_t flat = args.dispDestTokIdMap[tokenExpertId];
     destTokId = LocalTokIdFromFlatTokenIndex(config, flat);
   }
-  // Skip per-PE counter in replay mode (caller's totalRecvTokenNum is already correct).
+  // Skip per-PE counter in replay routing (caller's totalRecvTokenNum is already correct).
   if (!args.replayMode && laneId == (destPe % config.gpuPerNode)) localPeTokenCounter++;
   size_t srcTokOffset = tokenId * hiddenDim;
   size_t destTokOffset = destTokId * hiddenDim;
@@ -183,7 +183,7 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
 
         if (num == 0) continue;
 
-        // atomicAdd runs in both modes so blockFlagCounter stays in sync with mode-1.
+        // atomicAdd runs in both paths so blockFlagCounter stays in sync with cache routing.
         index_t flag = 0;
         index_t flagSlotId = 0;
         if (laneId == 0) {

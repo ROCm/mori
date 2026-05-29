@@ -177,7 +177,7 @@ def test_dispatch_combine(
 
 
 # ---------------------------------------------------------------------------
-# DeepEP-style -1 sentinel tests (InterNodeV1, default dispatch/combine path)
+# -1 routing sentinel tests (InterNodeV1, default dispatch/combine path)
 # gpu_per_node=4: 2 nodes × 4 GPUs — exercises RDMA send/recv with sentinels
 # gpu_per_node=8: 1 node × 8 GPUs — XGMI-only paths inside InterNodeV1
 # ---------------------------------------------------------------------------
@@ -241,7 +241,7 @@ def test_dispatch_combine_minus_one_sentinel(
     gpu_per_node,
     sentinel_pattern,
 ):
-    """InterNodeV1 dispatch + combine must skip DeepEP-style -1 routing entries."""
+    """InterNodeV1 dispatch + combine must skip -1 routing sentinel entries."""
     for _ in range(world_size):
         torch_dist_process_manager.task_queue.put(
             (

@@ -19,7 +19,7 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""DeepEP-style routing-handle (cached-mode) tests for IntraNode and InterNodeV1."""
+"""Cached/replay routing-handle tests for IntraNode and InterNodeV1."""
 import pytest
 import torch
 import mori
@@ -120,7 +120,7 @@ def _do_combine(op, dispatch_out, indices_local, *, routing=None):
 
 
 def _default_vs_routing_handle_parity(rank, world_size, kernel, gpu_per_node=None):
-    """Mode-1 default path (op-owned buffers) vs routing-handle path must match."""
+    """Default-path (op-owned buffers) vs routing-handle cache/replay path must match."""
     config = (
         _make_intranode_config(rank, world_size)
         if kernel == "intra"
@@ -174,7 +174,7 @@ def _replay_correctness(rank, world_size, kernel, gpu_per_node=None):
     combine_out, _ = _do_combine(op, fwd_disp, rank_idx, routing=R)
     tc.sync()
 
-    # Mode-2 dispatch with same indices but a different payload.
+    # Replay-routing dispatch with same indices but a different payload.
     rng = torch.Generator(device=torch.device("cuda", rank))
     rng.manual_seed(91234 + rank)
     grad_input = torch.randn(
@@ -213,12 +213,12 @@ def _replay_correctness(rank, world_size, kernel, gpu_per_node=None):
     if kernel == "v1" and n_nodes > 1:
         assert pre_inter_send.abs().sum() > 0 or pre_inter_dest.abs().sum() > 0, (
             f"rank {rank}: expected non-zero inter-node routing maps after "
-            f"mode-1 dispatch (n_nodes={n_nodes})"
+            f"cache-routing dispatch (n_nodes={n_nodes})"
         )
 
     assert rep_disp["total_recv"] == fwd_disp["total_recv"], (
         f"rank {rank}: replay total_recv {rep_disp['total_recv']} differs from "
-        f"mode-1 total_recv {fwd_disp['total_recv']}"
+        f"cache-routing total_recv {fwd_disp['total_recv']}"
     )
     assert combine_out is not None
 

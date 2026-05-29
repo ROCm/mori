@@ -525,20 +525,17 @@ class EpDispatchCombineTestCase:
         for src_rank, indices in enumerate(all_rank_indices):
             src_node = src_rank // self.config.gpu_per_node
 
-            # Map expert IDs to rank IDs
-            token_ranks = (
-                indices // self.config.num_experts_per_rank
-            )  # [num_tokens, num_experts_per_token]
+            # Per token, map valid expert IDs to destination ranks (skip -1 sentinels).
+            for row in indices:
+                valid_experts = row[row >= 0]
+                if valid_experts.numel() == 0:
+                    continue
+                ur = torch.unique(valid_experts // self.config.num_experts_per_rank)
 
-            # Deduplicate rank IDs per token
-            unique_ranks_per_token = [torch.unique(row) for row in token_ranks]
-
-            # For each token, update counts
-            for ur in unique_ranks_per_token:
                 rank_counts[ur] += 1  # All ranks that receive this token
 
                 dst_nodes = {
-                    dst_rank // self.config.gpu_per_node for dst_rank in ur.tolist()
+                    int(dst_rank // self.config.gpu_per_node) for dst_rank in ur.tolist()
                 }
 
                 for dst_rank in ur.tolist():
@@ -813,15 +810,13 @@ class EpDispatchCombineTestCase:
     def test_sentinel_dispatch_combine(
         self, sentinel_pattern="every_other", num_rounds=50
     ):
-        """Default-path dispatch/combine with DeepEP-style -1 expert sentinels."""
-        if self.config.kernel_type not in (
-            mori.ops.EpDispatchCombineKernelType.InterNodeV1,
-            mori.ops.EpDispatchCombineKernelType.InterNodeV1LL,
-        ):
+        """Default-path dispatch/combine with -1 routing sentinel expert IDs."""
+        # -1 sentinel skipping is implemented for IntraNode and InterNodeV1 only.
+        if self.config.kernel_type != mori.ops.EpDispatchCombineKernelType.InterNodeV1:
             if self.rank == 0:
                 print(
-                    "test_sentinel_dispatch_combine: skipping non-V1 kernel "
-                    f"{self.config.kernel_type}"
+                    "test_sentinel_dispatch_combine: skipping kernel without "
+                    f"-1 sentinel support ({self.config.kernel_type})"
                 )
             return
         error_round = set()
@@ -1788,7 +1783,7 @@ parser.add_argument(
     type=str,
     default="every_other",
     help=(
-        "DeepEP-style -1 sentinel injection for test_sentinel: every_other, "
+        "-1 routing sentinel injection for test_sentinel: every_other, "
         "first_only, or an integer suffix count (e.g. 1)."
     ),
 )

@@ -68,7 +68,7 @@ def _current_stream():
 
 @dataclass
 class EpDispatchRoutingHandle:
-    """Per-call routing snapshot from mode-1 dispatch, replayed by combine / mode-2 dispatch."""
+    """Per-call routing snapshot from cache-routing dispatch, replayed by combine / replay-routing dispatch."""
 
     disp_dest_tok_id_map: torch.Tensor
     inter_node_disp_dest_tok_id_map: torch.Tensor
@@ -539,7 +539,7 @@ class EpDispatchCombineOp:
 
     @staticmethod
     def _routing_source_token_count(routing: EpDispatchRoutingHandle) -> int:
-        """Return the mode-1 source token count stored in a routing handle."""
+        """Return the cache-routing source token count stored in a routing handle."""
         n = int(routing.cur_rank_num_token)
         if n <= 0:
             raise ValueError(
@@ -596,7 +596,7 @@ class EpDispatchCombineOp:
             raise NotImplementedError(
                 f"routing handle path not supported for kernel_type="
                 f"{self.config.kernel_type}; only IntraNode and InterNodeV1 "
-                "expose mode-1/mode-2 dispatch."
+                "expose cache/replay routing dispatch."
             )
         if return_routing:
             routing = self._alloc_routing_handle()
@@ -607,6 +607,11 @@ class EpDispatchCombineOp:
             if num_tokens != replay_n:
                 raise ValueError(
                     f"replay dispatch input has {num_tokens} tokens but "
+                    f"routing.cur_rank_num_token={replay_n}"
+                )
+            if int(indices.size(0)) != replay_n:
+                raise ValueError(
+                    f"replay dispatch indices has {int(indices.size(0))} tokens but "
                     f"routing.cur_rank_num_token={replay_n}"
                 )
 
@@ -723,6 +728,8 @@ class EpDispatchCombineOp:
             from mori.ops.local_expert_count import launch_local_expert_count
 
             _, _, _, outI_ptr, total_ptr = self._dispatch_out_ptrs
+            if use_routing_handle:
+                total_ptr = routing.total_recv_token_num.data_ptr()
             launch_local_expert_count(
                 self._cpp_config,
                 outI_ptr,
@@ -854,6 +861,14 @@ class EpDispatchCombineOp:
                 f"{self.config.kernel_type}; only IntraNode and InterNodeV1 "
                 "currently consume routing handles in combine."
             )
+
+        if routing is not None:
+            routing_n = self._routing_source_token_count(routing)
+            if int(indices.size(0)) != routing_n:
+                raise ValueError(
+                    f"combine indices has {int(indices.size(0))} tokens but "
+                    f"routing.cur_rank_num_token={routing_n}"
+                )
 
         hidden_dim = input.size(1)
         weight_ptr = (

@@ -595,7 +595,7 @@ class EpDispatchCombineTestCase:
             return
 
         for i in range(all_rank_num_token[self.config.rank]):
-            # Ignore DeepEP-style -1 sentinels: they should be skipped by
+            # Ignore -1 routing sentinels: they should be skipped by
             # both dispatch and combine, so they contribute no PE to the
             # expected unique-PE multiplier.
             pes = [

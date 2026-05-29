@@ -352,7 +352,7 @@ def test_dispatch_combine_max_total_recv_tokens_under_budget(
 # ---------------------------------------------------------------------------
 
 
-# DeepEP-style -1 sentinel tests (IntraNode only)
+# -1 routing sentinel tests (IntraNode only)
 
 
 @pytest.mark.parametrize("world_size", (8,))
@@ -375,7 +375,7 @@ def test_dispatch_combine_minus_one_sentinel(
     num_experts_per_token,
     sentinel_pattern,
 ):
-    """Dispatch + combine must treat -1 routing entries as DeepEP-style sentinels."""
+    """Dispatch + combine must treat -1 routing entries as routing sentinels."""
     for _ in range(world_size):
         torch_dist_process_manager.task_queue.put(
             (

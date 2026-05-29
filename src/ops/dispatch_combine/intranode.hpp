@@ -112,13 +112,13 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       index_t destTokId = 0;
 
       if (!args.replayMode) {
-        // Mode-1 (DeepEP-style cached-mode "first call"): decide where this
-        // (token, top-k) pair goes via atomicAdd-based slot assignment. Records
-        // the routing into dispDestTokIdMap (and the symmetric local view via
-        // dispTokIdToSrcTokIdMemObj on the destination PE) so a later mode-2
-        // dispatch / combine can replay the same layout deterministically.
+        // Cache routing: decide where this (token, top-k) pair goes via
+        // atomicAdd-based slot assignment. Records the routing into dispDestTokIdMap
+        // (and the symmetric local view via dispTokIdToSrcTokIdMemObj on the
+        // destination PE) so a later replay-routing dispatch / combine can reuse
+        // the same layout deterministically.
         index_t destExpert = args.tokenIndices[i];
-        // DeepEP-style sentinel: a negative expert id means "drop this top-k slot".
+        // Routing sentinel: a negative expert id means "drop this top-k slot".
         // Skip the dispatch entirely and write the existing combine-side null sentinel
         // (PE == worldSize) into dispDestTokIdMap so combine treats this slot as nullptr.
         if (destExpert < 0) {
@@ -156,10 +156,10 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
         }
         destTokId = __shfl(destTokId, 0);
       } else {
-        // Mode-2 (replay): caller already supplied a populated dispDestTokIdMap
-        // from a matching mode-1 dispatch. Recover (destPe, destTokId) directly
+        // Replay routing: caller already supplied a populated dispDestTokIdMap
+        // from a matching cache-routing dispatch. Recover (destPe, destTokId) directly
         // and skip CAS / dedup / cross-rank src-id writes. The sentinel slot
-        // (destPe == worldSize) means the original mode-1 dropped or deduped
+        // (destPe == worldSize) means the original cache-routing dispatch dropped or deduped
         // this top-k slot, so we skip transmitting payload as well.
         index_t flat = args.dispDestTokIdMap[i];
         destPe = PeFromFlatTokenIndex(config, flat);
