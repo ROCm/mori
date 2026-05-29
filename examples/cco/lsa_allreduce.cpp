@@ -45,12 +45,12 @@
 #include "args_parser.hpp"
 #include "mori/cco/cco_api.hpp"
 #include "mori/cco/cco_device_api.hpp"
-#include "mori/cco/cco_group.hpp"
+#include "mori/cco/cco_coop.hpp"
 #include "mori/cco/cco_lsa_impl.hpp"
 #include "mori/cco/cco_lsa_types.hpp"
 #include "mori/cco/cco_types.hpp"
 
-#define NELEMS  (4)  // tiny vector: rank r contributes (r,r,r,r)
+#define NELEMS  (32)  // tiny vector: rank r contributes (r,r,r,r)
 
 using namespace mori::cco;
 
@@ -79,8 +79,8 @@ __global__ void lsa_allreduce_block_kernel(ccoDevComm* devComm,
                                            ccoWindow_t sendWin, size_t sendOff,
                                            ccoWindow_t recvWin, size_t recvOff,
                                            size_t count) {
-  ccoBlockGroup g;
-  ccoLsaBarrierSession<ccoBlockGroup> bar(g, devComm, devComm->lsaBarrier, 0);
+  ccoCoopBlock g;
+  ccoLsaBarrierSession<ccoCoopBlock> bar(g, devComm, devComm->lsaBarrier, 0);
   bar.sync(g);
 
   const int lsaSize = devComm->lsaSize;
@@ -105,8 +105,8 @@ __global__ void lsa_allreduce_warp_kernel(ccoDevComm* devComm,
                                           ccoWindow_t sendWin, size_t sendOff,
                                           ccoWindow_t recvWin, size_t recvOff,
                                           size_t count) {
-  ccoWarpGroup g;
-  ccoLsaBarrierSession<ccoWarpGroup> bar(g, devComm, devComm->lsaBarrier, 0);
+  ccoCoopWarp g;
+  ccoLsaBarrierSession<ccoCoopWarp> bar(g, devComm, devComm->lsaBarrier, 0);
   bar.sync(g);
 
   const int lsaSize = devComm->lsaSize;
@@ -133,8 +133,8 @@ __global__ void lsa_allreduce_thread_kernel(ccoDevComm* devComm,
                                             ccoWindow_t sendWin, size_t sendOff,
                                             ccoWindow_t recvWin, size_t recvOff,
                                             size_t count) {
-  ccoThreadGroup g;
-  ccoLsaBarrierSession<ccoThreadGroup> bar(g, devComm, devComm->lsaBarrier, 0);
+  ccoCoopThread g;
+  ccoLsaBarrierSession<ccoCoopThread> bar(g, devComm, devComm->lsaBarrier, 0);
   bar.sync(g);
 
   const int lsaSize = devComm->lsaSize;

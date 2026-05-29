@@ -30,7 +30,7 @@ namespace cco {
 namespace gda {
 
 // ============================================================================
-// Cooperative Group Types (AMD wavefront = 64 threads)
+// Cooperative Coop Types (AMD wavefront = 64 threads)
 // ============================================================================
 
 struct ccoCoopThread {

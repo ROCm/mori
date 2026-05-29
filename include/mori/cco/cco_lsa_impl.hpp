@@ -27,8 +27,8 @@
 namespace mori {
 namespace cco {
 
-template <typename Group>
-__device__ inline ccoLsaBarrierSession<Group>::ccoLsaBarrierSession(Group grp, ccoDevComm_t comm,
+template <typename Coop>
+__device__ inline ccoLsaBarrierSession<Coop>::ccoLsaBarrierSession(Coop grp, ccoDevComm_t comm,
                                                                     ccoLsaBarrierHandle h,
                                                                     uint32_t idx)
     : group(grp), comm(comm), handle(h), index(idx) {
@@ -46,8 +46,8 @@ __device__ inline ccoLsaBarrierSession<Group>::ccoLsaBarrierSession(Group grp, c
   this->epoch = state[h.nBarriers + idx];  // unicast epoch slot
 }
 
-template <typename Group>
-__device__ inline ccoLsaBarrierSession<Group>::~ccoLsaBarrierSession() {
+template <typename Coop>
+__device__ inline ccoLsaBarrierSession<Coop>::~ccoLsaBarrierSession() {
   // Persist epoch so the next session on this barrier slot resumes correctly.
   const auto& rw = this->comm->resourceWindow_inlined;
   char* base = rw.winBase + ((uint64_t)this->comm->lsaRank * rw.stride4G << 32);
@@ -58,8 +58,8 @@ __device__ inline ccoLsaBarrierSession<Group>::~ccoLsaBarrierSession() {
   this->group.sync();
 }
 
-template <typename Group>
-__device__ inline void ccoLsaBarrierSession<Group>::arrive(Group) {
+template <typename Coop>
+__device__ inline void ccoLsaBarrierSession<Coop>::arrive(Coop) {
   this->group.sync();
 
   const int nranks = this->comm->lsaSize;
@@ -73,9 +73,9 @@ __device__ inline void ccoLsaBarrierSession<Group>::arrive(Group) {
   }
 }
 
-template <typename Group>
+template <typename Coop>
 template <bool EnableTimeout>
-__device__ inline int ccoLsaBarrierSession<Group>::waitInternal(Group, uint64_t timeoutCycles) {
+__device__ inline int ccoLsaBarrierSession<Coop>::waitInternal(Coop, uint64_t timeoutCycles) {
   const int nranks = this->comm->lsaSize;
   const int myRank = this->comm->lsaRank;
   int ret = 0;
@@ -109,24 +109,24 @@ done:
   return ret;
 }
 
-template <typename Group>
-__device__ inline void ccoLsaBarrierSession<Group>::wait(Group g) {
+template <typename Coop>
+__device__ inline void ccoLsaBarrierSession<Coop>::wait(Coop g) {
   this->template waitInternal</* DisableTimeout */ false>(g, 0ULL);
 }
 
-template <typename Group>
-__device__ inline int ccoLsaBarrierSession<Group>::wait(Group g, uint64_t timeoutCycles) {
+template <typename Coop>
+__device__ inline int ccoLsaBarrierSession<Coop>::wait(Coop g, uint64_t timeoutCycles) {
   return this->template waitInternal</* EnableTimeout */ true>(g, timeoutCycles);
 }
 
-template <typename Group>
-__device__ inline void ccoLsaBarrierSession<Group>::sync(Group g) {
+template <typename Coop>
+__device__ inline void ccoLsaBarrierSession<Coop>::sync(Coop g) {
   this->arrive(g);
   this->wait(g);
 }
 
-template <typename Group>
-__device__ inline int ccoLsaBarrierSession<Group>::sync(Group g, uint64_t timeoutCycles) {
+template <typename Coop>
+__device__ inline int ccoLsaBarrierSession<Coop>::sync(Coop g, uint64_t timeoutCycles) {
   this->arrive(g);
   return this->wait(g, timeoutCycles);
 }

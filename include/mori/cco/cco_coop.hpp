@@ -27,8 +27,8 @@
 namespace mori {
 namespace cco {
 
-// Concrete group types used as the `Group` template arg of
-// ccoLsaBarrierSession<Group>. Each must provide:
+// Concrete group types used as the `Coop` template arg of
+// ccoLsaBarrierSession<Coop>. Each must provide:
 //   __device__ int  thread_rank() const   // rank within the group
 //   __device__ int  size()        const   // number of threads in the group
 //   __device__ void sync()                // group-internal sync barrier
@@ -38,25 +38,22 @@ namespace cco {
 // reliability), and ccoLsaBarrierSession is a template — polymorphism is
 // not required.
 
-struct ccoBlockGroup {
-  __device__ inline int  thread_rank() const { return threadIdx.x; }
-  __device__ inline int  size()        const { return blockDim.x;  }
-  __device__ inline void sync()              { __syncthreads();    }
+struct ccoCoopThread {
+  __device__ int thread_rank() const { return 0; }
+  __device__ int size() const { return 1; }
+  __device__ void sync() {}
 };
 
-struct ccoWarpGroup {
-  __device__ inline int  thread_rank() const { return __lane_id(); }
-  // `warpSize` is a HIP/CUDA built-in __device__ const int (64 on AMD gfx9+).
-  __device__ inline int  size()        const { return warpSize; }
-  // AMD GPU: all lanes of a warp execute in lockstep; wave_barrier is the
-  // intrinsic synchronization primitive for a single wavefront.
-  __device__ inline void sync()              { __builtin_amdgcn_wave_barrier(); }
+struct ccoCoopWarp {
+  __device__ int thread_rank() const { return threadIdx.x % 64; }
+  __device__ int size() const { return 64; }
+  __device__ void sync() { __syncwarp(); }
 };
 
-struct ccoThreadGroup {
-  __device__ inline int  thread_rank() const { return 0; }
-  __device__ inline int  size()        const { return 1; }
-  __device__ inline void sync()              { /* empty: a 1-thread group is trivially synced */ }
+struct ccoCoopBlock {
+  __device__ int thread_rank() const { return threadIdx.x; }
+  __device__ int size() const { return blockDim.x; }
+  __device__ void sync() { __syncthreads(); }
 };
 
 }  // namespace cco

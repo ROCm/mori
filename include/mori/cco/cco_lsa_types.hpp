@@ -33,9 +33,9 @@ namespace cco {
 //   [2 * nBarries, 3 * nBarries)                     multimem inbox
 //   [3*nBarriers, 3*nBarriers + nBarriers*lsaSize)   ucInbox[index][peer]
 
-template <typename Group>
+template <typename Coop>
 struct ccoLsaBarrierSession {
-  Group group;
+  Coop group;
   ccoDevComm_t comm;
   ccoLsaBarrierHandle handle;
   uint32_t epoch;
@@ -44,19 +44,19 @@ struct ccoLsaBarrierSession {
   // TODO: support multicast on new generation hardware
   // TODO: add flexible memory order parameters in APIs
 
-  __device__ inline ccoLsaBarrierSession(Group group, ccoDevComm_t comm, ccoLsaBarrierHandle h,
+  __device__ inline ccoLsaBarrierSession(Coop group, ccoDevComm_t comm, ccoLsaBarrierHandle h,
                                          uint32_t index);
   __device__ inline ~ccoLsaBarrierSession();
 
   // Write epoch+1 into peer's inbox slot reserved for us, cross-gpu write
-  __device__ inline void arrive(Group);
+  __device__ inline void arrive(Coop);
 
   // Read each peer's arrival signal from my own buffer at slot[peer]
-  __device__ inline void wait(Group);
-  __device__ inline int wait(Group, uint64_t timeoutCycles);
+  __device__ inline void wait(Coop);
+  __device__ inline int wait(Coop, uint64_t timeoutCycles);
 
-  __device__ inline void sync(Group);
-  __device__ inline int sync(Group, uint64_t timeoutCycles);
+  __device__ inline void sync(Coop);
+  __device__ inline int sync(Coop, uint64_t timeoutCycles);
 
  private:
   __device__ inline uint32_t* ucInbox(int owner, int peer) {
@@ -72,7 +72,7 @@ struct ccoLsaBarrierSession {
   }
 
   template <bool EnableTimeout>
-  __device__ inline int waitInternal(Group, uint64_t timeoutCycles);
+  __device__ inline int waitInternal(Coop, uint64_t timeoutCycles);
 };
 
 }  // namespace cco
