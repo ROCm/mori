@@ -2,8 +2,11 @@
 // MIT License — see LICENSE for details.
 #pragma once
 
+#include <type_traits>
+
 #include "mori/application/transport/rdma/rdma.hpp"
 #include "mori/cco/cco_types.hpp"
+#include "mori/cco/gda/gda_device_types.hpp"
 #include "mori/core/transport/rdma/device_primitives.hpp"
 #include "mori/core/transport/rdma/providers/bnxt/bnxt_device_primitives.hpp"
 #include "mori/core/transport/rdma/providers/ionic/ionic_device_primitives.hpp"
@@ -156,434 +159,383 @@ __device__ inline static uint32_t getAtomicWqeCount(core::atomicType amo_op, uin
   }
 }
 
-// Core put implementation
+// Construct provider-correct dbrVal from already-posted WQE state
 template <core::ProviderType PrvdType>
-__device__ inline static void putImpl(ccoGdaCtx ctx, int peer, ccoWindow_t dstWin, size_t dstOffset,
-                                      ccoWindow_t srcWin, size_t srcOffset, size_t bytes,
-                                      bool isSignal, ccoGdaSignal_t signalId,
-                                      ccoGdaSignalOp_t signalOp, uint64_t signalOpArg,
-                                      bool isCounter, ccoGdaCounter_t counterId,
-                                      uint32_t optFlags = ccoGdaOptFlagsDefault) {
-  if (bytes == 0 && !isSignal) return;
+__device__ inline static uint64_t buildFlushDbrVal(core::WorkQueueHandle* wq, uint32_t postIdx,
+                                                   uint32_t qpn) {
+  // postIdx is the next-free slot; the last posted WQE is at postIdx-1
+  uint32_t lastWqeIdx = (postIdx - 1) & (wq->sqWqeNum - 1);
 
-  // 1. Get IBGDA context and select endpoint
-  ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(ctx.handle);
-  int qpIdx = peer * ibgda->numQpPerPe + (ctx.contextId % ibgda->numQpPerPe);
-  shmem::ShmemRdmaEndpoint* ep = &ibgda->endpoints[qpIdx];
+  if constexpr (PrvdType == core::ProviderType::PSD) {
+    return wq->sq_dbval | (postIdx & (wq->sqWqeNum - 1));
+  } else if constexpr (PrvdType == core::ProviderType::MLX5) {
+    // Read back ctrl seg first qword from SQ buffer
+    uintptr_t wqeAddr =
+        reinterpret_cast<uintptr_t>(wq->sqAddr) + (lastWqeIdx << MLX5_SEND_WQE_SHIFT);
+    return *reinterpret_cast<volatile uint64_t*>(wqeAddr);
+  } else {
+    // BNXT: reconstruct db header
+    uint8_t flags = (postIdx >> (__ffs(wq->sqWqeNum) - 1)) & 0x1;
+    uint32_t epoch = (flags & BNXT_RE_FLAG_EPOCH_TAIL_MASK) << BNXT_RE_DB_EPOCH_TAIL_SHIFT;
+    return core::bnxt_re_init_db_hdr(
+        ((postIdx & (wq->sqWqeNum - 1)) * BNXT_RE_NUM_SLOT_PER_WQE) | epoch, 0, qpn,
+        BNXT_RE_QUE_TYPE_SQ);
+  }
+}
+
+// New putImpl - Pure hardware operation layer
+template <core::ProviderType PrvdType>
+__device__ inline static void putImpl(
+    // Hardware resources (already selected endpoint)
+    shmem::ShmemRdmaEndpoint* ep, uint32_t qpn,
+
+    // Data transfer parameters (already parsed addresses and keys)
+    bool hasData, uintptr_t localAddr, uint32_t localKey,  // local buffer
+    uintptr_t remoteAddr, uint32_t remoteKey,              // remote buffer
+    size_t bytes,
+
+    // Signal parameters (already parsed)
+    bool hasSignal, uintptr_t signalRemoteAddr, uint32_t signalRemoteKey, ccoGdaSignalOp_t signalOp,
+    uint64_t signalOpArg,
+
+    // Counter parameters (already parsed)
+    bool hasCounter, uintptr_t counterRemoteAddr, uint32_t counterRemoteKey,
+
+    // Optimization flags
+    uint32_t optFlags = ccoGdaOptFlagsDefault) {
+  if (!hasData && !hasSignal && !hasCounter) return;
+
+  // Get work queue handle
   core::WorkQueueHandle* wq = &ep->wqHandle;
-  uint32_t qpn = ep->qpn;
 
-  // 2. Get window info and build addresses (iova=0 mode)
-  ccoWindowDevice* src = reinterpret_cast<ccoWindowDevice*>(srcWin);
-  ccoWindowDevice* dst = reinterpret_cast<ccoWindowDevice*>(dstWin);
-
-  uintptr_t laddr = srcOffset;
-  uintptr_t raddr = dstOffset;
-  uint32_t lkey = src->ibgdaWin.lkey;
-  uint32_t rkey = dst->ibgdaWin.peerRkeys[peer];
-
-  // 3. Calculate total WQEs needed (provider-specific for atomics)
-  uint32_t numWqesNeeded = (bytes > 0) ? 1 : 0;
-  if (isSignal) {
+  // Calculate total WQEs needed
+  uint32_t numWqesNeeded = hasData ? 1 : 0;
+  if (hasSignal) {
+    numWqesNeeded += getAtomicWqeCount<PrvdType>(core::AMO_FETCH_ADD, sizeof(uint64_t));
+  }
+  if (hasCounter) {
     numWqesNeeded += getAtomicWqeCount<PrvdType>(core::AMO_FETCH_ADD, sizeof(uint64_t));
   }
 
-  // 4. Reserve WQE slots (with flow control)
+  // Reserve WQE slots (with flow control)
   uint32_t curPostIdx = reserveWqeSlots<PrvdType>(ep, numWqesNeeded);
 
-  // 5. Post RDMA Write for data transfer
+  // Post RDMA Write for data transfer
   uint64_t dbrVal = 0;
   uint32_t wqeIdx = curPostIdx;
 
-  if (bytes > 0) {
+  if (hasData) {
     if constexpr (PrvdType == core::ProviderType::PSD) {
       wq->outstandingWqe[wqeIdx % OUTSTANDING_TABLE_SIZE] = wqeIdx;
     }
-    dbrVal = core::PostWrite<PrvdType>(*wq, wqeIdx, wqeIdx, wqeIdx, true /*cqeSignal*/, qpn, laddr,
-                                       lkey, raddr, rkey, bytes);
+    dbrVal = core::PostWrite<PrvdType>(*wq, wqeIdx, wqeIdx, wqeIdx, true /*cqeSignal*/, qpn,
+                                       localAddr, localKey, remoteAddr, remoteKey, bytes);
     wqeIdx++;
   }
 
-  // 6. Post atomic for signal if requested
-  if (isSignal) {
-    // Signal buffer is at offset 0 in resourceWindow, indexed by signalId
-    uintptr_t signalRaddr = signalId * sizeof(uint64_t);
-    uint32_t signalRkey = dst->ibgdaWin.peerRkeys[peer];  // TODO: use resource window rkey
-
-    uint64_t atomicVal = (signalOp == ccoGdaSignalInc) ? 1 : signalOpArg;
-
+  // Post atomic for signal (remote peer notification)
+  if (hasSignal) {
     if constexpr (PrvdType == core::ProviderType::PSD) {
       wq->outstandingWqe[wqeIdx % OUTSTANDING_TABLE_SIZE] = wqeIdx;
     }
 
-    // Use atomic ibuf for result storage
     uintptr_t atomicLaddr = reinterpret_cast<uintptr_t>(ep->atomicIbuf.addr);
     uint32_t atomicLkey = ep->atomicIbuf.lkey;
 
     dbrVal = core::PostAtomic<PrvdType, uint64_t>(
-        *wq, wqeIdx, wqeIdx, wqeIdx, true /*cqeSignal*/, qpn, atomicLaddr, atomicLkey, signalRaddr,
-        signalRkey, atomicVal, 0 /*compare*/, core::AMO_FETCH_ADD);
+        *wq, wqeIdx, wqeIdx, wqeIdx, true /*cqeSignal*/, qpn, atomicLaddr, atomicLkey,
+        signalRemoteAddr, signalRemoteKey, signalOpArg, 0 /*compare*/, core::AMO_FETCH_ADD);
+    wqeIdx++;
   }
 
-  // 7. Ring doorbell (ordered) unless AggregateRequests is set
+  // Post atomic for counter (NIC loopback write to local memory)
+  if (hasCounter) {
+    if constexpr (PrvdType == core::ProviderType::PSD) {
+      wq->outstandingWqe[wqeIdx % OUTSTANDING_TABLE_SIZE] = wqeIdx;
+    }
+
+    uintptr_t atomicLaddr = reinterpret_cast<uintptr_t>(ep->atomicIbuf.addr);
+    uint32_t atomicLkey = ep->atomicIbuf.lkey;
+
+    dbrVal = core::PostAtomic<PrvdType, uint64_t>(
+        *wq, wqeIdx, wqeIdx, wqeIdx, true /*cqeSignal*/, qpn, atomicLaddr, atomicLkey,
+        counterRemoteAddr, counterRemoteKey, 1 /*add 1*/, 0 /*compare*/, core::AMO_FETCH_ADD);
+  }
+
+  // Ring doorbell (ordered) unless AggregateRequests is set
   if (!(optFlags & ccoGdaOptFlagsAggregateRequests)) {
     ringDoorbellOrdered<PrvdType>(ep, curPostIdx, numWqesNeeded, dbrVal);
   }
 }
 
-// putValue implementation (inline write for small values)
+// New putValueImpl - Inline write for small values
 template <core::ProviderType PrvdType, typename T>
-__device__ inline static void putValueImpl(ccoGdaCtx ctx, int peer, ccoWindow_t dstWin,
-                                           size_t dstOffset, T value, bool isSignal,
-                                           ccoGdaSignal_t signalId, ccoGdaSignalOp_t signalOp,
+__device__ inline static void putValueImpl(shmem::ShmemRdmaEndpoint* ep, uint32_t qpn,
+                                           uintptr_t remoteAddr, uint32_t remoteKey, T value,
+                                           bool hasSignal, uintptr_t signalRemoteAddr,
+                                           uint32_t signalRemoteKey, ccoGdaSignalOp_t signalOp,
                                            uint64_t signalOpArg,
                                            uint32_t optFlags = ccoGdaOptFlagsDefault) {
   static_assert(sizeof(T) <= 8, "putValue only supports types <= 8 bytes");
 
-  // 1. Get IBGDA context and select endpoint
-  ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(ctx.handle);
-  int qpIdx = peer * ibgda->numQpPerPe + (ctx.contextId % ibgda->numQpPerPe);
-  shmem::ShmemRdmaEndpoint* ep = &ibgda->endpoints[qpIdx];
   core::WorkQueueHandle* wq = &ep->wqHandle;
-  uint32_t qpn = ep->qpn;
 
-  // 2. Get window info
-  ccoWindowDevice* dst = reinterpret_cast<ccoWindowDevice*>(dstWin);
-  uintptr_t raddr = dstOffset;
-  uint32_t rkey = dst->ibgdaWin.peerRkeys[peer];
-
-  // 3. Calculate WQEs needed (provider-specific for atomics)
+  // Calculate WQEs needed
   uint32_t numWqesNeeded = 1;
-  if (isSignal) {
+  if (hasSignal) {
     numWqesNeeded += getAtomicWqeCount<PrvdType>(core::AMO_FETCH_ADD, sizeof(uint64_t));
   }
 
-  // 4. Reserve WQE slots
+  // Reserve WQE slots
   uint32_t curPostIdx = reserveWqeSlots<PrvdType>(ep, numWqesNeeded);
 
-  // 5. Post inline write
+  // Post inline write
   uint32_t wqeIdx = curPostIdx;
   if constexpr (PrvdType == core::ProviderType::PSD) {
     wq->outstandingWqe[wqeIdx % OUTSTANDING_TABLE_SIZE] = wqeIdx;
   }
   uint64_t dbrVal = core::PostWriteInline<PrvdType>(*wq, wqeIdx, wqeIdx, wqeIdx, true /*cqeSignal*/,
-                                                    qpn, &value, raddr, rkey, sizeof(T));
+                                                    qpn, &value, remoteAddr, remoteKey, sizeof(T));
   wqeIdx++;
 
-  // 6. Post atomic for signal if requested
-  if (isSignal) {
-    uintptr_t signalRaddr = signalId * sizeof(uint64_t);
-    uint32_t signalRkey = dst->ibgdaWin.peerRkeys[peer];
-    uint64_t atomicVal = (signalOp == ccoGdaSignalInc) ? 1 : signalOpArg;
-
+  // Post atomic for signal if requested
+  if (hasSignal) {
     if constexpr (PrvdType == core::ProviderType::PSD) {
       wq->outstandingWqe[wqeIdx % OUTSTANDING_TABLE_SIZE] = wqeIdx;
     }
 
-    // Use atomic ibuf for result storage
     uintptr_t atomicLaddr = reinterpret_cast<uintptr_t>(ep->atomicIbuf.addr);
     uint32_t atomicLkey = ep->atomicIbuf.lkey;
 
-    dbrVal = core::PostAtomic<PrvdType, uint64_t>(*wq, wqeIdx, wqeIdx, wqeIdx, true /*cqeSignal*/,
-                                                  qpn, atomicLaddr, atomicLkey, signalRaddr,
-                                                  signalRkey, atomicVal, 0, core::AMO_FETCH_ADD);
+    dbrVal = core::PostAtomic<PrvdType, uint64_t>(
+        *wq, wqeIdx, wqeIdx, wqeIdx, true /*cqeSignal*/, qpn, atomicLaddr, atomicLkey,
+        signalRemoteAddr, signalRemoteKey, signalOpArg, 0, core::AMO_FETCH_ADD);
   }
 
-  // 7. Ring doorbell unless AggregateRequests is set
+  // Ring doorbell unless AggregateRequests is set
   if (!(optFlags & ccoGdaOptFlagsAggregateRequests)) {
     ringDoorbellOrdered<PrvdType>(ep, curPostIdx, numWqesNeeded, dbrVal);
   }
 }
 
-// Get implementation (RDMA read)
+// New getImpl - RDMA read
 template <core::ProviderType PrvdType>
-__device__ inline static void getImpl(ccoGdaCtx ctx, int peer, ccoWindow_t remoteWin,
-                                      size_t remoteOffset, ccoWindow_t localWin, size_t localOffset,
-                                      size_t bytes, uint32_t optFlags = ccoGdaOptFlagsDefault) {
+__device__ inline static void getImpl(shmem::ShmemRdmaEndpoint* ep, uint32_t qpn,
+                                      uintptr_t localAddr, uint32_t localKey, uintptr_t remoteAddr,
+                                      uint32_t remoteKey, size_t bytes,
+                                      uint32_t optFlags = ccoGdaOptFlagsDefault) {
   if (bytes == 0) return;
 
-  // 1. Get IBGDA context and select endpoint
-  ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(ctx.handle);
-  int qpIdx = peer * ibgda->numQpPerPe + (ctx.contextId % ibgda->numQpPerPe);
-  shmem::ShmemRdmaEndpoint* ep = &ibgda->endpoints[qpIdx];
   core::WorkQueueHandle* wq = &ep->wqHandle;
-  uint32_t qpn = ep->qpn;
 
-  // 2. Get addresses and keys (iova=0 mode)
-  ccoWindowDevice* local = reinterpret_cast<ccoWindowDevice*>(localWin);
-  ccoWindowDevice* remote = reinterpret_cast<ccoWindowDevice*>(remoteWin);
-
-  uintptr_t laddr = localOffset;
-  uintptr_t raddr = remoteOffset;
-  uint32_t lkey = local->ibgdaWin.lkey;
-  uint32_t rkey = remote->ibgdaWin.peerRkeys[peer];
-
-  // 3. Reserve WQE slot
+  // Reserve WQE slot
   uint32_t curPostIdx = reserveWqeSlots<PrvdType>(ep, 1);
 
-  // 4. Post RDMA Read
+  // Post RDMA Read
   if constexpr (PrvdType == core::ProviderType::PSD) {
     wq->outstandingWqe[curPostIdx % OUTSTANDING_TABLE_SIZE] = curPostIdx;
   }
   uint64_t dbrVal =
       core::PostRead<PrvdType>(*wq, curPostIdx, curPostIdx, curPostIdx, true /*cqeSignal*/, qpn,
-                               laddr, lkey, raddr, rkey, bytes);
+                               localAddr, localKey, remoteAddr, remoteKey, bytes);
 
-  // 5. Ring doorbell unless AggregateRequests is set
+  // Ring doorbell unless AggregateRequests is set
   if (!(optFlags & ccoGdaOptFlagsAggregateRequests)) {
     ringDoorbellOrdered<PrvdType>(ep, curPostIdx, 1, dbrVal);
   }
 }
 
-// Flush: ring doorbell for pending WQEs and wait for completion
-// 1. Lock → atomic_max(dbTouchIdx) → ring doorbell if advanced → unlock
-// 2. Wait for completion via quietUntil
+// Flush: submit all pending WQEs and wait for completion.
+// Cannot use ringDoorbellOrdered — it waits for dbTouchIdx == postIdx,
+// but AggregateRequests skips dbTouchIdx advancement, causing deadlock.
 template <core::ProviderType PrvdType>
-__device__ inline static void flushImpl(ccoGdaCtx ctx, int peer) {
-  ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(ctx.handle);
-  int qpIdx = peer * ibgda->numQpPerPe + (ctx.contextId % ibgda->numQpPerPe);
-  shmem::ShmemRdmaEndpoint* ep = &ibgda->endpoints[qpIdx];
+__device__ inline static void flushImpl(shmem::ShmemRdmaEndpoint* ep, uint32_t qpn) {
   core::WorkQueueHandle* wq = &ep->wqHandle;
   core::CompletionQueueHandle* cq = &ep->cqHandle;
-  uint32_t qpn = ep->qpn;
 
-  // Get current postIdx as target
-  uint32_t postIdx = __hip_atomic_load(&wq->postIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-  if (postIdx == 0) return;
-
-  // Ring doorbell for any pending WQEs
-  uint64_t activemask = core::GetActiveLaneMask();
-  while (!core::spin_lock_try_acquire_shared(&wq->postSendLock, activemask)) {
-    // Spin
+  uint32_t curPostIdx = wq->postIdx;
+  uint64_t dbTouched =
+      __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+  if (dbTouched == curPostIdx) {
+    // Nothing pending, just poll CQ for already-submitted work
+    quietUntil<PrvdType>(ep, curPostIdx);
+    return;
   }
 
-  // Atomic max on dbTouchIdx
-  uint32_t oldDbTouch =
-      __hip_atomic_fetch_max(&wq->dbTouchIdx, postIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+  uint32_t numPendingWqes = curPostIdx - static_cast<uint32_t>(dbTouched);
+  uint64_t dbrVal = buildFlushDbrVal<PrvdType>(wq, curPostIdx, qpn);
 
-  // Only ring doorbell if we advanced dbTouchIdx
-  if (oldDbTouch < postIdx) {
+  __threadfence_system();
+
+  if constexpr (PrvdType == core::ProviderType::PSD) {
+    core::RingDoorbell<PrvdType>(wq->dbrAddr, dbrVal);
+  } else {
+    core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, curPostIdx);
     __threadfence_system();
-
-    uint32_t lastWqeIdx = (postIdx - 1) & (wq->sqWqeNum - 1);
-    uint64_t dbrVal;
-
-    if constexpr (PrvdType == core::ProviderType::PSD) {
-      // PSD: doorbell value = sq_dbval | wrapped index
-      dbrVal = wq->sq_dbval | (postIdx & (wq->sqWqeNum - 1));
-      core::RingDoorbell<PrvdType>(wq->dbrAddr, dbrVal);
-    } else if constexpr (PrvdType == core::ProviderType::MLX5) {
-      // MLX5: read control segment from last WQE for doorbell value
-      uintptr_t wqeAddr =
-          reinterpret_cast<uintptr_t>(wq->sqAddr) + (lastWqeIdx << MLX5_SEND_WQE_SHIFT);
-      dbrVal = *reinterpret_cast<uint64_t*>(wqeAddr);
-
-      core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, postIdx);
-      __threadfence_system();
-      core::RingDoorbell<PrvdType>(wq->dbrAddr, dbrVal);
-    } else if constexpr (PrvdType == core::ProviderType::BNXT) {
-      // BNXT: compute doorbell value via bnxt_re_init_db_hdr
-      uint8_t flags = (postIdx >> (__ffs(wq->sqWqeNum) - 1)) & 0x1;
-      uint32_t epoch = (flags & BNXT_RE_FLAG_EPOCH_TAIL_MASK) << BNXT_RE_DB_EPOCH_TAIL_SHIFT;
-      uint32_t slotIdx = (postIdx & (wq->sqWqeNum - 1)) * BNXT_RE_NUM_SLOT_PER_WQE;
-      dbrVal = bnxt_re_init_db_hdr(slotIdx | epoch, 0, qpn, BNXT_RE_QUE_TYPE_SQ);
-
-      core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, postIdx);
-      __threadfence_system();
-      core::RingDoorbell<PrvdType>(wq->dbrAddr, dbrVal);
-    }
-
-    __threadfence_system();
-
-    // Update needConsIdx for the WQEs we just rang doorbell for
-    __hip_atomic_fetch_add(&cq->needConsIdx, postIdx - oldDbTouch, __ATOMIC_RELAXED,
-                           __HIP_MEMORY_SCOPE_AGENT);
+    core::RingDoorbell<PrvdType>(wq->dbrAddr, dbrVal);
   }
 
-  core::spin_lock_release_shared(&wq->postSendLock, activemask);
+  __threadfence_system();
 
-  // Wait for all operations up to postIdx to complete
-  quietUntil<PrvdType>(ep, postIdx);
+  __hip_atomic_fetch_add(&cq->needConsIdx, numPendingWqes, __ATOMIC_RELAXED,
+                         __HIP_MEMORY_SCOPE_AGENT);
+  __hip_atomic_store(&wq->dbTouchIdx, static_cast<uint64_t>(curPostIdx), __ATOMIC_RELAXED,
+                     __HIP_MEMORY_SCOPE_AGENT);
+
+  // Poll CQ until all WQEs complete (ensure source buffers are reusable)
+  quietUntil<PrvdType>(ep, curPostIdx);
 }
 
-// FlushAsync: ring doorbell for pending WQEs and return ticket for later wait
+// FlushAsync: submit all pending WQEs, return request handle for later wait.
 template <core::ProviderType PrvdType>
-__device__ inline static void flushAsyncImpl(ccoGdaCtx ctx, int peer, ccoGdaRequest_t* outRequest) {
-  ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(ctx.handle);
-  int qpIdx = peer * ibgda->numQpPerPe + (ctx.contextId % ibgda->numQpPerPe);
-  shmem::ShmemRdmaEndpoint* ep = &ibgda->endpoints[qpIdx];
+__device__ inline static void flushAsyncImpl(shmem::ShmemRdmaEndpoint* ep, uint32_t qpn,
+                                             ccoGdaRequest_t* outRequest) {
   core::WorkQueueHandle* wq = &ep->wqHandle;
   core::CompletionQueueHandle* cq = &ep->cqHandle;
-  uint32_t qpn = ep->qpn;
 
-  // Get current postIdx as target
-  uint32_t postIdx = __hip_atomic_load(&wq->postIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-  *outRequest = reinterpret_cast<ccoGdaRequest_t>(static_cast<uintptr_t>(postIdx));
+  uint32_t curPostIdx = wq->postIdx;
+  *outRequest = reinterpret_cast<ccoGdaRequest_t>(static_cast<uintptr_t>(curPostIdx));
 
-  if (postIdx == 0) return;
+  uint64_t dbTouched =
+      __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+  if (dbTouched == curPostIdx) return;
 
-  // Ring doorbell for any pending WQEs
-  uint64_t activemask = core::GetActiveLaneMask();
-  while (!core::spin_lock_try_acquire_shared(&wq->postSendLock, activemask)) {
-    // Spin
+  uint32_t numPendingWqes = curPostIdx - static_cast<uint32_t>(dbTouched);
+  uint64_t dbrVal = buildFlushDbrVal<PrvdType>(wq, curPostIdx, qpn);
+
+  __threadfence_system();
+
+  if constexpr (PrvdType == core::ProviderType::PSD) {
+    core::RingDoorbell<PrvdType>(wq->dbrAddr, dbrVal);
+  } else {
+    core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, curPostIdx);
+    __threadfence_system();
+    core::RingDoorbell<PrvdType>(wq->dbrAddr, dbrVal);
   }
 
-  // Atomic max on dbTouchIdx
-  uint32_t oldDbTouch =
-      __hip_atomic_fetch_max(&wq->dbTouchIdx, postIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+  __threadfence_system();
 
-  // Only ring doorbell if we advanced dbTouchIdx
-  if (oldDbTouch < postIdx) {
-    __threadfence_system();
-
-    uint32_t lastWqeIdx = (postIdx - 1) & (wq->sqWqeNum - 1);
-    uint64_t dbrVal;
-
-    if constexpr (PrvdType == core::ProviderType::PSD) {
-      dbrVal = wq->sq_dbval | (postIdx & (wq->sqWqeNum - 1));
-      core::RingDoorbell<PrvdType>(wq->dbrAddr, dbrVal);
-    } else if constexpr (PrvdType == core::ProviderType::MLX5) {
-      uintptr_t wqeAddr =
-          reinterpret_cast<uintptr_t>(wq->sqAddr) + (lastWqeIdx << MLX5_SEND_WQE_SHIFT);
-      dbrVal = *reinterpret_cast<uint64_t*>(wqeAddr);
-
-      core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, postIdx);
-      __threadfence_system();
-      core::RingDoorbell<PrvdType>(wq->dbrAddr, dbrVal);
-    } else if constexpr (PrvdType == core::ProviderType::BNXT) {
-      uint8_t flags = (postIdx >> (__ffs(wq->sqWqeNum) - 1)) & 0x1;
-      uint32_t epoch = (flags & BNXT_RE_FLAG_EPOCH_TAIL_MASK) << BNXT_RE_DB_EPOCH_TAIL_SHIFT;
-      uint32_t slotIdx = (postIdx & (wq->sqWqeNum - 1)) * BNXT_RE_NUM_SLOT_PER_WQE;
-      dbrVal = bnxt_re_init_db_hdr(slotIdx | epoch, 0, qpn, BNXT_RE_QUE_TYPE_SQ);
-
-      core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, postIdx);
-      __threadfence_system();
-      core::RingDoorbell<PrvdType>(wq->dbrAddr, dbrVal);
-    }
-
-    __threadfence_system();
-
-    __hip_atomic_fetch_add(&cq->needConsIdx, postIdx - oldDbTouch, __ATOMIC_RELAXED,
-                           __HIP_MEMORY_SCOPE_AGENT);
-  }
-
-  core::spin_lock_release_shared(&wq->postSendLock, activemask);
+  __hip_atomic_fetch_add(&cq->needConsIdx, numPendingWqes, __ATOMIC_RELAXED,
+                         __HIP_MEMORY_SCOPE_AGENT);
+  __hip_atomic_store(&wq->dbTouchIdx, static_cast<uint64_t>(curPostIdx), __ATOMIC_RELAXED,
+                     __HIP_MEMORY_SCOPE_AGENT);
 }
 
 // Wait: wait for async request to complete
 template <core::ProviderType PrvdType>
-__device__ inline static void waitImpl(ccoGdaCtx ctx, int peer, ccoGdaRequest_t request) {
-  ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(ctx.handle);
-  int qpIdx = peer * ibgda->numQpPerPe + (ctx.contextId % ibgda->numQpPerPe);
-  shmem::ShmemRdmaEndpoint* ep = &ibgda->endpoints[qpIdx];
+__device__ inline static void waitImpl(shmem::ShmemRdmaEndpoint* ep, ccoGdaRequest_t request) {
+  uint32_t targetIdx = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(request));
 
-  uint32_t targetIdx = reinterpret_cast<uintptr_t>(request);
+  // Actively poll CQ until target WQE completes
   quietUntil<PrvdType>(ep, targetIdx);
 }
 
-// Signal operations
+// Signal: send signal to remote peer (RDMA atomic increment/add)
 template <core::ProviderType PrvdType>
-__device__ inline static void signalImpl(ccoGdaCtx ctx, int peer, ccoGdaSignal_t signalId,
+__device__ inline static void signalImpl(shmem::ShmemRdmaEndpoint* ep, uint32_t qpn,
+                                         uintptr_t signalRemoteAddr, uint32_t signalRemoteKey,
                                          ccoGdaSignalOp_t signalOp, uint64_t signalOpArg,
                                          uint32_t optFlags = ccoGdaOptFlagsDefault) {
-  // Post atomic to remote signal buffer
-  ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(ctx.handle);
-  int qpIdx = peer * ibgda->numQpPerPe + (ctx.contextId % ibgda->numQpPerPe);
-  shmem::ShmemRdmaEndpoint* ep = &ibgda->endpoints[qpIdx];
   core::WorkQueueHandle* wq = &ep->wqHandle;
-  uint32_t qpn = ep->qpn;
 
-  // TODO: get signal buffer rkey from resource window
-  uintptr_t signalRaddr = signalId * sizeof(uint64_t);
-  uint32_t signalRkey = 0;  // TODO: proper rkey
+  // Reserve WQE slot
+  uint32_t curPostIdx = reserveWqeSlots<PrvdType>(ep, 1);
 
-  uint64_t atomicVal = (signalOp == ccoGdaSignalInc) ? 1 : signalOpArg;
-
-  // Calculate WQEs needed (provider-specific)
-  uint32_t numWqes = getAtomicWqeCount<PrvdType>(core::AMO_FETCH_ADD, sizeof(uint64_t));
-  uint32_t curPostIdx = reserveWqeSlots<PrvdType>(ep, numWqes);
-
+  // Post RDMA atomic operation
   if constexpr (PrvdType == core::ProviderType::PSD) {
     wq->outstandingWqe[curPostIdx % OUTSTANDING_TABLE_SIZE] = curPostIdx;
   }
 
-  // Use atomic ibuf for result storage
+  // RDMA atomic requires local buffer for FetchAdd result (even if unused)
   uintptr_t atomicLaddr = reinterpret_cast<uintptr_t>(ep->atomicIbuf.addr);
   uint32_t atomicLkey = ep->atomicIbuf.lkey;
 
+  uint64_t addValue = (signalOp == ccoGdaSignalInc) ? 1 : signalOpArg;
   uint64_t dbrVal = core::PostAtomic<PrvdType, uint64_t>(
-      *wq, curPostIdx, curPostIdx, curPostIdx, true, qpn, atomicLaddr, atomicLkey, signalRaddr,
-      signalRkey, atomicVal, 0, core::AMO_FETCH_ADD);
+      *wq, curPostIdx, curPostIdx, curPostIdx, true /*cqeSignal*/, qpn, atomicLaddr, atomicLkey,
+      signalRemoteAddr, signalRemoteKey, addValue, 0 /*compare*/, core::AMO_FETCH_ADD);
 
   // Ring doorbell unless AggregateRequests is set
   if (!(optFlags & ccoGdaOptFlagsAggregateRequests)) {
-    ringDoorbellOrdered<PrvdType>(ep, curPostIdx, numWqes, dbrVal);
+    ringDoorbellOrdered<PrvdType>(ep, curPostIdx, 1, dbrVal);
   }
 }
 
-__device__ inline static void resetSignalImpl(ccoGdaCtx ctx, ccoGdaSignal_t signalId) {
-  ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(ctx.handle);
-  ibgda->signalBuf[signalId] = 0;
-  ibgda->signalShadows[signalId] = 0;
-}
-
-__device__ inline static uint64_t readSignalImpl(ccoGdaCtx ctx, ccoGdaSignal_t signalId, int bits) {
-  ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(ctx.handle);
+// ReadSignal: read local signal value
+template <core::ProviderType PrvdType>
+__device__ inline static uint64_t readSignalImpl(volatile uint64_t* signalBuf,
+                                                 volatile uint64_t* signalShadows,
+                                                 ccoGdaSignal_t signalId, int bits) {
   uint64_t val =
-      __hip_atomic_load(&ibgda->signalBuf[signalId], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-  uint64_t shadow = ibgda->signalShadows[signalId];
+      __hip_atomic_load(&signalBuf[signalId], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+  uint64_t shadow = signalShadows[signalId];
   uint64_t mask = (bits >= 64) ? UINT64_MAX : ((1ULL << bits) - 1);
   return (val - shadow) & mask;
 }
 
-__device__ inline static void waitSignalImpl(ccoGdaCtx ctx, ccoGdaSignal_t signalId, uint64_t least,
-                                             int bits) {
-  ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(ctx.handle);
+// WaitSignal: wait until local signal reaches specified value
+template <core::ProviderType PrvdType>
+__device__ inline static void waitSignalImpl(volatile uint64_t* signalBuf,
+                                             volatile uint64_t* signalShadows,
+                                             ccoGdaSignal_t signalId, uint64_t least, int bits) {
   uint64_t mask = (bits >= 64) ? UINT64_MAX : ((1ULL << bits) - 1);
-  uint64_t shadow = ibgda->signalShadows[signalId];
+  uint64_t shadow = signalShadows[signalId];
 
   while (true) {
     uint64_t val =
-        __hip_atomic_load(&ibgda->signalBuf[signalId], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        __hip_atomic_load(&signalBuf[signalId], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
     uint64_t delta = (val - shadow) & mask;
     if (delta >= least) {
       // Update shadow to consume
-      ibgda->signalShadows[signalId] = (shadow + least) & mask;
+      signalShadows[signalId] = (shadow + least) & mask;
       break;
     }
-    // Spin
+    // Spin wait
     asm volatile("" ::: "memory");
   }
 }
 
-// Counter operations
-__device__ inline static uint64_t readCounterImpl(ccoGdaCtx ctx, ccoGdaCounter_t counterId,
-                                                  int bits) {
-  ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(ctx.handle);
+// ResetSignal: reset local signal to zero
+template <core::ProviderType PrvdType>
+__device__ inline static void resetSignalImpl(volatile uint64_t* signalBuf,
+                                              volatile uint64_t* signalShadows,
+                                              ccoGdaSignal_t signalId) {
+  signalBuf[signalId] = 0;
+  signalShadows[signalId] = 0;
+}
+
+// ReadCounter: read local counter value
+template <core::ProviderType PrvdType>
+__device__ inline static uint64_t readCounterImpl(volatile uint64_t* counterBuf,
+                                                  ccoGdaCounter_t counterId, int bits) {
   uint64_t val =
-      __hip_atomic_load(&ibgda->counterBuf[counterId], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+      __hip_atomic_load(&counterBuf[counterId], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
   uint64_t mask = (bits >= 64) ? UINT64_MAX : ((1ULL << bits) - 1);
   return val & mask;
 }
 
-__device__ inline static void resetCounterImpl(ccoGdaCtx ctx, ccoGdaCounter_t counterId) {
-  ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(ctx.handle);
-  ibgda->counterBuf[counterId] = 0;
-}
-
-__device__ inline static void waitCounterImpl(ccoGdaCtx ctx, ccoGdaCounter_t counterId,
-                                              uint64_t least, int bits) {
-  ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(ctx.handle);
+// WaitCounter: wait until local counter reaches specified value
+template <core::ProviderType PrvdType>
+__device__ inline static void waitCounterImpl(volatile uint64_t* counterBuf,
+                                              ccoGdaCounter_t counterId, uint64_t least, int bits) {
   uint64_t mask = (bits >= 64) ? UINT64_MAX : ((1ULL << bits) - 1);
 
   while (true) {
-    uint64_t val = __hip_atomic_load(&ibgda->counterBuf[counterId], __ATOMIC_RELAXED,
-                                     __HIP_MEMORY_SCOPE_SYSTEM);
+    uint64_t val =
+        __hip_atomic_load(&counterBuf[counterId], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
     if ((val & mask) >= least) {
       break;
     }
+    // Spin wait
     asm volatile("" ::: "memory");
   }
+}
+
+// ResetCounter: reset local counter to zero
+template <core::ProviderType PrvdType>
+__device__ inline static void resetCounterImpl(volatile uint64_t* counterBuf,
+                                               ccoGdaCounter_t counterId) {
+  counterBuf[counterId] = 0;
 }
 
 }  // namespace gda
