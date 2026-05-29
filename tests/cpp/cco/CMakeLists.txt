@@ -54,3 +54,34 @@ set_target_properties(
                                    BUILD_WITH_INSTALL_RPATH FALSE
                                    INSTALL_RPATH_USE_LINK_PATH TRUE)
 add_test(NAME cco_gda_modes COMMAND test_cco_gda_modes)
+
+# GDA device API test (requires HIP for __global__ kernel)
+add_executable(test_cco_gda_device test_cco_gda_device.cpp)
+set_source_files_properties(test_cco_gda_device.cpp PROPERTIES LANGUAGE HIP)
+target_include_directories(test_cco_gda_device PRIVATE ${CMAKE_SOURCE_DIR}/include
+                                                           ${CMAKE_SOURCE_DIR})
+target_link_libraries(test_cco_gda_device PRIVATE mori_cco mori_application
+                                                      mori_logging ibverbs hip::host hip::device)
+if(WITH_MPI)
+  target_compile_definitions(test_cco_gda_device PRIVATE MORI_WITH_MPI)
+  target_link_libraries(test_cco_gda_device PRIVATE ${MPI_CXX_LIBRARIES})
+  target_include_directories(test_cco_gda_device PRIVATE ${MPI_CXX_INCLUDE_DIRS})
+endif()
+if(DEFINED GPU_TARGETS)
+  set_target_properties(test_cco_gda_device PROPERTIES HIP_ARCHITECTURES
+                                                           "${GPU_TARGETS}")
+endif()
+set_target_properties(
+  test_cco_gda_device PROPERTIES SKIP_BUILD_RPATH FALSE
+                                    BUILD_WITH_INSTALL_RPATH FALSE
+                                    INSTALL_RPATH_USE_LINK_PATH TRUE)
+
+# ctest: fork mode
+add_test(NAME cco_gda_device COMMAND test_cco_gda_device)
+
+# ctest: MPI mode
+if(WITH_MPI)
+  add_test(NAME cco_gda_device_mpi
+           COMMAND ${MPIEXEC_EXECUTABLE} --allow-run-as-root ${MPIEXEC_NUMPROC_FLAG} 8
+                   $<TARGET_FILE:test_cco_gda_device>)
+endif()
