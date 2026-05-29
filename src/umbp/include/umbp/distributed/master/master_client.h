@@ -44,6 +44,12 @@
 #include "umbp/distributed/routing/route_put_strategy.h"
 #include "umbp/distributed/types.h"
 
+// Forward-declared to keep umbp.pb.h out of the public header.
+namespace umbp {
+class HeartbeatRequest;
+class HeartbeatResponse;
+}  // namespace umbp
+
 namespace mori::umbp {
 
 class PeerDramAllocator;
@@ -121,14 +127,14 @@ class MasterClient {
   void StartHeartbeat();
   void StopHeartbeat();
 
-  // Force the next heartbeat to send a UMBP-owned full-sync snapshot.
-  // Used by Clear(): after PeerDramAllocator::ClearLocal(), master collapses
-  // this node's UMBP-owned index in one shot.
-  void RequestClearFullSync();
-
-  // Synchronously clear this node's UMBP-owned and external HiCache placement
-  // from master. Returns true only after the heartbeat full-sync and external
-  // clear RPC are acknowledged by master.
+  // Synchronously clear this node's UMBP-owned and external HiCache
+  // placement from master. When peer_alloc_ is bound, caller MUST have
+  // already invoked peer_alloc_->ClearLocal() (PoolClient::Clear()
+  // handles this); SSD-only peers skip that step. Returns true only
+  // after both the full-sync heartbeat and the external KV revoke RPC
+  // are acknowledged by master; on any failure returns false and leaves
+  // PeerDramAllocator::clear_full_sync_pending_ closed for the caller
+  // to retry.
   bool ClearFullSync();
 
   // --- Client-side metrics ---
@@ -199,27 +205,38 @@ class MasterClient {
   // is managed by PoolClient.
   PeerDramAllocator* peer_alloc_ = nullptr;
 
+  // Serializes the actual Heartbeat RPC: at most one full-sync or
+  // delta heartbeat is on the wire at a time. ClearFullSync() takes
+  // it too so it cannot race with the heartbeat thread.
   std::mutex hb_send_mutex_;
+
+  // Protects fields shared between the heartbeat thread, RegisterSelf,
+  // and ClearFullSync: outbox_, next_bundle_seq_, hb_last_acked_seq_,
+  // full_sync_pending_.
   std::mutex hb_state_mutex_;
   std::deque<EventBundle> outbox_;
   uint64_t next_bundle_seq_ = 1;
   uint64_t hb_last_acked_seq_ = 0;
-  bool request_full_sync_ = false;
-
-  // Set by async RequestClearFullSync() or sync ClearFullSync().
-  // `_requested_` wakes the heartbeat thread and picks the
-  // empty-snapshot branch for async clears. `_in_flight_` survives
-  // that branch and triggers
-  // PeerDramAllocator::ClearFullSyncAcked() once master acks — kept
-  // separate so master-driven gap recovery (which also sends a
-  // full-sync) does not lift the allocator write gate.
-  std::atomic<bool> clear_full_sync_requested_{false};
-  std::atomic<bool> clear_full_sync_in_flight_{false};
+  // Force the next tick to send a full-sync (reseed master's view).
+  bool full_sync_pending_ = false;
 
   void HeartbeatLoop();
   bool SendHeartbeatOnce();
-  bool SendFullSyncLocked(const std::map<TierType, TierCapacity>& caps,
-                          const std::map<TierType, uint64_t>& kv_counts);
+  // The "*Locked" suffix means: caller must hold hb_send_mutex_.
+  bool SendFullSyncHeartbeatLocked(const std::map<TierType, TierCapacity>& caps,
+                                   const std::map<TierType, uint64_t>& kv_counts);
+  bool SendDeltaHeartbeatLocked(const std::map<TierType, TierCapacity>& caps,
+                                const std::map<TierType, uint64_t>& kv_counts);
+  grpc::Status SendHeartbeatRpcLocked(::umbp::HeartbeatRequest& req,
+                                      ::umbp::HeartbeatResponse* resp);
+
+  // Snapshot the freshest tier capacities and refresh the
+  // current_capacities_ fallback cache. When peer_alloc_ is bound,
+  // returns its bitmap-derived snapshot (DRAM/HBM) merged with cached
+  // entries for tiers it does not manage (e.g. SSD). When peer_alloc_
+  // is null, returns the cached snapshot unchanged. Acquires
+  // caps_mutex_ internally.
+  std::map<TierType, TierCapacity> SnapshotAndCacheTierCapacities();
 
   // --- Metrics buffering ---
   struct PendingSample {

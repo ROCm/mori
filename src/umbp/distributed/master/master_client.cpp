@@ -162,12 +162,12 @@ grpc::Status MasterClient::RegisterSelf(const std::map<TierType, TierCapacity>& 
   }
 
   if (resp.heartbeat_interval_ms() > 0) heartbeat_interval_ms_ = resp.heartbeat_interval_ms();
-  hb_last_acked_seq_ = 0;
-  next_bundle_seq_ = 1;
   {
     std::lock_guard lock(hb_state_mutex_);
+    hb_last_acked_seq_ = 0;
+    next_bundle_seq_ = 1;
     outbox_.clear();
-    request_full_sync_ = false;
+    full_sync_pending_ = false;
   }
   {
     std::lock_guard lock(caps_mutex_);
@@ -360,57 +360,39 @@ grpc::Status MasterClient::BatchLookup(const std::vector<std::string>& keys,
 
 void MasterClient::SetPeerDramAllocator(PeerDramAllocator* alloc) { peer_alloc_ = alloc; }
 
-void MasterClient::RequestClearFullSync() {
-  // Mark in-flight first so a heartbeat that races with us still
-  // sees we owe an ack-callback.
-  clear_full_sync_in_flight_.store(true);
-  clear_full_sync_requested_.store(true);
-  if (!heartbeat_running_.load()) {
-    MORI_UMBP_WARN(
-        "[Client] RequestClearFullSync without a running heartbeat thread; "
-        "master will not converge until StartHeartbeat()");
-    return;
-  }
-  std::lock_guard lock(hb_cv_mutex_);
-  hb_cv_.notify_all();
-}
-
 bool MasterClient::ClearFullSync() {
   std::lock_guard send_lock(hb_send_mutex_);
   if (!registered_) return false;
 
-  // Mark in-flight before sending so failed attempts leave the write gate
-  // closed until a later heartbeat retry succeeds.
-  clear_full_sync_in_flight_.store(true);
-  clear_full_sync_requested_.store(false);
-
-  std::map<TierType, TierCapacity> caps;
-  if (peer_alloc_ != nullptr) {
-    caps = peer_alloc_->TierCapacitiesSnapshot();
-    std::lock_guard lock(caps_mutex_);
-    for (auto& [t, c] : current_capacities_) {
-      if (caps.find(t) == caps.end()) caps[t] = c;
-    }
-    current_capacities_ = caps;
-  } else {
-    std::lock_guard lock(caps_mutex_);
-    caps = current_capacities_;
-  }
-
+  auto caps = SnapshotAndCacheTierCapacities();
   std::map<TierType, uint64_t> kv_counts;
   if (peer_alloc_ != nullptr) kv_counts = peer_alloc_->OwnedKeyCountByTier();
 
-  if (!SendFullSyncLocked(caps, kv_counts)) {
-    clear_full_sync_requested_.store(true);
-    return false;
+  ::umbp::HeartbeatRequest req;
+  req.set_node_id(config_.node_id);
+  req.set_is_full_sync(true);
+  FillTierCapacities(req.mutable_tier_capacities(), caps);
+  FillTierKvCounts(req.mutable_tier_kv_counts(), kv_counts);
+  {
+    std::lock_guard state_lock(hb_state_mutex_);
+    req.set_delta_seq_baseline(next_bundle_seq_ - 1);
   }
-  auto external_status = RevokeAllExternalKvBlocksForNode(config_.node_id);
-  if (!external_status.ok()) {
-    clear_full_sync_requested_.store(true);
+  // No bundles: ReplaceNodeLocations({}) drops every prior placement for this node.
+
+  ::umbp::HeartbeatResponse resp;
+  grpc::Status status = SendHeartbeatRpcLocked(req, &resp);
+  if (!status.ok()) {
+    MORI_UMBP_WARN("[Client] Clear full-sync RPC failed: {}", status.error_message());
     return false;
   }
 
-  if (clear_full_sync_in_flight_.exchange(false) && peer_alloc_ != nullptr) {
+  auto external_status = RevokeAllExternalKvBlocksForNode(config_.node_id);
+  if (!external_status.ok()) {
+    MORI_UMBP_WARN("[Client] Clear external KV revoke failed: {}", external_status.error_message());
+    return false;
+  }
+
+  if (peer_alloc_ != nullptr) {
     peer_alloc_->ClearFullSyncAcked();
     MORI_UMBP_INFO("[Client] Clear full-sync acked by master; allocator writes re-enabled");
   }
@@ -446,80 +428,83 @@ void MasterClient::HeartbeatLoop() {
   while (heartbeat_running_) {
     {
       std::unique_lock lock(hb_cv_mutex_);
-      hb_cv_.wait_for(lock, std::chrono::milliseconds(heartbeat_interval_ms_), [this] {
-        return !heartbeat_running_.load() || clear_full_sync_requested_.load();
-      });
+      hb_cv_.wait_for(lock, std::chrono::milliseconds(heartbeat_interval_ms_),
+                      [this] { return !heartbeat_running_.load(); });
     }
     if (!heartbeat_running_) break;
     SendHeartbeatOnce();
   }
 }
 
-bool MasterClient::SendHeartbeatOnce() {
-  std::lock_guard send_lock(hb_send_mutex_);
-  if (!registered_) return false;
-
-  // Snapshot the freshest capacity numbers.  When a peer allocator
-  // is bound, its bitmap is the ground truth.
-  std::map<TierType, TierCapacity> caps;
+std::map<TierType, TierCapacity> MasterClient::SnapshotAndCacheTierCapacities() {
   if (peer_alloc_ != nullptr) {
-    caps = peer_alloc_->TierCapacitiesSnapshot();
+    auto caps = peer_alloc_->TierCapacitiesSnapshot();
     std::lock_guard lock(caps_mutex_);
     for (auto& [t, c] : current_capacities_) {
       if (caps.find(t) == caps.end()) caps[t] = c;
     }
     current_capacities_ = caps;
-  } else {
-    std::lock_guard lock(caps_mutex_);
-    caps = current_capacities_;
+    return caps;
   }
+  std::lock_guard lock(caps_mutex_);
+  return current_capacities_;
+}
 
+bool MasterClient::SendHeartbeatOnce() {
+  std::lock_guard send_lock(hb_send_mutex_);
+  if (!registered_) return false;
+
+  auto caps = SnapshotAndCacheTierCapacities();
   std::map<TierType, uint64_t> kv_counts;
   if (peer_alloc_ != nullptr) kv_counts = peer_alloc_->OwnedKeyCountByTier();
 
-  const bool is_clear_sync = clear_full_sync_requested_.exchange(false);
-  if (is_clear_sync) {
-    const bool ok = SendFullSyncLocked(caps, kv_counts);
-    if (!ok) {
-      clear_full_sync_requested_.store(true);
-      return false;
-    }
-    auto external_status = RevokeAllExternalKvBlocksForNode(config_.node_id);
-    if (!external_status.ok()) {
-      clear_full_sync_requested_.store(true);
-      return false;
-    }
-    if (clear_full_sync_in_flight_.exchange(false) && peer_alloc_ != nullptr) {
-      peer_alloc_->ClearFullSyncAcked();
-      MORI_UMBP_INFO("[Client] Clear full-sync acked by master; allocator writes re-enabled");
-    }
-  }
-
-  bool request_full_sync = false;
+  bool do_full_sync;
   {
     std::lock_guard state_lock(hb_state_mutex_);
-    request_full_sync = request_full_sync_;
-    request_full_sync_ = false;
-  }
-  if (request_full_sync) {
-    if (!SendFullSyncLocked(caps, kv_counts)) {
-      std::lock_guard state_lock(hb_state_mutex_);
-      request_full_sync_ = true;
-      return false;
-    }
+    do_full_sync = std::exchange(full_sync_pending_, false);
   }
 
-  std::vector<KvEvent> new_events;
+  if (do_full_sync) {
+    if (SendFullSyncHeartbeatLocked(caps, kv_counts)) return true;
+    std::lock_guard state_lock(hb_state_mutex_);
+    full_sync_pending_ = true;
+    return false;
+  }
+  return SendDeltaHeartbeatLocked(caps, kv_counts);
+}
+
+bool MasterClient::SendFullSyncHeartbeatLocked(const std::map<TierType, TierCapacity>& caps,
+                                               const std::map<TierType, uint64_t>& kv_counts) {
+  ::umbp::HeartbeatRequest req;
+  req.set_node_id(config_.node_id);
+  req.set_is_full_sync(true);
+  FillTierCapacities(req.mutable_tier_capacities(), caps);
+  FillTierKvCounts(req.mutable_tier_kv_counts(), kv_counts);
+
+  EventBundle snapshot;
+  {
+    std::lock_guard state_lock(hb_state_mutex_);
+    snapshot.seq = next_bundle_seq_ - 1;
+    req.set_delta_seq_baseline(snapshot.seq);
+  }
+  if (peer_alloc_ != nullptr) snapshot.events = peer_alloc_->SnapshotOwnedKeys();
+  FillBundle(req.add_bundles(), snapshot);
+
+  ::umbp::HeartbeatResponse resp;
+  grpc::Status status = SendHeartbeatRpcLocked(req, &resp);
+  if (!status.ok()) {
+    MORI_UMBP_WARN("[Client] Full-sync heartbeat failed: error={}", status.error_message());
+    return false;
+  }
+  return true;
+}
+
+bool MasterClient::SendDeltaHeartbeatLocked(const std::map<TierType, TierCapacity>& caps,
+                                            const std::map<TierType, uint64_t>& kv_counts) {
   if (peer_alloc_ != nullptr) {
-    auto owned_events = peer_alloc_->DrainPendingEvents();
-    new_events.reserve(owned_events.size());
-    for (auto& ev : owned_events) {
-      new_events.push_back(std::move(ev));
-    }
-  }
-  {
-    std::lock_guard state_lock(hb_state_mutex_);
+    auto new_events = peer_alloc_->DrainPendingEvents();
     if (!new_events.empty()) {
+      std::lock_guard state_lock(hb_state_mutex_);
       outbox_.push_back(EventBundle{next_bundle_seq_++, std::move(new_events)});
     }
   }
@@ -537,28 +522,11 @@ bool MasterClient::SendHeartbeatOnce() {
   }
 
   ::umbp::HeartbeatResponse resp;
-  grpc::ClientContext ctx;
-  ctx.set_deadline(std::chrono::system_clock::now() +
-                   std::chrono::milliseconds(RpcShutdownTimeoutMs()));
-  grpc::Status status;
-  {
-    ScopedRpcTimer _rpc_timer(this, "Heartbeat");
-    status = GetStub(stub_.get())->Heartbeat(&ctx, req, &resp);
-    _rpc_timer.SetStatus(status);
-  }
+  grpc::Status status = SendHeartbeatRpcLocked(req, &resp);
   if (!status.ok()) {
     MORI_UMBP_WARN("[Client] Heartbeat failed: node_id={}, error={}", config_.node_id,
                    status.error_message());
     return false;
-  }
-
-  {
-    std::lock_guard state_lock(hb_state_mutex_);
-    hb_last_acked_seq_ = resp.acked_seq();
-    while (!outbox_.empty() && outbox_.front().seq <= hb_last_acked_seq_) {
-      outbox_.pop_front();
-    }
-    request_full_sync_ = request_full_sync_ || resp.request_full_sync();
   }
 
   if (resp.status() == ::umbp::CLIENT_STATUS_UNKNOWN) {
@@ -581,58 +549,43 @@ bool MasterClient::SendHeartbeatOnce() {
       registered_ = true;
       std::lock_guard state_lock(hb_state_mutex_);
       hb_last_acked_seq_ = 0;
-      request_full_sync_ = true;
+      full_sync_pending_ = true;
       MORI_UMBP_INFO("[Client] Re-registered with master after UNKNOWN status");
-    } else {
-      MORI_UMBP_WARN("[Client] Re-registration failed: {}", re_status.error_message());
+      return true;
+    }
+    MORI_UMBP_WARN("[Client] Re-registration failed: {}", re_status.error_message());
+    return false;
+  }
+
+  // Recover from a master-reported seq gap within the same tick.
+  if (resp.request_full_sync()) {
+    if (!SendFullSyncHeartbeatLocked(caps, kv_counts)) {
+      std::lock_guard state_lock(hb_state_mutex_);
+      full_sync_pending_ = true;
       return false;
     }
   }
   return true;
 }
 
-bool MasterClient::SendFullSyncLocked(const std::map<TierType, TierCapacity>& caps,
-                                      const std::map<TierType, uint64_t>& kv_counts) {
-  ::umbp::HeartbeatRequest req;
-  req.set_node_id(config_.node_id);
-  req.set_is_full_sync(true);
-  FillTierCapacities(req.mutable_tier_capacities(), caps);
-  FillTierKvCounts(req.mutable_tier_kv_counts(), kv_counts);
-
-  EventBundle snapshot;
-  {
-    std::lock_guard state_lock(hb_state_mutex_);
-    snapshot.seq = next_bundle_seq_ - 1;
-    req.set_delta_seq_baseline(snapshot.seq);
-  }
-  if (peer_alloc_ != nullptr) {
-    snapshot.events = peer_alloc_->SnapshotOwnedKeys();
-  }
-  FillBundle(req.add_bundles(), snapshot);
-
-  ::umbp::HeartbeatResponse resp;
+grpc::Status MasterClient::SendHeartbeatRpcLocked(::umbp::HeartbeatRequest& req,
+                                                  ::umbp::HeartbeatResponse* resp) {
   grpc::ClientContext ctx;
   ctx.set_deadline(std::chrono::system_clock::now() +
                    std::chrono::milliseconds(RpcShutdownTimeoutMs()));
   grpc::Status status;
   {
     ScopedRpcTimer _rpc_timer(this, "Heartbeat");
-    status = GetStub(stub_.get())->Heartbeat(&ctx, req, &resp);
+    status = GetStub(stub_.get())->Heartbeat(&ctx, req, resp);
     _rpc_timer.SetStatus(status);
   }
-  if (!status.ok()) {
-    MORI_UMBP_WARN("[Client] Full-sync heartbeat failed: error={}", status.error_message());
-    return false;
+  if (!status.ok()) return status;
+  std::lock_guard state_lock(hb_state_mutex_);
+  hb_last_acked_seq_ = resp->acked_seq();
+  while (!outbox_.empty() && outbox_.front().seq <= hb_last_acked_seq_) {
+    outbox_.pop_front();
   }
-  {
-    std::lock_guard state_lock(hb_state_mutex_);
-    hb_last_acked_seq_ = resp.acked_seq();
-    while (!outbox_.empty() && outbox_.front().seq <= hb_last_acked_seq_) {
-      outbox_.pop_front();
-    }
-    request_full_sync_ = request_full_sync_ || resp.request_full_sync();
-  }
-  return true;
+  return status;
 }
 
 // ---------------------------------------------------------------------------
