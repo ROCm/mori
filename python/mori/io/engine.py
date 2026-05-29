@@ -213,3 +213,6 @@ class IOEngine:
         if found:
             return transfer_status
         return None
+
+    def wait_all(self, statuses, timeout_ms: int = -1) -> "mori_cpp.StatusCode":
+        return self._engine.WaitAll(statuses, timeout_ms)
