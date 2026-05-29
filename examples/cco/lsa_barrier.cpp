@@ -23,7 +23,7 @@
 /*
  * CCo LSA Barrier Example (intra-node ccoLsaBarrierSession)
  *
- * Five UT cases, each on its own dedicated lsaBarrier slot:
+ * UT cases, each on its own dedicated lsaBarrier slot:
  *
  *   slot 0/1/2 — visibility (BLOCK / WARP / THREAD groups)
  *                Per-iter producer/consumer protocol with two syncs per iter,
@@ -39,6 +39,26 @@
  *                lsaRank 0 deliberately skips arrive/wait. Survivors enter
  *                bar.sync(timeoutCycles) and must return rc=1 (timeout)
  *                instead of hanging. Skipped when lsaSize<2.
+ *   slot 5 — arrive()/wait() split (BLOCK)
+ *                Tests the decoupled producer/consumer path: arrive, do local
+ *                work, then wait — instead of the fused sync().
+ *   slot 6 — epoch-persistence via cookie continuity (BLOCK)
+ *                K chained launches whose cookie sequence CONTINUES across the
+ *                launch boundary (buffer NOT reset). Unlike `stress` (which
+ *                only catches a hang), a broken ctor-restore / dtor-persist
+ *                makes the first sync of launch k>0 false-match the stale inbox
+ *                and read the WRONG cookie → caught as a payload mismatch.
+ *   slot 7/8 — multi-slot isolation (BLOCK)
+ *                Two sessions on two different slots interleaved in one kernel,
+ *                each with its own payload. Catches inbox addressing collisions
+ *                across barrier indices (index*lsaSize term in ucInbox()).
+ *   slot 9 — epoch wraparound (BLOCK)
+ *                Epoch + inbox preset to ~UINT32_MAX, then synced across the
+ *                2^32 boundary. Exercises the rolling less-equal compare at the
+ *                exact wrap point (its whole reason for existing).
+ *   slot 0 (reused) — single-rank no-op
+ *                lsaSize==1: arrive writes nothing, wait spins 0 times. Only
+ *                runs when lsaSize==1, else skipped.
  *
  * Run:
  *   mpirun --allow-run-as-root -np 8 ./examples/lsa_barrier
@@ -157,6 +177,154 @@ __global__ void barrier_timeout_kernel(ccoDevComm* dc, uint32_t slot, uint64_t t
   outRc[dc->lsaRank] = rc;
 }
 
+// Split kernel — same producer/consumer payload check as visibility, but the
+// first barrier of each round is driven by the DECOUPLED arrive()/wait() pair
+// (with unrelated local work in between) instead of the fused sync(). Verifies
+// the split API is first-class: arrive must publish the cookie (release fence)
+// and wait must observe all peers before the read-back.
+template <typename Coop>
+__global__ void barrier_split_kernel(ccoDevComm* dc, ccoWindow_t win, size_t off, uint32_t iters,
+                                     uint32_t slot, int* errors) {
+  Coop g;
+  ccoLsaBarrierSession<Coop> bar(g, dc, dc->lsaBarrier, slot);
+
+  const int N = dc->lsaSize;
+  const int myRank = dc->lsaRank;
+  constexpr uint32_t MUL = 1000003u;
+
+  uint32_t* myBuf = static_cast<uint32_t*>(getLocalPtr(win, off));
+
+  int localErr = 0;
+  for (uint32_t e = 1; e <= iters; ++e) {
+    if (g.thread_rank() == 0) {
+      myBuf[0] = e * MUL + static_cast<uint32_t>(myRank);
+    }
+    // Decoupled: signal arrival, do unrelated local work, then block on peers.
+    bar.arrive(g);
+    uint32_t acc = 0;
+    for (int s = 0; s < 128; ++s) acc += e + s;
+    if (acc == 0xFFFFFFFFu) myBuf[0] ^= acc;  // keep the loop from being elided
+    bar.wait(g);
+
+    for (int p = g.thread_rank(); p < N; p += g.size()) {
+      uint32_t v = static_cast<uint32_t*>(getLsaPeerPtr(win, p, off))[0];
+      if (v != e * MUL + static_cast<uint32_t>(p)) localErr |= 1;
+    }
+    bar.sync(g);  // separator before the next overwrite
+  }
+
+  if (localErr != 0) {
+    atomicAdd(errors, 1);
+  }
+}
+
+// Persist kernel — like visibility but the cookie tag uses a GLOBAL epoch
+// (epochBase + e) that the host CONTINUES across launches, and the host does
+// NOT reset the payload buffer between launches. If ctor-restore / dtor-persist
+// is broken, launch k>0 restarts its epoch at 0, false-matches the stale inbox
+// on the first sync, and reads the previous launch's leftover cookie → mismatch.
+__global__ void barrier_persist_kernel(ccoDevComm* dc, ccoWindow_t win, size_t off,
+                                       uint32_t epochBase, uint32_t iters, uint32_t slot,
+                                       int* errors) {
+  ccoCoopBlock g;
+  ccoLsaBarrierSession<ccoCoopBlock> bar(g, dc, dc->lsaBarrier, slot);
+
+  const int N = dc->lsaSize;
+  const int myRank = dc->lsaRank;
+  constexpr uint32_t MUL = 1000003u;
+
+  uint32_t* myBuf = static_cast<uint32_t*>(getLocalPtr(win, off));
+
+  int localErr = 0;
+  for (uint32_t e = 1; e <= iters; ++e) {
+    uint32_t tag = (epochBase + e) * MUL;
+    if (g.thread_rank() == 0) {
+      myBuf[0] = tag + static_cast<uint32_t>(myRank);
+    }
+    bar.sync(g);
+
+    for (int p = g.thread_rank(); p < N; p += g.size()) {
+      uint32_t v = static_cast<uint32_t*>(getLsaPeerPtr(win, p, off))[0];
+      if (v != tag + static_cast<uint32_t>(p)) localErr |= 1;
+    }
+    bar.sync(g);
+  }
+
+  if (localErr != 0) {
+    atomicAdd(errors, 1);
+  }
+}
+
+// Multi-slot kernel — two independent barriers (slotA, slotB) interleaved in a
+// single kernel, each carrying its own payload at a distinct window offset.
+// If the per-index inbox addressing (index*lsaSize in ucInbox) is wrong, the
+// two barriers stomp each other's slots and the payload check fails.
+__global__ void barrier_multislot_kernel(ccoDevComm* dc, ccoWindow_t win, uint32_t slotA,
+                                         uint32_t slotB, uint32_t iters, int* errors) {
+  ccoCoopBlock g;
+  ccoLsaBarrierSession<ccoCoopBlock> barA(g, dc, dc->lsaBarrier, slotA);
+  ccoLsaBarrierSession<ccoCoopBlock> barB(g, dc, dc->lsaBarrier, slotB);
+
+  const int N = dc->lsaSize;
+  const int myRank = dc->lsaRank;
+  constexpr uint32_t MULA = 1000003u;
+  constexpr uint32_t MULB = 2000029u;
+  const size_t offA = 0;
+  const size_t offB = 32;
+
+  uint32_t* bufA = static_cast<uint32_t*>(getLocalPtr(win, offA));
+  uint32_t* bufB = static_cast<uint32_t*>(getLocalPtr(win, offB));
+
+  int localErr = 0;
+  for (uint32_t e = 1; e <= iters; ++e) {
+    if (g.thread_rank() == 0) {
+      bufA[0] = e * MULA + static_cast<uint32_t>(myRank);
+      bufB[0] = e * MULB + static_cast<uint32_t>(myRank);
+    }
+    barA.sync(g);
+    for (int p = g.thread_rank(); p < N; p += g.size()) {
+      uint32_t v = static_cast<uint32_t*>(getLsaPeerPtr(win, p, offA))[0];
+      if (v != e * MULA + static_cast<uint32_t>(p)) localErr |= 1;
+    }
+    barB.sync(g);
+    for (int p = g.thread_rank(); p < N; p += g.size()) {
+      uint32_t v = static_cast<uint32_t*>(getLsaPeerPtr(win, p, offB))[0];
+      if (v != e * MULB + static_cast<uint32_t>(p)) localErr |= 1;
+    }
+    barA.sync(g);  // separators before the next overwrite
+    barB.sync(g);
+  }
+
+  if (localErr != 0) {
+    atomicAdd(errors, 1);
+  }
+}
+
+// Preset kernel — directly seeds a barrier slot's persisted epoch AND its inbox
+// slots to `val` on the LOCAL rank, mirroring the addressing in
+// ccoLsaBarrierSession's ctor / ucInbox(). Used to park the epoch just below
+// 2^32 so the next run crosses the wraparound boundary. Presetting the inbox to
+// the same value keeps the very first compare consistent (so it doesn't
+// false-match a stale 0 that looks "ahead" of an epoch near UINT32_MAX).
+//
+// State layout (cco_lsa_types.hpp):
+//   [0,nB)        multimem epoch
+//   [nB,2nB)      unicast epoch   <- ctor restores state[nB + slot]
+//   [2nB,3nB)     multimem inbox
+//   [3nB, ...)    ucInbox[slot][peer] = state[3nB + slot*lsaSize + peer]
+__global__ void barrier_preset_kernel(ccoDevComm* dc, uint32_t slot, uint32_t val) {
+  if (threadIdx.x != 0 || blockIdx.x != 0) return;
+  const auto& rw = dc->resourceWindow_inlined;
+  char* base = rw.winBase + ((uint64_t)dc->lsaRank * rw.stride4G << 32);
+  uint32_t* state = reinterpret_cast<uint32_t*>(base + dc->lsaBarrier.bufOffset);
+  const int nB = dc->lsaBarrier.nBarriers;
+  const int N = dc->lsaSize;
+  state[nB + slot] = val;  // unicast epoch slot restored by ctor
+  for (int peer = 0; peer < N; ++peer) {
+    state[3 * nB + slot * N + peer] = val;  // ucInbox[slot][peer]
+  }
+}
+
 // ============================================================================
 // UT framework
 // ============================================================================
@@ -175,14 +343,6 @@ struct UtCtx {
 };
 
 using UtFn = int (*)(UtCtx&);
-
-// Small helper: rank-0 prints a one-line PASS/FAIL summary.
-static void log_result(const UtCtx& ctx, const char* name, uint32_t slot, int errors,
-                       const char* tail = "") {
-  if (ctx.rank != 0) return;
-  std::printf("  [%-6s] slot=%u  errors=%d  %s%s\n", name, slot, errors,
-              errors == 0 ? "PASS" : "FAIL", tail);
-}
 
 // ============================================================================
 // UT cases
@@ -231,7 +391,7 @@ static int ut_visibility_thread(UtCtx& ctx) {
 //   next kernel's wait either hangs (best case: caught here) or
 //   false-positives (worst case: silently corrupts other tests).
 static int ut_stress(UtCtx& ctx) {
-  constexpr uint32_t kStressIters = 10;
+  constexpr uint32_t kStressIters = 4096;
   constexpr int kLaunches = 4;
   constexpr uint32_t kSlot = 3u;
 
@@ -308,17 +468,153 @@ static int ut_timeout(UtCtx& ctx) {
   return ok ? 0 : 1;
 }
 
+// UT 6 — arrive()/wait() split (slot 5)
+static int ut_arrive_wait_split(UtCtx& ctx) {
+  constexpr uint32_t kSlot = 5u;
+  constexpr uint32_t kIters = 5000u;
+
+  HIP_CHECK(hipMemset(ctx.devErrors, 0, sizeof(int)));
+  hipLaunchKernelGGL(barrier_split_kernel<ccoCoopBlock>, dim3(1), dim3(256), 0, 0, ctx.devComm,
+                     ctx.sendWin, (size_t)0, kIters, kSlot, ctx.devErrors);
+  HIP_CHECK(hipDeviceSynchronize());
+
+  int hostErr = 0;
+  HIP_CHECK(hipMemcpy(&hostErr, ctx.devErrors, sizeof(int), hipMemcpyDeviceToHost));
+  if (ctx.rank == 0) {
+    std::printf("  [split ] slot=%u iters=%u  errors=%d  %s\n", kSlot, kIters, hostErr,
+                hostErr == 0 ? "PASS" : "FAIL");
+  }
+  ccoBarrierAll(ctx.comm);
+  return hostErr == 0 ? 0 : 1;
+}
+
+// UT 7 — epoch persistence via cookie continuity (slot 6)
+//   Unlike ut_stress (hang-only), this CONTINUES the cookie sequence across
+//   launches and never resets the buffer, so a broken ctor/dtor epoch round-
+//   trip surfaces as a payload mismatch on the launch boundary, not just a hang.
+static int ut_persist_cookie(UtCtx& ctx) {
+  constexpr uint32_t kSlot = 6u;
+  constexpr uint32_t kItersPerLaunch = 200u;
+  constexpr int kLaunches = 4;
+
+  HIP_CHECK(hipMemset(ctx.devErrors, 0, sizeof(int)));
+  // NOTE: do NOT reset ctx.sendWin between launches — stale payload is exactly
+  // what exposes a false-matched first sync when persistence is broken.
+  for (int k = 0; k < kLaunches; ++k) {
+    uint32_t epochBase = static_cast<uint32_t>(k) * kItersPerLaunch;
+    hipLaunchKernelGGL(barrier_persist_kernel, dim3(1), dim3(256), 0, 0, ctx.devComm, ctx.sendWin,
+                       (size_t)0, epochBase, kItersPerLaunch, kSlot, ctx.devErrors);
+    HIP_CHECK(hipDeviceSynchronize());
+    ccoBarrierAll(ctx.comm);
+  }
+
+  int hostErr = 0;
+  HIP_CHECK(hipMemcpy(&hostErr, ctx.devErrors, sizeof(int), hipMemcpyDeviceToHost));
+  if (ctx.rank == 0) {
+    std::printf("  [persis] slot=%u iters=%u launches=%d  errors=%d  %s\n", kSlot, kItersPerLaunch,
+                kLaunches, hostErr, hostErr == 0 ? "PASS" : "FAIL");
+  }
+  ccoBarrierAll(ctx.comm);
+  return hostErr == 0 ? 0 : 1;
+}
+
+// UT 8 — multi-slot isolation (slots 7 & 8)
+static int ut_multislot(UtCtx& ctx) {
+  constexpr uint32_t kSlotA = 7u;
+  constexpr uint32_t kSlotB = 8u;
+  constexpr uint32_t kIters = 5000u;
+
+  HIP_CHECK(hipMemset(ctx.devErrors, 0, sizeof(int)));
+  hipLaunchKernelGGL(barrier_multislot_kernel, dim3(1), dim3(256), 0, 0, ctx.devComm, ctx.sendWin,
+                     kSlotA, kSlotB, kIters, ctx.devErrors);
+  HIP_CHECK(hipDeviceSynchronize());
+
+  int hostErr = 0;
+  HIP_CHECK(hipMemcpy(&hostErr, ctx.devErrors, sizeof(int), hipMemcpyDeviceToHost));
+  if (ctx.rank == 0) {
+    std::printf("  [mslot ] slots=%u,%u iters=%u  errors=%d  %s\n", kSlotA, kSlotB, kIters, hostErr,
+                hostErr == 0 ? "PASS" : "FAIL");
+  }
+  ccoBarrierAll(ctx.comm);
+  return hostErr == 0 ? 0 : 1;
+}
+
+// UT 9 — epoch wraparound (slot 9)
+//   Park epoch + inbox just below 2^32, then sync across the boundary with the
+//   payload-checked visibility protocol. The rolling less-equal compare must
+//   stay correct as epoch+1 wraps 0xFFFFFFFF → 0.
+static int ut_wraparound(UtCtx& ctx) {
+  constexpr uint32_t kSlot = 9u;
+  constexpr uint32_t kPreset = 0xFFFFFFFEu;  // 2 syncs later epoch wraps past 0
+  constexpr uint32_t kIters = 64u;
+
+  // Seed epoch + inbox on every rank, then make sure all presets land before
+  // anyone opens a session on this slot.
+  hipLaunchKernelGGL(barrier_preset_kernel, dim3(1), dim3(1), 0, 0, ctx.devComm, kSlot, kPreset);
+  HIP_CHECK(hipDeviceSynchronize());
+  ccoBarrierAll(ctx.comm);
+
+  HIP_CHECK(hipMemset(ctx.devErrors, 0, sizeof(int)));
+  hipLaunchKernelGGL(barrier_visibility_kernel<ccoCoopBlock>, dim3(1), dim3(256), 0, 0, ctx.devComm,
+                     ctx.sendWin, (size_t)0, kIters, kSlot, ctx.devErrors);
+  HIP_CHECK(hipDeviceSynchronize());
+
+  int hostErr = 0;
+  HIP_CHECK(hipMemcpy(&hostErr, ctx.devErrors, sizeof(int), hipMemcpyDeviceToHost));
+  if (ctx.rank == 0) {
+    std::printf("  [wrap  ] slot=%u preset=0x%08X iters=%u  errors=%d  %s\n", kSlot, kPreset, kIters,
+                hostErr, hostErr == 0 ? "PASS" : "FAIL");
+  }
+  ccoBarrierAll(ctx.comm);
+  return hostErr == 0 ? 0 : 1;
+}
+
+// UT 10 — single-rank no-op (slot 0, reused)
+//   Only meaningful with lsaSize==1: arrive writes nothing (nranks-1==0) and
+//   wait spins zero times, so sync() must be an instant no-op that completes.
+static int ut_single_rank(UtCtx& ctx) {
+  if (ctx.dcHost.lsaSize != 1) {
+    if (ctx.rank == 0) {
+      std::printf("  [single] skipped (lsaSize=%d != 1)\n", ctx.dcHost.lsaSize);
+    }
+    return 0;
+  }
+
+  constexpr uint32_t kIters = 1000u;
+  int* devCompleted = nullptr;
+  HIP_CHECK(hipMalloc(&devCompleted, sizeof(int)));
+  HIP_CHECK(hipMemset(devCompleted, 0, sizeof(int)));
+  hipLaunchKernelGGL(barrier_stress_kernel, dim3(1), dim3(256), 0, 0, ctx.devComm, kIters,
+                     /*slot=*/0u, devCompleted);
+  HIP_CHECK(hipDeviceSynchronize());
+  int completed = 0;
+  HIP_CHECK(hipMemcpy(&completed, devCompleted, sizeof(int), hipMemcpyDeviceToHost));
+  HIP_CHECK(hipFree(devCompleted));
+
+  bool ok = (completed == 1);
+  if (ctx.rank == 0) {
+    std::printf("  [single] iters=%u  %s\n", kIters, ok ? "PASS" : "FAIL");
+  }
+  ccoBarrierAll(ctx.comm);
+  return ok ? 0 : 1;
+}
+
 // Aggregate driver — runs all UTs in order, returns total #failures.
 static int run_all_tests(UtCtx& ctx) {
   static const struct {
     const char* name;
     UtFn fn;
   } kCases[] = {
-      // {"block", ut_visibility_block},
-      // {"warp", ut_visibility_warp},
-      // {"thread", ut_visibility_thread},
+      {"block", ut_visibility_block},
+      {"warp", ut_visibility_warp},
+      {"thread", ut_visibility_thread},
       {"stress", ut_stress},
-      // {"timeo", ut_timeout},
+      {"timeo", ut_timeout},
+      {"split", ut_arrive_wait_split},
+      {"persis", ut_persist_cookie},
+      {"mslot", ut_multislot},
+      {"wrap", ut_wraparound},
+      {"single", ut_single_rank},
   };
 
   int fails = 0;
@@ -359,10 +655,10 @@ int main(int argc, char* argv[]) {
   assert(ccoWindowRegister(comm, COOKIE_BYTES, &sendWin, &sendBuf) == 0);
   HIP_CHECK(hipMemset(sendBuf, 0, COOKIE_BYTES));
 
-  // ── Phase 3: DevComm with 5 LSA barrier slots ──
+  // ── Phase 3: DevComm with LSA barrier slots (0..9 used by the UTs) ──
   ccoDevCommRequirements reqs = CCO_DEV_COMM_REQUIREMENTS_INITIALIZER;
   reqs.gdaConnectionType = CCO_GDA_CONNECTION_NONE;
-  reqs.lsaBarrierCount = 5;
+  reqs.lsaBarrierCount = 10;
   ccoDevComm* devComm = nullptr;
   assert(ccoDevCommCreate(comm, &reqs, &devComm) == 0);
 
