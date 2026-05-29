@@ -122,7 +122,6 @@ void FinalizeRuntime(ShmemStates* states) {
     ms.barrierFunc = nullptr;
   }
   states->gpuStates = {};
-  GpuStatesProviders().clear();
 }
 
 /* ---------------------------------------------------------------------------------------------- */
