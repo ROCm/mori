@@ -67,6 +67,12 @@ class PeerDramAllocator : public OwnedLocationSource {
   struct TierConfig {
     std::vector<uint64_t> buffer_sizes;
     std::vector<std::vector<uint8_t>> buffer_descs;  // packed mori::io::MemoryDesc bytes
+    // Local host base pointer of each buffer (same order as buffer_sizes).
+    // Used by AcquireDramCopyPin to resolve a (buffer_index, page_index)
+    // page to a directly-readable local pointer for the SSD copy worker.
+    // Empty is allowed for tiers/deployments with no DRAM copy (e.g. unit
+    // tests that never pin); pin acquisition then yields no segments.
+    std::vector<void*> buffer_bases;
   };
 
   // `pending_ttl` is the only TTL in the system.  After this elapses
@@ -199,6 +205,32 @@ class PeerDramAllocator : public OwnedLocationSource {
   // For every key actually freed, a REMOVE event is queued.
   std::vector<EvictResult> Evict(const std::vector<std::string>& keys);
 
+  // -------- DRAM copy pin (SSD copy-on-commit, Phase 2) --------
+
+  // A copy pin protects a committed key's DRAM pages from eviction while
+  // the SSD copy worker reads them.  It is an in-process lifetime guard
+  // (NOT a master lease): pages stay readable until ReleaseDramCopyPin.
+  // `segments` are directly-readable local pointers + lengths (pages may
+  // be non-contiguous across buffers).
+  struct DramCopyPin {
+    std::vector<std::pair<const void*, size_t>> segments;
+    size_t total_size = 0;
+    uint64_t pin_token = 0;  // release-time validation
+  };
+
+  // Atomically (under mutex_) confirm `key` is owned, mark it pinned, and
+  // resolve its pages to local segments.  Returns nullopt if the key is
+  // not owned (already evicted -> worker drops the task) or is already
+  // pinned (duplicate task).  While pinned, Evict(key) reports
+  // bytes_freed=0 and emits no REMOVE DRAM (master retries next round).
+  // There is NO TTL: the pin lives until ReleaseDramCopyPin.  The caller
+  // MUST release (use a RAII guard) so a worker exit always frees the pin.
+  std::optional<DramCopyPin> AcquireDramCopyPin(const std::string& key);
+
+  // Release a pin.  No-op if the key is not pinned or the token does not
+  // match (tolerates duplicate / late release).
+  void ReleaseDramCopyPin(const std::string& key, uint64_t pin_token);
+
   // -------- Distributed Clear --------
 
   // Drop owned/lease state, bump allocator_generation_ so pre-clear
@@ -275,6 +307,16 @@ class PeerDramAllocator : public OwnedLocationSource {
   // is still in the future.  Drops the entry if it has expired.
   bool HasActiveReadLeaseLocked(const std::string& key);
 
+  // Caller MUST hold `mutex_`.  True iff `key` currently has an active
+  // copy pin (protects its pages from eviction).
+  bool HasActivePinLocked(const std::string& key) const;
+
+  // Caller MUST hold `mutex_`.  Resolve `pages` to directly-readable
+  // local segments via the per-tier buffer bases.  Empty if the tier has
+  // no bases configured.
+  std::vector<std::pair<const void*, size_t>> BuildCopySegmentsLocked(
+      TierType tier, const std::vector<PageLocation>& pages, uint64_t total_size) const;
+
   // Caller MUST hold `mutex_`.
   std::vector<BufferMemoryDescBytes> BuildBufferDescsLocked(
       TierType tier, const std::vector<PageLocation>& pages) const;
@@ -299,11 +341,26 @@ class PeerDramAllocator : public OwnedLocationSource {
 
   std::map<TierType, std::unique_ptr<PageBitmapAllocator>> allocators_;
   std::map<TierType, std::vector<std::vector<uint8_t>>> tier_descs_;
+  // Per-tier local host base pointer per buffer_index (parallel to the
+  // allocator's buffers).  Source of truth for page -> local pointer used
+  // by AcquireDramCopyPin.
+  std::map<TierType, std::vector<void*>> tier_bases_;
 
   std::unordered_map<uint64_t, PendingSlot> pending_;
   std::unordered_map<std::string, OwnedSlot> owned_;
   std::unordered_map<std::string, std::chrono::steady_clock::time_point> read_lease_until_;
   std::vector<KvEvent> pending_events_;
+
+  // Active copy pins.  An entry means `key`'s owned pages are protected
+  // from eviction until ReleaseDramCopyPin.  No TTL: lifetime is bound to
+  // the worker via a RAII guard, not a deadline (force-freeing under an
+  // in-flight backend Write would be a use-after-free).
+  struct PinState {
+    uint64_t token = 0;
+    std::chrono::steady_clock::time_point acquired_at;  // for long-running warning only
+  };
+  std::unordered_map<std::string, PinState> pins_;
+  uint64_t next_pin_token_ = 1;
 
   std::vector<DeferredFree> deferred_frees_;
 

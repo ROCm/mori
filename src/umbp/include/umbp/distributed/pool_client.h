@@ -44,6 +44,7 @@ namespace mori::umbp {
 class PeerDramAllocator;
 class PeerServiceServer;
 class PeerSsdManager;
+class SsdCopyPipeline;
 
 // Short name for log output. Generic FAILED maps to "FAILED" — the
 // detailed reason for that case lives in the peer's allocator log.
@@ -167,6 +168,11 @@ class PoolClient {
   // with MasterClient as an owned-location source + SSD capacity provider.
   // Phase 1: present and reporting, but nothing writes/reads it yet.
   std::unique_ptr<PeerSsdManager> peer_ssd_;
+  // Async copy-on-commit pipeline (Phase 2).  Built only when SSD is enabled;
+  // borrows peer_alloc_ (pin source) + peer_ssd_ (write target).  Started in
+  // Init, stopped in Shutdown (after the peer service so no commit can enqueue
+  // into a stopped pipeline).
+  std::unique_ptr<SsdCopyPipeline> ssd_copy_pipeline_;
   std::unique_ptr<PeerServiceServer> peer_service_;
 
   std::unique_ptr<mori::io::IOEngine> io_engine_;

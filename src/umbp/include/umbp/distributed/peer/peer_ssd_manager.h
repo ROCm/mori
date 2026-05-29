@@ -84,6 +84,14 @@ class PeerSsdManager : public OwnedLocationSource {
   // Phase 4: local LRU victim selection.  Minimal stub in Phase 1.
   std::vector<std::string> SelectVictims(size_t bytes_to_free);
 
+  // Distributed Clear: drop the logical owned-location map + undrained
+  // events so a post-Clear full-sync snapshot is empty and no stale ADD
+  // SSD is shipped.  Physical backend bytes are intentionally left in
+  // place (best-effort cache; reclaimed by Phase 4 local eviction).
+  // Callers MUST quiesce the SSD copy pipeline first so no in-flight copy
+  // re-populates owned_ right after this returns.
+  void ClearLocal();
+
   // Phase 3: read the key's bytes into a staging slot.  Minimal stub in
   // Phase 1 (always kNotFound); the real key-based read path lands in Phase 3.
   SsdReadOutcome PrepareRead(const std::string& key, void* staging_ptr, size_t staging_cap);

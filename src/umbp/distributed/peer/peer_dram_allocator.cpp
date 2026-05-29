@@ -22,6 +22,7 @@
 #include "umbp/distributed/peer/peer_dram_allocator.h"
 
 #include <algorithm>
+#include <cassert>
 #include <stdexcept>
 #include <utility>
 
@@ -61,8 +62,14 @@ PeerDramAllocator::PeerDramAllocator(uint64_t page_size, TierConfig dram, TierCo
     if (cfg.buffer_sizes.size() != cfg.buffer_descs.size()) {
       throw std::invalid_argument("PeerDramAllocator: buffer_sizes / buffer_descs length mismatch");
     }
+    // buffer_bases is optional (deployments / tests that never pin leave it
+    // empty); when present it must line up with the buffers one-to-one.
+    if (!cfg.buffer_bases.empty() && cfg.buffer_bases.size() != cfg.buffer_sizes.size()) {
+      throw std::invalid_argument("PeerDramAllocator: buffer_bases / buffer_sizes length mismatch");
+    }
     allocators_.emplace(tier, std::make_unique<PageBitmapAllocator>(page_size, cfg.buffer_sizes));
     tier_descs_.emplace(tier, std::move(cfg.buffer_descs));
+    tier_bases_.emplace(tier, std::move(cfg.buffer_bases));
   };
   install_tier(TierType::DRAM, dram);
   install_tier(TierType::HBM, hbm);
@@ -295,6 +302,13 @@ std::vector<PeerDramAllocator::EvictResult> PeerDramAllocator::Evict(
       out.push_back(std::move(r));
       continue;
     }
+    if (HasActivePinLocked(key)) {
+      // An SSD copy worker is reading these pages.  Do NOT free them, do
+      // NOT emit REMOVE DRAM, keep the key owned.  bytes_freed=0 tells
+      // master to retry; the pin is released when the copy finishes.
+      out.push_back(std::move(r));
+      continue;
+    }
     if (auto* alloc = AllocatorForLocked(it->second.tier)) {
       alloc->Deallocate(it->second.pages);
     }
@@ -306,6 +320,55 @@ std::vector<PeerDramAllocator::EvictResult> PeerDramAllocator::Evict(
   return out;
 }
 
+std::optional<PeerDramAllocator::DramCopyPin> PeerDramAllocator::AcquireDramCopyPin(
+    const std::string& key) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto it = owned_.find(key);
+  if (it == owned_.end()) return std::nullopt;              // already evicted -> drop task
+  if (pins_.find(key) != pins_.end()) return std::nullopt;  // duplicate task
+
+  DramCopyPin pin;
+  pin.total_size = it->second.size;
+  pin.segments = BuildCopySegmentsLocked(it->second.tier, it->second.pages, it->second.size);
+  pin.pin_token = next_pin_token_++;
+  pins_[key] = PinState{pin.pin_token, std::chrono::steady_clock::now()};
+  return pin;
+}
+
+void PeerDramAllocator::ReleaseDramCopyPin(const std::string& key, uint64_t pin_token) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto it = pins_.find(key);
+  if (it == pins_.end() || it->second.token != pin_token) return;  // tolerate late/dup release
+  pins_.erase(it);
+}
+
+bool PeerDramAllocator::HasActivePinLocked(const std::string& key) const {
+  return pins_.find(key) != pins_.end();
+}
+
+std::vector<std::pair<const void*, size_t>> PeerDramAllocator::BuildCopySegmentsLocked(
+    TierType tier, const std::vector<PageLocation>& pages, uint64_t total_size) const {
+  std::vector<std::pair<const void*, size_t>> segments;
+  auto it = tier_bases_.find(tier);
+  if (it == tier_bases_.end() || it->second.empty()) return segments;
+  const auto& bases = it->second;
+  segments.reserve(pages.size());
+  uint64_t remaining = total_size;
+  for (const auto& p : pages) {
+    if (p.buffer_index >= bases.size() || bases[p.buffer_index] == nullptr) {
+      MORI_UMBP_ERROR("[PeerDramAllocator] copy segment: bad buffer_index {} (bases={})",
+                      p.buffer_index, bases.size());
+      return {};
+    }
+    // Last page may be partial; earlier pages are full page_size.
+    const uint64_t bytes = std::min<uint64_t>(page_size_, remaining);
+    const char* base = static_cast<const char*>(bases[p.buffer_index]);
+    segments.emplace_back(base + static_cast<uint64_t>(p.page_index) * page_size_, bytes);
+    remaining -= bytes;
+  }
+  return segments;
+}
+
 void PeerDramAllocator::ClearLocal() {
   std::lock_guard<std::mutex> lock(mutex_);
   const auto now = std::chrono::steady_clock::now();
@@ -315,9 +378,23 @@ void PeerDramAllocator::ClearLocal() {
   // freed by the writer's Commit or by the reaper's TTL path.
   ++allocator_generation_;
 
-  // Owned: defer pages with an active read lease (RDMA read may still
-  // be in flight); free others immediately.  No REMOVE events — the
-  // upcoming full-sync empty snapshot collapses master's index.
+  // pins_ should be empty because PoolClient::Clear quiesces the copy pipeline.
+  // If not, this is a caller bug; log loudly.  We do not support clearing with
+  // active copy pins and make no attempt to salvage them here.  A debug assert
+  // turns this into a hard failure under test/CI; release builds keep running
+  // (the freed pages cannot be reused until ClearFullSyncAcked re-enables
+  // Allocate, so this stays UAF-safe in practice).
+  if (!pins_.empty()) {
+    MORI_UMBP_ERROR(
+        "[PeerDramAllocator] ClearLocal with {} active copy pin(s) — caller did not quiesce "
+        "the copy pipeline (bug)",
+        pins_.size());
+    assert(pins_.empty() && "ClearLocal called with active copy pins; quiesce the pipeline first");
+  }
+
+  // Owned: defer pages with an active read lease (an RDMA read may still be in
+  // flight) until their lease deadline; free the rest immediately.  No REMOVE
+  // events — the upcoming full-sync empty snapshot collapses master's index.
   for (auto& [key, slot] : owned_) {
     auto lease_it = read_lease_until_.find(key);
     if (lease_it != read_lease_until_.end() && lease_it->second > now) {
@@ -335,8 +412,9 @@ void PeerDramAllocator::ClearLocal() {
   }
   owned_.clear();
 
-  // Active deadlines that mattered are already in deferred_frees_.
+  // Active read-lease deadlines that mattered are already in deferred_frees_.
   read_lease_until_.clear();
+  pins_.clear();
 
   // Drop any queued ADD/REMOVE that the heartbeat hasn't shipped yet:
   // the snapshot we're about to send is the authoritative state.
@@ -484,6 +562,18 @@ void PeerDramAllocator::ReaperSweep() {
       it = read_lease_until_.erase(it);
     } else {
       ++it;
+    }
+  }
+
+  // Warn about copy pins held far longer than any healthy copy should
+  // take.  We never force-free a pin (a worker may still be reading its
+  // segments — freeing would be a use-after-free); this is purely an
+  // observability signal that a copy worker is stuck.
+  constexpr std::chrono::seconds kLongRunningPinWarn{30};
+  for (const auto& [key, pin] : pins_) {
+    if (now - pin.acquired_at > kLongRunningPinWarn) {
+      MORI_UMBP_WARN("[PeerDramAllocator] copy pin for key='{}' held >{}s — copy worker stuck?",
+                     key, kLongRunningPinWarn.count());
     }
   }
 

@@ -36,6 +36,7 @@ class LocalStorageManager;
 class LocalBlockIndex;
 class PeerDramAllocator;
 class MasterClient;
+class SsdCopyPipeline;
 
 struct StagingMetrics {
   std::atomic<uint64_t> expired_reclaims{0};
@@ -59,9 +60,13 @@ class PeerServiceServer {
                     PeerDramAllocator* dram_alloc = nullptr, int num_read_slots = 8,
                     int lease_timeout_s = 10, std::vector<uint8_t> engine_desc_bytes = {},
                     MasterClient* master_client = nullptr);
+  // `copy_pipeline` (non-owning, may be null when SSD is disabled) receives an
+  // SsdCopyTask after each successful DRAM commit so the owner peer copies the
+  // committed bytes to its local SSD tier asynchronously.
   PeerServiceServer(PeerDramAllocator* dram_alloc, int num_read_slots = 8, int lease_timeout_s = 10,
                     std::vector<uint8_t> engine_desc_bytes = {},
-                    MasterClient* master_client = nullptr);
+                    MasterClient* master_client = nullptr,
+                    SsdCopyPipeline* copy_pipeline = nullptr);
   ~PeerServiceServer();
 
   bool Start(uint16_t port);
@@ -81,6 +86,7 @@ class PeerServiceServer {
   LocalBlockIndex* index_;
   PeerDramAllocator* dram_alloc_;
   MasterClient* master_client_;
+  SsdCopyPipeline* copy_pipeline_ = nullptr;
 
   StagingMetrics metrics_;
 

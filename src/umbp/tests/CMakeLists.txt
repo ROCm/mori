@@ -105,3 +105,15 @@ target_link_libraries(test_peer_ssd_manager PRIVATE umbp_common
 target_compile_features(test_peer_ssd_manager PRIVATE cxx_std_17)
 
 gtest_discover_tests(test_peer_ssd_manager)
+
+# ---------------------------------------------------------------------------
+# test_ssd_copy_pipeline — Phase 2 DramCopyPin + async copy-on-commit pipeline
+# ---------------------------------------------------------------------------
+add_executable(test_ssd_copy_pipeline test_ssd_copy_pipeline.cpp)
+
+target_link_libraries(test_ssd_copy_pipeline PRIVATE umbp_common
+                                                     GTest::gtest_main)
+
+target_compile_features(test_ssd_copy_pipeline PRIVATE cxx_std_17)
+
+gtest_discover_tests(test_ssd_copy_pipeline)

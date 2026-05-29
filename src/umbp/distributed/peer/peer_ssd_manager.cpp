@@ -145,6 +145,12 @@ std::vector<std::string> PeerSsdManager::SelectVictims(size_t /*bytes_to_free*/)
   return {};
 }
 
+void PeerSsdManager::ClearLocal() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  owned_.clear();
+  pending_events_.clear();
+}
+
 SsdReadOutcome PeerSsdManager::PrepareRead(const std::string& /*key*/, void* /*staging_ptr*/,
                                            size_t /*staging_cap*/) {
   // TODO(Phase 3): key-based read into staging (local vs remote SSD get).

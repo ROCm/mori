@@ -33,6 +33,7 @@
 #include "umbp/distributed/master/master_client.h"
 #include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/peer/peer_dram_allocator.h"
+#include "umbp/distributed/peer/ssd_copy_pipeline.h"
 #include "umbp/distributed/types.h"
 #include "umbp/local/block_index/local_block_index.h"
 #include "umbp/local/tiers/local_storage_manager.h"
@@ -163,13 +164,14 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
                       LocalStorageManager* storage, LocalBlockIndex* index,
                       PeerDramAllocator* dram_alloc, MasterClient* master_client,
                       StagingMetrics& metrics, int num_read_slots, int lease_timeout_s,
-                      const std::vector<uint8_t>& engine_desc_bytes)
+                      const std::vector<uint8_t>& engine_desc_bytes, SsdCopyPipeline* copy_pipeline)
       : ssd_staging_base_(ssd_staging_base),
         ssd_staging_size_(ssd_staging_size),
         ssd_staging_mem_desc_bytes_(ssd_staging_mem_desc_bytes),
         storage_(storage),
         index_(index),
         dram_alloc_(dram_alloc),
+        copy_pipeline_(copy_pipeline),
         engine_desc_bytes_(engine_desc_bytes),
         metrics_(metrics),
         lease_timeout_(std::max(lease_timeout_s, 1)),
@@ -333,7 +335,10 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
     uint64_t committed_bytes = 0;
     const bool ok = dram_alloc_->Commit(request->slot_id(), request->key(), committed_bytes);
     response->set_success(ok);
-    if (ok) RecordInboundPut(committed_bytes, "remote");
+    if (ok) {
+      RecordInboundPut(committed_bytes, "remote");
+      EnqueueSsdCopy(request->key(), committed_bytes);
+    }
     return grpc::Status::OK;
   }
 
@@ -446,9 +451,13 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
 
     auto results = dram_alloc_->BatchCommit(entries);
     uint64_t total_committed = 0;
-    for (const auto& result : results) {
+    for (size_t i = 0; i < results.size(); ++i) {
+      const auto& result = results[i];
       response->add_success(result.success);
-      if (result.success) total_committed += result.bytes_committed;
+      if (result.success) {
+        total_committed += result.bytes_committed;
+        EnqueueSsdCopy(entries[i].key, result.bytes_committed);
+      }
     }
     if (total_committed > 0) RecordInboundPut(total_committed, "remote");
     return grpc::Status::OK;
@@ -500,6 +509,13 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
            ssd_staging_size_ > 0;
   }
 
+  // Best-effort enqueue of an async SSD copy after a successful DRAM commit.
+  // No-op when SSD is disabled; never blocks (a full/stopped queue drops).
+  void EnqueueSsdCopy(const std::string& key, uint64_t bytes) {
+    if (copy_pipeline_ == nullptr) return;
+    copy_pipeline_->Enqueue(SsdCopyTask{key, TierType::DRAM, static_cast<size_t>(bytes)});
+  }
+
   void RecordInboundPut(uint64_t bytes, const char* traffic) {
     if (master_client_ == nullptr || bytes == 0) return;
     MasterClient::Labels labels = {{"traffic", std::string(traffic)}};
@@ -522,6 +538,7 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
   LocalStorageManager* storage_;
   LocalBlockIndex* index_;
   PeerDramAllocator* dram_alloc_;
+  SsdCopyPipeline* copy_pipeline_;
   MasterClient* master_client_;
   const std::vector<uint8_t>& engine_desc_bytes_;
   StagingMetrics& metrics_;
@@ -552,22 +569,25 @@ PeerServiceServer::PeerServiceServer(void* ssd_staging_base, size_t ssd_staging_
       engine_desc_bytes_(std::move(engine_desc_bytes)) {
   service_ = std::make_unique<UMBPPeerServiceImpl>(
       ssd_staging_base_, ssd_staging_size_, ssd_staging_mem_desc_bytes_, storage_, index_,
-      dram_alloc_, master_client_, metrics_, num_read_slots, lease_timeout_s, engine_desc_bytes_);
+      dram_alloc_, master_client_, metrics_, num_read_slots, lease_timeout_s, engine_desc_bytes_,
+      /*copy_pipeline=*/nullptr);
 }
 
 PeerServiceServer::PeerServiceServer(PeerDramAllocator* dram_alloc, int num_read_slots,
                                      int lease_timeout_s, std::vector<uint8_t> engine_desc_bytes,
-                                     MasterClient* master_client)
+                                     MasterClient* master_client, SsdCopyPipeline* copy_pipeline)
     : ssd_staging_base_(nullptr),
       ssd_staging_size_(0),
       storage_(nullptr),
       index_(nullptr),
       dram_alloc_(dram_alloc),
       master_client_(master_client),
+      copy_pipeline_(copy_pipeline),
       engine_desc_bytes_(std::move(engine_desc_bytes)) {
   service_ = std::make_unique<UMBPPeerServiceImpl>(
       ssd_staging_base_, ssd_staging_size_, ssd_staging_mem_desc_bytes_, storage_, index_,
-      dram_alloc_, master_client_, metrics_, num_read_slots, lease_timeout_s, engine_desc_bytes_);
+      dram_alloc_, master_client_, metrics_, num_read_slots, lease_timeout_s, engine_desc_bytes_,
+      copy_pipeline_);
 }
 
 PeerServiceServer::~PeerServiceServer() { Stop(); }
@@ -593,6 +613,11 @@ void PeerServiceServer::Stop() {
     const auto deadline = std::chrono::system_clock::now() + GrpcShutdownDeadline();
     MORI_UMBP_INFO("[PeerService] Shutting down");
     server_->Shutdown(deadline);
+    // Block until every in-flight handler has returned (Shutdown's deadline
+    // force-cancels any that overrun).  This guarantees no RPC handler is still
+    // touching borrowed state (dram_alloc_ / copy_pipeline_) after Stop()
+    // returns, so PoolClient can safely tear those down next.
+    server_->Wait();
     server_.reset();
   }
 }

@@ -39,6 +39,7 @@
 #include "umbp/distributed/peer/peer_dram_allocator.h"
 #include "umbp/distributed/peer/peer_service.h"
 #include "umbp/distributed/peer/peer_ssd_manager.h"
+#include "umbp/distributed/peer/ssd_copy_pipeline.h"
 #include "umbp_peer.grpc.pb.h"
 
 namespace mori::umbp {
@@ -159,6 +160,9 @@ PeerDramAllocator::TierConfig BuildDramTierConfig(const std::vector<ExportableDr
     msgpack::sbuffer sbuf;
     msgpack::pack(sbuf, mems[i]);
     cfg.buffer_descs.emplace_back(sbuf.data(), sbuf.data() + sbuf.size());
+    // Local host base pointer, so PeerDramAllocator can resolve a committed
+    // key's pages to readable segments for the SSD copy worker (Phase 2).
+    cfg.buffer_bases.push_back(bufs[i].buffer);
   }
   return cfg;
 }
@@ -252,13 +256,16 @@ bool PoolClient::Init() {
   master_client_->SetPeerDramAllocator(peer_alloc_.get());
 
   // Peer-side SSD tier owner.  Built only when SSD is enabled; registered as an
-  // owned-location event source + SSD capacity provider.  Phase 1: present and
-  // reporting capacity, but nothing writes (copy = Phase 2) or reads (Phase 3)
-  // it yet.  TODO(Phase 2): PoolClient::Clear() must also clear peer_ssd_'s
-  // owned keys once copy-on-commit can populate them.
+  // owned-location event source + SSD capacity provider.  Phase 2 populates it
+  // via the copy-on-commit pipeline below; reads remain Phase 3.  Clear() now
+  // quiesces the pipeline and clears peer_ssd_ alongside peer_alloc_.
   if (config_.ssd.enabled) {
     peer_ssd_ = std::make_unique<PeerSsdManager>(config_.ssd);
     master_client_->SetPeerSsdManager(peer_ssd_.get());
+    // Copy-on-commit pipeline: commits enqueue here, a worker pins the DRAM
+    // pages and writes them to the local SSD tier.  Started below.
+    ssd_copy_pipeline_ = std::make_unique<SsdCopyPipeline>(peer_alloc_.get(), peer_ssd_.get());
+    ssd_copy_pipeline_->Start();
   }
 
   // Pack engine_desc for master registration.
@@ -285,8 +292,9 @@ bool PoolClient::Init() {
   }
 
   if (config_.peer_service_port > 0) {
-    peer_service_ = std::make_unique<PeerServiceServer>(peer_alloc_.get(), 8, 10, engine_desc_bytes,
-                                                        master_client_.get());
+    peer_service_ =
+        std::make_unique<PeerServiceServer>(peer_alloc_.get(), 8, 10, engine_desc_bytes,
+                                            master_client_.get(), ssd_copy_pipeline_.get());
     if (!peer_service_->Start(config_.peer_service_port)) {
       MORI_UMBP_ERROR("[PoolClient] PeerService failed to start on port {}",
                       config_.peer_service_port);
@@ -338,6 +346,15 @@ void PoolClient::Shutdown() {
 
   peer_service_.reset();
 
+  // Stop the copy pipeline AFTER the peer service (RPC commit path) is gone so
+  // no commit can enqueue into a stopping pipeline.  Stop() drops queued tasks
+  // and waits for the in-flight copy to finish + release its DRAM pin before
+  // we tear down peer_alloc_ / peer_ssd_ below.
+  if (ssd_copy_pipeline_) {
+    ssd_copy_pipeline_->Stop();
+    ssd_copy_pipeline_.reset();
+  }
+
   if (peer_alloc_) {
     peer_alloc_->StopReaper();
     peer_alloc_.reset();
@@ -372,14 +389,24 @@ bool PoolClient::Clear() {
   // clear and no master to notify.  Treat as success so callers in
   // shutdown / teardown paths do not surface a spurious error.
   if (!initialized_.load()) return true;
+  // Quiesce the copy pipeline first: drop queued tasks and wait for any
+  // in-flight copy to finish + release its pin.  Otherwise a copy completing
+  // after the clear below would re-record an SSD location and emit ADD SSD
+  // for a key we just collapsed.
+  if (ssd_copy_pipeline_) ssd_copy_pipeline_->Quiesce();
   if (peer_alloc_) peer_alloc_->ClearLocal();
+  if (peer_ssd_) peer_ssd_->ClearLocal();
+
+  bool ok = true;
   if (master_client_) {
-    if (!master_client_->ClearFullSync()) {
-      MORI_UMBP_WARN("[PoolClient] Clear full-sync heartbeat failed");
-      return false;
-    }
+    ok = master_client_->ClearFullSync();
+    if (!ok) MORI_UMBP_WARN("[PoolClient] Clear full-sync heartbeat failed");
   }
-  return true;
+
+  // Always resume — even if the full-sync RPC failed — so the pipeline is
+  // never left permanently paused (the heartbeat loop retries convergence).
+  if (ssd_copy_pipeline_) ssd_copy_pipeline_->Resume();
+  return ok;
 }
 
 bool PoolClient::IsInitialized() const { return initialized_; }
@@ -504,6 +531,10 @@ PoolClient::PutAttemptOutcome PoolClient::ExecuteLocalPut(const std::string& key
   if (!peer_alloc_->Commit(pending.slot_id, key, committed_bytes)) {
     peer_alloc_->Abort(pending.slot_id);
     return PutAttemptOutcome::kFatal;
+  }
+  // Owner-side commit succeeded: best-effort async copy to local SSD.
+  if (ssd_copy_pipeline_) {
+    ssd_copy_pipeline_->Enqueue(SsdCopyTask{key, tier, size});
   }
   master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL,
                              MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL_HELP,

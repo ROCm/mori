@@ -321,6 +321,7 @@ add_library(
   distributed/routing/route_put_strategy.cpp
   distributed/peer/peer_dram_allocator.cpp
   distributed/peer/peer_ssd_manager.cpp
+  distributed/peer/ssd_copy_pipeline.cpp
   distributed/peer/peer_service.cpp
   distributed/pool_client.cpp
   distributed/distributed_client.cpp)
