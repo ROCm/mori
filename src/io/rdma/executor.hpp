@@ -21,11 +21,16 @@
 // SOFTWARE.
 #pragma once
 
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <future>
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <thread>
+#include <utility>
 
 #include "mori/application/transport/rdma/rdma.hpp"
 #include "mori/io/common.hpp"
@@ -37,6 +42,22 @@ namespace io {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                         Data Structures                                        */
 /* ---------------------------------------------------------------------------------------------- */
+struct AdmissionToken {
+  std::shared_ptr<SqController> sq;
+  int estimatedWr{0};
+  bool active{false};
+
+  AdmissionToken() = default;
+  AdmissionToken(std::shared_ptr<SqController> sq_, int wr);
+  AdmissionToken(const AdmissionToken&) = delete;
+  AdmissionToken& operator=(const AdmissionToken&) = delete;
+  AdmissionToken(AdmissionToken&& rhs) noexcept;
+  AdmissionToken& operator=(AdmissionToken&& rhs) noexcept;
+  ~AdmissionToken();
+
+  void Release();
+};
+
 struct ExecutorReq {
   const EpPairVec& eps;
   const application::RdmaMemoryRegion& local;
@@ -77,17 +98,32 @@ class MultithreadExecutor : public Executor {
 
  private:
   struct Task {
-    const ExecutorReq* req;
+    const ExecutorReq* req{nullptr};
     int epId{-1};
     int begin{-1};
     int end{-1};
+    AdmissionToken admissionToken;
     std::promise<RdmaOpRet> ret;
 
+    Task() = default;
     Task(const ExecutorReq* req_, int epId_, int begin_, int end_)
         : req(req_), epId(epId_), begin(begin_), end(end_) {}
+    Task(const ExecutorReq* req_, int epId_, int begin_, int end_, AdmissionToken token)
+        : req(req_), epId(epId_), begin(begin_), end(end_), admissionToken(std::move(token)) {}
   };
 
-  std::vector<std::pair<int, int>> SplitWork(const ExecutorReq& req);
+  struct WorkSplit {
+    int workerId{-1};
+    int epId{-1};
+    int begin{-1};
+    int end{-1};
+    int admissionWr{0};
+  };
+
+  std::vector<WorkSplit> SplitWork(const ExecutorReq& req);
+  RdmaOpRet RdmaBatchReadWriteWithAdmission(const ExecutorReq& req);
+
+  friend void TestWorkerShutdownDrainsTokensAndPromisesForTest();
 
   class Worker {
    public:
@@ -100,6 +136,8 @@ class MultithreadExecutor : public Executor {
     void Submit(Task&&);
 
    private:
+    friend void TestWorkerShutdownDrainsTokensAndPromisesForTest();
+
     int workerId{-1};
     std::atomic<bool> running{false};
     mutable std::mutex mu;

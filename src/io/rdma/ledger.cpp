@@ -29,49 +29,59 @@ uint64_t SubmissionLedger::Insert(int postedWr, bool hasSignaledTail,
   std::lock_guard<std::mutex> lock(mu_);
   uint64_t id = nextId_++;
   records_[id] = SubmissionRecord{
-      id, postedWr, hasSignaledTail, SubmissionState::Posted, std::move(meta), batchSize};
+      id, postedWr, hasSignaledTail, SubmissionState::Tentative, std::move(meta), batchSize};
   return id;
 }
 
-void SubmissionLedger::InsertOrphaned(int postedWr, std::shared_ptr<CqCallbackMeta> meta,
-                                      int batchSize) {
+uint64_t SubmissionLedger::InsertOrphaned(int postedWr, std::shared_ptr<CqCallbackMeta> meta,
+                                          int batchSize) {
   std::lock_guard<std::mutex> lock(mu_);
   uint64_t id = nextId_++;
   records_[id] =
       SubmissionRecord{id, postedWr, false, SubmissionState::Orphaned, std::move(meta), batchSize};
+  return id;
 }
 
-std::shared_ptr<CqCallbackMeta> SubmissionLedger::ReleaseByCqe(uint64_t recordId,
-                                                               std::atomic<int>* sqDepth,
-                                                               int* outBatchSize) {
+bool SubmissionLedger::ReleaseByCqe(uint64_t recordId, SubmissionRecord* outRecord) {
   std::lock_guard<std::mutex> lock(mu_);
   auto it = records_.find(recordId);
-  if (it == records_.end()) return nullptr;
-  SubmissionRecord& rec = it->second;
-  if (sqDepth && rec.postedWr > 0) sqDepth->fetch_sub(rec.postedWr, std::memory_order_relaxed);
-  if (outBatchSize) *outBatchSize = rec.batchSize;
-  auto meta = std::move(rec.meta);
+  if (it == records_.end()) return false;
+  if (outRecord != nullptr) *outRecord = std::move(it->second);
   records_.erase(it);
-  return meta;
+  return true;
 }
 
-int SubmissionLedger::ReleaseOrphanedByRecovery(std::atomic<int>* sqDepth) {
+bool SubmissionLedger::MarkPosted(uint64_t recordId) {
   std::lock_guard<std::mutex> lock(mu_);
-  int total = 0;
-  // Only erase Orphaned records.  Posted records still have signaled WRs whose
-  // CQEs may arrive later; they must remain so ReleaseByCqe() can update the
-  // corresponding TransferStatus and release sqDepth normally.
+  auto it = records_.find(recordId);
+  if (it == records_.end()) return false;
+  if (it->second.state != SubmissionState::Tentative || !it->second.hasSignaledTail) return false;
+  it->second.state = SubmissionState::Posted;
+  return true;
+}
+
+bool SubmissionLedger::CancelTentative(uint64_t recordId, SubmissionRecord* outRecord) {
+  std::lock_guard<std::mutex> lock(mu_);
+  auto it = records_.find(recordId);
+  if (it == records_.end()) return false;
+  if (it->second.state != SubmissionState::Tentative || !it->second.hasSignaledTail) return false;
+  if (outRecord != nullptr) *outRecord = std::move(it->second);
+  records_.erase(it);
+  return true;
+}
+
+void SubmissionLedger::ExtractOrphanedRecords(std::vector<SubmissionRecord>* outRecords) {
+  std::lock_guard<std::mutex> lock(mu_);
+  if (outRecords != nullptr) outRecords->clear();
   auto it = records_.begin();
   while (it != records_.end()) {
     if (it->second.state == SubmissionState::Orphaned) {
-      total += it->second.postedWr;
+      if (outRecords != nullptr) outRecords->push_back(std::move(it->second));
       it = records_.erase(it);
     } else {
       ++it;
     }
   }
-  if (sqDepth && total > 0) sqDepth->fetch_sub(total, std::memory_order_relaxed);
-  return total;
 }
 
 bool SubmissionLedger::HasOrphaned() const {
@@ -80,6 +90,11 @@ bool SubmissionLedger::HasOrphaned() const {
     if (rec.state == SubmissionState::Orphaned) return true;
   }
   return false;
+}
+
+size_t SubmissionLedger::RecordCount() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  return records_.size();
 }
 
 }  // namespace io

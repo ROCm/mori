@@ -326,8 +326,10 @@ class RdmaBackend : public Backend {
       return seed;
     }
   };
-  RdmaBackendSession* GetOrCreateSessionCached(const MemoryDesc& local, const MemoryDesc& remote);
+  std::shared_ptr<RdmaBackendSession> GetOrCreateSessionCached(const MemoryDesc& local,
+                                                               const MemoryDesc& remote);
   void InvalidateSessionsForMemory(MemoryUniqueId id);
+  void InvalidateUnhealthySessionsLocked();
 
  private:
   EngineKey myEngKey;
@@ -337,7 +339,7 @@ class RdmaBackend : public Backend {
   std::unique_ptr<ControlPlaneServer> server{nullptr};
   std::unique_ptr<Executor> executor{nullptr};
   // session cache
-  std::unordered_map<SessionCacheKey, std::unique_ptr<RdmaBackendSession>, SessionCacheKeyHash>
+  std::unordered_map<SessionCacheKey, std::shared_ptr<RdmaBackendSession>, SessionCacheKeyHash>
       sessionCache;
   std::mutex sessionCacheMu;
 };

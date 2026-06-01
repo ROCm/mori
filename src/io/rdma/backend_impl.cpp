@@ -30,6 +30,7 @@
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 
 #include "mori/io/env.hpp"
 #include "mori/io/logging.hpp"
@@ -138,6 +139,67 @@ static CqeFailureAdvice DescribeCqeFailure(ibv_wc_status status, CqeFailureOrigi
       break;
   }
   return advice;
+}
+
+static bool IsTerminalCqeStatus(ibv_wc_status status) {
+  switch (status) {
+    case IBV_WC_RETRY_EXC_ERR:
+    case IBV_WC_RNR_RETRY_EXC_ERR:
+    case IBV_WC_LOC_QP_OP_ERR:
+    case IBV_WC_REM_ACCESS_ERR:
+    case IBV_WC_REM_INV_REQ_ERR:
+    case IBV_WC_FATAL_ERR:
+      return true;
+    default:
+      return false;
+  }
+}
+
+static void ReleaseSqCredit(const EpPair& ep, int wrCount) {
+  if (wrCount <= 0) return;
+  assert(ep.sq != nullptr);
+  ep.sq->Release(wrCount);
+}
+
+static bool EpDegraded(const EpPair& ep) {
+  assert(ep.sq != nullptr);
+  return ep.sq->IsDegraded();
+}
+
+static void MarkEpDegradedFromCqe(const EpPair& ep, SqDegradeReason reason) {
+  assert(ep.sq != nullptr);
+  ep.sq->MarkDegraded(reason);
+}
+
+static void FailUniqueSubmissionMetasFromCqe(const std::vector<SubmissionRecord>& records,
+                                             const std::string& message) {
+  std::unordered_set<CqCallbackMeta*> seen;
+  for (const auto& record : records) {
+    if (!record.meta || !seen.insert(record.meta.get()).second) continue;
+    if (record.batchSize > 0) {
+      (void)record.meta->finishedBatchSize.fetch_add(static_cast<uint32_t>(record.batchSize),
+                                                     std::memory_order_relaxed);
+    }
+    record.meta->diagnostics.MarkRootCause();
+    LogAsyncTransferFailureIfNeeded(&record.meta->diagnostics,
+                                    static_cast<uint32_t>(StatusCode::ERR_RDMA_OP), message);
+    TransferStatus* statusPtr = record.meta->status;
+    if (statusPtr != nullptr) {
+      statusPtr->Update(StatusCode::ERR_RDMA_OP, message);
+      record.meta->status = nullptr;
+    }
+  }
+}
+
+static void ExtractAndFailOrphanedRecordsFromCqe(const EpPair& ep, const std::string& message) {
+  if (!ep.ledger) return;
+  std::vector<SubmissionRecord> orphaned;
+  ep.ledger->ExtractOrphanedRecords(&orphaned);
+  if (!orphaned.empty()) {
+    MORI_IO_WARN("ProcessOneCqe: failing {} orphaned record(s) on endpoint qpn={}", orphaned.size(),
+                 ep.local.handle.qpn);
+    FailUniqueSubmissionMetasFromCqe(orphaned, message);
+  }
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -259,12 +321,30 @@ void RdmaManager::DeregisterRemoteMemory(EngineKey ekey, int remRdmaDevId, Memor
 /* ------------------------------------- Endpoint Management ------------------------------------ */
 int RdmaManager::CountEndpoint(EngineKey engine, TopoKeyPair key) {
   std::shared_lock<std::shared_mutex> lock(mu);
-  return remotes[engine].rTable[key].size();
+  auto remoteIt = remotes.find(engine);
+  if (remoteIt == remotes.end()) return 0;
+  auto routeIt = remoteIt->second.rTable.find(key);
+  if (routeIt == remoteIt->second.rTable.end()) return 0;
+  int count = 0;
+  for (const auto& ep : routeIt->second) {
+    assert(ep.sq != nullptr);
+    if (!ep.sq->IsTerminalDegraded()) count++;
+  }
+  return count;
 }
 
 EpPairVec RdmaManager::GetAllEndpoint(EngineKey engine, TopoKeyPair key) {
   std::shared_lock<std::shared_mutex> lock(mu);
-  return remotes[engine].rTable[key];
+  EpPairVec healthy;
+  auto remoteIt = remotes.find(engine);
+  if (remoteIt == remotes.end()) return healthy;
+  auto routeIt = remoteIt->second.rTable.find(key);
+  if (routeIt == remoteIt->second.rTable.end()) return healthy;
+  for (const auto& ep : routeIt->second) {
+    assert(ep.sq != nullptr);
+    if (!ep.sq->IsTerminalDegraded()) healthy.push_back(ep);
+  }
+  return healthy;
 }
 
 application::RdmaEndpointConfig RdmaManager::GetRdmaEndpointConfig(int devId) {
@@ -357,19 +437,24 @@ EndpointId RdmaManager::ConnectEndpoint(EngineKey remoteKey, int devId,
   deviceCtxs[devId]->ConnectEndpoint(local.handle, remote);
   RemoteEngineMeta& meta = remotes[remoteKey];
   auto epConfig = GetRdmaEndpointConfig(devId);
-  EpPair ep{weight,
-            devId,
-            rdevId,
-            remoteKey,
-            local,
-            remote,
-            std::make_shared<std::atomic<int>>(0),
-            static_cast<int>(epConfig.maxMsgsNum),
-            std::make_shared<std::atomic<bool>>(false),
-            std::make_shared<SubmissionLedger>(config.notifPerQp)};
+  EndpointId id = nextEndpointId_.fetch_add(1);
+  const int maxSqDepth = static_cast<int>(epConfig.maxMsgsNum);
+  EpPair ep{};
+  ep.endpointId = id;
+  ep.weight = weight;
+  ep.ldevId = devId;
+  ep.rdevId = rdevId;
+  ep.remoteEngineKey = remoteKey;
+  ep.local = local;
+  ep.remote = remote;
+  ep.sq = std::make_shared<SqController>(maxSqDepth, GetSqResumeWatermarkWrForDepth(maxSqDepth));
+  ep.maxSqDepth = maxSqDepth;
+  ep.ledger = std::make_shared<SubmissionLedger>(config.notifPerQp);
+  ep.qpPerTransfer = config.qpPerTransfer;
+  ep.numWorkerThreads = config.numWorkerThreads;
+  ep.sqCqeDiagnostics = std::make_shared<SqCqeDiagnostics>();
   meta.rTable[topoKey].push_back(ep);
 
-  EndpointId id = nextEndpointId_.fetch_add(1);
   auto rt = std::make_shared<EndpointRuntime>(id, ep);
   endpointsById_[id] = rt;
   return id;
@@ -472,6 +557,7 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
   const EpPair& ep = rt->ep;
   ibv_cq* cq = ep.local.ibvHandle.cq;
   FlushDrainStats flushDrain;
+  RecordSqPollAttempt(ep);
 
   // Resolve notif context once before the CQ drain loop.
   QpNotifContext* notifCtxPtr = nullptr;
@@ -486,6 +572,7 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
   int n = 0;
 
   while ((n = ibv_poll_cq(cq, batchSize, wc)) > 0) {
+    RecordSqPollCqes(ep, n);
     for (int i = 0; i < n; ++i) {
       if (wc[i].status != IBV_WC_SUCCESS) {
         const bool isFlush = (wc[i].status == IBV_WC_WR_FLUSH_ERR);
@@ -516,37 +603,34 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
           }
         }
 
-        int mergedBatchSize = 0;
-        auto meta = ep.ledger
-                        ? ep.ledger->ReleaseByCqe(wc[i].wr_id, ep.sqDepth.get(), &mergedBatchSize)
-                        : nullptr;
-        if (meta) {
-          (void)meta->finishedBatchSize.fetch_add(mergedBatchSize);
-          if (isFlush) {
-            meta->diagnostics.MarkFlushCascade();
-          } else {
-            meta->diagnostics.MarkRootCause();
-          }
-          LogAsyncTransferFailureIfNeeded(&meta->diagnostics,
-                                          static_cast<uint32_t>(StatusCode::ERR_RDMA_OP),
-                                          failureAdvice.ComposeStatusMessage());
-          TransferStatus* statusPtr = meta->status;
-          if (statusPtr != nullptr) {
-            statusPtr->Update(StatusCode::ERR_RDMA_OP, failureAdvice.ComposeStatusMessage());
-            meta->status = nullptr;
-          }
-          if (ep.degraded && ep.degraded->load(std::memory_order_relaxed) && ep.ledger) {
-            const int orphanedReleased = ep.ledger->ReleaseOrphanedByRecovery(ep.sqDepth.get());
-            ep.degraded->store(false, std::memory_order_relaxed);
-            MORI_IO_WARN(
-                "ProcessOneCqe: recovered degraded EP eid={} qpn={} by releasing {} orphaned WRs",
-                rt->id, ep.local.handle.qpn, orphanedReleased);
+        SubmissionRecord record;
+        const bool hasRecord = ep.ledger ? ep.ledger->ReleaseByCqe(wc[i].wr_id, &record) : false;
+        if (hasRecord) {
+          ReleaseSqCredit(ep, record.postedWr);
+          RecordSqBatchReleaseWr(ep, record.postedWr);
+          auto meta = record.meta;
+          if (meta) {
+            (void)meta->finishedBatchSize.fetch_add(static_cast<uint32_t>(record.batchSize),
+                                                    std::memory_order_relaxed);
+            if (isFlush) {
+              meta->diagnostics.MarkFlushCascade();
+            } else {
+              meta->diagnostics.MarkRootCause();
+            }
+            LogAsyncTransferFailureIfNeeded(&meta->diagnostics,
+                                            static_cast<uint32_t>(StatusCode::ERR_RDMA_OP),
+                                            failureAdvice.ComposeStatusMessage());
+            TransferStatus* statusPtr = meta->status;
+            if (statusPtr != nullptr) {
+              statusPtr->Update(StatusCode::ERR_RDMA_OP, failureAdvice.ComposeStatusMessage());
+              meta->status = nullptr;
+            }
           }
         } else if (IsNotifSendWrId(wc[i].wr_id)) {
-          if (ep.sqDepth) ep.sqDepth->fetch_sub(1, std::memory_order_relaxed);
+          ReleaseSqCredit(ep, 1);
           if (!isFlush) {
             MORI_IO_WARN(
-                "ProcessOneCqe: failed notification SEND CQE, transfer_id={}, released 1 sqDepth",
+                "ProcessOneCqe: failed notification SEND CQE, transfer_id={}, released 1 SQ credit",
                 ExtractTransferIdFromWrId(wc[i].wr_id));
           }
         } else if (wc[i].wr_id < config.notifPerQp) {
@@ -558,9 +642,17 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
           if (!isFlush) {
             MORI_IO_WARN(
                 "ProcessOneCqe: failed CQE wr_id={} in ledger range but no record found, "
-                "sqDepth may be stale",
+                "SQ credit may be stale",
                 wc[i].wr_id);
           }
+        }
+        if (!isFlush && IsTerminalCqeStatus(wc[i].status)) {
+          std::unique_lock<std::shared_mutex> recoveryGuard;
+          if (ep.sq) recoveryGuard = ep.sq->AcquireRecoveryGuard();
+          MarkEpDegradedFromCqe(ep, SqDegradeReason::FatalCqe);
+          ExtractAndFailOrphanedRecordsFromCqe(ep, failureAdvice.ComposeStatusMessage());
+        } else if (EpDegraded(ep) && ep.ledger && ep.ledger->HasOrphaned()) {
+          ExtractAndFailOrphanedRecordsFromCqe(ep, failureAdvice.ComposeStatusMessage());
         }
         continue;
       }
@@ -606,28 +698,34 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
         if (!IsNotifSendWrId(wc[i].wr_id)) {
           MORI_IO_WARN(
               "ProcessOneCqe: unexpected SEND completion with non-notification wr_id {}; "
-              "releasing 1 sqDepth under current SEND invariant",
+              "releasing 1 SQ credit under current SEND invariant",
               wc[i].wr_id);
         }
-        if (ep.sqDepth) ep.sqDepth->fetch_sub(1, std::memory_order_relaxed);
+        ReleaseSqCredit(ep, 1);
       } else {
         // Batch path: wr_id carries a recordId from the SubmissionLedger.
         uint64_t recordId = wc[i].wr_id;
-        int mergedBatchSize = 0;
-        auto meta = ep.ledger
-                        ? ep.ledger->ReleaseByCqe(recordId, ep.sqDepth.get(), &mergedBatchSize)
-                        : nullptr;
-        if (meta) {
-          uint32_t finishedBefore = meta->finishedBatchSize.fetch_add(mergedBatchSize);
-          TransferStatus* statusPtr = meta->status;
-          if (statusPtr != nullptr && (finishedBefore + mergedBatchSize) == meta->totalBatchSize) {
-            statusPtr->Update(StatusCode::SUCCESS, ibv_wc_status_str(wc[i].status));
+        SubmissionRecord record;
+        const bool hasRecord = ep.ledger ? ep.ledger->ReleaseByCqe(recordId, &record) : false;
+        if (hasRecord) {
+          ReleaseSqCredit(ep, record.postedWr);
+          RecordSqBatchReleaseWr(ep, record.postedWr);
+          auto meta = record.meta;
+          if (meta) {
+            uint32_t finishedBefore = meta->finishedBatchSize.fetch_add(
+                static_cast<uint32_t>(record.batchSize), std::memory_order_relaxed);
+            TransferStatus* statusPtr = meta->status;
+            if (statusPtr != nullptr &&
+                (finishedBefore + static_cast<uint32_t>(record.batchSize)) ==
+                    static_cast<uint32_t>(meta->totalBatchSize)) {
+              statusPtr->Update(StatusCode::SUCCESS, ibv_wc_status_str(wc[i].status));
+            }
+            MORI_IO_TRACE("ProcessOneCqe: batch CQE for task {} total={} finished={} cur={}",
+                          meta->id, meta->totalBatchSize, finishedBefore, record.batchSize);
           }
-          MORI_IO_TRACE("ProcessOneCqe: batch CQE for task {} total={} finished={} cur={}",
-                        meta->id, meta->totalBatchSize, finishedBefore, mergedBatchSize);
         } else {
           MORI_IO_WARN(
-              "ProcessOneCqe: no ledger record for wr_id {} (recordId {}); sqDepth may be stale",
+              "ProcessOneCqe: no ledger record for wr_id {} (recordId {}); SQ credit may be stale",
               wc[i].wr_id, recordId);
         }
       }
@@ -1015,7 +1113,12 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
   }
 }
 
-bool RdmaBackendSession::Alive() const { return true; }
+bool RdmaBackendSession::Alive() const {
+  for (const auto& ep : eps) {
+    if (ep.sq && ep.sq->IsTerminalDegraded()) return false;
+  }
+  return true;
+}
 
 /* ----------------------------------------------------------------------------------------------
  */
@@ -1090,7 +1193,7 @@ void RdmaBackend::ReadWrite(const MemoryDesc& localDest, size_t localOffset,
                             const MemoryDesc& remoteSrc, size_t remoteOffset, size_t size,
                             TransferStatus* status, TransferUniqueId id, bool isRead) {
   MORI_IO_FUNCTION_TIMER;
-  RdmaBackendSession* sess = GetOrCreateSessionCached(localDest, remoteSrc);
+  auto sess = GetOrCreateSessionCached(localDest, remoteSrc);
   sess->ReadWrite(localOffset, remoteOffset, size, status, id, isRead);
 }
 
@@ -1107,7 +1210,7 @@ void RdmaBackend::BatchReadWrite(const MemoryDesc& localDest, const SizeVec& loc
     return;
   }
 
-  RdmaBackendSession* sess = GetOrCreateSessionCached(localDest, remoteSrc);
+  auto sess = GetOrCreateSessionCached(localDest, remoteSrc);
   sess->BatchReadWrite(localOffsets, remoteOffsets, sizes, status, id, isRead);
 }
 
@@ -1125,13 +1228,34 @@ void RdmaBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remot
 
   EngineKey ekey = remote.engineKey;
 
-  // Create a pair of endpoint if none
-  int epNum = rdma->CountEndpoint(ekey, kp);
-  for (int i = 0; i < (config.qpPerTransfer - epNum); i++) {
-    server->BuildRdmaConn(ekey, kp);
+  if (config.qpPerTransfer <= 0) {
+    throw std::runtime_error("RDMA CreateSession requires qpPerTransfer > 0");
   }
-  EpPairVec eps = rdma->GetAllEndpoint(ekey, kp);
-  assert(!eps.empty());
+
+  EpPairVec eps;
+  const int maxAttempts = std::max(2, config.qpPerTransfer * 2);
+  for (int attempt = 0; attempt < maxAttempts; ++attempt) {
+    eps = rdma->GetAllEndpoint(ekey, kp);
+    const int missing = config.qpPerTransfer - static_cast<int>(eps.size());
+    if (missing <= 0) break;
+    for (int i = 0; i < missing; ++i) {
+      server->BuildRdmaConn(ekey, kp);
+    }
+  }
+  eps = rdma->GetAllEndpoint(ekey, kp);
+  if (static_cast<int>(eps.size()) < config.qpPerTransfer) {
+    std::string message =
+        "RDMA CreateSession could not allocate enough healthy endpoints: remoteEngine=" + ekey +
+        ", localTopo=(" + std::to_string(localKey.deviceId) + "," +
+        std::to_string(static_cast<uint32_t>(localKey.loc)) + "), remoteTopo=(" +
+        std::to_string(remoteKey.deviceId) + "," +
+        std::to_string(static_cast<uint32_t>(remoteKey.loc)) +
+        "), requestedQpPerTransfer=" + std::to_string(config.qpPerTransfer) +
+        ", healthyEndpointCount=" + std::to_string(eps.size()) +
+        ", attempts=" + std::to_string(maxAttempts);
+    MORI_IO_ERROR("{}", message);
+    throw std::runtime_error(std::move(message));
+  }
 
   EpPairVec epSet = {eps.begin(), eps.begin() + config.qpPerTransfer};
 
@@ -1159,32 +1283,44 @@ bool RdmaBackend::PopInboundTransferStatus(EngineKey remote, TransferUniqueId id
   return notif->PopInboundTransferStatus(remote, id, status);
 }
 
-RdmaBackendSession* RdmaBackend::GetOrCreateSessionCached(const MemoryDesc& local,
-                                                          const MemoryDesc& remote) {
+std::shared_ptr<RdmaBackendSession> RdmaBackend::GetOrCreateSessionCached(
+    const MemoryDesc& local, const MemoryDesc& remote) {
   SessionCacheKey key{remote.engineKey, local.id, remote.id};
   {
     std::lock_guard<std::mutex> lock(sessionCacheMu);
+    InvalidateUnhealthySessionsLocked();
     auto it = sessionCache.find(key);
     if (it != sessionCache.end()) {
-      return it->second.get();
+      return it->second;
     }
   }
   // create outside lock (CreateSession may allocate / block); then insert
-  auto newSess = std::make_unique<RdmaBackendSession>();
+  auto newSess = std::make_shared<RdmaBackendSession>();
   CreateSession(local, remote, *newSess);
   std::lock_guard<std::mutex> lock(sessionCacheMu);
+  InvalidateUnhealthySessionsLocked();
   auto it = sessionCache.find(key);
   if (it != sessionCache.end()) {
-    return it->second.get();
+    return it->second;
   }
   auto [emplacedIt, inserted] = sessionCache.emplace(key, std::move(newSess));
-  return emplacedIt->second.get();
+  return emplacedIt->second;
 }
 
 void RdmaBackend::InvalidateSessionsForMemory(MemoryUniqueId id) {
   std::lock_guard<std::mutex> lock(sessionCacheMu);
   for (auto it = sessionCache.begin(); it != sessionCache.end();) {
     if (it->first.localMemId == id || it->first.remoteMemId == id) {
+      it = sessionCache.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+void RdmaBackend::InvalidateUnhealthySessionsLocked() {
+  for (auto it = sessionCache.begin(); it != sessionCache.end();) {
+    if (!it->second || !it->second->Alive()) {
       it = sessionCache.erase(it);
     } else {
       ++it;
