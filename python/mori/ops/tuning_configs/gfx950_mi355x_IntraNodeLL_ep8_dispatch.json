@@ -1,0 +1,40 @@
+{
+  "version": "1.0",
+  "gpu_arch": "gfx950",
+  "gpu_model": "mi355x",
+  "kernel_type": "IntraNode",
+  "ep_size": 8,
+  "phase": "dispatch",
+  "rules": [
+    {
+      "dtype": "bf16",
+      "num_tokens": 1,
+      "hidden_dim": 7168,
+      "block_num": 4,
+      "rdma_block_num": 0,
+      "warp_per_block": 4,
+      "bandwidth_gbps": 2.56,
+      "latency_us": 27.7
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 32,
+      "hidden_dim": 7168,
+      "block_num": 32,
+      "rdma_block_num": 0,
+      "warp_per_block": 16,
+      "bandwidth_gbps": 79.9,
+      "latency_us": 30.9
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 64,
+      "hidden_dim": 7168,
+      "block_num": 64,
+      "rdma_block_num": 0,
+      "warp_per_block": 16,
+      "bandwidth_gbps": 145.95,
+      "latency_us": 34.3
+    }
+  ]
+}

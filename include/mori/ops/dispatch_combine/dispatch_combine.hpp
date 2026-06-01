@@ -45,7 +45,14 @@
 namespace mori {
 namespace moe {
 
-enum KernelType { IntraNode = 0, InterNode = 1, InterNodeV1 = 2, InterNodeV1LL = 3, AsyncLL = 4 };
+enum KernelType {
+  IntraNode = 0,
+  InterNode = 1,
+  InterNodeV1 = 2,
+  InterNodeV1LL = 3,
+  AsyncLL = 4,
+  IntraNodeLL = 5
+};
 enum class QuantType { None = 0, Fp8DirectCast = 1, Fp8BlockwiseQuant = 2 };
 
 inline const char* HipDataTypeToString(hipDataType dtype) {

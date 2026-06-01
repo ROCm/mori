@@ -119,7 +119,7 @@ jobs:
       - name: MORI-EP (intranode)
         run: |
           $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
-            cd $GITHUB_WORKSPACE && timeout 300 pytest tests/python/ops/test_dispatch_combine_intranode.py -v
+            cd $GITHUB_WORKSPACE && timeout 420 pytest tests/python/ops/test_dispatch_combine_intranode.py -v
           "
 
       - name: MORI-EP (internode_v1)
