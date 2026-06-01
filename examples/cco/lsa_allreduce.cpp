@@ -48,6 +48,7 @@
 #include "mori/cco/cco_coop.hpp"
 #include "mori/cco/cco_lsa_impl.hpp"
 #include "mori/cco/cco_lsa_types.hpp"
+#include "mori/cco/cco_team.hpp"
 #include "mori/cco/cco_types.hpp"
 
 #define NELEMS  (32)  // tiny vector: rank r contributes (r,r,r,r)
@@ -80,7 +81,7 @@ __global__ void lsa_allreduce_block_kernel(ccoDevComm* devComm,
                                            ccoWindow_t recvWin, size_t recvOff,
                                            size_t count) {
   ccoCoopBlock g;
-  ccoLsaBarrierSession<ccoCoopBlock> bar(g, devComm, devComm->lsaBarrier, 0);
+  ccoLsaBarrierSession<ccoCoopBlock> bar(g, devComm, ccoTeamLsa(*devComm), devComm->lsaBarrier, 0);
   bar.sync(g);
 
   const int lsaSize = devComm->lsaSize;
@@ -106,7 +107,7 @@ __global__ void lsa_allreduce_warp_kernel(ccoDevComm* devComm,
                                           ccoWindow_t recvWin, size_t recvOff,
                                           size_t count) {
   ccoCoopWarp g;
-  ccoLsaBarrierSession<ccoCoopWarp> bar(g, devComm, devComm->lsaBarrier, 0);
+  ccoLsaBarrierSession<ccoCoopWarp> bar(g, devComm, ccoTeamLsa(*devComm), devComm->lsaBarrier, 0);
   bar.sync(g);
 
   const int lsaSize = devComm->lsaSize;
@@ -134,7 +135,7 @@ __global__ void lsa_allreduce_thread_kernel(ccoDevComm* devComm,
                                             ccoWindow_t recvWin, size_t recvOff,
                                             size_t count) {
   ccoCoopThread g;
-  ccoLsaBarrierSession<ccoCoopThread> bar(g, devComm, devComm->lsaBarrier, 0);
+  ccoLsaBarrierSession<ccoCoopThread> bar(g, devComm, ccoTeamLsa(*devComm), devComm->lsaBarrier, 0);
   bar.sync(g);
 
   const int lsaSize = devComm->lsaSize;

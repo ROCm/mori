@@ -77,6 +77,7 @@
 #include "mori/cco/cco_device_api.hpp"
 #include "mori/cco/cco_lsa_impl.hpp"
 #include "mori/cco/cco_lsa_types.hpp"
+#include "mori/cco/cco_team.hpp"
 #include "mori/cco/cco_types.hpp"
 
 using namespace mori::cco;
@@ -113,7 +114,7 @@ template <typename Coop>
 __global__ void barrier_visibility_kernel(ccoDevComm* dc, ccoWindow_t win, size_t off,
                                           uint32_t iters, uint32_t slot, int* errors) {
   Coop g;
-  ccoLsaBarrierSession<Coop> bar(g, dc, dc->lsaBarrier, slot);
+  ccoLsaBarrierSession<Coop> bar(g, dc, ccoTeamLsa(*dc), dc->lsaBarrier, slot);
 
   const int N = dc->lsaSize;
   const int myRank = dc->lsaRank;
@@ -154,7 +155,7 @@ __global__ void barrier_visibility_kernel(ccoDevComm* dc, ccoWindow_t win, size_
 __global__ void barrier_stress_kernel(ccoDevComm* dc, uint32_t iters, uint32_t slot,
                                       int* completedFlag) {
   ccoCoopBlock g;
-  ccoLsaBarrierSession<ccoCoopBlock> bar(g, dc, dc->lsaBarrier, slot);
+  ccoLsaBarrierSession<ccoCoopBlock> bar(g, dc, ccoTeamLsa(*dc), dc->lsaBarrier, slot);
   for (uint32_t e = 0; e < iters; ++e) {
     bar.sync(g);
   }
@@ -172,7 +173,7 @@ __global__ void barrier_timeout_kernel(ccoDevComm* dc, uint32_t slot, uint64_t t
   if (dc->lsaRank == rankToSkip) {
     return;
   }
-  ccoLsaBarrierSession<ccoCoopThread> bar(g, dc, dc->lsaBarrier, slot);
+  ccoLsaBarrierSession<ccoCoopThread> bar(g, dc, ccoTeamLsa(*dc), dc->lsaBarrier, slot);
   int rc = bar.sync(g, timeoutCycles);
   outRc[dc->lsaRank] = rc;
 }
@@ -186,7 +187,7 @@ template <typename Coop>
 __global__ void barrier_split_kernel(ccoDevComm* dc, ccoWindow_t win, size_t off, uint32_t iters,
                                      uint32_t slot, int* errors) {
   Coop g;
-  ccoLsaBarrierSession<Coop> bar(g, dc, dc->lsaBarrier, slot);
+  ccoLsaBarrierSession<Coop> bar(g, dc, ccoTeamLsa(*dc), dc->lsaBarrier, slot);
 
   const int N = dc->lsaSize;
   const int myRank = dc->lsaRank;
@@ -227,7 +228,7 @@ __global__ void barrier_persist_kernel(ccoDevComm* dc, ccoWindow_t win, size_t o
                                        uint32_t epochBase, uint32_t iters, uint32_t slot,
                                        int* errors) {
   ccoCoopBlock g;
-  ccoLsaBarrierSession<ccoCoopBlock> bar(g, dc, dc->lsaBarrier, slot);
+  ccoLsaBarrierSession<ccoCoopBlock> bar(g, dc, ccoTeamLsa(*dc), dc->lsaBarrier, slot);
 
   const int N = dc->lsaSize;
   const int myRank = dc->lsaRank;
@@ -262,8 +263,8 @@ __global__ void barrier_persist_kernel(ccoDevComm* dc, ccoWindow_t win, size_t o
 __global__ void barrier_multislot_kernel(ccoDevComm* dc, ccoWindow_t win, uint32_t slotA,
                                          uint32_t slotB, uint32_t iters, int* errors) {
   ccoCoopBlock g;
-  ccoLsaBarrierSession<ccoCoopBlock> barA(g, dc, dc->lsaBarrier, slotA);
-  ccoLsaBarrierSession<ccoCoopBlock> barB(g, dc, dc->lsaBarrier, slotB);
+  ccoLsaBarrierSession<ccoCoopBlock> barA(g, dc, ccoTeamLsa(*dc), dc->lsaBarrier, slotA);
+  ccoLsaBarrierSession<ccoCoopBlock> barB(g, dc, ccoTeamLsa(*dc), dc->lsaBarrier, slotB);
 
   const int N = dc->lsaSize;
   const int myRank = dc->lsaRank;

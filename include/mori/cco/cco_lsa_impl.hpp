@@ -28,10 +28,10 @@ namespace mori {
 namespace cco {
 
 template <typename Coop>
-__device__ inline ccoLsaBarrierSession<Coop>::ccoLsaBarrierSession(Coop grp, ccoDevComm_t comm,
+__device__ inline ccoLsaBarrierSession<Coop>::ccoLsaBarrierSession(Coop grp, ccoDevComm_t comm, ccoTeam_t team,
                                                                     ccoLsaBarrierHandle h,
                                                                     uint32_t idx)
-    : group(grp), comm(comm), handle(h), index(idx) {
+    : group(grp), comm(comm), team(team), handle(h), index(idx) {
 
   // Restore epoch persisted by the previous session's destructor.
   // Inbox slots are never zeroed, so epoch must be monotonically increasing
@@ -62,8 +62,8 @@ template <typename Coop>
 __device__ inline void ccoLsaBarrierSession<Coop>::arrive(Coop) {
   this->group.sync();
 
-  const int nranks = this->comm->lsaSize;
-  const int myRank = this->comm->lsaRank;
+  const int nranks = this->team.nRanks;
+  const int myRank = this->team.rank;
 
   // System-scope fence so any prior payload writes from this coop are
   // observable to peers before the relaxed inbox stores below land. 
@@ -81,8 +81,8 @@ __device__ inline void ccoLsaBarrierSession<Coop>::arrive(Coop) {
 template <typename Coop>
 template <bool EnableTimeout>
 __device__ inline int ccoLsaBarrierSession<Coop>::waitInternal(Coop, uint64_t timeoutCycles) {
-  const int nranks = this->comm->lsaSize;
-  const int myRank = this->comm->lsaRank;
+  const int nranks = this->team.nRanks;
+  const int myRank = this->team.rank;
   int ret = 0;
 
   uint64_t startCycle;
