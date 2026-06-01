@@ -345,42 +345,13 @@ __device__ inline static void getImpl(shmem::ShmemRdmaEndpoint* ep, uint32_t qpn
   }
 }
 
-// Flush: submit all pending WQEs and wait for completion.
-// Cannot use ringDoorbellOrdered — it waits for dbTouchIdx == postIdx,
-// but AggregateRequests skips dbTouchIdx advancement, causing deadlock.
+// Flush: poll CQ until all submitted WQEs complete.
+// Consistent with NCCL GIN semantics: flush does NOT ring doorbell.
+// If using AggregateRequests, caller must call flushAsync first to ring doorbell.
 template <core::ProviderType PrvdType>
-__device__ inline static void flushImpl(shmem::ShmemRdmaEndpoint* ep, uint32_t qpn) {
+__device__ inline static void flushImpl(shmem::ShmemRdmaEndpoint* ep) {
   core::WorkQueueHandle* wq = &ep->wqHandle;
-  core::CompletionQueueHandle* cq = &ep->cqHandle;
-
   uint32_t curPostIdx = wq->postIdx;
-  uint64_t dbTouched =
-      __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-  if (dbTouched == curPostIdx) {
-    // Nothing pending, just poll CQ for already-submitted work
-    quietUntil<PrvdType>(ep, curPostIdx);
-    return;
-  }
-
-  uint32_t numPendingWqes = curPostIdx - static_cast<uint32_t>(dbTouched);
-  uint64_t dbrVal = buildFlushDbrVal<PrvdType>(wq, curPostIdx, qpn);
-
-  __threadfence_system();
-
-  if constexpr (PrvdType == core::ProviderType::PSD) {
-    core::RingDoorbell<PrvdType>(wq->dbrAddr, dbrVal);
-  } else {
-    core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, curPostIdx);
-    __threadfence_system();
-    core::RingDoorbell<PrvdType>(wq->dbrAddr, dbrVal);
-  }
-
-  __threadfence_system();
-
-  __hip_atomic_fetch_add(&cq->needConsIdx, numPendingWqes, __ATOMIC_RELAXED,
-                         __HIP_MEMORY_SCOPE_AGENT);
-  __hip_atomic_store(&wq->dbTouchIdx, static_cast<uint64_t>(curPostIdx), __ATOMIC_RELAXED,
-                     __HIP_MEMORY_SCOPE_AGENT);
 
   // Poll CQ until all WQEs complete (ensure source buffers are reusable)
   quietUntil<PrvdType>(ep, curPostIdx);
