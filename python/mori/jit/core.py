@@ -35,8 +35,6 @@ import tempfile
 import time
 from pathlib import Path
 
-logger = logging.getLogger(__name__)
-
 from mori.jit.cache import get_cache_dir, get_cache_root
 from mori.jit.config import (
     BuildConfig,
@@ -47,6 +45,8 @@ from mori.jit.config import (
     is_debuginfo_enabled,
     is_profiler_enabled,
 )
+
+logger = logging.getLogger(__name__)
 
 _BC_FILENAME = "libmori_shmem_device.bc"
 
@@ -246,7 +246,12 @@ def _is_all_ionic_support_ccqe() -> bool:
 @functools.cache
 def is_ccqe_enabled() -> bool:
     """Return True if CCQE should be enabled (cached after first call)."""
-    if os.environ.get("MORI_DISABLE_IONIC_CCQE", "").lower() in ("1", "true", "on", "yes"):
+    if os.environ.get("MORI_DISABLE_IONIC_CCQE", "").lower() in (
+        "1",
+        "true",
+        "on",
+        "yes",
+    ):
         logger.info("Ionic _ccqe_enabled: False (disabled by MORI_DISABLE_IONIC_CCQE)")
         return False
     lib_support = _lib_has_ionic_ccqe()
