@@ -197,7 +197,18 @@ for fsdp_param, input_numels, input_dtypes in zip(...):
 Groups that do not satisfy these conditions can still use MORI SDMA allgather, but they
 fall back to the regular rank-major output layout and FSDP2 copy-out path.
 
-### Operator-Level Changes
+The gate is needed because the direct-write path turns the SDMA output buffer into the
+backing storage for FSDP2 unsharded parameter views. That is only safe when each
+parameter maps to one contiguous input split and the final `[param][rank]` layout matches
+FSDP2's view construction. If a parameter uses a different shard dimension, DTensor
+placement, custom post-allgather hook, or multiple allgather inputs, the same offset
+formula may no longer describe the final parameter layout. In those cases, falling back
+to the regular copy-out path preserves correctness.
+
+For the Qwen 7B benchmark, the gate fully matches the observed FSDP2 allgather pattern:
+every measured FSDP2 allgather output used the param-contiguous no-copy path.
+
+### SDMA AG Operator-Level Changes
 
 At the operator level, the param-contiguous path changes where each rank's shard is
 written. Instead of first producing a rank-major buffer and then asking FSDP to copy it
