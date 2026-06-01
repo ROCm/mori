@@ -20,6 +20,17 @@ The MORI integration reduces this overhead in stages:
 3. Skip input copies when a single contiguous input can be used directly.
 4. Add a param-contiguous multi-parameter output no-copy path.
 
+## Why SDMA Allgather Helps
+
+On AMD GPUs, RCCL allgather uses GPU kernels that run on compute units (CUs), so an
+overlapped allgather can still compete with GEMM or attention for compute resources. MORI
+SDMA allgather routes the bulk GPU-to-GPU transfer through SDMA copy engines instead,
+giving the communication path a zero-CU implementation that is especially useful when
+allgather overlaps with model compute. This follows the same resource-overlap motivation
+as prior DeepSpeed ZeRO-3 SDMA allgather work; see
+[SDMA-Accelerated ZeRO-3 on AMD GPUs](https://github.com/deepspeedai/DeepSpeed/blob/master/examples/sdma_allgather/README.md)
+for related context.
+
 ## Runtime Modes
 
 The benchmarks compare three execution modes. The native mode establishes the RCCL
