@@ -17,7 +17,7 @@ You are helping the user deploy MORI inside a Docker container. Optional inputs:
 - **`--nic=<type>`**: `ainic` (Pensando DSC/Pollara), `cx7` (Mellanox ConnectX-7), `thor2` (Broadcom)
 
 **Locate `MORI_REPO_DIR`**: default to the current working directory if it
-contains `setup.py`; ask the user otherwise.
+contains `pyproject.toml`; ask the user otherwise.
 
 **Detect NIC type** (unless `--nic` was given) — determines whether Step 3 is needed:
 
@@ -39,9 +39,11 @@ Default image: `rocm/pytorch:rocm7.2.1_ubuntu22.04_py3.10_pytorch_release_2.8.0`
 Check if the container already exists:
 
 ```bash
-sudo docker inspect $CONTAINER_NAME &>/dev/null \
-  && sudo docker start $CONTAINER_NAME \
-  || sudo docker run $(build_flags) --name $CONTAINER_NAME $IMAGE_NAME sleep infinity
+if sudo docker inspect $CONTAINER_NAME &>/dev/null; then
+  sudo docker start $CONTAINER_NAME
+else
+  sudo docker run <flags> --name $CONTAINER_NAME $IMAGE_NAME sleep infinity
+fi
 ```
 
 Probe optional mount paths on the host and only include ones that exist:
@@ -92,9 +94,9 @@ All subsequent steps run **inside** `$CONTAINER_NAME` via `docker exec`.
 ## Step 2: Install base system packages
 
 ```bash
-apt-get update && apt-get install -y --no-install-recommends \
+sudo docker exec $CONTAINER_NAME bash -c "apt-get update && apt-get install -y --no-install-recommends \
     git libpci-dev libdw1 libibverbs-dev ibverbs-utils \
-    locales iputils-ping iproute2 ethtool
+    locales iputils-ping iproute2 ethtool"
 ```
 
 ---
@@ -105,69 +107,87 @@ apt-get update && apt-get install -y --no-install-recommends \
 
 ### Extract the AINIC bundle
 
-First detect the firmware version from the host sysfs, then find the matching bundle:
+First detect the firmware version from the **host** sysfs (outside container), then run everything else inside the container in one `docker exec` block:
 
 ```bash
-# Read firmware version from host — pick first available IB device dynamically
+# Run on HOST to detect firmware version
 IB_DEV=$(ls /sys/class/infiniband/ 2>/dev/null | head -1)
 FW_VER=$(cat /sys/class/infiniband/${IB_DEV}/fw_ver 2>/dev/null)
 echo "Detected IB device: $IB_DEV  firmware version: $FW_VER"
 
-# Find bundle matching full firmware version (e.g. "1.117.5-a-77"); fall back to latest if no match
-if [ -n "$FW_VER" ]; then
-  BUNDLE=$(find /shared /apps /mnt /home -name "ainic_bundle_${FW_VER}*.tar.gz" 2>/dev/null | head -1)
+# Search each root sequentially on HOST so /apps always wins over /home
+for ROOT in /apps /shared /mnt /home; do
+  BUNDLE=$(find "$ROOT" -maxdepth 3 -not -path "*/.snapshot/*" \
+    -name "ainic_bundle_${FW_VER}*.tar.gz" 2>/dev/null | head -1)
+  [ -n "$BUNDLE" ] && break
+done
+# Fallback: pick newest bundle if no version match found
+if [ -z "$BUNDLE" ]; then
+  for ROOT in /apps /shared /mnt /home; do
+    BUNDLE=$(find "$ROOT" -maxdepth 3 -not -path "*/.snapshot/*" \
+      -name "ainic_bundle_*.tar.gz" 2>/dev/null | sort -V | tail -1)
+    [ -n "$BUNDLE" ] && break
+  done
 fi
-# Fallback: pick newest bundle if version-matched bundle not found
-[ -z "$BUNDLE" ] && BUNDLE=$(find /shared /apps /mnt /home -name "ainic_bundle_*.tar.gz" 2>/dev/null | sort -V | tail -1)
-
 echo "Using bundle: $BUNDLE"
-WORK=$(dirname "$BUNDLE")
-BUNDLE_DIR="$WORK/$(basename "$BUNDLE" .tar.gz)"
-
-[ -d "$BUNDLE_DIR" ] || tar xf "$BUNDLE" -C "$WORK"
-[ -d "$BUNDLE_DIR/host_sw_pkg" ] || tar xf "$BUNDLE_DIR/host_sw_pkg.tar.gz" -C "$BUNDLE_DIR"
-[ -d "$BUNDLE_DIR/host_sw_pkg/ionic_driver/src/drivers-linux" ] || \
-    tar xf "$BUNDLE_DIR/host_sw_pkg/ionic_driver/src/drivers-linux.tar.xz" \
-        -C "$BUNDLE_DIR/host_sw_pkg/ionic_driver/src/"
 ```
 
-### Build and install rdma-core
+Then run the full install inside the container (pass `$BUNDLE` in):
 
 ```bash
+sudo docker exec $CONTAINER_NAME bash -c "
+set -e
+BUNDLE=$BUNDLE
+BUNDLE_DIR=\"/tmp/\$(basename \"\$BUNDLE\" .tar.gz)\"
+
+# Extract bundle into /tmp (guaranteed writable)
+[ -d \"\$BUNDLE_DIR\" ] || tar xf \"\$BUNDLE\" -C /tmp
+[ -d \"\$BUNDLE_DIR/host_sw_pkg\" ] || tar xf \"\$BUNDLE_DIR/host_sw_pkg.tar.gz\" -C \"\$BUNDLE_DIR\"
+[ -d \"\$BUNDLE_DIR/host_sw_pkg/ionic_driver/src/drivers-linux\" ] || \
+    tar xf \"\$BUNDLE_DIR/host_sw_pkg/ionic_driver/src/drivers-linux.tar.xz\" \
+        -C \"\$BUNDLE_DIR/host_sw_pkg/ionic_driver/src/\"
+
+# Build deps for rdma-core
 apt-get install -y --no-install-recommends \
     cmake ninja-build python3-docutils libudev-dev pkg-config dh-python pandoc
 
-RDMA_SRC="$BUNDLE_DIR/host_sw_pkg/ionic_driver/src/drivers-linux/rdma-core"
-mkdir -p "$RDMA_SRC/build" && cd "$RDMA_SRC/build"
+# Build and install rdma-core
+RDMA_SRC=\"\$BUNDLE_DIR/host_sw_pkg/ionic_driver/src/drivers-linux/rdma-core\"
+mkdir -p \"\$RDMA_SRC/build\" && cd \"\$RDMA_SRC/build\"
 cmake -GNinja -DCMAKE_INSTALL_PREFIX=/usr -DNO_PYVERBS=1 -DNO_MAN_PAGES=1 ..
 ninja && ninja install && ldconfig
+ldconfig -p | grep libibverbs
 
-ldconfig -p | grep libibverbs  # verify
-```
-
-### Install nicctl
-
-```bash
-CODENAME=$(. /etc/os-release && echo "$VERSION_CODENAME")
-NICCTL_DEB=$(find "$BUNDLE_DIR/host_sw_pkg/nicctl/deb/$CODENAME" -name "nicctl_*.deb" | head -1)
-dpkg -i "$NICCTL_DEB"
-nicctl --version  # verify
+# Install nicctl
+CODENAME=\$(. /etc/os-release && echo \"\$VERSION_CODENAME\")
+NICCTL_DEB=\$(find \"\$BUNDLE_DIR/host_sw_pkg/nicctl/deb/\$CODENAME\" -name 'nicctl_*.deb' | head -1)
+dpkg -i \"\$NICCTL_DEB\"
+nicctl --version
+"
 ```
 
 ---
 
 ## Step 4: Install MORI
 
-`pybind11` is a required build dep missing from `pyproject.toml` — install it first:
+`pybind11` is a required build dep missing from `pyproject.toml`. Run inside the container:
 
 ```bash
-pip install pybind11
+sudo docker exec -w $MORI_REPO_DIR $CONTAINER_NAME bash -c "
+pip install pybind11 -q
+rm -rf build   # clear stale cmake cache — old build/ can hardcode a wrong ROCm version
+pip install .
+"
 ```
 
+With MPI (if `--with-mpi` was passed):
+
 ```bash
-# Clear stale cmake cache if present — old build/ can hardcode a wrong ROCm version
-rm -rf "$MORI_REPO_DIR/build"
-cd "$MORI_REPO_DIR" && pip install .
+sudo docker exec -w $MORI_REPO_DIR $CONTAINER_NAME bash -c "
+pip install pybind11 -q
+rm -rf build
+MORI_WITH_MPI=ON pip install .
+"
 ```
 
 ---
@@ -175,14 +195,16 @@ cd "$MORI_REPO_DIR" && pip install .
 ## Step 5: Verify
 
 ```bash
-python3 -c "import mori; print('mori version:', mori.__version__)"
+sudo docker exec $CONTAINER_NAME python3 -c "import mori; print('mori version:', mori.__version__)"
 ```
 
 On shared-library errors (`libpci.so`, `libibverbs.so`, …):
 
 ```bash
-ldd $(python3 -c "import mori._C; print(mori._C.__file__)") | grep "not found"
+sudo docker exec $CONTAINER_NAME bash -c "
+ldd \$(python3 -c \"import mori._C; print(mori._C.__file__)\") | grep 'not found'
 ldconfig
+"
 ```
 
 ---
@@ -192,7 +214,7 @@ ldconfig
 Only if `--precompile` was passed. Recommended when baking a Docker image.
 
 ```bash
-MORI_PRECOMPILE=1 python3 -c "import mori"
+sudo docker exec $CONTAINER_NAME bash -c "MORI_PRECOMPILE=1 python3 -c 'import mori'"
 ```
 
 Kernels cache to `~/.mori/jit/` and are reused on every subsequent run.
@@ -202,13 +224,15 @@ Kernels cache to `~/.mori/jit/` and are reused on every subsequent run.
 ## Step 7: Show detected hardware
 
 ```bash
-python3 -c "
+sudo docker exec $CONTAINER_NAME bash -c "
+python3 -c \"
 from mori.jit.config import detect_build_config, detect_nic_type
 cfg = detect_build_config()
 print(f'GPU arch : {cfg.arch}')
 print(f'NIC type : {detect_nic_type()}')
-"
+\"
 ibv_devinfo | head -20
+"
 ```
 
 ---
@@ -219,7 +243,7 @@ ibv_devinfo | head -20
 - ROCm version
 - NIC library installed (`libionic` / `libmlx5` / `libbnxt_re` / none)
 - rdma-core: distro package or built from bundle
-- Install mode (`source` / `pypi` / `nightly`)
+- Install mode: source (`pip install .`)
 - GPU arch and NIC type as reported by MORI
 - Kernels: precompiled or JIT on first use (`~/.mori/jit/`)
 - Attach command (working directory set to the MORI source tree):
