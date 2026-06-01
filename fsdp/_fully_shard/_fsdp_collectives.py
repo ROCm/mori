@@ -617,7 +617,10 @@ def _try_no_copy_all_gather_output(
     for fsdp_param, output_view in zip(fsdp_params, output_views):
         fsdp_param._keep_all_gather_output_storage = True
         fsdp_param.all_gather_outputs = [output_view]
-    record_copy_out(output_numel, skipped=True)
+    hit_kind = (
+        "single_param_no_copy" if len(fsdp_params) == 1 else "param_contiguous"
+    )
+    record_copy_out(output_numel, skipped=True, hit_kind=hit_kind)
     return True
 
 

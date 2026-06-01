@@ -41,13 +41,21 @@ def record_copy_in(numel: int, skipped: bool) -> None:
     _counters[f"{key}_numel"] += int(numel)
 
 
-def record_copy_out(numel: int, skipped: bool, reason: Optional[str] = None) -> None:
+def record_copy_out(
+    numel: int,
+    skipped: bool,
+    reason: Optional[str] = None,
+    hit_kind: Optional[str] = None,
+) -> None:
     if not _ENABLED:
         return
     key = "copy_out_skipped" if skipped else "copy_out_performed"
     _counters[key] += 1
     _counters[f"{key}_numel"] += int(numel)
     _counters["no_copy_hit" if skipped else "no_copy_miss"] += 1
+    if skipped and hit_kind is not None:
+        _counters[f"{hit_kind}_hit"] += 1
+        _counters[f"{hit_kind}_hit_numel"] += int(numel)
     if not skipped and reason is not None:
         _copy_out_miss_reasons[reason] += 1
     _maybe_dump()
@@ -105,8 +113,12 @@ def dump(prefix: str = "[mori-fsdp-stats]") -> None:
         f"copy_out_performed={_counters['copy_out_performed']} "
         f"no_copy_hit={_counters['no_copy_hit']} "
         f"no_copy_miss={_counters['no_copy_miss']} "
+        f"param_contiguous_hit={_counters['param_contiguous_hit']} "
+        f"single_param_no_copy_hit={_counters['single_param_no_copy_hit']} "
         f"copy_out_skipped_numel={_counters['copy_out_skipped_numel']} "
         f"copy_out_performed_numel={_counters['copy_out_performed_numel']} "
+        f"param_contiguous_hit_numel={_counters['param_contiguous_hit_numel']} "
+        f"single_param_no_copy_hit_numel={_counters['single_param_no_copy_hit_numel']} "
         f"register_cache_hit={_counters['register_cache_hit']} "
         f"register_existing_hit={_counters['register_existing_hit']} "
         f"register_call={_counters['register_call']} "
