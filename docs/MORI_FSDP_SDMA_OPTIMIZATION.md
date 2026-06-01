@@ -18,13 +18,13 @@ The MORI integration reduces this overhead in stages:
 1. Use MORI SDMA for the allgather communication path.
 2. Register direct output buffers so SDMA can write into user-visible GPU memory.
 3. Skip input copies when a single contiguous input can be used directly.
-4. Add a param-contiguous multi-parameter no-copy output path.
+4. Add a param-contiguous multi-parameter output no-copy path.
 
 ## Runtime Modes
 
 The benchmarks compare three execution modes. The native mode establishes the RCCL
 baseline, the MORI SDMA base path isolates the communication replacement, and the
-param-contiguous mode measures the full no-copy output path.
+param-contiguous mode measures the output no-copy, copy-out-free path.
 
 Native baseline (RCCL):
 
@@ -47,7 +47,7 @@ torchrun --nproc_per_node=8 examples/fsdp/bench_qwen7b_allgather.py \
   --warmup 5
 ```
 
-MORI SDMA with param-contiguous multi-parameter no-copy:
+MORI SDMA with param-contiguous multi-parameter output no-copy:
 
 ```bash
 MORI_ENABLE_SDMA=1 \
@@ -62,6 +62,10 @@ torchrun --nproc_per_node=8 examples/fsdp/bench_qwen7b_allgather.py \
 `MORI_FSDP_PARAM_CONTIGUOUS=1` is intentionally explicit. Without it, MORI still uses
 the SDMA allgather path, but multi-parameter FSDP groups fall back to the safer copy-out
 layout path.
+
+The benchmark script sets `MORI_FSDP_ENABLE_SDMA=1` automatically for `--mode mori`.
+For manual integration outside this script, set both `MORI_ENABLE_SDMA=1` and
+`MORI_FSDP_ENABLE_SDMA=1`; otherwise FSDP2 keeps using the native allgather path.
 
 ## Benchmark Results
 
@@ -174,7 +178,10 @@ registered GPU output buffer so SDMA can write directly into user-visible memory
 for a single contiguous allgather input tensor, FSDP2 can skip the copy-in staging path
 and pass the original input tensor directly to MORI. Third, for eligible multi-parameter
 groups, FSDP2 passes per-parameter split sizes and offsets to MORI, enabling
-param-contiguous output and skipping the normal `split_with_sizes_copy` copy-out.
+param-contiguous output and skipping the normal `split_with_sizes_copy` copy-out. The
+multi-parameter param-contiguous path is an output no-copy optimization: it removes the
+FSDP copy-out/layout transform, while still packing multiple local input splits into one
+contiguous allgather input buffer before communication.
 
 The param-contiguous path is intentionally gated. It is used only for FSDP2 parameter
 groups that have multiple parameters, shard on dim 0, do not use DTensor, do not define
@@ -206,7 +213,7 @@ formula may no longer describe the final parameter layout. In those cases, falli
 to the regular copy-out path preserves correctness.
 
 For the Qwen 7B benchmark, the gate fully matches the observed FSDP2 allgather pattern:
-every measured FSDP2 allgather output used the param-contiguous no-copy path.
+every measured FSDP2 allgather output used the param-contiguous output no-copy path.
 
 ### SDMA AG Operator-Level Changes
 
