@@ -107,6 +107,18 @@ target_compile_features(test_peer_ssd_manager PRIVATE cxx_std_17)
 gtest_discover_tests(test_peer_ssd_manager)
 
 # ---------------------------------------------------------------------------
+# test_peer_ssd_eviction — Phase 4 LRU + watermark eviction + in-flight guard
+# ---------------------------------------------------------------------------
+add_executable(test_peer_ssd_eviction test_peer_ssd_eviction.cpp)
+
+target_link_libraries(test_peer_ssd_eviction PRIVATE umbp_common
+                                                     GTest::gtest_main)
+
+target_compile_features(test_peer_ssd_eviction PRIVATE cxx_std_17)
+
+gtest_discover_tests(test_peer_ssd_eviction)
+
+# ---------------------------------------------------------------------------
 # test_ssd_copy_pipeline — Phase 2 DramCopyPin + async copy-on-commit pipeline
 # ---------------------------------------------------------------------------
 add_executable(test_ssd_copy_pipeline test_ssd_copy_pipeline.cpp)

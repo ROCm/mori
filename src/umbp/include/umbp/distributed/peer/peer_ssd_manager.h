@@ -21,12 +21,15 @@
 // SOFTWARE.
 #pragma once
 
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -46,18 +49,20 @@ struct SsdReadOutcome {
 
 // Peer-side owner of the local SSD tier in the master-as-advisor design.
 // Single responsibility: manage one SSD TierBackend + the key->SSD-location
-// map + capacity + the owned-location event outbox (and, from Phase 3, the
-// read-prepare path).  It deliberately reuses ONLY the low-level TierBackend
+// map + capacity + the owned-location event outbox + the read-prepare and
+// local-eviction paths.  It deliberately reuses ONLY the low-level TierBackend
 // (SSDTier); it must NOT pull in LocalStorageManager / LocalBlockIndex (which
 // carry their own DRAM tier + demote/promote) — peer DRAM is owned by
 // PeerDramAllocator and two DRAM concepts would scramble ownership.
-//
-// Phase 1 builds the ownership model + reporting channel but does NOT move
-// data: nothing writes to SSD yet (copy-on-commit = Phase 2), so Write() is
-// only driven by unit tests; reads are a stub (Phase 3).
 class PeerSsdManager : public OwnedLocationSource {
  public:
   explicit PeerSsdManager(const PeerSsdConfig& cfg);
+
+  // Test-only: inject a ready-made backend and explicit watermarks so unit
+  // tests can drive eviction with a controllable (e.g. blocking) fake backend.
+  // Production code must use the config constructor.
+  PeerSsdManager(std::unique_ptr<TierBackend> backend, double high_watermark, double low_watermark);
+
   ~PeerSsdManager() override;
 
   PeerSsdManager(const PeerSsdManager&) = delete;
@@ -71,29 +76,47 @@ class PeerSsdManager : public OwnedLocationSource {
   // Write the key's bytes (assembled from possibly non-contiguous DRAM source
   // segments) to the SSD backend.  On success records the SSD location and
   // queues an ADD SSD event; on failure records nothing and queues nothing
-  // (best-effort clean).  In Phase 1 this is exercised only by unit tests; the
-  // copy worker that drives it lands in Phase 2.
+  // (best-effort clean).
   bool Write(const std::string& key, const std::vector<std::pair<const void*, size_t>>& segments,
              size_t total_size);
 
-  // Phase 4: local eviction.  Removes the key from the backend + map and
-  // queues a REMOVE SSD event.  Implemented here but not yet wired to any
-  // caller in Phase 1.
+  // Local eviction of a single key.  Read priority: a key with an
+  // in-flight PrepareRead (inflight_reads_ > 0) is NOT evicted (returns false).
+  // Concurrency: marks the key in evicting_ under the lock, runs the backend
+  // evict outside the lock, and only on backend success removes owned_/lru_ and
+  // queues a REMOVE SSD event (so REMOVE is never emitted while the bytes still
+  // exist, and two workers cannot double-evict the same victim).
+  //
+  // Does NOT itself hold eviction_mu_ (EvictToLowWatermark already holds it
+  // while looping over victims, so taking it here would deadlock).  The normal
+  // caller is EvictToLowWatermark; a direct caller must not run concurrently
+  // with ClearLocal (production relies on PoolClient::Clear quiescing the copy
+  // pipeline first, so no eviction is in flight during a Clear).
   bool Evict(const std::string& key);
 
-  // Phase 4: local LRU victim selection.  Minimal stub in Phase 1.
+  // Local LRU victim selection (oldest first), skipping keys that are
+  // being read (inflight_reads_ > 0) or already being evicted (evicting_).
+  // Accumulates sizes until >= bytes_to_free; returns fewer if not enough
+  // free-able keys exist (never blocks).
   std::vector<std::string> SelectVictims(size_t bytes_to_free);
 
-  // Distributed Clear: drop the logical owned-location map + undrained
-  // events so a post-Clear full-sync snapshot is empty and no stale ADD
-  // SSD is shipped.  Physical backend bytes are intentionally left in
-  // place (best-effort cache; reclaimed by Phase 4 local eviction).
-  // Callers MUST quiesce the SSD copy pipeline first so no in-flight copy
-  // re-populates owned_ right after this returns.
+  // Distributed Clear: drop the logical owned-location map + undrained events,
+  // then delete the physical SSD bytes (a user Clear means the cache is no
+  // longer wanted).  Read priority: clears the logical map first (so new reads
+  // immediately miss with kNotFound), waits for any in-flight PrepareRead to
+  // finish (SSD reads cannot be safely aborted), and only then wipes the
+  // backend.  Serializes against eviction rounds via eviction_mu_.
+  // Precondition: callers (PoolClient::Clear) MUST quiesce the SSD copy
+  // pipeline first so no in-flight copy re-populates owned_ right after this
+  // returns.  Crash-restart leftover (metadata gone, files remain) is a
+  // known follow-up.
   void ClearLocal();
 
-  // Phase 3: read the key's bytes into a staging slot.  Minimal stub in
-  // Phase 1 (always kNotFound); the real key-based read path lands in Phase 3.
+  // Read the key's bytes into a staging slot.  Returns kNotFound when
+  // the key is unknown OR currently being evicted (evicting_); kSizeTooLarge
+  // when the key is bigger than staging_cap; otherwise reads the bytes and
+  // returns kOk.  The backend IO runs outside the lock; the key is marked
+  // in-flight (inflight_reads_) across that window so eviction skips it.
   SsdReadOutcome PrepareRead(const std::string& key, void* staging_ptr, size_t staging_cap);
 
   // OwnedLocationSource — all events carry TierType::SSD.
@@ -101,10 +124,44 @@ class PeerSsdManager : public OwnedLocationSource {
   std::vector<KvEvent> SnapshotOwnedKeys() const override;
 
  private:
+  // One owned SSD key: its size plus a hook into the LRU recency list so that
+  // a touch is an O(1) splice and a victim lookup is an O(1) walk from the tail.
+  struct OwnedEntry {
+    uint64_t size = 0;
+    std::list<std::string>::iterator lru_it;  // position of this key in lru_
+  };
+
+  // Splice |key| to the MRU (front) of the recency list.  Caller holds mutex_
+  // and must have already inserted the key into owned_.
+  void TouchLocked(const std::string& key);
+
+  // Evict oldest keys until used <= low_watermark * total.  Runs the backend
+  // IO outside mutex_ (via Evict); serialized by eviction_mu_ so concurrent
+  // copy workers do not run overlapping eviction rounds (and never over-evict).
+  void EvictToLowWatermark();
+
+  // Serializes eviction rounds (EvictToLowWatermark) and excludes ClearLocal.
+  // Always acquired BEFORE mutex_ to keep a single lock order.
+  std::mutex eviction_mu_;
+
   mutable std::mutex mutex_;
-  std::unique_ptr<TierBackend> backend_;             // null when cfg.enabled == false
-  std::unordered_map<std::string, uint64_t> owned_;  // key -> size (SSD location)
+  std::unique_ptr<TierBackend> backend_;  // null when cfg.enabled == false
+  double high_watermark_ = 0.9;
+  double low_watermark_ = 0.7;
+
+  // key -> {size, lru position}.  The authoritative owned-location map.
+  std::unordered_map<std::string, OwnedEntry> owned_;
+  std::list<std::string> lru_;  // front = most-recently-used, back = LRU
   std::vector<KvEvent> pending_events_;
+
+  // Read priority + eviction coordination (all guarded by mutex_):
+  //   inflight_reads_: key -> active PrepareRead count (entry exists only while
+  //     > 0).  Eviction skips keys with a live read.
+  //   evicting_: keys currently inside Evict's backend-evict window; new reads
+  //     of these miss (kNotFound) and SelectVictims skips them.
+  std::unordered_map<std::string, int> inflight_reads_;
+  std::unordered_set<std::string> evicting_;
+  std::condition_variable reads_drained_cv_;  // notified when inflight_reads_ empties
 };
 
 }  // namespace mori::umbp

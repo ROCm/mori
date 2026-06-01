@@ -114,6 +114,24 @@ TEST(GlobalBlockIndexEvents, RemoveUnknownIsNoop) {
   EXPECT_EQ(idx.ApplyEvents("ghost", {Remove("ghost-key", TierType::DRAM)}), 0u);
 }
 
+// A key mirrored on both DRAM and SSD of one node: a DRAM eviction
+// (REMOVE DRAM) must drop only the DRAM bucket and leave the SSD location
+// readable.  This is the additive-index invariant the Phase 4 SSD tier relies
+// on (DRAM evict never touches the SSD copy); no master code is exercised here
+// beyond ApplyEvents.
+TEST(GlobalBlockIndexEvents, RemoveDramKeepsSsdBucket) {
+  GlobalBlockIndex idx;
+  idx.ApplyEvents("node-A", {Add("k", TierType::DRAM, 100), Add("k", TierType::SSD, 100)});
+  ASSERT_TRUE(HasLocation(idx.Lookup("k"), "node-A", TierType::DRAM, 100));
+  ASSERT_TRUE(HasLocation(idx.Lookup("k"), "node-A", TierType::SSD, 100));
+
+  idx.ApplyEvents("node-A", {Remove("k", TierType::DRAM)});
+
+  auto locs = idx.Lookup("k");
+  EXPECT_FALSE(HasLocation(locs, "node-A", TierType::DRAM, 100));  // DRAM bucket gone
+  EXPECT_TRUE(HasLocation(locs, "node-A", TierType::SSD, 100));    // SSD bucket retained
+}
+
 TEST(GlobalBlockIndexEvents, ClearAtTierClearsOnlyTargetNodeTier) {
   GlobalBlockIndex idx;
   idx.ApplyEvents("node-A", {Add("k1", TierType::DRAM, 1), Add("k2", TierType::SSD, 2),

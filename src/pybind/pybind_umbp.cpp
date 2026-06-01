@@ -158,6 +158,8 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("capacity_bytes", &UMBPSsdConfig::capacity_bytes)
       .def_readwrite("layout_mode", &UMBPSsdConfig::layout_mode)
       .def_readwrite("segment_size_bytes", &UMBPSsdConfig::segment_size_bytes)
+      .def_readwrite("high_watermark", &UMBPSsdConfig::high_watermark)
+      .def_readwrite("low_watermark", &UMBPSsdConfig::low_watermark)
       .def_readwrite("io", &UMBPSsdConfig::io)
       .def_readwrite("durability", &UMBPSsdConfig::durability)
       .def_readwrite("ssd_backend", &UMBPSsdConfig::ssd_backend)

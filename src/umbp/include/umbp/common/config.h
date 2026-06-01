@@ -85,6 +85,14 @@ struct UMBPSsdConfig {
   UMBPIoConfig io;
   UMBPDurabilityConfig durability;
 
+  // Local SSD-tier capacity watermarks for the distributed PeerSsdManager
+  // (Phase 4 local eviction).  When used/total crosses high_watermark the owner
+  // peer evicts its oldest keys down to low_watermark.  Mirrors the DRAM tier's
+  // env-tunable convention (UMBP_DRAM_HIGH_WM / LOW_WM); NOT the master-side
+  // EvictionConfig (whose watermarks are intentionally not env-tunable).
+  double high_watermark = 0.9;
+  double low_watermark = 0.7;
+
   // SSD backend selection. "posix" uses the segmented-log SSDTier; "spdk" /
   // "spdk_proxy" use the SPDK NVMe path (direct SpdkSsdTier in standalone, or
   // SpdkProxyTier when sharing the device across processes).  Kept here (rather
@@ -131,6 +139,14 @@ struct UMBPSsdConfig {
     }
     if (segment_size_bytes == 0) {
       if (error_message) *error_message = "ssd.segment_size_bytes must be > 0";
+      return false;
+    }
+    // Watermarks must satisfy 0 < low < high <= 1.  Fail fast on a misconfigured
+    // value rather than silently clamping (a clamp would hide the config error).
+    if (!(high_watermark > 0.0 && high_watermark <= 1.0 && low_watermark > 0.0 &&
+          low_watermark < high_watermark)) {
+      if (error_message)
+        *error_message = "ssd watermarks must satisfy 0 < low_watermark < high_watermark <= 1";
       return false;
     }
     return true;
@@ -303,6 +319,8 @@ struct UMBPConfig {
     cfg.eviction.policy = getenv_str("UMBP_EVICTION_POLICY", cfg.eviction.policy);
     cfg.dram.high_watermark = getenv_double("UMBP_DRAM_HIGH_WM", cfg.dram.high_watermark);
     cfg.dram.low_watermark = getenv_double("UMBP_DRAM_LOW_WM", cfg.dram.low_watermark);
+    cfg.ssd.high_watermark = getenv_double("UMBP_SSD_HIGH_WM", cfg.ssd.high_watermark);
+    cfg.ssd.low_watermark = getenv_double("UMBP_SSD_LOW_WM", cfg.ssd.low_watermark);
     cfg.dram.use_hugepages =
         getenv_int("UMBP_DRAM_USE_HUGEPAGES", cfg.dram.use_hugepages ? 1 : 0) != 0;
     cfg.dram.hugepage_size = getenv_size("UMBP_DRAM_HUGEPAGE_SIZE", cfg.dram.hugepage_size);

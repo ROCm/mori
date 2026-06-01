@@ -31,12 +31,32 @@
 
 namespace mori::umbp {
 
+namespace {
+// Watermarks must satisfy 0 < low < high <= 1.  We fail fast on a bad value
+// rather than silently clamping, so a misconfigured env surfaces immediately.
+bool WatermarksValid(double high, double low) {
+  return high > 0.0 && high <= 1.0 && low > 0.0 && low < high;
+}
+}  // namespace
+
+// ---------------------------------------------------------------------------
+//  Construction
+// ---------------------------------------------------------------------------
+
 PeerSsdManager::PeerSsdManager(const PeerSsdConfig& cfg) {
   if (!cfg.enabled) {
     MORI_UMBP_INFO("[PeerSsdManager] constructed disabled (no SSD backend)");
     return;
   }
   const auto& ssd = cfg.ssd;
+
+  if (!WatermarksValid(ssd.high_watermark, ssd.low_watermark)) {
+    throw std::runtime_error(
+        "[PeerSsdManager] invalid SSD watermarks (require 0 < low_watermark < "
+        "high_watermark <= 1)");
+  }
+  high_watermark_ = ssd.high_watermark;
+  low_watermark_ = ssd.low_watermark;
 
   // Explicit backend selection — an unknown value is a configuration error, not
   // a reason to silently fall back to POSIX.
@@ -72,7 +92,21 @@ PeerSsdManager::PeerSsdManager(const PeerSsdConfig& cfg) {
                            "' (expected one of: posix, spdk, spdk_proxy)");
 }
 
+PeerSsdManager::PeerSsdManager(std::unique_ptr<TierBackend> backend, double high_watermark,
+                               double low_watermark)
+    : backend_(std::move(backend)), high_watermark_(high_watermark), low_watermark_(low_watermark) {
+  if (!WatermarksValid(high_watermark_, low_watermark_)) {
+    throw std::runtime_error(
+        "[PeerSsdManager] invalid SSD watermarks (require 0 < low_watermark < "
+        "high_watermark <= 1)");
+  }
+}
+
 PeerSsdManager::~PeerSsdManager() = default;
+
+// ---------------------------------------------------------------------------
+//  Capacity & queries
+// ---------------------------------------------------------------------------
 
 std::pair<size_t, size_t> PeerSsdManager::Capacity() const {
   if (!backend_) return {0, 0};
@@ -84,15 +118,36 @@ bool PeerSsdManager::Exists(const std::string& key) const {
   return owned_.find(key) != owned_.end();
 }
 
+void PeerSsdManager::TouchLocked(const std::string& key) {
+  auto it = owned_.find(key);
+  if (it == owned_.end()) return;
+  lru_.splice(lru_.begin(), lru_, it->second.lru_it);  // move-to-front; iterator stays valid
+  it->second.lru_it = lru_.begin();
+}
+
+// ---------------------------------------------------------------------------
+//  Write (copy-on-commit landing)
+// ---------------------------------------------------------------------------
+
 bool PeerSsdManager::Write(const std::string& key,
                            const std::vector<std::pair<const void*, size_t>>& segments,
                            size_t total_size) {
   if (!backend_) return false;
 
-  // Assemble (possibly non-contiguous) DRAM source segments into one
-  // contiguous buffer before handing it to the backend.  v1 accepts the extra
-  // memcpy; a writev/batch path can replace this later.  When the source is
-  // already a single contiguous segment of the right size we write it directly.
+  // Optimization, not just defense: the DRAM pin only dedups *concurrent*
+  // copies, so a sequential re-put of an already-resident key would otherwise
+  // repeat the whole SSD write.  Skip it and refresh LRU instead.
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (owned_.find(key) != owned_.end()) {
+      TouchLocked(key);
+      return true;
+    }
+  }
+
+  // Assemble (possibly non-contiguous) DRAM source segments into one contiguous
+  // buffer for the backend.  A single right-sized segment is written directly;
+  // otherwise we memcpy into scratch (v1 accepts the copy; writev can replace).
   const void* data = nullptr;
   std::vector<char> scratch;
   if (segments.size() == 1 && segments[0].second == total_size) {
@@ -117,64 +172,180 @@ bool PeerSsdManager::Write(const std::string& key,
     data = scratch.data();
   }
 
-  // Backend IO outside our mutex_ — SSDTier is internally synchronized.
+  // Backend IO outside our mutex_ — SSDTier is internally synchronized.  A
+  // failure may be ENOSPC: run one eviction round to reclaim space and retry
+  // once before giving up (best-effort, no event/record on final failure).
   if (!backend_->Write(key, data, total_size)) {
-    MORI_UMBP_WARN("[PeerSsdManager] backend Write failed key={} size={}", key, total_size);
-    return false;
+    EvictToLowWatermark();
+    if (!backend_->Write(key, data, total_size)) {
+      MORI_UMBP_WARN("[PeerSsdManager] backend Write failed key={} size={}", key, total_size);
+      return false;
+    }
   }
 
-  std::lock_guard<std::mutex> lock(mutex_);
-  owned_[key] = total_size;
-  pending_events_.push_back(KvEvent{KvEvent::Kind::ADD, key, TierType::SSD, total_size});
+  // Record the location.  Re-check owned_: with > 1 copy worker, two of them
+  // could have both seen "absent" above and written the same (identical,
+  // content-addressed) bytes — only the first records it + emits ADD SSD.
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (owned_.find(key) != owned_.end()) {
+      TouchLocked(key);
+    } else {
+      lru_.push_front(key);
+      owned_.emplace(key, OwnedEntry{total_size, lru_.begin()});
+      pending_events_.push_back(KvEvent{KvEvent::Kind::ADD, key, TierType::SSD, total_size});
+    }
+  }
+
+  // Check-after-write trigger, on this copy worker (no dedicated thread).
+  auto [used, total] = Capacity();
+  if (total > 0 && static_cast<double>(used) >= high_watermark_ * static_cast<double>(total)) {
+    EvictToLowWatermark();
+  }
   return true;
 }
+
+// ---------------------------------------------------------------------------
+//  Eviction (local, read-priority)
+// ---------------------------------------------------------------------------
 
 bool PeerSsdManager::Evict(const std::string& key) {
   if (!backend_) return false;
-  backend_->Evict(key);
+
+  // Reserve under the lock: skip if a read is in flight (read priority), if the
+  // key is gone, or if another worker is already evicting it.  owned_ is kept
+  // until the backend confirms the delete.
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (owned_.find(key) == owned_.end()) return false;
+    if (inflight_reads_.count(key) != 0) return false;
+    if (!evicting_.insert(key).second) return false;
+  }
+
+  bool ok = backend_->Evict(key);  // backend IO outside the lock
+
+  // Commit only if the backend freed the bytes; on failure keep owned_ for a
+  // later retry, so REMOVE SSD is never emitted while the bytes still exist.
   std::lock_guard<std::mutex> lock(mutex_);
+  evicting_.erase(key);
+  if (!ok) {
+    MORI_UMBP_WARN("[PeerSsdManager] backend Evict failed key={} — keeping for retry", key);
+    return false;
+  }
   auto it = owned_.find(key);
-  if (it == owned_.end()) return false;
-  owned_.erase(it);
-  pending_events_.push_back(KvEvent{KvEvent::Kind::REMOVE, key, TierType::SSD, 0});
+  if (it != owned_.end()) {  // still present (a racing ClearLocal could have dropped it)
+    lru_.erase(it->second.lru_it);
+    owned_.erase(it);
+    pending_events_.push_back(KvEvent{KvEvent::Kind::REMOVE, key, TierType::SSD, 0});
+  }
   return true;
 }
 
-std::vector<std::string> PeerSsdManager::SelectVictims(size_t /*bytes_to_free*/) {
-  // TODO(Phase 4): local watermark + LRU victim selection.
-  return {};
+std::vector<std::string> PeerSsdManager::SelectVictims(size_t bytes_to_free) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  std::vector<std::string> victims;
+  if (bytes_to_free == 0) return victims;
+
+  // Oldest first (LRU tail -> MRU front), skipping keys being read or evicted.
+  size_t freed = 0;
+  for (auto it = lru_.rbegin(); it != lru_.rend(); ++it) {
+    const std::string& key = *it;
+    if (inflight_reads_.count(key) != 0) continue;
+    if (evicting_.count(key) != 0) continue;
+    auto owned_it = owned_.find(key);
+    if (owned_it == owned_.end()) continue;  // defensive; lru_/owned_ stay in sync
+    victims.push_back(key);
+    freed += owned_it->second.size;
+    if (freed >= bytes_to_free) break;
+  }
+  return victims;
 }
 
-void PeerSsdManager::ClearLocal() {
-  std::lock_guard<std::mutex> lock(mutex_);
-  owned_.clear();
-  pending_events_.clear();
+void PeerSsdManager::EvictToLowWatermark() {
+  if (!backend_) return;
+
+  // Only one eviction round at a time: a second concurrent worker (or a worker
+  // racing ClearLocal) backs off instead of over-evicting.  try_lock keeps the
+  // copy path non-blocking.
+  std::unique_lock<std::mutex> round(eviction_mu_, std::try_to_lock);
+  if (!round.owns_lock()) return;
+
+  auto [used, total] = Capacity();
+  if (total == 0) return;
+  double low_bytes = low_watermark_ * static_cast<double>(total);
+  if (static_cast<double>(used) <= low_bytes) return;
+  size_t bytes_to_free = used - static_cast<size_t>(low_bytes);
+
+  // Single pass, no retry loop: if everything reclaimable is in use we free
+  // what we can and stop, so a fully-pinned tier cannot starve the worker.
+  for (const auto& key : SelectVictims(bytes_to_free)) {
+    Evict(key);
+  }
 }
+
+// ---------------------------------------------------------------------------
+//  Clear (drop metadata + wipe physical bytes)
+// ---------------------------------------------------------------------------
+
+void PeerSsdManager::ClearLocal() {
+  // Exclude eviction rounds for the whole operation (lock order: eviction_mu_
+  // before mutex_, matching EvictToLowWatermark).
+  std::lock_guard<std::mutex> round(eviction_mu_);
+  {
+    std::unique_lock<std::mutex> lock(mutex_);
+    owned_.clear();
+    lru_.clear();
+    pending_events_.clear();
+    evicting_.clear();
+    // Read priority: new reads already miss (owned_ is empty), but a read that
+    // already started holds inflight_reads_ and is doing backend IO.  Wait for
+    // it to finish before wiping the bytes — SSD reads cannot be safely aborted.
+    reads_drained_cv_.wait(lock, [this] { return inflight_reads_.empty(); });
+  }
+  if (backend_) backend_->Clear();  // delete physical SSD bytes (user Clear = discard cache)
+}
+
+// ---------------------------------------------------------------------------
+//  Read
+// ---------------------------------------------------------------------------
 
 SsdReadOutcome PeerSsdManager::PrepareRead(const std::string& key, void* staging_ptr,
                                            size_t staging_cap) {
   if (!backend_) return SsdReadOutcome{SsdReadStatus::kNotFound, 0};
 
-  // Look up the authoritative size under the lock, then release it before the
-  // blocking SSD IO so a concurrent copy Write() is not serialized behind this
-  // read (the lock only guards the owned_ map, not the backend IO).
+  // Resolve size and mark the read in flight under the lock, then run the
+  // blocking SSD IO outside it (so a concurrent copy Write is not serialized).
   size_t size = 0;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = owned_.find(key);
     if (it == owned_.end()) return SsdReadOutcome{SsdReadStatus::kNotFound, 0};
-    size = it->second;
+    // Being evicted: bytes about to vanish — treat a new read as a stale-route
+    // miss rather than racing the backend delete.
+    if (evicting_.count(key) != 0) return SsdReadOutcome{SsdReadStatus::kNotFound, 0};
+    size = it->second.size;
+    // Reject over-capacity before touching the device (no in-flight mark, no IO).
+    if (size > staging_cap) {
+      MORI_UMBP_WARN("[PeerSsdManager] PrepareRead key={} size={} exceeds cap={}", key, size,
+                     staging_cap);
+      return SsdReadOutcome{SsdReadStatus::kSizeTooLarge, size};
+    }
+    ++inflight_reads_[key];
   }
 
-  // Reject before touching the device: a key larger than the caller's capacity
-  // (reader buffer / staging slot) must not trigger a wasted SSD read.
-  if (size > staging_cap) {
-    MORI_UMBP_WARN("[PeerSsdManager] PrepareRead key={} size={} exceeds cap={}", key, size,
-                   staging_cap);
-    return SsdReadOutcome{SsdReadStatus::kSizeTooLarge, size};
+  bool read_ok = backend_->ReadIntoPtr(key, reinterpret_cast<uintptr_t>(staging_ptr), size);
+
+  // Always release the in-flight mark (even on error), refresh LRU on success,
+  // and wake a waiting ClearLocal once the last read drains.
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto rit = inflight_reads_.find(key);
+    if (rit != inflight_reads_.end() && --rit->second <= 0) inflight_reads_.erase(rit);
+    if (read_ok && owned_.find(key) != owned_.end()) TouchLocked(key);
+    if (inflight_reads_.empty()) reads_drained_cv_.notify_all();
   }
 
-  if (!backend_->ReadIntoPtr(key, reinterpret_cast<uintptr_t>(staging_ptr), size)) {
+  if (!read_ok) {
     // owned_ had the key but the backend couldn't serve it (e.g. a Phase 4
     // local evict raced us, or a corrupt record): kError, not a definitive miss.
     MORI_UMBP_WARN("[PeerSsdManager] PrepareRead backend read failed key={} size={}", key, size);
@@ -182,6 +353,10 @@ SsdReadOutcome PeerSsdManager::PrepareRead(const std::string& key, void* staging
   }
   return SsdReadOutcome{SsdReadStatus::kOk, size};
 }
+
+// ---------------------------------------------------------------------------
+//  OwnedLocationSource (heartbeat event drain / snapshot)
+// ---------------------------------------------------------------------------
 
 std::vector<KvEvent> PeerSsdManager::DrainPendingEvents() {
   std::lock_guard<std::mutex> lock(mutex_);
@@ -194,8 +369,8 @@ std::vector<KvEvent> PeerSsdManager::SnapshotOwnedKeys() const {
   std::lock_guard<std::mutex> lock(mutex_);
   std::vector<KvEvent> out;
   out.reserve(owned_.size());
-  for (const auto& [key, size] : owned_) {
-    out.push_back(KvEvent{KvEvent::Kind::ADD, key, TierType::SSD, size});
+  for (const auto& [key, entry] : owned_) {
+    out.push_back(KvEvent{KvEvent::Kind::ADD, key, TierType::SSD, entry.size});
   }
   return out;
 }

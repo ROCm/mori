@@ -120,11 +120,10 @@ struct ExportableDram {
 
 // SSD-tier construction parameters lowered from the user-facing UMBPConfig.
 // SSDTier depends on UMBPSsdConfig (io backend/queue_depth, segment_size,
-// durability, storage_dir, capacity), so the peer only needs that subset — not
-// the whole global config.  (SPDK/proxy backend selection lives at UMBPConfig
-// top level and is not yet wired into the distributed peer path; v1 builds the
-// POSIX SSDTier.  TODO(follow-up): fold ssd_backend/spdk* into UMBPSsdConfig so
-// the distributed path can select SpdkSsdTier too.)
+// durability, storage_dir, capacity, watermarks, backend selection), so the
+// peer only needs that subset — not the whole global config.  ssd_backend
+// (posix / spdk / spdk_proxy) lives inside UMBPSsdConfig, so PeerSsdManager
+// picks the backend from cfg.ssd directly.
 struct PeerSsdConfig {
   bool enabled = false;
   UMBPSsdConfig ssd;
