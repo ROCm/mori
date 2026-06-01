@@ -10,16 +10,12 @@ description: >-
 
 # Deploy MORI
 
-You are helping the user deploy MORI inside a Docker container. Optional inputs:
-
-- **`--precompile`**: precompile GPU kernels after install
-- **`--with-mpi`**: enable MPI support
-- **`--nic=<type>`**: `ainic` (Pensando DSC/Pollara), `cx7` (Mellanox ConnectX-7), `thor2` (Broadcom)
+You are helping the user deploy MORI inside a Docker container.
 
 **Locate `MORI_REPO_DIR`**: default to the current working directory if it
 contains `pyproject.toml`; ask the user otherwise.
 
-**Detect NIC type** (unless `--nic` was given) — determines whether Step 3 is needed:
+**Detect NIC type** — determines whether Step 3 is needed:
 
 ```bash
 lspci | grep -iE "pensando|ionic|dsc|pollara" && echo "→ ainic"
@@ -31,7 +27,7 @@ lspci | grep -iE "broadcom.*thor|bnxt"         && echo "→ thor2"
 
 ## Step 1: Start the Docker container
 
-**Ask the user for a container name — mandatory before proceeding.**
+Use the container name from the user's args if provided; ask if not.
 
 Default image: `rocm/pytorch:rocm7.2.1_ubuntu22.04_py3.10_pytorch_release_2.8.0`
 (use this unless the user specifies another).
@@ -82,10 +78,6 @@ sudo docker run \
 Notes:
 - `--network=host` + `--device=/dev/infiniband` required for RDMA visibility.
 - `--rm` — data outside mounted volumes is lost on stop.
-- `nicctl show version host-software` inside the container **will not show**
-  `ionic driver` version — nicctl reads it via the `pds_core` IPC socket
-  (not mounted). Use `cat /sys/module/ionic/version` instead, or add
-  `-v /var/run/pds:/var/run/pds` to the `docker run` command.
 
 All subsequent steps run **inside** `$CONTAINER_NAME` via `docker exec`.
 
@@ -96,72 +88,71 @@ All subsequent steps run **inside** `$CONTAINER_NAME` via `docker exec`.
 ```bash
 sudo docker exec $CONTAINER_NAME bash -c "apt-get update && apt-get install -y --no-install-recommends \
     git libpci-dev libdw1 libibverbs-dev ibverbs-utils \
-    locales iputils-ping iproute2 ethtool"
+    locales iputils-ping iproute2 ethtool jq perftest"
 ```
+
+`jq` is required by `mori check`. `perftest` provides `ib_write_bw`/`ib_write_lat` for intra/inter-node bandwidth and latency checks.
 
 ---
 
-## Step 3: Install rdma-core and nicctl (AINIC only)
+## Step 3: Install AINIC userspace libraries (AINIC only)
 
 **Skip if NIC type is not `ainic`.**
 
-### Extract the AINIC bundle
+### Detect host AINIC version and check against public repo
 
-First detect the firmware version from the **host** sysfs (outside container), then run everything else inside the container in one `docker exec` block:
+Run on the **host** (outside container):
 
 ```bash
-# Run on HOST to detect firmware version
 IB_DEV=$(ls /sys/class/infiniband/ 2>/dev/null | head -1)
-FW_VER=$(cat /sys/class/infiniband/${IB_DEV}/fw_ver 2>/dev/null)
-echo "Detected IB device: $IB_DEV  firmware version: $FW_VER"
-
-# Search each root sequentially on HOST so /apps always wins over /home
-for ROOT in /apps /shared /mnt /home; do
-  BUNDLE=$(find "$ROOT" -maxdepth 3 -not -path "*/.snapshot/*" \
-    -name "ainic_bundle_${FW_VER}*.tar.gz" 2>/dev/null | head -1)
-  [ -n "$BUNDLE" ] && break
-done
-# Fallback: pick newest bundle if no version match found
-if [ -z "$BUNDLE" ]; then
-  for ROOT in /apps /shared /mnt /home; do
-    BUNDLE=$(find "$ROOT" -maxdepth 3 -not -path "*/.snapshot/*" \
-      -name "ainic_bundle_*.tar.gz" 2>/dev/null | sort -V | tail -1)
-    [ -n "$BUNDLE" ] && break
-  done
+if [ -z "$IB_DEV" ]; then
+  echo "ERROR: no InfiniBand device found under /sys/class/infiniband/"
+  echo "Make sure the ionic kernel module is loaded on the host."
+  exit 1
 fi
-echo "Using bundle: $BUNDLE"
+HOST_AINIC_VER=$(cat /sys/class/infiniband/${IB_DEV}/fw_ver 2>/dev/null)
+if [ -z "$HOST_AINIC_VER" ]; then
+  echo "ERROR: cannot read fw_ver from /sys/class/infiniband/${IB_DEV}/fw_ver"
+  exit 1
+fi
+echo "Host AINIC firmware version: $HOST_AINIC_VER (detected from $IB_DEV)"
+
+AVAILABLE=$(curl -fsSL https://repo.radeon.com/amdainic/pensando/ubuntu/ \
+  | grep -oP '(?<=href=")[^"]+(?=/)' \
+  | grep -v '^\.\.' | grep -v '^https' | sort)
+echo "Available AINIC versions in public repo:"
+echo "$AVAILABLE"
+
+if ! echo "$AVAILABLE" | grep -qx "$HOST_AINIC_VER"; then
+  echo ""
+  echo "ERROR: host AINIC version '$HOST_AINIC_VER' is not available in the public repo."
+  echo "Available versions: $(echo $AVAILABLE | tr '\n' ' ')"
+  echo "Please contact your AINIC vendor for a matching software bundle."
+  exit 1
+fi
+
+echo "Found matching version '$HOST_AINIC_VER' in public repo — proceeding."
 ```
 
-Then run the full install inside the container (pass `$BUNDLE` in):
+### Install inside container
 
 ```bash
 sudo docker exec $CONTAINER_NAME bash -c "
 set -e
-BUNDLE=$BUNDLE
-BUNDLE_DIR=\"/tmp/\$(basename \"\$BUNDLE\" .tar.gz)\"
+AINIC_VERSION=$HOST_AINIC_VER
+UBUNTU_CODENAME=\$(. /etc/os-release && echo \"\$VERSION_CODENAME\")
 
-# Extract bundle into /tmp (guaranteed writable)
-[ -d \"\$BUNDLE_DIR\" ] || tar xf \"\$BUNDLE\" -C /tmp
-[ -d \"\$BUNDLE_DIR/host_sw_pkg\" ] || tar xf \"\$BUNDLE_DIR/host_sw_pkg.tar.gz\" -C \"\$BUNDLE_DIR\"
-[ -d \"\$BUNDLE_DIR/host_sw_pkg/ionic_driver/src/drivers-linux\" ] || \
-    tar xf \"\$BUNDLE_DIR/host_sw_pkg/ionic_driver/src/drivers-linux.tar.xz\" \
-        -C \"\$BUNDLE_DIR/host_sw_pkg/ionic_driver/src/\"
+mkdir -p /etc/apt/keyrings
+curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key \
+    | gpg --dearmor > /etc/apt/keyrings/amdainic.gpg
+echo \"deb [arch=amd64 signed-by=/etc/apt/keyrings/amdainic.gpg] \
+    https://repo.radeon.com/amdainic/pensando/ubuntu/\${AINIC_VERSION} \
+    \${UBUNTU_CODENAME} main\" > /etc/apt/sources.list.d/amdainic.list
 
-# Build deps for rdma-core
-apt-get install -y --no-install-recommends \
-    cmake ninja-build python3-docutils libudev-dev pkg-config dh-python pandoc
-
-# Build and install rdma-core
-RDMA_SRC=\"\$BUNDLE_DIR/host_sw_pkg/ionic_driver/src/drivers-linux/rdma-core\"
-mkdir -p \"\$RDMA_SRC/build\" && cd \"\$RDMA_SRC/build\"
-cmake -GNinja -DCMAKE_INSTALL_PREFIX=/usr -DNO_PYVERBS=1 -DNO_MAN_PAGES=1 ..
-ninja && ninja install && ldconfig
-ldconfig -p | grep libibverbs
-
-# Install nicctl
-CODENAME=\$(. /etc/os-release && echo \"\$VERSION_CODENAME\")
-NICCTL_DEB=\$(find \"\$BUNDLE_DIR/host_sw_pkg/nicctl/deb/\$CODENAME\" -name 'nicctl_*.deb' | head -1)
-dpkg -i \"\$NICCTL_DEB\"
+apt-get update
+apt-get install -y nicctl libionic-dev ionic-common
+ldconfig
+ldconfig -p | grep libionic
 nicctl --version
 "
 ```
@@ -177,16 +168,6 @@ sudo docker exec -w $MORI_REPO_DIR $CONTAINER_NAME bash -c "
 pip install pybind11 -q
 rm -rf build   # clear stale cmake cache — old build/ can hardcode a wrong ROCm version
 pip install .
-"
-```
-
-With MPI (if `--with-mpi` was passed):
-
-```bash
-sudo docker exec -w $MORI_REPO_DIR $CONTAINER_NAME bash -c "
-pip install pybind11 -q
-rm -rf build
-MORI_WITH_MPI=ON pip install .
 "
 ```
 
@@ -209,19 +190,7 @@ ldconfig
 
 ---
 
-## Step 6 (optional): Precompile GPU kernels
-
-Only if `--precompile` was passed. Recommended when baking a Docker image.
-
-```bash
-sudo docker exec $CONTAINER_NAME bash -c "MORI_PRECOMPILE=1 python3 -c 'import mori'"
-```
-
-Kernels cache to `~/.mori/jit/` and are reused on every subsequent run.
-
----
-
-## Step 7: Show detected hardware
+## Step 6: Show detected hardware
 
 ```bash
 sudo docker exec $CONTAINER_NAME bash -c "
@@ -237,17 +206,50 @@ ibv_devinfo | head -20
 
 ---
 
+## Step 7: Run `mori check`
+
+```bash
+sudo docker exec $CONTAINER_NAME bash -c "mori check"
+```
+
+`mori check` validates the full AINIC/RDMA stack in 6 steps:
+
+1. **firmware & driver** — firmware, nicctl, ionic driver versions must match
+2. **QoS / SL / TC** — DSCP classification, PFC, DWRR scheduling, selects the SL/TC for MORI to use
+3. **DCQCN** — congestion control enabled on all RoCE devices, CNP DSCP consistent
+4. **intra-node bandwidth** — `ib_write_bw` between all local NIC pairs (requires `perftest`)
+5. **inter-node bandwidth** — `ib_write_bw` to a peer node; pass peer IP: `mori check <peer_ip>`
+6. **inter-node latency** — `ib_write_lat` to a peer node; same peer IP
+
+Steps 5 and 6 are skipped when no peer IP is given — run `mori check <peer_ip>` from both nodes to test cross-node connectivity.
+
+If any step shows `[FAIL]`:
+
+- Run `mori setup` to auto-apply recommended QoS/PFC/DCQCN settings:
+  ```bash
+  sudo docker exec $CONTAINER_NAME bash -c "mori setup"
+  ```
+  Note: env vars (`MORI_RDMA_SL`/`TC`) do **not** persist in the calling shell. To export them, use `source $(mori setup --path)` instead.
+
+- If the issue persists, run `mori diagnose` for deeper diagnostics:
+  ```bash
+  sudo docker exec $CONTAINER_NAME bash -c "mori diagnose"
+  ```
+
+---
+
 ## Done — Report Back
 
 - Base image and OS
-- ROCm version
 - NIC library installed (`libionic` / `libmlx5` / `libbnxt_re` / none)
-- rdma-core: distro package or built from bundle
 - Install mode: source (`pip install .`)
 - GPU arch and NIC type as reported by MORI
-- Kernels: precompiled or JIT on first use (`~/.mori/jit/`)
+- Kernels: JIT on first use (`~/.mori/jit/`)
+- `mori check` result — include full output, highlight any `[WARN]` or `[FAIL]`
 - Attach command (working directory set to the MORI source tree):
 
 ```bash
 sudo docker exec -it -w "$MORI_REPO_DIR" $CONTAINER_NAME bash
 ```
+
+**Built-in tools:** `mori check`, `mori setup`, `mori diagnose` — see Step 7 for usage.
