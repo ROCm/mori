@@ -260,7 +260,9 @@ __device__ void EpDispatchIntraNodeLLKernel_body(EpDispatchCombineArgs<T> args) 
   size_t warpDimOffset = (size_t)inGroupWarpId * dimPerWarp;
   size_t warpDimChunk =
       (warpDimOffset < hiddenDim) ? min(hiddenDim - warpDimOffset, dimPerWarp) : 0;
-  assert(warpDimChunk > 0 && "warpDimChunk must be > 0 for warpgroups to be useful");
+  assert(!(warpNum % kWarpsPerGroup) && warpDimChunk > 0 &&
+         "total num of warps must be divisible by the num of warpgroups,
+         warpDimChunk must be > 0 for warpgroups to be useful");
 
   IF_ENABLE_PROFILER(
       INTRANODE_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
