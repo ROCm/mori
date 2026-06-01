@@ -181,7 +181,20 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
   cpuMemObj->peerRkeys = static_cast<uint32_t*>(calloc(worldSize, sizeof(uint32_t)));
   cpuMemObj->peerRkeys[rank] = 0;
   RdmaDeviceContext* rdmaDeviceContext = context.GetRdmaDeviceContext();
-  if (rdmaDeviceContext) {
+  // Only register the symmetric buffer as an RDMA MR if at least one peer is
+  // actually reachable via RDMA. Otherwise (e.g. single-node 2-GPU runs that
+  // use only P2P/SDMA) ibv_reg_mr can still fail -- typically EINVAL on large
+  // heaps when the host's memlock/IB stack rejects the registration -- and
+  // bring down init even though no RDMA traffic will ever flow.
+  bool anyRdmaPeer = false;
+  for (int i = 0; i < worldSize; i++) {
+    if (i == rank) continue;
+    if (context.GetTransportType(i) == TransportType::RDMA) {
+      anyRdmaPeer = true;
+      break;
+    }
+  }
+  if (rdmaDeviceContext && anyRdmaPeer) {
     application::RdmaMemoryRegion mr = rdmaDeviceContext->RegisterRdmaMemoryRegion(localPtr, size);
     cpuMemObj->lkey = mr.lkey;
     cpuMemObj->peerRkeys[rank] = mr.rkey;
