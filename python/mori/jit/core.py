@@ -25,6 +25,8 @@
 
 from __future__ import annotations
 
+import functools
+import logging
 import os
 import re
 import subprocess
@@ -43,6 +45,8 @@ from mori.jit.config import (
     is_debuginfo_enabled,
     is_profiler_enabled,
 )
+
+logger = logging.getLogger(__name__)
 
 _BC_FILENAME = "libmori_shmem_device.bc"
 
@@ -230,7 +234,7 @@ def _is_all_ionic_support_ccqe() -> bool:
     if len(set(versions)) != 1:
         return False
 
-    print(f"ionic ver: {versions[-1]}")
+    logger.debug("ionic ver: %s", versions[-1])
 
     for ver in versions:
         if not _is_firmware_support_ccqe(ver):
@@ -239,25 +243,27 @@ def _is_all_ionic_support_ccqe() -> bool:
     return True
 
 
-_ccqe_enabled: bool | None = None
-
-
+@functools.cache
 def is_ccqe_enabled() -> bool:
     """Return True if CCQE should be enabled (cached after first call)."""
-    global _ccqe_enabled
-    if _ccqe_enabled is None:
-        if os.environ.get("MORI_DISABLE_IONIC_CCQE") == "1":
-            _ccqe_enabled = False
-            print("Ionic _ccqe_enabled: False (disabled by MORI_DISABLE_IONIC_CCQE)")
-        else:
-            lib_support = _lib_has_ionic_ccqe()
-            nic_support = _is_all_ionic_support_ccqe()
-            _ccqe_enabled = lib_support and nic_support
-            print(
-                f"Ionic _ccqe_enabled: {_ccqe_enabled} lib_support {lib_support} nic_support: {nic_support}"
-            )
-
-    return _ccqe_enabled
+    if os.environ.get("MORI_DISABLE_IONIC_CCQE", "").lower() in (
+        "1",
+        "true",
+        "on",
+        "yes",
+    ):
+        logger.info("Ionic _ccqe_enabled: False (disabled by MORI_DISABLE_IONIC_CCQE)")
+        return False
+    lib_support = _lib_has_ionic_ccqe()
+    nic_support = _is_all_ionic_support_ccqe()
+    enabled = lib_support and nic_support
+    logger.info(
+        "Ionic _ccqe_enabled: %s lib_support %s nic_support: %s",
+        enabled,
+        lib_support,
+        nic_support,
+    )
+    return enabled
 
 
 def _ccqe_defines() -> list[str]:
