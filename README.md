@@ -189,7 +189,10 @@ GPU Direct RDMA READ, pairwise, 128 consecutive transfers, 1 GPU, MI300X + Thor2
 ### Prerequisites
 
 - ROCm >= 6.4 (hipcc needed at runtime for JIT kernel compilation, not at install time)
-- System packages: `libpci-dev` (see [Dockerfile.dev](docker/Dockerfile.dev))
+- System packages (required for `pip install`; not bundled in wheels). On Debian/Ubuntu install at least:
+  - `libpci-dev`
+  - `libibverbs-dev`, `ibverbs-utils`
+  See [docker/Dockerfile.dev](docker/Dockerfile.dev) for the full apt list used in CI/dev images.
 - Optional: `libopenmpi-dev`, `openmpi-bin` — only needed when building C++ examples (`BUILD_EXAMPLES=ON`) or enabling MPI bootstrap (`MORI_WITH_MPI=ON`)
 
 Or build docker image with:
