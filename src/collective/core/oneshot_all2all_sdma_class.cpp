@@ -26,10 +26,16 @@
 #include <cstring>
 #include <stdexcept>
 
+#include "mori/shmem/internal.hpp"
 #include "mori/shmem/shmem.hpp"
 
 namespace mori {
 namespace collective {
+namespace {
+bool IsShmemInitialized() {
+  return shmem::ShmemStatesSingleton::GetInstance()->status == shmem::ShmemStatesStatus::Initialized;
+}
+}  // namespace
 #if 0
 // Implementation of ShmemDeleter::operator()
 void ShmemDeleter::operator()(void* ptr) const {
@@ -124,6 +130,13 @@ All2allSdma<T>::~All2allSdma() {
   // Cancel any ongoing async operation
   if (async_in_progress_) {
     cancel_async();
+  }
+
+  if (!IsShmemInitialized()) {
+    flags_.release();
+    input_transit_buffer_ptr_.release();
+    output_transit_buffer_ptr_.release();
+    return;
   }
 
   // Memory is automatically managed by unique_ptr, ShmemDeleter will auto-free during destruction

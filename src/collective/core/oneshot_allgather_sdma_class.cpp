@@ -26,10 +26,16 @@
 #include <cstring>
 #include <stdexcept>
 
+#include "mori/shmem/internal.hpp"
 #include "mori/shmem/shmem.hpp"
 
 namespace mori {
 namespace collective {
+namespace {
+bool IsShmemInitialized() {
+  return shmem::ShmemStatesSingleton::GetInstance()->status == shmem::ShmemStatesStatus::Initialized;
+}
+}  // namespace
 #if 0
 // Implementation of ShmemDeleter::operator()
 void ShmemDeleter::operator()(void* ptr) const {
@@ -126,6 +132,13 @@ template <typename T>
 AllgatherSdma<T>::~AllgatherSdma() {
   if (async_in_progress_) {
     cancel_async();
+  }
+  if (!IsShmemInitialized()) {
+    registered_output_buffers_.clear();
+    flags_.release();
+    input_transit_buffer_ptr_.release();
+    output_transit_buffer_ptr_.release();
+    return;
   }
   for (auto& [addr, entry] : registered_output_buffers_) {
     shmem::ShmemSymmetricDeregister(reinterpret_cast<void*>(addr), entry.size);

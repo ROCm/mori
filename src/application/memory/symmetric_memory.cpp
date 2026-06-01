@@ -304,6 +304,19 @@ void SymmMemManager::DeregisterSymmMemObj(void* localPtr) {
   if (rdmaDeviceContext) rdmaDeviceContext->DeregisterRdmaMemoryRegion(localPtr);
 
   SymmMemObjPtr memObjPtr = memObjPool.at(localPtr);
+  SymmMemObj gpuMemObjHost{};
+  HIP_RUNTIME_CHECK(
+      hipMemcpy(&gpuMemObjHost, memObjPtr.gpu, sizeof(SymmMemObj), hipMemcpyDeviceToHost));
+
+  auto freeGpuMetadata = [](void* ptr, const char* name) {
+    if (ptr == nullptr) return;
+    hipError_t err = hipFree(ptr);
+    if (err != hipSuccess) {
+      MORI_APP_WARN("hipFree failed for GPU metadata {} ptr {:p}: {}", name, ptr,
+                    hipGetErrorString(err));
+      (void)hipGetLastError();
+    }
+  };
 
   // Close IPC handles for peers that had P2P connection.
   // Skip same-process peers: their p2pPeerPtrs are direct VA pointers, not
@@ -342,19 +355,19 @@ void SymmMemManager::DeregisterSymmMemObj(void* localPtr) {
     }
     free(memObjPtr.cpu->peerSignalPtrsHost);
   }
-  if (memObjPtr.gpu->signalPtrs) HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu->signalPtrs));
-  if (memObjPtr.gpu->expectSignalsPtr) HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu->expectSignalsPtr));
-  if (memObjPtr.gpu->peerSignalPtrs) HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu->peerSignalPtrs));
-  if (memObjPtr.gpu->deviceHandles_d) HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu->deviceHandles_d));
+  freeGpuMetadata(gpuMemObjHost.signalPtrs, "signalPtrs");
+  freeGpuMetadata(gpuMemObjHost.expectSignalsPtr, "expectSignalsPtr");
+  freeGpuMetadata(gpuMemObjHost.peerSignalPtrs, "peerSignalPtrs");
+  freeGpuMetadata(gpuMemObjHost.deviceHandles_d, "deviceHandles_d");
 
   free(memObjPtr.cpu->peerPtrs);
   free(memObjPtr.cpu->p2pPeerPtrs);
   free(memObjPtr.cpu->peerRkeys);
   free(memObjPtr.cpu->ipcMemHandles);
   free(memObjPtr.cpu);
-  HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu->peerPtrs));
-  HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu->p2pPeerPtrs));
-  HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu->peerRkeys));
+  HIP_RUNTIME_CHECK(hipFree(gpuMemObjHost.peerPtrs));
+  HIP_RUNTIME_CHECK(hipFree(gpuMemObjHost.p2pPeerPtrs));
+  HIP_RUNTIME_CHECK(hipFree(gpuMemObjHost.peerRkeys));
   HIP_RUNTIME_CHECK(hipFree(memObjPtr.gpu));
 
   memObjPool.erase(localPtr);

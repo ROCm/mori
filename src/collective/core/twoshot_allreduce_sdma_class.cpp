@@ -30,10 +30,16 @@
 #include <cstring>
 #include <stdexcept>
 
+#include "mori/shmem/internal.hpp"
 #include "mori/shmem/shmem.hpp"
 
 namespace mori {
 namespace collective {
+namespace {
+bool IsShmemInitialized() {
+  return shmem::ShmemStatesSingleton::GetInstance()->status == shmem::ShmemStatesStatus::Initialized;
+}
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // Delegating constructor
@@ -111,6 +117,13 @@ template <typename T>
 AllreduceSdma<T>::~AllreduceSdma() {
   if (async_in_progress_) {
     cancel_async();
+  }
+  if (!IsShmemInitialized()) {
+    flags_.release();
+    barrierMem_.release();
+    input_transit_buffer_ptr_.release();
+    output_transit_buffer_ptr_.release();
+    return;
   }
   if (flags_) {
     printf("AllreduceSdma destroyed: PE %d\n", myPe_);
