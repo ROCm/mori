@@ -48,9 +48,13 @@ std::chrono::seconds GrpcShutdownDeadline() {
   return v;
 }
 
-// Free -> Preparing -> Leased.  SSD IO runs while Preparing; the TTL only
-// starts on Leased, and Preparing slots are never reclaimed — so a slow IO
-// can't let the reaper reassign a slot and corrupt bytes a reader will RDMA.
+// Free -> Preparing -> Leased.  Preparing slots (IO in flight) are never
+// reclaimed, so a slow IO can't have its slot reassigned mid-write.  The TTL is
+// anchored at request receipt (leased_at = received_at, set on promotion) to
+// align the peer's reclaim point (received_at + ttl) with the reader's deadline
+// (t_send + ttl, t_send < received_at).  A reader trusting bytes from a slot
+// reclaimed mid-use is prevented by Preparing (IO safety) + the reader's own
+// lease gating (see ssd_read_lease.h).
 enum class SlotState { kFree, kPreparing, kLeased };
 
 struct StagingSlot {
@@ -124,8 +128,9 @@ TierType FromProtoTier(::umbp::TierType t) {
 }
 
 // Map a PeerSsdManager read outcome (data-level: ok/not_found/size/error) to the
-// wire status.  NO_SLOT / LEASE_EXPIRED are staging-layer concerns owned by the
-// peer service, not PeerSsdManager, and are set directly by the handler.
+// wire status.  NO_SLOT is a staging-layer concern owned by the peer service,
+// not PeerSsdManager, and is set directly by the handler.  Lease expiry is not
+// a wire status: the reader decides it locally and the peer reclaims by TTL.
 ::umbp::SsdReadStatus ToProtoReadStatus(SsdReadStatus s) {
   switch (s) {
     case SsdReadStatus::kOk:
@@ -233,6 +238,12 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
       return grpc::Status::OK;
     }
 
+    // Anchor the lease TTL at request receipt (see SlotState comment): the slot
+    // is promoted to Leased with this timestamp once the IO completes, so the
+    // peer's reclaim point stays aligned with the reader's t_send-based
+    // deadline rather than starting only after the (variable) SSD IO.
+    const auto received_at = std::chrono::steady_clock::now();
+
     // Claim a slot first (Preparing — not yet TTL-tracked).  NO_SLOT is a
     // transient/retryable condition, not a miss.
     int slot_idx;
@@ -264,12 +275,13 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
       return grpc::Status::OK;
     }
 
-    // Data is in the slot: promote Preparing -> Leased and start the TTL now.
+    // Data is in the slot: promote Preparing -> Leased with the request-receipt
+    // TTL anchor (leased_at = received_at).
     {
       std::lock_guard<std::mutex> lock(read_slots_mutex_);
       auto& slot = read_slots_[slot_idx];
       slot.state = SlotState::kLeased;
-      slot.leased_at = std::chrono::steady_clock::now();
+      slot.leased_at = received_at;
       slot.allocated_size = outcome.size;
     }
     response->set_status(::umbp::SSD_READ_OK);

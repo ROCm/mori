@@ -41,6 +41,7 @@
 #include "umbp/distributed/peer/peer_service.h"
 #include "umbp/distributed/peer/peer_ssd_manager.h"
 #include "umbp/distributed/peer/ssd_copy_pipeline.h"
+#include "umbp/distributed/ssd_read_lease.h"
 #include "umbp_peer.grpc.pb.h"
 
 namespace mori::umbp {
@@ -148,19 +149,43 @@ uint32_t ReleaseLeaseMaxRetries() {
   return v;
 }
 
-// How many times a remote SSD get retries a TRANSIENT peer failure
-// (NO_SLOT / LEASE_EXPIRED) before giving up.  These are not misses: with only
-// a handful of staging slots a large prefetch batch will hit slot contention,
-// so we retry with a short backoff rather than surfacing a false miss.  A
-// definitive NOT_FOUND short-circuits immediately (no retry).
+// Total attempts for a remote SSD get.  Retryable outcomes (kRetry) are
+// NO_SLOT (transient slot exhaustion, no slot claimed) and a reader-local lease
+// expiry.  Defaults to 1 (no retry); operators opt into bounded retry to absorb
+// slot contention.  A slow/failed PrepareSsdRead (DEADLINE_EXCEEDED etc.) is a
+// hard failure, NOT retried — the peer may already hold a claimed slot, so a
+// retry would only pile up more staging-slot occupation.  NOT_FOUND is always a
+// definitive miss (no retry).
 uint32_t SsdGetTransientMaxAttempts() {
-  static const uint32_t v = GetEnvUint32("UMBP_SSD_GET_MAX_ATTEMPTS", 4, /*min_allowed=*/1);
+  static const uint32_t v = GetEnvUint32("UMBP_SSD_GET_MAX_ATTEMPTS", 1, /*min_allowed=*/1);
   return v;
 }
 
 std::chrono::milliseconds SsdGetRetryBackoff() {
   static const auto v = std::chrono::milliseconds(
       GetEnvUint32("UMBP_SSD_GET_RETRY_BACKOFF_MS", 2, /*min_allowed=*/1));
+  return v;
+}
+
+// Bounded client deadline for a single PrepareSsdRead RPC so a hung/slow peer
+// cannot block the serial per-key remote SSD read loop indefinitely.  A read
+// that cannot even return within this budget is past any useful lease window
+// and is treated as a hard failure (NOT retried: the peer may already hold a
+// claimed slot, and a retry would only claim another).  When the env is unset
+// the caller falls back to the configured lease timeout (cluster-homogeneous
+// assumption); 0 here means "use the fallback".
+std::chrono::milliseconds SsdPrepareRpcTimeoutOverride() {
+  static const auto v = GetEnvMilliseconds("UMBP_SSD_PREPARE_TIMEOUT_MS",
+                                           std::chrono::milliseconds(0), /*min_allowed=*/0);
+  return v;
+}
+
+// Bounded client deadline for a best-effort ReleaseSsdLease RPC.  Release is
+// never on the critical path (the slot is also reclaimed by TTL), so cap it
+// tightly to avoid blocking on a slow peer.
+std::chrono::milliseconds ReleaseLeaseRpcTimeout() {
+  static const auto v = GetEnvMilliseconds("UMBP_RELEASE_LEASE_TIMEOUT_MS",
+                                           std::chrono::milliseconds(1000), /*min_allowed=*/1);
   return v;
 }
 
@@ -1780,23 +1805,51 @@ bool PoolClient::EnsurePeerServiceConnection(PeerConnection& peer) {
 
 // Remote SSD get for one key (reader != owner): key-based PrepareSsdRead on the
 // peer reads the bytes into its serving staging slot; we RDMA them out of the
-// published staging buffer, then issue a best-effort ReleaseSsdLease.  The
-// returned outcome lets the caller separate a true miss (kMiss / NOT_FOUND)
-// from a retryable transient failure (kRetry / NO_SLOT / LEASE_EXPIRED).
+// published staging buffer, then issue a best-effort ReleaseSsdLease.  Outcomes:
+// kMiss (NOT_FOUND, definitive miss); kRetry (retryable: NO_SLOT or a
+// reader-local lease expiry); kError (not-served, not retried: rpc failure
+// incl. DEADLINE_EXCEEDED, size mismatch, RDMA failure).
+//
+// Lease gating: the deadline is anchored at t_send (before the RPC) so it stays
+// conservative against the peer, which counts the same TTL from request receipt
+// (see ssd_read_lease.h).  A read is reported successful only if RDMA finished
+// before that deadline; once expired we return a transient retry and do NOT
+// release (the peer reclaims the slot by TTL).  A late-returning PrepareSsdRead
+// is caught by the pre-RDMA expiry check; a hung one by the RPC deadline.
 PoolClient::SsdGetOutcome PoolClient::RemoteSsdReadOnce(PeerConnection& peer,
                                                         const std::string& key, void* dst,
                                                         size_t size) {
+  namespace lease = ssd_read_lease;
   if (!io_engine_) return SsdGetOutcome::kError;
   if (!EnsurePeerServiceConnection(peer)) return SsdGetOutcome::kError;
   if (!IsValidMemoryDesc(peer.ssd_staging_mem)) return SsdGetOutcome::kError;
   auto* stub = static_cast<::umbp::UMBPPeer::Stub*>(peer.peer_stub.get());
+
+  // Anchor the lease deadline before sending; also bound the RPC itself so a
+  // hung peer can't stall the serial batch.  Fall back to the configured lease
+  // timeout when the dedicated timeout env is unset (cluster-homogeneous).
+  const auto t_send = std::chrono::steady_clock::now();
+  auto rpc_timeout = SsdPrepareRpcTimeoutOverride();
+  if (rpc_timeout.count() == 0) {
+    rpc_timeout = std::chrono::seconds(std::max(config_.ssd_lease_timeout_s, 1));
+  }
 
   ::umbp::PrepareSsdReadRequest req;
   req.set_key(key);
   req.set_max_size(size);
   ::umbp::PrepareSsdReadResponse resp;
   grpc::ClientContext ctx;
-  if (!stub->PrepareSsdRead(&ctx, req, &resp).ok()) return SsdGetOutcome::kError;
+  // gRPC deadlines are specialized for system_clock; the lease gating below
+  // uses the monotonic steady_clock t_send for the actual validity window.
+  ctx.set_deadline(std::chrono::system_clock::now() + rpc_timeout);
+  const grpc::Status rpc = stub->PrepareSsdRead(&ctx, req, &resp);
+  if (!rpc.ok()) {
+    // Includes DEADLINE_EXCEEDED (peer slow / may already hold a claimed slot)
+    // and UNAVAILABLE: hard failure, not retried — see SsdGetTransientMaxAttempts.
+    MORI_UMBP_DEBUG("[PoolClient] RemoteSsdRead key='{}' PrepareSsdRead rpc failed (code={})", key,
+                    static_cast<int>(rpc.error_code()));
+    return SsdGetOutcome::kError;
+  }
 
   switch (resp.status()) {
     case ::umbp::SSD_READ_OK:
@@ -1804,12 +1857,23 @@ PoolClient::SsdGetOutcome PoolClient::RemoteSsdReadOnce(PeerConnection& peer,
     case ::umbp::SSD_READ_NOT_FOUND:
       return SsdGetOutcome::kMiss;
     case ::umbp::SSD_READ_NO_SLOT:
-    case ::umbp::SSD_READ_LEASE_EXPIRED:
+      // Transient slot exhaustion (no slot was claimed): retryable, not a miss.
       return SsdGetOutcome::kRetry;
     default:  // SIZE_TOO_LARGE / ERROR / unexpected
       MORI_UMBP_WARN("[PoolClient] RemoteSsdRead key='{}' status={}", key,
                      static_cast<int>(resp.status()));
       return SsdGetOutcome::kError;
+  }
+
+  const auto deadline_ttl = resp.lease_ttl_ms();
+
+  // If the lease already elapsed (slow/late PrepareSsdRead return), don't even
+  // RDMA — the staging bytes may already be getting recycled.  Transient, not a
+  // miss; leave the slot for the peer's TTL reclaim (no release).
+  if (lease::LeaseExpired(t_send, deadline_ttl, std::chrono::steady_clock::now())) {
+    MORI_UMBP_DEBUG("[PoolClient] RemoteSsdRead key='{}' lease expired before RDMA (ttl_ms={})",
+                    key, deadline_ttl);
+    return SsdGetOutcome::kRetry;
   }
 
   if (resp.size() != size) {
@@ -1844,20 +1908,41 @@ PoolClient::SsdGetOutcome PoolClient::RemoteSsdReadOnce(PeerConnection& peer,
     }
   }
 
-  ReleaseSsdLeaseBestEffort(stub, resp.lease_id());
-  return rdma_ok ? SsdGetOutcome::kSuccess : SsdGetOutcome::kError;
+  // Decide against the lease deadline: a read that finished after the deadline
+  // is untrusted (the peer may have recycled the slot mid-RDMA), so it becomes
+  // a transient retry and we skip release.  The caller uses the return value;
+  // any bytes already written to dst on the expired path are not consumed.
+  const bool expired = lease::LeaseExpired(t_send, deadline_ttl, std::chrono::steady_clock::now());
+  const auto decision = lease::DecideSsdReadOutcome(expired, rdma_ok);
+  if (decision.release) ReleaseSsdLeaseBestEffort(stub, resp.lease_id());
+  if (expired && rdma_ok) {
+    MORI_UMBP_DEBUG("[PoolClient] RemoteSsdRead key='{}' lease expired after RDMA (ttl_ms={})", key,
+                    deadline_ttl);
+  }
+  switch (decision.outcome) {
+    case lease::GateOutcome::kSuccess:
+      return SsdGetOutcome::kSuccess;
+    case lease::GateOutcome::kRetry:
+      return SsdGetOutcome::kRetry;
+    case lease::GateOutcome::kError:
+      return SsdGetOutcome::kError;
+  }
+  return SsdGetOutcome::kError;
 }
 
 // Best-effort lease release.  Correctness does not depend on it: if it fails or
-// is never called, the peer reclaims the slot when the lease TTL expires.
+// is never called, the peer reclaims the slot when the lease TTL expires.  Each
+// attempt is bounded by a short deadline so a slow peer can't stall the caller.
 void PoolClient::ReleaseSsdLeaseBestEffort(::umbp::UMBPPeer::Stub* stub, uint64_t lease_id) {
   if (lease_id == 0) return;
   const uint32_t max_retries = ReleaseLeaseMaxRetries();
+  const auto timeout = ReleaseLeaseRpcTimeout();
   for (uint32_t attempt = 0; attempt < max_retries; ++attempt) {
     ::umbp::ReleaseSsdLeaseRequest rel_req;
     rel_req.set_lease_id(lease_id);
     ::umbp::ReleaseSsdLeaseResponse rel_resp;
     grpc::ClientContext rel_ctx;
+    rel_ctx.set_deadline(std::chrono::system_clock::now() + timeout);
     if (stub->ReleaseSsdLease(&rel_ctx, rel_req, &rel_resp).ok()) break;
   }
 }
@@ -1882,15 +1967,15 @@ void PoolClient::ProcessRemoteSsdBatchGet(const std::vector<BatchGetItem>& items
         case SsdGetOutcome::kError:  // hard failure (already logged)
           done = true;
           break;
-        case SsdGetOutcome::kRetry:  // transient NO_SLOT / LEASE_EXPIRED, not a miss
-          std::this_thread::sleep_for(SsdGetRetryBackoff());
+        case SsdGetOutcome::kRetry:  // transient NO_SLOT / reader-local lease expiry; not a miss
+          if (attempt + 1 < max_attempts) std::this_thread::sleep_for(SsdGetRetryBackoff());
           break;
       }
     }
     if (!done) {
       MORI_UMBP_WARN(
-          "[PoolClient] Remote SSD get key='{}' still transient-failing after {} attempts "
-          "(NO_SLOT/LEASE_EXPIRED); reporting as not-served this round (not a definitive miss)",
+          "[PoolClient] Remote SSD get key='{}' still transient-failing (NO_SLOT/lease-expired) "
+          "after {} attempts; reporting as not-served this round (not a definitive miss)",
           *item.key, max_attempts);
     }
   }

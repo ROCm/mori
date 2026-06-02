@@ -159,3 +159,16 @@ target_link_libraries(
 target_compile_features(test_peer_ssd_read_rpc PRIVATE cxx_std_17)
 
 gtest_discover_tests(test_peer_ssd_read_rpc)
+
+# ---------------------------------------------------------------------------
+# test_ssd_read_lease_gating — pure reader-side lease gating decision logic
+# (ssd_read_lease.h).  Header-only under test (no gRPC / RDMA deps).
+# ---------------------------------------------------------------------------
+add_executable(test_ssd_read_lease_gating test_ssd_read_lease_gating.cpp)
+
+target_link_libraries(test_ssd_read_lease_gating PRIVATE umbp_common
+                                                         GTest::gtest_main)
+
+target_compile_features(test_ssd_read_lease_gating PRIVATE cxx_std_17)
+
+gtest_discover_tests(test_ssd_read_lease_gating)

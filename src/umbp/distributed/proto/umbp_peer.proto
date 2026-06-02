@@ -50,16 +50,17 @@ message GetPeerInfoResponse {
 //  SSD read staging (key-based; see UMBPPeer service comment + contract §5)
 // ============================================================
 
-// Per-key SSD read outcome.  Callers MUST distinguish retryable transient
-// failures (NO_SLOT / LEASE_EXPIRED) from a definitive miss (NOT_FOUND): a
-// transient failure must never be surfaced to hicache as a cache miss.
+// Per-key SSD read outcome.  Callers MUST distinguish a transient failure
+// (NO_SLOT) from a definitive miss (NOT_FOUND): a transient failure must never
+// be surfaced to hicache as a cache miss.  Lease expiry is NOT a wire status:
+// the reader decides it locally against lease_ttl_ms and the peer reclaims the
+// slot by TTL (see PrepareSsdReadResponse + contract §5).
 enum SsdReadStatus {
   SSD_READ_OK             = 0;
   SSD_READ_NOT_FOUND      = 1;   // key not on this peer's SSD tier → caller treats as miss
-  SSD_READ_NO_SLOT        = 2;   // staging slots exhausted → retryable
+  SSD_READ_NO_SLOT        = 2;   // staging slots exhausted → transient/retryable, not a miss
   SSD_READ_SIZE_TOO_LARGE = 3;   // actual size > reader cap / staging slot size
-  SSD_READ_LEASE_EXPIRED  = 4;   // lease elapsed before use → retryable
-  SSD_READ_ERROR          = 5;   // backend read error (e.g. concurrent evict / corruption)
+  SSD_READ_ERROR          = 4;   // backend read error (e.g. concurrent evict / corruption)
 }
 
 message PrepareSsdReadRequest {

@@ -77,6 +77,10 @@ that has loaded `libmori_pybinds.so`).
 | `UMBP_GRPC_SHUTDOWN_DEADLINE_SEC` | `3` | sec | `server_->Shutdown(deadline)` budget, shared by master and peer service. |
 | `UMBP_METRICS_REPORT_INTERVAL_MS` | `1000` | ms | Cadence at which the pool client's `MasterClient` flushes buffered counters/gauges/histograms via `ReportMetrics`. |
 | `UMBP_RELEASE_LEASE_MAX_RETRIES` | `2` | count | `ReleaseSsdLease` RPC attempt cap on the SSD read path. `min_allowed=1`. |
+| `UMBP_SSD_GET_MAX_ATTEMPTS` | `1` | count | Total remote SSD get attempts per key. `1` = no retry. Only NO_SLOT and a reader-local lease expiry retry; rpc failure / NOT_FOUND do not. Raise to absorb staging-slot contention. `min_allowed=1`. |
+| `UMBP_SSD_GET_RETRY_BACKOFF_MS` | `2` | ms | Sleep between remote SSD get retries (only applied when another attempt follows). `min_allowed=1`. |
+| `UMBP_RELEASE_LEASE_TIMEOUT_MS` | `1000` | ms | Per-attempt gRPC deadline for the best-effort `ReleaseSsdLease` RPC so a slow peer can't stall the reader. `min_allowed=1`. |
+| `UMBP_SSD_PREPARE_TIMEOUT_MS` | `0` | ms | Per-call gRPC deadline for `PrepareSsdRead` so a hung/slow peer can't stall the serial batch. `0` = fall back to `ssd_lease_timeout_s` (cluster-homogeneous). A timed-out / failed prepare is a hard not-served outcome (NOT retried, and never a miss). `min_allowed=0`. |
 
 ## SPDK proxy
 

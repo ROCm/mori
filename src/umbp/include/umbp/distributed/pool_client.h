@@ -223,10 +223,12 @@ class PoolClient {
 
   bool EnsurePeerServiceConnection(PeerConnection& peer);
 
-  // Outcome of one remote SSD get attempt.  kRetry (NO_SLOT / LEASE_EXPIRED) is
-  // a transient peer-side condition the caller retries; kMiss (NOT_FOUND) is a
-  // definitive miss; kError is a hard failure.  Keeping these distinct is what
-  // lets BatchGet avoid surfacing transient slot contention as a cache miss.
+  // Outcome of one remote SSD get attempt.  kRetry is a retryable transient
+  // condition (NO_SLOT or a reader-local lease expiry); kMiss (NOT_FOUND) is a
+  // definitive miss; kError is the not-served, not-retried catch-all (rpc
+  // failure incl. DEADLINE_EXCEEDED, size mismatch, RDMA failure) — not strictly
+  // a hard error.  Keeping kMiss distinct lets BatchGet avoid surfacing a
+  // non-served key as a cache miss.
   enum class SsdGetOutcome { kSuccess, kMiss, kRetry, kError };
 
   // Remote SSD get path (reader != owner): key-based PrepareSsdRead -> RDMA out
@@ -310,8 +312,9 @@ class PoolClient {
   void ProcessRemoteBatchPut(const std::vector<BatchPutItem>& items,
                              std::vector<PutEntryOutcome>* results);
   void ProcessRemoteBatchGet(const std::vector<BatchGetItem>& items, std::vector<bool>* results);
-  // Remote SSD reads (one staging slot + lease per key) with bounded retry on
-  // transient NO_SLOT / LEASE_EXPIRED; a NOT_FOUND short-circuits as a miss.
+  // Remote SSD reads (one staging slot + lease per key) with bounded retry
+  // (default off) on transient NO_SLOT / reader-local lease expiry; an rpc
+  // failure is hard not-served, and a NOT_FOUND short-circuits as a miss.
   void ProcessRemoteSsdBatchGet(const std::vector<BatchGetItem>& items, std::vector<bool>* results);
   void ExecuteRemoteBatchPut(const std::vector<BatchPutItem>& items,
                              std::vector<PutEntryOutcome>* results, PeerConnection& peer,
