@@ -245,7 +245,7 @@ class EpDispatchCombineHandle {
   int Fp8BlockwiseCombineScaleTypeSize() const { return fp8BlockwiseCombineScaleTypeSize; }
 
   mori::application::SymmMemObjPtr GetShmemDispatchOutTokMemObj() const {
-    if (config.kernelType == KernelType::IntraNode)
+    if (config.kernelType == KernelType::IntraNode || config.kernelType == KernelType::IntraNodeLL)
       return std::get<ShmemBufsIntraNode>(shmemTokBufs).dispatchOut;
     if (config.kernelType == KernelType::InterNodeV1 ||
         config.kernelType == KernelType::InterNodeV1LL)
@@ -253,7 +253,7 @@ class EpDispatchCombineHandle {
     return std::get<ShmemBufsInterNode>(shmemTokBufs).dispatchOut;
   }
   mori::application::SymmMemObjPtr GetShmemCombineOutTokMemObj() const {
-    if (config.kernelType == KernelType::IntraNode)
+    if (config.kernelType == KernelType::IntraNode || config.kernelType == KernelType::IntraNodeLL)
       return std::get<ShmemBufsIntraNode>(shmemTokBufs).combineOut;
     if (config.kernelType == KernelType::InterNodeV1 ||
         config.kernelType == KernelType::InterNodeV1LL)
@@ -261,7 +261,7 @@ class EpDispatchCombineHandle {
     return std::get<ShmemBufsInterNode>(shmemTokBufs).combineOut;
   }
   mori::application::SymmMemObjPtr GetShmemCombineInpTokMemObj() const {
-    if (config.kernelType == KernelType::IntraNode)
+    if (config.kernelType == KernelType::IntraNode || config.kernelType == KernelType::IntraNodeLL)
       return std::get<ShmemBufsIntraNode>(shmemTokBufs).combineInp;
     if (config.kernelType == KernelType::InterNodeV1 ||
         config.kernelType == KernelType::InterNodeV1LL)

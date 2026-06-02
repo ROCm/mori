@@ -2,7 +2,7 @@
   "version": "1.0",
   "gpu_arch": "gfx950",
   "gpu_model": "mi355x",
-  "kernel_type": "IntraNode",
+  "kernel_type": "IntraNodeLL",
   "ep_size": 8,
   "phase": "dispatch",
   "rules": [
