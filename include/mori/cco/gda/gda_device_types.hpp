@@ -1,59 +1,34 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
-//
-// MIT License
-//
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
-//
-// The above copyright notice and this permission notice shall be included in all
-// copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-// SOFTWARE.
-// Copyright © Advanced Micro Devices, Inc. All rights reserved.
 // MIT License — see LICENSE for details.
+//
+// Low-level GDA type aliases/enums shared by both the primitive layer
+// (gda_device_primitive.hpp) and the high-level layer (gda_device_common.hpp).
+// Kept in a standalone header so the primitive layer can depend on these
+// types without creating a circular include with the common layer.
 #pragma once
 
-#include "mori/cco/cco_types.hpp"
+#include <stdint.h>
 
 namespace mori {
 namespace cco {
 namespace gda {
 
-// ============================================================================
-// Cooperative Coop Types (AMD wavefront = 64 threads)
-// ============================================================================
+typedef void* ccoWindow_t;
+typedef void* ccoGdaRequest_t;
 
-struct ccoCoopThread {
-  __device__ int thread_rank() const { return 0; }
-  __device__ int size() const { return 1; }
-  __device__ void sync() {}
+typedef uint32_t ccoGdaSignal_t;
+typedef uint32_t ccoGdaCounter_t;
+
+enum ccoGdaOptFlags {
+  ccoGdaOptFlagsDefault = 0,
+  ccoGdaOptFlagsMaySkipCreditCheck = (1 << 0),
+  ccoGdaOptFlagsAggregateRequests = (1 << 1),
 };
 
-struct ccoCoopWarp {
-  __device__ int thread_rank() const { return threadIdx.x % 64; }
-  __device__ int size() const { return 64; }
-  __device__ void sync() { __syncwarp(); }
-};
-
-struct ccoCoopBlock {
-  __device__ int thread_rank() const { return threadIdx.x; }
-  __device__ int size() const { return blockDim.x; }
-  __device__ void sync() { __syncthreads(); }
-};
-
-// ============================================================================
-// Action Types
-// ============================================================================
+typedef enum ccoGdaSignalOp_t {
+  ccoGdaSignalInc = 0,
+  ccoGdaSignalAdd,
+} ccoGdaSignalOp_t;
 
 struct ccoGda_NoSignal {};
 struct ccoGda_NoCounter {};
@@ -81,27 +56,10 @@ struct ccoGdaCtx {
   int contextId;
 };
 
-typedef void* ccoWindow_t;
-typedef void* ccoGdaRequest_t;
-
-typedef uint32_t ccoGdaSignal_t;
-typedef uint32_t ccoGdaCounter_t;
-
-enum ccoGdaOptFlags {
-  ccoGdaOptFlagsDefault = 0,
-  ccoGdaOptFlagsMaySkipCreditCheck = (1 << 0),
-  ccoGdaOptFlagsAggregateRequests = (1 << 1),
-};
-
-typedef enum ccoGdaSignalOp_t {
-  ccoGdaSignalInc = 0,
-  ccoGdaSignalAdd,
-} ccoGdaSignalOp_t;
-
+template <core::ProviderType PrvdType>
 struct ccoGda {
   ccoDevComm const& comm;
   uint32_t contextId;
-  ccoGdaCtx ctx;
   void* _gdaHandle;
 
   // Constructor
@@ -149,6 +107,11 @@ struct ccoGda {
 
   __device__ inline void wait(ccoGdaRequest_t& request);
 };
+
+// Type aliases for convenience
+using ccoGdaMLX5 = ccoGda<core::ProviderType::MLX5>;
+using ccoGdaPSD = ccoGda<core::ProviderType::PSD>;
+using ccoGdaBNXT = ccoGda<core::ProviderType::BNXT>;
 
 }  // namespace gda
 }  // namespace cco
