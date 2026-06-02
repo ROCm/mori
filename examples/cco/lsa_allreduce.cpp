@@ -80,9 +80,9 @@ __global__ void lsa_allreduce_block_kernel(ccoDevComm* devComm,
                                            ccoWindow_t sendWin, size_t sendOff,
                                            ccoWindow_t recvWin, size_t recvOff,
                                            size_t count) {
-  ccoCoopBlock g;
-  ccoLsaBarrierSession<ccoCoopBlock> bar(g, devComm, ccoTeamLsa(*devComm), devComm->lsaBarrier, 0);
-  bar.sync(g);
+  ccoCoopBlock coop;
+  ccoLsaBarrierSession<ccoCoopBlock> bar(coop, devComm, devComm->lsaBarrier, 0);
+  bar.sync(coop);
 
   const int lsaSize = devComm->lsaSize;
 
@@ -96,7 +96,7 @@ __global__ void lsa_allreduce_block_kernel(ccoDevComm* devComm,
     }
   }
 
-  bar.sync(g);
+  bar.sync(coop);
 }
 
 // ─── WARP variant ──────────────────────────────────────────────────────────
@@ -106,9 +106,9 @@ __global__ void lsa_allreduce_warp_kernel(ccoDevComm* devComm,
                                           ccoWindow_t sendWin, size_t sendOff,
                                           ccoWindow_t recvWin, size_t recvOff,
                                           size_t count) {
-  ccoCoopWarp g;
-  ccoLsaBarrierSession<ccoCoopWarp> bar(g, devComm, ccoTeamLsa(*devComm), devComm->lsaBarrier, 0);
-  bar.sync(g);
+  ccoCoopWarp coop;
+  ccoLsaBarrierSession<ccoCoopWarp> bar(coop, devComm, devComm->lsaBarrier, 0);
+  bar.sync(coop);
 
   const int lsaSize = devComm->lsaSize;
   const int lane    = __lane_id();
@@ -124,7 +124,7 @@ __global__ void lsa_allreduce_warp_kernel(ccoDevComm* devComm,
     }
   }
 
-  bar.sync(g);
+  bar.sync(coop);
 }
 
 // ─── THREAD variant ────────────────────────────────────────────────────────
@@ -134,9 +134,9 @@ __global__ void lsa_allreduce_thread_kernel(ccoDevComm* devComm,
                                             ccoWindow_t sendWin, size_t sendOff,
                                             ccoWindow_t recvWin, size_t recvOff,
                                             size_t count) {
-  ccoCoopThread g;
-  ccoLsaBarrierSession<ccoCoopThread> bar(g, devComm, ccoTeamLsa(*devComm), devComm->lsaBarrier, 0);
-  bar.sync(g);
+  ccoCoopThread coop;
+  ccoLsaBarrierSession<ccoCoopThread> bar(coop, devComm, devComm->lsaBarrier, 0);
+  bar.sync(coop);
 
   const int lsaSize = devComm->lsaSize;
   for (size_t i = 0; i < count; i++) {
@@ -149,7 +149,7 @@ __global__ void lsa_allreduce_thread_kernel(ccoDevComm* devComm,
     }
   }
 
-  bar.sync(g);
+  bar.sync(coop);
 }
 
 // ===========================================================================
@@ -185,23 +185,32 @@ int main(int argc, char* argv[]) {
   std::vector<float> sendHost(NELEMS, static_cast<float>(rank));
   assert(hipMemcpy(sendBuf, sendHost.data(), sizeBytes, hipMemcpyHostToDevice) == hipSuccess);
 
-  // Print input.
-  {
-    char buf[256]; int n = 0;
-    n += snprintf(buf + n, sizeof(buf) - n, "  Rank %d INPUT  (", rank);
-    for (size_t i = 0; i < NELEMS; i++)
-      n += snprintf(buf + n, sizeof(buf) - n, "%s%.0f", i ? "," : "", sendHost[i]);
-    n += snprintf(buf + n, sizeof(buf) - n, ")\n");
-    fputs(buf, stdout); fflush(stdout);
+  // Print input (rank by rank in order).
+  for (int r = 0; r < nranks; r++) {
+    ccoBarrierAll(comm);
+    if (rank == r) {
+      char buf[256]; int n = 0;
+      n += snprintf(buf + n, sizeof(buf) - n, "  Rank %d INPUT  (", rank);
+      for (size_t i = 0; i < NELEMS; i++)
+        n += snprintf(buf + n, sizeof(buf) - n, "%s%.0f", i ? "," : "", sendHost[i]);
+      n += snprintf(buf + n, sizeof(buf) - n, ")\n");
+      fputs(buf, stdout); fflush(stdout);
+    }
   }
 
+  ccoBarrierAll(comm);
   const float expected = static_cast<float>(nranks * (nranks - 1)) / 2.f;
   if (rank == 0) {
     printf("AllReduce-SUM over %d ranks of %zu-elem vectors  ⇒  expected = (%.0f",
            nranks, (size_t)NELEMS, expected);
     for (size_t i = 1; i < NELEMS; i++) printf(",%.0f", expected);
     printf(")\n");
+    fflush(stdout);
   }
+
+  ccoBarrierAll(comm);
+
+
 
   // ── Phase 3: device communicator (1 barrier slot is enough for all 3) ──
   ccoDevCommRequirements reqs = CCO_DEV_COMM_REQUIREMENTS_INITIALIZER;
