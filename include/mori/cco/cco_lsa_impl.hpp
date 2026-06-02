@@ -28,10 +28,12 @@ namespace mori {
 namespace cco {
 
 template <typename Coop>
-__device__ inline ccoLsaBarrierSession<Coop>::ccoLsaBarrierSession(Coop grp, ccoDevComm_t comm,
+__device__ inline ccoLsaBarrierSession<Coop>::ccoLsaBarrierSession(Coop coop, ccoDevComm_t comm,
                                                                     ccoLsaBarrierHandle h,
                                                                     uint32_t idx)
-    : group(grp), comm(comm), handle(h), index(idx) {
+    : coop(coop), comm(comm), handle(h), index(idx) {
+
+  assert(idx < h.nBarriers);
 
   // Restore epoch persisted by the previous session's destructor.
   // Inbox slots are never zeroed, so epoch must be monotonically increasing
@@ -43,7 +45,7 @@ __device__ inline ccoLsaBarrierSession<Coop>::ccoLsaBarrierSession(Coop grp, cco
   const auto& rw = comm->resourceWindow_inlined;
   char* base = rw.winBase + ((uint64_t)comm->lsaRank * rw.stride4G << 32);
   uint32_t* state = reinterpret_cast<uint32_t*>(base + h.bufOffset);
-  this->epoch = state[h.nBarriers + idx];  // unicast epoch slot
+  this->epoch = state[idx];  // unicast epoch slot
 }
 
 template <typename Coop>
@@ -52,20 +54,20 @@ __device__ inline ccoLsaBarrierSession<Coop>::~ccoLsaBarrierSession() {
   const auto& rw = this->comm->resourceWindow_inlined;
   char* base = rw.winBase + ((uint64_t)this->comm->lsaRank * rw.stride4G << 32);
   uint32_t* state = reinterpret_cast<uint32_t*>(base + this->handle.bufOffset);
-  if (this->group.thread_rank() == 0) {
-    state[this->handle.nBarriers + this->index] = this->epoch;  // unicast epoch slot
+  if (this->coop.thread_rank() == 0) {
+    state[this->index] = this->epoch;  // unicast epoch slot
   }
-  this->group.sync();
+  this->coop.sync();
 }
 
 template <typename Coop>
 __device__ inline void ccoLsaBarrierSession<Coop>::arrive(Coop) {
-  this->group.sync();
+  this->coop.sync();
 
   const int nranks = this->comm->lsaSize;
   const int myRank = this->comm->lsaRank;
 
-  for (int i = this->group.thread_rank(); i < nranks - 1; i += this->group.size()) {
+  for (int i = this->coop.thread_rank(); i < nranks - 1; i += this->coop.size()) {
     int peer = i + ((i >= myRank) ? 1 : 0);
     // Write epoch+1 into peer's inbox slot reserved for us， cross-gpu write
     __hip_atomic_store(this->ucInbox(peer, myRank), this->epoch + 1, __ATOMIC_RELAXED,
@@ -85,7 +87,7 @@ __device__ inline int ccoLsaBarrierSession<Coop>::waitInternal(Coop, uint64_t ti
     startCycle = (uint64_t)clock64();
   }
 
-  for (int i = this->group.thread_rank(); i < nranks - 1; i += this->group.size()) {
+  for (int i = this->coop.thread_rank(); i < nranks - 1; i += this->coop.size()) {
     int peer = i + ((i >= myRank) ? 1 : 0);
     uint32_t* slot = this->ucInbox(myRank, peer);
 
@@ -105,30 +107,30 @@ __device__ inline int ccoLsaBarrierSession<Coop>::waitInternal(Coop, uint64_t ti
   this->epoch += 1;
 
 done:
-  this->group.sync();
+  this->coop.sync();
   return ret;
 }
 
 template <typename Coop>
-__device__ inline void ccoLsaBarrierSession<Coop>::wait(Coop g) {
-  this->template waitInternal</* DisableTimeout */ false>(g, 0ULL);
+__device__ inline void ccoLsaBarrierSession<Coop>::wait(Coop coop) {
+  this->template waitInternal</* DisableTimeout */ false>(coop, 0ULL);
 }
 
 template <typename Coop>
-__device__ inline int ccoLsaBarrierSession<Coop>::wait(Coop g, uint64_t timeoutCycles) {
-  return this->template waitInternal</* EnableTimeout */ true>(g, timeoutCycles);
+__device__ inline int ccoLsaBarrierSession<Coop>::wait(Coop coop, uint64_t timeoutCycles) {
+  return this->template waitInternal</* EnableTimeout */ true>(coop, timeoutCycles);
 }
 
 template <typename Coop>
-__device__ inline void ccoLsaBarrierSession<Coop>::sync(Coop g) {
-  this->arrive(g);
-  this->wait(g);
+__device__ inline void ccoLsaBarrierSession<Coop>::sync(Coop coop) {
+  this->arrive(coop);
+  this->wait(coop);
 }
 
 template <typename Coop>
-__device__ inline int ccoLsaBarrierSession<Coop>::sync(Coop g, uint64_t timeoutCycles) {
-  this->arrive(g);
-  return this->wait(g, timeoutCycles);
+__device__ inline int ccoLsaBarrierSession<Coop>::sync(Coop coop, uint64_t timeoutCycles) {
+  this->arrive(coop);
+  return this->wait(coop, timeoutCycles);
 }
 
 }  // namespace cco

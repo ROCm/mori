@@ -946,8 +946,8 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
 
   auto alignTo = [](size_t v, size_t a) { return (v + a - 1) & ~(a - 1); };
   auto lsaBarBytes = [&](int n) -> size_t {
-    // NCCL convention: state[3*N] + inbox[N*team.nRanks]
-    return static_cast<size_t>(3 * n + n * comm->lsaSize) * sizeof(uint32_t);
+    // Multimem epoch/inbox omitted; add when hardware support lands.
+    return static_cast<size_t>(n + n * comm->lsaSize) * sizeof(uint32_t);
   };
 
   struct ResourceWindowLayout {
