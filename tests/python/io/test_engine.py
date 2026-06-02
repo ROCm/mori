@@ -159,6 +159,30 @@ def test_engine_desc_node_id_env_override(monkeypatch):
     assert desc.node_id == "node-id-test"
 
 
+def test_rdma_backend_config_chunking_fields():
+    config = RdmaBackendConfig(
+        qp_per_transfer=4,
+        post_batch_size=-1,
+        num_worker_threads=2,
+        enable_notification=True,
+        notif_per_qp=2048,
+        enable_transfer_chunking=True,
+        chunk_bytes=65536,
+        max_chunks_per_transfer=32,
+        num_nics_per_transfer=2,
+    )
+
+    assert config.qp_per_transfer == 4
+    assert config.post_batch_size == -1
+    assert config.num_worker_threads == 2
+    assert config.enable_notification is True
+    assert config.notif_per_qp == 2048
+    assert config.enable_transfer_chunking is True
+    assert config.chunk_bytes == 65536
+    assert config.max_chunks_per_transfer == 32
+    assert config.num_nics_per_transfer == 2
+
+
 @pytest.mark.skipif(torch.cuda.device_count() < 1, reason="requires GPU")
 def test_rdmabackend_auto_creates_xgmi_backend_for_gpu_mem(monkeypatch):
     monkeypatch.setenv("MORI_DISABLE_AUTO_XGMI", "0")
@@ -236,6 +260,7 @@ def test_mem_desc():
     assert mem_desc.data == tensor.data_ptr()
     assert mem_desc.size == tensor.nelement() * tensor.element_size()
     assert mem_desc.loc == MemoryLocationType.CPU
+    assert mem_desc.numa_node >= -1
 
     # Test gpu tensor
     device = torch.device("cuda", 0)
@@ -248,6 +273,7 @@ def test_mem_desc():
     assert mem_desc.data == tensor.data_ptr()
     assert mem_desc.size == tensor.nelement() * tensor.element_size()
     assert mem_desc.loc == MemoryLocationType.GPU
+    assert mem_desc.numa_node == -1
 
     # TODO: test mem_desc pack / unpack
     packed_desc = mem_desc.pack()

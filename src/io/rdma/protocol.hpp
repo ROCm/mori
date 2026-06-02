@@ -47,7 +47,8 @@ struct MessageRegEndpoint {
   TopoKeyPair topo;
   int devId;
   application::RdmaEndpointHandle eph;
-  MSGPACK_DEFINE(ekey, topo, devId, eph);
+  int nicRank{0};
+  MSGPACK_DEFINE(ekey, topo, devId, eph, nicRank);
 };
 
 struct MessageAskMemoryRegion {

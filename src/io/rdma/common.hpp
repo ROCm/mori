@@ -27,6 +27,8 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include "mori/io/common.hpp"
 #include "mori/io/enum.hpp"
@@ -42,12 +44,13 @@ namespace io {
 struct TopoKey {
   int deviceId;
   MemoryLocationType loc;
+  int numaNode{-1};
 
   bool operator==(const TopoKey& rhs) const noexcept {
-    return (deviceId == rhs.deviceId) && (loc == rhs.loc);
+    return (deviceId == rhs.deviceId) && (loc == rhs.loc) && (numaNode == rhs.numaNode);
   }
 
-  MSGPACK_DEFINE(deviceId, loc);
+  MSGPACK_DEFINE(deviceId, loc, numaNode);
 };
 
 struct TopoKeyPair {
@@ -79,7 +82,9 @@ struct hash<mori::io::TopoKey> {
   std::size_t operator()(const mori::io::TopoKey& k) const noexcept {
     std::size_t h1 = std::hash<uint32_t>{}(k.deviceId);
     std::size_t h2 = std::hash<uint32_t>{}(static_cast<uint32_t>(k.loc));
-    return h1 ^ (h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));
+    std::size_t h3 = std::hash<int>{}(k.numaNode);
+    std::size_t seed = h1 ^ (h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));
+    return seed ^ (h3 + 0x9e3779b9 + (seed << 6) + (seed >> 2));
   }
 };
 
@@ -125,6 +130,9 @@ inline TransferUniqueId ExtractTransferIdFromWrId(uint64_t wr_id) {
 }
 
 uint64_t MakeNotifSendWrId(TransferUniqueId id);
+
+std::vector<std::pair<uint64_t, uint32_t>> PlanChunks(uint32_t total, size_t chunkBytes,
+                                                      int maxChunks);
 
 struct CqCallbackMeta {
   CqCallbackMeta(TransferStatus* s, TransferUniqueId id_, int n)
@@ -225,6 +233,15 @@ struct RdmaOpRet {
 };
 
 RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* status, TransferUniqueId id);
+
+RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
+                             const std::vector<application::RdmaMemoryRegion>& localMrPerEp,
+                             const std::vector<application::RdmaMemoryRegion>& remoteMrPerEp,
+                             const SizeVec& localOffsets, const SizeVec& remoteOffsets,
+                             const SizeVec& sizes, std::shared_ptr<CqCallbackMeta> callbackMeta,
+                             TransferUniqueId id, bool isRead, int postBatchSize = -1,
+                             size_t chunkBytes = 0, int maxChunks = 1,
+                             bool creditByWrCount = false);
 
 RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps, const application::RdmaMemoryRegion& local,
                              const SizeVec& localOffsets,

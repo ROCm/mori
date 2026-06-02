@@ -21,6 +21,8 @@
 // SOFTWARE.
 #pragma once
 
+#include <cstddef>
+
 #include "mori/io/common.hpp"
 #include "mori/io/enum.hpp"
 
@@ -45,14 +47,20 @@ struct BackendConfig {
 struct RdmaBackendConfig : public BackendConfig {
   RdmaBackendConfig() : BackendConfig(BackendType::RDMA) {}
   RdmaBackendConfig(int qpPerTransfer_, int postBatchSize_, int numWorkerThreads_,
-                    PollCqMode pollCqMode_, bool enableNotification_, uint32_t notifPerQp_ = 1024)
+                    PollCqMode pollCqMode_, bool enableNotification_, uint32_t notifPerQp_ = 1024,
+                    bool enableTransferChunking_ = false, size_t chunkBytes_ = 131072,
+                    int maxChunksPerTransfer_ = 64, int numNicsPerTransfer_ = 1)
       : BackendConfig(BackendType::RDMA),
         qpPerTransfer(qpPerTransfer_),
         postBatchSize(postBatchSize_),
         numWorkerThreads(numWorkerThreads_),
         pollCqMode(pollCqMode_),
         enableNotification(enableNotification_),
-        notifPerQp(notifPerQp_) {}
+        notifPerQp(notifPerQp_),
+        enableTransferChunking(enableTransferChunking_),
+        chunkBytes(chunkBytes_),
+        maxChunksPerTransfer(maxChunksPerTransfer_),
+        numNicsPerTransfer(numNicsPerTransfer_) {}
 
   int qpPerTransfer{1};
   int postBatchSize{-1};
@@ -60,6 +68,10 @@ struct RdmaBackendConfig : public BackendConfig {
   PollCqMode pollCqMode{PollCqMode::POLLING};
   bool enableNotification{true};  // Enable/disable notification mechanism for transfer completion
   uint32_t notifPerQp{1024};      // Pre-posted RECV WRs per QP; defines the Zone A boundary
+  bool enableTransferChunking{false};
+  size_t chunkBytes{131072};
+  int maxChunksPerTransfer{64};
+  int numNicsPerTransfer{1};
 
   int maxSendWr{0};
   int maxCqeNum{0};
@@ -69,8 +81,11 @@ struct RdmaBackendConfig : public BackendConfig {
 inline std::ostream& operator<<(std::ostream& os, const RdmaBackendConfig& c) {
   return os << "qpPerTransfer[" << c.qpPerTransfer << "] postBatchSize[" << c.postBatchSize
             << "] numWorkerThreads[" << c.numWorkerThreads << "] enableNotification["
-            << c.enableNotification << "] notifPerQp[" << c.notifPerQp << "] maxSendWr["
-            << c.maxSendWr << "] maxCqeNum[" << c.maxCqeNum << "] maxMsgSge[" << c.maxMsgSge << "]";
+            << c.enableNotification << "] notifPerQp[" << c.notifPerQp
+            << "] enableTransferChunking[" << c.enableTransferChunking << "] chunkBytes["
+            << c.chunkBytes << "] maxChunksPerTransfer[" << c.maxChunksPerTransfer
+            << "] numNicsPerTransfer[" << c.numNicsPerTransfer << "] maxSendWr[" << c.maxSendWr
+            << "] maxCqeNum[" << c.maxCqeNum << "] maxMsgSge[" << c.maxMsgSge << "]";
 }
 
 struct XgmiBackendConfig : public BackendConfig {
