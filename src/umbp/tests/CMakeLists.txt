@@ -95,7 +95,7 @@ target_compile_features(test_router_dedup PRIVATE cxx_std_17)
 gtest_discover_tests(test_router_dedup)
 
 # ---------------------------------------------------------------------------
-# test_peer_ssd_manager — Phase 1 SSD tier ownership + owned-location source
+# test_peer_ssd_manager — SSD tier ownership + owned-location source
 # ---------------------------------------------------------------------------
 add_executable(test_peer_ssd_manager test_peer_ssd_manager.cpp)
 
@@ -107,7 +107,7 @@ target_compile_features(test_peer_ssd_manager PRIVATE cxx_std_17)
 gtest_discover_tests(test_peer_ssd_manager)
 
 # ---------------------------------------------------------------------------
-# test_peer_ssd_eviction — Phase 4 LRU + watermark eviction + in-flight guard
+# test_peer_ssd_eviction — LRU + watermark eviction + in-flight guard
 # ---------------------------------------------------------------------------
 add_executable(test_peer_ssd_eviction test_peer_ssd_eviction.cpp)
 
@@ -119,7 +119,7 @@ target_compile_features(test_peer_ssd_eviction PRIVATE cxx_std_17)
 gtest_discover_tests(test_peer_ssd_eviction)
 
 # ---------------------------------------------------------------------------
-# test_ssd_copy_pipeline — Phase 2 DramCopyPin + async copy-on-commit pipeline
+# test_ssd_copy_pipeline — DramCopyPin + async copy-on-commit pipeline
 # ---------------------------------------------------------------------------
 add_executable(test_ssd_copy_pipeline test_ssd_copy_pipeline.cpp)
 
@@ -131,7 +131,7 @@ target_compile_features(test_ssd_copy_pipeline PRIVATE cxx_std_17)
 gtest_discover_tests(test_ssd_copy_pipeline)
 
 # ---------------------------------------------------------------------------
-# test_tier_priority_route_get — Phase 3 RouteGet tier-priority strategy
+# test_tier_priority_route_get — RouteGet tier-priority strategy
 # ---------------------------------------------------------------------------
 add_executable(test_tier_priority_route_get test_tier_priority_route_get.cpp)
 
@@ -143,7 +143,7 @@ target_compile_features(test_tier_priority_route_get PRIVATE cxx_std_17)
 gtest_discover_tests(test_tier_priority_route_get)
 
 # ---------------------------------------------------------------------------
-# test_peer_ssd_read_rpc — Phase 3 SSD read RPC over a gRPC loopback (status
+# test_peer_ssd_read_rpc — SSD read RPC over a gRPC loopback (status
 # distinctions: OK / NOT_FOUND / NO_SLOT / SIZE_TOO_LARGE + slot lifecycle).
 # Needs the gRPC peer service + generated stubs (umbp_core) and protobuf/gRPC.
 # ---------------------------------------------------------------------------
@@ -174,9 +174,9 @@ target_compile_features(test_ssd_read_lease_gating PRIVATE cxx_std_17)
 gtest_discover_tests(test_ssd_read_lease_gating)
 
 # ---------------------------------------------------------------------------
-# test_ssd_reliability — cross-component reliability: owned-source
-# DRAM+SSD merge, SSD evict -> REMOVE -> master index convergence, tier-priority
-# over the real index, crash-restart discard, and observability counters.
+# test_ssd_reliability — cross-component reliability: owned-source DRAM+SSD
+# merge, SSD evict -> REMOVE -> master index convergence, tier-priority over the
+# real index, crash-restart discard, and observability counters.
 # ---------------------------------------------------------------------------
 add_executable(test_ssd_reliability test_ssd_reliability.cpp)
 

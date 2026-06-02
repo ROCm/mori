@@ -20,7 +20,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 //
-// Phase 4: SSD local capacity management + eviction.  Drives PeerSsdManager
+// SSD local capacity management + eviction.  Drives PeerSsdManager
 // through a controllable in-memory TierBackend (the test-only constructor) so
 // LRU ordering, watermark eviction, the in-flight-read guard, idempotent Write,
 // backend-evict failure, concurrent eviction, and physical Clear are all

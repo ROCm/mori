@@ -150,7 +150,7 @@ uint32_t ReleaseLeaseMaxRetries() {
   return v;
 }
 
-// Crash-restart SSD leftover policy (v1 = discard): wipe physical SSD bytes a
+// Crash-restart SSD leftover policy (discard): wipe physical SSD bytes a
 // previous crashed process left behind at startup.  Default on; set
 // UMBP_SSD_STARTUP_DISCARD=0/false to keep leftover (opt-out hook for a future
 // rebuild-from-backend policy — there is no rebuild path yet).
@@ -215,7 +215,7 @@ PeerDramAllocator::TierConfig BuildDramTierConfig(const std::vector<ExportableDr
     msgpack::pack(sbuf, mems[i]);
     cfg.buffer_descs.emplace_back(sbuf.data(), sbuf.data() + sbuf.size());
     // Local host base pointer, so PeerDramAllocator can resolve a committed
-    // key's pages to readable segments for the SSD copy worker (Phase 2).
+    // key's pages to readable segments for the SSD copy worker.
     cfg.buffer_bases.push_back(bufs[i].buffer);
   }
   return cfg;
@@ -310,12 +310,12 @@ bool PoolClient::Init() {
   master_client_->SetPeerDramAllocator(peer_alloc_.get());
 
   // Peer-side SSD tier owner.  Built only when SSD is enabled; registered as an
-  // owned-location event source + SSD capacity provider.  Phase 2 populates it
-  // via the copy-on-commit pipeline below; reads remain Phase 3.  Clear() now
-  // quiesces the pipeline and clears peer_ssd_ alongside peer_alloc_.
+  // owned-location event source + SSD capacity provider.  The copy-on-commit
+  // pipeline below populates it.  Clear() quiesces the pipeline and clears
+  // peer_ssd_ alongside peer_alloc_.
   if (config_.ssd.enabled) {
     peer_ssd_ = std::make_unique<PeerSsdManager>(config_.ssd);
-    // Crash-restart leftover (v1 = discard): wipe stale SSD bytes before the
+    // Crash-restart leftover (discard): wipe stale SSD bytes before the
     // pipeline starts so used capacity and the empty owned_ map start consistent
     // (env-gated; see SsdStartupDiscardEnabled / DiscardLeftoverOnStartup).
     if (SsdStartupDiscardEnabled()) peer_ssd_->DiscardLeftoverOnStartup();
@@ -334,8 +334,8 @@ bool PoolClient::Init() {
     engine_desc_bytes.assign(sbuf.data(), sbuf.data() + sbuf.size());
   }
 
-  // SSD staging buffer (one per process; not part of DRAM exports).  Phase 3
-  // serves remote SSD reads out of it; allocated up front when SSD is enabled.
+  // SSD staging buffer (one per process; not part of DRAM exports).  Remote SSD
+  // reads are served out of it; allocated up front when SSD is enabled.
   if (config_.ssd.enabled) {
     ssd_staging_buffer_ = std::make_unique<char[]>(config_.staging_buffer_size);
     std::memset(ssd_staging_buffer_.get(), 0, config_.staging_buffer_size);

@@ -85,8 +85,8 @@ struct UMBPSsdConfig {
   UMBPIoConfig io;
   UMBPDurabilityConfig durability;
 
-  // Local SSD-tier capacity watermarks for the distributed PeerSsdManager
-  // (Phase 4 local eviction).  When used/total crosses high_watermark the owner
+  // Local SSD-tier capacity watermarks for the distributed PeerSsdManager's
+  // local eviction.  When used/total crosses high_watermark the owner
   // peer evicts its oldest keys down to low_watermark.  Mirrors the DRAM tier's
   // env-tunable convention (UMBP_DRAM_HIGH_WM / LOW_WM); NOT the master-side
   // EvictionConfig (whose watermarks are intentionally not env-tunable).

@@ -116,7 +116,7 @@ TEST(GlobalBlockIndexEvents, RemoveUnknownIsNoop) {
 
 // A key mirrored on both DRAM and SSD of one node: a DRAM eviction
 // (REMOVE DRAM) must drop only the DRAM bucket and leave the SSD location
-// readable.  This is the additive-index invariant the Phase 4 SSD tier relies
+// readable.  This is the additive-index invariant the SSD tier relies
 // on (DRAM evict never touches the SSD copy); no master code is exercised here
 // beyond ApplyEvents.
 TEST(GlobalBlockIndexEvents, RemoveDramKeepsSsdBucket) {

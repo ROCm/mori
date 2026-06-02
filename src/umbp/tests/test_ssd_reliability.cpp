@@ -253,7 +253,7 @@ TEST(SsdReliability, TierPriorityRoutesDramThenSsdAfterDramRemoved) {
 }
 
 // ---------------------------------------------------------------------------
-//  Crash-restart leftover handling (v1 = discard).
+//  Crash-restart leftover handling (discard).
 // ---------------------------------------------------------------------------
 
 // After a crash owned_ is empty but the backend still holds bytes from the

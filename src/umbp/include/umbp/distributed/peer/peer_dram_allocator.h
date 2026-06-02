@@ -78,7 +78,7 @@ class PeerDramAllocator : public OwnedLocationSource {
   // `pending_ttl` is the only TTL in the system.  After this elapses
   // without a matching Commit / Abort, the reaper frees the slot's
   // pages.  `read_lease_ttl` is how long a single Resolve protects its
-  // key from concurrent Evict (Bug #7 resolution).  `reaper_interval`
+  // key from concurrent Evict.  `reaper_interval`
   // is the wakeup cadence for sweeping expired pendings and read
   // leases.
   PeerDramAllocator(uint64_t page_size, TierConfig dram, TierConfig hbm,
@@ -205,7 +205,7 @@ class PeerDramAllocator : public OwnedLocationSource {
   // For every key actually freed, a REMOVE event is queued.
   std::vector<EvictResult> Evict(const std::vector<std::string>& keys);
 
-  // -------- DRAM copy pin (SSD copy-on-commit, Phase 2) --------
+  // -------- DRAM copy pin (SSD copy-on-commit) --------
 
   // A copy pin protects a committed key's DRAM pages from eviction while
   // the SSD copy worker reads them.  It is an in-process lifetime guard

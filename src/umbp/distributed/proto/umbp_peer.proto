@@ -47,14 +47,14 @@ message GetPeerInfoResponse {
 }
 
 // ============================================================
-//  SSD read staging (key-based; see UMBPPeer service comment + contract §5)
+//  SSD read staging (key-based; see the UMBPPeer service comment above)
 // ============================================================
 
 // Per-key SSD read outcome.  Callers MUST distinguish a transient failure
 // (NO_SLOT) from a definitive miss (NOT_FOUND): a transient failure must never
 // be surfaced to hicache as a cache miss.  Lease expiry is NOT a wire status:
 // the reader decides it locally against lease_ttl_ms and the peer reclaims the
-// slot by TTL (see PrepareSsdReadResponse + contract §5).
+// slot by TTL (see PrepareSsdReadResponse).
 enum SsdReadStatus {
   SSD_READ_OK             = 0;
   SSD_READ_NOT_FOUND      = 1;   // key not on this peer's SSD tier → caller treats as miss
@@ -140,7 +140,7 @@ message AbortSlotResponse {
 
 // Resolve a key the writer has been routed to.  Returns the page set
 // the reader needs to RDMA from.  Peer bumps its in-flight read counter
-// for `key` to defer concurrent eviction (Bug #7 resolution).
+// for `key` to defer concurrent eviction.
 message ResolveKeyRequest {
   string key = 1;
 }

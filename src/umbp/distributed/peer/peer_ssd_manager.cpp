@@ -147,7 +147,7 @@ bool PeerSsdManager::Write(const std::string& key,
 
   // Assemble (possibly non-contiguous) DRAM source segments into one contiguous
   // buffer for the backend.  A single right-sized segment is written directly;
-  // otherwise we memcpy into scratch (v1 accepts the copy; writev can replace).
+  // otherwise we memcpy into scratch (a writev-style path could avoid the copy).
   const void* data = nullptr;
   std::vector<char> scratch;
   if (segments.size() == 1 && segments[0].second == total_size) {
@@ -388,8 +388,8 @@ SsdReadOutcome PeerSsdManager::PrepareRead(const std::string& key, void* staging
   }
 
   if (!read_ok) {
-    // owned_ had the key but the backend couldn't serve it (e.g. a Phase 4
-    // local evict raced us, or a corrupt record): kError, not a definitive miss.
+    // owned_ had the key but the backend couldn't serve it (e.g. a local evict
+    // raced us, or a corrupt record): kError, not a definitive miss.
     metrics_.read_error.fetch_add(1, std::memory_order_relaxed);
     MORI_UMBP_WARN("[PeerSsdManager] PrepareRead backend read failed key={} size={}", key, size);
     return SsdReadOutcome{SsdReadStatus::kError, size};

@@ -166,9 +166,8 @@ class PoolClient {
   std::unique_ptr<PeerDramAllocator> peer_alloc_;
   // Peer-side SSD tier owner.  Built only when config_.ssd.enabled; registered
   // with MasterClient as an owned-location source + SSD capacity provider.
-  // Phase 1: present and reporting, but nothing writes/reads it yet.
   std::unique_ptr<PeerSsdManager> peer_ssd_;
-  // Async copy-on-commit pipeline (Phase 2).  Built only when SSD is enabled;
+  // Async copy-on-commit pipeline.  Built only when SSD is enabled;
   // borrows peer_alloc_ (pin source) + peer_ssd_ (write target).  Started in
   // Init, stopped in Shutdown (after the peer service so no commit can enqueue
   // into a stopped pipeline).

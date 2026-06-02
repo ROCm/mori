@@ -124,7 +124,7 @@ class PeerSsdManager : public OwnedLocationSource {
   std::vector<KvEvent> DrainPendingEvents() override;
   std::vector<KvEvent> SnapshotOwnedKeys() const override;
 
-  // Crash-restart leftover (v1 = discard): after a crash owned_ is empty but
+  // Crash-restart leftover policy (discard): after a crash owned_ is empty but
   // physical SSD bytes may remain, diverging used capacity from owned_.  This
   // best-effort wipes them at startup for a clean, consistent tier (cache is
   // re-fetchable).  Call before the copy pipeline starts / before any IO (not

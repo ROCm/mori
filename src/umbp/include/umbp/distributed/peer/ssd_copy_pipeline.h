@@ -48,11 +48,11 @@ struct SsdCopyTask {
   size_t size = 0;                        // informational; pin reports true size
 };
 
-// Peer-local copy-on-commit pipeline (Phase 2).  After a key's DRAM pages are
+// Peer-local copy-on-commit pipeline.  After a key's DRAM pages are
 // committed on this owner peer, the commit path enqueues an SsdCopyTask; a
 // background worker copies the bytes to the local SSD tier best-effort.
 //
-// Key properties (see docs/ssd dev/umbp-ssd-tier-interface-contract-zh.md §4):
+// Key properties:
 //   - Enqueue never blocks commit: a full queue (or a stopped/quiescing
 //     pipeline) drops the task and counts it.
 //   - The worker holds a DramCopyPin across the backend Write so eviction

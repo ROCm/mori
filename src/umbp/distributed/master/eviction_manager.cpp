@@ -69,12 +69,10 @@ void EvictionManager::EvictionLoop() {
   }
 }
 
-// In the master-as-advisor design, master decides what to evict but the
-// peer executes — and master's view of the index only changes when the
-// peer ships REMOVE events on the next heartbeat.  This function picks
-// victims; phase D wires the actual EvictKey RPC dispatch via the
-// master-server-owned peer-stub pool.  Until then, this is a no-op
-// beyond logging the intent.
+// Master decides what to evict but the peer executes — master's view of the
+// index only changes when the peer ships REMOVE events on the next heartbeat.
+// This function picks victims and dispatches EvictKey to each peer via the
+// dispatcher; master state itself is left untouched here.
 void EvictionManager::RunOnce() {
   auto clients = registry_.GetAliveClients();
 
@@ -84,8 +82,8 @@ void EvictionManager::RunOnce() {
 
   for (const auto& client : clients) {
     for (const auto& [tier, cap] : client.tier_capacities) {
-      // v1 SSD eviction is purely peer-local (Phase 4).  Master must NOT turn
-      // an SSD overload into an EvictKey: EvictKey only acts on the peer's
+      // SSD eviction is purely peer-local.  Master must NOT turn an SSD
+      // overload into an EvictKey: EvictKey only acts on the peer's
       // PeerDramAllocator, so it would wrongly evict the DRAM copy of the same
       // key while leaving SSD untouched.
       if (tier == TierType::SSD) continue;
