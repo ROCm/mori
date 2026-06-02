@@ -28,14 +28,12 @@ namespace mori {
 namespace cco {
 
 // State buffer layout (unicast only, no multicast):
-//   [ 0, nBarries)                                   multimem epoch
-//   [ nBarries,    2 * nBarries)                     unicast epoch
-//   [2 * nBarries, 3 * nBarries)                     multimem inbox
-//   [3*nBarriers, 3*nBarriers + nBarriers*lsaSize)   ucInbox[index][peer]
+//   [ 0, nBarries)                                   unicast epoch
+//   [nBarriers, nBarriers + nBarriers*lsaSize)   ucInbox[index][peer]
 
 template <typename Coop>
 struct ccoLsaBarrierSession {
-  Coop group;
+  Coop coop;
   ccoDevComm_t comm;
   ccoLsaBarrierHandle handle;
   uint32_t epoch;
@@ -68,7 +66,7 @@ struct ccoLsaBarrierSession {
     const auto& rw = comm->resourceWindow_inlined;
     char* base = rw.winBase + ((uint64_t)owner * rw.stride4G << 32);
     uint32_t* state = reinterpret_cast<uint32_t*>(base + handle.bufOffset);
-    return state + 3 * handle.nBarriers + index * comm->lsaSize + peer;
+    return state + handle.nBarriers + index * comm->lsaSize + peer;
   }
 
   template <bool EnableTimeout>
