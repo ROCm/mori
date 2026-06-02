@@ -37,10 +37,13 @@ class PeerSsdManager;
 class MasterClient;
 class SsdCopyPipeline;
 
+// Prometheus-only observability counters for the SSD read-staging slots.  NOT
+// correctness state (the slot state machine in peer_service.cpp is the source
+// of truth) — relaxed atomics incremented at discrete events and read once per
+// metrics tick by PoolClient::PublishSsdMetrics.
 struct StagingMetrics {
-  std::atomic<uint64_t> expired_reclaims{0};
-  std::atomic<uint64_t> invalid_lease_rejects{0};
-  std::atomic<uint64_t> slot_full_rejects{0};
+  std::atomic<uint64_t> expired_reclaims{0};   // leased slot reclaimed past TTL
+  std::atomic<uint64_t> slot_full_rejects{0};  // PrepareSsdRead -> NO_SLOT
 };
 
 class PeerServiceServer {
@@ -73,6 +76,10 @@ class PeerServiceServer {
   void Stop();
 
   const StagingMetrics& Metrics() const { return metrics_; }
+
+  // SSD read staging slots currently in use (Preparing or Leased).  Sampled
+  // once per metrics flush by PoolClient's metrics provider for a gauge.
+  size_t SnapshotReadSlotsInUse() const;
 
   // Read-only access for the heartbeat shipper (lives in MasterClient
   // / PoolClient).  Never null after construction with a non-null

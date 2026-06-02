@@ -565,6 +565,19 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
   std::mutex read_slots_mutex_;
   std::vector<StagingSlot> read_slots_;
   std::atomic<uint64_t> next_lease_id_{1};
+
+ public:
+  // SSD read staging slots currently busy (Preparing or Leased).  Sampled once
+  // per metrics flush by PoolClient's provider; a brief lock + small scan
+  // (num_read_slots, default 16) — not a busy loop.
+  size_t ReadSlotsInUse() {
+    std::lock_guard<std::mutex> lock(read_slots_mutex_);
+    size_t in_use = 0;
+    for (const auto& slot : read_slots_) {
+      if (slot.state != SlotState::kFree) ++in_use;
+    }
+    return in_use;
+  }
 };
 
 PeerServiceServer::PeerServiceServer(PeerDramAllocator* dram_alloc, PeerSsdManager* peer_ssd,
@@ -588,6 +601,10 @@ PeerServiceServer::PeerServiceServer(PeerDramAllocator* dram_alloc, PeerSsdManag
 }
 
 PeerServiceServer::~PeerServiceServer() { Stop(); }
+
+size_t PeerServiceServer::SnapshotReadSlotsInUse() const {
+  return service_ ? service_->ReadSlotsInUse() : 0;
+}
 
 bool PeerServiceServer::Start(uint16_t port) {
   std::string address = "0.0.0.0:" + std::to_string(port);

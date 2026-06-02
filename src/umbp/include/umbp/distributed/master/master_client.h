@@ -28,6 +28,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -158,6 +159,17 @@ class MasterClient {
   void SetGauge(std::string name, std::string help, Labels labels, double value);
   void Observe(std::string name, std::string help, Labels labels, const std::vector<double>& bounds,
                double value);
+
+  // Register a callback run once per metrics flush tick in the existing metrics
+  // thread (no new thread) so a component can publish counters/gauges from its
+  // own atomics, keeping AddCounter off hot paths.  MUST be called before
+  // RegisterSelf() (the list is read lock-free afterwards; late calls are
+  // rejected).  Caller keeps the provider's data alive until StopMetricsReporting().
+  void AddMetricsProvider(std::function<void()> provider);
+
+  // Stop and join the metrics thread.  Idempotent.  PoolClient::Shutdown calls
+  // it before tearing down the components its provider reads.
+  void StopMetricsReporting();
 
   bool IsRegistered() const { return registered_; }
 
@@ -308,8 +320,14 @@ class MasterClient {
   std::condition_variable metrics_cv_;
 
   void StartMetricsReporting();
-  void StopMetricsReporting();
   void MetricsLoop();
+  // Run providers, swap the pending buffers, and ship one ReportMetrics.  Called
+  // every tick and once more after the loop exits (final shutdown flush).
+  void FlushMetricsOnce();
+
+  // Callbacks run at the top of every MetricsLoop tick (see AddMetricsProvider).
+  // Written only before StartMetricsReporting(); read-only afterwards.
+  std::vector<std::function<void()>> metrics_providers_;
 
   // --- ScopedRpcTimer integration ---
   // Called by ScopedRpcTimer at the end of every monitored MasterClient RPC.

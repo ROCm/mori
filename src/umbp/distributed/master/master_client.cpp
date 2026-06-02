@@ -716,6 +716,18 @@ void MasterClient::RecordRpcError(std::string_view method, std::string_view code
              MORI_UMBP_METRIC_MASTER_CLIENT_RPC_ERRORS_TOTAL_HELP, std::move(labels), 1.0);
 }
 
+void MasterClient::AddMetricsProvider(std::function<void()> provider) {
+  // Reject late registration: MetricsLoop reads metrics_providers_ lock-free, so
+  // adding after the thread starts would race the reader (see header).
+  if (metrics_running_.load(std::memory_order_relaxed)) {
+    MORI_UMBP_ERROR(
+        "[Client] AddMetricsProvider called after the metrics thread started; ignoring "
+        "(providers must be registered before RegisterSelf)");
+    return;
+  }
+  if (provider) metrics_providers_.push_back(std::move(provider));
+}
+
 void MasterClient::StartMetricsReporting() {
   if (!registered_) return;
   if (metrics_running_) return;
@@ -746,76 +758,92 @@ void MasterClient::MetricsLoop() {
                            [this] { return !metrics_running_.load(); });
     }
     if (!metrics_running_) break;
+    FlushMetricsOnce();
+  }
+  // Final flush: ship the last sub-interval of provider deltas before the
+  // thread exits.  PoolClient::Shutdown calls StopMetricsReporting() BEFORE
+  // UnregisterSelf, so the master is still reachable here; without this final
+  // flush the last (<metrics_interval_ms_) of SSD counter deltas would be
+  // dropped at shutdown.
+  FlushMetricsOnce();
+}
 
-    std::unordered_map<std::string, PendingSample> counters;
-    std::unordered_map<std::string, PendingSample> gauges;
-    std::unordered_map<std::string, HistogramAccumulator> histogram_aggregates;
-    {
-      std::lock_guard lock(metrics_mutex_);
-      counters.swap(pending_counters_);
-      gauges.swap(pending_gauges_);
-      histogram_aggregates.swap(pending_histogram_aggregates_);
-    }
-    auto dropped_delta = metrics_dropped_count_.exchange(0, std::memory_order_relaxed);
-    if (counters.empty() && gauges.empty() && histogram_aggregates.empty() && dropped_delta == 0)
-      continue;
+void MasterClient::FlushMetricsOnce() {
+  // Let registered providers publish their latest counters/gauges into the
+  // pending buffers BEFORE we swap them out.  Runs in the metrics thread (no
+  // extra thread); providers are set before the thread starts.
+  for (const auto& provider : metrics_providers_) {
+    if (provider) provider();
+  }
 
-    ::umbp::ReportMetricsRequest req;
-    req.set_node_id(config_.node_id);
+  std::unordered_map<std::string, PendingSample> counters;
+  std::unordered_map<std::string, PendingSample> gauges;
+  std::unordered_map<std::string, HistogramAccumulator> histogram_aggregates;
+  {
+    std::lock_guard lock(metrics_mutex_);
+    counters.swap(pending_counters_);
+    gauges.swap(pending_gauges_);
+    histogram_aggregates.swap(pending_histogram_aggregates_);
+  }
+  auto dropped_delta = metrics_dropped_count_.exchange(0, std::memory_order_relaxed);
+  if (counters.empty() && gauges.empty() && histogram_aggregates.empty() && dropped_delta == 0)
+    return;
 
-    for (const auto& [key, s] : counters) {
-      auto* sample = req.add_metrics();
-      sample->set_name(s.name);
-      sample->set_help(s.help);
-      for (const auto& [k, v] : s.labels) {
-        auto* l = sample->add_labels();
-        l->set_name(k);
-        l->set_value(v);
-      }
-      sample->set_counter_delta(s.value);
-    }
-    for (const auto& [key, s] : gauges) {
-      auto* sample = req.add_metrics();
-      sample->set_name(s.name);
-      sample->set_help(s.help);
-      for (const auto& [k, v] : s.labels) {
-        auto* l = sample->add_labels();
-        l->set_name(k);
-        l->set_value(v);
-      }
-      sample->set_gauge_value(s.value);
-    }
-    for (const auto& [key, h] : histogram_aggregates) {
-      auto* sample = req.add_metrics();
-      sample->set_name(h.name);
-      sample->set_help(h.help);
-      for (const auto& [k, v] : h.labels) {
-        auto* l = sample->add_labels();
-        l->set_name(k);
-        l->set_value(v);
-      }
-      auto* agg = sample->mutable_histogram_aggregate();
-      for (double b : h.bounds) agg->add_bounds(b);
-      for (uint64_t c : h.bucket_counts) agg->add_bucket_counts(c);
-      agg->set_count(h.count);
-      agg->set_sum(h.sum);
-    }
-    if (dropped_delta > 0) {
-      auto* sample = req.add_metrics();
-      sample->set_name(MORI_UMBP_METRIC_MASTER_CLIENT_METRICS_DROPPED_TOTAL);
-      sample->set_help(MORI_UMBP_METRIC_MASTER_CLIENT_METRICS_DROPPED_TOTAL_HELP);
-      sample->set_counter_delta(static_cast<double>(dropped_delta));
-    }
+  ::umbp::ReportMetricsRequest req;
+  req.set_node_id(config_.node_id);
 
-    ::umbp::ReportMetricsResponse resp;
-    grpc::ClientContext ctx;
-    ctx.set_deadline(std::chrono::system_clock::now() +
-                     std::chrono::milliseconds(RpcShutdownTimeoutMs()));
-    auto status = GetStub(stub_.get())->ReportMetrics(&ctx, req, &resp);
-    if (!status.ok()) {
-      MORI_UMBP_WARN("[Client] ReportMetrics RPC failed: node_id={}, error={}", config_.node_id,
-                     status.error_message());
+  for (const auto& [key, s] : counters) {
+    auto* sample = req.add_metrics();
+    sample->set_name(s.name);
+    sample->set_help(s.help);
+    for (const auto& [k, v] : s.labels) {
+      auto* l = sample->add_labels();
+      l->set_name(k);
+      l->set_value(v);
     }
+    sample->set_counter_delta(s.value);
+  }
+  for (const auto& [key, s] : gauges) {
+    auto* sample = req.add_metrics();
+    sample->set_name(s.name);
+    sample->set_help(s.help);
+    for (const auto& [k, v] : s.labels) {
+      auto* l = sample->add_labels();
+      l->set_name(k);
+      l->set_value(v);
+    }
+    sample->set_gauge_value(s.value);
+  }
+  for (const auto& [key, h] : histogram_aggregates) {
+    auto* sample = req.add_metrics();
+    sample->set_name(h.name);
+    sample->set_help(h.help);
+    for (const auto& [k, v] : h.labels) {
+      auto* l = sample->add_labels();
+      l->set_name(k);
+      l->set_value(v);
+    }
+    auto* agg = sample->mutable_histogram_aggregate();
+    for (double b : h.bounds) agg->add_bounds(b);
+    for (uint64_t c : h.bucket_counts) agg->add_bucket_counts(c);
+    agg->set_count(h.count);
+    agg->set_sum(h.sum);
+  }
+  if (dropped_delta > 0) {
+    auto* sample = req.add_metrics();
+    sample->set_name(MORI_UMBP_METRIC_MASTER_CLIENT_METRICS_DROPPED_TOTAL);
+    sample->set_help(MORI_UMBP_METRIC_MASTER_CLIENT_METRICS_DROPPED_TOTAL_HELP);
+    sample->set_counter_delta(static_cast<double>(dropped_delta));
+  }
+
+  ::umbp::ReportMetricsResponse resp;
+  grpc::ClientContext ctx;
+  ctx.set_deadline(std::chrono::system_clock::now() +
+                   std::chrono::milliseconds(RpcShutdownTimeoutMs()));
+  auto status = GetStub(stub_.get())->ReportMetrics(&ctx, req, &resp);
+  if (!status.ok()) {
+    MORI_UMBP_WARN("[Client] ReportMetrics RPC failed: node_id={}, error={}", config_.node_id,
+                   status.error_message());
   }
 }
 

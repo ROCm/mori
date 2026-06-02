@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <msgpack.hpp>
 #include <numeric>
@@ -147,6 +148,17 @@ std::vector<ScatterGroup> GroupPagesByBuffer(const std::vector<PageLocation>& pa
 uint32_t ReleaseLeaseMaxRetries() {
   static const uint32_t v = GetEnvUint32("UMBP_RELEASE_LEASE_MAX_RETRIES", 2, /*min_allowed=*/1);
   return v;
+}
+
+// Crash-restart SSD leftover policy (v1 = discard): wipe physical SSD bytes a
+// previous crashed process left behind at startup.  Default on; set
+// UMBP_SSD_STARTUP_DISCARD=0/false to keep leftover (opt-out hook for a future
+// rebuild-from-backend policy — there is no rebuild path yet).
+bool SsdStartupDiscardEnabled() {
+  const char* v = std::getenv("UMBP_SSD_STARTUP_DISCARD");
+  if (v == nullptr) return true;
+  const std::string s(v);
+  return !(s == "0" || s == "false" || s == "FALSE" || s == "off");
 }
 
 // Total attempts for a remote SSD get.  Retryable outcomes (kRetry) are
@@ -303,6 +315,10 @@ bool PoolClient::Init() {
   // quiesces the pipeline and clears peer_ssd_ alongside peer_alloc_.
   if (config_.ssd.enabled) {
     peer_ssd_ = std::make_unique<PeerSsdManager>(config_.ssd);
+    // Crash-restart leftover (v1 = discard): wipe stale SSD bytes before the
+    // pipeline starts so used capacity and the empty owned_ map start consistent
+    // (env-gated; see SsdStartupDiscardEnabled / DiscardLeftoverOnStartup).
+    if (SsdStartupDiscardEnabled()) peer_ssd_->DiscardLeftoverOnStartup();
     master_client_->SetPeerSsdManager(peer_ssd_.get());
     // Copy-on-commit pipeline: commits enqueue here, a worker pins the DRAM
     // pages and writes them to the local SSD tier.  Started below.
@@ -356,6 +372,12 @@ bool PoolClient::Init() {
     peer_address = host + ":" + std::to_string(config_.peer_service_port);
   }
 
+  // Register the SSD metrics provider before RegisterSelf starts the metrics
+  // thread (the list is read lock-free afterwards).  See PublishSsdMetrics.
+  if (config_.ssd.enabled) {
+    master_client_->AddMetricsProvider([this] { PublishSsdMetrics(); });
+  }
+
   // Master register.  In the new design master holds no DRAM-side
   // metadata; only membership + capacity-snapshot (SSD capacity rides in
   // tier_capacities as TierType::SSD).
@@ -379,6 +401,10 @@ void PoolClient::Shutdown() {
 
   if (master_client_) {
     master_client_->StopHeartbeat();
+    // Stop the periodic metrics thread before tearing down the SSD components
+    // its provider reads (peer_service_ / ssd_copy_pipeline_ / peer_ssd_), so no
+    // provider callback runs against freed state.  Idempotent with ~MasterClient.
+    master_client_->StopMetricsReporting();
     auto status = master_client_->UnregisterSelf();
     if (!status.ok()) {
       MORI_UMBP_WARN("[PoolClient] UnregisterSelf failed: {}", status.error_message());
@@ -1954,6 +1980,7 @@ void PoolClient::ProcessRemoteSsdBatchGet(const std::vector<BatchGetItem>& items
   auto& peer = GetOrConnectPeer(first.route.node_id, first.route.peer_address);
 
   const uint32_t max_attempts = SsdGetTransientMaxAttempts();
+  uint64_t transient_not_served = 0;  // aggregated per batch → one AddCounter below
   for (const auto& item : items) {
     bool done = false;
     for (uint32_t attempt = 0; attempt < max_attempts && !done; ++attempt) {
@@ -1973,11 +2000,105 @@ void PoolClient::ProcessRemoteSsdBatchGet(const std::vector<BatchGetItem>& items
       }
     }
     if (!done) {
+      ++transient_not_served;
       MORI_UMBP_WARN(
           "[PoolClient] Remote SSD get key='{}' still transient-failing (NO_SLOT/lease-expired) "
           "after {} attempts; reporting as not-served this round (not a definitive miss)",
           *item.key, max_attempts);
     }
+  }
+  // Optional reader-side diagnostic: lease expiry is reader-local and never
+  // shows up in the peer's ssd_read_total, so surface transient not-served here.
+  // Aggregated to a single AddCounter per batch (cheap, no per-key lock churn).
+  if (transient_not_served > 0 && master_client_) {
+    master_client_->AddCounter(MORI_UMBP_METRIC_SSD_READ_CLIENT_TRANSIENT_TOTAL,
+                               MORI_UMBP_METRIC_SSD_READ_CLIENT_TRANSIENT_TOTAL_HELP, {},
+                               static_cast<double>(transient_not_served));
+  }
+}
+
+void PoolClient::PublishSsdMetrics() {
+  if (!master_client_) return;
+
+  // Ship a monotonic peer-side counter as the delta since the last tick.  `last`
+  // is updated even on a zero delta (or a defensive counter reset) so the next
+  // tick stays correct.  Runs once per metrics flush in the metrics thread.
+  auto ship_counter = [&](const char* name, const char* help, MasterClient::Labels labels,
+                          uint64_t current, uint64_t& last) {
+    if (current > last) {
+      master_client_->AddCounter(name, help, std::move(labels),
+                                 static_cast<double>(current - last));
+    }
+    last = current;
+  };
+
+  if (ssd_copy_pipeline_) {
+    ship_counter(MORI_UMBP_METRIC_SSD_COPY_ENQUEUED_TOTAL,
+                 MORI_UMBP_METRIC_SSD_COPY_ENQUEUED_TOTAL_HELP, {}, ssd_copy_pipeline_->Enqueued(),
+                 ssd_metrics_last_.copy_enqueued);
+    ship_counter(MORI_UMBP_METRIC_SSD_COPY_SUCCEEDED_TOTAL,
+                 MORI_UMBP_METRIC_SSD_COPY_SUCCEEDED_TOTAL_HELP, {}, ssd_copy_pipeline_->CopiedOk(),
+                 ssd_metrics_last_.copy_succeeded);
+    ship_counter(MORI_UMBP_METRIC_SSD_COPY_FAILED_TOTAL,
+                 MORI_UMBP_METRIC_SSD_COPY_FAILED_TOTAL_HELP, {}, ssd_copy_pipeline_->Failed(),
+                 ssd_metrics_last_.copy_failed);
+    ship_counter(MORI_UMBP_METRIC_SSD_COPY_DROPPED_TOTAL,
+                 MORI_UMBP_METRIC_SSD_COPY_DROPPED_TOTAL_HELP, {{"reason", "queue_full"}},
+                 ssd_copy_pipeline_->Dropped(), ssd_metrics_last_.copy_dropped_queue_full);
+    ship_counter(MORI_UMBP_METRIC_SSD_COPY_DROPPED_TOTAL,
+                 MORI_UMBP_METRIC_SSD_COPY_DROPPED_TOTAL_HELP, {{"reason", "stopped"}},
+                 ssd_copy_pipeline_->DroppedStopped(), ssd_metrics_last_.copy_dropped_stopped);
+  }
+
+  if (peer_ssd_) {
+    ship_counter(MORI_UMBP_METRIC_SSD_READ_TOTAL, MORI_UMBP_METRIC_SSD_READ_TOTAL_HELP,
+                 {{"status", "ok"}}, peer_ssd_->ReadOk(), ssd_metrics_last_.read_ok);
+    ship_counter(MORI_UMBP_METRIC_SSD_READ_TOTAL, MORI_UMBP_METRIC_SSD_READ_TOTAL_HELP,
+                 {{"status", "not_found"}}, peer_ssd_->ReadNotFound(),
+                 ssd_metrics_last_.read_not_found);
+    ship_counter(MORI_UMBP_METRIC_SSD_READ_TOTAL, MORI_UMBP_METRIC_SSD_READ_TOTAL_HELP,
+                 {{"status", "size_too_large"}}, peer_ssd_->ReadSizeTooLarge(),
+                 ssd_metrics_last_.read_size_too_large);
+    ship_counter(MORI_UMBP_METRIC_SSD_READ_TOTAL, MORI_UMBP_METRIC_SSD_READ_TOTAL_HELP,
+                 {{"status", "error"}}, peer_ssd_->ReadError(), ssd_metrics_last_.read_error);
+
+    // SSD IO byte counters -> bandwidth via rate() in Grafana.
+    ship_counter(MORI_UMBP_METRIC_SSD_COPY_BYTES_TOTAL, MORI_UMBP_METRIC_SSD_COPY_BYTES_TOTAL_HELP,
+                 {}, peer_ssd_->CopyBytes(), ssd_metrics_last_.copy_bytes);
+    ship_counter(MORI_UMBP_METRIC_SSD_READ_BYTES_TOTAL, MORI_UMBP_METRIC_SSD_READ_BYTES_TOTAL_HELP,
+                 {}, peer_ssd_->ReadBytes(), ssd_metrics_last_.read_bytes);
+
+    ship_counter(MORI_UMBP_METRIC_SSD_EVICTION_ROUNDS_TOTAL,
+                 MORI_UMBP_METRIC_SSD_EVICTION_ROUNDS_TOTAL_HELP, {}, peer_ssd_->EvictionRounds(),
+                 ssd_metrics_last_.evict_rounds);
+    ship_counter(MORI_UMBP_METRIC_SSD_EVICTION_VICTIMS_TOTAL,
+                 MORI_UMBP_METRIC_SSD_EVICTION_VICTIMS_TOTAL_HELP, {}, peer_ssd_->EvictionVictims(),
+                 ssd_metrics_last_.evict_victims);
+    ship_counter(MORI_UMBP_METRIC_SSD_EVICTION_BYTES_FREED_TOTAL,
+                 MORI_UMBP_METRIC_SSD_EVICTION_BYTES_FREED_TOTAL_HELP, {},
+                 peer_ssd_->EvictionBytesFreed(), ssd_metrics_last_.evict_bytes_freed);
+    ship_counter(MORI_UMBP_METRIC_SSD_EVICTION_BACKEND_FAILED_TOTAL,
+                 MORI_UMBP_METRIC_SSD_EVICTION_BACKEND_FAILED_TOTAL_HELP, {},
+                 peer_ssd_->EvictionBackendFailures(), ssd_metrics_last_.evict_backend_failed);
+  }
+
+  if (peer_service_) {
+    const auto& m = peer_service_->Metrics();
+    const uint64_t expired = m.expired_reclaims.load(std::memory_order_relaxed);
+    const uint64_t slot_full = m.slot_full_rejects.load(std::memory_order_relaxed);
+    ship_counter(MORI_UMBP_METRIC_SSD_STAGING_EXPIRED_RECLAIMS_TOTAL,
+                 MORI_UMBP_METRIC_SSD_STAGING_EXPIRED_RECLAIMS_TOTAL_HELP, {}, expired,
+                 ssd_metrics_last_.staging_expired_reclaims);
+    ship_counter(MORI_UMBP_METRIC_SSD_STAGING_SLOT_FULL_REJECTS_TOTAL,
+                 MORI_UMBP_METRIC_SSD_STAGING_SLOT_FULL_REJECTS_TOTAL_HELP, {}, slot_full,
+                 ssd_metrics_last_.staging_slot_full_rejects);
+    // A NO_SLOT read outcome IS a slot-full reject; surface it under the unified
+    // read_total{status=no_slot} too (same event, peer-service view of reads).
+    ship_counter(MORI_UMBP_METRIC_SSD_READ_TOTAL, MORI_UMBP_METRIC_SSD_READ_TOTAL_HELP,
+                 {{"status", "no_slot"}}, slot_full, ssd_metrics_last_.read_no_slot);
+    master_client_->SetGauge(MORI_UMBP_METRIC_SSD_STAGING_SLOTS_IN_USE,
+                             MORI_UMBP_METRIC_SSD_STAGING_SLOTS_IN_USE_HELP, {},
+                             static_cast<double>(peer_service_->SnapshotReadSlotsInUse()));
   }
 }
 

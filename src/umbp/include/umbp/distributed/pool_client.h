@@ -316,6 +316,23 @@ class PoolClient {
   // (default off) on transient NO_SLOT / reader-local lease expiry; an rpc
   // failure is hard not-served, and a NOT_FOUND short-circuits as a miss.
   void ProcessRemoteSsdBatchGet(const std::vector<BatchGetItem>& items, std::vector<bool>* results);
+
+  // Periodic SSD metrics provider (registered in Init() when SSD is enabled, run
+  // once per metrics flush tick in the metrics thread).  Reads the cheap atomics
+  // on the pipeline / PeerSsdManager / PeerService and ships counter deltas + a
+  // staging gauge, keeping AddCounter off the commit/read hot paths.  The
+  // last-shipped values below make each tick report only the delta.
+  void PublishSsdMetrics();
+  struct SsdMetricsLastShipped {
+    uint64_t copy_enqueued = 0, copy_succeeded = 0, copy_failed = 0;
+    uint64_t copy_dropped_queue_full = 0, copy_dropped_stopped = 0;
+    uint64_t read_ok = 0, read_not_found = 0, read_size_too_large = 0, read_error = 0;
+    uint64_t read_no_slot = 0;
+    uint64_t copy_bytes = 0, read_bytes = 0;
+    uint64_t evict_rounds = 0, evict_victims = 0, evict_bytes_freed = 0, evict_backend_failed = 0;
+    uint64_t staging_expired_reclaims = 0, staging_slot_full_rejects = 0;
+  };
+  SsdMetricsLastShipped ssd_metrics_last_;
   void ExecuteRemoteBatchPut(const std::vector<BatchPutItem>& items,
                              std::vector<PutEntryOutcome>* results, PeerConnection& peer,
                              ::umbp::UMBPPeer::Stub* stub);

@@ -242,6 +242,8 @@ TEST_F(SsdCopyPipelineTest, CommitCopiesToSsdAndEmitsAddEvent) {
 
   ASSERT_TRUE(WaitForSsd("k", std::chrono::seconds(2)));
   EXPECT_GE(pipeline.CopiedOk(), 1u);
+  EXPECT_GE(pipeline.Enqueued(), 1u);  // observability: task was accepted
+  EXPECT_EQ(pipeline.Failed(), 0u);
 
   auto events = ssd_->DrainPendingEvents();
   ASSERT_EQ(events.size(), 1u);
@@ -280,6 +282,8 @@ TEST_F(SsdCopyPipelineTest, FullQueueDropsWithoutBlocking) {
   EXPECT_FALSE(pipeline.Enqueue(SsdCopyTask{"c", TierType::DRAM, 1}));  // full -> drop
   EXPECT_FALSE(pipeline.Enqueue(SsdCopyTask{"d", TierType::DRAM, 1}));
   EXPECT_EQ(pipeline.Dropped(), 2u);
+  EXPECT_EQ(pipeline.Enqueued(), 2u);        // only the two accepted tasks
+  EXPECT_EQ(pipeline.DroppedStopped(), 0u);  // these are queue-full, not stopped, drops
 }
 
 TEST_F(SsdCopyPipelineTest, EnqueueRejectedWhileStopped) {
@@ -287,7 +291,8 @@ TEST_F(SsdCopyPipelineTest, EnqueueRejectedWhileStopped) {
   pipeline.Start();
   pipeline.Stop();
   EXPECT_FALSE(pipeline.Enqueue(SsdCopyTask{"k", TierType::DRAM, 1}));
-  EXPECT_EQ(pipeline.Dropped(), 0u);  // stopped path is not counted as a full-drop
+  EXPECT_EQ(pipeline.Dropped(), 0u);         // stopped path is not counted as a full-drop
+  EXPECT_EQ(pipeline.DroppedStopped(), 1u);  // counted under the stopped reason instead
 }
 
 TEST_F(SsdCopyPipelineTest, StopAfterCopyIsCleanAndReleasesPin) {

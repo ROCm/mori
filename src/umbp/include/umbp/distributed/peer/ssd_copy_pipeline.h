@@ -90,8 +90,19 @@ class SsdCopyPipeline {
   // full-queue drop is counted in dropped().
   bool Enqueue(SsdCopyTask task);
 
-  uint64_t Dropped() const { return dropped_.load(std::memory_order_relaxed); }
-  uint64_t CopiedOk() const { return copied_ok_.load(std::memory_order_relaxed); }
+  // Prometheus-only observability snapshots (see metrics_ below).  Not
+  // correctness state; sampled once per metrics tick by PublishSsdMetrics().
+  uint64_t Enqueued() const { return metrics_.enqueued.load(std::memory_order_relaxed); }
+  // CopiedOk counts completed copies: a real backend Write OR a content-addressed
+  // dedup hit (already resident) — both report success, only the former emits ADD SSD.
+  uint64_t CopiedOk() const { return metrics_.copied_ok.load(std::memory_order_relaxed); }
+  uint64_t Failed() const { return metrics_.failed.load(std::memory_order_relaxed); }
+  // Dropped because the bounded queue was full (kept name for existing tests).
+  uint64_t Dropped() const { return metrics_.dropped_queue_full.load(std::memory_order_relaxed); }
+  // Dropped because the pipeline was stopped / quiescing at enqueue time.
+  uint64_t DroppedStopped() const {
+    return metrics_.dropped_stopped.load(std::memory_order_relaxed);
+  }
 
  private:
   void WorkerLoop();
@@ -113,8 +124,17 @@ class SsdCopyPipeline {
   bool paused_ = false;
   size_t active_ = 0;  // tasks currently being processed by workers
 
-  std::atomic<uint64_t> dropped_{0};
-  std::atomic<uint64_t> copied_ok_{0};
+  // Prometheus-only observability counters (see getters above): relaxed atomics
+  // bumped at the enqueue/run events, read once per metrics tick.  NOT
+  // correctness state (queue_/stop_/paused_ are authoritative).
+  struct MetricsCounters {
+    std::atomic<uint64_t> enqueued{0};            // tasks accepted into the queue
+    std::atomic<uint64_t> copied_ok{0};           // copy completed (write OK or dedup hit)
+    std::atomic<uint64_t> failed{0};              // backend Write failed / unusable pin
+    std::atomic<uint64_t> dropped_queue_full{0};  // dropped: bounded queue full
+    std::atomic<uint64_t> dropped_stopped{0};     // dropped: pipeline stopped/quiescing
+  };
+  MetricsCounters metrics_;
 
   std::vector<std::thread> workers_;
 };

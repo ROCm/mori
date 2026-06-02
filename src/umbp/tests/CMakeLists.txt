@@ -172,3 +172,17 @@ target_link_libraries(test_ssd_read_lease_gating PRIVATE umbp_common
 target_compile_features(test_ssd_read_lease_gating PRIVATE cxx_std_17)
 
 gtest_discover_tests(test_ssd_read_lease_gating)
+
+# ---------------------------------------------------------------------------
+# test_ssd_reliability — cross-component reliability: owned-source
+# DRAM+SSD merge, SSD evict -> REMOVE -> master index convergence, tier-priority
+# over the real index, crash-restart discard, and observability counters.
+# ---------------------------------------------------------------------------
+add_executable(test_ssd_reliability test_ssd_reliability.cpp)
+
+target_link_libraries(test_ssd_reliability PRIVATE umbp_common
+                                                   GTest::gtest_main)
+
+target_compile_features(test_ssd_reliability PRIVATE cxx_std_17)
+
+gtest_discover_tests(test_ssd_reliability)

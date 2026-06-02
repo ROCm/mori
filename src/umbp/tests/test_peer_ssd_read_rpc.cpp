@@ -177,6 +177,48 @@ TEST_F(PeerSsdReadRpcTest, NoSlotIsDistinctFromNotFound) {
   EXPECT_EQ(Prepare("absent-extra", 64).status(), ::umbp::SSD_READ_NO_SLOT);
 }
 
+// Many concurrent readers contend for a fixed pool of staging slots: at most
+// kNumReadSlots win OK, the rest get NO_SLOT (a retryable transient), and NEVER
+// NOT_FOUND for a present key.  Also exercises the staging observability
+// (slot_full_rejects counter + the in-use gauge accessor).
+TEST_F(PeerSsdReadRpcTest, ConcurrentReadersExhaustSlotsWithoutFalseMiss) {
+  const std::string data = "concurrent-payload";
+  for (int i = 0; i < 32; ++i) WriteSsd("ck-" + std::to_string(i), data);
+
+  const uint64_t slot_full_before = server_->Metrics().slot_full_rejects.load();
+
+  constexpr int kReaders = 24;  // >> kNumReadSlots, leases held (never released)
+  std::atomic<int> ok{0}, no_slot{0}, other{0};
+  std::vector<std::thread> threads;
+  for (int i = 0; i < kReaders; ++i) {
+    threads.emplace_back([&, i] {
+      auto resp = Prepare("ck-" + std::to_string(i), data.size());
+      switch (resp.status()) {
+        case ::umbp::SSD_READ_OK:
+          ok.fetch_add(1);
+          break;
+        case ::umbp::SSD_READ_NO_SLOT:
+          no_slot.fetch_add(1);
+          break;
+        default:
+          other.fetch_add(1);  // NOT_FOUND / SIZE_TOO_LARGE / ERROR must never happen here
+          break;
+      }
+    });
+  }
+  for (auto& t : threads) t.join();
+
+  EXPECT_EQ(other.load(), 0) << "present keys never report a false miss under contention";
+  EXPECT_LE(ok.load(), kNumReadSlots) << "at most one OK per staging slot";
+  EXPECT_EQ(ok.load() + no_slot.load(), kReaders);
+  EXPECT_GT(no_slot.load(), 0) << "with more readers than slots, some must see NO_SLOT";
+
+  // The NO_SLOT rejections were counted, and the gauge sees the held leases.
+  EXPECT_GE(server_->Metrics().slot_full_rejects.load() - slot_full_before,
+            static_cast<uint64_t>(no_slot.load()));
+  EXPECT_EQ(server_->SnapshotReadSlotsInUse(), static_cast<size_t>(ok.load()));
+}
+
 // A best-effort release frees the slot; double release reports false.
 TEST_F(PeerSsdReadRpcTest, ReleaseFreesSlotAndIsBestEffort) {
   WriteSsd("k-rel", "payload");

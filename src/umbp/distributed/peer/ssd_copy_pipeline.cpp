@@ -109,17 +109,19 @@ bool SsdCopyPipeline::Enqueue(SsdCopyTask task) {
   {
     std::lock_guard<std::mutex> lock(mu_);
     if (stop_ || paused_) {
+      metrics_.dropped_stopped.fetch_add(1, std::memory_order_relaxed);
       MORI_UMBP_DEBUG("[SsdCopyPipeline] drop key='{}' — pipeline {}", task.key,
                       stop_ ? "stopped" : "paused");
       return false;
     }
     if (queue_.size() >= queue_depth_) {
-      dropped_.fetch_add(1, std::memory_order_relaxed);
+      metrics_.dropped_queue_full.fetch_add(1, std::memory_order_relaxed);
       MORI_UMBP_DEBUG("[SsdCopyPipeline] drop key='{}' — queue full (depth={})", task.key,
                       queue_depth_);
       return false;  // full — drop, never block commit
     }
     queue_.push_back(std::move(task));
+    metrics_.enqueued.fetch_add(1, std::memory_order_relaxed);
   }
   cv_.notify_one();
   return true;
@@ -159,6 +161,7 @@ void SsdCopyPipeline::RunTask(const SsdCopyTask& task) {
   DramCopyPinGuard guard(dram_, task.key, pin->pin_token);
 
   if (pin->segments.empty() || pin->total_size == 0) {
+    metrics_.failed.fetch_add(1, std::memory_order_relaxed);
     MORI_UMBP_WARN("[SsdCopyPipeline] key='{}' has no readable segments (size={}) — skip", task.key,
                    pin->total_size);
     return;
@@ -167,7 +170,9 @@ void SsdCopyPipeline::RunTask(const SsdCopyTask& task) {
   // Backend IO runs outside the allocator lock; the pin keeps the source
   // pages alive for the duration of this synchronous Write.
   if (ssd_->Write(task.key, pin->segments, pin->total_size)) {
-    copied_ok_.fetch_add(1, std::memory_order_relaxed);
+    metrics_.copied_ok.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    metrics_.failed.fetch_add(1, std::memory_order_relaxed);
   }
 }
 

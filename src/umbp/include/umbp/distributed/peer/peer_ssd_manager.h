@@ -21,6 +21,7 @@
 // SOFTWARE.
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -123,6 +124,35 @@ class PeerSsdManager : public OwnedLocationSource {
   std::vector<KvEvent> DrainPendingEvents() override;
   std::vector<KvEvent> SnapshotOwnedKeys() const override;
 
+  // Crash-restart leftover (v1 = discard): after a crash owned_ is empty but
+  // physical SSD bytes may remain, diverging used capacity from owned_.  This
+  // best-effort wipes them at startup for a clean, consistent tier (cache is
+  // re-fetchable).  Call before the copy pipeline starts / before any IO (not
+  // synchronized against Write/PrepareRead).  No-op when SSD is disabled.
+  void DiscardLeftoverOnStartup();
+
+  // Prometheus-only observability snapshots (see metrics_ below); sampled once
+  // per metrics tick by PublishSsdMetrics(), never drive correctness.
+  uint64_t ReadOk() const { return metrics_.read_ok.load(std::memory_order_relaxed); }
+  uint64_t ReadNotFound() const { return metrics_.read_not_found.load(std::memory_order_relaxed); }
+  uint64_t ReadSizeTooLarge() const {
+    return metrics_.read_size_too_large.load(std::memory_order_relaxed);
+  }
+  uint64_t ReadError() const { return metrics_.read_error.load(std::memory_order_relaxed); }
+  // Byte counters for SSD IO bandwidth (rate() in Grafana = bytes/s).
+  uint64_t CopyBytes() const { return metrics_.copy_bytes.load(std::memory_order_relaxed); }
+  uint64_t ReadBytes() const { return metrics_.read_bytes.load(std::memory_order_relaxed); }
+  uint64_t EvictionRounds() const { return metrics_.evict_rounds.load(std::memory_order_relaxed); }
+  uint64_t EvictionVictims() const {
+    return metrics_.evict_victims.load(std::memory_order_relaxed);
+  }
+  uint64_t EvictionBytesFreed() const {
+    return metrics_.evict_bytes_freed.load(std::memory_order_relaxed);
+  }
+  uint64_t EvictionBackendFailures() const {
+    return metrics_.evict_backend_failures.load(std::memory_order_relaxed);
+  }
+
  private:
   // One owned SSD key: its size plus a hook into the LRU recency list so that
   // a touch is an O(1) splice and a victim lookup is an O(1) walk from the tail.
@@ -162,6 +192,23 @@ class PeerSsdManager : public OwnedLocationSource {
   std::unordered_map<std::string, int> inflight_reads_;
   std::unordered_set<std::string> evicting_;
   std::condition_variable reads_drained_cv_;  // notified when inflight_reads_ empties
+
+  // Prometheus-only observability counters: relaxed atomics bumped at discrete
+  // events, read once per metrics tick.  NOT correctness state
+  // (owned_/lru_/inflight_reads_ are authoritative); deletable with the provider.
+  struct MetricsCounters {
+    std::atomic<uint64_t> read_ok{0};
+    std::atomic<uint64_t> read_not_found{0};
+    std::atomic<uint64_t> read_size_too_large{0};
+    std::atomic<uint64_t> read_error{0};
+    std::atomic<uint64_t> copy_bytes{0};  // bytes written to SSD (write IO)
+    std::atomic<uint64_t> read_bytes{0};  // bytes read from SSD (read IO)
+    std::atomic<uint64_t> evict_rounds{0};
+    std::atomic<uint64_t> evict_victims{0};
+    std::atomic<uint64_t> evict_bytes_freed{0};
+    std::atomic<uint64_t> evict_backend_failures{0};
+  };
+  MetricsCounters metrics_;
 };
 
 }  // namespace mori::umbp

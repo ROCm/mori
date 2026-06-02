@@ -183,6 +183,11 @@ bool PeerSsdManager::Write(const std::string& key,
     }
   }
 
+  // Bytes physically written to the SSD device (write IO bandwidth source).
+  // Counted on every successful backend Write, including the rare dup-content
+  // re-write by a second copy worker (real device IO happened either way).
+  metrics_.copy_bytes.fetch_add(total_size, std::memory_order_relaxed);
+
   // Record the location.  Re-check owned_: with > 1 copy worker, two of them
   // could have both seen "absent" above and written the same (identical,
   // content-addressed) bytes — only the first records it + emits ADD SSD.
@@ -229,11 +234,14 @@ bool PeerSsdManager::Evict(const std::string& key) {
   std::lock_guard<std::mutex> lock(mutex_);
   evicting_.erase(key);
   if (!ok) {
+    metrics_.evict_backend_failures.fetch_add(1, std::memory_order_relaxed);
     MORI_UMBP_WARN("[PeerSsdManager] backend Evict failed key={} — keeping for retry", key);
     return false;
   }
   auto it = owned_.find(key);
   if (it != owned_.end()) {  // still present (a racing ClearLocal could have dropped it)
+    metrics_.evict_victims.fetch_add(1, std::memory_order_relaxed);
+    metrics_.evict_bytes_freed.fetch_add(it->second.size, std::memory_order_relaxed);
     lru_.erase(it->second.lru_it);
     owned_.erase(it);
     pending_events_.push_back(KvEvent{KvEvent::Kind::REMOVE, key, TierType::SSD, 0});
@@ -276,6 +284,10 @@ void PeerSsdManager::EvictToLowWatermark() {
   if (static_cast<double>(used) <= low_bytes) return;
   size_t bytes_to_free = used - static_cast<size_t>(low_bytes);
 
+  // A real round is about to run (we own the round lock and are over the low
+  // watermark).  Count it before selecting victims.
+  metrics_.evict_rounds.fetch_add(1, std::memory_order_relaxed);
+
   // Single pass, no retry loop: if everything reclaimable is in use we free
   // what we can and stop, so a fully-pinned tier cannot starve the worker.
   for (const auto& key : SelectVictims(bytes_to_free)) {
@@ -288,6 +300,11 @@ void PeerSsdManager::EvictToLowWatermark() {
 // ---------------------------------------------------------------------------
 
 void PeerSsdManager::ClearLocal() {
+  // CALLER INVARIANT: quiesce the copy pipeline before calling this.  We drain
+  // in-flight reads (below) but not in-flight Writes, so a racing Write could
+  // re-add owned_/ADD SSD after backend->Clear() wipes its bytes.
+  // PoolClient::Clear() Quiesce()s first; new callers must too.
+  //
   // Exclude eviction rounds for the whole operation (lock order: eviction_mu_
   // before mutex_, matching EvictToLowWatermark).
   std::lock_guard<std::mutex> round(eviction_mu_);
@@ -305,13 +322,31 @@ void PeerSsdManager::ClearLocal() {
   if (backend_) backend_->Clear();  // delete physical SSD bytes (user Clear = discard cache)
 }
 
+void PeerSsdManager::DiscardLeftoverOnStartup() {
+  // owned_ is empty on a fresh process, so there is nothing to reconcile: just
+  // wipe any orphan bytes the backend loaded from disk so used capacity starts
+  // at 0 (cache is re-fetchable; safe to drop).  See header for the policy.
+  if (!backend_) return;
+  auto [used, total] = backend_->Capacity();
+  if (used == 0) {
+    MORI_UMBP_INFO("[PeerSsdManager] startup discard: no SSD leftover (used=0)");
+    return;
+  }
+  MORI_UMBP_INFO("[PeerSsdManager] startup discard: wiping {}B SSD leftover (total={}B)", used,
+                 total);
+  backend_->Clear();
+}
+
 // ---------------------------------------------------------------------------
 //  Read
 // ---------------------------------------------------------------------------
 
 SsdReadOutcome PeerSsdManager::PrepareRead(const std::string& key, void* staging_ptr,
                                            size_t staging_cap) {
-  if (!backend_) return SsdReadOutcome{SsdReadStatus::kNotFound, 0};
+  if (!backend_) {
+    metrics_.read_not_found.fetch_add(1, std::memory_order_relaxed);
+    return SsdReadOutcome{SsdReadStatus::kNotFound, 0};
+  }
 
   // Resolve size and mark the read in flight under the lock, then run the
   // blocking SSD IO outside it (so a concurrent copy Write is not serialized).
@@ -319,13 +354,20 @@ SsdReadOutcome PeerSsdManager::PrepareRead(const std::string& key, void* staging
   {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = owned_.find(key);
-    if (it == owned_.end()) return SsdReadOutcome{SsdReadStatus::kNotFound, 0};
+    if (it == owned_.end()) {
+      metrics_.read_not_found.fetch_add(1, std::memory_order_relaxed);
+      return SsdReadOutcome{SsdReadStatus::kNotFound, 0};
+    }
     // Being evicted: bytes about to vanish — treat a new read as a stale-route
     // miss rather than racing the backend delete.
-    if (evicting_.count(key) != 0) return SsdReadOutcome{SsdReadStatus::kNotFound, 0};
+    if (evicting_.count(key) != 0) {
+      metrics_.read_not_found.fetch_add(1, std::memory_order_relaxed);
+      return SsdReadOutcome{SsdReadStatus::kNotFound, 0};
+    }
     size = it->second.size;
     // Reject over-capacity before touching the device (no in-flight mark, no IO).
     if (size > staging_cap) {
+      metrics_.read_size_too_large.fetch_add(1, std::memory_order_relaxed);
       MORI_UMBP_WARN("[PeerSsdManager] PrepareRead key={} size={} exceeds cap={}", key, size,
                      staging_cap);
       return SsdReadOutcome{SsdReadStatus::kSizeTooLarge, size};
@@ -348,9 +390,12 @@ SsdReadOutcome PeerSsdManager::PrepareRead(const std::string& key, void* staging
   if (!read_ok) {
     // owned_ had the key but the backend couldn't serve it (e.g. a Phase 4
     // local evict raced us, or a corrupt record): kError, not a definitive miss.
+    metrics_.read_error.fetch_add(1, std::memory_order_relaxed);
     MORI_UMBP_WARN("[PeerSsdManager] PrepareRead backend read failed key={} size={}", key, size);
     return SsdReadOutcome{SsdReadStatus::kError, size};
   }
+  metrics_.read_ok.fetch_add(1, std::memory_order_relaxed);
+  metrics_.read_bytes.fetch_add(size, std::memory_order_relaxed);  // SSD read IO bandwidth source
   return SsdReadOutcome{SsdReadStatus::kOk, size};
 }
 
