@@ -102,5 +102,14 @@ inline bool IsEnvVarEnabled(const char* varName) {
   return parsed.value_or(true);
 }
 
+/// Read a positive int env var. Returns `defaultValue` when unset, empty, or
+/// not parseable as a positive int.
+inline int GetPositiveIntOr(const char* varName, int defaultValue) {
+  const char* val = Get(varName);
+  if (val == nullptr || val[0] == '\0') return defaultValue;
+  auto parsed = detail::ParsePositiveInt(val);
+  return parsed.value_or(defaultValue);
+}
+
 }  // namespace env
 }  // namespace mori

@@ -29,9 +29,9 @@
 
 #include "mori/application/transport/sdma/anvil.hpp"
 
+#include <cstring>
 #include <fstream>
 #include <iostream>
-
 namespace anvil {
 
 auto checkHsaError = [](hsa_status_t s, const char* msg, const char* file, int line) {
@@ -265,26 +265,27 @@ void AnvilLib::init() {
 }
 
 bool AnvilLib::connect(int srcDeviceId, int dstDeviceId, int numChannels) {
-  uint32_t engineId = getSdmaEngineId(srcDeviceId, dstDeviceId);  // + 1) * 2;
-  // std::cout << "Connect from " << srcDeviceId << " to " << dstDeviceId << " with " << numChannels
-  //           << " channels using engine " << engineId << std::endl;
+  uint32_t engineId = getSdmaEngineId(srcDeviceId, dstDeviceId);
+  std::lock_guard<std::mutex> lock(channels_mutex_);
+  auto key = std::make_pair(srcDeviceId, dstDeviceId);
   for (int c = 0; c < numChannels; ++c) {
-    sdma_channels_[dstDeviceId].emplace_back(
+    sdma_channels_[key].emplace_back(
         std::make_unique<SdmaQueue>(srcDeviceId, dstDeviceId, gpuAgents_[srcDeviceId], engineId));
   }
   return true;
 }
 
 SdmaQueue* AnvilLib::getSdmaQueue(int srcDeviceId, int dstDeviceId, int channel_idx) {
-  if (sdma_channels_.find(dstDeviceId) == sdma_channels_.end()) {
+  std::lock_guard<std::mutex> lock(channels_mutex_);
+  auto key = std::make_pair(srcDeviceId, dstDeviceId);
+  auto it = sdma_channels_.find(key);
+  if (it == sdma_channels_.end()) {
     return nullptr;
   }
-
-  if (!(channel_idx < sdma_channels_[dstDeviceId].size())) {
+  if (!(channel_idx < static_cast<int>(it->second.size()))) {
     return nullptr;
   }
-
-  return sdma_channels_[dstDeviceId][channel_idx].get();  // TODO
+  return it->second[channel_idx].get();
 }
 
 AnvilLib& AnvilLib::getInstance() {

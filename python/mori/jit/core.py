@@ -25,6 +25,8 @@
 
 from __future__ import annotations
 
+import functools
+import logging
 import os
 import re
 import subprocess
@@ -40,8 +42,11 @@ from mori.jit.config import (
     detect_nic_type,
     find_mpi_include,
     get_mori_source_root,
+    is_debuginfo_enabled,
     is_profiler_enabled,
 )
+
+logger = logging.getLogger(__name__)
 
 _BC_FILENAME = "libmori_shmem_device.bc"
 
@@ -113,6 +118,7 @@ def _hipcc_device_bc(
         "-D__HIP_PLATFORM_AMD__",
         "-DHIP_ENABLE_WARP_SYNC_BUILTINS",
         *_nic_defines(),
+        *_ccqe_defines(),
         *_profiler_defines(),
     ]
     for d in include_dirs:
@@ -161,6 +167,109 @@ def _verify_bitcode(cfg: BuildConfig, bc_path: Path) -> None:
         )
 
 
+def _lib_has_ionic_ccqe() -> bool:
+    """Check whether the ionic driver supports CCQE by probing the runtime library symbol."""
+    import ctypes
+    import ctypes.util
+
+    lib_name = ctypes.util.find_library("ionic")
+    if lib_name is None:
+        return False
+    try:
+        lib = ctypes.CDLL(lib_name)
+        return hasattr(lib, "ionic_dv_create_cq_ex")
+    except OSError:
+        return False
+
+
+_CCQE_MIN_FW_VERSION = (1, 117, 5, 58)
+
+
+def _parse_ionic_fw_version(fw_ver: str) -> tuple[int, ...] | None:
+    """Parse '1.117.5-a-58' → (1, 117, 5, 58). Returns None if unparseable."""
+    if not fw_ver:
+        return None
+    m = re.match(r"^(\d+)\.(\d+)\.(\d+)-a-?(\d+)$", fw_ver)
+    if not m:
+        return None
+    return tuple(int(x) for x in m.groups())
+
+
+def _is_firmware_support_ccqe(fw_ver: str) -> bool:
+    """Return True if the firmware version >= 1.117.5-a-58."""
+    ver = _parse_ionic_fw_version(fw_ver)
+    return ver is not None and ver >= _CCQE_MIN_FW_VERSION
+
+
+def _get_ionic_fw_versions() -> list[str]:
+    """Return fw_ver strings for every ionic IB device found in sysfs."""
+    ib_dir = "/sys/class/infiniband"
+    versions: list[str] = []
+    try:
+        for dev in os.listdir(ib_dir):
+            dev_path = os.path.join(ib_dir, dev)
+            driver_link = os.path.join(dev_path, "device", "driver")
+            try:
+                driver_name = os.path.basename(os.readlink(driver_link))
+            except OSError:
+                continue
+            if driver_name not in ("ionic_rdma", "ionic"):
+                continue
+            fw_path = os.path.join(dev_path, "fw_ver")
+            try:
+                fw_ver = Path(fw_path).read_text().strip()
+                versions.append(fw_ver)
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return versions
+
+
+def _is_all_ionic_support_ccqe() -> bool:
+    """Return True only when every ionic device has the same fw version and that version >= 58."""
+    versions = _get_ionic_fw_versions()
+    if not versions:
+        return False
+    if len(set(versions)) != 1:
+        return False
+
+    logger.debug("ionic ver: %s", versions[-1])
+
+    for ver in versions:
+        if not _is_firmware_support_ccqe(ver):
+            return False
+
+    return True
+
+
+@functools.cache
+def is_ccqe_enabled() -> bool:
+    """Return True if CCQE should be enabled (cached after first call)."""
+    if os.environ.get("MORI_DISABLE_IONIC_CCQE", "").lower() in (
+        "1",
+        "true",
+        "on",
+        "yes",
+    ):
+        logger.info("Ionic _ccqe_enabled: False (disabled by MORI_DISABLE_IONIC_CCQE)")
+        return False
+    lib_support = _lib_has_ionic_ccqe()
+    nic_support = _is_all_ionic_support_ccqe()
+    enabled = lib_support and nic_support
+    logger.info(
+        "Ionic _ccqe_enabled: %s lib_support %s nic_support: %s",
+        enabled,
+        lib_support,
+        nic_support,
+    )
+    return enabled
+
+
+def _ccqe_defines() -> list[str]:
+    return ["-DIONIC_CCQE"] if is_ccqe_enabled() else []
+
+
 def _nic_defines() -> list[str]:
     """Return compiler -D flags for the detected NIC type (device-side macros)."""
     nic = detect_nic_type()
@@ -174,6 +283,11 @@ def _nic_defines() -> list[str]:
 def _profiler_defines() -> list[str]:
     """Return -DENABLE_PROFILER if mori was built with profiler support."""
     return ["-DENABLE_PROFILER"] if is_profiler_enabled() else []
+
+
+def _debuginfo_flags() -> list[str]:
+    """Return hipcc debug flags if MORI_DEBUG_INFO is enabled."""
+    return ["-g", "-ggdb"] if is_debuginfo_enabled() else []
 
 
 def _ensure_generated_include(mori_root: Path) -> Path:
@@ -295,11 +409,14 @@ def _hipcc_genco(
         f"--offload-arch={cfg.arch}",
         "-std=c++17",
         "-O2",
+        *_debuginfo_flags(),
         "-D__HIP_PLATFORM_AMD__",
         "-DHIP_ENABLE_WARP_SYNC_BUILTINS",
         *_nic_defines(),
+        *_ccqe_defines(),
         *_profiler_defines(),
     ]
+
     for d in include_dirs:
         cmd.extend(["-I", str(d)])
     cmd.extend([str(source), "-o", str(output)])
@@ -372,6 +489,7 @@ def compile_genco(
     cfg = detect_build_config()
     nic = detect_nic_type()
     profiler = is_profiler_enabled()
+    ccqe = is_ccqe_enabled()
     include_dirs = _collect_include_dirs(mori_root)
 
     sub_kernels = _PARALLEL_KERNEL_GROUPS.get(kernel_name)
@@ -380,7 +498,9 @@ def compile_genco(
             mori_root / "src" / "ops" / "kernels",
             mori_root / "include" / "mori",
         ]
-        cache_dir = get_cache_dir(cfg.arch, source_paths, nic, profiler=profiler)
+        cache_dir = get_cache_dir(
+            cfg.arch, source_paths, nic, profiler=profiler, ccqe=ccqe
+        )
 
         hsaco_paths = [cache_dir / f"{k}.hsaco" for k in sub_kernels]
         if all(p.is_file() for p in hsaco_paths):
@@ -425,7 +545,7 @@ def compile_genco(
         raise FileNotFoundError(f"Kernel source not found: {source}")
 
     source_paths = [source, mori_root / "include" / "mori"]
-    cache_dir = get_cache_dir(cfg.arch, source_paths, nic, profiler=profiler)
+    cache_dir = get_cache_dir(cfg.arch, source_paths, nic, profiler=profiler, ccqe=ccqe)
     hsaco_path = cache_dir / f"{kernel_name}.hsaco"
 
     if hsaco_path.is_file():
@@ -441,7 +561,7 @@ def compile_genco(
         nic = detect_nic_type()
         print(
             f"[mori-jit] Compiling {kernel_name} for {cfg.arch} "
-            f"(nic={nic}, profiler={profiler}) ..."
+            f"(nic={nic}, ccqe={ccqe}, profiler={profiler}) ..."
         )
         _hipcc_genco(cfg, source, include_dirs, hsaco_path)
         print(f"[mori-jit]   Cached: {hsaco_path}")
@@ -469,12 +589,15 @@ def ensure_bitcode(*, cov: int = 5) -> str:
 
     nic = detect_nic_type()
     profiler = is_profiler_enabled()
+    ccqe = is_ccqe_enabled()
     source_paths = [
         mori_root / "src" / "shmem" / "shmem_device_api_wrapper.cpp",
         mori_root / "include" / "mori" / "shmem",
         mori_root / "include" / "mori" / "core",
     ]
-    cache_dir = get_cache_dir(cfg.arch, source_paths, nic, profiler=profiler, cov=cov)
+    cache_dir = get_cache_dir(
+        cfg.arch, source_paths, nic, profiler=profiler, cov=cov, ccqe=ccqe
+    )
     bc_path = cache_dir / _BC_FILENAME
 
     if bc_path.is_file():

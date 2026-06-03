@@ -21,19 +21,13 @@
 // SOFTWARE.
 #pragma once
 
-#include <pybind11/pybind11.h>
+// Tiny header so any TU (device or host) can size per-GPU arrays without
+// pulling in shmem/ops headers. Bump this when supporting nodes with > 8 GPUs
+// (e.g. future MI400 platforms) — every per-GPU array sized by this constant
+// will pick up the new value automatically.
 
 namespace mori {
-void RegisterMoriOps(pybind11::module_& m);
-void RegisterMoriShmem(pybind11::module_& m);
-void RegisterMoriIo(pybind11::module_& m);
-#ifdef MORI_BUILD_COLLECTIVE
-void RegisterMoriCcl(pybind11::module_& m);
-#endif
-#ifdef BUILD_XLA_FFI_OPS
-void RegisterXLAFFIOps(pybind11::module_& m);
-#endif
-#ifdef MORI_BUILD_UMBP
-void RegisterMoriUmbp(pybind11::module_& m);
-#endif
+
+inline constexpr int kMaxGpusPerNode = 8;
+
 }  // namespace mori

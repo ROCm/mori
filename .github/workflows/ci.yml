@@ -71,7 +71,7 @@ jobs:
         run: $CT exec $CONTAINER bash -c "BUILD_EXAMPLES=ON pip install ."
 
       - name: Verify installation
-        run: $CT exec $CONTAINER python -c "import mori; print('OK')"
+        run: $CT exec $CONTAINER python -c "import mori; print('mori ' + mori.__version__ + ' OK')"
 
       - name: Cleanup
         if: always()
@@ -145,10 +145,16 @@ jobs:
             cd $GITHUB_WORKSPACE && timeout 300 pytest tests/python/ops/test_dispatch_combine_internode_v1.py -v
           "
 
-      - name: MORI-EP (async_ll)
+      - name: MORI-EP (async_ll SDMA)
         run: |
           $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
-            cd $GITHUB_WORKSPACE && timeout 300 pytest tests/python/ops/test_dispatch_combine_async_ll.py -v
+            cd $GITHUB_WORKSPACE && MORI_ENABLE_SDMA=1 timeout 300 pytest tests/python/ops/test_dispatch_combine_async_ll.py -v
+          "
+
+      - name: MORI-EP (async_ll IBGDA)
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE && MORI_DISABLE_P2P=1 MORI_ENABLE_SDMA=0 timeout 300 pytest tests/python/ops/test_dispatch_combine_async_ll.py -v
           "
 
       - name: MORI-EP bench
@@ -156,6 +162,10 @@ jobs:
           $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
             cd $GITHUB_WORKSPACE
             timeout 120 python3 tests/python/ops/bench_dispatch_combine.py
+            timeout 120 python3 tests/python/ops/bench_dispatch_combine.py \
+              --cmd bench --dtype bf16 --quant-type fp8_blockwise \
+              --zero-copy 0 --max-tokens 128 \
+              --force-scale-active 1 --report-scale-stats 1
           "
 
       - name: MORI-IO
@@ -241,6 +251,14 @@ jobs:
           $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
             cd $GITHUB_WORKSPACE
             timeout 600 pytest tests/python/shmem/test_api.py -v
+          "
+
+      - name: MORI-CCL collectives
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE
+            MORI_ENABLE_SDMA=1 timeout 300 python -m tests.python.ccl.test_allgather --world-size 8 --elems 1024 --iterations 1 --warmup 0
+            MORI_ENABLE_SDMA=1 timeout 300 python -m tests.python.ccl.test_all2all --world-size 8 --elems 1024 --iterations 1 --warmup 0
           "
 
       - name: MORI-EP async kernel bench (intranode)

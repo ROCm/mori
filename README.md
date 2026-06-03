@@ -2,6 +2,10 @@
 
 ## News
 
+- **[2026/05]** 🔥 MORI becomes the primary EP communication library for AMD platforms in Alibaba RTP-LLM ([MORI-EP PR](https://github.com/alibaba/rtp-llm/pull/977)).
+- **[2026/05]** MORI's SDMA-based AllGather collective is integrated into DeepSpeed for ZeRO-3 optimization on AMD GPUs, delivering up to 10% end-to-end training speedup by offloading AllGather traffic to dedicated SDMA copy engines ([example](https://github.com/deepspeedai/DeepSpeed/blob/master/examples/sdma_allgather/README.md), [post](https://x.com/DeepSpeedAI/status/2056401598839140384)).
+- **[2026/04]** 🔥 Tencent OpenUCL adopts the Mori ecosystem, using Mori's EP-style dispatch/combine pattern in AMD GPU deployments and leveraging MORI-SHMEM for GPU-initiated communication.
+- **[2026/03]** 🔥 MORI-SHMEM powers ByteDance Triton-distributed EP dispatch/combine kernels as the backend, delivering seamless integration and high performance on AMD GPUs ([EP Kernels](https://github.com/ByteDance-Seed/Triton-distributed/pull/164), [MORI-SHMEM Integration](https://github.com/ByteDance-Seed/Triton-distributed/pull/145)).
 - **[2026/02]** 🔥 MORI powers AMD's WideEP and PD disaggregation in SemiAnalysis InferenceX v2 benchmark ([PR](https://github.com/SemiAnalysisAI/InferenceX/pull/348), [InferenceX](https://inferencex.semianalysis.com/), [blog](https://newsletter.semianalysis.com/p/inferencex-v2-nvidia-blackwell-vs)).
 - **[2026/01]** 🔥 MORI-EP and MORI-IO integrated into SGLang and vLLM for MoE Expert Parallelism and PD Disaggregation on AMD GPUs ([sglang & MORI-EP](https://github.com/sgl-project/sglang/pull/14797), [sglang & MORI-IO](https://github.com/sgl-project/sglang/pull/14626), [vllm & MORI-EP](https://github.com/vllm-project/vllm/pull/28664), [vllm & MORI-IO](https://github.com/vllm-project/vllm/pull/29304)).
 - **[2025/12]** MORI adds support for AMD's AINIC (Pollara) with SOTA performance ([AINIC & MORI-EP](https://github.com/ROCm/mori/pull/119), [AINIC & MORI-IO](https://github.com/ROCm/mori/pull/113)).
@@ -185,7 +189,10 @@ GPU Direct RDMA READ, pairwise, 128 consecutive transfers, 1 GPU, MI300X + Thor2
 ### Prerequisites
 
 - ROCm >= 6.4 (hipcc needed at runtime for JIT kernel compilation, not at install time)
-- System packages: `libpci-dev` (see [Dockerfile.dev](docker/Dockerfile.dev))
+- System packages (required for `pip install`; not bundled in wheels). On Debian/Ubuntu install at least:
+  - `libpci-dev`
+  - `libibverbs-dev`, `ibverbs-utils`
+  See [docker/Dockerfile.dev](docker/Dockerfile.dev) for the full apt list used in CI/dev images.
 - Optional: `libopenmpi-dev`, `openmpi-bin` — only needed when building C++ examples (`BUILD_EXAMPLES=ON`) or enabling MPI bootstrap (`MORI_WITH_MPI=ON`)
 
 Or build docker image with:
@@ -207,12 +214,37 @@ cd mori && docker build -t rocm/mori:dev -f docker/Dockerfile.dev .
 
 ### Install
 
+MoRI can be installed in three ways: from PyPI (stable), nightly pre-built wheels (latest dev), or from source.
+
+#### From PyPI (stable release)
+
+```bash
+pip install amd_mori
+```
+
+#### Nightly (pre-built, tested daily)
+
+```bash
+# From PyPI
+pip install --pre amd-mori-nightly
+
+# Or from GitHub Pages
+pip install --no-index --force-reinstall --find-links https://rocm.github.io/mori/nightly/latest/ amd_mori
+```
+
+Browse all nightly builds: https://rocm.github.io/mori/nightly/
+
+> **Note**: `amd-mori` and `amd-mori-nightly` both provide the `mori` Python module.
+> Do not install both at the same time — uninstall one before installing the other.
+
+#### From source
+
 ```bash
 # NOTE: for venv build, add --no-build-isolation at the end
 cd mori && pip install .
 ```
 
-That's it. No hipcc needed at install time — host code compiles with a standard
+No hipcc needed at install time — host code compiles with a standard
 C++ compiler. GPU kernels are JIT-compiled on first use and cached to
 `~/.mori/jit/`. If a GPU is detected during install, kernel precompilation
 starts automatically in the background.
@@ -225,7 +257,7 @@ MORI_PRECOMPILE=1 python -c "import mori"
 ### Verify installation
 
 ```bash
-python -c "import mori; print('OK')"
+python -c "import mori; print(mori.__version__)"
 ```
 
 ## Testing
@@ -235,6 +267,7 @@ python -c "import mori; print('OK')"
 ```bash
 cd /path/to/mori
 export PYTHONPATH=/path/to/mori:$PYTHONPATH
+python -c "import mori; print(mori.__file__)"
 
 # Test correctness (8 GPUs)
 pytest tests/python/ops/test_dispatch_combine_intranode.py -q

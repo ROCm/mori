@@ -173,8 +173,8 @@ class EpDispatchCombineOp:
             cpp.EpDispatchCombineKernelType.IntraNode.value,
             cpp.EpDispatchCombineKernelType.InterNodeV1.value,
             cpp.EpDispatchCombineKernelType.InterNodeV1LL.value,
+            cpp.EpDispatchCombineKernelType.AsyncLL.value,
         ):
-            # here we need to allocate enough space to accomodate handle->totalRecvTokenNum[0] items
             n_tokens = self.config.max_num_tokens_to_recv()
             return jax.ffi.ffi_call(
                 "mori_ep",

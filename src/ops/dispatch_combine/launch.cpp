@@ -29,6 +29,7 @@
 #include <hip/hip_runtime_api.h>
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cctype>
 #include <filesystem>
@@ -38,6 +39,9 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#include "mori/application/utils/check.hpp"
+#include "mori/utils/limits.hpp"
 
 #ifdef __linux__
 #include <dlfcn.h>
@@ -68,8 +72,22 @@ struct KernelRegistry::Impl {
 };
 
 KernelRegistry::Impl& KernelRegistry::GetImpl() {
+#ifdef MORI_MULTITHREAD_SUPPORT
+  // SPMT: one Impl per GPU. hipModuleLoad binds to the calling thread's
+  // current device; sharing modules across devices would launch the wrong
+  // kernel image. In multi-process mode every process sees its single GPU as
+  // device 0, so this collapses to slot[0] — equivalent to a singleton.
+  static std::array<Impl, mori::kMaxGpusPerNode> impls;
+  int id = -1;
+  HIP_RUNTIME_CHECK(hipGetDevice(&id));
+  if (id < 0 || id >= mori::kMaxGpusPerNode) {
+    throw std::runtime_error("KernelRegistry: hipGetDevice() out of range: " + std::to_string(id));
+  }
+  return impls[static_cast<size_t>(id)];
+#else
   static Impl impl;
   return impl;
+#endif
 }
 
 KernelRegistry& KernelRegistry::Instance() {
@@ -378,9 +396,10 @@ static int dispatch_shared_mem(const EpDispatchCombineConfig& cfg, int wpb) {
          static_cast<int>(sizeof(index_t));
 }
 
-static int combine_shared_mem(int wpb, int num_experts_per_token) {
-  // warpPerBlock * numExpertPerToken * (sizeof(ptr) + sizeof(ptr))
-  return wpb * num_experts_per_token * (8 + 8);
+static int combine_shared_mem(int wpb, int num_experts_per_token, bool use_scale_ptrs = false,
+                              bool use_weight_ptrs = true) {
+  int num_ptr_arrays = 1 + (use_weight_ptrs ? 1 : 0) + (use_scale_ptrs ? 1 : 0);
+  return wpb * num_experts_per_token * num_ptr_arrays * 8;
 }
 
 static void ensure_loaded() {
@@ -446,10 +465,22 @@ void LaunchDispatch(EpDispatchCombineHandle& handle, void* input, void* weights,
       reg.Launch(std::string("EpDispatchInterNodeV1KernelLowLatency_") + sfx, bn, block_x, smem,
                  stream, &args, args_size);
       break;
-    case KernelType::AsyncLL:
-      reg.Launch(std::string("EpDispatchLowLatencyAsyncSend_") + sfx, bn, block_x, smem, stream,
-                 &args, args_size);
+    case KernelType::AsyncLL: {
+      int mp = handle.multiProcessorCount;
+      int mp_aligned = mp - (mp % handle.config.worldSize);
+      unsigned int mb_block = WARP_SIZE * 16;
+      reg.Launch(std::string("EpDispatchLowLatencyAsyncSendCopySlotAssign_") + sfx, mp_aligned,
+                 mb_block, 0, stream, &args, args_size);
+      reg.Launch(std::string("EpDispatchLowLatencyAsyncSendCopyMultiBlock_") + sfx, mp_aligned,
+                 mb_block, 0, stream, &args, args_size);
+      reg.Launch(std::string("EpDispatchLowLatencyAsyncSendTransfer_") + sfx,
+                 handle.config.worldSize, block_x, 0, stream, &args, args_size);
+      reg.Launch(std::string("EpDispatchLowLatencyAsyncRecvTransfer_") + sfx,
+                 handle.config.worldSize, block_x, 0, stream, &args, args_size);
+      reg.Launch(std::string("EpDispatchLowLatencyAsyncRecvCopyMultiBlock_") + sfx, mp_aligned,
+                 mb_block, 0, stream, &args, args_size);
       break;
+    }
     default:
       throw std::runtime_error("Unsupported dispatch kernel_type");
   }
@@ -481,15 +512,58 @@ void LaunchCombine(EpDispatchCombineHandle& handle, void* input, void* weights, 
   }
 
   unsigned int block_x = WARP_SIZE * wpb;
-  int smem = combine_shared_mem(wpb, handle.config.numExpertPerToken);
+  const bool hasWeights = (weights != nullptr);
+  int smem = combine_shared_mem(wpb, handle.config.numExpertPerToken,
+                                handle.config.quantType == QuantType::Fp8BlockwiseQuant,
+                                /*use_weight_ptrs=*/true);
   size_t args_size = sizeof(EpDispatchCombineArgsRaw);
   const char* sfx = dtype_suffix(dtype);
   auto& reg = KernelRegistry::Instance();
   int mp = handle.multiProcessorCount;
 
+  if (args.config.quantType == QuantType::Fp8BlockwiseQuant &&
+      handle.config.kernelType != KernelType::IntraNode) {
+    throw std::runtime_error("Fp8BlockwiseQuant currently only supports IntraNode combine");
+  }
+
   switch (handle.config.kernelType) {
     case KernelType::IntraNode:
-      if (args.config.useExternalInpBuffer) {
+      if (args.config.quantType == QuantType::Fp8BlockwiseQuant) {
+        if (dtype != HIP_R_16BF) {
+          throw std::runtime_error("Fp8BlockwiseQuant currently only supports bf16 input");
+        }
+        if (!args.config.useExternalInpBuffer) {
+          throw std::runtime_error(
+              "Fp8BlockwiseQuant currently requires --zero-copy 0 "
+              "(useExternalInpBuffer=true)");
+        }
+        const int fp8ScaleDim = args.fp8BlockwiseCombineScaleDim;
+        if (fp8ScaleDim <= 0) {
+          throw std::runtime_error("Fp8BlockwiseQuant requires internal combine scaleDim > 0");
+        }
+        // Pick the AccumNum=8 + VecBytes=8 specialization when (no weights, hidden_dim % 512 == 0,
+        // top-k == 8, EP > 4) and block_elems matches a registered symbol. Keep in sync with the
+        // Python launch path in dispatch_combine.py.
+        const int block_elems = (args.config.hiddenDim + fp8ScaleDim - 1) / fp8ScaleDim;
+        const bool baseVec8Top8Eligible = !hasWeights && (args.config.hiddenDim % 512 == 0) &&
+                                          args.config.numExpertPerToken == 8 &&
+                                          args.config.worldSize > 4;
+        const char* kernel_name = "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq";
+        bool useVec8Top8 = false;
+        if (baseVec8Top8Eligible) {
+          if (block_elems == 128) {
+            kernel_name = "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq_noweight_block128_vec8";
+            useVec8Top8 = true;
+          } else if (block_elems == 256) {
+            kernel_name = "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq_noweight_block256_vec8";
+            useVec8Top8 = true;
+          }
+        }
+        int fp8bwq_smem = combine_shared_mem(wpb, handle.config.numExpertPerToken,
+                                             /*use_scale_ptrs=*/true,
+                                             /*use_weight_ptrs=*/!useVec8Top8);
+        reg.Launch(kernel_name, bn, block_x, fp8bwq_smem, stream, &args, args_size);
+      } else if (args.config.useExternalInpBuffer) {
         reg.Launch(std::string("EpCombineIntraNodeKernel_") + sfx + "_nop2p", bn, block_x, smem,
                    stream, &args, args_size);
       } else {
@@ -517,10 +591,19 @@ void LaunchCombine(EpDispatchCombineHandle& handle, void* input, void* weights, 
                  stream, &args, args_size);
       reg.Launch(std::string("EpCombineAll_") + sfx, mp, block_x, smem, stream, &args, args_size);
       break;
-    case KernelType::AsyncLL:
-      reg.Launch(std::string("EpCombineLowLatencyAsyncSend_") + sfx, bn, block_x, smem, stream,
-                 &args, args_size);
+    case KernelType::AsyncLL: {
+      int mp = handle.multiProcessorCount;
+      int mp_aligned = mp - (mp % handle.config.worldSize);
+      reg.Launch(std::string("EpCombineLowLatencyAsyncSendCopy_") + sfx, mp_aligned, block_x, 0,
+                 stream, &args, args_size);
+      reg.Launch(std::string("EpCombineLowLatencyAsyncSendTransfer_") + sfx,
+                 handle.config.worldSize, block_x, 0, stream, &args, args_size);
+      reg.Launch(std::string("EpCombineLowLatencyAsyncRecvTransfer_") + sfx,
+                 handle.config.worldSize, block_x, 0, stream, &args, args_size);
+      reg.Launch(std::string("EpCombineLowLatencyAsyncRecvCopy_") + sfx, mp_aligned, block_x, smem,
+                 stream, &args, args_size);
       break;
+    }
     default:
       throw std::runtime_error("Unsupported combine kernel_type");
   }
@@ -534,19 +617,23 @@ void LaunchDispatchRecv(EpDispatchCombineHandle& handle, int block_num, int warp
   ensure_loaded();
 
   int wpb = (warp_per_block <= 0) ? handle.config.warpNumPerBlock : warp_per_block;
-  int bn = (block_num <= 0) ? handle.config.blockNum : block_num;
 
   EpDispatchCombineArgsRaw args = GetEpDispatchCombineArgsRaw(handle, 0);
   if (handle.curHiddenDim > 0) args.config.hiddenDim = handle.curHiddenDim;
 
   unsigned int block_x = WARP_SIZE * wpb;
-  int smem = dispatch_shared_mem(handle.config, wpb);
   size_t args_size = sizeof(EpDispatchCombineArgsRaw);
   const char* sfx = dtype_suffix(handle.inputType);
 
   if (handle.config.kernelType == KernelType::AsyncLL) {
-    KernelRegistry::Instance().Launch(std::string("EpDispatchLowLatencyAsyncRecv_") + sfx, bn,
-                                      block_x, smem, stream, &args, args_size);
+    auto& reg = KernelRegistry::Instance();
+    int mp = handle.multiProcessorCount;
+    int mp_aligned = mp - (mp % handle.config.worldSize);
+    unsigned int mb_block = WARP_SIZE * 16;
+    reg.Launch(std::string("EpDispatchLowLatencyAsyncRecvTransfer_") + sfx, handle.config.worldSize,
+               block_x, 0, stream, &args, args_size);
+    reg.Launch(std::string("EpDispatchLowLatencyAsyncRecvCopyMultiBlock_") + sfx, mp_aligned,
+               mb_block, 0, stream, &args, args_size);
   } else {
     throw std::runtime_error("LaunchDispatchRecv only supported for AsyncLL");
   }
@@ -560,19 +647,24 @@ void LaunchCombineRecv(EpDispatchCombineHandle& handle, int block_num, int warp_
   ensure_loaded();
 
   int wpb = (warp_per_block <= 0) ? handle.config.warpNumPerBlock : warp_per_block;
-  int bn = (block_num <= 0) ? handle.config.blockNum : block_num;
 
   EpDispatchCombineArgsRaw args = GetEpDispatchCombineArgsRaw(handle, 0);
   if (handle.curHiddenDim > 0) args.config.hiddenDim = handle.curHiddenDim;
 
   unsigned int block_x = WARP_SIZE * wpb;
-  int smem = combine_shared_mem(wpb, handle.config.numExpertPerToken);
+  int smem = combine_shared_mem(wpb, handle.config.numExpertPerToken,
+                                handle.config.quantType == QuantType::Fp8BlockwiseQuant);
   size_t args_size = sizeof(EpDispatchCombineArgsRaw);
   const char* sfx = dtype_suffix(handle.inputType);
 
   if (handle.config.kernelType == KernelType::AsyncLL) {
-    KernelRegistry::Instance().Launch(std::string("EpCombineLowLatencyAsyncRecv_") + sfx, bn,
-                                      block_x, smem, stream, &args, args_size);
+    auto& reg = KernelRegistry::Instance();
+    int mp = handle.multiProcessorCount;
+    int mp_aligned = mp - (mp % handle.config.worldSize);
+    reg.Launch(std::string("EpCombineLowLatencyAsyncRecvTransfer_") + sfx, handle.config.worldSize,
+               block_x, 0, stream, &args, args_size);
+    reg.Launch(std::string("EpCombineLowLatencyAsyncRecvCopy_") + sfx, mp_aligned, block_x, smem,
+               stream, &args, args_size);
   } else {
     throw std::runtime_error("LaunchCombineRecv only supported for AsyncLL");
   }

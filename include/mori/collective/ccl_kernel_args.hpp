@@ -21,19 +21,50 @@
 // SOFTWARE.
 #pragma once
 
-#include <pybind11/pybind11.h>
+#include <cstddef>
+#include <cstdint>
+
+#include "mori/application/application_device_types.hpp"
 
 namespace mori {
-void RegisterMoriOps(pybind11::module_& m);
-void RegisterMoriShmem(pybind11::module_& m);
-void RegisterMoriIo(pybind11::module_& m);
-#ifdef MORI_BUILD_COLLECTIVE
-void RegisterMoriCcl(pybind11::module_& m);
-#endif
-#ifdef BUILD_XLA_FFI_OPS
-void RegisterXLAFFIOps(pybind11::module_& m);
-#endif
-#ifdef MORI_BUILD_UMBP
-void RegisterMoriUmbp(pybind11::module_& m);
-#endif
+namespace collective {
+
+struct CrossPeBarrier;
+
+template <typename T>
+struct CclAll2allArgs {
+  int myPe;
+  int npes;
+  T* input;
+  application::SymmMemObjPtr inputTransitMemObj;
+  application::SymmMemObjPtr outputTransitMemObj;
+  application::SymmMemObjPtr flagsMemObj;
+  size_t elementCount;
+};
+
+template <typename T>
+struct CclAllgatherArgs {
+  int myPe;
+  int npes;
+  T* input;
+  application::SymmMemObjPtr srcMemObj;
+  application::SymmMemObjPtr dstMemObj;
+  application::SymmMemObjPtr flagsMemObj;
+  size_t elementCount;
+  size_t dstBaseOffset;
+  uint64_t flagVal;
+};
+
+template <typename T>
+struct CclAllreduceArgs {
+  int myPe;
+  int npes;
+  const T* input;
+  application::SymmMemObjPtr dstMemObj;
+  application::SymmMemObjPtr flagsMemObj;
+  CrossPeBarrier* barrier;
+  size_t elementCount;
+};
+
+}  // namespace collective
 }  // namespace mori

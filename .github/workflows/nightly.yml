@@ -1,0 +1,920 @@
+name: Nightly Wheel Build
+
+on:
+  schedule:
+    - cron: '0 17 * * *'  # daily 01:00 Beijing (UTC+8)
+  workflow_dispatch:       # manual trigger
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CT: docker
+  CONTAINER: mori_nightly_${{ github.run_id }}
+
+jobs:
+  # ── Stage 1: Build wheels ──────────────────────────────────────────────────
+  build-wheel:
+    name: wheel (py${{ matrix.python }})
+    runs-on: [self-hosted, MI355X-AINIC-TW]
+    env:
+      IMAGE: rocm/mori:ci-py${{ matrix.python }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python: "3.10"
+            base_image: rocm/pytorch:rocm7.2.1_ubuntu22.04_py3.10_pytorch_release_2.8.0
+          - python: "3.12"
+            base_image: rocm/pytorch:rocm7.2.1_ubuntu24.04_py3.12_pytorch_release_2.8.0
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Clean stale dist
+        run: |
+          $CT run --rm -v ${{ runner.temp }}:/runner_temp ${{ matrix.base_image }} \
+            rm -rf /runner_temp/dist || true
+
+      - name: Build CI image
+        run: $CT build --network=host --build-arg BASE_IMAGE=${{ matrix.base_image }} -t $IMAGE -f docker/Dockerfile.dev .
+
+      - name: Build wheels
+        run: |
+          BASE_VER=$(git describe --tags --abbrev=0 | sed 's/^v//')
+          NEXT_VER=$(echo "$BASE_VER" | awk -F. '{$NF=$NF+1; print}' OFS=.)
+          DATE=$(date +%Y%m%d)
+          SHA=$(git rev-parse --short HEAD)
+          GH_VERSION="${NEXT_VER}.dev${DATE}+${SHA}"
+          PYPI_VERSION="${NEXT_VER}.dev${DATE}"
+
+          $CT run --rm --network=host \
+            -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE -w $GITHUB_WORKSPACE \
+            -v ${{ runner.temp }}/dist:/tmp/dist \
+            $IMAGE bash -c "
+              git config --global --add safe.directory '*'
+
+              echo '=== Building gh-pages wheel (amd_mori ${GH_VERSION}) ==='
+              SETUPTOOLS_SCM_PRETEND_VERSION=${GH_VERSION} \
+                python3 -m pip wheel --no-deps -w /tmp/dist .
+
+              echo '=== Building PyPI wheel (amd_mori_nightly ${PYPI_VERSION}) ==='
+              sed -i 's/name = \"amd_mori\"/name = \"amd_mori_nightly\"/' pyproject.toml
+              SETUPTOOLS_SCM_PRETEND_VERSION=${PYPI_VERSION} \
+                python3 -m pip wheel --no-deps -w /tmp/dist .
+              git checkout pyproject.toml
+            "
+
+          echo "=== produced ==="
+          ls -lh ${{ runner.temp }}/dist/
+
+      - name: Retag PyPI wheels (manylinux platform tag)
+        run: |
+          mkdir -p ${{ runner.temp }}/dist-pypi
+          cat > ${{ runner.temp }}/retag.py << 'PYEOF'
+          import zipfile, shutil, os, sys, tempfile
+          src, dst, plat = sys.argv[1], sys.argv[2], sys.argv[3]
+          shutil.copy2(src, dst)
+          with zipfile.ZipFile(dst, 'r') as zin:
+              wheel_file = [n for n in zin.namelist() if n.endswith('/WHEEL')][0]
+              content = zin.read(wheel_file).decode()
+          fixed = content.replace('linux_x86_64', plat)
+          tmpfd, tmppath = tempfile.mkstemp(suffix='.whl')
+          os.close(tmpfd)
+          with zipfile.ZipFile(dst, 'r') as zin, zipfile.ZipFile(tmppath, 'w') as zout:
+              for item in zin.infolist():
+                  data = zin.read(item.filename)
+                  if item.filename == wheel_file:
+                      data = fixed.encode()
+                  zout.writestr(item, data)
+          shutil.move(tmppath, dst)
+          print(f'Retagged: {os.path.basename(dst)}')
+          PYEOF
+          $CT run --rm \
+            -v ${{ runner.temp }}/dist:/tmp/dist:ro \
+            -v ${{ runner.temp }}/dist-pypi:/tmp/dist-pypi \
+            -v ${{ runner.temp }}/retag.py:/tmp/retag.py:ro \
+            $IMAGE bash -c "
+              pip install auditwheel -q
+              for whl in /tmp/dist/amd_mori_nightly-*.whl; do
+                PLAT=\$(auditwheel show \"\$whl\" 2>&1 | grep -o 'manylinux_[0-9_]*_x86_64' | head -1)
+                if [ -z \"\$PLAT\" ]; then PLAT=linux_x86_64; fi
+                NEWNAME=\$(basename \"\$whl\" | sed \"s/linux_x86_64/\$PLAT/\")
+                python3 /tmp/retag.py \"\$whl\" \"/tmp/dist-pypi/\$NEWNAME\" \"\$PLAT\"
+              done
+            "
+          $CT run --rm -v ${{ runner.temp }}/dist-pypi:/tmp/dist-pypi $IMAGE \
+            chown -R $(id -u):$(id -g) /tmp/dist-pypi
+          echo "=== PyPI wheels ==="
+          ls -lh ${{ runner.temp }}/dist-pypi/
+
+      - name: Upload gh-pages wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-cp${{ matrix.python }}
+          path: ${{ runner.temp }}/dist/amd_mori-*.whl
+          retention-days: 30
+
+      - name: Upload PyPI wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: pypi-wheel-cp${{ matrix.python }}
+          path: ${{ runner.temp }}/dist-pypi/amd_mori_nightly-*.whl
+          retention-days: 30
+
+      - name: Cleanup
+        if: always()
+        run: |
+          $CT run --rm \
+              -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
+              -v ${{ runner.temp }}:/runner_temp \
+              $IMAGE bash -c "
+                chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null
+                rm -rf /runner_temp/dist
+              " || true
+
+  # ── Stage 2: Deploy wheels to gh-pages (date dir only, no latest/) ─────────
+  deploy-staging:
+    name: deploy staging
+    needs: build-wheel
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      date: ${{ steps.set-date.outputs.date }}
+      wheel_url: ${{ steps.set-date.outputs.wheel_url }}
+      version: ${{ steps.set-date.outputs.version }}
+    steps:
+      - name: Download all wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          merge-multiple: true
+          path: ./wheels
+
+      - name: Set date and version
+        id: set-date
+        run: |
+          DATE=$(date +%Y-%m-%d)
+          VERSION=$(ls ./wheels/*.whl | head -1 | sed 's/.*amd_mori-\(.*\)-cp[0-9]*-cp.*/\1/')
+          echo "date=$DATE" >> $GITHUB_OUTPUT
+          echo "wheel_url=https://rocm.github.io/mori/nightly/$DATE/" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Detected version: $VERSION"
+
+      - name: List wheels
+        run: ls -lh ./wheels/
+
+      - name: Checkout gh-pages
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: gh-pages
+
+      - name: Add wheels and prune old dirs
+        run: |
+          DATE=${{ steps.set-date.outputs.date }}
+          mkdir -p gh-pages/nightly/$DATE
+          cp ./wheels/*.whl gh-pages/nightly/$DATE/
+
+          cd gh-pages/nightly/$DATE
+          echo '<!DOCTYPE html><html><body>' > index.html
+          for f in *.whl; do
+            [ -f "$f" ] && echo "<a href=\"$f\">$f</a><br>" >> index.html
+          done
+          echo '</body></html>' >> index.html
+          cd -
+
+          CUTOFF=$(date -d '30 days ago' +%Y-%m-%d 2>/dev/null || date -v-30d +%Y-%m-%d)
+          cd gh-pages/nightly
+          for d in 20??-??-??; do
+            [ -d "$d" ] || continue
+            if [ "$d" \< "$CUTOFF" ] || [ "$d" = "$CUTOFF" ]; then
+              echo "Pruning old directory: $d"
+              rm -rf "$d"
+            fi
+          done
+          cd -
+
+      - name: Generate index.html
+        run: |
+          cd gh-pages/nightly
+          cat > index.html << 'HEADER'
+          <!DOCTYPE html>
+          <html><head>
+          <meta charset="utf-8">
+          <title>MoRI Nightly Wheels</title>
+          <style>
+            body { font-family: -apple-system, sans-serif; max-width: 960px; margin: 2em auto; padding: 0 1em; }
+            h1 { border-bottom: 1px solid #ddd; padding-bottom: 0.3em; }
+            table { border-collapse: collapse; width: 100%; }
+            th, td { text-align: left; padding: 6px 12px; border-bottom: 1px solid #eee; }
+            th { background: #f6f8fa; }
+            a { color: #0366d6; text-decoration: none; }
+            a:hover { text-decoration: underline; }
+            code { background: #f0f0f0; padding: 2px 6px; border-radius: 3px; font-size: 0.9em; }
+            .install { background: #f6f8fa; padding: 1em; border-radius: 6px; margin: 1em 0; }
+            h2.date { margin-top: 1.5em; color: #24292e; font-size: 1.1em; }
+          </style>
+          </head><body>
+          <h1>MoRI Nightly Wheels</h1>
+          <div class="install">
+          <strong>Install latest nightly:</strong><br>
+          <code>pip install --no-index --force-reinstall --find-links https://rocm.github.io/mori/nightly/latest/ amd_mori</code>
+          </div>
+          HEADER
+
+          if [ -d "latest" ] && ls latest/amd_mori-*.whl &>/dev/null; then
+            LATEST_WHL=$(ls latest/amd_mori-*.whl | head -1 | xargs basename)
+            LATEST_VER=$(echo "$LATEST_WHL" | sed 's/amd_mori-\(.*\)-cp[0-9]*-cp.*/\1/')
+            LATEST_COMMIT=$(echo "$LATEST_VER" | sed -n 's/.*+\(.*\)/\1/p')
+            echo "<h2><a href=\"latest/\">Latest</a> (tested)</h2>" >> index.html
+            echo "<table>" >> index.html
+            echo "<tr><th>Commit</th><th>Version</th><th>Python</th><th>Wheel</th><th>Size</th></tr>" >> index.html
+            for f in $(ls -r latest/amd_mori-*.whl 2>/dev/null); do
+              BASENAME=$(basename "$f")
+              SIZE=$(du -h "$f" | cut -f1)
+              VER=$(echo "$BASENAME" | sed 's/amd_mori-\(.*\)-cp[0-9]*-cp.*/\1/')
+              COMMIT=$(echo "$VER" | sed -n 's/.*+\(.*\)/\1/p')
+              PYTAG=$(echo "$BASENAME" | sed 's/.*-\(cp[0-9]*\)-cp[0-9]*-.*/\1/')
+              echo "<tr><td><code>${COMMIT}</code></td><td>${VER}</td><td>${PYTAG}</td><td><a href=\"latest/${BASENAME}\">${BASENAME}</a></td><td>${SIZE}</td></tr>" >> index.html
+            done
+            echo "</table>" >> index.html
+          fi
+
+          echo "<hr>" >> index.html
+          echo "<h2>All builds</h2>" >> index.html
+
+          for d in $(ls -rd 20??-??-?? 2>/dev/null); do
+            [ -d "$d" ] || continue
+            echo "<h2 class=\"date\"><a href=\"$d/\">$d</a></h2>" >> index.html
+            echo "<table>" >> index.html
+            echo "<tr><th>Commit</th><th>Version</th><th>Python</th><th>Wheel</th><th>Size</th></tr>" >> index.html
+            for f in $(ls -r "$d"/amd_mori-*.whl 2>/dev/null); do
+              BASENAME=$(basename "$f")
+              SIZE=$(du -h "$f" | cut -f1)
+              VER=$(echo "$BASENAME" | sed 's/amd_mori-\(.*\)-cp[0-9]*-cp.*/\1/')
+              COMMIT=$(echo "$VER" | sed -n 's/.*+\(.*\)/\1/p')
+              PYTAG=$(echo "$BASENAME" | sed 's/.*-\(cp[0-9]*\)-cp[0-9]*-.*/\1/')
+              echo "<tr><td><code>${COMMIT}</code></td><td>${VER}</td><td>${PYTAG}</td><td><a href=\"${d}/${BASENAME}\">${BASENAME}</a></td><td>${SIZE}</td></tr>" >> index.html
+            done
+            echo "</table>" >> index.html
+          done
+
+          cat >> index.html << 'FOOTER'
+          <p style="color:#888; margin-top:2em; font-size:0.85em">
+          Auto-generated by <a href="https://github.com/ROCm/mori/actions/workflows/nightly.yml">nightly.yml</a>.
+          Wheels older than 30 days are automatically pruned. Only wheels that pass full test suite are published.
+          </p>
+          </body></html>
+          FOOTER
+
+      - name: Push to gh-pages
+        run: |
+          cd gh-pages
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add nightly/
+          git diff --cached --quiet && echo "No changes to deploy" && exit 0
+          git commit -m "nightly: stage wheels $(date +%Y-%m-%d)"
+          git push
+
+  # ── Stage 3a: Intranode tests (install from gh-pages) ──────────────────────
+  test-wheel:
+    name: intranode test (${{ matrix.platform }}, py${{ matrix.python }})
+    needs: deploy-staging
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: MI355X_AINIC
+            python: "3.10"
+            runner: [self-hosted, MI355X-AINIC-TW]
+            base_image: rocm/pytorch:rocm7.2.1_ubuntu22.04_py3.10_pytorch_release_2.8.0
+            rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
+            rdma_sl: 3
+            rdma_tc: 104
+          - platform: MI355X_AINIC
+            python: "3.12"
+            runner: [self-hosted, MI355X-AINIC-TW]
+            base_image: rocm/pytorch:rocm7.2.1_ubuntu24.04_py3.12_pytorch_release_2.8.0
+            rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
+            rdma_sl: 3
+            rdma_tc: 104
+          - platform: MI300X_BNXT
+            python: "3.12"
+            runner: [self-hosted, MI300X-BNXT]
+            base_image: rocm/pytorch:rocm7.2.1_ubuntu24.04_py3.12_pytorch_release_2.8.0
+            rdma_devices: bnxt_re0,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re7,bnxt_re8,bnxt_re9
+            rdma_sl: 3
+            rdma_tc: 104
+            socket_ifname: enp159s0np0
+    env:
+      IMAGE: rocm/mori:ci-py${{ matrix.python }}
+      MORI_RDMA_DEVICES: ${{ matrix.rdma_devices }}
+      MORI_RDMA_SL: ${{ matrix.rdma_sl }}
+      MORI_RDMA_TC: ${{ matrix.rdma_tc }}
+      MORI_SOCKET_IFNAME: ${{ matrix.socket_ifname }}
+      WHEEL_URL: ${{ needs.deploy-staging.outputs.wheel_url }}
+      WHEEL_VERSION: ${{ needs.deploy-staging.outputs.version }}
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Build CI image
+        run: $CT build --network=host --build-arg BASE_IMAGE=${{ matrix.base_image }} -t $IMAGE -f docker/Dockerfile.dev .
+
+      - name: Start container
+        run: |
+          $CT rm -f $CONTAINER 2>/dev/null || true
+          CONTAINER_RUNTIME=$CT ./docker/ci_run.sh --name $CONTAINER \
+            -e MORI_RDMA_DEVICES=$MORI_RDMA_DEVICES \
+            -e MORI_RDMA_SL=$MORI_RDMA_SL \
+            -e MORI_RDMA_TC=$MORI_RDMA_TC \
+            ${MORI_SOCKET_IFNAME:+-e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME} \
+            -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
+            -w $GITHUB_WORKSPACE \
+            $IMAGE sleep infinity
+          $CT exec $CONTAINER \
+            git config --global --add safe.directory $GITHUB_WORKSPACE
+
+      - name: Install from gh-pages
+        run: |
+          $CT exec $CONTAINER bash -c "
+            for i in \$(seq 1 15); do
+              pip install --no-index --find-links $WHEEL_URL amd_mori==$WHEEL_VERSION && break
+              echo \"Retry \$i/15: waiting for gh-pages to propagate...\"
+              sleep 15
+            done
+            pip install prettytable pytest
+            python3 -c 'import mori; print(\"mori \" + mori.__version__ + \" imported OK\")'
+          "
+
+      - name: MORI-EP (intranode)
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE && timeout 300 pytest tests/python/ops/test_dispatch_combine_intranode.py -v
+          "
+
+      - name: MORI-EP (internode_v1)
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE && timeout 300 pytest tests/python/ops/test_dispatch_combine_internode_v1.py -v
+          "
+
+      - name: MORI-EP (async_ll SDMA)
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE && MORI_ENABLE_SDMA=1 timeout 300 pytest tests/python/ops/test_dispatch_combine_async_ll.py -v
+          "
+
+      - name: MORI-EP (async_ll IBGDA)
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE && MORI_DISABLE_P2P=1 MORI_ENABLE_SDMA=0 timeout 300 pytest tests/python/ops/test_dispatch_combine_async_ll.py -v
+          "
+
+      - name: MORI-EP bench
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE
+            timeout 120 python3 tests/python/ops/bench_dispatch_combine.py
+            timeout 120 python3 tests/python/ops/bench_dispatch_combine.py \
+              --cmd bench --dtype bf16 --quant-type fp8_blockwise \
+              --zero-copy 0 --max-tokens 128 \
+              --force-scale-active 1 --report-scale-stats 1
+          "
+
+      - name: MORI-IO
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE
+            timeout 60 pytest tests/python/io/ -v
+            MORI_IO_XGMI_SCATTER_GATHER_THRESHOLD=4 \
+              timeout 120 pytest tests/python/io/test_discrete_buffer.py -v -k 'not performance'
+          "
+
+      - name: MORI-IR
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE -e HOME=/tmp $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE
+            timeout 60 torchrun --nproc_per_node=2 examples/shmem/ir/test_triton_shmem.py
+            timeout 60 torchrun --nproc_per_node=8 examples/shmem/ir/test_triton_allreduce.py
+            MORI_DISABLE_P2P=ON timeout 60 torchrun --nproc_per_node=8 examples/shmem/ir/test_triton_allreduce.py
+          "
+
+      - name: MORI-CCL/shmem
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE
+            timeout 600 pytest tests/python/shmem/test_api.py -v
+          "
+
+      - name: MORI-CCL collectives
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE
+            MORI_ENABLE_SDMA=1 timeout 300 python -m tests.python.ccl.test_allgather --world-size 8 --elems 1024 --iterations 1 --warmup 0
+            MORI_ENABLE_SDMA=1 timeout 300 python -m tests.python.ccl.test_all2all --world-size 8 --elems 1024 --iterations 1 --warmup 0
+          "
+
+      - name: MORI-EP async kernel bench (intranode)
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE
+            PORT=12390
+            for TOKENS in 64 128; do
+              echo \"=== async_ll bench max-tokens=\$TOKENS port=\$PORT ===\"
+              MORI_ENABLE_SDMA=1 GPU_PER_NODE=8 \
+              timeout 120 torchrun \
+                --nnodes=1 --node_rank=0 --nproc_per_node=1 \
+                --master_addr=127.0.0.1 --master_port=\$PORT \
+                examples/ops/dispatch_combine/test_dispatch_combine_internode.py \
+                --kernel-type async_ll --num-qp 2 --cmd bench \
+                --dtype bf16 --max-tokens \$TOKENS
+              PORT=\$((PORT + 1))
+            done
+          "
+
+      - name: Cleanup
+        if: always()
+        run: |
+          $CT run --rm \
+              -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
+              $IMAGE bash -c "
+                chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null
+              " || true
+          $CT rm -f $CONTAINER || true
+
+  # ── Stage 3b: Internode tests (install from gh-pages) ──────────────────────
+  test-wheel-internode:
+    name: internode test (${{ matrix.platform }}, py${{ matrix.python }})
+    needs: deploy-staging
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: MI355X_AINIC
+            python: "3.10"
+            runner: [self-hosted, MI355X-AINIC]
+            base_image: rocm/pytorch:rocm7.2.1_ubuntu22.04_py3.10_pytorch_release_2.8.0
+            node1_host: 10.2.80.22
+            node2_host: 10.2.80.20
+            node2_port: 22
+            node1_ifname: enp193s0f1np1
+            node2_ifname: enp193s0f1np1
+            rdma_devices: rocep105s0,rocep121s0,rocep137s0,rocep153s0,rocep233s0,rocep249s0,rocep25s0,rocep9s0
+            rdma_sl: 3
+            rdma_tc: 104
+            ct: podman
+          - platform: MI355X_AINIC
+            python: "3.12"
+            runner: [self-hosted, MI355X-AINIC]
+            base_image: rocm/pytorch:rocm7.2.1_ubuntu24.04_py3.12_pytorch_release_2.8.0
+            node1_host: 10.2.80.22
+            node2_host: 10.2.80.20
+            node2_port: 22
+            node1_ifname: enp193s0f1np1
+            node2_ifname: enp193s0f1np1
+            rdma_devices: rocep105s0,rocep121s0,rocep137s0,rocep153s0,rocep233s0,rocep249s0,rocep25s0,rocep9s0
+            rdma_sl: 3
+            rdma_tc: 104
+            ct: podman
+          - platform: MI300X_BNXT
+            python: "3.12"
+            runner: [self-hosted, MI300X-BNXT]
+            base_image: rocm/pytorch:rocm7.2.1_ubuntu24.04_py3.12_pytorch_release_2.8.0
+            node1_host: 10.245.128.61
+            node2_host: 10.245.128.59
+            node2_port: 22
+            node1_ifname: enp159s0np0
+            node2_ifname: enp159s0np0
+            rdma_devices: bnxt_re0,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re7,bnxt_re8,bnxt_re9
+            rdma_sl: 3
+            rdma_tc: 104
+            ct: docker
+    env:
+      CT: ${{ matrix.ct }}
+      IMAGE: rocm/mori:ci-py${{ matrix.python }}
+      SSH_OPTS: -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+      NODE1_HOST: ${{ matrix.node1_host }}
+      NODE2_HOST: ${{ matrix.node2_host }}
+      NODE2_PORT: ${{ matrix.node2_port }}
+      NODE1_IFNAME: ${{ matrix.node1_ifname }}
+      NODE2_IFNAME: ${{ matrix.node2_ifname }}
+      MORI_RDMA_DEVICES: ${{ matrix.rdma_devices }}
+      MORI_RDMA_SL: ${{ matrix.rdma_sl }}
+      MORI_RDMA_TC: ${{ matrix.rdma_tc }}
+      MORI_SOCKET_IFNAME: ${{ matrix.node1_ifname }}
+      WHEEL_URL: ${{ needs.deploy-staging.outputs.wheel_url }}
+      WHEEL_VERSION: ${{ needs.deploy-staging.outputs.version }}
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Build CI image
+        run: $CT build --network=host --build-arg BASE_IMAGE=${{ matrix.base_image }} -t $IMAGE -f docker/Dockerfile.dev .
+
+      - name: Start container on node1
+        run: |
+          $CT rm -f $CONTAINER 2>/dev/null || true
+          CONTAINER_RUNTIME=$CT ./docker/ci_run.sh --name $CONTAINER \
+            -e MORI_RDMA_DEVICES=$MORI_RDMA_DEVICES \
+            -e MORI_RDMA_SL=$MORI_RDMA_SL \
+            -e MORI_RDMA_TC=$MORI_RDMA_TC \
+            -e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME \
+            -e GLOO_SOCKET_IFNAME=$NODE1_IFNAME \
+            -e NCCL_SOCKET_IFNAME=$NODE1_IFNAME \
+            -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
+            -w $GITHUB_WORKSPACE \
+            $IMAGE sleep infinity
+          $CT exec $CONTAINER \
+            git config --global --add safe.directory $GITHUB_WORKSPACE
+
+      - name: Start container on node2
+        run: |
+          ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "
+            $CT rm -f $CONTAINER 2>/dev/null || true
+            mkdir -p $GITHUB_WORKSPACE
+          "
+          rsync -az --exclude='.git' \
+            -e "ssh $SSH_OPTS -p $NODE2_PORT" \
+            $GITHUB_WORKSPACE/ \
+            $(whoami)@$NODE2_HOST:$GITHUB_WORKSPACE/
+          ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "
+            cd $GITHUB_WORKSPACE &&
+            $CT build --network=host --build-arg BASE_IMAGE=${{ matrix.base_image }} -t $IMAGE -f docker/Dockerfile.dev . &&
+            CONTAINER_RUNTIME=$CT ./docker/ci_run.sh --name $CONTAINER \
+              -e MORI_RDMA_DEVICES=$MORI_RDMA_DEVICES \
+              -e MORI_RDMA_SL=$MORI_RDMA_SL \
+              -e MORI_RDMA_TC=$MORI_RDMA_TC \
+              -e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME \
+              -e GLOO_SOCKET_IFNAME=$NODE2_IFNAME \
+              -e NCCL_SOCKET_IFNAME=$NODE2_IFNAME \
+              -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
+              -w $GITHUB_WORKSPACE \
+              $IMAGE sleep infinity &&
+            $CT exec $CONTAINER \
+              git config --global --add safe.directory $GITHUB_WORKSPACE
+          "
+
+      - name: Install wheel (node1)
+        run: |
+          $CT exec $CONTAINER bash -c "
+            for i in \$(seq 1 15); do
+              pip install --no-index --find-links $WHEEL_URL amd_mori==$WHEEL_VERSION && break
+              echo \"Retry \$i/15: waiting for gh-pages to propagate...\"
+              sleep 15
+            done
+            pip install prettytable
+          "
+
+      - name: Install wheel (node2)
+        run: |
+          ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST \
+            "$CT exec $CONTAINER bash -c '
+              for i in \$(seq 1 15); do
+              pip install --no-index --find-links $WHEEL_URL amd_mori==$WHEEL_VERSION && break
+              echo \"Retry \$i/15: waiting for gh-pages...\"
+                sleep 15
+              done
+              pip install prettytable
+            '"
+
+      - name: MORI-IO internode write sweep
+        run: |
+          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_io_benchmark.sh"
+          PORT=29120
+          echo "=== MORI-IO internode benchmark: wide-write-sweep port=$PORT ==="
+          NODE2_CMD=(
+            $CT exec $CONTAINER bash $SCRIPT
+            --rank 1 --master-addr $NODE1_HOST --master-port $PORT
+            --ifname $NODE2_IFNAME
+            -- --op-type write --transfer-batch-size 128 --all
+            --sweep-start-size 1024 --sweep-max-size 16777216 --iters 4
+            --enable-sess --enable-batch-transfer
+            --num-qp-per-transfer 2 --num-worker-threads 2
+            --num-initiator-dev 8 --num-target-dev 8
+          )
+          ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
+          $CT exec $CONTAINER bash $SCRIPT \
+            --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+            --ifname $NODE1_IFNAME \
+            -- --op-type write --transfer-batch-size 128 --all \
+            --sweep-start-size 1024 --sweep-max-size 16777216 --iters 4 \
+            --enable-sess --enable-batch-transfer \
+            --num-qp-per-transfer 2 --num-worker-threads 2 \
+            --num-initiator-dev 8 --num-target-dev 8
+          wait
+
+      - name: MORI-IO internode read
+        run: |
+          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_io_benchmark.sh"
+          PORT=29121
+          echo "=== MORI-IO internode benchmark: batch-session-read port=$PORT ==="
+          NODE2_CMD=(
+            $CT exec $CONTAINER bash $SCRIPT
+            --rank 1 --master-addr $NODE1_HOST --master-port $PORT
+            --ifname $NODE2_IFNAME
+            -- --op-type read --buffer-size 4096 --transfer-batch-size 128 --iters 8
+            --enable-batch-transfer --enable-sess --poll_cq_mode event
+            --num-qp-per-transfer 2 --num-worker-threads 2
+            --num-initiator-dev 8 --num-target-dev 8
+          )
+          ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
+          $CT exec $CONTAINER bash $SCRIPT \
+            --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+            --ifname $NODE1_IFNAME \
+            -- --op-type read --buffer-size 4096 --transfer-batch-size 128 --iters 8 \
+            --enable-batch-transfer --enable-sess --poll_cq_mode event \
+            --num-qp-per-transfer 2 --num-worker-threads 2 \
+            --num-initiator-dev 8 --num-target-dev 8
+          wait
+
+      - name: MORI-EP internode normal kernel bench
+        run: |
+          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
+          PORT=29140
+          for KERNEL in v1 v1_ll; do
+            for TOKENS in 64 128 1024 2048 4096; do
+              echo "=== bench kernel=$KERNEL max-tokens=$TOKENS port=$PORT ==="
+              NODE2_CMD=(
+                $CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT
+                --rank 1 --master-addr $NODE1_HOST --master-port $PORT
+                --ifname $NODE2_IFNAME
+                --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS
+              )
+              ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
+              $CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT \
+                --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+                --ifname $NODE1_IFNAME \
+                --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS
+              wait
+              sleep 1
+              PORT=$((PORT + 1))
+            done
+          done
+
+      - name: MORI-EP internode normal kernel stress
+        run: |
+          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
+          PORT=29160
+          for KERNEL in v1 v1_ll; do
+            for TOKENS in 64 128 1024 2048 4096; do
+              echo "=== stress kernel=$KERNEL max-tokens=$TOKENS port=$PORT ==="
+              NODE2_CMD=(
+                $CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT
+                --rank 1 --master-addr $NODE1_HOST --master-port $PORT
+                --ifname $NODE2_IFNAME
+                --cmd stress --kernel-type $KERNEL --max-tokens $TOKENS
+              )
+              ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
+              $CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT \
+                --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+                --ifname $NODE1_IFNAME \
+                --cmd stress --kernel-type $KERNEL --max-tokens $TOKENS
+              wait
+              sleep 1
+              PORT=$((PORT + 1))
+            done
+          done
+
+      - name: MORI-EP internode async kernel test
+        run: |
+          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
+          PORT=29180
+          for TOKENS in 64 128; do
+            echo "=== async_ll test max-tokens=$TOKENS port=$PORT ==="
+            NODE2_CMD=(
+              $CT exec
+              -e GPU_PER_NODE=8 -e MORI_ENABLE_SDMA=1 -e MORI_INTERNODE_TIMEOUT=600
+              $CONTAINER bash $SCRIPT
+              --rank 1 --master-addr $NODE1_HOST --master-port $PORT
+              --ifname $NODE2_IFNAME
+              --cmd test --kernel-type async_ll
+              --quant-type none --dtype bf16 --max-tokens $TOKENS
+            )
+            ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
+            $CT exec \
+              -e GPU_PER_NODE=8 \
+              -e MORI_ENABLE_SDMA=1 \
+              -e MORI_INTERNODE_TIMEOUT=600 \
+              $CONTAINER bash $SCRIPT \
+              --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+              --ifname $NODE1_IFNAME \
+              --cmd test --kernel-type async_ll \
+              --quant-type none --dtype bf16 --max-tokens $TOKENS
+            wait
+            sleep 1
+            PORT=$((PORT + 1))
+          done
+
+      - name: Cleanup node1
+        if: always()
+        run: |
+          $CT rm -f $CONTAINER || true
+          if $CT image inspect $IMAGE &>/dev/null; then
+            $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE $IMAGE \
+                chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
+          fi
+
+      - name: Cleanup node2
+        if: always()
+        run: |
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -p $NODE2_PORT $(whoami)@$NODE2_HOST \
+            "$CT rm -f $CONTAINER || true"
+
+  # ── Stage 4: Promote to latest/ after all tests pass ───────────────────────
+  promote-latest:
+    name: promote to latest
+    needs: [deploy-staging, test-wheel, test-wheel-internode]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          merge-multiple: true
+          path: ./wheels
+
+      - name: Checkout gh-pages
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: gh-pages
+
+      - name: Update latest/
+        run: |
+          rm -rf gh-pages/nightly/latest
+          mkdir -p gh-pages/nightly/latest
+          cp ./wheels/*.whl gh-pages/nightly/latest/
+
+          cd gh-pages/nightly/latest
+          echo '<!DOCTYPE html><html><body>' > index.html
+          for f in *.whl; do
+            [ -f "$f" ] && echo "<a href=\"$f\">$f</a><br>" >> index.html
+          done
+          echo '</body></html>' >> index.html
+          cd -
+
+          echo "=== latest/ updated ==="
+          ls -lh gh-pages/nightly/latest/
+
+      - name: Regenerate index.html
+        run: |
+          cd gh-pages/nightly
+          cat > index.html << 'HEADER'
+          <!DOCTYPE html>
+          <html><head>
+          <meta charset="utf-8">
+          <title>MoRI Nightly Wheels</title>
+          <style>
+            body { font-family: -apple-system, sans-serif; max-width: 960px; margin: 2em auto; padding: 0 1em; }
+            h1 { border-bottom: 1px solid #ddd; padding-bottom: 0.3em; }
+            table { border-collapse: collapse; width: 100%; }
+            th, td { text-align: left; padding: 6px 12px; border-bottom: 1px solid #eee; }
+            th { background: #f6f8fa; }
+            a { color: #0366d6; text-decoration: none; }
+            a:hover { text-decoration: underline; }
+            code { background: #f0f0f0; padding: 2px 6px; border-radius: 3px; font-size: 0.9em; }
+            .install { background: #f6f8fa; padding: 1em; border-radius: 6px; margin: 1em 0; }
+            h2.date { margin-top: 1.5em; color: #24292e; font-size: 1.1em; }
+          </style>
+          </head><body>
+          <h1>MoRI Nightly Wheels</h1>
+          <div class="install">
+          <strong>Install latest nightly:</strong><br>
+          <code>pip install --no-index --force-reinstall --find-links https://rocm.github.io/mori/nightly/latest/ amd_mori</code>
+          </div>
+          HEADER
+
+          if [ -d "latest" ] && ls latest/amd_mori-*.whl &>/dev/null; then
+            echo "<h2><a href=\"latest/\">Latest</a> (tested)</h2>" >> index.html
+            echo "<table>" >> index.html
+            echo "<tr><th>Commit</th><th>Version</th><th>Python</th><th>Wheel</th><th>Size</th></tr>" >> index.html
+            for f in $(ls -r latest/amd_mori-*.whl 2>/dev/null); do
+              BASENAME=$(basename "$f")
+              SIZE=$(du -h "$f" | cut -f1)
+              VER=$(echo "$BASENAME" | sed 's/amd_mori-\(.*\)-cp[0-9]*-cp.*/\1/')
+              COMMIT=$(echo "$VER" | sed -n 's/.*+\(.*\)/\1/p')
+              PYTAG=$(echo "$BASENAME" | sed 's/.*-\(cp[0-9]*\)-cp[0-9]*-.*/\1/')
+              echo "<tr><td><code>${COMMIT}</code></td><td>${VER}</td><td>${PYTAG}</td><td><a href=\"latest/${BASENAME}\">${BASENAME}</a></td><td>${SIZE}</td></tr>" >> index.html
+            done
+            echo "</table>" >> index.html
+          fi
+
+          echo "<hr>" >> index.html
+          echo "<h2>All builds</h2>" >> index.html
+
+          for d in $(ls -rd 20??-??-?? 2>/dev/null); do
+            [ -d "$d" ] || continue
+            echo "<h2 class=\"date\"><a href=\"$d/\">$d</a></h2>" >> index.html
+            echo "<table>" >> index.html
+            echo "<tr><th>Commit</th><th>Version</th><th>Python</th><th>Wheel</th><th>Size</th></tr>" >> index.html
+            for f in $(ls -r "$d"/amd_mori-*.whl 2>/dev/null); do
+              BASENAME=$(basename "$f")
+              SIZE=$(du -h "$f" | cut -f1)
+              VER=$(echo "$BASENAME" | sed 's/amd_mori-\(.*\)-cp[0-9]*-cp.*/\1/')
+              COMMIT=$(echo "$VER" | sed -n 's/.*+\(.*\)/\1/p')
+              PYTAG=$(echo "$BASENAME" | sed 's/.*-\(cp[0-9]*\)-cp[0-9]*-.*/\1/')
+              echo "<tr><td><code>${COMMIT}</code></td><td>${VER}</td><td>${PYTAG}</td><td><a href=\"${d}/${BASENAME}\">${BASENAME}</a></td><td>${SIZE}</td></tr>" >> index.html
+            done
+            echo "</table>" >> index.html
+          done
+
+          cat >> index.html << 'FOOTER'
+          <p style="color:#888; margin-top:2em; font-size:0.85em">
+          Auto-generated by <a href="https://github.com/ROCm/mori/actions/workflows/nightly.yml">nightly.yml</a>.
+          Wheels older than 30 days are automatically pruned. Only wheels that pass full test suite are published.
+          </p>
+          </body></html>
+          FOOTER
+
+      - name: Push to gh-pages
+        run: |
+          cd gh-pages
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add nightly/
+          git diff --cached --quiet && echo "No changes" && exit 0
+          git commit -m "nightly: promote tested wheels to latest $(date +%Y-%m-%d)"
+          git push
+
+  # ── Stage 5: Test PyPI wheel (install + import verification) ───────────────
+  test-pypi-wheel:
+    name: test pypi wheel (py${{ matrix.python }})
+    needs: [promote-latest]
+    if: github.event_name != 'pull_request'
+    runs-on: [self-hosted, MI355X-AINIC-TW]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python: "3.10"
+            base_image: rocm/pytorch:rocm7.2.1_ubuntu22.04_py3.10_pytorch_release_2.8.0
+          - python: "3.12"
+            base_image: rocm/pytorch:rocm7.2.1_ubuntu24.04_py3.12_pytorch_release_2.8.0
+    env:
+      IMAGE: rocm/mori:ci-py${{ matrix.python }}
+    steps:
+      - name: Download PyPI wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: pypi-wheel-cp${{ matrix.python }}
+          path: ${{ runner.temp }}/pypi-wheel
+
+      - name: Build CI image
+        run: $CT build --network=host --build-arg BASE_IMAGE=${{ matrix.base_image }} -t $IMAGE -f docker/Dockerfile.dev .
+
+      - name: Test PyPI wheel
+        run: |
+          $CT run --rm --network=host \
+            --device=/dev/kfd --device=/dev/dri \
+            -v ${{ runner.temp }}/pypi-wheel:/tmp/wheel:ro \
+            $IMAGE bash -c "
+              pip install /tmp/wheel/*.whl
+              python3 -c 'import mori; print(\"amd-mori-nightly \" + mori.__version__ + \" OK\")'
+              python3 -c 'from mori import ops; print(\"mori.ops OK\")'
+            "
+
+  # ── Stage 6: Publish to PyPI ───────────────────────────────────────────────
+  publish-pypi:
+    name: publish to PyPI
+    needs: [test-pypi-wheel]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download PyPI wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: pypi-wheel-*
+          merge-multiple: true
+          path: ./dist
+
+      - name: List wheels
+        run: ls -lh ./dist/
+
+      - name: Upload to PyPI
+        run: |
+          pip install twine "packaging>=24.2"
+          python3 -m twine upload --skip-existing ./dist/*.whl
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}

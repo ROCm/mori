@@ -26,14 +26,18 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <array>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <unordered_map>
 
+#include "mori/application/utils/check.hpp"
 #include "mori/ops/dispatch_combine/launch.hpp"
 #include "mori/ops/ops.hpp"
 #include "mori/shmem/internal.hpp"
 #include "mori/utils/hip_helper.hpp"
+#include "mori/utils/limits.hpp"
 #include "src/pybind/mori.hpp"
 #include "xla/ffi/api/c_api.h"
 #include "xla/ffi/api/ffi.h"
@@ -53,7 +57,7 @@ using mori::moe::KernelType;
 /* ---------------------------------------------------------------------------------------------- */
 namespace {
 
-// Global cache: maps packed ep_config → shared handle.
+// Cache: maps packed ep_config → shared handle.
 // All call sites with identical ep_config reuse the same EpDispatchCombineHandle.
 struct VecI32Hash {
   size_t operator()(const std::vector<int32_t>& v) const noexcept {
@@ -66,10 +70,57 @@ struct VecI32Hash {
   }
 };
 
-static std::mutex g_handle_cache_mu;
-static std::unordered_map<std::vector<int32_t>, std::unique_ptr<EpDispatchCombineHandle>,
-                          VecI32Hash>
-    g_handle_cache;
+using HandleCacheMap =
+    std::unordered_map<std::vector<int32_t>, std::unique_ptr<EpDispatchCombineHandle>, VecI32Hash>;
+
+struct HandleCacheSlot {
+  std::mutex mu;
+  HandleCacheMap map;
+};
+
+#ifdef MORI_MULTITHREAD_SUPPORT
+// SPMT: per-GPU cache slot. Each thread is bound to its own device, so each
+// gets its own (mu, map). This avoids a deadlock that would occur if a single
+// process-global mutex were held while calling the cross-PE Barrier() below —
+// thread A would hold the mutex during Barrier(), thread B would block on the
+// mutex and never reach its own Barrier(). In multi-process mode every process
+// sees its single GPU as device 0, so this collapses to slot[0].
+static std::array<HandleCacheSlot, mori::kMaxGpusPerNode> g_handle_cache_slots;
+
+static HandleCacheSlot& GetHandleCacheSlot() {
+  int id = -1;
+  HIP_RUNTIME_CHECK(hipGetDevice(&id));
+  if (id < 0 || id >= mori::kMaxGpusPerNode) {
+    throw std::runtime_error("EpHandleCache: hipGetDevice() out of range: " + std::to_string(id));
+  }
+  return g_handle_cache_slots[static_cast<size_t>(id)];
+}
+
+// RAII helper: temporarily switch the calling thread to `target` and restore
+// the previous device on scope exit. Used in XLA FFI handlers so that
+// hipSetDevice does not leak out into XLA's worker-thread state.
+class ScopedDevice {
+ public:
+  explicit ScopedDevice(int target) : saved_(-1), restore_(false) {
+    if (target < 0) return;
+    if (hipGetDevice(&saved_) != hipSuccess) return;
+    if (saved_ == target) return;  // nothing to do
+    if (hipSetDevice(target) == hipSuccess) restore_ = true;
+  }
+  ~ScopedDevice() {
+    if (restore_) (void)hipSetDevice(saved_);
+  }
+  ScopedDevice(const ScopedDevice&) = delete;
+  ScopedDevice& operator=(const ScopedDevice&) = delete;
+
+ private:
+  int saved_;
+  bool restore_;
+};
+#else
+static HandleCacheSlot g_handle_cache_singleton;
+static HandleCacheSlot& GetHandleCacheSlot() { return g_handle_cache_singleton; }
+#endif
 
 struct EpDispatchCombineState {
   static TypeId id;
@@ -280,14 +331,27 @@ ErrorOr<std::unique_ptr<EpDispatchCombineState>> EpDispatchCombineInstantiate(
   // ep_config share a single EpDispatchCombineHandle.
   std::vector<int32_t> key(ep_config->begin(), ep_config->end());
 
-  std::lock_guard<std::mutex> lock(g_handle_cache_mu);
-  auto& entry = g_handle_cache[key];
+  // Decode once; reused below for both rank-based device routing (SPMT) and
+  // (on cache miss) handle construction.
+  auto cfg = EpDispatchCombineConfig::FromPackedI32Array(key.data(), key.size());
+
+#ifdef MORI_MULTITHREAD_SUPPORT
+  // SPMT: XLA FFI handlers run on framework worker threads where
+  // hipGetDevice() does NOT match the rank's device. Look up the device
+  // recorded at ShmemInit time and bind it on this thread (RAII-restored on
+  // exit so XLA's other state isn't disturbed) before any HIP call. This
+  // ensures GetHandleCacheSlot() and ShmemStatesSingleton::GetInstance()
+  // (both keyed by hipGetDevice()) hit the right slot.
+  ScopedDevice _dev_guard(mori::shmem::ShmemStatesSingleton::GetDeviceByRank(cfg.rank));
+#endif
+
+  auto& slot = GetHandleCacheSlot();
+  std::lock_guard<std::mutex> lock(slot.mu);
+  auto& entry = slot.map[key];
   if (!entry) {
     auto* states = mori::shmem::ShmemStatesSingleton::GetInstance();
     states->CheckStatusValid();
     states->bootStates->bootNet->Barrier();
-
-    auto cfg = EpDispatchCombineConfig::FromPackedI32Array(key.data(), key.size());
     // XPUT("EpDispatchCombineInstantiate: creating new handle for rank %d "
     //      "(#attrs: %zu)", cfg.rank, attrs.size());
     entry = std::make_unique<EpDispatchCombineHandle>(cfg);
@@ -305,6 +369,11 @@ Error EpDispatchCombineImpl(hipStream_t stream, EpDispatchCombineState* state, D
   auto& h = *state->handle;
   // XPUT("EpDispatchCombineImpl stream=%p rank=%d  attrs: %zu",
   //     stream, h.config.rank, attrs.size());
+#ifdef MORI_MULTITHREAD_SUPPORT
+  // SPMT: bind this thread to the rank's device for the duration of this
+  // FFI call (RAII-restored). See EpDispatchCombineInstantiate for rationale.
+  ScopedDevice _dev_guard(mori::shmem::ShmemStatesSingleton::GetDeviceByRank(h.config.rank));
+#endif
   if (attrs.contains("dispatch_op")) {
     return MoriDispatchImpl(stream, &h, attrs, args, rets);
   }
@@ -362,8 +431,14 @@ void RegisterXLAFFIOps(py::module_& m) {
   });
   m.def("preload_kernels", []() { mori::moe::KernelRegistry::Instance().AutoLoad(); });
   m.def("clear_ep_handle_cache", []() {
-    std::lock_guard<std::mutex> lock(g_handle_cache_mu);
-    g_handle_cache.clear();
+    // Clear only the calling thread's slot. Under SPMT, each thread is
+    // bound to its own GPU and owns one slot; clearing all slots from one
+    // thread would invoke ~EpDispatchCombineHandle on OTHER GPUs' handles
+    // while the calling thread's hipDevice is still set to its own GPU,
+    // and ShmemFree would then look up addresses in the wrong VA manager.
+    auto& slot = GetHandleCacheSlot();
+    std::lock_guard<std::mutex> lock(slot.mu);
+    slot.map.clear();
   });
 }
 

@@ -31,6 +31,7 @@
 
 // Include necessary headers
 #include "mori/application/application.hpp"
+#include "mori/collective/ccl_kernel_args.hpp"
 #include "mori/collective/collective_pub.hpp"
 #include "mori/collective/core/wall_time.hpp"
 #include "mori/shmem/shmem.hpp"
@@ -72,6 +73,9 @@ class All2allSdma {
   // Copy mode flag: if true, copy output_transit_buffer to user output buffer
   // if false, user should directly use output_transit_buffer
   bool copy_output_to_user_;
+
+  // Not reentrant: previous launch must complete before next prepare_*.
+  CclAll2allArgs<T> jit_args_;
 
   // Disable copy constructor and assignment operator
   All2allSdma(const All2allSdma&) = delete;
@@ -143,6 +147,18 @@ class All2allSdma {
    */
   void cancel_async();
   // =======================================================
+
+  // JIT launch support: prepare args struct and return pointer.
+  // Python calls prepare_*, then launches the kernel via JIT, then calls finish_*.
+
+  int64_t prepare_sync(T* input, T* output, size_t total_count, hipStream_t stream);
+  double finish_sync(T* output, size_t total_count, hipStream_t stream);
+
+  int64_t prepare_async_start(T* input, T* output, size_t total_count, hipStream_t stream);
+  void after_async_start();
+
+  int64_t prepare_async_wait(hipStream_t stream);
+  double finish_async_wait(hipStream_t stream);
 
   /**
    * @brief Executes synchronous All2All SDMA operation

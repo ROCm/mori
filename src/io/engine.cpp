@@ -25,7 +25,11 @@
 #include <unistd.h>
 
 #include <cctype>
+#include <chrono>
 #include <cstdlib>
+#include <limits>
+#include <stdexcept>
+#include <string>
 #include <utility>
 
 #include "mori/io/env.hpp"
@@ -73,6 +77,11 @@ std::string QueryDeviceBusId(int deviceId) {
     c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
   }
   return result;
+}
+
+bool IsAutoXgmiEnabled() {
+  const char* v = std::getenv("MORI_DISABLE_AUTO_XGMI");
+  return v != nullptr && v[0] == '0';
 }
 
 }  // namespace
@@ -163,6 +172,42 @@ void IOEngine::CreateBackend(BackendType type, const BackendConfig& beConfig) {
   }
 
   if (type == BackendType::RDMA) {
+    if (!RdmaBackend::HasActiveDevices()) {
+      if (!IsAutoXgmiEnabled()) {
+        throw std::runtime_error(
+            "no active RDMA device on this host; "
+            "set MORI_DISABLE_AUTO_XGMI=0 to enable XGMI-only fallback");
+      }
+
+      if (!SupportsXgmiBackendByP2P()) {
+        throw std::runtime_error(
+            "no active RDMA device and no usable GPU P2P; cannot create any backend");
+      }
+
+      desc.port = internal::kXgmiOnlyFallbackPlaceholderPort;
+      this->config.port = internal::kXgmiOnlyFallbackPlaceholderPort;
+
+      if (backends.find(BackendType::XGMI) != backends.end()) {
+        InvalidateRouteCache();
+        return;
+      }
+
+      MORI_IO_WARN("No active RDMA device; falling back to XGMI-only mode (port={})",
+                   internal::kXgmiOnlyFallbackPlaceholderPort);
+
+      XgmiBackendConfig xgmiConfig{};
+      auto backend = std::make_unique<XgmiBackend>(desc.key, config, xgmiConfig);
+      backends.insert({BackendType::XGMI, std::move(backend)});
+      InvalidateRouteCache();
+      return;
+    }
+
+    if (config.port == internal::kXgmiOnlyFallbackPlaceholderPort) {
+      throw std::runtime_error(
+          "IOEngineConfig.port=" + std::to_string(internal::kXgmiOnlyFallbackPlaceholderPort) +
+          " is reserved as XGMI-only fallback sentinel");
+    }
+
     auto backend = std::make_unique<RdmaBackend>(desc.key, config,
                                                  static_cast<const RdmaBackendConfig&>(beConfig));
 
@@ -174,6 +219,10 @@ void IOEngine::CreateBackend(BackendType type, const BackendConfig& beConfig) {
         assert(false && "Failed to retrieve bound port after RDMA backend init");
       } else {
         uint16_t bound_port = bound_port_opt.value();
+        if (bound_port == internal::kXgmiOnlyFallbackPlaceholderPort) {
+          throw std::runtime_error("RDMA control-plane bound to sentinel port " +
+                                   std::to_string(bound_port));
+        }
         desc.port = bound_port;
         this->config.port = bound_port;
         MORI_IO_INFO("IOEngine key {} bound ephemeral port {}", desc.key, bound_port);
@@ -234,9 +283,8 @@ bool IOEngine::SupportsXgmiBackendByP2P() const {
 }
 
 void IOEngine::EnsureXgmiBackendCreatedIfSupported() {
-  const char* disableAutoXgmi = std::getenv("MORI_DISABLE_AUTO_XGMI");
-  // Default: do not auto-create XGMI. Set MORI_DISABLE_AUTO_XGMI=0 to enable.
-  if (disableAutoXgmi == nullptr || disableAutoXgmi[0] != '0') {
+  if (!IsAutoXgmiEnabled()) {
+    const char* disableAutoXgmi = std::getenv("MORI_DISABLE_AUTO_XGMI");
     if (disableAutoXgmi != nullptr && disableAutoXgmi[0] != '\0' && disableAutoXgmi[0] != '0') {
       MORI_IO_INFO("Auto XGMI creation is disabled by MORI_DISABLE_AUTO_XGMI");
     }
@@ -333,11 +381,8 @@ Backend* IOEngine::SelectBackend(const MemoryDesc& local, const MemoryDesc& remo
 
   if (auto cachedType = QueryRouteCache(routeKey); cachedType.has_value()) {
     auto cachedBackend = backends.find(cachedType.value());
-    if (cachedBackend != backends.end()) {
-      if (cachedType.value() != BackendType::XGMI ||
-          cachedBackend->second->CanHandle(local, remote)) {
-        return cachedBackend->second.get();
-      }
+    if (cachedBackend != backends.end() && cachedBackend->second->CanHandle(local, remote)) {
+      return cachedBackend->second.get();
     }
   }
 
@@ -350,14 +395,13 @@ Backend* IOEngine::SelectBackend(const MemoryDesc& local, const MemoryDesc& remo
   }
 
   auto rdmaIt = backends.find(BackendType::RDMA);
-  if (rdmaIt != backends.end()) {
+  if (rdmaIt != backends.end() && rdmaIt->second->CanHandle(local, remote)) {
     UpdateRouteCache(routeKey, BackendType::RDMA);
     return rdmaIt->second.get();
   }
 
-  BackendType fallbackType = backends.begin()->first;
-  UpdateRouteCache(routeKey, fallbackType);
-  return backends.begin()->second.get();
+  // No backend can handle this pair (e.g. cross-node under XGMI-only fallback).
+  return nullptr;
 }
 
 void IOEngine::InvalidateRouteCache() {
@@ -512,6 +556,61 @@ bool IOEngine::PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
     if (popped) return true;
   }
   return false;
+}
+
+StatusCode IOEngine::WaitAll(const std::vector<TransferStatus*>& statuses, int timeoutMs) {
+  if (statuses.empty()) return StatusCode::SUCCESS;
+
+  if (timeoutMs == 0) {
+    bool anyInProgress = false;
+    for (TransferStatus* status : statuses) {
+      if (status == nullptr) continue;
+      StatusCode rc = status->WaitFor(0);
+      if (rc == StatusCode::IN_PROGRESS) {
+        anyInProgress = true;
+        continue;
+      }
+      if (rc != StatusCode::SUCCESS) return rc;
+    }
+    return anyInProgress ? StatusCode::IN_PROGRESS : StatusCode::SUCCESS;
+  }
+
+  if (timeoutMs < 0) {
+    StatusCode firstError = StatusCode::SUCCESS;
+    for (TransferStatus* status : statuses) {
+      if (status == nullptr) continue;
+      StatusCode rc = status->WaitFor(-1);
+      if (rc != StatusCode::SUCCESS && firstError == StatusCode::SUCCESS) {
+        firstError = rc;
+      }
+    }
+    return firstError;
+  }
+
+  using Clock = std::chrono::steady_clock;
+  const auto deadline = Clock::now() + std::chrono::milliseconds(timeoutMs);
+  StatusCode firstError = StatusCode::SUCCESS;
+  for (TransferStatus* status : statuses) {
+    if (status == nullptr) continue;
+
+    const auto now = Clock::now();
+    if (now >= deadline) {
+      return firstError != StatusCode::SUCCESS ? firstError : StatusCode::IN_PROGRESS;
+    }
+
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+    const int remainingMs = remaining.count() > std::numeric_limits<int>::max()
+                                ? std::numeric_limits<int>::max()
+                                : static_cast<int>(remaining.count());
+    StatusCode rc = status->WaitFor(remainingMs);
+    if (rc == StatusCode::IN_PROGRESS) {
+      return firstError != StatusCode::SUCCESS ? firstError : StatusCode::IN_PROGRESS;
+    }
+    if (rc != StatusCode::SUCCESS && firstError == StatusCode::SUCCESS) {
+      firstError = rc;
+    }
+  }
+  return firstError;
 }
 
 }  // namespace io

@@ -102,8 +102,16 @@ class AnvilLib {
 
   int getSdmaEngineId(int srcDeviceId, int dstDeviceId);
 
+  struct PairHash {
+    std::size_t operator()(const std::pair<int, int>& p) const {
+      return std::hash<int>()(p.first) ^ (std::hash<int>()(p.second) << 16);
+    }
+  };
+
   std::once_flag init_flag;
-  std::unordered_map<int, std::vector<std::unique_ptr<SdmaQueue>>> sdma_channels_;
+  std::mutex channels_mutex_;
+  std::unordered_map<std::pair<int, int>, std::vector<std::unique_ptr<SdmaQueue>>, PairHash>
+      sdma_channels_;
 };
 
 extern AnvilLib& anvil;

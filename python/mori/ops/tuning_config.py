@@ -79,7 +79,7 @@ _KERNEL_TYPE_NAMES = frozenset(
     {"IntraNode", "InterNode", "InterNodeV1", "InterNodeV1LL", "AsyncLL"}
 )
 
-_QUANT_TYPE_CONFIG_STRS = {"none", "fp8_direct_cast"}
+_QUANT_TYPE_CONFIG_STRS = {"none", "fp8_direct_cast", "fp8_blockwise"}
 
 
 def kernel_type_to_config_str(kernel_type) -> str:
@@ -94,7 +94,7 @@ def kernel_type_to_config_str(kernel_type) -> str:
 
 
 def quant_type_to_config_str(quant_type) -> str:
-    """Normalize quant_type (str or enum) to 'none' or 'fp8_direct_cast'."""
+    """Normalize quant_type (str or enum) to a combine quant config string."""
     if isinstance(quant_type, str):
         s = quant_type.strip().lower()
         if s in _QUANT_TYPE_CONFIG_STRS:
@@ -107,6 +107,8 @@ def quant_type_to_config_str(quant_type) -> str:
             return "none"
         if name == "Fp8DirectCast":
             return "fp8_direct_cast"
+        if name == "Fp8BlockwiseQuant":
+            return "fp8_blockwise"
     raise ValueError(f"Unknown quant_type: {quant_type!r}")
 
 

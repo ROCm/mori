@@ -99,7 +99,9 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def("Failed", &mori::io::TransferStatus::Failed)
       .def("SetCode", &mori::io::TransferStatus::SetCode)
       .def("SetMessage", &mori::io::TransferStatus::SetMessage)
-      .def("Wait", &mori::io ::TransferStatus::Wait);
+      .def("Wait", &mori::io::TransferStatus::Wait, py::call_guard<py::gil_scoped_release>())
+      .def("WaitFor", &mori::io::TransferStatus::WaitFor, py::arg("timeout_ms") = -1,
+           py::call_guard<py::gil_scoped_release>());
 
   py::class_<mori::io::EngineDesc>(m, "EngineDesc")
       .def_readonly("key", &mori::io::EngineDesc::key)
@@ -180,6 +182,8 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def("BatchWrite", &mori::io::IOEngine::BatchWrite, py::call_guard<py::gil_scoped_release>())
       .def("CreateSession", &mori::io::IOEngine::CreateSession)
       .def("PopInboundTransferStatus", &mori::io::IOEngine::PopInboundTransferStatus,
+           py::call_guard<py::gil_scoped_release>())
+      .def("WaitAll", &mori::io::IOEngine::WaitAll, py::arg("statuses"), py::arg("timeout_ms") = -1,
            py::call_guard<py::gil_scoped_release>())
       .def("LoadScatterGatherModule", &mori::io::IOEngine::LoadScatterGatherModule);
 }

@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <limits>
+#include <memory>
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
@@ -147,7 +148,9 @@ RdmaManager::RdmaManager(const RdmaBackendConfig cfg, application::RdmaContext* 
     : config(cfg), ctx(ctx) {
   application::RdmaDeviceList devices = ctx->GetRdmaDeviceList();
   availDevices = GetActiveDevicePortList(devices);
-  assert(availDevices.size() > 0);
+  if (availDevices.empty()) {
+    throw std::runtime_error("RdmaManager: no active RDMA device/port found");
+  }
 
   deviceCtxs.resize(availDevices.size(), nullptr);
   topo.reset(new application::TopoSystem());
@@ -780,6 +783,13 @@ void ControlPlaneServer::DeregisterRemoteEngine(const EngineDesc& rdesc) {
   engines.erase(rdesc.key);
 }
 
+std::optional<int> ControlPlaneServer::TryGetRemoteEnginePort(const EngineKey& ekey) const {
+  std::lock_guard<std::mutex> lock(mu);
+  auto it = engines.find(ekey);
+  if (it == engines.end()) return std::nullopt;
+  return it->second.port;
+}
+
 void ControlPlaneServer::BuildRdmaConn(EngineKey ekey, TopoKeyPair topo) {
   application::TCPEndpointHandle tcph;
   {
@@ -1026,6 +1036,11 @@ bool RdmaBackendSession::Alive() const { return true; }
 /* ----------------------------------------------------------------------------------------------
  */
 
+bool RdmaBackend::HasActiveDevices() {
+  application::RdmaContext ctx(application::RdmaBackendType::IBVerbs);
+  return !GetActiveDevicePortList(ctx.GetRdmaDeviceList()).empty();
+}
+
 RdmaBackend::RdmaBackend(EngineKey k, const IOEngineConfig& engConfig,
                          const RdmaBackendConfig& beConfig)
     : myEngKey(k), config(beConfig) {
@@ -1033,9 +1048,9 @@ RdmaBackend::RdmaBackend(EngineKey k, const IOEngineConfig& engConfig,
                 mori::env::detail::ParseBool);
   ValidateRdmaNotificationConfig(config);
 
-  application::RdmaContext* ctx =
-      new application::RdmaContext(application::RdmaBackendType::IBVerbs);
-  rdma.reset(new mori::io::RdmaManager(config, ctx));
+  auto rdmaCtx = std::make_unique<application::RdmaContext>(application::RdmaBackendType::IBVerbs);
+  rdma.reset(new mori::io::RdmaManager(config, rdmaCtx.get()));
+  (void)rdmaCtx.release();
 
   notif.reset(new NotifManager(rdma.get(), config));
   notif->Start();
@@ -1076,6 +1091,12 @@ void RdmaBackend::RegisterMemory(MemoryDesc& desc) { server->RegisterMemory(desc
 void RdmaBackend::DeregisterMemory(const MemoryDesc& desc) {
   server->DeregisterMemory(desc);
   InvalidateSessionsForMemory(desc.id);
+}
+
+bool RdmaBackend::CanHandle(const MemoryDesc& local, const MemoryDesc& remote) const {
+  (void)local;
+  auto rport = server->TryGetRemoteEnginePort(remote.engineKey);
+  return rport.has_value() && rport.value() != internal::kXgmiOnlyFallbackPlaceholderPort;
 }
 
 void RdmaBackend::ReadWrite(const MemoryDesc& localDest, size_t localOffset,
