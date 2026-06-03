@@ -381,9 +381,8 @@ application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionDmabuf(
   return handle;
 }
 
-namespace {
 // Export a dmabuf fd for the GPU buffer at `ptr`. Returns -1 if unsupported.
-int TryExportDmabufFd(void* ptr, size_t size) {
+static int TryExportDmabufFd(void* ptr, size_t size) {
   int fd = -1;
   hipError_t err = hipMemGetHandleForAddressRange(&fd, reinterpret_cast<hipDeviceptr_t>(ptr), size,
                                                   hipMemRangeHandleTypeDmaBufFd, 0);
@@ -393,7 +392,6 @@ int TryExportDmabufFd(void* ptr, size_t size) {
   }
   return fd;
 }
-}  // namespace
 
 application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionAuto(void* ptr,
                                                                               size_t size,
