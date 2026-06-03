@@ -124,6 +124,43 @@ path isolates the zero-CU communication change, while the zero-copy output mode 
 copy-out-free layout change. The absolute gain is workload-dependent and is expected to
 be strongest when FSDP allgather overlaps useful compute on the same node.
 
+## Profiler Evidence
+
+A short rank-0 PyTorch profiler trace separates the two sources of speedup. The native
+run shows RCCL/NCCL allgather activity, the SDMA base run replaces that allgather with
+the MORI SDMA kernel, and the zero-copy output run removes the FSDP copy-out kernel.
+
+The traces were collected from the same benchmark script using a short profiler window
+after warmup:
+
+```bash
+--steps 10 --warmup 10 --profile-start-step 2 --profile-steps 3 --profile-dir <trace-dir>
+```
+
+The numbers below are total event durations summed over the captured rank-0 profiler
+window, not single-operation latency:
+
+| Trace metric | Native baseline (RCCL) | MORI SDMA base path | MORI SDMA + zero-copy output |
+| --- | ---: | ---: | ---: |
+| Allgather communication kernel | `437.1 ms` `nccl:_all_gather_base` | `276.2 ms` `OneShotAllGatherSdmaKernel_u32` | `303.9 ms` `OneShotAllGatherSdmaParamContiguousKernel_u32` |
+| `split_with_sizes_copy` CUDA kernel | `46.4 ms` | `50.2 ms` | `0.0 ms` |
+| `FSDP::all_gather_copy_out` annotation | `104.7 ms` | `97.7 ms` | `28.6 ms` |
+
+The first row shows the communication-side gain: MORI SDMA replaces RCCL/NCCL allgather,
+and the SDMA base path reduces allgather kernel time by about `36.8%` in this trace
+window. The second row shows the zero-copy output gain: the separate
+`split_with_sizes_copy` CUDA kernel is removed entirely. The third row shows that the
+broader FSDP copy-out region shrinks from `97.7 ms` to `28.6 ms`, leaving mostly
+lightweight view/setup work. In the SDMA base path, `FSDP::all_gather_copy_out` includes
+the actual copy-out from the allgather output into per-parameter full buffers. With
+zero-copy output, MORI writes the final param-contiguous layout directly, so FSDP only
+needs to construct per-parameter views and perform bookkeeping.
+
+The zero-copy SDMA kernel itself is slightly longer than the base SDMA kernel
+(`303.9 ms` versus `276.2 ms`) because it writes directly into the final
+multi-parameter layout. That extra layout work replaces the separate copy-out kernel,
+which is why the zero-copy output path still improves end-to-end step time.
+
 ## Optimization Progression
 
 The full gain comes from two layers of optimization. The base MORI SDMA path improves
@@ -338,22 +375,23 @@ shared allgather output buffer.
 
 ## Open Items for Upstreaming
 
-Before proposing the zero-copy output capability upstream, the remaining work is to turn
-the current param-contiguous layout gates and lifetime contract into explicit tests:
+The benchmark and profiler evidence above already cover the main performance claim: the
+SDMA base path reduces allgather kernel time, and zero-copy output removes the
+`split_with_sizes_copy` copy-out kernel. Before proposing the zero-copy output capability
+upstream, the remaining work is to turn the current correctness gates and lifetime
+contract into explicit tests:
 
 - Buffer multiplicity and aliasing under forward prefetch and under
   `reshard_after_forward=False`.
-- Bit-exact unsharded parameter data and full train-step loss parity against the copy-out
-  path.
+- Bit-exact unsharded parameter data and full train-step loss parity against the
+  copy-out path.
 - Uneven dim-0 sharding with tail padding.
 - Gate fall-through for DTensor, non-dim-0 sharding, custom post-allgather, multi-input,
   mixed dtype or fp8 pre-allgather, post-forward mesh reshard, and `torch.compile` /
   Traceable FSDP2.
 
-A profiling trace that separately shows the SDMA base-path gain and the removed
-`split_with_sizes_copy` cost would also make the RFC stronger. The main open design
-questions are whether the core API should use a capability flag or a distinct
-`ParamContiguousAllGather` subtype, whether FSDP or the comm should own the registered
-buffer pool and lifetime ceiling, whether the idea should later extend to reduce-scatter,
-and whether a minimum size threshold is needed when the extra registered-buffer memory is
-not worth the copy-out savings.
+The main open design questions are whether the core API should use a capability flag or
+a distinct `ParamContiguousAllGather` subtype, whether FSDP or the comm should own the
+registered buffer pool and lifetime ceiling, whether the idea should later extend to
+reduce-scatter, and whether a minimum size threshold is needed when zero-copy output is
+not worth the layout-specific constraints.
