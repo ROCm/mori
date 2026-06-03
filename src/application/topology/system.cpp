@@ -101,6 +101,67 @@ std::string TopoSystem::MatchGpuAndNic(int id) {
   return matches[id];
 }
 
+std::vector<std::string> TopoSystem::MatchGpuAndNics(int id, int k) {
+  if (k <= 0) return {};
+
+  std::vector<Candidate> candidates = CollectAndSortCandidates(this, id);
+  std::vector<std::string> matches;
+  matches.reserve(std::min<int>(k, candidates.size()));
+
+  std::unordered_set<std::string> seen;
+  for (const auto& candidate : candidates) {
+    if (candidate.nic == nullptr) continue;
+    const std::string& name = candidate.nic->name;
+    if (!seen.insert(name).second) continue;
+    matches.push_back(name);
+    if (static_cast<int>(matches.size()) >= k) break;
+  }
+
+  return matches;
+}
+
+std::vector<std::string> TopoSystem::MatchCpuNics(int numaNode, int k) {
+  if (k <= 0) return {};
+
+  TopoSystemPci* pci = GetTopoSystemPci();
+  TopoSystemNet* net = GetTopoSystemNet();
+
+  auto nics = net->GetNics();
+  std::vector<TopoNodeNic*> candidates;
+  candidates.reserve(nics.size());
+  for (auto* nic : nics) {
+    if (nic == nullptr) continue;
+    candidates.push_back(nic);
+  }
+
+  std::sort(candidates.begin(), candidates.end(), [&](TopoNodeNic* a, TopoNodeNic* b) -> bool {
+    if (numaNode >= 0) {
+      TopoNodePci* aNode = pci->Node(a->busId);
+      TopoNodePci* bNode = pci->Node(b->busId);
+      const bool aLocal = (aNode != nullptr) && (aNode->NumaNode() == numaNode);
+      const bool bLocal = (bNode != nullptr) && (bNode->NumaNode() == numaNode);
+      if (aLocal != bLocal) return aLocal;
+    }
+
+    bool tie = (a->totalGbps == b->totalGbps);
+    if (!tie) return a->totalGbps > b->totalGbps;
+
+    return a->name <= b->name;
+  });
+
+  std::vector<std::string> matches;
+  matches.reserve(std::min<int>(k, candidates.size()));
+  std::unordered_set<std::string> seen;
+  for (const auto* nic : candidates) {
+    if (nic == nullptr) continue;
+    if (!seen.insert(nic->name).second) continue;
+    matches.push_back(nic->name);
+    if (static_cast<int>(matches.size()) >= k) break;
+  }
+
+  return matches;
+}
+
 std::vector<std::string> TopoSystem::MatchAllGpusAndNics() {
   int count;
   HIP_RUNTIME_CHECK(hipGetDeviceCount(&count));

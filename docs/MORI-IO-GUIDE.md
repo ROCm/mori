@@ -67,7 +67,7 @@ from mori.io import (
 | `IOEngine` | Primary engine for P2P transfers — create backends, register engines/memory, issue transfers |
 | `IOEngineSession` | Lightweight reusable session between two memory regions, lower per-transfer overhead |
 | `IOEngineConfig` | Engine configuration: `host` (str), `port` (int) |
-| `RdmaBackendConfig` | RDMA backend config: `qp_per_transfer`, `post_batch_size`, `num_worker_threads`, `poll_cq_mode`, `enable_notification` |
+| `RdmaBackendConfig` | RDMA backend config: `qp_per_transfer`, `post_batch_size`, `num_worker_threads`, `poll_cq_mode`, `enable_notification`, `enable_transfer_chunking`, `chunk_bytes`, `max_chunks_per_transfer`, `num_nics_per_transfer` |
 | `XgmiBackendConfig` | XGMI backend config: `num_streams` (default 64), `num_events` (default 64) |
 
 **Enums:**
@@ -166,9 +166,13 @@ See `examples/io/example.py` for more complete examples including batch transfer
 | Setting | Description |
 |---------|-------------|
 | `set_log_level(level)` | Set MORI-IO log verbosity level |
-| `RdmaBackendConfig.qp_per_transfer` | Queue pairs per transfer (default 1, increase for higher bandwidth) |
+| `RdmaBackendConfig.qp_per_transfer` | Queue pairs per transfer (default 1, increase for higher bandwidth; with multi-NIC these QPs are spread across NICs, so aim for ≥2 QP per NIC) |
 | `RdmaBackendConfig.poll_cq_mode` | CQ polling mode: `POLLING` (busy-wait, lower latency) or `EVENT` (interrupt-driven) |
 | `RdmaBackendConfig.enable_notification` | Enable target-side completion notifications (default `True`) |
+| `RdmaBackendConfig.enable_transfer_chunking` | Split a large single transfer into `chunk_bytes` chunks pipelined across QPs (default `False`). Lifts single-transfer bandwidth from single-outstanding (~28 GB/s) to NIC line rate. Forces single-thread inline posting (ignores `num_worker_threads`). Env: `MORI_IO_ENABLE_CHUNKING` |
+| `RdmaBackendConfig.chunk_bytes` | Chunk size when chunking is on (default `65536` = 64 KB). Messages ≤ this are unchanged. Env: `MORI_IO_CHUNK_BYTES` |
+| `RdmaBackendConfig.max_chunks_per_transfer` | Cap on chunks per transfer to bound WR/SQ usage (default `64`). Env: `MORI_IO_MAX_CHUNKS` |
+| `RdmaBackendConfig.num_nics_per_transfer` | Stripe a transfer across this many NICs (default `1`). Adaptive by memory type: GPU memory stays single-NIC (PCIe-bound); host memory stripes across NUMA-local NICs. Env: `MORI_IO_NUM_NICS_PER_TRANSFER` |
 | `IOEngineConfig.port = 0` | Auto-bind to a free port |
 
 UMBP (the upper-layer cache pool) exposes a separate set of runtime-tunable

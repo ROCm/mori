@@ -267,6 +267,198 @@ void CaseWrIdNamespaceHelpers() {
   Require(!IsNotifSendWrId(4096), "ledger-range ids without bit 63 should not be SEND-tagged");
 }
 
+void CaseRdmaBackendConfigChunkingFields() {
+  RdmaBackendConfig defaultCfg{};
+  Require(defaultCfg.chunkBytes == 65536, "default chunkBytes should be 64KB");
+
+  RdmaBackendConfig cfg{4, -1, 2, PollCqMode::POLLING, true, 2048, true, 65536, 32, 2};
+  Require(cfg.qpPerTransfer == 4, "qpPerTransfer constructor field mismatch");
+  Require(cfg.postBatchSize == -1, "postBatchSize constructor field mismatch");
+  Require(cfg.numWorkerThreads == 2, "numWorkerThreads constructor field mismatch");
+  Require(cfg.enableNotification, "enableNotification constructor field mismatch");
+  Require(cfg.notifPerQp == 2048, "notifPerQp constructor field mismatch");
+  Require(cfg.enableTransferChunking, "enableTransferChunking constructor field mismatch");
+  Require(cfg.chunkBytes == 65536, "chunkBytes constructor field mismatch");
+  Require(cfg.maxChunksPerTransfer == 32, "maxChunksPerTransfer constructor field mismatch");
+  Require(cfg.numNicsPerTransfer == 2, "numNicsPerTransfer constructor field mismatch");
+}
+
+void CaseResolveRequestedNics() {
+  RdmaBackendConfig cfg{};
+  cfg.numNicsPerTransfer = 4;
+
+  TopoKey cpu0{0, MemoryLocationType::CPU, 0};
+  TopoKey cpu1{1, MemoryLocationType::CPU, 1};
+  TopoKey gpu0{0, MemoryLocationType::GPU, -1};
+
+  Require(ResolveRequestedNics(cfg, cpu0, cpu1) == 4,
+          "host-host session should honor configured NIC count");
+  Require(ResolveRequestedNics(cfg, gpu0, cpu0) == 1, "GPU-local session should force single-NIC");
+  Require(ResolveRequestedNics(cfg, cpu0, gpu0) == 1, "GPU-remote session should force single-NIC");
+}
+
+void RequireChunkPlanCoverage(const std::vector<std::pair<uint64_t, uint32_t>>& plan,
+                              uint32_t total) {
+  uint64_t expectedOffset = 0;
+  uint64_t totalLength = 0;
+  for (const auto& [offset, length] : plan) {
+    Require(offset == expectedOffset, "chunk plan must be contiguous");
+    expectedOffset += length;
+    totalLength += length;
+  }
+  Require(totalLength == total, "chunk plan total length mismatch");
+}
+
+void CasePlanChunksBoundaries() {
+  {
+    auto plan = PlanChunks(0, 65536, 8);
+    Require(plan.empty(), "zero-length plan should be empty");
+  }
+  {
+    auto plan = PlanChunks(65536, 0, 8);
+    Require(plan.size() == 1, "chunkBytes==0 should disable splitting");
+    Require(plan[0].first == 0 && plan[0].second == 65536, "unsplit plan mismatch");
+  }
+  {
+    auto plan = PlanChunks(65536, 65536, 8);
+    Require(plan.size() == 1, "total==chunkBytes should not split");
+    Require(plan[0].first == 0 && plan[0].second == 65536, "boundary non-split mismatch");
+  }
+  {
+    auto plan = PlanChunks(65537, 65536, 8);
+    Require(plan.size() == 2, "chunkBytes+1 should split into 2 chunks");
+    RequireChunkPlanCoverage(plan, 65537);
+    Require(plan[0].second == 32769 && plan[1].second == 32768,
+            "unexpected chunkBytes+1 split geometry");
+  }
+  {
+    auto plan = PlanChunks(1024 * 1024, 131072, 4);
+    Require(plan.size() == 4, "maxChunks must cap chunk count");
+    RequireChunkPlanCoverage(plan, 1024 * 1024);
+    for (const auto& [_, length] : plan) {
+      Require(length == 262144, "capped chunk plan should rebalance evenly");
+    }
+  }
+  {
+    auto plan = PlanChunks(65536, 65536, 0);
+    Require(plan.empty(), "invalid maxChunks should produce empty plan");
+  }
+}
+
+void CaseBuildDesiredQpCounts() {
+  {
+    auto counts = BuildDesiredQpCounts(4, 3);
+    Require(counts.size() == 3, "counts size mismatch");
+    Require(counts[0] == 2 && counts[1] == 1 && counts[2] == 1,
+            "4 QPs over 3 ranks should distribute as 2/1/1");
+  }
+  {
+    auto counts = BuildDesiredQpCounts(8, 1);
+    Require(counts.size() == 1 && counts[0] == 8, "single-rank distribution mismatch");
+  }
+  {
+    auto counts = BuildDesiredQpCounts(2, 4);
+    Require(counts.size() == 4, "counts size mismatch for sparse distribution");
+    Require(counts[0] == 1 && counts[1] == 1 && counts[2] == 0 && counts[3] == 0,
+            "2 QPs over 4 ranks should distribute as 1/1/0/0");
+  }
+  {
+    auto counts = BuildDesiredQpCounts(0, 4);
+    int total = 0;
+    for (int v : counts) total += v;
+    Require(total == 0, "zero-QP distribution should sum to zero");
+  }
+}
+
+void CaseInterleaveEndpointsByLocalDevice() {
+  EpPairVec eps;
+  auto add = [&](int ldevId) {
+    EpPair ep{};
+    ep.ldevId = ldevId;
+    eps.push_back(ep);
+  };
+  add(0);
+  add(0);
+  add(1);
+  add(1);
+  add(2);
+
+  {
+    auto interleaved = InterleaveEndpointsByLocalDevice(eps, {0, 1, 2}, {2, 1, 1});
+    Require(interleaved.size() == 4, "interleaved endpoint count mismatch");
+    Require(interleaved[0].ldevId == 0 && interleaved[1].ldevId == 1 &&
+                interleaved[2].ldevId == 2 && interleaved[3].ldevId == 0,
+            "unexpected interleave order for 0/1/2 buckets");
+  }
+  {
+    auto interleaved = InterleaveEndpointsByLocalDevice(eps, {1, 0}, {1, 2});
+    Require(interleaved.size() == 3, "rank-limited interleave endpoint count mismatch");
+    Require(interleaved[0].ldevId == 1 && interleaved[1].ldevId == 0 && interleaved[2].ldevId == 0,
+            "unexpected interleave order for reordered buckets");
+  }
+}
+
+void CaseUsesInlineOnly() {
+  RdmaBackendConfig cfg{};
+  Require(!UsesInlineOnly(cfg), "default config should keep executor-compatible path");
+
+  cfg.enableTransferChunking = true;
+  Require(UsesInlineOnly(cfg), "chunking should force inline-only path");
+
+  cfg.enableTransferChunking = false;
+  cfg.numNicsPerTransfer = 2;
+  Require(UsesInlineOnly(cfg), "multi-NIC should force inline-only path");
+}
+
+void CaseValidateRdmaTransferConfig() {
+  {
+    RdmaBackendConfig cfg{};
+    ValidateRdmaTransferConfig(cfg);
+  }
+  {
+    RdmaBackendConfig cfg{};
+    cfg.maxChunksPerTransfer = 0;
+    bool threw = false;
+    try {
+      ValidateRdmaTransferConfig(cfg);
+    } catch (const std::runtime_error&) {
+      threw = true;
+    }
+    Require(threw, "maxChunksPerTransfer<1 should be rejected");
+  }
+  {
+    RdmaBackendConfig cfg{};
+    cfg.numNicsPerTransfer = 0;
+    bool threw = false;
+    try {
+      ValidateRdmaTransferConfig(cfg);
+    } catch (const std::runtime_error&) {
+      threw = true;
+    }
+    Require(threw, "numNicsPerTransfer<1 should be rejected");
+  }
+  {
+    RdmaBackendConfig cfg{};
+    cfg.enableTransferChunking = true;
+    cfg.chunkBytes = 1024;
+    bool threw = false;
+    try {
+      ValidateRdmaTransferConfig(cfg);
+    } catch (const std::runtime_error&) {
+      threw = true;
+    }
+    Require(threw, "chunkBytes<4096 should be rejected when chunking is enabled");
+  }
+  {
+    RdmaBackendConfig cfg{};
+    cfg.enableTransferChunking = true;
+    cfg.chunkBytes = 4096;
+    cfg.maxChunksPerTransfer = 1;
+    cfg.numNicsPerTransfer = 1;
+    ValidateRdmaTransferConfig(cfg);
+  }
+}
+
 void CaseRdmaNotificationRejectsZeroNotifPerQp() {
   if (!RdmaBackend::HasActiveDevices()) {
     throw TestSkip("requires at least one active RDMA device");
@@ -1068,6 +1260,13 @@ int main(int argc, char* argv[]) {
   std::vector<TestCase> cases = {
       {"submission_ledger_basic", CaseSubmissionLedgerBasic},
       {"wr_id_namespace_helpers", CaseWrIdNamespaceHelpers},
+      {"rdma_backend_config_chunking_fields", CaseRdmaBackendConfigChunkingFields},
+      {"resolve_requested_nics", CaseResolveRequestedNics},
+      {"plan_chunks_boundaries", CasePlanChunksBoundaries},
+      {"build_desired_qp_counts", CaseBuildDesiredQpCounts},
+      {"interleave_endpoints_by_local_device", CaseInterleaveEndpointsByLocalDevice},
+      {"uses_inline_only", CaseUsesInlineOnly},
+      {"validate_rdma_transfer_config", CaseValidateRdmaTransferConfig},
       {"rdma_notification_rejects_zero_notif_per_qp", CaseRdmaNotificationRejectsZeroNotifPerQp},
       {"rdma_backend_has_active_devices_returns_false_when_no_device",
        CaseRdmaBackendHasActiveDevicesReturnsFalseWhenNoDevice},

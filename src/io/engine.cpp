@@ -22,6 +22,8 @@
 #include "mori/io/engine.hpp"
 
 #include <hip/hip_runtime_api.h>
+#include <linux/mempolicy.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #include <cctype>
@@ -82,6 +84,19 @@ std::string QueryDeviceBusId(int deviceId) {
 bool IsAutoXgmiEnabled() {
   const char* v = std::getenv("MORI_DISABLE_AUTO_XGMI");
   return v != nullptr && v[0] == '0';
+}
+
+int DetectNumaNode(void* addr) {
+#if defined(SYS_get_mempolicy)
+  int node = -1;
+  long rc = syscall(SYS_get_mempolicy, &node, nullptr, 0,
+                    reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(addr)),
+                    MPOL_F_NODE | MPOL_F_ADDR);
+  return rc == 0 ? node : -1;
+#else
+  (void)addr;
+  return -1;
+#endif
 }
 
 }  // namespace
@@ -347,6 +362,9 @@ MemoryDesc IOEngine::RegisterMemory(void* data, size_t size, int device, MemoryL
   memDesc.data = reinterpret_cast<uintptr_t>(data);
   memDesc.size = size;
   memDesc.loc = loc;
+  if (loc == MemoryLocationType::CPU && data != nullptr) {
+    memDesc.numaNode = DetectNumaNode(data);
+  }
 
   for (auto& it : backends) {
     it.second->RegisterMemory(memDesc);

@@ -76,7 +76,7 @@ CONFIG_STR_TO_DTYPE: dict[str, torch.dtype] = {r[1]: r[0] for r in _DTYPE_REGIST
 CONFIG_STR_TO_SHORT_NAME: dict[str, str] = {r[1]: r[2] for r in _DTYPE_REGISTRY}
 
 _KERNEL_TYPE_NAMES = frozenset(
-    {"IntraNode", "InterNode", "InterNodeV1", "InterNodeV1LL", "AsyncLL"}
+    {"IntraNode", "InterNode", "InterNodeV1", "InterNodeV1LL", "AsyncLL", "IntraNodeLL"}
 )
 
 _QUANT_TYPE_CONFIG_STRS = {"none", "fp8_direct_cast", "fp8_blockwise"}

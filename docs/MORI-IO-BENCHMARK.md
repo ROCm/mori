@@ -39,11 +39,16 @@ torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
 | `--enable-sess` | Enable session transfer (lower latency) |
 | `--num-initiator-dev` | Number of initiator devices |
 | `--num-target-dev` | Number of target devices |
-| `--num-qp-per-transfer` | Number of queue pairs used |
+| `--num-qp-per-transfer` | Number of queue pairs used (default `4`) |
 | `--op-type` | Operation type: `read` or `write` |
 | `--poll_cq_mode` | CQ polling mode: `polling` or `event` |
-| `--num-worker-threads` | Number of worker threads |
+| `--num-worker-threads` | Number of worker threads (default `1`; ignored when chunking/multi-NIC is on — posting is single-thread inline) |
+| `--disable-chunking` | Disable single-transfer chunking (chunking is **on by default**) |
+| `--chunk-bytes` | Chunk size in bytes when chunking is on (default `65536` = 64 KB) |
+| `--max-chunks` | Max chunks per transfer (default `64`) |
 | `--log-level` | Log level (e.g., `info`) |
+
+> Multi-NIC striping is controlled by the env var `MORI_IO_NUM_NICS_PER_TRANSFER` (default `1`). For host memory, set it to the number of NUMA-local NICs and keep `--num-qp-per-transfer ≥ 2 × NICs` so each NIC gets ≥2 QPs. GPU memory should stay single-NIC (PCIe-bound).
 
 ## Results: Thor2 RDMA Read
 
