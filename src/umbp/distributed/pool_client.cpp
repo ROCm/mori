@@ -355,7 +355,7 @@ bool PoolClient::Init() {
     peer_service_ = std::make_unique<PeerServiceServer>(
         peer_alloc_.get(), peer_ssd_.get(), ssd_staging_buffer_.get(),
         ssd_staging_buffer_ ? config_.ssd_staging_buffer_size : 0, ssd_staging_mem_desc_bytes_,
-        config_.ssd_read_slots, config_.ssd_lease_timeout_s, engine_desc_bytes,
+        config_.ssd_staging_buffer_slots, config_.ssd_lease_timeout_s, engine_desc_bytes,
         master_client_.get(), ssd_copy_pipeline_.get());
     if (!peer_service_->Start(config_.peer_service_port)) {
       MORI_UMBP_ERROR("[PoolClient] PeerService failed to start on port {}",

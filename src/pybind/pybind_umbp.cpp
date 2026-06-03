@@ -216,7 +216,7 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("io_engine", &UMBPDistributedConfig::io_engine)
       .def_readwrite("staging_buffer_size", &UMBPDistributedConfig::staging_buffer_size)
       .def_readwrite("ssd_staging_buffer_size", &UMBPDistributedConfig::ssd_staging_buffer_size)
-      .def_readwrite("ssd_read_slots", &UMBPDistributedConfig::ssd_read_slots)
+      .def_readwrite("ssd_staging_buffer_slots", &UMBPDistributedConfig::ssd_staging_buffer_slots)
       .def_readwrite("peer_service_port", &UMBPDistributedConfig::peer_service_port)
       .def_readwrite("cache_remote_fetches", &UMBPDistributedConfig::cache_remote_fetches)
       .def_readwrite("dram_page_size", &UMBPDistributedConfig::dram_page_size);

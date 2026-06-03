@@ -900,8 +900,8 @@ fields:
 | `io_engine.host` | "" | Empty selects RDMA; sites typically use `127.0.0.1` for local IO engine. |
 | `io_engine.port` | 0 | `0` = OS-assigned ephemeral. |
 | `staging_buffer_size` | 64 MiB | Host staging for non-zero-copy RDMA. |
-| `ssd_staging_buffer_size` | 256 MiB | Dedicated SSD read staging, allocated only when SSD is enabled. A slot (`ssd_staging_buffer_size / ssd_read_slots`) must fit the largest single-key value. |
-| `ssd_read_slots` | 16 | Number of remote SSD read staging slots. |
+| `ssd_staging_buffer_size` | 256 MiB | Dedicated SSD read staging, allocated only when SSD is enabled. A slot (`ssd_staging_buffer_size / ssd_staging_buffer_slots`) must fit the largest single-key value. |
+| `ssd_staging_buffer_slots` | 16 | Number of remote SSD read staging slots. |
 | `peer_service_port` | 0 | `0` = OS-assigned. |
 | `cache_remote_fetches` | true | Locally re-cache blocks fetched from a remote peer. |
 | `dram_page_size` | 0 | `0` ⇒ use master's `default_dram_page_size` (2 MiB). |

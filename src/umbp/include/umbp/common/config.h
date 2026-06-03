@@ -193,12 +193,12 @@ struct UMBPDistributedConfig {
   size_t staging_buffer_size = 64ULL * 1024 * 1024;  // 64 MB
 
   // Dedicated SSD read staging, allocated only when ssd.enabled. Per-slot
-  // (this / ssd_read_slots) must be >= the largest single-key page KV
+  // (this / ssd_staging_buffer_slots) must be >= the largest single-key page KV
   // (61-layer MLA page ~= 4.5 MB).
   size_t ssd_staging_buffer_size = 268435456;  // 256 MiB
 
   // Remote SSD read staging slots; per-slot = ssd_staging_buffer_size / this.
-  int ssd_read_slots = 16;
+  int ssd_staging_buffer_slots = 16;
 
   uint16_t peer_service_port = 0;  // gRPC peer service port
 
