@@ -371,7 +371,7 @@ SsdReadOutcome PeerSsdManager::PrepareRead(const std::string& key, void* staging
       // staging_cap = per-slot cap (ssd_staging_buffer_size / ssd_read_slots).
       MORI_UMBP_WARN(
           "[PeerSsdManager] remote SSD read key={} size={}B exceeds per-slot staging cap {}B; "
-          "raise ssd_staging_buffer_size (UMBP_SSD_STAGING_BYTES) or lower ssd_read_slots",
+          "raise ssd_staging_buffer_size or lower ssd_read_slots",
           key, size, staging_cap);
       return SsdReadOutcome{SsdReadStatus::kSizeTooLarge, size};
     }
