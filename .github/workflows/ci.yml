@@ -435,12 +435,12 @@ jobs:
       - name: Install mori (node1)
         run: |
           $CT exec $CONTAINER bash -c \
-            "cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install . && pip install prettytable"
+            "cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install . && pip install prettytable && (command -v numactl >/dev/null || (apt-get update && apt-get install -y numactl))"
 
       - name: Install mori (node2)
         run: |
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST \
-            "$CT exec $CONTAINER bash -c 'cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install . && pip install prettytable'"
+            "$CT exec $CONTAINER bash -c 'cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install . && pip install prettytable && (command -v numactl >/dev/null || (apt-get update && apt-get install -y numactl))'"
 
       - name: MORI-IO internode write sweep
         run: |
@@ -454,7 +454,7 @@ jobs:
             -- --op-type write --transfer-batch-size 128 --all
             --sweep-start-size 1024 --sweep-max-size 16777216 --iters 4
             --enable-sess --enable-batch-transfer
-            --num-qp-per-transfer 2 --num-worker-threads 2
+            --num-qp-per-transfer 2
             --num-initiator-dev 8 --num-target-dev 8
           )
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
@@ -464,7 +464,7 @@ jobs:
             -- --op-type write --transfer-batch-size 128 --all \
             --sweep-start-size 1024 --sweep-max-size 16777216 --iters 4 \
             --enable-sess --enable-batch-transfer \
-            --num-qp-per-transfer 2 --num-worker-threads 2 \
+            --num-qp-per-transfer 2 \
             --num-initiator-dev 8 --num-target-dev 8
           wait
 
@@ -479,7 +479,7 @@ jobs:
             --ifname $NODE2_IFNAME
             -- --op-type read --buffer-size 4096 --transfer-batch-size 128 --iters 8
             --enable-batch-transfer --enable-sess --poll_cq_mode event
-            --num-qp-per-transfer 2 --num-worker-threads 2
+            --num-qp-per-transfer 2
             --num-initiator-dev 8 --num-target-dev 8
           )
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
@@ -488,7 +488,64 @@ jobs:
             --ifname $NODE1_IFNAME \
             -- --op-type read --buffer-size 4096 --transfer-batch-size 128 --iters 8 \
             --enable-batch-transfer --enable-sess --poll_cq_mode event \
-            --num-qp-per-transfer 2 --num-worker-threads 2 \
+            --num-qp-per-transfer 2 \
+            --num-initiator-dev 8 --num-target-dev 8
+          wait
+
+      - name: MORI-IO internode CPU memory sweep (chunking + 4 NIC x 4 QP)
+        run: |
+          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_io_benchmark.sh"
+          # CPU host memory, chunking on (default), striped across 4 NUMA-local NICs
+          # with 16 QPs total (= 4 QP per NIC). Single posting thread (inline).
+          PORT=29122
+          for OP in write read; do
+            echo "=== MORI-IO internode benchmark: cpu-mem $OP sweep (chunking, 4 NIC x 4 QP) port=$PORT ==="
+            NODE2_CMD=(
+              $CT exec -e MORI_IO_NUM_NICS_PER_TRANSFER=4 $CONTAINER bash $SCRIPT
+              --rank 1 --master-addr $NODE1_HOST --master-port $PORT
+              --ifname $NODE2_IFNAME --numa 0
+              -- --mem-type cpu --op-type $OP --transfer-batch-size 64 --all
+              --sweep-start-size 1024 --sweep-max-size 1048576 --iters 4
+              --enable-sess --enable-batch-transfer
+              --num-qp-per-transfer 16 --num-initiator-dev 1 --num-target-dev 1
+            )
+            ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
+            $CT exec -e MORI_IO_NUM_NICS_PER_TRANSFER=4 $CONTAINER bash $SCRIPT \
+              --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+              --ifname $NODE1_IFNAME --numa 0 \
+              -- --mem-type cpu --op-type $OP --transfer-batch-size 64 --all \
+              --sweep-start-size 1024 --sweep-max-size 1048576 --iters 4 \
+              --enable-sess --enable-batch-transfer \
+              --num-qp-per-transfer 16 --num-initiator-dev 1 --num-target-dev 1
+          wait
+            PORT=$((PORT + 1))
+          done
+
+      - name: MORI-IO internode multi-worker executor correctness (chunking off)
+        run: |
+          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_io_benchmark.sh"
+          PORT=29124
+          # Legacy multi-worker executor path: only active when chunking is off and
+          # single NIC. Small write run to guard byte-for-byte correctness of that path.
+          echo "=== MORI-IO internode benchmark: multi-worker executor (chunking off) port=$PORT ==="
+          NODE2_CMD=(
+            $CT exec $CONTAINER bash $SCRIPT
+            --rank 1 --master-addr $NODE1_HOST --master-port $PORT
+            --ifname $NODE2_IFNAME
+            -- --op-type write --disable-chunking --transfer-batch-size 64 --all
+            --sweep-start-size 1024 --sweep-max-size 1048576 --iters 4
+            --enable-sess --enable-batch-transfer
+            --num-qp-per-transfer 4 --num-worker-threads 2
+            --num-initiator-dev 8 --num-target-dev 8
+          )
+          ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
+          $CT exec $CONTAINER bash $SCRIPT \
+            --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+            --ifname $NODE1_IFNAME \
+            -- --op-type write --disable-chunking --transfer-batch-size 64 --all \
+            --sweep-start-size 1024 --sweep-max-size 1048576 --iters 4 \
+            --enable-sess --enable-batch-transfer \
+            --num-qp-per-transfer 4 --num-worker-threads 2 \
             --num-initiator-dev 8 --num-target-dev 8
           wait
 

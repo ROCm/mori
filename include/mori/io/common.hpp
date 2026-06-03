@@ -102,14 +102,15 @@ struct MemoryDesc {
   size_t size{0};
   MemoryLocationType loc;
   std::array<char, kIpcHandleSize> ipcHandle{};
+  int numaNode{-1};
 
   constexpr bool operator==(const MemoryDesc& rhs) const noexcept {
     return (engineKey == rhs.engineKey) && (id == rhs.id) && (deviceId == rhs.deviceId) &&
            (deviceBusId == rhs.deviceBusId) && (data == rhs.data) && (size == rhs.size) &&
-           (loc == rhs.loc);
+           (loc == rhs.loc) && (numaNode == rhs.numaNode);
   }
 
-  MSGPACK_DEFINE(engineKey, id, deviceId, deviceBusId, data, size, loc, ipcHandle);
+  MSGPACK_DEFINE(engineKey, id, deviceId, deviceBusId, data, size, loc, ipcHandle, numaNode);
 };
 
 using TransferUniqueId = uint64_t;

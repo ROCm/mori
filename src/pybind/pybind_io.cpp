@@ -63,17 +63,24 @@ void RegisterMoriIo(pybind11::module_& m) {
   py::class_<mori::io::BackendConfig>(m, "BackendConfig");
 
   py::class_<mori::io::RdmaBackendConfig, mori::io::BackendConfig>(m, "RdmaBackendConfig")
-      .def(py::init<int, int, int, mori::io::PollCqMode, bool, uint32_t>(),
+      .def(py::init<int, int, int, mori::io::PollCqMode, bool, uint32_t, bool, size_t, int, int>(),
            py::arg("qp_per_transfer") = 1, py::arg("post_batch_size") = -1,
            py::arg("num_worker_threads") = -1,
            py::arg("poll_cq_mode") = mori::io::PollCqMode::POLLING,
-           py::arg("enable_notification") = true, py::arg("notif_per_qp") = 1024)
+           py::arg("enable_notification") = true, py::arg("notif_per_qp") = 1024,
+           py::arg("enable_transfer_chunking") = false, py::arg("chunk_bytes") = 65536,
+           py::arg("max_chunks_per_transfer") = 64, py::arg("num_nics_per_transfer") = 1)
       .def_readwrite("qp_per_transfer", &mori::io::RdmaBackendConfig::qpPerTransfer)
       .def_readwrite("post_batch_size", &mori::io::RdmaBackendConfig::postBatchSize)
       .def_readwrite("num_worker_threads", &mori::io::RdmaBackendConfig::numWorkerThreads)
       .def_readwrite("poll_cq_mode", &mori::io::RdmaBackendConfig::pollCqMode)
       .def_readwrite("enable_notification", &mori::io::RdmaBackendConfig::enableNotification)
       .def_readwrite("notif_per_qp", &mori::io::RdmaBackendConfig::notifPerQp)
+      .def_readwrite("enable_transfer_chunking",
+                     &mori::io::RdmaBackendConfig::enableTransferChunking)
+      .def_readwrite("chunk_bytes", &mori::io::RdmaBackendConfig::chunkBytes)
+      .def_readwrite("max_chunks_per_transfer", &mori::io::RdmaBackendConfig::maxChunksPerTransfer)
+      .def_readwrite("num_nics_per_transfer", &mori::io::RdmaBackendConfig::numNicsPerTransfer)
       .def_readwrite("max_send_wr", &mori::io::RdmaBackendConfig::maxSendWr)
       .def_readwrite("max_cqe_num", &mori::io::RdmaBackendConfig::maxCqeNum)
       .def_readwrite("max_msg_sge", &mori::io::RdmaBackendConfig::maxMsgSge);
@@ -130,6 +137,7 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def_readonly("id", &mori::io::MemoryDesc::id)
       .def_readonly("device_id", &mori::io::MemoryDesc::deviceId)
       .def_readonly("device_bus_id", &mori::io::MemoryDesc::deviceBusId)
+      .def_readonly("numa_node", &mori::io::MemoryDesc::numaNode)
       .def_property_readonly("data",
                              [](const mori::io::MemoryDesc& desc) -> uintptr_t {
                                return reinterpret_cast<uintptr_t>(desc.data);
