@@ -49,7 +49,7 @@ enum class PostSendOpKind : uint8_t {
 
 static int GetSqBackoffTimeoutUs() {
   static const int kBackoffTimeoutUs = []() {
-    int v = 10000;
+    int v = 5000000;
     env::Override("MORI_IO_SQ_BACKOFF_TIMEOUT_US", v, mori::env::detail::ParsePositiveInt);
     return v;
   }();
