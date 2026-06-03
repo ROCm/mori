@@ -305,6 +305,7 @@ namespace mori {
 void RegisterMoriOps(py::module_& m) {
   pybind11::enum_<mori::moe::KernelType>(m, "EpDispatchCombineKernelType")
       .value("IntraNode", mori::moe::KernelType::IntraNode)
+      .value("IntraNodeLL", mori::moe::KernelType::IntraNodeLL)
       .value("InterNode", mori::moe::KernelType::InterNode)
       .value("InterNodeV1", mori::moe::KernelType::InterNodeV1)
       .value("InterNodeV1LL", mori::moe::KernelType::InterNodeV1LL)

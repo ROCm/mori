@@ -184,7 +184,8 @@ template <typename T>
 __device__ inline void InvokeConvertDispatchOutput(const EpDispatchCombineArgs<T>& args, int myPe) {
   ConvertDispatchOutputArgs convArgs{};
   convArgs.config = args.config;
-  if (args.config.kernelType == KernelType::IntraNode) {
+  if (args.config.kernelType == KernelType::IntraNode ||
+      args.config.kernelType == KernelType::IntraNodeLL) {
     convArgs.dispatchOutX = args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(myPe);
   } else if (args.config.kernelType == KernelType::InterNodeV1 ||
              args.config.kernelType == KernelType::InterNodeV1LL) {
@@ -218,7 +219,8 @@ __device__ inline void InvokeConvertCombineInput(const EpDispatchCombineArgs<T>&
   convArgs.combineInput = nullptr;
   convArgs.dispTokToEpSlotMap = args.dispTokToEpSlotMap;
   convArgs.packedRecvCount = args.standardPackedRecvCount;
-  if (args.config.kernelType == KernelType::IntraNode) {
+  if (args.config.kernelType == KernelType::IntraNode ||
+      args.config.kernelType == KernelType::IntraNodeLL) {
     convArgs.shmemCombineInpTokMemObj = args.intraNodeTokBufs.combineInp;
   } else if (args.config.kernelType == KernelType::InterNodeV1 ||
              args.config.kernelType == KernelType::InterNodeV1LL) {
