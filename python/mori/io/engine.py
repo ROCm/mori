@@ -216,3 +216,6 @@ class IOEngine:
 
     def wait_all(self, statuses, timeout_ms: int = -1) -> "mori_cpp.StatusCode":
         return self._engine.WaitAll(statuses, timeout_ms)
+
+    def get_telemetry_snapshot(self, backend_type=mori_cpp.BackendType.RDMA):
+        return self._engine.GetTelemetrySnapshot(backend_type)
