@@ -160,6 +160,9 @@ def test_engine_desc_node_id_env_override(monkeypatch):
 
 
 def test_rdma_backend_config_chunking_fields():
+    default_config = RdmaBackendConfig()
+    assert default_config.chunk_bytes == 65536
+
     config = RdmaBackendConfig(
         qp_per_transfer=4,
         post_batch_size=-1,

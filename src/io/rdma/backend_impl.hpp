@@ -53,6 +53,8 @@ inline constexpr uint16_t kXgmiOnlyFallbackPlaceholderPort = 1;
 
 void ValidateRdmaTransferConfig(const RdmaBackendConfig& config);
 bool UsesInlineOnly(const RdmaBackendConfig& config);
+int ResolveRequestedNics(const RdmaBackendConfig& config, const TopoKey& local,
+                         const TopoKey& remote);
 std::vector<int> BuildDesiredQpCounts(int totalQp, int numRanks);
 EpPairVec InterleaveEndpointsByLocalDevice(const EpPairVec& eps,
                                            const std::vector<int>& localDevOrder,
@@ -69,7 +71,7 @@ class RdmaManager {
   application::RdmaEndpointConfig GetRdmaEndpointConfig(int devId);
 
   // Topology APIs
-  std::vector<std::pair<int, int>> Search(TopoKey);
+  std::vector<std::pair<int, int>> Search(TopoKey, int requestedNics = -1);
 
   // Local memory management APIs
   std::optional<application::RdmaMemoryRegion> GetLocalMemory(int ldevId, MemoryUniqueId);
@@ -201,8 +203,8 @@ class NotifManager {
 /* ---------------------------------------------------------------------------------------------- */
 class ControlPlaneServer {
  public:
-  ControlPlaneServer(const std::string& key, const std::string& host, int port, RdmaManager*,
-                     NotifManager*);
+  ControlPlaneServer(const std::string& key, const std::string& host, int port,
+                     const RdmaBackendConfig& config, RdmaManager*, NotifManager*);
   ~ControlPlaneServer();
 
   std::optional<uint16_t> GetListenPort() const {
@@ -234,6 +236,7 @@ class ControlPlaneServer {
 
  private:
   EngineKey myEngKey;
+  RdmaBackendConfig config{};
 
   mutable std::mutex mu;
 

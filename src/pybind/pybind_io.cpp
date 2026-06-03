@@ -68,7 +68,7 @@ void RegisterMoriIo(pybind11::module_& m) {
            py::arg("num_worker_threads") = -1,
            py::arg("poll_cq_mode") = mori::io::PollCqMode::POLLING,
            py::arg("enable_notification") = true, py::arg("notif_per_qp") = 1024,
-           py::arg("enable_transfer_chunking") = false, py::arg("chunk_bytes") = 131072,
+           py::arg("enable_transfer_chunking") = false, py::arg("chunk_bytes") = 65536,
            py::arg("max_chunks_per_transfer") = 64, py::arg("num_nics_per_transfer") = 1)
       .def_readwrite("qp_per_transfer", &mori::io::RdmaBackendConfig::qpPerTransfer)
       .def_readwrite("post_batch_size", &mori::io::RdmaBackendConfig::postBatchSize)

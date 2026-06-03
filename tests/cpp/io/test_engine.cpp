@@ -268,6 +268,9 @@ void CaseWrIdNamespaceHelpers() {
 }
 
 void CaseRdmaBackendConfigChunkingFields() {
+  RdmaBackendConfig defaultCfg{};
+  Require(defaultCfg.chunkBytes == 65536, "default chunkBytes should be 64KB");
+
   RdmaBackendConfig cfg{4, -1, 2, PollCqMode::POLLING, true, 2048, true, 65536, 32, 2};
   Require(cfg.qpPerTransfer == 4, "qpPerTransfer constructor field mismatch");
   Require(cfg.postBatchSize == -1, "postBatchSize constructor field mismatch");
@@ -278,6 +281,20 @@ void CaseRdmaBackendConfigChunkingFields() {
   Require(cfg.chunkBytes == 65536, "chunkBytes constructor field mismatch");
   Require(cfg.maxChunksPerTransfer == 32, "maxChunksPerTransfer constructor field mismatch");
   Require(cfg.numNicsPerTransfer == 2, "numNicsPerTransfer constructor field mismatch");
+}
+
+void CaseResolveRequestedNics() {
+  RdmaBackendConfig cfg{};
+  cfg.numNicsPerTransfer = 4;
+
+  TopoKey cpu0{0, MemoryLocationType::CPU, 0};
+  TopoKey cpu1{1, MemoryLocationType::CPU, 1};
+  TopoKey gpu0{0, MemoryLocationType::GPU, -1};
+
+  Require(ResolveRequestedNics(cfg, cpu0, cpu1) == 4,
+          "host-host session should honor configured NIC count");
+  Require(ResolveRequestedNics(cfg, gpu0, cpu0) == 1, "GPU-local session should force single-NIC");
+  Require(ResolveRequestedNics(cfg, cpu0, gpu0) == 1, "GPU-remote session should force single-NIC");
 }
 
 void RequireChunkPlanCoverage(const std::vector<std::pair<uint64_t, uint32_t>>& plan,
@@ -1244,6 +1261,7 @@ int main(int argc, char* argv[]) {
       {"submission_ledger_basic", CaseSubmissionLedgerBasic},
       {"wr_id_namespace_helpers", CaseWrIdNamespaceHelpers},
       {"rdma_backend_config_chunking_fields", CaseRdmaBackendConfigChunkingFields},
+      {"resolve_requested_nics", CaseResolveRequestedNics},
       {"plan_chunks_boundaries", CasePlanChunksBoundaries},
       {"build_desired_qp_counts", CaseBuildDesiredQpCounts},
       {"interleave_endpoints_by_local_device", CaseInterleaveEndpointsByLocalDevice},

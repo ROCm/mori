@@ -72,6 +72,14 @@ bool UsesInlineOnly(const RdmaBackendConfig& config) {
   return config.enableTransferChunking || config.numNicsPerTransfer > 1;
 }
 
+int ResolveRequestedNics(const RdmaBackendConfig& config, const TopoKey& local,
+                         const TopoKey& remote) {
+  if (local.loc == MemoryLocationType::GPU || remote.loc == MemoryLocationType::GPU) {
+    return 1;
+  }
+  return std::max(1, config.numNicsPerTransfer);
+}
+
 enum class CqeFailureOrigin : uint8_t {
   BatchTransfer = 0,
   NotificationSend,
@@ -194,9 +202,12 @@ RdmaManager::~RdmaManager() {
   }
 }
 
-std::vector<std::pair<int, int>> RdmaManager::Search(TopoKey key) {
+std::vector<std::pair<int, int>> RdmaManager::Search(TopoKey key, int requestedNics) {
+  if (requestedNics <= 0) {
+    requestedNics = std::max(1, config.numNicsPerTransfer);
+  }
+
   if (key.loc == MemoryLocationType::GPU) {
-    const int requestedNics = std::max(1, config.numNicsPerTransfer);
     std::vector<std::string> nicNames;
     if (requestedNics == 1) {
       std::string nicName = topo->MatchGpuAndNic(key.deviceId);
@@ -219,7 +230,6 @@ std::vector<std::pair<int, int>> RdmaManager::Search(TopoKey key) {
     MORI_IO_WARN("No matching NIC found for GPU {}", key.deviceId);
   } else if (key.loc == MemoryLocationType::CPU) {
     if (availDevices.empty()) return {};
-    const int requestedNics = std::max(1, config.numNicsPerTransfer);
     const char* envNic = std::getenv("MORI_IO_RDMA_NIC_IDX");
     if (envNic) {
       if (requestedNics > 1) {
@@ -850,8 +860,9 @@ void NotifManager::Shutdown() {
 /* ----------------------------------------------------------------------------------------------
  */
 ControlPlaneServer::ControlPlaneServer(const std::string& k, const std::string& host, int port,
-                                       RdmaManager* rdmaMgr, NotifManager* notifMgr)
-    : myEngKey(k) {
+                                       const RdmaBackendConfig& cfg, RdmaManager* rdmaMgr,
+                                       NotifManager* notifMgr)
+    : myEngKey(k), config(cfg) {
   ctx.reset(new application::TCPContext(host, port));
   rdma = rdmaMgr;
   notif = notifMgr;
@@ -885,7 +896,8 @@ void ControlPlaneServer::BuildRdmaConn(EngineKey ekey, TopoKeyPair topo, int nic
     tcph = ctx->Connect(rdesc.host, rdesc.port);
   }
 
-  auto candidates = rdma->Search(topo.local);
+  int requestedNics = ResolveRequestedNics(config, topo.local, topo.remote);
+  auto candidates = rdma->Search(topo.local, requestedNics);
   assert(!candidates.empty());
   int rank = std::min<int>(nicRank, static_cast<int>(candidates.size()) - 1);
   auto [devId, weight] = candidates[rank];
@@ -956,7 +968,8 @@ void ControlPlaneServer::HandleControlPlaneProtocol(int fd) {
   switch (hdr.type) {
     case MessageType::RegEndpoint: {
       MessageRegEndpoint msg = p.ReadMessageRegEndpoint(hdr.len);
-      auto candidates = rdma->Search(msg.topo.remote);
+      int requestedNics = ResolveRequestedNics(config, msg.topo.remote, msg.topo.local);
+      auto candidates = rdma->Search(msg.topo.remote, requestedNics);
       assert(!candidates.empty());
       int rdevId = msg.devId;
       int rank = std::min<int>(msg.nicRank, static_cast<int>(candidates.size()) - 1);
@@ -1197,8 +1210,8 @@ RdmaBackend::RdmaBackend(EngineKey k, const IOEngineConfig& engConfig,
   notif.reset(new NotifManager(rdma.get(), config));
   notif->Start();
 
-  server.reset(
-      new ControlPlaneServer(myEngKey, engConfig.host, engConfig.port, rdma.get(), notif.get()));
+  server.reset(new ControlPlaneServer(myEngKey, engConfig.host, engConfig.port, config, rdma.get(),
+                                      notif.get()));
   server->Start();
 
   bool useInlineOnly = UsesInlineOnly(config);
@@ -1293,12 +1306,13 @@ void RdmaBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remot
 
   std::vector<std::pair<int, int>> localCandidates;
   int effectiveNumNics = 1;
-  if (config.numNicsPerTransfer > 1) {
-    localCandidates = rdma->Search(kp.local);
+  int requestedNics = ResolveRequestedNics(config, kp.local, kp.remote);
+  if (requestedNics > 1) {
+    localCandidates = rdma->Search(kp.local, requestedNics);
     if (localCandidates.empty()) {
       throw std::runtime_error("RdmaBackend::CreateSession: no local RDMA candidate found");
     }
-    effectiveNumNics = std::max(1, std::min({config.numNicsPerTransfer, config.qpPerTransfer,
+    effectiveNumNics = std::max(1, std::min({requestedNics, config.qpPerTransfer,
                                              static_cast<int>(localCandidates.size())}));
   }
   std::vector<int> desiredPerRank = BuildDesiredQpCounts(config.qpPerTransfer, effectiveNumNics);

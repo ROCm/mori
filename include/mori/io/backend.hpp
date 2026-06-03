@@ -48,7 +48,7 @@ struct RdmaBackendConfig : public BackendConfig {
   RdmaBackendConfig() : BackendConfig(BackendType::RDMA) {}
   RdmaBackendConfig(int qpPerTransfer_, int postBatchSize_, int numWorkerThreads_,
                     PollCqMode pollCqMode_, bool enableNotification_, uint32_t notifPerQp_ = 1024,
-                    bool enableTransferChunking_ = false, size_t chunkBytes_ = 131072,
+                    bool enableTransferChunking_ = false, size_t chunkBytes_ = 65536,
                     int maxChunksPerTransfer_ = 64, int numNicsPerTransfer_ = 1)
       : BackendConfig(BackendType::RDMA),
         qpPerTransfer(qpPerTransfer_),
@@ -69,7 +69,7 @@ struct RdmaBackendConfig : public BackendConfig {
   bool enableNotification{true};  // Enable/disable notification mechanism for transfer completion
   uint32_t notifPerQp{1024};      // Pre-posted RECV WRs per QP; defines the Zone A boundary
   bool enableTransferChunking{false};
-  size_t chunkBytes{131072};
+  size_t chunkBytes{65536};
   int maxChunksPerTransfer{64};
   int numNicsPerTransfer{1};
 
