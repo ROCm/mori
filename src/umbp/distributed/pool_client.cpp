@@ -276,6 +276,10 @@ bool PoolClient::Init() {
     io_cfg.port = config_.io_engine.port;
     io_engine_ = std::make_unique<mori::io::IOEngine>(config_.master_config.node_id, io_cfg);
     mori::io::RdmaBackendConfig rdma_cfg;
+
+    rdma_cfg.qpPerTransfer = 16;
+    rdma_cfg.enableTransferChunking = true;
+    rdma_cfg.numNicsPerTransfer = 4;
     io_engine_->CreateBackend(mori::io::BackendType::RDMA, rdma_cfg);
 
     staging_buffer_ = std::make_unique<char[]>(config_.staging_buffer_size);
