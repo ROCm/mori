@@ -105,6 +105,25 @@ __device__ inline static uint32_t reserveWqeSlots(shmem::ShmemRdmaEndpoint* ep,
   return curPostIdx;
 }
 
+// PSD/Ionic only: walk the warp's active lane mask and let one lane at a
+// time issue the doorbell MMIO store. Ionic's dbrAddr is shared across every
+// QP of the same ibv_context; multiple lanes of one warp storing to that
+// shared address in one SIMT instruction get coalesced into a single
+// transaction and only one lane's dbrVal survives. Atomic-store ordering
+// does not protect against this. MLX5/BNXT each have a per-QP dbrAddr so
+// multi-lane stores hit distinct addresses and stay on the fast path.
+__device__ inline static void ringDoorbellWarpPsd(void* dbrAddr, uint64_t dbrVal) {
+  uint64_t mask = core::GetActiveLaneMask();
+  while (mask) {
+    int lane = __ffsll(static_cast<unsigned long long>(mask)) - 1;
+    if (__lane_id() == lane) {
+      core::RingDoorbell<core::ProviderType::PSD>(dbrAddr, dbrVal);
+    }
+    __syncwarp();
+    mask &= ~(1ull << lane);
+  }
+}
+
 // Wait for doorbell ordering and ring doorbell
 template <core::ProviderType PrvdType>
 __device__ inline static void ringDoorbellOrdered(shmem::ShmemRdmaEndpoint* ep, uint32_t myPostIdx,
@@ -125,8 +144,9 @@ __device__ inline static void ringDoorbellOrdered(shmem::ShmemRdmaEndpoint* ep, 
   __threadfence_system();
 
   if constexpr (PrvdType == core::ProviderType::PSD) {
-    // PSD/Ionic: no DBR record update needed, just ring doorbell
-    core::RingDoorbell<PrvdType>(wq->dbrAddr, dbrVal);
+    // PSD/Ionic: shared dbrAddr, lane-serialize to avoid SIMT same-address
+    // store coalescing dropping doorbells.
+    ringDoorbellWarpPsd(wq->dbrAddr, dbrVal);
   } else if constexpr (PrvdType == core::ProviderType::MLX5) {
     // MLX5: must update DBR record before ringing doorbell
     core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, myPostIdx + numWqes);
@@ -377,7 +397,7 @@ __device__ inline static void flushAsyncImpl(shmem::ShmemRdmaEndpoint* ep, uint3
   __threadfence_system();
 
   if constexpr (PrvdType == core::ProviderType::PSD) {
-    core::RingDoorbell<PrvdType>(wq->dbrAddr, dbrVal);
+    ringDoorbellWarpPsd(wq->dbrAddr, dbrVal);
   } else {
     core::UpdateSendDbrRecord<PrvdType>(wq->dbrRecAddr, curPostIdx);
     __threadfence_system();
