@@ -40,6 +40,7 @@
 #include "mori/shmem/shmem.hpp"
 #include "src/pybind/torch_utils.hpp"
 #include "mori/collective/collective.hpp"
+#include "mori/collective/reducescatter/reducescatter_sdma_class.hpp"
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                            Ops APIs                                            */
@@ -1421,6 +1422,148 @@ void RegisterMoriCcl(pybind11::module_& m) {
             },
             py::arg("device") = py::none(),
             "Get output transit buffer as a PyTorch tensor (bf16)");
+
+    // =========================================================================
+    // Bind ReduceScatterSdma class (uint32_t version)
+    // =========================================================================
+    py::class_<mori::collective::ReduceScatterSdma<uint32_t>>(m, "ReduceScatterSdmaHandle")
+        .def(py::init<int, int, size_t, size_t, bool>(),
+             py::arg("my_pe"),
+             py::arg("npes"),
+             py::arg("input_buffer_size"),
+             py::arg("output_buffer_size"),
+             py::arg("copy_output_to_user") = true,
+             "Initialize ReduceScatterSdma with PE ID, number of PEs, and buffer sizes")
+        .def(py::init<int, int, size_t, bool>(),
+             py::arg("my_pe"),
+             py::arg("npes"),
+             py::arg("transit_buffer_size") = 512 * 1024 * 1024,
+             py::arg("copy_output_to_user") = true,
+             "Initialize ReduceScatterSdma with PE ID, number of PEs, and transit buffer size")
+        .def("__call__",
+            [](mori::collective::ReduceScatterSdma<uint32_t>& self,
+               const torch::Tensor& input_tensor,
+               const torch::Tensor& output_tensor,
+               size_t count,
+               py::object stream_obj) -> bool {
+
+                if (input_tensor.dim() != 1)
+                    throw std::runtime_error("Input tensor must be 1-dimensional");
+                if (output_tensor.dim() != 1)
+                    throw std::runtime_error("Output tensor must be 1-dimensional");
+                if (!input_tensor.is_cuda())
+                    throw std::runtime_error("Input tensor must be CUDA tensor");
+                if (!output_tensor.is_cuda())
+                    throw std::runtime_error("Output tensor must be CUDA tensor");
+
+                size_t byte_count = count * input_tensor.element_size();
+                size_t u32_count = (byte_count + sizeof(uint32_t) - 1) / sizeof(uint32_t);
+
+                uint32_t* input_ptr = reinterpret_cast<uint32_t*>(input_tensor.data_ptr());
+                uint32_t* output_ptr = reinterpret_cast<uint32_t*>(output_tensor.data_ptr());
+
+                int device_index = input_tensor.device().index();
+                hipStream_t stream = convert_torch_stream_to_hip(stream_obj, device_index);
+
+                return self(input_ptr, output_ptr, u32_count, stream);
+            },
+            py::arg("input"),
+            py::arg("output"),
+            py::arg("count"),
+            py::arg("stream") = py::none(),
+            "Execute ReduceScatter SDMA operation")
+        .def("start_async",
+            [](mori::collective::ReduceScatterSdma<uint32_t>& self,
+               const torch::Tensor& input_tensor,
+               const torch::Tensor& output_tensor,
+               size_t count,
+               py::object stream_obj) -> bool {
+
+                if (input_tensor.dim() != 1 || output_tensor.dim() != 1)
+                    throw std::runtime_error("Tensors must be 1-dimensional");
+                if (!input_tensor.is_cuda() || !output_tensor.is_cuda())
+                    throw std::runtime_error("Tensors must be CUDA tensors");
+
+                size_t byte_count = count * input_tensor.element_size();
+                size_t u32_count = (byte_count + sizeof(uint32_t) - 1) / sizeof(uint32_t);
+
+                uint32_t* input_ptr = reinterpret_cast<uint32_t*>(input_tensor.data_ptr());
+                uint32_t* output_ptr = reinterpret_cast<uint32_t*>(output_tensor.data_ptr());
+
+                int device_index = input_tensor.device().index();
+                hipStream_t stream = convert_torch_stream_to_hip(stream_obj, device_index);
+
+                return self.start_async(input_ptr, output_ptr, u32_count, stream);
+            },
+            py::arg("input"),
+            py::arg("output"),
+            py::arg("count"),
+            py::arg("stream") = py::none(),
+            "Start asynchronous ReduceScatter SDMA operation")
+        .def("wait_async",
+            [](mori::collective::ReduceScatterSdma<uint32_t>& self,
+               py::object stream_obj) -> double {
+                hipStream_t stream = convert_torch_stream_to_hip(stream_obj);
+                return self.wait_async(stream);
+            },
+            py::arg("stream") = py::none(),
+            "Wait for asynchronous ReduceScatter SDMA operation to complete")
+        .def("is_async_in_progress",
+            &mori::collective::ReduceScatterSdma<uint32_t>::is_async_in_progress,
+            "Check if async operation is in progress")
+        .def("cancel_async",
+            &mori::collective::ReduceScatterSdma<uint32_t>::cancel_async,
+            "Cancel ongoing async operation")
+        .def("reset_flags",
+            &mori::collective::ReduceScatterSdma<uint32_t>::resetFlags,
+            "Reset synchronization flags")
+        .def("get_transit_buffer",
+            [](mori::collective::ReduceScatterSdma<uint32_t>& self,
+               py::object device_obj,
+               py::object dtype_obj) -> torch::Tensor {
+                void* buffer_ptr = self.getTransitBuffer();
+                size_t buffer_size = self.getTransitBufferSize();
+
+                if (buffer_ptr == nullptr)
+                    throw std::runtime_error("Transit buffer is null");
+
+                torch::Dtype torch_dtype = torch::kUInt32;
+                if (!dtype_obj.is_none())
+                    torch_dtype = py::cast<torch::Dtype>(dtype_obj);
+                size_t elem_size = torch::elementSize(torch_dtype);
+                size_t num_elements = buffer_size / elem_size;
+
+                int device_index = 0;
+                if (!device_obj.is_none()) {
+                    py::object torch_module = py::module_::import("torch");
+                    py::object tensor_class = torch_module.attr("Tensor");
+                    if (py::isinstance(device_obj, tensor_class)) {
+                        torch::Tensor t = device_obj.cast<torch::Tensor>();
+                        if (t.is_cuda()) {
+                            device_index = t.device().index();
+                        } else {
+                            throw std::runtime_error("device tensor must be a CUDA tensor");
+                        }
+                    } else {
+                        try {
+                            device_index = device_obj.cast<int>();
+                        } catch (const py::cast_error&) {
+                            throw std::runtime_error("device must be an int, a CUDA tensor, or None");
+                        }
+                    }
+                } else {
+                    device_index = at::cuda::current_device();
+                }
+
+                return torch::from_blob(
+                    buffer_ptr,
+                    {static_cast<int64_t>(num_elements)},
+                    torch::TensorOptions().dtype(torch_dtype).device(torch::kCUDA, device_index)
+                );
+            },
+            py::arg("device") = py::none(),
+            py::arg("dtype") = py::none(),
+            "Get transit buffer as a PyTorch tensor");
 
     // Keep old function-based interface for backward compatibility (optional)
     m.def("allreduce_sdma",

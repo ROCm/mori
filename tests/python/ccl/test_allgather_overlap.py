@@ -19,7 +19,7 @@ except ImportError:
     print("Warning: aiter not available, gemm timing will be disabled")
 
 
-def _test_allgather(rank, world_size, port, elems, iterations, warmup, use_custom_stream, test_gemm_overlap):
+def _test_allgather(rank, world_size, port, elems, iterations, warmup, use_custom_stream, test_gemm_overlap, gemm_m=4096, gemm_n=4096, gemm_k=4096):
     """Worker function for each process"""
     
     with TorchDistContext(rank=rank, world_size=world_size, master_port=port):
@@ -84,8 +84,7 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup, use_custo
         # Prepare GEMM test data if testing overlap
         A_q = B_q = A_scale = B_scale = bias = None
         if test_gemm_overlap and HAS_AITER:
-            # Create sample GEMM matrices for testing overlap
-            M, N, K = 4096, 4096, 4096
+            M, N, K = gemm_m, gemm_n, gemm_k
             A_q = torch.randint(-127, 127, (M, K), dtype=torch.int8, device=device)
             B_q = torch.randint(-127, 127, (K, N), dtype=torch.int8, device=device)
             A_scale = torch.randn(M, dtype=torch.float32, device=device)
@@ -618,13 +617,13 @@ def _test_allgather(rank, world_size, port, elems, iterations, warmup, use_custo
             raise AssertionError(f"PE {rank}: Allgather verification failed")
 
 
-def test_allgather(elems=67108864, world_size=8, iterations=10, warmup=1, use_custom_stream=False, test_gemm_overlap=False):
+def test_allgather(elems=67108864, world_size=8, iterations=10, warmup=1, use_custom_stream=False, test_gemm_overlap=False, gemm_m=4096, gemm_n=4096, gemm_k=4096):
     """Run Allgather SDMA test"""
     os.environ.setdefault('MORI_ENABLE_SDMA', '1')
     port = get_free_port()
     torch.multiprocessing.spawn(
         _test_allgather,
-        args=(world_size, port, elems, iterations, warmup, use_custom_stream, test_gemm_overlap),
+        args=(world_size, port, elems, iterations, warmup, use_custom_stream, test_gemm_overlap, gemm_m, gemm_n, gemm_k),
         nprocs=world_size,
         join=True,
     )
@@ -644,6 +643,9 @@ if __name__ == "__main__":
     parser.add_argument("--enable-sdma", type=int, default=1, choices=[0, 1], help="Enable SDMA")
     parser.add_argument("--use-custom-stream", action="store_true", help="Use custom CUDA stream instead of default stream")
     parser.add_argument("--test-gemm-overlap", action="store_true", help="Test GEMM and AllGather overlap on different streams")
+    parser.add_argument("--gemm-m", type=int, default=4096, help="GEMM M dimension (default: 4096)")
+    parser.add_argument("--gemm-n", type=int, default=4096, help="GEMM N dimension (default: 4096)")
+    parser.add_argument("--gemm-k", type=int, default=4096, help="GEMM K dimension (default: 4096)")
     args = parser.parse_args()
     os.environ['MORI_ENABLE_SDMA'] = str(args.enable_sdma)
     
@@ -654,8 +656,10 @@ if __name__ == "__main__":
     print(f"  Warmup: {args.warmup}")
     print(f"  Custom Stream: {args.use_custom_stream}")
     print(f"  Test GEMM Overlap: {args.test_gemm_overlap}")
-    if args.test_gemm_overlap and not HAS_AITER:
-        print(f"  WARNING: aiter not available, GEMM testing will be skipped")
+    if args.test_gemm_overlap:
+        print(f"  GEMM Dimensions: M={args.gemm_m}, N={args.gemm_n}, K={args.gemm_k}")
+        if not HAS_AITER:
+            print(f"  WARNING: aiter not available, GEMM testing will be skipped")
     print("-" * 60)
     
-    test_allgather(args.elems, args.world_size, args.iterations, args.warmup, args.use_custom_stream, args.test_gemm_overlap)
+    test_allgather(args.elems, args.world_size, args.iterations, args.warmup, args.use_custom_stream, args.test_gemm_overlap, args.gemm_m, args.gemm_n, args.gemm_k)
