@@ -396,7 +396,7 @@
 <td><p>Engine configuration: <code class="docutils literal notranslate"><span class="pre">host</span></code> (str), <code class="docutils literal notranslate"><span class="pre">port</span></code> (int)</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">RdmaBackendConfig</span></code></p></td>
-<td><p>RDMA backend config: <code class="docutils literal notranslate"><span class="pre">qp_per_transfer</span></code>, <code class="docutils literal notranslate"><span class="pre">post_batch_size</span></code>, <code class="docutils literal notranslate"><span class="pre">num_worker_threads</span></code>, <code class="docutils literal notranslate"><span class="pre">poll_cq_mode</span></code>, <code class="docutils literal notranslate"><span class="pre">enable_notification</span></code></p></td>
+<td><p>RDMA backend config: <code class="docutils literal notranslate"><span class="pre">qp_per_transfer</span></code>, <code class="docutils literal notranslate"><span class="pre">post_batch_size</span></code>, <code class="docutils literal notranslate"><span class="pre">num_worker_threads</span></code>, <code class="docutils literal notranslate"><span class="pre">poll_cq_mode</span></code>, <code class="docutils literal notranslate"><span class="pre">enable_notification</span></code>, <code class="docutils literal notranslate"><span class="pre">enable_transfer_chunking</span></code>, <code class="docutils literal notranslate"><span class="pre">chunk_bytes</span></code>, <code class="docutils literal notranslate"><span class="pre">max_chunks_per_transfer</span></code>, <code class="docutils literal notranslate"><span class="pre">num_nics_per_transfer</span></code></p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">XgmiBackendConfig</span></code></p></td>
 <td><p>XGMI backend config: <code class="docutils literal notranslate"><span class="pre">num_streams</span></code> (default 64), <code class="docutils literal notranslate"><span class="pre">num_events</span></code> (default 64)</p></td>
@@ -570,13 +570,25 @@
 <td><p>Set MORI-IO log verbosity level</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">RdmaBackendConfig.qp_per_transfer</span></code></p></td>
-<td><p>Queue pairs per transfer (default 1, increase for higher bandwidth)</p></td>
+<td><p>Queue pairs per transfer (default 1, increase for higher bandwidth; with multi-NIC these QPs are spread across NICs, so aim for ≥2 QP per NIC)</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">RdmaBackendConfig.poll_cq_mode</span></code></p></td>
 <td><p>CQ polling mode: <code class="docutils literal notranslate"><span class="pre">POLLING</span></code> (busy-wait, lower latency) or <code class="docutils literal notranslate"><span class="pre">EVENT</span></code> (interrupt-driven)</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">RdmaBackendConfig.enable_notification</span></code></p></td>
 <td><p>Enable target-side completion notifications (default <code class="docutils literal notranslate"><span class="pre">True</span></code>)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">RdmaBackendConfig.enable_transfer_chunking</span></code></p></td>
+<td><p>Split a large single transfer into <code class="docutils literal notranslate"><span class="pre">chunk_bytes</span></code> chunks pipelined across QPs (default <code class="docutils literal notranslate"><span class="pre">False</span></code>). Lifts single-transfer bandwidth from single-outstanding (~28 GB/s) to NIC line rate. Forces single-thread inline posting (ignores <code class="docutils literal notranslate"><span class="pre">num_worker_threads</span></code>). Env: <code class="docutils literal notranslate"><span class="pre">MORI_IO_ENABLE_CHUNKING</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">RdmaBackendConfig.chunk_bytes</span></code></p></td>
+<td><p>Chunk size when chunking is on (default <code class="docutils literal notranslate"><span class="pre">65536</span></code> = 64 KB). Messages ≤ this are unchanged. Env: <code class="docutils literal notranslate"><span class="pre">MORI_IO_CHUNK_BYTES</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">RdmaBackendConfig.max_chunks_per_transfer</span></code></p></td>
+<td><p>Cap on chunks per transfer to bound WR/SQ usage (default <code class="docutils literal notranslate"><span class="pre">64</span></code>). Env: <code class="docutils literal notranslate"><span class="pre">MORI_IO_MAX_CHUNKS</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">RdmaBackendConfig.num_nics_per_transfer</span></code></p></td>
+<td><p>Stripe a transfer across this many NICs (default <code class="docutils literal notranslate"><span class="pre">1</span></code>). Adaptive by memory type: GPU memory stays single-NIC (PCIe-bound); host memory stripes across NUMA-local NICs. Env: <code class="docutils literal notranslate"><span class="pre">MORI_IO_NUM_NICS_PER_TRANSFER</span></code></p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">IOEngineConfig.port</span> <span class="pre">=</span> <span class="pre">0</span></code></p></td>
 <td><p>Auto-bind to a free port</p></td>

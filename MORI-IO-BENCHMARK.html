@@ -378,7 +378,7 @@ torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">
 <td><p>Number of target devices</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--num-qp-per-transfer</span></code></p></td>
-<td><p>Number of queue pairs used</p></td>
+<td><p>Number of queue pairs used (default <code class="docutils literal notranslate"><span class="pre">4</span></code>)</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--op-type</span></code></p></td>
 <td><p>Operation type: <code class="docutils literal notranslate"><span class="pre">read</span></code> or <code class="docutils literal notranslate"><span class="pre">write</span></code></p></td>
@@ -387,13 +387,25 @@ torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">
 <td><p>CQ polling mode: <code class="docutils literal notranslate"><span class="pre">polling</span></code> or <code class="docutils literal notranslate"><span class="pre">event</span></code></p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--num-worker-threads</span></code></p></td>
-<td><p>Number of worker threads</p></td>
+<td><p>Number of worker threads (default <code class="docutils literal notranslate"><span class="pre">1</span></code>; ignored when chunking/multi-NIC is on — posting is single-thread inline)</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--log-level</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--disable-chunking</span></code></p></td>
+<td><p>Disable single-transfer chunking (chunking is <strong>on by default</strong>)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--chunk-bytes</span></code></p></td>
+<td><p>Chunk size in bytes when chunking is on (default <code class="docutils literal notranslate"><span class="pre">65536</span></code> = 64 KB)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--max-chunks</span></code></p></td>
+<td><p>Max chunks per transfer (default <code class="docutils literal notranslate"><span class="pre">64</span></code>)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--log-level</span></code></p></td>
 <td><p>Log level (e.g., <code class="docutils literal notranslate"><span class="pre">info</span></code>)</p></td>
 </tr>
 </tbody>
 </table>
+<blockquote>
+<div><p>Multi-NIC striping is controlled by the env var <code class="docutils literal notranslate"><span class="pre">MORI_IO_NUM_NICS_PER_TRANSFER</span></code> (default <code class="docutils literal notranslate"><span class="pre">1</span></code>). For host memory, set it to the number of NUMA-local NICs and keep <code class="docutils literal notranslate"><span class="pre">--num-qp-per-transfer</span> <span class="pre">≥</span> <span class="pre">2</span> <span class="pre">×</span> <span class="pre">NICs</span></code> so each NIC gets ≥2 QPs. GPU memory should stay single-NIC (PCIe-bound).</p>
+</div></blockquote>
 </section>
 <section id="results-thor2-rdma-read">
 <h2>Results: Thor2 RDMA Read<a class="headerlink" href="#results-thor2-rdma-read" title="Link to this heading"></a></h2>
