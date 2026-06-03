@@ -350,7 +350,7 @@ def _can_use_param_contiguous_all_gather_output(
     param_all_gather_input_numels: list[list[int]],
     param_all_gather_input_dtypes: list[list[torch.dtype]],
 ) -> bool:
-    raw = os.environ.get("MORI_FSDP_PARAM_CONTIGUOUS", "").strip().lower()
+    raw = os.environ.get("MORI_FSDP_ZERO_COPY_OUTPUT", "").strip().lower()
     if raw not in ("1", "true", "yes", "on"):
         return False
     if not getattr(all_gather_comm, "supports_param_contiguous_output", False):
