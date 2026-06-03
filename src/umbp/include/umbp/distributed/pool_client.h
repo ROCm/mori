@@ -120,7 +120,7 @@ class PoolClient {
   std::vector<bool> BatchExists(const std::vector<std::string>& keys);
 
   void* SsdStagingPtr() const { return ssd_staging_buffer_.get(); }
-  size_t SsdStagingSize() const { return config_.staging_buffer_size; }
+  size_t SsdStagingSize() const { return config_.ssd_staging_buffer_size; }
   const std::vector<uint8_t>& SsdStagingMemDescBytes() const { return ssd_staging_mem_desc_bytes_; }
 
   MasterClient& Master();

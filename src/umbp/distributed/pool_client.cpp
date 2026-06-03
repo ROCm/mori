@@ -337,11 +337,11 @@ bool PoolClient::Init() {
   // SSD staging buffer (one per process; not part of DRAM exports).  Remote SSD
   // reads are served out of it; allocated up front when SSD is enabled.
   if (config_.ssd.enabled) {
-    ssd_staging_buffer_ = std::make_unique<char[]>(config_.staging_buffer_size);
-    std::memset(ssd_staging_buffer_.get(), 0, config_.staging_buffer_size);
+    ssd_staging_buffer_ = std::make_unique<char[]>(config_.ssd_staging_buffer_size);
+    std::memset(ssd_staging_buffer_.get(), 0, config_.ssd_staging_buffer_size);
     if (io_engine_) {
       ssd_staging_mem_ =
-          io_engine_->RegisterMemory(ssd_staging_buffer_.get(), config_.staging_buffer_size, -1,
+          io_engine_->RegisterMemory(ssd_staging_buffer_.get(), config_.ssd_staging_buffer_size, -1,
                                      mori::io::MemoryLocationType::CPU);
       msgpack::sbuffer sbuf;
       msgpack::pack(sbuf, ssd_staging_mem_);
@@ -354,7 +354,7 @@ bool PoolClient::Init() {
     // (both null/empty when SSD is disabled, leaving SsdRpcAvailable() false).
     peer_service_ = std::make_unique<PeerServiceServer>(
         peer_alloc_.get(), peer_ssd_.get(), ssd_staging_buffer_.get(),
-        ssd_staging_buffer_ ? config_.staging_buffer_size : 0, ssd_staging_mem_desc_bytes_,
+        ssd_staging_buffer_ ? config_.ssd_staging_buffer_size : 0, ssd_staging_mem_desc_bytes_,
         config_.ssd_read_slots, config_.ssd_lease_timeout_s, engine_desc_bytes,
         master_client_.get(), ssd_copy_pipeline_.get());
     if (!peer_service_->Start(config_.peer_service_port)) {

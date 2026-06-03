@@ -143,6 +143,11 @@ struct PoolClientConfig {
   int ssd_read_slots = 16;
   int ssd_lease_timeout_s = 10;
 
+  // Backs ssd_staging_buffer_, allocated only when ssd.enabled. A remote SSD
+  // read fits one whole key value in a slot, so this / ssd_read_slots must be
+  // >= the largest single-key page KV (61-layer MLA page ~= 4.5 MB).
+  size_t ssd_staging_buffer_size = 268435456;  // 256 MiB
+
   std::vector<ExportableDram> dram_buffers;
   PeerSsdConfig ssd;
 
@@ -173,6 +178,8 @@ inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
   pc.master_config = dc.master_config;
   pc.io_engine = dc.io_engine;
   pc.staging_buffer_size = dc.staging_buffer_size;
+  pc.ssd_staging_buffer_size = dc.ssd_staging_buffer_size;
+  pc.ssd_read_slots = dc.ssd_read_slots;
   pc.peer_service_port = dc.peer_service_port;
   // 0 propagates through PoolClient -> MasterClient::RegisterSelf ->
   // proto -> ClientRegistry, where it is interpreted as "use the
