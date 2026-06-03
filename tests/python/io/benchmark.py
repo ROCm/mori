@@ -181,6 +181,13 @@ def parse_args():
         help="Max number of chunks per transfer (default: 64)",
     )
     parser.add_argument(
+        "--mem-type",
+        type=str,
+        default="gpu",
+        choices=["gpu", "cpu"],
+        help="Memory type for transfer buffers: 'gpu' (cuda) or 'cpu' (host) (default: gpu)",
+    )
+    parser.add_argument(
         "--iters",
         type=int,
         default=128,
@@ -258,6 +265,7 @@ class MoriIoBenchmark:
         enable_chunking: bool = True,
         chunk_bytes: int = 65536,
         max_chunks: int = 64,
+        mem_type: str = "gpu",
         src_gpu: int = 0,
         dst_gpu: int = 1,
         num_streams: int = 64,
@@ -294,6 +302,7 @@ class MoriIoBenchmark:
         self.enable_chunking = enable_chunking
         self.chunk_bytes = chunk_bytes
         self.max_chunks = max_chunks
+        self.mem_type = mem_type
 
         self.src_gpu = src_gpu
         self.dst_gpu = dst_gpu
@@ -324,16 +333,20 @@ class MoriIoBenchmark:
             self.global_rank = self.role_rank + self.num_initiator_dev
             self.role = EngineRole.TARGET
 
-        self.device = torch.device("cuda", self.role_rank)
         # When not batch_contiguous, use strided offsets so buffer must fit (buffer_size+1)*transfer_batch_size
         total_elements = (
             (self.buffer_size + 1) * self.transfer_batch_size
             if not self.batch_contiguous
             else self.buffer_size * self.transfer_batch_size
         )
-        self.tensor = torch.randn(total_elements).to(
-            self.device, dtype=torch.float8_e4m3fnuz
-        )
+        if self.mem_type == "cpu":
+            self.device = torch.device("cpu")
+            self.tensor = torch.randint(0, 256, (total_elements,), dtype=torch.uint8)
+        else:
+            self.device = torch.device("cuda", self.role_rank)
+            self.tensor = torch.randn(total_elements).to(
+                self.device, dtype=torch.float8_e4m3fnuz
+            )
 
     def _setup_xgmi(self):
         if self.xgmi_multiprocess:
@@ -391,6 +404,7 @@ class MoriIoBenchmark:
             print(f"  role_rank: {self.role_rank}")
             print(f"  num_initiator_dev: {self.num_initiator_dev}")
             print(f"  num_target_dev: {self.num_target_dev}")
+            print(f"  mem_type: {self.mem_type}")
             print(f"  num_qp_per_transfer: {self.num_qp_per_transfer}")
             print(f"  num_worker_threads: {self.num_worker_threads}")
             print(f"  enable_chunking: {self.enable_chunking}")
@@ -1004,6 +1018,7 @@ def benchmark_engine(local_rank, node_rank, args):
         enable_chunking=not args.disable_chunking,
         chunk_bytes=args.chunk_bytes,
         max_chunks=args.max_chunks,
+        mem_type=args.mem_type,
     )
     bench.print_config()
     bench.run()
