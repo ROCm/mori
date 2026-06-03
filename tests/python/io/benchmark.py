@@ -154,14 +154,31 @@ def parse_args():
     parser.add_argument(
         "--num-qp-per-transfer",
         type=int,
-        default=1,
-        help="Number of QPs for a single transfer",
+        default=4,
+        help="Number of QPs for a single transfer (default: 4)",
     )
     parser.add_argument(
         "--num-worker-threads",
         type=int,
         default=1,
         help="Number of threads used for transfer",
+    )
+    parser.add_argument(
+        "--disable-chunking",
+        action="store_true",
+        help="Disable single-transfer chunking (chunking is enabled by default)",
+    )
+    parser.add_argument(
+        "--chunk-bytes",
+        type=int,
+        default=65536,
+        help="Chunk size in bytes when chunking is enabled (default: 64KB)",
+    )
+    parser.add_argument(
+        "--max-chunks",
+        type=int,
+        default=64,
+        help="Max number of chunks per transfer (default: 64)",
     )
     parser.add_argument(
         "--iters",
@@ -232,12 +249,15 @@ class MoriIoBenchmark:
         rank_in_node: int = 0,
         num_initiator_dev: int = 1,
         num_target_dev: int = 1,
-        num_qp_per_transfer: int = 1,
+        num_qp_per_transfer: int = 4,
         num_worker_threads: int = 1,
         poll_cq_mode: str = "polling",
         max_send_wr: int = 0,
         max_cqe_num: int = 0,
         max_msg_sge: int = 0,
+        enable_chunking: bool = True,
+        chunk_bytes: int = 65536,
+        max_chunks: int = 64,
         src_gpu: int = 0,
         dst_gpu: int = 1,
         num_streams: int = 64,
@@ -271,6 +291,9 @@ class MoriIoBenchmark:
         self.max_send_wr = max_send_wr
         self.max_cqe_num = max_cqe_num
         self.max_msg_sge = max_msg_sge
+        self.enable_chunking = enable_chunking
+        self.chunk_bytes = chunk_bytes
+        self.max_chunks = max_chunks
 
         self.src_gpu = src_gpu
         self.dst_gpu = dst_gpu
@@ -370,6 +393,10 @@ class MoriIoBenchmark:
             print(f"  num_target_dev: {self.num_target_dev}")
             print(f"  num_qp_per_transfer: {self.num_qp_per_transfer}")
             print(f"  num_worker_threads: {self.num_worker_threads}")
+            print(f"  enable_chunking: {self.enable_chunking}")
+            if self.enable_chunking:
+                print(f"  chunk_bytes: {self.chunk_bytes}")
+                print(f"  max_chunks: {self.max_chunks}")
             print(f"  poll_cq_mode: {self.poll_cq_mode}")
             if self.max_send_wr or self.max_cqe_num or self.max_msg_sge:
                 print(
@@ -528,6 +555,9 @@ class MoriIoBenchmark:
             post_batch_size=-1,
             num_worker_threads=self.num_worker_threads,
             poll_cq_mode=self.poll_cq_mode,
+            enable_transfer_chunking=self.enable_chunking,
+            chunk_bytes=self.chunk_bytes,
+            max_chunks_per_transfer=self.max_chunks,
         )
         if self.max_send_wr > 0:
             config.max_send_wr = self.max_send_wr
@@ -971,6 +1001,9 @@ def benchmark_engine(local_rank, node_rank, args):
         max_send_wr=args.max_send_wr,
         max_cqe_num=args.max_cqe_num,
         max_msg_sge=args.max_msg_sge,
+        enable_chunking=not args.disable_chunking,
+        chunk_bytes=args.chunk_bytes,
+        max_chunks=args.max_chunks,
     )
     bench.print_config()
     bench.run()
