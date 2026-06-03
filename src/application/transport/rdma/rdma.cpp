@@ -385,8 +385,8 @@ namespace {
 // Export a dmabuf fd for the GPU buffer at `ptr`. Returns -1 if unsupported.
 int TryExportDmabufFd(void* ptr, size_t size) {
   int fd = -1;
-  hipError_t err = hipMemGetHandleForAddressRange(
-      &fd, reinterpret_cast<hipDeviceptr_t>(ptr), size, hipMemRangeHandleTypeDmaBufFd, 0);
+  hipError_t err = hipMemGetHandleForAddressRange(&fd, reinterpret_cast<hipDeviceptr_t>(ptr), size,
+                                                  hipMemRangeHandleTypeDmaBufFd, 0);
   if (err != hipSuccess) {
     (void)hipGetLastError();
     return -1;
