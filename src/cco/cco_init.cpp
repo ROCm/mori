@@ -163,7 +163,7 @@ int ccoCommCreate(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
   // 4 GiB-aligned) and non-zero (kernel-allocated VA), satisfying
   // HeapVAManager's invariants.
   comm->vaManager.reset(
-      new application::HeapVAManager(LocalSlotBase(comm), perRankVmmSize, granularity));
+      new application::HeapVAManager(LocalSlotBase(comm), perRankVmmSize, 0));
 
   // Step 4: SDMA queue setup. Materialize only if the user opted in
   // (MORI_ENABLE_SDMA) AND at least one peer has SDMA-capable hardware.

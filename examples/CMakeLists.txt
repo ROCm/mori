@@ -131,6 +131,11 @@ target_link_libraries(lsa_allreduce mori_cco MPI::MPI_CXX hip::host hip::device)
 target_include_directories(lsa_allreduce PRIVATE ${CMAKE_SOURCE_DIR}/include
                                                   ${CMAKE_SOURCE_DIR}/examples/utils)
 
+add_executable(lsa_memcheck cco/lsa_memcheck.cpp utils/args_parser.cpp)
+target_link_libraries(lsa_memcheck mori_cco MPI::MPI_CXX hip::host hip::device)
+target_include_directories(lsa_memcheck PRIVATE ${CMAKE_SOURCE_DIR}/include
+                                                 ${CMAKE_SOURCE_DIR}/examples/utils)
+
 # --- Application examples ---
 add_executable(context application/context.cpp)
 target_link_libraries(context mori_application hip::host hip::device)
