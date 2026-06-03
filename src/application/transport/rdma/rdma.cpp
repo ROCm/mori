@@ -38,6 +38,8 @@
 #include "mori/application/transport/rdma/providers/ibverbs/ibverbs.hpp"
 #include "mori/application/transport/rdma/providers/ionic/ionic.hpp"
 #include "mori/application/transport/rdma/providers/mlx5/mlx5.hpp"
+#include "mori/hip_compat.hpp"
+#include "mori/utils/env_utils.hpp"
 #include "mori/utils/mori_log.hpp"
 
 namespace mori {
@@ -315,6 +317,7 @@ int MaybeAddRelaxedOrderingFlag(int accessFlag) {
 /* ---------------------------------------------------------------------------------------------- */
 RdmaDeviceContext::RdmaDeviceContext(RdmaDevice* device, ibv_pd* inPd) : device(device), pd(inPd) {
   InitializeUdpSportConfiguration();
+  dmabufRegDisabled = env::IsEnvVarEnabled("MORI_DISABLE_DMABUF_REG");
 }
 
 RdmaDeviceContext::~RdmaDeviceContext() {
@@ -376,6 +379,50 @@ application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionDmabuf(
   handle.rkey = mr->rkey;
   handle.length = mr->length;
   return handle;
+}
+
+namespace {
+// Export a dmabuf fd for the GPU buffer at `ptr`. Returns -1 if unsupported.
+int TryExportDmabufFd(void* ptr, size_t size) {
+  int fd = -1;
+  hipError_t err = hipMemGetHandleForAddressRange(
+      &fd, reinterpret_cast<hipDeviceptr_t>(ptr), size, hipMemRangeHandleTypeDmaBufFd, 0);
+  if (err != hipSuccess) {
+    (void)hipGetLastError();
+    return -1;
+  }
+  return fd;
+}
+}  // namespace
+
+application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionAuto(void* ptr,
+                                                                              size_t size,
+                                                                              int accessFlag) {
+  if (!dmabufRegDisabled) {
+    int dmabufFd = TryExportDmabufFd(ptr, size);
+    if (dmabufFd >= 0) {
+      int effectiveAccessFlag = MaybeAddRelaxedOrderingFlag(accessFlag);
+      ibv_mr* mr = ibv_reg_dmabuf_mr(pd, 0, size, reinterpret_cast<uint64_t>(ptr), dmabufFd,
+                                     effectiveAccessFlag);
+      close(dmabufFd);
+      if (mr) {
+        MORI_APP_TRACE("RegisterRdmaMemoryRegionAuto[dmabuf], addr:{}, size:{}, lkey:{}, rkey:{}",
+                       ptr, size, mr->lkey, mr->rkey);
+        mrPool.insert({ptr, mr});
+        application::RdmaMemoryRegion handle;
+        handle.addr = reinterpret_cast<uintptr_t>(ptr);
+        handle.lkey = mr->lkey;
+        handle.rkey = mr->rkey;
+        handle.length = mr->length;
+        return handle;
+      }
+      MORI_APP_WARN(
+          "ibv_reg_dmabuf_mr failed (addr:{}, size:{}, errno:{} ({})), falling back to "
+          "ibv_reg_mr",
+          ptr, size, errno, strerror(errno));
+    }
+  }
+  return RegisterRdmaMemoryRegion(ptr, size, accessFlag);
 }
 
 void RdmaDeviceContext::DeregisterRdmaMemoryRegion(void* ptr) {

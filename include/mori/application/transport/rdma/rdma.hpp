@@ -205,6 +205,9 @@ class RdmaDeviceContext {
                                                     int accessFlag = MR_DEFAULT_ACCESS_FLAG);
   virtual RdmaMemoryRegion RegisterRdmaMemoryRegionDmabuf(void* ptr, size_t size, int dmabuf_fd,
                                                           int accessFlag = MR_DEFAULT_ACCESS_FLAG);
+  // dmabuf-first registration; falls back to ibv_reg_mr. Disable via MORI_DISABLE_DMABUF_REG.
+  virtual RdmaMemoryRegion RegisterRdmaMemoryRegionAuto(void* ptr, size_t size,
+                                                        int accessFlag = MR_DEFAULT_ACCESS_FLAG);
   virtual void DeregisterRdmaMemoryRegion(void* ptr);
 
   // TODO: query gid entry by ibv_query_gid_table
@@ -242,6 +245,7 @@ class RdmaDeviceContext {
  private:
   RdmaDevice* device;
   std::unordered_map<void*, ibv_mr*> mrPool;
+  bool dmabufRegDisabled{false};
 };
 
 /* -------------------------------------------------------------------------- */
