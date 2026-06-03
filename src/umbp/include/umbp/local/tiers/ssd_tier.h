@@ -46,7 +46,7 @@ enum class SSDAccessMode : int {
 
 class SSDTier : public TierBackend {
  public:
-  SSDTier(const std::string& dir, size_t capacity, const UMBPConfig& config,
+  SSDTier(const std::string& dir, size_t capacity, const UMBPSsdConfig& ssd_config,
           SSDAccessMode access_mode = SSDAccessMode::ReadWrite);
   ~SSDTier() override;
 
@@ -80,7 +80,7 @@ class SSDTier : public TierBackend {
  private:
   bool IsReadOnlyShared() const { return access_mode_ == SSDAccessMode::ReadOnlyShared; }
   bool ShouldSyncOnWrite() const {
-    return config_.ssd.durability.mode == UMBPDurabilityMode::Strict;
+    return ssd_config_.durability.mode == UMBPDurabilityMode::Strict;
   }
 
   bool EnsureActiveSegment(size_t need_bytes);
@@ -96,7 +96,7 @@ class SSDTier : public TierBackend {
 
   std::string dir_;
   size_t capacity_;
-  UMBPConfig config_;
+  UMBPSsdConfig ssd_config_;
   SSDAccessMode access_mode_;
 
   mutable std::mutex mu_;

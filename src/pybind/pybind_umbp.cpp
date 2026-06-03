@@ -158,8 +158,31 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("capacity_bytes", &UMBPSsdConfig::capacity_bytes)
       .def_readwrite("layout_mode", &UMBPSsdConfig::layout_mode)
       .def_readwrite("segment_size_bytes", &UMBPSsdConfig::segment_size_bytes)
+      .def_readwrite("high_watermark", &UMBPSsdConfig::high_watermark)
+      .def_readwrite("low_watermark", &UMBPSsdConfig::low_watermark)
       .def_readwrite("io", &UMBPSsdConfig::io)
-      .def_readwrite("durability", &UMBPSsdConfig::durability);
+      .def_readwrite("durability", &UMBPSsdConfig::durability)
+      .def_readwrite("ssd_backend", &UMBPSsdConfig::ssd_backend)
+      .def_readwrite("spdk_bdev_name", &UMBPSsdConfig::spdk_bdev_name)
+      .def_readwrite("spdk_reactor_mask", &UMBPSsdConfig::spdk_reactor_mask)
+      .def_readwrite("spdk_mem_size_mb", &UMBPSsdConfig::spdk_mem_size_mb)
+      .def_readwrite("spdk_nvme_pci_addr", &UMBPSsdConfig::spdk_nvme_pci_addr)
+      .def_readwrite("spdk_nvme_ctrl_name", &UMBPSsdConfig::spdk_nvme_ctrl_name)
+      .def_readwrite("spdk_io_workers", &UMBPSsdConfig::spdk_io_workers)
+      .def_readwrite("spdk_proxy_shm_name", &UMBPSsdConfig::spdk_proxy_shm_name)
+      .def_readwrite("spdk_proxy_bin", &UMBPSsdConfig::spdk_proxy_bin)
+      .def_readwrite("spdk_proxy_tenant_id", &UMBPSsdConfig::spdk_proxy_tenant_id)
+      .def_readwrite("spdk_proxy_tenant_quota_bytes", &UMBPSsdConfig::spdk_proxy_tenant_quota_bytes)
+      .def_readwrite("spdk_proxy_max_channels", &UMBPSsdConfig::spdk_proxy_max_channels)
+      .def_readwrite("spdk_proxy_data_per_channel_mb",
+                     &UMBPSsdConfig::spdk_proxy_data_per_channel_mb)
+      .def_readwrite("spdk_proxy_startup_timeout_ms", &UMBPSsdConfig::spdk_proxy_startup_timeout_ms)
+      .def_readwrite("spdk_proxy_auto_start", &UMBPSsdConfig::spdk_proxy_auto_start)
+      .def_readwrite("spdk_proxy_idle_exit_timeout_ms",
+                     &UMBPSsdConfig::spdk_proxy_idle_exit_timeout_ms)
+      .def_readwrite("spdk_proxy_allow_borrow", &UMBPSsdConfig::spdk_proxy_allow_borrow)
+      .def_readwrite("spdk_proxy_reserved_shared_bytes",
+                     &UMBPSsdConfig::spdk_proxy_reserved_shared_bytes);
 
   py::class_<UMBPEvictionConfig>(m, "UMBPEvictionConfig")
       .def(py::init<>())
@@ -192,6 +215,8 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("master_config", &UMBPDistributedConfig::master_config)
       .def_readwrite("io_engine", &UMBPDistributedConfig::io_engine)
       .def_readwrite("staging_buffer_size", &UMBPDistributedConfig::staging_buffer_size)
+      .def_readwrite("ssd_staging_buffer_size", &UMBPDistributedConfig::ssd_staging_buffer_size)
+      .def_readwrite("ssd_read_slots", &UMBPDistributedConfig::ssd_read_slots)
       .def_readwrite("peer_service_port", &UMBPDistributedConfig::peer_service_port)
       .def_readwrite("cache_remote_fetches", &UMBPDistributedConfig::cache_remote_fetches)
       .def_readwrite("dram_page_size", &UMBPDistributedConfig::dram_page_size);
@@ -206,20 +231,6 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("role", &UMBPConfig::role)
       .def_readwrite("follower_mode", &UMBPConfig::follower_mode)
       .def_readwrite("force_ssd_copy_on_write", &UMBPConfig::force_ssd_copy_on_write)
-      .def_readwrite("ssd_backend", &UMBPConfig::ssd_backend)
-      .def_readwrite("spdk_nvme_pci_addr", &UMBPConfig::spdk_nvme_pci_addr)
-      .def_readwrite("spdk_proxy_shm_name", &UMBPConfig::spdk_proxy_shm_name)
-      .def_readwrite("spdk_proxy_tenant_id", &UMBPConfig::spdk_proxy_tenant_id)
-      .def_readwrite("spdk_proxy_tenant_quota_bytes", &UMBPConfig::spdk_proxy_tenant_quota_bytes)
-      .def_readwrite("spdk_proxy_max_channels", &UMBPConfig::spdk_proxy_max_channels)
-      .def_readwrite("spdk_proxy_data_per_channel_mb", &UMBPConfig::spdk_proxy_data_per_channel_mb)
-      .def_readwrite("spdk_proxy_startup_timeout_ms", &UMBPConfig::spdk_proxy_startup_timeout_ms)
-      .def_readwrite("spdk_proxy_auto_start", &UMBPConfig::spdk_proxy_auto_start)
-      .def_readwrite("spdk_proxy_idle_exit_timeout_ms",
-                     &UMBPConfig::spdk_proxy_idle_exit_timeout_ms)
-      .def_readwrite("spdk_proxy_allow_borrow", &UMBPConfig::spdk_proxy_allow_borrow)
-      .def_readwrite("spdk_proxy_reserved_shared_bytes",
-                     &UMBPConfig::spdk_proxy_reserved_shared_bytes)
       .def_readwrite("distributed", &UMBPConfig::distributed);
 
   py::class_<IUMBPClient, std::unique_ptr<IUMBPClient>>(m, "UMBPClient")

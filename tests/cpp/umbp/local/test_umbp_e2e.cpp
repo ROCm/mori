@@ -100,7 +100,7 @@ static UMBPConfig MakePosixConfig(size_t dram_mb = 64, size_t ssd_mb = 256) {
   cfg.dram.capacity_bytes = dram_mb * 1024 * 1024;
   cfg.ssd.capacity_bytes = ssd_mb * 1024 * 1024;
   cfg.ssd.io.backend = UMBPIoBackend::PThread;
-  cfg.ssd_backend = "posix";
+  cfg.ssd.ssd_backend = "posix";
   cfg.ssd.storage_dir = "/tmp/umbp_e2e_test_" + std::to_string(getpid());
   cfg.role = UMBPRole::Standalone;
   return cfg;
@@ -397,16 +397,16 @@ static bool test_spdk_standalone_write_read() {
   pid_t pid = fork();
   if (pid == 0) {
     UMBPConfig cfg;
-    cfg.ssd_backend = "spdk";
+    cfg.ssd.ssd_backend = "spdk";
     cfg.role = UMBPRole::Standalone;
     cfg.dram.capacity_bytes = 64ULL * 1024 * 1024;
     cfg.ssd.capacity_bytes = 1024ULL * 1024 * 1024;
 
     auto env_cfg = UMBPConfig::FromEnvironment();
-    cfg.spdk_nvme_pci_addr = env_cfg.spdk_nvme_pci_addr;
-    cfg.spdk_reactor_mask = env_cfg.spdk_reactor_mask;
-    cfg.spdk_mem_size_mb = env_cfg.spdk_mem_size_mb;
-    cfg.spdk_io_workers = env_cfg.spdk_io_workers;
+    cfg.ssd.spdk_nvme_pci_addr = env_cfg.ssd.spdk_nvme_pci_addr;
+    cfg.ssd.spdk_reactor_mask = env_cfg.ssd.spdk_reactor_mask;
+    cfg.ssd.spdk_mem_size_mb = env_cfg.ssd.spdk_mem_size_mb;
+    cfg.ssd.spdk_io_workers = env_cfg.ssd.spdk_io_workers;
 
     StandaloneClient client(cfg);
 
@@ -682,9 +682,9 @@ static bool test_proxy_cas_rank_allocation() {
 
       // Wait for proxy, then auto-allocate rank via CAS
       std::string shm_name =
-          cfg.spdk_proxy_shm_name.empty() ? "/umbp_spdk_proxy" : cfg.spdk_proxy_shm_name;
+          cfg.ssd.spdk_proxy_shm_name.empty() ? "/umbp_spdk_proxy" : cfg.ssd.spdk_proxy_shm_name;
       SpdkProxyTier::WaitForProxy(shm_name, 15000);
-      SpdkProxyTier tier(cfg);
+      SpdkProxyTier tier(cfg.ssd);
       uint8_t result = tier.IsValid() ? 1 : 0;
       write(pipe_fds[i][1], &result, 1);
       close(pipe_fds[i][1]);

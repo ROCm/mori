@@ -32,8 +32,12 @@ Router::Router(GlobalBlockIndex& index, ClientRegistry& registry,
                std::unique_ptr<RouteGetStrategy> get_strategy,
                std::unique_ptr<RoutePutStrategy> put_strategy)
     : index_(index), registry_(registry) {
+  // Default to tier-priority (HBM > DRAM > SSD): with the SSD cold tier live, a
+  // random pick could route a key that also has a DRAM/HBM copy to the slow
+  // SSD.  Callers can still inject RandomRouteGetStrategy (or any other) via
+  // config_.get_strategy.
   get_strategy_ =
-      get_strategy ? std::move(get_strategy) : std::make_unique<RandomRouteGetStrategy>();
+      get_strategy ? std::move(get_strategy) : std::make_unique<TierPriorityRouteGetStrategy>();
   put_strategy_ =
       put_strategy ? std::move(put_strategy) : std::make_unique<TierAwareMostAvailableStrategy>();
 }

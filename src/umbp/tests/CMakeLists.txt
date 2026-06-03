@@ -93,3 +93,96 @@ target_link_libraries(test_router_dedup PRIVATE umbp_common GTest::gtest_main)
 target_compile_features(test_router_dedup PRIVATE cxx_std_17)
 
 gtest_discover_tests(test_router_dedup)
+
+# ---------------------------------------------------------------------------
+# test_peer_ssd_manager — SSD tier ownership + owned-location source
+# ---------------------------------------------------------------------------
+add_executable(test_peer_ssd_manager test_peer_ssd_manager.cpp)
+
+target_link_libraries(test_peer_ssd_manager PRIVATE umbp_common
+                                                    GTest::gtest_main)
+
+target_compile_features(test_peer_ssd_manager PRIVATE cxx_std_17)
+
+gtest_discover_tests(test_peer_ssd_manager)
+
+# ---------------------------------------------------------------------------
+# test_peer_ssd_eviction — LRU + watermark eviction + in-flight guard
+# ---------------------------------------------------------------------------
+add_executable(test_peer_ssd_eviction test_peer_ssd_eviction.cpp)
+
+target_link_libraries(test_peer_ssd_eviction PRIVATE umbp_common
+                                                     GTest::gtest_main)
+
+target_compile_features(test_peer_ssd_eviction PRIVATE cxx_std_17)
+
+gtest_discover_tests(test_peer_ssd_eviction)
+
+# ---------------------------------------------------------------------------
+# test_ssd_copy_pipeline — DramCopyPin + async copy-on-commit pipeline
+# ---------------------------------------------------------------------------
+add_executable(test_ssd_copy_pipeline test_ssd_copy_pipeline.cpp)
+
+target_link_libraries(test_ssd_copy_pipeline PRIVATE umbp_common
+                                                     GTest::gtest_main)
+
+target_compile_features(test_ssd_copy_pipeline PRIVATE cxx_std_17)
+
+gtest_discover_tests(test_ssd_copy_pipeline)
+
+# ---------------------------------------------------------------------------
+# test_tier_priority_route_get — RouteGet tier-priority strategy
+# ---------------------------------------------------------------------------
+add_executable(test_tier_priority_route_get test_tier_priority_route_get.cpp)
+
+target_link_libraries(test_tier_priority_route_get PRIVATE umbp_common
+                                                           GTest::gtest_main)
+
+target_compile_features(test_tier_priority_route_get PRIVATE cxx_std_17)
+
+gtest_discover_tests(test_tier_priority_route_get)
+
+# ---------------------------------------------------------------------------
+# test_peer_ssd_read_rpc — SSD read RPC over a gRPC loopback (status
+# distinctions: OK / NOT_FOUND / NO_SLOT / SIZE_TOO_LARGE + slot lifecycle).
+# Needs the gRPC peer service + generated stubs (umbp_core) and protobuf/gRPC.
+# ---------------------------------------------------------------------------
+add_executable(test_peer_ssd_read_rpc test_peer_ssd_read_rpc.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_peer_ssd_read_rpc PRIVATE -Wl,--no-as-needed)
+endif()
+
+target_link_libraries(
+  test_peer_ssd_read_rpc PRIVATE umbp_core umbp_common ${_PROTOBUF_LIB}
+                                 ${_GRPCPP_LIB} GTest::gtest_main)
+
+target_compile_features(test_peer_ssd_read_rpc PRIVATE cxx_std_17)
+
+gtest_discover_tests(test_peer_ssd_read_rpc)
+
+# ---------------------------------------------------------------------------
+# test_ssd_read_lease_gating — pure reader-side lease gating decision logic
+# (ssd_read_lease.h).  Header-only under test (no gRPC / RDMA deps).
+# ---------------------------------------------------------------------------
+add_executable(test_ssd_read_lease_gating test_ssd_read_lease_gating.cpp)
+
+target_link_libraries(test_ssd_read_lease_gating PRIVATE umbp_common
+                                                         GTest::gtest_main)
+
+target_compile_features(test_ssd_read_lease_gating PRIVATE cxx_std_17)
+
+gtest_discover_tests(test_ssd_read_lease_gating)
+
+# ---------------------------------------------------------------------------
+# test_ssd_reliability — cross-component reliability: owned-source DRAM+SSD
+# merge, SSD evict -> REMOVE -> master index convergence, tier-priority over the
+# real index, crash-restart discard, and observability counters.
+# ---------------------------------------------------------------------------
+add_executable(test_ssd_reliability test_ssd_reliability.cpp)
+
+target_link_libraries(test_ssd_reliability PRIVATE umbp_common
+                                                   GTest::gtest_main)
+
+target_compile_features(test_ssd_reliability PRIVATE cxx_std_17)
+
+gtest_discover_tests(test_ssd_reliability)

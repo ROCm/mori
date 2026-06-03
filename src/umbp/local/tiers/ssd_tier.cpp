@@ -37,21 +37,21 @@ namespace fs = std::filesystem;
 
 namespace mori::umbp {
 
-SSDTier::SSDTier(const std::string& dir, size_t capacity, const UMBPConfig& config,
+SSDTier::SSDTier(const std::string& dir, size_t capacity, const UMBPSsdConfig& ssd_config,
                  SSDAccessMode access_mode)
     : TierBackend(StorageTier::LOCAL_SSD),
       dir_(dir),
       capacity_(capacity),
-      config_(config),
+      ssd_config_(ssd_config),
       access_mode_(access_mode),
-      io_driver_(CreateStorageIoDriver(config.ssd.io.backend,
-                                       static_cast<uint32_t>(config.ssd.io.queue_depth))),
+      io_driver_(CreateStorageIoDriver(ssd_config.io.backend,
+                                       static_cast<uint32_t>(ssd_config.io.queue_depth))),
       index_(capacity) {
   std::string error_message;
-  if (!config_.Validate(&error_message)) {
-    throw std::runtime_error("invalid UMBP config: " + error_message);
+  if (!ssd_config_.Validate(&error_message)) {
+    throw std::runtime_error("invalid UMBP SSD config: " + error_message);
   }
-  if (config_.ssd.io.backend == UMBPIoBackend::IoUring &&
+  if (ssd_config_.io.backend == UMBPIoBackend::IoUring &&
       !io_driver_->Capabilities().native_async) {
     MORI_UMBP_WARN(
         "SSDTier: io_uring backend requested but unavailable (kernel missing io_uring "
@@ -120,7 +120,7 @@ bool SSDTier::EnsureActiveSegment(size_t need_bytes) {
   }
   if (!seg) return false;
 
-  if (seg->write_offset + need_bytes <= config_.ssd.segment_size_bytes) return true;
+  if (seg->write_offset + need_bytes <= ssd_config_.segment_size_bytes) return true;
 
   uint64_t new_id = index_.next_segment_id();
   if (!OpenOrCreateSegmentLocked(new_id)) return false;
@@ -197,7 +197,7 @@ bool SSDTier::WriteBatch(const std::vector<std::string>& keys,
   for (size_t i = 0; i < keys.size(); ++i) {
     total_bytes += sizeof(segment::RecordHeader) + keys[i].size() + sizes[i];
   }
-  if (total_bytes > config_.ssd.segment_size_bytes) {
+  if (total_bytes > ssd_config_.segment_size_bytes) {
     bool all_ok = true;
     for (size_t i = 0; i < keys.size(); ++i) {
       if (!Write(keys[i], data_ptrs[i], sizes[i])) all_ok = false;

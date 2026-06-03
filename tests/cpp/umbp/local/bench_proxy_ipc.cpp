@@ -121,7 +121,7 @@ static void RunBatch(SpdkProxyTier& tier, uint32_t rank_id, const std::string& s
 }
 
 int main() {
-  auto cfg = UMBPConfig::FromEnvironment();
+  auto cfg = UMBPConfig::FromEnvironment().ssd;
   cfg.ssd_backend = "spdk_proxy";
 
   SpdkProxyTier tier(cfg);

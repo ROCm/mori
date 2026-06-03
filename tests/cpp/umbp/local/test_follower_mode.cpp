@@ -42,11 +42,11 @@ static void cleanup_dir(const std::string& dir) {
   }
 }
 
-static UMBPConfig make_ssd_config() {
-  UMBPConfig cfg;
-  cfg.ssd.io.backend = UMBPIoBackend::PThread;
-  cfg.ssd.durability.mode = UMBPDurabilityMode::Relaxed;
-  cfg.ssd.segment_size_bytes = 4 * 1024 * 1024;
+static UMBPSsdConfig make_ssd_config() {
+  UMBPSsdConfig cfg;
+  cfg.io.backend = UMBPIoBackend::PThread;
+  cfg.durability.mode = UMBPDurabilityMode::Relaxed;
+  cfg.segment_size_bytes = 4 * 1024 * 1024;
   return cfg;
 }
 

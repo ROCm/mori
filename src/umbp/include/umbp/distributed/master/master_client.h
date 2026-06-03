@@ -28,6 +28,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -41,6 +42,7 @@
 #include <vector>
 
 #include "umbp/distributed/config.h"
+#include "umbp/distributed/peer/owned_location_source.h"
 #include "umbp/distributed/routing/route_put_strategy.h"
 #include "umbp/distributed/types.h"
 
@@ -53,6 +55,7 @@ class HeartbeatResponse;
 namespace mori::umbp {
 
 class PeerDramAllocator;
+class PeerSsdManager;
 
 inline constexpr std::size_t kMasterClientMaxPendingHistograms = 15000;
 
@@ -81,11 +84,11 @@ class MasterClient {
 
   // Register with master.  In the master-as-advisor design only
   // membership + capacity-snapshot metadata is shipped — DRAM/HBM
-  // descriptors are peer-internal now.
+  // descriptors are peer-internal now.  `tier_capacities` is the single
+  // source of per-tier capacity, including SSD (TierType::SSD).
   grpc::Status RegisterSelf(const std::map<TierType, TierCapacity>& tier_capacities,
                             const std::string& peer_address = "",
-                            const std::vector<uint8_t>& engine_desc_bytes = {},
-                            const std::vector<uint64_t>& ssd_store_capacities = {});
+                            const std::vector<uint8_t>& engine_desc_bytes = {});
   grpc::Status UnregisterSelf();
 
   // --- Router ---
@@ -120,9 +123,23 @@ class MasterClient {
 
   // --- Heartbeat (event-driven) ---
   // Bind a PeerDramAllocator whose outbox the heartbeat thread will
-  // drain.  Pass nullptr for SSD-only peers.  Must be set before
-  // StartHeartbeat() — the heartbeat thread reads it once per tick.
-  void SetPeerDramAllocator(PeerDramAllocator* alloc);
+  // drain.  Pass nullptr for SSD-only peers (skipped, not registered).
+  // Also keeps the concrete pointer for DRAM-specific duties the
+  // OwnedLocationSource interface does not cover (capacity snapshot,
+  // owned-key counts, distributed-clear write gate).  Must be set before
+  // StartHeartbeat() — the heartbeat thread reads sources once per tick.
+  void SetPeerDramAllocator(PeerDramAllocator* dram_alloc);
+
+  // Bind the SSD manager: registers it as an owned-location event source
+  // AND keeps the concrete pointer so heartbeat can merge live SSD
+  // capacity into tier_capacities.  Pass nullptr to skip.  Must be set
+  // before StartHeartbeat().
+  void SetPeerSsdManager(PeerSsdManager* ssd_manager);
+
+  // Register an additional owned-location event source whose events are
+  // drained/snapshotted into the same heartbeat bundle (single monotonic
+  // seq).  Null is ignored.  Must be set before StartHeartbeat().
+  void AddOwnedLocationSource(OwnedLocationSource* source);
 
   void StartHeartbeat();
   void StopHeartbeat();
@@ -142,6 +159,17 @@ class MasterClient {
   void SetGauge(std::string name, std::string help, Labels labels, double value);
   void Observe(std::string name, std::string help, Labels labels, const std::vector<double>& bounds,
                double value);
+
+  // Register a callback run once per metrics flush tick in the existing metrics
+  // thread (no new thread) so a component can publish counters/gauges from its
+  // own atomics, keeping AddCounter off hot paths.  MUST be called before
+  // RegisterSelf() (the list is read lock-free afterwards; late calls are
+  // rejected).  Caller keeps the provider's data alive until StopMetricsReporting().
+  void AddMetricsProvider(std::function<void()> provider);
+
+  // Stop and join the metrics thread.  Idempotent.  PoolClient::Shutdown calls
+  // it before tearing down the components its provider reads.
+  void StopMetricsReporting();
 
   bool IsRegistered() const { return registered_; }
 
@@ -202,8 +230,20 @@ class MasterClient {
   std::map<TierType, TierCapacity> current_capacities_;
 
   // Peer-event source for the heartbeat thread.  Non-owning; lifetime
-  // is managed by PoolClient.
+  // is managed by PoolClient.  Kept as a concrete pointer (in addition to
+  // its slot in owned_sources_) for DRAM-specific duties the
+  // OwnedLocationSource interface does not cover: TierCapacitiesSnapshot,
+  // OwnedKeyCountByTier, ClearLocal/ClearFullSyncAcked.
   PeerDramAllocator* peer_alloc_ = nullptr;
+
+  // Non-owning.  Kept concrete (in addition to owned_sources_) so heartbeat
+  // can merge live SSD capacity into tier_capacities.
+  PeerSsdManager* ssd_manager_ = nullptr;
+
+  // All owned-location event sources (DRAM allocator + SSD manager).  Drained
+  // and snapshotted into a single heartbeat bundle under one monotonic seq.
+  // Populated before StartHeartbeat(); read-only afterwards (no lock needed).
+  std::vector<OwnedLocationSource*> owned_sources_;
 
   // Serializes the actual Heartbeat RPC: at most one full-sync or
   // delta heartbeat is on the wire at a time. ClearFullSync() takes
@@ -280,8 +320,14 @@ class MasterClient {
   std::condition_variable metrics_cv_;
 
   void StartMetricsReporting();
-  void StopMetricsReporting();
   void MetricsLoop();
+  // Run providers, swap the pending buffers, and ship one ReportMetrics.  Called
+  // every tick and once more after the loop exits (final shutdown flush).
+  void FlushMetricsOnce();
+
+  // Callbacks run at the top of every MetricsLoop tick (see AddMetricsProvider).
+  // Written only before StartMetricsReporting(); read-only afterwards.
+  std::vector<std::function<void()>> metrics_providers_;
 
   // --- ScopedRpcTimer integration ---
   // Called by ScopedRpcTimer at the end of every monitored MasterClient RPC.

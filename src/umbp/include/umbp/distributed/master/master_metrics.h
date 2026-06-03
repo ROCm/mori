@@ -207,3 +207,100 @@
 #define MORI_UMBP_METRIC_MASTER_CLIENT_METRICS_DROPPED_TOTAL_HELP                                \
   "Number of histogram observations dropped client-side because the pending buffer hit its cap " \
   "(see kMasterClientMaxPendingHistograms in master_client.h)"
+
+// --- SSD tier: copy / read / eviction / staging (peer-reported) ------------
+// All shipped via ReportMetrics from the owner peer (node=<node_id>).  Labels
+// are low-cardinality fixed enums only — status / reason — never key / path /
+// error string / lease id.  Counters are accumulated peer-side as cheap relaxed
+// atomics at the event point and converted to ReportMetrics deltas once per
+// metrics flush tick (no per-key AddCounter on the commit / read hot paths).
+// SSD capacity is NOT re-exported here: it rides heartbeat tier_capacities as
+// mori_umbp_client_capacity_{used,total}_bytes{tier="SSD"} (master emits the
+// tier label upper-cased, e.g. tier="SSD" — match that casing in queries).
+
+// copy-on-commit pipeline (ssd_copy_pipeline.cpp)
+#define MORI_UMBP_METRIC_SSD_COPY_ENQUEUED_TOTAL "mori_umbp_ssd_copy_enqueued_total"
+#define MORI_UMBP_METRIC_SSD_COPY_ENQUEUED_TOTAL_HELP \
+  "SSD copy-on-commit tasks accepted into the async copy queue"
+
+#define MORI_UMBP_METRIC_SSD_COPY_SUCCEEDED_TOTAL "mori_umbp_ssd_copy_succeeded_total"
+#define MORI_UMBP_METRIC_SSD_COPY_SUCCEEDED_TOTAL_HELP                                           \
+  "SSD copy-on-commit tasks that completed successfully: either the bytes were written to the "  \
+  "backend (emits ADD SSD) OR the content-addressed key was already resident (dedup fast path, " \
+  "no write, no event).  Not a count of physical writes — see "                                  \
+  "mori_umbp_ssd_copy_bytes_total for physical SSD write bytes."
+
+#define MORI_UMBP_METRIC_SSD_COPY_FAILED_TOTAL "mori_umbp_ssd_copy_failed_total"
+#define MORI_UMBP_METRIC_SSD_COPY_FAILED_TOTAL_HELP \
+  "SSD copy-on-commit tasks whose backend Write failed (no SSD copy, no event)"
+
+// label: reason=queue_full|stopped
+#define MORI_UMBP_METRIC_SSD_COPY_DROPPED_TOTAL "mori_umbp_ssd_copy_dropped_total"
+#define MORI_UMBP_METRIC_SSD_COPY_DROPPED_TOTAL_HELP                             \
+  "SSD copy tasks dropped at enqueue (reason=queue_full when the bounded queue " \
+  "was full, reason=stopped when the pipeline was stopped/quiescing)"
+
+// label: status=ok|not_found|no_slot|size_too_large|error
+#define MORI_UMBP_METRIC_SSD_READ_TOTAL "mori_umbp_ssd_read_total"
+#define MORI_UMBP_METRIC_SSD_READ_TOTAL_HELP                                    \
+  "SSD reads served by this peer's SSD tier, by outcome (covers local owner "   \
+  "reads and remote PrepareSsdRead).  not_found = stale-route miss; no_slot = " \
+  "staging slots exhausted (transient, not a miss)"
+
+// SSD IO byte counters.  Bandwidth is derived in Grafana/Prometheus via
+// rate(<counter>[<window>]) (bytes/s) — same convention as the client
+// inbound/outbound byte counters.  copy_bytes = bytes landed on SSD by a
+// successful copy-on-commit Write; read_bytes = bytes served by a successful
+// SSD read (local owner read or remote PrepareSsdRead).
+#define MORI_UMBP_METRIC_SSD_COPY_BYTES_TOTAL "mori_umbp_ssd_copy_bytes_total"
+#define MORI_UMBP_METRIC_SSD_COPY_BYTES_TOTAL_HELP                                 \
+  "Bytes written to the SSD tier by successful copy-on-commit.  rate() = offered " \
+  "SSD write throughput (bytes / wall-clock; a load signal, not device per-IO "    \
+  "bandwidth — it averages in idle gaps)"
+
+#define MORI_UMBP_METRIC_SSD_READ_BYTES_TOTAL "mori_umbp_ssd_read_bytes_total"
+#define MORI_UMBP_METRIC_SSD_READ_BYTES_TOTAL_HELP                                \
+  "Bytes read from the SSD tier by successful reads.  rate() = offered SSD read " \
+  "throughput (bytes / wall-clock; a load signal, not device per-IO bandwidth)"
+
+// eviction (peer_ssd_manager.cpp, local watermark + LRU)
+#define MORI_UMBP_METRIC_SSD_EVICTION_ROUNDS_TOTAL "mori_umbp_ssd_eviction_rounds_total"
+#define MORI_UMBP_METRIC_SSD_EVICTION_ROUNDS_TOTAL_HELP \
+  "Local SSD eviction rounds that actually ran (used above high watermark)"
+
+#define MORI_UMBP_METRIC_SSD_EVICTION_VICTIMS_TOTAL "mori_umbp_ssd_eviction_victims_total"
+#define MORI_UMBP_METRIC_SSD_EVICTION_VICTIMS_TOTAL_HELP \
+  "SSD keys evicted locally (REMOVE SSD emitted)"
+
+#define MORI_UMBP_METRIC_SSD_EVICTION_BYTES_FREED_TOTAL "mori_umbp_ssd_eviction_bytes_freed_total"
+#define MORI_UMBP_METRIC_SSD_EVICTION_BYTES_FREED_TOTAL_HELP "Bytes freed by local SSD eviction"
+
+#define MORI_UMBP_METRIC_SSD_EVICTION_BACKEND_FAILED_TOTAL \
+  "mori_umbp_ssd_eviction_backend_failed_total"
+#define MORI_UMBP_METRIC_SSD_EVICTION_BACKEND_FAILED_TOTAL_HELP \
+  "Local SSD evictions where the backend Evict failed (key kept for retry)"
+
+// staging (peer_service.cpp SSD read slots)
+#define MORI_UMBP_METRIC_SSD_STAGING_SLOTS_IN_USE "mori_umbp_ssd_staging_slots_in_use"
+#define MORI_UMBP_METRIC_SSD_STAGING_SLOTS_IN_USE_HELP \
+  "SSD read staging slots currently in use (Preparing or Leased), sampled once per flush"
+
+#define MORI_UMBP_METRIC_SSD_STAGING_EXPIRED_RECLAIMS_TOTAL \
+  "mori_umbp_ssd_staging_expired_reclaims_total"
+#define MORI_UMBP_METRIC_SSD_STAGING_EXPIRED_RECLAIMS_TOTAL_HELP \
+  "SSD read staging slots reclaimed after lease TTL expiry"
+
+#define MORI_UMBP_METRIC_SSD_STAGING_SLOT_FULL_REJECTS_TOTAL \
+  "mori_umbp_ssd_staging_slot_full_rejects_total"
+#define MORI_UMBP_METRIC_SSD_STAGING_SLOT_FULL_REJECTS_TOTAL_HELP \
+  "PrepareSsdRead calls rejected with NO_SLOT because all staging slots were busy"
+
+// Optional reader-side diagnostic: per-batch count of remote SSD reads that
+// stayed transient-not-served (NO_SLOT / reader-local lease expiry) after the
+// configured attempts.  Reported by the reader node; no reason label (kept
+// cheap — one AddCounter per batch).  lease expiry is reader-local and never
+// visible in the peer-side ssd_read_total, so this is its only observability.
+#define MORI_UMBP_METRIC_SSD_READ_CLIENT_TRANSIENT_TOTAL "mori_umbp_ssd_read_client_transient_total"
+#define MORI_UMBP_METRIC_SSD_READ_CLIENT_TRANSIENT_TOTAL_HELP                   \
+  "Remote SSD reads reported not-served this round due to transient NO_SLOT / " \
+  "reader-local lease expiry (not a definitive miss)"

@@ -118,9 +118,15 @@ struct ExportableDram {
   size_t size = 0;
 };
 
-struct ExportableSsd {
-  std::string dir;
-  size_t capacity = 0;
+// SSD-tier construction parameters lowered from the user-facing UMBPConfig.
+// SSDTier depends on UMBPSsdConfig (io backend/queue_depth, segment_size,
+// durability, storage_dir, capacity, watermarks, backend selection), so the
+// peer only needs that subset — not the whole global config.  ssd_backend
+// (posix / spdk / spdk_proxy) lives inside UMBPSsdConfig, so PeerSsdManager
+// picks the backend from cfg.ssd directly.
+struct PeerSsdConfig {
+  bool enabled = false;
+  UMBPSsdConfig ssd;
 };
 
 struct PoolClientConfig {
@@ -129,8 +135,21 @@ struct PoolClientConfig {
 
   size_t staging_buffer_size = 64ULL * 1024 * 1024;
 
+  // SSD read-staging tuning (peer side).  More slots reduce NO_SLOT under large
+  // concurrent prefetch batches, but shrink per-slot size (= staging_buffer_size
+  // / slots), which must stay >= the largest single SSD block.  The lease TTL
+  // is the primary slot-reclaim mechanism (ReleaseSsdLease is best-effort), so
+  // it should comfortably exceed one SSD read's latency.
+  int ssd_read_slots = 16;
+  int ssd_lease_timeout_s = 10;
+
+  // Backs ssd_staging_buffer_, allocated only when ssd.enabled. A remote SSD
+  // read fits one whole key value in a slot, so this / ssd_read_slots must be
+  // >= the largest single-key page KV (61-layer MLA page ~= 4.5 MB).
+  size_t ssd_staging_buffer_size = 268435456;  // 256 MiB
+
   std::vector<ExportableDram> dram_buffers;
-  std::vector<ExportableSsd> ssd_stores;
+  PeerSsdConfig ssd;
 
   std::map<TierType, TierCapacity> tier_capacities;
 
@@ -153,11 +172,14 @@ struct PoolClientConfig {
 // DistributedClient (pool mmap'd memory), not in the user-facing config.
 inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
                                            std::vector<ExportableDram> dram_buffers,
-                                           std::map<TierType, TierCapacity> tier_capacities) {
+                                           std::map<TierType, TierCapacity> tier_capacities,
+                                           PeerSsdConfig ssd = {}) {
   PoolClientConfig pc;
   pc.master_config = dc.master_config;
   pc.io_engine = dc.io_engine;
   pc.staging_buffer_size = dc.staging_buffer_size;
+  pc.ssd_staging_buffer_size = dc.ssd_staging_buffer_size;
+  pc.ssd_read_slots = dc.ssd_read_slots;
   pc.peer_service_port = dc.peer_service_port;
   // 0 propagates through PoolClient -> MasterClient::RegisterSelf ->
   // proto -> ClientRegistry, where it is interpreted as "use the
@@ -165,6 +187,7 @@ inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
   pc.dram_page_size = dc.dram_page_size;
   pc.dram_buffers = std::move(dram_buffers);
   pc.tier_capacities = std::move(tier_capacities);
+  pc.ssd = std::move(ssd);
   return pc;
 }
 

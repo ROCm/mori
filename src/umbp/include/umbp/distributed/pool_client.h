@@ -43,6 +43,8 @@ namespace mori::umbp {
 
 class PeerDramAllocator;
 class PeerServiceServer;
+class PeerSsdManager;
+class SsdCopyPipeline;
 
 // Short name for log output. Generic FAILED maps to "FAILED" — the
 // detailed reason for that case lives in the peer's allocator log.
@@ -118,7 +120,7 @@ class PoolClient {
   std::vector<bool> BatchExists(const std::vector<std::string>& keys);
 
   void* SsdStagingPtr() const { return ssd_staging_buffer_.get(); }
-  size_t SsdStagingSize() const { return config_.staging_buffer_size; }
+  size_t SsdStagingSize() const { return config_.ssd_staging_buffer_size; }
   const std::vector<uint8_t>& SsdStagingMemDescBytes() const { return ssd_staging_mem_desc_bytes_; }
 
   MasterClient& Master();
@@ -162,6 +164,14 @@ class PoolClient {
   // the natural lifetime anchor for the per-process IO engine + DRAM
   // buffers; PeerServiceServer borrows it.
   std::unique_ptr<PeerDramAllocator> peer_alloc_;
+  // Peer-side SSD tier owner.  Built only when config_.ssd.enabled; registered
+  // with MasterClient as an owned-location source + SSD capacity provider.
+  std::unique_ptr<PeerSsdManager> peer_ssd_;
+  // Async copy-on-commit pipeline.  Built only when SSD is enabled;
+  // borrows peer_alloc_ (pin source) + peer_ssd_ (write target).  Started in
+  // Init, stopped in Shutdown (after the peer service so no commit can enqueue
+  // into a stopped pipeline).
+  std::unique_ptr<SsdCopyPipeline> ssd_copy_pipeline_;
   std::unique_ptr<PeerServiceServer> peer_service_;
 
   std::unique_ptr<mori::io::IOEngine> io_engine_;
@@ -210,14 +220,21 @@ class PoolClient {
   bool LocalGetPages(const std::vector<PageLocation>& pages, uint64_t page_size, void* dst,
                      size_t size);
 
-  // SSD path helpers — preserved so the SSD CommitSsdWrite slot
-  // pre-allocation flow keeps working.  The peer side re-shaping of
-  // those RPCs is not in scope for this commit.
   bool EnsurePeerServiceConnection(PeerConnection& peer);
-  bool RemoteSsdWrite(PeerConnection& peer, const std::string& key, const void* src, size_t size,
-                      bool zero_copy, uint32_t store_index = 0);
-  bool RemoteSsdRead(PeerConnection& peer, const std::string& key, const std::string& location_id,
-                     void* dst, size_t size, bool zero_copy);
+
+  // Outcome of one remote SSD get attempt.  kRetry is a retryable transient
+  // condition (NO_SLOT or a reader-local lease expiry); kMiss (NOT_FOUND) is a
+  // definitive miss; kError is the not-served, not-retried catch-all (rpc
+  // failure incl. DEADLINE_EXCEEDED, size mismatch, RDMA failure) — not strictly
+  // a hard error.  Keeping kMiss distinct lets BatchGet avoid surfacing a
+  // non-served key as a cache miss.
+  enum class SsdGetOutcome { kSuccess, kMiss, kRetry, kError };
+
+  // Remote SSD get path (reader != owner): key-based PrepareSsdRead -> RDMA out
+  // of the peer's published SSD staging buffer -> best-effort ReleaseSsdLease.
+  SsdGetOutcome RemoteSsdReadOnce(PeerConnection& peer, const std::string& key, void* dst,
+                                  size_t size);
+  void ReleaseSsdLeaseBestEffort(::umbp::UMBPPeer::Stub* stub, uint64_t lease_id);
 
   // Zero-copy registered memory regions.
   struct RegisteredRegion {
@@ -238,6 +255,9 @@ class PoolClient {
   PutAttemptOutcome ExecuteLocalPut(const std::string& key, const void* src, size_t size,
                                     TierType tier);
   GetAttemptOutcome ExecuteLocalGet(const std::string& key, void* dst, size_t size);
+  // Self-target SSD get: read straight from the local SSD tier into the user
+  // buffer (no staging / RDMA / lease).
+  GetAttemptOutcome ExecuteLocalSsdGet(const std::string& key, void* dst, size_t size);
   struct BatchPutItem {
     size_t index;
     const std::string* key;
@@ -291,6 +311,27 @@ class PoolClient {
   void ProcessRemoteBatchPut(const std::vector<BatchPutItem>& items,
                              std::vector<PutEntryOutcome>* results);
   void ProcessRemoteBatchGet(const std::vector<BatchGetItem>& items, std::vector<bool>* results);
+  // Remote SSD reads (one staging slot + lease per key) with bounded retry
+  // (default off) on transient NO_SLOT / reader-local lease expiry; an rpc
+  // failure is hard not-served, and a NOT_FOUND short-circuits as a miss.
+  void ProcessRemoteSsdBatchGet(const std::vector<BatchGetItem>& items, std::vector<bool>* results);
+
+  // Periodic SSD metrics provider (registered in Init() when SSD is enabled, run
+  // once per metrics flush tick in the metrics thread).  Reads the cheap atomics
+  // on the pipeline / PeerSsdManager / PeerService and ships counter deltas + a
+  // staging gauge, keeping AddCounter off the commit/read hot paths.  The
+  // last-shipped values below make each tick report only the delta.
+  void PublishSsdMetrics();
+  struct SsdMetricsLastShipped {
+    uint64_t copy_enqueued = 0, copy_succeeded = 0, copy_failed = 0;
+    uint64_t copy_dropped_queue_full = 0, copy_dropped_stopped = 0;
+    uint64_t read_ok = 0, read_not_found = 0, read_size_too_large = 0, read_error = 0;
+    uint64_t read_no_slot = 0;
+    uint64_t copy_bytes = 0, read_bytes = 0;
+    uint64_t evict_rounds = 0, evict_victims = 0, evict_bytes_freed = 0, evict_backend_failed = 0;
+    uint64_t staging_expired_reclaims = 0, staging_slot_full_rejects = 0;
+  };
+  SsdMetricsLastShipped ssd_metrics_last_;
   void ExecuteRemoteBatchPut(const std::vector<BatchPutItem>& items,
                              std::vector<PutEntryOutcome>* results, PeerConnection& peer,
                              ::umbp::UMBPPeer::Stub* stub);

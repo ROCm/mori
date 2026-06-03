@@ -320,6 +320,8 @@ add_library(
   distributed/routing/route_get_strategy.cpp
   distributed/routing/route_put_strategy.cpp
   distributed/peer/peer_dram_allocator.cpp
+  distributed/peer/peer_ssd_manager.cpp
+  distributed/peer/ssd_copy_pipeline.cpp
   distributed/peer/peer_service.cpp
   distributed/pool_client.cpp
   distributed/distributed_client.cpp)
@@ -338,8 +340,12 @@ if(NOT EXISTS "${_PROTOBUF_COMPAT_DIR}/google")
 endif()
 target_include_directories(umbp_common BEFORE PUBLIC "${_PROTOBUF_COMPAT_DIR}")
 
-target_link_libraries(umbp_common PUBLIC mori_logging mori_io mori_metrics
-                                         ${_PROTOBUF_LIBS} ${_GRPCPP_LIB})
+# umbp_core provides the SSD tier backend (SSDTier/TierBackend) that
+# PeerSsdManager builds on.  This is the one new link dependency the SSD-tier
+# redesign introduces (umbp_core does not depend on umbp_common, so no cycle).
+target_link_libraries(
+  umbp_common PUBLIC mori_logging mori_io mori_metrics umbp_core
+                     ${_PROTOBUF_LIBS} ${_GRPCPP_LIB})
 
 target_compile_features(umbp_common PUBLIC cxx_std_17)
 

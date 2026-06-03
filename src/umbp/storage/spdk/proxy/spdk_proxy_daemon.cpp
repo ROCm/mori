@@ -282,7 +282,7 @@ struct TenantRuntime {
 
 class TenantRegistry {
  public:
-  TenantRegistry(ProxyShmRegion& shm, const UMBPConfig& tier_cfg, size_t total_capacity_bytes,
+  TenantRegistry(ProxyShmRegion& shm, const UMBPSsdConfig& tier_cfg, size_t total_capacity_bytes,
                  size_t reserved_shared_bytes, size_t default_tenant_quota_bytes,
                  uint32_t block_size, bool allow_borrow, bool write_back, uint64_t tenant_grace_ms,
                  SpdkSsdTier::SharedDmaPool shared_dma_pool)
@@ -605,7 +605,7 @@ class TenantRegistry {
   }
 
   ProxyShmRegion& shm_;
-  UMBPConfig tier_cfg_;
+  UMBPSsdConfig tier_cfg_;
   size_t total_capacity_bytes_ = 0;
   size_t reserved_shared_bytes_ = 0;
   size_t usable_capacity_bytes_ = 0;
@@ -1302,7 +1302,7 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  UMBPConfig tier_cfg;
+  UMBPSsdConfig tier_cfg;
   tier_cfg.ssd_backend = "spdk";
   tier_cfg.spdk_bdev_name = bdev_name;
   tier_cfg.spdk_reactor_mask = reactor_mask;
@@ -1310,7 +1310,7 @@ int main(int argc, char** argv) {
   tier_cfg.spdk_nvme_pci_addr = nvme_pci;
   tier_cfg.spdk_nvme_ctrl_name = nvme_ctrl;
   tier_cfg.spdk_io_workers = io_workers;
-  tier_cfg.ssd.capacity_bytes = service_capacity;
+  tier_cfg.capacity_bytes = service_capacity;
 
   auto shared_dma_pool =
       SpdkSsdTier::CreateSharedDmaPool(2ULL * 1024 * 1024, 128 * std::max(1, io_workers));

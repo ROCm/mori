@@ -419,7 +419,7 @@ static int RunBenchmarkProcess(int rank_id, int num_ranks, int pipe_fd, void* co
   const char* role_str = (role == UMBPRole::Standalone)        ? "Standalone"
                          : (role == UMBPRole::SharedSSDLeader) ? "Leader"
                                                                : "Follower";
-  const char* backend = cfg.ssd_backend.c_str();
+  const char* backend = cfg.ssd.ssd_backend.c_str();
 
   const int iterations = 2;  // 0=cold (O_DIRECT/bypass cache), 1=hot
 
@@ -493,7 +493,7 @@ static int RunLatencyBench() {
     return 1;
   }
 
-  const char* backend = cfg.ssd_backend.c_str();
+  const char* backend = cfg.ssd.ssd_backend.c_str();
   std::string session = MakeSessionId();
 
   ssd->SetColdRead(true);
@@ -666,7 +666,7 @@ int main(int argc, char** argv) {
   printf("\n=== %d/%d ranks completed successfully ===\n", num_ranks - failures, num_ranks);
 
   auto cfg = UMBPConfig::FromEnvironment();
-  const char* backend = cfg.ssd_backend.c_str();
+  const char* backend = cfg.ssd.ssd_backend.c_str();
   bool is_phased = (num_ranks > 1);
 
   for (auto& rr : all_results) {

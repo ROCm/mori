@@ -48,17 +48,15 @@ enum ClientStatus {
 }
 
 // Master no longer owns DRAM/HBM allocators, so descs / buffer sizes /
-// page sizes have moved to the peer.  ssd_store_capacities stays as
-// advisory capacity metadata for the routing strategy.  engine_desc is
-// retained so writers can resolve the target peer's IO engine without
-// an extra GetPeerInfo round trip on first contact.
+// page sizes have moved to the peer.  engine_desc is retained so writers can
+// resolve the target peer's IO engine without an extra GetPeerInfo round trip
+// on first contact.
 message RegisterClientRequest {
   string node_id                      = 1;
   string node_address                 = 2;   // Network address (e.g. "10.0.1.5:8080")
-  repeated TierCapacity tier_capacities = 3; // Capacity per tier
+  repeated TierCapacity tier_capacities = 3; // Capacity per tier (incl. SSD)
   string peer_address                 = 4;   // PeerService gRPC address
   bytes  engine_desc                  = 5;   // packed EngineDesc
-  repeated uint64 ssd_store_capacities = 12; // per-SSD-store capacity in bytes
   repeated string tags                = 13;  // opaque key=value labels (e.g. "sgl_role=prefill")
 }
 message RegisterClientResponse {
@@ -78,9 +76,6 @@ message UnregisterClientResponse {}
 // One mutation in the peer's owned-key set.  ADD carries `size`; REMOVE
 // elides it because master already knows the size from the prior ADD.
 message KvEvent {
-  reserved 5;
-  reserved "owner";
-
   enum Kind {
     ADD           = 0;
     REMOVE        = 1;
@@ -105,9 +100,6 @@ message TierKvCount {
 }
 
 message HeartbeatRequest {
-  reserved 5;
-  reserved "seq", "last_acked_seq", "events";
-
   string node_id            = 1;
   repeated EventBundle bundles = 2; // unacked delta bundles in seq order, or full-sync snapshot
   bool is_full_sync = 3;

@@ -92,10 +92,10 @@ SpdkSsdTier::SharedDmaPool SpdkSsdTier::EnsureDmaPool() {
   return dma_pool_;
 }
 
-SpdkSsdTier::SpdkSsdTier(const UMBPConfig& config)
-    : SpdkSsdTier(config, 0, config.ssd.capacity_bytes, nullptr) {}
+SpdkSsdTier::SpdkSsdTier(const UMBPSsdConfig& config)
+    : SpdkSsdTier(config, 0, config.capacity_bytes, nullptr) {}
 
-SpdkSsdTier::SpdkSsdTier(const UMBPConfig& config, uint64_t base_offset, size_t capacity_bytes,
+SpdkSsdTier::SpdkSsdTier(const UMBPSsdConfig& config, uint64_t base_offset, size_t capacity_bytes,
                          SharedDmaPool shared_dma_pool)
     : TierBackend(StorageTier::LOCAL_SSD) {
   auto& env = ::umbp::SpdkEnv::Instance();

@@ -38,18 +38,6 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
 
   const auto& dc = config.distributed.value();
 
-  // TODO(distributed-ssd): remove or narrow this guard once DistributedClient
-  // actually wires in ssd_stores + PeerService for the distributed data path.
-  if (config_.ssd.enabled) {
-    MORI_UMBP_WARN(
-        "[DistributedClient] SSD tier is currently not wired in distributed "
-        "mode (node_id={}); ignoring ssd.enabled={} ssd.capacity_bytes={} "
-        "and running DRAM-only.",
-        dc.master_config.node_id, config_.ssd.enabled, config_.ssd.capacity_bytes);
-    config_.ssd.enabled = false;
-    config_.ssd.capacity_bytes = 0;
-  }
-
   HostMemAllocator allocator;
   HostBufferOptions opts;
   opts.backing = config.dram.use_hugepages ? HostBufferBacking::kAnonymousHugetlb
@@ -74,10 +62,22 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
   // 2 MiB, so this only matters with non-default page size combinations.
   dram_pool_size_ = dram_pool_handle_.mapped_size;
 
-  auto pc_config = ToPoolClientConfig(
-      dc,
-      /*dram_buffers=*/{{dram_pool_, dram_pool_size_}},
-      /*tier_capacities=*/{{TierType::DRAM, {dram_pool_size_, dram_pool_size_}}});
+  // Lower SSD config to the peer.  When ssd.enabled, the peer builds a
+  // PeerSsdManager (SSDTier backend) from the SSD config (UMBPSsdConfig) and
+  // reports SSD capacity via TierType::SSD; when disabled, behavior is exactly
+  // DRAM-only (no PeerSsdManager, no SSD capacity, no SSD event source).
+  std::map<TierType, TierCapacity> tier_capacities = {
+      {TierType::DRAM, {dram_pool_size_, dram_pool_size_}}};
+  PeerSsdConfig ssd_cfg;
+  if (config_.ssd.enabled) {
+    ssd_cfg.enabled = true;
+    ssd_cfg.ssd = config_.ssd;
+    const uint64_t ssd_cap = config_.ssd.capacity_bytes;
+    tier_capacities[TierType::SSD] = {ssd_cap, ssd_cap};
+  }
+  auto pc_config = ToPoolClientConfig(dc,
+                                      /*dram_buffers=*/{{dram_pool_, dram_pool_size_}},
+                                      std::move(tier_capacities), std::move(ssd_cfg));
 
   pool_client_ = std::make_unique<PoolClient>(std::move(pc_config));
   if (!pool_client_->Init()) {

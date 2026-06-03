@@ -1,0 +1,142 @@
+{
+  "title": "UMBP Master - SSD Metrics",
+  "uid": "9b1d4e2a-ssd-tier-umbp-0001",
+  "tags": ["umbp", "ssd", "tier", "cold-tier"],
+  "schemaVersion": 36,
+  "refresh": "5s",
+  "time": { "from": "now-1h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "type": "datasource",
+        "name": "datasource",
+        "label": "Data Source",
+        "pluginId": "prometheus",
+        "current": { "text": "Prometheus", "value": "PBFA97CFB590B2093" },
+        "hide": 0,
+        "query": "prometheus"
+      },
+      {
+        "type": "query",
+        "name": "node",
+        "label": "Client (node label)",
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "query": "label_values(mori_umbp_ssd_copy_enqueued_total, node)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".+",
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "stat",
+      "title": "SSD reads served (ok, total)",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [ { "color": "green", "value": null } ] } } },
+      "targets": [ { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "sum(mori_umbp_ssd_read_total{node=~\"$node\", status=\"ok\"})", "legendFormat": "read ok" } ]
+    },
+    {
+      "type": "stat",
+      "title": "SSD copies succeeded (total)",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [ { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "sum(mori_umbp_ssd_copy_succeeded_total{node=~\"$node\"})", "legendFormat": "copy ok" } ]
+    },
+    {
+      "type": "stat",
+      "title": "SSD capacity used",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "bytes" } },
+      "targets": [ { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "sum(mori_umbp_client_capacity_used_bytes{node=~\"$node\", tier=\"SSD\"})", "legendFormat": "used" } ]
+    },
+    {
+      "type": "stat",
+      "title": "Copy failed + dropped (total)",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } },
+      "targets": [ { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "sum(mori_umbp_ssd_copy_failed_total{node=~\"$node\"}) + sum(mori_umbp_ssd_copy_dropped_total{node=~\"$node\"})", "legendFormat": "failed+dropped" } ]
+    },
+    {
+      "type": "timeseries",
+      "title": "SSD copy-on-commit throughput (ops/s)",
+      "description": "enqueued vs succeeded vs failed copy tasks (rate). enqueued≈succeeded with ~0 failed is healthy.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "sum(rate(mori_umbp_ssd_copy_enqueued_total{node=~\"$node\"}[$__rate_interval]))", "legendFormat": "enqueued" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "sum(rate(mori_umbp_ssd_copy_succeeded_total{node=~\"$node\"}[$__rate_interval]))", "legendFormat": "succeeded" },
+        { "refId": "C", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "sum(rate(mori_umbp_ssd_copy_failed_total{node=~\"$node\"}[$__rate_interval]))", "legendFormat": "failed" },
+        { "refId": "D", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "sum by (reason) (rate(mori_umbp_ssd_copy_dropped_total{node=~\"$node\"}[$__rate_interval]))", "legendFormat": "dropped {{reason}}" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "SSD read outcomes (ops/s, by status)",
+      "description": "ok / not_found / no_slot / size_too_large / error. no_slot is transient (not a miss).",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 20, "stacking": { "mode": "normal" } } } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "sum by (status) (rate(mori_umbp_ssd_read_total{node=~\"$node\"}[$__rate_interval]))", "legendFormat": "{{status}}" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "SSD capacity used / total (bytes)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "bytes", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "mori_umbp_client_capacity_used_bytes{node=~\"$node\", tier=\"SSD\"}", "legendFormat": "used {{node}}" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "mori_umbp_client_capacity_total_bytes{node=~\"$node\", tier=\"SSD\"}", "legendFormat": "total {{node}}" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "SSD local eviction (ops/s & bytes/s)",
+      "description": "Rounds / victims / backend failures (left), bytes freed (right). Stays flat until SSD hits the high watermark.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [ { "matcher": { "id": "byName", "options": "bytes_freed/s" }, "properties": [ { "id": "unit", "value": "Bps" }, { "id": "custom.axisPlacement", "value": "right" } ] } ] },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "sum(rate(mori_umbp_ssd_eviction_rounds_total{node=~\"$node\"}[$__rate_interval]))", "legendFormat": "rounds/s" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "sum(rate(mori_umbp_ssd_eviction_victims_total{node=~\"$node\"}[$__rate_interval]))", "legendFormat": "victims/s" },
+        { "refId": "C", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "sum(rate(mori_umbp_ssd_eviction_backend_failed_total{node=~\"$node\"}[$__rate_interval]))", "legendFormat": "backend_failed/s" },
+        { "refId": "D", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "sum(rate(mori_umbp_ssd_eviction_bytes_freed_total{node=~\"$node\"}[$__rate_interval]))", "legendFormat": "bytes_freed/s" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "SSD IO throughput (offered, bytes/s)",
+      "description": "Achieved/offered SSD throughput = SSD IO bytes / wall-clock over the window (rate()), summed across ranks. This is a LOAD signal (how much the workload drove the SSD tier), NOT the device's per-IO bandwidth: it averages in idle gaps so it under-reads bursty copy. For true device bandwidth (bytes / actual IO time) use fio or add ssd_*_io_seconds_total counters.",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 20 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "Bps", "custom": { "drawStyle": "line", "fillOpacity": 15 } } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "sum(rate(mori_umbp_ssd_copy_bytes_total{node=~\"$node\"}[$__rate_interval]))", "legendFormat": "SSD write (copy)" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "sum(rate(mori_umbp_ssd_read_bytes_total{node=~\"$node\"}[$__rate_interval]))", "legendFormat": "SSD read" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "SSD read staging health",
+      "description": "slots in use (gauge), plus slot_full_rejects / expired_reclaims / reader-local transient (ops/s). Non-zero rejects/transient = staging pressure.",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 28 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "sum(mori_umbp_ssd_staging_slots_in_use{node=~\"$node\"})", "legendFormat": "slots in use" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "sum(rate(mori_umbp_ssd_staging_slot_full_rejects_total{node=~\"$node\"}[$__rate_interval]))", "legendFormat": "slot_full_rejects/s" },
+        { "refId": "C", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "sum(rate(mori_umbp_ssd_staging_expired_reclaims_total{node=~\"$node\"}[$__rate_interval]))", "legendFormat": "expired_reclaims/s" },
+        { "refId": "D", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "sum(rate(mori_umbp_ssd_read_client_transient_total{node=~\"$node\"}[$__rate_interval]))", "legendFormat": "client_transient/s" }
+      ]
+    }
+  ]
+}

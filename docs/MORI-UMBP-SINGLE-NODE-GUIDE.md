@@ -52,6 +52,7 @@ Export the variables below to adapt the run to your environment. The script read
 | `UMBP_NODE_ADDRESS` | `127.0.0.1` | IP advertised to clients. | `<node-ip>` |
 | `UMBP_IO_ENGINE_PORT` | `16000` | Hicache IO engine port. | `16010` |
 | `UMBP_PEER_SERVICE_PORT` | `17000` | Peer service port. | `17010` |
+| `UMBP_SSD_STAGING_BYTES` | `268435456` (256 MiB) | Size of the dedicated remote-SSD read staging buffer. Allocated **only** when SSD is enabled (DRAM-only runs allocate nothing and are unaffected). Raise for large-KV models so each read slot fits one key's value. | `268435456` |
 | `USE_DUMMY_WEIGHTS` | `false` | Skip checkpoint validation. | `true` |
 | `MEM_FRACTION_STATIC` | `0.7` | Fraction reserved for static allocations. | `0.6` |
 | `PROBE_MAX_TIME` | `300` | Timeout for probe request in seconds. | `600` |
@@ -121,5 +122,6 @@ Make sure the directory exists and has enough space.
 - **UMBP master logs**: Saved alongside server logs when `START_UMBP_MASTER=true`.
 - **Model validation**: The script validates that `MODEL_PATH` contains `model-*.safetensors` when running with real weights.
 - **Probe failures**: Inspect the tail of the server log; the script prints it automatically on errors.
+- **Remote SSD reads silently recompute (`size_too_large`)**: A remote SSD read must fit a key's whole value into one slot, where `per_slot = ssd_staging_buffer_size / ssd_read_slots` (defaults 256 MiB / 16 = 16 MiB). The single-key page KV for an MLA model ≈ `page_size × (kv_lora_rank + qk_rope_head_dim) × dtype_bytes × num_layers` (DeepSeek-V3 5-layer ≈ 360 KB; full R1/V3 61-layer ≈ 4.5 MB). If `per_slot` is smaller, the read is dropped and the block is recomputed — requests don't error, but `mori_umbp_ssd_read_total{status="size_too_large"}` climbs and hit rate/throughput fall. Fix: raise `UMBP_SSD_STAGING_BYTES` or lower `ssd_read_slots` (now settable via `UMBP_SSD_READ_SLOTS`) so `per_slot ≥` the single-key page KV. (`ssd_staging_buffer_size` is allocated only when SSD is enabled, separate from the general `staging_buffer_size`.)
 
 Refer back to this document whenever the single-node smoke test needs to be run or automated. For the original skill instructions see `/home/ditian12/.codex/skills/umbp-single-node-launcher/SKILL.md`.

@@ -6,9 +6,12 @@ import "umbp.proto";
 service UMBPPeer {
   rpc GetPeerInfo(GetPeerInfoRequest) returns (GetPeerInfoResponse);
 
-  // SSD staging (unchanged in this redesign).
-  rpc AllocateWriteSlot(AllocateWriteSlotRequest) returns (AllocateWriteSlotResponse);
-  rpc CommitSsdWrite   (CommitSsdWriteRequest)   returns (CommitSsdWriteResponse);
+  // SSD read staging.  The direct-SSD-put RPCs (AllocateWriteSlot /
+  // CommitSsdWrite) were removed in the SSD-tier redesign: SSD is now an
+  // async copy-on-commit cold tier, not a writer-driven put target.
+  // PrepareSsdRead is key-based (the peer looks up the SSD location by key via
+  // PeerSsdManager) and returns a typed status + the actual size; ReleaseSsdLease
+  // is a best-effort fast release (slots are also reclaimed by lease TTL).
   rpc PrepareSsdRead   (PrepareSsdReadRequest)   returns (PrepareSsdReadResponse);
   rpc ReleaseSsdLease  (ReleaseSsdLeaseRequest)  returns (ReleaseSsdLeaseResponse);
 
@@ -32,8 +35,7 @@ service UMBPPeer {
 message GetPeerInfoRequest {}
 message GetPeerInfoResponse {
   bytes  engine_desc           = 1;
-  uint64 ssd_capacity          = 3;
-  uint64 ssd_available         = 4;
+  // SSD capacity is reported via heartbeat tier_capacities, not here.
   bytes  ssd_staging_mem_desc  = 6;  // packed MemoryDesc for dedicated SSD staging buffer
   uint64 ssd_staging_size      = 7;  // total staging buffer size
 
@@ -45,42 +47,34 @@ message GetPeerInfoResponse {
 }
 
 // ============================================================
-//  SSD slot machinery (unchanged)
+//  SSD read staging (key-based; see the UMBPPeer service comment above)
 // ============================================================
 
-message AllocateWriteSlotRequest {
-  uint64 size = 1;
-}
-message AllocateWriteSlotResponse {
-  bool   success        = 1;
-  uint64 staging_offset = 2;
-  uint64 lease_id       = 3;
-  uint64 lease_ttl_ms   = 4;
-}
-
-message CommitSsdWriteRequest {
-  string key              = 1;
-  uint64 staging_offset   = 2;
-  uint64 size             = 3;
-  uint32 store_index      = 4;
-  string allocation_id    = 5;  // historical echo from RoutePut; ignored in the new design
-  uint64 lease_id         = 6;
-}
-message CommitSsdWriteResponse {
-  bool   success          = 1;
-  string ssd_location_id  = 2;
+// Per-key SSD read outcome.  Callers MUST distinguish a transient failure
+// (NO_SLOT) from a definitive miss (NOT_FOUND): a transient failure must never
+// be surfaced to hicache as a cache miss.  Lease expiry is NOT a wire status:
+// the reader decides it locally against lease_ttl_ms and the peer reclaims the
+// slot by TTL (see PrepareSsdReadResponse).
+enum SsdReadStatus {
+  SSD_READ_OK             = 0;
+  SSD_READ_NOT_FOUND      = 1;   // key not on this peer's SSD tier → caller treats as miss
+  SSD_READ_NO_SLOT        = 2;   // staging slots exhausted → transient/retryable, not a miss
+  SSD_READ_SIZE_TOO_LARGE = 3;   // actual size > reader cap / staging slot size
+  SSD_READ_ERROR          = 4;   // backend read error (e.g. concurrent evict / corruption)
 }
 
 message PrepareSsdReadRequest {
-  string key              = 1;
-  string ssd_location_id  = 2;
-  uint64 size             = 3;
+  string key      = 1;
+  // Reader's destination buffer size (capacity upper bound).  The peer rejects
+  // with SSD_READ_SIZE_TOO_LARGE when the key's actual size exceeds it.
+  uint64 max_size = 2;
 }
 message PrepareSsdReadResponse {
-  bool   success          = 1;
-  uint64 staging_offset   = 2;
-  uint64 lease_id         = 3;
-  uint64 lease_ttl_ms     = 4;
+  SsdReadStatus status        = 1;
+  uint64        staging_offset = 2;   // offset into the published ssd_staging_mem_desc
+  uint64        size           = 3;   // actual readable bytes
+  uint64        lease_id       = 4;
+  uint64        lease_ttl_ms   = 5;
 }
 
 message ReleaseSsdLeaseRequest {
@@ -146,7 +140,7 @@ message AbortSlotResponse {
 
 // Resolve a key the writer has been routed to.  Returns the page set
 // the reader needs to RDMA from.  Peer bumps its in-flight read counter
-// for `key` to defer concurrent eviction (Bug #7 resolution).
+// for `key` to defer concurrent eviction.
 message ResolveKeyRequest {
   string key = 1;
 }

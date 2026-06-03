@@ -25,11 +25,13 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <msgpack.hpp>
 #include <numeric>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 
 #include "mori/io/backend.hpp"
@@ -38,6 +40,9 @@
 #include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/peer/peer_dram_allocator.h"
 #include "umbp/distributed/peer/peer_service.h"
+#include "umbp/distributed/peer/peer_ssd_manager.h"
+#include "umbp/distributed/peer/ssd_copy_pipeline.h"
+#include "umbp/distributed/ssd_read_lease.h"
 #include "umbp_peer.grpc.pb.h"
 
 namespace mori::umbp {
@@ -145,6 +150,57 @@ uint32_t ReleaseLeaseMaxRetries() {
   return v;
 }
 
+// Crash-restart SSD leftover policy (discard): wipe physical SSD bytes a
+// previous crashed process left behind at startup.  Default on; set
+// UMBP_SSD_STARTUP_DISCARD=0/false to keep leftover (opt-out hook for a future
+// rebuild-from-backend policy — there is no rebuild path yet).
+bool SsdStartupDiscardEnabled() {
+  const char* v = std::getenv("UMBP_SSD_STARTUP_DISCARD");
+  if (v == nullptr) return true;
+  const std::string s(v);
+  return !(s == "0" || s == "false" || s == "FALSE" || s == "off");
+}
+
+// Total attempts for a remote SSD get.  Retryable outcomes (kRetry) are
+// NO_SLOT (transient slot exhaustion, no slot claimed) and a reader-local lease
+// expiry.  Defaults to 1 (no retry); operators opt into bounded retry to absorb
+// slot contention.  A slow/failed PrepareSsdRead (DEADLINE_EXCEEDED etc.) is a
+// hard failure, NOT retried — the peer may already hold a claimed slot, so a
+// retry would only pile up more staging-slot occupation.  NOT_FOUND is always a
+// definitive miss (no retry).
+uint32_t SsdGetTransientMaxAttempts() {
+  static const uint32_t v = GetEnvUint32("UMBP_SSD_GET_MAX_ATTEMPTS", 1, /*min_allowed=*/1);
+  return v;
+}
+
+std::chrono::milliseconds SsdGetRetryBackoff() {
+  static const auto v = std::chrono::milliseconds(
+      GetEnvUint32("UMBP_SSD_GET_RETRY_BACKOFF_MS", 2, /*min_allowed=*/1));
+  return v;
+}
+
+// Bounded client deadline for a single PrepareSsdRead RPC so a hung/slow peer
+// cannot block the serial per-key remote SSD read loop indefinitely.  A read
+// that cannot even return within this budget is past any useful lease window
+// and is treated as a hard failure (NOT retried: the peer may already hold a
+// claimed slot, and a retry would only claim another).  When the env is unset
+// the caller falls back to the configured lease timeout (cluster-homogeneous
+// assumption); 0 here means "use the fallback".
+std::chrono::milliseconds SsdPrepareRpcTimeoutOverride() {
+  static const auto v = GetEnvMilliseconds("UMBP_SSD_PREPARE_TIMEOUT_MS",
+                                           std::chrono::milliseconds(0), /*min_allowed=*/0);
+  return v;
+}
+
+// Bounded client deadline for a best-effort ReleaseSsdLease RPC.  Release is
+// never on the critical path (the slot is also reclaimed by TTL), so cap it
+// tightly to avoid blocking on a slow peer.
+std::chrono::milliseconds ReleaseLeaseRpcTimeout() {
+  static const auto v = GetEnvMilliseconds("UMBP_RELEASE_LEASE_TIMEOUT_MS",
+                                           std::chrono::milliseconds(1000), /*min_allowed=*/1);
+  return v;
+}
+
 // Build a TierConfig from the PoolClientConfig (DRAM only — HBM
 // support requires per-tier buffer plumbing the upper layers don't
 // currently provide).  Returns an empty config when the engine has
@@ -158,6 +214,9 @@ PeerDramAllocator::TierConfig BuildDramTierConfig(const std::vector<ExportableDr
     msgpack::sbuffer sbuf;
     msgpack::pack(sbuf, mems[i]);
     cfg.buffer_descs.emplace_back(sbuf.data(), sbuf.data() + sbuf.size());
+    // Local host base pointer, so PeerDramAllocator can resolve a committed
+    // key's pages to readable segments for the SSD copy worker.
+    cfg.buffer_bases.push_back(bufs[i].buffer);
   }
   return cfg;
 }
@@ -250,6 +309,23 @@ bool PoolClient::Init() {
   peer_alloc_->StartReaper();
   master_client_->SetPeerDramAllocator(peer_alloc_.get());
 
+  // Peer-side SSD tier owner.  Built only when SSD is enabled; registered as an
+  // owned-location event source + SSD capacity provider.  The copy-on-commit
+  // pipeline below populates it.  Clear() quiesces the pipeline and clears
+  // peer_ssd_ alongside peer_alloc_.
+  if (config_.ssd.enabled) {
+    peer_ssd_ = std::make_unique<PeerSsdManager>(config_.ssd);
+    // Crash-restart leftover (discard): wipe stale SSD bytes before the
+    // pipeline starts so used capacity and the empty owned_ map start consistent
+    // (env-gated; see SsdStartupDiscardEnabled / DiscardLeftoverOnStartup).
+    if (SsdStartupDiscardEnabled()) peer_ssd_->DiscardLeftoverOnStartup();
+    master_client_->SetPeerSsdManager(peer_ssd_.get());
+    // Copy-on-commit pipeline: commits enqueue here, a worker pins the DRAM
+    // pages and writes them to the local SSD tier.  Started below.
+    ssd_copy_pipeline_ = std::make_unique<SsdCopyPipeline>(peer_alloc_.get(), peer_ssd_.get());
+    ssd_copy_pipeline_->Start();
+  }
+
   // Pack engine_desc for master registration.
   std::vector<uint8_t> engine_desc_bytes;
   if (io_engine_) {
@@ -258,13 +334,14 @@ bool PoolClient::Init() {
     engine_desc_bytes.assign(sbuf.data(), sbuf.data() + sbuf.size());
   }
 
-  // SSD staging buffer (one per process; not part of DRAM exports).
-  if (!config_.ssd_stores.empty()) {
-    ssd_staging_buffer_ = std::make_unique<char[]>(config_.staging_buffer_size);
-    std::memset(ssd_staging_buffer_.get(), 0, config_.staging_buffer_size);
+  // SSD staging buffer (one per process; not part of DRAM exports).  Remote SSD
+  // reads are served out of it; allocated up front when SSD is enabled.
+  if (config_.ssd.enabled) {
+    ssd_staging_buffer_ = std::make_unique<char[]>(config_.ssd_staging_buffer_size);
+    std::memset(ssd_staging_buffer_.get(), 0, config_.ssd_staging_buffer_size);
     if (io_engine_) {
       ssd_staging_mem_ =
-          io_engine_->RegisterMemory(ssd_staging_buffer_.get(), config_.staging_buffer_size, -1,
+          io_engine_->RegisterMemory(ssd_staging_buffer_.get(), config_.ssd_staging_buffer_size, -1,
                                      mori::io::MemoryLocationType::CPU);
       msgpack::sbuffer sbuf;
       msgpack::pack(sbuf, ssd_staging_mem_);
@@ -273,8 +350,13 @@ bool PoolClient::Init() {
   }
 
   if (config_.peer_service_port > 0) {
-    peer_service_ = std::make_unique<PeerServiceServer>(peer_alloc_.get(), 8, 8, 10,
-                                                        engine_desc_bytes, master_client_.get());
+    // Wire the SSD read path: peer_ssd_ + the RDMA-registered SSD staging buffer
+    // (both null/empty when SSD is disabled, leaving SsdRpcAvailable() false).
+    peer_service_ = std::make_unique<PeerServiceServer>(
+        peer_alloc_.get(), peer_ssd_.get(), ssd_staging_buffer_.get(),
+        ssd_staging_buffer_ ? config_.ssd_staging_buffer_size : 0, ssd_staging_mem_desc_bytes_,
+        config_.ssd_read_slots, config_.ssd_lease_timeout_s, engine_desc_bytes,
+        master_client_.get(), ssd_copy_pipeline_.get());
     if (!peer_service_->Start(config_.peer_service_port)) {
       MORI_UMBP_ERROR("[PoolClient] PeerService failed to start on port {}",
                       config_.peer_service_port);
@@ -290,13 +372,17 @@ bool PoolClient::Init() {
     peer_address = host + ":" + std::to_string(config_.peer_service_port);
   }
 
-  std::vector<uint64_t> ssd_store_capacities;
-  for (const auto& store : config_.ssd_stores) ssd_store_capacities.push_back(store.capacity);
+  // Register the SSD metrics provider before RegisterSelf starts the metrics
+  // thread (the list is read lock-free afterwards).  See PublishSsdMetrics.
+  if (config_.ssd.enabled) {
+    master_client_->AddMetricsProvider([this] { PublishSsdMetrics(); });
+  }
 
   // Master register.  In the new design master holds no DRAM-side
-  // metadata; only membership + capacity-snapshot.
-  auto status = master_client_->RegisterSelf(config_.tier_capacities, peer_address,
-                                             engine_desc_bytes, ssd_store_capacities);
+  // metadata; only membership + capacity-snapshot (SSD capacity rides in
+  // tier_capacities as TierType::SSD).
+  auto status =
+      master_client_->RegisterSelf(config_.tier_capacities, peer_address, engine_desc_bytes);
   if (!status.ok()) {
     MORI_UMBP_ERROR("[PoolClient] RegisterSelf failed: {}", status.error_message());
     initialized_ = false;
@@ -315,6 +401,10 @@ void PoolClient::Shutdown() {
 
   if (master_client_) {
     master_client_->StopHeartbeat();
+    // Stop the periodic metrics thread before tearing down the SSD components
+    // its provider reads (peer_service_ / ssd_copy_pipeline_ / peer_ssd_), so no
+    // provider callback runs against freed state.  Idempotent with ~MasterClient.
+    master_client_->StopMetricsReporting();
     auto status = master_client_->UnregisterSelf();
     if (!status.ok()) {
       MORI_UMBP_WARN("[PoolClient] UnregisterSelf failed: {}", status.error_message());
@@ -328,10 +418,23 @@ void PoolClient::Shutdown() {
 
   peer_service_.reset();
 
+  // Stop the copy pipeline AFTER the peer service (RPC commit path) is gone so
+  // no commit can enqueue into a stopping pipeline.  Stop() drops queued tasks
+  // and waits for the in-flight copy to finish + release its DRAM pin before
+  // we tear down peer_alloc_ / peer_ssd_ below.
+  if (ssd_copy_pipeline_) {
+    ssd_copy_pipeline_->Stop();
+    ssd_copy_pipeline_.reset();
+  }
+
   if (peer_alloc_) {
     peer_alloc_->StopReaper();
     peer_alloc_.reset();
   }
+
+  // Heartbeat thread is already stopped above, so MasterClient no longer reads
+  // ssd_manager_; safe to drop the SSD tier owner here.
+  peer_ssd_.reset();
 
   if (io_engine_) {
     {
@@ -358,14 +461,24 @@ bool PoolClient::Clear() {
   // clear and no master to notify.  Treat as success so callers in
   // shutdown / teardown paths do not surface a spurious error.
   if (!initialized_.load()) return true;
+  // Quiesce the copy pipeline first: drop queued tasks and wait for any
+  // in-flight copy to finish + release its pin.  Otherwise a copy completing
+  // after the clear below would re-record an SSD location and emit ADD SSD
+  // for a key we just collapsed.
+  if (ssd_copy_pipeline_) ssd_copy_pipeline_->Quiesce();
   if (peer_alloc_) peer_alloc_->ClearLocal();
+  if (peer_ssd_) peer_ssd_->ClearLocal();
+
+  bool ok = true;
   if (master_client_) {
-    if (!master_client_->ClearFullSync()) {
-      MORI_UMBP_WARN("[PoolClient] Clear full-sync heartbeat failed");
-      return false;
-    }
+    ok = master_client_->ClearFullSync();
+    if (!ok) MORI_UMBP_WARN("[PoolClient] Clear full-sync heartbeat failed");
   }
-  return true;
+
+  // Always resume — even if the full-sync RPC failed — so the pipeline is
+  // never left permanently paused (the heartbeat loop retries convergence).
+  if (ssd_copy_pipeline_) ssd_copy_pipeline_->Resume();
+  return ok;
 }
 
 bool PoolClient::IsInitialized() const { return initialized_; }
@@ -491,6 +604,10 @@ PoolClient::PutAttemptOutcome PoolClient::ExecuteLocalPut(const std::string& key
     peer_alloc_->Abort(pending.slot_id);
     return PutAttemptOutcome::kFatal;
   }
+  // Owner-side commit succeeded: best-effort async copy to local SSD.
+  if (ssd_copy_pipeline_) {
+    ssd_copy_pipeline_->Enqueue(SsdCopyTask{key, tier, size});
+  }
   master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL,
                              MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL_HELP,
                              {{"traffic", "local"}}, static_cast<double>(size));
@@ -511,6 +628,42 @@ PoolClient::GetAttemptOutcome PoolClient::ExecuteLocalGet(const std::string& key
     return GetAttemptOutcome::kRetry;
   }
   if (!LocalGetPages(resolved.pages, peer_alloc_->PageSize(), dst, size)) {
+    return GetAttemptOutcome::kFatal;
+  }
+  master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL,
+                             MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL_HELP,
+                             {{"traffic", "local"}}, static_cast<double>(size));
+  master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL,
+                             MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL_HELP,
+                             {{"traffic", "local"}}, static_cast<double>(size));
+  return GetAttemptOutcome::kSuccess;
+}
+
+PoolClient::GetAttemptOutcome PoolClient::ExecuteLocalSsdGet(const std::string& key, void* dst,
+                                                             size_t size) {
+  // reader == owner: read straight into the user buffer (no staging / RDMA /
+  // lease — those serve remote readers).  kNotFound -> kRetry (miss, not error).
+  if (!peer_ssd_) {
+    MORI_UMBP_ERROR("[PoolClient] Local SSD Get requested but PeerSsdManager unavailable");
+    return GetAttemptOutcome::kFatal;
+  }
+  SsdReadOutcome outcome = peer_ssd_->PrepareRead(key, dst, size);
+  switch (outcome.status) {
+    case SsdReadStatus::kOk:
+      break;
+    case SsdReadStatus::kNotFound:
+      return GetAttemptOutcome::kRetry;
+    case SsdReadStatus::kSizeTooLarge:
+    case SsdReadStatus::kError:
+      MORI_UMBP_WARN("[PoolClient] Local SSD Get key='{}' failed (status={}, size={})", key,
+                     static_cast<int>(outcome.status), outcome.size);
+      return GetAttemptOutcome::kFatal;
+  }
+  // Guard against a short read filling only part of the user buffer (mirrors the
+  // remote path's size check).
+  if (outcome.size != size) {
+    MORI_UMBP_WARN("[PoolClient] Local SSD Get key='{}' size mismatch (wanted {}, got {})", key,
+                   size, outcome.size);
     return GetAttemptOutcome::kFatal;
   }
   master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL,
@@ -656,7 +809,11 @@ std::vector<bool> PoolClient::BatchGet(const std::vector<std::string>& keys,
     routes.resize(keys.size());
   }
 
+  // DRAM/HBM remote reads go through the batched RDMA path (remote_groups);
+  // remote SSD reads go through a per-key staging path (ssd_remote_groups)
+  // because each needs its own peer-side staging slot + lease.
   std::unordered_map<std::string, std::vector<BatchGetItem>> remote_groups;
+  std::unordered_map<std::string, std::vector<BatchGetItem>> ssd_remote_groups;
   for (size_t i = 0; i < keys.size(); ++i) {
     if (i >= routes.size() || !routes[i].has_value()) {
       if (peer_alloc_) {
@@ -669,14 +826,14 @@ std::vector<bool> PoolClient::BatchGet(const std::vector<std::string>& keys,
     }
     const auto& route = routes[i].value();
     if (route.node_id == config_.master_config.node_id) {
-      auto outcome = ExecuteLocalGet(keys[i], const_cast<void*>(dsts[i]), sizes[i]);
+      // Self-target fast path: SSD via PeerSsdManager, DRAM/HBM via the allocator.
+      GetAttemptOutcome outcome =
+          route.tier == TierType::SSD
+              ? ExecuteLocalSsdGet(keys[i], const_cast<void*>(dsts[i]), sizes[i])
+              : ExecuteLocalGet(keys[i], const_cast<void*>(dsts[i]), sizes[i]);
       if (outcome == GetAttemptOutcome::kSuccess) {
         results[i] = true;
       }
-      continue;
-    }
-    if (route.tier != TierType::DRAM && route.tier != TierType::HBM) {
-      results[i] = false;
       continue;
     }
     BatchGetItem item{.index = i,
@@ -684,11 +841,18 @@ std::vector<bool> PoolClient::BatchGet(const std::vector<std::string>& keys,
                       .dst = const_cast<void*>(dsts[i]),
                       .size = sizes[i],
                       .route = route};
-    remote_groups[route.node_id].push_back(std::move(item));
+    if (route.tier == TierType::SSD) {
+      ssd_remote_groups[route.node_id].push_back(std::move(item));
+    } else {
+      remote_groups[route.node_id].push_back(std::move(item));
+    }
   }
 
   for (auto& [node_id, items] : remote_groups) {
     ProcessRemoteBatchGet(items, &results);
+  }
+  for (auto& [node_id, items] : ssd_remote_groups) {
+    ProcessRemoteSsdBatchGet(items, &results);
   }
 
   for (size_t i = 0; i < keys.size(); ++i) {
@@ -1665,88 +1829,99 @@ bool PoolClient::EnsurePeerServiceConnection(PeerConnection& peer) {
   return true;
 }
 
-bool PoolClient::RemoteSsdWrite(PeerConnection& peer, const std::string& key, const void* src,
-                                size_t size, bool zero_copy, uint32_t store_index) {
-  if (!io_engine_) return false;
-  if (!EnsurePeerServiceConnection(peer)) return false;
-  if (!IsValidMemoryDesc(peer.ssd_staging_mem)) return false;
+// Remote SSD get for one key (reader != owner): key-based PrepareSsdRead on the
+// peer reads the bytes into its serving staging slot; we RDMA them out of the
+// published staging buffer, then issue a best-effort ReleaseSsdLease.  Outcomes:
+// kMiss (NOT_FOUND, definitive miss); kRetry (retryable: NO_SLOT or a
+// reader-local lease expiry); kError (not-served, not retried: rpc failure
+// incl. DEADLINE_EXCEEDED, size mismatch, RDMA failure).
+//
+// Lease gating: the deadline is anchored at t_send (before the RPC) so it stays
+// conservative against the peer, which counts the same TTL from request receipt
+// (see ssd_read_lease.h).  A read is reported successful only if RDMA finished
+// before that deadline; once expired we return a transient retry and do NOT
+// release (the peer reclaims the slot by TTL).  A late-returning PrepareSsdRead
+// is caught by the pre-RDMA expiry check; a hung one by the RPC deadline.
+PoolClient::SsdGetOutcome PoolClient::RemoteSsdReadOnce(PeerConnection& peer,
+                                                        const std::string& key, void* dst,
+                                                        size_t size) {
+  namespace lease = ssd_read_lease;
+  if (!io_engine_) return SsdGetOutcome::kError;
+  if (!EnsurePeerServiceConnection(peer)) return SsdGetOutcome::kError;
+  if (!IsValidMemoryDesc(peer.ssd_staging_mem)) return SsdGetOutcome::kError;
   auto* stub = static_cast<::umbp::UMBPPeer::Stub*>(peer.peer_stub.get());
 
-  ::umbp::AllocateWriteSlotRequest alloc_req;
-  alloc_req.set_size(size);
-  ::umbp::AllocateWriteSlotResponse alloc_resp;
-  grpc::ClientContext alloc_ctx;
-  auto alloc_status = stub->AllocateWriteSlot(&alloc_ctx, alloc_req, &alloc_resp);
-  if (!alloc_status.ok() || !alloc_resp.success()) return false;
-  uint64_t write_offset = alloc_resp.staging_offset();
-
-  bool used_zero_copy = false;
-  if (zero_copy) {
-    auto reg = FindRegisteredMemory(src, size);
-    if (reg) {
-      auto uid = io_engine_->AllocateTransferUniqueId();
-      mori::io::TransferStatus status;
-      io_engine_->Write(reg->first, reg->second, peer.ssd_staging_mem, write_offset, size, &status,
-                        uid);
-      status.Wait();
-      if (!status.Succeeded()) return false;
-      used_zero_copy = true;
-    }
+  // Anchor the lease deadline before sending; also bound the RPC itself so a
+  // hung peer can't stall the serial batch.  Fall back to the configured lease
+  // timeout when the dedicated timeout env is unset (cluster-homogeneous).
+  const auto t_send = std::chrono::steady_clock::now();
+  auto rpc_timeout = SsdPrepareRpcTimeoutOverride();
+  if (rpc_timeout.count() == 0) {
+    rpc_timeout = std::chrono::seconds(std::max(config_.ssd_lease_timeout_s, 1));
   }
-  if (!used_zero_copy) {
-    if (size > config_.staging_buffer_size) return false;
-    std::lock_guard<std::mutex> lock(staging_mutex_);
-    std::memcpy(staging_buffer_.get(), src, size);
-    auto uid = io_engine_->AllocateTransferUniqueId();
-    mori::io::TransferStatus status;
-    io_engine_->Write(staging_mem_, 0, peer.ssd_staging_mem, write_offset, size, &status, uid);
-    status.Wait();
-    if (!status.Succeeded()) return false;
-  }
-
-  ::umbp::CommitSsdWriteRequest req;
-  req.set_key(key);
-  req.set_staging_offset(write_offset);
-  req.set_size(size);
-  req.set_store_index(store_index);
-  req.set_lease_id(alloc_resp.lease_id());
-  ::umbp::CommitSsdWriteResponse resp;
-  grpc::ClientContext ctx;
-  auto grpc_status = stub->CommitSsdWrite(&ctx, req, &resp);
-  return grpc_status.ok() && resp.success();
-}
-
-bool PoolClient::RemoteSsdRead(PeerConnection& peer, const std::string& key,
-                               const std::string& location_id, void* dst, size_t size,
-                               bool zero_copy) {
-  if (!io_engine_) return false;
-  if (!EnsurePeerServiceConnection(peer)) return false;
-  if (!IsValidMemoryDesc(peer.ssd_staging_mem)) return false;
-  auto* stub = static_cast<::umbp::UMBPPeer::Stub*>(peer.peer_stub.get());
 
   ::umbp::PrepareSsdReadRequest req;
   req.set_key(key);
-  req.set_ssd_location_id(location_id);
-  req.set_size(size);
+  req.set_max_size(size);
   ::umbp::PrepareSsdReadResponse resp;
   grpc::ClientContext ctx;
-  auto grpc_status = stub->PrepareSsdRead(&ctx, req, &resp);
-  if (!grpc_status.ok() || !resp.success()) return false;
-
-  bool rdma_ok = false;
-  if (zero_copy) {
-    auto reg = FindRegisteredMemory(dst, size);
-    if (reg) {
-      auto uid = io_engine_->AllocateTransferUniqueId();
-      mori::io::TransferStatus status;
-      io_engine_->Read(reg->first, reg->second, peer.ssd_staging_mem, resp.staging_offset(), size,
-                       &status, uid);
-      status.Wait();
-      rdma_ok = status.Succeeded();
-    }
+  // gRPC deadlines are specialized for system_clock; the lease gating below
+  // uses the monotonic steady_clock t_send for the actual validity window.
+  ctx.set_deadline(std::chrono::system_clock::now() + rpc_timeout);
+  const grpc::Status rpc = stub->PrepareSsdRead(&ctx, req, &resp);
+  if (!rpc.ok()) {
+    // Includes DEADLINE_EXCEEDED (peer slow / may already hold a claimed slot)
+    // and UNAVAILABLE: hard failure, not retried — see SsdGetTransientMaxAttempts.
+    MORI_UMBP_DEBUG("[PoolClient] RemoteSsdRead key='{}' PrepareSsdRead rpc failed (code={})", key,
+                    static_cast<int>(rpc.error_code()));
+    return SsdGetOutcome::kError;
   }
-  if (!rdma_ok) {
-    if (size > config_.staging_buffer_size) return false;
+
+  switch (resp.status()) {
+    case ::umbp::SSD_READ_OK:
+      break;
+    case ::umbp::SSD_READ_NOT_FOUND:
+      return SsdGetOutcome::kMiss;
+    case ::umbp::SSD_READ_NO_SLOT:
+      // Transient slot exhaustion (no slot was claimed): retryable, not a miss.
+      return SsdGetOutcome::kRetry;
+    default:  // SIZE_TOO_LARGE / ERROR / unexpected
+      MORI_UMBP_WARN("[PoolClient] RemoteSsdRead key='{}' status={}", key,
+                     static_cast<int>(resp.status()));
+      return SsdGetOutcome::kError;
+  }
+
+  const auto deadline_ttl = resp.lease_ttl_ms();
+
+  // If the lease already elapsed (slow/late PrepareSsdRead return), don't even
+  // RDMA — the staging bytes may already be getting recycled.  Transient, not a
+  // miss; leave the slot for the peer's TTL reclaim (no release).
+  if (lease::LeaseExpired(t_send, deadline_ttl, std::chrono::steady_clock::now())) {
+    MORI_UMBP_DEBUG("[PoolClient] RemoteSsdRead key='{}' lease expired before RDMA (ttl_ms={})",
+                    key, deadline_ttl);
+    return SsdGetOutcome::kRetry;
+  }
+
+  if (resp.size() != size) {
+    MORI_UMBP_WARN("[PoolClient] RemoteSsdRead key='{}' size mismatch (wanted {}, got {})", key,
+                   size, resp.size());
+    ReleaseSsdLeaseBestEffort(stub, resp.lease_id());
+    return SsdGetOutcome::kError;
+  }
+
+  // RDMA the staged bytes home: zero-copy if the dst is registered, else stage
+  // through our own buffer and memcpy.
+  bool rdma_ok = false;
+  auto reg = FindRegisteredMemory(dst, size);
+  if (reg) {
+    auto uid = io_engine_->AllocateTransferUniqueId();
+    mori::io::TransferStatus status;
+    io_engine_->Read(reg->first, reg->second, peer.ssd_staging_mem, resp.staging_offset(), size,
+                     &status, uid);
+    status.Wait();
+    rdma_ok = status.Succeeded();
+  }
+  if (!rdma_ok && size <= config_.staging_buffer_size) {
     std::lock_guard<std::mutex> lock(staging_mutex_);
     auto uid = io_engine_->AllocateTransferUniqueId();
     mori::io::TransferStatus status;
@@ -1759,17 +1934,172 @@ bool PoolClient::RemoteSsdRead(PeerConnection& peer, const std::string& key,
     }
   }
 
-  if (resp.lease_id() > 0) {
-    const uint32_t max_retries = ReleaseLeaseMaxRetries();
-    for (uint32_t attempt = 0; attempt < max_retries; ++attempt) {
-      ::umbp::ReleaseSsdLeaseRequest rel_req;
-      rel_req.set_lease_id(resp.lease_id());
-      ::umbp::ReleaseSsdLeaseResponse rel_resp;
-      grpc::ClientContext rel_ctx;
-      if (stub->ReleaseSsdLease(&rel_ctx, rel_req, &rel_resp).ok()) break;
+  // Decide against the lease deadline: a read that finished after the deadline
+  // is untrusted (the peer may have recycled the slot mid-RDMA), so it becomes
+  // a transient retry and we skip release.  The caller uses the return value;
+  // any bytes already written to dst on the expired path are not consumed.
+  const bool expired = lease::LeaseExpired(t_send, deadline_ttl, std::chrono::steady_clock::now());
+  const auto decision = lease::DecideSsdReadOutcome(expired, rdma_ok);
+  if (decision.release) ReleaseSsdLeaseBestEffort(stub, resp.lease_id());
+  if (expired && rdma_ok) {
+    MORI_UMBP_DEBUG("[PoolClient] RemoteSsdRead key='{}' lease expired after RDMA (ttl_ms={})", key,
+                    deadline_ttl);
+  }
+  switch (decision.outcome) {
+    case lease::GateOutcome::kSuccess:
+      return SsdGetOutcome::kSuccess;
+    case lease::GateOutcome::kRetry:
+      return SsdGetOutcome::kRetry;
+    case lease::GateOutcome::kError:
+      return SsdGetOutcome::kError;
+  }
+  return SsdGetOutcome::kError;
+}
+
+// Best-effort lease release.  Correctness does not depend on it: if it fails or
+// is never called, the peer reclaims the slot when the lease TTL expires.  Each
+// attempt is bounded by a short deadline so a slow peer can't stall the caller.
+void PoolClient::ReleaseSsdLeaseBestEffort(::umbp::UMBPPeer::Stub* stub, uint64_t lease_id) {
+  if (lease_id == 0) return;
+  const uint32_t max_retries = ReleaseLeaseMaxRetries();
+  const auto timeout = ReleaseLeaseRpcTimeout();
+  for (uint32_t attempt = 0; attempt < max_retries; ++attempt) {
+    ::umbp::ReleaseSsdLeaseRequest rel_req;
+    rel_req.set_lease_id(lease_id);
+    ::umbp::ReleaseSsdLeaseResponse rel_resp;
+    grpc::ClientContext rel_ctx;
+    rel_ctx.set_deadline(std::chrono::system_clock::now() + timeout);
+    if (stub->ReleaseSsdLease(&rel_ctx, rel_req, &rel_resp).ok()) break;
+  }
+}
+
+void PoolClient::ProcessRemoteSsdBatchGet(const std::vector<BatchGetItem>& items,
+                                          std::vector<bool>* results) {
+  if (items.empty()) return;
+  const auto& first = items.front();
+  auto& peer = GetOrConnectPeer(first.route.node_id, first.route.peer_address);
+
+  const uint32_t max_attempts = SsdGetTransientMaxAttempts();
+  uint64_t transient_not_served = 0;  // aggregated per batch → one AddCounter below
+  for (const auto& item : items) {
+    bool done = false;
+    for (uint32_t attempt = 0; attempt < max_attempts && !done; ++attempt) {
+      SsdGetOutcome outcome = RemoteSsdReadOnce(peer, *item.key, item.dst, item.size);
+      switch (outcome) {
+        case SsdGetOutcome::kSuccess:
+          (*results)[item.index] = true;
+          done = true;
+          break;
+        case SsdGetOutcome::kMiss:   // definitive miss
+        case SsdGetOutcome::kError:  // hard failure (already logged)
+          done = true;
+          break;
+        case SsdGetOutcome::kRetry:  // transient NO_SLOT / reader-local lease expiry; not a miss
+          if (attempt + 1 < max_attempts) std::this_thread::sleep_for(SsdGetRetryBackoff());
+          break;
+      }
+    }
+    if (!done) {
+      ++transient_not_served;
+      MORI_UMBP_WARN(
+          "[PoolClient] Remote SSD get key='{}' still transient-failing (NO_SLOT/lease-expired) "
+          "after {} attempts; reporting as not-served this round (not a definitive miss)",
+          *item.key, max_attempts);
     }
   }
-  return rdma_ok;
+  // Optional reader-side diagnostic: lease expiry is reader-local and never
+  // shows up in the peer's ssd_read_total, so surface transient not-served here.
+  // Aggregated to a single AddCounter per batch (cheap, no per-key lock churn).
+  if (transient_not_served > 0 && master_client_) {
+    master_client_->AddCounter(MORI_UMBP_METRIC_SSD_READ_CLIENT_TRANSIENT_TOTAL,
+                               MORI_UMBP_METRIC_SSD_READ_CLIENT_TRANSIENT_TOTAL_HELP, {},
+                               static_cast<double>(transient_not_served));
+  }
+}
+
+void PoolClient::PublishSsdMetrics() {
+  if (!master_client_) return;
+
+  // Ship a monotonic peer-side counter as the delta since the last tick.  `last`
+  // is updated even on a zero delta (or a defensive counter reset) so the next
+  // tick stays correct.  Runs once per metrics flush in the metrics thread.
+  auto ship_counter = [&](const char* name, const char* help, MasterClient::Labels labels,
+                          uint64_t current, uint64_t& last) {
+    if (current > last) {
+      master_client_->AddCounter(name, help, std::move(labels),
+                                 static_cast<double>(current - last));
+    }
+    last = current;
+  };
+
+  if (ssd_copy_pipeline_) {
+    ship_counter(MORI_UMBP_METRIC_SSD_COPY_ENQUEUED_TOTAL,
+                 MORI_UMBP_METRIC_SSD_COPY_ENQUEUED_TOTAL_HELP, {}, ssd_copy_pipeline_->Enqueued(),
+                 ssd_metrics_last_.copy_enqueued);
+    ship_counter(MORI_UMBP_METRIC_SSD_COPY_SUCCEEDED_TOTAL,
+                 MORI_UMBP_METRIC_SSD_COPY_SUCCEEDED_TOTAL_HELP, {}, ssd_copy_pipeline_->CopiedOk(),
+                 ssd_metrics_last_.copy_succeeded);
+    ship_counter(MORI_UMBP_METRIC_SSD_COPY_FAILED_TOTAL,
+                 MORI_UMBP_METRIC_SSD_COPY_FAILED_TOTAL_HELP, {}, ssd_copy_pipeline_->Failed(),
+                 ssd_metrics_last_.copy_failed);
+    ship_counter(MORI_UMBP_METRIC_SSD_COPY_DROPPED_TOTAL,
+                 MORI_UMBP_METRIC_SSD_COPY_DROPPED_TOTAL_HELP, {{"reason", "queue_full"}},
+                 ssd_copy_pipeline_->Dropped(), ssd_metrics_last_.copy_dropped_queue_full);
+    ship_counter(MORI_UMBP_METRIC_SSD_COPY_DROPPED_TOTAL,
+                 MORI_UMBP_METRIC_SSD_COPY_DROPPED_TOTAL_HELP, {{"reason", "stopped"}},
+                 ssd_copy_pipeline_->DroppedStopped(), ssd_metrics_last_.copy_dropped_stopped);
+  }
+
+  if (peer_ssd_) {
+    ship_counter(MORI_UMBP_METRIC_SSD_READ_TOTAL, MORI_UMBP_METRIC_SSD_READ_TOTAL_HELP,
+                 {{"status", "ok"}}, peer_ssd_->ReadOk(), ssd_metrics_last_.read_ok);
+    ship_counter(MORI_UMBP_METRIC_SSD_READ_TOTAL, MORI_UMBP_METRIC_SSD_READ_TOTAL_HELP,
+                 {{"status", "not_found"}}, peer_ssd_->ReadNotFound(),
+                 ssd_metrics_last_.read_not_found);
+    ship_counter(MORI_UMBP_METRIC_SSD_READ_TOTAL, MORI_UMBP_METRIC_SSD_READ_TOTAL_HELP,
+                 {{"status", "size_too_large"}}, peer_ssd_->ReadSizeTooLarge(),
+                 ssd_metrics_last_.read_size_too_large);
+    ship_counter(MORI_UMBP_METRIC_SSD_READ_TOTAL, MORI_UMBP_METRIC_SSD_READ_TOTAL_HELP,
+                 {{"status", "error"}}, peer_ssd_->ReadError(), ssd_metrics_last_.read_error);
+
+    // SSD IO byte counters -> bandwidth via rate() in Grafana.
+    ship_counter(MORI_UMBP_METRIC_SSD_COPY_BYTES_TOTAL, MORI_UMBP_METRIC_SSD_COPY_BYTES_TOTAL_HELP,
+                 {}, peer_ssd_->CopyBytes(), ssd_metrics_last_.copy_bytes);
+    ship_counter(MORI_UMBP_METRIC_SSD_READ_BYTES_TOTAL, MORI_UMBP_METRIC_SSD_READ_BYTES_TOTAL_HELP,
+                 {}, peer_ssd_->ReadBytes(), ssd_metrics_last_.read_bytes);
+
+    ship_counter(MORI_UMBP_METRIC_SSD_EVICTION_ROUNDS_TOTAL,
+                 MORI_UMBP_METRIC_SSD_EVICTION_ROUNDS_TOTAL_HELP, {}, peer_ssd_->EvictionRounds(),
+                 ssd_metrics_last_.evict_rounds);
+    ship_counter(MORI_UMBP_METRIC_SSD_EVICTION_VICTIMS_TOTAL,
+                 MORI_UMBP_METRIC_SSD_EVICTION_VICTIMS_TOTAL_HELP, {}, peer_ssd_->EvictionVictims(),
+                 ssd_metrics_last_.evict_victims);
+    ship_counter(MORI_UMBP_METRIC_SSD_EVICTION_BYTES_FREED_TOTAL,
+                 MORI_UMBP_METRIC_SSD_EVICTION_BYTES_FREED_TOTAL_HELP, {},
+                 peer_ssd_->EvictionBytesFreed(), ssd_metrics_last_.evict_bytes_freed);
+    ship_counter(MORI_UMBP_METRIC_SSD_EVICTION_BACKEND_FAILED_TOTAL,
+                 MORI_UMBP_METRIC_SSD_EVICTION_BACKEND_FAILED_TOTAL_HELP, {},
+                 peer_ssd_->EvictionBackendFailures(), ssd_metrics_last_.evict_backend_failed);
+  }
+
+  if (peer_service_) {
+    const auto& m = peer_service_->Metrics();
+    const uint64_t expired = m.expired_reclaims.load(std::memory_order_relaxed);
+    const uint64_t slot_full = m.slot_full_rejects.load(std::memory_order_relaxed);
+    ship_counter(MORI_UMBP_METRIC_SSD_STAGING_EXPIRED_RECLAIMS_TOTAL,
+                 MORI_UMBP_METRIC_SSD_STAGING_EXPIRED_RECLAIMS_TOTAL_HELP, {}, expired,
+                 ssd_metrics_last_.staging_expired_reclaims);
+    ship_counter(MORI_UMBP_METRIC_SSD_STAGING_SLOT_FULL_REJECTS_TOTAL,
+                 MORI_UMBP_METRIC_SSD_STAGING_SLOT_FULL_REJECTS_TOTAL_HELP, {}, slot_full,
+                 ssd_metrics_last_.staging_slot_full_rejects);
+    // A NO_SLOT read outcome IS a slot-full reject; surface it under the unified
+    // read_total{status=no_slot} too (same event, peer-service view of reads).
+    ship_counter(MORI_UMBP_METRIC_SSD_READ_TOTAL, MORI_UMBP_METRIC_SSD_READ_TOTAL_HELP,
+                 {{"status", "no_slot"}}, slot_full, ssd_metrics_last_.read_no_slot);
+    master_client_->SetGauge(MORI_UMBP_METRIC_SSD_STAGING_SLOTS_IN_USE,
+                             MORI_UMBP_METRIC_SSD_STAGING_SLOTS_IN_USE_HELP, {},
+                             static_cast<double>(peer_service_->SnapshotReadSlotsInUse()));
+  }
 }
 
 }  // namespace mori::umbp
