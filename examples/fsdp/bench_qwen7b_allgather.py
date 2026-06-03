@@ -68,6 +68,26 @@ def _parse_args() -> argparse.Namespace:
         default=10,
         help="Rank 0 prints an aggregate every N measured steps.",
     )
+    parser.add_argument(
+        "--profile-dir",
+        default=None,
+        help=(
+            "Optional directory for per-rank PyTorch profiler Chrome traces. "
+            "Profiling starts after warmup and uses measured-step indices."
+        ),
+    )
+    parser.add_argument(
+        "--profile-start-step",
+        type=int,
+        default=0,
+        help="Measured step index at which profiling starts after warmup.",
+    )
+    parser.add_argument(
+        "--profile-steps",
+        type=int,
+        default=5,
+        help="Number of measured steps to include in the profiler trace.",
+    )
     return parser.parse_args()
 
 
@@ -224,6 +244,11 @@ def _run_step(
 
 def main() -> None:
     args = _parse_args()
+    if args.profile_dir is not None:
+        if args.profile_start_step < 0:
+            raise ValueError("--profile-start-step must be non-negative")
+        if args.profile_steps <= 0:
+            raise ValueError("--profile-steps must be positive when --profile-dir is set")
     _configure_mode(args.mode)
     rank, local_rank, world_size, device = _init_distributed(args.backend)
     _init_mori_shmem_if_needed(args.mode)
@@ -270,7 +295,28 @@ def main() -> None:
     )
     dist.barrier()
     torch.cuda.synchronize(device)
+    profiler = None
+    profiled_steps = 0
     for step in range(total_steps):
+        measured_step_for_profile = step - args.warmup
+        should_start_profile = (
+            args.profile_dir is not None
+            and profiler is None
+            and profiled_steps == 0
+            and measured_step_for_profile == args.profile_start_step
+        )
+        if should_start_profile:
+            profiler = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                record_shapes=False,
+                profile_memory=False,
+                with_stack=False,
+            )
+            profiler.__enter__()
+
         torch.cuda.synchronize(device)
         start = time.perf_counter()
         with autocast_ctx:
@@ -281,6 +327,21 @@ def main() -> None:
             )
         torch.cuda.synchronize(device)
         elapsed = time.perf_counter() - start
+
+        if profiler is not None:
+            profiler.step()
+            profiled_steps += 1
+            if profiled_steps >= args.profile_steps:
+                trace_path = Path(args.profile_dir) / f"trace_rank{rank}.json"
+                trace_path.parent.mkdir(parents=True, exist_ok=True)
+                profiler.__exit__(None, None, None)
+                profiler.export_chrome_trace(str(trace_path))
+                profiler = None
+                if rank == 0:
+                    print(
+                        f"Exported PyTorch profiler traces to {args.profile_dir}",
+                        flush=True,
+                    )
 
         if step >= args.warmup:
             measured_step = step - args.warmup
@@ -310,6 +371,14 @@ def main() -> None:
                     f"loss={loss:.6f}",
                     flush=True,
                 )
+
+    if profiler is not None:
+        trace_path = Path(args.profile_dir) / f"trace_rank{rank}.json"
+        trace_path.parent.mkdir(parents=True, exist_ok=True)
+        profiler.__exit__(None, None, None)
+        profiler.export_chrome_trace(str(trace_path))
+        if rank == 0:
+            print(f"Exported PyTorch profiler traces to {args.profile_dir}", flush=True)
 
     local = torch.tensor(
         [
@@ -349,6 +418,7 @@ def main() -> None:
             "avg_tflops_per_gpu": avg_tflops / world_size,
             "last_loss": measured_losses[-1] if measured_losses else None,
             "mori_fsdp_enable_sdma": os.environ.get("MORI_FSDP_ENABLE_SDMA"),
+            "mori_fsdp_zero_copy_output": os.environ.get("MORI_FSDP_ZERO_COPY_OUTPUT"),
             "mori_enable_sdma": os.environ.get("MORI_ENABLE_SDMA"),
         }
         print(json.dumps(summary, indent=2, sort_keys=True), flush=True)
