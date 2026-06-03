@@ -63,23 +63,6 @@ __global__ void lsa_barrier_kernel(ccoDevComm* devComm) {
   bar.sync(coop);
 }
 
-// ── helpers ────────────────────────────────────────────────────────────────
-
-static size_t free_vram_mb() {
-  size_t freeMem, totalMem;
-  hipMemGetInfo(&freeMem, &totalMem);
-  return freeMem >> 20;
-}
-
-// Barrier across all ranks then rank 0 prints label + free VRAM.
-static void print_vram(mori::cco::ccoComm* comm, int rank, const char* label) {
-  ccoBarrierAll(comm);
-  if (rank == 0) {
-    printf("[vram] %-52s  free=%zu MB\n", label, free_vram_mb());
-    fflush(stdout);
-  }
-  ccoBarrierAll(comm);
-}
 
 // ── main ───────────────────────────────────────────────────────────────────
 int main(int argc, char* argv[]) {
@@ -109,8 +92,6 @@ int main(int argc, char* argv[]) {
   mori::cco::ccoComm* comm = nullptr;
   assert(ccoCommCreate(boot, 0, &comm) == 0);
 
-  print_vram(comm, rank, "after ccoCommCreate");
-
   // ── Phase 2: window + devcomm leak loop ──
   for (int wi = 0; wi < window_iters; wi++) {
     // Register a window pair.
@@ -136,16 +117,19 @@ int main(int argc, char* argv[]) {
 
     }
 
-
-    printf("Win dereg %d/%d\n", wi, window_iters);
+    printf("rank[%d] ccoWindowDeregister %d/%d\n", rank,  wi, window_iters);
 
     // Deregister window.
     ccoWindowDeregister(comm, win);
     ccoMemFree(comm, buf);
 
+    // Barrier: ensure every rank has torn down its peer mappings of this
+    // window (in ccoWindowDeregister) and freed its slot before any rank
+    // reuses the same flat VA in the next iteration. Without this, one rank's
+    // next-iter hipMemMap at the reused VA can race a peer that still holds the
+    // old dma-buf mapping, causing hsa_amd_vmem_map to fail.
+    ccoBarrierAll(comm);
   }
-
-  print_vram(comm, rank, "after all iterations");
 
   // ── Teardown ──
   // bootstrap ownership transfers to ccoComm; ccoCommDestroy calls
