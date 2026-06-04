@@ -163,7 +163,7 @@ int ccoCommCreate(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
   // 4 GiB-aligned) and non-zero (kernel-allocated VA), satisfying
   // HeapVAManager's invariants.
   comm->vaManager.reset(
-      new application::HeapVAManager(LocalSlotBase(comm), perRankVmmSize, granularity));
+      new application::HeapVAManager(LocalSlotBase(comm), perRankVmmSize, 0));
 
   // Step 4: SDMA queue setup. Materialize only if the user opted in
   // (MORI_ENABLE_SDMA) AND at least one peer has SDMA-capable hardware.
@@ -397,25 +397,9 @@ int ccoMemFree(ccoComm* comm, void* ptr) {
   (void)comm->vaManager->Free(reinterpret_cast<uintptr_t>(ptr));
 
   size_t alignedSize = meta.size;
-  size_t slotOffset = meta.slotOffset;
 
   MORI_SHMEM_TRACE("ccoMemFree: rank={} ptr={} size={}", comm->rank, ptr, alignedSize);
 
-  // Unmap peer slots that WindowRegister mapped. ENOMAP for never-registered
-  // windows is expected and ignored.
-  for (int lsa = 0; lsa < comm->lsaSize; lsa++) {
-    if (lsa == comm->lsaRank) continue;
-    int pe = comm->myNodeStart + lsa;
-    if (!comm->ctx->CanUseP2P(pe)) continue;
-
-    void* peerVa = static_cast<char*>(comm->flatBase) +
-                   static_cast<size_t>(lsa) * comm->perRankSize + slotOffset;
-    hipError_t err = hipMemUnmap(peerVa, alignedSize);
-    if (err != hipSuccess) {
-      MORI_SHMEM_WARN("ccoMemFree: unmap PE {} (lsa={}) failed: {}", pe, lsa,
-                      static_cast<int>(err));
-    }
-  }
 
   hipError_t err = hipMemUnmap(ptr, alignedSize);
   if (err != hipSuccess) {
