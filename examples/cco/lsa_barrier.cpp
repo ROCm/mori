@@ -569,6 +569,13 @@ int main(int argc, char* argv[]) {
 
   // ── Phase 1: communicator ──
   auto* boot = new mori::application::MpiBootstrapNetwork(MPI_COMM_WORLD);
+
+  // Bind each rank to its own GPU BEFORE ccoCommCreate (which calls
+  // hipGetDevice() and pins allocations to the current device).
+  int hipDevCount = 0;
+  HIP_CHECK(hipGetDeviceCount(&hipDevCount));
+  HIP_CHECK(hipSetDevice(boot->GetLocalRank() % hipDevCount));
+
   ccoComm* comm = nullptr;
   assert(ccoCommCreate(boot, PER_RANK_VMM_SIZE, &comm) == 0);
 

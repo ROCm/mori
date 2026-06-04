@@ -89,6 +89,14 @@ int main(int argc, char* argv[]) {
 
   // ── Phase 1: ccoComm (created once, destroyed at the end) ──
   auto* boot = new mori::application::MpiBootstrapNetwork(MPI_COMM_WORLD);
+
+  // Bind each rank to its own GPU BEFORE ccoCommCreate. ccoCommCreate calls
+  // hipGetDevice() and pins all allocations to the current device, so without
+  // this every rank would land on GPU 0 (all 8 GB windows stacked on PE0).
+  int hipDevCount = 0;
+  assert(hipGetDeviceCount(&hipDevCount) == hipSuccess);
+  assert(hipSetDevice(boot->GetLocalRank() % hipDevCount) == hipSuccess);
+
   mori::cco::ccoComm* comm = nullptr;
   assert(ccoCommCreate(boot, 0, &comm) == 0);
 
