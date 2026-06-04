@@ -45,8 +45,8 @@ struct ccoCoopThread {
 };
 
 struct ccoCoopWarp {
-  __device__ int thread_rank() const { return threadIdx.x % 64; }
-  __device__ int size() const { return 64; }
+  __device__ int thread_rank() const { return threadIdx.x % warpSize; }
+  __device__ int size() const { return warpSize; }
   __device__ void sync() { __syncwarp(); }
 };
 
