@@ -29,10 +29,9 @@ namespace cco {
 
 template <typename Coop>
 __device__ inline ccoLsaBarrierSession<Coop>::ccoLsaBarrierSession(Coop coop, ccoDevComm_t comm,
-                                                                    ccoLsaBarrierHandle h,
-                                                                    uint32_t idx)
+                                                                   ccoLsaBarrierHandle h,
+                                                                   uint32_t idx)
     : coop(coop), comm(comm), handle(h), index(idx) {
-
   assert(idx < h.nBarriers);
 
   // Restore epoch persisted by the previous session's destructor.

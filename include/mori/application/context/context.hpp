@@ -91,12 +91,8 @@ class Context {
   // reach the peer, without baking any policy choice. Use this when you need
   // to apply a custom policy (e.g. CCO's gdaConnectionType FULL forces NIC
   // QPs to intra-node peers even though canP2P is also true).
-  const PeerCapabilities& GetPeerCapabilities(int destRank) const {
-    return peerCaps[destRank];
-  }
-  const std::vector<PeerCapabilities>& GetAllPeerCapabilities() const {
-    return peerCaps;
-  }
+  const PeerCapabilities& GetPeerCapabilities(int destRank) const { return peerCaps[destRank]; }
+  const std::vector<PeerCapabilities>& GetAllPeerCapabilities() const { return peerCaps; }
 
   RdmaContext* GetRdmaContext() const { return rdmaContext.get(); }
   RdmaDeviceContext* GetRdmaDeviceContext() const { return rdmaDeviceContext.get(); }
@@ -161,15 +157,15 @@ class Context {
 
  private:
   void CollectHostNames();
-  void InitializeTopologyAndTransports();   // lightweight: topology + NIC + transport type decision + SDMA queues
-  void BuildAndConnectInitialEndpoints();   // heavyweight: build initial QP set + AllToAll + connect
+  void InitializeTopologyAndTransports();  // lightweight: topology + NIC + transport type decision
+                                           // + SDMA queues
+  void BuildAndConnectInitialEndpoints();  // heavyweight: build initial QP set + AllToAll + connect
 
   // Apply Context's built-in policy to derive a single TransportType from a
   // PeerCapabilities entry. Preference: P2P > SDMA > RDMA. Self always P2P.
   // Aborts (assert) if no transport is available, matching legacy behavior
   // expected by SHMEM init.
-  TransportType DefaultPolicyResolve(const PeerCapabilities& cap,
-                                     bool isSelf) const;
+  TransportType DefaultPolicyResolve(const PeerCapabilities& cap, bool isSelf) const;
 
   struct PeerInfo {
     bool sameHost{false};     // on the same node (same hostname+IP)
@@ -185,8 +181,8 @@ class Context {
   bool p2pDisabled{false};
   std::string myHostname;
   std::vector<PeerInfo> peerInfos;
-  std::vector<PeerCapabilities> peerCaps;        // raw capability discovery
-  std::vector<TransportType> transportTypes;     // derived via DefaultPolicyResolve
+  std::vector<PeerCapabilities> peerCaps;     // raw capability discovery
+  std::vector<TransportType> transportTypes;  // derived via DefaultPolicyResolve
 
   std::unique_ptr<RdmaContext> rdmaContext{nullptr};
   std::unique_ptr<RdmaDeviceContext> rdmaDeviceContext{nullptr};
