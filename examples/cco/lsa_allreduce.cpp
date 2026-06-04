@@ -44,14 +44,14 @@
 
 #include "args_parser.hpp"
 #include "mori/cco/cco_api.hpp"
-#include "mori/cco/cco_device_api.hpp"
 #include "mori/cco/cco_coop.hpp"
+#include "mori/cco/cco_device_api.hpp"
 #include "mori/cco/cco_lsa_impl.hpp"
 #include "mori/cco/cco_lsa_types.hpp"
 #include "mori/cco/cco_team.hpp"
 #include "mori/cco/cco_types.hpp"
 
-#define NELEMS  (32)  // tiny vector: rank r contributes (r,r,r,r)
+#define NELEMS (32)  // tiny vector: rank r contributes (r,r,r,r)
 
 using namespace mori::cco;
 
@@ -76,10 +76,8 @@ using namespace mori::cco;
 // ─── BLOCK variant ─────────────────────────────────────────────────────────
 //   Launch: <<<1, blockDim>>>
 //   All threads of the CTA cooperate. Stride loop over threadIdx.x.
-__global__ void lsa_allreduce_block_kernel(ccoDevComm* devComm,
-                                           ccoWindow_t sendWin, size_t sendOff,
-                                           ccoWindow_t recvWin, size_t recvOff,
-                                           size_t count) {
+__global__ void lsa_allreduce_block_kernel(ccoDevComm* devComm, ccoWindow_t sendWin, size_t sendOff,
+                                           ccoWindow_t recvWin, size_t recvOff, size_t count) {
   ccoCoopBlock coop;
   ccoLsaBarrierSession<ccoCoopBlock> bar(coop, devComm, devComm->lsaBarrier, 0);
   bar.sync(coop);
@@ -102,16 +100,14 @@ __global__ void lsa_allreduce_block_kernel(ccoDevComm* devComm,
 // ─── WARP variant ──────────────────────────────────────────────────────────
 //   Launch: <<<1, 64>>>  (exactly one wavefront on AMD)
 //   The 64 lanes of one warp cooperate. Stride loop over lane id.
-__global__ void lsa_allreduce_warp_kernel(ccoDevComm* devComm,
-                                          ccoWindow_t sendWin, size_t sendOff,
-                                          ccoWindow_t recvWin, size_t recvOff,
-                                          size_t count) {
+__global__ void lsa_allreduce_warp_kernel(ccoDevComm* devComm, ccoWindow_t sendWin, size_t sendOff,
+                                          ccoWindow_t recvWin, size_t recvOff, size_t count) {
   ccoCoopWarp coop;
   ccoLsaBarrierSession<ccoCoopWarp> bar(coop, devComm, devComm->lsaBarrier, 0);
   bar.sync(coop);
 
   const int lsaSize = devComm->lsaSize;
-  const int lane    = __lane_id();
+  const int lane = __lane_id();
   // `warpSize` is a HIP built-in __device__ const int (64 on AMD gfx9+).
 
   for (size_t i = lane; i < count; i += warpSize) {
@@ -130,9 +126,8 @@ __global__ void lsa_allreduce_warp_kernel(ccoDevComm* devComm,
 // ─── THREAD variant ────────────────────────────────────────────────────────
 //   Launch: <<<1, 1>>>  (one single thread per rank)
 //   That thread does the whole allreduce serially.
-__global__ void lsa_allreduce_thread_kernel(ccoDevComm* devComm,
-                                            ccoWindow_t sendWin, size_t sendOff,
-                                            ccoWindow_t recvWin, size_t recvOff,
+__global__ void lsa_allreduce_thread_kernel(ccoDevComm* devComm, ccoWindow_t sendWin,
+                                            size_t sendOff, ccoWindow_t recvWin, size_t recvOff,
                                             size_t count) {
   ccoCoopThread coop;
   ccoLsaBarrierSession<ccoCoopThread> bar(coop, devComm, devComm->lsaBarrier, 0);
@@ -189,20 +184,22 @@ int main(int argc, char* argv[]) {
   for (int r = 0; r < nranks; r++) {
     ccoBarrierAll(comm);
     if (rank == r) {
-      char buf[256]; int n = 0;
+      char buf[256];
+      int n = 0;
       n += snprintf(buf + n, sizeof(buf) - n, "  Rank %d INPUT  (", rank);
       for (size_t i = 0; i < NELEMS; i++)
         n += snprintf(buf + n, sizeof(buf) - n, "%s%.0f", i ? "," : "", sendHost[i]);
       n += snprintf(buf + n, sizeof(buf) - n, ")\n");
-      fputs(buf, stdout); fflush(stdout);
+      fputs(buf, stdout);
+      fflush(stdout);
     }
   }
 
   ccoBarrierAll(comm);
   const float expected = static_cast<float>(nranks * (nranks - 1)) / 2.f;
   if (rank == 0) {
-    printf("AllReduce-SUM over %d ranks of %zu-elem vectors  ⇒  expected = (%.0f",
-           nranks, (size_t)NELEMS, expected);
+    printf("AllReduce-SUM over %d ranks of %zu-elem vectors  ⇒  expected = (%.0f", nranks,
+           (size_t)NELEMS, expected);
     for (size_t i = 1; i < NELEMS; i++) printf(",%.0f", expected);
     printf(")\n");
     fflush(stdout);
@@ -210,12 +207,10 @@ int main(int argc, char* argv[]) {
 
   ccoBarrierAll(comm);
 
-
-
   // ── Phase 3: device communicator (1 barrier slot is enough for all 3) ──
   ccoDevCommRequirements reqs = CCO_DEV_COMM_REQUIREMENTS_INITIALIZER;
   reqs.gdaConnectionType = CCO_GDA_CONNECTION_NONE;
-  reqs.lsaBarrierCount   = 1;
+  reqs.lsaBarrierCount = 1;
 
   ccoDevComm* devComm = nullptr;
   assert(ccoDevCommCreate(comm, &reqs, &devComm) == 0);
@@ -235,29 +230,30 @@ int main(int argc, char* argv[]) {
     assert(hipDeviceSynchronize() == hipSuccess);
 
     std::vector<float> recvHost(NELEMS);
-    assert(hipMemcpy(recvHost.data(), recvBuf, sizeBytes,
-                     hipMemcpyDeviceToHost) == hipSuccess);
+    assert(hipMemcpy(recvHost.data(), recvBuf, sizeBytes, hipMemcpyDeviceToHost) == hipSuccess);
     int errors = 0;
     for (size_t i = 0; i < NELEMS; i++)
       if (recvHost[i] != expected) errors++;
     totalErrors += errors;
 
-    char buf[256]; int n = 0;
+    char buf[256];
+    int n = 0;
     n += snprintf(buf + n, sizeof(buf) - n, "  Rank %d [%-6s] RESULT (", rank, name);
     for (size_t i = 0; i < NELEMS; i++)
       n += snprintf(buf + n, sizeof(buf) - n, "%s%.0f", i ? "," : "", recvHost[i]);
     n += snprintf(buf + n, sizeof(buf) - n, ")  %s  (expected=%.0f errors=%d)\n",
                   errors == 0 ? "PASS" : "FAIL", expected, errors);
-    fputs(buf, stdout); fflush(stdout);
+    fputs(buf, stdout);
+    fflush(stdout);
   };
 
   // ── BLOCK variant ──
-  run_variant("block",  [&] {
+  run_variant("block", [&] {
     lsa_allreduce_block_kernel<<<1, 64>>>(devComm, sendWin, 0, recvWin, 0, NELEMS);
   });
 
   // ── WARP variant ──
-  run_variant("warp",   [&] {
+  run_variant("warp", [&] {
     lsa_allreduce_warp_kernel<<<1, 64>>>(devComm, sendWin, 0, recvWin, 0, NELEMS);
   });
 

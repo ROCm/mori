@@ -29,10 +29,9 @@ namespace cco {
 
 template <typename Coop>
 __device__ inline ccoLsaBarrierSession<Coop>::ccoLsaBarrierSession(Coop coop, ccoDevComm_t comm,
-                                                                    ccoLsaBarrierHandle h,
-                                                                    uint32_t idx)
+                                                                   ccoLsaBarrierHandle h,
+                                                                   uint32_t idx)
     : coop(coop), comm(comm), handle(h), index(idx) {
-
   assert(idx < h.nBarriers);
 
   // Restore epoch persisted by the previous session's destructor.
@@ -68,7 +67,7 @@ __device__ inline void ccoLsaBarrierSession<Coop>::arrive(Coop) {
   const int myRank = this->team.rank;
 
   // System-scope fence so any prior payload writes from this coop are
-  // observable to peers before the relaxed inbox stores below land. 
+  // observable to peers before the relaxed inbox stores below land.
   if (nranks > 1) {
     __threadfence_system();
   }
@@ -103,7 +102,7 @@ __device__ inline int ccoLsaBarrierSession<Coop>::waitInternal(Coop, uint64_t ti
 
       if constexpr (EnableTimeout) {
         if ((uint64_t)clock64() - startCycle >= timeoutCycles) {
-          ret = 1; 
+          ret = 1;
           goto done;
         }
       }

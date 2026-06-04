@@ -82,14 +82,14 @@
 
 using namespace mori::cco;
 
-#define HIP_CHECK(cmd)                                                                            \
-  do {                                                                                            \
-    hipError_t e = (cmd);                                                                         \
-    if (e != hipSuccess) {                                                                        \
-      std::fprintf(stderr, "HIP error %d (%s) at %s:%d\n", e, hipGetErrorString(e), __FILE__,     \
-                   __LINE__);                                                                     \
-      std::exit(1);                                                                               \
-    }                                                                                             \
+#define HIP_CHECK(cmd)                                                                        \
+  do {                                                                                        \
+    hipError_t e = (cmd);                                                                     \
+    if (e != hipSuccess) {                                                                    \
+      std::fprintf(stderr, "HIP error %d (%s) at %s:%d\n", e, hipGetErrorString(e), __FILE__, \
+                   __LINE__);                                                                 \
+      std::exit(1);                                                                           \
+    }                                                                                         \
   } while (0)
 
 static const size_t PER_RANK_VMM_SIZE = 64ULL * 1024 * 1024;
@@ -333,14 +333,14 @@ __global__ void barrier_preset_kernel(ccoDevComm* dc, uint32_t slot, uint32_t va
 // Shared state passed to every UT function. UTs only need this — they don't
 // touch MPI/DevComm setup directly, just consume what main() prepared.
 struct UtCtx {
-  int rank;          // world rank, used for "rank 0 prints" guards
-  ccoComm* comm;     // for ccoBarrierAll between cases
+  int rank;       // world rank, used for "rank 0 prints" guards
+  ccoComm* comm;  // for ccoBarrierAll between cases
   ccoDevComm* devComm;
   ccoDevComm dcHost;  // host-side snapshot (lsaSize, lsaRank, ...)
   ccoWindow_t sendWin;
   // Scratch device buffers, reused across cases.
-  int* devErrors;                      // one int
-  int* devRc;                          // [lsaSize]
+  int* devErrors;  // one int
+  int* devRc;      // [lsaSize]
 };
 
 using UtFn = int (*)(UtCtx&);
@@ -351,8 +351,8 @@ using UtFn = int (*)(UtCtx&);
 
 // Generic visibility runner — used by all three Coop-variant UTs.
 template <typename Coop>
-static int run_visibility(UtCtx& ctx, const char* name, uint32_t slot, uint32_t iters,
-                          dim3 grid, dim3 block) {
+static int run_visibility(UtCtx& ctx, const char* name, uint32_t slot, uint32_t iters, dim3 grid,
+                          dim3 block) {
   HIP_CHECK(hipMemset(ctx.devErrors, 0, sizeof(int)));
   hipLaunchKernelGGL(barrier_visibility_kernel<Coop>, grid, block, 0, 0, ctx.devComm, ctx.sendWin,
                      (size_t)0, iters, slot, ctx.devErrors);
@@ -448,12 +448,12 @@ static int ut_timeout(UtCtx& ctx) {
   hipLaunchKernelGGL(barrier_timeout_kernel, dim3(1), dim3(1), 0, 0, ctx.devComm, kSlot,
                      kTimeoutCycles, kRankToSkip, ctx.devRc);
   HIP_CHECK(hipEventRecord(stop, nullptr));
-  
+
   HIP_CHECK(hipDeviceSynchronize());
 
   std::vector<int> rcHost(ctx.dcHost.lsaSize);
-  HIP_CHECK(hipMemcpy(rcHost.data(), ctx.devRc, sizeof(int) * ctx.dcHost.lsaSize,
-                      hipMemcpyDeviceToHost));
+  HIP_CHECK(
+      hipMemcpy(rcHost.data(), ctx.devRc, sizeof(int) * ctx.dcHost.lsaSize, hipMemcpyDeviceToHost));
 
   bool ok = true;
   if (ctx.dcHost.lsaRank != kRankToSkip && rcHost[ctx.dcHost.lsaRank] != 1) {
@@ -462,8 +462,9 @@ static int ut_timeout(UtCtx& ctx) {
   if (ctx.rank == 0) {
     float elapsedTime;
     HIP_CHECK(hipEventElapsedTime(&elapsedTime, start, stop));
-    std::printf("  [timeo ] slot=%u skipRank=%d  expected rc=1 on survivors  %s elapsedTime=%f ms\n", kSlot,
-                kRankToSkip, ok ? "PASS" : "FAIL", elapsedTime);
+    std::printf(
+        "  [timeo ] slot=%u skipRank=%d  expected rc=1 on survivors  %s elapsedTime=%f ms\n", kSlot,
+        kRankToSkip, ok ? "PASS" : "FAIL", elapsedTime);
   }
   ccoBarrierAll(ctx.comm);
   return ok ? 0 : 1;
@@ -563,8 +564,8 @@ static int ut_wraparound(UtCtx& ctx) {
   int hostErr = 0;
   HIP_CHECK(hipMemcpy(&hostErr, ctx.devErrors, sizeof(int), hipMemcpyDeviceToHost));
   if (ctx.rank == 0) {
-    std::printf("  [wrap  ] slot=%u preset=0x%08X iters=%u  errors=%d  %s\n", kSlot, kPreset, kIters,
-                hostErr, hostErr == 0 ? "PASS" : "FAIL");
+    std::printf("  [wrap  ] slot=%u preset=0x%08X iters=%u  errors=%d  %s\n", kSlot, kPreset,
+                kIters, hostErr, hostErr == 0 ? "PASS" : "FAIL");
   }
   ccoBarrierAll(ctx.comm);
   return hostErr == 0 ? 0 : 1;
@@ -623,8 +624,8 @@ static int run_all_tests(UtCtx& ctx) {
     fails += c.fn(ctx);
   }
   if (ctx.rank == 0) {
-    std::printf("=== %d/%zu PASS ===\n", static_cast<int>(sizeof(kCases) / sizeof(kCases[0])) -
-                                              fails,
+    std::printf("=== %d/%zu PASS ===\n",
+                static_cast<int>(sizeof(kCases) / sizeof(kCases[0])) - fails,
                 sizeof(kCases) / sizeof(kCases[0]));
   }
   return fails;
