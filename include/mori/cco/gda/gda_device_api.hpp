@@ -217,17 +217,17 @@ __device__ inline void ccoGda<PrvdType>::flush() {
   }
 }
 
-// Flush single peer
+// Flush single peer: poll CQ until all submitted WQEs complete.
+// Consistent with NCCL GIN: flush does NOT ring doorbell.
+// If using AggregateRequests, caller must call flushAsync first to ring doorbell.
 template <core::ProviderType PrvdType>
 __device__ inline void ccoGda<PrvdType>::flush(int peer) {
-  // Select endpoint
   ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
   int qpIdx = peer * ibgda->numQpPerPe + (contextId % ibgda->numQpPerPe);
   shmem::ShmemRdmaEndpoint* ep = &ibgda->endpoints[qpIdx];
-  uint32_t qpn = ep->qpn;
 
-  // Call primitive flush
-  flushImpl<PrvdType>(ep, qpn);
+  // Only poll CQ, no doorbell ring (like NCCL's doca_gpu_dev_verbs_wait)
+  flushImpl<PrvdType>(ep);
 }
 
 // FlushAsync: async flush for peer

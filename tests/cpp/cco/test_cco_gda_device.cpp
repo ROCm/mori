@@ -38,6 +38,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <cassert>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -46,6 +48,7 @@
 #include "mori/application/bootstrap/socket_bootstrap.hpp"
 #include "mori/cco/cco_api.hpp"
 #include "mori/cco/gda/gda_device_api.hpp"
+#include "mori/shmem/internal.hpp"
 
 static int g_rank = 0;
 
@@ -62,14 +65,19 @@ static int g_rank = 0;
 static const size_t PER_RANK_VMM_SIZE = 256ULL * 1024 * 1024;
 static const size_t COUNT = 256;  // elements per rank-pair
 
-// NIC provider type selection (compile-time, same as shmem kernels)
-#ifdef MORI_DEVICE_NIC_BNXT
-static constexpr mori::core::ProviderType kPrvdType = mori::core::ProviderType::BNXT;
-#elif defined(MORI_DEVICE_NIC_IONIC)
+// NIC provider type — force PSD (Ionic) for this test.
 static constexpr mori::core::ProviderType kPrvdType = mori::core::ProviderType::PSD;
-#else
-static constexpr mori::core::ProviderType kPrvdType = mori::core::ProviderType::MLX5;
-#endif
+
+// Device-side guard: print + trap if `ptr` is null. Trap stops the kernel
+// immediately so we don't follow up with a page-fault from a null deref.
+#define DEV_ASSERT_NN(ptr, what)                                                               \
+  do {                                                                                         \
+    if ((ptr) == nullptr) {                                                                    \
+      printf("[dev rank=%d tid=%d] NULL ptr: %s (%s:%d)\n", devComm.rank, threadIdx.x, (what), \
+             __FILE__, __LINE__);                                                              \
+      __builtin_trap();                                                                        \
+    }                                                                                          \
+  } while (0)
 
 // AlltoAll kernel: each rank puts its data to every peer's recv buffer.
 // Single warp (threadIdx.x < 64) does the work.
@@ -90,17 +98,50 @@ __global__ void GdaAlltoAllKernel(mori::cco::ccoWindowDevice* sendWin,
 
   size_t perPairBytes = count * sizeof(T);
 
-  // Each thread handles a subset of peers
+  // Device-side sanity: catch null pointers BEFORE any RDMA op dereferences them.
+  // Only thread 0 to keep the printf output readable.
+  if (tid == 0) {
+    DEV_ASSERT_NN(sendWin, "sendWin");
+    DEV_ASSERT_NN(recvWin, "recvWin");
+    DEV_ASSERT_NN(sendWin->ibgdaWin.peerRkeys, "sendWin->ibgdaWin.peerRkeys");
+    DEV_ASSERT_NN(recvWin->ibgdaWin.peerRkeys, "recvWin->ibgdaWin.peerRkeys");
+    DEV_ASSERT_NN(devComm.ibgda.endpoints, "devComm.ibgda.endpoints");
+    DEV_ASSERT_NN(devComm.ibgda.signalBuf, "devComm.ibgda.signalBuf");
+    DEV_ASSERT_NN(devComm.ibgda.signalShadows, "devComm.ibgda.signalShadows");
+    DEV_ASSERT_NN(devComm.resourceWindow_inlined.ibgdaWin.peerRkeys,
+                  "resourceWindow_inlined.peerRkeys");
+
+    // Per-QP guards: walk every endpoint we'll touch and verify its handles.
+    int numQpPerPe = devComm.ibgda.numQpPerPe;
+    for (int peer = 0; peer < nRanks; peer++) {
+      if (peer == myRank) continue;
+      int qpIdx = peer * numQpPerPe + (ginContext % numQpPerPe);
+      mori::shmem::ShmemRdmaEndpoint* ep = &devComm.ibgda.endpoints[qpIdx];
+      // Doorbell + SQ/CQ addresses are the doorbell-ring / CQ-poll fast path.
+      // If any of these is null, RingDoorbell / poll_cq will fault.
+      DEV_ASSERT_NN(ep->wqHandle.sqAddr, "ep->wqHandle.sqAddr");
+      DEV_ASSERT_NN(ep->wqHandle.dbrAddr, "ep->wqHandle.dbrAddr");
+      DEV_ASSERT_NN(ep->cqHandle.cqAddr, "ep->cqHandle.cqAddr");
+      if (ep->qpn == 0) {
+        printf("[dev rank=%d] peer=%d qpn=0 (uninitialized QP)\n", devComm.rank, peer);
+        __builtin_trap();
+      }
+    }
+  }
+  __syncthreads();
+
+  // DEBUG: serialize puts on a single thread to test whether concurrent
+  // doorbell writes to the same dbrAddr (Ionic shared doorbell) are being
+  // coalesced and dropped by the NIC. If nrank>2 passes after this, the bug
+  // is doorbell contention across endpoints sharing the same dbrAddr.
   for (int r = tid; r < nRanks; r += nthreads) {
     if (r == myRank) continue;
-
-    // put my data for peer r into peer r's recv buffer at slot [myRank]
-    gda.put(r, reinterpret_cast<ccoWindow_t>(recvWin),  // dst: peer's recv window
-            myRank * perPairBytes,                      // dst offset: slot for myRank
-            reinterpret_cast<ccoWindow_t>(sendWin),     // src: my send window
-            r * perPairBytes,                           // src offset: data destined for peer r
-            perPairBytes, ccoGda_SignalInc{static_cast<ccoGdaSignal_t>(myRank)});
+    gda.put(r, reinterpret_cast<ccoWindow_t>(recvWin), myRank * perPairBytes,
+            reinterpret_cast<ccoWindow_t>(sendWin), r * perPairBytes, perPairBytes,
+            ccoGda_SignalInc{static_cast<ccoGdaSignal_t>(myRank)});
   }
+
+  __syncthreads();
 
   // Flush all peers — ring doorbells and wait for CQ completion
   if (tid == 0) {
@@ -109,11 +150,8 @@ __global__ void GdaAlltoAllKernel(mori::cco::ccoWindowDevice* sendWin,
 
   // Wait for all peers to have written to us (each peer increments signal[peerRank])
   // Only one thread does the waiting to avoid redundant polls
-  if (tid == 0) {
-    for (int r = 0; r < nRanks; r++) {
-      if (r == myRank) continue;
-      gda.waitSignal(static_cast<ccoGdaSignal_t>(r), 1);
-    }
+  if (tid < nRanks && tid != myRank) {
+    gda.waitSignal(static_cast<ccoGdaSignal_t>(tid), 1);
   }
 }
 
@@ -159,7 +197,7 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
     }
   }
   HIP_CHECK(hipMemcpy(sendBuf, hostSend.data(), bufSize, hipMemcpyHostToDevice));
-  HIP_CHECK(hipMemset(recvBuf, 0, bufSize));
+  HIP_CHECK(hipMemset(recvBuf, 0xff, bufSize));
 
   // Phase 3: Register windows
   mori::cco::ccoWindow_t sendWin = nullptr;
@@ -188,11 +226,56 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
   printf("[rank %d] DevCommCreate OK (worldSize=%d, lsaSize=%d)\n", rank, devCommHost.worldSize,
          devCommHost.lsaSize);
 
-  // Verify IBGDA endpoints are allocated
-  if (devCommHost.ibgda.endpoints == nullptr) {
-    fprintf(stderr, "[rank %d] IBGDA endpoints are null — GDA not initialized\n", rank);
+  // ── Host-side sanity: verify every GDA pointer the kernel will touch is non-null
+  //    and consistent. Fail loud here rather than crash in the kernel.
+#define HOST_ASSERT_NN(ptr, what)                                                  \
+  do {                                                                             \
+    if ((ptr) == nullptr) {                                                        \
+      fprintf(stderr, "[rank %d] HOST ASSERT FAILED: %s is NULL\n", rank, (what)); \
+      return 1;                                                                    \
+    }                                                                              \
+  } while (0)
+
+  HOST_ASSERT_NN(devCommHost.ibgda.endpoints, "devCommHost.ibgda.endpoints");
+  HOST_ASSERT_NN(devCommHost.ibgda.signalBuf, "devCommHost.ibgda.signalBuf");
+  HOST_ASSERT_NN(devCommHost.ibgda.signalShadows, "devCommHost.ibgda.signalShadows");
+  HOST_ASSERT_NN(devCommHost.resourceWindow_inlined.ibgdaWin.peerRkeys,
+                 "resourceWindow_inlined.ibgdaWin.peerRkeys");
+  if (devCommHost.gdaConnType == mori::cco::CCO_GDA_CONNECTION_NONE) {
+    fprintf(stderr,
+            "[rank %d] HOST ASSERT FAILED: gdaConnType collapsed to NONE — GDA "
+            "endpoints will not be functional. Check peer mask / RDMA support.\n",
+            rank);
     return 1;
   }
+  printf("[rank %d] gdaConnType=%d numQpPerPe=%d signalCount=%d\n", rank,
+         (int)devCommHost.gdaConnType, devCommHost.ibgda.numQpPerPe, devCommHost.ibgda.signalCount);
+
+  // Pull endpoints back to host and audit every QP's doorbell + queue addresses.
+  size_t numEps = static_cast<size_t>(nranks) * devCommHost.ibgda.numQpPerPe;
+  std::vector<mori::shmem::ShmemRdmaEndpoint> epsHost(numEps);
+  HIP_CHECK(hipMemcpy(epsHost.data(), devCommHost.ibgda.endpoints,
+                      numEps * sizeof(mori::shmem::ShmemRdmaEndpoint), hipMemcpyDeviceToHost));
+  for (int peer = 0; peer < nranks; peer++) {
+    if (peer == rank) continue;
+    for (int q = 0; q < devCommHost.ibgda.numQpPerPe; q++) {
+      size_t i = (size_t)peer * devCommHost.ibgda.numQpPerPe + q;
+      const auto& ep = epsHost[i];
+      printf(
+          "[rank %d] ep[peer=%d,q=%d]: qpn=%u sqAddr=%p dbrAddr=%p dbrRecAddr=%p "
+          "cqAddr=%p cqDbrAddr=%p\n",
+          rank, peer, q, ep.qpn, ep.wqHandle.sqAddr, ep.wqHandle.dbrAddr, ep.wqHandle.dbrRecAddr,
+          ep.cqHandle.cqAddr, ep.cqHandle.dbrAddr);
+      if (ep.qpn == 0) {
+        fprintf(stderr, "[rank %d] HOST ASSERT FAILED: ep[peer=%d,q=%d].qpn == 0\n", rank, peer, q);
+        return 1;
+      }
+      HOST_ASSERT_NN(ep.wqHandle.sqAddr, "ep.wqHandle.sqAddr");
+      HOST_ASSERT_NN(ep.wqHandle.dbrAddr, "ep.wqHandle.dbrAddr");
+      HOST_ASSERT_NN(ep.cqHandle.cqAddr, "ep.cqHandle.cqAddr");
+    }
+  }
+#undef HOST_ASSERT_NN
 
   // Host barrier to ensure all ranks have initialized
   mori::cco::ccoBarrierAll(comm);
@@ -212,6 +295,23 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
   // Phase 6: Verify recv buffer
   std::vector<float> hostRecv(COUNT * nranks);
   HIP_CHECK(hipMemcpy(hostRecv.data(), recvBuf, bufSize, hipMemcpyDeviceToHost));
+
+  // Dump recvBuf grouped by source rank (16/row). Self slot is the un-written
+  // 0xff init pattern — anything else means data either arrived (matches
+  // src*1000+rank*100+i) or got corrupted.
+  {
+    const size_t DUMP_PER_SLOT = std::min<size_t>(256, COUNT);
+    for (int srcRank = 0; srcRank < nranks; srcRank++) {
+      if (srcRank == rank) continue;  // skip self slot (never written)
+      printf("[r%d src=%d]", rank, srcRank);
+      for (size_t i = 0; i < DUMP_PER_SLOT; i++) {
+        if (i % 16 == 0) printf("\n[r%d s%d %3zu]", rank, srcRank, i);
+        printf(" %.0f", hostRecv[srcRank * COUNT + i]);
+      }
+      printf("\n");
+    }
+    fflush(stdout);
+  }
 
   bool ok = true;
   for (int srcRank = 0; srcRank < nranks; srcRank++) {
