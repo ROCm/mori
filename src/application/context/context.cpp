@@ -270,7 +270,7 @@ void Context::InitializeTopologyAndTransports() {
     //  - canRDMA: NIC is present (works for both same-host loopback and
     //             cross-node; lets FULL-style policies allocate NIC QPs
     //             even to intra-node peers)
-    cap.canP2P  = cap.sameHost;
+    cap.canP2P = cap.sameHost;
     cap.canSDMA = cap.sameHost;
     cap.canRDMA = (rdmaDeviceContext.get() != nullptr);
 
@@ -306,8 +306,7 @@ void Context::InitializeTopologyAndTransports() {
 /*  consumed by SHMEM's DISPATCH_TRANSPORT_TYPE macro.                      */
 /* ------------------------------------------------------------------------ */
 
-TransportType Context::DefaultPolicyResolve(const PeerCapabilities& cap,
-                                            bool isSelf) const {
+TransportType Context::DefaultPolicyResolve(const PeerCapabilities& cap, bool isSelf) const {
   // Same-host preference order (matching legacy behavior):
   //   1. SDMA if enabled by env AND hardware supports it
   //   2. P2P if not disabled by env AND hardware supports it
@@ -412,14 +411,14 @@ static bool ShouldCreateQpForPeer(int i, int selfRank,
   return peerCaps[i].canRDMA;
 }
 
-std::vector<RdmaEndpoint> Context::CreateAdditionalEndpoints(
-    int qpPerPe, const std::vector<bool>& peerMask) {
+std::vector<RdmaEndpoint> Context::CreateAdditionalEndpoints(int qpPerPe,
+                                                             const std::vector<bool>& peerMask) {
   std::vector<RdmaEndpoint> eps;
   eps.reserve(WorldSize() * qpPerPe);
 
   for (int i = 0; i < WorldSize(); i++) {
-    const bool need = rdmaDeviceContext != nullptr &&
-                      ShouldCreateQpForPeer(i, LocalRank(), peerCaps, peerMask);
+    const bool need =
+        rdmaDeviceContext != nullptr && ShouldCreateQpForPeer(i, LocalRank(), peerCaps, peerMask);
     if (!need) {
       for (int qp = 0; qp < qpPerPe; qp++) eps.push_back({});
       continue;
@@ -433,7 +432,7 @@ std::vector<RdmaEndpoint> Context::CreateAdditionalEndpoints(
 }
 
 void Context::ConnectAdditionalEndpoints(std::vector<RdmaEndpoint>& endpoints, int qpPerPe,
-                                          const std::vector<bool>& peerMask) {
+                                         const std::vector<bool>& peerMask) {
   int totalEps = WorldSize() * qpPerPe;
   std::vector<RdmaEndpointHandle> localHandles(totalEps);
   std::vector<RdmaEndpointHandle> peerHandles(totalEps);

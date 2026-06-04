@@ -1,3 +1,24 @@
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 // Test: CCO GDA device API — AlltoAll via GPU-initiated RDMA put + signal.
 //
 // Multi-process (fork or MPI). Each rank launches a HIP kernel that:
@@ -49,13 +70,13 @@ static constexpr mori::core::ProviderType kPrvdType = mori::core::ProviderType::
 
 // Device-side guard: print + trap if `ptr` is null. Trap stops the kernel
 // immediately so we don't follow up with a page-fault from a null deref.
-#define DEV_ASSERT_NN(ptr, what)                                                                  \
-  do {                                                                                            \
-    if ((ptr) == nullptr) {                                                                       \
-      printf("[dev rank=%d tid=%d] NULL ptr: %s (%s:%d)\n", devComm.rank, threadIdx.x, (what),    \
-             __FILE__, __LINE__);                                                                 \
-      __builtin_trap();                                                                           \
-    }                                                                                             \
+#define DEV_ASSERT_NN(ptr, what)                                                               \
+  do {                                                                                         \
+    if ((ptr) == nullptr) {                                                                    \
+      printf("[dev rank=%d tid=%d] NULL ptr: %s (%s:%d)\n", devComm.rank, threadIdx.x, (what), \
+             __FILE__, __LINE__);                                                              \
+      __builtin_trap();                                                                        \
+    }                                                                                          \
   } while (0)
 
 // AlltoAll kernel: each rank puts its data to every peer's recv buffer.
@@ -132,7 +153,6 @@ __global__ void GdaAlltoAllKernel(mori::cco::ccoWindowDevice* sendWin,
   if (tid < nRanks && tid != myRank) {
     gda.waitSignal(static_cast<ccoGdaSignal_t>(tid), 1);
   }
-
 }
 
 static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* bootNet) {
@@ -208,12 +228,12 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
 
   // ── Host-side sanity: verify every GDA pointer the kernel will touch is non-null
   //    and consistent. Fail loud here rather than crash in the kernel.
-#define HOST_ASSERT_NN(ptr, what)                                                        \
-  do {                                                                                   \
-    if ((ptr) == nullptr) {                                                              \
-      fprintf(stderr, "[rank %d] HOST ASSERT FAILED: %s is NULL\n", rank, (what));       \
-      return 1;                                                                          \
-    }                                                                                    \
+#define HOST_ASSERT_NN(ptr, what)                                                  \
+  do {                                                                             \
+    if ((ptr) == nullptr) {                                                        \
+      fprintf(stderr, "[rank %d] HOST ASSERT FAILED: %s is NULL\n", rank, (what)); \
+      return 1;                                                                    \
+    }                                                                              \
   } while (0)
 
   HOST_ASSERT_NN(devCommHost.ibgda.endpoints, "devCommHost.ibgda.endpoints");
@@ -229,8 +249,7 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
     return 1;
   }
   printf("[rank %d] gdaConnType=%d numQpPerPe=%d signalCount=%d\n", rank,
-         (int)devCommHost.gdaConnType, devCommHost.ibgda.numQpPerPe,
-         devCommHost.ibgda.signalCount);
+         (int)devCommHost.gdaConnType, devCommHost.ibgda.numQpPerPe, devCommHost.ibgda.signalCount);
 
   // Pull endpoints back to host and audit every QP's doorbell + queue addresses.
   size_t numEps = static_cast<size_t>(nranks) * devCommHost.ibgda.numQpPerPe;
@@ -245,11 +264,10 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
       printf(
           "[rank %d] ep[peer=%d,q=%d]: qpn=%u sqAddr=%p dbrAddr=%p dbrRecAddr=%p "
           "cqAddr=%p cqDbrAddr=%p\n",
-          rank, peer, q, ep.qpn, ep.wqHandle.sqAddr, ep.wqHandle.dbrAddr,
-          ep.wqHandle.dbrRecAddr, ep.cqHandle.cqAddr, ep.cqHandle.dbrAddr);
+          rank, peer, q, ep.qpn, ep.wqHandle.sqAddr, ep.wqHandle.dbrAddr, ep.wqHandle.dbrRecAddr,
+          ep.cqHandle.cqAddr, ep.cqHandle.dbrAddr);
       if (ep.qpn == 0) {
-        fprintf(stderr, "[rank %d] HOST ASSERT FAILED: ep[peer=%d,q=%d].qpn == 0\n", rank,
-                peer, q);
+        fprintf(stderr, "[rank %d] HOST ASSERT FAILED: ep[peer=%d,q=%d].qpn == 0\n", rank, peer, q);
         return 1;
       }
       HOST_ASSERT_NN(ep.wqHandle.sqAddr, "ep.wqHandle.sqAddr");

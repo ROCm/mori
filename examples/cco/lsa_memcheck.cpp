@@ -39,12 +39,11 @@
 
 #include <hip/hip_runtime.h>
 #include <mpi.h>
+#include <unistd.h>
 
 #include <cassert>
 #include <cstdio>
 #include <cstring>
-
-#include <unistd.h>
 
 #include "args_parser.hpp"
 #include "mori/cco/cco_api.hpp"
@@ -63,7 +62,6 @@ __global__ void lsa_barrier_kernel(ccoDevComm* devComm) {
   bar.sync(coop);
 }
 
-
 // ── main ───────────────────────────────────────────────────────────────────
 int main(int argc, char* argv[]) {
 #ifndef MORI_WITH_MPI
@@ -72,7 +70,7 @@ int main(int argc, char* argv[]) {
 #endif
 
   // ── parse optional args ──
-  int window_iters  = 100;
+  int window_iters = 100;
   int devcomm_iters = 1;
 
   // ── MPI init ──
@@ -82,8 +80,8 @@ int main(int argc, char* argv[]) {
   MPI_Comm_size(MPI_COMM_WORLD, &nranks);
 
   if (rank == 0) {
-    printf("lsa_memcheck: nranks=%d  window_iters=%d  devcomm_iters=%d\n\n",
-           nranks, window_iters, devcomm_iters);
+    printf("lsa_memcheck: nranks=%d  window_iters=%d  devcomm_iters=%d\n\n", nranks, window_iters,
+           devcomm_iters);
     fflush(stdout);
   }
 
@@ -96,15 +94,15 @@ int main(int argc, char* argv[]) {
   for (int wi = 0; wi < window_iters; wi++) {
     // Register a window pair.
     const size_t winBytes = 8ULL << 30;  // 8 GB
-    void*       buf  = nullptr;
-    ccoWindow_t win  = nullptr;
+    void* buf = nullptr;
+    ccoWindow_t win = nullptr;
     assert(ccoWindowRegister(comm, winBytes, &win, &buf) == 0);
 
     // ── DevComm loop ──
     for (int di = 0; di < devcomm_iters; di++) {
       ccoDevCommRequirements reqs = CCO_DEV_COMM_REQUIREMENTS_INITIALIZER;
       reqs.gdaConnectionType = CCO_GDA_CONNECTION_NONE;
-      reqs.lsaBarrierCount   = 1;
+      reqs.lsaBarrierCount = 1;
 
       ccoDevComm* devComm = nullptr;
       assert(ccoDevCommCreate(comm, &reqs, &devComm) == 0);
@@ -114,10 +112,9 @@ int main(int argc, char* argv[]) {
       assert(hipDeviceSynchronize() == hipSuccess);
 
       ccoDevCommDestroy(comm, devComm);
-
     }
 
-    printf("rank[%d] ccoWindowDeregister %d/%d\n", rank,  wi, window_iters);
+    printf("rank[%d] ccoWindowDeregister %d/%d\n", rank, wi, window_iters);
 
     // Deregister window.
     ccoWindowDeregister(comm, win);
