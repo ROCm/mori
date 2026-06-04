@@ -51,6 +51,7 @@
 #include "mori/cco/cco_device_api.hpp"
 #include "mori/cco/cco_lsa_impl.hpp"
 #include "mori/cco/cco_lsa_types.hpp"
+#include "mori/cco/cco_team.hpp"
 #include "mori/cco/cco_types.hpp"
 
 using namespace mori::cco;
@@ -58,7 +59,8 @@ using namespace mori::cco;
 // ── tiny barrier kernel — just enough to exercise the DevComm ──────────────
 __global__ void lsa_barrier_kernel(ccoDevComm* devComm) {
   ccoCoopBlock coop;
-  ccoLsaBarrierSession<ccoCoopBlock> bar(coop, devComm, devComm->lsaBarrier, 0);
+  ccoLsaBarrierSession<ccoCoopBlock> bar(coop, devComm, ccoTeamLsa(*devComm), devComm->lsaBarrier,
+                                         0);
   bar.sync(coop);
 }
 
