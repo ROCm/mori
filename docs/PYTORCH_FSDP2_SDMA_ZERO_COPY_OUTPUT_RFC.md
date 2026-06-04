@@ -94,11 +94,12 @@ window, not single-operation latency:
 | `split_with_sizes_copy` CUDA kernel | `46.4 ms` | `50.2 ms` | `0.0 ms` |
 | `FSDP::all_gather_copy_out` annotation | `104.7 ms` | `97.7 ms` | `28.6 ms` |
 
-The first row shows that MORI SDMA replaces RCCL/NCCL allgather and reduces allgather
-kernel time by about `36.8%` in this trace window. The second row shows that zero-copy
-output removes the separate `split_with_sizes_copy` CUDA kernel. The third row shows
-that the broader FSDP copy-out region shrinks from `97.7 ms` to `28.6 ms`; what remains
-is mostly view construction and bookkeeping.
+The first row shows that MORI SDMA replaces RCCL/NCCL allgather and reduces observed
+allgather kernel time by about `36.8%` in this FSDP overlap trace window. This number
+should be read as an overlap-case profiler delta, not as standalone allgather latency.
+The second row shows that zero-copy output removes the separate `split_with_sizes_copy`
+CUDA kernel. The third row shows that the broader FSDP copy-out region shrinks from
+`97.7 ms` to `28.6 ms`; what remains is mostly view construction and bookkeeping.
 
 The zero-copy SDMA kernel is slightly longer than the base SDMA kernel because it writes
 directly into the final multi-parameter layout. That extra layout work replaces the

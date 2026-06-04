@@ -147,10 +147,11 @@ window, not single-operation latency:
 | `FSDP::all_gather_copy_out` annotation | `104.7 ms` | `97.7 ms` | `28.6 ms` |
 
 The first row shows the communication-side gain: MORI SDMA replaces RCCL/NCCL allgather,
-and the SDMA base path reduces allgather kernel time by about `36.8%` in this trace
-window. The second row shows the zero-copy output gain: the separate
-`split_with_sizes_copy` CUDA kernel is removed entirely. The third row shows that the
-broader FSDP copy-out region shrinks from `97.7 ms` to `28.6 ms`, leaving mostly
+and the SDMA base path reduces observed allgather kernel time by about `36.8%` in this
+FSDP overlap trace window. This number should be read as an overlap-case profiler delta,
+not as standalone allgather latency. The second row shows the zero-copy output gain: the
+separate `split_with_sizes_copy` CUDA kernel is removed entirely. The third row shows
+that the broader FSDP copy-out region shrinks from `97.7 ms` to `28.6 ms`, leaving mostly
 lightweight view/setup work. In the SDMA base path, `FSDP::all_gather_copy_out` includes
 the actual copy-out from the allgather output into per-parameter full buffers. With
 zero-copy output, MORI writes the final param-contiguous layout directly, so FSDP only
@@ -376,10 +377,10 @@ shared allgather output buffer.
 ## Open Items for Upstreaming
 
 The benchmark and profiler evidence above already cover the main performance claim: the
-SDMA base path reduces allgather kernel time, and zero-copy output removes the
-`split_with_sizes_copy` copy-out kernel. Before proposing the zero-copy output capability
-upstream, the remaining work is to turn the current correctness gates and lifetime
-contract into explicit tests:
+SDMA base path reduces observed allgather kernel time in the overlap profiler window, and
+zero-copy output removes the `split_with_sizes_copy` copy-out kernel. Before proposing
+the zero-copy output capability upstream, the remaining work is to turn the current
+correctness gates and lifetime contract into explicit tests:
 
 - Buffer multiplicity and aliasing under forward prefetch and under
   `reshard_after_forward=False`.
