@@ -25,9 +25,9 @@ jobs:
       matrix:
         include:
           - python: "3.10"
-            base_image: rocm/pytorch:rocm7.2.1_ubuntu22.04_py3.10_pytorch_release_2.8.0
+            base_image: rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.8.0
           - python: "3.12"
-            base_image: rocm/pytorch:rocm7.2.1_ubuntu24.04_py3.12_pytorch_release_2.8.0
+            base_image: rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.8.0
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -296,21 +296,21 @@ jobs:
           - platform: MI355X_AINIC
             python: "3.10"
             runner: [self-hosted, MI355X-AINIC-TW]
-            base_image: rocm/pytorch:rocm7.2.1_ubuntu22.04_py3.10_pytorch_release_2.8.0
+            base_image: rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.8.0
             rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
             rdma_sl: 3
             rdma_tc: 104
           - platform: MI355X_AINIC
             python: "3.12"
             runner: [self-hosted, MI355X-AINIC-TW]
-            base_image: rocm/pytorch:rocm7.2.1_ubuntu24.04_py3.12_pytorch_release_2.8.0
+            base_image: rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.8.0
             rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
             rdma_sl: 3
             rdma_tc: 104
           - platform: MI300X_BNXT
             python: "3.12"
             runner: [self-hosted, MI300X-BNXT]
-            base_image: rocm/pytorch:rocm7.2.1_ubuntu24.04_py3.12_pytorch_release_2.8.0
+            base_image: rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.8.0
             rdma_devices: bnxt_re0,bnxt_re2,bnxt_re3,bnxt_re4,bnxt_re5,bnxt_re7,bnxt_re8,bnxt_re9
             rdma_sl: 3
             rdma_tc: 104
@@ -467,7 +467,7 @@ jobs:
           - platform: MI355X_AINIC
             python: "3.10"
             runner: [self-hosted, MI355X-AINIC]
-            base_image: rocm/pytorch:rocm7.2.1_ubuntu22.04_py3.10_pytorch_release_2.8.0
+            base_image: rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.8.0
             node1_host: 10.2.80.22
             node2_host: 10.2.80.20
             node2_port: 22
@@ -480,7 +480,7 @@ jobs:
           - platform: MI355X_AINIC
             python: "3.12"
             runner: [self-hosted, MI355X-AINIC]
-            base_image: rocm/pytorch:rocm7.2.1_ubuntu24.04_py3.12_pytorch_release_2.8.0
+            base_image: rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.8.0
             node1_host: 10.2.80.22
             node2_host: 10.2.80.20
             node2_port: 22
@@ -493,7 +493,7 @@ jobs:
           - platform: MI300X_BNXT
             python: "3.12"
             runner: [self-hosted, MI300X-BNXT]
-            base_image: rocm/pytorch:rocm7.2.1_ubuntu24.04_py3.12_pytorch_release_2.8.0
+            base_image: rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.8.0
             node1_host: 10.245.128.61
             node2_host: 10.245.128.59
             node2_port: 22
@@ -868,9 +868,9 @@ jobs:
       matrix:
         include:
           - python: "3.10"
-            base_image: rocm/pytorch:rocm7.2.1_ubuntu22.04_py3.10_pytorch_release_2.8.0
+            base_image: rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.8.0
           - python: "3.12"
-            base_image: rocm/pytorch:rocm7.2.1_ubuntu24.04_py3.12_pytorch_release_2.8.0
+            base_image: rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.8.0
     env:
       IMAGE: rocm/mori:ci-py${{ matrix.python }}
     steps:
