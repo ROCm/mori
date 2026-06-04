@@ -34,6 +34,7 @@ namespace cco {
 template <typename Coop>
 struct ccoLsaBarrierSession {
   Coop coop;
+  ccoTeam_t team;
   ccoDevComm_t comm;
   ccoLsaBarrierHandle handle;
   uint32_t epoch;
@@ -42,8 +43,8 @@ struct ccoLsaBarrierSession {
   // TODO: support multicast on new generation hardware
   // TODO: add flexible memory order parameters in APIs
 
-  __device__ inline ccoLsaBarrierSession(Coop group, ccoDevComm_t comm, ccoLsaBarrierHandle h,
-                                         uint32_t index);
+  __device__ inline ccoLsaBarrierSession(Coop group, ccoDevComm_t comm, ccoTeam_t team,
+                                         ccoLsaBarrierHandle h, uint32_t index);
   __device__ inline ~ccoLsaBarrierSession();
 
   // Write epoch+1 into peer's inbox slot reserved for us, cross-gpu write

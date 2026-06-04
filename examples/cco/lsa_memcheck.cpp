@@ -51,6 +51,7 @@
 #include "mori/cco/cco_device_api.hpp"
 #include "mori/cco/cco_lsa_impl.hpp"
 #include "mori/cco/cco_lsa_types.hpp"
+#include "mori/cco/cco_team.hpp"
 #include "mori/cco/cco_types.hpp"
 
 using namespace mori::cco;
@@ -58,7 +59,8 @@ using namespace mori::cco;
 // ── tiny barrier kernel — just enough to exercise the DevComm ──────────────
 __global__ void lsa_barrier_kernel(ccoDevComm* devComm) {
   ccoCoopBlock coop;
-  ccoLsaBarrierSession<ccoCoopBlock> bar(coop, devComm, devComm->lsaBarrier, 0);
+  ccoLsaBarrierSession<ccoCoopBlock> bar(coop, devComm, ccoTeamLsa(*devComm), devComm->lsaBarrier,
+                                         0);
   bar.sync(coop);
 }
 
@@ -87,6 +89,14 @@ int main(int argc, char* argv[]) {
 
   // ── Phase 1: ccoComm (created once, destroyed at the end) ──
   auto* boot = new mori::application::MpiBootstrapNetwork(MPI_COMM_WORLD);
+
+  // Bind each rank to its own GPU BEFORE ccoCommCreate. ccoCommCreate calls
+  // hipGetDevice() and pins all allocations to the current device, so without
+  // this every rank would land on GPU 0 (all 8 GB windows stacked on PE0).
+  int hipDevCount = 0;
+  assert(hipGetDeviceCount(&hipDevCount) == hipSuccess);
+  assert(hipSetDevice(boot->GetLocalRank() % hipDevCount) == hipSuccess);
+
   mori::cco::ccoComm* comm = nullptr;
   assert(ccoCommCreate(boot, 0, &comm) == 0);
 

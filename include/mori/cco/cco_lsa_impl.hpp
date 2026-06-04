@@ -29,9 +29,10 @@ namespace cco {
 
 template <typename Coop>
 __device__ inline ccoLsaBarrierSession<Coop>::ccoLsaBarrierSession(Coop coop, ccoDevComm_t comm,
+                                                                   ccoTeam_t team,
                                                                    ccoLsaBarrierHandle h,
                                                                    uint32_t idx)
-    : coop(coop), comm(comm), handle(h), index(idx) {
+    : coop(coop), team(team), comm(comm), handle(h), index(idx) {
   assert(idx < h.nBarriers);
 
   // Restore epoch persisted by the previous session's destructor.
@@ -63,12 +64,17 @@ template <typename Coop>
 __device__ inline void ccoLsaBarrierSession<Coop>::arrive(Coop) {
   this->coop.sync();
 
-  const int nranks = this->comm->lsaSize;
-  const int myRank = this->comm->lsaRank;
+  const int nranks = this->team.nRanks;
+  const int myRank = this->team.rank;
+
+  // System-scope fence so any prior payload writes from this coop are
+  // observable to peers before the relaxed inbox stores below land.
+  if (nranks > 1) {
+    __threadfence_system();
+  }
 
   for (int i = this->coop.thread_rank(); i < nranks - 1; i += this->coop.size()) {
     int peer = i + ((i >= myRank) ? 1 : 0);
-    // Write epoch+1 into peer's inbox slot reserved for us， cross-gpu write
     __hip_atomic_store(this->ucInbox(peer, myRank), this->epoch + 1, __ATOMIC_RELAXED,
                        __HIP_MEMORY_SCOPE_SYSTEM);
   }
@@ -77,8 +83,8 @@ __device__ inline void ccoLsaBarrierSession<Coop>::arrive(Coop) {
 template <typename Coop>
 template <bool EnableTimeout>
 __device__ inline int ccoLsaBarrierSession<Coop>::waitInternal(Coop, uint64_t timeoutCycles) {
-  const int nranks = this->comm->lsaSize;
-  const int myRank = this->comm->lsaRank;
+  const int nranks = this->team.nRanks;
+  const int myRank = this->team.rank;
   int ret = 0;
 
   uint64_t startCycle;
@@ -92,11 +98,12 @@ __device__ inline int ccoLsaBarrierSession<Coop>::waitInternal(Coop, uint64_t ti
 
     while (true) {
       uint32_t got = __hip_atomic_load(slot, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
-      if ((got - (uint32_t)(this->epoch + 1)) == 0) break;
+
+      if ((got - (uint32_t)(this->epoch + 1)) <= ((uint32_t)-1 >> 1)) break;
 
       if constexpr (EnableTimeout) {
         if ((uint64_t)clock64() - startCycle >= timeoutCycles) {
-          ret = 1;  // timeout
+          ret = 1;
           goto done;
         }
       }

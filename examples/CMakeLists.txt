@@ -126,17 +126,22 @@ target_include_directories(intra_node_benchmark
                            PRIVATE ${CMAKE_SOURCE_DIR}/include)
 
 # --- CCO examples ---
-add_executable(lsa_allreduce cco/lsa_allreduce.cpp utils/args_parser.cpp)
-target_link_libraries(lsa_allreduce mori_cco MPI::MPI_CXX hip::host hip::device)
-target_include_directories(
-  lsa_allreduce PRIVATE ${CMAKE_SOURCE_DIR}/include
-                        ${CMAKE_SOURCE_DIR}/examples/utils)
+# Helper: create a CCO example (links mori_cco + MPI, includes project headers).
+# Pass extra sources (e.g. utils/args_parser.cpp) as additional arguments; the
+# utils include dir is added automatically when extra sources are present.
+function(add_cco_example name)
+  add_executable(${name} cco/${name}.cpp ${ARGN})
+  target_link_libraries(${name} mori_cco MPI::MPI_CXX hip::host hip::device)
+  target_include_directories(${name} PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  if(ARGN)
+    target_include_directories(${name}
+                               PRIVATE ${CMAKE_SOURCE_DIR}/examples/utils)
+  endif()
+endfunction()
 
-add_executable(lsa_memcheck cco/lsa_memcheck.cpp utils/args_parser.cpp)
-target_link_libraries(lsa_memcheck mori_cco MPI::MPI_CXX hip::host hip::device)
-target_include_directories(
-  lsa_memcheck PRIVATE ${CMAKE_SOURCE_DIR}/include
-                       ${CMAKE_SOURCE_DIR}/examples/utils)
+add_cco_example(lsa_allreduce utils/args_parser.cpp)
+add_cco_example(lsa_barrier)
+add_cco_example(lsa_memcheck utils/args_parser.cpp)
 
 # --- Application examples ---
 add_executable(context application/context.cpp)
