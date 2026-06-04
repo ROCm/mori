@@ -38,7 +38,7 @@ namespace {
 
 namespace fs = std::filesystem;
 
-// Unique temp dir per fixture instance; backend uses PThread/posix to avoid
+// Unique temp dir per fixture instance; backend uses Posix I/O to avoid
 // io_uring availability differences inside the build container.
 class PeerSsdManagerTest : public ::testing::Test {
  protected:
@@ -60,7 +60,7 @@ class PeerSsdManagerTest : public ::testing::Test {
     cfg.ssd.enabled = true;
     cfg.ssd.storage_dir = dir_.string();
     cfg.ssd.capacity_bytes = capacity;
-    cfg.ssd.io.backend = UMBPIoBackend::PThread;  // avoid io_uring container flakiness
+    cfg.ssd.io.backend = UMBPIoBackend::Posix;  // avoid io_uring container flakiness
     return cfg;
   }
 

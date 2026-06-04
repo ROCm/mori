@@ -880,9 +880,9 @@ fields:
 | `ssd` | `capacity_bytes` | 32 GiB | |
 | `ssd` | `segment_size_bytes` | 256 MiB | SegmentedLog segment size. |
 | `ssd` | `high_watermark` / `low_watermark` | 0.9 / 0.7 | Peer-local SSD eviction band (`UMBP_SSD_HIGH_WM` / `UMBP_SSD_LOW_WM`). Must satisfy `0 < low < high <= 1` or construction throws. |
-| `ssd` | `ssd_backend` | `posix` | `posix`, `spdk`, or `spdk_proxy`. Distributed peers reach SPDK only via the proxy. |
+| `ssd` | `ssd_backend` | `file` | `file`, `spdk`, or `spdk_proxy`. Distributed peers reach SPDK only via the proxy. |
 | `ssd` | `spdk_*` | — | SPDK/proxy tuning (BDF, reactor mask, channels, shm name, ...), all under `ssd.*`. |
-| `ssd.io` | `backend` | `IoUring` | `PThread` or `IoUring`. |
+| `ssd.io` | `backend` | `IoUring` | `Posix` or `IoUring`. |
 | `ssd.durability` | `mode` | `Strict` | `Strict` or `Relaxed`. |
 | `eviction` | `policy` | `lru` | |
 | `copy_pipeline` | `worker_threads` | 2 | Async DRAM→SSD copy-on-commit workers. |

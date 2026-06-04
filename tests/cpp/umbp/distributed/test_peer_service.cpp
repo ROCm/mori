@@ -63,14 +63,14 @@ class PeerServiceSlotTest : public ::testing::Test {
 
     ssd_staging_mem_desc_ = {0xD0, 0xE0, 0xF0};
 
-    // Peer-side SSD tier owner (posix SSDTier on a temp dir; PThread backend to
+    // Peer-side SSD tier owner (file SSDTier on a temp dir; Posix I/O backend to
     // avoid io_uring availability differences inside the build container).
     PeerSsdConfig ssd_cfg;
     ssd_cfg.enabled = true;
     ssd_cfg.ssd.enabled = true;
     ssd_cfg.ssd.storage_dir = ssd_dir_.string();
     ssd_cfg.ssd.capacity_bytes = 1 << 20;
-    ssd_cfg.ssd.io.backend = UMBPIoBackend::PThread;
+    ssd_cfg.ssd.io.backend = UMBPIoBackend::Posix;
     peer_ssd_ = std::make_unique<PeerSsdManager>(ssd_cfg);
 
     PoolClientConfig pc_cfg;

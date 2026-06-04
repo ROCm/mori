@@ -43,7 +43,7 @@ enum class UMBPSsdLayoutMode : int {
 };
 
 enum class UMBPIoBackend : int {
-  PThread = 0,
+  Posix = 0,
   IoUring = 1,
 };
 
@@ -93,12 +93,12 @@ struct UMBPSsdConfig {
   double high_watermark = 0.9;
   double low_watermark = 0.7;
 
-  // SSD backend selection. "posix" uses the segmented-log SSDTier; "spdk" /
+  // SSD backend selection. "file" uses the segmented-log SSDTier; "spdk" /
   // "spdk_proxy" use the SPDK NVMe path (direct SpdkSsdTier in standalone, or
   // SpdkProxyTier when sharing the device across processes).  Kept here (rather
   // than at UMBPConfig top level) so both the standalone LocalStorageManager and
   // the distributed PeerSsdManager select the backend from the same config.
-  std::string ssd_backend = "posix";      // "posix" or "spdk"
+  std::string ssd_backend = "file";       // "file", "spdk" or "spdk_proxy"
   std::string spdk_bdev_name;             // e.g. "Malloc0" or "NVMe0n1"
   std::string spdk_reactor_mask = "0x1";  // CPU core mask for SPDK reactors
   int spdk_mem_size_mb = 256;             // DPDK hugepage limit (MB)
@@ -127,10 +127,10 @@ struct UMBPSsdConfig {
     // when the tier is actually enabled (mirrors UMBPConfig::Validate's
     // `if (ssd.enabled)` gate).
     if (!enabled) return true;
-    if (ssd_backend != "posix" && ssd_backend != "spdk" && ssd_backend != "spdk_proxy" &&
+    if (ssd_backend != "file" && ssd_backend != "spdk" && ssd_backend != "spdk_proxy" &&
         ssd_backend != "dummy_storage") {
       if (error_message)
-        *error_message = "ssd.ssd_backend must be one of: posix, spdk, spdk_proxy, dummy_storage";
+        *error_message = "ssd.ssd_backend must be one of: file, spdk, spdk_proxy, dummy_storage";
       return false;
     }
     if (capacity_bytes == 0) {
@@ -336,7 +336,7 @@ struct UMBPConfig {
     cfg.dram.prefault = getenv_int("UMBP_DRAM_PREFAULT", cfg.dram.prefault ? 1 : 0) != 0;
 
     cfg.ssd.ssd_backend = getenv_str("UMBP_SSD_BACKEND", cfg.ssd.ssd_backend);
-    if (cfg.ssd.ssd_backend == "posix" && !std::getenv("UMBP_SSD_BACKEND") &&
+    if (cfg.ssd.ssd_backend == "file" && !std::getenv("UMBP_SSD_BACKEND") &&
         std::getenv("UMBP_SPDK_NVME_PCI")) {
       cfg.ssd.ssd_backend = "spdk";
     }

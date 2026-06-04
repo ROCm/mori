@@ -99,8 +99,8 @@ static UMBPConfig MakePosixConfig(size_t dram_mb = 64, size_t ssd_mb = 256) {
   UMBPConfig cfg;
   cfg.dram.capacity_bytes = dram_mb * 1024 * 1024;
   cfg.ssd.capacity_bytes = ssd_mb * 1024 * 1024;
-  cfg.ssd.io.backend = UMBPIoBackend::PThread;
-  cfg.ssd.ssd_backend = "posix";
+  cfg.ssd.io.backend = UMBPIoBackend::Posix;
+  cfg.ssd.ssd_backend = "file";
   cfg.ssd.storage_dir = "/tmp/umbp_e2e_test_" + std::to_string(getpid());
   cfg.role = UMBPRole::Standalone;
   return cfg;

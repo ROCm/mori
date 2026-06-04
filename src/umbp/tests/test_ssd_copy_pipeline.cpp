@@ -194,7 +194,7 @@ class SsdCopyPipelineTest : public ::testing::Test {
     ssd_cfg.ssd.enabled = true;
     ssd_cfg.ssd.storage_dir = dir_.string();
     ssd_cfg.ssd.capacity_bytes = 64ULL * 1024 * 1024;
-    ssd_cfg.ssd.io.backend = UMBPIoBackend::PThread;  // avoid io_uring container flakiness
+    ssd_cfg.ssd.io.backend = UMBPIoBackend::Posix;  // avoid io_uring container flakiness
     ssd_ = std::make_unique<PeerSsdManager>(ssd_cfg);
   }
 

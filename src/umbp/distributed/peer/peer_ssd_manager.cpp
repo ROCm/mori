@@ -59,8 +59,8 @@ PeerSsdManager::PeerSsdManager(const PeerSsdConfig& cfg) {
   low_watermark_ = ssd.low_watermark;
 
   // Explicit backend selection — an unknown value is a configuration error, not
-  // a reason to silently fall back to POSIX.
-  if (ssd.ssd_backend == "posix") {
+  // a reason to silently fall back to the file backend.
+  if (ssd.ssd_backend == "file") {
     backend_ = std::make_unique<SSDTier>(ssd.storage_dir, ssd.capacity_bytes, ssd);
     MORI_UMBP_INFO("[PeerSsdManager] SSDTier ready dir={} capacity={}B", ssd.storage_dir,
                    ssd.capacity_bytes);
@@ -89,7 +89,7 @@ PeerSsdManager::PeerSsdManager(const PeerSsdConfig& cfg) {
   }
 
   throw std::runtime_error("[PeerSsdManager] unknown ssd_backend='" + ssd.ssd_backend +
-                           "' (expected one of: posix, spdk, spdk_proxy)");
+                           "' (expected one of: file, spdk, spdk_proxy)");
 }
 
 PeerSsdManager::PeerSsdManager(std::unique_ptr<TierBackend> backend, double high_watermark,

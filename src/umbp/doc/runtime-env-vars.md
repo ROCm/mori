@@ -118,7 +118,7 @@ Python wrapper construct one) — they are read once.
 | `UMBP_SSD_ENABLED` | `1` | `0` to disable the SSD tier entirely. |
 | `UMBP_SSD_DIR` | `/tmp/umbp_ssd` | POSIX backend root. |
 | `UMBP_SSD_CAPACITY` | 32 GiB | `ssd.capacity_bytes`. |
-| `UMBP_SSD_BACKEND` | `posix` | `posix` or `spdk`. Implicitly upgraded to `spdk` if `UMBP_SPDK_NVME_PCI` is set. |
+| `UMBP_SSD_BACKEND` | `file` | `file` or `spdk`. Implicitly upgraded to `spdk` if `UMBP_SPDK_NVME_PCI` is set. |
 | `UMBP_EVICTION_POLICY` | `lru` | Forwarded to `eviction.policy`. |
 | `UMBP_ROLE` | (empty) | `leader` / `follower` / `standalone`. If unset, falls back to `LOCAL_RANK` / `OMPI_COMM_WORLD_LOCAL_RANK` / `SLURM_LOCALID` / `MPI_LOCALRANKID`: rank 0 → leader, others → follower. |
 | `UMBP_SPDK_BDEV` | (empty) | SPDK bdev name (e.g. `Malloc0`, `NVMe0n1`). |

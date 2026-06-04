@@ -76,7 +76,7 @@ class PeerSsdReadRpcTest : public ::testing::Test {
     cfg.ssd.enabled = true;
     cfg.ssd.storage_dir = dir_.string();
     cfg.ssd.capacity_bytes = 1 << 20;
-    cfg.ssd.io.backend = UMBPIoBackend::PThread;  // avoid io_uring container flakiness
+    cfg.ssd.io.backend = UMBPIoBackend::Posix;  // avoid io_uring container flakiness
     peer_ssd_ = std::make_unique<PeerSsdManager>(cfg);
 
     // Fake staging MemoryDesc bytes — GetPeerInfo just echoes them; this test

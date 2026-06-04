@@ -44,7 +44,7 @@ static void cleanup_dir(const std::string& dir) {
 
 static UMBPSsdConfig make_ssd_config() {
   UMBPSsdConfig cfg;
-  cfg.io.backend = UMBPIoBackend::PThread;
+  cfg.io.backend = UMBPIoBackend::Posix;
   cfg.durability.mode = UMBPDurabilityMode::Relaxed;
   cfg.segment_size_bytes = 4 * 1024 * 1024;
   return cfg;
@@ -167,7 +167,7 @@ void test_follower_stale_index_after_evict() {
   leader_cfg.ssd.enabled = true;
   leader_cfg.ssd.storage_dir = SHARED_SSD_DIR;
   leader_cfg.ssd.capacity_bytes = 4 * 1024 * 1024;
-  leader_cfg.ssd.io.backend = UMBPIoBackend::PThread;
+  leader_cfg.ssd.io.backend = UMBPIoBackend::Posix;
   leader_cfg.ssd.durability.mode = UMBPDurabilityMode::Relaxed;
   leader_cfg.ssd.segment_size_bytes = 4 * 1024 * 1024;
   leader_cfg.copy_pipeline.async_enabled = false;
@@ -183,7 +183,7 @@ void test_follower_stale_index_after_evict() {
   follower_cfg.ssd.enabled = true;
   follower_cfg.ssd.storage_dir = SHARED_SSD_DIR;
   follower_cfg.ssd.capacity_bytes = 4 * 1024 * 1024;
-  follower_cfg.ssd.io.backend = UMBPIoBackend::PThread;
+  follower_cfg.ssd.io.backend = UMBPIoBackend::Posix;
   follower_cfg.ssd.durability.mode = UMBPDurabilityMode::Relaxed;
   follower_cfg.ssd.segment_size_bytes = 4 * 1024 * 1024;
   follower_cfg.role = UMBPRole::SharedSSDFollower;
@@ -224,7 +224,7 @@ void test_leader_copy_to_ssd() {
   cfg.ssd.enabled = true;
   cfg.ssd.storage_dir = SHARED_SSD_DIR;
   cfg.ssd.capacity_bytes = 4 * 1024 * 1024;
-  cfg.ssd.io.backend = UMBPIoBackend::PThread;
+  cfg.ssd.io.backend = UMBPIoBackend::Posix;
   cfg.ssd.durability.mode = UMBPDurabilityMode::Relaxed;
   cfg.ssd.segment_size_bytes = 4 * 1024 * 1024;
   cfg.copy_pipeline.async_enabled = false;
@@ -272,7 +272,7 @@ void test_e2e_leader_follower() {
   leader_cfg.ssd.enabled = true;
   leader_cfg.ssd.storage_dir = SHARED_SSD_DIR;
   leader_cfg.ssd.capacity_bytes = 4 * 1024 * 1024;
-  leader_cfg.ssd.io.backend = UMBPIoBackend::PThread;
+  leader_cfg.ssd.io.backend = UMBPIoBackend::Posix;
   leader_cfg.ssd.durability.mode = UMBPDurabilityMode::Relaxed;
   leader_cfg.ssd.segment_size_bytes = 4 * 1024 * 1024;
   leader_cfg.copy_pipeline.async_enabled = false;
@@ -286,7 +286,7 @@ void test_e2e_leader_follower() {
   follower_cfg.ssd.enabled = true;
   follower_cfg.ssd.storage_dir = SHARED_SSD_DIR;
   follower_cfg.ssd.capacity_bytes = 4 * 1024 * 1024;
-  follower_cfg.ssd.io.backend = UMBPIoBackend::PThread;
+  follower_cfg.ssd.io.backend = UMBPIoBackend::Posix;
   follower_cfg.ssd.durability.mode = UMBPDurabilityMode::Relaxed;
   follower_cfg.ssd.segment_size_bytes = 4 * 1024 * 1024;
   follower_cfg.role = UMBPRole::SharedSSDFollower;
@@ -336,7 +336,7 @@ void test_follower_batch_exists() {
   leader_cfg.ssd.enabled = true;
   leader_cfg.ssd.storage_dir = SHARED_SSD_DIR;
   leader_cfg.ssd.capacity_bytes = 4 * 1024 * 1024;
-  leader_cfg.ssd.io.backend = UMBPIoBackend::PThread;
+  leader_cfg.ssd.io.backend = UMBPIoBackend::Posix;
   leader_cfg.ssd.durability.mode = UMBPDurabilityMode::Relaxed;
   leader_cfg.ssd.segment_size_bytes = 4 * 1024 * 1024;
   leader_cfg.copy_pipeline.async_enabled = false;
@@ -349,7 +349,7 @@ void test_follower_batch_exists() {
   follower_cfg.ssd.enabled = true;
   follower_cfg.ssd.storage_dir = SHARED_SSD_DIR;
   follower_cfg.ssd.capacity_bytes = 4 * 1024 * 1024;
-  follower_cfg.ssd.io.backend = UMBPIoBackend::PThread;
+  follower_cfg.ssd.io.backend = UMBPIoBackend::Posix;
   follower_cfg.ssd.durability.mode = UMBPDurabilityMode::Relaxed;
   follower_cfg.ssd.segment_size_bytes = 4 * 1024 * 1024;
   follower_cfg.role = UMBPRole::SharedSSDFollower;
@@ -391,7 +391,7 @@ void test_follower_autopromote_no_writeback() {
   leader_cfg.ssd.enabled = true;
   leader_cfg.ssd.storage_dir = SHARED_SSD_DIR;
   leader_cfg.ssd.capacity_bytes = 4 * 1024 * 1024;
-  leader_cfg.ssd.io.backend = UMBPIoBackend::PThread;
+  leader_cfg.ssd.io.backend = UMBPIoBackend::Posix;
   leader_cfg.ssd.durability.mode = UMBPDurabilityMode::Relaxed;
   leader_cfg.ssd.segment_size_bytes = 4 * 1024 * 1024;
   leader_cfg.copy_pipeline.async_enabled = false;
@@ -421,7 +421,7 @@ void test_follower_autopromote_no_writeback() {
   follower_cfg.ssd.enabled = true;
   follower_cfg.ssd.storage_dir = SHARED_SSD_DIR;
   follower_cfg.ssd.capacity_bytes = 4 * 1024 * 1024;
-  follower_cfg.ssd.io.backend = UMBPIoBackend::PThread;
+  follower_cfg.ssd.io.backend = UMBPIoBackend::Posix;
   follower_cfg.ssd.durability.mode = UMBPDurabilityMode::Relaxed;
   follower_cfg.ssd.segment_size_bytes = 4 * 1024 * 1024;
   follower_cfg.role = UMBPRole::SharedSSDFollower;

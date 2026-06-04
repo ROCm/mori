@@ -120,7 +120,7 @@ void RegisterMoriUmbp(py::module_& m) {
       .export_values();
 
   py::enum_<UMBPIoBackend>(m, "UMBPIoBackend")
-      .value("PThread", UMBPIoBackend::PThread)
+      .value("Posix", UMBPIoBackend::Posix)
       .value("IoUring", UMBPIoBackend::IoUring)
       .export_values();
 

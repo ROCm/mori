@@ -31,7 +31,7 @@
 //     --value-size N                   Value size in bytes
 //     --batch-size N                   Batch size
 //     --iters N                        Measurement iterations (default: 10)
-//     --ssd-backend <posix|spdk>       SSD backend (default: posix)
+//     --ssd-backend <file|spdk>       SSD backend (default: file)
 //     --filter SUBSTRING               Run only matching scenarios
 //     --dir PATH                       Temp directory path
 //     -h, --help                       Help
@@ -94,13 +94,13 @@ struct BenchConfig {
   size_t dram_capacity = 64ULL * 1024 * 1024;
   size_t ssd_capacity = 256ULL * 1024 * 1024;
   size_t segment_size = 64ULL * 1024 * 1024;
-  UMBPIoBackend ssd_io_backend = UMBPIoBackend::PThread;
+  UMBPIoBackend ssd_io_backend = UMBPIoBackend::Posix;
   size_t ssd_io_queue_depth = 4096;
   UMBPDurabilityMode ssd_durability_mode = UMBPDurabilityMode::Relaxed;
 
   std::vector<int> thread_counts = {1, 2, 4, 8};
 
-  std::string ssd_backend = "posix";  // "posix" or "spdk"
+  std::string ssd_backend = "file";  // "file" or "spdk"
 
   std::string base_dir = "/tmp/umbp_bench";
   std::string filter;
@@ -355,7 +355,7 @@ struct IoBackendSpec {
 
 static const std::vector<IoBackendSpec>& IoBackendSpecs() {
   static const std::vector<IoBackendSpec> specs = {
-      {UMBPIoBackend::PThread, "pthread", "POSIX", "posix"},
+      {UMBPIoBackend::Posix, "posix", "POSIX", "posix"},
       {UMBPIoBackend::IoUring, "io_uring", "io_uring", "iouring"},
   };
   return specs;
@@ -370,8 +370,8 @@ static const IoBackendSpec& GetIoBackendSpec(UMBPIoBackend backend) {
 
 static bool ParseIoBackend(const std::string& text, UMBPIoBackend& backend) {
   std::string lower = ToLower(text);
-  if (lower == "pthread" || lower == "posix") {
-    backend = UMBPIoBackend::PThread;
+  if (lower == "posix") {
+    backend = UMBPIoBackend::Posix;
     return true;
   }
   if (lower == "io_uring" || lower == "iouring" || lower == "uring") {
@@ -3261,10 +3261,10 @@ static void PrintUsage(const char* argv0) {
       "  --dram-capacity N                DRAM capacity in bytes\n"
       "  --ssd-capacity N                 SSD capacity in bytes\n"
       "  --segment-size N                 SSD segment size in bytes\n"
-      "  --ssd-io-backend <pthread|posix|io_uring>\n"
+      "  --ssd-io-backend <posix|io_uring>\n"
       "  --ssd-queue-depth N              Storage I/O queue depth\n"
       "  --ssd-durability <strict|relaxed>\n"
-      "  --ssd-backend <posix|spdk>       SSD backend (default: posix)\n"
+      "  --ssd-backend <file|spdk>       SSD backend (default: file)\n"
       "                                   spdk requires UMBP_SPDK_NVME_PCI env var\n"
       "\n"
       "E2E (sglang connector simulation):\n"
@@ -3313,7 +3313,7 @@ static ParsedArgs ParseArgs(int argc, char* argv[]) {
   size_t user_dram_capacity = 0;
   size_t user_ssd_capacity = 0;
   size_t user_segment_size = 0;
-  UMBPIoBackend user_ssd_io_backend = UMBPIoBackend::PThread;
+  UMBPIoBackend user_ssd_io_backend = UMBPIoBackend::Posix;
   size_t user_ssd_io_queue_depth = 0;
   UMBPDurabilityMode user_ssd_durability = UMBPDurabilityMode::Relaxed;
 
@@ -3376,7 +3376,7 @@ static ParsedArgs ParseArgs(int argc, char* argv[]) {
     } else if (arg == "--ssd-io-backend" && i + 1 < argc) {
       std::string backend = argv[++i];
       if (!ParseIoBackend(backend, user_ssd_io_backend)) {
-        std::cerr << "Error: --ssd-io-backend must be one of: pthread, posix, io_uring"
+        std::cerr << "Error: --ssd-io-backend must be one of: posix, io_uring"
                   << " (got '" << backend << "')\n";
         std::exit(1);
       }
@@ -3395,8 +3395,8 @@ static ParsedArgs ParseArgs(int argc, char* argv[]) {
     } else if (arg == "--ssd-backend" && i + 1 < argc) {
       std::string val = argv[++i];
       std::string lower = ToLower(val);
-      if (lower != "posix" && lower != "spdk") {
-        std::cerr << "Error: --ssd-backend must be 'posix' or 'spdk'\n";
+      if (lower != "file" && lower != "spdk") {
+        std::cerr << "Error: --ssd-backend must be 'file' or 'spdk'\n";
         std::exit(1);
       }
       cfg.ssd_backend = lower;
