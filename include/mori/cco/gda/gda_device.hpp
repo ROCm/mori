@@ -24,4 +24,4 @@
 
 #pragma once
 
-#include "gda_device_common.hpp"
+#include "gda_device_api.hpp"

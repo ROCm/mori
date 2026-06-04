@@ -19,15 +19,25 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-// Test: CCO GDA device API — AlltoAll via GPU-initiated RDMA put + signal.
+// test: cco gda flushAsync — fire-and-forget doorbell ring.
 //
-// Multi-process (fork or MPI). Each rank launches a HIP kernel that:
-//   1. put(peer, ..., SignalInc{signalId}) to every peer
-//   2. waitSignal to confirm all peers have written
-//   3. flush to ensure source buffers are reusable
+// each rank launches one kernel that:
+//   1. put(peer, ..., SignalInc{myRank}) to every peer
+//   2. flushAsync(peer, &dummy) — rings doorbell, drops the request handle
+//   3. waitSignal on every incoming signal (data+signal are ordered on the same qp,
+//      so a landed signal implies the data write also landed)
 //
-// Host side verifies data correctness after kernel completion.
-// No BarrierSession — uses host ccoBarrierAll for pre/post sync.
+// no wait() — outbound completion is not checked on this side. correctness comes
+// from the peer-side waitSignal: once peer r's signal arrives, peer r has also seen
+// our put. host verifies recv buffer after the kernel.
+//
+// caveat: because we never poll our own cq, sendBuf isn't guaranteed reusable until
+// the next barrier / kernel flushes things. fine for this test (sendBuf is read-only).
+//
+// difference from test_cco_gda_device:
+//   - that test calls flush() (rings doorbell AND polls cq)
+//   - this test calls flushAsync() only — exercises the doorbell-ring path without
+//     paying for cq-poll on the sender side
 
 #ifdef MORI_WITH_MPI
 #include <mpi.h>
@@ -39,7 +49,6 @@
 #include <unistd.h>
 
 #include <algorithm>
-#include <cassert>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -65,91 +74,50 @@ static int g_rank = 0;
 static const size_t PER_RANK_VMM_SIZE = 256ULL * 1024 * 1024;
 static const size_t COUNT = 256;  // elements per rank-pair
 
-// NIC provider type — force PSD (Ionic) for this test.
+// force psd (ionic) provider
 static constexpr mori::core::ProviderType kPrvdType = mori::core::ProviderType::PSD;
 
-// Device-side guard: print + trap if `ptr` is null. Trap stops the kernel
-// immediately so we don't follow up with a page-fault from a null deref.
-#define DEV_ASSERT_NN(ptr, what)                                                               \
-  do {                                                                                         \
-    if ((ptr) == nullptr) {                                                                    \
-      printf("[dev rank=%d tid=%d] NULL ptr: %s (%s:%d)\n", devComm.rank, threadIdx.x, (what), \
-             __FILE__, __LINE__);                                                              \
-      __builtin_trap();                                                                        \
-    }                                                                                          \
-  } while (0)
-
-// AlltoAll kernel: each rank puts its data to every peer's recv buffer.
-// Single warp (threadIdx.x < 64) does the work.
-// Signal layout: one signal per rank — signal[r] is incremented by peer r.
+// alltoall kernel using flushAsync — one warp per peer for the doorbell ring.
+// signal layout: signal[r] is incremented by peer r.
+//
+// block layout: blockDim.x = nRanks * warpSize. warp w owns peer w:
+//   - step 2: warp w's lane 0 calls flushAsync(peer=w) — different warps
+//     fire doorbells in parallel rather than serialized on thread 0
 template <mori::core::ProviderType PrvdType, typename T>
-__global__ void GdaAlltoAllKernel(mori::cco::ccoWindowDevice* sendWin,
-                                  mori::cco::ccoWindowDevice* recvWin, size_t count,
-                                  mori::cco::ccoDevComm devComm) {
+__global__ void GdaAlltoAllFlushAsyncKernel(mori::cco::ccoWindowDevice* sendWin,
+                                            mori::cco::ccoWindowDevice* recvWin, size_t count,
+                                            mori::cco::ccoDevComm devComm) {
   using namespace mori::cco::gda;
 
-  int ginContext = 0;
-  ccoGda<PrvdType> gda{devComm, ginContext};
+  ccoGda<PrvdType> gda{devComm, /*ginContext=*/0};
 
   int myRank = devComm.rank;
   int nRanks = devComm.worldSize;
   int tid = threadIdx.x;
   int nthreads = blockDim.x;
+  int warpId = tid / warpSize;
+  int laneId = tid % warpSize;
 
   size_t perPairBytes = count * sizeof(T);
 
-  // Device-side sanity: catch null pointers BEFORE any RDMA op dereferences them.
-  // Only thread 0 to keep the printf output readable.
-  if (tid == 0) {
-    DEV_ASSERT_NN(sendWin, "sendWin");
-    DEV_ASSERT_NN(recvWin, "recvWin");
-    DEV_ASSERT_NN(sendWin->ibgdaWin.peerRkeys, "sendWin->ibgdaWin.peerRkeys");
-    DEV_ASSERT_NN(recvWin->ibgdaWin.peerRkeys, "recvWin->ibgdaWin.peerRkeys");
-    DEV_ASSERT_NN(devComm.ibgda.endpoints, "devComm.ibgda.endpoints");
-    DEV_ASSERT_NN(devComm.ibgda.signalBuf, "devComm.ibgda.signalBuf");
-    DEV_ASSERT_NN(devComm.ibgda.signalShadows, "devComm.ibgda.signalShadows");
-    DEV_ASSERT_NN(devComm.resourceWindow_inlined.ibgdaWin.peerRkeys,
-                  "resourceWindow_inlined.peerRkeys");
-
-    // Per-QP guards: walk every endpoint we'll touch and verify its handles.
-    int numQpPerPe = devComm.ibgda.numQpPerPe;
-    for (int peer = 0; peer < nRanks; peer++) {
-      if (peer == myRank) continue;
-      int qpIdx = peer * numQpPerPe + (ginContext % numQpPerPe);
-      mori::shmem::ShmemRdmaEndpoint* ep = &devComm.ibgda.endpoints[qpIdx];
-      // Doorbell + SQ/CQ addresses are the doorbell-ring / CQ-poll fast path.
-      // If any of these is null, RingDoorbell / poll_cq will fault.
-      DEV_ASSERT_NN(ep->wqHandle.sqAddr, "ep->wqHandle.sqAddr");
-      DEV_ASSERT_NN(ep->wqHandle.dbrAddr, "ep->wqHandle.dbrAddr");
-      DEV_ASSERT_NN(ep->cqHandle.cqAddr, "ep->cqHandle.cqAddr");
-      if (ep->qpn == 0) {
-        printf("[dev rank=%d] peer=%d qpn=0 (uninitialized QP)\n", devComm.rank, peer);
-        __builtin_trap();
-      }
-    }
-  }
-  __syncthreads();
-
-  // DEBUG: serialize puts on a single thread to test whether concurrent
-  // doorbell writes to the same dbrAddr (Ionic shared doorbell) are being
-  // coalesced and dropped by the NIC. If nrank>2 passes after this, the bug
-  // is doorbell contention across endpoints sharing the same dbrAddr.
+  // step 1: each thread issues put to a distinct peer
   for (int r = tid; r < nRanks; r += nthreads) {
     if (r == myRank) continue;
     gda.put(r, reinterpret_cast<ccoWindow_t>(recvWin), myRank * perPairBytes,
             reinterpret_cast<ccoWindow_t>(sendWin), r * perPairBytes, perPairBytes,
             ccoGda_SignalInc{static_cast<ccoGdaSignal_t>(myRank)});
   }
-
   __syncthreads();
 
-  // Flush all peers — ring doorbells and wait for CQ completion
-  if (tid == 0) {
-    gda.flush();
+  // step 2: warp w's lane 0 rings doorbell for peer w — parallel across warps.
+  // returned handle discarded (no wait on sender side).
+  if (laneId == 0 && warpId < nRanks && warpId != myRank) {
+    ccoGdaRequest_t dummy;
+    gda.flushAsync(warpId, &dummy);
   }
 
-  // Wait for all peers to have written to us (each peer increments signal[peerRank])
-  // Only one thread does the waiting to avoid redundant polls
+  // step 3: wait for every peer's signal. since data+signal share the qp and
+  // are ordered, a landed signal implies the data write also landed.
   if (tid < nRanks && tid != myRank) {
     gda.waitSignal(static_cast<ccoGdaSignal_t>(tid), 1);
   }
@@ -167,19 +135,18 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
     if (i == dev) continue;
     int canAccess = 0;
     HIP_CHECK(hipDeviceCanAccessPeer(&canAccess, dev, i));
-    if (canAccess) hipDeviceEnablePeerAccess(i, 0);
+    if (canAccess) (void)hipDeviceEnablePeerAccess(i, 0);
   }
 
   printf("[rank %d/%d] pid=%d GPU=%d\n", rank, nranks, getpid(), dev);
 
-  // Phase 1: CommCreate
+  // setup: comm, send/recv buffers, windows
   mori::cco::ccoComm* comm = nullptr;
   if (mori::cco::ccoCommCreate(bootNet, PER_RANK_VMM_SIZE, &comm) != 0) {
     fprintf(stderr, "[rank %d] CommCreate failed\n", rank);
     return 1;
   }
 
-  // Phase 2: Allocate send and recv buffers
   size_t bufSize = COUNT * nranks * sizeof(float);
   void* sendBuf = nullptr;
   void* recvBuf = nullptr;
@@ -189,7 +156,7 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
     return 1;
   }
 
-  // Initialize send data: sendBuf[r*COUNT + i] = rank*1000 + r*100 + i
+  // sendBuf[r*COUNT + i] = rank*1000 + r*100 + i — encodes (sender, dest-slot, idx)
   std::vector<float> hostSend(COUNT * nranks);
   for (int r = 0; r < nranks; r++) {
     for (size_t i = 0; i < COUNT; i++) {
@@ -199,7 +166,6 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
   HIP_CHECK(hipMemcpy(sendBuf, hostSend.data(), bufSize, hipMemcpyHostToDevice));
   HIP_CHECK(hipMemset(recvBuf, 0xff, bufSize));
 
-  // Phase 3: Register windows
   mori::cco::ccoWindow_t sendWin = nullptr;
   mori::cco::ccoWindow_t recvWin = nullptr;
   if (mori::cco::ccoWindowRegister(comm, sendBuf, bufSize, &sendWin) != 0 ||
@@ -208,11 +174,11 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
     return 1;
   }
 
-  // Phase 4: DevCommCreate with FULL GDA connectivity + signals
+  // devcomm: full gda connectivity + one signal per peer
   mori::cco::ccoDevCommRequirements reqs = CCO_DEV_COMM_REQUIREMENTS_INITIALIZER;
   reqs.gdaConnectionType = mori::cco::CCO_GDA_CONNECTION_FULL;
   reqs.gdaContextCount = 1;
-  reqs.gdaSignalCount = nranks;  // one signal per peer
+  reqs.gdaSignalCount = nranks;
   reqs.gdaCounterCount = 0;
   mori::cco::ccoDevComm* devComm = nullptr;
   if (mori::cco::ccoDevCommCreate(comm, &reqs, &devComm) != 0) {
@@ -220,121 +186,57 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
     return 1;
   }
 
-  // Copy DevComm to host for kernel launch (passed by value like NCCL)
   mori::cco::ccoDevComm devCommHost;
   HIP_CHECK(hipMemcpy(&devCommHost, devComm, sizeof(devCommHost), hipMemcpyDeviceToHost));
-  printf("[rank %d] DevCommCreate OK (worldSize=%d, lsaSize=%d)\n", rank, devCommHost.worldSize,
-         devCommHost.lsaSize);
+  printf("[rank %d] DevCommCreate OK (worldSize=%d, lsaSize=%d, gdaConnType=%d, numQpPerPe=%d)\n",
+         rank, devCommHost.worldSize, devCommHost.lsaSize, (int)devCommHost.gdaConnType,
+         devCommHost.ibgda.numQpPerPe);
 
-  // ── Host-side sanity: verify every GDA pointer the kernel will touch is non-null
-  //    and consistent. Fail loud here rather than crash in the kernel.
-#define HOST_ASSERT_NN(ptr, what)                                                  \
-  do {                                                                             \
-    if ((ptr) == nullptr) {                                                        \
-      fprintf(stderr, "[rank %d] HOST ASSERT FAILED: %s is NULL\n", rank, (what)); \
-      return 1;                                                                    \
-    }                                                                              \
-  } while (0)
-
-  HOST_ASSERT_NN(devCommHost.ibgda.endpoints, "devCommHost.ibgda.endpoints");
-  HOST_ASSERT_NN(devCommHost.ibgda.signalBuf, "devCommHost.ibgda.signalBuf");
-  HOST_ASSERT_NN(devCommHost.ibgda.signalShadows, "devCommHost.ibgda.signalShadows");
-  HOST_ASSERT_NN(devCommHost.resourceWindow_inlined.ibgdaWin.peerRkeys,
-                 "resourceWindow_inlined.ibgdaWin.peerRkeys");
   if (devCommHost.gdaConnType == mori::cco::CCO_GDA_CONNECTION_NONE) {
-    fprintf(stderr,
-            "[rank %d] HOST ASSERT FAILED: gdaConnType collapsed to NONE — GDA "
-            "endpoints will not be functional. Check peer mask / RDMA support.\n",
+    fprintf(stderr, "[rank %d] gdaConnType collapsed to NONE — check peer mask / rdma support\n",
             rank);
     return 1;
   }
-  printf("[rank %d] gdaConnType=%d numQpPerPe=%d signalCount=%d\n", rank,
-         (int)devCommHost.gdaConnType, devCommHost.ibgda.numQpPerPe, devCommHost.ibgda.signalCount);
 
-  // Pull endpoints back to host and audit every QP's doorbell + queue addresses.
-  size_t numEps = static_cast<size_t>(nranks) * devCommHost.ibgda.numQpPerPe;
-  std::vector<mori::shmem::ShmemRdmaEndpoint> epsHost(numEps);
-  HIP_CHECK(hipMemcpy(epsHost.data(), devCommHost.ibgda.endpoints,
-                      numEps * sizeof(mori::shmem::ShmemRdmaEndpoint), hipMemcpyDeviceToHost));
-  for (int peer = 0; peer < nranks; peer++) {
-    if (peer == rank) continue;
-    for (int q = 0; q < devCommHost.ibgda.numQpPerPe; q++) {
-      size_t i = (size_t)peer * devCommHost.ibgda.numQpPerPe + q;
-      const auto& ep = epsHost[i];
-      printf(
-          "[rank %d] ep[peer=%d,q=%d]: qpn=%u sqAddr=%p dbrAddr=%p dbrRecAddr=%p "
-          "cqAddr=%p cqDbrAddr=%p\n",
-          rank, peer, q, ep.qpn, ep.wqHandle.sqAddr, ep.wqHandle.dbrAddr, ep.wqHandle.dbrRecAddr,
-          ep.cqHandle.cqAddr, ep.cqHandle.dbrAddr);
-      if (ep.qpn == 0) {
-        fprintf(stderr, "[rank %d] HOST ASSERT FAILED: ep[peer=%d,q=%d].qpn == 0\n", rank, peer, q);
-        return 1;
-      }
-      HOST_ASSERT_NN(ep.wqHandle.sqAddr, "ep.wqHandle.sqAddr");
-      HOST_ASSERT_NN(ep.wqHandle.dbrAddr, "ep.wqHandle.dbrAddr");
-      HOST_ASSERT_NN(ep.cqHandle.cqAddr, "ep.cqHandle.cqAddr");
-    }
-  }
-#undef HOST_ASSERT_NN
-
-  // Host barrier to ensure all ranks have initialized
   mori::cco::ccoBarrierAll(comm);
 
-  // Phase 5: Launch AlltoAll kernel
+  // launch — one warp per peer so flushAsync calls fan out across warps.
+  // AMD warpSize = 64; block max = 1024 threads, so up to 16 peers.
+  constexpr int kWarpSize = 64;
+  if (nranks * kWarpSize > 1024) {
+    fprintf(stderr, "[rank %d] nranks=%d exceeds 1024/%d warp budget\n", rank, nranks, kWarpSize);
+    return 1;
+  }
+  int blockDim = nranks * kWarpSize;
+
   hipStream_t stream;
   HIP_CHECK(hipStreamCreate(&stream));
-
-  GdaAlltoAllKernel<kPrvdType, float><<<1, 64, 0, stream>>>(sendWin, recvWin, COUNT, devCommHost);
-
+  GdaAlltoAllFlushAsyncKernel<kPrvdType, float>
+      <<<1, blockDim, 0, stream>>>(sendWin, recvWin, COUNT, devCommHost);
   HIP_CHECK(hipStreamSynchronize(stream));
-  printf("[rank %d] Kernel completed\n", rank);
+  printf("[rank %d] kernel completed\n", rank);
 
-  // Host barrier after kernel to ensure all ranks finished
   mori::cco::ccoBarrierAll(comm);
 
-  // Phase 6: Verify recv buffer
+  // verify: recv[src*COUNT + i] should be src*1000 + rank*100 + i for every src != rank
   std::vector<float> hostRecv(COUNT * nranks);
   HIP_CHECK(hipMemcpy(hostRecv.data(), recvBuf, bufSize, hipMemcpyDeviceToHost));
 
-  // Dump recvBuf grouped by source rank (16/row). Self slot is the un-written
-  // 0xff init pattern — anything else means data either arrived (matches
-  // src*1000+rank*100+i) or got corrupted.
-  {
-    const size_t DUMP_PER_SLOT = std::min<size_t>(256, COUNT);
-    for (int srcRank = 0; srcRank < nranks; srcRank++) {
-      if (srcRank == rank) continue;  // skip self slot (never written)
-      printf("[r%d src=%d]", rank, srcRank);
-      for (size_t i = 0; i < DUMP_PER_SLOT; i++) {
-        if (i % 16 == 0) printf("\n[r%d s%d %3zu]", rank, srcRank, i);
-        printf(" %.0f", hostRecv[srcRank * COUNT + i]);
-      }
-      printf("\n");
-    }
-    fflush(stdout);
-  }
-
   bool ok = true;
-  for (int srcRank = 0; srcRank < nranks; srcRank++) {
+  for (int srcRank = 0; srcRank < nranks && ok; srcRank++) {
     if (srcRank == rank) continue;
     for (size_t i = 0; i < COUNT; i++) {
-      size_t idx = srcRank * COUNT + i;
-      // srcRank sent: srcRank*1000 + rank*100 + i  (data destined for us)
       float expected = static_cast<float>(srcRank * 1000 + rank * 100 + i);
-      if (hostRecv[idx] != expected) {
-        fprintf(stderr, "[rank %d] Mismatch at [src=%d][%zu]: got %.0f expected %.0f\n", rank,
-                srcRank, i, hostRecv[idx], expected);
+      float got = hostRecv[srcRank * COUNT + i];
+      if (got != expected) {
+        fprintf(stderr, "[rank %d] mismatch at [src=%d][%zu]: got %.0f expected %.0f\n", rank,
+                srcRank, i, got, expected);
         ok = false;
         break;
       }
     }
-    if (!ok) break;
   }
 
-  if (ok) {
-    printf("[rank %d] Data verification PASSED\n", rank);
-  }
-
-  // Cleanup
   HIP_CHECK(hipStreamDestroy(stream));
   mori::cco::ccoDevCommDestroy(comm, devComm);
   mori::cco::ccoWindowDeregister(comm, recvWin);
@@ -347,7 +249,7 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
   return ok ? 0 : 1;
 }
 
-// ── Fork mode ──
+// ── fork mode ──
 
 static void write_file(const char* path, const void* data, size_t len) {
   FILE* f = fopen(path, "wb");
@@ -365,12 +267,12 @@ static bool read_file(const char* path, void* data, size_t len) {
 
 static int run_fork_mode(int nranks) {
   char uidPath[256];
-  snprintf(uidPath, sizeof(uidPath), "/tmp/cco_gda_device_uid_%d", getpid());
+  snprintf(uidPath, sizeof(uidPath), "/tmp/cco_gda_flush_async_uid_%d", getpid());
 
-  printf("=== CCO GDA Device API Test (fork, %d ranks) ===\n", nranks);
+  printf("=== CCO GDA flushAsync Test (fork, %d ranks) ===\n", nranks);
   fflush(stdout);
 
-  auto uid = mori::application::SocketBootstrapNetwork::GenerateUniqueIdWithInterface("lo", 19877);
+  auto uid = mori::application::SocketBootstrapNetwork::GenerateUniqueIdWithInterface("lo", 19878);
   write_file(uidPath, &uid, sizeof(uid));
 
   std::vector<pid_t> children;
@@ -402,7 +304,7 @@ static int run_fork_mode(int nranks) {
   return fail > 0 ? 1 : 0;
 }
 
-// ── Single-rank mode for cross-host ──
+// ── single-rank mode for cross-host ──
 
 static int run_single_rank_mode(int argc, char** argv) {
   int rank = -1, worldSize = -1, gpuOffset = -1;
@@ -474,14 +376,14 @@ int main(int argc, char** argv) {
     int rank, nranks;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &nranks);
-    if (rank == 0) printf("=== CCO GDA Device API Test (MPI, %d ranks) ===\n", nranks);
+    if (rank == 0) printf("=== CCO GDA flushAsync Test (MPI, %d ranks) ===\n", nranks);
 
     auto* boot = new mori::application::MpiBootstrapNetwork(MPI_COMM_WORLD);
     return run_test(rank, nranks, boot);
   }
 #endif
 
-  // Fork mode
+  // fork mode — detect local gpu count
   int nranks = 0;
   for (int i = 0; i < 64; i++) {
     char path[128];
