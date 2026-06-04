@@ -369,35 +369,8 @@ This proposal also does not require making MORI the only user of the zero-copy o
 capability. The core FSDP2 API should be backend-agnostic so other scatter-capable
 backends can use the same hook.
 
-## Open Questions
-
-1. Should the core API use a capability flag on `AllGather`, or a distinct
-   `ParamContiguousAllGather` subtype?
-2. Should FSDP own the output buffer pool and lifetime ceiling, or should each comm
-   backend own registered buffer allocation?
-3. Should this idea later extend to reduce-scatter?
-4. Should there be a minimum size threshold below which zero-copy output is not worth
-   the layout-specific constraints?
-5. Should compile support be a hard requirement for landing the capability, or can the
-   capability initially be disabled under Traceable FSDP2?
-
-## Suggested Staging
-
-1. Discuss and, if acceptable, land an SDMA-backed `AllGather` path that still produces
-   rank-major output and keeps the existing copy-out behavior.
-2. Discuss the backend-agnostic zero-copy output capability and its buffer lifetime
-   contract.
-3. Add tests for the eligibility gate, buffer lifetime, fallback behavior, and numerical
-   parity.
-4. Allow scatter-capable backends to opt in.
-
-This staging keeps the low-risk communication backend work separate from the more
-invasive FSDP2 layout and lifetime change.
-
 ## References
 
 - DeepSpeed SDMA ZeRO-3 RFC: https://github.com/deepspeedai/DeepSpeed/issues/7884
 - MORI FSDP SDMA optimization notes:
   https://github.com/ROCm/mori/blob/fsdp-ccl/docs/MORI_FSDP_SDMA_OPTIMIZATION.md
-- Review and pre-RFC analysis:
-  https://gist.github.com/jeffdaily/703795f1eef12dc2eccd5775f06fdc81
