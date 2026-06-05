@@ -65,38 +65,6 @@ def _current_stream():
     return torch.cuda.current_stream().cuda_stream
 
 
-def validate_dispatch_indices(min_index, max_index, num_experts_per_rank, world_size):
-    """Host-side guard against out-of-range expert ids in dispatch indices.
-
-    mori's config carries no total ``num_experts`` field; every dispatch kernel
-    derives the destination rank as ``pe = indices[i] // num_experts_per_rank``
-    and requires ``0 <= pe < world_size``. The device kernels guard this with a
-    debug ``assert`` (e.g. ``internode_v1.cpp:387/:493``) that is compiled out in
-    release builds (NDEBUG), so an out-of-range id otherwise produces a garbage
-    ``pe`` and an out-of-bounds device access (HSA page fault).
-
-    EPLB can hand the dispatch path physical/redundant expert ids while
-    ``num_experts_per_rank`` still reflects the logical layout, so ids can reach
-    ``>= world_size * num_experts_per_rank``. This validator fails loud with a
-    clear error instead of faulting, mirroring the runtime range check the
-    LocalExpertCount kernel already performs (``ep_local_expert_count.hpp``).
-    Covers every kernel type (IntraNode / InterNode / InterNodeV1 / LL / AsyncLL)
-    in one host-side check. Raises ``ValueError`` on violation.
-    """
-    total_experts = world_size * num_experts_per_rank
-    if min_index < 0 or max_index >= total_experts:
-        raise ValueError(
-            "dispatch indices out of range for the configured expert layout: "
-            f"observed id range [{min_index}, {max_index}], but the contract "
-            f"requires 0 <= id < world_size * num_experts_per_rank = "
-            f"{world_size} * {num_experts_per_rank} = {total_experts}. "
-            f"id // num_experts_per_rank would reach "
-            f"{max_index // num_experts_per_rank} >= world_size ({world_size}). "
-            "If using EPLB, set num_experts_per_rank to the PHYSICAL layout "
-            "(num_physical_experts // world_size)."
-        )
-
-
 @dataclass
 class EpDispatchCombineConfig:
     """Configuration for :class:`EpDispatchCombineOp`.
@@ -227,13 +195,6 @@ def _load_hip_modules(kernel_type):
 class EpDispatchCombineOp:
     def __init__(self, config):
         self.config = config
-        # Host-side guard against out-of-range expert ids (see
-        # validate_dispatch_indices). OPT-IN (default OFF): the check does a
-        # min/max reduction whose int() forces a GPU->CPU sync, which is illegal
-        # under HIP/CUDA graph capture. The always-on device-side guards are the
-        # real protection; enable this only for eager-mode bring-up/debug via
-        # MORI_EP_VALIDATE_INDICES=1.
-        self._validate_indices = os.environ.get("MORI_EP_VALIDATE_INDICES", "0") == "1"
         _ensure_jit_kernels(config.kernel_type)
 
         if dist.is_initialized():
@@ -513,20 +474,6 @@ class EpDispatchCombineOp:
         call_local_expert_count: bool = False,
     ):
         hidden_dim = input.size(1)
-        # int(indices.min()/max()) forces a GPU->CPU sync, which is illegal under
-        # HIP/CUDA graph capture; skip the check while capturing.
-        if (
-            self._validate_indices
-            and indices is not None
-            and indices.numel()
-            and not torch.cuda.is_current_stream_capturing()
-        ):
-            validate_dispatch_indices(
-                int(indices.min()),
-                int(indices.max()),
-                self.config.num_experts_per_rank,
-                self.config.world_size,
-            )
         weight_ptr = weights.data_ptr() if weights is not None else 0
         has_scales = scales is not None and self.config.scale_dim > 0
         scale_ptr = scales.data_ptr() if has_scales else 0
