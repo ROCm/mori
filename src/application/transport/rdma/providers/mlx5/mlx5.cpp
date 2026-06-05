@@ -88,12 +88,14 @@ Mlx5CqContainer::Mlx5CqContainer(ibv_context* context, const RdmaEndpointConfig&
   // TODO: adjust cqe_num after aligning?
   cqSize = (cqSize + config.alignment - 1) / config.alignment * config.alignment;
 
+  // Init CQ buffer to 0xff so wqe_counter reads 0xffff ("nothing completed")
+  // until the NIC writes a real completion (zero-init would look like WQE 0 done).
   if (config.onGpu) {
-    HIP_RUNTIME_CHECK(hipMalloc(&cqUmemAddr, cqSize));
-    HIP_RUNTIME_CHECK(hipMemset(cqUmemAddr, 0, cqSize));
+    HIP_RUNTIME_CHECK(hipExtMallocWithFlags(&cqUmemAddr, cqSize, hipDeviceMallocUncached));
+    HIP_RUNTIME_CHECK(hipMemset(cqUmemAddr, 0xff, cqSize));
   } else {
     int status = posix_memalign(&cqUmemAddr, config.alignment, cqSize);
-    memset(cqUmemAddr, 0, cqSize);
+    memset(cqUmemAddr, 0xff, cqSize);
     assert(!status);
   }
 
@@ -102,7 +104,7 @@ Mlx5CqContainer::Mlx5CqContainer(ibv_context* context, const RdmaEndpointConfig&
 
   // Allocate user memory for CQ DBR (doorbell?)
   if (config.onGpu) {
-    HIP_RUNTIME_CHECK(hipMalloc(&cqDbrUmemAddr, 8));
+    HIP_RUNTIME_CHECK(hipExtMallocWithFlags(&cqDbrUmemAddr, 8, hipDeviceMallocUncached));
     HIP_RUNTIME_CHECK(hipMemset(cqDbrUmemAddr, 0, 8));
   } else {
     int status = posix_memalign(&cqDbrUmemAddr, 8, 8);
@@ -126,6 +128,12 @@ Mlx5CqContainer::Mlx5CqContainer(ibv_context* context, const RdmaEndpointConfig&
   void* cq_context = DEVX_ADDR_OF(create_cq_in, cmd_in, cq_context);
   DEVX_SET(cqc, cq_context, dbr_umem_valid, 0x1);
   DEVX_SET(cqc, cq_context, dbr_umem_id, cqDbrUmem->umem_id);
+  // Collapsed CQ: cc=1 collapses all completions into CQE slot 0, oi=1 ignores
+  // overrun (no CQ consumer doorbell); progress is tracked via CQE[0].wqe_counter.
+  // cqe_sz=0 selects 64B CQEs.
+  DEVX_SET(cqc, cq_context, cqe_sz, 0x0);
+  DEVX_SET(cqc, cq_context, cc, 0x1);
+  DEVX_SET(cqc, cq_context, oi, 0x1);
   DEVX_SET(cqc, cq_context, log_cq_size, LogCeil2(cqeNum));
   DEVX_SET(cqc, cq_context, uar_page, uar->page_id);
 
@@ -225,7 +233,7 @@ void Mlx5QpContainer::CreateQueuePair(uint32_t cqn, uint32_t pdn) {
   // Allocate user memory for QP
 
   if (config.onGpu) {
-    HIP_RUNTIME_CHECK(hipMalloc(&qpUmemAddr, qpTotalSize));
+    HIP_RUNTIME_CHECK(hipExtMallocWithFlags(&qpUmemAddr, qpTotalSize, hipDeviceMallocUncached));
     HIP_RUNTIME_CHECK(hipMemset(qpUmemAddr, 0, qpTotalSize));
   } else {
     status = posix_memalign(&qpUmemAddr, config.alignment, qpTotalSize);
@@ -239,7 +247,7 @@ void Mlx5QpContainer::CreateQueuePair(uint32_t cqn, uint32_t pdn) {
 
   // Allocate user memory for DBR (doorbell?)
   if (config.onGpu) {
-    HIP_RUNTIME_CHECK(hipMalloc(&qpDbrUmemAddr, 8));
+    HIP_RUNTIME_CHECK(hipExtMallocWithFlags(&qpDbrUmemAddr, 8, hipDeviceMallocUncached));
     HIP_RUNTIME_CHECK(hipMemset(qpDbrUmemAddr, 0, 8));
   } else {
     status = posix_memalign(&qpDbrUmemAddr, 8, 8);
@@ -254,7 +262,8 @@ void Mlx5QpContainer::CreateQueuePair(uint32_t cqn, uint32_t pdn) {
   // Allocate and register atomic internal buffer (ibuf)
   atomicIbufSize = (RoundUpPowOfTwo(config.atomicIbufSlots) + 1) * ATOMIC_IBUF_SLOT_SIZE;
   if (config.onGpu) {
-    HIP_RUNTIME_CHECK(hipMalloc(&atomicIbufAddr, atomicIbufSize));
+    HIP_RUNTIME_CHECK(
+        hipExtMallocWithFlags(&atomicIbufAddr, atomicIbufSize, hipDeviceMallocUncached));
     HIP_RUNTIME_CHECK(hipMemset(atomicIbufAddr, 0, atomicIbufSize));
   } else {
     status = posix_memalign(&atomicIbufAddr, config.alignment, atomicIbufSize);
@@ -451,9 +460,8 @@ void Mlx5QpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& local_handle,
            sizeof(remote_handle.eth.mac));
     DEVX_SET(qpc, qpc, primary_address_path.hop_limit, 64);
     DEVX_SET(qpc, qpc, primary_address_path.src_addr_index, local_handle.eth.gidIdx);
-    // UDP sport: default to a single fixed RoCEv2 sport (NVSHMEM-style, == 0xC000
-    // on RoCE). MORI_MLX5_ENABLE_UDP_SPORT=1 rotates per-qpId (GetUdpSport) for
-    // ECMP spread.
+    // UDP sport: default to a single fixed RoCEv2 sport (== 0xC000 on RoCE).
+    // MORI_MLX5_ENABLE_UDP_SPORT=1 rotates per-qpId (GetUdpSport) for ECMP spread.
     static const bool enableUdpSport = []() {
       const char* e = std::getenv("MORI_MLX5_ENABLE_UDP_SPORT");
       return e != nullptr && std::atoi(e) != 0;
