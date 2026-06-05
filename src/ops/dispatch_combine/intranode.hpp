@@ -112,6 +112,18 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       index_t destPe = destExpert / config.numExpertPerRank;
       index_t destTokId = 0;
 
+      // Out-of-range expert id guard: destPe is warp-uniform here (one
+      // token-expert per warp) and indexes GetAs(destPe) / destPeTokenCounter
+      // below. An out-of-range id (e.g. an EPLB physical id
+      // >= worldSize*numExpertPerRank) would index those out of bounds (the
+      // assert at dispatch is stripped under NDEBUG) -> HSA page fault. Drop it
+      // via the same overflow sentinel the dedup path uses; the whole warp
+      // skips coherently.
+      if ((destPe < 0) || (destPe >= config.worldSize)) {
+        if (laneId == 0) args.dispDestTokIdMap[i] = FlatTokenIndex(config, config.worldSize, 0);
+        continue;
+      }
+
       // Deduplicate
       assert(config.numExpertPerToken < warpSize);
       int condition = 0;

@@ -393,7 +393,14 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
         int destPe = __shfl(lanePe, e);
         int destNode = destPe / config.gpuPerNode;
 
-        bool shouldSkip = (destNode != myNode) || __any((laneId < e) && (destPe == lanePe));
+        // HSA-RCA Signature 1 guard: in Release builds NDEBUG strips the
+        // assert at :387, so an out-of-range expert id (e.g. EPLB physical id
+        // >= worldSize*numExpertPerRank, PR #254) yields destPe >= worldSize
+        // and an OOB GetAs/WarpCopy/atomicAdd -> HSA page fault. Treat any
+        // out-of-range destPe as a dropped token via the existing skip path.
+        bool peOutOfRange = (destPe < 0) || (destPe >= config.worldSize);
+        bool shouldSkip =
+            peOutOfRange || (destNode != myNode) || __any((laneId < e) && (destPe == lanePe));
         if (shouldSkip) {
           if (laneId == 0)
             args.interNodeDispDestTokIdMap[tokIdx * config.numExpertPerToken + e] =
@@ -498,7 +505,11 @@ inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs<T>& args) {
 
     int destPe = __shfl(lanePe, expertId);
     int destNode = destPe / config.gpuPerNode;
-    bool shouldSkip = (destNode != myNode) || __any((laneId < expertId) && (destPe == lanePe));
+    // HSA-RCA Signature 1 guard (mirror of the :396 site): out-of-range destPe
+    // (assert at :493 stripped under NDEBUG) is dropped instead of writing OOB.
+    bool peOutOfRange = (destPe < 0) || (destPe >= config.worldSize);
+    bool shouldSkip =
+        peOutOfRange || (destNode != myNode) || __any((laneId < expertId) && (destPe == lanePe));
     if (shouldSkip) {
       if (laneId == 0)
         args.interNodeDispDestTokIdMap[globalTokenId * config.numExpertPerToken + expertId] =

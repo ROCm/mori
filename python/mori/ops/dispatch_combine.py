@@ -65,6 +65,38 @@ def _current_stream():
     return torch.cuda.current_stream().cuda_stream
 
 
+def validate_dispatch_indices(min_index, max_index, num_experts_per_rank, world_size):
+    """Host-side guard against out-of-range expert ids in dispatch indices.
+
+    mori's config carries no total ``num_experts`` field; every dispatch kernel
+    derives the destination rank as ``pe = indices[i] // num_experts_per_rank``
+    and requires ``0 <= pe < world_size``. The device kernels guard this with a
+    debug ``assert`` (e.g. ``internode_v1.cpp:387/:493``) that is compiled out in
+    release builds (NDEBUG), so an out-of-range id otherwise produces a garbage
+    ``pe`` and an out-of-bounds device access (HSA page fault).
+
+    EPLB can hand the dispatch path physical/redundant expert ids while
+    ``num_experts_per_rank`` still reflects the logical layout, so ids can reach
+    ``>= world_size * num_experts_per_rank``. This validator fails loud with a
+    clear error instead of faulting, mirroring the runtime range check the
+    LocalExpertCount kernel already performs (``ep_local_expert_count.hpp``).
+    Covers every kernel type (IntraNode / InterNode / InterNodeV1 / LL / AsyncLL)
+    in one host-side check. Raises ``ValueError`` on violation.
+    """
+    total_experts = world_size * num_experts_per_rank
+    if min_index < 0 or max_index >= total_experts:
+        raise ValueError(
+            "dispatch indices out of range for the configured expert layout: "
+            f"observed id range [{min_index}, {max_index}], but the contract "
+            f"requires 0 <= id < world_size * num_experts_per_rank = "
+            f"{world_size} * {num_experts_per_rank} = {total_experts}. "
+            f"id // num_experts_per_rank would reach "
+            f"{max_index // num_experts_per_rank} >= world_size ({world_size}). "
+            "If using EPLB, set num_experts_per_rank to the PHYSICAL layout "
+            "(num_physical_experts // world_size)."
+        )
+
+
 @dataclass
 class EpDispatchCombineConfig:
     """Configuration for :class:`EpDispatchCombineOp`.
@@ -195,6 +227,13 @@ def _load_hip_modules(kernel_type):
 class EpDispatchCombineOp:
     def __init__(self, config):
         self.config = config
+        # Host-side guard against out-of-range expert ids (see
+        # validate_dispatch_indices). Default ON: one min/max reduction per
+        # dispatch trades a small sync for a clear error instead of a silent
+        # out-of-bounds device access. Set MORI_EP_VALIDATE_INDICES=0 to disable
+        # on the hot path once the expert layout is known-good (the device-side
+        # guards still prevent the fault).
+        self._validate_indices = os.environ.get("MORI_EP_VALIDATE_INDICES", "1") != "0"
         _ensure_jit_kernels(config.kernel_type)
 
         if dist.is_initialized():
@@ -474,6 +513,13 @@ class EpDispatchCombineOp:
         call_local_expert_count: bool = False,
     ):
         hidden_dim = input.size(1)
+        if self._validate_indices and indices is not None and indices.numel():
+            validate_dispatch_indices(
+                int(indices.min()),
+                int(indices.max()),
+                self.config.num_experts_per_rank,
+                self.config.world_size,
+            )
         weight_ptr = weights.data_ptr() if weights is not None else 0
         has_scales = scales is not None and self.config.scale_dim > 0
         scale_ptr = scales.data_ptr() if has_scales else 0
