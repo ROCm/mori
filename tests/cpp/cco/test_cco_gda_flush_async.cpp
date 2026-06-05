@@ -19,25 +19,24 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-// test: cco gda flushAsync — fire-and-forget doorbell ring.
+// test: cco gda flushAsync + wait — overlap doorbell ring with peer-signal wait.
 //
 // each rank launches one kernel that:
 //   1. put(peer, ..., SignalInc{myRank}) to every peer
-//   2. flushAsync(peer, &dummy) — rings doorbell, drops the request handle
+//   2. flushAsync(peer, &req[w]) — warp w's lane 0 rings doorbell, keeps the handle
 //   3. waitSignal on every incoming signal (data+signal are ordered on the same qp,
 //      so a landed signal implies the data write also landed)
+//   4. wait(req[w]) — warp w's lane 0 drains its own cq, confirming the outbound
+//      put has completed locally and sendBuf is reusable
 //
-// no wait() — outbound completion is not checked on this side. correctness comes
-// from the peer-side waitSignal: once peer r's signal arrives, peer r has also seen
-// our put. host verifies recv buffer after the kernel.
+// overlap pattern: between step 2 (doorbell rung) and step 4 (cq drained), step 3
+// blocks on remote signal landings — our outbound WQEs are in flight on the nic
+// during that window, so wait() in step 4 usually returns immediately.
 //
-// caveat: because we never poll our own cq, sendBuf isn't guaranteed reusable until
-// the next barrier / kernel flushes things. fine for this test (sendBuf is read-only).
-//
-// difference from test_cco_gda_device:
-//   - that test calls flush() (rings doorbell AND polls cq)
-//   - this test calls flushAsync() only — exercises the doorbell-ring path without
-//     paying for cq-poll on the sender side
+// difference from test_cco_gda_put:
+//   - that test calls flush() (rings doorbell AND polls cq, fused)
+//   - this test splits into flushAsync(ring only) → waitSignal → wait(poll only),
+//     letting the cq-poll be hidden behind the signal wait
 
 #ifdef MORI_WITH_MPI
 #include <mpi.h>
@@ -56,7 +55,7 @@
 #include "hip/hip_runtime.h"
 #include "mori/application/bootstrap/socket_bootstrap.hpp"
 #include "mori/cco/cco_api.hpp"
-#include "mori/cco/gda/gda_device_api.hpp"
+#include "mori/cco/gda/gda_device.hpp"
 #include "mori/shmem/internal.hpp"
 
 static int g_rank = 0;
@@ -100,6 +99,10 @@ __global__ void GdaAlltoAllFlushAsyncKernel(mori::cco::ccoWindowDevice* sendWin,
 
   size_t perPairBytes = count * sizeof(T);
 
+  // per-thread handle slot. only lane 0 of each "active" warp writes it in step 2
+  // and reads it in step 4; other threads leave it null.
+  ccoGdaRequest_t myReq = nullptr;
+
   // step 1: each thread issues put to a distinct peer
   for (int r = tid; r < nRanks; r += nthreads) {
     if (r == myRank) continue;
@@ -110,10 +113,9 @@ __global__ void GdaAlltoAllFlushAsyncKernel(mori::cco::ccoWindowDevice* sendWin,
   __syncthreads();
 
   // step 2: warp w's lane 0 rings doorbell for peer w — parallel across warps.
-  // returned handle discarded (no wait on sender side).
   if (laneId == 0 && warpId < nRanks && warpId != myRank) {
-    ccoGdaRequest_t dummy;
-    gda.flushAsync(warpId, &dummy);
+    gda.flushAsync(warpId, &myReq);
+    gda.wait(myReq);
   }
 
   // step 3: wait for every peer's signal. since data+signal share the qp and

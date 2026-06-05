@@ -24,4 +24,5 @@
 
 #pragma once
 
-#include "gda_device_api.hpp"
+#include "mori/cco/gda/gda_device_types.hpp"
+#include "mori/cco/gda/gda_device_api.hpp"
