@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "mori/io/logging.hpp"
+#include "mori/utils/env_utils.hpp"
 
 namespace mori {
 namespace io {
@@ -76,39 +77,34 @@ void MultithreadExecutor::Worker::Shutdown() {
 }
 
 void MultithreadExecutor::Worker::MainLoop() {
-  // MORI_CORE_OFFSET is a relative offset into the allowed CPU list, not an
-  // absolute host CPU id, so binding stays within the cpuset.
-  int coreOffset = 0;
-  const char* env = std::getenv("MORI_CORE_OFFSET");
-  if (env) {
-    coreOffset = std::stoi(env);
-  }
-
-  std::vector<int> allowed = GetAllowedCpus();
-  if (allowed.empty()) {
-    MORI_IO_WARN(
-        "worker {} could not read allowed CPU set (sched_getaffinity failed); "
-        "worker will run on any available core.",
-        workerId);
-  } else {
-    int n = static_cast<int>(allowed.size());
-    int idx = ((workerId + coreOffset) % n + n) % n;
-    int targetCore = allowed[idx];
-
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(targetCore, &cpuset);
-
-    int rc = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
-    if (rc != 0) {
+  // MORI_CORE_OFFSET is relative to the allowed CPU list, so binding stays within the cpuset.
+  if (auto coreOffset = mori::env::GetInt("MORI_CORE_OFFSET")) {
+    std::vector<int> allowed = GetAllowedCpus();
+    if (allowed.empty()) {
       MORI_IO_WARN(
-          "worker {} failed to set affinity to core {} (allowed[{}], allowed size {}): "
-          "errno={} ({}). Worker will run on any available core. "
-          "This is usually caused by NUMA configuration or container CPU limits.",
-          workerId, targetCore, idx, n, rc, strerror(rc));
+          "worker {} could not read allowed CPU set (sched_getaffinity failed); "
+          "worker will run on any available core.",
+          workerId);
     } else {
-      MORI_IO_INFO("worker {} bound to core {} (allowed[{}] of {} allowed CPUs, offset {})",
-                   workerId, targetCore, idx, n, coreOffset);
+      int n = static_cast<int>(allowed.size());
+      int idx = ((workerId + *coreOffset) % n + n) % n;
+      int targetCore = allowed[idx];
+
+      cpu_set_t cpuset;
+      CPU_ZERO(&cpuset);
+      CPU_SET(targetCore, &cpuset);
+
+      int rc = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+      if (rc != 0) {
+        MORI_IO_WARN(
+            "worker {} failed to set affinity to core {} (allowed[{}], allowed size {}): "
+            "errno={} ({}). Worker will run on any available core. "
+            "This is usually caused by NUMA configuration or container CPU limits.",
+            workerId, targetCore, idx, n, rc, strerror(rc));
+      } else {
+        MORI_IO_INFO("worker {} bound to core {} (allowed[{}] of {} allowed CPUs, offset {})",
+                     workerId, targetCore, idx, n, *coreOffset);
+      }
     }
   }
 
