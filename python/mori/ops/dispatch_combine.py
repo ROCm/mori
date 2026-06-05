@@ -228,12 +228,12 @@ class EpDispatchCombineOp:
     def __init__(self, config):
         self.config = config
         # Host-side guard against out-of-range expert ids (see
-        # validate_dispatch_indices). Default ON: one min/max reduction per
-        # dispatch trades a small sync for a clear error instead of a silent
-        # out-of-bounds device access. Set MORI_EP_VALIDATE_INDICES=0 to disable
-        # on the hot path once the expert layout is known-good (the device-side
-        # guards still prevent the fault).
-        self._validate_indices = os.environ.get("MORI_EP_VALIDATE_INDICES", "1") != "0"
+        # validate_dispatch_indices). OPT-IN (default OFF): the check does a
+        # min/max reduction whose int() forces a GPU->CPU sync, which is illegal
+        # under HIP/CUDA graph capture. The always-on device-side guards are the
+        # real protection; enable this only for eager-mode bring-up/debug via
+        # MORI_EP_VALIDATE_INDICES=1.
+        self._validate_indices = os.environ.get("MORI_EP_VALIDATE_INDICES", "0") == "1"
         _ensure_jit_kernels(config.kernel_type)
 
         if dist.is_initialized():
@@ -513,7 +513,14 @@ class EpDispatchCombineOp:
         call_local_expert_count: bool = False,
     ):
         hidden_dim = input.size(1)
-        if self._validate_indices and indices is not None and indices.numel():
+        # int(indices.min()/max()) forces a GPU->CPU sync, which is illegal under
+        # HIP/CUDA graph capture; skip the check while capturing.
+        if (
+            self._validate_indices
+            and indices is not None
+            and indices.numel()
+            and not torch.cuda.is_current_stream_capturing()
+        ):
             validate_dispatch_indices(
                 int(indices.min()),
                 int(indices.max()),
