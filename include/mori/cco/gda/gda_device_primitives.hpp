@@ -23,16 +23,8 @@
 // MIT License — see LICENSE for details.
 #pragma once
 
-#include <type_traits>
-
-#include "mori/application/transport/rdma/rdma.hpp"
-#include "mori/cco/cco_types.hpp"
-#include "mori/cco/gda/gda_device_types.hpp"
-#include "mori/core/transport/rdma/device_primitives.hpp"
-#include "mori/core/transport/rdma/providers/bnxt/bnxt_device_primitives.hpp"
-#include "mori/core/transport/rdma/providers/ionic/ionic_device_primitives.hpp"
-#include "mori/core/transport/rdma/providers/mlx5/mlx5_device_primitives.hpp"
 #include "mori/shmem/internal.hpp"
+#include "mori/core/transport/rdma/rdma.hpp"
 
 namespace mori {
 namespace cco {

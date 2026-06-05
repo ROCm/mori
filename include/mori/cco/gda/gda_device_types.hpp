@@ -22,13 +22,13 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
 // MIT License — see LICENSE for details.
 //
-// Low-level GDA type aliases/enums shared by both the primitive layer
+// low-level GDA type aliases/enums shared by both the primitive layer
 // (gda_device_primitive.hpp) and the high-level layer (gda_device_common.hpp).
-// Kept in a standalone header so the primitive layer can depend on these
+// kept in a standalone header so the primitive layer can depend on these
 // types without creating a circular include with the common layer.
 #pragma once
 
-#include <stdint.h>
+#include "mori/cco/cco_types.hpp"
 
 namespace mori {
 namespace cco {
@@ -80,13 +80,17 @@ struct ccoGdaCtx {
 template <core::ProviderType PrvdType>
 struct ccoGda {
   ccoDevComm const& comm;
+  int rank;    // my index in the GDA team [0, nRanks)
+  int nRanks;  // GDA team size, derived from gdaConnType at construction
   uint32_t contextId;
   void* _gdaHandle;
 
-  // Constructor
+  // constructor
   __device__ inline ccoGda(ccoDevComm const&, int contextIndex);
 
-  // Data transfer operations
+  // ── data transfer ───────────────────────────────────────────────────────
+
+  // put: rdma write with optional remote signal and local counter.
   template <typename RemoteAction = ccoGda_NoSignal, typename LocalAction = ccoGda_NoCounter>
   __device__ inline void put(int peer, ccoWindow_t dstWin, size_t dstOffset, ccoWindow_t srcWin,
                              size_t srcOffset, size_t bytes,
@@ -94,45 +98,63 @@ struct ccoGda {
                              LocalAction localAction = ccoGda_NoCounter{},
                              uint32_t optFlags = ccoGdaOptFlagsDefault);
 
+  // putValue: write an immediate value (≤8 bytes) with optional remote signal.
   template <typename T, typename RemoteAction = ccoGda_NoSignal>
   __device__ inline void putValue(int peer, ccoWindow_t dstWin, size_t dstOffset, T value,
                                   RemoteAction remoteAction = ccoGda_NoSignal{},
                                   uint32_t optFlags = ccoGdaOptFlagsDefault);
 
+  // get: rdma read — pull peer's window content into our local window.
   __device__ inline void get(int peer, ccoWindow_t remoteWin, size_t remoteOffset,
                              ccoWindow_t localWin, size_t localOffset, size_t bytes,
                              uint32_t optFlags = ccoGdaOptFlagsDefault);
 
-  // Signal operations
+  // ── signal ──────────────────────────────────────────────────────────────
+
+  // signal: send a signal-only message to peer (no data payload).
   template <typename RemoteAction>
   __device__ inline void signal(int peer, RemoteAction remoteAction);
 
+  // readSignal: read the local value of one signal slot.
   __device__ inline uint64_t readSignal(ccoGdaSignal_t signalId, int bits = 64);
 
+  // waitSignal: block until the local signal slot reaches `least`.
   __device__ inline void waitSignal(ccoGdaSignal_t signalId, uint64_t least, int bits = 64);
 
+  // resetSignal: zero one local signal slot.
   __device__ inline void resetSignal(ccoGdaSignal_t signalId);
 
-  // Counter operations
+  // ── counter ─────────────────────────────────────────────────────────────
+
+  // readCounter: read the local value of one counter slot.
   __device__ inline uint64_t readCounter(ccoGdaCounter_t counterId, int bits = 56);
 
+  // waitCounter: block until the local counter slot reaches `least`.
   __device__ inline void waitCounter(ccoGdaCounter_t counterId, uint64_t least, int bits = 56);
 
+  // resetCounter: zero one local counter slot.
   __device__ inline void resetCounter(ccoGdaCounter_t counterId);
 
-  // Completion operations
-  __device__ inline void flush();          // Ring doorbell for all peers
-  __device__ inline void flush(int peer);  // Ring doorbell for specific peer
+  // ── completion ──────────────────────────────────────────────────────────
+  //
+  // flush() / flush(peer) only poll the CQ — they do not ring the doorbell.
+  // matches NCCL GIN semantics. if WQEs were submitted with
+  // ccoGdaOptFlagsAggregateRequests, the caller must invoke flushAsync(peer, ...)
+  // first to ring the doorbell, then flush(peer) to wait for completion.
 
+  // flush: poll CQ for every peer until all submitted WQEs complete.
+  __device__ inline void flush();
+
+  // flush(peer): poll CQ for a single peer until its submitted WQEs complete.
+  __device__ inline void flush(int peer);
+
+  // flushAsync: ring doorbell for peer and return a request handle that
+  // wait() can later be used to wait on individually.
   __device__ inline void flushAsync(int peer, ccoGdaRequest_t* outRequest);
 
+  // wait: block on a request handle previously returned by flushAsync.
   __device__ inline void wait(ccoGdaRequest_t& request);
 };
-
-// Type aliases for convenience
-using ccoGdaMLX5 = ccoGda<core::ProviderType::MLX5>;
-using ccoGdaPSD = ccoGda<core::ProviderType::PSD>;
-using ccoGdaBNXT = ccoGda<core::ProviderType::BNXT>;
 
 }  // namespace gda
 }  // namespace cco

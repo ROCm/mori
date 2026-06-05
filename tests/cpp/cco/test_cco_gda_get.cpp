@@ -52,7 +52,7 @@
 #include "hip/hip_runtime.h"
 #include "mori/application/bootstrap/socket_bootstrap.hpp"
 #include "mori/cco/cco_api.hpp"
-#include "mori/cco/gda/gda_device_api.hpp"
+#include "mori/cco/gda/gda_device.hpp"
 #include "mori/shmem/internal.hpp"
 
 static int g_rank = 0;
