@@ -200,7 +200,7 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
             int qpId = (tokenId / warpSize) % config.numQpPerPe;
             shmem::ShmemPutMemNbiSignalThread(
                 args.interNodeV1TokBufs.dispatchInp, remoteIdx * xferBytes,
-                args.interNodeV1TokBufs.staging, stagingTokOffset, count * xferBytes,
+                args.interNodeV1TokBufs.dispatchStaging, stagingTokOffset, count * xferBytes,
                 args.interNodeChunkFlagMemObj,
                 (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t), flag,
                 core::atomicType::AMO_ADD, proxyPe, qpId);
@@ -236,7 +236,7 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
           int qpId = (tokenId / warpSize) % config.numQpPerPe;
           shmem::ShmemPutMemNbiSignalThread(
               args.interNodeV1TokBufs.dispatchInp, remoteIdx * xferBytes,
-              args.interNodeV1TokBufs.staging, stagingTokOffset, tokenNum * xferBytes,
+              args.interNodeV1TokBufs.dispatchStaging, stagingTokOffset, tokenNum * xferBytes,
               args.interNodeChunkFlagMemObj, (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t),
               tokenNum + 1, core::atomicType::AMO_ADD, proxyPe, qpId);
         }
@@ -308,7 +308,7 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs<T>& args) {
 
         shmem::ShmemPutMemNbiSignalThread(
             args.interNodeV1TokBufs.dispatchInp, remoteIdx * xferBytes,
-            args.interNodeV1TokBufs.staging, stagingTokOffset, tokenNum * xferBytes,
+            args.interNodeV1TokBufs.dispatchStaging, stagingTokOffset, tokenNum * xferBytes,
             args.interNodeChunkFlagMemObj, (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t),
             tokenNum + 1, core::atomicType::AMO_ADD, proxyPe, qpId);
       }
@@ -624,7 +624,7 @@ __device__ void EpDispatchCopyToStaging_body(EpDispatchCombineArgs<T> args) {
     size_t hiddenDimOffset, hiddenDimSize;
     mwIter.Decode(i, tokenId, inTokenPartId, hiddenDimOffset, hiddenDimSize);
 
-    uint8_t* stagingPtr = args.interNodeV1TokBufs.staging->template GetAs<uint8_t*>();
+    uint8_t* stagingPtr = args.interNodeV1TokBufs.dispatchStaging->template GetAs<uint8_t*>();
     size_t stagingTokOffset = tokenId * xferBytes;
     core::WarpCopy<uint8_t, 4>(stagingPtr + stagingTokOffset + hiddenDimOffset * sizeof(T),
                                reinterpret_cast<uint8_t*>(args.inpTokenBuf) +

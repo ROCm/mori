@@ -89,6 +89,17 @@ inline std::optional<int> ParsePositiveInt(const char* raw) {
   return static_cast<int>(parsed);
 }
 
+inline std::optional<int> ParseInt(const char* raw) {
+  errno = 0;
+  char* end = nullptr;
+  long parsed = std::strtol(raw, &end, 10);
+  if (end == raw || *end != '\0' || errno != 0 || parsed < std::numeric_limits<int>::min() ||
+      parsed > std::numeric_limits<int>::max()) {
+    return std::nullopt;
+  }
+  return static_cast<int>(parsed);
+}
+
 }  // namespace detail
 
 /// Check if an environment variable is set and enabled.
@@ -109,6 +120,14 @@ inline int GetPositiveIntOr(const char* varName, int defaultValue) {
   if (val == nullptr || val[0] == '\0') return defaultValue;
   auto parsed = detail::ParsePositiveInt(val);
   return parsed.value_or(defaultValue);
+}
+
+/// Read an int env var (any value, including 0 and negative). Returns nullopt
+/// when unset, empty, or not parseable.
+inline std::optional<int> GetInt(const char* varName) {
+  const char* val = Get(varName);
+  if (val == nullptr || val[0] == '\0') return std::nullopt;
+  return detail::ParseInt(val);
 }
 
 }  // namespace env

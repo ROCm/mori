@@ -182,6 +182,8 @@ struct ShmemBufsInterNodeV1 {
   mori::application::SymmMemObjPtr dispatchOut;
   mori::application::SymmMemObjPtr combineOut;
   mori::application::SymmMemObjPtr staging;
+  // Dispatch send source, separate from `staging` so combine can't overwrite it.
+  mori::application::SymmMemObjPtr dispatchStaging;
 };
 
 // InterNode / AsyncLL: full 5-buffer set used by the non-V1 RDMA paths.
