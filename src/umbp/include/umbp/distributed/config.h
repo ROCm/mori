@@ -162,6 +162,12 @@ struct PoolClientConfig {
   // 0 = delegate to Master's ClientRegistryConfig::default_dram_page_size
   // (2 MiB by default).  Set to an explicit byte count to override.
   uint64_t dram_page_size = 0;
+
+  UMBPCopyPipelineConfig copy_pipeline = [] {
+    UMBPCopyPipelineConfig c;
+    c.worker_threads = 1;
+    return c;
+  }();
 };
 
 // Lower a user-facing UMBPDistributedConfig to the internal PoolClientConfig.

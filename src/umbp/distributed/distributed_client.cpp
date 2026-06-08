@@ -78,6 +78,7 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
   auto pc_config = ToPoolClientConfig(dc,
                                       /*dram_buffers=*/{{dram_pool_, dram_pool_size_}},
                                       std::move(tier_capacities), std::move(ssd_cfg));
+  pc_config.copy_pipeline = config_.copy_pipeline;
 
   pool_client_ = std::make_unique<PoolClient>(std::move(pc_config));
   if (!pool_client_->Init()) {

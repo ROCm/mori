@@ -326,7 +326,9 @@ bool PoolClient::Init() {
     master_client_->SetPeerSsdManager(peer_ssd_.get());
     // Copy-on-commit pipeline: commits enqueue here, a worker pins the DRAM
     // pages and writes them to the local SSD tier.  Started below.
-    ssd_copy_pipeline_ = std::make_unique<SsdCopyPipeline>(peer_alloc_.get(), peer_ssd_.get());
+    ssd_copy_pipeline_ = std::make_unique<SsdCopyPipeline>(peer_alloc_.get(), peer_ssd_.get(),
+                                                           config_.copy_pipeline.queue_depth,
+                                                           config_.copy_pipeline.worker_threads);
     ssd_copy_pipeline_->Start();
   }
 
