@@ -22,11 +22,26 @@
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
 // MIT License — see LICENSE for details.
 //
-// CCO Device API — common helpers shared by all backends.
-// Per-backend session classes live under gda/, lsa/, sdma/.
+// CCO Device API — single include for device-side (kernel) code.
+//
+// Include this one header from device/kernel sources; host control-plane code
+// includes cco_api.hpp instead. This header aggregates every device-side
+// facility: the common window helpers defined below, cooperative groups,
+// teams, and the per-backend session classes (LSA, GDA).
 #pragma once
 
 #include "mori/cco/cco_types.hpp"
+
+// Cooperative groups + teams used across all device sessions.
+#include "mori/cco/cco_coop.hpp"
+#include "mori/cco/cco_team.hpp"
+
+// clang-format off
+#include "mori/cco/cco_lsa_types.hpp"
+#include "mori/cco/cco_lsa_impl.hpp"
+// clang-format off
+
+#include "mori/cco/gda/gda_device.hpp"
 
 namespace mori {
 namespace cco {

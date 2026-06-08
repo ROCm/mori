@@ -23,8 +23,10 @@
 // MIT License — see LICENSE for details.
 #pragma once
 
+// clang-format off
 #include "mori/cco/gda/gda_device_types.hpp"
 #include "mori/cco/gda/gda_device_primitives.hpp"
+// clang-format on
 
 namespace mori {
 namespace cco {
@@ -80,21 +82,21 @@ __device__ inline ccoGda<PrvdType>::ccoGda(ccoDevComm const& comm_, int contextI
   this->_gdaHandle = (void*)&comm.ibgda;
   switch (comm.gdaConnType) {
     case CCO_GDA_CONNECTION_FULL:
-      this->rank   = comm.rank;
+      this->rank = comm.rank;
       this->nRanks = comm.worldSize;
       break;
     case CCO_GDA_CONNECTION_RAIL:
-      this->rank   = comm.rank / comm.lsaSize;
+      this->rank = comm.rank / comm.lsaSize;
       this->nRanks = comm.worldSize / comm.lsaSize;
       break;
     case CCO_GDA_CONNECTION_CROSSNODE: {
       int nodeStart = (comm.rank / comm.lsaSize) * comm.lsaSize;
-      this->rank   = nodeStart;
+      this->rank = nodeStart;
       this->nRanks = comm.worldSize - comm.lsaSize + 1;
       break;
     }
     default:  // CCO_GDA_CONNECTION_NONE
-      this->rank   = 0;
+      this->rank = 0;
       this->nRanks = 0;
       break;
   }

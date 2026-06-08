@@ -24,5 +24,7 @@
 
 #pragma once
 
+// clang-format off
 #include "mori/cco/gda/gda_device_types.hpp"
 #include "mori/cco/gda/gda_device_api.hpp"
+// clang-format on
