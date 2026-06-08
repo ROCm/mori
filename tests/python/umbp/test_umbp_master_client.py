@@ -28,18 +28,29 @@ from pathlib import Path
 
 import pytest
 
-from mori.cpp import (
-    UMBPClient,
-    UMBPConfig,
-    UMBPDistributedConfig,
-    UMBPMasterClient,
-    UMBPTierType,
-    UMBPExternalKvNodeMatch,
-    UMBPExternalKvHitCountEntry,
+cpp = pytest.importorskip("mori.cpp")
+_REQUIRED_UMBP_SYMBOLS = (
+    "UMBPClient",
+    "UMBPConfig",
+    "UMBPDistributedConfig",
+    "UMBPMasterClient",
+    "UMBPTierType",
+    "UMBPExternalKvNodeMatch",
+    "UMBPExternalKvHitCountEntry",
 )
+if not all(hasattr(cpp, name) for name in _REQUIRED_UMBP_SYMBOLS):
+    pytest.skip("mori.cpp was built without UMBP bindings", allow_module_level=True)
+
+UMBPClient = cpp.UMBPClient
+UMBPConfig = cpp.UMBPConfig
+UMBPDistributedConfig = cpp.UMBPDistributedConfig
+UMBPMasterClient = cpp.UMBPMasterClient
+UMBPTierType = cpp.UMBPTierType
+UMBPExternalKvNodeMatch = cpp.UMBPExternalKvNodeMatch
+UMBPExternalKvHitCountEntry = cpp.UMBPExternalKvHitCountEntry
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 _DEFAULT_MASTER_BIN = REPO_ROOT / "build/lib.linux-x86_64-cpython-310/mori/umbp_master"
 MASTER_BIN = Path(os.environ.get("UMBP_MASTER_BIN", str(_DEFAULT_MASTER_BIN)))
 
