@@ -62,7 +62,7 @@ struct ccoLsaBarrierSession {
     // State buffer lives inside the DevComm's resource window at offset
     // `bufOffset`. Resource window's winBase already = flatBase + the
     // resource window's slotOffset, so applying the canonical LSA peer
-    // formula here matches getLsaPeerPtr / cco_types.hpp::ccoLsaBarrierHandle
+    // formula here matches ccoGetLsaPeerPtr / cco_types.hpp::ccoLsaBarrierHandle
     // comment (winBase + peer*stride4G<<32 + bufOffset).
     const auto& rw = comm->resourceWindow_inlined;
     char* base = rw.winBase + ((uint64_t)owner * rw.stride4G << 32);

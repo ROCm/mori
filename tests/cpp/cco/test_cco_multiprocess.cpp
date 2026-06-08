@@ -40,7 +40,7 @@
 
 #include "hip/hip_runtime.h"
 #include "mori/application/bootstrap/socket_bootstrap.hpp"
-#include "mori/cco/cco_api.hpp"
+#include "mori/cco/cco.hpp"
 
 static int g_rank = 0;
 

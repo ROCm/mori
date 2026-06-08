@@ -33,7 +33,7 @@ CCO 包含两层 API，**风格刻意分开**：
 | Handle typedef | `ccoPascalCase_t`（带前缀 + `_t` 后缀） | `ccoWindow_t`, `ccoDevComm_t` |
 | 字段（struct member） | `camelCase` | `worldSize`, `flatBase`, `nextOffset`, `numQpPerPe` |
 | 常量 / 宏 | `CCO_UPPER_SNAKE_CASE`（带前缀） | `CCO_WINDOW_TABLE_SIZE` |
-| 文件 | `cco_xxx.hpp` / `cco_xxx.cpp` | `cco_api.hpp`, `cco_init.cpp`, `cco_memory.cpp` |
+| 文件 | `cco_xxx.hpp` / `cco_xxx.cpp` | `cco.hpp`, `cco_init.cpp`, `cco_memory.cpp` |
 | 命名空间 | `mori::cco` | — |
 
 ### Device 端（ccoLsa / ccoGda / ccoSdma session + 内部辅助）
@@ -610,9 +610,9 @@ ccoDevCommCreate(comm, &devComm):
 
 CCO device API 分两层：
 
-1. **通用辅助**（`include/mori/cco/cco_device_api.hpp`）
+1. **通用辅助**（`include/mori/cco/cco_device.hpp`）
    - `findWindow(comm, ptr)` — 在 windowTable 里查 window
-   - `getPeerPtr(win, pe, off)` / `getLocalPtr(win, off)` — 计算 flat VA 地址（P2P / SDMA 用）
+   - `getPeerPtr(win, pe, off)` / `ccoGetLocalPtr(win, off)` — 计算 flat VA 地址（P2P / SDMA 用）
    - 在 `mori::cco` namespace 内，**不带** `cco` 前缀，camelCase
 
 2. **per-backend session class**（每个 backend 一个子目录）
@@ -742,9 +742,9 @@ __global__ void my_kernel(ccoDevComm* comm,
 include/mori/cco/
 ├── cco_types.hpp           ← Host/device 共享类型：ccoComm, ccoDevComm,
 │                              ccoWindowDevice, ccoWindowHost, ccoIbgdaContext
-├── cco_api.hpp             ← Host API 入口：host 控制面（ccoCommCreate/MemAlloc/...）
-├── cco_device_api.hpp      ← Device API 入口（伞头）：通用辅助(findWindow/getLsaPeerPtr/
-│                              getLocalPtr) + coop + team + lsa session + gda
+├── cco.hpp                 ← Host API 入口：host 控制面（ccoCommCreate/MemAlloc/...）
+├── cco_device.hpp          ← Device API 入口（伞头）：通用辅助(findWindow/ccoGetLsaPeerPtr/
+│                              ccoGetLocalPtr) + coop + team + lsa session + gda
 └── gda/                    ← GDA (RDMA) backend (NCCL 风格 session)
     ├── gda_device_common.hpp  ← ccoGda struct 声明 + tag 类型 + handle typedef
     └── gda_device_api.hpp     ← ccoGda 成员函数实现 + namespace 内 free function

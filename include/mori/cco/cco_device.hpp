@@ -25,9 +25,10 @@
 // CCO Device API — single include for device-side (kernel) code.
 //
 // Include this one header from device/kernel sources; host control-plane code
-// includes cco_api.hpp instead. This header aggregates every device-side
-// facility: the common window helpers defined below, cooperative groups,
-// teams, and the per-backend session classes (LSA, GDA).
+// includes cco.hpp instead. Pure umbrella: it pulls in every device-side
+// facility — shared types + findWindow (cco_types.hpp), cooperative groups,
+// teams, and the per-backend session classes plus their addressing helpers
+// (LSA ccoGetLsaPeerPtr/ccoGetLocalPtr live in cco_lsa_impl.hpp; GDA under gda/).
 #pragma once
 
 #include "mori/cco/cco_types.hpp"
@@ -42,38 +43,3 @@
 // clang-format off
 
 #include "mori/cco/gda/gda_device.hpp"
-
-namespace mori {
-namespace cco {
-
-// Look up a registered window by a local pointer that lies within it.
-__device__ inline ccoWindow_t findWindow(ccoDevComm* comm, const void* ptr) {
-  uintptr_t uptr = reinterpret_cast<uintptr_t>(ptr);
-  ccoWindowTableNode* node = comm->windowTable;
-  while (node) {
-    for (int i = 0; i < CCO_WINDOW_TABLE_SIZE; i++) {
-      auto& e = node->entries[i];
-      if (e.base != 0 && e.size != 0 && e.window != nullptr) {
-        if (uptr >= e.base && uptr < e.base + e.size) {
-          return e.window;
-        }
-      }
-    }
-    node = node->next;
-  }
-  return nullptr;
-}
-
-// Flat-VA helpers — intra-node addressing only. The flat VA covers the LSA
-// team, so peer indexing is by LSA rank. Cross-node access goes through the
-// GDA backend with iova=0 + offset and doesn't need these.
-__device__ inline void* getLsaPeerPtr(ccoWindow_t win, int peerLsaRank, size_t offset = 0) {
-  return win->winBase + ((static_cast<uint64_t>(peerLsaRank) * win->stride4G) << 32) + offset;
-}
-
-__device__ inline void* getLocalPtr(ccoWindow_t win, size_t offset = 0) {
-  return win->winBase + ((static_cast<uint64_t>(win->lsaRank) * win->stride4G) << 32) + offset;
-}
-
-}  // namespace cco
-}  // namespace mori

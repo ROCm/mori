@@ -242,6 +242,25 @@ struct ccoDevComm {
 };
 typedef ccoDevComm* ccoDevComm_t;
 
+// Look up a registered window by a local pointer that lies within it. Backend-
+// agnostic accessor over the window table built into ccoDevComm above.
+__device__ inline ccoWindow_t findWindow(ccoDevComm* comm, const void* ptr) {
+  uintptr_t uptr = reinterpret_cast<uintptr_t>(ptr);
+  ccoWindowTableNode* node = comm->windowTable;
+  while (node) {
+    for (int i = 0; i < CCO_WINDOW_TABLE_SIZE; i++) {
+      auto& e = node->entries[i];
+      if (e.base != 0 && e.size != 0 && e.window != nullptr) {
+        if (uptr >= e.base && uptr < e.base + e.size) {
+          return e.window;
+        }
+      }
+    }
+    node = node->next;
+  }
+  return nullptr;
+}
+
 /* ────────────────────────────────────────────────────────────────────────────
  *  DevComm requirements
  *
