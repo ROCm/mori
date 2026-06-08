@@ -64,12 +64,21 @@ namespace mori::umbp {
 namespace {
 
 static uint16_t AllocPort() {
-  static std::atomic<uint16_t> next{0};
-  if (next.load() == 0) {
-    std::srand(static_cast<unsigned>(std::time(nullptr)) ^ static_cast<unsigned>(::getpid()));
-    next.store(static_cast<uint16_t>(60000 + (std::rand() % 2000)));
+  // Bind to :0 and let the kernel pick a free port, then close immediately.
+  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) return 60400;
+  struct sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = 0;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if (::bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0) {
+    ::close(fd);
+    return 60400;
   }
-  return next.fetch_add(10);
+  socklen_t len = sizeof(addr);
+  ::getsockname(fd, reinterpret_cast<struct sockaddr*>(&addr), &len);
+  ::close(fd);
+  return ntohs(addr.sin_port);
 }
 
 // ============================================================
@@ -356,10 +365,13 @@ constexpr size_t kLocalBufSize = 8 << 20;
 class PoolClientLocalByteTrackingTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    uint16_t base = AllocPort();
-    master_port_ = base;
-    metrics_port_ = base + 1;
-    io_port_ = base + 2;
+    master_port_ = AllocPort();
+    do {
+      metrics_port_ = AllocPort();
+    } while (metrics_port_ == master_port_);
+    do {
+      io_port_ = AllocPort();
+    } while (io_port_ == master_port_ || io_port_ == metrics_port_);
 
     buf_ = std::malloc(kLocalBufSize);
     src_ = std::malloc(kLocalPageSize);
