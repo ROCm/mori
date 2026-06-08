@@ -6,7 +6,7 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Installation &mdash; MORI 0.1.0 documentation</title>
+  <title>MORI UMBP Single-Node Smoke Test &mdash; MORI 0.1.0 documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
 
@@ -18,9 +18,7 @@
       <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
     <link rel="index" title="Index" href="genindex.html" />
-    <link rel="search" title="Search" href="search.html" />
-    <link rel="next" title="Quickstart" href="quickstart.html" />
-    <link rel="prev" title="MORI Documentation" href="index.html" /> 
+    <link rel="search" title="Search" href="search.html" /> 
 </head>
 
 <body class="wy-body-for-nav"> 
@@ -43,16 +41,16 @@
 </div>
         </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
               <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
-<ul class="current">
-<li class="toctree-l1 current"><a class="current reference internal" href="#">Installation</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="#requirements">Requirements</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#installation-methods">Installation Methods</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="#from-source">From Source</a></li>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="installation.html">Installation</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#requirements">Requirements</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#installation-methods">Installation Methods</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="installation.html#from-source">From Source</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="#environment-variables">Environment Variables</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#verification">Verification</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#troubleshooting">Troubleshooting</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#environment-variables">Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#verification">Verification</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#troubleshooting">Troubleshooting</a></li>
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="quickstart.html">Quickstart</a><ul>
@@ -308,9 +306,9 @@
           <div role="navigation" aria-label="Page navigation">
   <ul class="wy-breadcrumbs">
       <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
-      <li class="breadcrumb-item active">Installation</li>
+      <li class="breadcrumb-item active">MORI UMBP Single-Node Smoke Test</li>
       <li class="wy-breadcrumbs-aside">
-            <a href="_sources/installation.rst.txt" rel="nofollow"> View page source</a>
+            <a href="_sources/MORI-UMBP-SINGLE-NODE-GUIDE.md.txt" rel="nofollow"> View page source</a>
       </li>
   </ul>
   <hr/>
@@ -318,97 +316,241 @@
           <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
            <div itemprop="articleBody">
              
-  <section id="installation">
-<h1>Installation<a class="headerlink" href="#installation" title="Link to this heading"></a></h1>
-<section id="requirements">
-<h2>Requirements<a class="headerlink" href="#requirements" title="Link to this heading"></a></h2>
+  <section id="mori-umbp-single-node-smoke-test">
+<h1>MORI UMBP Single-Node Smoke Test<a class="headerlink" href="#mori-umbp-single-node-smoke-test" title="Link to this heading"></a></h1>
+<p>This guide documents how to run the single-node UMBP + SGLang correctness smoke test that ships with Mori. The flow mirrors the <code class="docutils literal notranslate"><span class="pre">umbp-single-node-launcher</span></code> skill and launches the <a class="reference download internal" download="" href="_downloads/2a71e436c0b4c3535804f4dc53a137f5/run_umbp_single_node_hicache.sh"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">run_umbp_single_node_hicache.sh</span></code></span></a> helper script inside a ROCm container.</p>
+<p>Use the placeholders in this document to map the workflow to any target node. Every environment-dependent value is surfaced as an argument or environment variable; update those inputs and the script can run unchanged.</p>
+<p>For the underlying architecture see
+<span class="xref myst"><code class="docutils literal notranslate"><span class="pre">src/umbp/doc/design-master-control-plane.md</span></code></span>;
+for the full env-var inventory see
+<span class="xref myst"><code class="docutils literal notranslate"><span class="pre">src/umbp/doc/runtime-env-vars.md</span></code></span>.</p>
+<section id="overview">
+<h2>Overview<a class="headerlink" href="#overview" title="Link to this heading"></a></h2>
+<p>The script spins up the Docker image, rebuilds Mori with UMBP enabled, launches a single-node SGLang server backed by UMBP hierarchical cache, issues a probe completion, and collects logs under <code class="docutils literal notranslate"><span class="pre">~/umbp_single_node_results</span></code>. It is intended as a fast health check for DP+EP configurations.</p>
+</section>
+<section id="prerequisites">
+<h2>Prerequisites<a class="headerlink" href="#prerequisites" title="Link to this heading"></a></h2>
 <ul class="simple">
-<li><p>Python 3.10 or later</p></li>
-<li><p>ROCm 6.4 or later</p></li>
-<li><p>PyTorch with ROCm support</p></li>
-<li><p>AMD Instinct GPU (MI308X, MI300X, MI325X, MI355X)</p></li>
+<li><p>Access to the target node (for example <code class="docutils literal notranslate"><span class="pre">&lt;node-name&gt;</span></code>), including an active reservation if required by the cluster scheduler.</p></li>
+<li><p>Mori and SGLang checkouts on the node.</p></li>
+<li><p>Access to a checkpoint directory when running with real weights.</p></li>
+<li><p>Docker privileges on the node.</p></li>
 </ul>
 </section>
-<section id="installation-methods">
-<h2>Installation Methods<a class="headerlink" href="#installation-methods" title="Link to this heading"></a></h2>
-<section id="from-source">
-<h3>From Source<a class="headerlink" href="#from-source" title="Link to this heading"></a></h3>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Clone the repository</span>
-git<span class="w"> </span>clone<span class="w"> </span>--recursive<span class="w"> </span>https://github.com/ROCm/mori.git
-<span class="nb">cd</span><span class="w"> </span>mori
-
-<span class="c1"># Install PyTorch with ROCm support first</span>
-<span class="c1"># See https://pytorch.org for ROCm installation instructions</span>
-
-<span class="c1"># Build and install MORI</span>
-pip<span class="w"> </span>install<span class="w"> </span>.
-<span class="c1"># For venv build: pip install . --no-build-isolation</span>
-</pre></div>
-</div>
-<p>No hipcc is needed at install time — host code compiles with a standard C++
-compiler. GPU kernels are JIT-compiled on first use and cached to <code class="docutils literal notranslate"><span class="pre">~/.mori/jit/</span></code>.</p>
-<p>To manually precompile all kernels (e.g. in a Docker image build):</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">MORI_PRECOMPILE</span><span class="o">=</span><span class="m">1</span><span class="w"> </span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;import mori&quot;</span>
-</pre></div>
-</div>
+<section id="configuration-inputs">
+<h2>Configuration Inputs<a class="headerlink" href="#configuration-inputs" title="Link to this heading"></a></h2>
+<section id="script-constants">
+<h3>Script constants<a class="headerlink" href="#script-constants" title="Link to this heading"></a></h3>
+<p>The script declares a few host-specific defaults near the top. Update them before running if your environment differs.</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Variable</p></th>
+<th class="head"><p>Purpose</p></th>
+<th class="head"><p>Typical override</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">USER_HOME</span></code></p></td>
+<td><p>Home directory mounted into the container.</p></td>
+<td><p>Set to your <code class="docutils literal notranslate"><span class="pre">${HOME}</span></code> path on the node.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">NFS_BASE</span></code></p></td>
+<td><p>Base path containing the repositories.</p></td>
+<td><p>Point to the shared filesystem path that holds Mori and SGLang.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">EXTRA_MOUNTS</span></code></p></td>
+<td><p>Additional <code class="docutils literal notranslate"><span class="pre">docker</span> <span class="pre">run</span></code> bind mounts.</p></td>
+<td><p>Remove entries that do not exist or add the host paths you require.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">DOCKER_IMAGE</span></code></p></td>
+<td><p>ROCm container tag.</p></td>
+<td><p>Change if you need a different toolchain.</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="runtime-environment-variables">
+<h3>Runtime environment variables<a class="headerlink" href="#runtime-environment-variables" title="Link to this heading"></a></h3>
+<p>Export the variables below to adapt the run to your environment. The script reads these values at launch time.</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Variable</p></th>
+<th class="head"><p>Default in script</p></th>
+<th class="head"><p>When to change</p></th>
+<th class="head"><p>Example</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MODEL_PATH</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">/apps/data/models/DeepSeek-V3-0324</span></code></p></td>
+<td><p>Real checkpoint location.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">/apps/data/models/DeepSeek-V3-0324</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">SGLANG_REPO</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">${NFS_BASE}/sglang</span></code></p></td>
+<td><p>Local SGLang checkout.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">/apps/ditian12/sglang</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_REPO</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">${NFS_BASE}/mori</span></code></p></td>
+<td><p>Local Mori checkout.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">/apps/ditian12/mori</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">RESULTS_DIR</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">${USER_HOME}/umbp_single_node_results</span></code></p></td>
+<td><p>Where to store logs.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">/tmp/umbp_results</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ENABLE_DP</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">false</span></code></p></td>
+<td><p>Enable DP+EP mode.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">true</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">DP_SIZE</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">8</span></code></p></td>
+<td><p>Data parallel group size.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">4</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">EP_SIZE</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">8</span></code></p></td>
+<td><p>Expert parallel group size.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">2</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">TP_SIZE</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">8</span></code></p></td>
+<td><p>Tensor parallel group size.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">8</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">START_UMBP_MASTER</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">true</span></code></p></td>
+<td><p>Disable if you already manage the master.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">false</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">UMBP_MASTER_ADDRESS</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">127.0.0.1:15558</span></code></p></td>
+<td><p>Master listener address.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&lt;host-ip&gt;:15558</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">UMBP_NODE_ADDRESS</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">127.0.0.1</span></code></p></td>
+<td><p>IP advertised to clients.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&lt;node-ip&gt;</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">UMBP_IO_ENGINE_PORT</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">16000</span></code></p></td>
+<td><p>Hicache IO engine port.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">16010</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">UMBP_PEER_SERVICE_PORT</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">17000</span></code></p></td>
+<td><p>Peer service port.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">17010</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">UMBP_SSD_STAGING_BYTES</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">268435456</span></code> (256 MiB)</p></td>
+<td><p>Size of the dedicated remote-SSD read staging buffer. Allocated <strong>only</strong> when SSD is enabled (DRAM-only runs allocate nothing and are unaffected). Raise for large-KV models so each read slot fits one key’s value.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">268435456</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">USE_DUMMY_WEIGHTS</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">false</span></code></p></td>
+<td><p>Skip checkpoint validation.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">true</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MEM_FRACTION_STATIC</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">0.7</span></code></p></td>
+<td><p>Fraction reserved for static allocations.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">0.6</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">PROBE_MAX_TIME</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">300</span></code></p></td>
+<td><p>Timeout for probe request in seconds.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">600</span></code></p></td>
+</tr>
+</tbody>
+</table>
+<p>The script also respects <code class="docutils literal notranslate"><span class="pre">MORI_BRANCH</span></code>, <code class="docutils literal notranslate"><span class="pre">SGLANG_BRANCH</span></code>, and <code class="docutils literal notranslate"><span class="pre">MORI_PIP_FLAGS</span></code> if they are supplied.</p>
 </section>
 </section>
-<section id="environment-variables">
-<h2>Environment Variables<a class="headerlink" href="#environment-variables" title="Link to this heading"></a></h2>
-<p>Common environment variables:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Symmetric heap size (required for shmem/EP)</span>
-<span class="nb">export</span><span class="w"> </span><span class="nv">MORI_SHMEM_HEAP_SIZE</span><span class="o">=</span>6G
-
-<span class="c1"># Log verbosity</span>
-<span class="nb">export</span><span class="w"> </span><span class="nv">MORI_GLOBAL_LOG_LEVEL</span><span class="o">=</span>INFO<span class="w">  </span><span class="c1"># TRACE, DEBUG, INFO</span>
+<section id="launch-steps">
+<h2>Launch Steps<a class="headerlink" href="#launch-steps" title="Link to this heading"></a></h2>
+<ol class="arabic">
+<li><p><strong>SSH to the target node</strong>:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>ssh<span class="w"> </span>-o<span class="w"> </span><span class="nv">StrictHostKeyChecking</span><span class="o">=</span>no<span class="w"> </span>&lt;node-name&gt;
 </pre></div>
 </div>
+</li>
+<li><p><strong>Review script constants</strong>:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>sed<span class="w"> </span>-n<span class="w"> </span><span class="s1">&#39;1,120p&#39;</span><span class="w"> </span>run_umbp_single_node_hicache.sh
+</pre></div>
+</div>
+<p>Update <code class="docutils literal notranslate"><span class="pre">USER_HOME</span></code>, <code class="docutils literal notranslate"><span class="pre">NFS_BASE</span></code>, <code class="docutils literal notranslate"><span class="pre">EXTRA_MOUNTS</span></code>, and <code class="docutils literal notranslate"><span class="pre">DOCKER_IMAGE</span></code> if the defaults do not match your environment.</p>
+</li>
+<li><p><strong>Export runtime variables</strong> (fill placeholders with your values):</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">MODEL_PATH</span><span class="o">=</span>&lt;path-to-model-checkpoints&gt;
+<span class="nb">export</span><span class="w"> </span><span class="nv">SGLANG_REPO</span><span class="o">=</span>&lt;path-to-sglang&gt;
+<span class="nb">export</span><span class="w"> </span><span class="nv">MORI_REPO</span><span class="o">=</span>&lt;path-to-mori&gt;
+<span class="nb">export</span><span class="w"> </span><span class="nv">RESULTS_DIR</span><span class="o">=</span>&lt;path-for-results&gt;
+<span class="nb">export</span><span class="w"> </span><span class="nv">ENABLE_DP</span><span class="o">=</span>&lt;true<span class="p">|</span>false&gt;
+<span class="nb">export</span><span class="w"> </span><span class="nv">DP_SIZE</span><span class="o">=</span>&lt;dp-size&gt;
+<span class="nb">export</span><span class="w"> </span><span class="nv">EP_SIZE</span><span class="o">=</span>&lt;ep-size&gt;
+<span class="nb">export</span><span class="w"> </span><span class="nv">TP_SIZE</span><span class="o">=</span>&lt;tp-size&gt;
+<span class="nb">export</span><span class="w"> </span><span class="nv">START_UMBP_MASTER</span><span class="o">=</span><span class="nb">true</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">UMBP_NODE_ADDRESS</span><span class="o">=</span><span class="k">$(</span>hostname<span class="w"> </span>-I<span class="w"> </span><span class="p">|</span><span class="w"> </span>awk<span class="w"> </span><span class="s1">&#39;{print $1}&#39;</span><span class="k">)</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">USE_DUMMY_WEIGHTS</span><span class="o">=</span><span class="nb">false</span>
+</pre></div>
+</div>
+<p>Add any other overrides from the table above as needed.</p>
+</li>
+<li><p><strong>Run the script</strong> with the desired weight mode:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>bash<span class="w"> </span>run_umbp_single_node_hicache.sh<span class="w"> </span>--real-weights
+<span class="c1"># or</span>
+bash<span class="w"> </span>run_umbp_single_node_hicache.sh<span class="w"> </span>--use-dummy-weights
+</pre></div>
+</div>
+<p>The script will:</p>
+<ul class="simple">
+<li><p>Start or recycle the <code class="docutils literal notranslate"><span class="pre">umbp-single-node</span></code> container.</p></li>
+<li><p>Rebuild Mori with <code class="docutils literal notranslate"><span class="pre">BUILD_UMBP=ON</span></code> via <code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span></code>.</p></li>
+<li><p>Compute network interface settings for NCCL/Gloo.</p></li>
+<li><p>Launch the SGLang server with the configured parallelism values and hicache settings.</p></li>
+</ul>
+</li>
+<li><p><strong>Monitor the probe and cleanup</strong>:</p>
+<ul class="simple">
+<li><p>The script waits up to one hour for <code class="docutils literal notranslate"><span class="pre">http://127.0.0.1:30000/health</span></code> to report ready.</p></li>
+<li><p>It issues a probe request and stores the output in <code class="docutils literal notranslate"><span class="pre">${RESULTS_DIR}/probe_response.json</span></code>.</p></li>
+<li><p>On success, the script terminates the SGLang server and UMBP master, leaving artifacts in <code class="docutils literal notranslate"><span class="pre">${RESULTS_DIR}</span></code>.</p></li>
+</ul>
+</li>
+</ol>
 </section>
-<section id="verification">
-<h2>Verification<a class="headerlink" href="#verification" title="Link to this heading"></a></h2>
-<p>Verify the installation:</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">mori</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
-
-<span class="c1"># Check if modules loaded successfully</span>
-<span class="nb">print</span><span class="p">(</span><span class="s2">&quot;MORI modules available:&quot;</span><span class="p">)</span>
-<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  - mori.shmem: </span><span class="si">{</span><span class="nb">hasattr</span><span class="p">(</span><span class="n">mori</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;shmem&#39;</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
-<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  - mori.ops: </span><span class="si">{</span><span class="nb">hasattr</span><span class="p">(</span><span class="n">mori</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;ops&#39;</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
-<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  - mori.io: </span><span class="si">{</span><span class="nb">hasattr</span><span class="p">(</span><span class="n">mori</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;io&#39;</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
-<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  - mori.kernel_profiler: </span><span class="si">{</span><span class="nb">hasattr</span><span class="p">(</span><span class="n">mori</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;kernel_profiler&#39;</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
-
-<span class="c1"># Check ROCm availability via PyTorch</span>
-<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">PyTorch version: </span><span class="si">{</span><span class="n">torch</span><span class="o">.</span><span class="n">__version__</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
-<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;ROCm available: </span><span class="si">{</span><span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">()</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
-<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;ROCm version: </span><span class="si">{</span><span class="n">torch</span><span class="o">.</span><span class="n">version</span><span class="o">.</span><span class="n">hip</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="nb">hasattr</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">version</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;hip&#39;</span><span class="p">)</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="s1">&#39;N/A&#39;</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+<section id="core-dumps">
+<h2>Core Dumps<a class="headerlink" href="#core-dumps" title="Link to this heading"></a></h2>
+<p>By default the container routes crashes through Apport (<code class="docutils literal notranslate"><span class="pre">/usr/share/apport/apport</span></code>). If raw core files are required, disable Apport inside the container and set:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>sysctl<span class="w"> </span>-w<span class="w"> </span>kernel.core_pattern<span class="o">=</span>/nfs/users/&lt;user&gt;/cores/core.%e.%p
+<span class="nb">ulimit</span><span class="w"> </span>-c<span class="w"> </span>unlimited
 </pre></div>
 </div>
+<p>Make sure the directory exists and has enough space.</p>
 </section>
 <section id="troubleshooting">
 <h2>Troubleshooting<a class="headerlink" href="#troubleshooting" title="Link to this heading"></a></h2>
-<dl>
-<dt><strong>ImportError: No module named ‘mori’</strong></dt><dd><p>Ensure ROCm libraries are in your library path:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">LD_LIBRARY_PATH</span><span class="o">=</span>/opt/rocm/lib:<span class="nv">$LD_LIBRARY_PATH</span>
-</pre></div>
-</div>
-</dd>
-<dt><strong>RuntimeError: No AMD GPU found</strong></dt><dd><p>Verify GPU is accessible:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>rocm-smi
-rocminfo<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>gfx
-</pre></div>
-</div>
-</dd>
-</dl>
+<ul class="simple">
+<li><p><strong>Container launch</strong>: <code class="docutils literal notranslate"><span class="pre">docker</span> <span class="pre">ps</span></code> should show <code class="docutils literal notranslate"><span class="pre">umbp-single-node</span></code>. If it exits immediately, check <code class="docutils literal notranslate"><span class="pre">docker</span> <span class="pre">logs</span></code>.</p></li>
+<li><p><strong>Server logs</strong>: Available under <code class="docutils literal notranslate"><span class="pre">${RESULTS_DIR}/server_*.log</span></code>.</p></li>
+<li><p><strong>UMBP master logs</strong>: Saved alongside server logs when <code class="docutils literal notranslate"><span class="pre">START_UMBP_MASTER=true</span></code>.</p></li>
+<li><p><strong>Model validation</strong>: The script validates that <code class="docutils literal notranslate"><span class="pre">MODEL_PATH</span></code> contains <code class="docutils literal notranslate"><span class="pre">model-*.safetensors</span></code> when running with real weights.</p></li>
+<li><p><strong>Probe failures</strong>: Inspect the tail of the server log; the script prints it automatically on errors.</p></li>
+<li><p><strong>Remote SSD reads silently recompute (<code class="docutils literal notranslate"><span class="pre">size_too_large</span></code>)</strong>: A remote SSD read must fit a key’s whole value into one slot, where <code class="docutils literal notranslate"><span class="pre">per_slot</span> <span class="pre">=</span> <span class="pre">ssd_staging_buffer_size</span> <span class="pre">/</span> <span class="pre">ssd_staging_buffer_slots</span></code> (defaults 256 MiB / 16 = 16 MiB). The single-key page KV for an MLA model ≈ <code class="docutils literal notranslate"><span class="pre">page_size</span> <span class="pre">×</span> <span class="pre">(kv_lora_rank</span> <span class="pre">+</span> <span class="pre">qk_rope_head_dim)</span> <span class="pre">×</span> <span class="pre">dtype_bytes</span> <span class="pre">×</span> <span class="pre">num_layers</span></code> (DeepSeek-V3 5-layer ≈ 360 KB; full R1/V3 61-layer ≈ 4.5 MB). If <code class="docutils literal notranslate"><span class="pre">per_slot</span></code> is smaller, the read is dropped and the block is recomputed — requests don’t error, but <code class="docutils literal notranslate"><span class="pre">mori_umbp_ssd_read_total{status=&quot;size_too_large&quot;}</span></code> climbs and hit rate/throughput fall. Fix: raise <code class="docutils literal notranslate"><span class="pre">UMBP_SSD_STAGING_BYTES</span></code> or lower <code class="docutils literal notranslate"><span class="pre">ssd_staging_buffer_slots</span></code> so <code class="docutils literal notranslate"><span class="pre">per_slot</span> <span class="pre">≥</span></code> the single-key page KV. (<code class="docutils literal notranslate"><span class="pre">ssd_staging_buffer_size</span></code> is allocated only when SSD is enabled, separate from the general <code class="docutils literal notranslate"><span class="pre">staging_buffer_size</span></code>.)</p></li>
+</ul>
+<p>Refer back to this document whenever the single-node smoke test needs to be run or automated. For the original skill instructions see <code class="docutils literal notranslate"><span class="pre">/home/ditian12/.codex/skills/umbp-single-node-launcher/SKILL.md</span></code>.</p>
 </section>
 </section>
 
 
            </div>
           </div>
-          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
-        <a href="index.html" class="btn btn-neutral float-left" title="MORI Documentation" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
-        <a href="quickstart.html" class="btn btn-neutral float-right" title="Quickstart" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
-    </div>
+          <footer>
 
   <hr/>
 

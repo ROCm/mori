@@ -1,0 +1,1140 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="./">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MORI UMBP PD Disaggregation Benchmark &mdash; MORI 0.1.0 documentation</title>
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
+
+  
+      <script src="_static/jquery.js?v=5d32c60e"></script>
+      <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="_static/documentation_options.js?v=01f34227"></script>
+      <script src="_static/doctools.js?v=9bcbadda"></script>
+      <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search"  style="background: #C00000" >
+
+          
+          
+          <a href="index.html" class="icon icon-home">
+            MORI
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="installation.html">Installation</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#requirements">Requirements</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#installation-methods">Installation Methods</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="installation.html#from-source">From Source</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#environment-variables">Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#verification">Verification</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#troubleshooting">Troubleshooting</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="quickstart.html">Quickstart</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-ep-dispatch-and-combine">MORI-EP: Dispatch and Combine</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-io-point-to-point-transfers">MORI-IO: Point-to-Point Transfers</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-shmem-symmetric-memory">MORI Shmem: Symmetric Memory</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-ir-device-bitcode-for-gpu-kernels">MORI-IR: Device Bitcode for GPU Kernels</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#profiling-with-mori-viz">Profiling with MORI-VIZ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#next-steps">Next Steps</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">User Guides</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-EP-GUIDE.html">MORI-EP User Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#kernel-types">1. Kernel Types</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#configuration">2. Configuration</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#epdispatchcombineconfig">EpDispatchCombineConfig</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#operator-api">3. Operator API</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#epdispatchcombineop">EpDispatchCombineOp</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#dispatch">dispatch()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#combine">combine()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#split-dispatch-combine-send-recv">Split dispatch/combine (send + recv)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#reset">reset()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#get-dispatch-src-token-pos">get_dispatch_src_token_pos()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#get-registered-combine-input-buffer">get_registered_combine_input_buffer()</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#standard-moe-compatibility-deepep">4. Standard MoE Compatibility (DeepEP)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#dispatch-standard-moe">dispatch_standard_moe()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#combine-standard-moe">combine_standard_moe()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#convert-dispatch-output">convert_dispatch_output()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#convert-combine-input">convert_combine_input()</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#initialization">5. Initialization</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#method-1-pytorch-process-group-recommended">Method 1: PyTorch Process Group (Recommended)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#method-2-unique-id-no-pytorch-distributed">Method 2: Unique ID (No PyTorch Distributed)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#launch-configuration">6. Launch Configuration</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#manual-mode-default">Manual Mode (Default)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#auto-mode">Auto Mode</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#complete-example">7. Complete Example</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#environment-variables">8. Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#benchmarking">9. Benchmarking</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#intra-node">Intra-node</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#inter-node">Inter-node</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#reference-performance-deepseek-v3-config">Reference Performance (DeepSeek V3 config)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#tuning">10. Tuning</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#overview">Overview</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#tuning-config-files">Tuning Config Files</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#intra-node-tuning">Intra-node Tuning</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#inter-node-tuning">Inter-node Tuning</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#tuning-on-a-new-gpu-platform">Tuning on a New GPU Platform</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#profiling-with-mori-viz">11. Profiling with MORI-VIZ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#framework-integration">12. Framework Integration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#build-options">Build Options</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-SHMEM-GUIDE.html">MORI Shmem Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#concepts">1. Concepts</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#symmetric-memory">Symmetric Memory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#processing-element-pe">Processing Element (PE)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#symmetric-heap">Symmetric Heap</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#initialization">2. Initialization</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#method-1-pytorch-process-group-recommended">Method 1: PyTorch Process Group (Recommended)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#method-2-unique-id-no-pytorch-distributed">Method 2: Unique ID (No PyTorch Distributed)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#method-3-mpi-communicator-c-mpi-environments">Method 3: MPI Communicator (C++ / MPI environments)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#initialization-comparison">Initialization Comparison</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#finalization">Finalization</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#query-apis">3. Query APIs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#memory-management">4. Memory Management</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#allocating-symmetric-memory">Allocating Symmetric Memory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#freeing-symmetric-memory">Freeing Symmetric Memory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#registering-existing-buffers">Registering Existing Buffers</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#p2p-address-translation">5. P2P Address Translation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#synchronization">6. Synchronization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#hip-module-init-triton-integration">7. HIP Module Init (Triton Integration)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#initialization-flags">8. Initialization Flags</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#environment-variables">Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IR-GUIDE.html">MORI-IR Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#architecture">Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#host-side-python-api">1. Host-Side Python API</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#mori-ir-framework-agnostic"><code class="docutils literal notranslate"><span class="pre">mori.ir</span></code> (framework-agnostic)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#mori-ir-triton-triton-specific-reference-backend"><code class="docutils literal notranslate"><span class="pre">mori.ir.triton</span></code> (Triton-specific reference backend)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#device-bitcode">2. Device Bitcode</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#device-functions">3. Device Functions</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#query">Query</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#point-to-point">Point-to-Point</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#putnbi-thread-warp-block">PutNbi (Thread / Warp / Block)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#putnbi-with-signal">PutNbi with Signal</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#immediate-put">Immediate Put</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#atomics">Atomics</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#wait">Wait</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#synchronization">Synchronization</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#integration-example-triton">4. Integration Example: Triton</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#integration-example-raw-bitcode-no-framework">5. Integration Example: Raw Bitcode (no framework)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#bitcode-jit-compilation">6. Bitcode JIT Compilation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#examples">7. Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#testing">8. Testing</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#known-limitations">Known Limitations</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IO-GUIDE.html">MORI-IO Introduction</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#design-concepts">Design &amp; Concepts</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#workflow">Workflow</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#architecture">Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#python-api-quick-reference">Python API Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#example-basic-read-write">Example: Basic Read/Write</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#environment-configuration">Environment &amp; Configuration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="PROFILER.html">MORI-VIZ (Visualizer)</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#overview">Overview</a></li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#instrumentation">Instrumentation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#include-headers">1. Include Headers</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#define-profiler-context">2. Define Profiler Context</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#add-trace-points">3. Add Trace Points</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#build-code-generation">Build &amp; Code Generation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#enabling-the-profiler">Enabling the Profiler</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#code-generation">Code Generation</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#python-analysis">Python Analysis</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#device-side-elapsed-time-measurement">Device-side Elapsed Time Measurement</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#viewing-the-trace">Viewing the Trace</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#best-practices">Best Practices</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Benchmarks</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-EP-BENCHMARK.html">MORI-EP Benchmark</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#intra-node">Intra-node</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#profiling-intranode-kernels">Profiling intranode kernels</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#inter-node">Inter-node</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#nic-selection">NIC Selection</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#bandwidth-computation">Bandwidth Computation</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#rdma-bandwidth">RDMA bandwidth</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="MORI-EP-BENCHMARK.html#algo-bw-vs-physical-bw">Algo BW vs Physical BW</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#nvl-xgmi-bandwidth">NVL / XGMI bandwidth</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#why-deepep-and-mori-rdma-token-counts-are-equivalent">Why DeepEP and Mori RDMA token counts are equivalent</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#combine">Combine</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#reference-print-bw-values-py">Reference: <code class="docutils literal notranslate"><span class="pre">print_bw_values.py</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#profiling-internode-kernels">Profiling Internode Kernels</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#analyzing-traces-with-analyze-ep-kernel-trace-py">Analyzing traces with <code class="docutils literal notranslate"><span class="pre">analyze_ep_kernel_trace.py</span></code></a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IO-BENCHMARK.html">MORI-IO Benchmark</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#benchmark-commands">Benchmark Commands</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#benchmark-arguments">Benchmark Arguments</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#results-thor2-rdma-read">Results: Thor2 RDMA Read</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#results-thor2-rdma-write">Results: Thor2 RDMA Write</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#message-size-sweep">Message Size Sweep</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#batch-size-sweep">Batch Size Sweep</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#results-cx7-rdma-batch-size-1">Results: CX7 RDMA (Batch Size = 1)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#write">Write</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#read">Read</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="api/communication.html">Communication APIs</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-ep-expert-parallelism">MORI-EP (Expert Parallelism)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-shmem-symmetric-memory">MORI Shmem (Symmetric Memory)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-io-point-to-point-i-o">MORI-IO (Point-to-Point I/O)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-ir-device-bitcode-integration">MORI-IR (Device Bitcode Integration)</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="api/profiler.html">MORI-VIZ Kernel Profiler</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#requirements">Requirements</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#usage">Usage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#export-to-perfetto">export_to_perfetto</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#c-profiler-apis">C++ Profiler APIs</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="api/umbp.html">UMBP Master Client</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#starting-the-master-server">Starting the Master Server</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#umbptiertype">UMBPTierType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#umbpexternalkvnodematch">UMBPExternalKvNodeMatch</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#umbpmasterclient">UMBPMasterClient</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#cache-hit-tracking">Cache Hit Tracking</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="api/umbp.html#finding-hot-kv-blocks-the-typical-workflow">Finding hot KV blocks (the typical workflow)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="api/umbp.html#lifetime-cumulative-not-a-rate">Lifetime cumulative — not a rate</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#umbpexternalkvhitcountentry">UMBPExternalKvHitCountEntry</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#usage-examples">Usage Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#end-to-end-example">End-to-End Example</a></li>
+</ul>
+</li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu"  style="background: #C00000" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="index.html">MORI</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">MORI UMBP PD Disaggregation Benchmark</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="_sources/MORI-UMBP-PD-BENCHMARK.md.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="mori-umbp-pd-disaggregation-benchmark">
+<h1>MORI UMBP PD Disaggregation Benchmark<a class="headerlink" href="#mori-umbp-pd-disaggregation-benchmark" title="Link to this heading"></a></h1>
+<p>Runs a prefill-decode disaggregated serving benchmark using
+<a class="reference external" href="https://github.com/sgl-project/sglang">SGLang</a> with mori’s UMBP KV-cache transfer backend.</p>
+<p>This guide is <strong>xP1D-generic</strong>: N prefill nodes (N &gt;= 1) plus one decode node.
+The 1P1D case is just N=1; the 2P1D case is N=2. Set <code class="docutils literal notranslate"><span class="pre">PREFILL_NODES</span></code> /
+<code class="docutils literal notranslate"><span class="pre">PREFILL_IPS</span></code> to drive the topology — every step below loops over them.</p>
+<p>For the architecture this benchmark exercises (master-as-advisor,
+heartbeat-event index, peer-owned allocator), see
+<span class="xref myst"><code class="docutils literal notranslate"><span class="pre">src/umbp/doc/design-master-control-plane.md</span></code></span>.
+Every <code class="docutils literal notranslate"><span class="pre">UMBP_*</span></code> env var referenced below is documented in
+<span class="xref myst"><code class="docutils literal notranslate"><span class="pre">src/umbp/doc/runtime-env-vars.md</span></code></span>.</p>
+<section id="table-of-contents">
+<h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading"></a></h2>
+<ul class="simple">
+<li><p><a class="reference internal" href="#prerequisites"><span class="xref myst">Prerequisites</span></a></p></li>
+<li><p><a class="reference internal" href="#topology"><span class="xref myst">Topology</span></a></p></li>
+<li><p><a class="reference internal" href="#configuration"><span class="xref myst">Configuration</span></a></p></li>
+<li><p><a class="reference internal" href="#step-1--start-docker-on-all-nodes"><span class="xref myst">Step 1 — Start Docker on all nodes</span></a></p></li>
+<li><p><a class="reference internal" href="#step-2--start-grafana-and-prometheus"><span class="xref myst">Step 2 — Start Grafana and Prometheus</span></a></p></li>
+<li><p><a class="reference internal" href="#step-3--build-mori-on-all-nodes"><span class="xref myst">Step 3 — Build mori on all nodes</span></a></p></li>
+<li><p><a class="reference internal" href="#step-4--create-launcher-scripts"><span class="xref myst">Step 4 — Create launcher scripts</span></a></p></li>
+<li><p><a class="reference internal" href="#step-5--kill-stale-processes-and-launch-prefill"><span class="xref myst">Step 5 — Kill stale processes and launch prefill</span></a></p></li>
+<li><p><a class="reference internal" href="#step-6--wait-for-all-prefills-ready"><span class="xref myst">Step 6 — Wait for ALL prefills ready</span></a></p></li>
+<li><p><a class="reference internal" href="#step-7--launch-decode-and-benchmark"><span class="xref myst">Step 7 — Launch decode and benchmark</span></a></p></li>
+<li><p><a class="reference internal" href="#step-8--monitor-decode-and-benchmark"><span class="xref myst">Step 8 — Monitor decode and benchmark</span></a></p></li>
+<li><p><a class="reference internal" href="#step-9--show-results"><span class="xref myst">Step 9 — Show results</span></a></p></li>
+<li><p><a class="reference internal" href="#teardown"><span class="xref myst">Teardown</span></a></p></li>
+<li><p><a class="reference internal" href="#environment-variable-reference"><span class="xref myst">Environment Variable Reference</span></a></p></li>
+<li><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/nested.html#troubleshooting" title="PyTorch 2.12"><span class="xref myst">Troubleshooting</span></a></p></li>
+</ul>
+</section>
+<section id="prerequisites">
+<h2>Prerequisites<a class="headerlink" href="#prerequisites" title="Link to this heading"></a></h2>
+<ul class="simple">
+<li><p>N+1 nodes with ROCm-capable GPUs (8 GPUs per node, dp8ep8 topology):
+N prefill nodes + 1 decode node (N &gt;= 1)</p></li>
+<li><p>NFS mount shared between all nodes (for logs, results, and mori/sglang source)</p></li>
+<li><p>SSH key access from the local machine to all nodes</p></li>
+<li><p>Docker with ROCm image available on all nodes</p></li>
+<li><p>mori built with <code class="docutils literal notranslate"><span class="pre">UMBP=ON</span></code> (Step 3 below)</p></li>
+<li><p>SGLang checked out at <code class="docutils literal notranslate"><span class="pre">$NFS_BASE/sglang</span></code> with <code class="docutils literal notranslate"><span class="pre">benchmark/hicache/run_pd_disagg_bench_dp8ep8.sh</span></code>
+supporting both <code class="docutils literal notranslate"><span class="pre">PREFILL_URLS</span></code> (space-separated N prefill URLs) and the
+<code class="docutils literal notranslate"><span class="pre">wait_for_router_workers</span></code> gate (polls <code class="docutils literal notranslate"><span class="pre">/get_loads</span></code> after router is ready)</p></li>
+</ul>
+</section>
+<section id="topology">
+<h2>Topology<a class="headerlink" href="#topology" title="Link to this heading"></a></h2>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>┌──────────────────────────────────┐
+│       PREFILL NODE [0] (PRIMARY) │
+│                                  │
+│  SGLang prefill server :30000    │
+│  UMBP master           :15558  ◄────────────┐
+│  KV events publisher   :5557     │          │
+└──────────────────────────────────┘          │
+                                              │
+┌──────────────────────────────────┐          │   ┌──────────────────────────────────┐
+│       PREFILL NODE [i] (i&gt;=1)    │          │   │          DECODE NODE             │
+│  (only present when N &gt;= 2)      │          │   │                                  │
+│                                  │          │   │  SGLang decode server  :30001    │
+│  SGLang prefill server :30000    │          ├──►│  sglang_router         :8000     │
+│  UMBP_MASTER_AUTO_START=false  ──┼──────────┤   │  benchmark client            ────┼─► localhost:8000
+│  KV events publisher   :5557     │          │   │  UMBP_MASTER_AUTO_START=false ───┘
+└──────────────────────────────────┘          │   │  KV events publisher   :5557     │
+                                              │   │                                  │
+                                              │   │  Grafana       :3000             │
+                                              │   │  Prometheus    :9090             │
+                                              │   └──────────────────────────────────┘
+                                              │
+                                  (UMBP master discovery / dp-rank registry)
+</pre></div>
+</div>
+<p>All nodes share a <strong>single UMBP master</strong> that runs on <code class="docutils literal notranslate"><span class="pre">PREFILL_NODES[0]</span></code>
+(the primary prefill). The primary’s bench script auto-starts the master;
+all other prefills (i&gt;=1) and the decode node set
+<code class="docutils literal notranslate"><span class="pre">UMBP_MASTER_AUTO_START=false</span></code> and connect to it. With N prefills + 1 decode
+this means <code class="docutils literal notranslate"><span class="pre">(N+1)</span> <span class="pre">*</span> <span class="pre">8</span> <span class="pre">=</span> <span class="pre">8(N+1)</span></code> dp ranks all register with one master.</p>
+<p>The decode node hosts <code class="docutils literal notranslate"><span class="pre">sglang_router</span></code> (started by the bench script). The
+router fans out to all N prefills via repeated <code class="docutils literal notranslate"><span class="pre">--prefill</span></code> flags driven by
+the <code class="docutils literal notranslate"><span class="pre">PREFILL_URLS</span></code> env var.</p>
+</section>
+<section id="configuration">
+<h2>Configuration<a class="headerlink" href="#configuration" title="Link to this heading"></a></h2>
+<p>Define these variables once before running any step. All subsequent code blocks
+refer to them. <strong><code class="docutils literal notranslate"><span class="pre">PREFILL_NODES</span></code> and <code class="docutils literal notranslate"><span class="pre">PREFILL_IPS</span></code> are bash arrays of equal
+length</strong> — set one entry for 1P1D, two for 2P1D, N for xP1D.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># === Edit for your environment ===</span>
+<span class="nv">USER_HOME</span><span class="o">=</span><span class="s2">&quot;/home/youruser&quot;</span><span class="w">             </span><span class="c1"># home directory (same path on all nodes via NFS)</span>
+<span class="nv">NFS_BASE</span><span class="o">=</span><span class="s2">&quot;/nfs/users/youruser&quot;</span><span class="w">         </span><span class="c1"># NFS root containing sglang/ and mori/</span>
+<span class="nv">SSH_KEY</span><span class="o">=</span><span class="s2">&quot;</span><span class="nv">$USER_HOME</span><span class="s2">/.ssh/id_ed25519&quot;</span><span class="w">   </span><span class="c1"># SSH private key for node access</span>
+
+<span class="c1"># Prefill nodes (xP1D). Index 0 is the PRIMARY: it hosts the UMBP master and</span>
+<span class="c1"># must be started first. Indices 1..N-1 are SECONDARY: they connect to the</span>
+<span class="c1"># primary&#39;s master. Both arrays MUST have the same length.</span>
+<span class="c1">#</span>
+<span class="c1">#   1P1D example:</span>
+<span class="c1">#     PREFILL_NODES=(&quot;node-prefill-1&quot;)</span>
+<span class="c1">#     PREFILL_IPS=(&quot;10.x.x.1&quot;)</span>
+<span class="c1">#</span>
+<span class="c1">#   2P1D example:</span>
+<span class="c1">#     PREFILL_NODES=(&quot;node-prefill-1&quot; &quot;node-prefill-2&quot;)</span>
+<span class="c1">#     PREFILL_IPS=(&quot;10.x.x.1&quot; &quot;10.x.x.2&quot;)</span>
+<span class="nv">PREFILL_NODES</span><span class="o">=(</span><span class="s2">&quot;node-prefill-1&quot;</span><span class="o">)</span>
+<span class="nv">PREFILL_IPS</span><span class="o">=(</span><span class="s2">&quot;10.x.x.1&quot;</span><span class="o">)</span>
+
+<span class="nv">NODE_DECODE</span><span class="o">=</span><span class="s2">&quot;node-hostname-decode&quot;</span><span class="w">     </span><span class="c1"># decode node hostname</span>
+<span class="nv">IP_DECODE</span><span class="o">=</span><span class="s2">&quot;10.x.x.y&quot;</span><span class="w">                   </span><span class="c1"># decode node IP</span>
+
+<span class="c1"># Set to the image matching your AMD GPU platform, e.g.:</span>
+<span class="c1">#   MI300X / MI325X (gfx942): rocm/sgl-dev:vX.Y.Z-rocm7XX-mi30x-YYYYMMDD</span>
+<span class="c1">#   MI350X        (gfx950):   rocm/sgl-dev:vX.Y.Z-rocm7XX-mi35x-YYYYMMDD</span>
+<span class="nv">DOCKER_IMAGE</span><span class="o">=</span><span class="s2">&quot;rocm/sgl-dev:v0.5.9-rocm700-mi30x-20260316&quot;</span>
+
+<span class="c1"># Network interfaces — find with: ibstat | grep CA; ip link show</span>
+<span class="nv">NCCL_IB_HCA</span><span class="o">=</span><span class="s2">&quot;ionic_0,ionic_1,ionic_2,ionic_3,ionic_4,ionic_5,ionic_6,ionic_7&quot;</span>
+<span class="nv">NET_IFNAME</span><span class="o">=</span><span class="s2">&quot;ens14np0&quot;</span><span class="w">          </span><span class="c1"># TCP socket interface for GLOO/NCCL/MORI</span>
+<span class="nv">MORI_RDMA_DEVICES</span><span class="o">=</span><span class="s2">&quot;^mlx5_8&quot;</span><span class="w">   </span><span class="c1"># use ^ prefix to exclude; leave empty to use all devices</span>
+
+<span class="c1"># Benchmark parameters</span>
+<span class="nv">OUTPUT_LENGTH</span><span class="o">=</span><span class="m">100</span><span class="w">              </span><span class="c1"># decode output tokens per request</span>
+
+<span class="c1"># Extra Docker volume mounts (site-specific; clear if not needed)</span>
+<span class="nv">EXTRA_MOUNTS</span><span class="o">=</span><span class="s2">&quot;&quot;</span>
+<span class="c1"># Example: EXTRA_MOUNTS=&quot;-v /data/models:/models -v /apps:/apps&quot;</span>
+<span class="c1"># =================================</span>
+
+<span class="c1"># === Derived (do not edit) ===</span>
+<span class="c1"># Primary prefill: hosts the UMBP master.</span>
+<span class="nv">NODE_PREFILL_PRIMARY</span><span class="o">=</span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">PREFILL_NODES</span><span class="p">[0]</span><span class="si">}</span><span class="s2">&quot;</span>
+<span class="nv">IP_PREFILL_PRIMARY</span><span class="o">=</span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">PREFILL_IPS</span><span class="p">[0]</span><span class="si">}</span><span class="s2">&quot;</span>
+<span class="nv">N_PREFILLS</span><span class="o">=</span><span class="si">${#</span><span class="nv">PREFILL_NODES</span><span class="p">[@]</span><span class="si">}</span>
+
+<span class="c1"># Sanity check arrays are same length and non-empty.</span>
+<span class="k">if</span><span class="w"> </span><span class="o">((</span><span class="w"> </span><span class="nv">N_PREFILLS</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="m">0</span><span class="w"> </span><span class="o">))</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="o">((</span><span class="w"> </span>N_PREFILLS<span class="w"> </span>!<span class="o">=</span><span class="w"> </span><span class="si">${#</span><span class="nv">PREFILL_IPS</span><span class="p">[@]</span><span class="si">}</span><span class="w"> </span><span class="o">))</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">    </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;ERROR: PREFILL_NODES and PREFILL_IPS must be non-empty and same length&quot;</span><span class="w"> </span>&gt;<span class="p">&amp;</span><span class="m">2</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="m">2</span>&gt;/dev/null<span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="nb">exit</span><span class="w"> </span><span class="m">1</span>
+<span class="k">fi</span>
+
+<span class="nv">SSH</span><span class="o">=</span><span class="s2">&quot;ssh -o StrictHostKeyChecking=no -i </span><span class="nv">$SSH_KEY</span><span class="s2">&quot;</span>
+<span class="nv">SCP</span><span class="o">=</span><span class="s2">&quot;scp -o StrictHostKeyChecking=no -i </span><span class="nv">$SSH_KEY</span><span class="s2">&quot;</span>
+<span class="nv">CONTAINER</span><span class="o">=</span><span class="s2">&quot;umbp-pd-bench&quot;</span>
+<span class="nv">RESULTS_BASE</span><span class="o">=</span><span class="s2">&quot;</span><span class="nv">$NFS_BASE</span><span class="s2">/sglang/benchmark/hicache/results&quot;</span>
+
+<span class="c1"># All nodes (used by Steps 1, 3, Teardown).</span>
+<span class="nv">ALL_NODES</span><span class="o">=(</span><span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">PREFILL_NODES</span><span class="p">[@]</span><span class="si">}</span><span class="s2">&quot;</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$NODE_DECODE</span><span class="s2">&quot;</span><span class="w"> </span><span class="o">)</span>
+</pre></div>
+</div>
+</section>
+<section id="step-1-start-docker-on-all-nodes">
+<h2>Step 1 — Start Docker on all nodes<a class="headerlink" href="#step-1-start-docker-on-all-nodes" title="Link to this heading"></a></h2>
+<p>Loops over every prefill node plus the decode node.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="k">for</span><span class="w"> </span>NODE<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">ALL_NODES</span><span class="p">[@]</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">;</span><span class="w"> </span><span class="k">do</span>
+<span class="w">  </span><span class="nv">$SSH</span><span class="w"> </span><span class="nv">$NODE</span><span class="w"> </span><span class="s2">&quot;</span>
+<span class="s2">    docker rm -f </span><span class="nv">$CONTAINER</span><span class="s2"> 2&gt;/dev/null || true</span>
+<span class="s2">    docker run -d --name </span><span class="nv">$CONTAINER</span><span class="s2"> \</span>
+<span class="s2">      --ulimit memlock=-1:-1 --ulimit stack=67108864:67108864 \</span>
+<span class="s2">      --device /dev/dri --device /dev/kfd \</span>
+<span class="s2">      --network host --ipc host --group-add video \</span>
+<span class="s2">      --cap-add SYS_PTRACE --security-opt seccomp=unconfined --privileged \</span>
+<span class="s2">      -w </span><span class="nv">$NFS_BASE</span><span class="s2"> \</span>
+<span class="s2">      -v /nfs:/nfs \</span>
+<span class="s2">      -v </span><span class="nv">$USER_HOME</span><span class="s2">:</span><span class="nv">$USER_HOME</span><span class="s2"> \</span>
+<span class="s2">      </span><span class="nv">$EXTRA_MOUNTS</span><span class="s2"> \</span>
+<span class="s2">      --shm-size 32G \</span>
+<span class="s2">      </span><span class="nv">$DOCKER_IMAGE</span><span class="s2"> sleep infinity</span>
+<span class="s2">    docker ps --filter name=</span><span class="nv">$CONTAINER</span><span class="s2"> --format &#39;table {{.Names}}\t{{.Status}}&#39;&quot;</span><span class="w"> </span><span class="p">&amp;</span>
+<span class="k">done</span>
+<span class="nb">wait</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;Docker started on </span><span class="si">${#</span><span class="nv">ALL_NODES</span><span class="p">[@]</span><span class="si">}</span><span class="s2"> node(s)&quot;</span>
+</pre></div>
+</div>
+</section>
+<section id="step-2-start-grafana-and-prometheus">
+<h2>Step 2 — Start Grafana and Prometheus<a class="headerlink" href="#step-2-start-grafana-and-prometheus" title="Link to this heading"></a></h2>
+<p>Grafana and Prometheus run on the decode node. Dashboards are served from the
+mori and SGLang source trees on NFS.</p>
+<p>The Prometheus config is assembled locally so all N prefill targets can be
+folded into one scrape job, then piped over SSH to the decode node.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Build the multi-prefill targets list as YAML (nested under `- targets:`).</span>
+<span class="nv">PREFILL_TARGETS</span><span class="o">=</span><span class="s2">&quot;&quot;</span>
+<span class="k">for</span><span class="w"> </span>ip<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">PREFILL_IPS</span><span class="p">[@]</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">;</span><span class="w"> </span><span class="k">do</span>
+<span class="w">    </span><span class="nv">PREFILL_TARGETS</span><span class="o">+=</span><span class="s2">&quot;          - &#39;</span><span class="si">${</span><span class="nv">ip</span><span class="si">}</span><span class="s2">:30000&#39;&quot;</span><span class="s1">$&#39;\n&#39;</span>
+<span class="k">done</span>
+
+cat<span class="w"> </span>&gt;<span class="w"> </span>/tmp/pd_bench_prometheus.yml<span class="w"> </span><span class="s">&lt;&lt;EOF</span>
+<span class="s">global:</span>
+<span class="s">  scrape_interval: 5s</span>
+<span class="s">  evaluation_interval: 30s</span>
+
+<span class="s">scrape_configs:</span>
+<span class="s">  - job_name: sglang_prefill</span>
+<span class="s">    static_configs:</span>
+<span class="s">      - targets:</span>
+<span class="s">${PREFILL_TARGETS%$&#39;\n&#39;}</span>
+<span class="s">        labels:</span>
+<span class="s">          role: prefill</span>
+<span class="s">  - job_name: sglang_decode</span>
+<span class="s">    static_configs:</span>
+<span class="s">      - targets: [&#39;${IP_DECODE}:30001&#39;]</span>
+<span class="s">        labels:</span>
+<span class="s">          role: decode</span>
+<span class="s">  - job_name: umbp_master</span>
+<span class="s">    static_configs:</span>
+<span class="s">      - targets: [&#39;${IP_PREFILL_PRIMARY}:9091&#39;]</span>
+<span class="s">EOF</span>
+
+<span class="c1"># Push to the decode node.</span>
+<span class="nv">$SCP</span><span class="w"> </span>/tmp/pd_bench_prometheus.yml<span class="w"> </span><span class="nv">$NODE_DECODE</span>:/tmp/pd_bench_prometheus.yml
+
+<span class="nv">$SSH</span><span class="w"> </span><span class="nv">$NODE_DECODE</span><span class="w"> </span><span class="s2">&quot;</span>
+<span class="s2">  docker rm -f prometheus-pd 2&gt;/dev/null || true</span>
+<span class="s2">  docker run -d --name prometheus-pd \</span>
+<span class="s2">    --network host \</span>
+<span class="s2">    -v /tmp/pd_bench_prometheus.yml:/etc/prometheus/prometheus.yml:ro \</span>
+<span class="s2">    prom/prometheus:latest \</span>
+<span class="s2">    --config.file=/etc/prometheus/prometheus.yml \</span>
+<span class="s2">    --storage.tsdb.path=/prometheus</span>
+
+<span class="s2">  docker rm -f grafana-pd 2&gt;/dev/null || true</span>
+<span class="s2">  docker run -d --name grafana-pd \</span>
+<span class="s2">    --network host \</span>
+<span class="s2">    -v </span><span class="si">${</span><span class="nv">NFS_BASE</span><span class="si">}</span><span class="s2">/sglang/examples/monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro \</span>
+<span class="s2">    -v </span><span class="si">${</span><span class="nv">NFS_BASE</span><span class="si">}</span><span class="s2">/sglang/examples/monitoring/grafana/dashboards/config:/etc/grafana/provisioning/dashboards:ro \</span>
+<span class="s2">    -v </span><span class="si">${</span><span class="nv">NFS_BASE</span><span class="si">}</span><span class="s2">/sglang/examples/monitoring/grafana/dashboards/json:/var/lib/grafana/dashboards:ro \</span>
+<span class="s2">    -v </span><span class="si">${</span><span class="nv">NFS_BASE</span><span class="si">}</span><span class="s2">/mori/examples/monitoring/grafana/dashboards:/var/lib/grafana/mori_dashboards:ro \</span>
+<span class="s2">    -e GF_AUTH_ANONYMOUS_ENABLED=true \</span>
+<span class="s2">    -e GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer \</span>
+<span class="s2">    -e GF_AUTH_BASIC_ENABLED=false \</span>
+<span class="s2">    -e GF_USERS_ALLOW_SIGN_UP=false \</span>
+<span class="s2">    -e GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/sglang-dashboard.json \</span>
+<span class="s2">    grafana/grafana:latest</span>
+
+<span class="s2">  sleep 4</span>
+<span class="s2">  curl -sf http://localhost:9090/-/ready &amp;&amp; echo &#39;Prometheus: READY&#39; || echo &#39;Prometheus: NOT READY&#39;</span>
+<span class="s2">  curl -sf http://localhost:3000/api/health | python3 -c \&quot;import sys,json; d=json.load(sys.stdin); print(&#39;Grafana:&#39;, &#39;HEALTHY&#39; if d.get(&#39;database&#39;)==&#39;ok&#39; else &#39;NOT READY&#39;)\&quot; 2&gt;/dev/null || echo &#39;Grafana: NOT READY&#39;</span>
+<span class="s2">&quot;</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;=== Grafana:    http://</span><span class="si">${</span><span class="nv">IP_DECODE</span><span class="si">}</span><span class="s2">:3000 ===&quot;</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;=== Prometheus: http://</span><span class="si">${</span><span class="nv">IP_DECODE</span><span class="si">}</span><span class="s2">:9090 ===&quot;</span>
+</pre></div>
+</div>
+</section>
+<section id="step-3-build-mori-on-all-nodes">
+<h2>Step 3 — Build mori on all nodes<a class="headerlink" href="#step-3-build-mori-on-all-nodes" title="Link to this heading"></a></h2>
+<p>Clears the per-node build directory so cmake starts clean, then builds with UMBP enabled.
+Builds run in parallel across every prefill node and the decode node.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="k">for</span><span class="w"> </span>NODE<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">ALL_NODES</span><span class="p">[@]</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">;</span><span class="w"> </span><span class="k">do</span>
+<span class="w">  </span><span class="nv">$SSH</span><span class="w"> </span><span class="nv">$NODE</span><span class="w"> </span><span class="s2">&quot;docker exec </span><span class="nv">$CONTAINER</span><span class="s2"> bash -c &#39;</span>
+<span class="s2">    rm -rf </span><span class="si">${</span><span class="nv">NFS_BASE</span><span class="si">}</span><span class="s2">/mori/build_\$(hostname) &amp;&amp;</span>
+<span class="s2">    cd </span><span class="si">${</span><span class="nv">NFS_BASE</span><span class="si">}</span><span class="s2">/mori &amp;&amp; UMBP=ON bash build.sh&#39;&quot;</span><span class="w"> </span><span class="p">&amp;</span>
+<span class="k">done</span>
+<span class="nb">wait</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;mori builds done on </span><span class="si">${#</span><span class="nv">ALL_NODES</span><span class="p">[@]</span><span class="si">}</span><span class="s2"> node(s)&quot;</span>
+</pre></div>
+</div>
+</section>
+<section id="step-4-create-launcher-scripts">
+<h2>Step 4 — Create launcher scripts<a class="headerlink" href="#step-4-create-launcher-scripts" title="Link to this heading"></a></h2>
+<p>All launchers point at a single UMBP master on the primary prefill node
+(<code class="docutils literal notranslate"><span class="pre">${IP_PREFILL_PRIMARY}:15558</span></code>). Per-node behavior differs only on three
+variables:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Variable</p></th>
+<th class="head"><p>Primary prefill (i=0)</p></th>
+<th class="head"><p>Secondary prefill (i&gt;=1)</p></th>
+<th class="head"><p>Decode</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">UMBP_MASTER_AUTO_START</span></code></p></td>
+<td><p>(default true)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">false</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">false</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">UMBP_NODE_ADDRESS</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">${PREFILL_IPS[0]}</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">${PREFILL_IPS[i]}</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">${IP_DECODE}</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--role</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">prefill</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">prefill</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">decode</span></code></p></td>
+</tr>
+</tbody>
+</table>
+<p><code class="docutils literal notranslate"><span class="pre">UMBP_IO_ENGINE_PORT</span></code> and <code class="docutils literal notranslate"><span class="pre">UMBP_PEER_SERVICE_PORT</span></code> are required whenever
+<code class="docutils literal notranslate"><span class="pre">UMBP_MASTER_ADDRESS</span></code> is set. <code class="docutils literal notranslate"><span class="pre">UMBP_NODE_ADDRESS</span></code> must be unique per node so
+all <code class="docutils literal notranslate"><span class="pre">8</span> <span class="pre">*</span> <span class="pre">(N+1)</span></code> dp ranks register distinct identities in the master.</p>
+<blockquote>
+<div><p><strong>Note on <code class="docutils literal notranslate"><span class="pre">USE_DUMMY_WEIGHTS</span></code>:</strong> set to <code class="docutils literal notranslate"><span class="pre">true</span></code> below to skip loading real model
+weights, which speeds up startup and is useful for benchmarking transfer throughput.
+Set to <code class="docutils literal notranslate"><span class="pre">false</span></code> (or remove the variable) to run with actual weights.</p>
+</div></blockquote>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Helper that emits a prefill launcher for a given index.</span>
+<span class="c1"># Index 0 is primary (auto-starts the UMBP master); indices &gt;=1 connect to it.</span>
+emit_prefill_launcher<span class="o">()</span><span class="w"> </span><span class="o">{</span>
+<span class="w">    </span><span class="nb">local</span><span class="w"> </span><span class="nv">idx</span><span class="o">=</span><span class="s2">&quot;</span><span class="nv">$1</span><span class="s2">&quot;</span>
+<span class="w">    </span><span class="nb">local</span><span class="w"> </span><span class="nv">node_ip</span><span class="o">=</span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">PREFILL_IPS</span><span class="p">[</span><span class="nv">$idx</span><span class="p">]</span><span class="si">}</span><span class="s2">&quot;</span>
+<span class="w">    </span><span class="nb">local</span><span class="w"> </span><span class="nv">out</span><span class="o">=</span><span class="s2">&quot;/tmp/launch_pd_prefill_</span><span class="si">${</span><span class="nv">idx</span><span class="si">}</span><span class="s2">.sh&quot;</span>
+<span class="w">    </span><span class="nb">local</span><span class="w"> </span><span class="nv">extra_master_line</span><span class="o">=</span><span class="s2">&quot;&quot;</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="o">((</span><span class="w"> </span>idx<span class="w"> </span>&gt;<span class="w"> </span><span class="m">0</span><span class="w"> </span><span class="o">))</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">        </span><span class="nv">extra_master_line</span><span class="o">=</span><span class="s2">&quot;export UMBP_MASTER_AUTO_START=false&quot;</span>
+<span class="w">    </span><span class="k">fi</span>
+<span class="w">    </span>cat<span class="w"> </span>&gt;<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$out</span><span class="s2">&quot;</span><span class="w"> </span><span class="s">&lt;&lt; LAUNCHEOF</span>
+<span class="s">#!/bin/bash</span>
+<span class="s">export PYTHONPATH=${NFS_BASE}/mori/python:/sgl-workspace/aiter</span>
+<span class="s">export MC_IB_TC=96</span>
+<span class="s">export MORI_ENABLE_SDMA=0</span>
+<span class="s">export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=1800</span>
+<span class="s">export SGLANG_MORI_FP4_DISP=false</span>
+<span class="s">export SGLANG_MORI_FP8_DISP=true</span>
+<span class="s">export SGLANG_MORI_FP8_COMB=true</span>
+<span class="s">export SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=2048</span>
+<span class="s">export NCCL_IB_HCA=${NCCL_IB_HCA}</span>
+<span class="s">export GLOO_SOCKET_IFNAME=${NET_IFNAME}</span>
+<span class="s">export NCCL_SOCKET_IFNAME=${NET_IFNAME}</span>
+<span class="s">export MORI_SOCKET_IFNAME=${NET_IFNAME}</span>
+<span class="s">export MORI_RDMA_DEVICES=${MORI_RDMA_DEVICES}</span>
+<span class="s">export SGLANG_USE_AITER=1</span>
+<span class="s">export KV_CACHE_DTYPE=fp8_e4m3</span>
+<span class="s">export UMBP_MASTER_ADDRESS=${IP_PREFILL_PRIMARY}:15558</span>
+<span class="s">${extra_master_line}</span>
+<span class="s">export UMBP_NODE_ADDRESS=${node_ip}</span>
+<span class="s">export UMBP_MASTER_BIN=${NFS_BASE}/mori/build_\$(hostname)/src/umbp/umbp_master</span>
+<span class="s">export UMBP_IO_ENGINE_HOST=127.0.0.1</span>
+<span class="s">export UMBP_IO_ENGINE_PORT=16000</span>
+<span class="s">export UMBP_PEER_SERVICE_PORT=16001</span>
+<span class="s">export UMBP_CACHE_REMOTE_FETCHES=false</span>
+<span class="s">export ENABLE_KV_EVENTS=true</span>
+<span class="s">export KV_EVENTS_PUBLISHER=zmq</span>
+<span class="s">export KV_EVENTS_ENDPOINT=tcp://*:5557</span>
+<span class="s">export KV_EVENTS_TOPIC=</span>
+<span class="s">export USE_DUMMY_WEIGHTS=true</span>
+<span class="s">export MEM_FRACTION_STATIC=0.7</span>
+<span class="s">export MORI_GLOBAL_LOG_LEVEL=info</span>
+<span class="s">export MORI_LOG_FILE=${USER_HOME}/mori_prefill_${idx}.log</span>
+<span class="s">exec bash ${NFS_BASE}/sglang/benchmark/hicache/run_pd_disagg_bench_dp8ep8.sh --role prefill</span>
+<span class="s">LAUNCHEOF</span>
+<span class="w">    </span>chmod<span class="w"> </span>+x<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$out</span><span class="s2">&quot;</span>
+<span class="o">}</span>
+
+<span class="c1"># Build space-separated PREFILL_URLS list for the decode launcher.</span>
+<span class="c1"># The bench script&#39;s xP1D contract: pass each prefill URL once, separated by</span>
+<span class="c1"># a space. Bootstrap port is shared (DISAGG_BOOTSTRAP_PORT, default 8998).</span>
+<span class="nv">PREFILL_URLS_LIST</span><span class="o">=</span><span class="s2">&quot;&quot;</span>
+<span class="k">for</span><span class="w"> </span>ip<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">PREFILL_IPS</span><span class="p">[@]</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">;</span><span class="w"> </span><span class="k">do</span>
+<span class="w">    </span><span class="nv">PREFILL_URLS_LIST</span><span class="o">+=</span><span class="s2">&quot;http://</span><span class="si">${</span><span class="nv">ip</span><span class="si">}</span><span class="s2">:30000 &quot;</span>
+<span class="k">done</span>
+<span class="nv">PREFILL_URLS_LIST</span><span class="o">=</span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">PREFILL_URLS_LIST</span><span class="p">% </span><span class="si">}</span><span class="s2">&quot;</span><span class="w">   </span><span class="c1"># trim trailing space</span>
+
+cat<span class="w"> </span>&gt;<span class="w"> </span>/tmp/launch_pd_decode.sh<span class="w"> </span><span class="s">&lt;&lt; LAUNCHEOF</span>
+<span class="s">#!/bin/bash</span>
+<span class="s">export PYTHONPATH=${NFS_BASE}/mori/python:/sgl-workspace/aiter</span>
+<span class="s">export MC_IB_TC=96</span>
+<span class="s">export MORI_ENABLE_SDMA=0</span>
+<span class="s">export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=1800</span>
+<span class="s">export SGLANG_MORI_FP4_DISP=false</span>
+<span class="s">export SGLANG_MORI_FP8_DISP=true</span>
+<span class="s">export SGLANG_MORI_FP8_COMB=true</span>
+<span class="s">export SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=2048</span>
+<span class="s">export NCCL_IB_HCA=${NCCL_IB_HCA}</span>
+<span class="s">export GLOO_SOCKET_IFNAME=${NET_IFNAME}</span>
+<span class="s">export NCCL_SOCKET_IFNAME=${NET_IFNAME}</span>
+<span class="s">export MORI_SOCKET_IFNAME=${NET_IFNAME}</span>
+<span class="s">export MORI_RDMA_DEVICES=${MORI_RDMA_DEVICES}</span>
+<span class="s">export SGLANG_USE_AITER=1</span>
+<span class="s">export KV_CACHE_DTYPE=fp8_e4m3</span>
+<span class="s">export UMBP_MASTER_ADDRESS=${IP_PREFILL_PRIMARY}:15558</span>
+<span class="s">export UMBP_MASTER_AUTO_START=false</span>
+<span class="s">export UMBP_NODE_ADDRESS=${IP_DECODE}</span>
+<span class="s">export UMBP_MASTER_BIN=${NFS_BASE}/mori/build_\$(hostname)/src/umbp/umbp_master</span>
+<span class="s">export UMBP_IO_ENGINE_HOST=127.0.0.1</span>
+<span class="s">export UMBP_IO_ENGINE_PORT=16000</span>
+<span class="s">export UMBP_PEER_SERVICE_PORT=16001</span>
+<span class="s">export UMBP_CACHE_REMOTE_FETCHES=false</span>
+<span class="s">export ENABLE_KV_EVENTS=true</span>
+<span class="s">export KV_EVENTS_PUBLISHER=zmq</span>
+<span class="s">export KV_EVENTS_ENDPOINT=tcp://*:5557</span>
+<span class="s">export KV_EVENTS_TOPIC=</span>
+<span class="s">export USE_DUMMY_WEIGHTS=true</span>
+<span class="s">export MEM_FRACTION_STATIC=0.7</span>
+<span class="s">export OUTPUT_LENGTH=${OUTPUT_LENGTH}</span>
+<span class="s">export PREFILL_URLS=&quot;${PREFILL_URLS_LIST}&quot;</span>
+<span class="s">export MORI_GLOBAL_LOG_LEVEL=info</span>
+<span class="s">export MORI_LOG_FILE=${USER_HOME}/mori_decode.log</span>
+<span class="s">exec bash ${NFS_BASE}/sglang/benchmark/hicache/run_pd_disagg_bench_dp8ep8.sh --role decode</span>
+<span class="s">LAUNCHEOF</span>
+chmod<span class="w"> </span>+x<span class="w"> </span>/tmp/launch_pd_decode.sh
+
+<span class="c1"># Emit one prefill launcher per node and ship them.</span>
+<span class="k">for</span><span class="w"> </span>i<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="p">!PREFILL_NODES[@]</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">;</span><span class="w"> </span><span class="k">do</span>
+<span class="w">    </span>emit_prefill_launcher<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$i</span><span class="s2">&quot;</span>
+<span class="w">    </span><span class="nv">$SCP</span><span class="w"> </span><span class="s2">&quot;/tmp/launch_pd_prefill_</span><span class="si">${</span><span class="nv">i</span><span class="si">}</span><span class="s2">.sh&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">        </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">PREFILL_NODES</span><span class="p">[</span><span class="nv">$i</span><span class="p">]</span><span class="si">}</span><span class="s2">:</span><span class="si">${</span><span class="nv">USER_HOME</span><span class="si">}</span><span class="s2">/launch_pd_prefill.sh&quot;</span>
+<span class="k">done</span>
+<span class="nv">$SCP</span><span class="w"> </span>/tmp/launch_pd_decode.sh<span class="w"> </span><span class="nv">$NODE_DECODE</span>:<span class="nv">$USER_HOME</span>/launch_pd_decode.sh
+</pre></div>
+</div>
+</section>
+<section id="step-5-kill-stale-processes-and-launch-prefill">
+<h2>Step 5 — Kill stale processes and launch prefill<a class="headerlink" href="#step-5-kill-stale-processes-and-launch-prefill" title="Link to this heading"></a></h2>
+<p>Clears any leftover SGLang or UMBP master processes from a previous run on
+every node, then launches prefill nodes. Startup order matters:</p>
+<ol class="arabic simple">
+<li><p><strong>Primary first</strong> (<code class="docutils literal notranslate"><span class="pre">PREFILL_NODES[0]</span></code>) — its bench script auto-starts the
+shared UMBP master.</p></li>
+<li><p><strong>Secondaries</strong> (<code class="docutils literal notranslate"><span class="pre">PREFILL_NODES[1..N-1]</span></code>) — only after the master is up,
+since they connect to it with <code class="docutils literal notranslate"><span class="pre">UMBP_MASTER_AUTO_START=false</span></code>.</p></li>
+</ol>
+<p>For 1P1D, the secondaries loop is a no-op.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Stale-process cleanup on all nodes (parallel).</span>
+<span class="k">for</span><span class="w"> </span>NODE<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">ALL_NODES</span><span class="p">[@]</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">;</span><span class="w"> </span><span class="k">do</span>
+<span class="w">  </span><span class="nv">$SSH</span><span class="w"> </span><span class="nv">$NODE</span><span class="w"> </span><span class="s1">&#39;docker exec umbp-pd-bench bash -c &quot;</span>
+<span class="s1">    pkill -9 -f sglang 2&gt;/dev/null</span>
+<span class="s1">    pkill -9 -f umbp_master 2&gt;/dev/null</span>
+<span class="s1">    sleep 2</span>
+<span class="s1">    ss -tlnp | grep -E \&quot;:30000|:30001\&quot; || echo prefill_decode_ports_free&quot;&#39;</span><span class="w"> </span><span class="p">&amp;</span>
+<span class="k">done</span>
+<span class="nb">wait</span>
+
+<span class="c1"># Marker file used by Step 6/8 to filter out previous-run log dirs on NFS.</span>
+<span class="nv">RUN_START_MARKER</span><span class="o">=</span><span class="s2">&quot;/tmp/pd_bench_run_start&quot;</span>
+touch<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$RUN_START_MARKER</span><span class="s2">&quot;</span>
+
+<span class="c1"># 5a. Launch the PRIMARY prefill (auto-starts the UMBP master).</span>
+<span class="nv">$SSH</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$NODE_PREFILL_PRIMARY</span><span class="s2">&quot;</span><span class="w"> </span><span class="s2">&quot;docker exec -d </span><span class="nv">$CONTAINER</span><span class="s2"> bash -c \</span>
+<span class="s2">  &#39;bash </span><span class="nv">$USER_HOME</span><span class="s2">/launch_pd_prefill.sh &gt; </span><span class="nv">$USER_HOME</span><span class="s2">/pd_bench_prefill.log 2&gt;&amp;1&#39;&quot;</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;Primary prefill launched on </span><span class="nv">$NODE_PREFILL_PRIMARY</span><span class="s2">&quot;</span>
+
+<span class="c1"># 5b. Wait for the UMBP master to be reachable, then launch secondaries.</span>
+<span class="c1"># Secondaries fail fast if the master is not yet listening on :15558.</span>
+<span class="k">if</span><span class="w"> </span><span class="o">((</span><span class="w"> </span>N_PREFILLS<span class="w"> </span>&gt;<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="o">))</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">    </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;Waiting for UMBP master at </span><span class="si">${</span><span class="nv">IP_PREFILL_PRIMARY</span><span class="si">}</span><span class="s2">:15558...&quot;</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span>i<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="k">$(</span>seq<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="m">60</span><span class="k">)</span><span class="p">;</span><span class="w"> </span><span class="k">do</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="nv">$SSH</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$NODE_PREFILL_PRIMARY</span><span class="s2">&quot;</span><span class="w"> </span><span class="s2">&quot;ss -tlnp 2&gt;/dev/null | grep -q &#39;:15558&#39;&quot;</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">            </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;  UMBP master is listening (took </span><span class="si">${</span><span class="nv">i</span><span class="si">}</span><span class="s2">s window).&quot;</span>
+<span class="w">            </span><span class="k">break</span>
+<span class="w">        </span><span class="k">fi</span>
+<span class="w">        </span>sleep<span class="w"> </span><span class="m">5</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="o">((</span><span class="w"> </span><span class="nv">i</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="m">60</span><span class="w"> </span><span class="o">))</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">            </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;ERROR: UMBP master did not start within 5min — abort.&quot;</span><span class="w"> </span>&gt;<span class="p">&amp;</span><span class="m">2</span>
+<span class="w">            </span><span class="nb">exit</span><span class="w"> </span><span class="m">1</span>
+<span class="w">        </span><span class="k">fi</span>
+<span class="w">    </span><span class="k">done</span>
+
+<span class="w">    </span><span class="k">for</span><span class="w"> </span>i<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="k">$(</span>seq<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="k">$((</span><span class="nv">N_PREFILLS</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="m">1</span><span class="k">)))</span><span class="p">;</span><span class="w"> </span><span class="k">do</span>
+<span class="w">        </span><span class="nv">node</span><span class="o">=</span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">PREFILL_NODES</span><span class="p">[</span><span class="nv">$i</span><span class="p">]</span><span class="si">}</span><span class="s2">&quot;</span>
+<span class="w">        </span><span class="nv">$SSH</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$node</span><span class="s2">&quot;</span><span class="w"> </span><span class="s2">&quot;docker exec -d </span><span class="nv">$CONTAINER</span><span class="s2"> bash -c \</span>
+<span class="s2">          &#39;bash </span><span class="nv">$USER_HOME</span><span class="s2">/launch_pd_prefill.sh &gt; </span><span class="nv">$USER_HOME</span><span class="s2">/pd_bench_prefill.log 2&gt;&amp;1&#39;&quot;</span>
+<span class="w">        </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;Secondary prefill launched on </span><span class="nv">$node</span><span class="s2"> (idx </span><span class="nv">$i</span><span class="s2">)&quot;</span>
+<span class="w">    </span><span class="k">done</span>
+<span class="k">fi</span>
+</pre></div>
+</div>
+</section>
+<section id="step-6-wait-for-all-prefills-ready">
+<h2>Step 6 — Wait for ALL prefills ready<a class="headerlink" href="#step-6-wait-for-all-prefills-ready" title="Link to this heading"></a></h2>
+<p>Logs are on NFS, so they can be read directly without SSH or docker exec.
+For xP1D we wait until every prefill node’s <code class="docutils literal notranslate"><span class="pre">server_prefill.log</span></code> reports
+<code class="docutils literal notranslate"><span class="pre">fired</span> <span class="pre">up</span></code>. Logs from previous runs are excluded via the <code class="docutils literal notranslate"><span class="pre">RUN_START_MARKER</span></code>
+touched in Step 5.</p>
+<p>The loop polls every 5 seconds and prints incremental output every 30 seconds.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>sleep<span class="w"> </span><span class="m">10</span>
+<span class="nb">declare</span><span class="w"> </span>-A<span class="w"> </span>LAST_LINES
+<span class="k">for</span><span class="w"> </span>i<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="k">$(</span>seq<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="m">180</span><span class="k">)</span><span class="p">;</span><span class="w"> </span><span class="k">do</span>
+<span class="w">  </span><span class="c1"># Discover all server_prefill.log files newer than RUN_START_MARKER.</span>
+<span class="w">  </span>mapfile<span class="w"> </span>-t<span class="w"> </span>LOGS<span class="w"> </span>&lt;<span class="w"> </span>&lt;<span class="o">(</span>find<span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">RESULTS_BASE</span><span class="si">}</span><span class="s2">/pd_disagg_prefill&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">                        </span>-name<span class="w"> </span>server_prefill.log<span class="w"> </span>-newer<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$RUN_START_MARKER</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">                        </span><span class="m">2</span>&gt;/dev/null<span class="w"> </span><span class="p">|</span><span class="w"> </span>sort<span class="o">)</span>
+
+<span class="w">  </span><span class="c1"># Count READY logs.</span>
+<span class="w">  </span><span class="nv">READY_COUNT</span><span class="o">=</span><span class="m">0</span>
+<span class="w">  </span><span class="k">for</span><span class="w"> </span>LOG<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">LOGS</span><span class="p">[@]</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">;</span><span class="w"> </span><span class="k">do</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span>grep<span class="w"> </span>-q<span class="w"> </span><span class="s2">&quot;fired up&quot;</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$LOG</span><span class="s2">&quot;</span><span class="w"> </span><span class="m">2</span>&gt;/dev/null<span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">      </span><span class="nv">READY_COUNT</span><span class="o">=</span><span class="k">$((</span><span class="w"> </span><span class="nv">READY_COUNT</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="k">))</span>
+<span class="w">    </span><span class="k">fi</span>
+<span class="w">  </span><span class="k">done</span>
+
+<span class="w">  </span><span class="k">if</span><span class="w"> </span><span class="o">((</span><span class="w"> </span>READY_COUNT<span class="w"> </span>&gt;<span class="o">=</span><span class="w"> </span>N_PREFILLS<span class="w"> </span><span class="o">))</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">    </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;=== All </span><span class="si">${</span><span class="nv">N_PREFILLS</span><span class="si">}</span><span class="s2"> prefill(s) READY (iter </span><span class="nv">$i</span><span class="s2">) ===&quot;</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span>LOG<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">LOGS</span><span class="p">[@]</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">;</span><span class="w"> </span><span class="k">do</span>
+<span class="w">      </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;--- </span><span class="nv">$LOG</span><span class="s2"> (last 3) ---&quot;</span>
+<span class="w">      </span>tail<span class="w"> </span>-3<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$LOG</span><span class="s2">&quot;</span>
+<span class="w">    </span><span class="k">done</span>
+<span class="w">    </span><span class="k">break</span>
+<span class="w">  </span><span class="k">fi</span>
+
+<span class="w">  </span><span class="c1"># Surface fatal errors from any prefill log.</span>
+<span class="w">  </span><span class="nv">ERR_HIT</span><span class="o">=</span><span class="nb">false</span>
+<span class="w">  </span><span class="k">for</span><span class="w"> </span>LOG<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">LOGS</span><span class="p">[@]</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">;</span><span class="w"> </span><span class="k">do</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span>grep<span class="w"> </span>-qE<span class="w"> </span><span class="s2">&quot;^Traceback \(most recent|^[[:space:]]*(RuntimeError|AssertionError|ImportError):|CUDA error:|out of memory|Segmentation fault|core dumped|^Killed&quot;</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$LOG</span><span class="s2">&quot;</span><span class="w"> </span><span class="m">2</span>&gt;/dev/null<span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">      </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;=== ERROR in </span><span class="nv">$LOG</span><span class="s2"> (iter </span><span class="nv">$i</span><span class="s2">) ===&quot;</span>
+<span class="w">      </span>tail<span class="w"> </span>-60<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$LOG</span><span class="s2">&quot;</span>
+<span class="w">      </span><span class="nv">ERR_HIT</span><span class="o">=</span><span class="nb">true</span>
+<span class="w">      </span><span class="k">break</span>
+<span class="w">    </span><span class="k">fi</span>
+<span class="w">  </span><span class="k">done</span>
+<span class="w">  </span><span class="nv">$ERR_HIT</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="k">break</span>
+
+<span class="w">  </span><span class="c1"># Periodic incremental tail per log.</span>
+<span class="w">  </span><span class="k">if</span><span class="w"> </span><span class="o">((</span><span class="w"> </span>i<span class="w"> </span>%<span class="w"> </span><span class="nv">6</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="m">0</span><span class="w"> </span><span class="o">))</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">    </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;--- iter </span><span class="nv">$i</span><span class="s2">: </span><span class="si">${</span><span class="nv">READY_COUNT</span><span class="si">}</span><span class="s2">/</span><span class="si">${</span><span class="nv">N_PREFILLS</span><span class="si">}</span><span class="s2"> prefill(s) ready ---&quot;</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span>LOG<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">LOGS</span><span class="p">[@]</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">;</span><span class="w"> </span><span class="k">do</span>
+<span class="w">      </span><span class="nv">TOTAL</span><span class="o">=</span><span class="k">$(</span>wc<span class="w"> </span>-l<span class="w"> </span>&lt;<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$LOG</span><span class="s2">&quot;</span><span class="w"> </span><span class="m">2</span>&gt;/dev/null<span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="nb">echo</span><span class="w"> </span><span class="m">0</span><span class="k">)</span>
+<span class="w">      </span><span class="nv">LAST</span><span class="o">=</span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">LAST_LINES</span><span class="p">[</span><span class="nv">$LOG</span><span class="p">]</span><span class="k">:-</span><span class="nv">0</span><span class="si">}</span><span class="s2">&quot;</span>
+<span class="w">      </span><span class="k">if</span><span class="w"> </span><span class="o">((</span><span class="w"> </span>TOTAL<span class="w"> </span>&gt;<span class="w"> </span>LAST<span class="w"> </span><span class="o">))</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">        </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;  &gt;&gt;&gt; </span><span class="nv">$LOG</span><span class="s2"> (lines </span><span class="nv">$LAST</span><span class="s2"> -&gt; </span><span class="nv">$TOTAL</span><span class="s2">)&quot;</span>
+<span class="w">        </span>tail<span class="w"> </span>-n<span class="w"> </span>+<span class="s2">&quot;</span><span class="k">$((</span><span class="nv">LAST</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="m">1</span><span class="k">))</span><span class="s2">&quot;</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$LOG</span><span class="s2">&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>head<span class="w"> </span>-10
+<span class="w">        </span>LAST_LINES<span class="o">[</span><span class="nv">$LOG</span><span class="o">]=</span><span class="nv">$TOTAL</span>
+<span class="w">      </span><span class="k">fi</span>
+<span class="w">    </span><span class="k">done</span>
+<span class="w">  </span><span class="k">fi</span>
+
+<span class="w">  </span><span class="c1"># Wrapper logs on every prefill node — surface FATAL/FAILED early.</span>
+<span class="w">  </span><span class="nv">WRAP_HIT</span><span class="o">=</span><span class="nb">false</span>
+<span class="w">  </span><span class="k">for</span><span class="w"> </span>NODE<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">PREFILL_NODES</span><span class="p">[@]</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">;</span><span class="w"> </span><span class="k">do</span>
+<span class="w">    </span><span class="nv">WLOG</span><span class="o">=</span><span class="k">$(</span><span class="nv">$SSH</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$NODE</span><span class="s2">&quot;</span><span class="w"> </span><span class="s2">&quot;cat </span><span class="nv">$USER_HOME</span><span class="s2">/pd_bench_prefill.log 2&gt;/dev/null&quot;</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="nb">true</span><span class="k">)</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$WLOG</span><span class="s2">&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-qiE<span class="w"> </span><span class="s2">&quot;^\[.*\] FATAL|^\[.*\] FAILED&quot;</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">      </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;=== FATAL in wrapper log on </span><span class="nv">$NODE</span><span class="s2"> ===&quot;</span>
+<span class="w">      </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$WLOG</span><span class="s2">&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>tail<span class="w"> </span>-20
+<span class="w">      </span><span class="nv">WRAP_HIT</span><span class="o">=</span><span class="nb">true</span>
+<span class="w">      </span><span class="k">break</span>
+<span class="w">    </span><span class="k">fi</span>
+<span class="w">  </span><span class="k">done</span>
+<span class="w">  </span><span class="nv">$WRAP_HIT</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="k">break</span>
+
+<span class="w">  </span>sleep<span class="w"> </span><span class="m">5</span>
+<span class="k">done</span>
+</pre></div>
+</div>
+</section>
+<section id="step-7-launch-decode-and-benchmark">
+<h2>Step 7 — Launch decode and benchmark<a class="headerlink" href="#step-7-launch-decode-and-benchmark" title="Link to this heading"></a></h2>
+<p>Decode connects to the already-running UMBP master on the primary prefill
+node, and the bench script’s <code class="docutils literal notranslate"><span class="pre">sglang_router</span></code> fans out to all N prefills via
+<code class="docutils literal notranslate"><span class="pre">PREFILL_URLS</span></code>. The wrapper waits for all <code class="docutils literal notranslate"><span class="pre">N+1</span></code> workers to register on the
+router before starting the bench (timeout: <code class="docutils literal notranslate"><span class="pre">ROUTER_WORKER_READY_TIMEOUT_SECS</span></code>,
+default 180s).</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">$SSH</span><span class="w"> </span><span class="nv">$NODE_DECODE</span><span class="w"> </span><span class="s2">&quot;docker exec -d </span><span class="nv">$CONTAINER</span><span class="s2"> bash -c \</span>
+<span class="s2">  &#39;bash </span><span class="nv">$USER_HOME</span><span class="s2">/launch_pd_decode.sh &gt; </span><span class="nv">$USER_HOME</span><span class="s2">/pd_bench_decode.log 2&gt;&amp;1&#39;&quot;</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;Decode + benchmark launched (router will fan out to </span><span class="si">${</span><span class="nv">N_PREFILLS</span><span class="si">}</span><span class="s2"> prefill(s))&quot;</span>
+</pre></div>
+</div>
+</section>
+<section id="step-8-monitor-decode-and-benchmark">
+<h2>Step 8 — Monitor decode and benchmark<a class="headerlink" href="#step-8-monitor-decode-and-benchmark" title="Link to this heading"></a></h2>
+<p>Polls every 15 seconds. Prints incremental server log every 60 seconds.
+Exits when the benchmark reports completion or a fatal error is detected.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>sleep<span class="w"> </span><span class="m">10</span>
+<span class="nv">DECODE_READY</span><span class="o">=</span><span class="nb">false</span>
+<span class="nv">LAST</span><span class="o">=</span><span class="m">0</span>
+<span class="k">for</span><span class="w"> </span>i<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="k">$(</span>seq<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="m">720</span><span class="k">)</span><span class="p">;</span><span class="w"> </span><span class="k">do</span>
+<span class="w">  </span><span class="c1"># Filter out previous-run decode logs via RUN_START_MARKER from Step 5.</span>
+<span class="w">  </span><span class="nv">LOG</span><span class="o">=</span><span class="k">$(</span>find<span class="w"> </span><span class="si">${</span><span class="nv">RESULTS_BASE</span><span class="si">}</span>/pd_disagg_decode<span class="w"> </span>-name<span class="w"> </span>server_decode.log<span class="w"> </span><span class="se">\</span>
+<span class="w">          </span>-newer<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$RUN_START_MARKER</span><span class="s2">&quot;</span><span class="w"> </span><span class="m">2</span>&gt;/dev/null<span class="w"> </span><span class="p">|</span><span class="w"> </span>sort<span class="w"> </span>-r<span class="w"> </span><span class="p">|</span><span class="w"> </span>head<span class="w"> </span>-1<span class="k">)</span>
+<span class="w">  </span><span class="k">if</span><span class="w"> </span><span class="o">[[</span><span class="w"> </span>-n<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$LOG</span><span class="s2">&quot;</span><span class="w"> </span><span class="o">]]</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span>!<span class="w"> </span><span class="nv">$DECODE_READY</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>grep<span class="w"> </span>-q<span class="w"> </span><span class="s2">&quot;fired up&quot;</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$LOG</span><span class="s2">&quot;</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">      </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;--- Decode READY (iter </span><span class="nv">$i</span><span class="s2">), benchmark starting ---&quot;</span>
+<span class="w">      </span><span class="nv">DECODE_READY</span><span class="o">=</span><span class="nb">true</span>
+<span class="w">    </span><span class="k">fi</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span>grep<span class="w"> </span>-qE<span class="w"> </span><span class="s2">&quot;^Traceback \(most recent|^[[:space:]]*(RuntimeError|AssertionError|ImportError):|CUDA error:|out of memory|Segmentation fault|core dumped|^Killed&quot;</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$LOG</span><span class="s2">&quot;</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">      </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;=== ERROR in decode log (iter </span><span class="nv">$i</span><span class="s2">) ===&quot;</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>tail<span class="w"> </span>-60<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$LOG</span><span class="s2">&quot;</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="k">break</span>
+<span class="w">    </span><span class="k">fi</span>
+<span class="w">    </span><span class="nv">TOTAL</span><span class="o">=</span><span class="k">$(</span>wc<span class="w"> </span>-l<span class="w"> </span>&lt;<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$LOG</span><span class="s2">&quot;</span><span class="k">)</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="o">((</span><span class="w"> </span>i<span class="w"> </span>%<span class="w"> </span><span class="nv">4</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="m">0</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>TOTAL<span class="w"> </span>&gt;<span class="w"> </span>LAST<span class="w"> </span><span class="o">))</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">      </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;--- decode log update (iter </span><span class="nv">$i</span><span class="s2">, lines </span><span class="nv">$LAST</span><span class="s2">→</span><span class="nv">$TOTAL</span><span class="s2">) ---&quot;</span>
+<span class="w">      </span>tail<span class="w"> </span>-n<span class="w"> </span>+<span class="s2">&quot;</span><span class="k">$((</span><span class="nv">LAST</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="m">1</span><span class="k">))</span><span class="s2">&quot;</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$LOG</span><span class="s2">&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>head<span class="w"> </span>-15
+<span class="w">      </span><span class="nv">LAST</span><span class="o">=</span><span class="nv">$TOTAL</span>
+<span class="w">    </span><span class="k">fi</span>
+<span class="w">  </span><span class="k">fi</span>
+<span class="w">  </span><span class="nv">WLOG</span><span class="o">=</span><span class="k">$(</span><span class="nv">$SSH</span><span class="w"> </span><span class="nv">$NODE_DECODE</span><span class="w"> </span><span class="s2">&quot;cat </span><span class="nv">$USER_HOME</span><span class="s2">/pd_bench_decode.log 2&gt;/dev/null&quot;</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="nb">true</span><span class="k">)</span>
+<span class="w">  </span><span class="k">if</span><span class="w"> </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$WLOG</span><span class="s2">&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-q<span class="w"> </span><span class="s2">&quot;Benchmark finished in&quot;</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">    </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;=== Benchmark COMPLETE (iter </span><span class="nv">$i</span><span class="s2">) ===&quot;</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$WLOG</span><span class="s2">&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>tail<span class="w"> </span>-20<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="k">break</span>
+<span class="w">  </span><span class="k">fi</span>
+<span class="w">  </span><span class="k">if</span><span class="w"> </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$WLOG</span><span class="s2">&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-qiE<span class="w"> </span><span class="s2">&quot;^\[.*\] FATAL|SERVER_CRASH|^\[.*\] FAILED&quot;</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">    </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;=== FATAL in decode wrapper (iter </span><span class="nv">$i</span><span class="s2">) ===&quot;</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$WLOG</span><span class="s2">&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>tail<span class="w"> </span>-30
+<span class="w">    </span><span class="o">[[</span><span class="w"> </span>-n<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$LOG</span><span class="s2">&quot;</span><span class="w"> </span><span class="o">]]</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>tail<span class="w"> </span>-30<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$LOG</span><span class="s2">&quot;</span>
+<span class="w">    </span><span class="k">break</span>
+<span class="w">  </span><span class="k">fi</span>
+<span class="w">  </span>sleep<span class="w"> </span><span class="m">15</span>
+<span class="k">done</span>
+</pre></div>
+</div>
+</section>
+<section id="step-9-show-results">
+<h2>Step 9 — Show results<a class="headerlink" href="#step-9-show-results" title="Link to this heading"></a></h2>
+<p>For xP1D, all N prefill logs are listed (one per node). The
+<code class="docutils literal notranslate"><span class="pre">RUN_START_MARKER</span></code> filter ensures we only see this run’s logs.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;=== Prefill server logs (this run, last 20 each) ===&quot;</span>
+mapfile<span class="w"> </span>-t<span class="w"> </span>PLOGS<span class="w"> </span>&lt;<span class="w"> </span>&lt;<span class="o">(</span>find<span class="w"> </span><span class="si">${</span><span class="nv">RESULTS_BASE</span><span class="si">}</span>/pd_disagg_prefill<span class="w"> </span><span class="se">\</span>
+<span class="w">                       </span>-name<span class="w"> </span>server_prefill.log<span class="w"> </span>-newer<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$RUN_START_MARKER</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">                       </span><span class="m">2</span>&gt;/dev/null<span class="w"> </span><span class="p">|</span><span class="w"> </span>sort<span class="o">)</span>
+<span class="k">for</span><span class="w"> </span>LOG<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">PLOGS</span><span class="p">[@]</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">;</span><span class="w"> </span><span class="k">do</span>
+<span class="w">  </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;--- </span><span class="nv">$LOG</span><span class="s2"> ---&quot;</span>
+<span class="w">  </span>tail<span class="w"> </span>-20<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$LOG</span><span class="s2">&quot;</span>
+<span class="k">done</span>
+
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;=== Decode server log (last 20) ===&quot;</span>
+find<span class="w"> </span><span class="si">${</span><span class="nv">RESULTS_BASE</span><span class="si">}</span>/pd_disagg_decode<span class="w"> </span>-name<span class="w"> </span>server_decode.log<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-newer<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$RUN_START_MARKER</span><span class="s2">&quot;</span><span class="w"> </span><span class="m">2</span>&gt;/dev/null<span class="w"> </span><span class="p">|</span><span class="w"> </span>sort<span class="w"> </span>-r<span class="w"> </span><span class="p">|</span><span class="w"> </span>head<span class="w"> </span>-1<span class="w"> </span><span class="p">|</span><span class="w"> </span>xargs<span class="w"> </span>tail<span class="w"> </span>-20
+
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;=== Decode wrapper log (last 20) ===&quot;</span>
+<span class="nv">$SSH</span><span class="w"> </span><span class="nv">$NODE_DECODE</span><span class="w"> </span><span class="s2">&quot;tail -20 </span><span class="nv">$USER_HOME</span><span class="s2">/pd_bench_decode.log&quot;</span>
+
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;=== Summary ===&quot;</span>
+find<span class="w"> </span><span class="si">${</span><span class="nv">RESULTS_BASE</span><span class="si">}</span>/pd_disagg_decode<span class="w"> </span>-name<span class="w"> </span>summary.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-newer<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$RUN_START_MARKER</span><span class="s2">&quot;</span><span class="w"> </span><span class="m">2</span>&gt;/dev/null<span class="w"> </span><span class="p">|</span><span class="w"> </span>sort<span class="w"> </span>-r<span class="w"> </span><span class="p">|</span><span class="w"> </span>head<span class="w"> </span>-1<span class="w"> </span><span class="p">|</span><span class="w"> </span>xargs<span class="w"> </span>cat<span class="w"> </span><span class="m">2</span>&gt;/dev/null
+
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;=== Metrics ===&quot;</span>
+find<span class="w"> </span><span class="si">${</span><span class="nv">RESULTS_BASE</span><span class="si">}</span>/pd_disagg_decode<span class="w"> </span>-name<span class="w"> </span>performance_metrics.jsonl<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-newer<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$RUN_START_MARKER</span><span class="s2">&quot;</span><span class="w"> </span><span class="m">2</span>&gt;/dev/null<span class="w"> </span><span class="p">|</span><span class="w"> </span>sort<span class="w"> </span>-r<span class="w"> </span><span class="p">|</span><span class="w"> </span>head<span class="w"> </span>-1<span class="w"> </span><span class="p">|</span><span class="w"> </span>xargs<span class="w"> </span>tail<span class="w"> </span>-5<span class="w"> </span><span class="m">2</span>&gt;/dev/null
+</pre></div>
+</div>
+</section>
+<section id="teardown">
+<h2>Teardown<a class="headerlink" href="#teardown" title="Link to this heading"></a></h2>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="k">for</span><span class="w"> </span>NODE<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">ALL_NODES</span><span class="p">[@]</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">;</span><span class="w"> </span><span class="k">do</span>
+<span class="w">  </span><span class="nv">$SSH</span><span class="w"> </span><span class="nv">$NODE</span><span class="w"> </span><span class="s2">&quot;</span>
+<span class="s2">    docker exec </span><span class="nv">$CONTAINER</span><span class="s2"> bash -c &#39;pkill -9 -f sglang; pkill -9 -f umbp_master&#39; 2&gt;/dev/null || true</span>
+<span class="s2">    docker rm -f </span><span class="nv">$CONTAINER</span><span class="s2">&quot;</span><span class="w"> </span><span class="p">&amp;</span>
+<span class="k">done</span>
+<span class="nv">$SSH</span><span class="w"> </span><span class="nv">$NODE_DECODE</span><span class="w"> </span><span class="s2">&quot;docker rm -f prometheus-pd grafana-pd 2&gt;/dev/null || true&quot;</span><span class="w"> </span><span class="p">&amp;</span>
+<span class="nb">wait</span>
+</pre></div>
+</div>
+</section>
+<section id="environment-variable-reference">
+<h2>Environment Variable Reference<a class="headerlink" href="#environment-variable-reference" title="Link to this heading"></a></h2>
+<section id="topology-this-guide-s-wrapper-variables">
+<h3>Topology (this guide’s wrapper variables)<a class="headerlink" href="#topology-this-guide-s-wrapper-variables" title="Link to this heading"></a></h3>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Variable</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">PREFILL_NODES</span></code></p></td>
+<td><p>Bash array of prefill hostnames; index 0 is the <strong>primary</strong> (hosts the UMBP master). Length determines N in xP1D.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">PREFILL_IPS</span></code></p></td>
+<td><p>Bash array of prefill IPs; same length and order as <code class="docutils literal notranslate"><span class="pre">PREFILL_NODES</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">NODE_PREFILL_PRIMARY</span></code></p></td>
+<td><p>Derived: <code class="docutils literal notranslate"><span class="pre">${PREFILL_NODES[0]}</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">IP_PREFILL_PRIMARY</span></code></p></td>
+<td><p>Derived: <code class="docutils literal notranslate"><span class="pre">${PREFILL_IPS[0]}</span></code>; UMBP master listens on <code class="docutils literal notranslate"><span class="pre">${IP_PREFILL_PRIMARY}:15558</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">N_PREFILLS</span></code></p></td>
+<td><p>Derived: <code class="docutils literal notranslate"><span class="pre">${#PREFILL_NODES[&#64;]}</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">NODE_DECODE</span></code> / <code class="docutils literal notranslate"><span class="pre">IP_DECODE</span></code></p></td>
+<td><p>The single decode node.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ALL_NODES</span></code></p></td>
+<td><p>Derived: <code class="docutils literal notranslate"><span class="pre">(&quot;${PREFILL_NODES[&#64;]}&quot;</span> <span class="pre">&quot;$NODE_DECODE&quot;)</span></code>.</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="umbp-mori-consumed-by-run-pd-disagg-bench-dp8ep8-sh">
+<h3>UMBP / mori (consumed by <code class="docutils literal notranslate"><span class="pre">run_pd_disagg_bench_dp8ep8.sh</span></code>)<a class="headerlink" href="#umbp-mori-consumed-by-run-pd-disagg-bench-dp8ep8-sh" title="Link to this heading"></a></h3>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Variable</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">UMBP_MASTER_ADDRESS</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">host:port</span></code> of the shared UMBP master (always <code class="docutils literal notranslate"><span class="pre">${IP_PREFILL_PRIMARY}:15558</span></code>)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">UMBP_MASTER_AUTO_START</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">true</span></code> on the primary prefill (default); <code class="docutils literal notranslate"><span class="pre">false</span></code> on every secondary prefill and on decode</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">UMBP_NODE_ADDRESS</span></code></p></td>
+<td><p>This node’s IP — must be unique per node so all <code class="docutils literal notranslate"><span class="pre">8</span> <span class="pre">*</span> <span class="pre">(N+1)</span></code> dp ranks register distinct identities in the master</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">UMBP_MASTER_BIN</span></code></p></td>
+<td><p>Path to the <code class="docutils literal notranslate"><span class="pre">umbp_master</span></code> binary (per-node build directory)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">UMBP_IO_ENGINE_HOST</span></code></p></td>
+<td><p>Host for the local IO engine listener (always <code class="docutils literal notranslate"><span class="pre">127.0.0.1</span></code>)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">UMBP_IO_ENGINE_PORT</span></code></p></td>
+<td><p>Port for the local IO engine; required when <code class="docutils literal notranslate"><span class="pre">UMBP_MASTER_ADDRESS</span></code> is set</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">UMBP_PEER_SERVICE_PORT</span></code></p></td>
+<td><p>Port for peer-to-peer service; required when <code class="docutils literal notranslate"><span class="pre">UMBP_MASTER_ADDRESS</span></code> is set</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">UMBP_CACHE_REMOTE_FETCHES</span></code></p></td>
+<td><p>Set <code class="docutils literal notranslate"><span class="pre">false</span></code> to disable remote fetch caching during benchmarking</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">SGLANG_MORI_FP8_DISP</span></code></p></td>
+<td><p>Enable FP8 dispatch (reduces transfer size)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">SGLANG_MORI_FP8_COMB</span></code></p></td>
+<td><p>Enable FP8 combine</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_RDMA_DEVICES</span></code></p></td>
+<td><p>RDMA devices to use; prefix <code class="docutils literal notranslate"><span class="pre">^</span></code> to exclude (e.g., <code class="docutils literal notranslate"><span class="pre">^mlx5_8</span></code>)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_SOCKET_IFNAME</span></code></p></td>
+<td><p>Network interface for mori’s TCP socket</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">KV_CACHE_DTYPE</span></code></p></td>
+<td><p>KV cache dtype; <code class="docutils literal notranslate"><span class="pre">fp8_e4m3</span></code> recommended for transfer efficiency</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">KV_EVENTS_PUBLISHER</span></code></p></td>
+<td><p>KV event publisher backend (<code class="docutils literal notranslate"><span class="pre">zmq</span></code>)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">KV_EVENTS_ENDPOINT</span></code></p></td>
+<td><p>ZMQ endpoint for KV events (e.g., <code class="docutils literal notranslate"><span class="pre">tcp://*:5557</span></code>)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ENABLE_KV_EVENTS</span></code></p></td>
+<td><p>Enable KV event publishing</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">USE_DUMMY_WEIGHTS</span></code></p></td>
+<td><p>Skip loading real model weights (for throughput benchmarking)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MEM_FRACTION_STATIC</span></code></p></td>
+<td><p>Fraction of GPU memory reserved for static KV cache</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">OUTPUT_LENGTH</span></code></p></td>
+<td><p>Number of decode output tokens per request (decode node only)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">PREFILL_URLS</span></code></p></td>
+<td><p>Space-separated prefill URLs for the decode node’s <code class="docutils literal notranslate"><span class="pre">sglang_router</span></code> (e.g. <code class="docutils literal notranslate"><span class="pre">&quot;http://10.0.0.1:30000</span> <span class="pre">http://10.0.0.2:30000&quot;</span></code>); the bench script fans out one <code class="docutils literal notranslate"><span class="pre">--prefill</span></code> per entry</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">PREFILL_URL</span></code></p></td>
+<td><p>[DEPRECATED] Single-prefill shortcut (1P1D back-compat); folded into <code class="docutils literal notranslate"><span class="pre">PREFILL_URLS</span></code> if set</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ROUTER_WORKER_READY_TIMEOUT_SECS</span></code></p></td>
+<td><p>Max seconds the wrapper waits for all <code class="docutils literal notranslate"><span class="pre">N+1</span></code> workers to report <code class="docutils literal notranslate"><span class="pre">load</span> <span class="pre">&gt;=</span> <span class="pre">0</span></code> on <code class="docutils literal notranslate"><span class="pre">/get_loads</span></code> after the router is ready. Default <code class="docutils literal notranslate"><span class="pre">180</span></code>.</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+</section>
+<section id="troubleshooting">
+<h2>Troubleshooting<a class="headerlink" href="#troubleshooting" title="Link to this heading"></a></h2>
+<p><strong>SSH access denied on prefill node from local machine</strong></p>
+<p>Use the decode node as a jumphost to authorize your key on every prefill node.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">PUBKEY</span><span class="o">=</span><span class="k">$(</span>cat<span class="w"> </span><span class="nv">$USER_HOME</span>/.ssh/id_ed25519.pub<span class="k">)</span>
+<span class="k">for</span><span class="w"> </span>NODE<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">PREFILL_NODES</span><span class="p">[@]</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">;</span><span class="w"> </span><span class="k">do</span>
+<span class="w">  </span><span class="nv">$SSH</span><span class="w"> </span><span class="nv">$NODE_DECODE</span><span class="w"> </span><span class="s2">&quot;ssh -o StrictHostKeyChecking=no </span><span class="nv">$NODE</span><span class="s2"> \</span>
+<span class="s2">    \&quot;mkdir -p ~/.ssh &amp;&amp; echo &#39;</span><span class="nv">$PUBKEY</span><span class="s2">&#39; &gt;&gt; ~/.ssh/authorized_keys &amp;&amp; chmod 600 ~/.ssh/authorized_keys\&quot;&quot;</span>
+<span class="k">done</span>
+</pre></div>
+</div>
+<p><strong>Server fails to start / ImportError</strong></p>
+<p>Check <code class="docutils literal notranslate"><span class="pre">PYTHONPATH</span></code> includes both the mori Python bindings and aiter:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">PYTHONPATH</span><span class="o">=</span><span class="si">${</span><span class="nv">NFS_BASE</span><span class="si">}</span>/mori/python:/sgl-workspace/aiter
+</pre></div>
+</div>
+<p>The NFS copy of mori (<code class="docutils literal notranslate"><span class="pre">${NFS_BASE}/mori/python</span></code>) is authoritative. The
+docker-internal <code class="docutils literal notranslate"><span class="pre">/sgl-workspace/mori</span></code> may be an older version and should not
+be used.</p>
+<p><strong>Errors appear in the wrong log</strong></p>
+<p>Always check the actual SGLang server log, not the wrapper log:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Prefill</span>
+find<span class="w"> </span><span class="si">${</span><span class="nv">RESULTS_BASE</span><span class="si">}</span>/pd_disagg_prefill<span class="w"> </span>-name<span class="w"> </span>server_prefill.log<span class="w"> </span><span class="p">|</span><span class="w"> </span>sort<span class="w"> </span>-r<span class="w"> </span><span class="p">|</span><span class="w"> </span>head<span class="w"> </span>-1<span class="w"> </span><span class="p">|</span><span class="w"> </span>xargs<span class="w"> </span>tail<span class="w"> </span>-50
+
+<span class="c1"># Decode</span>
+find<span class="w"> </span><span class="si">${</span><span class="nv">RESULTS_BASE</span><span class="si">}</span>/pd_disagg_decode<span class="w"> </span>-name<span class="w"> </span>server_decode.log<span class="w"> </span><span class="p">|</span><span class="w"> </span>sort<span class="w"> </span>-r<span class="w"> </span><span class="p">|</span><span class="w"> </span>head<span class="w"> </span>-1<span class="w"> </span><span class="p">|</span><span class="w"> </span>xargs<span class="w"> </span>tail<span class="w"> </span>-50
+</pre></div>
+</div>
+<p><strong>Port already in use</strong></p>
+<p>Kill stale processes from a previous run (see Step 5) and verify the port is free.
+For xP1D, only the primary prefill is expected to be listening on <code class="docutils literal notranslate"><span class="pre">:15558</span></code> (UMBP master);
+secondary prefills should not be (they connect to the primary).</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="k">for</span><span class="w"> </span>NODE<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">PREFILL_NODES</span><span class="p">[@]</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">;</span><span class="w"> </span><span class="k">do</span>
+<span class="w">  </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;--- </span><span class="nv">$NODE</span><span class="s2"> ---&quot;</span>
+<span class="w">  </span><span class="nv">$SSH</span><span class="w"> </span><span class="nv">$NODE</span><span class="w"> </span><span class="s2">&quot;ss -tlnp | grep -E &#39;:30000|:15558|:16000|:16001&#39; || echo all_free&quot;</span>
+<span class="k">done</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;--- </span><span class="nv">$NODE_DECODE</span><span class="s2"> ---&quot;</span>
+<span class="nv">$SSH</span><span class="w"> </span><span class="nv">$NODE_DECODE</span><span class="w"> </span><span class="s2">&quot;ss -tlnp | grep -E &#39;:30001|:16000|:16001|:8000&#39; || echo all_free&quot;</span>
+</pre></div>
+</div>
+<p><strong>Bench progress freezes partway</strong></p>
+<p>If <code class="docutils literal notranslate"><span class="pre">bench_multiturn</span></code> sits at e.g. <code class="docutils literal notranslate"><span class="pre">4/8</span></code> for minutes with no new requests,
+check the decode wrapper log for <code class="docutils literal notranslate"><span class="pre">WARNING:</span> <span class="pre">router</span> <span class="pre">workers</span> <span class="pre">not</span> <span class="pre">all</span> <span class="pre">healthy</span></code>.
+That means <code class="docutils literal notranslate"><span class="pre">ROUTER_WORKER_READY_TIMEOUT_SECS</span></code> (default 180s) elapsed before
+all <code class="docutils literal notranslate"><span class="pre">N+1</span></code> workers registered, and the bench then raced a <code class="docutils literal notranslate"><span class="pre">503</span> <span class="pre">&quot;No</span> <span class="pre">decode</span> <span class="pre">workers</span> <span class="pre">available&quot;</span></code>. Increase the timeout and re-run:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">$SSH</span><span class="w"> </span><span class="nv">$NODE_DECODE</span><span class="w"> </span><span class="s2">&quot;docker exec </span><span class="nv">$CONTAINER</span><span class="s2"> bash -c \</span>
+<span class="s2">  &#39;ROUTER_WORKER_READY_TIMEOUT_SECS=300 bash </span><span class="nv">$USER_HOME</span><span class="s2">/launch_pd_decode.sh &gt; </span><span class="nv">$USER_HOME</span><span class="s2">/pd_bench_decode.log 2&gt;&amp;1&#39;&quot;</span>
+</pre></div>
+</div>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2026, AMD.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

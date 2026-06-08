@@ -277,6 +277,21 @@
 <li class="toctree-l2"><a class="reference internal" href="api/profiler.html#c-profiler-apis">C++ Profiler APIs</a></li>
 </ul>
 </li>
+<li class="toctree-l1"><a class="reference internal" href="api/umbp.html">UMBP Master Client</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#starting-the-master-server">Starting the Master Server</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#umbptiertype">UMBPTierType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#umbpexternalkvnodematch">UMBPExternalKvNodeMatch</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#umbpmasterclient">UMBPMasterClient</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#cache-hit-tracking">Cache Hit Tracking</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="api/umbp.html#finding-hot-kv-blocks-the-typical-workflow">Finding hot KV blocks (the typical workflow)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="api/umbp.html#lifetime-cumulative-not-a-rate">Lifetime cumulative — not a rate</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#umbpexternalkvhitcountentry">UMBPExternalKvHitCountEntry</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#usage-examples">Usage Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#end-to-end-example">End-to-End Example</a></li>
+</ul>
+</li>
 </ul>
 
         </div>
@@ -595,6 +610,9 @@
 </tr>
 </tbody>
 </table>
+<p>UMBP (the upper-layer cache pool) exposes a separate set of runtime-tunable
+env vars for distributed master / pool client / SPDK proxy timing. Those are
+out of scope for MORI-IO; see <span class="xref myst"><code class="docutils literal notranslate"><span class="pre">src/umbp/doc/runtime-env-vars.md</span></code></span>.</p>
 </section>
 <section id="source-files">
 <h2>Source Files<a class="headerlink" href="#source-files" title="Link to this heading"></a></h2>
