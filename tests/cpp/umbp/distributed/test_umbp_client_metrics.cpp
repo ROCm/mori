@@ -48,8 +48,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <initializer_list>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -66,17 +68,22 @@ namespace {
 static uint16_t AllocPort() {
   // Bind to :0 and let the kernel pick a free port, then close immediately.
   int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-  if (fd < 0) return 60400;
+  if (fd < 0) {
+    throw std::runtime_error("AllocPort socket() failed");
+  }
   struct sockaddr_in addr{};
   addr.sin_family = AF_INET;
   addr.sin_port = 0;
   addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   if (::bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0) {
     ::close(fd);
-    return 60400;
+    throw std::runtime_error("AllocPort bind() failed");
   }
   socklen_t len = sizeof(addr);
-  ::getsockname(fd, reinterpret_cast<struct sockaddr*>(&addr), &len);
+  if (::getsockname(fd, reinterpret_cast<struct sockaddr*>(&addr), &len) != 0) {
+    ::close(fd);
+    throw std::runtime_error("AllocPort getsockname() failed");
+  }
   ::close(fd);
   return ntohs(addr.sin_port);
 }
@@ -365,13 +372,27 @@ constexpr size_t kLocalBufSize = 8 << 20;
 class PoolClientLocalByteTrackingTest : public ::testing::Test {
  protected:
   void SetUp() override {
+    // Kernel-assigned ephemeral ports are expected to be plentiful in CI;
+    // bounded retries protect against pathological duplicate picks.
+    constexpr int kMaxPortAllocAttempts = 32;  // far above expected collision rate in CI
+    auto alloc_unique_port = [&](std::initializer_list<uint16_t> used) {
+      for (int attempt = 0; attempt < kMaxPortAllocAttempts; ++attempt) {
+        const uint16_t candidate = AllocPort();
+        bool duplicate = false;
+        for (const uint16_t port : used) {
+          if (candidate == port) {
+            duplicate = true;
+            break;
+          }
+        }
+        if (!duplicate) return candidate;
+      }
+      throw std::runtime_error("Failed to allocate unique test port");
+    };
+
     master_port_ = AllocPort();
-    do {
-      metrics_port_ = AllocPort();
-    } while (metrics_port_ == master_port_);
-    do {
-      io_port_ = AllocPort();
-    } while (io_port_ == master_port_ || io_port_ == metrics_port_);
+    metrics_port_ = alloc_unique_port({master_port_});
+    io_port_ = alloc_unique_port({master_port_, metrics_port_});
 
     buf_ = std::malloc(kLocalBufSize);
     src_ = std::malloc(kLocalPageSize);
