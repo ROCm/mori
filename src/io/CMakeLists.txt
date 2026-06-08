@@ -15,7 +15,10 @@ target_include_directories(mori_io PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_include_directories(mori_io PUBLIC ${CMAKE_SOURCE_DIR})
 target_include_directories(
   mori_io PUBLIC ${CMAKE_SOURCE_DIR}/3rdparty/msgpack-c/include)
-target_link_libraries(mori_io mori_application ibverbs hip::host mori_logging)
+# libibverbs is loaded at runtime via dlopen; embed the shim (hidden visibility)
+# so mori_io's own ibv_* references resolve without linking libibverbs.
+target_link_libraries(mori_io mori_application hip::host mori_logging
+                      mori_ibv_shim)
 target_compile_definitions(mori_io PUBLIC MSGPACK_NO_BOOST)
 set_target_properties(
   mori_io

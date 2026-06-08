@@ -21,7 +21,11 @@ add_executable(test_transport_ibverbs application/test_transport_ibverbs.cpp)
 target_include_directories(test_transport_ibverbs
                            PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_include_directories(test_transport_ibverbs PUBLIC ${CMAKE_SOURCE_DIR})
-target_link_libraries(test_transport_ibverbs mori_application)
+# This test calls libibverbs directly (e.g. ibv_get_cq_event); mori_application
+# no longer re-exports those symbols (they are dlopen'd internally). Link the
+# dlopen shim instead of the real libibverbs so BUILD_TESTS=ON does not
+# reintroduce a link-time dependency on a host without RDMA installed.
+target_link_libraries(test_transport_ibverbs mori_application mori_ibv_shim)
 
 if(BUILD_IO)
   add_executable(test_engine io/test_engine.cpp)

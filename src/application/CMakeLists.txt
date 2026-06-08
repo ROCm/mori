@@ -67,6 +67,20 @@ list(
   topology/pci.cpp
   topology/system.cpp)
 
+# libibverbs is loaded at runtime via dlopen (see ibv_shim.cpp), not linked. The
+# shim is built as an object library with hidden visibility so every mori shared
+# object that touches the verbs API embeds its own private copy and never
+# interposes a real libibverbs that may also be present in the process.
+add_library(mori_ibv_shim OBJECT transport/rdma/providers/ibverbs/ibv_shim.cpp)
+set_source_files_properties(transport/rdma/providers/ibverbs/ibv_shim.cpp
+                            PROPERTIES LANGUAGE CXX)
+target_include_directories(mori_ibv_shim PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(mori_ibv_shim PRIVATE mori_logging)
+target_link_libraries(mori_ibv_shim PRIVATE dl)
+target_compile_options(mori_ibv_shim PRIVATE -fvisibility=hidden
+                                             -fvisibility-inlines-hidden)
+set_target_properties(mori_ibv_shim PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 set_source_files_properties(${MORI_APP_SOURCES} PROPERTIES LANGUAGE CXX)
 add_library(mori_application SHARED ${MORI_APP_SOURCES})
 
@@ -76,14 +90,15 @@ find_library(ROCM_SMI_LIB rocm_smi64 HINTS /opt/rocm/lib REQUIRED)
 find_library(HSA_RUNTIME_LIB hsa-runtime64 HINTS /opt/rocm/lib REQUIRED)
 target_link_libraries(
   mori_application
-  PUBLIC ibverbs
-         hip::host
+  PUBLIC hip::host
          dl
          ${ROCM_SMI_LIB}
          pci
          mori_logging
          ${HSA_RUNTIME_LIB}
          hsakmt::hsakmt)
+# Embed the libibverbs dlopen shim (object library, hidden visibility).
+target_link_libraries(mori_application PRIVATE mori_ibv_shim)
 
 if(WITH_MPI)
   target_compile_definitions(mori_application PUBLIC MORI_WITH_MPI)

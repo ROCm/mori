@@ -515,7 +515,12 @@ ActiveDevicePortList GetActiveDevicePortList(const RdmaDeviceList& devices) {
 RdmaContext::RdmaContext(RdmaBackendType backendType) : backendType(backendType) {
   deviceList = ibv_get_device_list(&nums_device);
   MORI_APP_TRACE("ibv_get_device_list nums_device: {}", nums_device);
-  Initialize();
+  // ibv_get_device_list returns nullptr when libibverbs cannot be loaded (see
+  // ibv_shim.cpp) or device enumeration fails. Treat this the same as "no RDMA
+  // devices": leave rdmaDeviceList empty instead of dereferencing a null array
+  // in Initialize(). Single-node / intranode runs need no RDMA device and the
+  // upper layers already handle an empty list gracefully.
+  if (deviceList != nullptr) Initialize();
 }
 
 RdmaContext::~RdmaContext() {

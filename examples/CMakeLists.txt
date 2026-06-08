@@ -152,8 +152,8 @@ add_library(
 target_include_directories(
   mori_shmem_for_siof_static PUBLIC ${CMAKE_SOURCE_DIR}/include
                                     ${CMAKE_SOURCE_DIR})
-target_link_libraries(mori_shmem_for_siof_static
-                      PUBLIC mori_application mori_logging ibverbs hip::host)
+target_link_libraries(mori_shmem_for_siof_static PUBLIC mori_application
+                                                        mori_logging hip::host)
 
 add_executable(static_link_siof_test shmem/static_link_siof_test.cpp)
 
