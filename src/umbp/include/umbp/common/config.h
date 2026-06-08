@@ -21,17 +21,12 @@
 // SOFTWARE.
 #pragma once
 
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
-#include <map>
-#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
-
-#include "umbp/common/types.h"
 
 namespace mori::umbp {
 
@@ -48,7 +43,7 @@ enum class UMBPSsdLayoutMode : int {
 };
 
 enum class UMBPIoBackend : int {
-  PThread = 0,
+  Posix = 0,
   IoUring = 1,
 };
 
@@ -63,6 +58,12 @@ struct UMBPDramConfig {
   std::string shm_name = "/umbp_dram";
   double high_watermark = 0.9;
   double low_watermark = 0.7;
+
+  // Host memory options (ignored when use_shared_memory=true).
+  bool use_hugepages = false;
+  size_t hugepage_size = 2ULL * 1024 * 1024;  // 2 MiB
+  int numa_node = -1;                         // -1 = no NUMA binding
+  bool prefault = true;
 };
 
 struct UMBPIoConfig {
@@ -83,48 +84,21 @@ struct UMBPSsdConfig {
   size_t segment_size_bytes = 256ULL * 1024 * 1024;
   UMBPIoConfig io;
   UMBPDurabilityConfig durability;
-};
 
-struct UMBPEvictionConfig {
-  std::string policy = "lru";
-  size_t candidate_window = 16;
-  bool auto_promote_on_read = true;
-};
+  // Local SSD-tier capacity watermarks for the distributed PeerSsdManager's
+  // local eviction.  When used/total crosses high_watermark the owner
+  // peer evicts its oldest keys down to low_watermark.  Mirrors the DRAM tier's
+  // env-tunable convention (UMBP_DRAM_HIGH_WM / LOW_WM); NOT the master-side
+  // EvictionConfig (whose watermarks are intentionally not env-tunable).
+  double high_watermark = 0.9;
+  double low_watermark = 0.7;
 
-struct UMBPCopyPipelineConfig {
-  bool async_enabled = true;
-  size_t queue_depth = 4096;
-  size_t worker_threads = 2;
-  size_t batch_max_ops = 128;
-};
-
-// User-facing distributed configuration. Set UMBPConfig::distributed to enable
-// distributed mode. Internally translated to PoolClientConfig by UMBPClient.
-struct UMBPDistributedConfig {
-  std::string master_address;  // e.g. "master-host:50051"
-  std::string node_id;         // unique node identifier
-  std::string node_address;    // this node's reachable address for peers
-
-  bool auto_heartbeat = true;  // start heartbeat thread on Init
-
-  std::string io_engine_host;   // RDMA engine hostname
-  uint16_t io_engine_port = 0;  // RDMA engine port (0 = no RDMA)
-
-  size_t staging_buffer_size = 64ULL * 1024 * 1024;  // 64 MB
-
-  uint16_t peer_service_port = 0;  // gRPC peer service port
-
-  bool cache_remote_fetches = true;  // cache remotely-fetched blocks locally
-};
-
-struct UMBPConfig {
-  UMBPDramConfig dram;
-  UMBPSsdConfig ssd;
-  UMBPEvictionConfig eviction;
-  UMBPCopyPipelineConfig copy_pipeline;
-
-  // SPDK SSD tier configuration (only used when ssd_backend == "spdk")
-  std::string ssd_backend = "posix";      // "posix" or "spdk"
+  // SSD backend selection. "file" uses the segmented-log SSDTier; "spdk" /
+  // "spdk_proxy" use the SPDK NVMe path (direct SpdkSsdTier in standalone, or
+  // SpdkProxyTier when sharing the device across processes).  Kept here (rather
+  // than at UMBPConfig top level) so both the standalone LocalStorageManager and
+  // the distributed PeerSsdManager select the backend from the same config.
+  std::string ssd_backend = "file";       // "file", "spdk" or "spdk_proxy"
   std::string spdk_bdev_name;             // e.g. "Malloc0" or "NVMe0n1"
   std::string spdk_reactor_mask = "0x1";  // CPU core mask for SPDK reactors
   int spdk_mem_size_mb = 256;             // DPDK hugepage limit (MB)
@@ -145,6 +119,106 @@ struct UMBPConfig {
   bool spdk_proxy_allow_borrow = false;
   size_t spdk_proxy_reserved_shared_bytes = 0;
 
+  // Focused validation for the SSD tier alone (used by SSDTier, which depends
+  // on UMBPSsdConfig rather than the whole UMBPConfig).  UMBPConfig::Validate()
+  // remains the global validator.
+  bool Validate(std::string* error_message = nullptr) const {
+    // capacity_bytes == 0 is legal when SSD is not in use; only enforce sizing
+    // when the tier is actually enabled (mirrors UMBPConfig::Validate's
+    // `if (ssd.enabled)` gate).
+    if (!enabled) return true;
+    if (ssd_backend != "file" && ssd_backend != "spdk" && ssd_backend != "spdk_proxy" &&
+        ssd_backend != "dummy_storage") {
+      if (error_message)
+        *error_message = "ssd.ssd_backend must be one of: file, spdk, spdk_proxy, dummy_storage";
+      return false;
+    }
+    if (capacity_bytes == 0) {
+      if (error_message) *error_message = "ssd.capacity_bytes must be > 0";
+      return false;
+    }
+    if (segment_size_bytes == 0) {
+      if (error_message) *error_message = "ssd.segment_size_bytes must be > 0";
+      return false;
+    }
+    // Watermarks must satisfy 0 < low < high <= 1.  Fail fast on a misconfigured
+    // value rather than silently clamping (a clamp would hide the config error).
+    if (!(high_watermark > 0.0 && high_watermark <= 1.0 && low_watermark > 0.0 &&
+          low_watermark < high_watermark)) {
+      if (error_message)
+        *error_message = "ssd watermarks must satisfy 0 < low_watermark < high_watermark <= 1";
+      return false;
+    }
+    return true;
+  }
+};
+
+struct UMBPEvictionConfig {
+  std::string policy = "lru";
+  size_t candidate_window = 16;
+  bool auto_promote_on_read = true;
+};
+
+struct UMBPCopyPipelineConfig {
+  bool async_enabled = true;
+  size_t queue_depth = 4096;
+  size_t worker_threads = 2;
+  size_t batch_max_ops = 128;
+};
+
+// Master-control-plane client parameters.  Shared between user-facing
+// UMBPDistributedConfig and the internal PoolClientConfig/MasterClient.
+struct UMBPMasterClientConfig {
+  std::string master_address;  // e.g. "master-host:50051"
+  std::string node_id;         // unique node identifier
+  std::string node_address;    // this node's reachable address for peers
+  bool auto_heartbeat = true;  // start heartbeat thread on Init
+  // Opaque key=value strings forwarded to master on RegisterClient and
+  // attached to all metrics emitted for this node.  e.g. "sgl_role=prefill".
+  std::vector<std::string> tags;
+};
+
+// RDMA IO-engine endpoint parameters.
+struct UMBPIoEngineConfig {
+  std::string host;   // RDMA engine hostname (formerly UMBPDistributedConfig::io_engine_host)
+  uint16_t port = 0;  // RDMA engine port; 0 = OS-assigned ephemeral port (formerly io_engine_port)
+};
+
+// User-facing distributed configuration. Set UMBPConfig::distributed to enable
+// distributed mode. Internally translated to PoolClientConfig by DistributedClient.
+struct UMBPDistributedConfig {
+  UMBPMasterClientConfig master_config;
+  UMBPIoEngineConfig io_engine;
+
+  size_t staging_buffer_size = 64ULL * 1024 * 1024;  // 64 MB
+
+  // Dedicated SSD read staging, allocated only when ssd.enabled. Per-slot
+  // (this / ssd_staging_buffer_slots) must be >= the largest single-key page KV
+  // (61-layer MLA page ~= 4.5 MB).
+  size_t ssd_staging_buffer_size = 268435456;  // 256 MiB
+
+  // Remote SSD read staging slots; per-slot = ssd_staging_buffer_size / this.
+  int ssd_staging_buffer_slots = 16;
+
+  uint16_t peer_service_port = 0;  // gRPC peer service port
+
+  bool cache_remote_fetches = true;  // cache remotely-fetched blocks locally
+
+  // Page size used by Master's PageBitmapAllocator for this node's DRAM/HBM
+  // tier.  Reported via RegisterClient.  Same value applies to both DRAM
+  // and HBM.  Forwarded to PoolClientConfig::dram_page_size by
+  // DistributedClient unmodified.
+  // 0 = delegate to Master's ClientRegistryConfig::default_dram_page_size
+  // (2 MiB by default).  Set to an explicit byte count to override.
+  uint64_t dram_page_size = 0;
+};
+
+struct UMBPConfig {
+  UMBPDramConfig dram;
+  UMBPSsdConfig ssd;
+  UMBPEvictionConfig eviction;
+  UMBPCopyPipelineConfig copy_pipeline;
+
   // Role is the source of truth for runtime behavior.
   UMBPRole role = UMBPRole::Standalone;
 
@@ -153,8 +227,8 @@ struct UMBPConfig {
   bool follower_mode = false;
   bool force_ssd_copy_on_write = false;
 
-  // Optional distributed mode. When set, UMBPClient creates an internal
-  // PoolClient that connects to the Master and sends periodic heartbeats.
+  // Optional distributed mode. When set, DistributedClient wraps PoolClient
+  // that connects to the Master and sends periodic heartbeats.
   // nullopt (default) = local-only mode with no network dependencies.
   std::optional<UMBPDistributedConfig> distributed;
 
@@ -186,6 +260,11 @@ struct UMBPConfig {
         return false;
       }
     }
+    if (dram.use_hugepages && dram.hugepage_size != 0 &&
+        (dram.hugepage_size & (dram.hugepage_size - 1)) != 0) {
+      if (error_message) *error_message = "dram.hugepage_size must be a power of two";
+      return false;
+    }
     if (copy_pipeline.queue_depth == 0) {
       if (error_message) *error_message = "copy_pipeline.queue_depth must be > 0";
       return false;
@@ -198,22 +277,24 @@ struct UMBPConfig {
       if (error_message) *error_message = "copy_pipeline.batch_max_ops must be > 0";
       return false;
     }
-    if (spdk_proxy_max_channels == 0) {
-      if (error_message) *error_message = "spdk_proxy_max_channels must be > 0";
+    if (ssd.spdk_proxy_max_channels == 0) {
+      if (error_message) *error_message = "ssd.spdk_proxy_max_channels must be > 0";
       return false;
     }
     if (distributed.has_value()) {
       const auto& d = distributed.value();
-      if (d.master_address.empty()) {
-        if (error_message) *error_message = "distributed.master_address must not be empty";
+      if (d.master_config.master_address.empty()) {
+        if (error_message)
+          *error_message = "distributed.master_config.master_address must not be empty";
         return false;
       }
-      if (d.node_id.empty()) {
-        if (error_message) *error_message = "distributed.node_id must not be empty";
+      if (d.master_config.node_id.empty()) {
+        if (error_message) *error_message = "distributed.master_config.node_id must not be empty";
         return false;
       }
-      if (d.node_address.empty()) {
-        if (error_message) *error_message = "distributed.node_address must not be empty";
+      if (d.master_config.node_address.empty()) {
+        if (error_message)
+          *error_message = "distributed.master_config.node_address must not be empty";
         return false;
       }
     }
@@ -246,48 +327,55 @@ struct UMBPConfig {
     cfg.eviction.policy = getenv_str("UMBP_EVICTION_POLICY", cfg.eviction.policy);
     cfg.dram.high_watermark = getenv_double("UMBP_DRAM_HIGH_WM", cfg.dram.high_watermark);
     cfg.dram.low_watermark = getenv_double("UMBP_DRAM_LOW_WM", cfg.dram.low_watermark);
+    cfg.ssd.high_watermark = getenv_double("UMBP_SSD_HIGH_WM", cfg.ssd.high_watermark);
+    cfg.ssd.low_watermark = getenv_double("UMBP_SSD_LOW_WM", cfg.ssd.low_watermark);
+    cfg.dram.use_hugepages =
+        getenv_int("UMBP_DRAM_USE_HUGEPAGES", cfg.dram.use_hugepages ? 1 : 0) != 0;
+    cfg.dram.hugepage_size = getenv_size("UMBP_DRAM_HUGEPAGE_SIZE", cfg.dram.hugepage_size);
+    cfg.dram.numa_node = getenv_int("UMBP_DRAM_NUMA_NODE", cfg.dram.numa_node);
+    cfg.dram.prefault = getenv_int("UMBP_DRAM_PREFAULT", cfg.dram.prefault ? 1 : 0) != 0;
 
-    cfg.ssd_backend = getenv_str("UMBP_SSD_BACKEND", cfg.ssd_backend);
-    if (cfg.ssd_backend == "posix" && !std::getenv("UMBP_SSD_BACKEND") &&
+    cfg.ssd.ssd_backend = getenv_str("UMBP_SSD_BACKEND", cfg.ssd.ssd_backend);
+    if (cfg.ssd.ssd_backend == "file" && !std::getenv("UMBP_SSD_BACKEND") &&
         std::getenv("UMBP_SPDK_NVME_PCI")) {
-      cfg.ssd_backend = "spdk";
+      cfg.ssd.ssd_backend = "spdk";
     }
-    cfg.spdk_bdev_name = getenv_str("UMBP_SPDK_BDEV", cfg.spdk_bdev_name);
-    cfg.spdk_reactor_mask = getenv_str("UMBP_SPDK_REACTOR_MASK", cfg.spdk_reactor_mask);
-    cfg.spdk_mem_size_mb = getenv_int("UMBP_SPDK_MEM_MB", cfg.spdk_mem_size_mb);
-    cfg.spdk_nvme_pci_addr = getenv_str("UMBP_SPDK_NVME_PCI", cfg.spdk_nvme_pci_addr);
-    cfg.spdk_nvme_ctrl_name = getenv_str("UMBP_SPDK_NVME_CTRL", cfg.spdk_nvme_ctrl_name);
-    cfg.spdk_io_workers = getenv_int("UMBP_SPDK_IO_WORKERS", cfg.spdk_io_workers);
+    cfg.ssd.spdk_bdev_name = getenv_str("UMBP_SPDK_BDEV", cfg.ssd.spdk_bdev_name);
+    cfg.ssd.spdk_reactor_mask = getenv_str("UMBP_SPDK_REACTOR_MASK", cfg.ssd.spdk_reactor_mask);
+    cfg.ssd.spdk_mem_size_mb = getenv_int("UMBP_SPDK_MEM_MB", cfg.ssd.spdk_mem_size_mb);
+    cfg.ssd.spdk_nvme_pci_addr = getenv_str("UMBP_SPDK_NVME_PCI", cfg.ssd.spdk_nvme_pci_addr);
+    cfg.ssd.spdk_nvme_ctrl_name = getenv_str("UMBP_SPDK_NVME_CTRL", cfg.ssd.spdk_nvme_ctrl_name);
+    cfg.ssd.spdk_io_workers = getenv_int("UMBP_SPDK_IO_WORKERS", cfg.ssd.spdk_io_workers);
 
-    cfg.spdk_proxy_shm_name = getenv_str("UMBP_SPDK_PROXY_SHM", cfg.spdk_proxy_shm_name);
-    cfg.spdk_proxy_tenant_id = static_cast<uint32_t>(
-        getenv_int("UMBP_SPDK_PROXY_TENANT_ID", static_cast<int>(cfg.spdk_proxy_tenant_id)));
-    cfg.spdk_proxy_tenant_quota_bytes =
-        getenv_size("UMBP_SPDK_PROXY_TENANT_QUOTA_BYTES", cfg.spdk_proxy_tenant_quota_bytes);
+    cfg.ssd.spdk_proxy_shm_name = getenv_str("UMBP_SPDK_PROXY_SHM", cfg.ssd.spdk_proxy_shm_name);
+    cfg.ssd.spdk_proxy_tenant_id = static_cast<uint32_t>(
+        getenv_int("UMBP_SPDK_PROXY_TENANT_ID", static_cast<int>(cfg.ssd.spdk_proxy_tenant_id)));
+    cfg.ssd.spdk_proxy_tenant_quota_bytes =
+        getenv_size("UMBP_SPDK_PROXY_TENANT_QUOTA_BYTES", cfg.ssd.spdk_proxy_tenant_quota_bytes);
 
     const char* max_channels_env = std::getenv("UMBP_SPDK_PROXY_MAX_CHANNELS");
     if (!max_channels_env) max_channels_env = std::getenv("UMBP_SPDK_PROXY_MAX_RANKS");
     if (max_channels_env) {
-      cfg.spdk_proxy_max_channels = static_cast<uint32_t>(std::atoi(max_channels_env));
+      cfg.ssd.spdk_proxy_max_channels = static_cast<uint32_t>(std::atoi(max_channels_env));
     }
 
     const char* data_mb_env = std::getenv("UMBP_SPDK_PROXY_DATA_PER_CHANNEL_MB");
     if (!data_mb_env) data_mb_env = std::getenv("UMBP_SPDK_PROXY_DATA_MB");
     if (data_mb_env) {
-      cfg.spdk_proxy_data_per_channel_mb = static_cast<size_t>(std::stoull(data_mb_env));
+      cfg.ssd.spdk_proxy_data_per_channel_mb = static_cast<size_t>(std::stoull(data_mb_env));
     }
 
-    cfg.spdk_proxy_bin = getenv_str("UMBP_SPDK_PROXY_BIN", cfg.spdk_proxy_bin);
-    cfg.spdk_proxy_startup_timeout_ms =
-        getenv_int("UMBP_SPDK_PROXY_TIMEOUT_MS", cfg.spdk_proxy_startup_timeout_ms);
-    cfg.spdk_proxy_auto_start =
-        getenv_int("UMBP_SPDK_PROXY_AUTO_START", cfg.spdk_proxy_auto_start ? 1 : 0) != 0;
-    cfg.spdk_proxy_idle_exit_timeout_ms =
-        getenv_int("UMBP_SPDK_PROXY_IDLE_EXIT_TIMEOUT_MS", cfg.spdk_proxy_idle_exit_timeout_ms);
-    cfg.spdk_proxy_allow_borrow =
-        getenv_int("UMBP_SPDK_PROXY_ALLOW_BORROW", cfg.spdk_proxy_allow_borrow ? 1 : 0) != 0;
-    cfg.spdk_proxy_reserved_shared_bytes =
-        getenv_size("UMBP_SPDK_PROXY_RESERVED_SHARED_BYTES", cfg.spdk_proxy_reserved_shared_bytes);
+    cfg.ssd.spdk_proxy_bin = getenv_str("UMBP_SPDK_PROXY_BIN", cfg.ssd.spdk_proxy_bin);
+    cfg.ssd.spdk_proxy_startup_timeout_ms =
+        getenv_int("UMBP_SPDK_PROXY_TIMEOUT_MS", cfg.ssd.spdk_proxy_startup_timeout_ms);
+    cfg.ssd.spdk_proxy_auto_start =
+        getenv_int("UMBP_SPDK_PROXY_AUTO_START", cfg.ssd.spdk_proxy_auto_start ? 1 : 0) != 0;
+    cfg.ssd.spdk_proxy_idle_exit_timeout_ms =
+        getenv_int("UMBP_SPDK_PROXY_IDLE_EXIT_TIMEOUT_MS", cfg.ssd.spdk_proxy_idle_exit_timeout_ms);
+    cfg.ssd.spdk_proxy_allow_borrow =
+        getenv_int("UMBP_SPDK_PROXY_ALLOW_BORROW", cfg.ssd.spdk_proxy_allow_borrow ? 1 : 0) != 0;
+    cfg.ssd.spdk_proxy_reserved_shared_bytes = getenv_size(
+        "UMBP_SPDK_PROXY_RESERVED_SHARED_BYTES", cfg.ssd.spdk_proxy_reserved_shared_bytes);
 
     std::string role_str = getenv_str("UMBP_ROLE", "");
     if (role_str == "leader")
@@ -311,60 +399,6 @@ struct UMBPConfig {
 
     return cfg;
   }
-};
-
-// Forward declarations for strategy interfaces used by MasterServerConfig.
-class RouteGetStrategy;
-class RoutePutStrategy;
-
-// --- Distributed config structs ---
-
-struct ClientRegistryConfig {
-  std::chrono::seconds heartbeat_ttl{10};
-  std::chrono::seconds reaper_interval{5};
-  std::chrono::seconds allocation_ttl{30};
-  uint32_t max_missed_heartbeats = 3;
-};
-
-struct MasterClientConfig {
-  std::string master_address;
-  std::string node_id;
-  std::string node_address;
-  bool auto_heartbeat = true;
-};
-
-struct MasterServerConfig {
-  std::string listen_address = "0.0.0.0:50051";
-  ClientRegistryConfig registry_config;
-
-  std::unique_ptr<RouteGetStrategy> get_strategy;
-  std::unique_ptr<RoutePutStrategy> put_strategy;
-};
-
-struct ExportableDram {
-  void* buffer = nullptr;
-  size_t size = 0;
-};
-
-struct ExportableSsd {
-  std::string dir;
-  size_t capacity = 0;
-};
-
-struct PoolClientConfig {
-  MasterClientConfig master_config;
-
-  std::string io_engine_host;
-  uint16_t io_engine_port = 0;
-
-  size_t staging_buffer_size = 64ULL * 1024 * 1024;
-
-  std::vector<ExportableDram> dram_buffers;
-  std::vector<ExportableSsd> ssd_stores;
-
-  std::map<TierType, TierCapacity> tier_capacities;
-
-  uint16_t peer_service_port = 0;
 };
 
 }  // namespace mori::umbp

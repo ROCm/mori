@@ -24,7 +24,7 @@
 #include <string>
 #include <vector>
 
-#include "umbp/common/types.h"
+#include "umbp/distributed/types.h"
 
 namespace mori::umbp {
 
@@ -44,6 +44,15 @@ class RouteGetStrategy {
 /// Default strategy: uniform random selection among replicas.
 /// Uses thread_local RNG — no contention under concurrent calls.
 class RandomRouteGetStrategy : public RouteGetStrategy {
+ public:
+  Location Select(const std::vector<Location>& locations, const std::string& node_id) override;
+};
+
+/// Tier-priority strategy: prefer the fastest tier present (HBM > DRAM > SSD),
+/// then pick a random replica within that tier.  This is the distributed read
+/// path's default — without it a key with both a DRAM and an SSD copy could be
+/// routed to the slow SSD at random.  Unknown-tier locations rank last.
+class TierPriorityRouteGetStrategy : public RouteGetStrategy {
  public:
   Location Select(const std::vector<Location>& locations, const std::string& node_id) override;
 };

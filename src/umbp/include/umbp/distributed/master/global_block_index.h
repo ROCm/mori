@@ -21,24 +21,62 @@
 // SOFTWARE.
 #pragma once
 
+#include <atomic>
+#include <chrono>
 #include <optional>
+#include <set>
 #include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
-#include <utility>
+#include <unordered_set>
 #include <vector>
 
-#include "umbp/common/types.h"
+#include "umbp/distributed/types.h"
 
 namespace mori::umbp {
-
-class ClientRegistry;
 
 struct BlockEntry {
   std::vector<Location> locations;
   BlockMetrics metrics;
+
+  std::atomic<int64_t> lease_expiry_rep{0};
+  std::atomic<int64_t> last_accessed_rep{0};
+  std::atomic<uint64_t> atomic_access_count{0};
+
+  void GrantLease(std::chrono::steady_clock::duration duration) {
+    auto expiry = std::chrono::steady_clock::now() + duration;
+    lease_expiry_rep.store(expiry.time_since_epoch().count(), std::memory_order_release);
+  }
+
+  bool IsLeased() const {
+    auto now_rep = std::chrono::steady_clock::now().time_since_epoch().count();
+    return lease_expiry_rep.load(std::memory_order_acquire) > now_rep;
+  }
+
+  void RecordAccessAtomic() {
+    last_accessed_rep.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+                            std::memory_order_release);
+    atomic_access_count.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  std::chrono::steady_clock::time_point GetLastAccessed() const {
+    auto rep = last_accessed_rep.load(std::memory_order_acquire);
+    return std::chrono::steady_clock::time_point(std::chrono::steady_clock::duration(rep));
+  }
 };
 
+struct EvictionCandidate {
+  std::string key;
+  Location location;
+  std::chrono::steady_clock::time_point last_accessed_at;
+  uint64_t size;
+};
+
+// Master-side projection of every peer's owned-key set.  In the
+// master-as-advisor design this index is *only* mutated through the
+// event-shipping heartbeat — there are no per-Put or per-Eviction
+// master RPCs.  Routing and eviction read from here.
 class GlobalBlockIndex {
  public:
   GlobalBlockIndex() = default;
@@ -47,34 +85,65 @@ class GlobalBlockIndex {
   GlobalBlockIndex(const GlobalBlockIndex&) = delete;
   GlobalBlockIndex& operator=(const GlobalBlockIndex&) = delete;
 
-  void SetClientRegistry(ClientRegistry* registry);
+  // --- Mutators (event-driven only) ---
 
-  // --- Mutators ---
-  void Register(const std::string& node_id, const std::string& key, const Location& location);
+  // Apply one peer's heartbeat-shipped event batch.  Returns the count
+  // of location mutations.  ADD with a (node_id, tier) that already exists
+  // for the key is an idempotent no-op on the location's size.
+  // REMOVE for an unknown (key, node_id, tier) is a silent no-op.
+  // CLEAR_AT_TIER drops every key for (node_id, tier) and returns
+  // the number of locations removed.
+  size_t ApplyEvents(const std::string& node_id, const std::vector<KvEvent>& events);
 
-  bool Unregister(const std::string& node_id, const std::string& key, const Location& location);
+  // Replace this node's full set of locations with the ADDs carried in `adds`.
+  void ReplaceNodeLocations(const std::string& node_id, const std::vector<KvEvent>& adds);
 
-  size_t UnregisterByNode(const std::string& key, const std::string& node_id);
+  void RemoveByNode(const std::string& node_id);
 
-  // Batch variants — single lock acquisition for the entire batch.
-  size_t BatchRegister(const std::string& node_id,
-                       const std::vector<std::pair<std::string, Location>>& entries);
-  size_t BatchUnregister(const std::string& node_id,
-                         const std::vector<std::pair<std::string, Location>>& entries);
-
-  // Bump last_accessed_at and access_count. Called by Router on RouteGet.
+  // Bump last_accessed_at and access_count.  Lock-free under the shared lock.
   void RecordAccess(const std::string& key);
 
+  // Grant a time-limited lease to protect a key from eviction.
+  void GrantLease(const std::string& key, std::chrono::steady_clock::duration duration);
+
+  // Batched Lookup + filter + (on non-empty result) RecordAccess + GrantLease,
+  // under a single shared_lock.
+  std::vector<std::vector<Location>> BatchLookupForRouteGet(
+      const std::vector<std::string>& keys, const std::unordered_set<std::string>& exclude_nodes,
+      std::chrono::steady_clock::duration lease_duration);
+
   // --- Queries ---
+
   std::vector<Location> Lookup(const std::string& key) const;
 
-  // Returns metrics for a key, or nullopt if the key doesn't exist.
+  // Batched existence check — single shared_lock acquisition for the
+  // whole batch.  Read-only, no access-count or lease side-effects.
+  // Returns a vector parallel to `keys` where entry i is true iff the
+  // key has at least one registered Location.
+  std::vector<bool> BatchLookupExists(const std::vector<std::string>& keys) const;
+
   std::optional<BlockMetrics> GetMetrics(const std::string& key) const;
+
+  // --- Eviction ---
+
+  struct NodeTierKey {
+    std::string node_id;
+    TierType tier;
+    bool operator<(const NodeTierKey& o) const {
+      if (node_id != o.node_id) return node_id < o.node_id;
+      return tier < o.tier;
+    }
+    bool operator==(const NodeTierKey& o) const { return node_id == o.node_id && tier == o.tier; }
+  };
+
+  std::vector<EvictionCandidate> FindEvictionCandidates(
+      const std::set<NodeTierKey>& overloaded_node_tiers) const;
 
  private:
   mutable std::shared_mutex mutex_;
   std::unordered_map<std::string, BlockEntry> entries_;
-  ClientRegistry* registry_ = nullptr;
+  // Reverse index: lets ReplaceNodeLocations skip a full entries_ scan.
+  std::unordered_map<std::string, std::unordered_set<std::string>> node_to_keys_;
 };
 
 }  // namespace mori::umbp

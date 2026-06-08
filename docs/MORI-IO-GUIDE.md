@@ -175,6 +175,10 @@ See `examples/io/example.py` for more complete examples including batch transfer
 | `RdmaBackendConfig.num_nics_per_transfer` | Stripe a transfer across this many NICs (default `1`). Adaptive by memory type: GPU memory stays single-NIC (PCIe-bound); host memory stripes across NUMA-local NICs. Env: `MORI_IO_NUM_NICS_PER_TRANSFER` |
 | `IOEngineConfig.port = 0` | Auto-bind to a free port |
 
+UMBP (the upper-layer cache pool) exposes a separate set of runtime-tunable
+env vars for distributed master / pool client / SPDK proxy timing. Those are
+out of scope for MORI-IO; see [`src/umbp/doc/runtime-env-vars.md`](../src/umbp/doc/runtime-env-vars.md).
+
 ## Source Files
 
 | File | Description |

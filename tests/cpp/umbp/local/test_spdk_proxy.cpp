@@ -38,12 +38,12 @@
 #include <vector>
 
 #include "umbp/common/config.h"
-#include "umbp/local/storage/spdk_proxy_tier.h"
+#include "umbp/local/tiers/spdk_proxy_tier.h"
 
 using namespace mori::umbp;
 
-static UMBPConfig MakeProxyConfig() {
-  auto cfg = UMBPConfig::FromEnvironment();
+static UMBPSsdConfig MakeProxyConfig() {
+  auto cfg = UMBPConfig::FromEnvironment().ssd;
   cfg.ssd_backend = "spdk_proxy";
   // rank auto-allocated via CAS (spdk_proxy_rank_id == kAutoRankId from env)
   if (cfg.spdk_proxy_shm_name.empty()) cfg.spdk_proxy_shm_name = "/umbp_spdk_proxy";

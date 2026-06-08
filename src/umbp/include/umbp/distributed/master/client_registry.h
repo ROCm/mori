@@ -25,119 +25,97 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <map>
 #include <mutex>
-#include <optional>
-#include <set>
 #include <shared_mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
 
-#include "umbp/common/config.h"
-#include "umbp/common/types.h"
+#include "umbp/distributed/config.h"
+#include "umbp/distributed/types.h"
 
 namespace mori::umbp {
 
 class GlobalBlockIndex;
+class ExternalKvBlockIndex;
 
-struct AllocateResult {
-  std::string allocation_id;
-  std::string peer_address;
-  std::vector<uint8_t> engine_desc_bytes;
-  std::vector<uint8_t> dram_memory_desc_bytes;
-  uint64_t allocated_offset = 0;
-  uint32_t buffer_index = 0;
-};
-
-struct ClientIOInfo {
-  std::string peer_address;
-  std::vector<uint8_t> engine_desc_bytes;
-  std::vector<uint8_t> dram_memory_desc_bytes;
-};
-
+// Master-side membership ledger + heartbeat ingestion.  In the
+// master-as-advisor design this class no longer owns any allocator
+// state; every per-tier capacity number it stores is the value the peer
+// reported in its most recent heartbeat.  Heartbeat is also the channel
+// through which peer-shipped KvEvents reach GlobalBlockIndex.
 class ClientRegistry {
  public:
   explicit ClientRegistry(const ClientRegistryConfig& config);
-  ClientRegistry(const ClientRegistryConfig& config, GlobalBlockIndex& index);
+  ClientRegistry(const ClientRegistryConfig& config, GlobalBlockIndex& index,
+                 ExternalKvBlockIndex* external_kv_index = nullptr);
   ~ClientRegistry();
 
   ClientRegistry(const ClientRegistry&) = delete;
   ClientRegistry& operator=(const ClientRegistry&) = delete;
 
   void SetBlockIndex(GlobalBlockIndex* index);
+  void SetExternalKvBlockIndex(ExternalKvBlockIndex* index);
 
   // --- Client lifecycle ---
+
   // Returns false when a live node with the same id already exists.
-  // Returns true for new registrations or re-registration of expired nodes.
+  // Returns true for new registrations or re-registration of expired
+  // nodes.  In the new design the only state master holds for a node is
+  // membership + last-reported tier capacities; the peer owns its own
+  // allocators.
   bool RegisterClient(const std::string& node_id, const std::string& node_address,
                       const std::map<TierType, TierCapacity>& tier_capacities,
                       const std::string& peer_address = "",
                       const std::vector<uint8_t>& engine_desc_bytes = {},
-                      const std::vector<std::vector<uint8_t>>& dram_memory_desc_bytes_list = {},
-                      const std::vector<uint64_t>& dram_buffer_sizes = {},
-                      const std::vector<uint64_t>& ssd_store_capacities = {});
+                      const std::vector<std::string>& tags = {});
 
-  // Gracefully unregister. Returns number of block keys cleaned up.
-  size_t UnregisterClient(const std::string& node_id);
+  // Drops the node from the registry and clears every index entry that
+  // belonged to it.
+  void UnregisterClient(const std::string& node_id);
 
-  // Process heartbeat. Updates last_heartbeat and tier capacities.
-  // Returns CLIENT_STATUS_UNKNOWN if node is not registered.
-  // PA-3 fix: uses exclusive lock since it mutates record fields.
+  // Apply one heartbeat request.  Returns the resulting status
+  // (UNKNOWN if the node isn't registered).  On the success path:
+  //   - tier_capacities replace the stored values unconditionally,
+  //   - delta bundles are applied in seq order, with retransmissions skipped,
+  //   - full-sync replaces this node's UMBP-owned locations.
   ClientStatus Heartbeat(const std::string& node_id,
-                         const std::map<TierType, TierCapacity>& tier_capacities);
-
-  // --- Ownership tracking (called by BlockIndex) ---
-  void TrackKey(const std::string& node_id, const std::string& key);
-  void UntrackKey(const std::string& node_id, const std::string& key);
-
-  // --- PoolClient allocation ---
-  std::optional<AllocateResult> AllocateForPut(const std::string& node_id, TierType tier,
-                                               uint64_t size);
-  void DeallocateForUnregister(const std::string& node_id, TierType tier, uint32_t buffer_index,
-                               uint64_t offset, uint64_t size);
-  bool FinalizeAllocation(const std::string& node_id, const std::string& key,
-                          const Location& location, const std::string& allocation_id);
-  bool PublishLocalBlock(const std::string& node_id, const std::string& key,
-                         const Location& location);
-  bool AbortAllocation(const std::string& node_id, const std::string& allocation_id, uint64_t size);
-  std::optional<ClientIOInfo> GetClientIOInfo(const std::string& node_id,
-                                              uint32_t buffer_index = 0) const;
+                         const std::map<TierType, TierCapacity>& tier_capacities,
+                         const std::vector<EventBundle>& bundles, bool is_full_sync,
+                         uint64_t delta_seq_baseline, uint64_t* out_acked_seq,
+                         bool* out_request_full_sync);
 
   // --- Queries ---
   bool IsClientAlive(const std::string& node_id) const;
   size_t ClientCount() const;
-
-  // Returns all clients with status == ALIVE. Used by Router for RoutePut.
   std::vector<ClientRecord> GetAliveClients() const;
+  // Returns the tags registered for node_id, or empty if not found.
+  std::vector<std::string> GetClientTags(const std::string& node_id) const;
 
   // --- Reaper control ---
+  // The reaper only expires nodes whose last_heartbeat has aged past
+  // `heartbeat_ttl × max_missed_heartbeats`.  No allocation reaper —
+  // pending state lives at the peer in this design.
   void StartReaper();
   void StopReaper();
 
  private:
   ClientRegistryConfig config_;
   GlobalBlockIndex* index_ = nullptr;
+  ExternalKvBlockIndex* external_kv_index_ = nullptr;
 
   mutable std::shared_mutex mutex_;
   std::unordered_map<std::string, ClientRecord> clients_;
-  std::unordered_map<std::string, std::set<std::string>> client_keys_;
-  std::unordered_map<std::string, PendingAllocation> pending_allocations_;
 
-  // Reaper thread
   std::thread reaper_thread_;
   std::atomic<bool> reaper_running_{false};
   std::mutex reaper_cv_mutex_;
   std::condition_variable reaper_cv_;
-  std::atomic<uint64_t> next_allocation_id_{1};
 
   void ReaperLoop();
-  // PA-4 fix: uses iterator-safe erase pattern.
   void ReapExpiredClients();
-  void ReapExpiredPendingAllocations();
-  void ReleasePendingAllocationsForNodeLocked(const std::string& node_id);
-  static uint32_t ParseBufferIndex(const std::string& location_id);
-  void UpdateAvailableBytesLocked(ClientRecord& record, TierType tier);
 
   std::chrono::seconds ExpiryDuration() const {
     return config_.heartbeat_ttl * config_.max_missed_heartbeats;

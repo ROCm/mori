@@ -1,0 +1,306 @@
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+#pragma once
+
+// ---------------------------------------------------------------------------
+// Prometheus metric names and help strings for the UMBP master server.
+//
+// All metric identifiers and their descriptions are centralised here so that
+// dashboards, alerts, and tests can refer to a single source of truth.
+// ---------------------------------------------------------------------------
+
+// --- External KV API call counters -----------------------------------------
+
+#define MORI_UMBP_METRIC_EXT_KV_REPORT_TOTAL "mori_umbp_external_kv_report_total"
+#define MORI_UMBP_METRIC_EXT_KV_REPORT_TOTAL_HELP \
+  "Total number of ReportExternalKvBlocks API calls received by the master"
+
+#define MORI_UMBP_METRIC_EXT_KV_REVOKE_TOTAL "mori_umbp_external_kv_revoke_total"
+#define MORI_UMBP_METRIC_EXT_KV_REVOKE_TOTAL_HELP \
+  "Total number of RevokeExternalKvBlocks API calls received by the master"
+
+#define MORI_UMBP_METRIC_EXT_KV_MATCH_TOTAL "mori_umbp_external_kv_match_total"
+#define MORI_UMBP_METRIC_EXT_KV_MATCH_TOTAL_HELP \
+  "Total number of MatchExternalKv API calls received by the master"
+
+// --- External KV block count counters (for average-per-call computation) ---
+
+#define MORI_UMBP_METRIC_EXT_KV_REPORT_BLOCKS_TOTAL "mori_umbp_external_kv_report_blocks_total"
+#define MORI_UMBP_METRIC_EXT_KV_REPORT_BLOCKS_TOTAL_HELP \
+  "Total number of KV blocks received across all ReportExternalKvBlocks calls"
+
+#define MORI_UMBP_METRIC_EXT_KV_REVOKE_BLOCKS_TOTAL "mori_umbp_external_kv_revoke_blocks_total"
+#define MORI_UMBP_METRIC_EXT_KV_REVOKE_BLOCKS_TOTAL_HELP \
+  "Total number of KV blocks revoked across all RevokeExternalKvBlocks calls"
+
+// --- External KV match block counters (for avg match num and hit rate) ------
+
+#define MORI_UMBP_METRIC_EXT_KV_MATCH_QUERIED_BLOCKS_TOTAL \
+  "mori_umbp_external_kv_match_queried_blocks_total"
+#define MORI_UMBP_METRIC_EXT_KV_MATCH_QUERIED_BLOCKS_TOTAL_HELP \
+  "Total number of KV blocks queried across all MatchExternalKv calls"
+
+#define MORI_UMBP_METRIC_EXT_KV_MATCH_MATCHED_BLOCKS_TOTAL \
+  "mori_umbp_external_kv_match_matched_blocks_total"
+#define MORI_UMBP_METRIC_EXT_KV_MATCH_MATCHED_BLOCKS_TOTAL_HELP \
+  "Total number of KV blocks matched across all MatchExternalKv calls"
+
+// --- Per-node live external KV block count (gauge) -------------------------
+// The full metric name is the prefix concatenated with the node_id.
+// The full help string is the prefix concatenated with the node_id.
+
+#define MORI_UMBP_METRIC_EXT_KV_LIVE_COUNT_PREFIX "mori_umbp_external_kv_live_count_"
+#define MORI_UMBP_METRIC_EXT_KV_LIVE_COUNT_HELP_PREFIX "Live external KV block count for node "
+#define MORI_UMBP_METRIC_EXT_KV_LIVE_COUNT "mori_umbp_external_kv_live_count"
+#define MORI_UMBP_METRIC_EXT_KV_LIVE_COUNT_HELP "Live external KV block count"
+
+// --- Per-client live KV key count (reported by clients in heartbeat) -------
+// Labels: node=<node_id>, tier=<hbm|dram|ssd>
+
+#define MORI_UMBP_METRIC_CLIENT_KV_LIVE_COUNT "mori_umbp_client_kv_live_count"
+#define MORI_UMBP_METRIC_CLIENT_KV_LIVE_COUNT_HELP \
+  "Live KV key count owned by this client, reported by the client (per tier)"
+
+#define MORI_UMBP_METRIC_CLIENT_KV_LIVE_COUNT_TOTAL "mori_umbp_client_kv_live_count_total"
+#define MORI_UMBP_METRIC_CLIENT_KV_LIVE_COUNT_TOTAL_HELP \
+  "Total live KV key count owned by this client (sum across tiers)"
+
+// --- Alive client count (gauge) --------------------------------------------
+
+#define MORI_UMBP_METRIC_CLIENT_COUNT "mori_umbp_client_count"
+#define MORI_UMBP_METRIC_CLIENT_COUNT_HELP "Number of alive clients registered with the master"
+
+// --- Per-client tier capacity gauges ---------------------------------------
+// Full name: prefix + sanitized_node_id + "_" + tier (hbm|dram|ssd)
+
+#define MORI_UMBP_METRIC_CLIENT_CAPACITY_TOTAL_PREFIX "mori_umbp_client_capacity_total_bytes_"
+#define MORI_UMBP_METRIC_CLIENT_CAPACITY_TOTAL_HELP_PREFIX "Total capacity bytes for client "
+#define MORI_UMBP_METRIC_CLIENT_CAPACITY_TOTAL "mori_umbp_client_capacity_total_bytes"
+#define MORI_UMBP_METRIC_CLIENT_CAPACITY_TOTAL_HELP "Total capacity bytes"
+
+#define MORI_UMBP_METRIC_CLIENT_CAPACITY_AVAIL_PREFIX "mori_umbp_client_capacity_available_bytes_"
+#define MORI_UMBP_METRIC_CLIENT_CAPACITY_AVAIL_HELP_PREFIX "Available capacity bytes for client "
+#define MORI_UMBP_METRIC_CLIENT_CAPACITY_AVAIL "mori_umbp_client_capacity_available_bytes"
+#define MORI_UMBP_METRIC_CLIENT_CAPACITY_AVAIL_HELP "Available capacity bytes"
+
+#define MORI_UMBP_METRIC_CLIENT_CAPACITY_USED_PREFIX "mori_umbp_client_capacity_used_bytes_"
+#define MORI_UMBP_METRIC_CLIENT_CAPACITY_USED_HELP_PREFIX "Used capacity bytes for client "
+#define MORI_UMBP_METRIC_CLIENT_CAPACITY_USED "mori_umbp_client_capacity_used_bytes"
+#define MORI_UMBP_METRIC_CLIENT_CAPACITY_USED_HELP "Used capacity bytes (total - available)"
+
+#define MORI_UMBP_METRIC_CLIENT_CAPACITY_UTILIZATION_PREFIX \
+  "mori_umbp_client_capacity_utilization_ratio_"
+#define MORI_UMBP_METRIC_CLIENT_CAPACITY_UTILIZATION_HELP_PREFIX \
+  "Capacity utilization ratio for client "
+#define MORI_UMBP_METRIC_CLIENT_CAPACITY_UTILIZATION "mori_umbp_client_capacity_utilization_ratio"
+#define MORI_UMBP_METRIC_CLIENT_CAPACITY_UTILIZATION_HELP \
+  "Capacity utilization ratio (used / total) in [0,1]"
+
+// --- Per-client RPC call counters ------------------------------------------
+// Full name: prefix + sanitized_node_id
+
+#define MORI_UMBP_METRIC_CLIENT_ROUTE_PUT_PREFIX "mori_umbp_client_route_put_total_"
+#define MORI_UMBP_METRIC_CLIENT_ROUTE_PUT_HELP_PREFIX "Total RoutePut calls targeting client "
+#define MORI_UMBP_METRIC_CLIENT_ROUTE_PUT "mori_umbp_client_route_put_total"
+#define MORI_UMBP_METRIC_CLIENT_ROUTE_PUT_HELP "Total RoutePut calls targeting client"
+
+#define MORI_UMBP_METRIC_CLIENT_ROUTE_GET_PREFIX "mori_umbp_client_route_get_total_"
+#define MORI_UMBP_METRIC_CLIENT_ROUTE_GET_HELP_PREFIX "Total RouteGet hits served by client "
+#define MORI_UMBP_METRIC_CLIENT_ROUTE_GET "mori_umbp_client_route_get_total"
+#define MORI_UMBP_METRIC_CLIENT_ROUTE_GET_HELP "Total RouteGet hits served by client"
+
+#define MORI_UMBP_METRIC_CLIENT_LOOKUP_PREFIX "mori_umbp_client_lookup_total_"
+#define MORI_UMBP_METRIC_CLIENT_LOOKUP_HELP_PREFIX "Total Lookup (exists) hits for keys on client "
+#define MORI_UMBP_METRIC_CLIENT_LOOKUP "mori_umbp_client_lookup_total"
+#define MORI_UMBP_METRIC_CLIENT_LOOKUP_HELP "Total Lookup (exists) hits for keys on client"
+
+// --- Per-client batch RPC call counters ------------------------------------
+// Full name: prefix + sanitized_node_id
+
+#define MORI_UMBP_METRIC_CLIENT_BATCH_ROUTE_PUT_PREFIX "mori_umbp_client_batch_route_put_total_"
+#define MORI_UMBP_METRIC_CLIENT_BATCH_ROUTE_PUT_HELP_PREFIX \
+  "Total BatchRoutePut entries targeting client "
+#define MORI_UMBP_METRIC_CLIENT_BATCH_ROUTE_PUT "mori_umbp_client_batch_route_put_total"
+#define MORI_UMBP_METRIC_CLIENT_BATCH_ROUTE_PUT_HELP "Total BatchRoutePut entries targeting client"
+
+#define MORI_UMBP_METRIC_CLIENT_BATCH_ROUTE_GET_PREFIX "mori_umbp_client_batch_route_get_total_"
+#define MORI_UMBP_METRIC_CLIENT_BATCH_ROUTE_GET_HELP_PREFIX \
+  "Total BatchRouteGet hits served by client "
+#define MORI_UMBP_METRIC_CLIENT_BATCH_ROUTE_GET "mori_umbp_client_batch_route_get_total"
+#define MORI_UMBP_METRIC_CLIENT_BATCH_ROUTE_GET_HELP "Total BatchRouteGet hits served by client"
+
+// --- Per-client traffic byte counters (reported by clients) ----------------
+
+#define MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL "mori_umbp_client_outbound_put_bytes_total"
+#define MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL_HELP \
+  "Total bytes written by this client (outbound) split by local/remote traffic"
+
+#define MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL "mori_umbp_client_outbound_get_bytes_total"
+#define MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL_HELP \
+  "Total bytes fetched by this client (outbound reads) split by local/remote traffic"
+
+#define MORI_UMBP_METRIC_CLIENT_INBOUND_PUT_BYTES_TOTAL "mori_umbp_client_inbound_put_bytes_total"
+#define MORI_UMBP_METRIC_CLIENT_INBOUND_PUT_BYTES_TOTAL_HELP \
+  "Total bytes received by this client (inbound writes) split by local/remote traffic"
+
+#define MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL "mori_umbp_client_inbound_get_bytes_total"
+#define MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL_HELP \
+  "Total bytes delivered to this client (inbound reads) split by local/remote traffic"
+
+// --- Heartbeat / event-shipping counters (master-as-advisor) ----------------
+
+#define MORI_UMBP_METRIC_HEARTBEAT_EVENTS_APPLIED_TOTAL "mori_umbp_heartbeat_events_applied_total"
+#define MORI_UMBP_METRIC_HEARTBEAT_EVENTS_APPLIED_TOTAL_HELP \
+  "KvEvents applied to GlobalBlockIndex via heartbeat"
+
+#define MORI_UMBP_METRIC_HEARTBEAT_SEQ_GAP_TOTAL "mori_umbp_heartbeat_seq_gap_total"
+#define MORI_UMBP_METRIC_HEARTBEAT_SEQ_GAP_TOTAL_HELP \
+  "Heartbeats rejected due to seq gap (full sync requested)"
+
+// --- Per-client batch bandwidth histograms (reported by clients) -----------
+
+#define MORI_UMBP_METRIC_CLIENT_BATCH_PUT_BANDWIDTH "mori_umbp_client_batch_put_bandwidth_gibps"
+#define MORI_UMBP_METRIC_CLIENT_BATCH_PUT_BANDWIDTH_HELP                                           \
+  "BatchPut e2e call bandwidth in GiB/s (successful bytes only, split by client and local/remote " \
+  "traffic)"
+
+#define MORI_UMBP_METRIC_CLIENT_BATCH_GET_BANDWIDTH "mori_umbp_client_batch_get_bandwidth_gibps"
+#define MORI_UMBP_METRIC_CLIENT_BATCH_GET_BANDWIDTH_HELP                                           \
+  "BatchGet e2e call bandwidth in GiB/s (successful bytes only, split by client and local/remote " \
+  "traffic)"
+
+// --- MasterClient -> MasterServer RPC latency (client-perceived) -----------
+// Histogram of round-trip latency for every RPC method on the
+// MasterClient channel, reported by clients via ReportMetrics.  Labels
+// added by the binary: rpc=<MethodName>, status=ok|error.  Master then
+// injects node=<node_id> as a third label.
+
+#define MORI_UMBP_METRIC_MASTER_CLIENT_RPC_LATENCY "mori_umbp_master_client_rpc_latency_seconds"
+#define MORI_UMBP_METRIC_MASTER_CLIENT_RPC_LATENCY_HELP \
+  "Latency of MasterClient RPC calls (client-perceived, includes network)"
+
+#define MORI_UMBP_METRIC_MASTER_CLIENT_RPC_ERRORS_TOTAL "mori_umbp_master_client_rpc_errors_total"
+#define MORI_UMBP_METRIC_MASTER_CLIENT_RPC_ERRORS_TOTAL_HELP \
+  "Number of MasterClient RPC calls returning a non-OK gRPC status"
+
+#define MORI_UMBP_METRIC_MASTER_CLIENT_METRICS_DROPPED_TOTAL \
+  "mori_umbp_master_client_metrics_dropped_total"
+#define MORI_UMBP_METRIC_MASTER_CLIENT_METRICS_DROPPED_TOTAL_HELP                                \
+  "Number of histogram observations dropped client-side because the pending buffer hit its cap " \
+  "(see kMasterClientMaxPendingHistograms in master_client.h)"
+
+// --- SSD tier: copy / read / eviction / staging (peer-reported) ------------
+// All shipped via ReportMetrics from the owner peer (node=<node_id>).  Labels
+// are low-cardinality fixed enums only — status / reason — never key / path /
+// error string / lease id.  Counters are accumulated peer-side as cheap relaxed
+// atomics at the event point and converted to ReportMetrics deltas once per
+// metrics flush tick (no per-key AddCounter on the commit / read hot paths).
+// SSD capacity is NOT re-exported here: it rides heartbeat tier_capacities as
+// mori_umbp_client_capacity_{used,total}_bytes{tier="SSD"} (master emits the
+// tier label upper-cased, e.g. tier="SSD" — match that casing in queries).
+
+// copy-on-commit pipeline (ssd_copy_pipeline.cpp)
+#define MORI_UMBP_METRIC_SSD_COPY_ENQUEUED_TOTAL "mori_umbp_ssd_copy_enqueued_total"
+#define MORI_UMBP_METRIC_SSD_COPY_ENQUEUED_TOTAL_HELP \
+  "SSD copy-on-commit tasks accepted into the async copy queue"
+
+#define MORI_UMBP_METRIC_SSD_COPY_SUCCEEDED_TOTAL "mori_umbp_ssd_copy_succeeded_total"
+#define MORI_UMBP_METRIC_SSD_COPY_SUCCEEDED_TOTAL_HELP                                           \
+  "SSD copy-on-commit tasks that completed successfully: either the bytes were written to the "  \
+  "backend (emits ADD SSD) OR the content-addressed key was already resident (dedup fast path, " \
+  "no write, no event).  Not a count of physical writes — see "                                  \
+  "mori_umbp_ssd_copy_bytes_total for physical SSD write bytes."
+
+#define MORI_UMBP_METRIC_SSD_COPY_FAILED_TOTAL "mori_umbp_ssd_copy_failed_total"
+#define MORI_UMBP_METRIC_SSD_COPY_FAILED_TOTAL_HELP \
+  "SSD copy-on-commit tasks whose backend Write failed (no SSD copy, no event)"
+
+// label: reason=queue_full|stopped
+#define MORI_UMBP_METRIC_SSD_COPY_DROPPED_TOTAL "mori_umbp_ssd_copy_dropped_total"
+#define MORI_UMBP_METRIC_SSD_COPY_DROPPED_TOTAL_HELP                             \
+  "SSD copy tasks dropped at enqueue (reason=queue_full when the bounded queue " \
+  "was full, reason=stopped when the pipeline was stopped/quiescing)"
+
+// label: status=ok|not_found|no_slot|size_too_large|error
+#define MORI_UMBP_METRIC_SSD_READ_TOTAL "mori_umbp_ssd_read_total"
+#define MORI_UMBP_METRIC_SSD_READ_TOTAL_HELP                                    \
+  "SSD reads served by this peer's SSD tier, by outcome (covers local owner "   \
+  "reads and remote PrepareSsdRead).  not_found = stale-route miss; no_slot = " \
+  "staging slots exhausted (transient, not a miss)"
+
+// SSD IO byte counters.  Bandwidth is derived in Grafana/Prometheus via
+// rate(<counter>[<window>]) (bytes/s) — same convention as the client
+// inbound/outbound byte counters.  copy_bytes = bytes landed on SSD by a
+// successful copy-on-commit Write; read_bytes = bytes served by a successful
+// SSD read (local owner read or remote PrepareSsdRead).
+#define MORI_UMBP_METRIC_SSD_COPY_BYTES_TOTAL "mori_umbp_ssd_copy_bytes_total"
+#define MORI_UMBP_METRIC_SSD_COPY_BYTES_TOTAL_HELP                                 \
+  "Bytes written to the SSD tier by successful copy-on-commit.  rate() = offered " \
+  "SSD write throughput (bytes / wall-clock; a load signal, not device per-IO "    \
+  "bandwidth — it averages in idle gaps)"
+
+#define MORI_UMBP_METRIC_SSD_READ_BYTES_TOTAL "mori_umbp_ssd_read_bytes_total"
+#define MORI_UMBP_METRIC_SSD_READ_BYTES_TOTAL_HELP                                \
+  "Bytes read from the SSD tier by successful reads.  rate() = offered SSD read " \
+  "throughput (bytes / wall-clock; a load signal, not device per-IO bandwidth)"
+
+// eviction (peer_ssd_manager.cpp, local watermark + LRU)
+#define MORI_UMBP_METRIC_SSD_EVICTION_ROUNDS_TOTAL "mori_umbp_ssd_eviction_rounds_total"
+#define MORI_UMBP_METRIC_SSD_EVICTION_ROUNDS_TOTAL_HELP \
+  "Local SSD eviction rounds that actually ran (used above high watermark)"
+
+#define MORI_UMBP_METRIC_SSD_EVICTION_VICTIMS_TOTAL "mori_umbp_ssd_eviction_victims_total"
+#define MORI_UMBP_METRIC_SSD_EVICTION_VICTIMS_TOTAL_HELP \
+  "SSD keys evicted locally (REMOVE SSD emitted)"
+
+#define MORI_UMBP_METRIC_SSD_EVICTION_BYTES_FREED_TOTAL "mori_umbp_ssd_eviction_bytes_freed_total"
+#define MORI_UMBP_METRIC_SSD_EVICTION_BYTES_FREED_TOTAL_HELP "Bytes freed by local SSD eviction"
+
+#define MORI_UMBP_METRIC_SSD_EVICTION_BACKEND_FAILED_TOTAL \
+  "mori_umbp_ssd_eviction_backend_failed_total"
+#define MORI_UMBP_METRIC_SSD_EVICTION_BACKEND_FAILED_TOTAL_HELP \
+  "Local SSD evictions where the backend Evict failed (key kept for retry)"
+
+// staging (peer_service.cpp SSD read slots)
+#define MORI_UMBP_METRIC_SSD_STAGING_SLOTS_IN_USE "mori_umbp_ssd_staging_slots_in_use"
+#define MORI_UMBP_METRIC_SSD_STAGING_SLOTS_IN_USE_HELP \
+  "SSD read staging slots currently in use (Preparing or Leased), sampled once per flush"
+
+#define MORI_UMBP_METRIC_SSD_STAGING_EXPIRED_RECLAIMS_TOTAL \
+  "mori_umbp_ssd_staging_expired_reclaims_total"
+#define MORI_UMBP_METRIC_SSD_STAGING_EXPIRED_RECLAIMS_TOTAL_HELP \
+  "SSD read staging slots reclaimed after lease TTL expiry"
+
+#define MORI_UMBP_METRIC_SSD_STAGING_SLOT_FULL_REJECTS_TOTAL \
+  "mori_umbp_ssd_staging_slot_full_rejects_total"
+#define MORI_UMBP_METRIC_SSD_STAGING_SLOT_FULL_REJECTS_TOTAL_HELP \
+  "PrepareSsdRead calls rejected with NO_SLOT because all staging slots were busy"
+
+// Optional reader-side diagnostic: per-batch count of remote SSD reads that
+// stayed transient-not-served (NO_SLOT / reader-local lease expiry) after the
+// configured attempts.  Reported by the reader node; no reason label (kept
+// cheap — one AddCounter per batch).  lease expiry is reader-local and never
+// visible in the peer-side ssd_read_total, so this is its only observability.
+#define MORI_UMBP_METRIC_SSD_READ_CLIENT_TRANSIENT_TOTAL "mori_umbp_ssd_read_client_transient_total"
+#define MORI_UMBP_METRIC_SSD_READ_CLIENT_TRANSIENT_TOTAL_HELP                   \
+  "Remote SSD reads reported not-served this round due to transient NO_SLOT / " \
+  "reader-local lease expiry (not a definitive miss)"

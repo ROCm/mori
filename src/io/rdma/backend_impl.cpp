@@ -962,6 +962,19 @@ void ControlPlaneServer::HandleControlPlaneProtocol(int fd) {
   assert(eps.find(fd) != eps.end());
   application::TCPEndpointHandle tcph = eps[fd];
 
+  // Detect remote close: Recv returns 0 for both success and EOF, so
+  // SYSCALL_RETURN_ZERO can't distinguish them — peek before reading to avoid
+  // processing an uninitialized header when the peer disconnects.
+  {
+    char probe;
+    if (::recv(fd, &probe, 1, MSG_PEEK) == 0) {
+      MORI_IO_DEBUG("ControlPlaneServer: peer closed connection on fd {}", fd);
+      ctx->CloseEndpoint(tcph);
+      eps.erase(fd);
+      return;
+    }
+  }
+
   Protocol p(tcph);
   MessageHeader hdr = p.ReadMessageHeader();
 

@@ -441,6 +441,10 @@ class CMakeBuild(build_ext):
                 build_dir / "src/io/libmori_io.so",
                 root_dir / "python/mori/libmori_io.so",
             ),
+            (
+                build_dir / "src/metrics/libmori_metrics.so",
+                root_dir / "python/mori/libmori_metrics.so",
+            ),
         ]
         collective_so = build_dir / "src/collective/libmori_collective.so"
         if collective_so.exists():
@@ -568,6 +572,7 @@ mori_package_data = [
     "libmori_ops.so",
     "libmori_io.so",
     "libmori_application.so",
+    "libmori_metrics.so",
     "libmori_collective.so",  # optional: only present when BUILD_COLLECTIVE=ON
     "spdk_proxy",
     "umbp_master",
