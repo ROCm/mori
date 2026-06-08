@@ -28,6 +28,7 @@
 // types without creating a circular include with the common layer.
 #pragma once
 
+#include "mori/cco/cco_coop.hpp"
 #include "mori/cco/cco_types.hpp"
 
 namespace mori {
@@ -35,7 +36,10 @@ namespace cco {
 namespace gda {
 
 typedef void* ccoWindow_t;
-typedef void* ccoGdaRequest_t;
+typedef struct {
+  int qpIdx;
+  uint64_t postIdx;
+} ccoGdaRequest_t;
 
 typedef uint32_t ccoGdaSignal_t;
 typedef uint32_t ccoGdaCounter_t;
@@ -91,35 +95,39 @@ struct ccoGda {
   // ── data transfer ───────────────────────────────────────────────────────
 
   // put: rdma write with optional remote signal and local counter.
-  template <typename RemoteAction = ccoGda_NoSignal, typename LocalAction = ccoGda_NoCounter>
+  template <typename RemoteAction = ccoGda_NoSignal, typename LocalAction = ccoGda_NoCounter,
+            typename Coop = ccoCoopThread>
   __device__ inline void put(int peer, ccoWindow_t dstWin, size_t dstOffset, ccoWindow_t srcWin,
                              size_t srcOffset, size_t bytes,
                              RemoteAction remoteAction = ccoGda_NoSignal{},
-                             LocalAction localAction = ccoGda_NoCounter{},
+                             LocalAction localAction = ccoGda_NoCounter{}, Coop coop = Coop{},
                              uint32_t optFlags = ccoGdaOptFlagsDefault);
 
   // putValue: write an immediate value (≤8 bytes) with optional remote signal.
-  template <typename T, typename RemoteAction = ccoGda_NoSignal>
+  template <typename T, typename RemoteAction = ccoGda_NoSignal, typename Coop = ccoCoopThread>
   __device__ inline void putValue(int peer, ccoWindow_t dstWin, size_t dstOffset, T value,
-                                  RemoteAction remoteAction = ccoGda_NoSignal{},
+                                  RemoteAction remoteAction = ccoGda_NoSignal{}, Coop coop = Coop{},
                                   uint32_t optFlags = ccoGdaOptFlagsDefault);
 
   // get: rdma read — pull peer's window content into our local window.
+  template <typename Coop = ccoCoopThread>
   __device__ inline void get(int peer, ccoWindow_t remoteWin, size_t remoteOffset,
                              ccoWindow_t localWin, size_t localOffset, size_t bytes,
-                             uint32_t optFlags = ccoGdaOptFlagsDefault);
+                             Coop coop = Coop{}, uint32_t optFlags = ccoGdaOptFlagsDefault);
 
   // ── signal ──────────────────────────────────────────────────────────────
 
   // signal: send a signal-only message to peer (no data payload).
-  template <typename RemoteAction>
-  __device__ inline void signal(int peer, RemoteAction remoteAction);
+  template <typename RemoteAction, typename Coop = ccoCoopThread>
+  __device__ inline void signal(int peer, RemoteAction remoteAction, Coop coop = Coop{});
 
   // readSignal: read the local value of one signal slot.
   __device__ inline uint64_t readSignal(ccoGdaSignal_t signalId, int bits = 64);
 
   // waitSignal: block until the local signal slot reaches `least`.
-  __device__ inline void waitSignal(ccoGdaSignal_t signalId, uint64_t least, int bits = 64);
+  template <typename Coop = ccoCoopThread>
+  __device__ inline void waitSignal(ccoGdaSignal_t signalId, uint64_t least, Coop coop = Coop{},
+                                    int bits = 64);
 
   // resetSignal: zero one local signal slot.
   __device__ inline void resetSignal(ccoGdaSignal_t signalId);
@@ -130,30 +138,36 @@ struct ccoGda {
   __device__ inline uint64_t readCounter(ccoGdaCounter_t counterId, int bits = 56);
 
   // waitCounter: block until the local counter slot reaches `least`.
-  __device__ inline void waitCounter(ccoGdaCounter_t counterId, uint64_t least, int bits = 56);
+  template <typename Coop = ccoCoopThread>
+  __device__ inline void waitCounter(ccoGdaCounter_t counterId, uint64_t least, Coop coop = Coop{},
+                                     int bits = 56);
 
   // resetCounter: zero one local counter slot.
   __device__ inline void resetCounter(ccoGdaCounter_t counterId);
 
   // ── completion ──────────────────────────────────────────────────────────
-  //
-  // flush() / flush(peer) only poll the CQ — they do not ring the doorbell.
-  // matches NCCL GIN semantics. if WQEs were submitted with
-  // ccoGdaOptFlagsAggregateRequests, the caller must invoke flushAsync(peer, ...)
-  // first to ring the doorbell, then flush(peer) to wait for completion.
 
-  // flush: poll CQ for every peer until all submitted WQEs complete.
-  __device__ inline void flush();
+  // flush = flushAsync + wait per peer.
+  // flushAsync rings the doorbell if any WQEs are pending (skips if already
+  // rung), then wait polls CQ until all submitted WQEs complete.
+
+  // flush: ring doorbell + poll CQ for every peer.
+  // peers are distributed across the Coop group (default: warp).
+  // all threads in the group must call flush together.
+  template <typename Coop = ccoCoopWarp>
+  __device__ inline void flush(Coop coop = Coop{});
 
   // flush(peer): poll CQ for a single peer until its submitted WQEs complete.
   __device__ inline void flush(int peer);
 
   // flushAsync: ring doorbell for peer and return a request handle that
   // wait() can later be used to wait on individually.
-  __device__ inline void flushAsync(int peer, ccoGdaRequest_t* outRequest);
+  template <typename Coop = ccoCoopThread>
+  __device__ inline void flushAsync(int peer, ccoGdaRequest_t* outRequest, Coop coop = Coop{});
 
   // wait: block on a request handle previously returned by flushAsync.
-  __device__ inline void wait(ccoGdaRequest_t& request);
+  template <typename Coop = ccoCoopThread>
+  __device__ inline void wait(ccoGdaRequest_t& request, Coop coop = Coop{});
 };
 
 }  // namespace gda

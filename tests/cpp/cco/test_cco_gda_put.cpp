@@ -81,7 +81,6 @@ __global__ void GdaAlltoAllKernel(mori::cco::ccoWindowDevice* sendWin,
   int nRanks = devComm.worldSize;
   int tid = threadIdx.x;
   int nthreads = blockDim.x;
-
   size_t perPairBytes = count * sizeof(T);
 
   // each thread issues put to a distinct peer
@@ -91,10 +90,9 @@ __global__ void GdaAlltoAllKernel(mori::cco::ccoWindowDevice* sendWin,
             reinterpret_cast<ccoWindow_t>(sendWin), r * perPairBytes, perPairBytes,
             ccoGda_SignalInc{static_cast<ccoGdaSignal_t>(myRank)});
   }
-  __syncthreads();
 
   // drain local sq / cq so sendWin is reusable after the kernel
-  if (tid == 0) gda.flush();
+  gda.flush(mori::cco::ccoCoopBlock{});
 
   // wait for every peer's write to land
   if (tid < nRanks && tid != myRank) {
