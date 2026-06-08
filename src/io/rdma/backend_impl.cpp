@@ -905,7 +905,7 @@ void ControlPlaneServer::BuildRdmaConn(EngineKey ekey, TopoKeyPair topo, int nic
   application::RdmaEndpoint lep = rdma->CreateEndpoint(devId);
 
   Protocol p(tcph);
-  p.WriteMessageRegEndpoint({myEngKey, topo, devId, lep.handle, rank});
+  p.WriteMessageRegEndpoint({myEngKey, topo, devId, lep.handle, rank, devId});
   MessageHeader hdr = p.ReadMessageHeader();
   assert(hdr.type == MessageType::RegEndpoint);
   MessageRegEndpoint msg = p.ReadMessageRegEndpoint(hdr.len);
@@ -981,18 +981,38 @@ void ControlPlaneServer::HandleControlPlaneProtocol(int fd) {
   switch (hdr.type) {
     case MessageType::RegEndpoint: {
       MessageRegEndpoint msg = p.ReadMessageRegEndpoint(hdr.len);
-      int requestedNics = ResolveRequestedNics(config, msg.topo.remote, msg.topo.local);
-      auto candidates = rdma->Search(msg.topo.remote, requestedNics);
-      assert(!candidates.empty());
       int rdevId = msg.devId;
-      int rank = std::min<int>(msg.nicRank, static_cast<int>(candidates.size()) - 1);
-      auto [devId, weight] = candidates[rank];
+
+      // Rail affinity: if the sender provided a valid railId, use the same
+      // availDevices index so that both endpoints sit on the same network rail
+      // (leaf switch pair), reducing cross-spine hops.
+      int devId = -1;
+      int weight = 1;
+      bool railAffinityEnabled = false;
+      const char* envRailAffinity = std::getenv("MORI_IO_RAIL_AFFINITY");
+      if (envRailAffinity != nullptr && std::string(envRailAffinity) == "1") {
+        railAffinityEnabled = true;
+      }
+
+      if (railAffinityEnabled && msg.railId >= 0 &&
+          msg.railId < static_cast<int>(rdma->NumAvailDevices())) {
+        devId = msg.railId;
+        MORI_IO_TRACE("Rail affinity: using railId={} from sender", msg.railId);
+      } else {
+        // Fallback: original behavior (topo search + nicRank)
+        int requestedNics = ResolveRequestedNics(config, msg.topo.remote, msg.topo.local);
+        auto candidates = rdma->Search(msg.topo.remote, requestedNics);
+        assert(!candidates.empty());
+        int rank = std::min<int>(msg.nicRank, static_cast<int>(candidates.size()) - 1);
+        std::tie(devId, weight) = candidates[rank];
+      }
+
       application::RdmaEndpoint lep = rdma->CreateEndpoint(devId);
       EndpointId eid =
           rdma->ConnectEndpoint(msg.ekey, devId, lep, rdevId, msg.eph, msg.topo, weight);
       auto ert = rdma->GetEndpointRuntime(eid);
       notif->RegisterEndpoint(ert);
-      p.WriteMessageRegEndpoint(MessageRegEndpoint{myEngKey, msg.topo, devId, lep.handle, rank});
+      p.WriteMessageRegEndpoint(MessageRegEndpoint{myEngKey, msg.topo, devId, lep.handle, 0, devId});
       SYSCALL_RETURN_ZERO(epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL));
       break;
     }

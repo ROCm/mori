@@ -97,6 +97,7 @@ class RdmaManager {
   std::vector<std::shared_ptr<EndpointRuntime>> SnapshotEndpointRuntimes();
 
   application::RdmaDeviceContext* GetRdmaDeviceContext(int devId);
+  size_t NumAvailDevices() const { return availDevices.size(); }
 
  private:
   application::RdmaDeviceContext* GetOrCreateDeviceContext(int devId);
