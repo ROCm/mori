@@ -34,6 +34,13 @@ if(BUILD_IO)
   target_include_directories(test_protocol PUBLIC ${CMAKE_SOURCE_DIR})
   target_link_libraries(test_protocol mori_application mori_io)
 
+  add_executable(test_rail_affinity io/test_rail_affinity.cpp)
+
+  target_include_directories(test_rail_affinity
+                             PUBLIC ${CMAKE_SOURCE_DIR}/include)
+  target_include_directories(test_rail_affinity PUBLIC ${CMAKE_SOURCE_DIR})
+  target_link_libraries(test_rail_affinity mori_application mori_io numa)
+
   add_executable(test_engine io/test_engine.cpp)
 
   target_include_directories(test_engine PUBLIC ${CMAKE_SOURCE_DIR}/include)
