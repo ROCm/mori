@@ -1012,7 +1012,8 @@ void ControlPlaneServer::HandleControlPlaneProtocol(int fd) {
           rdma->ConnectEndpoint(msg.ekey, devId, lep, rdevId, msg.eph, msg.topo, weight);
       auto ert = rdma->GetEndpointRuntime(eid);
       notif->RegisterEndpoint(ert);
-      p.WriteMessageRegEndpoint(MessageRegEndpoint{myEngKey, msg.topo, devId, lep.handle, 0, devId});
+      p.WriteMessageRegEndpoint(
+          MessageRegEndpoint{myEngKey, msg.topo, devId, lep.handle, 0, devId});
       SYSCALL_RETURN_ZERO(epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL));
       break;
     }

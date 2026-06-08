@@ -22,10 +22,9 @@
 #include <cassert>
 #include <cstdio>
 #include <cstring>
+#include <msgpack.hpp>
 #include <string>
 #include <vector>
-
-#include <msgpack.hpp>
 
 #include "mori/application/transport/tcp/tcp.hpp"
 #include "src/io/rdma/protocol.hpp"
@@ -142,15 +141,15 @@ void TestMessageRegEndpointBackwardCompat() {
   // Pack topo (TopoKeyPair) - need to match its MSGPACK_DEFINE format
   // TopoKeyPair has {local, remote}, each TopoKey has {deviceId, loc, numaNode}
   // Pack as nested arrays matching their MSGPACK_DEFINE
-  pk.pack_array(2);  // TopoKeyPair = [local, remote]
-  pk.pack_array(3);  // local TopoKey = [deviceId, loc, numaNode]
-  pk.pack(0);        // deviceId
+  pk.pack_array(2);                                    // TopoKeyPair = [local, remote]
+  pk.pack_array(3);                                    // local TopoKey = [deviceId, loc, numaNode]
+  pk.pack(0);                                          // deviceId
   pk.pack(static_cast<int>(MemoryLocationType::CPU));  // loc
-  pk.pack(0);        // numaNode
-  pk.pack_array(3);  // remote TopoKey
-  pk.pack(1);        // deviceId
+  pk.pack(0);                                          // numaNode
+  pk.pack_array(3);                                    // remote TopoKey
+  pk.pack(1);                                          // deviceId
   pk.pack(static_cast<int>(MemoryLocationType::CPU));  // loc
-  pk.pack(0);        // numaNode
+  pk.pack(0);                                          // numaNode
 
   // Pack devId
   pk.pack(7);
@@ -164,7 +163,9 @@ void TestMessageRegEndpointBackwardCompat() {
   // --- Alternative approach: serialize full message, then repack without last field ---
   // This is more robust. Let's use msgpack zone + object manipulation.
 
-  printf("  SKIP: TestMessageRegEndpointBackwardCompat (requires matching RdmaEndpointHandle msgpack layout)\n");
+  printf(
+      "  SKIP: TestMessageRegEndpointBackwardCompat (requires matching RdmaEndpointHandle msgpack "
+      "layout)\n");
   printf("        Verify manually: old sender without railId → new receiver gets railId=-1\n");
 
   // At minimum, verify that default construction gives railId = -1
@@ -232,9 +233,9 @@ void TestRailAffinityDecisionLogic() {
   assert(shouldUseRailId(false, 3, 8) == false);
 
   // MORI_IO_RAIL_AFFINITY=1, invalid railId → fallback
-  assert(shouldUseRailId(true, -1, 8) == false);   // unset
-  assert(shouldUseRailId(true, 8, 8) == false);    // out of range
-  assert(shouldUseRailId(true, 99, 8) == false);   // way out of range
+  assert(shouldUseRailId(true, -1, 8) == false);  // unset
+  assert(shouldUseRailId(true, 8, 8) == false);   // out of range
+  assert(shouldUseRailId(true, 99, 8) == false);  // way out of range
 
   // Edge case: numDevices = 0
   assert(shouldUseRailId(true, 0, 0) == false);
