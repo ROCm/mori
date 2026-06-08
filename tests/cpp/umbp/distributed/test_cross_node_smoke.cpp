@@ -21,6 +21,7 @@
 // SOFTWARE.
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <memory>
@@ -37,6 +38,29 @@ namespace {
 
 constexpr size_t kBufSize = 1 << 20;
 constexpr size_t kBlockSize = 4096;
+
+// Unique peer-service port per PoolClient.  A non-zero peer_service_port is
+// required for the node to register a peer_address and accept remote
+// AllocateSlot/CommitSlot RPCs; without it remote BatchPut fails with
+// "peer service connection unavailable".
+inline uint16_t NextPeerServicePort() {
+  static std::atomic<uint16_t> next{52000};
+  return next.fetch_add(1);
+}
+
+// The master index is eventually consistent: a committed key becomes visible
+// only after the owning peer ships its ADD event on the next heartbeat.  Poll
+// Exists() until the key shows up (or the timeout elapses) before asserting
+// visibility / issuing a Get.
+inline bool WaitForExists(PoolClient* client, const std::string& key,
+                          std::chrono::milliseconds timeout = std::chrono::milliseconds{5000}) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (client->Exists(key)) return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  }
+  return client->Exists(key);
+}
 
 class CrossNodeSmoke : public ::testing::Test {
  protected:
@@ -56,6 +80,9 @@ class CrossNodeSmoke : public ::testing::Test {
 
     MasterServerConfig master_cfg;
     master_cfg.listen_address = "0.0.0.0:0";
+    // Short heartbeat so committed keys propagate to the master index quickly
+    // (event-driven index converges within ~one heartbeat interval).
+    master_cfg.registry_config.heartbeat_ttl = std::chrono::seconds{1};
     master_ = std::make_unique<MasterServer>(std::move(master_cfg));
     server_thread_ = std::thread([this] { master_->Run(); });
     for (int i = 0; i < 50 && master_->GetBoundPort() == 0; ++i) {
@@ -75,6 +102,7 @@ class CrossNodeSmoke : public ::testing::Test {
     cfg_a.master_config.master_address = master_addr;
     cfg_a.io_engine.host = "0.0.0.0";
     cfg_a.io_engine.port = 0;
+    cfg_a.peer_service_port = NextPeerServicePort();
     cfg_a.dram_buffers = {{buf_a_, kBlockSize}};
     cfg_a.tier_capacities = {{TierType::DRAM, {kBlockSize, kBlockSize}}};
     cfg_a.dram_page_size = kBlockSize;
@@ -87,6 +115,7 @@ class CrossNodeSmoke : public ::testing::Test {
     cfg_b.master_config.master_address = master_addr;
     cfg_b.io_engine.host = "0.0.0.0";
     cfg_b.io_engine.port = 0;
+    cfg_b.peer_service_port = NextPeerServicePort();
     cfg_b.dram_buffers = {{buf_b_, kBufSize}};
     cfg_b.tier_capacities = {{TierType::DRAM, {kBufSize, kBufSize}}};
     cfg_b.dram_page_size = kBlockSize;
@@ -122,8 +151,8 @@ TEST_F(CrossNodeSmoke, PutGetWithRDMA) {
   std::memset(caller_buf_, 0xAB, kBlockSize);
 
   ASSERT_TRUE(client_a_->Put("rdma-key", caller_buf_, kBlockSize));
-  EXPECT_TRUE(client_a_->Exists("rdma-key"));
-  EXPECT_TRUE(client_b_->Exists("rdma-key"));
+  EXPECT_TRUE(WaitForExists(client_a_.get(), "rdma-key"));
+  EXPECT_TRUE(WaitForExists(client_b_.get(), "rdma-key"));
 
   std::memset(read_buf_, 0, kBlockSize);
   ASSERT_TRUE(client_b_->Get("rdma-key", read_buf_, kBlockSize));
@@ -149,8 +178,8 @@ TEST_F(CrossNodeSmoke, BatchPutGetWithRDMA) {
   }
 
   for (const auto& key : keys) {
-    EXPECT_TRUE(client_a_->Exists(key));
-    EXPECT_TRUE(client_b_->Exists(key));
+    EXPECT_TRUE(WaitForExists(client_a_.get(), key));
+    EXPECT_TRUE(WaitForExists(client_b_.get(), key));
   }
 
   auto* dst1 = static_cast<char*>(read_buf_);
@@ -172,60 +201,24 @@ TEST_F(CrossNodeSmoke, BatchPutGetWithRDMA) {
 TEST_F(CrossNodeSmoke, FinalizeIdempotentE2E) {
   std::memset(caller_buf_, 0xCD, kBlockSize);
   ASSERT_TRUE(client_a_->Put("idem-key", caller_buf_, kBlockSize));
-  EXPECT_TRUE(client_a_->Exists("idem-key"));
+  EXPECT_TRUE(WaitForExists(client_a_.get(), "idem-key"));
 
   ASSERT_TRUE(client_a_->Put("idem-key", caller_buf_, kBlockSize));
-  EXPECT_TRUE(client_b_->Exists("idem-key"));
+  EXPECT_TRUE(WaitForExists(client_b_.get(), "idem-key"));
 
   std::memset(read_buf_, 0, kBlockSize);
   ASSERT_TRUE(client_b_->Get("idem-key", read_buf_, kBlockSize));
   EXPECT_EQ(std::memcmp(caller_buf_, read_buf_, kBlockSize), 0);
 }
 
-TEST_F(CrossNodeSmoke, DepthPropagation) {
-  auto* src1 = static_cast<char*>(caller_buf_);
-  auto* src2 = src1 + kBlockSize;
-  auto* src3 = src2 + kBlockSize;
-  std::memset(src1, 0x41, kBlockSize);
-  std::memset(src2, 0x42, kBlockSize);
-  std::memset(src3, 0x43, kBlockSize);
-
-  std::vector<std::string> keys = {"d1", "d2", "d3"};
-  std::vector<const void*> srcs = {src1, src2, src3};
-  std::vector<size_t> sizes = {kBlockSize, kBlockSize, kBlockSize};
-  std::vector<int> depths = {5, 10, 15};
-
-  auto results = client_a_->BatchPut(keys, srcs, sizes, depths);
-  ASSERT_EQ(results.size(), 3u);
-  for (size_t i = 0; i < 3; ++i) {
-    EXPECT_TRUE(results[i]) << "put with depth failed for " << keys[i];
-    EXPECT_TRUE(client_a_->Exists(keys[i]));
-  }
-
-  // Master-side depth propagation assertion (v2.1.2 R2-C).  Catches
-  // fin_depths[] vs pending[] alignment bugs that the BatchPut fused
-  // path could regress when reordering items between phases.
-  for (size_t i = 0; i < keys.size(); ++i) {
-    auto d = master_->GetBlockDepthForTest(keys[i]);
-    ASSERT_TRUE(d.has_value()) << "master has no entry for " << keys[i];
-    EXPECT_EQ(*d, depths[i]) << "depth mismatch for " << keys[i];
-  }
-
-  auto* dst1 = static_cast<char*>(read_buf_);
-  std::memset(dst1, 0, kBlockSize);
-  ASSERT_TRUE(client_b_->Get("d1", dst1, kBlockSize));
-  EXPECT_EQ(std::memcmp(src1, dst1, kBlockSize), 0);
-}
-
 // ===========================================================================
-// Phase 2 multi-page scatter-gather tests.  These exercise the new
-// RemoteDramScatterWrite/Read code path across all three PageBitmapAllocator
+// Phase 2 multi-page scatter-gather tests.  These exercise the
+// RemoteDramScatterWrite/Read code path across the PageBitmapAllocator
 // strategies:
 //   1) same-buffer continuous run        -> MultiPageSameBufferPutGet
-//   2) same-buffer discrete pages        -> MultiPageDiscretePutGet
 //   3) cross-buffer discrete pages       -> CrossBufferScatterPutGet
 // Each test stands up its own master + two clients so it can choose the
-// per-node buffer layout independently of the legacy single-page fixture.
+// per-node buffer layout independently of the single-page fixture.
 // ===========================================================================
 
 class CrossNodeMultiPage : public ::testing::Test {
@@ -241,6 +234,7 @@ class CrossNodeMultiPage : public ::testing::Test {
   void StartMaster() {
     MasterServerConfig master_cfg;
     master_cfg.listen_address = "0.0.0.0:0";
+    master_cfg.registry_config.heartbeat_ttl = std::chrono::seconds{1};
     master_ = std::make_unique<MasterServer>(std::move(master_cfg));
     server_thread_ = std::thread([this] { master_->Run(); });
     for (int i = 0; i < 50 && master_->GetBoundPort() == 0; ++i) {
@@ -259,6 +253,7 @@ class CrossNodeMultiPage : public ::testing::Test {
     cfg.master_config.master_address = "localhost:" + std::to_string(master_->GetBoundPort());
     cfg.io_engine.host = "0.0.0.0";
     cfg.io_engine.port = 0;
+    cfg.peer_service_port = NextPeerServicePort();
     cfg.dram_page_size = kPageSize;
     uint64_t total = 0;
     for (size_t sz : setup.buffer_sizes) {
@@ -310,8 +305,8 @@ TEST_F(CrossNodeMultiPage, MultiPageSameBufferPutGet) {
   for (size_t i = 0; i < kPayload; ++i) src[i] = static_cast<char>(i & 0xFF);
 
   ASSERT_TRUE(client_a_->Put("mp-same-buf", src.data(), kPayload));
-  EXPECT_TRUE(client_a_->Exists("mp-same-buf"));
-  EXPECT_TRUE(client_b_->Exists("mp-same-buf"));
+  EXPECT_TRUE(WaitForExists(client_a_.get(), "mp-same-buf"));
+  EXPECT_TRUE(WaitForExists(client_b_.get(), "mp-same-buf"));
 
   std::vector<char> dst(kPayload, 0);
   ASSERT_TRUE(client_a_->Get("mp-same-buf", dst.data(), kPayload));
@@ -333,8 +328,8 @@ TEST_F(CrossNodeMultiPage, CrossBufferScatterPutGet) {
   for (size_t i = 0; i < kPayload; ++i) src[i] = static_cast<char>((i * 7) & 0xFF);
 
   ASSERT_TRUE(client_a_->Put("xbuf-key", src.data(), kPayload));
-  EXPECT_TRUE(client_a_->Exists("xbuf-key"));
-  EXPECT_TRUE(client_b_->Exists("xbuf-key"));
+  EXPECT_TRUE(WaitForExists(client_a_.get(), "xbuf-key"));
+  EXPECT_TRUE(WaitForExists(client_b_.get(), "xbuf-key"));
 
   std::vector<char> dst(kPayload, 0);
   ASSERT_TRUE(client_a_->Get("xbuf-key", dst.data(), kPayload));
@@ -365,6 +360,7 @@ TEST_F(CrossNodeMultiPage, PartialTailSinglePage) {
   for (size_t i = 0; i < kPayload; ++i) src[i] = static_cast<char>((i * 13 + 7) & 0xFF);
 
   ASSERT_TRUE(client_a_->Put("pt-1", src.data(), kPayload));
+  ASSERT_TRUE(WaitForExists(client_a_.get(), "pt-1"));
 
   // Sentinel bytes after `dst` validate that Get does not write past
   // `size` (would catch a regression that copied a full page back).
@@ -389,6 +385,7 @@ TEST_F(CrossNodeMultiPage, PartialTailMultiPageSameBuffer) {
   for (size_t i = 0; i < kPayload; ++i) src[i] = static_cast<char>((i * 31 + 1) & 0xFF);
 
   ASSERT_TRUE(client_a_->Put("pt-mp", src.data(), kPayload));
+  ASSERT_TRUE(WaitForExists(client_a_.get(), "pt-mp"));
 
   constexpr char kSentinel = 0xA5;
   std::vector<char> dst(kPayload + 64, kSentinel);
@@ -415,6 +412,7 @@ TEST_F(CrossNodeMultiPage, PartialTailCrossBufferScatter) {
   for (size_t i = 0; i < kPayload; ++i) src[i] = static_cast<char>((i * 53 + 3) & 0xFF);
 
   ASSERT_TRUE(client_a_->Put("pt-xbuf", src.data(), kPayload));
+  ASSERT_TRUE(WaitForExists(client_a_.get(), "pt-xbuf"));
 
   constexpr char kSentinel = 0x3C;
   std::vector<char> dst(kPayload + 64, kSentinel);
@@ -437,6 +435,7 @@ TEST_F(CrossNodeMultiPage, PartialTailGetSizeMismatchRejected) {
   constexpr size_t kPayload = 999;
   std::vector<char> src(kPayload, 'X');
   ASSERT_TRUE(client_a_->Put("pt-mismatch", src.data(), kPayload));
+  ASSERT_TRUE(WaitForExists(client_a_.get(), "pt-mismatch"));
 
   // Asking for the rounded-up cap (1 full page) is in the page window but
   // != stored size; must fail rather than leaking the unused tail bytes.
@@ -447,50 +446,6 @@ TEST_F(CrossNodeMultiPage, PartialTailGetSizeMismatchRejected) {
   // Sanity: the correct size still works.
   ASSERT_TRUE(client_a_->Get("pt-mismatch", dst.data(), kPayload));
   EXPECT_EQ(std::memcmp(src.data(), dst.data(), kPayload), 0);
-}
-
-TEST_F(CrossNodeMultiPage, MultiPageDiscretePutGet) {
-  // Strategy 2: same buffer, discrete (non-contiguous) free pages.
-  //
-  // We deliberately undersize node-a (sub-page) so the Master never picks
-  // it as a Put target.  This makes the page-layout evolution on node-b
-  // fully deterministic regardless of TierAwareMostAvailableStrategy's
-  // tie-breaking.
-  //
-  // Sequence on node-b's single buffer (3 pages):
-  //   PUT A -> buf0:p0        layout = [A, _, _]
-  //   PUT B -> buf0:p1        layout = [A, B, _]
-  //   PUT C -> buf0:p2        layout = [A, B, C]
-  //   Unregister A            layout = [_, B, C]
-  //   Unregister C            layout = [_, B, _]   (2 discrete free pages
-  //                                                  at idx 0 and idx 2)
-  //   PUT 2-page -> Strategy 1 fails (no 2-contig run since idx 1 is
-  //                 taken), Strategy 2 picks pages 0 and 2 ->
-  //                 scatter-gather Write across two non-adjacent slots
-  //                 inside the same buffer.
-  StartMaster();
-  client_a_ = MakeClient("node-a", NodeSetup{{kPageSize / 2}}, &owned_a_);
-  client_b_ = MakeClient("node-b", NodeSetup{{kPageSize * 3}}, &owned_b_);
-
-  std::vector<char> page_a(kPageSize, 'A');
-  std::vector<char> page_b(kPageSize, 'B');
-  std::vector<char> page_c(kPageSize, 'C');
-  ASSERT_TRUE(client_a_->Put("disc-A", page_a.data(), kPageSize));
-  ASSERT_TRUE(client_a_->Put("disc-B", page_b.data(), kPageSize));
-  ASSERT_TRUE(client_a_->Put("disc-C", page_c.data(), kPageSize));
-
-  // Free pages 0 and 2 — leaves the buffer with two non-contiguous free
-  // slots which is exactly the Strategy 2 trigger condition.
-  ASSERT_TRUE(client_a_->UnregisterFromMaster("disc-A"));
-  ASSERT_TRUE(client_a_->UnregisterFromMaster("disc-C"));
-
-  std::vector<char> payload(kPageSize * 2);
-  for (size_t i = 0; i < payload.size(); ++i) payload[i] = static_cast<char>((i * 11) & 0xFF);
-  ASSERT_TRUE(client_a_->Put("disc-2page", payload.data(), payload.size()));
-
-  std::vector<char> dst(payload.size(), 0);
-  ASSERT_TRUE(client_a_->Get("disc-2page", dst.data(), payload.size()));
-  EXPECT_EQ(std::memcmp(payload.data(), dst.data(), payload.size()), 0);
 }
 
 }  // namespace

@@ -25,9 +25,7 @@
 // older revision, git checkout the previous release commit and re-run the
 // same scenario binary; record both CSV rows in the PR description.
 //
-// Reports items_per_pair (NIC-layer WR-batching proxy), br_calls
-// (CPU-side IOEngine::BatchRead count), wall_ms and GiB/s.  Build with
-// -DMORI_UMBP_TESTING=ON for non-zero counter readings.
+// Reports wall_ms and GiB/s aggregate throughput for the BatchGet data path.
 //
 // Usage:
 //   bench_pool_client_batch_get [--scenario all_zc|mixed|all_stg|multi_peer]
@@ -37,8 +35,9 @@
 //                               [--sweep batch=1,4,16,64,256]
 //
 // CSV (stdout):
-//   scenario,batch,page_bytes,iters,wall_ms,gibps,br_calls,br_pairs,items_per_pair
+//   scenario,batch,page_bytes,iters,wall_ms,gibps
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -62,6 +61,13 @@ using mori::umbp::PoolClientConfig;
 using mori::umbp::TierType;
 
 namespace {
+
+// Unique peer-service port per PoolClient: required so each node registers a
+// peer_address and can serve/accept remote AllocateSlot/ResolveKey RPCs.
+inline uint16_t NextPeerServicePort() {
+  static std::atomic<uint16_t> next{55000};
+  return next.fetch_add(1);
+}
 
 struct BenchOpts {
   std::string scenario = "all_zc";
@@ -161,6 +167,7 @@ class Cluster {
     cc.master_config.master_address = master_addr;
     cc.io_engine.host = "0.0.0.0";
     cc.io_engine.port = 0;
+    cc.peer_service_port = NextPeerServicePort();
     cc.dram_page_size = page_bytes;
     cc.dram_buffers = {{caller_local_.data(), caller_local_.size()}};
     cc.tier_capacities = {{TierType::DRAM, {caller_local_.size(), caller_local_.size()}}};
@@ -180,6 +187,7 @@ class Cluster {
       tc.master_config.master_address = master_addr;
       tc.io_engine.host = "0.0.0.0";
       tc.io_engine.port = 0;
+      tc.peer_service_port = NextPeerServicePort();
       tc.dram_page_size = page_bytes;
       tc.dram_buffers = {{peers_[k].dram.data(), peers_[k].dram.size()}};
       tc.tier_capacities = {{TierType::DRAM, {peers_[k].dram.size(), peers_[k].dram.size()}}};
@@ -335,10 +343,6 @@ void RunScenario(const BenchOpts& base, size_t batch_override) {
   build_iter(0, &keys, &dsts, &sizes);
   RunOnce(cluster.caller(), keys, dsts, sizes);
 
-  const uint64_t calls0 = cluster.caller()->BatchGetIoEngineCallsCount();
-  const uint64_t pairs0 = cluster.caller()->BatchGetIoEnginePairsCount();
-  const uint64_t items0 = cluster.caller()->BatchGetItemsCount();
-
   double total_ms = 0;
   size_t total_bytes = 0;
   for (size_t it = 1; it <= o.iters; ++it) {
@@ -348,18 +352,11 @@ void RunScenario(const BenchOpts& base, size_t batch_override) {
     total_bytes += bytes;
   }
 
-  const uint64_t br_calls = cluster.caller()->BatchGetIoEngineCallsCount() - calls0;
-  const uint64_t br_pairs = cluster.caller()->BatchGetIoEnginePairsCount() - pairs0;
-  const uint64_t items = cluster.caller()->BatchGetItemsCount() - items0;
-  const double items_per_pair = br_pairs > 0 ? static_cast<double>(items) / br_pairs : 0.0;
-
   constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
   const double mean_gibps = total_ms > 0 ? (total_bytes / kGiB) / (total_ms / 1000.0) : 0.0;
 
-  std::printf("%s,%zu,%zu,%zu,%.3f,%.3f,%llu,%llu,%.3f\n", o.scenario.c_str(), o.batch,
-              o.page_bytes, o.iters, total_ms / o.iters, mean_gibps,
-              static_cast<unsigned long long>(br_calls), static_cast<unsigned long long>(br_pairs),
-              items_per_pair);
+  std::printf("%s,%zu,%zu,%zu,%.3f,%.3f\n", o.scenario.c_str(), o.batch, o.page_bytes, o.iters,
+              total_ms / o.iters, mean_gibps);
   std::fflush(stdout);
 }
 
@@ -369,7 +366,7 @@ int main(int argc, char** argv) {
   BenchOpts opts;
   if (!ParseArgs(argc, argv, &opts)) return 2;
 
-  std::printf("scenario,batch,page_bytes,iters,wall_ms,gibps,br_calls,br_pairs,items_per_pair\n");
+  std::printf("scenario,batch,page_bytes,iters,wall_ms,gibps\n");
   std::fflush(stdout);
 
   if (!opts.sweep.empty()) {
