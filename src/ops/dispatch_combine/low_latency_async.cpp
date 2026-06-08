@@ -62,6 +62,16 @@ __device__ void EpDispatchLowLatencyAsyncSendCopy_body(EpDispatchCombineArgs<T> 
     index_t destPe = destExpert / config.numExpertPerRank;
     index_t destTokId = 0;
 
+    // Out-of-range expert id guard: destPe is warp-uniform here and indexes
+    // destPeTokenCounter / SendBufSlotOffset below; an out-of-range id (e.g. an
+    // EPLB physical id >= worldSize*numExpertPerRank) would index/offset out of
+    // bounds -> HSA page fault. Drop it via the same null sentinel the dedup
+    // path uses; the whole warp skips coherently.
+    if ((destPe < 0) || (destPe >= config.worldSize)) {
+      if (laneId == 0) args.dispDestTokIdMap[i] = NullSendBufSlotOffset(config);
+      continue;
+    }
+
     // Deduplicate
     assert(config.numExpertPerToken < warpSize);
     int condition = 0;
@@ -147,7 +157,12 @@ __device__ void EpDispatchLowLatencyAsyncSendCopySlotAssign_body(EpDispatchCombi
       }
     }
 
-    if (isDuplicate) {
+    // Out-of-range expert id guard: destPe indexes destPeTokenCounter /
+    // SendBufSlotOffset below; an out-of-range id (EPLB physical id) would
+    // index/offset out of bounds -> HSA page fault. Fold it into the dedup null
+    // branch so the __shfl dedup above stays warp-coherent (no early continue).
+    bool peOutOfRange = (destPe < 0) || (destPe >= config.worldSize);
+    if (isDuplicate || peOutOfRange) {
       args.dispDestTokIdMap[i] = NullSendBufSlotOffset(config);
     } else {
       index_t destTokId = atomicAdd(args.destPeTokenCounter + destPe, 1);

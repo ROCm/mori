@@ -103,7 +103,13 @@ __device__ void EpDispatchInterNodeKernel_body(EpDispatchCombineArgs<T> args) {
             dupMask & (((1ULL << laneInSubWarp) - 1ULL) << (subWarpId * numExpertPerToken));
         dup = (lowerMask != 0ULL);
       }
-      if (dup) {
+      // Out-of-range expert id guard: destPe indexes destPeTokenCounter and
+      // destPeTokenIdxMap below; an out-of-range id (e.g. an EPLB physical id
+      // >= worldSize*numExpertPerRank) would index them out of bounds -> HSA
+      // page fault. Fold it into the dedup skip (the __match_any_sync above has
+      // already run for all lanes, so this per-lane skip stays coherent).
+      bool peOutOfRange = (destPe < 0) || (destPe >= config.worldSize);
+      if (dup || peOutOfRange) {
         args.dispSenderIdxMap[expertOffset] = MaxNumTokensToRecv;
         continue;
       } else {
