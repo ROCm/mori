@@ -335,7 +335,7 @@ jobs:
       - name: Install mori (XLA FFI)
         run: |
           $CT exec ${CONTAINER}_jax bash -c \
-            "cd $GITHUB_WORKSPACE && BUILD_XLA_FFI_OPS=ON pip install --break-system-packages ."
+            "cd $GITHUB_WORKSPACE && BUILD_UMBP=OFF BUILD_XLA_FFI_OPS=ON pip install --break-system-packages ."
 
       - name: MORI-EP JAX test
         run: |
@@ -393,7 +393,7 @@ jobs:
         run: |
           $CT exec $CONTAINER bash -c "
             cd $GITHUB_WORKSPACE
-            timeout 60 pytest tests/python/test_umbp_packaging.py -v
+            timeout 60 pytest tests/python/umbp/ -v
           "
 
       - name: UMBP C++ unit tests (local + distributed)
