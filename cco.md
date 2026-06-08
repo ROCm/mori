@@ -742,9 +742,9 @@ __global__ void my_kernel(ccoDevComm* comm,
 include/mori/cco/
 ├── cco_types.hpp           ← Host/device 共享类型：ccoComm, ccoDevComm,
 │                              ccoWindowDevice, ccoWindowHost, ccoIbgdaContext
-├── cco_api.hpp             ← Host API 声明（mori 风格）
-├── cco_device.hpp          ← Device API umbrella，include 下面所有
-├── cco_device_api.hpp      ← 通用 device 辅助：findWindow, getPeerPtr, getLocalPtr
+├── cco_api.hpp             ← Host API 入口：host 控制面（ccoCommCreate/MemAlloc/...）
+├── cco_device_api.hpp      ← Device API 入口（伞头）：通用辅助(findWindow/getLsaPeerPtr/
+│                              getLocalPtr) + coop + team + lsa session + gda
 └── gda/                    ← GDA (RDMA) backend (NCCL 风格 session)
     ├── gda_device_common.hpp  ← ccoGda struct 声明 + tag 类型 + handle typedef
     └── gda_device_api.hpp     ← ccoGda 成员函数实现 + namespace 内 free function
