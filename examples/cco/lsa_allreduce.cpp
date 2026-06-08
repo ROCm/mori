@@ -47,13 +47,8 @@
 #include <vector>
 
 #include "args_parser.hpp"
-#include "mori/cco/cco_api.hpp"
-#include "mori/cco/cco_coop.hpp"
-#include "mori/cco/cco_device_api.hpp"
-#include "mori/cco/cco_lsa_impl.hpp"
-#include "mori/cco/cco_lsa_types.hpp"
-#include "mori/cco/cco_team.hpp"
-#include "mori/cco/cco_types.hpp"
+#include "mori/cco/cco.hpp"         // host control-plane
+#include "mori/cco/cco_device.hpp"  // device-side (kernel) API
 
 // Larger vector so the multi-block grid-stride loop actually spreads work
 // across blocks (each rank r contributes a vector of all r's).
@@ -104,10 +99,10 @@ __global__ void lsa_allreduce_kernel(ccoDevComm* devComm, ccoWindow_t sendWin, s
   for (size_t i = blockIdx.x * stride + lane; i < count; i += gridDim.x * stride) {
     float v = 0.f;
     for (int peer = 0; peer < lsaSize; peer++) {
-      v += reinterpret_cast<float*>(getLsaPeerPtr(sendWin, peer, sendOff))[i];
+      v += reinterpret_cast<float*>(ccoGetLsaPeerPtr(sendWin, peer, sendOff))[i];
     }
     for (int peer = 0; peer < lsaSize; peer++) {
-      reinterpret_cast<float*>(getLsaPeerPtr(recvWin, peer, recvOff))[i] = v;
+      reinterpret_cast<float*>(ccoGetLsaPeerPtr(recvWin, peer, recvOff))[i] = v;
     }
   }
 

@@ -46,13 +46,8 @@
 #include <cstring>
 
 #include "args_parser.hpp"
-#include "mori/cco/cco_api.hpp"
-#include "mori/cco/cco_coop.hpp"
-#include "mori/cco/cco_device_api.hpp"
-#include "mori/cco/cco_lsa_impl.hpp"
-#include "mori/cco/cco_lsa_types.hpp"
-#include "mori/cco/cco_team.hpp"
-#include "mori/cco/cco_types.hpp"
+#include "mori/cco/cco.hpp"         // host control-plane
+#include "mori/cco/cco_device.hpp"  // device-side (kernel) API
 
 using namespace mori::cco;
 

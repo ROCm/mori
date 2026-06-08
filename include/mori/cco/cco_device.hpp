@@ -19,15 +19,27 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+// MIT License — see LICENSE for details.
+//
+// CCO Device API — single include for device-side (kernel) code.
+//
+// Include this one header from device/kernel sources; host control-plane code
+// includes cco.hpp instead. Pure umbrella: it pulls in every device-side
+// facility — shared types + findWindow (cco_types.hpp), cooperative groups,
+// teams, and the per-backend session classes plus their addressing helpers
+// (LSA ccoGetLsaPeerPtr/ccoGetLocalPtr live in cco_lsa_impl.hpp; GDA under gda/).
 #pragma once
 
-// Umbrella header for the CCO device API. Pulls in:
-//   * Common helpers (findWindow, getPeerPtr, getLocalPtr)
-//   * All available backend session classes (currently: GDA)
-//
-// Future backends will live under cco/lsa/ and cco/sdma/.
+#include "mori/cco/cco_types.hpp"
 
-#include "mori/cco/cco_device_api.hpp"
+// Cooperative groups + teams used across all device sessions.
+#include "mori/cco/cco_coop.hpp"
 #include "mori/cco/cco_team.hpp"
+
+// clang-format off
+#include "mori/cco/cco_lsa_types.hpp"
+#include "mori/cco/cco_lsa_impl.hpp"
+// clang-format off
+
 #include "mori/cco/gda/gda_device.hpp"

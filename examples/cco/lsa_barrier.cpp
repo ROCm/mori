@@ -48,13 +48,8 @@
 #include <cstdio>
 #include <vector>
 
-#include "mori/cco/cco_api.hpp"
-#include "mori/cco/cco_coop.hpp"
-#include "mori/cco/cco_device_api.hpp"
-#include "mori/cco/cco_lsa_impl.hpp"
-#include "mori/cco/cco_lsa_types.hpp"
-#include "mori/cco/cco_team.hpp"
-#include "mori/cco/cco_types.hpp"
+#include "mori/cco/cco.hpp"         // host control-plane
+#include "mori/cco/cco_device.hpp"  // device-side (kernel) API
 
 using namespace mori::cco;
 
@@ -93,7 +88,7 @@ __global__ void barrier_visibility_kernel(ccoDevComm* dc, ccoWindow_t win, size_
   // sequence across launches (persistence UT); pass 0 for a fresh sequence.
   constexpr uint32_t MUL = 1000003u;
 
-  uint32_t* myBuf = static_cast<uint32_t*>(getLocalPtr(win, off));
+  uint32_t* myBuf = static_cast<uint32_t*>(ccoGetLocalPtr(win, off));
 
   int localErr = 0;
   for (uint32_t e = 1; e <= iters; ++e) {
@@ -104,7 +99,7 @@ __global__ void barrier_visibility_kernel(ccoDevComm* dc, ccoWindow_t win, size_
     bar.sync(g);
 
     for (int p = g.thread_rank(); p < N; p += g.size()) {
-      uint32_t v = static_cast<uint32_t*>(getLsaPeerPtr(win, p, off))[0];
+      uint32_t v = static_cast<uint32_t*>(ccoGetLsaPeerPtr(win, p, off))[0];
       if (v != tag + static_cast<uint32_t>(p)) localErr |= 1;
     }
     bar.sync(g);
@@ -161,7 +156,7 @@ __global__ void barrier_split_kernel(ccoDevComm* dc, ccoWindow_t win, size_t off
   const int myRank = dc->lsaRank;
   constexpr uint32_t MUL = 1000003u;
 
-  uint32_t* myBuf = static_cast<uint32_t*>(getLocalPtr(win, off));
+  uint32_t* myBuf = static_cast<uint32_t*>(ccoGetLocalPtr(win, off));
 
   int localErr = 0;
   for (uint32_t e = 1; e <= iters; ++e) {
@@ -176,7 +171,7 @@ __global__ void barrier_split_kernel(ccoDevComm* dc, ccoWindow_t win, size_t off
     bar.wait(g);
 
     for (int p = g.thread_rank(); p < N; p += g.size()) {
-      uint32_t v = static_cast<uint32_t*>(getLsaPeerPtr(win, p, off))[0];
+      uint32_t v = static_cast<uint32_t*>(ccoGetLsaPeerPtr(win, p, off))[0];
       if (v != e * MUL + static_cast<uint32_t>(p)) localErr |= 1;
     }
     bar.sync(g);  // separator before the next overwrite
@@ -205,7 +200,7 @@ __global__ void barrier_multislot_kernel(ccoDevComm* dc, ccoWindow_t win, uint32
 
   const int N = dc->lsaSize;
   const int myRank = dc->lsaRank;
-  uint32_t* myBuf = static_cast<uint32_t*>(getLocalPtr(win, off));
+  uint32_t* myBuf = static_cast<uint32_t*>(ccoGetLocalPtr(win, off));
 
   int localErr = 0;
   for (uint32_t e = 1; e <= iters; ++e) {
@@ -214,7 +209,7 @@ __global__ void barrier_multislot_kernel(ccoDevComm* dc, ccoWindow_t win, uint32
     }
     bar.sync(g);
     for (int p = g.thread_rank(); p < N; p += g.size()) {
-      uint32_t v = static_cast<uint32_t*>(getLsaPeerPtr(win, p, off))[0];
+      uint32_t v = static_cast<uint32_t*>(ccoGetLsaPeerPtr(win, p, off))[0];
       if (v != e * MUL + static_cast<uint32_t>(p)) localErr |= 1;
     }
     bar.sync(g);  // separator before the next overwrite

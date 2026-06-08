@@ -31,7 +31,7 @@
 #include "mori/application/transport/rdma/rdma.hpp"
 #include "mori/application/transport/sdma/anvil.hpp"
 #include "mori/application/utils/check.hpp"
-#include "mori/cco/cco_api.hpp"
+#include "mori/cco/cco.hpp"
 #include "mori/utils/hip_compat.hpp"
 #include "mori/utils/mori_log.hpp"
 

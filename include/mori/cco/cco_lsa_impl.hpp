@@ -27,6 +27,17 @@
 namespace mori {
 namespace cco {
 
+// Flat-VA addressing helpers — intra-node (LSA) only. The flat VA covers the
+// LSA team, so peer indexing is by LSA rank. Cross-node access goes through the
+// GDA backend with iova=0 + offset and doesn't need these.
+__device__ inline void* ccoGetLsaPeerPtr(ccoWindow_t win, int peerLsaRank, size_t offset = 0) {
+  return win->winBase + ((static_cast<uint64_t>(peerLsaRank) * win->stride4G) << 32) + offset;
+}
+
+__device__ inline void* ccoGetLocalPtr(ccoWindow_t win, size_t offset = 0) {
+  return win->winBase + ((static_cast<uint64_t>(win->lsaRank) * win->stride4G) << 32) + offset;
+}
+
 template <typename Coop>
 __device__ inline ccoLsaBarrierSession<Coop>::ccoLsaBarrierSession(Coop coop, ccoDevComm_t comm,
                                                                    ccoTeam_t team,

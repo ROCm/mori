@@ -23,9 +23,10 @@
 // MIT License — see LICENSE for details.
 #pragma once
 
+// clang-format off
 #include "mori/shmem/internal.hpp"
 #include "mori/core/transport/rdma/rdma.hpp"
-
+// clang-format off
 namespace mori {
 namespace cco {
 namespace gda {

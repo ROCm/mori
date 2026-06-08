@@ -34,7 +34,7 @@
 
 #include "hip/hip_runtime.h"
 #include "mori/application/bootstrap/socket_bootstrap.hpp"
-#include "mori/cco/cco_api.hpp"
+#include "mori/cco/cco.hpp"
 #include "mori/utils/mori_log.hpp"
 
 #define HIP_CHECK(cmd)                                                            \
