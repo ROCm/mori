@@ -445,6 +445,13 @@ jobs:
             done
           "
 
+      - name: MORI-UMBP (python)
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE
+            timeout 300 pytest tests/python/umbp/ -v
+          "
+
       - name: Cleanup
         if: always()
         run: |
