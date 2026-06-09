@@ -122,7 +122,11 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
         // Routing sentinel: a negative expert id means "drop this top-k slot".
         // Skip the dispatch entirely and write the existing combine-side null sentinel
         // (PE == worldSize) into dispDestTokIdMap so combine treats this slot as nullptr.
-
+        if (destExpert < 0) {
+          if (laneId == 0) args.dispDestTokIdMap[i] = FlatTokenIndex(config, config.worldSize, 0);
+          continue;
+        }
+        destPe = destExpert / config.numExpertPerRank;
         // Out-of-range expert id guard: destPe is warp-uniform here (one
         // token-expert per warp) and indexes GetAs(destPe) / destPeTokenCounter
         // below. An out-of-range id (e.g. an EPLB physical id
@@ -130,11 +134,10 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
         // assert at dispatch is stripped under NDEBUG) -> HSA page fault. Drop it
         // via the same overflow sentinel the dedup path uses; the whole warp
         // skips coherently.
-        if (destExpert < 0 || ((destPe < 0) || (destPe >= config.worldSize))) {
+        if (destPe < 0 || destPe >= config.worldSize) {
           if (laneId == 0) args.dispDestTokIdMap[i] = FlatTokenIndex(config, config.worldSize, 0);
           continue;
         }
-        destPe = destExpert / config.numExpertPerRank;
 
         // Deduplicate
         assert(config.numExpertPerToken < warpSize);
