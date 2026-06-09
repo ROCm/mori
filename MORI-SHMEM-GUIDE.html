@@ -673,39 +673,43 @@
 <td><p>RDMA NIC selection. Include: <code class="docutils literal notranslate"><span class="pre">mlx5_0,mlx5_1</span></code>. Exclude: <code class="docutils literal notranslate"><span class="pre">^mlx5_2,mlx5_3</span></code></p></td>
 <td><p>All available</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_NUM_QP_PER_PE</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_IBVERBS_LIB</span></code></p></td>
+<td><p>Path/soname of libibverbs to <code class="docutils literal notranslate"><span class="pre">dlopen</span></code> at runtime (mori loads libibverbs dynamically instead of linking it). Set this to point at an out-of-tree libibverbs.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">libibverbs.so</span></code> / <code class="docutils literal notranslate"><span class="pre">libibverbs.so.1</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_NUM_QP_PER_PE</span></code></p></td>
 <td><p>Number of RDMA queue pairs per PE</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_IB_GID_INDEX</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_IB_GID_INDEX</span></code></p></td>
 <td><p>InfiniBand GID index for RDMA connections</p></td>
 <td><p>Auto-detect</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_RDMA_SL</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_RDMA_SL</span></code></p></td>
 <td><p>RDMA service level</p></td>
 <td><p>Auto</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_RDMA_TC</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_RDMA_TC</span></code></p></td>
 <td><p>RDMA traffic class</p></td>
 <td><p>Auto</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_DISABLE_P2P</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_DISABLE_P2P</span></code></p></td>
 <td><p>Disable P2P (XGMI) transport, force RDMA</p></td>
 <td><p>Not set</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_DISABLE_TOPO</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_DISABLE_TOPO</span></code></p></td>
 <td><p>Disable topology detection</p></td>
 <td><p>Not set</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_GLOBAL_LOG_LEVEL</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_GLOBAL_LOG_LEVEL</span></code></p></td>
 <td><p>Global log verbosity: <code class="docutils literal notranslate"><span class="pre">TRACE</span></code>, <code class="docutils literal notranslate"><span class="pre">DEBUG</span></code>, <code class="docutils literal notranslate"><span class="pre">INFO</span></code>, <code class="docutils literal notranslate"><span class="pre">WARN</span></code>, <code class="docutils literal notranslate"><span class="pre">ERROR</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">INFO</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_PRECOMPILE</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_PRECOMPILE</span></code></p></td>
 <td><p>Precompile all JIT kernels on import</p></td>
 <td><p>Not set</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_DISABLE_JIT</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_DISABLE_JIT</span></code></p></td>
 <td><p>Disable JIT compilation of device bitcode</p></td>
 <td><p>Not set</p></td>
 </tr>
