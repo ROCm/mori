@@ -48,6 +48,38 @@ static void ValidateRdmaNotificationConfig(const RdmaBackendConfig& config) {
   }
 }
 
+void ValidateRdmaTransferConfig(const RdmaBackendConfig& config) {
+  if (config.maxChunksPerTransfer < 1) {
+    MORI_IO_ERROR("Invalid RDMA config: maxChunksPerTransfer must be >= 1; got {}",
+                  config.maxChunksPerTransfer);
+    throw std::runtime_error("Invalid RDMA config: maxChunksPerTransfer must be >= 1");
+  }
+  if (config.numNicsPerTransfer < 1) {
+    MORI_IO_ERROR("Invalid RDMA config: numNicsPerTransfer must be >= 1; got {}",
+                  config.numNicsPerTransfer);
+    throw std::runtime_error("Invalid RDMA config: numNicsPerTransfer must be >= 1");
+  }
+  if (config.enableTransferChunking && config.chunkBytes < 4096) {
+    MORI_IO_ERROR(
+        "Invalid RDMA config: chunkBytes must be >= 4096 when chunking is enabled; got {}",
+        config.chunkBytes);
+    throw std::runtime_error(
+        "Invalid RDMA config: chunkBytes must be >= 4096 when chunking is enabled");
+  }
+}
+
+bool UsesInlineOnly(const RdmaBackendConfig& config) {
+  return config.enableTransferChunking || config.numNicsPerTransfer > 1;
+}
+
+int ResolveRequestedNics(const RdmaBackendConfig& config, const TopoKey& local,
+                         const TopoKey& remote) {
+  if (local.loc == MemoryLocationType::GPU || remote.loc == MemoryLocationType::GPU) {
+    return 1;
+  }
+  return std::max(1, config.numNicsPerTransfer);
+}
+
 enum class CqeFailureOrigin : uint8_t {
   BatchTransfer = 0,
   NotificationSend,
@@ -170,20 +202,39 @@ RdmaManager::~RdmaManager() {
   }
 }
 
-std::vector<std::pair<int, int>> RdmaManager::Search(TopoKey key) {
+std::vector<std::pair<int, int>> RdmaManager::Search(TopoKey key, int requestedNics) {
+  if (requestedNics <= 0) {
+    requestedNics = std::max(1, config.numNicsPerTransfer);
+  }
+
   if (key.loc == MemoryLocationType::GPU) {
-    std::string nicName = topo->MatchGpuAndNic(key.deviceId);
-    assert(!nicName.empty());
-    for (int i = 0; i < availDevices.size(); i++) {
-      if (availDevices[i].first->Name() == nicName) {
-        return {{i, 1}};
+    std::vector<std::string> nicNames;
+    if (requestedNics == 1) {
+      std::string nicName = topo->MatchGpuAndNic(key.deviceId);
+      if (!nicName.empty()) nicNames.push_back(std::move(nicName));
+    } else {
+      nicNames = topo->MatchGpuAndNics(key.deviceId, requestedNics);
+    }
+
+    std::vector<std::pair<int, int>> matches;
+    matches.reserve(nicNames.size());
+    for (const auto& nicName : nicNames) {
+      for (int i = 0; i < availDevices.size(); i++) {
+        if (availDevices[i].first->Name() == nicName) {
+          matches.push_back({i, 1});
+          break;
+        }
       }
     }
-    MORI_IO_WARN("No matching NIC found for GPU {}, nicName: {}", key.deviceId, nicName);
+    if (!matches.empty()) return matches;
+    MORI_IO_WARN("No matching NIC found for GPU {}", key.deviceId);
   } else if (key.loc == MemoryLocationType::CPU) {
     if (availDevices.empty()) return {};
     const char* envNic = std::getenv("MORI_IO_RDMA_NIC_IDX");
     if (envNic) {
+      if (requestedNics > 1) {
+        MORI_IO_WARN("MORI_IO_RDMA_NIC_IDX pins a single NIC; multi-NIC selection is disabled");
+      }
       int idx = std::atoi(envNic);
       if (idx >= 0 && idx < static_cast<int>(availDevices.size())) {
         return {{idx, 1}};
@@ -191,8 +242,25 @@ std::vector<std::pair<int, int>> RdmaManager::Search(TopoKey key) {
       MORI_IO_WARN("MORI_IO_RDMA_NIC_IDX={} out of range [0, {}), falling back to round-robin", idx,
                    availDevices.size());
     }
-    int idx = (roundRobinCounter.fetch_add(1, std::memory_order_relaxed) % availDevices.size());
-    return {{idx, 1}};
+
+    if (requestedNics == 1) {
+      int idx = (roundRobinCounter.fetch_add(1, std::memory_order_relaxed) % availDevices.size());
+      return {{idx, 1}};
+    }
+
+    std::vector<std::string> nicNames = topo->MatchCpuNics(key.numaNode, requestedNics);
+    std::vector<std::pair<int, int>> matches;
+    matches.reserve(nicNames.size());
+    for (const auto& nicName : nicNames) {
+      for (int i = 0; i < availDevices.size(); i++) {
+        if (availDevices[i].first->Name() == nicName) {
+          matches.push_back({i, 1});
+          break;
+        }
+      }
+    }
+    if (!matches.empty()) return matches;
+    MORI_IO_WARN("No matching NIC found for CPU numa node {}", key.numaNode);
   }
   MORI_IO_ERROR(
       "topo searching for device other than CPU/GPU is not implemented yet, returning default "
@@ -206,7 +274,7 @@ std::optional<application::RdmaMemoryRegion> RdmaManager::GetLocalMemory(int dev
   std::shared_lock<std::shared_mutex> lock(mu);
   MemoryKey key{devId, id};
   if (mTable.find(key) == mTable.end()) return std::nullopt;
-  return mTable[key];
+  return mTable.at(key);
 }
 
 application::RdmaMemoryRegion RdmaManager::RegisterLocalMemory(int devId, const MemoryDesc& desc) {
@@ -226,17 +294,37 @@ void RdmaManager::DeregisterLocalMemory(int devId, const MemoryDesc& desc) {
   }
 }
 
+void RdmaManager::DeregisterLocalMemory(const MemoryDesc& desc) {
+  std::unique_lock<std::shared_mutex> lock(mu);
+  std::vector<MemoryKey> keysToErase;
+  keysToErase.reserve(mTable.size());
+  for (const auto& [key, _] : mTable) {
+    if (key.id == desc.id) keysToErase.push_back(key);
+  }
+  for (const auto& key : keysToErase) {
+    auto it = mTable.find(key);
+    if (it == mTable.end()) continue;
+    if (key.devId >= 0 && key.devId < static_cast<int>(deviceCtxs.size()) &&
+        deviceCtxs[key.devId] != nullptr) {
+      deviceCtxs[key.devId]->DeregisterRdmaMemoryRegion(reinterpret_cast<void*>(desc.data));
+    }
+    mTable.erase(it);
+  }
+}
+
 /* ---------------------------------- Remote Memory Management ---------------------------------- */
 std::optional<application::RdmaMemoryRegion> RdmaManager::GetRemoteMemory(EngineKey ekey,
                                                                           int remRdmaDevId,
                                                                           MemoryUniqueId id) {
   std::shared_lock<std::shared_mutex> lock(mu);
+  auto remoteIt = remotes.find(ekey);
+  if (remoteIt == remotes.end()) return std::nullopt;
   MemoryKey key{remRdmaDevId, id};
-  RemoteEngineMeta& remote = remotes[ekey];
+  const RemoteEngineMeta& remote = remoteIt->second;
   if (remote.mTable.find(key) == remote.mTable.end()) {
     return std::nullopt;
   }
-  return remote.mTable[key];
+  return remote.mTable.at(key);
 }
 
 void RdmaManager::RegisterRemoteMemory(EngineKey ekey, int remRdmaDevId, MemoryUniqueId id,
@@ -259,12 +347,20 @@ void RdmaManager::DeregisterRemoteMemory(EngineKey ekey, int remRdmaDevId, Memor
 /* ------------------------------------- Endpoint Management ------------------------------------ */
 int RdmaManager::CountEndpoint(EngineKey engine, TopoKeyPair key) {
   std::shared_lock<std::shared_mutex> lock(mu);
-  return remotes[engine].rTable[key].size();
+  auto remoteIt = remotes.find(engine);
+  if (remoteIt == remotes.end()) return 0;
+  auto tableIt = remoteIt->second.rTable.find(key);
+  if (tableIt == remoteIt->second.rTable.end()) return 0;
+  return tableIt->second.size();
 }
 
 EpPairVec RdmaManager::GetAllEndpoint(EngineKey engine, TopoKeyPair key) {
   std::shared_lock<std::shared_mutex> lock(mu);
-  return remotes[engine].rTable[key];
+  auto remoteIt = remotes.find(engine);
+  if (remoteIt == remotes.end()) return {};
+  auto tableIt = remoteIt->second.rTable.find(key);
+  if (tableIt == remoteIt->second.rTable.end()) return {};
+  return tableIt->second;
 }
 
 application::RdmaEndpointConfig RdmaManager::GetRdmaEndpointConfig(int devId) {
@@ -764,8 +860,9 @@ void NotifManager::Shutdown() {
 /* ----------------------------------------------------------------------------------------------
  */
 ControlPlaneServer::ControlPlaneServer(const std::string& k, const std::string& host, int port,
-                                       RdmaManager* rdmaMgr, NotifManager* notifMgr)
-    : myEngKey(k) {
+                                       const RdmaBackendConfig& cfg, RdmaManager* rdmaMgr,
+                                       NotifManager* notifMgr)
+    : myEngKey(k), config(cfg) {
   ctx.reset(new application::TCPContext(host, port));
   rdma = rdmaMgr;
   notif = notifMgr;
@@ -790,7 +887,7 @@ std::optional<int> ControlPlaneServer::TryGetRemoteEnginePort(const EngineKey& e
   return it->second.port;
 }
 
-void ControlPlaneServer::BuildRdmaConn(EngineKey ekey, TopoKeyPair topo) {
+void ControlPlaneServer::BuildRdmaConn(EngineKey ekey, TopoKeyPair topo, int nicRank) {
   application::TCPEndpointHandle tcph;
   {
     std::lock_guard<std::mutex> lock(mu);
@@ -799,14 +896,16 @@ void ControlPlaneServer::BuildRdmaConn(EngineKey ekey, TopoKeyPair topo) {
     tcph = ctx->Connect(rdesc.host, rdesc.port);
   }
 
-  auto candidates = rdma->Search(topo.local);
+  int requestedNics = ResolveRequestedNics(config, topo.local, topo.remote);
+  auto candidates = rdma->Search(topo.local, requestedNics);
   assert(!candidates.empty());
-  auto [devId, weight] = candidates[0];
+  int rank = std::min<int>(nicRank, static_cast<int>(candidates.size()) - 1);
+  auto [devId, weight] = candidates[rank];
 
   application::RdmaEndpoint lep = rdma->CreateEndpoint(devId);
 
   Protocol p(tcph);
-  p.WriteMessageRegEndpoint({myEngKey, topo, devId, lep.handle});
+  p.WriteMessageRegEndpoint({myEngKey, topo, devId, lep.handle, rank});
   MessageHeader hdr = p.ReadMessageHeader();
   assert(hdr.type == MessageType::RegEndpoint);
   MessageRegEndpoint msg = p.ReadMessageRegEndpoint(hdr.len);
@@ -863,22 +962,37 @@ void ControlPlaneServer::HandleControlPlaneProtocol(int fd) {
   assert(eps.find(fd) != eps.end());
   application::TCPEndpointHandle tcph = eps[fd];
 
+  // Detect remote close: Recv returns 0 for both success and EOF, so
+  // SYSCALL_RETURN_ZERO can't distinguish them — peek before reading to avoid
+  // processing an uninitialized header when the peer disconnects.
+  {
+    char probe;
+    if (::recv(fd, &probe, 1, MSG_PEEK) == 0) {
+      MORI_IO_DEBUG("ControlPlaneServer: peer closed connection on fd {}", fd);
+      ctx->CloseEndpoint(tcph);
+      eps.erase(fd);
+      return;
+    }
+  }
+
   Protocol p(tcph);
   MessageHeader hdr = p.ReadMessageHeader();
 
   switch (hdr.type) {
     case MessageType::RegEndpoint: {
       MessageRegEndpoint msg = p.ReadMessageRegEndpoint(hdr.len);
-      auto candidates = rdma->Search(msg.topo.remote);
+      int requestedNics = ResolveRequestedNics(config, msg.topo.remote, msg.topo.local);
+      auto candidates = rdma->Search(msg.topo.remote, requestedNics);
       assert(!candidates.empty());
       int rdevId = msg.devId;
-      auto [devId, weight] = candidates[0];
+      int rank = std::min<int>(msg.nicRank, static_cast<int>(candidates.size()) - 1);
+      auto [devId, weight] = candidates[rank];
       application::RdmaEndpoint lep = rdma->CreateEndpoint(devId);
       EndpointId eid =
           rdma->ConnectEndpoint(msg.ekey, devId, lep, rdevId, msg.eph, msg.topo, weight);
       auto ert = rdma->GetEndpointRuntime(eid);
       notif->RegisterEndpoint(ert);
-      p.WriteMessageRegEndpoint(MessageRegEndpoint{myEngKey, msg.topo, devId, lep.handle});
+      p.WriteMessageRegEndpoint(MessageRegEndpoint{myEngKey, msg.topo, devId, lep.handle, rank});
       SYSCALL_RETURN_ZERO(epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL));
       break;
     }
@@ -959,11 +1073,66 @@ void ControlPlaneServer::Shutdown() {
 /*                                       RdmaBackendSession */
 /* ----------------------------------------------------------------------------------------------
  */
+std::vector<int> BuildDesiredQpCounts(int totalQp, int numRanks) {
+  std::vector<int> counts(numRanks, 0);
+  if (totalQp <= 0 || numRanks <= 0) return counts;
+  const int base = totalQp / numRanks;
+  const int rem = totalQp % numRanks;
+  for (int rank = 0; rank < numRanks; ++rank) {
+    counts[rank] = base + (rank < rem ? 1 : 0);
+  }
+  return counts;
+}
+
+EpPairVec InterleaveEndpointsByLocalDevice(const EpPairVec& eps,
+                                           const std::vector<int>& localDevOrder,
+                                           const std::vector<int>& wantPerRank) {
+  assert(localDevOrder.size() == wantPerRank.size());
+  std::unordered_map<int, size_t> rankByDev;
+  for (size_t rank = 0; rank < localDevOrder.size(); ++rank) {
+    rankByDev[localDevOrder[rank]] = rank;
+  }
+
+  std::vector<EpPairVec> buckets(localDevOrder.size());
+  int wantTotal = 0;
+  for (int want : wantPerRank) wantTotal += want;
+
+  for (const auto& ep : eps) {
+    auto it = rankByDev.find(ep.ldevId);
+    if (it == rankByDev.end()) continue;
+    size_t rank = it->second;
+    if (static_cast<int>(buckets[rank].size()) < wantPerRank[rank]) {
+      buckets[rank].push_back(ep);
+    }
+  }
+
+  EpPairVec interleaved;
+  interleaved.reserve(wantTotal);
+  for (size_t round = 0; interleaved.size() < static_cast<size_t>(wantTotal); ++round) {
+    bool progressed = false;
+    for (size_t rank = 0; rank < buckets.size(); ++rank) {
+      if (round >= buckets[rank].size()) continue;
+      interleaved.push_back(buckets[rank][round]);
+      progressed = true;
+      if (interleaved.size() == static_cast<size_t>(wantTotal)) break;
+    }
+    if (!progressed) break;
+  }
+
+  return interleaved;
+}
+
+/* ----------------------------------------------------------------------------------------------
+ */
 RdmaBackendSession::RdmaBackendSession(const RdmaBackendConfig& config,
-                                       const application::RdmaMemoryRegion& l,
-                                       const application::RdmaMemoryRegion& r, const EpPairVec& e,
-                                       Executor* exec)
-    : config(config), local(l), remote(r), eps(e), executor(exec) {}
+                                       std::vector<application::RdmaMemoryRegion> localMrPerEp,
+                                       std::vector<application::RdmaMemoryRegion> remoteMrPerEp,
+                                       const EpPairVec& e, Executor* exec)
+    : config(config),
+      localMrPerEp(std::move(localMrPerEp)),
+      remoteMrPerEp(std::move(remoteMrPerEp)),
+      eps(e),
+      executor(exec) {}
 
 void RdmaBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size_t size,
                                    TransferStatus* status, TransferUniqueId id, bool isRead) {
@@ -972,8 +1141,10 @@ void RdmaBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size
   auto callbackMeta = std::make_shared<CqCallbackMeta>(status, id, 1);
   internal::PublishCurrentIoCallDiagnostics(callbackMeta);
 
-  RdmaOpRet ret =
-      RdmaReadWrite(eps, local, localOffset, remote, remoteOffset, size, callbackMeta, id, isRead);
+  RdmaOpRet ret = RdmaBatchReadWrite(eps, localMrPerEp, remoteMrPerEp, {localOffset},
+                                     {remoteOffset}, {size}, callbackMeta, id, isRead, 1,
+                                     config.enableTransferChunking ? config.chunkBytes : 0,
+                                     config.maxChunksPerTransfer, config.enableTransferChunking);
 
   assert(!ret.Init());
   if (ret.Failed() || ret.Succeeded()) {
@@ -996,12 +1167,14 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
   internal::PublishCurrentIoCallDiagnostics(callbackMeta);
   RdmaOpRet ret;
   if (executor) {
-    ExecutorReq req{eps,          local, localOffsets,         remote, remoteOffsets, sizes,
-                    callbackMeta, id,    config.postBatchSize, isRead};
+    ExecutorReq req{eps,   localMrPerEp.front(), localOffsets, remoteMrPerEp.front(), remoteOffsets,
+                    sizes, callbackMeta,         id,           config.postBatchSize,  isRead};
     ret = executor->RdmaBatchReadWrite(req);
   } else {
-    ret = RdmaBatchReadWrite(eps, local, localOffsets, remote, remoteOffsets, sizes, callbackMeta,
-                             id, isRead, config.postBatchSize);
+    ret = RdmaBatchReadWrite(eps, localMrPerEp, remoteMrPerEp, localOffsets, remoteOffsets, sizes,
+                             callbackMeta, id, isRead, config.postBatchSize,
+                             config.enableTransferChunking ? config.chunkBytes : 0,
+                             config.maxChunksPerTransfer, config.enableTransferChunking);
   }
   assert(!ret.Init());
   if (ret.Failed() || ret.Succeeded()) {
@@ -1033,7 +1206,15 @@ RdmaBackend::RdmaBackend(EngineKey k, const IOEngineConfig& engConfig,
     : myEngKey(k), config(beConfig) {
   env::Override("MORI_IO_ENABLE_NOTIFICATION", config.enableNotification,
                 mori::env::detail::ParseBool);
+  env::Override("MORI_IO_ENABLE_CHUNKING", config.enableTransferChunking,
+                mori::env::detail::ParseBool);
+  env::Override("MORI_IO_CHUNK_BYTES", config.chunkBytes, mori::env::detail::ParsePositiveInt);
+  env::Override("MORI_IO_MAX_CHUNKS", config.maxChunksPerTransfer,
+                mori::env::detail::ParsePositiveInt);
+  env::Override("MORI_IO_NUM_NICS_PER_TRANSFER", config.numNicsPerTransfer,
+                mori::env::detail::ParsePositiveInt);
   ValidateRdmaNotificationConfig(config);
+  ValidateRdmaTransferConfig(config);
 
   auto rdmaCtx = std::make_unique<application::RdmaContext>(application::RdmaBackendType::IBVerbs);
   rdma.reset(new mori::io::RdmaManager(config, rdmaCtx.get()));
@@ -1042,11 +1223,18 @@ RdmaBackend::RdmaBackend(EngineKey k, const IOEngineConfig& engConfig,
   notif.reset(new NotifManager(rdma.get(), config));
   notif->Start();
 
-  server.reset(
-      new ControlPlaneServer(myEngKey, engConfig.host, engConfig.port, rdma.get(), notif.get()));
+  server.reset(new ControlPlaneServer(myEngKey, engConfig.host, engConfig.port, config, rdma.get(),
+                                      notif.get()));
   server->Start();
 
-  if (config.numWorkerThreads > 1) {
+  bool useInlineOnly = UsesInlineOnly(config);
+  if (config.numWorkerThreads > 1 && useInlineOnly) {
+    MORI_IO_WARN(
+        "numWorkerThreads={} is ignored because transfer chunking / multi-NIC is enabled; "
+        "using single-thread inline posting",
+        config.numWorkerThreads);
+  }
+  if (config.numWorkerThreads > 1 && !useInlineOnly) {
     executor.reset(
         new MultithreadExecutor(std::min(config.qpPerTransfer, config.numWorkerThreads)));
     executor->Start();
@@ -1077,6 +1265,7 @@ void RdmaBackend::RegisterMemory(MemoryDesc& desc) { server->RegisterMemory(desc
 
 void RdmaBackend::DeregisterMemory(const MemoryDesc& desc) {
   server->DeregisterMemory(desc);
+  rdma->DeregisterLocalMemory(desc);
   InvalidateSessionsForMemory(desc.id);
 }
 
@@ -1119,39 +1308,106 @@ BackendSession* RdmaBackend::CreateSession(const MemoryDesc& local, const Memory
 
 void RdmaBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remote,
                                 RdmaBackendSession& sess) {
-  TopoKey localKey{local.deviceId, local.loc};
-  TopoKey remoteKey{remote.deviceId, remote.loc};
+  TopoKey localKey{local.deviceId, local.loc, local.numaNode};
+  TopoKey remoteKey{remote.deviceId, remote.loc, remote.numaNode};
   TopoKeyPair kp{localKey, remoteKey};
 
   EngineKey ekey = remote.engineKey;
 
-  // Create a pair of endpoint if none
-  int epNum = rdma->CountEndpoint(ekey, kp);
-  for (int i = 0; i < (config.qpPerTransfer - epNum); i++) {
-    server->BuildRdmaConn(ekey, kp);
+  auto buildLock = GetConnBuildLock(ekey, kp);
+  std::lock_guard<std::mutex> connGuard(*buildLock);
+
+  std::vector<std::pair<int, int>> localCandidates;
+  int effectiveNumNics = 1;
+  int requestedNics = ResolveRequestedNics(config, kp.local, kp.remote);
+  if (requestedNics > 1) {
+    localCandidates = rdma->Search(kp.local, requestedNics);
+    if (localCandidates.empty()) {
+      throw std::runtime_error("RdmaBackend::CreateSession: no local RDMA candidate found");
+    }
+    effectiveNumNics = std::max(1, std::min({requestedNics, config.qpPerTransfer,
+                                             static_cast<int>(localCandidates.size())}));
   }
+  std::vector<int> desiredPerRank = BuildDesiredQpCounts(config.qpPerTransfer, effectiveNumNics);
+
+  if (effectiveNumNics == 1) {
+    int epNum = rdma->CountEndpoint(ekey, kp);
+    for (int i = epNum; i < config.qpPerTransfer; ++i) {
+      server->BuildRdmaConn(ekey, kp, 0);
+    }
+  } else {
+    std::unordered_map<int, int> rankByDev;
+    for (int rank = 0; rank < effectiveNumNics; ++rank) {
+      rankByDev[localCandidates[rank].first] = rank;
+    }
+
+    EpPairVec existing = rdma->GetAllEndpoint(ekey, kp);
+    std::vector<int> haveByRank(effectiveNumNics, 0);
+    for (const auto& ep : existing) {
+      auto it = rankByDev.find(ep.ldevId);
+      if (it != rankByDev.end()) haveByRank[it->second] += 1;
+    }
+
+    for (int rank = 0; rank < effectiveNumNics; ++rank) {
+      for (int count = haveByRank[rank]; count < desiredPerRank[rank]; ++count) {
+        server->BuildRdmaConn(ekey, kp, rank);
+      }
+    }
+  }
+
   EpPairVec eps = rdma->GetAllEndpoint(ekey, kp);
-  assert(!eps.empty());
-
-  EpPairVec epSet = {eps.begin(), eps.begin() + config.qpPerTransfer};
-
-  // TODO: we assume all eps is on same device and has same ldevId/rdevId
-  EpPair ep = epSet[0];
-  auto localMr = rdma->GetLocalMemory(ep.ldevId, local.id);
-  if (!localMr.has_value()) {
-    localMr = rdma->RegisterLocalMemory(ep.ldevId, local);
+  if (static_cast<int>(eps.size()) < config.qpPerTransfer) {
+    throw std::runtime_error("RdmaBackend::CreateSession: insufficient RDMA endpoints");
   }
 
-  auto remoteMr = rdma->GetRemoteMemory(ekey, ep.rdevId, remote.id);
-  if (!remoteMr.has_value()) {
-    remoteMr = server->AskRemoteMemoryRegion(ekey, ep.rdevId, remote.id);
-    // TODO: protocol should return status code
-    // Currently we check member equality to ensure correct memory region
-    assert(remoteMr->length == remote.size);
-    rdma->RegisterRemoteMemory(ekey, ep.rdevId, remote.id, remoteMr.value());
+  EpPairVec epSet;
+  if (effectiveNumNics == 1) {
+    epSet = {eps.begin(), eps.begin() + config.qpPerTransfer};
+  } else {
+    std::vector<int> localDevOrder;
+    localDevOrder.reserve(effectiveNumNics);
+    for (int rank = 0; rank < effectiveNumNics; ++rank) {
+      localDevOrder.push_back(localCandidates[rank].first);
+    }
+    epSet = InterleaveEndpointsByLocalDevice(eps, localDevOrder, desiredPerRank);
+    if (static_cast<int>(epSet.size()) != config.qpPerTransfer) {
+      throw std::runtime_error(
+          "RdmaBackend::CreateSession: failed to assemble multi-NIC endpoint set");
+    }
   }
 
-  sess = RdmaBackendSession(config, localMr.value(), remoteMr.value(), epSet, executor.get());
+  std::unordered_map<int, application::RdmaMemoryRegion> localMrByDev;
+  std::unordered_map<int, application::RdmaMemoryRegion> remoteMrByDev;
+  std::vector<application::RdmaMemoryRegion> localMrPerEp;
+  std::vector<application::RdmaMemoryRegion> remoteMrPerEp;
+  localMrPerEp.reserve(epSet.size());
+  remoteMrPerEp.reserve(epSet.size());
+
+  for (const auto& ep : epSet) {
+    if (localMrByDev.find(ep.ldevId) == localMrByDev.end()) {
+      auto localMr = rdma->GetLocalMemory(ep.ldevId, local.id);
+      if (!localMr.has_value()) {
+        localMr = rdma->RegisterLocalMemory(ep.ldevId, local);
+      }
+      localMrByDev[ep.ldevId] = *localMr;
+    }
+
+    if (remoteMrByDev.find(ep.rdevId) == remoteMrByDev.end()) {
+      auto remoteMr = rdma->GetRemoteMemory(ekey, ep.rdevId, remote.id);
+      if (!remoteMr.has_value()) {
+        remoteMr = server->AskRemoteMemoryRegion(ekey, ep.rdevId, remote.id);
+        assert(remoteMr->length == remote.size);
+        rdma->RegisterRemoteMemory(ekey, ep.rdevId, remote.id, remoteMr.value());
+      }
+      remoteMrByDev[ep.rdevId] = *remoteMr;
+    }
+
+    localMrPerEp.push_back(localMrByDev.at(ep.ldevId));
+    remoteMrPerEp.push_back(remoteMrByDev.at(ep.rdevId));
+  }
+
+  sess = RdmaBackendSession(config, std::move(localMrPerEp), std::move(remoteMrPerEp), epSet,
+                            executor.get());
 }
 
 bool RdmaBackend::PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
@@ -1190,6 +1446,15 @@ void RdmaBackend::InvalidateSessionsForMemory(MemoryUniqueId id) {
       ++it;
     }
   }
+}
+
+std::shared_ptr<std::mutex> RdmaBackend::GetConnBuildLock(const EngineKey& remoteEngineKey,
+                                                          const TopoKeyPair& topo) {
+  std::lock_guard<std::mutex> guard(connBuildMapMu_);
+  ConnBuildKey key{remoteEngineKey, topo};
+  auto& lockPtr = connBuildMu_[key];
+  if (!lockPtr) lockPtr = std::make_shared<std::mutex>();
+  return lockPtr;
 }
 
 }  // namespace io

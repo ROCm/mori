@@ -51,6 +51,15 @@ inline constexpr uint16_t kXgmiOnlyFallbackPlaceholderPort = 1;
 
 }  // namespace internal
 
+void ValidateRdmaTransferConfig(const RdmaBackendConfig& config);
+bool UsesInlineOnly(const RdmaBackendConfig& config);
+int ResolveRequestedNics(const RdmaBackendConfig& config, const TopoKey& local,
+                         const TopoKey& remote);
+std::vector<int> BuildDesiredQpCounts(int totalQp, int numRanks);
+EpPairVec InterleaveEndpointsByLocalDevice(const EpPairVec& eps,
+                                           const std::vector<int>& localDevOrder,
+                                           const std::vector<int>& wantPerRank);
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                           RdmaManager                                          */
 /* ---------------------------------------------------------------------------------------------- */
@@ -62,12 +71,13 @@ class RdmaManager {
   application::RdmaEndpointConfig GetRdmaEndpointConfig(int devId);
 
   // Topology APIs
-  std::vector<std::pair<int, int>> Search(TopoKey);
+  std::vector<std::pair<int, int>> Search(TopoKey, int requestedNics = -1);
 
   // Local memory management APIs
   std::optional<application::RdmaMemoryRegion> GetLocalMemory(int ldevId, MemoryUniqueId);
   application::RdmaMemoryRegion RegisterLocalMemory(int ldevId, const MemoryDesc& desc);
   void DeregisterLocalMemory(int ldevId, const MemoryDesc& desc);
+  void DeregisterLocalMemory(const MemoryDesc& desc);
 
   // Remote memory management APIs
   std::optional<application::RdmaMemoryRegion> GetRemoteMemory(EngineKey, int remRdmaDevId,
@@ -193,8 +203,8 @@ class NotifManager {
 /* ---------------------------------------------------------------------------------------------- */
 class ControlPlaneServer {
  public:
-  ControlPlaneServer(const std::string& key, const std::string& host, int port, RdmaManager*,
-                     NotifManager*);
+  ControlPlaneServer(const std::string& key, const std::string& host, int port,
+                     const RdmaBackendConfig& config, RdmaManager*, NotifManager*);
   ~ControlPlaneServer();
 
   std::optional<uint16_t> GetListenPort() const {
@@ -208,7 +218,7 @@ class ControlPlaneServer {
   std::optional<int> TryGetRemoteEnginePort(const EngineKey&) const;
 
   // Endpoint management
-  void BuildRdmaConn(EngineKey, TopoKeyPair);
+  void BuildRdmaConn(EngineKey, TopoKeyPair, int nicRank);
 
   // MemoryRegion management
   void RegisterMemory(MemoryDesc&);
@@ -226,6 +236,7 @@ class ControlPlaneServer {
 
  private:
   EngineKey myEngKey;
+  RdmaBackendConfig config{};
 
   mutable std::mutex mu;
 
@@ -247,8 +258,9 @@ class ControlPlaneServer {
 class RdmaBackendSession : public BackendSession {
  public:
   RdmaBackendSession() = default;
-  RdmaBackendSession(const RdmaBackendConfig& config, const application::RdmaMemoryRegion& local,
-                     const application::RdmaMemoryRegion& remote, const EpPairVec& eps,
+  RdmaBackendSession(const RdmaBackendConfig& config,
+                     std::vector<application::RdmaMemoryRegion> localMrPerEp,
+                     std::vector<application::RdmaMemoryRegion> remoteMrPerEp, const EpPairVec& eps,
                      Executor* executor);
   ~RdmaBackendSession() = default;
 
@@ -263,8 +275,8 @@ class RdmaBackendSession : public BackendSession {
 
  private:
   RdmaBackendConfig config{};
-  application::RdmaMemoryRegion local{};
-  application::RdmaMemoryRegion remote{};
+  std::vector<application::RdmaMemoryRegion> localMrPerEp{};
+  std::vector<application::RdmaMemoryRegion> remoteMrPerEp{};
   EpPairVec eps{};
   Executor* executor{nullptr};
 };
@@ -326,8 +338,24 @@ class RdmaBackend : public Backend {
       return seed;
     }
   };
+  struct ConnBuildKey {
+    EngineKey remoteEngineKey;
+    TopoKeyPair topo;
+    bool operator==(const ConnBuildKey& o) const {
+      return remoteEngineKey == o.remoteEngineKey && topo == o.topo;
+    }
+  };
+  struct ConnBuildKeyHash {
+    std::size_t operator()(const ConnBuildKey& k) const noexcept {
+      std::size_t topoHash = std::hash<TopoKeyPair>{}(k.topo);
+      std::size_t engineHash = std::hash<std::string>{}(k.remoteEngineKey);
+      return topoHash ^ (engineHash + 0x9e3779b97f4a7c15ULL + (topoHash << 6) + (topoHash >> 2));
+    }
+  };
   RdmaBackendSession* GetOrCreateSessionCached(const MemoryDesc& local, const MemoryDesc& remote);
   void InvalidateSessionsForMemory(MemoryUniqueId id);
+  std::shared_ptr<std::mutex> GetConnBuildLock(const EngineKey& remoteEngineKey,
+                                               const TopoKeyPair& topo);
 
  private:
   EngineKey myEngKey;
@@ -340,6 +368,8 @@ class RdmaBackend : public Backend {
   std::unordered_map<SessionCacheKey, std::unique_ptr<RdmaBackendSession>, SessionCacheKeyHash>
       sessionCache;
   std::mutex sessionCacheMu;
+  std::mutex connBuildMapMu_;
+  std::unordered_map<ConnBuildKey, std::shared_ptr<std::mutex>, ConnBuildKeyHash> connBuildMu_;
 };
 
 }  // namespace io

@@ -206,7 +206,7 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
                       config.WeightBytes() + config.SrcTokenIdBytes() + blockwiseScaleBytes);
   }
 
-  if (config.kernelType == KernelType::IntraNode) {
+  if (config.kernelType == KernelType::IntraNode || config.kernelType == KernelType::IntraNodeLL) {
     auto& bufs = shmemTokBufs.emplace<ShmemBufsIntraNode>();
     bufs.combineInp = ShmemMallocAndReturnMemObjPtr(maxStagingSize, hipDeviceMallocUncached);
     bufs.dispatchOut = ShmemMallocAndReturnMemObjPtr(dispatchOutSize, hipDeviceMallocUncached);
@@ -219,11 +219,15 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
                              config.MaxXferBytesPerToken();
     size_t stagingSize = static_cast<ssize_t>(2 * nNodes) * config.MaxNumTokensToSendPerRank() *
                          config.MaxXferBytesPerToken();
+    size_t dispatchStagingSize =
+        static_cast<ssize_t>(config.MaxNumTokensToSendPerRank()) * config.MaxXferBytesPerToken();
     bufs.dispatchInp = ShmemMallocAndReturnMemObjPtr(dispatchInpSize, hipDeviceMallocUncached);
     bufs.combineInp = ShmemMallocAndReturnMemObjPtr(maxStagingSize, hipDeviceMallocUncached);
     bufs.staging = ShmemMallocAndReturnMemObjPtr(stagingSize, hipDeviceMallocUncached);
     bufs.dispatchOut = ShmemMallocAndReturnMemObjPtr(dispatchOutSize, hipDeviceMallocUncached);
     bufs.combineOut = ShmemMallocAndReturnMemObjPtr(combineOutSize, hipDeviceMallocUncached);
+    bufs.dispatchStaging =
+        ShmemMallocAndReturnMemObjPtr(dispatchStagingSize, hipDeviceMallocUncached);
   } else {
     auto& bufs = shmemTokBufs.emplace<ShmemBufsInterNode>();
     // NOTE(ditian12): no overflow protection for dispatchInp/combinInp/staging in async kernel,
@@ -279,7 +283,7 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
 }
 
 void EpDispatchCombineHandle::FinalizeShmemBuf() {
-  if (config.kernelType == KernelType::IntraNode) {
+  if (config.kernelType == KernelType::IntraNode || config.kernelType == KernelType::IntraNodeLL) {
     auto& bufs = std::get<ShmemBufsIntraNode>(shmemTokBufs);
     ShmemFree(bufs.dispatchOut->localPtr);
     ShmemFree(bufs.combineInp->localPtr);
@@ -292,6 +296,7 @@ void EpDispatchCombineHandle::FinalizeShmemBuf() {
     ShmemFree(bufs.dispatchOut->localPtr);
     ShmemFree(bufs.combineOut->localPtr);
     ShmemFree(bufs.staging->localPtr);
+    ShmemFree(bufs.dispatchStaging->localPtr);
   } else {
     auto& bufs = std::get<ShmemBufsInterNode>(shmemTokBufs);
     ShmemFree(bufs.dispatchInp->localPtr);
@@ -471,7 +476,8 @@ EpDispatchCombineArgsRaw GetEpDispatchCombineArgsRaw(const EpDispatchCombineHand
   args.scalesBuf = handle.scalesBuf;
   args.destPeTokenCounter = handle.destPeTokenCounter;
   args.localPeTokenCounter = handle.localPeTokenCounter;
-  if (handle.config.kernelType == KernelType::IntraNode) {
+  if (handle.config.kernelType == KernelType::IntraNode ||
+      handle.config.kernelType == KernelType::IntraNodeLL) {
     args.intraNodeTokBufs = std::get<ShmemBufsIntraNode>(handle.shmemTokBufs);
   } else if (handle.config.kernelType == KernelType::InterNodeV1 ||
              handle.config.kernelType == KernelType::InterNodeV1LL) {

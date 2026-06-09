@@ -154,14 +154,38 @@ def parse_args():
     parser.add_argument(
         "--num-qp-per-transfer",
         type=int,
-        default=1,
-        help="Number of QPs for a single transfer",
+        default=4,
+        help="Number of QPs for a single transfer (default: 4)",
     )
     parser.add_argument(
         "--num-worker-threads",
         type=int,
         default=1,
         help="Number of threads used for transfer",
+    )
+    parser.add_argument(
+        "--disable-chunking",
+        action="store_true",
+        help="Disable single-transfer chunking (chunking is enabled by default)",
+    )
+    parser.add_argument(
+        "--chunk-bytes",
+        type=int,
+        default=65536,
+        help="Chunk size in bytes when chunking is enabled (default: 64KB)",
+    )
+    parser.add_argument(
+        "--max-chunks",
+        type=int,
+        default=64,
+        help="Max number of chunks per transfer (default: 64)",
+    )
+    parser.add_argument(
+        "--mem-type",
+        type=str,
+        default="gpu",
+        choices=["gpu", "cpu"],
+        help="Memory type for transfer buffers: 'gpu' (cuda) or 'cpu' (host) (default: gpu)",
     )
     parser.add_argument(
         "--iters",
@@ -232,12 +256,16 @@ class MoriIoBenchmark:
         rank_in_node: int = 0,
         num_initiator_dev: int = 1,
         num_target_dev: int = 1,
-        num_qp_per_transfer: int = 1,
+        num_qp_per_transfer: int = 4,
         num_worker_threads: int = 1,
         poll_cq_mode: str = "polling",
         max_send_wr: int = 0,
         max_cqe_num: int = 0,
         max_msg_sge: int = 0,
+        enable_chunking: bool = True,
+        chunk_bytes: int = 65536,
+        max_chunks: int = 64,
+        mem_type: str = "gpu",
         src_gpu: int = 0,
         dst_gpu: int = 1,
         num_streams: int = 64,
@@ -271,6 +299,10 @@ class MoriIoBenchmark:
         self.max_send_wr = max_send_wr
         self.max_cqe_num = max_cqe_num
         self.max_msg_sge = max_msg_sge
+        self.enable_chunking = enable_chunking
+        self.chunk_bytes = chunk_bytes
+        self.max_chunks = max_chunks
+        self.mem_type = mem_type
 
         self.src_gpu = src_gpu
         self.dst_gpu = dst_gpu
@@ -301,16 +333,20 @@ class MoriIoBenchmark:
             self.global_rank = self.role_rank + self.num_initiator_dev
             self.role = EngineRole.TARGET
 
-        self.device = torch.device("cuda", self.role_rank)
         # When not batch_contiguous, use strided offsets so buffer must fit (buffer_size+1)*transfer_batch_size
         total_elements = (
             (self.buffer_size + 1) * self.transfer_batch_size
             if not self.batch_contiguous
             else self.buffer_size * self.transfer_batch_size
         )
-        self.tensor = torch.randn(total_elements).to(
-            self.device, dtype=torch.float8_e4m3fnuz
-        )
+        if self.mem_type == "cpu":
+            self.device = torch.device("cpu")
+            self.tensor = torch.randint(0, 256, (total_elements,), dtype=torch.uint8)
+        else:
+            self.device = torch.device("cuda", self.role_rank)
+            self.tensor = torch.randn(total_elements).to(
+                self.device, dtype=torch.float8_e4m3fnuz
+            )
 
     def _setup_xgmi(self):
         if self.xgmi_multiprocess:
@@ -368,8 +404,13 @@ class MoriIoBenchmark:
             print(f"  role_rank: {self.role_rank}")
             print(f"  num_initiator_dev: {self.num_initiator_dev}")
             print(f"  num_target_dev: {self.num_target_dev}")
+            print(f"  mem_type: {self.mem_type}")
             print(f"  num_qp_per_transfer: {self.num_qp_per_transfer}")
             print(f"  num_worker_threads: {self.num_worker_threads}")
+            print(f"  enable_chunking: {self.enable_chunking}")
+            if self.enable_chunking:
+                print(f"  chunk_bytes: {self.chunk_bytes}")
+                print(f"  max_chunks: {self.max_chunks}")
             print(f"  poll_cq_mode: {self.poll_cq_mode}")
             if self.max_send_wr or self.max_cqe_num or self.max_msg_sge:
                 print(
@@ -528,6 +569,9 @@ class MoriIoBenchmark:
             post_batch_size=-1,
             num_worker_threads=self.num_worker_threads,
             poll_cq_mode=self.poll_cq_mode,
+            enable_transfer_chunking=self.enable_chunking,
+            chunk_bytes=self.chunk_bytes,
+            max_chunks_per_transfer=self.max_chunks,
         )
         if self.max_send_wr > 0:
             config.max_send_wr = self.max_send_wr
@@ -971,6 +1015,10 @@ def benchmark_engine(local_rank, node_rank, args):
         max_send_wr=args.max_send_wr,
         max_cqe_num=args.max_cqe_num,
         max_msg_sge=args.max_msg_sge,
+        enable_chunking=not args.disable_chunking,
+        chunk_bytes=args.chunk_bytes,
+        max_chunks=args.max_chunks,
+        mem_type=args.mem_type,
     )
     bench.print_config()
     bench.run()

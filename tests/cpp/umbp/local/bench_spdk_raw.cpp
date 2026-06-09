@@ -48,11 +48,11 @@
 #include <thread>
 #include <vector>
 
+#include "mori/utils/mori_log.hpp"
 #include "umbp/common/config.h"
-#include "umbp/common/log.h"
-#include "umbp/local/storage/spdk_ssd_tier.h"
-#include "umbp/local/storage/ssd_tier.h"
-#include "umbp/spdk/spdk_env.h"
+#include "umbp/local/tiers/spdk_ssd_tier.h"
+#include "umbp/local/tiers/ssd_tier.h"
+#include "umbp/storage/spdk/spdk_env.h"
 
 using namespace mori::umbp;
 using Clock = std::chrono::high_resolution_clock;
@@ -131,7 +131,7 @@ static void SeqDirectWorker(umbp::SpdkEnv& env, size_t io_size, size_t aligned_i
   auto dma_bufs = std::make_unique<void*[]>(qd);
   int got = env.DmaPoolAllocBatch(dma_bufs.get(), aligned_io, qd, env.GetBlockSize());
   if (got == 0) {
-    UMBP_LOG_ERROR("DMA alloc failed");
+    MORI_UMBP_ERROR("DMA alloc failed");
     return;
   }
   qd = got;
@@ -391,7 +391,7 @@ int main(int argc, char** argv) {
   {
     PrintHeader("SpdkSsdTier BATCH THROUGHPUT");
 
-    UMBPConfig tier_cfg;
+    UMBPSsdConfig tier_cfg;
     tier_cfg.ssd_backend = "spdk";
     tier_cfg.spdk_bdev_name = ecfg.bdev_name;
     tier_cfg.spdk_reactor_mask = ecfg.reactor_mask;
@@ -399,7 +399,7 @@ int main(int argc, char** argv) {
     tier_cfg.spdk_nvme_pci_addr = ecfg.nvme_pci_addr;
     tier_cfg.spdk_nvme_ctrl_name = ecfg.nvme_ctrl_name;
     tier_cfg.spdk_io_workers = bench.threads;
-    tier_cfg.ssd.capacity_bytes = env.GetBdevSize();
+    tier_cfg.capacity_bytes = env.GetBdevSize();
 
     SpdkSsdTier tier(tier_cfg);
     if (!tier.IsValid()) {
@@ -486,7 +486,7 @@ int main(int argc, char** argv) {
       std::vector<double> wbw, rbw;
       for (int iter = 0; iter < bench.iterations; ++iter) {
         UMBPConfig posix_cfg;
-        SSDTier posix_tier(posix_dir, 8ULL * 1024 * 1024 * 1024, posix_cfg);
+        SSDTier posix_tier(posix_dir, 8ULL * 1024 * 1024 * 1024, posix_cfg.ssd);
 
         std::vector<std::string> keys(count);
         std::vector<std::vector<char>> bufs(count);

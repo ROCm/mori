@@ -1,3 +1,14 @@
+# ---------------------------------------------------------------------------
+# GoogleTest — fetched once here; gtest_main is available to all subdirs.
+# ---------------------------------------------------------------------------
+include(FetchContent)
+FetchContent_Declare(
+  googletest
+  GIT_REPOSITORY https://github.com/google/googletest.git
+  GIT_TAG v1.14.0
+  GIT_SHALLOW TRUE)
+FetchContent_MakeAvailable(googletest)
+
 add_executable(test_transport_tcp application/test_transport_tcp.cpp)
 
 target_include_directories(test_transport_tcp
@@ -18,6 +29,13 @@ if(BUILD_IO)
   target_include_directories(test_engine PUBLIC ${CMAKE_SOURCE_DIR}/include)
   target_include_directories(test_engine PUBLIC ${CMAKE_SOURCE_DIR})
   target_link_libraries(test_engine mori_application mori_io)
+
+  add_executable(test_transfer_wait io/test_transfer_wait.cpp)
+
+  target_include_directories(test_transfer_wait
+                             PUBLIC ${CMAKE_SOURCE_DIR}/include)
+  target_include_directories(test_transfer_wait PUBLIC ${CMAKE_SOURCE_DIR})
+  target_link_libraries(test_transfer_wait mori_application mori_io)
 
   add_executable(test_topology application/test_topology.cpp)
 
@@ -51,4 +69,8 @@ endif()
 
 if(BUILD_UMBP)
   add_subdirectory(umbp)
+endif()
+
+if(BUILD_METRICS)
+  add_subdirectory(metrics)
 endif()

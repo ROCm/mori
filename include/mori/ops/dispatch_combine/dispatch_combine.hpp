@@ -45,7 +45,14 @@
 namespace mori {
 namespace moe {
 
-enum KernelType { IntraNode = 0, InterNode = 1, InterNodeV1 = 2, InterNodeV1LL = 3, AsyncLL = 4 };
+enum KernelType {
+  IntraNode = 0,
+  InterNode = 1,
+  InterNodeV1 = 2,
+  InterNodeV1LL = 3,
+  AsyncLL = 4,
+  IntraNodeLL = 5
+};
 enum class QuantType { None = 0, Fp8DirectCast = 1, Fp8BlockwiseQuant = 2 };
 
 inline const char* HipDataTypeToString(hipDataType dtype) {
@@ -194,6 +201,8 @@ struct ShmemBufsInterNodeV1 {
   mori::application::SymmMemObjPtr dispatchOut;
   mori::application::SymmMemObjPtr combineOut;
   mori::application::SymmMemObjPtr staging;
+  // Dispatch send source, separate from `staging` so combine can't overwrite it.
+  mori::application::SymmMemObjPtr dispatchStaging;
 };
 
 // InterNode / AsyncLL: full 5-buffer set used by the non-V1 RDMA paths.
@@ -257,7 +266,7 @@ class EpDispatchCombineHandle {
   int Fp8BlockwiseCombineScaleTypeSize() const { return fp8BlockwiseCombineScaleTypeSize; }
 
   mori::application::SymmMemObjPtr GetShmemDispatchOutTokMemObj() const {
-    if (config.kernelType == KernelType::IntraNode)
+    if (config.kernelType == KernelType::IntraNode || config.kernelType == KernelType::IntraNodeLL)
       return std::get<ShmemBufsIntraNode>(shmemTokBufs).dispatchOut;
     if (config.kernelType == KernelType::InterNodeV1 ||
         config.kernelType == KernelType::InterNodeV1LL)
@@ -265,7 +274,7 @@ class EpDispatchCombineHandle {
     return std::get<ShmemBufsInterNode>(shmemTokBufs).dispatchOut;
   }
   mori::application::SymmMemObjPtr GetShmemCombineOutTokMemObj() const {
-    if (config.kernelType == KernelType::IntraNode)
+    if (config.kernelType == KernelType::IntraNode || config.kernelType == KernelType::IntraNodeLL)
       return std::get<ShmemBufsIntraNode>(shmemTokBufs).combineOut;
     if (config.kernelType == KernelType::InterNodeV1 ||
         config.kernelType == KernelType::InterNodeV1LL)
@@ -273,7 +282,7 @@ class EpDispatchCombineHandle {
     return std::get<ShmemBufsInterNode>(shmemTokBufs).combineOut;
   }
   mori::application::SymmMemObjPtr GetShmemCombineInpTokMemObj() const {
-    if (config.kernelType == KernelType::IntraNode)
+    if (config.kernelType == KernelType::IntraNode || config.kernelType == KernelType::IntraNodeLL)
       return std::get<ShmemBufsIntraNode>(shmemTokBufs).combineInp;
     if (config.kernelType == KernelType::InterNodeV1 ||
         config.kernelType == KernelType::InterNodeV1LL)

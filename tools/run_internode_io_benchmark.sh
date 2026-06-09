@@ -21,6 +21,7 @@ MASTER_ADDR=""
 MASTER_PORT=1234
 IFNAME=""
 HOST=""
+NUMA_NODE=""
 EXTRA_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -30,6 +31,7 @@ while [[ $# -gt 0 ]]; do
     --master-port)  MASTER_PORT="$2"; shift 2 ;;
     --ifname)       IFNAME="$2";      shift 2 ;;
     --host)         HOST="$2";        shift 2 ;;
+    --numa)         NUMA_NODE="$2";   shift 2 ;;
     --)             shift; EXTRA_ARGS=("$@"); break ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
@@ -73,7 +75,25 @@ cd "$REPO_ROOT"
 
 BENCH_TIMEOUT_SEC="${MORI_IO_BENCH_TIMEOUT_SEC:-600}"
 
-exec timeout "$BENCH_TIMEOUT_SEC" torchrun \
+# Optional NUMA pinning. For host-memory multi-NIC runs this is REQUIRED to stay
+# rail-safe: the multi-NIC pairing matches each side's rank-j NUMA-local NIC, so
+# both nodes must select the SAME NIC subset. Pinning both nodes to the same NUMA
+# node makes MatchCpuNics() return an identical, rail-aligned NIC ordering on both
+# ends; without it the two nodes can land on different NUMA nodes and pair NICs
+# across rails (fails on fabrics where rails are not interconnected).
+NUMACTL=()
+if [[ -n "$NUMA_NODE" ]]; then
+  if command -v numactl >/dev/null 2>&1; then
+    NUMACTL=(numactl --cpunodebind="$NUMA_NODE" --membind="$NUMA_NODE")
+    echo "[run_internode_io_benchmark] NUMA pinned to node $NUMA_NODE: ${NUMACTL[*]}"
+  else
+    echo "[run_internode_io_benchmark] ERROR: --numa $NUMA_NODE requested but numactl not found;" \
+         "refusing to run multi-NIC host benchmark unpinned (cross-rail risk)." >&2
+    exit 1
+  fi
+fi
+
+exec "${NUMACTL[@]}" timeout "$BENCH_TIMEOUT_SEC" torchrun \
   --nnodes=2 \
   --node_rank="$RANK" \
   --nproc_per_node=1 \

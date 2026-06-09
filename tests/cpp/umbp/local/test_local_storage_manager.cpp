@@ -26,7 +26,7 @@
 #include <iostream>
 #include <vector>
 
-#include "umbp/local/storage/local_storage_manager.h"
+#include "umbp/local/tiers/local_storage_manager.h"
 
 using namespace mori::umbp;
 

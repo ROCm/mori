@@ -29,9 +29,9 @@
 
 #include "mori/application/transport/sdma/anvil.hpp"
 
+#include <cstring>
 #include <fstream>
 #include <iostream>
-
 namespace anvil {
 
 auto checkHsaError = [](hsa_status_t s, const char* msg, const char* file, int line) {

@@ -45,6 +45,8 @@ class TopoSystem {
   TopoSystemNet* GetTopoSystemNet() { return net.get(); }
 
   std::string MatchGpuAndNic(int id);
+  std::vector<std::string> MatchGpuAndNics(int id, int k);
+  std::vector<std::string> MatchCpuNics(int numaNode, int k);
   std::vector<std::string> MatchAllGpusAndNics();
 
  private:

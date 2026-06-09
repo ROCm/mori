@@ -5,13 +5,30 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      run_umbp_single_node_hicache:
+        type: boolean
+        default: false
+        description: Run UMBP single-node hicache smoke test
+      sglang_repo:
+        type: string
+        default: "sgl-team/sglang"
+        description: owner/repo to checkout for SGLang
+      sglang_ref:
+        type: string
+        default: "main"
+        description: branch, tag, or SHA for SGLang checkout
+      enable_dp:
+        type: boolean
+        default: false
+        description: Enable DP/EP modes when launching the hicache test
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
   IMAGE: rocm/mori:ci
-  BASE_IMAGE: rocm/pytorch:rocm7.2.1_ubuntu24.04_py3.12_pytorch_release_2.8.0
+  BASE_IMAGE: rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.8.0
   CONTAINER: mori_ci_${{ github.run_id }}
   CT: docker
 
@@ -119,7 +136,7 @@ jobs:
       - name: MORI-EP (intranode)
         run: |
           $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
-            cd $GITHUB_WORKSPACE && timeout 300 pytest tests/python/ops/test_dispatch_combine_intranode.py -v
+            cd $GITHUB_WORKSPACE && timeout 360 pytest tests/python/ops/test_dispatch_combine_intranode.py -v
           "
 
       - name: MORI-EP (internode_v1)
@@ -324,7 +341,7 @@ jobs:
       - name: Install mori (XLA FFI)
         run: |
           $CT exec ${CONTAINER}_jax bash -c \
-            "cd $GITHUB_WORKSPACE && BUILD_XLA_FFI_OPS=ON pip install --break-system-packages ."
+            "cd $GITHUB_WORKSPACE && BUILD_UMBP=OFF BUILD_XLA_FFI_OPS=ON pip install --break-system-packages ."
 
       - name: MORI-EP JAX test
         run: |
@@ -342,6 +359,62 @@ jobs:
             $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE rocm/mori:jax-ci \
                 chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
           fi
+
+  umbp-unit-test:
+    name: mori umbp unit test (${{ matrix.platform }})
+    needs: build
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: MI355X_AINIC
+            runner: [self-hosted, MI355X-AINIC-TW]
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Build CI image
+        run: $CT build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE -t $IMAGE -f docker/Dockerfile.dev .
+
+      - name: Start container
+        run: |
+          $CT rm -f $CONTAINER 2>/dev/null || true
+          CONTAINER_RUNTIME=$CT ./docker/ci_run.sh --name $CONTAINER \
+            -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
+            -w $GITHUB_WORKSPACE \
+            $IMAGE sleep infinity
+          $CT exec $CONTAINER \
+            git config --global --add safe.directory $GITHUB_WORKSPACE
+
+      - name: Build mori with UMBP
+        run: |
+          $CT exec $CONTAINER bash -c \
+            "cd $GITHUB_WORKSPACE && BUILD_UMBP=ON BUILD_TESTS=ON pip install -e ."
+
+      - name: UMBP Python packaging tests
+        run: |
+          $CT exec $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE
+            timeout 60 pytest tests/python/umbp/ -v
+          "
+
+      - name: UMBP C++ unit tests (local + distributed)
+        run: |
+          $CT exec $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE/build
+            timeout 300 ctest --output-on-failure \
+              -R '^(umbp_|test_dummy_ssd_tier|test_prefix_aware_eviction|test_ssd_tier)'
+          "
+
+      - name: Cleanup
+        if: always()
+        run: |
+          $CT exec $CONTAINER chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
+          $CT rm -f $CONTAINER || true
 
   internode-test:
     name: mori internode test (${{ matrix.platform }})
@@ -441,12 +514,12 @@ jobs:
       - name: Install mori (node1)
         run: |
           $CT exec $CONTAINER bash -c \
-            "cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install . && pip install prettytable"
+            "cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install . && pip install prettytable && (command -v numactl >/dev/null || (apt-get update && apt-get install -y numactl))"
 
       - name: Install mori (node2)
         run: |
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST \
-            "$CT exec $CONTAINER bash -c 'cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install . && pip install prettytable'"
+            "$CT exec $CONTAINER bash -c 'cd $GITHUB_WORKSPACE && BUILD_EXAMPLES=ON pip install . && pip install prettytable && (command -v numactl >/dev/null || (apt-get update && apt-get install -y numactl))'"
 
       - name: MORI-IO internode write sweep
         run: |
@@ -460,7 +533,7 @@ jobs:
             -- --op-type write --transfer-batch-size 128 --all
             --sweep-start-size 1024 --sweep-max-size 16777216 --iters 4
             --enable-sess --enable-batch-transfer
-            --num-qp-per-transfer 2 --num-worker-threads 2
+            --num-qp-per-transfer 2
             --num-initiator-dev 8 --num-target-dev 8
           )
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
@@ -470,7 +543,7 @@ jobs:
             -- --op-type write --transfer-batch-size 128 --all \
             --sweep-start-size 1024 --sweep-max-size 16777216 --iters 4 \
             --enable-sess --enable-batch-transfer \
-            --num-qp-per-transfer 2 --num-worker-threads 2 \
+            --num-qp-per-transfer 2 \
             --num-initiator-dev 8 --num-target-dev 8
           wait
 
@@ -485,7 +558,7 @@ jobs:
             --ifname $NODE2_IFNAME
             -- --op-type read --buffer-size 4096 --transfer-batch-size 128 --iters 8
             --enable-batch-transfer --enable-sess --poll_cq_mode event
-            --num-qp-per-transfer 2 --num-worker-threads 2
+            --num-qp-per-transfer 2
             --num-initiator-dev 8 --num-target-dev 8
           )
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
@@ -494,7 +567,64 @@ jobs:
             --ifname $NODE1_IFNAME \
             -- --op-type read --buffer-size 4096 --transfer-batch-size 128 --iters 8 \
             --enable-batch-transfer --enable-sess --poll_cq_mode event \
-            --num-qp-per-transfer 2 --num-worker-threads 2 \
+            --num-qp-per-transfer 2 \
+            --num-initiator-dev 8 --num-target-dev 8
+          wait
+
+      - name: MORI-IO internode CPU memory sweep (chunking + 4 NIC x 4 QP)
+        run: |
+          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_io_benchmark.sh"
+          # CPU host memory, chunking on (default), striped across 4 NUMA-local NICs
+          # with 16 QPs total (= 4 QP per NIC). Single posting thread (inline).
+          PORT=29122
+          for OP in write read; do
+            echo "=== MORI-IO internode benchmark: cpu-mem $OP sweep (chunking, 4 NIC x 4 QP) port=$PORT ==="
+            NODE2_CMD=(
+              $CT exec -e MORI_IO_NUM_NICS_PER_TRANSFER=4 $CONTAINER bash $SCRIPT
+              --rank 1 --master-addr $NODE1_HOST --master-port $PORT
+              --ifname $NODE2_IFNAME --numa 0
+              -- --mem-type cpu --op-type $OP --transfer-batch-size 64 --all
+              --sweep-start-size 1024 --sweep-max-size 1048576 --iters 4
+              --enable-sess --enable-batch-transfer
+              --num-qp-per-transfer 16 --num-initiator-dev 1 --num-target-dev 1
+            )
+            ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
+            $CT exec -e MORI_IO_NUM_NICS_PER_TRANSFER=4 $CONTAINER bash $SCRIPT \
+              --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+              --ifname $NODE1_IFNAME --numa 0 \
+              -- --mem-type cpu --op-type $OP --transfer-batch-size 64 --all \
+              --sweep-start-size 1024 --sweep-max-size 1048576 --iters 4 \
+              --enable-sess --enable-batch-transfer \
+              --num-qp-per-transfer 16 --num-initiator-dev 1 --num-target-dev 1
+          wait
+            PORT=$((PORT + 1))
+          done
+
+      - name: MORI-IO internode multi-worker executor correctness (chunking off)
+        run: |
+          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_io_benchmark.sh"
+          PORT=29124
+          # Legacy multi-worker executor path: only active when chunking is off and
+          # single NIC. Small write run to guard byte-for-byte correctness of that path.
+          echo "=== MORI-IO internode benchmark: multi-worker executor (chunking off) port=$PORT ==="
+          NODE2_CMD=(
+            $CT exec $CONTAINER bash $SCRIPT
+            --rank 1 --master-addr $NODE1_HOST --master-port $PORT
+            --ifname $NODE2_IFNAME
+            -- --op-type write --disable-chunking --transfer-batch-size 64 --all
+            --sweep-start-size 1024 --sweep-max-size 1048576 --iters 4
+            --enable-sess --enable-batch-transfer
+            --num-qp-per-transfer 4 --num-worker-threads 2
+            --num-initiator-dev 8 --num-target-dev 8
+          )
+          ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
+          $CT exec $CONTAINER bash $SCRIPT \
+            --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+            --ifname $NODE1_IFNAME \
+            -- --op-type write --disable-chunking --transfer-batch-size 64 --all \
+            --sweep-start-size 1024 --sweep-max-size 1048576 --iters 4 \
+            --enable-sess --enable-batch-transfer \
+            --num-qp-per-transfer 4 --num-worker-threads 2 \
             --num-initiator-dev 8 --num-target-dev 8
           wait
 
@@ -591,3 +721,54 @@ jobs:
           ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
             -p $NODE2_PORT $(whoami)@$NODE2_HOST \
             "$CT rm -f $CONTAINER || true"
+
+  umbp-single-node-hicache:
+    name: mori umbp single-node hicache smoke test
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && inputs.run_umbp_single_node_hicache == 'true'
+    runs-on: [self-hosted, MI355X-AINIC-TW]
+    timeout-minutes: 180
+    steps:
+      - name: Checkout MoRI
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Checkout SGLang
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.sglang_repo }}
+          ref: ${{ inputs.sglang_ref }}
+          path: sglang
+          fetch-depth: 1
+
+      - name: Ensure hicache script is executable
+        run: chmod +x src/umbp/scripts/run_umbp_single_node_hicache.sh
+
+      - name: Run hicache smoke test
+        env:
+          SGLANG_REPO: ${{ github.workspace }}/sglang
+          MORI_REPO: ${{ github.workspace }}
+          RESULTS_DIR: ${{ github.workspace }}/umbp_single_node_results
+          USE_DUMMY_WEIGHTS: "true"
+          RUN_GSM8K: "false"
+          MODEL_PATH: ${{ github.workspace }}/umbp_dummy_model
+          ENABLE_DP: ${{ inputs.enable_dp }}
+          START_UMBP_MASTER: "false"
+        run: |
+          set -euo pipefail
+          mkdir -p "$RESULTS_DIR"
+          ./src/umbp/scripts/run_umbp_single_node_hicache.sh
+
+      - name: Upload hicache artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: umbp-single-node-hicache-${{ github.run_id }}
+          path: |
+            ${{ github.workspace }}/umbp_single_node_results
+          if-no-files-found: warn
+
+      - name: Cleanup hicache container
+        if: always()
+        run: docker rm -f umbp-single-node >/dev/null 2>&1 || true

@@ -164,6 +164,7 @@ def _cpp_dispatch_combine_factory(entity_name, allow_missing=False):
 # ---------------------------------------------------------------------------
 _KERNEL_TYPE_TO_HIP = {
     EpDispatchCombineKernelType.IntraNode: "ep_intranode",
+    EpDispatchCombineKernelType.IntraNodeLL: "ep_intranode",
     EpDispatchCombineKernelType.InterNode: "ep_internode",
     EpDispatchCombineKernelType.InterNodeV1: "ep_internode_v1",
     EpDispatchCombineKernelType.InterNodeV1LL: "ep_internode_v1ll",
@@ -705,6 +706,15 @@ class EpDispatchCombineOp:
                 stream,
                 args_ptr,
             )
+        elif kt == EpDispatchCombineKernelType.IntraNodeLL.value:
+            self._launch(
+                f"EpDispatchIntraNodeLLKernel_{sfx}",
+                grid,
+                block,
+                shared_mem,
+                stream,
+                args_ptr,
+            )
         elif kt == EpDispatchCombineKernelType.AsyncLL.value:
             mp = self._handle_info["multi_processor_count"]
             mp_aligned = mp // self.config.world_size * self.config.world_size
@@ -933,9 +943,12 @@ class EpDispatchCombineOp:
         shared_mem = self._combine_shared_mem(actual_wpb)
 
         if quant_type == EpDispatchCombineQuantType.Fp8BlockwiseQuant:
-            if kt != EpDispatchCombineKernelType.IntraNode.value:
+            if kt not in (
+                EpDispatchCombineKernelType.IntraNode.value,
+                EpDispatchCombineKernelType.IntraNodeLL.value,
+            ):
                 raise ValueError(
-                    "Fp8BlockwiseQuant currently only supports IntraNode combine"
+                    "Fp8BlockwiseQuant currently only supports IntraNode/IntraNodeLL combine"
                 )
             if sfx != "bf16":
                 raise ValueError(f"Fp8BlockwiseQuant only supports bf16, got {sfx}")
@@ -990,7 +1003,10 @@ class EpDispatchCombineOp:
                 stream,
                 args_ptr,
             )
-        elif kt == EpDispatchCombineKernelType.IntraNode.value:
+        elif kt in (
+            EpDispatchCombineKernelType.IntraNode.value,
+            EpDispatchCombineKernelType.IntraNodeLL.value,
+        ):
             if quant_type == EpDispatchCombineQuantType.Fp8BlockwiseQuant:
                 # Mirror of the AccumNum=8 + VecBytes=8 specialization gating in
                 # LaunchCombine() / launch.cpp. Keep in sync.
@@ -1546,6 +1562,7 @@ class EpDispatchCombineOp:
 
         if self.config.kernel_type.value in (
             EpDispatchCombineKernelType.IntraNode.value,
+            EpDispatchCombineKernelType.IntraNodeLL.value,
             EpDispatchCombineKernelType.InterNodeV1.value,
             EpDispatchCombineKernelType.InterNodeV1LL.value,
             EpDispatchCombineKernelType.AsyncLL.value,
