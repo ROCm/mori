@@ -23,10 +23,11 @@
 // MIT License — see LICENSE for details.
 #pragma once
 
-// clang-format off
+/* clang-format off */
 #include "mori/shmem/internal.hpp"
 #include "mori/core/transport/rdma/rdma.hpp"
-// clang-format off
+/* clang-format on */
+
 namespace mori {
 namespace cco {
 namespace gda {
@@ -379,27 +380,16 @@ __device__ inline static void getImpl(shmem::ShmemRdmaEndpoint* ep, uint32_t qpn
   }
 }
 
-// Flush: poll CQ until all submitted WQEs complete.
-// Consistent with NCCL GIN semantics: flush does NOT ring doorbell.
-// If using AggregateRequests, caller must call flushAsync first to ring doorbell.
-template <core::ProviderType PrvdType>
-__device__ inline static void flushImpl(shmem::ShmemRdmaEndpoint* ep) {
-  core::WorkQueueHandle* wq = &ep->wqHandle;
-  uint32_t curPostIdx = wq->postIdx;
-
-  // Poll CQ until all WQEs complete (ensure source buffers are reusable)
-  quietUntil<PrvdType>(ep, curPostIdx);
-}
-
-// FlushAsync: submit all pending WQEs, return request handle for later wait.
+// FlushAsync: ring doorbell for pending WQEs (skip if already rung),
+// return the postIdx for later wait.
 template <core::ProviderType PrvdType>
 __device__ inline static void flushAsyncImpl(shmem::ShmemRdmaEndpoint* ep, uint32_t qpn,
-                                             ccoGdaRequest_t* outRequest) {
+                                             uint32_t* outPostIdx) {
   core::WorkQueueHandle* wq = &ep->wqHandle;
   core::CompletionQueueHandle* cq = &ep->cqHandle;
 
   uint32_t curPostIdx = wq->postIdx;
-  *outRequest = reinterpret_cast<ccoGdaRequest_t>(static_cast<uintptr_t>(curPostIdx));
+  *outPostIdx = curPostIdx;
 
   uint64_t dbTouched =
       __hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
@@ -428,11 +418,8 @@ __device__ inline static void flushAsyncImpl(shmem::ShmemRdmaEndpoint* ep, uint3
 
 // Wait: wait for async request to complete
 template <core::ProviderType PrvdType>
-__device__ inline static void waitImpl(shmem::ShmemRdmaEndpoint* ep, ccoGdaRequest_t request) {
-  uint32_t targetIdx = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(request));
-
-  // Actively poll CQ until target WQE completes
-  quietUntil<PrvdType>(ep, targetIdx);
+__device__ inline static void waitImpl(shmem::ShmemRdmaEndpoint* ep, uint32_t postIdx) {
+  quietUntil<PrvdType>(ep, postIdx);
 }
 
 // Signal: send signal to remote peer (RDMA atomic increment/add)

@@ -20,14 +20,21 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-// test: cco gda put + signal — alltoall via gpu-initiated rdma put.
+// test: cco gda signal API — standalone signal/waitSignal/resetSignal verification.
 //
-// each rank launches one kernel that:
-//   1. put(peer, ..., SignalInc{myRank}) to every peer
-//   2. flush to drain local sq / cq
-//   3. waitSignal on signal[peer] for every peer, confirming remote writes landed
+// tests three signal patterns without mixing put data:
+//   1. SignalInc: each rank sends gda.signal(peer, SignalInc{myRank}) to every peer.
+//      every rank waits for signal[r] >= 1 for each r != myRank.
+//   2. SignalAdd: each rank sends gda.signal(peer, SignalAdd{myRank, 42}) to every peer.
+//      every rank waits for signal[r] >= 42.
+//   3. resetSignal + reuse: reset all signal slots, repeat SignalInc, verify counters
+//      start from 0 (not from prior round's value).
 //
-// host verifies recv buffer after the kernel. ccoBarrierAll provides pre/post sync.
+// signal layout: devComm requests nRanks signal slots. signal[r] is the slot
+// dedicated to messages from rank r (sender sends to slot r on the receiver).
+//
+// unlike test_cco_gda_put which verifies signals as a side-effect of put,
+// this test exercises the signal primitive in isolation.
 
 #ifdef MORI_WITH_MPI
 #include <mpi.h>
@@ -63,43 +70,88 @@ static int g_rank = 0;
   } while (0)
 
 static const size_t PER_RANK_VMM_SIZE = 256ULL * 1024 * 1024;
-static const size_t COUNT = 256;  // elements per rank-pair
 
-// force psd (ionic) provider for this test
 static constexpr mori::core::ProviderType kPrvdType = mori::core::ProviderType::PSD;
 
-// alltoall kernel — single warp does the work.
-// signal layout: signal[r] is incremented by peer r.
-template <mori::core::ProviderType PrvdType, typename T>
-__global__ void GdaAlltoAllKernel(mori::cco::ccoWindowDevice* sendWin,
-                                  mori::cco::ccoWindowDevice* recvWin, size_t count,
-                                  mori::cco::ccoDevComm devComm) {
+// ── kernel: round 1 — SignalInc ─────────────────────────────────────────────
+//
+// step 1: each thread sends SignalInc{myRank} to peer tid (no data payload).
+// step 2: collective flush — ring doorbell + drain CQ for every peer.
+//         flush(ccoCoopBlock) distributes peers across all threads via stride,
+//         ensuring each QP's CQ is polled by exactly one thread (avoids the
+//         warp-level pollCqLock collision that hangs with >= 4 ranks when
+//         multiple threads call flush(single-peer) on different QPs simultaneously).
+// step 3: each thread waits for peer tid's reciprocal signal on our slot.
+template <mori::core::ProviderType PrvdType>
+__global__ void GdaSignalIncKernel(mori::cco::ccoDevComm devComm) {
   using namespace mori::cco::gda;
 
   ccoGda<PrvdType> gda{devComm, /*ginContext=*/0};
 
   int myRank = devComm.rank;
   int nRanks = devComm.worldSize;
-  int tid = threadIdx.x;
-  int nthreads = blockDim.x;
-  size_t perPairBytes = count * sizeof(T);
+  int tid    = threadIdx.x;
 
-  // each thread issues put to a distinct peer
-  for (int r = tid; r < nRanks; r += nthreads) {
-    if (r == myRank) continue;
-    gda.put(r, reinterpret_cast<ccoWindow_t>(recvWin), myRank * perPairBytes,
-            reinterpret_cast<ccoWindow_t>(sendWin), r * perPairBytes, perPairBytes,
-            ccoGda_SignalInc{static_cast<ccoGdaSignal_t>(myRank)});
+  // step 1: send
+  if (tid < nRanks && tid != myRank) {
+    gda.signal(tid, ccoGda_SignalInc{static_cast<ccoGdaSignal_t>(myRank)});
   }
 
-  // drain local sq / cq so sendWin is reusable after the kernel
+  // step 2: collective flush — all threads participate
   gda.flush(mori::cco::ccoCoopBlock{});
 
-  // wait for every peer's write to land
+  // step 3: wait for peer's signal
   if (tid < nRanks && tid != myRank) {
-    gda.waitSignal(static_cast<ccoGdaSignal_t>(tid), 1);
+    gda.waitSignal(static_cast<ccoGdaSignal_t>(tid), /*least=*/1);
   }
 }
+
+// ── kernel: reset all signal slots ──────────────────────────────────────────
+// must complete on ALL ranks (via host ccoBarrierAll) before any rank sends
+// round-2 signals, otherwise a remote SignalAdd can race with the local reset.
+template <mori::core::ProviderType PrvdType>
+__global__ void GdaSignalResetKernel(mori::cco::ccoDevComm devComm) {
+  using namespace mori::cco::gda;
+
+  ccoGda<PrvdType> gda{devComm, /*ginContext=*/0};
+
+  int nRanks = devComm.worldSize;
+  int tid    = threadIdx.x;
+
+  if (tid == 0) {
+    for (int r = 0; r < nRanks; r++) {
+      gda.resetSignal(static_cast<ccoGdaSignal_t>(r));
+    }
+  }
+}
+
+// ── kernel: round 2 — SignalAdd ─────────────────────────────────────────────
+// launched only after ccoBarrierAll confirms all ranks have completed the reset.
+template <mori::core::ProviderType PrvdType>
+__global__ void GdaSignalAddKernel(mori::cco::ccoDevComm devComm) {
+  using namespace mori::cco::gda;
+
+  ccoGda<PrvdType> gda{devComm, /*ginContext=*/0};
+
+  int myRank = devComm.rank;
+  int nRanks = devComm.worldSize;
+  int tid    = threadIdx.x;
+
+  // send SignalAdd{myRank, 42} to every peer
+  if (tid < nRanks && tid != myRank) {
+    gda.signal(tid, ccoGda_SignalAdd{static_cast<ccoGdaSignal_t>(myRank), 42ULL});
+  }
+
+  // collective flush
+  gda.flush(mori::cco::ccoCoopBlock{});
+
+  // wait for peer tid's signal to reach 42
+  if (tid < nRanks && tid != myRank) {
+    gda.waitSignal(static_cast<ccoGdaSignal_t>(tid), /*least=*/42);
+  }
+}
+
+// ── host test ────────────────────────────────────────────────────────────────
 
 static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* bootNet) {
   g_rank = rank;
@@ -118,108 +170,71 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
 
   printf("[rank %d/%d] pid=%d GPU=%d\n", rank, nranks, getpid(), dev);
 
-  // setup: comm, send/recv buffers, windows
   mori::cco::ccoComm* comm = nullptr;
   if (mori::cco::ccoCommCreate(bootNet, PER_RANK_VMM_SIZE, &comm) != 0) {
     fprintf(stderr, "[rank %d] CommCreate failed\n", rank);
     return 1;
   }
 
-  size_t bufSize = COUNT * nranks * sizeof(float);
-  void* sendBuf = nullptr;
-  void* recvBuf = nullptr;
-  if (mori::cco::ccoMemAlloc(comm, bufSize, &sendBuf) != 0 ||
-      mori::cco::ccoMemAlloc(comm, bufSize, &recvBuf) != 0) {
-    fprintf(stderr, "[rank %d] MemAlloc failed\n", rank);
-    return 1;
-  }
-
-  // sendBuf[r*COUNT + i] = rank*1000 + r*100 + i — encodes (sender, dest-slot, idx)
-  std::vector<float> hostSend(COUNT * nranks);
-  for (int r = 0; r < nranks; r++) {
-    for (size_t i = 0; i < COUNT; i++) {
-      hostSend[r * COUNT + i] = static_cast<float>(rank * 1000 + r * 100 + i);
-    }
-  }
-  HIP_CHECK(hipMemcpy(sendBuf, hostSend.data(), bufSize, hipMemcpyHostToDevice));
-  HIP_CHECK(hipMemset(recvBuf, 0xff, bufSize));
-
-  mori::cco::ccoWindow_t sendWin = nullptr;
-  mori::cco::ccoWindow_t recvWin = nullptr;
-  if (mori::cco::ccoWindowRegister(comm, sendBuf, bufSize, &sendWin) != 0 ||
-      mori::cco::ccoWindowRegister(comm, recvBuf, bufSize, &recvWin) != 0) {
-    fprintf(stderr, "[rank %d] WindowRegister failed\n", rank);
-    return 1;
-  }
-
-  // devcomm: full gda connectivity + one signal per peer
+  // devcomm: full gda connectivity, one signal slot per rank
   mori::cco::ccoDevCommRequirements reqs = CCO_DEV_COMM_REQUIREMENTS_INITIALIZER;
   reqs.gdaConnectionType = mori::cco::CCO_GDA_CONNECTION_FULL;
-  reqs.gdaContextCount = 1;
-  reqs.gdaSignalCount = nranks;
-  reqs.gdaCounterCount = 0;
+  reqs.gdaContextCount   = 1;
+  reqs.gdaSignalCount    = nranks;
+  reqs.gdaCounterCount   = 0;
   mori::cco::ccoDevComm* devComm = nullptr;
   if (mori::cco::ccoDevCommCreate(comm, &reqs, &devComm) != 0) {
     fprintf(stderr, "[rank %d] DevCommCreate failed\n", rank);
     return 1;
   }
 
-  // kernel takes devcomm by value (nccl-style), so copy to host
   mori::cco::ccoDevComm devCommHost;
   HIP_CHECK(hipMemcpy(&devCommHost, devComm, sizeof(devCommHost), hipMemcpyDeviceToHost));
-  printf("[rank %d] DevCommCreate OK (worldSize=%d, lsaSize=%d, gdaConnType=%d, numQpPerPe=%d)\n",
-         rank, devCommHost.worldSize, devCommHost.lsaSize, (int)devCommHost.gdaConnType,
-         devCommHost.ibgda.numQpPerPe);
+  printf("[rank %d] DevCommCreate OK (worldSize=%d, gdaConnType=%d)\n",
+         rank, devCommHost.worldSize, (int)devCommHost.gdaConnType);
 
   if (devCommHost.gdaConnType == mori::cco::CCO_GDA_CONNECTION_NONE) {
-    fprintf(stderr, "[rank %d] gdaConnType collapsed to NONE — check peer mask / rdma support\n",
-            rank);
+    fprintf(stderr, "[rank %d] gdaConnType collapsed to NONE\n", rank);
     return 1;
   }
 
-  mori::cco::ccoBarrierAll(comm);
-
-  // launch
   hipStream_t stream;
   HIP_CHECK(hipStreamCreate(&stream));
-  GdaAlltoAllKernel<kPrvdType, float><<<1, 64, 0, stream>>>(sendWin, recvWin, COUNT, devCommHost);
-  HIP_CHECK(hipStreamSynchronize(stream));
-  printf("[rank %d] kernel completed\n", rank);
 
   mori::cco::ccoBarrierAll(comm);
 
-  // verify: recv[src*COUNT + i] should be src*1000 + rank*100 + i for every src != rank
-  std::vector<float> hostRecv(COUNT * nranks);
-  HIP_CHECK(hipMemcpy(hostRecv.data(), recvBuf, bufSize, hipMemcpyDeviceToHost));
+  // ── round 1: SignalInc ────────────────────────────────────────────────────
+  printf("[rank %d] round 1: SignalInc\n", rank);
+  GdaSignalIncKernel<kPrvdType><<<1, nranks, 0, stream>>>(devCommHost);
+  HIP_CHECK(hipStreamSynchronize(stream));
+  printf("[rank %d] round 1 passed\n", rank);
 
-  bool ok = true;
-  for (int srcRank = 0; srcRank < nranks && ok; srcRank++) {
-    if (srcRank == rank) continue;  // self slot — never written
-    for (size_t i = 0; i < COUNT; i++) {
-      float expected = static_cast<float>(srcRank * 1000 + rank * 100 + i);
-      float got = hostRecv[srcRank * COUNT + i];
-      if (got != expected) {
-        fprintf(stderr, "[rank %d] mismatch at [src=%d][%zu]: got %.0f expected %.0f\n", rank,
-                srcRank, i, got, expected);
-        ok = false;
-        break;
-      }
-    }
-  }
+  mori::cco::ccoBarrierAll(comm);
+
+  // ── round 2: resetSignal + SignalAdd ─────────────────────────────────────
+  // reset must be globally complete before any rank sends round-2 signals.
+  printf("[rank %d] round 2: resetSignal\n", rank);
+  GdaSignalResetKernel<kPrvdType><<<1, nranks, 0, stream>>>(devCommHost);
+  HIP_CHECK(hipStreamSynchronize(stream));
+
+  mori::cco::ccoBarrierAll(comm);  // all ranks reset before any sends
+
+  printf("[rank %d] round 2: SignalAdd\n", rank);
+  GdaSignalAddKernel<kPrvdType><<<1, nranks, 0, stream>>>(devCommHost);
+  HIP_CHECK(hipStreamSynchronize(stream));
+  printf("[rank %d] round 2 passed\n", rank);
+
+  mori::cco::ccoBarrierAll(comm);
 
   HIP_CHECK(hipStreamDestroy(stream));
   mori::cco::ccoDevCommDestroy(comm, devComm);
-  mori::cco::ccoWindowDeregister(comm, recvWin);
-  mori::cco::ccoWindowDeregister(comm, sendWin);
-  mori::cco::ccoMemFree(comm, recvBuf);
-  mori::cco::ccoMemFree(comm, sendBuf);
   mori::cco::ccoCommDestroy(comm);
 
-  printf("[rank %d] %s\n", rank, ok ? "PASSED" : "FAILED");
-  return ok ? 0 : 1;
+  printf("[rank %d] PASSED\n", rank);
+  return 0;
 }
 
-// ── fork mode ──
+// ── fork mode ─────────────────────────────────────────────────────────────────
 
 static void write_file(const char* path, const void* data, size_t len) {
   FILE* f = fopen(path, "wb");
@@ -237,12 +252,12 @@ static bool read_file(const char* path, void* data, size_t len) {
 
 static int run_fork_mode(int nranks) {
   char uidPath[256];
-  snprintf(uidPath, sizeof(uidPath), "/tmp/cco_gda_put_uid_%d", getpid());
+  snprintf(uidPath, sizeof(uidPath), "/tmp/cco_gda_signal_uid_%d", getpid());
 
-  printf("=== CCO GDA put Test (fork, %d ranks) ===\n", nranks);
+  printf("=== CCO GDA signal Test (fork, %d ranks) ===\n", nranks);
   fflush(stdout);
 
-  auto uid = mori::application::SocketBootstrapNetwork::GenerateUniqueIdWithInterface("lo", 19877);
+  auto uid = mori::application::SocketBootstrapNetwork::GenerateUniqueIdWithInterface("lo", 19878);
   write_file(uidPath, &uid, sizeof(uid));
 
   std::vector<pid_t> children;
@@ -250,9 +265,7 @@ static int run_fork_mode(int nranks) {
     pid_t pid = fork();
     if (pid == 0) {
       mori::application::UniqueId childUid;
-      while (!read_file(uidPath, &childUid, sizeof(childUid))) {
-        usleep(10000);
-      }
+      while (!read_file(uidPath, &childUid, sizeof(childUid))) usleep(10000);
       auto* boot = new mori::application::SocketBootstrapNetwork(childUid, r, nranks);
       _exit(run_test(r, nranks, boot));
     }
@@ -274,7 +287,7 @@ static int run_fork_mode(int nranks) {
   return fail > 0 ? 1 : 0;
 }
 
-// ── single-rank mode for cross-host ──
+// ── single-rank mode for cross-host ──────────────────────────────────────────
 
 static int run_single_rank_mode(int argc, char** argv) {
   int rank = -1, worldSize = -1, gpuOffset = -1;
@@ -313,8 +326,8 @@ static int run_gen_uid_mode(int argc, char** argv) {
     fprintf(stderr, "usage: --gen-uid IFACE PORT OUTFILE\n");
     return 1;
   }
-  const char* iface = argv[2];
-  int port = atoi(argv[3]);
+  const char* iface  = argv[2];
+  int port           = atoi(argv[3]);
   const char* outPath = argv[4];
   auto uid = mori::application::SocketBootstrapNetwork::GenerateUniqueIdWithInterface(iface, port);
   FILE* f = fopen(outPath, "wb");
@@ -346,8 +359,7 @@ int main(int argc, char** argv) {
     int rank, nranks;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &nranks);
-    if (rank == 0) printf("=== CCO GDA put Test (MPI, %d ranks) ===\n", nranks);
-
+    if (rank == 0) printf("=== CCO GDA signal Test (MPI, %d ranks) ===\n", nranks);
     auto* boot = new mori::application::MpiBootstrapNetwork(MPI_COMM_WORLD);
     return run_test(rank, nranks, boot);
   }

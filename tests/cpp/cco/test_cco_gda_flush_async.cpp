@@ -54,9 +54,10 @@
 
 #include "hip/hip_runtime.h"
 #include "mori/application/bootstrap/socket_bootstrap.hpp"
-#include "mori/cco/cco.hpp"
-#include "mori/cco/gda/gda_device.hpp"
 #include "mori/shmem/internal.hpp"
+
+#include "mori/cco/cco.hpp"
+#include "mori/cco/cco_device.hpp"
 
 static int g_rank = 0;
 
@@ -101,7 +102,7 @@ __global__ void GdaAlltoAllFlushAsyncKernel(mori::cco::ccoWindowDevice* sendWin,
 
   // per-thread handle slot. only lane 0 of each "active" warp writes it in step 2
   // and reads it in step 4; other threads leave it null.
-  ccoGdaRequest_t myReq = nullptr;
+  ccoGdaRequest_t myReq{};
 
   // step 1: each thread issues put to a distinct peer
   for (int r = tid; r < nRanks; r += nthreads) {

@@ -51,9 +51,10 @@
 
 #include "hip/hip_runtime.h"
 #include "mori/application/bootstrap/socket_bootstrap.hpp"
-#include "mori/cco/cco.hpp"
-#include "mori/cco/gda/gda_device.hpp"
 #include "mori/shmem/internal.hpp"
+
+#include "mori/cco/cco.hpp"
+#include "mori/cco/cco_device.hpp"
 
 static int g_rank = 0;
 
@@ -87,7 +88,6 @@ __global__ void GdaAlltoAllGetKernel(mori::cco::ccoWindowDevice* sendWin,
   int nRanks = devComm.worldSize;
   int tid = threadIdx.x;
   int nthreads = blockDim.x;
-
   size_t perPairBytes = count * sizeof(T);
 
   // step 1: each thread issues a get from a distinct peer.
@@ -98,11 +98,9 @@ __global__ void GdaAlltoAllGetKernel(mori::cco::ccoWindowDevice* sendWin,
     gda.get(r, reinterpret_cast<ccoWindow_t>(sendWin), myRank * perPairBytes,
             reinterpret_cast<ccoWindow_t>(recvWin), r * perPairBytes, perPairBytes);
   }
-  __syncthreads();
 
-  // step 2: thread 0 flushes — get has no signal, this is the only sync point
-  // that tells us the rdma read has actually landed in our recvBuf.
-  if (tid == 0) gda.flush();
+  // step 2: flush — ring doorbell + poll CQ, ensures rdma reads have landed.
+  gda.flush(mori::cco::ccoCoopBlock{});
 }
 
 static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* bootNet) {
