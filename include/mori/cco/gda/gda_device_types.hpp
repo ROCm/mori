@@ -28,8 +28,10 @@
 // types without creating a circular include with the common layer.
 #pragma once
 
-#include "mori/cco/cco_coop.hpp"
+/* clang-format off */
 #include "mori/cco/cco_types.hpp"
+#include "mori/cco/cco_coop.hpp"
+/* clang-format on */
 
 namespace mori {
 namespace cco {
@@ -158,7 +160,8 @@ struct ccoGda {
   __device__ inline void flush(Coop coop = Coop{});
 
   // flush(peer): poll CQ for a single peer until its submitted WQEs complete.
-  __device__ inline void flush(int peer);
+  template <typename Coop = ccoCoopWarp>
+  __device__ inline void flush(int peer, Coop coop = Coop{});
 
   // flushAsync: ring doorbell for peer and return a request handle that
   // wait() can later be used to wait on individually.
@@ -166,7 +169,7 @@ struct ccoGda {
   __device__ inline void flushAsync(int peer, ccoGdaRequest_t* outRequest, Coop coop = Coop{});
 
   // wait: block on a request handle previously returned by flushAsync.
-  template <typename Coop = ccoCoopThread>
+  template <typename Coop = ccoCoopWarp>
   __device__ inline void wait(ccoGdaRequest_t& request, Coop coop = Coop{});
 };
 

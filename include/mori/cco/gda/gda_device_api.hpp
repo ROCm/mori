@@ -23,10 +23,10 @@
 // MIT License — see LICENSE for details.
 #pragma once
 
-// clang-format off
+/* clang-format off */
 #include "mori/cco/gda/gda_device_types.hpp"
 #include "mori/cco/gda/gda_device_primitives.hpp"
-// clang-format on
+/* clang-format on */
 
 namespace mori {
 namespace cco {
@@ -298,6 +298,10 @@ __device__ inline void ccoGda<PrvdType>::signal(int peer, RemoteAction remoteAct
 template <core::ProviderType PrvdType>
 template <typename Coop>
 __device__ inline void ccoGda<PrvdType>::flush(Coop coop) {
+  static_assert(!std::is_same_v<Coop, ccoCoopThread>,
+                "flush() requires at least ccoCoopWarp. "
+                "ccoCoopThread causes each thread to independently enter quietUntil "
+                "on different QPs, breaking the warp-level pollCqLock.");
   coop.sync();
   ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
   for (int teamPeer = coop.thread_rank(); teamPeer < this->nRanks; teamPeer += coop.size()) {
@@ -313,14 +317,23 @@ __device__ inline void ccoGda<PrvdType>::flush(Coop coop) {
 
 // flush single peer: ring doorbell if needed, then poll CQ until complete.
 template <core::ProviderType PrvdType>
-__device__ inline void ccoGda<PrvdType>::flush(int peer) {
-  int teamPeer = WorldPeerToGda(comm, peer);
-  ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
-  int qpIdx = teamPeer * ibgda->numQpPerPe + (contextId % ibgda->numQpPerPe);
-  shmem::ShmemRdmaEndpoint* ep = &ibgda->endpoints[qpIdx];
-  uint32_t postIdx = 0;
-  flushAsyncImpl<PrvdType>(ep, ep->qpn, &postIdx);
-  waitImpl<PrvdType>(ep, postIdx);
+template <typename Coop>
+__device__ inline void ccoGda<PrvdType>::flush(int peer, Coop coop) {
+  static_assert(!std::is_same_v<Coop, ccoCoopThread>,
+                "flush(peer) requires at least ccoCoopWarp. "
+                "ccoCoopThread allows concurrent per-thread calls on different QPs, "
+                "which breaks the warp-level pollCqLock inside quietUntil.");
+  coop.sync();
+  if (coop.thread_rank() == 0) {
+    int teamPeer = WorldPeerToGda(comm, peer);
+    ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
+    int qpIdx = teamPeer * ibgda->numQpPerPe + (contextId % ibgda->numQpPerPe);
+    shmem::ShmemRdmaEndpoint* ep = &ibgda->endpoints[qpIdx];
+    uint32_t postIdx = 0;
+    flushAsyncImpl<PrvdType>(ep, ep->qpn, &postIdx);
+    waitImpl<PrvdType>(ep, postIdx);
+  }
+  coop.sync();
 }
 
 // flushAsync: ring doorbell for peer, return a request handle for wait().
@@ -344,10 +357,14 @@ __device__ inline void ccoGda<PrvdType>::flushAsync(int peer, ccoGdaRequest_t* o
   coop.sync();
 }
 
-// wait: block until a request returned by flushAsync completes.
+// wait: poll CQ until the request returned by flushAsync completes.
 template <core::ProviderType PrvdType>
 template <typename Coop>
 __device__ inline void ccoGda<PrvdType>::wait(ccoGdaRequest_t& request, Coop coop) {
+  static_assert(!std::is_same_v<Coop, ccoCoopThread>,
+                "wait() requires at least ccoCoopWarp. "
+                "ccoCoopThread allows concurrent per-thread calls on different QPs, "
+                "which breaks the warp-level pollCqLock inside quietUntil.");
   coop.sync();
   if (coop.thread_rank() == 0) {
     ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
