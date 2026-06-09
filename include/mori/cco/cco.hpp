@@ -180,7 +180,7 @@ struct ccoIbgdaContext {
 // window so it inherits LSA peer P2P addressing for free (no separate
 // hipMalloc / Allgather).
 //
-// Layout in window (NCCL-style, lsa team):
+// Layout in window (lsa team):
 //   uint32_t state[3*nBarriers]                          ← local epoch / arrive counters
 //   uint32_t inbox[nBarriers * lsaSize]                  ← per-rank slots, peers store-add here
 //
@@ -194,7 +194,7 @@ struct ccoLsaBarrierHandle {
   int nBarriers;       // 0 == disabled
 };
 
-// GDA barrier handle: barriers via IBGDA signal pool. NCCL-style — each
+// GDA barrier handle: barriers via IBGDA signal pool. Each
 // barrier consumes `team.nRanks` signal slots; peers do RDMA atomic-add to
 // `signalBuf[signal0 + barrierIdx * team.nRanks + mySrcIdx]` and poll/reset.
 // Team is determined by which DevComm field this handle lives in:
@@ -246,7 +246,7 @@ struct ccoDevComm {
   //   peer_va = winBase + peerLsa * stride4G<<32 + offset
   //   raddr   = offset, rkey = peerRkeys[peer]
   //
-  // Two fields, matching NCCL's `resourceWindow` + `resourceWindow_inlined`:
+  // Two fields, `resourceWindow` + `resourceWindow_inlined`:
   //   * resourceWindow         : GPU pointer to the window struct. Used
   //                              by host-side bookkeeping (DevCommDestroy
   //                              looks up the matching ccoWindowHost via
@@ -263,7 +263,7 @@ struct ccoDevComm {
 
   // IBGDA context (QP + signal + counter); empty when gdaConnType==NONE.
   ccoIbgdaContext ibgda;
-  // Standalone barriers (mirroring NCCL `ncclDevComm`):
+  // Standalone barriers:
   //   * lsaBarrier            — intra-node, driven by reqs.lsaBarrierCount
   //   * railGdaBarrier        — same-rail cross-node, driven by reqs.railGdaBarrierCount
   // Hybrid barrier pair (two-stage LSA+Rail world barrier):
@@ -1821,6 +1821,34 @@ struct ccoComm;
 #endif
 
 // ── Phase 1: Communicator ──
+//
+// Two ways to bootstrap:
+//
+//  A) Self-contained (needs only this header). Rank 0 calls
+//     ccoGetUniqueId, broadcasts the 128-byte POD id to all ranks out-of-band
+//     (MPI_Bcast, a file, your launcher, ...), then every rank calls the
+//     ccoUniqueId overload. cco builds its built-in socket bootstrap internally.
+//
+//       ccoUniqueId id;
+//       if (rank == 0) ccoGetUniqueId(&id);
+//       /* broadcast id to all ranks */
+//       ccoCommCreate(id, nRanks, rank, vmm, &comm);
+//
+//  B) Pluggable transport: construct a concrete bootstrap yourself (include the
+//     matching mori/application/bootstrap/{socket,mpi,torch}_bootstrap.hpp) and
+//     pass it in. cco takes ownership and destroys it in ccoCommDestroy.
+//
+// ccoUniqueId encodes rank 0's socket rendezvous address; the interface is
+// picked from MORI_SOCKET_IFNAME (see socket bootstrap docs).
+struct ccoUniqueId {
+  char internal[128];
+};
+
+int ccoGetUniqueId(ccoUniqueId* uniqueId);
+int ccoCommCreate(const ccoUniqueId& uniqueId, int nRanks, int rank, size_t perRankVmmSize,
+                  ccoComm** comm);
+
+// Overload B: caller-provided bootstrap (ownership transferred to the comm).
 int ccoCommCreate(application::BootstrapNetwork* bootNet, size_t perRankVmmSize, ccoComm** comm);
 int ccoCommDestroy(ccoComm* comm);
 
