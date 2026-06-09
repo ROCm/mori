@@ -63,6 +63,36 @@ struct RdmaMemoryRegion {
   size_t length{0};
 };
 
+// Device-side view of an RDMA endpoint: the GPU-visible subset of the host
+// application::RdmaEndpoint (transport/rdma/rdma.hpp). Holds only the fields
+// device kernels need to post work — no ibverbs objects, no STL. Populated on
+// the host from application::RdmaEndpoint, then hipMemcpy'd to the device.
+//
+// This lives in the application (transport) layer, not in any higher module,
+// so backends that drive RDMA from kernels (shmem, cco, ...) depend DOWN on it
+// rather than on each other. Only `qpn` is pulled out of RdmaEndpoint::handle;
+// the rest map field-for-field.
+struct RdmaEndpointDevice {
+  RdmaDeviceVendorId vendorId{RdmaDeviceVendorId::Unknown};
+  uint32_t qpn{0};  // QP number — extracted from application::RdmaEndpoint::handle.qpn
+  core::WorkQueueHandle wqHandle;
+  core::CompletionQueueHandle cqHandle;
+  core::IbufHandle atomicIbuf;
+
+  __device__ __host__ core::ProviderType GetProviderType() const {
+    switch (vendorId) {
+      case RdmaDeviceVendorId::Mellanox:
+        return core::ProviderType::MLX5;
+      case RdmaDeviceVendorId::Broadcom:
+        return core::ProviderType::BNXT;
+      case RdmaDeviceVendorId::Pensando:
+        return core::ProviderType::PSD;
+      default:
+        return core::ProviderType::Unknown;
+    }
+  }
+};
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                    Symmetric Memory Types */
 /* ---------------------------------------------------------------------------------------------- */
