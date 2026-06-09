@@ -21,13 +21,18 @@
 // SOFTWARE.
 // Copyright © Advanced Micro Devices, Inc. All rights reserved.
 // MIT License — see LICENSE for details.
+#include <unistd.h>
+
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
+#include <random>
 #include <string>
 #include <vector>
 
 #include "hip/hip_runtime_api.h"
 #include "mori/application/bootstrap/local_bootstrap.hpp"
+#include "mori/application/bootstrap/socket_bootstrap.hpp"
 #include "mori/application/transport/rdma/rdma.hpp"
 #include "mori/application/transport/sdma/anvil.hpp"
 #include "mori/application/utils/check.hpp"
@@ -52,6 +57,64 @@ static uintptr_t LocalSlotBase(const ccoComm* comm) {
 /* ========================================================================== */
 /*                              ccoCommCreate                              */
 /* ========================================================================== */
+
+int ccoGetUniqueId(ccoUniqueId* uniqueId) {
+  if (!uniqueId) return -1;
+  static_assert(sizeof(application::UniqueId) <= sizeof(ccoUniqueId),
+                "ccoUniqueId must be large enough to hold application::UniqueId");
+  // Encode rank 0's socket rendezvous endpoint into the id; non-root ranks
+  // connect here during ccoCommCreate, so the address+port must be concrete.
+  // Pick a free port by random probe-bind (zero-config, no fixed port to
+  // collide) — same scheme as shmem's ShmemGetUniqueId. Interface from
+  // MORI_SOCKET_IFNAME, else the first non-loopback NIC. Caller broadcasts the
+  // POD id to every rank out-of-band.
+  const char* ifname = std::getenv("MORI_SOCKET_IFNAME");
+  std::random_device rd;
+  std::mt19937 gen(rd());
+  std::uniform_int_distribution<int> portDis(10000, 60000);
+  constexpr int kMaxPortRetries = 20;
+
+  try {
+    for (int attempt = 0; attempt < kMaxPortRetries; attempt++) {
+      int port = portDis(gen);
+      int probeFd = socket(AF_INET, SOCK_STREAM, 0);
+      if (probeFd < 0) continue;
+      int opt = 1;
+      setsockopt(probeFd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+      struct sockaddr_in probeAddr{};
+      probeAddr.sin_family = AF_INET;
+      probeAddr.sin_port = htons(static_cast<uint16_t>(port));
+      probeAddr.sin_addr.s_addr = htonl(INADDR_ANY);
+      if (bind(probeFd, reinterpret_cast<struct sockaddr*>(&probeAddr), sizeof(probeAddr)) == 0) {
+        close(probeFd);
+        application::UniqueId appUid =
+            ifname ? application::SocketBootstrapNetwork::GenerateUniqueIdWithInterface(ifname, port)
+                   : application::SocketBootstrapNetwork::GenerateUniqueIdWithLocalAddr(port);
+        std::memset(uniqueId, 0, sizeof(*uniqueId));
+        std::memcpy(uniqueId, &appUid, sizeof(appUid));
+        return 0;
+      }
+      close(probeFd);
+    }
+  } catch (const std::exception& e) {
+    MORI_SHMEM_ERROR("ccoGetUniqueId failed: {} (set MORI_SOCKET_IFNAME=<iface>)", e.what());
+    return -1;
+  }
+  MORI_SHMEM_ERROR("ccoGetUniqueId: no free port after {} attempts", kMaxPortRetries);
+  return -1;
+}
+
+// Self-contained overload: build cco's built-in socket bootstrap from the id and
+// delegate to the BootstrapNetwork* overload, which takes ownership (the socket
+// bootstrap is Finalize()d + deleted in ccoCommDestroy).
+int ccoCommCreate(const ccoUniqueId& uniqueId, int nRanks, int rank, size_t perRankVmmSize,
+                  ccoComm** outComm) {
+  if (!outComm || nRanks <= 0 || rank < 0 || rank >= nRanks) return -1;
+  application::UniqueId appUid;
+  std::memcpy(&appUid, &uniqueId, sizeof(appUid));
+  auto* boot = new application::SocketBootstrapNetwork(appUid, rank, nRanks);
+  return ccoCommCreate(boot, perRankVmmSize, outComm);
+}
 
 int ccoCommCreate(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
                   ccoComm** outComm) {
@@ -833,7 +896,7 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
   ibgda.numQpPerPe = numQpPerPe;
 
   size_t numEps = static_cast<size_t>(comm->worldSize) * numQpPerPe;
-  shmem::ShmemRdmaEndpoint* epsGpu = nullptr;
+  application::RdmaEndpointDevice* epsGpu = nullptr;
 
   // Build the peer mask once based on connType. Context::CreateAdditional /
   // ConnectAdditional take the same mask. Empty mask if NONE.
@@ -888,17 +951,17 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
     // a TODO; for now, rely on modify_qp's internal check + the transport
     // map dump (MORI_CCO_LOG_TRANSPORT) for visibility.
 
-    std::vector<shmem::ShmemRdmaEndpoint> shmemEps(numEps);
+    std::vector<application::RdmaEndpointDevice> epsHost(numEps);
     for (size_t i = 0; i < numEps; i++) {
-      shmemEps[i].vendorId = newEps[i].vendorId;
-      shmemEps[i].qpn = newEps[i].handle.qpn;
-      shmemEps[i].wqHandle = newEps[i].wqHandle;
-      shmemEps[i].cqHandle = newEps[i].cqHandle;
-      shmemEps[i].atomicIbuf = newEps[i].atomicIbuf;
+      epsHost[i].vendorId = newEps[i].vendorId;
+      epsHost[i].qpn = newEps[i].handle.qpn;
+      epsHost[i].wqHandle = newEps[i].wqHandle;
+      epsHost[i].cqHandle = newEps[i].cqHandle;
+      epsHost[i].atomicIbuf = newEps[i].atomicIbuf;
     }
 
-    HIP_RUNTIME_CHECK(hipMalloc(&epsGpu, numEps * sizeof(shmem::ShmemRdmaEndpoint)));
-    HIP_RUNTIME_CHECK(hipMemcpy(epsGpu, shmemEps.data(), numEps * sizeof(shmem::ShmemRdmaEndpoint),
+    HIP_RUNTIME_CHECK(hipMalloc(&epsGpu, numEps * sizeof(application::RdmaEndpointDevice)));
+    HIP_RUNTIME_CHECK(hipMemcpy(epsGpu, epsHost.data(), numEps * sizeof(application::RdmaEndpointDevice),
                                 hipMemcpyHostToDevice));
   }
   ibgda.endpoints = epsGpu;
@@ -907,7 +970,7 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
   // state. Lives in the LSA flat VA + has an RDMA MR, so each block inside
   // is simultaneously P2P-load/store-addressable by intra-node peers AND
   // RDMA-write-target-addressable by cross-node peers — every per-session
-  // sub-allocation gets the full transport matrix "for free", same as NCCL.
+  // sub-allocation gets the full transport matrix "for free".
   //
   // Current residents:
   //   * IBGDA signal / shadows / counter pool (gdaConnType != NONE)
@@ -934,7 +997,7 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
   // hybrid Rail half is only active when we have cross-rail peers + RDMA.
   int hybridRailBarrierCount = gdaRailUsable ? hybridBarrierCount : 0;
 
-  // Signal slot assignment (NCCL-style):
+  // Signal slot assignment:
   //   [0 .. signalCountUser)                 — user-visible signal slots
   //   [signalCountUser .. +A)                — railGdaBarrier (A = N*nNodes)
   //   [.. +B)                                — hybridRailGdaBarrier (B = N*nNodes)

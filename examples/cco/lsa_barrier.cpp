@@ -48,8 +48,7 @@
 #include <cstdio>
 #include <vector>
 
-#include "mori/cco/cco.hpp"         // host control-plane
-#include "mori/cco/cco_device.hpp"  // device-side (kernel) API
+#include "mori/cco/cco.hpp"  // CCO single header (host + device)
 
 using namespace mori::cco;
 
@@ -139,6 +138,22 @@ __global__ void barrier_timeout_kernel(ccoDevComm* dc, uint32_t slot, uint64_t t
   }
   ccoLsaBarrierSession<ccoCoopThread> bar(g, dc, ccoTeamLsa(*dc), dc->lsaBarrier, slot);
   int rc = bar.sync(g, timeoutCycles);
+  outRc[dc->lsaRank] = rc;
+}
+
+// Timeout kernel (decoupled) — same setup as barrier_timeout_kernel, but the
+// survivors use the direct arrive() + wait(coop, timeoutCycles) pair instead of
+// the fused sync(coop, timeoutCycles). Exercises the 2-arg wait() overload
+// directly; rankToSkip never arrives, so survivors' wait() must return 1.
+__global__ void barrier_timeout_wait_kernel(ccoDevComm* dc, uint32_t slot, uint64_t timeoutCycles,
+                                            int rankToSkip, int* outRc) {
+  ccoCoopThread g;
+  if (dc->lsaRank == rankToSkip) {
+    return;
+  }
+  ccoLsaBarrierSession<ccoCoopThread> bar(g, dc, ccoTeamLsa(*dc), dc->lsaBarrier, slot);
+  bar.arrive(g);
+  int rc = bar.wait(g, timeoutCycles);
   outRc[dc->lsaRank] = rc;
 }
 
@@ -385,6 +400,43 @@ static int ut_timeout(UtCtx& ctx) {
   return ok ? 0 : 1;
 }
 
+// UT 5b — timeout via direct arrive() + wait(coop, timeoutCycles) (slot 10).
+// Same contract as ut_timeout but exercises the 2-arg wait() overload directly
+// (ut_timeout goes through sync(coop, timeoutCycles)).
+static int ut_timeout_wait(UtCtx& ctx) {
+  constexpr uint32_t kSlot = 10u;
+  constexpr uint64_t kTimeoutCycles = 500ULL * 1000 * 1000;
+  constexpr int kRankToSkip = 0;
+
+  if (ctx.dcHost.lsaSize < 2) {
+    if (ctx.rank == 0) {
+      std::printf("  [twait ] skipped (lsaSize=%d < 2)\n", ctx.dcHost.lsaSize);
+    }
+    return 0;
+  }
+
+  HIP_CHECK(hipMemset(ctx.devRc, 0xFF, sizeof(int) * ctx.dcHost.lsaSize));  // sentinel = -1
+
+  hipLaunchKernelGGL(barrier_timeout_wait_kernel, dim3(1), dim3(1), 0, 0, ctx.devComm, kSlot,
+                     kTimeoutCycles, kRankToSkip, ctx.devRc);
+  HIP_CHECK(hipDeviceSynchronize());
+
+  std::vector<int> rcHost(ctx.dcHost.lsaSize);
+  HIP_CHECK(
+      hipMemcpy(rcHost.data(), ctx.devRc, sizeof(int) * ctx.dcHost.lsaSize, hipMemcpyDeviceToHost));
+
+  bool ok = true;
+  if (ctx.dcHost.lsaRank != kRankToSkip && rcHost[ctx.dcHost.lsaRank] != 1) {
+    ok = false;
+  }
+  if (ctx.rank == 0) {
+    std::printf("  [twait ] slot=%u skipRank=%d  expected rc=1 on survivors (direct wait)  %s\n",
+                kSlot, kRankToSkip, ok ? "PASS" : "FAIL");
+  }
+  ccoBarrierAll(ctx.comm);
+  return ok ? 0 : 1;
+}
+
 // UT 6 — arrive()/wait() split (slot 5)
 static int ut_arrive_wait_split(UtCtx& ctx) {
   constexpr uint32_t kSlot = 5u;
@@ -528,6 +580,7 @@ static int run_all_tests(UtCtx& ctx) {
       {"thread", ut_visibility_thread},
       {"stress", ut_stress},
       {"timeo", ut_timeout},
+      {"twait", ut_timeout_wait},
       {"split", ut_arrive_wait_split},
       {"persis", ut_persist_cookie},
       {"mslot", ut_multislot},
@@ -562,17 +615,21 @@ int main(int argc, char* argv[]) {
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   MPI_Comm_size(MPI_COMM_WORLD, &nranks);
 
-  // ── Phase 1: communicator ──
-  auto* boot = new mori::application::MpiBootstrapNetwork(MPI_COMM_WORLD);
+  // ── Phase 1: communicator (self-contained bootstrap) ──
+  // MPI is only the launcher + a one-shot broadcast of the cco unique id;
+  // cco builds its own socket bootstrap internally from the id.
+  ccoUniqueId uid;
+  if (rank == 0) assert(ccoGetUniqueId(&uid) == 0);
+  MPI_Bcast(&uid, sizeof(uid), MPI_BYTE, 0, MPI_COMM_WORLD);
 
   // Bind each rank to its own GPU BEFORE ccoCommCreate (which calls
   // hipGetDevice() and pins allocations to the current device).
   int hipDevCount = 0;
   HIP_CHECK(hipGetDeviceCount(&hipDevCount));
-  HIP_CHECK(hipSetDevice(boot->GetLocalRank() % hipDevCount));
+  HIP_CHECK(hipSetDevice(rank % hipDevCount));
 
   ccoComm* comm = nullptr;
-  assert(ccoCommCreate(boot, PER_RANK_VMM_SIZE, &comm) == 0);
+  assert(ccoCommCreate(uid, nranks, rank, PER_RANK_VMM_SIZE, &comm) == 0);
 
   // ── Phase 2: send window (one uint32 cookie slot) ──
   void* sendBuf = nullptr;
@@ -580,10 +637,10 @@ int main(int argc, char* argv[]) {
   assert(ccoWindowRegister(comm, COOKIE_BYTES, &sendWin, &sendBuf) == 0);
   HIP_CHECK(hipMemset(sendBuf, 0, COOKIE_BYTES));
 
-  // ── Phase 3: DevComm with LSA barrier slots (0..9 used by the UTs) ──
+  // ── Phase 3: DevComm with LSA barrier slots (0..10 used by the UTs) ──
   ccoDevCommRequirements reqs = CCO_DEV_COMM_REQUIREMENTS_INITIALIZER;
   reqs.gdaConnectionType = CCO_GDA_CONNECTION_NONE;
-  reqs.lsaBarrierCount = 10;
+  reqs.lsaBarrierCount = 11;
   ccoDevComm* devComm = nullptr;
   assert(ccoDevCommCreate(comm, &reqs, &devComm) == 0);
 
@@ -612,9 +669,11 @@ int main(int argc, char* argv[]) {
   ccoWindowDeregister(comm, sendWin);
   ccoMemFree(comm, sendBuf);
 
-  // Bootstrap ownership transfers to ccoComm at ccoCommCreate; ccoCommDestroy
-  // does `bootNet->Finalize()` + `delete bootNet`, which calls MPI_Finalize().
+  // cco owns the internal socket bootstrap (built from the unique id) and tears
+  // it down in ccoCommDestroy. MPI is only our launcher + id broadcast, so we
+  // finalize it ourselves.
   ccoCommDestroy(comm);
 
+  MPI_Finalize();
   return fails != 0 ? 1 : 0;
 }

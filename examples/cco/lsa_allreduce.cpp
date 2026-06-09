@@ -23,10 +23,10 @@
 /*
  * CCo Device API AllReduce Example (intra-node LSA, multi-block / multi-slot)
  *
- * Mirrors NCCL's device-API allreduce: the kernel is launched with CTA_COUNT
- * blocks, each block drives its OWN lsaBarrier slot (slot = blockIdx.x), and
- * the workload is spread across the full (block × rank × thread) grid via a
- * grid-stride loop. lsaBarrierCount must therefore equal CTA_COUNT.
+ * Device-API allreduce: the kernel is launched with CTA_COUNT blocks, each
+ * block drives its OWN lsaBarrier slot (slot = blockIdx.x), and the workload is
+ * spread across the full (block × rank × thread) grid via a grid-stride loop.
+ * lsaBarrierCount must therefore equal CTA_COUNT.
  *
  * Three variants of the same allreduce-sum, one per CCo coop type — identical
  * apart from the barrier cooperation granularity:
@@ -47,8 +47,7 @@
 #include <vector>
 
 #include "args_parser.hpp"
-#include "mori/cco/cco.hpp"         // host control-plane
-#include "mori/cco/cco_device.hpp"  // device-side (kernel) API
+#include "mori/cco/cco.hpp"  // CCO single header (host + device)
 
 // Larger vector so the multi-block grid-stride loop actually spreads work
 // across blocks (each rank r contributes a vector of all r's).
@@ -72,9 +71,9 @@ using namespace mori::cco;
 //        v = sum over peers of sendBuf[i]; write v to every peer's recvBuf[i]
 //   4. sync (release — signal recvBuf is fully written)
 //
-// Work is spread across the whole (block × rank × thread) grid like the NCCL
-// device-API example: every barrier slot is exercised concurrently, and each
-// element is owned by exactly one (rank, block, lane) triple.
+// Work is spread across the whole (block × rank × thread) grid: every barrier
+// slot is exercised concurrently, and each element is owned by exactly one
+// (rank, block, lane) triple.
 //
 // The Coop type only changes the cooperation granularity within a block:
 //   ccoCoopBlock  → all THREADS_PER_CTA threads stride together
@@ -123,17 +122,20 @@ int main(int argc, char* argv[]) {
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   MPI_Comm_size(MPI_COMM_WORLD, &nranks);
 
-  // ── Phase 1: communicator ──
-  auto* boot = new mori::application::MpiBootstrapNetwork(MPI_COMM_WORLD);
+  // ── Phase 1: communicator (self-contained bootstrap) ──
+  // MPI is only the launcher + a one-shot broadcast of the cco unique id.
+  ccoUniqueId uid;
+  if (rank == 0) assert(ccoGetUniqueId(&uid) == 0);
+  MPI_Bcast(&uid, sizeof(uid), MPI_BYTE, 0, MPI_COMM_WORLD);
 
   // Bind each rank to its own GPU BEFORE ccoCommCreate (which calls
   // hipGetDevice() and pins allocations to the current device).
   int hipDevCount = 0;
   assert(hipGetDeviceCount(&hipDevCount) == hipSuccess);
-  assert(hipSetDevice(boot->GetLocalRank() % hipDevCount) == hipSuccess);
+  assert(hipSetDevice(rank % hipDevCount) == hipSuccess);
 
   ccoComm* comm = nullptr;
-  assert(ccoCommCreate(boot, 0, &comm) == 0);
+  assert(ccoCommCreate(uid, nranks, rank, 0, &comm) == 0);
 
   const size_t sizeBytes = NELEMS * sizeof(float);
 
@@ -243,9 +245,10 @@ int main(int argc, char* argv[]) {
   ccoMemFree(comm, sendBuf);
   ccoMemFree(comm, recvBuf);
 
-  // bootstrap ownership transfers to ccoComm at ccoCommCreate; ccoCommDestroy
-  // does `bootNet->Finalize()` + `delete bootNet`, which calls MPI_Finalize().
-  // Don't double-free `boot` or call MPI_Finalize() a second time here.
+  // cco owns the internal socket bootstrap (built from the unique id) and tears
+  // it down in ccoCommDestroy. MPI is only our launcher + id broadcast, so we
+  // finalize it ourselves.
   ccoCommDestroy(comm);
+  MPI_Finalize();
   return totalErrors != 0 ? 1 : 0;
 }

@@ -52,10 +52,8 @@
 
 #include "hip/hip_runtime.h"
 #include "mori/application/bootstrap/socket_bootstrap.hpp"
-#include "mori/shmem/internal.hpp"
 
 #include "mori/cco/cco.hpp"
-#include "mori/cco/cco_device.hpp"
 
 static int g_rank = 0;
 
@@ -84,7 +82,7 @@ static constexpr mori::core::ProviderType kPrvdType = mori::core::ProviderType::
 // step 3: each thread waits for peer tid's reciprocal signal on our slot.
 template <mori::core::ProviderType PrvdType>
 __global__ void GdaSignalIncKernel(mori::cco::ccoDevComm devComm) {
-  using namespace mori::cco::gda;
+  using namespace mori::cco;
 
   ccoGda<PrvdType> gda{devComm, /*ginContext=*/0};
 
@@ -111,7 +109,7 @@ __global__ void GdaSignalIncKernel(mori::cco::ccoDevComm devComm) {
 // round-2 signals, otherwise a remote SignalAdd can race with the local reset.
 template <mori::core::ProviderType PrvdType>
 __global__ void GdaSignalResetKernel(mori::cco::ccoDevComm devComm) {
-  using namespace mori::cco::gda;
+  using namespace mori::cco;
 
   ccoGda<PrvdType> gda{devComm, /*ginContext=*/0};
 
@@ -129,7 +127,7 @@ __global__ void GdaSignalResetKernel(mori::cco::ccoDevComm devComm) {
 // launched only after ccoBarrierAll confirms all ranks have completed the reset.
 template <mori::core::ProviderType PrvdType>
 __global__ void GdaSignalAddKernel(mori::cco::ccoDevComm devComm) {
-  using namespace mori::cco::gda;
+  using namespace mori::cco;
 
   ccoGda<PrvdType> gda{devComm, /*ginContext=*/0};
 

@@ -149,7 +149,7 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
       HIP_CHECK(hipMemcpy(&h, dc, sizeof(h), hipMemcpyDeviceToHost));
       if (!h.ibgda.endpoints || h.ibgda.numQpPerPe == 0) return 0;
       size_t n = static_cast<size_t>(h.worldSize) * h.ibgda.numQpPerPe;
-      std::vector<mori::shmem::ShmemRdmaEndpoint> eps(n);
+      std::vector<mori::application::RdmaEndpointDevice> eps(n);
       HIP_CHECK(
           hipMemcpy(eps.data(), h.ibgda.endpoints, n * sizeof(eps[0]), hipMemcpyDeviceToHost));
       int c = 0;

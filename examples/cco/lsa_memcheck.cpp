@@ -46,8 +46,7 @@
 #include <cstring>
 
 #include "args_parser.hpp"
-#include "mori/cco/cco.hpp"         // host control-plane
-#include "mori/cco/cco_device.hpp"  // device-side (kernel) API
+#include "mori/cco/cco.hpp"  // CCO single header (host + device)
 
 using namespace mori::cco;
 
@@ -82,18 +81,21 @@ int main(int argc, char* argv[]) {
     fflush(stdout);
   }
 
-  // ── Phase 1: ccoComm (created once, destroyed at the end) ──
-  auto* boot = new mori::application::MpiBootstrapNetwork(MPI_COMM_WORLD);
+  // ── Phase 1: ccoComm (self-contained bootstrap) ──
+  // MPI is only the launcher + a one-shot broadcast of the cco unique id.
+  ccoUniqueId uid;
+  if (rank == 0) assert(ccoGetUniqueId(&uid) == 0);
+  MPI_Bcast(&uid, sizeof(uid), MPI_BYTE, 0, MPI_COMM_WORLD);
 
   // Bind each rank to its own GPU BEFORE ccoCommCreate. ccoCommCreate calls
   // hipGetDevice() and pins all allocations to the current device, so without
   // this every rank would land on GPU 0 (all 8 GB windows stacked on PE0).
   int hipDevCount = 0;
   assert(hipGetDeviceCount(&hipDevCount) == hipSuccess);
-  assert(hipSetDevice(boot->GetLocalRank() % hipDevCount) == hipSuccess);
+  assert(hipSetDevice(rank % hipDevCount) == hipSuccess);
 
   mori::cco::ccoComm* comm = nullptr;
-  assert(ccoCommCreate(boot, 0, &comm) == 0);
+  assert(ccoCommCreate(uid, nranks, rank, 0, &comm) == 0);
 
   // ── Phase 2: window + devcomm leak loop ──
   for (int wi = 0; wi < window_iters; wi++) {
@@ -134,8 +136,10 @@ int main(int argc, char* argv[]) {
   }
 
   // ── Teardown ──
-  // bootstrap ownership transfers to ccoComm; ccoCommDestroy calls
-  // bootNet->Finalize() + delete bootNet, which calls MPI_Finalize().
+  // cco owns the internal socket bootstrap (built from the unique id) and tears
+  // it down in ccoCommDestroy. MPI is only our launcher + id broadcast, so we
+  // finalize it ourselves.
   ccoCommDestroy(comm);
+  MPI_Finalize();
   return 0;
 }
