@@ -162,7 +162,7 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
     return 1;
   }
 
-  // kernel takes devcomm by value (nccl-style), so copy to host
+  // kernel takes devcomm by value, so copy to host
   mori::cco::ccoDevComm devCommHost;
   HIP_CHECK(hipMemcpy(&devCommHost, devComm, sizeof(devCommHost), hipMemcpyDeviceToHost));
   printf("[rank %d] DevCommCreate OK (worldSize=%d, lsaSize=%d, gdaConnType=%d, numQpPerPe=%d)\n",
