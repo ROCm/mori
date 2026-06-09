@@ -125,6 +125,7 @@ def _test_dispatch_combine_ll(
     routing=None,
     use_max_token_num=False,
     check_results=True,
+    sentinel_pattern=None,
 ):
     config = _make_intranode_config(
         rank=rank,
