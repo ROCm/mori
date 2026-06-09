@@ -122,7 +122,7 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
         // Routing sentinel: a negative expert id means "drop this top-k slot".
         // Skip the dispatch entirely and write the existing combine-side null sentinel
         // (PE == worldSize) into dispDestTokIdMap so combine treats this slot as nullptr.
-        
+
         // Out-of-range expert id guard: destPe is warp-uniform here (one
         // token-expert per warp) and indexes GetAs(destPe) / destPeTokenCounter
         // below. An out-of-range id (e.g. an EPLB physical id

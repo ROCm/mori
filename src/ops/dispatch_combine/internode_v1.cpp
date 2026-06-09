@@ -429,8 +429,8 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
         // and an OOB GetAs/WarpCopy/atomicAdd -> HSA page fault. Treat any
         // out-of-range destPe as a dropped token via the existing skip path.
         bool peOutOfRange = (destPe < 0) || (destPe >= config.worldSize);
-        bool shouldSkip =
-            peOutOfRange || isSentinelSlot || (destNode != myNode) || __any((laneId < e) && (destPe == lanePe));
+        bool shouldSkip = peOutOfRange || isSentinelSlot || (destNode != myNode) ||
+                          __any((laneId < e) && (destPe == lanePe));
         if (shouldSkip) {
           if (!args.replayMode && laneId == 0)
             args.interNodeDispDestTokIdMap[tokIdx * config.numExpertPerToken + e] =
