@@ -74,7 +74,7 @@ static int CountQpsFor(mori::cco::ccoDevComm* devComm, int worldSize) {
   HIP_CHECK(hipMemcpy(&host, devComm, sizeof(host), hipMemcpyDeviceToHost));
   if (host.ibgda.endpoints == nullptr || host.ibgda.numQpPerPe == 0) return 0;
   size_t total = static_cast<size_t>(worldSize) * host.ibgda.numQpPerPe;
-  std::vector<mori::shmem::ShmemRdmaEndpoint> eps(total);
+  std::vector<mori::application::RdmaEndpointDevice> eps(total);
   HIP_CHECK(
       hipMemcpy(eps.data(), host.ibgda.endpoints, total * sizeof(eps[0]), hipMemcpyDeviceToHost));
   int count = 0;

@@ -47,8 +47,7 @@
 #include <vector>
 
 #include "args_parser.hpp"
-#include "mori/cco/cco.hpp"         // host control-plane
-#include "mori/cco/cco_device.hpp"  // device-side (kernel) API
+#include "mori/cco/cco.hpp"  // CCO single header (host + device)
 
 // Larger vector so the multi-block grid-stride loop actually spreads work
 // across blocks (each rank r contributes a vector of all r's).

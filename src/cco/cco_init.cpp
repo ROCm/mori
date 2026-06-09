@@ -833,7 +833,7 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
   ibgda.numQpPerPe = numQpPerPe;
 
   size_t numEps = static_cast<size_t>(comm->worldSize) * numQpPerPe;
-  shmem::ShmemRdmaEndpoint* epsGpu = nullptr;
+  application::RdmaEndpointDevice* epsGpu = nullptr;
 
   // Build the peer mask once based on connType. Context::CreateAdditional /
   // ConnectAdditional take the same mask. Empty mask if NONE.
@@ -888,17 +888,17 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
     // a TODO; for now, rely on modify_qp's internal check + the transport
     // map dump (MORI_CCO_LOG_TRANSPORT) for visibility.
 
-    std::vector<shmem::ShmemRdmaEndpoint> shmemEps(numEps);
+    std::vector<application::RdmaEndpointDevice> epsHost(numEps);
     for (size_t i = 0; i < numEps; i++) {
-      shmemEps[i].vendorId = newEps[i].vendorId;
-      shmemEps[i].qpn = newEps[i].handle.qpn;
-      shmemEps[i].wqHandle = newEps[i].wqHandle;
-      shmemEps[i].cqHandle = newEps[i].cqHandle;
-      shmemEps[i].atomicIbuf = newEps[i].atomicIbuf;
+      epsHost[i].vendorId = newEps[i].vendorId;
+      epsHost[i].qpn = newEps[i].handle.qpn;
+      epsHost[i].wqHandle = newEps[i].wqHandle;
+      epsHost[i].cqHandle = newEps[i].cqHandle;
+      epsHost[i].atomicIbuf = newEps[i].atomicIbuf;
     }
 
-    HIP_RUNTIME_CHECK(hipMalloc(&epsGpu, numEps * sizeof(shmem::ShmemRdmaEndpoint)));
-    HIP_RUNTIME_CHECK(hipMemcpy(epsGpu, shmemEps.data(), numEps * sizeof(shmem::ShmemRdmaEndpoint),
+    HIP_RUNTIME_CHECK(hipMalloc(&epsGpu, numEps * sizeof(application::RdmaEndpointDevice)));
+    HIP_RUNTIME_CHECK(hipMemcpy(epsGpu, epsHost.data(), numEps * sizeof(application::RdmaEndpointDevice),
                                 hipMemcpyHostToDevice));
   }
   ibgda.endpoints = epsGpu;

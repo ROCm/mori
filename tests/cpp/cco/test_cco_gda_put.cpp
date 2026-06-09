@@ -45,10 +45,8 @@
 
 #include "hip/hip_runtime.h"
 #include "mori/application/bootstrap/socket_bootstrap.hpp"
-#include "mori/shmem/internal.hpp"
 
 #include "mori/cco/cco.hpp"
-#include "mori/cco/cco_device.hpp"
 
 static int g_rank = 0;
 
@@ -74,7 +72,7 @@ template <mori::core::ProviderType PrvdType, typename T>
 __global__ void GdaAlltoAllKernel(mori::cco::ccoWindowDevice* sendWin,
                                   mori::cco::ccoWindowDevice* recvWin, size_t count,
                                   mori::cco::ccoDevComm devComm) {
-  using namespace mori::cco::gda;
+  using namespace mori::cco;
 
   ccoGda<PrvdType> gda{devComm, /*ginContext=*/0};
 

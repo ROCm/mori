@@ -48,8 +48,7 @@
 #include <cstdio>
 #include <vector>
 
-#include "mori/cco/cco.hpp"         // host control-plane
-#include "mori/cco/cco_device.hpp"  // device-side (kernel) API
+#include "mori/cco/cco.hpp"  // CCO single header (host + device)
 
 using namespace mori::cco;
 
