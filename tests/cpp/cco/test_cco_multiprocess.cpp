@@ -98,14 +98,14 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
 
   // ── Create DevComm #1 (default requirements) ──
   mori::cco::ccoDevCommRequirements reqs = CCO_DEV_COMM_REQUIREMENTS_INITIALIZER;
-  mori::cco::ccoDevComm* devComm1 = nullptr;
+  mori::cco::ccoDevComm devComm1{};
   if (mori::cco::ccoDevCommCreate(comm, &reqs, &devComm1) != 0) {
     fprintf(stderr, "[rank %d] DevCommCreate #1 failed\n", rank);
     return 1;
   }
 
   // ── Create DevComm #2 (fresh QPs, independent from #1) ──
-  mori::cco::ccoDevComm* devComm2 = nullptr;
+  mori::cco::ccoDevComm devComm2{};
   if (mori::cco::ccoDevCommCreate(comm, &reqs, &devComm2) != 0) {
     fprintf(stderr, "[rank %d] DevCommCreate #2 failed\n", rank);
     return 1;
@@ -113,23 +113,20 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
   printf("[rank %d] 2x DevCommCreate OK\n", rank);
 
   // Verify both DevComms have correct rank/worldSize
-  mori::cco::ccoDevComm dc1Host, dc2Host;
-  HIP_CHECK(hipMemcpy(&dc1Host, devComm1, sizeof(dc1Host), hipMemcpyDeviceToHost));
-  HIP_CHECK(hipMemcpy(&dc2Host, devComm2, sizeof(dc2Host), hipMemcpyDeviceToHost));
-  if (dc1Host.rank != rank || dc2Host.rank != rank) {
+  if (devComm1.rank != rank || devComm2.rank != rank) {
     fprintf(stderr, "[rank %d] DevComm rank mismatch\n", rank);
     return 1;
   }
 
   // Verify DevComm #1 and #2 have different QP resources (different GPU endpoint pointers)
-  if (dc1Host.ibgda.endpoints == dc2Host.ibgda.endpoints && dc1Host.ibgda.endpoints != nullptr) {
+  if (devComm1.ibgda.endpoints == devComm2.ibgda.endpoints && devComm1.ibgda.endpoints != nullptr) {
     fprintf(stderr, "[rank %d] DevComm #1 and #2 share same endpoint pointer — NOT independent!\n",
             rank);
     return 1;
   }
 
   // Verify signal buffers are also independent
-  if (dc1Host.ibgda.signalBuf == dc2Host.ibgda.signalBuf && dc1Host.ibgda.signalBuf != nullptr) {
+  if (devComm1.ibgda.signalBuf == devComm2.ibgda.signalBuf && devComm1.ibgda.signalBuf != nullptr) {
     fprintf(stderr, "[rank %d] DevComm #1 and #2 share same signalBuf!\n", rank);
     return 1;
   }
@@ -144,14 +141,12 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
   //   CROSSNODE : (worldSize - lsaSize) * qpsPerPe   (collapses to 0 on single-node)
   //   RAIL      : (nNodes - 1) * qpsPerPe            (collapses to 0 on single-node)
   {
-    auto countQps = [&](mori::cco::ccoDevComm* dc) -> int {
-      mori::cco::ccoDevComm h;
-      HIP_CHECK(hipMemcpy(&h, dc, sizeof(h), hipMemcpyDeviceToHost));
-      if (!h.ibgda.endpoints || h.ibgda.numQpPerPe == 0) return 0;
-      size_t n = static_cast<size_t>(h.worldSize) * h.ibgda.numQpPerPe;
+    auto countQps = [&](const mori::cco::ccoDevComm& dc) -> int {
+      if (!dc.ibgda.endpoints || dc.ibgda.numQpPerPe == 0) return 0;
+      size_t n = static_cast<size_t>(dc.worldSize) * dc.ibgda.numQpPerPe;
       std::vector<mori::application::RdmaEndpointDevice> eps(n);
       HIP_CHECK(
-          hipMemcpy(eps.data(), h.ibgda.endpoints, n * sizeof(eps[0]), hipMemcpyDeviceToHost));
+          hipMemcpy(eps.data(), dc.ibgda.endpoints, n * sizeof(eps[0]), hipMemcpyDeviceToHost));
       int c = 0;
       for (auto& ep : eps)
         if (ep.qpn != 0) c++;
@@ -162,8 +157,8 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
       r.gdaConnectionType = ct;
       return r;
     };
-    mori::cco::ccoDevComm *dcNone = nullptr, *dcFull = nullptr;
-    mori::cco::ccoDevComm *dcXnode = nullptr, *dcRail = nullptr;
+    mori::cco::ccoDevComm dcNone{}, dcFull{};
+    mori::cco::ccoDevComm dcXnode{}, dcRail{};
     auto rNone = mkReqs(mori::cco::CCO_GDA_CONNECTION_NONE);
     auto rFull = mkReqs(mori::cco::CCO_GDA_CONNECTION_FULL);
     auto rXnode = mkReqs(mori::cco::CCO_GDA_CONNECTION_CROSSNODE);
@@ -176,13 +171,13 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
       fprintf(stderr, "[rank %d] connType DevCommCreate failed\n", rank);
       return 1;
     }
-    const int nNodes = dc1Host.worldSize / dc1Host.lsaSize;
+    const int nNodes = devComm1.worldSize / devComm1.lsaSize;
     const int qNone = countQps(dcNone);
     const int qFull = countQps(dcFull);
     const int qXnode = countQps(dcXnode);
     const int qRail = countQps(dcRail);
-    const int eFull = (dc1Host.worldSize - 1) * qpsPerPe;
-    const int eXnode = (dc1Host.worldSize - dc1Host.lsaSize) * qpsPerPe;
+    const int eFull = (devComm1.worldSize - 1) * qpsPerPe;
+    const int eXnode = (devComm1.worldSize - devComm1.lsaSize) * qpsPerPe;
     const int eRail = (nNodes - 1) * qpsPerPe;
     if (qNone != 0 || qFull != eFull || qXnode != eXnode || qRail != eRail) {
       fprintf(stderr,
@@ -193,23 +188,21 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
     }
     printf("[rank %d] connType OK: NONE=0 FULL=%d XNODE=%d RAIL=%d (nNodes=%d qpsPerPe=%d)\n", rank,
            qFull, qXnode, qRail, nNodes, qpsPerPe);
-    mori::cco::ccoDevCommDestroy(comm, dcRail);
-    mori::cco::ccoDevCommDestroy(comm, dcXnode);
-    mori::cco::ccoDevCommDestroy(comm, dcFull);
-    mori::cco::ccoDevCommDestroy(comm, dcNone);
+    mori::cco::ccoDevCommDestroy(comm, &dcRail);
+    mori::cco::ccoDevCommDestroy(comm, &dcXnode);
+    mori::cco::ccoDevCommDestroy(comm, &dcFull);
+    mori::cco::ccoDevCommDestroy(comm, &dcNone);
   }
 
   // P2P cross-read via flat addressing — LSA peers only (intra-node).
   mori::cco::ccoWindowDevice winHost;
   HIP_CHECK(hipMemcpy(&winHost, win, sizeof(winHost), hipMemcpyDeviceToHost));
-  mori::cco::ccoDevComm devCommSnap;
-  HIP_CHECK(hipMemcpy(&devCommSnap, devComm1, sizeof(devCommSnap), hipMemcpyDeviceToHost));
 
   mori::cco::ccoBarrierAll(comm);
 
   int p2pOk = 0;
-  int lsaSize = devCommSnap.lsaSize;
-  int myNodeStart = devCommSnap.myNodeStart;
+  int lsaSize = devComm1.lsaSize;
+  int myNodeStart = devComm1.myNodeStart;
   for (int lsa = 0; lsa < lsaSize; lsa++) {
     if (lsa == winHost.lsaRank) continue;
     int pe = myNodeStart + lsa;
@@ -226,8 +219,8 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
   }
   printf("[rank %d] P2P OK from %d LSA peers\n", rank, p2pOk);
 
-  mori::cco::ccoDevCommDestroy(comm, devComm2);
-  mori::cco::ccoDevCommDestroy(comm, devComm1);
+  mori::cco::ccoDevCommDestroy(comm, &devComm2);
+  mori::cco::ccoDevCommDestroy(comm, &devComm1);
   mori::cco::ccoWindowDeregister(comm, win);
   mori::cco::ccoMemFree(comm, buf);
   mori::cco::ccoCommDestroy(comm);

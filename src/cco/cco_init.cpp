@@ -849,7 +849,7 @@ int ccoWindowDeregister(ccoComm* comm, ccoWindow_t win) {
 /*                            ccoDevCommCreate                             */
 /* ========================================================================== */
 
-int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevComm** outDevComm) {
+int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevComm* outDevComm) {
   MORI_SHMEM_TRACE("ccoDevCommCreate: rank={}", comm->rank);
 
   // Forward-compat: validate {magic, version}.
@@ -1222,15 +1222,13 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
         sdma.sdmaNumQueue);
   }
 
-  ccoDevComm* devCommGpu = nullptr;
-  HIP_RUNTIME_CHECK(hipMalloc(&devCommGpu, sizeof(ccoDevComm)));
-  HIP_RUNTIME_CHECK(hipMemcpy(devCommGpu, &hostShadow, sizeof(ccoDevComm), hipMemcpyHostToDevice));
-
-  *outDevComm = devCommGpu;
+  // Fill the caller-provided host struct in place — no device allocation. It
+  // holds device pointers (windowTable, endpoints, resource pools) but lives on
+  // the host; kernels take it by value.
+  *outDevComm = hostShadow;
   MORI_SHMEM_INFO(
-      "ccoDevCommCreate: rank={} devComm={} windows={} signals={} counters={} "
-      "resourceWindow={}",
-      comm->rank, (void*)devCommGpu, numWindows, signalCount, counterCount, (void*)resourceWindow);
+      "ccoDevCommCreate: rank={} windows={} signals={} counters={} resourceWindow={}", comm->rank,
+      numWindows, signalCount, counterCount, (void*)resourceWindow);
 
   // Optional transport map dump, gated on MORI_CCO_LOG_TRANSPORT. Shows each
   // peer's hardware capability (canP2P/canSDMA/canRDMA) alongside whether
@@ -1319,8 +1317,9 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
 int ccoDevCommDestroy(ccoComm* comm, ccoDevComm* devComm) {
   if (!devComm) return 0;
 
-  ccoDevComm hostShadow;
-  HIP_RUNTIME_CHECK(hipMemcpy(&hostShadow, devComm, sizeof(ccoDevComm), hipMemcpyDeviceToHost));
+  // devComm is the caller's host struct (filled by ccoDevCommCreate); read its
+  // device-pointer fields directly to release the resources they reference.
+  ccoDevComm& hostShadow = *devComm;
 
   auto& ibgda = hostShadow.ibgda;
 
@@ -1376,7 +1375,6 @@ int ccoDevCommDestroy(ccoComm* comm, ccoDevComm* devComm) {
     node = nodeHost.next;
   }
 
-  HIP_RUNTIME_CHECK(hipFree(devComm));
   return 0;
 }
 

@@ -180,18 +180,16 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
   reqs.gdaContextCount   = 1;
   reqs.gdaSignalCount    = nranks;
   reqs.gdaCounterCount   = 0;
-  mori::cco::ccoDevComm* devComm = nullptr;
+  mori::cco::ccoDevComm devComm{};
   if (mori::cco::ccoDevCommCreate(comm, &reqs, &devComm) != 0) {
     fprintf(stderr, "[rank %d] DevCommCreate failed\n", rank);
     return 1;
   }
 
-  mori::cco::ccoDevComm devCommHost;
-  HIP_CHECK(hipMemcpy(&devCommHost, devComm, sizeof(devCommHost), hipMemcpyDeviceToHost));
   printf("[rank %d] DevCommCreate OK (worldSize=%d, gdaConnType=%d)\n",
-         rank, devCommHost.worldSize, (int)devCommHost.gdaConnType);
+         rank, devComm.worldSize, (int)devComm.gdaConnType);
 
-  if (devCommHost.gdaConnType == mori::cco::CCO_GDA_CONNECTION_NONE) {
+  if (devComm.gdaConnType == mori::cco::CCO_GDA_CONNECTION_NONE) {
     fprintf(stderr, "[rank %d] gdaConnType collapsed to NONE\n", rank);
     return 1;
   }
@@ -203,7 +201,7 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
 
   // ── round 1: SignalInc ────────────────────────────────────────────────────
   printf("[rank %d] round 1: SignalInc\n", rank);
-  GdaSignalIncKernel<kPrvdType><<<1, nranks, 0, stream>>>(devCommHost);
+  GdaSignalIncKernel<kPrvdType><<<1, nranks, 0, stream>>>(devComm);
   HIP_CHECK(hipStreamSynchronize(stream));
   printf("[rank %d] round 1 passed\n", rank);
 
@@ -212,20 +210,20 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
   // ── round 2: resetSignal + SignalAdd ─────────────────────────────────────
   // reset must be globally complete before any rank sends round-2 signals.
   printf("[rank %d] round 2: resetSignal\n", rank);
-  GdaSignalResetKernel<kPrvdType><<<1, nranks, 0, stream>>>(devCommHost);
+  GdaSignalResetKernel<kPrvdType><<<1, nranks, 0, stream>>>(devComm);
   HIP_CHECK(hipStreamSynchronize(stream));
 
   mori::cco::ccoBarrierAll(comm);  // all ranks reset before any sends
 
   printf("[rank %d] round 2: SignalAdd\n", rank);
-  GdaSignalAddKernel<kPrvdType><<<1, nranks, 0, stream>>>(devCommHost);
+  GdaSignalAddKernel<kPrvdType><<<1, nranks, 0, stream>>>(devComm);
   HIP_CHECK(hipStreamSynchronize(stream));
   printf("[rank %d] round 2 passed\n", rank);
 
   mori::cco::ccoBarrierAll(comm);
 
   HIP_CHECK(hipStreamDestroy(stream));
-  mori::cco::ccoDevCommDestroy(comm, devComm);
+  mori::cco::ccoDevCommDestroy(comm, &devComm);
   mori::cco::ccoCommDestroy(comm);
 
   printf("[rank %d] PASSED\n", rank);

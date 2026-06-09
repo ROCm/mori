@@ -69,14 +69,12 @@ struct Result {
   } while (0)
 
 // Read DevComm back to host, count non-zero QPs in the IBGDA endpoint array.
-static int CountQpsFor(mori::cco::ccoDevComm* devComm, int worldSize) {
-  mori::cco::ccoDevComm host;
-  HIP_CHECK(hipMemcpy(&host, devComm, sizeof(host), hipMemcpyDeviceToHost));
-  if (host.ibgda.endpoints == nullptr || host.ibgda.numQpPerPe == 0) return 0;
-  size_t total = static_cast<size_t>(worldSize) * host.ibgda.numQpPerPe;
+static int CountQpsFor(const mori::cco::ccoDevComm& dc, int worldSize) {
+  if (dc.ibgda.endpoints == nullptr || dc.ibgda.numQpPerPe == 0) return 0;
+  size_t total = static_cast<size_t>(worldSize) * dc.ibgda.numQpPerPe;
   std::vector<mori::application::RdmaEndpointDevice> eps(total);
   HIP_CHECK(
-      hipMemcpy(eps.data(), host.ibgda.endpoints, total * sizeof(eps[0]), hipMemcpyDeviceToHost));
+      hipMemcpy(eps.data(), dc.ibgda.endpoints, total * sizeof(eps[0]), hipMemcpyDeviceToHost));
   int count = 0;
   for (const auto& ep : eps) {
     if (ep.qpn != 0) count++;
@@ -227,18 +225,17 @@ static void run_rank(int rank, int nranks, const mori::application::UniqueId& ui
     return reqs;
   };
 
-  mori::cco::ccoDevComm* dcNone = nullptr;
-  mori::cco::ccoDevComm* dcFull = nullptr;
-  mori::cco::ccoDevComm* dcRail = nullptr;
+  mori::cco::ccoDevComm dcNone{}, dcFull{}, dcRail{};
+  bool haveNone = false, haveFull = false, haveRail = false;
   auto reqsNone = makeReqs(mori::cco::CCO_GDA_CONNECTION_NONE);
   auto reqsFull = makeReqs(mori::cco::CCO_GDA_CONNECTION_FULL);
   auto reqsRail = makeReqs(mori::cco::CCO_GDA_CONNECTION_RAIL);
   const int numQpPerPe = reqsFull.gdaContextCount;
 
   auto teardown_after_partial_devcomm = [&]() {
-    if (dcRail) mori::cco::ccoDevCommDestroy(comm, dcRail);
-    if (dcFull) mori::cco::ccoDevCommDestroy(comm, dcFull);
-    if (dcNone) mori::cco::ccoDevCommDestroy(comm, dcNone);
+    if (haveRail) mori::cco::ccoDevCommDestroy(comm, &dcRail);
+    if (haveFull) mori::cco::ccoDevCommDestroy(comm, &dcFull);
+    if (haveNone) mori::cco::ccoDevCommDestroy(comm, &dcNone);
     mori::cco::ccoWindowDeregister(comm, winConv);
     mori::cco::ccoWindowDeregister(comm, win);
     mori::cco::ccoMemFree(comm, bufConv);
@@ -251,16 +248,19 @@ static void run_rank(int rank, int nranks, const mori::application::UniqueId& ui
     teardown_after_partial_devcomm();
     return;
   }
+  haveNone = true;
   if (mori::cco::ccoDevCommCreate(comm, &reqsFull, &dcFull) != 0) {
     snprintf(r->detail, sizeof(r->detail), "DevCommCreate FULL failed");
     teardown_after_partial_devcomm();
     return;
   }
+  haveFull = true;
   if (mori::cco::ccoDevCommCreate(comm, &reqsRail, &dcRail) != 0) {
     snprintf(r->detail, sizeof(r->detail), "DevCommCreate RAIL failed");
     teardown_after_partial_devcomm();
     return;
   }
+  haveRail = true;
 
   // Expectations on a uniform N-nodes × lsaSize layout:
   //   NONE : 0
@@ -297,9 +297,9 @@ static void run_rank(int rank, int nranks, const mori::application::UniqueId& ui
 
   // Teardown in reverse order of creation:
   // DevComm × 3 → WindowDeregister × 2 → MemFree × 2 → CommDestroy.
-  mori::cco::ccoDevCommDestroy(comm, dcRail);
-  mori::cco::ccoDevCommDestroy(comm, dcFull);
-  mori::cco::ccoDevCommDestroy(comm, dcNone);
+  mori::cco::ccoDevCommDestroy(comm, &dcRail);
+  mori::cco::ccoDevCommDestroy(comm, &dcFull);
+  mori::cco::ccoDevCommDestroy(comm, &dcNone);
   mori::cco::ccoWindowDeregister(comm, winConv);
   mori::cco::ccoWindowDeregister(comm, win);
   mori::cco::ccoMemFree(comm, bufConv);

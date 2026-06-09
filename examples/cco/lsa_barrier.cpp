@@ -75,14 +75,14 @@ static const size_t COOKIE_BYTES = 64;
 // scope fence in arrive() paired with ACQUIRE load in wait) and back-to-back
 // sync correctness (rolling less-equal wait, so fast ranks can't deadlock slow).
 template <typename Coop>
-__global__ void barrier_visibility_kernel(ccoDevComm* dc, ccoWindow_t win, size_t off,
+__global__ void barrier_visibility_kernel(ccoDevComm dc, ccoWindow_t win, size_t off,
                                           uint32_t epochBase, uint32_t iters, uint32_t slot,
                                           int* errors) {
   Coop g;
-  ccoLsaBarrierSession<Coop> bar(g, dc, ccoTeamLsa(*dc), dc->lsaBarrier, slot);
+  ccoLsaBarrierSession<Coop> bar(g, &dc, ccoTeamLsa(dc), dc.lsaBarrier, slot);
 
-  const int N = dc->lsaSize;
-  const int myRank = dc->lsaRank;
+  const int N = dc.lsaSize;
+  const int myRank = dc.lsaRank;
   // cookie = tag + rank, unique per (iter, rank). epochBase continues the
   // sequence across launches (persistence UT); pass 0 for a fresh sequence.
   constexpr uint32_t MUL = 1000003u;
@@ -115,10 +115,10 @@ __global__ void barrier_visibility_kernel(ccoDevComm* dc, ccoWindow_t win, size_
 // hang under the rolling-less-equal wait path AND that ctor (epoch restore) /
 // dtor (epoch persist) round-trip across separate kernel launches that reuse
 // the same barrier slot.
-__global__ void barrier_stress_kernel(ccoDevComm* dc, uint32_t iters, uint32_t slot,
+__global__ void barrier_stress_kernel(ccoDevComm dc, uint32_t iters, uint32_t slot,
                                       int* completedFlag) {
   ccoCoopBlock g;
-  ccoLsaBarrierSession<ccoCoopBlock> bar(g, dc, ccoTeamLsa(*dc), dc->lsaBarrier, slot);
+  ccoLsaBarrierSession<ccoCoopBlock> bar(g, &dc, ccoTeamLsa(dc), dc.lsaBarrier, slot);
   for (uint32_t e = 0; e < iters; ++e) {
     bar.sync(g);
   }
@@ -130,31 +130,31 @@ __global__ void barrier_stress_kernel(ccoDevComm* dc, uint32_t iters, uint32_t s
 // Timeout kernel — lsaRank `rankToSkip` exits without opening a session;
 // every other rank enters sync(t) with a finite budget and stores the
 // return code into outRc[lsaRank].
-__global__ void barrier_timeout_kernel(ccoDevComm* dc, uint32_t slot, uint64_t timeoutCycles,
+__global__ void barrier_timeout_kernel(ccoDevComm dc, uint32_t slot, uint64_t timeoutCycles,
                                        int rankToSkip, int* outRc) {
   ccoCoopThread g;
-  if (dc->lsaRank == rankToSkip) {
+  if (dc.lsaRank == rankToSkip) {
     return;
   }
-  ccoLsaBarrierSession<ccoCoopThread> bar(g, dc, ccoTeamLsa(*dc), dc->lsaBarrier, slot);
+  ccoLsaBarrierSession<ccoCoopThread> bar(g, &dc, ccoTeamLsa(dc), dc.lsaBarrier, slot);
   int rc = bar.sync(g, timeoutCycles);
-  outRc[dc->lsaRank] = rc;
+  outRc[dc.lsaRank] = rc;
 }
 
 // Timeout kernel (decoupled) — same setup as barrier_timeout_kernel, but the
 // survivors use the direct arrive() + wait(coop, timeoutCycles) pair instead of
 // the fused sync(coop, timeoutCycles). Exercises the 2-arg wait() overload
 // directly; rankToSkip never arrives, so survivors' wait() must return 1.
-__global__ void barrier_timeout_wait_kernel(ccoDevComm* dc, uint32_t slot, uint64_t timeoutCycles,
+__global__ void barrier_timeout_wait_kernel(ccoDevComm dc, uint32_t slot, uint64_t timeoutCycles,
                                             int rankToSkip, int* outRc) {
   ccoCoopThread g;
-  if (dc->lsaRank == rankToSkip) {
+  if (dc.lsaRank == rankToSkip) {
     return;
   }
-  ccoLsaBarrierSession<ccoCoopThread> bar(g, dc, ccoTeamLsa(*dc), dc->lsaBarrier, slot);
+  ccoLsaBarrierSession<ccoCoopThread> bar(g, &dc, ccoTeamLsa(dc), dc.lsaBarrier, slot);
   bar.arrive(g);
   int rc = bar.wait(g, timeoutCycles);
-  outRc[dc->lsaRank] = rc;
+  outRc[dc.lsaRank] = rc;
 }
 
 // Split kernel — same payload check as visibility, but the first barrier of
@@ -162,13 +162,13 @@ __global__ void barrier_timeout_wait_kernel(ccoDevComm* dc, uint32_t slot, uint6
 // instead of fused sync(). Verifies arrive publishes the cookie and wait
 // observes all peers before the read-back.
 template <typename Coop>
-__global__ void barrier_split_kernel(ccoDevComm* dc, ccoWindow_t win, size_t off, uint32_t iters,
+__global__ void barrier_split_kernel(ccoDevComm dc, ccoWindow_t win, size_t off, uint32_t iters,
                                      uint32_t slot, int* errors) {
   Coop g;
-  ccoLsaBarrierSession<Coop> bar(g, dc, ccoTeamLsa(*dc), dc->lsaBarrier, slot);
+  ccoLsaBarrierSession<Coop> bar(g, &dc, ccoTeamLsa(dc), dc.lsaBarrier, slot);
 
-  const int N = dc->lsaSize;
-  const int myRank = dc->lsaRank;
+  const int N = dc.lsaSize;
+  const int myRank = dc.lsaRank;
   constexpr uint32_t MUL = 1000003u;
 
   uint32_t* myBuf = static_cast<uint32_t*>(ccoGetLocalPtr(win, off));
@@ -202,7 +202,7 @@ __global__ void barrier_split_kernel(ccoDevComm* dc, ccoWindow_t win, size_t off
 // payload offset. The two barriers run in parallel rather than interleaved by
 // one block, so if per-index inbox addressing (index*lsaSize in ucInbox) is
 // wrong the concurrent slots stomp each other and the payload check fails.
-__global__ void barrier_multislot_kernel(ccoDevComm* dc, ccoWindow_t win, uint32_t slotA,
+__global__ void barrier_multislot_kernel(ccoDevComm dc, ccoWindow_t win, uint32_t slotA,
                                          uint32_t slotB, uint32_t iters, int* errors) {
   ccoCoopBlock g;
 
@@ -211,10 +211,10 @@ __global__ void barrier_multislot_kernel(ccoDevComm* dc, ccoWindow_t win, uint32
   const size_t off = blockIdx.x * sizeof(uint32_t);
   const uint32_t MUL = (blockIdx.x == 0) ? 1000003u : 2000029u;
 
-  ccoLsaBarrierSession<ccoCoopBlock> bar(g, dc, ccoTeamLsa(*dc), dc->lsaBarrier, slot);
+  ccoLsaBarrierSession<ccoCoopBlock> bar(g, &dc, ccoTeamLsa(dc), dc.lsaBarrier, slot);
 
-  const int N = dc->lsaSize;
-  const int myRank = dc->lsaRank;
+  const int N = dc.lsaSize;
+  const int myRank = dc.lsaRank;
   uint32_t* myBuf = static_cast<uint32_t*>(ccoGetLocalPtr(win, off));
 
   int localErr = 0;
@@ -244,13 +244,13 @@ __global__ void barrier_multislot_kernel(ccoDevComm* dc, ccoWindow_t win, uint32
 // Unicast-only state layout (cco_lsa_types.hpp):
 //   [0, nB)        unicast epoch   <- ctor restores state[slot]
 //   [nB, ...)      ucInbox[slot][peer] = state[nB + slot*lsaSize + peer]
-__global__ void barrier_preset_kernel(ccoDevComm* dc, uint32_t slot, uint32_t val) {
+__global__ void barrier_preset_kernel(ccoDevComm dc, uint32_t slot, uint32_t val) {
   if (threadIdx.x != 0 || blockIdx.x != 0) return;
-  const auto& rw = dc->resourceWindow_inlined;
-  char* base = rw.winBase + ((uint64_t)dc->lsaRank * rw.stride4G << 32);
-  uint32_t* state = reinterpret_cast<uint32_t*>(base + dc->lsaBarrier.bufOffset);
-  const int nB = dc->lsaBarrier.nBarriers;
-  const int N = dc->lsaSize;
+  const auto& rw = dc.resourceWindow_inlined;
+  char* base = rw.winBase + ((uint64_t)dc.lsaRank * rw.stride4G << 32);
+  uint32_t* state = reinterpret_cast<uint32_t*>(base + dc.lsaBarrier.bufOffset);
+  const int nB = dc.lsaBarrier.nBarriers;
+  const int N = dc.lsaSize;
   state[slot] = val;  // unicast epoch slot restored by ctor
   for (int peer = 0; peer < N; ++peer) {
     state[nB + slot * N + peer] = val;  // ucInbox[slot][peer]
@@ -266,8 +266,7 @@ __global__ void barrier_preset_kernel(ccoDevComm* dc, uint32_t slot, uint32_t va
 struct UtCtx {
   int rank;       // world rank, used for "rank 0 prints" guards
   ccoComm* comm;  // for ccoBarrierAll between cases
-  ccoDevComm* devComm;
-  ccoDevComm dcHost;  // host-side snapshot (lsaSize, lsaRank, ...)
+  ccoDevComm dcHost;  // host DevComm struct (filled by ccoDevCommCreate); passed by value to kernels
   ccoWindow_t sendWin;
   // Scratch device buffers, reused across cases.
   int* devErrors;  // one int
@@ -285,7 +284,7 @@ template <typename Coop>
 static int run_visibility(UtCtx& ctx, const char* name, uint32_t slot, uint32_t iters, dim3 grid,
                           dim3 block) {
   HIP_CHECK(hipMemset(ctx.devErrors, 0, sizeof(int)));
-  hipLaunchKernelGGL(barrier_visibility_kernel<Coop>, grid, block, 0, 0, ctx.devComm, ctx.sendWin,
+  hipLaunchKernelGGL(barrier_visibility_kernel<Coop>, grid, block, 0, 0, ctx.dcHost, ctx.sendWin,
                      (size_t)0, /*epochBase=*/0u, iters, slot, ctx.devErrors);
   HIP_CHECK(hipDeviceSynchronize());
 
@@ -333,7 +332,7 @@ static int ut_stress(UtCtx& ctx) {
   bool ok = true;
   for (int k = 0; k < kLaunches; ++k) {
     HIP_CHECK(hipMemset(devCompleted, 0, sizeof(int)));
-    hipLaunchKernelGGL(barrier_stress_kernel, dim3(1), dim3(256), 0, 0, ctx.devComm, kStressIters,
+    hipLaunchKernelGGL(barrier_stress_kernel, dim3(1), dim3(256), 0, 0, ctx.dcHost, kStressIters,
                        kSlot, devCompleted);
     HIP_CHECK(hipDeviceSynchronize());
     int completed = 0;
@@ -375,7 +374,7 @@ static int ut_timeout(UtCtx& ctx) {
   HIP_CHECK(hipMemset(ctx.devRc, 0xFF, sizeof(int) * ctx.dcHost.lsaSize));  // sentinel = -1
 
   HIP_CHECK(hipEventRecord(start, nullptr));
-  hipLaunchKernelGGL(barrier_timeout_kernel, dim3(1), dim3(1), 0, 0, ctx.devComm, kSlot,
+  hipLaunchKernelGGL(barrier_timeout_kernel, dim3(1), dim3(1), 0, 0, ctx.dcHost, kSlot,
                      kTimeoutCycles, kRankToSkip, ctx.devRc);
   HIP_CHECK(hipEventRecord(stop, nullptr));
 
@@ -417,7 +416,7 @@ static int ut_timeout_wait(UtCtx& ctx) {
 
   HIP_CHECK(hipMemset(ctx.devRc, 0xFF, sizeof(int) * ctx.dcHost.lsaSize));  // sentinel = -1
 
-  hipLaunchKernelGGL(barrier_timeout_wait_kernel, dim3(1), dim3(1), 0, 0, ctx.devComm, kSlot,
+  hipLaunchKernelGGL(barrier_timeout_wait_kernel, dim3(1), dim3(1), 0, 0, ctx.dcHost, kSlot,
                      kTimeoutCycles, kRankToSkip, ctx.devRc);
   HIP_CHECK(hipDeviceSynchronize());
 
@@ -443,7 +442,7 @@ static int ut_arrive_wait_split(UtCtx& ctx) {
   constexpr uint32_t kIters = 5000u;
 
   HIP_CHECK(hipMemset(ctx.devErrors, 0, sizeof(int)));
-  hipLaunchKernelGGL(barrier_split_kernel<ccoCoopBlock>, dim3(1), dim3(256), 0, 0, ctx.devComm,
+  hipLaunchKernelGGL(barrier_split_kernel<ccoCoopBlock>, dim3(1), dim3(256), 0, 0, ctx.dcHost,
                      ctx.sendWin, (size_t)0, kIters, kSlot, ctx.devErrors);
   HIP_CHECK(hipDeviceSynchronize());
 
@@ -472,7 +471,7 @@ static int ut_persist_cookie(UtCtx& ctx) {
   for (int k = 0; k < kLaunches; ++k) {
     uint32_t epochBase = static_cast<uint32_t>(k) * kItersPerLaunch;
     hipLaunchKernelGGL(barrier_visibility_kernel<ccoCoopBlock>, dim3(1), dim3(256), 0, 0,
-                       ctx.devComm, ctx.sendWin, (size_t)0, epochBase, kItersPerLaunch, kSlot,
+                       ctx.dcHost, ctx.sendWin, (size_t)0, epochBase, kItersPerLaunch, kSlot,
                        ctx.devErrors);
     HIP_CHECK(hipDeviceSynchronize());
     ccoBarrierAll(ctx.comm);
@@ -496,7 +495,7 @@ static int ut_multislot(UtCtx& ctx) {
 
   HIP_CHECK(hipMemset(ctx.devErrors, 0, sizeof(int)));
   // Two blocks: block 0 drives slotA, block 1 drives slotB, concurrently.
-  hipLaunchKernelGGL(barrier_multislot_kernel, dim3(2), dim3(256), 0, 0, ctx.devComm, ctx.sendWin,
+  hipLaunchKernelGGL(barrier_multislot_kernel, dim3(2), dim3(256), 0, 0, ctx.dcHost, ctx.sendWin,
                      kSlotA, kSlotB, kIters, ctx.devErrors);
   HIP_CHECK(hipDeviceSynchronize());
 
@@ -520,12 +519,12 @@ static int ut_wraparound(UtCtx& ctx) {
 
   // Seed epoch + inbox on every rank, then make sure all presets land before
   // anyone opens a session on this slot.
-  hipLaunchKernelGGL(barrier_preset_kernel, dim3(1), dim3(1), 0, 0, ctx.devComm, kSlot, kPreset);
+  hipLaunchKernelGGL(barrier_preset_kernel, dim3(1), dim3(1), 0, 0, ctx.dcHost, kSlot, kPreset);
   HIP_CHECK(hipDeviceSynchronize());
   ccoBarrierAll(ctx.comm);
 
   HIP_CHECK(hipMemset(ctx.devErrors, 0, sizeof(int)));
-  hipLaunchKernelGGL(barrier_visibility_kernel<ccoCoopBlock>, dim3(1), dim3(256), 0, 0, ctx.devComm,
+  hipLaunchKernelGGL(barrier_visibility_kernel<ccoCoopBlock>, dim3(1), dim3(256), 0, 0, ctx.dcHost,
                      ctx.sendWin, (size_t)0, /*epochBase=*/0u, kIters, kSlot, ctx.devErrors);
   HIP_CHECK(hipDeviceSynchronize());
 
@@ -554,7 +553,7 @@ static int ut_single_rank(UtCtx& ctx) {
   int* devCompleted = nullptr;
   HIP_CHECK(hipMalloc(&devCompleted, sizeof(int)));
   HIP_CHECK(hipMemset(devCompleted, 0, sizeof(int)));
-  hipLaunchKernelGGL(barrier_stress_kernel, dim3(1), dim3(256), 0, 0, ctx.devComm, kIters,
+  hipLaunchKernelGGL(barrier_stress_kernel, dim3(1), dim3(256), 0, 0, ctx.dcHost, kIters,
                      /*slot=*/0u, devCompleted);
   HIP_CHECK(hipDeviceSynchronize());
   int completed = 0;
@@ -641,11 +640,8 @@ int main(int argc, char* argv[]) {
   ccoDevCommRequirements reqs = CCO_DEV_COMM_REQUIREMENTS_INITIALIZER;
   reqs.gdaConnectionType = CCO_GDA_CONNECTION_NONE;
   reqs.lsaBarrierCount = 11;
-  ccoDevComm* devComm = nullptr;
-  assert(ccoDevCommCreate(comm, &reqs, &devComm) == 0);
-
   ccoDevComm dcHost{};
-  HIP_CHECK(hipMemcpy(&dcHost, devComm, sizeof(dcHost), hipMemcpyDeviceToHost));
+  assert(ccoDevCommCreate(comm, &reqs, &dcHost) == 0);
   if (rank == 0) {
     std::printf("=== LSA barrier example: world=%d lsa=%d ===\n", dcHost.worldSize, dcHost.lsaSize);
   }
@@ -659,13 +655,13 @@ int main(int argc, char* argv[]) {
   ccoBarrierAll(comm);
 
   // ── Run ALL UTs in one shot ──
-  UtCtx ctx{rank, comm, devComm, dcHost, sendWin, devErrors, devRc};
+  UtCtx ctx{rank, comm, dcHost, sendWin, devErrors, devRc};
   int fails = run_all_tests(ctx);
 
   // ── Teardown ──
   HIP_CHECK(hipFree(devRc));
   HIP_CHECK(hipFree(devErrors));
-  ccoDevCommDestroy(comm, devComm);
+  ccoDevCommDestroy(comm, &dcHost);
   ccoWindowDeregister(comm, sendWin);
   ccoMemFree(comm, sendBuf);
 

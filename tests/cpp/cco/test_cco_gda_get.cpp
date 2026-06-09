@@ -158,19 +158,17 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
   reqs.gdaContextCount = 1;
   reqs.gdaSignalCount = 0;
   reqs.gdaCounterCount = 0;
-  mori::cco::ccoDevComm* devComm = nullptr;
+  mori::cco::ccoDevComm devComm{};
   if (mori::cco::ccoDevCommCreate(comm, &reqs, &devComm) != 0) {
     fprintf(stderr, "[rank %d] DevCommCreate failed\n", rank);
     return 1;
   }
 
-  mori::cco::ccoDevComm devCommHost;
-  HIP_CHECK(hipMemcpy(&devCommHost, devComm, sizeof(devCommHost), hipMemcpyDeviceToHost));
   printf("[rank %d] DevCommCreate OK (worldSize=%d, lsaSize=%d, gdaConnType=%d, numQpPerPe=%d)\n",
-         rank, devCommHost.worldSize, devCommHost.lsaSize, (int)devCommHost.gdaConnType,
-         devCommHost.ibgda.numQpPerPe);
+         rank, devComm.worldSize, devComm.lsaSize, (int)devComm.gdaConnType,
+         devComm.ibgda.numQpPerPe);
 
-  if (devCommHost.gdaConnType == mori::cco::CCO_GDA_CONNECTION_NONE) {
+  if (devComm.gdaConnType == mori::cco::CCO_GDA_CONNECTION_NONE) {
     fprintf(stderr, "[rank %d] gdaConnType collapsed to NONE — check peer mask / rdma support\n",
             rank);
     return 1;
@@ -183,7 +181,7 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
   hipStream_t stream;
   HIP_CHECK(hipStreamCreate(&stream));
   GdaAlltoAllGetKernel<kPrvdType, float>
-      <<<1, 64, 0, stream>>>(sendWin, recvWin, COUNT, devCommHost);
+      <<<1, 64, 0, stream>>>(sendWin, recvWin, COUNT, devComm);
   HIP_CHECK(hipStreamSynchronize(stream));
   printf("[rank %d] kernel completed\n", rank);
 
@@ -211,7 +209,7 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
   }
 
   HIP_CHECK(hipStreamDestroy(stream));
-  mori::cco::ccoDevCommDestroy(comm, devComm);
+  mori::cco::ccoDevCommDestroy(comm, &devComm);
   mori::cco::ccoWindowDeregister(comm, recvWin);
   mori::cco::ccoWindowDeregister(comm, sendWin);
   mori::cco::ccoMemFree(comm, recvBuf);

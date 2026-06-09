@@ -1871,7 +1871,12 @@ int ccoWindowDeregister(ccoComm* comm, ccoWindow_t win);
 // per-DevComm settings (gdaSignalCount, gdaConnectionType, ...) as needed.
 // `reqs` must not be NULL; passing NULL or a struct without the magic/version
 // triplet results in an error return (binary forward-compat check).
-int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevComm** devComm);
+//
+// outDevComm is a caller-provided host struct filled in place (it holds device
+// pointers but lives on the host). Pass it by value into kernels — it lands in
+// kernel-arg space, no per-access GPU-memory dereference. The device resources
+// it references are released by ccoDevCommDestroy(comm, &devComm).
+int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevComm* outDevComm);
 int ccoDevCommDestroy(ccoComm* comm, ccoDevComm* devComm);
 
 // ── Host barrier ──

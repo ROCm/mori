@@ -158,7 +158,7 @@ static void run_rank(int rank, int nranks, const mori::application::UniqueId& ui
   reqs.lsaBarrierCount = 4;      // standalone LSA barrier (resource-window slab)
   reqs.railGdaBarrierCount = 2;  // standalone GDA-Rail barrier (signal pool)
   reqs.barrierCount = 3;         // hybrid LSA + GDA-Rail two-stage barrier
-  mori::cco::ccoDevComm* devComm = nullptr;
+  mori::cco::ccoDevComm devComm{};
   ret = mori::cco::ccoDevCommCreate(comm, &reqs, &devComm);
   if (ret != 0) {
     snprintf(result->detail, sizeof(result->detail), "DevCommCreate failed: %d", ret);
@@ -170,35 +170,33 @@ static void run_rank(int rank, int nranks, const mori::application::UniqueId& ui
   }
 
   // Verify DevComm on GPU
-  mori::cco::ccoDevComm devCommHost;
-  HIP_CHECK(hipMemcpy(&devCommHost, devComm, sizeof(devCommHost), hipMemcpyDeviceToHost));
-  if (devCommHost.rank != rank || devCommHost.worldSize != nranks) {
+  if (devComm.rank != rank || devComm.worldSize != nranks) {
     snprintf(result->detail, sizeof(result->detail),
-             "DevComm mismatch: rank=%d(want %d) world=%d(want %d)", devCommHost.rank, rank,
-             devCommHost.worldSize, nranks);
+             "DevComm mismatch: rank=%d(want %d) world=%d(want %d)", devComm.rank, rank,
+             devComm.worldSize, nranks);
     goto cleanup;
   }
   // lsaBarrier handle populated and resource window allocated.
-  if (devCommHost.lsaBarrier.nBarriers != reqs.lsaBarrierCount ||
-      devCommHost.resourceWindow == nullptr) {
+  if (devComm.lsaBarrier.nBarriers != reqs.lsaBarrierCount ||
+      devComm.resourceWindow == nullptr) {
     snprintf(result->detail, sizeof(result->detail),
              "lsaBarrier handle bad: nBarriers=%d (want %d) resourceWindow=%p",
-             devCommHost.lsaBarrier.nBarriers, reqs.lsaBarrierCount, devCommHost.resourceWindow);
+             devComm.lsaBarrier.nBarriers, reqs.lsaBarrierCount, devComm.resourceWindow);
     goto cleanup;
   }
   // hybridLsaBarrier handle populated.
-  if (devCommHost.hybridLsaBarrier.nBarriers != reqs.barrierCount) {
+  if (devComm.hybridLsaBarrier.nBarriers != reqs.barrierCount) {
     snprintf(result->detail, sizeof(result->detail),
              "hybridLsaBarrier handle bad: nBarriers=%d (want %d)",
-             devCommHost.hybridLsaBarrier.nBarriers, reqs.barrierCount);
+             devComm.hybridLsaBarrier.nBarriers, reqs.barrierCount);
     goto cleanup;
   }
   // Single-node test: nNodes==1 → rail GDA handles must collapse to disabled.
-  if (devCommHost.railGdaBarrier.nBarriers != 0 ||
-      devCommHost.hybridRailGdaBarrier.nBarriers != 0) {
+  if (devComm.railGdaBarrier.nBarriers != 0 ||
+      devComm.hybridRailGdaBarrier.nBarriers != 0) {
     snprintf(result->detail, sizeof(result->detail),
              "rail GDA handles must collapse on single-node: rail=%d hyb=%d",
-             devCommHost.railGdaBarrier.nBarriers, devCommHost.hybridRailGdaBarrier.nBarriers);
+             devComm.railGdaBarrier.nBarriers, devComm.hybridRailGdaBarrier.nBarriers);
     goto cleanup;
   }
 
@@ -206,8 +204,6 @@ static void run_rank(int rank, int nranks, const mori::application::UniqueId& ui
     // Verify WindowDevice on GPU — uses LSA-sized flat VA, addressed by lsaRank.
     mori::cco::ccoWindowDevice winHost;
     HIP_CHECK(hipMemcpy(&winHost, win, sizeof(winHost), hipMemcpyDeviceToHost));
-    mori::cco::ccoDevComm devCommSnap;
-    HIP_CHECK(hipMemcpy(&devCommSnap, devComm, sizeof(devCommSnap), hipMemcpyDeviceToHost));
 
     // Verify local ptr via flat addressing (uses lsaRank now).
     void* localVa =
@@ -224,8 +220,8 @@ static void run_rank(int rank, int nranks, const mori::application::UniqueId& ui
     // P2P read from every LSA peer via flat addressing (intra-node only;
     // cross-node peers would need RDMA path, not exercised by this test).
     int p2pChecked = 0;
-    int lsaSize = devCommSnap.lsaSize;
-    int myNodeStart = devCommSnap.myNodeStart;
+    int lsaSize = devComm.lsaSize;
+    int myNodeStart = devComm.myNodeStart;
     for (int lsa = 0; lsa < lsaSize; lsa++) {
       if (lsa == winHost.lsaRank) continue;
       int pe = myNodeStart + lsa;
@@ -247,7 +243,7 @@ static void run_rank(int rank, int nranks, const mori::application::UniqueId& ui
   snprintf(result->detail, sizeof(result->detail), "all OK (%d ranks)", nranks);
 
 cleanup:
-  mori::cco::ccoDevCommDestroy(comm, devComm);
+  mori::cco::ccoDevCommDestroy(comm, &devComm);
   mori::cco::ccoWindowDeregister(comm, win2);
   mori::cco::ccoWindowDeregister(comm, win);
   mori::cco::ccoMemFree(comm, buf2);

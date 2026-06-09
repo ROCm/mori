@@ -80,14 +80,14 @@ using namespace mori::cco;
 //   ccoCoopWarp   → the first wavefront (64 lanes) strides
 //   ccoCoopThread → lane 0 alone strides
 template <typename Coop>
-__global__ void lsa_allreduce_kernel(ccoDevComm* devComm, ccoWindow_t sendWin, size_t sendOff,
+__global__ void lsa_allreduce_kernel(ccoDevComm devComm, ccoWindow_t sendWin, size_t sendOff,
                                      ccoWindow_t recvWin, size_t recvOff, size_t count) {
   Coop coop;
-  ccoLsaBarrierSession<Coop> bar(coop, devComm, ccoTeamLsa(*devComm), devComm->lsaBarrier,
+  ccoLsaBarrierSession<Coop> bar(coop, &devComm, ccoTeamLsa(devComm), devComm.lsaBarrier,
                                  blockIdx.x);
   bar.sync(coop);
 
-  const int lsaSize = devComm->lsaSize;
+  const int lsaSize = devComm.lsaSize;
   const int lane = coop.thread_rank();
   const int stride = coop.size();
 
@@ -182,12 +182,14 @@ int main(int argc, char* argv[]) {
   reqs.gdaConnectionType = CCO_GDA_CONNECTION_NONE;
   reqs.lsaBarrierCount = CTA_COUNT;
 
-  ccoDevComm* devComm = nullptr;
+  // Host struct, filled in place; kernels take it by value (lands in kernel-arg
+  // space, no per-access GPU-memory dereference).
+  ccoDevComm devComm{};
   assert(ccoDevCommCreate(comm, &reqs, &devComm) == 0);
 
   if (rank == 0) {
     printf("DevComm ready, lsaSize=%d  grid=%d blocks × %d slots  (3 coop variants)\n",
-           devComm->lsaSize, CTA_COUNT, CTA_COUNT);
+           devComm.lsaSize, CTA_COUNT, CTA_COUNT);
   }
 
   // ── Helper: launch one variant, verify, print ──
@@ -239,7 +241,7 @@ int main(int argc, char* argv[]) {
   });
 
   // ── Teardown ──
-  ccoDevCommDestroy(comm, devComm);
+  ccoDevCommDestroy(comm, &devComm);
   ccoWindowDeregister(comm, sendWin);
   ccoWindowDeregister(comm, recvWin);
   ccoMemFree(comm, sendBuf);

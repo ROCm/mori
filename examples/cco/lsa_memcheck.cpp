@@ -51,9 +51,9 @@
 using namespace mori::cco;
 
 // ── tiny barrier kernel — just enough to exercise the DevComm ──────────────
-__global__ void lsa_barrier_kernel(ccoDevComm* devComm) {
+__global__ void lsa_barrier_kernel(ccoDevComm devComm) {
   ccoCoopBlock coop;
-  ccoLsaBarrierSession<ccoCoopBlock> bar(coop, devComm, ccoTeamLsa(*devComm), devComm->lsaBarrier,
+  ccoLsaBarrierSession<ccoCoopBlock> bar(coop, &devComm, ccoTeamLsa(devComm), devComm.lsaBarrier,
                                          0);
   bar.sync(coop);
 }
@@ -111,14 +111,15 @@ int main(int argc, char* argv[]) {
       reqs.gdaConnectionType = CCO_GDA_CONNECTION_NONE;
       reqs.lsaBarrierCount = 1;
 
-      ccoDevComm* devComm = nullptr;
+      // Host struct, filled in place; kernel takes it by value.
+      ccoDevComm devComm{};
       assert(ccoDevCommCreate(comm, &reqs, &devComm) == 0);
 
       // Exercise the barrier so the DevComm is actually used.
       lsa_barrier_kernel<<<1, 64>>>(devComm);
       assert(hipDeviceSynchronize() == hipSuccess);
 
-      ccoDevCommDestroy(comm, devComm);
+      ccoDevCommDestroy(comm, &devComm);
     }
 
     printf("rank[%d] ccoWindowDeregister %d/%d\n", rank, wi, window_iters);
