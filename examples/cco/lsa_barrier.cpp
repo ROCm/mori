@@ -49,6 +49,7 @@
 #include <vector>
 
 #include "mori/cco/cco.hpp"  // CCO single header (host + device)
+#include "mori/application/bootstrap/mpi_bootstrap.hpp"
 
 using namespace mori::cco;
 
