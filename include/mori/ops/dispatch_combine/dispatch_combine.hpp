@@ -91,6 +91,25 @@ inline size_t GetHipDataTypeSize(hipDataType dtype) {
 
 using index_t = int32_t;
 
+// Caller-owned routing pointers for cached/replay routing dispatch/combine.
+// All fields must be non-null when passed to GetEpDispatchCombineArgsRaw(..., routing, ...).
+struct EpDispatchCombineRoutingPtrs {
+  index_t* dispDestTokIdMap{nullptr};
+  index_t* interNodeDispDestTokIdMap{nullptr};
+  index_t* interNodeDispSendMap{nullptr};
+  index_t* totalRecvTokenNum{nullptr};
+  index_t* dispTokIdToSrcTokIdLocal{nullptr};
+
+  bool IsValid() const {
+    return dispDestTokIdMap != nullptr && interNodeDispDestTokIdMap != nullptr &&
+           interNodeDispSendMap != nullptr && totalRecvTokenNum != nullptr &&
+           dispTokIdToSrcTokIdLocal != nullptr;
+  }
+
+  // Throws std::invalid_argument listing any null required pointer.
+  void Validate() const;
+};
+
 #define MAX_EXPERTS_PER_TOKEN (9)
 struct EpDispatchCombineConfig {
   constexpr static size_t kPackedI32Len = 19;
@@ -400,6 +419,7 @@ struct EpDispatchCombineArgs {
   EpDispatchCombineConfig config;
   int fp8BlockwiseCombineScaleDim{0};
   int rdmaBlockNum{-1};
+  bool replayMode{false};
   index_t curRankNumToken{0};
   index_t* tokenIndices{nullptr};
   T* inpTokenBuf{nullptr};
@@ -431,6 +451,7 @@ struct EpDispatchCombineArgs {
   mori::application::SymmMemObjPtr dispTokIdToSrcTokIdMemObj;
   index_t* dispDestTokIdMap{nullptr};
   index_t* totalRecvTokenNum{nullptr};
+  index_t* dispTokIdToSrcTokIdLocal{nullptr};
   mori::application::SymmMemObjPtr crossDeviceBarrierMemObj;
   uint64_t* crossDeviceBarrierFlag{nullptr};
   mori::application::SymmMemObjPtr interNodeChunkFlagMemObj;
@@ -463,6 +484,7 @@ struct EpDispatchCombineArgsRaw {
   EpDispatchCombineConfig config;
   int fp8BlockwiseCombineScaleDim{0};
   int rdmaBlockNum{-1};
+  bool replayMode{false};
   index_t curRankNumToken{0};
   index_t* tokenIndices{nullptr};
   void* inpTokenBuf{nullptr};
@@ -494,6 +516,7 @@ struct EpDispatchCombineArgsRaw {
   mori::application::SymmMemObjPtr dispTokIdToSrcTokIdMemObj;
   index_t* dispDestTokIdMap{nullptr};
   index_t* totalRecvTokenNum{nullptr};
+  index_t* dispTokIdToSrcTokIdLocal{nullptr};
   mori::application::SymmMemObjPtr crossDeviceBarrierMemObj;
   uint64_t* crossDeviceBarrierFlag{nullptr};
   mori::application::SymmMemObjPtr interNodeChunkFlagMemObj;
@@ -525,6 +548,13 @@ static_assert(sizeof(EpDispatchCombineArgsRaw) == sizeof(EpDispatchCombineArgs<h
 
 EpDispatchCombineArgsRaw GetEpDispatchCombineArgsRaw(const EpDispatchCombineHandle& handle,
                                                      int rdmaBlockNum);
+
+// Routing-handle overload: routing pointers come from caller-owned tensors;
+// `replayMode` selects cache vs replay routing dispatch (combine always passes false).
+EpDispatchCombineArgsRaw GetEpDispatchCombineArgsRaw(const EpDispatchCombineHandle& handle,
+                                                     int rdmaBlockNum,
+                                                     const EpDispatchCombineRoutingPtrs* routing,
+                                                     bool replayMode);
 
 struct LocalExpertCountArgs {
   const index_t* indices;

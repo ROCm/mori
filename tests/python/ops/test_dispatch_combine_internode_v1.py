@@ -177,6 +177,93 @@ def test_dispatch_combine(
 
 
 # ---------------------------------------------------------------------------
+# -1 routing sentinel tests (InterNodeV1, default dispatch/combine path)
+# gpu_per_node=4: 2 nodes × 4 GPUs — exercises RDMA send/recv with sentinels
+# gpu_per_node=8: 1 node × 8 GPUs — XGMI-only paths inside InterNodeV1
+# ---------------------------------------------------------------------------
+
+
+def _test_dispatch_combine_sentinel(
+    rank,
+    world_size,
+    kernel_type_str,
+    data_type,
+    hidden_dim,
+    max_num_inp_token_per_rank,
+    num_experts_per_rank,
+    num_experts_per_token,
+    gpu_per_node,
+    sentinel_pattern,
+    scale_dim=0,
+    scale_type_size=1,
+):
+    config = _make_internode_v1_config(
+        rank=rank,
+        world_size=world_size,
+        kernel_type_str=kernel_type_str,
+        data_type=data_type,
+        hidden_dim=hidden_dim,
+        max_num_inp_token_per_rank=max_num_inp_token_per_rank,
+        num_experts_per_rank=num_experts_per_rank,
+        num_experts_per_token=num_experts_per_token,
+        gpu_per_node=gpu_per_node,
+        scale_dim=scale_dim,
+        scale_type_size=scale_type_size,
+    )
+    run_ep_dispatch_combine_test(
+        config,
+        EpDispatchCombineTestCase,
+        sentinel_pattern=sentinel_pattern,
+    )
+
+
+@pytest.mark.parametrize("world_size", (8,))
+@pytest.mark.parametrize("kernel_type", ("internode_v1",))
+@pytest.mark.parametrize("data_type", (torch.bfloat16,))
+@pytest.mark.parametrize("hidden_dim", (4096,))
+@pytest.mark.parametrize("max_num_inp_token_per_rank", (1, 32))
+@pytest.mark.parametrize("num_experts_per_rank", (4,))
+@pytest.mark.parametrize("num_experts_per_token", (4,))
+@pytest.mark.parametrize("gpu_per_node", (4, 8))
+@pytest.mark.parametrize(
+    "sentinel_pattern",
+    ("every_other", "first_only", 1),
+)
+def test_dispatch_combine_minus_one_sentinel(
+    torch_dist_process_manager,
+    world_size,
+    kernel_type,
+    data_type,
+    hidden_dim,
+    max_num_inp_token_per_rank,
+    num_experts_per_rank,
+    num_experts_per_token,
+    gpu_per_node,
+    sentinel_pattern,
+):
+    """InterNodeV1 dispatch + combine must skip -1 routing sentinel entries."""
+    for _ in range(world_size):
+        torch_dist_process_manager.task_queue.put(
+            (
+                _test_dispatch_combine_sentinel,
+                [
+                    world_size,
+                    kernel_type,
+                    data_type,
+                    hidden_dim,
+                    max_num_inp_token_per_rank,
+                    num_experts_per_rank,
+                    num_experts_per_token,
+                    gpu_per_node,
+                    sentinel_pattern,
+                ],
+            )
+        )
+
+    assert_worker_results(torch_dist_process_manager, world_size)
+
+
+# ---------------------------------------------------------------------------
 # maxTotalRecvTokens tests (InterNodeV1 / InterNodeV1LL)
 #
 # "spread" routing: each token sends 1 expert to every rank, so after per-rank

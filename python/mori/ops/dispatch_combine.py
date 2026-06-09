@@ -67,6 +67,31 @@ def _current_stream():
 
 
 @dataclass
+class EpDispatchRoutingHandle:
+    """Per-call routing snapshot from cache-routing dispatch, replayed by combine / replay-routing dispatch."""
+
+    disp_dest_tok_id_map: torch.Tensor
+    inter_node_disp_dest_tok_id_map: torch.Tensor
+    inter_node_disp_send_map: torch.Tensor
+    total_recv_token_num: torch.Tensor
+    disp_tok_id_to_src_tok_id_local: torch.Tensor
+    cur_rank_num_token: int = 0
+
+    def tensors(self):
+        return (
+            self.disp_dest_tok_id_map,
+            self.inter_node_disp_dest_tok_id_map,
+            self.inter_node_disp_send_map,
+            self.total_recv_token_num,
+            self.disp_tok_id_to_src_tok_id_local,
+        )
+
+    @classmethod
+    def from_tensors(cls, tensors, cur_rank_num_token=0):
+        return cls(*tensors, cur_rank_num_token=cur_rank_num_token)
+
+
+@dataclass
 class EpDispatchCombineConfig:
     """Configuration for :class:`EpDispatchCombineOp`.
 
@@ -481,6 +506,72 @@ class EpDispatchCombineOp:
         )
         return from_gpu_ptr(ptr, (shape0, shape1), dtype)
 
+    def _alloc_routing_handle(self) -> EpDispatchRoutingHandle:
+        cfg = self.config
+        world_size = cfg.world_size
+        m_send = cfg.max_num_inp_token_per_rank
+        e = cfg.num_experts_per_token
+        r = cfg.num_experts_per_rank
+        n_nodes = max(1, world_size // cfg.gpu_per_node)
+
+        device = "cuda"
+        return EpDispatchRoutingHandle(
+            disp_dest_tok_id_map=torch.zeros(
+                world_size * m_send * r, dtype=torch.int32, device=device
+            ),
+            inter_node_disp_dest_tok_id_map=torch.zeros(
+                n_nodes * m_send * e, dtype=torch.int32, device=device
+            ),
+            inter_node_disp_send_map=torch.zeros(
+                n_nodes * m_send, dtype=torch.int32, device=device
+            ),
+            total_recv_token_num=torch.zeros(1, dtype=torch.int32, device=device),
+            disp_tok_id_to_src_tok_id_local=torch.zeros(
+                world_size * m_send * r, dtype=torch.int32, device=device
+            ),
+        )
+
+    def _supports_routing_handle(self) -> bool:
+        kt = self.config.kernel_type.value
+        return kt in (
+            EpDispatchCombineKernelType.IntraNode.value,
+            EpDispatchCombineKernelType.InterNodeV1.value,
+        )
+
+    @staticmethod
+    def _routing_source_token_count(routing: EpDispatchRoutingHandle) -> int:
+        """Return the cache-routing source token count stored in a routing handle."""
+        n = int(routing.cur_rank_num_token)
+        if n <= 0:
+            raise ValueError(
+                "routing handle has cur_rank_num_token <= 0; use a handle from "
+                "dispatch(..., return_routing=True) or pass a positive "
+                "cur_rank_num_token to EpDispatchRoutingHandle.from_tensors(...)"
+            )
+        return n
+
+    def _build_args_routing(
+        self,
+        routing,
+        *,
+        rdma_block_num,
+        hidden_dim,
+        replay_mode,
+        use_external_inp_buf=-1,
+    ):
+        return mori_cpp.build_args_with_routing(
+            self._handle,
+            rdma_block_num=rdma_block_num,
+            hidden_dim=hidden_dim,
+            use_external_inp_buf=use_external_inp_buf,
+            replay_mode=replay_mode,
+            disp_dest_tok_id_map_ptr=routing.disp_dest_tok_id_map.data_ptr(),
+            inter_node_disp_dest_tok_id_map_ptr=routing.inter_node_disp_dest_tok_id_map.data_ptr(),
+            inter_node_disp_send_map_ptr=routing.inter_node_disp_send_map.data_ptr(),
+            total_recv_token_num_ptr=routing.total_recv_token_num.data_ptr(),
+            disp_tok_id_to_src_tok_id_local_ptr=routing.disp_tok_id_to_src_tok_id_local.data_ptr(),
+        )
+
     def dispatch(
         self,
         input: torch.Tensor,
@@ -491,7 +582,40 @@ class EpDispatchCombineOp:
         rdma_block_num: int = -1,
         warp_per_block: int = -1,
         call_local_expert_count: bool = False,
+        *,
+        routing: "EpDispatchRoutingHandle | None" = None,
+        return_routing: bool = False,
     ):
+        if routing is not None and return_routing:
+            raise ValueError(
+                "pass either `routing=` (replay) or `return_routing=True` "
+                "(new layout), not both"
+            )
+        use_routing_handle = routing is not None or return_routing
+        is_replay = routing is not None
+        if use_routing_handle and not self._supports_routing_handle():
+            raise NotImplementedError(
+                f"routing handle path not supported for kernel_type="
+                f"{self.config.kernel_type}; only IntraNode and InterNodeV1 "
+                "expose cache/replay routing dispatch."
+            )
+        if return_routing:
+            routing = self._alloc_routing_handle()
+
+        num_tokens = int(input.size(0))
+        if is_replay:
+            replay_n = self._routing_source_token_count(routing)
+            if num_tokens != replay_n:
+                raise ValueError(
+                    f"replay dispatch input has {num_tokens} tokens but "
+                    f"routing.cur_rank_num_token={replay_n}"
+                )
+            if int(indices.size(0)) != replay_n:
+                raise ValueError(
+                    f"replay dispatch indices has {int(indices.size(0))} tokens but "
+                    f"routing.cur_rank_num_token={replay_n}"
+                )
+
         hidden_dim = input.size(1)
         weight_ptr = weights.data_ptr() if weights is not None else 0
         has_scales = scales is not None and self.config.scale_dim > 0
@@ -519,11 +643,19 @@ class EpDispatchCombineOp:
             scale_ptr=scale_ptr,
             indices_ptr=indices.data_ptr(),
         )
-        args_ptr = mori_cpp.build_args(
-            self._handle,
-            rdma_block_num=actual_rbn,
-            hidden_dim=hidden_dim,
-        )
+        if use_routing_handle:
+            args_ptr = self._build_args_routing(
+                routing,
+                rdma_block_num=actual_rbn,
+                hidden_dim=hidden_dim,
+                replay_mode=is_replay,
+            )
+        else:
+            args_ptr = mori_cpp.build_args(
+                self._handle,
+                rdma_block_num=actual_rbn,
+                hidden_dim=hidden_dim,
+            )
 
         grid = (actual_bn,)
         block = (WARP_SIZE * actual_wpb,)
@@ -606,6 +738,8 @@ class EpDispatchCombineOp:
             from mori.ops.local_expert_count import launch_local_expert_count
 
             _, _, _, outI_ptr, total_ptr = self._dispatch_out_ptrs
+            if use_routing_handle:
+                total_ptr = routing.total_recv_token_num.data_ptr()
             launch_local_expert_count(
                 self._cpp_config,
                 outI_ptr,
@@ -628,9 +762,24 @@ class EpDispatchCombineOp:
         out_indices = from_gpu_ptr(
             outI_ptr, (max_recv, self.config.num_experts_per_token), TOPK_IDX_DTYPE
         )
-        total_recv = from_gpu_ptr(total_ptr, (1,), TOPK_IDX_DTYPE)
+        total_recv = (
+            routing.total_recv_token_num
+            if use_routing_handle
+            else from_gpu_ptr(total_ptr, (1,), TOPK_IDX_DTYPE)
+        )
 
-        return (out, out_weights, out_scales, out_indices, total_recv)
+        if return_routing:
+            mori_cpp.snapshot_disp_tok_id_to_src_tok_id_local(
+                self._handle,
+                routing.disp_tok_id_to_src_tok_id_local.data_ptr(),
+                stream=stream,
+            )
+            routing.cur_rank_num_token = int(input.size(0))
+
+        base = (out, out_weights, out_scales, out_indices, total_recv)
+        if return_routing:
+            return base + (routing,)
+        return base
 
     def dispatch_send(
         self,
@@ -713,7 +862,24 @@ class EpDispatchCombineOp:
         warp_per_block: int = -1,
         use_external_inp_buf: int = -1,
         call_reset: bool = False,
+        *,
+        routing: "EpDispatchRoutingHandle | None" = None,
     ):
+        if routing is not None and not self._supports_routing_handle():
+            raise NotImplementedError(
+                f"routing handle path not supported for kernel_type="
+                f"{self.config.kernel_type}; only IntraNode and InterNodeV1 "
+                "currently consume routing handles in combine."
+            )
+
+        if routing is not None:
+            routing_n = self._routing_source_token_count(routing)
+            if int(indices.size(0)) != routing_n:
+                raise ValueError(
+                    f"combine indices has {int(indices.size(0))} tokens but "
+                    f"routing.cur_rank_num_token={routing_n}"
+                )
+
         hidden_dim = input.size(1)
         weight_ptr = (
             weights.data_ptr() if weights is not None and weights.size(0) != 0 else 0
@@ -724,11 +890,16 @@ class EpDispatchCombineOp:
             else int(self.config.use_external_inp_buf)
         )
         is_zero_copy = not actual_use_ext
+        cur_n = (
+            self._routing_source_token_count(routing)
+            if routing is not None
+            else self._get_cur_rank_num_token(self._handle)
+        )
         actual_bn, actual_rbn, actual_wpb = self._resolve_launch_params(
             block_num,
             rdma_block_num,
             warp_per_block,
-            num_tokens=self._get_cur_rank_num_token(self._handle),
+            num_tokens=cur_n,
             hidden_dim=hidden_dim,
             dtype=input.dtype,
             tuning_rules=self._combine_rules,
@@ -744,17 +915,26 @@ class EpDispatchCombineOp:
             self._handle,
             inp_ptr=input.data_ptr(),
             dtype=dtype_to_int(input.dtype),
-            num_tokens=self._get_cur_rank_num_token(self._handle),
+            num_tokens=cur_n,
             weight_ptr=weight_ptr,
             scale_ptr=0,
             indices_ptr=indices.data_ptr(),
         )
-        args_ptr = mori_cpp.build_args(
-            self._handle,
-            rdma_block_num=actual_rbn,
-            hidden_dim=hidden_dim,
-            use_external_inp_buf=use_external_inp_buf,
-        )
+        if routing is not None:
+            args_ptr = self._build_args_routing(
+                routing,
+                rdma_block_num=actual_rbn,
+                hidden_dim=hidden_dim,
+                replay_mode=False,
+                use_external_inp_buf=use_external_inp_buf,
+            )
+        else:
+            args_ptr = mori_cpp.build_args(
+                self._handle,
+                rdma_block_num=actual_rbn,
+                hidden_dim=hidden_dim,
+                use_external_inp_buf=use_external_inp_buf,
+            )
 
         grid = (actual_bn,)
         block = (WARP_SIZE * actual_wpb,)
