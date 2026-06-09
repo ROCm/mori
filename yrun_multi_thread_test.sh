@@ -51,8 +51,11 @@ export MORI_KERNEL_DIR=/tf/mori/build/lib/gfx942_mlx5
 
 export MORI_DISABLE_P2P=0
 export MORI_ENABLE_SDMA=1
+# it looks like 1 channel gives the best performance
+export MORI_SDMA_NUM_CHANNELS=1
 
-# export HIP_VISIBLE_DEVICES=0,1
+# export ROCR_VISIBLE_DEVICES=4,5,6,7
+export HIP_VISIBLE_DEVICES=0,1,2,3
 # export AMD_LOG_LEVEL=4
 
 TORCH_LIBS=/usr/local/lib/python3.12/dist-packages/torch/lib
@@ -69,8 +72,24 @@ NUM_GPUS_PER_PROCESS=4
 pkill -9 -c -f allgather_test
 rm -f allgather_test_uid.bin zz*.log
 
-TEST=./build/examples/all2all_test
-#TEST=./build/examples/allgather_test
+export RS_PULL=0
+#TEST=./build/examples/all2all_test
+# TEST=./build/examples/allgather_test
+TEST=./build/examples/reduce_scatter_test
+
+# Number of GPUs/PEs and the total-element sweep (num_elems = total input elems,
+# doubling each step). num_elems must stay divisible by NUM_GPUS, so keep
+# MIN_SIZE a multiple of NUM_GPUS (doubling preserves divisibility).
+NUM_GPUS=${NUM_GPUS:-4}
+MIN_SIZE=${MIN_SIZE:-262144}
+MAX_SIZE=${MAX_SIZE:-33554432}
+
+rm -f zzout_0.log
+for ((size = MIN_SIZE; size <= MAX_SIZE; size *= 2)); do
+  $TEST $NUM_GPUS $size $@ 2>&1 | tee -a zzout_0.log
+done
+exit 0
+
 # TEST=./build/examples/sdma_put_test
 for ((pid = 0; pid < $NUM_PROCS; pid++ )); do
   gpus=$(seq -s, $((pid*NUM_GPUS_PER_PROCESS)) $((pid*NUM_GPUS_PER_PROCESS+NUM_GPUS_PER_PROCESS-1)))

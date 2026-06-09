@@ -63,6 +63,7 @@ target_link_libraries(atomic_gpu mori_application hip::host hip::device)
 # --- Shmem examples (HIP compiled, contain device kernels) ---
 add_shmem_example(put_thread_allgather SOURCES shmem/put_thread_allgather.cpp)
 add_shmem_example(allgather_test SOURCES shmem/allgather_test.cpp)
+add_shmem_example(reduce_scatter_test SOURCES shmem/reduce_scatter_test.cpp)
 add_shmem_example(all2all_test SOURCES shmem/all2all_test.cpp)
 add_shmem_example(concurrent_put_thread SOURCES shmem/concurrent_put_thread.cpp)
 add_shmem_example(concurrent_get_thread SOURCES shmem/concurrent_get_thread.cpp)
