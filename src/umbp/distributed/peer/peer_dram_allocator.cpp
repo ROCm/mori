@@ -122,15 +122,15 @@ PeerDramAllocator::AllocateResult PeerDramAllocator::AllocateLocked(const std::s
   PageBitmapAllocator* alloc = AllocatorForLocked(tier);
   if (alloc == nullptr) return fail(Outcome::kFailed, "BAD_TIER");
 
-  auto result = alloc->Allocate(num_pages);
-  if (!result) return fail(Outcome::kFailedNoSpace, "NO_SPACE");
+  auto pages = alloc->Allocate(num_pages);
+  if (!pages) return fail(Outcome::kFailedNoSpace, "NO_SPACE");
 
   AllocateResult out;
 
   PendingSlot slot;
   slot.slot_id = next_slot_id_.fetch_add(1, std::memory_order_relaxed);
   slot.tier = tier;
-  slot.pages = std::move(result->pages);
+  slot.pages = std::move(*pages);
   slot.size = size;
   slot.deadline = std::chrono::steady_clock::now() + pending_ttl_;
   slot.generation = allocator_generation_;
