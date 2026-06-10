@@ -1,6 +1,8 @@
 #include <cstdio>
+#include <memory>
 
 #include "mori/application/transport/rdma/rdma.hpp"
+#include "src/io/rdma/backend_impl.hpp"
 #include "rocm_smi/rocm_smi.h"
 
 namespace {
@@ -90,6 +92,20 @@ int main() {
   }
 
   failures += RunRsmiTopologyProbe("rdma-context-destroyed");
+
+  {
+    auto ctx =
+        std::make_unique<mori::application::RdmaContext>(mori::application::RdmaBackendType::IBVerbs);
+    PrintRdmaDevices(*ctx);
+
+    mori::io::RdmaBackendConfig config;
+    mori::io::RdmaManager manager(config, ctx.get());
+    (void)ctx.release();
+
+    failures += RunRsmiTopologyProbe("rdma-manager-alive");
+  }
+
+  failures += RunRsmiTopologyProbe("rdma-manager-destroyed");
 
   return failures == 0 ? 0 : 1;
 }

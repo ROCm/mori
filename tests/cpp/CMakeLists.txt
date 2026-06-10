@@ -34,12 +34,6 @@ target_include_directories(test_topology_gpu_smi_shutdown
 target_include_directories(test_topology_gpu_smi_shutdown PUBLIC ${CMAKE_SOURCE_DIR})
 target_link_libraries(test_topology_gpu_smi_shutdown mori_application)
 
-add_executable(test_rdma_rsmi_lifecycle application/test_rdma_rsmi_lifecycle.cpp)
-target_include_directories(test_rdma_rsmi_lifecycle
-                           PUBLIC ${CMAKE_SOURCE_DIR}/include)
-target_include_directories(test_rdma_rsmi_lifecycle PUBLIC ${CMAKE_SOURCE_DIR})
-target_link_libraries(test_rdma_rsmi_lifecycle mori_application)
-
 if(BUILD_IO)
   add_executable(test_engine io/test_engine.cpp)
 
@@ -59,6 +53,14 @@ if(BUILD_IO)
   target_include_directories(test_topology PUBLIC ${CMAKE_SOURCE_DIR}/include)
   target_include_directories(test_topology PUBLIC ${CMAKE_SOURCE_DIR})
   target_link_libraries(test_topology mori_application mori_io)
+
+  add_executable(test_rdma_rsmi_lifecycle
+                 application/test_rdma_rsmi_lifecycle.cpp)
+  target_include_directories(test_rdma_rsmi_lifecycle
+                             PUBLIC ${CMAKE_SOURCE_DIR}/include)
+  target_include_directories(test_rdma_rsmi_lifecycle
+                             PUBLIC ${CMAKE_SOURCE_DIR})
+  target_link_libraries(test_rdma_rsmi_lifecycle mori_application mori_io)
 
   add_executable(test_discrete_buffer io/test_discrete_buffer.cpp)
   set_source_files_properties(io/test_discrete_buffer.cpp PROPERTIES LANGUAGE
