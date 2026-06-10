@@ -179,6 +179,22 @@ MasterServerConfig MasterServerConfig::FromEnvironment() {
   MasterServerConfig cfg;
   cfg.registry_config = ClientRegistryConfig::FromEnvironment();
   cfg.eviction_config = EvictionConfig::FromEnvironment();
+
+  cfg.route_put_algo =
+      GetEnvEnum("UMBP_ROUTE_PUT_SELECT_ALGO", "most_available", {"most_available", "random"});
+  cfg.route_put_affinity =
+      GetEnvEnum("UMBP_ROUTE_PUT_NODE_AFFINITY", "none", {"none", "same", "local"});
+
+  using Algo = ConfigurableRoutePutStrategy::SelectAlgo;
+  using Affinity = ConfigurableRoutePutStrategy::NodeAffinity;
+  const Algo algo = cfg.route_put_algo == "random" ? Algo::kRandom : Algo::kMostAvailable;
+  Affinity affinity = Affinity::kNone;
+  if (cfg.route_put_affinity == "same") {
+    affinity = Affinity::kSame;
+  } else if (cfg.route_put_affinity == "local") {
+    affinity = Affinity::kLocal;
+  }
+  cfg.put_strategy = std::make_unique<ConfigurableRoutePutStrategy>(algo, affinity);
   return cfg;
 }
 

@@ -56,6 +56,9 @@ int main(int argc, char** argv) {
       config.registry_config.max_missed_heartbeats, config.eviction_config.check_interval.count(),
       config.eviction_config.lease_duration.count());
 
+  MORI_UMBP_INFO("[Master] Resolved route-put strategy: select_algo={} node_affinity={}",
+                 config.route_put_algo, config.route_put_affinity);
+
   mori::umbp::MasterServer server(std::move(config));
 
   sigset_t signal_set;

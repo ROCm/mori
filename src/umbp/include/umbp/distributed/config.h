@@ -101,6 +101,12 @@ struct MasterServerConfig {
   std::unique_ptr<RouteGetStrategy> get_strategy;
   std::unique_ptr<RoutePutStrategy> put_strategy;
 
+  // Resolved put-strategy knobs, kept as strings for startup logging because a
+  // unique_ptr<RoutePutStrategy> is not cheaply introspectable.  Populated by
+  // FromEnvironment() alongside put_strategy.
+  std::string route_put_algo = "most_available";
+  std::string route_put_affinity = "none";
+
   // Composes ClientRegistryConfig::FromEnvironment() and
   // EvictionConfig::FromEnvironment().  listen_address is NOT read from env
   // here; callers (e.g. bin/master_main.cpp) apply argv overrides after
