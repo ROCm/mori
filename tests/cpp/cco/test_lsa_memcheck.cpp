@@ -37,16 +37,24 @@
  *     ./build/examples/lsa_memcheck [--window-iters W] [--devcomm-iters D]
  */
 
-#include <hip/hip_runtime.h>
-#include <mpi.h>
-#include <unistd.h>
-
 #include <cassert>
 #include <cstdio>
 #include <cstring>
 
-#include "args_parser.hpp"
+#include "cco_test_harness.hpp"
 #include "mori/cco/cco.hpp"  // CCO single header (host + device)
+
+// Tests build with -DNDEBUG (Release), which strips assert(). Re-define an
+// always-on check so the assert(...)-style error handling below stays effective.
+#undef assert
+#define assert(expr)                                                                         \
+  do {                                                                                       \
+    if (!(expr)) {                                                                           \
+      std::fprintf(stderr, "[rank %d] check failed: %s at %s:%d\n", g_rank, #expr, __FILE__, \
+                   __LINE__);                                                                \
+      std::exit(1);                                                                          \
+    }                                                                                        \
+  } while (0)
 
 using namespace mori::cco;
 
@@ -59,33 +67,17 @@ __global__ void lsa_barrier_kernel(ccoDevComm devComm) {
 }
 
 // ── main ───────────────────────────────────────────────────────────────────
-int main(int argc, char* argv[]) {
-#ifndef MORI_WITH_MPI
-  fprintf(stderr, "lsa_memcheck requires MORI_WITH_MPI (enable WITH_MPI).\n");
-  return 1;
-#endif
+int run_test(int rank, int nranks, mori::application::BootstrapNetwork* bootNet) {
+  g_rank = rank;
 
-  // ── parse optional args ──
   int window_iters = 100;
   int devcomm_iters = 1;
-
-  // ── MPI init ──
-  int rank, nranks;
-  MPI_Init(&argc, &argv);
-  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-  MPI_Comm_size(MPI_COMM_WORLD, &nranks);
 
   if (rank == 0) {
     printf("lsa_memcheck: nranks=%d  window_iters=%d  devcomm_iters=%d\n\n", nranks, window_iters,
            devcomm_iters);
     fflush(stdout);
   }
-
-  // ── Phase 1: ccoComm (self-contained bootstrap) ──
-  // MPI is only the launcher + a one-shot broadcast of the cco unique id.
-  ccoUniqueId uid;
-  if (rank == 0) assert(ccoGetUniqueId(&uid) == 0);
-  MPI_Bcast(&uid, sizeof(uid), MPI_BYTE, 0, MPI_COMM_WORLD);
 
   // Bind each rank to its own GPU BEFORE ccoCommCreate. ccoCommCreate calls
   // hipGetDevice() and pins all allocations to the current device, so without
@@ -95,7 +87,10 @@ int main(int argc, char* argv[]) {
   assert(hipSetDevice(rank % hipDevCount) == hipSuccess);
 
   mori::cco::ccoComm* comm = nullptr;
-  assert(ccoCommCreate(uid, nranks, rank, 0, &comm) == 0);
+  if (ccoCommCreate(bootNet, /*perRankVmmSize=*/0, &comm) != 0) {
+    fprintf(stderr, "[rank %d] CommCreate failed\n", rank);
+    return 1;
+  }
 
   // ── Phase 2: window + devcomm leak loop ──
   for (int wi = 0; wi < window_iters; wi++) {
@@ -141,6 +136,10 @@ int main(int argc, char* argv[]) {
   // it down in ccoCommDestroy. MPI is only our launcher + id broadcast, so we
   // finalize it ourselves.
   ccoCommDestroy(comm);
-  MPI_Finalize();
+  printf("[rank %d] PASSED\n", rank);
   return 0;
+}
+
+int main(int argc, char** argv) {
+  return ccoTestMain(argc, argv, "CCO LSA memcheck", "/tmp/cco_lsa_memcheck_uid", 19884);
 }

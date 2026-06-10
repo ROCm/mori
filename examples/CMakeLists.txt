@@ -125,23 +125,7 @@ target_link_libraries(intra_node_benchmark mori_collective MPI::MPI_CXX
 target_include_directories(intra_node_benchmark
                            PRIVATE ${CMAKE_SOURCE_DIR}/include)
 
-# --- CCO examples ---
-# Helper: create a CCO example (links mori_cco + MPI, includes project headers).
-# Pass extra sources (e.g. utils/args_parser.cpp) as additional arguments; the
-# utils include dir is added automatically when extra sources are present.
-function(add_cco_example name)
-  add_executable(${name} cco/${name}.cpp ${ARGN})
-  target_link_libraries(${name} mori_cco MPI::MPI_CXX hip::host hip::device)
-  target_include_directories(${name} PRIVATE ${CMAKE_SOURCE_DIR}/include)
-  if(ARGN)
-    target_include_directories(${name}
-                               PRIVATE ${CMAKE_SOURCE_DIR}/examples/utils)
-  endif()
-endfunction()
-
-add_cco_example(lsa_allreduce utils/args_parser.cpp)
-add_cco_example(lsa_barrier)
-add_cco_example(lsa_memcheck utils/args_parser.cpp)
+# CCO examples moved to tests/cpp/cco (test_cco_lsa_*).
 
 # --- Application examples ---
 add_executable(context application/context.cpp)

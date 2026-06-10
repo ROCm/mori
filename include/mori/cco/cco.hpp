@@ -1017,8 +1017,9 @@ __device__ inline static void ringDoorbellWarpPsd(void* dbrAddr, uint64_t dbrVal
 
 // Wait for doorbell ordering and ring doorbell
 template <core::ProviderType PrvdType>
-__device__ inline static void ringDoorbellOrdered(application::RdmaEndpointDevice* ep, uint32_t myPostIdx,
-                                                  uint32_t numWqes, uint64_t dbrVal) {
+__device__ inline static void ringDoorbellOrdered(application::RdmaEndpointDevice* ep,
+                                                  uint32_t myPostIdx, uint32_t numWqes,
+                                                  uint64_t dbrVal) {
   core::WorkQueueHandle* wq = &ep->wqHandle;
   core::CompletionQueueHandle* cq = &ep->cqHandle;
 
@@ -1541,11 +1542,11 @@ __device__ inline void ccoGda<PrvdType>::put(int peer, ccoWindow_t dstWin, size_
 
     // step 5: call primitive API (PrvdType is compile-time determined)
     impl::putImpl<PrvdType>(ep, qpn,
-                      bytes > 0,            // hasData
-                      localAddr, srcLkey,   // local
-                      remoteAddr, dstRkey,  // remote
-                      bytes, hasSignal, signalRaddr, signalRkey, signalOp, signalOpArg, hasCounter,
-                      counterRaddr, counterRkey, optFlags);
+                            bytes > 0,            // hasData
+                            localAddr, srcLkey,   // local
+                            remoteAddr, dstRkey,  // remote
+                            bytes, hasSignal, signalRaddr, signalRkey, signalOp, signalOpArg,
+                            hasCounter, counterRaddr, counterRkey, optFlags);
   }
   coop.sync();
 }
@@ -1594,7 +1595,7 @@ __device__ inline void ccoGda<PrvdType>::putValue(int peer, ccoWindow_t dstWin, 
 
     // step 4: call primitive API
     impl::putValueImpl<PrvdType, T>(ep, qpn, remoteAddr, dstRkey, value, hasSignal, signalRaddr,
-                              signalRkey, signalOp, signalOpArg, optFlags);
+                                    signalRkey, signalOp, signalOpArg, optFlags);
   }
   coop.sync();
 }
@@ -1748,7 +1749,8 @@ __device__ inline void ccoGda<PrvdType>::wait(ccoGdaRequest_t& request, Coop coo
   coop.sync();
   if (coop.thread_rank() == 0) {
     ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
-    impl::waitImpl<PrvdType>(&ibgda->endpoints[request.qpIdx], static_cast<uint32_t>(request.postIdx));
+    impl::waitImpl<PrvdType>(&ibgda->endpoints[request.qpIdx],
+                             static_cast<uint32_t>(request.postIdx));
   }
   coop.sync();
 }

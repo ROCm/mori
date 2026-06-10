@@ -40,37 +40,8 @@
 //
 // Self-contained: does not depend on any shared test harness.
 
-#ifdef MORI_WITH_MPI
-#include <mpi.h>
-
-#include "mori/application/bootstrap/mpi_bootstrap.hpp"
-#endif
-
-#include <sys/wait.h>
-#include <unistd.h>
-
-#include <algorithm>
-#include <cstdio>
-#include <cstring>
-#include <vector>
-
-#include "hip/hip_runtime.h"
-#include "mori/application/bootstrap/socket_bootstrap.hpp"
+#include "cco_test_harness.hpp"
 #include "mori/cco/cco.hpp"
-#include "mori/cco/cco_device.hpp"
-#include "mori/shmem/internal.hpp"
-
-static int g_rank = 0;
-
-#define HIP_CHECK(cmd)                                                                           \
-  do {                                                                                           \
-    hipError_t e = (cmd);                                                                        \
-    if (e != hipSuccess) {                                                                       \
-      fprintf(stderr, "[rank %d] HIP error %d (%s) at %s:%d\n", g_rank, e, hipGetErrorString(e), \
-              __FILE__, __LINE__);                                                               \
-      _exit(1);                                                                                  \
-    }                                                                                            \
-  } while (0)
 
 static const size_t PER_RANK_VMM_SIZE = 256ULL * 1024 * 1024;
 
@@ -103,7 +74,7 @@ static constexpr int kMaxSigChecks = 4;
 template <mori::core::ProviderType PrvdType>
 __global__ void GdaSignalSendKernel(mori::cco::ccoDevComm devComm, SigOp op0, SigOp op1, SigOp op2,
                                     int nOps) {
-  using namespace mori::cco::gda;
+  using namespace mori::cco;
   ccoGda<PrvdType> gda{devComm, /*ginContext=*/0};
   int myRank = devComm.rank;
   int nRanks = devComm.worldSize;
@@ -128,7 +99,7 @@ template <mori::core::ProviderType PrvdType>
 __global__ void GdaSignalCheckKernel(mori::cco::ccoDevComm devComm, SigCheck c0, SigCheck c1,
                                      SigCheck c2, int nChecks, int bits, int round,
                                      int* errorFlag) {
-  using namespace mori::cco::gda;
+  using namespace mori::cco;
   ccoGda<PrvdType> gda{devComm, /*ginContext=*/0};
   if (threadIdx.x != 0) return;
   SigCheck cs[3] = {c0, c1, c2};
@@ -145,10 +116,51 @@ __global__ void GdaSignalCheckKernel(mori::cco::ccoDevComm devComm, SigCheck c0,
 // Generic RESET: zero slots [0, nSlots).
 template <mori::core::ProviderType PrvdType>
 __global__ void GdaSignalResetKernel(mori::cco::ccoDevComm devComm, int nSlots) {
-  using namespace mori::cco::gda;
+  using namespace mori::cco;
   ccoGda<PrvdType> gda{devComm, /*ginContext=*/0};
   if (threadIdx.x == 0)
     for (int i = 0; i < nSlots; i++) gda.resetSignal(static_cast<ccoGdaSignal_t>(i));
+}
+
+// Dedicated-slot SEND: each peer tid signals into ITS OWN slot (slot == myRank)
+// on the target — i.e. one sender per slot, no contention. addVal<=0 selects
+// SignalInc(+1); addVal>0 selects SignalAdd(+addVal). This is the per-sender
+// pattern the standalone signal test exercised.
+template <mori::core::ProviderType PrvdType>
+__global__ void GdaSignalDedicatedSendKernel(mori::cco::ccoDevComm devComm, uint64_t addVal) {
+  using namespace mori::cco;
+  ccoGda<PrvdType> gda{devComm, /*ginContext=*/0};
+  int myRank = devComm.rank;
+  int nRanks = devComm.worldSize;
+  int tid = threadIdx.x;
+  if (tid < nRanks && tid != myRank) {
+    if (addVal == 0)
+      gda.signal(tid, ccoGda_SignalInc{static_cast<ccoGdaSignal_t>(myRank)});
+    else
+      gda.signal(tid, ccoGda_SignalAdd{static_cast<ccoGdaSignal_t>(myRank), addVal});
+  }
+  gda.flush(mori::cco::ccoCoopBlock{});
+}
+
+// Dedicated-slot CHECK: slot s (for every peer s != myRank) must equal `expect`
+// (exactly one sender wrote it); my own slot must stay 0.
+template <mori::core::ProviderType PrvdType>
+__global__ void GdaSignalDedicatedCheckKernel(mori::cco::ccoDevComm devComm, uint64_t expect,
+                                              int round, int* errorFlag) {
+  using namespace mori::cco;
+  ccoGda<PrvdType> gda{devComm, /*ginContext=*/0};
+  if (threadIdx.x != 0) return;
+  int myRank = devComm.rank;
+  int nRanks = devComm.worldSize;
+  for (int s = 0; s < nRanks; s++) {
+    uint64_t want = (s == myRank) ? 0 : expect;
+    uint64_t got = gda.readSignal(static_cast<ccoGdaSignal_t>(s));
+    if (got != want) {
+      printf("[rank %d] round %d: signal[%d] = %llu, expected %llu\n", myRank, round, s,
+             (unsigned long long)got, (unsigned long long)want);
+      atomicExch(errorFlag, 1);
+    }
+  }
 }
 
 // Round C only: waitSignal partial/full consume semantics (unique — mutates
@@ -157,7 +169,7 @@ __global__ void GdaSignalResetKernel(mori::cco::ccoDevComm devComm, int nSlots) 
 template <mori::core::ProviderType PrvdType>
 __global__ void GdaSignalConsumeKernel(mori::cco::ccoDevComm devComm, uint64_t total, uint64_t k,
                                        int* errorFlag) {
-  using namespace mori::cco::gda;
+  using namespace mori::cco;
   ccoGda<PrvdType> gda{devComm, /*ginContext=*/0};
   if (threadIdx.x != 0) return;
 
@@ -183,7 +195,7 @@ __global__ void GdaSignalConsumeKernel(mori::cco::ccoDevComm devComm, uint64_t t
 template <mori::core::ProviderType PrvdType>
 __global__ void GdaSignalReuseCheckKernel(mori::cco::ccoDevComm devComm, uint64_t least, int round,
                                           int* errorFlag) {
-  using namespace mori::cco::gda;
+  using namespace mori::cco;
   ccoGda<PrvdType> gda{devComm, /*ginContext=*/0};
   if (threadIdx.x != 0) return;
   gda.waitSignal(1, least);          // consume this sub-round's increments
@@ -338,6 +350,28 @@ static int ut_reset(UtCtx& c) {
   return c.harvest("reset");
 }
 
+// dedicated per-sender slots: each peer s writes only slot s (no contention).
+// SignalInc → every slot s!=me == 1; SignalAdd{42} → == 42; own slot == 0.
+static int ut_dedicated(UtCtx& c) {
+  // reset all nranks slots (fresh() only covers 0,1,2)
+  c.step([&] { GdaSignalResetKernel<kPrvdType><<<1, 1, 0, c.stream>>>(c.dc, c.nranks); });
+
+  // round 1: SignalInc into own slot
+  c.step([&] { GdaSignalDedicatedSendKernel<kPrvdType><<<1, c.nranks, 0, c.stream>>>(c.dc, 0); });
+  c.step([&] {
+    GdaSignalDedicatedCheckKernel<kPrvdType><<<1, 1, 0, c.stream>>>(c.dc, /*expect=*/1, 9, c.dErr);
+  });
+
+  // round 2: reset, then SignalAdd{42} into own slot
+  c.step([&] { GdaSignalResetKernel<kPrvdType><<<1, 1, 0, c.stream>>>(c.dc, c.nranks); });
+  c.step([&] { GdaSignalDedicatedSendKernel<kPrvdType><<<1, c.nranks, 0, c.stream>>>(c.dc, 42); });
+  c.step([&] {
+    GdaSignalDedicatedCheckKernel<kPrvdType>
+        <<<1, 1, 0, c.stream>>>(c.dc, /*expect=*/42, 10, c.dErr);
+  });
+  return c.harvest("dedic");
+}
+
 using UtFn = int (*)(UtCtx&);
 
 static int run_all_tests(UtCtx& ctx) {
@@ -345,8 +379,9 @@ static int run_all_tests(UtCtx& ctx) {
     const char* name;
     UtFn fn;
   } kCases[] = {
-      {"inc", ut_inc_contend}, {"mixed", ut_mixed},   {"consume", ut_consume}, {"reuse", ut_reuse},
-      {"mslot", ut_multislot}, {"bits32", ut_bits32}, {"bigadd", ut_big_add},  {"reset", ut_reset},
+      {"inc", ut_inc_contend}, {"mixed", ut_mixed},     {"consume", ut_consume},
+      {"reuse", ut_reuse},     {"mslot", ut_multislot}, {"bits32", ut_bits32},
+      {"bigadd", ut_big_add},  {"reset", ut_reset},     {"dedic", ut_dedicated},
   };
   int fails = 0;
   for (const auto& c : kCases) fails += c.fn(ctx);
@@ -357,7 +392,7 @@ static int run_all_tests(UtCtx& ctx) {
 
 // ── host driver: setup → run_all_tests → teardown ────────────────────────────
 
-static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* bootNet) {
+int run_test(int rank, int nranks, mori::application::BootstrapNetwork* bootNet) {
   g_rank = rank;
 
   int numDevices = 0;
@@ -385,15 +420,12 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
   reqs.gdaContextCount = 1;
   reqs.gdaSignalCount = std::max(nranks, 3);  // slot 0 contended; mslot uses 0,1,2
   reqs.gdaCounterCount = 0;
-  mori::cco::ccoDevComm* devComm = nullptr;
+  mori::cco::ccoDevComm devComm{};
   if (mori::cco::ccoDevCommCreate(comm, &reqs, &devComm) != 0) {
     fprintf(stderr, "[rank %d] DevCommCreate failed\n", rank);
     return 1;
   }
-
-  mori::cco::ccoDevComm devCommHost;
-  HIP_CHECK(hipMemcpy(&devCommHost, devComm, sizeof(devCommHost), hipMemcpyDeviceToHost));
-  if (devCommHost.gdaConnType == mori::cco::CCO_GDA_CONNECTION_NONE) {
+  if (devComm.gdaConnType == mori::cco::CCO_GDA_CONNECTION_NONE) {
     fprintf(stderr, "[rank %d] gdaConnType collapsed to NONE\n", rank);
     return 1;
   }
@@ -403,7 +435,7 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
   HIP_CHECK(hipMemset(dErr, 0, sizeof(int)));
 
   UtCtx ctx{
-      comm, devCommHost, /*stream=*/nullptr, dErr, nranks, rank, static_cast<uint64_t>(nranks - 1)};
+      comm, devComm, /*stream=*/nullptr, dErr, nranks, rank, static_cast<uint64_t>(nranks - 1)};
   HIP_CHECK(hipStreamCreate(&ctx.stream));
 
   mori::cco::ccoBarrierAll(comm);
@@ -411,160 +443,13 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
 
   HIP_CHECK(hipStreamDestroy(ctx.stream));
   HIP_CHECK(hipFree(dErr));
-  mori::cco::ccoDevCommDestroy(comm, devComm);
+  mori::cco::ccoDevCommDestroy(comm, &devComm);
   mori::cco::ccoCommDestroy(comm);
 
   printf("[rank %d] %s\n", rank, fails == 0 ? "PASSED" : "FAILED");
   return fails == 0 ? 0 : 1;
 }
 
-// ── fork mode ─────────────────────────────────────────────────────────────────
-
-static void write_file(const char* path, const void* data, size_t len) {
-  FILE* f = fopen(path, "wb");
-  fwrite(data, 1, len, f);
-  fclose(f);
-}
-
-static bool read_file(const char* path, void* data, size_t len) {
-  FILE* f = fopen(path, "rb");
-  if (!f) return false;
-  bool ok = fread(data, 1, len, f) == len;
-  fclose(f);
-  return ok;
-}
-
-static int run_fork_mode(int nranks) {
-  char uidPath[256];
-  snprintf(uidPath, sizeof(uidPath), "/tmp/cco_gda_signal_ut_uid_%d", getpid());
-
-  printf("=== CCO GDA signal UT (contention) Test (fork, %d ranks) ===\n", nranks);
-  fflush(stdout);
-
-  auto uid = mori::application::SocketBootstrapNetwork::GenerateUniqueIdWithInterface("lo", 19880);
-  write_file(uidPath, &uid, sizeof(uid));
-
-  std::vector<pid_t> children;
-  for (int r = 0; r < nranks; r++) {
-    pid_t pid = fork();
-    if (pid == 0) {
-      mori::application::UniqueId childUid;
-      while (!read_file(uidPath, &childUid, sizeof(childUid))) usleep(10000);
-      auto* boot = new mori::application::SocketBootstrapNetwork(childUid, r, nranks);
-      _exit(run_test(r, nranks, boot));
-    }
-    children.push_back(pid);
-  }
-
-  int fail = 0;
-  for (int r = 0; r < nranks; r++) {
-    int status = 0;
-    waitpid(children[r], &status, 0);
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-      fprintf(stderr, "rank %d failed (status=%d)\n", r, status);
-      fail++;
-    }
-  }
-
-  unlink(uidPath);
-  printf("\n=== %d/%d PASSED ===\n", nranks - fail, nranks);
-  return fail > 0 ? 1 : 0;
-}
-
-// ── single-rank mode for cross-host ──────────────────────────────────────────
-
-static int run_single_rank_mode(int argc, char** argv) {
-  int rank = -1, worldSize = -1, gpuOffset = -1;
-  const char* uidPath = nullptr;
-  for (int i = 1; i < argc; i++) {
-    if (!strcmp(argv[i], "--rank") && i + 1 < argc)
-      rank = atoi(argv[++i]);
-    else if (!strcmp(argv[i], "--world") && i + 1 < argc)
-      worldSize = atoi(argv[++i]);
-    else if (!strcmp(argv[i], "--uid-file") && i + 1 < argc)
-      uidPath = argv[++i];
-    else if (!strcmp(argv[i], "--gpu-offset") && i + 1 < argc)
-      gpuOffset = atoi(argv[++i]);
-  }
-  if (rank < 0 || worldSize <= 0 || !uidPath) return -1;
-
-  mori::application::UniqueId uid;
-  for (int tries = 0; tries < 600; tries++) {
-    FILE* f = fopen(uidPath, "rb");
-    if (f) {
-      size_t n = fread(&uid, 1, sizeof(uid), f);
-      fclose(f);
-      if (n == sizeof(uid)) break;
-    }
-    usleep(100000);
-  }
-
-  if (gpuOffset >= 0) HIP_CHECK(hipSetDevice(rank - gpuOffset));
-
-  auto* boot = new mori::application::SocketBootstrapNetwork(uid, rank, worldSize);
-  return run_test(rank, worldSize, boot);
-}
-
-static int run_gen_uid_mode(int argc, char** argv) {
-  if (argc < 5) {
-    fprintf(stderr, "usage: --gen-uid IFACE PORT OUTFILE\n");
-    return 1;
-  }
-  const char* iface = argv[2];
-  int port = atoi(argv[3]);
-  const char* outPath = argv[4];
-  auto uid = mori::application::SocketBootstrapNetwork::GenerateUniqueIdWithInterface(iface, port);
-  FILE* f = fopen(outPath, "wb");
-  if (!f) {
-    fprintf(stderr, "fopen(%s) failed\n", outPath);
-    return 1;
-  }
-  fwrite(&uid, 1, sizeof(uid), f);
-  fclose(f);
-  printf("Wrote UID (%zu bytes) for iface=%s port=%d to %s\n", sizeof(uid), iface, port, outPath);
-  return 0;
-}
-
 int main(int argc, char** argv) {
-  if (argc >= 2 && !strcmp(argv[1], "--gen-uid")) return run_gen_uid_mode(argc, argv);
-  for (int i = 1; i < argc; i++) {
-    if (!strcmp(argv[i], "--rank")) return run_single_rank_mode(argc, argv);
-  }
-
-#ifdef MORI_WITH_MPI
-  int mpiInitialized = 0;
-  MPI_Initialized(&mpiInitialized);
-
-  bool underMpi = mpiInitialized || getenv("OMPI_COMM_WORLD_SIZE") || getenv("PMI_SIZE") ||
-                  getenv("PMI_RANK") || getenv("SLURM_PROCID");
-
-  if (underMpi) {
-    if (!mpiInitialized) MPI_Init(&argc, &argv);
-    int rank, nranks;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &nranks);
-    if (rank == 0) printf("=== CCO GDA signal UT (contention) Test (MPI, %d ranks) ===\n", nranks);
-    auto* boot = new mori::application::MpiBootstrapNetwork(MPI_COMM_WORLD);
-    return run_test(rank, nranks, boot);
-  }
-#endif
-
-  // fork mode — detect local gpu count
-  int nranks = 0;
-  for (int i = 0; i < 64; i++) {
-    char path[128];
-    snprintf(path, sizeof(path), "/sys/class/kfd/kfd/topology/nodes/%d/gpu_id", i);
-    FILE* f = fopen(path, "r");
-    if (!f) break;
-    unsigned long gpuId = 0;
-    if (fscanf(f, "%lu", &gpuId) == 1 && gpuId != 0) nranks++;
-    fclose(f);
-  }
-  if (argc > 1) nranks = std::min(atoi(argv[1]), nranks);
-  if (nranks < 2) {
-    printf("Need at least 2 GPUs.\n");
-    return 1;
-  }
-
-  return run_fork_mode(nranks);
+  return ccoTestMain(argc, argv, "CCO GDA signal UT", "/tmp/cco_gda_signal_ut_uid", 19880);
 }

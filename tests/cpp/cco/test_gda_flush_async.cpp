@@ -38,36 +38,8 @@
 //   - this test splits into flushAsync(ring only) → waitSignal → wait(poll only),
 //     letting the cq-poll be hidden behind the signal wait
 
-#ifdef MORI_WITH_MPI
-#include <mpi.h>
-
-#include "mori/application/bootstrap/mpi_bootstrap.hpp"
-#endif
-
-#include <sys/wait.h>
-#include <unistd.h>
-
-#include <algorithm>
-#include <cstdio>
-#include <cstring>
-#include <vector>
-
-#include "hip/hip_runtime.h"
-#include "mori/application/bootstrap/socket_bootstrap.hpp"
-
+#include "cco_test_harness.hpp"
 #include "mori/cco/cco.hpp"
-
-static int g_rank = 0;
-
-#define HIP_CHECK(cmd)                                                                           \
-  do {                                                                                           \
-    hipError_t e = (cmd);                                                                        \
-    if (e != hipSuccess) {                                                                       \
-      fprintf(stderr, "[rank %d] HIP error %d (%s) at %s:%d\n", g_rank, e, hipGetErrorString(e), \
-              __FILE__, __LINE__);                                                               \
-      _exit(1);                                                                                  \
-    }                                                                                            \
-  } while (0)
 
 static const size_t PER_RANK_VMM_SIZE = 256ULL * 1024 * 1024;
 static const size_t COUNT = 256;  // elements per rank-pair
@@ -124,7 +96,7 @@ __global__ void GdaAlltoAllFlushAsyncKernel(mori::cco::ccoWindowDevice* sendWin,
   }
 }
 
-static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* bootNet) {
+int run_test(int rank, int nranks, mori::application::BootstrapNetwork* bootNet) {
   g_rank = rank;
 
   int numDevices = 0;
@@ -248,156 +220,6 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
   return ok ? 0 : 1;
 }
 
-// ── fork mode ──
-
-static void write_file(const char* path, const void* data, size_t len) {
-  FILE* f = fopen(path, "wb");
-  fwrite(data, 1, len, f);
-  fclose(f);
-}
-
-static bool read_file(const char* path, void* data, size_t len) {
-  FILE* f = fopen(path, "rb");
-  if (!f) return false;
-  bool ok = fread(data, 1, len, f) == len;
-  fclose(f);
-  return ok;
-}
-
-static int run_fork_mode(int nranks) {
-  char uidPath[256];
-  snprintf(uidPath, sizeof(uidPath), "/tmp/cco_gda_flush_async_uid_%d", getpid());
-
-  printf("=== CCO GDA flushAsync Test (fork, %d ranks) ===\n", nranks);
-  fflush(stdout);
-
-  auto uid = mori::application::SocketBootstrapNetwork::GenerateUniqueIdWithInterface("lo", 19878);
-  write_file(uidPath, &uid, sizeof(uid));
-
-  std::vector<pid_t> children;
-  for (int r = 0; r < nranks; r++) {
-    pid_t pid = fork();
-    if (pid == 0) {
-      mori::application::UniqueId childUid;
-      while (!read_file(uidPath, &childUid, sizeof(childUid))) {
-        usleep(10000);
-      }
-      auto* boot = new mori::application::SocketBootstrapNetwork(childUid, r, nranks);
-      _exit(run_test(r, nranks, boot));
-    }
-    children.push_back(pid);
-  }
-
-  int fail = 0;
-  for (int r = 0; r < nranks; r++) {
-    int status = 0;
-    waitpid(children[r], &status, 0);
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-      fprintf(stderr, "rank %d failed (status=%d)\n", r, status);
-      fail++;
-    }
-  }
-
-  unlink(uidPath);
-  printf("\n=== %d/%d PASSED ===\n", nranks - fail, nranks);
-  return fail > 0 ? 1 : 0;
-}
-
-// ── single-rank mode for cross-host ──
-
-static int run_single_rank_mode(int argc, char** argv) {
-  int rank = -1, worldSize = -1, gpuOffset = -1;
-  const char* uidPath = nullptr;
-  for (int i = 1; i < argc; i++) {
-    if (!strcmp(argv[i], "--rank") && i + 1 < argc)
-      rank = atoi(argv[++i]);
-    else if (!strcmp(argv[i], "--world") && i + 1 < argc)
-      worldSize = atoi(argv[++i]);
-    else if (!strcmp(argv[i], "--uid-file") && i + 1 < argc)
-      uidPath = argv[++i];
-    else if (!strcmp(argv[i], "--gpu-offset") && i + 1 < argc)
-      gpuOffset = atoi(argv[++i]);
-  }
-  if (rank < 0 || worldSize <= 0 || !uidPath) return -1;
-
-  mori::application::UniqueId uid;
-  for (int tries = 0; tries < 600; tries++) {
-    FILE* f = fopen(uidPath, "rb");
-    if (f) {
-      size_t n = fread(&uid, 1, sizeof(uid), f);
-      fclose(f);
-      if (n == sizeof(uid)) break;
-    }
-    usleep(100000);
-  }
-
-  if (gpuOffset >= 0) HIP_CHECK(hipSetDevice(rank - gpuOffset));
-
-  auto* boot = new mori::application::SocketBootstrapNetwork(uid, rank, worldSize);
-  return run_test(rank, worldSize, boot);
-}
-
-static int run_gen_uid_mode(int argc, char** argv) {
-  if (argc < 5) {
-    fprintf(stderr, "usage: --gen-uid IFACE PORT OUTFILE\n");
-    return 1;
-  }
-  const char* iface = argv[2];
-  int port = atoi(argv[3]);
-  const char* outPath = argv[4];
-  auto uid = mori::application::SocketBootstrapNetwork::GenerateUniqueIdWithInterface(iface, port);
-  FILE* f = fopen(outPath, "wb");
-  if (!f) {
-    fprintf(stderr, "fopen(%s) failed\n", outPath);
-    return 1;
-  }
-  fwrite(&uid, 1, sizeof(uid), f);
-  fclose(f);
-  printf("Wrote UID (%zu bytes) for iface=%s port=%d to %s\n", sizeof(uid), iface, port, outPath);
-  return 0;
-}
-
 int main(int argc, char** argv) {
-  if (argc >= 2 && !strcmp(argv[1], "--gen-uid")) return run_gen_uid_mode(argc, argv);
-  for (int i = 1; i < argc; i++) {
-    if (!strcmp(argv[i], "--rank")) return run_single_rank_mode(argc, argv);
-  }
-
-#ifdef MORI_WITH_MPI
-  int mpiInitialized = 0;
-  MPI_Initialized(&mpiInitialized);
-
-  bool underMpi = mpiInitialized || getenv("OMPI_COMM_WORLD_SIZE") || getenv("PMI_SIZE") ||
-                  getenv("PMI_RANK") || getenv("SLURM_PROCID");
-
-  if (underMpi) {
-    if (!mpiInitialized) MPI_Init(&argc, &argv);
-    int rank, nranks;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &nranks);
-    if (rank == 0) printf("=== CCO GDA flushAsync Test (MPI, %d ranks) ===\n", nranks);
-
-    auto* boot = new mori::application::MpiBootstrapNetwork(MPI_COMM_WORLD);
-    return run_test(rank, nranks, boot);
-  }
-#endif
-
-  // fork mode — detect local gpu count
-  int nranks = 0;
-  for (int i = 0; i < 64; i++) {
-    char path[128];
-    snprintf(path, sizeof(path), "/sys/class/kfd/kfd/topology/nodes/%d/gpu_id", i);
-    FILE* f = fopen(path, "r");
-    if (!f) break;
-    unsigned long gpuId = 0;
-    if (fscanf(f, "%lu", &gpuId) == 1 && gpuId != 0) nranks++;
-    fclose(f);
-  }
-  if (argc > 1) nranks = std::min(atoi(argv[1]), nranks);
-  if (nranks < 2) {
-    printf("Need at least 2 GPUs.\n");
-    return 1;
-  }
-
-  return run_fork_mode(nranks);
+  return ccoTestMain(argc, argv, "CCO GDA flushAsync", "/tmp/cco_gda_flush_async_uid", 19878);
 }

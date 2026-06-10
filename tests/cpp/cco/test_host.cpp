@@ -177,8 +177,7 @@ static void run_rank(int rank, int nranks, const mori::application::UniqueId& ui
     goto cleanup;
   }
   // lsaBarrier handle populated and resource window allocated.
-  if (devComm.lsaBarrier.nBarriers != reqs.lsaBarrierCount ||
-      devComm.resourceWindow == nullptr) {
+  if (devComm.lsaBarrier.nBarriers != reqs.lsaBarrierCount || devComm.resourceWindow == nullptr) {
     snprintf(result->detail, sizeof(result->detail),
              "lsaBarrier handle bad: nBarriers=%d (want %d) resourceWindow=%p",
              devComm.lsaBarrier.nBarriers, reqs.lsaBarrierCount, devComm.resourceWindow);
@@ -192,8 +191,7 @@ static void run_rank(int rank, int nranks, const mori::application::UniqueId& ui
     goto cleanup;
   }
   // Single-node test: nNodes==1 → rail GDA handles must collapse to disabled.
-  if (devComm.railGdaBarrier.nBarriers != 0 ||
-      devComm.hybridRailGdaBarrier.nBarriers != 0) {
+  if (devComm.railGdaBarrier.nBarriers != 0 || devComm.hybridRailGdaBarrier.nBarriers != 0) {
     snprintf(result->detail, sizeof(result->detail),
              "rail GDA handles must collapse on single-node: rail=%d hyb=%d",
              devComm.railGdaBarrier.nBarriers, devComm.hybridRailGdaBarrier.nBarriers);

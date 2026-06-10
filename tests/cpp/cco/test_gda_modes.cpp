@@ -53,8 +53,8 @@
   } while (0)
 
 static const size_t PER_RANK_VMM_SIZE = 64ULL * 1024 * 1024;
-static const size_t WINDOW_SIZE_SMALL = 4096;             // 4 KiB
-static const size_t WINDOW_SIZE_LARGE = 4096ULL * 1024;   // 4 MiB (triggers VMM regression path)
+static const size_t WINDOW_SIZE_SMALL = 4096;            // 4 KiB
+static const size_t WINDOW_SIZE_LARGE = 4096ULL * 1024;  // 4 MiB (triggers VMM regression path)
 
 struct Result {
   int rank;
@@ -63,9 +63,10 @@ struct Result {
 };
 
 // Helper: fail with formatted detail and return early.
-#define FAIL(...) do {                                                       \
-    snprintf(r->detail, sizeof(r->detail), __VA_ARGS__);                     \
-    return false;                                                             \
+#define FAIL(...)                                        \
+  do {                                                   \
+    snprintf(r->detail, sizeof(r->detail), __VA_ARGS__); \
+    return false;                                        \
   } while (0)
 
 // Read DevComm back to host, count non-zero QPs in the IBGDA endpoint array.
@@ -115,10 +116,9 @@ static bool exercise_mem_alloc(mori::cco::ccoComm* comm, Result* r) {
 // Exercise both ccoWindowRegister overloads on an established comm.
 // On success, the user-allocated buffer is left registered as `*outWin` /
 // `*outBuf` so the caller can verify window structure and clean up.
-static bool exercise_window_register(mori::cco::ccoComm* comm,
-                                     mori::cco::ccoWindow_t* outWin, void** outBuf,
-                                     mori::cco::ccoWindow_t* outWinConv, void** outBufConv,
-                                     Result* r) {
+static bool exercise_window_register(mori::cco::ccoComm* comm, mori::cco::ccoWindow_t* outWin,
+                                     void** outBuf, mori::cco::ccoWindow_t* outWinConv,
+                                     void** outBufConv, Result* r) {
   // Overload B: pre-allocate via ccoMemAlloc, then register. Use 4 MiB to
   // exercise the VMM sub-buffer regression path (resource window allocations
   // from DevCommCreate later add more sub-buffers).
@@ -157,11 +157,13 @@ static bool exercise_window_register(mori::cco::ccoComm* comm,
   // through the flat-VA formula.
   mori::cco::ccoWindowDevice winHost;
   HIP_CHECK(hipMemcpy(&winHost, win, sizeof(winHost), hipMemcpyDeviceToHost));
-  void* localVa = winHost.winBase + (static_cast<uint64_t>(winHost.lsaRank) * winHost.stride4G << 32);
+  void* localVa =
+      winHost.winBase + (static_cast<uint64_t>(winHost.lsaRank) * winHost.stride4G << 32);
   if (localVa != buf) {
     mori::cco::ccoWindowDeregister(comm, winConv);
     mori::cco::ccoWindowDeregister(comm, win);
-    mori::cco::ccoMemFree(comm, bufConv);  // convenience path: must MemFree even though we didn't alloc
+    mori::cco::ccoMemFree(comm,
+                          bufConv);  // convenience path: must MemFree even though we didn't alloc
     mori::cco::ccoMemFree(comm, buf);
     FAIL("flat-VA local lookup mismatch: localVa=%p buf=%p", localVa, buf);
   }
