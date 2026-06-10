@@ -52,7 +52,7 @@
 #include "hip/hip_runtime.h"
 #include "mori/application/bootstrap/socket_bootstrap.hpp"
 
-#include "mori/cco/cco.hpp"
+#include "mori/cco/cco_scale_out.hpp"
 
 static int g_rank = 0;
 
@@ -69,8 +69,30 @@ static int g_rank = 0;
 static const size_t PER_RANK_VMM_SIZE = 256ULL * 1024 * 1024;
 static const size_t COUNT = 256;  // elements per rank-pair
 
-// force psd (ionic) provider
-static constexpr mori::core::ProviderType kPrvdType = mori::core::ProviderType::PSD;
+// Dispatch a kernel launch to the ccoGda<PrvdType> instantiation matching the
+// DevComm's RDMA backend (devComm.ibgda.providerType), resolved at runtime. `P`
+// is a constexpr ProviderType usable as a template argument in the launch expr.
+#define CCO_GDA_DISPATCH(prvd, ...)                                          \
+  do {                                                                       \
+    switch (prvd) {                                                          \
+      case mori::core::ProviderType::BNXT: {                                 \
+        constexpr auto P = mori::core::ProviderType::BNXT;                   \
+        __VA_ARGS__;                                                         \
+      } break;                                                               \
+      case mori::core::ProviderType::MLX5: {                                 \
+        constexpr auto P = mori::core::ProviderType::MLX5;                   \
+        __VA_ARGS__;                                                         \
+      } break;                                                               \
+      case mori::core::ProviderType::PSD: {                                  \
+        constexpr auto P = mori::core::ProviderType::PSD;                    \
+        __VA_ARGS__;                                                         \
+      } break;                                                               \
+      default:                                                               \
+        fprintf(stderr, "[cco gda test] unsupported GDA provider %d\n",      \
+                static_cast<int>(prvd));                                     \
+        _exit(1);                                                            \
+    }                                                                        \
+  } while (0)
 
 // alltoall-via-get kernel — single warp does the work.
 // each thread pulls one peer's destined slice into our recvBuf.
@@ -180,8 +202,9 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
   // launch
   hipStream_t stream;
   HIP_CHECK(hipStreamCreate(&stream));
-  GdaAlltoAllGetKernel<kPrvdType, float>
-      <<<1, 64, 0, stream>>>(sendWin, recvWin, COUNT, devComm);
+  CCO_GDA_DISPATCH(devComm.ibgda.providerType,
+                   GdaAlltoAllGetKernel<P, float><<<1, 64, 0, stream>>>(sendWin, recvWin, COUNT,
+                                                                        devComm));
   HIP_CHECK(hipStreamSynchronize(stream));
   printf("[rank %d] kernel completed\n", rank);
 

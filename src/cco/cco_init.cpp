@@ -958,6 +958,12 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
       epsHost[i].wqHandle = newEps[i].wqHandle;
       epsHost[i].cqHandle = newEps[i].cqHandle;
       epsHost[i].atomicIbuf = newEps[i].atomicIbuf;
+      // Resolve the GDA backend provider from the first connected endpoint
+      // (empty slots for peers without a QP keep vendorId==Unknown).
+      if (ibgda.providerType == core::ProviderType::Unknown) {
+        core::ProviderType p = epsHost[i].GetProviderType();
+        if (p != core::ProviderType::Unknown) ibgda.providerType = p;
+      }
     }
 
     HIP_RUNTIME_CHECK(hipMalloc(&epsGpu, numEps * sizeof(application::RdmaEndpointDevice)));
