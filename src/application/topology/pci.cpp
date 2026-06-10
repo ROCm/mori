@@ -265,7 +265,10 @@ TopoNodePci* CreateTopoNodePciFrom(pci_dev* dev) {
     return TopoNodePci::CreateBridge(bus, numa);
   } else if (baseCls == PCI_BASE_CLASS_NETWORK) {
     return TopoNodePci::CreateNet(bus, numa);
-  } else if (cls == 0x1200) {
+  } else if (cls == 0x1200 || cls == 0x0300 || cls == 0x0302) {
+    // 0x1200: Processing Accelerator (data-center GPUs)
+    // 0x0300: VGA compatible controller (RDNA 4 consumer/workstation GPUs, e.g. R9700)
+    // 0x0302: 3D controller (some workstation GPUs)
     return TopoNodePci::CreateGpu(bus, numa);
   }
 
