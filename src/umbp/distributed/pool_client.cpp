@@ -35,6 +35,7 @@
 #include <unordered_map>
 
 #include "mori/io/backend.hpp"
+#include "mori/utils/env_utils.hpp"
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/env_time.h"
 #include "umbp/distributed/master/master_metrics.h"
@@ -277,7 +278,10 @@ bool PoolClient::Init() {
     io_engine_ = std::make_unique<mori::io::IOEngine>(config_.master_config.node_id, io_cfg);
     mori::io::RdmaBackendConfig rdma_cfg;
 
-    rdma_cfg.qpPerTransfer = 16;
+    // Default 4 QPs spread 1/NIC across 4 NICs. Ionic NICs accept only ~488 QPs
+    // (~1290 at default queue depths) before EINVAL, so qpPerTransfer scales QP
+    // pressure linearly with engine count; numNicsPerTransfer only spreads QPs.
+    rdma_cfg.qpPerTransfer = mori::env::GetPositiveIntOr("MORI_UMBP_QP_PER_TRANSFER", 4);
     rdma_cfg.enableTransferChunking = true;
     rdma_cfg.numNicsPerTransfer = 4;
     io_engine_->CreateBackend(mori::io::BackendType::RDMA, rdma_cfg);
