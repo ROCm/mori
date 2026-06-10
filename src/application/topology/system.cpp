@@ -63,15 +63,19 @@ std::vector<Candidate> CollectAndSortCandidates(TopoSystem* sys, int id) {
   TopoSystemNet* net = sys->GetTopoSystemNet();
 
   TopoNodeGpu* dev = gpu->GetGpuByLogicalId(id);
-  NumaNodeId gpuNumaNodeId = pci->Node(dev->busId)->NumaNode();
+  if (dev == nullptr) return {};
+  TopoNodePci* gpuPci = pci->Node(dev->busId);
+  if (gpuPci == nullptr) return {};
+  NumaNodeId gpuNumaNodeId = gpuPci->NumaNode();
 
   // Collect nic candidates
   auto nics = net->GetNics();
   std::vector<Candidate> candidates;
   for (auto* nic : nics) {
+    if (nic == nullptr) continue;
     TopoPathPci* path = pci->Path(dev->busId, nic->busId);
     TopoNodePci* nicPci = pci->Node(nic->busId);
-    if (!path) continue;
+    if (!path || nicPci == nullptr) continue;
     candidates.push_back({path, nicPci, nic});
   }
 
@@ -97,7 +101,7 @@ std::vector<Candidate> CollectAndSortCandidates(TopoSystem* sys, int id) {
 
 std::string TopoSystem::MatchGpuAndNic(int id) {
   std::vector<std::string> matches = MatchAllGpusAndNics();
-  assert(id < matches.size());
+  if (id < 0 || id >= static_cast<int>(matches.size())) return "";
   return matches[id];
 }
 
