@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <array>
 #include <sstream>
+#include <stdexcept>
 
 #include "mori/utils/mori_log.hpp"
 
@@ -72,6 +73,61 @@ std::string SummarizeClientTiers(const std::vector<ClientRecord>& alive_clients)
 }
 
 }  // namespace
+
+std::vector<std::optional<RoutePutResult>> RoutePutStrategy::SelectBatch(
+    const std::vector<uint64_t>& block_sizes, const std::vector<bool>& already_exists,
+    std::vector<ClientRecord> candidates, const std::unordered_set<std::string>& exclude_nodes) {
+  if (already_exists.size() != block_sizes.size()) {
+    throw std::runtime_error(
+        "RoutePutStrategy::SelectBatch: already_exists length must match block_sizes");
+  }
+
+  std::vector<std::optional<RoutePutResult>> results;
+  results.reserve(block_sizes.size());
+
+  for (size_t i = 0; i < block_sizes.size(); ++i) {
+    if (already_exists[i]) {
+      results.push_back(RoutePutResult{.outcome = RoutePutOutcome::kAlreadyExists});
+      continue;
+    }
+    if (candidates.empty()) {
+      results.push_back(std::nullopt);
+      continue;
+    }
+    uint64_t block_size = block_sizes[i];
+    auto selected = Select(candidates, block_size, exclude_nodes);
+    if (selected && selected->outcome == RoutePutOutcome::kRouted) {
+      // Deduct projected capacity from the batch-local copy so later entries
+      // see the reservation.  Select() only returns kRouted for a node/tier
+      // with available_bytes >= block_size, and `candidates` is a single-thread
+      // local copy, so the node/tier must exist with enough room here.  A
+      // violation means Select()'s contract is broken: fail fast, never clamp.
+      auto client_it =
+          std::find_if(candidates.begin(), candidates.end(),
+                       [&](const ClientRecord& c) { return c.node_id == selected->node_id; });
+      if (client_it == candidates.end()) {
+        throw std::runtime_error(
+            "RoutePutStrategy::SelectBatch: Select returned node not in candidates: " +
+            selected->node_id);
+      }
+      auto tier_it = client_it->tier_capacities.find(selected->tier);
+      if (tier_it == client_it->tier_capacities.end()) {
+        throw std::runtime_error(
+            "RoutePutStrategy::SelectBatch: Select returned tier absent on node " +
+            selected->node_id);
+      }
+      if (tier_it->second.available_bytes < block_size) {
+        throw std::runtime_error(
+            "RoutePutStrategy::SelectBatch: projected capacity underflow on node " +
+            selected->node_id);
+      }
+      tier_it->second.available_bytes -= block_size;
+    }
+    results.push_back(std::move(selected));
+  }
+
+  return results;
+}
 
 std::optional<RoutePutResult> TierAwareMostAvailableStrategy::Select(
     const std::vector<ClientRecord>& alive_clients, uint64_t block_size,

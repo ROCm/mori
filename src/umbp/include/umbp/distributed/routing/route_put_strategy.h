@@ -64,6 +64,23 @@ class RoutePutStrategy {
   virtual std::optional<RoutePutResult> Select(
       const std::vector<ClientRecord>& alive_clients, uint64_t block_size,
       const std::unordered_set<std::string>& exclude_nodes) = 0;
+
+  /// Batch-aware placement with projected capacity: each routed pick deducts
+  /// the chosen node/tier's available_bytes in the by-value @p candidates
+  /// copy so later entries in the same batch see the reservation.  The copy is
+  /// batch-local and never written back to the registry — the peer allocator is
+  /// still the final arbiter.  Result length and order match @p block_sizes.
+  ///
+  /// @p already_exists must be the same length as @p block_sizes (throws
+  /// otherwise).  Entries with already_exists[i]==true are master-side dedup
+  /// hits: they return kAlreadyExists and consume no projected capacity.
+  ///
+  /// The default implementation reuses the virtual Select() unchanged; it does
+  /// not alter single-key placement semantics.  Override only to implement a
+  /// smarter batch planner.
+  virtual std::vector<std::optional<RoutePutResult>> SelectBatch(
+      const std::vector<uint64_t>& block_sizes, const std::vector<bool>& already_exists,
+      std::vector<ClientRecord> candidates, const std::unordered_set<std::string>& exclude_nodes);
 };
 
 /// Default strategy: try tiers fastest-first (HBM -> DRAM -> SSD),

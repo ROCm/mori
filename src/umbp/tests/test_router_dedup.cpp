@@ -77,6 +77,65 @@ TEST(RouterDedup, BatchRoutePutMarksAlreadyExistsForIndexedKey) {
   EXPECT_EQ(results[1]->node_id, "node-a");
 }
 
+// Dedup hits never enter the planner, so they consume no projected capacity.
+// node-a fits exactly one 6GB block on HBM.  key-X is an indexed dedup hit
+// sized 6GB; if dedup had deducted capacity, node-a would have 0 left and the
+// new key-Y could not route.  Since dedup does not deduct, key-Y still routes.
+TEST(RouterDedup, BatchRoutePutDedupDoesNotConsumeCapacity) {
+  GlobalBlockIndex index;
+  ClientRegistry registry(ClientRegistryConfig{}, index);
+  Router router(index, registry);
+
+  std::map<TierType, TierCapacity> caps;
+  caps[TierType::HBM] = {6 * kGB, 6 * kGB};
+  ASSERT_TRUE(registry.RegisterClient("node-a", "node-a:1", caps,
+                                      /*peer_address=*/"node-a:peer"));
+  ASSERT_EQ(
+      index.ApplyEvents("node-a", {KvEvent{KvEvent::Kind::ADD, "key-X", TierType::HBM, 6 * kGB}}),
+      1u);
+
+  std::vector<std::string> keys{"key-X", "key-Y"};
+  std::vector<uint64_t> sizes{6 * kGB, 6 * kGB};
+  std::unordered_set<std::string> excludes;
+
+  auto results = router.BatchRoutePut(keys, "requester", sizes, excludes);
+  ASSERT_EQ(results.size(), 2u);
+
+  ASSERT_TRUE(results[0].has_value());
+  EXPECT_EQ(results[0]->outcome, RoutePutOutcome::kAlreadyExists);
+
+  ASSERT_TRUE(results[1].has_value());
+  EXPECT_EQ(results[1]->outcome, RoutePutOutcome::kRouted);
+  EXPECT_EQ(results[1]->node_id, "node-a");
+  EXPECT_EQ(results[1]->tier, TierType::HBM);
+}
+
+// Projected capacity is batch-local: BatchRoutePut must not write the
+// deductions back to the registry's real capacity.
+TEST(RouterDedup, BatchRoutePutDoesNotWriteBackProjectedCapacity) {
+  GlobalBlockIndex index;
+  ClientRegistry registry(ClientRegistryConfig{}, index);
+  Router router(index, registry);
+
+  std::map<TierType, TierCapacity> caps;
+  caps[TierType::HBM] = {80 * kGB, 10 * kGB};
+  ASSERT_TRUE(registry.RegisterClient("node-a", "node-a:1", caps,
+                                      /*peer_address=*/"node-a:peer"));
+
+  std::vector<std::string> keys{"key-A", "key-B"};
+  std::vector<uint64_t> sizes{1 * kGB, 2 * kGB};
+  std::unordered_set<std::string> excludes;
+
+  auto results = router.BatchRoutePut(keys, "requester", sizes, excludes);
+  ASSERT_EQ(results.size(), 2u);
+  ASSERT_TRUE(results[0].has_value());
+  EXPECT_EQ(results[0]->outcome, RoutePutOutcome::kRouted);
+
+  auto alive = registry.GetAliveClients();
+  ASSERT_EQ(alive.size(), 1u);
+  EXPECT_EQ(alive[0].tier_capacities.at(TierType::HBM).available_bytes, 10 * kGB);
+}
+
 // already_exists wins over no-alive-client: caller drops Put even if
 // registry is empty (some other node owns the key).
 TEST(RouterDedup, BatchRoutePutAlreadyExistsBypassesNoAliveClient) {

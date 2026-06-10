@@ -23,7 +23,9 @@
 
 #include <chrono>
 #include <optional>
+#include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "umbp/distributed/routing/route_put_strategy.h"
@@ -163,6 +165,128 @@ TEST(TierAwareMostAvailableTest, ClientWithNoTierCapacitiesSkipped) {
 
   auto result = strategy.Select(clients, 4096, /*exclude=*/{});
   EXPECT_FALSE(result.has_value());
+}
+
+// ---- SelectBatch projected-capacity tests ----
+
+// Two 6GB blocks against node-a (10GB) and node-b (8GB) on the same tier.
+// Without projected capacity both pick node-a (most available in the
+// snapshot).  With per-batch deduction, block 1 lands on node-a (10GB -> 4GB),
+// and block 2 is forced to node-b because node-a no longer fits 6GB.
+TEST(SelectBatchTest, ProjectedCapacitySpreadsAcrossNodes) {
+  TierAwareMostAvailableStrategy strategy;
+
+  std::vector<ClientRecord> clients = {
+      MakeClient("node-a", "addr-a", {{TierType::HBM, {80 * GB, 10 * GB}}}),
+      MakeClient("node-b", "addr-b", {{TierType::HBM, {80 * GB, 8 * GB}}}),
+  };
+
+  auto results = strategy.SelectBatch({6 * GB, 6 * GB}, {false, false}, clients, /*exclude=*/{});
+  ASSERT_EQ(results.size(), 2u);
+
+  ASSERT_TRUE(results[0].has_value());
+  EXPECT_EQ(results[0]->outcome, RoutePutOutcome::kRouted);
+  EXPECT_EQ(results[0]->node_id, "node-a");
+
+  ASSERT_TRUE(results[1].has_value());
+  EXPECT_EQ(results[1]->outcome, RoutePutOutcome::kRouted);
+  EXPECT_EQ(results[1]->node_id, "node-b");
+}
+
+// A dedup hit returns kAlreadyExists and consumes no projected capacity:
+// node-a fits exactly one 6GB block, block 0 is a dedup hit, so block 1 must
+// still route to node-a.
+TEST(SelectBatchTest, DedupHitConsumesNoCapacity) {
+  TierAwareMostAvailableStrategy strategy;
+
+  std::vector<ClientRecord> clients = {
+      MakeClient("node-a", "addr-a", {{TierType::HBM, {80 * GB, 6 * GB}}}),
+  };
+
+  auto results = strategy.SelectBatch({6 * GB, 6 * GB}, {true, false}, clients, /*exclude=*/{});
+  ASSERT_EQ(results.size(), 2u);
+
+  ASSERT_TRUE(results[0].has_value());
+  EXPECT_EQ(results[0]->outcome, RoutePutOutcome::kAlreadyExists);
+
+  ASSERT_TRUE(results[1].has_value());
+  EXPECT_EQ(results[1]->outcome, RoutePutOutcome::kRouted);
+  EXPECT_EQ(results[1]->node_id, "node-a");
+}
+
+TEST(SelectBatchTest, ThrowsOnAlreadyExistsLengthMismatch) {
+  TierAwareMostAvailableStrategy strategy;
+
+  std::vector<ClientRecord> clients = {
+      MakeClient("node-a", "addr-a", {{TierType::HBM, {80 * GB, 10 * GB}}}),
+  };
+
+  EXPECT_THROW(strategy.SelectBatch({4096, 4096}, {false}, clients, /*exclude=*/{}),
+               std::runtime_error);
+}
+
+// The by-value candidates copy is never mutated for the caller: passing the
+// same snapshot again yields the same placement (no projected state leaks out).
+TEST(SelectBatchTest, DoesNotMutateCallerCandidates) {
+  TierAwareMostAvailableStrategy strategy;
+
+  std::vector<ClientRecord> clients = {
+      MakeClient("node-a", "addr-a", {{TierType::HBM, {80 * GB, 10 * GB}}}),
+      MakeClient("node-b", "addr-b", {{TierType::HBM, {80 * GB, 8 * GB}}}),
+  };
+
+  strategy.SelectBatch({6 * GB, 6 * GB}, {false, false}, clients, /*exclude=*/{});
+
+  EXPECT_EQ(clients[0].tier_capacities.at(TierType::HBM).available_bytes, 10 * GB);
+  EXPECT_EQ(clients[1].tier_capacities.at(TierType::HBM).available_bytes, 8 * GB);
+}
+
+// SelectBatch with one request must match a direct Select() call: the default
+// batch path does not alter single-key placement semantics.
+TEST(SelectBatchTest, SizeOneMatchesSelect) {
+  TierAwareMostAvailableStrategy strategy;
+
+  std::vector<ClientRecord> clients = {
+      MakeClient("node-a", "addr-a", {{TierType::HBM, {80 * GB, 10 * GB}}}),
+      MakeClient("node-b", "addr-b", {{TierType::HBM, {80 * GB, 50 * GB}}}),
+  };
+
+  auto single = strategy.Select(clients, 4096, /*exclude=*/{});
+  auto batch = strategy.SelectBatch({4096}, {false}, clients, /*exclude=*/{});
+
+  ASSERT_EQ(batch.size(), 1u);
+  ASSERT_TRUE(single.has_value());
+  ASSERT_TRUE(batch[0].has_value());
+  EXPECT_EQ(batch[0]->node_id, single->node_id);
+  EXPECT_EQ(batch[0]->tier, single->tier);
+}
+
+// A strategy whose Select() breaks its own contract (routes to a node/tier
+// without enough room) must trip the projected-capacity invariant and throw,
+// never silently clamp the deduction.
+class BrokenContractStrategy : public RoutePutStrategy {
+ public:
+  std::optional<RoutePutResult> Select(
+      const std::vector<ClientRecord>& alive_clients, uint64_t /*block_size*/,
+      const std::unordered_set<std::string>& /*exclude_nodes*/) override {
+    return RoutePutResult{
+        .outcome = RoutePutOutcome::kRouted,
+        .node_id = alive_clients.front().node_id,
+        .peer_address = alive_clients.front().peer_address,
+        .tier = TierType::HBM,
+    };
+  }
+};
+
+TEST(SelectBatchTest, ThrowsOnProjectedCapacityUnderflow) {
+  BrokenContractStrategy strategy;
+
+  std::vector<ClientRecord> clients = {
+      MakeClient("node-a", "addr-a", {{TierType::HBM, {80 * GB, 1 * GB}}}),
+  };
+
+  EXPECT_THROW(strategy.SelectBatch({4 * GB}, {false}, clients, /*exclude=*/{}),
+               std::runtime_error);
 }
 
 }  // namespace

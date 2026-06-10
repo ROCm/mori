@@ -73,21 +73,12 @@ std::vector<std::optional<RoutePutResult>> Router::BatchRoutePut(
     const std::vector<uint64_t>& block_sizes,
     const std::unordered_set<std::string>& exclude_nodes) {
   (void)node_id;
-  std::vector<std::optional<RoutePutResult>> results(keys.size());
-  // Single shared_lock for the whole batch: dedup mask + alive snapshot.
-  // Two entries picking the same (node, tier) is fine — peer will sort
-  // out ENOSPC at AllocateSlot.
+  // SelectBatch applies dedup + projected capacity on this batch-local snapshot;
+  // the peer allocator stays the final ENOSPC arbiter. A keys/block_sizes length
+  // mismatch surfaces as a SelectBatch throw (no silent coercion).
   auto exists_mask = index_.BatchLookupExists(keys);
   auto candidates = registry_.GetAliveClients();
-  for (size_t i = 0; i < keys.size(); ++i) {
-    if (i < exists_mask.size() && exists_mask[i]) {
-      results[i] = RoutePutResult{.outcome = RoutePutOutcome::kAlreadyExists};
-      continue;
-    }
-    if (candidates.empty()) continue;
-    results[i] = put_strategy_->Select(candidates, block_sizes[i], exclude_nodes);
-  }
-  return results;
+  return put_strategy_->SelectBatch(block_sizes, exists_mask, std::move(candidates), exclude_nodes);
 }
 
 std::vector<std::optional<RouteGetResolution>> Router::BatchRouteGet(
