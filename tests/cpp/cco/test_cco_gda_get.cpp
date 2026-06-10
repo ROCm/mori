@@ -52,7 +52,7 @@
 #include "hip/hip_runtime.h"
 #include "mori/application/bootstrap/socket_bootstrap.hpp"
 
-#include "mori/cco/cco.hpp"
+#include "mori/cco/cco_scale_out.hpp"
 
 static int g_rank = 0;
 
