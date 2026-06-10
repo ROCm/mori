@@ -41,12 +41,24 @@
 #include <mpi.h>
 #include <unistd.h>
 
-#include <cassert>
+#include <cstdlib>
+
+// Always-on check: these tests build under -DNDEBUG (Release), where CCO_MUST()
+// would drop the wrapped expression together with its side effects. CCO_MUST
+// always evaluates expr and aborts the rank on failure (mpirun then tears down
+// the whole job).
+#define CCO_MUST(expr)                                                            \
+  do {                                                                            \
+    if (!(expr)) {                                                                \
+      std::fprintf(stderr, "[cco lsa test] CHECK FAILED: %s at %s:%d\n", #expr,   \
+                   __FILE__, __LINE__);                                           \
+      std::abort();                                                               \
+    }                                                                             \
+  } while (0)
 #include <cstdio>
 #include <cstring>
 
-#include "args_parser.hpp"
-#include "mori/cco/cco.hpp"  // CCO single header (host + device)
+#include "mori/cco/cco.hpp"  // CCO core header (host + LSA device; no GDA/RDMA)
 
 using namespace mori::cco;
 
@@ -84,18 +96,18 @@ int main(int argc, char* argv[]) {
   // ── Phase 1: ccoComm (self-contained bootstrap) ──
   // MPI is only the launcher + a one-shot broadcast of the cco unique id.
   ccoUniqueId uid;
-  if (rank == 0) assert(ccoGetUniqueId(&uid) == 0);
+  if (rank == 0) CCO_MUST(ccoGetUniqueId(&uid) == 0);
   MPI_Bcast(&uid, sizeof(uid), MPI_BYTE, 0, MPI_COMM_WORLD);
 
   // Bind each rank to its own GPU BEFORE ccoCommCreate. ccoCommCreate calls
   // hipGetDevice() and pins all allocations to the current device, so without
   // this every rank would land on GPU 0 (all 8 GB windows stacked on PE0).
   int hipDevCount = 0;
-  assert(hipGetDeviceCount(&hipDevCount) == hipSuccess);
-  assert(hipSetDevice(rank % hipDevCount) == hipSuccess);
+  CCO_MUST(hipGetDeviceCount(&hipDevCount) == hipSuccess);
+  CCO_MUST(hipSetDevice(rank % hipDevCount) == hipSuccess);
 
   mori::cco::ccoComm* comm = nullptr;
-  assert(ccoCommCreate(uid, nranks, rank, 0, &comm) == 0);
+  CCO_MUST(ccoCommCreate(uid, nranks, rank, 0, &comm) == 0);
 
   // ── Phase 2: window + devcomm leak loop ──
   for (int wi = 0; wi < window_iters; wi++) {
@@ -103,7 +115,7 @@ int main(int argc, char* argv[]) {
     const size_t winBytes = 8ULL << 30;  // 8 GB
     void* buf = nullptr;
     ccoWindow_t win = nullptr;
-    assert(ccoWindowRegister(comm, winBytes, &win, &buf) == 0);
+    CCO_MUST(ccoWindowRegister(comm, winBytes, &win, &buf) == 0);
 
     // ── DevComm loop ──
     for (int di = 0; di < devcomm_iters; di++) {
@@ -113,11 +125,11 @@ int main(int argc, char* argv[]) {
 
       // Host struct, filled in place; kernel takes it by value.
       ccoDevComm devComm{};
-      assert(ccoDevCommCreate(comm, &reqs, &devComm) == 0);
+      CCO_MUST(ccoDevCommCreate(comm, &reqs, &devComm) == 0);
 
       // Exercise the barrier so the DevComm is actually used.
       lsa_barrier_kernel<<<1, 64>>>(devComm);
-      assert(hipDeviceSynchronize() == hipSuccess);
+      CCO_MUST(hipDeviceSynchronize() == hipSuccess);
 
       ccoDevCommDestroy(comm, &devComm);
     }

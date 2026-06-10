@@ -42,12 +42,24 @@
 #include <mpi.h>
 
 #include <algorithm>
-#include <cassert>
+#include <cstdlib>
+
+// Always-on check: these tests build under -DNDEBUG (Release), where CCO_MUST()
+// would drop the wrapped expression together with its side effects. CCO_MUST
+// always evaluates expr and aborts the rank on failure (mpirun then tears down
+// the whole job).
+#define CCO_MUST(expr)                                                            \
+  do {                                                                            \
+    if (!(expr)) {                                                                \
+      std::fprintf(stderr, "[cco lsa test] CHECK FAILED: %s at %s:%d\n", #expr,   \
+                   __FILE__, __LINE__);                                           \
+      std::abort();                                                               \
+    }                                                                             \
+  } while (0)
 #include <cstdio>
 #include <vector>
 
-#include "args_parser.hpp"
-#include "mori/cco/cco.hpp"  // CCO single header (host + device)
+#include "mori/cco/cco.hpp"  // CCO core header (host + LSA device; no GDA/RDMA)
 
 // Larger vector so the multi-block grid-stride loop actually spreads work
 // across blocks (each rank r contributes a vector of all r's).
@@ -125,17 +137,17 @@ int main(int argc, char* argv[]) {
   // ── Phase 1: communicator (self-contained bootstrap) ──
   // MPI is only the launcher + a one-shot broadcast of the cco unique id.
   ccoUniqueId uid;
-  if (rank == 0) assert(ccoGetUniqueId(&uid) == 0);
+  if (rank == 0) CCO_MUST(ccoGetUniqueId(&uid) == 0);
   MPI_Bcast(&uid, sizeof(uid), MPI_BYTE, 0, MPI_COMM_WORLD);
 
   // Bind each rank to its own GPU BEFORE ccoCommCreate (which calls
   // hipGetDevice() and pins allocations to the current device).
   int hipDevCount = 0;
-  assert(hipGetDeviceCount(&hipDevCount) == hipSuccess);
-  assert(hipSetDevice(rank % hipDevCount) == hipSuccess);
+  CCO_MUST(hipGetDeviceCount(&hipDevCount) == hipSuccess);
+  CCO_MUST(hipSetDevice(rank % hipDevCount) == hipSuccess);
 
   ccoComm* comm = nullptr;
-  assert(ccoCommCreate(uid, nranks, rank, 0, &comm) == 0);
+  CCO_MUST(ccoCommCreate(uid, nranks, rank, 0, &comm) == 0);
 
   const size_t sizeBytes = NELEMS * sizeof(float);
 
@@ -144,12 +156,12 @@ int main(int argc, char* argv[]) {
   void* recvBuf = nullptr;
   ccoWindow_t sendWin = nullptr;
   ccoWindow_t recvWin = nullptr;
-  assert(ccoWindowRegister(comm, sizeBytes, &sendWin, &sendBuf) == 0);
-  assert(ccoWindowRegister(comm, sizeBytes, &recvWin, &recvBuf) == 0);
+  CCO_MUST(ccoWindowRegister(comm, sizeBytes, &sendWin, &sendBuf) == 0);
+  CCO_MUST(ccoWindowRegister(comm, sizeBytes, &recvWin, &recvBuf) == 0);
 
   // Each rank's send vector is (rank, rank, rank, rank).
   std::vector<float> sendHost(NELEMS, static_cast<float>(rank));
-  assert(hipMemcpy(sendBuf, sendHost.data(), sizeBytes, hipMemcpyHostToDevice) == hipSuccess);
+  CCO_MUST(hipMemcpy(sendBuf, sendHost.data(), sizeBytes, hipMemcpyHostToDevice) == hipSuccess);
 
   // Print input (rank by rank in order). Show only the first few elements.
   const size_t kShow = std::min<size_t>(NELEMS, 8);
@@ -185,7 +197,7 @@ int main(int argc, char* argv[]) {
   // Host struct, filled in place; kernels take it by value (lands in kernel-arg
   // space, no per-access GPU-memory dereference).
   ccoDevComm devComm{};
-  assert(ccoDevCommCreate(comm, &reqs, &devComm) == 0);
+  CCO_MUST(ccoDevCommCreate(comm, &reqs, &devComm) == 0);
 
   if (rank == 0) {
     printf("DevComm ready, lsaSize=%d  grid=%d blocks × %d slots  (3 coop variants)\n",
@@ -196,13 +208,13 @@ int main(int argc, char* argv[]) {
   int totalErrors = 0;
   auto run_variant = [&](const char* name, auto launch_fn) {
     // Zero recvBuf so each variant is independently verified.
-    assert(hipMemset(recvBuf, 0, sizeBytes) == hipSuccess);
+    CCO_MUST(hipMemset(recvBuf, 0, sizeBytes) == hipSuccess);
 
     launch_fn();
-    assert(hipDeviceSynchronize() == hipSuccess);
+    CCO_MUST(hipDeviceSynchronize() == hipSuccess);
 
     std::vector<float> recvHost(NELEMS);
-    assert(hipMemcpy(recvHost.data(), recvBuf, sizeBytes, hipMemcpyDeviceToHost) == hipSuccess);
+    CCO_MUST(hipMemcpy(recvHost.data(), recvBuf, sizeBytes, hipMemcpyDeviceToHost) == hipSuccess);
     int errors = 0;
     for (size_t i = 0; i < NELEMS; i++)
       if (recvHost[i] != expected) errors++;

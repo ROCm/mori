@@ -44,11 +44,24 @@
 #include <mpi.h>
 
 #include <algorithm>
-#include <cassert>
+#include <cstdlib>
+
+// Always-on check: these tests build under -DNDEBUG (Release), where CCO_MUST()
+// would drop the wrapped expression together with its side effects. CCO_MUST
+// always evaluates expr and aborts the rank on failure (mpirun then tears down
+// the whole job).
+#define CCO_MUST(expr)                                                            \
+  do {                                                                            \
+    if (!(expr)) {                                                                \
+      std::fprintf(stderr, "[cco lsa test] CHECK FAILED: %s at %s:%d\n", #expr,   \
+                   __FILE__, __LINE__);                                           \
+      std::abort();                                                               \
+    }                                                                             \
+  } while (0)
 #include <cstdio>
 #include <vector>
 
-#include "mori/cco/cco.hpp"  // CCO single header (host + device)
+#include "mori/cco/cco.hpp"  // CCO core header (host + LSA device; no GDA/RDMA)
 
 using namespace mori::cco;
 
@@ -618,7 +631,7 @@ int main(int argc, char* argv[]) {
   // MPI is only the launcher + a one-shot broadcast of the cco unique id;
   // cco builds its own socket bootstrap internally from the id.
   ccoUniqueId uid;
-  if (rank == 0) assert(ccoGetUniqueId(&uid) == 0);
+  if (rank == 0) CCO_MUST(ccoGetUniqueId(&uid) == 0);
   MPI_Bcast(&uid, sizeof(uid), MPI_BYTE, 0, MPI_COMM_WORLD);
 
   // Bind each rank to its own GPU BEFORE ccoCommCreate (which calls
@@ -628,12 +641,12 @@ int main(int argc, char* argv[]) {
   HIP_CHECK(hipSetDevice(rank % hipDevCount));
 
   ccoComm* comm = nullptr;
-  assert(ccoCommCreate(uid, nranks, rank, PER_RANK_VMM_SIZE, &comm) == 0);
+  CCO_MUST(ccoCommCreate(uid, nranks, rank, PER_RANK_VMM_SIZE, &comm) == 0);
 
   // ── Phase 2: send window (one uint32 cookie slot) ──
   void* sendBuf = nullptr;
   ccoWindow_t sendWin = nullptr;
-  assert(ccoWindowRegister(comm, COOKIE_BYTES, &sendWin, &sendBuf) == 0);
+  CCO_MUST(ccoWindowRegister(comm, COOKIE_BYTES, &sendWin, &sendBuf) == 0);
   HIP_CHECK(hipMemset(sendBuf, 0, COOKIE_BYTES));
 
   // ── Phase 3: DevComm with LSA barrier slots (0..10 used by the UTs) ──
@@ -641,7 +654,7 @@ int main(int argc, char* argv[]) {
   reqs.gdaConnectionType = CCO_GDA_CONNECTION_NONE;
   reqs.lsaBarrierCount = 11;
   ccoDevComm dcHost{};
-  assert(ccoDevCommCreate(comm, &reqs, &dcHost) == 0);
+  CCO_MUST(ccoDevCommCreate(comm, &reqs, &dcHost) == 0);
   if (rank == 0) {
     std::printf("=== LSA barrier example: world=%d lsa=%d ===\n", dcHost.worldSize, dcHost.lsaSize);
   }
