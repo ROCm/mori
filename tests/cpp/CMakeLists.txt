@@ -27,6 +27,19 @@ target_include_directories(test_transport_ibverbs PUBLIC ${CMAKE_SOURCE_DIR})
 # reintroduce a link-time dependency on a host without RDMA installed.
 target_link_libraries(test_transport_ibverbs mori_application mori_ibv_shim)
 
+add_executable(test_topology_gpu_smi_shutdown
+               application/test_topology_gpu_smi_shutdown.cpp)
+target_include_directories(test_topology_gpu_smi_shutdown
+                           PUBLIC ${CMAKE_SOURCE_DIR}/include)
+target_include_directories(test_topology_gpu_smi_shutdown PUBLIC ${CMAKE_SOURCE_DIR})
+target_link_libraries(test_topology_gpu_smi_shutdown mori_application)
+
+add_executable(test_rdma_rsmi_lifecycle application/test_rdma_rsmi_lifecycle.cpp)
+target_include_directories(test_rdma_rsmi_lifecycle
+                           PUBLIC ${CMAKE_SOURCE_DIR}/include)
+target_include_directories(test_rdma_rsmi_lifecycle PUBLIC ${CMAKE_SOURCE_DIR})
+target_link_libraries(test_rdma_rsmi_lifecycle mori_application)
+
 if(BUILD_IO)
   add_executable(test_engine io/test_engine.cpp)
 

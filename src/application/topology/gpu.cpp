@@ -22,11 +22,35 @@
 #include "mori/application/topology/gpu.hpp"
 
 #include <cstdio>
+#include <cstdlib>
+#include <mutex>
 
 #include "mori/application/utils/check.hpp"
 
 namespace mori {
 namespace application {
+namespace detail {
+
+void ShutdownRsmiAtExit() {
+  rsmi_status_t status = rsmi_shut_down();
+  if (status != RSMI_STATUS_SUCCESS) {
+    const char* msg = nullptr;
+    rsmi_status_string(status, &msg);
+    if (msg == nullptr) msg = "unknown rocm smi error";
+    fprintf(stderr, "[%s:%d] warning: rocm smi shutdown failed at exit with %s\n", __FILE__,
+            __LINE__, msg);
+  }
+}
+
+void EnsureRsmiInitialized() {
+  static std::once_flag initOnce;
+  std::call_once(initOnce, []() {
+    ROCM_SMI_CHECK(rsmi_init(0));
+    std::atexit(ShutdownRsmiAtExit);
+  });
+}
+
+}  // namespace detail
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                          TopoSystemGpu                                         */
@@ -46,7 +70,7 @@ PciBusId RsmiBusId2PciBusId(uint64_t rsmiBusId) {
 void TopoSystemGpu::Load() {
   uint32_t numGpus;
 
-  ROCM_SMI_CHECK(rsmi_init(0));
+  detail::EnsureRsmiInitialized();
   ROCM_SMI_CHECK(rsmi_num_monitor_devices(&numGpus));
 
   for (uint32_t i = 0; i < numGpus; ++i) {
@@ -77,7 +101,8 @@ void TopoSystemGpu::Load() {
     }
   }
 
-  ROCM_SMI_CHECK(rsmi_shut_down());
+  // RSMI owns process-global state. Keep it initialized after topology discovery instead of
+  // shutting it down per TopoSystemGpu instance; shutdown is registered once at process exit.
 }
 
 std::vector<TopoNodeGpu*> TopoSystemGpu::GetGpus() const {
