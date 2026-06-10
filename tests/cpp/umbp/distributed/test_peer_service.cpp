@@ -32,15 +32,16 @@
 
 #include "umbp/common/config.h"
 #include "umbp/distributed/config.h"
+#include "umbp/distributed/peer/peer_dram_allocator.h"
 #include "umbp/distributed/peer/peer_service.h"
 #include "umbp/distributed/peer/peer_ssd_manager.h"
-#include "umbp/distributed/pool_client.h"
 #include "umbp_peer.grpc.pb.h"
 
 namespace mori::umbp {
 namespace {
 
 constexpr size_t kStagingSize = 4096;
+constexpr uint64_t kPageSize = 4096;
 constexpr uint16_t kBasePort = 50200;
 constexpr int kNumReadSlots = 4;
 constexpr int kLeaseTimeoutS = 2;
@@ -73,17 +74,20 @@ class PeerServiceSlotTest : public ::testing::Test {
     ssd_cfg.ssd.io.backend = UMBPIoBackend::Posix;
     peer_ssd_ = std::make_unique<PeerSsdManager>(ssd_cfg);
 
-    PoolClientConfig pc_cfg;
-    pc_cfg.master_config.master_address = "localhost:9999";
-    pc_cfg.master_config.node_id = "test_node";
-    coordinator_ = std::make_unique<PoolClient>(std::move(pc_cfg));
+    // Standalone DRAM allocator: the SSD-path RPCs exercised here never
+    // allocate DRAM, but PeerServiceServer requires a non-null allocator.
+    // An empty TierConfig (no DRAM/HBM buffers) is sufficient and avoids
+    // standing up a PoolClient / connecting to a master.
+    dram_alloc_ = std::make_unique<PeerDramAllocator>(kPageSize, PeerDramAllocator::TierConfig{},
+                                                      PeerDramAllocator::TierConfig{},
+                                                      std::chrono::milliseconds{1000});
 
     port_ = AllocPort();
 
     server_ = std::make_unique<PeerServiceServer>(
-        coordinator_->DramAllocator(), peer_ssd_.get(), staging_buffer_, kStagingSize,
-        ssd_staging_mem_desc_, kNumReadSlots, kLeaseTimeoutS, std::vector<uint8_t>{},
-        &coordinator_->Master());
+        dram_alloc_.get(), peer_ssd_.get(), staging_buffer_, kStagingSize, ssd_staging_mem_desc_,
+        kNumReadSlots, kLeaseTimeoutS, std::vector<uint8_t>{},
+        /*master_client=*/nullptr);
     server_->Start(port_);
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
@@ -95,7 +99,7 @@ class PeerServiceSlotTest : public ::testing::Test {
   void TearDown() override {
     server_->Stop();
     server_.reset();
-    coordinator_.reset();
+    dram_alloc_.reset();
     peer_ssd_.reset();
     std::free(staging_buffer_);
     std::filesystem::remove_all(ssd_dir_);
@@ -110,7 +114,7 @@ class PeerServiceSlotTest : public ::testing::Test {
   std::vector<uint8_t> ssd_staging_mem_desc_;
   uint16_t port_ = 0;
   std::unique_ptr<PeerSsdManager> peer_ssd_;
-  std::unique_ptr<PoolClient> coordinator_;
+  std::unique_ptr<PeerDramAllocator> dram_alloc_;
   std::unique_ptr<PeerServiceServer> server_;
   std::unique_ptr<::umbp::UMBPPeer::Stub> stub_;
 };

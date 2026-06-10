@@ -1,12 +1,16 @@
 # --------------------------------------------------------------------------
-# Tests below this header compile against the current MasterClient /
-# MasterServer / PoolClient surface (Route* / Batch* / *External RPCs). They are
-# built unconditionally because they cover the live API.
+# Tests in this directory compile against the current MasterClient /
+# MasterServer / PoolClient / PeerDramAllocator surface (Route* / Batch* /
+# event-driven index). They are split into three groups:
 #
-# The legacy distributed suite further down references symbols that no longer
-# exist (AllocateForPut / FinalizeAllocation / Register / Lookup / fused-RDMA
-# pipeline).  It remains gated behind MORI_UMBP_LEGACY_DISTRIBUTED_TESTS=OFF
-# until rewritten.
+# * unit        - pure-logic tests (no gRPC / RDMA); always registered as CTest
+#   cases.
+# * integration - stand up in-process master/peer servers and exercise the gRPC
+#   + RDMA data path; registered as CTest cases under the "integration" label so
+#   environments without the required transport can skip them via `ctest -LE
+#   integration`.
+# * bench       - manual micro-benchmarks; built but NOT registered with
+#   add_test (never run under a plain `ctest`).
 # --------------------------------------------------------------------------
 
 find_library(_TEST_PROTOBUF_LIB NAMES protobuf libprotobuf REQUIRED)
@@ -68,15 +72,8 @@ target_link_libraries(
 add_test(NAME umbp_tags COMMAND test_umbp_tags)
 
 # --------------------------------------------------------------------------
-# Legacy gate.  Everything below here references deleted symbols (AllocateForPut
-# / FinalizeAllocation / Register / Lookup / fused-RDMA pipeline) and is opt-in
-# via -DMORI_UMBP_LEGACY_DISTRIBUTED_TESTS=ON.
+# Unit tests (pure logic; no gRPC / RDMA).  Linked against umbp_common only.
 # --------------------------------------------------------------------------
-option(MORI_UMBP_LEGACY_DISTRIBUTED_TESTS
-       "Build the pre-redesign tests/cpp/umbp/distributed/* suite" OFF)
-if(NOT MORI_UMBP_LEGACY_DISTRIBUTED_TESTS)
-  return()
-endif()
 
 add_executable(test_umbp_types test_types.cpp)
 target_link_libraries(test_umbp_types PRIVATE umbp_common gtest_main)
@@ -89,15 +86,6 @@ add_executable(test_umbp_env_time test_env_time.cpp)
 target_link_libraries(test_umbp_env_time PRIVATE umbp_common gtest_main)
 add_test(NAME umbp_env_time COMMAND test_umbp_env_time)
 
-add_executable(test_umbp_client_registry test_client_registry.cpp)
-target_link_libraries(test_umbp_client_registry PRIVATE umbp_common gtest_main)
-add_test(NAME umbp_client_registry COMMAND test_umbp_client_registry)
-
-add_executable(test_umbp_global_block_index test_global_block_index.cpp)
-target_link_libraries(test_umbp_global_block_index PRIVATE umbp_common
-                                                           gtest_main)
-add_test(NAME umbp_global_block_index COMMAND test_umbp_global_block_index)
-
 add_executable(test_umbp_route_get_strategy test_route_get_strategy.cpp)
 target_link_libraries(test_umbp_route_get_strategy PRIVATE umbp_common
                                                            gtest_main)
@@ -108,28 +96,17 @@ target_link_libraries(test_umbp_route_put_strategy PRIVATE umbp_common
                                                            gtest_main)
 add_test(NAME umbp_route_put_strategy COMMAND test_umbp_route_put_strategy)
 
-add_executable(test_umbp_router test_router.cpp)
-target_link_libraries(test_umbp_router PRIVATE umbp_common gtest_main)
-add_test(NAME umbp_router COMMAND test_umbp_router)
-
-add_executable(test_umbp_pool_allocator test_pool_allocator.cpp)
-target_link_libraries(test_umbp_pool_allocator PRIVATE umbp_common gtest_main)
-add_test(NAME umbp_pool_allocator COMMAND test_umbp_pool_allocator)
-
+# PageBitmapAllocator (peer-side per-tier page allocator primitive).
 add_executable(test_umbp_page_bitmap_allocator test_page_bitmap_allocator.cpp)
 target_link_libraries(test_umbp_page_bitmap_allocator PRIVATE umbp_common
                                                               gtest_main)
 add_test(NAME umbp_page_bitmap_allocator
          COMMAND test_umbp_page_bitmap_allocator)
 
-add_executable(test_umbp_finalize_idempotency test_finalize_idempotency.cpp)
-target_link_libraries(test_umbp_finalize_idempotency PRIVATE umbp_common
-                                                             gtest_main)
-add_test(NAME umbp_finalize_idempotency COMMAND test_umbp_finalize_idempotency)
-
-add_executable(test_umbp_eviction test_eviction.cpp)
-target_link_libraries(test_umbp_eviction PRIVATE umbp_common gtest_main)
-add_test(NAME umbp_eviction COMMAND test_umbp_eviction)
+# --------------------------------------------------------------------------
+# Integration tests (stand up in-process servers; gRPC + RDMA data path).
+# Registered as CTest cases under the "integration" label.
+# --------------------------------------------------------------------------
 
 add_executable(test_umbp_peer_service test_peer_service.cpp)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -150,19 +127,6 @@ target_link_libraries(
           gtest_main)
 add_test(NAME umbp_cross_node_smoke COMMAND test_umbp_cross_node_smoke)
 
-add_executable(test_umbp_pool_client_batch_abort
-               test_pool_client_batch_abort.cpp)
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  target_link_options(test_umbp_pool_client_batch_abort PRIVATE
-                      -Wl,--no-as-needed)
-endif()
-target_link_libraries(
-  test_umbp_pool_client_batch_abort
-  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
-          gtest_main)
-add_test(NAME umbp_pool_client_batch_abort
-         COMMAND test_umbp_pool_client_batch_abort)
-
 add_executable(test_umbp_pool_client_batch_put test_pool_client_batch_put.cpp)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   target_link_options(test_umbp_pool_client_batch_put PRIVATE
@@ -175,35 +139,16 @@ target_link_libraries(
 add_test(NAME umbp_pool_client_batch_put
          COMMAND test_umbp_pool_client_batch_put)
 
-add_executable(test_umbp_pool_client_batch_put_fused
-               test_pool_client_batch_put_fused.cpp)
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  target_link_options(test_umbp_pool_client_batch_put_fused PRIVATE
-                      -Wl,--no-as-needed)
-endif()
-target_link_libraries(
-  test_umbp_pool_client_batch_put_fused
-  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
-          gtest_main)
-add_test(NAME umbp_pool_client_batch_put_fused
-         COMMAND test_umbp_pool_client_batch_put_fused)
+set_tests_properties(umbp_peer_service umbp_cross_node_smoke
+                     umbp_pool_client_batch_put PROPERTIES LABELS "integration")
 
-add_executable(test_umbp_pool_client_batch_get_fused
-               test_pool_client_batch_get_fused.cpp)
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  target_link_options(test_umbp_pool_client_batch_get_fused PRIVATE
-                      -Wl,--no-as-needed)
-endif()
-target_link_libraries(
-  test_umbp_pool_client_batch_get_fused
-  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
-          gtest_main)
-add_test(NAME umbp_pool_client_batch_get_fused
-         COMMAND test_umbp_pool_client_batch_get_fused)
+# --------------------------------------------------------------------------
+# Benchmarks (manual; built but NOT registered with add_test).
+# --------------------------------------------------------------------------
 
 # PoolClient::BatchPut micro-bench (standalone executable, not a CTest target).
-# Reports items_per_pair / wall_ms / GiB/s; useful for integration regression
-# tracking and NIC tuning.
+# Reports wall_ms / GiB/s; useful for integration regression tracking and NIC
+# tuning.
 add_executable(bench_umbp_pool_client_batch_put bench_pool_client_batch_put.cpp)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   target_link_options(bench_umbp_pool_client_batch_put PRIVATE

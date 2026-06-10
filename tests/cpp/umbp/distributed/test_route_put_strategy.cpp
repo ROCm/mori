@@ -36,6 +36,7 @@ ClientRecord MakeClient(const std::string& node_id, const std::string& addr,
   ClientRecord rec;
   rec.node_id = node_id;
   rec.node_address = addr;
+  rec.peer_address = addr;
   rec.status = ClientStatus::ALIVE;
   rec.last_heartbeat = std::chrono::steady_clock::now();
   rec.registered_at = std::chrono::steady_clock::now();
@@ -55,7 +56,7 @@ TEST(TierAwareMostAvailableTest, PrefersHBMOverDRAM) {
                  {{TierType::HBM, {80 * GB, 10 * GB}}, {TierType::DRAM, {512 * GB, 400 * GB}}}),
   };
 
-  auto result = strategy.Select(clients, 4096);
+  auto result = strategy.Select(clients, 4096, /*exclude=*/{});
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->node_id, "node-a");
   EXPECT_EQ(result->tier, TierType::HBM);
@@ -69,12 +70,15 @@ TEST(TierAwareMostAvailableTest, FallsThroughToDRAMWhenHBMFull) {
                  {{TierType::HBM, {80 * GB, 0}}, {TierType::DRAM, {512 * GB, 200 * GB}}}),
   };
 
-  auto result = strategy.Select(clients, 4096);
+  auto result = strategy.Select(clients, 4096, /*exclude=*/{});
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->tier, TierType::DRAM);
 }
 
-TEST(TierAwareMostAvailableTest, FallsThroughToSSDWhenHBMAndDRAMFull) {
+TEST(TierAwareMostAvailableTest, SsdIsNotADirectPutTarget) {
+  // SSD capacity is reported via heartbeat but RoutePut never steers a put at
+  // SSD: the SSD copy is filled asynchronously by copy-on-commit.  With HBM and
+  // DRAM full, Select must return nullopt even when SSD has ample space.
   TierAwareMostAvailableStrategy strategy;
 
   std::vector<ClientRecord> clients = {
@@ -84,9 +88,8 @@ TEST(TierAwareMostAvailableTest, FallsThroughToSSDWhenHBMAndDRAMFull) {
                   {TierType::SSD, {4096 * GB, 3000 * GB}}}),
   };
 
-  auto result = strategy.Select(clients, 4096);
-  ASSERT_TRUE(result.has_value());
-  EXPECT_EQ(result->tier, TierType::SSD);
+  auto result = strategy.Select(clients, 4096, /*exclude=*/{});
+  EXPECT_FALSE(result.has_value());
 }
 
 TEST(TierAwareMostAvailableTest, ReturnsNulloptWhenAllFull) {
@@ -99,7 +102,7 @@ TEST(TierAwareMostAvailableTest, ReturnsNulloptWhenAllFull) {
                   {TierType::SSD, {4096 * GB, 0}}}),
   };
 
-  auto result = strategy.Select(clients, 4096);
+  auto result = strategy.Select(clients, 4096, /*exclude=*/{});
   EXPECT_FALSE(result.has_value());
 }
 
@@ -110,7 +113,7 @@ TEST(TierAwareMostAvailableTest, ReturnsNulloptWhenBlockTooLarge) {
       MakeClient("node-a", "addr-a", {{TierType::HBM, {80 * GB, 10 * GB}}}),
   };
 
-  auto result = strategy.Select(clients, 100 * GB);
+  auto result = strategy.Select(clients, 100 * GB, /*exclude=*/{});
   EXPECT_FALSE(result.has_value());
 }
 
@@ -123,10 +126,10 @@ TEST(TierAwareMostAvailableTest, PicksMostAvailableOnSameTier) {
       MakeClient("node-c", "addr-c", {{TierType::HBM, {80 * GB, 30 * GB}}}),
   };
 
-  auto result = strategy.Select(clients, 4096);
+  auto result = strategy.Select(clients, 4096, /*exclude=*/{});
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->node_id, "node-b");
-  EXPECT_EQ(result->node_address, "addr-b");
+  EXPECT_EQ(result->peer_address, "addr-b");
   EXPECT_EQ(result->tier, TierType::HBM);
 }
 
@@ -138,7 +141,7 @@ TEST(TierAwareMostAvailableTest, HBMPreferredEvenIfDRAMHasMoreSpace) {
                  {{TierType::HBM, {80 * GB, 5 * GB}}, {TierType::DRAM, {512 * GB, 400 * GB}}}),
   };
 
-  auto result = strategy.Select(clients, 4096);
+  auto result = strategy.Select(clients, 4096, /*exclude=*/{});
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->tier, TierType::HBM);
 }
@@ -147,7 +150,7 @@ TEST(TierAwareMostAvailableTest, EmptyClientListReturnsNullopt) {
   TierAwareMostAvailableStrategy strategy;
   std::vector<ClientRecord> empty;
 
-  auto result = strategy.Select(empty, 4096);
+  auto result = strategy.Select(empty, 4096, /*exclude=*/{});
   EXPECT_FALSE(result.has_value());
 }
 
@@ -158,7 +161,7 @@ TEST(TierAwareMostAvailableTest, ClientWithNoTierCapacitiesSkipped) {
       MakeClient("node-a", "addr-a", {}),
   };
 
-  auto result = strategy.Select(clients, 4096);
+  auto result = strategy.Select(clients, 4096, /*exclude=*/{});
   EXPECT_FALSE(result.has_value());
 }
 

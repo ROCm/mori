@@ -34,6 +34,19 @@ target_compile_features(test_external_kv_block_index PRIVATE cxx_std_17)
 gtest_discover_tests(test_external_kv_block_index)
 
 # ---------------------------------------------------------------------------
+# test_client_registry — membership ledger: register/re-register, capacity
+# round-trip, heartbeat status, and the silent-node reaper.
+# ---------------------------------------------------------------------------
+add_executable(test_client_registry test_client_registry.cpp)
+
+target_link_libraries(test_client_registry PRIVATE umbp_common
+                                                   GTest::gtest_main)
+
+target_compile_features(test_client_registry PRIVATE cxx_std_17)
+
+gtest_discover_tests(test_client_registry)
+
+# ---------------------------------------------------------------------------
 # test_client_registry_external_kv
 # ---------------------------------------------------------------------------
 add_executable(test_client_registry_external_kv

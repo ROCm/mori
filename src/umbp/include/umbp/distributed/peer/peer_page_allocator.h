@@ -23,33 +23,19 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <map>
 #include <optional>
 #include <stdexcept>
-#include <string>
 #include <vector>
 
 #include "umbp/distributed/types.h"
 
 namespace mori::umbp {
 
-// Result of a successful PageBitmapAllocator::Allocate call.
-//
-// Both fields describe the same page set in two complementary forms:
-//   - `pages`       : structured (buffer_index, page_index) pairs used by the
-//                     RDMA scatter-gather builder on the Client side.
-//   - `location_id` : canonical string form (e.g. "0:p1,2;1:p0") used as the
-//                     opaque handle stored in GlobalBlockIndex / sent over the
-//                     wire to Master/Client.
-struct AllocResult {
-  std::string location_id;
-  std::vector<PageLocation> pages;
-};
-
-// Page-granularity bitmap allocator owned by Master, one instance per
-// (node_id, tier) pair.  Internally holds N BufferState entries (one per
-// physical buffer registered by the Client at RegisterClient time); each
-// BufferState carries an independent `vector<bool>` bitmap.
+// Page-granularity bitmap allocator, one instance per (node_id, tier) pair
+// (owned by Master on the control plane, or by PeerDramAllocator on the peer).
+// Internally holds N BufferState entries (one per physical buffer registered
+// by the Client at RegisterClient time); each BufferState carries an
+// independent `vector<bool>` bitmap.
 //
 // Allocation strategy:
 //   1. same-buffer continuous run  (best — single-RDMA-friendly)
@@ -59,12 +45,9 @@ struct AllocResult {
 // All-or-nothing semantic: if no strategy can satisfy `num_pages`, the call
 // returns std::nullopt and **no bitmap bit is touched**.
 //
-// THREAD SAFETY: PageBitmapAllocator holds NO internal mutex.  Every
-// entry-point that reaches into a PageBitmapAllocator (RoutePut, RouteGet,
-// Heartbeat, eviction, Reaper) is already serialized by
-// `ClientRegistry::mutex_`.  Adding a second internal lock would only
-// introduce a two-tier locking order with no benefit.  Do NOT call any
-// method on this class without holding the owning ClientRegistry mutex.
+// THREAD SAFETY: PageBitmapAllocator holds NO internal mutex.  Callers MUST
+// serialize every method via the owning object's mutex (e.g.
+// `ClientRegistry::mutex_` on master, `PeerDramAllocator::mutex_` on peer).
 class PageBitmapAllocator {
  public:
   struct BufferState {
@@ -101,9 +84,9 @@ class PageBitmapAllocator {
     }
   }
 
-  // All-or-nothing allocate.  Returns nullopt for num_pages == 0 or when no
-  // strategy can satisfy the request.  See class doc for strategy ordering.
-  std::optional<AllocResult> Allocate(uint32_t num_pages) {
+  // All-or-nothing allocate.  See class doc for strategy ordering; nullopt
+  // leaves every bitmap bit untouched.
+  std::optional<std::vector<PageLocation>> Allocate(uint32_t num_pages) {
     if (num_pages == 0) return std::nullopt;
 
     // Strategy 1: same-buffer continuous run.
@@ -119,7 +102,7 @@ class PageBitmapAllocator {
           pages.push_back({buf.buffer_index, idx});
         }
         buf.free_count -= num_pages;
-        return BuildAllocResult(std::move(pages));
+        return pages;
       }
     }
 
@@ -135,7 +118,7 @@ class PageBitmapAllocator {
         pages.push_back({buf.buffer_index, idx});
       }
       buf.free_count -= num_pages;
-      return BuildAllocResult(std::move(pages));
+      return pages;
     }
 
     // Strategy 3: cross-buffer discrete pages (greedy, in buffer-index order).
@@ -160,7 +143,7 @@ class PageBitmapAllocator {
       buf.free_count -= take;
       remaining -= take;
     }
-    return BuildAllocResult(std::move(pages));
+    return pages;
   }
 
   // Idempotent free: for each entry, only flip true -> false.  Out-of-range
@@ -198,36 +181,8 @@ class PageBitmapAllocator {
 
   // Read-only access to per-buffer state (e.g. for diagnostics / Heartbeat
   // status reporting).  Returned reference is invalidated by any subsequent
-  // mutating call; callers under the ClientRegistry mutex are safe.
+  // mutating call; callers holding the owning object's mutex are safe.
   const std::vector<BufferState>& Buffers() const { return buffers_; }
-
-  // Serialize a list of PageLocation into the canonical location_id string.
-  // - Pages are grouped by buffer_index (ascending).
-  // - Within each group, page_index values are emitted in ascending order.
-  // - Empty input returns an empty string.
-  // Example: [(0,2),(0,1),(1,0)] -> "0:p1,2;1:p0".
-  static std::string BuildLocationId(const std::vector<PageLocation>& pages) {
-    if (pages.empty()) return std::string();
-    std::map<uint32_t, std::vector<uint32_t>> by_buf;
-    for (const auto& p : pages) by_buf[p.buffer_index].push_back(p.page_index);
-    std::string s;
-    bool first_buf = true;
-    for (auto& kv : by_buf) {
-      auto& idxs = kv.second;
-      std::sort(idxs.begin(), idxs.end());
-      if (!first_buf) s += ';';
-      first_buf = false;
-      s += std::to_string(kv.first);
-      s += ":p";
-      bool first_p = true;
-      for (auto i : idxs) {
-        if (!first_p) s += ',';
-        first_p = false;
-        s += std::to_string(i);
-      }
-    }
-    return s;
-  }
 
  private:
   // Find a contiguous run of `n` free pages in `buf`.  Returns the starting
@@ -255,13 +210,6 @@ class PageBitmapAllocator {
       if (!buf.bitmap[i]) result.push_back(i);
     }
     return result;
-  }
-
-  static AllocResult BuildAllocResult(std::vector<PageLocation> pages) {
-    AllocResult r;
-    r.location_id = BuildLocationId(pages);
-    r.pages = std::move(pages);
-    return r;
   }
 
   uint64_t page_size_;
