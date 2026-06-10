@@ -69,7 +69,30 @@ static int g_rank = 0;
 
 static const size_t PER_RANK_VMM_SIZE = 256ULL * 1024 * 1024;
 
-static constexpr mori::core::ProviderType kPrvdType = mori::core::ProviderType::PSD;
+// Dispatch a kernel launch to the ccoGda<PrvdType> instantiation matching the
+// DevComm's RDMA backend (devComm.ibgda.providerType), resolved at runtime. `P`
+// is a constexpr ProviderType usable as a template argument in the launch expr.
+#define CCO_GDA_DISPATCH(prvd, ...)                                          \
+  do {                                                                       \
+    switch (prvd) {                                                          \
+      case mori::core::ProviderType::BNXT: {                                 \
+        constexpr auto P = mori::core::ProviderType::BNXT;                   \
+        __VA_ARGS__;                                                         \
+      } break;                                                               \
+      case mori::core::ProviderType::MLX5: {                                 \
+        constexpr auto P = mori::core::ProviderType::MLX5;                   \
+        __VA_ARGS__;                                                         \
+      } break;                                                               \
+      case mori::core::ProviderType::PSD: {                                  \
+        constexpr auto P = mori::core::ProviderType::PSD;                    \
+        __VA_ARGS__;                                                         \
+      } break;                                                               \
+      default:                                                               \
+        fprintf(stderr, "[cco gda test] unsupported GDA provider %d\n",      \
+                static_cast<int>(prvd));                                     \
+        _exit(1);                                                            \
+    }                                                                        \
+  } while (0)
 
 // ── kernel: round 1 — SignalInc ─────────────────────────────────────────────
 //
@@ -201,7 +224,8 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
 
   // ── round 1: SignalInc ────────────────────────────────────────────────────
   printf("[rank %d] round 1: SignalInc\n", rank);
-  GdaSignalIncKernel<kPrvdType><<<1, nranks, 0, stream>>>(devComm);
+  CCO_GDA_DISPATCH(devComm.ibgda.providerType,
+                   GdaSignalIncKernel<P><<<1, nranks, 0, stream>>>(devComm));
   HIP_CHECK(hipStreamSynchronize(stream));
   printf("[rank %d] round 1 passed\n", rank);
 
@@ -210,13 +234,15 @@ static int run_test(int rank, int nranks, mori::application::BootstrapNetwork* b
   // ── round 2: resetSignal + SignalAdd ─────────────────────────────────────
   // reset must be globally complete before any rank sends round-2 signals.
   printf("[rank %d] round 2: resetSignal\n", rank);
-  GdaSignalResetKernel<kPrvdType><<<1, nranks, 0, stream>>>(devComm);
+  CCO_GDA_DISPATCH(devComm.ibgda.providerType,
+                   GdaSignalResetKernel<P><<<1, nranks, 0, stream>>>(devComm));
   HIP_CHECK(hipStreamSynchronize(stream));
 
   mori::cco::ccoBarrierAll(comm);  // all ranks reset before any sends
 
   printf("[rank %d] round 2: SignalAdd\n", rank);
-  GdaSignalAddKernel<kPrvdType><<<1, nranks, 0, stream>>>(devComm);
+  CCO_GDA_DISPATCH(devComm.ibgda.providerType,
+                   GdaSignalAddKernel<P><<<1, nranks, 0, stream>>>(devComm));
   HIP_CHECK(hipStreamSynchronize(stream));
   printf("[rank %d] round 2 passed\n", rank);
 
