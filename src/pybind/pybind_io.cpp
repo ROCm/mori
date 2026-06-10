@@ -81,6 +81,7 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def_readwrite("chunk_bytes", &mori::io::RdmaBackendConfig::chunkBytes)
       .def_readwrite("max_chunks_per_transfer", &mori::io::RdmaBackendConfig::maxChunksPerTransfer)
       .def_readwrite("num_nics_per_transfer", &mori::io::RdmaBackendConfig::numNicsPerTransfer)
+      .def_readwrite("nic_select_by_dest_gpu", &mori::io::RdmaBackendConfig::nicSelectByDestGpu)
       .def_readwrite("max_send_wr", &mori::io::RdmaBackendConfig::maxSendWr)
       .def_readwrite("max_cqe_num", &mori::io::RdmaBackendConfig::maxCqeNum)
       .def_readwrite("max_msg_sge", &mori::io::RdmaBackendConfig::maxMsgSge);

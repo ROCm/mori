@@ -72,6 +72,9 @@ struct RdmaBackendConfig : public BackendConfig {
   size_t chunkBytes{65536};
   int maxChunksPerTransfer{64};
   int numNicsPerTransfer{1};
+  // Rail-only topology: pick the local NIC by the destination GPU id (assumes a uniform physical
+  // topology across the cluster), so cross-node QPs always stay on the same rail.
+  bool nicSelectByDestGpu{false};
 
   int maxSendWr{0};
   int maxCqeNum{0};
@@ -84,8 +87,9 @@ inline std::ostream& operator<<(std::ostream& os, const RdmaBackendConfig& c) {
             << c.enableNotification << "] notifPerQp[" << c.notifPerQp
             << "] enableTransferChunking[" << c.enableTransferChunking << "] chunkBytes["
             << c.chunkBytes << "] maxChunksPerTransfer[" << c.maxChunksPerTransfer
-            << "] numNicsPerTransfer[" << c.numNicsPerTransfer << "] maxSendWr[" << c.maxSendWr
-            << "] maxCqeNum[" << c.maxCqeNum << "] maxMsgSge[" << c.maxMsgSge << "]";
+            << "] numNicsPerTransfer[" << c.numNicsPerTransfer << "] nicSelectByDestGpu["
+            << c.nicSelectByDestGpu << "] maxSendWr[" << c.maxSendWr << "] maxCqeNum["
+            << c.maxCqeNum << "] maxMsgSge[" << c.maxMsgSge << "]";
 }
 
 struct XgmiBackendConfig : public BackendConfig {

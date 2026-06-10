@@ -173,6 +173,7 @@ See `examples/io/example.py` for more complete examples including batch transfer
 | `RdmaBackendConfig.chunk_bytes` | Chunk size when chunking is on (default `65536` = 64 KB). Messages ≤ this are unchanged. Env: `MORI_IO_CHUNK_BYTES` |
 | `RdmaBackendConfig.max_chunks_per_transfer` | Cap on chunks per transfer to bound WR/SQ usage (default `64`). Env: `MORI_IO_MAX_CHUNKS` |
 | `RdmaBackendConfig.num_nics_per_transfer` | Stripe a transfer across this many NICs (default `1`). Adaptive by memory type: GPU memory stays single-NIC (PCIe-bound); host memory stripes across NUMA-local NICs. Env: `MORI_IO_NUM_NICS_PER_TRANSFER` |
+| `RdmaBackendConfig.nic_select_by_dest_gpu` | Rail-only topology: select the local NIC by the destination GPU id so cross-node QPs stay on the same rail (default `False`). Assumes a uniform physical topology across the cluster. Only affects transfers whose remote memory is on a GPU. Env: `MORI_IO_NIC_SELECT_BY_DEST_GPU` |
 | `IOEngineConfig.port = 0` | Auto-bind to a free port |
 | `MORI_IBVERBS_LIB` | Path/soname of libibverbs to `dlopen` at runtime — MORI-IO loads libibverbs dynamically rather than linking it. Set to point at an out-of-tree libibverbs; defaults to `libibverbs.so` / `libibverbs.so.1`. |
 

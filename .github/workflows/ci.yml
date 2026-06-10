@@ -435,6 +435,7 @@ jobs:
             rdma_sl: 3
             rdma_tc: 104
             ct: podman
+            rail_only: true
           - platform: MI300X_BNXT
             runner: [self-hosted, MI300X-BNXT]
             node1_host: 10.245.128.61
@@ -446,6 +447,7 @@ jobs:
             rdma_sl: 3
             rdma_tc: 104
             ct: docker
+            rail_only: false
     env:
       CT: ${{ matrix.ct }}
       SSH_OPTS: -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
@@ -569,6 +571,36 @@ jobs:
             --enable-batch-transfer --enable-sess --poll_cq_mode event \
             --num-qp-per-transfer 2 \
             --num-initiator-dev 8 --num-target-dev 8
+          wait
+
+      - name: MORI-IO internode cross-rail (nic_select_by_dest_gpu)
+        if: ${{ matrix.rail_only }}
+        run: |
+          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_io_benchmark.sh"
+          PORT=29123
+          # Rail-only fabric: pair initiator GPU i with target GPU (i+5)%8 so every
+          # transfer crosses rails (e.g. GPU0 -> GPU5). This only succeeds when
+          # MORI_IO_NIC_SELECT_BY_DEST_GPU=1 keeps both ends on the destination GPU's
+          # rail; without it the local NIC follows the source GPU and the QP would span
+          # two rails and fail on this fabric.
+          echo "=== MORI-IO internode benchmark: cross-rail write (offset 5) port=$PORT ==="
+          NODE2_CMD=(
+            $CT exec -e MORI_IO_NIC_SELECT_BY_DEST_GPU=1 $CONTAINER bash $SCRIPT
+            --rank 1 --master-addr $NODE1_HOST --master-port $PORT
+            --ifname $NODE2_IFNAME
+            -- --op-type write --buffer-size 4096 --transfer-batch-size 64 --iters 4
+            --enable-batch-transfer --enable-sess
+            --num-qp-per-transfer 2
+            --num-initiator-dev 8 --num-target-dev 8 --target-dev-offset 5
+          )
+          ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
+          $CT exec -e MORI_IO_NIC_SELECT_BY_DEST_GPU=1 $CONTAINER bash $SCRIPT \
+            --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+            --ifname $NODE1_IFNAME \
+            -- --op-type write --buffer-size 4096 --transfer-batch-size 64 --iters 4 \
+            --enable-batch-transfer --enable-sess \
+            --num-qp-per-transfer 2 \
+            --num-initiator-dev 8 --num-target-dev 8 --target-dev-offset 5
           wait
 
       - name: MORI-IO internode CPU memory sweep (chunking + 4 NIC x 4 QP)

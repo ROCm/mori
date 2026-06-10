@@ -483,6 +483,11 @@ application::RdmaDeviceContext* RdmaManager::GetRdmaDeviceContext(int devId) {
   return deviceCtxs[devId];
 }
 
+std::string RdmaManager::GetDeviceName(int devId) {
+  if (devId < 0 || devId >= static_cast<int>(availDevices.size())) return "";
+  return availDevices[devId].first->Name();
+}
+
 std::vector<std::shared_ptr<EndpointRuntime>> RdmaManager::SnapshotEndpointRuntimes() {
   std::shared_lock<std::shared_mutex> lock(mu);
   std::vector<std::shared_ptr<EndpointRuntime>> result;
@@ -897,7 +902,14 @@ void ControlPlaneServer::BuildRdmaConn(EngineKey ekey, TopoKeyPair topo, int nic
   }
 
   int requestedNics = ResolveRequestedNics(config, topo.local, topo.remote);
-  auto candidates = rdma->Search(topo.local, requestedNics);
+  // Rail-only: select the local NIC by the destination GPU id so this QP stays on the same rail as
+  // the remote NIC. The responder picks its NIC from topo.remote (its own GPU), which matches.
+  TopoKey searchKey = topo.local;
+  if (config.nicSelectByDestGpu && topo.remote.loc == MemoryLocationType::GPU) {
+    searchKey.deviceId = topo.remote.deviceId;
+    searchKey.loc = MemoryLocationType::GPU;
+  }
+  auto candidates = rdma->Search(searchKey, requestedNics);
   assert(!candidates.empty());
   int rank = std::min<int>(nicRank, static_cast<int>(candidates.size()) - 1);
   auto [devId, weight] = candidates[rank];
@@ -913,8 +925,9 @@ void ControlPlaneServer::BuildRdmaConn(EngineKey ekey, TopoKeyPair topo, int nic
   EndpointId eid = rdma->ConnectEndpoint(ekey, devId, lep, msg.devId, msg.eph, topo, weight);
   auto ert = rdma->GetEndpointRuntime(eid);
   notif->RegisterEndpoint(ert);
-  MORI_IO_INFO("Built RdmaConn for engine {} with topo local({},{}) remote({},{})", ekey,
-               topo.local.deviceId, topo.local.loc, topo.remote.deviceId, topo.remote.loc);
+  MORI_IO_INFO("Built RdmaConn for engine {} with topo local({},{}) remote({},{}) local nic {}",
+               ekey, topo.local.deviceId, topo.local.loc, topo.remote.deviceId, topo.remote.loc,
+               rdma->GetDeviceName(devId));
   ctx->CloseEndpoint(tcph);
 }
 
@@ -992,6 +1005,10 @@ void ControlPlaneServer::HandleControlPlaneProtocol(int fd) {
           rdma->ConnectEndpoint(msg.ekey, devId, lep, rdevId, msg.eph, msg.topo, weight);
       auto ert = rdma->GetEndpointRuntime(eid);
       notif->RegisterEndpoint(ert);
+      MORI_IO_INFO(
+          "Accepted RdmaConn for engine {} with topo local({},{}) remote({},{}) local nic {}",
+          msg.ekey, msg.topo.local.deviceId, msg.topo.local.loc, msg.topo.remote.deviceId,
+          msg.topo.remote.loc, rdma->GetDeviceName(devId));
       p.WriteMessageRegEndpoint(MessageRegEndpoint{myEngKey, msg.topo, devId, lep.handle, rank});
       SYSCALL_RETURN_ZERO(epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL));
       break;
@@ -1213,6 +1230,8 @@ RdmaBackend::RdmaBackend(EngineKey k, const IOEngineConfig& engConfig,
                 mori::env::detail::ParsePositiveInt);
   env::Override("MORI_IO_NUM_NICS_PER_TRANSFER", config.numNicsPerTransfer,
                 mori::env::detail::ParsePositiveInt);
+  env::Override("MORI_IO_NIC_SELECT_BY_DEST_GPU", config.nicSelectByDestGpu,
+                mori::env::detail::ParseBool);
   ValidateRdmaNotificationConfig(config);
   ValidateRdmaTransferConfig(config);
 
