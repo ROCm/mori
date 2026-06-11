@@ -628,6 +628,36 @@ jobs:
             --num-initiator-dev 8 --num-target-dev 8
           wait
 
+      - name: MORI-IO internode cross-rail write (rail affinity)
+        run: |
+          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_io_benchmark.sh"
+          PORT=29125
+          # Cross-rail validation: --target-dev-offset 5 makes GPU-0 pair with GPU-5
+          # (different NUMA → different NIC preference). With MORI_IO_RAIL_AFFINITY=1
+          # the receiver must follow the sender's railId, keeping traffic on-rail.
+          # On a rail-isolated fabric this would fail without rail affinity.
+          echo "=== MORI-IO internode: cross-rail GPU write (offset=5, rail affinity ON) ==="
+          NODE2_CMD=(
+            $CT exec -e MORI_IO_RAIL_AFFINITY=1 $CONTAINER bash $SCRIPT
+            --rank 1 --master-addr $NODE1_HOST --master-port $PORT
+            --ifname $NODE2_IFNAME
+            -- --op-type write --buffer-size 4096 --transfer-batch-size 64
+            --iters 4 --enable-sess --enable-batch-transfer
+            --num-qp-per-transfer 2
+            --num-initiator-dev 8 --num-target-dev 8
+            --target-dev-offset 5
+          )
+          ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
+          $CT exec -e MORI_IO_RAIL_AFFINITY=1 $CONTAINER bash $SCRIPT \
+            --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+            --ifname $NODE1_IFNAME \
+            -- --op-type write --buffer-size 4096 --transfer-batch-size 64 \
+            --iters 4 --enable-sess --enable-batch-transfer \
+            --num-qp-per-transfer 2 \
+            --num-initiator-dev 8 --num-target-dev 8 \
+            --target-dev-offset 5
+          wait
+
       - name: MORI-EP internode normal kernel bench
         run: |
           SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
