@@ -16,7 +16,7 @@ request scheduler/router can consult.
 Existing L3 backends (file, Mooncake, NIXL, HF3FS, …) are passive byte stores:
 SGLang pushes pages down and pulls pages up, and everything the system knows
 about cache placement, temperature, and access economics is invisible to the
-layer that needs it most — the scheduler. UMBP differs in three ways:
+layer that needs it most — the scheduler. UMBP differs in four ways:
 
 1. **Scheduler-friendly, co-designed with mori-sched.** The UMBP master is a
    cluster-wide KV placement directory covering *all* tiers (engine HBM, host
@@ -34,6 +34,8 @@ layer that needs it most — the scheduler. UMBP differs in three ways:
 3. **(WIP) Agent-aware hints.** TTL, session pinning, and priority hints flow
    from the serving API through HiCache into UMBP, so agentic workloads with
    known revisit patterns can shape cache retention explicitly.
+
+4. **AMD hardware affinity by design.** UMBP explores software–hardware codesign opportunities with AMD GPU/CPU/NIC — examples include IBGDA and SDMA transports, GPU Direct Storage, and GPU-initiated NVMe.
 
 The data plane already runs daily in our PD-disaggregation benchmarks
 (`--hicache-storage-backend mori`). This RFC documents the design and proposes
@@ -87,9 +89,10 @@ the remaining integration work in phases.
 ┌───────────┴───┐      ┌───┴───────────┐     ┌───┴───────────┐
 │ SGLang engine │      │ SGLang engine │     │ SGLang engine │
 │ L1 HBM radix  │      │      ...      │     │      ...      │
-│ L2 host pool ←┼── UMBPHostTensorAllocator (hugepage/NUMA)  │
-│ L3 UMBPStore ─┼── IUMBPClient ── peer DRAM pool + SSD tier │
-└───────────────┘        RDMA data plane (zero-copy)         │
+│ L2 host pool ←┼── UMBPHostTensorAllocator (hugepage/NUMA)  │ ◄── Pillar 4
+│ L3 UMBPStore ─┼── IUMBPClient ── peer DRAM pool + SSD tier │     AMD HW
+└───────────────┘        RDMA data plane (zero-copy)         │     affinity
+   codesign examples: IBGDA / SDMA transport · GPU Direct Storage · GPU-initiated NVMe
 ```
 
 The L3 data path (`UMBPStore` ↔ `IUMBPClient`, zero-copy RDMA) and the KV-event
@@ -100,7 +103,8 @@ trains the hit history → placement / eviction / replication policies consume
 it (Pillar 2) → agent hints override where the workload knows better
 (Pillar 3). A prefix that fell out of every engine's HBM but survives in the
 UMBP pool remains routable and is fetched from the nearest replica over RDMA
-instead of being recomputed.
+instead of being recomputed. The whole loop rides on a data plane codesigned
+with AMD hardware (Pillar 4).
 
 ---
 
@@ -131,8 +135,6 @@ import-guarded, so a build without UMBP is unaffected.
     issued directly against the host KV page buffers (no intermediate copy).
 - **Key scheme.** Key construction and MHA / MLA / split-heads handling mirror
   `MooncakeStore`, so existing layouts are reused rather than reinvented.
-- **Eviction depth.** Radix depth from `extra_info.prefix_keys` is forwarded
-  via `BatchPutWithDepth`, enabling depth-aware eviction in the master.
 - **Compatibility.** Existing write / prefetch policy knobs are unchanged.
 
 ### 3.3 Deployment modes
@@ -151,14 +153,12 @@ on AINIC / ROCm.
 
 With `kv_events_subscriber=true`, the `KVEventsSubscriber` in `umbp_store.py` mirrors L1/L2 `BlockStored`/`BlockRemoved` events from SGLang's existing `ZmqEventPublisher` into the master's external-KV index (no engine changes); mori-sched reads it back via `MatchExternalKv` for the `umbp_cache_aware` routing policy, closing the Pillar-1 loop.
 
-**Config & failure handling.** All knobs are passed via
-`--hicache-storage-backend-extra-config` JSON (allow-listed and scope-checked),
-with `UMBP_*` environment-variable fallbacks. A master outage degrades
-gracefully to local-tier serving.
+---
 
-### 3.6 Not yet in SGLang
+## 4. TODO
 
-- **Pillar 2 (mori-side work):** the `PolicyContext` plugin surface and the
-  replication policy.
-- **Pillar 3:** the `cache_hints` extension to `HiCacheStorageExtraInfo`
-  carrying TTL / session / priority.
+- [ ] **Benchmark results.** Publish end-to-end numbers (hit rate, TTFT / ITL, throughput) for UMBP vs. existing L3 backends across standalone/distributed modes and the HBM / DRAM / SSD tiers.
+
+- [ ] **More test coverage.** Extend beyond smoke/unit tests to zero-copy get/set correctness across MHA / MLA / split-heads, depth-aware eviction, distributed multi-rank dedup + RDMA registration, and policy-interface conformance.
+
+- [ ] **mori-scheduler integration.** Promote `umbp_cache_aware` from prefix-match to the full §2 cost model and wire the pluggable policies (Pillar 2) and agent hints (Pillar 3) through to mori-sched.
