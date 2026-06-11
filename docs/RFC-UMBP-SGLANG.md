@@ -10,7 +10,7 @@
 
 This RFC proposes integrating **MORI-UMBP** (Unified Memory & Bandwidth Pool —
 the tiered-storage, distributed KV component of AMD's MORI library) into SGLang
-as a HiCache L3 storage backend **plus** a KV-placement control plane that the
+as a HiCache L3 storage backend **plus** a KV-event feed that the
 request scheduler/router can consult.
 
 Existing L3 backends (file, Mooncake, NIXL, HF3FS, …) are passive byte stores:
@@ -92,8 +92,8 @@ the remaining integration work in phases.
 └───────────────┘        RDMA data plane (zero-copy)         │
 ```
 
-The L3 data path (`UMBPStore` ↔ `IUMBPClient`, zero-copy RDMA) and the control
-path (KV events ↔ master ↔ router) are decoupled: each is useful alone, and
+The L3 data path (`UMBPStore` ↔ `IUMBPClient`, zero-copy RDMA) and the KV-event
+feed (KV events ↔ master ↔ router) are decoupled: each is useful alone, and
 together they close the loop — engine reports placement → master indexes and
 accumulates history → router routes on the cost model (Pillar 1) → routing
 trains the hit history → placement / eviction / replication policies consume
@@ -106,38 +106,59 @@ instead of being recomputed.
 
 ## 3. Implementation details
 
-Current state of the integration (working in our fork, exercised daily by the
-PD-disaggregation benchmarks):
+This section describes the current state of the integration, which runs in our
+fork and is exercised daily by the PD-disaggregation benchmarks. Everything in
+§3.1–§3.5 is implemented; §3.6 lists the work still pending.
 
-- **L3 backend** — `UMBPStore` (`mem_cache/storage/umbp/umbp_store.py`),
-  registered as `mori` in `StorageBackendFactory`, selected via
-  `--hicache-storage-backend mori`. Implements the zero-copy v1
-  `HiCacheStorage` interface: `batch_exists` → `BatchExistsConsecutive`
-  (prefetch probe), `batch_get_v1` / `batch_set_v1` → pointer-based
-  `BatchGet`/`BatchPut` directly against host KV page buffers. Key scheme and
-  MHA/MLA/split-heads handling mirror MooncakeStore; radix depth from
-  `extra_info.prefix_keys` is forwarded via `BatchPutWithDepth` for
-  depth-aware eviction. Existing write/prefetch policy knobs are unchanged.
-- **Modes** — standalone (default): per-rank local DRAM+SSD with automatic
-  rank isolation (per-rank SSD dirs, MLA+TP shared-SSD leader/follower,
-  DP+SPDK tenant quotas). Distributed (`master_address` set): each rank joins
-  the master-led pool with per-rank identities, the host KV buffer registered
-  once for RDMA zero-copy (staging-buffer fallback for capped-MR NICs),
-  master `dram_page_size` auto-derived so one Put/Get = one page = one RDMA
-  op, and cross-DP-rank duplicate puts deduped by the master.
-- **L2 host allocator** — opt-in `UMBPHostTensorAllocator` hook in
-  `memory_pool_host.py`: hugepage + NUMA-bound + prefaulted host KV tensor,
-  which also makes the one-shot RDMA registration reliable on AINIC/ROCm.
-- **Control plane** — `kv_events_subscriber=true` mirrors L1/L2
-  `BlockStored`/`BlockRemoved` events (via SGLang's existing
-  `ZmqEventPublisher`, no engine changes) into the master's external-KV
-  index; mori-sched queries it per request to implement the
-  `umbp_cache_aware` routing policy — closing the Pillar-1 loop.
-- **Config & failure handling** — all knobs via
-  `--hicache-storage-backend-extra-config` JSON (allow-listed,
-  scope-checked) with `UMBP_*` env fallbacks. Flag-gated and import-guarded;
-  master outage degrades to local-tier serving.
+### 3.1 Where the code lives
 
-**Not yet in SGLang:** the `PolicyContext` plugin surface and replication
-policy (Pillar 2, mori-side work), and the `cache_hints` extension to
-`HiCacheStorageExtraInfo` for TTL/session/priority (Pillar 3).
+| Concern | SGLang touchpoint | Backing MORI call |
+| --- | --- | --- |
+| L3 byte store | `mem_cache/storage/umbp/umbp_store.py` (`UMBPStore`) | `BatchGet` / `BatchPut` / `BatchExistsConsecutive` |
+| L2 host buffer | `memory_pool_host.py` (`UMBPHostTensorAllocator` hook) | host KV tensor registration |
+| KV-event feed | `KVEventsSubscriber` in `umbp_store.py` ← `ZmqEventPublisher` (no engine changes) | master external-KV index |
+| Routing | mori-sched (`umbp_cache_aware` policy) | master query per request |
+
+The backend is registered as `mori` in `StorageBackendFactory` and selected
+with `--hicache-storage-backend mori`. The whole integration is flag-gated and
+import-guarded, so a build without UMBP is unaffected.
+
+### 3.2 L3 backend (`UMBPStore`)
+
+- **Interface.** Implements the zero-copy v1 `HiCacheStorage` interface:
+  - `batch_exists` → `BatchExistsConsecutive` (the prefetch probe).
+  - `batch_get_v1` / `batch_set_v1` → pointer-based `BatchGet` / `BatchPut`
+    issued directly against the host KV page buffers (no intermediate copy).
+- **Key scheme.** Key construction and MHA / MLA / split-heads handling mirror
+  `MooncakeStore`, so existing layouts are reused rather than reinvented.
+- **Eviction depth.** Radix depth from `extra_info.prefix_keys` is forwarded
+  via `BatchPutWithDepth`, enabling depth-aware eviction in the master.
+- **Compatibility.** Existing write / prefetch policy knobs are unchanged.
+
+### 3.3 Deployment modes
+
+- **Standalone (default).** Per-rank local DRAM + SSD with automatic rank isolation (per-rank SSD dirs, MLA+TP shared-SSD leader/follower, DP+SPDK tenant quotas).
+- **Distributed (`master_address` set).** Each rank joins the master-led pool with a per-rank identity, the host KV buffer registered once for RDMA zero-copy (staging-buffer fallback for capped-MR NICs), `dram_page_size` auto-derived so one Put/Get = one page = one RDMA op, and cross-DP-rank duplicate puts deduped by the master.
+
+### 3.4 L2 host allocator
+
+Opt-in `UMBPHostTensorAllocator` hook in `memory_pool_host.py`. It allocates a
+hugepage-backed, NUMA-bound, prefaulted host KV tensor. Beyond the allocation
+itself, this layout is what makes the one-shot RDMA registration (§3.3) reliable
+on AINIC / ROCm.
+
+### 3.5 KV-event feed
+
+With `kv_events_subscriber=true`, the `KVEventsSubscriber` in `umbp_store.py` mirrors L1/L2 `BlockStored`/`BlockRemoved` events from SGLang's existing `ZmqEventPublisher` into the master's external-KV index (no engine changes); mori-sched reads it back via `MatchExternalKv` for the `umbp_cache_aware` routing policy, closing the Pillar-1 loop.
+
+**Config & failure handling.** All knobs are passed via
+`--hicache-storage-backend-extra-config` JSON (allow-listed and scope-checked),
+with `UMBP_*` environment-variable fallbacks. A master outage degrades
+gracefully to local-tier serving.
+
+### 3.6 Not yet in SGLang
+
+- **Pillar 2 (mori-side work):** the `PolicyContext` plugin surface and the
+  replication policy.
+- **Pillar 3:** the `cache_hints` extension to `HiCacheStorageExtraInfo`
+  carrying TTL / session / priority.
