@@ -38,9 +38,6 @@
  * Expected per-rank output: all elements = N(N-1)/2 on every rank.
  */
 
-#include <hip/hip_runtime.h>
-#include <mpi.h>
-
 #include <algorithm>
 #include <cstdlib>
 
@@ -48,18 +45,31 @@
 // would drop the wrapped expression together with its side effects. CCO_MUST
 // always evaluates expr and aborts the rank on failure (mpirun then tears down
 // the whole job).
-#define CCO_MUST(expr)                                                            \
-  do {                                                                            \
-    if (!(expr)) {                                                                \
-      std::fprintf(stderr, "[cco lsa test] CHECK FAILED: %s at %s:%d\n", #expr,   \
-                   __FILE__, __LINE__);                                           \
-      std::abort();                                                               \
-    }                                                                             \
+#define CCO_MUST(expr)                                                                    \
+  do {                                                                                    \
+    if (!(expr)) {                                                                        \
+      std::fprintf(stderr, "[cco lsa test] CHECK FAILED: %s at %s:%d\n", #expr, __FILE__, \
+                   __LINE__);                                                             \
+      std::abort();                                                                       \
+    }                                                                                     \
   } while (0)
 #include <cstdio>
 #include <vector>
 
-#include "mori/cco/cco.hpp"  // CCO core header (host + LSA device; no GDA/RDMA)
+#include "cco_test_harness.hpp"
+#include "mori/cco/cco.hpp"  // CCO single header (host + device)
+
+// Tests build with -DNDEBUG (Release), which strips assert(). Re-define an
+// always-on check so the assert(...)-style error handling below stays effective.
+#undef assert
+#define assert(expr)                                                                         \
+  do {                                                                                       \
+    if (!(expr)) {                                                                           \
+      std::fprintf(stderr, "[rank %d] check failed: %s at %s:%d\n", g_rank, #expr, __FILE__, \
+                   __LINE__);                                                                \
+      std::exit(1);                                                                          \
+    }                                                                                        \
+  } while (0)
 
 // Larger vector so the multi-block grid-stride loop actually spreads work
 // across blocks (each rank r contributes a vector of all r's).
@@ -123,22 +133,8 @@ __global__ void lsa_allreduce_kernel(ccoDevComm devComm, ccoWindow_t sendWin, si
 // ===========================================================================
 // Host driver
 // ===========================================================================
-int main(int argc, char* argv[]) {
-#ifndef MORI_WITH_MPI
-  std::fprintf(stderr, "lsa_allreduce requires MORI_WITH_MPI (enable WITH_MPI).\n");
-  return 1;
-#endif
-
-  int rank, nranks;
-  MPI_Init(&argc, &argv);
-  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-  MPI_Comm_size(MPI_COMM_WORLD, &nranks);
-
-  // ── Phase 1: communicator (self-contained bootstrap) ──
-  // MPI is only the launcher + a one-shot broadcast of the cco unique id.
-  ccoUniqueId uid;
-  if (rank == 0) CCO_MUST(ccoGetUniqueId(&uid) == 0);
-  MPI_Bcast(&uid, sizeof(uid), MPI_BYTE, 0, MPI_COMM_WORLD);
+int run_test(int rank, int nranks, mori::application::BootstrapNetwork* bootNet) {
+  g_rank = rank;
 
   // Bind each rank to its own GPU BEFORE ccoCommCreate (which calls
   // hipGetDevice() and pins allocations to the current device).
@@ -147,7 +143,10 @@ int main(int argc, char* argv[]) {
   CCO_MUST(hipSetDevice(rank % hipDevCount) == hipSuccess);
 
   ccoComm* comm = nullptr;
-  CCO_MUST(ccoCommCreate(uid, nranks, rank, 0, &comm) == 0);
+  if (ccoCommCreate(bootNet, /*perRankVmmSize=*/0, &comm) != 0) {
+    std::fprintf(stderr, "[rank %d] CommCreate failed\n", rank);
+    return 1;
+  }
 
   const size_t sizeBytes = NELEMS * sizeof(float);
 
@@ -263,6 +262,10 @@ int main(int argc, char* argv[]) {
   // it down in ccoCommDestroy. MPI is only our launcher + id broadcast, so we
   // finalize it ourselves.
   ccoCommDestroy(comm);
-  MPI_Finalize();
+  printf("[rank %d] %s\n", rank, totalErrors == 0 ? "PASSED" : "FAILED");
   return totalErrors != 0 ? 1 : 0;
+}
+
+int main(int argc, char** argv) {
+  return ccoTestMain(argc, argv, "CCO LSA allreduce", "/tmp/cco_lsa_allreduce_uid", 19883);
 }

@@ -9,7 +9,7 @@
 #                                        ctest entry running under mpirun
 #
 # ctest naming:
-#   test_cco_<x>.cpp  →  ctest "cco_<x>"  (+ "cco_<x>_mpi" when applicable)
+#   test_<x>.cpp  →  ctest "cco_<x>"  (+ "cco_<x>_mpi" when applicable)
 #
 # add a new test by dropping a file here. no further cmake changes needed.
 
@@ -32,8 +32,8 @@ function(_cco_source_contains src needle out_var)
 endfunction()
 
 function(add_cco_test src)
-  get_filename_component(target "${src}" NAME_WE) # e.g. test_cco_gda_put
-  string(REGEX REPLACE "^test_cco_" "" short "${target}") # e.g. gda_put
+  get_filename_component(target "${src}" NAME_WE) # e.g. test_gda_put
+  string(REGEX REPLACE "^test_" "" short "${target}") # e.g. gda_put
 
   _cco_source_contains("${src}" "__global__" uses_hip)
   _cco_source_contains("${src}" "MORI_WITH_MPI" uses_mpi)

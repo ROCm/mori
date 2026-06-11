@@ -40,9 +40,6 @@
  *   mpirun --allow-run-as-root -np 8 ./examples/lsa_barrier
  */
 
-#include <hip/hip_runtime.h>
-#include <mpi.h>
-
 #include <algorithm>
 #include <cstdlib>
 
@@ -50,34 +47,30 @@
 // would drop the wrapped expression together with its side effects. CCO_MUST
 // always evaluates expr and aborts the rank on failure (mpirun then tears down
 // the whole job).
-#define CCO_MUST(expr)                                                            \
-  do {                                                                            \
-    if (!(expr)) {                                                                \
-      std::fprintf(stderr, "[cco lsa test] CHECK FAILED: %s at %s:%d\n", #expr,   \
-                   __FILE__, __LINE__);                                           \
-      std::abort();                                                               \
-    }                                                                             \
+#define CCO_MUST(expr)                                                                    \
+  do {                                                                                    \
+    if (!(expr)) {                                                                        \
+      std::fprintf(stderr, "[cco lsa test] CHECK FAILED: %s at %s:%d\n", #expr, __FILE__, \
+                   __LINE__);                                                             \
+      std::abort();                                                                       \
+    }                                                                                     \
   } while (0)
 #include <cstdio>
 #include <vector>
 
-#include "mori/cco/cco.hpp"  // CCO core header (host + LSA device; no GDA/RDMA)
+#include "cco_test_harness.hpp"
+#include "mori/cco/cco.hpp"  // CCO single header (host + device)
 
 using namespace mori::cco;
 
-#define HIP_CHECK(cmd)                                                                        \
-  do {                                                                                        \
-    hipError_t e = (cmd);                                                                     \
-    if (e != hipSuccess) {                                                                    \
-      std::fprintf(stderr, "HIP error %d (%s) at %s:%d\n", e, hipGetErrorString(e), __FILE__, \
-                   __LINE__);                                                                 \
-      std::exit(1);                                                                           \
-    }                                                                                         \
-  } while (0)
+// HIP_CHECK comes from cco_test_harness.hpp.
 
 static const size_t PER_RANK_VMM_SIZE = 64ULL * 1024 * 1024;
-// One uint32 cookie slot per rank in the symmetric send window.
-static const size_t COOKIE_BYTES = 64;
+// Symmetric send window. Only a few cookie bytes are actually used, but the
+// window must be at least the VMM allocation granularity (the convenience
+// ccoWindowRegister overload fails for sub-granularity sizes), so size it to
+// one page.
+static const size_t COOKIE_BYTES = 4096;
 
 // ============================================================================
 // Device kernels
@@ -279,7 +272,8 @@ __global__ void barrier_preset_kernel(ccoDevComm dc, uint32_t slot, uint32_t val
 struct UtCtx {
   int rank;       // world rank, used for "rank 0 prints" guards
   ccoComm* comm;  // for ccoBarrierAll between cases
-  ccoDevComm dcHost;  // host DevComm struct (filled by ccoDevCommCreate); passed by value to kernels
+  ccoDevComm
+      dcHost;  // host DevComm struct (filled by ccoDevCommCreate); passed by value to kernels
   ccoWindow_t sendWin;
   // Scratch device buffers, reused across cases.
   int* devErrors;  // one int
@@ -616,47 +610,51 @@ static int run_all_tests(UtCtx& ctx) {
 // Host driver — setup, single call to run_all_tests, teardown.
 // ============================================================================
 
-int main(int argc, char* argv[]) {
-#ifndef MORI_WITH_MPI
-  std::fprintf(stderr, "lsa_barrier requires MORI_WITH_MPI (enable WITH_MPI).\n");
-  return 1;
-#endif
+int run_test(int rank, int nranks, mori::application::BootstrapNetwork* bootNet) {
+  g_rank = rank;
 
-  int rank, nranks;
-  MPI_Init(&argc, &argv);
-  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-  MPI_Comm_size(MPI_COMM_WORLD, &nranks);
+  // Bind each rank to its own GPU BEFORE ccoCommCreate (which pins
+  // allocations to the current device).
+  int numDevices = 0;
+  HIP_CHECK(hipGetDeviceCount(&numDevices));
+  HIP_CHECK(hipSetDevice(rank % numDevices));
 
-  // ── Phase 1: communicator (self-contained bootstrap) ──
-  // MPI is only the launcher + a one-shot broadcast of the cco unique id;
-  // cco builds its own socket bootstrap internally from the id.
-  ccoUniqueId uid;
-  if (rank == 0) CCO_MUST(ccoGetUniqueId(&uid) == 0);
-  MPI_Bcast(&uid, sizeof(uid), MPI_BYTE, 0, MPI_COMM_WORLD);
-
-  // Bind each rank to its own GPU BEFORE ccoCommCreate (which calls
-  // hipGetDevice() and pins allocations to the current device).
-  int hipDevCount = 0;
-  HIP_CHECK(hipGetDeviceCount(&hipDevCount));
-  HIP_CHECK(hipSetDevice(rank % hipDevCount));
-
+  // ── Phase 1: communicator ──
   ccoComm* comm = nullptr;
-  CCO_MUST(ccoCommCreate(uid, nranks, rank, PER_RANK_VMM_SIZE, &comm) == 0);
+  if (ccoCommCreate(bootNet, PER_RANK_VMM_SIZE, &comm) != 0) {
+    std::fprintf(stderr, "[rank %d] CommCreate failed\n", rank);
+    return 1;
+  }
 
-  // ── Phase 2: send window (one uint32 cookie slot) ──
+  // ── Phase 2: send window (cookie slots) ──
+  // Allocate then register (the same path the GDA tests use) rather than the
+  // convenience register-and-alloc overload.
   void* sendBuf = nullptr;
   ccoWindow_t sendWin = nullptr;
-  CCO_MUST(ccoWindowRegister(comm, COOKIE_BYTES, &sendWin, &sendBuf) == 0);
+  // NOTE: do NOT use assert() for these — tests are built with -DNDEBUG
+  // (CMAKE_BUILD_TYPE=Release), which strips assert, so a failed call would
+  // silently leave sendBuf=nullptr and surface as a bogus hipMemset error.
+  if (ccoMemAlloc(comm, COOKIE_BYTES, &sendBuf) != 0) {
+    std::fprintf(stderr, "[rank %d] MemAlloc failed\n", rank);
+    return 1;
+  }
   HIP_CHECK(hipMemset(sendBuf, 0, COOKIE_BYTES));
+  if (ccoWindowRegister(comm, sendBuf, COOKIE_BYTES, &sendWin) != 0) {
+    std::fprintf(stderr, "[rank %d] WindowRegister failed\n", rank);
+    return 1;
+  }
 
   // ── Phase 3: DevComm with LSA barrier slots (0..10 used by the UTs) ──
   ccoDevCommRequirements reqs = CCO_DEV_COMM_REQUIREMENTS_INITIALIZER;
   reqs.gdaConnectionType = CCO_GDA_CONNECTION_NONE;
   reqs.lsaBarrierCount = 11;
   ccoDevComm dcHost{};
-  CCO_MUST(ccoDevCommCreate(comm, &reqs, &dcHost) == 0);
+  if (ccoDevCommCreate(comm, &reqs, &dcHost) != 0) {
+    std::fprintf(stderr, "[rank %d] DevCommCreate failed\n", rank);
+    return 1;
+  }
   if (rank == 0) {
-    std::printf("=== LSA barrier example: world=%d lsa=%d ===\n", dcHost.worldSize, dcHost.lsaSize);
+    std::printf("=== LSA barrier: world=%d lsa=%d ===\n", dcHost.worldSize, dcHost.lsaSize);
   }
 
   // ── Scratch buffers reused across UTs ──
@@ -677,12 +675,12 @@ int main(int argc, char* argv[]) {
   ccoDevCommDestroy(comm, &dcHost);
   ccoWindowDeregister(comm, sendWin);
   ccoMemFree(comm, sendBuf);
-
-  // cco owns the internal socket bootstrap (built from the unique id) and tears
-  // it down in ccoCommDestroy. MPI is only our launcher + id broadcast, so we
-  // finalize it ourselves.
   ccoCommDestroy(comm);
 
-  MPI_Finalize();
+  printf("[rank %d] %s\n", rank, fails == 0 ? "PASSED" : "FAILED");
   return fails != 0 ? 1 : 0;
+}
+
+int main(int argc, char** argv) {
+  return ccoTestMain(argc, argv, "CCO LSA barrier", "/tmp/cco_lsa_barrier_uid", 19882);
 }

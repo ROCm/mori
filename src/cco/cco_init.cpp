@@ -88,8 +88,9 @@ int ccoGetUniqueId(ccoUniqueId* uniqueId) {
       if (bind(probeFd, reinterpret_cast<struct sockaddr*>(&probeAddr), sizeof(probeAddr)) == 0) {
         close(probeFd);
         application::UniqueId appUid =
-            ifname ? application::SocketBootstrapNetwork::GenerateUniqueIdWithInterface(ifname, port)
-                   : application::SocketBootstrapNetwork::GenerateUniqueIdWithLocalAddr(port);
+            ifname
+                ? application::SocketBootstrapNetwork::GenerateUniqueIdWithInterface(ifname, port)
+                : application::SocketBootstrapNetwork::GenerateUniqueIdWithLocalAddr(port);
         std::memset(uniqueId, 0, sizeof(*uniqueId));
         std::memcpy(uniqueId, &appUid, sizeof(appUid));
         return 0;
@@ -967,7 +968,8 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
     }
 
     HIP_RUNTIME_CHECK(hipMalloc(&epsGpu, numEps * sizeof(application::RdmaEndpointDevice)));
-    HIP_RUNTIME_CHECK(hipMemcpy(epsGpu, epsHost.data(), numEps * sizeof(application::RdmaEndpointDevice),
+    HIP_RUNTIME_CHECK(hipMemcpy(epsGpu, epsHost.data(),
+                                numEps * sizeof(application::RdmaEndpointDevice),
                                 hipMemcpyHostToDevice));
   }
   ibgda.endpoints = epsGpu;
@@ -1232,9 +1234,8 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
   // holds device pointers (windowTable, endpoints, resource pools) but lives on
   // the host; kernels take it by value.
   *outDevComm = hostShadow;
-  MORI_SHMEM_INFO(
-      "ccoDevCommCreate: rank={} windows={} signals={} counters={} resourceWindow={}", comm->rank,
-      numWindows, signalCount, counterCount, (void*)resourceWindow);
+  MORI_SHMEM_INFO("ccoDevCommCreate: rank={} windows={} signals={} counters={} resourceWindow={}",
+                  comm->rank, numWindows, signalCount, counterCount, (void*)resourceWindow);
 
   // Optional transport map dump, gated on MORI_CCO_LOG_TRANSPORT. Shows each
   // peer's hardware capability (canP2P/canSDMA/canRDMA) alongside whether
