@@ -1,7 +1,6 @@
 #!/bin/bash
 
-# TODO: adapt for MLX (Mellanox/NVIDIA) and BRCM (Broadcom) NICs —
-#       currently ionic-specific (device detection, PFC/DCQCN knobs, port enumeration).
+# TODO: adapt for MLX (Mellanox/NVIDIA) NICs.
 
 set -uo pipefail
 
@@ -336,6 +335,290 @@ check_inter_node_bw() {
                        || log_fail "some inter-node pairs failed"
 }
 
+# =================== bnxt_re (Broadcom) checks =================
+# All three functions below skip gracefully on non-bnxt hosts.
+# They share the BNXT_DEVS / BNXT_ETH_DEVS arrays populated by
+# check_bnxt_versions(); call that one first.
+
+BNXT_DEVS=()        # bnxt_re IB device names      (e.g. bnxt_re_bond0)
+BNXT_ETH_DEVS=()    # corresponding net devices    (e.g. enp30s0f0np0)
+BNXT_NICCLI_IDX=1   # niccli index for first bond  (resolved in check_bnxt_versions)
+
+# Populate BNXT_DEVS and BNXT_ETH_DEVS, check fw/driver/lib versions.
+check_bnxt_versions() {
+    step "check bnxt_re firmware and driver version (Broadcom NICs)"
+
+    local ib_root="/sys/class/infiniband"
+    if [[ ! -d "$ib_root" ]]; then
+        log_skip "RDMA stack not loaded ($ib_root absent)"; return 0
+    fi
+
+    mapfile -t BNXT_DEVS < <(
+        find "$ib_root" -maxdepth 1 -mindepth 1 -type l -printf '%f\n' \
+        | grep '^bnxt_re' | sort -V)
+
+    if [[ ${#BNXT_DEVS[@]} -eq 0 ]]; then
+        log_skip "no bnxt_re devices found, skipping Broadcom checks"; return 0
+    fi
+    log_ok "bnxt_re devices (${#BNXT_DEVS[@]}): ${BNXT_DEVS[*]}"
+
+    # --- kernel modules ---
+    local m disk_ver load_ver
+    for m in bnxt_re bnxt_en; do
+        disk_ver=$(modinfo -F version "$m" 2>/dev/null || true)
+        if [[ -r "/sys/module/$m/version" ]]; then
+            load_ver=$(cat "/sys/module/$m/version")
+        elif lsmod | awk '{print $1}' | grep -qx "$m"; then
+            load_ver="(loaded, no version node)"
+        else
+            load_ver="(not loaded)"
+        fi
+        if [[ "${load_ver:0:1}" != "(" ]]; then
+            log_ok "$m driver : $load_ver"
+            [[ -n "$disk_ver" && "$disk_ver" != "$load_ver" ]] \
+                && log_warn "$m on-disk ($disk_ver) differs from loaded ($load_ver) — reboot needed?"
+        else
+            [[ -n "$disk_ver" ]] && log_ok "$m driver (on-disk) : $disk_ver" \
+                                 || log_fail "$m : not installed"
+        fi
+    done
+
+    # --- RoCE userspace library ---
+    local roce_lib_dir="/usr/local/lib"
+    local found_ver
+    found_ver=$(find "$roce_lib_dir" -maxdepth 2 -name 'libbnxt_re-*.so' 2>/dev/null \
+        | sed -n 's|.*libbnxt_re-\([0-9][0-9.]*\)\.so$|\1|p' | sort -V | tail -1)
+    if [[ -n "$found_ver" ]]; then
+        log_ok "libbnxt_re userspace : $found_ver"
+    else
+        log_warn "libbnxt_re-<ver>.so not found under $roce_lib_dir"
+    fi
+
+    # --- firmware version via niccli -i <idx> show -p per NIC ---
+    if ! command -v niccli >/dev/null 2>&1; then
+        log_fail "niccli not found — cannot check firmware version"; return 1
+    fi
+
+    # get list of NIC indices from niccli -l (first column, skip header)
+    local nic_indices=()
+    mapfile -t nic_indices < <(sudo niccli -l 2>/dev/null | awk 'NR>1 && /^[[:space:]]*[0-9]/{gsub(/[^0-9]/,"",$1); print $1}')
+    if [[ ${#nic_indices[@]} -eq 0 ]]; then
+        log_warn "niccli -l returned no devices; defaulting to index 1"
+        nic_indices=(1)
+    fi
+
+    local pkg_versions=() failed_idxs=()
+    local idx
+    for idx in "${nic_indices[@]}"; do
+        local fw_out pkg_ver
+        fw_out=$(sudo niccli -i "$idx" show -p 2>/dev/null || true)
+        pkg_ver=$(echo "$fw_out" | awk '/Active Package Version/{print $NF}')
+        if [[ -n "$pkg_ver" ]]; then
+            pkg_versions+=("$pkg_ver")
+        else
+            failed_idxs+=("$idx")
+        fi
+    done
+
+    local uniq_fw
+    uniq_fw=$(printf '%s\n' "${pkg_versions[@]}" | sort -u)
+    local uniq_count
+    uniq_count=$(echo "$uniq_fw" | grep -c . || true)
+    if [[ $uniq_count -gt 1 ]]; then
+        log_warn "firmware versions inconsistent across NICs:"
+        for idx in "${nic_indices[@]}"; do
+            local fw_out pkg_ver
+            fw_out=$(sudo niccli -i "$idx" show -p 2>/dev/null || true)
+            pkg_ver=$(echo "$fw_out" | awk '/Active Package Version/{print $NF}')
+            log_warn "  NIC $idx : ${pkg_ver:-unknown}"
+        done
+    elif [[ $uniq_count -eq 1 ]]; then
+        log_ok "firmware : $uniq_fw (consistent across all ${#nic_indices[@]} NICs)"
+    fi
+    [[ ${#failed_idxs[@]} -gt 0 ]] && log_warn "could not read firmware from NIC(s): ${failed_idxs[*]}"
+
+    # --- port state, net device, and niccli index mapping via sysfs ---
+    # Build a PCI->niccli_index map from "niccli -l" output:
+    #   "  1) BCM57608  <mac>  235.2.40.0  0000:06:00.0  NIC  PCI"
+    declare -A _pci2idx=()
+    local niccli_list
+    niccli_list=$(sudo niccli -l 2>/dev/null || true)
+    while IFS= read -r line; do
+        local idx pci
+        idx=$(echo "$line" | awk '/^[[:space:]]*[0-9]+\)/{gsub(/[^0-9]/,"",$1); print $1}')
+        pci=$(echo "$line" | grep -oiE '[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9]' | tr '[:upper:]' '[:lower:]')
+        [[ -n "$idx" && -n "$pci" ]] && _pci2idx["$pci"]="$idx"
+    done < <(echo "$niccli_list")
+
+    local first_idx_set=false
+    local dev state link eth_dev pci_addr
+    local active_count=0 inactive_devs=()
+    for dev in "${BNXT_DEVS[@]}"; do
+        state=$(awk -F': *' '{print $2}' "$ib_root/$dev/ports/1/state" 2>/dev/null || true)
+        link=$(cat "$ib_root/$dev/ports/1/link_layer" 2>/dev/null || true)
+        pci_addr=$(basename "$(readlink -f "$ib_root/$dev/device")" 2>/dev/null || true)
+        eth_dev=$(basename "$(readlink -f "$ib_root/$dev/device/net/"* 2>/dev/null)" 2>/dev/null || true)
+
+        if [[ -n "${_pci2idx[$pci_addr]+x}" ]]; then
+            local dev_idx="${_pci2idx[$pci_addr]}"
+            [[ "$first_idx_set" == "false" ]] && { BNXT_NICCLI_IDX="$dev_idx"; first_idx_set=true; }
+        fi
+
+        local idx_label=""
+        [[ -n "${_pci2idx[$pci_addr]+x}" ]] && idx_label="  niccli_idx=${_pci2idx[$pci_addr]}"
+
+        if [[ "${state:-}" == "ACTIVE" ]]; then
+            (( active_count++ ))
+            log_ok "$dev : pci=$pci_addr  eth=${eth_dev:-?}  state=$state  link=${link:-?}$idx_label"
+        else
+            inactive_devs+=("$dev")
+            log_warn "$dev : pci=$pci_addr  eth=${eth_dev:-?}  state=${state:-?}  link=${link:-?}$idx_label"
+        fi
+        [[ -n "$eth_dev" ]] && BNXT_ETH_DEVS+=("$eth_dev")
+    done
+
+    local total=${#BNXT_DEVS[@]}
+    if [[ ${#inactive_devs[@]} -eq 0 ]]; then
+        log_ok "all $total bnxt_re ports ACTIVE"
+    else
+        log_fail "$active_count/$total ports ACTIVE; not active: ${inactive_devs[*]}"
+    fi
+}
+
+# Check PFC and DSCP-based QoS for bnxt_re via niccli; derive MORI_RDMA_SL / MORI_RDMA_TC.
+check_bnxt_qos() {
+    step "check bnxt_re QoS / PFC (Broadcom NICs)"
+
+    if [[ ${#BNXT_DEVS[@]} -eq 0 ]]; then
+        log_skip "no bnxt_re devices, run check_bnxt_versions first"; return 0
+    fi
+
+    if ! command -v niccli >/dev/null 2>&1; then
+        log_warn "niccli not found, cannot check QoS/PFC"; return 0
+    fi
+
+    local fail=0
+
+    # Use the first bond as the representative (QoS config is homogeneous across NICs).
+    local rep_dev="${BNXT_DEVS[0]}"
+    local nic_idx="$BNXT_NICCLI_IDX"
+
+    # --- lossless TC check: ingress CoSQ ---
+    # Output format:  TC   State     Mode
+    #                  0   Enabled   Lossy
+    #                  1   Enabled   Lossless
+    local ingress_out lossless_tcs=()
+    ingress_out=$(sudo niccli -i "$nic_idx" qos --ingress --cosq --show 2>/dev/null || true)
+    if [[ -z "$ingress_out" ]]; then
+        log_fail "$rep_dev : niccli qos --ingress --cosq --show returned nothing"; return 1
+    fi
+    while IFS= read -r line; do
+        local tc mode
+        tc=$(echo "$line"   | awk '/^[[:space:]]+[0-9]+[[:space:]]+Enabled/{print $1}')
+        mode=$(echo "$line" | awk '/^[[:space:]]+[0-9]+[[:space:]]+Enabled/{print $3}')
+        [[ -n "$tc" && "${mode,,}" == "lossless" ]] && lossless_tcs+=("$tc")
+    done < <(echo "$ingress_out")
+
+    if [[ ${#lossless_tcs[@]} -eq 0 ]]; then
+        log_fail "$rep_dev : no lossless TC configured — PFC not active on NIC"; fail=1
+    else
+        log_ok "$rep_dev : lossless TC(s): ${lossless_tcs[*]}"
+    fi
+
+    # --- lossless bandwidth check: ETS TC Bandwidth ---
+    local ets_out
+    ets_out=$(sudo niccli -i "$nic_idx" qos --ets --show 2>/dev/null || true)
+    if [[ -n "$ets_out" && ${#lossless_tcs[@]} -gt 0 ]]; then
+        local bw_line
+        bw_line=$(echo "$ets_out" | grep -i "TC Bandwidth")
+        if [[ -n "$bw_line" ]]; then
+            local bw_vals=()
+            mapfile -t bw_vals < <(echo "$bw_line" | grep -oE '[0-9]+%' | tr -d '%')
+
+            local total_bw=0 lossless_bw=0
+            for tc in "${lossless_tcs[@]}"; do
+                local bw="${bw_vals[$tc]:-0}"
+                (( lossless_bw += bw ))
+            done
+            for bw in "${bw_vals[@]}"; do
+                (( total_bw += bw ))
+            done
+
+            if [[ $total_bw -eq 0 ]]; then
+                log_ok "$rep_dev : all TCs strict priority (ETS BW = 0%) — lossless TC has absolute precedence"
+            else
+                local pct=$(( lossless_bw * 100 / total_bw ))
+                if (( pct >= 90 )); then
+                    log_ok "$rep_dev : lossless TC bandwidth ${lossless_bw}% / ${total_bw}% total (${pct}% >= 90%)"
+                else
+                    log_fail "$rep_dev : lossless TC bandwidth ${lossless_bw}% / ${total_bw}% total (${pct}% < 90%)"; fail=1
+                fi
+            fi
+        fi
+
+        # PFC status from ETS output
+        local pfc_line
+        pfc_line=$(echo "$ets_out" | grep -i "PFC enabled")
+        if [[ "$pfc_line" == *none* ]]; then
+            log_warn "$rep_dev : DCBx PFC = none"
+        else
+            local pfc_prios
+            pfc_prios=$(echo "$pfc_line" | grep -oE '[0-9]+' | tr '\n' ' ')
+            log_ok "$rep_dev : DCBx PFC enabled on priorities: ${pfc_prios% }"
+        fi
+    fi
+
+    [[ $fail -eq 0 ]]
+}
+
+
+check_bnxt_dcqcn() {
+    step "check bnxt_re DCQCN (Broadcom NICs)"
+
+    if [[ ${#BNXT_DEVS[@]} -eq 0 ]]; then
+        log_skip "no bnxt_re devices, run check_bnxt_versions first"; return 0
+    fi
+
+    local fail=0
+
+    for dev in "${BNXT_DEVS[@]}"; do
+        # Method 1: configfs (CNP_SERVICE_TYPE=0, driver-managed CC)
+        local cc_path="/sys/kernel/config/bnxt_re/$dev/ports/1/cc"
+        if mkdir -p "/sys/kernel/config/bnxt_re/$dev" 2>/dev/null && [[ -d "$cc_path" ]]; then
+            local ecn_enable cc_mode
+            ecn_enable=$(cat "$cc_path/ecn_enable" 2>/dev/null || true)
+            cc_mode=$(cat    "$cc_path/cc_mode"    2>/dev/null || true)
+            rmdir -p "/sys/kernel/config/bnxt_re/$dev" 2>/dev/null || true
+
+            if [[ "$ecn_enable" == "0x1" || "$ecn_enable" == "1" ]] && \
+               [[ "$cc_mode"    == "1" ]]; then
+                log_ok "$dev : DCQCN enabled (ecn_enable=$ecn_enable cc_mode=$cc_mode) [configfs]"
+            else
+                log_fail "$dev : DCQCN not enabled (ecn_enable=${ecn_enable:-?} cc_mode=${cc_mode:-?}) [configfs]"
+                fail=1
+            fi
+            continue
+        fi
+
+        # Method 2: debugfs (CNP_SERVICE_TYPE=1, firmware-managed CC)
+        local debug_info="/sys/kernel/debug/bnxt_re/$dev/info"
+        if [[ -r "$debug_info" ]]; then
+            local prof_type
+            prof_type=$(grep "fw_service_prof_type_sup" "$debug_info" 2>/dev/null | awk '{print $3}')
+            if [[ "$prof_type" == "1" ]]; then
+                log_ok "$dev : DCQCN managed by firmware (fw_service_prof_type_sup=1) [debugfs]"
+            else
+                log_warn "$dev : cannot confirm DCQCN via debugfs (fw_service_prof_type_sup=${prof_type:-?})"
+            fi
+            continue
+        fi
+
+        log_warn "$dev : cannot determine DCQCN status (no configfs or debugfs access)"
+    done
+
+    [[ $fail -eq 0 ]]
+}
+
 check_inter_node_lat() {
     step "inter-node latency check"
 
@@ -363,14 +646,38 @@ check_inter_node_lat() {
 
 # ============================= main =============================
 
-require_cmd nicctl
+# ionic checks require nicctl AND real AMD/ionic NICs on this host.
+# nicctl exits 0 even when no NIC is present, so check the output.
 # [[ $EUID -eq 0 ]] || die "please run as root"
 
 LOCAL_DEVS=()
 
-check_versions
-check_qos
-check_dcqcn
+# detect NIC vendor and run the matching checks
+_have_ionic=false
+if command -v nicctl >/dev/null 2>&1; then
+    _nicctl_out=$(nicctl show version firmware 2>&1 || true)
+    echo "$_nicctl_out" | grep -qi "No AMD NICs" || _have_ionic=true
+    unset _nicctl_out
+fi
+
+_have_bnxt=false
+if [[ -d /sys/class/infiniband ]] && \
+   find /sys/class/infiniband -maxdepth 1 -name 'bnxt_re*' 2>/dev/null | grep -q .; then
+    _have_bnxt=true
+fi
+
+if [[ "$_have_ionic" == "true" ]]; then
+    check_versions
+    check_qos
+    check_dcqcn
+elif [[ "$_have_bnxt" == "true" ]]; then
+    check_bnxt_versions
+    check_bnxt_qos
+    check_bnxt_dcqcn
+else
+    log_warn "no ionic or bnxt_re NICs detected — skipping NIC-specific checks"
+fi
+
 check_intra_node_bw
 check_inter_node_bw
 check_inter_node_lat
