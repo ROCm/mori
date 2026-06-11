@@ -85,6 +85,22 @@ __device__ __forceinline__ SDMA_PKT_ATOMIC CreateAtomicIncPacket(HSAuint64* sign
   return packet;
 }
 
+__device__ __forceinline__ SDMA_PKT_ATOMIC CreateAtomicAddPacket(HSAuint64* signal,
+                                                                 uint64_t value) {
+  SDMA_PKT_ATOMIC packet = {};
+
+  packet.HEADER_UNION.op = SDMA_OP_ATOMIC;
+  packet.HEADER_UNION.operation = SDMA_ATOMIC_ADD64;
+
+  packet.ADDR_LO_UNION.addr_31_0 = (uint32_t)((uintptr_t)signal);
+  packet.ADDR_HI_UNION.addr_63_32 = (uint32_t)((uintptr_t)signal >> 32);
+
+  packet.SRC_DATA_LO_UNION.src_data_31_0 = static_cast<uint32_t>(value);
+  packet.SRC_DATA_HI_UNION.src_data_63_32 = static_cast<uint32_t>(value >> 32);
+
+  return packet;
+}
+
 __device__ __forceinline__ SDMA_PKT_FENCE CreateFencePacket(HSAuint64* address, uint32_t data = 1) {
   SDMA_PKT_FENCE packet = {};
 
@@ -119,24 +135,24 @@ __device__ __forceinline__ bool waitForSignal(HSAuint64* addr, uint64_t expected
 
 struct SdmaQueueDeviceHandle {
 #if defined(__HIPCC__) || defined(__CUDACC__)
-  __device__ __forceinline__ uint64_t WrapIntoRing(uint64_t index) {
+  __device__ __forceinline__ uint64_t WrapIntoRing(uint64_t index) const {
     const uint64_t queue_size_in_bytes = SDMA_QUEUE_SIZE;
     return index % queue_size_in_bytes;
   }
 
-  __device__ __forceinline__ bool CanWriteUpto(uint64_t uptoIndex) {
+  __device__ __forceinline__ bool CanWriteUpto(uint64_t uptoIndex) const {
     const uint64_t queue_size_in_bytes = SDMA_QUEUE_SIZE;
-    if ((uptoIndex - cachedHwReadIndex) < queue_size_in_bytes) {
-      return true;
-    }
+    // if ((uptoIndex - cachedHwReadIndex) < queue_size_in_bytes) {
+    //   return true;
+    // }
     // Only read hardware register if the queue is full based on cached index
-    cachedHwReadIndex = __hip_atomic_load(rptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    uint64_t cachedHwReadIndex = __hip_atomic_load(rptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
     __atomic_signal_fence(__ATOMIC_SEQ_CST);
     return (uptoIndex - cachedHwReadIndex) < queue_size_in_bytes;
   }
 
   __device__ __forceinline__ uint64_t ReserveQueueSpace(const size_t size_in_bytes,
-                                                        uint64_t& offset) {
+                                                        uint64_t& offset) const {
     const uint64_t queue_size_in_bytes = SDMA_QUEUE_SIZE;
 
     uint64_t cur_index;
@@ -171,7 +187,7 @@ struct SdmaQueueDeviceHandle {
 
   template <typename PacketType>
   __device__ __forceinline__ void placePacket(PacketType& packet, uint64_t& pendingWptr,
-                                              uint64_t offset) {
+                                              uint64_t offset) const {
     // Ensure that one warp can write the whole packet
     static_assert(sizeof(PacketType) / sizeof(uint32_t) <= 64);
 
@@ -195,7 +211,7 @@ struct SdmaQueueDeviceHandle {
     pendingWptr += sizeof(PacketType);
   }
 
-  __device__ __forceinline__ void submitPacket(uint64_t base, uint64_t pendingWptr) {
+  __device__ __forceinline__ void submitPacket(uint64_t base, uint64_t pendingWptr) const {
     int retries = 0;
     while (true) {
       uint64_t val = __hip_atomic_load(committedWptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
@@ -236,7 +252,7 @@ struct SdmaQueueDeviceHandle {
 
  private:
   __device__ __forceinline__ bool nontemporal_compare_exchange(uint64_t* vaddr, uint64_t expected,
-                                                               uint64_t value) {
+                                                               uint64_t value) const {
     uint64_t vdst;
     unsigned __int128 vdata = ((unsigned __int128)expected << 64) | value;
     __asm__ __volatile__("flat_atomic_cmpswap_x2 %0, %1, %2 sc0 nt;\n s_waitcnt vmcnt(0); \n\t"
@@ -258,7 +274,7 @@ struct SdmaQueueDeviceHandle {
   uint64_t* cachedWptr;
   uint64_t* committedWptr;
   // local variables
-  uint64_t cachedHwReadIndex;
+  // uint64_t cachedHwReadIndex;
 };
 
 struct SdmaQueueSingleProducerDeviceHandle : SdmaQueueDeviceHandle {};
@@ -267,7 +283,7 @@ static_assert(sizeof(SdmaQueueSingleProducerDeviceHandle) == sizeof(SdmaQueueDev
 
 #if defined(__HIPCC__) || defined(__CUDACC__)
 
-__device__ __forceinline__ void put(SdmaQueueDeviceHandle& handle, void* dst, void* src,
+__device__ __forceinline__ void put(const SdmaQueueDeviceHandle handle, void* dst, void* src,
                                     size_t size) {
   uint64_t offset = 0;
   auto base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_COPY_LINEAR), offset);
@@ -277,7 +293,7 @@ __device__ __forceinline__ void put(SdmaQueueDeviceHandle& handle, void* dst, vo
   handle.submitPacket(base, pendingWptr);
 }
 
-__device__ __forceinline__ void signal(SdmaQueueDeviceHandle& handle, void* signal) {
+__device__ __forceinline__ void signal(const SdmaQueueDeviceHandle handle, void* signal) {
   uint64_t offset;
   auto base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_ATOMIC), offset);
   auto packet = CreateAtomicIncPacket(reinterpret_cast<HSAuint64*>(signal));
@@ -286,7 +302,7 @@ __device__ __forceinline__ void signal(SdmaQueueDeviceHandle& handle, void* sign
   handle.submitPacket(base, pendingWptr);
 }
 
-__device__ __forceinline__ void putWithSignal(SdmaQueueDeviceHandle& handle, void* dst, void* src,
+__device__ __forceinline__ void putWithSignal(const SdmaQueueDeviceHandle handle, void* dst, void* src,
                                               size_t size, void* signal) {
   uint64_t offset = 0;
   auto base =

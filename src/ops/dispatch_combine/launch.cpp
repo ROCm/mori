@@ -445,10 +445,13 @@ void LaunchDispatch(EpDispatchCombineHandle& handle, void* input, void* weights,
   auto& reg = KernelRegistry::Instance();
 
   switch (handle.config.kernelType) {
-    case KernelType::IntraNode:
-      reg.Launch(std::string("EpDispatchIntraNodeKernel_") + sfx, bn, block_x, smem, stream, &args,
-                 args_size);
+    case KernelType::IntraNode: {
+      std::string kernelName =
+          handle.config.enableSdma ? "EpDispatchIntraNodeSdmaKernel_"
+                                   : "EpDispatchIntraNodeKernel_";
+      reg.Launch(kernelName + sfx, bn, block_x, smem, stream, &args, args_size);
       break;
+    }
     case KernelType::InterNode:
       reg.Launch(std::string("EpDispatchInterNodeKernel_") + sfx, bn, block_x, smem, stream, &args,
                  args_size);

@@ -66,6 +66,10 @@ def _current_stream():
     return torch.cuda.current_stream().cuda_stream
 
 
+def _env_flag_enabled(name):
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
 @dataclass
 class EpDispatchCombineConfig:
     """Configuration for :class:`EpDispatchCombineOp`.
@@ -365,6 +369,9 @@ class EpDispatchCombineOp:
     # ------------------------------------------------------------------
     # Kernel launch helpers
     # ------------------------------------------------------------------
+    def _sdma_enabled(self):
+        return self._handle_info.get("enable_sdma", _env_flag_enabled("MORI_ENABLE_SDMA"))
+
     def _resolve_launch_params(
         self,
         block_num,
@@ -566,8 +573,13 @@ class EpDispatchCombineOp:
                 args_ptr,
             )
         elif kt == EpDispatchCombineKernelType.IntraNode.value:
+            kernel = (
+                "EpDispatchIntraNodeSdmaKernel"
+                if self._sdma_enabled()
+                else "EpDispatchIntraNodeKernel"
+            )
             self._launch(
-                f"EpDispatchIntraNodeKernel_{sfx}",
+                f"{kernel}_{sfx}",
                 grid,
                 block,
                 shared_mem,
@@ -1098,8 +1110,13 @@ class EpDispatchCombineOp:
                 args_ptr,
             )
         elif kt == EpDispatchCombineKernelType.IntraNode.value:
+            kernel = (
+                "EpDispatchIntraNodeSdmaKernel"
+                if self._sdma_enabled()
+                else "EpDispatchIntraNodeKernel"
+            )
             self._launch(
-                f"EpDispatchIntraNodeKernel_{sfx}_stdmoe",
+                f"{kernel}_{sfx}_stdmoe",
                 grid,
                 block,
                 shared_mem,

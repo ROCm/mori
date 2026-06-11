@@ -6,6 +6,10 @@ MORI_DEFINE_GPU_STATES
 WRAP_ALL_TYPES_BOOL(EpDispatchIntraNodeKernel, , false)
 WRAP_ALL_TYPES_BOOL(EpDispatchIntraNodeKernel, _stdmoe, true)
 
+// Dispatch SDMA
+WRAP_ALL_TYPES_BOOL(EpDispatchIntraNodeSdmaKernel, , false)
+WRAP_ALL_TYPES_BOOL(EpDispatchIntraNodeSdmaKernel, _stdmoe, true)
+
 // Dispatch Low Lantency (SMALL TOKEN)
 WRAP_ALL_TYPES_BOOL(EpDispatchIntraNodeLLKernel, , false)
 WRAP_ALL_TYPES_BOOL(EpDispatchIntraNodeLLKernel, _stdmoe, true)

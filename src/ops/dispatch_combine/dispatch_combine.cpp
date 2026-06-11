@@ -134,7 +134,7 @@ EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config_
   // because Malloc started returning uncached buffers while Context still
   // believed the transport was P2P.
   config.enableSdma = ShmemSdmaEnabled();
-  MORI_OPS_INFO("EpDispatchCombine SDMA {} (currently only effective for AsyncLL kernel type)",
+  MORI_OPS_INFO("EpDispatchCombine SDMA {}",
                 config.enableSdma ? "enabled" : "disabled");
   if (config.kernelType == KernelType::AsyncLL && !config.enableSdma && config.rank == 0) {
     MORI_OPS_WARN(

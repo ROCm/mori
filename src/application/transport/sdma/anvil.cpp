@@ -209,7 +209,6 @@ SdmaQueue::SdmaQueue(int localDeviceId, int remoteDeviceId, hsa_agent_t& localAg
       .doorbell = queue_.Queue_DoorBell_aql,
       .cachedWptr = cachedWptr_,
       .committedWptr = committedWptr_,
-      .cachedHwReadIndex = (uint64_t)*(queue_.Queue_read_ptr_aql),
   };
 
   CHECK_HIP_ERROR(

@@ -130,6 +130,7 @@ py::dict GetHandleInfo(mori::moe::EpDispatchCombineHandle& handle) {
   info["warp_num_per_block"] = handle.config.warpNumPerBlock;
   info["block_num"] = handle.config.blockNum;
   info["use_external_inp_buffer"] = handle.config.useExternalInpBuffer;
+  info["enable_sdma"] = handle.config.enableSdma;
   info["kernel_type"] = static_cast<int>(handle.config.kernelType);
   info["gpu_per_node"] = handle.config.gpuPerNode;
   info["rdma_block_num"] = handle.config.rdmaBlockNum;
