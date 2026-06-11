@@ -21,6 +21,10 @@
 // SOFTWARE.
 #include "mori/application/transport/rdma/providers/ibverbs/ibverbs.hpp"
 
+#include <cerrno>
+#include <cstring>
+#include <stdexcept>
+
 #include "mori/application/utils/check.hpp"
 #include "mori/utils/mori_log.hpp"
 namespace mori {
@@ -69,7 +73,13 @@ RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& 
   endpoint.ibvHandle.compCh = config.withCompChannel ? ibv_create_comp_channel(context) : nullptr;
   endpoint.ibvHandle.cq =
       ibv_create_cq(context, config.maxCqeNum, NULL, endpoint.ibvHandle.compCh, 0);
-  assert(endpoint.ibvHandle.cq);
+  if (!endpoint.ibvHandle.cq) {
+    MORI_APP_ERROR(
+        "ibv_create_cq failed: errno={} ({}); dev={} max_cqe={} dev_max_cqe={} cqs_in_pool={}",
+        errno, strerror(errno), GetRdmaDevice()->Name(), config.maxCqeNum,
+        deviceAttr->orig_attr.max_cqe, cqPool.size());
+    throw std::runtime_error("ibv_create_cq failed: " + std::string(strerror(errno)));
+  }
 
   // TODO: should also manage the lifecycle of completion channel && srq
   if (config.withCompChannel)
@@ -92,7 +102,16 @@ RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& 
                                  },
                              .qp_type = IBV_QPT_RC};
   endpoint.ibvHandle.qp = ibv_create_qp(pd, &qpAttr);
-  assert(endpoint.ibvHandle.qp);
+  if (!endpoint.ibvHandle.qp) {
+    MORI_APP_ERROR(
+        "ibv_create_qp failed: errno={} ({}); dev={} port={} max_send_wr={} max_recv_wr={} "
+        "max_send_sge={} max_cqe={} dev_caps(max_qp_wr={} max_qp={} max_cqe={}) qps_in_pool={}",
+        errno, strerror(errno), GetRdmaDevice()->Name(), config.portId, qpAttr.cap.max_send_wr,
+        qpAttr.cap.max_recv_wr, qpAttr.cap.max_send_sge, config.maxCqeNum,
+        deviceAttr->orig_attr.max_qp_wr, deviceAttr->orig_attr.max_qp,
+        deviceAttr->orig_attr.max_cqe, qpPool.size());
+    throw std::runtime_error("ibv_create_qp failed: " + std::string(strerror(errno)));
+  }
   endpoint.handle.qpn = endpoint.ibvHandle.qp->qp_num;
 
   if (config.enableSrq)
@@ -208,6 +227,10 @@ IBVerbsDevice::~IBVerbsDevice() {}
 
 RdmaDeviceContext* IBVerbsDevice::CreateRdmaDeviceContext() {
   ibv_pd* pd = ibv_alloc_pd(defaultContext);
+  if (!pd) {
+    MORI_APP_ERROR("ibv_alloc_pd failed: errno={} ({}); dev={}", errno, strerror(errno), Name());
+    throw std::runtime_error("ibv_alloc_pd failed: " + std::string(strerror(errno)));
+  }
   return new IBVerbsDeviceContext(this, pd);
 }
 
