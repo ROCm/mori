@@ -26,10 +26,81 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <thread>
+
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
 
 namespace mori::umbp {
+
+namespace {
+
+#if defined(__x86_64__) || defined(__i386__)
+// Non-temporal AVX2 (256-bit) copy: streaming stores bypass the cache and skip
+// the read-for-ownership (RFO) on dst. This is the right choice for the real
+// batch-get path, where each KV block is read ONCE from cold DRAM and the
+// working set far exceeds L3: a cached copy moves 3x the block bytes through
+// memory (read src + RFO dst + writeback dst), NT moves only 2x (read src +
+// stream-write dst).
+//
+// Width: AVX2 (256-bit), not AVX-512. On Zen4 the 512-bit datapath is
+// double-pumped over 256-bit units, so 512-bit stream stores give no real
+// width advantage and can trip AVX-512 frequency throttling; the NT bottleneck
+// is the write-combining buffer drain rate, which 256-bit already saturates.
+// Measured cold 4 MiB blocks, 8 threads (no pinning) on Zen4 EPYC:
+//   avx2_nt ~134  >  avx512_nt ~130  >  glibc memcpy ~88  >  cached storeu ~77.
+// dst is a host pinned buffer; sfence orders the streaming stores before the
+// subsequent host->device DMA reads it.
+__attribute__((target("avx2"))) void NtCopyAvx2(char* d, const char* s, size_t n) {
+  size_t head = (32 - (reinterpret_cast<uintptr_t>(d) & 31)) & 31;
+  if (head > n) head = n;
+  std::memcpy(d, s, head);
+  size_t i = head;
+  for (; i + 128 <= n; i += 128) {
+    __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i));
+    __m256i b = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i + 32));
+    __m256i c = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i + 64));
+    __m256i e = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i + 96));
+    _mm256_stream_si256(reinterpret_cast<__m256i*>(d + i), a);
+    _mm256_stream_si256(reinterpret_cast<__m256i*>(d + i + 32), b);
+    _mm256_stream_si256(reinterpret_cast<__m256i*>(d + i + 64), c);
+    _mm256_stream_si256(reinterpret_cast<__m256i*>(d + i + 96), e);
+  }
+  for (; i + 32 <= n; i += 32) {
+    __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + i));
+    _mm256_stream_si256(reinterpret_cast<__m256i*>(d + i), a);
+  }
+  if (i < n) std::memcpy(d + i, s + i, n - i);
+  _mm_sfence();
+}
+bool Avx2Supported() { return __builtin_cpu_supports("avx2"); }
+#else
+void NtCopyAvx2(char* d, const char* s, size_t n) { std::memcpy(d, s, n); }
+bool Avx2Supported() { return false; }
+#endif
+
+// Copy one KV block. Large blocks (>= 256 KiB, the real KV-page regime, always
+// cold DRAM) use non-temporal stores (~1.5x over memcpy on Zen4). Tiny blocks
+// fall back to glibc memcpy (its small-copy path is faster and they may be hot).
+// Disable NT via UMBP_DRAM_NT_COPY=0.
+inline void CopyBlock(void* dst, const void* src, size_t size) {
+  static const bool kNt =
+      Avx2Supported() &&
+      !(std::getenv("UMBP_DRAM_NT_COPY") && std::getenv("UMBP_DRAM_NT_COPY")[0] == '0');
+  static const size_t kNtMinBytes = 256ull << 10;
+  if (kNt && size >= kNtMinBytes) {
+    NtCopyAvx2(static_cast<char*>(dst), static_cast<const char*>(src), size);
+  } else {
+    std::memcpy(dst, src, size);
+  }
+}
+
+}  // namespace
 
 DRAMTier::DRAMTier(size_t capacity, bool use_shm, const std::string& shm_name, bool use_hugepages,
                    size_t hugepage_size, int numa_node, bool prefault)
@@ -78,6 +149,16 @@ DRAMTier::DRAMTier(size_t capacity, bool use_shm, const std::string& shm_name, b
 
   // Initialize free list with entire capacity
   free_list_.push_back({0, capacity_});
+
+  // Threads for parallel batch-read CopyBlock. Default 8, override via env,
+  // capped to hardware concurrency. >1 breaks the single-core memcpy ceiling.
+  if (const char* e = std::getenv("UMBP_DRAM_READ_THREADS")) {
+    int v = std::atoi(e);
+    if (v >= 1) read_threads_ = v;
+  }
+  unsigned hc = std::thread::hardware_concurrency();
+  if (hc > 0 && read_threads_ > static_cast<int>(hc)) read_threads_ = static_cast<int>(hc);
+  if (read_threads_ < 1) read_threads_ = 1;
 }
 
 DRAMTier::~DRAMTier() {
@@ -206,6 +287,63 @@ bool DRAMTier::ReadIntoPtr(const std::string& key, uintptr_t dst_ptr, size_t siz
   return true;
 }
 
+std::vector<bool> DRAMTier::ReadBatchIntoPtr(const std::vector<std::string>& keys,
+                                             const std::vector<uintptr_t>& dst_ptrs,
+                                             const std::vector<size_t>& sizes) {
+  const size_t n = keys.size();
+  std::vector<bool> results(n, false);
+  if (n == 0) return results;
+
+  // Hold mu_ for the whole batch. This tier uses a single mutex (reads and
+  // writes are mutually exclusive), so holding it keeps slot offsets valid
+  // during the parallel copy without a use-after-free against Write/Evict/
+  // Clear. The per-block copies still run in parallel within the batch, which
+  // is what breaks the single-core memcpy ceiling on cold DRAM.
+  std::lock_guard<std::mutex> lock(mu_);
+
+  struct Job {
+    void* dst;
+    const void* src;
+    size_t size;
+    size_t idx;
+  };
+  std::vector<Job> jobs;
+  jobs.reserve(n);
+  for (size_t i = 0; i < n; ++i) {
+    auto it = slots_.find(keys[i]);
+    if (it == slots_.end()) continue;
+    if (sizes[i] != it->second.size) continue;
+    jobs.push_back({reinterpret_cast<void*>(dst_ptrs[i]),
+                    static_cast<char*>(base_ptr_) + it->second.offset, sizes[i], i});
+  }
+
+  int num_threads = read_threads_;
+  if (num_threads > static_cast<int>(jobs.size())) num_threads = static_cast<int>(jobs.size());
+
+  if (num_threads <= 1) {
+    for (const auto& j : jobs) {
+      CopyBlock(j.dst, j.src, j.size);
+      results[j.idx] = true;
+    }
+  } else {
+    std::atomic<size_t> next{0};
+    auto worker = [&]() {
+      size_t i;
+      while ((i = next.fetch_add(1)) < jobs.size()) {
+        CopyBlock(jobs[i].dst, jobs[i].src, jobs[i].size);
+      }
+    };
+    std::vector<std::thread> pool;
+    pool.reserve(num_threads);
+    for (int t = 0; t < num_threads; ++t) pool.emplace_back(worker);
+    for (auto& th : pool) th.join();
+    for (const auto& j : jobs) results[j.idx] = true;
+  }
+
+  for (const auto& j : jobs) TouchLRU(keys[j.idx]);
+  return results;
+}
+
 const void* DRAMTier::ReadPtr(const std::string& key, size_t* out_size) {
   std::lock_guard<std::mutex> lock(mu_);
 
@@ -233,6 +371,7 @@ std::vector<char> DRAMTier::Read(const std::string& key) {
 TierCapabilities DRAMTier::Capabilities() const {
   TierCapabilities caps;
   caps.zero_copy_read = true;
+  caps.batch_read = true;  // use the multi-threaded ReadBatchIntoPtr above
   return caps;
 }
 
