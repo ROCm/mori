@@ -1,0 +1,129 @@
+# Manual SAST scan with CodeQL.
+#
+# Compilation happens *inside* the CI docker container (same image as ci.yml),
+# so CodeQL must run inside that container too: its C/C++ analysis works by
+# tracing real compiler invocations, which it cannot do across `docker exec`.
+# The CodeQL CLI bundle is therefore downloaded and driven from within the
+# container, wrapping the project's normal `pip install .` build.
+#
+# Results are written as SARIF, uploaded to the repo's Security > Code scanning
+# tab, and also attached as a build artifact (the report to hand to Security).
+name: CodeQL (manual SAST)
+
+on:
+  workflow_dispatch:
+    inputs:
+      languages:
+        description: "Languages to scan"
+        type: choice
+        default: "cpp,python"
+        options:
+          - "cpp,python"
+          - "cpp"
+          - "python"
+
+permissions:
+  contents: read
+  security-events: write   # required to upload SARIF to the Security tab
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: rocm/mori:ci
+  BASE_IMAGE: rocm/pytorch:rocm7.2.1_ubuntu24.04_py3.12_pytorch_release_2.8.0
+  CONTAINER: mori_codeql_${{ github.run_id }}
+  CT: docker
+  LANGUAGES: ${{ inputs.languages }}
+
+jobs:
+  codeql:
+    name: CodeQL scan (MI355X_AINIC)
+    runs-on: [self-hosted, MI355X-AINIC-TW]
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Build CI image
+        run: $CT build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE -t $IMAGE -f docker/Dockerfile.dev .
+
+      - name: Start container
+        run: |
+          $CT rm -f $CONTAINER 2>/dev/null || true
+          CONTAINER_RUNTIME=$CT ./docker/ci_run.sh --name $CONTAINER \
+            -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
+            -w $GITHUB_WORKSPACE \
+            $IMAGE sleep infinity
+          $CT exec $CONTAINER \
+            git config --global --add safe.directory $GITHUB_WORKSPACE
+
+      - name: Run CodeQL (build + analyze) inside container
+        run: |
+          $CT exec \
+            -e GITHUB_WORKSPACE=$GITHUB_WORKSPACE \
+            -e LANGUAGES="$LANGUAGES" \
+            -e HOST_UID=$(id -u) \
+            -e HOST_GID=$(id -g) \
+            $CONTAINER bash -euo pipefail -c '
+            cd "$GITHUB_WORKSPACE"
+
+            # --- tooling: ensure curl/tar, then fetch the CodeQL CLI bundle ---
+            command -v curl >/dev/null 2>&1 || (apt-get update && apt-get install -y --no-install-recommends curl ca-certificates)
+            mkdir -p /opt/codeql-bundle
+            curl -fsSL -o /tmp/codeql-bundle.tar.gz \
+              https://github.com/github/codeql-action/releases/latest/download/codeql-bundle-linux64.tar.gz
+            tar -xzf /tmp/codeql-bundle.tar.gz -C /opt/codeql-bundle
+            export PATH="/opt/codeql-bundle/codeql:$PATH"
+            codeql --version
+
+            OUT="$GITHUB_WORKSPACE/codeql-results"
+            rm -rf "$OUT" && mkdir -p "$OUT"
+
+            # --- build CodeQL database(s). For cpp, CodeQL traces the real
+            #     compiler calls made by `pip install .`; python needs no build. ---
+            codeql database create "$OUT/db" \
+              --db-cluster \
+              --language="$LANGUAGES" \
+              --command="pip install . -v" \
+              --overwrite
+
+            # --- analyze each language with the security-and-quality suite ---
+            IFS=, read -ra LANGS <<< "$LANGUAGES"
+            for lang in "${LANGS[@]}"; do
+              codeql database analyze "$OUT/db/$lang" \
+                "codeql/${lang}-queries:codeql-suites/${lang}-security-and-quality.qls" \
+                --format=sarif-latest \
+                --output="$OUT/mori-${lang}.sarif" \
+                --sarif-category="$lang"
+            done
+
+            # --- make results readable/owned by the runner user on the host ---
+            chown -R "$HOST_UID:$HOST_GID" "$OUT"
+            ls -la "$OUT"
+          '
+
+      - name: Upload SARIF to code scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: codeql-results
+          wait-for-processing: true
+
+      - name: Upload SARIF as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codeql-sarif-${{ github.run_id }}
+          path: codeql-results/*.sarif
+          if-no-files-found: warn
+
+      - name: Cleanup
+        if: always()
+        run: |
+          $CT rm -f $CONTAINER || true
+          $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE $BASE_IMAGE \
+              chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
