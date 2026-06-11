@@ -168,7 +168,9 @@ struct EpDispatchCombineConfig {
     return numExpertPerToken * sizeof(float);
   }
   inline __host__ __device__ size_t SrcTokenIdBytes() const { return sizeof(index_t); }
-  inline __host__ __device__ size_t ScaleBytes() const { return scaleDim * scaleTypeSize; }
+  inline __host__ __device__ size_t ScaleBytes() const {
+    return static_cast<size_t>(scaleDim) * scaleTypeSize;
+  }
   // Size_t accessors for fields used in token-offset arithmetic.
   // Use these instead of the raw int members to avoid int32 overflow when
   // multiplying by token counts (e.g. tokenId * HiddenDimSz() is size_t * size_t).
