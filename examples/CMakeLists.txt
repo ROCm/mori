@@ -125,7 +125,10 @@ target_link_libraries(intra_node_benchmark mori_collective MPI::MPI_CXX
 target_include_directories(intra_node_benchmark
                            PRIVATE ${CMAKE_SOURCE_DIR}/include)
 
-# CCO examples moved to tests/cpp/cco (test_cco_lsa_*).
+# --- CCO examples ---
+# The CCO LSA examples (lsa_barrier / lsa_allreduce / lsa_memcheck) were moved
+# to tests/cpp/cco/test_cco_lsa_*.cpp, where the auto-discovery harness builds
+# them as MPI ctests. Nothing to register here.
 
 # --- Application examples ---
 add_executable(context application/context.cpp)
