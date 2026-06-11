@@ -149,7 +149,7 @@ def test_engine_desc_port_zero_auto_bind():
 
 
 def test_engine_desc_node_id_env_override(monkeypatch):
-    monkeypatch.setenv("MORI_IO_NODE_ID", "node-id-test")
+    monkeypatch.setenv("MORI_NODE_ID", "node-id-test")
     config = IOEngineConfig(
         host="127.0.0.1",
         port=get_free_port(),

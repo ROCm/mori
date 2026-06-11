@@ -36,6 +36,7 @@
 
 #include "mori/io/env.hpp"
 #include "mori/io/logging.hpp"
+#include "mori/utils/host_utils.hpp"
 #include "src/io/call_diagnostics_internal.hpp"
 #include "src/io/rdma/backend_impl.hpp"
 #include "src/io/xgmi/backend_impl.hpp"
@@ -169,7 +170,7 @@ IOEngine::IOEngine(EngineKey key, IOEngineConfig config) : config(config) {
   desc.key = key;
   char hostname[HOST_NAME_MAX];
   gethostname(hostname, HOST_NAME_MAX);
-  desc.nodeId = ResolveNodeId(hostname);
+  desc.nodeId = mori::ResolveNodeId(hostname);
   desc.hostname = std::string(hostname);
   desc.host = config.host;
   desc.port = config.port;
@@ -439,13 +440,6 @@ std::optional<BackendType> IOEngine::QueryRouteCache(const RouteCacheKey& key) c
     return std::nullopt;
   }
   return it->second;
-}
-
-std::string IOEngine::ResolveNodeId(const std::string& hostname) const {
-  if (auto nodeId = mori::env::GetString("MORI_IO_NODE_ID"); nodeId.has_value()) {
-    return *nodeId;
-  }
-  return hostname;
 }
 
 #define SELECT_BACKEND_AND_RETURN_IF_NONE(local, remote, status, backend)     \
