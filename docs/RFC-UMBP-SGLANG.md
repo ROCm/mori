@@ -1,4 +1,4 @@
-# [RFC] MORI-UMBP: A Scheduler-Codesigned, Policy-Pluggable Multi-Tier KV Cache Backend for SGLang
+# [RFC] Closing the Loop: Co-Designing KV Cache Placement and Request Routing in SGLang with MORI-UMBP
 
 - **Status:** Draft
 - **Author(s):** MORI team (AMD)
