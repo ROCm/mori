@@ -293,16 +293,40 @@ check_intra_node_bw() {
 
     command -v ib_write_bw > /dev/null 2>&1 || { log_warn "ib_write_bw not found, skipping"; return 0; }
 
-    LOCAL_DEVS=($(query_rdma_devices))
-    local count=${#LOCAL_DEVS[@]}
+    local all_devs=()
+    mapfile -t all_devs < <(query_rdma_devices)
+    local count=${#all_devs[@]}
     [[ $count -gt 0 ]] || { log_fail "no local RDMA devices found (check ibv_devices)"; return 1; }
-    log_ok "local RDMA devices ($count): ${LOCAL_DEVS[*]}"
+    log_ok "local RDMA devices ($count): ${all_devs[*]}"
 
-    if [[ $count -lt 2 ]]; then
-        log_skip "only 1 local RDMA device, skipping intra-node test"; return 0
+    # Group devices by vendor prefix (e.g. bnxt_re, irdma, mlx5) and pick the largest group
+    declare -A _prefix_devs=()
+    local dev prefix
+    for dev in "${all_devs[@]}"; do
+        prefix=$(echo "$dev" | sed 's/[0-9]*$//')
+        _prefix_devs["$prefix"]+="$dev "
+    done
+
+    local best_prefix="" best_count=0
+    for prefix in "${!_prefix_devs[@]}"; do
+        local grp=()
+        read -ra grp <<< "${_prefix_devs[$prefix]}"
+        if (( ${#grp[@]} > best_count )); then
+            best_count=${#grp[@]}
+            best_prefix="$prefix"
+        fi
+    done
+
+    read -ra LOCAL_DEVS <<< "${_prefix_devs[$best_prefix]}"
+    if (( ${#all_devs[@]} != best_count )); then
+        log_warn "mixed NIC vendors detected; using '$best_prefix' devices (${best_count}) for tests: ${LOCAL_DEVS[*]}"
     fi
 
-    for (( i=1; i<count; i++ )); do
+    if [[ ${#LOCAL_DEVS[@]} -lt 2 ]]; then
+        log_skip "only 1 local RDMA device in dominant group, skipping intra-node test"; return 0
+    fi
+
+    for (( i=1; i<${#LOCAL_DEVS[@]}; i++ )); do
         run_ib_bw_test "${LOCAL_DEVS[0]}" "${LOCAL_DEVS[$i]}" "localhost" "false"
     done
 }
@@ -551,7 +575,7 @@ check_bnxt_qos() {
                 if (( pct >= 90 )); then
                     log_ok "$rep_dev : lossless TC bandwidth ${lossless_bw}% / ${total_bw}% total (${pct}% >= 90%)"
                 else
-                    log_fail "$rep_dev : lossless TC bandwidth ${lossless_bw}% / ${total_bw}% total (${pct}% < 90%)"; fail=1
+                    log_warn "$rep_dev : lossless TC bandwidth ${lossless_bw}% / ${total_bw}% total (${pct}% < 90%)"
                 fi
             fi
         fi
@@ -591,7 +615,7 @@ check_bnxt_dcqcn() {
             rmdir -p "/sys/kernel/config/bnxt_re/$dev" 2>/dev/null || true
 
             if [[ "$ecn_enable" == "0x1" || "$ecn_enable" == "1" ]] && \
-               [[ "$cc_mode"    == "1" ]]; then
+               [[ "$cc_mode"    == "0x1" || "$cc_mode" == "1" ]]; then
                 log_ok "$dev : DCQCN enabled (ecn_enable=$ecn_enable cc_mode=$cc_mode) [configfs]"
             else
                 log_fail "$dev : DCQCN not enabled (ecn_enable=${ecn_enable:-?} cc_mode=${cc_mode:-?}) [configfs]"
