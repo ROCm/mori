@@ -397,7 +397,7 @@ static void CopyRdmaEndpointsToGpu(ShmemStates* states) {
     return;
   }
 
-  size_t numEndpoints = gpuStates->worldSize * gpuStates->numQpPerPe;
+  size_t numEndpoints = static_cast<size_t>(gpuStates->worldSize) * gpuStates->numQpPerPe;
 
   // Allocate and copy endpoints.
   // Convert from host-side application::RdmaEndpoint (which contains ibverbs handles and QP

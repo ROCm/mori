@@ -111,6 +111,11 @@ jobs:
                 --sarif-category="$lang"
             done
 
+            # --- drop third-party/test/build results. CodeQL paths-ignore is
+            #     not reliably applied to compiled C++, so filter the SARIF
+            #     directly to keep only MoRI code. ---
+            python3 "$GITHUB_WORKSPACE/tools/codeql/filter_sarif.py" "$OUT"/*.sarif
+
             # --- make results readable/owned by the runner user on the host ---
             chown -R "$HOST_UID:$HOST_GID" "$OUT"
             ls -la "$OUT"

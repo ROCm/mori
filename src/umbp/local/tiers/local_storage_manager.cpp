@@ -274,7 +274,7 @@ class ScopedBootstrapLock {
  public:
   explicit ScopedBootstrapLock(const std::string& shm_name) {
     path_ = ::umbp::proxy::ProxyShmRegion::BootstrapLockPath(shm_name);
-    fd_ = open(path_.c_str(), O_CREAT | O_RDWR, 0666);
+    fd_ = open(path_.c_str(), O_CREAT | O_RDWR, 0600);
     if (fd_ < 0) {
       MORI_UMBP_ERROR("LSM: open bootstrap lock '{}' failed: {}", path_, strerror(errno));
       return;

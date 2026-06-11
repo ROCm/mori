@@ -240,7 +240,7 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
       for (size_t q = 0; q < numOfQueuesPerDevice; q++) {
         auto* anvilHandle = anvil::anvil.getSdmaQueue(srcDeviceId, dstDeviceId, q)->deviceHandle();
         HIP_RUNTIME_CHECK(
-            hipMemcpy(&gpuMemObj->deviceHandles_d[dstDeviceId * numOfQueuesPerDevice + q],
+            hipMemcpy(&gpuMemObj->deviceHandles_d[static_cast<size_t>(dstDeviceId) * numOfQueuesPerDevice + q],
                       &anvilHandle, sizeof(anvilHandle), hipMemcpyHostToDevice));
       }
     }

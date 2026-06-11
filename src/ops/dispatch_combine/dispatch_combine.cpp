@@ -242,7 +242,8 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
     bufs.combineOut = ShmemMallocAndReturnMemObjPtr(combineOutSize, hipDeviceMallocUncached);
   }
 
-  size_t maxWeightSize = config.MaxNumTokensToRecv() * config.numExpertPerToken * sizeof(float);
+  size_t maxWeightSize =
+      static_cast<size_t>(config.MaxNumTokensToRecv()) * config.numExpertPerToken * sizeof(float);
   shmemInpWeightsMemObj = ShmemMallocAndReturnMemObjPtr(maxWeightSize, hipDeviceMallocUncached);
   shmemDispatchOutWeightsMemObj =
       ShmemMallocAndReturnMemObjPtr(maxWeightSize, hipDeviceMallocUncached);
@@ -267,7 +268,8 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
     shmemOutScalesMemObj = ShmemMallocAndReturnMemObjPtr(userScaleSize, hipDeviceMallocUncached);
   }
 
-  size_t maxIndicesSize = config.MaxNumTokensToRecv() * config.numExpertPerToken * sizeof(index_t);
+  size_t maxIndicesSize =
+      static_cast<size_t>(config.MaxNumTokensToRecv()) * config.numExpertPerToken * sizeof(index_t);
   shmemInpIndicesMemObj = ShmemMallocAndReturnMemObjPtr(maxIndicesSize, hipDeviceMallocUncached);
   shmemOutIndicesMemObj = ShmemMallocAndReturnMemObjPtr(maxIndicesSize, hipDeviceMallocUncached);
 
@@ -342,7 +344,8 @@ void EpDispatchCombineHandle::FinalizeTokenNumSignalBuf() {
 }
 
 void EpDispatchCombineHandle::InitializeOrderMapBuf() {
-  size_t maxNumOutToken = config.MaxNumTokensToSend() * config.numExpertPerRank;
+  size_t maxNumOutToken =
+      static_cast<size_t>(config.MaxNumTokensToSend()) * config.numExpertPerRank;
   HIP_RUNTIME_CHECK(hipMalloc(&dispReceiverIdxMap, maxNumOutToken * sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(dispReceiverIdxMap, 0, maxNumOutToken * sizeof(index_t)));
 
@@ -373,7 +376,7 @@ void EpDispatchCombineHandle::InitializeOrderMapBuf() {
   HIP_RUNTIME_CHECK(hipMalloc(&dispDestTokIdMap, maxNumOutToken * sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(dispDestTokIdMap, 0, maxNumOutToken * sizeof(index_t)));
 
-  size_t maxNumInterNodeToken = config.worldSize / config.gpuPerNode *
+  size_t maxNumInterNodeToken = static_cast<size_t>(config.worldSize) / config.gpuPerNode *
                                 config.MaxNumTokensToSendPerRank() * config.numExpertPerToken;
   HIP_RUNTIME_CHECK(hipMalloc(&interNodeDispDestTokIdMap, maxNumInterNodeToken * sizeof(index_t)));
   HIP_RUNTIME_CHECK(
@@ -384,8 +387,8 @@ void EpDispatchCombineHandle::InitializeOrderMapBuf() {
   HIP_RUNTIME_CHECK(
       hipMemset(blockFlagCounter, 0, config.worldSize / config.gpuPerNode * sizeof(index_t)));
 
-  size_t interNodeDispSendMapSize =
-      config.worldSize / config.gpuPerNode * config.MaxNumTokensToSendPerRank() * sizeof(index_t);
+  size_t interNodeDispSendMapSize = static_cast<size_t>(config.worldSize) / config.gpuPerNode *
+                                    config.MaxNumTokensToSendPerRank() * sizeof(index_t);
   HIP_RUNTIME_CHECK(hipMalloc(&interNodeDispSendMap, interNodeDispSendMapSize));
   HIP_RUNTIME_CHECK(hipMemset(interNodeDispSendMap, 0, interNodeDispSendMapSize));
 
@@ -435,8 +438,8 @@ void EpDispatchCombineHandle::InitializeBarrier() {
   crossDeviceBarrierMemObj =
       ShmemMallocAndReturnMemObjPtr(barrierSize * 2 * sizeof(uint64_t), hipDeviceMallocUncached);
 
-  size_t interNodeChunkFlagSize =
-      config.worldSize / config.gpuPerNode * config.MaxNumTokensToSendPerRank() * sizeof(uint64_t);
+  size_t interNodeChunkFlagSize = static_cast<size_t>(config.worldSize) / config.gpuPerNode *
+                                  config.MaxNumTokensToSendPerRank() * sizeof(uint64_t);
   interNodeChunkFlagMemObj =
       ShmemMallocAndReturnMemObjPtr(interNodeChunkFlagSize, hipDeviceMallocUncached);
 
