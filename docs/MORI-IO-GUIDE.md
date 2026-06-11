@@ -174,7 +174,7 @@ See `examples/io/example.py` for more complete examples including batch transfer
 | `RdmaBackendConfig.max_chunks_per_transfer` | Cap on chunks per transfer to bound WR/SQ usage (default `64`). Env: `MORI_IO_MAX_CHUNKS` |
 | `RdmaBackendConfig.num_nics_per_transfer` | Stripe a transfer across this many NICs (default `1`). Adaptive by memory type: GPU memory stays single-NIC (PCIe-bound); host memory stripes across NUMA-local NICs. Env: `MORI_IO_NUM_NICS_PER_TRANSFER` |
 | `IOEngineConfig.port = 0` | Auto-bind to a free port |
-| `MORI_IBVERBS_LIB` | soname of libibverbs to `dlopen` at runtime — MORI-IO loads libibverbs dynamically rather than linking it. Must be a bare soname (no path); to use an out-of-tree libibverbs, set `LD_LIBRARY_PATH`. Defaults to `libibverbs.so` / `libibverbs.so.1`. |
+| `LD_LIBRARY_PATH` | MORI-IO loads libibverbs dynamically at runtime (`dlopen` of `libibverbs.so` / `libibverbs.so.1`) rather than linking it. To use an out-of-tree libibverbs, put its directory on `LD_LIBRARY_PATH`. |
 
 UMBP (the upper-layer cache pool) exposes a separate set of runtime-tunable
 env vars for distributed master / pool client / SPDK proxy timing. Those are

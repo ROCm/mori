@@ -54,8 +54,6 @@
 #include <infiniband/verbs.h>
 
 #include <cerrno>
-#include <cstdlib>
-#include <cstring>
 
 #include "mori/utils/mori_log.hpp"
 
@@ -67,25 +65,15 @@
 
 namespace {
 
-// Lazily dlopen libibverbs once. Order: MORI_IBVERBS_LIB override (restricted to
-// a bare soname), then the unversioned and versioned sonames. Returns nullptr if
-// none is found, in which case every shim degrades to a failure return so that
-// RDMA discovery / setup fails gracefully instead of crashing on a host without
-// RDMA.
+// Lazily dlopen libibverbs once, trying the unversioned then the versioned
+// soname. Returns nullptr if neither is found, in which case every shim degrades
+// to a failure return so that RDMA discovery / setup fails gracefully instead of
+// crashing on a host without RDMA. To use an out-of-tree libibverbs, point
+// LD_LIBRARY_PATH at it.
 void* IbvHandle() {
   static void* handle = [] {
-    // MORI_IBVERBS_LIB may override the soname, but reject any value containing a
-    // path separator: a bare soname is resolved only via the trusted dynamic
-    // linker search path, so the override cannot load a library from an
-    // attacker-chosen directory.
-    const char* envLib = std::getenv("MORI_IBVERBS_LIB");
-    if (envLib && std::strchr(envLib, '/') != nullptr) {
-      MORI_APP_WARN("ignoring MORI_IBVERBS_LIB='{}': must be a bare soname, not a path", envLib);
-      envLib = nullptr;
-    }
-    const char* libs[] = {envLib, "libibverbs.so", "libibverbs.so.1"};
+    const char* libs[] = {"libibverbs.so", "libibverbs.so.1"};
     for (const char* lib : libs) {
-      if (!lib || !*lib) continue;
       void* h = dlopen(lib, RTLD_LAZY | RTLD_LOCAL);
       if (h) {
         MORI_APP_TRACE("dlopen({}) succeeded", lib);
@@ -93,7 +81,7 @@ void* IbvHandle() {
       }
       MORI_APP_TRACE("dlopen({}) failed: {}", lib, dlerror());
     }
-    MORI_APP_WARN("failed to dlopen libibverbs (set MORI_IBVERBS_LIB to override)");
+    MORI_APP_WARN("failed to dlopen libibverbs (set LD_LIBRARY_PATH if it is out-of-tree)");
     return static_cast<void*>(nullptr);
   }();
   return handle;
