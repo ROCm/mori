@@ -49,51 +49,7 @@ the remaining integration work in phases.
 
 ### Architecture
 
-```
-  request (+ agent hints: ttl / session_id / pin / priority)        ◄── Pillar 3 (WIP)
-      │
-      ▼
-┌──────────────────────────────────────────────────────────────────┐
-│            Router (mori-sched / sgl-model-gateway)               │
-│                                                                  │ ◄── Pillar 1
-│  score(worker) = α·Σ_tier(matched_tokens[tier]·tier_speedup)     │     scheduler
-│                − β·queue_tokens − γ·tier_pressure − δ·fetch_eta  │     co-design
-└──────────────┬───────────────────────────────────────────────────┘
-               │ MatchExternalKv (per-node, per-tier prefix match;
-               │   count_as_hit trains the hit index)
-               │ GetExternalKvHitCounts / capacity & bw snapshots
-               ▼
-┌──────────────────────────────────────────────────────────────────┐
-│                       UMBP Master (gRPC)                         │
-│                                                                  │
-│  Placement & history (scheduler cost-model inputs)    ◄── Pillar 1
-│   ├─ ExternalKvBlockIndex   engine L1 HBM / L2 DRAM placement    │
-│   ├─ GlobalBlockIndex       UMBP DRAM/HBM/SSD placement          │
-│   │                         + BlockMetrics{access_cnt, recency}  │
-│   ├─ ExternalKvHitIndex     historical per-hash hit counters     │
-│   └─ Prometheus             per-node capacity/utilization,       │
-│                             route counters, bandwidth, latency   │
-│                                                                  │
-│  Pluggable policies (PolicyContext = metrics above)   ◄── Pillar 2
-│   ├─ RouteGetStrategy       load routing  (default: HBM>DRAM>SSD)│
-│   ├─ RoutePutStrategy       offload routing (default: most-avail)│
-│   ├─ EvictionManager        eviction (default: lease-aware LRU;  │
-│   │                         radix depth via BatchPutWithDepth)   │
-│   └─ ReplicationPolicy      (planned: hit-count-driven copies)   │
-│                                                                  │
-│  Hint-aware retention                                 ◄── Pillar 3 (WIP)
-│   └─ TTL / session pin / priority consumed by eviction &         │
-│      replication; session close → bulk revoke                    │
-└───────────▲──────────────▲─────────────────────▲─────────────────┘
-  heartbeat │   KV events  │ report/revoke       │ heartbeat
-┌───────────┴───┐      ┌───┴───────────┐     ┌───┴───────────┐
-│ SGLang engine │      │ SGLang engine │     │ SGLang engine │
-│ L1 HBM radix  │      │      ...      │     │      ...      │
-│ L2 host pool ←┼── UMBPHostTensorAllocator (hugepage/NUMA)  │ ◄── Pillar 4
-│ L3 UMBPStore ─┼── IUMBPClient ── peer DRAM pool + SSD tier │     AMD HW
-└───────────────┘        RDMA data plane (zero-copy)         │     affinity
-   codesign examples: IBGDA / SDMA transport · GPU Direct Storage · GPU-initiated NVMe
-```
+![MORI-UMBP × SGLang architecture](umbp_sglang_architecture.svg)
 
 The L3 data path (`UMBPStore` ↔ `IUMBPClient`, zero-copy RDMA) and the KV-event
 feed (KV events ↔ master ↔ router) are decoupled: each is useful alone, and
