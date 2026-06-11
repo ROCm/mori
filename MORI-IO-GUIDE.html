@@ -608,8 +608,8 @@
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">IOEngineConfig.port</span> <span class="pre">=</span> <span class="pre">0</span></code></p></td>
 <td><p>Auto-bind to a free port</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_IBVERBS_LIB</span></code></p></td>
-<td><p>Path/soname of libibverbs to <code class="docutils literal notranslate"><span class="pre">dlopen</span></code> at runtime — MORI-IO loads libibverbs dynamically rather than linking it. Set to point at an out-of-tree libibverbs; defaults to <code class="docutils literal notranslate"><span class="pre">libibverbs.so</span></code> / <code class="docutils literal notranslate"><span class="pre">libibverbs.so.1</span></code>.</p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">LD_LIBRARY_PATH</span></code></p></td>
+<td><p>MORI-IO loads libibverbs dynamically at runtime (<code class="docutils literal notranslate"><span class="pre">dlopen</span></code> of <code class="docutils literal notranslate"><span class="pre">libibverbs.so</span></code> / <code class="docutils literal notranslate"><span class="pre">libibverbs.so.1</span></code>) rather than linking it. To use an out-of-tree libibverbs, put its directory on <code class="docutils literal notranslate"><span class="pre">LD_LIBRARY_PATH</span></code>.</p></td>
 </tr>
 </tbody>
 </table>

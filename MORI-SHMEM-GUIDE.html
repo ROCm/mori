@@ -673,8 +673,8 @@
 <td><p>RDMA NIC selection. Include: <code class="docutils literal notranslate"><span class="pre">mlx5_0,mlx5_1</span></code>. Exclude: <code class="docutils literal notranslate"><span class="pre">^mlx5_2,mlx5_3</span></code></p></td>
 <td><p>All available</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_IBVERBS_LIB</span></code></p></td>
-<td><p>Path/soname of libibverbs to <code class="docutils literal notranslate"><span class="pre">dlopen</span></code> at runtime (mori loads libibverbs dynamically instead of linking it). Set this to point at an out-of-tree libibverbs.</p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">LD_LIBRARY_PATH</span></code></p></td>
+<td><p>mori loads libibverbs dynamically at runtime (<code class="docutils literal notranslate"><span class="pre">dlopen</span></code>) instead of linking it; to use an out-of-tree libibverbs, put its directory here.</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">libibverbs.so</span></code> / <code class="docutils literal notranslate"><span class="pre">libibverbs.so.1</span></code></p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_NUM_QP_PER_PE</span></code></p></td>
