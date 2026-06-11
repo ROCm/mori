@@ -1,7 +1,7 @@
 # [RFC] MORI-UMBP: A Scheduler-Codesigned, Policy-Pluggable Multi-Tier KV Cache Backend for SGLang
 
 - **Status:** Draft
-- **Author(s):** Di Tian (MORI / AMD)
+- **Author(s):** MORI team (AMD)
 - **Tracking:** mori `src/umbp/`, sglang `python/sglang/srt/mem_cache/storage/umbp/`
 
 ---
