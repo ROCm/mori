@@ -19,7 +19,7 @@
 
   <!-- ===================== Router ===================== -->
   <rect x="170" y="102" width="900" height="92" rx="10" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
-  <text x="620" y="128" text-anchor="middle" font-size="16" font-weight="bold" fill="#1e293b">Router  (mori-sched)</text>
+  <text x="620" y="128" text-anchor="middle" font-size="16" font-weight="bold" fill="#1e293b">Scheduler  (mori-sched)</text>
   <text x="620" y="156" text-anchor="middle" font-size="13.5" fill="#1e3a8a">score(worker) = α · Σ_tier ( matched_tokens[tier] · tier_speedup )</text>
   <text x="620" y="176" text-anchor="middle" font-size="13.5" fill="#1e3a8a">− β · queue_tokens  −  γ · tier_pressure  −  δ · fetch_eta</text>
   <rect x="1084" y="120" width="148" height="40" rx="13" fill="#2563eb"/>
