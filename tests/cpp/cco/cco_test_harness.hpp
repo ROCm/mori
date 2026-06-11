@@ -47,6 +47,7 @@
 
 #include "hip/hip_runtime.h"
 #include "mori/application/bootstrap/socket_bootstrap.hpp"
+#include "mori/core/transport/rdma/core_device_types.hpp"  // mori::core::ProviderType
 
 // Current rank, set at the top of each run_test; used by HIP_CHECK diagnostics.
 inline int g_rank = 0;
@@ -58,6 +59,30 @@ inline int g_rank = 0;
       fprintf(stderr, "[rank %d] HIP error %d (%s) at %s:%d\n", g_rank, e, hipGetErrorString(e), \
               __FILE__, __LINE__);                                                               \
       _exit(1);                                                                                  \
+    }                                                                                            \
+  } while (0)
+
+// Run a kernel-launch (or any statement) against the ccoGda<PrvdType> provider
+// matching the DevComm's RDMA backend, resolved at runtime. Inside __VA_ARGS__,
+// `P` is a constexpr mori::core::ProviderType usable as a template argument.
+#define CCO_GDA_DISPATCH(prvd, ...)                                                              \
+  do {                                                                                           \
+    switch (prvd) {                                                                              \
+      case mori::core::ProviderType::BNXT: {                                                     \
+        constexpr auto P = mori::core::ProviderType::BNXT;                                       \
+        __VA_ARGS__;                                                                             \
+      } break;                                                                                   \
+      case mori::core::ProviderType::MLX5: {                                                     \
+        constexpr auto P = mori::core::ProviderType::MLX5;                                       \
+        __VA_ARGS__;                                                                             \
+      } break;                                                                                   \
+      case mori::core::ProviderType::PSD: {                                                      \
+        constexpr auto P = mori::core::ProviderType::PSD;                                        \
+        __VA_ARGS__;                                                                             \
+      } break;                                                                                   \
+      default:                                                                                   \
+        fprintf(stderr, "[cco gda test] unsupported GDA provider %d\n", static_cast<int>(prvd)); \
+        _exit(1);                                                                                \
     }                                                                                            \
   } while (0)
 

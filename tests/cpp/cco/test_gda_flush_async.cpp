@@ -38,50 +38,11 @@
 //   - this test splits into flushAsync(ring only) → waitSignal → wait(poll only),
 //     letting the cq-poll be hidden behind the signal wait
 
-#ifdef MORI_WITH_MPI
-#include <mpi.h>
-
-#include "mori/application/bootstrap/mpi_bootstrap.hpp"
-#endif
-
-#include <sys/wait.h>
-#include <unistd.h>
-
-#include <algorithm>
-#include <cstdio>
-#include <cstring>
-#include <vector>
-
-#include "hip/hip_runtime.h"
-#include "mori/application/bootstrap/socket_bootstrap.hpp"
+#include "cco_test_harness.hpp"
 #include "mori/cco/cco_scale_out.hpp"
 
 static const size_t PER_RANK_VMM_SIZE = 256ULL * 1024 * 1024;
 static const size_t COUNT = 256;  // elements per rank-pair
-
-// Dispatch a kernel launch to the ccoGda<PrvdType> instantiation matching the
-// DevComm's RDMA backend (devComm.ibgda.providerType), resolved at runtime. `P`
-// is a constexpr ProviderType usable as a template argument in the launch expr.
-#define CCO_GDA_DISPATCH(prvd, ...)                                                              \
-  do {                                                                                           \
-    switch (prvd) {                                                                              \
-      case mori::core::ProviderType::BNXT: {                                                     \
-        constexpr auto P = mori::core::ProviderType::BNXT;                                       \
-        __VA_ARGS__;                                                                             \
-      } break;                                                                                   \
-      case mori::core::ProviderType::MLX5: {                                                     \
-        constexpr auto P = mori::core::ProviderType::MLX5;                                       \
-        __VA_ARGS__;                                                                             \
-      } break;                                                                                   \
-      case mori::core::ProviderType::PSD: {                                                      \
-        constexpr auto P = mori::core::ProviderType::PSD;                                        \
-        __VA_ARGS__;                                                                             \
-      } break;                                                                                   \
-      default:                                                                                   \
-        fprintf(stderr, "[cco gda test] unsupported GDA provider %d\n", static_cast<int>(prvd)); \
-        _exit(1);                                                                                \
-    }                                                                                            \
-  } while (0)
 
 // alltoall kernel using flushAsync — one warp per peer for the doorbell ring.
 // signal layout: signal[r] is incremented by peer r.

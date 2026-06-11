@@ -56,14 +56,8 @@
 #include <cstdio>
 #include <vector>
 
-<<<<<<<<HEAD : tests / cpp / cco / test_lsa_allreduce.cpp
 #include "cco_test_harness.hpp"
 #include "mori/cco/cco.hpp"  // CCO single header (host + device)
-        == == == ==
-#include "mori/cco/cco.hpp"  // CCO core header (host + LSA device; no GDA/RDMA)
-        >>>>>>>> dev /
-    cco : tests / cpp / cco /
-          test_cco_lsa_allreduce.cpp
 
 // Tests build with -DNDEBUG (Release), which strips assert(). Re-define an
 // always-on check so the assert(...)-style error handling below stays effective.
@@ -86,7 +80,7 @@
 #define CTA_COUNT (8)
 #define THREADS_PER_CTA (256)
 
-          using namespace mori::cco;
+using namespace mori::cco;
 
 // ===========================================================================
 // Multi-block / multi-slot allreduce kernel — generic over CCo coop type.
@@ -142,38 +136,19 @@ __global__ void lsa_allreduce_kernel(ccoDevComm devComm, ccoWindow_t sendWin, si
 int run_test(int rank, int nranks, mori::application::BootstrapNetwork* bootNet) {
   g_rank = rank;
 
-  < < < < < < < < HEAD : tests / cpp / cco / test_lsa_allreduce.cpp
-      // Bind each rank to its own GPU BEFORE ccoCommCreate (pins allocations to it).
-      == == == == int rank,
-      nranks;
-  MPI_Init(&argc, &argv);
-  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-  MPI_Comm_size(MPI_COMM_WORLD, &nranks);
-
-  // ── Phase 1: communicator (self-contained bootstrap) ──
-  // MPI is only the launcher + a one-shot broadcast of the cco unique id.
-  ccoUniqueId uid;
-  if (rank == 0) CCO_MUST(ccoGetUniqueId(&uid) == 0);
-  MPI_Bcast(&uid, sizeof(uid), MPI_BYTE, 0, MPI_COMM_WORLD);
-
   // Bind each rank to its own GPU BEFORE ccoCommCreate (which calls
   // hipGetDevice() and pins allocations to the current device).
-  >>>>>>>> dev / cco : tests / cpp / cco / test_cco_lsa_allreduce.cpp int hipDevCount = 0;
+  int hipDevCount = 0;
   CCO_MUST(hipGetDeviceCount(&hipDevCount) == hipSuccess);
   CCO_MUST(hipSetDevice(rank % hipDevCount) == hipSuccess);
 
   ccoComm* comm = nullptr;
-  < < < < < < < <
-      HEAD : tests / cpp / cco /
-             test_lsa_allreduce.cpp if (ccoCommCreate(bootNet, /*perRankVmmSize=*/0, &comm) != 0) {
+  if (ccoCommCreate(bootNet, /*perRankVmmSize=*/0, &comm) != 0) {
     std::fprintf(stderr, "[rank %d] CommCreate failed\n", rank);
     return 1;
   }
-  == == == == CCO_MUST(ccoCommCreate(uid, nranks, rank, 0, &comm) == 0);
-  >>>>>>>> dev / cco : tests / cpp / cco /
-                       test_cco_lsa_allreduce.cpp
 
-                       const size_t sizeBytes = NELEMS * sizeof(float);
+  const size_t sizeBytes = NELEMS * sizeof(float);
 
   // ── Phase 2: register send/recv windows + init send buffer ──
   void* sendBuf = nullptr;

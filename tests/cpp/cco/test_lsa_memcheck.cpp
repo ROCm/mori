@@ -37,19 +37,12 @@
  *     ./build/examples/lsa_memcheck [--window-iters W] [--devcomm-iters D]
  */
 
-<<<<<<<<HEAD : tests / cpp / cco / test_lsa_memcheck.cpp
 #include <cassert>
 #include <cstdio>
 #include <cstring>
 
 #include "cco_test_harness.hpp"
 #include "mori/cco/cco.hpp"  // CCO single header (host + device)
-        == == == ==
-#include <hip/hip_runtime.h>
-#include <mpi.h>
-#include <unistd.h>
-
-#include <cstdlib>
 
 // Always-on check: these tests build under -DNDEBUG (Release), where CCO_MUST()
 // would drop the wrapped expression together with its side effects. CCO_MUST
@@ -63,13 +56,6 @@
       std::abort();                                                                       \
     }                                                                                     \
   } while (0)
-#include <cstdio>
-#include <cstring>
-
-#include "mori/cco/cco.hpp"  // CCO core header (host + LSA device; no GDA/RDMA)
-        >>>>>>>> dev /
-    cco : tests / cpp / cco /
-          test_cco_lsa_memcheck.cpp
 
 // Tests build with -DNDEBUG (Release), which strips assert(). Re-define an
 // always-on check so the assert(...)-style error handling below stays effective.
@@ -83,7 +69,7 @@
     }                                                                                        \
   } while (0)
 
-          using namespace mori::cco;
+using namespace mori::cco;
 
 // ── tiny barrier kernel — just enough to exercise the DevComm ──────────────
 __global__ void lsa_barrier_kernel(ccoDevComm devComm) {
@@ -106,35 +92,21 @@ int run_test(int rank, int nranks, mori::application::BootstrapNetwork* bootNet)
     fflush(stdout);
   }
 
-  < < < < < < < < HEAD : tests / cpp / cco / test_lsa_memcheck.cpp == == == ==
-      // ── Phase 1: ccoComm (self-contained bootstrap) ──
-      // MPI is only the launcher + a one-shot broadcast of the cco unique id.
-      ccoUniqueId uid;
-  if (rank == 0) CCO_MUST(ccoGetUniqueId(&uid) == 0);
-  MPI_Bcast(&uid, sizeof(uid), MPI_BYTE, 0, MPI_COMM_WORLD);
-
-  >>>>>>>> dev / cco : tests / cpp / cco /
-                       test_cco_lsa_memcheck.cpp
-                       // Bind each rank to its own GPU BEFORE ccoCommCreate. ccoCommCreate calls
-                       // hipGetDevice() and pins all allocations to the current device, so without
-                       // this every rank would land on GPU 0 (all 8 GB windows stacked on PE0).
-                       int hipDevCount = 0;
+  // Bind each rank to its own GPU BEFORE ccoCommCreate. ccoCommCreate calls
+  // hipGetDevice() and pins all allocations to the current device, so without
+  // this every rank would land on GPU 0 (all 8 GB windows stacked on PE0).
+  int hipDevCount = 0;
   CCO_MUST(hipGetDeviceCount(&hipDevCount) == hipSuccess);
   CCO_MUST(hipSetDevice(rank % hipDevCount) == hipSuccess);
 
   mori::cco::ccoComm* comm = nullptr;
-  < < < < < < < <
-      HEAD : tests / cpp / cco /
-             test_lsa_memcheck.cpp if (ccoCommCreate(bootNet, /*perRankVmmSize=*/0, &comm) != 0) {
+  if (ccoCommCreate(bootNet, /*perRankVmmSize=*/0, &comm) != 0) {
     fprintf(stderr, "[rank %d] CommCreate failed\n", rank);
     return 1;
   }
-  == == == == CCO_MUST(ccoCommCreate(uid, nranks, rank, 0, &comm) == 0);
-  >>>>>>>> dev / cco : tests / cpp / cco /
-                       test_cco_lsa_memcheck.cpp
 
-                       // ── Phase 2: window + devcomm leak loop ──
-                       for (int wi = 0; wi < window_iters; wi++) {
+  // ── Phase 2: window + devcomm leak loop ──
+  for (int wi = 0; wi < window_iters; wi++) {
     // Register a window pair.
     const size_t winBytes = 8ULL << 30;  // 8 GB
     void* buf = nullptr;

@@ -41,7 +41,7 @@
 // Self-contained: does not depend on any shared test harness.
 
 #include "cco_test_harness.hpp"
-#include "mori/cco/cco.hpp"
+#include "mori/cco/cco_scale_out.hpp"
 
 static const size_t PER_RANK_VMM_SIZE = 256ULL * 1024 * 1024;
 

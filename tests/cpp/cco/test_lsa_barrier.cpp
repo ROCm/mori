@@ -58,16 +58,10 @@
 #include <cstdio>
 #include <vector>
 
-<<<<<<<<HEAD : tests / cpp / cco / test_lsa_barrier.cpp
 #include "cco_test_harness.hpp"
 #include "mori/cco/cco.hpp"  // CCO single header (host + device)
-        == == == ==
-#include "mori/cco/cco.hpp"  // CCO core header (host + LSA device; no GDA/RDMA)
-        >>>>>>>> dev /
-    cco : tests / cpp / cco /
-          test_cco_lsa_barrier.cpp
 
-          using namespace mori::cco;
+using namespace mori::cco;
 
 // HIP_CHECK comes from cco_test_harness.hpp.
 
@@ -619,62 +613,32 @@ static int run_all_tests(UtCtx& ctx) {
 int run_test(int rank, int nranks, mori::application::BootstrapNetwork* bootNet) {
   g_rank = rank;
 
-  < < < < < < < < HEAD : tests / cpp / cco /
-                         test_lsa_barrier.cpp
-                         // Bind each rank to its own GPU BEFORE ccoCommCreate (which pins
-                         // allocations to the current device).
-                         int numDevices = 0;
+  // Bind each rank to its own GPU BEFORE ccoCommCreate (which pins
+  // allocations to the current device).
+  int numDevices = 0;
   HIP_CHECK(hipGetDeviceCount(&numDevices));
   HIP_CHECK(hipSetDevice(rank % numDevices));
-  == == == == int rank, nranks;
-  MPI_Init(&argc, &argv);
-  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-  MPI_Comm_size(MPI_COMM_WORLD, &nranks);
 
-  // ── Phase 1: communicator (self-contained bootstrap) ──
-  // MPI is only the launcher + a one-shot broadcast of the cco unique id;
-  // cco builds its own socket bootstrap internally from the id.
-  ccoUniqueId uid;
-  if (rank == 0) CCO_MUST(ccoGetUniqueId(&uid) == 0);
-  MPI_Bcast(&uid, sizeof(uid), MPI_BYTE, 0, MPI_COMM_WORLD);
-
-  // Bind each rank to its own GPU BEFORE ccoCommCreate (which calls
-  // hipGetDevice() and pins allocations to the current device).
-  int hipDevCount = 0;
-  HIP_CHECK(hipGetDeviceCount(&hipDevCount));
-  HIP_CHECK(hipSetDevice(rank % hipDevCount));
-  >>>>>>>> dev / cco : tests / cpp / cco /
-                       test_cco_lsa_barrier.cpp
-
-                       // ── Phase 1: communicator ──
-                       ccoComm* comm = nullptr;
-  < < < < < < < <
-      HEAD : tests / cpp / cco /
-             test_lsa_barrier.cpp if (ccoCommCreate(bootNet, PER_RANK_VMM_SIZE, &comm) != 0) {
+  // ── Phase 1: communicator ──
+  ccoComm* comm = nullptr;
+  if (ccoCommCreate(bootNet, PER_RANK_VMM_SIZE, &comm) != 0) {
     std::fprintf(stderr, "[rank %d] CommCreate failed\n", rank);
     return 1;
   }
-  == == == == CCO_MUST(ccoCommCreate(uid, nranks, rank, PER_RANK_VMM_SIZE, &comm) == 0);
-  >>>>>>>> dev / cco : tests / cpp / cco /
-                       test_cco_lsa_barrier.cpp
 
-                       // ── Phase 2: send window (cookie slots) ──
-                       // Allocate then register (the same path the GDA tests use) rather than the
-                       // convenience register-and-alloc overload.
-                       void* sendBuf = nullptr;
+  // ── Phase 2: send window (cookie slots) ──
+  // Allocate then register (the same path the GDA tests use) rather than the
+  // convenience register-and-alloc overload.
+  void* sendBuf = nullptr;
   ccoWindow_t sendWin = nullptr;
-  < < < < < < < < HEAD : tests / cpp / cco /
-                         test_lsa_barrier.cpp
-                         // NOTE: do NOT use assert() for these — tests are built with -DNDEBUG
-                         // (CMAKE_BUILD_TYPE=Release), which strips assert, so a failed call would
-                         // silently leave sendBuf=nullptr and surface as a bogus hipMemset error.
-                         if (ccoMemAlloc(comm, COOKIE_BYTES, &sendBuf) != 0) {
+  // NOTE: do NOT use assert() for these — tests are built with -DNDEBUG
+  // (CMAKE_BUILD_TYPE=Release), which strips assert, so a failed call would
+  // silently leave sendBuf=nullptr and surface as a bogus hipMemset error.
+  if (ccoMemAlloc(comm, COOKIE_BYTES, &sendBuf) != 0) {
     std::fprintf(stderr, "[rank %d] MemAlloc failed\n", rank);
     return 1;
   }
-  == == == == CCO_MUST(ccoWindowRegister(comm, COOKIE_BYTES, &sendWin, &sendBuf) == 0);
-  >>>>>>>> dev / cco : tests / cpp / cco /
-                       test_cco_lsa_barrier.cpp HIP_CHECK(hipMemset(sendBuf, 0, COOKIE_BYTES));
+  HIP_CHECK(hipMemset(sendBuf, 0, COOKIE_BYTES));
   if (ccoWindowRegister(comm, sendBuf, COOKIE_BYTES, &sendWin) != 0) {
     std::fprintf(stderr, "[rank %d] WindowRegister failed\n", rank);
     return 1;
@@ -685,13 +649,11 @@ int run_test(int rank, int nranks, mori::application::BootstrapNetwork* bootNet)
   reqs.gdaConnectionType = CCO_GDA_CONNECTION_NONE;
   reqs.lsaBarrierCount = 11;
   ccoDevComm dcHost{};
-  < < < < < < < < HEAD : tests / cpp / cco /
-                         test_lsa_barrier.cpp if (ccoDevCommCreate(comm, &reqs, &dcHost) != 0) {
+  if (ccoDevCommCreate(comm, &reqs, &dcHost) != 0) {
     std::fprintf(stderr, "[rank %d] DevCommCreate failed\n", rank);
     return 1;
   }
-  == == == == CCO_MUST(ccoDevCommCreate(comm, &reqs, &dcHost) == 0);
-  >>>>>>>> dev / cco : tests / cpp / cco / test_cco_lsa_barrier.cpp if (rank == 0) {
+  if (rank == 0) {
     std::printf("=== LSA barrier: world=%d lsa=%d ===\n", dcHost.worldSize, dcHost.lsaSize);
   }
 

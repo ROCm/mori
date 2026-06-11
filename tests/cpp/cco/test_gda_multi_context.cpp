@@ -38,7 +38,7 @@
 // (that is the connection create/destroy path we want to stress).
 
 #include "cco_test_harness.hpp"
-#include "mori/cco/cco.hpp"
+#include "mori/cco/cco_scale_out.hpp"
 
 static const size_t PER_RANK_VMM_SIZE = 256ULL * 1024 * 1024;
 static const size_t COUNT = 256;  // float elements per (peer, context) slice
