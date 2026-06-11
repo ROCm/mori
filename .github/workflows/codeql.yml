@@ -11,12 +11,6 @@
 name: CodeQL (manual SAST)
 
 on:
-  # TEMPORARY: lets this workflow run on push to the feature branch so it can be
-  # validated before merging (workflow_dispatch's "Run workflow" button only
-  # appears once the file is on the default branch). Remove this `push:` block
-  # before merging — keep only workflow_dispatch.
-  push:
-    branches: [jiahzhou/codeql-sast]
   workflow_dispatch:
     inputs:
       languages:
