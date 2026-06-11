@@ -91,11 +91,14 @@ jobs:
             rm -rf "$OUT" && mkdir -p "$OUT"
 
             # --- build CodeQL database(s). For cpp, CodeQL traces the real
-            #     compiler calls made by `pip install .`; python needs no build. ---
+            #     compiler calls made by `pip install .`; python needs no build.
+            #     The config file scopes results to MoRI's own code (excludes
+            #     3rdparty/, tests, and build artifacts). ---
             codeql database create "$OUT/db" \
               --db-cluster \
               --language="$LANGUAGES" \
               --command="pip install . -v" \
+              --codescanning-config="$GITHUB_WORKSPACE/.github/codeql/codeql-config.yml" \
               --overwrite
 
             # --- analyze each language with the security-and-quality suite ---
