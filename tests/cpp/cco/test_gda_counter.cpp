@@ -27,19 +27,18 @@
 //   signal  — REMOTE peer's NIC atomic-adds into our signalBuf after a put's
 //             data LANDS on the peer. "did my data arrive?"  (monotonic +
 //             shadow; readSignal returns a delta).
-//   counter — our LOCAL NIC loopback-writes counterBuf after a put's SOURCE
-//             data is fully transmitted. "is my sendBuf reusable?"  (absolute
+//   counter — software-incremented after polling CQ confirms all pending WQEs
+//             are locally complete. "is my sendBuf reusable?"  (absolute
 //             value, no shadow; readCounter returns the raw count, resetCounter
 //             zeroes it).
 //
-// Counter only exists as a side-effect of a put (CounterInc is a LocalAction on
-// put), so every round issues real puts. One counter slot per peer: counter[p]
-// is incremented once per put to peer p.
+// counter() is a standalone API called after put/flush. It polls CQ for all
+// GDA-team peers, then increments counterBuf[id].
 //
-//   inc    — put to every peer with CounterInc{p}; counter[p] == 1 each.
-//   multi  — N puts per peer; counter[p] == N (absolute count, no shadow).
+//   inc    — put to every peer, then counter(CounterInc{p}); counter[p] == 1.
+//   multi  — N rounds of put+counter per peer; counter[p] == N.
 //   wait   — waitCounter blocks until the local completion count is reached.
-//   reset  — resetCounter zeroes a slot; a fresh put counts from 0 again.
+//   reset  — resetCounter zeroes a slot; a fresh put+counter counts from 0.
 
 #include "cco_test_harness.hpp"
 #include "mori/cco/cco_scale_out.hpp"
@@ -49,9 +48,9 @@ static const size_t COUNT = 256;  // float elements per rank-pair slice
 
 static constexpr mori::core::ProviderType kPrvdType = mori::core::ProviderType::PSD;
 
-// SEND: each thread issues `putsPerPeer` puts to a distinct peer, each carrying
-// CounterInc{peer} (LocalAction). No remote signal — we only test the local
-// completion counter here. recvWin/sendWin slices are per rank-pair.
+// SEND: each thread issues `putsPerPeer` puts to a distinct peer (no counter
+// on put — counter is a separate API). After all puts + flush, one counter()
+// call per peer increments the per-peer counter slot.
 template <mori::core::ProviderType PrvdType, typename T>
 __global__ void GdaCounterPutKernel(mori::cco::ccoWindowDevice* sendWin,
                                     mori::cco::ccoWindowDevice* recvWin, size_t count,
@@ -69,15 +68,20 @@ __global__ void GdaCounterPutKernel(mori::cco::ccoWindowDevice* sendWin,
     if (r == myRank) continue;
     for (int k = 0; k < putsPerPeer; k++) {
       gda.put(r, reinterpret_cast<ccoWindow_t>(recvWin), myRank * perPairBytes,
-              reinterpret_cast<ccoWindow_t>(sendWin), r * perPairBytes, perPairBytes,
-              ccoGda_NoSignal{}, ccoGda_CounterInc{static_cast<ccoGdaCounter_t>(r)});
+              reinterpret_cast<ccoWindow_t>(sendWin), r * perPairBytes, perPairBytes);
     }
   }
-  gda.flush(mori::cco::ccoCoopBlock{});
+  gda.flush(ccoCoopBlock{});
+  for (int r = 0; r < nRanks; r++) {
+    if (r == myRank) continue;
+    for (int k = 0; k < putsPerPeer; k++) {
+      gda.counter(ccoGda_CounterInc{static_cast<ccoGdaCounter_t>(r)}, ccoCoopBlock{});
+    }
+  }
 }
 
 // CHECK: single thread asserts counter[p] == expect for every peer p != myRank;
-// own slot must stay 0. readCounter reads the absolute value (no shadow).
+// own slot must stay 0. readCounter reads the absolute value (software-driven).
 template <mori::core::ProviderType PrvdType>
 __global__ void GdaCounterCheckKernel(mori::cco::ccoDevComm devComm, uint64_t expect, int round,
                                       int* errorFlag) {
@@ -97,8 +101,8 @@ __global__ void GdaCounterCheckKernel(mori::cco::ccoDevComm devComm, uint64_t ex
   }
 }
 
-// WAIT-then-check: waitCounter blocks until counter[p] >= expect for each peer,
-// then readCounter confirms it is exactly expect.
+// WAIT-then-check: issue puts + flush + counter(), then waitCounter blocks
+// until counter[p] >= expect for each peer, and readCounter confirms the value.
 template <mori::core::ProviderType PrvdType>
 __global__ void GdaCounterWaitKernel(mori::cco::ccoDevComm devComm, uint64_t expect,
                                      int* errorFlag) {

@@ -76,7 +76,6 @@ typedef enum ccoGdaSignalOp_t {
 } ccoGdaSignalOp_t;
 
 struct ccoGda_NoSignal {};
-struct ccoGda_NoCounter {};
 
 struct ccoGda_SignalInc {
   ccoGdaSignal_t signalId;
@@ -114,13 +113,12 @@ struct ccoGda {
 
   // ── data transfer ───────────────────────────────────────────────────────
 
-  // put: rdma write with optional remote signal and local counter.
-  template <typename RemoteAction = ccoGda_NoSignal, typename LocalAction = ccoGda_NoCounter,
-            typename Coop = ccoCoopThread>
+  // put: rdma write with optional remote signal.
+  template <typename RemoteAction = ccoGda_NoSignal, typename Coop = ccoCoopThread>
   __device__ inline void put(int peer, ccoWindow_t dstWin, size_t dstOffset, ccoWindow_t srcWin,
                              size_t srcOffset, size_t bytes,
                              RemoteAction remoteAction = ccoGda_NoSignal{},
-                             LocalAction localAction = ccoGda_NoCounter{}, Coop coop = Coop{},
+                             Coop coop = Coop{},
                              uint32_t optFlags = ccoGdaOptFlagsDefault);
 
   // putValue: write an immediate value (≤8 bytes) with optional remote signal.
@@ -153,6 +151,10 @@ struct ccoGda {
   __device__ inline void resetSignal(ccoGdaSignal_t signalId);
 
   // ── counter ─────────────────────────────────────────────────────────────
+  // counter: poll CQ for all GDA-team peers (quietUntil), then increment
+  // counterBuf[localAction.counterId]. Requires ≥warp coop.
+  template <typename LocalAction, typename Coop = ccoCoopWarp>
+  __device__ inline void counter(LocalAction localAction, Coop coop = Coop{});
 
   // readCounter: read the local value of one counter slot.
   __device__ inline uint64_t readCounter(ccoGdaCounter_t counterId, int bits = 56);
@@ -190,6 +192,41 @@ struct ccoGda {
   template <typename Coop = ccoCoopWarp>
   __device__ inline void wait(ccoGdaRequest_t& request, Coop coop = Coop{});
 };
+
+// ── GDA barrier session ──────────────────────────────────────────────────
+//
+// Signal-based cross-node barrier. Each rank sends a signal (NIC atomic-add)
+// to every peer, then polls for the reciprocal signals. Uses the signal
+// slots reserved by ccoGdaBarrierHandle (allocated at DevComm creation via
+// railGdaBarrierCount / barrierCount in ccoDevCommRequirements).
+//
+// Usage:
+//   ccoGdaBarrierSession<PrvdType, ccoCoopBlock> session(ccoCoopBlock{}, gda,
+//       devComm.railGdaBarrier, /*index=*/0);
+//   session.sync(ccoCoopBlock{});
+//
+// Or one-shot:
+//   ccoGdaBarrier(ccoCoopBlock{}, gda, devComm.railGdaBarrier, 0);
+
+template <core::ProviderType PrvdType, typename Coop>
+struct ccoGdaBarrierSession {
+  Coop coop;
+  ccoGda<PrvdType>& gda;
+  ccoGdaBarrierHandle handle;
+  uint32_t index;
+
+  __device__ inline ccoGdaBarrierSession(Coop coop, ccoGda<PrvdType>& gda,
+                                         ccoGdaBarrierHandle handle, uint32_t index);
+  __device__ inline ~ccoGdaBarrierSession() {}
+
+  ccoGdaBarrierSession(ccoGdaBarrierSession const&) = delete;
+
+  __device__ inline void sync(Coop);
+};
+
+template <core::ProviderType PrvdType, typename Coop>
+__device__ inline void ccoGdaBarrier(Coop coop, ccoGda<PrvdType>& gda,
+                                     ccoGdaBarrierHandle handle, uint32_t index);
 
 // ── provider-specialized primitive layer (putImpl/getImpl/...) ──
 //
@@ -430,7 +467,7 @@ __device__ inline static uint64_t buildFlushDbrVal(core::WorkQueueHandle* wq, ui
   }
 }
 
-// New putImpl - Pure hardware operation layer
+// putImpl - Pure hardware operation layer
 template <core::ProviderType PrvdType>
 __device__ inline static void putImpl(
     // Hardware resources (already selected endpoint)
@@ -445,12 +482,9 @@ __device__ inline static void putImpl(
     bool hasSignal, uintptr_t signalRemoteAddr, uint32_t signalRemoteKey, ccoGdaSignalOp_t signalOp,
     uint64_t signalOpArg,
 
-    // Counter parameters (already parsed)
-    bool hasCounter, uintptr_t counterRemoteAddr, uint32_t counterRemoteKey,
-
     // Optimization flags
     uint32_t optFlags = ccoGdaOptFlagsDefault) {
-  if (!hasData && !hasSignal && !hasCounter) return;
+  if (!hasData && !hasSignal) return;
 
   // Get work queue handle
   core::WorkQueueHandle* wq = &ep->wqHandle;
@@ -458,9 +492,6 @@ __device__ inline static void putImpl(
   // Calculate total WQEs needed
   uint32_t numWqesNeeded = hasData ? 1 : 0;
   if (hasSignal) {
-    numWqesNeeded += getAtomicWqeCount<PrvdType>(core::AMO_FETCH_ADD, sizeof(uint64_t));
-  }
-  if (hasCounter) {
     numWqesNeeded += getAtomicWqeCount<PrvdType>(core::AMO_FETCH_ADD, sizeof(uint64_t));
   }
 
@@ -488,19 +519,6 @@ __device__ inline static void putImpl(
     dbrVal = core::PostAtomic<PrvdType, uint64_t>(
         *wq, wqeIdx, wqeIdx, wqeIdx, true /*cqeSignal*/, qpn, atomicLaddr, atomicLkey,
         signalRemoteAddr, signalRemoteKey, signalOpArg, 0 /*compare*/, core::AMO_FETCH_ADD);
-    wqeIdx++;
-  }
-
-  // Post atomic for counter (NIC loopback write to local memory)
-  if (hasCounter) {
-    recordOutstandingWqe<PrvdType>(wq, wqeIdx);
-
-    uintptr_t atomicLaddr = reinterpret_cast<uintptr_t>(ep->atomicIbuf.addr);
-    uint32_t atomicLkey = ep->atomicIbuf.lkey;
-
-    dbrVal = core::PostAtomic<PrvdType, uint64_t>(
-        *wq, wqeIdx, wqeIdx, wqeIdx, true /*cqeSignal*/, qpn, atomicLaddr, atomicLkey,
-        counterRemoteAddr, counterRemoteKey, 1 /*add 1*/, 0 /*compare*/, core::AMO_FETCH_ADD);
   }
 
   // Ring doorbell (ordered) unless AggregateRequests is set
@@ -804,12 +822,12 @@ __device__ inline ccoGda<PrvdType>::ccoGda(ccoDevComm const& comm_, int contextI
   }
 }
 
-// put: RDMA write with optional signal/counter
+// put: RDMA write with optional signal
 template <core::ProviderType PrvdType>
-template <typename RemoteAction, typename LocalAction, typename Coop>
+template <typename RemoteAction, typename Coop>
 __device__ inline void ccoGda<PrvdType>::put(int peer, ccoWindow_t dstWin, size_t dstOffset,
                                              ccoWindow_t srcWin, size_t srcOffset, size_t bytes,
-                                             RemoteAction remoteAction, LocalAction localAction,
+                                             RemoteAction remoteAction,
                                              Coop coop, uint32_t optFlags) {
   coop.sync();
   if (coop.thread_rank() == 0) {
@@ -850,24 +868,13 @@ __device__ inline void ccoGda<PrvdType>::put(int peer, ccoWindow_t dstWin, size_
       signalOpArg = remoteAction.value;
     }
 
-    // step 4: parse LocalAction -> counter parameters
-    constexpr bool hasCounter = !std::is_same_v<LocalAction, ccoGda_NoCounter>;
-    uintptr_t counterRaddr = 0;
-    uint32_t counterRkey = 0;
-
-    if constexpr (std::is_same_v<LocalAction, ccoGda_CounterInc>) {
-      uintptr_t counterBaseAddr = reinterpret_cast<uintptr_t>(ibgda->counterBuf);
-      counterRaddr = counterBaseAddr + localAction.counterId * sizeof(uint64_t);
-      counterRkey = comm.resourceWindow_inlined.ibgdaWin.lkey;
-    }
-
-    // step 5: call primitive API (PrvdType is compile-time determined)
+    // step 4: call primitive API (PrvdType is compile-time determined)
     impl::putImpl<PrvdType>(ep, qpn,
                       bytes > 0,            // hasData
                       localAddr, srcLkey,   // local
                       remoteAddr, dstRkey,  // remote
-                      bytes, hasSignal, signalRaddr, signalRkey, signalOp, signalOpArg, hasCounter,
-                      counterRaddr, counterRkey, optFlags);
+                      bytes, hasSignal, signalRaddr, signalRkey, signalOp, signalOpArg,
+                      optFlags);
   }
   coop.sync();
 }
@@ -1075,6 +1082,36 @@ __device__ inline void ccoGda<PrvdType>::wait(ccoGdaRequest_t& request, Coop coo
   coop.sync();
 }
 
+// counter: poll CQ for all GDA-team peers, then software-increment counterBuf.
+template <core::ProviderType PrvdType>
+template <typename LocalAction, typename Coop>
+__device__ inline void ccoGda<PrvdType>::counter(LocalAction localAction, Coop coop) {
+  static_assert(!std::is_same_v<Coop, ccoCoopThread>,
+                "counter() requires at least ccoCoopWarp. "
+                "ccoCoopThread causes each thread to independently enter quietUntil "
+                "on different QPs, breaking the warp-level pollCqLock.");
+  coop.sync();
+
+  ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
+
+  for (int teamPeer = coop.thread_rank(); teamPeer < this->nRanks; teamPeer += coop.size()) {
+    if (teamPeer == this->rank) continue;
+    int qpIdx = teamPeer * ibgda->numQpPerPe + (contextId % ibgda->numQpPerPe);
+    application::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
+    impl::quietUntil<PrvdType>(ep, ep->wqHandle.postIdx);
+  }
+
+  coop.sync();
+
+  if (coop.thread_rank() == 0) {
+    if constexpr (std::is_same_v<LocalAction, ccoGda_CounterInc>) {
+      atomicAdd(&ibgda->counterBuf[localAction.counterId], (uint64_t)1);
+    }
+  }
+
+  coop.sync();
+}
+
 // readSignal: read local signal value
 template <core::ProviderType PrvdType>
 __device__ inline uint64_t ccoGda<PrvdType>::readSignal(ccoGdaSignal_t signalId, int bits) {
@@ -1129,6 +1166,68 @@ __device__ inline void ccoGda<PrvdType>::resetCounter(ccoGdaCounter_t counterId)
   impl::resetCounterImpl<PrvdType>(ibgda->counterBuf, counterId);
 }
 
+// ── ccoGdaBarrierSession method definitions ──
+
+template <core::ProviderType PrvdType, typename Coop>
+__device__ inline ccoGdaBarrierSession<PrvdType, Coop>::ccoGdaBarrierSession(
+    Coop coop_, ccoGda<PrvdType>& gda_, ccoGdaBarrierHandle handle_, uint32_t index_)
+    : coop(coop_), gda(gda_), handle(handle_), index(index_) {}
+
+template <core::ProviderType PrvdType, typename Coop>
+__device__ inline void ccoGdaBarrierSession<PrvdType, Coop>::sync(Coop) {
+  static_assert(!std::is_same_v<Coop, ccoCoopThread>,
+                "GDA barrier requires at least ccoCoopWarp. "
+                "ccoCoopThread causes each thread to independently enter signalImpl / "
+                "waitSignalImpl on different QPs, breaking the warp-level pollCqLock.");
+  this->coop.sync();
+
+  ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(gda._gdaHandle);
+  int myRank = gda.rank;
+  int nRanks = gda.nRanks;
+
+  // Each barrier instance uses nRanks signal slots starting at signalBase.
+  // slot[peer] at our rank: peer writes here to notify us.
+  // slot[myRank] at peer's rank: we write here to notify peer.
+  ccoGdaSignal_t signalBase = handle.signal0 + index * nRanks;
+
+  // Phase 1: signal every peer (distribute across coop lanes).
+  // Peer rotation: (myRank+1+i) % nRanks spreads load evenly.
+  for (int i = this->coop.thread_rank(); i < nRanks - 1; i += this->coop.size()) {
+    int peer = 1 + myRank + i;
+    if (peer >= nRanks) peer -= nRanks;
+
+    int qpIdx = peer * ibgda->numQpPerPe + (gda.contextId % ibgda->numQpPerPe);
+    application::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
+
+    uintptr_t signalRaddr = (signalBase + myRank) * sizeof(uint64_t);
+    uint32_t signalRkey = gda.comm.resourceWindow_inlined.ibgdaWin.peerRkeys[
+        impl::GdaPeerToWorld(gda.comm, peer)];
+
+    impl::signalImpl<PrvdType>(ep, ep->qpn, signalRaddr, signalRkey,
+                               ccoGdaSignalInc, 1);
+  }
+
+  this->coop.sync();
+
+  // Phase 2: wait for every peer's reciprocal signal.
+  for (int i = this->coop.thread_rank(); i < nRanks - 1; i += this->coop.size()) {
+    int peer = 1 + myRank + i;
+    if (peer >= nRanks) peer -= nRanks;
+
+    ccoGdaSignal_t slotId = signalBase + peer;
+    impl::waitSignalImpl<PrvdType>(ibgda->signalBuf, ibgda->signalShadows,
+                                   slotId, 1, 64);
+  }
+
+  this->coop.sync();
+}
+
+template <core::ProviderType PrvdType, typename Coop>
+__device__ inline void ccoGdaBarrier(Coop coop, ccoGda<PrvdType>& gda,
+                                     ccoGdaBarrierHandle handle, uint32_t index) {
+  ccoGdaBarrierSession<PrvdType, Coop> session(coop, gda, handle, index);
+  session.sync(coop);
+}
 
 #endif  // defined(__HIPCC__) || defined(__CUDACC__)
 

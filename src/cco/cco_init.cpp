@@ -216,7 +216,7 @@ int ccoCommCreate(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
   // Cache the device once — subsequent API calls (ccoMemAlloc, ccoWindow-
   // Register) reuse this without re-querying hipGetDevice. Callers MUST keep
   // the calling thread bound to this device for any later CCO API on this comm.
-  HIP_RUNTIME_CHECK(hipGetDevice(&comm->cudaDev));
+  HIP_RUNTIME_CHECK(hipGetDevice(&comm->hipDev));
 
   // Query granularity with the SAME allocProp MemAlloc will use — granularity
   // can shift when requestedHandleType (FD export) is enabled.
@@ -224,7 +224,7 @@ int ccoCommCreate(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
   allocProp.type = hipMemAllocationTypePinned;
   allocProp.requestedHandleType = hipMemHandleTypePosixFileDescriptor;
   allocProp.location.type = hipMemLocationTypeDevice;
-  allocProp.location.id = comm->cudaDev;
+  allocProp.location.id = comm->hipDev;
 
   // RECOMMENDED granularity (typically 2 MiB on modern GPUs) trades a small
   // amount of internal fragmentation for fewer page-table entries, matching
@@ -264,7 +264,7 @@ int ccoCommCreate(application::BootstrapNetwork* bootNet, size_t perRankVmmSize,
 
     // sdmaDevHandles is lsaSize × sdmaNumQueue, indexed by lsaRank. Assumes
     // ranks bind 1:1 to GPUs within a node (rank lsa ⇒ GPU lsa).
-    int srcDeviceId = comm->cudaDev;
+    int srcDeviceId = comm->hipDev;
     size_t numSlots = static_cast<size_t>(comm->lsaSize) * comm->sdmaNumQueue;
     HIP_RUNTIME_CHECK(
         hipMalloc(&comm->sdmaDevHandles, numSlots * sizeof(anvil::SdmaQueueDeviceHandle*)));
@@ -390,7 +390,7 @@ int ccoMemAlloc(ccoComm* comm, size_t size, void** outPtr) {
   allocProp.type = hipMemAllocationTypePinned;
   allocProp.requestedHandleType = hipMemHandleTypePosixFileDescriptor;
   allocProp.location.type = hipMemLocationTypeDevice;
-  allocProp.location.id = comm->cudaDev;
+  allocProp.location.id = comm->hipDev;
 
   hipMemGenericAllocationHandle_t physHandle = 0;
   hipError_t err = hipMemCreate(&physHandle, alignedSize, &allocProp, 0);
@@ -416,7 +416,7 @@ int ccoMemAlloc(ccoComm* comm, size_t size, void** outPtr) {
 
   hipMemAccessDesc accessDesc = {};
   accessDesc.location.type = hipMemLocationTypeDevice;
-  accessDesc.location.id = comm->cudaDev;
+  accessDesc.location.id = comm->hipDev;
   accessDesc.flags = hipMemAccessFlagsProtReadWrite;
   err = hipMemSetAccess(localVa, alignedSize, &accessDesc, 1);
   if (err != hipSuccess) {
@@ -600,7 +600,7 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
 
     hipMemAccessDesc accessDesc = {};
     accessDesc.location.type = hipMemLocationTypeDevice;
-    accessDesc.location.id = comm->cudaDev;
+    accessDesc.location.id = comm->hipDev;
     accessDesc.flags = hipMemAccessFlagsProtReadWrite;
 
     // Track already-mapped peers so we can roll back if any later peer
@@ -986,8 +986,8 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
   //
   // Layout pins signalBufOffset == 0 so a peer's RDMA atomic add still uses
   // raddr = signal_slot_id * 8 (no per-rank offset shift needed).
-  // counterBuf is NIC-loopback local — placed in the pool for uniformity
-  // even though peers never write to it.
+  // counterBuf is software-incremented (via CQ-polling + GPU store) —
+  // placed in the pool for uniformity even though peers never write to it.
   //
   // Allocated BEFORE the windowTable build below so the GPU windowTable
   // includes it (a kernel can findWindow(devComm.resourceWindow) too).
