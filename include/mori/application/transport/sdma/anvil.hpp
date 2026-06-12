@@ -102,15 +102,25 @@ class AnvilLib {
 
   int getSdmaEngineId(int srcDeviceId, int dstDeviceId);
 
+  // KFD topology node id for a HIP device id.
+  uint32_t getNodeId(int deviceId);
+
+  // Bitmask of SDMA engine ids KFD recommends for the src->dst xGMI link to
+  // reach maximum bandwidth (sysfs recommended_sdma_engine_id_mask). Returns 0
+  // if the link or property is unavailable, in which case callers fall back to
+  // the static OAM map.
+  uint32_t getRecommendedEngineMask(int srcDeviceId, int dstDeviceId);
+
   struct PairHash {
     std::size_t operator()(const std::pair<int, int>& p) const {
       return std::hash<int>()(p.first) ^ (std::hash<int>()(p.second) << 16);
     }
   };
+  using SdmaQueueVector = std::vector<std::unique_ptr<SdmaQueue>>;
 
   std::once_flag init_flag;
   std::mutex channels_mutex_;
-  std::unordered_map<std::pair<int, int>, std::vector<std::unique_ptr<SdmaQueue>>, PairHash>
+  std::unordered_map<std::pair<int, int>, SdmaQueueVector, PairHash>
       sdma_channels_;
 };
 
