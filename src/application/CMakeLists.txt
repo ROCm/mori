@@ -8,6 +8,25 @@ if(WITH_MPI)
         "'-DBUILD_EXAMPLES=OFF' / 'BUILD_EXAMPLES=OFF pip install .'")
   endif()
 endif()
+# ROCm's hsakmt CMake package links an imported target `numa::numa`, but some
+# ROCm distributions ship hsakmtTargets.cmake without a Find module that
+# actually creates it. Define it here from the system libnuma if missing.
+if(NOT TARGET numa::numa)
+  find_library(NUMA_LIBRARY NAMES numa)
+  find_path(NUMA_INCLUDE_DIR NAMES numa.h)
+  if(NUMA_LIBRARY)
+    add_library(numa::numa UNKNOWN IMPORTED)
+    set_target_properties(
+      numa::numa PROPERTIES IMPORTED_LOCATION "${NUMA_LIBRARY}"
+                            INTERFACE_INCLUDE_DIRECTORIES "${NUMA_INCLUDE_DIR}")
+  else()
+    message(
+      FATAL_ERROR
+        "libnuma not found but required by hsakmt (numa::numa). Install it "
+        "(e.g. 'apt install libnuma-dev').")
+  endif()
+endif()
+
 find_package(hsa-runtime64 REQUIRED)
 
 # ROCm 7.14's hsakmt cmake config declares a link dependency on the imported

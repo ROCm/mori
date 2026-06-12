@@ -247,7 +247,12 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
       }
     }
 
-    size_t signalArraySize = sizeof(HSAuint64) * numDevices * numOfQueuesPerDevice;
+    // reduce-scatter push: up to 8 per-slice bitmask flags (counters live in a
+    // separate local buffer), so reserve a minimum even when npes*channels < 8.
+    size_t numSignalSlots = numDevices * numOfQueuesPerDevice;
+    constexpr size_t kMinSignalSlots = 8;
+    if (numSignalSlots < kMinSignalSlots) numSignalSlots = kMinSignalSlots;
+    size_t signalArraySize = sizeof(HSAuint64) * numSignalSlots;
     HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->signalPtrs, signalArraySize));
     HIP_RUNTIME_CHECK(hipMemset(gpuMemObj->signalPtrs, 0, signalArraySize));
     HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->expectSignalsPtr, signalArraySize));
