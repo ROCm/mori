@@ -109,6 +109,15 @@ add_executable(sdma_self_copy_test sdma/sdma_self_copy_test.cpp)
 target_link_libraries(sdma_self_copy_test mori_collective mori_shmem hip::host
                       hip::device)
 
+add_executable(allgather_test collective/allgather_test.cpp)
+target_link_libraries(allgather_test mori_shmem hip::host hip::device)
+
+add_executable(reduce_scatter_test collective/reduce_scatter_test.cpp)
+target_link_libraries(reduce_scatter_test mori_shmem hip::host hip::device)
+
+add_executable(all2all_test collective/all2all_test.cpp)
+target_link_libraries(all2all_test mori_shmem hip::host hip::device)
+
 # Find MPI package (required by intra-node examples)
 find_package(MPI REQUIRED)
 
