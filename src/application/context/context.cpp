@@ -366,7 +366,8 @@ void Context::EnsureSdmaTransport(int requestedChannels) {
     if (!peerCaps[i].canSDMA) continue;
     // Peer within-node device id: count of same-host peers before it.
     int peerDevId = SameHostPeersBefore(i);
-    if (i != LocalRank()) anvil::EnablePeerAccess(localDevId, peerDevId);
+    // NOTE NOTE this is not necessary for SDMA !!
+    //if (i != LocalRank()) anvil::EnablePeerAccess(localDevId, peerDevId);
     anvil::anvil.connect(localDevId, peerDevId, sdmaNumChannels);
   }
   sdmaChannels_ = sdmaNumChannels;

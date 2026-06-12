@@ -8,6 +8,25 @@ if(WITH_MPI)
         "'-DBUILD_EXAMPLES=OFF' / 'BUILD_EXAMPLES=OFF pip install .'")
   endif()
 endif()
+# ROCm's hsakmt CMake package links an imported target `numa::numa`, but some
+# ROCm distributions ship hsakmtTargets.cmake without a Find module that
+# actually creates it. Define it here from the system libnuma if missing.
+if(NOT TARGET numa::numa)
+  find_library(NUMA_LIBRARY NAMES numa)
+  find_path(NUMA_INCLUDE_DIR NAMES numa.h)
+  if(NUMA_LIBRARY)
+    add_library(numa::numa UNKNOWN IMPORTED)
+    set_target_properties(
+      numa::numa PROPERTIES IMPORTED_LOCATION "${NUMA_LIBRARY}"
+                            INTERFACE_INCLUDE_DIRECTORIES "${NUMA_INCLUDE_DIR}")
+  else()
+    message(
+      FATAL_ERROR
+        "libnuma not found but required by hsakmt (numa::numa). Install it "
+        "(e.g. 'apt install libnuma-dev').")
+  endif()
+endif()
+
 find_package(hsa-runtime64 REQUIRED)
 
 # ROCm 7.14's hsakmt cmake config declares a link dependency on the imported
@@ -33,6 +52,22 @@ if(NOT TARGET numa::numa)
 endif()
 
 find_package(hsakmt REQUIRED)
+
+# ROCm 7.13's hsakmt cmake package (built on a RHEL-style CI runner) bakes an
+# absolute /usr/lib64/libc.so into hsakmt::hsakmt's link interface. That path
+# doesn't exist on Debian/Ubuntu containers, so it becomes an unbuildable make
+# dependency ("No rule to make target '/usr/lib64/libc.so'"). Drop the bogus
+# full path and fall back to letting the linker resolve libc itself.
+if(TARGET hsakmt::hsakmt)
+  get_target_property(_hsakmt_iface hsakmt::hsakmt INTERFACE_LINK_LIBRARIES)
+  if(_hsakmt_iface)
+    string(REGEX REPLACE "/usr/lib[^;]*/libc\\.so" "c" _hsakmt_iface
+                         "${_hsakmt_iface}")
+    set_target_properties(hsakmt::hsakmt PROPERTIES INTERFACE_LINK_LIBRARIES
+                                                    "${_hsakmt_iface}")
+  endif()
+endif()
+
 # find_library(IONIC_LIBRARY NAMES ionic HINTS /lib/x86_64-linux-gnu REQUIRED )
 
 set(MORI_APP_SOURCES bootstrap/socket_bootstrap.cpp

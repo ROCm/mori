@@ -109,6 +109,22 @@ add_executable(sdma_self_copy_test sdma/sdma_self_copy_test.cpp)
 target_link_libraries(sdma_self_copy_test mori_collective mori_shmem hip::host
                       hip::device)
 
+add_executable(reduce_scatter_test collective/XLA/reduce_scatter_test.cpp)
+target_link_libraries(reduce_scatter_test mori_shmem hip::host hip::device)
+# Print per-kernel resource usage (VGPRs / SGPRs / LDS / spills / occupancy) as
+# compiler remarks during the normal build of this TU.
+target_compile_options(reduce_scatter_test PRIVATE -Rpass-analysis=kernel-resource-usage)
+
+add_executable(all_gather_test collective/XLA/all_gather_test.cpp)
+target_link_libraries(all_gather_test mori_shmem hip::host hip::device)
+
+add_executable(all_to_all_test collective/XLA/all_to_all_test.cpp)
+target_link_libraries(all_to_all_test mori_shmem hip::host hip::device)
+
+add_executable(all_reduce_test collective/XLA/all_reduce_test.cpp)
+target_link_libraries(all_reduce_test mori_shmem hip::host hip::device)
+target_compile_options(all_reduce_test PRIVATE -Rpass-analysis=kernel-resource-usage)
+
 # Find MPI package (required by intra-node examples)
 find_package(MPI REQUIRED)
 
