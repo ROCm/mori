@@ -57,7 +57,6 @@
 // core — now lives in cco_scale_out.hpp, so this header pulls in no RDMA
 // headers. Include cco_scale_out.hpp (which includes this file) for GDA.
 
-#if !defined(__HIPCC__) && !defined(__CUDACC__)
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -65,7 +64,6 @@
 
 #include "mori/application/application.hpp"
 #include "mori/application/memory/va_manager.hpp"
-#endif
 
 // BootstrapNetwork is referenced only by pointer (host API prototypes + ccoComm),
 // so a forward declaration is enough. This keeps the heavy mpi/torch/socket
@@ -75,8 +73,8 @@
 namespace mori {
 namespace application {
 class BootstrapNetwork;
-}  // namespace application
-}  // namespace mori
+}
+}
 
 namespace mori {
 namespace cco {
@@ -379,87 +377,6 @@ struct ccoDevCommRequirements {
       0,                                         /* sdmaQueueCount     */       \
       0,                                         /* barrierCount       */       \
   }
-
-/* ────────────────────────────────────────────────────────────────────────────
- *  Host-only structures
- * ──────────────────────────────────────────────────────────────────────────── */
-
-#if !defined(__HIPCC__) && !defined(__CUDACC__)
-
-struct ccoWindowHost {
-  void* localPtr;
-  size_t size;
-  ccoWindowDevice* devPtr;
-  uint32_t* peerRkeys_gpu;
-  // Peer's dma-buf imported handles. WindowRegister inserts one per P2P-
-  // mapped peer; WindowDeregister hipMemUnmap's the peer VA then
-  // hipMemRelease's the handle to drop the cross-process refcount.
-  std::vector<hipMemGenericAllocationHandle_t> peerImportedHandles;
-};
-
-struct ccoComm {
-  int rank{0};
-  int worldSize{0};
-  application::BootstrapNetwork* bootNet{nullptr};
-  application::Context* ctx{nullptr};
-
-  // rank 0's pid, gathered via Allgather. Disambiguates LocalBootstrap socket
-  // paths across independent comm groups in the same process tree.
-  int64_t groupId{0};
-
-  // Local HIP device this comm is bound to. Cached at CommCreate so we
-  // don't call hipGetDevice() on the hot path (per-MemAlloc / per-Window).
-  // Callers MUST keep the calling thread bound to this device for the
-  // lifetime of any CCO API call on this comm.
-  int cudaDev{-1};
-
-  // Intra-node topology (populated at CommCreate).
-  int lsaSize{1};
-  int lsaRank{0};
-  int myNodeStart{0};
-
-  // VMM flat address space (sized lsaSize * perRankSize).
-  void* flatBase{nullptr};
-  size_t perRankSize{0};
-  size_t vmmGranularity{0};
-
-  // Per-rank slot allocator within [0, perRankSize). Reuses the application
-  // HeapVAManager (first-fit + O(log n) coalescing, already used by shmem).
-  // baseAddr=0 so Allocate() returns the offset directly.
-  std::unique_ptr<application::HeapVAManager> vaManager;
-
-  // Default # of QPs per peer (from Context). Per-DevComm may override via reqs.
-  int defaultNumQpPerPe{4};
-  bool iovaZeroMode{true};
-
-  // SDMA queue handles (per-comm, sized lsaSize * sdmaNumQueue, indexed by lsaRank).
-  anvil::SdmaQueueDeviceHandle** sdmaDevHandles{nullptr};
-  int sdmaNumQueue{0};
-
-  struct AllocMeta {
-    hipMemGenericAllocationHandle_t physHandle;
-    int shareFd{-1};
-    size_t slotOffset{0};
-    size_t size{0};
-  };
-  std::unordered_map<void*, AllocMeta> allocTable;
-
-  // Protects allocTable, windows, windowTableEntries against concurrent
-  // MemAlloc / MemFree / WindowRegister / WindowDeregister from multiple
-  // threads sharing the same ccoComm. The vaManager has its own mutex.
-  mutable std::mutex allocMutex;
-
-  std::vector<ccoWindowHost*> windows;
-
-  struct WindowTableEntry {
-    uintptr_t base;
-    uintptr_t size;
-    ccoWindowDevice* devPtr;
-  };
-  std::vector<WindowTableEntry> windowTableEntries;
-};
-
-#endif  // !defined(__HIPCC__) && !defined(__CUDACC__)
 
 /* ════════════════════════════════════════════════════════════════════════════
  *  Device-side API (cooperative groups, teams, LSA barrier session, GDA layer).
@@ -767,15 +684,84 @@ __device__ inline int ccoLsaBarrierSession<Coop>::sync(Coop coop, uint64_t timeo
 #endif  // defined(__HIPCC__) || defined(__CUDACC__)  — end device-side API
 
 /* ════════════════════════════════════════════════════════════════════════════
- *  5. Host control-plane API
+ *  5. Host control-plane Structure & API
  *
  *  Implemented in src/cco/cco_init.cpp. The full ccoComm definition is
  *  host-only (guarded above); device/kernel TUs see only this forward decl.
  * ════════════════════════════════════════════════════════════════════════════ */
 
-#if defined(__HIPCC__) || defined(__CUDACC__)
-struct ccoComm;
-#endif
+struct ccoWindowHost {
+  void* localPtr;
+  size_t size;
+  ccoWindowDevice* devPtr;
+  uint32_t* peerRkeys_gpu;
+  // Peer's dma-buf imported handles. WindowRegister inserts one per P2P-
+  // mapped peer; WindowDeregister hipMemUnmap's the peer VA then
+  // hipMemRelease's the handle to drop the cross-process refcount.
+  std::vector<hipMemGenericAllocationHandle_t> peerImportedHandles;
+};
+
+struct ccoComm {
+  int rank{0};
+  int worldSize{0};
+  application::BootstrapNetwork* bootNet{nullptr};
+  application::Context* ctx{nullptr};
+
+  // rank 0's pid, gathered via Allgather. Disambiguates LocalBootstrap socket
+  // paths across independent comm groups in the same process tree.
+  int64_t groupId{0};
+
+  // Local HIP device this comm is bound to. Cached at CommCreate so we
+  // don't call hipGetDevice() on the hot path (per-MemAlloc / per-Window).
+  // Callers MUST keep the calling thread bound to this device for the
+  // lifetime of any CCO API call on this comm.
+  int hipDev{-1};
+
+  // Intra-node topology (populated at CommCreate).
+  int lsaSize{1};
+  int lsaRank{0};
+  int myNodeStart{0};
+
+  // VMM flat address space (sized lsaSize * perRankSize).
+  void* flatBase{nullptr};
+  size_t perRankSize{0};
+  size_t vmmGranularity{0};
+
+  // Per-rank slot allocator within [0, perRankSize). Reuses the application
+  // HeapVAManager (first-fit + O(log n) coalescing, already used by shmem).
+  // baseAddr=0 so Allocate() returns the offset directly.
+  std::unique_ptr<application::HeapVAManager> vaManager;
+
+  // Default # of QPs per peer (from Context). Per-DevComm may override via reqs.
+  int defaultNumQpPerPe{4};
+  bool iovaZeroMode{true};
+
+  // SDMA queue handles (per-comm, sized lsaSize * sdmaNumQueue, indexed by lsaRank).
+  anvil::SdmaQueueDeviceHandle** sdmaDevHandles{nullptr};
+  int sdmaNumQueue{0};
+
+  struct AllocMeta {
+    hipMemGenericAllocationHandle_t physHandle;
+    int shareFd{-1};
+    size_t slotOffset{0};
+    size_t size{0};
+  };
+  std::unordered_map<void*, AllocMeta> allocTable;
+
+  // Protects allocTable, windows, windowTableEntries against concurrent
+  // MemAlloc / MemFree / WindowRegister / WindowDeregister from multiple
+  // threads sharing the same ccoComm. The vaManager has its own mutex.
+  mutable std::mutex allocMutex;
+
+  std::vector<ccoWindowHost*> windows;
+
+  struct WindowTableEntry {
+    uintptr_t base;
+    uintptr_t size;
+    ccoWindowDevice* devPtr;
+  };
+  std::vector<WindowTableEntry> windowTableEntries;
+};
 
 // ── Phase 1: Communicator ──
 //

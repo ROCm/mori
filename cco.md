@@ -624,7 +624,6 @@ namespace mori::cco::gda {
 
 // Tag types (template dispatch)
 struct ccoGda_NoSignal {};
-struct ccoGda_NoCounter {};
 struct ccoGda_SignalInc { ccoGdaSignal_t signalId; };
 struct ccoGda_SignalAdd { ccoGdaSignal_t signalId; uint64_t value; };
 struct ccoGda_CounterInc { ccoGdaCounter_t counterId; };
@@ -643,12 +642,10 @@ struct ccoGda {
 
   __device__ ccoGda(ccoDevComm const&, int contextIndex);
 
-  template <typename RemoteAction = ccoGda_NoSignal,
-            typename LocalAction  = ccoGda_NoCounter>
+  template <typename RemoteAction = ccoGda_NoSignal>
   __device__ void put(int peer, ccoWindow_t dstWin, size_t dstOff,
                       ccoWindow_t srcWin, size_t srcOff, size_t bytes,
-                      RemoteAction = ccoGda_NoSignal{},
-                      LocalAction  = ccoGda_NoCounter{});
+                      RemoteAction = ccoGda_NoSignal{});
 
   template <typename T, typename RemoteAction = ccoGda_NoSignal>
   __device__ void putValue(int peer, ccoWindow_t dstWin, size_t dstOff,
@@ -662,6 +659,12 @@ struct ccoGda {
   __device__ uint64_t readSignal (ccoGdaSignal_t,  int bits = 64);
   __device__ void     waitSignal (ccoGdaSignal_t,  uint64_t least, int bits = 64);
   __device__ void     resetSignal(ccoGdaSignal_t);
+
+  // counter: poll CQ for all GDA-team peers (quietUntil), then software-
+  // increment counterBuf[counterId]. Requires ≥warp coop.
+  template <typename LocalAction, typename Coop = ccoCoopWarp>
+  __device__ void counter(LocalAction, Coop = Coop{});
+
   __device__ uint64_t readCounter (ccoGdaCounter_t, int bits = 56);
   __device__ void     waitCounter (ccoGdaCounter_t, uint64_t least, int bits = 56);
   __device__ void     resetCounter(ccoGdaCounter_t);
@@ -670,6 +673,29 @@ struct ccoGda {
   __device__ void flushAsync(int peer, ccoGdaRequest_t* outRequest);
   __device__ void wait(ccoGdaRequest_t& request);
 };
+
+// ── GDA barrier session ──
+// Signal-based cross-node barrier. Each rank RDMA atomic-adds to every
+// peer's signalBuf slot, then polls for reciprocal signals. Uses slots
+// reserved via ccoGdaBarrierHandle (allocated at DevComm creation from
+// railGdaBarrierCount / barrierCount).
+//
+// Signal slot layout per barrier instance (nRanks slots):
+//   signalBuf[signal0 + index*nRanks + srcRank]
+// Each peer writes to our slot[peer.rank], we poll slot[peer] for arrival.
+template <core::ProviderType PrvdType, typename Coop>
+struct ccoGdaBarrierSession {
+  __device__ ccoGdaBarrierSession(Coop, ccoGda<PrvdType>&,
+                                  ccoGdaBarrierHandle, uint32_t index);
+  // sync = signal all peers + wait all reciprocal signals.
+  // Requires ≥warp coop. Repeatable (shadow auto-advances).
+  __device__ void sync(Coop);
+};
+
+// Free-function one-shot barrier:
+template <core::ProviderType PrvdType, typename Coop>
+__device__ void ccoGdaBarrier(Coop, ccoGda<PrvdType>&,
+                              ccoGdaBarrierHandle, uint32_t index);
 
 }  // namespace mori::cco::gda
 
@@ -971,7 +997,7 @@ CCO **天然 SPMT-friendly**，无 process-global singleton 漏出：
 
 1. **每个 thread 一个 `ccoComm`**（不要跨线程共享 comm 句柄）
 2. **每个 thread 在 `ccoCommCreate` 之前 `hipSetDevice(...)`** —— comm
-   会 cache `cudaDev`，后续 API 调用必须保持线程绑在同一 device
+   会 cache `hipDev`，后续 API 调用必须保持线程绑在同一 device
 
 测试覆盖：`test_cco_host`（8 thread SPMT）+ `test_cco_gda_modes`
 （同样 SPMT, 4 个 connType × 8 thread）均通过。
