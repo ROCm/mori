@@ -11,9 +11,8 @@ BW_THRESHOLD=300    # Gbps
 LAT_THRESHOLD=10    # microseconds
 MSG_SIZE=65536      # 64K
 LAT_MSG_SIZE=2      # bytes (small message for latency)
-LAT_ITERS=5000      # iterations for latency test
-TEST_DURATION=2     # seconds
 IB_PORT=18515       # base port for ib_write_bw / ib_write_lat
+MESH_PARALLEL=8     # max concurrent pair probes for mesh tests
 MORI_RDMA_SL=0      # overwritten by check_qos()
 MORI_RDMA_TC=0      # overwritten by check_qos()
 
@@ -50,82 +49,189 @@ query_rdma_devices() {
     fi
 }
 
-# run_ib_bw_test <client_dev> <server_dev> <server_host> [check_threshold]
-#   check_threshold: if "true" (default), compare BW against BW_THRESHOLD
-run_ib_bw_test() {
-    local client_dev="$1" server_dev="$2" server_host="$3"
-    local check="${4:-true}"
-    local port=$((IB_PORT++))
-    local label="$client_dev -> $server_dev@$server_host"
-    local ib_args="-x 1 -p $port -s $MSG_SIZE -D $TEST_DURATION \
-        --report_gbits --sl $MORI_RDMA_SL"
+# Self-contained snippet ($1=ib device) that prints the best GID index for that
+# device, mirroring MORI's ScoreGidCandidate (rdma.cpp): RoCEv2 (+1000) over
+# RoCEv1 (+500); IPv4-mapped (+200) over global IPv6 (+100) over link-local (+0);
+# smaller index wins ties. Hardcoding "-x 1" picks the RoCEv2 *link-local* GID
+# (fe80::), which is NOT routable through the ToR and makes QPs fail at RTR.
+_GID_PICK_SNIPPET='dev="$1"; g="/sys/class/infiniband/$dev/ports/1"; best=""; bs=-1;
+for tf in "$g/gid_attrs/types/"*; do
+  [ -e "$tf" ] || continue; i=$(basename "$tf");
+  t=$(cat "$g/gid_attrs/types/$i" 2>/dev/null); gid=$(cat "$g/gids/$i" 2>/dev/null);
+  [ -z "$gid" ] && continue;
+  [ "$gid" = "0000:0000:0000:0000:0000:0000:0000:0000" ] && continue;
+  s=0; case "$t" in *v2*) s=$((s+1000));; *) s=$((s+500));; esac;
+  case "$gid" in 0000:0000:0000:0000:0000:ffff:*) s=$((s+200));; fe80:*) : ;; *) s=$((s+100));; esac;
+  s=$((s-i)); if [ "$s" -gt "$bs" ]; then bs=$s; best=$i; fi;
+done; echo "$best"'
 
-    if [[ "$server_host" == "localhost" || "$server_host" == "127.0.0.1" ]]; then
-        ib_write_bw -d "$server_dev" $ib_args &>/dev/null &
+# gid_index <dev> [host]   -> best GID index (default 1 if detection fails)
+gid_index() {
+    local dev="$1" host="${2:-}" idx
+    if [[ -z "$host" || "$host" == "localhost" || "$host" == "127.0.0.1" ]]; then
+        idx=$(bash -c "$_GID_PICK_SNIPPET" _ "$dev" 2>/dev/null)
     else
-        ssh "$(whoami)"@"$server_host" "ib_write_bw -d $server_dev $ib_args" &>/dev/null &
+        idx=$(ssh -o ConnectTimeout=5 "$(whoami)"@"$host" \
+              "bash -c '$_GID_PICK_SNIPPET' _ $dev" 2>/dev/null)
     fi
-    local server_pid=$!
-    sleep 1
-
-    local output rc=0
-    output=$(ib_write_bw -d "$client_dev" $ib_args "$server_host" 2>&1) || rc=$?
-    wait "$server_pid" 2>/dev/null
-
-    if [[ $rc -ne 0 ]]; then
-        log_fail "$label : ib_write_bw failed (rc=$rc)"; return 1
-    fi
-
-    # parse BW from the data line (format: "65536  ...  <BW_avg>  ...")
-    local bw
-    bw=$(echo "$output" | grep "^[[:space:]]*$MSG_SIZE" | awk '{print $(NF-1)}')
-    if [[ -z "$bw" ]]; then
-        log_fail "$label : cannot parse bandwidth"; return 1
-    fi
-
-    if [[ "$check" == "true" ]]; then
-        if awk "BEGIN{exit !($bw >= $BW_THRESHOLD)}"; then
-            log_ok "$label : ${bw} Gbps"
-        else
-            log_fail "$label : ${bw} Gbps (threshold: ${BW_THRESHOLD} Gbps)"; return 1
-        fi
-    else
-        log_ok "$label : ${bw} Gbps"
-    fi
+    echo "${idx:-1}"
 }
 
-# run_ib_lat_test <client_dev> <server_dev> <server_host>
-#   returns 0 if avg latency <= threshold, 1 otherwise
-run_ib_lat_test() {
-    local client_dev="$1" server_dev="$2" server_host="$3"
-    local port=$((IB_PORT++))
-    local label="$client_dev -> $server_dev@$server_host"
-    local ib_args="-x 1 -p $port -s $LAT_MSG_SIZE -n $LAT_ITERS --sl $MORI_RDMA_SL"
+# nic_ipv4 <dev>   -> first IPv4 of the device's netdev (empty if none)
+nic_ipv4() {
+    local dev="$1" nd
+    nd=$(ls "/sys/class/infiniband/$dev/device/net" 2>/dev/null | head -1)
+    [[ -n "$nd" ]] || { echo ""; return; }
+    ip -o -4 addr show dev "$nd" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1
+}
 
-    ssh "$(whoami)"@"$server_host" "ib_write_lat -d $server_dev $ib_args" &>/dev/null &
-    local server_pid=$!
-    sleep 1
+# intra_reachable <src_dev> <dst_dev>
+#   0 if src can route to dst on this host (same backend fabric), 1 otherwise.
+#   Uses the per-source policy routing table (the same path RoCEv2 traffic takes
+#   when it hairpins through the ToR), so it matches what ib_write_bw will do.
+intra_reachable() {
+    local sip dip stable
+    sip=$(nic_ipv4 "$1"); dip=$(nic_ipv4 "$2")
+    [[ -n "$sip" && -n "$dip" ]] || return 0   # can't tell -> don't skip
+    stable=$(ip rule show 2>/dev/null | awk -v ip="$sip" \
+        '$0 ~ ("from "ip"[ /]") {for(i=1;i<=NF;i++) if($i=="lookup") print $(i+1)}' | head -1)
+    [[ -n "$stable" ]] || return 0             # no policy table -> don't skip
+    # dst is reachable if it falls inside any prefix present in src's table
+    local pfx
+    while read -r pfx; do
+        [[ -n "$pfx" ]] || continue
+        if python3 -c "import ipaddress,sys; sys.exit(0 if ipaddress.ip_address('$dip') in ipaddress.ip_network('$pfx',strict=False) else 1)" 2>/dev/null; then
+            return 0
+        fi
+    done < <(ip route show table "$stable" 2>/dev/null | awk '$1 ~ /\//{print $1}')
+    return 1
+}
 
-    local output rc=0
-    output=$(ib_write_lat -d "$client_dev" $ib_args "$server_host" 2>&1) || rc=$?
-    wait "$server_pid" 2>/dev/null
+# ---------------- generic parallel full-mesh runner + matrix ----------------
 
-    if [[ $rc -ne 0 ]]; then
-        log_fail "$label : ib_write_lat failed (rc=$rc)"; return 1
-    fi
+# build_gid_map <assoc_name> <host> <dev...>
+#   fills the named assoc array with each device's best GID index.
+build_gid_map() {
+    local -n _m="$1"; local host="$2"; shift 2
+    local d
+    for d in "$@"; do _m["$d"]=$(gid_index "$d" "$host"); done
+}
 
-    # columns: #bytes #iterations t_min t_max t_typical t_avg t_stdev 99% 99.9%
-    local avg_lat
-    avg_lat=$(echo "$output" | grep "^[[:space:]]*$LAT_MSG_SIZE" | awk '{print $6}')
-    if [[ -z "$avg_lat" ]]; then
-        log_fail "$label : cannot parse latency"; return 1
-    fi
-
-    if awk "BEGIN{exit !($avg_lat <= $LAT_THRESHOLD)}"; then
-        log_ok "$label : ${avg_lat} us"
+# mesh_execute fills <cell_assoc>[i,j] with a numeric metric, "x" (fail) or "-" (self).
+#   mesh_execute <cell_assoc> <tool> <server_host> <self_skip> <iters> \
+#                <row_gid_assoc> <col_gid_assoc> <row_arr> <col_arr>
+#   tool=ib_write_bw -> BW avg (Gbps);  tool=ib_write_lat -> avg latency (us).
+#   iters: empty = ib_* default; otherwise "-n <iters>".
+#   Probes run in parallel, throttled to MESH_PARALLEL. Each pair uses a unique
+#   port so concurrent runs don't collide.
+mesh_execute() {
+    local -n _cell="$1" _rgid="$6" _cgid="$7" _row="$8" _col="$9"
+    local tool="$2" shost="$3" self_skip="$4" iters="$5"
+    local nr=${#_row[@]} nc=${#_col[@]}
+    local extra key col
+    if [[ "$tool" == "ib_write_bw" ]]; then
+        extra="-s $MSG_SIZE --report_gbits"; key="$MSG_SIZE"; col='$(NF-1)'
     else
-        log_fail "$label : ${avg_lat} us (threshold: ${LAT_THRESHOLD} us)"; return 1
+        extra="-s $LAT_MSG_SIZE"; key="$LAT_MSG_SIZE"; col='$6'
     fi
+    [[ -n "$iters" ]] && extra="$extra -n $iters"
+
+    local tmpd; tmpd=$(mktemp -d)
+    local i j port running=0
+    for (( i=0; i<nr; i++ )); do
+        for (( j=0; j<nc; j++ )); do
+            if [[ "$self_skip" == "true" && "${_row[$i]}" == "${_col[$j]}" ]]; then
+                printf -- '-' > "$tmpd/$i.$j"; continue
+            fi
+            port=$(( IB_PORT + i * nc + j ))   # unique per pair
+            (
+                local sa="-p $port -x ${_cgid[${_col[$j]}]} --sl $MORI_RDMA_SL $extra"
+                local ca="-p $port -x ${_rgid[${_row[$i]}]} --sl $MORI_RDMA_SL $extra"
+                if [[ "$shost" == "localhost" || "$shost" == "127.0.0.1" ]]; then
+                    $tool -d "${_col[$j]}" $sa &>/dev/null &
+                else
+                    ssh -o ConnectTimeout=5 "$(whoami)@$shost" "$tool -d ${_col[$j]} $sa" &>/dev/null &
+                fi
+                local sp=$!; sleep 0.5
+                local out rc=0
+                out=$(timeout 30 $tool -d "${_row[$i]}" $ca "$shost" 2>&1) || rc=$?
+                wait "$sp" 2>/dev/null
+                if (( rc != 0 )); then echo "x" > "$tmpd/$i.$j"
+                else echo "$out" | grep "^[[:space:]]*$key" | awk "{print $col}" | head -1 > "$tmpd/$i.$j"; fi
+            ) &
+            running=$(( running + 1 ))
+            if (( running >= MESH_PARALLEL )); then wait -n 2>/dev/null; running=$(( running - 1 )); fi
+        done
+    done
+    wait
+
+    for (( i=0; i<nr; i++ )); do
+        for (( j=0; j<nc; j++ )); do
+            local v; v=$(cat "$tmpd/$i.$j" 2>/dev/null)
+            [[ "$v" =~ ^[0-9.]+$ || "$v" == "-" ]] || v="x"
+            _cell["$i,$j"]="$v"
+        done
+    done
+    rm -rf "$tmpd"
+}
+
+# mesh_report prints a reachability matrix + a value matrix + summary.
+#   mesh_report <cell_assoc> <row_arr> <col_arr> <title> <unit> <fmt>
+#   fmt: "int" (round) or "f1" (1 decimal) for the value matrix.
+mesh_report() {
+    local -n _cell="$1" _row="$2" _col="$3"
+    local title="$4" unit="$5" fmt="$6"
+    local nr=${#_row[@]} nc=${#_col[@]}
+    local i j ok=0 fail=0
+    local hdr; hdr=$(printf "  %-10s" "")
+    for (( j=0; j<nc; j++ )); do hdr+=$(printf " %6s" "$(echo "${_col[$j]}" | sed 's/bnxt_//')"); done
+
+    echo ""
+    echo -e "  $title reachability  (${GREEN}✓${NC}=ok ${RED}✗${NC}=fail '-'=self)  rows=client cols=server"
+    echo "$hdr"
+    for (( i=0; i<nr; i++ )); do
+        local row; row=$(printf "  %-10s" "$(echo "${_row[$i]}" | sed 's/bnxt_//')")
+        for (( j=0; j<nc; j++ )); do
+            local c="${_cell[$i,$j]}"
+            if [[ "$c" == "-" ]]; then row+="     -"
+            elif [[ "$c" == "x" ]]; then row+="     ${RED}✗${NC}"; (( fail++ ))
+            else row+="     ${GREEN}✓${NC}"; (( ok++ )); fi
+        done
+        echo -e "$row"
+    done
+
+    echo ""
+    echo "  $title $unit matrix"
+    echo "$hdr"
+    for (( i=0; i<nr; i++ )); do
+        local row; row=$(printf "  %-10s" "$(echo "${_row[$i]}" | sed 's/bnxt_//')")
+        for (( j=0; j<nc; j++ )); do
+            local c="${_cell[$i,$j]}"
+            if [[ "$c" =~ ^[0-9.]+$ ]]; then
+                if [[ "$fmt" == "int" ]]; then c=$(printf "%.0f" "$c"); else c=$(printf "%.1f" "$c"); fi
+            fi
+            row+=$(printf " %6s" "$c")
+        done
+        echo "$row"
+    done
+
+    echo ""
+    local total=$(( ok + fail ))
+    if (( fail == 0 )); then log_ok "$title: all $total ordered pairs reachable"
+    else log_warn "$title: $ok/$total reachable, $fail unreachable (see ✗ cells)"; fi
+}
+
+# dominant_group <out_array_name> <dev...>
+#   sets the named array to the largest same-vendor-prefix subset of the inputs.
+dominant_group() {
+    local -n _out="$1"; shift
+    local -A _pref=(); local d p best="" bc=0
+    for d in "$@"; do p=$(echo "$d" | sed 's/[0-9]*$//'); _pref["$p"]+="$d "; done
+    for p in "${!_pref[@]}"; do
+        local g=(); read -ra g <<< "${_pref[$p]}"
+        (( ${#g[@]} > bc )) && { bc=${#g[@]}; best="$p"; }
+    done
+    read -ra _out <<< "${_pref[$best]}"
 }
 
 # ======================== check functions =======================
@@ -289,74 +395,56 @@ check_dcqcn() {
 }
 
 check_intra_node_bw() {
-    step "intra-node bandwidth check"
+    step "intra-node bandwidth check (full mesh)"
 
     command -v ib_write_bw > /dev/null 2>&1 || { log_warn "ib_write_bw not found, skipping"; return 0; }
 
     local all_devs=()
     mapfile -t all_devs < <(query_rdma_devices)
-    local count=${#all_devs[@]}
-    [[ $count -gt 0 ]] || { log_fail "no local RDMA devices found (check ibv_devices)"; return 1; }
-    log_ok "local RDMA devices ($count): ${all_devs[*]}"
+    [[ ${#all_devs[@]} -gt 0 ]] || { log_fail "no local RDMA devices found (check ibv_devices)"; return 1; }
+    log_ok "local RDMA devices (${#all_devs[@]}): ${all_devs[*]}"
 
-    # Group devices by vendor prefix (e.g. bnxt_re, irdma, mlx5) and pick the largest group
-    declare -A _prefix_devs=()
-    local dev prefix
-    for dev in "${all_devs[@]}"; do
-        prefix=$(echo "$dev" | sed 's/[0-9]*$//')
-        _prefix_devs["$prefix"]+="$dev "
-    done
-
-    local best_prefix="" best_count=0
-    for prefix in "${!_prefix_devs[@]}"; do
-        local grp=()
-        read -ra grp <<< "${_prefix_devs[$prefix]}"
-        if (( ${#grp[@]} > best_count )); then
-            best_count=${#grp[@]}
-            best_prefix="$prefix"
-        fi
-    done
-
-    read -ra LOCAL_DEVS <<< "${_prefix_devs[$best_prefix]}"
-    if (( ${#all_devs[@]} != best_count )); then
-        log_warn "mixed NIC vendors detected; using '$best_prefix' devices (${best_count}) for tests: ${LOCAL_DEVS[*]}"
+    # Pick the largest same-vendor group; exported via LOCAL_DEVS for inter-node tests.
+    dominant_group LOCAL_DEVS "${all_devs[@]}"
+    if (( ${#all_devs[@]} != ${#LOCAL_DEVS[@]} )); then
+        log_warn "mixed NIC vendors detected; using ${#LOCAL_DEVS[@]} devices for tests: ${LOCAL_DEVS[*]}"
     fi
+    [[ ${#LOCAL_DEVS[@]} -ge 2 ]] || { log_skip "only 1 device in dominant group, skipping"; return 0; }
 
-    if [[ ${#LOCAL_DEVS[@]} -lt 2 ]]; then
-        log_skip "only 1 local RDMA device in dominant group, skipping intra-node test"; return 0
-    fi
+    local n=${#LOCAL_DEVS[@]}
+    # RDMA writes per pair scales with the test size (number of devices squared).
+    local iters=$(( n * n ))
+    log_ok "full mesh over $n devices ($((n*(n-1))) ordered pairs, ${iters} writes/pair, parallel=$MESH_PARALLEL)"
 
-    for (( i=1; i<${#LOCAL_DEVS[@]}; i++ )); do
-        run_ib_bw_test "${LOCAL_DEVS[0]}" "${LOCAL_DEVS[$i]}" "localhost" "false"
-    done
+    local -A GID=(); build_gid_map GID "" "${LOCAL_DEVS[@]}"
+    local -A CELL=()
+    mesh_execute CELL ib_write_bw localhost true "$iters" GID GID LOCAL_DEVS LOCAL_DEVS
+    mesh_report CELL LOCAL_DEVS LOCAL_DEVS "intra-node BW" "Gbps" int
 }
 
 check_inter_node_bw() {
-    step "inter-node bandwidth check"
+    step "inter-node bandwidth check (full mesh)"
 
     command -v ib_write_bw > /dev/null 2>&1 || { log_warn "ib_write_bw not found, skipping"; return 0; }
-
     if [[ -z "$PEER_IP" ]]; then
         log_skip "no peer IP provided (usage: $0 <peer_ip>)"; return 0
     fi
-
     ping -c 2 -W 2 "$PEER_IP" > /dev/null 2>&1 || die "cannot ping $PEER_IP, skip inter-node bandwidth test"
     log_ok "ping $PEER_IP reachable"
 
-    local remote_devs
-    remote_devs=($(query_rdma_devices "$PEER_IP"))
-    [[ ${#remote_devs[@]} -gt 0 ]] || { log_fail "no RDMA devices on $PEER_IP (check ibv_devices / ssh)"; return 1; }
-    log_ok "remote RDMA devices: ${remote_devs[*]}"
-
+    local all_remote=()
+    mapfile -t all_remote < <(query_rdma_devices "$PEER_IP")
+    [[ ${#all_remote[@]} -gt 0 ]] || { log_fail "no RDMA devices on $PEER_IP (check ibv_devices / ssh)"; return 1; }
+    local REMOTE_DEVS=(); dominant_group REMOTE_DEVS "${all_remote[@]}"
     [[ ${#LOCAL_DEVS[@]} -gt 0 ]] || { log_fail "no local RDMA devices available"; return 1; }
+    log_ok "local ${#LOCAL_DEVS[@]} x remote ${#REMOTE_DEVS[@]} mesh (parallel=$MESH_PARALLEL): ${REMOTE_DEVS[*]}"
 
-    local fail=0
-    for rdev in "${remote_devs[@]}"; do
-        run_ib_bw_test "${LOCAL_DEVS[0]}" "$rdev" "$PEER_IP" || fail=1
-    done
-
-    [[ $fail -eq 0 ]] && log_ok  "all inter-node pairs passed (>= ${BW_THRESHOLD} Gbps)" \
-                       || log_fail "some inter-node pairs failed"
+    local -A LGID=(); build_gid_map LGID "" "${LOCAL_DEVS[@]}"
+    local -A RGID=(); build_gid_map RGID "$PEER_IP" "${REMOTE_DEVS[@]}"
+    local -A CELL=()
+    # default iters, no self-skip (rows=local, cols=remote are distinct hosts)
+    mesh_execute CELL ib_write_bw "$PEER_IP" false "" LGID RGID LOCAL_DEVS REMOTE_DEVS
+    mesh_report CELL LOCAL_DEVS REMOTE_DEVS "inter-node BW" "Gbps" int
 }
 
 # =================== bnxt_re (Broadcom) checks =================
@@ -644,28 +732,27 @@ check_bnxt_dcqcn() {
 }
 
 check_inter_node_lat() {
-    step "inter-node latency check"
+    step "inter-node latency check (full mesh)"
 
     command -v ib_write_lat > /dev/null 2>&1 || { log_warn "ib_write_lat not found, skipping"; return 0; }
-
     if [[ -z "$PEER_IP" ]]; then
         log_skip "no peer IP provided (usage: $0 <peer_ip>)"; return 0
     fi
-
     ping -c 1 -W 2 "$PEER_IP" > /dev/null 2>&1 || die "cannot ping $PEER_IP, skip inter-node latency test"
 
-    local remote_devs
-    remote_devs=($(query_rdma_devices "$PEER_IP"))
-    [[ ${#remote_devs[@]} -gt 0 ]] || { log_fail "no RDMA devices on $PEER_IP"; return 1; }
+    local all_remote=()
+    mapfile -t all_remote < <(query_rdma_devices "$PEER_IP")
+    [[ ${#all_remote[@]} -gt 0 ]] || { log_fail "no RDMA devices on $PEER_IP"; return 1; }
+    local REMOTE_DEVS=(); dominant_group REMOTE_DEVS "${all_remote[@]}"
     [[ ${#LOCAL_DEVS[@]} -gt 0 ]]  || { log_fail "no local RDMA devices available"; return 1; }
+    log_ok "local ${#LOCAL_DEVS[@]} x remote ${#REMOTE_DEVS[@]} latency mesh (parallel=$MESH_PARALLEL)"
 
-    local fail=0
-    for rdev in "${remote_devs[@]}"; do
-        run_ib_lat_test "${LOCAL_DEVS[0]}" "$rdev" "$PEER_IP" || fail=1
-    done
-
-    [[ $fail -eq 0 ]] && log_ok  "all inter-node pairs passed (<= ${LAT_THRESHOLD} us)" \
-                       || log_fail "some inter-node pairs failed"
+    local -A LGID=(); build_gid_map LGID "" "${LOCAL_DEVS[@]}"
+    local -A RGID=(); build_gid_map RGID "$PEER_IP" "${REMOTE_DEVS[@]}"
+    local -A CELL=()
+    # latency uses ib_write_lat default iterations
+    mesh_execute CELL ib_write_lat "$PEER_IP" false "" LGID RGID LOCAL_DEVS REMOTE_DEVS
+    mesh_report CELL LOCAL_DEVS REMOTE_DEVS "inter-node latency" "us" f1
 }
 
 # ============================= main =============================
