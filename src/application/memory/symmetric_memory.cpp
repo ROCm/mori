@@ -298,7 +298,21 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
       }
     }
 
-    size_t signalArraySize = sizeof(HSAuint64) * numDevices * numOfQueuesPerDevice;
+    // Push collectives use the per-PE signal buffer for two disjoint counter
+    // ranges: the reduce-scatter per-slice completion counters [0..S-1] and the
+    // all-reduce broadcast counters [kBcastSlot .. kBcastSlot+S-1] (kBcastSlot ==
+    // kRSPushMaxSlices), so the max index reached is 2*kRSPushMaxSlices-1 with
+    // S <= kRSPushMaxSlices. Reserve a minimum even when npes*channels is small.
+    // RS_MIN_SIGNAL_SLOTS_PER_DEV overrides the floor with a per-device count
+    // (floor = numDevices * value) so tests can size the buffer explicitly.
+    size_t numSignalSlots = numDevices * numOfQueuesPerDevice;
+    size_t minSignalSlots = 16;  // default total floor (comfortable headroom)
+    if (const char* s = std::getenv("RS_MIN_SIGNAL_SLOTS_PER_DEV")) {
+      int perDev = std::atoi(s);
+      if (perDev > 0) minSignalSlots = numDevices * static_cast<size_t>(perDev);
+    }
+    if (numSignalSlots < minSignalSlots) numSignalSlots = minSignalSlots;
+    size_t signalArraySize = sizeof(HSAuint64) * numSignalSlots;
     HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->signalPtrs, signalArraySize));
     HIP_RUNTIME_CHECK(hipMemset(gpuMemObj->signalPtrs, 0, signalArraySize));
     HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->expectSignalsPtr, signalArraySize));
