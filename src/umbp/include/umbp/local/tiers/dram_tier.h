@@ -67,6 +67,14 @@ class DRAMTier : public TierBackend {
   std::vector<bool> ReadBatchIntoPtr(const std::vector<std::string>& keys,
                                      const std::vector<uintptr_t>& dst_ptrs,
                                      const std::vector<size_t>& sizes) override;
+  // Multi-threaded batch write: serial slot allocation (mutates free_list_)
+  // followed by parallel non-temporal CopyBlock of each payload into its slot.
+  // Mirrors ReadBatchIntoPtr to break the single-core memcpy ceiling on the
+  // L2->L3 backup (PUT) path. Does NOT self-evict — keys that don't fit are
+  // left false so the upper layer can demote and retry per-key.
+  std::vector<bool> BatchWrite(const std::vector<std::string>& keys,
+                               const std::vector<const void*>& data_ptrs,
+                               const std::vector<size_t>& sizes) override;
   bool Exists(const std::string& key) const override;
   bool Evict(const std::string& key) override;
   std::pair<size_t, size_t> Capacity() const override;
@@ -124,6 +132,11 @@ class DRAMTier : public TierBackend {
   // via env UMBP_DRAM_READ_THREADS, capped to hardware concurrency. >1 breaks
   // the single-core memcpy ceiling on cold DRAM.
   int read_threads_ = 8;
+
+  // Threads used by BatchWrite for parallel CopyBlock. Default 8, override via
+  // env UMBP_DRAM_WRITE_THREADS, capped to hardware concurrency. >1 breaks the
+  // single-core memcpy ceiling on the PUT (backup) path.
+  int write_threads_ = 8;
 
   size_t Allocate(size_t size);                 // Allocate from free_list_
   void Deallocate(size_t offset, size_t size);  // Return to free_list_

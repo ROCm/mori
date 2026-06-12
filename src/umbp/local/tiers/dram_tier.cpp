@@ -156,9 +156,15 @@ DRAMTier::DRAMTier(size_t capacity, bool use_shm, const std::string& shm_name, b
     int v = std::atoi(e);
     if (v >= 1) read_threads_ = v;
   }
+  if (const char* e = std::getenv("UMBP_DRAM_WRITE_THREADS")) {
+    int v = std::atoi(e);
+    if (v >= 1) write_threads_ = v;
+  }
   unsigned hc = std::thread::hardware_concurrency();
   if (hc > 0 && read_threads_ > static_cast<int>(hc)) read_threads_ = static_cast<int>(hc);
   if (read_threads_ < 1) read_threads_ = 1;
+  if (hc > 0 && write_threads_ > static_cast<int>(hc)) write_threads_ = static_cast<int>(hc);
+  if (write_threads_ < 1) write_threads_ = 1;
 }
 
 DRAMTier::~DRAMTier() {
@@ -344,6 +350,79 @@ std::vector<bool> DRAMTier::ReadBatchIntoPtr(const std::vector<std::string>& key
   return results;
 }
 
+std::vector<bool> DRAMTier::BatchWrite(const std::vector<std::string>& keys,
+                                       const std::vector<const void*>& data_ptrs,
+                                       const std::vector<size_t>& sizes) {
+  const size_t n = keys.size();
+  std::vector<bool> results(n, false);
+  if (n == 0) return results;
+
+  // Hold mu_ for the whole batch (single-mutex model: serializes against other
+  // reads/writes). Slot allocation mutates free_list_/slots_ and must be serial;
+  // only the per-block payload copies run in parallel, which is what breaks the
+  // single-core memcpy ceiling on the backup path.
+  std::lock_guard<std::mutex> lock(mu_);
+
+  struct Job {
+    void* dst;
+    const void* src;
+    size_t size;
+    size_t idx;
+    size_t offset;
+  };
+  std::vector<Job> jobs;
+  jobs.reserve(n);
+
+  // Phase 1 (serial): free any existing slot for the key, then allocate. Does
+  // NOT self-evict — a key that doesn't fit is left false so the upper layer
+  // (LocalStorageManager) can demote LRU keys and retry per-key.
+  for (size_t i = 0; i < n; ++i) {
+    auto existing = slots_.find(keys[i]);
+    if (existing != slots_.end()) {
+      Deallocate(existing->second.offset, existing->second.size);
+      used_ -= existing->second.size;
+      slots_.erase(existing);
+      auto lru_it = lru_map_.find(keys[i]);
+      if (lru_it != lru_map_.end()) {
+        lru_list_.erase(lru_it->second);
+        lru_map_.erase(lru_it);
+      }
+    }
+    size_t offset = Allocate(sizes[i]);
+    if (offset == static_cast<size_t>(-1)) continue;
+    jobs.push_back({static_cast<char*>(base_ptr_) + offset, data_ptrs[i], sizes[i], i, offset});
+  }
+
+  // Phase 2 (parallel): non-temporal CopyBlock each payload into its slot.
+  int num_threads = write_threads_;
+  if (num_threads > static_cast<int>(jobs.size())) num_threads = static_cast<int>(jobs.size());
+
+  if (num_threads <= 1) {
+    for (const auto& j : jobs) CopyBlock(j.dst, j.src, j.size);
+  } else {
+    std::atomic<size_t> next{0};
+    auto worker = [&]() {
+      size_t i;
+      while ((i = next.fetch_add(1)) < jobs.size()) {
+        CopyBlock(jobs[i].dst, jobs[i].src, jobs[i].size);
+      }
+    };
+    std::vector<std::thread> pool;
+    pool.reserve(num_threads);
+    for (int t = 0; t < num_threads; ++t) pool.emplace_back(worker);
+    for (auto& th : pool) th.join();
+  }
+
+  // Phase 3 (serial): register slots + LRU, mark successes.
+  for (const auto& j : jobs) {
+    slots_[keys[j.idx]] = {j.offset, j.size};
+    used_ += j.size;
+    TouchLRU(keys[j.idx]);
+    results[j.idx] = true;
+  }
+  return results;
+}
+
 const void* DRAMTier::ReadPtr(const std::string& key, size_t* out_size) {
   std::lock_guard<std::mutex> lock(mu_);
 
@@ -371,7 +450,8 @@ std::vector<char> DRAMTier::Read(const std::string& key) {
 TierCapabilities DRAMTier::Capabilities() const {
   TierCapabilities caps;
   caps.zero_copy_read = true;
-  caps.batch_read = true;  // use the multi-threaded ReadBatchIntoPtr above
+  caps.batch_read = true;   // use the multi-threaded ReadBatchIntoPtr above
+  caps.batch_write = true;  // use the multi-threaded BatchWrite below
   return caps;
 }
 

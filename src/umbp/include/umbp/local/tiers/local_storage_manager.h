@@ -65,6 +65,13 @@ class LocalStorageManager {
   // depth == -1 means no metadata (degenerates to plain LRU eviction).
   bool WriteFromPtrWithDepth(const std::string& key, uintptr_t src, size_t size, int depth,
                              StorageTier tier = StorageTier::CPU_DRAM);
+  // Batch counterpart of WriteFromPtr. When the target tier advertises
+  // batch_write, payloads are copied in parallel via TierBackend::BatchWrite;
+  // any key that doesn't fit falls back to a per-key Write() with LRU demotion.
+  std::vector<bool> WriteBatchFromPtr(const std::vector<std::string>& keys,
+                                      const std::vector<uintptr_t>& srcs,
+                                      const std::vector<size_t>& sizes,
+                                      StorageTier tier = StorageTier::CPU_DRAM);
 
   bool ReadIntoPtr(const std::string& key, uintptr_t dst, size_t size);
   bool ReadIntoPtrNoPromote(const std::string& key, uintptr_t dst, size_t size);
