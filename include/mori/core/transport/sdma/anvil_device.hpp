@@ -149,6 +149,75 @@ __device__ __forceinline__ SDMA_PKT_POLL_REGMEM CreatePollMemPacket(HSAuint64* a
   return packet;
 }
 
+// One packet for `height` rows of `widthBytes`; offsets are folded into the
+// base addresses, so the packet's x/y/z stay 0. sub_op 36 is SDMA 4.4.x only,
+// so the 2D path is left undefined on gfx1250: a caller fails to compile
+// rather than posting a packet that engine does not decode. (cco's put2d posts
+// the gfx12 rect packet there.)
+#if !defined(__gfx1250__)
+__device__ __forceinline__ SDMA_PKT_COPY_LARGE_SUB_WINDOW
+CreateCopy2DPacket(void* srcBuf, uint32_t srcPitch, void* dstBuf, uint32_t dstPitch,
+                   uint32_t widthBytes, uint32_t height) {
+  SDMA_PKT_COPY_LARGE_SUB_WINDOW packet = {};
+
+  packet.HEADER_UNION.op = SDMA_OP_COPY;
+  packet.HEADER_UNION.sub_op = SDMA_SUBOP_COPY_LINEAR_LARGE_SUB_WINDOW;
+
+  packet.src_addr_31_0 = (uint32_t)(uintptr_t)srcBuf;
+  packet.src_addr_63_32 = (uint32_t)((uintptr_t)srcBuf >> 32);
+  packet.src_pitch = srcPitch - 1;
+  packet.dst_addr_31_0 = (uint32_t)(uintptr_t)dstBuf;
+  packet.dst_addr_63_32 = (uint32_t)((uintptr_t)dstBuf >> 32);
+  packet.dst_pitch = dstPitch - 1;
+  packet.rect_x = widthBytes - 1;
+  packet.rect_y = height - 1;
+
+  return packet;
+}
+#endif  // !__gfx1250__
+
+__device__ __forceinline__ SDMA_PKT_COPY_BROADCAST
+CreateCopyBroadcastPacket(void* srcBuf, void* dstBuf1, void* dstBuf2, long long int packetSize) {
+  SDMA_PKT_COPY_BROADCAST packet = {};
+
+  packet.HEADER_UNION.op = SDMA_OP_COPY;
+  packet.HEADER_UNION.sub_op = SDMA_SUBOP_COPY_LINEAR;
+  packet.HEADER_UNION.broadcast = 1;
+
+  packet.COUNT_UNION.count = (uint32_t)(packetSize - 1);
+  packet.SRC_ADDR_LO = (uint32_t)(uintptr_t)srcBuf;
+  packet.SRC_ADDR_HI = (uint32_t)((uintptr_t)srcBuf >> 32);
+  packet.DST1_ADDR_LO = (uint32_t)(uintptr_t)dstBuf1;
+  packet.DST1_ADDR_HI = (uint32_t)((uintptr_t)dstBuf1 >> 32);
+  packet.DST2_ADDR_LO = (uint32_t)(uintptr_t)dstBuf2;
+  packet.DST2_ADDR_HI = (uint32_t)((uintptr_t)dstBuf2 >> 32);
+
+  return packet;
+}
+
+// func: 0 always, 1 <, 2 <=, 3 ==, 4 !=, 5 >=, 6 >. Compares (*addr & mask) against value.
+// retry_count 0xFFF polls forever. The engine stalls the queue until the condition holds.
+__device__ __forceinline__ SDMA_PKT_POLL_REGMEM CreatePollMemPacket(HSAuint64* addr, uint32_t value,
+                                                                    uint32_t mask = 0xFFFFFFFF,
+                                                                    uint32_t func = 3,
+                                                                    uint32_t interval = 10,
+                                                                    uint32_t retryCount = 0xFFF) {
+  SDMA_PKT_POLL_REGMEM packet = {};
+
+  packet.HEADER_UNION.op = SDMA_OP_POLL_REGMEM;
+  packet.HEADER_UNION.mem_poll = 1;
+  packet.HEADER_UNION.func = func;
+
+  packet.ADDR_LO_UNION.addr_31_0 = (uint32_t)((uintptr_t)addr);
+  packet.ADDR_HI_UNION.addr_63_32 = (uint32_t)((uintptr_t)addr >> 32);
+  packet.VALUE_UNION.value = value;
+  packet.MASK_UNION.mask = mask;
+  packet.DW5_UNION.interval = interval;
+  packet.DW5_UNION.retry_count = retryCount;
+
+  return packet;
+}
+
 __device__ __forceinline__ SDMA_PKT_ATOMIC CreateAtomicIncPacket(HSAuint64* signal) {
   SDMA_PKT_ATOMIC packet = {};
 
@@ -158,8 +227,8 @@ __device__ __forceinline__ SDMA_PKT_ATOMIC CreateAtomicIncPacket(HSAuint64* sign
   packet.ADDR_LO_UNION.addr_31_0 = (uint32_t)((uintptr_t)signal);
   packet.ADDR_HI_UNION.addr_63_32 = (uint32_t)((uintptr_t)signal >> 32);
 
-  packet.SRC_DATA_LO_UNION.src_data_31_0 = 0x1;
-  packet.SRC_DATA_HI_UNION.src_data_63_32 = 0x0;
+  packet.SRC_DATA_LO_UNION.src_data_31_0 = 1;
+  packet.SRC_DATA_HI_UNION.src_data_63_32 = 0;
 
   return packet;
 }
@@ -186,12 +255,11 @@ __device__ __forceinline__ bool waitForSignal(HSAuint64* addr, uint64_t expected
   }
   return true;
 }
-
 #endif  // __HIPCC__ || __CUDACC__
 
 struct SdmaQueueDeviceHandle {
 #if defined(__HIPCC__) || defined(__CUDACC__)
-  __device__ __forceinline__ uint64_t WrapIntoRing(uint64_t index) {
+  static __device__ __forceinline__ uint64_t WrapIntoRing(uint64_t index) {
     const uint64_t queue_size_in_bytes = SDMA_QUEUE_SIZE;
     return index % queue_size_in_bytes;
   }
