@@ -146,7 +146,6 @@ class IOEngine {
   void InvalidateRouteCache();
   void UpdateRouteCache(const RouteCacheKey& key, BackendType backendType);
   std::optional<BackendType> QueryRouteCache(const RouteCacheKey& key) const;
-  std::string ResolveNodeId(const std::string& hostname) const;
 
  public:
   IOEngineConfig config;

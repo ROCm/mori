@@ -70,7 +70,9 @@ class Context {
   void InitializePossibleTransports();
 
   struct PeerInfo {
-    bool sameHost{false};     // on the same node (same hostname+IP)
+    // True if peer is on this rank's physical node. Keyed on node identity, not
+    // raw hostname, so it holds even when all machines share one hostname.
+    bool sameHost{false};
     bool sameProcess{false};  // in the same OS process (same pid + same host)
   };
 
