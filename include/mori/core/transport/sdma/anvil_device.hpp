@@ -80,6 +80,7 @@ __device__ __forceinline__ SDMA_PKT_COPY_LINEAR CreateCopyPacket(void* srcBuf, v
   return copy_packet;
 }
 
+// Build an SDMA ADD64 atomic packet that increments the signal by 1.
 __device__ __forceinline__ SDMA_PKT_ATOMIC CreateAtomicIncPacket(HSAuint64* signal) {
   SDMA_PKT_ATOMIC packet = {};
 
@@ -89,8 +90,8 @@ __device__ __forceinline__ SDMA_PKT_ATOMIC CreateAtomicIncPacket(HSAuint64* sign
   packet.ADDR_LO_UNION.addr_31_0 = (uint32_t)((uintptr_t)signal);
   packet.ADDR_HI_UNION.addr_63_32 = (uint32_t)((uintptr_t)signal >> 32);
 
-  packet.SRC_DATA_LO_UNION.src_data_31_0 = 0x1;
-  packet.SRC_DATA_HI_UNION.src_data_63_32 = 0x0;
+  packet.SRC_DATA_LO_UNION.src_data_31_0 = 1;
+  packet.SRC_DATA_HI_UNION.src_data_63_32 = 0;
 
   return packet;
 }
@@ -117,12 +118,11 @@ __device__ __forceinline__ bool waitForSignal(HSAuint64* addr, uint64_t expected
   }
   return true;
 }
-
 #endif  // __HIPCC__ || __CUDACC__
 
 struct SdmaQueueDeviceHandle {
 #if defined(__HIPCC__) || defined(__CUDACC__)
-  __device__ __forceinline__ uint64_t WrapIntoRing(uint64_t index) {
+  static __device__ __forceinline__ uint64_t WrapIntoRing(uint64_t index) {
     const uint64_t queue_size_in_bytes = SDMA_QUEUE_SIZE;
     return index % queue_size_in_bytes;
   }
