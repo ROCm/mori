@@ -12,11 +12,17 @@ LAT_THRESHOLD=10    # microseconds
 MSG_SIZE=65536      # 64K
 LAT_MSG_SIZE=2      # bytes (small message for latency)
 IB_PORT=18515       # base port for ib_write_bw / ib_write_lat
+# Kept <= sshd MaxSessions (default 10): all remote servers multiplex over one
+# ssh master connection, so too many concurrent exec sessions would be refused.
 MESH_PARALLEL=8     # max concurrent pair probes for mesh tests
+MESH_CLI_TIMEOUT=3  # per-pair client timeout (s); unreachable pair -> fail
+MESH_SRV_TIMEOUT=6  # per-pair server timeout (s); must exceed client timeout
+MESH_SRV_WAIT_REMOTE=0.5  # wait (s) for ssh-launched remote server to bind (master is warm)
+MESH_RETRIES=2      # extra attempts for a pair when the server wasn't ready (anti false-negative)
 MORI_RDMA_SL=0      # overwritten by check_qos()
 MORI_RDMA_TC=0      # overwritten by check_qos()
 
-# ============================ helpers ===========================
+# ========================== logging / ui ========================
 
 STEP=0
 GREEN='\033[0;32m'
@@ -37,6 +43,45 @@ require_cmd() {
     command -v "$1" > /dev/null 2>&1 || die "$1 not found. Please install it first."
 }
 
+# =============== ssh: identity + connection multiplexing ========
+
+# SSH identity for peer access. Under sudo, $(whoami) is root (no authorized key),
+# so prefer the invoking user ($SUDO_USER). Override with SSH_USER=... if needed.
+SSH_USER="${SSH_USER:-${SUDO_USER:-$(whoami)}}"
+# Connection multiplexing: a single persistent master carries every ssh in the mesh,
+# so per-pair runs skip the TCP+auth handshake (~0.5-1s each) and don't hit sshd
+# MaxStartups. The socket must be writable by the user that actually runs ssh.
+SSH_MUX_DIR="${TMPDIR:-/tmp}/.envcheck_sshmux.${SUDO_USER:-${USER:-$(id -un)}}"
+SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR \
+-o ControlMaster=auto -o ControlPath=$SSH_MUX_DIR/%r@%h:%p -o ControlPersist=60"
+# When running under sudo (HOME=/root), ssh would use root's keys. Drop back to the
+# invoking user so their ~/.ssh key is used. SSH_PREFIX is empty otherwise.
+if [[ "$EUID" -eq 0 && -n "${SUDO_USER:-}" ]]; then
+    SSH_PREFIX=(sudo -u "$SUDO_USER")
+    install -d -o "$SUDO_USER" -m 700 "$SSH_MUX_DIR" 2>/dev/null
+else
+    SSH_PREFIX=()
+    mkdir -p -m 700 "$SSH_MUX_DIR" 2>/dev/null
+fi
+
+# Open one master connection up front so the first mesh pairs reuse it immediately.
+ssh_warm() {
+    local host="$1"
+    "${SSH_PREFIX[@]}" ssh $SSH_OPTS "$SSH_USER@$host" true 2>/dev/null
+}
+ssh_cleanup() {
+    [[ -d "$SSH_MUX_DIR" ]] || return 0
+    local s
+    for s in "$SSH_MUX_DIR"/*; do
+        [[ -S "$s" ]] || continue
+        "${SSH_PREFIX[@]}" ssh $SSH_OPTS -O exit -o ControlPath="$s" x 2>/dev/null
+    done
+    rm -rf "$SSH_MUX_DIR" 2>/dev/null
+}
+trap ssh_cleanup EXIT
+
+# ================== rdma device & gid discovery =================
+
 # query_rdma_devices [host]
 #   prints one RDMA device name per line; empty host = local
 query_rdma_devices() {
@@ -44,8 +89,10 @@ query_rdma_devices() {
     if [[ -z "$host" || "$host" == "localhost" || "$host" == "127.0.0.1" ]]; then
         ibv_devices 2>/dev/null | awk 'NR>2 && NF {print $1}'
     else
-        ssh -o ConnectTimeout=5 "$(whoami)"@"$host" "ibv_devices 2>/dev/null" \
-            | awk 'NR>2 && NF {print $1}'
+        # A login banner (e.g. Conductor MOTD) can precede the command output, so
+        # emit a sentinel and parse only the ibv_devices table after it.
+        "${SSH_PREFIX[@]}" ssh $SSH_OPTS "$SSH_USER@$host" 'echo __IBV__; ibv_devices 2>/dev/null' 2>/dev/null \
+            | sed -n '/^__IBV__$/,$p' | awk 'NR>3 && NF {print $1}'
     fi
 }
 
@@ -71,10 +118,33 @@ gid_index() {
     if [[ -z "$host" || "$host" == "localhost" || "$host" == "127.0.0.1" ]]; then
         idx=$(bash -c "$_GID_PICK_SNIPPET" _ "$dev" 2>/dev/null)
     else
-        idx=$(ssh -o ConnectTimeout=5 "$(whoami)"@"$host" \
-              "bash -c '$_GID_PICK_SNIPPET' _ $dev" 2>/dev/null)
+        idx=$("${SSH_PREFIX[@]}" ssh $SSH_OPTS "$SSH_USER@$host" \
+              "echo __GID__; bash -c '$_GID_PICK_SNIPPET' _ $dev" 2>/dev/null \
+              | sed -n '/^__GID__$/,$p' | sed -n '2p')
     fi
     echo "${idx:-1}"
+}
+
+# build_gid_map <assoc_name> <host> <dev...>
+#   fills the named assoc array with each device's best GID index.
+build_gid_map() {
+    local -n _m="$1"; local host="$2"; shift 2
+    # gid_index is expensive (scans hundreds of sysfs GID entries, or an ssh round
+    # trip per device). Probe all devices in parallel; throttle to MESH_PARALLEL so
+    # remote probes stay under sshd MaxSessions.
+    local d tmpd running=0
+    tmpd=$(mktemp -d)
+    for d in "$@"; do
+        ( gid_index "$d" "$host" > "$tmpd/$d" ) &
+        running=$(( running + 1 ))
+        if (( running >= MESH_PARALLEL )); then wait -n 2>/dev/null; running=$(( running - 1 )); fi
+    done
+    wait
+    for d in "$@"; do
+        _m["$d"]=$(cat "$tmpd/$d" 2>/dev/null)
+        [[ -n "${_m[$d]}" ]] || _m["$d"]=1
+    done
+    rm -rf "$tmpd"
 }
 
 # nic_ipv4 <dev>   -> first IPv4 of the device's netdev (empty if none)
@@ -107,15 +177,7 @@ intra_reachable() {
     return 1
 }
 
-# ---------------- generic parallel full-mesh runner + matrix ----------------
-
-# build_gid_map <assoc_name> <host> <dev...>
-#   fills the named assoc array with each device's best GID index.
-build_gid_map() {
-    local -n _m="$1"; local host="$2"; shift 2
-    local d
-    for d in "$@"; do _m["$d"]=$(gid_index "$d" "$host"); done
-}
+# ==================== parallel full-mesh runner =================
 
 # mesh_execute fills <cell_assoc>[i,j] with a numeric metric, "x" (fail) or "-" (self).
 #   mesh_execute <cell_assoc> <tool> <server_host> <self_skip> <iters> \
@@ -145,19 +207,40 @@ mesh_execute() {
             fi
             port=$(( IB_PORT + i * nc + j ))   # unique per pair
             (
-                local sa="-p $port -x ${_cgid[${_col[$j]}]} --sl $MORI_RDMA_SL $extra"
-                local ca="-p $port -x ${_rgid[${_row[$i]}]} --sl $MORI_RDMA_SL $extra"
-                if [[ "$shost" == "localhost" || "$shost" == "127.0.0.1" ]]; then
-                    $tool -d "${_col[$j]}" $sa &>/dev/null &
-                else
-                    ssh -o ConnectTimeout=5 "$(whoami)@$shost" "$tool -d ${_col[$j]} $sa" &>/dev/null &
-                fi
-                local sp=$!; sleep 0.5
-                local out rc=0
-                out=$(timeout 30 $tool -d "${_row[$i]}" $ca "$shost" 2>&1) || rc=$?
-                wait "$sp" 2>/dev/null
-                if (( rc != 0 )); then echo "x" > "$tmpd/$i.$j"
-                else echo "$out" | grep "^[[:space:]]*$key" | awk "{print $col}" | head -1 > "$tmpd/$i.$j"; fi
+                local is_local=false base_wait="$MESH_SRV_WAIT_REMOTE"
+                [[ "$shost" == "localhost" || "$shost" == "127.0.0.1" ]] && { is_local=true; base_wait=0.5; }
+                local result="x" try sp out rc m tport sw
+                # Retry only transient "server not ready yet" races (client couldn't
+                # open the out-of-band socket because the server hadn't bound the port).
+                # A genuine unreachable pair connects on TCP but the RDMA QP never comes
+                # up -> the client hits its timeout (rc=124); those are NOT retried, so
+                # dead NICs don't waste attempts.
+                for (( try=0; try<=MESH_RETRIES; try++ )); do
+                    tport=$(( port + try * nr * nc ))   # fresh port each try (old server may linger)
+                    local sa="-p $tport -x ${_cgid[${_col[$j]}]} --sl $MORI_RDMA_SL $extra"
+                    local ca="-p $tport -x ${_rgid[${_row[$i]}]} --sl $MORI_RDMA_SL $extra"
+                    # Server is wrapped in `timeout` so an unreachable pair can never make
+                    # `wait` block forever (no client ever connects -> server self-exits).
+                    if $is_local; then
+                        timeout "$MESH_SRV_TIMEOUT" $tool -d "${_col[$j]}" $sa &>/dev/null &
+                    else
+                        "${SSH_PREFIX[@]}" ssh $SSH_OPTS "$SSH_USER@$shost" \
+                            "timeout $MESH_SRV_TIMEOUT $tool -d ${_col[$j]} $sa" &>/dev/null &
+                    fi
+                    sp=$!
+                    sw=$(awk "BEGIN{print $base_wait + $try*0.8}")   # wait longer on later tries
+                    sleep "$sw"
+                    rc=0
+                    out=$(timeout "$MESH_CLI_TIMEOUT" $tool -d "${_row[$i]}" $ca "$shost" 2>&1) || rc=$?
+                    kill "$sp" 2>/dev/null; wait "$sp" 2>/dev/null
+                    if (( rc == 0 )); then
+                        m=$(echo "$out" | grep "^[[:space:]]*$key" | awk "{print $col}" | head -1)
+                        [[ "$m" =~ ^[0-9.]+$ ]] && { result="$m"; break; }
+                    fi
+                    # stop unless this looks like a server-not-ready race
+                    grep -qiE "couldn'?t connect|unable to (init|open).*socket|connection refused|read.*server" <<<"$out" || break
+                done
+                echo "$result" > "$tmpd/$i.$j"
             ) &
             running=$(( running + 1 ))
             if (( running >= MESH_PARALLEL )); then wait -n 2>/dev/null; running=$(( running - 1 )); fi
@@ -176,28 +259,34 @@ mesh_execute() {
 }
 
 # mesh_report prints a reachability matrix + a value matrix + summary.
-#   mesh_report <cell_assoc> <row_arr> <col_arr> <title> <unit> <fmt>
+#   mesh_report <cell_assoc> <row_arr> <col_arr> <title> <unit> <fmt> [show_reach]
 #   fmt: "int" (round) or "f1" (1 decimal) for the value matrix.
+#   show_reach: "no" skips the reachability matrix (e.g. inter-node latency, where
+#   the BW step already reported it); the summary line is still printed. Default "yes".
 mesh_report() {
     local -n _cell="$1" _row="$2" _col="$3"
-    local title="$4" unit="$5" fmt="$6"
+    local title="$4" unit="$5" fmt="$6" show_reach="${7:-yes}"
     local nr=${#_row[@]} nc=${#_col[@]}
     local i j ok=0 fail=0
     local hdr; hdr=$(printf "  %-10s" "")
     for (( j=0; j<nc; j++ )); do hdr+=$(printf " %6s" "$(echo "${_col[$j]}" | sed 's/bnxt_//')"); done
 
-    echo ""
-    echo -e "  $title reachability  (${GREEN}✓${NC}=ok ${RED}✗${NC}=fail '-'=self)  rows=client cols=server"
-    echo "$hdr"
+    if [[ "$show_reach" != "no" ]]; then
+        echo ""
+        echo -e "  $title reachability  (${GREEN}✓${NC}=ok ${RED}✗${NC}=fail '-'=self)  rows=client cols=server"
+        echo "$hdr"
+    fi
     for (( i=0; i<nr; i++ )); do
         local row; row=$(printf "  %-10s" "$(echo "${_row[$i]}" | sed 's/bnxt_//')")
         for (( j=0; j<nc; j++ )); do
             local c="${_cell[$i,$j]}"
-            if [[ "$c" == "-" ]]; then row+="     -"
-            elif [[ "$c" == "x" ]]; then row+="     ${RED}✗${NC}"; (( fail++ ))
-            else row+="     ${GREEN}✓${NC}"; (( ok++ )); fi
+            # 6 spaces + 1 glyph = 7 cols, matching the header's `printf " %6s"`
+            # columns. Color escapes have zero display width, so pad by hand.
+            if [[ "$c" == "-" ]]; then row+="      -"
+            elif [[ "$c" == "x" ]]; then row+="      ${RED}✗${NC}"; (( fail++ ))
+            else row+="      ${GREEN}✓${NC}"; (( ok++ )); fi
         done
-        echo -e "$row"
+        [[ "$show_reach" != "no" ]] && echo -e "$row"
     done
 
     echo ""
@@ -414,6 +503,9 @@ check_intra_node_bw() {
     local n=${#LOCAL_DEVS[@]}
     # RDMA writes per pair scales with the test size (number of devices squared).
     local iters=$(( n * n ))
+    # Intra-node pairs are all local (no ssh), so they aren't bound by sshd
+    # MaxSessions -> use more parallelism than the inter-node mesh.
+    local MESH_PARALLEL=$(( MESH_PARALLEL * 4 ))
     log_ok "full mesh over $n devices ($((n*(n-1))) ordered pairs, ${iters} writes/pair, parallel=$MESH_PARALLEL)"
 
     local -A GID=(); build_gid_map GID "" "${LOCAL_DEVS[@]}"
@@ -431,6 +523,7 @@ check_inter_node_bw() {
     fi
     ping -c 2 -W 2 "$PEER_IP" > /dev/null 2>&1 || die "cannot ping $PEER_IP, skip inter-node bandwidth test"
     log_ok "ping $PEER_IP reachable"
+    ssh_warm "$PEER_IP"
 
     local all_remote=()
     mapfile -t all_remote < <(query_rdma_devices "$PEER_IP")
@@ -442,8 +535,9 @@ check_inter_node_bw() {
     local -A LGID=(); build_gid_map LGID "" "${LOCAL_DEVS[@]}"
     local -A RGID=(); build_gid_map RGID "$PEER_IP" "${REMOTE_DEVS[@]}"
     local -A CELL=()
-    # default iters, no self-skip (rows=local, cols=remote are distinct hosts)
-    mesh_execute CELL ib_write_bw "$PEER_IP" false "" LGID RGID LOCAL_DEVS REMOTE_DEVS
+    # 1000 writes is plenty for a reachability + rough-BW probe; the default (5000)
+    # just makes each working pair ~5x slower. no self-skip (distinct hosts).
+    mesh_execute CELL ib_write_bw "$PEER_IP" false 1000 LGID RGID LOCAL_DEVS REMOTE_DEVS
     mesh_report CELL LOCAL_DEVS REMOTE_DEVS "inter-node BW" "Gbps" int
 }
 
@@ -506,7 +600,11 @@ check_bnxt_versions() {
         log_warn "libbnxt_re-<ver>.so not found under $roce_lib_dir"
     fi
 
-    # --- firmware version via niccli -i <idx> show -p per NIC ---
+    # --- firmware version via niccli -i <idx> show per NIC ---
+    # Use the running "Firmware Version" / "RoCE Firmware Version" reported by
+    # `niccli -i <idx> show` (the actual FW the NIC is running, e.g. 236.1.173.0),
+    # NOT the "Active Package Version" from `show -p` (the NVM bundle version,
+    # e.g. 36.11.73.00) which is a different identifier and confusing for RoCE.
     if ! command -v niccli >/dev/null 2>&1; then
         log_fail "niccli not found — cannot check firmware version"; return 1
     fi
@@ -519,34 +617,35 @@ check_bnxt_versions() {
         nic_indices=(1)
     fi
 
-    local pkg_versions=() failed_idxs=()
+    # field <output> <label> -> value after the ':' for the line starting with <label>
+    _niccli_field() { awk -F: -v k="$2" 'index($0,k)==1 {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2; exit}' <<<"$1"; }
+
+    local fw_versions=() roce_versions=() failed_idxs=()
     local idx
     for idx in "${nic_indices[@]}"; do
-        local fw_out pkg_ver
-        fw_out=$(sudo niccli -i "$idx" show -p 2>/dev/null || true)
-        pkg_ver=$(echo "$fw_out" | awk '/Active Package Version/{print $NF}')
-        if [[ -n "$pkg_ver" ]]; then
-            pkg_versions+=("$pkg_ver")
+        local show_out fw_ver roce_ver
+        show_out=$(sudo niccli -i "$idx" show 2>/dev/null || true)
+        fw_ver=$(_niccli_field "$show_out" "Firmware Version")
+        roce_ver=$(_niccli_field "$show_out" "RoCE Firmware Version")
+        if [[ -n "$fw_ver" ]]; then
+            fw_versions+=("$fw_ver"); roce_versions+=("${roce_ver:-$fw_ver}")
         else
             failed_idxs+=("$idx")
         fi
     done
 
-    local uniq_fw
-    uniq_fw=$(printf '%s\n' "${pkg_versions[@]}" | sort -u)
-    local uniq_count
-    uniq_count=$(echo "$uniq_fw" | grep -c . || true)
-    if [[ $uniq_count -gt 1 ]]; then
-        log_warn "firmware versions inconsistent across NICs:"
-        for idx in "${nic_indices[@]}"; do
-            local fw_out pkg_ver
-            fw_out=$(sudo niccli -i "$idx" show -p 2>/dev/null || true)
-            pkg_ver=$(echo "$fw_out" | awk '/Active Package Version/{print $NF}')
-            log_warn "  NIC $idx : ${pkg_ver:-unknown}"
-        done
-    elif [[ $uniq_count -eq 1 ]]; then
-        log_ok "firmware : $uniq_fw (consistent across all ${#nic_indices[@]} NICs)"
-    fi
+    _report_fw() {  # <label> <versions...>
+        local label="$1"; shift
+        [[ $# -gt 0 ]] || return 0
+        local uniq; uniq=$(printf '%s\n' "$@" | sort -u)
+        if [[ $(grep -c . <<<"$uniq") -gt 1 ]]; then
+            log_warn "$label inconsistent across NICs:"; printf '         %s\n' $uniq
+        else
+            log_ok "$label : $uniq (consistent across all ${#nic_indices[@]} NICs)"
+        fi
+    }
+    _report_fw "firmware"      "${fw_versions[@]}"
+    _report_fw "RoCE firmware" "${roce_versions[@]}"
     [[ ${#failed_idxs[@]} -gt 0 ]] && log_warn "could not read firmware from NIC(s): ${failed_idxs[*]}"
 
     # --- port state, net device, and niccli index mapping via sysfs ---
@@ -739,6 +838,7 @@ check_inter_node_lat() {
         log_skip "no peer IP provided (usage: $0 <peer_ip>)"; return 0
     fi
     ping -c 1 -W 2 "$PEER_IP" > /dev/null 2>&1 || die "cannot ping $PEER_IP, skip inter-node latency test"
+    ssh_warm "$PEER_IP"
 
     local all_remote=()
     mapfile -t all_remote < <(query_rdma_devices "$PEER_IP")
@@ -750,9 +850,10 @@ check_inter_node_lat() {
     local -A LGID=(); build_gid_map LGID "" "${LOCAL_DEVS[@]}"
     local -A RGID=(); build_gid_map RGID "$PEER_IP" "${REMOTE_DEVS[@]}"
     local -A CELL=()
-    # latency uses ib_write_lat default iterations
+    # latency uses ib_write_lat default iterations. Skip the reachability matrix
+    # here: Step 5 (inter-node BW) already reported inter-node reachability.
     mesh_execute CELL ib_write_lat "$PEER_IP" false "" LGID RGID LOCAL_DEVS REMOTE_DEVS
-    mesh_report CELL LOCAL_DEVS REMOTE_DEVS "inter-node latency" "us" f1
+    mesh_report CELL LOCAL_DEVS REMOTE_DEVS "inter-node latency" "us" f1 no
 }
 
 # ============================= main =============================
