@@ -245,7 +245,7 @@ template <typename T
           >
 __device__ __forceinline__ void EpDispatchIntraNodeSdmaSubmitMappedWave(
     EpDispatchCombineArgs<T> args, int queuePe, int destPe, index_t srcTokId, index_t destTokId,
-    int activeCount, int activeBefore, bool selected
+    int activeCount, int activeBefore, bool selected, uint64_t* cachedHwReadIndex
 #ifdef ENABLE_PROFILER
     ,
     ProfilerT& profiler
@@ -271,7 +271,7 @@ __device__ __forceinline__ void EpDispatchIntraNodeSdmaSubmitMappedWave(
   uint64_t queueOffset = 0;
   if (laneId == 0) {
     IF_ENABLE_PROFILER(MORI_TRACE_SPAN(profiler, SdmaSlot::DispatchSdmaReserve));
-    base = handle.ReserveQueueSpace(activeCount * copyPacketBytes, queueOffset);
+    base = handle.ReserveQueueSpace(activeCount * copyPacketBytes, queueOffset, cachedHwReadIndex);
   }
   base = __shfl(base, 0);
   queueOffset = __shfl(queueOffset, 0);
@@ -299,7 +299,8 @@ __device__ __forceinline__ void EpDispatchIntraNodeSdmaSubmitMappedWave(
 
 template <typename T>
 __device__ __forceinline__ void EpDispatchIntraNodeSdmaSubmitCompletion(
-    EpDispatchCombineArgs<T> args, int queuePe, int signalPe, index_t tokenCount) {
+    EpDispatchCombineArgs<T> args, int queuePe, int signalPe, index_t tokenCount,
+    uint64_t* cachedHwReadIndex) {
   if (tokenCount == 0) return;
 
   auto destObj = args.intraNodeTokBufs.dispatchOut;
@@ -312,7 +313,7 @@ __device__ __forceinline__ void EpDispatchIntraNodeSdmaSubmitCompletion(
   anvil::SdmaQueueDeviceHandle handle = **(deviceHandles + qId);
 
   uint64_t queueOffset = 0;
-  uint64_t base = handle.ReserveQueueSpace(atomicPacketBytes, queueOffset);
+  uint64_t base = handle.ReserveQueueSpace(atomicPacketBytes, queueOffset, cachedHwReadIndex);
   HSAuint64* completionSignal =
       destObj->peerSignalPtrs[signalPe] + static_cast<size_t>(args.config.rank) * numQueues + qId;
   auto packet = anvil::CreateAtomicAddPacket(completionSignal, static_cast<uint64_t>(tokenCount));
@@ -456,6 +457,7 @@ __device__ void EpDispatchIntraNodeSdmaKernel_body(EpDispatchCombineArgs<T> args
     } else {
       IF_ENABLE_PROFILER(MORI_TRACE_SPAN(profiler, Slot::DispatchSdmaCopyWarp));
       index_t submittedCount = 0;
+      uint64_t cachedHwReadIndex = 0;
       while (true) {
         int producerId = laneId;
         bool selected = false;
@@ -486,7 +488,8 @@ __device__ void EpDispatchIntraNodeSdmaKernel_body(EpDispatchCombineArgs<T> args
           if (laneId == 0) submittedCount += activeCount;
           IF_ENABLE_PROFILER(MORI_TRACE_SPAN(profiler, Slot::DispatchSdmaSubmit));
           EpDispatchIntraNodeSdmaSubmitMappedWave(args, queuePe, task.destPe, task.srcTokId,
-                                                  task.destTokId, activeCount, activeBefore, selected
+                                                  task.destTokId, activeCount, activeBefore,
+                                                  selected, &cachedHwReadIndex
 #ifdef ENABLE_PROFILER
                                                   ,
                                                   profiler
@@ -505,7 +508,8 @@ __device__ void EpDispatchIntraNodeSdmaKernel_body(EpDispatchCombineArgs<T> args
         if (doneMask == activeProducerMask) break;
       }
       if (laneId == 0) {
-        EpDispatchIntraNodeSdmaSubmitCompletion<T>(args, queuePe, queuePe, submittedCount);
+        EpDispatchIntraNodeSdmaSubmitCompletion<T>(args, queuePe, queuePe, submittedCount,
+                                                   &cachedHwReadIndex);
       }
     }
   }

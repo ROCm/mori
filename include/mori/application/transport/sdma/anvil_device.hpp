@@ -140,19 +140,22 @@ struct SdmaQueueDeviceHandle {
     return index % queue_size_in_bytes;
   }
 
-  __device__ __forceinline__ bool CanWriteUpto(uint64_t uptoIndex) const {
+  __device__ __forceinline__ bool CanWriteUpto(uint64_t uptoIndex, uint64_t* cachedHwReadIndex = nullptr) const {
     const uint64_t queue_size_in_bytes = SDMA_QUEUE_SIZE;
-    // if ((uptoIndex - cachedHwReadIndex) < queue_size_in_bytes) {
-    //   return true;
-    // }
+    if ((cachedHwReadIndex != nullptr) && (uptoIndex - *cachedHwReadIndex) < queue_size_in_bytes) {
+      return true;
+    }
     // Only read hardware register if the queue is full based on cached index
-    uint64_t cachedHwReadIndex = __hip_atomic_load(rptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    uint64_t hwRead = __hip_atomic_load(rptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
     __atomic_signal_fence(__ATOMIC_SEQ_CST);
-    return (uptoIndex - cachedHwReadIndex) < queue_size_in_bytes;
+    if (cachedHwReadIndex != nullptr) {
+      *cachedHwReadIndex = hwRead;
+    }
+    return (uptoIndex - hwRead) < queue_size_in_bytes;
   }
 
   __device__ __forceinline__ uint64_t ReserveQueueSpace(const size_t size_in_bytes,
-                                                        uint64_t& offset) const {
+                                                        uint64_t& offset, uint64_t* cachedHwReadIndex = nullptr) const {
     const uint64_t queue_size_in_bytes = SDMA_QUEUE_SIZE;
 
     uint64_t cur_index;
@@ -168,7 +171,7 @@ struct SdmaQueueDeviceHandle {
       }
       uint64_t new_index = cur_index + size_in_bytes + offset;
 
-      if (CanWriteUpto(new_index)) {
+      if (CanWriteUpto(new_index, cachedHwReadIndex)) {
         if (__hip_atomic_compare_exchange_strong(cachedWptr, &cur_index, new_index,
                                                  __ATOMIC_RELAXED, __ATOMIC_RELAXED,
                                                  __HIP_MEMORY_SCOPE_AGENT)) {
