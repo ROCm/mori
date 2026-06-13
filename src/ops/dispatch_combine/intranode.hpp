@@ -347,7 +347,11 @@ __device__ void EpDispatchIntraNodeSdmaKernel_body(EpDispatchCombineArgs<T> args
 
   constexpr int kSdmaWarpId = 0;
   constexpr int kMaxMetadataWarps = 15;
-  constexpr int kSlotsPerProducer = 8;
+  constexpr int kSlotsPerProducer = 32;
+  constexpr int kSlotsPerSdmaBatchPerProducer = 4;
+  constexpr int kProducerLaneGroupSize = 16;
+  static_assert(kSlotsPerProducer >= kSlotsPerSdmaBatchPerProducer,
+                "producer ring must fit one SDMA batch per producer");
   __shared__ EpDispatchIntraNodeSdmaCopyTask sdmaTasks[kMaxMetadataWarps][kSlotsPerProducer];
   __shared__ int producerHead[kMaxMetadataWarps];
   __shared__ int producerTail[kMaxMetadataWarps];
@@ -373,7 +377,7 @@ __device__ void EpDispatchIntraNodeSdmaKernel_body(EpDispatchCombineArgs<T> args
 
   if (args.tokenIndices && args.inpTokenBuf) {
     IF_ENABLE_PROFILER(MORI_TRACE_SPAN(profiler, Slot::DispatchSdmaLoop));
-    if (warpId != kSdmaWarpId) {
+    if (warpId > kSdmaWarpId && warpId <= metadataWarpNumPerBlock) {
       IF_ENABLE_PROFILER(MORI_TRACE_SPAN(profiler, Slot::DispatchSdmaMetadataWarp));
       int metadataWarpId = warpId - 1;
       int globalMetadataWarpId = blockIdxForQueuePe * metadataWarpNumPerBlock + metadataWarpId;
@@ -454,29 +458,33 @@ __device__ void EpDispatchIntraNodeSdmaKernel_body(EpDispatchCombineArgs<T> args
         __hip_atomic_store(producerDone + metadataWarpId, 1, __ATOMIC_RELEASE,
                            __HIP_MEMORY_SCOPE_WORKGROUP);
       }
-    } else {
+    } else if (warpId == kSdmaWarpId) {
       IF_ENABLE_PROFILER(MORI_TRACE_SPAN(profiler, Slot::DispatchSdmaCopyWarp));
       index_t submittedCount = 0;
       uint64_t cachedHwReadIndex = 0;
       while (true) {
-        int producerId = laneId;
+        int producerId = laneId & (kProducerLaneGroupSize - 1);
+        int slotOffset = laneId >> 4;
         bool selected = false;
         bool laneDone = true;
         int head = 0;
+        int consumeCount = 0;
         EpDispatchIntraNodeSdmaCopyTask task{};
         if (producerId < metadataWarpNumPerBlock) {
           head = __hip_atomic_load(producerHead + producerId, __ATOMIC_RELAXED,
                                    __HIP_MEMORY_SCOPE_WORKGROUP);
           int tail = __hip_atomic_load(producerTail + producerId, __ATOMIC_ACQUIRE,
                                        __HIP_MEMORY_SCOPE_WORKGROUP);
-          if (head < tail) {
-            task = sdmaTasks[producerId][head % kSlotsPerProducer];
+          int available = tail - head;
+          consumeCount = min(available, kSlotsPerSdmaBatchPerProducer);
+          if (slotOffset < consumeCount) {
+            task = sdmaTasks[producerId][(head + slotOffset) % kSlotsPerProducer];
             selected = true;
             laneDone = false;
-          } else {
+          } else if (slotOffset == 0) {
             int done = __hip_atomic_load(producerDone + producerId, __ATOMIC_ACQUIRE,
                                          __HIP_MEMORY_SCOPE_WORKGROUP);
-            laneDone = done != 0;
+            laneDone = (done != 0) && (available == 0);
           }
         }
 
@@ -497,14 +505,13 @@ __device__ void EpDispatchIntraNodeSdmaKernel_body(EpDispatchCombineArgs<T> args
           );
         }
 
-        if (selected) {
-          __hip_atomic_store(producerHead + producerId, head + 1, __ATOMIC_RELEASE,
+        if (producerId < metadataWarpNumPerBlock && slotOffset == 0 && consumeCount > 0) {
+          __hip_atomic_store(producerHead + producerId, head + consumeCount, __ATOMIC_RELEASE,
                              __HIP_MEMORY_SCOPE_WORKGROUP);
         }
 
-        unsigned long long activeProducerMask =
-            (metadataWarpNumPerBlock >= warpSize) ? ~0ULL : ((1ULL << metadataWarpNumPerBlock) - 1);
-        unsigned long long doneMask = __ballot(laneDone) & activeProducerMask;
+        unsigned long long activeProducerMask = (1ULL << metadataWarpNumPerBlock) - 1;
+        unsigned long long doneMask = __ballot((slotOffset == 0) && laneDone) & activeProducerMask;
         if (doneMask == activeProducerMask) break;
       }
       if (laneId == 0) {
