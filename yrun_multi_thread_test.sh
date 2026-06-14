@@ -72,7 +72,7 @@ NUM_GPUS_PER_PROCESS=4
 pkill -9 -c -f allgather_test
 rm -f allgather_test_uid.bin zz*.log
 
-export RS_PULL=0
+export RS_MODE=ring
 #TEST=./build/examples/all2all_test
 # TEST=./build/examples/allgather_test
 TEST=./build/examples/reduce_scatter_test
