@@ -308,10 +308,6 @@ add_library(
   ${UMBP_GRPC_SRCS}
   ${UMBP_PEER_PROTO_SRCS}
   ${UMBP_PEER_GRPC_SRCS}
-  distributed/master/global_block_index.cpp
-  distributed/master/external_kv_block_index.cpp
-  distributed/master/client_registry.cpp
-  distributed/master/external_kv_hit_index.cpp
   distributed/master/in_memory_master_metadata_store.cpp
   distributed/master/master_server.cpp
   distributed/master/master_client.cpp

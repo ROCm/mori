@@ -25,7 +25,7 @@
 //   * the unified owned-location event source merges DRAM + SSD into one
 //     snapshot/delta (so a heartbeat full-sync ships SSD owned keys too);
 //   * a local SSD eviction's REMOVE SSD event converges the master
-//     GlobalBlockIndex while leaving the DRAM bucket intact;
+//     metadata store while leaving the DRAM bucket intact;
 //   * tier-priority RouteGet over the real index picks DRAM, then SSD once the
 //     DRAM replica is removed;
 //   * crash-restart leftover is discarded at startup;
@@ -33,18 +33,21 @@
 //
 // (copy-pin vs DRAM evict is covered by test_ssd_copy_pipeline's
 // EvictBlockedWhilePinnedThenAllowedAfterRelease; seq-gap -> full-sync by
-// test_global_block_index_events' ClientRegistryHeartbeat.SeqGap*.)
+// test_in_memory_master_metadata_store's heartbeat SeqGap cases.)
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
-#include "umbp/distributed/master/global_block_index.h"
+#include "umbp/distributed/master/in_memory_master_metadata_store.h"
 #include "umbp/distributed/peer/owned_location_source.h"
 #include "umbp/distributed/peer/peer_ssd_manager.h"
 #include "umbp/distributed/routing/route_get_strategy.h"
@@ -138,6 +141,29 @@ int CountTier(const std::vector<KvEvent>& events, KvEvent::Kind kind, TierType t
   return n;
 }
 
+// Under the merged store a block location can only be created through an
+// ApplyHeartbeat from a registered (alive) node — locations no longer exist
+// independently of a client record the way the old GlobalBlockIndex allowed.
+// These helpers register a node once and apply heartbeat deltas with an
+// ascending seq, standing in for the old GlobalBlockIndex::ApplyEvents.
+constexpr uint64_t kGB = 1024ULL * 1024 * 1024;
+
+std::map<TierType, TierCapacity> MakeCaps() {
+  std::map<TierType, TierCapacity> caps;
+  caps[TierType::DRAM] = {8 * kGB, 8 * kGB};
+  caps[TierType::SSD] = {8 * kGB, 8 * kGB};
+  return caps;
+}
+
+ClientRegistration MakeReg(const std::string& node_id) {
+  ClientRegistration reg;
+  reg.node_id = node_id;
+  reg.node_address = node_id + ":1";
+  reg.peer_address = node_id + ":peer";
+  reg.tier_capacities = MakeCaps();
+  return reg;
+}
+
 // A canned owned-location source standing in for PeerDramAllocator so the
 // aggregation can be tested without standing up a DRAM allocator.
 class FakeOwnedSource : public OwnedLocationSource {
@@ -194,58 +220,86 @@ TEST(SsdReliability, DeltaDrainMergesDramAndSsdEvents) {
 }
 
 // ---------------------------------------------------------------------------
-//  SSD local eviction -> REMOVE SSD -> master GlobalBlockIndex converges.
+//  SSD local eviction -> REMOVE SSD -> master metadata store converges.
 // ---------------------------------------------------------------------------
 
 // A key mirrored on DRAM + SSD of one owner: a local SSD eviction emits
-// REMOVE SSD, and applying that to the master index drops only the SSD bucket
+// REMOVE SSD, and applying that to the master store drops only the SSD bucket
 // (the DRAM replica, owned independently, stays routable).
 TEST(SsdReliability, LocalSsdEvictionRemoveConvergesMasterIndex) {
-  GlobalBlockIndex idx;
+  InMemoryMasterMetadataStore store;
+  const auto now = std::chrono::system_clock::now();
+  ASSERT_TRUE(store.RegisterClient(MakeReg("owner"), now, std::chrono::seconds{30}));
 
   auto be = std::make_unique<FakeBackend>(1'000'000);
   PeerSsdManager ssd(std::move(be), 0.9, 0.7);
 
   // DRAM replica added independently (a DRAM owner would emit this).
-  idx.ApplyEvents("owner", {KvEvent{KvEvent::Kind::ADD, "k", TierType::DRAM, 100}});
-  // SSD copy lands -> ADD SSD drained into the index.
+  ASSERT_EQ(store
+                .ApplyHeartbeat("owner", /*seq=*/1, now, MakeCaps(),
+                                {KvEvent{KvEvent::Kind::ADD, "k", TierType::DRAM, 100}},
+                                /*is_full_sync=*/false)
+                .status,
+            HeartbeatResult::APPLIED);
+  // SSD copy lands -> ADD SSD drained into the store.
   ASSERT_TRUE(ssd.Write("k", OneSeg(std::string(100, 'x')), 100));
-  idx.ApplyEvents("owner", ssd.DrainPendingEvents());
+  ASSERT_EQ(store
+                .ApplyHeartbeat("owner", /*seq=*/2, now, MakeCaps(), ssd.DrainPendingEvents(),
+                                /*is_full_sync=*/false)
+                .status,
+            HeartbeatResult::APPLIED);
 
-  auto both = idx.Lookup("k");
+  auto both = store.LookupBlock("k");
   ASSERT_TRUE(HasLoc(both, "owner", TierType::DRAM));
   ASSERT_TRUE(HasLoc(both, "owner", TierType::SSD));
 
-  // Local SSD eviction -> REMOVE SSD -> index drops only the SSD bucket.
+  // Local SSD eviction -> REMOVE SSD -> store drops only the SSD bucket.
   ASSERT_TRUE(ssd.Evict("k"));
   auto ssd_events = ssd.DrainPendingEvents();
   EXPECT_EQ(CountTier(ssd_events, KvEvent::Kind::REMOVE, TierType::SSD), 1);
-  idx.ApplyEvents("owner", ssd_events);
+  ASSERT_EQ(store
+                .ApplyHeartbeat("owner", /*seq=*/3, now, MakeCaps(), ssd_events,
+                                /*is_full_sync=*/false)
+                .status,
+            HeartbeatResult::APPLIED);
 
-  auto after = idx.Lookup("k");
+  auto after = store.LookupBlock("k");
   EXPECT_TRUE(HasLoc(after, "owner", TierType::DRAM));  // DRAM replica still routable
   EXPECT_FALSE(HasLoc(after, "owner", TierType::SSD));  // SSD bucket converged away
 }
 
 // ---------------------------------------------------------------------------
-//  Tier-priority RouteGet over the real index: DRAM first, SSD after evict.
+//  Tier-priority RouteGet over the real store: DRAM first, SSD after evict.
 // ---------------------------------------------------------------------------
 
 TEST(SsdReliability, TierPriorityRoutesDramThenSsdAfterDramRemoved) {
-  GlobalBlockIndex idx;
-  idx.ApplyEvents("owner", {KvEvent{KvEvent::Kind::ADD, "k", TierType::DRAM, 100},
-                            KvEvent{KvEvent::Kind::ADD, "k", TierType::SSD, 100}});
+  InMemoryMasterMetadataStore store;
+  const auto now = std::chrono::system_clock::now();
+  const std::unordered_set<std::string> kNoExclude;
+  ASSERT_TRUE(store.RegisterClient(MakeReg("owner"), now, std::chrono::seconds{30}));
+  ASSERT_EQ(store
+                .ApplyHeartbeat("owner", /*seq=*/1, now, MakeCaps(),
+                                {KvEvent{KvEvent::Kind::ADD, "k", TierType::DRAM, 100},
+                                 KvEvent{KvEvent::Kind::ADD, "k", TierType::SSD, 100}},
+                                /*is_full_sync=*/false)
+                .status,
+            HeartbeatResult::APPLIED);
 
   TierPriorityRouteGetStrategy strategy;
 
-  auto locs = idx.BatchLookupForRouteGet({"k"}, {}, std::chrono::seconds{10});
+  auto locs = store.BatchLookupBlockForRouteGet({"k"}, kNoExclude, now, std::chrono::seconds{10});
   ASSERT_EQ(locs.size(), 1u);
   auto dram_pick = strategy.Select(locs[0], "reader");
   EXPECT_EQ(dram_pick.tier, TierType::DRAM) << "prefers the fast DRAM replica";
 
   // DRAM evicted -> only the SSD bucket remains -> RouteGet must serve from SSD.
-  idx.ApplyEvents("owner", {KvEvent{KvEvent::Kind::REMOVE, "k", TierType::DRAM, 0}});
-  auto locs2 = idx.BatchLookupForRouteGet({"k"}, {}, std::chrono::seconds{10});
+  ASSERT_EQ(store
+                .ApplyHeartbeat("owner", /*seq=*/2, now, MakeCaps(),
+                                {KvEvent{KvEvent::Kind::REMOVE, "k", TierType::DRAM, 0}},
+                                /*is_full_sync=*/false)
+                .status,
+            HeartbeatResult::APPLIED);
+  auto locs2 = store.BatchLookupBlockForRouteGet({"k"}, kNoExclude, now, std::chrono::seconds{10});
   ASSERT_EQ(locs2.size(), 1u);
   auto ssd_pick = strategy.Select(locs2[0], "reader");
   EXPECT_EQ(ssd_pick.tier, TierType::SSD) << "falls back to the surviving SSD replica";

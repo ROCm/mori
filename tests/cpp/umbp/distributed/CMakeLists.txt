@@ -259,50 +259,12 @@ target_link_libraries(test_in_memory_master_metadata_store
 target_compile_features(test_in_memory_master_metadata_store PRIVATE cxx_std_17)
 gtest_discover_tests(test_in_memory_master_metadata_store)
 
-# test_external_kv_block_index
-add_executable(test_external_kv_block_index test_external_kv_block_index.cpp)
-target_link_libraries(test_external_kv_block_index PRIVATE umbp_common
-                                                           GTest::gtest_main)
-target_compile_features(test_external_kv_block_index PRIVATE cxx_std_17)
-gtest_discover_tests(test_external_kv_block_index)
-
-# test_client_registry — membership ledger: register/re-register, capacity
-# round-trip, heartbeat status, and the silent-node reaper.
-add_executable(test_client_registry test_client_registry.cpp)
-target_link_libraries(test_client_registry PRIVATE umbp_common
-                                                   GTest::gtest_main)
-target_compile_features(test_client_registry PRIVATE cxx_std_17)
-gtest_discover_tests(test_client_registry)
-
-# test_client_registry_external_kv
-add_executable(test_client_registry_external_kv
-               test_client_registry_external_kv.cpp)
-target_link_libraries(test_client_registry_external_kv
-                      PRIVATE umbp_common GTest::gtest_main)
-target_compile_features(test_client_registry_external_kv PRIVATE cxx_std_17)
-gtest_discover_tests(test_client_registry_external_kv)
-
-# test_external_kv_hit_index
-add_executable(test_external_kv_hit_index test_external_kv_hit_index.cpp)
-target_link_libraries(test_external_kv_hit_index PRIVATE umbp_common
-                                                         GTest::gtest_main)
-target_compile_features(test_external_kv_hit_index PRIVATE cxx_std_17)
-gtest_discover_tests(test_external_kv_hit_index)
-
 # test_peer_dram_allocator
 add_executable(test_peer_dram_allocator test_peer_dram_allocator.cpp)
 target_link_libraries(test_peer_dram_allocator PRIVATE umbp_common
                                                        GTest::gtest_main)
 target_compile_features(test_peer_dram_allocator PRIVATE cxx_std_17)
 gtest_discover_tests(test_peer_dram_allocator)
-
-# test_global_block_index_events
-add_executable(test_global_block_index_events
-               test_global_block_index_events.cpp)
-target_link_libraries(test_global_block_index_events PRIVATE umbp_common
-                                                             GTest::gtest_main)
-target_compile_features(test_global_block_index_events PRIVATE cxx_std_17)
-gtest_discover_tests(test_global_block_index_events)
 
 # test_router_dedup — master-side BatchRoutePut dedup via IMasterMetadataStore
 add_executable(test_router_dedup test_router_dedup.cpp)
