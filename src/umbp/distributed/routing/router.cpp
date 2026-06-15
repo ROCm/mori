@@ -28,10 +28,9 @@
 
 namespace mori::umbp {
 
-Router::Router(GlobalBlockIndex& index, ClientRegistry& registry,
-               std::unique_ptr<RouteGetStrategy> get_strategy,
+Router::Router(IMasterMetadataStore& store, std::unique_ptr<RouteGetStrategy> get_strategy,
                std::unique_ptr<RoutePutStrategy> put_strategy)
-    : index_(index), registry_(registry) {
+    : store_(store) {
   // Default to tier-priority (HBM > DRAM > SSD): with the SSD cold tier live, a
   // random pick could route a key that also has a DRAM/HBM copy to the slow
   // SSD.  Callers can still inject RandomRouteGetStrategy (or any other) via
@@ -55,7 +54,7 @@ std::optional<RoutePutResult> Router::RoutePut(
   // Master-side dedup lives only in BatchRoutePut (single RoutePut
   // proto carries no already_exists; PoolClient::Put wraps BatchPut).
   (void)key;
-  auto candidates = registry_.GetAliveClients();
+  auto candidates = store_.ListAliveClients();
   if (candidates.empty()) {
     MORI_UMBP_DEBUG("[Router] RoutePut from={}: no alive clients", node_id);
     return std::nullopt;
@@ -77,8 +76,8 @@ std::vector<std::optional<RoutePutResult>> Router::BatchRoutePut(
   // Single shared_lock for the whole batch: dedup mask + alive snapshot.
   // Two entries picking the same (node, tier) is fine — peer will sort
   // out ENOSPC at AllocateSlot.
-  auto exists_mask = index_.BatchLookupExists(keys);
-  auto candidates = registry_.GetAliveClients();
+  auto exists_mask = store_.BatchExistsBlock(keys);
+  auto candidates = store_.ListAliveClients();
   for (size_t i = 0; i < keys.size(); ++i) {
     if (i < exists_mask.size() && exists_mask[i]) {
       results[i] = RoutePutResult{.outcome = RoutePutOutcome::kAlreadyExists};
@@ -98,11 +97,15 @@ std::vector<std::optional<RouteGetResolution>> Router::BatchRouteGet(
   // Snapshot peer addresses once for the whole batch.  Master assumes
   // the snapshot is stable for the duration of one BatchRouteGet.
   std::unordered_map<std::string, std::string> node_to_peer;
-  for (const auto& client : registry_.GetAliveClients()) {
+  for (const auto& client : store_.ListAliveClients()) {
     node_to_peer[client.node_id] = client.peer_address;
   }
 
-  auto all_locs = index_.BatchLookupForRouteGet(keys, exclude_nodes, lease_duration_);
+  // Unlike the old GlobalBlockIndex::BatchLookupForRouteGet (which read the
+  // clock internally), BatchLookupBlockForRouteGet takes an explicit `now`
+  // the router supplies — the timestamp now crosses the store boundary.
+  auto all_locs = store_.BatchLookupBlockForRouteGet(
+      keys, exclude_nodes, std::chrono::system_clock::now(), lease_duration_);
   for (size_t i = 0; i < keys.size(); ++i) {
     auto& locations = all_locs[i];
     if (locations.empty()) {

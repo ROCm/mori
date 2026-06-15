@@ -21,23 +21,23 @@
 // SOFTWARE.
 #include "umbp/distributed/master/eviction_manager.h"
 
-#include <algorithm>
+#include <chrono>
 #include <cstdint>
-#include <set>
+#include <map>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
 
 #include "mori/utils/mori_log.hpp"
-#include "umbp/distributed/master/client_registry.h"
-#include "umbp/distributed/master/global_block_index.h"
+#include "umbp/distributed/master/master_metadata_store.h"
+#include "umbp/distributed/types.h"
 
 namespace mori::umbp {
 
-EvictionManager::EvictionManager(GlobalBlockIndex& index, ClientRegistry& registry,
-                                 const EvictionConfig& config, EvictKeyDispatcher* dispatcher)
-    : index_(index), registry_(registry), config_(config), dispatcher_(dispatcher) {}
+EvictionManager::EvictionManager(IMasterMetadataStore& store, const EvictionConfig& config,
+                                 EvictKeyDispatcher* dispatcher)
+    : store_(store), config_(config), dispatcher_(dispatcher) {}
 
 EvictionManager::~EvictionManager() { Stop(); }
 
@@ -74,11 +74,15 @@ void EvictionManager::EvictionLoop() {
 // This function picks victims and dispatches EvictKey to each peer via the
 // dispatcher; master state itself is left untouched here.
 void EvictionManager::RunOnce() {
-  auto clients = registry_.GetAliveClients();
+  auto clients = store_.ListAliveClients();
 
-  using NodeTierKey = GlobalBlockIndex::NodeTierKey;
-  std::set<NodeTierKey> overloaded_node_tiers;
-  std::unordered_map<std::string, std::map<TierType, int64_t>> bytes_to_free;
+  // Per-(node, tier) byte budget down to the LOW watermark.  This is the same
+  // computation the manager did before the store refactor; the only change is
+  // that the budget map is now passed straight into EnumerateLruForEviction
+  // (keyed by NodeTierKey) instead of being consumed locally after a separate
+  // FindEvictionCandidates call.  The budget map's keys also identify the
+  // overloaded buckets, so the old standalone overloaded-set is gone.
+  std::map<NodeTierKey, uint64_t> bytes_to_free;
 
   for (const auto& client : clients) {
     for (const auto& [tier, cap] : client.tier_capacities) {
@@ -93,44 +97,35 @@ void EvictionManager::RunOnce() {
       if (usage >= config_.high_watermark) {
         auto target_used =
             static_cast<uint64_t>(static_cast<double>(cap.total_bytes) * config_.low_watermark);
-        auto to_free = static_cast<int64_t>(used) - static_cast<int64_t>(target_used);
-        if (to_free > 0) {
-          overloaded_node_tiers.insert({client.node_id, tier});
-          bytes_to_free[client.node_id][tier] += to_free;
+        if (used > target_used) {
+          bytes_to_free[{client.node_id, tier}] += used - target_used;
         }
       }
     }
   }
 
-  if (overloaded_node_tiers.empty()) return;
-  MORI_UMBP_INFO("[EvictionManager] {} overloaded node-tiers detected",
-                 overloaded_node_tiers.size());
+  if (bytes_to_free.empty()) return;
+  MORI_UMBP_INFO("[EvictionManager] {} overloaded node-tiers detected", bytes_to_free.size());
 
-  auto candidates = index_.FindEvictionCandidates(overloaded_node_tiers);
-  if (candidates.empty()) {
+  // The store returns candidates already LRU-ordered (oldest first) and already
+  // trimmed to each bucket's byte budget, so the manager no longer sorts or
+  // runs its own greedy budget walk.
+  auto candidates_by_bucket =
+      store_.EnumerateLruForEviction(bytes_to_free, std::chrono::system_clock::now());
+  if (candidates_by_bucket.empty()) {
     MORI_UMBP_DEBUG("[EvictionManager] No eviction candidates found");
     return;
   }
-
-  // Sort by oldest-access first (LRU).  Depth-aware tiebreaking went away
-  // along with master's per-key depth field — peers don't ship depth in
-  // KvEvent — so a pure LRU sort is what we get.
-  std::sort(candidates.begin(), candidates.end(),
-            [](const EvictionCandidate& a, const EvictionCandidate& b) {
-              return a.last_accessed_at < b.last_accessed_at;
-            });
 
   // Group selected victims by node so the eventual EvictKey RPC takes a
   // single keys[] per peer instead of N round trips.
   std::unordered_map<std::string, std::vector<std::string>> per_node_keys;
   size_t selected = 0;
-  for (const auto& c : candidates) {
-    auto& tier_budget = bytes_to_free[c.location.node_id];
-    auto it = tier_budget.find(c.location.tier);
-    if (it == tier_budget.end() || it->second <= 0) continue;
-    per_node_keys[c.location.node_id].push_back(c.key);
-    it->second -= static_cast<int64_t>(c.size);
-    ++selected;
+  for (const auto& [bucket, candidates] : candidates_by_bucket) {
+    for (const auto& c : candidates) {
+      per_node_keys[c.location.node_id].push_back(c.key);
+      ++selected;
+    }
   }
 
   if (selected == 0) return;
