@@ -383,4 +383,6 @@ endif()
 target_link_libraries(umbp_client PRIVATE umbp_common ${_PROTOBUF_LIBS}
                                           ${_GRPCPP_LIB})
 
-add_subdirectory(tests)
+# UMBP unit tests live under tests/cpp/umbp (built when BUILD_TESTS=ON); they
+# were previously duplicated here under src/umbp/tests with a second GoogleTest
+# fetch.
