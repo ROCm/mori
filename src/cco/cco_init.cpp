@@ -26,22 +26,32 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <mutex>
 #include <random>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "hip/hip_runtime_api.h"
+#include "mori/application/application.hpp"  // Context, BootstrapNetwork
 #include "mori/application/bootstrap/local_bootstrap.hpp"
 #include "mori/application/bootstrap/socket_bootstrap.hpp"
+#include "mori/application/memory/va_manager.hpp"  // HeapVAManager
 #include "mori/application/transport/rdma/rdma.hpp"
 #include "mori/application/transport/sdma/anvil.hpp"
 #include "mori/application/utils/check.hpp"
-#include "mori/cco/cco.hpp"
+#include "mori/cco/cco.hpp"  // public, self-contained (opaque ccoComm fwd-decl)
 #include "mori/utils/hip_compat.hpp"
 #include "mori/utils/mori_log.hpp"
 
 namespace mori {
 namespace cco {
+
+// Out-of-line dtor for the unique_ptr<HeapVAManager> member: ccoComm is defined
+// in cco.hpp with HeapVAManager only forward-declared, so its destruction must
+// be emitted here where HeapVAManager (va_manager.hpp) is complete.
+ccoComm::~ccoComm() = default;
 
 static size_t AlignUp(size_t x, size_t align) { return (x + align - 1) & ~(align - 1); }
 
@@ -960,10 +970,11 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
       epsHost[i].cqHandle = newEps[i].cqHandle;
       epsHost[i].atomicIbuf = newEps[i].atomicIbuf;
       // Resolve the GDA backend provider from the first connected endpoint
-      // (empty slots for peers without a QP keep vendorId==Unknown).
-      if (ibgda.providerType == core::ProviderType::Unknown) {
+      // (empty slots for peers without a QP keep vendorId==Unknown). cco's own
+      // ccoProviderType mirrors core::ProviderType values 1:1.
+      if (ibgda.providerType == CCO_PROVIDER_UNKNOWN) {
         core::ProviderType p = epsHost[i].GetProviderType();
-        if (p != core::ProviderType::Unknown) ibgda.providerType = p;
+        if (p != core::ProviderType::Unknown) ibgda.providerType = static_cast<ccoProviderType>(p);
       }
     }
 

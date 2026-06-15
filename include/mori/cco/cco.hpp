@@ -47,37 +47,124 @@
 #include <stddef.h>
 #include <stdint.h>
 
-// application::RdmaEndpointDevice + the device-safe transport types it carries.
-// This header also transitively provides anvil_device (anvil::SdmaQueueDeviceHandle,
-// HSAuint64), core_device_types, and hip_compat (__device__, hipMem* handles),
-// which the structs below rely on — so they are not included separately here.
-#include "mori/application/application_device_types.hpp"
-
-// NOTE: the GDA (RDMA) device layer — the only consumer of the provider RDMA
-// core — now lives in cco_scale_out.hpp, so this header pulls in no RDMA
-// headers. Include cco_scale_out.hpp (which includes this file) for GDA.
-
+// HIP/host compatibility shim — keeps this header self-contained:
+//   * Device/kernel TUs (hipcc, -x hip): NO <hip/hip_runtime.h> is pulled in.
+//     The device code uses clang AMDGCN builtins directly (wrapped below in
+//     _cco* helpers), plus __hip_atomic_* builtins / __HIP_MEMORY_SCOPE_*
+//     predefined macros. __device__ / __host__ are provided as attribute-macro
+//     fallbacks (#ifndef-guarded, like aiter's opus/hip_minimal.hpp) so cco.hpp
+//     compiles even with no HIP runtime header AND no hipcc auto-wrapper
+//     (-nogpuinc, or a DSL/JIT front-end) — and still coexists with the real
+//     HIP headers when they ARE present.
+//   * Pure-host TUs (plain g++/clang, no hipcc) get __device__/__host__ as
+//     empty macros so the few __device__ helpers in the shared region compile
+//     as host no-ops, plus the STL used by the host control-plane structs.
+#if defined(__HIPCC__) || defined(__CUDACC__)
+#ifndef __device__
+#define __device__ __attribute__((device))
+#endif
+#ifndef __host__
+#define __host__ __attribute__((host))
+#endif
+#else
+#ifndef __device__
+#define __device__
+#endif
+#ifndef __host__
+#define __host__
+#endif
+// Host-only: STL containers/smart-pointers used by the host control-plane
+// structs (ccoComm / ccoWindowHost) defined further down. System headers only —
+// they keep cco.hpp self-contained (no mori headers) while these structs stay in
+// this file. Device/kernel TUs skip both the includes and the structs.
 #include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
+#endif
 
-#include "mori/application/application.hpp"
-#include "mori/application/memory/va_manager.hpp"
-
-// BootstrapNetwork is referenced only by pointer (host API prototypes + ccoComm),
-// so a forward declaration is enough. This keeps the heavy mpi/torch/socket
-// bootstrap headers out of every TU that includes cco.hpp — especially device
-// TUs, which never touch bootstrap. The full definition reaches the host
-// implementation (cco_init.cpp) via application.hpp.
+// SELF-CONTAINED: this header pulls in NO other mori headers. A user needs only
+// this file + the host .so to drive the CCO host API and write LSA device
+// kernels.
+//   * Device kernels get HIP builtins (__device__, __hip_atomic_*, threadIdx,
+//     __syncthreads, ...) from hipcc — no header needed.
+//   * The few external types referenced below appear ONLY as pointers, so they
+//     are forward-declared (their full definitions are never needed here).
+//   * The host control-plane structs (ccoComm, ccoWindowHost) ARE defined here
+//     (host-only, under #if !defined(__HIPCC__)), but reference the application
+//     layer only through forward-declared pointers / unique_ptr (PImpl dtor), so
+//     no application headers are pulled in — only system STL. Their member
+//     functions live in src/cco/cco_init.cpp. Users treat ccoComm as opaque.
+//   * The GDA (RDMA) device layer — the only consumer of the provider RDMA core
+//     — lives in cco_scale_out.hpp (include that, not this, for GDA).
+//
+// Forward declarations (referenced only via pointer / unique_ptr below):
 namespace mori {
 namespace application {
+// BootstrapNetwork / Context: ccoComm members (pointer only).
 class BootstrapNetwork;
-}
-}
+class Context;
+// HeapVAManager: ccoComm::vaManager (unique_ptr; ccoComm has an out-of-line
+// dtor in cco_init.cpp so the incomplete type is fine here).
+class HeapVAManager;
+// RdmaEndpointDevice: ccoIbgdaContext::endpoints (pointer only). Full definition
+// reaches GDA device code via cco_scale_out.hpp, and the host impl via
+// application_device_types.hpp.
+struct RdmaEndpointDevice;
+}  // namespace application
+}  // namespace mori
+namespace anvil {
+// SdmaQueueDeviceHandle: ccoSdmaContext / ccoComm (pointer only).
+struct SdmaQueueDeviceHandle;
+}  // namespace anvil
+// hipMemGenericAllocationHandle_t is an opaque pointer typedef from
+// <hip/hip_runtime_api.h>. Replicated here (identical definition) so ccoComm can
+// name it without pulling the ROCm header into host TUs that include cco.hpp.
+struct ihipMemGenericAllocationHandle;
+typedef struct ihipMemGenericAllocationHandle* hipMemGenericAllocationHandle_t;
 
 namespace mori {
 namespace cco {
+
+/* ════════════════════════════════════════════════════════════════════════════
+ *  0. Device intrinsic wrappers (clang AMDGCN builtins)
+ *
+ *  The reason this header needs NO <hip/hip_runtime.h>: the device code below
+ *  goes through these thin wrappers instead of HIP's threadIdx / __syncthreads /
+ *  __syncwarp / __threadfence_system / clock64. That avoids pulling in and
+ *  parsing the full HIP runtime header (faster compile, minimal dependency),
+ *  mirroring aiter's opus.hpp. Bodies copy HIP's amd_detail definitions
+ *  verbatim. (__hip_atomic_* used elsewhere are clang builtins and
+ *  __HIP_MEMORY_SCOPE_* are compiler-predefined macros under -x hip, so those
+ *  need no header either.) Device-only.
+ * ════════════════════════════════════════════════════════════════════════════ */
+#if defined(__HIPCC__) || defined(__CUDACC__)
+// Internal — not part of the cco API. Kept in mori::cco::impl (the same internal
+// namespace as the GDA provider primitives in cco_scale_out.hpp) so cco's public
+// surface (mori::cco::*) stays free of these generic device-compat helpers.
+namespace impl {
+__device__ inline unsigned threadIdxX() { return __builtin_amdgcn_workitem_id_x(); }
+__device__ inline unsigned blockDimX() { return __builtin_amdgcn_workgroup_size_x(); }
+__device__ inline int warpSize() { return __builtin_amdgcn_wavefrontsize(); }
+// HIP __syncwarp (amd_warp_sync_functions.h)
+__device__ inline void syncWarp() {
+  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+  __builtin_amdgcn_wave_barrier();
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+}
+// HIP __syncthreads = __work_group_barrier(global|local fence); conservative
+// SEQ_CST workgroup fence around the execution barrier matches its guarantees.
+__device__ inline void syncThreads() {
+  __builtin_amdgcn_fence(__ATOMIC_SEQ_CST, "workgroup");
+  __builtin_amdgcn_s_barrier();
+  __builtin_amdgcn_fence(__ATOMIC_SEQ_CST, "workgroup");
+}
+// HIP __threadfence_system (amd_device_functions.h)
+__device__ inline void threadFenceSystem() { __builtin_amdgcn_fence(__ATOMIC_SEQ_CST, ""); }
+// HIP clock64 (amd_device_functions.h): cycle counter for the barrier timeout.
+__device__ inline long long clock64() { return (long long)__builtin_readcyclecounter(); }
+}  // namespace impl
+#endif  // defined(__HIPCC__) || defined(__CUDACC__)
 
 /* ════════════════════════════════════════════════════════════════════════════
  *  1. Shared types (device-safe; host-only structs guarded)
@@ -89,6 +176,18 @@ namespace cco {
 // with INITIALIZER defaults.
 static constexpr uint32_t CCO_API_MAGIC = 0x0CC0AAAA;
 static constexpr uint32_t CCO_API_VERSION = 1;
+
+// RDMA backend provider of the GDA endpoints. Mirrors core::ProviderType values
+// 1:1, but is cco's OWN type so this header needs no core header (and so the
+// host impl, which also includes core_device_types.hpp, gets no enum-redefinition
+// conflict). cco_init.cpp maps core::ProviderType -> ccoProviderType.
+enum ccoProviderType {
+  CCO_PROVIDER_UNKNOWN = 0,
+  CCO_PROVIDER_MLX5 = 1,  // Mellanox
+  CCO_PROVIDER_BNXT = 2,  // Broadcom
+  CCO_PROVIDER_PSD = 3,   // Pensando
+  CCO_PROVIDER_IBVERBS = 4,
+};
 
 // GDA backend QP allocation strategy.
 enum ccoGdaConnectionType {
@@ -177,7 +276,7 @@ struct ccoIbgdaContext {
   // valid endpoint's vendorId; host-readable so a launcher can dispatch to the
   // matching ccoGda<PrvdType> kernel instantiation without hardcoding it.
   // Unknown when gdaConnType==NONE (no endpoints).
-  core::ProviderType providerType{core::ProviderType::Unknown};
+  ccoProviderType providerType{CCO_PROVIDER_UNKNOWN};
 
   // Signal: remote peers atomic +1 here after put completes.
   int signalCount;
@@ -231,9 +330,9 @@ struct ccoGdaBarrierHandle {
 struct ccoSdmaContext {
   uint32_t sdmaNumQueue;                         // 0 when SDMA disabled
   anvil::SdmaQueueDeviceHandle** deviceHandles;  // [lsaSize * sdmaNumQueue], shared from comm
-  HSAuint64* signalBuf;                          // [lsaSize * sdmaNumQueue], local pool
-  HSAuint64* expectSignals;                      // [lsaSize * sdmaNumQueue], local
-  HSAuint64** peerSignalPtrs;                    // [lsaSize], peer signalBuf via IPC
+  uint64_t* signalBuf;                           // [lsaSize * sdmaNumQueue], local pool (HSAuint64)
+  uint64_t* expectSignals;                       // [lsaSize * sdmaNumQueue], local
+  uint64_t** peerSignalPtrs;                     // [lsaSize], peer signalBuf via IPC
 };
 
 struct ccoDevComm {
@@ -417,15 +516,15 @@ struct ccoCoopThread {
 };
 
 struct ccoCoopWarp {
-  __device__ int thread_rank() const { return threadIdx.x % warpSize; }
-  __device__ int size() const { return warpSize; }
-  __device__ void sync() { __syncwarp(); }
+  __device__ int thread_rank() const { return impl::threadIdxX() % impl::warpSize(); }
+  __device__ int size() const { return impl::warpSize(); }
+  __device__ void sync() { impl::syncWarp(); }
 };
 
 struct ccoCoopBlock {
-  __device__ int thread_rank() const { return threadIdx.x; }
-  __device__ int size() const { return blockDim.x; }
-  __device__ void sync() { __syncthreads(); }
+  __device__ int thread_rank() const { return impl::threadIdxX(); }
+  __device__ int size() const { return impl::blockDimX(); }
+  __device__ void sync() { impl::syncThreads(); }
 };
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -581,7 +680,9 @@ __device__ inline ccoLsaBarrierSession<Coop>::ccoLsaBarrierSession(Coop coop, cc
                                                                    ccoLsaBarrierHandle h,
                                                                    uint32_t idx)
     : coop(coop), team(team), comm(comm), handle(h), index(idx) {
-  assert(idx < h.nBarriers);
+  // Precondition: idx < h.nBarriers (caller passes a valid barrier slot). No
+  // device-side assert() here — it would require <hip/hip_runtime.h> for the
+  // HIP device __assert_fail, which this header deliberately avoids.
 
   // Restore epoch persisted by the previous session's destructor.
   // Inbox slots are never zeroed, so epoch must be monotonically increasing
@@ -618,7 +719,7 @@ __device__ inline void ccoLsaBarrierSession<Coop>::arrive(Coop) {
   // System-scope fence so any prior payload writes from this coop are
   // observable to peers before the relaxed inbox stores below land.
   if (nranks > 1) {
-    __threadfence_system();
+    impl::threadFenceSystem();
   }
 
   for (int i = this->coop.thread_rank(); i < nranks - 1; i += this->coop.size()) {
@@ -637,7 +738,7 @@ __device__ inline int ccoLsaBarrierSession<Coop>::waitInternal(Coop, uint64_t ti
 
   uint64_t startCycle;
   if constexpr (EnableTimeout) {
-    startCycle = (uint64_t)clock64();
+    startCycle = (uint64_t)impl::clock64();
   }
 
   for (int i = this->coop.thread_rank(); i < nranks - 1; i += this->coop.size()) {
@@ -650,7 +751,7 @@ __device__ inline int ccoLsaBarrierSession<Coop>::waitInternal(Coop, uint64_t ti
       if ((got - (uint32_t)(this->epoch + 1)) <= ((uint32_t)-1 >> 1)) break;
 
       if constexpr (EnableTimeout) {
-        if ((uint64_t)clock64() - startCycle >= timeoutCycles) {
+        if ((uint64_t)impl::clock64() - startCycle >= timeoutCycles) {
           ret = 1;
           goto done;
         }
@@ -690,11 +791,17 @@ __device__ inline int ccoLsaBarrierSession<Coop>::sync(Coop coop, uint64_t timeo
 #endif  // defined(__HIPCC__) || defined(__CUDACC__)  — end device-side API
 
 /* ════════════════════════════════════════════════════════════════════════════
- *  5. Host control-plane Structure & API
+ *  5. Host control-plane structs & API
  *
- *  Implemented in src/cco/cco_init.cpp. The full ccoComm definition is
- *  host-only (guarded above); device/kernel TUs see only this forward decl.
+ *  ccoWindowHost / ccoComm are host-only (device/kernel TUs see ccoComm only as
+ *  an opaque forward declaration). They reference the application layer purely
+ *  through forward-declared pointers / unique_ptr, so this header still pulls in
+ *  no application headers — only system STL. Member functions and the
+ *  out-of-line ccoComm destructor live in src/cco/cco_init.cpp. To callers,
+ *  ccoComm is an opaque handle obtained from ccoCommCreate.
  * ════════════════════════════════════════════════════════════════════════════ */
+
+#if !defined(__HIPCC__) && !defined(__CUDACC__)
 
 struct ccoWindowHost {
   void* localPtr;
@@ -767,7 +874,15 @@ struct ccoComm {
     ccoWindowDevice* devPtr;
   };
   std::vector<WindowTableEntry> windowTableEntries;
+
+  // Out-of-line (defined in cco_init.cpp where HeapVAManager is complete) so the
+  // unique_ptr<HeapVAManager> member works with only a forward declaration here.
+  ~ccoComm();
 };
+
+#else
+struct ccoComm;  // device/kernel TUs: opaque handle only
+#endif  // !defined(__HIPCC__) && !defined(__CUDACC__)
 
 // ── Phase 1: Communicator ──
 //

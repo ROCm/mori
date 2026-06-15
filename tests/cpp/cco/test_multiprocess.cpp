@@ -39,6 +39,7 @@
 #include <vector>
 
 #include "hip/hip_runtime.h"
+#include "mori/application/application_device_types.hpp"  // white-box: RdmaEndpointDevice (count QPs)
 #include "mori/application/bootstrap/socket_bootstrap.hpp"
 #include "mori/cco/cco.hpp"
 

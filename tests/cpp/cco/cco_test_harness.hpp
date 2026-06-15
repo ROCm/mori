@@ -63,20 +63,21 @@ inline int g_rank = 0;
   } while (0)
 
 // Run a kernel-launch (or any statement) against the ccoGda<PrvdType> provider
-// matching the DevComm's RDMA backend, resolved at runtime. Inside __VA_ARGS__,
+// matching the DevComm's RDMA backend, resolved at runtime. `prvd` is the
+// DevComm's ccoProviderType (devComm.ibgda.providerType); inside __VA_ARGS__,
 // `P` is a constexpr mori::core::ProviderType usable as a template argument.
 #define CCO_GDA_DISPATCH(prvd, ...)                                                              \
   do {                                                                                           \
     switch (prvd) {                                                                              \
-      case mori::core::ProviderType::BNXT: {                                                     \
+      case mori::cco::CCO_PROVIDER_BNXT: {                                                       \
         constexpr auto P = mori::core::ProviderType::BNXT;                                       \
         __VA_ARGS__;                                                                             \
       } break;                                                                                   \
-      case mori::core::ProviderType::MLX5: {                                                     \
+      case mori::cco::CCO_PROVIDER_MLX5: {                                                       \
         constexpr auto P = mori::core::ProviderType::MLX5;                                       \
         __VA_ARGS__;                                                                             \
       } break;                                                                                   \
-      case mori::core::ProviderType::PSD: {                                                      \
+      case mori::cco::CCO_PROVIDER_PSD: {                                                        \
         constexpr auto P = mori::core::ProviderType::PSD;                                        \
         __VA_ARGS__;                                                                             \
       } break;                                                                                   \
