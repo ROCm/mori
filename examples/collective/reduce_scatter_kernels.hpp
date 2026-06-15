@@ -67,8 +67,26 @@ using namespace mori::application;
 template <int Bytes>
 using TVecType = typename mori::core::VecTypeSelector<Bytes>::dataType;
 
+/*
+using index_t = int32_t;
+using int32x4_t = int32_t __attribute__((ext_vector_type(4)));
+__device__ void
+llvm_amdgcn_raw_buffer_store_i32x4(int32x4_t vdata,
+                                   int32x4_t rsrc,
+                                   index_t voffset,
+                                   index_t soffset,
+                                   index_t glc_slc) __asm("llvm.amdgcn.raw.buffer.store.v4i32");
+
+__device__ int32x4_t
+llvm_amdgcn_raw_buffer_load_i32x4(int32x4_t srsrc,
+                                  index_t voffset,
+                                  index_t soffset,
+                                  index_t glc_slc) __asm("llvm.amdgcn.raw.buffer.load.v4i32");
+*/
+
 using rs_v4u = __attribute__((__vector_size__(4 * sizeof(unsigned int)))) unsigned int;
 using rs_v4u_gptr = GLOBAL_SPACE rs_v4u*;
+
 
 template <int Bytes>
 __device__ __forceinline__ TVecType<Bytes> StreamLoad(
@@ -523,12 +541,6 @@ __global__ void ReduceScatterRingKernel(int myPe, int npes, const T* __restrict_
   if (blockIdx.x != 0) return;
   const int tid = static_cast<int>(threadIdx.x);
 
-  // npes == 1: result is just the local shard.
-  if (npes <= 1) {
-    for (size_t i = tid; i < chunkElems; i += blockDim.x) output[i] = input[i];
-    return;
-  }
-
   const int next = (myPe + 1) % npes;
   const auto chunkOf = [npes, myPe](int k) -> int {
     int c = (myPe - 1 - k) % npes;
@@ -555,8 +567,10 @@ __global__ void ReduceScatterRingKernel(int myPe, int npes, const T* __restrict_
     const T* src = input + sc * chunkElems;
     if (tid == 0) {
       for (int j = 0; j < S; ++j) {
-        RingSdmaSend<T>(src + sliceOfs(j), recvBuf + sliceOfs(j), readySig + j,
-                        sliceCnt(j) * sizeof(T), next, j % numSdmaQ);
+        size_t base = chunkElems / S, ofs = j * base,
+               cnt = (j == S - 1) ? (chunkElems - ofs) : base;
+        RingSdmaSend<T>(src + ofs, recvBuf + ofs, readySig + j,
+                        cnt * sizeof(T), next, j % numSdmaQ);
       }
     }
     __syncthreads();
@@ -578,8 +592,8 @@ __global__ void ReduceScatterRingKernel(int myPe, int npes, const T* __restrict_
     T* dest = isFinal ? output : (sendBuf + k * chunkElems);
 
     for (int j = 0; j < S; ++j) {
-      const size_t ofs = sliceOfs(j);
-      const size_t cnt = sliceCnt(j);
+      size_t base = chunkElems / S, ofs = j * base,
+             cnt = (j == S - 1) ? (chunkElems - ofs) : base;
 
       // Wait for slice j of recvSlot to land, then acquire (invalidate L2) so the
       // CU reads the SDMA-written staging fresh from HBM.
