@@ -312,6 +312,7 @@ add_library(
   distributed/master/external_kv_block_index.cpp
   distributed/master/client_registry.cpp
   distributed/master/external_kv_hit_index.cpp
+  distributed/master/in_memory_master_metadata_store.cpp
   distributed/master/master_server.cpp
   distributed/master/master_client.cpp
   distributed/master/rpc_latency_timer.cpp
